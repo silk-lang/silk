@@ -1,0 +1,258 @@
+//! `silk cached` keys a task on the command, the options that change only its output and the
+//! package's `silk hash`, saves what is worth keeping, and replays it without running the compiler.
+
+import Command { Outcome }
+import Install { HostFiles }
+import NativeHostFiles { NativeHostFiles }
+import TaskCache as TaskCaches { Artifact, Entry, Package, Split, TaskStore }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.system.child_process { ChildProcess, ProcessError, ProcessOutcome, ProcessRequest }
+import silk.core.effect { Effect }
+import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.system.filesystem_machine { MachineFileSystem }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.collections.slice { Slice }
+import silk.testing.testing { AssertionError, Testing }
+import silk.num.usize
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn contains(text: &[u8], part: &[u8]) -> bool {
+  let mut at = usize.ZERO
+  while at + part.length <= text.length {
+    if same(Slice.view<u8>(text, at, part.length), part) {
+      return true
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+effect fn words(values: &[&[u8]]) -> List<Bytes> ! OutOfMemoryError ? &mut Allocator {
+  let mut listed = List<Bytes>.make()
+  let mut at = usize.ZERO
+  while at < values.length {
+    run List<Bytes>.append(&mut listed, run Bytes.copy(values[at]))
+    at = at + usize.ONE
+  }
+  return move listed
+}
+
+// Whether `listed` holds exactly `expected`, in order.
+fn holds(listed: &List<Bytes>, expected: &[&[u8]]) -> bool {
+  let values = List<Bytes>.asSlice(listed)
+  if values.length != expected.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < values.length {
+    if !same(Bytes.asSlice(&values[at]), expected[at]) {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+test effect fn entriesRoundTripAndRefuseDamage() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run roundTrips() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn roundTrips() -> () ! AssertionError<'static> | OutOfMemoryError ? &mut Allocator {
+  let mut artifacts = List<Artifact>.make()
+  run List<Artifact>.append(&mut artifacts, Artifact { path: run Bytes.copy(b"../build/app"), bytes: run Bytes.copy(b"\x00\x01binary\n") })
+  run List<Artifact>.append(&mut artifacts, Artifact { path: run Bytes.copy(b"empty"), bytes: Bytes.make() })
+  let entry = Entry { status: 1, output: run Bytes.copy(b"out\nput"), errors: run Bytes.copy(b"error: x\n"), artifacts: move artifacts }
+  let encoded = run TaskCaches.encode(&entry)
+  let decoded = run TaskCaches.decode(Bytes.asSlice(&encoded))
+  match move decoded {
+    Option<Entry>.Some { value } => {
+      run Testing.expect(value.status == 1, "the status survives")
+      run Testing.expect(same(Bytes.asSlice(&value.output), b"out\nput"), "the output survives")
+      run Testing.expect(same(Bytes.asSlice(&value.errors), b"error: x\n"), "the errors survive")
+      let restored = List<Artifact>.asSlice(&value.artifacts)
+      run Testing.expect(restored.length == 2, "both artifacts survive")
+      run Testing.expect(same(Bytes.asSlice(&restored[0].path), b"../build/app") && same(Bytes.asSlice(&restored[0].bytes), b"\x00\x01binary\n"), "an artifact keeps its path and bytes")
+      run Testing.expect(same(Bytes.asSlice(&restored[1].path), b"empty") && Bytes.length(&restored[1].bytes) == 0, "an empty artifact survives")
+    }
+    Option<Entry>.None => {
+      run Testing.expect(false, "an encoded entry decodes")
+    }
+  }
+  let text = Bytes.asSlice(&encoded)
+  let cut = run TaskCaches.decode(Slice.view<u8>(text, usize.ZERO, text.length - usize.ONE))
+  run Testing.expect(Option<Entry>.isNone(&cut), "a truncated entry is refused")
+  let other = run TaskCaches.decode(b"silk-task 2\nstatus 0\n")
+  run Testing.expect(Option<Entry>.isNone(&other), "another version is refused")
+}
+
+test effect fn optionsSortIntoSelectionSharedAndOwn() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run sorts() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn sorts() -> () ! AssertionError<'static> | OutOfMemoryError ? &mut Allocator {
+  let given = run words(&[b"-p", b"app", b"--quiet", b"--target", b"wasm32-wasi", b"--release", b"--filter", b"--target", b"--stdlib=../std", b"--workspace", b"--root", b"src/tests.silk"])
+  let sorted = run TaskCaches.split(b"test", List<Bytes>.asSlice(&given))
+  run Testing.expect(holds(&sorted.selection, &[b"-p", b"app", b"--workspace"]), "packages are selection")
+  run Testing.expect(holds(&sorted.shared, &[b"--target", b"wasm32-wasi", b"--release", b"--stdlib=../std", b"--root", b"src/tests.silk"]), "what a build reads is shared, and a test root with it")
+  run Testing.expect(holds(&sorted.own, &[b"--quiet", b"--filter", b"--target"]), "a filter keeps its value, even one that looks like an option")
+  let checked = run TaskCaches.split(b"check", List<Bytes>.asSlice(&run words(&[b"--root", b"x.silk"])))
+  run Testing.expect(holds(&checked.own, &[b"--root", b"x.silk"]), "only a test hashes another root")
+}
+
+test effect fn keysFollowTheCommandItsOutputOptionsAndTheHash() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run keys() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn keys() -> () ! AssertionError<'static> | OutOfMemoryError ? &mut Allocator {
+  let none = List<Bytes>.make()
+  let quiet = run words(&[b"--quiet"])
+  let split = run words(&[b"a", b"b"])
+  let joined = run words(&[b"a\nb"])
+  let base = run TaskCaches.key(b"check", List<Bytes>.asSlice(&none), b"aa")
+  run Testing.expect(Bytes.length(&base) == 64, "a key is a SHA-256 in hexadecimal")
+  run Testing.expect(same(Bytes.asSlice(&base), Bytes.asSlice(&run TaskCaches.key(b"check", List<Bytes>.asSlice(&none), b"aa"))), "a key is stable")
+  run Testing.expect(!same(Bytes.asSlice(&base), Bytes.asSlice(&run TaskCaches.key(b"build", List<Bytes>.asSlice(&none), b"aa"))), "the command changes the key")
+  run Testing.expect(!same(Bytes.asSlice(&base), Bytes.asSlice(&run TaskCaches.key(b"check", List<Bytes>.asSlice(&quiet), b"aa"))), "an output option changes the key")
+  run Testing.expect(!same(Bytes.asSlice(&base), Bytes.asSlice(&run TaskCaches.key(b"check", List<Bytes>.asSlice(&none), b"ab"))), "the hash changes the key")
+  run Testing.expect(!same(Bytes.asSlice(&run TaskCaches.key(b"check", List<Bytes>.asSlice(&split), b"aa")), Bytes.asSlice(&run TaskCaches.key(b"check", List<Bytes>.asSlice(&joined), b"aa"))), "options cannot run together")
+}
+
+test effect fn artifactPathsMoveWithTheProject() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run moves() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn moves() -> () ! AssertionError<'static> | OutOfMemoryError ? &mut Allocator {
+  run Testing.expect(same(Bytes.asSlice(&run TaskCaches.relative(b"/w/app", b"/w/app/build/x")), b"build/x"), "below the package")
+  run Testing.expect(same(Bytes.asSlice(&run TaskCaches.relative(b"/w/app", b"/w/build/x")), b"../build/x"), "in a workspace output directory")
+  run Testing.expect(same(Bytes.asSlice(&run TaskCaches.relative(b"/w/app", b"/w/apps/x")), b"../apps/x"), "a sibling sharing a prefix")
+  run Testing.expect(same(Bytes.asSlice(&run TaskCaches.placed(b"/v/app", b"../build/x")), b"/v/build/x"), "climbing out of the package")
+  run Testing.expect(same(Bytes.asSlice(&run TaskCaches.placed(b"/v/app", b"build/x")), b"/v/app/build/x"), "below the package")
+  run Testing.expect(same(Bytes.asSlice(&run TaskCaches.placed(b"/v/app", b"/abs/x")), b"/abs/x"), "an absolute path stays")
+  run Testing.expect(TaskCaches.keeps(b"check", 1) && TaskCaches.keeps(b"build", 0) && !TaskCaches.keeps(b"build", 1) && !TaskCaches.keeps(b"test", 1) && !TaskCaches.keeps(b"check", 2), "only results worth keeping are saved")
+}
+
+// A store in memory.
+struct MemoryStore {
+  keys: List<Bytes>,
+  entries: List<Bytes>,
+}
+
+impl MemoryStore {
+  effect fn load(self: &mut Self, key: &[u8]) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+    let listed = List<Bytes>.asSlice(&self.keys)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      if same(Bytes.asSlice(&listed[at]), key) {
+        return Option<Bytes>.some(run Bytes.copy(Bytes.asSlice(&List<Bytes>.asSlice(&self.entries)[at])))
+      }
+      at = at + usize.ONE
+    }
+    return Option<Bytes>.none()
+  }
+
+  effect fn save(self: &mut Self, key: &[u8], entry: &[u8]) -> bool ! OutOfMemoryError ? &mut Allocator {
+    run List<Bytes>.append(&mut self.keys, run Bytes.copy(key))
+    run List<Bytes>.append(&mut self.entries, run Bytes.copy(entry))
+    return true
+  }
+}
+
+impl TaskStore for MemoryStore {
+  load: MemoryStore.load
+  save: MemoryStore.save
+}
+
+// A compiler that hashes `app` and `lib` to the hashes in `hashes`, and checks each with status 1.
+struct FakeCompiler {
+  runs: List<Bytes>,
+  hash: Bytes,
+}
+
+impl FakeCompiler {
+  effect fn execute(self: &mut Self, request: &ProcessRequest) -> ProcessOutcome ! ProcessError | OutOfMemoryError ? &mut Allocator {
+    let arguments = ChildProcess.arguments(request)
+    let mut line = run Bytes.copy(arguments)
+    run List<Bytes>.append(&mut self.runs, move line)
+    if arguments.length >= 4 && same(Slice.view<u8>(arguments, usize.ZERO, 4), b"hash") {
+      let mut document = run Bytes.copy(b"{\"packages\":[{\"name\":\"app\",\"directory\":\"/w/app\",\"hash\":\"")
+      run Bytes.append(&mut document, Bytes.asSlice(&self.hash))
+      run Bytes.append(&mut document, b"\",\"artifacts\":[]},{\"name\":\"lib\",\"directory\":\"/w/lib\",\"hash\":\"22\",\"artifacts\":[]}]}\n")
+      return ChildProcess.exited(0, move document, Bytes.make())
+    }
+    return ChildProcess.exited(1, run Bytes.copy(b"checked\n"), run Bytes.copy(b"error: one\n"))
+  }
+}
+
+impl ChildProcess for FakeCompiler {
+  execute: FakeCompiler.execute
+}
+
+test effect fn aSecondRunReplaysWithoutTheCompiler() -> () ! AssertionError<'static> | FileError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run replays() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn replays() -> () ! AssertionError<'static> | FileError | OutOfMemoryError ? &mut Allocator {
+  let mut store = MemoryStore { keys: List<Bytes>.make(), entries: List<Bytes>.make() }
+  let mut compiler = FakeCompiler { runs: List<Bytes>.make(), hash: run Bytes.copy(b"11") }
+  let mut files = run MachineFileSystem.make()
+  let mut host = NativeHostFiles.at(b"/")
+  let silkc = run Path.fromBytes(b"/fake/silkc")
+  let given = run words(&[b"check", b"--workspace", b"--quiet"])
+  let environment = run words(&[b"PATH", b"/bin"])
+  let first = run TaskCaches.cached(&silkc, List<Bytes>.asSlice(&environment), List<Bytes>.asSlice(&given))
+    |> Effect.provideMut<TaskStore>(&mut store) |> Effect.provideMut<ChildProcess>(&mut compiler)
+    |> Effect.provideMut<FileSystem>(&mut files) |> Effect.provideMut<HostFiles>(&mut host)
+  let ran = List<Bytes>.length(&compiler.runs)
+  run Testing.expect(ran == 3, "a miss hashes once and checks each package alone")
+  run Testing.expect(contains(Bytes.asSlice(&List<Bytes>.asSlice(&compiler.runs)[1]), b"--package\x00app\x00--quiet"), "each package is selected by name")
+  match move first {
+    Option<Outcome>.Some { value } => {
+      run Testing.expect(value.status == 1, "the check's status is kept")
+      run Testing.expect(same(Bytes.asSlice(&value.output), b"checked\nchecked\n"), "each package's output is written")
+    }
+    Option<Outcome>.None => {
+      run Testing.expect(false, "a hashed check runs cached")
+    }
+  }
+  run Testing.expect(List<Bytes>.length(&store.keys) == 2, "a check that found errors is saved")
+  let second = run TaskCaches.cached(&silkc, List<Bytes>.asSlice(&environment), List<Bytes>.asSlice(&given))
+    |> Effect.provideMut<TaskStore>(&mut store) |> Effect.provideMut<ChildProcess>(&mut compiler)
+    |> Effect.provideMut<FileSystem>(&mut files) |> Effect.provideMut<HostFiles>(&mut host)
+  run Testing.expect(List<Bytes>.length(&compiler.runs) == ran + usize.ONE, "a hit only hashes")
+  match move second {
+    Option<Outcome>.Some { value } => {
+      run Testing.expect(value.status == 1 && same(Bytes.asSlice(&value.output), b"checked\nchecked\n"), "a hit replays the status and output")
+      run Testing.expect(contains(Bytes.asSlice(&value.errors), b"error: one\n") && contains(Bytes.asSlice(&value.errors), b"replayed `check` of lib"), "a hit replays the errors and says so")
+    }
+    Option<Outcome>.None => {
+      run Testing.expect(false, "a hit replays")
+    }
+  }
+  compiler.hash = run Bytes.copy(b"12")
+  let third = run TaskCaches.cached(&silkc, List<Bytes>.asSlice(&environment), List<Bytes>.asSlice(&given))
+    |> Effect.provideMut<TaskStore>(&mut store) |> Effect.provideMut<ChildProcess>(&mut compiler)
+    |> Effect.provideMut<FileSystem>(&mut files) |> Effect.provideMut<HostFiles>(&mut host)
+  drop third
+  run Testing.expect(List<Bytes>.length(&compiler.runs) == ran + usize.add(0, 3), "a changed package runs again, and only it")
+}
