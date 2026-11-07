@@ -565,6 +565,11 @@ These are compiler architecture rules, not additional source obligations:
   destinations, and their cancellation cleanup runs before the caller's cleanup. Explicit
   suspension boundaries, recursive calls, `@inlineNever`, source line tables, and bodies whose
   own observed traps or failures need their source sites retain their call boundaries.
+- Small synchronous value-forwarding callbacks can also be inlined before frame layout. A call
+  whose result becomes a variant's sole payload can write that payload in place when no borrow,
+  drop, failure path, or cancellation path can observe the variant before it is initialized.
+  The success continuation commits the tag after the producer finishes; ordinary `map` callbacks
+  still execute their transformation.
 - Every resume state names only the values needed after that transfer. One statically known maximum
   layout covers all mutually exclusive states, including compiler-generated temporaries.
 - A suspendable specialization's frame identity includes its complete specialization key,

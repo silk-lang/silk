@@ -33,9 +33,13 @@ without entering the intervening combinators. Counting all emitted `$enter` defi
 a frame-count measurement: definitions retained by the compilation worklist may be unused by the
 executed path. The generated IR also shows whether payload moves survive as `llvm.memcpy` calls.
 
-The first local comparison used the compiler at `bcef1ff39` as the baseline, the same stdlib,
-speed optimization, and the default observed runtime on aarch64 macOS. Both executables completed
-the checksum. The benchmark loop's call chain bypassed four combinator frames and reached
-`step$enter` directly. Aggregate copy elimination is still incomplete: LLVM 22.1.8 at `-O3`
-retained two 256-byte copies on the inlined success path. This change establishes frame removal;
-it does not establish zero-copy Result construction or an HTTP instruction/cache improvement.
+The comparison in [results.md](results.md) uses the compiler at `bcef1ff39` as the baseline,
+the same stdlib at `37ba70d15`, speed optimization, and the default observed runtime.
+Both executables complete the checksum. The benchmark loop bypasses four combinator frames and
+reaches `step$enter` directly. Small value-forwarding callbacks are exposed before layout, and the
+producer writes the final Result payload. LLVM 22.1.8 at `-O2` leaves no `memcpy` or `memmove` in
+that loop's success continuation. This does not imply that arbitrary transforming callbacks or
+every owned aggregate elsewhere in the HTTP stack are copy-free.
+
+The [HTTP comparison](http/README.md) exercises the current `NativeHttp.sendAll` against a local
+Hyper server, with a Hyper client using the same request count, concurrency, and response body.
