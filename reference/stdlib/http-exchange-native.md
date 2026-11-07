@@ -116,7 +116,7 @@ pub fn main() -> i32 {
 
 Import as `HttpExchangeNative` with `import silk.http.exchange_native as HttpExchangeNative`.
 
-Public declarations: 18.
+Public declarations: 19.
 
 <a id="NativeRoute"></a>
 
@@ -584,6 +584,44 @@ connection keeps no deadline. Close it, or give it to another owner such as a po
 - `UnsupportedDeadline` if the host of `origin` is a name and a deadline is set.
 - `ResolverError`, `NativeSocketError`, `ConnectionError`, and `IdentityError` from resolution,
   the socket, TLS, and the certificate check.
+
+### Gotchas
+Only Darwin on x86_64 or aarch64, and Linux with GNU libc on x86_64 or aarch64, are supported. On other
+targets, a call fails to compile.
+
+<a id="acquireResolvedOwned"></a>
+
+## `acquireResolvedOwned`
+
+```silk
+pub effect fn acquireResolvedOwned(
+  origin: Origin,
+  endpoints: &[Endpoint],
+  options: Options,
+  limits: Limits,
+  preparedTrust: Option<TrustSnapshot>,
+  acquisitionDeadline: Option<Instant>,
+) -> Connection<NativeTransport>
+! NativeExchangeError | ExchangeError | NativeSocketError | ConnectionError | IdentityError | OutOfMemoryError
+? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random
+```
+
+Opens a direct TCP or HTTPS connection to `origin` at one of `endpoints`, and returns it.
+
+### When to use
+Use it to open several connections to one origin with one name lookup: resolve the host once,
+for example with `silk.net.resolver_native`, and give the same endpoints to each call.
+
+### Details
+It works like [`acquireOwned`](#acquireOwned), but it does not resolve the host of `origin`. It tries
+`endpoints` in order. The host of `origin` still names the server for TLS and the certificate
+check, so give endpoints of that host.
+
+### Errors
+- `NativeExchangeError.TrustRequired` if `origin` uses `https` and `preparedTrust` is none.
+- `NativeSocketError.Timeout` if the deadline has passed.
+- `NativeSocketError`, `ConnectionError`, and `IdentityError` from the socket, TLS, and the
+  certificate check.
 
 ### Gotchas
 Only Darwin on x86_64 or aarch64, and Linux with GNU libc on x86_64 or aarch64, are supported. On other

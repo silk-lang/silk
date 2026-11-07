@@ -130,7 +130,8 @@ import silk.concurrency.scheduler {Scheduler, TaskIdExhaustedError}
 import silk.core.option {Option}
 import silk.core.ownership {Copy}
 import silk.system.random {Random}
-import silk.net.resolver {ResolverError}
+import silk.net.resolver {ResolveRequest, ResolvedEndpoints, Resolver, ResolverError}
+import silk.net.address {Endpoint}
 import silk.core.result {Result}
 import silk.collections.slice {Slice}
 import silk.text.string {String}
@@ -222,6 +223,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   import silk.system.monotonic_clock_native {OsMonotonicClock}
   import silk.system.random_native {OsRandom}
   import silk.net.socket_native {NativeSocketError}
+  import silk.net.resolver_native {NativeSystemResolver}
   import silk.system.system_clock_native {OsSystemClock}
 
   /// The default deadline for one request, in seconds.
@@ -1247,14 +1249,20 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   // connection is about 16 KB by value; keeping it out of `exchangeKept` keeps that out of the frame
   // every request carves.
   @inlineNever
-  effect fn connectIdle(idle: &mut List<Box<IdleConnection>>, origin: &Origin, options: &Options, limits: &Limits) -> usize
+  // `endpoints` are addresses of the host of `origin` that a worker of `sendAll` resolved before,
+  // or empty, and then the connection resolves the host.
+  effect fn connectIdle(idle: &mut List<Box<IdleConnection>>, origin: &Origin, endpoints: &List<Endpoint>, options: &Options, limits: &Limits) -> usize
   ! NativeExchangeError | ExchangeError | ResolverError | NativeSocketError | ConnectionError | IdentityError | TrustSourceError | OutOfMemoryError
   ? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random | &mut TrustSource {
     let mut trust = Option<TrustSnapshot>.none()
     if Origin.secure(origin) {
       trust = Option<TrustSnapshot>.some(run TrustSource.load(options.trust))
     }
-    let connection = run ExchangeNative.acquireOwned(origin.*, copyOptions(options), limits.*, move trust, Option<Instant>.none())
+    let connection = if List<Endpoint>.length(&endpoints.*) == usize.ZERO {
+      run ExchangeNative.acquireOwned(origin.*, copyOptions(options), limits.*, move trust, Option<Instant>.none())
+    } else {
+      run ExchangeNative.acquireResolvedOwned(origin.*, List<Endpoint>.asSlice(&endpoints.*), copyOptions(options), limits.*, move trust, Option<Instant>.none())
+    }
     if List<Box<IdleConnection>>.length(&idle.*) >= MAX_IDLE {
       run discard(&mut idle.*, usize.ZERO)
     }
@@ -1301,7 +1309,8 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     }
     // Only a new connection loads trust, so the trust source wraps the connect alone and not the
     // exchange on a kept connection.
-    let index = run connectIdle(&mut idle.*, origin, options, limits) |> Effect.provideMut<TrustSource>(&mut trust.*)
+    let unresolved = List<Endpoint>.make()
+    let index = run connectIdle(&mut idle.*, origin, &unresolved, options, limits) |> Effect.provideMut<TrustSource>(&mut trust.*)
     // The exchange runs straight on the kept connection, without a helper frame between.
     let callback = effect fn(live: &mut Live<NativeTransport>) -> Received
     ! HttpError | ExchangeError | OutOfMemoryError
@@ -1617,6 +1626,10 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     // The client's trust source, which every worker loads from. A load takes it out and puts it
     // back without suspending.
     trust: Option<CachedTrust>,
+    // The endpoints of each origin that a worker resolved in this batch, so that the batch looks
+    // up each host once rather than once for each new connection. The system lookup blocks the
+    // thread, so each one stalls every worker.
+    resolved: List<ResolvedOrigin>,
   }
 
   // A job for a worker, and the request it belongs to.
@@ -1688,7 +1701,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     if open < MAX_IDLE {
       run List<Box<IdleConnection>>.reserveExact(&mut pool, MAX_IDLE - open)
     }
-    let state = run Shared<BatchState>.make(BatchState {pool: move pool, trust: move trust})
+    let state = run Shared<BatchState>.make(BatchState {pool: move pool, trust: move trust, resolved: List<ResolvedOrigin>.make()})
     let mut queues = List<Sender<Indexed>>.make()
     run List<Sender<Indexed>>.reserveExact(&mut queues, workers)
     // The workers without a job.
@@ -1867,6 +1880,77 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
 
   fn putSource(state: &mut BatchState, source: CachedTrust) -> () {
     state.trust = Option<CachedTrust>.some(move source)
+  }
+
+  // An origin and its endpoints.
+  struct ResolvedOrigin {
+    origin: Origin,
+    endpoints: ResolvedEndpoints,
+  }
+
+  // Takes the endpoints of `origin` out of the batch state, if a worker resolved it.
+  fn takeEndpoints(state: &mut BatchState, origin: Origin) -> Option<ResolvedEndpoints> {
+    let kept = List<ResolvedOrigin>.asSlice(&state.resolved)
+    let mut index = usize.ZERO
+    while index < kept.length {
+      if Origin.equals(&kept[index].origin, &origin) {
+        drop kept
+        let ResolvedOrigin {origin: _found, endpoints} = List<ResolvedOrigin>.remove(&mut state.resolved, index)
+        return Option<ResolvedEndpoints>.some(move endpoints)
+      }
+      index = index + usize.ONE
+    }
+    return Option<ResolvedEndpoints>.none()
+  }
+
+  // Keeps the endpoints of `origin` for the later workers of the batch.
+  effect fn keepEndpoints(state: &Shared<BatchState>, origin: Origin, endpoints: ResolvedEndpoints) -> () ! OutOfMemoryError ? &mut Allocator {
+    // The append needs the allocator, so the list is reserved first and the move into it does not
+    // allocate.
+    let reserved = Shared<BatchState>.withMut<bool>(&state.*, hasRoomForEndpoints)
+    if !reserved {
+      let mut grown = Shared<BatchState>.withMut<List<ResolvedOrigin>>(&state.*, takeResolved)
+      run List<ResolvedOrigin>.reserve(&mut grown, usize.ONE)
+      Shared<BatchState>.withMut<()>(&state.*, putResolved(move grown))
+    }
+    Shared<BatchState>.withMut<()>(&state.*, addEndpoints(ResolvedOrigin {origin: origin, endpoints: move endpoints}))
+  }
+
+  fn hasRoomForEndpoints(state: &mut BatchState) -> bool {
+    return List<ResolvedOrigin>.length(&state.resolved) < List<ResolvedOrigin>.capacity(&state.resolved)
+  }
+
+  fn takeResolved(state: &mut BatchState) -> List<ResolvedOrigin> {
+    return Intrinsic.replace(state.resolved, List<ResolvedOrigin>.make())
+  }
+
+  fn putResolved(state: &mut BatchState, resolved: List<ResolvedOrigin>) -> () {
+    state.resolved = move resolved
+  }
+
+  fn addEndpoints(state: &mut BatchState, entry: ResolvedOrigin) -> () {
+    let _added = List<ResolvedOrigin>.appendWithinCapacity(&mut state.resolved, move entry)
+  }
+
+  // Resolves the host of `origin` as `ExchangeNative.acquireOwned` does.
+  effect fn resolveOrigin(origin: &Origin, options: &Options) -> ResolvedEndpoints ! ResolverError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock {
+    let request = match move ResolveRequest.make(Origin.host(origin), Origin.port(origin), options.family, options.maximumAddresses, Option<Instant>.none()) {
+      Result.Success {value} => move value
+      Result.Failure {error} => { fail move error }
+    }
+    let mut resolver = NativeSystemResolver.make()
+    return run Resolver.resolve(&request) |> Effect.provideMut<Resolver>(&mut resolver)
+  }
+
+  effect fn copyEndpoints(endpoints: &ResolvedEndpoints) -> List<Endpoint> ! OutOfMemoryError ? &mut Allocator {
+    let values = ResolvedEndpoints.asSlice(endpoints)
+    let mut copied = run List<Endpoint>.makeWithCapacity(values.length)
+    let mut index = usize.ZERO
+    while index < values.length {
+      let _added = List<Endpoint>.appendWithinCapacity(&mut copied, values[index])
+      index = index + usize.ONE
+    }
+    return move copied
   }
 
   fn hasSource(state: &BatchState) -> bool {
@@ -2079,7 +2163,27 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     let options = requestOptions(job.timeoutNanoseconds)
     let limits = limitsFor(job.maxBody)
     let origin = job.request.origin()
-    return run connectIdle(&mut idle.*, &origin, &options, &limits) |> Effect.provideMut<TrustSource>(&mut trust.*)
+    let mut endpoints = List<Endpoint>.make()
+    if let JobTrust.Batch {state} = &trust.* {
+      let shared = Shared<BatchState>.clone(&state)
+      endpoints = run batchEndpoints(&shared, &origin, &options)
+    }
+    return run connectIdle(&mut idle.*, &origin, &endpoints, &options, &limits) |> Effect.provideMut<TrustSource>(&mut trust.*)
+  }
+
+  // The endpoints of `origin` for a new connection of a batch: the ones an earlier worker
+  // resolved, or a new lookup, which the later workers then use.
+  effect fn batchEndpoints(state: &Shared<BatchState>, origin: &Origin, options: &Options) -> List<Endpoint>
+  ! ResolverError | OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock {
+    let cached = Shared<BatchState>.withMut<Option<ResolvedEndpoints>>(&state.*, takeEndpoints(origin.*))
+    let endpoints = match move cached {
+      Option.Some {value} => move value
+      Option.None => run resolveOrigin(origin, options)
+    }
+    let copied = run copyEndpoints(&endpoints)
+    run keepEndpoints(&state.*, origin.*, move endpoints)
+    return move copied
   }
 
   enum Slot {
