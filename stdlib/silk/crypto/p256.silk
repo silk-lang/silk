@@ -291,6 +291,8 @@ import silk.crypto.hmac {Hmac, HmacSha256}
 import silk.collections.slice {Slice}
 import silk.crypto.digest {Digest}
 import silk.crypto.sha2 {Sha256}
+import silk.core.target {Arch, Target}
+import silk.simd.cpu {CpuFeatures}
 import silk.system.random {Random}
 import silk.core.result {Result}
 import silk.num.u8
@@ -734,11 +736,12 @@ fn addCarry(left: u64, right: u64, carry: u64) -> Wide {
 
 // left - right - borrow, with the borrow out in `high`.
 fn subBorrow(left: u64, right: u64, borrow: u64) -> Wide {
-  let total = u64.wrappingSubtract(u64.wrappingSubtract(left, right), borrow)
-  // The borrow out is the top bit of (~left & right) | (~(left ^ right) & total).
-  let taken = u64.bitAnd(u64.bitNot(left), right)
-  let kept = u64.bitAnd(u64.bitNot(u64.bitXor(left, right)), total)
-  return Wide {low: total, high: u64.shiftRight(u64.bitOr(taken, kept), 63)}
+  // Written as two compares, the same shape as `addCarry`, so LLVM selects a `sbb` chain.
+  let difference = u64.wrappingSubtract(left, right)
+  let first: u64 = if left < right { 1 } else { 0 }
+  let total = u64.wrappingSubtract(difference, borrow)
+  let second: u64 = if difference < borrow { 1 } else { 0 }
+  return Wide {low: total, high: u64.bitOr(first, second)}
 }
 
 // left + right, with the carry out of the top limb.
@@ -1175,7 +1178,8 @@ fn pointAdd(left: Point, right: Point) -> Point {
 // with explicit branches.
 
 // Doubling for a = -3: Bernstein and Lange, dbl-2001-b (3M + 5S).
-fn jacobianDouble(point: Point) -> Point {
+@inlineAlways
+fn doubleBody(point: Point) -> Point {
   if nonzero(point.z) == 0 { return point }
   let delta = square(point.z)
   let gamma = square(point.y)
@@ -1194,7 +1198,8 @@ fn jacobianDouble(point: Point) -> Point {
 }
 
 // `point` plus the affine point (x, y), which is not the identity: madd-2007-bl (7M + 4S).
-fn jacobianAddAffine(point: Point, x: Field, y: Field) -> Point {
+@inlineAlways
+fn addAffineBody(point: Point, x: Field, y: Field) -> Point {
   if nonzero(point.z) == 0 { return Point {x: x, y: y, z: one()} }
   let z1z1 = square(point.z)
   let u2 = mul(x, z1z1)
@@ -1219,7 +1224,8 @@ fn jacobianAddAffine(point: Point, x: Field, y: Field) -> Point {
 }
 
 // The sum of two Jacobian points: add-2007-bl (11M + 5S).
-fn jacobianAdd(left: Point, right: Point) -> Point {
+@inlineAlways
+fn addBody(left: Point, right: Point) -> Point {
   if nonzero(left.z) == 0 { return right }
   if nonzero(right.z) == 0 { return left }
   let z1z1 = square(left.z)
@@ -1243,6 +1249,70 @@ fn jacobianAdd(left: Point, right: Point) -> Point {
   let y = sub(mul(r, sub(v, x)), add(s1j, s1j))
   let z = mul(sub(sub(square(add(left.z, right.z)), z1z1), z2z2), h)
   return Point {x: x, y: y, z: z}
+}
+
+fn jacobianDouble(point: Point) -> Point {
+  return doubleBody(point)
+}
+
+fn jacobianAddAffine(point: Point, x: Field, y: Field) -> Point {
+  return addAffineBody(point, x, y)
+}
+
+fn jacobianAdd(left: Point, right: Point) -> Point {
+  return addBody(left, right)
+}
+
+// The same point formulas compiled with BMI2, whose `mulx` takes either multiplicand from any
+// register and leaves the flags alone, so the word products need far fewer moves around `rdx:rax`.
+// Verification picks them once per call when the CPU has the feature; their results are the same.
+static if Target.arch() == Arch.X86_64 {
+  @features("bmi2")
+  unsafe fn jacobianDoubleBmi2(point: Point) -> Point {
+    return doubleBody(point)
+  }
+
+  @features("bmi2")
+  unsafe fn jacobianAddAffineBmi2(point: Point, x: Field, y: Field) -> Point {
+    return addAffineBody(point, x, y)
+  }
+
+  @features("bmi2")
+  unsafe fn jacobianAddBmi2(left: Point, right: Point) -> Point {
+    return addBody(left, right)
+  }
+}
+
+// Whether verification may use the BMI2 point formulas.
+fn fastPoints() -> bool {
+  static if Target.arch() == Arch.X86_64 {
+    return CpuFeatures.available("bmi2")
+  }
+  return false
+}
+
+@inlineAlways
+fn doubleWith(point: Point, fast: bool) -> Point {
+  static if Target.arch() == Arch.X86_64 {
+    if fast { return unsafe jacobianDoubleBmi2(point) }
+  }
+  return jacobianDouble(point)
+}
+
+@inlineAlways
+fn addAffineWith(point: Point, x: Field, y: Field, fast: bool) -> Point {
+  static if Target.arch() == Arch.X86_64 {
+    if fast { return unsafe jacobianAddAffineBmi2(point, x, y) }
+  }
+  return jacobianAddAffine(point, x, y)
+}
+
+@inlineAlways
+fn addWith(left: Point, right: Point, fast: bool) -> Point {
+  static if Target.arch() == Arch.X86_64 {
+    if fast { return unsafe jacobianAddBmi2(left, right) }
+  }
+  return jacobianAdd(left, right)
 }
 
 // The width-5 non-adjacent form of `scalar`, least significant digit first: every digit is zero or
@@ -1298,13 +1368,14 @@ fn multiplyPublic(baseScalar: &([u8; 32]), point: Point, scalar: &([u8; 32])) ->
   let mut digits: [i32; 257] = [0; 257]
   let baseCount = nonAdjacentForm(decode(&baseBytes, 0), &mut baseDigits)
   let count = nonAdjacentForm(decode(&bytes, 0), &mut digits)
+  let fast = fastPoints()
   // table[i] = (2 i + 1) point.
   let mut table: [Point; 8] = [identity(); 8]
   table[0] = point
-  let twice = jacobianDouble(point)
+  let twice = doubleWith(point, fast)
   let mut i: usize = 1
   while i < 8 {
-    table[i] = jacobianAdd(table[i - 1], twice)
+    table[i] = addWith(table[i - 1], twice, fast)
     i = i + 1
   }
   let row = Slice.view<u64>(&BASE_TABLE, usize.ZERO, 120)
@@ -1313,7 +1384,7 @@ fn multiplyPublic(baseScalar: &([u8; 32]), point: Point, scalar: &([u8; 32])) ->
   if count > position { position = count }
   while position > 0 {
     position = position - 1
-    result = jacobianDouble(result)
+    result = doubleWith(result, fast)
     let baseDigit = baseDigits[position]
     if baseDigit != 0 {
       let size = if baseDigit < 0 { 0 - baseDigit } else { baseDigit }
@@ -1322,14 +1393,14 @@ fn multiplyPublic(baseScalar: &([u8; 32]), point: Point, scalar: &([u8; 32])) ->
       let x = Field {limbs: [row[at], row[at + 1], row[at + 2], row[at + 3]]}
       let mut y = Field {limbs: [row[at + 4], row[at + 5], row[at + 6], row[at + 7]]}
       if baseDigit < 0 { y = negate(y) }
-      result = jacobianAddAffine(result, x, y)
+      result = addAffineWith(result, x, y, fast)
     }
     let digit = digits[position]
     if digit != 0 {
       let size = if digit < 0 { 0 - digit } else { digit }
       let mut entry = table[i32.toUsize(size) / 2]
       if digit < 0 { entry.y = negate(entry.y) }
-      result = jacobianAdd(result, entry)
+      result = addWith(result, entry, fast)
     }
   }
   return result
@@ -1835,6 +1906,75 @@ fn parseDer(signature: &[u8]) -> Result<[u8; 64], P256SignatureError> {
 }
 
 // `signature` is the fixed form: r, then s, each 32 bytes big-endian.
+// 1 / value modulo the group order, for a public `value` between 1 and n - 1, by the binary
+// extended Euclidean algorithm. Its running time depends on `value`, so it must never see a
+// secret. Invariants: x1 value = u and x2 value = v modulo n.
+fn publicScalarInverse(value: Field) -> Field {
+  let n = order()
+  let mut u = value
+  let mut v = n
+  let mut x1 = Field {limbs: [1, 0, 0, 0]}
+  let mut x2 = zero()
+  while !isOne(u) && !isOne(v) {
+    while u64.bitAnd(u.limbs[0], 1) == 0 {
+      u = halve(u, 0)
+      x1 = halveModOrder(x1)
+    }
+    while u64.bitAnd(v.limbs[0], 1) == 0 {
+      v = halve(v, 0)
+      x2 = halveModOrder(x2)
+    }
+    if below(u, v) == 0 {
+      u = subModOrder(u, v)
+      x1 = subModOrder(x1, x2)
+    } else {
+      v = subModOrder(v, u)
+      x2 = subModOrder(x2, x1)
+    }
+  }
+  if isOne(u) { return x1 }
+  return x2
+}
+
+fn isOne(value: Field) -> bool {
+  return value.limbs[0] == 1 && u64.bitOr(value.limbs[1], u64.bitOr(value.limbs[2], value.limbs[3])) == 0
+}
+
+// value / 2, with `carry` as bit 256 of `value`.
+fn halve(value: Field, carry: u64) -> Field {
+  return Field {
+    limbs: [
+      u64.bitOr(u64.shiftRight(value.limbs[0], 1), u64.shiftLeft(value.limbs[1], 63)),
+      u64.bitOr(u64.shiftRight(value.limbs[1], 1), u64.shiftLeft(value.limbs[2], 63)),
+      u64.bitOr(u64.shiftRight(value.limbs[2], 1), u64.shiftLeft(value.limbs[3], 63)),
+      u64.bitOr(u64.shiftRight(value.limbs[3], 1), u64.shiftLeft(carry, 63)),
+    ],
+  }
+}
+
+// value / 2 modulo n, for value below n: an odd value is made even by adding n first.
+fn halveModOrder(value: Field) -> Field {
+  if u64.bitAnd(value.limbs[0], 1) == 0 { return halve(value, 0) }
+  let sum = addCarryFields(value, order())
+  return halve(sum.value, sum.carry)
+}
+
+// left - right modulo n, for both below n. The Euclid steps also use it on u and v, where
+// left >= right, so the correction never applies there.
+fn subModOrder(left: Field, right: Field) -> Field {
+  let mut result = zero()
+  let mut borrow: u64 = 0
+  let mut i: usize = 0
+  while i < 4 {
+    let step = subBorrow(left.limbs[i], right.limbs[i], borrow)
+    result.limbs[i] = step.low
+    borrow = step.high
+    i = i + 1
+  }
+  if borrow == 0 { return result }
+  return addCarryFields(result, order()).value
+}
+
 fn verifyScalars(publicPoint: Point, z: Field, signature: &[u8]) -> Result<(), P256SignatureError> {
   if signature.length != 64 {
     return Result<(), P256SignatureError>.failResult(P256SignatureError.InvalidEncoding)
@@ -1844,7 +1984,9 @@ fn verifyScalars(publicPoint: Point, z: Field, signature: &[u8]) -> Result<(), P
   if nonzero(r) == 0 || nonzero(s) == 0 || below(r, order()) == 0 || below(s, order()) == 0 {
     return Result<(), P256SignatureError>.failResult(P256SignatureError.InvalidEncoding)
   }
-  let inverse = scalarInvert(scalarToMontgomery(s))
+  // `s` is public, so a variable-time inversion is safe here, and it costs about a quarter of
+  // the fixed exponentiation that signing uses.
+  let inverse = scalarToMontgomery(publicScalarInverse(s))
   let u1 = encode(scalarFromMontgomery(scalarMul(scalarToMontgomery(z), inverse)))
   let u2 = encode(scalarFromMontgomery(scalarMul(scalarToMontgomery(r), inverse)))
   let result = multiplyPublic(&u1, publicPoint, &u2)
