@@ -45,7 +45,7 @@ import silk.core.option { Option }
 import silk.system.random { Random }
 import silk.core.result { Result }
 import silk.system.system_clock { Instant, SystemClock }
-import silk.tls.client { AlpnConfig, ClientConfig, ClientLimits, Resumption }
+import silk.tls.client { AlpnConfig, CipherOrder, ClientConfig, ClientLimits, Resumption }
 import silk.tls.connection { OwnedConnection, ConnectionOptions, withClient }
 import silk.tls.trust_anchor { TrustAnchor }
 import silk.tls.trust_snapshot { SnapshotLimits, TrustSnapshot }
@@ -167,6 +167,7 @@ effect fn program() -> i32
     resumption: Resumption.Disabled,
     versions: VersionPolicy.defaults(),
     limits: ClientLimits.defaults(),
+    ciphers: CipherOrder.Machine,
   }
   let attempt = withClient<i32, never>(
     move transport,
