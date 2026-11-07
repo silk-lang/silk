@@ -169,6 +169,56 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     }
     impl TrustSource for ConfiguredTrust { load: ConfiguredTrust.loadCurrent }
   } else { type ConfiguredTrust = NativeFileTrustSource }
+
+  // A snapshot that a trust source loaded, and the limits it was loaded with.
+  struct LoadedTrust {
+    limits: TrustLoadLimits,
+    snapshot: TrustSnapshot,
+  }
+
+  // The trust source of a client. It reads and decodes the bundle on the first secure connection
+  // and gives each later connection a copy, so a client with the system bundle of about 150
+  // anchors decodes it once rather than in every handshake. A load with other limits reads the
+  // bundle again.
+  struct CachedTrust {
+    provider: ConfiguredTrust,
+    loaded: Option<LoadedTrust>,
+  }
+
+  impl CachedTrust {
+    fn of(provider: ConfiguredTrust) -> CachedTrust {
+      return CachedTrust {provider: move provider, loaded: Option<LoadedTrust>.none()}
+    }
+
+    effect fn loadCached(self: &mut Self, limits: TrustLoadLimits) -> TrustSnapshot
+    ! TrustSourceError | OutOfMemoryError ? &mut Allocator {
+      if let Option.Some {value} = &self.loaded {
+        if sameLimits(value.limits, limits) { return run copyLoaded(&value.snapshot, limits) }
+      }
+      let fresh = run TrustSource.load(limits) |> Effect.provideMut<TrustSource>(&mut self.provider)
+      let copied = run copyLoaded(&fresh, limits)
+      self.loaded = Option<LoadedTrust>.some(LoadedTrust {limits: limits, snapshot: move fresh})
+      return move copied
+    }
+  }
+
+  impl TrustSource for CachedTrust { load: CachedTrust.loadCached }
+
+  effect fn copyLoaded(snapshot: &TrustSnapshot, limits: TrustLoadLimits) -> TrustSnapshot
+  ! TrustSourceError | OutOfMemoryError ? &mut Allocator {
+    return match move run TrustSnapshot.copy(snapshot, limits.snapshot) {
+      Result<TrustSnapshot, TrustSourceError>.Success {value} => move value
+      Result<TrustSnapshot, TrustSourceError>.Failure {error} => { fail move error }
+    }
+  }
+
+  fn sameLimits(left: TrustLoadLimits, right: TrustLoadLimits) -> bool {
+    return left.snapshot.anchors == right.snapshot.anchors && left.snapshot.encodedBytes == right.snapshot.encodedBytes
+      && left.decode.inputBytes == right.decode.inputBytes && left.decode.certificateBytes == right.decode.certificateBytes
+      && left.decode.totalDerBytes == right.decode.totalDerBytes && left.decode.certificates == right.decode.certificates
+      && left.decode.fieldBytes == right.decode.fieldBytes && left.decode.extensions == right.decode.extensions
+      && left.decode.depth == right.decode.depth && left.decode.nodes == right.decode.nodes
+  }
   import silk.system.monotonic_clock_native {OsMonotonicClock}
   import silk.system.random_native {OsRandom}
   import silk.net.socket_native {NativeSocketError}
@@ -211,7 +261,8 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   /// Windows `ROOT` certificate store. Requests use HTTP/1.1 and send `Accept-Encoding: identity`,
   /// so the body arrives as the server sent it. The next request to an origin reuses an open
   /// connection to it. The client keeps up to 64 open connections, several for one origin when
-  /// requests ran at the same time.
+  /// requests ran at the same time. It reads the trust bundle on its first HTTPS connection and
+  /// keeps the anchors for later ones.
   ///
   /// [`Http.sendAll`] runs up to 32 requests at the same time on one thread, each on its own
   /// connection. Set the number with [`NativeHttp.withConcurrency`].
@@ -224,7 +275,8 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   /// # Gotchas
   ///
   /// The deadline covers the TLS handshake and the HTTP exchange, but not the name lookup and the
-  /// TCP connect. The macOS keychain is not used, only the PEM bundle. [`NativeHttp.make`] reads no
+  /// TCP connect. A change to the trust bundle file takes effect in a new client. The macOS
+  /// keychain is not used, only the PEM bundle. [`NativeHttp.make`] reads no
   /// environment variables, so it never uses a proxy. Only `http://` proxies are supported.
   /// Windows imports root certificates rather than chain-engine policy; revocation, store usage
   /// properties, and disallowed-store entries are not imported.
@@ -238,7 +290,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     redirectValue: usize,
     failOnStatusValue: bool,
     trustChoice: TrustChoice<'config>,
-    trust: Option<ConfiguredTrust>,
+    trust: Option<CachedTrust>,
     clock: OsMonotonicClock,
     random: OsRandom,
     secureProxy: Option<ProxyConfig>,
@@ -248,7 +300,6 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     concurrencyValue: usize,
     // The trust sources that the worker tasks of `sendAll` made, kept for the next round so that a
     // task does not open the PEM bundle path again.
-    workerTrust: List<JobTrust>,
   }
 
   // A direct connection that finished its last exchange and stayed open, kept for the next request
@@ -292,7 +343,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
         redirectValue: DEFAULT_MAX_REDIRECTS,
         failOnStatusValue: false,
         trustChoice: TrustChoice<'config>.Platform,
-        trust: Option<ConfiguredTrust>.none(),
+        trust: Option<CachedTrust>.none(),
         clock: OsMonotonicClock.make(),
         random: OsRandom.make(),
         secureProxy: Option<ProxyConfig>.none(),
@@ -300,7 +351,6 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
         noProxy: Bytes.make(),
         idle: List<Box<IdleConnection>>.make(),
         concurrencyValue: DEFAULT_CONCURRENCY,
-        workerTrust: List<JobTrust>.make(),
       }
     }
 
@@ -443,8 +493,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     pub fn trustBundle(self: Self, path: string<'config>) -> NativeHttp<'config> {
       let mut next = move self
       next.trustChoice = TrustChoice<'config>.Borrowed {path: path}
-      next.trust = Option<ConfiguredTrust>.none()
-      next.workerTrust = List<JobTrust>.make()
+      next.trust = Option<CachedTrust>.none()
       return move next
     }
   }
@@ -529,7 +578,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   effect fn ensureTrust(client: &mut NativeHttp<'_>) -> () ! HttpError | OutOfMemoryError ? &mut Allocator {
     if let Option.Some {..} = &client.trust { return () }
     let plan = run trustPlan(&client.*)
-    client.trust = Option<ConfiguredTrust>.some(run trustOf(&plan))
+    client.trust = Option<CachedTrust>.some(CachedTrust.of(run trustOf(&plan)))
   }
 
   // What a task of `sendAll` needs to make its own trust source.
@@ -1104,7 +1153,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     let deadline = MonotonicClock.deadlineAfter(&now, nanoseconds)
     let options = requestOptions(nanoseconds)
     let payload = Slice.view<u8>(request.bodyBytes(), usize.ZERO, payloadLength)
-    let taken = Intrinsic.replace(client.trust, Option<ConfiguredTrust>.none())
+    let taken = Intrinsic.replace(client.trust, Option<CachedTrust>.none())
     let mut trust = match move taken {
       Option.Some {value} => move value
       Option.None => { fail HttpError.make(HttpErrorKind.Tls, "The trust source is not configured.") }
@@ -1116,14 +1165,14 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
         |> Effect.provideMut<SystemClock>(&mut wall)
         |> Effect.provideMut<MonotonicClock>(&mut client.clock)
         |> Effect.provideMut<Random>(&mut client.random))
-      client.trust = Option<ConfiguredTrust>.some(move trust)
+      client.trust = Option<CachedTrust>.some(move trust)
       return match move result {
         Result.Success {value} => Attempted.Done {received: move value}
         Result.Failure {error} => { fail move error }
       }
     }
     if defer {
-      client.trust = Option<ConfiguredTrust>.some(move trust)
+      client.trust = Option<CachedTrust>.some(move trust)
       drop deadline
       drop options
       // The calls come first, so the request moves straight into the job instead of through a
@@ -1157,13 +1206,13 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
       }
     }
     let exchange = Direct {request: &prepared, body: payload, deadline: &deadline, maxBody: settings.maxBody, idempotent: method.idempotent()}
-    let mut job = JobTrust.Configured {provider: move trust}
+    let mut job = JobTrust.Own {source: move trust}
     let outcome = run Effect.result(exchangeKept(&mut client.idle, slot, &origin, &options, &limits, exchange, &mut job)
       |> Effect.provideMut<SystemClock>(&mut wall)
       |> Effect.provideMut<MonotonicClock>(&mut client.clock)
       |> Effect.provideMut<Random>(&mut client.random))
-    if let JobTrust.Configured {provider} = move job {
-      client.trust = Option<ConfiguredTrust>.some(move provider)
+    if let JobTrust.Own {source} = move job {
+      client.trust = Option<CachedTrust>.some(move source)
     }
     return match move outcome {
       Result.Success {value} => Attempted.Done {received: move value}
@@ -1344,7 +1393,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     route: Route<'configuration>,
     options: Options,
     limits: Limits,
-    trust: &mut ConfiguredTrust,
+    trust: &mut CachedTrust,
     handler: RouteBody<'b>,
   ) -> Received
   ! HttpError | ProxyError | ExchangeError | NativeExchangeError | ResolverError | NativeSocketError | ConnectionError | IdentityError | TrustSourceError | OutOfMemoryError
@@ -1518,11 +1567,11 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   effect fn sendBatch(client: &mut NativeHttp<'_>, all: &[Request<'_>], progress: &mut List<Progress>, going: usize) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
-    // Every job comes from this client, so the batch has one trust plan, and each worker copies
-    // it once rather than each job carrying its own copy of the path.
+    // Every job comes from this client, so the workers share its trust source, and the first
+    // secure job makes it from the plan when the client has none yet.
     let plan = run trustPlan(&client.*)
     let idle = Intrinsic.replace(client.idle, List<Box<IdleConnection>>.make())
-    let trusts = Intrinsic.replace(client.workerTrust, List<JobTrust>.make())
+    let trust = Intrinsic.replace(client.trust, Option<CachedTrust>.none())
     let mut workers = client.concurrencyValue
     if going < workers { workers = going }
     if workers == usize.ZERO { workers = usize.ONE }
@@ -1532,7 +1581,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     let mut clock = OsMonotonicClock.make()
     let mut scheduler = LocalScheduler.make()
     let outcome = run Effect.result(scheduler.execute<Batch, OutOfMemoryError | TaskIdExhaustedError | Cancelled>(
-      runBatch(move view, move idle, move trusts, workers, move plan),
+      runBatch(move view, move idle, move trust, workers, move plan),
     ) |> Effect.provideMut<MonotonicClock>(&mut clock))
     let batch = match move outcome {
       Result.Success {value} => move value
@@ -1543,21 +1592,21 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
         StalledError _stalled => Intrinsic.trap("sendAll: the request tasks stalled")
       }
     }
-    let Batch {idle: kept, trusts: made} = move batch
+    let Batch {idle: kept, trust: made} = move batch
     let previous = Intrinsic.replace(client.idle, move kept)
     drop previous
-    client.workerTrust = move made
+    client.trust = move made
     while List<Box<IdleConnection>>.length(&client.idle) > MAX_IDLE {
       run discard(&mut client.idle, usize.ZERO)
     }
     return ()
   }
 
-  // What the root task of a batch gives back: the connections that stayed open and the trust
-  // sources the workers made.
+  // What the root task of a batch gives back: the connections that stayed open and the client's
+  // trust source.
   struct Batch {
     idle: List<Box<IdleConnection>>,
-    trusts: List<JobTrust>,
+    trust: Option<CachedTrust>,
   }
 
   // The state that the worker tasks of a batch share on its thread.
@@ -1565,9 +1614,9 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     // The open connections that no worker holds. Its capacity has room for `MAX_IDLE`, and a
     // worker that gives one back past that closes the oldest, so adding one never allocates.
     pool: List<Box<IdleConnection>>,
-    // The trust sources of earlier batches. A worker takes one when it starts and gives it back
-    // when it ends; the capacity has room for one from each worker.
-    trusts: List<JobTrust>,
+    // The client's trust source, which every worker loads from. A load takes it out and puts it
+    // back without suspending.
+    trust: Option<CachedTrust>,
   }
 
   // A job for a worker, and the request it belongs to.
@@ -1589,17 +1638,17 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     Close {connection: Box<IdleConnection>},
   }
 
-  effect fn runBatch(view: BatchView, idle: List<Box<IdleConnection>>, trusts: List<JobTrust>, workers: usize, plan: TrustPlan) -> Batch
+  effect fn runBatch(view: BatchView, idle: List<Box<IdleConnection>>, trust: Option<CachedTrust>, workers: usize, plan: TrustPlan) -> Batch
   ! OutOfMemoryError | TaskIdExhaustedError | Cancelled
   ? &mut Scheduler | &mut MonotonicClock {
     let mut allocator = Allocator.systemAllocatorProvider()
-    return run driveBatch(move view, move idle, move trusts, workers, &plan) |> Effect.provideMut<Allocator>(&mut allocator)
+    return run driveBatch(move view, move idle, move trust, workers, &plan) |> Effect.provideMut<Allocator>(&mut allocator)
   }
 
   // The root task of a batch. It steps each request to its next direct job and gives it to a
   // worker without one, and takes each result back as it arrives. A worker gives its connection back when its job ends, so a later job to the
   // same origin reuses it.
-  effect fn driveBatch(view: BatchView, idle: List<Box<IdleConnection>>, trusts: List<JobTrust>, workers: usize, plan: &TrustPlan) -> Batch
+  effect fn driveBatch(view: BatchView, idle: List<Box<IdleConnection>>, trust: Option<CachedTrust>, workers: usize, plan: &TrustPlan) -> Batch
   ! OutOfMemoryError | TaskIdExhaustedError | Cancelled
   ? &mut Scheduler | &mut MonotonicClock | &mut Allocator {
     let BatchView {client: clientAddress, requests: requestsAddress, count, progress: progressAddress} = move view
@@ -1639,12 +1688,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     if open < MAX_IDLE {
       run List<Box<IdleConnection>>.reserveExact(&mut pool, MAX_IDLE - open)
     }
-    let mut sources = move trusts
-    let held = List<JobTrust>.length(&sources)
-    if held < workers {
-      run List<JobTrust>.reserveExact(&mut sources, workers - held)
-    }
-    let state = run Shared<BatchState>.make(BatchState {pool: move pool, trusts: move sources})
+    let state = run Shared<BatchState>.make(BatchState {pool: move pool, trust: move trust})
     let mut queues = List<Sender<Indexed>>.make()
     run List<Sender<Indexed>>.reserveExact(&mut queues, workers)
     // The workers without a job.
@@ -1789,9 +1833,8 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     // A job holds its connection in this list while it runs, and the list keeps its memory for the
     // next job.
     let mut idle = List<Box<IdleConnection>>.make()
-    // The trust source of the first secure job, kept for the later ones and for later batches:
-    // every job comes from one client, so they share its trust configuration.
-    let mut trust = Shared<BatchState>.withMut<JobTrust>(&state, takeTrust)
+    // Every job comes from one client, so the workers share its trust source.
+    let mut trust = JobTrust.Batch {state: Shared<BatchState>.clone(&state)}
     while true {
       let Indexed {index, pending} = match run jobs.receive() {
         Option.None => { break }
@@ -1814,21 +1857,21 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
       let sent = run done.send(Settled {worker: worker, index: index, outcome: move outcome})
       drop sent
     }
-    Shared<BatchState>.withMut<()>(&state, keepTrust(move trust))
+    drop trust
     return ()
   }
 
-  fn takeTrust(state: &mut BatchState) -> JobTrust {
-    return match List<JobTrust>.pop(&mut state.trusts) {
-      Option.None => JobTrust.Plain
-      Option.Some {value} => move value
-    }
+  fn takeSource(state: &mut BatchState) -> Option<CachedTrust> {
+    return Intrinsic.replace(state.trust, Option<CachedTrust>.none())
   }
 
-  fn keepTrust(state: &mut BatchState, trust: JobTrust) -> () {
-    if let JobTrust.Configured {..} = &trust {
-      let _added = List<JobTrust>.appendWithinCapacity(&mut state.trusts, move trust)
-    }
+  fn putSource(state: &mut BatchState, source: CachedTrust) -> () {
+    state.trust = Option<CachedTrust>.some(move source)
+  }
+
+  fn hasSource(state: &BatchState) -> bool {
+    if let Option.Some {..} = &state.trust { return true }
+    return false
   }
 
   fn checkOut(state: &mut BatchState, job: &PendingJob) -> Checkout {
@@ -1849,7 +1892,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   fn finishBatch(state: &mut BatchState) -> Batch {
     return Batch {
       idle: Intrinsic.replace(state.pool, List<Box<IdleConnection>>.make()),
-      trusts: Intrinsic.replace(state.trusts, List<JobTrust>.make()),
+      trust: Intrinsic.replace(state.trust, Option<CachedTrust>.none()),
     }
   }
 
@@ -1882,18 +1925,35 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     drop closed
   }
 
-  // The trust source of one task: none for a plain HTTP origin, which never loads trust.
+  // Where a request loads trust: the client's source, which a request on the calling task holds,
+  // or the batch state that holds it for the workers of `sendAll`.
   union JobTrust {
-    Plain,
-    Configured {provider: ConfiguredTrust},
+    Own {source: CachedTrust},
+    Batch {state: Shared<BatchState>},
   }
 
   impl JobTrust {
     effect fn loadFor(self: &mut Self, limits: TrustLoadLimits) -> TrustSnapshot
     ! TrustSourceError | OutOfMemoryError ? &mut Allocator {
       return match &mut self.* {
-        JobTrust.Plain => Intrinsic.trap("sendAll: a plain HTTP request loaded trust")
-        JobTrust.Configured {provider} => run TrustSource.load(limits) |> Effect.provideMut<TrustSource>(&mut provider)
+        JobTrust.Own {source} => run CachedTrust.loadCached(&mut source, limits)
+        JobTrust.Batch {state} => {
+          // `setUpJob` made the source, and a load does not suspend, so no other worker finds the
+          // state without it.
+          let mut source = match Shared<BatchState>.withMut<Option<CachedTrust>>(&state, takeSource) {
+            Option.None => Intrinsic.trap("sendAll: a request loaded trust before its source was made")
+            Option.Some {value} => move value
+          }
+          let loaded = run Effect.result(CachedTrust.loadCached(&mut source, limits))
+          Shared<BatchState>.withMut<()>(&state, putSource(move source))
+          return match move loaded {
+            Result.Success {value} => move value
+            Result.Failure {error} => match move error {
+              TrustSourceError failure => { fail move failure }
+              OutOfMemoryError exhausted => { fail move exhausted }
+            }
+          }
+        }
       }
     }
   }
@@ -1919,8 +1979,11 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     // A plain HTTP origin never loads trust, so it does not make a trust source.
     let secure = Origin.secure(&Box<PendingJob>.get(&pending)[usize.ZERO].request.origin())
     if secure {
-      if let JobTrust.Plain = &trust.* {
-        trust.* = JobTrust.Configured {provider: run trustOf(plan)}
+      if let JobTrust.Batch {state} = &trust.* {
+        if !Shared<BatchState>.with<bool>(&state, hasSource) {
+          let made = CachedTrust.of(run trustOf(plan))
+          Shared<BatchState>.withMut<()>(&state, putSource(move made))
+        }
       }
     }
     return JobSetup {pending: move pending, slot: slot}
