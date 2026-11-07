@@ -192,16 +192,17 @@ dedicated syntax.
 
 A static value is finite, deterministic, identity-free, and freely reusable during static
 evaluation. Admitted values include unit, foundational scalars, scalar enums, static UTF-8 text,
-and recursively pure aggregates whose members are admitted. Admission excludes values carrying a
-runtime resource, borrow, opaque identity, callable execution, Effect, service, unsafe pointer, or
+recursively pure aggregates whose members are admitted, and shared views of admitted static data:
+a `&'static T` and a `&'static [T]`. Admission excludes values carrying a runtime resource,
+exclusive borrow, opaque identity, callable execution, Effect, service, unsafe pointer, or
 observable cleanup behavior.
 
 Reusing a static value does not grant its declared runtime type the `Copy` property and does not
 change runtime interface selection. When an admitted value is runtime-representable and
 cleanup-free, residualization may embed it directly without retaining compiler storage.
 
-**Boundary:** Static evaluation has no addresses, references, loans, mutable aliases, destructors,
-allocator identities, or observable allocation. It cannot construct or run an Effect, invoke an
+**Boundary:** Static evaluation has no addresses, mutable aliases, destructors, allocator
+identities, or observable allocation. It cannot construct or run an Effect, invoke an
 ordinary runtime function, read a runtime binding, or perform unsafe, external, or host work.
 
 A static function value is a static value. In a static body or a `let static` initializer, a
@@ -222,10 +223,29 @@ static fn calc() -> Command {
 }
 ```
 
+Static data never changes and, once embedded, lives for the whole program, so a static body can
+view it through a shared borrow. `&value` is a `&'static T` and `&[a, b]` or `&array` a
+`&'static [T]`; indexing, `.length`, `.*` and field reads see through the view. Constants can
+therefore hold trees of static data. When a view reaches runtime code, its referent is emitted once
+as immutable program-lifetime storage
+([BORROW-006](ownership-and-borrowing.md#borrow-006--a-borrow-requires-an-owner-not-a-source-level-name))
+and the view is that storage's address. An index past the end of a static array or slice fails the
+evaluation.
+
+```silk
+pub struct Command {
+  pub name: string<'static>,
+  pub subcommands: &'static [&'static Command],
+}
+
+const ADD: Command = Command {name: "add", subcommands: &[]}
+const ROOT: Command = Command {name: "calc", subcommands: &[&ADD]}
+```
+
 **Diagnostics:** Attempting a prohibited operation reports `SEM0176` at that operation and produces
 no static result. Naming an ordinary function, an anonymous function or a bound method value as a
 value in a static body, or partially applying an ordinary function there, reports `SEM0176` at that
-expression. A value outside the admitted domain is rejected at the static boundary rather than
+expression. An exclusive borrow (`&mut`) in a static body reports `SEM0176`. A value outside the admitted domain is rejected at the static boundary rather than
 acquiring a second compile-time ownership model.
 
 **Evidence:** static value requirements,
@@ -249,12 +269,12 @@ static fn countTo(limit: u32) -> u32 {
 }
 ```
 
-**Boundary:** Static mutation cannot take a reference to the slot, project a writable place through
+**Boundary:** Static mutation cannot take an exclusive reference to the slot, project a writable place through
 an alias, mutate one aggregate field in place, partially move a value, observe cleanup, or retain
 the slot in a residual value. A mixed function cannot declare `let static mut`; it computes a new
 static value through a static function instead.
 
-**Diagnostics:** A static borrow, unsupported place mutation, or runtime-dependent replacement
+**Diagnostics:** An exclusive static borrow, unsupported place mutation, or runtime-dependent replacement
 reports `SEM0176` at the invalid operation. The failed evaluation exposes no partial value.
 
 **Evidence:** static mutation limits.
