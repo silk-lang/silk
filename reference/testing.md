@@ -141,9 +141,9 @@ targets, profiles, compiler and runner versions, files, environment, time, and n
 test calls `parse`, editing only `parse` may change the test result while leaving the test's
 fingerprint unchanged.
 
-**Boundary:** The authored fingerprint is never cache authority. `silk test` reuses no test result
-(TEST-008), and it decides whether a built runner is current from every file the build read
-(TEST-009), not from fingerprints.
+**Boundary:** The authored fingerprint is never cache authority. `silk test` reuses a passing run
+only as a whole (TEST-008), and it decides whether a built runner is current from every file the
+build read (TEST-009), not from fingerprints.
 
 **Diagnostics:** No diagnostic applies to observing a fingerprint. Treating it as cache authority
 has no language support.
@@ -234,7 +234,7 @@ The runner identifies each selected test, prints elapsed time for each executed 
 discovered, selected, cached, executed, passed, and failed counts plus total run time. The exchange
 lets a host mark a test as an already passed cache hit, which the runner reports as `CACHED`
 without invoking it and counts in `cached` and `passed`, but not `executed`. `silk test` marks no
-test that way (TEST-008), so its `cached` count is 0. Completed runs return 0 when all selected
+test that way: it reuses a passing run as a whole (TEST-008), so its `cached` count is 0. Completed runs return 0 when all selected
 tests pass, including zero selected tests; they return 1 when a typed test failure or a trapping
 test occurs. Runner or cache-exchange operational failures return 2. Abnormal termination outside a
 test body remains abnormal.
@@ -249,17 +249,20 @@ boundary are compile-time errors even when runtime filters would exclude that te
 [typed failures](typed-failures.md), [requirements and services](requirements-and-services.md),
 [program termination](program-termination-and-reporting.md).
 
-### TEST-008 — Every run executes every selected test
+### TEST-008 — A passing run is not repeated while nothing changed
 
 **Status:** Confirmed
 
-`silk test` stores no test results. Each run executes every selected test, whether or not it
-passed before, so a test that reads files, the environment, the clock, or the network always runs
-against the current state. What a rerun can skip is building the runner (TEST-009). `--no-cache`
-skips that reuse too and builds the runner again.
+`silk test` keeps the output of the last run that passed, beside its runner. A rerun whose runner is
+unchanged (TEST-009), with the same `--file`, `--filter` and `--timeout`, does not run the tests
+again: it prints that run's output, says that nothing changed since the tests passed, and exits 0,
+as a build step whose inputs did not change is not repeated. A run that failed is always repeated.
+Tests run with an empty environment, but a test that reads files outside its imports, the clock or
+the network is not seen to change; `--no-cache` builds the runner again and runs every selected
+test.
 
 ```sh
-silk test             # reuses an unchanged runner, then runs every selected test
+silk test             # reuses an unchanged runner; runs the tests unless they passed unchanged
 silk test --no-cache  # builds the runner again, then runs every selected test
 ```
 
