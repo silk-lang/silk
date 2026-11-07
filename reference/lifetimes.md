@@ -116,8 +116,8 @@ requirement row or a provides premise in an implementation head may still omit a
 which becomes one more implementation lifetime.
 
 In a signature, each omitted lifetime in an input introduces a fresh declaration binder. The
-result defaults follow Rust's elision rules. A borrowed receiver (`self: &Self` or
-`self: &mut Self`) supplies every omitted result lifetime. Without one, if the inputs show exactly
+result defaults follow Rust's elision rules. A borrowed receiver, such as `self: &Self`,
+`self: &mut Self` or a `string` receiver, supplies every omitted result lifetime. Without one, if the inputs show exactly
 one lifetime, written or elided, that lifetime supplies the omitted result lifetimes. A string
 input counts as a borrowed view. Lifetimes inside a callable's or Effect's environment and
 lifetimes carried by a type parameter do not count.
@@ -145,7 +145,8 @@ always sees that a value borrows. A reference or slice may still omit its own li
 there, as in `fn first(values: &'_ [i32]) -> &'_ i32`, elides exactly as the omitted lifetime does.
 `'_` names nothing, so it is refused where a lifetime cannot be elided, such as a bound or a
 lifetime parameter, and a field that writes it is refused as an omitted field lifetime is. Inside a
-body a nominal type may still omit its lifetimes.
+body a nominal type may still omit its lifetimes, and so may a callable contract's parameters and
+result, as in `fn apply(f: fn<'static>(&Span) -> usize)`.
 
 Inside a body, every omitted lifetime is a fresh region of that body, inferred from its uses and
 cleanup: in a local annotation, a literal's or constructor's type arguments (also through an alias),
@@ -157,8 +158,9 @@ relationships never depend on return bodies, setter histories, or which construc
 initialize a field.
 
 **Boundary:** Two input lifetimes with no borrowed receiver require an explicit result
-relationship. A by-value holder's stored view can be returned by naming its data lifetime; elision
-does not reinterpret that stored view as an outer borrowed receiver.
+relationship. A by-value receiver is not a borrowed receiver: `self: View<'_>` beside
+`key: &[u8]` shows two lifetimes and gives no default, so its stored view is returned by naming
+its data lifetime. Alone, its one lifetime is the default.
 
 **Diagnostics:** A field, declaration bound, alias target or implementation head that omits a
 lifetime reports `SEM0210` with the declaration to write, and so do missing or ambiguous output

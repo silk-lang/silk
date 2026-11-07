@@ -2,7 +2,7 @@
 // code at the right place, and a message that names what is wrong.
 import { strict as assert } from 'node:assert'
 import { test } from 'node:test'
-import { initPackage, join, sharedHome, show, silk, write } from './lib.mjs'
+import { initPackage, join, read, sharedHome, show, silk, write } from './lib.mjs'
 
 const h = sharedHome()
 const dir = initPackage(h, 'mistakes')
@@ -84,4 +84,15 @@ test('silk check --json writes one object per diagnostic on standard error', () 
   const objects = result.stderr.trim().split('\n').map((line) => JSON.parse(line))
   assert.deepEqual(objects.map((object) => [object.code, object.line, object.column]), [['SEM0037', 2, 16], ['SEM0006', 3, 10]])
   assert.ok(objects.every((object) => object.path.endsWith('/src/main.silk') && object.severity === 'error'))
+})
+
+test('check --fix writes the lifetimes a signature hides', () => {
+  const source = "struct Span<'a> { text: string<'a> }\nfn width(span: Span) -> usize { return 0 }\nfn pair(left: &Span, right: Span) -> usize { return 0 }\npub fn main() -> i32 { return 0 }\n"
+  write(join(dir, 'src/main.silk'), source)
+  const before = silk(h, ['check', '--quiet'], { cwd: dir })
+  assert.equal(before.status, 1, show(before))
+  assert.match(before.stderr, /error\[SEM0210\].*shows every lifetime/, show(before))
+  const fixed = silk(h, ['check', '--fix', '--quiet'], { cwd: dir })
+  assert.equal(fixed.status, 0, show(fixed))
+  assert.equal(read(join(dir, 'src/main.silk')), "struct Span<'a> { text: string<'a> }\nfn width(span: Span<'_>) -> usize { return 0 }\nfn pair(left: &Span<'_>, right: Span<'_>) -> usize { return 0 }\npub fn main() -> i32 { return 0 }\n")
 })
