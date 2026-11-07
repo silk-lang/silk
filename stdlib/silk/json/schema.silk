@@ -1,0 +1,2003 @@
+//! Compile JSON Schema resources and validate immutable JSON or TOML-derived values.
+//!
+//! # Details
+//!
+//! Supports drafts 4, 6, 7, 2019-09, and 2020-12. Resources are supplied by the caller;
+//! compilation and validation never perform network or filesystem access. Parse source with
+//! `Json.parseExact` or `SchemaValue.parseToml`, then retain the trees while using the
+//! compiled schema. Formats are annotations unless assertion is explicitly enabled.
+//!
+//! @category Data formats
+
+import silk.json.value { Json, Value, JsonEntry, JsonNumber }
+import silk.json.schema_format { SchemaFormat }
+import silk.json.scanner { JsonScanner, JsonToken, JsonError }
+import silk.encoding.base64 { Base64, Base64Error }
+import silk.text.regex { Regex, RegexError, Pattern }
+import silk.text.string { String, InvalidUtf8 }
+import silk.text.format { Format }
+import silk.collections.list { List }
+import silk.collections.bytes { Bytes }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.uri.uri { Uri, OwnedUri }
+import silk.uri.reference { UriReference, ParseError }
+import silk.num.usize
+import silk.uri.percent { UriPercent, PercentComponent, DecodeError }
+import silk.num.u8
+
+/// The JSON Schema dialect used when a resource has no `$schema` declaration.
+pub enum Draft {
+  /// JSON Schema draft 4.
+  Draft4,
+  /// JSON Schema draft 6.
+  Draft6,
+  /// JSON Schema draft 7.
+  Draft7,
+  /// JSON Schema draft 2019-09.
+  Draft201909,
+  /// JSON Schema draft 2020-12.
+  Draft202012,
+}
+
+/// Compilation policy, including the fallback dialect and optional format and content assertions.
+pub struct Options {
+  /// Dialect for a root resource without `$schema`.
+  pub draft: Draft,
+  /// Assert known formats; unknown names remain annotations unless the format-assertion vocabulary is used.
+  pub assertFormats: bool,
+  /// In draft 7, assert `base64` content encoding and `application/json` media type.
+  /// Disabled by default. Unknown encodings and media types remain annotations; in other drafts
+  /// all content keywords remain annotations, regardless of this option.
+  pub assertContent: bool,
+}
+impl Copy for Options {}
+
+/// A caller-supplied schema and its absolute retrieval URI; the tree remains caller-owned.
+pub struct Resource<'a> {
+  /// Absolute retrieval URI, without a fragment.
+  pub uri: string<'a>,
+  /// Immutable schema tree to register.
+  pub schema: &'a Value,
+}
+
+/// The kind of schema, dialect, or reference error; instance failures use `Output` instead.
+pub enum SchemaReason {
+  /// A recognized keyword has an invalid schema value.
+  InvalidSchema,
+  /// The instance tree contains a non-finite number, which is outside the JSON data model.
+  InvalidInstance,
+  /// The declared dialect cannot be resolved to a supported dialect.
+  UnknownDialect,
+  /// A required vocabulary is not implemented.
+  UnknownVocabulary,
+  /// A schema identifier or reference is not a valid URI reference.
+  InvalidUri,
+  /// Two distinct schemas declare the same identifier or anchor.
+  DuplicateIdentifier,
+  /// No supplied schema resource or anchor resolves the reference.
+  UnresolvedReference,
+  /// A reference does not designate a schema.
+  InvalidReference,
+  /// A reference cycle applies a schema to the same instance without progress.
+  NonterminatingReference,
+}
+
+/// A schema compilation or evaluation failure, distinct from an invalid instance.
+pub struct SchemaError {
+  /// Stable category of the failure.
+  pub reason: SchemaReason,
+  /// JSON Pointer to the problematic schema keyword.
+  pub keywordLocation: String,
+  /// Human-readable description, including an unresolved URI when relevant.
+  pub detail: String,
+}
+
+/// One failed keyword evaluation, with the locations used by JSON Schema basic output.
+pub struct Diagnostic {
+  /// Evaluation-path JSON Pointer to the failed keyword.
+  pub keywordLocation: String,
+  /// Absolute URI identifying the failed schema keyword.
+  pub absoluteKeywordLocation: String,
+  /// JSON Pointer identifying the instance value that failed.
+  pub instanceLocation: String,
+  /// Human-readable validation error.
+  pub error: String,
+}
+
+/// A validation result. `Schema.toJson` converts it to the standard basic output representation.
+pub struct Output {
+  /// Whether the complete instance satisfies the schema.
+  pub valid: bool,
+  /// Failed keyword evaluations; empty when `valid` is true.
+  pub errors: List<Diagnostic>,
+}
+
+struct Node<'a> {
+  value: &'a Value,
+  path: String,
+  base: String,
+  resource: usize,
+  document: usize,
+  draft: Draft,
+  validation: bool,
+  applicator: bool,
+  unevaluated: bool,
+  formatAssertion: bool,
+  formatEnabled: bool,
+  metadata: bool,
+  content: bool,
+  pattern: Option<Pattern>,
+  propertyPatterns: List<Pattern>,
+  meta: usize,
+  reference: usize,
+  dynamicReference: usize,
+  dynamicName: String,
+  recursiveReference: usize,
+}
+struct Alias { uri: String, node: usize, dynamic: bool }
+
+/// An indexed schema whose references have been resolved. It borrows all input schema trees.
+///
+/// # Gotchas
+///
+/// Keep the root and every registered schema tree alive and immutable for this value's lifetime.
+/// A compiled schema can validate multiple instances without recompiling its resource graph.
+pub struct CompiledSchema<'a> {
+  nodes: List<Node<'a>>,
+  aliases: List<Alias>,
+  options: Options,
+}
+
+/// Operations for compiling JSON Schema resources and validating instance trees.
+pub struct Schema {}
+
+impl Schema {
+  /// Returns options for `draft`, with format and content assertions disabled.
+  pub fn options(draft: Draft) -> Options {
+    return Options { draft: draft, assertFormats: false, assertContent: false }
+  }
+
+  /// Validates and indexes a root schema and supplied external resources.
+  ///
+  /// # Details
+  ///
+  /// `baseUri` is the absolute retrieval URI of the root. An empty URI gives the root an
+  /// anonymous local base. `$schema` overrides `options.draft`. External resources and custom
+  /// metaschemas must be supplied explicitly; no URI is fetched automatically.
+  ///
+  /// # Errors
+  ///
+  /// - `SchemaError` for an invalid schema, dialect, vocabulary, identifier, or reference.
+  /// - `RegexError` for an invalid regular expression in a schema.
+  /// - `OutOfMemoryError` if schema indexing cannot allocate storage.
+  pub effect fn compile<'a>(schema: &'a Value, baseUri: string,
+    resources: &[Resource<'a>], options: Options) -> CompiledSchema<'a>
+    ! SchemaError | RegexError | OutOfMemoryError ? &mut Allocator {
+    let mut compiled = CompiledSchema<'a> {
+      nodes: List<Node<'a>>.make(), aliases: List<Alias>.make(), options: options,
+    }
+    let mut base = baseUri
+    if base == "" { base = "urn:silk:json-schema:root" }
+    run checkAbsolute(base, "")
+    let root = run indexSchema(&mut compiled, schema, "", base, usize.MAX,
+      usize.MAX, options.draft, resources)
+    run addAlias(&mut compiled, base, root, false)
+    let mut i = usize.ZERO
+    while i < resources.length {
+      run checkAbsolute(resources[i].uri, "")
+      i = i + usize.ONE
+    }
+    i = usize.ZERO
+    while i < List<Node<'a>>.length(&compiled.nodes) {
+      let source = List<Node<'a>>.asSlice(&compiled.nodes)[i].value
+      let baseCopy = run String.copy(String.view(&List<Node<'a>>.asSlice(&compiled.nodes)[i].base))
+      let pathCopy = run String.copy(String.view(&List<Node<'a>>.asSlice(&compiled.nodes)[i].path))
+      let draft = List<Node<'a>>.asSlice(&compiled.nodes)[i].draft
+      let mut reference = usize.MAX
+      let mut dynamicReference = usize.MAX
+      let mut recursiveReference = usize.MAX
+      let mut dynamicName = String.make()
+      let refText = textField(source, "$ref")
+      if hasField(source, "$ref") {
+        let referencePath = run pointer(String.view(&pathCopy), "$ref")
+        reference = run resolveReference(&mut compiled, String.view(&baseCopy), refText,
+          String.view(&referencePath), resources)
+      }
+      if draft == Draft.Draft202012 && hasField(source, "$dynamicRef") {
+        let referencePath = run pointer(String.view(&pathCopy), "$dynamicRef")
+        dynamicReference = run resolveReference(&mut compiled, String.view(&baseCopy),
+          textField(source, "$dynamicRef"), String.view(&referencePath), resources)
+        dynamicName = run decodeFragment(fragment(textField(source, "$dynamicRef")),
+          String.view(&referencePath))
+      }
+      if draft == Draft.Draft201909 && hasField(source, "$recursiveRef") {
+        let referencePath = run pointer(String.view(&pathCopy), "$recursiveRef")
+        recursiveReference = run resolveReference(&mut compiled, String.view(&baseCopy),
+          textField(source, "$recursiveRef"), String.view(&referencePath), resources)
+      }
+      let mut meta = usize.MAX
+      if hasField(source, "$schema") {
+        let metaUri = textField(source, "$schema")
+        match move builtinDialect(metaUri) {
+          Option<Draft>.Some { .. } => {}
+          Option<Draft>.None => {
+            let referencePath = run pointer(String.view(&pathCopy), "$schema")
+            meta = run resolveReference(&mut compiled, String.view(&baseCopy), metaUri,
+              String.view(&referencePath), resources)
+          }
+        }
+      }
+      let node = &mut List<Node<'a>>.asMutSlice(&mut compiled.nodes)[i]
+      node.reference = reference
+      node.dynamicReference = dynamicReference
+      node.dynamicName = move dynamicName
+      node.recursiveReference = recursiveReference
+      node.meta = meta
+      i = i + usize.ONE
+    }
+    i = usize.ZERO
+    while i < List<Node<'a>>.length(&compiled.nodes) {
+      let node = &List<Node<'a>>.asSlice(&compiled.nodes)[i]
+      if node.meta != usize.MAX {
+        let mut context = Context { active: List<Frame>.make(), scope: List<usize>.make() }
+        let checked = run evaluate(&compiled, node.meta, node.value, "", "", &mut context)
+        if !checked.valid {
+          fail run problem(SchemaReason.InvalidSchema, String.view(&node.path),
+            "schema does not satisfy its declared metaschema")
+        }
+      }
+      i = i + usize.ONE
+    }
+    return move compiled
+  }
+
+  /// Applies a compiled schema and returns JSON Schema basic output.
+  ///
+  /// # Errors
+  ///
+  /// - `SchemaError.NonterminatingReference` for a reference cycle without instance progress.
+  /// - `SchemaError.InvalidInstance` if a manually constructed instance contains a non-finite number.
+  /// - `RegexError` if a regular expression cannot be evaluated.
+  /// - `OutOfMemoryError` if evaluation or diagnostics cannot allocate storage.
+  ///
+  /// An invalid instance is not an error effect: the returned `Output.valid` is false.
+  pub effect fn validate(compiled: &CompiledSchema, instance: &Value) -> Output
+    ! SchemaError | RegexError | OutOfMemoryError ? &mut Allocator {
+    if !finiteTree(instance) {
+      fail run problem(SchemaReason.InvalidInstance, "", "instance contains a non-finite number")
+    }
+    let mut context = Context { active: List<Frame>.make(), scope: List<usize>.make() }
+    let evaluated = run evaluate(compiled, usize.ZERO, instance, "", "", &mut context)
+    return Output { valid: evaluated.valid, errors: move evaluated.errors }
+  }
+
+  /// Converts a validation result to a JSON Schema standard basic output tree.
+  ///
+  /// # Details
+  ///
+  /// Includes root and error-unit validity and JSON Pointer locations. Successful output omits
+  /// `errors`; failed output contains the keyword diagnostics. Write the tree with `Json.write`.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the JSON output tree cannot be allocated.
+  pub effect fn toJson(output: &Output) -> Value ! OutOfMemoryError ? &mut Allocator {
+    let mut entries = List<JsonEntry>.make()
+    run List<JsonEntry>.append(&mut entries, JsonEntry {
+      key: run String.copy("valid"), value: Value.Bool { value: output.valid },
+    })
+    run List<JsonEntry>.append(&mut entries, JsonEntry {
+      key: run String.copy("keywordLocation"), value: Value.String { text: String.make() },
+    })
+    run List<JsonEntry>.append(&mut entries, JsonEntry {
+      key: run String.copy("instanceLocation"), value: Value.String { text: String.make() },
+    })
+    if !output.valid {
+      let diagnostics = List<Diagnostic>.asSlice(&output.errors)
+      let mut errors = run List<Value>.makeWithCapacity(diagnostics.length)
+      let mut i = usize.ZERO
+      while i < diagnostics.length {
+        let error = &diagnostics[i]
+        let mut fields = run List<JsonEntry>.makeWithCapacity(5)
+        run List<JsonEntry>.append(&mut fields, JsonEntry {
+          key: run String.copy("valid"), value: Value.Bool { value: false },
+        })
+        run List<JsonEntry>.append(&mut fields, JsonEntry {
+          key: run String.copy("keywordLocation"),
+          value: Value.String { text: run String.copy(String.view(&error.keywordLocation)) },
+        })
+        run List<JsonEntry>.append(&mut fields, JsonEntry {
+          key: run String.copy("absoluteKeywordLocation"),
+          value: Value.String { text: run String.copy(String.view(&error.absoluteKeywordLocation)) },
+        })
+        run List<JsonEntry>.append(&mut fields, JsonEntry {
+          key: run String.copy("instanceLocation"),
+          value: Value.String { text: run String.copy(String.view(&error.instanceLocation)) },
+        })
+        run List<JsonEntry>.append(&mut fields, JsonEntry {
+          key: run String.copy("error"),
+          value: Value.String { text: run String.copy(String.view(&error.error)) },
+        })
+        run List<Value>.append(&mut errors, Value.Object { entries: move fields })
+        i = i + usize.ONE
+      }
+      run List<JsonEntry>.append(&mut entries, JsonEntry {
+        key: run String.copy("errors"), value: Value.Array { values: move errors },
+      })
+    }
+    return Value.Object { entries: move entries }
+  }
+}
+
+fn modern(draft: Draft) -> bool {
+  return draft == Draft.Draft201909 || draft == Draft.Draft202012
+}
+fn hasField(value: &Value, key: string) -> bool {
+  return match move Json.field(value, key) {
+    Option<&Value>.Some { .. } => true
+    Option<&Value>.None => false
+  }
+}
+fn textField<'a>(value: &'a Value, key: string) -> string<'a> {
+  return Option<string>.unwrapOr(Json.asString(Json.field(value, key)), "")
+}
+fn boolean(value: &Value, fallback: bool) -> bool {
+  return match &value.* { Value.Bool { value: flag } => flag _ => fallback }
+}
+fn flag(value: &Value, key: string) -> bool {
+  return match move Json.field(value, key) {
+    Option<&Value>.Some { value: field } => boolean(field, false)
+    Option<&Value>.None => false
+  }
+}
+fn isObject(value: &Value) -> bool {
+  return match &value.* { Value.Object { .. } => true _ => false }
+}
+fn isArray(value: &Value) -> bool {
+  return match &value.* { Value.Array { .. } => true _ => false }
+}
+fn schemaShape(value: &Value, draft: Draft) -> bool {
+  return match &value.* {
+    Value.Object { .. } => true
+    Value.Bool { .. } => draft != Draft.Draft4
+    _ => false
+  }
+}
+effect fn problem(reason: SchemaReason, path: string, detail: string) -> SchemaError
+  ! OutOfMemoryError ? &mut Allocator {
+  return SchemaError { reason: reason, keywordLocation: run String.copy(path),
+    detail: run String.copy(detail) }
+}
+effect fn pointer(parent: string, token: string) -> String
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut result = run String.copy(parent)
+  run String.append(&mut result, "/")
+  let bytes = String.utf8Bytes(token)
+  let mut start = usize.ZERO
+  let mut i = usize.ZERO
+  while i < bytes.length {
+    if bytes[i] == 126 || bytes[i] == 47 {
+      run String.append(&mut result, String.slice(token, start, i - start))
+      run String.append(&mut result, if bytes[i] == 126 { "~0" } else { "~1" })
+      start = i + usize.ONE
+    }
+    i = i + usize.ONE
+  }
+  run String.append(&mut result, String.slice(token, start, bytes.length - start))
+  return move result
+}
+effect fn indexText(index: usize) -> String ! OutOfMemoryError ? &mut Allocator {
+  let mut buffer: [u8; 20] = [0; 20]
+  let length = Format.writeU64Display(usize.toU64(index), &mut buffer, usize.ZERO)
+  let text = unsafe String.fromUtf8Unchecked(Slice.view<u8>(&buffer, usize.ZERO, length))
+  return run String.copy(text)
+}
+fn withoutFragment(uri: string) -> string {
+  let bytes = String.utf8Bytes(uri)
+  let mut i = usize.ZERO
+  while i < bytes.length {
+    if bytes[i] == 35 { return String.slice(uri, usize.ZERO, i) }
+    i = i + usize.ONE
+  }
+  return uri
+}
+fn fragment(uri: string) -> string {
+  let base = withoutFragment(uri)
+  let offset = String.byteLength(base)
+  if offset == String.byteLength(uri) { return "" }
+  return String.slice(uri, offset + usize.ONE, String.byteLength(uri) - offset - usize.ONE)
+}
+effect fn checkAbsolute(uri: string, path: string) -> ()
+  ! SchemaError | OutOfMemoryError ? &mut Allocator {
+  match move Uri.parse(uri) {
+    Result<Uri, ParseError>.Success { .. } => {}
+    Result<Uri, ParseError>.Failure { .. } => {
+      fail run problem(SchemaReason.InvalidUri, path, uri)
+    }
+  }
+}
+effect fn resolveUri(base: string, reference: string, path: string) -> String
+  ! SchemaError | OutOfMemoryError ? &mut Allocator {
+  let parsedBase = match move Uri.parse(base) {
+    Result<Uri, ParseError>.Success { value } => value
+    Result<Uri, ParseError>.Failure { .. } => {
+      fail run problem(SchemaReason.InvalidUri, path, base)
+    }
+  }
+  let parsedRef = match move UriReference.parse(reference) {
+    Result<UriReference, ParseError>.Success { value } => value
+    Result<UriReference, ParseError>.Failure { .. } => {
+      fail run problem(SchemaReason.InvalidUri, path, reference)
+    }
+  }
+  match move run Uri.resolveOwned(&parsedBase, &parsedRef) {
+    Result<OwnedUri, ParseError>.Success { value } => {
+      return run String.copy(Uri.format(&OwnedUri.view(&value)))
+    }
+    Result<OwnedUri, ParseError>.Failure { .. } => {
+      fail run problem(SchemaReason.InvalidUri, path, reference)
+    }
+  }
+}
+
+fn builtinDialect(uri: string) -> Option<Draft> {
+  let plain = withoutFragment(uri)
+  if plain == "http://json-schema.org/draft-04/schema" ||
+      plain == "https://json-schema.org/draft-04/schema" {
+    return Option<Draft>.some(Draft.Draft4)
+  }
+  if plain == "http://json-schema.org/draft-06/schema" ||
+      plain == "https://json-schema.org/draft-06/schema" {
+    return Option<Draft>.some(Draft.Draft6)
+  }
+  if plain == "http://json-schema.org/draft-07/schema" ||
+      plain == "https://json-schema.org/draft-07/schema" {
+    return Option<Draft>.some(Draft.Draft7)
+  }
+  if plain == "https://json-schema.org/draft/2019-09/schema" {
+    return Option<Draft>.some(Draft.Draft201909)
+  }
+  if plain == "https://json-schema.org/draft/2020-12/schema" {
+    return Option<Draft>.some(Draft.Draft202012)
+  }
+  return Option<Draft>.none()
+}
+
+fn registrySchema<'a>(resources: &[Resource<'a>], uri: string) -> Option<&'a Value> {
+  if uri == "" { return Option<&'a Value>.none() }
+  let mut i = usize.ZERO
+  while i < resources.length {
+    if withoutFragment(resources[i].uri) == withoutFragment(uri) ||
+        withoutFragment(textField(resources[i].schema, "$id")) == withoutFragment(uri) ||
+        withoutFragment(textField(resources[i].schema, "id")) == withoutFragment(uri) {
+      return Option<&'a Value>.some(resources[i].schema)
+    }
+    i = i + usize.ONE
+  }
+  return Option<&'a Value>.none()
+}
+
+effect fn dialect<'a>(schema: &'a Value, inherited: Draft, resources: &[Resource<'a>], path: string) -> Draft
+  ! SchemaError | OutOfMemoryError ? &mut Allocator {
+  if !hasField(schema, "$schema") { return inherited }
+  let mut uri = textField(schema, "$schema")
+  let mut hops = usize.ZERO
+  while true {
+    match move builtinDialect(uri) {
+      Option<Draft>.Some { value } => { return value }
+      Option<Draft>.None => {}
+    }
+    if hops > resources.length {
+      fail run problem(SchemaReason.UnknownDialect, path, uri)
+    }
+    match move registrySchema(resources, uri) {
+      Option<&Value>.Some { value } => {
+        uri = textField(value, "$schema")
+        if uri == "" { fail run problem(SchemaReason.UnknownDialect, path, uri) }
+      }
+      Option<&Value>.None => { fail run problem(SchemaReason.UnknownDialect, path, uri) }
+    }
+    hops = hops + usize.ONE
+  }
+}
+
+fn vocabularyName(uri: string) -> string {
+  let prefix2020 = "https://json-schema.org/draft/2020-12/vocab/"
+  let prefix2019 = "https://json-schema.org/draft/2019-09/vocab/"
+  if String.startsWith(uri, prefix2020) {
+    return String.slice(uri, String.byteLength(prefix2020),
+      String.byteLength(uri) - String.byteLength(prefix2020))
+  }
+  if String.startsWith(uri, prefix2019) {
+    return String.slice(uri, String.byteLength(prefix2019),
+      String.byteLength(uri) - String.byteLength(prefix2019))
+  }
+  return ""
+}
+
+struct Vocabulary {
+  validation: bool, applicator: bool, unevaluated: bool, format: bool,
+  formatEnabled: bool, metadata: bool, content: bool,
+}
+
+effect fn vocabularies(schema: &Value, draft: Draft, resources: &[Resource], path: string)
+  -> Vocabulary ! SchemaError | OutOfMemoryError ? &mut Allocator {
+  let mut result = Vocabulary {
+    validation: true, applicator: true, unevaluated: true, format: false,
+    formatEnabled: true, metadata: true, content: true,
+  }
+  if !modern(draft) { return move result }
+  let meta = match move registrySchema(resources, textField(schema, "$schema")) {
+    Option<&Value>.Some { value } => value
+    Option<&Value>.None => { return move result }
+  }
+  let declaration = match move Json.field(meta, "$vocabulary") {
+    Option<&Value>.Some { value } => value
+    Option<&Value>.None => { return move result }
+  }
+  result.validation = false
+  result.applicator = false
+  result.unevaluated = false
+  result.formatEnabled = false
+  result.metadata = false
+  result.content = false
+  match &declaration.* {
+    Value.Object { entries } => {
+      let fields = List<JsonEntry>.asSlice(&entries)
+      let mut i = usize.ZERO
+      while i < fields.length {
+        let name = vocabularyName(String.view(&fields[i].key))
+        if name == "validation" { result.validation = true }
+        else if name == "applicator" {
+          result.applicator = true
+          if draft == Draft.Draft201909 { result.unevaluated = true }
+        }
+        else if name == "unevaluated" { result.unevaluated = true }
+        else if name == "format-assertion" {
+          result.format = true
+          result.formatEnabled = true
+        }
+        else if name == "format" || name == "format-annotation" { result.formatEnabled = true }
+        else if name == "meta-data" { result.metadata = true }
+        else if name == "content" { result.content = true }
+        else if name != "core" && boolean(&fields[i].value, false) {
+          fail run problem(SchemaReason.UnknownVocabulary, path, String.view(&fields[i].key))
+        }
+        i = i + usize.ONE
+      }
+    }
+    _ => { fail run problem(SchemaReason.InvalidSchema, path, "$vocabulary must be an object") }
+  }
+  return move result
+}
+
+effect fn addAlias(compiled: &mut CompiledSchema, uri: string, node: usize, dynamic: bool) -> ()
+  ! SchemaError | OutOfMemoryError ? &mut Allocator {
+  let normalized = if fragment(uri) == "" { withoutFragment(uri) } else { uri }
+  let aliases = List<Alias>.asSlice(&compiled.aliases)
+  let mut i = usize.ZERO
+  while i < aliases.length {
+    if String.view(&aliases[i].uri) == normalized {
+      if aliases[i].node != node {
+        let source = &List<Node>.asSlice(&compiled.nodes)[node]
+        let key = if dynamic { "$dynamicAnchor" }
+          else if modern(source.draft) && fragment(uri) != "" { "$anchor" }
+          else if source.draft == Draft.Draft4 { "id" } else { "$id" }
+        let location = run pointer(String.view(&source.path), key)
+        fail run problem(SchemaReason.DuplicateIdentifier, String.view(&location), uri)
+      }
+      if dynamic {
+        let mut aliasesMut = List<Alias>.asMutSlice(&mut compiled.aliases)
+        aliasesMut[i].dynamic = true
+      }
+      return
+    }
+    i = i + usize.ONE
+  }
+  run List<Alias>.append(&mut compiled.aliases,
+    Alias { uri: run String.copy(normalized), node: node, dynamic: dynamic })
+}
+
+fn aliasNode(compiled: &CompiledSchema, uri: string) -> usize {
+  let normalized = if fragment(uri) == "" { withoutFragment(uri) } else { uri }
+  let aliases = List<Alias>.asSlice(&compiled.aliases)
+  let mut i = usize.ZERO
+  while i < aliases.length {
+    if String.view(&aliases[i].uri) == normalized { return aliases[i].node }
+    i = i + usize.ONE
+  }
+  return usize.MAX
+}
+
+fn nodeAt(compiled: &CompiledSchema, document: usize, path: string) -> usize {
+  let nodes = List<Node>.asSlice(&compiled.nodes)
+  let mut i = usize.ZERO
+  while i < nodes.length {
+    if nodes[i].document == document && String.view(&nodes[i].path) == path { return i }
+    i = i + usize.ONE
+  }
+  return usize.MAX
+}
+
+effect fn indexSchema<'a>(compiled: &mut CompiledSchema<'a>, value: &'a Value,
+  path: string, inheritedBase: string, inheritedResource: usize, inheritedDocument: usize,
+  inheritedDraft: Draft, resources: &[Resource<'a>]) -> usize
+  ! SchemaError | RegexError | OutOfMemoryError ? &mut Allocator {
+  if inheritedDocument == usize.MAX && !finiteTree(value) {
+    fail run problem(SchemaReason.InvalidSchema, path, "schema contains a non-finite number")
+  }
+  if inheritedDocument != usize.MAX {
+    let existing = nodeAt(&compiled.*, inheritedDocument, path)
+    if existing != usize.MAX { return existing }
+  }
+  let selected = run dialect(value, inheritedDraft, resources, path)
+  // Draft 4 allows booleans only in the two "additional" keywords. Their parent validates
+  // that position before indexing; root resources still require an object.
+  let indexedBoolean = inheritedDocument != usize.MAX &&
+    match &value.* { Value.Bool { .. } => true _ => false }
+  if !schemaShape(value, selected) && !indexedBoolean {
+    fail run problem(SchemaReason.InvalidSchema, path, "expected a schema object or boolean")
+  }
+  let index = List<Node<'a>>.length(&compiled.nodes)
+  let document = if inheritedDocument == usize.MAX { index } else { inheritedDocument }
+  let mut resource = if inheritedResource == usize.MAX { index } else { inheritedResource }
+  let idKey = if selected == Draft.Draft4 { "id" } else { "$id" }
+  let mut base = run String.copy(inheritedBase)
+  let usesId = hasField(value, idKey) && !(hasField(value, "$ref") && !modern(selected))
+  if modern(selected) && hasField(value, "$schema") && inheritedResource != usize.MAX && !usesId {
+    fail run problem(SchemaReason.InvalidSchema, path,
+      "$schema is only permitted at a schema resource root")
+  }
+  if usesId {
+    let idPath = run pointer(path, idKey)
+    base = run resolveUri(inheritedBase, textField(value, idKey), String.view(&idPath))
+    if modern(selected) && fragment(String.view(&base)) != "" {
+      fail run problem(SchemaReason.InvalidSchema, String.view(&idPath),
+        "$id must not have a nonempty fragment")
+    }
+    if fragment(String.view(&base)) == "" { resource = index }
+  }
+  let mut vocabulary = run vocabularies(value, selected, resources, path)
+  if !hasField(value, "$schema") && inheritedResource != usize.MAX {
+    let ancestor = &List<Node<'a>>.asSlice(&compiled.nodes)[inheritedResource]
+    vocabulary.validation = ancestor.validation
+    vocabulary.applicator = ancestor.applicator
+    vocabulary.unevaluated = ancestor.unevaluated
+    vocabulary.format = ancestor.formatAssertion
+    vocabulary.formatEnabled = ancestor.formatEnabled
+    vocabulary.metadata = ancestor.metadata
+    vocabulary.content = ancestor.content
+  }
+  run checkSchema(value, selected, &vocabulary, path)
+  let mut pattern = Option<Pattern>.none()
+  let mut propertyPatterns = List<Pattern>.make()
+  if !(hasField(value, "$ref") && !modern(selected)) {
+    if vocabulary.validation && hasField(value, "pattern") {
+      pattern = Option<Pattern>.some(run Regex.compile(textField(value, "pattern")))
+    }
+    if vocabulary.applicator {
+      match move Json.field(value, "patternProperties") {
+        Option<&Value>.Some { value: patterns } => match &patterns.* {
+          Value.Object { entries } => {
+            let members = List<JsonEntry>.asSlice(&entries)
+            let mut i = usize.ZERO
+            while i < members.length {
+              run List<Pattern>.append(&mut propertyPatterns,
+                run Regex.compile(String.view(&members[i].key)))
+              i = i + usize.ONE
+            }
+          }
+          _ => {}
+        }
+        Option<&Value>.None => {}
+      }
+    }
+  }
+  run List<Node<'a>>.append(&mut compiled.nodes, Node<'a> {
+    value: value, path: run String.copy(path), base: run String.copy(String.view(&base)),
+    resource: resource, document: document, draft: selected,
+    validation: vocabulary.validation, applicator: vocabulary.applicator,
+    unevaluated: vocabulary.unevaluated, formatAssertion: vocabulary.format,
+    formatEnabled: vocabulary.formatEnabled, metadata: vocabulary.metadata, content: vocabulary.content,
+    pattern: move pattern, propertyPatterns: move propertyPatterns, meta: usize.MAX,
+    reference: usize.MAX, dynamicReference: usize.MAX, recursiveReference: usize.MAX,
+    dynamicName: String.make(),
+  })
+  if inheritedResource == usize.MAX { run addAlias(&mut compiled.*, inheritedBase, index, false) }
+  if usesId { run addAlias(&mut compiled.*, String.view(&base), index, false) }
+  if modern(selected) && hasField(value, "$anchor") {
+    let mut uri = run String.copy(withoutFragment(String.view(&base)))
+    run String.append(&mut uri, "#")
+    run String.append(&mut uri, textField(value, "$anchor"))
+    run addAlias(&mut compiled.*, String.view(&uri), index, false)
+  }
+  if selected == Draft.Draft202012 && hasField(value, "$dynamicAnchor") {
+    let mut uri = run String.copy(withoutFragment(String.view(&base)))
+    run String.append(&mut uri, "#")
+    run String.append(&mut uri, textField(value, "$dynamicAnchor"))
+    run addAlias(&mut compiled.*, String.view(&uri), index, true)
+  }
+  if hasField(value, "$ref") && !modern(selected) { return index }
+  match &value.* {
+    Value.Object { entries } => {
+      let fields = List<JsonEntry>.asSlice(&entries)
+      let mut i = usize.ZERO
+      while i < fields.length {
+        let key = String.view(&fields[i].key)
+        let child = &fields[i].value
+        let childPath = run pointer(path, key)
+        let kind = schemaChildren(key, child, selected, &vocabulary)
+        if kind == 1 {
+          let ignored = run indexSchema(&mut compiled.*, child, String.view(&childPath),
+            String.view(&base), resource, document, selected, resources)
+        } else if kind == 2 {
+          match &child.* {
+            Value.Object { entries: nested } => {
+              let members = List<JsonEntry>.asSlice(&nested)
+              let mut j = usize.ZERO
+              while j < members.length {
+                if key != "dependencies" || !isArray(&members[j].value) {
+                  let memberPath = run pointer(String.view(&childPath), String.view(&members[j].key))
+                  let ignored = run indexSchema(&mut compiled.*, &members[j].value, String.view(&memberPath),
+                    String.view(&base), resource, document, selected, resources)
+                }
+                j = j + usize.ONE
+              }
+            }
+            _ => {}
+          }
+        } else if kind == 3 {
+          match &child.* {
+            Value.Array { values } => {
+              let members = List<Value>.asSlice(&values)
+              let mut j = usize.ZERO
+              while j < members.length {
+                let token = run indexText(j)
+                let memberPath = run pointer(String.view(&childPath), String.view(&token))
+                let ignored = run indexSchema(&mut compiled.*, &members[j], String.view(&memberPath),
+                  String.view(&base), resource, document, selected, resources)
+                j = j + usize.ONE
+              }
+            }
+            _ => {}
+          }
+        }
+        i = i + usize.ONE
+      }
+    }
+    _ => {}
+  }
+  return index
+}
+
+fn schemaChildren(key: string, value: &Value, draft: Draft, vocab: &Vocabulary) -> i32 {
+  if key == "$defs" && modern(draft) || key == "definitions" { return 2 }
+  if key == "contentSchema" && modern(draft) && vocab.content { return 1 }
+  if vocab.unevaluated && modern(draft) &&
+      (key == "unevaluatedProperties" || key == "unevaluatedItems") { return 1 }
+  if !vocab.applicator { return 0 }
+  if key == "properties" || key == "patternProperties" ||
+      key == "dependentSchemas" && modern(draft) ||
+      key == "dependencies" { return 2 }
+  if key == "allOf" || key == "anyOf" || key == "oneOf" ||
+      key == "prefixItems" && draft == Draft.Draft202012 { return 3 }
+  if key == "items" {
+    if draft != Draft.Draft202012 && isArray(value) { return 3 }
+    return 1
+  }
+  if key == "not" || key == "additionalProperties" ||
+      key == "additionalItems" && draft != Draft.Draft202012 ||
+      (key == "contains" || key == "propertyNames") && draft != Draft.Draft4 ||
+      (key == "if" || key == "then" || key == "else") &&
+        draft != Draft.Draft4 && draft != Draft.Draft6 { return 1 }
+  return 0
+}
+
+fn knownType(name: string) -> bool {
+  return name == "null" || name == "boolean" || name == "number" || name == "integer" ||
+    name == "string" || name == "array" || name == "object"
+}
+fn numeric(value: &Value) -> bool {
+  return match &value.* { Value.Number { .. } => true _ => false }
+}
+fn nonnegativeInteger(value: &Value, draft: Draft) -> bool {
+  return match &value.* {
+    Value.Number { value: number } => typeMatches(value, "integer", draft) &&
+      Json.compareNumbers(&number, &JsonNumber.Integer { value: 0 }) >= 0
+    _ => false
+  }
+}
+fn stringList(value: &Value, nonempty: bool, types: bool) -> bool {
+  return match &value.* {
+    Value.Array { values } => {
+      let items = List<Value>.asSlice(&values)
+      if nonempty && items.length == usize.ZERO { return false }
+      let mut i = usize.ZERO
+      while i < items.length {
+        let text = match move Json.asString(Option<&Value>.some(&items[i])) {
+          Option<string>.Some { value: text } => text
+          Option<string>.None => { return false }
+        }
+        if types && !knownType(text) { return false }
+        let mut j = usize.ZERO
+        while j < i {
+          if Json.equal(&items[i], &items[j]) { return false }
+          j = j + usize.ONE
+        }
+        i = i + usize.ONE
+      }
+      return true
+    }
+    _ => false
+  }
+}
+fn validAnchor(text: string, draft: Draft) -> bool {
+  let bytes = String.utf8Bytes(text)
+  if bytes.length == usize.ZERO { return false }
+  let first = bytes[0]
+  if !(first >= 65 && first <= 90 || first >= 97 && first <= 122 ||
+      draft == Draft.Draft202012 && first == 95) { return false }
+  let mut i = usize.ONE
+  while i < bytes.length {
+    let c = bytes[i]
+    if !(c >= 65 && c <= 90 || c >= 97 && c <= 122 || c >= 48 && c <= 57 ||
+        c == 45 || c == 95 || c == 46 || draft == Draft.Draft201909 && c == 58) {
+      return false
+    }
+    i = i + usize.ONE
+  }
+  return true
+}
+
+effect fn checkSchema(schema: &Value, draft: Draft, vocab: &Vocabulary, path: string) -> ()
+  ! SchemaError | RegexError | OutOfMemoryError ? &mut Allocator {
+  if hasField(schema, "$ref") && !modern(draft) {
+    match move Json.field(schema, "$ref") {
+      Option<&Value>.Some { value } => match &value.* {
+        Value.String { .. } => { return }
+        _ => { fail run problem(SchemaReason.InvalidSchema, path, "$ref must be a string") }
+      }
+      Option<&Value>.None => {}
+    }
+  }
+  match &schema.* {
+    Value.Object { entries } => {
+      let fields = List<JsonEntry>.asSlice(&entries)
+      let mut i = usize.ZERO
+      while i < fields.length {
+        let key = String.view(&fields[i].key)
+        let value = &fields[i].value
+        let keywordPath = run pointer(path, key)
+        let location = String.view(&keywordPath)
+        let mut valid = true
+        if key == "$schema" || key == "$ref" ||
+            key == "id" && draft == Draft.Draft4 ||
+            key == "$id" && draft != Draft.Draft4 ||
+            key == "$dynamicRef" && draft == Draft.Draft202012 ||
+            key == "$recursiveRef" && draft == Draft.Draft201909 ||
+            key == "$comment" && draft != Draft.Draft4 && draft != Draft.Draft6 ||
+            (key == "title" || key == "description") && vocab.metadata ||
+            key == "format" && vocab.formatEnabled ||
+            (key == "contentEncoding" || key == "contentMediaType") && vocab.content &&
+              draft != Draft.Draft4 && draft != Draft.Draft6 {
+          valid = match &value.* { Value.String { .. } => true _ => false }
+        }
+        if (key == "$anchor" && modern(draft)) ||
+            (key == "$dynamicAnchor" && draft == Draft.Draft202012) {
+          valid = match move Json.asString(Option<&Value>.some(value)) {
+            Option<string>.Some { value: text } => validAnchor(text, draft)
+            Option<string>.None => false
+          }
+        }
+        if key == "$vocabulary" && modern(draft) {
+          valid = isObject(value)
+          match &value.* {
+            Value.Object { entries: declarations } => {
+              let members = List<JsonEntry>.asSlice(&declarations)
+              let mut j = usize.ZERO
+              while j < members.length {
+                run checkAbsolute(String.view(&members[j].key), location)
+                match &members[j].value {
+                  Value.Bool { .. } => {}
+                  _ => { valid = false }
+                }
+                j = j + usize.ONE
+              }
+            }
+            _ => {}
+          }
+        }
+        if key == "$recursiveAnchor" && draft == Draft.Draft201909 ||
+            vocab.metadata && (key == "readOnly" && draft != Draft.Draft4 && draft != Draft.Draft6 ||
+              key == "writeOnly" && draft != Draft.Draft4 && draft != Draft.Draft6 ||
+              key == "deprecated" && modern(draft)) {
+          valid = match &value.* { Value.Bool { .. } => true _ => false }
+        }
+        if vocab.metadata && key == "examples" && draft != Draft.Draft4 { valid = isArray(value) }
+        if vocab.validation {
+          if key == "type" {
+            valid = match &value.* {
+              Value.String { text } => knownType(String.view(&text))
+              Value.Array { .. } => stringList(value, true, true)
+              _ => false
+            }
+          }
+          if key == "enum" {
+            valid = isArray(value)
+            if !modern(draft) {
+              match &value.* {
+                Value.Array { values } => {
+                  let items = List<Value>.asSlice(&values)
+                  valid = items.length != usize.ZERO
+                  let mut j = usize.ZERO
+                  while j < items.length {
+                    let mut k = usize.ZERO
+                    while k < j {
+                      if Json.equal(&items[j], &items[k]) { valid = false }
+                      k = k + usize.ONE
+                    }
+                    j = j + usize.ONE
+                  }
+                }
+                _ => {}
+              }
+            }
+          }
+          if key == "minimum" || key == "maximum" { valid = numeric(value) }
+          if key == "multipleOf" {
+            valid = match &value.* {
+              Value.Number { value: number } =>
+                Json.compareNumbers(&number, &JsonNumber.Integer { value: 0 }) > 0
+              _ => false
+            }
+          }
+          if key == "exclusiveMinimum" || key == "exclusiveMaximum" {
+            valid = if draft == Draft.Draft4 {
+              match &value.* { Value.Bool { .. } => true _ => false }
+            } else { numeric(value) }
+            if draft == Draft.Draft4 &&
+                !hasField(schema, if key == "exclusiveMinimum" { "minimum" } else { "maximum" }) {
+              valid = false
+            }
+          }
+          if key == "minLength" || key == "maxLength" || key == "minItems" ||
+              key == "maxItems" || key == "minProperties" || key == "maxProperties" ||
+              (key == "minContains" || key == "maxContains") && modern(draft) {
+            valid = nonnegativeInteger(value, draft)
+          }
+          if key == "uniqueItems" {
+            valid = match &value.* { Value.Bool { .. } => true _ => false }
+          }
+          if key == "required" { valid = stringList(value, draft == Draft.Draft4, false) }
+          if key == "dependentRequired" && modern(draft) {
+            valid = isObject(value)
+            match &value.* {
+              Value.Object { entries: dependencies } => {
+                let members = List<JsonEntry>.asSlice(&dependencies)
+                let mut j = usize.ZERO
+                while j < members.length {
+                  if !stringList(&members[j].value, false, false) { valid = false }
+                  j = j + usize.ONE
+                }
+              }
+              _ => {}
+            }
+          }
+          if key == "pattern" {
+            match move Json.asString(Option<&Value>.some(value)) {
+              Option<string>.Some { .. } => {}
+              Option<string>.None => { valid = false }
+            }
+          }
+        }
+        let kind = schemaChildren(key, value, draft, vocab)
+        if kind == 1 {
+          valid = schemaShape(value, draft) ||
+            draft == Draft.Draft4 && (key == "additionalProperties" || key == "additionalItems") &&
+              match &value.* { Value.Bool { .. } => true _ => false }
+        }
+        if kind == 2 {
+          valid = isObject(value)
+          match &value.* {
+            Value.Object { entries: children } => {
+              let members = List<JsonEntry>.asSlice(&children)
+              let mut j = usize.ZERO
+              while j < members.length {
+                if key == "dependencies" && isArray(&members[j].value) {
+                  if !stringList(&members[j].value, draft == Draft.Draft4, false) { valid = false }
+                } else if !schemaShape(&members[j].value, draft) { valid = false }
+                j = j + usize.ONE
+              }
+            }
+            _ => {}
+          }
+        }
+        if kind == 3 {
+          valid = isArray(value)
+          match &value.* {
+            Value.Array { values } => {
+              let children = List<Value>.asSlice(&values)
+              if children.length == usize.ZERO { valid = false }
+              let mut j = usize.ZERO
+              while j < children.length {
+                if !schemaShape(&children[j], draft) { valid = false }
+                j = j + usize.ONE
+              }
+            }
+            _ => {}
+          }
+        }
+        if !valid { fail run problem(SchemaReason.InvalidSchema, location, key) }
+        i = i + usize.ONE
+      }
+    }
+    _ => {}
+  }
+}
+
+effect fn decodeFragment(text: string, path: string) -> String
+  ! SchemaError | OutOfMemoryError ? &mut Allocator {
+  let result = match move run UriPercent.decodeOwned(text) {
+    Result<Bytes, DecodeError>.Success { value } => move value
+    Result<Bytes, DecodeError>.Failure { .. } => {
+      fail run problem(SchemaReason.InvalidReference, path, text)
+    }
+  }
+  match move String.fromBytes(move result) {
+    Result<String, InvalidUtf8>.Success { value } => { return move value }
+    Result<String, InvalidUtf8>.Failure { .. } => {
+      fail run problem(SchemaReason.InvalidReference, path, text)
+    }
+  }
+}
+
+effect fn pointerToken(text: string, path: string) -> String
+  ! SchemaError | OutOfMemoryError ? &mut Allocator {
+  let bytes = String.utf8Bytes(text)
+  let mut result = String.make()
+  let mut start = usize.ZERO
+  let mut i = usize.ZERO
+  while i < bytes.length {
+    if bytes[i] == 126 {
+      if i + 1 == bytes.length || bytes[i + 1] != 48 && bytes[i + 1] != 49 {
+        fail run problem(SchemaReason.InvalidReference, path, text)
+      }
+      run String.append(&mut result, String.slice(text, start, i - start))
+      run String.append(&mut result, if bytes[i + 1] == 48 { "~" } else { "/" })
+      i = i + 2
+      start = i
+    } else { i = i + usize.ONE }
+  }
+  run String.append(&mut result, String.slice(text, start, bytes.length - start))
+  return move result
+}
+
+fn arrayIndex(token: string) -> usize {
+  let bytes = String.utf8Bytes(token)
+  if bytes.length == usize.ZERO || bytes.length > usize.ONE && bytes[0] == 48 {
+    return usize.MAX
+  }
+  if bytes[0] < 48 || bytes[0] > 57 { return usize.MAX }
+  return match move usize.parse(token) {
+    Result.Success { value } => value
+    Result.Failure { .. } => usize.MAX
+  }
+}
+
+effect fn resolveReference<'a>(compiled: &mut CompiledSchema<'a>, base: string,
+  reference: string, path: string, resources: &[Resource<'a>]) -> usize
+  ! SchemaError | RegexError | OutOfMemoryError ? &mut Allocator {
+  let resolved = run resolveUri(base, reference, path)
+  let uri = String.view(&resolved)
+  let existing = aliasNode(&compiled.*, uri)
+  if existing != usize.MAX { return existing }
+  let documentUri = withoutFragment(uri)
+  let mut root = aliasNode(&compiled.*, documentUri)
+  if root == usize.MAX {
+    let external = match move registrySchema(resources, documentUri) {
+      Option<&Value>.Some { value } => value
+      Option<&Value>.None => {
+        fail run problem(SchemaReason.UnresolvedReference, path, uri)
+      }
+    }
+    let fallbackDraft = compiled.options.draft
+    root = run indexSchema(&mut compiled.*, external, "", documentUri, usize.MAX, usize.MAX,
+      fallbackDraft, resources)
+    run addAlias(&mut compiled.*, documentUri, root, false)
+  }
+  let fragmentText = run decodeFragment(fragment(uri), path)
+  let pointerText = String.view(&fragmentText)
+  if pointerText == "" { return root }
+  if !String.startsWith(pointerText, "/") {
+    let mut decodedUri = run String.copy(documentUri)
+    run String.append(&mut decodedUri, "#")
+    run String.append(&mut decodedUri, pointerText)
+    let anchored = aliasNode(&compiled.*, String.view(&decodedUri))
+    if anchored != usize.MAX { return anchored }
+    fail run problem(SchemaReason.UnresolvedReference, path, uri)
+  }
+  let rootNode = &List<Node<'a>>.asSlice(&compiled.nodes)[root]
+  let document = rootNode.document
+  let selected = rootNode.draft
+  let mut current = rootNode.value
+  let mut currentPath = run String.copy(String.view(&rootNode.path))
+  let mut ancestor = root
+  let bytes = String.utf8Bytes(pointerText)
+  let mut start = usize.ONE
+  let mut i = usize.ONE
+  while i <= bytes.length {
+    if i == bytes.length || bytes[i] == 47 {
+      let token = run pointerToken(String.slice(pointerText, start, i - start), path)
+      current = match &current.* {
+        Value.Object { .. } => match move Json.field(current, String.view(&token)) {
+          Option<&Value>.Some { value } => value
+          Option<&Value>.None => { fail run problem(SchemaReason.UnresolvedReference, path, uri) }
+        }
+        Value.Array { .. } => match move Json.item(current, arrayIndex(String.view(&token))) {
+          Option<&Value>.Some { value } => value
+          Option<&Value>.None => { fail run problem(SchemaReason.UnresolvedReference, path, uri) }
+        }
+        _ => { fail run problem(SchemaReason.UnresolvedReference, path, uri) }
+      }
+      currentPath = run pointer(String.view(&currentPath), String.view(&token))
+      let indexed = nodeAt(&compiled.*, document, String.view(&currentPath))
+      if indexed != usize.MAX { ancestor = indexed }
+      start = i + usize.ONE
+    }
+    i = i + usize.ONE
+  }
+  let indexed = nodeAt(&compiled.*, document, String.view(&currentPath))
+  if indexed != usize.MAX { return indexed }
+  if !schemaShape(current, selected) {
+    fail run problem(SchemaReason.InvalidReference, path, uri)
+  }
+  let ancestorNode = &List<Node<'a>>.asSlice(&compiled.nodes)[ancestor]
+  let inheritedBase = run String.copy(String.view(&ancestorNode.base))
+  let inheritedResource = ancestorNode.resource
+  let inheritedDraft = ancestorNode.draft
+  return run indexSchema(&mut compiled.*, current, String.view(&currentPath),
+    String.view(&inheritedBase), inheritedResource, document, inheritedDraft, resources)
+}
+
+struct Evaluation {
+  valid: bool,
+  errors: List<Diagnostic>,
+  properties: List<usize>,
+  items: List<usize>,
+}
+// Along an active evaluation chain, instance paths only grow. Equal path lengths identify
+// the same location; the kind distinguishes the synthetic propertyNames string from its object.
+struct Frame { node: usize, instanceLength: usize, instanceType: u8 }
+struct Context { active: List<Frame>, scope: List<usize> }
+
+fn successful() -> Evaluation {
+  return Evaluation { valid: true, errors: List<Diagnostic>.make(),
+    properties: List<usize>.make(), items: List<usize>.make() }
+}
+fn marked(marks: &List<usize>, index: usize) -> bool {
+  let values = List<usize>.asSlice(marks)
+  let mut i = usize.ZERO
+  while i < values.length {
+    if values[i] == index { return true }
+    i = i + usize.ONE
+  }
+  return false
+}
+effect fn mark(marks: &mut List<usize>, index: usize) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  if !marked(&marks.*, index) { run List<usize>.append(&mut marks.*, index) }
+}
+effect fn mergeMarks(target: &mut List<usize>, source: &List<usize>) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let values = List<usize>.asSlice(source)
+  let mut i = usize.ZERO
+  while i < values.length {
+    run mark(&mut target.*, values[i])
+    i = i + usize.ONE
+  }
+}
+effect fn annotations(target: &mut Evaluation, source: &Evaluation) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  if source.valid {
+    run mergeMarks(&mut target.properties, &source.properties)
+    run mergeMarks(&mut target.items, &source.items)
+  }
+}
+effect fn transferErrors(target: &mut Evaluation, source: &mut Evaluation) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  while List<Diagnostic>.length(&source.errors) != usize.ZERO {
+    let last = List<Diagnostic>.length(&source.errors) - usize.ONE
+    let error = List<Diagnostic>.remove(&mut source.errors, last)
+    run List<Diagnostic>.append(&mut target.errors, move error)
+  }
+}
+effect fn combine(target: &mut Evaluation, source: Evaluation, sameInstance: bool) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut child = move source
+  if sameInstance { run annotations(&mut target.*, &child) }
+  if !child.valid { target.valid = false }
+  run transferErrors(&mut target.*, &mut child)
+}
+
+effect fn absoluteKeyword(compiled: &CompiledSchema, index: usize, key: string) -> String
+  ! OutOfMemoryError ? &mut Allocator {
+  let node = &List<Node>.asSlice(&compiled.nodes)[index]
+  let root = &List<Node>.asSlice(&compiled.nodes)[node.resource]
+  let rootPath = String.view(&root.path)
+  let nodePath = String.view(&node.path)
+  let relative = String.slice(nodePath, String.byteLength(rootPath),
+    String.byteLength(nodePath) - String.byteLength(rootPath))
+  let full = if key == "" { run String.copy(relative) } else { run pointer(relative, key) }
+  let mut result = Bytes.make()
+  run Bytes.append(&mut result, String.utf8Bytes(withoutFragment(String.view(&node.base))))
+  run Bytes.append(&mut result, b"#")
+  run UriPercent.appendEncoded(&mut result, String.utf8Bytes(String.view(&full)),
+    PercentComponent.Fragment)
+  return unsafe String.fromBytesUnchecked(move result)
+}
+effect fn reject(result: &mut Evaluation, compiled: &CompiledSchema, node: usize,
+  evaluationPath: string, instancePath: string, keyword: string, message: string) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  result.valid = false
+  let location = if keyword == "" {
+    run String.copy(evaluationPath)
+  } else { run pointer(evaluationPath, keyword) }
+  run List<Diagnostic>.append(&mut result.errors, Diagnostic {
+    keywordLocation: move location,
+    absoluteKeywordLocation: run absoluteKeyword(compiled, node, keyword),
+    instanceLocation: run String.copy(instancePath),
+    error: run String.copy(message),
+  })
+}
+
+effect fn childIndex(compiled: &CompiledSchema, parent: usize, keyword: string,
+  member: string, hasMember: bool) -> usize ! SchemaError | OutOfMemoryError ? &mut Allocator {
+  let node = &List<Node>.asSlice(&compiled.nodes)[parent]
+  let mut path = run pointer(String.view(&node.path), keyword)
+  if hasMember { path = run pointer(String.view(&path), member) }
+  let result = nodeAt(compiled, node.document, String.view(&path))
+  if result == usize.MAX {
+    fail run problem(SchemaReason.InvalidReference, String.view(&path), "schema was not indexed")
+  }
+  return result
+}
+
+effect fn applyChild(compiled: &CompiledSchema, parent: usize, keyword: string,
+  member: string, hasMember: bool, instance: &Value, instancePath: string,
+  evaluationPath: string, context: &mut Context) -> Evaluation
+  ! SchemaError | RegexError | OutOfMemoryError ? &mut Allocator {
+  let child = run childIndex(compiled, parent, keyword, member, hasMember)
+  let mut path = run pointer(evaluationPath, keyword)
+  if hasMember { path = run pointer(String.view(&path), member) }
+  return run evaluate(compiled, child, instance, instancePath, String.view(&path), &mut context.*)
+}
+
+fn typeMatches(instance: &Value, kind: string, draft: Draft) -> bool {
+  return match &instance.* {
+    Value.Null => kind == "null"
+    Value.Bool { .. } => kind == "boolean"
+    Value.String { .. } => kind == "string"
+    Value.Array { .. } => kind == "array"
+    Value.Object { .. } => kind == "object"
+    Value.Number { value: number } => {
+      if kind == "number" { return true }
+      if kind != "integer" { return false }
+      if draft == Draft.Draft4 {
+        match &number {
+          JsonNumber.Float { .. } => { return false }
+          JsonNumber.Decimal { text } => {
+            let bytes = String.utf8Bytes(String.view(&text))
+            let mut i = usize.ZERO
+            while i < bytes.length {
+              if bytes[i] == 46 || bytes[i] == 69 || bytes[i] == 101 { return false }
+              i = i + usize.ONE
+            }
+          }
+          _ => {}
+        }
+      }
+      return Json.isIntegerNumber(&number)
+    }
+  }
+}
+fn acceptsType(instance: &Value, specification: &Value, draft: Draft) -> bool {
+  return match &specification.* {
+    Value.String { text } => typeMatches(instance, String.view(&text), draft)
+    Value.Array { values } => {
+      let items = List<Value>.asSlice(&values)
+      let mut i = usize.ZERO
+      while i < items.length {
+        let kind = Option<string>.unwrapOr(Json.asString(Option<&Value>.some(&items[i])), "")
+        if typeMatches(instance, kind, draft) { return true }
+        i = i + usize.ONE
+      }
+      return false
+    }
+    _ => false
+  }
+}
+fn scalarLength(text: string) -> usize {
+  let bytes = String.utf8Bytes(text)
+  let mut result = usize.ZERO
+  let mut i = usize.ZERO
+  while i < bytes.length {
+    if bytes[i] < 128 || bytes[i] >= 192 { result = result + usize.ONE }
+    i = i + usize.ONE
+  }
+  return result
+}
+effect fn countWithin(count: usize, bound: &Value, maximum: bool) -> bool
+  ! OutOfMemoryError ? &mut Allocator {
+  return match &bound.* {
+    Value.Number { value: number } => {
+      let small = Json.asUsizeNumber(&number)
+      match move small {
+        Option<usize>.Some { value } => {
+          return if maximum { count <= value } else { count >= value }
+        }
+        Option<usize>.None => {
+          let actual = JsonNumber.Unsigned { value: usize.toU64(count) }
+          let comparison = Json.compareNumbers(&actual, &number)
+          return if maximum { comparison <= 0 } else { comparison >= 0 }
+        }
+      }
+    }
+    _ => true
+  }
+}
+
+fn jsonContent(bytes: &[u8]) -> bool {
+  let mut scanner = JsonScanner.make(bytes)
+  while true {
+    match move JsonScanner.next(&mut scanner) {
+      Result<JsonToken, JsonError>.Failure { .. } => { return false }
+      Result<JsonToken, JsonError>.Success { value } => match value {
+        JsonToken.EndOfInput => { return true }
+        _ => {}
+      }
+    }
+  }
+  return false
+}
+
+effect fn contentFailure(schema: &Value, text: string) -> string<'static>
+  ! OutOfMemoryError ? &mut Allocator {
+  let encoding = textField(schema, "contentEncoding")
+  let json = textField(schema, "contentMediaType") == "application/json"
+  let bytes = String.utf8Bytes(text)
+  if encoding == "base64" {
+    let length = match move Base64.decodedLength(bytes) {
+      Result<usize, Base64Error>.Success { value } => value
+      Result<usize, Base64Error>.Failure { .. } => { return "contentEncoding" }
+    }
+    if json {
+      let mut decoded = run Bytes.zeroed(length)
+      match move Base64.decodeInto(Bytes.asMutSlice(&mut decoded), bytes) {
+        Result<usize, Base64Error>.Success { .. } => {}
+        Result<usize, Base64Error>.Failure { .. } => { return "contentEncoding" }
+      }
+      if !jsonContent(Bytes.asSlice(&decoded)) { return "contentMediaType" }
+    }
+  } else if encoding == "" && json && !jsonContent(bytes) {
+    return "contentMediaType"
+  }
+  return ""
+}
+
+effect fn assertions(compiled: &CompiledSchema, index: usize, instance: &Value,
+  instancePath: string, evaluationPath: string, result: &mut Evaluation) -> ()
+  ! RegexError | OutOfMemoryError ? &mut Allocator {
+  let node = &List<Node>.asSlice(&compiled.nodes)[index]
+  if !node.validation { return }
+  let schema = node.value
+  if node.draft == Draft.Draft7 && compiled.options.assertContent {
+    match &instance.* {
+      Value.String { text } => {
+        let keyword = run contentFailure(schema, String.view(&text))
+        if keyword != "" {
+          run reject(&mut result.*, compiled, index, evaluationPath, instancePath, keyword,
+            "string content does not satisfy the keyword")
+        }
+      }
+      _ => {}
+    }
+  }
+  match &schema.* {
+    Value.Object { entries } => {
+      let fields = List<JsonEntry>.asSlice(&entries)
+      let mut i = usize.ZERO
+      while i < fields.length {
+        let key = String.view(&fields[i].key)
+        let constraint = &fields[i].value
+        let mut valid = true
+        if key == "type" { valid = acceptsType(instance, constraint, node.draft) }
+        else if key == "const" && node.draft != Draft.Draft4 {
+          valid = Json.equal(instance, constraint)
+        } else if key == "enum" {
+          valid = false
+          match &constraint.* {
+            Value.Array { values } => {
+              let choices = List<Value>.asSlice(&values)
+              let mut j = usize.ZERO
+              while j < choices.length {
+                if Json.equal(instance, &choices[j]) { valid = true }
+                j = j + usize.ONE
+              }
+            }
+            _ => {}
+          }
+        }
+        match &instance.* {
+          Value.Number { value: number } => {
+            match &constraint.* {
+              Value.Number { value: bound } => {
+                let comparison = Json.compareNumbers(&number, &bound)
+                if key == "minimum" {
+                  valid = comparison >= 0 &&
+                    !(node.draft == Draft.Draft4 && flag(schema, "exclusiveMinimum") && comparison == 0)
+                } else if key == "maximum" {
+                  valid = comparison <= 0 &&
+                    !(node.draft == Draft.Draft4 && flag(schema, "exclusiveMaximum") && comparison == 0)
+                } else if key == "exclusiveMinimum" && node.draft != Draft.Draft4 {
+                  valid = comparison > 0
+                } else if key == "exclusiveMaximum" && node.draft != Draft.Draft4 {
+                  valid = comparison < 0
+                } else if key == "multipleOf" {
+                  valid = run Json.multipleOfNumbers(&number, &bound)
+                }
+              }
+              _ => {}
+            }
+          }
+          Value.String { text } => {
+            if key == "minLength" || key == "maxLength" {
+              valid = run countWithin(scalarLength(String.view(&text)), constraint, key == "maxLength")
+            } else if key == "pattern" {
+              match &node.pattern {
+                Option<Pattern>.Some { value: pattern } => {
+                  valid = run Regex.test(&pattern, String.view(&text))
+                }
+                Option<Pattern>.None => {}
+              }
+            }
+          }
+          Value.Array { values } => {
+            let items = List<Value>.asSlice(&values)
+            if key == "minItems" || key == "maxItems" {
+              valid = run countWithin(items.length, constraint, key == "maxItems")
+            } else if key == "uniqueItems" && boolean(constraint, false) {
+              let mut j = usize.ZERO
+              while j < items.length && valid {
+                let mut k = usize.ZERO
+                while k < j {
+                  if Json.equal(&items[j], &items[k]) { valid = false }
+                  k = k + usize.ONE
+                }
+                j = j + usize.ONE
+              }
+            }
+          }
+          Value.Object { entries: members } => {
+            if key == "minProperties" || key == "maxProperties" {
+              valid = run countWithin(List<JsonEntry>.length(&members), constraint, key == "maxProperties")
+            } else if key == "required" {
+              valid = requiredPresent(instance, constraint)
+            } else if key == "dependentRequired" && modern(node.draft) {
+              match &constraint.* {
+                Value.Object { entries: requirements } => {
+                  let dependencies = List<JsonEntry>.asSlice(&requirements)
+                  let mut j = usize.ZERO
+                  while j < dependencies.length {
+                    if hasField(instance, String.view(&dependencies[j].key)) &&
+                        !requiredPresent(instance, &dependencies[j].value) { valid = false }
+                    j = j + usize.ONE
+                  }
+                }
+                _ => {}
+              }
+            }
+          }
+          _ => {}
+        }
+        if !valid {
+          run reject(&mut result.*, compiled, index, evaluationPath, instancePath, key,
+            "instance does not satisfy the keyword")
+        }
+        i = i + usize.ONE
+      }
+    }
+    _ => {}
+  }
+}
+
+fn requiredPresent(instance: &Value, required: &Value) -> bool {
+  return match &required.* {
+    Value.Array { values } => {
+      let names = List<Value>.asSlice(&values)
+      let mut i = usize.ZERO
+      while i < names.length {
+        let name = Option<string>.unwrapOr(Json.asString(Option<&Value>.some(&names[i])), "")
+        if !hasField(instance, name) { return false }
+        i = i + usize.ONE
+      }
+      return true
+    }
+    _ => true
+  }
+}
+
+fn dynamicTarget(compiled: &CompiledSchema, source: usize, target: usize, context: &Context) -> usize {
+  let nodes = List<Node>.asSlice(&compiled.nodes)
+  let name = String.view(&nodes[source].dynamicName)
+  if name == "" || String.startsWith(name, "/") ||
+      textField(nodes[target].value, "$dynamicAnchor") != name { return target }
+  let scope = List<usize>.asSlice(&context.scope)
+  let aliases = List<Alias>.asSlice(&compiled.aliases)
+  let mut i = usize.ZERO
+  while i < scope.length {
+    let mut j = usize.ZERO
+    while j < aliases.length {
+      if aliases[j].dynamic && nodes[aliases[j].node].resource == scope[i] &&
+          fragment(String.view(&aliases[j].uri)) == name { return aliases[j].node }
+      j = j + usize.ONE
+    }
+    i = i + usize.ONE
+  }
+  return target
+}
+
+fn recursiveTarget(compiled: &CompiledSchema, target: usize, context: &Context) -> usize {
+  let nodes = List<Node>.asSlice(&compiled.nodes)
+  if !flag(nodes[target].value, "$recursiveAnchor") { return target }
+  let scope = List<usize>.asSlice(&context.scope)
+  let mut result = target
+  let mut i = scope.length
+  while i != usize.ZERO {
+    i = i - usize.ONE
+    if !flag(nodes[scope[i]].value, "$recursiveAnchor") { break }
+    result = scope[i]
+  }
+  return result
+}
+
+effect fn evaluate(compiled: &CompiledSchema, index: usize, instance: &Value,
+  instancePath: string, evaluationPath: string, context: &mut Context) -> Evaluation
+  ! SchemaError | RegexError | OutOfMemoryError ? &mut Allocator {
+  let frames = List<Frame>.asSlice(&context.active)
+  let mut i = usize.ZERO
+  while i < frames.length {
+    if frames[i].node == index && frames[i].instanceLength == String.byteLength(instancePath) &&
+        frames[i].instanceType == instanceType(instance) {
+      fail run problem(SchemaReason.NonterminatingReference, evaluationPath,
+        "reference cycle applies the same schema without instance progress")
+    }
+    i = i + usize.ONE
+  }
+  run List<Frame>.append(&mut context.active,
+    Frame { node: index, instanceLength: String.byteLength(instancePath),
+      instanceType: instanceType(instance) })
+  let node = &List<Node>.asSlice(&compiled.nodes)[index]
+  let scopeLength = List<usize>.length(&context.scope)
+  if scopeLength == usize.ZERO ||
+      List<usize>.get(&context.scope, scopeLength - usize.ONE) != node.resource {
+    run List<usize>.append(&mut context.scope, node.resource)
+  }
+  let mut result = successful()
+  if !boolean(node.value, true) {
+    run reject(&mut result, compiled, index, evaluationPath, instancePath, "",
+      "boolean schema is false")
+  }
+  if node.reference != usize.MAX {
+    let path = run pointer(evaluationPath, "$ref")
+    let reference = run evaluate(compiled, node.reference, instance, instancePath,
+      String.view(&path), &mut context.*)
+    run combine(&mut result, move reference, true)
+  }
+  if modern(node.draft) || node.reference == usize.MAX {
+    if node.dynamicReference != usize.MAX {
+      let target = dynamicTarget(compiled, index, node.dynamicReference, &context.*)
+      let path = run pointer(evaluationPath, "$dynamicRef")
+      let reference = run evaluate(compiled, target, instance, instancePath, String.view(&path), &mut context.*)
+      run combine(&mut result, move reference, true)
+    }
+    if node.recursiveReference != usize.MAX {
+      let target = recursiveTarget(compiled, node.recursiveReference, &context.*)
+      let path = run pointer(evaluationPath, "$recursiveRef")
+      let reference = run evaluate(compiled, target, instance, instancePath, String.view(&path), &mut context.*)
+      run combine(&mut result, move reference, true)
+    }
+    run assertions(compiled, index, instance, instancePath, evaluationPath, &mut result)
+    if node.formatEnabled && hasField(node.value, "format") &&
+        (compiled.options.assertFormats || node.formatAssertion) {
+      let name = textField(node.value, "format")
+      if node.formatAssertion && !SchemaFormat.known(name) {
+        run reject(&mut result, compiled, index, evaluationPath, instancePath,
+          "format", "format-assertion vocabulary does not recognize the format")
+      } else {
+        match &instance.* {
+          Value.String { text } => {
+            if !run SchemaFormat.check(name, String.view(&text)) {
+              run reject(&mut result, compiled, index, evaluationPath, instancePath,
+                "format", "string does not satisfy the format")
+            }
+          }
+          _ => {}
+        }
+      }
+    }
+    if node.applicator {
+      run branches(compiled, index, instance, instancePath, evaluationPath, &mut context.*, &mut result)
+      run objectKeywords(compiled, index, instance, instancePath, evaluationPath, &mut context.*, &mut result)
+      run arrayKeywords(compiled, index, instance, instancePath, evaluationPath, &mut context.*, &mut result)
+    }
+    if modern(node.draft) && node.unevaluated {
+      run unevaluatedKeywords(compiled, index, instance, instancePath, evaluationPath, &mut context.*, &mut result)
+    }
+  }
+  let remainingFrames = List<Frame>.length(&context.active) - usize.ONE
+  List<Frame>.truncate(&mut context.active, remainingFrames)
+  List<usize>.truncate(&mut context.scope, scopeLength)
+  if !result.valid {
+    List<usize>.clear(&mut result.properties)
+    List<usize>.clear(&mut result.items)
+  }
+  return move result
+}
+
+effect fn branches(compiled: &CompiledSchema, index: usize, instance: &Value,
+  instancePath: string, evaluationPath: string, context: &mut Context, result: &mut Evaluation)
+  -> () ! SchemaError | RegexError | OutOfMemoryError ? &mut Allocator {
+  let node = &List<Node>.asSlice(&compiled.nodes)[index]
+  let keywords = ["allOf", "anyOf", "oneOf"]
+  let mut k = usize.ZERO
+  while k < 3 {
+    let keyword = keywords[k]
+    match move Json.field(node.value, keyword) {
+      Option<&Value>.Some { value } => match &value.* {
+        Value.Array { values } => {
+          let mut collected = successful()
+          let mut failures = successful()
+          let mut successes = usize.ZERO
+          let mut j = usize.ZERO
+          while j < List<Value>.length(&values) {
+            let token = run indexText(j)
+            let mut branch = run applyChild(compiled, index, keyword, String.view(&token), true,
+              instance, instancePath, evaluationPath, &mut context.*)
+            if branch.valid {
+              successes = successes + usize.ONE
+              run annotations(&mut collected, &branch)
+            } else { run transferErrors(&mut failures, &mut branch) }
+            j = j + usize.ONE
+          }
+          let valid = if keyword == "allOf" {
+            successes == List<Value>.length(&values)
+          } else if keyword == "anyOf" { successes != usize.ZERO } else { successes == usize.ONE }
+          if valid { run annotations(&mut result.*, &collected) }
+          else {
+            run transferErrors(&mut result.*, &mut failures)
+            run reject(&mut result.*, compiled, index, evaluationPath, instancePath, keyword,
+              if keyword == "oneOf" { "exactly one subschema must validate" }
+              else if keyword == "anyOf" { "at least one subschema must validate" }
+              else { "every subschema must validate" })
+          }
+        }
+        _ => {}
+      }
+      Option<&Value>.None => {}
+    }
+    k = k + usize.ONE
+  }
+  if hasField(node.value, "not") {
+    let negated = run applyChild(compiled, index, "not", "", false, instance,
+      instancePath, evaluationPath, &mut context.*)
+    if negated.valid {
+      run reject(&mut result.*, compiled, index, evaluationPath, instancePath, "not",
+        "negated subschema validates")
+    }
+  }
+  if node.draft != Draft.Draft4 && node.draft != Draft.Draft6 && hasField(node.value, "if") {
+    let condition = run applyChild(compiled, index, "if", "", false, instance,
+      instancePath, evaluationPath, &mut context.*)
+    run annotations(&mut result.*, &condition)
+    let keyword = if condition.valid { "then" } else { "else" }
+    if hasField(node.value, keyword) {
+      let branch = run applyChild(compiled, index, keyword, "", false, instance,
+        instancePath, evaluationPath, &mut context.*)
+      run combine(&mut result.*, move branch, true)
+    }
+  }
+}
+
+effect fn matchedProperty(node: &Node, name: string) -> bool
+  ! RegexError | OutOfMemoryError ? &mut Allocator {
+  match move Json.field(node.value, "properties") {
+    Option<&Value>.Some { value } => { if hasField(value, name) { return true } }
+    Option<&Value>.None => {}
+  }
+  let patterns = List<Pattern>.asSlice(&node.propertyPatterns)
+  let mut i = usize.ZERO
+  while i < patterns.length {
+    if run Regex.test(&patterns[i], name) { return true }
+    i = i + usize.ONE
+  }
+  return false
+}
+
+effect fn objectKeywords(compiled: &CompiledSchema, index: usize, instance: &Value,
+  instancePath: string, evaluationPath: string, context: &mut Context, result: &mut Evaluation)
+  -> () ! SchemaError | RegexError | OutOfMemoryError ? &mut Allocator {
+  let members = match &instance.* {
+    Value.Object { entries } => List<JsonEntry>.asSlice(&entries)
+    _ => { return }
+  }
+  let node = &List<Node>.asSlice(&compiled.nodes)[index]
+  let schema = node.value
+  let keywords = ["properties", "patternProperties"]
+  let mut k = usize.ZERO
+  while k < 2 {
+    let keyword = keywords[k]
+    match move Json.field(schema, keyword) {
+      Option<&Value>.Some { value } => match &value.* {
+        Value.Object { entries } => {
+          let constraints = List<JsonEntry>.asSlice(&entries)
+          let mut applied = successful()
+          let mut j = usize.ZERO
+          while j < constraints.length {
+            let name = String.view(&constraints[j].key)
+            let mut m = usize.ZERO
+            while m < members.length {
+              let member = String.view(&members[m].key)
+              let matches = if keyword == "properties" { name == member }
+                else { run Regex.test(&List<Pattern>.asSlice(&node.propertyPatterns)[j], member) }
+              if matches {
+                let location = run pointer(instancePath, member)
+                let child = run applyChild(compiled, index, keyword, name, true,
+                  &members[m].value, String.view(&location), evaluationPath, &mut context.*)
+                run combine(&mut applied, move child, false)
+                run mark(&mut applied.properties, m)
+              }
+              m = m + usize.ONE
+            }
+            j = j + usize.ONE
+          }
+          run combine(&mut result.*, move applied, true)
+        }
+        _ => {}
+      }
+      Option<&Value>.None => {}
+    }
+    k = k + usize.ONE
+  }
+  if hasField(schema, "additionalProperties") {
+    let mut applied = successful()
+    let mut i = usize.ZERO
+    while i < members.length {
+      let name = String.view(&members[i].key)
+      if !run matchedProperty(node, name) {
+        let location = run pointer(instancePath, name)
+        let child = run applyChild(compiled, index, "additionalProperties", "", false,
+          &members[i].value, String.view(&location), evaluationPath, &mut context.*)
+        run combine(&mut applied, move child, false)
+        run mark(&mut applied.properties, i)
+      }
+      i = i + usize.ONE
+    }
+    run combine(&mut result.*, move applied, true)
+  }
+  if node.draft != Draft.Draft4 && hasField(schema, "propertyNames") {
+    let mut i = usize.ZERO
+    while i < members.length {
+      let name = Value.String { text: run String.copy(String.view(&members[i].key)) }
+      let child = run applyChild(compiled, index, "propertyNames", "", false,
+        &name, instancePath, evaluationPath, &mut context.*)
+      run combine(&mut result.*, move child, false)
+      i = i + usize.ONE
+    }
+  }
+  run dependencies(compiled, index, "dependencies", instance, instancePath, evaluationPath, &mut context.*, &mut result.*)
+  if modern(node.draft) {
+    run dependencies(compiled, index, "dependentSchemas", instance, instancePath,
+      evaluationPath, &mut context.*, &mut result.*)
+  }
+}
+
+effect fn dependencies(compiled: &CompiledSchema, index: usize, dependencyKeyword: string,
+  instance: &Value, instancePath: string, evaluationPath: string, context: &mut Context,
+  result: &mut Evaluation) -> () ! SchemaError | RegexError | OutOfMemoryError ? &mut Allocator {
+  let schema = List<Node>.asSlice(&compiled.nodes)[index].value
+  match move Json.field(schema, dependencyKeyword) {
+    Option<&Value>.Some { value } => match &value.* {
+      Value.Object { entries } => {
+        let dependencies = List<JsonEntry>.asSlice(&entries)
+        let mut i = usize.ZERO
+        while i < dependencies.length {
+          let name = String.view(&dependencies[i].key)
+          if hasField(instance, name) {
+            if isArray(&dependencies[i].value) {
+              if !requiredPresent(instance, &dependencies[i].value) {
+                run reject(&mut result.*, compiled, index, evaluationPath, instancePath,
+                  dependencyKeyword, "dependent properties are missing")
+              }
+            } else {
+              let child = run applyChild(compiled, index, dependencyKeyword, name, true,
+                instance, instancePath, evaluationPath, &mut context.*)
+              run combine(&mut result.*, move child, true)
+            }
+          }
+          i = i + usize.ONE
+        }
+      }
+      _ => {}
+    }
+    Option<&Value>.None => {}
+  }
+}
+
+effect fn arrayKeywords(compiled: &CompiledSchema, index: usize, instance: &Value,
+  instancePath: string, evaluationPath: string, context: &mut Context, result: &mut Evaluation)
+  -> () ! SchemaError | RegexError | OutOfMemoryError ? &mut Allocator {
+  let elements = match &instance.* {
+    Value.Array { values } => List<Value>.asSlice(&values)
+    _ => { return }
+  }
+  let node = &List<Node>.asSlice(&compiled.nodes)[index]
+  let schema = node.value
+  let tupleKeyword = if node.draft == Draft.Draft202012 { "prefixItems" } else { "items" }
+  let mut tupleLength = usize.ZERO
+  let mut tupleItems = false
+  match move Json.field(schema, tupleKeyword) {
+    Option<&Value>.Some { value } => match &value.* {
+      Value.Array { values } => {
+        tupleItems = true
+        tupleLength = List<Value>.length(&values)
+        let mut applied = successful()
+        let mut i = usize.ZERO
+        while i < tupleLength && i < elements.length {
+          let token = run indexText(i)
+          let location = run pointer(instancePath, String.view(&token))
+          let child = run applyChild(compiled, index, tupleKeyword, String.view(&token), true,
+            &elements[i], String.view(&location), evaluationPath, &mut context.*)
+          run combine(&mut applied, move child, false)
+          run mark(&mut applied.items, i)
+          i = i + usize.ONE
+        }
+        run combine(&mut result.*, move applied, true)
+      }
+      _ => {}
+    }
+    Option<&Value>.None => {}
+  }
+  let remainderKeyword = if node.draft == Draft.Draft202012 || !tupleItems {
+    "items"
+  } else { "additionalItems" }
+  if hasField(schema, remainderKeyword) {
+    let mut applied = successful()
+    let mut i = if tupleItems { tupleLength } else { usize.ZERO }
+    while i < elements.length {
+      let token = run indexText(i)
+      let location = run pointer(instancePath, String.view(&token))
+      let child = run applyChild(compiled, index, remainderKeyword, "", false,
+        &elements[i], String.view(&location), evaluationPath, &mut context.*)
+      run combine(&mut applied, move child, false)
+      run mark(&mut applied.items, i)
+      i = i + usize.ONE
+    }
+    run combine(&mut result.*, move applied, true)
+  }
+  if node.draft != Draft.Draft4 && hasField(schema, "contains") {
+    let mut matches = List<usize>.make()
+    let mut i = usize.ZERO
+    while i < elements.length {
+      let token = run indexText(i)
+      let location = run pointer(instancePath, String.view(&token))
+      let child = run applyChild(compiled, index, "contains", "", false, &elements[i],
+        String.view(&location), evaluationPath, &mut context.*)
+      if child.valid { run List<usize>.append(&mut matches, i) }
+      i = i + usize.ONE
+    }
+    let count = List<usize>.length(&matches)
+    let mut valid = count != usize.ZERO
+    if modern(node.draft) && node.validation {
+      match move Json.field(schema, "minContains") {
+        Option<&Value>.Some { value } => { valid = run countWithin(count, value, false) }
+        Option<&Value>.None => {}
+      }
+      match move Json.field(schema, "maxContains") {
+        Option<&Value>.Some { value } => {
+          if !run countWithin(count, value, true) { valid = false }
+        }
+        Option<&Value>.None => {}
+      }
+    }
+    if valid {
+      if node.draft == Draft.Draft202012 { run mergeMarks(&mut result.items, &matches) }
+    } else {
+      run reject(&mut result.*, compiled, index, evaluationPath, instancePath, "contains",
+        "number of matching array elements is outside the contains bounds")
+    }
+  }
+}
+
+effect fn unevaluatedKeywords(compiled: &CompiledSchema, index: usize, instance: &Value,
+  instancePath: string, evaluationPath: string, context: &mut Context, result: &mut Evaluation)
+  -> () ! SchemaError | RegexError | OutOfMemoryError ? &mut Allocator {
+  let schema = List<Node>.asSlice(&compiled.nodes)[index].value
+  match &instance.* {
+    Value.Object { entries } => {
+      if !hasField(schema, "unevaluatedProperties") { return }
+      let members = List<JsonEntry>.asSlice(&entries)
+      let mut applied = successful()
+      let mut i = usize.ZERO
+      while i < members.length {
+        if !marked(&result.properties, i) {
+          let location = run pointer(instancePath, String.view(&members[i].key))
+          let child = run applyChild(compiled, index, "unevaluatedProperties", "", false,
+            &members[i].value, String.view(&location), evaluationPath, &mut context.*)
+          run combine(&mut applied, move child, false)
+          run mark(&mut applied.properties, i)
+        }
+        i = i + usize.ONE
+      }
+      run combine(&mut result.*, move applied, true)
+    }
+    Value.Array { values } => {
+      if !hasField(schema, "unevaluatedItems") { return }
+      let elements = List<Value>.asSlice(&values)
+      let mut applied = successful()
+      let mut i = usize.ZERO
+      while i < elements.length {
+        if !marked(&result.items, i) {
+          let token = run indexText(i)
+          let location = run pointer(instancePath, String.view(&token))
+          let child = run applyChild(compiled, index, "unevaluatedItems", "", false,
+            &elements[i], String.view(&location), evaluationPath, &mut context.*)
+          run combine(&mut applied, move child, false)
+          run mark(&mut applied.items, i)
+        }
+        i = i + usize.ONE
+      }
+      run combine(&mut result.*, move applied, true)
+    }
+    _ => {}
+  }
+}
+
+fn instanceType(value: &Value) -> u8 {
+  return match &value.* {
+    Value.Null => 0
+    Value.Bool { .. } => 1
+    Value.Number { .. } => 2
+    Value.String { .. } => 3
+    Value.Array { .. } => 4
+    Value.Object { .. } => 5
+  }
+}
+
+fn finiteTree(value: &Value) -> bool {
+  return match &value.* {
+    Value.Number { value: number } => Json.numberIsFinite(&number)
+    Value.Array { values } => {
+      let children = List<Value>.asSlice(&values)
+      let mut i = usize.ZERO
+      while i < children.length {
+        if !finiteTree(&children[i]) { return false }
+        i = i + usize.ONE
+      }
+      return true
+    }
+    Value.Object { entries } => {
+      let children = List<JsonEntry>.asSlice(&entries)
+      let mut i = usize.ZERO
+      while i < children.length {
+        if !finiteTree(&children[i].value) { return false }
+        i = i + usize.ONE
+      }
+      return true
+    }
+    _ => true
+  }
+}

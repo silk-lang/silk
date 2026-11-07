@@ -1,0 +1,944 @@
+//! Native ECMAScript Unicode regular expressions for text and JSON Schema patterns.
+//!
+//! # When to use
+//! Use `Regex.compile` and `Regex.test` to reuse a `Pattern` across many searches. Use
+//! `Regex.validate` to check syntax or `Regex.matches` for a one-off unanchored search. Patterns
+//! use the ECMA-262 Unicode (`u`) grammar, not shell glob syntax.
+//!
+//! # Details
+//! Matching supports captures, named and numeric backreferences, forward and backward assertions,
+//! alternation, character classes, Unicode properties, greedy and lazy repetition, and scoped
+//! `i`, `m`, and `s` modifiers. Unicode properties and simple case folding use Unicode 17.0.0.
+//! Text is UTF-8: positions advance by Unicode scalars, never by bytes or UTF-16 code units.
+//! Syntax failures and exhausted resource limits are errors, never a negative match.
+//!
+//! @category Text
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.text.string { String }
+import silk.text.utf8_scan
+import silk.text.regex_unicode
+import silk.num.u8
+import silk.num.u32
+
+/// The reason a Unicode regular expression could not be parsed or matched.
+pub enum RegexReason {
+  /// A metacharacter occurs where the Unicode pattern grammar does not permit it.
+  UnexpectedToken,
+  /// A parenthesized group has no closing parenthesis.
+  UnclosedGroup,
+  /// A character class has no closing bracket.
+  UnclosedClass,
+  /// An escape is incomplete or forbidden by the Unicode pattern grammar.
+  InvalidEscape,
+  /// A class range has non-character endpoints or descending endpoints.
+  InvalidRange,
+  /// A quantifier is malformed, has descending bounds, or follows an assertion.
+  InvalidQuantifier,
+  /// A numeric or named backreference has no corresponding capture.
+  InvalidReference,
+  /// A capture name is not an ECMAScript identifier.
+  InvalidName,
+  /// Two same-named captures can participate in the same alternative.
+  DuplicateName,
+  /// A Unicode property name or value is not an exact permitted alias.
+  InvalidProperty,
+  /// The pattern exceeds a documented parser size, nesting, or repetition bound.
+  PatternLimit,
+  /// Matching exhausted the documented work or recursive-frame limit.
+  MatchLimit,
+}
+
+/// A structured regex failure, distinct from a valid pattern that does not match.
+pub struct RegexError {
+  /// The syntax or resource-limit failure.
+  pub reason: RegexReason,
+  /// The byte offset in the pattern where the failure was detected; zero for a matching limit.
+  pub offset: usize,
+}
+
+/// An owned, immutable ECMAScript Unicode regular-expression program.
+///
+/// # Details
+/// Construct it with `Regex.compile` and search any number of strings with `Regex.test`. It owns
+/// decoded instructions and does not borrow the source pattern. Matching does not mutate it.
+pub struct Pattern { program: Program }
+
+/// The owner of native ECMAScript Unicode pattern validation and unanchored matching operations.
+pub struct Regex {}
+
+impl Regex {
+  /// Compiles an ECMAScript Unicode (`u`) pattern for repeated unanchored searches.
+  ///
+  /// # Details
+  /// Patterns have no surrounding slashes or flags. Scoped `i`, `m` and `s` modifiers are supported.
+  /// Captures, backreferences, lookarounds and Unicode property escapes are compiled natively;
+  /// property aliases and simple case folding use Unicode 17.0.0. The result owns its instructions
+  /// and does not borrow `pattern`.
+  ///
+  /// # Errors
+  /// - `RegexError` for invalid syntax, more than 65,536 pattern bytes, group nesting beyond 256,
+  ///   or a repetition bound greater than 1,000,000.
+  /// - `OutOfMemoryError` if the allocator cannot supply the program.
+  pub effect fn compile(pattern: string) -> Pattern ! RegexError | OutOfMemoryError ? &mut Allocator {
+    return Pattern { program: run compilePattern(pattern) }
+  }
+
+  /// Checks the entire pattern against the ECMAScript Unicode (`u`) grammar.
+  ///
+  /// # Details
+  /// There are no surrounding slashes or flags. Scoped `(?ims-ims:...)` modifiers are accepted.
+  /// Unicode property aliases are exact, case-sensitive Unicode 17.0.0 aliases. Numeric and named
+  /// forward references are checked after parsing; duplicate names are allowed only in disjoint
+  /// alternatives. Legacy octal and identity escapes are not accepted in Unicode mode.
+  ///
+  /// # Errors
+  /// - `RegexError` for invalid syntax, more than 65,536 pattern bytes, nesting beyond 256 groups,
+  ///   or a repetition bound greater than 1,000,000.
+  /// - `OutOfMemoryError` if the allocator cannot supply the parsed pattern.
+  pub effect fn validate(pattern: string) -> () ! RegexError | OutOfMemoryError ? &mut Allocator {
+    let program = run compilePattern(pattern)
+    drop program
+    return ()
+  }
+
+  /// Returns whether any substring of `text` matches an ECMAScript Unicode (`u`) pattern.
+  ///
+  /// # Details
+  /// The pattern has no surrounding slashes or flags. Matching is case-sensitive, with `.` excluding
+  /// LF, CR, U+2028 and U+2029, unless scoped `i`, `m` or `s` modifiers change those rules. Without
+  /// `m`, `^` and `$` mean the actual beginning and end, including when text ends in a newline.
+  /// `\d` and `\w` are ASCII classes; `\s` is ECMAScript whitespace and line terminators.
+  /// Captures, backreferences, lazy repetition and variable-length lookbehind have ECMAScript
+  /// backtracking order. Positive lookarounds commit their first successful captures. The Unicode
+  /// property and case-folding data version is 17.0.0. Text advances by UTF-8 Unicode scalars.
+  ///
+  /// # Errors
+  /// - `RegexError` for invalid syntax, more than 65,536 pattern bytes, group nesting beyond 256,
+  ///   a repetition bound greater than 1,000,000, more than 1,000,000 matcher steps, or recursive
+  ///   matching deeper than 1,024 frames. Exhaustion is never reported as `false`.
+  /// - `OutOfMemoryError` if the allocator cannot supply the program or matcher state.
+  pub effect fn matches(pattern: string, text: string) -> bool
+    ! RegexError | OutOfMemoryError ? &mut Allocator {
+    let compiled = run Regex.compile(pattern)
+    return run Regex.test(&compiled, text)
+  }
+
+  /// Searches `text` with a previously compiled ECMAScript Unicode pattern.
+  ///
+  /// # Details
+  /// Searches are unanchored unless the pattern supplies anchors. Captures and repetition use
+  /// ECMAScript backtracking order, positive lookarounds are atomic, and lookbehind runs backward.
+  /// Text advances by Unicode scalars. The pattern is immutable; input and backtracking storage
+  /// belong to this invocation. Unicode properties and folding use Unicode 17.0.0.
+  ///
+  /// # Errors
+  /// - `RegexError` with `MatchLimit` after 1,000,000 matcher steps or 1,024 recursive frames.
+  ///   Exhaustion is never reported as `false`.
+  /// - `OutOfMemoryError` if the allocator cannot supply input or matcher storage.
+  pub effect fn test(pattern: &Pattern, text: string) -> bool
+    ! RegexError | OutOfMemoryError ? &mut Allocator {
+    let program = &pattern.program
+    let mut state = State {
+      text: List<u32>.make(), captures: List<Capture>.make(), changes: List<Change>.make(),
+      frames: List<Frame>.make(), steps: 0,
+    }
+    let bytes = String.utf8Bytes(text)
+    let mut at: usize = 0
+    while at < bytes.length {
+      let decoded = utf8_scan.decode(bytes, at)
+      run List<u32>.append(&mut state.text, decoded.scalar)
+      at = decoded.next
+    }
+    run List<Capture>.appendRepeated(&mut state.captures, Capture { start: 0, end: 0, set: false }, program.captures + 1)
+    run List<Frame>.append(&mut state.frames, Frame { kind: FrameKind.Node, node: 0, next: 0, count: 0, previous: 0 })
+    at = 0
+    while at <= List<u32>.length(&state.text) {
+      if run evaluate(program, &mut state, program.root, 0, at, false, 0) { return true }
+      at = at + 1
+    }
+    return false
+  }
+}
+
+enum Op { Empty, Literal, Dot, Class, Start, End, Boundary, Sequence, Alternative, Capture, Reference, Repeat, Look }
+enum ItemKind { Range, Digit, Word, Space, Property }
+enum FrameKind { Node, Capture, Repeat }
+
+struct Node {
+  op: Op, a: usize, b: usize, scalar: u32, flags: u32, negative: bool, backward: bool,
+  minimum: usize, maximum: usize, lazy: bool, firstCapture: usize, afterCapture: usize,
+}
+impl Copy for Node {}
+struct Item { kind: ItemKind, low: u32, high: u32, property: usize, negative: bool }
+impl Copy for Item {}
+struct Name { text: List<u32>, capture: usize, node: usize, offset: usize }
+struct Program {
+  nodes: List<Node>, items: List<Item>, names: List<Name>, references: List<usize>, captures: usize, root: usize,
+}
+struct Parser { at: usize, depth: usize, flags: u32 }
+struct Capture { start: usize, end: usize, set: bool }
+impl Copy for Capture {}
+struct Change { index: usize, previous: Capture }
+impl Copy for Change {}
+struct Frame { kind: FrameKind, node: usize, next: usize, count: usize, previous: usize }
+impl Copy for Frame {}
+struct State { text: List<u32>, captures: List<Capture>, changes: List<Change>, frames: List<Frame>, steps: usize }
+
+fn node(op: Op, flags: u32, capture: usize) -> Node {
+  return Node { op: op, a: 0, b: 0, scalar: 0, flags: flags, negative: false, backward: false,
+    minimum: 0, maximum: 0, lazy: false, firstCapture: capture + 1, afterCapture: capture + 1 }
+}
+fn error(reason: RegexReason, offset: usize) -> RegexError { return RegexError { reason: reason, offset: offset } }
+fn peek(bytes: &[u8], at: usize) -> u8 {
+  if at < bytes.length { return bytes[at] }
+  return 0
+}
+fn digit(cp: u32) -> bool { return cp >= 48 && cp <= 57 }
+fn letter(cp: u32) -> bool { return (cp >= 65 && cp <= 90) || (cp >= 97 && cp <= 122) }
+fn hex(cp: u32) -> u32 {
+  if digit(cp) { return cp - 48 }
+  if cp >= 65 && cp <= 70 { return cp - 55 }
+  if cp >= 97 && cp <= 102 { return cp - 87 }
+  return 16
+}
+fn same(left: string, right: string) -> bool {
+  let a = String.utf8Bytes(left)
+  let b = String.utf8Bytes(right)
+  if a.length != b.length { return false }
+  let mut i: usize = 0
+  while i < a.length {
+    if a[i] != b[i] { return false }
+    i = i + 1
+  }
+  return true
+}
+fn sameName(left: &List<u32>, right: &List<u32>) -> bool {
+  let a = List<u32>.asSlice(left)
+  let b = List<u32>.asSlice(right)
+  if a.length != b.length { return false }
+  let mut i: usize = 0
+  while i < a.length {
+    if a[i] != b[i] { return false }
+    i = i + 1
+  }
+  return true
+}
+
+effect fn add(program: &mut Program, value: Node) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let index = List<Node>.length(&program.nodes)
+  run List<Node>.append(&mut program.nodes, value)
+  return index
+}
+
+effect fn compilePattern(pattern: string) -> Program ! RegexError | OutOfMemoryError ? &mut Allocator {
+  let bytes = String.utf8Bytes(pattern)
+  if bytes.length > 65536 { fail error(RegexReason.PatternLimit, 65536) }
+  let mut program = Program { nodes: List<Node>.make(), items: List<Item>.make(), names: List<Name>.make(),
+    references: List<usize>.make(), captures: 0, root: 0 }
+  let mut parser = Parser { at: 0, depth: 0, flags: 0 }
+  program.root = run disjunction(pattern, &mut parser, &mut program)
+  if parser.at != bytes.length { fail error(RegexReason.UnexpectedToken, parser.at) }
+  run resolve(&mut program)
+  program.names = List<Name>.make()
+  return move program
+}
+
+effect fn disjunction(pattern: string, parser: &mut Parser, program: &mut Program) -> usize
+  ! RegexError | OutOfMemoryError ? &mut Allocator {
+  let first = program.captures
+  let mut result = run sequence(pattern, &mut parser.*, &mut program.*)
+  let bytes = String.utf8Bytes(pattern)
+  while peek(bytes, parser.at) == 124 {
+    parser.at = parser.at + 1
+    let right = run sequence(pattern, &mut parser.*, &mut program.*)
+    let mut value = node(Op.Alternative, parser.flags, first)
+    value.a = result
+    value.b = right
+    value.afterCapture = program.captures + 1
+    result = run add(&mut program.*, value)
+  }
+  return result
+}
+
+effect fn sequence(pattern: string, parser: &mut Parser, program: &mut Program) -> usize
+  ! RegexError | OutOfMemoryError ? &mut Allocator {
+  let first = program.captures
+  let bytes = String.utf8Bytes(pattern)
+  let mut result = run add(&mut program.*, node(Op.Empty, parser.flags, first))
+  while parser.at < bytes.length && bytes[parser.at] != 124 && bytes[parser.at] != 41 {
+    let right = run term(pattern, &mut parser.*, &mut program.*)
+    let mut value = node(Op.Sequence, parser.flags, first)
+    value.a = result
+    value.b = right
+    value.afterCapture = program.captures + 1
+    result = run add(&mut program.*, value)
+  }
+  return result
+}
+
+effect fn decimal(bytes: &[u8], parser: &mut Parser) -> usize ! RegexError {
+  let start = parser.at
+  let mut value: usize = 0
+  while parser.at < bytes.length && digit(u8.toU32(bytes[parser.at])) {
+    let next = u32.toUsize(u8.toU32(bytes[parser.at]) - 48)
+    if value > 100000 || (value == 100000 && next > 0) { fail error(RegexReason.PatternLimit, start) }
+    value = value * 10 + next
+    parser.at = parser.at + 1
+  }
+  if parser.at == start { fail error(RegexReason.InvalidQuantifier, start) }
+  return value
+}
+
+effect fn term(pattern: string, parser: &mut Parser, program: &mut Program) -> usize
+  ! RegexError | OutOfMemoryError ? &mut Allocator {
+  let bytes = String.utf8Bytes(pattern)
+  let first = program.captures
+  let atom = run parseAtom(pattern, &mut parser.*, &mut program.*)
+  let at = parser.at
+  let byte = peek(bytes, at)
+  if byte != 42 && byte != 43 && byte != 63 && byte != 123 { return atom }
+  let op = List<Node>.get(&program.nodes, atom).op
+  if op == Op.Start || op == Op.End || op == Op.Boundary || op == Op.Look {
+    fail error(RegexReason.InvalidQuantifier, at)
+  }
+  parser.at = parser.at + 1
+  let mut value = node(Op.Repeat, parser.flags, first)
+  value.a = atom
+  value.maximum = 1000001
+  if byte == 43 { value.minimum = 1 }
+  if byte == 63 { value.maximum = 1 }
+  if byte == 123 {
+    value.minimum = run decimal(bytes, &mut parser.*)
+    value.maximum = value.minimum
+    if peek(bytes, parser.at) == 44 {
+      parser.at = parser.at + 1
+      value.maximum = 1000001
+      if digit(u8.toU32(peek(bytes, parser.at))) { value.maximum = run decimal(bytes, &mut parser.*) }
+    }
+    if peek(bytes, parser.at) != 125 || value.minimum > value.maximum {
+      fail error(RegexReason.InvalidQuantifier, at)
+    }
+    parser.at = parser.at + 1
+  }
+  if peek(bytes, parser.at) == 63 {
+    value.lazy = true
+    parser.at = parser.at + 1
+  }
+  value.afterCapture = program.captures + 1
+  return run add(&mut program.*, value)
+}
+
+effect fn parseAtom(pattern: string, parser: &mut Parser, program: &mut Program) -> usize
+  ! RegexError | OutOfMemoryError ? &mut Allocator {
+  let bytes = String.utf8Bytes(pattern)
+  let at = parser.at
+  let byte = bytes[at]
+  parser.at = at + 1
+  let mut value = node(Op.Literal, parser.flags, program.captures)
+  if byte == 40 { return run group(pattern, &mut parser.*, &mut program.*, at) }
+  if byte == 91 { return run characterClass(pattern, &mut parser.*, &mut program.*) }
+  if byte == 92 {
+    if peek(bytes, parser.at) == 98 || peek(bytes, parser.at) == 66 {
+      value.op = Op.Boundary
+      value.negative = bytes[parser.at] == 66
+      parser.at = parser.at + 1
+      return run add(&mut program.*, value)
+    }
+    if digit(u8.toU32(peek(bytes, parser.at))) && peek(bytes, parser.at) != 48 {
+      value.op = Op.Reference
+      value.minimum = at
+      value.a = run decimal(bytes, &mut parser.*)
+      return run add(&mut program.*, value)
+    }
+    if peek(bytes, parser.at) == 107 {
+      parser.at = parser.at + 1
+      if peek(bytes, parser.at) != 60 { fail error(RegexReason.InvalidReference, at) }
+      parser.at = parser.at + 1
+      let name = run identifier(pattern, &mut parser.*)
+      value.op = Op.Reference
+      value.negative = true
+      let id = run add(&mut program.*, value)
+      run List<Name>.append(&mut program.names, Name { text: move name, capture: 0, node: id, offset: at })
+      return id
+    }
+    let item = run escape(pattern, &mut parser.*, false)
+    if item.kind == ItemKind.Range {
+      value.scalar = item.low
+    } else {
+      value.op = Op.Class
+      value.a = List<Item>.length(&program.items)
+      run List<Item>.append(&mut program.items, item)
+      value.b = List<Item>.length(&program.items)
+    }
+    return run add(&mut program.*, value)
+  }
+  if byte == 46 { value.op = Op.Dot }
+  else if byte == 94 { value.op = Op.Start }
+  else if byte == 36 { value.op = Op.End }
+  else if byte == 42 || byte == 43 || byte == 63 || byte == 123 || byte == 125 || byte == 93 {
+    fail error(RegexReason.UnexpectedToken, at)
+  } else {
+    let decoded = utf8_scan.decode(bytes, at)
+    value.scalar = decoded.scalar
+    parser.at = decoded.next
+  }
+  return run add(&mut program.*, value)
+}
+
+effect fn unicodeEscape(bytes: &[u8], parser: &mut Parser) -> u32 ! RegexError {
+  let start = parser.at
+  if peek(bytes, parser.at) == 123 {
+    parser.at = parser.at + 1
+    let digits = parser.at
+    let mut value: u32 = 0
+    while parser.at < bytes.length && hex(u8.toU32(bytes[parser.at])) < 16 {
+      if value > 0x10ffff / 16 { fail error(RegexReason.InvalidEscape, start) }
+      value = value * 16 + hex(u8.toU32(bytes[parser.at]))
+      parser.at = parser.at + 1
+    }
+    if parser.at == digits || peek(bytes, parser.at) != 125 || value > 0x10ffff {
+      fail error(RegexReason.InvalidEscape, start)
+    }
+    parser.at = parser.at + 1
+    return value
+  }
+  let first = run hexDigits(bytes, &mut parser.*, 4)
+  if first >= 0xd800 && first <= 0xdbff && peek(bytes, parser.at) == 92
+    && peek(bytes, parser.at + 1) == 117 && parser.at + 6 <= bytes.length {
+    let mut low: u32 = 0
+    let mut i: usize = 0
+    while i < 4 {
+      let part = hex(u8.toU32(bytes[parser.at + 2 + i]))
+      if part >= 16 { return first }
+      low = low * 16 + part
+      i = i + 1
+    }
+    if low >= 0xdc00 && low <= 0xdfff {
+      parser.at = parser.at + 6
+      return 0x10000 + (first - 0xd800) * 1024 + low - 0xdc00
+    }
+  }
+  return first
+}
+
+effect fn hexDigits(bytes: &[u8], parser: &mut Parser, count: usize) -> u32 ! RegexError {
+  let start = parser.at
+  let mut value: u32 = 0
+  let mut i: usize = 0
+  while i < count {
+    if parser.at >= bytes.length { fail error(RegexReason.InvalidEscape, start) }
+    let part = hex(u8.toU32(bytes[parser.at]))
+    if part >= 16 { fail error(RegexReason.InvalidEscape, parser.at) }
+    value = value * 16 + part
+    parser.at = parser.at + 1
+    i = i + 1
+  }
+  return value
+}
+
+effect fn escape(pattern: string, parser: &mut Parser, inClass: bool) -> Item ! RegexError {
+  let bytes = String.utf8Bytes(pattern)
+  let at = parser.at
+  if at >= bytes.length { fail error(RegexReason.InvalidEscape, at) }
+  let byte = bytes[at]
+  parser.at = at + 1
+  let mut result = Item { kind: ItemKind.Range, low: u8.toU32(byte), high: u8.toU32(byte), property: 0, negative: false }
+  if byte == 100 || byte == 68 {
+    result.kind = ItemKind.Digit
+    result.negative = byte == 68
+  }
+  else if byte == 119 || byte == 87 {
+    result.kind = ItemKind.Word
+    result.negative = byte == 87
+  }
+  else if byte == 115 || byte == 83 {
+    result.kind = ItemKind.Space
+    result.negative = byte == 83
+  }
+  else if byte == 112 || byte == 80 {
+    result.kind = ItemKind.Property
+    result.negative = byte == 80
+    if peek(bytes, parser.at) != 123 { fail error(RegexReason.InvalidProperty, at) }
+    parser.at = parser.at + 1
+    let start = parser.at
+    while parser.at < bytes.length && bytes[parser.at] != 125 { parser.at = parser.at + 1 }
+    if parser.at >= bytes.length { fail error(RegexReason.InvalidProperty, at) }
+    let mut split = start
+    while split < parser.at && bytes[split] != 61 { split = split + 1 }
+    if split == parser.at {
+      result.property = regex_unicode.lookup(0, String.slice(pattern, start, parser.at - start))
+    } else {
+      let property = String.slice(pattern, start, split - start)
+      let mut kind: usize = 0
+      if same(property, "gc") || same(property, "General_Category") { kind = 1 }
+      else if same(property, "sc") || same(property, "Script") { kind = 2 }
+      else if same(property, "scx") || same(property, "Script_Extensions") { kind = 3 }
+      else { fail error(RegexReason.InvalidProperty, at) }
+      result.property = regex_unicode.lookup(kind, String.slice(pattern, split + 1, parser.at - split - 1))
+    }
+    if result.property == 0 { fail error(RegexReason.InvalidProperty, at) }
+    parser.at = parser.at + 1
+  }
+  else if byte == 110 { result.low = 10 }
+  else if byte == 114 { result.low = 13 }
+  else if byte == 116 { result.low = 9 }
+  else if byte == 118 { result.low = 11 }
+  else if byte == 102 { result.low = 12 }
+  else if byte == 98 && inClass { result.low = 8 }
+  else if byte == 48 {
+    if digit(u8.toU32(peek(bytes, parser.at))) { fail error(RegexReason.InvalidEscape, at) }
+    result.low = 0
+  }
+  else if byte == 99 {
+    let control = u8.toU32(peek(bytes, parser.at))
+    if !letter(control) { fail error(RegexReason.InvalidEscape, at) }
+    result.low = control % 32
+    parser.at = parser.at + 1
+  }
+  else if byte == 120 { result.low = run hexDigits(bytes, &mut parser.*, 2) }
+  else if byte == 117 { result.low = run unicodeEscape(bytes, &mut parser.*) }
+  else if byte != 94 && byte != 36 && byte != 92 && byte != 46 && byte != 42 && byte != 43
+    && byte != 63 && byte != 40 && byte != 41 && byte != 91 && byte != 93 && byte != 123
+    && byte != 125 && byte != 124 && byte != 47 && !(inClass && byte == 45) {
+    fail error(RegexReason.InvalidEscape, at)
+  }
+  result.high = result.low
+  return result
+}
+
+effect fn classItem(pattern: string, parser: &mut Parser) -> Item ! RegexError {
+  let bytes = String.utf8Bytes(pattern)
+  if bytes[parser.at] == 92 {
+    parser.at = parser.at + 1
+    return run escape(pattern, &mut parser.*, true)
+  }
+  let decoded = utf8_scan.decode(bytes, parser.at)
+  parser.at = decoded.next
+  return Item { kind: ItemKind.Range, low: decoded.scalar, high: decoded.scalar, property: 0, negative: false }
+}
+
+effect fn characterClass(pattern: string, parser: &mut Parser, program: &mut Program) -> usize
+  ! RegexError | OutOfMemoryError ? &mut Allocator {
+  let bytes = String.utf8Bytes(pattern)
+  let start = parser.at - 1
+  let mut value = node(Op.Class, parser.flags, program.captures)
+  value.a = List<Item>.length(&program.items)
+  if peek(bytes, parser.at) == 94 {
+    value.negative = true
+    parser.at = parser.at + 1
+  }
+  while parser.at < bytes.length && bytes[parser.at] != 93 {
+    let mut item = run classItem(pattern, &mut parser.*)
+    if peek(bytes, parser.at) == 45 && parser.at + 1 < bytes.length && bytes[parser.at + 1] != 93 {
+      let dash = parser.at
+      parser.at = parser.at + 1
+      let end = run classItem(pattern, &mut parser.*)
+      if item.kind != ItemKind.Range || end.kind != ItemKind.Range || item.low > end.low {
+        fail error(RegexReason.InvalidRange, dash)
+      }
+      item.high = end.low
+    }
+    run List<Item>.append(&mut program.items, item)
+  }
+  if parser.at >= bytes.length { fail error(RegexReason.UnclosedClass, start) }
+  parser.at = parser.at + 1
+  value.b = List<Item>.length(&program.items)
+  return run add(&mut program.*, value)
+}
+
+effect fn identifier(pattern: string, parser: &mut Parser) -> List<u32>
+  ! RegexError | OutOfMemoryError ? &mut Allocator {
+  let bytes = String.utf8Bytes(pattern)
+  let start = parser.at
+  let mut result = List<u32>.make()
+  while parser.at < bytes.length && bytes[parser.at] != 62 {
+    let mut cp: u32 = 0
+    if bytes[parser.at] == 92 {
+      parser.at = parser.at + 1
+      if peek(bytes, parser.at) != 117 { fail error(RegexReason.InvalidName, parser.at) }
+      parser.at = parser.at + 1
+      cp = run unicodeEscape(bytes, &mut parser.*)
+    } else {
+      let decoded = utf8_scan.decode(bytes, parser.at)
+      parser.at = decoded.next
+      cp = decoded.scalar
+    }
+    if List<u32>.length(&result) == 0 {
+      if !regex_unicode.identifierStart(cp) { fail error(RegexReason.InvalidName, start) }
+    } else if !regex_unicode.identifierContinue(cp) { fail error(RegexReason.InvalidName, start) }
+    run List<u32>.append(&mut result, cp)
+  }
+  if List<u32>.length(&result) == 0 || parser.at >= bytes.length { fail error(RegexReason.InvalidName, start) }
+  parser.at = parser.at + 1
+  return move result
+}
+
+fn modifier(byte: u8) -> u32 {
+  if byte == 105 { return 1 }
+  if byte == 109 { return 2 }
+  if byte == 115 { return 4 }
+  return 0
+}
+
+effect fn group(pattern: string, parser: &mut Parser, program: &mut Program, start: usize) -> usize
+  ! RegexError | OutOfMemoryError ? &mut Allocator {
+  if parser.depth >= 256 { fail error(RegexReason.PatternLimit, start) }
+  parser.depth = parser.depth + 1
+  let flags = parser.flags
+  let bytes = String.utf8Bytes(pattern)
+  let mut value = node(Op.Capture, flags, program.captures)
+  let mut named = false
+  let mut name = List<u32>.make()
+  if peek(bytes, parser.at) == 63 {
+    parser.at = parser.at + 1
+    let byte = peek(bytes, parser.at)
+    if byte == 58 {
+      value.op = Op.Empty
+      parser.at = parser.at + 1
+    }
+    else if byte == 61 || byte == 33 {
+      value.op = Op.Look
+      value.negative = byte == 33
+      parser.at = parser.at + 1
+    } else if byte == 60 {
+      parser.at = parser.at + 1
+      let following = peek(bytes, parser.at)
+      if following == 61 || following == 33 {
+        value.op = Op.Look
+        value.backward = true
+        value.negative = following == 33
+        parser.at = parser.at + 1
+      } else {
+        named = true
+        name = run identifier(pattern, &mut parser.*)
+      }
+    } else {
+      value.op = Op.Empty
+      let mut added: u32 = 0
+      let mut removed: u32 = 0
+      while modifier(peek(bytes, parser.at)) != 0 {
+        let bit = modifier(bytes[parser.at])
+        if (added & bit) != 0 { fail error(RegexReason.UnexpectedToken, parser.at) }
+        added = added | bit
+        parser.at = parser.at + 1
+      }
+      if peek(bytes, parser.at) == 45 {
+        parser.at = parser.at + 1
+        while modifier(peek(bytes, parser.at)) != 0 {
+          let bit = modifier(bytes[parser.at])
+          if ((added | removed) & bit) != 0 { fail error(RegexReason.UnexpectedToken, parser.at) }
+          removed = removed | bit
+          parser.at = parser.at + 1
+        }
+        if removed == 0 { fail error(RegexReason.UnexpectedToken, parser.at) }
+      }
+      if (added | removed) == 0 || peek(bytes, parser.at) != 58 { fail error(RegexReason.UnexpectedToken, parser.at) }
+      parser.at = parser.at + 1
+      parser.flags = (flags | added) & (7 - removed)
+    }
+  }
+  if value.op == Op.Capture {
+    program.captures = program.captures + 1
+    value.b = program.captures
+  }
+  value.a = run disjunction(pattern, &mut parser.*, &mut program.*)
+  value.afterCapture = program.captures + 1
+  if peek(bytes, parser.at) != 41 { fail error(RegexReason.UnclosedGroup, start) }
+  parser.at = parser.at + 1
+  parser.depth = parser.depth - 1
+  parser.flags = flags
+  // A noncapturing group remains an atom, even when its child is an assertion.
+  if value.op == Op.Empty {
+    value.op = Op.Sequence
+    let empty = node(Op.Empty, flags, program.captures)
+    value.b = run add(&mut program.*, empty)
+  }
+  let index = run add(&mut program.*, value)
+  if named { run List<Name>.append(&mut program.names, Name { text: move name, capture: value.b, node: index, offset: start }) }
+  return index
+}
+
+fn owns(value: Node, capture: usize) -> bool { return capture >= value.firstCapture && capture < value.afterCapture }
+fn exclusive(program: &Program, root: usize, a: usize, b: usize) -> bool {
+  let mut current = root
+  while true {
+    let value = List<Node>.get(&program.nodes, current)
+    if value.op == Op.Alternative || value.op == Op.Sequence {
+      let left = List<Node>.get(&program.nodes, value.a)
+      let right = List<Node>.get(&program.nodes, value.b)
+      if value.op == Op.Alternative && ((owns(left, a) && owns(right, b)) || (owns(left, b) && owns(right, a))) { return true }
+      if owns(left, a) && owns(left, b) { current = value.a }
+      else if owns(right, a) && owns(right, b) { current = value.b }
+      else { return false }
+    } else if value.op == Op.Capture || value.op == Op.Look || value.op == Op.Repeat {
+      current = value.a
+    } else { return false }
+  }
+  return false
+}
+
+effect fn resolve(program: &mut Program) -> () ! RegexError | OutOfMemoryError ? &mut Allocator {
+  let mut i: usize = 0
+  while i < List<Node>.length(&program.nodes) {
+    let value = List<Node>.get(&program.nodes, i)
+    if value.op == Op.Reference && !value.negative && value.a > program.captures {
+      fail error(RegexReason.InvalidReference, value.minimum)
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < List<Name>.length(&program.names) {
+    let names = List<Name>.asSlice(&program.names)
+    let capture = names[i].capture
+    let offset = names[i].offset
+    let reference = names[i].node
+    let mut j: usize = 0
+    let first = List<usize>.length(&program.references)
+    while j < names.length {
+      if names[j].capture != 0 && sameName(&names[i].text, &names[j].text) {
+        if capture != 0 && j < i && !exclusive(&program.*, program.root, capture, names[j].capture) {
+          fail error(RegexReason.DuplicateName, offset)
+        }
+        if capture == 0 { run List<usize>.append(&mut program.references, names[j].capture) }
+      }
+      j = j + 1
+    }
+    if capture == 0 {
+      let last = List<usize>.length(&program.references)
+      if first == last { fail error(RegexReason.InvalidReference, offset) }
+      let mut value = List<Node>.get(&program.nodes, reference)
+      value.a = first
+      value.b = last
+      List<Node>.set(&mut program.nodes, reference, value)
+    }
+    i = i + 1
+  }
+  return ()
+}
+
+fn line(cp: u32) -> bool { return cp == 10 || cp == 13 || cp == 0x2028 || cp == 0x2029 }
+fn space(cp: u32) -> bool {
+  return (cp >= 9 && cp <= 13) || cp == 32 || cp == 0xa0 || cp == 0x1680
+    || (cp >= 0x2000 && cp <= 0x200a) || cp == 0x2028 || cp == 0x2029 || cp == 0x202f
+    || cp == 0x205f || cp == 0x3000 || cp == 0xfeff
+}
+fn word(cp: u32, flags: u32) -> bool {
+  if digit(cp) || letter(cp) || cp == 95 { return true }
+  if (flags & 1) != 0 {
+    let folded = regex_unicode.equivalent(cp, 0)
+    return digit(folded) || letter(folded) || folded == 95
+  }
+  return false
+}
+fn equalScalar(a: u32, b: u32, flags: u32) -> bool {
+  if a == b { return true }
+  return (flags & 1) != 0 && regex_unicode.equivalent(a, 0) == regex_unicode.equivalent(b, 0)
+}
+fn itemContains(item: Item, cp: u32, flags: u32) -> bool {
+  let result = match item.kind {
+    ItemKind.Range => cp >= item.low && cp <= item.high
+    ItemKind.Digit => digit(cp)
+    ItemKind.Word => word(cp, flags)
+    ItemKind.Space => space(cp)
+    ItemKind.Property => regex_unicode.contains(item.property, cp)
+  }
+  return result != item.negative
+}
+fn classContains(program: &Program, value: Node, cp: u32) -> bool {
+  let mut found = false
+  let mut i = value.a
+  while i < value.b && !found {
+    let item = List<Item>.get(&program.items, i)
+    if (value.flags & 1) == 0 { found = itemContains(item, cp, value.flags) }
+    else {
+      let mut member: usize = 0
+      while member < 4 && !found {
+        let equivalent = regex_unicode.equivalent(cp, member)
+        if equivalent > 0x10ffff { break }
+        found = itemContains(item, equivalent, value.flags)
+        member = member + 1
+      }
+    }
+    i = i + 1
+  }
+  return found != value.negative
+}
+
+fn rollback(state: &mut State, mark: usize) -> () {
+  while List<Change>.length(&state.changes) > mark {
+    let index = List<Change>.length(&state.changes) - 1
+    let change = List<Change>.get(&state.changes, index)
+    List<Capture>.set(&mut state.captures, change.index, change.previous)
+    List<Change>.truncate(&mut state.changes, index)
+  }
+}
+
+effect fn capture(state: &mut State, index: usize, value: Capture) -> () ! OutOfMemoryError ? &mut Allocator {
+  let previous = List<Capture>.get(&state.captures, index)
+  run List<Change>.append(&mut state.changes, Change { index: index, previous: previous })
+  List<Capture>.set(&mut state.captures, index, value)
+}
+
+effect fn tick(state: &mut State, depth: usize) -> () ! RegexError {
+  if state.steps >= 1000000 || depth >= 1024 { fail error(RegexReason.MatchLimit, 0) }
+  state.steps = state.steps + 1
+}
+
+effect fn resume(program: &Program, state: &mut State, next: usize, at: usize, backward: bool, depth: usize) -> bool
+  ! RegexError | OutOfMemoryError ? &mut Allocator {
+  if next == 0 { return true }
+  run tick(&mut state.*, depth)
+  let frame = List<Frame>.get(&state.frames, next)
+  if frame.kind == FrameKind.Node { return run evaluate(program, &mut state.*, frame.node, frame.next, at, backward, depth + 1) }
+  if frame.kind == FrameKind.Capture {
+    let mut value = Capture { start: frame.previous, end: at, set: true }
+    if backward {
+      value.start = at
+      value.end = frame.previous
+    }
+    run capture(&mut state.*, frame.node, value)
+    return run resume(program, &mut state.*, frame.next, at, backward, depth + 1)
+  }
+  let value = List<Node>.get(&program.nodes, frame.node)
+  if at == frame.previous && frame.count >= value.minimum { return false }
+  return run repeat(program, &mut state.*, frame.node, frame.next, at, backward, depth + 1, frame.count + 1)
+}
+
+effect fn withFrame(program: &Program, state: &mut State, child: usize, frame: Frame, at: usize, backward: bool, depth: usize) -> bool
+  ! RegexError | OutOfMemoryError ? &mut Allocator {
+  let index = List<Frame>.length(&state.frames)
+  run List<Frame>.append(&mut state.frames, frame)
+  let result = run evaluate(program, &mut state.*, child, index, at, backward, depth + 1)
+  List<Frame>.truncate(&mut state.frames, index)
+  return result
+}
+
+effect fn evaluate(program: &Program, state: &mut State, id: usize, next: usize, at: usize, backward: bool, depth: usize) -> bool
+  ! RegexError | OutOfMemoryError ? &mut Allocator {
+  run tick(&mut state.*, depth)
+  let mark = List<Change>.length(&state.changes)
+  let result = run evaluateNode(program, &mut state.*, id, next, at, backward, depth)
+  if !result { rollback(&mut state.*, mark) }
+  return result
+}
+
+effect fn evaluateNode(program: &Program, state: &mut State, id: usize, next: usize, at: usize, backward: bool, depth: usize) -> bool
+  ! RegexError | OutOfMemoryError ? &mut Allocator {
+  let value = List<Node>.get(&program.nodes, id)
+  let length = List<u32>.length(&state.text)
+  if value.op == Op.Empty { return run resume(program, &mut state.*, next, at, backward, depth + 1) }
+  if value.op == Op.Sequence {
+    let mut first = value.a
+    let mut second = value.b
+    if backward {
+      first = value.b
+      second = value.a
+    }
+    return run withFrame(program, &mut state.*, first, Frame { kind: FrameKind.Node, node: second, next: next, count: 0, previous: 0 }, at, backward, depth)
+  }
+  if value.op == Op.Alternative {
+    if run evaluate(program, &mut state.*, value.a, next, at, backward, depth + 1) { return true }
+    return run evaluate(program, &mut state.*, value.b, next, at, backward, depth + 1)
+  }
+  if value.op == Op.Capture {
+    return run withFrame(program, &mut state.*, value.a, Frame { kind: FrameKind.Capture, node: value.b, next: next, count: 0, previous: at }, at, backward, depth)
+  }
+  if value.op == Op.Repeat { return run repeat(program, &mut state.*, id, next, at, backward, depth + 1, 0) }
+  if value.op == Op.Look {
+    let mark = List<Change>.length(&state.changes)
+    let found = run evaluate(program, &mut state.*, value.a, 0, at, value.backward, depth + 1)
+    if value.negative { rollback(&mut state.*, mark) }
+    if found == value.negative { return false }
+    return run resume(program, &mut state.*, next, at, backward, depth + 1)
+  }
+  if value.op == Op.Start {
+    if at != 0 && ((value.flags & 2) == 0 || !line(List<u32>.get(&state.text, at - 1))) { return false }
+    return run resume(program, &mut state.*, next, at, backward, depth + 1)
+  }
+  if value.op == Op.End {
+    if at != length && ((value.flags & 2) == 0 || !line(List<u32>.get(&state.text, at))) { return false }
+    return run resume(program, &mut state.*, next, at, backward, depth + 1)
+  }
+  if value.op == Op.Boundary {
+    let left = at > 0 && word(List<u32>.get(&state.text, at - 1), value.flags)
+    let right = at < length && word(List<u32>.get(&state.text, at), value.flags)
+    if (left != right) == value.negative { return false }
+    return run resume(program, &mut state.*, next, at, backward, depth + 1)
+  }
+  if value.op == Op.Reference {
+    let mut captured = Capture { start: 0, end: 0, set: false }
+    if !value.negative { captured = List<Capture>.get(&state.captures, value.a) }
+    else {
+      let mut i = value.a
+      while i < value.b {
+        let candidate = List<Capture>.get(&state.captures, List<usize>.get(&program.references, i))
+        if candidate.set {
+          captured = candidate
+          break
+        }
+        i = i + 1
+      }
+    }
+    if !captured.set { return run resume(program, &mut state.*, next, at, backward, depth + 1) }
+    let count = captured.end - captured.start
+    let mut start = at
+    let mut end = at + count
+    if backward {
+      if count > at { return false }
+      start = at - count
+      end = start
+    } else if count > length - at { return false }
+    let mut i: usize = 0
+    while i < count {
+      if !equalScalar(List<u32>.get(&state.text, captured.start + i), List<u32>.get(&state.text, start + i), value.flags) { return false }
+      i = i + 1
+    }
+    return run resume(program, &mut state.*, next, end, backward, depth + 1)
+  }
+  let mut index = at
+  let mut after = at + 1
+  if backward {
+    if at == 0 { return false }
+    index = at - 1
+    after = index
+  }
+  else if at >= length { return false }
+  let cp = List<u32>.get(&state.text, index)
+  let accepted = match value.op {
+    Op.Literal => equalScalar(value.scalar, cp, value.flags)
+    Op.Dot => (value.flags & 4) != 0 || !line(cp)
+    Op.Class => classContains(program, value, cp)
+    _ => false
+  }
+  if !accepted { return false }
+  return run resume(program, &mut state.*, next, after, backward, depth + 1)
+}
+
+effect fn repeat(program: &Program, state: &mut State, id: usize, next: usize, at: usize, backward: bool, depth: usize, count: usize) -> bool
+  ! RegexError | OutOfMemoryError ? &mut Allocator {
+  run tick(&mut state.*, depth)
+  let value = List<Node>.get(&program.nodes, id)
+  let mark = List<Change>.length(&state.changes)
+  if value.lazy && count >= value.minimum {
+    if run resume(program, &mut state.*, next, at, backward, depth + 1) { return true }
+    rollback(&mut state.*, mark)
+  }
+  if value.maximum == 1000001 || count < value.maximum {
+    let mut i = value.firstCapture
+    while i < value.afterCapture {
+      run capture(&mut state.*, i, Capture { start: 0, end: 0, set: false })
+      i = i + 1
+    }
+    let frame = Frame { kind: FrameKind.Repeat, node: id, next: next, count: count, previous: at }
+    if run withFrame(program, &mut state.*, value.a, frame, at, backward, depth) { return true }
+    rollback(&mut state.*, mark)
+  }
+  if !value.lazy && count >= value.minimum {
+    if run resume(program, &mut state.*, next, at, backward, depth + 1) { return true }
+    rollback(&mut state.*, mark)
+  }
+  return false
+}
