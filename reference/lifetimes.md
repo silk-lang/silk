@@ -132,6 +132,11 @@ adds its own outer lifetime; that outer borrow does not merge the wrapper's stor
 Omitted nominal output lifetimes use the same result default. `Self` in an implementation denotes
 the head's applied owner, including its stored-data lifetimes.
 
+A signature may write an omitted lifetime as `'_`, as in `fn width(span: Span<'_>) -> usize` or
+`fn first(values: &'_ [i32]) -> &'_ i32`. It elides exactly as the omitted lifetime does; writing it
+shows that the type borrows. `'_` names nothing, so it is refused where a lifetime cannot be
+elided, such as a bound, and a field that writes it is refused as an omitted field lifetime is.
+
 Inside a body, every omitted lifetime is a fresh region of that body, inferred from its uses and
 cleanup: in a local annotation, a literal's or constructor's type arguments (also through an alias),
 and a call's explicit generic arguments, as in `maybeWith<&Entry>(42)` or
@@ -192,6 +197,19 @@ input and a capture has the intersection of their invocation and capture environ
 loans. A callback may return independent data. It may not conceal retained input dependencies in a
 result type, return a borrowed view of a consumed parameter's former binding cell, or let a
 computation retaining those inputs escape their use extent.
+
+`effect fn(A) -> B ! F ? S` is the short spelling of a callable whose invocation returns such a
+computation. `once effect fn<'env>(A) -> B ! F ? S` is the contract
+`for<use 'call> once fn<'env>(A) -> once Effect<'call & 'env; B ! F ? S>`: the invocation binder
+follows the written ones, and a contract written either way accepts the same callables. An
+`effect fn` contract marks no written binder `use`, and it cannot appear inside another contract's
+parameters or result.
+
+```silk
+effect fn apply<F: once effect fn(i32) -> i32 ! Shortfall>(f: F, n: i32) -> i32 ! Shortfall {
+  return run f(n)
+}
+```
 
 An unmarked `for<'data>` still quantifies an independent data lifetime. The marked binder keeps its
 original position alongside such binders and cannot be chosen by an explicit call-prefix argument.
