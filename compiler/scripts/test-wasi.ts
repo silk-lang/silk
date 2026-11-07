@@ -404,9 +404,38 @@ const program = Effect.gen(function* () {
       )
     }
   }
+  // The regex engine's greedy one-unit loops backtrack through frames that pack a start position
+  // and an exit pc in one 64-bit word, which a 32-bit usize cannot hold (the playground's
+  // manifest check trapped on it).
+  yield* fs.writeFileString(
+    join(directory, 'main.silk'),
+    [
+      'import silk.core.effect { Effect }',
+      'import silk.core.result { Result }',
+      'import silk.text.regex { Regex, RegexError }',
+      'import silk.mem.allocator { Allocator, OutOfMemoryError }',
+      'effect fn checks() -> i32 ! RegexError | OutOfMemoryError ? &mut Allocator {',
+      '  if !run Regex.matches("^[a-z][a-z0-9-]*$", "wasi-test") { return 1 }',
+      '  if !run Regex.matches("^a*ab$", "aaaab") { return 2 }',
+      '  if !run Regex.matches("^x+xy$", "xxxxy") { return 3 }',
+      '  if run Regex.matches("^a*ab$", "aaaa") { return 4 }',
+      '  return 0',
+      '}',
+      'pub fn main() -> i32 {',
+      '  let mut allocator = Allocator.systemAllocatorProvider()',
+      '  return match move run Effect.result(checks()) |> Effect.provideMut<Allocator>(&mut allocator) {',
+      '    Result<i32, RegexError | OutOfMemoryError>.Success {value} => value',
+      '    Result<i32, RegexError | OutOfMemoryError>.Failure {error} => { drop error 5 }',
+      '  }',
+      '}',
+      '',
+    ].join('\n'),
+  )
+  const regex = yield* invoke(compiler, ['run', '--target', 'wasm32-wasip1', '--stdlib', join(repo, 'stdlib'), '--quiet'])
+  assert.equal(regex.status, 0, regex.stderr.toString())
   yield* WasiComponents.verify(compiler, clang, tools, repo, directory)
   yield* Console.log(
-    'WASI Preview 1 and Preview 2: services, capability confinement, command entries, components, sockets, DNS, HTTP client/server, WIT composition, run, test, doctest, emission stages, and atomic publication passed',
+    'WASI Preview 1 and Preview 2: services, capability confinement, command entries, components, sockets, DNS, HTTP client/server, WIT composition, run, test, doctest, emission stages, atomic publication and regex backtracking passed',
   )
 })
 await Effect.runPromise(program.pipe(Effect.scoped, Effect.provide(NodeServices.layer)))
