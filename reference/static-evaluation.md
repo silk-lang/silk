@@ -92,8 +92,8 @@ is available only when all of its dependencies and operations are static.
 
 **Boundary:** Static parameters and `let static` bindings cannot also be `mut`. An ordinary local
 remains runtime even when its initializer is a literal; preserving the value for later static use
-requires `let static`. Inside a `static fn`, ordinary locals and control flow are already static and
-do not require `let static`.
+requires `let static`. Inside a `static fn`, ordinary locals and control flow are already static, so
+a local is written with plain `let`; `let static` there reports `SEM0176`.
 
 A runtime function's body supplies static arguments to any call it writes: a type-qualified call
 such as `Leaf.own(&leaf, spec)`, method-call syntax such as `leaf.own(spec)`, and a call of an
@@ -204,9 +204,29 @@ cleanup-free, residualization may embed it directly without retaining compiler s
 allocator identities, or observable allocation. It cannot construct or run an Effect, invoke an
 ordinary runtime function, read a runtime binding, or perform unsafe, external, or host work.
 
+A static function value is a static value. In a static body or a `let static` initializer, a
+static function can be named as a value, partially applied
+([CALLABLE-002](functions-callables-and-control-flow.md#callable-002--supplying-a-trailing-argument-suffix-constructs-a-section)),
+passed to a static function's `fn(A) -> B` parameter, and called directly or through a pipeline.
+A section stores its supplied arguments as static data, so it can be called again even when a
+captured value is not `Copy`. Such a value exists only during static evaluation and has no runtime
+representation.
+
+```silk
+static fn calc() -> Command {
+  let values = Arg.named("values") |> Arg.required
+  let withValues = Command.arg(values)
+  return Command.make("calc", "Integer calculator")
+    |> Command.subcommand("sum", Command.make("sum", "Add values") |> withValues)
+    |> Command.subcommand("product", Command.make("product", "Multiply values") |> withValues)
+}
+```
+
 **Diagnostics:** Attempting a prohibited operation reports `SEM0176` at that operation and produces
-no static result. A value outside the admitted domain is rejected at the static boundary rather
-than acquiring a second compile-time ownership model.
+no static result. Naming an ordinary function, an anonymous function or a bound method value as a
+value in a static body, or partially applying an ordinary function there, reports `SEM0176` at that
+expression. A value outside the admitted domain is rejected at the static boundary rather than
+acquiring a second compile-time ownership model.
 
 **Evidence:** static value requirements,
 [canonical static values](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/StaticValue.ts).
