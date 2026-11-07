@@ -25,6 +25,7 @@ import silk.collections.list { List }
 import silk.collections.slice { Slice }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
+import silk.core.ownership { Copy }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.mem.pointer { Pointer }
 import silk.mem.stack { Stack }
@@ -1130,58 +1131,168 @@ impl CompilerState {
   }
 }
 
+const GROUP_TOP: u8 = 0
+
+const GROUP_PLAIN: u8 = 1
+
+const GROUP_LOOKAROUND: u8 = 2
+
+// A disjunction the parser has open: the pattern itself or a group, the alternative it is in, and
+// what ends it.
+struct OpenGroup {
+  kind: u8,
+  // The direction of the disjunction: backward inside a lookbehind.
+  backward: bool,
+  // Where the current alternative's code starts, and the gotos waiting for the end.
+  altStart: usize,
+  lastJump: usize,
+  // Where the group's term starts in the enclosing alternative, and the captures before it.
+  termStart: usize,
+  termCaptures: usize,
+  // A plain group: whether it captures, as which index, and the flags to restore.
+  capture: bool,
+  index: usize,
+  savedFlags: u32,
+  // A lookaround: the opening instruction to patch and the closing opcode.
+  jump: usize,
+  endOpcode: u8
+}
+
+impl Copy for OpenGroup {}
+
+impl OpenGroup {
+  fn top(altStart: usize, backward: bool) -> OpenGroup {
+    return OpenGroup {
+      kind: GROUP_TOP,
+      backward: backward,
+      altStart: altStart,
+      lastJump: 0,
+      termStart: 0,
+      termCaptures: 0,
+      capture: false,
+      index: 0,
+      savedFlags: 0,
+      jump: 0,
+      endOpcode: 0,
+    }
+  }
+
+  fn group(backward: bool, capture: bool, index: usize, savedFlags: u32) -> OpenGroup {
+    return OpenGroup {
+      kind: GROUP_PLAIN,
+      backward: backward,
+      altStart: 0,
+      lastJump: 0,
+      termStart: 0,
+      termCaptures: 0,
+      capture: capture,
+      index: index,
+      savedFlags: savedFlags,
+      jump: 0,
+      endOpcode: 0,
+    }
+  }
+
+  fn lookaround(behind: bool, jump: usize, endOpcode: u8) -> OpenGroup {
+    return OpenGroup {
+      kind: GROUP_LOOKAROUND,
+      backward: behind,
+      altStart: 0,
+      lastJump: 0,
+      termStart: 0,
+      termCaptures: 0,
+      capture: false,
+      index: 0,
+      savedFlags: 0,
+      jump: jump,
+      endOpcode: endOpcode,
+    }
+  }
+}
+
 impl CompilerState {
-  effect fn disjunction(self: &mut Self, input: &[u8], backward: bool) -> ()
-    ! OutOfMemoryError | RegExpSyntaxError | RegExpStackOverflow
-    ? &mut Allocator {
+  // Counts one more open disjunction, failing past maxDepth (or below stackLimit).
+  effect fn enter(self: &mut Self) -> ()
+    ! RegExpStackOverflow {
     if self.depth >= self.maxDepth
       || (self.stackLimit != 0 && currentFrameAddress() < self.stackLimit) {
       fail RegExpStackOverflow {}
     }
     self.depth = self.depth + 1
-
-    // a|b|c becomes split(b) a goto(end) split(c) b goto(end) c: each choice
-    // pushes one frame, and the first alternative runs after one split, not
-    // one per alternative. Until the end is known, each goto's operand holds
-    // the previous goto's operand offset plus one (0 for none).
-    let mut altStart = self.code.length()
-    let mut lastJump: usize = 0
-    run self.alternative(input, backward)
-    while byte(input, self.cursor) == 124 {
-      self.cursor = self.cursor + 1
-      let length = self.code.length() - altStart
-      run self.code.insertZeroes(altStart, 5)
-      self.code.set(altStart, REOP_split_next_first)
-      self.code.patchU32(altStart + 1, usize.toU32(length + 5))
-      let jump = run self.emit32(REOP_goto, usize.toU32(lastJump))
-      lastJump = jump + 1
-      altStart = self.code.length()
-      self.scope = u8.wrappingAdd(self.scope, 1)
-      run self.alternative(input, backward)
-    }
-    while lastJump != 0 {
-      let jump = lastJump - 1
-      lastJump = u32.toUsize(readU32(self.code.asSlice(), jump))
-      self.patchEnd(jump)
-    }
-    self.depth = self.depth - 1
   }
 
-  effect fn alternative(self: &mut Self, input: &[u8], backward: bool) -> ()
+  // QuickJS parses a group's disjunction by recursion, a few native frames per level, which a
+  // wasm engine's call stack holds only so many of. This parser keeps the open groups in a list
+  // instead, so nesting costs heap rather than stack and maxDepth is the only nesting bound.
+  effect fn disjunction(self: &mut Self, input: &[u8], backward: bool) -> ()
     ! OutOfMemoryError | RegExpSyntaxError | RegExpStackOverflow
     ? &mut Allocator {
-    let start = self.code.length()
-    while self.cursor < input.length && byte(input, self.cursor) != 124
-      && byte(input, self.cursor) != 41 {
-      let termStart = self.code.length()
-      run self.term(input, backward)
-      if backward {
-        // Rotate the newly compiled term to the front without a temporary allocation.
-        let end = self.code.length()
-        reverseBytes(&mut self.code, start, termStart)
-        reverseBytes(&mut self.code, termStart, end)
-        reverseBytes(&mut self.code, start, end)
+    run self.enter()
+    let mut current = OpenGroup.top(self.code.length(), backward)
+    let mut parents = List<OpenGroup>.make()
+    while true {
+      let c = byte(input, self.cursor)
+      if self.cursor < input.length && c != 124 && c != 41 {
+        // One more term of the current alternative.
+        let termStart = self.code.length()
+        if c == 40 {
+          let captures = self.captures
+          let mut inner = run self.openGroup(input, current.backward)
+          run self.enter()
+          inner.altStart = self.code.length()
+          inner.termStart = termStart
+          inner.termCaptures = captures
+          run parents.append(current)
+          current = inner
+        } else {
+          run self.term(input, current.backward)
+          self.placeTerm(&current, termStart)
+        }
+      } else if c == 124 {
+        // a|b|c becomes split(b) a goto(end) split(c) b goto(end) c: each choice
+        // pushes one frame, and the first alternative runs after one split, not
+        // one per alternative. Until the end is known, each goto's operand holds
+        // the previous goto's operand offset plus one (0 for none).
+        self.cursor = self.cursor + 1
+        let length = self.code.length() - current.altStart
+        run self.code.insertZeroes(current.altStart, 5)
+        self.code.set(current.altStart, REOP_split_next_first)
+        self.code.patchU32(current.altStart + 1, usize.toU32(length + 5))
+        let jump = run self.emit32(REOP_goto, usize.toU32(current.lastJump))
+        current.lastJump = jump + 1
+        current.altStart = self.code.length()
+        self.scope = u8.wrappingAdd(self.scope, 1)
+      } else {
+        while current.lastJump != 0 {
+          let jump = current.lastJump - 1
+          current.lastJump = u32.toUsize(readU32(self.code.asSlice(), jump))
+          self.patchEnd(jump)
+        }
+        self.depth = self.depth - 1
+        match move parents.pop() {
+          Option<OpenGroup>.None => {
+            return ()
+          }
+          Option<OpenGroup>.Some { value: parent } => {
+            let closed = current
+            let quantifiable = run self.closeGroup(input, &closed)
+            run self.finishTerm(input, closed.termStart, closed.termCaptures, quantifiable)
+            current = parent
+            self.placeTerm(&current, closed.termStart)
+          }
+        }
       }
+    }
+  }
+
+  // In a backward alternative, rotates the term just compiled at termStart to the front.
+  fn placeTerm(self: &mut Self, alternative: &OpenGroup, termStart: usize) -> () {
+    if alternative.backward {
+      // Rotate the newly compiled term to the front without a temporary allocation.
+      let end = self.code.length()
+      reverseBytes(&mut self.code, alternative.altStart, termStart)
+      reverseBytes(&mut self.code, termStart, end)
+      reverseBytes(&mut self.code, alternative.altStart, end)
     }
   }
 
@@ -1261,8 +1372,9 @@ impl CompilerState {
     }
   }
 
-  effect fn group(self: &mut Self, input: &[u8], backward: bool) -> bool
-    ! OutOfMemoryError | RegExpSyntaxError | RegExpStackOverflow
+  // Opens the group at the cursor, emitting what precedes its disjunction.
+  effect fn openGroup(self: &mut Self, input: &[u8], backward: bool) -> OpenGroup
+    ! OutOfMemoryError | RegExpSyntaxError
     ? &mut Allocator {
     let p = self.cursor
     let mut capture = true
@@ -1303,11 +1415,7 @@ impl CompilerState {
           endOpcode = REOP_negative_lookahead_match
         }
         let jump = run self.emit32(opcode, 0)
-        run self.disjunction(input, behind)
-        run self.expect(input, 41)
-        run self.code.append(endOpcode)
-        self.patchEnd(jump)
-        return !unicode(self.flags) && !behind
+        return OpenGroup.lookaround(behind, jump, endOpcode)
       } else if c == 60 {
         let name = run parseGroupName(input, p + 3)
         if self.duplicateName(name.bytes.asSlice()) {
@@ -1341,19 +1449,32 @@ impl CompilerState {
       }
       run self.emit8(opcode, usize.toU8(index))
     }
-    run self.disjunction(input, backward)
-    if capture {
+    return OpenGroup.group(backward, capture, index, savedFlags)
+  }
+
+  // Ends the group `open` after its disjunction; whether a quantifier may follow it.
+  effect fn closeGroup(self: &mut Self, input: &[u8], open: &OpenGroup) -> bool
+    ! OutOfMemoryError | RegExpSyntaxError
+    ? &mut Allocator {
+    if open.kind == GROUP_LOOKAROUND {
+      run self.expect(input, 41)
+      run self.code.append(open.endOpcode)
+      self.patchEnd(open.jump)
+      return !unicode(self.flags) && !open.backward
+    }
+    if open.capture {
       let mut opcode = REOP_save_end
-      if backward {
+      if open.backward {
         opcode = REOP_save_start
       }
-      run self.emit8(opcode, usize.toU8(index))
+      run self.emit8(opcode, usize.toU8(open.index))
     }
     run self.expect(input, 41)
-    self.flags = savedFlags
+    self.flags = open.savedFlags
     return true
   }
 
+  // A term other than a group, which the disjunction opens itself.
   effect fn term(self: &mut Self, input: &[u8], backward: bool) -> ()
     ! OutOfMemoryError | RegExpSyntaxError | RegExpStackOverflow
     ? &mut Allocator {
@@ -1407,8 +1528,6 @@ impl CompilerState {
         }
       }
       run self.normalAtom(input, backward)
-    } else if c == 40 {
-      quantifiable = run self.group(input, backward)
     } else if c == 91 {
       let parsed = run parseClass(input, p, self.flags, self.maxDepth - self.depth, self.stackLimit)
       self.cursor = parsed.next
@@ -1464,6 +1583,19 @@ impl CompilerState {
       }
       run self.normalAtom(input, backward)
     }
+    run self.finishTerm(input, start, captures, quantifiable)
+  }
+
+  // Applies a quantifier after the term at start, which began with captures groups seen.
+  effect fn finishTerm(
+    self: &mut Self,
+    input: &[u8],
+    start: usize,
+    captures: usize,
+    quantifiable: bool,
+  ) -> ()
+    ! OutOfMemoryError | RegExpSyntaxError
+    ? &mut Allocator {
     if quantifiable {
       run self.quantifier(input, start, captures)
     }
