@@ -204,14 +204,29 @@ cleanup-free, residualization may embed it directly without retaining compiler s
 allocator identities, or observable allocation. It cannot construct or run an Effect, invoke an
 ordinary runtime function, read a runtime binding, or perform unsafe, external, or host work.
 
-Callable execution includes function values: a static body cannot name a function as a value,
-partially apply one, or call through a callable value. Write every call with all of its arguments,
-or pipe the first one in, as in `command |> Command.arg(spec)`.
+A static function value is a static value. In a static body or a `let static` initializer, a
+static function can be named as a value, partially applied
+([CALLABLE-002](functions-callables-and-control-flow.md#callable-002--supplying-a-trailing-argument-suffix-constructs-a-section)),
+passed to a static function's `fn(A) -> B` parameter, and called directly or through a pipeline.
+A section stores its supplied arguments as static data, so it can be called again even when a
+captured value is not `Copy`. Such a value exists only during static evaluation and has no runtime
+representation.
+
+```silk
+static fn calc() -> Command {
+  let values = Arg.named("values") |> Arg.required
+  let withValues = Command.arg(values)
+  return Command.make("calc", "Integer calculator")
+    |> Command.subcommand("sum", Command.make("sum", "Add values") |> withValues)
+    |> Command.subcommand("product", Command.make("product", "Multiply values") |> withValues)
+}
+```
 
 **Diagnostics:** Attempting a prohibited operation reports `SEM0176` at that operation and produces
-no static result. A function value, a partial application, or a call through a callable value in a
-static body reports `SEM0176` at that expression. A value outside the admitted domain is rejected at
-the static boundary rather than acquiring a second compile-time ownership model.
+no static result. Naming an ordinary function, an anonymous function or a bound method value as a
+value in a static body, or partially applying an ordinary function there, reports `SEM0176` at that
+expression. A value outside the admitted domain is rejected at the static boundary rather than
+acquiring a second compile-time ownership model.
 
 **Evidence:** static value requirements,
 [canonical static values](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/StaticValue.ts).
