@@ -698,8 +698,13 @@ callee's first parameter. To invoke the callable a call returns, group it: `valu
 
 The left expression may be an explicit `&` or `&mut` borrow when the callee expects a borrowed view.
 
+A pipeline never partially applies. `value |> f` passes exactly one argument, so `f` must take
+exactly one parameter; for a callee with more, write the others in the call, as in
+`value |> f(rest)`.
+
 **Diagnostics:** A non-callable right expression reports `SEM0075`. A call with the wrong number or
-type of arguments reports the same diagnostic as the direct call. Invalid transfer or borrowing of
+type of arguments reports the same diagnostic as the direct call. A pipeline into a callable value
+that takes more than one parameter reports `SEM0007` with both counts. Invalid transfer or borrowing of
 the left value reports its ordinary ownership diagnostic.
 
 **Evidence:** operator pipeline specification,

@@ -92,8 +92,8 @@ is available only when all of its dependencies and operations are static.
 
 **Boundary:** Static parameters and `let static` bindings cannot also be `mut`. An ordinary local
 remains runtime even when its initializer is a literal; preserving the value for later static use
-requires `let static`. Inside a `static fn`, ordinary locals and control flow are already static and
-do not require `let static`.
+requires `let static`. Inside a `static fn`, ordinary locals and control flow are already static, so
+a local is written with plain `let`; `let static` there reports `SEM0176`.
 
 A runtime function's body supplies static arguments to any call it writes: a type-qualified call
 such as `Leaf.own(&leaf, spec)`, method-call syntax such as `leaf.own(spec)`, and a call of an
@@ -204,9 +204,14 @@ cleanup-free, residualization may embed it directly without retaining compiler s
 allocator identities, or observable allocation. It cannot construct or run an Effect, invoke an
 ordinary runtime function, read a runtime binding, or perform unsafe, external, or host work.
 
+Callable execution includes function values: a static body cannot name a function as a value,
+partially apply one, or call through a callable value. Write every call with all of its arguments,
+or pipe the first one in, as in `command |> Command.arg(spec)`.
+
 **Diagnostics:** Attempting a prohibited operation reports `SEM0176` at that operation and produces
-no static result. A value outside the admitted domain is rejected at the static boundary rather
-than acquiring a second compile-time ownership model.
+no static result. A function value, a partial application, or a call through a callable value in a
+static body reports `SEM0176` at that expression. A value outside the admitted domain is rejected at
+the static boundary rather than acquiring a second compile-time ownership model.
 
 **Evidence:** static value requirements,
 [canonical static values](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/StaticValue.ts).
