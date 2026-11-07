@@ -181,6 +181,8 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   // The most idle connections the client keeps open at once. An origin can have several, so that
   // concurrent requests reuse them.
   const MAX_IDLE: usize = 64
+  const ROUND_JOBS_PER_TASK: usize = 2
+  const MIN_ROUND_JOBS: usize = 128
   /// The default number of requests that [`Http.sendAll`] runs at the same time.
   pub const DEFAULT_CONCURRENCY: usize = 32
   /// The maximum number of headers that [`NativeHttp.header`] adds.
@@ -244,6 +246,9 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     noProxy: Bytes,
     idle: List<Box<IdleConnection>>,
     concurrencyValue: usize,
+    // The trust sources that the worker tasks of `sendAll` made, kept for the next round so that a
+    // task does not open the PEM bundle path again.
+    workerTrust: List<JobTrust>,
   }
 
   // A direct connection that finished its last exchange and stayed open, kept for the next request
@@ -295,6 +300,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
         noProxy: Bytes.make(),
         idle: List<Box<IdleConnection>>.make(),
         concurrencyValue: DEFAULT_CONCURRENCY,
+        workerTrust: List<JobTrust>.make(),
       }
     }
 
@@ -438,6 +444,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
       let mut next = move self
       next.trustChoice = TrustChoice<'config>.Borrowed {path: path}
       next.trust = Option<ConfiguredTrust>.none()
+      next.workerTrust = List<JobTrust>.make()
       return move next
     }
   }
@@ -992,9 +999,8 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     }
   }
 
-  effect fn attempt<'r>(
-    client: &mut NativeHttp,
-    defaults: &[Field<'r>],
+  effect fn attempt<'config: 'r, 'r>(
+    client: &mut NativeHttp<'config>,
     method: Method<'static>,
     url: string,
     request: &Request<'r>,
@@ -1033,19 +1039,22 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     let mut hasContentType = false
     let requested = request.headers()
     let mut index = usize.ZERO
-    // Provider defaults first; a request header with the same name replaces the default.
-    while index < defaults.length + requested.length {
+    // Provider defaults first; a request header with the same name replaces the default. Each
+    // default is copied out of the client on its own, so the request never copies the whole table.
+    let defaultCount = client.headerCount
+    while index < defaultCount + requested.length {
       let mut field = Field<'r> {name: "", value: ""}
       let mut use = true
-      if index < defaults.length {
-        field = defaults[index]
+      if index < defaultCount {
+        let stored: Field<'config> = client.headerValues[index]
+        field = Field<'r> {name: stored.name, value: stored.value}
         let mut other = usize.ZERO
         while other < requested.length {
           if sameName(requested[other].name, field.name) { use = false }
           other = other + usize.ONE
         }
       } else {
-        field = requested[index - defaults.length]
+        field = requested[index - defaultCount]
       }
       if use {
         if sameName(field.name, "accept-encoding") { hasEncoding = true }
@@ -1373,6 +1382,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   struct Round {
     results: List<Result<Received, HttpError | OutOfMemoryError>>,
     idle: List<Box<IdleConnection>>,
+    trusts: List<JobTrust>,
   }
 
   // One request of `sendAll` and where it is.
@@ -1406,12 +1416,13 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
       run List<Progress>.append(&mut progress, move next)
       index = index + usize.ONE
     }
+    let window = roundWindow(client.concurrencyValue)
     while true {
       let mut jobs = List<Box<PendingJob>>.make()
       let mut owners = List<usize>.make()
       let states = List<Progress>.asMutSlice(&mut progress)
       index = usize.ZERO
-      while index < states.length {
+      while index < states.length && List<Box<PendingJob>>.length(&jobs) < window {
         let mut finished = Option<Result<Response, HttpError>>.none()
         if let Progress.Going {hop} = &mut states[index] {
           let attempted = run Effect.result(stepHop(&mut client.*, &all[index], &mut hop))
@@ -1499,6 +1510,16 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     return move ordered
   }
 
+  // The most jobs one round prepares. A round keeps the prepared request and the response of each
+  // job live until it ends, so a whole large batch in one round outgrows the cache: at 64 tasks, a
+  // round of 256 jobs costs about 15% more time for each request than rounds of 128. Two jobs for
+  // each task keep a task busy while another waits on a slow server.
+  fn roundWindow(concurrency: usize) -> usize {
+    let window = concurrency * ROUND_JOBS_PER_TASK
+    if window < MIN_ROUND_JOBS { return MIN_ROUND_JOBS }
+    return window
+  }
+
   fn anyGoing(states: &[Progress]) -> bool {
     let mut index = usize.ZERO
     while index < states.length {
@@ -1559,9 +1580,10 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     // worker copies it once rather than each job carrying its own copy of the path.
     let plan = run trustPlan(&client.*)
     let idle = Intrinsic.replace(client.idle, List<Box<IdleConnection>>.make())
+    let trusts = Intrinsic.replace(client.workerTrust, List<JobTrust>.make())
     let mut scheduler = LocalScheduler.make()
     let outcome = run Effect.result(scheduler.execute<Round, OutOfMemoryError | TaskIdExhaustedError | Cancelled>(
-      runJobs(move jobs, move idle, client.concurrencyValue, move plan),
+      runJobs(move jobs, move idle, move trusts, client.concurrencyValue, move plan),
     ) |> Effect.provideMut<MonotonicClock>(&mut client.clock))
     let round = match move outcome {
       Result.Success {value} => move value
@@ -1572,9 +1594,10 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
         StalledError _stalled => Intrinsic.trap("sendAll: the request tasks stalled")
       }
     }
-    let Round {results, idle: kept} = move round
+    let Round {results, idle: kept, trusts: made} = move round
     let previous = Intrinsic.replace(client.idle, move kept)
     drop previous
+    client.workerTrust = move made
     while List<Box<IdleConnection>>.length(&client.idle) > MAX_IDLE {
       run discard(&mut client.idle, usize.ZERO)
     }
@@ -1583,11 +1606,11 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
 
   // The root task of a round. It keeps up to `limit` tasks running and collects them in job order.
   // A task that finishes gives its connection back, so a later job to the same origin reuses it.
-  effect fn runJobs(jobs: List<Box<PendingJob>>, idle: List<Box<IdleConnection>>, limit: usize, plan: TrustPlan) -> Round
+  effect fn runJobs(jobs: List<Box<PendingJob>>, idle: List<Box<IdleConnection>>, trusts: List<JobTrust>, limit: usize, plan: TrustPlan) -> Round
   ! OutOfMemoryError | TaskIdExhaustedError | Cancelled
   ? &mut Scheduler | &mut MonotonicClock {
     let mut allocator = Allocator.systemAllocatorProvider()
-    return run collectJobs(move jobs, move idle, limit, &plan) |> Effect.provideMut<Allocator>(&mut allocator)
+    return run collectJobs(move jobs, move idle, move trusts, limit, &plan) |> Effect.provideMut<Allocator>(&mut allocator)
   }
 
   // The work of one round, shared by its worker tasks on the round's thread.
@@ -1598,6 +1621,9 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     // allocating.
     pool: List<Box<IdleConnection>>,
     results: List<Option<Result<Received, HttpError | OutOfMemoryError>>>,
+    // The trust sources of earlier rounds. A worker takes one when it starts and gives it back when
+    // it ends; the capacity has room for one from each worker.
+    trusts: List<JobTrust>,
   }
 
   struct Indexed {
@@ -1614,6 +1640,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   struct Finished {
     results: List<Option<Result<Received, HttpError | OutOfMemoryError>>>,
     idle: List<Box<IdleConnection>>,
+    trusts: List<JobTrust>,
   }
 
   union Checkout {
@@ -1625,7 +1652,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   // Runs the jobs on at most `limit` worker tasks. Each worker takes the next job, and gives its
   // connection back when the job ends, so a later job to the same origin reuses it. A task per
   // worker, not per job, keeps the task setup out of the cost of each request.
-  effect fn collectJobs(jobs: List<Box<PendingJob>>, idle: List<Box<IdleConnection>>, limit: usize, plan: &TrustPlan) -> Round
+  effect fn collectJobs(jobs: List<Box<PendingJob>>, idle: List<Box<IdleConnection>>, trusts: List<JobTrust>, limit: usize, plan: &TrustPlan) -> Round
   ! OutOfMemoryError | TaskIdExhaustedError | Cancelled
   ? &mut Scheduler | &mut MonotonicClock | &mut Allocator {
     let count = List<Box<PendingJob>>.length(&jobs)
@@ -1652,9 +1679,14 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
         Option<Result<Received, HttpError | OutOfMemoryError>>.none(),
       )
     }
-    let state = run Shared<RoundState>.make(RoundState {waiting: move waiting, pool: move pool, results: move slots})
     let mut workers = limit
     if count < workers { workers = count }
+    let mut sources = move trusts
+    let held = List<JobTrust>.length(&sources)
+    if held < workers {
+      run List<JobTrust>.reserveExact(&mut sources, workers - held)
+    }
+    let state = run Shared<RoundState>.make(RoundState {waiting: move waiting, pool: move pool, results: move slots, trusts: move sources})
     let mut running = List<Fiber<(), never>>.make()
     run List<Fiber<(), never>>.reserveExact(&mut running, workers)
     while List<Fiber<(), never>>.length(&running) < workers {
@@ -1668,7 +1700,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
         Option.Some {value} => run value.join()
       }
     }
-    let Finished {results: filled, idle: kept} = Shared<RoundState>.withMut<Finished>(&state, finishRound)
+    let Finished {results: filled, idle: kept, trusts: made} = Shared<RoundState>.withMut<Finished>(&state, finishRound)
     let mut slotsDone = move filled
     drop state
     let mut results = List<Result<Received, HttpError | OutOfMemoryError>>.make()
@@ -1684,7 +1716,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
       }
       at = at + usize.ONE
     }
-    return Round {results: move results, idle: move kept}
+    return Round {results: move results, idle: move kept, trusts: move made}
   }
 
   // One worker task of a round. Its clock parks only this task while the socket waits.
@@ -1705,9 +1737,9 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     // A job holds its connection in this list while it runs, and the list keeps its memory for the
     // next job.
     let mut idle = List<Box<IdleConnection>>.make()
-    // The trust source of the first secure job, kept for the later ones: every job of a round
-    // comes from one client, so they share its trust configuration.
-    let mut trust = JobTrust.Plain
+    // The trust source of the first secure job, kept for the later ones and for later rounds:
+    // every job comes from one client, so they share its trust configuration.
+    let mut trust = Shared<RoundState>.withMut<JobTrust>(&state, takeTrust)
     while true {
       let taken = match Shared<RoundState>.withMut<Option<Taken>>(&state, takeJob) {
         Option.None => { break }
@@ -1718,7 +1750,21 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
       let outcome = run runJob(&mut idle, &mut trust, plan, move job)
       Shared<RoundState>.withMut<()>(&state, storeOutcome(index, move outcome))
     }
+    Shared<RoundState>.withMut<()>(&state, keepTrust(move trust))
     return ()
+  }
+
+  fn takeTrust(state: &mut RoundState) -> JobTrust {
+    return match List<JobTrust>.pop(&mut state.trusts) {
+      Option.None => JobTrust.Plain
+      Option.Some {value} => move value
+    }
+  }
+
+  fn keepTrust(state: &mut RoundState, trust: JobTrust) -> () {
+    if let JobTrust.Configured {..} = &trust {
+      let _added = List<JobTrust>.appendWithinCapacity(&mut state.trusts, move trust)
+    }
   }
 
   fn takeJob(state: &mut RoundState) -> Option<Taken> {
@@ -1752,6 +1798,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     return Finished {
       results: Intrinsic.replace(state.results, List<Option<Result<Received, HttpError | OutOfMemoryError>>>.make()),
       idle: Intrinsic.replace(state.pool, List<Box<IdleConnection>>.make()),
+      trusts: Intrinsic.replace(state.trusts, List<JobTrust>.make()),
     }
   }
 
@@ -1953,9 +2000,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   effect fn attemptHop(client: &mut NativeHttp, request: &Request, hop: &Hop, defer: bool) -> Attempted
   ! HttpError | ProxyError | RequestError | ExchangeError | NativeExchangeError | ResolverError | NativeSocketError | ConnectionError | IdentityError | TrustSourceError | OutOfMemoryError
   ? &mut Allocator {
-    let defaultValues = client.headerValues
-    let defaults = Slice.view<Field>(&defaultValues, usize.ZERO, client.headerCount)
-    return run attempt(&mut client.*, defaults, hop.method, String.view(&hop.current), request, Bytes.asSlice(&hop.bearer), hop.withBody, hop.credentials, &hop.settings, defer)
+    return run attempt(&mut client.*, hop.method, String.view(&hop.current), request, Bytes.asSlice(&hop.bearer), hop.withBody, hop.credentials, &hop.settings, defer)
   }
 
   // Takes the response of the current hop. It returns the final response, or none after it moved
