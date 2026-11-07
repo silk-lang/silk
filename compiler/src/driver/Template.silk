@@ -28,6 +28,8 @@ import driver.Generate as Generators {InvalidHook, PostInit}
 import driver.GenerateRun as GenerateRuns {Outcome}
 import driver.GitCheckouts as GitCheckouts {FetchFailed, Fetched}
 import driver.Project as Projects
+import driver.ToolSandbox
+import driver.ToolStep as ToolSteps
 import driver.ProjectInitializer as ProjectInitializers {InitializationError}
 import silk.mem.allocator {Allocator, OutOfMemoryError}
 import silk.collections.bytes {Bytes}
@@ -447,7 +449,7 @@ effect fn fetchFailed(spec: &Spec, problem: FetchFailed) -> never ! TemplateRefu
 
 // Writes the template into `directory` and runs its entries, recording each created path in
 // `journal` before creating it.
-effect fn write(fetched: &Fetched, spec: &Spec, treeish: &[u8], files: &[Bytes], directory: &Path, manifest: &Manifest, extra: &[Bytes], journal: &mut Journal) -> Outcome
+effect fn write(fetched: &Fetched, spec: &Spec, treeish: &[u8], files: &[Bytes], directory: &Path, manifest: &Manifest, compilerRelease: &[u8], arguments: &[Bytes], sandbox: Option<&Path>, home: &Path, journal: &mut Journal) -> Outcome
   ! InitializationError | TemplateRefused | HostInputError | OutOfMemoryError
   ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
   // The missing directories, outermost first, up to the nearest existing ancestor.
@@ -528,11 +530,18 @@ effect fn write(fetched: &Fetched, spec: &Spec, treeish: &[u8], files: &[Bytes],
       }
     }
   }
-  return run GenerateRuns.postInit(directory, List<PostInit>.asSlice(&manifest.entries), extra)
+  return match move run Effect.result(GenerateRuns.postInit(directory, List<PostInit>.asSlice(&manifest.entries), compilerRelease, arguments, move sandbox, home)) {
+    Result<Outcome, HostInputError | FileError | OutOfMemoryError>.Success {value} => move value
+    Result<Outcome, HostInputError | FileError | OutOfMemoryError>.Failure {error} => match move error {
+      HostInputError input => { fail move input }
+      FileError file => run fileFailed(directory, move file)
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
 }
 
 // Creates the project once the template is fetched into `fetched`.
-effect fn instantiate(fetched: &Fetched, spec: &Spec, directory: &Path, name: Option<Bytes>, compilerRelease: &[u8], extra: &[Bytes]) -> Created
+effect fn instantiate(fetched: &Fetched, spec: &Spec, directory: &Path, name: Option<Bytes>, compilerRelease: &[u8], arguments: &[Bytes], unsandboxed: bool, home: &Path) -> Created
   ! InitializationError | TemplateRefused | HostInputError | OutOfMemoryError
   ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
   let mut treeish = run Bytes.copy(Bytes.asSlice(&fetched.commit))
@@ -560,6 +569,33 @@ effect fn instantiate(fetched: &Fetched, spec: &Spec, directory: &Path, name: Op
     Option<Bytes>.None => run refused(b"Template ", Bytes.asSlice(&shown), b" has no silk.toml")
   }
   let manifest = run adapted(Bytes.asSlice(&text), move name, directory, compilerRelease)
+  // Arguments after `--` that no entry takes would be dropped, so they are refused instead.
+  if arguments.length > usize.ZERO {
+    let entries = List<PostInit>.asSlice(&manifest.entries)
+    let mut taken = false
+    let mut entry = usize.ZERO
+    while entry < entries.length {
+      if entries[entry].arguments { taken = true }
+      entry = entry + usize.ONE
+    }
+    if !taken {
+      run refused(b"Template ", Bytes.asSlice(&shown), b" takes no arguments after `--`: no [[post-init]] entry of its silk.toml sets `arguments = true`")
+    }
+  }
+  // Entries run confined to the new project; a host with no sandbox runs them only when asked to.
+  let mut launcher = Option<Path>.none()
+  if List<PostInit>.length(&manifest.entries) > usize.ZERO {
+    if ToolSandbox.supported() {
+      if let Result<Option<Path>, FileError | OutOfMemoryError>.Success {value} = move run Effect.result(ToolSteps.compiler()) { launcher = move value }
+    }
+    let sandboxed = match &launcher {
+      Option<Path>.Some {..} => true
+      Option<Path>.None => false
+    }
+    if !sandboxed && !unsandboxed {
+      run refused(b"Template ", Bytes.asSlice(&shown), b" has [[post-init]] entries, and this host has no sandbox to run them in (Linux 6.7 with Landlock, or macOS); add --unsandboxed-post-init to run them with your full access")
+    }
+  }
   // Nothing is written until every file is known to be new.
   let mut at = usize.ZERO
   while at < files.length {
@@ -577,7 +613,9 @@ effect fn instantiate(fetched: &Fetched, spec: &Spec, directory: &Path, name: Op
     }
   }
   let mut journal = Journal {created: List<Path>.make(), ignore: move ignore, previousIgnore: move previousIgnore}
-  let written = run Effect.result(write(fetched, spec, Bytes.asSlice(&treeish), files, directory, &manifest, extra, &mut journal))
+  let mut sandbox = Option<&Path>.none()
+  if let Option<Path>.Some {value} = &launcher { sandbox = Option<&Path>.some(&value) }
+  let written = run Effect.result(write(fetched, spec, Bytes.asSlice(&treeish), files, directory, &manifest, compilerRelease, arguments, move sandbox, home, &mut journal))
   let outcome = match move written {
     Result<Outcome, InitializationError | TemplateRefused | HostInputError | OutOfMemoryError>.Success {value} => move value
     Result<Outcome, InitializationError | TemplateRefused | HostInputError | OutOfMemoryError>.Failure {error} => {
@@ -647,21 +685,15 @@ effect fn fetchInto(scratch: &Path, spec: &Spec) -> Fetched
 /// Creates a project from the template `spec` in `directory`, fetching it into a scratch directory
 /// below `store`, the git checkout store, that is removed afterwards. The package name is `name`,
 /// or else the directory's own name, and the manifest records `compilerRelease` as its
-/// `silk-version`. Each `[[post-init]]` entry runs with `compilerRelease`, then `arguments`, after
-/// its own arguments.
-pub effect fn create(store: &Path, spec: &Spec, directory: &Path, name: Option<Bytes>, compilerRelease: &[u8], arguments: &[Bytes]) -> Created
+/// `silk-version`. Each `[[post-init]]` entry runs in the build tool sandbox, confined to the new
+/// project, with `compilerRelease` in `SILK_VERSION`, and an entry that sets `arguments = true` gets
+/// `arguments` after its own. A host with no sandbox refuses the entries unless `unsandboxed`.
+pub effect fn create(store: &Path, spec: &Spec, directory: &Path, name: Option<Bytes>, compilerRelease: &[u8], arguments: &[Bytes], unsandboxed: bool) -> Created
   ! InitializationError | TemplateRefused | HostInputError | OutOfMemoryError
   ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
-  let mut extra = List<Bytes>.make()
-  run List<Bytes>.append(&mut extra, run Bytes.copy(compilerRelease))
-  let mut argument = usize.ZERO
-  while argument < arguments.length {
-    run List<Bytes>.append(&mut extra, run Bytes.copy(Bytes.asSlice(&arguments[argument])))
-    argument = argument + usize.ONE
-  }
   let scratch = run scratchBelow(store)
   let scratchPath = run copyPath(&scratch.path)
-  let ran = run Effect.result(created(&scratchPath, spec, directory, move name, compilerRelease, List<Bytes>.asSlice(&extra)))
+  let ran = run Effect.result(created(&scratchPath, spec, directory, move name, compilerRelease, arguments, unsandboxed))
   run FileSystem.releaseIgnored(move scratch)
   return match move ran {
     Result<Created, InitializationError | TemplateRefused | HostInputError | OutOfMemoryError>.Success {value} => move value
@@ -675,11 +707,16 @@ pub effect fn create(store: &Path, spec: &Spec, directory: &Path, name: Option<B
 }
 
 // Fetches the template into `scratch` and creates the project from it.
-effect fn created(scratch: &Path, spec: &Spec, directory: &Path, name: Option<Bytes>, compilerRelease: &[u8], extra: &[Bytes]) -> Created
+effect fn created(scratch: &Path, spec: &Spec, directory: &Path, name: Option<Bytes>, compilerRelease: &[u8], arguments: &[Bytes], unsandboxed: bool) -> Created
   ! InitializationError | TemplateRefused | HostInputError | OutOfMemoryError
   ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
   let fetched = run fetchInto(scratch, spec)
-  return run instantiate(&fetched, spec, directory, move name, compilerRelease, extra)
+  // The `[[post-init]]` entries' `HOME` and `TMPDIR`, removed with the scratch directory.
+  let home = run below(scratch, b"home")
+  if let Result<(), FileError>.Failure {error} = move run Effect.result(FileSystem.createDirectory(&home)) {
+    run fileFailed(&home, move error)
+  }
+  return run instantiate(&fetched, spec, directory, move name, compilerRelease, arguments, unsandboxed, &home)
 }
 
 /// The official examples, `silk-lang/examples` at its root on the default branch: what

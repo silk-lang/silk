@@ -3584,7 +3584,9 @@ const program = Effect.gen(function* () {
     )
     yield* fs.writeFileString(
       join(examples, 'ui/silk.toml'),
-      '[package]\nname = "ui"\nversion = "0.1.0"\nsilk-version = "0.0.1"\ndescription = "A window"\n\n[[post-init]]\nrun = ["scripts/post-init.sh", "ready"]\n',
+      '[package]\nname = "ui"\nversion = "0.1.0"\nsilk-version = "0.0.1"\ndescription = "A window"\n\n' +
+        "[[post-init]]\nrun = ['sh', '-c', 'echo \"plain $# $SILK_VERSION $PATH\"']\n\n" +
+        '[[post-init]]\nrun = ["scripts/post-init.sh", "ready"]\narguments = true\n',
     )
     yield* fs.writeFileString(join(examples, 'ui/src/main.silk'), 'pub fn main() -> i32 {\n  return 7\n}\n')
     yield* fs.writeFileString(
@@ -3592,6 +3594,12 @@ const program = Effect.gen(function* () {
       '#!/bin/sh\ngrep -q post-init silk.toml && exit 4\necho "post-init $*"\nrm scripts/post-init.sh\n',
     )
     yield* fs.chmod(join(examples, 'ui/scripts/post-init.sh'), 0o755)
+    // An entry that reaches outside the new project, which the sandbox refuses.
+    yield* fs.makeDirectory(join(examples, 'escape'), { recursive: true })
+    yield* fs.writeFileString(
+      join(examples, 'escape/silk.toml'),
+      `[package]\nname = "escape"\n\n[[post-init]]\nrun = ["sh", "-c", "touch '${join(work, 'escaped')}' || exit 5; cat '${join(home, '.gitconfig')}'"]\n`,
+    )
     yield* fs.writeFileString(
       join(examples, 'broken/silk.toml'),
       '[package]\nname = "broken"\n\n[[post-init]]\nrun = ["sh", "-c", "touch made; exit 3"]\n',
@@ -3606,12 +3614,19 @@ const program = Effect.gen(function* () {
     git(['-c', 'user.name=Silk', '-c', 'user.email=silk@example.com', '-c', 'commit.gpgsign=false', 'commit', '--quiet', '-m', 'templates'])
     git(['tag', 'v1'])
     const commit = git(['rev-parse', 'HEAD'])
+    // [[post-init]] entries run in the build tool sandbox; a host without one runs them only with
+    // --unsandboxed-post-init.
+    const templateEnvironment = { ...process.env, HOME: home, SILK_HOME: silkHome, XDG_CONFIG_HOME: join(home, '.config') }
     const templated = (args: ReadonlyArray<string>, cwd = work) =>
-      invoke(silk, ['init', ...args], cwd, { ...process.env, HOME: home, SILK_HOME: silkHome, XDG_CONFIG_HOME: join(home, '.config') })
+      landlockNet || args[0] === '-l' || args[0] === '--list'
+        ? invoke(silk, ['init', ...args], cwd, templateEnvironment)
+        : invoke(silk, ['init', args[0], '--unsandboxed-post-init', ...args.slice(1)], cwd, { ...templateEnvironment, SILK_NO_TOOL_SANDBOX: '1' })
     const official = yield* templated(['app', '-t', 'ui', '--', '--dark', 'two words'])
     assert.equal(official.status, 0, official.stderr)
-    // An entry gets its own arguments, then the compiler's release, then the ones after `--`.
-    assert.match(official.stdout, /^post-init ready \d+\.\d+\.\d+\S* --dark two words\nInitialized Silk project app at \S+app from template silk-lang\/examples\/ui \(([0-9a-f]{40})\)\n$/)
+    // Every entry sees the compiler's release in SILK_VERSION and gets only its own arguments; one
+    // that sets `arguments = true` also gets the ones after `--`. A sandboxed entry sees a fixed PATH.
+    assert.match(official.stdout, landlockNet ? /^plain 0 \d+\.\d+\.\d+\S* \/usr\/local\/bin:\/usr\/bin:\/bin\n/ : /^plain 0 \d+\.\d+\.\d+\S* /)
+    assert.match(official.stdout, /\npost-init ready --dark two words\nInitialized Silk project app at \S+app from template silk-lang\/examples\/ui \(([0-9a-f]{40})\)\n$/)
     assert.equal(official.stdout.includes(commit), true, official.stdout)
     const manifest = yield* fs.readFileString(join(work, 'app/silk.toml'))
     assert.match(manifest, /^\[package\]\nname = "app"\nversion = "0\.1\.0"\nsilk-version = "[^"]+"\n$/)
@@ -3633,6 +3648,26 @@ const program = Effect.gen(function* () {
     assert.match(collision.stderr, /Refusing to overwrite existing project file \S+taken\/src\/main\.silk\n/)
     assert.deepEqual(readdirSync(join(work, 'taken')).sort(), ['src'])
     assert.equal(yield* fs.readFileString(join(work, 'taken/src/main.silk')), 'kept\n')
+    // Arguments no entry takes are refused before anything is written.
+    const unwanted = yield* templated(['unwanted', '-t', 'broken', '--', 'extra'])
+    assert.equal(unwanted.status, 1, unwanted.stderr)
+    assert.match(unwanted.stderr, /Template silk-lang\/examples\/broken takes no arguments after `--`: no \[\[post-init\]\] entry of its silk\.toml sets `arguments = true`\n/)
+    assert.equal(yield* fs.exists(join(work, 'unwanted')), false)
+    if (landlockNet) {
+      const escaping = yield* templated(['escaping', '-t', 'escape'])
+      assert.equal(escaping.status, 1, escaping.stderr)
+      assert.match(escaping.stderr, /failed with status 5\nsilk: the template's \[\[post-init\]\] entry failed, so the project was removed\n/)
+      assert.equal(yield* fs.exists(join(work, 'escaped')), false, 'a post-init entry wrote outside the new project')
+      assert.equal(yield* fs.exists(join(work, 'escaping')), false)
+    } else {
+      const warned = yield* templated(['warned', '-t', 'ui'])
+      assert.equal(warned.status, 0, warned.stderr)
+      assert.match(warned.stderr, /silk: warning: running the template's \[\[post-init\]\] entries without a sandbox \(--unsandboxed-post-init\)\n/)
+    }
+    const refusedHost = yield* invoke(silk, ['init', 'nosandbox', '-t', 'ui'], work, { ...templateEnvironment, SILK_NO_TOOL_SANDBOX: '1' })
+    assert.equal(refusedHost.status, 1, refusedHost.stderr)
+    assert.match(refusedHost.stderr, /Template silk-lang\/examples\/ui has \[\[post-init\]\] entries, and this host has no sandbox to run them in .*add --unsandboxed-post-init to run them with your full access\n/)
+    assert.equal(yield* fs.exists(join(work, 'nosandbox')), false)
     const failing = yield* templated(['failing', '-t', 'broken'])
     assert.equal(failing.status, 1, failing.stderr)
     assert.match(failing.stderr, /silk: sh -c touch made; exit 3 failed with status 3\nsilk: the template's \[\[post-init\]\] entry failed, so the project was removed\n/)
@@ -3646,7 +3681,7 @@ const program = Effect.gen(function* () {
     // `--list` names each directory with a silk.toml by what `--template` takes, with its description.
     const listed = yield* templated(['-l'])
     assert.equal(listed.status, 0, listed.stderr)
-    assert.match(listed.stdout, /^Templates in silk-lang\/examples \([0-9a-f]{40}\):\n  broken\n  ui      A window\nCreate a project from one with `silk init <path> --template <name>`\n$/)
+    assert.match(listed.stdout, /^Templates in silk-lang\/examples \([0-9a-f]{40}\):\n  broken\n  escape\n  ui      A window\nCreate a project from one with `silk init <path> --template <name>`\n$/)
     const listedFull = yield* templated(['--list', 'silk-lang/examples/ui@v1'])
     assert.equal(listedFull.status, 0, listedFull.stderr)
     assert.match(listedFull.stdout, /\n  ui@v1  A window\n/)
