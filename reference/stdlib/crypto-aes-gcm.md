@@ -373,6 +373,14 @@ pub fn main() -> i32 {
 }
 ```
 
+<a id="AesGcmKey.impl.Transferable"></a>
+
+## Implementation `Transferable for AesGcmKey`
+
+```silk
+impl Transferable for AesGcmKey
+```
+
 <a id="AesGcmKey.impl"></a>
 
 ## Implementation `AesGcmKey`
