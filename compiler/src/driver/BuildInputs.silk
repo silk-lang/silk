@@ -54,12 +54,21 @@ pub struct Recorder {
   produced: List<Bytes>,
   // False once a note could not be kept; an incomplete record is never stored.
   complete: bool,
+  // The child names of each directory listed, for `inputLines`, which keeps only the names the
+  // build could have looked for.
+  listed: List<Listed>,
+}
+
+// The child names one listing answered.
+struct Listed {
+  directory: Bytes,
+  names: List<Bytes>,
 }
 
 /// A recorder over the host filesystem.
 pub effect fn recorder() -> Recorder ! OutOfMemoryError ? &mut Allocator {
   let native = run MachineFileSystem.make()
-  return Recorder {native: move native, allocator: Allocator.systemAllocatorProvider(), notes: List<Note>.make(), produced: List<Bytes>.make(), complete: true}
+  return Recorder {native: move native, allocator: Allocator.systemAllocatorProvider(), notes: List<Note>.make(), produced: List<Bytes>.make(), complete: true, listed: List<Listed>.make()}
 }
 
 /// Whether every operation the build ran could be noted.
@@ -144,19 +153,41 @@ fn statNote(answer: &(FileInfo | DirectoryInfo)) -> Note {
   }
 }
 
-// The digest of a listing: each entry's path and kind in listed order.
+// The digest of a listing: each entry's name and kind in listed order. Names, not full paths, so
+// the same directory listed in another checkout digests the same.
 fn listingDigest(entries: &List<DirectoryEntry>) -> ContentHash {
   let listed = List<DirectoryEntry>.asSlice(entries)
   let mut stream = ContentHash.stream()
   let mut at = usize.ZERO
   while at < listed.length {
-    let path = Path.rawBytes(&listed[at].path)
+    let path = lastSegment(Path.rawBytes(&listed[at].path))
     ContentHash.append(&mut stream, path)
     ContentHash.appendByte(&mut stream, 0)
     ContentHash.appendByte(&mut stream, i32.toU8(listed[at].kind.code))
     at = at + usize.ONE
   }
   return ContentHash.finish(move stream)
+}
+
+effect fn keepNames(listed: &mut List<Listed>, path: &Path, entries: &List<DirectoryEntry>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut names = List<Bytes>.make()
+  let children = List<DirectoryEntry>.asSlice(entries)
+  let mut at = usize.ZERO
+  while at < children.length {
+    let mut name = run Bytes.copy(lastSegment(Path.rawBytes(&children[at].path)))
+    let kind: [u8; 2] = [0, i32.toU8(children[at].kind.code)]
+    run Bytes.append(&mut name, &kind)
+    run List<Bytes>.append(&mut names, move name)
+    at = at + usize.ONE
+  }
+  return run List<Listed>.append(&mut listed.*, Listed {directory: run Bytes.copy(Path.rawBytes(path)), names: move names})
+}
+
+// The part of `path` after its last `/`.
+fn lastSegment(path: &[u8]) -> &[u8] {
+  let mut at = path.length
+  while at > usize.ZERO && path[at - usize.ONE] != 47 { at = at - usize.ONE }
+  return Slice.view<u8>(path, at, path.length - at)
 }
 
 impl FileSystem for Recorder {
@@ -220,6 +251,13 @@ impl FileSystem for Recorder {
     }
     let digest = listingDigest(&value)
     run note(&mut self.*, LISTING, path, digest.high, digest.low)
+    if !excluded(&self.*, path) {
+      let kept = run Effect.result(keepNames(&mut self.listed, path, &value) |> Effect.provideMut<Allocator>(&mut self.allocator))
+      if let Result<(), OutOfMemoryError>.Failure {error} = move kept {
+        drop error
+        self.complete = false
+      }
+    }
     return move value
   }
   effect fn createDirectory(self: &mut Self, path: &Path) -> () ! FileError {
@@ -378,4 +416,230 @@ pub effect fn unchanged(record: &[u8], key: &[u8]) -> Option<Bytes> ! OutOfMemor
   }
   if reader.failed || reader.at != record.length { return Option<Bytes>.none() }
   return Option<Bytes>.some(run Bytes.copy(payload))
+}
+
+/// A directory that [`inputLines`] names the inputs below it from, as `label` then the path
+/// relative to `directory`, such as `std/silk/core/option.silk` for the standard library.
+pub struct Anchor {
+  /// The directory, as the build named it.
+  pub directory: Bytes,
+  /// The name its inputs are listed under; empty to list them by their relative path alone.
+  pub label: Bytes,
+}
+
+/// The inputs `recorder` noted, one line each and sorted, with every path below an anchor named
+/// from it, so the same inputs in another checkout or on another machine list the same.
+///
+/// # Details
+/// Each line is `<kind> <answer> <path>`: `read <digest>` for a file the build read, as 32
+/// hexadecimal digits of its content hash; `stat file:<length>` or `stat directory` for a path it
+/// looked at; `list <digest>` for a directory it listed, digesting the entry names and kinds; and
+/// `missing` in place of the answer when the look failed. A path below no anchor is written as
+/// the build named it. The first anchor that holds a path names it, so a nested anchor is listed
+/// before the one that encloses it.
+pub effect fn inputLines(recorder: &Recorder, anchors: &[Anchor]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let notes = List<Note>.asSlice(&recorder.notes)
+  let mut lines = List<Bytes>.make()
+  let mut at = usize.ZERO
+  while at < notes.length {
+    let note = &notes[at]
+    let mut line = Bytes.make()
+    if note.kind == READ {
+      run Bytes.append(&mut line, b"read ")
+      if note.first == 0 && note.second == 0 {
+        run Bytes.append(&mut line, b"missing")
+      } else {
+        run appendHex(&mut line, note.first)
+        run appendHex(&mut line, note.second)
+      }
+    } else if note.kind == STAT {
+      run Bytes.append(&mut line, b"stat ")
+      if note.first == 1 {
+        run Bytes.append(&mut line, b"file:")
+        run appendDecimal(&mut line, note.second)
+      } else if note.first == 2 {
+        run Bytes.append(&mut line, b"directory")
+      } else {
+        run Bytes.append(&mut line, b"missing")
+      }
+    } else {
+      run Bytes.append(&mut line, b"list ")
+      if note.first == 0 && note.second == 0 {
+        run Bytes.append(&mut line, b"missing")
+      } else {
+        let digest = run relevantListing(recorder, Bytes.asSlice(&note.path))
+        run appendHex(&mut line, digest.high)
+        run appendHex(&mut line, digest.low)
+      }
+    }
+    run Bytes.append(&mut line, b" ")
+    run appendAnchored(&mut line, Bytes.asSlice(&note.path), anchors)
+    run List<Bytes>.append(&mut lines, move line)
+    at = at + usize.ONE
+  }
+  // Ordered by the path, then the kind: binary insertion into a list of positions.
+  let written = List<Bytes>.asSlice(&lines)
+  let mut order = List<usize>.make()
+  let mut placed = usize.ZERO
+  while placed < written.length {
+    let ranked = List<usize>.asSlice(&order)
+    let mut low = usize.ZERO
+    let mut high = ranked.length
+    while low < high {
+      let middle = low + (high - low) / 2
+      if lineBefore(Bytes.asSlice(&written[ranked[middle]]), Bytes.asSlice(&written[placed])) { low = middle + usize.ONE } else { high = middle }
+    }
+    let one: [usize; 1] = [placed]
+    run List<usize>.insertSlice(&mut order, low, &one)
+    placed = placed + usize.ONE
+  }
+  let mut output = Bytes.make()
+  let ranked = List<usize>.asSlice(&order)
+  let mut moved = usize.ZERO
+  while moved < ranked.length {
+    run Bytes.append(&mut output, Bytes.asSlice(&written[ranked[moved]]))
+    run Bytes.append(&mut output, b"\n")
+    moved = moved + usize.ONE
+  }
+  return move output
+}
+
+// The digest of the names in the listing of `directory` that the build could have looked for: those
+// equal, once ASCII letters are folded to lower case, to the next component of a path some other
+// note names below it. A file added beside the imported ones leaves it unchanged; a file renamed
+// to another letter case, which the load refuses, changes it.
+effect fn relevantListing(recorder: &Recorder, directory: &[u8]) -> ContentHash ! OutOfMemoryError ? &mut Allocator {
+  let mut stream = ContentHash.stream()
+  let listings = List<Listed>.asSlice(&recorder.listed)
+  let mut found = usize.MAX
+  let mut at = usize.ZERO
+  while at < listings.length {
+    if same(Bytes.asSlice(&listings[at].directory), directory) { found = at }
+    at = at + usize.ONE
+  }
+  if found == usize.MAX { return ContentHash.finish(move stream) }
+  let names = List<Bytes>.asSlice(&listings[found].names)
+  let notes = List<Note>.asSlice(&recorder.notes)
+  let mut wanted = List<Bytes>.make()
+  at = usize.ZERO
+  while at < notes.length {
+    let path = Bytes.asSlice(&notes[at].path)
+    if path.length > directory.length + usize.ONE && within(path, directory) {
+      let rest = Slice.view<u8>(path, directory.length + usize.ONE, path.length - directory.length - usize.ONE)
+      let mut end = usize.ZERO
+      while end < rest.length && rest[end] != 47 { end = end + usize.ONE }
+      run List<Bytes>.append(&mut wanted, run Bytes.copy(Slice.view<u8>(rest, usize.ZERO, end)))
+    }
+    at = at + usize.ONE
+  }
+  let looked = List<Bytes>.asSlice(&wanted)
+  // Listed order is the filesystem's; the kept names are digested in name order.
+  let mut kept = List<usize>.make()
+  let mut name = usize.ZERO
+  while name < names.length {
+    let entry = Bytes.asSlice(&names[name])
+    let bare = Slice.view<u8>(entry, usize.ZERO, entry.length - 2)
+    let mut hit = false
+    let mut one = usize.ZERO
+    while one < looked.length && !hit {
+      hit = sameFolded(bare, Bytes.asSlice(&looked[one]))
+      one = one + usize.ONE
+    }
+    if hit {
+      let ranked = List<usize>.asSlice(&kept)
+      let mut slot = usize.ZERO
+      while slot < ranked.length && bytesBefore(Bytes.asSlice(&names[ranked[slot]]), entry) { slot = slot + usize.ONE }
+      let placed: [usize; 1] = [name]
+      run List<usize>.insertSlice(&mut kept, slot, &placed)
+    }
+    name = name + usize.ONE
+  }
+  let ranked = List<usize>.asSlice(&kept)
+  at = usize.ZERO
+  while at < ranked.length {
+    ContentHash.append(&mut stream, Bytes.asSlice(&names[ranked[at]]))
+    ContentHash.appendByte(&mut stream, 10)
+    at = at + usize.ONE
+  }
+  return ContentHash.finish(move stream)
+}
+
+fn sameFolded(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    let mut a = left[at]
+    let mut b = right[at]
+    if a >= 65 && a <= 90 { a = a + 32 }
+    if b >= 65 && b <= 90 { b = b + 32 }
+    if a != b { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// `path` named from the first anchor that holds it, or as it is.
+effect fn appendAnchored(line: &mut Bytes, path: &[u8], anchors: &[Anchor]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < anchors.length {
+    let directory = Bytes.asSlice(&anchors[at].directory)
+    if directory.length > usize.ZERO && within(path, directory) {
+      let label = Bytes.asSlice(&anchors[at].label)
+      let mut rest = Slice.view<u8>(path, directory.length, path.length - directory.length)
+      if rest.length > usize.ZERO { rest = Slice.view<u8>(rest, usize.ONE, rest.length - usize.ONE) }
+      run Bytes.append(&mut line.*, label)
+      if label.length > usize.ZERO && rest.length > usize.ZERO { run Bytes.append(&mut line.*, b"/") }
+      if label.length == usize.ZERO && rest.length == usize.ZERO { run Bytes.append(&mut line.*, b".") }
+      return run Bytes.append(&mut line.*, rest)
+    }
+    at = at + usize.ONE
+  }
+  return run Bytes.append(&mut line.*, path)
+}
+
+// Whether line `left` sorts before `right`: by the path after the second space, then the whole line.
+fn lineBefore(left: &[u8], right: &[u8]) -> bool {
+  let leftPath = afterSecondSpace(left)
+  let rightPath = afterSecondSpace(right)
+  if !same(leftPath, rightPath) { return bytesBefore(leftPath, rightPath) }
+  return bytesBefore(left, right)
+}
+
+fn afterSecondSpace(line: &[u8]) -> &[u8] {
+  let mut spaces = usize.ZERO
+  let mut at = usize.ZERO
+  while at < line.length {
+    if line[at] == 32 {
+      spaces = spaces + usize.ONE
+      if spaces == 2 { return Slice.view<u8>(line, at + usize.ONE, line.length - at - usize.ONE) }
+    }
+    at = at + usize.ONE
+  }
+  return line
+}
+
+fn bytesBefore(left: &[u8], right: &[u8]) -> bool {
+  let mut at = usize.ZERO
+  while at < left.length && at < right.length {
+    if left[at] != right[at] { return left[at] < right[at] }
+    at = at + usize.ONE
+  }
+  return left.length < right.length
+}
+
+effect fn appendHex(output: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let digits = b"0123456789abcdef"
+  let mut at = usize.ZERO
+  while at < 16 {
+    let digit: [u8; 1] = [digits[u64.toUsize(u64.bitAnd(u64.shiftRight(value, usize.toU64((15 - at) * 4)), 15))]]
+    run Bytes.append(&mut output.*, &digit)
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+effect fn appendDecimal(output: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  if value >= 10 { run appendDecimal(&mut output.*, value / 10) }
+  let digit: [u8; 1] = [u64.toU8(value % 10) + 48]
+  return run Bytes.append(&mut output.*, &digit)
 }
