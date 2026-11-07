@@ -108,7 +108,9 @@ a function address and has no environment to write.
 An implementation head writes the lifetimes of the type it implements. `impl<'a> Row<'a>` covers
 every lifetime. `impl Row<'static>` implements one lifetime: its members exist only for
 `Row<'static>`, each call proves that bound, and the members assume it. That head is the only
-spelling for it; `impl<'a: 'static> Row<'a>` is refused. Conformance heads write lifetimes the
+spelling for it; `impl<'a: 'static> Row<'a>` is refused. A head with type parameters pins the same
+way, as in `impl<T> Tagged<'static, T>`. A bound in the head writes its lifetimes too, as in
+`impl<'a, T: Read<'a>> Reader<T>`. Conformance heads write lifetimes the
 same way, as in `impl<'data, A: Copy> Stream<A, never ? never> for SliceStream<'data, A>`. A
 requirement row or a provides premise in an implementation head may still omit a loan's lifetime,
 which becomes one more implementation lifetime.
