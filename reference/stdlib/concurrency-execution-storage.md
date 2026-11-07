@@ -13,8 +13,9 @@ Each [`ExecutionStorage`](#ExecutionStorage) state owns its limit, its accountin
 shared counter and no environment lookup. A state is a stack: frames are carved one after
 another from segments, and released in reverse order, so a callee's frame sits right after its
 caller's and costs no allocation of its own. The first segment, one page, comes with the
-state; a frame that does not fit starts a segment four times the size of the last, which stays
-for reuse once it empties. Compiled code carves most frames itself from the state's window
+state; a frame that does not fit starts a new segment, which stays for reuse once it empties.
+The second segment is sixteen times the size of the first, and each later one four times the
+size of the last. Compiled code carves most frames itself from the state's window
 without calling the state. Segments use the declared allocator of the selected target.
 
 ## Errors
