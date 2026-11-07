@@ -21,6 +21,7 @@ and when TLS 1.3 is also allowed, it rejects a TLS 1.2 ServerHello with the RFC 
 mark. It checks the certificate chain
 against your `TrustSnapshot`, the host name of your `ReferenceIdentity`, the CertificateVerify
 signature, and the Finished message. It gives no application data before all checks pass.
+`ClientConfig.ciphers` sets the order in which it offers the cipher suites.
 
 When the server sends a CertificateRequest, the client answers with the [`ClientCredential`](#ClientCredential)
 given to [`Client.make`](#Client.impl.make): the chain and a CertificateVerify signed with its key, using a scheme
@@ -69,7 +70,7 @@ import silk.collections.list { List }
 import silk.system.random { Random }
 import silk.core.result { Result }
 import silk.system.system_clock { SystemClock }
-import silk.tls.client { AlpnConfig, Client, ClientConfig, ClientCredential, ClientLimits, Progress, Resumption, TlsError }
+import silk.tls.client { AlpnConfig, CipherOrder, Client, ClientConfig, ClientCredential, ClientLimits, Progress, Resumption, TlsError }
 import silk.tls.record { VersionPolicy }
 import silk.tls.trust_anchor { TrustAnchor }
 import silk.tls.trust_snapshot { SnapshotLimits, TrustSnapshot, TrustSourceError }
@@ -115,7 +116,8 @@ pub effect fn main() -> i32
     alpn: AlpnConfig.defaults(),
     resumption: Resumption.Disabled,
     versions: VersionPolicy.defaults(),
-    limits: ClientLimits.defaults()
+    limits: ClientLimits.defaults(),
+    ciphers: CipherOrder.Machine,
   }
   let made = run Client.make(&config, move trust, SystemClock.make(1789156800, 0), ClientCredential.None)
     |> Effect.provideMut<Random>(&mut random)
@@ -141,7 +143,7 @@ pub effect fn main() -> i32
 
 Import as `Client` with `import silk.tls.client { Client }`.
 
-Public declarations: 19.
+Public declarations: 20.
 
 <a id="NamedGroup"></a>
 
@@ -563,6 +565,71 @@ pub limits: ClientLimits
 ```
 
 Finite connection limits and nested certificate policies.
+
+<a id="ClientConfig.ciphers"></a>
+
+### Field `ciphers`
+
+```silk
+pub ciphers: CipherOrder
+```
+
+The order in which the client offers its cipher suites. `CipherOrder.Machine` puts the
+fastest on this machine first.
+
+<a id="CipherOrder"></a>
+
+## `CipherOrder`
+
+```silk
+pub enum CipherOrder
+```
+
+The order in which a [`Client`](#Client) offers its cipher suites, in [`ClientConfig.ciphers`](#ClientConfig.ciphers).
+
+### Details
+A server that follows the client's order, as most do, picks the first suite it also supports.
+The order is the same for the TLS 1.3 and the TLS 1.2 suites.
+
+<a id="CipherOrder.Machine"></a>
+
+### `Machine`
+
+```silk
+Machine
+```
+
+AES-GCM first when this machine has the AES instructions that `silk.crypto.aes_gcm` uses
+(AES-NI, PCLMULQDQ and SSSE3 on x86-64, AES and PMULL on AArch64), and ChaCha20-Poly1305 first
+when it does not. Most clients order their suites this way.
+
+<a id="CipherOrder.ChaChaFirst"></a>
+
+### `ChaChaFirst`
+
+```silk
+ChaChaFirst
+```
+
+ChaCha20-Poly1305 first, then AES-128-GCM and AES-256-GCM, on every machine.
+
+<a id="CipherOrder.AesFirst"></a>
+
+### `AesFirst`
+
+```silk
+AesFirst
+```
+
+AES-128-GCM and AES-256-GCM first, then ChaCha20-Poly1305, on every machine.
+
+<a id="CipherOrder.impl"></a>
+
+## Implementation `CipherOrder`
+
+```silk
+impl CipherOrder
+```
 
 <a id="Resumption"></a>
 
