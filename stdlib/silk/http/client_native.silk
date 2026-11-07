@@ -119,6 +119,8 @@ import silk.http.request {Authorization, BodyMode, HeaderControl, HeaderPolicy, 
 import silk.http.transport {HttpTransport, TransportError}
 import silk.tls.https_identity {IdentityError}
 import silk.collections.list {List}
+import silk.concurrency.channel {Channel, Receiver, Sender, TryReceive, TrySend}
+import silk.mem.pointer {Pointer}
 import silk.mem.box {Box}
 import silk.mem.shared {Shared}
 import silk.system.monotonic_clock {MonotonicClock}
@@ -181,8 +183,6 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   // The most idle connections the client keeps open at once. An origin can have several, so that
   // concurrent requests reuse them.
   const MAX_IDLE: usize = 64
-  const ROUND_JOBS_PER_TASK: usize = 2
-  const MIN_ROUND_JOBS: usize = 128
   /// The default number of requests that [`Http.sendAll`] runs at the same time.
   pub const DEFAULT_CONCURRENCY: usize = 32
   /// The maximum number of headers that [`NativeHttp.header`] adds.
@@ -1394,19 +1394,6 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     }
   }
 
-  // What a task gives back: its response or failure, and its connection if it stays open.
-  struct JobOutcome {
-    received: Outcome,
-    kept: Option<Box<IdleConnection>>,
-  }
-
-  // The results of one round of jobs, in job order, and the connections that stayed open.
-  struct Round {
-    results: List<Outcome>,
-    idle: List<Box<IdleConnection>>,
-    trusts: List<JobTrust>,
-  }
-
   // One request of `sendAll` and where it is.
   union Progress {
     // It needs another hop.
@@ -1417,21 +1404,25 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     Taken,
   }
 
-  // Sends `requests` and returns their results in the same order. Each round sends the current hop
-  // of each unfinished request: direct requests run as tasks of a local scheduler, at most
-  // `concurrencyValue` at once, and proxied requests run one by one. A redirect goes to the next
-  // round.
+  // Sends `requests` and returns their results in the same order. The direct requests run on at
+  // most `concurrencyValue` worker tasks of one local scheduler, which live for the whole batch: the
+  // root task prepares the next hop of each request while the workers send the ones before it, and
+  // proxied requests run one by one in the root task. A redirect goes back to the root task.
   effect fn sendConcurrent(client: &mut NativeHttp<'_>, requests: List<Request<'_>>) -> List<Result<Response, HttpError>>
   ! OutOfMemoryError
   ? &mut Allocator {
     let all = List<Request>.asSlice(&requests)
     let mut progress = List<Progress>.make()
     run List<Progress>.reserveExact(&mut progress, all.length)
+    let mut going = usize.ZERO
     let mut index = usize.ZERO
     while index < all.length {
       let begun = run Effect.result(begin(&client.*, &all[index]))
       let next = match move begun {
-        Result.Success {value} => Progress.Going {hop: move value}
+        Result.Success {value} => {
+          going = going + usize.ONE
+          Progress.Going {hop: move value}
+        }
         Result.Failure {error} => match move error {
           HttpError failure => Progress.Finished {result: Result<Response, HttpError>.failResult(move failure)}
           OutOfMemoryError exhausted => { fail move exhausted }
@@ -1440,73 +1431,8 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
       run List<Progress>.append(&mut progress, move next)
       index = index + usize.ONE
     }
-    let window = roundWindow(client.concurrencyValue)
-    while true {
-      let mut jobs = List<Box<PendingJob>>.make()
-      let mut owners = List<usize>.make()
-      let states = List<Progress>.asMutSlice(&mut progress)
-      index = usize.ZERO
-      while index < states.length && List<Box<PendingJob>>.length(&jobs) < window {
-        let mut finished = Option<Result<Response, HttpError>>.none()
-        if let Progress.Going {hop} = &mut states[index] {
-          let attempted = run Effect.result(stepHop(&mut client.*, &all[index], &mut hop))
-          match move attempted {
-            Result.Success {value} => match move value {
-              Stepped.Again => {}
-              Stepped.Final {response} => { finished = Option<Result<Response, HttpError>>.some(Result<Response, HttpError>.succeed(move response)) }
-              Stepped.Queued {job} => {
-                run List<Box<PendingJob>>.append(&mut jobs, move job)
-                run List<usize>.append(&mut owners, index)
-              }
-            }
-            Result.Failure {error} => match move error {
-              HttpError failure => { finished = Option<Result<Response, HttpError>>.some(Result<Response, HttpError>.failResult(move failure)) }
-              OutOfMemoryError exhausted => { fail move exhausted }
-            }
-          }
-        }
-        if let Option.Some {value} = move finished {
-          states[index] = Progress.Finished {result: move value}
-        }
-        index = index + usize.ONE
-      }
-      drop states
-      if List<Box<PendingJob>>.length(&jobs) == usize.ZERO && !anyGoing(List<Progress>.asSlice(&progress)) { break }
-      let mut results = run runRound(&mut client.*, move jobs)
-      // The results come in job order; take them from the end.
-      let settled = List<Progress>.asMutSlice(&mut progress)
-      let indices = List<usize>.asSlice(&owners)
-      let mut position = indices.length
-      while position > usize.ZERO {
-        position = position - usize.ONE
-        let owner = indices[position]
-        let result = match List<Outcome>.pop(&mut results) {
-          Option.Some {value} => move value
-          Option.None => Intrinsic.trap("sendAll: a round returned fewer results than jobs")
-        }
-        let mut finished = Option<Result<Response, HttpError>>.none()
-        if let Progress.Going {hop} = &mut settled[owner] {
-          let advanced = match move result {
-            Outcome.Done {received} => run Effect.result(advance(client.failOnStatusValue, &mut hop, move received))
-            Outcome.Failed {error} => Result<Option<Response>, HttpError | OutOfMemoryError>.failResult(Box<HttpError>.into(move error))
-            Outcome.Exhausted => { fail OutOfMemoryError {} }
-          }
-          match move advanced {
-            Result.Success {value} => {
-              if let Option.Some {value: response} = move value {
-                finished = Option<Result<Response, HttpError>>.some(Result<Response, HttpError>.succeed(move response))
-              }
-            }
-            Result.Failure {error} => match move error {
-              HttpError failure => { finished = Option<Result<Response, HttpError>>.some(Result<Response, HttpError>.failResult(move failure)) }
-              OutOfMemoryError exhausted => { fail move exhausted }
-            }
-          }
-        }
-        if let Option.Some {value} = move finished {
-          settled[owner] = Progress.Finished {result: move value}
-        }
-      }
+    if going > usize.ZERO {
+      run sendBatch(&mut client.*, all, &mut progress, going)
     }
     drop all
     // Take each result out in request order, leaving `Taken` behind.
@@ -1523,25 +1449,6 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     }
     drop done
     return move ordered
-  }
-
-  // The most jobs one round prepares. A round keeps the prepared request and the response of each
-  // job live until it ends, so a whole large batch in one round outgrows the cache: at 64 tasks, a
-  // round of 256 jobs costs about 15% more time for each request than rounds of 128. Two jobs for
-  // each task keep a task busy while another waits on a slow server.
-  fn roundWindow(concurrency: usize) -> usize {
-    let window = concurrency * ROUND_JOBS_PER_TASK
-    if window < MIN_ROUND_JOBS { return MIN_ROUND_JOBS }
-    return window
-  }
-
-  fn anyGoing(states: &[Progress]) -> bool {
-    let mut index = usize.ZERO
-    while index < states.length {
-      if let Progress.Going {..} = &states[index] { return true }
-      index = index + usize.ONE
-    }
-    return false
   }
 
   // What one step of a request did.
@@ -1583,24 +1490,51 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     }
   }
 
-  // Runs `jobs` as tasks of a local scheduler that waits on the client's clock. The client's idle
-  // connections go to the tasks and come back after.
-  effect fn runRound(client: &mut NativeHttp<'_>, jobs: List<Box<PendingJob>>) -> List<Outcome>
+  // The client, the requests, and their progress, which the root task of `sendBatch` reaches. They
+  // live in the frame of `sendBatch`, which waits in `LocalScheduler.execute` until the root task
+  // and every worker task have finished, so they outlive every task. The root program of a
+  // scheduler must be `'static`, so the borrows travel as addresses
+  // (https://github.com/silk-lang/silk/issues/2961).
+  struct BatchView {
+    client: *mut u8,
+    requests: ?[*]const u8,
+    count: usize,
+    progress: *mut u8,
+  }
+
+  fn viewOf<'c, 'r>(client: &mut NativeHttp<'c>, all: &[Request<'r>], progress: &mut List<Progress>) -> BatchView {
+    let clientAt = Pointer.fromMutRef<NativeHttp<'c>>(&mut client.*)
+    let requestsAt = Pointer.fromSlice<Request<'r>>(all)
+    let progressAt = Pointer.fromMutRef<List<Progress>>(&mut progress.*)
+    let erasedClient = unsafe Intrinsic.pointerReinterpret<*mut NativeHttp<'c>, *mut u8>(clientAt)
+    let erasedRequests = unsafe Intrinsic.pointerReinterpret<?[*]const Request<'r>, ?[*]const u8>(requestsAt)
+    let erasedProgress = unsafe Intrinsic.pointerReinterpret<*mut List<Progress>, *mut u8>(progressAt)
+    return BatchView {client: erasedClient, requests: erasedRequests, count: all.length, progress: erasedProgress}
+  }
+
+  // Sends the unfinished requests of `progress`, `going` of them, on worker tasks of one local
+  // scheduler that waits on the client's clock. The client's idle connections go to the tasks and
+  // come back after.
+  effect fn sendBatch(client: &mut NativeHttp<'_>, all: &[Request<'_>], progress: &mut List<Progress>, going: usize) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
-    if List<Box<PendingJob>>.length(&jobs) == usize.ZERO {
-      return List<Outcome>.make()
-    }
-    // Every job of a round comes from this client, so the round has one trust plan, and each
-    // worker copies it once rather than each job carrying its own copy of the path.
+    // Every job comes from this client, so the batch has one trust plan, and each worker copies
+    // it once rather than each job carrying its own copy of the path.
     let plan = run trustPlan(&client.*)
     let idle = Intrinsic.replace(client.idle, List<Box<IdleConnection>>.make())
     let trusts = Intrinsic.replace(client.workerTrust, List<JobTrust>.make())
+    let mut workers = client.concurrencyValue
+    if going < workers { workers = going }
+    if workers == usize.ZERO { workers = usize.ONE }
+    let view = viewOf(&mut client.*, all, &mut progress.*)
+    // The root task reaches the client through `view`, so the scheduler waits on a clock of its
+    // own rather than on `client.clock`.
+    let mut clock = OsMonotonicClock.make()
     let mut scheduler = LocalScheduler.make()
-    let outcome = run Effect.result(scheduler.execute<Round, OutOfMemoryError | TaskIdExhaustedError | Cancelled>(
-      runJobs(move jobs, move idle, move trusts, client.concurrencyValue, move plan),
-    ) |> Effect.provideMut<MonotonicClock>(&mut client.clock))
-    let round = match move outcome {
+    let outcome = run Effect.result(scheduler.execute<Batch, OutOfMemoryError | TaskIdExhaustedError | Cancelled>(
+      runBatch(move view, move idle, move trusts, workers, move plan),
+    ) |> Effect.provideMut<MonotonicClock>(&mut clock))
+    let batch = match move outcome {
       Result.Success {value} => move value
       Result.Failure {error} => match move error {
         OutOfMemoryError exhausted => { fail move exhausted }
@@ -1609,53 +1543,43 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
         StalledError _stalled => Intrinsic.trap("sendAll: the request tasks stalled")
       }
     }
-    let Round {results, idle: kept, trusts: made} = move round
+    let Batch {idle: kept, trusts: made} = move batch
     let previous = Intrinsic.replace(client.idle, move kept)
     drop previous
     client.workerTrust = move made
     while List<Box<IdleConnection>>.length(&client.idle) > MAX_IDLE {
       run discard(&mut client.idle, usize.ZERO)
     }
-    return move results
+    return ()
   }
 
-  // The root task of a round. It keeps up to `limit` tasks running and collects them in job order.
-  // A task that finishes gives its connection back, so a later job to the same origin reuses it.
-  effect fn runJobs(jobs: List<Box<PendingJob>>, idle: List<Box<IdleConnection>>, trusts: List<JobTrust>, limit: usize, plan: TrustPlan) -> Round
-  ! OutOfMemoryError | TaskIdExhaustedError | Cancelled
-  ? &mut Scheduler | &mut MonotonicClock {
-    let mut allocator = Allocator.systemAllocatorProvider()
-    return run collectJobs(move jobs, move idle, move trusts, limit, &plan) |> Effect.provideMut<Allocator>(&mut allocator)
-  }
-
-  // The work of one round, shared by its worker tasks on the round's thread.
-  struct RoundState {
-    // The jobs not yet taken, last job first, so that `pop` takes them in order.
-    waiting: List<Indexed>,
-    // Its capacity has room for every connection the jobs give back, so a worker adds one without
-    // allocating.
-    pool: List<Box<IdleConnection>>,
-    results: List<Option<Outcome>>,
-    // The trust sources of earlier rounds. A worker takes one when it starts and gives it back when
-    // it ends; the capacity has room for one from each worker.
+  // What the root task of a batch gives back: the connections that stayed open and the trust
+  // sources the workers made.
+  struct Batch {
+    idle: List<Box<IdleConnection>>,
     trusts: List<JobTrust>,
   }
 
+  // The state that the worker tasks of a batch share on its thread.
+  struct BatchState {
+    // The open connections that no worker holds. Its capacity has room for `MAX_IDLE`, and a
+    // worker that gives one back past that closes the oldest, so adding one never allocates.
+    pool: List<Box<IdleConnection>>,
+    // The trust sources of earlier batches. A worker takes one when it starts and gives it back
+    // when it ends; the capacity has room for one from each worker.
+    trusts: List<JobTrust>,
+  }
+
+  // A job for a worker, and the request it belongs to.
   struct Indexed {
     index: usize,
     pending: Box<PendingJob>,
   }
 
-  struct Taken {
+  // A job's result on its way back to the root task.
+  struct Settled {
     index: usize,
-    job: Job,
-    closing: Option<Box<IdleConnection>>,
-  }
-
-  struct Finished {
-    results: List<Option<Outcome>>,
-    idle: List<Box<IdleConnection>>,
-    trusts: List<JobTrust>,
+    outcome: Outcome,
   }
 
   union Checkout {
@@ -1664,156 +1588,258 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     Close {connection: Box<IdleConnection>},
   }
 
-  // Runs the jobs on at most `limit` worker tasks. Each worker takes the next job, and gives its
-  // connection back when the job ends, so a later job to the same origin reuses it. A task per
-  // worker, not per job, keeps the task setup out of the cost of each request.
-  effect fn collectJobs(jobs: List<Box<PendingJob>>, idle: List<Box<IdleConnection>>, trusts: List<JobTrust>, limit: usize, plan: &TrustPlan) -> Round
+  effect fn runBatch(view: BatchView, idle: List<Box<IdleConnection>>, trusts: List<JobTrust>, workers: usize, plan: TrustPlan) -> Batch
+  ! OutOfMemoryError | TaskIdExhaustedError | Cancelled
+  ? &mut Scheduler | &mut MonotonicClock {
+    let mut allocator = Allocator.systemAllocatorProvider()
+    return run driveBatch(move view, move idle, move trusts, workers, &plan) |> Effect.provideMut<Allocator>(&mut allocator)
+  }
+
+  // The root task of a batch. It steps each request to its next direct job and queues it for the
+  // workers, keeping one job for each worker in flight, and takes each result back
+  // as it arrives. A worker gives its connection back when its job ends, so a later job to the
+  // same origin reuses it.
+  effect fn driveBatch(view: BatchView, idle: List<Box<IdleConnection>>, trusts: List<JobTrust>, workers: usize, plan: &TrustPlan) -> Batch
   ! OutOfMemoryError | TaskIdExhaustedError | Cancelled
   ? &mut Scheduler | &mut MonotonicClock | &mut Allocator {
-    let count = List<Box<PendingJob>>.length(&jobs)
-    let mut pool = move idle
-    run List<Box<IdleConnection>>.reserveExact(&mut pool, count)
-    let mut queued = move jobs
-    let mut waiting = List<Indexed>.make()
-    run List<Indexed>.reserveExact(&mut waiting, count)
-    let mut index = count
-    while true {
-      match List<Box<PendingJob>>.pop(&mut queued) {
-        Option.None => { break }
-        Option.Some {value} => {
-          index = index - usize.ONE
-          let _added = List<Indexed>.appendWithinCapacity(&mut waiting, Indexed {index: index, pending: move value})
-        }
+    let BatchView {client: clientAddress, requests: requestsAddress, count, progress: progressAddress} = move view
+    let mut clientAnchor: u8 = 0
+    let requestsAnchor: u8 = 0
+    let mut progressAnchor: u8 = 0
+    // `sendBatch` made these addresses from live borrows that outlive this task (see `BatchView`).
+    let clientAt = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut NativeHttp<'static>>(clientAddress)
+    let client = unsafe Pointer.borrowMut<u8, NativeHttp<'static>>(&mut clientAnchor, clientAt)
+    let requestsMany = unsafe Intrinsic.pointerReinterpret<?[*]const u8, ?[*]const Request<'static>>(requestsAddress)
+    let requestsAt = unsafe Intrinsic.pointerRequalify<?[*]const Request<'static>, [*]const Request<'static>>(requestsMany)
+    let all = unsafe Pointer.borrowMany<u8, Request<'static>>(&requestsAnchor, requestsAt, count)
+    let progressAt = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut List<Progress>>(progressAddress)
+    let progress = unsafe Pointer.borrowMut<u8, List<Progress>>(&mut progressAnchor, progressAt)
+    let failOnStatus = client.failOnStatusValue
+    // The requests to step next, in order; a redirected one goes to the end.
+    let mut ready = List<usize>.make()
+    let states = List<Progress>.asSlice(&progress.*)
+    run List<usize>.reserveExact(&mut ready, states.length)
+    let mut index = usize.ZERO
+    while index < states.length {
+      if let Progress.Going {..} = &states[index] {
+        let _added = List<usize>.appendWithinCapacity(&mut ready, index)
       }
+      index = index + usize.ONE
     }
-    let mut slots = List<Option<Outcome>>.make()
-    run List<Option<Outcome>>.reserveExact(&mut slots, count)
-    while List<Option<Outcome>>.length(&slots) < count {
-      let _added = List<Option<Outcome>>.appendWithinCapacity(
-        &mut slots,
-        Option<Outcome>.none(),
-      )
+    drop states
+    // At most one job for each worker is queued or running. A worker that finishes waits for the
+    // root task to step the next request, but each prepared request goes out while it is still in
+    // the cache: at 64 workers, two jobs for each cost about 13% more time for each request.
+    let backlog = workers
+    let queue = run Channel<Indexed>.make(backlog)
+    let Channel<Indexed> {sender: jobs, receiver: taken} = move queue
+    let results = run Channel<Settled>.make(backlog)
+    let Channel<Settled> {sender: done, receiver: settled} = move results
+    let mut pool = move idle
+    let open = List<Box<IdleConnection>>.length(&pool)
+    if open < MAX_IDLE {
+      run List<Box<IdleConnection>>.reserveExact(&mut pool, MAX_IDLE - open)
     }
-    let mut workers = limit
-    if count < workers { workers = count }
     let mut sources = move trusts
     let held = List<JobTrust>.length(&sources)
     if held < workers {
       run List<JobTrust>.reserveExact(&mut sources, workers - held)
     }
-    let state = run Shared<RoundState>.make(RoundState {waiting: move waiting, pool: move pool, results: move slots, trusts: move sources})
+    let state = run Shared<BatchState>.make(BatchState {pool: move pool, trusts: move sources})
     let mut running = List<Fiber<(), never>>.make()
     run List<Fiber<(), never>>.reserveExact(&mut running, workers)
-    while List<Fiber<(), never>>.length(&running) < workers {
-      let copied = run copyPlan(plan)
-      let fiber = run Fiber<(), never>.forkChild(roundWorker(Shared<RoundState>.clone(&state), move copied))
-      let _added = List<Fiber<(), never>>.appendWithinCapacity(&mut running, move fiber)
+    let mut head = usize.ZERO
+    let mut inflight = usize.ZERO
+    while true {
+      while inflight < backlog && head < List<usize>.length(&ready) {
+        let at = List<usize>.asSlice(&ready)[head]
+        head = head + usize.ONE
+        if run stepRequest(&mut client.*, &all[at], List<Progress>.asMutSlice(&mut progress.*), &mut ready, &jobs, at) {
+          inflight = inflight + usize.ONE
+        }
+      }
+      // The workers start once the first jobs wait for them, so they do not all wait on an empty
+      // queue and wake for each of the first jobs.
+      if List<Fiber<(), never>>.length(&running) == usize.ZERO && inflight > usize.ZERO {
+        while List<Fiber<(), never>>.length(&running) < workers {
+          let copied = run copyPlan(plan)
+          let receiver = run taken.clone()
+          let sender = run done.clone()
+          let fiber = run Fiber<(), never>.forkChild(batchWorker(Shared<BatchState>.clone(&state), move receiver, move sender, move copied))
+          let _added = List<Fiber<(), never>>.appendWithinCapacity(&mut running, move fiber)
+        }
+      }
+      if inflight == usize.ZERO { break }
+      let first = match run settled.receive() {
+        Option.Some {value} => move value
+        Option.None => Intrinsic.trap("sendAll: the request tasks stopped before their jobs ended")
+      }
+      inflight = inflight - usize.ONE
+      run absorb(failOnStatus, List<Progress>.asMutSlice(&mut progress.*), &mut ready, move first)
+      while true {
+        match settled.tryReceive() {
+          TryReceive.Received {value} => {
+            inflight = inflight - usize.ONE
+            run absorb(failOnStatus, List<Progress>.asMutSlice(&mut progress.*), &mut ready, move value)
+          }
+          _ => { break }
+        }
+      }
     }
+    // Closing the queue ends each worker once it finds no job.
+    jobs.close()
+    drop jobs
+    drop taken
+    drop done
     while true {
       match List<Fiber<(), never>>.pop(&mut running) {
         Option.None => { break }
         Option.Some {value} => run value.join()
       }
     }
-    let Finished {results: filled, idle: kept, trusts: made} = Shared<RoundState>.withMut<Finished>(&state, finishRound)
-    let mut slotsDone = move filled
-    drop state
-    let mut results = List<Outcome>.make()
-    run List<Outcome>.reserveExact(&mut results, count)
-    let entries = List<Option<Outcome>>.asMutSlice(&mut slotsDone)
-    let mut at = usize.ZERO
-    while at < entries.length {
-      match Intrinsic.replace(entries[at], Option<Outcome>.none()) {
-        Option.None => Intrinsic.trap("sendAll: a request of the round has no result")
-        Option.Some {value} => {
-          let _added = List<Outcome>.appendWithinCapacity(&mut results, move value)
-        }
-      }
-      at = at + usize.ONE
-    }
-    return Round {results: move results, idle: move kept, trusts: move made}
+    drop settled
+    return Shared<BatchState>.withMut<Batch>(&state, finishBatch)
   }
 
-  // One worker task of a round. Its clock parks only this task while the socket waits.
-  effect fn roundWorker(state: Shared<RoundState>, plan: TrustPlan) -> () ? &mut Scheduler | &mut MonotonicClock {
+  // Steps the request at `index` once, and queues its job for the workers. Returns whether it
+  // queued a job.
+  effect fn stepRequest(client: &mut NativeHttp<'_>, request: &Request<'_>, states: &mut [Progress], ready: &mut List<usize>, jobs: &Sender<Indexed>, index: usize) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+    let mut finished = Option<Result<Response, HttpError>>.none()
+    let mut queued = false
+    if let Progress.Going {hop} = &mut states[index] {
+      let attempted = run Effect.result(stepHop(&mut client.*, request, &mut hop))
+      match move attempted {
+        Result.Success {value} => match move value {
+          Stepped.Again => run List<usize>.append(&mut ready.*, index)
+          Stepped.Final {response} => { finished = Option<Result<Response, HttpError>>.some(Result<Response, HttpError>.succeed(move response)) }
+          Stepped.Queued {job} => {
+            match jobs.trySend(Indexed {index: index, pending: move job}) {
+              TrySend.Sent => {}
+              _ => Intrinsic.trap("sendAll: the job queue had no room")
+            }
+            queued = true
+          }
+        }
+        Result.Failure {error} => match move error {
+          HttpError failure => { finished = Option<Result<Response, HttpError>>.some(Result<Response, HttpError>.failResult(move failure)) }
+          OutOfMemoryError exhausted => { fail move exhausted }
+        }
+      }
+    }
+    if let Option.Some {value} = move finished {
+      states[index] = Progress.Finished {result: move value}
+    }
+    return queued
+  }
+
+  // Takes the result of a job: the request finishes, or goes back to `ready` for its next hop.
+  effect fn absorb(failOnStatus: bool, states: &mut [Progress], ready: &mut List<usize>, settled: Settled) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+    let Settled {index, outcome} = move settled
+    let mut finished = Option<Result<Response, HttpError>>.none()
+    if let Progress.Going {hop} = &mut states[index] {
+      let advanced = match move outcome {
+        Outcome.Done {received} => run Effect.result(advance(failOnStatus, &mut hop, move received))
+        Outcome.Failed {error} => Result<Option<Response>, HttpError | OutOfMemoryError>.failResult(Box<HttpError>.into(move error))
+        Outcome.Exhausted => { fail OutOfMemoryError {} }
+      }
+      match move advanced {
+        Result.Success {value} => match move value {
+          Option.Some {value: response} => { finished = Option<Result<Response, HttpError>>.some(Result<Response, HttpError>.succeed(move response)) }
+          Option.None => run List<usize>.append(&mut ready.*, index)
+        }
+        Result.Failure {error} => match move error {
+          HttpError failure => { finished = Option<Result<Response, HttpError>>.some(Result<Response, HttpError>.failResult(move failure)) }
+          OutOfMemoryError exhausted => { fail move exhausted }
+        }
+      }
+    }
+    if let Option.Some {value} = move finished {
+      states[index] = Progress.Finished {result: move value}
+    }
+    return ()
+  }
+
+  // One worker task of a batch. Its clock parks only this task while the socket waits.
+  effect fn batchWorker(state: Shared<BatchState>, jobs: Receiver<Indexed>, done: Sender<Settled>, plan: TrustPlan) -> () ? &mut Scheduler | &mut MonotonicClock {
     // The services that do not depend on the request are given once for all the jobs of this
     // task, so a request does not pay for a provider layer of each.
     let mut allocator = Allocator.systemAllocatorProvider()
     let mut wall = OsSystemClock.make()
     let mut random = OsRandom.make()
-    return run workJobs(move state, &plan)
+    return run workBatch(move state, &jobs, &done, &plan)
       |> Effect.provideMut<Allocator>(&mut allocator)
       |> Effect.provideMut<SystemClock>(&mut wall)
       |> Effect.provideMut<Random>(&mut random)
   }
 
-  effect fn workJobs(state: Shared<RoundState>, plan: &TrustPlan) -> ()
+  effect fn workBatch(state: Shared<BatchState>, jobs: &Receiver<Indexed>, done: &Sender<Settled>, plan: &TrustPlan) -> ()
   ? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random {
     // A job holds its connection in this list while it runs, and the list keeps its memory for the
     // next job.
     let mut idle = List<Box<IdleConnection>>.make()
-    // The trust source of the first secure job, kept for the later ones and for later rounds:
+    // The trust source of the first secure job, kept for the later ones and for later batches:
     // every job comes from one client, so they share its trust configuration.
-    let mut trust = Shared<RoundState>.withMut<JobTrust>(&state, takeTrust)
+    let mut trust = Shared<BatchState>.withMut<JobTrust>(&state, takeTrust)
     while true {
-      let taken = match Shared<RoundState>.withMut<Option<Taken>>(&state, takeJob) {
+      let Indexed {index, pending} = match run jobs.receive() {
         Option.None => { break }
         Option.Some {value} => move value
       }
-      let Taken {index, job, closing} = move taken
-      if let Option.Some {value} = move closing { run closeIdle(move value) }
+      let mut connection = Option<Box<IdleConnection>>.none()
+      match Shared<BatchState>.withMut<Checkout>(&state, checkOut(&Box<PendingJob>.get(&pending)[usize.ZERO])) {
+        Checkout.Fresh => {}
+        Checkout.Reuse {connection: open} => { connection = Option<Box<IdleConnection>>.some(move open) }
+        Checkout.Close {connection: stale} => run closeIdle(move stale)
+      }
       // `idle` is empty here, and holds at most the connection of this job after the exchange.
-      let received = run outcomeOf(run jobExchange(&mut idle, &mut trust, plan, move job))
-      let kept = List<Box<IdleConnection>>.pop(&mut idle)
-      Shared<RoundState>.withMut<()>(&state, storeOutcome(index, JobOutcome {received: move received, kept: move kept}))
+      let outcome = run outcomeOf(run jobExchange(&mut idle, &mut trust, plan, Job {pending: move pending, connection: move connection}))
+      if let Option.Some {value} = List<Box<IdleConnection>>.pop(&mut idle) {
+        if let Option.Some {value: evicted} = Shared<BatchState>.withMut<Option<Box<IdleConnection>>>(&state, giveBack(move value)) {
+          run closeIdle(move evicted)
+        }
+      }
+      // The root task takes every result before it closes the queue, so the send succeeds.
+      let sent = run done.send(Settled {index: index, outcome: move outcome})
+      drop sent
     }
-    Shared<RoundState>.withMut<()>(&state, keepTrust(move trust))
+    Shared<BatchState>.withMut<()>(&state, keepTrust(move trust))
     return ()
   }
 
-  fn takeTrust(state: &mut RoundState) -> JobTrust {
+  fn takeTrust(state: &mut BatchState) -> JobTrust {
     return match List<JobTrust>.pop(&mut state.trusts) {
       Option.None => JobTrust.Plain
       Option.Some {value} => move value
     }
   }
 
-  fn keepTrust(state: &mut RoundState, trust: JobTrust) -> () {
+  fn keepTrust(state: &mut BatchState, trust: JobTrust) -> () {
     if let JobTrust.Configured {..} = &trust {
       let _added = List<JobTrust>.appendWithinCapacity(&mut state.trusts, move trust)
     }
   }
 
-  fn takeJob(state: &mut RoundState) -> Option<Taken> {
-    let Indexed {index, pending} = match List<Indexed>.pop(&mut state.waiting) {
-      Option.None => { return Option<Taken>.none() }
-      Option.Some {value} => move value
-    }
-    let mut connection = Option<Box<IdleConnection>>.none()
-    let mut closing = Option<Box<IdleConnection>>.none()
-    match move pick(&mut state.pool, &Box<PendingJob>.get(&pending)[usize.ZERO]) {
-      Checkout.Fresh => {}
-      Checkout.Reuse {connection: open} => { connection = Option<Box<IdleConnection>>.some(move open) }
-      Checkout.Close {connection: stale} => { closing = Option<Box<IdleConnection>>.some(move stale) }
-    }
-    return Option<Taken>.some(Taken {index: index, job: Job {pending: move pending, connection: move connection}, closing: move closing})
+  fn checkOut(state: &mut BatchState, job: &PendingJob) -> Checkout {
+    return pick(&mut state.pool, job)
   }
 
-  fn storeOutcome(state: &mut RoundState, index: usize, outcome: JobOutcome) -> () {
-    let JobOutcome {received, kept} = move outcome
-    if let Option.Some {value} = move kept {
-      let _added = List<Box<IdleConnection>>.appendWithinCapacity(&mut state.pool, move value)
+  // Puts `connection` in the pool, and returns the oldest one when the pool already holds
+  // `MAX_IDLE`, for the caller to close.
+  fn giveBack(state: &mut BatchState, connection: Box<IdleConnection>) -> Option<Box<IdleConnection>> {
+    let mut evicted = Option<Box<IdleConnection>>.none()
+    if List<Box<IdleConnection>>.length(&state.pool) >= MAX_IDLE {
+      evicted = Option<Box<IdleConnection>>.some(List<Box<IdleConnection>>.remove(&mut state.pool, usize.ZERO))
     }
-    List<Option<Outcome>>.set(
-      &mut state.results,
-      index,
-      Option<Outcome>.some(move received),
-    )
+    let _added = List<Box<IdleConnection>>.appendWithinCapacity(&mut state.pool, move connection)
+    return move evicted
   }
 
-  fn finishRound(state: &mut RoundState) -> Finished {
-    return Finished {
-      results: Intrinsic.replace(state.results, List<Option<Outcome>>.make()),
+  fn finishBatch(state: &mut BatchState) -> Batch {
+    return Batch {
       idle: Intrinsic.replace(state.pool, List<Box<IdleConnection>>.make()),
       trusts: Intrinsic.replace(state.trusts, List<JobTrust>.make()),
     }
