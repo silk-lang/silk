@@ -29,7 +29,7 @@ HTTP/2-only TLS.
 ## `requireAlpn`
 
 ```silk
-pub effect fn requireAlpn(authentication: &Authentication) -> ()
+pub effect fn requireAlpn(authentication: &Authentication<'_>) -> ()
   ! ProtocolError
 ```
 

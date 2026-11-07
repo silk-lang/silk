@@ -745,8 +745,8 @@ import silk.text.format { Debug, Format, Formatter }
 import silk.io.writer { Writer, WriterError }
 
 struct Account {
-  pub name: string,
-  secret: string,
+  pub name: string<'static>,
+  secret: string<'static>,
 }
 
 impl Debug for Account {

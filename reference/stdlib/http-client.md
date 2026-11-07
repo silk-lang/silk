@@ -41,13 +41,13 @@ struct FakeHttp {
 }
 
 impl Http for FakeHttp {
-  effect fn sendAll(self: &mut Self, requests: List<Request>) -> List<Result<Response, HttpError>>
+  effect fn sendAll(self: &mut Self, requests: List<Request<'_>>) -> List<Result<Response, HttpError>>
     ! OutOfMemoryError
     ? &mut Allocator {
     return run Http.sendEach(move requests) |> Effect.provideMut<Http>(&mut self.*)
   }
 
-  effect fn send(self: &mut Self, request: Request) -> Response
+  effect fn send(self: &mut Self, request: Request<'_>) -> Response
     ! HttpError | OutOfMemoryError
     ? &mut Allocator {
     self.calls = self.calls + 1
@@ -1164,7 +1164,7 @@ Makes a response with no headers, for fake providers in tests.
 ### Associated function `withHeaders`
 
 ```silk
-pub effect fn withHeaders(status: u16, headers: &[Header], body: &[u8]) -> Response
+pub effect fn withHeaders(status: u16, headers: &[Header<'_>], body: &[u8]) -> Response
   ! HttpError | OutOfMemoryError
   ? &mut Allocator
 ```
@@ -1310,7 +1310,7 @@ or a fake in tests. Use `silk.http.exchange` to stream bodies or to control the 
 ### Operation `send`
 
 ```silk
-effect fn send(request: Request) -> Response ! HttpError | OutOfMemoryError ? &mut Http | &mut Allocator
+effect fn send(request: Request<'_>) -> Response ! HttpError | OutOfMemoryError ? &mut Http | &mut Allocator
 ```
 
 Sends one request and returns the complete response, whatever its status.
@@ -1333,7 +1333,7 @@ It checks the request first. A response with a 4xx or 5xx status is a success. C
 ### Operation `sendAll`
 
 ```silk
-effect fn sendAll(requests: List<Request>) -> List<Result<Response, HttpError>>
+effect fn sendAll(requests: List<Request<'_>>) -> List<Result<Response, HttpError>>
   ! OutOfMemoryError
   ? &mut Http | &mut Allocator
 ```
@@ -1363,7 +1363,7 @@ impl Http
 ### Associated function `sendEach`
 
 ```silk
-pub effect fn sendEach(requests: List<Request>) -> List<Result<Response, HttpError>>
+pub effect fn sendEach(requests: List<Request<'_>>) -> List<Result<Response, HttpError>>
   ! OutOfMemoryError
   ? &mut Http | &mut Allocator
 ```

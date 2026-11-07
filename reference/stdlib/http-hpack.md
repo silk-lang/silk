@@ -114,7 +114,7 @@ impl Header
 ### Method `view`
 
 ```silk
-pub fn view(self: &Self) -> Field
+pub fn view(self: &Self) -> Field<'_>
 ```
 
 Borrows the field bytes. The view cannot outlive the owned field.
@@ -263,7 +263,7 @@ Applies the peer's table limit and emits the required updates at the next field 
 ### Method `encode`
 
 ```silk
-pub effect fn encode(self: &mut Self, fields: &[Field]) -> Bytes
+pub effect fn encode(self: &mut Self, fields: &[Field<'_>]) -> Bytes
     ! OutOfMemoryError
     ? &mut Allocator
 ```

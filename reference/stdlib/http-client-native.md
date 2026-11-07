@@ -330,7 +330,7 @@ impl<'config> Http for NativeHttp<'config>
 ### Operation `sendAll`
 
 ```silk
-effect fn sendAll(self: &mut Self, requests: List<Request>) -> List<Result<Response, HttpError>>
+effect fn sendAll(self: &mut Self, requests: List<Request<'_>>) -> List<Result<Response, HttpError>>
     ! OutOfMemoryError
     ? &mut Allocator
 ```
@@ -340,7 +340,7 @@ effect fn sendAll(self: &mut Self, requests: List<Request>) -> List<Result<Respo
 ### Operation `send`
 
 ```silk
-effect fn send(self: &mut Self, request: Request) -> Response ! HttpError | OutOfMemoryError ? &mut Allocator
+effect fn send(self: &mut Self, request: Request<'_>) -> Response ! HttpError | OutOfMemoryError ? &mut Allocator
 ```
 
 

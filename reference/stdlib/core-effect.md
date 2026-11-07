@@ -463,7 +463,7 @@ not change. The new failure keeps the original failure as its diagnostic cause.
 ```silk
 pub effect fn flatMap<'env, A, B, E, F, ?R, ?S>(
     self: once Effect<'env; A ! E ? R>,
-    onSuccess: for<use 'call> once fn<'env>(A) -> once Effect<'call & 'env; B ! F ? S>
+    onSuccess: once effect fn<'env>(A) -> B ! F ? S
   ) -> B ! E | F ? R | S
 ```
 
@@ -546,7 +546,7 @@ not run. The output has the failures and providers of all three effects.
 ```silk
 pub effect fn tap<'env, A, E, F, ?R, ?S>(
     self: once Effect<'env; A ! E ? R>,
-    callback: for<use 'call> once fn<'env>(A) -> once Effect<'call & 'env; A ! F ? S>
+    callback: once effect fn<'env>(A) -> A ! F ? S
   ) -> A ! E | F ? R | S
 ```
 
@@ -570,7 +570,7 @@ If `self` fails, `callback` does not run. A failure of either step propagates.
 ```silk
 pub effect fn catchAll<'env, A, B, E, F, ?R, ?S>(
     self: once Effect<'env; A ! E ? R>,
-    onFailure: for<use 'call> once fn<'env>(E) -> once Effect<'call & 'env; B ! F ? S>
+    onFailure: once effect fn<'env>(E) -> B ! F ? S
   ) -> A | B ! F ? R | S
 ```
 
@@ -602,7 +602,7 @@ A trap is not a typed failure. `catchAll` does not catch a trap.
 ```silk
 pub effect fn catch<'env, S, A, B, E, F, ?R, ?Q>(
     self: once Effect<'env; A ! E ? R>,
-    onFailure: for<use 'call> once fn<'env>(S) -> once Effect<'call & 'env; B ! F ? Q>
+    onFailure: once effect fn<'env>(S) -> B ! F ? Q
   ) -> A | B ! Without<E, S> | F ? R | Q
   where S in E
 ```

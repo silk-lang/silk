@@ -674,7 +674,7 @@ It consumes `text` also when it fails.
 ### Method `view`
 
 ```silk
-pub fn view(self: &Self) -> UriReference
+pub fn view(self: &Self) -> UriReference<'_>
 ```
 
 Returns a [`UriReference`](#UriReference) that borrows this value. It does not parse again or allocate.

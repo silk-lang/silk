@@ -300,7 +300,7 @@ Returns the path and, when it is present, the `?` and the query, as one part of 
 ### Associated function `resolveInto`
 
 ```silk
-pub effect fn resolveInto(output: &mut Bytes, base: &Uri, reference: &UriReference) -> Result<
+pub effect fn resolveInto(output: &mut Bytes, base: &Uri<'_>, reference: &UriReference<'_>) -> Result<
     (),
     ParseError,
   > ! OutOfMemoryError ? &mut Allocator
@@ -324,7 +324,7 @@ To read the result, call [`Uri.parse`](#Uri.impl.parse) on the bytes of `output`
 ### Associated function `resolveOwned`
 
 ```silk
-pub effect fn resolveOwned(base: &Uri, reference: &UriReference) -> Result<OwnedUri, ParseError>
+pub effect fn resolveOwned(base: &Uri<'_>, reference: &UriReference<'_>) -> Result<OwnedUri, ParseError>
   ! OutOfMemoryError
   ? &mut Allocator
 ```
@@ -397,7 +397,7 @@ It consumes `text` also when it fails.
 ### Method `view`
 
 ```silk
-pub fn view(self: &Self) -> Uri
+pub fn view(self: &Self) -> Uri<'_>
 ```
 
 Returns a [`Uri`](#Uri) that borrows this value. It does not parse again or allocate.

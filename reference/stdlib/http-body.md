@@ -1405,7 +1405,7 @@ that is never allowed in a trailer.
 ```silk
 pub fn selectRequest<'value>(
   head: RequestHead<'value>,
-  policy: TrailerPolicy,
+  policy: TrailerPolicy<'_>,
 ) -> Result<Selection<'value>, BodyError>
 ```
 
@@ -1420,8 +1420,8 @@ A request without `Content-Length` or `Transfer-Encoding` has no body.
 ```silk
 pub fn selectResponse<'value>(
   head: ResponseHead<'value>,
-  requestMethod: &Method,
-  policy: TrailerPolicy,
+  requestMethod: &Method<'_>,
+  policy: TrailerPolicy<'_>,
 ) -> Result<Selection<'value>, BodyError>
 ```
 
@@ -1439,7 +1439,7 @@ closes.
 ```silk
 pub fn validateOutgoingRequest<'value>(
   head: RequestHead<'value>,
-  policy: TrailerPolicy,
+  policy: TrailerPolicy<'_>,
 ) -> Result<Selection<'value>, BodyError>
 ```
 
@@ -1453,8 +1453,8 @@ Checks the framing fields of a request that you send, and returns the framing fo
 ```silk
 pub fn validateOutgoingResponse<'value>(
   head: ResponseHead<'value>,
-  requestMethod: &Method,
-  policy: TrailerPolicy,
+  requestMethod: &Method<'_>,
+  policy: TrailerPolicy<'_>,
 ) -> Result<Selection<'value>, BodyError>
 ```
 
@@ -1488,7 +1488,7 @@ impl Decoder
 pub effect fn make<'head>(
     selection: Selection<'head>,
     limits: Limits,
-    policy: TrailerPolicy,
+    policy: TrailerPolicy<'_>,
   ) -> Result<Decoder, BodyError> ! OutOfMemoryError ? &mut Allocator
 ```
 
@@ -1721,7 +1721,7 @@ impl Encoder
 pub effect fn make<'head>(
     selection: Selection<'head>,
     limits: Limits,
-    policy: TrailerPolicy,
+    policy: TrailerPolicy<'_>,
   ) -> Result<Encoder, BodyError> ! OutOfMemoryError ? &mut Allocator
 ```
 

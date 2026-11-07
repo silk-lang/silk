@@ -86,38 +86,67 @@ boundary.
 **Evidence:** outlives requirements,
 compatibility tests.
 
-## LIFE-003 — Elision is determined by the declaration header
+## LIFE-003 — Declarations write their lifetimes; signatures elide them
 
 **Status:** Confirmed
 
-An omitted lifetime on each independent borrowed input introduces a fresh declaration binder. An
-outer borrowed receiver supplies omitted result lifetimes; without that receiver, exactly one
-top-level borrowed input supplies the default. A string input participates as a borrowed view.
+A declaration has exactly the lifetimes its header writes. A struct, union or tuple field, a
+declaration bound and an alias target write every lifetime they borrow for, and the compiler never
+adds a hidden lifetime parameter. A field that holds program-long data writes `'static`, and a
+callable or Effect bound writes its environment, as in `fn<'static>(i32) -> i32`.
+
+```silk
+struct Row<'a> { title: string<'a>, done: bool }
+struct Config { name: string<'static> }
+struct Cb<F: fn<'static>(i32) -> i32> { f: F }
+```
+
+A field's type is one runtime representation, so a callable contract cannot be a field's type;
+the field holds a type parameter bounded by the contract, as `Cb` does. An `extern "C" fn` field is
+a function address and has no environment to write.
+
+An implementation head writes the lifetimes of the type it implements. `impl<'a> Row<'a>` covers
+every lifetime. `impl Row<'static>` implements one lifetime: its members exist only for
+`Row<'static>`, each call proves that bound, and the members assume it. That head is the only
+spelling for it; `impl<'a: 'static> Row<'a>` is refused. A head with type parameters pins the same
+way, as in `impl<T> Tagged<'static, T>`. A bound in the head writes its lifetimes too, as in
+`impl<'a, T: Read<'a>> Reader<T>`. Conformance heads write lifetimes the
+same way, as in `impl<'data, A: Copy> Stream<A, never ? never> for SliceStream<'data, A>`. A
+requirement row or a provides premise in an implementation head may still omit a loan's lifetime,
+which becomes one more implementation lifetime.
+
+In a signature, each omitted lifetime in an input introduces a fresh declaration binder. The
+result defaults follow Rust's elision rules. A borrowed receiver, such as `self: &Self`,
+`self: &mut Self` or a `string` receiver, supplies every omitted result lifetime. Without one, if the inputs show exactly
+one lifetime, written or elided, that lifetime supplies the omitted result lifetimes. A string
+input counts as a borrowed view. Lifetimes inside a callable's or Effect's environment and
+lifetimes carried by a type parameter do not count.
 
 ```silk
 fn first(values: &[i32]) -> &i32 {
   return &values[0]
 }
+struct Span<'a> { text: string<'a> }
+fn same(span: Span<'_>) -> Span<'_> {
+  return span
+}
 ```
 
-Its expanded contract is `fn first<'life0>(values: &'life0 [i32]) -> &'life0 i32`.
-Each omitted lifetime in a nominal input introduces an independent binder. Borrowing a wrapper
-adds its own outer lifetime; that outer borrow does not merge the wrapper's stored-data lifetimes.
-Omitted nominal output lifetimes use the same result default. Each omitted borrowed field introduces
-an independent parameter of its containing declaration.
+The expanded contract of `first` is `fn first<'life0>(values: &'life0 [i32]) -> &'life0 i32`, and
+`same` returns a `Span` of the one lifetime its input shows. Borrowing a wrapper adds its own outer
+lifetime, so `&Span<'_>` shows two lifetimes and gives no default. Omitted nominal output lifetimes
+use the same result default. `Self` in an implementation denotes the head's applied owner,
+including its stored-data lifetimes.
 
-An inherent impl also introduces owner binders for omitted nominal lifetimes. For example,
-`impl<A> SliceStream<A>` can define `make(slice: &[A]) -> SliceStream<A>`: its returned
-holder uses the input's lifetime, so `SliceStream.make(&values)` is callable. Returning `Self`
-instead keeps the impl's applied owner, including its stored-data lifetimes. It does not connect
-those lifetimes to an independently elided input; name the shared lifetime explicitly when a
-constructor returns `Self`.
-
-Conformance headers apply the same nominal lifetime elision. For a holder with one stored-data
-lifetime, `impl<A: Copy> Stream<A, never ? never> for SliceStream<A>` introduces an independent
-impl lifetime and retains it in the operation contracts. It has the same relationships as an
-explicitly bound `impl<'data, A: Copy> ... for SliceStream<'data, A>`. Ordinary type arguments,
-bounds and conformance selection are unchanged; `Self` still denotes that fixed applied owner.
+A signature shows every lifetime of a type that holds borrows. A nominal type with lifetime
+parameters writes each of them, by name or as `'_`, as in `fn width(span: Span<'_>) -> usize` or
+`fn find(tree: &UiTree<'_>) -> usize`. Writing `Span` alone in a signature is refused, so a reader
+always sees that a value borrows. A reference or slice may still omit its own lifetime, and `'_`
+there, as in `fn first(values: &'_ [i32]) -> &'_ i32`, elides exactly as the omitted lifetime does.
+`'_` names nothing, so it is refused where a lifetime cannot be elided, such as a bound or a
+lifetime parameter, and a field that writes it is refused as an omitted field lifetime is. Inside a
+body a nominal type may still omit its lifetimes, and so may a callable contract's parameters and
+result, as in `fn apply(f: fn<'static>(&Span) -> usize)`.
 
 Inside a body, every omitted lifetime is a fresh region of that body, inferred from its uses and
 cleanup: in a local annotation, a literal's or constructor's type arguments (also through an alias),
@@ -128,14 +157,18 @@ borrow for `'a`. Public
 relationships never depend on return bodies, setter histories, or which constructor happened to
 initialize a field.
 
-**Boundary:** Two independent borrowed inputs with no receiver default require an explicit result
-relationship. A by-value holder's stored view can be returned by naming its data lifetime; elision
-does not reinterpret that stored view as an outer borrowed receiver.
+**Boundary:** Two input lifetimes with no borrowed receiver require an explicit result
+relationship. A by-value receiver is not a borrowed receiver: `self: View<'_>` beside
+`key: &[u8]` shows two lifetimes and gives no default, so its stored view is returned by naming
+its data lifetime. Alone, its one lifetime is the default.
 
-**Diagnostics:** Missing or ambiguous output relationships report `SEM0210`. Editor hover shows
-stable readable generated binders. **Make lifetimes explicit** offers a compiler-owned edit only
-for a complete supported header, preserves comments and semantics, and disables stale actions.
-Ordinary formatting preserves the author's explicit or omitted choices.
+**Diagnostics:** A field, declaration bound, alias target or implementation head that omits a
+lifetime reports `SEM0210` with the declaration to write, and so do missing or ambiguous output
+relationships and a signature type that hides its lifetimes. The editor offers a
+quick fix that inserts `'_` for a hidden signature lifetime. A lifetime binder bounded by `'static` on an implementation head reports `SEM0211`,
+and a field whose type is a callable contract reports `SEM0018`. Editor hover shows stable
+readable generated binders. Ordinary formatting preserves the author's explicit or omitted
+choices in signatures.
 
 **Evidence:** elision requirements,
 declaration tests,
@@ -177,6 +210,19 @@ input and a capture has the intersection of their invocation and capture environ
 loans. A callback may return independent data. It may not conceal retained input dependencies in a
 result type, return a borrowed view of a consumed parameter's former binding cell, or let a
 computation retaining those inputs escape their use extent.
+
+`effect fn(A) -> B ! F ? S` is the short spelling of a callable whose invocation returns such a
+computation. `once effect fn<'env>(A) -> B ! F ? S` is the contract
+`for<use 'call> once fn<'env>(A) -> once Effect<'call & 'env; B ! F ? S>`: the invocation binder
+follows the written ones, and a contract written either way accepts the same callables. An
+`effect fn` contract marks no written binder `use`, and it cannot appear inside another contract's
+parameters or result.
+
+```silk
+effect fn apply<F: once effect fn(i32) -> i32 ! Shortfall>(f: F, n: i32) -> i32 ! Shortfall {
+  return run f(n)
+}
+```
 
 An unmarked `for<'data>` still quantifies an independent data lifetime. The marked binder keeps its
 original position alongside such binders and cannot be chosen by an explicit call-prefix argument.
@@ -274,7 +320,7 @@ lifetime checking tests.
 
 `Intrinsic.RawBuffer<T>` is invariant in its payload type. `Intrinsic.Slot<'storage, T>` adds the
 exclusive storage access lifetime; that lifetime may shorten, while `T` remains invariant. The elided
-spelling `Intrinsic.Slot<T>` follows ordinary nominal lifetime elision. A slot cannot escape the buffer that supplied
+spelling `Intrinsic.Slot<T>` follows ordinary nominal lifetime elision in a signature; a field writes `Intrinsic.Slot<'storage, T>`. A slot cannot escape the buffer that supplied
 it. Slot projection checks the recorded element count; the caller still proves that the underlying
 allocation fits that count. Taking an initialized element transfers `T`, including its external referent lifetimes;
 copying one requires `T: Copy` and retains those same lifetimes. Neither operation extends a

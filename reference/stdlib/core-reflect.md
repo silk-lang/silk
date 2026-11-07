@@ -273,7 +273,7 @@ Use this function only for a field where [`Reflect.fieldKind`](#Reflect.impl.fie
 ### Associated function `borrowField`
 
 ```silk
-pub fn borrowField<Owner, Value>(owner: &Owner, static field: Intrinsic.Field<Owner, Value>) -> &Value
+pub fn borrowField<'o, Owner, Value>(owner: &'o Owner, static field: Intrinsic.Field<Owner, Value>) -> &'o Value
 ```
 
 Returns a shared borrow of the field of `owner` that `field` describes.
@@ -360,7 +360,7 @@ import silk.core.reflect { Reflect }
 
 union Command {
   Status,
-  Clone { pub url: string, pub depth: u32 },
+  Clone { pub url: string<'static>, pub depth: u32 },
 }
 
 static fn fieldCount<U>(variant: Intrinsic.Variant<U>) -> usize {
