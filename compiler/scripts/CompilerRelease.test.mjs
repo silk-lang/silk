@@ -278,6 +278,8 @@ const maintenanceFixture = Effect.fnUntraced(function* () {
     commits: 0,
     pull: { ...pull, number: 1, merged_at: null },
     failMetadata: false,
+    written: new Map(),
+    added: [],
   }
   yield* transport((file, args, options) =>
     Effect.sync(() => {
@@ -310,6 +312,7 @@ const maintenanceFixture = Effect.fnUntraced(function* () {
           state.head = 'c'.repeat(40)
           state.commits++
         }
+        if (args[0] === 'add') state.added.push(...args.slice(1))
         if (args[0] === 'push') {
           state.remote = state.head
           state.parent = commit
@@ -341,10 +344,25 @@ const maintenanceFixture = Effect.fnUntraced(function* () {
       Effect.provideService(FileSystem.FileSystem, {
         ...fs,
         readDirectory: () => Effect.succeed(['pending.md']),
+        readFileString: (path) =>
+          path === 'compiler/src/ReleaseVersion.silk'
+            ? Effect.succeed('generated 0.2.0 module')
+            : fs.readFileString(path),
+        writeFileString: (path, text) => Effect.sync(() => void state.written.set(path, text)),
       }),
     )
   return { state, refresh }
 })
+
+it.effect('refresh copies the generated version module into the silk tool', () =>
+  Effect.gen(function* () {
+    const { state, refresh } = yield* maintenanceFixture()
+    yield* refresh()
+    assert.strictEqual(state.written.get('tool/src/ReleaseVersion.silk'), 'generated 0.2.0 module')
+    assert.include(state.added, 'tool/src/ReleaseVersion.silk')
+    assert.strictEqual(state.commits, 1)
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+)
 
 it.effect('refresh preserves human-edited PR descriptions by refusing the update', () =>
   Effect.gen(function* () {

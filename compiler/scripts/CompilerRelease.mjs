@@ -204,6 +204,7 @@ export const maintain = Effect.fn('CompilerRelease.maintain')(function* ({ repos
           ![
             'compiler/silk.toml',
             'compiler/src/ReleaseVersion.silk',
+            'tool/src/ReleaseVersion.silk',
             'compiler/CHANGELOG.md',
           ].includes(path) && !path.startsWith('compiler/.changes/'),
       )
@@ -216,6 +217,12 @@ export const maintain = Effect.fn('CompilerRelease.maintain')(function* ({ repos
     if (parents[0] === base) preparedHead = oldHead
   }
   yield* command(tool, ['change', '--dir', 'compiler', 'version'])
+  // The silk tool reports the release version from a copy of the compiler's generated module;
+  // the release build refuses a tool copy that differs.
+  yield* fs.writeFileString(
+    'tool/src/ReleaseVersion.silk',
+    yield* fs.readFileString('compiler/src/ReleaseVersion.silk'),
+  )
   const release = yield* json(
     yield* command(tool, ['change', '--dir', 'compiler', 'release', '--json']),
   )
@@ -224,6 +231,7 @@ export const maintain = Effect.fn('CompilerRelease.maintain')(function* ({ repos
     'add',
     'compiler/silk.toml',
     'compiler/src/ReleaseVersion.silk',
+    'tool/src/ReleaseVersion.silk',
     'compiler/CHANGELOG.md',
     'compiler/.changes',
   ])
