@@ -55,7 +55,8 @@ The pattern does not follow the ECMAScript Unicode (`u`) grammar.
 PatternLimit
 ```
 
-The pattern exceeds 65,536 bytes or nests groups and classes deeper than 256 levels.
+The pattern exceeds 65,536 bytes, nests groups deeper than 255 levels, or has 255 or more
+captures, too many class ranges or too many nested quantifiers.
 
 <a id="RegexReason.MatchLimit"></a>
 
@@ -159,7 +160,8 @@ and does not borrow `pattern`.
 
 #### Errors
 - `RegexError` with `Syntax` for invalid syntax, or `PatternLimit` for more than 65,536
-  pattern bytes or nesting deeper than 256 levels.
+  pattern bytes, groups nested deeper than 255 levels, 255 or more captures, or too many
+  class ranges or nested quantifiers.
 - `OutOfMemoryError` if the allocator cannot supply the program.
 
 <a id="Regex.impl.validate"></a>
@@ -181,7 +183,8 @@ octal and identity escapes are not accepted in Unicode mode.
 
 #### Errors
 - `RegexError` with `Syntax` for invalid syntax, or `PatternLimit` for more than 65,536
-  pattern bytes or nesting deeper than 256 levels.
+  pattern bytes, groups nested deeper than 255 levels, 255 or more captures, or too many
+  class ranges or nested quantifiers.
 - `OutOfMemoryError` if the allocator cannot supply the program.
 
 <a id="Regex.impl.matches"></a>

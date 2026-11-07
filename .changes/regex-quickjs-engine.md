@@ -2,7 +2,7 @@
 bump: minor
 ---
 
-`silk.text.regex` now runs the QuickJS engine from SilkJS: matching is 15 to 100 times faster, long text no longer fails with `MatchLimit`, and `RegexError` carries a `message` with `RegexReason` reduced to `Syntax`, `PatternLimit` and `MatchLimit`.
+`silk.text.regex` now runs the QuickJS engine from SilkJS: matching is 15 to 100 times faster, a pattern that scans long text once, such as `^[a-z]+$`, no longer fails with `MatchLimit`, and `RegexError` carries a `message` with `RegexReason` reduced to `Syntax`, `PatternLimit` and `MatchLimit`.
 
 ## Migration
 
