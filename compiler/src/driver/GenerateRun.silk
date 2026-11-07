@@ -5,6 +5,7 @@ import diagnostic.JsonText
 import driver.CommandPath
 import driver.Generate {Entry, PostInit}
 import driver.HostRename
+import driver.ToolStep as ToolSteps
 import silk.mem.allocator {Allocator, OutOfMemoryError}
 import silk.collections.bytes {Bytes}
 import silk.system.child_process {ChildProcess, ProcessError, ProcessOutcome, ProcessRequest}
@@ -259,16 +260,23 @@ effect fn inherit(request: &mut ProcessRequest) -> () ! HostInputError | OutOfMe
 // The program `written` names: a path below `directory` when it holds a `/`, else the first file of
 // that name on `PATH`.
 effect fn program(directory: &Path, written: &[u8]) -> Option<Path> ! HostInputError | OutOfMemoryError ? &mut FileSystem | &mut HostInput | &mut Allocator {
+  if holds(written, 47) { return run programOn(directory, written, b"") }
+  let searched = match move run HostInput.variableNamed("PATH") {
+    Option<Bytes>.Some {value} => move value
+    Option<Bytes>.None => { return Option<Path>.none() }
+  }
+  return run programOn(directory, written, Bytes.asSlice(&searched))
+}
+
+// The program `written` names: a path below `directory` when it holds a `/`, else the first file of
+// that name on the search path `searched`.
+effect fn programOn(directory: &Path, written: &[u8], searched: &[u8]) -> Option<Path> ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
   if holds(written, 47) {
     let path = run joined(directory, written)
     if run isFile(&path) { return Option<Path>.some(move path) }
     return Option<Path>.none()
   }
-  let searched = match move run HostInput.variableNamed("PATH") {
-    Option<Bytes>.Some {value} => move value
-    Option<Bytes>.None => { return Option<Path>.none() }
-  }
-  let candidates = run CommandPath.searchCandidates(Bytes.asSlice(&searched), written)
+  let candidates = run CommandPath.searchCandidates(searched, written)
   let listedCandidates = List<Bytes>.asSlice(&candidates)
   let mut at = usize.ZERO
   while at < listedCandidates.length {
@@ -555,18 +563,40 @@ pub effect fn generate(declared: &[Declared], check: bool, working: &Path) -> Ou
   return move outcome
 }
 
-/// Runs the `[[post-init]]` entries `entries` in order in `directory`, the new project's, with the
-/// caller's environment and `extra` after each entry's own arguments, stopping at the first that
-/// cannot start or fails. The status is 0 when
+// The search path of a sandboxed `[[post-init]]` entry: system directories the sandbox reads.
+fn confinedPath() -> &'static [u8] {
+  return b"/usr/local/bin:/usr/bin:/bin"
+}
+
+/// Runs the `[[post-init]]` entries `entries` in order in `directory`, the new project's, with
+/// `SILK_VERSION` set to `compilerRelease` and `arguments` after the own arguments of each entry that
+/// sets `arguments = true`, stopping at the first that cannot start or fails. With a `sandbox`
+/// launcher (driver/ToolStep) an entry runs confined: it reads the system's programs and libraries,
+/// writes only `directory` and `home`, opens no TCP connection and sees only `PATH`, `HOME` and
+/// `TMPDIR` (both `home`) and `SILK_VERSION`; a bare program name is searched on that `PATH`.
+/// Without one it runs with the caller's environment, after a warning in `errors`. The status is 0 when
 /// every entry succeeded, else 1, with the reason in `errors`.
-pub effect fn postInit(directory: &Path, entries: &[PostInit], extra: &[Bytes]) -> Outcome
-! HostInputError | OutOfMemoryError ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
+pub effect fn postInit(directory: &Path, entries: &[PostInit], compilerRelease: &[u8], arguments: &[Bytes], sandbox: Option<&Path>, home: &Path) -> Outcome
+! HostInputError | FileError | OutOfMemoryError ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
   let mut outcome = Outcome {status: 0, output: Bytes.make(), errors: Bytes.make()}
+  let confined = match &sandbox {
+    Option<&Path>.Some {..} => true
+    Option<&Path>.None => false
+  }
+  if !confined && entries.length > usize.ZERO {
+    run Bytes.append(&mut outcome.errors, b"silk: warning: running the template's [[post-init]] entries without a sandbox (--unsandboxed-post-init)\n")
+  }
   let mut index = usize.ZERO
   while index < entries.length {
     let words = List<Bytes>.asSlice(&entries[index].command)
     let line = run spelled(words)
-    let found = match move run program(directory, Bytes.asSlice(&words[usize.ZERO])) {
+    let mut resolved = Option<Path>.none()
+    if confined {
+      resolved = run programOn(directory, Bytes.asSlice(&words[usize.ZERO]), confinedPath())
+    } else {
+      resolved = run program(directory, Bytes.asSlice(&words[usize.ZERO]))
+    }
+    let found = match move resolved {
       Option<Path>.Some {value} => move value
       Option<Path>.None => {
         run Bytes.append(&mut outcome.errors, b"silk: [[post-init]][")
@@ -576,24 +606,44 @@ pub effect fn postInit(directory: &Path, entries: &[PostInit], extra: &[Bytes]) 
         if holds(Bytes.asSlice(&words[usize.ZERO]), 47) {
           run Bytes.append(&mut outcome.errors, b" in the template\n")
         } else {
-          run Bytes.append(&mut outcome.errors, b" on PATH\n")
+          if confined {
+            run Bytes.append(&mut outcome.errors, b" in /usr/local/bin, /usr/bin or /bin\n")
+          } else {
+            run Bytes.append(&mut outcome.errors, b" on PATH\n")
+          }
         }
         outcome.status = 1
         return move outcome
       }
     }
-    let mut request = run ChildProcess.requestWithin(&found, directory)
+    let mut request = match &sandbox {
+      Option<&Path>.Some {value: launcher} => {
+        let writable: [&Path; 2] = [directory, home]
+        let readable = List<Path>.make()
+        run ToolSteps.confined(launcher, &found, List<Path>.asSlice(&readable), &writable)
+      }
+      Option<&Path>.None => run ChildProcess.requestWithin(&found, directory)
+    }
     let mut word = usize.ONE
     while word < words.length {
       run ChildProcess.addArgumentBytes(&mut request, Bytes.asSlice(&words[word]))
       word = word + usize.ONE
     }
-    let mut added = usize.ZERO
-    while added < extra.length {
-      run ChildProcess.addArgumentBytes(&mut request, Bytes.asSlice(&extra[added]))
-      added = added + usize.ONE
+    if entries[index].arguments {
+      let mut added = usize.ZERO
+      while added < arguments.length {
+        run ChildProcess.addArgumentBytes(&mut request, Bytes.asSlice(&arguments[added]))
+        added = added + usize.ONE
+      }
     }
-    run inherit(&mut request)
+    if confined {
+      run ChildProcess.setVariableBytes(&mut request, b"PATH", confinedPath())
+      run ChildProcess.setVariableBytes(&mut request, b"HOME", Path.rawBytes(home))
+      run ChildProcess.setVariableBytes(&mut request, b"TMPDIR", Path.rawBytes(home))
+    } else {
+      run inherit(&mut request)
+    }
+    run ChildProcess.setVariableBytes(&mut request, b"SILK_VERSION", compilerRelease)
     let finished = match move run Effect.result(ChildProcess.submit(&request)) {
       Result<ProcessOutcome, ProcessError | OutOfMemoryError>.Success {value} => move value
       Result<ProcessOutcome, ProcessError | OutOfMemoryError>.Failure {error} => match move error {

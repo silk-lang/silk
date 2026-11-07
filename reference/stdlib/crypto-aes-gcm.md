@@ -16,6 +16,9 @@ says. The tag is 16 bytes, or a prefix of 4, 8 or 12 to 15 bytes. The tag is sep
 both. The associated data (`aad`) is authenticated but not encrypted. Use it for headers that
 must stay readable. The ciphertext has the same length as the plaintext. Nothing allocates.
 
+When one key protects many messages, prepare it once with [`AesGcmKey`](#AesGcmKey), whose `seal` and
+`open` skip the key schedule.
+
 For data that arrives in parts, such as a stream or a Node.js `createCipheriv` call, use
 [`AesGcmEncryptor`](#AesGcmEncryptor) and [`AesGcmDecryptor`](#AesGcmDecryptor). They take the message in any split, give the same
 result, accept nonces of any nonzero length, and can write a truncated tag. On x86-64 they check
@@ -104,7 +107,7 @@ pub fn main() -> i32 {
 
 Import as `AesGcm` with `import silk.crypto.aes_gcm { AesGcm }`.
 
-Public declarations: 4.
+Public declarations: 5.
 
 <a id="AesGcmError"></a>
 
@@ -312,6 +315,136 @@ All checks come before the first write. On an error, `plaintext` does not change
 #### Gotchas
 Authentication does not stop replay: an attacker can send an old valid message again. The
 function does not erase its copy of the key.
+
+<a id="AesGcmKey"></a>
+
+## `AesGcmKey`
+
+```silk
+pub struct AesGcmKey
+```
+
+An AES-GCM key prepared once for many messages: its AES round keys and its GHASH key.
+
+### When to use
+Use it in place of [`AesGcm.seal`](#AesGcm.impl.seal) and [`AesGcm.open`](#AesGcm.impl.open) when one key protects many messages,
+such as the records of a TLS connection. Each of those calls computes the key schedule again,
+which costs about as much as encrypting a few hundred bytes.
+
+### Details
+[`AesGcmKey.seal`](#AesGcmKey.impl.seal) and [`AesGcmKey.open`](#AesGcmKey.impl.open) give the same output and errors as [`AesGcm.seal`](#AesGcm.impl.seal)
+and [`AesGcm.open`](#AesGcm.impl.open) with the same key bytes. With a 12-byte nonce and a 16-byte tag on a machine
+with the AES instructions, they use the prepared key. Otherwise they run the same code as those
+functions. Nothing allocates.
+
+### Gotchas
+The value holds a copy of the key and its schedule, and does not erase them when it is dropped.
+The rules for nonces are those of [`AesGcm.seal`](#AesGcm.impl.seal).
+
+### Examples
+```silk
+import silk.crypto.aes_gcm { AesGcmError, AesGcmKey }
+import silk.core.result { Result }
+
+pub fn main() -> i32 {
+  let key: [u8; 16] = [0; 16]
+  let prepared = match AesGcmKey.make(&key) {
+    Result<AesGcmKey, AesGcmError>.Success { value } => move value
+    Result<AesGcmKey, AesGcmError>.Failure { error: _ } => {
+      return 1
+    }
+  }
+  let nonce: [u8; 12] = [0; 12]
+  let plaintext: [u8; 16] = [0; 16]
+  let mut ciphertext: [u8; 16] = [0; 16]
+  let mut tag: [u8; 16] = [0; 16]
+  if let Result<(), AesGcmError>.Failure { error: _ } = prepared.seal(&nonce, b"header", &plaintext, &mut ciphertext, &mut tag) {
+    return 1
+  }
+  // The same ciphertext as `AesGcm.seal` with this key and nonce.
+  if ciphertext[0] != 0x03 || ciphertext[1] != 0x88 {
+    return 1
+  }
+  let mut decrypted: [u8; 16] = [1; 16]
+  return match prepared.open(&nonce, b"header", &ciphertext, &tag, &mut decrypted) {
+    Result<(), AesGcmError>.Success { value: _ } => if decrypted[0] == 0 { 0 } else { 1 }
+    Result<(), AesGcmError>.Failure { error: _ } => 1
+  }
+}
+```
+
+<a id="AesGcmKey.impl.Transferable"></a>
+
+## Implementation `Transferable for AesGcmKey`
+
+```silk
+impl Transferable for AesGcmKey
+```
+
+<a id="AesGcmKey.impl"></a>
+
+## Implementation `AesGcmKey`
+
+```silk
+impl AesGcmKey
+```
+
+<a id="AesGcmKey.impl.make"></a>
+
+### Associated function `make`
+
+```silk
+pub fn make(key: &[u8]) -> Result<AesGcmKey, AesGcmError>
+```
+
+Prepares `key`, which is 16 bytes (AES-128), 24 bytes (AES-192), or 32 bytes (AES-256).
+
+#### Errors
+- `InvalidKeyLength` if `key` is not 16, 24, or 32 bytes.
+
+<a id="AesGcmKey.impl.seal"></a>
+
+### Method `seal`
+
+```silk
+pub fn seal(
+    self: &Self,
+    nonce: &[u8],
+    aad: &[u8],
+    plaintext: &[u8],
+    ciphertext: &mut [u8],
+    tag: &mut [u8],
+  ) -> Result<(), AesGcmError>
+```
+
+[`AesGcm.seal`](#AesGcm.impl.seal) with this key: encrypts `plaintext` into `ciphertext` and writes the tag to
+`tag`.
+
+#### Errors
+The errors of [`AesGcm.seal`](#AesGcm.impl.seal), other than `InvalidKeyLength`. On an error, `ciphertext` and
+`tag` do not change.
+
+<a id="AesGcmKey.impl.open"></a>
+
+### Method `open`
+
+```silk
+pub fn open(
+    self: &Self,
+    nonce: &[u8],
+    aad: &[u8],
+    ciphertext: &[u8],
+    tag: &[u8],
+    plaintext: &mut [u8],
+  ) -> Result<(), AesGcmError>
+```
+
+[`AesGcm.open`](#AesGcm.impl.open) with this key: checks `tag`, and if it is correct, decrypts `ciphertext` into
+`plaintext`.
+
+#### Errors
+The errors of [`AesGcm.open`](#AesGcm.impl.open), other than `InvalidKeyLength`. On an error, `plaintext` does
+not change.
 
 <a id="AesGcmEncryptor"></a>
 

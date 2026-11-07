@@ -100,6 +100,7 @@ import silk.http.exchange_native as ExchangeNative
 import silk.http.exchange_native {NativeExchangeError, NativeRouteProvider, NativeTransport, Options}
 import silk.tls.certificate_path {ValidationError, ValidationReason}
 import silk.http.headers {Headers, Limits as HeaderLimits}
+import silk.http.body {Framing}
 import silk.http.origin {Origin}
 import silk.http.proxy {
   BypassPolicy,
@@ -905,11 +906,19 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     if isRedirect(status) {
       location = run redirectLocation(&head)
     }
-    // A body with a declared length is read straight into storage of that size. Bigger bodies
-    // use the loop below, so a response to HEAD cannot make the client zero a large buffer.
-    let declaredBody = declaredLength(&head)
-    if let Option.Some {value: declared} = move declaredBody {
-      if declared <= maxBody && declared <= 1048576 && status != 204 && status != 304 {
+    // A body with a fixed length is read straight into storage of that size, and a response with
+    // no body reads nothing. Bigger bodies use the loop below, which grows the storage as bytes
+    // arrive.
+    let framing = exchange.responseFraming()
+    if let Option.Some {value: Framing.Empty} = framing {
+      run Exchange.finishResponse(&mut exchange.*)
+      return Received {
+        parts: run Box<ReceivedParts>.make(ReceivedParts {status: status, head: move head, body: Bytes.make(), location: move location}),
+      }
+    }
+    if let Option.Some {value: Framing.Fixed {length}} = framing {
+      let declared = u64.toUsize(length)
+      if length <= usize.toU64(maxBody) && length <= u64.toU64(1048576) {
         let mut sized = run Bytes.zeroed(declared)
         let mut filled = usize.ZERO
         while filled < declared {
@@ -944,37 +953,6 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     return Received {
       parts: run Box<ReceivedParts>.make(ReceivedParts {status: status, head: move head, body: move body, location: move location}),
     }
-  }
-
-  // The value of a single `Content-Length` field, or `None` when there is none, more than one, or
-  // it is not a plain decimal number. The exchange has already checked the framing.
-  fn declaredLength(head: &OwnedResponseHead) -> Option<usize> {
-    let view = head.view()
-    let mut fields = view.headers().iter()
-    let mut found = Option<usize>.none()
-    while true {
-      let next = fields.next()
-      match move next {
-        Option.None => { break }
-        Option.Some {value} => {
-          if sameName(Header.name(&value), "content-length") {
-            if let Option.Some {..} = &found { return Option<usize>.none() }
-            let digits = Header.value(&value)
-            if digits.length == usize.ZERO || digits.length > 18 { return Option<usize>.none() }
-            let mut number = usize.ZERO
-            let mut index = usize.ZERO
-            while index < digits.length {
-              let digit = digits[index]
-              if digit < 48 || digit > 57 { return Option<usize>.none() }
-              number = number * 10 + u8.toUsize(digit - 48)
-              index = index + usize.ONE
-            }
-            found = Option<usize>.some(number)
-          }
-        }
-      }
-    }
-    return found
   }
 
   // A redirect without a `Location` field has nowhere to go, so it is returned as the response
@@ -1042,7 +1020,11 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     let limits = limitsFor(settings.maxBody)
     let values = limits.head.values
     let mut policy = HeaderPolicy<'r>.defaults()
-    let mut entries = List<Header<'r>>.make()
+    // A client holds at most MAX_DEFAULT_HEADERS defaults and a request at most MAX_HEADERS fields,
+    // and the client adds at most two, so the fields fit in a fixed array.
+    let blank = blankHeader<'r>()
+    let mut fields: [Header<'r>; 50] = [blank; 50]
+    let mut count = usize.ZERO
     let mut hasEncoding = false
     let mut hasContentType = false
     let requested = request.headers()
@@ -1071,7 +1053,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
           Slot.Host => { policy.host = HeaderControl<'r>.Value {value: bytes} }
           Slot.Authorization => { policy.authorization = Authorization<'r>.Value {value: bytes} }
           Slot.Skip => {}
-          Slot.Plain => run appendHeader<'r>(&mut entries, field.name, bytes, values)
+          Slot.Plain => run appendHeader<'r>(&mut fields, &mut count, field.name, bytes, values)
         }
       }
       index = index + usize.ONE
@@ -1080,7 +1062,8 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
       policy.authorization = Authorization<'r>.Value {value: bearer}
     }
     if !hasEncoding {
-      run appendHeader<'r>(&mut entries, "Accept-Encoding", b"identity", values)
+      unsafe { fields[count] = Header<'r>.makeUnchecked("Accept-Encoding", b"identity") }
+      count = count + usize.ONE
     }
     let mut payloadLength = usize.ZERO
     let mut body = BodyMode.Empty
@@ -1089,11 +1072,11 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
       body = BodyMode.KnownLength {length: usize.toU64(payloadLength)}
       if !hasContentType {
         if let Option.Some {value: contentType} = move request.contentType() {
-          run appendHeader<'r>(&mut entries, "Content-Type", String.utf8Bytes(contentType), values)
+          run appendHeader<'r>(&mut fields, &mut count, "Content-Type", String.utf8Bytes(contentType), values)
         }
       }
     }
-    let headers = match move Headers.make(List<Header<'r>>.asSlice(&entries), values) {
+    let headers = match move Headers.make(Slice.view<Header<'r>>(&fields, usize.ZERO, count), values) {
       Result.Success {value} => move value
       Result.Failure {error} => {
         fail HttpError.caused(HttpErrorKind.InvalidRequest, "The request headers exceed the header limits.", HttpCause.Value {error: move error})
@@ -1902,16 +1885,23 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     return Slot.Plain
   }
 
-  effect fn appendHeader<'r>(entries: &mut List<Header<'r>>, name: string<'r>, value: &'r [u8], values: HeaderLimits) -> ()
-  ! HttpError | OutOfMemoryError
-  ? &mut Allocator {
+  // A field that only fills unused storage; it is never sent.
+  fn blankHeader<'r>() -> Header<'r> {
+    unsafe { return Header<'r>.makeUnchecked("", b"") }
+  }
+
+  // `fields` holds every field a request can have: a client keeps at most MAX_DEFAULT_HEADERS
+  // defaults, a request at most MAX_HEADERS fields, and the client adds at most two.
+  effect fn appendHeader<'r>(fields: &mut [Header<'r>; 50], count: &mut usize, name: string<'r>, value: &'r [u8], values: HeaderLimits) -> ()
+  ! HttpError {
     let header = match move Header.make(name, value, values) {
       Result.Success {value: made} => move made
       Result.Failure {error} => {
         fail HttpError.caused(HttpErrorKind.InvalidRequest, "A request header name or value is invalid.", HttpCause.Value {error: move error})
       }
     }
-    run List<Header<'r>>.append(&mut entries.*, header)
+    fields[count.*] = header
+    count.* = count.* + usize.ONE
   }
 
   // The state of one request while it follows redirects.

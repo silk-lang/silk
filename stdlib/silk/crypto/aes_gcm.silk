@@ -12,6 +12,9 @@
 //! both. The associated data (`aad`) is authenticated but not encrypted. Use it for headers that
 //! must stay readable. The ciphertext has the same length as the plaintext. Nothing allocates.
 //!
+//! When one key protects many messages, prepare it once with [`AesGcmKey`], whose `seal` and
+//! `open` skip the key schedule.
+//!
 //! For data that arrives in parts, such as a stream or a Node.js `createCipheriv` call, use
 //! [`AesGcmEncryptor`] and [`AesGcmDecryptor`]. They take the message in any split, give the same
 //! result, accept nonces of any nonzero length, and can write a truncated tag. On x86-64 they check
@@ -110,6 +113,7 @@ import silk.simd.u8x16
 import silk.simd.u32x4
 import silk.simd.u64x2
 import silk.collections.slice {Slice}
+import silk.concurrency.thread {Transferable}
 import silk.core.ownership {Copy}
 import silk.num.u8
 import silk.num.u32
@@ -313,6 +317,176 @@ impl AesGcm {
     }
     keystreamApply(&mut core.keystream, ciphertext, move plaintext)
     return Result<(), AesGcmError>.succeed(())
+  }
+}
+
+/// An AES-GCM key prepared once for many messages: its AES round keys and its GHASH key.
+///
+/// # When to use
+/// Use it in place of [`AesGcm.seal`] and [`AesGcm.open`] when one key protects many messages,
+/// such as the records of a TLS connection. Each of those calls computes the key schedule again,
+/// which costs about as much as encrypting a few hundred bytes.
+///
+/// # Details
+/// [`AesGcmKey.seal`] and [`AesGcmKey.open`] give the same output and errors as [`AesGcm.seal`]
+/// and [`AesGcm.open`] with the same key bytes. With a 12-byte nonce and a 16-byte tag on a machine
+/// with the AES instructions, they use the prepared key. Otherwise they run the same code as those
+/// functions. Nothing allocates.
+///
+/// # Gotchas
+/// The value holds a copy of the key and its schedule, and does not erase them when it is dropped.
+/// The rules for nonces are those of [`AesGcm.seal`].
+///
+/// # Examples
+/// ```silk
+/// import silk.crypto.aes_gcm { AesGcmError, AesGcmKey }
+/// import silk.core.result { Result }
+///
+/// pub fn main() -> i32 {
+///   let key: [u8; 16] = [0; 16]
+///   let prepared = match AesGcmKey.make(&key) {
+///     Result<AesGcmKey, AesGcmError>.Success { value } => move value
+///     Result<AesGcmKey, AesGcmError>.Failure { error: _ } => {
+///       return 1
+///     }
+///   }
+///   let nonce: [u8; 12] = [0; 12]
+///   let plaintext: [u8; 16] = [0; 16]
+///   let mut ciphertext: [u8; 16] = [0; 16]
+///   let mut tag: [u8; 16] = [0; 16]
+///   if let Result<(), AesGcmError>.Failure { error: _ } = prepared.seal(&nonce, b"header", &plaintext, &mut ciphertext, &mut tag) {
+///     return 1
+///   }
+///   // The same ciphertext as `AesGcm.seal` with this key and nonce.
+///   if ciphertext[0] != 0x03 || ciphertext[1] != 0x88 {
+///     return 1
+///   }
+///   let mut decrypted: [u8; 16] = [1; 16]
+///   return match prepared.open(&nonce, b"header", &ciphertext, &tag, &mut decrypted) {
+///     Result<(), AesGcmError>.Success { value: _ } => if decrypted[0] == 0 { 0 } else { 1 }
+///     Result<(), AesGcmError>.Failure { error: _ } => 1
+///   }
+/// }
+/// ```
+pub struct AesGcmKey {
+  key: [u8; 32],
+  length: usize,
+  rounds: RoundKeys,
+  powers: HashKeys,
+  prepared: bool,
+}
+
+// A prepared key is plain data: key bytes and vector registers' worth of round keys and hash
+// powers, with no pointers or thread-bound state. The compiler does not yet derive `Transferable`
+// for `simd` values, so the property is stated here, and a TLS connection that holds the key can
+// still move to another thread.
+impl Transferable for AesGcmKey {}
+
+impl AesGcmKey {
+  /// Prepares `key`, which is 16 bytes (AES-128), 24 bytes (AES-192), or 32 bytes (AES-256).
+  ///
+  /// # Errors
+  /// - `InvalidKeyLength` if `key` is not 16, 24, or 32 bytes.
+  pub fn make(key: &[u8]) -> Result<AesGcmKey, AesGcmError> {
+    if key.length != 16 && key.length != 24 && key.length != 32 {
+      return Result<AesGcmKey, AesGcmError>.failResult(AesGcmError.InvalidKeyLength)
+    }
+    let mut stored: [u8; 32] = [0; 32]
+    let mut index: usize = 0
+    while index < key.length {
+      stored[index] = key[index]
+      index = index + 1
+    }
+    let mut rounds = zeroRoundKeys()
+    let mut powers = zeroHashKeys()
+    let mut prepared = false
+    static if Target.arch() == Arch.X86_64 {
+      if hardware() {
+        rounds = unsafe expandKeyX86(key)
+        powers = unsafe hashKeysOfX86(&rounds)
+        prepared = true
+      }
+    }
+    static if Target.arch() == Arch.Aarch64 {
+      if hardware() {
+        rounds = unsafe expandKeyArm(key)
+        powers = unsafe hashKeysOfArm(&rounds)
+        prepared = true
+      }
+    }
+    return Result<AesGcmKey, AesGcmError>.succeed(AesGcmKey {
+      key: stored,
+      length: key.length,
+      rounds: move rounds,
+      powers: move powers,
+      prepared: prepared,
+    })
+  }
+
+  /// [`AesGcm.seal`] with this key: encrypts `plaintext` into `ciphertext` and writes the tag to
+  /// `tag`.
+  ///
+  /// # Errors
+  /// The errors of [`AesGcm.seal`], other than `InvalidKeyLength`. On an error, `ciphertext` and
+  /// `tag` do not change.
+  pub fn seal(
+    self: &Self,
+    nonce: &[u8],
+    aad: &[u8],
+    plaintext: &[u8],
+    ciphertext: &mut [u8],
+    tag: &mut [u8],
+  ) -> Result<(), AesGcmError> {
+    if self.prepared && nonce.length == 12 && tag.length == 16 {
+      let admitted = validate(self.length, nonce.length, tag.length, plaintext.length, aad.length, ciphertext.length)
+      if let Result.Failure {error} = move admitted {
+        return Result<(), AesGcmError>.failResult(move error)
+      }
+      static if Target.arch() == Arch.X86_64 {
+        unsafe sealPreparedX86(&self.rounds, &self.powers, nonce, aad, plaintext, &mut ciphertext, &mut tag)
+        return Result<(), AesGcmError>.succeed(())
+      }
+      static if Target.arch() == Arch.Aarch64 {
+        unsafe sealPreparedArm(&self.rounds, &self.powers, nonce, aad, plaintext, &mut ciphertext, &mut tag)
+        return Result<(), AesGcmError>.succeed(())
+      }
+    }
+    return AesGcm.seal(Slice.view<u8>(&self.key, 0, self.length), nonce, aad, plaintext, &mut ciphertext, &mut tag)
+  }
+
+  /// [`AesGcm.open`] with this key: checks `tag`, and if it is correct, decrypts `ciphertext` into
+  /// `plaintext`.
+  ///
+  /// # Errors
+  /// The errors of [`AesGcm.open`], other than `InvalidKeyLength`. On an error, `plaintext` does
+  /// not change.
+  pub fn open(
+    self: &Self,
+    nonce: &[u8],
+    aad: &[u8],
+    ciphertext: &[u8],
+    tag: &[u8],
+    plaintext: &mut [u8],
+  ) -> Result<(), AesGcmError> {
+    if self.prepared && nonce.length == 12 && tag.length == 16 {
+      let admitted = validate(self.length, nonce.length, tag.length, ciphertext.length, aad.length, plaintext.length)
+      if let Result.Failure {error} = move admitted {
+        return Result<(), AesGcmError>.failResult(move error)
+      }
+      static if Target.arch() == Arch.X86_64 {
+        if unsafe openPreparedX86(&self.rounds, &self.powers, nonce, aad, ciphertext, tag, &mut plaintext) {
+          return Result<(), AesGcmError>.succeed(())
+        }
+        return Result<(), AesGcmError>.failResult(AesGcmError.AuthenticationFailed)
+      }
+      static if Target.arch() == Arch.Aarch64 {
+        if unsafe openPreparedArm(&self.rounds, &self.powers, nonce, aad, ciphertext, tag, &mut plaintext) {
+          return Result<(), AesGcmError>.succeed(())
+        }
+        return Result<(), AesGcmError>.failResult(AesGcmError.AuthenticationFailed)
+      }
+    }
+    return AesGcm.open(Slice.view<u8>(&self.key, 0, self.length), nonce, aad, ciphertext, tag, &mut plaintext)
   }
 }
 
@@ -1049,10 +1223,25 @@ static if Target.arch() == Arch.X86_64 {
   @features("aes", "pclmul", "ssse3")
   unsafe fn sealX86(key: &[u8], nonce: &[u8], aad: &[u8], plaintext: &[u8], ciphertext: &mut [u8], tag: &mut [u8]) -> () {
     let keys = unsafe expandKeyX86(key)
-    unsafe cryptX86(&keys, nonce, plaintext, &mut ciphertext)
-    let computed = unsafe authenticateX86(&keys, nonce, aad, &ciphertext, plaintext.length)
+    let powers = unsafe hashKeysOfX86(&keys)
+    unsafe sealPreparedX86(&keys, &powers, nonce, aad, plaintext, &mut ciphertext, &mut tag)
+    return ()
+  }
+
+  // `sealX86` with the round keys and hash key powers already computed.
+  @features("aes", "pclmul", "ssse3")
+  unsafe fn sealPreparedX86(keys: &RoundKeys, powers: &HashKeys, nonce: &[u8], aad: &[u8], plaintext: &[u8], ciphertext: &mut [u8], tag: &mut [u8]) -> () {
+    unsafe cryptX86(keys, nonce, plaintext, &mut ciphertext)
+    let computed = unsafe authenticateX86(keys, powers, nonce, aad, &ciphertext, plaintext.length)
     u8x16.store(&mut tag, 0, computed)
     return ()
+  }
+
+  // The hash key powers of the round keys `keys`.
+  @features("aes", "pclmul", "ssse3")
+  unsafe fn hashKeysOfX86(keys: &RoundKeys) -> HashKeys {
+    let hashKey = u8x16.bitcastToU64x2(reverse(unsafe encryptX86(keys, u8x16.splat(0))))
+    return unsafe hashKeysX86(hashKey)
   }
 
   // Writes the plaintext and answers `true` only when `tag` is correct; otherwise `plaintext`
@@ -1060,11 +1249,18 @@ static if Target.arch() == Arch.X86_64 {
   @features("aes", "pclmul", "ssse3")
   unsafe fn openX86(key: &[u8], nonce: &[u8], aad: &[u8], ciphertext: &[u8], tag: &[u8], plaintext: &mut [u8]) -> bool {
     let keys = unsafe expandKeyX86(key)
-    let computed = u8x16.toArray(unsafe authenticateX86(&keys, nonce, aad, ciphertext, ciphertext.length))
+    let powers = unsafe hashKeysOfX86(&keys)
+    return unsafe openPreparedX86(&keys, &powers, nonce, aad, ciphertext, tag, &mut plaintext)
+  }
+
+  // `openX86` with the round keys and hash key powers already computed.
+  @features("aes", "pclmul", "ssse3")
+  unsafe fn openPreparedX86(keys: &RoundKeys, powers: &HashKeys, nonce: &[u8], aad: &[u8], ciphertext: &[u8], tag: &[u8], plaintext: &mut [u8]) -> bool {
+    let computed = u8x16.toArray(unsafe authenticateX86(keys, powers, nonce, aad, ciphertext, ciphertext.length))
     if tagsDiffer(&computed, tag) {
       return false
     }
-    unsafe cryptX86(&keys, nonce, ciphertext, &mut plaintext)
+    unsafe cryptX86(keys, nonce, ciphertext, &mut plaintext)
     return true
   }
 
@@ -1303,11 +1499,9 @@ static if Target.arch() == Arch.X86_64 {
 
   // `authenticate` with the hardware cipher and multiplication.
   @features("aes", "pclmul", "ssse3")
-  unsafe fn authenticateX86(keys: &RoundKeys, nonce: &[u8], aad: &[u8], ciphertext: &[u8], length: usize) -> simd<u8, 16> {
-    let hashKey = u8x16.bitcastToU64x2(reverse(unsafe encryptX86(keys, u8x16.splat(0))))
-    let powers = unsafe hashKeysX86(hashKey)
-    let mut state = unsafe hashInputX86(u64x2.splat(0), &powers, aad, aad.length)
-    state = unsafe hashInputX86(state, &powers, ciphertext, length)
+  unsafe fn authenticateX86(keys: &RoundKeys, powers: &HashKeys, nonce: &[u8], aad: &[u8], ciphertext: &[u8], length: usize) -> simd<u8, 16> {
+    let mut state = unsafe hashInputX86(u64x2.splat(0), powers, aad, aad.length)
+    state = unsafe hashInputX86(state, powers, ciphertext, length)
     let sizes = u64x2.fromArray([usize.toU64(length) * 8, usize.toU64(aad.length) * 8])
     let digest = unsafe multiplyX86(state ^ sizes, powers.powers[0])
     let mask = unsafe encryptX86(keys, u8x16.fromArray(counterBlock(nonce, 1)))
@@ -1455,10 +1649,25 @@ static if Target.arch() == Arch.Aarch64 {
   @features("aes")
   unsafe fn sealArm(key: &[u8], nonce: &[u8], aad: &[u8], plaintext: &[u8], ciphertext: &mut [u8], tag: &mut [u8]) -> () {
     let keys = unsafe expandKeyArm(key)
-    drop unsafe cryptArm(&keys, u8x16.fromArray(counterBlock(nonce, 2)), plaintext, &mut ciphertext)
-    let computed = unsafe authenticateArm(&keys, nonce, aad, &ciphertext, plaintext.length)
+    let powers = unsafe hashKeysOfArm(&keys)
+    unsafe sealPreparedArm(&keys, &powers, nonce, aad, plaintext, &mut ciphertext, &mut tag)
+    return ()
+  }
+
+  // `sealArm` with the round keys and hash key powers already computed.
+  @features("aes")
+  unsafe fn sealPreparedArm(keys: &RoundKeys, powers: &HashKeys, nonce: &[u8], aad: &[u8], plaintext: &[u8], ciphertext: &mut [u8], tag: &mut [u8]) -> () {
+    drop unsafe cryptArm(keys, u8x16.fromArray(counterBlock(nonce, 2)), plaintext, &mut ciphertext)
+    let computed = unsafe authenticateArm(keys, powers, nonce, aad, &ciphertext, plaintext.length)
     u8x16.store(&mut tag, 0, computed)
     return ()
+  }
+
+  // The hash key powers of the round keys `keys`.
+  @features("aes")
+  unsafe fn hashKeysOfArm(keys: &RoundKeys) -> HashKeys {
+    let hashKey = u8x16.bitcastToU64x2(reverse(unsafe encryptArm(keys, u8x16.splat(0))))
+    return unsafe hashKeysArm(hashKey)
   }
 
   // Writes the plaintext and answers `true` only when `tag` is correct; otherwise `plaintext`
@@ -1466,11 +1675,18 @@ static if Target.arch() == Arch.Aarch64 {
   @features("aes")
   unsafe fn openArm(key: &[u8], nonce: &[u8], aad: &[u8], ciphertext: &[u8], tag: &[u8], plaintext: &mut [u8]) -> bool {
     let keys = unsafe expandKeyArm(key)
-    let computed = u8x16.toArray(unsafe authenticateArm(&keys, nonce, aad, ciphertext, ciphertext.length))
+    let powers = unsafe hashKeysOfArm(&keys)
+    return unsafe openPreparedArm(&keys, &powers, nonce, aad, ciphertext, tag, &mut plaintext)
+  }
+
+  // `openArm` with the round keys and hash key powers already computed.
+  @features("aes")
+  unsafe fn openPreparedArm(keys: &RoundKeys, powers: &HashKeys, nonce: &[u8], aad: &[u8], ciphertext: &[u8], tag: &[u8], plaintext: &mut [u8]) -> bool {
+    let computed = u8x16.toArray(unsafe authenticateArm(keys, powers, nonce, aad, ciphertext, ciphertext.length))
     if tagsDiffer(&computed, tag) {
       return false
     }
-    drop unsafe cryptArm(&keys, u8x16.fromArray(counterBlock(nonce, 2)), ciphertext, &mut plaintext)
+    drop unsafe cryptArm(keys, u8x16.fromArray(counterBlock(nonce, 2)), ciphertext, &mut plaintext)
     return true
   }
 
@@ -1666,11 +1882,9 @@ static if Target.arch() == Arch.Aarch64 {
   }
 
   @features("aes")
-  unsafe fn authenticateArm(keys: &RoundKeys, nonce: &[u8], aad: &[u8], ciphertext: &[u8], length: usize) -> simd<u8, 16> {
-    let hashKey = u8x16.bitcastToU64x2(reverse(unsafe encryptArm(keys, u8x16.splat(0))))
-    let powers = unsafe hashKeysArm(hashKey)
-    let mut state = unsafe hashInputArm(u64x2.splat(0), &powers, aad, aad.length)
-    state = unsafe hashInputArm(state, &powers, ciphertext, length)
+  unsafe fn authenticateArm(keys: &RoundKeys, powers: &HashKeys, nonce: &[u8], aad: &[u8], ciphertext: &[u8], length: usize) -> simd<u8, 16> {
+    let mut state = unsafe hashInputArm(u64x2.splat(0), powers, aad, aad.length)
+    state = unsafe hashInputArm(state, powers, ciphertext, length)
     let sizes = u64x2.fromArray([usize.toU64(length) * 8, usize.toU64(aad.length) * 8])
     let digest = unsafe multiplyArm(state ^ sizes, powers.powers[0])
     let mask = unsafe encryptArm(keys, u8x16.fromArray(counterBlock(nonce, 1)))
