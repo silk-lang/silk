@@ -464,6 +464,38 @@ the message it is written into.
 #### Errors
 - `OutOfMemoryError` if the `Allocator` fails.
 
+<a id="OwnedHeaders.impl.withRegion"></a>
+
+### Associated function `withRegion`
+
+```silk
+pub effect fn withRegion(region: &[u8], count: usize) -> OwnedHeaders ! OutOfMemoryError ? &mut Allocator
+```
+
+Makes a list whose field bytes are a copy of `region`, with room for `count` fields. Add the
+fields with [`OwnedHeaders.appendRecordUnchecked`](#OwnedHeaders.impl.appendRecordUnchecked), by where their name and value start in
+`region`. A parsed head copies its field lines this way with one copy, leaving the separators
+and line ends in place between the fields.
+
+#### Errors
+- `OutOfMemoryError` if the `Allocator` fails.
+
+<a id="OwnedHeaders.impl.appendRecordUnchecked"></a>
+
+### Method `appendRecordUnchecked`
+
+```silk
+pub unsafe fn appendRecordUnchecked(self: &mut Self, nameStart: usize, nameLength: usize, valueStart: usize, valueLength: usize) -> ()
+```
+
+Adds the field whose name and value are at these offsets of the region given to
+[`OwnedHeaders.withRegion`](#OwnedHeaders.impl.withRegion), without checking it. It never allocates.
+
+#### Details
+This function is `unsafe`. The ranges must lie inside the region, the list must have room
+for the field, and the field must follow the rules of `Header.make` and the limits that the
+list is used with.
+
 <a id="HeaderIterator"></a>
 
 ## `HeaderIterator`
