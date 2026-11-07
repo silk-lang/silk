@@ -200,7 +200,7 @@ Returns the origin for `host` and `port`. `secure` selects HTTPS. Port 0 returns
 ### Associated function `fromUri`
 
 ```silk
-pub fn fromUri(uri: &Uri) -> Result<Origin, OriginError>
+pub fn fromUri(uri: &Uri<'_>) -> Result<Origin, OriginError>
 ```
 
 Returns the origin of an `http`, `https`, `ws`, or `wss` URI.

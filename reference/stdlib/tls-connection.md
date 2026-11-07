@@ -559,7 +559,7 @@ succeeds.
 ```silk
 pub effect<'env> fn authenticateOwned<P: 'env, 'env>(
   provider: P,
-  config: &ClientConfig,
+  config: &ClientConfig<'_>,
   trust: TrustSnapshot,
   options: ConnectionOptions,
 ) -> OwnedConnection<P>
@@ -589,7 +589,7 @@ The function reads the `SystemClock` one time to check certificate dates, and us
 ```silk
 pub effect<'env> fn withClient<'env, A, E, ?CallbackRequirements, P: 'env>(
   provider: P,
-  config: &'env ClientConfig,
+  config: &'env ClientConfig<'_>,
   trust: TrustSnapshot,
   options: ConnectionOptions,
   callback: for<'call> once fn<'env>(&'call mut OwnedConnection<P>) -> once Effect<'call & 'env; A ! E ? CallbackRequirements>,

@@ -153,7 +153,7 @@ returns `true`.
 ## `isPerTest`
 
 ```silk
-pub fn isPerTest(plan: &Plan) -> bool
+pub fn isPerTest(plan: &Plan<'_>) -> bool
 ```
 
 Returns true for a per-test plan (mode `1`).
@@ -163,7 +163,7 @@ Returns true for a per-test plan (mode `1`).
 ## `isUncached`
 
 ```silk
-pub fn isUncached(plan: &Plan) -> bool
+pub fn isUncached(plan: &Plan<'_>) -> bool
 ```
 
 Returns true for an uncached plan of 256 bytes (mode `2`).
@@ -173,7 +173,7 @@ Returns true for an uncached plan of 256 bytes (mode `2`).
 ## `failed`
 
 ```silk
-pub fn failed(plan: &Plan) -> bool
+pub fn failed(plan: &Plan<'_>) -> bool
 ```
 
 Returns true after a check on the plan fails. It does not become false again.
@@ -183,7 +183,7 @@ Returns true after a check on the plan fails. It does not become false again.
 ## `beginPerTest`
 
 ```silk
-pub fn beginPerTest(plan: &mut Plan, expectedDiscovered: u64) -> bool
+pub fn beginPerTest(plan: &mut Plan<'_>, expectedDiscovered: u64) -> bool
 ```
 
 Reads the test count of a per-test plan, and checks it and the size bound of the file.
@@ -212,7 +212,7 @@ execution identity. For an uncached plan, it returns [`uncachedEntry`](#uncached
 ## `cached`
 
 ```silk
-pub fn cached(entry: &Entry) -> bool
+pub fn cached(entry: &Entry<'_>) -> bool
 ```
 
 Returns true for a valid entry that the host marked as a cache hit.
@@ -242,7 +242,7 @@ Returns the empty entry that is not cached, for uncached mode.
 ## `finishPerTest`
 
 ```silk
-pub fn finishPerTest(plan: &mut Plan) -> bool
+pub fn finishPerTest(plan: &mut Plan<'_>) -> bool
 ```
 
 Checks that a per-test plan ends exactly after the catalog.
@@ -253,7 +253,7 @@ Checks that a per-test plan ends exactly after the catalog.
 
 ```silk
 pub fn validateUncached(
-  plan: &mut Plan,
+  plan: &mut Plan<'_>,
   expectedCatalogDigest: &[u8],
   expectedDiscovered: u64,
 ) -> bool

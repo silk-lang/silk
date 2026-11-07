@@ -1111,7 +1111,7 @@ for plain HTTP. It does not allocate or use the network.
 
 ```silk
 pub effect fn classifyConnect(
-  head: &ResponseHead,
+  head: &ResponseHead<'_>,
 ) -> () ! ProxyError | OutOfMemoryError ? &mut Allocator
 ```
 

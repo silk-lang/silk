@@ -55,7 +55,7 @@ import silk.http.serve { Handler, Request, Response, Server }
 struct Hello {}
 
 impl Handler for Hello {
-  effect fn handle(self: &Self, request: &Request, response: &mut Response) -> () ! OutOfMemoryError ? &mut Allocator {
+  effect fn handle(self: &Self, request: &Request<'_>, response: &mut Response<'_>) -> () ! OutOfMemoryError ? &mut Allocator {
     if request.path() == "/" {
       run response.text("Hello, World!")
       return ()
@@ -396,7 +396,7 @@ One handler value serves every worker thread through a shared borrow, so the typ
 ### Operation `handle`
 
 ```silk
-effect fn handle(self: &Self, request: &Request, response: &mut Response) -> () ! OutOfMemoryError ? &mut Allocator
+effect fn handle(self: &Self, request: &Request<'_>, response: &mut Response<'_>) -> () ! OutOfMemoryError ? &mut Allocator
 ```
 
 Reads `request` and writes `response`. A failure makes the server answer 500 and close the

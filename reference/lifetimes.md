@@ -115,27 +115,37 @@ same way, as in `impl<'data, A: Copy> Stream<A, never ? never> for SliceStream<'
 requirement row or a provides premise in an implementation head may still omit a loan's lifetime,
 which becomes one more implementation lifetime.
 
-In a signature, an omitted lifetime on each independent borrowed input introduces a fresh
-declaration binder. An outer borrowed receiver supplies omitted result lifetimes; without that
-receiver, exactly one top-level borrowed input supplies the default. A string input participates
-as a borrowed view.
+In a signature, each omitted lifetime in an input introduces a fresh declaration binder. The
+result defaults follow Rust's elision rules. A borrowed receiver (`self: &Self` or
+`self: &mut Self`) supplies every omitted result lifetime. Without one, if the inputs show exactly
+one lifetime, written or elided, that lifetime supplies the omitted result lifetimes. A string
+input counts as a borrowed view. Lifetimes inside a callable's or Effect's environment and
+lifetimes carried by a type parameter do not count.
 
 ```silk
 fn first(values: &[i32]) -> &i32 {
   return &values[0]
 }
+struct Span<'a> { text: string<'a> }
+fn same(span: Span<'_>) -> Span<'_> {
+  return span
+}
 ```
 
-Its expanded contract is `fn first<'life0>(values: &'life0 [i32]) -> &'life0 i32`.
-Each omitted lifetime in a nominal input introduces an independent binder. Borrowing a wrapper
-adds its own outer lifetime; that outer borrow does not merge the wrapper's stored-data lifetimes.
-Omitted nominal output lifetimes use the same result default. `Self` in an implementation denotes
-the head's applied owner, including its stored-data lifetimes.
+The expanded contract of `first` is `fn first<'life0>(values: &'life0 [i32]) -> &'life0 i32`, and
+`same` returns a `Span` of the one lifetime its input shows. Borrowing a wrapper adds its own outer
+lifetime, so `&Span<'_>` shows two lifetimes and gives no default. Omitted nominal output lifetimes
+use the same result default. `Self` in an implementation denotes the head's applied owner,
+including its stored-data lifetimes.
 
-A signature may write an omitted lifetime as `'_`, as in `fn width(span: Span<'_>) -> usize` or
-`fn first(values: &'_ [i32]) -> &'_ i32`. It elides exactly as the omitted lifetime does; writing it
-shows that the type borrows. `'_` names nothing, so it is refused where a lifetime cannot be
-elided, such as a bound, and a field that writes it is refused as an omitted field lifetime is.
+A signature shows every lifetime of a type that holds borrows. A nominal type with lifetime
+parameters writes each of them, by name or as `'_`, as in `fn width(span: Span<'_>) -> usize` or
+`fn find(tree: &UiTree<'_>) -> usize`. Writing `Span` alone in a signature is refused, so a reader
+always sees that a value borrows. A reference or slice may still omit its own lifetime, and `'_`
+there, as in `fn first(values: &'_ [i32]) -> &'_ i32`, elides exactly as the omitted lifetime does.
+`'_` names nothing, so it is refused where a lifetime cannot be elided, such as a bound or a
+lifetime parameter, and a field that writes it is refused as an omitted field lifetime is. Inside a
+body a nominal type may still omit its lifetimes.
 
 Inside a body, every omitted lifetime is a fresh region of that body, inferred from its uses and
 cleanup: in a local annotation, a literal's or constructor's type arguments (also through an alias),
@@ -146,13 +156,15 @@ borrow for `'a`. Public
 relationships never depend on return bodies, setter histories, or which constructor happened to
 initialize a field.
 
-**Boundary:** Two independent borrowed inputs with no receiver default require an explicit result
+**Boundary:** Two input lifetimes with no borrowed receiver require an explicit result
 relationship. A by-value holder's stored view can be returned by naming its data lifetime; elision
 does not reinterpret that stored view as an outer borrowed receiver.
 
 **Diagnostics:** A field, declaration bound, alias target or implementation head that omits a
 lifetime reports `SEM0210` with the declaration to write, and so do missing or ambiguous output
-relationships. A lifetime binder bounded by `'static` on an implementation head reports `SEM0211`,
+relationships and a signature type that hides its lifetimes. A hidden signature lifetime carries a
+fix that inserts `'_`: `silk check --fix` applies every such fix in the project's own files, and
+the editor offers it as a quick fix. A lifetime binder bounded by `'static` on an implementation head reports `SEM0211`,
 and a field whose type is a callable contract reports `SEM0018`. Editor hover shows stable
 readable generated binders. Ordinary formatting preserves the author's explicit or omitted
 choices in signatures.

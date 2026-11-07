@@ -941,7 +941,7 @@ impl Deserialize for Value
 ### Operation `deserialize`
 
 ```silk
-effect fn deserialize(scanner: &mut JsonScanner)
+effect fn deserialize(scanner: &mut JsonScanner<'_>)
     -> Self ! JsonError | OutOfMemoryError ? &mut Allocator
 ```
 

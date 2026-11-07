@@ -5,7 +5,7 @@ import Progress {Display as ProgressDisplay, Phase as ProgressPhase, Progress, S
 import semantic.Types {TypeTable, Types}
 import diagnostic.Catalog as Catalog { Code, Severity }
 import diagnostic.JsonText
-import diagnostic.Report as Reports {RelatedLocation, RenderedDiagnostic}
+import diagnostic.Report as Reports {RelatedLocation, RenderedDiagnostic, SourceFix}
 import documentation.Command as DocumentationCommand {Error as DocumentationError, PackageExamples}
 import documentation.Doctest
 import documentation.Doctest {Outcome, Summary, Verdict}
@@ -4176,6 +4176,20 @@ effect fn appendJson(out: &mut Bytes, target: &[u8], rendered: &RenderedDiagnost
     run Bytes.append(&mut out.*, b"}")
     at = at + usize.ONE
   }
+  run Bytes.append(&mut out.*, b"],\"fixes\":[")
+  let fixes = List<SourceFix>.asSlice(&rendered.fixes)
+  at = usize.ZERO
+  while at < fixes.length {
+    if at > usize.ZERO { run Bytes.append(&mut out.*, b",") }
+    run Bytes.append(&mut out.*, b"{\"start\":")
+    run JsonText.appendDecimal(&mut out.*, fixes[at].start)
+    run Bytes.append(&mut out.*, b",\"end\":")
+    run JsonText.appendDecimal(&mut out.*, fixes[at].end)
+    run Bytes.append(&mut out.*, b",\"text\":")
+    run JsonText.appendString(&mut out.*, Bytes.asSlice(&fixes[at].text))
+    run Bytes.append(&mut out.*, b"}")
+    at = at + usize.ONE
+  }
   run Bytes.append(&mut out.*, b"]}\n")
 }
 
@@ -5447,7 +5461,7 @@ effect fn buildProjectTarget(project: &Project, plan: ProjectPlan, standardLibra
 ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types {
   // A library is Silk source for other packages: building it checks it and makes no artifact.
   if Projects.form(project) == Form.Library {
-    return run checkTarget(project, move plan, standardLibrary, false, false, abandon, settings, compiler, &mut ModuleSourceFiles.snapshot())
+    return run checkTarget(project, move plan, standardLibrary, false, false, false, abandon, settings, compiler, &mut ModuleSourceFiles.snapshot())
   }
   let ProjectPlan {input: planned, bindings, name: profileNamed, maxMemory, stackSize} = move plan
   let form = Projects.form(project)
@@ -5761,7 +5775,7 @@ effect fn packageCaches(project: &Project, sources: &ModuleSources) -> List<Path
   return move directories
 }
 
-effect fn checkTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Option<Path>, json: bool, roots: bool, abandon: bool, settings: &ProgressSettings, compiler: &Option<Bytes>, snapshot: &mut SourceSnapshot) -> ProjectArtifact
+effect fn checkTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Option<Path>, json: bool, roots: bool, fix: bool, abandon: bool, settings: &ProgressSettings, compiler: &Option<Bytes>, snapshot: &mut SourceSnapshot) -> ProjectArtifact
 ! ApplicationError | InitialProfileProblem | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | InvalidDependency | MissingManifest | InvalidBuildComposition | MissingStandardLibrary | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
 ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types {
   let ProjectPlan {input: planned, bindings, name: _, maxMemory: unlimited, stackSize: _} = move plan
@@ -5895,6 +5909,15 @@ effect fn checkTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Op
     run Bytes.append(&mut out, Bytes.asSlice(&message))
     status = 2
   }
+  // `check --fix` applies what the diagnostics suggest and checks again instead of reporting them.
+  if fix && status != 0 {
+    let fixRoot = run diagnosticRoot(Projects.manifest(project))
+    let applied = run applyFixes(&sources, rejected, Bytes.asSlice(&fixRoot))
+    if applied > usize.ZERO {
+      out = Bytes.make()
+      status = fixedStatus
+    }
+  }
   if roots {
     let compared = run CheckRoots.compare(&mut store, &mut request, List<ModuleId>.asSlice(&sweptModules), &runtime, rejected)
     run Bytes.append(&mut out, Bytes.asSlice(&compared.report))
@@ -5926,6 +5949,112 @@ effect fn checkTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Op
     run abandonValue(move checked)
   }
   return ProjectArtifact {status: status, target: target, path: move path}
+}
+
+// The status a check under `--fix` answers when it applied edits, so the files are checked again.
+const fixedStatus: i32 = 3
+// How many rounds of edits `check --fix` applies before it reports what remains.
+const fixRounds: usize = 16
+
+// `check --fix`: applies the edits that `rejections` suggest to the files under `root`, and
+// answers how many. Of two overlapping edits the later one is kept; the next round finds the
+// other again.
+effect fn applyFixes(sources: &ModuleSources, rejections: &[Shared<Rejection>], root: &[u8]) -> usize
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  if root.length == usize.ZERO { return usize.ZERO }
+  let mut paths = List<Bytes>.make()
+  let mut fixes = List<List<SourceFix>>.make()
+  let mut at = usize.ZERO
+  while at < rejections.length {
+    let module = Shared<Rejection>.with<ModuleId>(&rejections[at], fn(value: &Rejection) -> ModuleId { return ModuleId.copy(&value.module) })
+    if let Option<Bytes>.Some {value: text} = move run moduleSource(sources, &module) {
+      let path = run displayPath(sources, &module, b"")
+      if underRoot(Bytes.asSlice(&path), root) {
+        if let Option<RenderedDiagnostic>.Some {value: rendered} = move run Reports.fields(&rejections[at], Bytes.asSlice(&text), Bytes.asSlice(&path)) {
+          let suggested = List<SourceFix>.asSlice(&rendered.fixes)
+          if suggested.length > usize.ZERO {
+            let known = List<Bytes>.asSlice(&paths)
+            let mut slot = usize.ZERO
+            while slot < known.length && !same(Bytes.asSlice(&known[slot]), Bytes.asSlice(&path)) { slot = slot + usize.ONE }
+            if slot == known.length {
+              run List<Bytes>.append(&mut paths, move path)
+              run List<List<SourceFix>>.append(&mut fixes, List<SourceFix>.make())
+            }
+            let mut edit = usize.ZERO
+            while edit < suggested.length {
+              let held = List<List<SourceFix>>.asMutSlice(&mut fixes)
+              run List<SourceFix>.append(&mut held[slot], SourceFix {start: suggested[edit].start, end: suggested[edit].end,
+                text: run Bytes.copy(Bytes.asSlice(&suggested[edit].text))})
+              edit = edit + usize.ONE
+            }
+          }
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+  let mut applied = usize.ZERO
+  let files = List<Bytes>.asSlice(&paths)
+  let lists = List<List<SourceFix>>.asSlice(&fixes)
+  at = usize.ZERO
+  while at < files.length {
+    let path = run Path.fromBytes(Bytes.asSlice(&files[at]))
+    let text = run FileSystem.readFile(&path)
+    let source = Bytes.asSlice(&text)
+    let edits = List<SourceFix>.asSlice(&lists[at])
+    // Edits apply from the end of the file back, so earlier offsets stay valid.
+    let mut order = List<usize>.make()
+    let mut edit = usize.ZERO
+    while edit < edits.length {
+      let mut place = usize.ZERO
+      let sorted = List<usize>.asSlice(&order)
+      while place < sorted.length && edits[sorted[place]].start >= edits[edit].start { place = place + usize.ONE }
+      run List<usize>.insertSlice(&mut order, place, &[edit])
+      edit = edit + usize.ONE
+    }
+    let mut kept = List<usize>.make()
+    let mut limit = source.length
+    let ordered = List<usize>.asSlice(&order)
+    edit = usize.ZERO
+    while edit < ordered.length {
+      let chosen = &edits[ordered[edit]]
+      if chosen.end <= limit {
+        run List<usize>.append(&mut kept, ordered[edit])
+        limit = chosen.start
+      }
+      edit = edit + usize.ONE
+    }
+    // `kept` runs from the end of the file back; the text is rebuilt from the start.
+    let chosen = List<usize>.asSlice(&kept)
+    let mut rebuilt = Bytes.make()
+    let mut cursor = usize.ZERO
+    let mut back = chosen.length
+    while back > usize.ZERO {
+      back = back - usize.ONE
+      let next = &edits[chosen[back]]
+      run Bytes.append(&mut rebuilt, Slice.view<u8>(source, cursor, next.start - cursor))
+      run Bytes.append(&mut rebuilt, Bytes.asSlice(&next.text))
+      cursor = next.end
+    }
+    run Bytes.append(&mut rebuilt, Slice.view<u8>(source, cursor, source.length - cursor))
+    if chosen.length > usize.ZERO {
+      run FileSystem.writeFile(&path, Bytes.asSlice(&rebuilt))
+      applied = applied + chosen.length
+    }
+    at = at + usize.ONE
+  }
+  return applied
+}
+
+// Whether `path` names a file under the directory `root`.
+fn underRoot(path: &[u8], root: &[u8]) -> bool {
+  if path.length <= root.length { return false }
+  let mut at = usize.ZERO
+  while at < root.length {
+    if path[at] != root[at] { return false }
+    at = at + usize.ONE
+  }
+  return root[root.length - usize.ONE] == 47 || path[root.length] == 47 || path[root.length] == 92
 }
 
 // Reads the edit script of `check --replay`, or writes why it cannot and answers none.
@@ -6435,7 +6564,7 @@ fn worse(left: i32, right: i32) -> i32 {
 effect fn checkProject(working: &Path, command: CheckCommand) -> i32
 ! ApplicationError | InitialProfileProblem | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | InvalidDependency | MissingManifest | InvalidBuildComposition | MissingStandardLibrary | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
 ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types | &mut Writer {
-  let CheckCommand {options, json, roots, replay: script, differential} = move command
+  let CheckCommand {options, json, roots, replay: script, differential, fix} = move command
   if ProjectCommands.conflicting(&options) {
     run reportOptimizationConflict(&options)
     return 2
@@ -6471,7 +6600,10 @@ effect fn checkProject(working: &Path, command: CheckCommand) -> i32
   // Members check side by side in copies of the process, except in a replay, which compares one
   // run's steps.
   let mut jobs = usize.ONE
-  if !replaying && projects.length > usize.ONE { jobs = run MemberChecks.jobs() }
+  if !replaying && !fix && projects.length > usize.ONE { jobs = run MemberChecks.jobs() }
+  // `--fix` checks until a round applies no edit, at most `fixRounds` times; each round reads the
+  // files again.
+  let mut rounds = usize.ZERO
   if jobs > usize.ONE {
     let checked = run checkSideBySide(projects, List<usize>.asSlice(&order), jobs, selection.members, &options, &standardLibrary, json, roots, &settings, &compiler)
     status = checked.status
@@ -6484,11 +6616,20 @@ effect fn checkProject(working: &Path, command: CheckCommand) -> i32
     // Each member interns its own applications: no type outlives its check, so a long workspace
     // check does not keep every earlier member's keys.
     let mut memberTypes = TypeTable.make()
-    let checked = run memberStatus(run Effect.result(checkOne(&projects[member], &options, &standardLibrary, json, roots, &settings, &edits, differential, at + usize.ONE == projects.length, &compiler, &mut snapshot)
+    let fixing = fix && rounds < fixRounds
+    let checked = run memberStatus(run Effect.result(checkOne(&projects[member], &options, &standardLibrary, json, roots, fixing, &settings, &edits, differential, at + usize.ONE == projects.length && !fixing, &compiler, &mut snapshot)
       |> Effect.provideMut<Types>(&mut memberTypes)))
     drop memberTypes
     // The member's store is gone; hand its free pages back before the next member allocates.
     HeapRelease.release()
+    if checked == fixedStatus {
+      rounds = rounds + usize.ONE
+      snapshot = ModuleSourceFiles.snapshot()
+      status = 0
+      succeeded = usize.ZERO
+      at = usize.ZERO
+      continue
+    }
     if checked == 0 { succeeded = succeeded + usize.ONE }
     status = worse(status, checked)
     at = at + usize.ONE
@@ -6616,7 +6757,7 @@ effect fn checkMember(project: &Project, options: &ProjectOptions, standardLibra
 ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Writer {
   let mut memberTypes = TypeTable.make()
   let mut snapshot = ModuleSourceFiles.snapshot()
-  let checked = run memberStatus(run Effect.result(checkOne(project, options, standardLibrary, json, roots, settings, edits, false, last, compiler, &mut snapshot)
+  let checked = run memberStatus(run Effect.result(checkOne(project, options, standardLibrary, json, roots, false, settings, edits, false, last, compiler, &mut snapshot)
     |> Effect.provideMut<Types>(&mut memberTypes)))
   drop memberTypes
   HeapRelease.release()
@@ -6735,7 +6876,7 @@ effect fn visitInOrder(projects: &[Project], at: usize, state: &mut List<usize>,
   run List<usize>.append(&mut order.*, at)
 }
 
-effect fn checkOne(project: &Project, options: &ProjectOptions, standardLibrary: &Option<Path>, json: bool, roots: bool, packages: &ProgressSettings, edits: &Option<List<Edit>>, differential: bool, last: bool, compiler: &Option<Bytes>, snapshot: &mut SourceSnapshot) -> i32
+effect fn checkOne(project: &Project, options: &ProjectOptions, standardLibrary: &Option<Path>, json: bool, roots: bool, fix: bool, packages: &ProgressSettings, edits: &Option<List<Edit>>, differential: bool, last: bool, compiler: &Option<Bytes>, snapshot: &mut SourceSnapshot) -> i32
 ! ApplicationError | InitialProfileProblem | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | InvalidDependency | MissingManifest | InvalidBuildComposition | MissingStandardLibrary | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
 ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types | &mut Writer {
   let mut plans = match move run projectPlans(project, options, Projects.targets(project)) {
@@ -6755,7 +6896,10 @@ effect fn checkOne(project: &Project, options: &ProjectOptions, standardLibrary:
   while List<ProjectPlan>.length(&plans) > usize.ZERO {
     let plan = List<ProjectPlan>.remove(&mut plans, usize.ZERO)
     let abandon = last && List<ProjectPlan>.length(&plans) == usize.ZERO
-    run List<ProjectArtifact>.append(&mut attempts, run checkTarget(project, move plan, standardLibrary, json, roots, abandon, &settings, compiler, &mut snapshot.*))
+    let attempt = run checkTarget(project, move plan, standardLibrary, json, roots, fix, abandon && !fix, &settings, compiler, &mut snapshot.*)
+    // The files changed under the remaining targets' sources, so the whole check starts again.
+    if attempt.status == fixedStatus { return fixedStatus }
+    run List<ProjectArtifact>.append(&mut attempts, move attempt)
   }
   // Each attempt has reported itself on standard error, so only the status is left to combine.
   let attempted = List<ProjectArtifact>.asSlice(&attempts)

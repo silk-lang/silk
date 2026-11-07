@@ -653,7 +653,7 @@ Returns a scanner at the start of `input`.
 ### Method `validate`
 
 ```silk
-pub fn validate(self: &mut TomlScanner) -> Result<bool, TomlError>
+pub fn validate(self: &mut TomlScanner<'_>) -> Result<bool, TomlError>
 ```
 
 Checks the syntax of the full input as a TOML 1.1.0 document. It does not move the scanner.
@@ -669,7 +669,7 @@ Returns `Success(true)` for valid syntax. It does not check that each key is def
 ### Method `next`
 
 ```silk
-pub fn next(self: &mut TomlScanner) -> Result<TomlToken, TomlError>
+pub fn next(self: &mut TomlScanner<'_>) -> Result<TomlToken, TomlError>
 ```
 
 Returns the next token and moves past it. Spaces, tabs, and comments are skipped.
@@ -685,7 +685,7 @@ After the last token, it returns [`TomlToken.EndOfInput`](#TomlToken.EndOfInput)
 ### Method `scalarKind`
 
 ```silk
-pub fn scalarKind(self: &TomlScanner, span: TomlSpan) -> Option<TomlScalarKind>
+pub fn scalarKind(self: &TomlScanner<'_>, span: TomlSpan) -> Option<TomlScalarKind>
 ```
 
 Returns the kind of the unquoted value in `span`, or `None` if the bytes are not a valid
@@ -706,7 +706,7 @@ Returns the source bytes of `span`. They borrow from the input, not from the sca
 ### Method `offset`
 
 ```silk
-pub fn offset(self: &TomlScanner) -> usize
+pub fn offset(self: &TomlScanner<'_>) -> usize
 ```
 
 Returns the byte position where the next call to [`TomlScanner.next`](#TomlScanner.impl.next) starts.
