@@ -253,13 +253,15 @@ boundary are compile-time errors even when runtime filters would exclude that te
 
 **Status:** Confirmed
 
-`silk test` keeps the output of the last run that passed, beside its runner. A rerun whose runner is
-unchanged (TEST-009), with the same `--file`, `--filter` and `--timeout`, does not run the tests
-again: it prints that run's output, says that nothing changed since the tests passed, and exits 0,
-as a build step whose inputs did not change is not repeated. A run that failed is always repeated.
-Tests run with an empty environment, but a test that reads files outside its imports, the clock or
-the network is not seen to change; `--no-cache` builds the runner again and runs every selected
-test.
+`silk test` keeps the output of the last run that passed and selected at least one test, beside
+its runner. A rerun by the same compiler, from the same working directory, whose runner is byte for
+byte the one that passed (TEST-009), with the same `--file`, `--filter` and `--timeout`, does not run
+the tests again: it prints that run's output, says that nothing changed since the tests passed, and
+exits 0, as a build step whose inputs did not change is not repeated. A run that failed or selected
+no test is always repeated, and so is a WASI run, which depends on the wasmtime it finds. Tests run
+with an empty environment, but a test that reads files outside its imports, a dynamic library it
+loads, the clock or the network is not seen to change; `--no-cache` builds the runner again and runs
+every selected test.
 
 ```sh
 silk test             # reuses an unchanged runner; runs the tests unless they passed unchanged
