@@ -7,6 +7,79 @@ Public API documentation lives in the `//!` and `///` comments of the Silk sourc
 [DOCUMENTATION.md](./DOCUMENTATION.md) for contributor rules and the
 [language reference](../reference/index.md) for the language itself.
 
+## JSON Schema and TOML
+
+`silk.json.schema.Schema` compiles schemas for drafts 4, 6, 7, 2019-09, and 2020-12.
+It validates the existing `silk.json.value.Value` tree; there is no second JSON parser or
+schema-specific value model. Use `Json.parseExact` for JSON schemas and instances to retain
+arbitrary-precision numbers, or `SchemaValue.parseToml` for either side written in TOML.
+The ordinary `Json.parse` remains the machine-number parser.
+
+```silk
+import silk.json.schema { Schema, Draft, SchemaError }
+import silk.json.schema_resolver { SchemaResolver, SchemaRegistry, SchemaResolutionError }
+import silk.json.schema_value { SchemaValue, ValueError }
+import silk.toml.scanner { TomlError }
+import silk.text.regex { RegexError }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+
+effect fn checkConfig(schemaToml: &[u8], configToml: &[u8]) -> bool
+  ! TomlError | ValueError | SchemaError | SchemaResolutionError | RegexError | OutOfMemoryError
+  ? &mut Allocator {
+  let schema = run SchemaValue.parseToml(schemaToml)
+  let config = run SchemaValue.parseToml(configToml)
+  let mut registry = SchemaRegistry.make()
+  let mut options = Schema.options(Draft.Draft202012)
+  options.assertFormats = true
+  let compiled = run Schema.compile(&schema, "https://example.com/config",
+    options) |> Effect.provideMut<SchemaResolver>(&mut registry)
+  let output = run Schema.validate(&compiled, &config)
+  return output.valid
+}
+```
+
+TOML tables and arrays of tables become JSON objects and arrays. Dates and times become
+their original text; base-prefixed integers become exact decimal numbers. NaN and infinity
+are rejected. JSON Schema's boolean schemas and `null` cannot be expressed as TOML document
+roots; use JSON or construct the shared `Value` directly when those forms are needed.
+
+The compiled schema borrows its root and owns any resolved external documents. It can validate
+multiple instances after the resolver has gone out of scope. Compilation requires the replaceable
+`silk.json.schema_resolver.SchemaResolver` service; validation does not. Its `resolve` operation
+receives an absolute URI without a fragment and returns an owned optional `Value`. Missing
+resources become unresolved-reference errors; provider failures preserve `SchemaResolutionError`.
+Each retrieval URI is resolved at most once per compilation.
+
+`SchemaRegistry.make()` creates an explicit empty in-memory provider. Add owned JSON or
+TOML-derived schemas with `SchemaRegistry.add(&mut registry, uri, move schema)`. The registry is
+reusable; `SchemaMetas.documents` supplies official metaschemas to register when explicitly
+referenced. Applications can instead implement filesystem, HTTP, embedded-resource or other
+providers and bind them with `Effect.provideMut<SchemaResolver>`. The validator has no default
+filesystem or network access and never executes schema code. `$dynamicRef`, `$recursiveRef`,
+vocabulary declarations and unevaluated-property/item annotations follow the selected dialect.
+
+`format` is an annotation by default. Set `assertFormats` to check the standard formats;
+the 2020-12 format-assertion vocabulary also enables their assertions. Draft 7's optional
+`base64`/`application/json` content assertions require `assertContent = true`; newer drafts'
+content keywords remain annotations. Regex resource-limit errors are distinct from a
+non-match. Source parsing retains the existing JSON/TOML nesting limits.
+
+Invalid instances return `Output.valid = false` with keyword and instance JSON Pointers.
+Invalid schemas, unresolved references, and operational failures use typed errors.
+`Schema.toJson` produces the standard basic output as a `Value`, written with `Json.write`.
+
+Run the pinned official conformance suite, including optional cases, with:
+
+```sh
+integration/json-schema-conformance/check-json-schema
+```
+
+The driver downloads a checksum-pinned suite, builds the native runner, and reports failures
+without skips. `--draft draft2020-12` or `--match unevaluated` narrows an investigation;
+`--runner /path/to/runner` reuses a build. Unicode data is reproducible with
+`scripts/unicode/generate-regex-unicode` and `scripts/unicode/generate-schema-idna`.
+
 ## Compression
 
 The compression modules cover the formats in Zig's `lib/std/compress` (reference commit

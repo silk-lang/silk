@@ -6,20 +6,21 @@ Parse JSON into a tree of values, read fields from it, and write it back.
 
 ## When to use
 Use [`Json.parse`](#Json.impl.parse) when the shape of a document is not fixed, or when you need only a few fields
-of a larger document. Read the fields with [`Json.field`](#Json.impl.field), [`Json.fieldAt`](#Json.impl.fieldAt), and the `as...`
-functions. Use [`Json.deserialize`](#Json.impl.deserialize) or [`Json.decode`](#Json.impl.decode) to read a document straight into a typed
-value, and [`Json.serialize`](#Json.impl.serialize) to write a typed value. To read tokens without building a tree,
-use `silk.json.scanner`.
+of a larger document. Use [`Json.parseExact`](#Json.impl.parseExact) when decimal precision matters: it retains number
+spellings without rounding. Both return the same tree. Read fields with [`Json.field`](#Json.impl.field),
+[`Json.fieldAt`](#Json.impl.fieldAt), and the `as...` functions. Use [`Json.deserialize`](#Json.impl.deserialize) or [`Json.decode`](#Json.impl.decode) for typed
+values and [`Json.serialize`](#Json.impl.serialize) to write them. Use `silk.json.scanner` to read tokens without a tree.
 
 ## Details
 Parsing is strict (RFC 8259): no comments, no trailing commas, and no duplicate keys in an
-object. Arrays and objects keep the order of the source. Numbers and string escapes are converted
-when the document is parsed: an integer that fits in `i64` or `u64` stays exact, and any other
-number becomes the nearest `f64`. If parsing fails, everything that was built is released.
+object. Arrays and objects keep source order. String escapes are decoded. `Json.parse` keeps
+integers that fit in `i64` or `u64` exact and converts other numbers to the nearest `f64`.
+`Json.parseExact` keeps every number as a validated decimal spelling with no precision or
+exponent bound. If parsing fails, everything that was built is released.
 
 ## Errors
-- `JsonError` if the input is not valid JSON, has a duplicate key, has a number too large for a
-  finite `f64`, nests deeper than `MAX_DEPTH` (64), or has content after the value. `offset` gives the position.
+- `JsonError` for invalid JSON, duplicate keys, nesting deeper than `MAX_DEPTH` (64), or trailing
+  content. `Json.parse` also rejects numbers outside finite `f64`; `Json.parseExact` does not.
 - `OutOfMemoryError` if the `Allocator` cannot supply the tree.
 - `WriterError` from the write functions if the `Writer` fails.
 
@@ -73,7 +74,7 @@ pub effect fn main() -> i32
 
 Import as `Json` with `import silk.json.value { Json }`.
 
-Public declarations: 10.
+Public declarations: 11.
 
 <a id="JsonEntry"></a>
 
@@ -113,17 +114,18 @@ The value.
 pub union JsonNumber
 ```
 
-A JSON number, converted to the type that holds it exactly when there is one.
+An owned JSON number stored as a machine value or as an exact validated decimal spelling.
 
 ### Details
 
-An integer written without a fraction or an exponent is `Integer` if it fits in `i64` and
-`Unsigned` if it is larger but fits in `u64`. Any other number is `Float`, rounded to the nearest
-`f64` with ties to even. `1.0` and `1e3` are floats.
+`Json.parse` stores an integer written without a fraction or exponent as `Integer` when it fits
+in `i64`, or `Unsigned` when it fits only in `u64`. Other numbers become `Float`, rounded to
+nearest `f64` with ties to even. `Json.parseExact` stores all numbers as `Decimal`, retaining
+their source spelling without a precision or exponent bound. `Decimal` owns its text.
 
 ### Gotchas
-
-`Json.write` fails with `InvalidNumber` for a `Float` that is not finite.
+`Json.write` rejects a `Float` that is not finite. Manually constructed `Decimal` values must
+contain a valid JSON number spelling. Borrow with `JsonNumber.view` instead of copying text.
 
 <a id="JsonNumber.Integer"></a>
 
@@ -185,13 +187,164 @@ pub value: f64
 
 The nearest `f64`.
 
-<a id="JsonNumber.impl.Copy"></a>
+<a id="JsonNumber.Decimal"></a>
 
-## Implementation `Copy for JsonNumber`
+### `Decimal`
 
 ```silk
-impl Copy for JsonNumber
+Decimal
 ```
+
+An exact decimal number retained without a precision or exponent bound by `Json.parseExact`.
+
+<a id="JsonNumber.Decimal.text"></a>
+
+#### Field `text`
+
+```silk
+pub text: String
+```
+
+A validated JSON number spelling. Manually constructed values must obey JSON number syntax.
+
+<a id="JsonNumberView"></a>
+
+## `JsonNumberView`
+
+```silk
+pub union JsonNumberView<'text>
+```
+
+An allocation-free view of a JSON number from a tree or packed document.
+Decimal text borrows its owner; scalar variants copy their machine value.
+
+<a id="JsonNumberView.Integer"></a>
+
+### `Integer`
+
+```silk
+Integer
+```
+
+A signed machine integer.
+
+<a id="JsonNumberView.Integer.value"></a>
+
+#### Field `value`
+
+```silk
+pub value: i64
+```
+
+The exact integer value.
+
+<a id="JsonNumberView.Unsigned"></a>
+
+### `Unsigned`
+
+```silk
+Unsigned
+```
+
+An unsigned machine integer.
+
+<a id="JsonNumberView.Unsigned.value"></a>
+
+#### Field `value`
+
+```silk
+pub value: u64
+```
+
+The exact integer value.
+
+<a id="JsonNumberView.Float"></a>
+
+### `Float`
+
+```silk
+Float
+```
+
+A binary floating-point value.
+
+<a id="JsonNumberView.Float.value"></a>
+
+#### Field `value`
+
+```silk
+pub value: f64
+```
+
+The stored `f64`; manually constructed trees can contain nonfinite values.
+
+<a id="JsonNumberView.Decimal"></a>
+
+### `Decimal`
+
+```silk
+Decimal
+```
+
+A validated JSON decimal spelling with no precision or exponent bound.
+
+<a id="JsonNumberView.Decimal.text"></a>
+
+#### Field `text`
+
+```silk
+pub text: string<'text>
+```
+
+The number text, borrowed from the tree or document.
+
+<a id="JsonNumberView.impl.Copy"></a>
+
+## Implementation `Copy for JsonNumberView<'text>`
+
+```silk
+impl<'text> Copy for JsonNumberView<'text>
+```
+
+<a id="JsonNumber.impl"></a>
+
+## Implementation `JsonNumber`
+
+```silk
+impl JsonNumber
+```
+
+<a id="JsonNumber.impl.view"></a>
+
+### Method `view`
+
+```silk
+pub fn view<'a>(self: &'a Self) -> JsonNumberView<'a>
+```
+
+Borrows a number without allocating or copying owned decimal text.
+The returned decimal view cannot outlive `self`.
+
+<a id="JsonNumberView.impl"></a>
+
+## Implementation `JsonNumberView<'text>`
+
+```silk
+impl<'text> JsonNumberView<'text>
+```
+
+<a id="JsonNumberView.impl.toOwned"></a>
+
+### Method `toOwned`
+
+```silk
+pub effect fn toOwned(self: Self) -> JsonNumber ! OutOfMemoryError ? &mut Allocator
+```
+
+Copies a number into independently owned storage. Machine-number variants do not allocate.
+
+#### Errors
+- `OutOfMemoryError` if decimal text cannot be copied.
 
 <a id="Value"></a>
 
@@ -206,8 +359,8 @@ One JSON value: null, a boolean, a number, a string, an array, or an object.
 ### Details
 
 A `Value` owns all of its children. Use `match` to get the kind, or the `Json.as...` functions
-to read a field of a known kind. Arrays and objects keep the order of the source. A number is
-converted when the document is parsed, as a [`JsonNumber`](#JsonNumber).
+to read a field of a known kind. Arrays and objects keep source order. `Json.parse` converts
+numbers to machine values; `Json.parseExact` keeps exact decimal spellings in the same tree.
 
 ### Gotchas
 
@@ -261,7 +414,7 @@ A JSON number.
 pub value: JsonNumber
 ```
 
-The number, converted when the document was parsed.
+The number, as a machine value or an owned exact decimal spelling.
 
 <a id="Value.String"></a>
 
@@ -342,6 +495,19 @@ constructed.
 impl Json
 ```
 
+<a id="Json.impl.copy"></a>
+
+### Associated function `copy`
+
+```silk
+pub effect fn copy(value: &Value) -> Value ! OutOfMemoryError ? &mut Allocator
+```
+
+Copies a tree into independent owned storage, preserving object order and exact number text.
+
+#### Errors
+- `OutOfMemoryError` if the allocator cannot supply the copied tree.
+
 <a id="Json.impl.parse"></a>
 
 ### Associated function `parse`
@@ -367,6 +533,22 @@ object. String escapes are decoded when the document is parsed.
 - `JsonError` if `bytes` is not one valid JSON value, if an object has a duplicate key, if the
   nesting is deeper than 64, or if content follows the value. The partial tree is dropped.
 - `OutOfMemoryError` if the `Allocator` cannot supply the tree.
+
+<a id="Json.impl.parseExact"></a>
+
+### Associated function `parseExact`
+
+```silk
+pub effect fn parseExact(bytes: &[u8]) -> Value ! JsonError | OutOfMemoryError ? &mut Allocator
+```
+
+Parses one complete strict JSON document with every number retained as `JsonNumber.Decimal`.
+Numbers keep their validated source spelling without rounding or a fixed exponent bound.
+String decoding, duplicate-key checks, and the nesting limit are shared with `Json.parse`.
+
+#### Errors
+- `JsonError` for invalid JSON, duplicate decoded keys, excessive nesting, or trailing content.
+- `OutOfMemoryError` if the allocator cannot supply the owned tree and number text.
 
 <a id="Json.impl.decode"></a>
 
@@ -575,8 +757,8 @@ Use it to read nested fields in a chain: `Json.field(&doc, "user") |> Json.field
 pub fn asI32(self: Option<&Value>) -> Option<i32>
 ```
 
-Returns the number as `i32`. Returns an absent option if the value is absent, is not an
-integer (`1.0` and `1e3` are not), or does not fit in `i32`.
+Returns an integer-spelled number as `i32`, accepting machine integers and exact decimals.
+Returns `None` for an absent value, a fraction or exponent spelling, a float, or overflow.
 
 <a id="Json.impl.asI64"></a>
 
@@ -586,8 +768,8 @@ integer (`1.0` and `1e3` are not), or does not fit in `i32`.
 pub fn asI64(self: Option<&Value>) -> Option<i64>
 ```
 
-Returns the number as `i64`. Returns an absent option if the value is absent, is not an
-integer (`1.0` and `1e3` are not), or does not fit in `i64`.
+Returns an integer-spelled number as `i64`, accepting signed machine integers and decimals.
+Returns `None` for an absent value, a fraction or exponent spelling, a float, or overflow.
 
 <a id="Json.impl.asU64"></a>
 
@@ -597,8 +779,8 @@ integer (`1.0` and `1e3` are not), or does not fit in `i64`.
 pub fn asU64(self: Option<&Value>) -> Option<u64>
 ```
 
-Returns the number as `u64`. Returns an absent option if the value is absent, is not an
-integer (`1.0` and `1e3` are not), or does not fit in `u64`.
+Returns an integer-spelled number as `u64`, accepting machine integers and exact decimals.
+Returns `None` for an absent value, a negative or noninteger spelling, a float, or overflow.
 
 <a id="Json.impl.asF64"></a>
 
@@ -637,6 +819,97 @@ pub fn asString<'a>(self: Option<&'a Value>) -> Option<string<'a>>
 
 Returns the text of a string. Returns an absent option if the value is absent or is not a
 string. The text is borrowed from the tree.
+
+<a id="Json.impl.item"></a>
+
+### Associated function `item`
+
+```silk
+pub fn item<'a>(value: &'a Value, index: usize) -> Option<&'a Value>
+```
+
+Returns the zero-based array element, or `None` for a non-array or an out-of-range index.
+The returned value borrows the input tree and cannot outlive it.
+
+<a id="Json.impl.equal"></a>
+
+### Associated function `equal`
+
+```silk
+pub fn equal(left: &Value, right: &Value) -> bool
+```
+
+Compares JSON values without allocating. Numbers compare mathematically, arrays compare in
+order, and objects compare by decoded key regardless of insertion order. Object keys must be
+unique. A nonfinite machine number compares unequal to every value, including itself.
+Finite floats are interpreted using their shortest round-tripping decimal spelling.
+
+<a id="Json.impl.numberIsFinite"></a>
+
+### Associated function `numberIsFinite`
+
+```silk
+pub fn numberIsFinite(value: &JsonNumber) -> bool
+```
+
+Returns false only for a machine float that is NaN or an infinity.
+Exact decimal spellings are finite mathematical numbers even when their exponents are huge.
+
+<a id="Json.impl.compareNumbers"></a>
+
+### Associated function `compareNumbers`
+
+```silk
+pub fn compareNumbers(left: &JsonNumber, right: &JsonNumber) -> i32
+```
+
+Returns -1, 0, or 1 according to the mathematical order of two finite JSON numbers.
+Decimal and integer variants remain exact. Floats use their shortest round-tripping decimal
+spelling. No heap storage is needed. Both numbers must be finite; otherwise this traps.
+
+<a id="Json.impl.isIntegerNumber"></a>
+
+### Associated function `isIntegerNumber`
+
+```silk
+pub fn isIntegerNumber(value: &JsonNumber) -> bool
+```
+
+Returns whether a finite JSON number is mathematically integral without allocating.
+Decimal and integer variants remain exact; floats use their shortest round-tripping decimal
+spelling. The number must be finite; otherwise this traps.
+
+<a id="Json.impl.multipleOfNumbers"></a>
+
+### Associated function `multipleOfNumbers`
+
+```silk
+pub effect fn multipleOfNumbers(value: &JsonNumber, divisor: &JsonNumber) -> bool
+    ! OutOfMemoryError ? &mut Allocator
+```
+
+Returns whether a finite JSON number is an exact integer multiple of a positive divisor.
+Returns false for nonpositive divisors. Decimal and integer variants remain exact; floats
+use their shortest round-tripping decimal spelling. Both numbers must be finite.
+
+#### Errors
+- `OutOfMemoryError` if decimal arithmetic scratch storage cannot be allocated.
+
+#### Gotchas
+Traps for a NaN or infinite machine-number argument.
+
+<a id="Json.impl.asUsizeNumber"></a>
+
+### Associated function `asUsizeNumber`
+
+```silk
+pub fn asUsizeNumber(value: &JsonNumber) -> Option<usize>
+```
+
+Converts a finite JSON number to `usize` if nonnegative, integral, and in range.
+Returns `None` for fractions, negatives, or overflow. Negative zero becomes zero.
+Floats use their shortest round-tripping decimal spelling. No allocation is needed.
+The number must be finite; otherwise this traps.
 
 <a id="Value.impl.Serialize"></a>
 
@@ -1010,10 +1283,11 @@ Returns the value of a boolean. Returns an absent option if `node` is not a bool
 ### Method `asNumber`
 
 ```silk
-pub fn asNumber(self: &Self, node: JsonNode) -> Option<JsonNumber>
+pub fn asNumber<'a>(self: &'a Self, node: JsonNode) -> Option<JsonNumberView<'a>>
 ```
 
-Returns the value of a number. Returns an absent option if `node` is not a number.
+Returns a borrowed view of a number, or `None` if `node` is not a number.
+This operation does not allocate. Decimal text borrows the document and cannot outlive it.
 
 <a id="JsonDocument.impl.asString"></a>
 

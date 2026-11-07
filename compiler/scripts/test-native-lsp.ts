@@ -121,7 +121,10 @@ const notificationsUntil = (session: Session, id: number) =>
 interface Diagnostics {
   uri: string
   version?: number
-  diagnostics: Array<{ range: { start: { line: number; character: number } }; code: string }>
+  diagnostics: Array<{
+    range: { start: { line: number; character: number }; end: { line: number; character: number } }
+    code: string
+  }>
 }
 
 // The diagnostics published for `uri` at `version` (`undefined` for a closed document), from the
@@ -152,6 +155,85 @@ const change = (session: Session, uri: string, version: number, text: string) =>
     method: 'textDocument/didChange',
     params: { textDocument: { uri, version }, contentChanges: [{ text }] },
   })
+
+// Manifest diagnostics use unsaved TOML, not package loading or the Silk parser. This exercises
+// the wire boundary (including incremental edit coordinates), which schema unit tests cannot.
+const manifestSession = Effect.fnUntraced(function* (
+  session: Session,
+  directory: string,
+  encoding: 'utf-8' | 'utf-16',
+) {
+  // Escaping the basename also checks that classification happens after URI decoding.
+  const uri = pathToFileURL(join(directory, 'silk.toml')).href.replace('silk.toml', '%73ilk.toml')
+  const text = 'package = { name = "session", description = "é😀", version = 7 }\n'
+  yield* session.send({
+    jsonrpc: '2.0',
+    method: 'textDocument/didOpen',
+    params: { textDocument: { uri, languageId: 'toml', version: 1, text } },
+  })
+  const opened = yield* diagnosticsFor(session, uri, 1, [])
+  const character = encoding === 'utf-8' ? 64 : 61
+  assert.deepEqual(
+    opened.diagnostics.map(({ code, range }) => ({ code, range })),
+    [{
+      code: 'MANIFEST_SCHEMA',
+      range: {
+        start: { line: 0, character },
+        end: { line: 0, character: character + 1 },
+      },
+    }],
+    `${encoding}: unsaved manifest value has an encoded range, not Silk syntax diagnostics`,
+  )
+  const formatting = yield* request(session, 70, 'textDocument/formatting', {
+    textDocument: { uri },
+    options: { tabSize: 2, insertSpaces: true },
+  })
+  assert.equal(formatting['result'], null, 'manifest text is never offered Silk formatting')
+  yield* session.send({
+    jsonrpc: '2.0',
+    method: 'textDocument/didChange',
+    params: {
+      textDocument: { uri, version: 2 },
+      contentChanges: [{
+        range: {
+          start: { line: 0, character },
+          end: { line: 0, character: character + 1 },
+        },
+        text: '"0.1.0"',
+      }],
+    },
+  })
+  const valid = yield* diagnosticsFor(session, uri, 2, [])
+  assert.deepEqual(valid.diagnostics, [], 'an incremental valid edit clears schema diagnostics')
+  yield* change(session, uri, 3, '[package')
+  const malformed = yield* diagnosticsFor(session, uri, 3, [])
+  assert.deepEqual(malformed.diagnostics.map(({ code }) => code), ['TOML'])
+  yield* session.send({
+    jsonrpc: '2.0',
+    method: 'textDocument/didClose',
+    params: { textDocument: { uri } },
+  })
+  const closed = yield* diagnosticsFor(session, uri, undefined, [])
+  assert.deepEqual(closed.diagnostics, [], 'close clears syntax diagnostics without a version')
+
+  const otherUri = pathToFileURL(`${directory}-silk.toml`).href
+  yield* session.send({
+    jsonrpc: '2.0',
+    method: 'textDocument/didOpen',
+    params: { textDocument: { uri: otherUri, languageId: 'toml', version: 1, text } },
+  })
+  const other = yield* diagnosticsFor(session, otherUri, 1, [])
+  assert.ok(
+    other.diagnostics.every(({ code }) => code !== 'MANIFEST_SCHEMA' && code !== 'TOML'),
+    'unrelated TOML files are not manifest documents',
+  )
+  yield* session.send({
+    jsonrpc: '2.0',
+    method: 'textDocument/didClose',
+    params: { textDocument: { uri: otherUri } },
+  })
+  assert.deepEqual((yield* diagnosticsFor(session, otherUri, undefined, [])).diagnostics, [])
+})
 
 const program = Effect.gen(function* () {
   const compiler = process.argv[2]
@@ -507,6 +589,24 @@ const program = Effect.gen(function* () {
   const cleared = yield* diagnosticsFor(session, uri, undefined, messy.notifications)
   assert.deepEqual(cleared.diagnostics, [])
 
+  // Both negotiated encodings must locate non-ASCII manifest fields and apply ranged changes.
+  for (const encoding of ['utf-8', 'utf-16'] as const) {
+    const manifests = yield* start(silk, stdlib)
+    const initialized = yield* request(manifests, 1, 'initialize', {
+      processId: null,
+      rootUri: null,
+      capabilities: { general: { positionEncodings: [encoding] } },
+    })
+    const result = initialized['result'] as { capabilities: { positionEncoding: string } }
+    assert.equal(result.capabilities.positionEncoding, encoding)
+    yield* manifests.send({ jsonrpc: '2.0', method: 'initialized', params: {} })
+    yield* manifestSession(manifests, directory, encoding)
+    yield* request(manifests, 2, 'shutdown')
+    yield* manifests.send({ jsonrpc: '2.0', method: 'exit' })
+    assert.equal(yield* manifests.exited, 0)
+  }
+  yield* Console.log('Native manifest LSP: UTF-8/UTF-16 ranges, incremental fixes, syntax, close and TOML isolation passed')
+
   // In a workspace, a member sees the open text of a member it depends on, and keeps its saved
   // text once it closes. An import's member list completes only what the module exports.
   const members = yield* start(silk, stdlib)
@@ -588,6 +688,7 @@ const program = Effect.gen(function* () {
   yield* session.send({ jsonrpc: '2.0', method: 'exit' })
   assert.equal(yield* session.exited, 0, 'exit after shutdown stops the server with status 0')
 
+
   // Exit without shutdown, and input that closes before exit, are both status 1.
   const abrupt = yield* start(silk, stdlib)
   yield* abrupt.send({ jsonrpc: '2.0', method: 'exit' })
@@ -622,7 +723,7 @@ const program = Effect.gen(function* () {
   assert.equal(yield* deep.exited, 0, 'deeply nested code is checked without exhausting the stack')
 
   yield* Console.log(
-    'Native language server: scripted lifecycle, syntax and semantic diagnostics, navigation, syntax features, and deep nesting sessions passed',
+    'Native language server: scripted lifecycle, syntax, semantic and manifest diagnostics, navigation, syntax features, and deep nesting sessions passed',
   )
 })
 

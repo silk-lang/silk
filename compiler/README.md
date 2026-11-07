@@ -16,6 +16,28 @@ compiles it again.
 
 The build and test steps CI runs are in `.github/workflows/selfhost.yml`.
 
+## Manifest validation
+
+[`manifest.schema.toml`](manifest.schema.toml) is the canonical JSON Schema Draft 2020-12
+contract for `silk.toml`. The compiler embeds it and uses the existing JSON Schema and TOML
+modules to validate structure before applying build-specific semantic rules.
+
+`silk lsp` validates unsaved files whose decoded basename is exactly `silk.toml`. It publishes
+`TOML` syntax errors and `MANIFEST_SCHEMA` constraint errors with UTF-8 or UTF-16 source ranges,
+refreshes them after edits, and clears them on close. Manifests never enter the Silk parser or
+formatter; unrelated TOML files do not receive manifest validation. Filesystem-dependent build
+semantics, such as dependency resolution, remain build checks.
+
+LSP clients must include manifest documents in their selector, for example
+`{ scheme: "file", language: "toml", pattern: "**/silk.toml" }`, alongside their Silk selector.
+No editor client implementation is maintained in this repository.
+
+Verify the schema's official metaschema, tracked manifests and boundary fixtures with:
+
+```sh
+integration/json-schema-conformance/check-json-schema --manifest-schema
+```
+
 ## Edit replay
 
 `silk check --replay <script>` measures how much of a revisable semantic store an edit
@@ -130,6 +152,11 @@ compares the two by module, code and span. It writes one
 `silk-check-roots only=package|roots <module> <code> <start>-<end>` line per rejection
 only one side reached, then `silk-check-roots modules=<count> rejections=<count>
 differences=<count>`, and fails the check when they differ.
+
+`SILK_VERIFY_MIR=1` enables the mechanical MIR checks used by CI. Use it when reproducing
+selfhost compilation failures: it checks compiler-placed drops before MIR compaction, independently
+of source borrow checking. Lifetime facts follow only feasible edges for literal or known Boolean
+conditions; unknown conditions retain both paths.
 
 ## Toolchains
 
