@@ -1578,6 +1578,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
 
   // A job's result on its way back to the root task.
   struct Settled {
+    worker: usize,
     index: usize,
     outcome: Outcome,
   }
@@ -1595,9 +1596,8 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     return run driveBatch(move view, move idle, move trusts, workers, &plan) |> Effect.provideMut<Allocator>(&mut allocator)
   }
 
-  // The root task of a batch. It steps each request to its next direct job and queues it for the
-  // workers, keeping one job for each worker in flight, and takes each result back
-  // as it arrives. A worker gives its connection back when its job ends, so a later job to the
+  // The root task of a batch. It steps each request to its next direct job and gives it to a
+  // worker without one, and takes each result back as it arrives. A worker gives its connection back when its job ends, so a later job to the
   // same origin reuses it.
   effect fn driveBatch(view: BatchView, idle: List<Box<IdleConnection>>, trusts: List<JobTrust>, workers: usize, plan: &TrustPlan) -> Batch
   ! OutOfMemoryError | TaskIdExhaustedError | Cancelled
@@ -1627,13 +1627,12 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
       index = index + usize.ONE
     }
     drop states
-    // At most one job for each worker is queued or running. A worker that finishes waits for the
-    // root task to step the next request, but each prepared request goes out while it is still in
-    // the cache: at 64 workers, two jobs for each cost about 13% more time for each request.
-    let backlog = workers
-    let queue = run Channel<Indexed>.make(backlog)
-    let Channel<Indexed> {sender: jobs, receiver: taken} = move queue
-    let results = run Channel<Settled>.make(backlog)
+    // Each worker has a queue of its own, which holds its next job, and the root task gives a job
+    // only to a worker without one. A worker that finishes waits for the root task to step the
+    // next request, but each prepared request goes out while it is still in the cache: at 64
+    // workers, two jobs for each cost about 13% more time for each request. A queue of its own
+    // wakes only that worker, where one shared queue wakes every waiting worker for each job.
+    let results = run Channel<Settled>.make(workers)
     let Channel<Settled> {sender: done, receiver: settled} = move results
     let mut pool = move idle
     let open = List<Box<IdleConnection>>.length(&pool)
@@ -1646,27 +1645,37 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
       run List<JobTrust>.reserveExact(&mut sources, workers - held)
     }
     let state = run Shared<BatchState>.make(BatchState {pool: move pool, trusts: move sources})
+    let mut queues = List<Sender<Indexed>>.make()
+    run List<Sender<Indexed>>.reserveExact(&mut queues, workers)
+    // The workers without a job.
+    let mut free = List<usize>.make()
+    run List<usize>.reserveExact(&mut free, workers)
     let mut running = List<Fiber<(), never>>.make()
     run List<Fiber<(), never>>.reserveExact(&mut running, workers)
+    while List<Fiber<(), never>>.length(&running) < workers {
+      let worker = List<Fiber<(), never>>.length(&running)
+      let channel = run Channel<Indexed>.make(usize.ONE)
+      let Channel<Indexed> {sender, receiver} = move channel
+      let _queued = List<Sender<Indexed>>.appendWithinCapacity(&mut queues, move sender)
+      let _free = List<usize>.appendWithinCapacity(&mut free, workers - usize.ONE - worker)
+      let copied = run copyPlan(plan)
+      let back = run done.clone()
+      let fiber = run Fiber<(), never>.forkChild(batchWorker(Shared<BatchState>.clone(&state), move receiver, move back, worker, move copied))
+      let _added = List<Fiber<(), never>>.appendWithinCapacity(&mut running, move fiber)
+    }
+    drop done
     let mut head = usize.ZERO
     let mut inflight = usize.ZERO
     while true {
-      while inflight < backlog && head < List<usize>.length(&ready) {
+      while head < List<usize>.length(&ready) && List<usize>.length(&free) > usize.ZERO {
         let at = List<usize>.asSlice(&ready)[head]
         head = head + usize.ONE
-        if run stepRequest(&mut client.*, &all[at], List<Progress>.asMutSlice(&mut progress.*), &mut ready, &jobs, at) {
+        let idle = List<usize>.asSlice(&free)
+        let worker = idle[idle.length - usize.ONE]
+        drop idle
+        if run stepRequest(&mut client.*, &all[at], List<Progress>.asMutSlice(&mut progress.*), &mut ready, &List<Sender<Indexed>>.asSlice(&queues)[worker], at) {
+          let _taken = List<usize>.pop(&mut free)
           inflight = inflight + usize.ONE
-        }
-      }
-      // The workers start once the first jobs wait for them, so they do not all wait on an empty
-      // queue and wake for each of the first jobs.
-      if List<Fiber<(), never>>.length(&running) == usize.ZERO && inflight > usize.ZERO {
-        while List<Fiber<(), never>>.length(&running) < workers {
-          let copied = run copyPlan(plan)
-          let receiver = run taken.clone()
-          let sender = run done.clone()
-          let fiber = run Fiber<(), never>.forkChild(batchWorker(Shared<BatchState>.clone(&state), move receiver, move sender, move copied))
-          let _added = List<Fiber<(), never>>.appendWithinCapacity(&mut running, move fiber)
         }
       }
       if inflight == usize.ZERO { break }
@@ -1675,22 +1684,21 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
         Option.None => Intrinsic.trap("sendAll: the request tasks stopped before their jobs ended")
       }
       inflight = inflight - usize.ONE
+      let _freed = List<usize>.appendWithinCapacity(&mut free, first.worker)
       run absorb(failOnStatus, List<Progress>.asMutSlice(&mut progress.*), &mut ready, move first)
       while true {
         match settled.tryReceive() {
           TryReceive.Received {value} => {
             inflight = inflight - usize.ONE
+            let _freed = List<usize>.appendWithinCapacity(&mut free, value.worker)
             run absorb(failOnStatus, List<Progress>.asMutSlice(&mut progress.*), &mut ready, move value)
           }
           _ => { break }
         }
       }
     }
-    // Closing the queue ends each worker once it finds no job.
-    jobs.close()
-    drop jobs
-    drop taken
-    drop done
+    // Dropping its queue ends each worker once it finds no job.
+    drop queues
     while true {
       match List<Fiber<(), never>>.pop(&mut running) {
         Option.None => { break }
@@ -1701,8 +1709,8 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     return Shared<BatchState>.withMut<Batch>(&state, finishBatch)
   }
 
-  // Steps the request at `index` once, and queues its job for the workers. Returns whether it
-  // queued a job.
+  // Steps the request at `index` once, and queues its job on `jobs`, a worker's empty queue.
+  // Returns whether it queued a job.
   effect fn stepRequest(client: &mut NativeHttp<'_>, request: &Request<'_>, states: &mut [Progress], ready: &mut List<usize>, jobs: &Sender<Indexed>, index: usize) -> bool
   ! OutOfMemoryError
   ? &mut Allocator {
@@ -1738,7 +1746,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   effect fn absorb(failOnStatus: bool, states: &mut [Progress], ready: &mut List<usize>, settled: Settled) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
-    let Settled {index, outcome} = move settled
+    let Settled {worker: _worker, index, outcome} = move settled
     let mut finished = Option<Result<Response, HttpError>>.none()
     if let Progress.Going {hop} = &mut states[index] {
       let advanced = match move outcome {
@@ -1764,19 +1772,19 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   }
 
   // One worker task of a batch. Its clock parks only this task while the socket waits.
-  effect fn batchWorker(state: Shared<BatchState>, jobs: Receiver<Indexed>, done: Sender<Settled>, plan: TrustPlan) -> () ? &mut Scheduler | &mut MonotonicClock {
+  effect fn batchWorker(state: Shared<BatchState>, jobs: Receiver<Indexed>, done: Sender<Settled>, worker: usize, plan: TrustPlan) -> () ? &mut Scheduler | &mut MonotonicClock {
     // The services that do not depend on the request are given once for all the jobs of this
     // task, so a request does not pay for a provider layer of each.
     let mut allocator = Allocator.systemAllocatorProvider()
     let mut wall = OsSystemClock.make()
     let mut random = OsRandom.make()
-    return run workBatch(move state, &jobs, &done, &plan)
+    return run workBatch(move state, &jobs, &done, worker, &plan)
       |> Effect.provideMut<Allocator>(&mut allocator)
       |> Effect.provideMut<SystemClock>(&mut wall)
       |> Effect.provideMut<Random>(&mut random)
   }
 
-  effect fn workBatch(state: Shared<BatchState>, jobs: &Receiver<Indexed>, done: &Sender<Settled>, plan: &TrustPlan) -> ()
+  effect fn workBatch(state: Shared<BatchState>, jobs: &Receiver<Indexed>, done: &Sender<Settled>, worker: usize, plan: &TrustPlan) -> ()
   ? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random {
     // A job holds its connection in this list while it runs, and the list keeps its memory for the
     // next job.
@@ -1803,7 +1811,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
         }
       }
       // The root task takes every result before it closes the queue, so the send succeeds.
-      let sent = run done.send(Settled {index: index, outcome: move outcome})
+      let sent = run done.send(Settled {worker: worker, index: index, outcome: move outcome})
       drop sent
     }
     Shared<BatchState>.withMut<()>(&state, keepTrust(move trust))
