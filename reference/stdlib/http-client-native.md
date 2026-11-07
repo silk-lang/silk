@@ -155,7 +155,8 @@ most 16 MiB, up to 10 redirects, and the PEM bundle of the platform for HTTPS:
 Windows `ROOT` certificate store. Requests use HTTP/1.1 and send `Accept-Encoding: identity`,
 so the body arrives as the server sent it. The next request to an origin reuses an open
 connection to it. The client keeps up to 64 open connections, several for one origin when
-requests ran at the same time.
+requests ran at the same time. It reads the trust bundle on its first HTTPS connection and
+keeps the anchors for later ones.
 
 [`Http.sendAll`](./http-client.md#Http.sendAll) runs up to 32 requests at the same time on one thread, each on its own
 connection. Set the number with [`NativeHttp.withConcurrency`](#NativeHttp.impl.withConcurrency).
@@ -168,7 +169,8 @@ from HTTPS to HTTP fails. A redirect to another origin does not send `Authorizat
 ### Gotchas
 
 The deadline covers the TLS handshake and the HTTP exchange, but not the name lookup and the
-TCP connect. The macOS keychain is not used, only the PEM bundle. [`NativeHttp.make`](#NativeHttp.impl.make) reads no
+TCP connect. A change to the trust bundle file takes effect in a new client. The macOS
+keychain is not used, only the PEM bundle. [`NativeHttp.make`](#NativeHttp.impl.make) reads no
 environment variables, so it never uses a proxy. Only `http://` proxies are supported.
 Windows imports root certificates rather than chain-engine policy; revocation, store usage
 properties, and disallowed-store entries are not imported.
