@@ -257,11 +257,9 @@ whose parameter is spelled `Fallible<T>` sees the expansion `T | IoError`; GEN-0
 union member backwards, so the caller writes `take<Left>(...)`. Alias parameters carry no bounds:
 the target's own bounds are proven at the expanded application with their usual diagnostics.
 
-A lifetime the target omits is an implicit lifetime parameter of the alias, as an omitted field
-lifetime is of a struct header (LIFE-003), and each use elides it as it elides any nominal's.
-A use stands for its written-out target in header elision, so with `type Borrow = &i32`,
-`fn same(value: Borrow) -> Borrow` means `fn same(value: &i32) -> &i32`. A written lifetime is an
-ordinary parameter: `type Ref<'a, T> = &'a T` is used as `Ref<'a, i32>` or, eliding it, `Ref<i32>`.
+An alias target writes every lifetime it borrows for, as a field does (LIFE-003). A written
+lifetime is an ordinary parameter: `type Ref<'a, T> = &'a T` is used as `Ref<'a, i32>` or, in a
+signature, eliding it, `Ref<i32>`.
 
 An alias is valid wherever its target is valid: a value or type position, a type argument, a bound
 in a generic parameter list, the interface of an `impl` head, the qualifier of a static member or

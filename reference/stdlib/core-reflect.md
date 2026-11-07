@@ -360,7 +360,7 @@ import silk.core.reflect { Reflect }
 
 union Command {
   Status,
-  Clone { pub url: string, pub depth: u32 },
+  Clone { pub url: string<'static>, pub depth: u32 },
 }
 
 static fn fieldCount<U>(variant: Intrinsic.Variant<U>) -> usize {

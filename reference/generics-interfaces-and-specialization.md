@@ -1722,8 +1722,9 @@ reports the unproven bound while `swapped` stays available.
 **Boundary:** Every `impl` parameter must be determined by the interface application or provider
 head, and every bounded provider parameter must occur structurally inside the conformance provider.
 A parameter introduced only by a bound would create indistinguishable witnesses and is invalid.
-An inherent head still names the whole family of its owner (`impl<T: Float> Vector2<T>`, never
-`impl Vector2<f64>`), takes interface, sealed-property and outlives bounds but no callable bound or
+An inherent head still names the whole family of its owner's types (`impl<T: Float> Vector2<T>`,
+never `impl Vector2<f64>`); a lifetime argument may be `'static`, as in `impl Row<'static>`, which
+stands for one lifetime bounded by `'static` (LIFE-003). It takes interface, sealed-property and outlives bounds but no callable bound or
 `where` clause, and no head bounds arbitrary constructed types. Bounds never make two inherent
 members distinct: one name declared in two blocks is a duplicate member whatever their bounds. A
 member never restates an owner parameter to add bounds for itself alone: one spelling names one

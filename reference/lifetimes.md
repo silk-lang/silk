@@ -86,13 +86,39 @@ boundary.
 **Evidence:** outlives requirements,
 compatibility tests.
 
-## LIFE-003 — Elision is determined by the declaration header
+## LIFE-003 — Declarations write their lifetimes; signatures elide them
 
 **Status:** Confirmed
 
-An omitted lifetime on each independent borrowed input introduces a fresh declaration binder. An
-outer borrowed receiver supplies omitted result lifetimes; without that receiver, exactly one
-top-level borrowed input supplies the default. A string input participates as a borrowed view.
+A declaration has exactly the lifetimes its header writes. A struct, union or tuple field, a
+declaration bound and an alias target write every lifetime they borrow for, and the compiler never
+adds a hidden lifetime parameter. A field that holds program-long data writes `'static`, and a
+callable or Effect bound writes its environment, as in `fn<'static>(i32) -> i32`.
+
+```silk
+struct Row<'a> { title: string<'a>, done: bool }
+struct Config { name: string<'static> }
+struct Cb<F: fn<'static>(i32) -> i32> { f: F }
+```
+
+A field's type is one runtime representation, so a callable contract cannot be a field's type;
+the field holds a type parameter bounded by the contract, as `Cb` does. An `extern "C" fn` field is
+a function address and has no environment to write.
+
+An implementation head writes the lifetimes of the type it implements. `impl<'a> Row<'a>` covers
+every lifetime. `impl Row<'static>` implements one lifetime: its members exist only for
+`Row<'static>`, each call proves that bound, and the members assume it. That head is the only
+spelling for it; `impl<'a: 'static> Row<'a>` is refused. A head with type parameters pins the same
+way, as in `impl<T> Tagged<'static, T>`. A bound in the head writes its lifetimes too, as in
+`impl<'a, T: Read<'a>> Reader<T>`. Conformance heads write lifetimes the
+same way, as in `impl<'data, A: Copy> Stream<A, never ? never> for SliceStream<'data, A>`. A
+requirement row or a provides premise in an implementation head may still omit a loan's lifetime,
+which becomes one more implementation lifetime.
+
+In a signature, an omitted lifetime on each independent borrowed input introduces a fresh
+declaration binder. An outer borrowed receiver supplies omitted result lifetimes; without that
+receiver, exactly one top-level borrowed input supplies the default. A string input participates
+as a borrowed view.
 
 ```silk
 fn first(values: &[i32]) -> &i32 {
@@ -103,21 +129,8 @@ fn first(values: &[i32]) -> &i32 {
 Its expanded contract is `fn first<'life0>(values: &'life0 [i32]) -> &'life0 i32`.
 Each omitted lifetime in a nominal input introduces an independent binder. Borrowing a wrapper
 adds its own outer lifetime; that outer borrow does not merge the wrapper's stored-data lifetimes.
-Omitted nominal output lifetimes use the same result default. Each omitted borrowed field introduces
-an independent parameter of its containing declaration.
-
-An inherent impl also introduces owner binders for omitted nominal lifetimes. For example,
-`impl<A> SliceStream<A>` can define `make(slice: &[A]) -> SliceStream<A>`: its returned
-holder uses the input's lifetime, so `SliceStream.make(&values)` is callable. Returning `Self`
-instead keeps the impl's applied owner, including its stored-data lifetimes. It does not connect
-those lifetimes to an independently elided input; name the shared lifetime explicitly when a
-constructor returns `Self`.
-
-Conformance headers apply the same nominal lifetime elision. For a holder with one stored-data
-lifetime, `impl<A: Copy> Stream<A, never ? never> for SliceStream<A>` introduces an independent
-impl lifetime and retains it in the operation contracts. It has the same relationships as an
-explicitly bound `impl<'data, A: Copy> ... for SliceStream<'data, A>`. Ordinary type arguments,
-bounds and conformance selection are unchanged; `Self` still denotes that fixed applied owner.
+Omitted nominal output lifetimes use the same result default. `Self` in an implementation denotes
+the head's applied owner, including its stored-data lifetimes.
 
 Inside a body, every omitted lifetime is a fresh region of that body, inferred from its uses and
 cleanup: in a local annotation, a literal's or constructor's type arguments (also through an alias),
@@ -132,10 +145,12 @@ initialize a field.
 relationship. A by-value holder's stored view can be returned by naming its data lifetime; elision
 does not reinterpret that stored view as an outer borrowed receiver.
 
-**Diagnostics:** Missing or ambiguous output relationships report `SEM0210`. Editor hover shows
-stable readable generated binders. **Make lifetimes explicit** offers a compiler-owned edit only
-for a complete supported header, preserves comments and semantics, and disables stale actions.
-Ordinary formatting preserves the author's explicit or omitted choices.
+**Diagnostics:** A field, declaration bound, alias target or implementation head that omits a
+lifetime reports `SEM0210` with the declaration to write, and so do missing or ambiguous output
+relationships. A lifetime binder bounded by `'static` on an implementation head reports `SEM0211`,
+and a field whose type is a callable contract reports `SEM0018`. Editor hover shows stable
+readable generated binders. Ordinary formatting preserves the author's explicit or omitted
+choices in signatures.
 
 **Evidence:** elision requirements,
 declaration tests,
@@ -274,7 +289,7 @@ lifetime checking tests.
 
 `Intrinsic.RawBuffer<T>` is invariant in its payload type. `Intrinsic.Slot<'storage, T>` adds the
 exclusive storage access lifetime; that lifetime may shorten, while `T` remains invariant. The elided
-spelling `Intrinsic.Slot<T>` follows ordinary nominal lifetime elision. A slot cannot escape the buffer that supplied
+spelling `Intrinsic.Slot<T>` follows ordinary nominal lifetime elision in a signature; a field writes `Intrinsic.Slot<'storage, T>`. A slot cannot escape the buffer that supplied
 it. Slot projection checks the recorded element count; the caller still proves that the underlying
 allocation fits that count. Taking an initialized element transfers `T`, including its external referent lifetimes;
 copying one requires `T: Copy` and retains those same lifetimes. Neither operation extends a
