@@ -108,6 +108,14 @@ pub connect: bool
 
 True for a CONNECT request.
 
+<a id="Message.impl.Copy"></a>
+
+## Implementation `Copy for Message`
+
+```silk
+impl Copy for Message
+```
+
 <a id="validate"></a>
 
 ## `validate`
