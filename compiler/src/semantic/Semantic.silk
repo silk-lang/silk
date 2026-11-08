@@ -7,6 +7,7 @@
 import semantic.Types {TypeTable, Types}
 import semantic.CacheImage {Merge}
 import semantic.WalkFragments
+import semantic.SweepFragments
 import semantic.FiniteBudget {Budget as SpecializationBudget}
 import semantic.SourceSyntax
 import semantic.SyntaxNames {primitive}
@@ -595,6 +596,50 @@ fn takeFrontierTask(table: [*]mut u64, ordinal: usize) -> bool {
 fn takeFrontierModule(table: [*]mut u64) -> usize {
   // Module zero is the runtime root already being completed by every worker.
   return u64.toUsize(unsafe Atomic.fetchAdd<u64>(unsafe Pointer.atMut<u64>(table, frontierModuleCursor), 1, MemoryOrder.Relaxed)) + usize.ONE
+}
+
+// Ready module rosters publish only declaration counts; every worker reconstructs the
+// exact source roster locally before checking its claimed contiguous range.
+struct FrontierChunkTask { module: usize, start: usize, end: usize }
+struct FrontierModuleRoster { module: usize, checks: ModuleChecks }
+const frontierChunkWidth: usize = 64
+const frontierChunkThreshold: usize = 256
+
+fn chunkedFrontier() -> bool {
+  return ephemeralFrontier() && dynamicFrontier() && sharedFrontier()
+    && !Pointer.isNullMany<u8>(unsafe FrontierHost.environment(Pointer.fromSlice<u8>(b"SILK_FRONTIER_CHUNKS\0")))
+}
+
+fn makeFrontierChunks(modules: usize) -> Option<[*]mut u64> {
+  if !chunkedFrontier() || modules == usize.ZERO || modules > usize.MAX / 16 { return Option<[*]mut u64>.none() }
+  let mapped = unsafe FrontierHost.mapShared(modules * 16)
+  if Pointer.addressMany<u64>(mapped) == usize.MAX { return Option<[*]mut u64>.none() }
+  return Pointer.nonNullManyMut<u64>(mapped)
+}
+
+fn publishFrontierChunks(table: [*]mut u64, module: usize, declarations: usize) -> () {
+  unsafe Atomic.store<u64>(unsafe Pointer.atMut<u64>(table, module * 2), usize.toU64(declarations), MemoryOrder.Release)
+}
+
+fn takeFrontierChunk(table: [*]mut u64, modules: usize) -> Option<FrontierChunkTask> {
+  let mut module = usize.ONE
+  while module < modules {
+    let count = u64.toUsize(unsafe Atomic.load<u64>(unsafe Pointer.atMut<u64>(table, module * 2), MemoryOrder.Acquire))
+    if count != usize.ZERO {
+      let counter = unsafe Pointer.atMut<u64>(table, module * 2 + usize.ONE)
+      let observed = u64.toUsize(unsafe Atomic.load<u64>(counter, MemoryOrder.Relaxed))
+      if observed < count {
+        let start = u64.toUsize(unsafe Atomic.fetchAdd<u64>(counter, usize.toU64(frontierChunkWidth), MemoryOrder.Relaxed))
+        if start < count {
+          let mut end = start + frontierChunkWidth
+          if end > count { end = count }
+          return Option<FrontierChunkTask>.some(FrontierChunkTask {module: module, start: start, end: end})
+        }
+      }
+    }
+    module = module + usize.ONE
+  }
+  return Option<FrontierChunkTask>.none()
 }
 
 fn makeFrontierClaims() -> Option<[*]mut u64> {
@@ -3423,6 +3468,10 @@ pub struct Semantic {
   frontierExpected: usize,
   specializationBudget: SpecializationBudget,
   frontierClaims: Option<[*]mut u64>,
+  frontierChunks: Option<[*]mut u64>,
+  frontierChecked: List<usize>,
+  frontierSweepChunks: List<SweepFragments.Packet>,
+  frontierRosters: List<FrontierModuleRoster>,
   frontierOwned: usize,
   frontierTasks: usize,
   frontierSkipped: usize,
@@ -93044,6 +93093,10 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
     frontierExpected: usize.ZERO,
     specializationBudget: SpecializationBudget.make(),
     frontierClaims: Option<[*]mut u64>.none(),
+    frontierChunks: Option<[*]mut u64>.none(),
+    frontierChecked: List<usize>.make(),
+    frontierSweepChunks: List<SweepFragments.Packet>.make(),
+    frontierRosters: List<FrontierModuleRoster>.make(),
     frontierOwned: usize.ZERO,
     frontierTasks: usize.ZERO,
     frontierSkipped: usize.ZERO,
@@ -94901,6 +94954,97 @@ impl Semantic {
     return false
   }
 
+  // A range remains a transport-only partial sweep until the parent verifies the complete
+  // authored roster and name checks. Its escape memo is moved into the packet immediately.
+  effect fn frontierSweepChunk(self: &mut Self, request: &mut Request, modules: &[usize], task: FrontierChunkTask) -> ()
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+    let started = run frontierNow()
+    let ordinal = modules[task.module]
+    let module = resolvedModule(&self.resolver, ordinal)
+    let cached = List<FrontierModuleRoster>.asSlice(&self.frontierRosters)
+    let mut foundRoster = usize.MAX
+    let mut rosterAt = usize.ZERO
+    while rosterAt < cached.length && foundRoster == usize.MAX {
+      if cached[rosterAt].module == ordinal { foundRoster = rosterAt }
+      rosterAt = rosterAt + usize.ONE
+    }
+    let listed = if foundRoster != usize.MAX {
+      let held = List<FrontierModuleRoster>.remove(&mut self.frontierRosters, foundRoster)
+      move held.checks
+    } else {
+      run Semantic.readPendingDeclarations(&mut self.*, &module)
+      run Semantic.moduleChecks(&mut self.*, &module, &Option<DeclarationId>.none())
+    }
+    let written = List<DeclarationCheck>.asSlice(&listed.declarations)
+    if task.start >= task.end || task.end > written.length { unsafe FrontierHost.exit(3) return () }
+    self.deferredTemplates = List<DeferredStaticTemplate>.make()
+    self.uncheckedRoot = List<UncheckedBody>.make()
+    let mut sweep = Sweep.make()
+    let mut names = List<Bytes>.make()
+    if task.start == usize.ZERO {
+      let expected = List<CheckedName>.asSlice(&listed.names)
+      run Semantic.checkNames(&mut self.*, &module, expected, &mut sweep.rejections)
+      let mut at = usize.ZERO
+      while at < expected.length {
+        run List<Bytes>.append(&mut names, run Bytes.copy(Bytes.asSlice(&expected[at].name)))
+        at = at + usize.ONE
+      }
+    }
+    let mut declarations = List<Bytes>.make()
+    let mut at = task.start
+    while at < task.end {
+      run Semantic.sweptDeclaration(&mut self.*, &mut request.*, &module, ordinal, &written[at], &mut sweep)
+      let mut identity = Bytes.make()
+      run StableKey.declaration(&mut identity, &written[at].identity)
+      run List<Bytes>.append(&mut declarations, move identity)
+      at = at + usize.ONE
+    }
+    let diagnoses = List<Shared<Rejection>>.asSlice(&sweep.rejections)
+    at = usize.ZERO
+    while at < diagnoses.length {
+      let warning = Shared<Rejection>.with<bool>(&diagnoses[at], fn(value: &Rejection) -> bool { return rejectionWarns(value.code) })
+      if !warning { unsafe FrontierHost.exit(3) return () }
+      at = at + usize.ONE
+    }
+    if List<Shared<BackendGap>>.length(&sweep.gaps) != usize.ZERO || List<UncheckedDeclaration>.length(&sweep.unchecked) != usize.ZERO
+      || List<UncheckedBody>.length(&self.uncheckedRoot) != usize.ZERO { unsafe FrontierHost.exit(3) return () }
+    let mut sites = List<ModuleId>.make()
+    let answer = match move run reportingAnswer(0, List<DeclarationId>.asSlice(&sweep.concrete),
+      List<Shared<Rejection>>.asSlice(&sweep.rejections), List<DeferredStaticTemplate>.asSlice(&self.deferredTemplates), &mut sites) {
+      Option<Bytes>.Some {value} => move value
+      Option<Bytes>.None => { unsafe FrontierHost.exit(3) return () }
+    }
+    let sweepWord = run internKey(&mut self.resolver, Key {family: Family.ModuleCheck, module: ordinal, name: usize.ZERO,
+      declaration: usize.MAX, member: usize.ZERO, external: false})
+    let sweepKey = match move run stableUnit(&self.resolver, u64.toUsize(sweepWord.value)) {
+      Option<Bytes>.Some {value} => move value
+      Option<Bytes>.None => { unsafe FrontierHost.exit(3) return () }
+    }
+    let escaped = run Semantic.keptEscapes(&mut self.*, &mut request.*, ordinal, modules, List<DeclarationId>.asSlice(&sweep.concrete), false)
+    if List<Shared<Rejection>>.length(&escaped.rejections) != usize.ZERO || List<Shared<BackendGap>>.length(&escaped.gaps) != usize.ZERO
+      || List<UncheckedDeclaration>.length(&escaped.unchecked) != usize.ZERO { unsafe FrontierHost.exit(3) return () }
+    let escapeWord = run internKey(&mut self.resolver, Key {family: Family.ModuleCheck, module: ordinal, name: usize.ONE,
+      declaration: usize.MAX, member: usize.ONE, external: false})
+    let unit = u64.toUsize(escapeWord.value)
+    let found = escapeMemoOf(List<EscapeMemo>.asSlice(&self.escapeMemos), unit)
+    if found == usize.MAX { unsafe FrontierHost.exit(3) return () }
+    let memo = List<EscapeMemo>.remove(&mut self.escapeMemos, found)
+    let capture = match move memo.captured {
+      Option<CapturedBuild>.Some {value} => move value
+      Option<CapturedBuild>.None => { unsafe FrontierHost.exit(3) return () }
+    }
+    let escapeKey = match move run stableUnit(&self.resolver, unit) {
+      Option<Bytes>.Some {value} => move value
+      Option<Bytes>.None => { unsafe FrontierHost.exit(3) return () }
+    }
+    run List<SweepFragments.Packet>.append(&mut self.frontierSweepChunks, SweepFragments.Packet {
+      sweep: move sweepKey, escape: move escapeKey, total: written.length, start: task.start,
+      declarations: move declarations, namesChecked: task.start == usize.ZERO, names: move names,
+      answer: move answer, record: run BuildRecord.encode(&capture.record)})
+    run List<FrontierModuleRoster>.append(&mut self.frontierRosters, FrontierModuleRoster {module: ordinal, checks: move listed})
+    run frontierTrace(b"declaration chunk", started, self.frontierWorker, task.start)
+  }
+
   effect fn publishFrontier(self: &mut Self, request: &mut Request, modules: &[usize]) -> ()
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
     self.frontierAvailable = false
@@ -94914,7 +95058,15 @@ impl Semantic {
     }
     let mut at = self.frontierWorker + usize.ONE
     let mut modulesRun = usize.ZERO
+    let mut chunksRun = usize.ZERO
     while self.frontierWorker < 4 {
+      if let Option<[*]mut u64>.Some {value: table} = &self.frontierChunks {
+        if let Option<FrontierChunkTask>.Some {value: task} = move takeFrontierChunk(table, modules.length) {
+          run Semantic.frontierSweepChunk(&mut self.*, &mut request.*, modules, move task)
+          chunksRun = chunksRun + usize.ONE
+          continue
+        }
+      }
       if dynamicFrontier() {
         if let Option<[*]mut u64>.Some {value: table} = &self.frontierClaims { at = takeFrontierModule(table) }
       }
@@ -94922,6 +95074,17 @@ impl Semantic {
       modulesRun = modulesRun + usize.ONE
       let ordinal = modules[at]
       let module = resolvedModule(&self.resolver, ordinal)
+      let chunking = match &self.frontierChunks { Option<[*]mut u64>.Some {..} => true _ => false }
+      if chunking {
+        run Semantic.readPendingDeclarations(&mut self.*, &module)
+        let roster = run Semantic.moduleChecks(&mut self.*, &module, &Option<DeclarationId>.none())
+        let count = List<DeclarationCheck>.length(&roster.declarations)
+        if count >= frontierChunkThreshold {
+          run List<FrontierModuleRoster>.append(&mut self.frontierRosters, FrontierModuleRoster {module: ordinal, checks: move roster})
+          if let Option<[*]mut u64>.Some {value: table} = &self.frontierChunks { publishFrontierChunks(table, at, count) }
+          continue
+        }
+      }
       let found = run Semantic.keptSweep(&mut self.*, &mut request.*, &module, ordinal)
       let mut concrete = List<DeclarationId>.make()
       let mut result = DeclarationCheckResult {rejections: List<Shared<Rejection>>.make(), gaps: List<Shared<BackendGap>>.make(), unchecked: List<UncheckedDeclaration>.make()}
@@ -94940,6 +95103,7 @@ impl Semantic {
         || List<UncheckedDeclaration>.length(&escaped.unchecked) > usize.ZERO { unsafe FrontierHost.exit(3) }
       at = at + 4
     }
+    run frontierTrace(b"module chunk count", self.frontierSplit, self.frontierWorker, chunksRun)
     run frontierTrace(b"module task count", self.frontierSplit, self.frontierWorker, modulesRun)
     run frontierTrace(b"worker-total-owned-skipped", self.frontierSplit, self.frontierOwned, self.frontierSkipped)
     run frontierTrace(b"worker-modules", self.frontierSplit, self.frontierWorker, usize.ZERO)
@@ -94984,6 +95148,13 @@ impl Semantic {
       if !escaped { run List<CacheImage.Root>.append(&mut retained, move root) }
     }
     image.roots = move retained
+    let chunks = List<SweepFragments.Packet>.asSlice(&self.frontierSweepChunks)
+    let mut chunkAt = usize.ZERO
+    while chunkAt < chunks.length {
+      run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: run Bytes.copy(b"frontier-sweep-chunk-v1"),
+        answer: run SweepFragments.encode(&chunks[chunkAt]), node: usize.ZERO})
+      chunkAt = chunkAt + usize.ONE
+    }
     let memos = List<EscapeMemo>.asSlice(&self.escapeMemos)
     let mut memoAt = usize.ZERO
     while memoAt < memos.length {
@@ -95049,6 +95220,135 @@ impl Semantic {
     CompilerBug.panic(b"frontier child returned")
   }
 
+  // Reconstructs a complete sweep only after exact declaration/name roster coverage. This
+  // proof is ephemeral: no dependency-less module answer is ever persisted as a cache root.
+  effect fn aggregateFrontierSweeps(self: &mut Self, packets: &[SweepFragments.Packet], completed: &mut List<ModuleCheckMemo>,
+    coverage: &mut List<FrontierCoverage>) -> bool
+  ! Cycle | OutOfMemoryError ? &mut Allocator | &mut Types {
+    let mut seen = ExactSet.make()
+    let mut packetAt = usize.ZERO
+    while packetAt < packets.length {
+      let packet = &packets[packetAt]
+      packetAt = packetAt + usize.ONE
+      let stable = Bytes.asSlice(&packet.sweep)
+      if ExactSet.find(&seen, stable) != usize.MAX { continue }
+      drop run ExactSet.add(&mut seen, stable)
+      let checked = match move run readCheckKey(stable) {
+        Option<CheckKey>.Some {value} => move value
+        Option<CheckKey>.None => { return false }
+      }
+      let escaped = match move run readCheckKey(Bytes.asSlice(&packet.escape)) {
+        Option<CheckKey>.Some {value} => move value
+        Option<CheckKey>.None => { return false }
+      }
+      if checked.name != usize.ZERO || checked.member != usize.ZERO || escaped.name != usize.ONE || escaped.member != usize.ONE
+        || !ModuleId.equals(&checked.module, &escaped.module) { return false }
+      let assigned = List<usize>.asSlice(&self.frontierChecked)
+      let mut assignedAt = usize.ONE
+      let mut requested = false
+      while assignedAt < assigned.length {
+        if ModuleId.equals(&checked.module, &resolvedModule(&self.resolver, assigned[assignedAt])) { requested = true break }
+        assignedAt = assignedAt + usize.ONE
+      }
+      if !requested { return false }
+      let module = run internModule(&mut self.resolver, &checked.module)
+      let sweepWord = run internKey(&mut self.resolver, Key {family: Family.ModuleCheck, module: module, name: usize.ZERO,
+        declaration: usize.MAX, member: usize.ZERO, external: false})
+      let escapeWord = run internKey(&mut self.resolver, Key {family: Family.ModuleCheck, module: module, name: usize.ONE,
+        declaration: usize.MAX, member: usize.ONE, external: false})
+      let unit = u64.toUsize(sweepWord.value)
+      let sweepExact = match move run stableUnit(&self.resolver, unit) {
+        Option<Bytes>.Some {value} => same(Bytes.asSlice(&value), stable)
+        Option<Bytes>.None => false
+      }
+      let escapeExact = match move run stableUnit(&self.resolver, u64.toUsize(escapeWord.value)) {
+        Option<Bytes>.Some {value} => same(Bytes.asSlice(&value), Bytes.asSlice(&packet.escape))
+        Option<Bytes>.None => false
+      }
+      if !sweepExact || !escapeExact { return false }
+      let listed = match move run Effect.result(Semantic.moduleChecks(&mut self.*, &checked.module, &Option<DeclarationId>.none())) {
+        Result<ModuleChecks, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} => move value
+        Result<ModuleChecks, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} => match move error {
+          Cycle {} => { fail Cycle {} }
+          OutOfMemoryError {} => { fail OutOfMemoryError {} }
+          InvalidModulePath {} => { return false }
+          RevisionMismatch {} => { return false }
+        }
+      }
+      let mut expected = List<Bytes>.make()
+      let declarations = List<DeclarationCheck>.asSlice(&listed.declarations)
+      let mut at = usize.ZERO
+      while at < declarations.length {
+        let mut identity = Bytes.make()
+        run StableKey.declaration(&mut identity, &declarations[at].identity)
+        run List<Bytes>.append(&mut expected, move identity)
+        at = at + usize.ONE
+      }
+      let mut names = List<Bytes>.make()
+      let named = List<CheckedName>.asSlice(&listed.names)
+      at = usize.ZERO
+      while at < named.length {
+        run List<Bytes>.append(&mut names, run Bytes.copy(Bytes.asSlice(&named[at].name)))
+        at = at + usize.ONE
+      }
+      let ordered = match move run SweepFragments.order(packets, stable, List<Bytes>.asSlice(&expected), List<Bytes>.asSlice(&names)) {
+        Option<List<usize>>.Some {value} => move value
+        Option<List<usize>>.None => { return false }
+      }
+      let mut sweep = Sweep.make()
+      let mut deferred = List<DeferredStaticTemplate>.make()
+      let order = List<usize>.asSlice(&ordered)
+      at = usize.ZERO
+      while at < order.length {
+        let part = &packets[order[at]]
+        let answer = match move run readCheckAnswer(Bytes.asSlice(&part.answer), Option<&ModuleId>.some(&checked.module)) {
+          Option<CheckAnswer>.Some {value} => move value
+          Option<CheckAnswer>.None => { return false }
+        }
+        if answer.kind != 0 { return false }
+        let reports = List<Shared<Rejection>>.asSlice(&answer.rejections)
+        let mut report = usize.ZERO
+        while report < reports.length {
+          if !Shared<Rejection>.with<bool>(&reports[report], fn(value: &Rejection) -> bool { return rejectionWarns(value.code) }) { return false }
+          run List<Shared<Rejection>>.append(&mut sweep.rejections, Shared<Rejection>.clone(&reports[report]))
+          report = report + usize.ONE
+        }
+        // Concrete/deferred answers may select only declarations this chunk actually checked.
+        let owned = List<Bytes>.asSlice(&part.declarations)
+        let concrete = List<DeclarationId>.asSlice(&answer.concrete)
+        let mut body = usize.ZERO
+        let mut position = usize.ZERO
+        while body < concrete.length {
+          let mut identity = Bytes.make()
+          run StableKey.declaration(&mut identity, &concrete[body])
+          while position < owned.length && !same(Bytes.asSlice(&owned[position]), Bytes.asSlice(&identity)) { position = position + usize.ONE }
+          if position == owned.length { return false }
+          run List<DeclarationId>.append(&mut sweep.concrete, DeclarationId.copy(&concrete[body]))
+          position = position + usize.ONE
+          body = body + usize.ONE
+        }
+        let templates = List<DeferredStaticTemplate>.asSlice(&answer.deferred)
+        body = usize.ZERO
+        position = usize.ZERO
+        while body < templates.length {
+          let mut identity = Bytes.make()
+          run StableKey.declaration(&mut identity, &templates[body].declaration)
+          while position < owned.length && !same(Bytes.asSlice(&owned[position]), Bytes.asSlice(&identity)) { position = position + usize.ONE }
+          if position == owned.length { return false }
+          position = position + usize.ONE
+          body = body + usize.ONE
+        }
+        run appendDeferred(&mut deferred, templates)
+        at = at + usize.ONE
+      }
+      run List<FrontierCoverage>.append(&mut coverage.*, FrontierCoverage {stable: run Bytes.copy(Bytes.asSlice(&packet.escape)),
+        concrete: run copyDeclarations(List<DeclarationId>.asSlice(&sweep.concrete))})
+      run List<ModuleCheckMemo>.append(&mut completed.*, ModuleCheckMemo {unit: unit, sweep: move sweep,
+        deferred: move deferred, unchecked: List<UncheckedBody>.make()})
+    }
+    return true
+  }
+
   effect fn joinFrontier(self: &mut Self, request: &Request, workers: &[CheckWorker]) -> bool
   ! Cycle | OutOfMemoryError ? &mut Allocator | &mut Types {
     let stable = match move run stableUnit(&self.resolver, self.frontierUnit) {
@@ -95057,6 +95357,7 @@ impl Semantic {
     }
     let mut merge = Merge.make()
     let mut completedSweeps = List<ModuleCheckMemo>.make()
+    let mut sweepChunks = List<SweepFragments.Packet>.make()
     let mut records = List<BuildRecord.Record>.make()
     let mut coverage = List<FrontierCoverage>.make()
     let mut recordKeys = ExactSet.make()
@@ -95081,6 +95382,24 @@ impl Semantic {
       while at < roots.length {
         let root = &roots[at]
         let key = Bytes.asSlice(&root.key)
+        if same(key, b"frontier-sweep-chunk-v1") {
+          let packet = match move run SweepFragments.decode(Bytes.asSlice(&root.answer)) {
+            Option<SweepFragments.Packet>.Some {value} => move value
+            Option<SweepFragments.Packet>.None => { good = false at = at + usize.ONE continue }
+          }
+          if !run Semantic.frontierRecordUnit(&self.*, Bytes.asSlice(&packet.escape)) {
+            good = false at = at + usize.ONE continue
+          }
+          let record = match move run BuildRecord.decode(Bytes.asSlice(&packet.record)) {
+            Option<BuildRecord.Record>.Some {value} => move value
+            Option<BuildRecord.Record>.None => { good = false at = at + usize.ONE continue }
+          }
+          run List<BuildRecord.Record>.append(&mut records, move record)
+          drop run ExactSet.add(&mut recordKeys, Bytes.asSlice(&packet.escape))
+          run List<SweepFragments.Packet>.append(&mut sweepChunks, move packet)
+          at = at + usize.ONE
+          continue
+        }
         let mut exact = Span.make(usize.ZERO, usize.ZERO)
         let kind = buildRootKind(key, &mut exact)
         let runtimeRecord = kind == 3 && same(Slice.view<u8>(key, exact.start, exact.end - exact.start), Bytes.asSlice(&stable))
@@ -95157,6 +95476,12 @@ impl Semantic {
       if !ephemeralFrontier() { run Merge.add(&mut merge, &image, List<usize>.asSlice(&selected)) }
       shard = shard + usize.ONE
     }
+    if good && !run Semantic.aggregateFrontierSweeps(&mut self.*, List<SweepFragments.Packet>.asSlice(&sweepChunks),
+      &mut completedSweeps, &mut coverage) {
+      run frontierTrace(b"declaration coverage refused", self.frontierSplit, List<SweepFragments.Packet>.length(&sweepChunks), usize.ZERO)
+      good = false
+    }
+    run frontierTrace(b"declaration coverage", self.frontierSplit, List<SweepFragments.Packet>.length(&sweepChunks), List<ModuleCheckMemo>.length(&completedSweeps))
     run frontierTrace(b"record counts", self.frontierSplit, List<BuildRecord.Record>.length(&records), self.frontierExpected)
     run frontierTrace(b"runtime and coverage counts", self.frontierSplit, runtimeRecords, List<FrontierCoverage>.length(&coverage))
     if !good || runtimeRecords != workers.length || List<BuildRecord.Record>.length(&records) < self.frontierExpected {
@@ -95225,6 +95550,8 @@ impl Semantic {
     ? &mut Allocator | &mut Types {
     self.frontierCoverage = List<FrontierCoverage>.make()
     self.frontierSweepUnits = List<usize>.make()
+    self.frontierSweepChunks = List<SweepFragments.Packet>.make()
+    self.frontierRosters = List<FrontierModuleRoster>.make()
     let selected = Option<ModuleId>.some(ModuleId.copy(runtime))
     if !Graph.recording(&self.resolver.graph) {
       let mut started = List<ModuleId>.make()
@@ -95252,6 +95579,7 @@ impl Semantic {
     let mut concrete = List<DeclarationId>.make()
     let memos = List<ModuleCheckMemo>.asSlice(&self.moduleMemos)
     run mergeSweep(&mut result, &mut concrete, &memos[found].sweep)
+    self.frontierChecked = run copySlots(List<usize>.asSlice(&modules))
     self.frontierExpected = List<usize>.length(&modules) + 3
     self.frontierStarted = run frontierNow()
     self.frontierAvailable = self.processWorkersAllowed && !self.resolver.revisable && frontierExperiment() && checked.length > 32
@@ -96776,6 +97104,7 @@ impl Semantic {
         self.frontierClaims = makeFrontierClaims()
         self.frontierForkControl = makeFrontierForkControl()
         run List<CheckWorker>.reserve(&mut self.frontierChildren, usize.ONE)
+        self.frontierChunks = makeFrontierChunks(List<usize>.length(&self.frontierChecked))
         let prior = List<InstanceKey>.asSlice(&visited)
         let mut keyAt = usize.ZERO
         while keyAt < prior.length {
@@ -96849,6 +97178,10 @@ impl Semantic {
             drop unsafe FrontierHost.unmapShared(value, 4096)
           }
           self.frontierForkControl = Option<[*]mut u64>.none()
+          if let Option<[*]mut u64>.Some {value} = move self.frontierChunks {
+            drop unsafe FrontierHost.unmapShared(value, List<usize>.length(&self.frontierChecked) * 16)
+          }
+          self.frontierChunks = Option<[*]mut u64>.none()
           let accepted = match move joined {
             Result<bool, Cycle | OutOfMemoryError>.Success {value} => value
             Result<bool, Cycle | OutOfMemoryError>.Failure {error} => { fail move error }
