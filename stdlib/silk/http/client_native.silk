@@ -2078,6 +2078,13 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     // up each host once rather than once for each new connection. The system lookup blocks the
     // thread, so each one stalls every worker.
     resolved: List<ResolvedOrigin>,
+    // The workers that drive an HTTP/2 connection which more jobs can share. It has room for every
+    // worker, so adding one never allocates.
+    mux: List<MuxEntry>,
+    // The queue of each worker for the jobs other workers forward to it.
+    sides: List<Option<Sender<Forwarded>>>,
+    // How many jobs share one connection; see `muxStreams`.
+    muxStreams: usize,
   }
 
   // A job for a worker, and the request it belongs to.
@@ -2149,7 +2156,19 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     if open < MAX_IDLE {
       run List<Box<IdleConnection>>.reserveExact(&mut pool, MAX_IDLE - open)
     }
-    let state = run Shared<BatchState>.make(BatchState {pool: move pool, trust: move trust, resolved: List<ResolvedOrigin>.make()})
+    let mut mux = List<MuxEntry>.make()
+    run List<MuxEntry>.reserveExact(&mut mux, workers)
+    let mut sides = List<Option<Sender<Forwarded>>>.make()
+    run List<Option<Sender<Forwarded>>>.reserveExact(&mut sides, workers)
+    let mut sideQueues = List<Receiver<Forwarded>>.make()
+    run List<Receiver<Forwarded>>.reserveExact(&mut sideQueues, workers)
+    while List<Option<Sender<Forwarded>>>.length(&sides) < workers {
+      let channel = run Channel<Forwarded>.make(muxStreams(workers))
+      let Channel<Forwarded> {sender, receiver} = move channel
+      let _sender = List<Option<Sender<Forwarded>>>.appendWithinCapacity(&mut sides, Option<Sender<Forwarded>>.some(move sender))
+      let _receiver = List<Receiver<Forwarded>>.appendWithinCapacity(&mut sideQueues, move receiver)
+    }
+    let state = run Shared<BatchState>.make(BatchState {pool: move pool, trust: move trust, resolved: List<ResolvedOrigin>.make(), mux: move mux, sides: move sides, muxStreams: muxStreams(workers)})
     let mut queues = List<Sender<Indexed>>.make()
     run List<Sender<Indexed>>.reserveExact(&mut queues, workers)
     // The workers without a job.
@@ -2165,7 +2184,8 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
       let _free = List<usize>.appendWithinCapacity(&mut free, workers - usize.ONE - worker)
       let copied = run copyPlan(plan)
       let back = run done.clone()
-      let fiber = run Fiber<(), never>.forkChild(batchWorker(Shared<BatchState>.clone(&state), move receiver, move back, worker, move copied))
+      let side = List<Receiver<Forwarded>>.remove(&mut sideQueues, usize.ZERO)
+      let fiber = run Fiber<(), never>.forkChild(batchWorker(Shared<BatchState>.clone(&state), move receiver, move side, move back, worker, move copied))
       let _added = List<Fiber<(), never>>.appendWithinCapacity(&mut running, move fiber)
     }
     drop done
@@ -2277,19 +2297,19 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   }
 
   // One worker task of a batch. Its clock parks only this task while the socket waits.
-  effect fn batchWorker(state: Shared<BatchState>, jobs: Receiver<Indexed>, done: Sender<Settled>, worker: usize, plan: TrustPlan) -> () ? &mut Scheduler | &mut MonotonicClock {
+  effect fn batchWorker(state: Shared<BatchState>, jobs: Receiver<Indexed>, side: Receiver<Forwarded>, done: Sender<Settled>, worker: usize, plan: TrustPlan) -> () ? &mut Scheduler | &mut MonotonicClock {
     // The services that do not depend on the request are given once for all the jobs of this
     // task, so a request does not pay for a provider layer of each.
     let mut allocator = Allocator.systemAllocatorProvider()
     let mut wall = OsSystemClock.make()
     let mut random = OsRandom.make()
-    return run workBatch(move state, &jobs, &done, worker, &plan)
+    return run workBatch(move state, &jobs, &side, &done, worker, &plan)
       |> Effect.provideMut<Allocator>(&mut allocator)
       |> Effect.provideMut<SystemClock>(&mut wall)
       |> Effect.provideMut<Random>(&mut random)
   }
 
-  effect fn workBatch(state: Shared<BatchState>, jobs: &Receiver<Indexed>, done: &Sender<Settled>, worker: usize, plan: &TrustPlan) -> ()
+  effect fn workBatch(state: Shared<BatchState>, jobs: &Receiver<Indexed>, side: &Receiver<Forwarded>, done: &Sender<Settled>, worker: usize, plan: &TrustPlan) -> ()
   ? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random {
     // A job holds its connection in this list while it runs, and the list keeps its memory for the
     // next job.
@@ -2301,25 +2321,703 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
         Option.None => { break }
         Option.Some {value} => move value
       }
-      let mut connection = Option<Box<IdleConnection>>.none()
-      match Shared<BatchState>.withMut<Checkout>(&state, checkOut(&Box<PendingJob>.get(&pending)[usize.ZERO])) {
-        Checkout.Fresh => {}
-        Checkout.Reuse {connection: open} => { connection = Option<Box<IdleConnection>>.some(move open) }
-        Checkout.Close {connection: stale} => run closeIdle(move stale)
+      // A worker driving an HTTP/2 connection to the job's origin takes it when it has room.
+      let handed = forward(&state, Forwarded {owner: worker, index: index, pending: move pending})
+      let job = match move handed {
+        Option.None => { continue }
+        Option.Some {value} => move value
       }
-      // `idle` is empty here, and holds at most the connection of this job after the exchange.
-      let outcome = run outcomeOf(run jobExchange(&mut idle, &mut trust, plan, Job {pending: move pending, connection: move connection}))
-      if let Option.Some {value} = List<Box<IdleConnection>>.pop(&mut idle) {
-        if let Option.Some {value: evicted} = Shared<BatchState>.withMut<Option<Box<IdleConnection>>>(&state, giveBack(move value)) {
-          run closeIdle(move evicted)
+      match Shared<BatchState>.withMut<Checkout>(&state, checkOut(&Box<PendingJob>.get(&job.pending)[usize.ZERO])) {
+        Checkout.Fresh => run plainJob(&state, &mut idle, &mut trust, plan, done, move job, Option<Box<IdleConnection>>.none())
+        Checkout.Reuse {connection: open} => {
+          if isHttp2Connection(&open) {
+            // This worker drives the connection, and the jobs to its origin share it.
+            let left = run Effect.result(muxLoop(&state, jobs, side, done, worker, move open, move job))
+            let mut retry = match move left {
+              Result.Success {value} => move value
+              Result.Failure {..} => Intrinsic.trap("sendAll: out of memory while sharing an HTTP/2 connection")
+            }
+            while List<Forwarded>.length(&retry) > usize.ZERO {
+              let again = List<Forwarded>.remove(&mut retry, usize.ZERO)
+              let checked = Shared<BatchState>.withMut<Checkout>(&state, checkOut(&Box<PendingJob>.get(&again.pending)[usize.ZERO]))
+              let mut kept = Option<Box<IdleConnection>>.none()
+              match move checked {
+                Checkout.Fresh => {}
+                Checkout.Reuse {connection: reused} => { kept = Option<Box<IdleConnection>>.some(move reused) }
+                Checkout.Close {connection: stale} => run closeIdle(move stale)
+              }
+              run plainJob(&state, &mut idle, &mut trust, plan, done, move again, move kept)
+            }
+          } else {
+            run plainJob(&state, &mut idle, &mut trust, plan, done, move job, Option<Box<IdleConnection>>.some(move open))
+          }
+        }
+        Checkout.Close {connection: stale} => {
+          run closeIdle(move stale)
+          run plainJob(&state, &mut idle, &mut trust, plan, done, move job, Option<Box<IdleConnection>>.none())
         }
       }
-      // The root task takes every result before it closes the queue, so the send succeeds.
-      let sent = run done.send(Settled {worker: worker, index: index, outcome: move outcome})
-      drop sent
     }
     drop trust
     return ()
+  }
+
+  // Runs `job` on its own connection, `connection` when one was kept, and sends its result.
+  effect fn plainJob(state: &Shared<BatchState>, idle: &mut List<Box<IdleConnection>>, trust: &mut JobTrust, plan: &TrustPlan, done: &Sender<Settled>, job: Forwarded, connection: Option<Box<IdleConnection>>) -> ()
+  ? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random {
+    let Forwarded {owner, index, pending} = move job
+    // `idle` is empty here, and holds at most the connection of this job after the exchange.
+    let outcome = run outcomeOf(run jobExchange(&mut idle.*, &mut trust.*, plan, Job {pending: move pending, connection: move connection}))
+    if let Option.Some {value} = List<Box<IdleConnection>>.pop(&mut idle.*) {
+      if let Option.Some {value: evicted} = Shared<BatchState>.withMut<Option<Box<IdleConnection>>>(&state.*, giveBack(move value)) {
+        run closeIdle(move evicted)
+      }
+    }
+    // The root task takes every result before it closes the queue, so the send succeeds.
+    let sent = run done.send(Settled {worker: owner, index: index, outcome: move outcome})
+    drop sent
+  }
+
+  // Up to this many requests of `sendAll` share one HTTP/2 connection. Servers allow at least
+  // 100 streams by default, and a few streams on a connection already let one write and one read
+  // carry several requests.
+  const MUX_STREAMS: usize = 16
+
+  // The requests that share one HTTP/2 connection when `workers` run at once: a quarter of them,
+  // so that a batch spreads over about four connections and a server can answer them in
+  // parallel, and at most `MUX_STREAMS`.
+  fn muxStreams(workers: usize) -> usize {
+    let share = (workers + 3) / 4
+    if share > MUX_STREAMS { return MUX_STREAMS }
+    if share == usize.ZERO { return usize.ONE }
+    return share
+  }
+
+  // A job that a worker hands to the worker driving an HTTP/2 connection to its origin. `owner`
+  // is the worker the root task gave it to, which its result names.
+  struct Forwarded {
+    owner: usize,
+    index: usize,
+    pending: Box<PendingJob>,
+  }
+
+  // A worker that drives an HTTP/2 connection and takes more jobs for its origin.
+  struct MuxEntry {
+    origin: Origin,
+    worker: usize,
+    // The jobs it holds or that are on their way to it.
+    active: usize,
+    // Whether it takes more jobs.
+    open: bool,
+  }
+
+  // One request on a shared HTTP/2 connection.
+  struct MuxStream {
+    owner: usize,
+    index: usize,
+    pending: Box<PendingJob>,
+    id: u32,
+    sent: usize,
+    deadline: Instant,
+    status: u16,
+    head: Option<OwnedResponseHead>,
+    body: Bytes,
+  }
+
+  // How a stream on a shared connection ended.
+  union MuxResult {
+    Answer {received: Received},
+    Fail {error: HttpError},
+    // The server did not process it: it goes again on another connection.
+    Again,
+  }
+
+  struct MuxEnded {
+    stream: MuxStream,
+    result: MuxResult,
+  }
+
+  // The worker driving an HTTP/2 connection to `origin` with the most jobs that still has room,
+  // or `usize.MAX`. It counts the job it is given.
+  fn chooseMux(state: &mut BatchState, origin: Origin, owner: usize) -> usize {
+    let entries = List<MuxEntry>.asMutSlice(&mut state.mux)
+    let mut best = usize.MAX
+    let mut bestActive = usize.ZERO
+    let mut index = usize.ZERO
+    while index < entries.length {
+      let entry = &entries[index]
+      if entry.open && entry.active < state.muxStreams && entry.worker != owner && Origin.equals(&entry.origin, &origin) {
+        if best == usize.MAX || entry.active > bestActive {
+          best = index
+          bestActive = entry.active
+        }
+      }
+      index = index + usize.ONE
+    }
+    if best == usize.MAX { return usize.MAX }
+    entries[best].active = bestActive + usize.ONE
+    return entries[best].worker
+  }
+
+  // Takes the forwarding queue of `worker` out of the state, so that a send wakes the worker
+  // without the state borrowed.
+  fn takeSide(state: &mut BatchState, worker: usize) -> Option<Sender<Forwarded>> {
+    let sides = List<Option<Sender<Forwarded>>>.asMutSlice(&mut state.sides)
+    return Intrinsic.replace(sides[worker], Option<Sender<Forwarded>>.none())
+  }
+
+  fn putSide(state: &mut BatchState, worker: usize, side: Sender<Forwarded>) -> () {
+    let sides = List<Option<Sender<Forwarded>>>.asMutSlice(&mut state.sides)
+    sides[worker] = Option<Sender<Forwarded>>.some(move side)
+  }
+
+  // Gives `job` to the worker driving an HTTP/2 connection to its origin with the most jobs that
+  // still has room, and gives it back when there is none.
+  fn forward(state: &Shared<BatchState>, job: Forwarded) -> Option<Forwarded> {
+    let origin = Box<PendingJob>.get(&job.pending)[usize.ZERO].request.origin()
+    let target = Shared<BatchState>.withMut<usize>(&state.*, chooseMux(origin, job.owner))
+    if target == usize.MAX { return Option<Forwarded>.some(move job) }
+    let side = match Shared<BatchState>.withMut<Option<Sender<Forwarded>>>(&state.*, takeSide(target)) {
+      Option.Some {value} => move value
+      Option.None => Intrinsic.trap("sendAll: a forwarding queue is in use")
+    }
+    let sent = side.trySend(move job)
+    Shared<BatchState>.withMut<()>(&state.*, putSide(target, move side))
+    return match move sent {
+      TrySend.Sent => Option<Forwarded>.none()
+      TrySend.Full {value} => {
+        Shared<BatchState>.withMut<()>(&state.*, muxDone(target))
+        Option<Forwarded>.some(move value)
+      }
+      TrySend.Closed {value} => {
+        Shared<BatchState>.withMut<()>(&state.*, muxDone(target))
+        Option<Forwarded>.some(move value)
+      }
+    }
+  }
+
+  fn streamLimit(state: &BatchState) -> usize {
+    return state.muxStreams
+  }
+
+  fn muxAt(state: &BatchState, worker: usize) -> usize {
+    let entries = List<MuxEntry>.asSlice(&state.mux)
+    let mut index = usize.ZERO
+    while index < entries.length {
+      if entries[index].worker == worker { return index }
+      index = index + usize.ONE
+    }
+    return usize.MAX
+  }
+
+  fn muxRegister(state: &mut BatchState, entry: MuxEntry) -> () {
+    let _added = List<MuxEntry>.appendWithinCapacity(&mut state.mux, move entry)
+  }
+
+  fn muxRemove(state: &mut BatchState, worker: usize) -> () {
+    let at = muxAt(&state.*, worker)
+    if at != usize.MAX { drop List<MuxEntry>.remove(&mut state.mux, at) }
+  }
+
+  fn muxClose(state: &mut BatchState, worker: usize) -> () {
+    let at = muxAt(&state.*, worker)
+    if at != usize.MAX {
+      let entries = List<MuxEntry>.asMutSlice(&mut state.mux)
+      entries[at].open = false
+    }
+  }
+
+  fn muxAdd(state: &mut BatchState, worker: usize) -> () {
+    let at = muxAt(&state.*, worker)
+    if at != usize.MAX {
+      let entries = List<MuxEntry>.asMutSlice(&mut state.mux)
+      entries[at].active = entries[at].active + usize.ONE
+    }
+  }
+
+  fn muxDone(state: &mut BatchState, worker: usize) -> () {
+    let at = muxAt(&state.*, worker)
+    if at != usize.MAX {
+      let entries = List<MuxEntry>.asMutSlice(&mut state.mux)
+      if entries[at].active > usize.ZERO { entries[at].active = entries[at].active - usize.ONE }
+    }
+  }
+
+  // Whether `left` comes before `right`.
+  fn earlier(left: &Instant, right: &Instant) -> bool {
+    let a = SystemClock.seconds(left)
+    let b = SystemClock.seconds(right)
+    return a < b || (a == b && SystemClock.nanoseconds(left) < SystemClock.nanoseconds(right))
+  }
+
+  fn copyInstant(value: &Instant) -> Instant {
+    return SystemClock.make(SystemClock.seconds(value), SystemClock.nanoseconds(value))
+  }
+
+  fn http2Of(connection: &mut Box<IdleConnection>) -> &mut Http2Link {
+    let entry = &mut Box<IdleConnection>.getMut(&mut connection.*)[usize.ZERO]
+    return match &mut entry.link {
+      Link.Http2 {link} => &mut Box<Http2Link>.getMut(&mut link)[usize.ZERO]
+      Link.Http1 {..} => Intrinsic.trap("sendAll: a shared connection does not speak HTTP/2")
+    }
+  }
+
+  fn isHttp2Connection(connection: &Box<IdleConnection>) -> bool {
+    let entry = &Box<IdleConnection>.get(&connection.*)[usize.ZERO]
+    return match &entry.link {
+      Link.Http2 {..} => true
+      Link.Http1 {..} => false
+    }
+  }
+
+  // Sends the result of the job at `index` of `owner`, which this worker drove.
+  effect fn settleMux(state: &Shared<BatchState>, done: &Sender<Settled>, worker: usize, owner: usize, index: usize, result: Result<Received, HttpError | OutOfMemoryError>) -> ()
+  ? &mut Allocator {
+    Shared<BatchState>.withMut<()>(&state.*, muxDone(worker))
+    let outcome = run outcomeOf(move result)
+    // The root task takes every result before it closes the queue, so the send succeeds.
+    let sent = run done.send(Settled {worker: owner, index: index, outcome: move outcome})
+    drop sent
+  }
+
+  // Opens a stream for `job` on `driver`.
+  effect fn muxOpen(driver: &mut Driver, job: &PendingJob, secure: bool) -> u32
+  ! HttpError | ProtocolError | OutOfMemoryError
+  ? &mut Allocator {
+    let rewritten = run rewriteRequest(job.request.bytes(), secure)
+    let fields = run fieldsOf(&rewritten)
+    return run Http2Connection.open(Driver.connection(&mut driver.*), List<Http2Field<'_>>.asSlice(&fields), Bytes.length(&job.body) == usize.ZERO)
+  }
+
+  fn streamAt(streams: &List<MuxStream>, id: u32) -> usize {
+    let all = List<MuxStream>.asSlice(&streams.*)
+    let mut index = usize.ZERO
+    while index < all.length {
+      if all[index].id == id { return index }
+      index = index + usize.ONE
+    }
+    return usize.MAX
+  }
+
+  // Moves the stream at `at` out of `streams` with how it ended. A failed stream is reset, so the
+  // server stops sending it.
+  effect fn endStream(driver: &mut Driver, streams: &mut List<MuxStream>, at: usize, result: MuxResult, ended: &mut List<MuxEnded>) -> ()
+  ! ProtocolError | OutOfMemoryError
+  ? &mut Allocator {
+    let stream = List<MuxStream>.remove(&mut streams.*, at)
+    if let MuxResult.Fail {..} = &result {
+      // CANCEL: the client no longer wants the response.
+      run Http2Connection.reset(Driver.connection(&mut driver.*), stream.id, 8)
+    }
+    run List<MuxEnded>.append(&mut ended.*, MuxEnded {stream: move stream, result: move result})
+  }
+
+  // The result of a stream whose final response and body have arrived.
+  effect fn answered(stream: &mut MuxStream) -> MuxResult ! OutOfMemoryError ? &mut Allocator {
+    let head = Intrinsic.replace(stream.head, Option<OwnedResponseHead>.none())
+    let kept = match move head {
+      Option.Some {value} => move value
+      Option.None => { return MuxResult.Fail {error: HttpError.make(HttpErrorKind.Protocol, "The HTTP/2 response has no head.")} }
+    }
+    let mut location = Option<String>.none()
+    if isRedirect(stream.status) {
+      let found = run Effect.result(redirectLocation(&kept))
+      match move found {
+        Result.Success {value} => { location = move value }
+        Result.Failure {error} => match move error {
+          HttpError failure => { return MuxResult.Fail {error: move failure} }
+          OutOfMemoryError exhausted => { fail move exhausted }
+        }
+      }
+    }
+    let body = Intrinsic.replace(stream.body, Bytes.make())
+    let parts = run Box<ReceivedParts>.make(ReceivedParts {status: stream.status, head: move kept, body: move body, location: move location})
+    return MuxResult.Answer {received: Received {parts: move parts}}
+  }
+
+  // What one step of a shared connection gives: the streams that ended, and whether the
+  // connection can carry more.
+  struct MuxStepped {
+    ended: List<MuxEnded>,
+    // The connection still reads and writes.
+    alive: bool,
+    // The connection takes new streams.
+    accepting: bool,
+  }
+
+  // Sends what the streams can, then takes one event from the connection and applies it.
+  effect fn muxStep(driver: &mut Driver, streams: &mut List<MuxStream>) -> MuxStepped
+  ! ProtocolError | TransportError | OutOfMemoryError
+  ? &mut HttpTransport | &mut Allocator | &mut MonotonicClock | &mut Random {
+    let mut ended = List<MuxEnded>.make()
+    // Request bodies, as far as the flow-control windows allow.
+    let mut at = usize.ZERO
+    while at < List<MuxStream>.length(&streams.*) {
+      let all = List<MuxStream>.asMutSlice(&mut streams.*)
+      let stream = &mut all[at]
+      let payload = Bytes.asSlice(&Box<PendingJob>.get(&stream.pending)[usize.ZERO].body)
+      while stream.sent < payload.length {
+        let wrote = run Http2Connection.sendData(Driver.connection(&mut driver.*), stream.id, Slice.view<u8>(payload, stream.sent, payload.length - stream.sent), true)
+        if wrote == usize.ZERO { break }
+        stream.sent = stream.sent + wrote
+      }
+      at = at + usize.ONE
+    }
+    // The streams whose deadline passed fail; the others wait until the earliest one left.
+    let now = run MonotonicClock.now()
+    at = usize.ZERO
+    while at < List<MuxStream>.length(&streams.*) {
+      if earlier(&List<MuxStream>.asSlice(&streams.*)[at].deadline, &now) {
+        run endStream(&mut driver.*, &mut streams.*, at, MuxResult.Fail {error: HttpError.make(HttpErrorKind.Timeout, "The request deadline passed.")}, &mut ended)
+      } else {
+        at = at + usize.ONE
+      }
+    }
+    let all = List<MuxStream>.asSlice(&streams.*)
+    if all.length == usize.ZERO {
+      run Driver.flush(&mut driver.*, Option<Instant>.none())
+      return MuxStepped {ended: move ended, alive: true, accepting: true}
+    }
+    let mut earliest = copyInstant(&all[0].deadline)
+    at = usize.ONE
+    while at < all.length {
+      if earlier(&all[at].deadline, &earliest) { earliest = copyInstant(&all[at].deadline) }
+      at = at + usize.ONE
+    }
+    drop all
+    let next = run Effect.result(Driver.next(&mut driver.*, Option<Instant>.some(move earliest)))
+    let event = match move next {
+      Result.Success {value} => match move value {
+        Option.Some {value: found} => move found
+        Option.None => { return MuxStepped {ended: move ended, alive: false, accepting: false} }
+      }
+      Result.Failure {error} => match move error {
+        TransportError failure => {
+          if transportTimedOut(&failure) {
+            // The transport may hold part of a record, so the connection goes; the streams still
+            // in time go again on another connection.
+            drop failure
+            let later = run MonotonicClock.now()
+            at = usize.ZERO
+            while at < List<MuxStream>.length(&streams.*) {
+              if earlier(&List<MuxStream>.asSlice(&streams.*)[at].deadline, &later) {
+                run endStream(&mut driver.*, &mut streams.*, at, MuxResult.Fail {error: HttpError.make(HttpErrorKind.Timeout, "The request deadline passed.")}, &mut ended)
+              } else {
+                at = at + usize.ONE
+              }
+            }
+            return MuxStepped {ended: move ended, alive: false, accepting: false}
+          }
+          fail move failure
+        }
+        ProtocolError failure => { fail move failure }
+        OutOfMemoryError exhausted => { fail move exhausted }
+      }
+    }
+    let mut accepting = true
+    match move event {
+      Http2Event.Headers {stream, fields: received, endStream: last} => {
+        let at = streamAt(&streams.*, stream)
+        if at != usize.MAX {
+          if List<MuxStream>.asSlice(&streams.*)[at].status == 0 {
+            let code = statusField(&received)
+            if code < 100 || code > 999 {
+              run endStream(&mut driver.*, &mut streams.*, at, MuxResult.Fail {error: HttpError.make(HttpErrorKind.Protocol, "The HTTP/2 response has no valid :status.")}, &mut ended)
+              return MuxStepped {ended: move ended, alive: true, accepting: true}
+            }
+            // An informational response comes before the final one.
+            if code >= 200 {
+              let made = run Effect.result(headOf(code, &received))
+              match move made {
+                Result.Success {value} => {
+                  let entry = &mut List<MuxStream>.asMutSlice(&mut streams.*)[at]
+                  entry.status = code
+                  entry.head = Option<OwnedResponseHead>.some(move value)
+                }
+                Result.Failure {error} => match move error {
+                  HttpError failure => {
+                    run endStream(&mut driver.*, &mut streams.*, at, MuxResult.Fail {error: move failure}, &mut ended)
+                    return MuxStepped {ended: move ended, alive: true, accepting: true}
+                  }
+                  OutOfMemoryError exhausted => { fail move exhausted }
+                }
+              }
+            }
+          }
+          if last && List<MuxStream>.asSlice(&streams.*)[at].status != 0 {
+            let result = run answered(&mut List<MuxStream>.asMutSlice(&mut streams.*)[at])
+            run endStream(&mut driver.*, &mut streams.*, at, move result, &mut ended)
+          }
+        }
+      }
+      Http2Event.Data {stream, bytes, endStream: last} => {
+        let count = Bytes.length(&bytes)
+        if count > usize.ZERO {
+          run Http2Connection.release(Driver.connection(&mut driver.*), stream, usize.toU32(count))
+        }
+        let at = streamAt(&streams.*, stream)
+        if at != usize.MAX {
+          let entry = &mut List<MuxStream>.asMutSlice(&mut streams.*)[at]
+          let limit = Box<PendingJob>.get(&entry.pending)[usize.ZERO].maxBody
+          if count > limit - Bytes.length(&entry.body) {
+            let status = entry.status
+            run endStream(&mut driver.*, &mut streams.*, at, MuxResult.Fail {error: HttpError {
+              kind: HttpErrorKind.TooLarge,
+              message: "The response body exceeds the configured limit.",
+              status: Option<u16>.some(status),
+              cause: HttpCause.None,
+            }}, &mut ended)
+            return MuxStepped {ended: move ended, alive: true, accepting: true}
+          }
+          run Bytes.append(&mut entry.body, Bytes.asSlice(&bytes))
+          if last {
+            let result = run answered(&mut List<MuxStream>.asMutSlice(&mut streams.*)[at])
+            run endStream(&mut driver.*, &mut streams.*, at, move result, &mut ended)
+          }
+        }
+      }
+      Http2Event.Reset {stream, code} => {
+        let at = streamAt(&streams.*, stream)
+        if at != usize.MAX {
+          // REFUSED_STREAM means the server did not process the request (RFC 9113 section 8.7).
+          let refused = code == 7 && List<MuxStream>.asSlice(&streams.*)[at].status == 0
+          let gone = List<MuxStream>.remove(&mut streams.*, at)
+          if refused {
+            run List<MuxEnded>.append(&mut ended, MuxEnded {stream: move gone, result: MuxResult.Again})
+          } else {
+            run List<MuxEnded>.append(&mut ended, MuxEnded {stream: move gone, result: MuxResult.Fail {error: HttpError.make(HttpErrorKind.Protocol, "The server reset the HTTP/2 stream.")}})
+          }
+        }
+      }
+      Http2Event.StreamError {stream, code} => {
+        drop code
+        let at = streamAt(&streams.*, stream)
+        if at != usize.MAX {
+          run endStream(&mut driver.*, &mut streams.*, at, MuxResult.Fail {error: HttpError.make(HttpErrorKind.Protocol, "The HTTP/2 response is malformed.")}, &mut ended)
+        }
+      }
+      Http2Event.Goaway {lastStream, code, debug} => {
+        drop code
+        drop debug
+        accepting = false
+        // The server will not answer the streams after `lastStream`: they go again.
+        at = usize.ZERO
+        while at < List<MuxStream>.length(&streams.*) {
+          if List<MuxStream>.asSlice(&streams.*)[at].id > lastStream {
+            let gone = List<MuxStream>.remove(&mut streams.*, at)
+            run List<MuxEnded>.append(&mut ended, MuxEnded {stream: move gone, result: MuxResult.Again})
+          } else {
+            at = at + usize.ONE
+          }
+        }
+      }
+      _ => {}
+    }
+    return MuxStepped {ended: move ended, alive: true, accepting: accepting}
+  }
+
+  // A stream whose connection failed: it goes again when the server never answered it and the
+  // request may repeat, and fails otherwise.
+  effect fn retryOrFail(state: &Shared<BatchState>, done: &Sender<Settled>, worker: usize, retry: &mut List<Forwarded>, stream: MuxStream) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+    let MuxStream {owner, index, pending, status, ..} = move stream
+    if status == 0 && Box<PendingJob>.get(&pending)[usize.ZERO].idempotent {
+      Shared<BatchState>.withMut<()>(&state.*, muxDone(worker))
+      run List<Forwarded>.append(&mut retry.*, Forwarded {owner: owner, index: index, pending: move pending})
+      return ()
+    }
+    drop pending
+    run settleMux(&state.*, done, worker, owner, index, Result<Received, HttpError | OutOfMemoryError>.failResult(
+      HttpError.make(HttpErrorKind.Protocol, "The HTTP/2 connection closed before the response ended.")))
+  }
+
+  // Drives the HTTP/2 connection `connection` for `first` and for the jobs to its origin that the
+  // root task or other workers give this worker while it has streams open, and sends each result
+  // as it ends. The connection goes back to the pool when no stream is left. It returns the jobs
+  // it could not finish, for the caller to send on other connections.
+  effect fn muxLoop(
+    state: &Shared<BatchState>,
+    jobs: &Receiver<Indexed>,
+    side: &Receiver<Forwarded>,
+    done: &Sender<Settled>,
+    worker: usize,
+    connection: Box<IdleConnection>,
+    first: Forwarded,
+  ) -> List<Forwarded>
+  ! OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock | &mut Random {
+    let mut link = move connection
+    let origin = Box<IdleConnection>.get(&link)[usize.ZERO].origin
+    let secure = Origin.secure(&origin)
+    Shared<BatchState>.withMut<()>(&state.*, muxRegister(MuxEntry {origin: origin, worker: worker, active: usize.ONE, open: true}))
+    let mut streams = List<MuxStream>.make()
+    let mut waiting = List<Forwarded>.make()
+    let mut retry = List<Forwarded>.make()
+    let mut deferred = Option<Indexed>.none()
+    let mut alive = true
+    let mut accepting = true
+    let mut incoming = Option<Forwarded>.some(move first)
+    let mut idleTurns = usize.ZERO
+    while true {
+      // Take the new jobs: the one in hand, those other workers forwarded, and those the root task
+      // gave this worker for the same origin.
+      while true {
+        if let Option.None = &incoming {
+          if let TryReceive.Received {value} = side.tryReceive() {
+            incoming = Option<Forwarded>.some(move value)
+          }
+        }
+        if let Option.None = &incoming {
+          if accepting {
+            if let Option.None = &deferred {
+              if let TryReceive.Received {value} = jobs.tryReceive() {
+                let Indexed {index, pending} = move value
+                let same = Origin.equals(&Box<PendingJob>.get(&pending)[usize.ZERO].request.origin(), &origin)
+                if same && List<MuxStream>.length(&streams) + List<Forwarded>.length(&waiting) < Shared<BatchState>.with<usize>(&state.*, streamLimit) {
+                  Shared<BatchState>.withMut<()>(&state.*, muxAdd(worker))
+                  incoming = Option<Forwarded>.some(Forwarded {owner: worker, index: index, pending: move pending})
+                } else {
+                  // It waits until this connection has no stream left, and no job is forwarded
+                  // here meanwhile.
+                  Shared<BatchState>.withMut<()>(&state.*, muxClose(worker))
+                  deferred = Option<Indexed>.some(Indexed {index: index, pending: move pending})
+                }
+              }
+            }
+          }
+        }
+        let taken = Intrinsic.replace(incoming, Option<Forwarded>.none())
+        match move taken {
+          Option.None => { break }
+          Option.Some {value} => run List<Forwarded>.append(&mut waiting, move value)
+        }
+      }
+      // Open a stream for each waiting job while the server allows more.
+      while accepting && List<Forwarded>.length(&waiting) > usize.ZERO {
+        let open = http2Of(&mut link)
+        let opened = run Effect.result(muxOpen(&mut open.driver, &Box<PendingJob>.get(&List<Forwarded>.asSlice(&waiting)[0].pending)[usize.ZERO], secure))
+        match move opened {
+          Result.Success {value: id} => {
+            let Forwarded {owner, index, pending} = List<Forwarded>.remove(&mut waiting, usize.ZERO)
+            let now = run MonotonicClock.now()
+            let deadline = MonotonicClock.deadlineAfter(&now, Box<PendingJob>.get(&pending)[usize.ZERO].timeoutNanoseconds)
+            run List<MuxStream>.append(&mut streams, MuxStream {
+              owner: owner,
+              index: index,
+              pending: move pending,
+              id: id,
+              sent: usize.ZERO,
+              deadline: move deadline,
+              status: 0,
+              head: Option<OwnedResponseHead>.none(),
+              body: Bytes.make(),
+            })
+          }
+          Result.Failure {error} => match move error {
+            ProtocolError failure => {
+              // The server allows no more streams now: the job waits for one to end.
+              if failure.code == 7 && failure.stream == 0 && List<MuxStream>.length(&streams) > usize.ZERO { break }
+              accepting = false
+            }
+            HttpError failure => {
+              let job = List<Forwarded>.remove(&mut waiting, usize.ZERO)
+              run settleMux(&state.*, done, worker, job.owner, job.index, Result<Received, HttpError | OutOfMemoryError>.failResult(move failure))
+            }
+            OutOfMemoryError exhausted => { fail move exhausted }
+          }
+        }
+      }
+      if !alive { accepting = false }
+      if !accepting {
+        Shared<BatchState>.withMut<()>(&state.*, muxClose(worker))
+        let closing = http2Of(&mut link)
+        closing.closed = true
+        while List<Forwarded>.length(&waiting) > usize.ZERO {
+          Shared<BatchState>.withMut<()>(&state.*, muxDone(worker))
+          run List<Forwarded>.append(&mut retry, List<Forwarded>.remove(&mut waiting, usize.ZERO))
+        }
+      }
+      if !alive {
+        while List<MuxStream>.length(&streams) > usize.ZERO {
+          run retryOrFail(&state.*, done, worker, &mut retry, List<MuxStream>.remove(&mut streams, usize.ZERO))
+        }
+      }
+      if List<MuxStream>.length(&streams) == usize.ZERO && List<Forwarded>.length(&waiting) == usize.ZERO {
+        // The root task steps the next requests once it has the results, and the workers that
+        // receive them forward them here: two turns of the other tasks let them arrive before this
+        // worker gives the connection up.
+        if accepting && idleTurns < 2 {
+          idleTurns = idleTurns + usize.ONE
+          run Fiber.yieldNow()
+          continue
+        }
+        // Nothing is in flight. A job forwarded since the last look is taken before the entry
+        // goes, so none is left in the queue.
+        Shared<BatchState>.withMut<()>(&state.*, muxRemove(worker))
+        if let TryReceive.Received {value} = side.tryReceive() {
+          if accepting {
+            Shared<BatchState>.withMut<()>(&state.*, muxRegister(MuxEntry {origin: origin, worker: worker, active: usize.ONE, open: true}))
+            incoming = Option<Forwarded>.some(move value)
+            continue
+          }
+          run List<Forwarded>.append(&mut retry, move value)
+        }
+        break
+      }
+      idleTurns = usize.ZERO
+      let mut sentResults = false
+      let open = http2Of(&mut link)
+      let stepped = run Effect.result(muxStep(&mut open.driver, &mut streams)
+        |> Effect.provideMut<HttpTransport>(&mut open.transport))
+      match move stepped {
+        Result.Success {value} => {
+          let MuxStepped {ended, alive: still, accepting: taking} = move value
+          if !still { alive = false }
+          if !taking { accepting = false }
+          let mut finished = move ended
+          sentResults = List<MuxEnded>.length(&finished) > usize.ZERO
+          while List<MuxEnded>.length(&finished) > usize.ZERO {
+            let MuxEnded {stream, result} = List<MuxEnded>.remove(&mut finished, usize.ZERO)
+            match move result {
+              MuxResult.Answer {received} => {
+                run settleMux(&state.*, done, worker, stream.owner, stream.index, Result<Received, HttpError | OutOfMemoryError>.succeed(move received))
+              }
+              MuxResult.Fail {error} => {
+                run settleMux(&state.*, done, worker, stream.owner, stream.index, Result<Received, HttpError | OutOfMemoryError>.failResult(move error))
+              }
+              MuxResult.Again => {
+                Shared<BatchState>.withMut<()>(&state.*, muxDone(worker))
+                let MuxStream {owner, index, pending, ..} = move stream
+                run List<Forwarded>.append(&mut retry, Forwarded {owner: owner, index: index, pending: move pending})
+              }
+            }
+          }
+        }
+        Result.Failure {error} => {
+          drop error
+          alive = false
+        }
+      }
+      if sentResults {
+        // The results wake the root task; its next jobs reach this worker before it waits on the
+        // connection again.
+        run Fiber.yieldNow()
+      }
+    }
+    // The connection goes back to the pool when it can take more streams.
+    if linkReusable(&Box<IdleConnection>.get(&link)[usize.ZERO].link) {
+      if let Option.Some {value: evicted} = Shared<BatchState>.withMut<Option<Box<IdleConnection>>>(&state.*, giveBack(move link)) {
+        run closeIdle(move evicted)
+      }
+    } else {
+      run closeIdle(move link)
+    }
+    if let Option.Some {value} = move deferred {
+      let Indexed {index, pending} = move value
+      run List<Forwarded>.append(&mut retry, Forwarded {owner: worker, index: index, pending: move pending})
+    }
+    return move retry
   }
 
   fn takeSource(state: &mut BatchState) -> Option<CachedTrust> {
