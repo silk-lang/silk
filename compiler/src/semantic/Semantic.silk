@@ -164,6 +164,9 @@ import semantic.DeclarationTable
 import semantic.StableKey
 import semantic.CacheImage
 import semantic.CachePackets
+import semantic.EscapeGraph
+import semantic.EscapeGraph {Answer as EscapeAnswer}
+import semantic.EscapeGraphReach
 import semantic.BuildRecord
 import semantic.FinalProfile {Entry as ProfileEntry, FinalProfile}
 import semantic.InitialProfile {InitialProfile}
@@ -4548,6 +4551,7 @@ pub struct Semantic {
   // The escape walk records and green entries an unlinked adoption read, until a check replays or
   // replaces a record (see `replayEscapes`), and whether a replay lowered anything they lack.
   escapeImage: EscapeImage,
+  escapeGraphs: List<CachedEscapeGraph>,
   freshEscapes: bool,
   artifactKeys: List<InstanceKey>,
   artifactDigests: DigestSet,
@@ -4755,6 +4759,245 @@ fn replayRootKey(roots: &[Option<InstanceKey>], entryRoots: &[usize], index: usi
   if root >= roots.length { return Option<InstanceKey>.none() }
   if let Option<InstanceKey>.Some {value} = &roots[root] { return Option<InstanceKey>.some(InstanceKey.copy(&value)) }
   return Option<InstanceKey>.none()
+}
+
+effect fn inlineEscapeAnswer(bytes: &[u8]) -> Option<BuildRecord.Record> ! OutOfMemoryError ? &mut Allocator {
+  let record = match EscapeGraph.readInline(bytes) {
+    Option<Span>.Some {value} => value
+    Option<Span>.None => { return Option<BuildRecord.Record>.none() }
+  }
+  return run BuildRecord.decode(StableKey.view(bytes, record))
+}
+
+// Each immutable payload is decoded once per adopted image. No check owns or mutates it.
+struct CachedEscapeGraph {
+  digest: ContentHash,
+  record: BuildRecord.Record,
+  index: WalkFragments.GraphIndex,
+}
+
+fn heldImageReference<'a>(image: &'a Option<CacheImage.Image>) -> Option<&'a CacheImage.Image> {
+  return match &image.* {
+    Option<CacheImage.Image>.Some {value} => Option<&CacheImage.Image>.some(&value)
+    Option<CacheImage.Image>.None => Option<&CacheImage.Image>.none()
+  }
+}
+
+fn escapeGraphRoot(image: &CacheImage.Image, digest: ContentHash) -> usize {
+  let roots = List<CacheImage.Root>.asSlice(&image.roots)
+  let mut at = usize.ZERO
+  while at < roots.length {
+    if let Option<ContentHash>.Some {value} = EscapeGraph.readGraphKey(Bytes.asSlice(&roots[at].key)) {
+      if ContentHash.equals(value, digest) { return at }
+    }
+    at = at + usize.ONE
+  }
+  return usize.MAX
+}
+
+effect fn cachedEscapeGraph(image: &CacheImage.Image, cache: &mut List<CachedEscapeGraph>, digest: ContentHash) -> usize
+! OutOfMemoryError ? &mut Allocator {
+  let known = List<CachedEscapeGraph>.asSlice(&cache.*)
+  let mut at = usize.ZERO
+  while at < known.length {
+    if ContentHash.equals(known[at].digest, digest) { return at }
+    at = at + usize.ONE
+  }
+  let root = escapeGraphRoot(image, digest)
+  if root == usize.MAX { return usize.MAX }
+  let record = match move run EscapeGraph.decodeGraph(Bytes.asSlice(&List<CacheImage.Root>.asSlice(&image.roots)[root].answer), digest) {
+    Option<BuildRecord.Record>.Some {value} => move value
+    Option<BuildRecord.Record>.None => { return usize.MAX }
+  }
+  let index = run WalkFragments.indexGraph(&record)
+  run List<CachedEscapeGraph>.append(&mut cache.*, CachedEscapeGraph {digest: digest, record: move record, index: move index})
+  return at
+}
+
+fn escapeEntryGreen(entry: &BuildRecord.Entry, green: &DigestSet) -> bool {
+  if entry.leaf != 0 || entry.alias != usize.MAX { return true }
+  return DigestSet.find(green, entry.exact) != usize.MAX
+    && u64.bitAnd(entry.facts.flags, BuildRecord.FACT_KNOWN + BuildRecord.FACT_KEY_BYTES)
+      == BuildRecord.FACT_KNOWN + BuildRecord.FACT_KEY_BYTES
+}
+
+// Binding a green memo needs membership and exact entry evidence, not a copied walk record.
+effect fn escapeAnswerGreen(image: &CacheImage.Image, cache: &mut List<CachedEscapeGraph>, bytes: &[u8], green: &DigestSet) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  let answer = match move run EscapeGraph.decodeAnswer(bytes) {
+    Option<EscapeAnswer>.Some {value} => move value
+    Option<EscapeAnswer>.None => { return false }
+  }
+  if let EscapeAnswer.Inline {record} = &answer {
+    let decoded = match move run BuildRecord.decode(StableKey.view(bytes, record)) {
+      Option<BuildRecord.Record>.Some {value} => move value
+      Option<BuildRecord.Record>.None => { return false }
+    }
+    if decoded.patterns { return false }
+    let entries = List<BuildRecord.Entry>.asSlice(&decoded.entries)
+    let mut at = usize.ZERO
+    while at < entries.length { if !escapeEntryGreen(&entries[at], green) { return false } at = at + usize.ONE }
+    return true
+  }
+  if let EscapeAnswer.View {value: descriptor} = &answer {
+    let found = run cachedEscapeGraph(image, &mut cache.*, descriptor.graph)
+    if found == usize.MAX { return false }
+    let graph = &List<CachedEscapeGraph>.asSlice(&cache.*)[found]
+    let selected = match move run EscapeGraphReach.reachable(&graph.record, &graph.index, List<ContentHash>.asSlice(&descriptor.roots)) {
+      Option<List<usize>>.Some {value} => move value
+      Option<List<usize>>.None => { return false }
+    }
+    let entries = List<BuildRecord.Entry>.asSlice(&graph.record.entries)
+    let indexes = List<usize>.asSlice(&selected)
+    let mut at = usize.ZERO
+    while at < indexes.length { if !escapeEntryGreen(&entries[indexes[at]], green) { return false } at = at + usize.ONE }
+    return true
+  }
+  return false
+}
+
+// A selected check charges only its own reachable definitions. Other rows in its shared blob
+// are replay data, not evidence that this command demanded those definitions.
+effect fn escapeAnswerBudget(image: Option<&CacheImage.Image>, cache: &mut List<CachedEscapeGraph>, budget: &mut SpecializationBudget,
+  bytes: &[u8]) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let answer = match move run EscapeGraph.decodeAnswer(bytes) {
+    Option<EscapeAnswer>.Some {value} => move value
+    Option<EscapeAnswer>.None => { return false }
+  }
+  if let EscapeAnswer.Inline {record} = &answer {
+    if let Option<BuildRecord.Record>.Some {value} = move run BuildRecord.decode(StableKey.view(bytes, record)) {
+      return run WalkFragments.includeBudget(&mut budget.*, &value)
+    }
+    return false
+  }
+  if let EscapeAnswer.View {value: descriptor} = &answer {
+    let held = match image { Option<&CacheImage.Image>.Some {value} => value _ => { return false } }
+    let found = run cachedEscapeGraph(held, &mut cache.*, descriptor.graph)
+    if found == usize.MAX { return false }
+    let graph = &List<CachedEscapeGraph>.asSlice(&cache.*)[found]
+    let selected = match move run EscapeGraphReach.reachable(&graph.record, &graph.index, List<ContentHash>.asSlice(&descriptor.roots)) {
+      Option<List<usize>>.Some {value} => move value
+      Option<List<usize>>.None => { return false }
+    }
+    return run EscapeGraphReach.includeBudget(&mut budget.*, &graph.record, List<usize>.asSlice(&selected))
+  }
+  return false
+}
+
+// Only a demanded stale view gets a mutable record. Existing replay reconstructs keys and
+// diagnostic requester paths from this ordinary rooted record, without mutating shared rows.
+effect fn materializeEscapeAnswer(image: Option<&CacheImage.Image>, cache: &mut List<CachedEscapeGraph>, bytes: &[u8],
+  boundary: &Option<WalkBoundary>) -> Option<BuildRecord.Record> ! OutOfMemoryError ? &mut Allocator {
+  let answer = match move run EscapeGraph.decodeAnswer(bytes) {
+    Option<EscapeAnswer>.Some {value} => move value
+    Option<EscapeAnswer>.None => { return Option<BuildRecord.Record>.none() }
+  }
+  if let EscapeAnswer.Inline {record} = &answer { return run BuildRecord.decode(StableKey.view(bytes, record)) }
+  if let EscapeAnswer.View {value: descriptor} = &answer {
+    let held = match image { Option<&CacheImage.Image>.Some {value} => value _ => { return Option<BuildRecord.Record>.none() } }
+    let found = run cachedEscapeGraph(held, &mut cache.*, descriptor.graph)
+    if found == usize.MAX { return Option<BuildRecord.Record>.none() }
+    let graph = &List<CachedEscapeGraph>.asSlice(&cache.*)[found]
+    let mut record = match move run WalkFragments.rooted(&graph.record, &graph.index, List<ContentHash>.asSlice(&descriptor.roots)) {
+      Option<BuildRecord.Record>.Some {value} => move value
+      Option<BuildRecord.Record>.None => { return Option<BuildRecord.Record>.none() }
+    }
+    if let Option<WalkBoundary>.Some {value: walk} = &boundary.* {
+      if !run rebindWalkRecord(&mut record, &walk) { return Option<BuildRecord.Record>.none() }
+    } else { return Option<BuildRecord.Record>.none() }
+    return Option<BuildRecord.Record>.some(move record)
+  }
+  return Option<BuildRecord.Record>.none()
+}
+
+// Names the independently reusable entries without constructing every adopted check's slice.
+effect fn nameEscapeAnswer(image: Option<&CacheImage.Image>, cache: &mut List<CachedEscapeGraph>, bytes: &[u8], named: &mut DigestSet) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  let answer = match move run EscapeGraph.decodeAnswer(bytes) {
+    Option<EscapeAnswer>.Some {value} => move value
+    Option<EscapeAnswer>.None => { return false }
+  }
+  if let EscapeAnswer.Inline {record} = &answer {
+    let decoded = match move run BuildRecord.decode(StableKey.view(bytes, record)) {
+      Option<BuildRecord.Record>.Some {value} => move value
+      Option<BuildRecord.Record>.None => { return false }
+    }
+    let entries = List<BuildRecord.Entry>.asSlice(&decoded.entries)
+    let mut at = usize.ZERO
+    while at < entries.length {
+      if entries[at].leaf == 0 { drop run DigestSet.add(&mut named.*, entries[at].exact) }
+      at = at + usize.ONE
+    }
+    return true
+  }
+  if let EscapeAnswer.View {value: descriptor} = &answer {
+    let held = match image { Option<&CacheImage.Image>.Some {value} => value _ => { return false } }
+    let found = run cachedEscapeGraph(held, &mut cache.*, descriptor.graph)
+    if found == usize.MAX { return false }
+    let graph = &List<CachedEscapeGraph>.asSlice(&cache.*)[found]
+    let selected = match move run EscapeGraphReach.reachable(&graph.record, &graph.index, List<ContentHash>.asSlice(&descriptor.roots)) {
+      Option<List<usize>>.Some {value} => move value
+      Option<List<usize>>.None => { return false }
+    }
+    let entries = List<BuildRecord.Entry>.asSlice(&graph.record.entries)
+    let indexes = List<usize>.asSlice(&selected)
+    let mut at = usize.ZERO
+    while at < indexes.length {
+      if entries[indexes[at]].leaf == 0 { drop run DigestSet.add(&mut named.*, entries[indexes[at]].exact) }
+      at = at + usize.ONE
+    }
+    return true
+  }
+  return false
+}
+
+// Root-answer references are explicit: dependency node edges cannot carry another root's blob.
+effect fn includeEscapeBlobs(image: &CacheImage.Image, selected: &mut List<usize>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let roots = List<CacheImage.Root>.asSlice(&image.roots)
+  let count = List<usize>.length(&selected.*)
+  let mut blobs = DigestSet.make()
+  let mut at = usize.ZERO
+  while at < count {
+    let index = List<usize>.get(&selected.*, at)
+    at = at + usize.ONE
+    if index >= roots.length { continue }
+    let mut named = Span.make(usize.ZERO, usize.ZERO)
+    if buildRootKind(Bytes.asSlice(&roots[index].key), &mut named) != 3 { continue }
+    if let Option<EscapeGraph.Descriptor>.Some {value} = move run EscapeGraph.decodeDescriptor(Bytes.asSlice(&roots[index].answer)) {
+      if run DigestSet.add(&mut blobs, value.graph) {
+        let blob = escapeGraphRoot(image, value.graph)
+        if blob != usize.MAX { run List<usize>.append(&mut selected.*, blob) }
+      }
+    }
+  }
+}
+
+// Fresh-first check roots choose one descriptor. Keep only blobs referenced by those winners,
+// so repeated edits cannot accumulate unreferenced generations in the published image.
+effect fn pruneEscapeBlobs(image: &mut CacheImage.Image) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut named = ExactSet.make()
+  let mut live = DigestSet.make()
+  let roots = List<CacheImage.Root>.asSlice(&image.roots)
+  let mut at = usize.ZERO
+  while at < roots.length {
+    let root = &roots[at]
+    at = at + usize.ONE
+    let mut identity = Span.make(usize.ZERO, usize.ZERO)
+    if buildRootKind(Bytes.asSlice(&root.key), &mut identity) != 3 || !(run ExactSet.add(&mut named, Bytes.asSlice(&root.key))) { continue }
+    if let Option<EscapeGraph.Descriptor>.Some {value} = move run EscapeGraph.decodeDescriptor(Bytes.asSlice(&root.answer)) {
+      drop run DigestSet.add(&mut live, value.graph)
+    }
+  }
+  let mut kept = List<CacheImage.Root>.make()
+  while let Option<CacheImage.Root>.Some {value} = move List<CacheImage.Root>.pop(&mut image.roots) {
+    if let Option<ContentHash>.Some {value: digest} = EscapeGraph.readGraphKey(Bytes.asSlice(&value.key)) {
+      if DigestSet.find(&live, digest) == usize.MAX { continue }
+    }
+    run List<CacheImage.Root>.append(&mut kept, move value)
+  }
+  while let Option<CacheImage.Root>.Some {value} = move List<CacheImage.Root>.pop(&mut kept) {
+    run List<CacheImage.Root>.append(&mut image.roots, move value)
+  }
 }
 
 struct EscapeImage {
@@ -94229,6 +94472,7 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
     replay: Option<ReplayState>.none(),
     carriedBuild: List<usize>.make(),
     escapeImage: EscapeImage.make(),
+    escapeGraphs: List<CachedEscapeGraph>.make(),
     freshEscapes: false,
     artifactKeys: List<InstanceKey>.make(),
     artifactDigests: DigestSet.make(),
@@ -94955,6 +95199,7 @@ impl Semantic {
     ! Cycle | OutOfMemoryError ? &mut Allocator | &mut Types {
     // Record indices belong to exactly one held image, including when an existing store adopts another.
     Semantic.clearEscapeBudgetRecords(&mut self.*)
+    self.escapeGraphs = List<CachedEscapeGraph>.make()
     self.reusableAdoptedChecks = false
     let mut held = move image
     let attempted = run Effect.result(Semantic.adoptFrom(&mut self.*, request, &mut held, linked))
@@ -95194,6 +95439,7 @@ impl Semantic {
       let node = List<usize>.get(&units, root.node)
       let mut exact = Span.make(usize.ZERO, usize.ZERO)
       let kind = buildRootKind(Bytes.asSlice(&root.key), &mut exact)
+      if kind == 6 { continue }
       if kind == 1 {
         if node != usize.MAX { recordRoot = at - usize.ONE }
         continue
@@ -95287,24 +95533,7 @@ impl Semantic {
     while at < candidates.length {
       let root = candidates[at]
       at = at + usize.ONE
-      let record = match move run BuildRecord.decode(Bytes.asSlice(&roots[root].answer)) {
-        Option<BuildRecord.Record>.Some {value} => move value
-        Option<BuildRecord.Record>.None => { continue }
-      }
-      if record.patterns { continue }
-      let entries = List<BuildRecord.Entry>.asSlice(&record.entries)
-      let mut complete = true
-      let mut entry = usize.ZERO
-      while entry < entries.length && complete {
-        let value = &entries[entry]
-        if value.leaf == 0 && value.alias == usize.MAX {
-          complete = DigestSet.find(green, value.exact) != usize.MAX
-            && u64.bitAnd(value.facts.flags, BuildRecord.FACT_KNOWN + BuildRecord.FACT_KEY_BYTES)
-              == BuildRecord.FACT_KNOWN + BuildRecord.FACT_KEY_BYTES
-        }
-        entry = entry + usize.ONE
-      }
-      if !complete { continue }
+      if !(run escapeAnswerGreen(image, &mut self.escapeGraphs, Bytes.asSlice(&roots[root].answer), green)) { continue }
       let mut exact = Span.make(usize.ZERO, usize.ZERO)
       if buildRootKind(Bytes.asSlice(&roots[root].key), &mut exact) != 3 { continue }
       let key = StableKey.view(Bytes.asSlice(&roots[root].key), exact)
@@ -95655,6 +95884,7 @@ impl Semantic {
         run List<usize>.append(&mut carried, definitions[at])
         at = at + usize.ONE
       }
+      run includeEscapeBlobs(read, &mut carried)
       nodes = run CacheImage.carry(&mut image, read, List<usize>.asSlice(&carried))
     }
     if adopted {
@@ -95662,6 +95892,7 @@ impl Semantic {
       run Semantic.imageReplayedChecks(&self.*, &mut image)
       run Semantic.imageCarriedFiles(&mut self.*, &mut image)
     }
+    run pruneEscapeBlobs(&mut image)
     return move image
   }
 
@@ -95887,15 +96118,9 @@ impl Semantic {
     let records = List<EscapeRecordRoot>.asSlice(&self.escapeImage.records)
     at = usize.ZERO
     while at < records.length {
-      run List<usize>.append(&mut carried, records[at].root)
       let recorded = run adoptedAnswer(&self.heldImage, records[at].root)
-      if let Option<BuildRecord.Record>.Some {value: record} = move run BuildRecord.decode(Bytes.asSlice(&recorded)) {
-        let entries = List<BuildRecord.Entry>.asSlice(&record.entries)
-        let mut entry = usize.ZERO
-        while entry < entries.length {
-          if entries[entry].leaf == 0 { drop run DigestSet.add(&mut named, entries[entry].exact) }
-          entry = entry + usize.ONE
-        }
+      if run nameEscapeAnswer(heldImageReference(&self.heldImage), &mut self.escapeGraphs, Bytes.asSlice(&recorded), &mut named) {
+        run List<usize>.append(&mut carried, records[at].root)
       }
       at = at + usize.ONE
     }
@@ -96637,7 +96862,8 @@ impl Semantic {
     while let Option<CacheImage.Root>.Some {value: root} = move List<CacheImage.Root>.pop(&mut image.roots) {
       let key = Bytes.asSlice(&root.key)
       let mut exact = Span.make(usize.ZERO, usize.ZERO)
-      if buildRootKind(key, &mut exact) == 3 { continue }
+      let kind = buildRootKind(key, &mut exact)
+      if kind == 3 || kind == 6 { continue }
       let mut escaped = false
       if let Option<CheckKey>.Some {value: checked} = move run readCheckKey(key) { escaped = checked.name == usize.ONE }
       if !escaped { run List<CacheImage.Root>.append(&mut retained, move root) }
@@ -96677,7 +96903,7 @@ impl Semantic {
         }
         let node = run CacheImage.addNode(&mut image, &[])
         run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {
-          key: run escapeRecordKey(Bytes.asSlice(&unit)), node: node, answer: run BuildRecord.encode(&captured.record)})
+          key: run escapeRecordKey(Bytes.asSlice(&unit)), node: node, answer: run EscapeGraph.encodeInline(Bytes.asSlice(&run BuildRecord.encode(&captured.record)))})
         run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {
           key: move unit, node: node, answer: run checkAnswer(1, List<DeclarationId>.asSlice(&memo.concrete))})
       } else {
@@ -96918,7 +97144,7 @@ impl Semantic {
         let kind = buildRootKind(key, &mut exact)
         let runtimeRecord = kind == 3 && same(Slice.view<u8>(key, exact.start, exact.end - exact.start), Bytes.asSlice(&stable))
         if kind == 3 {
-          if let Option<BuildRecord.Record>.Some {value} = move run BuildRecord.decode(Bytes.asSlice(&root.answer)) {
+          if let Option<BuildRecord.Record>.Some {value} = move run inlineEscapeAnswer(Bytes.asSlice(&root.answer)) {
             if !run Semantic.frontierRecordUnit(&self.*, Slice.view<u8>(key, exact.start, exact.end - exact.start)) {
               good = false at = at + usize.ONE continue
             }
@@ -97522,9 +97748,8 @@ impl Semantic {
           // Workers still replay assigned checks to obtain real transport captures. Ordinary green
           // hits need only the exact graph's budget facts, already verified during adoption.
           let encoded = run adoptedAnswer(&self.heldImage, kept[found].budgetRecord)
-          if let Option<BuildRecord.Record>.Some {value: record} = move run BuildRecord.decode(Bytes.asSlice(&encoded)) {
-            accounted = run WalkFragments.includeBudget(&mut self.specializationBudget, &record)
-          }
+          accounted = run escapeAnswerBudget(heldImageReference(&self.heldImage), &mut self.escapeGraphs,
+            &mut self.specializationBudget, Bytes.asSlice(&encoded))
         }
         if accounted { return run copyCheckResult(&kept[found].result) }
         if SpecializationBudget.exhausted(&self.specializationBudget) {
@@ -97553,7 +97778,7 @@ impl Semantic {
       // adopted one is, while the reads of its growth guards hold: an entry is green when its MIR
       // unit is current.
       if last.guard == usize.MAX || run Semantic.unitCurrent(&mut self.*, last.guard) {
-        let recorded = run BuildRecord.encode(&last.record)
+        let recorded = run EscapeGraph.encodeInline(Bytes.asSlice(&run BuildRecord.encode(&last.record)))
         let replayed = run Semantic.replayKept(&mut self.*, &mut request.*, module, member, unit, concrete, &boundary,
           Bytes.asSlice(&recorded), last.carriedRecord, List<CapturedEntry>.asSlice(&last.entries), last.guard, true)
         if let Option<DeclarationCheckResult>.Some {value: result} = move replayed { return move result }
@@ -97677,7 +97902,7 @@ impl Semantic {
     ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
     ? &mut Allocator | &mut Types {
     // Both read the record decoded once; a replay that succeeds takes it.
-    let mut record = match move run BuildRecord.decode(recorded) {
+    let mut record = match move run materializeEscapeAnswer(heldImageReference(&self.heldImage), &mut self.escapeGraphs, recorded, boundary) {
       Option<BuildRecord.Record>.Some {value} => move value
       Option<BuildRecord.Record>.None => { return Option<EscapeReplay>.none() }
     }
@@ -105601,7 +105826,7 @@ effect fn imageEscapeRecord(resolver: &Resolver, build: &mut ImageBuild, capture
   }
   if node != usize.MAX {
     run List<CacheImage.Root>.append(&mut build.image.roots, CacheImage.Root {key: run escapeRecordKey(unit), node: node,
-      answer: run BuildRecord.encode(&captured.record)})
+      answer: run EscapeGraph.encodeInline(Bytes.asSlice(&run BuildRecord.encode(&captured.record)))})
   }
 }
 
@@ -105637,10 +105862,12 @@ effect fn rootsOfKinds(image: &CacheImage.Image, checks: bool) -> List<usize> ! 
     if (checks && kind == 0) || kind == 3 || kind == 4 { run List<usize>.append(&mut kept, at) }
     at = at + usize.ONE
   }
+  run includeEscapeBlobs(image, &mut kept)
   return move kept
 }
 
 fn buildRootKind(key: &[u8], exact: &mut Span) -> u64 {
+  if let Option<ContentHash>.Some {..} = EscapeGraph.readGraphKey(key) { return 6 }
   let mut reader = StableKey.reader()
   let named = StableKey.readField(key, &mut reader)
   if StableKey.failed(&reader) { return 0 }
@@ -106096,6 +106323,20 @@ effect fn rebindWalkRecord(record: &mut BuildRecord.Record, walk: &WalkBoundary)
     }
     if u64.bitAnd(entry.facts.flags, BuildRecord.FACT_ELSEWHERE) != 0 { entry.facts.flags = entry.facts.flags - BuildRecord.FACT_ELSEWHERE }
     if elsewhere { entry.facts.flags = u64.bitOr(entry.facts.flags, BuildRecord.FACT_ELSEWHERE) }
+  }
+  return true
+}
+
+// A view stores no supplier-relative pruning decisions. Validate that every selected row
+// has the immutable classification needed to derive those decisions at the destination.
+effect fn escapeSelectionBoundary(record: &BuildRecord.Record, selected: &[usize], walk: &WalkBoundary) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  let entries = List<BuildRecord.Entry>.asSlice(&record.entries)
+  let mut at = usize.ZERO
+  while at < selected.length {
+    if selected[at] >= entries.length { return false }
+    if let Option<bool>.None = move run recordedElsewhere(&entries[selected[at]], walk) { return false }
+    at = at + usize.ONE
   }
   return true
 }
@@ -111151,6 +111392,8 @@ impl Semantic {
     // Move only reusable roots into the envelope. Leaves and nodes keep their local numbering;
     // the coordinator alone traverses, compacts and interns their reachable dependency graph.
     run retainArtifactCacheRoots(&mut image)
+    // Partition records were removed above; their old replay blobs have no IPC consumers.
+    run pruneEscapeBlobs(&mut image)
     let encoded = run CacheImage.encode(&image, stamp)
     let mut packet = run CachePackets.make()
     if !(run CachePackets.append(&mut packet, Bytes.asSlice(&encoded))) { return Bytes.make() }
@@ -111733,7 +111976,8 @@ effect fn carryFrontierReads(held: &Option<CacheImage.Image>, image: &mut CacheI
     if kind != expected { return Option<usize>.none() }
     at = at + usize.ONE
   }
-  let nodes = run CacheImage.carry(&mut image.*, previous, picked)
+  run includeEscapeBlobs(previous, &mut selected)
+  let nodes = run CacheImage.carry(&mut image.*, previous, List<usize>.asSlice(&selected))
   if capture.carriedRecord == usize.MAX { return Option<usize>.some(fresh) }
   return Option<usize>.some(run CacheImage.addNode(&mut image.*, &[CacheImage.nodeEdge(fresh), CacheImage.nodeEdge(List<usize>.get(&nodes, usize.ZERO))]))
 }
@@ -111897,6 +112141,11 @@ impl Semantic {
     graph: &BuildRecord.Record, coverage: &[FrontierCoverage]) -> List<usize>
   ! OutOfMemoryError ? &mut Allocator | &mut Types {
     if graph.guarded { return run artifactCacheSelections(&image.*, false) }
+    let graphBytes = match move run EscapeGraph.encodeGraph(graph) {
+      Option<Bytes>.Some {value} => move value
+      Option<Bytes>.None => { return run artifactCacheSelections(&image.*, false) }
+    }
+    let graphDigest = ContentHash.of(Bytes.asSlice(&graphBytes))
     let mut entries = DigestSet.make()
     let mut entryNodes = List<usize>.make()
     let mut readKeys = List<Bytes>.make()
@@ -111960,23 +112209,24 @@ impl Semantic {
         at = at + usize.ONE
       }
       if !allRoots { noRoots = noRoots + usize.ONE continue }
-      let mut sliced = match move run WalkFragments.rooted(graph, &index, List<ContentHash>.asSlice(&wanted)) {
-        Option<BuildRecord.Record>.Some {value} => move value
-        Option<BuildRecord.Record>.None => { continue }
+      let selected = match move run EscapeGraphReach.reachable(graph, &index, List<ContentHash>.asSlice(&wanted)) {
+        Option<List<usize>>.Some {value} => move value
+        Option<List<usize>>.None => { noClosure = noClosure + usize.ONE continue }
       }
       let walk = match move run Semantic.frontierRecordBoundary(&self.*, Bytes.asSlice(&covered.stable)) {
         Option<WalkBoundary>.Some {value} => move value
         Option<WalkBoundary>.None => { noClosure = noClosure + usize.ONE continue }
       }
-      if !run rebindWalkRecord(&mut sliced, &walk) { noClosure = noClosure + usize.ONE continue }
-      if !(run WalkFragments.finiteClosed(&sliced)) || !(run WalkFragments.escapeFree(&sliced)) { noClosure = noClosure + usize.ONE continue }
-      let members = List<BuildRecord.Entry>.asSlice(&sliced.entries)
+      if !(run escapeSelectionBoundary(graph, List<usize>.asSlice(&selected), &walk))
+        || !(run EscapeGraphReach.escapeFree(graph, List<usize>.asSlice(&selected))) { noClosure = noClosure + usize.ONE continue }
+      let members = List<BuildRecord.Entry>.asSlice(&graph.entries)
+      let selectedEntries = List<usize>.asSlice(&selected)
       let mut dependencies = List<usize>.make()
       let mut complete = true
       at = usize.ZERO
-      while at < members.length && complete {
-        if members[at].leaf == 0 {
-          let entry = DigestSet.find(&entries, members[at].exact)
+      while at < selectedEntries.length && complete {
+        if members[selectedEntries[at]].leaf == 0 {
+          let entry = DigestSet.find(&entries, members[selectedEntries[at]].exact)
           if entry == usize.MAX { complete = false }
           else { run List<usize>.append(&mut dependencies, CacheImage.nodeEdge(List<usize>.get(&entryNodes, entry))) }
         }
@@ -111989,8 +112239,9 @@ impl Semantic {
       let application = run captureRequest(&self.resolver, b"application")
       let recordNode = run frontierBoundaryGuard(&mut image.*, &walk, Bytes.asSlice(&application), readNode)
       if recordNode == usize.MAX { continue }
-      let encoded = run BuildRecord.encode(&sliced)
-      persistedEntries = persistedEntries + members.length
+      let descriptor = EscapeGraph.Descriptor {graph: graphDigest, roots: move wanted}
+      let encoded = run EscapeGraph.encodeDescriptor(&descriptor)
+      persistedEntries = persistedEntries + selectedEntries.length
       persistedBytes = persistedBytes + Bytes.asSlice(&encoded).length
       run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: run escapeRecordKey(Bytes.asSlice(&covered.stable)),
         node: recordNode, answer: move encoded})
@@ -111999,6 +112250,11 @@ impl Semantic {
       run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: run Bytes.copy(Bytes.asSlice(&covered.stable)),
         node: checked, answer: run checkAnswer(1, concrete)})
       persisted = persisted + usize.ONE
+    }
+    if persisted > usize.ZERO {
+      let node = run CacheImage.addNode(&mut image.*, &[])
+      run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {
+        key: run EscapeGraph.graphKey(graphDigest), node: node, answer: move graphBytes})
     }
     let sweeps = List<FrontierSweepProof>.asSlice(&self.frontierSweepProofs)
     let mut sweepCount = usize.ZERO
@@ -112119,12 +112375,16 @@ impl Semantic {
     if let Option<CacheImage.Image>.Some {value: held} = &mut self.heldImage {
       let root = &List<CacheImage.Root>.asSlice(&held.roots)[source]
       let sourceGuard = root.node
-      let graph = match move run BuildRecord.decode(Bytes.asSlice(&root.answer)) {
-        Option<BuildRecord.Record>.Some {value} => move value
-        Option<BuildRecord.Record>.None => { return () }
+      let descriptor = match move run EscapeGraph.decodeDescriptor(Bytes.asSlice(&root.answer)) {
+        Option<EscapeGraph.Descriptor>.Some {value} => move value
+        Option<EscapeGraph.Descriptor>.None => { return () }
       }
+      let found = run cachedEscapeGraph(&held, &mut self.escapeGraphs, descriptor.graph)
+      if found == usize.MAX { return () }
+      let cached = &List<CachedEscapeGraph>.asSlice(&self.escapeGraphs)[found]
+      let graph = &cached.record
       let mut available = DigestSet.make()
-      let originalRoots = List<ContentHash>.asSlice(&graph.roots)
+      let originalRoots = List<ContentHash>.asSlice(&descriptor.roots)
       let mut at = usize.ZERO
       while at < originalRoots.length { drop run DigestSet.add(&mut available, originalRoots[at]) at = at + usize.ONE }
       let mut wanted = List<ContentHash>.make()
@@ -112137,36 +112397,36 @@ impl Semantic {
         run List<ContentHash>.append(&mut wanted, exact)
         at = at + usize.ONE
       }
-      let index = run WalkFragments.indexGraph(&graph)
-      let mut slice = match move run WalkFragments.rooted(&graph, &index, List<ContentHash>.asSlice(&wanted)) {
-        Option<BuildRecord.Record>.Some {value} => move value
-        Option<BuildRecord.Record>.None => { return () }
+      let selectedEntries = match move run EscapeGraphReach.reachable(graph, &cached.index, List<ContentHash>.asSlice(&wanted)) {
+        Option<List<usize>>.Some {value} => move value
+        Option<List<usize>>.None => { return () }
       }
-      if !run rebindWalkRecord(&mut slice, &walk) { return () }
-      if !(run WalkFragments.finiteClosed(&slice)) || !(run WalkFragments.escapeFree(&slice)) { return () }
+      let picked = List<usize>.asSlice(&selectedEntries)
+      if !(run escapeSelectionBoundary(graph, picked, &walk)) || !(run EscapeGraphReach.escapeFree(graph, picked)) { return () }
       let guard = run frontierBoundaryGuard(&mut held, &walk, Bytes.asSlice(&application), sourceGuard)
       if guard == usize.MAX { return () }
       let mut dependencies = List<usize>.make()
       run List<usize>.append(&mut dependencies, CacheImage.nodeEdge(guard))
-      let members = List<BuildRecord.Entry>.asSlice(&slice.entries)
+      let members = List<BuildRecord.Entry>.asSlice(&graph.entries)
       at = usize.ZERO
-      while at < members.length {
-        if members[at].leaf == 0 {
-          let found = DigestSet.find(&entries, members[at].exact)
+      while at < picked.length {
+        if members[picked[at]].leaf == 0 {
+          let found = DigestSet.find(&entries, members[picked[at]].exact)
           if found == usize.MAX { return () }
           run List<usize>.append(&mut dependencies, CacheImage.nodeEdge(List<usize>.get(&nodes, found)))
         }
         at = at + usize.ONE
       }
       let base = List<CacheImage.Root>.length(&held.roots)
+      let subset = EscapeGraph.Descriptor {graph: descriptor.graph, roots: move wanted}
       run List<CacheImage.Root>.append(&mut held.roots, CacheImage.Root {key: run escapeRecordKey(selected), node: guard,
-        answer: run BuildRecord.encode(&slice)})
+        answer: run EscapeGraph.encodeDescriptor(&subset)})
       let checked = run CacheImage.addNode(&mut held, List<usize>.asSlice(&dependencies))
       run List<CacheImage.Root>.append(&mut held.roots, CacheImage.Root {key: run Bytes.copy(selected), node: checked,
         answer: run checkAnswer(1, concrete)})
       run List<usize>.append(&mut self.artifactCacheRoots, base)
       run List<usize>.append(&mut self.artifactCacheRoots, base + usize.ONE)
-      run frontierTrace(b"runtime exports cached", self.frontierSplit, concrete.length, members.length)
+      run frontierTrace(b"runtime exports cached", self.frontierSplit, concrete.length, picked.length)
     }
   }
 }
@@ -112386,4 +112646,145 @@ test effect fn frontierRecordsRebindPruningToDestinationBoundary() -> ()
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut types = TypeTable.make()
   run frontierBoundaryFactsClaims() |> Effect.provideMut<Types>(&mut types) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn sharedEscapeViewClaims() -> ()
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError | AssertionError<'static>
+? &mut Allocator | &mut Types {
+  let module = run ModuleId.make(b"memory", b"shared-escape", b"body.silk")
+  let original = Option<Bytes>.some(run Bytes.copy(b"fn value() -> i32 { return 1 }\nfn caller() -> i32 { return value() }\n"))
+  let revision = run Revision.publish(&Revision.make(), &module, &original)
+  let mut cold = Semantic.make(run Revision.copy(&revision), MachineTarget.forId(TargetId.Aarch64AppleDarwin), Option<FinalProfile>.none())
+  let mut request = Request.make()
+  let inventory = run Semantic.demandSourceInventory(&mut cold, &mut request, &module)
+  let syntax = match move inventory {
+    SourceInventory.Present {syntax, ..} => move syntax
+    _ => { run Testing.expect(false, "shared-view source is present") return () }
+  }
+  let functions = List<NamedFunction>.asSlice(&syntax.functions)
+  let roots = [DeclarationId.copy(&functions[1].declaration.identity)]
+  let ordinal = run internModule(&mut cold.resolver, &module)
+  let result = run Semantic.keptEscapes(&mut cold, &mut request, ordinal, &[ordinal], &roots, false)
+  run Testing.expect(!checkRefuses(&result), "the original walk is clean")
+  let mut image = run Semantic.completeCacheImage(&mut cold)
+  let capture = match &List<EscapeMemo>.asSlice(&cold.escapeMemos)[0].captured {
+    Option<CapturedBuild>.Some {value} => &value
+    _ => { run Testing.expect(false, "the clean walk captures exact MIR evidence") return () }
+  }
+  let blob = match move run EscapeGraph.encodeGraph(&capture.record) {
+    Option<Bytes>.Some {value} => move value
+    _ => { run Testing.expect(false, "the captured graph is complete and classifiable") return () }
+  }
+  let digest = ContentHash.of(Bytes.asSlice(&blob))
+  let mut selected = List<ContentHash>.make()
+  let originalRoots = List<ContentHash>.asSlice(&capture.record.roots)
+  let mut at = usize.ZERO
+  while at < originalRoots.length { run List<ContentHash>.append(&mut selected, originalRoots[at]) at = at + usize.ONE }
+  let descriptor = EscapeGraph.Descriptor {graph: digest, roots: move selected}
+  let written = run EscapeGraph.encodeDescriptor(&descriptor)
+  let mut records = usize.ZERO
+  let cacheRoots = List<CacheImage.Root>.asMutSlice(&mut image.roots)
+  at = usize.ZERO
+  while at < cacheRoots.length {
+    let mut identity = Span.make(usize.ZERO, usize.ZERO)
+    if buildRootKind(Bytes.asSlice(&cacheRoots[at].key), &mut identity) == 3 {
+      cacheRoots[at].answer = run Bytes.copy(Bytes.asSlice(&written))
+      records = records + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  run Testing.expect(records == usize.ONE, "one ordinary record becomes a shared view without changing its guard")
+  let blobNode = run CacheImage.addNode(&mut image, &[])
+  run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: run EscapeGraph.graphKey(digest), node: blobNode, answer: move blob})
+  let changed = run Revision.publish(&revision, &module, &Option<Bytes>.some(run Bytes.copy(
+    b"fn value() -> i32 { return 2 }\nfn caller() -> i32 { return value() }\n")))
+  let mut warm = Semantic.make(run Revision.copy(&changed), MachineTarget.forId(TargetId.Aarch64AppleDarwin), Option<FinalProfile>.none())
+  drop run Semantic.adoptCache(&mut warm, &request, &image, false)
+  run Testing.expect(List<CachedEscapeGraph>.length(&warm.escapeGraphs) == usize.ONE,
+    "adoption validates one shared graph rather than materializing its check slices")
+  let warmOrdinal = run internModule(&mut warm.resolver, &module)
+  let replayed = run Semantic.keptEscapes(&mut warm, &mut request, warmOrdinal, &[warmOrdinal], &roots, false)
+  run Testing.expect(!checkRefuses(&replayed), "a body-only edit replays the shared view")
+  let rewritten = run Semantic.completeCacheImage(&mut warm)
+  run Testing.expect(escapeGraphRoot(&rewritten, digest) != usize.MAX,
+    "replayed check descriptors explicitly carry their shared blob into the next image")
+  let invalid = run Revision.publish(&changed, &module, &Option<Bytes>.some(run Bytes.copy(
+    b"fn value() -> i32 { return true }\nfn caller() -> i32 { return value() }\n")))
+  let mut failed = Semantic.make(move invalid, MachineTarget.forId(TargetId.Aarch64AppleDarwin), Option<FinalProfile>.none())
+  drop run Semantic.adoptCache(&mut failed, &request, &rewritten, false)
+  let failedOrdinal = run internModule(&mut failed.resolver, &module)
+  let rejected = run Semantic.keptEscapes(&mut failed, &mut request, failedOrdinal, &[failedOrdinal], &roots, false)
+  run Testing.expect(List<Shared<Rejection>>.length(&rejected.rejections) == usize.ONE,
+    "a shared graph cannot make changed invalid MIR green")
+  run Testing.expect(Shared<Rejection>.with<bool>(&List<Shared<Rejection>>.asSlice(&rejected.rejections)[0], fn(value: &Rejection) -> bool {
+    return value.code == RejectionCode.ReturnTypeMismatch && value.span.start == 27 && value.span.end == 31
+  }), "lazy view materialization retains ordinary diagnostic code and authored location")
+  let mut missing = run CacheImage.copy(&image)
+  let absent = escapeGraphRoot(&missing, digest)
+  drop List<CacheImage.Root>.remove(&mut missing.roots, absent)
+  let mut fallback = Semantic.make(run Revision.copy(&revision), MachineTarget.forId(TargetId.Aarch64AppleDarwin), Option<FinalProfile>.none())
+  drop run Semantic.adoptCache(&mut fallback, &request, &missing, false)
+  let memos = List<EscapeMemo>.asSlice(&fallback.escapeMemos)
+  run Testing.expect(memos.length > usize.ZERO, "the missing-blob fixture otherwise offers green check roots")
+  at = usize.ZERO
+  while at < memos.length {
+    run Testing.expect(memos[at].budgetRecord == usize.MAX, "a missing blob never enables a green escape memo shortcut")
+    at = at + usize.ONE
+  }
+  let fallbackOrdinal = run internModule(&mut fallback.resolver, &module)
+  let checked = run Semantic.keptEscapes(&mut fallback, &mut request, fallbackOrdinal, &[fallbackOrdinal], &roots, false)
+  run Testing.expect(!checkRefuses(&checked), "a missing blob falls back to the ordinary live walk")
+}
+
+test effect fn sharedEscapeViewsReplayBodyEditsAndRefuseMissingEvidence() -> ()
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut types = TypeTable.make()
+  run sharedEscapeViewClaims() |> Effect.provideMut<Types>(&mut types) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn sharedEscapeLivenessClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let old = ContentHash {high: 1, low: 11}
+  let fresh = ContentHash {high: 2, low: 22}
+  let mut image = CacheImage.make()
+  let node = run CacheImage.addNode(&mut image, &[])
+  let first = EscapeGraph.Descriptor {graph: fresh, roots: List<ContentHash>.make()}
+  let second = EscapeGraph.Descriptor {graph: old, roots: List<ContentHash>.make()}
+  run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: run escapeRecordKey(b"check-a"), node: node,
+    answer: run EscapeGraph.encodeDescriptor(&first)})
+  run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: run escapeRecordKey(b"check-b"), node: node,
+    answer: run EscapeGraph.encodeDescriptor(&second)})
+  run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: run escapeRecordKey(b"check-a"), node: node,
+    answer: run EscapeGraph.encodeDescriptor(&second)})
+  run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: run EscapeGraph.graphKey(old), node: node, answer: run Bytes.copy(b"old")})
+  run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: run EscapeGraph.graphKey(fresh), node: node, answer: run Bytes.copy(b"fresh")})
+  let mut selected = List<usize>.make()
+  run List<usize>.append(&mut selected, 1)
+  run includeEscapeBlobs(&image, &mut selected)
+  run Testing.expect(sameSlots(List<usize>.asSlice(&selected), &[1, 3]), "carrying a descriptor also explicitly carries its referenced blob")
+  let checkRoots = run rootsOfKinds(&image, true)
+  let escapeRoots = run rootsOfKinds(&image, false)
+  let mut filtered = CacheImage.make()
+  drop run CacheImage.carry(&mut filtered, &image, List<usize>.asSlice(&escapeRoots))
+  run Testing.expect(List<usize>.length(&checkRoots) == List<usize>.length(&escapeRoots)
+    && escapeGraphRoot(&filtered, old) != usize.MAX && escapeGraphRoot(&filtered, fresh) != usize.MAX,
+    "filtered check/escape images retain every graph their descriptors reference")
+  run pruneEscapeBlobs(&mut image)
+  run Testing.expect(escapeGraphRoot(&image, old) != usize.MAX && escapeGraphRoot(&image, fresh) != usize.MAX,
+    "unchanged and refreshed checks may retain different immutable generations")
+  let mut roots = List<CacheImage.Root>.asMutSlice(&mut image.roots)
+  roots[1].answer = run EscapeGraph.encodeDescriptor(&first)
+  run pruneEscapeBlobs(&mut image)
+  run Testing.expect(escapeGraphRoot(&image, old) == usize.MAX && escapeGraphRoot(&image, fresh) != usize.MAX,
+    "only winning descriptors determine liveness; a superseded duplicate cannot pin an old generation")
+  let mut rootsAgain = List<CacheImage.Root>.asMutSlice(&mut image.roots)
+  rootsAgain[0].answer = run EscapeGraph.encodeInline(Bytes.asSlice(&run BuildRecord.encode(&BuildRecord.make(false, false))))
+  rootsAgain[1].answer = run EscapeGraph.encodeInline(Bytes.asSlice(&run BuildRecord.encode(&BuildRecord.make(false, false))))
+  run pruneEscapeBlobs(&mut image)
+  run Testing.expect(escapeGraphRoot(&image, fresh) == usize.MAX, "a blob disappears after its final current view is replaced")
+}
+
+test effect fn sharedEscapeBlobsFollowWinningDescriptorsAcrossGenerations() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run sharedEscapeLivenessClaims() |> Effect.provideMut<Allocator>(&mut allocator)
 }
