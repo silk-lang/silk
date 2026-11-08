@@ -12,6 +12,9 @@ import semantic.ModuleId {InvalidModulePath, ModuleId}
 import silk.collections.hash {Hash}
 import silk.collections.list {List}
 import silk.core.option {Option}
+import silk.core.result {Result}
+import silk.mem.layout {Layout}
+import silk.mem.pointer {Pointer}
 import silk.core.effect {Effect}
 import silk.mem.allocator {Allocator, OutOfMemoryError}
 import silk.testing.testing {AssertionError, Testing}
@@ -87,7 +90,7 @@ impl Budget {
     if self.depth == usize.ZERO { List<Update>.clear(&mut self.updates) }
   }
   /// Discards observations of an unproved replay so the live walk retains its own refusal site.
-  pub effect fn rollback(self: &mut Self, saved: Checkpoint) -> () ! OutOfMemoryError ? &mut Allocator {
+  pub fn rollback(self: &mut Self, saved: Checkpoint) -> () {
     while List<Update>.length(&self.updates) > saved.updates {
       let last = List<Update>.length(&self.updates) - usize.ONE
       let update = List<Update>.remove(&mut self.updates, last)
@@ -112,26 +115,11 @@ impl Budget {
     self.failed = saved.failed
     self.failure = saved.failure
     self.depth = saved.depth
-    // A successful replay never rebuilds indexes. Only an abandoned extension needs relinking.
-    if rebuildDefinitions {
-      self.definitionLookup = InternIndex.make()
-      let entries = List<Definition>.asSlice(&self.definitions)
-      let mut at = usize.ZERO
-      while at < entries.length {
-        run InternIndex.record(&mut self.definitionLookup, Hash.combine(entries[at].key.high, entries[at].key.low))
-        at = at + usize.ONE
-      }
-    }
-    if rebuildBodies {
-      self.bodyLookup = InternIndex.make()
-      let bodies = List<DeclarationId>.asSlice(&self.bodies)
-      let mut at = usize.ZERO
-      while at < bodies.length {
-        run InternIndex.record(&mut self.bodyLookup, DeclarationId.hash(&bodies[at]))
-        at = at + usize.ONE
-      }
-    }
+    // A successful replay never relinks indexes; abandoned extensions reuse their existing storage.
+    if rebuildDefinitions { InternIndex.truncate(&mut self.definitionLookup, saved.definitions) }
+    if rebuildBodies { InternIndex.truncate(&mut self.bodyLookup, saved.bodies) }
   }
+
   fn refuse(self: &mut Self, resource: usize) -> bool {
     if !self.failed { self.failure = resource }
     self.failed = true
@@ -209,8 +197,18 @@ impl Budget {
         || (selectedBody != usize.MAX && List<usize>.get(&self.bodyCounts, selectedBody) >= self.maxBodyDefinitions) {
         return Budget.refuse(&mut self.*, 2)
       }
+    }
+    run List<Definition>.reserve(&mut self.definitions, usize.ONE)
+    run InternIndex.reserveNext(&mut self.definitionLookup)
+    if let Option<&DeclarationId>.Some {value} = &body {
       if selectedBody == usize.MAX {
-        selectedBody = declared.length
+        run List<DeclarationId>.reserve(&mut self.bodies, usize.ONE)
+        run List<usize>.reserve(&mut self.bodyCounts, usize.ONE)
+        run InternIndex.reserveNext(&mut self.bodyLookup)
+      }
+      // All allocations completed before any body count or ordinal is published.
+      if selectedBody == usize.MAX {
+        selectedBody = List<DeclarationId>.length(&self.bodies)
         run List<DeclarationId>.append(&mut self.bodies, DeclarationId.copy(value))
         run List<usize>.append(&mut self.bodyCounts, usize.ZERO)
         run InternIndex.record(&mut self.bodyLookup, DeclarationId.hash(value))
@@ -270,7 +268,7 @@ effect fn budgetClaims() -> () ! InvalidModulePath | OutOfMemoryError | Assertio
   run Testing.expect(run Budget.include(&mut speculative, exampleKey(2), Option<&DeclarationId>.some(&otherBody), 20, 3), "nested replay adds another body")
   Budget.commit(&mut speculative, move inner)
   run Testing.expect(!run Budget.include(&mut speculative, exampleKey(3), Option<&DeclarationId>.none(), 60, 1), "speculative graph can exhaust bytes")
-  run Budget.rollback(&mut speculative, move outer)
+  Budget.rollback(&mut speculative, move outer)
   run Testing.expect(!Budget.exhausted(&speculative) && Budget.definitionCount(&speculative) == 1
     && Budget.runtimeBytes(&speculative) == 10 && Budget.referenceCount(&speculative) == 2,
     "outer rollback restores existing maxima and removes committed inner additions and exhaustion")
@@ -285,4 +283,72 @@ effect fn budgetClaims() -> () ! InvalidModulePath | OutOfMemoryError | Assertio
 test effect fn frontierFiniteBudgetsAreExactAndIndependentOfOrder() -> () ! InvalidModulePath | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run budgetClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+struct BudgetFaultAllocator {target: usize, attempts: usize}
+impl BudgetFaultAllocator {
+  effect fn allocate(self: &mut Self, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
+    self.attempts = self.attempts + usize.ONE
+    if self.attempts == self.target { fail OutOfMemoryError {} }
+    let mut system = Allocator.systemAllocatorProvider()
+    return run Allocator.allocate(move layout) |> Effect.provideMut<Allocator>(&mut system)
+  }
+}
+impl Allocator for BudgetFaultAllocator {
+  allocate: BudgetFaultAllocator.allocate
+  effect fn allocateZeroed(self: &mut Self, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
+    self.attempts = self.attempts + usize.ONE
+    if self.attempts == self.target { fail OutOfMemoryError {} }
+    let mut system = Allocator.systemAllocatorProvider()
+    return run Allocator.allocateZeroed(move layout) |> Effect.provideMut<Allocator>(&mut system)
+  }
+  unsafe effect fn takeBlock(self: &mut Self, layout: Layout) -> ?*mut u8 { drop layout return Pointer.null<u8>() }
+}
+
+effect fn allocationClaims() -> () ! InvalidModulePath | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let body = run DeclarationId.fromParts(run ModuleId.make(b"memory", b"finite", b"allocation"), List<OwnerStep>.make())
+  let stages: [usize; 3] = [0, 12, 16]
+  let mut stage = usize.ZERO
+  while stage < stages.length {
+    let existing = stages[stage]
+    let mut target = usize.ZERO
+    let mut allocations = usize.ONE
+    while target <= allocations {
+      let mut budget = Budget.withLimits(100, existing + usize.ONE, 100, 100)
+      let mut at = usize.ZERO
+      while at < existing {
+        drop run Budget.include(&mut budget, exampleKey(usize.toU64(at)), Option<&DeclarationId>.some(&body), 1, 1)
+        at = at + usize.ONE
+      }
+      let saved = Budget.checkpoint(&mut budget)
+      let mut fault = BudgetFaultAllocator {target: target, attempts: usize.ZERO}
+      let tried = run Effect.result(Budget.include(&mut budget, exampleKey(usize.toU64(existing)), Option<&DeclarationId>.some(&body), 1, 1))
+        |> Effect.provideMut<Allocator>(&mut fault)
+      if target == usize.ZERO { allocations = fault.attempts }
+      else {
+        run Testing.expect(match &tried { Result<bool, OutOfMemoryError>.Failure {..} => true _ => false },
+          "every injected allocation failure is reported before publishing the definition")
+        run Testing.expect(Budget.definitionCount(&budget) == existing && Budget.runtimeBytes(&budget) == existing
+          && Budget.referenceCount(&budget) == existing && !Budget.exhausted(&budget),
+          "failed publication leaves the accepted graph and its resource state intact")
+        if existing != usize.ZERO {
+          run Testing.expect(List<usize>.get(&budget.bodyCounts, usize.ZERO) == existing,
+            "failed definition allocation never increments an existing body's specialization count")
+        }
+      }
+      // Rollback has no allocator effect, including when the allocator that failed still refuses storage.
+      Budget.rollback(&mut budget, move saved)
+      run Testing.expect(run Budget.include(&mut budget, exampleKey(usize.toU64(existing)), Option<&DeclarationId>.some(&body), 1, 1),
+        "the actual definition can be retried after speculative allocation failure")
+      run Testing.expect(!run Budget.include(&mut budget, exampleKey(usize.toU64(existing + usize.ONE)), Option<&DeclarationId>.some(&body), 1, 1),
+        "retry consumes exactly one body slot rather than retaining or duplicating a failed publication")
+      target = target + usize.ONE
+    }
+    stage = stage + usize.ONE
+  }
+}
+
+test effect fn frontierBudgetAllocationFailureIsAtomic() -> () ! InvalidModulePath | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run allocationClaims() |> Effect.provideMut<Allocator>(&mut allocator)
 }
