@@ -2074,7 +2074,7 @@ Tells the server that the transport sent the first `count` bytes of [`Server.pen
 pub fn plaintextAvailable(self: &Self) -> usize
 ```
 
-Returns how many bytes of decrypted application data wait for [`Server.readPlaintext`](#Server.impl.readPlaintext).
+Returns how many decrypted application bytes `readPlaintext` can copy out now.
 
 <a id="Server.impl.readPlaintext"></a>
 
