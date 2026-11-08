@@ -103,6 +103,7 @@ import silk.http.hpack {Field as Http2Field, FieldBlock as Http2Fields}
 import silk.http.http2 {Connection as Http2Connection, Event as Http2Event, Limits as Http2Limits, Role as Http2Role}
 import silk.http.http2_connection {Driver}
 import silk.http.http2_frame {ProtocolError}
+import silk.http.http2_headers {Message as Http2Message}
 import silk.tls.certificate_path {ValidationError, ValidationReason}
 import silk.http.headers {Headers, Limits as HeaderLimits}
 import silk.http.body {Framing}
@@ -445,17 +446,32 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     storage: Bytes,
     // Name start, name length, value start, value length, for each field.
     spans: List<usize>,
+    // True if the fields pass HTTP/2 request validation with `message` as its result: the
+    // HTTP/1.1 head was validated when it was written, and the rewrite keeps it valid.
+    validated: bool,
+    message: Http2Message,
   }
 
   // Rewrites the HTTP/1.1 head `head` as HTTP/2 fields: the request line becomes `:method`,
   // `:scheme` and `:path`, `Host` becomes `:authority`, names are lowercased, and the fields that
   // HTTP/2 forbids (RFC 9113 section 8.2.2) are left out.
   effect fn rewriteRequest(head: &[u8], secure: bool) -> Http2Request ! HttpError | OutOfMemoryError ? &mut Allocator {
-    let mut storage = run Bytes.copy(head)
+    let mut rewritten = Http2Request {storage: Bytes.make(), spans: List<usize>.make(), validated: false, message: noMessage()}
+    run rewriteInto(head, secure, &mut rewritten)
+    return move rewritten
+  }
+
+  // Rewrites `head` into `into`, whose storage and spans a shared connection keeps from one
+  // request to the next.
+  effect fn rewriteInto(head: &[u8], secure: bool, into: &mut Http2Request) -> () ! HttpError | OutOfMemoryError ? &mut Allocator {
+    let storage = &mut into.storage
+    let spans = &mut into.spans
+    Bytes.clear(&mut storage.*)
+    run Bytes.append(&mut storage.*, head)
+    List<usize>.clear(&mut spans.*)
     // Four spans for each field; sixteen fields cover the usual request.
-    let mut spans = List<usize>.make()
-    run List<usize>.reserveExact(&mut spans, 64)
-    let bytes = Bytes.asMutSlice(&mut storage)
+    run List<usize>.reserve(&mut spans.*, 64)
+    let bytes = Bytes.asMutSlice(&mut storage.*)
     let mut space = usize.ZERO
     while space < bytes.length && bytes[space] != 32 { space = space + usize.ONE }
     let mut second = space + usize.ONE
@@ -465,38 +481,83 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     if second >= bytes.length || lineEnd + usize.ONE >= bytes.length {
       fail HttpError.make(HttpErrorKind.InvalidRequest, "The request head cannot be sent over HTTP/2.")
     }
-    run appendSpan(&mut spans, usize.MAX, 0, 0, space)
-    run appendSpan(&mut spans, usize.MAX - usize.ONE, if secure { 1 } else { 0 }, 0, 0)
-    run appendSpan(&mut spans, usize.MAX - 2, 0, space + usize.ONE, second - space - usize.ONE)
+    run appendSpan(&mut spans.*, usize.MAX, 0, 0, space)
+    run appendSpan(&mut spans.*, usize.MAX - usize.ONE, if secure { 1 } else { 0 }, 0, 0)
+    run appendSpan(&mut spans.*, usize.MAX - 2, 0, space + usize.ONE, second - space - usize.ONE)
     // The authority goes in its slot once `Host` is found; until then it is empty.
-    run appendSpan(&mut spans, usize.MAX - 3, 0, 0, 0)
+    run appendSpan(&mut spans.*, usize.MAX - 3, 0, 0, 0)
+    let method = Slice.view<u8>(&bytes, usize.ZERO, space)
+    let target = Slice.view<u8>(&bytes, space + usize.ONE, second - space - usize.ONE)
+    // CONNECT and targets other than origin-form or `*` are left to the full validation.
+    let mut validated = !bytesEqual(method, b"CONNECT") && target.length > usize.ZERO
+      && (target[0] == 47 || bytesEqual(target, b"*"))
+    let mut hasHost = false
+    let mut message = noMessage()
+    message.head = bytesEqual(method, b"HEAD")
     let mut start = lineEnd + 2
     while start + usize.ONE < bytes.length && bytes[start] != 13 {
+      // The name is lowercased while its end is found.
       let mut colon = start
-      while colon < bytes.length && bytes[colon] != 58 { colon = colon + usize.ONE }
+      while colon < bytes.length {
+        let byte = bytes[colon]
+        if byte == 58 { break }
+        if byte >= 65 && byte <= 90 { bytes[colon] = byte + 32 }
+        colon = colon + usize.ONE
+      }
       let mut end = colon
       while end < bytes.length && bytes[end] != 13 { end = end + usize.ONE }
       if colon >= end || end >= bytes.length { break }
-      let mut at = start
-      while at < colon {
-        if bytes[at] >= 65 && bytes[at] <= 90 { bytes[at] = bytes[at] + 32 }
-        at = at + usize.ONE
-      }
       let mut valueStart = colon + usize.ONE
       while valueStart < end && (bytes[valueStart] == 32 || bytes[valueStart] == 9) { valueStart = valueStart + usize.ONE }
+      // HTTP/2 forbids whitespace around a value, and it is not part of an HTTP/1.1 value.
+      let mut valueEnd = end
+      while valueEnd > valueStart && (bytes[valueEnd - usize.ONE] == 32 || bytes[valueEnd - usize.ONE] == 9) {
+        valueEnd = valueEnd - usize.ONE
+      }
       let name = Slice.view<u8>(&bytes, start, colon - start)
       if bytesEqual(name, b"host") {
-        List<usize>.set(&mut spans, 14, valueStart)
-        List<usize>.set(&mut spans, 15, end - valueStart)
+        if hasHost { validated = false }
+        hasHost = true
+        List<usize>.set(&mut spans.*, 14, valueStart)
+        List<usize>.set(&mut spans.*, 15, valueEnd - valueStart)
       } else if !forbiddenInHttp2(name) {
-        run appendSpan(&mut spans, start, colon - start, valueStart, end - valueStart)
+        if bytesEqual(name, b"content-length") {
+          if message.hasLength { validated = false }
+          message.hasLength = true
+          let mut digit = valueStart
+          while digit < valueEnd {
+            let byte = bytes[digit]
+            if byte < 48 || byte > 57 || message.length > 100000000000000 {
+              validated = false
+              break
+            }
+            message.length = message.length * 10 + u8.toU64(byte - 48)
+            digit = digit + usize.ONE
+          }
+          if valueStart == valueEnd { validated = false }
+        }
+        run appendSpan(&mut spans.*, start, colon - start, valueStart, valueEnd - valueStart)
       }
       start = end + 2
     }
-    return Http2Request {storage: move storage, spans: move spans}
+    into.validated = validated && hasHost
+    into.message = message
+    return ()
+  }
+
+  fn noMessage() -> Http2Message {
+    return Http2Message {hasLength: false, length: 0, status: 0, head: false, connect: false}
   }
 
   effect fn appendSpan(spans: &mut List<usize>, nameStart: usize, nameLength: usize, valueStart: usize, valueLength: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    // The spans are reserved for the usual request, so the four values fit without a check each.
+    if List<usize>.capacity(&spans.*) - List<usize>.length(&spans.*) >= 4 {
+      let _name = List<usize>.appendWithinCapacity(&mut spans.*, nameStart)
+      let _nameLength = List<usize>.appendWithinCapacity(&mut spans.*, nameLength)
+      let _value = List<usize>.appendWithinCapacity(&mut spans.*, valueStart)
+      let _valueLength = List<usize>.appendWithinCapacity(&mut spans.*, valueLength)
+      return ()
+    }
     run List<usize>.append(&mut spans.*, nameStart)
     run List<usize>.append(&mut spans.*, nameLength)
     run List<usize>.append(&mut spans.*, valueStart)
@@ -521,27 +582,34 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
 
   // The HTTP/2 fields of `request`.
   effect fn fieldsOf<'a>(request: &'a Http2Request) -> List<Http2Field<'a>> ! OutOfMemoryError ? &mut Allocator {
-    let bytes = Bytes.asSlice(&request.storage)
-    let spans = List<usize>.asSlice(&request.spans)
+    let count = List<usize>.length(&request.spans) / 4
     let mut fields = List<Http2Field<'a>>.make()
-    run List<Http2Field<'a>>.reserveExact(&mut fields, spans.length / 4)
+    run List<Http2Field<'a>>.reserveExact(&mut fields, count)
     let mut at = usize.ZERO
-    while at < spans.length {
-      let nameStart = spans[at]
-      let name: &'a [u8] = if nameStart == usize.MAX { b":method" } else if nameStart == usize.MAX - usize.ONE {
-        b":scheme"
-      } else if nameStart == usize.MAX - 2 { b":path" } else if nameStart == usize.MAX - 3 { b":authority" } else {
-        Slice.view<u8>(bytes, nameStart, spans[at + usize.ONE])
-      }
-      let value: &'a [u8] = if nameStart == usize.MAX - usize.ONE {
-        if spans[at + usize.ONE] == 1 { b"https" } else { b"http" }
-      } else {
-        Slice.view<u8>(bytes, spans[at + 2], spans[at + 3])
-      }
-      run List<Http2Field<'a>>.append(&mut fields, Http2Field<'a> {name: name, value: value, sensitive: false})
-      at = at + 4
+    while at < count {
+      run List<Http2Field<'a>>.append(&mut fields, fieldAt(request, at))
+      at = at + usize.ONE
     }
     return move fields
+  }
+
+  // The field at `index` of `request`.
+  fn fieldAt<'a>(request: &'a Http2Request, index: usize) -> Http2Field<'a> {
+    let bytes = Bytes.asSlice(&request.storage)
+    let spans = List<usize>.asSlice(&request.spans)
+    let at = index * 4
+    let nameStart = spans[at]
+    let name: &'a [u8] = if nameStart == usize.MAX { b":method" } else if nameStart == usize.MAX - usize.ONE {
+      b":scheme"
+    } else if nameStart == usize.MAX - 2 { b":path" } else if nameStart == usize.MAX - 3 { b":authority" } else {
+      Slice.view<u8>(bytes, nameStart, spans[at + usize.ONE])
+    }
+    let value: &'a [u8] = if nameStart == usize.MAX - usize.ONE {
+      if spans[at + usize.ONE] == 1 { b"https" } else { b"http" }
+    } else {
+      Slice.view<u8>(bytes, spans[at + 2], spans[at + 3])
+    }
+    return Http2Field<'a> {name: name, value: value, sensitive: false}
   }
 
   effect fn streamHttp2(driver: &mut Driver, exchange: Direct<'_>, secure: bool) -> Streamed
@@ -600,7 +668,11 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
                 cause: HttpCause.None,
               }
             }
-            run Bytes.append(&mut body, Bytes.asSlice(&bytes))
+            if Bytes.length(&body) == usize.ZERO {
+              body = move bytes
+            } else {
+              run Bytes.append(&mut body, Bytes.asSlice(&bytes))
+            }
           }
           if count > usize.ZERO {
             run Http2Connection.release(Driver.connection(&mut driver.*), stream, usize.toU32(count))
@@ -2671,12 +2743,19 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   }
 
   // Opens a stream for `job` on `driver`.
-  effect fn muxOpen(driver: &mut Driver, job: &PendingJob, secure: bool) -> u32
+  effect fn muxOpen(driver: &mut Driver, job: &PendingJob, secure: bool, rewritten: &mut Http2Request) -> u32
   ! HttpError | ProtocolError | OutOfMemoryError
   ? &mut Allocator {
-    let rewritten = run rewriteRequest(job.request.bytes(), secure)
-    let fields = run fieldsOf(&rewritten)
-    return run Http2Connection.open(Driver.connection(&mut driver.*), List<Http2Field<'_>>.asSlice(&fields), Bytes.length(&job.body) == usize.ZERO)
+    run rewriteInto(job.request.bytes(), secure, &mut rewritten.*)
+    let request: &Http2Request = &rewritten.*
+    let last = Bytes.length(&job.body) == usize.ZERO
+    let fields = run fieldsOf(request)
+    if request.validated {
+      // The head was validated as HTTP/1.1 when it was written, and the rewrite keeps it a valid
+      // HTTP/2 request.
+      return run unsafe Http2Connection.openValidated(Driver.connection(&mut driver.*), List<Http2Field<'_>>.asSlice(&fields), last, request.message)
+    }
+    return run Http2Connection.open(Driver.connection(&mut driver.*), List<Http2Field<'_>>.asSlice(&fields), last)
   }
 
   fn streamAt(streams: &List<MuxStream>, id: u32) -> usize {
@@ -2689,12 +2768,23 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     return usize.MAX
   }
 
+  // Takes the stream at `at` out of `streams`, moving the last one into its place: the order of
+  // the streams does not matter, and a stream is large to shift.
+  fn takeStream(streams: &mut List<MuxStream>, at: usize) -> MuxStream {
+    let last = match List<MuxStream>.pop(&mut streams.*) {
+      Option.Some {value} => move value
+      Option.None => Intrinsic.trap("sendAll: no stream to take")
+    }
+    if at == List<MuxStream>.length(&streams.*) { return move last }
+    return Intrinsic.replace(List<MuxStream>.asMutSlice(&mut streams.*)[at], move last)
+  }
+
   // Moves the stream at `at` out of `streams` with how it ended. A failed stream is reset, so the
   // server stops sending it.
   effect fn endStream(driver: &mut Driver, streams: &mut List<MuxStream>, at: usize, result: MuxResult, ended: &mut List<MuxEnded>) -> ()
   ! ProtocolError | OutOfMemoryError
   ? &mut Allocator {
-    let stream = List<MuxStream>.remove(&mut streams.*, at)
+    let stream = takeStream(&mut streams.*, at)
     if let MuxResult.Fail {..} = &result {
       // CANCEL: the client no longer wants the response.
       run Http2Connection.reset(Driver.connection(&mut driver.*), stream.id, 8)
@@ -2725,10 +2815,8 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     return MuxResult.Answer {received: Received {parts: move parts}}
   }
 
-  // What one step of a shared connection gives: the streams that ended, and whether the
-  // connection can carry more.
+  // Whether a shared connection can carry more after one step.
   struct MuxStepped {
-    ended: List<MuxEnded>,
     // The connection still reads and writes.
     alive: bool,
     // The connection takes new streams.
@@ -2736,10 +2824,9 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   }
 
   // Sends what the streams can, then takes one event from the connection and applies it.
-  effect fn muxStep(driver: &mut Driver, streams: &mut List<MuxStream>) -> MuxStepped
+  effect fn muxStep(driver: &mut Driver, streams: &mut List<MuxStream>, ended: &mut List<MuxEnded>) -> MuxStepped
   ! ProtocolError | TransportError | OutOfMemoryError
   ? &mut HttpTransport | &mut Allocator | &mut MonotonicClock | &mut Random {
-    let mut ended = List<MuxEnded>.make()
     // Request bodies, as far as the flow-control windows allow.
     let mut at = usize.ZERO
     while at < List<MuxStream>.length(&streams.*) {
@@ -2758,7 +2845,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     at = usize.ZERO
     while at < List<MuxStream>.length(&streams.*) {
       if earlier(&List<MuxStream>.asSlice(&streams.*)[at].deadline, &now) {
-        run endStream(&mut driver.*, &mut streams.*, at, MuxResult.Fail {error: HttpError.make(HttpErrorKind.Timeout, "The request deadline passed.")}, &mut ended)
+        run endStream(&mut driver.*, &mut streams.*, at, MuxResult.Fail {error: HttpError.make(HttpErrorKind.Timeout, "The request deadline passed.")}, &mut ended.*)
       } else {
         at = at + usize.ONE
       }
@@ -2766,7 +2853,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     let all = List<MuxStream>.asSlice(&streams.*)
     if all.length == usize.ZERO {
       run Driver.flush(&mut driver.*, Option<Instant>.none())
-      return MuxStepped {ended: move ended, alive: true, accepting: true}
+      return MuxStepped {alive: true, accepting: true}
     }
     let mut earliest = copyInstant(&all[0].deadline)
     at = usize.ONE
@@ -2779,7 +2866,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     let event = match move next {
       Result.Success {value} => match move value {
         Option.Some {value: found} => move found
-        Option.None => { return MuxStepped {ended: move ended, alive: false, accepting: false} }
+        Option.None => { return MuxStepped {alive: false, accepting: false} }
       }
       Result.Failure {error} => match move error {
         TransportError failure => {
@@ -2791,12 +2878,12 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
             at = usize.ZERO
             while at < List<MuxStream>.length(&streams.*) {
               if earlier(&List<MuxStream>.asSlice(&streams.*)[at].deadline, &later) {
-                run endStream(&mut driver.*, &mut streams.*, at, MuxResult.Fail {error: HttpError.make(HttpErrorKind.Timeout, "The request deadline passed.")}, &mut ended)
+                run endStream(&mut driver.*, &mut streams.*, at, MuxResult.Fail {error: HttpError.make(HttpErrorKind.Timeout, "The request deadline passed.")}, &mut ended.*)
               } else {
                 at = at + usize.ONE
               }
             }
-            return MuxStepped {ended: move ended, alive: false, accepting: false}
+            return MuxStepped {alive: false, accepting: false}
           }
           fail move failure
         }
@@ -2812,8 +2899,8 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
           if List<MuxStream>.asSlice(&streams.*)[at].status == 0 {
             let code = statusField(&received)
             if code < 100 || code > 999 {
-              run endStream(&mut driver.*, &mut streams.*, at, MuxResult.Fail {error: HttpError.make(HttpErrorKind.Protocol, "The HTTP/2 response has no valid :status.")}, &mut ended)
-              return MuxStepped {ended: move ended, alive: true, accepting: true}
+              run endStream(&mut driver.*, &mut streams.*, at, MuxResult.Fail {error: HttpError.make(HttpErrorKind.Protocol, "The HTTP/2 response has no valid :status.")}, &mut ended.*)
+              return MuxStepped {alive: true, accepting: true}
             }
             // An informational response comes before the final one.
             if code >= 200 {
@@ -2826,8 +2913,8 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
                 }
                 Result.Failure {error} => match move error {
                   HttpError failure => {
-                    run endStream(&mut driver.*, &mut streams.*, at, MuxResult.Fail {error: move failure}, &mut ended)
-                    return MuxStepped {ended: move ended, alive: true, accepting: true}
+                    run endStream(&mut driver.*, &mut streams.*, at, MuxResult.Fail {error: move failure}, &mut ended.*)
+                    return MuxStepped {alive: true, accepting: true}
                   }
                   OutOfMemoryError exhausted => { fail move exhausted }
                 }
@@ -2836,7 +2923,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
           }
           if last && List<MuxStream>.asSlice(&streams.*)[at].status != 0 {
             let result = run answered(&mut List<MuxStream>.asMutSlice(&mut streams.*)[at])
-            run endStream(&mut driver.*, &mut streams.*, at, move result, &mut ended)
+            run endStream(&mut driver.*, &mut streams.*, at, move result, &mut ended.*)
           }
         }
       }
@@ -2856,13 +2943,18 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
               message: "The response body exceeds the configured limit.",
               status: Option<u16>.some(status),
               cause: HttpCause.None,
-            }}, &mut ended)
-            return MuxStepped {ended: move ended, alive: true, accepting: true}
+            }}, &mut ended.*)
+            return MuxStepped {alive: true, accepting: true}
           }
-          run Bytes.append(&mut entry.body, Bytes.asSlice(&bytes))
+          // The first DATA frame's bytes become the body, so a one-frame body is never copied.
+          if Bytes.length(&entry.body) == usize.ZERO {
+            entry.body = move bytes
+          } else {
+            run Bytes.append(&mut entry.body, Bytes.asSlice(&bytes))
+          }
           if last {
             let result = run answered(&mut List<MuxStream>.asMutSlice(&mut streams.*)[at])
-            run endStream(&mut driver.*, &mut streams.*, at, move result, &mut ended)
+            run endStream(&mut driver.*, &mut streams.*, at, move result, &mut ended.*)
           }
         }
       }
@@ -2873,9 +2965,9 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
           let refused = code == 7 && List<MuxStream>.asSlice(&streams.*)[at].status == 0
           let gone = List<MuxStream>.remove(&mut streams.*, at)
           if refused {
-            run List<MuxEnded>.append(&mut ended, MuxEnded {stream: move gone, result: MuxResult.Again})
+            run List<MuxEnded>.append(&mut ended.*, MuxEnded {stream: move gone, result: MuxResult.Again})
           } else {
-            run List<MuxEnded>.append(&mut ended, MuxEnded {stream: move gone, result: MuxResult.Fail {error: HttpError.make(HttpErrorKind.Protocol, "The server reset the HTTP/2 stream.")}})
+            run List<MuxEnded>.append(&mut ended.*, MuxEnded {stream: move gone, result: MuxResult.Fail {error: HttpError.make(HttpErrorKind.Protocol, "The server reset the HTTP/2 stream.")}})
           }
         }
       }
@@ -2883,7 +2975,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
         drop code
         let at = streamAt(&streams.*, stream)
         if at != usize.MAX {
-          run endStream(&mut driver.*, &mut streams.*, at, MuxResult.Fail {error: HttpError.make(HttpErrorKind.Protocol, "The HTTP/2 response is malformed.")}, &mut ended)
+          run endStream(&mut driver.*, &mut streams.*, at, MuxResult.Fail {error: HttpError.make(HttpErrorKind.Protocol, "The HTTP/2 response is malformed.")}, &mut ended.*)
         }
       }
       Http2Event.Goaway {lastStream, code, debug} => {
@@ -2895,7 +2987,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
         while at < List<MuxStream>.length(&streams.*) {
           if List<MuxStream>.asSlice(&streams.*)[at].id > lastStream {
             let gone = List<MuxStream>.remove(&mut streams.*, at)
-            run List<MuxEnded>.append(&mut ended, MuxEnded {stream: move gone, result: MuxResult.Again})
+            run List<MuxEnded>.append(&mut ended.*, MuxEnded {stream: move gone, result: MuxResult.Again})
           } else {
             at = at + usize.ONE
           }
@@ -2903,7 +2995,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
       }
       _ => {}
     }
-    return MuxStepped {ended: move ended, alive: true, accepting: accepting}
+    return MuxStepped {alive: true, accepting: accepting}
   }
 
   // A stream whose connection failed: it goes again when the server never answered it and the
@@ -2945,6 +3037,9 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     let mut streams = List<MuxStream>.make()
     let mut waiting = move more
     let mut retry = List<Forwarded>.make()
+    // The streams each step ends; drained after the step, so one list serves the whole loop.
+    let mut finished = List<MuxEnded>.make()
+    let mut rewritten = Http2Request {storage: Bytes.make(), spans: List<usize>.make(), validated: false, message: noMessage()}
     let mut deferred = Option<Indexed>.none()
     let mut alive = true
     let mut accepting = true
@@ -2987,7 +3082,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
       // Open a stream for each waiting job while the server allows more.
       while accepting && List<Forwarded>.length(&waiting) > usize.ZERO {
         let open = http2Of(&mut link)
-        let opened = run Effect.result(muxOpen(&mut open.driver, &Box<PendingJob>.get(&List<Forwarded>.asSlice(&waiting)[0].pending)[usize.ZERO], secure))
+        let opened = run Effect.result(muxOpen(&mut open.driver, &Box<PendingJob>.get(&List<Forwarded>.asSlice(&waiting)[0].pending)[usize.ZERO], secure, &mut rewritten))
         match move opened {
           Result.Success {value: id} => {
             let Forwarded {owner, index, pending} = List<Forwarded>.remove(&mut waiting, usize.ZERO)
@@ -3059,35 +3154,38 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
       idleTurns = usize.ZERO
       let mut sentResults = false
       let open = http2Of(&mut link)
-      let stepped = run Effect.result(muxStep(&mut open.driver, &mut streams)
+      let stepped = run Effect.result(muxStep(&mut open.driver, &mut streams, &mut finished)
         |> Effect.provideMut<HttpTransport>(&mut open.transport))
       match move stepped {
         Result.Success {value} => {
-          let MuxStepped {ended, alive: still, accepting: taking} = move value
+          let MuxStepped {alive: still, accepting: taking} = move value
           if !still { alive = false }
           if !taking { accepting = false }
-          let mut finished = move ended
-          sentResults = List<MuxEnded>.length(&finished) > usize.ZERO
-          while List<MuxEnded>.length(&finished) > usize.ZERO {
-            let MuxEnded {stream, result} = List<MuxEnded>.remove(&mut finished, usize.ZERO)
-            match move result {
-              MuxResult.Answer {received} => {
-                run settleMux(&state.*, done, worker, stream.owner, stream.index, Result<Received, HttpError | OutOfMemoryError>.succeed(move received))
-              }
-              MuxResult.Fail {error} => {
-                run settleMux(&state.*, done, worker, stream.owner, stream.index, Result<Received, HttpError | OutOfMemoryError>.failResult(move error))
-              }
-              MuxResult.Again => {
-                Shared<BatchState>.withMut<()>(&state.*, muxDone(worker))
-                let MuxStream {owner, index, pending, ..} = move stream
-                run List<Forwarded>.append(&mut retry, Forwarded {owner: owner, index: index, pending: move pending})
-              }
-            }
-          }
         }
         Result.Failure {error} => {
           drop error
           alive = false
+        }
+      }
+      // Streams that ended before a step failed are settled too.
+      sentResults = List<MuxEnded>.length(&finished) > usize.ZERO
+      while true {
+        let MuxEnded {stream, result} = match List<MuxEnded>.pop(&mut finished) {
+          Option.Some {value: ending} => move ending
+          Option.None => { break }
+        }
+        match move result {
+          MuxResult.Answer {received} => {
+            run settleMux(&state.*, done, worker, stream.owner, stream.index, Result<Received, HttpError | OutOfMemoryError>.succeed(move received))
+          }
+          MuxResult.Fail {error} => {
+            run settleMux(&state.*, done, worker, stream.owner, stream.index, Result<Received, HttpError | OutOfMemoryError>.failResult(move error))
+          }
+          MuxResult.Again => {
+            Shared<BatchState>.withMut<()>(&state.*, muxDone(worker))
+            let MuxStream {owner, index, pending, ..} = move stream
+            run List<Forwarded>.append(&mut retry, Forwarded {owner: owner, index: index, pending: move pending})
+          }
         }
       }
       if sentResults {
