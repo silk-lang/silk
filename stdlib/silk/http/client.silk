@@ -7,8 +7,9 @@
 //! connection.
 //!
 //! # Details
-//! Build a [`Request`] with chained calls, such as `Request.get("/repos").query("page",
-//! "2").bearer(token)`. Building never allocates and never fails. [`Http.send`] checks the request.
+//! Build a [`Request`] with chained calls, such as `Request.get("/repos").bearer(token)`, and add
+//! path segments, query parameters, and headers in place with `run request.query("page", "2")`.
+//! Those three allocate, so they need `? &mut Allocator`. [`Http.send`] checks the request.
 //! A response with any status, also 4xx and 5xx, is a [`Response`]. Call [`Response.expectOk`] to
 //! make a status outside 200 to 299 an error.
 //!
@@ -18,9 +19,8 @@
 //! - `OutOfMemoryError` if the `Allocator` fails.
 //!
 //! # Gotchas
-//! A request holds at most 8 path segments, 16 query parameters, and 32 headers. More fail at send
-//! time with `InvalidRequest`. [`Request.json`] writes only the fields that are visible from your
-//! module. Fields that are private to another module are not written.
+//! [`Request.json`] writes only the fields that are visible from your module. Fields that are
+//! private to another module are not written.
 //!
 //! # Examples
 //! ## Test code that uses Http with a fake provider
@@ -59,7 +59,9 @@
 //! effect fn search() -> i32
 //!   ! HttpError | OutOfMemoryError
 //!   ? &mut Http | &mut Allocator {
-//!   let response = run Http.send(Request.get("/search").query("q", "a b"))
+//!   let mut request = Request.get("/search")
+//!   run request.query("q", "a b")
+//!   let response = run Http.send(move request)
 //!   let checked = run response.expectOk()
 //!   let text = run checked.text()
 //!   if text != "found" {
@@ -110,13 +112,6 @@ import silk.uri.reference {ParseError as UriError}
 import silk.num.usize
 import silk.io.writer {Writer, WriterError}
 import silk.collections.list {List}
-
-/// The maximum number of path segments in a request.
-pub const MAX_PATH_SEGMENTS: usize = 8
-/// The maximum number of query parameters in a request.
-pub const MAX_QUERY_PARAMETERS: usize = 16
-/// The maximum number of headers that you add to a request.
-pub const MAX_HEADERS: usize = 32
 
 /// What kind of failure an [`HttpError`] reports.
 pub enum HttpErrorKind {
@@ -357,29 +352,27 @@ pub union Body<'a> {
   },
 }
 
-/// An HTTP request that you build with chained calls. Nothing is checked or sent until
-/// [`Http.send`].
+/// An HTTP request. Nothing is checked or sent until [`Http.send`].
 ///
 /// # Details
 ///
-/// Build it with chained calls, such as `Request.get("/repos").query("page", "2").bearer(token)`.
-/// Nothing is checked until [`Http.send`]. Only [`Request.json`] allocates.
+/// Set the method, body, bearer token, and limits with chained calls, such as
+/// `Request.get("/repos").bearer(token)`. Add path segments, query parameters, and headers in
+/// place with [`Request.path`], [`Request.query`], and [`Request.header`]. Those keep their parts
+/// in lists from the ambient allocator, so a request holds any number of them and stays small.
 ///
 /// # Gotchas
 ///
-/// A request holds at most 8 path segments, 16 query parameters, and 32 headers. More fail at send
-/// time with `InvalidRequest`. [`Request.json`] writes only the fields that are visible from your
-/// module.
+/// [`Request.json`] writes only the fields that are visible from your module.
 pub struct Request<'a> {
   methodValue: Method<'static>,
   urlValue: string<'a>,
-  pathValues: [string<'a>; 8],
-  pathCount: usize,
-  queryValues: [Field<'a>; 16],
-  queryCount: usize,
-  headerValues: [Field<'a>; 32],
-  headerCount: usize,
-  overflowValue: bool,
+  // The bytes of every path segment, query parameter, and header, in the order they were added.
+  // Each span says where one of them is, so the request borrows nothing for them.
+  partBytes: Bytes,
+  pathSpans: List<PartSpan>,
+  querySpans: List<PartSpan>,
+  headerSpans: List<PartSpan>,
   bodyValue: Body<'a>,
   timeoutValue: Option<u64>,
   maxBodyValue: Option<usize>,
@@ -390,27 +383,13 @@ pub struct Request<'a> {
 impl<'a> Request<'a> {
   /// Starts a request with an explicit method.
   pub fn make(method: Method<'static>, url: string<'a>) -> Request<'a> {
-    let empty = Field<'a> {name: "", value: ""}
     return Request<'a> {
       methodValue: method,
       urlValue: url,
-      pathValues: [
-        "", "", "", "", "", "", "", "",
-      ],
-      pathCount: usize.ZERO,
-      queryValues: [
-        empty, empty, empty, empty, empty, empty, empty, empty,
-        empty, empty, empty, empty, empty, empty, empty, empty,
-      ],
-      queryCount: usize.ZERO,
-      headerValues: [
-        empty, empty, empty, empty, empty, empty, empty, empty,
-        empty, empty, empty, empty, empty, empty, empty, empty,
-        empty, empty, empty, empty, empty, empty, empty, empty,
-        empty, empty, empty, empty, empty, empty, empty, empty,
-      ],
-      headerCount: usize.ZERO,
-      overflowValue: false,
+      partBytes: Bytes.make(),
+      pathSpans: List<PartSpan>.make(),
+      querySpans: List<PartSpan>.make(),
+      headerSpans: List<PartSpan>.make(),
       bodyValue: Body<'a>.Empty,
       timeoutValue: Option<u64>.none(),
       maxBodyValue: Option<usize>.none(),
@@ -434,45 +413,30 @@ impl<'a> Request<'a> {
   /// Starts an OPTIONS request.
   pub fn options(url: string<'a>) -> Request<'a> { return Request<'a>.make(Method.options(), url) }
 
-  /// Adds `segment` to the end of the URL path, as given, such as `"/repos"`.
-  pub fn path(self: Self, segment: string<'a>) -> Request<'a> {
-    let mut next = move self
-    if next.pathCount == MAX_PATH_SEGMENTS {
-      next.overflowValue = true
-      return move next
-    }
-    next.pathValues[next.pathCount] = segment
-    next.pathCount = next.pathCount + usize.ONE
-    return move next
+  /// Adds `segment` to the end of the URL path, as given, such as `"/repos"`. The request keeps a
+  /// copy.
+  pub effect fn path(self: &mut Self, segment: string) -> () ! OutOfMemoryError ? &mut Allocator {
+    let span = run appendPart(&mut self.partBytes, segment, "")
+    run List<PartSpan>.append(&mut self.pathSpans, span)
   }
 
   /// Adds a query parameter. The name and the value are percent-encoded when the request is sent.
-  pub fn query(self: Self, name: string<'a>, value: string<'a>) -> Request<'a> {
-    let mut next = move self
-    if next.queryCount == MAX_QUERY_PARAMETERS {
-      next.overflowValue = true
-      return move next
-    }
-    next.queryValues[next.queryCount] = Field<'a> {name: name, value: value}
-    next.queryCount = next.queryCount + usize.ONE
-    return move next
+  /// The request keeps a copy of both.
+  pub effect fn query(self: &mut Self, name: string, value: string) -> () ! OutOfMemoryError ? &mut Allocator {
+    let span = run appendPart(&mut self.partBytes, name, value)
+    run List<PartSpan>.append(&mut self.querySpans, span)
   }
 
-  /// Adds a header. The name and value are validated when the request is sent.
+  /// Adds a header. The name and value are validated when the request is sent. The request keeps a
+  /// copy of both.
   ///
   /// # Details
   ///
   /// `User-Agent`, `Accept`, `Authorization`, and `Host` replace the generated values.
   /// `Content-Length` and `Transfer-Encoding` are generated from the body and are rejected.
-  pub fn header(self: Self, name: string<'a>, value: string<'a>) -> Request<'a> {
-    let mut next = move self
-    if next.headerCount == MAX_HEADERS {
-      next.overflowValue = true
-      return move next
-    }
-    next.headerValues[next.headerCount] = Field<'a> {name: name, value: value}
-    next.headerCount = next.headerCount + usize.ONE
-    return move next
+  pub effect fn header(self: &mut Self, name: string, value: string) -> () ! OutOfMemoryError ? &mut Allocator {
+    let span = run appendPart(&mut self.partBytes, name, value)
+    run List<PartSpan>.append(&mut self.headerSpans, span)
   }
 
   /// Sets `Authorization: Bearer <token>`, replacing any `Authorization` header.
@@ -544,19 +508,32 @@ impl<'a> Request<'a> {
   /// Returns the URL exactly as given, before path segments and query parameters.
   pub fn url(self: &Self) -> string<'a> { return self.urlValue }
 
-  /// Returns the path segments in the order they were added.
-  pub fn paths(self: &Self) -> &[string<'a>] {
-    return Slice.view<string<'a>>(&self.pathValues, usize.ZERO, self.pathCount)
+  /// Returns the number of path segments.
+  pub fn pathCount(self: &Self) -> usize { return List<PartSpan>.length(&self.pathSpans) }
+
+  /// Returns path segment `index`, in the order they were added. It traps if `index` is not less
+  /// than [`Request.pathCount`].
+  pub fn pathAt<'r>(self: &'r Self, index: usize) -> string<'r> {
+    let span = List<PartSpan>.get(&self.pathSpans, index)
+    return partField(Bytes.asSlice(&self.partBytes), span).name
   }
 
-  /// Returns the query parameters in the order they were added.
-  pub fn queryParameters(self: &Self) -> &[Field<'a>] {
-    return Slice.view<Field<'a>>(&self.queryValues, usize.ZERO, self.queryCount)
+  /// Returns the number of query parameters.
+  pub fn queryCount(self: &Self) -> usize { return List<PartSpan>.length(&self.querySpans) }
+
+  /// Returns query parameter `index`, in the order they were added. It traps if `index` is not less
+  /// than [`Request.queryCount`].
+  pub fn queryAt<'r>(self: &'r Self, index: usize) -> Field<'r> {
+    return partField(Bytes.asSlice(&self.partBytes), List<PartSpan>.get(&self.querySpans, index))
   }
 
-  /// Returns the headers in the order they were added.
-  pub fn headers(self: &Self) -> &[Field<'a>] {
-    return Slice.view<Field<'a>>(&self.headerValues, usize.ZERO, self.headerCount)
+  /// Returns the number of headers.
+  pub fn headerCount(self: &Self) -> usize { return List<PartSpan>.length(&self.headerSpans) }
+
+  /// Returns header `index`, in the order they were added. It traps if `index` is not less than
+  /// [`Request.headerCount`].
+  pub fn headerAt<'r>(self: &'r Self, index: usize) -> Field<'r> {
+    return partField(Bytes.asSlice(&self.partBytes), List<PartSpan>.get(&self.headerSpans, index))
   }
 
   /// Returns the payload bytes, empty when there is no body.
@@ -584,10 +561,6 @@ impl<'a> Request<'a> {
       _ => true
     }
   }
-
-  /// Returns `true` if the request has more parts than it can hold. [`Http.send`] then fails with
-  /// `InvalidRequest`.
-  pub fn overflowed(self: &Self) -> bool { return self.overflowValue }
 
   /// Returns the per-request timeout in seconds, when set.
   pub fn timeout(self: &Self) -> Option<u64> {
@@ -620,15 +593,15 @@ impl<'a> Request<'a> {
     }
     run Bytes.append(&mut output, String.utf8Bytes(self.urlValue))
     let mut index = usize.ZERO
-    while index < self.pathCount {
-      run Bytes.append(&mut output, String.utf8Bytes(self.pathValues[index]))
+    while index < self.pathCount() {
+      run Bytes.append(&mut output, String.utf8Bytes(self.pathAt(index)))
       index = index + usize.ONE
     }
     let mut separator: u8 = 63
     if containsByte(Bytes.asSlice(&output), 63) { separator = 38 }
     index = usize.ZERO
-    while index < self.queryCount {
-      let field = self.queryValues[index]
+    while index < self.queryCount() {
+      let field = self.queryAt(index)
       let mark = [separator]
       run Bytes.append(&mut output, &mark)
       run UriPercent.appendEncoded(&mut output, String.utf8Bytes(field.name), PercentComponent.Unreserved)
@@ -640,6 +613,34 @@ impl<'a> Request<'a> {
     // Every appended byte is UTF-8 from a string or ASCII from the percent encoder.
     return unsafe String.fromBytesUnchecked(move output)
   }
+}
+
+// Where one path segment, query parameter, or header sits in `Request.partBytes`: the name, then
+// the value right after it. A path segment has no value.
+struct PartSpan {
+  start: usize,
+  nameLength: usize,
+  valueLength: usize,
+}
+
+impl Copy for PartSpan {}
+
+effect fn appendPart(bytes: &mut Bytes, name: string, value: string) -> PartSpan ! OutOfMemoryError ? &mut Allocator {
+  let start = Bytes.length(&bytes.*)
+  let nameBytes = String.utf8Bytes(name)
+  let valueBytes = String.utf8Bytes(value)
+  run Bytes.append(&mut bytes.*, nameBytes)
+  run Bytes.append(&mut bytes.*, valueBytes)
+  return PartSpan {start: start, nameLength: nameBytes.length, valueLength: valueBytes.length}
+}
+
+fn partField<'r>(bytes: &'r [u8], span: PartSpan) -> Field<'r> {
+  let name = Slice.view<u8>(bytes, span.start, span.nameLength)
+  let value = Slice.view<u8>(bytes, span.start + span.nameLength, span.valueLength)
+  // `appendPart` copied both from strings, so they are UTF-8.
+  let nameText = unsafe String.fromUtf8Unchecked(name)
+  let valueText = unsafe String.fromUtf8Unchecked(value)
+  return Field<'r> {name: nameText, value: valueText}
 }
 
 /// A complete response: status, headers, and the whole body in memory.
@@ -807,9 +808,7 @@ pub service Http {
   /// # Errors
   ///
   /// - `HttpError` for all failures. Its `kind` tells what failed, `status` has the response
-  ///   status if one arrived, and `cause` keeps the error from the lower module. A request with
-  ///   more than 8 path segments, 16 query parameters, or 32 headers fails with
-  ///   `InvalidRequest`.
+  ///   status if one arrived, and `cause` keeps the error from the lower module.
   /// - `OutOfMemoryError` if the `Allocator` fails.
   effect fn send(request: Request<'_>) -> Response ! HttpError | OutOfMemoryError ? &mut Http | &mut Allocator
 
