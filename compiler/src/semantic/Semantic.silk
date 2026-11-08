@@ -4525,6 +4525,8 @@ pub struct Semantic {
   // The image the store adopted, which the image it writes next carries checks from.
   heldImage: Option<CacheImage.Image>,
   heldImageCorrupt: bool,
+  // A prior check supplied at least one still-valid check or MIR-entry dependency root.
+  reusableAdoptedChecks: bool,
   // The declaration check roots of the adopted image an unlinked store reused without reading
   // them yet, by the hash of their module's stable key, read when a sweep of their module runs
   // (`readPendingDeclarations`); `usize.MAX` once read.
@@ -94217,6 +94219,7 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
     carriedRoots: List<usize>.make(),
     heldImage: Option<CacheImage.Image>.none(),
     heldImageCorrupt: false,
+    reusableAdoptedChecks: false,
     pendingLookup: InternIndex.make(),
     pendingRoots: List<usize>.make(),
     checkRuns: usize.ZERO,
@@ -94952,6 +94955,7 @@ impl Semantic {
     ! Cycle | OutOfMemoryError ? &mut Allocator | &mut Types {
     // Record indices belong to exactly one held image, including when an existing store adopts another.
     Semantic.clearEscapeBudgetRecords(&mut self.*)
+    self.reusableAdoptedChecks = false
     let mut held = move image
     let attempted = run Effect.result(Semantic.adoptFrom(&mut self.*, request, &mut held, linked))
     let adopted = match move attempted {
@@ -94966,6 +94970,7 @@ impl Semantic {
     // An image whose nodes do not read is not adopted.
     return match move adopted {
       Option<Adopted>.Some {value} => {
+        self.reusableAdoptedChecks = value.roots > usize.ZERO || List<usize>.length(&self.escapeImage.roots) > usize.ZERO
         self.heldImage = Option<CacheImage.Image>.some(move held)
         self.heldImageCorrupt = false
         move value
@@ -97094,6 +97099,17 @@ impl Semantic {
     self.frontierExpected = List<usize>.length(&modules) + 3
     self.frontierStarted = run frontierNow()
     self.frontierAvailable = self.processWorkersAllowed && !self.resolver.revisable && frontierExperiment() && checked.length > 32
+    if self.frontierAvailable && self.reusableAdoptedChecks && !self.heldImageCorrupt {
+      // An edited runtime already has useful serial replay state. Forking that state duplicates
+      // its dependency image and repeats cache publication. A different runtime remains cold.
+      let word = run internKey(&mut self.resolver, Key {family: Family.ModuleCheck, module: ordinal, name: usize.ONE,
+        declaration: usize.MAX, member: usize.ONE, external: false})
+      if let Option<Bytes>.Some {value: stable} = move run stableUnit(&self.resolver, u64.toUsize(word.value)) {
+        if let Option<CacheImage.Image>.Some {value: image} = &self.heldImage {
+          if frontierUsesReplay(&image, Bytes.asSlice(&stable), self.reusableAdoptedChecks, self.heldImageCorrupt) { self.frontierAvailable = false }
+        }
+      }
+    }
 
     let escapes = run Semantic.keptEscapes(&mut self.*, &mut request.*, ordinal, List<usize>.asSlice(&modules),
       List<DeclarationId>.asSlice(&concrete), false)
@@ -111175,6 +111191,22 @@ impl Semantic {
   }
 }
 
+// Exact module/profile/scope identity keeps an unrelated dependency image from making a new
+// runtime appear warm. The old runtime root may be stale: ordinary replay still checks it.
+fn frontierUsesReplay(image: &CacheImage.Image, stable: &[u8], reusable: bool, corrupt: bool) -> bool {
+  if !reusable || corrupt { return false }
+  let roots = List<CacheImage.Root>.asSlice(&image.roots)
+  let mut at = usize.ZERO
+  while at < roots.length {
+    let key = Bytes.asSlice(&roots[at].key)
+    at = at + usize.ONE
+    if same(key, stable) { return true }
+    let mut named = Span.make(usize.ZERO, usize.ZERO)
+    if buildRootKind(key, &mut named) == 3 && same(StableKey.view(key, named), stable) { return true }
+  }
+  return false
+}
+
 effect fn artifactCacheCheckKey(module: &ModuleId, name: usize) -> Bytes ! OutOfMemoryError ? &mut Allocator {
   let mut key = Bytes.make()
   run RuntimeEncoding.word(&mut key, u8.toU64(Family.value(Family.ModuleCheck)))
@@ -111186,6 +111218,36 @@ effect fn artifactCacheCheckKey(module: &ModuleId, name: usize) -> Bytes ! OutOf
   run RuntimeEncoding.word(&mut key, 1)
   run RuntimeEncoding.word(&mut key, 0)
   return move key
+}
+
+effect fn frontierWarmPolicyClaims() -> () ! InvalidModulePath | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let runtime = run ModuleId.make(b"memory", b"application", b"main")
+  let dependency = run ModuleId.make(b"memory", b"dependency", b"library")
+  let stable = run artifactCacheCheckKey(&runtime, 1)
+  let mut image = CacheImage.make()
+  run Testing.expect(!frontierUsesReplay(&image, Bytes.asSlice(&stable), true, false), "empty images leave a runtime cold")
+  let node = run CacheImage.addNode(&mut image, &[])
+  run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {
+    key: run artifactCacheCheckKey(&dependency, 1), answer: Bytes.make(), node: node})
+  run Testing.expect(!frontierUsesReplay(&image, Bytes.asSlice(&stable), true, false), "a reusable dependency does not warm an unrelated runtime")
+  run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {
+    key: run Bytes.copy(Bytes.asSlice(&stable)), answer: Bytes.make(), node: node})
+  run Testing.expect(frontierUsesReplay(&image, Bytes.asSlice(&stable), true, false), "an earlier runtime with reusable dependency evidence uses serial replay")
+  run Testing.expect(!frontierUsesReplay(&image, Bytes.asSlice(&stable), false, false), "an entirely invalid image cannot disable a cold frontier")
+  run Testing.expect(!frontierUsesReplay(&image, Bytes.asSlice(&stable), true, true), "a corrupt image cannot disable a cold frontier")
+  let mut anotherScope = run Bytes.copy(Bytes.asSlice(&stable))
+  run RuntimeEncoding.word(&mut anotherScope, 7)
+  run Testing.expect(!frontierUsesReplay(&image, Bytes.asSlice(&anotherScope), true, false), "runtime scope and profile identity must match exactly")
+  drop List<CacheImage.Root>.remove(&mut image.roots, usize.ONE)
+  run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {
+    key: run escapeRecordKey(Bytes.asSlice(&stable)), answer: Bytes.make(), node: node})
+  run Testing.expect(frontierUsesReplay(&image, Bytes.asSlice(&stable), true, false), "a prior runtime record remains useful when its aggregate check is stale")
+}
+
+test effect fn frontierWarmPolicyKeepsColdAndUnrelatedRuntimesParallel() -> ()
+! InvalidModulePath | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run frontierWarmPolicyClaims() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
 effect fn artifactCacheTransportClaims() -> () ! InvalidModulePath | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
