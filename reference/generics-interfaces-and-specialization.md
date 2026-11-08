@@ -1326,6 +1326,31 @@ fn width<T: Arg>() -> i32 {
 A static root such as the `static if` condition assumes its declaration's bounds, so `takes<T>()`
 there is proved by `T: Arg` and evaluated once `T` is known.
 
+A static operation may have a default body, which a conformance that omits the operation runs with
+`Self` bound to the provider. A static operation may return any static value, a struct included,
+and a `let static` binding in a generic body may read one through a bounded helper such as
+`takes<T>()`; the body is checked once its type arguments are known.
+
+```silk
+interface Line {
+  static fn flag() -> bool { return true }
+}
+
+struct Plain {}
+
+impl Line for Plain {}
+
+static fn flagOf<T: Line>() -> bool {
+  return Line.flag()
+}
+
+fn chosen<T: Line>() -> i32 {
+  let static flagged = flagOf<T>()
+  if flagged { return 1 }
+  return 2
+}
+```
+
 **Boundary:** A static operation has no runtime witness, so runtime code cannot call it, and a
 runtime operation cannot be called during static evaluation. Static and runtime witnesses do not
 substitute for each other in either direction, and each `static` parameter of the operation must
