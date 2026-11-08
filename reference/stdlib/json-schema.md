@@ -11,7 +11,7 @@ through the caller's `SchemaResolver`; this module performs no filesystem or net
 Parse the root with `Json.parseExact` or `SchemaValue.parseToml` and keep it alive while using
 the compiled schema. Formats are annotations unless assertion is explicitly enabled.
 
-Import as `Schema` with `import silk.json.schema { Schema }`.
+Import as `JsonSchema` with `import silk.json.schema { JsonSchema }`.
 
 Public declarations: 8.
 
@@ -225,17 +225,17 @@ NonterminatingReference
 
 A reference cycle applies a schema to the same instance without progress.
 
-<a id="SchemaError"></a>
+<a id="JsonSchemaError"></a>
 
-## `SchemaError`
+## `JsonSchemaError`
 
 ```silk
-pub struct SchemaError
+pub struct JsonSchemaError
 ```
 
 A schema compilation or evaluation failure, distinct from an invalid instance.
 
-<a id="SchemaError.reason"></a>
+<a id="JsonSchemaError.reason"></a>
 
 ### Field `reason`
 
@@ -245,7 +245,7 @@ pub reason: SchemaReason
 
 Stable category of the failure.
 
-<a id="SchemaError.keywordLocation"></a>
+<a id="JsonSchemaError.keywordLocation"></a>
 
 ### Field `keywordLocation`
 
@@ -255,7 +255,7 @@ pub keywordLocation: String
 
 JSON Pointer to the problematic schema keyword.
 
-<a id="SchemaError.detail"></a>
+<a id="JsonSchemaError.detail"></a>
 
 ### Field `detail`
 
@@ -323,7 +323,7 @@ Human-readable validation error.
 pub struct Output
 ```
 
-A validation result. `Schema.toJson` converts it to the standard basic output representation.
+A validation result. `JsonSchema.toJson` converts it to the standard basic output representation.
 
 <a id="Output.valid"></a>
 
@@ -360,25 +360,25 @@ An indexed schema that borrows its root and owns all resolved external document 
 Keep only the root tree alive and immutable for this value's lifetime. The resolver and
 its inputs may be dropped after compilation. Validation never requires a resolver.
 
-<a id="Schema"></a>
+<a id="JsonSchema"></a>
 
-## `Schema`
+## `JsonSchema`
 
 ```silk
-pub struct Schema
+pub struct JsonSchema
 ```
 
 Operations for compiling JSON Schema resources and validating instance trees.
 
-<a id="Schema.impl"></a>
+<a id="JsonSchema.impl"></a>
 
-## Implementation `Schema`
+## Implementation `JsonSchema`
 
 ```silk
-impl Schema
+impl JsonSchema
 ```
 
-<a id="Schema.impl.options"></a>
+<a id="JsonSchema.impl.options"></a>
 
 ### Associated function `options`
 
@@ -388,14 +388,14 @@ pub fn options(draft: Draft) -> Options
 
 Returns options for `draft`, with format and content assertions disabled.
 
-<a id="Schema.impl.compile"></a>
+<a id="JsonSchema.impl.compile"></a>
 
 ### Associated function `compile`
 
 ```silk
 pub effect fn compile<'a>(schema: &'a Value, baseUri: string,
     options: Options) -> CompiledSchema<'a>
-    ! SchemaError | SchemaResolutionError | RegexError | OutOfMemoryError
+    ! JsonSchemaError | SchemaResolutionError | RegexError | OutOfMemoryError
     ? &mut SchemaResolver | &mut Allocator
 ```
 
@@ -410,32 +410,32 @@ resolved trees are owned by the result, and the root remains borrowed.
 
 #### Errors
 
-- `SchemaError` for an invalid schema, dialect, vocabulary, identifier, or reference.
+- `JsonSchemaError` for an invalid schema, dialect, vocabulary, identifier, or reference.
 - `RegexError` for an invalid regular expression in a schema.
 - `SchemaResolutionError` for operational resolver failures, propagated unchanged.
 - `OutOfMemoryError` if schema indexing cannot allocate storage.
 
-<a id="Schema.impl.validate"></a>
+<a id="JsonSchema.impl.validate"></a>
 
 ### Associated function `validate`
 
 ```silk
 pub effect fn validate(compiled: &CompiledSchema<'_>, instance: &Value) -> Output
-    ! SchemaError | RegexError | OutOfMemoryError ? &mut Allocator
+    ! JsonSchemaError | RegexError | OutOfMemoryError ? &mut Allocator
 ```
 
 Applies a compiled schema and returns JSON Schema basic output.
 
 #### Errors
 
-- `SchemaError.NonterminatingReference` for a reference cycle without instance progress.
-- `SchemaError.InvalidInstance` if a manually constructed instance contains a non-finite number.
+- `JsonSchemaError.NonterminatingReference` for a reference cycle without instance progress.
+- `JsonSchemaError.InvalidInstance` if a manually constructed instance contains a non-finite number.
 - `RegexError` if a regular expression cannot be evaluated.
 - `OutOfMemoryError` if evaluation or diagnostics cannot allocate storage.
 
 An invalid instance is not an error effect: the returned `Output.valid` is false.
 
-<a id="Schema.impl.toJson"></a>
+<a id="JsonSchema.impl.toJson"></a>
 
 ### Associated function `toJson`
 

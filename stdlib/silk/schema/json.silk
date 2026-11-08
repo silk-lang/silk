@@ -1,0 +1,546 @@
+//! Read and write `Schema` types as JSON.
+//!
+//! # When to use
+//! Call [`SchemaJson.decode`] to read a value of a `silk.schema.schema.Schema` type from JSON text,
+//! and [`SchemaJson.encode`] to write one to the ambient `Writer`. Use `silk.json.value.Json` to
+//! work with a JSON document whose shape is not known in advance.
+//!
+//! # Details
+//! Decoding streams over the text with `silk.json.scanner.JsonScanner` and builds the value
+//! directly, with no tree of JSON values in between. Object members may come in any order, and
+//! members the type does not name are skipped. Encoding writes compact JSON, with struct fields in
+//! declaration order.
+//!
+//! # Examples
+//! ## Report where a value failed
+//! ```silk
+//! import silk.collections.list { List }
+//! import silk.core.effect { Effect }
+//! import silk.core.result { Result }
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.schema.issue { IssueReason, SchemaError }
+//! import silk.schema.json { SchemaJson }
+//! import silk.schema.schema { Schema }
+//!
+//! struct Limits {
+//!   pub ports: List<u16>,
+//! }
+//!
+//! impl Schema for Limits {}
+//!
+//! pub effect fn main() -> i32 ! OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let decoded = run Effect.result(SchemaJson.decode<Limits>(b"{\"ports\": [80, 70000]}"))
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!   return match move decoded {
+//!     Result<Limits, SchemaError | OutOfMemoryError>.Success {..} => 1
+//!     Result<Limits, SchemaError | OutOfMemoryError>.Failure {error} => match move error {
+//!       SchemaError {path, issue} => if path.view() == "ports[1]" && issue.reason == IssueReason.InvalidValue { 0 } else { 2 }
+//!       OutOfMemoryError {} => 3
+//!     }
+//!   }
+//! }
+//! ```
+//!
+//! @category Data formats
+
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.io.writer { Writer, WriterError }
+import silk.json.output { JsonOutput }
+import silk.json.scanner { JsonError, JsonScanner, JsonSpan, JsonToken }
+import silk.json.text { JsonText }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.usize
+import silk.schema.issue { Issue, IssueReason, SchemaError, SchemaErrors }
+import silk.schema.schema { PathSegment, Schema, SchemaPath, SchemaReader, SchemaWriter, Schemas }
+import silk.text.format { Format, ParseError, NotANumber, OutOfRange }
+import silk.text.string { InvalidUtf8, String }
+
+/// The owner of the JSON entry points. It has no fields and is never constructed.
+pub struct SchemaJson {}
+
+impl SchemaJson {
+  /// Reads one value of type `T` from the JSON text `bytes`.
+  ///
+  /// # Details
+  ///
+  /// The whole input must be one JSON value, with optional white space around it.
+  ///
+  /// # Errors
+  ///
+  /// - `SchemaError` if the text is not valid JSON or does not hold a `T`. Its `path` names the part
+  ///   that failed, and its issue has the byte offset when the problem is in the text.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the value.
+  pub effect fn decode<T: Schema>(bytes: &[u8]) -> T ! SchemaError | OutOfMemoryError ? &mut Allocator {
+    let mut reader = JsonSchemaReader.make(bytes)
+    let read = run Effect.result(readAll<T>(&mut reader))
+    return match move read {
+      Result<T, Issue | OutOfMemoryError>.Success {value} => move value
+      Result<T, Issue | OutOfMemoryError>.Failure {error} => match move error {
+        Issue {reason, expected, offset} => {
+          fail SchemaError {path: run SchemaPath.text(&reader.path), issue: Issue {reason: reason, expected: expected, offset: offset}}
+        }
+        OutOfMemoryError {} => { fail OutOfMemoryError {} }
+      }
+    }
+  }
+
+  /// Reads one value of type `T` from the JSON text `bytes`, reporting every failed check.
+  ///
+  /// # Details
+  ///
+  /// Each failed `Schema.check` is recorded and reading goes on, so one call lists every field
+  /// that is out of range. Reading stops at the first part whose shape is wrong, such as text
+  /// where a number belongs, which is listed last.
+  ///
+  /// # Errors
+  ///
+  /// - `SchemaErrors` with every problem found, in input order.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the value.
+  pub effect fn decodeAll<T: Schema>(bytes: &[u8]) -> T ! SchemaErrors | OutOfMemoryError ? &mut Allocator {
+    let mut reader = JsonSchemaReader.collectingAll(bytes)
+    let read = run Effect.result(readAll<T>(&mut reader))
+    return match move read {
+      Result<T, Issue | OutOfMemoryError>.Success {value} => {
+        let errors = JsonSchemaReader.intoErrors(move reader)
+        if List<SchemaError>.length(&errors) != 0 { fail SchemaErrors {errors: move errors} }
+        move value
+      }
+      Result<T, Issue | OutOfMemoryError>.Failure {error} => match move error {
+        Issue {reason, expected, offset} => {
+          let path = run SchemaPath.text(&reader.path)
+          let mut errors = JsonSchemaReader.intoErrors(move reader)
+          run List<SchemaError>.append(&mut errors, SchemaError {path: move path, issue: Issue {reason: reason, expected: expected, offset: offset}})
+          fail SchemaErrors {errors: move errors}
+        }
+        OutOfMemoryError {} => { fail OutOfMemoryError {} }
+      }
+    }
+  }
+
+  /// Writes `value` as compact JSON to the ambient `Writer`.
+  ///
+  /// # Errors
+  ///
+  /// - `SchemaError` if JSON cannot hold the value, such as a NaN or an infinity, or a value nested
+  ///   more than 64 levels deep. Its path is empty.
+  /// - `WriterError` if the `Writer` fails. Bytes that it accepted before the failure stay written.
+  /// - `OutOfMemoryError` if a codec needs memory that the `Allocator` cannot supply.
+  pub effect fn encode<T: Schema>(value: &T)
+    -> () ! SchemaError | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
+    let mut writer = JsonSchemaWriter.make()
+    return run Effect.catch<Issue>(Schemas.write<T, JsonSchemaWriter>(value, &mut writer),
+      effect fn(issue: Issue) -> () ! SchemaError { fail SchemaError {path: String.make(), issue: issue} })
+  }
+}
+
+effect fn readAll<T: Schema>(reader: &mut JsonSchemaReader<'_>) -> T ! Issue | OutOfMemoryError ? &mut Allocator {
+  let value = run Schemas.read<T, JsonSchemaReader<'_>>(&mut reader.*)
+  match run token(&mut reader.scanner) {
+    JsonToken.EndOfInput => {}
+    _ => { fail Issue.at(IssueReason.InvalidSyntax, "the end of the input", JsonScanner.offset(&reader.scanner)) }
+  }
+  return move value
+}
+
+/// A `SchemaReader` over JSON text.
+///
+/// # When to use
+///
+/// [`SchemaJson.decode`] uses it. Use it directly to read a value from the middle of a larger
+/// program's own JSON handling.
+pub struct JsonSchemaReader<'input> {
+  scanner: JsonScanner<'input>,
+  objects: List<JsonScanner<'input>>,
+  path: SchemaPath,
+  collecting: bool,
+  errors: List<SchemaError>,
+}
+
+impl<'input> JsonSchemaReader<'input> {
+  /// Returns a reader at the start of `input`.
+  pub fn make(input: &'input [u8]) -> JsonSchemaReader<'input> {
+    return JsonSchemaReader<'input> {
+      scanner: JsonScanner.make(input),
+      objects: List<JsonScanner<'input>>.make(),
+      path: SchemaPath.make(),
+      collecting: false,
+      errors: List<SchemaError>.make(),
+    }
+  }
+
+  /// Returns a reader at the start of `input` that records every failed check instead of
+  /// stopping at the first. Read them with [`JsonSchemaReader.intoErrors`].
+  pub fn collectingAll(input: &'input [u8]) -> JsonSchemaReader<'input> {
+    let mut reader = JsonSchemaReader<'input>.make(input)
+    reader.collecting = true
+    return move reader
+  }
+
+  /// Returns the failed checks the reader recorded, in the order they were found.
+  pub fn intoErrors(self: Self) -> List<SchemaError> {
+    return move self.errors
+  }
+}
+
+fn syntax(error: JsonError) -> Issue {
+  return match error.offset {
+    Option<usize>.Some {value} => Issue.at(IssueReason.InvalidSyntax, "valid JSON", value)
+    Option<usize>.None => Issue.make(IssueReason.InvalidSyntax, "valid JSON")
+  }
+}
+
+effect fn token(scanner: &mut JsonScanner<'_>) -> JsonToken ! Issue {
+  return match move JsonScanner.next(&mut scanner.*) {
+    Result<JsonToken, JsonError>.Success {value} => value
+    Result<JsonToken, JsonError>.Failure {error} => { fail syntax(move error) }
+  }
+}
+
+effect fn peekToken(scanner: &mut JsonScanner<'_>) -> JsonToken ! Issue {
+  return match move JsonScanner.peek(&mut scanner.*) {
+    Result<JsonToken, JsonError>.Success {value} => value
+    Result<JsonToken, JsonError>.Failure {error} => { fail syntax(move error) }
+  }
+}
+
+// Reads past one complete value, nested lists and objects included.
+effect fn skipValue(scanner: &mut JsonScanner<'_>) -> () ! Issue {
+  let mut depth = usize.ZERO
+  while true {
+    match run token(&mut scanner.*) {
+      JsonToken.ObjectBegin => { depth = depth + usize.ONE }
+      JsonToken.ArrayBegin => { depth = depth + usize.ONE }
+      JsonToken.ObjectEnd => { depth = depth - usize.ONE }
+      JsonToken.ArrayEnd => { depth = depth - usize.ONE }
+      JsonToken.KeySeparator => { continue }
+      JsonToken.ValueSeparator => { continue }
+      JsonToken.EndOfInput => { fail Issue.at(IssueReason.InvalidSyntax, "valid JSON", JsonScanner.offset(&scanner.*)) }
+      _ => {}
+    }
+    if depth == usize.ZERO { return () }
+  }
+  return ()
+}
+
+effect fn numberText<'input>(scanner: &mut JsonScanner<'input>, expected: string<'static>) -> string<'input> ! Issue {
+  return match run token(&mut scanner.*) {
+    JsonToken.Number {span} => unsafe Intrinsic.stringFromUtf8Unchecked(JsonScanner.slice(&scanner.*, span))
+    _ => { fail Issue.at(IssueReason.InvalidType, expected, JsonScanner.offset(&scanner.*)) }
+  }
+}
+
+effect fn parsedNumber<T>(result: Result<T, ParseError>, offset: usize, expected: string<'static>) -> T ! Issue {
+  return match move result {
+    Result<T, ParseError>.Success {value} => move value
+    Result<T, ParseError>.Failure {error} => match move error.reason {
+      NotANumber {..} => { fail Issue.at(IssueReason.InvalidType, expected, offset) }
+      OutOfRange {} => { fail Issue.at(IssueReason.InvalidValue, expected, offset) }
+    }
+  }
+}
+
+fn sameBytes(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+effect fn keyMatches(scanner: &JsonScanner<'_>, span: JsonSpan, escaped: bool, key: string)
+  -> bool ! Issue | OutOfMemoryError ? &mut Allocator {
+  let wanted = String.utf8Bytes(key)
+  let offset = span.offset
+  let raw = JsonScanner.slice(scanner, span)
+  if !escaped {
+    return raw.length == wanted.length + 2 && sameBytes(Slice.view<u8>(raw, usize.ONE, wanted.length), wanted)
+  }
+  let decoded = match move run Effect.result(JsonText.decode(raw, offset, true)) {
+    Result<Bytes, JsonError | OutOfMemoryError>.Success {value} => move value
+    Result<Bytes, JsonError | OutOfMemoryError>.Failure {error} => match move error {
+      JsonError {..} => { fail Issue.at(IssueReason.InvalidSyntax, "valid JSON", offset) }
+      OutOfMemoryError {} => { fail OutOfMemoryError {} }
+    }
+  }
+  return sameBytes(Bytes.asSlice(&decoded), wanted)
+}
+
+impl<'input> SchemaReader for JsonSchemaReader<'input> {
+  /// Returns the path of the part being read.
+  fn path(self: &mut Self) -> &mut SchemaPath {
+    return &mut self.path
+  }
+
+  /// Fails with the check, or records it and returns when the reader collects every problem.
+  effect fn checkFailed(self: &mut Self, field: Option<string<'static>>, expected: string<'static>)
+    -> () ! Issue | OutOfMemoryError ? &mut Allocator {
+    if let Option<string<'static>>.Some {value: name} = field {
+      run SchemaPath.push(&mut self.path, PathSegment.Field {name: name})
+    }
+    if !self.collecting { fail Issue.checkFailed(expected) }
+    let path = run SchemaPath.text(&self.path)
+    run List<SchemaError>.append(&mut self.errors, SchemaError {path: move path, issue: Issue.checkFailed(expected)})
+    if field.isSome() { SchemaPath.pop(&mut self.path) }
+    return ()
+  }
+
+  /// Reads `true` or `false`.
+  effect fn boolean(self: &mut Self) -> bool ! Issue | OutOfMemoryError ? &mut Allocator {
+    return match run token(&mut self.scanner) {
+      JsonToken.True => true
+      JsonToken.False => false
+      _ => { fail Issue.at(IssueReason.InvalidType, "true or false", JsonScanner.offset(&self.scanner)) }
+    }
+  }
+
+  /// Reads a JSON number as an `i64`.
+  effect fn signed(self: &mut Self) -> i64 ! Issue | OutOfMemoryError ? &mut Allocator {
+    let text = run numberText(&mut self.scanner, "an integer")
+    return run parsedNumber<i64>(Format.signedValue(text), JsonScanner.offset(&self.scanner), "an integer")
+  }
+
+  /// Reads a JSON number as a `u64`.
+  effect fn unsigned(self: &mut Self) -> u64 ! Issue | OutOfMemoryError ? &mut Allocator {
+    let text = run numberText(&mut self.scanner, "a non-negative integer")
+    return run parsedNumber<u64>(Format.unsignedValue(text), JsonScanner.offset(&self.scanner), "a non-negative integer")
+  }
+
+  /// Reads a JSON number as an `f64`.
+  effect fn float(self: &mut Self) -> f64 ! Issue | OutOfMemoryError ? &mut Allocator {
+    let text = run numberText(&mut self.scanner, "a number")
+    return run parsedNumber<f64>(Format.f64Value(text), JsonScanner.offset(&self.scanner), "a number")
+  }
+
+  /// Reads a JSON string, with its escapes decoded.
+  effect fn text(self: &mut Self) -> String ! Issue | OutOfMemoryError ? &mut Allocator {
+    return match run token(&mut self.scanner) {
+      JsonToken.String {span, escaped} => {
+        let offset = span.offset
+        let raw = JsonScanner.slice(&self.scanner, span)
+        let bytes = match move run Effect.result(JsonText.decode(raw, offset, escaped)) {
+          Result<Bytes, JsonError | OutOfMemoryError>.Success {value} => move value
+          Result<Bytes, JsonError | OutOfMemoryError>.Failure {error} => match move error {
+            JsonError {..} => { fail Issue.at(IssueReason.InvalidSyntax, "valid JSON", offset) }
+            OutOfMemoryError {} => { fail OutOfMemoryError {} }
+          }
+        }
+        // The scanner checked the UTF-8 of the string, and each decoded escape is a scalar value.
+        match move String.fromBytes(move bytes) {
+          Result<String, InvalidUtf8>.Success {value} => move value
+          Result<String, InvalidUtf8>.Failure {..} => { fail Issue.at(IssueReason.InvalidSyntax, "valid JSON", offset) }
+        }
+      }
+      _ => { fail Issue.at(IssueReason.InvalidType, "text", JsonScanner.offset(&self.scanner)) }
+    }
+  }
+
+  /// Reads past `null` and returns `true`, or returns `false` for another value.
+  effect fn null(self: &mut Self) -> bool ! Issue | OutOfMemoryError ? &mut Allocator {
+    return match run peekToken(&mut self.scanner) {
+      JsonToken.Null => {
+        let skipped = run token(&mut self.scanner)
+        drop skipped
+        true
+      }
+      _ => false
+    }
+  }
+
+  /// Reads past `[`.
+  effect fn beginList(self: &mut Self) -> () ! Issue | OutOfMemoryError ? &mut Allocator {
+    return match run token(&mut self.scanner) {
+      JsonToken.ArrayBegin => ()
+      _ => { fail Issue.at(IssueReason.InvalidType, "a list", JsonScanner.offset(&self.scanner)) }
+    }
+  }
+
+  /// Returns `true` at the next element, or reads past `]` and returns `false`.
+  effect fn nextElement(self: &mut Self) -> bool ! Issue | OutOfMemoryError ? &mut Allocator {
+    return match run peekToken(&mut self.scanner) {
+      JsonToken.ArrayEnd => {
+        let skipped = run token(&mut self.scanner)
+        drop skipped
+        false
+      }
+      JsonToken.ValueSeparator => {
+        let skipped = run token(&mut self.scanner)
+        drop skipped
+        true
+      }
+      _ => true
+    }
+  }
+
+  /// Checks that an object comes next and remembers where it starts.
+  effect fn beginObject(self: &mut Self) -> () ! Issue | OutOfMemoryError ? &mut Allocator {
+    let start = JsonScanner.fork(&self.scanner)
+    match run peekToken(&mut self.scanner) {
+      JsonToken.ObjectBegin => {}
+      _ => { fail Issue.at(IssueReason.InvalidType, "an object", JsonScanner.offset(&self.scanner)) }
+    }
+    return run List<JsonScanner<'input>>.append(&mut self.objects, move start)
+  }
+
+  /// Searches the object being read for the member `key` and leaves the reader at its value.
+  effect fn member(self: &mut Self, key: string) -> bool ! Issue | OutOfMemoryError ? &mut Allocator {
+    let objects = List<JsonScanner<'input>>.asSlice(&self.objects)
+    let mut scanner = JsonScanner.fork(&objects[objects.length - usize.ONE])
+    match run token(&mut scanner) {
+      JsonToken.ObjectBegin => {}
+      _ => { fail Issue.at(IssueReason.InvalidType, "an object", JsonScanner.offset(&scanner)) }
+    }
+    while true {
+      let matched = match run token(&mut scanner) {
+        JsonToken.ObjectEnd => { return false }
+        JsonToken.String {span, escaped} => run keyMatches(&scanner, span, escaped, key)
+        _ => { fail Issue.at(IssueReason.InvalidSyntax, "valid JSON", JsonScanner.offset(&scanner)) }
+      }
+      match run token(&mut scanner) {
+        JsonToken.KeySeparator => {}
+        _ => { fail Issue.at(IssueReason.InvalidSyntax, "valid JSON", JsonScanner.offset(&scanner)) }
+      }
+      if matched {
+        self.scanner = move scanner
+        return true
+      }
+      run skipValue(&mut scanner)
+      match run token(&mut scanner) {
+        JsonToken.ValueSeparator => {}
+        JsonToken.ObjectEnd => { return false }
+        _ => { fail Issue.at(IssueReason.InvalidSyntax, "valid JSON", JsonScanner.offset(&scanner)) }
+      }
+    }
+    return false
+  }
+
+  /// Reads past the whole object being read.
+  effect fn endObject(self: &mut Self) -> () ! Issue | OutOfMemoryError ? &mut Allocator {
+    let start = match List<JsonScanner<'input>>.pop(&mut self.objects) {
+      Option<JsonScanner<'input>>.Some {value} => move value
+      Option<JsonScanner<'input>>.None => { fail Issue.make(IssueReason.InvalidSyntax, "an object") }
+    }
+    self.scanner = move start
+    return run skipValue(&mut self.scanner)
+  }
+}
+
+const MAX_DEPTH: usize = 64
+
+/// A `SchemaWriter` that writes compact JSON to the ambient `Writer`.
+///
+/// # When to use
+///
+/// [`SchemaJson.encode`] uses it. Use it directly to write a value inside JSON that the program
+/// writes itself.
+pub struct JsonSchemaWriter {
+  first: [bool; 64],
+  depth: usize,
+}
+
+impl JsonSchemaWriter {
+  /// Returns a writer for one top-level value.
+  pub fn make() -> JsonSchemaWriter {
+    return JsonSchemaWriter {first: [false; 64], depth: usize.ZERO}
+  }
+}
+
+effect fn opened(self: &mut JsonSchemaWriter, bracket: &[u8]) -> () ! Issue | WriterError ? &mut Writer {
+  if self.depth + usize.ONE >= MAX_DEPTH { fail Issue.invalidValue("a value nested at most 64 levels deep") }
+  self.depth = self.depth + usize.ONE
+  self.first[self.depth] = true
+  return run Writer.writeAll(bracket)
+}
+
+effect fn closed(self: &mut JsonSchemaWriter, bracket: &[u8]) -> () ! Issue | WriterError ? &mut Writer {
+  self.depth = self.depth - usize.ONE
+  return run Writer.writeAll(bracket)
+}
+
+effect fn separated(self: &mut JsonSchemaWriter) -> () ! Issue | WriterError ? &mut Writer {
+  if self.first[self.depth] {
+    self.first[self.depth] = false
+    return ()
+  }
+  return run Writer.writeAll(b",")
+}
+
+effect fn jsonFailure(error: JsonError) -> () ! Issue {
+  fail Issue.invalidValue("a finite number")
+}
+
+impl SchemaWriter for JsonSchemaWriter {
+  /// Writes `true` or `false`.
+  effect fn boolean(self: &mut Self, value: bool) -> () ! Issue | WriterError ? &mut Writer {
+    if value { return run Writer.writeAll(b"true") }
+    return run Writer.writeAll(b"false")
+  }
+
+  /// Writes the integer in decimal.
+  effect fn signed(self: &mut Self, value: i64) -> () ! Issue | WriterError ? &mut Writer {
+    let mut digits: [u8; 24] = [0; 24]
+    let end = Format.writeI64Display(value, &mut digits, usize.ZERO)
+    return run Writer.writeAll(Slice.view<u8>(&digits, usize.ZERO, end))
+  }
+
+  /// Writes the integer in decimal.
+  effect fn unsigned(self: &mut Self, value: u64) -> () ! Issue | WriterError ? &mut Writer {
+    let mut digits: [u8; 24] = [0; 24]
+    let end = Format.writeU64Display(value, &mut digits, usize.ZERO)
+    return run Writer.writeAll(Slice.view<u8>(&digits, usize.ZERO, end))
+  }
+
+  /// Writes the number. A NaN or an infinity fails with `IssueReason.InvalidValue`.
+  effect fn float(self: &mut Self, value: f64) -> () ! Issue | WriterError ? &mut Writer {
+    return run Effect.catch<JsonError>(JsonOutput.writeFloat(value), jsonFailure)
+  }
+
+  /// Writes a JSON string, with the escapes JSON needs.
+  effect fn text(self: &mut Self, value: string) -> () ! Issue | WriterError ? &mut Writer {
+    return run JsonOutput.writeString(value)
+  }
+
+  /// Writes `null`.
+  effect fn null(self: &mut Self) -> () ! Issue | WriterError ? &mut Writer {
+    return run Writer.writeAll(b"null")
+  }
+
+  /// Writes `[`.
+  effect fn beginList(self: &mut Self) -> () ! Issue | WriterError ? &mut Writer {
+    return run opened(&mut self.*, b"[")
+  }
+
+  /// Writes `,` before every element but the first.
+  effect fn element(self: &mut Self) -> () ! Issue | WriterError ? &mut Writer {
+    return run separated(&mut self.*)
+  }
+
+  /// Writes `]`.
+  effect fn endList(self: &mut Self) -> () ! Issue | WriterError ? &mut Writer {
+    return run closed(&mut self.*, b"]")
+  }
+
+  /// Writes `{`.
+  effect fn beginObject(self: &mut Self) -> () ! Issue | WriterError ? &mut Writer {
+    return run opened(&mut self.*, b"{")
+  }
+
+  /// Writes `,` before every member but the first, then the key and `:`.
+  effect fn key(self: &mut Self, name: string) -> () ! Issue | WriterError ? &mut Writer {
+    run separated(&mut self.*)
+    run JsonOutput.writeString(name)
+    return run Writer.writeAll(b":")
+  }
+
+  /// Writes `}`.
+  effect fn endObject(self: &mut Self) -> () ! Issue | WriterError ? &mut Writer {
+    return run closed(&mut self.*, b"}")
+  }
+}
