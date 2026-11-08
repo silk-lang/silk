@@ -17,6 +17,7 @@ import silk.collections.list {List}
 import silk.core.option {Option}
 import silk.mem.allocator {Allocator, OutOfMemoryError}
 import silk.mem.frozen {Frozen}
+import silk.num.u64
 import silk.num.usize
 import silk.core.effect {Effect}
 
@@ -37,11 +38,11 @@ pub struct TypeTable {
   inputs: List<ContentHash>,
   keys: List<InstanceKey>,
   lookup: InternIndex,
-  // The distinct type nodes alive, their intern hashes in the same order, and the length at
-  // which the next sweep drops the nodes only this table still holds.
+  // The distinct type nodes alive, an open-addressed table over them, and the length at which the
+  // next sweep drops the nodes only this table still holds. A slot is empty (0) or holds the high
+  // half of the node's intern hash above its position plus one, so a probe reads one array.
   nodes: List<Frozen<Type>>,
-  hashes: List<u64>,
-  nodeLookup: InternIndex,
+  slots: List<u64>,
   sweepAt: usize,
 }
 
@@ -52,30 +53,72 @@ impl TypeTable {
   /// An empty table.
   pub fn make() -> TypeTable {
     return TypeTable {inputs: List<ContentHash>.make(), keys: List<InstanceKey>.make(), lookup: InternIndex.make(),
-      nodes: List<Frozen<Type>>.make(), hashes: List<u64>.make(), nodeLookup: InternIndex.make(), sweepAt: FIRST_SWEEP}
+      nodes: List<Frozen<Type>>.make(), slots: List<u64>.make(), sweepAt: FIRST_SWEEP}
   }
 
   effect fn intern(self: &mut Self, node: Type) -> Frozen<Type> ! OutOfMemoryError ? &mut Allocator {
     let hashed = Type.internHash(&node)
-    let mut at = InternIndex.first(&self.nodeLookup, hashed)
-    if at != usize.MAX {
-      let mut scratch = TypeTable.make()
-      // A chain longer than this holds nodes that share a hash but rarely an identity, so a miss
-      // there costs a share and never a scan of all of them.
+    let tag = u64.shiftRight(hashed, 32)
+    let width = List<u64>.length(&self.slots)
+    let mut crowded = false
+    if width != usize.ZERO {
+      let mask = width - usize.ONE
+      let mut at = u64.toUsize(u64.bitAnd(u64.shiftRight(u64.wrappingMultiply(hashed, 0x9E3779B97F4A7C15), 29), usize.toU64(mask)))
+      let mut scratch = PlainTypes {}
+      // Comparisons stop after a few nodes that share the tag, so a crowded run costs a missed
+      // share and never a scan of all of them.
       let mut tries = usize.ZERO
-      while at != usize.MAX && tries < 4 {
-        tries = tries + usize.ONE
-        let known = &List<Frozen<Type>>.asSlice(&self.nodes)[at]
-        if run Type.internEquals(&node, known) |> Effect.provideMut<Types>(&mut scratch) { return Frozen<Type>.clone(known) }
-        at = InternIndex.after(&self.nodeLookup, at)
+      let mut slot = List<u64>.get(&self.slots, at)
+      while slot != 0 && tries < 4 {
+        if u64.shiftRight(slot, 32) == tag {
+          tries = tries + usize.ONE
+          let known = &List<Frozen<Type>>.asSlice(&self.nodes)[u64.toUsize(u64.bitAnd(slot, 0xFFFFFFFF)) - usize.ONE]
+          if run Type.internEquals(&node, known) |> Effect.provideMut<Types>(&mut scratch) { return Frozen<Type>.clone(known) }
+        }
+        at = (at + usize.ONE) & mask
+        slot = List<u64>.get(&self.slots, at)
       }
+      crowded = tries == 4
     }
     let made = run Frozen<Type>.make(move node)
+    // Nodes that hash alike but never compare equal would otherwise pile into one run of slots
+    // that every probe through it walks, so a node is not recorded once its run already holds
+    // enough of them.
+    if crowded { return move made }
     if List<Frozen<Type>>.length(&self.nodes) >= self.sweepAt { run TypeTable.sweep(&mut self.*) }
     run List<Frozen<Type>>.append(&mut self.nodes, Frozen<Type>.clone(&made))
-    run List<u64>.append(&mut self.hashes, hashed)
-    run InternIndex.record(&mut self.nodeLookup, hashed)
+    run TypeTable.place(&mut self.*, tag, hashed)
     return move made
+  }
+
+  // Records the last node, whose intern hash is `hashed`, growing the table to keep it at most
+  // half full.
+  effect fn place(self: &mut Self, tag: u64, hashed: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+    let count = List<Frozen<Type>>.length(&self.nodes)
+    if count + count > List<u64>.length(&self.slots) { run TypeTable.rebuild(&mut self.*, count) }
+    else { TypeTable.put(&mut self.*, tag, hashed, count) }
+  }
+
+  fn put(self: &mut Self, tag: u64, hashed: u64, position: usize) -> () {
+    let mask = List<u64>.length(&self.slots) - usize.ONE
+    let mut at = u64.toUsize(u64.bitAnd(u64.shiftRight(u64.wrappingMultiply(hashed, 0x9E3779B97F4A7C15), 29), usize.toU64(mask)))
+    while List<u64>.get(&self.slots, at) != 0 { at = (at + usize.ONE) & mask }
+    List<u64>.set(&mut self.slots, at, u64.bitOr(u64.shiftLeft(tag, 32), usize.toU64(position)))
+  }
+
+  // Sizes the table for `count` nodes and puts every node back.
+  effect fn rebuild(self: &mut Self, count: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut width = usize.ONE
+    while width < count * 4 { width = width + width }
+    let mut slots = run List<u64>.makeWithCapacity(width)
+    run List<u64>.appendRepeated(&mut slots, 0, width)
+    self.slots = move slots
+    let mut at = usize.ZERO
+    while at < List<Frozen<Type>>.length(&self.nodes) {
+      let hashed = Type.internHash(Frozen<Type>.get(&List<Frozen<Type>>.asSlice(&self.nodes)[at]))
+      TypeTable.put(&mut self.*, u64.shiftRight(hashed, 32), hashed, at + usize.ONE)
+      at = at + usize.ONE
+    }
   }
 
   // Drops the nodes no handle outside the table holds, so the table never keeps a type alive. A
@@ -83,32 +126,15 @@ impl TypeTable {
   // next sweep waits until the table has doubled, so sweeping costs a constant share per node.
   effect fn sweep(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
     let mut nodes = Intrinsic.replace(self.nodes, List<Frozen<Type>>.make())
-    let mut hashes = Intrinsic.replace(self.hashes, List<u64>.make())
-    self.nodeLookup = InternIndex.make()
-    // Taken from the end and then put back, so the kept nodes keep their order.
-    let mut keptNodes = List<Frozen<Type>>.make()
-    let mut keptHashes = List<u64>.make()
+    let total = List<Frozen<Type>>.length(&nodes)
+    let mut kept = run List<Frozen<Type>>.makeWithCapacity(total)
     while let Option<Frozen<Type>>.Some {value: node} = List<Frozen<Type>>.pop(&mut nodes) {
-      let hashed = match List<u64>.pop(&mut hashes) {
-        Option<u64>.Some {value} => value
-        Option<u64>.None => usize.toU64(usize.ZERO)
-      }
-      if Frozen<Type>.count(&node) > usize.ONE {
-        run List<Frozen<Type>>.append(&mut keptNodes, move node)
-        run List<u64>.append(&mut keptHashes, hashed)
-      }
+      if Frozen<Type>.count(&node) > usize.ONE { run List<Frozen<Type>>.append(&mut kept, move node) }
     }
-    while let Option<Frozen<Type>>.Some {value: node} = List<Frozen<Type>>.pop(&mut keptNodes) {
-      let hashed = match List<u64>.pop(&mut keptHashes) {
-        Option<u64>.Some {value} => value
-        Option<u64>.None => usize.toU64(usize.ZERO)
-      }
-      run List<Frozen<Type>>.append(&mut self.nodes, move node)
-      run List<u64>.append(&mut self.hashes, hashed)
-      run InternIndex.record(&mut self.nodeLookup, hashed)
-    }
-    let kept = List<Frozen<Type>>.length(&self.nodes)
-    self.sweepAt = kept + kept
+    self.nodes = move kept
+    let count = List<Frozen<Type>>.length(&self.nodes)
+    run TypeTable.rebuild(&mut self.*, count)
+    self.sweepAt = count + count
     if self.sweepAt < FIRST_SWEEP { self.sweepAt = FIRST_SWEEP }
   }
 
@@ -128,6 +154,30 @@ impl TypeTable {
     run List<InstanceKey>.append(&mut self.keys, move key)
     return run InternIndex.record(&mut self.lookup, input.high)
   }
+}
+
+// The types an intern comparison builds while it runs: never shared, and with no canonical keys,
+// as an empty table would give, but with nothing to make or drop.
+struct PlainTypes {}
+
+impl PlainTypes {
+  effect fn intern(self: &mut Self, node: Type) -> Frozen<Type> ! OutOfMemoryError ? &mut Allocator {
+    return run Frozen<Type>.make(move node)
+  }
+
+  effect fn canonical(self: &mut Self, input: ContentHash) -> Option<InstanceKey> ! OutOfMemoryError ? &mut Allocator {
+    return Option<InstanceKey>.none()
+  }
+
+  effect fn keepCanonical(self: &mut Self, input: ContentHash, key: InstanceKey) -> () ! OutOfMemoryError ? &mut Allocator {
+    return ()
+  }
+}
+
+impl Types for PlainTypes {
+  intern: PlainTypes.intern
+  canonical: PlainTypes.canonical
+  keepCanonical: PlainTypes.keepCanonical
 }
 
 impl Types for TypeTable {
