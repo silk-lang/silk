@@ -632,6 +632,24 @@ pub effect fn open(self: &mut Self, fields: &[Field<'_>], endStream: bool) -> u3
 Opens a client request stream. GOAWAY, exhausted identifiers, and peer stream limits refuse
 new streams.
 
+<a id="Connection.impl.openValidated"></a>
+
+### Method `openValidated`
+
+```silk
+pub unsafe effect fn openValidated(self: &mut Self, fields: &[Field<'_>], endStream: bool, message: Fields.Message) -> u32
+    ! ProtocolError | OutOfMemoryError
+    ? &mut Allocator
+```
+
+Opens a client request stream like `open`, for fields the caller already validated.
+
+#### Safety
+
+`fields` must pass `http2_headers.validate` as a request section, except that its
+`:authority` may be any bytes, and `message` must be what that validation returns for them.
+An authority other than the one this connection last checked is validated in full.
+
 <a id="Connection.impl.sendHeaders"></a>
 
 ### Method `sendHeaders`
