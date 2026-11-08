@@ -275,7 +275,13 @@ pub struct Connection {
   decoder: Decoder,
   encoder: Encoder,
   streams: List<Stream>,
+  // How many entries of `streams` are open or half closed, by which endpoint opened them.
+  openLocal: u32,
+  openRemote: u32,
   origins: List<RequestOrigin>,
+  // The `:authority` of the last request fields that passed validation, which the next request
+  // fields on the connection need not parse again when they repeat it.
+  checkedAuthority: Bytes,
   input: Bytes,
   wire: Bytes,
   outputOffset: usize,
@@ -328,7 +334,10 @@ impl Connection {
       decoder: Decoder.make(4096, limits.fields, u32.toUsize(limits.headerBytes)),
       encoder: Encoder.make(4096),
       streams: List<Stream>.make(),
+      openLocal: 0,
+      openRemote: 0,
       origins: List<RequestOrigin>.make(),
+      checkedAuthority: Bytes.make(),
       input: Bytes.make(),
       wire: Bytes.make(),
       outputOffset: 0,
@@ -464,7 +473,13 @@ impl Connection {
     if self.lastLocal != 0 {
       id = self.lastLocal + 2
     }
-    let message = run Fields.validate(fields, Section.Request, id)
+    let message = run Fields.validateExcept(
+      fields,
+      Section.Request,
+      id,
+      Bytes.asSlice(&self.checkedAuthority)
+    )
+    run rememberAuthority(&mut self.*, fields)
     if endStream && message.hasLength && message.length != 0 {
       fail ProtocolError { code: Frame.PROTOCOL_ERROR, stream: id }
     }
@@ -477,7 +492,7 @@ impl Connection {
     value.sendLength = message.length
     value.local = !endStream
     prune(&mut self.*)
-    run List.append(&mut self.streams, value)
+    run add(&mut self.*, value)
     self.lastLocal = id
     if self.limits.push {
       run saveOrigin(&mut self.*, id, fields)
@@ -542,7 +557,7 @@ impl Connection {
       value.local = false
     }
     run headers(&mut self.*, id, 0, fields, endStream)
-    List.set(&mut self.streams, index, value)
+    store(&mut self.*, index, value)
   }
 
   /// Queues as many body bytes as flow control, the frame size, and output space allow. END_STREAM
@@ -602,7 +617,7 @@ impl Connection {
     if finish {
       value.local = false
     }
-    List.set(&mut self.streams, index, value)
+    store(&mut self.*, index, value)
     return length
   }
 
@@ -631,7 +646,7 @@ impl Connection {
       run window(&mut self.*, id, count)
       value.receiveWindow = value.receiveWindow + u32.toI64(count)
     }
-    List.set(&mut self.streams, index, value)
+    store(&mut self.*, index, value)
   }
 
   /// Cancels an existing stream and queues RST_STREAM. Queued incoming body credit is returned to
@@ -706,7 +721,7 @@ impl Connection {
     value.receivedFinal = true
     value.head = message.head
     prune(&mut self.*)
-    run List.append(&mut self.streams, value)
+    run add(&mut self.*, value)
     self.lastLocal = id
     run headers(&mut self.*, associated, id, fields, false)
     return id
@@ -737,18 +752,68 @@ fn idle(self: &Connection, id: u32) -> bool {
   return id > self.lastRemote
 }
 
-fn active(self: &Connection, initiatedLocally: bool) -> u32 {
-  let values = List.asSlice(&self.streams)
-  let mut count: u32 = 0
+// Keeps the `:authority` of request fields that passed validation as the connection's checked
+// authority.
+effect fn rememberAuthority(self: &mut Connection, fields: &[Field<'_>]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
   let mut index: usize = 0
-  while index < values.length {
-    let value = values[index]
-    if (value.local || value.remote) && local(&self.*, value.id) == initiatedLocally {
-      count = count + 1
+  while index < fields.length {
+    let field = fields[index]
+    if field.name.length == 0 || field.name[0] != 58 {
+      return ()
+    }
+    if equal(field.name, b":authority") {
+      if !equal(Bytes.asSlice(&self.checkedAuthority), field.value) {
+        Bytes.clear(&mut self.checkedAuthority)
+        run Bytes.append(&mut self.checkedAuthority, field.value)
+      }
+      return ()
     }
     index = index + 1
   }
-  return count
+}
+
+fn active(self: &Connection, initiatedLocally: bool) -> u32 {
+  if initiatedLocally {
+    return self.openLocal
+  }
+  return self.openRemote
+}
+
+// Adds one to the open count of `value`'s initiator when the stream is open or half closed, and
+// takes one away when `remove` is set.
+fn tally(self: &mut Connection, value: &Stream, remove: bool) -> () {
+  if !value.local && !value.remote {
+    return ()
+  }
+  if local(&self.*, value.id) {
+    if remove {
+      self.openLocal = self.openLocal - 1
+    } else {
+      self.openLocal = self.openLocal + 1
+    }
+  } else if remove {
+    self.openRemote = self.openRemote - 1
+  } else {
+    self.openRemote = self.openRemote + 1
+  }
+}
+
+// Replaces the stream at `index`. Every change to a known stream goes through here, so that the
+// open counts stay exact.
+fn store(self: &mut Connection, index: usize, value: Stream) -> () {
+  let old = List.get(&self.streams, index)
+  tally(&mut self.*, &old, true)
+  tally(&mut self.*, &value, false)
+  List.set(&mut self.streams, index, value)
+}
+
+effect fn add(self: &mut Connection, value: Stream) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run List.append(&mut self.streams, value)
+  tally(&mut self.*, &value, false)
 }
 
 // Forgets the oldest closed streams once more than 64 streams are known, down to 32 closed ones,
@@ -767,10 +832,17 @@ fn prune(self: &mut Connection) -> () {
     }
     index = index + 1
   }
+  if closed <= 32 {
+    return ()
+  }
+  // Moves the kept streams down over the forgotten ones in one pass.
+  let mut excess = closed - 32
+  let length = List.length(&self.streams)
+  let mut kept: usize = 0
   index = 0
-  while closed > 32 && index < List.length(&self.streams) {
+  while index < length {
     let value = List.get(&self.streams, index)
-    if !value.local && !value.remote && value.uncredited == 0 {
+    if excess > 0 && !value.local && !value.remote && value.uncredited == 0 {
       let mut origin: usize = 0
       while origin < List.length(&self.origins) {
         if List.asSlice(&self.origins)[origin].stream == value.id {
@@ -779,12 +851,16 @@ fn prune(self: &mut Connection) -> () {
         }
         origin = origin + 1
       }
-      drop List.remove(&mut self.streams, index)
-      closed = closed - 1
+      excess = excess - 1
     } else {
-      index = index + 1
+      if kept != index {
+        List.set(&mut self.streams, kept, value)
+      }
+      kept = kept + 1
     }
+    index = index + 1
   }
+  List.truncate(&mut self.streams, kept)
 }
 
 effect fn setting(output: &mut Bytes, id: u8, value: u32) -> ()
@@ -836,7 +912,7 @@ effect fn closeStream(self: &mut Connection, id: u32) -> ()
     value.remote = false
     value.reservedLocal = false
     value.reservedRemote = false
-    List.set(&mut self.streams, index, value)
+    store(&mut self.*, index, value)
   }
 }
 
@@ -854,13 +930,13 @@ effect fn reset(self: &mut Connection, id: u32, code: u32) -> ()
     let mut closed = stream(id, self.peerWindow, receiveWindow(&self.*))
     closed.local = false
     closed.remote = false
-    run List.append(&mut self.streams, closed)
+    run add(&mut self.*, closed)
   }
   let index = find(&self.*, id)
   if index < List.length(&self.streams) {
     let mut value = List.get(&self.streams, index)
     value.resetSent = true
-    List.set(&mut self.streams, index, value)
+    store(&mut self.*, index, value)
   }
 }
 
@@ -1123,7 +1199,7 @@ effect fn frame(self: &mut Connection, header: FrameHeader, payload: &[u8]) -> E
             fail ProtocolError { code: Frame.FLOW_CONTROL_ERROR, stream: id }
           }
           value.sendWindow = value.sendWindow + u32.toI64(amount)
-          List.set(&mut self.streams, index, value)
+          store(&mut self.*, index, value)
         }
       }
     }
@@ -1173,7 +1249,7 @@ effect fn settings(self: &mut Connection, header: FrameHeader, payload: &[u8]) -
       let mut value = List.get(&self.streams, index)
       if value.remote {
         value.receiveWindow = value.receiveWindow + delta
-        List.set(&mut self.streams, index, value)
+        store(&mut self.*, index, value)
       }
       index = index + 1
     }
@@ -1217,7 +1293,7 @@ effect fn settings(self: &mut Connection, header: FrameHeader, payload: &[u8]) -
             fail ProtocolError { code: Frame.FLOW_CONTROL_ERROR, stream: 0 }
           }
           entry.sendWindow = entry.sendWindow + delta
-          List.set(&mut self.streams, index, entry)
+          store(&mut self.*, index, entry)
         }
         index = index + 1
       }
@@ -1273,7 +1349,7 @@ effect fn data(self: &mut Connection, header: FrameHeader, payload: &[u8]) -> Ev
   let length = payload.length - start - padding
   value.uncredited = value.uncredited + usize.toU32(payload.length)
   self.uncredited = self.uncredited + usize.toU32(payload.length)
-  List.set(&mut self.streams, index, value)
+  store(&mut self.*, index, value)
   if value.reservedLocal || value.reservedRemote {
     fail ProtocolError { code: Frame.PROTOCOL_ERROR, stream: 0 }
   }
@@ -1306,7 +1382,7 @@ effect fn data(self: &mut Connection, header: FrameHeader, payload: &[u8]) -> Ev
     && (value.received > value.receiveLength || (end && value.received != value.receiveLength)) {
     fail ProtocolError { code: Frame.PROTOCOL_ERROR, stream: id }
   }
-  List.set(&mut self.streams, index, value)
+  store(&mut self.*, index, value)
   if start + padding > 0 {
     run Connection.release(&mut self.*, id, usize.toU32(start + padding))
     value = List.get(&self.streams, index)
@@ -1314,7 +1390,7 @@ effect fn data(self: &mut Connection, header: FrameHeader, payload: &[u8]) -> Ev
   if end {
     value.remote = false
   }
-  List.set(&mut self.streams, index, value)
+  store(&mut self.*, index, value)
   return Event.Data {
     stream: id,
     bytes: run Bytes.copy(Slice.view(payload, start, length)),
@@ -1446,7 +1522,7 @@ effect fn fieldSection(self: &mut Connection, id: u32, fields: FieldBlock) -> Ev
     value.sentFinal = true
     value.head = message.head
     prune(&mut self.*)
-    run List.append(&mut self.streams, value)
+    run add(&mut self.*, value)
     drop views
     return Event.Push { stream: id, promised: promised, fields: move fields }
   }
@@ -1457,7 +1533,7 @@ effect fn fieldSection(self: &mut Connection, id: u32, fields: FieldBlock) -> Ev
     }
     prune(&mut self.*)
     let opened = stream(id, self.peerWindow, receiveWindow(&self.*))
-    run List.append(&mut self.streams, opened)
+    run add(&mut self.*, opened)
   }
   let index = find(&self.*, id)
   if index == List.length(&self.streams) {
@@ -1486,7 +1562,20 @@ effect fn fieldSection(self: &mut Connection, id: u32, fields: FieldBlock) -> Ev
   if value.receivedFinal {
     section = Section.Trailers
   }
-  let message = run Fields.validate(List.asSlice(&views), move section, id)
+  let request = match &section {
+    Section.Request => true
+    Section.Response => false
+    Section.Trailers => false
+  }
+  let message = run Fields.validateExcept(
+    List.asSlice(&views),
+    move section,
+    id,
+    Bytes.asSlice(&self.checkedAuthority)
+  )
+  if request {
+    run rememberAuthority(&mut self.*, List.asSlice(&views))
+  }
   if value.tunnel {
     fail ProtocolError { code: Frame.PROTOCOL_ERROR, stream: id }
   }
@@ -1526,7 +1615,7 @@ effect fn fieldSection(self: &mut Connection, id: u32, fields: FieldBlock) -> Ev
   if end {
     value.remote = false
   }
-  List.set(&mut self.streams, index, value)
+  store(&mut self.*, index, value)
   drop views
   return Event.Headers { stream: id, fields: move fields, endStream: end }
 }
