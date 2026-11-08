@@ -215,6 +215,48 @@ The list contains only the `pub` fields, even when the caller is the module that
 `Intrinsic.reflectFields<Owner>()` directly to list the fields that the calling module can
 see.
 
+<a id="Reflect.impl.field"></a>
+
+### Associated function `field`
+
+```silk
+pub static fn field<Owner, Value>(label: string<'static>) -> Intrinsic.Field<Owner, Value>
+```
+
+Returns the compile-time descriptor of the field of `Owner` named `label`.
+
+#### Details
+
+Use it to name one field by its label, such as a command line option that fills the field
+`verbose`. Pass the descriptor to [`Reflect.borrowField`](#Reflect.impl.borrowField) to read the field at runtime.
+
+#### Gotchas
+
+Static evaluation stops at the call when `Owner` has no `pub` field named `label`, or when
+that field's type is not `Value`.
+
+#### Examples
+```silk
+import silk.core.reflect { Reflect }
+
+struct Flags {
+  pub verbose: bool,
+  pub depth: u32,
+}
+
+fn depthOf(flags: &Flags) -> u32 {
+  return Reflect.borrowField<Flags, u32>(flags, Reflect.field<Flags, u32>("depth")).*
+}
+
+pub fn main() -> i32 {
+  let flags = Flags { verbose: false, depth: 3 }
+  if depthOf(&flags) != 3 {
+    return 1
+  }
+  return 0
+}
+```
+
 <a id="Reflect.impl.typeKind"></a>
 
 ### Associated function `typeKind`
