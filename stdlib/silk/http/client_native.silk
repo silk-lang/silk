@@ -97,7 +97,12 @@ import silk.http.exchange {
   RouteTransport,
 }
 import silk.http.exchange_native as ExchangeNative
-import silk.http.exchange_native {NativeExchangeError, NativeRouteProvider, NativeTransport, Options}
+import silk.http.exchange_native {AlpnPolicy, Negotiated, NativeExchangeError, NativeRouteProvider, NativeTransport, Options}
+import silk.http.headers {OwnedHeaders}
+import silk.http.hpack {Field as Http2Field, Header as Http2Header}
+import silk.http.http2 {Connection as Http2Connection, Event as Http2Event, Limits as Http2Limits, Role as Http2Role}
+import silk.http.http2_connection {Driver}
+import silk.http.http2_frame {ProtocolError}
 import silk.tls.certificate_path {ValidationError, ValidationReason}
 import silk.http.headers {Headers, Limits as HeaderLimits}
 import silk.http.body {Framing}
@@ -309,7 +314,387 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   // holds kilobytes of record state, and a box moves as one pointer between the pool and a task.
   struct IdleConnection {
     origin: Origin,
-    connection: Connection<NativeTransport>,
+    link: Link,
+  }
+
+  // ---- HTTP/2 ----
+  //
+  // A direct https connection offers `h2`, then `http/1.1`. When the server selects `h2`, each
+  // request on it is one stream: the prepared HTTP/1.1 head is rewritten as HTTP/2 fields, and the
+  // response is read whole, as `exchangeBody` reads it.
+
+  // A connection that speaks HTTP/2, with its transport and its protocol state.
+  struct Http2Link {
+    transport: NativeTransport,
+    driver: Driver,
+    // The peer sent GOAWAY, or the connection failed: no new stream goes on it.
+    closed: bool,
+  }
+
+  // The protocol of a kept connection.
+  union Link {
+    Http1 {connection: Connection<NativeTransport>},
+    Http2 {link: Box<Http2Link>},
+  }
+
+  fn isHttp2(idle: &List<Box<IdleConnection>>, index: usize) -> bool {
+    let kept = List<Box<IdleConnection>>.asSlice(&idle.*)
+    let entry = &Box<IdleConnection>.get(&kept[index])[usize.ZERO]
+    return match &entry.link {
+      Link.Http1 {..} => false
+      Link.Http2 {..} => true
+    }
+  }
+
+  // Whether another request can go out on `link`. An HTTP/2 connection can carry one unless the
+  // peer has sent GOAWAY or the connection failed; frames the peer sends while it is idle, such as
+  // PING or SETTINGS, are read with the next response.
+  fn linkReusable(link: &Link) -> bool {
+    return match &link.* {
+      Link.Http1 {connection} => ExchangeNative.reusable(&connection)
+      Link.Http2 {link: kept} => {
+        let open = &Box<Http2Link>.get(&kept)[usize.ZERO]
+        !open.closed && !Driver.finished(&open.driver)
+      }
+    }
+  }
+
+  // Closes `link`, ignoring failures: the connection is being dropped. An HTTP/2 connection closes
+  // without GOAWAY, as an HTTP/1.1 connection closes without a last request.
+  effect fn closeLink(link: &mut Link) -> () {
+    match &mut link.* {
+      Link.Http1 {connection} => {
+        let closed = run Effect.result(Exchange.close(&mut connection))
+        drop closed
+      }
+      Link.Http2 {link: kept} => {
+        let open = &mut Box<Http2Link>.getMut(&mut kept)[usize.ZERO]
+        let closed = run Effect.result(HttpTransport.close())
+          |> Effect.provideMut<HttpTransport>(&mut open.transport)
+        drop closed
+      }
+    }
+    return ()
+  }
+
+  // Makes the kept form of a connection that `acquireNegotiatedOwned` opened.
+  effect fn linkOf(negotiated: Negotiated) -> Link ! ProtocolError | OutOfMemoryError ? &mut Allocator {
+    return match move negotiated {
+      Negotiated.Http1 {connection} => Link.Http1 {connection: move connection}
+      Negotiated.Http2 {transport} => {
+        let driver = run Driver.make(Http2Role.Client, Http2Limits.defaults())
+        Link.Http2 {link: run Box<Http2Link>.make(Http2Link {transport: move transport, driver: move driver, closed: false})}
+      }
+    }
+  }
+
+  // Sends `exchange` as one stream on the HTTP/2 connection at `index`, and reads the whole response.
+  // It returns none when the connection closed before the response began, so that an idempotent
+  // request can go again on a new connection.
+  effect fn exchangeHttp2(idle: &mut List<Box<IdleConnection>>, index: usize, exchange: Direct<'_>) -> Option<Received>
+  ! HttpError | OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock | &mut Random {
+    let kept = List<Box<IdleConnection>>.asMutSlice(&mut idle.*)
+    let entry = &mut Box<IdleConnection>.getMut(&mut kept[index])[usize.ZERO]
+    let secure = Origin.secure(&entry.origin)
+    let open = match &mut entry.link {
+      Link.Http2 {link} => &mut Box<Http2Link>.getMut(&mut link)[usize.ZERO]
+      Link.Http1 {..} => { fail HttpError.make(HttpErrorKind.Protocol, "The connection does not speak HTTP/2.") }
+    }
+    let result = run Effect.result(streamHttp2(&mut open.driver, exchange, secure)
+      |> Effect.provideMut<HttpTransport>(&mut open.transport))
+    return match move result {
+      Result.Success {value} => {
+        if !value.reusable { open.closed = true }
+        move value.received
+      }
+      Result.Failure {error} => {
+        open.closed = true
+        match move error {
+          HttpError failure => { fail move failure }
+          OutOfMemoryError failure => { fail move failure }
+          ProtocolError failure => {
+            drop failure
+            fail HttpError.make(HttpErrorKind.Protocol, "The HTTP/2 connection failed.")
+          }
+          TransportError failure => {
+            if transportTimedOut(&failure) {
+              fail HttpError.make(HttpErrorKind.Timeout, "The request deadline passed.")
+            }
+            drop failure
+            // A transport failure before any response leaves the request unanswered: it can go
+            // again on a new connection.
+            Option<Received>.none()
+          }
+        }
+      }
+    }
+  }
+
+  fn unanswered() -> HttpError {
+    return HttpError.make(HttpErrorKind.Protocol, "The server closed the HTTP/2 connection before it answered.")
+  }
+
+  struct Streamed {
+    received: Option<Received>,
+    reusable: bool,
+  }
+
+  // The rewritten request: its HTTP/2 fields point into `storage`.
+  struct Http2Request {
+    storage: Bytes,
+    // Name start, name length, value start, value length, for each field.
+    spans: List<usize>,
+  }
+
+  // Rewrites the HTTP/1.1 head `head` as HTTP/2 fields: the request line becomes `:method`,
+  // `:scheme` and `:path`, `Host` becomes `:authority`, names are lowercased, and the fields that
+  // HTTP/2 forbids (RFC 9113 section 8.2.2) are left out.
+  effect fn rewriteRequest(head: &[u8], secure: bool) -> Http2Request ! HttpError | OutOfMemoryError ? &mut Allocator {
+    let mut storage = run Bytes.copy(head)
+    let mut spans = List<usize>.make()
+    let bytes = Bytes.asMutSlice(&mut storage)
+    let mut space = usize.ZERO
+    while space < bytes.length && bytes[space] != 32 { space = space + usize.ONE }
+    let mut second = space + usize.ONE
+    while second < bytes.length && bytes[second] != 32 { second = second + usize.ONE }
+    let mut lineEnd = second
+    while lineEnd < bytes.length && bytes[lineEnd] != 13 { lineEnd = lineEnd + usize.ONE }
+    if second >= bytes.length || lineEnd + usize.ONE >= bytes.length {
+      fail HttpError.make(HttpErrorKind.InvalidRequest, "The request head cannot be sent over HTTP/2.")
+    }
+    run appendSpan(&mut spans, usize.MAX, 0, 0, space)
+    run appendSpan(&mut spans, usize.MAX - usize.ONE, if secure { 1 } else { 0 }, 0, 0)
+    run appendSpan(&mut spans, usize.MAX - 2, 0, space + usize.ONE, second - space - usize.ONE)
+    // The authority goes in its slot once `Host` is found; until then it is empty.
+    run appendSpan(&mut spans, usize.MAX - 3, 0, 0, 0)
+    let mut start = lineEnd + 2
+    while start + usize.ONE < bytes.length && bytes[start] != 13 {
+      let mut colon = start
+      while colon < bytes.length && bytes[colon] != 58 { colon = colon + usize.ONE }
+      let mut end = colon
+      while end < bytes.length && bytes[end] != 13 { end = end + usize.ONE }
+      if colon >= end || end >= bytes.length { break }
+      let mut at = start
+      while at < colon {
+        if bytes[at] >= 65 && bytes[at] <= 90 { bytes[at] = bytes[at] + 32 }
+        at = at + usize.ONE
+      }
+      let mut valueStart = colon + usize.ONE
+      while valueStart < end && (bytes[valueStart] == 32 || bytes[valueStart] == 9) { valueStart = valueStart + usize.ONE }
+      let name = Slice.view<u8>(&bytes, start, colon - start)
+      if bytesEqual(name, b"host") {
+        List<usize>.set(&mut spans, 14, valueStart)
+        List<usize>.set(&mut spans, 15, end - valueStart)
+      } else if !forbiddenInHttp2(name) {
+        run appendSpan(&mut spans, start, colon - start, valueStart, end - valueStart)
+      }
+      start = end + 2
+    }
+    return Http2Request {storage: move storage, spans: move spans}
+  }
+
+  effect fn appendSpan(spans: &mut List<usize>, nameStart: usize, nameLength: usize, valueStart: usize, valueLength: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    run List<usize>.append(&mut spans.*, nameStart)
+    run List<usize>.append(&mut spans.*, nameLength)
+    run List<usize>.append(&mut spans.*, valueStart)
+    run List<usize>.append(&mut spans.*, valueLength)
+    return ()
+  }
+
+  fn forbiddenInHttp2(name: &[u8]) -> bool {
+    return bytesEqual(name, b"connection") || bytesEqual(name, b"keep-alive") || bytesEqual(name, b"proxy-connection")
+      || bytesEqual(name, b"transfer-encoding") || bytesEqual(name, b"upgrade") || bytesEqual(name, b"te")
+  }
+
+  fn bytesEqual(left: &[u8], right: &[u8]) -> bool {
+    if left.length != right.length { return false }
+    let mut index = usize.ZERO
+    while index < left.length {
+      if left[index] != right[index] { return false }
+      index = index + usize.ONE
+    }
+    return true
+  }
+
+  // The HTTP/2 fields of `request`.
+  effect fn fieldsOf<'a>(request: &'a Http2Request) -> List<Http2Field<'a>> ! OutOfMemoryError ? &mut Allocator {
+    let bytes = Bytes.asSlice(&request.storage)
+    let spans = List<usize>.asSlice(&request.spans)
+    let mut fields = List<Http2Field<'a>>.make()
+    run List<Http2Field<'a>>.reserveExact(&mut fields, spans.length / 4)
+    let mut at = usize.ZERO
+    while at < spans.length {
+      let nameStart = spans[at]
+      let name: &'a [u8] = if nameStart == usize.MAX { b":method" } else if nameStart == usize.MAX - usize.ONE {
+        b":scheme"
+      } else if nameStart == usize.MAX - 2 { b":path" } else if nameStart == usize.MAX - 3 { b":authority" } else {
+        Slice.view<u8>(bytes, nameStart, spans[at + usize.ONE])
+      }
+      let value: &'a [u8] = if nameStart == usize.MAX - usize.ONE {
+        if spans[at + usize.ONE] == 1 { b"https" } else { b"http" }
+      } else {
+        Slice.view<u8>(bytes, spans[at + 2], spans[at + 3])
+      }
+      run List<Http2Field<'a>>.append(&mut fields, Http2Field<'a> {name: name, value: value, sensitive: false})
+      at = at + 4
+    }
+    return move fields
+  }
+
+  effect fn streamHttp2(driver: &mut Driver, exchange: Direct<'_>, secure: bool) -> Streamed
+  ! HttpError | ProtocolError | TransportError | OutOfMemoryError
+  ? &mut HttpTransport | &mut Allocator | &mut MonotonicClock | &mut Random {
+    let rewritten = run rewriteRequest(exchange.request.bytes(), secure)
+    let fields = run fieldsOf(&rewritten)
+    let payload = exchange.body
+    let id = run Http2Connection.open(Driver.connection(&mut driver.*), List<Http2Field<'_>>.asSlice(&fields), payload.length == usize.ZERO)
+    drop fields
+    let deadline = SystemClock.make(SystemClock.seconds(exchange.deadline), SystemClock.nanoseconds(exchange.deadline))
+    let mut sent = usize.ZERO
+    let mut status: u16 = 0
+    let mut head = Option<OwnedResponseHead>.none()
+    let mut body = Bytes.make()
+    let mut reusable = true
+    while true {
+      while sent < payload.length {
+        let wrote = run Http2Connection.sendData(Driver.connection(&mut driver.*), id, Slice.view<u8>(payload, sent, payload.length - sent), true)
+        if wrote == usize.ZERO { break }
+        sent = sent + wrote
+      }
+      let next = run Driver.next(&mut driver.*, Option<Instant>.some(SystemClock.make(SystemClock.seconds(&deadline), SystemClock.nanoseconds(&deadline))))
+      let event = match move next {
+        Option.Some {value} => move value
+        Option.None => {
+          if status == 0 { return Streamed {received: Option<Received>.none(), reusable: false} }
+          fail HttpError.make(HttpErrorKind.Protocol, "The HTTP/2 connection closed before the response ended.")
+        }
+      }
+      match move event {
+        Http2Event.Headers {stream, fields: received, endStream} => {
+          if stream == id {
+            if status == 0 {
+              let code = statusField(&received)
+              if code < 100 || code > 999 {
+                fail HttpError.make(HttpErrorKind.Protocol, "The HTTP/2 response has no valid :status.")
+              }
+              // An informational response comes before the final one.
+              if code >= 200 {
+                status = code
+                head = Option<OwnedResponseHead>.some(run headOf(code, &received))
+              }
+            }
+            if endStream && status != 0 { break }
+          }
+        }
+        Http2Event.Data {stream, bytes, endStream} => {
+          let count = Bytes.length(&bytes)
+          if stream == id {
+            if count > exchange.maxBody - Bytes.length(&body) {
+              fail HttpError {
+                kind: HttpErrorKind.TooLarge,
+                message: "The response body exceeds the configured limit.",
+                status: Option<u16>.some(status),
+                cause: HttpCause.None,
+              }
+            }
+            run Bytes.append(&mut body, Bytes.asSlice(&bytes))
+          }
+          if count > usize.ZERO {
+            run Http2Connection.release(Driver.connection(&mut driver.*), stream, usize.toU32(count))
+          }
+          if stream == id && endStream { break }
+        }
+        Http2Event.Reset {stream, code} => {
+          if stream == id {
+            // REFUSED_STREAM means the server did not process the request (RFC 9113 section 8.7).
+            if code == 7 && status == 0 { return Streamed {received: Option<Received>.none(), reusable: true} }
+            fail HttpError.make(HttpErrorKind.Protocol, "The server reset the HTTP/2 stream.")
+          }
+        }
+        Http2Event.StreamError {stream, code} => {
+          drop code
+          if stream == id { fail HttpError.make(HttpErrorKind.Protocol, "The HTTP/2 response is malformed.") }
+        }
+        Http2Event.Goaway {lastStream, code, debug} => {
+          drop code
+          reusable = false
+          if lastStream < id { return Streamed {received: Option<Received>.none(), reusable: false} }
+        }
+        _ => {}
+      }
+    }
+    let mut location = Option<String>.none()
+    let kept = match move head {
+      Option.Some {value} => move value
+      Option.None => { fail HttpError.make(HttpErrorKind.Protocol, "The HTTP/2 response has no head.") }
+    }
+    if isRedirect(status) {
+      location = run redirectLocation(&kept)
+    }
+    // The request bytes queued last (WINDOW_UPDATE, RST_STREAM) go out with the next request.
+    return Streamed {
+      received: Option<Received>.some(Received {
+        parts: run Box<ReceivedParts>.make(ReceivedParts {status: status, head: move kept, body: move body, location: move location}),
+      }),
+      reusable: reusable,
+    }
+  }
+
+  fn statusField(fields: &List<Http2Header>) -> u16 {
+    let all = List<Http2Header>.asSlice(&fields.*)
+    let mut index = usize.ZERO
+    while index < all.length {
+      let name = Bytes.asSlice(&all[index].name)
+      if bytesEqual(name, b":status") {
+        let value = Bytes.asSlice(&all[index].value)
+        if value.length != 3 { return 0 }
+        let mut code: u16 = 0
+        let mut at = usize.ZERO
+        while at < 3 {
+          if value[at] < 48 || value[at] > 57 { return 0 }
+          code = code * 10 + u8.toU16(value[at] - 48)
+          at = at + usize.ONE
+        }
+        return code
+      }
+      index = index + usize.ONE
+    }
+    return 0
+  }
+
+  // The response head of an HTTP/2 response: `code`, and the regular fields of `fields`.
+  effect fn headOf(code: u16, fields: &List<Http2Header>) -> OwnedResponseHead ! HttpError | OutOfMemoryError ? &mut Allocator {
+    let all = List<Http2Header>.asSlice(&fields.*)
+    let mut count = usize.ZERO
+    let mut bytes = usize.ZERO
+    let mut index = usize.ZERO
+    while index < all.length {
+      count = count + usize.ONE
+      bytes = bytes + Bytes.length(&all[index].name) + Bytes.length(&all[index].value)
+      index = index + usize.ONE
+    }
+    let mut headers = run OwnedHeaders.withCapacity(count, bytes)
+    index = usize.ZERO
+    while index < all.length {
+      let name = Bytes.asSlice(&all[index].name)
+      if name.length > usize.ZERO && name[0] != 58 {
+        // The HPACK decoder accepted the field, so its name is a lowercase token and its value
+        // has no CR, LF or NUL (RFC 9113 section 8.2.1).
+        run unsafe OwnedHeaders.appendUnchecked(&mut headers, name, Bytes.asSlice(&all[index].value))
+      }
+      index = index + usize.ONE
+    }
+    let status = match move Status.fromCode(code) {
+      Result.Success {value} => value
+      Result.Failure {..} => { fail HttpError.make(HttpErrorKind.Protocol, "The HTTP/2 response has no valid :status.") }
+    }
+    return match move run OwnedResponseHead.make(Version.Http11, status, b"", move headers, Limits.defaults().head.values) {
+      Result.Success {value} => move value
+      Result.Failure {error} => {
+        fail HttpError.caused(HttpErrorKind.Protocol, "The response head exceeds the header limits.", HttpCause.Value {error: move error})
+      }
+    }
   }
 
   impl<'config> NativeHttp<'config> {
@@ -561,6 +946,8 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     options.handshakeNanoseconds = nanoseconds
     // Requests are small writes that wait for an answer, so Nagle's algorithm only adds delay.
     options.noDelay = true
+    // An https connection offers `h2`, then `http/1.1`; the server picks.
+    options.alpn = AlpnPolicy.PreferHttp2
     return move options
   }
 
@@ -1201,7 +1588,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
       scan = scan + usize.ONE
     }
     if found != usize.MAX {
-      if method.idempotent() || ExchangeNative.reusable(&Box<IdleConnection>.get(&pool[found])[usize.ZERO].connection) {
+      if method.idempotent() || linkReusable(&Box<IdleConnection>.get(&pool[found])[usize.ZERO].link) {
         slot = Option<usize>.some(found)
       } else {
         run discard(&mut client.idle, found)
@@ -1259,14 +1646,26 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
       trust = Option<TrustSnapshot>.some(run TrustSource.load(options.trust))
     }
     let connection = if List<Endpoint>.length(&endpoints.*) == usize.ZERO {
-      run ExchangeNative.acquireOwned(origin.*, copyOptions(options), limits.*, move trust, Option<Instant>.none())
+      run ExchangeNative.acquireNegotiatedOwned(origin.*, copyOptions(options), limits.*, move trust, Option<Instant>.none())
     } else {
-      run ExchangeNative.acquireResolvedOwned(origin.*, List<Endpoint>.asSlice(&endpoints.*), copyOptions(options), limits.*, move trust, Option<Instant>.none())
+      run ExchangeNative.acquireResolvedNegotiatedOwned(origin.*, List<Endpoint>.asSlice(&endpoints.*), copyOptions(options), limits.*, move trust, Option<Instant>.none())
+    }
+    let made = run Effect.result(linkOf(move connection))
+    let link = match move made {
+      Result.Success {value} => move value
+      Result.Failure {error} => match move error {
+        // Only invalid limits fail here, and the defaults are valid.
+        ProtocolError failure => {
+          drop failure
+          fail ExchangeError.InvalidLimits
+        }
+        OutOfMemoryError failure => { fail move failure }
+      }
     }
     if List<Box<IdleConnection>>.length(&idle.*) >= MAX_IDLE {
       run discard(&mut idle.*, usize.ZERO)
     }
-    let boxed = run Box<IdleConnection>.make(IdleConnection {origin: origin.*, connection: move connection})
+    let boxed = run Box<IdleConnection>.make(IdleConnection {origin: origin.*, link: move link})
     run List<Box<IdleConnection>>.append(&mut idle.*, move boxed)
     return List<Box<IdleConnection>>.length(&idle.*) - usize.ONE
   }
@@ -1283,26 +1682,46 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   ! HttpError | ExchangeError | NativeExchangeError | ResolverError | NativeSocketError | ConnectionError | IdentityError | TrustSourceError | OutOfMemoryError
   ? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random {
     if let Option.Some {value: index} = slot {
-      // The exchange runs straight on the kept connection, without a helper frame between.
-      let callback = effect fn(live: &mut Live<NativeTransport>) -> Received
-      ! HttpError | ExchangeError | OutOfMemoryError
-      ? &mut Allocator | &mut MonotonicClock | &mut Random {
-        return run exchangeBody(&mut live.*, exchange.body, exchange.maxBody)
-      }
-      let attempt = run Effect.result(Exchange.withExchange(connectionAt(&mut idle.*, index), exchange.request, exchangeOptions(exchange.deadline), move callback))
-      match move attempt {
-        Result.Success {value: received} => {
-          run settle(&mut idle.*, index)
-          return move received
-        }
-        Result.Failure {error} => {
-          run discard(&mut idle.*, index)
-          match move error {
-            ExchangeError failure => {
-              if !exchange.idempotent || !closedByPeer(&failure) { fail move failure }
+      if isHttp2(&idle.*, index) {
+        let tried = run Effect.result(exchangeHttp2(&mut idle.*, index, exchange))
+        match move tried {
+          Result.Success {value} => match move value {
+            Option.Some {value: received} => {
+              run settle(&mut idle.*, index)
+              return move received
             }
-            HttpError failure => { fail move failure }
-            OutOfMemoryError failure => { fail move failure }
+            Option.None => {
+              run discard(&mut idle.*, index)
+              if !exchange.idempotent { fail unanswered() }
+            }
+          }
+          Result.Failure {error} => {
+            run discard(&mut idle.*, index)
+            fail move error
+          }
+        }
+      } else {
+        // The exchange runs straight on the kept connection, without a helper frame between.
+        let callback = effect fn(live: &mut Live<NativeTransport>) -> Received
+        ! HttpError | ExchangeError | OutOfMemoryError
+        ? &mut Allocator | &mut MonotonicClock | &mut Random {
+          return run exchangeBody(&mut live.*, exchange.body, exchange.maxBody)
+        }
+        let attempt = run Effect.result(Exchange.withExchange(connectionAt(&mut idle.*, index), exchange.request, exchangeOptions(exchange.deadline), move callback))
+        match move attempt {
+          Result.Success {value: received} => {
+            run settle(&mut idle.*, index)
+            return move received
+          }
+          Result.Failure {error} => {
+            run discard(&mut idle.*, index)
+            match move error {
+              ExchangeError failure => {
+                if !exchange.idempotent || !closedByPeer(&failure) { fail move failure }
+              }
+              HttpError failure => { fail move failure }
+              OutOfMemoryError failure => { fail move failure }
+            }
           }
         }
       }
@@ -1311,6 +1730,25 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     // exchange on a kept connection.
     let unresolved = List<Endpoint>.make()
     let index = run connectIdle(&mut idle.*, origin, &unresolved, options, limits) |> Effect.provideMut<TrustSource>(&mut trust.*)
+    if isHttp2(&idle.*, index) {
+      let fresh = run Effect.result(exchangeHttp2(&mut idle.*, index, exchange))
+      match move fresh {
+        Result.Success {value} => match move value {
+          Option.Some {value: received} => {
+            run settle(&mut idle.*, index)
+            return move received
+          }
+          Option.None => {
+            run discard(&mut idle.*, index)
+            fail unanswered()
+          }
+        }
+        Result.Failure {error} => {
+          run discard(&mut idle.*, index)
+          fail move error
+        }
+      }
+    }
     // The exchange runs straight on the kept connection, without a helper frame between.
     let callback = effect fn(live: &mut Live<NativeTransport>) -> Received
     ! HttpError | ExchangeError | OutOfMemoryError
@@ -1353,7 +1791,12 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   // The connection at `index` in `idle`.
   fn connectionAt(idle: &mut List<Box<IdleConnection>>, index: usize) -> &mut Connection<NativeTransport> {
     let kept = List<Box<IdleConnection>>.asMutSlice(&mut idle.*)
-    return &mut Box<IdleConnection>.getMut(&mut kept[index])[usize.ZERO].connection
+    let entry = &mut Box<IdleConnection>.getMut(&mut kept[index])[usize.ZERO]
+    return match &mut entry.link {
+      Link.Http1 {connection} => &mut connection
+      // Callers check `isHttp2` first.
+      Link.Http2 {..} => Intrinsic.trap("connectionAt: an HTTP/2 connection")
+    }
   }
 
   // The options of an exchange that must end by `deadline`.
@@ -1366,9 +1809,13 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   // closes it otherwise.
   effect fn settle(idle: &mut List<Box<IdleConnection>>, index: usize) -> () {
     let kept = List<Box<IdleConnection>>.asSlice(&idle.*)
-    let eligible = match Exchange.reuseEligibility<NativeTransport>(&Box<IdleConnection>.get(&kept[index])[usize.ZERO].connection) {
-      ReuseEligibility.Eligible => true
-      _ => false
+    let entry = &Box<IdleConnection>.get(&kept[index])[usize.ZERO]
+    let eligible = match &entry.link {
+      Link.Http1 {connection} => match Exchange.reuseEligibility<NativeTransport>(&connection) {
+        ReuseEligibility.Eligible => true
+        _ => false
+      }
+      Link.Http2 {..} => linkReusable(&entry.link)
     }
     if !eligible {
       run discard(&mut idle.*, index)
@@ -1379,8 +1826,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   // Closes the connection at `index` and removes it from `idle`.
   effect fn discard(idle: &mut List<Box<IdleConnection>>, index: usize) -> () {
     let mut removed = List<Box<IdleConnection>>.remove(&mut idle.*, index)
-    let closed = run Effect.result(Exchange.close(&mut Box<IdleConnection>.getMut(&mut removed)[usize.ZERO].connection))
-    drop closed
+    run closeLink(&mut Box<IdleConnection>.getMut(&mut removed)[usize.ZERO].link)
     drop removed
     return ()
   }
@@ -1996,7 +2442,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
       }
     }
     if found == usize.MAX { return Checkout.Fresh }
-    let usable = job.idempotent || ExchangeNative.reusable(&Box<IdleConnection>.get(&kept[found])[usize.ZERO].connection)
+    let usable = job.idempotent || linkReusable(&Box<IdleConnection>.get(&kept[found])[usize.ZERO].link)
     drop kept
     let taken = List<Box<IdleConnection>>.remove(&mut pool.*, found)
     if !usable { return Checkout.Close {connection: move taken} }
@@ -2005,8 +2451,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
 
   effect fn closeIdle(stale: Box<IdleConnection>) -> () ? &mut MonotonicClock {
     let mut closing = move stale
-    let closed = run Effect.result(Exchange.close(&mut Box<IdleConnection>.getMut(&mut closing)[usize.ZERO].connection))
-    drop closed
+    run closeLink(&mut Box<IdleConnection>.getMut(&mut closing)[usize.ZERO].link)
   }
 
   // Where a request loads trust: the client's source, which a request on the calling task holds,
@@ -2087,29 +2532,49 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     // This is `exchangeKept` written out for a job, which returns its failure: the exchange runs
     // in this frame, without a result and the frame of `exchangeKept` around it.
     if let Option.Some {value: index} = slot {
-      let callback = effect fn(live: &mut Live<NativeTransport>) -> Received
-      ! HttpError | ExchangeError | OutOfMemoryError
-      ? &mut Allocator | &mut MonotonicClock | &mut Random {
-        return run exchangeBody(&mut live.*, exchange.body, exchange.maxBody)
-      }
-      let attempt = run Effect.result(Exchange.withExchange(connectionAt(&mut idle.*, index), exchange.request, exchangeOptions(exchange.deadline), move callback))
-      match move attempt {
-        Result.Success {value: received} => {
-          run settle(&mut idle.*, index)
-          return Result<Received, HttpError | OutOfMemoryError>.succeed(move received)
-        }
-        Result.Failure {error} => {
-          run discard(&mut idle.*, index)
-          match move error {
-            ExchangeError failure => {
-              // An idempotent request whose kept connection the server closed goes again on a
-              // new connection.
-              if !exchange.idempotent || !closedByPeer(&failure) {
-                return Result<Received, HttpError | OutOfMemoryError>.failResult(httpErrorOf(move failure))
-              }
+      if isHttp2(&idle.*, index) {
+        let tried = run Effect.result(exchangeHttp2(&mut idle.*, index, exchange))
+        match move tried {
+          Result.Success {value} => match move value {
+            Option.Some {value: received} => {
+              run settle(&mut idle.*, index)
+              return Result<Received, HttpError | OutOfMemoryError>.succeed(move received)
             }
-            HttpError failure => { return Result<Received, HttpError | OutOfMemoryError>.failResult(move failure) }
-            OutOfMemoryError failure => { return Result<Received, HttpError | OutOfMemoryError>.failResult(move failure) }
+            Option.None => {
+              run discard(&mut idle.*, index)
+              if !exchange.idempotent { return Result<Received, HttpError | OutOfMemoryError>.failResult(unanswered()) }
+            }
+          }
+          Result.Failure {error} => {
+            run discard(&mut idle.*, index)
+            return Result<Received, HttpError | OutOfMemoryError>.failResult(move error)
+          }
+        }
+      } else {
+        let callback = effect fn(live: &mut Live<NativeTransport>) -> Received
+        ! HttpError | ExchangeError | OutOfMemoryError
+        ? &mut Allocator | &mut MonotonicClock | &mut Random {
+          return run exchangeBody(&mut live.*, exchange.body, exchange.maxBody)
+        }
+        let attempt = run Effect.result(Exchange.withExchange(connectionAt(&mut idle.*, index), exchange.request, exchangeOptions(exchange.deadline), move callback))
+        match move attempt {
+          Result.Success {value: received} => {
+            run settle(&mut idle.*, index)
+            return Result<Received, HttpError | OutOfMemoryError>.succeed(move received)
+          }
+          Result.Failure {error} => {
+            run discard(&mut idle.*, index)
+            match move error {
+              ExchangeError failure => {
+                // An idempotent request whose kept connection the server closed goes again on a
+                // new connection.
+                if !exchange.idempotent || !closedByPeer(&failure) {
+                  return Result<Received, HttpError | OutOfMemoryError>.failResult(httpErrorOf(move failure))
+                }
+              }
+              HttpError failure => { return Result<Received, HttpError | OutOfMemoryError>.failResult(move failure) }
+              OutOfMemoryError failure => { return Result<Received, HttpError | OutOfMemoryError>.failResult(move failure) }
+            }
           }
         }
       }
@@ -2132,6 +2597,25 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
           TrustSourceError failure => httpErrorOf(move failure)
         }
         return Result<Received, HttpError | OutOfMemoryError>.failResult(move failure)
+      }
+    }
+    if isHttp2(&idle.*, index) {
+      let fresh = run Effect.result(exchangeHttp2(&mut idle.*, index, exchange))
+      return match move fresh {
+        Result.Success {value} => match move value {
+          Option.Some {value: received} => {
+            run settle(&mut idle.*, index)
+            Result<Received, HttpError | OutOfMemoryError>.succeed(move received)
+          }
+          Option.None => {
+            run discard(&mut idle.*, index)
+            Result<Received, HttpError | OutOfMemoryError>.failResult(unanswered())
+          }
+        }
+        Result.Failure {error} => {
+          run discard(&mut idle.*, index)
+          Result<Received, HttpError | OutOfMemoryError>.failResult(move error)
+        }
       }
     }
     let callback = effect fn(live: &mut Live<NativeTransport>) -> Received
