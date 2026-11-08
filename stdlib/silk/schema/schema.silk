@@ -1,0 +1,798 @@
+//! Read and write your own types in any data format, from the types alone.
+//!
+//! # When to use
+//! Write `impl Schema for T {}` for a struct or a union of unit variants, and read or write it with
+//! a format such as `silk.schema.json.SchemaJson`. Give a type its own `read` and `write` when its
+//! wire form differs from its fields, such as a port written as text, and build them from a codec
+//! chain with [`Schemas.readVia`] and [`Schemas.writeVia`].
+//!
+//! # Details
+//! A type is declared once, and the schema derives what to do from it. The default `read` and
+//! `write` walk the type's public fields with `silk.core.reflect`, so a struct is read from an
+//! object with one member per field, in any order, and written in declaration order. A union whose
+//! variants have no fields is the name of its variant, such as `"Admin"`. An `Option` field may be
+//! absent, or `null`, when it is `None`, and is left out when written.
+//!
+//! [`Spec`] holds what the types cannot say, such as a field whose name on the wire differs. A type
+//! returns its spec from `Schema.spec`.
+//!
+//! A format implements [`SchemaReader`] and [`SchemaWriter`], so the same types read JSON today and
+//! other formats later without changes.
+//!
+//! # Gotchas
+//! Every field of a derived struct must be public, because reflection sees only public fields.
+//! Unions whose variants have fields are not supported yet and report a compile error.
+//!
+//! # Examples
+//! ## Read and write a struct as JSON
+//! ```silk
+//! import silk.core.effect { Effect }
+//! import silk.core.result { Result }
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.schema.issue { SchemaError }
+//! import silk.schema.json { SchemaJson }
+//! import silk.schema.schema { Schema, Spec }
+//! import silk.text.string { String }
+//!
+//! struct User {
+//!   pub id: u64,
+//!   pub name: String,
+//!   pub admin: bool,
+//! }
+//!
+//! impl Schema for User {
+//!   static fn spec() -> Spec<User> {
+//!     return Spec<User>.of() |> Spec<User>.rename("id", "user_id")
+//!   }
+//! }
+//!
+//! effect fn load() -> u64 ! SchemaError | OutOfMemoryError ? &mut Allocator {
+//!   let user = run SchemaJson.decode<User>(b"{\"name\": \"Ada\", \"user_id\": 7, \"admin\": true}")
+//!   if !user.admin { return 0 }
+//!   return user.id
+//! }
+//!
+//! pub effect fn main() -> i32 ! OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let loaded = run Effect.result(load()) |> Effect.provideMut<Allocator>(&mut allocator)
+//!   return match move loaded {
+//!     Result<u64, SchemaError | OutOfMemoryError>.Success {value} => if value == 7 { 0 } else { 1 }
+//!     Result<u64, SchemaError | OutOfMemoryError>.Failure {..} => 2
+//!   }
+//! }
+//! ```
+//!
+//! @category Data formats
+
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.reflect { Reflect, unionKind }
+import silk.core.static_map { StaticMap }
+import silk.io.writer { Writer, WriterError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.i16
+import silk.num.i32
+import silk.num.i64
+import silk.num.i8
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+import silk.schema.codec { Codec }
+import silk.schema.issue { Issue, IssueReason }
+import silk.text.format { Format }
+import silk.text.string { String }
+import silk.collections.slice { Slice }
+
+/// One step of a [`SchemaPath`]: a struct field by its Silk name, or a list element by its index.
+pub union PathSegment {
+  /// A struct field.
+  Field {
+    /// The field's name in Silk, not its name on the wire.
+    pub name: string<'static>,
+  },
+  /// A list element.
+  Index {
+    /// The position of the element, from 0.
+    pub at: usize,
+  },
+}
+
+impl Copy for PathSegment {}
+
+/// The path from the root value to the part a reader is reading, such as `settings.ports[2]`.
+///
+/// # When to use
+///
+/// A format's [`SchemaReader`] keeps one and returns it from `SchemaReader.path`. The derived
+/// `read` operations push a segment before they read a part and pop it after, so when a read fails
+/// the path still names the part that failed.
+pub struct SchemaPath {
+  segments: List<PathSegment>,
+}
+
+impl SchemaPath {
+  /// Returns an empty path, which names the root value.
+  pub fn make() -> SchemaPath {
+    return SchemaPath {segments: List<PathSegment>.make()}
+  }
+
+  /// Adds `segment` at the end of the path.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot grow the path.
+  pub effect fn push(self: &mut Self, segment: PathSegment) -> () ! OutOfMemoryError ? &mut Allocator {
+    return run List<PathSegment>.append(&mut self.segments, segment)
+  }
+
+  /// Removes the last segment. It does nothing to an empty path.
+  pub fn pop(self: &mut Self) -> () {
+    let removed = List<PathSegment>.pop(&mut self.segments)
+    drop removed
+  }
+
+  /// Returns the number of segments.
+  pub fn length(self: &Self) -> usize {
+    return List<PathSegment>.length(&self.segments)
+  }
+
+  /// Returns the path as text, such as `settings.ports[2]`. The root value is empty text.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the text.
+  pub effect fn text(self: &Self) -> String ! OutOfMemoryError ? &mut Allocator {
+    let mut result = String.make()
+    let segments = List<PathSegment>.asSlice(&self.segments)
+    let mut at = usize.ZERO
+    while at < segments.length {
+      match segments[at] {
+        PathSegment.Field {name} => {
+          if at > usize.ZERO { run String.append(&mut result, ".") }
+          run String.append(&mut result, name)
+        }
+        PathSegment.Index {at: index} => {
+          let mut digits: [u8; 24] = [0; 24]
+          let end = Format.writeU64Display(usize.toU64(index), &mut digits, usize.ZERO)
+          run String.append(&mut result, "[")
+          run String.append(&mut result, unsafe Intrinsic.stringFromUtf8Unchecked(Slice.view<u8>(&digits, usize.ZERO, end)))
+          run String.append(&mut result, "]")
+        }
+      }
+      at = at + usize.ONE
+    }
+    return move result
+  }
+}
+
+/// The reading side of a data format, in terms every format shares: scalars, text, lists and
+/// objects.
+///
+/// # When to use
+///
+/// Implement it to let every `Schema` type read a new format. Programs call a format's own entry
+/// point, such as `silk.schema.json.SchemaJson.decode`, rather than these operations.
+///
+/// # Details
+///
+/// The schema reads an object by calling `beginObject`, then `member` once for each field it
+/// needs, in its own order, and then `endObject`. `member` finds the member wherever it is in the
+/// object and leaves the reader at its value.
+pub interface SchemaReader {
+  /// Returns the path of the part being read.
+  fn path(self: &mut Self) -> &mut SchemaPath
+
+  /// Reads `true` or `false`.
+  ///
+  /// # Errors
+  ///
+  /// - `Issue` with `IssueReason.InvalidType` for another kind of value.
+  effect fn boolean(self: &mut Self) -> bool ! Issue | OutOfMemoryError ? &mut Allocator
+
+  /// Reads an integer that fits in `i64`.
+  ///
+  /// # Errors
+  ///
+  /// - `Issue` with `IssueReason.InvalidType` for another kind of value, or `InvalidValue` for an
+  ///   integer outside `i64`.
+  effect fn signed(self: &mut Self) -> i64 ! Issue | OutOfMemoryError ? &mut Allocator
+
+  /// Reads an integer that fits in `u64`.
+  ///
+  /// # Errors
+  ///
+  /// - `Issue` with `IssueReason.InvalidType` for another kind of value, or `InvalidValue` for an
+  ///   integer outside `u64`.
+  effect fn unsigned(self: &mut Self) -> u64 ! Issue | OutOfMemoryError ? &mut Allocator
+
+  /// Reads a number as an `f64`.
+  ///
+  /// # Errors
+  ///
+  /// - `Issue` with `IssueReason.InvalidType` for another kind of value.
+  effect fn float(self: &mut Self) -> f64 ! Issue | OutOfMemoryError ? &mut Allocator
+
+  /// Reads text.
+  ///
+  /// # Errors
+  ///
+  /// - `Issue` with `IssueReason.InvalidType` for another kind of value.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the text.
+  effect fn text(self: &mut Self) -> String ! Issue | OutOfMemoryError ? &mut Allocator
+
+  /// Reads past a null value and returns `true`, or returns `false` and leaves another value
+  /// unread.
+  effect fn null(self: &mut Self) -> bool ! Issue | OutOfMemoryError ? &mut Allocator
+
+  /// Starts reading a list.
+  ///
+  /// # Errors
+  ///
+  /// - `Issue` with `IssueReason.InvalidType` for another kind of value.
+  effect fn beginList(self: &mut Self) -> () ! Issue | OutOfMemoryError ? &mut Allocator
+
+  /// Returns `true` and leaves the reader at the next element, or returns `false` and reads past
+  /// the end of the list.
+  effect fn nextElement(self: &mut Self) -> bool ! Issue | OutOfMemoryError ? &mut Allocator
+
+  /// Starts reading an object.
+  ///
+  /// # Errors
+  ///
+  /// - `Issue` with `IssueReason.InvalidType` for another kind of value.
+  effect fn beginObject(self: &mut Self) -> () ! Issue | OutOfMemoryError ? &mut Allocator
+
+  /// Finds the member `key` of the object being read and leaves the reader at its value, or
+  /// returns `false` if the object has no such member.
+  effect fn member(self: &mut Self, key: string) -> bool ! Issue | OutOfMemoryError ? &mut Allocator
+
+  /// Reads past the end of the object being read, whatever members were read.
+  effect fn endObject(self: &mut Self) -> () ! Issue | OutOfMemoryError ? &mut Allocator
+}
+
+/// The writing side of a data format, in terms every format shares: scalars, text, lists and
+/// objects.
+///
+/// # When to use
+///
+/// Implement it to let every `Schema` type write a new format. Programs call a format's own entry
+/// point, such as `silk.schema.json.SchemaJson.encode`.
+///
+/// # Details
+///
+/// The schema writes a list as `beginList`, then `element` before each element, then `endList`. It
+/// writes an object as `beginObject`, then `key` before each member's value, then `endObject`.
+pub interface SchemaWriter {
+  /// Writes `true` or `false`.
+  effect fn boolean(self: &mut Self, value: bool) -> () ! Issue | WriterError ? &mut Writer
+
+  /// Writes a signed integer.
+  effect fn signed(self: &mut Self, value: i64) -> () ! Issue | WriterError ? &mut Writer
+
+  /// Writes an unsigned integer.
+  effect fn unsigned(self: &mut Self, value: u64) -> () ! Issue | WriterError ? &mut Writer
+
+  /// Writes a number.
+  ///
+  /// # Errors
+  ///
+  /// - `Issue` with `IssueReason.InvalidValue` if the format cannot hold `value`, such as a NaN in
+  ///   JSON.
+  effect fn float(self: &mut Self, value: f64) -> () ! Issue | WriterError ? &mut Writer
+
+  /// Writes text.
+  effect fn text(self: &mut Self, value: string) -> () ! Issue | WriterError ? &mut Writer
+
+  /// Writes a null value.
+  effect fn null(self: &mut Self) -> () ! Issue | WriterError ? &mut Writer
+
+  /// Starts a list.
+  effect fn beginList(self: &mut Self) -> () ! Issue | WriterError ? &mut Writer
+
+  /// Starts the next element of the list being written.
+  effect fn element(self: &mut Self) -> () ! Issue | WriterError ? &mut Writer
+
+  /// Ends the list being written.
+  effect fn endList(self: &mut Self) -> () ! Issue | WriterError ? &mut Writer
+
+  /// Starts an object.
+  effect fn beginObject(self: &mut Self) -> () ! Issue | WriterError ? &mut Writer
+
+  /// Writes the key of the next member of the object being written. Its value comes next.
+  effect fn key(self: &mut Self, name: string) -> () ! Issue | WriterError ? &mut Writer
+
+  /// Ends the object being written.
+  effect fn endObject(self: &mut Self) -> () ! Issue | WriterError ? &mut Writer
+}
+
+/// What a type's schema says beyond its declaration, such as a field whose name on the wire
+/// differs.
+///
+/// # When to use
+///
+/// Return one from `Schema.spec` and build it with pipes:
+/// `Spec<User>.of() |> Spec<User>.rename("id", "user_id")`.
+///
+/// # Details
+///
+/// A spec exists only during static evaluation. Field names are checked against `T` where they
+/// are written, and the editor links them to the field.
+pub struct Spec<T> {
+  renames: StaticMap<string<'static>>,
+  owner: [T; 0],
+}
+
+impl<T> Spec<T> {
+  /// Returns the spec that keeps every field's own name.
+  pub static fn of() -> Self {
+    return Spec<T> {renames: StaticMap<string<'static>>.empty(), owner: []}
+  }
+
+  /// Returns the spec in which `field` is called `wire` in the data format.
+  pub static fn rename(self: Self, field: Intrinsic.FieldName<T>, wire: string<'static>) -> Self {
+    let name = Reflect.fieldNameText<T>(field)
+    return Spec<T> {renames: StaticMap<string<'static>>.insert(self.renames, name, wire), owner: []}
+  }
+
+  /// Returns the name of the field `label` in the data format.
+  pub static fn wireName(self: &Self, label: string<'static>) -> string<'static> {
+    return match StaticMap<string<'static>>.get(&self.renames, label) {
+      Option<string<'static>>.Some {value} => value
+      Option<string<'static>>.None => label
+    }
+  }
+}
+
+/// A type that can be read from and written to any data format.
+///
+/// # When to use
+///
+/// Write `impl Schema for T {}` for a struct whose fields are all public and implement `Schema`, or
+/// for a union whose variants have no fields. Override `spec` to rename fields. Override `read` and
+/// `write` for a type whose wire form is not its fields, usually with [`Schemas.readVia`] and
+/// [`Schemas.writeVia`].
+///
+/// # Details
+///
+/// The standard library implements it for `bool`, the integer types, `f64`, `String`, `Option<T>`
+/// and `List<T>`.
+pub interface Schema {
+  /// Returns what the type's schema says beyond its declaration. The default renames nothing.
+  static fn spec() -> Spec<Self> {
+    return Spec<Self>.of()
+  }
+
+  /// Reads a value. The default reads a struct from an object, or a union from its variant name.
+  ///
+  /// # Errors
+  ///
+  /// - `Issue` if the input does not hold a value of the type.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the value.
+  effect fn read<R: SchemaReader>(reader: &mut R) -> Self ! Issue | OutOfMemoryError ? &mut Allocator {
+    return run derivedRead<Self, R>(&mut reader.*)
+  }
+
+  /// Writes the value. The default writes a struct as an object, or a union as its variant name.
+  ///
+  /// # Errors
+  ///
+  /// - `Issue` if the format cannot hold the value.
+  /// - `WriterError` if the `Writer` fails.
+  /// - `OutOfMemoryError` if a codec needs memory that the `Allocator` cannot supply.
+  effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
+    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
+    return run derivedWrite<Self, W>(self, &mut writer.*)
+  }
+
+  /// Returns the value of a field whose key is absent. The default fails, because the key is
+  /// required; `Option` returns `None`.
+  ///
+  /// # Errors
+  ///
+  /// - `Issue` with `IssueReason.MissingKey`.
+  effect fn missing() -> Self ! Issue {
+    fail Issue.missingKey()
+  }
+
+  /// Returns whether a field holding the value is left out when written. The default is `false`;
+  /// `Option` returns `true` for `None`.
+  fn omitted(self: &Self) -> bool {
+    return false
+  }
+}
+
+/// The owner of the functions that read and write `Schema` types. It has no fields and is never
+/// constructed.
+pub struct Schemas {}
+
+impl Schemas {
+  /// Reads a `T` with its `Schema` implementation.
+  ///
+  /// # Errors
+  ///
+  /// - `Issue` if the input does not hold a value of the type.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the value.
+  pub effect fn read<T: Schema, R: SchemaReader>(reader: &mut R) -> T ! Issue | OutOfMemoryError ? &mut Allocator {
+    return run Schema.read(&mut reader.*)
+  }
+
+  /// Writes `value` with its `Schema` implementation.
+  ///
+  /// # Errors
+  ///
+  /// - `Issue` if the format cannot hold the value.
+  /// - `WriterError` if the `Writer` fails.
+  pub effect fn write<T: Schema, W: SchemaWriter>(value: &T, writer: &mut W)
+    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
+    return run Schema.write(value, &mut writer.*)
+  }
+
+  /// Returns the spec of `T`.
+  pub static fn spec<T: Schema>() -> Spec<T> {
+    return Schema.spec()
+  }
+
+  /// Reads the wire form `I` and decodes it into an `A` with `codec`.
+  ///
+  /// # When to use
+  ///
+  /// Call it from the `read` of a type whose wire form is another type, such as a port written as
+  /// text.
+  ///
+  /// # Errors
+  ///
+  /// - `Issue` if the input does not hold an `I`, or if `codec` rejects it.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the value.
+  pub effect fn readVia<A, I: Schema, C: Codec<A, I>, R: SchemaReader>(codec: &C, reader: &mut R)
+    -> A ! Issue | OutOfMemoryError ? &mut Allocator {
+    let wire = run Schemas.read<I, R>(&mut reader.*)
+    return run Codec.decode(codec, move wire)
+  }
+
+  /// Encodes `value` into the wire form `I` with `codec` and writes it.
+  ///
+  /// # Errors
+  ///
+  /// - `Issue` if the format cannot hold the wire value.
+  /// - `OutOfMemoryError` if `codec` needs memory that the `Allocator` cannot supply.
+  /// - `WriterError` if the `Writer` fails.
+  pub effect fn writeVia<A, I: Schema, C: Codec<A, I>, W: SchemaWriter>(codec: &C, value: &A, writer: &mut W)
+    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
+    let wire = run Codec.encode(codec, value)
+    return run Schemas.write<I, W>(&wire, &mut writer.*)
+  }
+}
+
+effect fn missingValue<T: Schema>() -> T ! Issue {
+  return run Schema.missing()
+}
+
+static fn wireNameOf<T: Schema>(label: string<'static>) -> string<'static> {
+  let spec = Schemas.spec<T>()
+  return Spec<T>.wireName(&spec, label)
+}
+
+static fn variantFieldCount<U>(variant: Intrinsic.Variant<U>) -> usize {
+  let mut count = usize.ZERO
+  static for field in Reflect.variantFields(variant) { count = count + usize.ONE }
+  return count
+}
+
+static fn isUnion<T>() -> bool {
+  return Reflect.typeKind(Reflect.typeOf<T>()) == unionKind
+}
+
+effect fn derivedRead<T: Schema, R: SchemaReader>(reader: &mut R) -> T ! Issue | OutOfMemoryError ? &mut Allocator {
+  static if isUnion<T>() {
+    return run unionRead<T, R>(&mut reader.*)
+  } else {
+    run SchemaReader.beginObject(&mut reader.*)
+    let value = T {
+      static for field in Reflect.fields<T>() { [field]: run fieldRead(&mut reader.*, field) },
+    }
+    run SchemaReader.endObject(&mut reader.*)
+    return move value
+  }
+}
+
+effect fn fieldRead<R: SchemaReader, Owner: Schema, V: Schema>(reader: &mut R, static field: Intrinsic.Field<Owner, V>)
+  -> V ! Issue | OutOfMemoryError ? &mut Allocator {
+  let static label = Reflect.fieldLabel(field)
+  let static wire = wireNameOf<Owner>(label)
+  run SchemaPath.push(SchemaReader.path(&mut reader.*), PathSegment.Field {name: label})
+  let value = if run SchemaReader.member(&mut reader.*, wire) {
+    run Schemas.read<V, R>(&mut reader.*)
+  } else {
+    run missingValue<V>()
+  }
+  SchemaPath.pop(SchemaReader.path(&mut reader.*))
+  return move value
+}
+
+effect fn unionRead<U: Schema, R: SchemaReader>(reader: &mut R) -> U ! Issue | OutOfMemoryError ? &mut Allocator {
+  let name = run SchemaReader.text(&mut reader.*)
+  static for variant in Reflect.variants<U>() {
+    static if variantFieldCount<U>(variant) != usize.ZERO {
+      compileError("silk.schema does not derive unions whose variants have fields yet; write `read` and `write` for this type")
+    } else {
+      if name.view() == wireNameOf<U>(Reflect.variantLabel(variant)) { return U.[variant] {} }
+    }
+  }
+  fail Issue.make(IssueReason.UnknownVariant, "the name of a variant")
+}
+
+effect fn derivedWrite<T: Schema, W: SchemaWriter>(value: &T, writer: &mut W)
+  -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
+  static if isUnion<T>() {
+    static for variant in Reflect.variants<T>() {
+      static if variantFieldCount<T>(variant) != usize.ZERO {
+        compileError("silk.schema does not derive unions whose variants have fields yet; write `read` and `write` for this type")
+      } else {
+        if Reflect.isVariant(value, variant) {
+          return run SchemaWriter.text(&mut writer.*, wireNameOf<T>(Reflect.variantLabel(variant)))
+        }
+      }
+    }
+    return ()
+  } else {
+    run SchemaWriter.beginObject(&mut writer.*)
+    static for field in Reflect.fields<T>() {
+      run fieldWrite(value, &mut writer.*, field)
+    }
+    return run SchemaWriter.endObject(&mut writer.*)
+  }
+}
+
+effect fn fieldWrite<W: SchemaWriter, Owner: Schema, V: Schema>(owner: &Owner, writer: &mut W, static field: Intrinsic.Field<Owner, V>)
+  -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
+  let static wire = wireNameOf<Owner>(Reflect.fieldLabel(field))
+  let value = Reflect.borrowField(owner, field)
+  if Schema.omitted(value) { return () }
+  run SchemaWriter.key(&mut writer.*, wire)
+  return run Schemas.write<V, W>(value, &mut writer.*)
+}
+
+impl Schema for bool {
+  /// Reads `true` or `false`.
+  effect fn read<R: SchemaReader>(reader: &mut R) -> bool ! Issue | OutOfMemoryError ? &mut Allocator {
+    return run SchemaReader.boolean(&mut reader.*)
+  }
+
+  /// Writes `true` or `false`.
+  effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
+    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
+    return run SchemaWriter.boolean(&mut writer.*, self.*)
+  }
+}
+
+impl Schema for u64 {
+  /// Reads a number.
+  effect fn read<R: SchemaReader>(reader: &mut R) -> u64 ! Issue | OutOfMemoryError ? &mut Allocator {
+    return run SchemaReader.unsigned(&mut reader.*)
+  }
+
+  /// Writes the number.
+  effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
+    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
+    return run SchemaWriter.unsigned(&mut writer.*, self.*)
+  }
+}
+
+impl Schema for i64 {
+  /// Reads a number.
+  effect fn read<R: SchemaReader>(reader: &mut R) -> i64 ! Issue | OutOfMemoryError ? &mut Allocator {
+    return run SchemaReader.signed(&mut reader.*)
+  }
+
+  /// Writes the number.
+  effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
+    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
+    return run SchemaWriter.signed(&mut writer.*, self.*)
+  }
+}
+
+impl Schema for f64 {
+  /// Reads a number.
+  effect fn read<R: SchemaReader>(reader: &mut R) -> f64 ! Issue | OutOfMemoryError ? &mut Allocator {
+    return run SchemaReader.float(&mut reader.*)
+  }
+
+  /// Writes the number. A format that cannot hold a NaN or an infinity fails with an `Issue`.
+  effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
+    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
+    return run SchemaWriter.float(&mut writer.*, self.*)
+  }
+}
+
+impl Schema for String {
+  /// Reads text.
+  effect fn read<R: SchemaReader>(reader: &mut R) -> String ! Issue | OutOfMemoryError ? &mut Allocator {
+    return run SchemaReader.text(&mut reader.*)
+  }
+
+  /// Writes the text.
+  effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
+    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
+    return run SchemaWriter.text(&mut writer.*, self.view())
+  }
+}
+
+impl<T: Schema> Schema for Option<T> {
+  /// Reads `None` from a null value, and `Some` from any other value.
+  effect fn read<R: SchemaReader>(reader: &mut R) -> Option<T> ! Issue | OutOfMemoryError ? &mut Allocator {
+    if run SchemaReader.null(&mut reader.*) { return Option<T>.none() }
+    return Option<T>.some(run Schemas.read<T, R>(&mut reader.*))
+  }
+
+  /// Writes the value of `Some`, or a null value for `None`. A `None` field is left out instead.
+  effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
+    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
+    return match &self.* {
+      Option<T>.Some {value} => run Schemas.write<T, W>(&value, &mut writer.*)
+      Option<T>.None => run SchemaWriter.null(&mut writer.*)
+    }
+  }
+
+  /// Returns `None`, so an `Option` field may be absent.
+  effect fn missing() -> Option<T> ! Issue {
+    return Option<T>.none()
+  }
+
+  /// Returns `true` for `None`, so a `None` field is left out.
+  fn omitted(self: &Self) -> bool {
+    return Option<T>.isNone(self)
+  }
+}
+
+impl<T: Schema> Schema for List<T> {
+  /// Reads a list, element by element.
+  effect fn read<R: SchemaReader>(reader: &mut R) -> List<T> ! Issue | OutOfMemoryError ? &mut Allocator {
+    run SchemaReader.beginList(&mut reader.*)
+    let mut values = List<T>.make()
+    let mut index = usize.ZERO
+    while run SchemaReader.nextElement(&mut reader.*) {
+      run SchemaPath.push(SchemaReader.path(&mut reader.*), PathSegment.Index {at: index})
+      let value = run Schemas.read<T, R>(&mut reader.*)
+      SchemaPath.pop(SchemaReader.path(&mut reader.*))
+      run List<T>.append(&mut values, move value)
+      index = index + usize.ONE
+    }
+    return move values
+  }
+
+  /// Writes the list, element by element.
+  effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
+    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
+    run SchemaWriter.beginList(&mut writer.*)
+    let values = List<T>.asSlice(self)
+    let mut at = usize.ZERO
+    while at < values.length {
+      run SchemaWriter.element(&mut writer.*)
+      run Schemas.write<T, W>(&values[at], &mut writer.*)
+      at = at + usize.ONE
+    }
+    return run SchemaWriter.endList(&mut writer.*)
+  }
+}
+
+impl Schema for u8 {
+  /// Reads a number and fails with `IssueReason.InvalidValue` if it does not fit.
+  effect fn read<R: SchemaReader>(reader: &mut R) -> u8 ! Issue | OutOfMemoryError ? &mut Allocator {
+    let raw = run SchemaReader.unsigned(&mut reader.*)
+    return match u64.checkedToU8(raw) {
+      Option<u8>.Some {value} => value
+      Option<u8>.None => { fail Issue.invalidValue("an integer from 0 to 255") }
+    }
+  }
+
+  /// Writes the number.
+  effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
+    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
+    return run SchemaWriter.unsigned(&mut writer.*, u8.toU64(self.*))
+  }
+}
+
+impl Schema for u16 {
+  /// Reads a number and fails with `IssueReason.InvalidValue` if it does not fit.
+  effect fn read<R: SchemaReader>(reader: &mut R) -> u16 ! Issue | OutOfMemoryError ? &mut Allocator {
+    let raw = run SchemaReader.unsigned(&mut reader.*)
+    return match u64.checkedToU16(raw) {
+      Option<u16>.Some {value} => value
+      Option<u16>.None => { fail Issue.invalidValue("an integer from 0 to 65535") }
+    }
+  }
+
+  /// Writes the number.
+  effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
+    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
+    return run SchemaWriter.unsigned(&mut writer.*, u16.toU64(self.*))
+  }
+}
+
+impl Schema for u32 {
+  /// Reads a number and fails with `IssueReason.InvalidValue` if it does not fit.
+  effect fn read<R: SchemaReader>(reader: &mut R) -> u32 ! Issue | OutOfMemoryError ? &mut Allocator {
+    let raw = run SchemaReader.unsigned(&mut reader.*)
+    return match u64.checkedToU32(raw) {
+      Option<u32>.Some {value} => value
+      Option<u32>.None => { fail Issue.invalidValue("an integer from 0 to 4294967295") }
+    }
+  }
+
+  /// Writes the number.
+  effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
+    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
+    return run SchemaWriter.unsigned(&mut writer.*, u32.toU64(self.*))
+  }
+}
+
+impl Schema for usize {
+  /// Reads a number and fails with `IssueReason.InvalidValue` if it does not fit.
+  effect fn read<R: SchemaReader>(reader: &mut R) -> usize ! Issue | OutOfMemoryError ? &mut Allocator {
+    let raw = run SchemaReader.unsigned(&mut reader.*)
+    return match u64.checkedToUsize(raw) {
+      Option<usize>.Some {value} => value
+      Option<usize>.None => { fail Issue.invalidValue("a size that fits in usize") }
+    }
+  }
+
+  /// Writes the number.
+  effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
+    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
+    return run SchemaWriter.unsigned(&mut writer.*, usize.toU64(self.*))
+  }
+}
+
+impl Schema for i8 {
+  /// Reads a number and fails with `IssueReason.InvalidValue` if it does not fit.
+  effect fn read<R: SchemaReader>(reader: &mut R) -> i8 ! Issue | OutOfMemoryError ? &mut Allocator {
+    let raw = run SchemaReader.signed(&mut reader.*)
+    return match i64.checkedToI8(raw) {
+      Option<i8>.Some {value} => value
+      Option<i8>.None => { fail Issue.invalidValue("an integer from -128 to 127") }
+    }
+  }
+
+  /// Writes the number.
+  effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
+    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
+    return run SchemaWriter.signed(&mut writer.*, i8.toI64(self.*))
+  }
+}
+
+impl Schema for i16 {
+  /// Reads a number and fails with `IssueReason.InvalidValue` if it does not fit.
+  effect fn read<R: SchemaReader>(reader: &mut R) -> i16 ! Issue | OutOfMemoryError ? &mut Allocator {
+    let raw = run SchemaReader.signed(&mut reader.*)
+    return match i64.checkedToI16(raw) {
+      Option<i16>.Some {value} => value
+      Option<i16>.None => { fail Issue.invalidValue("an integer from -32768 to 32767") }
+    }
+  }
+
+  /// Writes the number.
+  effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
+    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
+    return run SchemaWriter.signed(&mut writer.*, i16.toI64(self.*))
+  }
+}
+
+impl Schema for i32 {
+  /// Reads a number and fails with `IssueReason.InvalidValue` if it does not fit.
+  effect fn read<R: SchemaReader>(reader: &mut R) -> i32 ! Issue | OutOfMemoryError ? &mut Allocator {
+    let raw = run SchemaReader.signed(&mut reader.*)
+    return match i64.checkedToI32(raw) {
+      Option<i32>.Some {value} => value
+      Option<i32>.None => { fail Issue.invalidValue("an integer from -2147483648 to 2147483647") }
+    }
+  }
+
+  /// Writes the number.
+  effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
+    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
+    return run SchemaWriter.signed(&mut writer.*, i32.toI64(self.*))
+  }
+}

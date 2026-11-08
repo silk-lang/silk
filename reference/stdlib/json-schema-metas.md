@@ -7,7 +7,7 @@ Offline official JSON Schema meta-schemas for drafts 4, 6, 7, 2019-09, and 2020-
 ## When to use
 Use [`SchemaMetas.documents`](#SchemaMetas.impl.documents) to supply the official meta-schema resources when compiling
 schemas that reference them. Add borrowed views of the returned documents to the resource
-registry passed to `silk.json.schema.Schema.compile`; keep the documents alive while the
+registry passed to `silk.json.schema.JsonSchema.compile`; keep the documents alive while the
 compiled schema is used. No network requests are made.
 
 Import as `SchemaMetas` with `import silk.json.schema_metas { SchemaMetas }`.
@@ -75,7 +75,7 @@ Parses the embedded official meta-schemas for drafts 4, 6, 7, 2019-09, and 2020-
 
 #### Details
 
-The returned collection owns its trees. Pass borrowed `Resource` views to `Schema.compile`
+The returned collection owns its trees. Pass borrowed `Resource` views to `JsonSchema.compile`
 and retain this collection for the lifetime of compiled schemas. It includes the individual
 vocabulary meta-schemas, including the optional 2020-12 format-assertion vocabulary.
 Nothing is downloaded and no schemas are read from the filesystem.
