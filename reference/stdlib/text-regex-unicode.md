@@ -10,9 +10,10 @@ Unicode support: ECMAScript case folding, the property sets `\p{...}` names, and
 arithmetic that builds character classes.
 
 ## Details
-The tables are QuickJS's compact range encodings, generated from the Unicode 17.0.0 Character
-Database (Unicode License v3) by SilkJS's `scripts/generate_unicode.py`. QuickJS is Copyright (c)
-2017-2021 Fabrice Bellard and Charlie Gordon, under the MIT license in `licenses/quickjs.txt`.
+The tables are compact range encodings, generated from the Unicode 17.0.0 Character Database
+(Unicode License v3) by SilkJS's `scripts/generate_unicode.py`. The encoding started from
+QuickJS, Copyright (c) 2017-2021 Fabrice Bellard and Charlie Gordon, under the MIT license in
+`licenses/quickjs.txt`.
 
 Public declarations: 5.
 
@@ -154,7 +155,7 @@ pub effect fn property(name: string) -> CharRange
     ? &mut Allocator
 ```
 
-Resolves the QuickJS-supported binary property names and aliases.
+Resolves the supported binary property names and aliases.
 
 #### Errors
 - `UnknownProperty` if `name` is not an exact supported alias.
@@ -239,7 +240,7 @@ pub struct CharRange
 ```
 
 Sorted, disjoint half-open intervals over u32 character values.
-Inversion uses QuickJS's exclusive UINT32_MAX sentinel, not 0x110000.
+Inversion uses an exclusive UINT32_MAX sentinel, not 0x110000.
 
 <a id="CharRange.impl"></a>
 
@@ -319,7 +320,7 @@ pub effect fn unionInterval(self: &mut Self, first: u32, last: u32) -> ()
     ? &mut Allocator
 ```
 
-QuickJS cr_union_interval uses inclusive endpoints and unsigned wrapping.
+Interval union uses inclusive endpoints and unsigned wrapping.
 
 #### Errors
 - `OutOfMemoryError` if the allocator cannot supply the set.

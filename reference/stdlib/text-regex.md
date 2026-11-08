@@ -10,8 +10,8 @@ Use `Regex.compile` and `Regex.test` to reuse a `Pattern` across many searches. 
 use the ECMA-262 Unicode (`u`) grammar, not shell glob syntax.
 
 ## Details
-The engine is the QuickJS regular-expression compiler and backtracking matcher as SilkJS ports
-it to Silk (QuickJS is Copyright (c) 2017-2021 Fabrice Bellard and Charlie Gordon, under the MIT
+The engine is Silk's own regular-expression compiler and backtracking matcher. It started from
+the QuickJS engine (Copyright (c) 2017-2021 Fabrice Bellard and Charlie Gordon, under the MIT
 license in `licenses/quickjs.txt`). A pattern compiles to bytecode once; a search then runs it
 with search hints (literal runs, anchors and first-character sets) and a heap backtracking
 stack, so long text never exhausts the native stack. Matching supports captures, named and
