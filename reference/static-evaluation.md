@@ -212,8 +212,9 @@ static function can be named as a value, partially applied
 ([CALLABLE-002](functions-callables-and-control-flow.md#callable-002--supplying-a-trailing-argument-suffix-constructs-a-section)),
 passed to a static function's `fn(A) -> B` parameter, and called directly or through a pipeline.
 A section stores its supplied arguments as static data, so it can be called again even when a
-captured value is not `Copy`. Such a value exists only during static evaluation and has no runtime
-representation.
+captured value is not `Copy`. A function value whose target is a `static fn` exists only during static evaluation and has no
+runtime representation; one whose target is an ordinary function can reach runtime code
+(STATIC-020).
 
 ```silk
 static fn calc() -> Command {
@@ -246,9 +247,8 @@ const ROOT: Command = Command {name: "calc", subcommands: &[&ADD]}
 ```
 
 **Diagnostics:** Attempting a prohibited operation reports `SEM0176` at that operation and produces
-no static result. Naming an ordinary function, an anonymous function or a bound method value as a
-value in a static body, or partially applying an ordinary function there, reports `SEM0176` at that
-expression. An exclusive borrow (`&mut`) or a borrow of a `let mut` local in a static body reports `SEM0176`. A value outside the admitted domain is rejected at the static boundary rather than
+no static result. Naming an anonymous function or a bound method value as a value in a static body
+reports `SEM0176` at that expression. An exclusive borrow (`&mut`) or a borrow of a `let mut` local in a static body reports `SEM0176`. A value outside the admitted domain is rejected at the static boundary rather than
 acquiring a second compile-time ownership model.
 
 **Evidence:** static value requirements,
@@ -799,3 +799,38 @@ A key that is not a field of the selected variant reports `SEM0022` at the key, 
 literal leaves out reports `SEM0024`.
 
 **Evidence:** variant selector checker test, corpus program `static-variant-literals`.
+
+### STATIC-020 — Runtime code calls a static function value that names an ordinary function
+
+**Status:** Confirmed
+
+A static function value whose target is an ordinary function, such as one a static function
+returns, can be read by runtime code. There it is the section it denotes: the target with its
+captured static values as the trailing arguments, each embedded as a constant. Calling it, directly
+or through a pipeline, calls the target, so a check or a parser chosen during static evaluation
+costs the same as calling it by name. Its identity is the target and its captures, so editing the
+target's body does not respecialize the code that reads it.
+
+```silk
+fn between(value: u32, low: u32, high: u32) -> bool {
+  return value >= low && value <= high
+}
+
+static fn range(low: u32, high: u32) -> fn<'static>(u32) -> bool {
+  return between(low, high)
+}
+
+fn inRange(value: u32) -> bool {
+  let static check = range(1, 5)
+  return check(value)
+}
+```
+
+**Boundary:** The target must be an ordinary function that is not an `effect fn`, and every
+captured value must be one static data can embed (STATIC-005). A function value whose target is a
+`static fn` stays phase-only.
+
+**Diagnostics:** Reading a phase-only function value in runtime code reports `SEM0176` at the
+read.
+
+**Evidence:** corpus program `static-function-values-at-runtime`.
