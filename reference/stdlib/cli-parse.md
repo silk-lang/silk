@@ -571,6 +571,23 @@ Writes a one-line message for `error`, such as `error: unknown option --nmae`.
 
 - `WriterError` if the `Writer` fails.
 
+<a id="Cli.impl.message"></a>
+
+### Associated function `message`
+
+```silk
+pub effect fn message(error: &CliError) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Returns the message for `error` that [`Cli.writeError`](#Cli.impl.writeError) writes, without `error: ` and the
+line break, such as `unknown option --nmae; did you mean --name?`.
+
+#### Errors
+
+- `OutOfMemoryError` if the `Allocator` cannot supply the text.
+
 
 Category: Command line.
 
