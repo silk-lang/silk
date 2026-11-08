@@ -71,7 +71,7 @@ pub effect fn main() -> i32 ! OutOfMemoryError {
 
 Import as `Schema` with `import silk.schema.schema { Schema }`.
 
-Public declarations: 7.
+Public declarations: 8.
 
 <a id="PathSegment"></a>
 
@@ -710,6 +710,110 @@ fn omitted(self: &Self) -> bool
 
 Returns whether a field holding the value is left out when written. The default is `false`;
 `Option` returns `true` for `None`.
+
+<a id="Schema.check"></a>
+
+### Operation `check`
+
+```silk
+fn check(self: &Self, checks: &mut Checks<Self>) -> ()
+```
+
+Checks a value after it is read. The default accepts every value.
+
+#### When to use
+
+Override it to state what the type alone cannot, such as a port between 1 and 65535 or a
+name of at most 64 bytes, with [`Checks.field`](#Checks.impl.field) and [`Checks.that`](#Checks.impl.that). The first failed check
+becomes the read's `Issue`, at the path of the field it names.
+
+<a id="Checks"></a>
+
+## `Checks`
+
+```silk
+pub struct Checks<T>
+```
+
+The checks of one value of `T`, run by [`Schema.check`](#Schema.check) after the value is read.
+
+### Examples
+
+```silk
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.schema.codec { Between, Length }
+import silk.schema.issue { IssueReason, SchemaError }
+import silk.schema.json { SchemaJson }
+import silk.schema.schema { Checks, Schema }
+import silk.text.string { String }
+
+struct Server {
+  pub host: String,
+  pub port: u16,
+}
+
+impl Schema for Server {
+  fn check(self: &Self, checks: &mut Checks<Server>) -> () {
+    checks.field<String>(self, "host", Length {min: 1, max: 253, message: "a host name"})
+    checks.field<u16>(self, "port", Between<u16> {low: 1, high: 65535, message: "a port"})
+  }
+}
+
+effect fn load() -> Server ! SchemaError | OutOfMemoryError ? &mut Allocator {
+  return run SchemaJson.decode<Server>(b"{\"host\": \"silk.dev\", \"port\": 0}")
+}
+
+pub effect fn main() -> i32 ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return match run Effect.result(load()) |> Effect.provideMut<Allocator>(&mut allocator) {
+    Result<Server, SchemaError | OutOfMemoryError>.Failure {error: SchemaError {path, issue}} =>
+      if path.view() == "port" && issue.reason == IssueReason.CheckFailed { 0 } else { 1 }
+    _ => 2
+  }
+}
+```
+
+<a id="Checks.impl"></a>
+
+## Implementation `Checks<T>`
+
+```silk
+impl<T> Checks<T>
+```
+
+<a id="Checks.impl.make"></a>
+
+### Associated function `make`
+
+```silk
+pub fn make() -> Checks<T>
+```
+
+Returns the checks with nothing failed yet.
+
+<a id="Checks.impl.field"></a>
+
+### Method `field`
+
+```silk
+pub fn field<V, Owner, K: Check<V>>(self: &mut Self, owner: &Owner, static name: Intrinsic.FieldName<Owner>, check: K) -> ()
+```
+
+Checks the field `name` of `owner` with `check`. `V` is the field's type, written out as in
+`checks.field<u16>(self, "port", ...)`.
+
+<a id="Checks.impl.that"></a>
+
+### Method `that`
+
+```silk
+pub fn that(self: &mut Self, holds: bool, expected: string<'static>) -> ()
+```
+
+Checks a condition on the whole value, such as two fields that must agree. `expected` says
+what the value must be when `holds` is `false`.
 
 <a id="Schemas"></a>
 

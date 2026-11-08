@@ -52,7 +52,7 @@ pub effect fn main() -> i32 ! OutOfMemoryError {
 
 Import as `Codec` with `import silk.schema.codec { Codec }`.
 
-Public declarations: 14.
+Public declarations: 15.
 
 <a id="Codec"></a>
 
@@ -1381,6 +1381,74 @@ fn test(self: &Self, value: &String) -> bool
 Returns whether the byte length of `value` is between `min` and `max`.
 
 <a id="Length.impl.Check.message"></a>
+
+### Operation `message`
+
+```silk
+fn message(self: &Self) -> string<'static>
+```
+
+Returns `message`.
+
+<a id="Items"></a>
+
+## `Items`
+
+```silk
+pub struct Items
+```
+
+The check that a list has between `min` and `max` elements, both included.
+
+<a id="Items.min"></a>
+
+### Field `min`
+
+```silk
+pub min: usize
+```
+
+The fewest accepted elements.
+
+<a id="Items.max"></a>
+
+### Field `max`
+
+```silk
+pub max: usize
+```
+
+The most accepted elements.
+
+<a id="Items.message"></a>
+
+### Field `message`
+
+```silk
+pub message: string<'static>
+```
+
+What a person sees when the check fails, such as `"1 to 8 tags"`.
+
+<a id="Items.impl.Check"></a>
+
+## Implementation `Check<List<T>> for Items`
+
+```silk
+impl<T> Check<List<T>> for Items
+```
+
+<a id="Items.impl.Check.test"></a>
+
+### Operation `test`
+
+```silk
+fn test(self: &Self, value: &List<T>) -> bool
+```
+
+Returns whether `value` has between `min` and `max` elements.
+
+<a id="Items.impl.Check.message"></a>
 
 ### Operation `message`
 
