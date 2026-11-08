@@ -673,4 +673,4 @@ pure body that static evaluation cannot perform reports `SEM0176` at that work, 
 trace.
 
 **Evidence:** static function requirements,
-[pure call corpus program](../corpus/native/static-pure-functions/Main.silk).
+[pure call corpus program](../corpus/native/static-pure-functions/main.silk).
