@@ -737,6 +737,10 @@ Because both fields are public, another module may construct `Point` directly. A
 private required field instead preserves construction control and exposes visible ordinary
 constructor functions when external construction is intended.
 
+A `static for` among the initializers generates `[key]: value` initializers from static field
+descriptors, so a generic function can construct its own type parameter field by field
+([STATIC-017](static-evaluation.md#static-017--a-struct-literal-initializes-fields-from-a-static-sequence-of-field-descriptors)).
+
 **Boundary:** Unknown, duplicate, missing, inaccessible, or mistyped initializers produce no
 partially initialized value. Construction never fills omitted fields with defaults. A diagnostic
 for hidden required fields does not expose their names or types. A declarationless opaque nominal

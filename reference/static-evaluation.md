@@ -674,3 +674,41 @@ trace.
 
 **Evidence:** static function requirements,
 [pure call corpus program](../corpus/native/static-pure-functions/main.silk).
+
+## Constructing types field by field
+
+### STATIC-017 — A struct literal initializes fields from a static sequence of field descriptors
+
+**Status:** Confirmed
+
+Inside a struct literal, `static for field in fields { [key]: value, ... }` initializes one field
+for each `[key]: value` entry of each iteration. `fields` is a static sequence, such as
+`Reflect.fields<T>()`, and each `key` is a static field descriptor of the literal's type, usually
+the loop binding itself. Each value is checked against the type of the field its key describes, so
+one entry can initialize fields of different types. The loop unrolls during selection like a
+statement-level `static for` (STATIC-010) and leaves an ordinary literal at runtime. Written
+`name: value` initializers and loops combine in one literal, and together they must initialize
+every field exactly once.
+
+The literal's type may be the selected body's own type parameter, so a generic function builds
+any struct whose public fields it can produce:
+
+```silk
+import silk.core.reflect {Reflect}
+
+fn copied<T>(source: &T) -> T {
+  return T {static for field in Reflect.fields<T>() { [field]: Reflect.borrowField(source, field).* }}
+}
+```
+
+**Boundary:** Keys are field descriptors only; a union variant's field or another type's field
+initializes nothing. A struct literal with a `static for` is runtime code, so a `static fn` body
+cannot contain one.
+
+**Diagnostics:** A key that does not describe a field of the literal's type reports `SEM0022`. A
+field initialized twice, by two entries or by a written initializer and an entry, reports
+`SEM0023`, and a field no entry initializes reports `SEM0024`. A value of the wrong type reports
+`SEM0025` naming the field. Each names the iteration in its trace.
+
+**Evidence:** static field initializer checker tests,
+[field-by-field construction corpus program](../corpus/native/static-field-initializers/main.silk).
