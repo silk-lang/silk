@@ -7,17 +7,18 @@
 //! URL, as a local mirror serves it), checks its SHA-256
 //! against the manifest before reading it, and extracts a gzip-compressed or plain tar archive, or
 //! a ZIP archive. Extraction writes only directories and regular files, dropping the archive's
-//! `strip` leading path segments: a member path that is absolute or holds `..` refuses the archive,
-//! and links and other special members are skipped, so nothing is written outside the archive's
-//! directory. A ZIP member name with a backslash, a colon, or an empty or `.` segment also refuses
-//! the archive. A
-//! build fetches only the archives its inputs name, and never while `SILK_OFFLINE` is set.
+//! `strip` leading path segments: a member path that is absolute or holds a backslash or `..`
+//! refuses the archive, and links and other special members are skipped, so nothing is written
+//! outside the archive's directory. A ZIP member name with a colon or an empty or `.` segment also
+//! refuses the archive. A build fetches only the archives its inputs name, and never while
+//! `SILK_OFFLINE` is set.
 
 import driver.HostRename
 import driver.NativeLinkInput as NativeLinkInputs {Archive, NativeLinkInput}
 import silk.mem.allocator {Allocator, OutOfMemoryError}
 import silk.collections.bytes {Bytes}
 import silk.core.effect {Effect}
+import silk.compress.tar {TarError, TarKind, TarMember, TarReader}
 import silk.compress.zip {ZipError, ZipKind, ZipMember, ZipReader}
 import silk.compress.inflate {DecodeError, Decoder, Format as InflateFormat, Limits as InflateLimits, MEMORY_BOUND as INFLATE_MEMORY_BOUND, Progress, Status as InflateStatus}
 import silk.crypto.sha2 {Sha256}
@@ -32,7 +33,6 @@ import silk.core.result {Result}
 import silk.collections.slice {Slice}
 import silk.text.string {String}
 import silk.num.u16
-import silk.num.u8
 import silk.num.usize
 
 const MAX_DOWNLOAD_BYTES: usize = 1073741824
@@ -310,69 +310,6 @@ effect fn gunzip(data: &[u8]) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocat
   return Option<Bytes>.some(move output)
 }
 
-// The text of a NUL-terminated header field.
-fn field(header: &[u8], offset: usize, length: usize) -> &[u8] {
-  let mut end = usize.ZERO
-  while end < length && header[offset + end] != 0 { end = end + usize.ONE }
-  return Slice.view<u8>(header, offset, end)
-}
-
-// The octal (or base-256) number of a header field, or none when it holds neither.
-fn number(header: &[u8], offset: usize, length: usize) -> Option<usize> {
-  if (header[offset] & 128) != 0 {
-    let mut value = usize.ZERO
-    let mut at = usize.ONE
-    while at < length {
-      value = value * usize.add(0, 256) + u8.toUsize(header[offset + at])
-      at = at + usize.ONE
-    }
-    return Option<usize>.some(value)
-  }
-  let mut value = usize.ZERO
-  let mut at = usize.ZERO
-  while at < length && (header[offset + at] == 32 || header[offset + at] == 0) { at = at + usize.ONE }
-  while at < length && header[offset + at] >= 48 && header[offset + at] <= 55 {
-    value = value * usize.add(0, 8) + u8.toUsize(header[offset + at] - 48)
-    at = at + usize.ONE
-  }
-  return Option<usize>.some(value)
-}
-
-// Whether the header's checksum matches its bytes.
-fn checksummed(header: &[u8]) -> bool {
-  let stored = match number(header, usize.add(0, 148), usize.add(0, 8)) {
-    Option<usize>.Some {value} => value
-    Option<usize>.None => { return false }
-  }
-  let mut sum = usize.ZERO
-  let mut at = usize.ZERO
-  while at < usize.add(0, 512) {
-    if at >= usize.add(0, 148) && at < usize.add(0, 156) { sum = sum + usize.add(0, 32) } else { sum = sum + u8.toUsize(header[at]) }
-    at = at + usize.ONE
-  }
-  return sum == stored
-}
-
-// The `path` record of a pax extended header's records, or none.
-fn paxPath(records: &[u8]) -> Option<&[u8]> {
-  let mut at = usize.ZERO
-  while at < records.length {
-    let mut space = at
-    let mut length = usize.ZERO
-    while space < records.length && records[space] >= 48 && records[space] <= 57 {
-      length = length * usize.add(0, 10) + u8.toUsize(records[space] - 48)
-      space = space + usize.ONE
-    }
-    if length == usize.ZERO || at + length > records.length || space >= records.length || records[space] != 32 { return Option<&[u8]>.none() }
-    let record = Slice.view<u8>(records, space + usize.ONE, at + length - space - usize.ONE)
-    if startsWith(record, b"path=") && record.length > usize.add(0, 6) {
-      return Option<&[u8]>.some(Slice.view<u8>(record, usize.add(0, 5), record.length - usize.add(0, 6)))
-    }
-    at = at + length
-  }
-  return Option<&[u8]>.none()
-}
-
 // The path below the archive directory that member `path` extracts to, after dropping `strip`
 // leading segments: none for a member the strip removes, or a refusal for an unsafe path.
 effect fn memberPath(path: &[u8], strip: usize) -> Result<Option<Bytes>, Bytes> ! OutOfMemoryError ? &mut Allocator {
@@ -403,52 +340,31 @@ effect fn memberPath(path: &[u8], strip: usize) -> Result<Option<Bytes>, Bytes> 
 // Extracts the tar stream `tar` into `destination`, answering why it was refused, or none.
 effect fn extract(tar: &[u8], destination: &Path, strip: usize) -> Option<Bytes>
 ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  let mut at = usize.ZERO
-  let mut longName = Option<Bytes>.none()
-  while at + usize.add(0, 512) <= tar.length {
-    let header = Slice.view<u8>(tar, at, usize.add(0, 512))
-    if header[usize.ZERO] == 0 { return Option<Bytes>.none() }
-    if !checksummed(header) { return Option<Bytes>.some(run Bytes.copy(b"a member header has a bad checksum")) }
-    let size = match number(header, usize.add(0, 124), usize.add(0, 12)) {
-      Option<usize>.Some {value} => value
-      Option<usize>.None => { return Option<Bytes>.some(run Bytes.copy(b"a member header has a bad size")) }
+  let mut reader = TarReader.open(tar)
+  while true {
+    let next = match TarReader.next(&mut reader) {
+      Result.Success {value} => move value
+      Result.Failure {error} => { return Option<Bytes>.some(run Bytes.copy(String.utf8Bytes(TarError.describe(error)))) }
     }
-    let start = at + usize.add(0, 512)
-    if start + size > tar.length { return Option<Bytes>.some(run Bytes.copy(b"the archive ends inside a member")) }
-    let content = Slice.view<u8>(tar, start, size)
-    at = start + (size + usize.add(0, 511)) / usize.add(0, 512) * usize.add(0, 512)
-    let kind = header[usize.add(0, 156)]
-    // A GNU long name, or a pax header's `path`, names the next member.
-    if kind == 76 {
-      longName = Option<Bytes>.some(run Bytes.copy(field(content, usize.ZERO, content.length)))
-      continue
+    let member = match move next {
+      Option<TarMember>.Some {value} => move value
+      Option<TarMember>.None => { return Option<Bytes>.none() }
     }
-    if kind == 120 {
-      if let Option<&[u8]>.Some {value} = paxPath(content) { longName = Option<Bytes>.some(run Bytes.copy(value)) }
-      continue
-    }
-    if kind == 103 { continue }
-    let mut name = run Bytes.copy(field(header, usize.ZERO, usize.add(0, 100)))
-    let prefix = field(header, usize.add(0, 345), usize.add(0, 155))
-    if same(field(header, usize.add(0, 257), usize.add(0, 5)), b"ustar") && prefix.length > usize.ZERO {
-      name = run joined(&[prefix, b"/", Bytes.asSlice(&name)])
-    }
-    if let Option<Bytes>.Some {value: long} = move longName { name = move long }
-    longName = Option<Bytes>.none()
-    let file = kind == 48 || kind == 0 || kind == 55
-    let directory = kind == 53
-    if file || directory {
-      let relative = match move run memberPath(Bytes.asSlice(&name), strip) {
+    if member.kind == TarKind.File || member.kind == TarKind.Directory {
+      let mut path = run Bytes.copy(member.prefix)
+      if member.prefix.length > usize.ZERO && member.name.length > usize.ZERO { run Bytes.append(&mut path, b"/") }
+      run Bytes.append(&mut path, member.name)
+      let relative = match move run memberPath(Bytes.asSlice(&path), strip) {
         Result<Option<Bytes>, Bytes>.Success {value} => move value
         Result<Option<Bytes>, Bytes>.Failure {error} => { return Option<Bytes>.some(move error) }
       }
       if let Option<Bytes>.Some {value: below} = move relative {
         let target = run Path.joinBytes(destination, Bytes.asSlice(&below))
-        if directory {
+        if member.kind == TarKind.Directory {
           run FileSystem.createDirectoriesRecursively(&target)
         } else {
           if let Option<Path>.Some {value: parent} = move run Path.parent(&target) { run FileSystem.createDirectoriesRecursively(&parent) }
-          run FileSystem.writeFile(&target, content)
+          run FileSystem.writeFile(&target, member.content)
         }
       }
     }
