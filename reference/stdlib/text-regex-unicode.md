@@ -113,6 +113,48 @@ The character sets that `\p{...}` and `\P{...}` name.
 impl UnicodeProperties
 ```
 
+<a id="UnicodeProperties.impl.isScriptName"></a>
+
+### Associated function `isScriptName`
+
+```silk
+pub static fn isScriptName(name: string) -> bool
+```
+
+Returns whether `name` is a script name or alias that `\p{Script=name}` accepts.
+
+#### Details
+A static function, for checking a pattern while it compiles. It reads the name table the
+engine's own script lookup reads.
+
+<a id="UnicodeProperties.impl.isCategoryName"></a>
+
+### Associated function `isCategoryName`
+
+```silk
+pub static fn isCategoryName(name: string) -> bool
+```
+
+Returns whether `name` is a general category name or alias that `\p{gc=name}` accepts.
+
+#### Details
+A static function, for checking a pattern while it compiles. It reads the name table the
+engine's own category lookup reads.
+
+<a id="UnicodeProperties.impl.isBinaryName"></a>
+
+### Associated function `isBinaryName`
+
+```silk
+pub static fn isBinaryName(name: string) -> bool
+```
+
+Returns whether `name` is a binary property name or alias that `\p{name}` accepts.
+
+#### Details
+A static function, for checking a pattern while it compiles. It reads the name table the
+engine's own property lookup reads, and admits only the properties it can build.
+
 <a id="UnicodeProperties.impl.script"></a>
 
 ### Associated function `script`
