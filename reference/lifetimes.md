@@ -164,8 +164,7 @@ its data lifetime. Alone, its one lifetime is the default.
 
 **Diagnostics:** A field, declaration bound, alias target or implementation head that omits a
 lifetime reports `SEM0210` with the declaration to write, and so do missing or ambiguous output
-relationships and a signature type that hides its lifetimes. The editor offers a
-quick fix that inserts `'_` for a hidden signature lifetime. A lifetime binder bounded by `'static` on an implementation head reports `SEM0211`,
+relationships and a signature type that hides its lifetimes. A lifetime binder bounded by `'static` on an implementation head reports `SEM0211`,
 and a field whose type is a callable contract reports `SEM0018`. Editor hover shows stable
 readable generated binders. Ordinary formatting preserves the author's explicit or omitted
 choices in signatures.
