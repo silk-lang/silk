@@ -20,9 +20,8 @@ codec object left at runtime.
 Decoding runs the steps from the wire form to the value, and encoding runs them the other way.
 A check added with `Codecs.check` runs on decode only, on the value its step produced.
 
-## Gotchas
-A step of a chain must not be another chain, and the codec inside `Codecs.check` must not be a
-chain: the compiler rejects the nested specialization (`SEM0053`). Use one longer chain instead.
+A chain can be a step in another chain or the codec inside `Codecs.check`. Nested composition
+follows the same decode and encode order, and its concrete specialization graph is finite.
 
 ## Examples
 ### Read a port from text
