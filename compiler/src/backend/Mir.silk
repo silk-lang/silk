@@ -621,10 +621,12 @@ struct ExitDrop {
 
 impl Copy for ExitDrop {}
 
-// How an exit path ends: returning, failing, or abandoning a cancelled frame.
+// How an exit path ends: returning, failing, forwarding a callee's failure through the shared
+// forward block, or abandoning a cancelled frame.
 enum ExitKind {
   Returns,
   Fails,
+  Forwards,
   Abandons,
 }
 
@@ -641,6 +643,12 @@ struct ExitStep {
   block: usize,
   origin: Origin,
   children: List<usize>,
+}
+
+// The slot run sites catch failures of type `ty` in, on their way out of the function.
+struct CaughtSlot {
+  ty: Interned<Type>,
+  local: usize,
 }
 
 // A `return`, `fail` or failure propagation whose block is completed once the function ends: its
@@ -1044,6 +1052,16 @@ struct Builder {
   // those exits in lowering order.
   exits: List<ExitStep>,
   left: List<LeftExit>,
+  // The block every forwarded failure's drop path ends in, which records the forwarding site as the
+  // failure's next frame and fails, and the local holding that site's label; usize.MAX until a run
+  // site in a program that observes diagnostics forwards a failure. Sharing the block keeps the
+  // observer glue out of each run site.
+  forward: usize,
+  forwardSite: usize,
+  // The slot each failure type a run site forwards is caught in. Only one failure is in flight at
+  // a time and each site moves it out at once, so the sites of one type share a slot and its
+  // context companion instead of each keeping its own for the whole frame.
+  caught: List<CaughtSlot>,
   // The remaining children of each partial consuming site, keyed by body node.
   remainders: List<Remainder>,
   // Which typed-body locals and node values need cleanup, answered by semantic analysis.
@@ -2994,8 +3012,9 @@ fn sameExitDrop(left: ExitDrop, right: ExitDrop) -> bool {
   return left.node == right.node && left.state == right.state && left.plan == right.plan && left.temporary == right.temporary
 }
 
-fn exitTerminator(kind: ExitKind, origin: Origin) -> Terminator {
+fn exitTerminator(builder: &Builder, kind: ExitKind, origin: Origin) -> Terminator {
   if kind == ExitKind.Fails { return Terminator.Fail {origin: origin} }
+  if kind == ExitKind.Forwards { return Terminator.Goto {target: builder.forward, origin: origin} }
   if kind == ExitKind.Abandons { return Terminator.Abandon {origin: origin} }
   return Terminator.Return {origin: origin}
 }
@@ -3057,7 +3076,8 @@ effect fn leaveFunction(builder: &mut Builder, kind: ExitKind, origin: Origin) -
   let drops = run exitDrops(&mut builder.*)
   let listed = List<ExitDrop>.asSlice(&drops)
   if listed.length == usize.ZERO {
-    terminate(&mut builder.*, exitTerminator(kind, origin))
+    let ending = exitTerminator(&builder.*, kind, origin)
+    terminate(&mut builder.*, move ending)
     return ()
   }
   // An owner of an open abstract type is reported at the exit that needs its drop, as inline
@@ -3328,7 +3348,8 @@ effect fn walkExit(builder: &mut Builder, start: usize, owned: bool, queue: &mut
     let shared = steps[step].count > usize.ONE
     let released = steps[step].released
     if next == usize.MAX {
-      terminate(&mut builder.*, exitTerminator(kind, origin))
+      let ending = exitTerminator(&builder.*, kind, origin)
+      terminate(&mut builder.*, move ending)
       return ()
     }
     if !inline && shared {
@@ -7630,7 +7651,7 @@ effect fn helperBuilder(creator: &Builder, key: InstanceKey, result: &Interned<T
     failure: usize.MAX, plans: List<NodePlan>.make(), storage: List<StoragePlan>.make(), carriers: List<CarrierPlan>.make(),
     providers: List<usize>.make(), diagnostics: move diagnostics, sites: Option<SiteText>.none(), anchor: Anchor.copy(&creator.anchor),
     witnessIntrinsics: List<WitnessIntrinsic>.make(), helpers: List<MirFunction>.make(),
-    exits: List<ExitStep>.make(), left: List<LeftExit>.make(), suspending: Option<List<InstanceKey>>.none(),
+    exits: List<ExitStep>.make(), left: List<LeftExit>.make(), forward: usize.MAX, forwardSite: usize.MAX, caught: List<CaughtSlot>.make(), suspending: Option<List<InstanceKey>>.none(),
     cancelEveryCall: cancellable,
     held: List<HeldFailure>.make(),
     cancelScopes: List<CancelScope>.make(),
@@ -8647,7 +8668,7 @@ effect fn lowerRun(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Module
   let mut handler = usize.MAX
   if !Interned<Type>.with<bool>(&calleeFailure, neverType) {
     if builder.failure == usize.MAX { return run unsupported(&owner, origin, GapCode.TypedForm) }
-    caught = run temporary(&mut builder.*, &calleeFailure, origin)
+    caught = run caughtSlot(&mut builder.*, &calleeFailure, origin)
     handler = run block(&mut builder.*, origin)
     edge = Option<FailureEdge>.some(FailureEdge {destination: place(caught), target: handler,
 })
@@ -8677,15 +8698,57 @@ fn continueAfter(builder: &mut Builder, continuation: usize, output: usize, ty: 
   return Operand.Copy {place: place(output)}
 }
 
+// The slot a run site catches a forwarded failure of type `ty` in, shared by every such site.
+effect fn caughtSlot(builder: &mut Builder, ty: &Interned<Type>, origin: Origin) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let slots = List<CaughtSlot>.asSlice(&builder.caught)
+  let mut at = usize.ZERO
+  while at < slots.length {
+    if Interned<Type>.same(&slots[at].ty, ty) { return slots[at].local }
+    at = at + usize.ONE
+  }
+  let local = run temporary(&mut builder.*, ty, origin)
+  run List<CaughtSlot>.append(&mut builder.*.caught, CaughtSlot {ty: Interned<Type>.clone(ty), local: local})
+  return local
+}
+
 // Moves a caught failure into `Failure`, widening it into the caller's failure union, then leaves
-// every open scope innermost first and fails.
+// every open scope innermost first and fails. In a program that observes diagnostics the exit ends
+// in the shared forward block, which records this site as the failure's next frame.
 effect fn propagateFailure(builder: &mut Builder, caught: usize, from: &Interned<Type>, origin: Origin) -> ()
 ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
   let destination = builder.failure
   run widenInto(&mut builder.*, caught, from, destination, origin)
   run carry(&mut builder.*, caught, destination, origin)
-  run frame(&mut builder.*, destination, origin)
-  return run leaveFunction(&mut builder.*, ExitKind.Fails, origin)
+  if !run forwardFrom(&mut builder.*, origin) { return run leaveFunction(&mut builder.*, ExitKind.Fails, origin) }
+  return run leaveFunction(&mut builder.*, ExitKind.Forwards, origin)
+}
+
+// Names the current block's run site as the forwarded failure's next frame, for the shared forward
+// block to record after the site's drops, and reports whether there is a frame to record: only a
+// program that observes diagnostics records one. The first forwarding site creates the block.
+effect fn forwardFrom(builder: &mut Builder, origin: Origin) -> bool
+! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
+  if let Option<DiagnosticPlaces>.None = &builder.diagnostics { return false }
+  let label = match &builder.sites {
+    Option<SiteText>.Some {value: sites} => run siteLabel(&sites, &builder.anchor, origin)
+    Option<SiteText>.None => { return false }
+  }
+  if builder.forward == usize.MAX {
+    let site = builder.current
+    let text = run temporary(&mut builder.*, &run reportTextType(), origin)
+    let shared = run block(&mut builder.*, origin)
+    builder.forwardSite = text
+    builder.forward = shared
+    let slot = builder.failure
+    resume(&mut builder.*, shared)
+    run frame(&mut builder.*, slot, text, origin)
+    terminate(&mut builder.*, Terminator.Fail {origin: origin})
+    resume(&mut builder.*, site)
+  }
+  let count = run usizeOperand(usize.toU64(Bytes.length(&label)))
+  let named = builder.forwardSite
+  run assign(&mut builder.*, place(named), Rvalue.Slice {data: Operand.StaticBytes {bytes: move label}, count: move count}, origin)
+  return true
 }
 
 // Moves `caught`, of type `from`, into `destination`: as itself, injected under its tag, or, when
@@ -10023,17 +10086,11 @@ effect fn chainCause(builder: &mut Builder, handle: usize, origin: Origin) -> ()
   return ()
 }
 
-// A failure that leaves this function through a run site gains that site as its next logical
-// frame (event 1), which takes over the previous node's reference (event 4, N7).
-effect fn frame(builder: &mut Builder, slot: usize, origin: Origin) -> () ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
-  if let Option<DiagnosticPlaces>.None = &builder.diagnostics { return () }
-  let label = match &builder.sites {
-    Option<SiteText>.Some {value: sites} => run siteLabel(&sites, &builder.anchor, origin)
-    Option<SiteText>.None => { return () }
-  }
+// A failure that leaves this function through a run site gains that site, labeled by local `site`,
+// as its next logical frame (event 1), which takes over the previous node's reference (event 4, N7).
+effect fn frame(builder: &mut Builder, slot: usize, site: usize, origin: Origin) -> () ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
   let address = run companion(&mut builder.*, slot, origin)
   let previous = run handleOf(&mut builder.*, address, origin)
-  let site = run reportText(&mut builder.*, Bytes.asSlice(&label), origin)
   let unlabeled = run reportText(&mut builder.*, b"", origin)
   let handle = run observerEvent(&mut builder.*, 1, Operand.Copy {place: place(previous)}, run usizeOperand(0),
     Operand.Copy {place: place(site)}, Operand.Copy {place: place(unlabeled)}, origin)
@@ -11188,6 +11245,9 @@ impl MirFunction {
       temporaries: List<Pending>.make(),
       exits: List<ExitStep>.make(),
       left: List<LeftExit>.make(),
+      forward: usize.MAX,
+      forwardSite: usize.MAX,
+      caught: List<CaughtSlot>.make(),
       remainders: move remainders,
       needs: move needs,
       failure: failureLocal,
