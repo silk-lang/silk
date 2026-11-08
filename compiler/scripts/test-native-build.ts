@@ -231,7 +231,8 @@ const program = Effect.gen(function* () {
   ]) {
     const help = yield* invoke(silkTool, args, releaseWorkspace, changesEnvironment)
     assert.equal(help.status, 0, help.stderr)
-    assert.match(help.stdout, /silk change \[--dir PATH\] patch\|minor\|major/)
+    assert.match(help.stdout, /^Usage: silk change \[options\] <command>\n/)
+    assert.match(help.stdout, /\n  patch +Record a patch change\n/)
     assert.equal(help.stderr, '')
   }
   const missingDirectory = yield* invoke(silkTool,
@@ -239,8 +240,8 @@ const program = Effect.gen(function* () {
     releaseWorkspace,
     changesEnvironment,
   )
-  assert.equal(missingDirectory.status, 1)
-  assert.match(missingDirectory.stderr, /silk change: --dir requires/)
+  assert.equal(missingDirectory.status, 2)
+  assert.match(missingDirectory.stderr, /^error: --dir needs a value\n/)
   assert.doesNotMatch(missingDirectory.stderr, /\.lock/, 'an argument error writes nothing to recover')
   for (const args of [
     ['patch', 'Must not create a workspace release'],
