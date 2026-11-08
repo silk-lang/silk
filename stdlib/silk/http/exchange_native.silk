@@ -143,7 +143,7 @@ import silk.http.transport as Transport {HttpTransport, TransportError}
 import silk.tls.https_identity {HttpsIdentity, OriginHost, ReferenceIdentity, IdentityError}
 import silk.tls.record {VersionPolicy}
 import silk.system.monotonic_clock {MonotonicClock}
-import silk.net.address {Host, DomainHost, Ipv4Address, Ipv6Address}
+import silk.net.address {Host, DomainHost, Endpoint, Ipv4Address, Ipv6Address}
 import silk.core.option {Option}
 import silk.core.ownership {Copy}
 import silk.system.random {Random}
@@ -337,6 +337,10 @@ pub enum AlpnPolicy {
   RequiredHttp11,
   /// Sends no ALPN extension. Use it for a server that supports only HTTP/1.0.
   Http10,
+  /// Offers `h2`, then `http/1.1`, on a direct `https` connection from [`acquireNegotiatedOwned`]
+  /// or [`acquireResolvedNegotiatedOwned`], which return which one the server selected. The other
+  /// functions, proxy routes and plain `http` offer `http/1.1` only, as `OptionalHttp11` does.
+  PreferHttp2,
 }
 
 /// The settings of a native connection. Start from [`Options.defaults`].
@@ -416,6 +420,7 @@ fn proxyProtocol(policy: AlpnPolicy) -> RouteProtocol {
     AlpnPolicy.Http10 => RouteProtocol.Http10
     AlpnPolicy.OptionalHttp11 => RouteProtocol.OptionalHttp11
     AlpnPolicy.RequiredHttp11 => RouteProtocol.RequiredHttp11
+    AlpnPolicy.PreferHttp2 => RouteProtocol.OptionalHttp11
   }
 }
 
@@ -747,6 +752,28 @@ effect fn releasePublication(owned: &mut OwnedPublication) -> () {
   return ()
 }
 
+/// The connection that [`acquireNegotiatedOwned`] opened, by the protocol the server selected.
+pub union Negotiated {
+  /// HTTP/1.1, or HTTP/1.0 with `AlpnPolicy.Http10`: an exchange connection.
+  Http1 {pub connection: Connection<NativeTransport>},
+  /// HTTP/2, selected with ALPN `h2`: the transport, for a `silk.http.http2_connection` driver.
+  Http2 {pub transport: NativeTransport},
+}
+
+// Whether the TLS handshake of `transport` selected `h2`.
+fn selectedHttp2(transport: &NativeTransport) -> bool {
+  return match &transport.state {
+    State.Secured {connection} => match move connection.authentication() {
+      Option.Some {value} => match move value.selectedAlpn() {
+        Option.Some {value: protocol} => protocol.length == 2 && protocol[0] == 104 && protocol[1] == 50
+        Option.None => false
+      }
+      Option.None => false
+    }
+    _ => false
+  }
+}
+
 effect fn publishOwned(
   socket: NativeConnection,
   origin: Origin,
@@ -758,12 +785,35 @@ effect fn publishOwned(
 ) -> Connection<NativeTransport>
 ! NativeExchangeError | ExchangeError | NativeSocketError | ConnectionError | IdentityError | OutOfMemoryError
 ? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random {
+  let negotiated = run publishNegotiated(move socket, origin, options, limits, move preparedTrust, route, move deadline, false)
+  return match move negotiated {
+    Negotiated.Http1 {connection} => move connection
+    // Without `h2` on offer, the server cannot select it.
+    Negotiated.Http2 {transport} => {
+      drop transport
+      unavailable<Connection<NativeTransport>>()
+    }
+  }
+}
+
+effect fn publishNegotiated(
+  socket: NativeConnection,
+  origin: Origin,
+  options: &Options,
+  limits: Limits,
+  preparedTrust: Option<TrustSnapshot>,
+  route: NativeRoute,
+  deadline: Option<Instant>,
+  http2: bool,
+) -> Negotiated
+! NativeExchangeError | ExchangeError | NativeSocketError | ConnectionError | IdentityError | OutOfMemoryError
+? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random {
   let guard = OwnedPublication {
     socket: Option<NativeConnection>.some(move socket),
     transport: Option<NativeTransport>.none(),
     connection: Option<Connection<NativeTransport>>.none(),
   }
-  let use = effect fn(owned: &mut OwnedPublication) -> Connection<NativeTransport>
+  let use = effect fn(owned: &mut OwnedPublication) -> Negotiated
   ! NativeExchangeError | ExchangeError | NativeSocketError | ConnectionError | IdentityError | OutOfMemoryError
   ? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random {
     if Origin.secure(&origin) {
@@ -771,7 +821,7 @@ effect fn publishOwned(
         Option.Some {value} => move value
         Option.None => unavailable<TrustSnapshot>()
       }
-      run securePrepared(&mut owned.*, &origin, options, route, move trust)
+      run securePrepared(&mut owned.*, &origin, options, route, move trust, http2)
     } else {
       drop preparedTrust
       let stored = Intrinsic.replace(owned.socket, Option<NativeConnection>.none())
@@ -792,10 +842,15 @@ effect fn publishOwned(
       Option.Some {value} => move value
       Option.None => unavailable<NativeTransport>()
     }
+    if http2 && selectedHttp2(&publishedTransport) {
+      run checkOpeningDeadline(&deadline)
+      return Negotiated.Http2 {transport: move publishedTransport}
+    }
     let version = match options.alpn {
       AlpnPolicy.Http10 => Version.Http10
       AlpnPolicy.OptionalHttp11 => Version.Http11
       AlpnPolicy.RequiredHttp11 => Version.Http11
+      AlpnPolicy.PreferHttp2 => Version.Http11
     }
     let connection = run Client.makeOwned(
       move publishedTransport,
@@ -808,8 +863,8 @@ effect fn publishOwned(
     run checkOpeningDeadline(&deadline)
     let complete = Intrinsic.replace(owned.connection, Option<Connection<NativeTransport>>.none())
     return match move complete {
-      Option.Some {value} => move value
-      Option.None => unavailable<Connection<NativeTransport>>()
+      Option.Some {value} => Negotiated.Http1 {connection: move value}
+      Option.None => unavailable<Negotiated>()
     }
   }
   let release = effect fn(owned: &mut OwnedPublication) -> () {
@@ -892,6 +947,196 @@ pub effect fn acquireOwned(
     )
   } else {
     compileError("Native HTTP acquisition requires a supported Windows, Darwin, or GNU libc profile")
+  }
+}
+
+/// Opens a direct TCP or HTTPS connection to `origin` at one of `endpoints`, and returns it.
+///
+/// # When to use
+/// Use it to open several connections to one origin with one name lookup: resolve the host once,
+/// for example with `silk.net.resolver_native`, and give the same endpoints to each call.
+///
+/// # Details
+/// It works like [`acquireOwned`], but it does not resolve the host of `origin`. It tries
+/// `endpoints` in order. The host of `origin` still names the server for TLS and the certificate
+/// check, so give endpoints of that host.
+///
+/// # Errors
+/// - `NativeExchangeError.TrustRequired` if `origin` uses `https` and `preparedTrust` is none.
+/// - `NativeSocketError.Timeout` if the deadline has passed.
+/// - `NativeSocketError`, `ConnectionError`, and `IdentityError` from the socket, TLS, and the
+///   certificate check.
+///
+/// # Gotchas
+/// Only Darwin on x86_64 or aarch64, and Linux with GNU libc on x86_64 or aarch64, are supported. On other
+/// targets, a call fails to compile.
+pub effect fn acquireResolvedOwned(
+  origin: Origin,
+  endpoints: &[Endpoint],
+  options: Options,
+  limits: Limits,
+  preparedTrust: Option<TrustSnapshot>,
+  acquisitionDeadline: Option<Instant>,
+) -> Connection<NativeTransport>
+! NativeExchangeError | ExchangeError | NativeSocketError | ConnectionError | IdentityError | OutOfMemoryError
+? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random {
+  static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArchitecture() == "x86_64" && Intrinsic.targetAbi() == "msvc" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "darwin" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64") && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText(
+    "libc",
+  ) == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText(
+    "libc",
+  ) == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")) {
+    let deadline = selectOpeningDeadline(&options.deadline, &acquisitionDeadline)
+    let mut openingOptions = move options
+    openingOptions.deadline = copyDeadline(&deadline)
+    let admitted = preflight(&origin, &openingOptions)
+    if let Result.Failure {error} = move admitted {
+      fail move error
+    }
+    if Origin.secure(&origin) && !trustPresent(&preparedTrust) {
+      fail NativeExchangeError.TrustRequired
+    }
+    run checkOpeningDeadline(&deadline)
+    let connect = run connectOptions(&openingOptions)
+    let socket = run Sockets.connectResolvedOwned(endpoints, connect, copyDeadline(&deadline))
+    return run publishOwned(
+      move socket,
+      origin,
+      &openingOptions,
+      limits,
+      move preparedTrust,
+      directRoute(),
+      move deadline,
+    )
+  } else {
+    compileError("Native HTTP acquisition requires a supported Windows, Darwin, or GNU libc profile")
+  }
+}
+
+/// Opens a direct TCP or HTTPS connection to `origin`, as [`acquireOwned`] does, and returns it
+/// by the protocol the server selected.
+///
+/// # Details
+/// With `AlpnPolicy.PreferHttp2`, an `https` connection offers `h2`, then `http/1.1`. When the
+/// server selects `h2`, the result is `Negotiated.Http2` with the transport; otherwise it is
+/// `Negotiated.Http1` with an exchange connection, as from [`acquireOwned`].
+///
+/// # Errors
+/// The same as [`acquireOwned`].
+pub effect fn acquireNegotiatedOwned(
+  origin: Origin,
+  options: Options,
+  limits: Limits,
+  preparedTrust: Option<TrustSnapshot>,
+  acquisitionDeadline: Option<Instant>,
+) -> Negotiated
+! NativeExchangeError | ExchangeError | ResolverError | NativeSocketError | ConnectionError | IdentityError | OutOfMemoryError
+? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random {
+  static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArchitecture() == "x86_64" && Intrinsic.targetAbi() == "msvc" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "darwin" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64") && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText(
+    "libc",
+  ) == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText(
+    "libc",
+  ) == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")) {
+    let deadline = selectOpeningDeadline(&options.deadline, &acquisitionDeadline)
+    let mut openingOptions = move options
+    openingOptions.deadline = copyDeadline(&deadline)
+    let admitted = preflight(&origin, &openingOptions)
+    if let Result.Failure {error} = move admitted {
+      fail move error
+    }
+    if Origin.secure(&origin) && !trustPresent(&preparedTrust) {
+      fail NativeExchangeError.TrustRequired
+    }
+    run checkOpeningDeadline(&deadline)
+    let connect = run connectOptions(&openingOptions)
+    let request = match move ResolveRequest.make(
+      Origin.host(&origin),
+      Origin.port(&origin),
+      openingOptions.family,
+      openingOptions.maximumAddresses,
+      copyDeadline(&deadline),
+    ) {
+      Result.Success {value} => move value
+      Result.Failure {error} => {
+        fail move error
+      }
+    }
+    let mut resolver = NativeSystemResolver.make()
+    let endpoints = run Resolver.resolve(&request)
+      |> Effect.provideMut<Resolver>(&mut resolver)
+    let socket = run Sockets.connectResolvedOwned(
+      ResolvedEndpoints.asSlice(&endpoints),
+      connect,
+      copyDeadline(&deadline),
+    )
+    let http2 = offersHttp2(openingOptions.alpn)
+    return run publishNegotiated(
+      move socket,
+      origin,
+      &openingOptions,
+      limits,
+      move preparedTrust,
+      directRoute(),
+      move deadline,
+      http2,
+    )
+  } else {
+    compileError("Native HTTP acquisition requires a supported Windows, Darwin, or GNU libc profile")
+  }
+}
+
+/// Opens a direct connection to one of `endpoints`, as [`acquireResolvedOwned`] does, and returns
+/// it by the protocol the server selected, as [`acquireNegotiatedOwned`] does.
+///
+/// # Errors
+/// The same as [`acquireResolvedOwned`].
+pub effect fn acquireResolvedNegotiatedOwned(
+  origin: Origin,
+  endpoints: &[Endpoint],
+  options: Options,
+  limits: Limits,
+  preparedTrust: Option<TrustSnapshot>,
+  acquisitionDeadline: Option<Instant>,
+) -> Negotiated
+! NativeExchangeError | ExchangeError | NativeSocketError | ConnectionError | IdentityError | OutOfMemoryError
+? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random {
+  static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArchitecture() == "x86_64" && Intrinsic.targetAbi() == "msvc" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "darwin" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64") && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText(
+    "libc",
+  ) == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText(
+    "libc",
+  ) == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")) {
+    let deadline = selectOpeningDeadline(&options.deadline, &acquisitionDeadline)
+    let mut openingOptions = move options
+    openingOptions.deadline = copyDeadline(&deadline)
+    let admitted = preflight(&origin, &openingOptions)
+    if let Result.Failure {error} = move admitted {
+      fail move error
+    }
+    if Origin.secure(&origin) && !trustPresent(&preparedTrust) {
+      fail NativeExchangeError.TrustRequired
+    }
+    run checkOpeningDeadline(&deadline)
+    let connect = run connectOptions(&openingOptions)
+    let socket = run Sockets.connectResolvedOwned(endpoints, connect, copyDeadline(&deadline))
+    let http2 = offersHttp2(openingOptions.alpn)
+    return run publishNegotiated(
+      move socket,
+      origin,
+      &openingOptions,
+      limits,
+      move preparedTrust,
+      directRoute(),
+      move deadline,
+      http2,
+    )
+  } else {
+    compileError("Native HTTP acquisition requires a supported Windows, Darwin, or GNU libc profile")
+  }
+}
+
+fn offersHttp2(policy: AlpnPolicy) -> bool {
+  return match policy {
+    AlpnPolicy.PreferHttp2 => true
+    _ => false
   }
 }
 
@@ -1500,6 +1745,7 @@ effect fn securePrepared(
   options: &Options,
   route: NativeRoute,
   trust: TrustSnapshot,
+  http2: bool,
 ) -> ()
 ! NativeExchangeError | ConnectionError | IdentityError | OutOfMemoryError
 ? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random {
@@ -1507,12 +1753,13 @@ effect fn securePrepared(
   let mut name = emptyDomainName()
   let nameLength = copyDomain(&host, &mut name)
   let nameBytes = Slice.view<u8>(&name, usize.ZERO, nameLength)
-  let protocols = [AlpnProtocol {bytes: b"http/1.1"}]
+  let both = [AlpnProtocol {bytes: b"h2"}, AlpnProtocol {bytes: b"http/1.1"}]
+  let protocols = if http2 { Slice.view<AlpnProtocol<'_>>(&both, 0, 2) } else { Slice.view<AlpnProtocol<'_>>(&both, 1, 1) }
   let transport = run authenticatePrepared(
     &mut owned.*,
     &host,
     nameBytes,
-    &protocols,
+    protocols,
     move trust,
     options,
     route,
@@ -1592,6 +1839,7 @@ fn selectAlpn<'a>(protocols: &'a [AlpnProtocol<'a>], policy: AlpnPolicy) -> Alpn
     AlpnPolicy.Http10 => AlpnConfig<'a>.Disabled
     AlpnPolicy.OptionalHttp11 => AlpnConfig<'a>.Offered {protocols: protocols, required: false}
     AlpnPolicy.RequiredHttp11 => AlpnConfig<'a>.Offered {protocols: protocols, required: true}
+    AlpnPolicy.PreferHttp2 => AlpnConfig<'a>.Offered {protocols: protocols, required: false}
   }
 }
 

@@ -18,7 +18,8 @@ operation returns, also on errors.
 
 ## Gotchas
 - The memory limit of a control group is read from cgroup v2 `memory.max` or cgroup v1
-  `memory.limit_in_bytes`. Other limits, such as `ulimit`, are not reported.
+  `memory.limit_in_bytes`. Other limits, such as `ulimit`, are not reported. The usage leaves
+  out the inactive file cache in `memory.stat`, which both versions count.
 - The provider exists on Darwin on x86_64 or aarch64, and on GNU Linux on x86_64 or aarch64.
 
 ## Examples
@@ -78,7 +79,8 @@ On Linux, it reads `/proc`, `/sys`, `uname`, `getifaddrs`, `getpwuid_r`, `getrus
 
 ### Gotchas
 - The memory limit of a control group is read from cgroup v2 `memory.max` or cgroup v1
-  `memory.limit_in_bytes`. Other limits, such as `ulimit`, are not reported.
+  `memory.limit_in_bytes`. Other limits, such as `ulimit`, are not reported. The usage leaves
+  out the inactive file cache in `memory.stat`, which both versions count.
 - The provider exists on Darwin on x86_64 or aarch64, and on GNU Linux on x86_64 or aarch64.
 
 <a id="OsSystemInfo.impl"></a>

@@ -5,7 +5,7 @@
 //! Lowering gives each call a fresh temporary destination and a fresh snapshot of each argument, so
 //! `return f(x)` copies `f`'s result into the function's own result, and `f(x)` copies `x` before the
 //! call. For a large `Copy` struct each copy is a `memcpy` that LLVM keeps, because the callee may
-//! write the address it receives. Two rewrites remove them:
+//! write the address it receives. The following rewrites remove them:
 //!
 //! - A call whose temporary result is only moved or copied whole into the result local, or into
 //!   another temporary, by the first statement of its continuation writes that place directly. The
@@ -36,8 +36,13 @@
 //!   Effect built from its function's parameters then runs on the parameters' own storage instead
 //!   of a copy of them.
 //!
-//! All keep the invariants `MirVerification.callDestinationsFresh` checks: a destination is still a
-//! whole temporary or the result local, never borrowed, and named by no argument.
+//! - A call's otherwise-unused result that becomes a variant's sole field writes that field
+//!   directly when no path observes the variant before a whole write initializes it. The success
+//!   continuation retains the field in place and commits the tag. Failure and cancellation paths
+//!   must not observe the partially written variant.
+//!
+//! All keep the invariants `MirVerification.callDestinationsFresh` checks: a destination is a
+//! temporary or the result local (possibly its unborrowed variant field), named by no argument.
 
 import backend.MirVerification
 import backend.Mir {
@@ -65,7 +70,7 @@ import semantic.TypedBody {Origin}
 import semantic.Types {Types}
 import silk.mem.allocator {Allocator, OutOfMemoryError}
 import silk.mem.box {Box}
-import silk.mem.shared {Shared}
+import silk.mem.frozen {Frozen}
 import silk.collections.list {List}
 import silk.core.option {Option}
 import silk.core.ownership {Copy}
@@ -86,7 +91,109 @@ pub effect fn coalesce(function: &mut MirFunction) -> () ! OutOfMemoryError ? &m
     run forwardResults(&mut function.*, &mut table)
     run forwardArguments(&mut function.*, &mut table)
   }
+  run forwardVariantPayloads(&mut function.*)
   return run splitAggregates(&mut function.*)
+}
+
+// A completed call followed by a single-field variant constructor can build the payload in
+// place. The constructor still writes the tag only on success. On failure or cancellation the
+// partially written payload must be unobservable until a whole write replaces the variant.
+effect fn forwardVariantPayloads(function: &mut MirFunction) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut table = run UseTable.of(&function.*)
+  let mut sites = run JoinSites.of(&function.*)
+  let mut block = usize.ZERO
+  while block < List<Block>.length(&function.blocks) {
+    let mut at = usize.ZERO
+    while at < List<Statement>.length(&List<Block>.asSlice(&function.blocks)[block].statements) {
+      let mut target = usize.MAX
+      let mut source = usize.MAX
+      let mut tag = usize.ZERO
+      let mut field = usize.ZERO
+      if let Statement.Assign {destination, value: Rvalue.Variant {tag: variant, fields}, ..} =
+        &List<Statement>.asSlice(&List<Block>.asSlice(&function.blocks)[block].statements)[at] {
+        let listed = List<AggregateField>.asSlice(&fields)
+        if listed.length == usize.ONE {
+          target = wholePlace(&destination)
+          source = wholeLocal(&listed[0].value)
+          tag = variant
+          field = listed[0].index
+        }
+      }
+      if target != usize.MAX && source != usize.MAX && source != target && isTemp(&function.*, source)
+        && (isTemp(&function.*, target) || isReturn(&function.*, target)) {
+        let from = UseTable.uses(&table, source)
+        let into = UseTable.uses(&table, target)
+        if from.named == 2 && !from.borrowed && !from.dropped && !UseTable.flagged(&table, source)
+          && !into.borrowed && !into.dropped && !UseTable.flagged(&table, target)
+          && List<usize>.get(&sites.count, source) == usize.ONE {
+          let definition = List<JoinSite>.get(&sites.sites, List<usize>.get(&sites.first, source))
+          if definition.index == usize.MAX && run variantDestinationFresh(&function.*, definition.block, target) {
+            let mut projections = List<Projection>.make()
+            run List<Projection>.append(&mut projections, Projection.VariantField {variant: tag, field: field})
+            let payload = Place {local: target, projections: move projections}
+            let retained = Operand.Move {place: run copyPlace(&payload)}
+            let mut blocks = List<Block>.asMutSlice(&mut function.blocks)
+            if let Terminator.Call {destination, ..} = &mut blocks[definition.block].terminator {
+              destination = move payload
+            }
+            let mut statements = List<Statement>.asMutSlice(&mut blocks[block].statements)
+            if let Statement.Assign {value: Rvalue.Variant {fields, ..}, ..} = &mut statements[at] {
+              // Retain the field operand so ownership/view analysis still sees the payload.
+              // Emission's same-address move disappears; only the tag changes at runtime.
+              let mut values = List<AggregateField>.asMutSlice(&mut fields)
+              values[0].value = move retained
+            }
+            drop statements
+            drop blocks
+            table = run UseTable.of(&function.*)
+            sites = run JoinSites.of(&function.*)
+          }
+        }
+      }
+      at = at + usize.ONE
+    }
+    block = block + usize.ONE
+  }
+  return ()
+}
+
+// Every path after the producing call must replace `target` before reading it. This includes
+// the call's failure and cancellation edges and paths that loop back to the next invocation.
+effect fn variantDestinationFresh(function: &MirFunction, call: usize, target: usize) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  let blocks = List<Block>.asSlice(&function.blocks)
+  if let Terminator.Call {callee, ..} = &blocks[call].terminator {
+    if !silkCallee(&callee) || terminatorNames(&blocks[call].terminator, target) != usize.ZERO { return false }
+  } else { return false }
+  let mut pending = run MirFunction.successors(function, call)
+  let mut seen = List<bool>.make()
+  run List<bool>.appendRepeated(&mut seen, false, blocks.length)
+  let mut walked = usize.ZERO
+  while let Option<usize>.Some {value: next} = move List<usize>.pop(&mut pending) {
+    if List<bool>.get(&seen, next) { continue }
+    walked = walked + usize.ONE
+    if walked > joinWalkLimit() { return false }
+    List<bool>.set(&mut seen, next, true)
+    let statements = List<Statement>.asSlice(&blocks[next].statements)
+    let mut at = usize.ZERO
+    let mut replaced = false
+    while at < statements.length && !replaced {
+      if statementNames(&statements[at], target) != usize.ZERO {
+        if let Statement.Assign {destination, value, ..} = &statements[at] {
+          replaced = wholePlace(&destination) == target && rvalueNames(&value, target) == usize.ZERO
+        }
+        if !replaced { return false }
+      }
+      at = at + usize.ONE
+    }
+    if replaced { continue }
+    if terminatorNames(&blocks[next].terminator, target) != usize.ZERO { return false }
+    if isReturn(function, target) {
+      if let Terminator.Return {..} = &blocks[next].terminator { return false }
+    }
+    run MirFunction.appendSuccessors(function, next, &mut pending)
+  }
+  return true
 }
 
 // Whether `callee` follows the Silk calling convention rather than a C signature.
@@ -640,7 +747,7 @@ impl Rename {
 fn copyProjection(projection: &Projection) -> Projection {
   return match &projection.* {
     Projection.Field {index} => Projection.Field {index: index}
-    Projection.Payload {index, ty} => Projection.Payload {index: index, ty: Shared<Type>.clone(&ty)}
+    Projection.Payload {index, ty} => Projection.Payload {index: index, ty: Frozen<Type>.clone(&ty)}
     Projection.VariantField {variant, field} => Projection.VariantField {variant: variant, field: field}
     Projection.Index {local} => Projection.Index {local: local}
     Projection.ConstIndex {index} => Projection.ConstIndex {index: index}
@@ -2144,8 +2251,8 @@ effect fn inCycle(function: &MirFunction, block: usize) -> bool
 
 // The split the aggregate at statement `at` of `block` allows, if any.
 // Whether `ty` is an Effect value, such as one a composition intrinsic builds.
-fn nominal(ty: &Shared<Type>) -> bool {
-  return Shared<Type>.with<bool>(ty, fn(value: &Type) -> bool {
+fn nominal(ty: &Frozen<Type>) -> bool {
+  return Frozen<Type>.with<bool>(ty, fn(value: &Type) -> bool {
     return match &value.* {
       Type.Nominal {..} => true
       _ => false
@@ -2153,8 +2260,8 @@ fn nominal(ty: &Shared<Type>) -> bool {
   })
 }
 
-fn composedEffect(ty: &Shared<Type>) -> bool {
-  return Shared<Type>.with<bool>(ty, fn(value: &Type) -> bool {
+fn composedEffect(ty: &Frozen<Type>) -> bool {
+  return Frozen<Type>.with<bool>(ty, fn(value: &Type) -> bool {
     return match &value.* {
       Type.EffectComposite {..} => true
       Type.EffectJoin {..} => true

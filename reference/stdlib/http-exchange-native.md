@@ -116,7 +116,7 @@ pub fn main() -> i32 {
 
 Import as `HttpExchangeNative` with `import silk.http.exchange_native as HttpExchangeNative`.
 
-Public declarations: 18.
+Public declarations: 22.
 
 <a id="NativeRoute"></a>
 
@@ -282,6 +282,18 @@ Http10
 ```
 
 Sends no ALPN extension. Use it for a server that supports only HTTP/1.0.
+
+<a id="AlpnPolicy.PreferHttp2"></a>
+
+### `PreferHttp2`
+
+```silk
+PreferHttp2
+```
+
+Offers `h2`, then `http/1.1`, on a direct `https` connection from [`acquireNegotiatedOwned`](#acquireNegotiatedOwned)
+or [`acquireResolvedNegotiatedOwned`](#acquireResolvedNegotiatedOwned), which return which one the server selected. The other
+functions, proxy routes and plain `http` offer `http/1.1` only, as `OptionalHttp11` does.
 
 <a id="Options"></a>
 
@@ -555,6 +567,52 @@ shutdownWriteRaw: NativeRouteProvider.shutdownBytes
 closeRaw: NativeRouteProvider.closeBytes
 ```
 
+<a id="Negotiated"></a>
+
+## `Negotiated`
+
+```silk
+pub union Negotiated
+```
+
+The connection that [`acquireNegotiatedOwned`](#acquireNegotiatedOwned) opened, by the protocol the server selected.
+
+<a id="Negotiated.Http1"></a>
+
+### `Http1`
+
+```silk
+Http1
+```
+
+HTTP/1.1, or HTTP/1.0 with `AlpnPolicy.Http10`: an exchange connection.
+
+<a id="Negotiated.Http1.connection"></a>
+
+#### Field `connection`
+
+```silk
+pub connection: Connection<NativeTransport>
+```
+
+<a id="Negotiated.Http2"></a>
+
+### `Http2`
+
+```silk
+Http2
+```
+
+HTTP/2, selected with ALPN `h2`: the transport, for a `silk.http.http2_connection` driver.
+
+<a id="Negotiated.Http2.transport"></a>
+
+#### Field `transport`
+
+```silk
+pub transport: NativeTransport
+```
+
 <a id="acquireOwned"></a>
 
 ## `acquireOwned`
@@ -588,6 +646,94 @@ connection keeps no deadline. Close it, or give it to another owner such as a po
 ### Gotchas
 Only Darwin on x86_64 or aarch64, and Linux with GNU libc on x86_64 or aarch64, are supported. On other
 targets, a call fails to compile.
+
+<a id="acquireResolvedOwned"></a>
+
+## `acquireResolvedOwned`
+
+```silk
+pub effect fn acquireResolvedOwned(
+  origin: Origin,
+  endpoints: &[Endpoint],
+  options: Options,
+  limits: Limits,
+  preparedTrust: Option<TrustSnapshot>,
+  acquisitionDeadline: Option<Instant>,
+) -> Connection<NativeTransport>
+! NativeExchangeError | ExchangeError | NativeSocketError | ConnectionError | IdentityError | OutOfMemoryError
+? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random
+```
+
+Opens a direct TCP or HTTPS connection to `origin` at one of `endpoints`, and returns it.
+
+### When to use
+Use it to open several connections to one origin with one name lookup: resolve the host once,
+for example with `silk.net.resolver_native`, and give the same endpoints to each call.
+
+### Details
+It works like [`acquireOwned`](#acquireOwned), but it does not resolve the host of `origin`. It tries
+`endpoints` in order. The host of `origin` still names the server for TLS and the certificate
+check, so give endpoints of that host.
+
+### Errors
+- `NativeExchangeError.TrustRequired` if `origin` uses `https` and `preparedTrust` is none.
+- `NativeSocketError.Timeout` if the deadline has passed.
+- `NativeSocketError`, `ConnectionError`, and `IdentityError` from the socket, TLS, and the
+  certificate check.
+
+### Gotchas
+Only Darwin on x86_64 or aarch64, and Linux with GNU libc on x86_64 or aarch64, are supported. On other
+targets, a call fails to compile.
+
+<a id="acquireNegotiatedOwned"></a>
+
+## `acquireNegotiatedOwned`
+
+```silk
+pub effect fn acquireNegotiatedOwned(
+  origin: Origin,
+  options: Options,
+  limits: Limits,
+  preparedTrust: Option<TrustSnapshot>,
+  acquisitionDeadline: Option<Instant>,
+) -> Negotiated
+! NativeExchangeError | ExchangeError | ResolverError | NativeSocketError | ConnectionError | IdentityError | OutOfMemoryError
+? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random
+```
+
+Opens a direct TCP or HTTPS connection to `origin`, as [`acquireOwned`](#acquireOwned) does, and returns it
+by the protocol the server selected.
+
+### Details
+With `AlpnPolicy.PreferHttp2`, an `https` connection offers `h2`, then `http/1.1`. When the
+server selects `h2`, the result is `Negotiated.Http2` with the transport; otherwise it is
+`Negotiated.Http1` with an exchange connection, as from [`acquireOwned`](#acquireOwned).
+
+### Errors
+The same as [`acquireOwned`](#acquireOwned).
+
+<a id="acquireResolvedNegotiatedOwned"></a>
+
+## `acquireResolvedNegotiatedOwned`
+
+```silk
+pub effect fn acquireResolvedNegotiatedOwned(
+  origin: Origin,
+  endpoints: &[Endpoint],
+  options: Options,
+  limits: Limits,
+  preparedTrust: Option<TrustSnapshot>,
+  acquisitionDeadline: Option<Instant>,
+) -> Negotiated
+! NativeExchangeError | ExchangeError | NativeSocketError | ConnectionError | IdentityError | OutOfMemoryError
+? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random
+```
+
+Opens a direct connection to one of `endpoints`, as [`acquireResolvedOwned`](#acquireResolvedOwned) does, and returns
+it by the protocol the server selected, as [`acquireNegotiatedOwned`](#acquireNegotiatedOwned) does.
+
+### Errors
+The same as [`acquireResolvedOwned`](#acquireResolvedOwned).
 
 <a id="admitUnixRoute"></a>
 

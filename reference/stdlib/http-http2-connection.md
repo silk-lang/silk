@@ -68,6 +68,16 @@ pub effect fn make(endpoint: Role, limits: Limits) -> Driver
 Creates a protocol connection and a 16 KiB transport read buffer. No I/O occurs until `flush`
 or `next`.
 
+<a id="Driver.impl.finished"></a>
+
+### Method `finished`
+
+```silk
+pub fn finished(self: &Self) -> bool
+```
+
+Returns true after transport EOF, `close`, or a connection error: no new stream can go out.
+
 <a id="Driver.impl.connection"></a>
 
 ### Method `connection`

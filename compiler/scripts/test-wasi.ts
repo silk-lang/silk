@@ -404,9 +404,59 @@ const program = Effect.gen(function* () {
       )
     }
   }
+  // The regex engine's greedy one-unit loops backtrack through frames that pack a start position
+  // and an exit pc in one 64-bit word, which a 32-bit usize cannot hold (the playground's
+  // manifest check trapped on it). The pattern parser keeps its open groups on the heap, so
+  // groups nested to the limit parse within Wasmtime's stack and deeper ones fail with
+  // PatternLimit, even in a debug build.
+  yield* fs.writeFileString(
+    join(directory, 'main.silk'),
+    [
+      'import silk.core.effect { Effect }',
+      'import silk.core.result { Result }',
+      'import silk.text.regex { Regex, RegexError, RegexReason }',
+      'import silk.text.string { String }',
+      'import silk.mem.allocator { Allocator, OutOfMemoryError }',
+      '// 0 when groups nested depth deep parse, 1 for PatternLimit, 2 for another error.',
+      'effect fn nested(depth: usize) -> i32 ! OutOfMemoryError ? &mut Allocator {',
+      '  let mut text = String.make()',
+      '  let mut i: usize = 0',
+      '  while i < depth { run text.append("(?:") i = i + 1 }',
+      '  run text.append("a")',
+      '  i = 0',
+      '  while i < depth { run text.append(")") i = i + 1 }',
+      '  return match move run Effect.result(Regex.validate(text.view())) {',
+      '    Result<(), RegexError | OutOfMemoryError>.Success {value: _} => 0',
+      '    Result<(), RegexError | OutOfMemoryError>.Failure {error} => match move error {',
+      '      RegexError problem => if problem.reason == RegexReason.PatternLimit { 1 } else { 2 }',
+      '      OutOfMemoryError exhausted => { fail move exhausted }',
+      '    }',
+      '  }',
+      '}',
+      'effect fn checks() -> i32 ! RegexError | OutOfMemoryError ? &mut Allocator {',
+      '  if !run Regex.matches("^[a-z][a-z0-9-]*$", "wasi-test") { return 1 }',
+      '  if !run Regex.matches("^a*ab$", "aaaab") { return 2 }',
+      '  if !run Regex.matches("^x+xy$", "xxxxy") { return 3 }',
+      '  if run Regex.matches("^a*ab$", "aaaa") { return 4 }',
+      '  if (run nested(255)) != 0 { return 6 }',
+      '  if (run nested(300)) != 1 { return 7 }',
+      '  return 0',
+      '}',
+      'pub fn main() -> i32 {',
+      '  let mut allocator = Allocator.systemAllocatorProvider()',
+      '  return match move run Effect.result(checks()) |> Effect.provideMut<Allocator>(&mut allocator) {',
+      '    Result<i32, RegexError | OutOfMemoryError>.Success {value} => value',
+      '    Result<i32, RegexError | OutOfMemoryError>.Failure {error} => { drop error 5 }',
+      '  }',
+      '}',
+      '',
+    ].join('\n'),
+  )
+  const regex = yield* invoke(compiler, ['run', '--target', 'wasm32-wasip1', '--stdlib', join(repo, 'stdlib'), '--quiet'])
+  assert.equal(regex.status, 0, regex.stderr.toString())
   yield* WasiComponents.verify(compiler, clang, tools, repo, directory)
   yield* Console.log(
-    'WASI Preview 1 and Preview 2: services, capability confinement, command entries, components, sockets, DNS, HTTP client/server, WIT composition, run, test, doctest, emission stages, and atomic publication passed',
+    'WASI Preview 1 and Preview 2: services, capability confinement, command entries, components, sockets, DNS, HTTP client/server, WIT composition, run, test, doctest, emission stages, atomic publication, regex backtracking and regex nesting passed',
   )
 })
 await Effect.runPromise(program.pipe(Effect.scoped, Effect.provide(NodeServices.layer)))
