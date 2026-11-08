@@ -9,14 +9,14 @@
 //! ([`Types.canonical`]), so the many call sites that rebuild one callee's application from
 //! equal inputs canonicalize it once.
 
-import backend.InstanceKey {InstanceKey}
-import semantic.ContentHash {ContentHash}
+import backend.InstanceKey {InstanceKey, ProviderEntry}
 import semantic.InternIndex {InternIndex}
 import semantic.Type {Type, Row}
 import semantic.Specialization {Application}
 import semantic.DeclarationId {DeclarationId}
 import semantic.Lifetime {Lifetime}
 import silk.collections.list {List}
+import silk.collections.hash {Hash}
 import silk.core.option {Option}
 import silk.mem.allocator {Allocator, OutOfMemoryError}
 import silk.mem.interned {Interned}
@@ -37,17 +37,17 @@ pub service Types {
   effect fn internRow(value: Row) -> Interned<Row> ! OutOfMemoryError ? &mut Types | &mut Allocator
   /// The shared handle of the application `value`.
   effect fn internApplication(value: Application) -> Interned<Application> ! OutOfMemoryError ? &mut Types | &mut Allocator
-  /// The canonical key kept for the application whose exact input encoding has digest `input`.
-  effect fn canonical(input: ContentHash) -> Option<InstanceKey> ! OutOfMemoryError ? &mut Types | &mut Allocator
-  /// Keeps `key` as the canonical key of the application whose exact input encoding has digest
-  /// `input`.
-  effect fn keepCanonical(input: ContentHash, key: InstanceKey) -> () ! OutOfMemoryError ? &mut Types | &mut Allocator
+  /// The canonical key kept for these exact interned application and provider handles.
+  effect fn canonical(input: &Interned<Application>, providers: &[ProviderEntry]) -> Option<InstanceKey> ! OutOfMemoryError ? &mut Types | &mut Allocator
+  /// Keeps `key` for these exact interned inputs. Handle identity is private to the memo;
+  /// canonical keys and their published content identities never contain allocation addresses.
+  effect fn keepCanonical(input: &Interned<Application>, providers: &[ProviderEntry], key: InstanceKey) -> () ! OutOfMemoryError ? &mut Types | &mut Allocator
 }
 
 /// The provider of [`Types`] for one build.
 pub struct TypeTable {
-  // Digests of canonicalized applications' exact input encodings, and the key each gave.
-  inputs: List<ContentHash>,
+  // Exact interned inputs of each canonicalized application, and the key each gave.
+  inputs: List<CanonicalInput>,
   keys: List<InstanceKey>,
   lookup: InternIndex,
   // Every distinct type node of the check, which lives as long as the check, and an
@@ -64,7 +64,7 @@ pub struct TypeTable {
 impl TypeTable {
   /// An empty table.
   pub fn make() -> TypeTable {
-    return TypeTable {inputs: List<ContentHash>.make(), keys: List<InstanceKey>.make(), lookup: InternIndex.make(),
+    return TypeTable {inputs: List<CanonicalInput>.make(), keys: List<InstanceKey>.make(), lookup: InternIndex.make(),
       nodes: List<Interned<Type>>.make(), slots: List<u64>.make(),
       declarations: InternSet<DeclarationId>.make(), lifetimes: InternSet<Lifetime>.make(), rows: InternSet<Row>.make(), applications: InternSet<Application>.make()}
   }
@@ -147,18 +147,14 @@ impl TypeTable {
   }
 
   effect fn internLifetime(self: &mut Self, value: Lifetime) -> Interned<Lifetime> ! OutOfMemoryError ? &mut Allocator {
-    let made = run Interned<Lifetime>.make(move value)
-    let hashed = Lifetime.hash(&made)
+    let hashed = Lifetime.internHash(&value)
     let mut at = InternSet<Lifetime>.first(&self.lifetimes, hashed)
     while at != usize.MAX {
       let known = InternSet<Lifetime>.at(&self.lifetimes, at)
-      if Lifetime.equalsShared(&made, known) {
-        let found = Interned<Lifetime>.clone(known)
-        unsafe Interned<Lifetime>.discard(move made)
-        return move found
-      }
+      if Lifetime.internEquals(&value, known) { return Interned<Lifetime>.clone(known) }
       at = InternSet<Lifetime>.next(&self.lifetimes, hashed, at)
     }
+    let made = run Interned<Lifetime>.make(move value)
     run InternSet<Lifetime>.add(&mut self.lifetimes, hashed, Interned<Lifetime>.clone(&made))
     return move made
   }
@@ -186,7 +182,9 @@ impl TypeTable {
       tries = tries + usize.ONE
       let known = InternSet<Application>.at(&self.applications, at)
       if Application.sameArgumentHandles(&value, Interned<Application>.get(known)) {
-        if run Application.equals(&value, Interned<Application>.get(known)) |> Effect.provideMut<Types>(&mut scratch) { return Interned<Application>.clone(known) }
+        if run Application.equals(&value, Interned<Application>.get(known)) |> Effect.provideMut<Types>(&mut scratch) {
+          if run Application.sameStaticInputs(&value, Interned<Application>.get(known)) { return Interned<Application>.clone(known) }
+        }
       }
       at = InternSet<Application>.next(&self.applications, hashed, at)
     }
@@ -196,10 +194,11 @@ impl TypeTable {
     return move made
   }
 
-  effect fn canonical(self: &mut Self, input: ContentHash) -> Option<InstanceKey> ! OutOfMemoryError ? &mut Allocator {
-    let mut at = InternIndex.first(&self.lookup, input.high)
+  effect fn canonical(self: &mut Self, input: &Interned<Application>, providers: &[ProviderEntry]) -> Option<InstanceKey>
+  ! OutOfMemoryError ? &mut Allocator {
+    let mut at = InternIndex.first(&self.lookup, canonicalHash(input, providers))
     while at != usize.MAX {
-      if ContentHash.equals(List<ContentHash>.get(&self.inputs, at), input) {
+      if sameCanonicalInput(&List<CanonicalInput>.asSlice(&self.inputs)[at], input, providers) {
         return Option<InstanceKey>.some(InstanceKey.copy(&List<InstanceKey>.asSlice(&self.keys)[at]))
       }
       at = InternIndex.after(&self.lookup, at)
@@ -207,11 +206,61 @@ impl TypeTable {
     return Option<InstanceKey>.none()
   }
 
-  effect fn keepCanonical(self: &mut Self, input: ContentHash, key: InstanceKey) -> () ! OutOfMemoryError ? &mut Allocator {
-    run List<ContentHash>.append(&mut self.inputs, input)
+  effect fn keepCanonical(self: &mut Self, input: &Interned<Application>, providers: &[ProviderEntry], key: InstanceKey) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+    let mut copied = List<ProviderEntry>.make()
+    let mut at = usize.ZERO
+    while at < providers.length {
+      run List<ProviderEntry>.append(&mut copied, ProviderEntry.copy(&providers[at]))
+      at = at + usize.ONE
+    }
+    run List<CanonicalInput>.append(&mut self.inputs, CanonicalInput {application: Interned<Application>.clone(input), providers: move copied})
     run List<InstanceKey>.append(&mut self.keys, move key)
-    return run InternIndex.record(&mut self.lookup, input.high)
+    return run InternIndex.record(&mut self.lookup, canonicalHash(input, providers))
   }
+}
+
+// The exact input handles identify one canonicalization request. A missed sharing opportunity
+// only canonicalizes again; no structural hash or digest collision can return another input's key.
+struct CanonicalInput {
+  application: Interned<Application>,
+  providers: List<ProviderEntry>,
+}
+
+fn canonicalHash(input: &Interned<Application>, providers: &[ProviderEntry]) -> u64 {
+  let mut hash = Hash.combine(Hash.mix(&Hash.seed(0), usize.toU64(Interned<Application>.address(input))), usize.toU64(providers.length))
+  let mut at = usize.ZERO
+  while at < providers.length {
+    hash = Hash.combine(hash, usize.toU64(Interned<Type>.address(&providers[at].key.capability)))
+    hash = Hash.combine(hash, usize.toU64(Interned<Type>.address(&providers[at].provider)))
+    let mut roleAddress = usize.ZERO
+    if let Option<Interned<Type>>.Some {value} = &providers[at].key.roleType { roleAddress = Interned<Type>.address(&value) }
+    hash = Hash.combine(hash, usize.toU64(roleAddress))
+    at = at + usize.ONE
+  }
+  return hash
+}
+
+fn sameCanonicalInput(known: &CanonicalInput, input: &Interned<Application>, providers: &[ProviderEntry]) -> bool {
+  if !Interned<Application>.same(&known.application, input) { return false }
+  let held = List<ProviderEntry>.asSlice(&known.providers)
+  if held.length != providers.length { return false }
+  let mut at = usize.ZERO
+  while at < providers.length {
+    if held[at].key.access != providers[at].key.access
+      || !Interned<Type>.same(&held[at].key.capability, &providers[at].key.capability)
+      || !Interned<Type>.same(&held[at].provider, &providers[at].provider) { return false }
+    match &held[at].key.roleType {
+      Option<Interned<Type>>.Some {value} => {
+        if let Option<Interned<Type>>.Some {value: other} = &providers[at].key.roleType {
+          if !Interned<Type>.same(&value, &other) { return false }
+        } else { return false }
+      }
+      Option<Interned<Type>>.None => { if let Option<Interned<Type>>.Some {..} = &providers[at].key.roleType { return false } }
+    }
+    at = at + usize.ONE
+  }
+  return true
 }
 
 // The types an intern comparison builds while it runs: never shared, and with no canonical keys,
@@ -223,11 +272,11 @@ impl PlainTypes {
     return run Interned<Type>.make(move node)
   }
 
-  effect fn canonical(self: &mut Self, input: ContentHash) -> Option<InstanceKey> ! OutOfMemoryError ? &mut Allocator {
+  effect fn canonical(self: &mut Self, input: &Interned<Application>, providers: &[ProviderEntry]) -> Option<InstanceKey> ! OutOfMemoryError ? &mut Allocator {
     return Option<InstanceKey>.none()
   }
 
-  effect fn keepCanonical(self: &mut Self, input: ContentHash, key: InstanceKey) -> () ! OutOfMemoryError ? &mut Allocator {
+  effect fn keepCanonical(self: &mut Self, input: &Interned<Application>, providers: &[ProviderEntry], key: InstanceKey) -> () ! OutOfMemoryError ? &mut Allocator {
     return ()
   }
 }
