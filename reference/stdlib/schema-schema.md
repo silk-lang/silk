@@ -389,6 +389,24 @@ effect fn endObject(self: &mut Self) -> () ! Issue | OutOfMemoryError ? &mut All
 
 Reads past the end of the object being read, whatever members were read.
 
+<a id="SchemaReader.checkFailed"></a>
+
+### Operation `checkFailed`
+
+```silk
+effect fn checkFailed(self: &mut Self, field: Option<string<'static>>, expected: string<'static>)
+    -> () ! Issue | OutOfMemoryError ? &mut Allocator
+```
+
+Reports a check that failed on the value just read: on its field `field`, or on the whole
+value when `field` is `None`. The default fails with it; a reader that collects every
+problem records it and returns.
+
+#### Errors
+
+- `Issue` with `IssueReason.CheckFailed`, at the field's path.
+- `OutOfMemoryError` if the path cannot grow.
+
 <a id="SchemaWriter"></a>
 
 ## `SchemaWriter`
@@ -724,8 +742,9 @@ Checks a value after it is read. The default accepts every value.
 #### When to use
 
 Override it to state what the type alone cannot, such as a port between 1 and 65535 or a
-name of at most 64 bytes, with [`Checks.field`](#Checks.impl.field) and [`Checks.that`](#Checks.impl.that). The first failed check
-becomes the read's `Issue`, at the path of the field it names.
+name of at most 64 bytes, with [`Checks.field`](#Checks.impl.field) and [`Checks.that`](#Checks.impl.that). A failed check becomes an
+`Issue` at the path of the field it names: the read's only one, or one of all of them when
+the format collects every problem, as `SchemaJson.decodeAll` does.
 
 <a id="Checks"></a>
 
@@ -756,8 +775,8 @@ struct Server {
 
 impl Schema for Server {
   fn check(self: &Self, checks: &mut Checks<Server>) -> () {
-    checks.field<String>(self, "host", Length {min: 1, max: 253, message: "a host name"})
-    checks.field<u16>(self, "port", Between<u16> {low: 1, high: 65535, message: "a port"})
+    checks.field(self, "host", Length {min: 1, max: 253, message: "a host name"})
+    checks.field(self, "port", Between<u16> {low: 1, high: 65535, message: "a port"})
   }
 }
 
@@ -774,6 +793,10 @@ pub effect fn main() -> i32 ! OutOfMemoryError {
   }
 }
 ```
+
+### Gotchas
+
+One value records at most 16 failed checks; later ones are dropped.
 
 <a id="Checks.impl"></a>
 
@@ -801,8 +824,8 @@ Returns the checks with nothing failed yet.
 pub fn field<V, Owner, K: Check<V>>(self: &mut Self, owner: &Owner, static name: Intrinsic.FieldName<Owner>, check: K) -> ()
 ```
 
-Checks the field `name` of `owner` with `check`. `V` is the field's type, written out as in
-`checks.field<u16>(self, "port", ...)`.
+Checks the field `name` of `owner` with `check`, whose type says the field's type, such as
+`Between<u16>` for a `u16` field.
 
 <a id="Checks.impl.that"></a>
 

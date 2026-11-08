@@ -1395,47 +1395,39 @@ Returns `message`.
 ## `Items`
 
 ```silk
-pub struct Items
+pub struct Items<T>
 ```
 
-The check that a list has between `min` and `max` elements, both included.
+The check that a list of `T` has between `min` and `max` elements, both included.
 
-<a id="Items.min"></a>
+### When to use
 
-### Field `min`
+Build it with [`Items.between`](#Items.impl.between), such as `Items<String>.between(1, 8, "1 to 8 tags")`.
+
+<a id="Items.impl"></a>
+
+## Implementation `Items<T>`
 
 ```silk
-pub min: usize
+impl<T> Items<T>
 ```
 
-The fewest accepted elements.
+<a id="Items.impl.between"></a>
 
-<a id="Items.max"></a>
-
-### Field `max`
+### Associated function `between`
 
 ```silk
-pub max: usize
+pub fn between(min: usize, max: usize, message: string<'static>) -> Items<T>
 ```
 
-The most accepted elements.
-
-<a id="Items.message"></a>
-
-### Field `message`
-
-```silk
-pub message: string<'static>
-```
-
-What a person sees when the check fails, such as `"1 to 8 tags"`.
+Returns the check for `min` to `max` elements. `message` is what a person sees when it fails.
 
 <a id="Items.impl.Check"></a>
 
-## Implementation `Check<List<T>> for Items`
+## Implementation `Check<List<T>> for Items<T>`
 
 ```silk
-impl<T> Check<List<T>> for Items
+impl<T> Check<List<T>> for Items<T>
 ```
 
 <a id="Items.impl.Check.test"></a>
@@ -1456,7 +1448,7 @@ Returns whether `value` has between `min` and `max` elements.
 fn message(self: &Self) -> string<'static>
 ```
 
-Returns `message`.
+Returns the message.
 
 <a id="Codecs"></a>
 

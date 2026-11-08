@@ -88,6 +88,27 @@ The whole input must be one JSON value, with optional white space around it.
   that failed, and its issue has the byte offset when the problem is in the text.
 - `OutOfMemoryError` if the `Allocator` cannot supply the value.
 
+<a id="SchemaJson.impl.decodeAll"></a>
+
+### Associated function `decodeAll`
+
+```silk
+pub effect fn decodeAll<T: Schema>(bytes: &[u8]) -> T ! SchemaErrors | OutOfMemoryError ? &mut Allocator
+```
+
+Reads one value of type `T` from the JSON text `bytes`, reporting every failed check.
+
+#### Details
+
+Each failed `Schema.check` is recorded and reading goes on, so one call lists every field
+that is out of range. Reading stops at the first part whose shape is wrong, such as text
+where a number belongs, which is listed last.
+
+#### Errors
+
+- `SchemaErrors` with every problem found, in input order.
+- `OutOfMemoryError` if the `Allocator` cannot supply the value.
+
 <a id="SchemaJson.impl.encode"></a>
 
 ### Associated function `encode`
@@ -139,6 +160,27 @@ pub fn make(input: &'input [u8]) -> JsonSchemaReader<'input>
 
 Returns a reader at the start of `input`.
 
+<a id="JsonSchemaReader.impl.collectingAll"></a>
+
+### Associated function `collectingAll`
+
+```silk
+pub fn collectingAll(input: &'input [u8]) -> JsonSchemaReader<'input>
+```
+
+Returns a reader at the start of `input` that records every failed check instead of
+stopping at the first. Read them with [`JsonSchemaReader.intoErrors`](#JsonSchemaReader.impl.intoErrors).
+
+<a id="JsonSchemaReader.impl.intoErrors"></a>
+
+### Method `intoErrors`
+
+```silk
+pub fn intoErrors(self: Self) -> List<SchemaError>
+```
+
+Returns the failed checks the reader recorded, in the order they were found.
+
 <a id="JsonSchemaReader.impl.SchemaReader"></a>
 
 ## Implementation `SchemaReader for JsonSchemaReader<'input>`
@@ -156,6 +198,17 @@ fn path(self: &mut Self) -> &mut SchemaPath
 ```
 
 Returns the path of the part being read.
+
+<a id="JsonSchemaReader.impl.SchemaReader.checkFailed"></a>
+
+### Operation `checkFailed`
+
+```silk
+effect fn checkFailed(self: &mut Self, field: Option<string<'static>>, expected: string<'static>)
+    -> () ! Issue | OutOfMemoryError ? &mut Allocator
+```
+
+Fails with the check, or records it and returns when the reader collects every problem.
 
 <a id="JsonSchemaReader.impl.SchemaReader.boolean"></a>
 

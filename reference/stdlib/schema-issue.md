@@ -16,7 +16,7 @@ the path from the root value to the part that failed.
 
 Import as `Issue` with `import silk.schema.issue { Issue }`.
 
-Public declarations: 3.
+Public declarations: 4.
 
 <a id="IssueReason"></a>
 
@@ -299,6 +299,49 @@ effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &m
 ```
 
 Writes the fields, as `SchemaError { path: ..., issue: ... }`.
+
+<a id="SchemaErrors"></a>
+
+## `SchemaErrors`
+
+```silk
+pub struct SchemaErrors
+```
+
+Every problem found while reading one value, in the order they were found.
+
+### Details
+
+`silk.schema.json.SchemaJson.decodeAll` reports it. Every failed check is listed, and reading
+stops at the first value that does not have the expected shape, which is listed last.
+
+<a id="SchemaErrors.errors"></a>
+
+### Field `errors`
+
+```silk
+pub errors: List<SchemaError>
+```
+
+The problems, never empty.
+
+<a id="SchemaErrors.impl.Debug"></a>
+
+## Implementation `Debug for SchemaErrors`
+
+```silk
+impl Debug for SchemaErrors
+```
+
+<a id="SchemaErrors.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the problems, as `SchemaErrors { errors: [...] }`.
 
 
 Category: Data formats.
