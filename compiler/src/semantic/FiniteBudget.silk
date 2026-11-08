@@ -29,6 +29,16 @@ struct Definition {
   references: usize,
 }
 
+// Only maxima changed on existing definitions need an undo entry. Newly appended definitions
+// and bodies are removed by their saved lengths when a speculative walk is abandoned.
+struct Update {definition: usize, bytes: usize, references: usize}
+
+/// A nested speculative accounting boundary. Commit only a replay that proves the current graph.
+pub struct Checkpoint {
+  definitions: usize, bodies: usize, updates: usize, references: usize, bytes: usize,
+  failed: bool, failure: usize, depth: usize,
+}
+
 pub struct Budget {
   definitions: List<Definition>,
   definitionLookup: InternIndex,
@@ -43,6 +53,8 @@ pub struct Budget {
   maxBytes: usize,
   failed: bool,
   failure: usize,
+  updates: List<Update>,
+  depth: usize,
 }
 
 impl Budget {
@@ -54,12 +66,71 @@ impl Budget {
     return Budget {definitions: List<Definition>.make(), definitionLookup: InternIndex.make(),
       bodies: List<DeclarationId>.make(), bodyLookup: InternIndex.make(), bodyCounts: List<usize>.make(),
       references: usize.ZERO, bytes: usize.ZERO, maxDefinitions: definitions, maxBodyDefinitions: perBody,
-      maxReferences: references, maxBytes: runtimeBytes, failed: false, failure: usize.ZERO}
+      maxReferences: references, maxBytes: runtimeBytes, failed: false, failure: usize.ZERO, updates: List<Update>.make(), depth: usize.ZERO}
   }
   /// Starts a new command/revision while preserving the configured resource policy.
   pub fn clear(self: &mut Self) -> () {
     let fresh = Budget.withLimits(self.maxDefinitions, self.maxBodyDefinitions, self.maxReferences, self.maxBytes)
     self.* = move fresh
+  }
+  /// Begins accounting that may be discarded without copying the already accepted graph.
+  pub fn checkpoint(self: &mut Self) -> Checkpoint {
+    let saved = Checkpoint {definitions: List<Definition>.length(&self.definitions), bodies: List<DeclarationId>.length(&self.bodies),
+      updates: List<Update>.length(&self.updates), references: self.references, bytes: self.bytes,
+      failed: self.failed, failure: self.failure, depth: self.depth}
+    self.depth = self.depth + usize.ONE
+    return move saved
+  }
+  /// Keeps the observations of a completed replay. An outer transaction can still undo them.
+  pub fn commit(self: &mut Self, saved: Checkpoint) -> () {
+    self.depth = saved.depth
+    if self.depth == usize.ZERO { List<Update>.clear(&mut self.updates) }
+  }
+  /// Discards observations of an unproved replay so the live walk retains its own refusal site.
+  pub effect fn rollback(self: &mut Self, saved: Checkpoint) -> () ! OutOfMemoryError ? &mut Allocator {
+    while List<Update>.length(&self.updates) > saved.updates {
+      let last = List<Update>.length(&self.updates) - usize.ONE
+      let update = List<Update>.remove(&mut self.updates, last)
+      let entries = List<Definition>.asMutSlice(&mut self.definitions)
+      entries[update.definition].bytes = update.bytes
+      entries[update.definition].references = update.references
+    }
+    let rebuildDefinitions = List<Definition>.length(&self.definitions) != saved.definitions
+    let rebuildBodies = List<DeclarationId>.length(&self.bodies) != saved.bodies
+    while List<Definition>.length(&self.definitions) > saved.definitions {
+      let last = List<Definition>.length(&self.definitions) - usize.ONE
+      let removed = List<Definition>.remove(&mut self.definitions, last)
+      if removed.body != usize.MAX {
+        let count = List<usize>.get(&self.bodyCounts, removed.body)
+        List<usize>.set(&mut self.bodyCounts, removed.body, count - usize.ONE)
+      }
+    }
+    List<DeclarationId>.truncate(&mut self.bodies, saved.bodies)
+    List<usize>.truncate(&mut self.bodyCounts, saved.bodies)
+    self.references = saved.references
+    self.bytes = saved.bytes
+    self.failed = saved.failed
+    self.failure = saved.failure
+    self.depth = saved.depth
+    // A successful replay never rebuilds indexes. Only an abandoned extension needs relinking.
+    if rebuildDefinitions {
+      self.definitionLookup = InternIndex.make()
+      let entries = List<Definition>.asSlice(&self.definitions)
+      let mut at = usize.ZERO
+      while at < entries.length {
+        run InternIndex.record(&mut self.definitionLookup, Hash.combine(entries[at].key.high, entries[at].key.low))
+        at = at + usize.ONE
+      }
+    }
+    if rebuildBodies {
+      self.bodyLookup = InternIndex.make()
+      let bodies = List<DeclarationId>.asSlice(&self.bodies)
+      let mut at = usize.ZERO
+      while at < bodies.length {
+        run InternIndex.record(&mut self.bodyLookup, DeclarationId.hash(&bodies[at]))
+        at = at + usize.ONE
+      }
+    }
   }
   fn refuse(self: &mut Self, resource: usize) -> bool {
     if !self.failed { self.failure = resource }
@@ -114,6 +185,9 @@ impl Budget {
       let extraReferences = if referenceCount > previous.references { referenceCount - previous.references } else { usize.ZERO }
       if extraBytes > self.maxBytes - self.bytes { return Budget.refuse(&mut self.*, 4) }
       if extraReferences > self.maxReferences - self.references { return Budget.refuse(&mut self.*, 3) }
+      if self.depth != usize.ZERO && (extraBytes != usize.ZERO || extraReferences != usize.ZERO) {
+        run List<Update>.append(&mut self.updates, Update {definition: known, bytes: previous.bytes, references: previous.references})
+      }
       self.bytes = self.bytes + extraBytes
       self.references = self.references + extraReferences
       let entries = List<Definition>.asMutSlice(&mut self.definitions)
@@ -188,6 +262,24 @@ effect fn budgetClaims() -> () ! InvalidModulePath | OutOfMemoryError | Assertio
   let mut calls = Budget.withLimits(2, 2, 3, 100)
   run Testing.expect(run Budget.include(&mut calls, exampleKey(1), Option<&DeclarationId>.none(), 1, 2), "initial reference cost fits")
   run Testing.expect(!run Budget.include(&mut calls, exampleKey(1), Option<&DeclarationId>.none(), 1, 4), "a larger MIR variant can exhaust the aggregate reference budget")
+  let mut speculative = Budget.withLimits(3, 2, 20, 100)
+  run Testing.expect(run Budget.include(&mut speculative, exampleKey(1), Option<&DeclarationId>.some(&body), 10, 2), "an accepted graph precedes the replay")
+  let outer = Budget.checkpoint(&mut speculative)
+  run Testing.expect(run Budget.include(&mut speculative, exampleKey(1), Option<&DeclarationId>.some(&body), 30, 5), "replay can observe larger maxima")
+  let inner = Budget.checkpoint(&mut speculative)
+  run Testing.expect(run Budget.include(&mut speculative, exampleKey(2), Option<&DeclarationId>.some(&otherBody), 20, 3), "nested replay adds another body")
+  Budget.commit(&mut speculative, move inner)
+  run Testing.expect(!run Budget.include(&mut speculative, exampleKey(3), Option<&DeclarationId>.none(), 60, 1), "speculative graph can exhaust bytes")
+  run Budget.rollback(&mut speculative, move outer)
+  run Testing.expect(!Budget.exhausted(&speculative) && Budget.definitionCount(&speculative) == 1
+    && Budget.runtimeBytes(&speculative) == 10 && Budget.referenceCount(&speculative) == 2,
+    "outer rollback restores existing maxima and removes committed inner additions and exhaustion")
+  run Testing.expect(run Budget.include(&mut speculative, exampleKey(2), Option<&DeclarationId>.some(&body), 10, 2), "rolled-back body counts and lookup chains admit the actual graph")
+  let accepted = Budget.checkpoint(&mut speculative)
+  run Testing.expect(run Budget.include(&mut speculative, exampleKey(2), Option<&DeclarationId>.some(&body), 20, 4), "successful replay updates maxima")
+  Budget.commit(&mut speculative, move accepted)
+  run Testing.expect(Budget.runtimeBytes(&speculative) == 30 && Budget.referenceCount(&speculative) == 6, "committing a replay retains its exact resource contribution")
+
 }
 
 test effect fn frontierFiniteBudgetsAreExactAndIndependentOfOrder() -> () ! InvalidModulePath | OutOfMemoryError | AssertionError<'static> {
