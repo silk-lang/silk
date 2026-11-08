@@ -335,7 +335,8 @@ The limit, in bytes.
 pub used: u64
 ```
 
-The memory that the group uses now, in bytes.
+The memory that the group uses now, in bytes, without the inactive file cache that the
+kernel drops before the group reaches its limit.
 
 <a id="MemoryLimit.impl.Copy"></a>
 
