@@ -11,8 +11,9 @@ requests, or a fake in tests. Use `silk.http.exchange` to stream bodies or to co
 connection.
 
 ## Details
-Build a [`Request`](#Request) with chained calls, such as `Request.get("/repos").query("page",
-"2").bearer(token)`. Building never allocates and never fails. [`Http.send`](#Http.send) checks the request.
+Build a [`Request`](#Request) with chained calls, such as `Request.get("/repos").bearer(token)`, and add
+path segments, query parameters, and headers in place with `run request.query("page", "2")`.
+Those three allocate, so they need `? &mut Allocator`. [`Http.send`](#Http.send) checks the request.
 A response with any status, also 4xx and 5xx, is a [`Response`](#Response). Call [`Response.expectOk`](#Response.impl.expectOk) to
 make a status outside 200 to 299 an error.
 
@@ -22,9 +23,8 @@ make a status outside 200 to 299 an error.
 - `OutOfMemoryError` if the `Allocator` fails.
 
 ## Gotchas
-A request holds at most 8 path segments, 16 query parameters, and 32 headers. More fail at send
-time with `InvalidRequest`. [`Request.json`](#Request.impl.json) writes only the fields that are visible from your
-module. Fields that are private to another module are not written.
+[`Request.json`](#Request.impl.json) writes only the fields that are visible from your module. Fields that are
+private to another module are not written.
 
 ## Examples
 ### Test code that uses Http with a fake provider
@@ -63,7 +63,9 @@ impl Http for FakeHttp {
 effect fn search() -> i32
   ! HttpError | OutOfMemoryError
   ? &mut Http | &mut Allocator {
-  let response = run Http.send(Request.get("/search").query("q", "a b"))
+  let mut request = Request.get("/search")
+  run request.query("q", "a b")
+  let response = run Http.send(move request)
   let checked = run response.expectOk()
   let text = run checked.text()
   if text != "found" {
@@ -87,37 +89,7 @@ pub effect fn main() -> i32
 
 Import as `HttpClient` with `import silk.http.client as HttpClient`.
 
-Public declarations: 11.
-
-<a id="MAX_PATH_SEGMENTS"></a>
-
-## `MAX_PATH_SEGMENTS`
-
-```silk
-pub const MAX_PATH_SEGMENTS: usize
-```
-
-The maximum number of path segments in a request.
-
-<a id="MAX_QUERY_PARAMETERS"></a>
-
-## `MAX_QUERY_PARAMETERS`
-
-```silk
-pub const MAX_QUERY_PARAMETERS: usize
-```
-
-The maximum number of query parameters in a request.
-
-<a id="MAX_HEADERS"></a>
-
-## `MAX_HEADERS`
-
-```silk
-pub const MAX_HEADERS: usize
-```
-
-The maximum number of headers that you add to a request.
+Public declarations: 8.
 
 <a id="HttpErrorKind"></a>
 
@@ -752,19 +724,18 @@ The `Content-Type` value.
 pub struct Request<'a>
 ```
 
-An HTTP request that you build with chained calls. Nothing is checked or sent until
-[`Http.send`](#Http.send).
+An HTTP request. Nothing is checked or sent until [`Http.send`](#Http.send).
 
 ### Details
 
-Build it with chained calls, such as `Request.get("/repos").query("page", "2").bearer(token)`.
-Nothing is checked until [`Http.send`](#Http.send). Only [`Request.json`](#Request.impl.json) allocates.
+Set the method, body, bearer token, and limits with chained calls, such as
+`Request.get("/repos").bearer(token)`. Add path segments, query parameters, and headers in
+place with [`Request.path`](#Request.impl.path), [`Request.query`](#Request.impl.query), and [`Request.header`](#Request.impl.header). Those keep their parts
+in lists from the ambient allocator, so a request holds any number of them and stays small.
 
 ### Gotchas
 
-A request holds at most 8 path segments, 16 query parameters, and 32 headers. More fail at send
-time with `InvalidRequest`. [`Request.json`](#Request.impl.json) writes only the fields that are visible from your
-module.
+[`Request.json`](#Request.impl.json) writes only the fields that are visible from your module.
 
 <a id="Request.impl"></a>
 
@@ -859,30 +830,33 @@ Starts an OPTIONS request.
 ### Method `path`
 
 ```silk
-pub fn path(self: Self, segment: string<'a>) -> Request<'a>
+pub effect fn path(self: &mut Self, segment: string) -> () ! OutOfMemoryError ? &mut Allocator
 ```
 
-Adds `segment` to the end of the URL path, as given, such as `"/repos"`.
+Adds `segment` to the end of the URL path, as given, such as `"/repos"`. The request keeps a
+copy.
 
 <a id="Request.impl.query"></a>
 
 ### Method `query`
 
 ```silk
-pub fn query(self: Self, name: string<'a>, value: string<'a>) -> Request<'a>
+pub effect fn query(self: &mut Self, name: string, value: string) -> () ! OutOfMemoryError ? &mut Allocator
 ```
 
 Adds a query parameter. The name and the value are percent-encoded when the request is sent.
+The request keeps a copy of both.
 
 <a id="Request.impl.header"></a>
 
 ### Method `header`
 
 ```silk
-pub fn header(self: Self, name: string<'a>, value: string<'a>) -> Request<'a>
+pub effect fn header(self: &mut Self, name: string, value: string) -> () ! OutOfMemoryError ? &mut Allocator
 ```
 
-Adds a header. The name and value are validated when the request is sent.
+Adds a header. The name and value are validated when the request is sent. The request keeps a
+copy of both.
 
 #### Details
 
@@ -992,35 +966,68 @@ pub fn url(self: &Self) -> string<'a>
 
 Returns the URL exactly as given, before path segments and query parameters.
 
-<a id="Request.impl.paths"></a>
+<a id="Request.impl.pathCount"></a>
 
-### Method `paths`
-
-```silk
-pub fn paths(self: &Self) -> &[string<'a>]
-```
-
-Returns the path segments in the order they were added.
-
-<a id="Request.impl.queryParameters"></a>
-
-### Method `queryParameters`
+### Method `pathCount`
 
 ```silk
-pub fn queryParameters(self: &Self) -> &[Field<'a>]
+pub fn pathCount(self: &Self) -> usize
 ```
 
-Returns the query parameters in the order they were added.
+Returns the number of path segments.
 
-<a id="Request.impl.headers"></a>
+<a id="Request.impl.pathAt"></a>
 
-### Method `headers`
+### Method `pathAt`
 
 ```silk
-pub fn headers(self: &Self) -> &[Field<'a>]
+pub fn pathAt<'r>(self: &'r Self, index: usize) -> string<'r>
 ```
 
-Returns the headers in the order they were added.
+Returns path segment `index`, in the order they were added. It traps if `index` is not less
+than [`Request.pathCount`](#Request.impl.pathCount).
+
+<a id="Request.impl.queryCount"></a>
+
+### Method `queryCount`
+
+```silk
+pub fn queryCount(self: &Self) -> usize
+```
+
+Returns the number of query parameters.
+
+<a id="Request.impl.queryAt"></a>
+
+### Method `queryAt`
+
+```silk
+pub fn queryAt<'r>(self: &'r Self, index: usize) -> Field<'r>
+```
+
+Returns query parameter `index`, in the order they were added. It traps if `index` is not less
+than [`Request.queryCount`](#Request.impl.queryCount).
+
+<a id="Request.impl.headerCount"></a>
+
+### Method `headerCount`
+
+```silk
+pub fn headerCount(self: &Self) -> usize
+```
+
+Returns the number of headers.
+
+<a id="Request.impl.headerAt"></a>
+
+### Method `headerAt`
+
+```silk
+pub fn headerAt<'r>(self: &'r Self, index: usize) -> Field<'r>
+```
+
+Returns header `index`, in the order they were added. It traps if `index` is not less than
+[`Request.headerCount`](#Request.impl.headerCount).
 
 <a id="Request.impl.bodyBytes"></a>
 
@@ -1051,17 +1058,6 @@ pub fn hasBody(self: &Self) -> bool
 ```
 
 Returns whether the request has a body.
-
-<a id="Request.impl.overflowed"></a>
-
-### Method `overflowed`
-
-```silk
-pub fn overflowed(self: &Self) -> bool
-```
-
-Returns `true` if the request has more parts than it can hold. [`Http.send`](#Http.send) then fails with
-`InvalidRequest`.
 
 <a id="Request.impl.timeout"></a>
 
@@ -1323,9 +1319,7 @@ It checks the request first. A response with a 4xx or 5xx status is a success. C
 #### Errors
 
 - `HttpError` for all failures. Its `kind` tells what failed, `status` has the response
-  status if one arrived, and `cause` keeps the error from the lower module. A request with
-  more than 8 path segments, 16 query parameters, or 32 headers fails with
-  `InvalidRequest`.
+  status if one arrived, and `cause` keeps the error from the lower module.
 - `OutOfMemoryError` if the `Allocator` fails.
 
 <a id="Http.sendAll"></a>
