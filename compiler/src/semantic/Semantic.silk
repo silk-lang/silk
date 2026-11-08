@@ -58,6 +58,7 @@ import backend.UnionDispatch {Arm as DispatchArm, Borrowed as DispatchBorrow, Un
 import backend.CodegenUnits {CodegenUnit}
 import backend.Bitcode
 import backend.Mir
+import backend.MirInline
 import backend.MirCoalesce
 import backend.MirVerification
 import backend.MirVerification {UseAfterDrop}
@@ -97,6 +98,7 @@ import semantic.Specialization {
 }
 import backend.Mir {
   Lowered,
+  Cancel as MirCancel,
   Inlining as MirInlining,
   ConstantValue as MirConstantValue,
   NonParkingRun as MirNonParkingRun,
@@ -77981,6 +77983,81 @@ effect fn witnessFailureType(resolver: &mut Resolver, owner: &mut Query<Answer, 
   return Option<Shared<Type>>.some(run Type.applyBindings(&declared, List<Binding>.asSlice(&bindings), true))
 }
 
+struct InlineExpansion {
+  key: InstanceKey,
+  parent: usize,
+}
+
+// A frame variant can read another variant's checked cancellation paths without recursively
+// expanding it. The selection carries the transitive suspension mask of all eligible wrappers.
+effect fn inlineFrameCalls(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>,
+  dependencies: &mut List<Dependency>, function: &mut MirFunction, facts: &CoroutineFacts, observing: bool) -> ()
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let candidates = List<InstanceKey>.asSlice(&facts.inline)
+  if candidates.length == usize.ZERO { return () }
+  let mut raw = run CoroutineFacts.copy(facts)
+  raw.inline = List<InstanceKey>.make()
+  let rawFacts = Option<CoroutineFacts>.some(move raw)
+  let mut ancestry = List<usize>.make()
+  run List<usize>.appendRepeated(&mut ancestry, usize.MAX, List<MirBlock>.length(&function.blocks))
+  let mut expansions = List<InlineExpansion>.make()
+  let mut at = usize.ZERO
+  while at < List<MirBlock>.length(&function.blocks) {
+    let target = match &List<MirBlock>.asSlice(&function.blocks)[at].terminator {
+      MirTerminator.Call {callee: MirCallee.Instance {key}, ..} => Option<InstanceKey>.some(InstanceKey.copy(&key))
+      _ => Option<InstanceKey>.none()
+    }
+    let point = at
+    at = at + usize.ONE
+    let selected = match move target {
+      Option<InstanceKey>.Some {value} => move value
+      Option<InstanceKey>.None => { continue }
+    }
+    let mut candidate = usize.ZERO
+    let mut found = false
+    while candidate < candidates.length && !found {
+      found = run InstanceKey.sameInstance(&candidates[candidate], &selected)
+      candidate = candidate + usize.ONE
+    }
+    let mut suspending = false
+    let cancels = List<MirCancel>.asSlice(&function.cancels)
+    let mut cancel = usize.ZERO
+    while cancel < cancels.length {
+      if cancels[cancel].point == point { suspending = true }
+      cancel = cancel + usize.ONE
+    }
+    if !found && suspending { continue }
+    let mut recursive = run InstanceKey.sameInstance(&function.key, &selected)
+    let mut ancestor = List<usize>.get(&ancestry, point)
+    let prior = List<InlineExpansion>.asSlice(&expansions)
+    while ancestor != usize.MAX && !recursive {
+      recursive = run InstanceKey.sameInstance(&prior[ancestor].key, &selected)
+      ancestor = prior[ancestor].parent
+    }
+    if recursive { continue }
+    let location = match move run locationOfInstance(&mut resolver.*, &selected) {
+      Option<InstanceLocation>.Some {value} => value
+      Option<InstanceLocation>.None => { continue }
+    }
+    let variant = run exactBackendVariant(&mut resolver.*, &selected, observing, &rawFacts)
+    let request = run internDeclaration(&mut resolver.*, Key {family: Family.Mir, module: location.module,
+      declaration: location.declaration, member: instanceMember(&selected), name: variant, external: false})
+    let answer = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies.*, request, Span.make(usize.ZERO, usize.ZERO))
+    if let Option<usize>.Some {value: index} = move Shared<Result<Answer, NoRejection>>.with<Option<usize>>(&answer, answerMirIndex) {
+      let functions = List<MirFunction>.asSlice(&resolver.mirValues)
+      let allowed = if suspending { MirInline.eligible(&functions[index]) } else { MirInline.valueForwarder(&functions[index]) }
+      if allowed && run MirInline.call(&mut function.*, point, &functions[index]) {
+        let parent = List<usize>.get(&ancestry, point)
+        let expansion = List<InlineExpansion>.length(&expansions)
+        run List<InlineExpansion>.append(&mut expansions, InlineExpansion {key: InstanceKey.copy(&selected), parent: parent})
+        let added = List<MirBlock>.length(&function.blocks) - List<usize>.length(&ancestry)
+        run List<usize>.appendRepeated(&mut ancestry, expansion, added)
+      }
+    }
+  }
+  return ()
+}
+
 effect fn lowerMir(
   resolver: &mut Resolver,
   owner: &mut Query<Answer, NoRejection>,
@@ -78823,6 +78900,11 @@ effect fn lowerMir(
   completed.function.features = run featureAttribute(&mut resolver.*, &module, List<Bytes>.asSlice(&listedFeatures))
   completed.function.inlining = run declarationInlining(&mut resolver.*, &module, declarationAccess182)
   completed.function.optimizeSize = run declarationOptimizeSize(&mut resolver.*, &module, declarationAccess182)
+  let variants = List<BackendInstance>.asSlice(&resolver.backendInstances)
+  let expanded = run copySuspension(&variants[key.name].suspension)
+  if let Option<CoroutineFacts>.Some {value: facts} = &expanded {
+    run inlineFrameCalls(&mut resolver.*, &mut owner.*, &mut dependencies, &mut completed.function, &facts, observing)
+  }
   return run storeLowered(&mut resolver.*, &mut owner.*, move completed, move dependencies)
 }
 
@@ -97532,7 +97614,7 @@ impl Semantic {
           if let Option<usize>.Some {value: loweredIndex} = &mirIndex {
             if run FrameSelection.contains(&selection, &instance) {
               let functions = List<MirFunction>.asSlice(&self.resolver.mirValues)
-              suspension = Option<CoroutineFacts>.some(run FrameSelection.facts(&selection, &functions[loweredIndex]))
+              suspension = Option<CoroutineFacts>.some(run FrameSelection.facts(&selection, &functions[loweredIndex], functions))
             }
           }
         }
@@ -97799,6 +97881,19 @@ impl Semantic {
         at = usize.ZERO
         while at < marked.length {
           if marked[at] { run FrameSelection.include(&mut selection, &reached[at].key, component[at]) }
+          at = at + usize.ONE
+        }
+        // Only this walk's MIR is current. The arena can also hold obsolete revisions and the
+        // non-observing pass abandoned before this walk selected diagnostic observation.
+        let ordinary = List<MirFunction>.asSlice(&self.resolver.mirValues)
+        let current = List<usize>.asSlice(&self.resolver.emittedMir)
+        at = usize.ZERO
+        while at < current.length {
+          let body = current[at]
+          if !self.resolver.fastPathIr && !self.resolver.lineTables && MirInline.eligible(&ordinary[body]) {
+            let position = run FrameSelection.position(&selection, &ordinary[body].key)
+            if position != usize.MAX { List<usize>.set(&mut selection.bodies, position, body) }
+          }
           at = at + usize.ONE
         }
         let mut extended = run List<BuildRoot>.makeWithCapacity(roots.length)
@@ -103527,17 +103622,19 @@ struct FrameSelection {
   components: List<usize>,
   lookup: InternIndex,
   symbols: List<Bytes>,
+  bodies: List<usize>,
 }
 
 impl FrameSelection {
   fn make() -> FrameSelection {
     return FrameSelection {suspendable: List<InstanceKey>.make(), components: List<usize>.make(), lookup: InternIndex.make(),
-      symbols: List<Bytes>.make()}
+      symbols: List<Bytes>.make(), bodies: List<usize>.make()}
   }
 
   effect fn include(self: &mut Self, key: &InstanceKey, component: usize) -> () ! OutOfMemoryError ? &mut Allocator {
     run List<InstanceKey>.append(&mut self.suspendable, InstanceKey.copy(key))
     run List<usize>.append(&mut self.components, component)
+    run List<usize>.append(&mut self.bodies, usize.MAX)
     run InternIndex.record(&mut self.lookup, InstanceKey.runtimeHash(key))
   }
 
@@ -103562,9 +103659,9 @@ impl FrameSelection {
     return usize.MAX
   }
 
-  // The emission facts of one suspendable instance: its suspendable direct callees in first-call
-  // order, which of them can call back into it, and the storage symbols.
-  effect fn facts(self: &Self, function: &MirFunction) -> CoroutineFacts ! OutOfMemoryError ? &mut Allocator {
+  // The emission facts of one suspendable instance: its suspendable callees in discovery order,
+  // which can call back into it, eligible forwarding bodies, and the storage symbols.
+  effect fn facts(self: &Self, function: &MirFunction, functions: &[MirFunction]) -> CoroutineFacts ! OutOfMemoryError ? &mut Allocator {
     let mut callees = List<InstanceKey>.make()
     let mut cyclic = List<bool>.make()
     let components = List<usize>.asSlice(&self.components)
@@ -103590,8 +103687,56 @@ impl FrameSelection {
       }
       at = at + usize.ONE
     }
+    let mut inline = List<InstanceKey>.make()
+    // Discover only forwarding bodies reachable through other forwarding bodies. The candidate
+    // graph excludes every recursive SCC, so each splice strictly advances through that graph.
+    let mut expandedBlocks = usize.ZERO
+    let mut next = usize.ZERO
+    while next < List<InstanceKey>.length(&callees) {
+      let target = InstanceKey.copy(&List<InstanceKey>.asSlice(&callees)[next])
+      let entry = run FrameSelection.position(self, &target)
+      let body = List<usize>.get(&self.bodies, entry)
+      let allowed = !List<bool>.get(&cyclic, next) && body != usize.MAX &&
+        List<u64>.length(&function.lines) == usize.ZERO
+      next = next + usize.ONE
+      if !allowed { continue }
+      let nested = List<MirBlock>.asSlice(&functions[body].blocks)
+      let mut recursive = false
+      let mut block = usize.ZERO
+      while block < nested.length {
+        if let MirTerminator.Call {callee: MirCallee.Instance {key}, ..} = &nested[block].terminator {
+          let child = run FrameSelection.position(self, &key)
+          if child != usize.MAX && components[entry] == components[child] { recursive = true }
+        }
+        block = block + usize.ONE
+      }
+      if recursive || expandedBlocks + nested.length > 256 { continue }
+      expandedBlocks = expandedBlocks + nested.length
+      run List<InstanceKey>.append(&mut inline, InstanceKey.copy(&target))
+      block = usize.ZERO
+      while block < nested.length {
+        if let MirTerminator.Call {callee: MirCallee.Instance {key}, ..} = &nested[block].terminator {
+          let child = run FrameSelection.position(self, &key)
+          if child != usize.MAX {
+            let listed = List<InstanceKey>.asSlice(&callees)
+            let mut prior = usize.ZERO
+            let mut seen = false
+            while prior < listed.length && !seen {
+              seen = run InstanceKey.sameInstance(&listed[prior], &key)
+              prior = prior + usize.ONE
+            }
+            if !seen {
+              run List<InstanceKey>.append(&mut callees, InstanceKey.copy(&key))
+              run List<bool>.append(&mut cyclic, own != usize.MAX && components[own] == components[child])
+            }
+          }
+        }
+        block = block + usize.ONE
+      }
+    }
     let symbols = List<Bytes>.asSlice(&self.symbols)
     return CoroutineFacts {
+      inline: move inline,
       callees: move callees,
       cyclic: move cyclic,
       create: run Bytes.copy(Bytes.asSlice(&symbols[usize.ZERO])),
