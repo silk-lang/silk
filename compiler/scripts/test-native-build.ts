@@ -115,28 +115,34 @@ const program = Effect.gen(function* () {
   assert.equal(helpCommand.stdout, helped.stdout)
   const helpFormat = yield* invoke(silk, ['help', 'format'], directory)
   assert.equal(helpFormat.status, 0, helpFormat.stderr)
-  assert.equal(helpFormat.stdout, 'usage: silk format [paths] [--check] [--manifest-path <path>]\n')
+  assert.match(helpFormat.stdout, /^Usage: silk format \[options\] <paths>\n\nFormat Silk source and TOML files\n\nOptions:\n {6}--check /)
   const helpDocReference = yield* invoke(silk, ['help', 'doc-reference'], directory)
   assert.equal(helpDocReference.status, 0, helpDocReference.stderr)
-  assert.match(helpDocReference.stdout, /^usage: silk doc-reference \[--stdlib-root <directory>\] --output/)
-  // The project form of `build` comes before the single-file form.
+  assert.match(helpDocReference.stdout, /^Usage: silk doc-reference \[options\]\n\nWrite the standard library reference pages\n/)
+  assert.match(helpDocReference.stdout, /\n  -o, --output <value> /)
+  // The options of the project form of `build` come before the single-file form.
   const helpBuild = yield* invoke(silk, ['help', 'build'], directory)
   assert.equal(helpBuild.status, 0, helpBuild.stderr)
-  assert.match(helpBuild.stdout, /^usage: silk build \[--manifest-path <path>\].*\n {7}silk build <source> -o <output>/)
+  assert.match(helpBuild.stdout, /^Usage: silk build \[options\]\n\nBuild the package or the workspace members\n\nOptions:\n {6}--manifest-path <value> /)
+  assert.match(helpBuild.stdout, /\n {2}-p, --package <value> /)
+  assert.match(helpBuild.stdout, /\n\nUsage: silk build \[options\] <source>\n\nBuild one source file\n/)
+  assert.match(helpBuild.stdout, /\n  -o, --output <value> +Where to write the artifact \(required\)\n/)
   const helpUnknown = yield* invoke(silk, ['help', 'frobnicate'], directory)
   assert.equal(helpUnknown.status, 2, helpUnknown.stderr)
   assert.match(helpUnknown.stderr, /^silk: unknown command `frobnicate`\nusage: silk <command>/)
-  // `silk <command> --help` prints that command's lines of the usage.
-  const commandHelp = yield* invoke(silk, ['format', '--help'], directory)
+  // `silk <command> --help` prints the same help as `silk help <command>`.
+  const commandHelp = yield* invoke(silk, ['format', '--check', '--help'], directory)
   assert.equal(commandHelp.status, 0, commandHelp.stderr)
-  assert.equal(commandHelp.stdout, 'usage: silk format [paths] [--check] [--manifest-path <path>]\n')
-  // `run` lists the progress options it accepts.
-  const runHelp = yield* invoke(silk, ['run', '--help'], directory)
+  assert.equal(commandHelp.stdout, helpFormat.stdout)
+  // `run` lists the progress options it accepts, and answers `--help` after other options.
+  const runHelp = yield* invoke(silk, ['run', '--release', '--help'], directory)
   assert.equal(runHelp.status, 0, runHelp.stderr)
-  assert.match(runHelp.stdout, /^usage: silk run .*\[--progress auto\|live\|plain\|never\] \[--quiet\] \[--coredump <path>\]/)
+  assert.match(runHelp.stdout, /^Usage: silk run \[options\] <arguments>\n/)
+  assert.match(runHelp.stdout, /\n {6}--progress <value> +How to report progress on standard error \[choices: auto, live, plain, never\]\n/)
+  assert.match(runHelp.stdout, /\n {6}--coredump <value> /)
   const debugHelp = yield* invoke(silk, ['debug', '--help'], directory)
   assert.equal(debugHelp.status, 0, debugHelp.stderr)
-  assert.match(debugHelp.stdout, /^usage: silk debug .*\[--port <\[address:\]port>\]/)
+  assert.match(debugHelp.stdout, /\n {6}--port <value> .*\[default: 1234\]\n/)
   // Toolchains belong to the silk tool, not the compiler: `silk toolchain` and `+<version>` are unknown here.
   const toolchain = yield* invoke(silk, ['toolchain'], directory)
   assert.equal(toolchain.status, 2, toolchain.stderr)
@@ -144,7 +150,7 @@ const program = Effect.gen(function* () {
   // A command line that does not parse is a usage error, status 2, like format's and doc's.
   const unparsed = yield* invoke(silk, ['check', '--bogus'], directory)
   assert.equal(unparsed.status, 2, unparsed.stderr)
-  assert.match(unparsed.stderr, /^silk check: unknown option `--bogus`\nusage: silk check /)
+  assert.equal(unparsed.stderr, 'silk check: unknown option `--bogus`\nRun `silk help check` for its options.\n')
   // A misspelled option is named with the closest one the command takes.
   const relase = yield* invoke(silk, ['check', '--relase'], directory)
   assert.equal(relase.status, 2, relase.stderr)
@@ -189,7 +195,10 @@ const program = Effect.gen(function* () {
   assert.ok(!existsSync(marker), 'silk dump ran Clang')
   const badStage = yield* invoke(silk, ['dump', 'llvm', 'main.silk'], directory)
   assert.equal(badStage.status, 2, badStage.stderr)
-  assert.match(badStage.stderr, /^silk dump: unknown stage `llvm`; expected tokens, syntax, hir or mir\nusage: silk dump tokens\|syntax\|hir <source>\n {7}silk dump mir /)
+  assert.equal(badStage.stderr, 'silk dump: `<stage>` takes tokens, syntax, hir or mir\nRun `silk help dump` for its options.\n')
+  const optioned = yield* invoke(silk, ['dump', 'syntax', 'main.silk', '--all'], directory)
+  assert.equal(optioned.status, 2, optioned.stderr)
+  assert.match(optioned.stderr, /^silk dump: the tokens, syntax and hir stages take no options\n/)
   const absent = yield* invoke(silk, ['dump', 'syntax', 'missing.silk'], directory)
   assert.equal(absent.status, 2, absent.stderr)
   assert.equal(absent.stderr, 'silk dump: no such source file `missing.silk`\n')
@@ -231,7 +240,8 @@ const program = Effect.gen(function* () {
   ]) {
     const help = yield* invoke(silkTool, args, releaseWorkspace, changesEnvironment)
     assert.equal(help.status, 0, help.stderr)
-    assert.match(help.stdout, /silk change \[--dir PATH\] patch\|minor\|major/)
+    assert.match(help.stdout, /^Usage: silk change \[options\] <command>\n/)
+    assert.match(help.stdout, /\n  patch +Record a patch change\n/)
     assert.equal(help.stderr, '')
   }
   const missingDirectory = yield* invoke(silkTool,
@@ -239,8 +249,8 @@ const program = Effect.gen(function* () {
     releaseWorkspace,
     changesEnvironment,
   )
-  assert.equal(missingDirectory.status, 1)
-  assert.match(missingDirectory.stderr, /silk change: --dir requires/)
+  assert.equal(missingDirectory.status, 2)
+  assert.match(missingDirectory.stderr, /^error: --dir needs a value\n/)
   assert.doesNotMatch(missingDirectory.stderr, /\.lock/, 'an argument error writes nothing to recover')
   for (const args of [
     ['patch', 'Must not create a workspace release'],
