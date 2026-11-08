@@ -192,7 +192,9 @@ dedicated syntax.
 
 A static value is finite, deterministic, identity-free, and freely reusable during static
 evaluation. Admitted values include unit, foundational scalars, scalar enums, static UTF-8 text,
-recursively pure aggregates whose members are admitted, and shared views of admitted static data:
+recursively pure aggregates whose members are admitted (structs, tuples, fixed arrays and the
+variants of nominal unions, such as `Option<i32>.Some {value: 1}`), and shared views of admitted
+static data:
 a `&'static T` and a `&'static [T]`. Admission excludes values carrying a runtime resource,
 exclusive borrow, opaque identity, callable execution, Effect, service, unsafe pointer, or
 observable cleanup behavior.
@@ -210,8 +212,9 @@ static function can be named as a value, partially applied
 ([CALLABLE-002](functions-callables-and-control-flow.md#callable-002--supplying-a-trailing-argument-suffix-constructs-a-section)),
 passed to a static function's `fn(A) -> B` parameter, and called directly or through a pipeline.
 A section stores its supplied arguments as static data, so it can be called again even when a
-captured value is not `Copy`. Such a value exists only during static evaluation and has no runtime
-representation.
+captured value is not `Copy`. A function value whose target is a `static fn` exists only during static evaluation and has no
+runtime representation; one whose target is an ordinary function can reach runtime code
+(STATIC-020).
 
 ```silk
 static fn calc() -> Command {
@@ -244,41 +247,57 @@ const ROOT: Command = Command {name: "calc", subcommands: &[&ADD]}
 ```
 
 **Diagnostics:** Attempting a prohibited operation reports `SEM0176` at that operation and produces
-no static result. Naming an ordinary function, an anonymous function or a bound method value as a
-value in a static body, or partially applying an ordinary function there, reports `SEM0176` at that
-expression. An exclusive borrow (`&mut`) or a borrow of a `let mut` local in a static body reports `SEM0176`. A value outside the admitted domain is rejected at the static boundary rather than
+no static result. Naming an anonymous function or a bound method value as a value in a static body
+reports `SEM0176` at that expression. An exclusive borrow (`&mut`) or a borrow of a `let mut` local in a static body reports `SEM0176`. A value outside the admitted domain is rejected at the static boundary rather than
 acquiring a second compile-time ownership model.
 
 **Evidence:** static value requirements,
 [canonical static values](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/StaticValue.ts).
 
-### STATIC-006 — Static mutation replaces one complete local value
+### STATIC-006 — Static mutation assigns to a local or a part of one
 
 **Status:** Confirmed
 
 Inside a `static fn`, ordinary `let mut` creates one mutable evaluator-local slot. Assignment
-replaces the complete stored static value. Ordinary `if`, `while`, `break`, `continue`, and `return`
-operate in the static function's compile-time phase.
+replaces the complete stored static value, or one field or element of it: `point.x = 1`,
+`pair.0 = 5`, `items[i] = value` and `outer.inner.count = 2` store a new value in the slot with
+that part replaced. Ordinary `if`, `if let`, `match`, `while`, `break`, `continue`, and `return` operate in
+the static function's compile-time phase; an `if`, `if let` or `match` is also a value, and a
+`return` inside one of its branches leaves the function when the branch is a whole statement, a
+binding's initializer or a returned value.
 
 ```silk
-static fn countTo(limit: u32) -> u32 {
-  let mut current = 0
-  while current < limit {
-    current = current + 1
+union Shape { Dot, Circle { pub r: u32 } }
+
+static fn area(shape: Shape) -> u32 {
+  return match move shape {
+    Shape.Dot => 0
+    Shape.Circle {r} if r > 100 => 1
+    Shape.Circle {r} => r * r * 3
   }
-  return current
+}
+
+static fn countTo(limit: u32) -> [u32; 3] {
+  let mut counts = [0, 0, 0]
+  let mut at: usize = 0
+  while at < 3 {
+    counts[at] = limit + 1
+    at = at + 1
+  }
+  return counts
 }
 ```
 
-**Boundary:** Static mutation cannot take an exclusive reference to the slot, project a writable place through
-an alias, mutate one aggregate field in place, partially move a value, observe cleanup, or retain
-the slot in a residual value. A mixed function cannot declare `let static mut`; it computes a new
-static value through a static function instead.
+**Boundary:** Static mutation cannot take an exclusive reference to the slot, project a writable
+place through an alias or a static view, partially move a value, observe cleanup, or retain the
+slot in a residual value. A `match &mut` binding is unavailable. A mixed function cannot declare
+`let static mut`; it computes a new static value through a static function instead.
 
-**Diagnostics:** An exclusive static borrow, unsupported place mutation, or runtime-dependent replacement
-reports `SEM0176` at the invalid operation. The failed evaluation exposes no partial value.
+**Diagnostics:** An exclusive static borrow, unsupported place mutation, an index past the end of
+a static array, or runtime-dependent replacement reports `SEM0176` at the invalid operation. The
+failed evaluation exposes no partial value.
 
-**Evidence:** static mutation limits.
+**Evidence:** static mutation limits; corpus program `static-tuple-element-assignment`.
 
 ### STATIC-007 — `silk.core.static_text` inspects UTF-8 bytes without exposing storage
 
@@ -332,6 +351,7 @@ kind, and the reflecting declaration's visibility authority are retained.
 | `typeKind(descriptor)`                | `u8`                        | Stable named/positional aggregate-kind code             |
 | `fieldKind(field)`                    | `u8`                        | Stable labeled/positional/variant member-kind code      |
 | `fieldLabel(field)`                   | `string`                    | Label of a labeled or variant field                     |
+| `fieldDoc(field)`                     | `string`                    | The `///` comment of a named struct field, or empty     |
 | `fieldOrdinal(field)`                 | `usize`                     | Position of a positional or variant field               |
 | `borrowField(owner, static field)`    | `&Value`                    | Shared runtime projection authorized by the descriptor  |
 | `borrowFieldMut(owner, static field)` | `&mut Value`                | Mutable runtime projection authorized by the descriptor |
@@ -611,3 +631,288 @@ anything but a literal at the call), and `Source.text` of a file that is not UTF
 evaluation with `SEM0176` at the call.
 
 **Evidence:** [package file source actor](../stdlib/silk/build/source.silk).
+
+## Ordinary functions in static code
+
+### STATIC-016 — Static code calls pure ordinary functions
+
+**Status:** Confirmed
+
+A `static fn`, a `static if` condition and every other static context may call an ordinary function
+whose signature is pure: it is not `effect`, `unsafe`, a test, variadic or foreign, it declares no
+failures (`!`), no requirements (`?`) and no environment, and it has no `static` parameter. Its body
+runs during static evaluation exactly as a `static fn` body does, and the same function stays an
+ordinary runtime function for runtime callers. Methods of generic types qualify, so `Option.isSome`,
+`u32.checkedToU8` and a library's own pure helpers run in static code without a static copy.
+
+```silk
+import silk.core.option {Option}
+import silk.num.u32
+
+fn clamp(value: u32, limit: u32) -> u32 {
+  if value > limit { return limit }
+  return value
+}
+
+static fn small(value: u32) -> bool {
+  return u32.checkedToU8(clamp(value, 300)).isSome()
+}
+```
+
+A receiver call that borrows its subject, as `value.isSome()`, passes a static view of the value.
+The sealed scalar intrinsics such pure functions wrap evaluate with the semantics of their source
+operators: arithmetic and conversions stop evaluation on overflow, and checked forms return through
+their `present` and `absent` function values.
+
+**Boundary:** A pure function body is still checked as runtime code, so reaching a runtime-only
+operation inside it, such as a raw pointer read, stops static evaluation at that operation. A
+scalar intrinsic without a source operator, such as a wrapping or saturating form, is not yet
+evaluated.
+
+**Diagnostics:** A static call of an impure function reports `SEM0176` at the call. Work inside a
+pure body that static evaluation cannot perform reports `SEM0176` at that work, with the call in the
+trace.
+
+**Evidence:** static function requirements,
+[pure call corpus program](../corpus/native/static-pure-functions/main.silk).
+
+## Constructing types field by field
+
+### STATIC-017 — A struct literal initializes fields from a static sequence of field descriptors
+
+**Status:** Confirmed
+
+Inside a struct literal, `static for field in fields { [key]: value, ... }` initializes one field
+for each `[key]: value` entry of each iteration. `fields` is a static sequence, such as
+`Reflect.fields<T>()`, and each `key` is a static field descriptor of the literal's type, usually
+the loop binding itself. Each value is checked against the type of the field its key describes, so
+one entry can initialize fields of different types. The loop unrolls during selection like a
+statement-level `static for` (STATIC-010) and leaves an ordinary literal at runtime. Written
+`name: value` initializers and loops combine in one literal, and together they must initialize
+every field exactly once.
+
+The literal's type may be the selected body's own type parameter, so a generic function builds
+any struct whose public fields it can produce:
+
+```silk
+import silk.core.reflect {Reflect}
+
+fn copied<T>(source: &T) -> T {
+  return T {static for field in Reflect.fields<T>() { [field]: Reflect.borrowField(source, field).* }}
+}
+```
+
+**Boundary:** Keys are field descriptors only; a union variant's field or another type's field
+initializes nothing. A struct literal with a `static for` is runtime code, so a `static fn` body
+cannot contain one.
+
+**Diagnostics:** A key that does not describe a field of the literal's type reports `SEM0022`. A
+field initialized twice, by two entries or by a written initializer and an entry, reports
+`SEM0023`, and a field no entry initializes reports `SEM0024`. A value of the wrong type reports
+`SEM0025` naming the field. Each names the iteration in its trace.
+
+**Evidence:** static field initializer checker tests,
+[field-by-field construction corpus program](../corpus/native/static-field-initializers/main.silk).
+
+### STATIC-018 — A string literal can be a checked field name
+
+**Status:** Confirmed
+
+`Intrinsic.FieldName<Owner>` is the name of one field of `Owner`. A string literal written where
+one is expected must name a field of `Owner` that the literal's module can see, and the editor links
+the literal to that field. A library takes a field name where its caller names one of its own
+fields, such as the field a command line option fills, and reads its text with
+`Reflect.fieldNameText` or its descriptor with `Reflect.fieldNamed`.
+
+```silk
+import silk.core.reflect {Reflect}
+
+struct Flags {
+  pub verbose: bool,
+}
+
+static fn optionName<T>(name: Intrinsic.FieldName<T>) -> string<'static> {
+  return Reflect.fieldNameText<T>(name)
+}
+
+static fn verbose() -> string<'static> {
+  return optionName<Flags>("verbose")
+}
+```
+
+A literal is checked once its owner is a closed type, so inside a generic body that still names its
+own parameter, a field name passes through and is checked where the caller writes it.
+
+For a union, a field name names a field of any of its variants. `Intrinsic.VariantName<Union>` is
+the name of one variant, checked the same way and read with `Reflect.variantNameText`.
+
+**Boundary:** A field name exists only in static code, like other reflection descriptors. Only a
+literal becomes a field name; computed text does not.
+
+**Diagnostics:** A literal that names no visible field of `Owner`, or no variant of `Union`, reports
+`SEM0022` at the literal.
+A field name in a runtime signature or value reports `SEM0176`.
+
+**Evidence:** field name checker and editor table tests.
+
+### STATIC-019 — `Union.[variant] { ... }` builds the variant a static descriptor selects
+
+**Status:** Confirmed
+
+`Union.[variant] { ... }` is a variant literal whose variant is chosen by `variant`, a static
+`Intrinsic.Variant<Union>` descriptor, such as an element of `Reflect.variants<Union>()`. Its body
+is the body of a written variant literal: named field initializers, a `static for` over
+`Reflect.variantFields(variant)` whose `[field]: value` entries initialize the variant's fields
+(STATIC-017), or both. `Union` may be a type parameter, so a generic body builds whichever variant
+its caller selects.
+
+```silk
+import silk.core.reflect {Reflect}
+
+union Shape {
+  Dot,
+  Circle {pub radius: u32},
+}
+
+fn zero<U, V>(static field: Intrinsic.Field<U, V>) -> u32 {
+  return 0
+}
+
+fn build<U>(static variant: Intrinsic.Variant<U>) -> U {
+  return U.[variant] { static for field in Reflect.variantFields(variant) { [field]: zero(field) } }
+}
+
+fn shapes() -> u32 {
+  let mut count: u32 = 0
+  static for variant in Reflect.variants<Shape>() {
+    let shape = build<Shape>(variant)
+    drop shape
+    count = count + 1
+  }
+  return count
+}
+```
+
+**Boundary:** The literal is runtime code; a static body cannot build a variant this way.
+
+**Diagnostics:** A descriptor that is not a variant of `Union` reports `SEM0022` at the descriptor.
+A key that is not a field of the selected variant reports `SEM0022` at the key, and a field the
+literal leaves out reports `SEM0024`.
+
+**Evidence:** variant selector checker test, corpus program `static-variant-literals`.
+
+### STATIC-020 — Runtime code calls a static function value that names an ordinary function
+
+**Status:** Confirmed
+
+A static function value whose target is an ordinary function, such as one a static function
+returns, can be read by runtime code. There it is the section it denotes: the target with its
+captured static values as the trailing arguments, each embedded as a constant. Calling it, directly
+or through a pipeline, calls the target, so a check or a parser chosen during static evaluation
+costs the same as calling it by name. Its identity is the target and its captures, so editing the
+target's body does not respecialize the code that reads it.
+
+```silk
+fn between(value: u32, low: u32, high: u32) -> bool {
+  return value >= low && value <= high
+}
+
+static fn range(low: u32, high: u32) -> fn<'static>(u32) -> bool {
+  return between(low, high)
+}
+
+fn inRange(value: u32) -> bool {
+  let static check = range(1, 5)
+  return check(value)
+}
+```
+
+**Boundary:** The target must be an ordinary function that is not an `effect fn`, and every
+captured value must be one static data can embed (STATIC-005). A function value whose target is a
+`static fn` stays phase-only.
+
+**Diagnostics:** Reading a phase-only function value in runtime code reports `SEM0176` at the
+read.
+
+**Evidence:** corpus program `static-function-values-at-runtime`.
+
+### STATIC-021 — An erased function reference holds function values of any contract
+
+**Status:** Confirmed
+
+`Intrinsic.FunctionRef` holds one static function value with its contract erased, so a single
+struct field or list can hold checks or parsers that take different types.
+`Intrinsic.functionRef<F>(value)` erases the contract `F` of `value`, and
+`Intrinsic.functionAs<F>(reference)` returns the function value again at the contract `F`. An
+erased reference is static data: it exists only during static evaluation and every read sees it
+again, so it is `Copy`. A restored value that names an ordinary function is called by runtime code
+as that function (STATIC-020).
+
+```silk
+struct Rule {
+  pub check: Intrinsic.FunctionRef,
+}
+
+fn positive(value: &u32) -> bool {
+  return value.* > 0
+}
+
+static fn rule() -> Rule {
+  return Rule {check: Intrinsic.functionRef<fn<'static>(&u32) -> bool>(positive)}
+}
+
+static fn checkOf(rule: Rule) -> fn<'static>(&u32) -> bool {
+  return Intrinsic.functionAs<fn<'static>(&u32) -> bool>(rule.check)
+}
+
+fn valid(value: &u32) -> bool {
+  let static check = checkOf(rule())
+  return check(value)
+}
+```
+
+**Boundary:** Both intrinsics run only in static code. Erasing checks `value` against `F` as a
+call checks an argument against an `F: fn(...)` bound. Restoring compares the parameters the value
+still takes and its result with `F`, by representation: the lifetimes of a reference parameter are
+the call's to check.
+
+**Diagnostics:** Erasing a value that cannot satisfy `F` reports `SEM0076` at the `functionRef`
+call. Restoring a reference at a contract it was not erased from stops the evaluation with
+`SEM0176` at the `functionAs` call, with the static trace that reached it.
+
+**Evidence:** corpus programs `static-function-references` and
+`static-function-reference-contract` (rejected).
+
+### STATIC-022 — A static function reads the documentation of a struct field
+
+**Status:** Confirmed
+
+`Reflect.fieldDoc(field)` returns the `///` comment written directly above a named struct field,
+each line without its leading blanks, its three slashes and the space after them, and the lines
+joined by newlines. A field without one gives empty text, and so does an ordinary `//` comment. The
+comment must open its lines and end on the line just above the field, which must start its own
+line, so a struct's comment or the comment of a field written earlier on the same line is never
+the field's. These are the rules the generated reference uses. A library can show the comment as
+help text, so the description of a field is written once.
+
+```silk
+struct Flags {
+  /// Say more.
+  pub verbose: bool,
+}
+
+static fn help() -> string<'static> {
+  let mut all = ""
+  static for field in Reflect.fields<Flags>() {
+    all = StaticText.concat(all, Reflect.fieldDoc(field))
+  }
+  return all
+}
+```
+
+**Boundary:** Only a named struct field has a comment of its own; a positional field, an anonymous
+field and a union variant's field give empty text. Reading the comment makes the program depend on
+the struct's module, so editing the comment rebuilds what reads it.
+
+**Evidence:** corpus programs `static-field-documentation` and
+`static-field-documentation-attachment`.

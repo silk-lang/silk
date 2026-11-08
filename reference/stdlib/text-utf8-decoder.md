@@ -128,6 +128,14 @@ If the input ends while [`Utf8Decoder.pending`](#Utf8Decoder.impl.pending) is `t
 the caller must report an error. After an invalid result, make a new decoder before the next
 byte.
 
+<a id="Utf8Decoder.impl.Copy"></a>
+
+## Implementation `Copy for Utf8Decoder`
+
+```silk
+impl Copy for Utf8Decoder
+```
+
 <a id="Utf8Decoder.impl"></a>
 
 ## Implementation `Utf8Decoder`

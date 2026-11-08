@@ -215,6 +215,107 @@ The list contains only the `pub` fields, even when the caller is the module that
 `Intrinsic.reflectFields<Owner>()` directly to list the fields that the calling module can
 see.
 
+<a id="Reflect.impl.field"></a>
+
+### Associated function `field`
+
+```silk
+pub static fn field<Owner, Value>(label: string<'static>) -> Intrinsic.Field<Owner, Value>
+```
+
+Returns the compile-time descriptor of the field of `Owner` named `label`.
+
+#### Details
+
+Use it to name one field by its label, such as a command line option that fills the field
+`verbose`. Pass the descriptor to [`Reflect.borrowField`](#Reflect.impl.borrowField) to read the field at runtime.
+
+#### Gotchas
+
+Static evaluation stops at the call when `Owner` has no `pub` field named `label`, or when
+that field's type is not `Value`.
+
+#### Examples
+```silk
+import silk.core.reflect { Reflect }
+
+struct Flags {
+  pub verbose: bool,
+  pub depth: u32,
+}
+
+fn depthOf(flags: &Flags) -> u32 {
+  return Reflect.borrowField<Flags, u32>(flags, Reflect.field<Flags, u32>("depth")).*
+}
+
+pub fn main() -> i32 {
+  let flags = Flags { verbose: false, depth: 3 }
+  if depthOf(&flags) != 3 {
+    return 1
+  }
+  return 0
+}
+```
+
+<a id="Reflect.impl.fieldNameText"></a>
+
+### Associated function `fieldNameText`
+
+```silk
+pub static fn fieldNameText<Owner>(name: Intrinsic.FieldName<Owner>) -> string<'static>
+```
+
+Returns the text of `name`, a field name of `Owner` that was checked where it was written.
+
+#### When to use
+
+Take an `Intrinsic.FieldName<Owner>` parameter where a library asks for the name of one of the
+caller's fields, such as the field a command line option fills. A string literal passed there
+must name a field of `Owner`, so a misspelled name is an error at the literal, and the editor
+links the literal to the field.
+
+#### Examples
+```silk
+import silk.core.reflect { Reflect }
+
+struct Flags {
+  pub verbose: bool,
+}
+
+static fn optionName<T>(name: Intrinsic.FieldName<T>) -> string<'static> {
+  return Reflect.fieldNameText<T>(name)
+}
+
+pub fn main() -> i32 {
+  static if optionName<Flags>("verbose") != "verbose" {
+    compileError("the name is its text")
+  }
+  return 0
+}
+```
+
+<a id="Reflect.impl.fieldNamed"></a>
+
+### Associated function `fieldNamed`
+
+```silk
+pub static fn fieldNamed<Owner, Value>(name: Intrinsic.FieldName<Owner>) -> Intrinsic.Field<Owner, Value>
+```
+
+Returns the descriptor of the field that `name` names, whose type must be `Value`.
+
+<a id="Reflect.impl.variantNameText"></a>
+
+### Associated function `variantNameText`
+
+```silk
+pub static fn variantNameText<Union>(name: Intrinsic.VariantName<Union>) -> string<'static>
+```
+
+Returns the text of `name`, a variant name of `Union` that the compiler checked where it was
+written. A string literal is an `Intrinsic.VariantName<Union>` when that type is expected, and
+a literal that names no variant of `Union` is a compile error at the literal.
+
 <a id="Reflect.impl.typeKind"></a>
 
 ### Associated function `typeKind`
@@ -252,6 +353,46 @@ Returns the name of a named field, as written in the type declaration.
 
 Use this function only for a field where [`Reflect.fieldKind`](#Reflect.impl.fieldKind) is [`labeledFieldKind`](#labeledFieldKind) or
 [`variantFieldKind`](#variantFieldKind).
+
+<a id="Reflect.impl.fieldDoc"></a>
+
+### Associated function `fieldDoc`
+
+```silk
+pub static fn fieldDoc<Owner, Value>(field: Intrinsic.Field<Owner, Value>) -> string<'static>
+```
+
+Returns the `///` comment written on a named struct field, without its slashes and with its
+lines joined by newlines, or empty text when the field has none.
+
+#### When to use
+
+Read a field's comment where a library shows text about the field, such as the help text of
+the command line option the field fills, so the comment is written once.
+
+#### Gotchas
+
+Editing the comment changes what the program shows, as it would for a string literal. A
+field of a union variant, a positional field and an anonymous field give empty text.
+
+#### Examples
+```silk
+import silk.core.reflect { Reflect }
+
+struct Flags {
+  /// Say more.
+  pub verbose: bool,
+}
+
+pub fn main() -> i32 {
+  static for field in Reflect.fields<Flags>() {
+    static if Reflect.fieldDoc(field) != "Say more." {
+      compileError("the comment is the field's documentation")
+    }
+  }
+  return 0
+}
+```
 
 <a id="Reflect.impl.fieldOrdinal"></a>
 
