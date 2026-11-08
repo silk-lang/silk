@@ -2066,6 +2066,16 @@ pub fn ackWritten(self: &mut Self, count: usize) -> Result<ServerProgress, Serve
 
 Tells the server that the transport sent the first `count` bytes of [`Server.pendingOutput`](#Server.impl.pendingOutput).
 
+<a id="Server.impl.plaintextAvailable"></a>
+
+### Method `plaintextAvailable`
+
+```silk
+pub fn plaintextAvailable(self: &Self) -> usize
+```
+
+Returns how many decrypted application bytes `readPlaintext` can copy out now.
+
 <a id="Server.impl.readPlaintext"></a>
 
 ### Method `readPlaintext`
