@@ -1,0 +1,330 @@
+//! Read the members of a tar archive held in memory.
+//!
+//! # When to use
+//! Use a [`TarReader`] to unpack a `.tar` file, or a `.tar.gz` file after you decode it with
+//! `silk.compress.inflate`. Open the archive with [`TarReader.open`] and call [`TarReader.next`]
+//! until it returns none. This module does not write archives and does not decompress.
+//!
+//! # Details
+//! The reader understands ustar, GNU, and pax archives: the ustar `prefix` field, GNU long names,
+//! pax `path` records, and base-256 sizes. It does not allocate, and every member it returns
+//! borrows the archive. Each header's checksum is checked. A member's path is checked before the
+//! member is returned: an absolute path, a backslash, or a `..` segment refuses the archive, so a
+//! caller that joins a path to a directory and creates no links never writes outside it. Empty and
+//! `.` segments are allowed, because `tar -C dir .` writes paths such as `./include/x.h`.
+//!
+//! # Errors
+//! - [`TarError`] from [`TarReader.next`] when a header is corrupt, the archive ends inside a
+//!   member, or a path is unsafe.
+//!
+//! # Examples
+//! ```silk
+//! import silk.compress.tar {TarError, TarKind, TarMember, TarReader}
+//! import silk.core.option {Option}
+//! import silk.core.result {Result}
+//!
+//! // Counts the regular files of `archive`, or answers -1 when it is not a valid tar archive.
+//! fn files(archive: &[u8]) -> i32 {
+//!   let mut reader = TarReader.open(archive)
+//!   let mut count = 0
+//!   while true {
+//!     match TarReader.next(&mut reader) {
+//!       Result<Option<TarMember>, TarError>.Success {value} => match move value {
+//!         Option<TarMember>.Some {value: member} => { if member.kind == TarKind.File { count = count + 1 } }
+//!         Option<TarMember>.None => { return count }
+//!       }
+//!       Result<Option<TarMember>, TarError>.Failure {..} => { return -1 }
+//!     }
+//!   }
+//!   return count
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   let empty: [u8; 1024] = [0; 1024]
+//!   return files(&empty)
+//! }
+//! ```
+//!
+//! @category Data formats
+
+import silk.collections.slice {Slice}
+import silk.core.option {Option}
+import silk.core.result {Result}
+import silk.io.writer {Writer, WriterError}
+import silk.text.format {Debug, Format as TextFormat, Formatter}
+import silk.num.u8
+import silk.num.u64
+import silk.num.usize
+
+/// The reason a tar archive was refused.
+pub enum TarError {
+  /// The archive ends inside a header or inside a member's content.
+  Truncated,
+  /// A header's checksum does not match its bytes, or a number field holds something other than
+  /// an octal or base-256 number.
+  BadHeader,
+  /// A member path is absolute, holds a backslash, or has a `..` segment.
+  UnsafePath,
+}
+
+impl TarError {
+  /// Returns a short sentence that describes `error`, such as "the tar archive is truncated".
+  pub fn describe(error: TarError) -> string<'static> {
+    return match error {
+      TarError.Truncated => "the tar archive is truncated"
+      TarError.BadHeader => "a tar header is corrupt"
+      TarError.UnsafePath => "the tar archive holds a path outside its directory"
+    }
+  }
+}
+
+impl Debug for TarError {
+  /// Writes the name of the variant, such as `Truncated`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      TarError.Truncated => run TextFormat.write(&mut formatter, b"Truncated")
+      TarError.BadHeader => run TextFormat.write(&mut formatter, b"BadHeader")
+      TarError.UnsafePath => run TextFormat.write(&mut formatter, b"UnsafePath")
+    }
+  }
+}
+
+/// What a tar member is.
+pub enum TarKind {
+  /// A regular file. Its bytes are the member's `content`.
+  File,
+  /// A directory. Its path has no trailing `/`, and it has no content.
+  Directory,
+  /// A symbolic link to `link`, which the reader does not check.
+  SymbolicLink,
+  /// A hard link to the earlier member `link`, which the reader does not check.
+  HardLink,
+  /// A device, a FIFO, or a type this module does not know.
+  Other,
+}
+
+/// One member of a tar archive: its checked path, its kind, and its content.
+///
+/// # Details
+/// The member's path is `prefix/name`, or `name` alone when `prefix` is empty. A GNU long name or a
+/// pax `path` record comes back as `name` with an empty `prefix`. The slices borrow the archive
+/// given to [`TarReader.open`].
+pub struct TarMember<'a> {
+  /// The ustar `prefix` field, or empty.
+  pub prefix: &'a [u8],
+  /// The rest of the path, without the trailing `/` a directory may carry.
+  pub name: &'a [u8],
+  /// Whether the member is a file, a directory, a link, or something else.
+  pub kind: TarKind,
+  /// Whether the member is a file whose mode has an execute permission bit.
+  pub executable: bool,
+  /// The target of a symbolic or hard link, or empty.
+  pub link: &'a [u8],
+  /// The bytes of a regular file. It is empty for a directory or a link.
+  pub content: &'a [u8],
+}
+
+/// A position in a tar archive held in memory.
+///
+/// # When to use
+/// Make one with [`TarReader.open`] and call [`TarReader.next`] until it returns none.
+///
+/// # Details
+/// The reader does not allocate and borrows the archive. It stops at the first all-zero block or at
+/// the end of the bytes. After a failure, discard the reader.
+pub struct TarReader<'a> {
+  archive: &'a [u8],
+  offset: usize,
+}
+
+const BLOCK: usize = 512
+
+// The bytes of a NUL-terminated header field.
+fn field<'a>(header: &'a [u8], start: usize, width: usize) -> &'a [u8] {
+  let mut length: usize = 0
+  while length < width && header[start + length] != 0 { length = length + 1 }
+  return Slice.view<u8>(header, start, length)
+}
+
+// The number in a header field: octal, after leading spaces and before a space or NUL, or base-256
+// when the first byte has its high bit set. None for any other byte, or for a value of 2^56 or more.
+fn number(header: &[u8], start: usize, width: usize) -> Option<u64> {
+  let mut value: u64 = 0
+  if (header[start] & 128) != 0 {
+    if (header[start] & 127) != 0 { return Option<u64>.none() }
+    let mut at: usize = 1
+    while at < width {
+      if value >= 72057594037927936 / 256 { return Option<u64>.none() }
+      value = value * 256 + u8.toU64(header[start + at])
+      at = at + 1
+    }
+    return Option<u64>.some(value)
+  }
+  let mut at = start
+  let end = start + width
+  while at < end && header[at] == 32 { at = at + 1 }
+  while at < end && header[at] != 0 && header[at] != 32 {
+    let digit = header[at]
+    if digit < 48 || digit > 55 || value >= 72057594037927936 / 8 { return Option<u64>.none() }
+    value = value * 8 + u8.toU64(digit - 48)
+    at = at + 1
+  }
+  return Option<u64>.some(value)
+}
+
+fn allZero(block: &[u8]) -> bool {
+  let mut at: usize = 0
+  while at < block.length {
+    if block[at] != 0 { return false }
+    at = at + 1
+  }
+  return true
+}
+
+fn startsWith(text: &[u8], prefix: &[u8]) -> bool {
+  if text.length < prefix.length { return false }
+  let mut at: usize = 0
+  while at < prefix.length {
+    if text[at] != prefix[at] { return false }
+    at = at + 1
+  }
+  return true
+}
+
+// Whether `path` is relative and has no backslash, NUL, or `..` segment.
+fn safe(path: &[u8]) -> bool {
+  if path.length > 0 && path[0] == 47 { return false }
+  let mut start: usize = 0
+  let mut at: usize = 0
+  while at <= path.length {
+    if at < path.length && (path[at] == 92 || path[at] == 0) { return false }
+    if at == path.length || path[at] == 47 {
+      if at - start == 2 && path[start] == 46 && path[start + 1] == 46 { return false }
+      start = at + 1
+    }
+    at = at + 1
+  }
+  return true
+}
+
+// The value of the `path` record in pax extended header records, or none.
+fn paxPath<'a>(records: &'a [u8]) -> Option<&'a [u8]> {
+  let mut at: usize = 0
+  while at < records.length {
+    let mut space = at
+    let mut length: usize = 0
+    while space < records.length && records[space] >= 48 && records[space] <= 57 && length <= records.length {
+      length = length * 10 + u8.toUsize(records[space] - 48)
+      space = space + 1
+    }
+    if length == 0 || length > records.length - at || space >= at + length || records[space] != 32 { return Option<&'a [u8]>.none() }
+    // The record is `<length> path=<value>\n`.
+    let record = Slice.view<u8>(records, space + 1, at + length - space - 1)
+    if startsWith(record, b"path=") && record.length > 6 {
+      return Option<&'a [u8]>.some(Slice.view<u8>(record, 5, record.length - 6))
+    }
+    at = at + length
+  }
+  return Option<&'a [u8]>.none()
+}
+
+impl<'a> TarReader<'a> {
+  /// Returns a reader at the start of `archive`.
+  pub fn open(archive: &'a [u8]) -> TarReader<'a> {
+    return TarReader<'a> {archive: archive, offset: 0}
+  }
+
+  /// Returns the next member in archive order, or none at the end-of-archive blocks or the end of
+  /// the bytes. GNU long-name and pax headers are read as part of the member they name.
+  ///
+  /// # Errors
+  /// - [`TarError`] with `Truncated` when the archive ends inside a header or a member,
+  ///   `BadHeader` when a checksum or number is invalid, and `UnsafePath` when the member's path
+  ///   is absolute, holds a backslash, or has a `..` segment.
+  pub fn next(self: &mut TarReader<'a>) -> Result<Option<TarMember<'a>>, TarError> {
+    let archive = self.archive
+    let mut longName = Option<&'a [u8]>.none()
+    while true {
+      if self.offset == archive.length { return Result<Option<TarMember<'a>>, TarError>.succeed(Option<TarMember<'a>>.none()) }
+      if archive.length - self.offset < BLOCK { return Result<Option<TarMember<'a>>, TarError>.failResult(TarError.Truncated) }
+      let header = Slice.view<u8>(archive, self.offset, BLOCK)
+      if allZero(header) {
+        self.offset = archive.length
+        return Result<Option<TarMember<'a>>, TarError>.succeed(Option<TarMember<'a>>.none())
+      }
+      // The checksum counts its own eight bytes as spaces.
+      let mut sum: u64 = 0
+      let mut at: usize = 0
+      while at < BLOCK {
+        if at >= 148 && at < 156 { sum = sum + 32 } else { sum = sum + u8.toU64(header[at]) }
+        at = at + 1
+      }
+      let recorded = match number(header, 148, 8) {
+        Option<u64>.Some {value} => value
+        Option<u64>.None => { return Result<Option<TarMember<'a>>, TarError>.failResult(TarError.BadHeader) }
+      }
+      if recorded != sum { return Result<Option<TarMember<'a>>, TarError>.failResult(TarError.BadHeader) }
+      let size = match number(header, 124, 12) {
+        Option<u64>.Some {value} => value
+        Option<u64>.None => { return Result<Option<TarMember<'a>>, TarError>.failResult(TarError.BadHeader) }
+      }
+      let start = self.offset + BLOCK
+      if size > usize.toU64(archive.length - start) { return Result<Option<TarMember<'a>>, TarError>.failResult(TarError.Truncated) }
+      let length = u64.toUsize(size)
+      let content = Slice.view<u8>(archive, start, length)
+      // The content is padded to whole blocks; a missing final pad is accepted.
+      let padded = (length + BLOCK - 1) / BLOCK * BLOCK
+      self.offset = if padded > archive.length - start { archive.length } else { start + padded }
+      let kind = header[156]
+      // A GNU long name (`L`) or a pax `path` record (`x`) names the next member, a GNU long link
+      // name (`K`) is not used, and a pax global header (`g`) applies to no one member here.
+      if kind == 76 {
+        longName = Option<&'a [u8]>.some(field(content, 0, content.length))
+        continue
+      }
+      if kind == 120 {
+        if let Option<&'a [u8]>.Some {value} = paxPath(content) { longName = Option<&'a [u8]>.some(value) }
+        continue
+      }
+      if kind == 75 || kind == 103 { continue }
+      let mut prefix = Slice.view<u8>(header, 0, 0)
+      let mut name = field(header, 0, 100)
+      if startsWith(Slice.view<u8>(header, 257, 6), b"ustar\x00") { prefix = field(header, 345, 155) }
+      if let Option<&'a [u8]>.Some {value} = longName {
+        name = value
+        prefix = Slice.view<u8>(header, 0, 0)
+      }
+      if !safe(prefix) || !safe(name) {
+        return Result<Option<TarMember<'a>>, TarError>.failResult(TarError.UnsafePath)
+      }
+      let mut memberKind = TarKind.Other
+      if kind == 48 || kind == 0 || kind == 55 {
+        memberKind = TarKind.File
+      } else if kind == 53 {
+        memberKind = TarKind.Directory
+      } else if kind == 50 {
+        memberKind = TarKind.SymbolicLink
+      } else if kind == 49 {
+        memberKind = TarKind.HardLink
+      }
+      // An old archive marks a directory only by the trailing `/` of a file member's name.
+      if memberKind == TarKind.File && name.length > 0 && name[name.length - 1] == 47 { memberKind = TarKind.Directory }
+      while memberKind == TarKind.Directory && name.length > 0 && name[name.length - 1] == 47 {
+        name = Slice.view<u8>(name, 0, name.length - 1)
+      }
+      let mode = match number(header, 100, 8) {
+        Option<u64>.Some {value} => value
+        Option<u64>.None => { return Result<Option<TarMember<'a>>, TarError>.failResult(TarError.BadHeader) }
+      }
+      return Result<Option<TarMember<'a>>, TarError>.succeed(Option<TarMember<'a>>.some(TarMember<'a> {
+        prefix: prefix,
+        name: name,
+        kind: memberKind,
+        executable: memberKind == TarKind.File && (mode & 73) != 0,
+        link: field(header, 157, 100),
+        content: if memberKind == TarKind.File { content } else { Slice.view<u8>(content, 0, 0) },
+      }))
+    }
+    return Result<Option<TarMember<'a>>, TarError>.succeed(Option<TarMember<'a>>.none())
+  }
+}
