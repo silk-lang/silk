@@ -260,8 +260,8 @@ acquiring a second compile-time ownership model.
 
 Inside a `static fn`, ordinary `let mut` creates one mutable evaluator-local slot. Assignment
 replaces the complete stored static value, or one field or element of it: `point.x = 1`,
-`items[i] = value` and `outer.inner.count = 2` store a new value in the slot with that part
-replaced. Ordinary `if`, `if let`, `match`, `while`, `break`, `continue`, and `return` operate in
+`pair.0 = 5`, `items[i] = value` and `outer.inner.count = 2` store a new value in the slot with
+that part replaced. Ordinary `if`, `if let`, `match`, `while`, `break`, `continue`, and `return` operate in
 the static function's compile-time phase; an `if`, `if let` or `match` is also a value, and a
 `return` inside one of its branches leaves the function when the branch is a whole statement, a
 binding's initializer or a returned value.
@@ -297,7 +297,7 @@ slot in a residual value. A `match &mut` binding is unavailable. A mixed functio
 a static array, or runtime-dependent replacement reports `SEM0176` at the invalid operation. The
 failed evaluation exposes no partial value.
 
-**Evidence:** static mutation limits.
+**Evidence:** static mutation limits; corpus program `static-tuple-element-assignment`.
 
 ### STATIC-007 — `silk.core.static_text` inspects UTF-8 bytes without exposing storage
 
@@ -871,14 +871,17 @@ fn valid(value: &u32) -> bool {
 }
 ```
 
-**Boundary:** Both intrinsics run only in static code. Restoring compares the parameters the value
+**Boundary:** Both intrinsics run only in static code. Erasing checks `value` against `F` as a
+call checks an argument against an `F: fn(...)` bound. Restoring compares the parameters the value
 still takes and its result with `F`, by representation: the lifetimes of a reference parameter are
 the call's to check.
 
-**Diagnostics:** Restoring a reference at a contract it was not erased from stops the evaluation
-with `SEM0176` at the `functionAs` call, with the static trace that reached it.
+**Diagnostics:** Erasing a value that cannot satisfy `F` reports `SEM0076` at the `functionRef`
+call. Restoring a reference at a contract it was not erased from stops the evaluation with
+`SEM0176` at the `functionAs` call, with the static trace that reached it.
 
-**Evidence:** corpus program `static-function-references`.
+**Evidence:** corpus programs `static-function-references` and
+`static-function-reference-contract` (rejected).
 
 ### STATIC-022 — A static function reads the documentation of a struct field
 
@@ -886,8 +889,11 @@ with `SEM0176` at the `functionAs` call, with the static trace that reached it.
 
 `Reflect.fieldDoc(field)` returns the `///` comment written directly above a named struct field,
 each line without its leading blanks, its three slashes and the space after them, and the lines
-joined by newlines. A field without one gives empty text, and so does an ordinary `//` comment. A
-library can show the comment as help text, so the description of a field is written once.
+joined by newlines. A field without one gives empty text, and so does an ordinary `//` comment. The
+comment must open its lines and end on the line just above the field, which must start its own
+line, so a struct's comment or the comment of a field written earlier on the same line is never
+the field's. These are the rules the generated reference uses. A library can show the comment as
+help text, so the description of a field is written once.
 
 ```silk
 struct Flags {
@@ -908,4 +914,5 @@ static fn help() -> string<'static> {
 field and a union variant's field give empty text. Reading the comment makes the program depend on
 the struct's module, so editing the comment rebuilds what reads it.
 
-**Evidence:** corpus program `static-field-documentation`.
+**Evidence:** corpus programs `static-field-documentation` and
+`static-field-documentation-attachment`.
