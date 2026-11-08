@@ -630,3 +630,47 @@ anything but a literal at the call), and `Source.text` of a file that is not UTF
 evaluation with `SEM0176` at the call.
 
 **Evidence:** [package file source actor](../stdlib/silk/build/source.silk).
+
+## Ordinary functions in static code
+
+### STATIC-016 — Static code calls pure ordinary functions
+
+**Status:** Confirmed
+
+A `static fn`, a `static if` condition and every other static context may call an ordinary function
+whose signature is pure: it is not `effect`, `unsafe`, a test, variadic or foreign, it declares no
+failures (`!`), no requirements (`?`) and no environment, and it has no `static` parameter. Its body
+runs during static evaluation exactly as a `static fn` body does, and the same function stays an
+ordinary runtime function for runtime callers. Methods of generic types qualify, so `Option.isSome`,
+`u32.checkedToU8` and a library's own pure helpers run in static code without a static copy.
+
+```silk
+import silk.core.option {Option}
+import silk.num.u32
+
+fn clamp(value: u32, limit: u32) -> u32 {
+  if value > limit { return limit }
+  return value
+}
+
+static fn small(value: u32) -> bool {
+  return u32.checkedToU8(clamp(value, 300)).isSome()
+}
+```
+
+A receiver call that borrows its subject, as `value.isSome()`, passes a static view of the value.
+The sealed scalar intrinsics such pure functions wrap evaluate with the semantics of their source
+operators: arithmetic and conversions stop evaluation on overflow, and checked forms return through
+their `present` and `absent` function values.
+
+**Boundary:** A pure function body is still checked as runtime code, so reaching a runtime-only
+operation inside it, such as a raw pointer read, stops static evaluation at that operation. A
+scalar intrinsic without a source operator, such as a wrapping or saturating form, is not yet
+evaluated.
+
+**Diagnostics:** A static call of an impure function reports `SEM0176` at the call. Work inside a
+pure body that static evaluation cannot perform reports `SEM0176` at that work, with the call in the
+trace.
+
+**Evidence:** static function requirements,
+[pure call corpus program](../corpus/native/static-pure-functions/Main.silk).
