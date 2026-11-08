@@ -192,7 +192,9 @@ dedicated syntax.
 
 A static value is finite, deterministic, identity-free, and freely reusable during static
 evaluation. Admitted values include unit, foundational scalars, scalar enums, static UTF-8 text,
-recursively pure aggregates whose members are admitted, and shared views of admitted static data:
+recursively pure aggregates whose members are admitted (structs, tuples, fixed arrays and the
+variants of nominal unions, such as `Option<i32>.Some {value: 1}`), and shared views of admitted
+static data:
 a `&'static T` and a `&'static [T]`. Admission excludes values carrying a runtime resource,
 exclusive borrow, opaque identity, callable execution, Effect, service, unsafe pointer, or
 observable cleanup behavior.
@@ -252,31 +254,48 @@ acquiring a second compile-time ownership model.
 **Evidence:** static value requirements,
 [canonical static values](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/StaticValue.ts).
 
-### STATIC-006 — Static mutation replaces one complete local value
+### STATIC-006 — Static mutation assigns to a local or a part of one
 
 **Status:** Confirmed
 
 Inside a `static fn`, ordinary `let mut` creates one mutable evaluator-local slot. Assignment
-replaces the complete stored static value. Ordinary `if`, `while`, `break`, `continue`, and `return`
-operate in the static function's compile-time phase.
+replaces the complete stored static value, or one field or element of it: `point.x = 1`,
+`items[i] = value` and `outer.inner.count = 2` store a new value in the slot with that part
+replaced. Ordinary `if`, `if let`, `match`, `while`, `break`, `continue`, and `return` operate in
+the static function's compile-time phase; an `if`, `if let` or `match` is also a value, and a
+`return` inside one of its branches leaves the function when the branch is a whole statement, a
+binding's initializer or a returned value.
 
 ```silk
-static fn countTo(limit: u32) -> u32 {
-  let mut current = 0
-  while current < limit {
-    current = current + 1
+union Shape { Dot, Circle { pub r: u32 } }
+
+static fn area(shape: Shape) -> u32 {
+  return match move shape {
+    Shape.Dot => 0
+    Shape.Circle {r} if r > 100 => 1
+    Shape.Circle {r} => r * r * 3
   }
-  return current
+}
+
+static fn countTo(limit: u32) -> [u32; 3] {
+  let mut counts = [0, 0, 0]
+  let mut at: usize = 0
+  while at < 3 {
+    counts[at] = limit + 1
+    at = at + 1
+  }
+  return counts
 }
 ```
 
-**Boundary:** Static mutation cannot take an exclusive reference to the slot, project a writable place through
-an alias, mutate one aggregate field in place, partially move a value, observe cleanup, or retain
-the slot in a residual value. A mixed function cannot declare `let static mut`; it computes a new
-static value through a static function instead.
+**Boundary:** Static mutation cannot take an exclusive reference to the slot, project a writable
+place through an alias or a static view, partially move a value, observe cleanup, or retain the
+slot in a residual value. A `match &mut` binding is unavailable. A mixed function cannot declare
+`let static mut`; it computes a new static value through a static function instead.
 
-**Diagnostics:** An exclusive static borrow, unsupported place mutation, or runtime-dependent replacement
-reports `SEM0176` at the invalid operation. The failed evaluation exposes no partial value.
+**Diagnostics:** An exclusive static borrow, unsupported place mutation, an index past the end of
+a static array, or runtime-dependent replacement reports `SEM0176` at the invalid operation. The
+failed evaluation exposes no partial value.
 
 **Evidence:** static mutation limits.
 
