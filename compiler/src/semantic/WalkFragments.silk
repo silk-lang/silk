@@ -1,0 +1,625 @@
+//! Composes independently checked worker fragments into a complete finite graph.
+
+import semantic.DeclarationId {DeclarationId, OwnerStep}
+import semantic.ModuleId {InvalidModulePath, ModuleId}
+import semantic.StableKey
+import semantic.FiniteBudget {Budget}
+import semantic.BuildRecord
+import semantic.ContentHash {ContentHash}
+import semantic.InternIndex {InternIndex}
+import silk.collections.bytes {Bytes}
+import silk.collections.hash {Hash}
+import silk.collections.list {List}
+import silk.core.option {Option}
+import silk.core.result {Result}
+import silk.core.effect {Effect}
+import silk.testing.testing {AssertionError, Testing}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.mem.pointer {Pointer}
+import semantic.FrontierHost {FrontierHost}
+import silk.num.u64
+import silk.num.usize
+
+/// A frontier omitted by one worker and supplied by another worker's complete entry.
+pub const EXTERNAL: u64 = 3
+/// A malformed capture index, diagnosed before transport encoding.
+pub struct FragmentFault {pub entry: usize, pub code: usize, pub value: usize}
+
+/// Checks the index constraints enforced by the BuildRecord decoder and fragment merger.
+pub fn structuralFailure(record: &BuildRecord.Record) -> Option<FragmentFault> {
+  let entries = List<BuildRecord.Entry>.asSlice(&record.entries)
+  let mut at = usize.ZERO
+  while at < entries.length {
+    let entry = &entries[at]
+    if entry.parent != usize.MAX && entry.parent >= at {
+      return Option<FragmentFault>.some(FragmentFault {entry: at, code: 1, value: entry.parent})
+    }
+    if entry.alias != usize.MAX && entry.alias >= at {
+      return Option<FragmentFault>.some(FragmentFault {entry: at, code: 2, value: entry.alias})
+    }
+    if entry.requested && entry.parent == usize.MAX {
+      return Option<FragmentFault>.some(FragmentFault {entry: at, code: 3, value: entry.position})
+    }
+    if entry.leaf > EXTERNAL {
+      return Option<FragmentFault>.some(FragmentFault {entry: at, code: 4, value: u64.toUsize(entry.leaf)})
+    }
+    let references = List<BuildRecord.Reference>.asSlice(&entry.references)
+    let mut reference = usize.ZERO
+    while reference < references.length {
+      if references[reference].target >= entries.length {
+        return Option<FragmentFault>.some(FragmentFault {entry: at, code: 5, value: references[reference].target})
+      }
+      reference = reference + usize.ONE
+    }
+    let callees = List<usize>.asSlice(&entry.facts.callees)
+    reference = usize.ZERO
+    while reference < callees.length {
+      if callees[reference] >= references.length {
+        return Option<FragmentFault>.some(FragmentFault {entry: at, code: 6, value: callees[reference]})
+      }
+      reference = reference + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return Option<FragmentFault>.none()
+}
+
+struct Source {record: usize, entry: usize}
+struct Visit {entry: usize, parent: usize, position: usize}
+
+
+fn refused(label: &[u8]) -> Option<BuildRecord.Record> {
+  drop unsafe FrontierHost.write(2, Pointer.fromSlice<u8>(label), label.length)
+  return Option<BuildRecord.Record>.none()
+}
+fn refuseProof(label: &[u8]) -> bool {
+  drop unsafe FrontierHost.write(2, Pointer.fromSlice<u8>(label), label.length)
+  return false
+}
+
+fn hashed(value: ContentHash) -> u64 { return Hash.combine(value.high, value.low) }
+fn find(keys: &[ContentHash], lookup: &InternIndex, key: ContentHash) -> usize {
+  let mut at = InternIndex.first(lookup, hashed(key))
+  while at != usize.MAX {
+    if ContentHash.equals(keys[at], key) { return at }
+    at = InternIndex.after(lookup, at)
+  }
+  return usize.MAX
+}
+fn rank(leaf: u64) -> usize {
+  if leaf == EXTERNAL { return usize.ZERO }
+  if leaf == BuildRecord.LEFT { return usize.ONE }
+  return 2
+}
+
+fn sameDefinition(firstEntries: &[BuildRecord.Entry], first: &BuildRecord.Entry,
+  secondEntries: &[BuildRecord.Entry], second: &BuildRecord.Entry) -> bool {
+  if !ContentHash.equals(first.summary, second.summary) { return refuseProof(b"frontier duplicate summary differs\n") }
+  let left = List<BuildRecord.Reference>.asSlice(&first.references)
+  let right = List<BuildRecord.Reference>.asSlice(&second.references)
+  if left.length != right.length { return refuseProof(b"frontier duplicate reference count differs\n") }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at].target >= firstEntries.length || right[at].target >= secondEntries.length { return false }
+    if !ContentHash.equals(firstEntries[left[at].target].exact, secondEntries[right[at].target].exact)
+      || !ContentHash.equals(left[at].edge, right[at].edge) { return refuseProof(b"frontier duplicate reference differs\n") }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+/// Joins the roots of escape fragments, resolves omitted frontier entries, and remaps
+/// every reference. Entries are ordered by deterministic root/reference DFS. This graph can
+/// prove a clean union; bounded LEFT/full occurrences are collapsed, so it is not a cache image.
+pub effect fn merge(records: &[BuildRecord.Record]) -> Option<BuildRecord.Record>
+! OutOfMemoryError ? &mut Allocator {
+  return run mergeFragments(records, false)
+}
+
+/// Composes a provisional graph while retaining external/left leaves for worker expansion.
+pub effect fn mergeOpen(records: &[BuildRecord.Record]) -> Option<BuildRecord.Record>
+! OutOfMemoryError ? &mut Allocator {
+  return run mergeFragments(records, true)
+}
+
+effect fn mergeFragments(records: &[BuildRecord.Record], open: bool) -> Option<BuildRecord.Record>
+! OutOfMemoryError ? &mut Allocator {
+  if records.length == usize.ZERO { return refused(b"frontier merge refused: empty records\n") }
+  if records[usize.ZERO].patterns { return refused(b"frontier merge refused: root patterns\n") }
+  let mut rootKeys = List<ContentHash>.make()
+  let mut rootLookup = InternIndex.make()
+  let mut keys = List<ContentHash>.make()
+  let mut chosen = List<Source>.make()
+  let mut lookup = InternIndex.make()
+  let mut mappings = List<List<usize>>.make()
+  let mut guarded = false
+  let mut recordAt = usize.ZERO
+  while recordAt < records.length {
+    let record = &records[recordAt]
+    if record.patterns || record.observing != records[usize.ZERO].observing { return refused(b"frontier merge refused: record mode\n") }
+    guarded = guarded || record.guarded
+    let listedRoots = List<ContentHash>.asSlice(&record.roots)
+    let mut at = usize.ZERO
+    while at < listedRoots.length {
+      if find(List<ContentHash>.asSlice(&rootKeys), &rootLookup, listedRoots[at]) == usize.MAX {
+        run List<ContentHash>.append(&mut rootKeys, listedRoots[at])
+        run InternIndex.record(&mut rootLookup, hashed(listedRoots[at]))
+      }
+      at = at + usize.ONE
+    }
+    let entries = List<BuildRecord.Entry>.asSlice(&record.entries)
+    let mut mapping = List<usize>.make()
+    at = usize.ZERO
+    while at < entries.length {
+      let entry = &entries[at]
+      if entry.alias != usize.MAX || entry.leaf > EXTERNAL { return refused(b"frontier merge refused: alias or leaf\n") }
+      let mut selected = find(List<ContentHash>.asSlice(&keys), &lookup, entry.exact)
+      if selected == usize.MAX {
+        selected = List<ContentHash>.length(&keys)
+        run List<ContentHash>.append(&mut keys, entry.exact)
+        run InternIndex.record(&mut lookup, hashed(entry.exact))
+        run List<Source>.append(&mut chosen, Source {record: recordAt, entry: at})
+      } else {
+        let prior = &List<Source>.asSlice(&chosen)[selected]
+        let known = &List<BuildRecord.Entry>.asSlice(&records[prior.record].entries)[prior.entry]
+        if entry.leaf != EXTERNAL && known.leaf != EXTERNAL
+          && ((entry.leaf == BuildRecord.FOREIGN && known.leaf != BuildRecord.FOREIGN)
+            || (known.leaf == BuildRecord.FOREIGN && entry.leaf != BuildRecord.FOREIGN)) { return refused(b"frontier merge refused: foreign conflict\n") }
+        if entry.leaf == 0 && known.leaf == 0
+          && !sameDefinition(entries, entry, List<BuildRecord.Entry>.asSlice(&records[prior.record].entries), known) {
+          return refused(b"frontier merge refused: definition conflict\n")
+        }
+        if rank(entry.leaf) > rank(known.leaf) { List<Source>.set(&mut chosen, selected, Source {record: recordAt, entry: at}) }
+      }
+      run List<usize>.append(&mut mapping, selected)
+      at = at + usize.ONE
+    }
+    run List<List<usize>>.append(&mut mappings, move mapping)
+    recordAt = recordAt + usize.ONE
+  }
+  let sources = List<Source>.asSlice(&chosen)
+  let maps = List<List<usize>>.asSlice(&mappings)
+  let mut at = usize.ZERO
+  while at < sources.length {
+    let source = &sources[at]
+    if !open && List<BuildRecord.Entry>.asSlice(&records[source.record].entries)[source.entry].leaf == EXTERNAL {
+      return refused(b"frontier merge refused: external unresolved\n")
+    }
+    at = at + usize.ONE
+  }
+  let mut result = BuildRecord.make(records[usize.ZERO].observing, false)
+  result.guarded = guarded
+  let mut pending = List<Visit>.make()
+  let roots = List<ContentHash>.asSlice(&rootKeys)
+  at = usize.ZERO
+  while at < roots.length {
+    run List<ContentHash>.append(&mut result.roots, roots[at])
+    let entry = find(List<ContentHash>.asSlice(&keys), &lookup, roots[at])
+    if entry == usize.MAX { return refused(b"frontier merge refused: root missing\n") }
+    run List<Visit>.append(&mut pending, Visit {entry: entry, parent: usize.MAX, position: at})
+    at = at + usize.ONE
+  }
+  let mut placed = List<usize>.make()
+  run List<usize>.appendRepeated(&mut placed, usize.MAX, sources.length)
+  while true {
+    let visit = match move List<Visit>.pop(&mut pending) {
+      Option<Visit>.Some {value} => move value
+      Option<Visit>.None => { break }
+    }
+    if List<usize>.get(&placed, visit.entry) != usize.MAX { continue }
+    let source = &sources[visit.entry]
+    let entry = &List<BuildRecord.Entry>.asSlice(&records[source.record].entries)[source.entry]
+    let mapping = List<usize>.asSlice(&maps[source.record])
+    let next = List<BuildRecord.Entry>.length(&result.entries)
+    List<usize>.set(&mut placed, visit.entry, next)
+    let mut references = List<BuildRecord.Reference>.make()
+    let original = List<BuildRecord.Reference>.asSlice(&entry.references)
+    at = usize.ZERO
+    while at < original.length {
+      if original[at].target >= mapping.length { return refused(b"frontier merge refused: target bounds\n") }
+      run List<BuildRecord.Reference>.append(&mut references, BuildRecord.Reference {target: mapping[original[at].target], edge: original[at].edge})
+      at = at + usize.ONE
+    }
+    let callees = List<usize>.asSlice(&entry.facts.callees)
+    at = usize.ZERO
+    while at < callees.length {
+      if callees[at] >= original.length { return refused(b"frontier merge refused: callee bounds\n") }
+      at = at + usize.ONE
+    }
+    run List<BuildRecord.Entry>.append(&mut result.entries, BuildRecord.Entry {
+      exact: entry.exact, hash: entry.hash, family: entry.family, declaration: run Bytes.copy(Bytes.asSlice(&entry.declaration)),
+      parent: visit.parent, position: visit.position, requested: false, alias: usize.MAX, leaf: entry.leaf,
+      references: move references, summary: entry.summary, facts: run BuildRecord.copyFacts(&entry.facts)})
+    at = original.length
+    while at > usize.ZERO {
+      at = at - usize.ONE
+      run List<Visit>.append(&mut pending, Visit {entry: mapping[original[at].target], parent: next, position: at})
+    }
+  }
+  let entries = List<BuildRecord.Entry>.asMutSlice(&mut result.entries)
+  at = usize.ZERO
+  while at < entries.length {
+    let references = List<BuildRecord.Reference>.asMutSlice(&mut entries[at].references)
+    let mut reference = usize.ZERO
+    while reference < references.length {
+      let target = List<usize>.get(&placed, references[reference].target)
+      if target == usize.MAX { return refused(b"frontier merge refused: unplaced target\n") }
+      references[reference].target = target
+      reference = reference + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return Option<BuildRecord.Record>.some(move result)
+}
+
+/// Every unresolved body of the provisional graph, deduplicated by its definition identity.
+/// Completing all leaves also completes callbacks discovered behind a different worker's cut.
+pub effect fn missingBodies(record: &BuildRecord.Record) -> List<ContentHash> ! OutOfMemoryError ? &mut Allocator {
+  let entries = List<BuildRecord.Entry>.asSlice(&record.entries)
+  let mut missing = List<ContentHash>.make()
+  let mut lookup = InternIndex.make()
+  let mut at = usize.ZERO
+  while at < entries.length {
+    if entries[at].leaf == BuildRecord.LEFT || entries[at].leaf == EXTERNAL {
+      if find(List<ContentHash>.asSlice(&missing), &lookup, entries[at].exact) == usize.MAX {
+        run InternIndex.record(&mut lookup, hashed(entries[at].exact))
+        run List<ContentHash>.append(&mut missing, entries[at].exact)
+      }
+    }
+    at = at + usize.ONE
+  }
+  return move missing
+}
+
+/// Charges every completed MIR definition from a build or escape record. Pattern aliases and
+/// repeated records share the region-erased definition charge. Missing old-cache cost metadata
+/// returns false. Failed imports roll back all charges, so the live walk can reproduce its exact
+/// resource refusal and authored request site.
+pub effect fn includeBudget(budget: &mut Budget, record: &BuildRecord.Record) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let saved = Budget.checkpoint(&mut budget.*)
+  let result = run Effect.result(includeBudgetEntries(&mut budget.*, record))
+  return match move result {
+    Result<bool, OutOfMemoryError>.Success {value} => {
+      if value { Budget.commit(&mut budget.*, move saved) }
+      else { Budget.rollback(&mut budget.*, move saved) }
+      return value
+    }
+    Result<bool, OutOfMemoryError>.Failure {error} => {
+      Budget.rollback(&mut budget.*, move saved)
+      fail move error
+    }
+  }
+}
+
+effect fn includeBudgetEntries(budget: &mut Budget, record: &BuildRecord.Record) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let entries = List<BuildRecord.Entry>.asSlice(&record.entries)
+  let mut at = usize.ZERO
+  while at < entries.length {
+    let entry = &entries[at]
+    if entry.alias == usize.MAX && entry.leaf == 0 {
+      if u64.bitAnd(entry.facts.flags, BuildRecord.FACT_KNOWN + BuildRecord.FACT_KEY_BYTES)
+        != BuildRecord.FACT_KNOWN + BuildRecord.FACT_KEY_BYTES { return false }
+      let referenceCount = List<BuildRecord.Reference>.length(&entry.references)
+      let mut included = false
+      if u64.bitAnd(entry.facts.flags, BuildRecord.FACT_APPLICATION) != 0 {
+        let declared = Bytes.asSlice(&entry.declaration)
+        let mut reader = StableKey.reader()
+        match move run StableKey.readDeclaration(declared, &mut reader) {
+          Option<DeclarationId>.Some {value} => {
+            included = run Budget.include(&mut budget.*, entry.facts.definition, Option<&DeclarationId>.some(&value), entry.facts.keyBytes, referenceCount)
+          }
+          Option<DeclarationId>.None => { return false }
+        }
+      } else {
+        included = run Budget.include(&mut budget.*, entry.facts.definition, Option<&DeclarationId>.none(), entry.facts.keyBytes, referenceCount)
+      }
+      if !included { return false }
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+/// A finite, closed graph of code definitions. The caller must have transported only clean,
+/// completed MIR captures and must independently prove shared-access escape obligations.
+/// Provider-sensitive definition identity is retained; validity regions remain source proofs.
+pub effect fn finiteClosed(record: &BuildRecord.Record) -> bool ! OutOfMemoryError ? &mut Allocator {
+  if record.patterns { return false }
+  let entries = List<BuildRecord.Entry>.asSlice(&record.entries)
+  let mut keys = List<ContentHash>.make()
+  let mut lookup = InternIndex.make()
+  let mut at = usize.ZERO
+  while at < entries.length {
+    let entry = &entries[at]
+    if entry.alias != usize.MAX || (entry.leaf != 0 && entry.leaf != BuildRecord.FOREIGN) { return false }
+    if u64.bitAnd(entry.facts.flags, BuildRecord.FACT_KNOWN) == 0 { return false }
+    if u64.bitAnd(entry.facts.flags, BuildRecord.FACT_APPLICATION) != 0
+      && u64.bitAnd(entry.facts.flags, BuildRecord.FACT_CLOSED) == 0 { return false }
+    let references = List<BuildRecord.Reference>.asSlice(&entry.references)
+    if entry.leaf == 0 && u64.bitAnd(entry.facts.flags, BuildRecord.FACT_SUMMARIZED) == 0 { return false }
+    if entry.leaf == BuildRecord.FOREIGN && references.length != usize.ZERO { return false }
+    let mut reference = usize.ZERO
+    while reference < references.length {
+      if references[reference].target >= entries.length { return false }
+      reference = reference + usize.ONE
+    }
+    if find(List<ContentHash>.asSlice(&keys), &lookup, entry.exact) != usize.MAX { return false }
+    run List<ContentHash>.append(&mut keys, entry.exact)
+    run InternIndex.record(&mut lookup, hashed(entry.exact))
+    at = at + usize.ONE
+  }
+  let roots = List<ContentHash>.asSlice(&record.roots)
+  at = usize.ZERO
+  while at < roots.length {
+    if find(List<ContentHash>.asSlice(&keys), &lookup, roots[at]) == usize.MAX { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+/// Proves that no access callback reaches an escape through direct calls in the union. Missing
+/// call facts or a possible escape request a serial diagnostic walk. The caller must have
+/// completed all frontier and bounded callbacks.
+pub effect fn escapeFree(record: &BuildRecord.Record) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let entries = List<BuildRecord.Entry>.asSlice(&record.entries)
+  let mut keys = List<ContentHash>.make()
+  let mut owners = List<usize>.make()
+  let mut lookup = InternIndex.make()
+  let mut at = usize.ZERO
+  while at < entries.length {
+    if entries[at].leaf == EXTERNAL { return false }
+    if entries[at].leaf == 0 && u64.bitAnd(entries[at].facts.flags, BuildRecord.FACT_KNOWN + BuildRecord.FACT_SUMMARIZED)
+      != BuildRecord.FACT_KNOWN + BuildRecord.FACT_SUMMARIZED { return false }
+    run List<ContentHash>.append(&mut keys, entries[at].facts.definition)
+    run List<usize>.append(&mut owners, at)
+    run InternIndex.record(&mut lookup, hashed(entries[at].facts.definition))
+    if u64.bitAnd(entries[at].facts.flags, BuildRecord.FACT_BARE) != 0 {
+      run List<ContentHash>.append(&mut keys, entries[at].facts.bare)
+      run List<usize>.append(&mut owners, at)
+      run InternIndex.record(&mut lookup, hashed(entries[at].facts.bare))
+    }
+    at = at + usize.ONE
+  }
+  let mut pending = List<usize>.make()
+  let mut queued = List<bool>.make()
+  run List<bool>.appendRepeated(&mut queued, false, entries.length)
+  at = usize.ZERO
+  while at < entries.length {
+    let callbacks = List<ContentHash>.asSlice(&entries[at].facts.callbacks)
+    let mut callback = usize.ZERO
+    while callback < callbacks.length {
+      let mut named = InternIndex.first(&lookup, hashed(callbacks[callback]))
+      let mut found = false
+      while named != usize.MAX {
+        if ContentHash.equals(List<ContentHash>.get(&keys, named), callbacks[callback]) {
+          let target = List<usize>.get(&owners, named)
+          found = true
+          if !List<bool>.get(&queued, target) {
+            List<bool>.set(&mut queued, target, true)
+            run List<usize>.append(&mut pending, target)
+          }
+        }
+        named = InternIndex.after(&lookup, named)
+      }
+      if !found { return false }
+      callback = callback + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  let mut head = usize.ZERO
+  while head < List<usize>.length(&pending) {
+    let target = List<usize>.get(&pending, head)
+    head = head + usize.ONE
+    let entry = &entries[target]
+    if entry.leaf == BuildRecord.LEFT { return false }
+    if u64.bitAnd(entry.facts.flags, BuildRecord.FACT_ESCAPES) != 0 { return false }
+    if entry.leaf == BuildRecord.FOREIGN { continue }
+    if u64.bitAnd(entry.facts.flags, BuildRecord.FACT_CALLEES) == 0 { return false }
+    let references = List<BuildRecord.Reference>.asSlice(&entry.references)
+    let callees = List<usize>.asSlice(&entry.facts.callees)
+    let mut callee = usize.ZERO
+    while callee < callees.length {
+      if callees[callee] >= references.length { return false }
+      let called = references[callees[callee]].target
+      if called >= entries.length { return false }
+      if !List<bool>.get(&queued, called) {
+        List<bool>.set(&mut queued, called, true)
+        run List<usize>.append(&mut pending, called)
+      }
+      callee = callee + usize.ONE
+    }
+  }
+  return true
+}
+
+fn exampleKey(id: u64) -> ContentHash { return ContentHash {high: 0, low: id} }
+
+effect fn exampleEntry(id: u64, leaf: u64, targets: &[usize]) -> BuildRecord.Entry ! OutOfMemoryError ? &mut Allocator {
+  let mut references = List<BuildRecord.Reference>.make()
+  let mut at = usize.ZERO
+  while at < targets.length {
+    run List<BuildRecord.Reference>.append(&mut references, BuildRecord.Reference {target: targets[at], edge: exampleKey(0)})
+    at = at + usize.ONE
+  }
+  let mut facts = BuildRecord.unknownFacts()
+  facts.definition = exampleKey(id)
+  facts.flags = BuildRecord.FACT_KNOWN + BuildRecord.FACT_SUMMARIZED + BuildRecord.FACT_CALLEES + BuildRecord.FACT_KEY_BYTES
+  facts.keyBytes = 1
+  at = usize.ZERO
+  while at < targets.length {
+    run List<usize>.append(&mut facts.callees, at)
+    at = at + usize.ONE
+  }
+  return BuildRecord.Entry {exact: exampleKey(id), hash: id, family: id, declaration: Bytes.make(), parent: usize.MAX,
+    position: usize.ZERO, requested: false, alias: usize.MAX, leaf: leaf, references: move references,
+    summary: exampleKey(id), facts: move facts}
+}
+
+effect fn fragmentClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut first = BuildRecord.make(false, false)
+  run List<ContentHash>.append(&mut first.roots, exampleKey(1))
+  run List<BuildRecord.Entry>.append(&mut first.entries, run exampleEntry(1, 0, &[1, 2]))
+  run List<BuildRecord.Entry>.append(&mut first.entries, run exampleEntry(2, 0, &[2]))
+  run List<BuildRecord.Entry>.append(&mut first.entries, run exampleEntry(3, EXTERNAL, &[]))
+  let mut second = BuildRecord.make(false, false)
+  run List<ContentHash>.append(&mut second.roots, exampleKey(1))
+  run List<BuildRecord.Entry>.append(&mut second.entries, run exampleEntry(1, 0, &[2, 1]))
+  run List<BuildRecord.Entry>.append(&mut second.entries, run exampleEntry(3, 0, &[2]))
+  run List<BuildRecord.Entry>.append(&mut second.entries, run exampleEntry(2, EXTERNAL, &[]))
+  let mut records = List<BuildRecord.Record>.make()
+  run List<BuildRecord.Record>.append(&mut records, move first)
+  let incomplete = run merge(List<BuildRecord.Record>.asSlice(&records))
+  run Testing.expect(match &incomplete { Option<BuildRecord.Record>.None => true _ => false }, "an unresolved frontier cannot establish a complete walk")
+  run List<BuildRecord.Record>.append(&mut records, move second)
+  let combined = run merge(List<BuildRecord.Record>.asSlice(&records))
+  if let Option<BuildRecord.Record>.Some {value} = move combined {
+    let mut joined = move value
+    let entries = List<BuildRecord.Entry>.asSlice(&joined.entries)
+    run Testing.expect(entries.length == 3 && ContentHash.equals(entries[1].exact, exampleKey(2))
+      && ContentHash.equals(entries[2].exact, exampleKey(3)) && entries[1].parent == 0 && entries[2].parent == 1,
+      "fragment-local indexes become deterministic DFS parents")
+    run Testing.expect(List<BuildRecord.Reference>.asSlice(&entries[2].references)[0].target == 1,
+      "a cross-fragment back edge points to the merged recursive component")
+    run Testing.expect(run escapeFree(&joined), "a complete graph without escape sites is clean")
+    let edited = List<BuildRecord.Entry>.asMutSlice(&mut joined.entries)
+    edited[0].facts.flags = u64.bitOr(edited[0].facts.flags, BuildRecord.FACT_ACCESSES)
+    run List<ContentHash>.append(&mut edited[0].facts.callbacks, exampleKey(2))
+    edited[2].facts.flags = u64.bitOr(edited[2].facts.flags, BuildRecord.FACT_ESCAPES)
+    run Testing.expect(!run escapeFree(&joined), "a callback in one fragment reaches an escape from another fragment")
+    let indirect = List<BuildRecord.Entry>.asMutSlice(&mut joined.entries)
+    List<usize>.clear(&mut indirect[1].facts.callees)
+    run Testing.expect(run escapeFree(&joined), "an indirect reference does not invoke an escape during a held access")
+  } else {
+    run Testing.expect(false, "complementary fragments resolve each other's frontier")
+  }
+}
+
+effect fn finalCalleeClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut record = BuildRecord.make(false, false)
+  run List<ContentHash>.append(&mut record.roots, exampleKey(2))
+  run List<BuildRecord.Entry>.append(&mut record.entries, run exampleEntry(1, 0, &[]))
+  let mut targets = List<usize>.make()
+  run List<usize>.appendRepeated(&mut targets, usize.ZERO, 41)
+  run List<BuildRecord.Entry>.append(&mut record.entries, run exampleEntry(2, 0, List<usize>.asSlice(&targets)))
+  let entries = List<BuildRecord.Entry>.asMutSlice(&mut record.entries)
+  List<usize>.clear(&mut entries[1].facts.callees)
+  run List<usize>.append(&mut entries[1].facts.callees, 40)
+  let encoded = run BuildRecord.encode(&record)
+  if let Option<BuildRecord.Record>.Some {value} = move run BuildRecord.decode(Bytes.asSlice(&encoded)) {
+    let lastEntry = &List<BuildRecord.Entry>.asSlice(&value.entries)[1]
+    run Testing.expect(List<usize>.length(&lastEntry.facts.callees) == 1 && List<usize>.get(&lastEntry.facts.callees, 0) == 40,
+      "the final entry preserves a direct callee near the end of its reference list")
+  } else { run Testing.expect(false, "a final direct callee index is not a remaining byte count") }
+  let invalid = List<BuildRecord.Entry>.asMutSlice(&mut record.entries)
+  List<usize>.set(&mut invalid[1].facts.callees, 0, 41)
+  let malformed = run BuildRecord.encode(&record)
+  let decoded = run BuildRecord.decode(Bytes.asSlice(&malformed))
+  run Testing.expect(match &decoded { Option<BuildRecord.Record>.None => true _ => false },
+    "direct callee positions must refer to the entry's reference list")
+}
+
+effect fn finiteExample(count: usize) -> BuildRecord.Record ! OutOfMemoryError ? &mut Allocator {
+  let mut record = BuildRecord.make(false, false)
+  run List<ContentHash>.append(&mut record.roots, exampleKey(1))
+  let mut at = usize.ZERO
+  while at < count {
+    let mut entry = run exampleEntry(usize.toU64(at + usize.ONE), 0, &[])
+    entry.facts.flags = u64.bitOr(entry.facts.flags, BuildRecord.FACT_APPLICATION)
+    if at + usize.ONE < count {
+      run List<BuildRecord.Reference>.append(&mut entry.references, BuildRecord.Reference {target: at + usize.ONE, edge: exampleKey(0)})
+      run List<usize>.append(&mut entry.facts.callees, 0)
+    }
+    run List<BuildRecord.Entry>.append(&mut record.entries, move entry)
+    at = at + usize.ONE
+  }
+  return move record
+}
+
+effect fn closureBodyClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut original = BuildRecord.make(false, false)
+  run List<ContentHash>.append(&mut original.roots, exampleKey(1))
+  run List<BuildRecord.Entry>.append(&mut original.entries, run exampleEntry(1, 0, &[1, 1]))
+  run List<BuildRecord.Entry>.append(&mut original.entries, run exampleEntry(2, BuildRecord.LEFT, &[]))
+  let missing = run missingBodies(&original)
+  run Testing.expect(List<ContentHash>.length(&missing) == 1
+    && ContentHash.equals(List<ContentHash>.get(&missing, 0), exampleKey(2)),
+    "repeated references to an omitted body produce one closure request")
+  run Testing.expect(!run finiteClosed(&original), "an omitted body is not a complete finite graph")
+  let mut extension = BuildRecord.make(false, false)
+  run List<ContentHash>.append(&mut extension.roots, exampleKey(2))
+  run List<BuildRecord.Entry>.append(&mut extension.entries, run exampleEntry(2, 0, &[1]))
+  run List<BuildRecord.Entry>.append(&mut extension.entries, run exampleEntry(3, 0, &[]))
+  let mut fragments = List<BuildRecord.Record>.make()
+  run List<BuildRecord.Record>.append(&mut fragments, move original)
+  run List<BuildRecord.Record>.append(&mut fragments, move extension)
+  if let Option<BuildRecord.Record>.Some {value: joined} = move run merge(List<BuildRecord.Record>.asSlice(&fragments)) {
+    let remaining = run missingBodies(&joined)
+    run Testing.expect(List<ContentHash>.length(&remaining) == 0 && (run finiteClosed(&joined)),
+      "a checked extension resolves the omitted body and its reachable successors")
+  } else { run Testing.expect(false, "the extension resolves the previously omitted body") }
+}
+
+effect fn finiteClosureClaims() -> () ! InvalidModulePath | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut record = run finiteExample(2)
+  let entries = List<BuildRecord.Entry>.asMutSlice(&mut record.entries)
+  let declaration = run DeclarationId.fromParts(run ModuleId.make(b"memory", b"finite", b"cycle"), List<OwnerStep>.make())
+  run StableKey.declaration(&mut entries[0].declaration, &declaration)
+  run StableKey.declaration(&mut entries[1].declaration, &declaration)
+  run List<BuildRecord.Reference>.append(&mut entries[1].references, BuildRecord.Reference {target: 0, edge: exampleKey(0)})
+  run List<usize>.append(&mut entries[1].facts.callees, 0)
+  entries[0].facts.flags = u64.bitOr(entries[0].facts.flags, BuildRecord.FACT_CLOSED)
+  entries[1].facts.flags = u64.bitOr(entries[1].facts.flags, BuildRecord.FACT_CLOSED)
+  run Testing.expect(run finiteClosed(&record), "a closed complete finite code graph directly establishes finite specialization")
+  let mut exactBudget = Budget.withLimits(2, 2, 2, 2)
+  run Testing.expect(run includeBudget(&mut exactBudget, &record), "the complete graph is charged by the same budget as live MIR discovery")
+  run Testing.expect(run includeBudget(&mut exactBudget, &record), "replaying the same graph does not consume its allowance twice")
+  let encodedCosts = run BuildRecord.encode(&record)
+  if let Option<BuildRecord.Record>.Some {value: decodedCosts} = move run BuildRecord.decode(Bytes.asSlice(&encodedCosts)) {
+    let mut limited = Budget.withLimits(2, 1, 2, 2)
+    run Testing.expect(!run includeBudget(&mut limited, &decodedCosts), "transport preserves exact body grouping and retained key cost")
+    run Testing.expect(!Budget.exhausted(&limited) && Budget.definitionCount(&limited) == usize.ZERO,
+      "a failed record import leaves the live walk a clean budget for its own refusal site")
+  } else { run Testing.expect(false, "key cost metadata must roundtrip") }
+
+  let escaped = List<BuildRecord.Entry>.asMutSlice(&mut record.entries)
+  run List<ContentHash>.append(&mut escaped[0].facts.callbacks, exampleKey(2))
+  escaped[1].facts.flags = u64.bitOr(escaped[1].facts.flags, BuildRecord.FACT_ESCAPES)
+  run Testing.expect(run finiteClosed(&record), "finite specialization does not erase separate semantic obligations")
+  run Testing.expect(!run escapeFree(&record), "a finite graph still refuses callback escapes")
+  let partial = List<BuildRecord.Entry>.asMutSlice(&mut record.entries)
+  partial[1].leaf = EXTERNAL
+  List<BuildRecord.Reference>.clear(&mut partial[1].references)
+  List<usize>.clear(&mut partial[1].facts.callees)
+  run Testing.expect(!run finiteClosed(&record), "an unresolved external cut cannot prove a finite reachable graph")
+  let missing = run missingBodies(&record)
+  run Testing.expect(List<ContentHash>.length(&missing) == 1 && ContentHash.equals(List<ContentHash>.get(&missing, 0), exampleKey(2)),
+    "full closure requests the omitted definition")
+  let mut fragments = List<BuildRecord.Record>.make()
+  run List<BuildRecord.Record>.append(&mut fragments, move record)
+  if let Option<BuildRecord.Record>.Some {value: open} = move run mergeOpen(List<BuildRecord.Record>.asSlice(&fragments)) {
+    run Testing.expect(!run finiteClosed(&open), "a provisional union retains unresolved external leaves")
+  } else { run Testing.expect(false, "a provisional merge must support graph extension") }
+  let mut unclosed = run finiteExample(1)
+  let declaredUnclosed = List<BuildRecord.Entry>.asMutSlice(&mut unclosed.entries)
+  run StableKey.declaration(&mut declaredUnclosed[0].declaration, &declaration)
+  run Testing.expect(!run finiteClosed(&unclosed), "every reached runtime application must carry closedness evidence")
+  let unclosedEntries = List<BuildRecord.Entry>.asMutSlice(&mut unclosed.entries)
+  unclosedEntries[0].facts.flags = BuildRecord.FACT_KNOWN + BuildRecord.FACT_APPLICATION + BuildRecord.FACT_CLOSED + BuildRecord.FACT_KEY_BYTES
+  run Testing.expect(!run finiteClosed(&unclosed), "closed keys alone cannot replace completed checked MIR bodies")
+}
+
+test effect fn frontierFiniteGraphsRetainClosureAndSemanticObligations() -> () ! InvalidModulePath | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run finiteClosureClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn frontierGraphExtensionRequiresCompleteBodies() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run closureBodyClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn frontierFragmentsRemapCyclesAndFindCrossWorkerEscapes() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run fragmentClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+  run finalCalleeClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}

@@ -321,16 +321,14 @@ semantic analysis could not close.
 [instance discovery](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Instances.ts),
 [specialization identity](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Specialization.ts).
 
-### GEN-006 — Recursive generic calls cannot grow a new type argument chain
+### GEN-006 — Recursive generic calls must form a finite specialization graph
 
 **Status:** Confirmed
 
-A recursively reachable call normally reuses its current concrete generic arguments. Any recursive
-call, direct or through an interface witness, may instead move a type argument into the owned
-structure of the earlier one while other type arguments remain fixed or descend. A concrete
-interface witness may also delegate through a bounded helper to another concrete specialization
-when its type arguments do not grow. Hidden Effect identities may differ on a strict descent. These
-routes keep specialization finite.
+A reachable generic application must have concrete type arguments, static arguments, witnesses,
+and Effect requirements. Recursive calls may change those arguments when the complete reachable
+specialization graph is finite. An edge back to an existing application reuses that specialization;
+it does not require another copy of the function. Runtime recursion itself need not terminate.
 
 ```silk,ignore
 fn walk<T>(value: T, remaining: i32) -> T {
@@ -341,64 +339,38 @@ fn walk<T>(value: T, remaining: i32) -> T {
 }
 ```
 
-The recursive call reuses the same `walk<T>` specialization. A concrete witness can also call a
-bounded helper at a smaller or equally sized concrete type, such as `decodeOne<Outer>()` delegating
-to `decodeOne<i32>()`. An Effect witness can delegate from a concrete aggregate to its field type
-even when its hidden Effect identity changes. The reachable type shapes remain finite.
+This function has one specialization for each reachable concrete `T`, regardless of the runtime
+value of `remaining`. Mutual recursion and recursion through generic helpers follow the same
+rule. A cycle such as `visit<Node> → visit<Box<Node>> → visit<Node>` contains two specializations
+and is permitted when both bodies are otherwise valid.
 
-A `Drop` hook that cleanup selects is such a witness. When dropping a `Box<State<i32>>` frees a
-`Box<Node<i32>>` that `State<i32>` reached through a raw pointer, `Box<T>.drop` runs again at a type
-no larger than before, so the second drop is admitted even though `Node<i32>` is not part of
-`State<i32>`.
+The graph includes every reachable lowered call, concrete interface witness, provider-selected
+operation, callable body, and cleanup or `Drop` hook. Both arms of a runtime conditional contribute
+edges. Static evaluation may remove an arm before specialization discovery; a runtime condition
+cannot establish that an otherwise growing specialization chain is finite.
 
-A recursive application may change a type argument to a type that lies within the owned structure
-of the earlier one: a part of it, a field or variant payload of it, a field of one of its fields,
-or a part of such a type. The earlier application is the nearest active application of the same
-function. `Debug` for `Option<Line>` calls the generic helper `Format.debugField` for a `Line`;
-when `Line` writes its field `weight: Option<i32>`, the same helper runs for `Option<i32>`, which
-lies inside `Line`. Ordinary generic calls descend the same way, which lets reflection walk nested
-types:
+Each application must still pass the ordinary typing, conformance, ownership, lifetime, and Effect
+checks. Sharing a runtime code definition across lifetime-equivalent applications does not waive
+checks at their call sites. Different concrete providers remain part of specialization identity.
 
-```silk,ignore
-fn count<T>() -> i32 {
-  let mut total = 1
-  static for field in Reflect.fields<T>() {
-    total = total + visit(field)
-  }
-  return total
-}
+**Boundary:** Compilation succeeds only after all reachable work is complete and all graph edges
+resolve to checked applications. For example, an unconditional `grow<T>` call to `grow<Box<T>>`
+continually creates new specializations and cannot produce a completed finite graph. A changing
+static argument can instead make such a chain finite when static evaluation removes the recursive
+call at a concrete stopping value.
 
-fn visit<Owner, Sub>(static field: Intrinsic.Field<Owner, Option<Sub>>) -> i32 {
-  return count<Sub>()
-}
-```
+The compiler applies resource limits to specialization discovery and type construction. A finite
+graph can exceed those limits; such a refusal means the compiler did not establish the graph
+within its resources, not that it proved the graph infinite. Serial and parallel compilation apply
+the same acceptance rules. Incomplete discovery is never reusable evidence of successful checking.
 
-`count<Root>` reaches `count<Branch>` when `Root` has a field `branch: Option<Branch>`. Static
-arguments may change along such a descent. The owned structure of a type is finite, because a
-declaration unfolds beneath itself only at a strictly smaller application, and a descent may not
-return to an active application whose type arguments it repeats, so these re-entries stay finite.
-A recursive type such as `Node { next: Option<Box<Node>> }` admits `count<Box<Node>>` below
-`count<Node>`, and refuses the step back to `count<Node>`.
+**Diagnostics:** An unresolved application reports the responsible call or escaping callable.
+Resource exhaustion reports that the specialization graph could not be established within the
+limit, with the relevant application and request location. Other errors retain their ordinary
+typing, ownership, lifetime, and Effect diagnostics.
 
-**Boundary:** Ordinary polymorphic recursion that changes a type argument to a type outside the
-owned structure of the earlier one is outside the stable model, even when the new type is no larger.
-Witness delegation that grows a type argument along a recursive call cycle is also invalid:
-
-```silk,ignore
-fn grow<T>(value: T) -> i32 {
-  return grow<Box<T>>(Box<T> { value: move value })
-}
-```
-
-Each step would require another specialization and no finite static family follows from the source.
-Mutual recursion is subject to the same rule across the complete cycle.
-
-**Diagnostics:** A disallowed recursive call reports a polymorphic-recursion diagnostic at that
-call and shows the current and requested applications. It must be rejected before instance
-discovery recursively expands the family.
-
-**Evidence:** runtime specialization requirement,
-[generic instance discovery](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Instances.ts).
+**Evidence:** Native specialization graph discovery and structured finite-cycle, growing-chain,
+cleanup, provider, and lifetime regression tests.
 
 ### GEN-007 — Struct construction infers omitted arguments from supplied fields
 
