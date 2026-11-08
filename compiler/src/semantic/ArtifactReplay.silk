@@ -1,0 +1,161 @@
+//! Exact selected-instance paths for replaying a retained worker build after a source edit.
+//! A definition's chosen MIR must be the actual key reached by its recorded incoming edge.
+import semantic.BuildRecord
+import semantic.ContentHash {ContentHash}
+import semantic.DigestSet {DigestSet}
+import semantic.DigestSet
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.core.option {Option}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.usize
+
+struct Visit {source: usize, parent: usize, position: usize, requested: bool}
+
+fn body(records: &[BuildRecord.Record], source: usize) -> &BuildRecord.Entry {
+  return &List<BuildRecord.Entry>.asSlice(&records[source].entries)[0]
+}
+
+effect fn copied(entry: &BuildRecord.Entry, parent: usize, position: usize, requested: bool, alias: usize) -> BuildRecord.Entry
+! OutOfMemoryError ? &mut Allocator {
+  return BuildRecord.Entry {exact: entry.exact, hash: entry.hash, family: entry.family,
+    declaration: run Bytes.copy(Bytes.asSlice(&entry.declaration)), parent: parent, position: position,
+    requested: requested, alias: alias, leaf: if alias == usize.MAX { entry.leaf } else { 0 },
+    references: List<BuildRecord.Reference>.make(), summary: entry.summary, facts: run BuildRecord.copyFacts(&entry.facts)}
+}
+
+// A selected exact key can only be reconstructed from a matching real incoming edge. Other
+// patterns of that definition become aliases; they cannot silently choose a different MIR.
+effect fn enqueue(records: &[BuildRecord.Record], definitions: &DigestSet, exact: ContentHash, definition: ContentHash,
+  parent: usize, position: usize, requested: bool, queue: &mut List<Visit>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let selected = DigestSet.find(definitions, definition)
+  if selected != usize.MAX && ContentHash.equals(body(records, selected).exact, exact) {
+    run List<Visit>.append(&mut queue.*, Visit {source: selected, parent: parent, position: position, requested: requested})
+  }
+}
+
+/// Builds an ordinary exact-pattern record from one selected full body per definition.
+/// Every selected body must have a real root, MIR-reference or requested NonParking path;
+/// references to another exact pattern share its selected definition through explicit aliases.
+/// No cache dependencies are manufactured here: the caller must separately import each full
+/// body's validated MIR and emission roots before publishing this record.
+pub effect fn capture(records: &[BuildRecord.Record], roots: &[ContentHash], observing: bool) -> Option<BuildRecord.Record>
+! OutOfMemoryError ? &mut Allocator {
+  let mut definitions = DigestSet.make()
+  let mut exacts = DigestSet.make()
+  let mut at = usize.ZERO
+  while at < records.length {
+    let record = &records[at]
+    let entries = List<BuildRecord.Entry>.asSlice(&record.entries)
+    if !record.patterns || record.observing != observing || record.guarded || entries.length == usize.ZERO
+      || entries[0].alias != usize.MAX || entries[0].leaf != 0
+      || !(run DigestSet.add(&mut definitions, entries[0].facts.definition))
+      || !(run DigestSet.add(&mut exacts, entries[0].exact)) { return Option<BuildRecord.Record>.none() }
+    let references = List<BuildRecord.Reference>.asSlice(&entries[0].references)
+    let mut reference = usize.ZERO
+    while reference < references.length {
+      if references[reference].target >= entries.length { return Option<BuildRecord.Record>.none() }
+      let target = &entries[references[reference].target]
+      if target.alias != usize.MAX || (references[reference].target != usize.ZERO && target.leaf != 3) {
+        return Option<BuildRecord.Record>.none()
+      }
+      reference = reference + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  let mut result = BuildRecord.make(observing, true)
+  let mut queue = List<Visit>.make()
+  at = usize.ZERO
+  while at < roots.length {
+    let source = DigestSet.find(&exacts, roots[at])
+    if source == usize.MAX { return Option<BuildRecord.Record>.none() }
+    run List<ContentHash>.append(&mut result.roots, roots[at])
+    run List<Visit>.append(&mut queue, Visit {source: source, parent: usize.MAX, position: at, requested: false})
+    at = at + usize.ONE
+  }
+  let mut placed = List<usize>.make()
+  run List<usize>.appendRepeated(&mut placed, usize.MAX, records.length)
+  let mut order = List<usize>.make()
+  let mut head = usize.ZERO
+  while head < List<Visit>.length(&queue) {
+    let visit = &List<Visit>.asSlice(&queue)[head]
+    let source = visit.source
+    let parent = visit.parent
+    let position = visit.position
+    let requested = visit.requested
+    head = head + usize.ONE
+    if List<usize>.get(&placed, source) != usize.MAX { continue }
+    let entry = body(records, source)
+    let index = List<BuildRecord.Entry>.length(&result.entries)
+    List<usize>.set(&mut placed, source, index)
+    run List<usize>.append(&mut order, source)
+    run List<BuildRecord.Entry>.append(&mut result.entries, run copied(entry, parent, position, requested, usize.MAX))
+    let entries = List<BuildRecord.Entry>.asSlice(&records[source].entries)
+    let references = List<BuildRecord.Reference>.asSlice(&entry.references)
+    at = usize.ZERO
+    while at < references.length {
+      let target = &entries[references[at].target]
+      run enqueue(records, &definitions, target.exact, target.facts.definition, index, at, false, &mut queue)
+      at = at + usize.ONE
+    }
+    let obligations = List<BuildRecord.Obligation>.asSlice(&entry.facts.obligations)
+    let mut obligation = usize.ZERO
+    let mut requestedPosition = usize.ZERO
+    while obligation < obligations.length {
+      let callees = List<BuildRecord.Callee>.asSlice(&obligations[obligation].callees)
+      let mut callee = usize.ZERO
+      while callee < callees.length {
+        if obligations[obligation].exact {
+          run enqueue(records, &definitions, callees[callee].exact, callees[callee].definition,
+            index, requestedPosition, true, &mut queue)
+        }
+        requestedPosition = requestedPosition + usize.ONE
+        callee = callee + usize.ONE
+      }
+      obligation = obligation + usize.ONE
+    }
+  }
+  if List<usize>.length(&order) != records.length { return Option<BuildRecord.Record>.none() }
+  // Full bodies precede all aliases, so both each path's parent and each alias's definition
+  // precede it. Normal reference cycles remain reference edges, not cyclic parent paths.
+  let mut aliases = DigestSet.make()
+  let mut aliasPositions = List<usize>.make()
+  let sources = List<usize>.asSlice(&order)
+  let mut index = usize.ZERO
+  while index < sources.length {
+    let source = sources[index]
+    let entries = List<BuildRecord.Entry>.asSlice(&records[source].entries)
+    let references = List<BuildRecord.Reference>.asSlice(&entries[0].references)
+    let mut rewritten = List<BuildRecord.Reference>.make()
+    at = usize.ZERO
+    while at < references.length {
+      let target = &entries[references[at].target]
+      let selected = DigestSet.find(&definitions, target.facts.definition)
+      if selected == usize.MAX { return Option<BuildRecord.Record>.none() }
+      let full = body(records, selected)
+      let mut position = List<usize>.get(&placed, selected)
+      if !ContentHash.equals(full.exact, target.exact) {
+        let known = DigestSet.find(&aliases, target.exact)
+        if known != usize.MAX {
+          position = List<usize>.get(&aliasPositions, known)
+          let prior = &List<BuildRecord.Entry>.asSlice(&result.entries)[position]
+          if !ContentHash.equals(prior.facts.definition, target.facts.definition) || prior.hash != target.hash {
+            return Option<BuildRecord.Record>.none()
+          }
+        } else {
+          let alias = run copied(target, index, at, false, position)
+          position = List<BuildRecord.Entry>.length(&result.entries)
+          drop run DigestSet.add(&mut aliases, target.exact)
+          run List<usize>.append(&mut aliasPositions, position)
+          run List<BuildRecord.Entry>.append(&mut result.entries, move alias)
+        }
+      }
+      run List<BuildRecord.Reference>.append(&mut rewritten, BuildRecord.Reference {target: position, edge: references[at].edge})
+      at = at + usize.ONE
+    }
+    let output = List<BuildRecord.Entry>.asMutSlice(&mut result.entries)
+    output[index].references = move rewritten
+    index = index + usize.ONE
+  }
+  return Option<BuildRecord.Record>.some(move result)
+}
