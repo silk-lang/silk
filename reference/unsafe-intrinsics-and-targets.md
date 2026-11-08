@@ -1232,9 +1232,10 @@ build for a target the archive has no `url` for refuses the reference.
 
 The URL is `https://`, or `file:///` for a local mirror. A build that links a package naming an
 archive fetches the whole file once into `$SILK_HOME/archives/<sha256>` (`~/.silk/archives` by
-default), checks its SHA-256 before reading it, and extracts it if it is gzip-compressed or plain
-tar. Extraction writes only directories and regular files, skips links, and refuses a member path
-that is absolute or holds `..`. A later build reuses the extraction while its digest matches, and
+default), checks its SHA-256 before reading it, and extracts it if it is a ZIP archive or a
+gzip-compressed or plain tar archive. Extraction writes only directories and regular files, skips
+links, and refuses a member path that is absolute or holds `..`. A ZIP archive may also not be
+encrypted, span disks, or use a compression method other than stored or DEFLATE. A later build reuses the extraction while its digest matches, and
 `silk check` fetches nothing. With `SILK_OFFLINE` set, a build that needs a missing archive fails
 naming it.
 

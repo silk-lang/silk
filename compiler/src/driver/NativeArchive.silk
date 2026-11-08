@@ -5,10 +5,12 @@
 //! the marker `<store>/<sha256>.fetched` exists; a directory without one is a fetch that stopped
 //! part way and is fetched again. A fetch downloads the whole file over HTTPS (or reads a `file://`
 //! URL, as a local mirror serves it), checks its SHA-256
-//! against the manifest before reading it, and extracts a gzip-compressed or plain tar archive.
-//! Extraction writes only directories and regular files, dropping the archive's `strip` leading
-//! path segments: a member path that is absolute or holds `..` refuses the archive, and links and
-//! other special members are skipped, so nothing is written outside the archive's directory. A
+//! against the manifest before reading it, and extracts a gzip-compressed or plain tar archive, or
+//! a ZIP archive. Extraction writes only directories and regular files, dropping the archive's
+//! `strip` leading path segments: a member path that is absolute or holds `..` refuses the archive,
+//! and links and other special members are skipped, so nothing is written outside the archive's
+//! directory. A ZIP member name with a backslash, a colon, or an empty or `.` segment also refuses
+//! the archive. A
 //! build fetches only the archives its inputs name, and never while `SILK_OFFLINE` is set.
 
 import driver.HostRename
@@ -16,6 +18,7 @@ import driver.NativeLinkInput as NativeLinkInputs {Archive, NativeLinkInput}
 import silk.mem.allocator {Allocator, OutOfMemoryError}
 import silk.collections.bytes {Bytes}
 import silk.core.effect {Effect}
+import silk.compress.zip {ZipError, ZipKind, ZipMember, ZipReader}
 import silk.compress.inflate {DecodeError, Decoder, Format as InflateFormat, Limits as InflateLimits, MEMORY_BOUND as INFLATE_MEMORY_BOUND, Progress, Status as InflateStatus}
 import silk.crypto.sha2 {Sha256}
 static if Intrinsic.targetOperatingSystem() != "wasi" {
@@ -134,25 +137,15 @@ effect fn fetch(archive: &Archive, marker: &Path) -> Option<Bytes>
     return Option<Bytes>.some(run joined(&[b"archive ", name, b" from ", url, b" has SHA-256 ", Bytes.asSlice(&digest), b", but its manifest pins ",
       Bytes.asSlice(&archive.sha256), b"; nothing was extracted"]))
   }
-  let mut tar = Bytes.make()
-  let content = Bytes.asSlice(&body)
-  if content.length >= usize.add(0, 2) && content[usize.ZERO] == 31 && content[usize.ONE] == 139 {
-    tar = match move run gunzip(content) {
-      Option<Bytes>.Some {value} => move value
-      Option<Bytes>.None => { return Option<Bytes>.some(run joined(&[b"archive ", name, b" is not valid gzip"])) }
-    }
-  } else if content.length > usize.add(0, 262) && same(Slice.view<u8>(content, usize.add(0, 257), usize.add(0, 5)), b"ustar") {
-    tar = run Bytes.copy(content)
-  } else {
-    return Option<Bytes>.some(run joined(&[b"archive ", name, b" is neither a gzip-compressed nor a plain tar archive"]))
-  }
-  drop body
   let directory = &archive.directory
   let partial = run Path.fromBytes(Bytes.asSlice(&run joined(&[Path.rawBytes(directory), b".partial"])))
   let cleared = run Effect.result(FileSystem.removeDirectoryRecursively(&partial))
   drop cleared
   run FileSystem.createDirectoriesRecursively(&partial)
-  if let Option<Bytes>.Some {value: refused} = move run extract(Bytes.asSlice(&tar), &partial, archive.strip) {
+  let content = Bytes.asSlice(&body)
+  let refusal = run extractArchive(content, &partial, archive.strip)
+  drop body
+  if let Option<Bytes>.Some {value: refused} = move refusal {
     let removed = run Effect.result(FileSystem.removeDirectoryRecursively(&partial))
     drop removed
     return Option<Bytes>.some(run joined(&[b"cannot extract archive ", name, b": ", Bytes.asSlice(&refused)]))
@@ -163,6 +156,71 @@ effect fn fetch(archive: &Archive, marker: &Path) -> Option<Bytes>
     return Option<Bytes>.some(run joined(&[b"cannot move archive ", name, b" into ", Path.rawBytes(directory)]))
   }
   run FileSystem.writeFile(marker, url)
+  return Option<Bytes>.none()
+}
+
+/// Extracts `content`, a ZIP archive or a gzip-compressed or plain tar archive, into `destination`
+/// (see the module documentation), answering why it was refused, or none.
+pub effect fn extractArchive(content: &[u8], destination: &Path, strip: usize) -> Option<Bytes>
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  // A ZIP archive starts with a local header, or with the end record when it is empty.
+  if content.length >= usize.add(0, 4) && content[usize.ZERO] == 80 && content[usize.ONE] == 75
+    && ((content[usize.add(0, 2)] == 3 && content[usize.add(0, 3)] == 4) || (content[usize.add(0, 2)] == 5 && content[usize.add(0, 3)] == 6)) {
+    return run extractZip(content, destination, strip)
+  }
+  let mut tar = Bytes.make()
+  if content.length >= usize.add(0, 2) && content[usize.ZERO] == 31 && content[usize.ONE] == 139 {
+    tar = match move run gunzip(content) {
+      Option<Bytes>.Some {value} => move value
+      Option<Bytes>.None => { return Option<Bytes>.some(run Bytes.copy(b"it is not valid gzip")) }
+    }
+  } else if content.length > usize.add(0, 262) && same(Slice.view<u8>(content, usize.add(0, 257), usize.add(0, 5)), b"ustar") {
+    tar = run Bytes.copy(content)
+  } else {
+    return Option<Bytes>.some(run Bytes.copy(b"it is neither a gzip-compressed or plain tar archive nor a ZIP archive"))
+  }
+  return run extract(Bytes.asSlice(&tar), destination, strip)
+}
+
+// Extracts the ZIP archive `zip` into `destination`, answering why it was refused, or none.
+effect fn extractZip(zip: &[u8], destination: &Path, strip: usize) -> Option<Bytes>
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let mut reader = match ZipReader.open(zip, MAX_EXTRACTED_BYTES) {
+    Result.Success {value} => move value
+    Result.Failure {error} => { return Option<Bytes>.some(run Bytes.copy(String.utf8Bytes(ZipError.describe(error)))) }
+  }
+  while true {
+    let next = match ZipReader.next(&mut reader) {
+      Result.Success {value} => move value
+      Result.Failure {error} => { return Option<Bytes>.some(run Bytes.copy(String.utf8Bytes(ZipError.describe(error)))) }
+    }
+    let member = match move next {
+      Option<ZipMember>.Some {value} => move value
+      Option<ZipMember>.None => { return Option<Bytes>.none() }
+    }
+    if member.kind != ZipKind.SymbolicLink {
+      let relative = match move run memberPath(member.name, strip) {
+        Result<Option<Bytes>, Bytes>.Success {value} => move value
+        Result<Option<Bytes>, Bytes>.Failure {error} => { return Option<Bytes>.some(move error) }
+      }
+      if let Option<Bytes>.Some {value: below} = move relative {
+        let target = run Path.joinBytes(destination, Bytes.asSlice(&below))
+        if member.kind == ZipKind.Directory {
+          run FileSystem.createDirectoriesRecursively(&target)
+        } else {
+          let decoded = match move run Effect.result(ZipMember.content(&member)) {
+            Result<Bytes, ZipError | OutOfMemoryError>.Success {value} => move value
+            Result<Bytes, ZipError | OutOfMemoryError>.Failure {error} => match move error {
+              ZipError invalid => { return Option<Bytes>.some(run Bytes.copy(String.utf8Bytes(ZipError.describe(invalid)))) }
+              OutOfMemoryError exhausted => { fail move exhausted }
+            }
+          }
+          if let Option<Path>.Some {value: parent} = move run Path.parent(&target) { run FileSystem.createDirectoriesRecursively(&parent) }
+          run FileSystem.writeFile(&target, Bytes.asSlice(&decoded))
+        }
+      }
+    }
+  }
   return Option<Bytes>.none()
 }
 
@@ -342,9 +400,8 @@ effect fn memberPath(path: &[u8], strip: usize) -> Result<Option<Bytes>, Bytes> 
   return Result<Option<Bytes>, Bytes>.succeed(Option<Bytes>.some(move kept))
 }
 
-/// Extracts the tar stream `tar` into `destination` (see the module documentation), answering why
-/// it was refused, or none.
-pub effect fn extract(tar: &[u8], destination: &Path, strip: usize) -> Option<Bytes>
+// Extracts the tar stream `tar` into `destination`, answering why it was refused, or none.
+effect fn extract(tar: &[u8], destination: &Path, strip: usize) -> Option<Bytes>
 ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
   let mut at = usize.ZERO
   let mut longName = Option<Bytes>.none()
