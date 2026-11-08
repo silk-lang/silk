@@ -354,6 +354,46 @@ Returns the name of a named field, as written in the type declaration.
 Use this function only for a field where [`Reflect.fieldKind`](#Reflect.impl.fieldKind) is [`labeledFieldKind`](#labeledFieldKind) or
 [`variantFieldKind`](#variantFieldKind).
 
+<a id="Reflect.impl.fieldDoc"></a>
+
+### Associated function `fieldDoc`
+
+```silk
+pub static fn fieldDoc<Owner, Value>(field: Intrinsic.Field<Owner, Value>) -> string<'static>
+```
+
+Returns the `///` comment written on a named struct field, without its slashes and with its
+lines joined by newlines, or empty text when the field has none.
+
+#### When to use
+
+Read a field's comment where a library shows text about the field, such as the help text of
+the command line option the field fills, so the comment is written once.
+
+#### Gotchas
+
+Editing the comment changes what the program shows, as it would for a string literal. A
+field of a union variant, a positional field and an anonymous field give empty text.
+
+#### Examples
+```silk
+import silk.core.reflect { Reflect }
+
+struct Flags {
+  /// Say more.
+  pub verbose: bool,
+}
+
+pub fn main() -> i32 {
+  static for field in Reflect.fields<Flags>() {
+    static if Reflect.fieldDoc(field) != "Say more." {
+      compileError("the comment is the field's documentation")
+    }
+  }
+  return 0
+}
+```
+
 <a id="Reflect.impl.fieldOrdinal"></a>
 
 ### Associated function `fieldOrdinal`

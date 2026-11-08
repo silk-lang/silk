@@ -351,6 +351,7 @@ kind, and the reflecting declaration's visibility authority are retained.
 | `typeKind(descriptor)`                | `u8`                        | Stable named/positional aggregate-kind code             |
 | `fieldKind(field)`                    | `u8`                        | Stable labeled/positional/variant member-kind code      |
 | `fieldLabel(field)`                   | `string`                    | Label of a labeled or variant field                     |
+| `fieldDoc(field)`                     | `string`                    | The `///` comment of a named struct field, or empty     |
 | `fieldOrdinal(field)`                 | `usize`                     | Position of a positional or variant field               |
 | `borrowField(owner, static field)`    | `&Value`                    | Shared runtime projection authorized by the descriptor  |
 | `borrowFieldMut(owner, static field)` | `&mut Value`                | Mutable runtime projection authorized by the descriptor |
@@ -878,3 +879,33 @@ the call's to check.
 with `SEM0176` at the `functionAs` call, with the static trace that reached it.
 
 **Evidence:** corpus program `static-function-references`.
+
+### STATIC-022 — A static function reads the documentation of a struct field
+
+**Status:** Confirmed
+
+`Reflect.fieldDoc(field)` returns the `///` comment written directly above a named struct field,
+each line without its leading blanks, its three slashes and the space after them, and the lines
+joined by newlines. A field without one gives empty text, and so does an ordinary `//` comment. A
+library can show the comment as help text, so the description of a field is written once.
+
+```silk
+struct Flags {
+  /// Say more.
+  pub verbose: bool,
+}
+
+static fn help() -> string<'static> {
+  let mut all = ""
+  static for field in Reflect.fields<Flags>() {
+    all = StaticText.concat(all, Reflect.fieldDoc(field))
+  }
+  return all
+}
+```
+
+**Boundary:** Only a named struct field has a comment of its own; a positional field, an anonymous
+field and a union variant's field give empty text. Reading the comment makes the program depend on
+the struct's module, so editing the comment rebuilds what reads it.
+
+**Evidence:** corpus program `static-field-documentation`.
