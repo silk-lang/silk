@@ -453,6 +453,7 @@ struct FrontierCoverage { stable: Bytes, concrete: List<DeclarationId> }
 struct ArtifactWarmText { unit: usize, used: bool }
 struct FrontierCacheCapture { stable: Bytes, unit: usize, capture: CapturedBuild }
 struct FrontierMirEvidence { exact: ContentHash, unit: usize }
+struct DeferredFrontierSubset { full: Bytes, selected: Bytes, concrete: List<DeclarationId> }
 
 fn frontierSend(fd: i32, bytes: &[u8]) -> bool {
   let mut at = usize.ZERO
@@ -4548,6 +4549,8 @@ pub struct Semantic {
   artifactCacheEntries: List<ArtifactCacheEntry>,
   artifactCacheDigests: DigestSet,
   artifactWorkers: List<CheckWorker>,
+  deferredFrontierGraph: Option<BuildRecord.Record>,
+  deferredFrontierSubsets: List<DeferredFrontierSubset>,
   artifactCacheRoots: List<usize>,
   artifactRoutes: List<ArtifactJob>,
   artifactRouteDigests: DigestSet,
@@ -94224,6 +94227,8 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
     artifactCacheEntries: List<ArtifactCacheEntry>.make(),
     artifactCacheDigests: DigestSet.make(),
     artifactWorkers: List<CheckWorker>.make(),
+    deferredFrontierGraph: Option<BuildRecord.Record>.none(),
+    deferredFrontierSubsets: List<DeferredFrontierSubset>.make(),
     artifactCacheRoots: List<usize>.make(),
     artifactRoutes: List<ArtifactJob>.make(),
     artifactRouteDigests: DigestSet.make(),
@@ -96959,7 +96964,11 @@ impl Semantic {
         }
       } else { drop run Semantic.adoptImage(&mut self.*, request, Merge.finish(move merge), false) }
       if retainedCacheExperiment() {
-        run Semantic.persistFrontierChecks(&mut self.*, workers, &value, List<FrontierCoverage>.asSlice(&coverage))
+        if self.keepArtifactWorkers {
+          // The same resident workers will add final emission dependencies. Export one image
+          // after that work, retaining this already-proved graph for its check-cache roots.
+          self.deferredFrontierGraph = Option<BuildRecord.Record>.some(move value)
+        } else { run Semantic.persistFrontierChecks(&mut self.*, workers, &value, List<FrontierCoverage>.asSlice(&coverage)) }
       }
       self.frontierCoverage = move coverage
       run frontierTrace(b"adopted", self.frontierSplit, usize.ZERO, usize.ZERO)
@@ -96995,6 +97004,8 @@ impl Semantic {
     self.artifactCacheRoots = List<usize>.make()
     self.frontierSweepChunks = List<SweepFragments.Packet>.make()
     self.frontierCacheCaptures = List<FrontierCacheCapture>.make()
+    self.deferredFrontierGraph = Option<BuildRecord.Record>.none()
+    self.deferredFrontierSubsets = List<DeferredFrontierSubset>.make()
     self.frontierExtensionEvidence = List<FrontierMirEvidence>.make()
     self.frontierExtensionReads = List<usize>.make()
     self.frontierCacheComplete = true
@@ -97398,7 +97409,10 @@ impl Semantic {
           if frontierCovers(List<FrontierCoverage>.asSlice(&self.frontierCoverage), Bytes.asSlice(&stable), concrete, true) {
             if retainedCacheExperiment() {
               if let Option<Bytes>.Some {value: selected} = move run stableUnit(&self.resolver, unit) {
-                run Semantic.persistFrontierSubset(&mut self.*, Bytes.asSlice(&stable), Bytes.asSlice(&selected), concrete)
+                if let Option<BuildRecord.Record>.Some {..} = &self.deferredFrontierGraph {
+                  run List<DeferredFrontierSubset>.append(&mut self.deferredFrontierSubsets, DeferredFrontierSubset {
+                    full: run Bytes.copy(Bytes.asSlice(&stable)), selected: move selected, concrete: run copyDeclarations(concrete)})
+                } else { run Semantic.persistFrontierSubset(&mut self.*, Bytes.asSlice(&stable), Bytes.asSlice(&selected), concrete) }
               }
             }
             run frontierTrace(b"covered runtime exports", self.frontierSplit, module, concrete.length)
@@ -100737,15 +100751,23 @@ impl Semantic {
     // whole runtime frontier before the build's existing validation path can reuse it.
     if let Option<ReplayState>.Some {..} = &self.replay { self.frontierAvailable = false }
     let attempted = run Effect.result(Semantic.buildArtifactHeld(&mut self.*, &mut request.*, runtime, rootPackage, checked, closureNodes))
+    let cached = run Effect.result(Semantic.flushDeferredFrontierCache(&mut self.*))
     stopFrontier(List<CheckWorker>.asSlice(&self.artifactWorkers))
     List<CheckWorker>.clear(&mut self.artifactWorkers)
+    self.deferredFrontierGraph = Option<BuildRecord.Record>.none()
+    self.deferredFrontierSubsets = List<DeferredFrontierSubset>.make()
     if let Option<[*]mut u64>.Some {value} = move self.frontierClaims { drop unsafe FrontierHost.unmapShared(value, frontierClaimBytes) }
     self.frontierClaims = Option<[*]mut u64>.none()
     if let Option<[*]mut u64>.Some {value} = move self.frontierForkControl { drop unsafe FrontierHost.unmapShared(value, 4096) }
     self.frontierForkControl = Option<[*]mut u64>.none()
     self.keepArtifactWorkers = false
     return match move attempted {
-      Result<BackendBuild, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} => move value
+      Result<BackendBuild, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} => {
+        match move cached {
+          Result<(), Cycle | OutOfMemoryError>.Success {..} => move value
+          Result<(), Cycle | OutOfMemoryError>.Failure {error} => { fail move error }
+        }
+      }
       Result<BackendBuild, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} => { fail move error }
     }
   }
@@ -100980,6 +101002,7 @@ impl Semantic {
         return run withUnemittedBodies(move value, List<UncheckedDeclaration>.asSlice(&checked.unchecked))
       }
       run frontierTrace(b"artifact refused", self.frontierSplit, usize.ZERO, usize.ZERO)
+      run Semantic.flushDeferredFrontierCache(&mut self.*)
       stopFrontier(List<CheckWorker>.asSlice(&self.artifactWorkers))
       List<CheckWorker>.clear(&mut self.artifactWorkers)
     }
@@ -110994,21 +111017,46 @@ impl Semantic {
     return Option<usize>.none()
   }
 
-  // Called only after every selected definition has completed emission. The immutable workers
-  // share this source snapshot/profile; the next process validates their exact input leaves.
+  // Export final check and definition evidence together. This is also called before an
+  // unsupported artifact path stops its workers, so a fallback does not lose valid check caches.
   effect fn importArtifactCache(self: &mut Self) -> Option<List<ArtifactImportedRoot>>
-  ! Cycle | OutOfMemoryError ? &mut Allocator {
+  ! Cycle | OutOfMemoryError ? &mut Allocator | &mut Types {
     if self.resolver.revisable || !Graph.recording(&self.resolver.graph) || !self.frontierCacheComplete { return Option<List<ArtifactImportedRoot>>.none() }
     let stamp = run artifactCacheStamp(&self.*)
     let workers = List<CheckWorker>.asSlice(&self.artifactWorkers)
-    let image = match move run fetchFrontierCache(workers, Bytes.asSlice(&stamp)) {
+    let mut image = match move run fetchFrontierCache(workers, Bytes.asSlice(&stamp)) {
       Option<CacheImage.Image>.Some {value} => move value
       Option<CacheImage.Image>.None => { return Option<List<ArtifactImportedRoot>>.none() }
     }
+    let selected = match &self.deferredFrontierGraph {
+      Option<BuildRecord.Record>.Some {value: graph} => run Semantic.completeFrontierChecks(&self.*, &mut image,
+        &graph, List<FrontierCoverage>.asSlice(&self.frontierCoverage))
+      Option<BuildRecord.Record>.None => run artifactCacheSelections(&image, false)
+    }
+    let imported = run Semantic.appendArtifactImage(&mut self.*, &image, List<usize>.asSlice(&selected))
+    if let Option<List<ArtifactImportedRoot>>.Some {..} = &imported {
+      self.deferredFrontierGraph = Option<BuildRecord.Record>.none()
+      while let Option<DeferredFrontierSubset>.Some {value: subset} = move List<DeferredFrontierSubset>.pop(&mut self.deferredFrontierSubsets) {
+        run Semantic.persistFrontierSubset(&mut self.*, Bytes.asSlice(&subset.full), Bytes.asSlice(&subset.selected),
+          List<DeclarationId>.asSlice(&subset.concrete))
+      }
+    }
+    return move imported
+  }
+
+  effect fn flushDeferredFrontierCache(self: &mut Self) -> ()
+  ! Cycle | OutOfMemoryError ? &mut Allocator | &mut Types {
+    if let Option<BuildRecord.Record>.Some {..} = &self.deferredFrontierGraph {
+      if List<CheckWorker>.length(&self.artifactWorkers) > usize.ZERO { drop run Semantic.importArtifactCache(&mut self.*) }
+    }
+    self.deferredFrontierGraph = Option<BuildRecord.Record>.none()
+    self.deferredFrontierSubsets = List<DeferredFrontierSubset>.make()
+  }
+
+  effect fn appendArtifactImage(self: &mut Self, image: &CacheImage.Image, positions: &[usize]) -> Option<List<ArtifactImportedRoot>>
+  ! OutOfMemoryError ? &mut Allocator {
     let roots = List<CacheImage.Root>.asSlice(&image.roots)
-    let selected = run artifactCacheSelections(&image, false)
-    let positions = List<usize>.asSlice(&selected)
-    let base = match move run Semantic.appendFrontierImage(&mut self.*, &image, positions) {
+    let base = match move run Semantic.appendFrontierImage(&mut self.*, image, positions) {
       Option<usize>.Some {value} => value
       Option<usize>.None => { return Option<List<ArtifactImportedRoot>>.none() }
     }
@@ -111384,6 +111432,16 @@ impl Semantic {
       Option<CacheImage.Image>.Some {value} => move value
       Option<CacheImage.Image>.None => { run frontierTrace(b"check cache unavailable", self.frontierSplit, usize.ZERO, usize.ZERO) return () }
     }
+    let selected = run Semantic.completeFrontierChecks(&self.*, &mut image, graph, coverage)
+    drop run Semantic.appendArtifactImage(&mut self.*, &image, List<usize>.asSlice(&selected))
+  }
+
+  // Validates portable records against their exact MIR and root-read evidence before any root
+  // is published. Both check-only and deferred build publication use this one proof path.
+  effect fn completeFrontierChecks(self: &Self, image: &mut CacheImage.Image,
+    graph: &BuildRecord.Record, coverage: &[FrontierCoverage]) -> List<usize>
+  ! OutOfMemoryError ? &mut Allocator | &mut Types {
+    if graph.guarded { return run artifactCacheSelections(&image.*, false) }
     let mut entries = DigestSet.make()
     let mut entryNodes = List<usize>.make()
     let mut readKeys = List<Bytes>.make()
@@ -111467,14 +111525,14 @@ impl Semantic {
       if !complete { noEntries = noEntries + usize.ONE continue }
       // Root/signature reads remain separate from per-MIR validity, just as a normal record's
       // growth guard does. The check root additionally rests on every entry's exact MIR inputs.
-      let recordNode = run CacheImage.addNode(&mut image, List<usize>.asSlice(&reads))
+      let recordNode = run CacheImage.addNode(&mut image.*, List<usize>.asSlice(&reads))
       let encoded = run BuildRecord.encode(&sliced)
       persistedEntries = persistedEntries + members.length
       persistedBytes = persistedBytes + Bytes.asSlice(&encoded).length
       run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: run escapeRecordKey(Bytes.asSlice(&covered.stable)),
         node: recordNode, answer: move encoded})
       run List<usize>.append(&mut dependencies, CacheImage.nodeEdge(recordNode))
-      let checked = run CacheImage.addNode(&mut image, List<usize>.asSlice(&dependencies))
+      let checked = run CacheImage.addNode(&mut image.*, List<usize>.asSlice(&dependencies))
       run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: run Bytes.copy(Bytes.asSlice(&covered.stable)),
         node: checked, answer: run checkAnswer(1, concrete)})
       persisted = persisted + usize.ONE
@@ -111489,20 +111547,12 @@ impl Semantic {
       if !frontierReadKey(Bytes.asSlice(&finalRoots[at].key), &mut named) { run List<usize>.append(&mut selected, at) }
       at = at + usize.ONE
     }
-    let base = match move run Semantic.appendFrontierImage(&mut self.*, &image, List<usize>.asSlice(&selected)) {
-      Option<usize>.Some {value} => value
-      Option<usize>.None => { return () }
-    }
-    at = usize.ZERO
-    while at < List<usize>.length(&selected) {
-      run List<usize>.append(&mut self.artifactCacheRoots, base + at)
-      at = at + usize.ONE
-    }
-    run frontierTrace(b"check cache imported", self.frontierSplit, persisted, List<usize>.length(&selected))
+    run frontierTrace(b"check cache assembled", self.frontierSplit, persisted, List<usize>.length(&selected))
     run frontierTrace(b"check cache records", self.frontierSplit, persistedEntries, persistedBytes)
     run frontierTrace(b"check cache missing reads-roots", self.frontierSplit, noReads, noRoots)
     run frontierTrace(b"check cache missing closure-entries", self.frontierSplit, noClosure, noEntries)
     run frontierTrace(b"check cache unique", self.frontierSplit, List<BuildRecord.Entry>.length(&graph.entries), List<ContentHash>.length(&graph.roots))
+    return move selected
   }
 }
 
