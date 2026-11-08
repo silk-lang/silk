@@ -4519,6 +4519,7 @@ pub struct Semantic {
   carriedRoots: List<usize>,
   // The image the store adopted, which the image it writes next carries checks from.
   heldImage: Option<CacheImage.Image>,
+  heldImageCorrupt: bool,
   // The declaration check roots of the adopted image an unlinked store reused without reading
   // them yet, by the hash of their module's stable key, read when a sweep of their module runs
   // (`readPendingDeclarations`); `usize.MAX` once read.
@@ -94204,6 +94205,7 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
     carriedUnits: List<usize>.make(),
     carriedRoots: List<usize>.make(),
     heldImage: Option<CacheImage.Image>.none(),
+    heldImageCorrupt: false,
     pendingLookup: InternIndex.make(),
     pendingRoots: List<usize>.make(),
     checkRuns: usize.ZERO,
@@ -94948,6 +94950,7 @@ impl Semantic {
     return match move adopted {
       Option<Adopted>.Some {value} => {
         self.heldImage = Option<CacheImage.Image>.some(move held)
+        self.heldImageCorrupt = false
         move value
       }
       Option<Adopted>.None => Adopted {roots: usize.ZERO, stale: usize.ZERO, nodes: usize.ZERO, changedLeaves: usize.ZERO}
@@ -94974,7 +94977,11 @@ impl Semantic {
         read = run CacheImage.readNodes(&mut image)
       }
     }
-    if !read { self.heldImage = Option<CacheImage.Image>.none() }
+    if !read {
+      self.heldImage = Option<CacheImage.Image>.none()
+      // Existing carried indexes must never become indexes into a later appended image.
+      self.heldImageCorrupt = true
+    }
   }
   /// The image the store adopted ([`adoptImage`]), if any.
   pub fn adoptedImage<'a>(self: &'a Self) -> Option<&'a CacheImage.Image> {
@@ -96426,7 +96433,8 @@ impl Semantic {
       declarations: move declarations, namesChecked: start == usize.ZERO, names: move names,
       answer: move answer, record: run BuildRecord.encode(&capture.record)})
     if Graph.recording(&self.resolver.graph) {
-      run Semantic.keepFrontierCacheCapture(&mut self.*, ordinal, unit, move cacheKey, move capture)
+      let reads = if memo.reads == usize.MAX { unit } else { memo.reads }
+      run Semantic.keepFrontierCacheCapture(&mut self.*, ordinal, reads, move cacheKey, move capture)
     }
     run List<FrontierModuleRoster>.append(&mut self.frontierRosters, move roster)
     run frontierTrace(b"declaration chunk", started, self.frontierWorker, start)
@@ -97354,6 +97362,11 @@ impl Semantic {
           declaration: usize.MAX, member: usize.ONE, external: false})
         if let Option<Bytes>.Some {value: stable} = move run stableUnit(&self.resolver, u64.toUsize(full.value)) {
           if frontierCovers(List<FrontierCoverage>.asSlice(&self.frontierCoverage), Bytes.asSlice(&stable), concrete, true) {
+            if retainedCacheExperiment() {
+              if let Option<Bytes>.Some {value: selected} = move run stableUnit(&self.resolver, unit) {
+                run Semantic.persistFrontierSubset(&mut self.*, Bytes.asSlice(&stable), Bytes.asSlice(&selected), concrete)
+              }
+            }
             run frontierTrace(b"covered runtime exports", self.frontierSplit, module, concrete.length)
             return DeclarationCheckResult {rejections: List<Shared<Rejection>>.make(), gaps: List<Shared<BackendGap>>.make(),
               unchecked: List<UncheckedDeclaration>.make()}
@@ -110708,9 +110721,9 @@ effect fn privateFrontierPartitionClaims() -> () ! InvalidModulePath | OutOfMemo
   let mut at = usize.ZERO
   while at < remaining.length {
     match &remaining[at] {
-      BackendVisit.Enter {key, span, module, ..} => {
-        run List<BackendVisit>.append(&mut later, BackendVisit.Enter {key: InstanceKey.copy(key), edge: Edge.Direct,
-          span: Span.make(span.start, span.end), module: ModuleId.copy(module), cleanup: Option<Interned<Type>>.none(), requester: Option<RelatedSite>.none()})
+      BackendVisit.Enter {key, span, module: visitModule, ..} => {
+        run List<BackendVisit>.append(&mut later, BackendVisit.Enter {key: InstanceKey.copy(&key), edge: Edge.Direct,
+          span: Span.make(span.start, span.end), module: ModuleId.copy(&visitModule), cleanup: Option<Interned<Type>>.none(), requester: Option<RelatedSite>.none()})
       }
     }
     run List<VisitOrigin>.append(&mut laterOrigins, VisitOrigin {parent: remainingOrigins[at].parent,
@@ -110948,7 +110961,7 @@ impl Semantic {
   // share this source snapshot/profile; the next process validates their exact input leaves.
   effect fn importArtifactCache(self: &mut Self) -> Option<List<ArtifactImportedRoot>>
   ! Cycle | OutOfMemoryError ? &mut Allocator {
-    if self.resolver.revisable || !Graph.recording(&self.resolver.graph) { return Option<List<ArtifactImportedRoot>>.none() }
+    if self.resolver.revisable || !Graph.recording(&self.resolver.graph) || !self.frontierCacheComplete { return Option<List<ArtifactImportedRoot>>.none() }
     let stamp = run artifactCacheStamp(&self.*)
     let workers = List<CheckWorker>.asSlice(&self.artifactWorkers)
     let image = match move run fetchFrontierCache(workers, Bytes.asSlice(&stamp)) {
@@ -110959,6 +110972,7 @@ impl Semantic {
     let selected = run artifactCacheSelections(&image, false)
     let positions = List<usize>.asSlice(&selected)
     run Semantic.unpackAdoptedImage(&mut self.*)
+    if self.heldImageCorrupt { return Option<List<ArtifactImportedRoot>>.none() }
     if let Option<CacheImage.Image>.None = &self.heldImage { self.heldImage = Option<CacheImage.Image>.some(CacheImage.make()) }
     let mut imported = List<ArtifactImportedRoot>.make()
     if let Option<CacheImage.Image>.Some {value: held} = &mut self.heldImage {
@@ -111130,6 +111144,39 @@ effect fn frontierNonMirReads(resolver: &mut Resolver, module: usize, unit: usiz
   return saved
 }
 
+// A replay's old graph remains justified by its old record guard and its green entry roots.
+// Copy those precise nodes as well as the new non-MIR reads; never replace them by empty evidence.
+effect fn carryFrontierReads(held: &Option<CacheImage.Image>, image: &mut CacheImage.Image, fresh: usize, capture: &CapturedBuild)
+-> Option<usize> ! OutOfMemoryError ? &mut Allocator {
+  let mut selected = List<usize>.make()
+  if capture.carriedRecord != usize.MAX { run List<usize>.append(&mut selected, capture.carriedRecord) }
+  let entries = List<CapturedEntry>.asSlice(&capture.entries)
+  let mut at = usize.ZERO
+  while at < entries.length {
+    if entries[at].carried != usize.MAX { run List<usize>.append(&mut selected, entries[at].carried) }
+    at = at + usize.ONE
+  }
+  if List<usize>.length(&selected) == usize.ZERO { return Option<usize>.some(fresh) }
+  let previous = match &held.* {
+    Option<CacheImage.Image>.Some {value} => &value
+    Option<CacheImage.Image>.None => { return Option<usize>.none() }
+  }
+  let roots = List<CacheImage.Root>.asSlice(&previous.roots)
+  let picked = List<usize>.asSlice(&selected)
+  at = usize.ZERO
+  while at < picked.length {
+    if picked[at] >= roots.length { return Option<usize>.none() }
+    let mut exact = Span.make(usize.ZERO, usize.ZERO)
+    let kind = buildRootKind(Bytes.asSlice(&roots[picked[at]].key), &mut exact)
+    let expected: u64 = if at == usize.ZERO && capture.carriedRecord != usize.MAX { 3 } else { 4 }
+    if kind != expected { return Option<usize>.none() }
+    at = at + usize.ONE
+  }
+  let nodes = run CacheImage.carry(&mut image.*, previous, picked)
+  if capture.carriedRecord == usize.MAX { return Option<usize>.some(fresh) }
+  return Option<usize>.some(run CacheImage.addNode(&mut image.*, &[CacheImage.nodeEdge(fresh), CacheImage.nodeEdge(List<usize>.get(&nodes, usize.ZERO))]))
+}
+
 impl Semantic {
   effect fn keepFrontierCacheCapture(self: &mut Self, module: usize, unit: usize, stable: Bytes, capture: CapturedBuild) -> ()
   ! OutOfMemoryError ? &mut Allocator {
@@ -111144,6 +111191,7 @@ impl Semantic {
 
   effect fn imageFrontierReads(self: &mut Self, build: &mut ImageBuild) -> () ! OutOfMemoryError ? &mut Allocator {
     if self.frontierWorker == usize.MAX || !retainedCacheExperiment() { return () }
+    run Semantic.unpackAdoptedImage(&mut self.*)
     let memos = List<EscapeMemo>.asSlice(&self.escapeMemos)
     let mut at = usize.ZERO
     let mut ordinal = usize.ZERO
@@ -111161,10 +111209,15 @@ impl Semantic {
         Option<Bytes>.None => { self.frontierCacheComplete = false continue }
       }
       let module = List<ScopedKey>.get(&self.resolver.keys, memo.unit).key.module
-      let saved = run frontierNonMirReads(&mut self.resolver, module, memo.unit, capture,
+      let reads = if memo.reads == usize.MAX { memo.unit } else { memo.reads }
+      let saved = run frontierNonMirReads(&mut self.resolver, module, reads, capture,
         List<FrontierCacheCapture>.length(&self.frontierCacheCaptures) + at)
-      let node = run imageUnit(&self.resolver, &mut build.*, saved)
-      if node >= unfit() { self.frontierCacheComplete = false continue }
+      let fresh = run imageUnit(&self.resolver, &mut build.*, saved)
+      if fresh >= unfit() { self.frontierCacheComplete = false continue }
+      let node = match move run carryFrontierReads(&self.heldImage, &mut build.image, fresh, capture) {
+        Option<usize>.Some {value} => value
+        Option<usize>.None => { self.frontierCacheComplete = false continue }
+      }
       run List<CacheImage.Root>.append(&mut build.image.roots, CacheImage.Root {
         key: run frontierReadsKey(Bytes.asSlice(&stable), self.frontierWorker, ordinal), node: node, answer: Bytes.make()})
       ordinal = ordinal + usize.ONE
@@ -111177,8 +111230,12 @@ impl Semantic {
     while at < chunks.length {
       let part = &chunks[at]
       at = at + usize.ONE
-      let node = run imageUnit(&self.resolver, &mut build.*, part.unit)
-      if node >= unfit() { self.frontierCacheComplete = false continue }
+      let fresh = run imageUnit(&self.resolver, &mut build.*, part.unit)
+      if fresh >= unfit() { self.frontierCacheComplete = false continue }
+      let node = match move run carryFrontierReads(&self.heldImage, &mut build.image, fresh, &part.capture) {
+        Option<usize>.Some {value} => value
+        Option<usize>.None => { self.frontierCacheComplete = false continue }
+      }
       let key = run frontierReadsKey(Bytes.asSlice(&part.stable), self.frontierWorker, ordinal)
       run List<CacheImage.Root>.append(&mut build.image.roots, CacheImage.Root {key: run Bytes.copy(Bytes.asSlice(&key)),
         node: node, answer: Bytes.make()})
@@ -111186,14 +111243,12 @@ impl Semantic {
       run imageEscapeRecord(&self.resolver, &mut build.*, &part.capture, Bytes.asSlice(&key), &mut written, &mut named, &mut carried)
       ordinal = ordinal + usize.ONE
     }
-    // A chunk using an adopted record must carry the associated entry roots too. Until this
-    // lane can authenticate those old-image indexes independently, refuse incomplete evidence.
-    if List<usize>.length(&carried) > usize.ZERO { self.frontierCacheComplete = false }
+    // carryFrontierReads copied every adopted record/entry needed by a replayed chunk.
   }
 
   effect fn persistFrontierChecks(self: &mut Self, workers: &[CheckWorker], graph: &BuildRecord.Record, coverage: &[FrontierCoverage]) -> ()
   ! Cycle | OutOfMemoryError ? &mut Allocator | &mut Types {
-    if self.resolver.revisable || graph.guarded { return () }
+    if self.resolver.revisable || graph.guarded || !self.frontierCacheComplete { return () }
     let stamp = run artifactCacheStamp(&self.*)
     let mut image = match move run fetchFrontierCache(workers, Bytes.asSlice(&stamp)) {
       Option<CacheImage.Image>.Some {value} => move value
@@ -111225,6 +111280,8 @@ impl Semantic {
     while at < available.length { drop run DigestSet.add(&mut globalRoots, available[at]) at = at + usize.ONE }
     let mut written = ExactSet.make()
     let mut persisted = usize.ZERO
+    let mut persistedEntries = usize.ZERO
+    let mut persistedBytes = usize.ZERO
     let mut part = usize.ZERO
     while part < coverage.length {
       let covered = &coverage[part]
@@ -111242,14 +111299,17 @@ impl Semantic {
       if List<usize>.length(&reads) == usize.ZERO { continue }
       let mut wanted = List<ContentHash>.make()
       let concrete = List<DeclarationId>.asSlice(&covered.concrete)
+      let mut allRoots = true
       at = usize.ZERO
       while at < concrete.length {
         let identity = run Types.internDeclaration(DeclarationId.copy(&concrete[at]))
         let instance = run InstanceKey.named(&identity)
         let exact = run keyDigest(&instance, false)
-        if DigestSet.find(&globalRoots, exact) != usize.MAX { run List<ContentHash>.append(&mut wanted, exact) }
+        if DigestSet.find(&globalRoots, exact) == usize.MAX { allRoots = false }
+        else { run List<ContentHash>.append(&mut wanted, exact) }
         at = at + usize.ONE
       }
+      if !allRoots { continue }
       let sliced = match move run WalkFragments.rooted(graph, &index, List<ContentHash>.asSlice(&wanted)) {
         Option<BuildRecord.Record>.Some {value} => move value
         Option<BuildRecord.Record>.None => { continue }
@@ -111271,8 +111331,11 @@ impl Semantic {
       // Root/signature reads remain separate from per-MIR validity, just as a normal record's
       // growth guard does. The check root additionally rests on every entry's exact MIR inputs.
       let recordNode = run CacheImage.addNode(&mut image, List<usize>.asSlice(&reads))
+      let encoded = run BuildRecord.encode(&sliced)
+      persistedEntries = persistedEntries + members.length
+      persistedBytes = persistedBytes + Bytes.asSlice(&encoded).length
       run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: run escapeRecordKey(Bytes.asSlice(&covered.stable)),
-        node: recordNode, answer: run BuildRecord.encode(&sliced)})
+        node: recordNode, answer: move encoded})
       run List<usize>.append(&mut dependencies, CacheImage.nodeEdge(recordNode))
       let checked = run CacheImage.addNode(&mut image, List<usize>.asSlice(&dependencies))
       run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: run Bytes.copy(Bytes.asSlice(&covered.stable)),
@@ -111290,6 +111353,7 @@ impl Semantic {
       at = at + usize.ONE
     }
     run Semantic.unpackAdoptedImage(&mut self.*)
+    if self.heldImageCorrupt { return () }
     if let Option<CacheImage.Image>.None = &self.heldImage { self.heldImage = Option<CacheImage.Image>.some(CacheImage.make()) }
     if let Option<CacheImage.Image>.Some {value: held} = &mut self.heldImage {
       let base = List<CacheImage.Root>.length(&held.roots)
@@ -111301,6 +111365,8 @@ impl Semantic {
       }
     }
     run frontierTrace(b"check cache imported", self.frontierSplit, persisted, List<usize>.length(&selected))
+    run frontierTrace(b"check cache records", self.frontierSplit, persistedEntries, persistedBytes)
+    run frontierTrace(b"check cache unique", self.frontierSplit, List<BuildRecord.Entry>.length(&graph.entries), List<ContentHash>.length(&graph.roots))
   }
 }
 
@@ -111351,4 +111417,82 @@ test effect fn frontierCacheSeparatesBodyInputsFromRootReads() -> ()
 ! InvalidModulePath | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run frontierReadSeparationClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+impl Semantic {
+  // The later export-only runtime walk is already covered by the full accepted runtime graph.
+  // Give that distinct cache key its own root slice so the next command can replay it directly.
+  effect fn persistFrontierSubset(self: &mut Self, full: &[u8], selected: &[u8], concrete: &[DeclarationId]) -> ()
+  ! OutOfMemoryError ? &mut Allocator | &mut Types {
+    run Semantic.unpackAdoptedImage(&mut self.*)
+    let recordKey = run escapeRecordKey(full)
+    let mut source = usize.MAX
+    let mut entries = DigestSet.make()
+    let mut nodes = List<usize>.make()
+    if let Option<CacheImage.Image>.Some {value: held} = &self.heldImage {
+      let roots = List<CacheImage.Root>.asSlice(&held.roots)
+      let imported = List<usize>.asSlice(&self.artifactCacheRoots)
+      let mut at = usize.ZERO
+      while at < imported.length {
+        let root = &roots[imported[at]]
+        let key = Bytes.asSlice(&root.key)
+        if same(key, Bytes.asSlice(&recordKey)) { source = imported[at] }
+        let mut exact = Span.make(usize.ZERO, usize.ZERO)
+        if buildRootKind(key, &mut exact) == 4 {
+          if run DigestSet.add(&mut entries, digestOfBytes(StableKey.view(key, exact))) { run List<usize>.append(&mut nodes, root.node) }
+        }
+        at = at + usize.ONE
+      }
+    }
+    if source == usize.MAX { return () }
+    if let Option<CacheImage.Image>.Some {value: held} = &mut self.heldImage {
+      let root = &List<CacheImage.Root>.asSlice(&held.roots)[source]
+      let guard = root.node
+      let graph = match move run BuildRecord.decode(Bytes.asSlice(&root.answer)) {
+        Option<BuildRecord.Record>.Some {value} => move value
+        Option<BuildRecord.Record>.None => { return () }
+      }
+      let mut available = DigestSet.make()
+      let originalRoots = List<ContentHash>.asSlice(&graph.roots)
+      let mut at = usize.ZERO
+      while at < originalRoots.length { drop run DigestSet.add(&mut available, originalRoots[at]) at = at + usize.ONE }
+      let mut wanted = List<ContentHash>.make()
+      at = usize.ZERO
+      while at < concrete.length {
+        let identity = run Types.internDeclaration(DeclarationId.copy(&concrete[at]))
+        let instance = run InstanceKey.named(&identity)
+        let exact = run keyDigest(&instance, false)
+        if DigestSet.find(&available, exact) == usize.MAX { return () }
+        run List<ContentHash>.append(&mut wanted, exact)
+        at = at + usize.ONE
+      }
+      let index = run WalkFragments.indexGraph(&graph)
+      let slice = match move run WalkFragments.rooted(&graph, &index, List<ContentHash>.asSlice(&wanted)) {
+        Option<BuildRecord.Record>.Some {value} => move value
+        Option<BuildRecord.Record>.None => { return () }
+      }
+      if !(run WalkFragments.finiteClosed(&slice)) || !(run WalkFragments.escapeFree(&slice)) { return () }
+      let mut dependencies = List<usize>.make()
+      run List<usize>.append(&mut dependencies, CacheImage.nodeEdge(guard))
+      let members = List<BuildRecord.Entry>.asSlice(&slice.entries)
+      at = usize.ZERO
+      while at < members.length {
+        if members[at].leaf == 0 {
+          let found = DigestSet.find(&entries, members[at].exact)
+          if found == usize.MAX { return () }
+          run List<usize>.append(&mut dependencies, CacheImage.nodeEdge(List<usize>.get(&nodes, found)))
+        }
+        at = at + usize.ONE
+      }
+      let base = List<CacheImage.Root>.length(&held.roots)
+      run List<CacheImage.Root>.append(&mut held.roots, CacheImage.Root {key: run escapeRecordKey(selected), node: guard,
+        answer: run BuildRecord.encode(&slice)})
+      let checked = run CacheImage.addNode(&mut held, List<usize>.asSlice(&dependencies))
+      run List<CacheImage.Root>.append(&mut held.roots, CacheImage.Root {key: run Bytes.copy(selected), node: checked,
+        answer: run checkAnswer(1, concrete)})
+      run List<usize>.append(&mut self.artifactCacheRoots, base)
+      run List<usize>.append(&mut self.artifactCacheRoots, base + usize.ONE)
+      run frontierTrace(b"runtime exports cached", self.frontierSplit, concrete.length, members.length)
+    }
+  }
 }
