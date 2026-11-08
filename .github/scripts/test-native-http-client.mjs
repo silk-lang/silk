@@ -112,8 +112,18 @@ try {
   const serve = async (create, scheme, host) => {
     const versions = new Set()
     const opened = { main: 0, other: 0 }
+    // The most HTTP/2 streams open at once on one connection.
+    const shared = { streams: 0 }
     const record = (handler) => (request, response) => {
       versions.add(request.httpVersion)
+      const session = request.stream?.session
+      if (session) {
+        session.open = (session.open ?? 0) + 1
+        shared.streams = Math.max(shared.streams, session.open)
+        response.on('close', () => {
+          session.open -= 1
+        })
+      }
       handler(request, response)
     }
     const other = create(record(handle([[/^\/echo$/, echo('other')]])))
@@ -160,7 +170,7 @@ try {
     other.on(connection, () => {
       opened.other += 1
     })
-    return { main, origin, otherOrigin, opened, versions }
+    return { main, origin, otherOrigin, opened, versions, shared }
   }
 
   const plain = await serve(createServer, 'http', '127.0.0.1')
@@ -181,8 +191,9 @@ try {
   assert.equal(result.status, 0, JSON.stringify(result))
   // Sequential requests reuse an idle connection, so a redirect to the other server and back
   // reuses the first connection to the main server. The four requests of `sendAll` run at once and
-  // open up to four more, and the two tasks of the 150-request batch open up to two.
-  assert.ok(plain.opened.main <= 10 && plain.opened.other <= 2, JSON.stringify(plain.opened))
+  // open up to four more, the two tasks of the 150-request batch up to two, and the sixteen tasks
+  // of the last batch up to sixteen.
+  assert.ok(plain.opened.main <= 26 && plain.opened.other <= 2, JSON.stringify(plain.opened))
   assert.deepEqual([...plain.versions], ['1.1'])
   console.log('Native silk.http.client conformance over HTTP/1.1 passed')
 
@@ -198,13 +209,21 @@ try {
   )
   openssl('x509', '-req', '-in', 'leaf.csr', '-CA', 'root.pem', '-CAkey', 'root.key', '-set_serial', '10',
     '-days', '2', '-sha256', '-extfile', 'leaf.ext', '-out', 'leaf.pem')
-  const tls = { key: readFileSync(join(directory, 'leaf.key')), cert: readFileSync(join(directory, 'leaf.pem')) }
+  // Two streams at once per connection, fewer than the client puts on one: the others wait for
+  // a stream to end.
+  const tls = {
+    key: readFileSync(join(directory, 'leaf.key')),
+    cert: readFileSync(join(directory, 'leaf.pem')),
+    settings: { maxConcurrentStreams: 2 },
+  }
   const secure = await serve((handler) => createSecureServer(tls, handler), 'https', 'localhost')
   const secured = await run(executable, [secure.origin, secure.otherOrigin, '', join(directory, 'root.pem')])
   assert.equal(secured.status, 0, JSON.stringify(secured))
-  assert.ok(secure.opened.main <= 10 && secure.opened.other <= 2, JSON.stringify(secure.opened))
+  assert.ok(secure.opened.main <= 26 && secure.opened.other <= 2, JSON.stringify(secure.opened))
   assert.deepEqual([...secure.versions], ['2.0'])
-  console.log('Native silk.http.client conformance over HTTP/2 with TLS passed')
+  // The sixteen tasks put several streams on one connection.
+  assert.ok(secure.shared.streams > 1, JSON.stringify(secure.shared))
+  console.log(`Native silk.http.client conformance over HTTP/2 with TLS passed ${JSON.stringify({ opened: secure.opened, streams: secure.shared.streams })}`)
 } finally {
   for (const timer of timers) clearTimeout(timer)
   for (const server of servers) {
