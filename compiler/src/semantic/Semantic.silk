@@ -110945,6 +110945,21 @@ impl Semantic {
     return run CacheImage.encode(&Merge.finish(move merge), stamp)
   }
 
+  // Both check and artifact imports append to the same index space. A rejected lazy image
+  // leaves old carried indexes behind, so even a later append must refuse until adoption resets it.
+  effect fn appendFrontierImage(self: &mut Self, image: &CacheImage.Image, selected: &[usize]) -> Option<usize>
+  ! OutOfMemoryError ? &mut Allocator {
+    run Semantic.unpackAdoptedImage(&mut self.*)
+    if self.heldImageCorrupt { return Option<usize>.none() }
+    if let Option<CacheImage.Image>.None = &self.heldImage { self.heldImage = Option<CacheImage.Image>.some(CacheImage.make()) }
+    if let Option<CacheImage.Image>.Some {value: held} = &mut self.heldImage {
+      let base = List<CacheImage.Root>.length(&held.roots)
+      drop run CacheImage.carry(&mut held, image, selected)
+      return Option<usize>.some(base)
+    }
+    return Option<usize>.none()
+  }
+
   // Called only after every selected definition has completed emission. The immutable workers
   // share this source snapshot/profile; the next process validates their exact input leaves.
   effect fn importArtifactCache(self: &mut Self) -> Option<List<ArtifactImportedRoot>>
@@ -110959,23 +110974,20 @@ impl Semantic {
     let roots = List<CacheImage.Root>.asSlice(&image.roots)
     let selected = run artifactCacheSelections(&image, false)
     let positions = List<usize>.asSlice(&selected)
-    run Semantic.unpackAdoptedImage(&mut self.*)
-    if self.heldImageCorrupt { return Option<List<ArtifactImportedRoot>>.none() }
-    if let Option<CacheImage.Image>.None = &self.heldImage { self.heldImage = Option<CacheImage.Image>.some(CacheImage.make()) }
+    let base = match move run Semantic.appendFrontierImage(&mut self.*, &image, positions) {
+      Option<usize>.Some {value} => value
+      Option<usize>.None => { return Option<List<ArtifactImportedRoot>>.none() }
+    }
     let mut imported = List<ArtifactImportedRoot>.make()
-    if let Option<CacheImage.Image>.Some {value: held} = &mut self.heldImage {
-      let base = List<CacheImage.Root>.length(&held.roots)
-      drop run CacheImage.carry(&mut held, &image, List<usize>.asSlice(&selected))
-      let mut at = usize.ZERO
-      while at < positions.length {
-        let root = &roots[positions[at]]
-        let mut exact = Span.make(usize.ZERO, usize.ZERO)
-        if buildRootKind(Bytes.asSlice(&root.key), &mut exact) == 2 {
-          run List<ArtifactImportedRoot>.append(&mut imported, ArtifactImportedRoot {
-            exact: digestOfBytes(StableKey.view(Bytes.asSlice(&root.key), exact)), root: base + at})
-        } else { run List<usize>.append(&mut self.artifactCacheRoots, base + at) }
-        at = at + usize.ONE
-      }
+    let mut at = usize.ZERO
+    while at < positions.length {
+      let root = &roots[positions[at]]
+      let mut exact = Span.make(usize.ZERO, usize.ZERO)
+      if buildRootKind(Bytes.asSlice(&root.key), &mut exact) == 2 {
+        run List<ArtifactImportedRoot>.append(&mut imported, ArtifactImportedRoot {
+          exact: digestOfBytes(StableKey.view(Bytes.asSlice(&root.key), exact)), root: base + at})
+      } else { run List<usize>.append(&mut self.artifactCacheRoots, base + at) }
+      at = at + usize.ONE
     }
     run frontierTrace(b"artifact cache imported", self.frontierSplit, roots.length, List<ArtifactImportedRoot>.length(&imported))
     return Option<List<ArtifactImportedRoot>>.some(move imported)
@@ -111040,6 +111052,51 @@ effect fn artifactCacheTransportClaims() -> () ! InvalidModulePath | OutOfMemory
   run Testing.expect(dependencies.length == usize.ONE && !CacheImage.namesNode(dependencies[0])
     && ContentHash.equals(CacheImage.leaves(&held)[CacheImage.target(dependencies[0])].digest, ContentHash {high: 9, low: 11}),
     "the second descendant's exact source dependency survives appended node and leaf numbering")
+}
+
+effect fn frontierCacheCorruptAppendClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  // Keep the envelope valid while encoding an invalid self-edge. Decoding defers reading
+  // graph edges, just as a cache adopted without changed inputs may defer their validation.
+  let mut invalid = CacheImage.make()
+  let node = run CacheImage.addNode(&mut invalid, &[CacheImage.nodeEdge(usize.ZERO)])
+  run List<CacheImage.Root>.append(&mut invalid.roots, CacheImage.Root {
+    key: run Bytes.copy(b"old-carried-index"), answer: Bytes.make(), node: node})
+  let encoded = run CacheImage.encode(&invalid, b"corrupt-append")
+  let lazy = match move run CacheImage.decode(Bytes.asSlice(&encoded), b"corrupt-append") {
+    Option<CacheImage.Image>.Some {value} => move value
+    Option<CacheImage.Image>.None => { run Testing.expect(false, "the corrupt graph envelope decodes lazily") return () }
+  }
+  let mut store = Semantic.make(Revision.make(), MachineTarget.forId(TargetId.Aarch64AppleDarwin), Option<FinalProfile>.none())
+  store.heldImage = Option<CacheImage.Image>.some(move lazy)
+  run List<usize>.append(&mut store.carriedRoots, usize.ZERO)
+  run List<usize>.append(&mut store.carriedBuild, usize.ZERO)
+  let mut fresh = CacheImage.make()
+  let freshNode = run CacheImage.addNode(&mut fresh, &[])
+  run List<CacheImage.Root>.append(&mut fresh.roots, CacheImage.Root {
+    key: run Bytes.copy(b"different-worker-root"), answer: Bytes.make(), node: freshNode})
+  let mut attempt = usize.ZERO
+  while attempt < 2 {
+    let imported = run Semantic.appendFrontierImage(&mut store, &fresh, &[0])
+    run Testing.expect(match imported { Option<usize>.None => true _ => false },
+      "neither the first nor a repeated worker import may rebind indexes from a corrupt adopted graph")
+    run Testing.expect(match &store.heldImage { Option<CacheImage.Image>.None => true _ => false },
+      "refusing an append leaves no replacement image for stale indexes to address")
+    run Testing.expect(store.heldImageCorrupt && List<usize>.get(&store.carriedRoots, usize.ZERO) == usize.ZERO
+      && List<usize>.get(&store.carriedBuild, usize.ZERO) == usize.ZERO,
+      "the refusal remains sticky even though the old carried indexes remain present")
+    attempt = attempt + usize.ONE
+  }
+  let mut clean = Semantic.make(Revision.make(), MachineTarget.forId(TargetId.Aarch64AppleDarwin), Option<FinalProfile>.none())
+  let first = run Semantic.appendFrontierImage(&mut clean, &fresh, &[0])
+  let second = run Semantic.appendFrontierImage(&mut clean, &fresh, &[0])
+  run Testing.expect(match first { Option<usize>.Some {value} => value == usize.ZERO _ => false }
+    && match second { Option<usize>.Some {value} => value == usize.ONE _ => false },
+    "an empty healthy store accepts consecutive imports with stable disjoint root indexes")
+}
+
+test effect fn frontierCacheRefusesRepeatedImportsAfterLazyCorruption() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run frontierCacheCorruptAppendClaims() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
 test effect fn artifactCacheTransportRejectsPartialProofsAndPreservesIndexes() -> ()
@@ -111340,17 +111397,14 @@ impl Semantic {
       if !frontierReadKey(Bytes.asSlice(&finalRoots[at].key), &mut named) { run List<usize>.append(&mut selected, at) }
       at = at + usize.ONE
     }
-    run Semantic.unpackAdoptedImage(&mut self.*)
-    if self.heldImageCorrupt { return () }
-    if let Option<CacheImage.Image>.None = &self.heldImage { self.heldImage = Option<CacheImage.Image>.some(CacheImage.make()) }
-    if let Option<CacheImage.Image>.Some {value: held} = &mut self.heldImage {
-      let base = List<CacheImage.Root>.length(&held.roots)
-      drop run CacheImage.carry(&mut held, &image, List<usize>.asSlice(&selected))
-      at = usize.ZERO
-      while at < List<usize>.length(&selected) {
-        run List<usize>.append(&mut self.artifactCacheRoots, base + at)
-        at = at + usize.ONE
-      }
+    let base = match move run Semantic.appendFrontierImage(&mut self.*, &image, List<usize>.asSlice(&selected)) {
+      Option<usize>.Some {value} => value
+      Option<usize>.None => { return () }
+    }
+    at = usize.ZERO
+    while at < List<usize>.length(&selected) {
+      run List<usize>.append(&mut self.artifactCacheRoots, base + at)
+      at = at + usize.ONE
     }
     run frontierTrace(b"check cache imported", self.frontierSplit, persisted, List<usize>.length(&selected))
     run frontierTrace(b"check cache records", self.frontierSplit, persistedEntries, persistedBytes)
