@@ -1,5 +1,6 @@
 // Bidirectional HTTP/2 interoperability with Node/nghttp2, authenticated h2 ALPN, and h2spec.
 import http2 from 'node:http2'
+import http from 'node:http'
 import tls from 'node:tls'
 import net from 'node:net'
 import assert from 'node:assert/strict'
@@ -10,6 +11,7 @@ import {
   copyFileSync,
   writeFileSync,
   readFileSync,
+  mkdirSync,
   rmSync,
   realpathSync,
 } from 'node:fs'
@@ -263,6 +265,123 @@ try {
     )
     assert.equal(conformance.code, 0, conformance.output)
     console.log(conformance.output.slice(conformance.output.lastIndexOf('Finished in')))
+  }
+
+  // silk.http.serve: HTTP/1.1 and HTTP/2 with prior knowledge on one port.
+  const serveDirectory = join(directory, 'serve')
+  mkdirSync(serveDirectory)
+  copyFileSync(
+    join(root, 'compiler/conformance/native-serve-http2/main.silk'),
+    join(serveDirectory, 'main.silk'),
+  )
+  writeFileSync(
+    join(serveDirectory, 'silk.toml'),
+    '[package]\nname = "serve-http2-test"\nversion = "0.0.0"\nsource = "."\n',
+  )
+  const serveExecutable = join(serveDirectory, 'serve')
+  const serveBuild = await run(process.env.SILK_COMPILER ?? 'silk', [
+    'build',
+    join(serveDirectory, 'main.silk'),
+    '-o',
+    serveExecutable,
+    '--stdlib',
+    join(root, 'stdlib'),
+    '--clang',
+    process.env.SILK_CLANG ?? 'clang',
+  ])
+  assert.equal(serveBuild.code, 0, serveBuild.output)
+  const serveReservation = net.createServer()
+  const servePort = await listen(serveReservation)
+  await new Promise((resolveClose) => serveReservation.close(resolveClose))
+  servers.delete(serveReservation)
+  const served = spawn(serveExecutable, [String(servePort)], { stdio: ['ignore', 'pipe', 'pipe'] })
+  children.add(served)
+  let serveReady = false
+  for (let i = 0; i < 100 && !serveReady; i++) {
+    serveReady = await new Promise((resolveReady) => {
+      const socket = net.connect(servePort, '127.0.0.1')
+      socket.once('connect', () => {
+        socket.destroy()
+        resolveReady(true)
+      })
+      socket.once('error', () => resolveReady(false))
+    })
+    if (!serveReady) await new Promise((resolveDelay) => setTimeout(resolveDelay, 20))
+  }
+  assert.ok(serveReady, 'Silk serve listens')
+
+  const http1 = await new Promise((resolveGet, reject) => {
+    http
+      .get({ host: '127.0.0.1', port: servePort, path: '/one', headers: { 'x-test': 'h1' } }, (response) => {
+        let body = ''
+        response.setEncoding('utf8').on('data', (text) => (body += text))
+        response.on('end', () => resolveGet({ status: response.statusCode, body }))
+      })
+      .on('error', reject)
+  })
+  assert.deepEqual(http1, { status: 200, body: 'hello /one h1' })
+
+  const serveSession = http2.connect(`http://127.0.0.1:${servePort}`)
+  sessions.add(serveSession)
+  serveSession.on('error', () => {})
+  const exchange = (headers, body) =>
+    new Promise((resolveExchange, reject) => {
+      const request = serveSession.request(headers, { endStream: body === undefined })
+      const timeout = setTimeout(() => reject(new Error(`timeout ${headers[':path']}`)), 10000)
+      const chunks = []
+      let head
+      request.on('response', (fields) => (head = fields))
+      request.on('data', (chunk) => chunks.push(chunk))
+      request.on('error', (error) => {
+        clearTimeout(timeout)
+        reject(error)
+      })
+      request.on('end', () => {
+        clearTimeout(timeout)
+        resolveExchange({ head, body: Buffer.concat(chunks) })
+      })
+      if (body !== undefined) request.end(body)
+    })
+  const many = await Promise.all(
+    Array.from({ length: 8 }, (_, index) =>
+      exchange({ ':path': `/many/${index}`, 'x-test': `stream ${index}` }),
+    ),
+  )
+  many.forEach(({ head, body }, index) => {
+    assert.equal(head[':status'], 200)
+    assert.equal(head['x-served-by'], 'Silk')
+    assert.equal(head['content-length'], String(body.length))
+    assert.ok(head.date)
+    assert.equal(body.toString(), `hello /many/${index} stream ${index}`)
+  })
+  const upload = Buffer.alloc(200000, 'u')
+  const echoed = await exchange({ ':method': 'POST', ':path': '/echo' }, upload)
+  assert.equal(echoed.head['x-method'], 'POST')
+  assert.ok(echoed.body.equals(upload), 'a 200 KB body round-trips through flow control')
+  const large = await exchange({ ':path': '/large' })
+  assert.equal(large.body.length, 100000)
+  assert.ok(large.body.equals(Buffer.alloc(100000, 'x')))
+  const missing = await exchange({ ':path': '/missing' })
+  assert.equal(missing.head[':status'], 404)
+  assert.equal(missing.body.toString(), 'missing')
+  const head = await exchange({ ':method': 'HEAD', ':path': '/large' })
+  assert.equal(head.head['content-length'], '100000')
+  assert.equal(head.body.length, 0)
+  serveSession.close()
+  await once(serveSession, 'close')
+  sessions.delete(serveSession)
+  console.log('Node client / Silk serve: HTTP/1.1 and HTTP/2 on one port, multiplexing, 200 KB upload, HEAD passed')
+
+  if (process.env.SILK_H2SPEC) {
+    // Every section but 3.5/2: a cleartext server cannot tell an invalid preface from HTTP/1.1.
+    const sections = ['generic', 'hpack', 'http2/3.5/1', 'http2/4', 'http2/5', 'http2/6', 'http2/7', 'http2/8']
+    const conformance = await run(
+      process.env.SILK_H2SPEC,
+      ['-h', '127.0.0.1', '-p', String(servePort), '--strict', '-o', '2', ...sections],
+      180000,
+    )
+    assert.equal(conformance.code, 0, conformance.output)
+    console.log(`serve h2spec: ${conformance.output.slice(conformance.output.lastIndexOf('Finished in'))}`)
   }
 } finally {
   for (const session of sessions) session.destroy()
