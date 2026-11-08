@@ -163,6 +163,7 @@ import semantic.SourceInputs as Inputs {SourceInputs, Selector as SourceSelector
 import semantic.DeclarationTable
 import semantic.StableKey
 import semantic.CacheImage
+import semantic.CachePackets
 import semantic.BuildRecord
 import semantic.FinalProfile {Entry as ProfileEntry, FinalProfile}
 import semantic.InitialProfile {InitialProfile}
@@ -110983,6 +110984,47 @@ effect fn artifactCacheSelections(image: &CacheImage.Image, proof: bool) -> List
   return move selected
 }
 
+// Selection is ordered, so roots can be moved rather than copied through a local graph merge.
+effect fn retainArtifactCacheRoots(image: &mut CacheImage.Image) -> () ! OutOfMemoryError ? &mut Allocator {
+  let selected = run artifactCacheSelections(&image.*, true)
+  let positions = List<usize>.asSlice(&selected)
+  let mut remaining = positions.length
+  let mut kept = List<CacheImage.Root>.make()
+  while let Option<CacheImage.Root>.Some {value} = move List<CacheImage.Root>.pop(&mut image.roots) {
+    if remaining > usize.ZERO && positions[remaining - usize.ONE] == List<CacheImage.Root>.length(&image.roots) {
+      run List<CacheImage.Root>.append(&mut kept, move value)
+      remaining = remaining - usize.ONE
+    }
+  }
+  while let Option<CacheImage.Root>.Some {value} = move List<CacheImage.Root>.pop(&mut kept) {
+    run List<CacheImage.Root>.append(&mut image.roots, move value)
+  }
+}
+
+// This is the only structural merge in the worker transport. Each image is independently
+// validated against the current fork's source/profile stamp before any roots are admitted.
+effect fn mergeArtifactCachePacket(merge: &mut Merge, count: &mut usize, bytes: &[u8], stamp: &[u8]) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  let spans = match move run CachePackets.read(bytes) {
+    Option<List<Span>>.Some {value} => move value
+    Option<List<Span>>.None => { return false }
+  }
+  let fields = List<Span>.asSlice(&spans)
+  if count.* > CachePackets.MAX_IMAGES || fields.length > CachePackets.MAX_IMAGES - count.* { return false }
+  count.* = count.* + fields.length
+  let mut at = usize.ZERO
+  while at < fields.length {
+    let image = match move run readArtifactCache(StableKey.view(bytes, fields[at]), stamp) {
+      Option<CacheImage.Image>.Some {value} => move value
+      Option<CacheImage.Image>.None => { return false }
+    }
+    let selected = run artifactCacheSelections(&image, true)
+    run Merge.add(&mut merge.*, &image, List<usize>.asSlice(&selected))
+    at = at + usize.ONE
+  }
+  return true
+}
+
 impl Semantic {
   // The emitting worker owns the actual MIR and EmissionInputs units of each selected key.
   // No entry can be persisted merely because another worker emitted equal text.
@@ -111010,12 +111052,18 @@ impl Semantic {
     // Frozen workers lack the observations needed for reuse after an edit. They may emit now,
     // but cannot create apparently green cache roots for those answers.
     if !Graph.recording(&self.resolver.graph) || !same(stamp, Bytes.asSlice(&run artifactCacheStamp(&self.*))) { return Bytes.make() }
-    let image = run Semantic.completeCacheImage(&mut self.*)
+    let mut image = run Semantic.completeCacheImage(&mut self.*)
     if !self.frontierCacheComplete { return Bytes.make() }
-    let selected = run artifactCacheSelections(&image, true)
-    let mut merge = Merge.make()
-    run Merge.add(&mut merge, &image, List<usize>.asSlice(&selected))
-    return run CacheImage.encode(&Merge.finish(move merge), stamp)
+    // Move only reusable roots into the envelope. Leaves and nodes keep their local numbering;
+    // the coordinator alone traverses, compacts and interns their reachable dependency graph.
+    run retainArtifactCacheRoots(&mut image)
+    let encoded = run CacheImage.encode(&image, stamp)
+    let mut packet = run CachePackets.make()
+    if !(run CachePackets.append(&mut packet, Bytes.asSlice(&encoded))) { return Bytes.make() }
+    return match move run CachePackets.finish(move packet) {
+      Option<Bytes>.Some {value} => move value
+      Option<Bytes>.None => Bytes.make()
+    }
   }
 
   effect fn artifactCacheProxy(self: &mut Self, stamp: &[u8]) -> Bytes
@@ -111031,27 +111079,26 @@ impl Semantic {
       at = at + usize.ONE
     }
     let own = run Semantic.artifactLocalCommand(&mut self.*, 7, stamp)
-    let mut merge = Merge.make()
-    if let Option<CacheImage.Image>.Some {value} = move run readArtifactCache(Bytes.asSlice(&own), stamp) {
-      let selected = run artifactCacheSelections(&value, true)
-      run Merge.add(&mut merge, &value, List<usize>.asSlice(&selected))
-    } else { good = false }
+    let mut packet = run CachePackets.make()
+    if !(run CachePackets.forward(&mut packet, Bytes.asSlice(&own))) { good = false }
     let held = List<CheckWorker>.asSlice(&self.frontierChildren)
     at = usize.ZERO
     while at < held.length {
       if List<bool>.get(&sent, at) {
         let reply = run readArtifactPacket(held[at].control)
         if let Option<Bytes>.Some {value: bytes} = move reply {
-          if let Option<CacheImage.Image>.Some {value} = move run readArtifactCache(Bytes.asSlice(&bytes), stamp) {
-            let selected = run artifactCacheSelections(&value, true)
-            run Merge.add(&mut merge, &value, List<usize>.asSlice(&selected))
-          } else { good = false }
+          if !(run CachePackets.forward(&mut packet, Bytes.asSlice(&bytes))) { good = false }
         } else { good = false }
       }
       at = at + usize.ONE
     }
+    // Drain all dispatched replies even after a malformed or oversized packet. No image has
+    // been decoded here, and no partial packet can be published as complete cache evidence.
     if !good { return Bytes.make() }
-    return run CacheImage.encode(&Merge.finish(move merge), stamp)
+    return match move run CachePackets.finish(move packet) {
+      Option<Bytes>.Some {value} => move value
+      Option<Bytes>.None => Bytes.make()
+    }
   }
 
   // Both check and artifact imports append to the same index space. A rejected lazy image
@@ -111188,6 +111235,86 @@ effect fn artifactCacheTransportClaims() -> () ! InvalidModulePath | OutOfMemory
     "the second descendant's exact source dependency survives appended node and leaf numbering")
 }
 
+effect fn artifactCacheLeafPacketClaims() -> () ! InvalidModulePath | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let module = run ModuleId.make(b"memory", b"cache", b"leaf-packet")
+  let mut first = CacheImage.make()
+  let leaf = run CacheImage.addLeaf(&mut first, false, run Bytes.copy(b"source-a"), ContentHash {high: 17, low: 23},
+    usize.MAX, usize.MAX, ContentHash {high: 0, low: 0})
+  let node = run CacheImage.addNode(&mut first, &[CacheImage.leafEdge(leaf)])
+  run List<CacheImage.Root>.append(&mut first.roots, CacheImage.Root {
+    key: run buildRecordKey(), answer: run Bytes.copy(b"partial-proof"), node: node})
+  run List<CacheImage.Root>.append(&mut first.roots, CacheImage.Root {
+    key: run buildEntryKey(ContentHash {high: 3, low: 7}), answer: run Bytes.copy(b"emitted-definition"), node: node})
+  run List<CacheImage.Root>.append(&mut first.roots, CacheImage.Root {
+    key: run artifactCacheCheckKey(&module, 0), answer: run Bytes.copy(b"complete-sweep"), node: node})
+  let mut second = CacheImage.make()
+  let otherLeaf = run CacheImage.addLeaf(&mut second, false, run Bytes.copy(b"source-b"), ContentHash {high: 19, low: 29},
+    usize.MAX, usize.MAX, ContentHash {high: 0, low: 0})
+  let otherNode = run CacheImage.addNode(&mut second, &[CacheImage.leafEdge(otherLeaf)])
+  run List<CacheImage.Root>.append(&mut second.roots, CacheImage.Root {
+    key: run buildEntryKey(ContentHash {high: 3, low: 8}), answer: run Bytes.copy(b"descendant-definition"), node: otherNode})
+  let mut expected = Merge.make()
+  run Merge.add(&mut expected, &first, &[1, 2])
+  run Merge.add(&mut expected, &second, &[0])
+  let expectedBytes = run CacheImage.encode(&Merge.finish(move expected), b"leaf-test")
+  run retainArtifactCacheRoots(&mut first)
+  run Testing.expect(List<CacheImage.Root>.length(&first.roots) == 2
+    && same(Bytes.asSlice(&List<CacheImage.Root>.asSlice(&first.roots)[0].answer), b"emitted-definition"),
+    "leaf selection moves ordered complete roots and discards partition proofs")
+  let firstBytes = run CacheImage.encode(&first, b"leaf-test")
+  let secondBytes = run CacheImage.encode(&second, b"leaf-test")
+  let mut descendant = run CachePackets.make()
+  drop run CachePackets.append(&mut descendant, Bytes.asSlice(&firstBytes))
+  drop run CachePackets.append(&mut descendant, Bytes.asSlice(&secondBytes))
+  let descendantBytes = match move run CachePackets.finish(move descendant) {
+    Option<Bytes>.Some {value} => move value
+    Option<Bytes>.None => { run Testing.expect(false, "descendant envelope finishes") return () }
+  }
+  let mut parent = run CachePackets.make()
+  drop run CachePackets.append(&mut parent, Bytes.asSlice(&firstBytes))
+  run Testing.expect(run CachePackets.forward(&mut parent, Bytes.asSlice(&descendantBytes)), "ancestor forwards unchanged dependency images")
+  let packet = match move run CachePackets.finish(move parent) {
+    Option<Bytes>.Some {value} => move value
+    Option<Bytes>.None => { run Testing.expect(false, "ancestor envelope finishes") return () }
+  }
+  let mut actual = Merge.make()
+  let mut count = usize.ZERO
+  run Testing.expect(run mergeArtifactCachePacket(&mut actual, &mut count, Bytes.asSlice(&packet), b"leaf-test"),
+    "coordinator validates every forwarded image")
+  let actualBytes = run CacheImage.encode(&Merge.finish(move actual), b"leaf-test")
+  run Testing.expect(count == 3 && same(Bytes.asSlice(&actualBytes), Bytes.asSlice(&expectedBytes)),
+    "one coordinator merge preserves exact roots, answers and dependency graph despite duplicate leaf stores")
+  let mut wrong = Merge.make()
+  count = usize.ZERO
+  run Testing.expect(!(run mergeArtifactCachePacket(&mut wrong, &mut count, Bytes.asSlice(&packet), b"other-profile")),
+    "an opaque forwarded image cannot bypass source/profile validation")
+  let mut excessive = Merge.make()
+  count = CachePackets.MAX_IMAGES - usize.ONE
+  run Testing.expect(!(run mergeArtifactCachePacket(&mut excessive, &mut count, Bytes.asSlice(&packet), b"leaf-test")),
+    "the coordinator bounds the combined store count across all root-worker packets")
+  let mut corrupt = CacheImage.make()
+  let invalid = run CacheImage.addNode(&mut corrupt, &[CacheImage.nodeEdge(usize.ZERO)])
+  run List<CacheImage.Root>.append(&mut corrupt.roots, CacheImage.Root {
+    key: run buildEntryKey(ContentHash {high: 9, low: 9}), answer: Bytes.make(), node: invalid})
+  let corruptBytes = run CacheImage.encode(&corrupt, b"leaf-test")
+  let mut corruptPacket = run CachePackets.make()
+  drop run CachePackets.append(&mut corruptPacket, Bytes.asSlice(&corruptBytes))
+  let corruptEnvelope = match move run CachePackets.finish(move corruptPacket) {
+    Option<Bytes>.Some {value} => move value
+    Option<Bytes>.None => { run Testing.expect(false, "opaque malformed image can be framed") return () }
+  }
+  let mut refused = Merge.make()
+  count = usize.ZERO
+  run Testing.expect(!(run mergeArtifactCachePacket(&mut refused, &mut count, Bytes.asSlice(&corruptEnvelope), b"leaf-test")),
+    "coordinator refuses malformed dependency edges even when envelope and stamp are valid")
+}
+
+test effect fn artifactCacheLeafPacketsPreserveMergeAndValidateEvidence() -> ()
+! InvalidModulePath | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run artifactCacheLeafPacketClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
 effect fn frontierCacheCorruptAppendClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
   // Keep the envelope valid while encoding an invalid self-edge. Decoding defers reading
   // graph edges, just as a cache adopted without changed inputs may defer their validation.
@@ -111251,15 +111378,13 @@ effect fn fetchFrontierCache(workers: &[CheckWorker], stamp: &[u8]) -> Option<Ca
       at = at + usize.ONE
     }
     let mut merge = Merge.make()
+    let mut imageCount = usize.ZERO
     at = usize.ZERO
     while at < workers.length {
       if List<bool>.get(&sent, at) {
         let reply = run readArtifactPacket(workers[at].control)
         if let Option<Bytes>.Some {value: bytes} = move reply {
-          if let Option<CacheImage.Image>.Some {value} = move run readArtifactCache(Bytes.asSlice(&bytes), stamp) {
-            let selected = run artifactCacheSelections(&value, true)
-            run Merge.add(&mut merge, &value, List<usize>.asSlice(&selected))
-          } else { good = false }
+          if !(run mergeArtifactCachePacket(&mut merge, &mut imageCount, Bytes.asSlice(&bytes), stamp)) { good = false }
         } else { good = false }
       }
       at = at + usize.ONE
