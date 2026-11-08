@@ -449,6 +449,7 @@ fn frontierFullEntries(record: &BuildRecord.Record) -> usize {
 
 struct CheckWorker { process: i32, stream: ?*mut u8, control: i32 }
 struct FrontierCoverage { stable: Bytes, concrete: List<DeclarationId> }
+struct FrontierCacheCapture { stable: Bytes, unit: usize, capture: CapturedBuild }
 
 fn frontierSend(fd: i32, bytes: &[u8]) -> bool {
   let mut at = usize.ZERO
@@ -872,6 +873,10 @@ struct ArtifactJob {
   worker: usize,
   producer: usize,
   done: bool,
+}
+
+fn retainedCacheExperiment() -> bool {
+  return !Pointer.isNullMany<u8>(unsafe FrontierHost.environment(Pointer.fromSlice<u8>(b"SILK_RETAINED_CACHE\0")))
 }
 
 fn retainedBuildExperiment() -> bool {
@@ -4431,6 +4436,8 @@ pub struct Semantic {
   frontierChunks: Option<[*]mut u64>,
   frontierChecked: List<usize>,
   frontierSweepChunks: List<SweepFragments.Packet>,
+  frontierCacheCaptures: List<FrontierCacheCapture>,
+  frontierCacheComplete: bool,
   frontierRosters: List<FrontierModuleRoster>,
   frontierOwned: usize,
   frontierTasks: usize,
@@ -94095,6 +94102,8 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
     frontierChunks: Option<[*]mut u64>.none(),
     frontierChecked: List<usize>.make(),
     frontierSweepChunks: List<SweepFragments.Packet>.make(),
+    frontierCacheCaptures: List<FrontierCacheCapture>.make(),
+    frontierCacheComplete: true,
     frontierRosters: List<FrontierModuleRoster>.make(),
     frontierOwned: usize.ZERO,
     frontierTasks: usize.ZERO,
@@ -95343,6 +95352,7 @@ impl Semantic {
     }
     self.replayReports = move reports
     run Semantic.imageArtifactEntries(&self.*, &mut build)
+    run Semantic.imageFrontierReads(&mut self.*, &mut build)
     // The last build's record and each definition it lowered, on the units it rests on. The
     // definitions a replay took from the image this store read, and a record no build here
     // replaced, stay in that image, which the written one carries them from.
@@ -96218,10 +96228,14 @@ impl Semantic {
       Option<Bytes>.Some {value} => move value
       Option<Bytes>.None => { Semantic.abortFrontierWorker(&self.*, true) return () }
     }
+    let cacheKey = if Graph.recording(&self.resolver.graph) { run Bytes.copy(Bytes.asSlice(&escapeKey)) } else { Bytes.make() }
     run List<SweepFragments.Packet>.append(&mut self.frontierSweepChunks, SweepFragments.Packet {
       sweep: move sweepKey, escape: move escapeKey, total: written.length, start: start,
       declarations: move declarations, namesChecked: start == usize.ZERO, names: move names,
       answer: move answer, record: run BuildRecord.encode(&capture.record)})
+    if Graph.recording(&self.resolver.graph) {
+      run Semantic.keepFrontierCacheCapture(&mut self.*, ordinal, unit, move cacheKey, move capture)
+    }
     run List<FrontierModuleRoster>.append(&mut self.frontierRosters, move roster)
     run frontierTrace(b"declaration chunk", started, self.frontierWorker, start)
   }
@@ -96712,6 +96726,9 @@ impl Semantic {
           run List<ModuleCheckMemo>.append(&mut self.moduleMemos, move memo)
         }
       } else { drop run Semantic.adoptImage(&mut self.*, request, Merge.finish(move merge), false) }
+      if retainedCacheExperiment() {
+        run Semantic.persistFrontierChecks(&mut self.*, workers, &value, List<FrontierCoverage>.asSlice(&coverage))
+      }
       self.frontierCoverage = move coverage
       run frontierTrace(b"adopted", self.frontierSplit, usize.ZERO, usize.ZERO)
       drop unsafe FrontierHost.write(2, Pointer.fromSlice<u8>(b"frontier accepted\n"), 18)
@@ -96745,6 +96762,8 @@ impl Semantic {
     self.frontierSweepUnits = List<usize>.make()
     self.artifactCacheRoots = List<usize>.make()
     self.frontierSweepChunks = List<SweepFragments.Packet>.make()
+    self.frontierCacheCaptures = List<FrontierCacheCapture>.make()
+    self.frontierCacheComplete = true
     self.frontierRosters = List<FrontierModuleRoster>.make()
     let selected = Option<ModuleId>.some(ModuleId.copy(runtime))
     if !Graph.recording(&self.resolver.graph) {
@@ -98391,7 +98410,7 @@ impl Semantic {
             donationAllowed = true
             self.frontierOutput = stream
             self.frontierControl = sockets[1]
-            if ephemeralFrontier() {
+            if ephemeralFrontier() && !retainedCacheExperiment() {
               // Updates queue changed sources until reconciliation marks their dependent units.
               run reconcileSources(&mut self.resolver)
               if Graph.freeze(&mut self.resolver.graph) {
@@ -105375,7 +105394,7 @@ impl BuildCapture {
           hash: entry.hash, family: entry.family, declaration: Bytes.make(), parent: entry.parent,
           position: entry.position, requested: entry.requested, alias: usize.MAX, leaf: WalkFragments.EXTERNAL,
           references: List<BuildRecord.Reference>.make(), summary: ContentHash {high: 0, low: 0}, facts: BuildRecord.unknownFacts()})
-        run List<CapturedEntry>.append(&mut rested, CapturedEntry {value: usize.MAX, mirUnit: usize.MAX,
+        run List<CapturedEntry>.append(&mut rested, CapturedEntry {value: usize.MAX, mirUnit: entry.mirUnit,
           emissionUnit: usize.MAX, carried: usize.MAX})
         at = at + usize.ONE
         continue
@@ -110533,13 +110552,18 @@ effect fn readArtifactCache(bytes: &[u8], stamp: &[u8]) -> Option<CacheImage.Ima
   return Option<CacheImage.Image>.some(move image)
 }
 
-effect fn artifactCacheSelections(image: &CacheImage.Image) -> List<usize> ! OutOfMemoryError ? &mut Allocator {
+effect fn artifactCacheSelections(image: &CacheImage.Image, proof: bool) -> List<usize> ! OutOfMemoryError ? &mut Allocator {
   let mut selected = List<usize>.make()
   let roots = List<CacheImage.Root>.asSlice(&image.roots)
   let mut at = usize.ZERO
   while at < roots.length {
     let key = Bytes.asSlice(&roots[at].key)
     let mut named = Span.make(usize.ZERO, usize.ZERO)
+    if frontierReadKey(key, &mut named) {
+      if proof { run List<usize>.append(&mut selected, at) }
+      at = at + usize.ONE
+      continue
+    }
     let kind = buildRootKind(key, &mut named)
     // Shared frontier records prove a partition only. Never publish a partition as an ordinary
     // replayable walk, even when each of its individual MIR dependency roots is complete.
@@ -110582,7 +110606,8 @@ impl Semantic {
     // but cannot create apparently green cache roots for those answers.
     if !Graph.recording(&self.resolver.graph) || !same(stamp, Bytes.asSlice(&run artifactCacheStamp(&self.*))) { return Bytes.make() }
     let image = run Semantic.completeCacheImage(&mut self.*)
-    let selected = run artifactCacheSelections(&image)
+    if !self.frontierCacheComplete { return Bytes.make() }
+    let selected = run artifactCacheSelections(&image, true)
     let mut merge = Merge.make()
     run Merge.add(&mut merge, &image, List<usize>.asSlice(&selected))
     return run CacheImage.encode(&Merge.finish(move merge), stamp)
@@ -110603,7 +110628,7 @@ impl Semantic {
     let own = run Semantic.artifactLocalCommand(&mut self.*, 7, stamp)
     let mut merge = Merge.make()
     if let Option<CacheImage.Image>.Some {value} = move run readArtifactCache(Bytes.asSlice(&own), stamp) {
-      let selected = run artifactCacheSelections(&value)
+      let selected = run artifactCacheSelections(&value, true)
       run Merge.add(&mut merge, &value, List<usize>.asSlice(&selected))
     } else { good = false }
     let held = List<CheckWorker>.asSlice(&self.frontierChildren)
@@ -110613,7 +110638,7 @@ impl Semantic {
         let reply = run readArtifactPacket(held[at].control)
         if let Option<Bytes>.Some {value: bytes} = move reply {
           if let Option<CacheImage.Image>.Some {value} = move run readArtifactCache(Bytes.asSlice(&bytes), stamp) {
-            let selected = run artifactCacheSelections(&value)
+            let selected = run artifactCacheSelections(&value, true)
             run Merge.add(&mut merge, &value, List<usize>.asSlice(&selected))
           } else { good = false }
         } else { good = false }
@@ -110631,47 +110656,26 @@ impl Semantic {
     if self.resolver.revisable || !Graph.recording(&self.resolver.graph) { return Option<List<ArtifactImportedRoot>>.none() }
     let stamp = run artifactCacheStamp(&self.*)
     let workers = List<CheckWorker>.asSlice(&self.artifactWorkers)
-    let mut sent = List<bool>.make()
-    let mut good = workers.length > usize.ZERO
-    let mut at = usize.ZERO
-    while at < workers.length {
-      let dispatched = run sendArtifactPacket(workers[at].control, 7, Bytes.asSlice(&stamp))
-      good = good && dispatched
-      run List<bool>.append(&mut sent, dispatched)
-      at = at + usize.ONE
+    let image = match move run fetchFrontierCache(workers, Bytes.asSlice(&stamp)) {
+      Option<CacheImage.Image>.Some {value} => move value
+      Option<CacheImage.Image>.None => { return Option<List<ArtifactImportedRoot>>.none() }
     }
-    let mut merge = Merge.make()
-    at = usize.ZERO
-    while at < workers.length {
-      if List<bool>.get(&sent, at) {
-        let reply = run readArtifactPacket(workers[at].control)
-        if let Option<Bytes>.Some {value: bytes} = move reply {
-          if let Option<CacheImage.Image>.Some {value} = move run readArtifactCache(Bytes.asSlice(&bytes), Bytes.asSlice(&stamp)) {
-            let selected = run artifactCacheSelections(&value)
-            run Merge.add(&mut merge, &value, List<usize>.asSlice(&selected))
-          } else { good = false }
-        } else { good = false }
-      }
-      at = at + usize.ONE
-    }
-    if !good { return Option<List<ArtifactImportedRoot>>.none() }
-    let image = Merge.finish(move merge)
     let roots = List<CacheImage.Root>.asSlice(&image.roots)
-    let mut selected = List<usize>.make()
-    at = usize.ZERO
-    while at < roots.length { run List<usize>.append(&mut selected, at) at = at + usize.ONE }
+    let selected = run artifactCacheSelections(&image, false)
+    let positions = List<usize>.asSlice(&selected)
     run Semantic.unpackAdoptedImage(&mut self.*)
     if let Option<CacheImage.Image>.None = &self.heldImage { self.heldImage = Option<CacheImage.Image>.some(CacheImage.make()) }
     let mut imported = List<ArtifactImportedRoot>.make()
     if let Option<CacheImage.Image>.Some {value: held} = &mut self.heldImage {
       let base = List<CacheImage.Root>.length(&held.roots)
       drop run CacheImage.carry(&mut held, &image, List<usize>.asSlice(&selected))
-      at = usize.ZERO
-      while at < roots.length {
+      let mut at = usize.ZERO
+      while at < positions.length {
+        let root = &roots[positions[at]]
         let mut exact = Span.make(usize.ZERO, usize.ZERO)
-        if buildRootKind(Bytes.asSlice(&roots[at].key), &mut exact) == 2 {
+        if buildRootKind(Bytes.asSlice(&root.key), &mut exact) == 2 {
           run List<ArtifactImportedRoot>.append(&mut imported, ArtifactImportedRoot {
-            exact: digestOfBytes(StableKey.view(Bytes.asSlice(&roots[at].key), exact)), root: base + at})
+            exact: digestOfBytes(StableKey.view(Bytes.asSlice(&root.key), exact)), root: base + at})
         } else { run List<usize>.append(&mut self.artifactCacheRoots, base + at) }
         at = at + usize.ONE
       }
@@ -110705,7 +110709,7 @@ effect fn artifactCacheTransportClaims() -> () ! InvalidModulePath | OutOfMemory
   run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: run escapeRecordKey(Bytes.asSlice(&check)), answer: Bytes.make(), node: node})
   run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: move check, answer: Bytes.make(), node: node})
   run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: run artifactCacheCheckKey(&module, 0), answer: Bytes.make(), node: node})
-  let selected = run artifactCacheSelections(&image)
+  let selected = run artifactCacheSelections(&image, false)
   run Testing.expect(sameSlots(List<usize>.asSlice(&selected), &[1, 4]),
     "worker images retain final definitions and complete sweeps, never partition walks or escape checks")
   let encoded = run CacheImage.encode(&image, b"profile-a")
@@ -110719,12 +110723,10 @@ effect fn artifactCacheTransportClaims() -> () ! InvalidModulePath | OutOfMemory
   let oldNode = run CacheImage.addNode(&mut held, &[])
   run List<CacheImage.Root>.append(&mut held.roots, CacheImage.Root {key: run Bytes.copy(b"old-carried-index"), answer: run Bytes.copy(b"old-answer"), node: oldNode})
   drop run CacheImage.carry(&mut held, &decoded, List<usize>.asSlice(&selected))
-  {
-    let roots = List<CacheImage.Root>.asSlice(&held.roots)
-    run Testing.expect(roots.length == 3 && same(Bytes.asSlice(&roots[0].key), b"old-carried-index")
-      && same(Bytes.asSlice(&roots[0].answer), b"old-answer") && same(Bytes.asSlice(&roots[1].key), Bytes.asSlice(&run buildEntryKey(exact))),
-      "appending worker evidence preserves prior root indices and the returned definition index")
-  }
+  let firstRoots = List<CacheImage.Root>.asSlice(&held.roots)
+  run Testing.expect(firstRoots.length == 3 && same(Bytes.asSlice(&firstRoots[0].key), b"old-carried-index")
+    && same(Bytes.asSlice(&firstRoots[0].answer), b"old-answer") && same(Bytes.asSlice(&firstRoots[1].key), Bytes.asSlice(&run buildEntryKey(exact))),
+    "appending worker evidence preserves prior root indices and the returned definition index")
   let mut second = CacheImage.make()
   let leaf = run CacheImage.addLeaf(&mut second, false, run Bytes.copy(b"another-source"), ContentHash {high: 9, low: 11},
     usize.MAX, usize.MAX, ContentHash {high: 0, low: 0})
@@ -110747,4 +110749,311 @@ test effect fn artifactCacheTransportRejectsPartialProofsAndPreservesIndexes() -
 ! InvalidModulePath | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run artifactCacheTransportClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn fetchFrontierCache(workers: &[CheckWorker], stamp: &[u8]) -> Option<CacheImage.Image>
+! OutOfMemoryError ? &mut Allocator {
+    let mut sent = List<bool>.make()
+    let mut good = workers.length > usize.ZERO
+    let mut at = usize.ZERO
+    while at < workers.length {
+      let dispatched = run sendArtifactPacket(workers[at].control, 7, stamp)
+      good = good && dispatched
+      run List<bool>.append(&mut sent, dispatched)
+      at = at + usize.ONE
+    }
+    let mut merge = Merge.make()
+    at = usize.ZERO
+    while at < workers.length {
+      if List<bool>.get(&sent, at) {
+        let reply = run readArtifactPacket(workers[at].control)
+        if let Option<Bytes>.Some {value: bytes} = move reply {
+          if let Option<CacheImage.Image>.Some {value} = move run readArtifactCache(Bytes.asSlice(&bytes), stamp) {
+            let selected = run artifactCacheSelections(&value, true)
+            run Merge.add(&mut merge, &value, List<usize>.asSlice(&selected))
+          } else { good = false }
+        } else { good = false }
+      }
+      at = at + usize.ONE
+    }
+    if !good { return Option<CacheImage.Image>.none() }
+    return Option<CacheImage.Image>.some(Merge.finish(move merge))
+
+}
+
+// These roots are IPC metadata only. Distinct workers/chunks cannot overwrite each other's
+// check-unit reads while their individual MIR roots are deduplicated by exact definition.
+effect fn frontierReadsKey(stable: &[u8], worker: usize, ordinal: usize) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut key = Bytes.make()
+  run RuntimeEncoding.field(&mut key, b"silk.frontier.reads")
+  run RuntimeEncoding.word(&mut key, usize.toU64(worker))
+  run RuntimeEncoding.word(&mut key, usize.toU64(ordinal))
+  run RuntimeEncoding.field(&mut key, stable)
+  return move key
+}
+
+fn frontierReadKey(key: &[u8], stable: &mut Span) -> bool {
+  let mut reader = StableKey.reader()
+  let tag = StableKey.readField(key, &mut reader)
+  if StableKey.failed(&reader) || !same(StableKey.view(key, tag), b"silk.frontier.reads") { return false }
+  drop StableKey.readWord(key, &mut reader)
+  drop StableKey.readWord(key, &mut reader)
+  let named = StableKey.readField(key, &mut reader)
+  if !StableKey.finished(key, &reader) { return false }
+  stable.* = named
+  return true
+}
+
+// Separate exact per-MIR validity from root/signature reads. A body edit must invalidate the
+// check without discarding the old graph used to replay unchanged entries around that edit.
+effect fn frontierNonMirReads(resolver: &mut Resolver, module: usize, unit: usize, capture: &CapturedBuild, ordinal: usize) -> usize
+! OutOfMemoryError ? &mut Allocator {
+  let mut mirUnits = DigestSet.make()
+  let entries = List<CapturedEntry>.asSlice(&capture.entries)
+  let mut at = usize.ZERO
+  while at < entries.length {
+    if entries[at].mirUnit != usize.MAX {
+      drop run DigestSet.add(&mut mirUnits, ContentHash {high: 0, low: usize.toU64(entries[at].mirUnit)})
+    }
+    at = at + usize.ONE
+  }
+  let word = run internKey(&mut resolver.*, Key {family: Family.ModuleCheck, module: module, name: usize.MAX - usize.ONE,
+    declaration: usize.MAX, member: ordinal, external: false})
+  let saved = u64.toUsize(word.value)
+  run Graph.startRun(&mut resolver.graph, saved)
+  let mut edge = Graph.firstEdgeOf(&resolver.graph, unit)
+  while edge != usize.MAX {
+    let consumed = Graph.dependeeOf(&resolver.graph, edge)
+    edge = Graph.nextEdgeOf(&resolver.graph, edge)
+    let represented = match &consumed {
+      Dependee.UnitResult {unit: child} => DigestSet.find(&mirUnits, ContentHash {high: 0, low: usize.toU64(child)}) != usize.MAX
+      _ => false
+    }
+    if !represented { run Graph.record(&mut resolver.graph, saved, consumed) }
+  }
+  drop run Graph.finishRun(&mut resolver.graph, saved, Option<ContentHash>.none())
+  return saved
+}
+
+impl Semantic {
+  effect fn keepFrontierCacheCapture(self: &mut Self, module: usize, unit: usize, stable: Bytes, capture: CapturedBuild) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+    // Captured growth guards are currently absent under finite admission. Do not retain a
+    // future mutable guard unit without also snapshotting that guard's dependency list.
+    if capture.guard != usize.MAX { self.frontierCacheComplete = false return () }
+    let saved = run frontierNonMirReads(&mut self.resolver, module, unit, &capture,
+      List<FrontierCacheCapture>.length(&self.frontierCacheCaptures))
+    run List<FrontierCacheCapture>.append(&mut self.frontierCacheCaptures, FrontierCacheCapture {stable: move stable,
+      unit: saved, capture: move capture})
+  }
+
+  effect fn imageFrontierReads(self: &mut Self, build: &mut ImageBuild) -> () ! OutOfMemoryError ? &mut Allocator {
+    if self.frontierWorker == usize.MAX || !retainedCacheExperiment() { return () }
+    let memos = List<EscapeMemo>.asSlice(&self.escapeMemos)
+    let mut at = usize.ZERO
+    let mut ordinal = usize.ZERO
+    while at < memos.length {
+      let memo = &memos[at]
+      at = at + usize.ONE
+      let capture = match &memo.captured {
+        Option<CapturedBuild>.Some {value} => &value
+        Option<CapturedBuild>.None => { continue }
+      }
+      if List<Shared<Rejection>>.length(&memo.result.rejections) > usize.ZERO || List<Shared<BackendGap>>.length(&memo.result.gaps) > usize.ZERO
+        || List<UncheckedDeclaration>.length(&memo.result.unchecked) > usize.ZERO { self.frontierCacheComplete = false continue }
+      let stable = match move run stableUnit(&self.resolver, memo.unit) {
+        Option<Bytes>.Some {value} => move value
+        Option<Bytes>.None => { self.frontierCacheComplete = false continue }
+      }
+      let module = List<ScopedKey>.get(&self.resolver.keys, memo.unit).key.module
+      let saved = run frontierNonMirReads(&mut self.resolver, module, memo.unit, capture,
+        List<FrontierCacheCapture>.length(&self.frontierCacheCaptures) + at)
+      let node = run imageUnit(&self.resolver, &mut build.*, saved)
+      if node >= unfit() { self.frontierCacheComplete = false continue }
+      run List<CacheImage.Root>.append(&mut build.image.roots, CacheImage.Root {
+        key: run frontierReadsKey(Bytes.asSlice(&stable), self.frontierWorker, ordinal), node: node, answer: Bytes.make()})
+      ordinal = ordinal + usize.ONE
+    }
+    let chunks = List<FrontierCacheCapture>.asSlice(&self.frontierCacheCaptures)
+    let mut written = DigestSet.make()
+    let mut named = DigestSet.make()
+    let mut carried = List<usize>.make()
+    at = usize.ZERO
+    while at < chunks.length {
+      let part = &chunks[at]
+      at = at + usize.ONE
+      let node = run imageUnit(&self.resolver, &mut build.*, part.unit)
+      if node >= unfit() { self.frontierCacheComplete = false continue }
+      let key = run frontierReadsKey(Bytes.asSlice(&part.stable), self.frontierWorker, ordinal)
+      run List<CacheImage.Root>.append(&mut build.image.roots, CacheImage.Root {key: run Bytes.copy(Bytes.asSlice(&key)),
+        node: node, answer: Bytes.make()})
+      // Only the entry roots survive IPC filtering; this temporary record is never persisted.
+      run imageEscapeRecord(&self.resolver, &mut build.*, &part.capture, Bytes.asSlice(&key), &mut written, &mut named, &mut carried)
+      ordinal = ordinal + usize.ONE
+    }
+    // A chunk using an adopted record must carry the associated entry roots too. Until this
+    // lane can authenticate those old-image indexes independently, refuse incomplete evidence.
+    if List<usize>.length(&carried) > usize.ZERO { self.frontierCacheComplete = false }
+  }
+
+  effect fn persistFrontierChecks(self: &mut Self, workers: &[CheckWorker], graph: &BuildRecord.Record, coverage: &[FrontierCoverage]) -> ()
+  ! Cycle | OutOfMemoryError ? &mut Allocator | &mut Types {
+    if self.resolver.revisable || graph.guarded { return () }
+    let stamp = run artifactCacheStamp(&self.*)
+    let mut image = match move run fetchFrontierCache(workers, Bytes.asSlice(&stamp)) {
+      Option<CacheImage.Image>.Some {value} => move value
+      Option<CacheImage.Image>.None => { run frontierTrace(b"check cache unavailable", self.frontierSplit, usize.ZERO, usize.ZERO) return () }
+    }
+    let mut entries = DigestSet.make()
+    let mut entryNodes = List<usize>.make()
+    let mut readKeys = List<Bytes>.make()
+    let mut readNodes = List<usize>.make()
+    let roots = List<CacheImage.Root>.asSlice(&image.roots)
+    let mut at = usize.ZERO
+    while at < roots.length {
+      let root = &roots[at]
+      let key = Bytes.asSlice(&root.key)
+      let mut named = Span.make(usize.ZERO, usize.ZERO)
+      if frontierReadKey(key, &mut named) {
+        run List<Bytes>.append(&mut readKeys, run Bytes.copy(StableKey.view(key, named)))
+        run List<usize>.append(&mut readNodes, root.node)
+      } else if buildRootKind(key, &mut named) == 4 {
+        let exact = digestOfBytes(StableKey.view(key, named))
+        if run DigestSet.add(&mut entries, exact) { run List<usize>.append(&mut entryNodes, root.node) }
+      }
+      at = at + usize.ONE
+    }
+    let index = run WalkFragments.indexGraph(graph)
+    let mut globalRoots = DigestSet.make()
+    let available = List<ContentHash>.asSlice(&graph.roots)
+    at = usize.ZERO
+    while at < available.length { drop run DigestSet.add(&mut globalRoots, available[at]) at = at + usize.ONE }
+    let mut written = ExactSet.make()
+    let mut persisted = usize.ZERO
+    let mut part = usize.ZERO
+    while part < coverage.length {
+      let covered = &coverage[part]
+      part = part + usize.ONE
+      if !run ExactSet.add(&mut written, Bytes.asSlice(&covered.stable)) { continue }
+      let mut reads = List<usize>.make()
+      let keys = List<Bytes>.asSlice(&readKeys)
+      at = usize.ZERO
+      while at < keys.length {
+        if same(Bytes.asSlice(&keys[at]), Bytes.asSlice(&covered.stable)) {
+          run List<usize>.append(&mut reads, CacheImage.nodeEdge(List<usize>.get(&readNodes, at)))
+        }
+        at = at + usize.ONE
+      }
+      if List<usize>.length(&reads) == usize.ZERO { continue }
+      let mut wanted = List<ContentHash>.make()
+      let concrete = List<DeclarationId>.asSlice(&covered.concrete)
+      at = usize.ZERO
+      while at < concrete.length {
+        let identity = run Types.internDeclaration(DeclarationId.copy(&concrete[at]))
+        let instance = run InstanceKey.named(&identity)
+        let exact = run keyDigest(&instance, false)
+        if DigestSet.find(&globalRoots, exact) != usize.MAX { run List<ContentHash>.append(&mut wanted, exact) }
+        at = at + usize.ONE
+      }
+      let sliced = match move run WalkFragments.rooted(graph, &index, List<ContentHash>.asSlice(&wanted)) {
+        Option<BuildRecord.Record>.Some {value} => move value
+        Option<BuildRecord.Record>.None => { continue }
+      }
+      if !(run WalkFragments.finiteClosed(&sliced)) || !(run WalkFragments.escapeFree(&sliced)) { continue }
+      let members = List<BuildRecord.Entry>.asSlice(&sliced.entries)
+      let mut dependencies = List<usize>.make()
+      let mut complete = true
+      at = usize.ZERO
+      while at < members.length && complete {
+        if members[at].leaf == 0 {
+          let entry = DigestSet.find(&entries, members[at].exact)
+          if entry == usize.MAX { complete = false }
+          else { run List<usize>.append(&mut dependencies, CacheImage.nodeEdge(List<usize>.get(&entryNodes, entry))) }
+        }
+        at = at + usize.ONE
+      }
+      if !complete { continue }
+      // Root/signature reads remain separate from per-MIR validity, just as a normal record's
+      // growth guard does. The check root additionally rests on every entry's exact MIR inputs.
+      let recordNode = run CacheImage.addNode(&mut image, List<usize>.asSlice(&reads))
+      run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: run escapeRecordKey(Bytes.asSlice(&covered.stable)),
+        node: recordNode, answer: run BuildRecord.encode(&sliced)})
+      run List<usize>.append(&mut dependencies, CacheImage.nodeEdge(recordNode))
+      let checked = run CacheImage.addNode(&mut image, List<usize>.asSlice(&dependencies))
+      run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: run Bytes.copy(Bytes.asSlice(&covered.stable)),
+        node: checked, answer: run checkAnswer(1, concrete)})
+      persisted = persisted + usize.ONE
+    }
+    // The record/check roots added above are complete. Drop only the opaque IPC reads roots;
+    // their dependency nodes remain reachable from the complete published records.
+    let finalRoots = List<CacheImage.Root>.asSlice(&image.roots)
+    let mut selected = List<usize>.make()
+    at = usize.ZERO
+    while at < finalRoots.length {
+      let mut named = Span.make(usize.ZERO, usize.ZERO)
+      if !frontierReadKey(Bytes.asSlice(&finalRoots[at].key), &mut named) { run List<usize>.append(&mut selected, at) }
+      at = at + usize.ONE
+    }
+    run Semantic.unpackAdoptedImage(&mut self.*)
+    if let Option<CacheImage.Image>.None = &self.heldImage { self.heldImage = Option<CacheImage.Image>.some(CacheImage.make()) }
+    if let Option<CacheImage.Image>.Some {value: held} = &mut self.heldImage {
+      let base = List<CacheImage.Root>.length(&held.roots)
+      drop run CacheImage.carry(&mut held, &image, List<usize>.asSlice(&selected))
+      at = usize.ZERO
+      while at < List<usize>.length(&selected) {
+        run List<usize>.append(&mut self.artifactCacheRoots, base + at)
+        at = at + usize.ONE
+      }
+    }
+    run frontierTrace(b"check cache imported", self.frontierSplit, persisted, List<usize>.length(&selected))
+  }
+}
+
+effect fn frontierReadSeparationClaims() -> ()
+! InvalidModulePath | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let module = run ModuleId.make(b"memory", b"frontier", b"dependencies")
+  let mut store = Semantic.make(Revision.make(), MachineTarget.forId(TargetId.Aarch64AppleDarwin), Option<FinalProfile>.none())
+  let ordinal = run internModule(&mut store.resolver, &module)
+  let mirWord = run internKey(&mut store.resolver, Key {family: Family.Mir, module: ordinal, name: 0,
+    declaration: usize.MAX, member: 0, external: false})
+  let signatureWord = run internKey(&mut store.resolver, Key {family: Family.Signature, module: ordinal, name: 0,
+    declaration: usize.MAX, member: 0, external: false})
+  let checkWord = run internKey(&mut store.resolver, Key {family: Family.ModuleCheck, module: ordinal, name: 1,
+    declaration: usize.MAX, member: 1, external: false})
+  let mir = u64.toUsize(mirWord.value)
+  let signature = u64.toUsize(signatureWord.value)
+  let check = u64.toUsize(checkWord.value)
+  run Graph.startRun(&mut store.resolver.graph, mir)
+  run Graph.record(&mut store.resolver.graph, mir, Dependee.SourceInput {input: 1, module: ordinal})
+  drop run Graph.finishRun(&mut store.resolver.graph, mir, Option<ContentHash>.none())
+  run Graph.startRun(&mut store.resolver.graph, signature)
+  run Graph.record(&mut store.resolver.graph, signature, Dependee.SourceInput {input: 2, module: ordinal})
+  drop run Graph.finishRun(&mut store.resolver.graph, signature, Option<ContentHash>.none())
+  run Graph.startRun(&mut store.resolver.graph, check)
+  run Graph.record(&mut store.resolver.graph, check, Dependee.UnitResult {unit: mir})
+  run Graph.record(&mut store.resolver.graph, check, Dependee.UnitResult {unit: signature})
+  run Graph.record(&mut store.resolver.graph, check, Dependee.SourceInput {input: 3, module: ordinal})
+  drop run Graph.finishRun(&mut store.resolver.graph, check, Option<ContentHash>.none())
+  let mut entries = List<CapturedEntry>.make()
+  run List<CapturedEntry>.append(&mut entries, CapturedEntry {value: usize.MAX, mirUnit: mir, emissionUnit: usize.MAX, carried: usize.MAX})
+  let capture = CapturedBuild {record: BuildRecord.make(false, false), entries: move entries, guard: usize.MAX, carriedRecord: usize.MAX}
+  let saved = run frontierNonMirReads(&mut store.resolver, ordinal, check, &capture, 99)
+  // The next declaration chunk reuses the check unit, but cannot replace the previous chunk's reads.
+  run Graph.startRun(&mut store.resolver.graph, check)
+  run Graph.record(&mut store.resolver.graph, check, Dependee.SourceInput {input: 4, module: ordinal})
+  drop run Graph.finishRun(&mut store.resolver.graph, check, Option<ContentHash>.none())
+  Graph.beginRevision(&mut store.resolver.graph)
+  run Graph.inputChanged(&mut store.resolver.graph, 1, ordinal)
+  run Testing.expect(Graph.state(&store.resolver.graph, mir) == UnitState.Outdated
+    && Graph.state(&store.resolver.graph, saved) == UnitState.UpToDate,
+    "a body edit invalidates its MIR entry without discarding the reusable record's root reads")
+  run Graph.inputChanged(&mut store.resolver.graph, 2, ordinal)
+  run Testing.expect(Graph.state(&store.resolver.graph, saved) == UnitState.Outdated,
+    "root signature dependencies remain exact even after the next chunk replaces its original check unit")
+}
+
+test effect fn frontierCacheSeparatesBodyInputsFromRootReads() -> ()
+! InvalidModulePath | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run frontierReadSeparationClaims() |> Effect.provideMut<Allocator>(&mut allocator)
 }
