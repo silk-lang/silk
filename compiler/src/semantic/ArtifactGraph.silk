@@ -1,0 +1,316 @@
+//! Mode-consistent selected-instance graphs returned by retained semantic workers.
+//! Only the coordinator's roots participate. Exact-pattern graphs keep region aliases separate;
+//! code graphs use provider-sensitive definition digests supplied by their producing workers.
+import semantic.BuildRecord
+import semantic.ContentHash {ContentHash}
+import semantic.DeclarationId {DeclarationId}
+import semantic.StableKey
+import semantic.InternIndex {InternIndex}
+import silk.collections.bytes {Bytes}
+import silk.collections.hash {Hash}
+import silk.collections.list {List}
+import silk.core.option {Option}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.u64
+import silk.num.usize
+
+// An omitted reference whose producing worker supplies its exact body separately.
+const EXTERNAL: u64 = 3
+struct Source {record: usize, entry: usize}
+struct Visit {entry: usize, parent: usize, position: usize}
+
+fn hashed(value: ContentHash) -> u64 { return Hash.combine(value.high, value.low) }
+fn find(keys: &[ContentHash], lookup: &InternIndex, key: ContentHash) -> usize {
+  let mut at = InternIndex.first(lookup, hashed(key))
+  while at != usize.MAX {
+    if ContentHash.equals(keys[at], key) { return at }
+    at = InternIndex.after(lookup, at)
+  }
+  return usize.MAX
+}
+fn sameBytes(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+fn sameFacts(left: &BuildRecord.Facts, right: &BuildRecord.Facts) -> bool {
+  if left.flags != right.flags || left.keyBytes != right.keyBytes || !ContentHash.equals(left.definition, right.definition)
+    || !ContentHash.equals(left.bare, right.bare) { return false }
+  let firstCalls = List<usize>.asSlice(&left.callees)
+  let secondCalls = List<usize>.asSlice(&right.callees)
+  if firstCalls.length != secondCalls.length { return false }
+  let mut at = usize.ZERO
+  while at < firstCalls.length {
+    if firstCalls[at] != secondCalls[at] { return false }
+    at = at + usize.ONE
+  }
+  let firstCallbacks = List<ContentHash>.asSlice(&left.callbacks)
+  let secondCallbacks = List<ContentHash>.asSlice(&right.callbacks)
+  if firstCallbacks.length != secondCallbacks.length { return false }
+  at = usize.ZERO
+  while at < firstCallbacks.length {
+    if !ContentHash.equals(firstCallbacks[at], secondCallbacks[at]) { return false }
+    at = at + usize.ONE
+  }
+  let firstObligations = List<BuildRecord.Obligation>.asSlice(&left.obligations)
+  let secondObligations = List<BuildRecord.Obligation>.asSlice(&right.obligations)
+  if firstObligations.length != secondObligations.length { return false }
+  at = usize.ZERO
+  while at < firstObligations.length {
+    let first = &firstObligations[at]
+    let second = &secondObligations[at]
+    if first.exact != second.exact { return false }
+    let firstTargets = List<BuildRecord.Callee>.asSlice(&first.callees)
+    let secondTargets = List<BuildRecord.Callee>.asSlice(&second.callees)
+    if firstTargets.length != secondTargets.length { return false }
+    let mut target = usize.ZERO
+    while target < firstTargets.length {
+      if !ContentHash.equals(firstTargets[target].exact, secondTargets[target].exact)
+        || !ContentHash.equals(firstTargets[target].definition, secondTargets[target].definition) { return false }
+      target = target + usize.ONE
+    }
+    let firstDeclarations = List<Bytes>.asSlice(&first.declarations)
+    let secondDeclarations = List<Bytes>.asSlice(&second.declarations)
+    if firstDeclarations.length != secondDeclarations.length { return false }
+    let mut declaration = usize.ZERO
+    while declaration < firstDeclarations.length {
+      if !sameBytes(Bytes.asSlice(&firstDeclarations[declaration]), Bytes.asSlice(&secondDeclarations[declaration])) { return false }
+      declaration = declaration + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+fn sameBody(leftEntries: &[BuildRecord.Entry], left: &BuildRecord.Entry,
+  rightEntries: &[BuildRecord.Entry], right: &BuildRecord.Entry) -> bool {
+  if left.leaf != right.leaf || !ContentHash.equals(left.summary, right.summary) || !sameFacts(&left.facts, &right.facts) { return false }
+  let first = List<BuildRecord.Reference>.asSlice(&left.references)
+  let second = List<BuildRecord.Reference>.asSlice(&right.references)
+  if first.length != second.length { return false }
+  let mut at = usize.ZERO
+  while at < first.length {
+    if first[at].target >= leftEntries.length || second[at].target >= rightEntries.length { return false }
+    if !ContentHash.equals(leftEntries[first[at].target].exact, rightEntries[second[at].target].exact)
+      || !ContentHash.equals(first[at].edge, second[at].edge) { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+fn wellFormed(entries: &[BuildRecord.Entry], entry: &BuildRecord.Entry) -> bool {
+  if entry.alias != usize.MAX || (entry.leaf != 0 && entry.leaf != BuildRecord.FOREIGN && entry.leaf != EXTERNAL)
+    || entry.family > 3 { return false }
+  let references = List<BuildRecord.Reference>.asSlice(&entry.references)
+  if entry.leaf != 0 && references.length != usize.ZERO { return false }
+  let mut at = usize.ZERO
+  while at < references.length {
+    if references[at].target >= entries.length { return false }
+    at = at + usize.ONE
+  }
+  let callees = List<usize>.asSlice(&entry.facts.callees)
+  at = usize.ZERO
+  while at < callees.length {
+    if callees[at] >= references.length { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+/// Resolves the graph reachable from `roots`, in root/reference DFS order.
+/// Every fragment must use `observing` and `patterns`. When `patterns` is true, roots and edges
+/// already name exact region patterns; otherwise they already name provider-sensitive definitions.
+/// Identities are never converted between modes. A reached body must observe diagnostics exactly
+/// when `observing` is selected. Refuses unresolved edges, conflicting definitions, suspension,
+/// and NonParking obligations whose definitions, provider-free targets or declarations have no body.
+/// This graph still needs admission and escape proof; its worker fragments are not admission
+/// certificates or a persistent build cache.
+pub effect fn merge(records: &[BuildRecord.Record], roots: &[ContentHash], observing: bool, patterns: bool) -> Option<BuildRecord.Record>
+! OutOfMemoryError ? &mut Allocator {
+  let mut keys = List<ContentHash>.make()
+  let mut lookup = InternIndex.make()
+  let mut chosen = List<Source>.make()
+  let mut mappings = List<List<usize>>.make()
+  let mut guarded = false
+  let mut recordAt = usize.ZERO
+  while recordAt < records.length {
+    let record = &records[recordAt]
+    if record.patterns != patterns || record.observing != observing { return Option<BuildRecord.Record>.none() }
+    guarded = guarded || record.guarded
+    let entries = List<BuildRecord.Entry>.asSlice(&record.entries)
+    let mut mapping = List<usize>.make()
+    let mut at = usize.ZERO
+    while at < entries.length {
+      let entry = &entries[at]
+      if !wellFormed(entries, entry) { return Option<BuildRecord.Record>.none() }
+      let mut selected = find(List<ContentHash>.asSlice(&keys), &lookup, entry.exact)
+      if selected == usize.MAX {
+        selected = List<ContentHash>.length(&keys)
+        run List<ContentHash>.append(&mut keys, entry.exact)
+        run InternIndex.record(&mut lookup, hashed(entry.exact))
+        run List<Source>.append(&mut chosen, Source {record: recordAt, entry: at})
+      } else {
+        let prior = &List<Source>.asSlice(&chosen)[selected]
+        let knownEntries = List<BuildRecord.Entry>.asSlice(&records[prior.record].entries)
+        let known = &knownEntries[prior.entry]
+        if entry.hash != known.hash || entry.family != known.family
+          || !sameBytes(Bytes.asSlice(&entry.declaration), Bytes.asSlice(&known.declaration)) { return Option<BuildRecord.Record>.none() }
+        if entry.leaf != EXTERNAL && known.leaf != EXTERNAL && !sameBody(entries, entry, knownEntries, known) {
+          return Option<BuildRecord.Record>.none()
+        }
+        if known.leaf == EXTERNAL && entry.leaf != EXTERNAL {
+          List<Source>.set(&mut chosen, selected, Source {record: recordAt, entry: at})
+        }
+      }
+      run List<usize>.append(&mut mapping, selected)
+      at = at + usize.ONE
+    }
+    run List<List<usize>>.append(&mut mappings, move mapping)
+    recordAt = recordAt + usize.ONE
+  }
+  let sources = List<Source>.asSlice(&chosen)
+  let maps = List<List<usize>>.asSlice(&mappings)
+  let mut result = BuildRecord.make(observing, patterns)
+  result.guarded = guarded
+  let mut at = usize.ZERO
+  while at < roots.length {
+    run List<ContentHash>.append(&mut result.roots, roots[at])
+    at = at + usize.ONE
+  }
+  let mut pending = List<Visit>.make()
+  at = roots.length
+  while at > usize.ZERO {
+    at = at - usize.ONE
+    let entry = find(List<ContentHash>.asSlice(&keys), &lookup, roots[at])
+    if entry == usize.MAX { return Option<BuildRecord.Record>.none() }
+    run List<Visit>.append(&mut pending, Visit {entry: entry, parent: usize.MAX, position: at})
+  }
+  let mut observes = false
+  let mut placed = List<usize>.make()
+  run List<usize>.appendRepeated(&mut placed, usize.MAX, sources.length)
+  while let Option<Visit>.Some {value: visit} = move List<Visit>.pop(&mut pending) {
+    if List<usize>.get(&placed, visit.entry) != usize.MAX { continue }
+    let source = &sources[visit.entry]
+    let entry = &List<BuildRecord.Entry>.asSlice(&records[source.record].entries)[source.entry]
+    if entry.leaf == EXTERNAL { return Option<BuildRecord.Record>.none() }
+    let flags = entry.facts.flags
+    if u64.bitAnd(flags, BuildRecord.FACT_SUSPENDS) != 0 { return Option<BuildRecord.Record>.none() }
+    if u64.bitAnd(flags, BuildRecord.FACT_OBSERVES) != 0 {
+      if !observing { return Option<BuildRecord.Record>.none() }
+      observes = true
+    }
+    if entry.leaf == 0 && u64.bitAnd(flags, BuildRecord.FACT_KNOWN + BuildRecord.FACT_SUMMARIZED)
+      != BuildRecord.FACT_KNOWN + BuildRecord.FACT_SUMMARIZED { return Option<BuildRecord.Record>.none() }
+    let mapping = List<usize>.asSlice(&maps[source.record])
+    let next = List<BuildRecord.Entry>.length(&result.entries)
+    List<usize>.set(&mut placed, visit.entry, next)
+    let original = List<BuildRecord.Reference>.asSlice(&entry.references)
+    let mut references = List<BuildRecord.Reference>.make()
+    at = usize.ZERO
+    while at < original.length {
+      run List<BuildRecord.Reference>.append(&mut references, BuildRecord.Reference {
+        target: mapping[original[at].target], edge: original[at].edge})
+      at = at + usize.ONE
+    }
+    run List<BuildRecord.Entry>.append(&mut result.entries, BuildRecord.Entry {
+      exact: entry.exact, hash: entry.hash, family: entry.family, declaration: run Bytes.copy(Bytes.asSlice(&entry.declaration)),
+      parent: visit.parent, position: visit.position, requested: false, alias: usize.MAX, leaf: entry.leaf,
+      references: move references, summary: entry.summary, facts: run BuildRecord.copyFacts(&entry.facts)})
+    at = original.length
+    while at > usize.ZERO {
+      at = at - usize.ONE
+      run List<Visit>.append(&mut pending, Visit {entry: mapping[original[at].target], parent: next, position: at})
+    }
+  }
+  // A declaration obligation needs some selected body of that declaration. Every selected
+  // body has already passed the no-suspension check, so all matching instances are nonparking.
+  // Entry declarations may append shape information; compare the canonical declaration prefix.
+  let reached = List<BuildRecord.Entry>.asSlice(&result.entries)
+  // NonParking uses sameInstance, including a provider-bearing body's bare key, even
+  // when graph roots/edges use exact patterns. These are proofs of already reached
+  // bodies, never extra emission roots. Every reached body is globally nonparking.
+  let mut covered = List<ContentHash>.make()
+  let mut coverage = InternIndex.make()
+  let mut named = false
+  at = usize.ZERO
+  while at < reached.length {
+    if reached[at].leaf == 0 {
+      run List<ContentHash>.append(&mut covered, reached[at].facts.definition)
+      run InternIndex.record(&mut coverage, hashed(reached[at].facts.definition))
+      if u64.bitAnd(reached[at].facts.flags, BuildRecord.FACT_BARE) != 0 {
+        run List<ContentHash>.append(&mut covered, reached[at].facts.bare)
+        run InternIndex.record(&mut coverage, hashed(reached[at].facts.bare))
+      }
+    }
+    let obligations = List<BuildRecord.Obligation>.asSlice(&reached[at].facts.obligations)
+    let mut obligation = usize.ZERO
+    while obligation < obligations.length {
+      if List<Bytes>.length(&obligations[obligation].declarations) > usize.ZERO { named = true }
+      obligation = obligation + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  let mut declarations = List<Bytes>.make()
+  let mut declarationLookup = InternIndex.make()
+  if named {
+    at = usize.ZERO
+    while at < reached.length {
+      if reached[at].leaf == 0 && u64.bitAnd(reached[at].facts.flags, BuildRecord.FACT_SUMMARIZED) != 0 {
+        let mut reader = StableKey.reader()
+        let declaration = match move run StableKey.readDeclaration(Bytes.asSlice(&reached[at].declaration), &mut reader) {
+          Option<DeclarationId>.Some {value} => move value
+          Option<DeclarationId>.None => { return Option<BuildRecord.Record>.none() }
+        }
+        let mut canonical = Bytes.make()
+        run StableKey.declaration(&mut canonical, &declaration)
+        run InternIndex.record(&mut declarationLookup, InternIndex.hashBytes(0, Bytes.asSlice(&canonical)))
+        run List<Bytes>.append(&mut declarations, move canonical)
+      }
+      at = at + usize.ONE
+    }
+  }
+  let identities = List<Bytes>.asSlice(&declarations)
+  let entries = List<BuildRecord.Entry>.asMutSlice(&mut result.entries)
+  at = usize.ZERO
+  while at < entries.length {
+    let references = List<BuildRecord.Reference>.asMutSlice(&mut entries[at].references)
+    let mut reference = usize.ZERO
+    while reference < references.length {
+      let target = List<usize>.get(&placed, references[reference].target)
+      if target == usize.MAX { return Option<BuildRecord.Record>.none() }
+      references[reference].target = target
+      reference = reference + usize.ONE
+    }
+    let obligations = List<BuildRecord.Obligation>.asSlice(&entries[at].facts.obligations)
+    let mut obligation = usize.ZERO
+    while obligation < obligations.length {
+      let owed = &obligations[obligation]
+      if !owed.exact { return Option<BuildRecord.Record>.none() }
+      let declared = List<Bytes>.asSlice(&owed.declarations)
+      let mut declaration = usize.ZERO
+      while declaration < declared.length {
+        let expected = Bytes.asSlice(&declared[declaration])
+        let mut found = InternIndex.first(&declarationLookup, InternIndex.hashBytes(0, expected))
+        while found != usize.MAX && !sameBytes(Bytes.asSlice(&identities[found]), expected) {
+          found = InternIndex.after(&declarationLookup, found)
+        }
+        if found == usize.MAX { return Option<BuildRecord.Record>.none() }
+        declaration = declaration + usize.ONE
+      }
+      let callees = List<BuildRecord.Callee>.asSlice(&owed.callees)
+      let mut callee = usize.ZERO
+      while callee < callees.length {
+        if find(List<ContentHash>.asSlice(&covered), &coverage, callees[callee].definition) == usize.MAX {
+          return Option<BuildRecord.Record>.none()
+        }
+        callee = callee + usize.ONE
+      }
+      obligation = obligation + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  if observes != observing { return Option<BuildRecord.Record>.none() }
+  return Option<BuildRecord.Record>.some(move result)
+}
