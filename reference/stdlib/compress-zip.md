@@ -16,7 +16,8 @@ be stored or DEFLATE-compressed, unencrypted, and on one disk. A member's local 
 with its central record on method and name, and its data must lie before the central directory.
 Names are checked before a member is returned: an absolute name, a backslash, a colon, a NUL, an
 empty segment, or a `.` or `..` segment refuses the archive, so a caller that joins a name to a
-directory never writes outside it. The reader does not detect repeated names.
+directory and creates no symbolic links never writes outside it. A link's target is not checked,
+so skip `SymbolicLink` members unless you check it. The reader does not detect repeated names.
 
 [`ZipMember.content`](#ZipMember.impl.content) decodes one member and checks its length and CRC-32. The reader bounds the
 sum of the decoded lengths that the central directory declares, so a caller can bound memory

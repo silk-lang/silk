@@ -79,6 +79,14 @@ def plain(name, data, method=zipfile.ZIP_DEFLATED):
     return buffer.getvalue()
 
 
+def empty_deflate():
+    """An empty file recorded as DEFLATE with no compressed bytes, as some writers record it."""
+    archive = bytearray(plain('empty', b'', zipfile.ZIP_STORED))
+    archive[8] = 8
+    archive[archive.index(b'PK\x01\x02') + 10] = 8
+    return bytes(archive)
+
+
 def listing(archive):
     """The listing the Silk program builds, from Python's own reader."""
     lines = []
@@ -102,6 +110,7 @@ def main():
         'streamed': infozip(True),
         'zip64': zip64(),
         'stored': plain('a.txt', b'stored text', zipfile.ZIP_STORED),
+        'empty-deflate': empty_deflate(),
     }
     assert any(info.flag_bits & 8 for info in zipfile.ZipFile(io.BytesIO(cases['streamed'])).infolist()), 'zip wrote no data descriptor'
     assert cases['infozip'].endswith(b'An archive comment.')
