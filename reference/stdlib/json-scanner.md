@@ -690,6 +690,14 @@ string has escapes, so you can decode it with `silk.json.text.JsonText.decode` o
 The scanner does not check for duplicate keys. `silk.json.value.Json.parse` does. After an
 error, the scanner cannot continue. Make a new one.
 
+<a id="JsonScanState.impl.Copy"></a>
+
+## Implementation `Copy for JsonScanState`
+
+```silk
+impl Copy for JsonScanState
+```
+
 <a id="JsonScanState.impl"></a>
 
 ## Implementation `JsonScanState`
@@ -776,6 +784,22 @@ pub fn peek(self: &mut JsonScanner<'input>) -> Result<JsonToken, JsonError>
 ```
 
 Returns the next token without consuming it. The next call to `next` returns the same token.
+
+<a id="JsonScanner.impl.fork"></a>
+
+### Method `fork`
+
+```silk
+pub fn fork(self: &JsonScanner<'input>) -> JsonScanner<'input>
+```
+
+Returns a scanner at the same position as `self`, which reads the same tokens next without
+moving `self`.
+
+#### When to use
+
+Use it to look ahead more than one token, such as to find a member of an object before
+reading the members before it.
 
 <a id="JsonScanner.impl.offset"></a>
 
