@@ -1,12 +1,13 @@
-// Real native silk.http.client requests against two loopback HTTP servers: query encoding, header
-// defaults and overrides, bodies, status handling, redirects, credential stripping, and limits.
+// Real native silk.http.client requests against two loopback servers, over HTTP/1.1 and over
+// HTTP/2 with TLS: query encoding, header defaults and overrides, bodies, status handling, redirects, credential stripping, and limits.
 import * as assert from 'node:assert/strict'
 import * as Config from 'effect/Config'
 import * as Effect from 'effect/Effect'
-import { spawn } from 'node:child_process'
 import { createServer } from 'node:http'
+import { createSecureServer } from 'node:http2'
+import { execFileSync, spawn } from 'node:child_process'
 import { once } from 'node:events'
-import { mkdtempSync, realpathSync, rmSync, writeFileSync, copyFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, copyFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
@@ -78,9 +79,7 @@ const handle = (routes) => (request, response) => {
   })
 }
 
-let main
-let other
-let proxy
+const servers = new Set()
 const timers = new Set()
 try {
   copyFileSync(
@@ -108,49 +107,70 @@ try {
   ])
   assert.equal(build.status, 0, JSON.stringify(build))
 
-  other = createServer(handle([[/^\/echo$/, echo('other')]]))
-  const otherOrigin = await listen(other)
-  const redirect = (status, location) => (request, response) =>
-    response.writeHead(status, { location }).end()
-  main = createServer(
-    handle([
-      [/^\/echo$/, echo('main')],
-      [/^\/status\/(\d+)$/, (request, response, body, [, code]) =>
-        response.writeHead(Number(code)).end(`status ${code}`)],
-      [/^\/redirect\/(\d+)$/, (request, response, body, [, hops]) =>
-        redirect(302, hops === '0' ? '/echo' : `/redirect/${Number(hops) - 1}`)(request, response)],
-      [/^\/absolute$/, (request, response) =>
-        redirect(302, `http://127.0.0.1:${main.address().port}/echo`)(request, response)],
-      [/^\/see-other$/, redirect(303, '/echo')],
-      [/^\/temporary$/, redirect(307, '/echo')],
-      [/^\/cross$/, redirect(302, `${otherOrigin}/echo`)],
-      [/^\/large$/, (request, response) => response.writeHead(200).end('x'.repeat(4096))],
-      [/^\/json-string$/, (request, response) =>
-        response.writeHead(200, { 'content-type': 'application/json' }).end('"hello"')],
-      [/^\/slow$/, (request, response) => {
-        const timer = setTimeout(() => {
-          timers.delete(timer)
-          response.writeHead(200).end('late')
-        }, 5_000)
-        timers.add(timer)
-      }],
-    ]),
-  )
-  const origin = await listen(main)
-  const opened = { main: 0, other: 0 }
-  main.on('connection', () => {
-    opened.main += 1
-  })
-  other.on('connection', () => {
-    opened.other += 1
-  })
+  // Both origins are served once over HTTP/1.1 and once over HTTP/2 with TLS, where the
+  // client offers h2 and http/1.1 with ALPN and the server accepts only h2.
+  const serve = async (create, scheme, host) => {
+    const versions = new Set()
+    const opened = { main: 0, other: 0 }
+    const record = (handler) => (request, response) => {
+      versions.add(request.httpVersion)
+      handler(request, response)
+    }
+    const other = create(record(handle([[/^\/echo$/, echo('other')]])))
+    servers.add(other)
+    await listen(other)
+    const otherOrigin = `${scheme}://${host}:${other.address().port}`
+    const redirect = (status, location) => (request, response) =>
+      response.writeHead(status, { location }).end()
+    let origin
+    const main = create(
+      record(
+        handle([
+          [/^\/echo$/, echo('main')],
+          [/^\/status\/(\d+)$/, (request, response, body, [, code]) =>
+            response.writeHead(Number(code)).end(`status ${code}`)],
+          [/^\/redirect\/(\d+)$/, (request, response, body, [, hops]) =>
+            redirect(302, hops === '0' ? '/echo' : `/redirect/${Number(hops) - 1}`)(request, response)],
+          [/^\/absolute$/, (request, response) => redirect(302, `${origin}/echo`)(request, response)],
+          [/^\/see-other$/, redirect(303, '/echo')],
+          [/^\/temporary$/, redirect(307, '/echo')],
+          [/^\/cross$/, redirect(302, `${otherOrigin}/echo`)],
+          [/^\/large$/, (request, response) => response.writeHead(200).end('x'.repeat(4096))],
+          [/^\/big$/, (request, response) => response.writeHead(200).end('b'.repeat(100000))],
+          [/^\/length$/, (request, response, body) => response.writeHead(200).end(String(body.length))],
+          [/^\/json-string$/, (request, response) =>
+            response.writeHead(200, { 'content-type': 'application/json' }).end('"hello"')],
+          [/^\/slow$/, (request, response) => {
+            const timer = setTimeout(() => {
+              timers.delete(timer)
+              response.writeHead(200).end('late')
+            }, 5_000)
+            timers.add(timer)
+          }],
+        ]),
+      ),
+    )
+    servers.add(main)
+    await listen(main)
+    origin = `${scheme}://${host}:${main.address().port}`
+    const connection = scheme === 'https' ? 'session' : 'connection'
+    main.on(connection, () => {
+      opened.main += 1
+    })
+    other.on(connection, () => {
+      opened.other += 1
+    })
+    return { main, origin, otherOrigin, opened, versions }
+  }
 
+  const plain = await serve(createServer, 'http', '127.0.0.1')
   // A forward proxy answers itself, so the echo shows the absolute target it received. NO_PROXY
   // names 127.0.0.1, so the other server is reached directly.
-  proxy = createServer(handle([[/^\/echo$/, echo('proxy')]]))
+  const proxy = createServer(handle([[/^\/echo$/, echo('proxy')]]))
+  servers.add(proxy)
   const proxyOrigin = await listen(proxy)
-  const through = `http://localhost:${main.address().port}`
-  const result = await run(executable, [origin, otherOrigin, through], {
+  const through = `http://localhost:${plain.main.address().port}`
+  const result = await run(executable, [plain.origin, plain.otherOrigin, through], {
     ...process.env,
     HTTP_PROXY: proxyOrigin.replace('http://', 'http://user:pa%3Ass@'),
     http_proxy: '',
@@ -162,15 +182,34 @@ try {
   // Sequential requests reuse an idle connection, so a redirect to the other server and back
   // reuses the first connection to the main server. The four requests of `sendAll` run at once and
   // open up to four more, and the two tasks of the 150-request batch open up to two.
-  assert.ok(opened.main <= 10 && opened.other <= 2, JSON.stringify(opened))
-  console.log('Native silk.http.client conformance passed')
+  assert.ok(plain.opened.main <= 10 && plain.opened.other <= 2, JSON.stringify(plain.opened))
+  assert.deepEqual([...plain.versions], ['1.1'])
+  console.log('Native silk.http.client conformance over HTTP/1.1 passed')
+
+  const openssl = (...args) => execFileSync('openssl', args, { cwd: directory, stdio: 'pipe' })
+  openssl('ecparam', '-name', 'prime256v1', '-genkey', '-noout', '-out', 'root.key')
+  openssl('req', '-new', '-x509', '-key', 'root.key', '-sha256', '-days', '2', '-subj', '/CN=Silk Client Test Root',
+    '-addext', 'basicConstraints=critical,CA:TRUE', '-addext', 'keyUsage=critical,keyCertSign,cRLSign', '-out', 'root.pem')
+  openssl('ecparam', '-name', 'prime256v1', '-genkey', '-noout', '-out', 'leaf.key')
+  openssl('req', '-new', '-key', 'leaf.key', '-subj', '/CN=localhost', '-out', 'leaf.csr')
+  writeFileSync(
+    join(directory, 'leaf.ext'),
+    'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:localhost\n',
+  )
+  openssl('x509', '-req', '-in', 'leaf.csr', '-CA', 'root.pem', '-CAkey', 'root.key', '-set_serial', '10',
+    '-days', '2', '-sha256', '-extfile', 'leaf.ext', '-out', 'leaf.pem')
+  const tls = { key: readFileSync(join(directory, 'leaf.key')), cert: readFileSync(join(directory, 'leaf.pem')) }
+  const secure = await serve((handler) => createSecureServer(tls, handler), 'https', 'localhost')
+  const secured = await run(executable, [secure.origin, secure.otherOrigin, '', join(directory, 'root.pem')])
+  assert.equal(secured.status, 0, JSON.stringify(secured))
+  assert.ok(secure.opened.main <= 10 && secure.opened.other <= 2, JSON.stringify(secure.opened))
+  assert.deepEqual([...secure.versions], ['2.0'])
+  console.log('Native silk.http.client conformance over HTTP/2 with TLS passed')
 } finally {
   for (const timer of timers) clearTimeout(timer)
-  main?.closeAllConnections?.()
-  other?.closeAllConnections?.()
-  proxy?.closeAllConnections?.()
-  main?.close()
-  other?.close()
-  proxy?.close()
+  for (const server of servers) {
+    server.closeAllConnections?.()
+    server.close()
+  }
   rmSync(directory, { recursive: true, force: true })
 }
