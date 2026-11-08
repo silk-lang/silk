@@ -25,7 +25,7 @@ and exhausted resource limits are errors, never a negative match.
 
 Import as `Regex` with `import silk.text.regex { Regex }`.
 
-Public declarations: 4.
+Public declarations: 5.
 
 <a id="RegexReason"></a>
 
@@ -232,6 +232,130 @@ to UTF-16 in storage that belongs to this call. The pattern is immutable.
 - `RegexError` with `MatchLimit` after about 1,000,000 backtracking steps. Exhaustion is
   never reported as `false`.
 - `OutOfMemoryError` if the allocator cannot supply converted text or backtracking storage.
+
+<a id="Regex.impl.find"></a>
+
+### Associated function `find`
+
+```silk
+pub effect fn find<'a>(pattern: &Pattern, text: string<'a>) -> Option<Match<'a>>
+    ! RegexError | OutOfMemoryError
+    ? &mut Allocator
+```
+
+Returns the first match of a compiled pattern in `text`, with its capture groups.
+
+#### Details
+The search is the one `Regex.test` runs: unanchored unless the pattern supplies anchors, with
+ECMAScript backtracking order deciding which match is first and what each group holds. The
+match borrows `text`; its offsets count UTF-8 bytes even when the search ran on UTF-16.
+
+#### Errors
+- `RegexError` with `MatchLimit` after about 1,000,000 backtracking steps. Exhaustion is
+  never reported as no match.
+- `OutOfMemoryError` if the allocator cannot supply converted text, backtracking storage or
+  the capture offsets.
+
+<a id="Regex.impl.groupCount"></a>
+
+### Associated function `groupCount`
+
+```silk
+pub fn groupCount(pattern: &Pattern) -> usize
+```
+
+Returns the number of capture groups in a compiled pattern, counting group 0, the whole match.
+
+<a id="Regex.impl.groupIndex"></a>
+
+### Associated function `groupIndex`
+
+```silk
+pub fn groupIndex(pattern: &Pattern, name: string) -> Option<usize>
+```
+
+Returns the number of the first capture group named `name`, or none.
+
+#### Details
+Groups are numbered from 1 in the order their `(` appears; group 0 is the whole match. A name
+that ECMAScript lets two alternatives share, as in `(?<n>a)|(?<n>b)`, gives the first group.
+
+<a id="Match"></a>
+
+## `Match`
+
+```silk
+pub struct Match<'a>
+```
+
+One match of a compiled pattern in a text: the matched span and the span of each capture group.
+
+### Details
+Group 0 is the whole match; groups 1 and up are the pattern's capture groups, numbered in the
+order their `(` appears. A group that took no part in the match has no text. Offsets count
+UTF-8 bytes of the searched text, so they cut it with `String.slice`. The match borrows the
+text it was found in.
+
+<a id="Match.impl"></a>
+
+## Implementation `Match<'a>`
+
+```silk
+impl<'a> Match<'a>
+```
+
+<a id="Match.impl.groupCount"></a>
+
+### Method `groupCount`
+
+```silk
+pub fn groupCount(self: &Self) -> usize
+```
+
+Returns the number of groups, counting group 0, the whole match.
+
+<a id="Match.impl.start"></a>
+
+### Method `start`
+
+```silk
+pub fn start(self: &Self) -> usize
+```
+
+Returns the byte offset where the match starts.
+
+<a id="Match.impl.end"></a>
+
+### Method `end`
+
+```silk
+pub fn end(self: &Self) -> usize
+```
+
+Returns the byte offset just past the end of the match.
+
+<a id="Match.impl.text"></a>
+
+### Method `text`
+
+```silk
+pub fn text(self: &Self) -> string<'a>
+```
+
+Returns the matched text.
+
+<a id="Match.impl.group"></a>
+
+### Method `group`
+
+```silk
+pub fn group(self: &Self, index: usize) -> Option<string<'a>>
+```
+
+Returns the text of group `index`, or none when the group took no part in the match.
+
+#### Gotchas
+The program traps if `index` is not less than `groupCount()`.
 
 
 Category: Text.
