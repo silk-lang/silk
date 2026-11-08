@@ -502,10 +502,28 @@ const frontierClaimBytes: usize = 4194320
 const frontierRuntimeCursor: usize = 524288
 const frontierModuleCursor: usize = 524289
 
-// At most one descendant of each original worker is resident. Four shared compute leases
-// cover original work, descendant work and later graph extensions; proxy I/O holds no lease.
+// At most four private descendants are resident globally, alongside the four original workers.
+// Four compute leases cover checking and graph work; proxy I/O holds no lease.
 fn privateFrontier() -> bool {
   return ephemeralFrontier() && !Pointer.isNullMany<u8>(unsafe FrontierHost.environment(Pointer.fromSlice<u8>(b"SILK_FRONTIER_FORK_PRIVATE\0")))
+}
+fn privateFrontierLimit() -> usize {
+  if !Pointer.isNullMany<u8>(unsafe FrontierHost.environment(Pointer.fromSlice<u8>(b"SILK_FRONTIER_RESHARE\0"))) { return 2 }
+  return usize.ONE
+}
+fn reserveFrontierChild(table: [*]mut u64) -> bool {
+  let slot = unsafe Pointer.atMut<u64>(table, 2)
+  let mut before = unsafe Atomic.load<u64>(slot, MemoryOrder.Acquire)
+  while before < 4 {
+    match unsafe Atomic.compareExchange<u64>(slot, before, before + 1, MemoryOrder.AcquireRelease, MemoryOrder.Acquire) {
+      CompareExchange<u64>.Exchanged => { return true }
+      CompareExchange<u64>.Observed {value} => { before = value }
+    }
+  }
+  return false
+}
+fn releaseFrontierChild(table: [*]mut u64) -> () {
+  drop unsafe Atomic.fetchAdd<u64>(unsafe Pointer.atMut<u64>(table, 2), u64.MAX, MemoryOrder.Release)
 }
 fn makeFrontierForkControl() -> Option<[*]mut u64> {
   if !privateFrontier() { return Option<[*]mut u64>.none() }
@@ -514,6 +532,7 @@ fn makeFrontierForkControl() -> Option<[*]mut u64> {
   let table = Pointer.nonNullManyMut<u64>(mapped)
   if let Option<[*]mut u64>.Some {value} = &table {
     unsafe Atomic.store<u64>(unsafe Pointer.atMut<u64>(value, 0), 4, MemoryOrder.Relaxed)
+    unsafe Atomic.store<u64>(unsafe Pointer.atMut<u64>(value, 2), 0, MemoryOrder.Relaxed)
   }
   return table
 }
@@ -1000,10 +1019,17 @@ impl Semantic {
   effect fn artifactProxyBatch(self: &mut Self, command: u8, payload: &[u8]) -> Bytes
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
     if command != 4 && command != 5 { return Bytes.make() }
-    // This scheduler permits one child per original shard. Reject unexpected topology rather
-    // than allowing a stale route to select a different MIR store.
-    if List<CheckWorker>.length(&self.frontierChildren) != usize.ONE { return Bytes.make() }
-    let childControl = List<CheckWorker>.asSlice(&self.frontierChildren)[0].control
+    // Logical owner root+4*sequence maps to child sequence-1. Copy handles before local
+    // commands mutate the store; publication freezes this bounded descendant roster.
+    let children = List<CheckWorker>.asSlice(&self.frontierChildren)
+    if children.length == usize.ZERO || children.length > 2 { return Bytes.make() }
+    let mut controls = List<i32>.make()
+    let mut child = usize.ZERO
+    while child < children.length {
+      run List<i32>.append(&mut controls, children[child].control)
+      child = child + usize.ONE
+    }
+    let stores = List<i32>.length(&controls) + usize.ONE
     let mut reader = StableKey.reader()
     let count = StableKey.readWord(payload, &mut reader)
     if count > 100000 { return Bytes.make() }
@@ -1016,7 +1042,8 @@ impl Semantic {
       if StableKey.failed(&reader) { return Bytes.make() }
       let mut worker = usize.ZERO
       if command == 4 {
-        if artifactLogicalOwner(&self.frontierClaims, definition, self.frontierWorker) == self.frontierWorker + 4 { worker = usize.ONE }
+        let owner = artifactLogicalOwner(&self.frontierClaims, definition, self.frontierWorker)
+        if owner >= 4 && owner % 4 == self.frontierWorker && owner / 4 < stores { worker = owner / 4 }
       } else {
         let route = DigestSet.find(&self.artifactRouteDigests, definition)
         if route == usize.MAX { return Bytes.make() }
@@ -1024,6 +1051,7 @@ impl Semantic {
         if !ContentHash.equals(chosen.exact, exact) { return Bytes.make() }
         worker = chosen.worker
       }
+      if worker >= stores { return Bytes.make() }
       run List<ArtifactJob>.append(&mut jobs, ArtifactJob {exact: exact, definition: definition, worker: worker, producer: worker, done: false})
       run List<Bytes>.append(&mut replies, Bytes.make())
       at = at + 1
@@ -1031,10 +1059,13 @@ impl Semantic {
     if !StableKey.finished(payload, &reader) { return Bytes.make() }
     let mut childEmitted = usize.ZERO
     let mut round = usize.ZERO
-    while round < 2 {
+    while round < stores {
       let mut batches = List<List<usize>>.make()
-      run List<List<usize>>.append(&mut batches, List<usize>.make())
-      run List<List<usize>>.append(&mut batches, List<usize>.make())
+      let mut batch = usize.ZERO
+      while batch < stores {
+        run List<List<usize>>.append(&mut batches, List<usize>.make())
+        batch = batch + usize.ONE
+      }
       let pending = List<ArtifactJob>.asSlice(&jobs)
       let mut index = usize.ZERO
       let mut remaining = usize.ZERO
@@ -1049,7 +1080,7 @@ impl Semantic {
       let selected = List<List<usize>>.asSlice(&batches)
       let mut requests = List<Bytes>.make()
       let mut side = usize.ZERO
-      while side < 2 {
+      while side < stores {
         let positions = List<usize>.asSlice(&selected[side])
         let mut request = Bytes.make()
         run RuntimeEncoding.word(&mut request, usize.toU64(positions.length))
@@ -1062,17 +1093,22 @@ impl Semantic {
         run List<Bytes>.append(&mut requests, move request)
         side = side + usize.ONE
       }
-      if List<usize>.length(&selected[1]) > usize.ZERO {
-        if !run sendArtifactPacket(childControl, command, Bytes.asSlice(&List<Bytes>.asSlice(&requests)[1])) { return Bytes.make() }
+      side = usize.ONE
+      while side < stores {
+        if List<usize>.length(&selected[side]) > usize.ZERO {
+          if !run sendArtifactPacket(List<i32>.asSlice(&controls)[side - usize.ONE], command,
+            Bytes.asSlice(&List<Bytes>.asSlice(&requests)[side])) { return Bytes.make() }
+        }
+        side = side + usize.ONE
       }
       side = usize.ZERO
-      while side < 2 {
+      while side < stores {
         let positions = List<usize>.asSlice(&selected[side])
         if positions.length == usize.ZERO { side = side + usize.ONE continue }
         let reply = if side == usize.ZERO {
           run Semantic.artifactLocalCommand(&mut self.*, command, Bytes.asSlice(&List<Bytes>.asSlice(&requests)[0]))
         } else {
-          match move run readArtifactPacket(childControl) {
+          match move run readArtifactPacket(List<i32>.asSlice(&controls)[side - usize.ONE]) {
             Option<Bytes>.Some {value} => move value
             Option<Bytes>.None => { return Bytes.make() }
           }
@@ -1099,7 +1135,7 @@ impl Semantic {
             } else if status > 3 { return Bytes.make() }
             if StableKey.failed(&fields) { return Bytes.make() }
             let changed = &mut List<ArtifactJob>.asMutSlice(&mut jobs)[positions[index]]
-            if status == 0 && round == usize.ZERO { changed.worker = usize.ONE - side }
+            if status == 0 && round + usize.ONE < stores { changed.worker = (side + usize.ONE) % stores }
             else {
               changed.done = true
               let output = List<Bytes>.asMutSlice(&mut replies)
@@ -1109,13 +1145,16 @@ impl Semantic {
           }
           if !StableKey.finished(bytes, &fields) { return Bytes.make() }
         } else {
-          if side == usize.ONE { childEmitted = childEmitted + positions.length }
+          if side != usize.ZERO { childEmitted = childEmitted + positions.length }
           let entries = match move run DefinitionFragments.read(bytes, b"retained-ordinary-artifact") {
             Option<List<DefinitionFragments.Entry>>.Some {value} => move value
             Option<List<DefinitionFragments.Entry>>.None => { return Bytes.make() }
           }
           let values = List<DefinitionFragments.Entry>.asSlice(&entries)
           if values.length != positions.length { return Bytes.make() }
+          if side != usize.ZERO {
+            run frontierTrace(b"artifact descendant store emitted", self.frontierSplit, self.frontierWorker + 4 * side, values.length)
+          }
           while index < values.length {
             let job = List<ArtifactJob>.get(&jobs, positions[index])
             let value = &values[index]
@@ -98277,7 +98316,7 @@ impl Semantic {
         self.frontierTried = true
         self.frontierSplit = run frontierNow()
         run frontierTrace(b"split", self.frontierStarted, List<CaptureEntry>.length(&capture.entries), frontierWidth(List<BackendVisit>.asSlice(&pending)))
-        run List<CheckWorker>.reserve(&mut self.frontierChildren, usize.ONE)
+        run List<CheckWorker>.reserve(&mut self.frontierChildren, privateFrontierLimit())
         let prior = List<InstanceKey>.asSlice(&visited)
         let mut keyAt = usize.ZERO
         while keyAt < prior.length {
@@ -98389,35 +98428,54 @@ impl Semantic {
             let wanted = frontierWidth(private) >= 16
             requestFrontierFork(control, &mut self.frontierForkRequested, wanted)
             if wanted && tryFrontierLease(control) {
-              self.frontierForkUsed = true
               requestFrontierFork(control, &mut self.frontierForkRequested, false)
-              let stream = unsafe FrontierHost.temporaryFile()
-              let mut sockets: [i32; 2] = [-1, -1]
-              let paired = !Pointer.isNull<u8>(stream) && unsafe FrontierHost.socketPair(Pointer.fromMutSlice<i32>(&mut sockets)) == 0
-              let process = if paired { unsafe FrontierHost.fork() } else { -1 }
-              if process < 0 {
-                if paired { drop unsafe FrontierHost.close(sockets[0]) drop unsafe FrontierHost.close(sockets[1]) }
-                if !Pointer.isNull<u8>(stream) { drop unsafe FrontierHost.closeFile(stream) }
+              if !reserveFrontierChild(control) {
+                self.frontierForkUsed = true
                 releaseFrontierLease(control)
               } else {
-                let child = process == 0
-                if child {
-                  drop unsafe FrontierHost.close(sockets[0])
-                  drop unsafe FrontierHost.close(self.frontierControl)
-                  drop unsafe FrontierHost.closeFile(self.frontierOutput)
-                  self.frontierControl = sockets[1]
-                  self.frontierOutput = stream
-                  self.frontierWorker = self.frontierWorker + 4
+                let sequence = List<CheckWorker>.length(&self.frontierChildren) + usize.ONE
+                let stream = unsafe FrontierHost.temporaryFile()
+                let mut sockets: [i32; 2] = [-1, -1]
+                let paired = !Pointer.isNull<u8>(stream) && unsafe FrontierHost.socketPair(Pointer.fromMutSlice<i32>(&mut sockets)) == 0
+                let process = if paired { unsafe FrontierHost.fork() } else { -1 }
+                if process < 0 {
+                  if paired { drop unsafe FrontierHost.close(sockets[0]) drop unsafe FrontierHost.close(sockets[1]) }
+                  if !Pointer.isNull<u8>(stream) { drop unsafe FrontierHost.closeFile(stream) }
+                  releaseFrontierChild(control)
+                  releaseFrontierLease(control)
+                  self.frontierForkUsed = true
                 } else {
-                  drop unsafe FrontierHost.close(sockets[1])
-                  run List<CheckWorker>.append(&mut self.frontierChildren, CheckWorker {process: process, stream: stream, control: sockets[0]})
+                  let child = process == 0
+                  if child {
+                    drop unsafe FrontierHost.close(sockets[0])
+                    // Sibling sockets belong to the ancestor. Retaining a duplicate endpoint
+                    // here would hide EOF and could make siblings wait on one another.
+                    let siblings = List<CheckWorker>.asSlice(&self.frontierChildren)
+                    let mut sibling = usize.ZERO
+                    while sibling < siblings.length {
+                      drop unsafe FrontierHost.close(siblings[sibling].control)
+                      drop unsafe FrontierHost.closeFile(siblings[sibling].stream)
+                      sibling = sibling + usize.ONE
+                    }
+                    List<CheckWorker>.clear(&mut self.frontierChildren)
+                    drop unsafe FrontierHost.close(self.frontierControl)
+                    drop unsafe FrontierHost.closeFile(self.frontierOutput)
+                    self.frontierControl = sockets[1]
+                    self.frontierOutput = stream
+                    self.frontierWorker = self.frontierWorker + 4 * sequence
+                    self.frontierForkUsed = true
+                  } else {
+                    drop unsafe FrontierHost.close(sockets[1])
+                    run List<CheckWorker>.append(&mut self.frontierChildren, CheckWorker {process: process, stream: stream, control: sockets[0]})
+                    self.frontierForkUsed = sequence >= privateFrontierLimit()
+                  }
+                  run frontierTrace(b"private fork", self.frontierSplit, self.frontierWorker, frontierWidth(private))
+                  // The ancestor retains this completed prefix. Keep resident MIR and capture
+                  // indexes, but transport only external identities for inherited definitions.
+                  if child { capture.inheritedPrefix = List<CaptureEntry>.length(&capture.entries) }
+                  run selectPrivateFrontier(&mut pending, &mut origins, &mut capture.*, inheritedRemaining, child)
+                  if child { inheritedRemaining = usize.ZERO }
                 }
-                run frontierTrace(b"private fork", self.frontierSplit, self.frontierWorker, frontierWidth(private))
-                // The ancestor retains this completed prefix. Keep resident MIR and capture
-                // indexes, but transport only external identities for its inherited definitions.
-                if child { capture.inheritedPrefix = List<CaptureEntry>.length(&capture.entries) }
-                run selectPrivateFrontier(&mut pending, &mut origins, &mut capture.*, inheritedRemaining, child)
-                if child { inheritedRemaining = usize.ZERO }
               }
             }
           }
@@ -110296,7 +110354,7 @@ test effect fn frontierCoverageRequiresAssignedCapturesAndExactRoots() -> ()
 // origin. Inherited root tasks remain addressable by the original shared scheduling cursor.
 effect fn privateFrontierPartitionClaims() -> () ! InvalidModulePath | OutOfMemoryError | AssertionError<'static>
 ? &mut Allocator | &mut Types {
-  let mut slots: [u64; 2] = [3, 0]
+  let mut slots: [u64; 3] = [3, 0, 0]
   let control = unsafe Pointer.assumeManyMut<u64>(Pointer.fromMutRef<u64>(&mut slots[0]))
   run Testing.expect(tryFrontierLease(control) && !tryFrontierLease(control), "a donated worker reserves the fourth compute lease, never a fifth")
   releaseFrontierLease(control)
@@ -110310,6 +110368,12 @@ effect fn privateFrontierPartitionClaims() -> () ! InvalidModulePath | OutOfMemo
   requestFrontierFork(control, &mut requested, false)
   run Testing.expect(unsafe Atomic.load<u64>(unsafe Pointer.atMut<u64>(control, 1), MemoryOrder.Relaxed) == 0,
     "completed or unavailable donors release their request")
+  run Testing.expect(reserveFrontierChild(control) && reserveFrontierChild(control)
+    && reserveFrontierChild(control) && reserveFrontierChild(control) && !reserveFrontierChild(control),
+    "four global child reservations bound resident workers even when roots donate twice")
+  releaseFrontierChild(control)
+  run Testing.expect(reserveFrontierChild(control) && !reserveFrontierChild(control),
+    "a failed fork returns exactly one resident child reservation")
   let module = run ModuleId.make(b"memory", b"frontier", b"partition")
   let declaration = run Types.internDeclaration(run DeclarationId.fromParts(ModuleId.copy(&module), List<OwnerStep>.make()))
   let mut primary = List<BackendVisit>.make()
