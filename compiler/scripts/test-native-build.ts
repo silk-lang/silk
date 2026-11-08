@@ -119,10 +119,12 @@ const program = Effect.gen(function* () {
   const helpDocReference = yield* invoke(silk, ['help', 'doc-reference'], directory)
   assert.equal(helpDocReference.status, 0, helpDocReference.stderr)
   assert.match(helpDocReference.stdout, /^usage: silk doc-reference \[--stdlib-root <directory>\] --output/)
-  // The project form of `build` comes before the single-file form.
+  // The options of the project form of `build` come before the single-file form.
   const helpBuild = yield* invoke(silk, ['help', 'build'], directory)
   assert.equal(helpBuild.status, 0, helpBuild.stderr)
-  assert.match(helpBuild.stdout, /^usage: silk build \[--manifest-path <path>\].*\n {7}silk build <source> -o <output>/)
+  assert.match(helpBuild.stdout, /^Usage: silk build \[options\]\n\nBuild the package or the workspace members\n\nOptions:\n {6}--manifest-path <value> /)
+  assert.match(helpBuild.stdout, /\n {2}-p, --package <value> /)
+  assert.match(helpBuild.stdout, /\n\nusage: silk build <source> -o <output>/)
   const helpUnknown = yield* invoke(silk, ['help', 'frobnicate'], directory)
   assert.equal(helpUnknown.status, 2, helpUnknown.stderr)
   assert.match(helpUnknown.stderr, /^silk: unknown command `frobnicate`\nusage: silk <command>/)
@@ -130,13 +132,15 @@ const program = Effect.gen(function* () {
   const commandHelp = yield* invoke(silk, ['format', '--help'], directory)
   assert.equal(commandHelp.status, 0, commandHelp.stderr)
   assert.equal(commandHelp.stdout, 'usage: silk format [paths] [--check] [--manifest-path <path>]\n')
-  // `run` lists the progress options it accepts.
-  const runHelp = yield* invoke(silk, ['run', '--help'], directory)
+  // `run` lists the progress options it accepts, and answers `--help` after other options.
+  const runHelp = yield* invoke(silk, ['run', '--release', '--help'], directory)
   assert.equal(runHelp.status, 0, runHelp.stderr)
-  assert.match(runHelp.stdout, /^usage: silk run .*\[--progress auto\|live\|plain\|never\] \[--quiet\] \[--coredump <path>\]/)
+  assert.match(runHelp.stdout, /^Usage: silk run \[options\] <arguments>\n/)
+  assert.match(runHelp.stdout, /\n {6}--progress <value> +How to report progress on standard error \[choices: auto, live, plain, never\]\n/)
+  assert.match(runHelp.stdout, /\n {6}--coredump <value> /)
   const debugHelp = yield* invoke(silk, ['debug', '--help'], directory)
   assert.equal(debugHelp.status, 0, debugHelp.stderr)
-  assert.match(debugHelp.stdout, /^usage: silk debug .*\[--port <\[address:\]port>\]/)
+  assert.match(debugHelp.stdout, /\n {6}--port <value> .*\[default: 1234\]\n/)
   // Toolchains belong to the silk tool, not the compiler: `silk toolchain` and `+<version>` are unknown here.
   const toolchain = yield* invoke(silk, ['toolchain'], directory)
   assert.equal(toolchain.status, 2, toolchain.stderr)
@@ -144,7 +148,7 @@ const program = Effect.gen(function* () {
   // A command line that does not parse is a usage error, status 2, like format's and doc's.
   const unparsed = yield* invoke(silk, ['check', '--bogus'], directory)
   assert.equal(unparsed.status, 2, unparsed.stderr)
-  assert.match(unparsed.stderr, /^silk check: unknown option `--bogus`\nusage: silk check /)
+  assert.equal(unparsed.stderr, 'silk check: unknown option `--bogus`\nRun `silk help check` for its options.\n')
   // A misspelled option is named with the closest one the command takes.
   const relase = yield* invoke(silk, ['check', '--relase'], directory)
   assert.equal(relase.status, 2, relase.stderr)
