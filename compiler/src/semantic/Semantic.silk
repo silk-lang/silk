@@ -507,9 +507,32 @@ fn sharedFrontier() -> bool {
   return !Pointer.isNullMany<u8>(unsafe getenv(Pointer.fromSlice<u8>(b"SILK_FRONTIER_SHARED\0")))
 }
 
+// Two trailing words schedule inherited runtime tasks and checked modules independently.
+const frontierClaimBytes: usize = 4194320
+const frontierRuntimeCursor: usize = 524288
+const frontierModuleCursor: usize = 524289
+
+fn dynamicFrontier() -> bool {
+  return Pointer.isNullMany<u8>(unsafe getenv(Pointer.fromSlice<u8>(b"SILK_FRONTIER_STATIC\0")))
+}
+
+fn takeFrontierTask(table: [*]mut u64, ordinal: usize) -> bool {
+  let counter = unsafe Pointer.atMut<u64>(table, frontierRuntimeCursor)
+  return match unsafe Atomic.compareExchange<u64>(counter, usize.toU64(ordinal), usize.toU64(ordinal + usize.ONE),
+    MemoryOrder.Relaxed, MemoryOrder.Relaxed) {
+    CompareExchange<u64>.Exchanged => true
+    CompareExchange<u64>.Observed {..} => false
+  }
+}
+
+fn takeFrontierModule(table: [*]mut u64) -> usize {
+  // Module zero is the runtime root already being completed by every worker.
+  return u64.toUsize(unsafe Atomic.fetchAdd<u64>(unsafe Pointer.atMut<u64>(table, frontierModuleCursor), 1, MemoryOrder.Relaxed)) + usize.ONE
+}
+
 fn makeFrontierClaims() -> Option<[*]mut u64> {
   if !sharedFrontier() { return Option<[*]mut u64>.none() }
-  let mapped = unsafe mmap(Pointer.null<u8>(), 4194304, 3, 33, -1, 0)
+  let mapped = unsafe mmap(Pointer.null<u8>(), frontierClaimBytes, 3, 33, -1, 0)
   if Pointer.addressMany<u64>(mapped) == usize.MAX { return CompilerBug.panic(b"frontier shared mapping failed") }
   return Pointer.nonNullManyMut<u64>(mapped)
 }
@@ -3270,6 +3293,7 @@ pub struct Semantic {
   frontierChecked: List<usize>,
   frontierClaims: Option<[*]mut u64>,
   frontierOwned: usize,
+  frontierTasks: usize,
   frontierSkipped: usize,
   frontierStarted: u64,
   frontierSplit: u64,
@@ -92647,6 +92671,7 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
     frontierChecked: List<usize>.make(),
     frontierClaims: Option<[*]mut u64>.none(),
     frontierOwned: usize.ZERO,
+    frontierTasks: usize.ZERO,
     frontierSkipped: usize.ZERO,
     frontierStarted: 0,
     frontierSplit: 0,
@@ -94587,8 +94612,15 @@ impl Semantic {
     self.frontierAvailable = false
     run frontierTrace(b"worker-owned-skipped", self.frontierSplit, self.frontierOwned, self.frontierSkipped)
     run frontierTrace(b"worker-runtime", self.frontierSplit, self.frontierWorker, usize.ZERO)
+    run frontierTrace(b"runtime task count", self.frontierSplit, self.frontierWorker, self.frontierTasks)
     let mut at = self.frontierWorker + usize.ONE
-    while at < modules.length {
+    let mut modulesRun = usize.ZERO
+    while true {
+      if dynamicFrontier() {
+        if let Option<[*]mut u64>.Some {value: table} = &self.frontierClaims { at = takeFrontierModule(table) }
+      }
+      if at >= modules.length { break }
+      modulesRun = modulesRun + usize.ONE
       let ordinal = modules[at]
       let module = resolvedModule(&self.resolver, ordinal)
       let found = run Semantic.keptSweep(&mut self.*, &mut request.*, &module, ordinal)
@@ -94609,6 +94641,7 @@ impl Semantic {
         || List<UncheckedDeclaration>.length(&escaped.unchecked) > usize.ZERO { unsafe _exit(3) }
       at = at + 4
     }
+    run frontierTrace(b"module task count", self.frontierSplit, self.frontierWorker, modulesRun)
     run frontierTrace(b"worker-total-owned-skipped", self.frontierSplit, self.frontierOwned, self.frontierSkipped)
     run frontierTrace(b"worker-modules", self.frontierSplit, self.frontierWorker, usize.ZERO)
     let mut image = run Semantic.cacheImage(&mut self.*)
@@ -96284,6 +96317,8 @@ impl Semantic {
     ? &mut Allocator | &mut Types {
     let capturing = guard != usize.MAX
     let mut pending = List<BackendVisit>.make()
+    let mut inheritedRemaining = usize.ZERO
+    let mut inheritedOrdinal = usize.ZERO
     // How each pending visit was reached, as in a build walk.
     let mut origins = List<VisitOrigin>.make()
     let mut summaries = List<SuspensionSummary>.make()
@@ -96408,7 +96443,10 @@ impl Semantic {
             self.frontierWorker = shard
             self.frontierOutput = stream
             self.frontierControl = sockets[1]
-            run selectFrontier(&mut pending, &mut origins, &mut capture.*, shard)
+            let shared = match &self.frontierClaims { Option<[*]mut u64>.Some {..} => true _ => false }
+            if dynamicFrontier() && shared {
+              inheritedRemaining = List<BackendVisit>.length(&pending)
+            } else { run selectFrontier(&mut pending, &mut origins, &mut capture.*, shard) }
             break
           }
           drop unsafe close(sockets[1])
@@ -96423,7 +96461,7 @@ impl Semantic {
             Result<bool, Cycle | OutOfMemoryError>.Failure {error} => { fail move error }
           }
           if let Option<[*]mut u64>.Some {value} = move self.frontierClaims {
-            drop unsafe munmap(value, 4194304)
+            drop unsafe munmap(value, frontierClaimBytes)
           }
           self.frontierClaims = Option<[*]mut u64>.none()
           if accepted {
@@ -96452,6 +96490,10 @@ impl Semantic {
         }
         bounded = false
       }
+      // Private descendants sit above the inherited suffix. Leave markers from that suffix
+      // must still run in order, even when another worker claimed a neighboring Enter task.
+      let inheritedVisit = inheritedRemaining > usize.ZERO && List<BackendVisit>.length(&pending) == inheritedRemaining
+      if inheritedVisit { inheritedRemaining = inheritedRemaining - usize.ONE }
       let visit = match move List<BackendVisit>.pop(&mut pending) {
         Option<BackendVisit>.Some { value } => move value
         _ => {
@@ -96485,6 +96527,17 @@ impl Semantic {
       }
       let instance = move entered.key
       if self.frontierWorker != usize.MAX { run Semantic.rememberFrontier(&mut self.*, &instance) }
+      if inheritedVisit {
+        let ordinal = inheritedOrdinal
+        inheritedOrdinal = inheritedOrdinal + usize.ONE
+        if let Option<[*]mut u64>.Some {value: table} = &self.frontierClaims {
+          if !takeFrontierTask(table, ordinal) {
+            run BuildCapture.reached(&mut capture.*, &instance, origin, WalkFragments.EXTERNAL)
+            continue
+          }
+          self.frontierTasks = self.frontierTasks + usize.ONE
+        }
+      }
 
       // Imported C declarations have checked headers and no authored body to summarize. They
       // remain foreign edges, exactly as in the executable walk; no MIR body is fabricated.
