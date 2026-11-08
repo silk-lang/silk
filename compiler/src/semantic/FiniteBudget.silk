@@ -1,0 +1,196 @@
+//! Deterministic resource accounting for a completed graph of code definitions.
+//!
+//! Exact definitions are charged once. Repeated MIR variants contribute the maximum observed
+//! reference count and retained runtime-key length, so traversal and worker order cannot change
+//! whether a completed graph fits. Exhaustion means the graph was not proved within resources;
+//! it is never evidence that the graph is infinite.
+
+import semantic.ContentHash {ContentHash}
+import semantic.DeclarationId {DeclarationId, OwnerStep}
+import semantic.InternIndex {InternIndex}
+import semantic.ModuleId {InvalidModulePath, ModuleId}
+import silk.collections.hash {Hash}
+import silk.collections.list {List}
+import silk.core.option {Option}
+import silk.core.effect {Effect}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.testing.testing {AssertionError, Testing}
+import silk.num.usize
+
+pub const definitionsLimit: usize = 250000
+pub const bodyDefinitionsLimit: usize = 4096
+pub const referencesLimit: usize = 4000000
+pub const runtimeBytesLimit: usize = 536870912
+
+struct Definition {
+  key: ContentHash,
+  body: usize,
+  bytes: usize,
+  references: usize,
+}
+
+pub struct Budget {
+  definitions: List<Definition>,
+  definitionLookup: InternIndex,
+  bodies: List<DeclarationId>,
+  bodyLookup: InternIndex,
+  bodyCounts: List<usize>,
+  references: usize,
+  bytes: usize,
+  maxDefinitions: usize,
+  maxBodyDefinitions: usize,
+  maxReferences: usize,
+  maxBytes: usize,
+  failed: bool,
+  failure: usize,
+}
+
+impl Budget {
+  pub fn make() -> Self {
+    return Budget.withLimits(definitionsLimit, bodyDefinitionsLimit, referencesLimit, runtimeBytesLimit)
+  }
+  /// Explicit bounds for isolated checks and inexpensive exhaustion tests.
+  pub fn withLimits(definitions: usize, perBody: usize, references: usize, runtimeBytes: usize) -> Self {
+    return Budget {definitions: List<Definition>.make(), definitionLookup: InternIndex.make(),
+      bodies: List<DeclarationId>.make(), bodyLookup: InternIndex.make(), bodyCounts: List<usize>.make(),
+      references: usize.ZERO, bytes: usize.ZERO, maxDefinitions: definitions, maxBodyDefinitions: perBody,
+      maxReferences: references, maxBytes: runtimeBytes, failed: false, failure: usize.ZERO}
+  }
+  /// Starts a new command/revision while preserving the configured resource policy.
+  pub fn clear(self: &mut Self) -> () {
+    let fresh = Budget.withLimits(self.maxDefinitions, self.maxBodyDefinitions, self.maxReferences, self.maxBytes)
+    self.* = move fresh
+  }
+  fn refuse(self: &mut Self, resource: usize) -> bool {
+    if !self.failed { self.failure = resource }
+    self.failed = true
+    return false
+  }
+  pub fn failureResource(self: &Self) -> &'static [u8] {
+    return match self.failure {
+      1 => b"command definitions"
+      2 => b"definitions of one original body"
+      3 => b"MIR reference slots"
+      4 => b"retained runtime-key bytes"
+      5 => b"consistent definition metadata"
+      _ => b"none"
+    }
+  }
+  pub fn failureLimit(self: &Self) -> usize {
+    return match self.failure {
+      1 => self.maxDefinitions
+      2 => self.maxBodyDefinitions
+      3 => self.maxReferences
+      4 => self.maxBytes
+      _ => usize.ZERO
+    }
+  }
+  pub fn exhausted(self: &Self) -> bool { return self.failed }
+  pub fn definitionCount(self: &Self) -> usize { return List<Definition>.length(&self.definitions) }
+  pub fn referenceCount(self: &Self) -> usize { return self.references }
+  pub fn runtimeBytes(self: &Self) -> usize { return self.bytes }
+
+  /// Charges a complete provider-sensitive code definition. `body` is its exact original
+  /// function declaration; glue, export and generated helper definitions have none.
+  /// A before-lowering call may give zero references; completed MIR updates the same entry.
+  pub effect fn include(self: &mut Self, definition: ContentHash, body: Option<&DeclarationId>, runtimeBytes: usize,
+    referenceCount: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
+    if self.failed { return false }
+    let hash = Hash.combine(definition.high, definition.low)
+    let mut known = InternIndex.first(&self.definitionLookup, hash)
+    let listed = List<Definition>.asSlice(&self.definitions)
+    while known != usize.MAX && !ContentHash.equals(listed[known].key, definition) {
+      known = InternIndex.after(&self.definitionLookup, known)
+    }
+    if known != usize.MAX {
+      let previous = &listed[known]
+      let sameBody = match &body {
+        Option<&DeclarationId>.Some {value} => previous.body != usize.MAX
+          && DeclarationId.equals(&List<DeclarationId>.asSlice(&self.bodies)[previous.body], value)
+        Option<&DeclarationId>.None => previous.body == usize.MAX
+      }
+      if !sameBody { return Budget.refuse(&mut self.*, 5) }
+      let extraBytes = if runtimeBytes > previous.bytes { runtimeBytes - previous.bytes } else { usize.ZERO }
+      let extraReferences = if referenceCount > previous.references { referenceCount - previous.references } else { usize.ZERO }
+      if extraBytes > self.maxBytes - self.bytes { return Budget.refuse(&mut self.*, 4) }
+      if extraReferences > self.maxReferences - self.references { return Budget.refuse(&mut self.*, 3) }
+      self.bytes = self.bytes + extraBytes
+      self.references = self.references + extraReferences
+      let entries = List<Definition>.asMutSlice(&mut self.definitions)
+      if runtimeBytes > entries[known].bytes { entries[known].bytes = runtimeBytes }
+      if referenceCount > entries[known].references { entries[known].references = referenceCount }
+      return true
+    }
+    if listed.length >= self.maxDefinitions { return Budget.refuse(&mut self.*, 1) }
+    if runtimeBytes > self.maxBytes - self.bytes { return Budget.refuse(&mut self.*, 4) }
+    if referenceCount > self.maxReferences - self.references { return Budget.refuse(&mut self.*, 3) }
+    let mut selectedBody = usize.MAX
+    if let Option<&DeclarationId>.Some {value} = &body {
+      let declared = List<DeclarationId>.asSlice(&self.bodies)
+      selectedBody = InternIndex.first(&self.bodyLookup, DeclarationId.hash(value))
+      while selectedBody != usize.MAX && !DeclarationId.equals(&declared[selectedBody], value) {
+        selectedBody = InternIndex.after(&self.bodyLookup, selectedBody)
+      }
+      if self.maxBodyDefinitions == usize.ZERO
+        || (selectedBody != usize.MAX && List<usize>.get(&self.bodyCounts, selectedBody) >= self.maxBodyDefinitions) {
+        return Budget.refuse(&mut self.*, 2)
+      }
+      if selectedBody == usize.MAX {
+        selectedBody = declared.length
+        run List<DeclarationId>.append(&mut self.bodies, DeclarationId.copy(value))
+        run List<usize>.append(&mut self.bodyCounts, usize.ZERO)
+        run InternIndex.record(&mut self.bodyLookup, DeclarationId.hash(value))
+      }
+      let count = List<usize>.get(&self.bodyCounts, selectedBody)
+      List<usize>.set(&mut self.bodyCounts, selectedBody, count + usize.ONE)
+    }
+    run List<Definition>.append(&mut self.definitions, Definition {key: definition, body: selectedBody, bytes: runtimeBytes,
+      references: referenceCount})
+    run InternIndex.record(&mut self.definitionLookup, hash)
+    self.bytes = self.bytes + runtimeBytes
+    self.references = self.references + referenceCount
+    return true
+  }
+}
+
+fn exampleKey(value: u64) -> ContentHash { return ContentHash {high: 0, low: value} }
+
+effect fn budgetClaims() -> () ! InvalidModulePath | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let body = run DeclarationId.fromParts(run ModuleId.make(b"memory", b"finite", b"first"), List<OwnerStep>.make())
+  let sameBody = run DeclarationId.fromParts(run ModuleId.make(b"memory", b"finite", b"first"), List<OwnerStep>.make())
+  let otherBody = run DeclarationId.fromParts(run ModuleId.make(b"memory", b"finite", b"second"), List<OwnerStep>.make())
+  let mut forward = Budget.withLimits(4, 2, 10, 100)
+  let mut reverse = Budget.withLimits(4, 2, 10, 100)
+  run Testing.expect(run Budget.include(&mut forward, exampleKey(1), Option<&DeclarationId>.some(&body), 20, 2), "first observation charges one definition")
+  run Testing.expect(run Budget.include(&mut forward, exampleKey(1), Option<&DeclarationId>.some(&sameBody), 40, 5), "a repeated variant updates only maxima under exact body equality")
+  run Testing.expect(run Budget.include(&mut reverse, exampleKey(1), Option<&DeclarationId>.some(&sameBody), 40, 5), "the larger observation may arrive first")
+  run Testing.expect(run Budget.include(&mut reverse, exampleKey(1), Option<&DeclarationId>.some(&body), 20, 2), "smaller repeated observations do not charge twice")
+  run Testing.expect(Budget.definitionCount(&forward) == 1 && Budget.referenceCount(&forward) == Budget.referenceCount(&reverse)
+    && Budget.runtimeBytes(&forward) == Budget.runtimeBytes(&reverse), "complete graph cost does not depend on variant or worker order")
+  run Testing.expect(run Budget.include(&mut forward, exampleKey(2), Option<&DeclarationId>.some(&body), 10, 1), "the second distinct definition of a body fits")
+  run Testing.expect(!run Budget.include(&mut forward, exampleKey(3), Option<&DeclarationId>.some(&sameBody), 10, 1), "per-body limits count exact unique definitions across independently decoded declaration identities")
+  run Testing.expect(Budget.exhausted(&forward) && Budget.failureLimit(&forward) == 2,
+    "exhaustion retains the specific configured per-body bound")
+  Budget.clear(&mut forward)
+  run Testing.expect(!Budget.exhausted(&forward) && Budget.definitionCount(&forward) == 0 && Budget.failureLimit(&forward) == 0,
+    "a revision reset clears charged definitions and the earlier refusal")
+  run Testing.expect(run Budget.include(&mut forward, exampleKey(1), Option<&DeclarationId>.some(&body), 1, 1), "the reset accepts its first definition")
+  run Testing.expect(run Budget.include(&mut forward, exampleKey(2), Option<&DeclarationId>.some(&body), 1, 1), "the reset accepts its second definition")
+  run Testing.expect(!run Budget.include(&mut forward, exampleKey(3), Option<&DeclarationId>.some(&body), 1, 1), "a revision reset preserves the configured per-body limit")
+  let mut distinct = Budget.withLimits(3, 1, 10, 100)
+  run Testing.expect(run Budget.include(&mut distinct, exampleKey(1), Option<&DeclarationId>.some(&body), 1, 1), "first body fits")
+  run Testing.expect(run Budget.include(&mut distinct, exampleKey(2), Option<&DeclarationId>.some(&otherBody), 1, 1), "a different original body has its own allowance")
+  run Testing.expect(run Budget.include(&mut distinct, exampleKey(3), Option<&DeclarationId>.none(), 1, 1), "glue counts toward the aggregate without inventing a function body")
+  run Testing.expect(!run Budget.include(&mut distinct, exampleKey(4), Option<&DeclarationId>.none(), 1, 1), "aggregate definition count bounds functions and glue together")
+  let mut edges = Budget.withLimits(2, 2, 3, usize.MAX)
+  run Testing.expect(run Budget.include(&mut edges, exampleKey(1), Option<&DeclarationId>.none(), usize.MAX, 2), "exact maximum byte accounting does not overflow")
+  run Testing.expect(!run Budget.include(&mut edges, exampleKey(2), Option<&DeclarationId>.none(), 1, 1), "adding bytes beyond MAX is refused before arithmetic overflow")
+  let mut calls = Budget.withLimits(2, 2, 3, 100)
+  run Testing.expect(run Budget.include(&mut calls, exampleKey(1), Option<&DeclarationId>.none(), 1, 2), "initial reference cost fits")
+  run Testing.expect(!run Budget.include(&mut calls, exampleKey(1), Option<&DeclarationId>.none(), 1, 4), "a larger MIR variant can exhaust the aggregate reference budget")
+}
+
+test effect fn frontierFiniteBudgetsAreExactAndIndependentOfOrder() -> () ! InvalidModulePath | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run budgetClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
