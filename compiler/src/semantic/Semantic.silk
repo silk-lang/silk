@@ -7,6 +7,8 @@
 import semantic.Types {TypeTable, Types}
 import semantic.CacheImage {Merge}
 import semantic.WalkFragments
+import semantic.ArtifactGraph
+import semantic.DefinitionFragments
 import semantic.FiniteBudget {Budget as SpecializationBudget}
 import semantic.SourceSyntax
 import semantic.SyntaxNames {primitive}
@@ -527,6 +529,9 @@ fn makeFrontierClaims() -> Option<[*]mut u64> {
 // Slot state 0 is empty, 1 publishes the full digest, and 2 exposes immutable digest/owner words.
 // Colliding full digests probe onwards; no fingerprint-only ownership decisions are made.
 fn claimFrontier(table: [*]mut u64, digest: ContentHash, worker: usize) -> bool {
+  // The coordinator may perform later build checks while workers remain alive. It is not a
+  // routable worker and must never claim a definition or skip its own required query demand.
+  if worker == usize.MAX { return true }
   let mut slot = u64.toUsize(Hash.combine(digest.high, digest.low)) % 131072
   let mut probes = usize.ZERO
   while probes < 131072 {
@@ -599,6 +604,7 @@ effect fn frontierDump(label: &[u8], bytes: &[u8], shard: usize, ordinal: usize)
 }
 
 fn frontierExperiment() -> bool {
+  if postcheckBuildExperiment() { return false }
   return !Pointer.isNullMany<u8>(unsafe FrontierHost.environment(Pointer.fromSlice<u8>(b"SILK_EXPERIMENT_FRONTIER\0")))
 }
 
@@ -736,6 +742,721 @@ effect fn readWorkerImage(fd: i32) -> CacheImage.Image ! OutOfMemoryError ? &mut
   if !(run CacheImage.readLeaves(&mut image)) || !(run CacheImage.readNodes(&mut image)) { CompilerBug.panic(b"fork check graph failed") }
   run CacheImage.expandKeys(&mut image)
   return move image
+}
+
+struct ArtifactJob {
+  exact: ContentHash,
+  definition: ContentHash,
+  worker: usize,
+  producer: usize,
+  done: bool,
+}
+
+fn retainedBuildExperiment() -> bool {
+  return !Pointer.isNullMany<u8>(unsafe FrontierHost.environment(Pointer.fromSlice<u8>(b"SILK_RETAINED_BUILD\0")))
+}
+
+fn artifactOwner(table: &Option<[*]mut u64>, digest: ContentHash, otherwise: usize) -> usize {
+  if let Option<[*]mut u64>.Some {value} = &table.* {
+    let mut slot = u64.toUsize(Hash.combine(digest.high, digest.low)) % 131072
+    let mut probes = usize.ZERO
+    while probes < 131072 {
+      let state = unsafe Atomic.load<u64>(unsafe Pointer.atMut<u64>(value, slot * 4), MemoryOrder.Acquire)
+      if state == 0 { return otherwise }
+      if state == 2 && unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(value, slot * 4 + 1)) == digest.high
+        && unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(value, slot * 4 + 2)) == digest.low {
+        let owner = u64.toUsize(unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(value, slot * 4 + 3)))
+        if owner == usize.MAX { return otherwise }
+        return owner % 4
+      }
+      slot = (slot + usize.ONE) % 131072
+      probes = probes + usize.ONE
+    }
+  }
+  if postcheckBuildExperiment() { return u64.toUsize(Hash.combine(digest.high, digest.low) % 4) }
+  return otherwise
+}
+
+effect fn sendArtifactPacket(control: i32, command: u8, payload: &[u8]) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  let mut header = run Bytes.copy(&[command])
+  run RuntimeEncoding.word(&mut header, usize.toU64(payload.length))
+  return frontierSend(control, Bytes.asSlice(&header)) && frontierSend(control, payload)
+}
+
+effect fn readArtifactPacket(control: i32) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+  let mut header: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0]
+  if !frontierRead(control, &mut header) { return Option<Bytes>.none() }
+  let mut reader = StableKey.reader()
+  let count = StableKey.readWord(&header, &mut reader)
+  if count > 1073741824 { return Option<Bytes>.none() }
+  let mut bytes = run Bytes.zeroed(u64.toUsize(count))
+  if !frontierRead(control, Bytes.asMutSlice(&mut bytes)) { return Option<Bytes>.none() }
+  return Option<Bytes>.some(move bytes)
+}
+
+effect fn replyArtifactPacket(control: i32, payload: &[u8]) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut header = Bytes.make()
+  run RuntimeEncoding.word(&mut header, usize.toU64(payload.length))
+  return frontierSend(control, Bytes.asSlice(&header)) && frontierSend(control, payload)
+}
+
+// An unresolved edge needs stable routing identity, not another copy of expensive family facts.
+effect fn artifactExternal(capture: &mut BuildCapture, key: &InstanceKey, position: usize) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let exact = run keyDigest(key, capture.patterns)
+  if BuildCapture.find(&capture.*, exact) != usize.MAX { return () }
+  let mut declaration = Bytes.make()
+  run StableKey.declaration(&mut declaration, &DeclarationId.copyShared(&InstanceKey.identity(key)))
+  if capture.patterns { run appendRecordedShape(&mut declaration, key) }
+  let mut facts = BuildRecord.unknownFacts()
+  facts.flags = BuildRecord.FACT_KNOWN
+  facts.definition = run keyDigest(key, false)
+  run InternIndex.record(&mut capture.lookup, digestHash(exact))
+  run List<CaptureEntry>.append(&mut capture.entries, CaptureEntry {digest: exact, hash: InstanceKey.runtimeHash(key),
+    family: EmissionPlan.familyName(key), declaration: move declaration, parent: usize.ZERO, position: position,
+    requested: false, alias: usize.MAX, leaf: WalkFragments.EXTERNAL, targets: List<ContentHash>.make(),
+    edges: List<ContentHash>.make(), summary: ContentHash {high: 0, low: 0}, value: usize.MAX, mirUnit: usize.MAX,
+    emissionUnit: usize.MAX, facts: move facts})
+  return ()
+}
+
+impl Semantic {
+  effect fn artifactCommand(self: &mut Self, command: u8, payload: &[u8]) -> Bytes
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+    if command == 3 { return run Semantic.artifactRoots(&mut self.*, payload) }
+    if command == 4 { return run Semantic.artifactGraphBatch(&mut self.*, payload) }
+    if command == 6 {
+      if !same(payload, &[1]) { return Bytes.make() }
+      self.artifactObserving = true
+      return run Bytes.copy(&[1])
+    }
+    return run Semantic.artifactEmitBatch(&mut self.*, payload)
+  }
+
+  effect fn rememberArtifactKey(self: &mut Self, key: &InstanceKey) -> () ! OutOfMemoryError ? &mut Allocator {
+    run Semantic.rememberFrontier(&mut self.*, key)
+    if run DigestSet.add(&mut self.artifactDigests, run instanceDigest(key)) {
+      run List<InstanceKey>.append(&mut self.artifactKeys, InstanceKey.copy(key))
+    }
+  }
+
+  effect fn artifactKey(self: &mut Self, exact: ContentHash, definition: ContentHash) -> Option<InstanceKey>
+  ! OutOfMemoryError ? &mut Allocator {
+    let found = DigestSet.find(&self.artifactDigests, exact)
+    if found != usize.MAX { return Option<InstanceKey>.some(InstanceKey.copy(&List<InstanceKey>.asSlice(&self.artifactKeys)[found])) }
+    let known = DigestSet.find(&self.frontierKeyDigests, definition)
+    if known == usize.MAX { return Option<InstanceKey>.none() }
+    let key = InstanceKey.copy(&List<InstanceKey>.asSlice(&self.frontierKeys)[known])
+    if !ContentHash.equals(run instanceDigest(&key), exact) { return Option<InstanceKey>.none() }
+    run Semantic.rememberArtifactKey(&mut self.*, &key)
+    return Option<InstanceKey>.some(move key)
+  }
+
+  // Select one complete checked semantic representative of a provider-sensitive definition.
+  // The chosen key owns both this node's MIR references and its later emitted definition.
+  effect fn artifactRepresentative(self: &mut Self, definition: ContentHash) -> Option<InstanceKey>
+  ! OutOfMemoryError ? &mut Allocator {
+    let known = DigestSet.find(&self.frontierKeyDigests, definition)
+    if known == usize.MAX { return Option<InstanceKey>.none() }
+    let key = InstanceKey.copy(&List<InstanceKey>.asSlice(&self.frontierKeys)[known])
+    if !ContentHash.equals(run keyDigest(&key, false), definition) { return Option<InstanceKey>.none() }
+    run Semantic.rememberArtifactKey(&mut self.*, &key)
+    return Option<InstanceKey>.some(move key)
+  }
+
+  effect fn artifactRoots(self: &mut Self, payload: &[u8]) -> Bytes
+  ! OutOfMemoryError ? &mut Allocator | &mut Types {
+    let mut reader = StableKey.reader()
+    let count = StableKey.readWord(payload, &mut reader)
+    if count > 100000 { return Bytes.make() }
+    let mut at: u64 = 0
+    while at < count {
+      let family = StableKey.readWord(payload, &mut reader)
+      let expected = ContentHash {high: StableKey.readWord(payload, &mut reader), low: StableKey.readWord(payload, &mut reader)}
+      let declared = match move run StableKey.readDeclaration(payload, &mut reader) {
+        Option<DeclarationId>.Some {value} => move value
+        Option<DeclarationId>.None => { return Bytes.make() }
+      }
+      let symbol = StableKey.readField(payload, &mut reader)
+      if StableKey.failed(&reader) || family > 1 { return Bytes.make() }
+      let identity = run Types.internDeclaration(move declared)
+      let key = if family == 1 {
+        InstanceKey.Export {function: move identity, symbol: run Shared<Bytes>.make(run Bytes.copy(StableKey.view(payload, symbol)))}
+      } else { run InstanceKey.named(&identity) }
+      if !ContentHash.equals(run instanceDigest(&key), expected) { return Bytes.make() }
+      run Semantic.rememberArtifactKey(&mut self.*, &key)
+      at = at + 1
+    }
+    if !StableKey.finished(payload, &reader) { return Bytes.make() }
+    return run Bytes.copy(&[1])
+  }
+
+  // Lower the selected checked representative, then follow exactly its own MIR edges.
+  effect fn artifactNode(self: &mut Self, key: &InstanceKey) -> Option<BuildRecord.Record>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+    let location = match move run locationOfInstance(&mut self.resolver, key) {
+      Option<InstanceLocation>.Some {value} => value
+      Option<InstanceLocation>.None => { return Option<BuildRecord.Record>.none() }
+    }
+    let name = run exactBackendVariant(&mut self.resolver, key, self.artifactObserving, &Option<CoroutineFacts>.none())
+    let demand = run internDeclaration(&mut self.resolver, Key {family: Family.Mir, module: location.module,
+      name: name, declaration: location.declaration, member: instanceMember(key), external: false})
+    if artifactTraceExperiment() {
+      let identity = DeclarationId.copyShared(&InstanceKey.identity(key))
+      let label = run shownName(&mut self.resolver, &identity)
+      run frontierTrace(Bytes.asSlice(&label), self.frontierSplit, self.frontierWorker, name)
+      let selected = run InstanceKey.exactIdentity(key)
+      run frontierDump(b"artifact-lowering", Bytes.asSlice(&selected), self.frontierWorker, usize.ZERO)
+    }
+    if !run Semantic.includeInstanceBudget(&mut self.*, key, usize.ZERO) { return Option<BuildRecord.Record>.none() }
+    let answer = run demandRaw(&mut self.resolver, &mut self.query, demand, Span.make(usize.ZERO, usize.ZERO))
+    if !run Semantic.includeAnswerBudget(&mut self.*, key, &answer) { return Option<BuildRecord.Record>.none() }
+    let reports = run reportedDiagnostics(&mut self.query, &answer)
+    if List<Shared<Rejection>>.length(&reports) != usize.ZERO { return Option<BuildRecord.Record>.none() }
+    let index = match move Shared<Result<Answer, NoRejection>>.with<Option<usize>>(&answer, answerMirIndex) {
+      Option<usize>.Some {value} => value
+      Option<usize>.None => { return Option<BuildRecord.Record>.none() }
+    }
+    let word = run internKey(&mut self.resolver, demand)
+    let owner = DeclarationId.copyShared(&InstanceKey.identity(key))
+    let module = ModuleId.copy(DeclarationId.moduleId(&owner))
+    let anchor = run instanceAnchor(&mut self.resolver, key)
+    let function = &List<MirFunction>.asSlice(&self.resolver.mirValues)[index]
+    let summary = run SuspensionSummary.make(function, key, &module, &anchor, &module, Span.make(usize.ZERO, usize.ZERO))
+    if function.observes && !self.artifactObserving {
+      self.artifactObservationRequired = true
+      run frontierTrace(b"artifact needs observation", self.frontierSplit, self.frontierWorker, index)
+      return Option<BuildRecord.Record>.none() }
+    if spanPresent(&summary.boundary) || spanPresent(&summary.park) { run frontierTrace(b"artifact suspending", self.frontierSplit, self.frontierWorker, index)
+      return Option<BuildRecord.Record>.none() }
+    let mut roots = List<BuildRoot>.make()
+    run List<BuildRoot>.append(&mut roots, BuildRoot {key: InstanceKey.copy(key), span: Span.make(usize.ZERO, usize.ZERO), retained: false})
+    let mut capture = run BuildCapture.make(self.artifactObserving, List<BuildRoot>.asSlice(&roots))
+    capture.patterns = false
+    List<ContentHash>.clear(&mut capture.roots)
+    run List<ContentHash>.append(&mut capture.roots, run keyDigest(key, false))
+    run BuildCapture.enter(&mut capture, key, VisitOrigin {parent: usize.MAX, position: usize.ZERO, requested: false})
+    // Definition graph headers carry the declaration, not a first-seen lifetime reconstruction.
+    let capturedEntries = List<CaptureEntry>.asMutSlice(&mut capture.entries)
+    Bytes.clear(&mut capturedEntries[usize.ZERO].declaration)
+    run StableKey.declaration(&mut capturedEntries[usize.ZERO].declaration, &owner)
+    BuildCapture.lowered(&mut capture, usize.ZERO, u64.toUsize(word.value))
+    run BuildCapture.references(&mut capture, usize.ZERO, key, List<MirReference>.asSlice(&function.references),
+      run summaryDigest(&summary, function.observes, false))
+    run BuildCapture.walked(&mut capture, usize.ZERO, &summary)
+    if function.observes { BuildCapture.flag(&mut capture, usize.ZERO, BuildRecord.FACT_OBSERVES) }
+    let references = List<MirReference>.asSlice(&function.references)
+    let mut remembered = List<InstanceKey>.make()
+    let mut at = usize.ZERO
+    while at < references.length {
+      run artifactExternal(&mut capture, &references[at].key, at)
+      run List<InstanceKey>.append(&mut remembered, InstanceKey.copy(&references[at].key))
+      at = at + usize.ONE
+    }
+    let obligations = List<ParkObligation>.asSlice(&summary.nonParking)
+    at = usize.ZERO
+    while at < obligations.length {
+      if !obligations[at].exact {
+        run frontierTrace(b"artifact inexact obligation", self.frontierSplit, self.frontierWorker, index)
+        return Option<BuildRecord.Record>.none() }
+      // Named obligations are checked against the final actually-reached artifact graph.
+      // No additional module-check roots are emitted merely to satisfy a name.
+      // With no parking node anywhere, parkingGlue only needs canonicalization to succeed.
+      let glues = List<Interned<Type>>.asSlice(&obligations[at].glues)
+      let mut glue = usize.ZERO
+      while glue < glues.length {
+        if let Result<Option<InstanceKey>, CanonicalizationFailure>.Failure {..} = move run InstanceKey.dropGlue(&glues[glue], &owner) {
+          return Option<BuildRecord.Record>.none()
+        }
+        glue = glue + usize.ONE
+      }
+      let callees = List<InstanceKey>.asSlice(&obligations[at].callees)
+      let mut child = usize.ZERO
+      while child < callees.length {
+        run List<InstanceKey>.append(&mut remembered, InstanceKey.copy(&callees[child]))
+        child = child + usize.ONE
+      }
+      at = at + usize.ONE
+    }
+    let keys = List<InstanceKey>.asSlice(&remembered)
+    at = usize.ZERO
+    while at < keys.length { run Semantic.rememberArtifactKey(&mut self.*, &keys[at])
+      at = at + usize.ONE }
+    return match move run BuildCapture.finish(move capture, usize.MAX) {
+      Option<CapturedBuild>.Some {value} => Option<BuildRecord.Record>.some(move value.record)
+      Option<CapturedBuild>.None => Option<BuildRecord.Record>.none()
+    }
+  }
+
+  effect fn artifactGraphBatch(self: &mut Self, payload: &[u8]) -> Bytes
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+    let mut reader = StableKey.reader()
+    let count = StableKey.readWord(payload, &mut reader)
+    if count > 100000 { return Bytes.make() }
+    let mut output = Bytes.make()
+    run RuntimeEncoding.word(&mut output, count)
+    let mut at: u64 = 0
+    while at < count {
+      let exact = ContentHash {high: StableKey.readWord(payload, &mut reader), low: StableKey.readWord(payload, &mut reader)}
+      let definition = ContentHash {high: StableKey.readWord(payload, &mut reader), low: StableKey.readWord(payload, &mut reader)}
+      if StableKey.failed(&reader) { return Bytes.make() }
+      drop exact
+      let found = run Semantic.artifactRepresentative(&mut self.*, definition)
+      match move found {
+        Option<InstanceKey>.None => { run RuntimeEncoding.word(&mut output, 0) }
+        Option<InstanceKey>.Some {value} => {
+          let chosen = run instanceDigest(&value)
+          self.artifactObservationRequired = false
+          match move run Semantic.artifactNode(&mut self.*, &value) {
+            Option<BuildRecord.Record>.Some {value: node} => {
+              run RuntimeEncoding.word(&mut output, 1)
+              run RuntimeEncoding.word(&mut output, chosen.high)
+              run RuntimeEncoding.word(&mut output, chosen.low)
+              let encoded = run BuildRecord.encode(&node)
+              run RuntimeEncoding.field(&mut output, Bytes.asSlice(&encoded))
+            }
+            Option<BuildRecord.Record>.None => {
+              run RuntimeEncoding.word(&mut output, if self.artifactObservationRequired { 3 } else { 2 })
+            }
+          }
+        }
+      }
+      at = at + 1
+    }
+    if !StableKey.finished(payload, &reader) { return Bytes.make() }
+    return move output
+  }
+
+  effect fn artifactEmitBatch(self: &mut Self, payload: &[u8]) -> Bytes
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+    let mut reader = StableKey.reader()
+    let count = StableKey.readWord(payload, &mut reader)
+    if count > 100000 { return Bytes.make() }
+    let mut output = run DefinitionFragments.begin(b"retained-ordinary-artifact", u64.toUsize(count))
+    let mut at: u64 = 0
+    while at < count {
+      let exact = ContentHash {high: StableKey.readWord(payload, &mut reader), low: StableKey.readWord(payload, &mut reader)}
+      let definition = ContentHash {high: StableKey.readWord(payload, &mut reader), low: StableKey.readWord(payload, &mut reader)}
+      if StableKey.failed(&reader) { return Bytes.make() }
+      let key = match move run Semantic.artifactKey(&mut self.*, exact, definition) {
+        Option<InstanceKey>.Some {value} => move value
+        Option<InstanceKey>.None => { return Bytes.make() }
+      }
+      let location = match move run locationOfInstance(&mut self.resolver, &key) {
+        Option<InstanceLocation>.Some {value} => value
+        Option<InstanceLocation>.None => { return Bytes.make() }
+      }
+      let name = run exactBackendVariant(&mut self.resolver, &key, self.artifactObserving, &Option<CoroutineFacts>.none())
+      let demand = run internDeclaration(&mut self.resolver, Key {family: Family.EmissionInputs,
+        module: location.module, name: name, declaration: location.declaration, member: instanceMember(&key), external: false})
+      let prepared = run demandRaw(&mut self.resolver, &mut self.query, demand, Span.make(usize.ZERO, usize.ZERO))
+      let answer = run demandPreparedText(&mut self.resolver, &mut self.query, demand, &prepared)
+      let reports = run reportedDiagnostics(&mut self.query, &answer)
+      if List<Shared<Rejection>>.length(&reports) != usize.ZERO { return Bytes.make() }
+      let index = match move Shared<Result<Answer, NoRejection>>.with<Option<usize>>(&answer, answerLlvmTextIndex) {
+        Option<usize>.Some {value} => value
+        Option<usize>.None => { return Bytes.make() }
+      }
+      let identity = Replayed {exact: run digestBytes(exact), hash: InstanceKey.runtimeHash(&key),
+        declaration: DeclarationId.copyShared(&InstanceKey.identity(&key)), family: EmissionPlan.familyName(&key)}
+      let value = &List<InstanceDefinition>.asSlice(&self.resolver.llvmValues)[index]
+      run DefinitionFragments.append(&mut output, &identity, value, Bytes.asSlice(&value.text))
+      at = at + 1
+    }
+    if !StableKey.finished(payload, &reader) { return Bytes.make() }
+    return move output
+  }
+}
+
+impl Copy for ArtifactJob {}
+
+effect fn appendArtifactJob(jobs: &mut List<ArtifactJob>, seen: &mut DigestSet, exact: ContentHash,
+  definition: ContentHash, worker: usize, producer: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  if run DigestSet.add(&mut seen.*, definition) {
+    run List<ArtifactJob>.append(&mut jobs.*, ArtifactJob {exact: exact, definition: definition, worker: worker, producer: producer, done: false})
+  }
+}
+
+// Serial requestUnreached first closes ordinary references: a provider-free obligation may
+// already be executed by a reached provider-bearing definition. Only truly absent targets
+// become additional actual roots, and their discovery can discharge further obligations.
+effect fn requestArtifactObligations(records: &[BuildRecord.Record], jobs: &mut List<ArtifactJob>,
+  seen: &mut DigestSet, roots: &mut List<ContentHash>, rootSet: &mut DigestSet,
+  claims: &Option<[*]mut u64>) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut covered = DigestSet.make()
+  let mut at = usize.ZERO
+  while at < records.length {
+    let entries = List<BuildRecord.Entry>.asSlice(&records[at].entries)
+    if entries.length > usize.ZERO {
+      drop run DigestSet.add(&mut covered, entries[usize.ZERO].facts.definition)
+      if u64.bitAnd(entries[usize.ZERO].facts.flags, BuildRecord.FACT_BARE) != 0 {
+        drop run DigestSet.add(&mut covered, entries[usize.ZERO].facts.bare)
+      }
+    }
+    at = at + usize.ONE
+  }
+  let before = List<ArtifactJob>.length(&jobs.*)
+  at = usize.ZERO
+  while at < records.length {
+    let entries = List<BuildRecord.Entry>.asSlice(&records[at].entries)
+    at = at + usize.ONE
+    if entries.length == usize.ZERO { continue }
+    let position = DigestSet.find(&seen.*, entries[usize.ZERO].facts.definition)
+    if position == usize.MAX { continue }
+    let producer = List<ArtifactJob>.get(&jobs.*, position).worker
+    let obligations = List<BuildRecord.Obligation>.asSlice(&entries[usize.ZERO].facts.obligations)
+    let mut obligation = usize.ZERO
+    while obligation < obligations.length {
+      let targets = List<BuildRecord.Callee>.asSlice(&obligations[obligation].callees)
+      let mut child = usize.ZERO
+      while obligations[obligation].exact && child < targets.length {
+        let target = &targets[child]
+        if DigestSet.find(&covered, target.definition) == usize.MAX {
+          let owner = artifactOwner(claims, target.definition, producer)
+          run appendArtifactJob(&mut jobs.*, &mut seen.*, target.exact, target.definition, owner, producer)
+          if run DigestSet.add(&mut rootSet.*, target.definition) {
+            run List<ContentHash>.append(&mut roots.*, target.definition)
+          }
+        }
+        child = child + usize.ONE
+      }
+      obligation = obligation + usize.ONE
+    }
+  }
+  return List<ArtifactJob>.length(&jobs.*) > before
+}
+
+effect fn appendArtifactIdentity(bytes: &mut Bytes, exact: ContentHash, definition: ContentHash) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  run RuntimeEncoding.word(&mut bytes.*, exact.high)
+  run RuntimeEncoding.word(&mut bytes.*, exact.low)
+  run RuntimeEncoding.word(&mut bytes.*, definition.high)
+  return run RuntimeEncoding.word(&mut bytes.*, definition.low)
+}
+
+impl Semantic {
+  effect fn retainedArtifact(self: &mut Self, roots: &[BuildRoot], module: &ModuleId, span: Span) -> Option<BackendBuild>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+    let started = run frontierNow()
+    let workers = List<CheckWorker>.asSlice(&self.artifactWorkers)
+    if workers.length != 4 { return Option<BackendBuild>.none() }
+    let mut rootPacket = Bytes.make()
+    run RuntimeEncoding.word(&mut rootPacket, usize.toU64(roots.length))
+    let mut jobs = List<ArtifactJob>.make()
+    let mut seen = DigestSet.make()
+    let mut selectedRoots = List<ContentHash>.make()
+    let mut rootSet = DigestSet.make()
+    let mut at = usize.ZERO
+    while at < roots.length {
+      let key = &roots[at].key
+      let family = EmissionPlan.familyName(key)
+      if family > 1 { return Option<BackendBuild>.none() }
+      let exact = run instanceDigest(key)
+      let definition = run keyDigest(key, false)
+      run RuntimeEncoding.word(&mut rootPacket, family)
+      run RuntimeEncoding.word(&mut rootPacket, exact.high)
+      run RuntimeEncoding.word(&mut rootPacket, exact.low)
+      run StableKey.declaration(&mut rootPacket, &DeclarationId.copyShared(&InstanceKey.identity(key)))
+      let mut symbol = Bytes.make()
+      if family == 1 { symbol = run InstanceKey.symbol(key) }
+      run RuntimeEncoding.field(&mut rootPacket, Bytes.asSlice(&symbol))
+      let worker = artifactOwner(&self.frontierClaims, definition, at % 4)
+      run appendArtifactJob(&mut jobs, &mut seen, exact, definition, worker, worker)
+      if run DigestSet.add(&mut rootSet, definition) { run List<ContentHash>.append(&mut selectedRoots, definition) }
+      at = at + usize.ONE
+    }
+    let mut shard = usize.ZERO
+    while shard < workers.length {
+      if !run sendArtifactPacket(workers[shard].control, 3, Bytes.asSlice(&rootPacket)) { return Option<BackendBuild>.none() }
+      shard = shard + usize.ONE
+    }
+    shard = usize.ZERO
+    while shard < workers.length {
+      let reply = match move run readArtifactPacket(workers[shard].control) {
+        Option<Bytes>.Some {value} => move value
+        Option<Bytes>.None => { return Option<BackendBuild>.none() }
+      }
+      if !same(Bytes.asSlice(&reply), &[1]) { return Option<BackendBuild>.none() }
+      shard = shard + usize.ONE
+    }
+    let mut records = List<BuildRecord.Record>.make()
+    let mut rounds = usize.ZERO
+    while true {
+      let mut batches = List<List<usize>>.make()
+      shard = usize.ZERO
+      while shard < workers.length { run List<List<usize>>.append(&mut batches, List<usize>.make())
+        shard = shard + usize.ONE }
+      let pending = List<ArtifactJob>.asSlice(&jobs)
+      let mut count = usize.ZERO
+      at = usize.ZERO
+      while at < pending.length {
+        if !pending[at].done {
+          let lists = List<List<usize>>.asMutSlice(&mut batches)
+          run List<usize>.append(&mut lists[pending[at].worker], at)
+          count = count + usize.ONE
+        }
+        at = at + usize.ONE
+      }
+      if count == usize.ZERO {
+        if run requestArtifactObligations(List<BuildRecord.Record>.asSlice(&records), &mut jobs, &mut seen,
+          &mut selectedRoots, &mut rootSet, &self.frontierClaims) { continue }
+        break
+      }
+      if rounds > 512 || pending.length > 150000 { return Option<BackendBuild>.none() }
+      rounds = rounds + usize.ONE
+      let selected = List<List<usize>>.asSlice(&batches)
+      shard = usize.ZERO
+      while shard < workers.length {
+        let positions = List<usize>.asSlice(&selected[shard])
+        let mut request = Bytes.make()
+        run RuntimeEncoding.word(&mut request, usize.toU64(positions.length))
+        at = usize.ZERO
+        while at < positions.length {
+          let job = &pending[positions[at]]
+          run appendArtifactIdentity(&mut request, job.exact, job.definition)
+          at = at + usize.ONE
+        }
+        if !run sendArtifactPacket(workers[shard].control, 4, Bytes.asSlice(&request)) { return Option<BackendBuild>.none() }
+        shard = shard + usize.ONE
+      }
+      let mut healthy = true
+      let mut observing = false
+      shard = usize.ZERO
+      while shard < workers.length {
+        let reply = match move run readArtifactPacket(workers[shard].control) {
+          Option<Bytes>.Some {value} => move value
+          Option<Bytes>.None => { return Option<BackendBuild>.none() }
+        }
+        let bytes = Bytes.asSlice(&reply)
+        let mut reader = StableKey.reader()
+        let positions = List<usize>.asSlice(&selected[shard])
+        let answered = StableKey.readWord(bytes, &mut reader)
+        if answered != usize.toU64(positions.length) { healthy = false }
+        at = usize.ZERO
+        while at < positions.length && !StableKey.failed(&reader) {
+          let job = List<ArtifactJob>.get(&jobs, positions[at])
+          let status = StableKey.readWord(bytes, &mut reader)
+          if status == 0 {
+            if job.worker == job.producer { healthy = false }
+            else {
+              let changed = List<ArtifactJob>.asMutSlice(&mut jobs)
+              changed[positions[at]].worker = job.producer
+            }
+          } else if status == 1 {
+            let chosen = ContentHash {high: StableKey.readWord(bytes, &mut reader), low: StableKey.readWord(bytes, &mut reader)}
+            let encoded = StableKey.readField(bytes, &mut reader)
+            let decoded = run BuildRecord.decode(StableKey.view(bytes, encoded))
+            match move decoded {
+              Option<BuildRecord.Record>.Some {value} => {
+                let entries = List<BuildRecord.Entry>.asSlice(&value.entries)
+                if entries.length == usize.ZERO || !ContentHash.equals(entries[usize.ZERO].exact, job.definition)
+                  || !ContentHash.equals(entries[usize.ZERO].facts.definition, job.definition) || value.patterns { healthy = false }
+                else {
+                  let changed = List<ArtifactJob>.asMutSlice(&mut jobs)
+                  changed[positions[at]].done = true
+                  changed[positions[at]].exact = chosen
+                  let references = List<BuildRecord.Reference>.asSlice(&entries[usize.ZERO].references)
+                  let mut child = usize.ZERO
+                  while child < references.length {
+                    if references[child].target >= entries.length { healthy = false
+                      break }
+                    let target = &entries[references[child].target]
+                    let owner = artifactOwner(&self.frontierClaims, target.facts.definition, shard)
+                    run appendArtifactJob(&mut jobs, &mut seen, target.exact, target.facts.definition, owner, shard)
+                    child = child + usize.ONE
+                  }
+                  run List<BuildRecord.Record>.append(&mut records, move value)
+                }
+              }
+              Option<BuildRecord.Record>.None => { healthy = false }
+            }
+          } else if status == 3 { observing = true
+            healthy = false
+          } else { healthy = false }
+          if StableKey.failed(&reader) { healthy = false }
+          at = at + usize.ONE
+        }
+        if !StableKey.finished(bytes, &reader) { healthy = false }
+        shard = shard + usize.ONE
+      }
+      if observing && !self.artifactObserving {
+        shard = usize.ZERO
+        while shard < workers.length {
+          if !run sendArtifactPacket(workers[shard].control, 6, &[1]) { return Option<BackendBuild>.none() }
+          shard = shard + usize.ONE
+        }
+        shard = usize.ZERO
+        while shard < workers.length {
+          let reply = match move run readArtifactPacket(workers[shard].control) {
+            Option<Bytes>.Some {value} => move value
+            Option<Bytes>.None => { return Option<BackendBuild>.none() }
+          }
+          if !same(Bytes.asSlice(&reply), &[1]) { return Option<BackendBuild>.none() }
+          shard = shard + usize.ONE
+        }
+        self.artifactObserving = true
+        run frontierTrace(b"artifact observing restart", started, rounds, List<ArtifactJob>.length(&jobs))
+        return run Semantic.retainedArtifact(&mut self.*, roots, module, span)
+      }
+      if !healthy { run frontierTrace(b"artifact graph refused", started, rounds, List<ArtifactJob>.length(&jobs))
+        return Option<BackendBuild>.none() }
+    }
+    run frontierTrace(b"artifact discovered", started, rounds, List<ArtifactJob>.length(&jobs))
+    let graph = match move run ArtifactGraph.merge(List<BuildRecord.Record>.asSlice(&records), List<ContentHash>.asSlice(&selectedRoots), self.artifactObserving, false) {
+      Option<BuildRecord.Record>.Some {value} => move value
+      Option<BuildRecord.Record>.None => { return Option<BackendBuild>.none() }
+    }
+    if !(run WalkFragments.finiteClosed(&graph)) { return Option<BackendBuild>.none() }
+    if !(run WalkFragments.includeBudget(&mut self.specializationBudget, &graph)) { return Option<BackendBuild>.none() }
+    if !(run WalkFragments.escapeFree(&graph)) { return Option<BackendBuild>.none() }
+    run frontierTrace(b"artifact proved", started, rounds, List<BuildRecord.Entry>.length(&graph.entries))
+    let graphEntries = List<BuildRecord.Entry>.asSlice(&graph.entries)
+    let mut batches = List<List<usize>>.make()
+    shard = usize.ZERO
+    while shard < workers.length { run List<List<usize>>.append(&mut batches, List<usize>.make())
+      shard = shard + usize.ONE }
+    at = usize.ZERO
+    while at < graphEntries.length {
+      let job = DigestSet.find(&seen, graphEntries[at].exact)
+      if job == usize.MAX { return Option<BackendBuild>.none() }
+      let owner = List<ArtifactJob>.get(&jobs, job).worker
+      let lists = List<List<usize>>.asMutSlice(&mut batches)
+      run List<usize>.append(&mut lists[owner], job)
+      at = at + usize.ONE
+    }
+    let selected = List<List<usize>>.asSlice(&batches)
+    shard = usize.ZERO
+    while shard < workers.length {
+      let positions = List<usize>.asSlice(&selected[shard])
+      let mut request = Bytes.make()
+      run RuntimeEncoding.word(&mut request, usize.toU64(positions.length))
+      at = usize.ZERO
+      while at < positions.length {
+        let job = List<ArtifactJob>.get(&jobs, positions[at])
+        run appendArtifactIdentity(&mut request, job.exact, job.definition)
+        at = at + usize.ONE
+      }
+      if !run sendArtifactPacket(workers[shard].control, 5, Bytes.asSlice(&request)) { return Option<BackendBuild>.none() }
+      shard = shard + usize.ONE
+    }
+    let mut definitions = List<DefinitionFragments.Entry>.make()
+    let mut healthy = true
+    shard = usize.ZERO
+    while shard < workers.length {
+      let reply = match move run readArtifactPacket(workers[shard].control) {
+        Option<Bytes>.Some {value} => move value
+        Option<Bytes>.None => { return Option<BackendBuild>.none() }
+      }
+      match move run DefinitionFragments.read(Bytes.asSlice(&reply), b"retained-ordinary-artifact") {
+        Option<List<DefinitionFragments.Entry>>.Some {value} => {
+          let mut entries = move value
+          let positions = List<usize>.asSlice(&selected[shard])
+          let mut count = List<DefinitionFragments.Entry>.length(&entries)
+          if count != positions.length { healthy = false }
+          while count > usize.ZERO && count <= positions.length {
+            count = count - usize.ONE
+            let entry = List<DefinitionFragments.Entry>.remove(&mut entries, count)
+            let expected = List<ArtifactJob>.get(&jobs, positions[count]).exact
+            if !ContentHash.equals(digestOfBytes(Bytes.asSlice(&entry.identity.exact)), expected) { healthy = false }
+            run List<DefinitionFragments.Entry>.append(&mut definitions, move entry)
+          }
+        }
+        Option<List<DefinitionFragments.Entry>>.None => { healthy = false }
+      }
+      shard = shard + usize.ONE
+    }
+    if !healthy || !run DefinitionFragments.valid(List<DefinitionFragments.Entry>.asSlice(&definitions)) { return Option<BackendBuild>.none() }
+    run frontierTrace(b"artifact emitted", started, List<DefinitionFragments.Entry>.length(&definitions), usize.ZERO)
+    let mut collected = List<CollectedText>.make()
+    while let Option<DefinitionFragments.Entry>.Some {value} = move List<DefinitionFragments.Entry>.pop(&mut definitions) {
+      let index = List<InstanceDefinition>.length(&self.resolver.llvmValues)
+      run List<InstanceDefinition>.append(&mut self.resolver.llvmValues, move value.definition)
+      run List<CollectedText>.append(&mut collected, CollectedText {key: Option<InstanceKey>.none(),
+        replayed: Option<Replayed>.some(move value.identity), index: index, pack: usize.MAX, member: usize.MAX})
+    }
+    let mut packed = PackedBuild.make()
+    let built = run assembleEmission(&self.resolver, List<CollectedText>.asSlice(&collected), roots, module, span, &mut packed)
+    self.packedBuild = move packed
+    self.capturedBuild = Option<CapturedBuild>.none()
+    self.freshBuild = true
+    run frontierTrace(b"artifact accepted", started, List<CollectedText>.length(&collected), usize.ZERO)
+    return Option<BackendBuild>.some(move built)
+  }
+}
+
+fn artifactTraceExperiment() -> bool {
+  return !Pointer.isNullMany<u8>(unsafe FrontierHost.environment(Pointer.fromSlice<u8>(b"SILK_ARTIFACT_TRACE\0")))
+}
+
+fn postcheckBuildExperiment() -> bool {
+  return !Pointer.isNullMany<u8>(unsafe FrontierHost.environment(Pointer.fromSlice<u8>(b"SILK_POSTCHECK_BUILD\0")))
+}
+
+impl Semantic {
+  // Control experiment: the entire ordinary check has completed in this store. All worker
+  // query state is inherited from that trusted check; no frontier proof skips semantic work.
+  effect fn forkArtifactWorkers(self: &mut Self, request: &mut Request) -> bool ! OutOfMemoryError ? &mut Allocator | &mut Types {
+    let mut keys = List<InstanceKey>.make()
+    // Prefer a key with a completed MIR answer over an interned-only query subject.
+    let functions = List<MirFunction>.asSlice(&self.resolver.mirValues)
+    let mut at = usize.ZERO
+    while at < functions.length {
+      run List<InstanceKey>.append(&mut keys, InstanceKey.copy(&functions[at].key))
+      at = at + usize.ONE
+    }
+    let backend = List<BackendInstance>.asSlice(&self.resolver.backendInstances)
+    at = usize.ZERO
+    while at < backend.length {
+      run List<InstanceKey>.append(&mut keys, InstanceKey.copy(&backend[at].key))
+      at = at + usize.ONE
+    }
+    let selected = List<InstanceKey>.asSlice(&keys)
+    at = usize.ZERO
+    while at < selected.length { run Semantic.rememberFrontier(&mut self.*, &selected[at])
+      at = at + usize.ONE }
+    run List<CheckWorker>.reserve(&mut self.artifactWorkers, 4)
+    self.frontierSplit = run frontierNow()
+    let mut shard = usize.ZERO
+    while shard < 4 {
+      let mut sockets: [i32; 2] = [-1, -1]
+      if unsafe FrontierHost.socketPair(Pointer.fromMutSlice<i32>(&mut sockets)) != 0 { return false }
+      let process = unsafe FrontierHost.fork()
+      if process < 0 { drop unsafe FrontierHost.close(sockets[0])
+        drop unsafe FrontierHost.close(sockets[1])
+        return false }
+      if process == 0 {
+        drop unsafe FrontierHost.close(sockets[0])
+        let inherited = List<CheckWorker>.asSlice(&self.artifactWorkers)
+        let mut sibling = usize.ZERO
+        while sibling < inherited.length { drop unsafe FrontierHost.close(inherited[sibling].control)
+          sibling = sibling + usize.ONE }
+        List<CheckWorker>.clear(&mut self.artifactWorkers)
+        self.frontierWorker = shard
+        self.frontierControl = sockets[1]
+        let served = run Effect.result(Semantic.serveFrontier(&mut self.*, &mut request.*))
+        drop unsafe FrontierHost.close(self.frontierControl)
+        let status: i32 = match &served {
+          Result<(), OutOfMemoryError>.Success {..} => 0
+          Result<(), OutOfMemoryError>.Failure {..} => 2
+        }
+        unsafe FrontierHost.exit(status)
+        return CompilerBug.panic(b"artifact worker exit returned")
+      }
+      drop unsafe FrontierHost.close(sockets[1])
+      run List<CheckWorker>.append(&mut self.artifactWorkers,
+        CheckWorker {process: process, stream: Pointer.null<u8>(), control: sockets[0]})
+      shard = shard + usize.ONE
+    }
+    let workers = List<CheckWorker>.asSlice(&self.artifactWorkers)
+    at = usize.ZERO
+    while at < workers.length {
+      let mut ready: [u8; 1] = [0]
+      if !frontierRead(workers[at].control, &mut ready) || ready[0] != 1 { return false }
+      at = at + usize.ONE
+    }
+    return true
+  }
 }
 
 /// The semantic fact selected by a query key.
@@ -3332,6 +4053,12 @@ pub struct Semantic {
   // replaces a record (see `replayEscapes`), and whether a replay lowered anything they lack.
   escapeImage: EscapeImage,
   freshEscapes: bool,
+  artifactKeys: List<InstanceKey>,
+  artifactDigests: DigestSet,
+  artifactWorkers: List<CheckWorker>,
+  keepArtifactWorkers: bool,
+  artifactObserving: bool,
+  artifactObservationRequired: bool,
   frontierKeys: List<InstanceKey>,
   frontierKeyDigests: DigestSet,
   frontierControl: i32,
@@ -92922,6 +93649,12 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
     carriedBuild: List<usize>.make(),
     escapeImage: EscapeImage.make(),
     freshEscapes: false,
+    artifactKeys: List<InstanceKey>.make(),
+    artifactDigests: DigestSet.make(),
+    artifactWorkers: List<CheckWorker>.make(),
+    keepArtifactWorkers: false,
+    artifactObserving: false,
+    artifactObservationRequired: false,
     frontierKeys: List<InstanceKey>.make(),
     frontierKeyDigests: DigestSet.make(),
     frontierControl: -1,
@@ -94615,6 +95348,19 @@ impl Semantic {
     while true {
       let mut command: [u8; 1] = [0]
       if !frontierRead(self.frontierControl, &mut command) || command[0] == 0 { return () }
+      if command[0] >= 3 && command[0] <= 6 {
+        let payload = match move run readArtifactPacket(self.frontierControl) {
+          Option<Bytes>.Some {value} => move value
+          Option<Bytes>.None => { return () }
+        }
+        let attempted = run Effect.result(Semantic.artifactCommand(&mut self.*, command[0], Bytes.asSlice(&payload)))
+        let reply = match move attempted {
+          Result<Bytes, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} => move value
+          Result<Bytes, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {..} => Bytes.make()
+        }
+        if !run replyArtifactPacket(self.frontierControl, Bytes.asSlice(&reply)) { return () }
+        continue
+      }
       if command[0] != 2 { return () }
       // Frontier placeholders may be recorded before their visit reaches rememberFrontier.
       // Include canonical keys inherited at fork so graph extension can still find those roots.
@@ -96630,14 +97376,21 @@ impl Semantic {
           let joined = if available {
             run Effect.result(Semantic.joinFrontier(&mut self.*, &request.*, List<CheckWorker>.asSlice(&workers)))
           } else { Result<bool, Cycle | OutOfMemoryError>.Success {value: false} }
-          stopFrontier(List<CheckWorker>.asSlice(&workers))
-          if let Option<[*]mut u64>.Some {value} = move self.frontierClaims {
-            drop unsafe FrontierHost.unmapShared(value, frontierClaimBytes)
-          }
-          self.frontierClaims = Option<[*]mut u64>.none()
           let accepted = match move joined {
             Result<bool, Cycle | OutOfMemoryError>.Success {value} => value
-            Result<bool, Cycle | OutOfMemoryError>.Failure {error} => { fail move error }
+            Result<bool, Cycle | OutOfMemoryError>.Failure {error} => {
+              stopFrontier(List<CheckWorker>.asSlice(&workers))
+              if let Option<[*]mut u64>.Some {value} = move self.frontierClaims { drop unsafe FrontierHost.unmapShared(value, frontierClaimBytes) }
+              self.frontierClaims = Option<[*]mut u64>.none()
+              fail move error
+            }
+          }
+          if accepted && self.keepArtifactWorkers {
+            self.artifactWorkers = move workers
+          } else {
+            stopFrontier(List<CheckWorker>.asSlice(&workers))
+            if let Option<[*]mut u64>.Some {value} = move self.frontierClaims { drop unsafe FrontierHost.unmapShared(value, frontierClaimBytes) }
+            self.frontierClaims = Option<[*]mut u64>.none()
           }
           if accepted {
             self.frontierUncachedUnit = self.frontierUnit
@@ -98622,6 +99375,25 @@ impl Semantic {
     rootPackage: &[ModuleId], checked: &[ModuleId], closureNodes: usize) -> BackendBuild
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
   ? &mut Allocator | &mut Types {
+    self.keepArtifactWorkers = retainedBuildExperiment()
+    self.artifactObserving = false
+    self.artifactObservationRequired = false
+    let attempted = run Effect.result(Semantic.buildArtifactHeld(&mut self.*, &mut request.*, runtime, rootPackage, checked, closureNodes))
+    stopFrontier(List<CheckWorker>.asSlice(&self.artifactWorkers))
+    List<CheckWorker>.clear(&mut self.artifactWorkers)
+    if let Option<[*]mut u64>.Some {value} = move self.frontierClaims { drop unsafe FrontierHost.unmapShared(value, frontierClaimBytes) }
+    self.frontierClaims = Option<[*]mut u64>.none()
+    self.keepArtifactWorkers = false
+    return match move attempted {
+      Result<BackendBuild, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} => move value
+      Result<BackendBuild, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} => { fail move error }
+    }
+  }
+
+  effect fn buildArtifactHeld(self: &mut Self, request: &mut Request, runtime: Option<&ModuleId>,
+    rootPackage: &[ModuleId], checked: &[ModuleId], closureNodes: usize) -> BackendBuild
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
     run selectRequest(&mut self.resolver, &request.*)
     self.resolver.exportedObjects = List<ExportedObject>.make()
     self.resolver.exportedFunctions = List<LlvmCode.Declaration>.make()
@@ -98630,6 +99402,14 @@ impl Semantic {
       Option<&ModuleId>.None => Option<ModuleId>.none()
     }
     run Progress.begin(&mut self.resolver.progress, ProgressPhase.Check, checked.length)
+    // The runtime entry creates the same finite worker frontier used by check. Its preliminary
+    // reports are not published here: ordinary declaration/build validation below owns reports.
+    if self.keepArtifactWorkers && frontierExperiment() {
+      if let Option<ModuleId>.Some {value: selected} = &exempt {
+        let entered = run Semantic.checkRuntime(&mut self.*, &mut request.*, &selected, checked)
+        drop entered
+      }
+    }
     let mut checked = run Semantic.checkDeclarations(&mut self.*, &mut request.*, checked, &exempt)
     // Warnings leave the build going; they are reported beside its output.
     let mut refusals = List<Shared<Rejection>>.make()
@@ -98827,6 +99607,21 @@ impl Semantic {
       }
     }
     self.replay = Option<ReplayState>.none()
+    if postcheckBuildExperiment() && List<CheckWorker>.length(&self.artifactWorkers) == usize.ZERO {
+      if !run Semantic.forkArtifactWorkers(&mut self.*, &mut request.*) {
+        stopFrontier(List<CheckWorker>.asSlice(&self.artifactWorkers))
+        List<CheckWorker>.clear(&mut self.artifactWorkers)
+      }
+    }
+    if List<CheckWorker>.length(&self.artifactWorkers) > usize.ZERO {
+      if let Option<BackendBuild>.Some {value} = move run Semantic.retainedArtifact(&mut self.*, List<BuildRoot>.asSlice(&roots), &module, origin) {
+        drop emitting
+        return run withUnemittedBodies(move value, List<UncheckedDeclaration>.asSlice(&checked.unchecked))
+      }
+      run frontierTrace(b"artifact refused", self.frontierSplit, usize.ZERO, usize.ZERO)
+      stopFrontier(List<CheckWorker>.asSlice(&self.artifactWorkers))
+      List<CheckWorker>.clear(&mut self.artifactWorkers)
+    }
     let built = run Semantic.buildFrom(&mut self.*, &module, runtimeSelected, List<BuildRoot>.asSlice(&roots), origin,
       closureNodes, false, &Option<FrameSelection>.none())
     drop emitting
@@ -101956,6 +102751,25 @@ effect fn assembleUnits(resolver: &Resolver, reached: &[CollectedText], plan: &E
     while List<usize>.get(&moduleBytes, at) > count * unitShardBytes() { count = count * 2 }
     run List<usize>.append(&mut shardCounts, count)
     at = at + usize.ONE
+  }
+  // Diagnostic cold-build experiment: stable symbol buckets across modules avoid hundreds
+  // of tiny LLVM invocations and duplicated declarations. Existing module packs remain the
+  // off-mode control in this same executable.
+  if devPackedGroups() {
+    let mut total = usize.ZERO
+    at = usize.ZERO
+    while at < List<usize>.length(&moduleBytes) {
+      total = total + List<usize>.get(&moduleBytes, at)
+      at = at + usize.ONE
+    }
+    let mut count = usize.ONE
+    while total > count * 4194304 { count = count * 2 }
+    if List<usize>.length(&shardCounts) > usize.ZERO { List<usize>.set(&mut shardCounts, usize.ZERO, count) }
+    at = usize.ZERO
+    while at < List<usize>.length(&moduleOf) {
+      List<usize>.set(&mut moduleOf, at, usize.ZERO)
+      at = at + usize.ONE
+    }
   }
   // Each unit's module and shard.
   let mut unitModules = List<usize>.make()
@@ -108545,4 +109359,9 @@ test effect fn bodySourceSnapshotsRespectCapturesAndRevisions() -> ()
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut types = TypeTable.make()
   return run bodySourceSnapshotClaims() |> Effect.provideMut<Types>(&mut types) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Optional global symbol buckets; measured separately from the retained worker path.
+fn devPackedGroups() -> bool {
+  return !Pointer.isNullMany<u8>(unsafe FrontierHost.environment(Pointer.fromSlice<u8>(b"SILK_EXPERIMENT_DEV_PACKS\0")))
 }
