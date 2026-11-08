@@ -103,6 +103,7 @@ import silk.http.hpack {Field as Http2Field, FieldBlock as Http2Fields}
 import silk.http.http2 {Connection as Http2Connection, Event as Http2Event, Limits as Http2Limits, Role as Http2Role}
 import silk.http.http2_connection {Driver}
 import silk.http.http2_frame {ProtocolError}
+import silk.http.http2_headers {Message as Http2Message}
 import silk.tls.certificate_path {ValidationError, ValidationReason}
 import silk.http.headers {Headers, Limits as HeaderLimits}
 import silk.http.body {Framing}
@@ -445,13 +446,17 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     storage: Bytes,
     // Name start, name length, value start, value length, for each field.
     spans: List<usize>,
+    // True if the fields pass HTTP/2 request validation with `message` as its result: the
+    // HTTP/1.1 head was validated when it was written, and the rewrite keeps it valid.
+    validated: bool,
+    message: Http2Message,
   }
 
   // Rewrites the HTTP/1.1 head `head` as HTTP/2 fields: the request line becomes `:method`,
   // `:scheme` and `:path`, `Host` becomes `:authority`, names are lowercased, and the fields that
   // HTTP/2 forbids (RFC 9113 section 8.2.2) are left out.
   effect fn rewriteRequest(head: &[u8], secure: bool) -> Http2Request ! HttpError | OutOfMemoryError ? &mut Allocator {
-    let mut rewritten = Http2Request {storage: Bytes.make(), spans: List<usize>.make()}
+    let mut rewritten = Http2Request {storage: Bytes.make(), spans: List<usize>.make(), validated: false, message: noMessage()}
     run rewriteInto(head, secure, &mut rewritten)
     return move rewritten
   }
@@ -481,6 +486,14 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     run appendSpan(&mut spans.*, usize.MAX - 2, 0, space + usize.ONE, second - space - usize.ONE)
     // The authority goes in its slot once `Host` is found; until then it is empty.
     run appendSpan(&mut spans.*, usize.MAX - 3, 0, 0, 0)
+    let method = Slice.view<u8>(&bytes, usize.ZERO, space)
+    let target = Slice.view<u8>(&bytes, space + usize.ONE, second - space - usize.ONE)
+    // CONNECT and targets other than origin-form or `*` are left to the full validation.
+    let mut validated = !bytesEqual(method, b"CONNECT") && target.length > usize.ZERO
+      && (target[0] == 47 || bytesEqual(target, b"*"))
+    let mut hasHost = false
+    let mut message = noMessage()
+    message.head = bytesEqual(method, b"HEAD")
     let mut start = lineEnd + 2
     while start + usize.ONE < bytes.length && bytes[start] != 13 {
       // The name is lowercased while its end is found.
@@ -496,16 +509,44 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
       if colon >= end || end >= bytes.length { break }
       let mut valueStart = colon + usize.ONE
       while valueStart < end && (bytes[valueStart] == 32 || bytes[valueStart] == 9) { valueStart = valueStart + usize.ONE }
+      // HTTP/2 forbids whitespace around a value, and it is not part of an HTTP/1.1 value.
+      let mut valueEnd = end
+      while valueEnd > valueStart && (bytes[valueEnd - usize.ONE] == 32 || bytes[valueEnd - usize.ONE] == 9) {
+        valueEnd = valueEnd - usize.ONE
+      }
       let name = Slice.view<u8>(&bytes, start, colon - start)
       if bytesEqual(name, b"host") {
+        if hasHost { validated = false }
+        hasHost = true
         List<usize>.set(&mut spans.*, 14, valueStart)
-        List<usize>.set(&mut spans.*, 15, end - valueStart)
+        List<usize>.set(&mut spans.*, 15, valueEnd - valueStart)
       } else if !forbiddenInHttp2(name) {
-        run appendSpan(&mut spans.*, start, colon - start, valueStart, end - valueStart)
+        if bytesEqual(name, b"content-length") {
+          if message.hasLength { validated = false }
+          message.hasLength = true
+          let mut digit = valueStart
+          while digit < valueEnd {
+            let byte = bytes[digit]
+            if byte < 48 || byte > 57 || message.length > 100000000000000 {
+              validated = false
+              break
+            }
+            message.length = message.length * 10 + u8.toU64(byte - 48)
+            digit = digit + usize.ONE
+          }
+          if valueStart == valueEnd { validated = false }
+        }
+        run appendSpan(&mut spans.*, start, colon - start, valueStart, valueEnd - valueStart)
       }
       start = end + 2
     }
+    into.validated = validated && hasHost
+    into.message = message
     return ()
+  }
+
+  fn noMessage() -> Http2Message {
+    return Http2Message {hasLength: false, length: 0, status: 0, head: false, connect: false}
   }
 
   effect fn appendSpan(spans: &mut List<usize>, nameStart: usize, nameLength: usize, valueStart: usize, valueLength: usize) -> () ! OutOfMemoryError ? &mut Allocator {
@@ -2707,9 +2748,13 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   ? &mut Allocator {
     run rewriteInto(job.request.bytes(), secure, &mut rewritten.*)
     let request: &Http2Request = &rewritten.*
-    let count = List<usize>.length(&request.spans) / 4
     let last = Bytes.length(&job.body) == usize.ZERO
     let fields = run fieldsOf(request)
+    if request.validated {
+      // The head was validated as HTTP/1.1 when it was written, and the rewrite keeps it a valid
+      // HTTP/2 request.
+      return run unsafe Http2Connection.openValidated(Driver.connection(&mut driver.*), List<Http2Field<'_>>.asSlice(&fields), last, request.message)
+    }
     return run Http2Connection.open(Driver.connection(&mut driver.*), List<Http2Field<'_>>.asSlice(&fields), last)
   }
 
@@ -2994,7 +3039,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     let mut retry = List<Forwarded>.make()
     // The streams each step ends; drained after the step, so one list serves the whole loop.
     let mut finished = List<MuxEnded>.make()
-    let mut rewritten = Http2Request {storage: Bytes.make(), spans: List<usize>.make()}
+    let mut rewritten = Http2Request {storage: Bytes.make(), spans: List<usize>.make(), validated: false, message: noMessage()}
     let mut deferred = Option<Indexed>.none()
     let mut alive = true
     let mut accepting = true
