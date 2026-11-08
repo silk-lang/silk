@@ -834,3 +834,47 @@ captured value must be one static data can embed (STATIC-005). A function value 
 read.
 
 **Evidence:** corpus program `static-function-values-at-runtime`.
+
+### STATIC-021 — An erased function reference holds function values of any contract
+
+**Status:** Confirmed
+
+`Intrinsic.FunctionRef` holds one static function value with its contract erased, so a single
+struct field or list can hold checks or parsers that take different types.
+`Intrinsic.functionRef<F>(value)` erases the contract `F` of `value`, and
+`Intrinsic.functionAs<F>(reference)` returns the function value again at the contract `F`. An
+erased reference is static data: it exists only during static evaluation and every read sees it
+again, so it is `Copy`. A restored value that names an ordinary function is called by runtime code
+as that function (STATIC-020).
+
+```silk
+struct Rule {
+  pub check: Intrinsic.FunctionRef,
+}
+
+fn positive(value: &u32) -> bool {
+  return value.* > 0
+}
+
+static fn rule() -> Rule {
+  return Rule {check: Intrinsic.functionRef<fn<'static>(&u32) -> bool>(positive)}
+}
+
+static fn checkOf(rule: Rule) -> fn<'static>(&u32) -> bool {
+  return Intrinsic.functionAs<fn<'static>(&u32) -> bool>(rule.check)
+}
+
+fn valid(value: &u32) -> bool {
+  let static check = checkOf(rule())
+  return check(value)
+}
+```
+
+**Boundary:** Both intrinsics run only in static code. Restoring compares the parameters the value
+still takes and its result with `F`, by representation: the lifetimes of a reference parameter are
+the call's to check.
+
+**Diagnostics:** Restoring a reference at a contract it was not erased from stops the evaluation
+with `SEM0176` at the `functionAs` call, with the static trace that reached it.
+
+**Evidence:** corpus program `static-function-references`.
