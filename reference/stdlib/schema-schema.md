@@ -14,8 +14,11 @@ chain with [`Schemas.readVia`](#Schemas.impl.readVia) and [`Schemas.writeVia`](#
 A type is declared once, and the schema derives what to do from it. The default `read` and
 `write` walk the type's public fields with `silk.core.reflect`, so a struct is read from an
 object with one member per field, in any order, and written in declaration order. A union whose
-variants have no fields is the name of its variant, such as `"Admin"`. An `Option` field may be
-absent, or `null`, when it is `None`, and is left out when written.
+variants have no fields is the name of its variant, such as `"Admin"`. A union with a variant
+that has fields is an object whose `type` member names the variant and whose other members are
+that variant's fields, such as `{"type": "Circle", "radius": 2}`; `Spec.tag` picks another
+member name. An `Option` field may be absent, or `null`, when it is `None`, and is left out when
+written.
 
 [`Spec`](#Spec) holds what the types cannot say, such as a field whose name on the wire differs. A type
 returns its spec from `Schema.spec`.
@@ -24,8 +27,8 @@ A format implements [`SchemaReader`](#SchemaReader) and [`SchemaWriter`](#Schema
 other formats later without changes.
 
 ## Gotchas
-Every field of a derived struct must be public, because reflection sees only public fields.
-Unions whose variants have fields are not supported yet and report a compile error.
+Every field of a derived struct or variant must be public, because reflection sees only public
+fields. A variant field cannot be named `type`, or whatever `Spec.tag` picks.
 
 ## Examples
 ### Read and write a struct as JSON
@@ -581,6 +584,31 @@ pub static fn rename(self: Self, field: Intrinsic.FieldName<T>, wire: string<'st
 
 Returns the spec in which `field` is called `wire` in the data format.
 
+<a id="Spec.impl.tag"></a>
+
+### Method `tag`
+
+```silk
+pub static fn tag(self: Self, name: string<'static>) -> Self
+```
+
+Returns the spec in which a union's variant is named by the field `name`, instead of `type`.
+
+#### Details
+
+A union with a variant that has fields is written as an object holding the variant's name in
+this field next to the variant's own fields, such as `{"type": "Circle", "radius": 2}`.
+
+<a id="Spec.impl.tagName"></a>
+
+### Method `tagName`
+
+```silk
+pub static fn tagName(self: &Self) -> string<'static>
+```
+
+Returns the name of the field that holds a union's variant name.
+
 <a id="Spec.impl.wireName"></a>
 
 ### Method `wireName`
@@ -603,8 +631,8 @@ A type that can be read from and written to any data format.
 
 ### When to use
 
-Write `impl Schema for T {}` for a struct whose fields are all public and implement `Schema`, or
-for a union whose variants have no fields. Override `spec` to rename fields. Override `read` and
+Write `impl Schema for T {}` for a struct or union whose fields are all public and implement
+`Schema`. Override `spec` to rename fields. Override `read` and
 `write` for a type whose wire form is not its fields, usually with [`Schemas.readVia`](#Schemas.impl.readVia) and
 [`Schemas.writeVia`](#Schemas.impl.writeVia).
 
@@ -631,7 +659,8 @@ Returns what the type's schema says beyond its declaration. The default renames 
 effect fn read<R: SchemaReader>(reader: &mut R) -> Self ! Issue | OutOfMemoryError ? &mut Allocator
 ```
 
-Reads a value. The default reads a struct from an object, or a union from its variant name.
+Reads a value. The default reads a struct from an object, a union of unit variants from its
+variant name, and any other union from an object tagged with its variant name.
 
 #### Errors
 
@@ -647,7 +676,8 @@ effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
     -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator
 ```
 
-Writes the value. The default writes a struct as an object, or a union as its variant name.
+Writes the value. The default writes a struct as an object, a union of unit variants as its
+variant name, and any other union as an object tagged with its variant name.
 
 #### Errors
 

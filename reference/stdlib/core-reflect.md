@@ -560,7 +560,8 @@ field, and the kind [`variantFieldKind`](#variantFieldKind). A unit variant has 
 
 The list contains only the `pub` fields, because visibility is judged from
 `silk/core/reflect`. A field descriptor of a variant cannot be given to
-[`Reflect.borrowField`](#Reflect.impl.borrowField), because the union holds the field only while that variant is active.
+[`Reflect.borrowField`](#Reflect.impl.borrowField), because the union holds the field only while that variant is active;
+read it with [`Reflect.borrowVariantField`](#Reflect.impl.borrowVariantField).
 
 <a id="Reflect.impl.makeVariant"></a>
 
@@ -628,6 +629,61 @@ pub fn main() -> i32 {
 
 The tuple must have exactly the variant's field types in declaration order. Every field of the
 variant must be `pub`, since the variant is built from `silk/core/reflect`.
+
+<a id="Reflect.impl.borrowVariantField"></a>
+
+### Associated function `borrowVariantField`
+
+```silk
+pub fn borrowVariantField<'o, Union, Value>(owner: &'o Union, static variant: Intrinsic.Variant<Union>,
+    static field: Intrinsic.Field<Union, Value>) -> &'o Value
+```
+
+Returns a borrow of the field that `field` describes, of the variant that `variant` describes.
+
+#### Details
+
+`variant` and `field` are static arguments, so at runtime this function is a test of the
+union's active variant followed by a plain field borrow, like a `match` arm that binds that
+field. `field` must be one of [`Reflect.variantFields`](#Reflect.impl.variantFields) of `variant`.
+
+#### Examples
+
+```silk
+import silk.core.reflect { Reflect }
+
+union Shape {
+  Dot,
+  Line { pub length: u32, pub width: u32 },
+}
+
+// Adds the fields of whichever variant `shape` holds.
+fn total(shape: &Shape) -> u32 {
+  let mut sum: u32 = 0
+  static for variant in Reflect.variants<Shape>() {
+    if Reflect.isVariant(shape, variant) {
+      static for field in Reflect.variantFields(variant) {
+        sum = sum + Reflect.borrowVariantField<Shape, u32>(shape, variant, field).*
+      }
+    }
+  }
+  return sum
+}
+
+pub fn main() -> i32 {
+  if total(&Shape.Line {length: 3, width: 4}) != 7 {
+    return 1
+  }
+  if total(&Shape.Dot) != 0 {
+    return 2
+  }
+  return 0
+}
+```
+
+#### Gotchas
+
+It traps when `owner` holds another variant, so test with [`Reflect.isVariant`](#Reflect.impl.isVariant) first.
 
 <a id="Reflect.impl.isVariant"></a>
 
