@@ -111,8 +111,8 @@ entry has a `retention` budget instead: its `answers` and `mir-functions` may no
 Most of what an edit marks outdated is the edited module's fanout: every unit that reads it,
 directly or through another unit, marked and then verified. New code that uses the module adds
 to it, so each entry measures it once, on a trivia edit (its `fanout` step), and budgets the
-module's other edits with `outdatedOverFanout`: how many more units than that trivia edit the
-edit's kind may mark, or fewer when negative. Those offsets move only when the compiler's
+module's other edits with `outdatedOverFanout`: how many more units than the trivia edit's
+limit the edit's kind may mark, or fewer when negative. Those offsets move only when the compiler's
 invalidation does, and stay exact.
 
 The fanout step's limit is a base in the top-level `fanout` object plus the ledger in
