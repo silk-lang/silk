@@ -108,6 +108,22 @@ compiler stores need more memory than a CI runner has. The long standard library
 entry has a `retention` budget instead: its `answers` and `mir-functions` may not grow from step
 2 to the last step, so what an edit replaces is released and a long session stays the same size.
 
+Most of what an edit marks outdated is the edited module's fanout: every unit that reads it,
+directly or through another unit, marked and then verified. New code that uses the module adds
+to it, so each entry measures it once, on a trivia edit (its `fanout` step), and budgets the
+module's other edits with `outdatedOverFanout`: how many more units than that trivia edit the
+edit's kind may mark, or fewer when negative. Those offsets move only when the compiler's
+invalidation does, and stay exact.
+
+The fanout step's limit is a base in the top-level `fanout` object plus the ledger in
+`fixtures/replay/fanout/`. When a change adds code that reads the module and the trivia step
+fails, add one file of your own there, such as `fanout/zip-reader.txt`, with a line
+`stdlib +5` (or `compiler +5`) and a comment naming the code that added the units; the check
+prints the exact line. Each change writes its own file, so two branches never conflict, and
+their increases add up when both merge. A line may be negative to tighten the limit after a
+change that removes readers. Now and then a change of its own folds the ledger: it adds the
+files' sum to the base and deletes them.
+
 The budgets allow twice the measured units (at least 20 more) and about two and a half times
 the largest measured demand fraction. When a change moves a step's numbers for a good reason, replay the
 script and update its entry. Measured on 2026-10-22:

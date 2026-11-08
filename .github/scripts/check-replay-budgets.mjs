@@ -13,17 +13,61 @@
 // `--differential` log must also report `differences=0` for every step. The initial check is only
 // reported. An entry's `retention` bounds how much its `answers` and `mir-functions` may grow from
 // step `from` to the last step, so a long session releases what its edits replace.
-import { readFileSync } from 'node:fs';
+//
+// An entry's `fanout` step is a trivia edit: it changes no answer, so the units it marks outdated
+// are every unit that reads the edited module, directly or through another unit. New code that
+// uses the module raises that count, so it is the one number that tracks the workspace. Its limit
+// is the top-level `fanout` base it names plus every line for that name in the files of the
+// `fanout` directory beside budgets.json. A step budgeted with `outdatedOverFanout` may mark at
+// most that many more units than the fanout step measured (fewer when negative), which is what
+// the edit's kind costs on top of the module's readers, so it only moves when the compiler does.
+import { readdirSync, readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 
 const [logPath, budgetsPath, workspace] = process.argv.slice(2);
 if (!logPath || !budgetsPath || !workspace) {
   console.error('usage: check-replay-budgets.mjs <replay.log> <budgets.json> <workspace>');
   process.exit(2);
 }
-const entry = JSON.parse(readFileSync(budgetsPath, 'utf8'))[workspace];
-if (!entry) {
+const budgetsFile = JSON.parse(readFileSync(budgetsPath, 'utf8'));
+const entry = budgetsFile[workspace];
+if (!entry || workspace === 'fanout') {
   console.error(`no budgets for ${workspace} in ${budgetsPath}`);
   process.exit(2);
+}
+
+function invalid(message) {
+  console.error(message);
+  process.exit(2);
+}
+
+// One file per change that moved a fanout, so two branches never edit the same line and their
+// increases add up when both merge. Each line is `<name> <+n|-n>`; `#` starts a comment.
+const ledgerDirectory = join(dirname(budgetsPath), 'fanout');
+const ledgerPath = ledgerDirectory.replace(/^(\.\/)?/, '');
+function fanoutLimit(name) {
+  const base = budgetsFile.fanout?.[name];
+  if (!Number.isInteger(base)) invalid(`${budgetsPath} has no fanout base named ${name}`);
+  let ledger = 0;
+  let files;
+  try {
+    files = readdirSync(ledgerDirectory).filter((file) => file.endsWith('.txt')).sort();
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    files = [];
+  }
+  for (const file of files) {
+    const lines = readFileSync(join(ledgerDirectory, file), 'utf8').split('\n');
+    lines.forEach((text, at) => {
+      const line = text.replace(/#.*/, '').trim();
+      if (line === '') return;
+      const match = /^(\S+)\s+([+-]\d+)$/.exec(line);
+      if (!match) invalid(`${join(ledgerPath, file)}:${at + 1}: expected \`<name> <+n|-n>\`, found \`${line}\``);
+      if (!(match[1] in budgetsFile.fanout)) invalid(`${join(ledgerPath, file)}:${at + 1}: no fanout base named ${match[1]}`);
+      if (match[1] === name) ledger += Number(match[2]);
+    });
+  }
+  return { base, ledger, limit: base + ledger };
 }
 
 function fields(line) {
@@ -46,8 +90,26 @@ for (const line of readFileSync(logPath, 'utf8').split('\n')) {
 }
 
 const failures = [];
+const notes = [];
 const rows = [];
 const budgets = entry.steps;
+const fanout = entry.fanout;
+if (fanout) {
+  if (!Number.isInteger(fanout.step) || fanout.step < 1 || fanout.step >= budgets.length || budgets[fanout.step].kind !== 'trivia') {
+    invalid(`${workspace}: the fanout step must name a trivia step`);
+  }
+}
+const fanoutBudget = fanout ? fanoutLimit(fanout.of) : undefined;
+const fanoutMeasured = fanout && steps.length > fanout.step ? Number(steps[fanout.step]['marked-outdated']) : undefined;
+budgets.forEach((budget, at) => {
+  if (at === 0 || at === fanout?.step) {
+    if ('outdated' in budget || 'outdatedOverFanout' in budget) invalid(`${workspace}: step ${at} must not budget outdated units`);
+  } else if (('outdated' in budget) === ('outdatedOverFanout' in budget)) {
+    invalid(`${workspace}: step ${at} must budget exactly one of outdated and outdatedOverFanout`);
+  } else if ('outdatedOverFanout' in budget && !fanout) {
+    invalid(`${workspace}: step ${at} budgets outdatedOverFanout without a fanout step`);
+  }
+});
 if (steps.length !== budgets.length) {
   failures.push(`expected ${budgets.length} steps, the log has ${steps.length}`);
 }
@@ -60,9 +122,26 @@ for (let at = 0; at < Math.min(steps.length, budgets.length); at += 1) {
     continue;
   }
   const fraction = Number(step.demands) / Number(steps[0].demands);
+  let outdatedLimit = budget.outdated;
+  if (at === fanout?.step) outdatedLimit = fanoutBudget.limit;
+  else if ('outdatedOverFanout' in budget) outdatedLimit = fanoutMeasured + budget.outdatedOverFanout;
   if (at > 0) {
-    for (const [key, name] of [['units-run', 'units'], ['marked-outdated', 'outdated']]) {
-      if (Number(step[key]) > budget[name]) failures.push(`${label}: ${key}=${step[key]} exceeds its budget of ${budget[name]}`);
+    if (Number(step['units-run']) > budget.units) failures.push(`${label}: units-run=${step['units-run']} exceeds its budget of ${budget.units}`);
+    if (Number(step['marked-outdated']) > outdatedLimit) {
+      if (at === fanout?.step) {
+        const over = Number(step['marked-outdated']) - fanoutBudget.base - fanoutBudget.ledger;
+        failures.push(
+          `${label}: marked-outdated=${step['marked-outdated']} exceeds the ${fanout.of} fanout of ${outdatedLimit} ` +
+            `(base ${fanoutBudget.base}, ledger ${fanoutBudget.ledger >= 0 ? '+' : ''}${fanoutBudget.ledger}). ` +
+            `When new code that reads ${budget.module} accounts for the ${over} more, add a file under ${ledgerPath}/ ` +
+            `with the line \`${fanout.of} +${over}\` and say which code added them; every step budgeted over the fanout follows it.`,
+        );
+      } else {
+        const over = 'outdatedOverFanout' in budget ? ` (the fanout step's ${fanoutMeasured} ${budget.outdatedOverFanout >= 0 ? '+' : ''}${budget.outdatedOverFanout})` : '';
+        failures.push(`${label}: marked-outdated=${step['marked-outdated']} exceeds its budget of ${outdatedLimit}${over}`);
+      }
+    } else if (at === fanout?.step && Number(step['marked-outdated']) < outdatedLimit) {
+      notes.push(`The ${fanout.of} fanout measured ${step['marked-outdated']}, under its limit of ${outdatedLimit}; a ledger line \`${fanout.of} -${outdatedLimit - Number(step['marked-outdated'])}\` would tighten it.`);
     }
     if (fraction > budget.demandsFraction) {
       failures.push(`${label}: demands are ${fraction.toFixed(3)} of the initial check's, over the budget of ${budget.demandsFraction}`);
@@ -84,7 +163,7 @@ for (let at = 0; at < Math.min(steps.length, budgets.length); at += 1) {
     failures.push(`${label}: the differential check reported differences=${differences.get(at)}`);
   }
   const limit = (value, max) => (at > 0 ? `${value} / ${max}` : value);
-  rows.push(`| ${at} | ${budget.kind} | ${limit(step['units-run'], budget.units)} | ${limit(step['marked-outdated'], budget.outdated)} | ${step.demands} (${limit(fraction.toFixed(3), budget.demandsFraction)}) | ${step.unchanged ?? '-'} | ${step.verified ?? '-'} | ${step.rejections} | ${step['update-us']} | ${step['check-us']} |`);
+  rows.push(`| ${at} | ${budget.kind} | ${limit(step['units-run'], budget.units)} | ${limit(step['marked-outdated'], outdatedLimit)} | ${step.demands} (${limit(fraction.toFixed(3), budget.demandsFraction)}) | ${step.unchanged ?? '-'} | ${step.verified ?? '-'} | ${step.rejections} | ${step['update-us']} | ${step['check-us']} |`);
 }
 
 const retention = entry.retention;
@@ -103,6 +182,7 @@ console.log(`Replay budgets for ${workspace} (measured / budget):\n`);
 console.log('| Step | Kind | Units run | Marked outdated | Demands (fraction of initial) | Unchanged | Verified | Rejections | Update us | Check us |');
 console.log('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |');
 for (const row of rows) console.log(row);
+for (const note of notes) console.log(`\n${note}`);
 if (failures.length > 0) {
   console.error(`\n${failures.length} budget failure(s):`);
   for (const failure of failures) console.error(`  ${failure}`);
