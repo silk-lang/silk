@@ -14,6 +14,7 @@
 //! read (driver/BuildInputs) sees an edit to any of them, and a build that changes nothing never
 //! starts Clang.
 
+import driver.CommandPath
 import driver.HostRename
 import driver.NativeLinkInput as NativeLinkInputs {InvalidNativeLinkInput, NativeLinkInput, SourceLanguage}
 import driver.NativeToolchain
@@ -24,6 +25,7 @@ import silk.system.child_process {ChildProcess, ProcessError}
 import silk.core.effect {Effect}
 import silk.system.host_input {HostInput, HostInputError}
 import silk.system.filesystem {DirectoryEntry, FileError, FileSystem, Path}
+import silk.system.filesystem_machine {MachineFileSystem}
 import silk.collections.list {List}
 import silk.core.option {Option}
 import silk.core.result {Result}
@@ -34,9 +36,11 @@ import silk.num.usize
 /// The outcome of compiling a build's sources: the inputs to link, each `Sources` entry replaced
 /// by the objects of its files, or the failed compile's status. `diagnostics` holds what Clang
 /// wrote, warnings included. `headers` is the digest of every object's header record: an object's
-/// name does not change with its headers, so a link stamp names this too.
+/// name does not change with its headers, so a link stamp names this too. `cacheable` says whether
+/// the artifact may skip native-header validation: raw paths the input recorder cannot represent
+/// keep it false, while individual native objects can still reuse their freshly checked headers.
 pub union NativeBuild {
-  Linked {pub inputs: List<NativeLinkInput>, pub diagnostics: Bytes, pub headers: ContentHash},
+  Linked {pub inputs: List<NativeLinkInput>, pub diagnostics: Bytes, pub headers: ContentHash, pub cacheable: bool},
   Failed {pub diagnostics: Bytes},
 }
 
@@ -229,31 +233,84 @@ effect fn readOptional(path: &Path) -> Option<Bytes> ! OutOfMemoryError ? &mut F
   }
 }
 
-// The digest of the file at `path`, spelled in hexadecimal, or `missing` when it cannot be read.
-effect fn digestOf(path: &[u8]) -> Bytes ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  let parsed = match move run Effect.result(Path.fromBytes(path)) {
+// The digest of a header, or `missing` when it cannot be read. Clang can report native
+// paths containing `..`; resolving these lexically changes their meaning through symlinks.
+// Resolve such names through the host and retain the original name in the header record so
+// every native-object validation resolves it again. The input recorder cannot represent that
+// raw lookup, so the complete artifact must not bypass this validation on the next build.
+effect fn digestOf(path: &[u8], cacheable: &mut bool) -> Bytes ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let mut resolvedName = Bytes.make()
+  let parsed = match move run Effect.result(CommandPath.fromHost(path)) {
     Result<Path, FileError | OutOfMemoryError>.Success {value} => move value
     Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
-      FileError failure => { drop failure return run Bytes.copy(b"missing") }
+      FileError failure => {
+        drop failure
+        cacheable.* = false
+        resolvedName = match move run CommandPath.canonical(path) {
+          Option<Bytes>.Some {value} => move value
+          Option<Bytes>.None => { return run Bytes.copy(b"missing") }
+        }
+        match move run Effect.result(Path.fromBytes(Bytes.asSlice(&resolvedName))) {
+          Result<Path, FileError | OutOfMemoryError>.Success {value} => move value
+          Result<Path, FileError | OutOfMemoryError>.Failure {error: invalidPath} => match move invalidPath {
+            FileError invalid => { drop invalid return run Bytes.copy(b"missing") }
+            OutOfMemoryError exhausted => { fail move exhausted }
+          }
+        }
+      }
       OutOfMemoryError exhausted => { fail move exhausted }
     }
   }
   return match move run readOptional(&parsed) {
-    Option<Bytes>.Some {value} => run hexOf(ContentHash.of(Bytes.asSlice(&value)))
-    Option<Bytes>.None => run Bytes.copy(b"missing")
+    Option<Bytes>.Some {value} => {
+      let mut stream = ContentHash.stream()
+      if Bytes.length(&resolvedName) > usize.ZERO {
+        // A symlink retarget is significant even when the new header has identical bytes.
+        ContentHash.append(&mut stream, b"resolved-native-header")
+        ContentHash.appendByte(&mut stream, 0)
+        ContentHash.append(&mut stream, Bytes.asSlice(&resolvedName))
+        ContentHash.appendByte(&mut stream, 0)
+      }
+      ContentHash.append(&mut stream, Bytes.asSlice(&value))
+      return run hexOf(ContentHash.finish(move stream))
+    }
+    Option<Bytes>.None => {
+      cacheable.* = false
+      return run Bytes.copy(b"missing")
+    }
+  }
+}
+
+// Pruning is optional. If an actual native input shares the cache directory, preserve that
+// directory's contents even when an authored file has the shape of a cache artifact. Resolve
+// symbolic links too; inability to establish that an input is outside the cache disables pruning.
+effect fn inputInCache(path: &[u8], cache: &Option<Bytes>) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let prefix = match &cache.* {
+    Option<Bytes>.Some {value} => Bytes.asSlice(&value)
+    Option<Bytes>.None => { return true }
+  }
+  return match move run CommandPath.canonical(path) {
+    Option<Bytes>.Some {value} => {
+      let resolved = Bytes.asSlice(&value)
+      if resolved.length < prefix.length || !same(Slice.view<u8>(resolved, usize.ZERO, prefix.length), prefix) { return false }
+      return resolved.length == prefix.length || resolved[prefix.length] == 47
+    }
+    Option<Bytes>.None => true
   }
 }
 
 // Whether the header record `record` (lines of `<digest> <path>`) still holds: every header it
 // names has the digest it records.
-effect fn headersUnchanged(record: &[u8]) -> bool ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+effect fn headersUnchanged(record: &[u8], cache: &Option<Bytes>, keepCache: &mut bool, cacheable: &mut bool) -> bool ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
   let mut start = usize.ZERO
   while start < record.length {
     let mut end = start
     while end < record.length && record[end] != 10 { end = end + usize.ONE }
     let line = Slice.view<u8>(record, start, end - start)
     if line.length < usize.add(0, 34) || line[usize.add(0, 32)] != 32 { return false }
-    let digest = run digestOf(Slice.view<u8>(line, usize.add(0, 33), line.length - usize.add(0, 33)))
+    let path = Slice.view<u8>(line, usize.add(0, 33), line.length - usize.add(0, 33))
+    if !keepCache.* { keepCache.* = run inputInCache(path, cache) }
+    let digest = run digestOf(path, &mut cacheable.*)
     if !same(Bytes.asSlice(&digest), Slice.view<u8>(line, usize.ZERO, usize.add(0, 32))) { return false }
     start = end + usize.ONE
   }
@@ -299,12 +356,12 @@ pub effect fn dependencies(rule: &[u8]) -> List<Bytes> ! OutOfMemoryError ? &mut
 // Compiles `source` (whose contents are `contents`) into `object` unless the cache holds it with
 // unchanged headers, and answers Clang's status: 0 when the object is ready.
 effect fn compileOne(clang: &Path, base: &[Bytes], language: SourceLanguage, include: &[Path], flags: &[Bytes], source: &Path,
-  object: &Path, record: &Path, diagnostics: &mut Bytes, headerDigests: &mut Stream) -> i32
+  object: &Path, record: &Path, diagnostics: &mut Bytes, headerDigests: &mut Stream, cacheFiles: &mut MachineFileSystem, cache: &Option<Bytes>, keepCache: &mut bool, cacheable: &mut bool) -> i32
 ! FileError | ProcessError | HostInputError | OutOfMemoryError ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
-  if let Option<Bytes>.Some {value: recorded} = move run readOptional(record) {
-    let present = run FileSystem.exists(object)
+  if let Option<Bytes>.Some {value: recorded} = move run readOptional(record) |> Effect.provideMut<FileSystem>(&mut cacheFiles.*) {
+    let present = run FileSystem.exists(object) |> Effect.provideMut<FileSystem>(&mut cacheFiles.*)
     if present {
-      let unchanged = run headersUnchanged(Bytes.asSlice(&recorded))
+      let unchanged = run headersUnchanged(Bytes.asSlice(&recorded), cache, &mut keepCache.*, &mut cacheable.*)
       if unchanged {
         ContentHash.append(&mut headerDigests.*, Bytes.asSlice(&recorded))
         return 0
@@ -356,19 +413,20 @@ effect fn compileOne(clang: &Path, base: &[Bytes], language: SourceLanguage, inc
   // The headers' digests, read before the object is published so a header edited meanwhile
   // compiles again next time.
   let mut headers = Bytes.make()
-  if let Option<Bytes>.Some {value: written} = move run readOptional(&rule) {
+  if let Option<Bytes>.Some {value: written} = move run readOptional(&rule) |> Effect.provideMut<FileSystem>(&mut cacheFiles.*) {
     let listed = run dependencies(Bytes.asSlice(&written))
     let names = List<Bytes>.asSlice(&listed)
     let mut name = usize.ZERO
     while name < names.length {
-      let digest = run digestOf(Bytes.asSlice(&names[name]))
+      if !keepCache.* { keepCache.* = run inputInCache(Bytes.asSlice(&names[name]), cache) }
+      let digest = run digestOf(Bytes.asSlice(&names[name]), &mut cacheable.*)
       run Bytes.append(&mut headers, Bytes.asSlice(&digest))
       run Bytes.append(&mut headers, b" ")
       run Bytes.append(&mut headers, Bytes.asSlice(&names[name]))
       run Bytes.append(&mut headers, b"\n")
       name = name + usize.ONE
     }
-    let removed = run Effect.result(FileSystem.removeFile(&rule))
+    let removed = run Effect.result(FileSystem.removeFile(&rule) |> Effect.provideMut<FileSystem>(&mut cacheFiles.*))
     drop removed
   } else {
     run Bytes.append(&mut diagnostics.*, b"silk: Clang wrote no dependency file for ")
@@ -382,7 +440,7 @@ effect fn compileOne(clang: &Path, base: &[Bytes], language: SourceLanguage, inc
     run Bytes.append(&mut diagnostics.*, b"\n")
     return 1
   }
-  run FileSystem.writeFile(record, Bytes.asSlice(&headers))
+  run FileSystem.writeFile(record, Bytes.asSlice(&headers)) |> Effect.provideMut<FileSystem>(&mut cacheFiles.*)
   ContentHash.append(&mut headerDigests.*, Bytes.asSlice(&headers))
   return 0
 }
@@ -396,7 +454,13 @@ effect fn compileOne(clang: &Path, base: &[Bytes], language: SourceLanguage, inc
 pub effect fn compile(inputs: &[NativeLinkInput], cache: &Path, clang: &Path, identity: &[u8], base: &[Bytes]) -> NativeBuild
 ! FileError | ProcessError | HostInputError | InvalidNativeLinkInput | OutOfMemoryError
 ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
-  run FileSystem.createDirectoriesRecursively(cache)
+  // Cache metadata is not an authored input. Keep these operations outside a caller's input
+  // recorder, while source expansion and every source/header digest use its filesystem.
+  let mut cacheFiles = run MachineFileSystem.make()
+  run FileSystem.createDirectoriesRecursively(cache) |> Effect.provideMut<FileSystem>(&mut cacheFiles)
+  let canonicalCache = run CommandPath.canonical(Path.rawBytes(cache))
+  let mut keepCache = false
+  let mut cacheable = true
   let mut shared = run Bytes.copy(b"silk-native-1\n")
   run Bytes.append(&mut shared, Path.rawBytes(clang))
   run Bytes.append(&mut shared, b"\n")
@@ -443,6 +507,7 @@ pub effect fn compile(inputs: &[NativeLinkInput], cache: &Path, clang: &Path, id
         let sources = List<Path>.asSlice(&expanded)
         let mut source = usize.ZERO
         while source < sources.length {
+          if !keepCache { keepCache = run inputInCache(Path.rawBytes(&sources[source]), &canonicalCache) }
           let contents = match move run readOptional(&sources[source]) {
             Option<Bytes>.Some {value} => move value
             Option<Bytes>.None => {
@@ -465,23 +530,44 @@ pub effect fn compile(inputs: &[NativeLinkInput], cache: &Path, clang: &Path, id
           run Bytes.append(&mut recordName, b".headers")
           let record = run Path.joinBytes(cache, Bytes.asSlice(&recordName))
           let status = run compileOne(clang, base, language, List<Path>.asSlice(&include), written, &sources[source], &object, &record,
-            &mut diagnostics, &mut headerDigests)
+            &mut diagnostics, &mut headerDigests, &mut cacheFiles, &canonicalCache, &mut keepCache, &mut cacheable)
           if status != 0 { return NativeBuild.Failed {diagnostics: move diagnostics} }
           run List<Bytes>.append(&mut kept, move name)
           run List<NativeLinkInput>.append(&mut linked, NativeLinkInputs.object(move object))
           source = source + usize.ONE
         }
       }
-      _ => { run List<NativeLinkInput>.append(&mut linked, run NativeLinkInputs.copy(&inputs[at])) }
+      _ => {
+        if !keepCache { keepCache = NativeLinkInputs.below(&inputs[at], Path.rawBytes(cache)) }
+        if !keepCache {
+          if let Option<&Path>.Some {value: path} = move NativeLinkInputs.file(&inputs[at]) {
+            keepCache = run inputInCache(Path.rawBytes(path), &canonicalCache)
+          }
+        }
+        run List<NativeLinkInput>.append(&mut linked, run NativeLinkInputs.copy(&inputs[at]))
+      }
     }
     at = at + usize.ONE
   }
-  run prune(cache, List<Bytes>.asSlice(&kept))
-  return NativeBuild.Linked {inputs: move linked, diagnostics: move diagnostics, headers: ContentHash.finish(move headerDigests)}
+  if !keepCache { run prune(cache, List<Bytes>.asSlice(&kept)) |> Effect.provideMut<FileSystem>(&mut cacheFiles) }
+  return NativeBuild.Linked {inputs: move linked, diagnostics: move diagnostics, headers: ContentHash.finish(move headerDigests), cacheable: cacheable}
 }
 
-// Removes the files of `cache` whose names start with no digest in `kept`: objects and records an
-// earlier build made for sources that have since changed.
+// Whether a name has the exact digest-and-suffix form of this cache's own files. Authored
+// sources and headers may share the directory and must never be pruned as cache artifacts.
+fn cacheArtifact(name: &[u8]) -> bool {
+  if name.length < 34 { return false }
+  let mut at = usize.ZERO
+  while at < 32 {
+    let byte = name[at]
+    if !(byte >= 48 && byte <= 57) && !(byte >= 97 && byte <= 102) { return false }
+    at = at + usize.ONE
+  }
+  let suffix = Slice.view<u8>(name, 32, name.length - 32)
+  return same(suffix, b".o") || same(suffix, b".headers") || same(suffix, b".o.partial") || same(suffix, b".o.d")
+}
+
+// Removes only this cache's objects and records whose digest is no longer in `kept`.
 effect fn prune(cache: &Path, kept: &[Bytes]) -> () ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
   let listed = match move run Effect.result(FileSystem.listDirectory(cache)) {
     Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Success {value} => move value
@@ -494,8 +580,8 @@ effect fn prune(cache: &Path, kept: &[Bytes]) -> () ! OutOfMemoryError ? &mut Fi
   let mut at = usize.ZERO
   while at < entries.length {
     let name = lastSegment(Path.rawBytes(&entries[at].path))
-    let mut used = false
-    if name.length >= usize.add(0, 32) {
+    let mut used = !cacheArtifact(name)
+    if !used {
       let digest = Slice.view<u8>(name, usize.ZERO, usize.add(0, 32))
       let mut keep = usize.ZERO
       while keep < kept.length && !used {

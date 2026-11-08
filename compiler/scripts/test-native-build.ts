@@ -1812,6 +1812,105 @@ const program = Effect.gen(function* () {
   const adoptedCheck = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(directory, 'adopt/app'))
   assert.equal(adoptedCheck.status, 1, adoptedCheck.stderr)
   assert.match(adoptedCheck.stderr, /app\/src\/main\.silk:4:\d+: error\[/)
+  // Authored inputs stay authoritative even below the compiler's cache parent. Changing only
+  // a dependency's exports must invalidate its artifact while all source bytes stay fixed.
+  const cacheInputs = join(directory, 'cache-inputs')
+  const cachedVendor = join(cacheInputs, 'build/cache/vendor')
+  yield* fs.makeDirectory(join(cacheInputs, 'src'), { recursive: true })
+  yield* fs.makeDirectory(cachedVendor, { recursive: true })
+  yield* fs.writeFileString(join(cacheInputs, 'silk.toml'),
+    '[package]\nname="cache-inputs"\nversion="0.0.0"\nsource="src"\n[dependencies]\nvendor={path="build/cache/vendor"}\n')
+  yield* fs.writeFileString(join(cacheInputs, 'src/main.silk'),
+    'import vendor.A\npub fn main() -> i32 { return A.answer() }\n')
+  for (const name of ['A', 'B']) {
+    yield* fs.writeFileString(join(cachedVendor, `${name}.silk`), 'pub fn answer() -> i32 { return 0 }\n')
+  }
+  const vendorManifest = (name: string) =>
+    `[package]\nname="vendor"\nversion="0.0.0"\nkind="library"\nsource="."\nexports=["${name}"]\n`
+  yield* fs.writeFileString(join(cachedVendor, 'silk.toml'), vendorManifest('A'))
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const checked = yield* invoke(silk, ['check', '--json', '--progress', 'never', '--stdlib', standardLibrary], cacheInputs)
+    assert.equal(checked.status, 0, checked.stderr)
+  }
+  yield* fs.writeFileString(join(cachedVendor, 'silk.toml'), vendorManifest('B'))
+  const refusedExport = yield* invoke(silk, ['check', '--json', '--progress', 'never', '--stdlib', standardLibrary], cacheInputs)
+  assert.equal(refusedExport.status, 1, refusedExport.stderr)
+  const exportDiagnostics = yield* Effect.forEach(
+    refusedExport.stderr.split('\n').filter((line) => line.startsWith('{')),
+    Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Struct({ code: Schema.String, start: Schema.Number, end: Schema.Number }))),
+  )
+  assert.deepEqual(exportDiagnostics, [{ code: 'MOD0003', start: 7, end: 15 }])
+  // Whole-artifact reuse authenticates the same manifest, even though the dependency lives
+  // beside disposable semantic caches. The cached build must reject the changed export.
+  yield* fs.writeFileString(join(cachedVendor, 'silk.toml'), vendorManifest('A'))
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const built = yield* invoke(silk, ['build', '--progress', 'never', '--stdlib', standardLibrary], cacheInputs)
+    assert.equal(built.status, 0, built.stderr)
+  }
+  yield* fs.writeFileString(join(cachedVendor, 'silk.toml'), vendorManifest('B'))
+  const refusedBuildExport = yield* invoke(silk, ['build', '--progress', 'never', '--stdlib', standardLibrary], cacheInputs)
+  assert.equal(refusedBuildExport.status, 1, refusedBuildExport.stderr)
+  assert.match(refusedBuildExport.stderr, /error\[MOD0003\]/)
+  // A header remains an authored input even when its filename looks exactly like native
+  // cache metadata. Pruning preserves it, and editing it invalidates whole-artifact reuse.
+  const nativeCacheInputs = join(directory, 'native-cache-inputs')
+  const authoredNativeDirectory = `build/llvm/${hostTarget}/debug/native-cache-inputs.native`
+  const authoredNativeCache = join(nativeCacheInputs, authoredNativeDirectory)
+  yield* fs.makeDirectory(join(nativeCacheInputs, 'src'), { recursive: true })
+  yield* fs.makeDirectory(authoredNativeCache, { recursive: true })
+  yield* fs.writeFileString(join(nativeCacheInputs, 'silk.toml'),
+    '[package]\nname="native-cache-inputs"\nversion="0.0.0"\nsource="src"\n[native]\n'
+    + `sources=[{ c="src/input.c", include=["${authoredNativeDirectory}"] }]\n`)
+  yield* fs.writeFileString(join(nativeCacheInputs, 'src/main.silk'),
+    'unsafe extern "C" fn cached_header_value() -> i32\npub fn main() -> i32 { return unsafe cached_header_value() }\n')
+  const authoredHeader = "00000000000000000000000000000000.headers"
+  const authoredNativeSource = `#include "../${authoredNativeDirectory}/${authoredHeader}"\nint cached_header_value(void) { return VALUE; }\n`
+  yield* fs.writeFileString(join(nativeCacheInputs, 'src/input.c'), authoredNativeSource)
+  for (const value of [17, 17, 23, 23]) {
+    const header = `#define VALUE ${value}\n`
+    yield* fs.writeFileString(join(authoredNativeCache, authoredHeader), header)
+    const built = yield* invoke(silk, ['build', '--progress', 'never', '--stdlib', standardLibrary],
+      nativeCacheInputs, { ...process.env, SILK_CLANG: clang })
+    assert.equal(built.status, 0, built.stderr)
+    assert.equal(yield* fs.readFileString(join(nativeCacheInputs, 'src/input.c')), authoredNativeSource,
+      'native compilation preserves authored source')
+    assert.equal(yield* fs.readFileString(join(authoredNativeCache, authoredHeader)), header,
+      'native cache pruning preserves authored headers')
+    const ran = yield* invoke(join(nativeCacheInputs, `build/llvm/${hostTarget}/debug/native-cache-inputs`), [], nativeCacheInputs)
+    assert.equal(ran.status, value, 'header edits must change the rebuilt artifact')
+  }
+  // `..` after a directory symlink means its target's parent, not the lexical parent.
+  // Both a header edit and retargeting the link must invalidate native object/artifact reuse.
+  const linkedHeaders = join(directory, 'native-linked-headers')
+  yield* fs.makeDirectory(join(linkedHeaders, 'src'), { recursive: true })
+  for (const name of ['a', 'b']) {
+    yield* fs.makeDirectory(join(linkedHeaders, `targets/${name}/child`), { recursive: true })
+  }
+  yield* fs.writeFileString(join(linkedHeaders, 'silk.toml'),
+    '[package]\nname="native-linked-headers"\nversion="0.0.0"\nsource="src"\n[native]\nsources=[{ c="src/input.c" }]\n')
+  yield* fs.writeFileString(join(linkedHeaders, 'src/main.silk'),
+    'unsafe extern "C" fn linked_header_value() -> i32\npub fn main() -> i32 { return unsafe linked_header_value() }\n')
+  yield* fs.writeFileString(join(linkedHeaders, 'src/input.c'),
+    '#include "../alias/../value.h"\nint linked_header_value(void) { return VALUE; }\n')
+  yield* fs.writeFileString(join(linkedHeaders, 'value.h'), '#define VALUE 99\n')
+  yield* fs.writeFileString(join(linkedHeaders, 'targets/a/value.h'), '#define VALUE 17\n')
+  yield* fs.writeFileString(join(linkedHeaders, 'targets/b/value.h'), '#define VALUE 31\n')
+  yield* fs.symlink('targets/a/child', join(linkedHeaders, 'alias'))
+  for (const stage of [0, 1, 2, 3]) {
+    if (stage === 1) {
+      yield* fs.writeFileString(join(linkedHeaders, 'targets/a/value.h'), '#define VALUE 23\n')
+    }
+    if (stage === 2) {
+      yield* fs.remove(join(linkedHeaders, 'alias'))
+      yield* fs.symlink('targets/b/child', join(linkedHeaders, 'alias'))
+    }
+    const built = yield* invoke(silk, ['build', '--progress', 'never', '--stdlib', standardLibrary],
+      linkedHeaders, { ...process.env, SILK_CLANG: clang })
+    assert.equal(built.status, 0, built.stderr)
+    const ran = yield* invoke(join(linkedHeaders, `build/llvm/${hostTarget}/debug/native-linked-headers`), [], linkedHeaders)
+    assert.equal(ran.status, stage === 0 ? 17 : stage === 1 ? 23 : 31,
+      'native parent lookup must follow the current symlink target')
+  }
   // A `mut fn` binding is lent to each call it is passed to, so it stays usable afterwards, and one
   // call cannot be lent it twice. Callable diagnostics name the binding and the fix.
   // Match and pattern mistakes are one diagnostic each, naming the fix or the types involved.

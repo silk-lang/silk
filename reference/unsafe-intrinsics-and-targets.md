@@ -1210,9 +1210,15 @@ Each file compiles to an object in `<output>.native`, named by a digest of the C
 version, those flags, the entry's language, include directories and flags, and the file's path and
 contents. Clang reports the package headers the file included (`-MMD`); the object is reused while
 each still has the digest recorded beside it, and system headers are covered by the Clang, target
-and platform supply in the name. The build reads every source and header itself, so a build that
-changes none of them reuses the executable without starting Clang, an edit to one file or header
-compiles only the objects it reaches, and `silk check` compiles nothing.
+and platform supply in the name. The build reads every source and header itself. With normalized
+header dependency paths, an unchanged build reuses the executable without starting Clang; an edit
+to one file or header compiles only the objects it reaches. `silk check` compiles nothing.
+
+If Clang reports a header name that cannot be represented as a normalized path, including a name
+containing `.` or `..`, each build resolves that original name through the host again. This keeps
+parent traversal through symbolic links and later link retargets correct. Such builds revalidate
+native objects and relink on every invocation; unchanged native objects remain reusable. A native
+source or header inside the object cache also disables pruning of that cache for the build.
 
 ```toml
 [native]
