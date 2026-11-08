@@ -1,0 +1,1349 @@
+//! Parse a command line into a struct, and write the help text of a command.
+//!
+//! # When to use
+//! Call [`Cli.read`] from `main` to read the process arguments and print help, the version, or
+//! errors, [`Cli.fromHost`] to handle those yourself, or [`Cli.parse`] to parse a list of
+//! arguments that you already have, such as in a test.
+//!
+//! # Details
+//! The type to parse has `CommandLine`, which describes it. The description and the type are
+//! checked against each other during compilation. The loops over the fields and variants are
+//! expanded during compilation too, so the parser that runs only compares each argument with the
+//! option names and calls the reader of the matching field type. The parser builds the value
+//! after it has read the whole command line, so a subcommand that was not chosen never exists, and
+//! a field that the command line does not give takes its `Opt.default`, its environment variable,
+//! or `ArgValue.initial`.
+//!
+//! Subcommands are the variants of a union, named in kebab case: a field marked with
+//! `Command.subcommand` holds the variant that the command line chose.
+//!
+//! The parser accepts `--name value`, `--name=value`, `-n value`, `-n5`, flags such as `--loud`,
+//! grouped one-letter flags such as `-abc`, positional arguments, and `--`, after which every
+//! argument is positional. `--help` and `-h` give
+//! [`Parsed.Help`], and `--version` gives [`Parsed.Version`] when the command has a version.
+//!
+//! @category Command line
+
+import silk.cli.command { Command, CommandLine, OptionSpec, kebab }
+import silk.cli.value { ArgValue }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.effect { Effect }
+import silk.core.ownership { Copy }
+import silk.core.reflect { Reflect, namedKind, unionKind }
+import silk.core.result { Result }
+import silk.core.static_sequence { StaticSequence }
+import silk.core.static_text { StaticText }
+import silk.text.string { String }
+import silk.io.writer { Writer, WriterError }
+import silk.io.writer_native { StderrWriter, StdoutWriter }
+
+/// Why a command line was not accepted.
+pub union CliError {
+  /// An argument looks like an option, but no option has that name.
+  UnknownOption {
+    /// The argument as given.
+    pub token: String
+  },
+  /// An option that takes a value is the last argument.
+  MissingValue {
+    /// The option, such as `--name`.
+    pub option: string<'static>
+  },
+  /// The value of an option or positional argument is not one of its choices.
+  NotAChoice {
+    /// The option, such as `--format`, or the positional argument, such as `<format>`.
+    pub option: string<'static>,
+    /// The value as given.
+    pub token: String,
+    /// The choices, separated by commas, such as `json, text`.
+    pub choices: string<'static>
+  },
+  /// The value of an option or positional argument is not valid for its field type.
+  InvalidValue {
+    /// The option, such as `--times`, or the positional argument, such as `<files>`.
+    pub option: string<'static>,
+    /// The value as given.
+    pub token: String
+  },
+  /// A flag was given a value with `=`.
+  UnexpectedValue {
+    /// The flag, such as `--loud`.
+    pub option: string<'static>
+  },
+  /// A required option or positional argument is missing.
+  MissingRequired {
+    /// The option, such as `--name`, or the positional argument, such as `<files>`.
+    pub option: string<'static>
+  },
+  /// There are more positional arguments than the command takes.
+  UnexpectedArgument {
+    /// The argument as given.
+    pub token: String
+  },
+  /// A command with subcommands was given none.
+  MissingCommand {
+    /// The command, such as `git remote`.
+    pub command: string<'static>
+  },
+  /// An argument names no subcommand.
+  UnknownCommand {
+    /// The command, such as `git remote`.
+    pub command: string<'static>,
+    /// The argument as given.
+    pub token: String
+  },
+  /// An argument is not valid UTF-8.
+  InvalidText {
+    /// The position of the argument; 0 is the program name.
+    pub index: usize
+  }
+}
+
+/// The result of parsing a command line.
+pub union Parsed<T> {
+  /// The command line was accepted. `value` holds the parsed fields.
+  Run {
+    /// The parsed struct.
+    pub value: T
+  },
+  /// The command line asked for the help text.
+  Help {
+    /// The subcommand path whose help was asked for, such as `remote.add`, in the names the
+    /// command line uses. Empty for the root command. Give it to [`Cli.writeHelp`].
+    pub command: string<'static>
+  },
+  /// The command line asked for the version.
+  Version,
+  /// The command line was not accepted.
+  Failed {
+    /// Why.
+    pub error: CliError
+  }
+}
+
+/// One environment variable, for [`Cli.parseWith`].
+pub struct Variable<'a> {
+  /// The variable name, such as `HOME`.
+  pub name: string<'a>,
+  /// The variable value.
+  pub value: string<'a>,
+}
+
+impl<'a> Copy for Variable<'a> {}
+
+/// The owner type of the parser. It has no fields and is never constructed.
+pub struct Cli {}
+
+impl Cli {
+  /// Parses `arguments` into a `T`, as `T`'s `CommandLine` description says. `arguments[0]` is
+  /// the program name and is skipped.
+  ///
+  /// # Details
+  ///
+  /// Each field of `T` is an option unless the description marks it positional or a subcommand.
+  /// A description that names a field `T` does not have, or a field type without `ArgValue`, is a
+  /// compile error.
+  pub effect fn parse<T: CommandLine>(arguments: &[string]) -> Parsed<T>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let environment: [Variable<'static>; 0] = []
+    return run parsedFrom<T>(arguments, &environment)
+  }
+
+  /// Parses like [`Cli.parse`], and reads an option that the command line does not give from
+  /// `environment` when the option names a variable with `Opt.env`. The command line wins over the
+  /// environment, and the environment wins over `Opt.default`.
+  pub effect fn parseWith<T: CommandLine>(
+    arguments: &[string],
+    environment: &[Variable<'_>],
+  ) -> Parsed<T>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run parsedFrom<T>(arguments, environment)
+  }
+
+  /// Reads the process arguments, and the environment variables that `T`'s description names,
+  /// and parses them with [`Cli.parseWith`].
+  ///
+  /// # Errors
+  ///
+  /// - `HostInputError` if the arguments cannot be read.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the copies.
+  pub effect fn fromHost<T: CommandLine>() -> Parsed<T>
+    ! HostInputError | OutOfMemoryError
+    ? &mut HostInput | &mut Allocator {
+    let raw = run HostInput.arguments()
+    let mut texts = List<string>.make()
+    let mut index: usize = 0
+    while index < List<Bytes>.length(&raw) {
+      match HostInput.text(Bytes.asSlice(&List<Bytes>.asSlice(&raw)[index])) {
+        Result.Success { value: text } => {
+          run List<string>.append(&mut texts, text)
+        }
+        Result.Failure { error: _ } => {
+          return Parsed<T>.Failed { error: CliError.InvalidText { index: index } }
+        }
+      }
+      index = index + 1
+    }
+    let mut names = List<string>.make()
+    let static command = commandOf<T>()
+    run environmentNames<T>(command, &mut names)
+    let mut found = List<Bytes>.make()
+    let mut known = List<string>.make()
+    let mut at: usize = 0
+    while at < List<string>.length(&names) {
+      let name = List<string>.asSlice(&names)[at]
+      match run HostInput.variableNamed(name) {
+        Option.Some { value: bytes } => {
+          run List<string>.append(&mut known, name)
+          run List<Bytes>.append(&mut found, move bytes)
+        }
+        Option.None => {}
+      }
+      at = at + 1
+    }
+    let mut environment = List<Variable>.make()
+    at = 0
+    while at < List<Bytes>.length(&found) {
+      match HostInput.text(Bytes.asSlice(&List<Bytes>.asSlice(&found)[at])) {
+        Result.Success { value: text } => {
+          let variable = Variable { name: List<string>.asSlice(&known)[at], value: text }
+          run List<Variable>.append(&mut environment, variable)
+        }
+        Result.Failure { error: _ } => {}
+      }
+      at = at + 1
+    }
+    return run Cli.parseWith<T>(List<string>.asSlice(&texts), List<Variable>.asSlice(&environment))
+  }
+
+  /// Reads the command line like [`Cli.fromHost`], and handles everything but a value: it writes
+  /// the help text or the version to standard output, or the error to standard error. Returns the
+  /// value, or in `Result.Failure` the exit code for `main` to return: 0 after help or the
+  /// version, 2 after an error.
+  ///
+  /// # Errors
+  ///
+  /// - `HostInputError` if the arguments cannot be read.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the copies.
+  /// - `WriterError` if standard output or standard error fails.
+  pub effect fn read<T: CommandLine>() -> Result<T, i32>
+    ! HostInputError | OutOfMemoryError | WriterError
+    ? &mut HostInput | &mut Allocator {
+    let parsed = run Cli.fromHost<T>()
+    let mut out = StdoutWriter.make()
+    let mut err = StderrWriter.make()
+    match move parsed {
+      Parsed.Run { value } => {
+        return Result<T, i32>.Success { value: move value }
+      }
+      Parsed.Help { command } => {
+        run Cli.writeHelp<T>(command) |> Effect.provideMut<Writer>(&mut out)
+        return Result<T, i32>.Failure { error: 0 }
+      }
+      Parsed.Version => {
+        run Cli.writeVersion<T>() |> Effect.provideMut<Writer>(&mut out)
+        return Result<T, i32>.Failure { error: 0 }
+      }
+      Parsed.Failed { error } => {
+        run Cli.writeError(&error) |> Effect.provideMut<Writer>(&mut err)
+        return Result<T, i32>.Failure { error: 2 }
+      }
+    }
+  }
+
+  /// Writes the help text of the command or subcommand at `path` (from [`Parsed.Help`]; empty
+  /// for the root command) of `T`.
+  ///
+  /// # Errors
+  ///
+  /// - `WriterError` if the `Writer` fails.
+  pub effect fn writeHelp<T: CommandLine>(path: string) -> ()
+    ! WriterError
+    ? &mut Writer {
+    let static command = commandOf<T>()
+    static if isUnion<T>() {
+      return run writeChoiceHelp<T>(command, "", command.name, command.description, path)
+    } else {
+      return run writeLevelHelp<T>(
+        command,
+        Reflect.fields<T>(),
+        "",
+        command.name,
+        command.description,
+        command.version,
+        path,
+      )
+    }
+  }
+
+  /// Writes the version of `T`'s command and a line break.
+  ///
+  /// # Errors
+  ///
+  /// - `WriterError` if the `Writer` fails.
+  pub effect fn writeVersion<T: CommandLine>() -> ()
+    ! WriterError
+    ? &mut Writer {
+    let static command = commandOf<T>()
+    run Writer.writeString(command.name)
+    run Writer.writeString(" ")
+    run Writer.writeString(command.version)
+    run Writer.writeString("\n")
+  }
+
+  /// Writes a one-line message for `error`, such as `error: unknown option --nmae`.
+  ///
+  /// # Errors
+  ///
+  /// - `WriterError` if the `Writer` fails.
+  pub effect fn writeError(error: &CliError) -> ()
+    ! WriterError
+    ? &mut Writer {
+    run Writer.writeString("error: ")
+    match &error.* {
+      CliError.UnknownOption { token } => {
+        run Writer.writeString("unknown option ")
+        run Writer.writeString(String.view(&token))
+      }
+      CliError.MissingValue { option } => {
+        run Writer.writeString(option)
+        run Writer.writeString(" needs a value")
+      }
+      CliError.NotAChoice { option, token, choices } => {
+        run Writer.writeString("invalid value '")
+        run Writer.writeString(String.view(&token))
+        run Writer.writeString("' for ")
+        run Writer.writeString(option)
+        run Writer.writeString(" (choose from ")
+        run Writer.writeString(choices)
+        run Writer.writeString(")")
+      }
+      CliError.InvalidValue { option, token } => {
+        run Writer.writeString("invalid value '")
+        run Writer.writeString(String.view(&token))
+        run Writer.writeString("' for ")
+        run Writer.writeString(option)
+      }
+      CliError.UnexpectedValue { option } => {
+        run Writer.writeString(option)
+        run Writer.writeString(" takes no value")
+      }
+      CliError.MissingRequired { option } => {
+        run Writer.writeString("missing ")
+        run Writer.writeString(option)
+      }
+      CliError.UnexpectedArgument { token } => {
+        run Writer.writeString("unexpected argument ")
+        run Writer.writeString(String.view(&token))
+      }
+      CliError.MissingCommand { command } => {
+        run Writer.writeString(command)
+        run Writer.writeString(" needs a command")
+      }
+      CliError.UnknownCommand { command, token } => {
+        run Writer.writeString("unknown command ")
+        run Writer.writeString(String.view(&token))
+        run Writer.writeString(" for ")
+        run Writer.writeString(command)
+      }
+      CliError.InvalidText { index: _ } => {
+        run Writer.writeString("an argument is not valid UTF-8")
+      }
+    }
+    run Writer.writeString("\n")
+  }
+}
+
+// Why reading stopped before a value was built.
+union Stop {
+  Help { command: string<'static> },
+  Version,
+  Error { error: CliError }
+}
+
+// One argument that the command line gave for the field `label` at subcommand depth `depth`: the
+// text of `arguments[at]` from byte `from`. A flag's text is empty. A subcommand's text is the
+// variant name.
+struct Given {
+  depth: usize,
+  label: string<'static>,
+  at: usize,
+  from: usize,
+}
+
+impl Copy for Given {}
+
+static fn commandOf<T: CommandLine>() -> Command<T> {
+  return CommandLine.command()
+}
+
+static fn isUnion<T>() -> bool {
+  return Reflect.typeKind(Reflect.typeOf<T>()) == unionKind
+}
+
+fn givenText<'a>(arguments: &[string<'a>], given: Given) -> string<'a> {
+  let token = arguments[given.at]
+  return String.slice(token, given.from, String.byteLength(token) - given.from)
+}
+
+effect fn parsedFrom<T: CommandLine>(arguments: &[string], environment: &[Variable<'_>]) -> Parsed<
+  T
+>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let result = run Effect.result(readCommand<T>(arguments, environment))
+  match move result {
+    Result.Success { value } => {
+      return Parsed<T>.Run { value: move value }
+    }
+    Result.Failure { error } => {
+      match move error {
+        Stop.Help { command } => {
+          return Parsed<T>.Help { command: command }
+        }
+        Stop.Version => {
+          return Parsed<T>.Version
+        }
+        Stop.Error { error: failure } => {
+          return Parsed<T>.Failed { error: move failure }
+        }
+        OutOfMemoryError {} => {
+          fail OutOfMemoryError {}
+        }
+      }
+    }
+  }
+}
+
+effect fn readCommand<T: CommandLine>(arguments: &[string], environment: &[Variable<'_>]) -> T
+  ! Stop | OutOfMemoryError
+  ? &mut Allocator {
+  let static command = commandOf<T>()
+  let mut given = List<Given>.make()
+  static if isUnion<T>() {
+    run collectChoice<T>(command, "", command.name, 0, "", true, arguments, 1, &mut given)
+    return run choiceValue<T>(command, "", 0, arguments, List<Given>.asSlice(&given), environment)
+  } else {
+    static if Reflect.typeKind(Reflect.typeOf<T>()) != namedKind {
+      compileError("Cli.parse needs a struct with named fields or a union")
+    }
+    run collect<T>(
+      command,
+      Reflect.fields<T>(),
+      "",
+      command.name,
+      0,
+      true,
+      arguments,
+      1,
+      &mut given,
+    )
+    return T {
+      static for field in Reflect.fields<T>() { [field]: run fieldValue(
+        command,
+        field,
+        0,
+        arguments,
+        List<Given>.asSlice(&given),
+        environment,
+      ) },
+    }
+  }
+}
+
+// Reads the command line from `start` for the fields `fields` of `command`, at subcommand depth
+// `depth`. `path` is the subcommand path for help, and `name` the command name for errors.
+effect fn collect<Owner>(
+  static command: Command<Owner>,
+  static fields: Intrinsic.Fields<Owner>,
+  static path: string<'static>,
+  static name: string<'static>,
+  static depth: usize,
+  static root: bool,
+  arguments: &[string],
+  start: usize,
+  given: &mut List<Given>,
+) -> ()
+  ! Stop | OutOfMemoryError
+  ? &mut Allocator {
+  static if !Command.validate(command, fields) {
+    compileError("the command description does not match its type")
+  }
+  let mut positionalOnly = false
+  let mut positional: usize = 0
+  let mut index = start
+  while index < arguments.length {
+    let token = arguments[index]
+    index = index + 1
+    if !positionalOnly && token == "--" {
+      positionalOnly = true
+      continue
+    }
+    if !positionalOnly && (token == "--help" || token == "-h") {
+      fail Stop.Help { command: path }
+    }
+    static if root && command.version != "" {
+      if !positionalOnly && token == "--version" {
+        fail Stop.Version
+      }
+    }
+    if !positionalOnly && String.startsWith(token, "-") && token != "-" {
+      if String.startsWith(token, "--") || String.byteLength(token) == 2 {
+        let mut flag = token
+        let mut from = String.byteLength(token)
+        let mut hasInline = false
+        if String.startsWith(token, "--") {
+          match String.find(token, "=") {
+            Option.Some { value: at } => {
+              flag = String.slice(token, 0, at)
+              hasInline = true
+              from = at + 1
+            }
+            Option.None => {}
+          }
+        }
+        let applied = run applyOption<Owner>(
+          command,
+          fields,
+          depth,
+          flag,
+          false,
+          index - 1,
+          from,
+          hasInline,
+          arguments,
+          &mut index,
+          &mut given,
+        )
+        if !applied {
+          fail Stop.Error { error: CliError.UnknownOption { token: run String.copy(token) } }
+        }
+        continue
+      }
+
+      // A group of one-letter options, such as `-abc`. An option that takes a value takes the rest
+      // of the group, such as `-n5`, or else the next argument.
+      let length = String.byteLength(token)
+      let at = index - 1
+      let mut letter: usize = 1
+      while letter < length {
+        if String.utf8Bytes(token)[letter] >= 128 {
+          fail Stop.Error { error: CliError.UnknownOption { token: run String.copy(token) } }
+        }
+        let before = List<Given>.length(&given)
+        let applied = run applyOption<Owner>(
+          command,
+          fields,
+          depth,
+          String.slice(token, letter, 1),
+          true,
+          at,
+          letter + 1,
+          letter + 1 < length,
+          arguments,
+          &mut index,
+          &mut given,
+        )
+        if !applied {
+          fail Stop.Error { error: CliError.UnknownOption { token: run String.copy(token) } }
+        }
+
+        // A flag's entry is the empty text at the end of the group; an option that took a value
+        // ends the group.
+        let added = List<Given>.asSlice(&given)[before]
+        if added.at == at && added.from == length {
+          letter = letter + 1
+        } else {
+          letter = length
+        }
+      }
+      continue
+    }
+    static if Command.count(command, fields, true) != 0 {
+      static for field in fields {
+        let static option = Command.field(command, field)
+        static if option.subcommand {
+          return run collectSubcommand(field, path, name, depth, arguments, index - 1, &mut given)
+        }
+      }
+    }
+    let mut taken = false
+    static for field in fields {
+      let static option = Command.field(command, field)
+      static if option.positional {
+        let static at = Command.position(command, fields, option.field)
+        if !taken && (positional == at || (repeats(field) && positional > at)) {
+          taken = true
+          static if StaticSequence.length<string<'static>>(option.choices) != 0 {
+            if !isChoice(option, token) {
+              let static placeholder = OptionSpec.placeholder(option)
+              fail Stop.Error {
+                error: CliError.NotAChoice {
+                  option: placeholder,
+                  token: run String.copy(token),
+                  choices: choiceList(option),
+                },
+              }
+            }
+          }
+          run List<Given>.append(
+            &mut given,
+            Given { depth: depth, label: option.field, at: index - 1, from: 0 },
+          )
+        }
+      }
+    }
+    if !taken {
+      fail Stop.Error { error: CliError.UnexpectedArgument { token: run String.copy(token) } }
+    }
+    positional = positional + 1
+  }
+  static if Command.count(command, fields, true) != 0 {
+    fail Stop.Error { error: CliError.MissingCommand { command: name } }
+  }
+}
+
+effect fn collectSubcommand<Owner, Sub: CommandLine>(
+  static field: Intrinsic.Field<Owner, Sub>,
+  static path: string<'static>,
+  static name: string<'static>,
+  static depth: usize,
+  arguments: &[string],
+  at: usize,
+  given: &mut List<Given>,
+) -> ()
+  ! Stop | OutOfMemoryError
+  ? &mut Allocator {
+  static if !isUnion<Sub>() {
+    compileError("a subcommand field holds a union whose variants are the subcommands")
+  }
+  return run collectChoice<Sub>(
+    commandOf<Sub>(),
+    path,
+    name,
+    depth,
+    Reflect.fieldLabel(field),
+    false,
+    arguments,
+    at,
+    &mut given,
+  )
+}
+
+// Reads the subcommand at `arguments[at]`, one of the variants of `U`, and the rest of the command
+// line for its fields.
+effect fn collectChoice<U>(
+  static command: Command<U>,
+  static path: string<'static>,
+  static name: string<'static>,
+  static depth: usize,
+  static label: string<'static>,
+  static root: bool,
+  arguments: &[string],
+  at: usize,
+  given: &mut List<Given>,
+) -> ()
+  ! Stop | OutOfMemoryError
+  ? &mut Allocator {
+  if at >= arguments.length {
+    fail Stop.Error { error: CliError.MissingCommand { command: name } }
+  }
+  let token = arguments[at]
+  if token == "--help" || token == "-h" {
+    fail Stop.Help { command: path }
+  }
+  static if root && command.version != "" {
+    if token == "--version" {
+      fail Stop.Version
+    }
+  }
+  static for variant in Reflect.variants<U>() {
+    let static word = kebab(Reflect.variantLabel(variant))
+    if token == word {
+      run List<Given>.append(&mut given, Given { depth: depth, label: label, at: at, from: 0 })
+      return run collect<U>(
+        command,
+        Reflect.variantFields(variant),
+        joinPath(path, word),
+        joinName(name, word),
+        depth + 1,
+        false,
+        arguments,
+        at + 1,
+        &mut given,
+      )
+    }
+  }
+  fail Stop.Error {
+    error: CliError.UnknownCommand { command: name, token: run String.copy(token) },
+  }
+}
+
+// Records the option `flag` among `fields`: a long name or an alias with its dash, or with
+// `letter`, an alias letter alone. With `hasAttached`, the value is `arguments[at]` from byte
+// `from`: the text after `=` or after the letter. Returns `false` when no option has that name.
+effect fn applyOption<Owner>(
+  static command: Command<Owner>,
+  static fields: Intrinsic.Fields<Owner>,
+  static depth: usize,
+  flag: string,
+  letter: bool,
+  at: usize,
+  from: usize,
+  hasAttached: bool,
+  arguments: &[string],
+  index: &mut usize,
+  given: &mut List<Given>,
+) -> bool
+  ! Stop | OutOfMemoryError
+  ? &mut Allocator {
+  static for field in fields {
+    let static option = Command.field(command, field)
+    static if !option.positional && !option.subcommand {
+      let static long = OptionSpec.longFlag(option)
+      let static short = OptionSpec.shortFlag(option)
+      let mut hit = false
+      if letter {
+        hit = option.short != "" && flag == option.short
+      } else {
+        hit = flag == long || (short != "" && flag == short)
+      }
+      if hit {
+        let mut entry = Given {
+          depth: depth,
+          label: option.field,
+          at: at,
+          from: String.byteLength(arguments[at]),
+        }
+        if takesValue(field) {
+          if hasAttached {
+            entry.from = from
+            if letter && String.startsWith(givenText(arguments, entry), "=") {
+              entry.from = from + 1
+            }
+          } else {
+            if index.* >= arguments.length {
+              fail Stop.Error { error: CliError.MissingValue { option: long } }
+            }
+            entry.at = index.*
+            entry.from = 0
+            index.* = index.* + 1
+          }
+          static if StaticSequence.length<string<'static>>(option.choices) != 0 {
+            let text = givenText(arguments, entry)
+            if !isChoice(option, text) {
+              fail Stop.Error {
+                error: CliError.NotAChoice {
+                  option: long,
+                  token: run String.copy(text),
+                  choices: choiceList(option),
+                },
+              }
+            }
+          }
+        } else {
+          if hasAttached && !letter {
+            fail Stop.Error { error: CliError.UnexpectedValue { option: long } }
+          }
+        }
+        run List<Given>.append(&mut given, entry)
+        return true
+      }
+    }
+  }
+  return false
+}
+
+effect fn fieldValue<Owner, Value>(
+  static command: Command<Owner>,
+  static field: Intrinsic.Field<Owner, Value>,
+  static depth: usize,
+  arguments: &[string],
+  given: &[Given],
+  environment: &[Variable<'_>],
+) -> Value
+  ! Stop | OutOfMemoryError
+  ? &mut Allocator {
+  let static option = Command.field(command, field)
+  static if option.subcommand {
+    return run subcommandValue(field, depth, arguments, given, environment)
+  } else {
+    return run argumentValue(command, field, depth, arguments, given, environment)
+  }
+}
+
+effect fn subcommandValue<Owner, Sub: CommandLine>(
+  static field: Intrinsic.Field<Owner, Sub>,
+  static depth: usize,
+  arguments: &[string],
+  given: &[Given],
+  environment: &[Variable<'_>],
+) -> Sub
+  ! Stop | OutOfMemoryError
+  ? &mut Allocator {
+  return run choiceValue<Sub>(
+    commandOf<Sub>(),
+    Reflect.fieldLabel(field),
+    depth,
+    arguments,
+    given,
+    environment,
+  )
+}
+
+// Whether the command line chose the subcommand `word` for `label` at `depth`.
+fn chosen(
+  arguments: &[string],
+  given: &[Given],
+  depth: usize,
+  label: string,
+  word: string,
+) -> bool {
+  let mut at: usize = 0
+  while at < given.length {
+    if given[at].depth == depth && given[at].label == label {
+      return givenText(arguments, given[at]) == word
+    }
+    at = at + 1
+  }
+  return false
+}
+
+// Builds the variant of `U` that the command line chose for `label` at `depth`.
+effect fn choiceValue<U>(
+  static command: Command<U>,
+  static label: string<'static>,
+  static depth: usize,
+  arguments: &[string],
+  given: &[Given],
+  environment: &[Variable<'_>],
+) -> U
+  ! Stop | OutOfMemoryError
+  ? &mut Allocator {
+  static for variant in Reflect.variants<U>() {
+    let static word = kebab(Reflect.variantLabel(variant))
+    if chosen(arguments, given, depth, label, word) {
+      return U.[variant] {
+        static for field in Reflect.variantFields(variant) { [field]: run fieldValue(
+          command,
+          field,
+          depth + 1,
+          arguments,
+          given,
+          environment,
+        ) },
+      }
+    }
+  }
+  fail Stop.Error { error: CliError.MissingCommand { command: command.name } }
+}
+
+// Builds the value of an option or positional argument from what the command line gave, then the
+// environment, then the option's default.
+effect fn argumentValue<Owner, Value: ArgValue>(
+  static command: Command<Owner>,
+  static field: Intrinsic.Field<Owner, Value>,
+  static depth: usize,
+  arguments: &[string],
+  given: &[Given],
+  environment: &[Variable<'_>],
+) -> Value
+  ! Stop | OutOfMemoryError
+  ? &mut Allocator {
+  let static option = Command.field(command, field)
+  let static shown = shownName(option)
+  let mut value = run ArgValue.initial()
+  let mut seen = false
+  let mut at: usize = 0
+  while at < given.length {
+    if given[at].depth == depth && given[at].label == option.field {
+      seen = true
+      let text = givenText(arguments, given[at])
+      if !(run ArgValue.accept(&mut value, text)) || !passes<Value>(option, &value) {
+        fail Stop.Error {
+          error: CliError.InvalidValue { option: shown, token: run String.copy(text) },
+        }
+      }
+    }
+    at = at + 1
+  }
+  static if option.env != "" {
+    let mut index: usize = 0
+    while !seen && index < environment.length {
+      if environment[index].name == option.env {
+        let text = environment[index].value
+        if ArgValue.takesValue() {
+          seen = true
+          static if StaticSequence.length<string<'static>>(option.choices) != 0 {
+            if !isChoice(option, text) {
+              fail Stop.Error {
+                error: CliError.NotAChoice {
+                  option: option.env,
+                  token: run String.copy(text),
+                  choices: choiceList(option),
+                },
+              }
+            }
+          }
+          if !(run ArgValue.accept(&mut value, text)) || !passes<Value>(option, &value) {
+            fail Stop.Error {
+              error: CliError.InvalidValue { option: option.env, token: run String.copy(text) },
+            }
+          }
+        } else {
+          if text != "" && text != "0" && text != "false" {
+            seen = true
+            let _flagged = run ArgValue.accept(&mut value, "")
+          }
+        }
+      }
+      index = index + 1
+    }
+  }
+  static if option.fallback != "" {
+    if !seen {
+      seen = true
+      if !(run ArgValue.accept(&mut value, option.fallback)) || !passes<Value>(option, &value) {
+        fail Stop.Error {
+          error: CliError.InvalidValue { option: shown, token: run String.copy(option.fallback) },
+        }
+      }
+    }
+  }
+  static if option.required {
+    if !seen {
+      fail Stop.Error { error: CliError.MissingRequired { option: shown } }
+    }
+  }
+  return move value
+}
+
+// Whether `value` passes the check of `option`; a value of an option with no check always does.
+// The check is an ordinary function, called directly.
+fn passes<Value>(static option: OptionSpec, value: &Value) -> bool {
+  static if hasCheck(option) {
+    let static check = checkOf<Value>(option)
+    return check(value)
+  }
+  return true
+}
+
+static fn hasCheck(option: OptionSpec) -> bool {
+  return match option.check {
+    Option<Intrinsic.FunctionRef>.Some { .. } => true
+    Option<Intrinsic.FunctionRef>.None => false
+  }
+}
+
+static fn checkOf<Value>(option: OptionSpec) -> fn<'static>(&Value) -> bool {
+  return Intrinsic.functionAs<fn<'static>(&Value) -> bool>(referenceOf(option))
+}
+
+// The check of `option`, which `passes` reads only when the option has one.
+static fn referenceOf(option: OptionSpec) -> Intrinsic.FunctionRef {
+  if let Option<Intrinsic.FunctionRef>.Some { value } = option.check {
+    return value
+  }
+  return Intrinsic.functionRef<fn<'static>(&bool) -> bool>(unchecked)
+}
+
+fn unchecked(value: &bool) -> bool {
+  return true
+}
+
+// The name of `option` in messages: `<name>` for a positional argument, `--name` for an option.
+static fn shownName(option: OptionSpec) -> string<'static> {
+  if option.positional {
+    return OptionSpec.placeholder(option)
+  }
+  return OptionSpec.longFlag(option)
+}
+
+fn isChoice(static option: OptionSpec, text: string) -> bool {
+  static for choice in option.choices {
+    if text == choice {
+      return true
+    }
+  }
+  return false
+}
+
+static fn choiceList(option: OptionSpec) -> string<'static> {
+  let mut list = ""
+  static for choice in option.choices {
+    if list != "" {
+      list = StaticText.concat(list, ", ")
+    }
+    list = StaticText.concat(list, choice)
+  }
+  return list
+}
+
+// Appends the environment variables that `command` and its subcommands name.
+effect fn environmentNames<Owner>(static command: Command<Owner>, names: &mut List<string>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  static if isUnion<Owner>() {
+    static for variant in Reflect.variants<Owner>() {
+      run environmentNamesOf<Owner>(command, Reflect.variantFields(variant), &mut names)
+    }
+  } else {
+    run environmentNamesOf<Owner>(command, Reflect.fields<Owner>(), &mut names)
+  }
+}
+
+effect fn environmentNamesOf<Owner>(
+  static command: Command<Owner>,
+  static fields: Intrinsic.Fields<Owner>,
+  names: &mut List<string>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  static for field in fields {
+    let static option = Command.field(command, field)
+    static if option.subcommand {
+      run subcommandNames(field, &mut names)
+    } else {
+      static if option.env != "" {
+        run List<string>.append(&mut names, option.env)
+      }
+    }
+  }
+}
+
+effect fn subcommandNames<Owner, Sub: CommandLine>(
+  static field: Intrinsic.Field<Owner, Sub>,
+  names: &mut List<string>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let static command = commandOf<Sub>()
+  return run environmentNames<Sub>(command, &mut names)
+}
+
+static fn joinPath(path: string<'static>, word: string<'static>) -> string<'static> {
+  if path == "" {
+    return word
+  }
+  return StaticText.concat(StaticText.concat(path, "."), word)
+}
+
+static fn joinName(name: string<'static>, word: string<'static>) -> string<'static> {
+  if name == "" {
+    return word
+  }
+  return StaticText.concat(StaticText.concat(name, " "), word)
+}
+
+// Writes the help of the level at `at`, or of the subcommand below it that `path` names.
+effect fn writeLevelHelp<Owner>(
+  static command: Command<Owner>,
+  static fields: Intrinsic.Fields<Owner>,
+  static at: string<'static>,
+  static name: string<'static>,
+  static description: string<'static>,
+  static version: string<'static>,
+  path: string,
+) -> ()
+  ! WriterError
+  ? &mut Writer {
+  static for field in fields {
+    let static option = Command.field(command, field)
+    static if option.subcommand {
+      if path != at {
+        return run writeSubcommandHelp(field, at, name, path)
+      }
+    }
+  }
+  return run writeCommandHelp<Owner>(command, fields, name, description, version)
+}
+
+effect fn writeSubcommandHelp<Owner, Sub: CommandLine>(
+  static field: Intrinsic.Field<Owner, Sub>,
+  static at: string<'static>,
+  static name: string<'static>,
+  path: string,
+) -> ()
+  ! WriterError
+  ? &mut Writer {
+  let static command = commandOf<Sub>()
+  return run writeChoiceHelp<Sub>(command, at, name, "", path)
+}
+
+// Writes the help of the subcommand that `path` names among the variants of `U`, below `at`. A
+// path that names none writes the help of the command at `at`, whose help text is `description`.
+effect fn writeChoiceHelp<U>(
+  static command: Command<U>,
+  static at: string<'static>,
+  static name: string<'static>,
+  static description: string<'static>,
+  path: string,
+) -> ()
+  ! WriterError
+  ? &mut Writer {
+  static for variant in Reflect.variants<U>() {
+    let static word = kebab(Reflect.variantLabel(variant))
+    let static below = joinPath(at, word)
+    if path == below || String.startsWith(path, StaticText.concat(below, ".")) {
+      return run writeLevelHelp<U>(
+        command,
+        Reflect.variantFields(variant),
+        below,
+        joinName(name, word),
+        Command.describeVariant(command, Reflect.variantLabel(variant)),
+        "",
+        path,
+      )
+    }
+  }
+
+  // Only a root union lands here: the help of the program itself.
+  let static usage = StaticText.concat(StaticText.concat("Usage: ", name), " <command>\n")
+  run Writer.writeString(usage)
+  static if description != "" {
+    run Writer.writeString("\n")
+    run Writer.writeString(description)
+    run Writer.writeString("\n")
+  }
+  run Writer.writeString("\nOptions:\n")
+  run Writer.writeString("  -h, --help")
+  run pad(12, variantColumn<U>(command))
+  run Writer.writeString("Print this help\n")
+  static if command.version != "" && at == "" {
+    run Writer.writeString("      --version")
+    run pad(15, variantColumn<U>(command))
+    run Writer.writeString("Print the version\n")
+  }
+  run writeVariants<U>(command, variantColumn<U>(command))
+}
+
+effect fn writeVariants<U>(static command: Command<U>, static column: usize) -> ()
+  ! WriterError
+  ? &mut Writer {
+  run Writer.writeString("\nCommands:\n")
+  static for variant in Reflect.variants<U>() {
+    let static word = kebab(Reflect.variantLabel(variant))
+    let static about = Command.describeVariant(command, Reflect.variantLabel(variant))
+    run Writer.writeString("  ")
+    run Writer.writeString(word)
+    static if about != "" {
+      run pad(2 + String.byteLength(word), column)
+      run Writer.writeString(about)
+    }
+    run Writer.writeString("\n")
+  }
+}
+
+effect fn writeSubcommandList<Owner, Sub: CommandLine>(
+  static field: Intrinsic.Field<Owner, Sub>,
+  static column: usize,
+) -> ()
+  ! WriterError
+  ? &mut Writer {
+  return run writeVariants<Sub>(commandOf<Sub>(), column)
+}
+
+effect fn writeCommandHelp<Owner>(
+  static command: Command<Owner>,
+  static fields: Intrinsic.Fields<Owner>,
+  static name: string<'static>,
+  static description: string<'static>,
+  static version: string<'static>,
+) -> ()
+  ! WriterError
+  ? &mut Writer {
+  let static usage = usageLine<Owner>(command, fields, name)
+  let static column = optionColumn<Owner>(command, fields)
+  run Writer.writeString(usage)
+  static if description != "" {
+    run Writer.writeString("\n")
+    run Writer.writeString(description)
+    run Writer.writeString("\n")
+  }
+  run Writer.writeString("\nOptions:\n")
+  static for field in fields {
+    let static option = Command.field(command, field)
+    static if !option.positional && !option.subcommand {
+      let static short = OptionSpec.shortFlag(option)
+      let static long = OptionSpec.longFlag(option)
+      let mut width: usize = 6 + String.byteLength(long)
+      static if short != "" {
+        run Writer.writeString("  ")
+        run Writer.writeString(short)
+        run Writer.writeString(", ")
+      } else {
+        run Writer.writeString("      ")
+      }
+      run Writer.writeString(long)
+      if takesValue(field) {
+        run Writer.writeString(" <value>")
+        width = width + 8
+      }
+      static if hasNotes(option) {
+        run pad(width, column)
+      }
+      run Writer.writeString(option.description)
+      static if option.required {
+        run Writer.writeString(" (required)")
+      }
+      run writeNotes(option)
+      run Writer.writeString("\n")
+    }
+  }
+  run Writer.writeString("  -h, --help")
+  run pad(12, column)
+  run Writer.writeString("Print this help\n")
+  static if version != "" {
+    run Writer.writeString("      --version")
+    run pad(15, column)
+    run Writer.writeString("Print the version\n")
+  }
+  static if Command.count(command, fields, false) != 0 {
+    run Writer.writeString("\nArguments:\n")
+    static for field in fields {
+      let static option = Command.field(command, field)
+      static if option.positional {
+        let static placeholder = OptionSpec.placeholder(option)
+        run Writer.writeString("  ")
+        run Writer.writeString(placeholder)
+        static if hasNotes(option) {
+          run pad(2 + String.byteLength(placeholder), column)
+        }
+        run Writer.writeString(option.description)
+        static if option.required {
+          static if option.description == "" {
+            run Writer.writeString("(required)")
+          } else {
+            run Writer.writeString(" (required)")
+          }
+        }
+        run writeNotes(option)
+        run Writer.writeString("\n")
+      }
+    }
+  }
+  static for field in fields {
+    let static option = Command.field(command, field)
+    static if option.subcommand {
+      run writeSubcommandList(field, column)
+    }
+  }
+}
+
+// Whether the help line of `option` has text after its name.
+static fn hasNotes(option: OptionSpec) -> bool {
+  return option.description != "" || option.required
+    || StaticSequence.length<string<'static>>(option.choices) != 0
+    || option.env != ""
+    || option.fallback != ""
+}
+
+// Writes the choices, the environment variable, and the default of `option` after its help text.
+effect fn writeNotes(static option: OptionSpec) -> ()
+  ! WriterError
+  ? &mut Writer {
+  static if StaticSequence.length<string<'static>>(option.choices) != 0 {
+    static if option.description != "" || option.required {
+      run Writer.writeString(" ")
+    }
+    run Writer.writeString("[choices: ")
+    run Writer.writeString(choiceList(option))
+    run Writer.writeString("]")
+  }
+  static if option.env != "" {
+    static if option.description != "" || option.required
+      || StaticSequence.length<string<'static>>(option.choices) != 0 {
+      run Writer.writeString(" ")
+    }
+    run Writer.writeString("[env: ")
+    run Writer.writeString(option.env)
+    run Writer.writeString("]")
+  }
+  static if option.fallback != "" {
+    static if option.description != "" || option.required
+      || StaticSequence.length<string<'static>>(option.choices) != 0
+      || option.env != "" {
+      run Writer.writeString(" ")
+    }
+    run Writer.writeString("[default: ")
+    run Writer.writeString(option.fallback)
+    run Writer.writeString("]")
+  }
+}
+
+fn takesValue<Owner, Value: ArgValue>(static field: Intrinsic.Field<Owner, Value>) -> bool {
+  return ArgValue.takesValue()
+}
+
+fn repeats<Owner, Value: ArgValue>(static field: Intrinsic.Field<Owner, Value>) -> bool {
+  return ArgValue.repeats()
+}
+
+effect fn pad(used: usize, column: usize) -> ()
+  ! WriterError
+  ? &mut Writer {
+  let mut at = used
+  if at + 2 > column {
+    run Writer.writeString("  ")
+    return
+  }
+  while at < column {
+    run Writer.writeString(" ")
+    at = at + 1
+  }
+}
+
+// The column where option descriptions start: the widest `-n, --long <value>` plus two spaces.
+static fn optionColumn<T>(command: Command<T>, fields: Intrinsic.Fields<T>) -> usize {
+  let mut widest: usize = 15
+  static for field in fields {
+    let option = Command.field(command, field)
+    let mut width = 6 + StaticText.byteLength(OptionSpec.longFlag(option)) + 8
+    if option.subcommand {
+      width = 0
+    }
+    if option.positional {
+      width = 2 + StaticText.byteLength(OptionSpec.placeholder(option))
+    }
+    if width > widest {
+      widest = width
+    }
+  }
+  return widest + 2
+}
+
+// The column where the help text of the variants of `U` starts.
+static fn variantColumn<U>(command: Command<U>) -> usize {
+  let mut widest: usize = 15
+  static for variant in Reflect.variants<U>() {
+    let width = 2 + StaticText.byteLength(kebab(Reflect.variantLabel(variant)))
+    if width > widest {
+      widest = width
+    }
+  }
+  return widest + 2
+}
+
+static fn usageLine<T>(
+  command: Command<T>,
+  fields: Intrinsic.Fields<T>,
+  name: string<'static>,
+) -> string<'static> {
+  let mut line = StaticText.concat(StaticText.concat("Usage: ", name), " [options]")
+  static for field in fields {
+    let option = Command.field(command, field)
+    if option.positional {
+      line = StaticText.concat(StaticText.concat(line, " "), OptionSpec.placeholder(option))
+    }
+  }
+  if Command.count(command, fields, true) != 0 {
+    line = StaticText.concat(line, " <command>")
+  }
+  return StaticText.concat(line, "\n")
+}
