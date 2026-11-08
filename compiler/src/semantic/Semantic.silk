@@ -453,6 +453,8 @@ struct FrontierCoverage { stable: Bytes, concrete: List<DeclarationId> }
 struct ArtifactWarmText { unit: usize, used: bool }
 struct FrontierCacheCapture { stable: Bytes, unit: usize, capture: CapturedBuild }
 struct FrontierMirEvidence { exact: ContentHash, unit: usize }
+struct FrontierSweepCache { key: Bytes, unit: usize, sites: List<ModuleId> }
+struct FrontierSweepProof { stable: Bytes, parts: List<Bytes>, answer: Bytes }
 struct DeferredFrontierSubset { full: Bytes, selected: Bytes, concrete: List<DeclarationId> }
 
 fn frontierSend(fd: i32, bytes: &[u8]) -> bool {
@@ -4575,6 +4577,8 @@ pub struct Semantic {
   frontierChunks: Option<[*]mut u64>,
   frontierChecked: List<usize>,
   frontierSweepChunks: List<SweepFragments.Packet>,
+  frontierSweepCache: List<FrontierSweepCache>,
+  frontierSweepProofs: List<FrontierSweepProof>,
   frontierCacheCaptures: List<FrontierCacheCapture>,
   frontierExtensionEvidence: List<FrontierMirEvidence>,
   frontierExtensionReads: List<usize>,
@@ -94251,6 +94255,8 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
     frontierChunks: Option<[*]mut u64>.none(),
     frontierChecked: List<usize>.make(),
     frontierSweepChunks: List<SweepFragments.Packet>.make(),
+    frontierSweepCache: List<FrontierSweepCache>.make(),
+    frontierSweepProofs: List<FrontierSweepProof>.make(),
     frontierCacheCaptures: List<FrontierCacheCapture>.make(),
     frontierExtensionEvidence: List<FrontierMirEvidence>.make(),
     frontierExtensionReads: List<usize>.make(),
@@ -96378,6 +96384,30 @@ impl Semantic {
     unsafe FrontierHost.exit(3)
   }
 
+  effect fn frontierChunkDeclarations(self: &mut Self, request: &mut Request, module: &ModuleId,
+    ordinal: usize, listed: &ModuleChecks, start: usize, end: usize, sweep: &mut Sweep,
+    names: &mut List<Bytes>, declarations: &mut List<Bytes>) -> ()
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+    if start == usize.ZERO {
+      let expected = List<CheckedName>.asSlice(&listed.names)
+      run Semantic.checkNames(&mut self.*, module, expected, &mut sweep.rejections)
+      let mut at = usize.ZERO
+      while at < expected.length {
+        run List<Bytes>.append(&mut names.*, run Bytes.copy(Bytes.asSlice(&expected[at].name)))
+        at = at + usize.ONE
+      }
+    }
+    let written = List<DeclarationCheck>.asSlice(&listed.declarations)
+    let mut at = start
+    while at < end {
+      run Semantic.sweptDeclaration(&mut self.*, &mut request.*, module, ordinal, &written[at], &mut sweep.*)
+      let mut identity = Bytes.make()
+      run StableKey.declaration(&mut identity, &written[at].identity)
+      run List<Bytes>.append(&mut declarations.*, move identity)
+      at = at + usize.ONE
+    }
+  }
+
   effect fn frontierSweepChunk(self: &mut Self, request: &mut Request, modules: &[usize], task: FrontierChunkTask) -> ()
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
     let started = run frontierNow()
@@ -96408,26 +96438,27 @@ impl Semantic {
     self.uncheckedRoot = List<UncheckedBody>.make()
     let mut sweep = Sweep.make()
     let mut names = List<Bytes>.make()
-    if start == usize.ZERO {
-      let expected = List<CheckedName>.asSlice(&listed.names)
-      run Semantic.checkNames(&mut self.*, &module, expected, &mut sweep.rejections)
-      let mut at = usize.ZERO
-      while at < expected.length {
-        run List<Bytes>.append(&mut names, run Bytes.copy(Bytes.asSlice(&expected[at].name)))
-        at = at + usize.ONE
-      }
-    }
     let mut declarations = List<Bytes>.make()
-    let mut at = start
-    while at < end {
-      run Semantic.sweptDeclaration(&mut self.*, &mut request.*, &module, ordinal, &written[at], &mut sweep)
-      let mut identity = Bytes.make()
-      run StableKey.declaration(&mut identity, &written[at].identity)
-      run List<Bytes>.append(&mut declarations, move identity)
-      at = at + usize.ONE
+    let recording = retainedCacheExperiment() && Graph.recording(&self.resolver.graph)
+    let recorder = self.resolver.rootRecorder
+    let mut chunkUnit = usize.MAX
+    if recording {
+      let word = run internKey(&mut self.resolver, Key {family: Family.ModuleCheck, module: ordinal,
+        name: usize.MAX - 5, declaration: usize.MAX, member: task.index, external: false})
+      chunkUnit = u64.toUsize(word.value)
+      run Graph.startRun(&mut self.resolver.graph, chunkUnit)
+      // The cached roster is read from this exact immutable module. Ordinary moduleChecks
+      // records the same whole-file dependency through source(), including roster/name changes.
+      run Graph.record(&mut self.resolver.graph, chunkUnit, Dependee.SourceFile {module: ordinal})
+      self.resolver.rootRecorder = chunkUnit
     }
+    let attempted = run Effect.result(Semantic.frontierChunkDeclarations(&mut self.*, &mut request.*, &module,
+      ordinal, listed, start, end, &mut sweep, &mut names, &mut declarations))
+    self.resolver.rootRecorder = recorder
+    if recording { drop run Graph.finishRun(&mut self.resolver.graph, chunkUnit, Option<ContentHash>.none()) }
+    if let Result<(), Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} = move attempted { fail move error }
     let diagnoses = List<Shared<Rejection>>.asSlice(&sweep.rejections)
-    at = usize.ZERO
+    let mut at = usize.ZERO
     while at < diagnoses.length {
       let warning = Shared<Rejection>.with<bool>(&diagnoses[at], fn(value: &Rejection) -> bool { return rejectionWarns(value.code) })
       if !warning { Semantic.abortFrontierWorker(&self.*, true) return () }
@@ -96465,10 +96496,15 @@ impl Semantic {
       Option<Bytes>.None => { Semantic.abortFrontierWorker(&self.*, true) return () }
     }
     let cacheKey = if Graph.recording(&self.resolver.graph) { run Bytes.copy(Bytes.asSlice(&escapeKey)) } else { Bytes.make() }
-    run List<SweepFragments.Packet>.append(&mut self.frontierSweepChunks, SweepFragments.Packet {
+    let packet = SweepFragments.Packet {
       sweep: move sweepKey, escape: move escapeKey, total: written.length, start: start,
       declarations: move declarations, namesChecked: start == usize.ZERO, names: move names,
-      answer: move answer, record: run BuildRecord.encode(&capture.record)})
+      answer: move answer, record: run BuildRecord.encode(&capture.record)}
+    if recording {
+      run List<FrontierSweepCache>.append(&mut self.frontierSweepCache, FrontierSweepCache {
+        key: run frontierSweepPartKey(&packet), unit: chunkUnit, sites: move sites})
+    }
+    run List<SweepFragments.Packet>.append(&mut self.frontierSweepChunks, move packet)
     if Graph.recording(&self.resolver.graph) {
       let reads = if memo.reads == usize.MAX { unit } else { memo.reads }
       run Semantic.keepFrontierCacheCapture(&mut self.*, ordinal, reads, move cacheKey, move capture)
@@ -96785,6 +96821,20 @@ impl Semantic {
         run appendDeferred(&mut deferred, templates)
         at = at + usize.ONE
       }
+      if retainedCacheExperiment() {
+        let mut parts = List<Bytes>.make()
+        at = usize.ZERO
+        while at < order.length {
+          run List<Bytes>.append(&mut parts, run frontierSweepPartKey(&packets[order[at]]))
+          at = at + usize.ONE
+        }
+        let mut sites = List<ModuleId>.make()
+        if let Option<Bytes>.Some {value: answer} = move run reportingAnswer(0, List<DeclarationId>.asSlice(&sweep.concrete),
+          List<Shared<Rejection>>.asSlice(&sweep.rejections), List<DeferredStaticTemplate>.asSlice(&deferred), &mut sites) {
+          run List<FrontierSweepProof>.append(&mut self.frontierSweepProofs, FrontierSweepProof {
+            stable: run Bytes.copy(stable), parts: move parts, answer: move answer})
+        }
+      }
       run List<FrontierCoverage>.append(&mut coverage.*, FrontierCoverage {stable: run Bytes.copy(Bytes.asSlice(&packet.escape)),
         concrete: run copyDeclarations(List<DeclarationId>.asSlice(&sweep.concrete))})
       run List<ModuleCheckMemo>.append(&mut completed.*, ModuleCheckMemo {unit: unit, sweep: move sweep,
@@ -97003,6 +97053,8 @@ impl Semantic {
     self.frontierSweepUnits = List<usize>.make()
     self.artifactCacheRoots = List<usize>.make()
     self.frontierSweepChunks = List<SweepFragments.Packet>.make()
+    self.frontierSweepCache = List<FrontierSweepCache>.make()
+    self.frontierSweepProofs = List<FrontierSweepProof>.make()
     self.frontierCacheCaptures = List<FrontierCacheCapture>.make()
     self.deferredFrontierGraph = Option<BuildRecord.Record>.none()
     self.deferredFrontierSubsets = List<DeferredFrontierSubset>.make()
@@ -111276,6 +111328,50 @@ effect fn frontierNonMirReadsAt(resolver: &mut Resolver, module: usize, unit: us
   return saved
 }
 
+// Binds a recorded partial sweep to the exact roster range, names and answer that the parent
+// validated. Escape records are separate: they do not justify declaration-body or name checks.
+effect fn frontierSweepPartKey(packet: &SweepFragments.Packet) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut key = run Bytes.copy(b"frontier-sweep-dependencies-v1")
+  run RuntimeEncoding.field(&mut key, Bytes.asSlice(&packet.sweep))
+  run RuntimeEncoding.word(&mut key, usize.toU64(packet.total))
+  run RuntimeEncoding.word(&mut key, usize.toU64(packet.start))
+  let declarations = List<Bytes>.asSlice(&packet.declarations)
+  run RuntimeEncoding.word(&mut key, usize.toU64(declarations.length))
+  let mut at = usize.ZERO
+  while at < declarations.length {
+    run RuntimeEncoding.field(&mut key, Bytes.asSlice(&declarations[at]))
+    at = at + usize.ONE
+  }
+  run RuntimeEncoding.word(&mut key, if packet.namesChecked { 1 } else { 0 })
+  let names = List<Bytes>.asSlice(&packet.names)
+  run RuntimeEncoding.word(&mut key, usize.toU64(names.length))
+  at = usize.ZERO
+  while at < names.length { run RuntimeEncoding.field(&mut key, Bytes.asSlice(&names[at])) at = at + usize.ONE }
+  run RuntimeEncoding.field(&mut key, Bytes.asSlice(&packet.answer))
+  return move key
+}
+
+effect fn frontierSweepEdges(parts: &[Bytes], keys: &[Bytes], nodes: &[usize]) -> Option<List<usize>>
+! OutOfMemoryError ? &mut Allocator {
+  if parts.length == usize.ZERO || keys.length != nodes.length { return Option<List<usize>>.none() }
+  let mut edges = List<usize>.make()
+  let mut part = usize.ZERO
+  while part < parts.length {
+    let mut found = false
+    let mut at = usize.ZERO
+    while at < keys.length {
+      if same(Bytes.asSlice(&keys[at]), Bytes.asSlice(&parts[part])) {
+        run List<usize>.append(&mut edges, CacheImage.nodeEdge(nodes[at]))
+        found = true
+      }
+      at = at + usize.ONE
+    }
+    if !found { return Option<List<usize>>.none() }
+    part = part + usize.ONE
+  }
+  return Option<List<usize>>.some(move edges)
+}
+
 // Only completed lowered entries have independently reusable MIR query evidence. EXTERNAL,
 // FOREIGN, LEFT and carried-only entries cannot acquire an empty dependency node here.
 effect fn retainFrontierMirEvidence(evidence: &mut List<FrontierMirEvidence>, captured: &CapturedBuild) -> ()
@@ -111421,6 +111517,19 @@ impl Semantic {
         at = at + usize.ONE
       }
     }
+    let sweeps = List<FrontierSweepCache>.asSlice(&self.frontierSweepCache)
+    at = usize.ZERO
+    while at < sweeps.length {
+      let part = &sweeps[at]
+      at = at + usize.ONE
+      let query = run imageUnit(&self.resolver, &mut build.*, part.unit)
+      if query >= unfit() { continue }
+      let node = run sitedNode(&self.resolver, &mut build.*, query, List<ModuleId>.asSlice(&part.sites))
+      if node == usize.MAX { continue }
+      run List<CacheImage.Root>.append(&mut build.image.roots, CacheImage.Root {
+        key: run frontierReadsKey(Bytes.asSlice(&part.key), self.frontierWorker, ordinal), node: node, answer: Bytes.make()})
+      ordinal = ordinal + usize.ONE
+    }
     // carryFrontierReads copied every adopted record/entry needed by a replayed chunk.
   }
 
@@ -111537,6 +111646,23 @@ impl Semantic {
         node: checked, answer: run checkAnswer(1, concrete)})
       persisted = persisted + usize.ONE
     }
+    let sweeps = List<FrontierSweepProof>.asSlice(&self.frontierSweepProofs)
+    let mut sweepCount = usize.ZERO
+    part = usize.ZERO
+    while part < sweeps.length {
+      let sweep = &sweeps[part]
+      part = part + usize.ONE
+      let dependencies = match move run frontierSweepEdges(List<Bytes>.asSlice(&sweep.parts),
+        List<Bytes>.asSlice(&readKeys), List<usize>.asSlice(&readNodes)) {
+        Option<List<usize>>.Some {value} => move value
+        Option<List<usize>>.None => { continue }
+      }
+      let node = run CacheImage.addNode(&mut image.*, List<usize>.asSlice(&dependencies))
+      run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: run Bytes.copy(Bytes.asSlice(&sweep.stable)),
+        node: node, answer: run Bytes.copy(Bytes.asSlice(&sweep.answer))})
+      sweepCount = sweepCount + usize.ONE
+    }
+    run frontierTrace(b"module sweep cache assembled", self.frontierSplit, sweepCount, sweeps.length)
     // The record/check roots added above are complete. Drop only the opaque IPC reads roots;
     // their dependency nodes remain reachable from the complete published records.
     let finalRoots = List<CacheImage.Root>.asSlice(&image.roots)
@@ -111702,4 +111828,45 @@ effect fn frontierExtensionEvidenceClaims() -> () ! OutOfMemoryError | Assertion
 test effect fn frontierExtensionsRetainOnlyRecordedMirEvidence() -> () ! OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run frontierExtensionEvidenceClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn frontierSweepEvidenceClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut packet = SweepFragments.Packet {sweep: run Bytes.copy(b"profile/module/sweep"), escape: Bytes.make(),
+    total: 2, start: 0, declarations: List<Bytes>.make(), namesChecked: true, names: List<Bytes>.make(),
+    answer: run Bytes.copy(b"clean"), record: Bytes.make()}
+  run List<Bytes>.append(&mut packet.declarations, run Bytes.copy(b"declaration-a"))
+  run List<Bytes>.append(&mut packet.names, run Bytes.copy(b"name-a"))
+  let first = run frontierSweepPartKey(&packet)
+  packet.start = 1
+  packet.namesChecked = false
+  packet.names = List<Bytes>.make()
+  packet.declarations = List<Bytes>.make()
+  run List<Bytes>.append(&mut packet.declarations, run Bytes.copy(b"declaration-b"))
+  let second = run frontierSweepPartKey(&packet)
+  let mut wanted = List<Bytes>.make()
+  run List<Bytes>.append(&mut wanted, run Bytes.copy(Bytes.asSlice(&first)))
+  run List<Bytes>.append(&mut wanted, run Bytes.copy(Bytes.asSlice(&second)))
+  let mut supplied = List<Bytes>.make()
+  run List<Bytes>.append(&mut supplied, move first)
+  run Testing.expect(match move run frontierSweepEdges(List<Bytes>.asSlice(&wanted), List<Bytes>.asSlice(&supplied), &[3]) {
+    Option<List<usize>>.None => true _ => false }, "a missing declaration chunk never becomes a complete sweep cache")
+  run List<Bytes>.append(&mut supplied, move second)
+  run Testing.expect(match move run frontierSweepEdges(List<Bytes>.asSlice(&wanted), List<Bytes>.asSlice(&supplied), &[3, 7]) {
+    Option<List<usize>>.Some {value} => sameSlots(List<usize>.asSlice(&value), &[CacheImage.nodeEdge(3), CacheImage.nodeEdge(7)])
+    _ => false }, "complete chunk evidence retains every dependency node")
+  packet.answer = run Bytes.copy(b"warning")
+  let altered = run frontierSweepPartKey(&packet)
+  run Testing.expect(!same(Bytes.asSlice(&altered), Bytes.asSlice(&List<Bytes>.asSlice(&wanted)[1])),
+    "identical declaration coverage with a different diagnostic answer cannot borrow clean evidence")
+  packet.answer = run Bytes.copy(b"clean")
+  packet.namesChecked = true
+  run List<Bytes>.append(&mut packet.names, run Bytes.copy(b"changed-name"))
+  let renamed = run frontierSweepPartKey(&packet)
+  run Testing.expect(!same(Bytes.asSlice(&renamed), Bytes.asSlice(&List<Bytes>.asSlice(&wanted)[1])),
+    "name-check evidence is bound to its exact checked names")
+}
+
+test effect fn frontierSweepPersistenceRequiresEveryExactChunk() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run frontierSweepEvidenceClaims() |> Effect.provideMut<Allocator>(&mut allocator)
 }
