@@ -95,6 +95,7 @@ The compression modules cover the formats in Zig's `lib/std/compress` (reference
 | XZ (`.xz`, single LZMA2 filter per block) | — | `silk.compress.xz.Xz.decode` |
 | Zstandard | `silk.compress.zstd_encode.ZstdEncoder` | `silk.compress.zstd.Zstd` |
 | Brotli | `silk.compress.brotli_encode.BrotliEncoder` | `silk.compress.brotli.Brotli` |
+| ZIP archives (stored or DEFLATE members, ZIP64) | — | `silk.compress.zip.ZipReader` |
 
 DEFLATE encoding follows zlib: levels 0 to 9, its strategies and flush modes, preset dictionaries,
 and stored, fixed, or dynamic Huffman blocks, with raw, zlib, or deterministic gzip framing.
