@@ -68,6 +68,16 @@ pub effect fn make(endpoint: Role, limits: Limits) -> Driver
 Creates a protocol connection and a 16 KiB transport read buffer. No I/O occurs until `flush`
 or `next`.
 
+<a id="Driver.impl.finished"></a>
+
+### Method `finished`
+
+```silk
+pub fn finished(self: &Self) -> bool
+```
+
+Returns true after transport EOF, `close`, or a connection error: no new stream can go out.
+
 <a id="Driver.impl.connection"></a>
 
 ### Method `connection`
@@ -115,7 +125,8 @@ pub effect fn next(self: &mut Self, deadline: Option<Instant>) -> Option<Event>
     ? &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
 ```
 
-Flushes queued output, then waits for one event. None means clean transport EOF. A partial
+Returns the next event, from input already read when it holds one, and otherwise flushes
+queued output and waits for more input. None means clean transport EOF. A partial
 frame or unfinished stream at EOF fails. Protocol errors attempt to flush GOAWAY before
 returning.
 

@@ -265,7 +265,7 @@ The stream identifier.
 #### Field `fields`
 
 ```silk
-pub fields: List<Header>
+pub fields: FieldBlock
 ```
 
 Decoded fields in wire order.
@@ -355,7 +355,7 @@ The promised even stream identifier.
 #### Field `fields`
 
 ```silk
-pub fields: List<Header>
+pub fields: FieldBlock
 ```
 
 The promised request fields.

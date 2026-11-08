@@ -15,6 +15,7 @@ import silk.core.ownership { Copy }
 import silk.collections.list { List }
 import silk.collections.slice { Slice }
 import silk.num.u8
+import silk.num.u32
 import silk.num.usize
 import silk.http.hpack_tables as Tables
 
@@ -169,7 +170,7 @@ effect fn integer(input: &[u8], cursor: &mut usize, prefix: u8) -> usize
   }
 }
 
-effect fn stringBytes(input: &[u8], cursor: &mut usize, maximum: usize) -> Bytes
+effect fn stringInto(input: &[u8], cursor: &mut usize, maximum: usize, output: &mut Bytes) -> usize
   ! HpackError | OutOfMemoryError
   ? &mut Allocator {
   if cursor.* >= input.length {
@@ -186,42 +187,117 @@ effect fn stringBytes(input: &[u8], cursor: &mut usize, maximum: usize) -> Bytes
     if length > maximum {
       fail HpackError { offset: cursor.*, limit: true }
     }
-    return run Bytes.copy(value)
+    run Bytes.append(&mut output.*, value)
+    return length
   }
-  let mut output = Bytes.make()
-  let mut node: usize = 0
-  let mut tail: usize = 0
-  let mut ones = true
+  // A Huffman code is at least five bits long, so the decoded string fits in this many bytes.
+  run Bytes.reserve(&mut output.*, length * 8 / 5)
+  let mut decoded: usize = 0
+  let mut state: usize = 0
+  let mut accept = true
   let mut index: usize = 0
   while index < value.length {
-    let mut mask: u8 = 128
-    while mask > 0 {
-      let bit = (value[index] & mask) != 0
-      node = Tables.next(node, bit)
-      tail = tail + 1
-      ones = ones && bit
-      let symbol = Tables.symbol(node)
-      if symbol != 257 {
-        if symbol == 256 {
-          fail HpackError { offset: cursor.* - length + index, limit: false }
-        }
-        if Bytes.length(&output) >= maximum {
+    let byte = u8.toUsize(value[index])
+    let mut half: usize = 0
+    while half < 2 {
+      let mut nibble = byte / 16
+      if half == 1 {
+        nibble = byte % 16
+      }
+      let step = Tables.huffmanStep(state, nibble)
+      if step & 131072 != 0 {
+        fail HpackError { offset: cursor.* - length + index, limit: false }
+      }
+      if step & 65536 != 0 {
+        if decoded >= maximum {
           fail HpackError { offset: cursor.*, limit: true }
         }
-        let byte = [usize.toU8(symbol)]
-        run Bytes.append(&mut output, &byte)
-        node = 0
-        tail = 0
-        ones = true
+        let symbol = [u32.toU8((step / 256) % 256)]
+        run Bytes.append(&mut output.*, &symbol)
+        decoded = decoded + 1
       }
-      mask = mask / 2
+      state = u32.toUsize(step % 256)
+      accept = step & 262144 != 0
+      half = half + 1
     }
     index = index + 1
   }
-  if tail > 7 || !ones {
+  // Padding is at most seven bits, all ones (RFC 7541 section 5.2).
+  if !accept {
     fail HpackError { offset: cursor.*, limit: false }
   }
-  return move output
+  return decoded
+}
+
+/// A decoded field block: every name and value in one buffer, in wire order.
+pub struct FieldBlock {
+  bytes: Bytes,
+  spans: List<FieldSpan>,
+}
+
+struct FieldSpan {
+  start: usize,
+  nameLength: usize,
+  valueLength: usize,
+  sensitive: bool,
+}
+
+impl Copy for FieldSpan {}
+
+impl FieldBlock {
+  /// Returns an empty block. It allocates nothing.
+  pub fn make() -> FieldBlock {
+    return FieldBlock { bytes: Bytes.make(), spans: List<FieldSpan>.make() }
+  }
+
+  /// Returns the number of fields.
+  pub fn length(self: &Self) -> usize {
+    return List.length(&self.spans)
+  }
+
+  /// Borrows field `index`, counted from 0 in wire order. Requires `index < length()`.
+  pub fn field(self: &Self, index: usize) -> Field<'_> {
+    let span = List.asSlice(&self.spans)[index]
+    let bytes = Bytes.asSlice(&self.bytes)
+    return Field {
+      name: Slice.view(bytes, span.start, span.nameLength),
+      value: Slice.view(bytes, span.start + span.nameLength, span.valueLength),
+      sensitive: span.sensitive
+    }
+  }
+
+  /// Borrows every field, in wire order.
+  pub effect fn views(self: &Self) -> List<Field<'_>>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut views = List<Field>.make()
+    run List.reserveExact(&mut views, List.length(&self.spans))
+    let mut index: usize = 0
+    while index < List.length(&self.spans) {
+      run List.append(&mut views, self.field(index))
+      index = index + 1
+    }
+    return move views
+  }
+
+  /// Copies every field into its own `Header`, in wire order.
+  pub effect fn headers(self: &Self) -> List<Header>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut headers = List<Header>.make()
+    let mut index: usize = 0
+    while index < List.length(&self.spans) {
+      let field = self.field(index)
+      let name = run Bytes.copy(field.name)
+      let value = run Bytes.copy(field.value)
+      run List.append(
+        &mut headers,
+        Header { name: move name, value: move value, sensitive: field.sensitive }
+      )
+      index = index + 1
+    }
+    return move headers
+  }
 }
 
 /// A connection's HPACK decoder with a bounded dynamic table and decoded field list.
@@ -265,7 +341,16 @@ impl Decoder {
   pub effect fn decode(self: &mut Self, input: &[u8]) -> List<Header>
     ! HpackError | OutOfMemoryError
     ? &mut Allocator {
-    let mut output = List<Header>.make()
+    let block = run self.decodeBlock(input)
+    return run block.headers()
+  }
+
+  /// Decodes one complete field block into a single buffer and updates the dynamic table.
+  /// A failure invalidates the compression context; close its HTTP/2 connection.
+  pub effect fn decodeBlock(self: &mut Self, input: &[u8]) -> FieldBlock
+    ! HpackError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut output = FieldBlock.make()
     let mut cursor: usize = 0
     let mut size: usize = 0
     let mut fieldsStarted = false
@@ -286,12 +371,15 @@ impl Decoder {
         if self.requireUpdate {
           fail HpackError { offset: cursor, limit: false }
         }
+        if !fieldsStarted {
+          // Decoded fields are usually about twice as long as their encoding.
+          run Bytes.reserve(&mut output.bytes, input.length * 2)
+          run List.reserve(&mut output.spans, 8)
+        }
         fieldsStarted = true
-        if List.length(&output) >= self.maxFields || self.maxBytes - size < 32 {
+        if List.length(&output.spans) >= self.maxFields || self.maxBytes - size < 32 {
           fail HpackError { offset: cursor, limit: true }
         }
-        let mut name = Bytes.make()
-        let mut value = Bytes.make()
         let indexed = byte >= 128
         let incremental = byte >= 64 && byte < 128
         let sensitive = byte >= 16 && byte < 32
@@ -306,31 +394,44 @@ impl Decoder {
         if index > 61 + List.length(&self.table.entries) || (indexed && index == 0) {
           fail HpackError { offset: cursor, limit: false }
         }
+        let start = Bytes.length(&output.bytes)
+        let mut nameLength: usize = 0
         if index == 0 {
-          name = run stringBytes(input, &mut cursor, self.maxBytes - size - 32)
+          nameLength = run stringInto(input, &mut cursor, self.maxBytes - size - 32, &mut output.bytes)
         } else {
           let field = entry(&self.table, index)
           if field.name.length > self.maxBytes - size - 32 {
             fail HpackError { offset: cursor, limit: true }
           }
-          name = run Bytes.copy(field.name)
+          run Bytes.append(&mut output.bytes, field.name)
+          nameLength = field.name.length
         }
-        let remaining = self.maxBytes - size - 32 - Bytes.length(&name)
+        let remaining = self.maxBytes - size - 32 - nameLength
+        let mut valueLength: usize = 0
         if indexed {
           let field = entry(&self.table, index)
           if field.value.length > remaining {
             fail HpackError { offset: cursor, limit: true }
           }
-          value = run Bytes.copy(field.value)
+          run Bytes.append(&mut output.bytes, field.value)
+          valueLength = field.value.length
         } else {
-          value = run stringBytes(input, &mut cursor, remaining)
+          valueLength = run stringInto(input, &mut cursor, remaining, &mut output.bytes)
         }
-        let header = Header { name: move name, value: move value, sensitive: sensitive }
-        size = size + Bytes.length(&header.name) + Bytes.length(&header.value) + 32
+        size = size + nameLength + valueLength + 32
+        run List.append(
+          &mut output.spans,
+          FieldSpan {
+            start: start,
+            nameLength: nameLength,
+            valueLength: valueLength,
+            sensitive: sensitive
+          }
+        )
         if incremental {
-          run insert(&mut self.table, Header.view(&header))
+          let added = output.field(List.length(&output.spans) - 1)
+          run insert(&mut self.table, added)
         }
-        run List.append(&mut output, move header)
       }
     }
     if self.requireUpdate {
@@ -345,8 +446,11 @@ effect fn writeInteger(output: &mut Bytes, value: usize, prefix: u8, tag: u8) ->
   ? &mut Allocator {
   let mut remaining = value
   if remaining < u8.toUsize(prefix) {
-    let bytes = [tag | usize.toU8(remaining)]
-    run Bytes.append(&mut output.*, &bytes)
+    let byte = tag | usize.toU8(remaining)
+    if !Bytes.appendWithinCapacity(&mut output.*, byte) {
+      let bytes = [byte]
+      run Bytes.append(&mut output.*, &bytes)
+    }
     return ()
   }
   let first = [tag | prefix]
@@ -395,7 +499,15 @@ impl Encoder {
   pub effect fn encode(self: &mut Self, fields: &[Field<'_>]) -> Bytes
     ! OutOfMemoryError
     ? &mut Allocator {
+    // Room for every field as a literal with its name, so that the block grows once.
+    let mut room: usize = 6
+    let mut sized: usize = 0
+    while sized < fields.length {
+      room = room + fields[sized].name.length + fields[sized].value.length + 6
+      sized = sized + 1
+    }
     let mut output = Bytes.make()
+    run Bytes.reserveExact(&mut output, room)
     if self.pending {
       run writeInteger(&mut output, self.minimum, 31, 32)
       if self.minimum != self.table.maximum {
@@ -406,21 +518,38 @@ impl Encoder {
     let mut fieldIndex: usize = 0
     while fieldIndex < fields.length {
       let field = fields[fieldIndex]
-      let mut nameIndex: usize = 0
+      // The lowest index with the field's name, and the lowest with its name and value: the
+      // static fields with that name first, then the dynamic table from its newest entry.
+      let mut nameIndex = Tables.nameIndex(field.name)
       let mut exactIndex: usize = 0
-      let mut index: usize = 1
-      while index <= 61 + List.length(&self.table.entries) {
-        let candidate = entry(&self.table, index)
-        if equal(candidate.name, field.name) {
-          if nameIndex == 0 {
-            nameIndex = index
-          }
-          if equal(candidate.value, field.value) {
-            exactIndex = index
-            break
-          }
+      let mut index = nameIndex
+      while index != 0 && index <= 61 {
+        let candidate = Tables.field(index)
+        if !equal(candidate.name, field.name) {
+          break
+        }
+        if equal(candidate.value, field.value) {
+          exactIndex = index
+          break
         }
         index = index + 1
+      }
+      if exactIndex == 0 {
+        let dynamic = List.asSlice(&self.table.entries)
+        let mut offset: usize = 0
+        while offset < dynamic.length {
+          let candidate = &dynamic[dynamic.length - 1 - offset]
+          if equal(Bytes.asSlice(&candidate.name), field.name) {
+            if nameIndex == 0 {
+              nameIndex = 62 + offset
+            }
+            if equal(Bytes.asSlice(&candidate.value), field.value) {
+              exactIndex = 62 + offset
+              break
+            }
+          }
+          offset = offset + 1
+        }
       }
       if exactIndex != 0 && !field.sensitive {
         run writeInteger(&mut output, exactIndex, 127, 128)
