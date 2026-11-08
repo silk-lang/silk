@@ -6,17 +6,58 @@ How a struct field reads its value from the command line.
 
 ## When to use
 Every field of a command struct needs [`ArgValue`](#ArgValue). This module implements it for `String`,
-`bool`, the integer types, `Option<T>`, and `List<T>`. Implement it for your own type to read
-that type from an argument.
+`Bytes`, `bool`, the integer types, `Option<T>`, and `List<T>`. Implement it for your own type
+to read that type from an argument.
 
 ## Details
 A `bool` field is a flag: it takes no value and becomes `true` when the flag is present. An
 `Option<T>` field becomes present when the option is given. A `List<T>` field collects every
-occurrence, and as a positional argument it takes every remaining argument.
+occurrence, and as a positional argument it takes every remaining argument. A `Bytes` field
+takes the argument's exact bytes, so it also reads a path that is not valid UTF-8; every other
+type reads [`Arg.text`](#Arg.text), where each byte that is not valid UTF-8 reads as `?`.
 
 Import as `ArgValue` with `import silk.cli.value { ArgValue }`.
 
-Public declarations: 2.
+Public declarations: 3.
+
+<a id="Arg"></a>
+
+## `Arg`
+
+```silk
+pub struct Arg<'a>
+```
+
+One argument, or the part of one after `=` or after an option letter.
+
+<a id="Arg.text"></a>
+
+### Field `text`
+
+```silk
+pub text: string<'a>
+```
+
+The argument as text. Each byte that is not valid UTF-8 reads as `?`, so the text has the
+same length as `bytes`.
+
+<a id="Arg.bytes"></a>
+
+### Field `bytes`
+
+```silk
+pub bytes: &'a [u8]
+```
+
+The argument's exact bytes, as the program received them.
+
+<a id="Arg.impl.Copy"></a>
+
+## Implementation `Copy for Arg<'a>`
+
+```silk
+impl<'a> Copy for Arg<'a>
+```
 
 <a id="FromArg"></a>
 
@@ -33,11 +74,11 @@ A type that reads one value from command-line text.
 ### Operation `fromArg`
 
 ```silk
-effect fn fromArg(text: string) -> Result<Self, bool> ! OutOfMemoryError ? &mut Allocator
+effect fn fromArg(arg: Arg<'_>) -> Result<Self, bool> ! OutOfMemoryError ? &mut Allocator
 ```
 
-Returns the value that `text` spells, or `false` in `Result.Failure` when `text` is not a
-valid value.
+Returns the value that `arg` spells, or `false` in `Result.Failure` when it is not a valid
+value.
 
 <a id="ArgValue"></a>
 
@@ -85,10 +126,10 @@ Returns the value of a field that the command line does not give: empty text, ze
 ### Operation `accept`
 
 ```silk
-effect fn accept(self: &mut Self, text: string) -> bool ! OutOfMemoryError ? &mut Allocator
+effect fn accept(self: &mut Self, arg: Arg<'_>) -> bool ! OutOfMemoryError ? &mut Allocator
 ```
 
-Stores one occurrence. `text` is empty for a flag. Returns `false` when `text` is not a valid
+Stores one occurrence. `arg` is empty for a flag. Returns `false` when it is not a valid
 value.
 
 <a id="String.impl.FromArg"></a>
@@ -104,7 +145,7 @@ impl FromArg for String
 ### Operation `fromArg`
 
 ```silk
-effect fn fromArg(text: string) -> Result<String, bool>
+effect fn fromArg(arg: Arg<'_>) -> Result<String, bool>
     ! OutOfMemoryError
     ? &mut Allocator
 ```
@@ -122,7 +163,7 @@ impl FromArg for i8
 ### Operation `fromArg`
 
 ```silk
-effect fn fromArg(text: string) -> Result<i8, bool>
+effect fn fromArg(arg: Arg<'_>) -> Result<i8, bool>
     ! OutOfMemoryError
     ? &mut Allocator
 ```
@@ -140,7 +181,7 @@ impl FromArg for i16
 ### Operation `fromArg`
 
 ```silk
-effect fn fromArg(text: string) -> Result<i16, bool>
+effect fn fromArg(arg: Arg<'_>) -> Result<i16, bool>
     ! OutOfMemoryError
     ? &mut Allocator
 ```
@@ -158,7 +199,7 @@ impl FromArg for i32
 ### Operation `fromArg`
 
 ```silk
-effect fn fromArg(text: string) -> Result<i32, bool>
+effect fn fromArg(arg: Arg<'_>) -> Result<i32, bool>
     ! OutOfMemoryError
     ? &mut Allocator
 ```
@@ -176,7 +217,7 @@ impl FromArg for i64
 ### Operation `fromArg`
 
 ```silk
-effect fn fromArg(text: string) -> Result<i64, bool>
+effect fn fromArg(arg: Arg<'_>) -> Result<i64, bool>
     ! OutOfMemoryError
     ? &mut Allocator
 ```
@@ -194,7 +235,7 @@ impl FromArg for u8
 ### Operation `fromArg`
 
 ```silk
-effect fn fromArg(text: string) -> Result<u8, bool>
+effect fn fromArg(arg: Arg<'_>) -> Result<u8, bool>
     ! OutOfMemoryError
     ? &mut Allocator
 ```
@@ -212,7 +253,7 @@ impl FromArg for u16
 ### Operation `fromArg`
 
 ```silk
-effect fn fromArg(text: string) -> Result<u16, bool>
+effect fn fromArg(arg: Arg<'_>) -> Result<u16, bool>
     ! OutOfMemoryError
     ? &mut Allocator
 ```
@@ -230,7 +271,7 @@ impl FromArg for u32
 ### Operation `fromArg`
 
 ```silk
-effect fn fromArg(text: string) -> Result<u32, bool>
+effect fn fromArg(arg: Arg<'_>) -> Result<u32, bool>
     ! OutOfMemoryError
     ? &mut Allocator
 ```
@@ -248,7 +289,7 @@ impl FromArg for u64
 ### Operation `fromArg`
 
 ```silk
-effect fn fromArg(text: string) -> Result<u64, bool>
+effect fn fromArg(arg: Arg<'_>) -> Result<u64, bool>
     ! OutOfMemoryError
     ? &mut Allocator
 ```
@@ -266,7 +307,69 @@ impl FromArg for usize
 ### Operation `fromArg`
 
 ```silk
-effect fn fromArg(text: string) -> Result<usize, bool>
+effect fn fromArg(arg: Arg<'_>) -> Result<usize, bool>
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+<a id="Bytes.impl.FromArg"></a>
+
+## Implementation `FromArg for Bytes`
+
+```silk
+impl FromArg for Bytes
+```
+
+<a id="Bytes.impl.FromArg.fromArg"></a>
+
+### Operation `fromArg`
+
+```silk
+effect fn fromArg(arg: Arg<'_>) -> Result<Bytes, bool>
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+<a id="Bytes.impl.ArgValue"></a>
+
+## Implementation `ArgValue for Bytes`
+
+```silk
+impl ArgValue for Bytes
+```
+
+<a id="Bytes.impl.ArgValue.takesValue"></a>
+
+### Operation `takesValue`
+
+```silk
+fn takesValue() -> bool
+```
+
+<a id="Bytes.impl.ArgValue.repeats"></a>
+
+### Operation `repeats`
+
+```silk
+fn repeats() -> bool
+```
+
+<a id="Bytes.impl.ArgValue.initial"></a>
+
+### Operation `initial`
+
+```silk
+effect fn initial() -> Self
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+<a id="Bytes.impl.ArgValue.accept"></a>
+
+### Operation `accept`
+
+```silk
+effect fn accept(self: &mut Self, arg: Arg<'_>) -> bool
     ! OutOfMemoryError
     ? &mut Allocator
 ```
@@ -310,7 +413,7 @@ effect fn initial() -> Self
 ### Operation `accept`
 
 ```silk
-effect fn accept(self: &mut Self, text: string) -> bool
+effect fn accept(self: &mut Self, arg: Arg<'_>) -> bool
     ! OutOfMemoryError
     ? &mut Allocator
 ```
@@ -354,7 +457,7 @@ effect fn initial() -> Self
 ### Operation `accept`
 
 ```silk
-effect fn accept(self: &mut Self, text: string) -> bool
+effect fn accept(self: &mut Self, arg: Arg<'_>) -> bool
     ! OutOfMemoryError
     ? &mut Allocator
 ```
@@ -398,7 +501,7 @@ effect fn initial() -> Self
 ### Operation `accept`
 
 ```silk
-effect fn accept(self: &mut Self, text: string) -> bool
+effect fn accept(self: &mut Self, arg: Arg<'_>) -> bool
     ! OutOfMemoryError
     ? &mut Allocator
 ```
@@ -442,7 +545,7 @@ effect fn initial() -> Self
 ### Operation `accept`
 
 ```silk
-effect fn accept(self: &mut Self, text: string) -> bool
+effect fn accept(self: &mut Self, arg: Arg<'_>) -> bool
     ! OutOfMemoryError
     ? &mut Allocator
 ```
@@ -486,7 +589,7 @@ effect fn initial() -> Self
 ### Operation `accept`
 
 ```silk
-effect fn accept(self: &mut Self, text: string) -> bool
+effect fn accept(self: &mut Self, arg: Arg<'_>) -> bool
     ! OutOfMemoryError
     ? &mut Allocator
 ```
@@ -530,7 +633,7 @@ effect fn initial() -> Self
 ### Operation `accept`
 
 ```silk
-effect fn accept(self: &mut Self, text: string) -> bool
+effect fn accept(self: &mut Self, arg: Arg<'_>) -> bool
     ! OutOfMemoryError
     ? &mut Allocator
 ```
@@ -574,7 +677,7 @@ effect fn initial() -> Self
 ### Operation `accept`
 
 ```silk
-effect fn accept(self: &mut Self, text: string) -> bool
+effect fn accept(self: &mut Self, arg: Arg<'_>) -> bool
     ! OutOfMemoryError
     ? &mut Allocator
 ```
@@ -618,7 +721,7 @@ effect fn initial() -> Self
 ### Operation `accept`
 
 ```silk
-effect fn accept(self: &mut Self, text: string) -> bool
+effect fn accept(self: &mut Self, arg: Arg<'_>) -> bool
     ! OutOfMemoryError
     ? &mut Allocator
 ```
@@ -662,7 +765,7 @@ effect fn initial() -> Self
 ### Operation `accept`
 
 ```silk
-effect fn accept(self: &mut Self, text: string) -> bool
+effect fn accept(self: &mut Self, arg: Arg<'_>) -> bool
     ! OutOfMemoryError
     ? &mut Allocator
 ```
@@ -706,7 +809,7 @@ effect fn initial() -> Self
 ### Operation `accept`
 
 ```silk
-effect fn accept(self: &mut Self, text: string) -> bool
+effect fn accept(self: &mut Self, arg: Arg<'_>) -> bool
     ! OutOfMemoryError
     ? &mut Allocator
 ```
@@ -750,7 +853,7 @@ effect fn initial() -> Self
 ### Operation `accept`
 
 ```silk
-effect fn accept(self: &mut Self, text: string) -> bool
+effect fn accept(self: &mut Self, arg: Arg<'_>) -> bool
     ! OutOfMemoryError
     ? &mut Allocator
 ```
@@ -794,7 +897,7 @@ effect fn initial() -> Self
 ### Operation `accept`
 
 ```silk
-effect fn accept(self: &mut Self, text: string) -> bool
+effect fn accept(self: &mut Self, arg: Arg<'_>) -> bool
     ! OutOfMemoryError
     ? &mut Allocator
 ```
@@ -838,7 +941,7 @@ effect fn initial() -> Self
 ### Operation `accept`
 
 ```silk
-effect fn accept(self: &mut Self, text: string) -> bool
+effect fn accept(self: &mut Self, arg: Arg<'_>) -> bool
     ! OutOfMemoryError
     ? &mut Allocator
 ```

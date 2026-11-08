@@ -107,6 +107,17 @@ pub subcommand: bool
 Whether the field is a subcommand: a union with `CommandLine`, whose variants are the
 subcommands.
 
+<a id="OptionSpec.flatten"></a>
+
+### Field `flatten`
+
+```silk
+pub flatten: bool
+```
+
+Whether the field is a group of options: a struct with `CommandLine` whose options the
+command line gives as this command's own.
+
 <a id="OptionSpec.fallback"></a>
 
 ### Field `fallback`
@@ -343,6 +354,24 @@ pub static fn subcommand(command: Command<T>, field: Intrinsic.FieldName<T>) -> 
 Returns `command` with the field `field` read as a subcommand. The field's type is a union
 with `CommandLine`, and the command line names one of its variants in kebab case, such as
 `remote` for the variant `Remote`.
+
+<a id="Command.impl.flatten"></a>
+
+### Associated function `flatten`
+
+```silk
+pub static fn flatten(command: Command<T>, field: Intrinsic.FieldName<T>) -> Command<T>
+```
+
+Returns `command` with the field `field` read as a group of options. The field's type is a
+struct with `CommandLine`, and its options are written as options of this command, so one
+group, such as the options every build command shares, is described once and used by many
+commands.
+
+#### Details
+
+A group holds named options only: its own positional arguments or subcommands are a compile
+error. Help lists the group's options among the command's own.
 
 <a id="Command.impl.variant"></a>
 

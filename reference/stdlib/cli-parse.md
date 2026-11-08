@@ -260,26 +260,6 @@ pub token: String
 
 The argument as given.
 
-<a id="CliError.InvalidText"></a>
-
-### `InvalidText`
-
-```silk
-InvalidText
-```
-
-An argument is not valid UTF-8.
-
-<a id="CliError.InvalidText.index"></a>
-
-#### Field `index`
-
-```silk
-pub index: usize
-```
-
-The position of the argument; 0 is the program name.
-
 <a id="Parsed"></a>
 
 ## `Parsed`
@@ -452,6 +432,23 @@ pub effect fn parseWith<T: CommandLine>(
 Parses like [`Cli.parse`](#Cli.impl.parse), and reads an option that the command line does not give from
 `environment` when the option names a variable with `Opt.env`. The command line wins over the
 environment, and the environment wins over `Opt.default`.
+
+<a id="Cli.impl.parseBytes"></a>
+
+### Associated function `parseBytes`
+
+```silk
+pub effect fn parseBytes<T: CommandLine>(
+    arguments: &[Bytes],
+    environment: &[Variable<'_>],
+  ) -> Parsed<T>
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Parses like [`Cli.parseWith`](#Cli.impl.parseWith), from arguments as the program received them, such as
+`HostInput.arguments`. A `Bytes` field takes its argument's exact bytes; every other field
+reads the argument as text, where each byte that is not valid UTF-8 reads as `?`.
 
 <a id="Cli.impl.fromHost"></a>
 
