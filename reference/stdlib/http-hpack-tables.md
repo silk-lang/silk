@@ -4,7 +4,7 @@
 
 RFC 7541 Appendix A static fields and Appendix B Huffman decoding trie.
 
-Public declarations: 3.
+Public declarations: 4.
 
 <a id="field"></a>
 
@@ -16,6 +16,17 @@ pub fn field(index: usize) -> Field<'static>
 
 Returns the RFC 7541 static field at a one-based index from 1 through 61. Other indices return
 an empty field.
+
+<a id="nameIndex"></a>
+
+## `nameIndex`
+
+```silk
+pub fn nameIndex(name: &[u8]) -> usize
+```
+
+Returns the lowest RFC 7541 static index whose name is `name`, or 0 when no static field has
+that name. The fields that share a name have consecutive indices.
 
 <a id="next"></a>
 
