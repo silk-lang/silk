@@ -670,7 +670,8 @@ pub effect fn release(self: &mut Self, id: u32, count: u32) -> ()
 
 Returns consumed DATA credit to the peer. Padding credit is returned automatically. The count
 cannot exceed unreleased body bytes for this stream. Closed streams return connection credit
-only.
+only. Connection credit is gathered and sent in one WINDOW_UPDATE once the peer may send less
+than half of the initial connection window.
 
 <a id="Connection.impl.reset"></a>
 
