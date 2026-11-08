@@ -29,6 +29,7 @@
 
 import backend.Bitstream
 import silk.core.effect {Effect}
+import silk.core.option {Option}
 import silk.testing.testing {AssertionError, Testing}
 import backend.Bitstream {Writer}
 import semantic.InternIndex {InternIndex}
@@ -2658,6 +2659,132 @@ pub effect fn globalsOf(fragments: &[u8]) -> List<Named> ! OutOfMemoryError ? &m
   return move named
 }
 
+struct FragmentCursor {
+  at: usize,
+  end: usize,
+  failed: bool,
+}
+
+// Bounded decoding for the lightweight fragment projection; malformed cache bytes must never
+// become partial line tables. Even discarded words must be valid unsigned 64-bit varints.
+fn markerWord(bytes: &[u8], cursor: &mut FragmentCursor) -> u64 {
+  let mut value: u64 = 0
+  let mut shift: u64 = 0
+  while !cursor.failed {
+    if cursor.at >= cursor.end { cursor.failed = true return 0 }
+    let byte = u8.toU64(bytes[cursor.at])
+    cursor.at = cursor.at + usize.ONE
+    if shift == 63 && byte > 1 { cursor.failed = true return 0 }
+    value = u64.bitOr(value, u64.shiftLeft(u64.bitAnd(byte, 127), shift))
+    if byte < 128 { return value }
+    shift = shift + 7
+  }
+  return 0
+}
+
+// Every counted item requires at least one remaining byte; indexes use markerWord instead.
+fn markerCount(bytes: &[u8], cursor: &mut FragmentCursor) -> usize {
+  let value = markerWord(bytes, &mut cursor.*)
+  if value > usize.toU64(cursor.end - cursor.at) { cursor.failed = true return usize.ZERO }
+  return u64.toUsize(value)
+}
+
+fn skipMarkerWords(bytes: &[u8], cursor: &mut FragmentCursor, count: usize) -> () {
+  if count > cursor.end - cursor.at { cursor.failed = true return () }
+  let mut at = usize.ZERO
+  while at < count && !cursor.failed {
+    drop markerWord(bytes, &mut cursor.*)
+    at = at + usize.ONE
+  }
+}
+
+/// The defined functions' first source lines, as `Module.mergeAll` followed by
+/// `Module.markedFunctions` would read them, without merging types, constants or instructions.
+/// First definitions win even when they have no source markers. Malformed fragments return None.
+pub effect fn markedFunctionsOf(fragments: &[u8]) -> Option<List<MarkedFunction>> ! OutOfMemoryError ? &mut Allocator {
+  let mut marked = List<MarkedFunction>.make()
+  let mut names = Module.make()
+  let mut at = usize.ZERO
+  while at < fragments.length {
+    if fragments.length - at < 8 || !same(Slice.view<u8>(fragments, at, 4), b"SLKF") {
+      return Option<List<MarkedFunction>>.none()
+    }
+    let length = u64.bitOr(u64.bitOr(u8.toU64(fragments[at + 4]), u64.shiftLeft(u8.toU64(fragments[at + 5]), 8)),
+      u64.bitOr(u64.shiftLeft(u8.toU64(fragments[at + 6]), 16), u64.shiftLeft(u8.toU64(fragments[at + 7]), 24)))
+    if length > usize.toU64(fragments.length - at - 8) { return Option<List<MarkedFunction>>.none() }
+    let end = at + 8 + u64.toUsize(length)
+    let mut cursor = FragmentCursor {at: at + 8, end: end, failed: false}
+    let globals = markerCount(fragments, &mut cursor)
+    let mut mapping = List<usize>.make()
+    let mut adopted = List<bool>.make()
+    let mut index = usize.ZERO
+    while index < globals && !cursor.failed {
+      let length = markerCount(fragments, &mut cursor)
+      let symbol = Slice.view<u8>(fragments, cursor.at, length)
+      cursor.at = cursor.at + length
+      let flags = markerWord(fragments, &mut cursor)
+      skipMarkerWords(fragments, &mut cursor, 9)
+      if cursor.failed { break }
+      let found = names.find(symbol)
+      let wins = found == usize.MAX || rank(flags) > rank(List<Global>.get(&names.globals, found).flags)
+      let selected = run Module.unify(&mut names, symbol, blank(flags, 0, 0))
+      run List<usize>.append(&mut mapping, selected)
+      run List<bool>.append(&mut adopted, wins)
+      index = index + usize.ONE
+    }
+    // Types, constants, attribute groups and attribute lists.
+    index = usize.ZERO
+    while index < 4 && !cursor.failed {
+      drop markerWord(fragments, &mut cursor)
+      let words = markerCount(fragments, &mut cursor)
+      skipMarkerWords(fragments, &mut cursor, words)
+      index = index + usize.ONE
+    }
+    let sections = markerCount(fragments, &mut cursor)
+    index = usize.ZERO
+    while index < sections && !cursor.failed {
+      let length = markerCount(fragments, &mut cursor)
+      cursor.at = cursor.at + length
+      index = index + usize.ONE
+    }
+    let bodies = markerCount(fragments, &mut cursor)
+    index = usize.ZERO
+    while index < bodies && !cursor.failed {
+      let functionWord = markerWord(fragments, &mut cursor)
+      if functionWord >= usize.toU64(List<usize>.length(&mapping)) { cursor.failed = true break }
+      let function = u64.toUsize(functionWord)
+      drop markerWord(fragments, &mut cursor)
+      let locals = markerCount(fragments, &mut cursor)
+      skipMarkerWords(fragments, &mut cursor, locals)
+      skipMarkerWords(fragments, &mut cursor, locals)
+      let blocks = markerCount(fragments, &mut cursor)
+      skipMarkerWords(fragments, &mut cursor, blocks)
+      let words = markerCount(fragments, &mut cursor)
+      let mut first = u64.MAX
+      let mut position = usize.ZERO
+      while position < words && !cursor.failed {
+        let value = markerWord(fragments, &mut cursor)
+        if tagOf(value) == tagHeader() && headerCode(value) == markerLocation() && words - position > 2 {
+          drop markerWord(fragments, &mut cursor)
+          let line = u64.shiftRight(payloadOf(markerWord(fragments, &mut cursor)), 24)
+          if line != 0 && line < first { first = line }
+          position = position + 2
+        }
+        position = position + usize.ONE
+      }
+      if List<bool>.get(&adopted, function) && first != u64.MAX {
+        let entry = List<Global>.get(&names.globals, List<usize>.get(&mapping, function))
+        run List<MarkedFunction>.append(&mut marked, MarkedFunction {
+          symbol: run Bytes.copy(Slice.view<u8>(Bytes.asSlice(&names.names), entry.nameStart, entry.nameLength)), line: first})
+      }
+      index = index + usize.ONE
+    }
+    if cursor.failed || cursor.at != end { return Option<List<MarkedFunction>>.none() }
+    at = end
+  }
+  return Option<List<MarkedFunction>>.some(move marked)
+}
+
 /// The bitcode module `fragments` merge into.
 pub effect fn compile(fragments: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
   let mut module = Module.make()
@@ -3800,4 +3927,100 @@ effect fn debugMetadataInterningClaims() -> () ! OutOfMemoryError | AssertionErr
   run Testing.expect(group == tupleAgain && localOne != localTwo && distinctOne != distinctTwo,
     "tuples share while distinct locals and distinct composite types retain identities")
   return ()
+}
+
+test effect fn fragmentSourceMarkersMatchMergedDefinitionSelection() -> ()
+! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run fragmentSourceMarkerClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn markerFixtureBody(module: &mut Module, symbol: &[u8], lines: &[u64]) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let unit = run Module.void(&mut module.*)
+  let integer = run Module.integer(&mut module.*, 32)
+  let signature = run Module.function(&mut module.*, unit, &[integer], false)
+  drop run Module.int(&mut module.*, integer, 1024)
+  drop run Module.section(&mut module.*, b"fixture-section")
+  Module.beginAttributes(&mut module.*)
+  run Module.attributeGroup(&mut module.*, positionFunction(), &[0, 1])
+  let attributes = run Module.endAttributes(&mut module.*)
+  let function = run Module.defineFunction(&mut module.*, symbol, signature, linkExternal(), attributes)
+  run Module.beginBody(&mut module.*, function, &[integer], &[0])
+  drop run Module.block(&mut module.*, 0)
+  let mut at = usize.ZERO
+  while at < lines.length {
+    run Module.location(&mut module.*, usize.toU64(at), u64.shiftLeft(lines[at], 24))
+    at = at + usize.ONE
+  }
+  run Module.retVoid(&mut module.*)
+  return run Module.endBody(&mut module.*)
+}
+
+effect fn fragmentSourceMarkerClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut first = Module.make()
+  let unit = run Module.void(&mut first)
+  let integer = run Module.integer(&mut first, 32)
+  let signature = run Module.function(&mut first, unit, &[integer], false)
+  drop run Module.functionRef(&mut first, b"later", signature)
+  run markerFixtureBody(&mut first, b"marked", &[29, 0, 7])
+  run markerFixtureBody(&mut first, b"unmarked", &[])
+  let mut second = Module.make()
+  run markerFixtureBody(&mut second, b"later", &[13])
+  run markerFixtureBody(&mut second, b"marked", &[1])
+  run markerFixtureBody(&mut second, b"unmarked", &[2])
+  let mut fragments = run Module.serialize(&first)
+  let tail = run Module.serialize(&second)
+  run Bytes.append(&mut fragments, Bytes.asSlice(&tail))
+  let scanned = match move run markedFunctionsOf(Bytes.asSlice(&fragments)) {
+    Option<List<MarkedFunction>>.Some {value} => move value
+    Option<List<MarkedFunction>>.None => {
+      run Testing.expect(false, "well-formed fragments decode source markers")
+      return ()
+    }
+  }
+  let mut merged = Module.make()
+  run Module.mergeAll(&mut merged, Bytes.asSlice(&fragments))
+  let expected = run Module.markedFunctions(&merged)
+  let actual = List<MarkedFunction>.asSlice(&scanned)
+  let reference = List<MarkedFunction>.asSlice(&expected)
+  run Testing.expect(actual.length == 2 && actual.length == reference.length,
+    "unmarked first definitions suppress later marked copies while declarations permit definitions")
+  let mut at = usize.ZERO
+  while at < reference.length {
+    run Testing.expect(same(Bytes.asSlice(&actual[at].symbol), Bytes.asSlice(&reference[at].symbol))
+      && actual[at].line == reference[at].line, "direct fragment source markers preserve merged definition order and minimum nonzero lines")
+    at = at + usize.ONE
+  }
+  run Testing.expect(actual[0].line == 7 && actual[1].line == 13, "nonmonotonic and zero location markers retain source lines")
+  let firstBytes = run Module.serialize(&first)
+  let bytes = Bytes.asSlice(&firstBytes)
+  let mut cut = usize.ONE
+  while cut < bytes.length {
+    let mut truncated = run Bytes.copy(Slice.view<u8>(bytes, usize.ZERO, cut))
+    if cut >= 8 {
+      // Keep the outer length valid so the cursor must reject each truncated inner record.
+      let length = usize.toU64(cut - 8)
+      let writable = Bytes.asMutSlice(&mut truncated)
+      writable[4] = u64.toU8(u64.bitAnd(length, 255))
+      writable[5] = u64.toU8(u64.bitAnd(u64.shiftRight(length, 8), 255))
+      writable[6] = u64.toU8(u64.bitAnd(u64.shiftRight(length, 16), 255))
+      writable[7] = u64.toU8(u64.shiftRight(length, 24))
+    }
+    run Testing.expect(run markerProjectionRejects(Bytes.asSlice(&truncated)), "truncated fragment fields never publish partial source metadata")
+    cut = cut + usize.ONE
+  }
+  // Overflowing first count and a body referencing a nonexistent global, respectively.
+  run Testing.expect(run markerProjectionRejects(&[83, 76, 75, 70, 10, 0, 0, 0,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 2]), "overflowing varints are rejected")
+  run Testing.expect(run markerProjectionRejects(&[83, 76, 75, 70, 12, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0]), "body global indexes are bounds checked independently of remaining bytes")
+  return ()
+}
+
+effect fn markerProjectionRejects(bytes: &[u8]) -> bool ! OutOfMemoryError ? &mut Allocator {
+  return match move run markedFunctionsOf(bytes) {
+    Option<List<MarkedFunction>>.None => true
+    Option<List<MarkedFunction>>.Some {..} => false
+  }
 }
