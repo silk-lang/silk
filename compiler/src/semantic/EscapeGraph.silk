@@ -1,0 +1,344 @@
+//! Shared immutable escape graphs and per-check root descriptors.
+//!
+//! A descriptor is not proof by itself: its cache root retains that check's source, signature
+//! and application guards, plus exact MIR evidence for the selected closure. The graph blob is
+//! addressed by its full encoded content. A reader must find and authenticate that blob before
+//! resolving a descriptor, and must derive paths and pruning from the destination walk rather
+//! than the blob's original capture context. Budget accounting is restricted to selected roots.
+
+import lexer.Span {Span}
+import semantic.BuildRecord
+import semantic.ContentHash {ContentHash}
+import semantic.InternIndex {InternIndex}
+import semantic.RuntimeEncoding as Encoding
+import semantic.StableKey
+import semantic.WalkFragments
+import silk.collections.bytes {Bytes}
+import silk.collections.hash {Hash}
+import silk.collections.list {List}
+import silk.collections.slice {Slice}
+import silk.core.effect {Effect}
+import silk.core.option {Option}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.u64
+import silk.num.usize
+import silk.testing.testing {AssertionError, Testing}
+
+/// One check's ordered concrete roots in an authenticated immutable graph.
+pub struct Descriptor {
+  pub graph: ContentHash,
+  pub roots: List<ContentHash>,
+}
+
+/// An escape-cache answer. Inline bytes borrow their span from the original answer buffer;
+/// a view must resolve its graph before being used. Neither variant admits legacy naked records.
+pub enum Answer {
+  Inline {pub record: Span},
+  View {pub value: Descriptor},
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length { if left[at] != right[at] { return false } at = at + usize.ONE }
+  return true
+}
+fn answerTag() -> &'static [u8] { return b"silk.escape.answer.v1" }
+fn graphTag() -> &'static [u8] { return b"silk.escape.graph.v1" }
+
+/// Stable root key for a graph blob. Its answer must hash to `digest` before decoding.
+pub effect fn graphKey(digest: ContentHash) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut output = Bytes.make()
+  run Encoding.field(&mut output, graphTag())
+  run Encoding.word(&mut output, digest.high)
+  run Encoding.word(&mut output, digest.low)
+  return move output
+}
+
+pub fn readGraphKey(bytes: &[u8]) -> Option<ContentHash> {
+  let mut reader = StableKey.reader()
+  let tag = StableKey.readField(bytes, &mut reader)
+  if StableKey.failed(&reader) || !same(StableKey.view(bytes, tag), graphTag()) { return Option<ContentHash>.none() }
+  let high = StableKey.readWord(bytes, &mut reader)
+  let low = StableKey.readWord(bytes, &mut reader)
+  if !StableKey.finished(bytes, &reader) { return Option<ContentHash>.none() }
+  return Option<ContentHash>.some(ContentHash {high: high, low: low})
+}
+
+pub effect fn encodeInline(record: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut output = Bytes.make()
+  run Encoding.field(&mut output, answerTag())
+  run Encoding.word(&mut output, 0)
+  run Encoding.field(&mut output, record)
+  return move output
+}
+
+/// Reads only an inline answer, without allocation. The record still needs BuildRecord.decode.
+pub fn readInline(bytes: &[u8]) -> Option<Span> {
+  let mut reader = StableKey.reader()
+  let tag = StableKey.readField(bytes, &mut reader)
+  if StableKey.failed(&reader) || !same(StableKey.view(bytes, tag), answerTag())
+    || StableKey.readWord(bytes, &mut reader) != 0 { return Option<Span>.none() }
+  let record = StableKey.readField(bytes, &mut reader)
+  if !StableKey.finished(bytes, &reader) { return Option<Span>.none() }
+  return Option<Span>.some(record)
+}
+
+pub effect fn encodeDescriptor(value: &Descriptor) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut output = Bytes.make()
+  run Encoding.field(&mut output, answerTag())
+  run Encoding.word(&mut output, 1)
+  run Encoding.word(&mut output, value.graph.high)
+  run Encoding.word(&mut output, value.graph.low)
+  let roots = List<ContentHash>.asSlice(&value.roots)
+  run Encoding.word(&mut output, usize.toU64(roots.length))
+  let mut at = usize.ZERO
+  while at < roots.length {
+    run Encoding.word(&mut output, roots[at].high)
+    run Encoding.word(&mut output, roots[at].low)
+    at = at + usize.ONE
+  }
+  return move output
+}
+
+pub effect fn decodeAnswer(bytes: &[u8]) -> Option<Answer> ! OutOfMemoryError ? &mut Allocator {
+  let mut reader = StableKey.reader()
+  let tag = StableKey.readField(bytes, &mut reader)
+  if StableKey.failed(&reader) || !same(StableKey.view(bytes, tag), answerTag()) { return Option<Answer>.none() }
+  let kind = StableKey.readWord(bytes, &mut reader)
+  if kind == 0 {
+    let record = StableKey.readField(bytes, &mut reader)
+    if !StableKey.finished(bytes, &reader) { return Option<Answer>.none() }
+    return Option<Answer>.some(Answer.Inline {record: record})
+  }
+  if kind != 1 || StableKey.failed(&reader) { return Option<Answer>.none() }
+  let high = StableKey.readWord(bytes, &mut reader)
+  let low = StableKey.readWord(bytes, &mut reader)
+  let count = StableKey.readWord(bytes, &mut reader)
+  if StableKey.failed(&reader) { return Option<Answer>.none() }
+  let remaining = bytes.length - StableKey.offset(&reader)
+  // Check the actual bytes before allocating or converting the declared count to usize.
+  if remaining % 16 != usize.ZERO || count != usize.toU64(remaining / 16) { return Option<Answer>.none() }
+  let mut roots = run List<ContentHash>.makeWithCapacity(u64.toUsize(count))
+  let mut lookup = InternIndex.make()
+  let mut at = usize.ZERO
+  while at < u64.toUsize(count) {
+    let rootHigh = StableKey.readWord(bytes, &mut reader)
+    let rootLow = StableKey.readWord(bytes, &mut reader)
+    let root = ContentHash {high: rootHigh, low: rootLow}
+    let hash = Hash.combine(rootHigh, rootLow)
+    let mut found = InternIndex.first(&lookup, hash)
+    while found != usize.MAX {
+      if ContentHash.equals(List<ContentHash>.get(&roots, found), root) { return Option<Answer>.none() }
+      found = InternIndex.after(&lookup, found)
+    }
+    run InternIndex.record(&mut lookup, hash)
+    run List<ContentHash>.append(&mut roots, root)
+    at = at + usize.ONE
+  }
+  if !StableKey.finished(bytes, &reader) { return Option<Answer>.none() }
+  return Option<Answer>.some(Answer.View {value: Descriptor {graph: ContentHash {high: high, low: low}, roots: move roots}})
+}
+
+pub effect fn decodeDescriptor(bytes: &[u8]) -> Option<Descriptor> ! OutOfMemoryError ? &mut Allocator {
+  return match move run decodeAnswer(bytes) {
+    Option<Answer>.Some {value: answer} => match move answer {
+      Answer.View {value} => Option<Descriptor>.some(move value)
+      Answer.Inline {..} => Option<Descriptor>.none()
+    }
+    Option<Answer>.None => Option<Descriptor>.none()
+  }
+}
+
+// Structural completeness is independent of any one destination's pruning or dependency guard.
+effect fn validGraph(record: &BuildRecord.Record, normalized: bool) -> bool ! OutOfMemoryError ? &mut Allocator {
+  if record.guarded || record.patterns { return false }
+  if let Option<WalkFragments.FragmentFault>.Some {..} = move WalkFragments.structuralFailure(record) { return false }
+  let entries = List<BuildRecord.Entry>.asSlice(&record.entries)
+  let mut at = usize.ZERO
+  while at < entries.length {
+    let flags = entries[at].facts.flags
+    let required = BuildRecord.FACT_KNOWN + BuildRecord.FACT_KEY_BYTES + BuildRecord.FACT_BOUNDARY_KEY
+    if u64.bitAnd(flags, required) != required { return false }
+    if normalized && u64.bitAnd(flags, BuildRecord.FACT_ELSEWHERE) != 0 { return false }
+    let classified = BuildRecord.FACT_PLAIN_FUNCTION + BuildRecord.FACT_STATIC_ARGUMENTS
+    if u64.bitAnd(flags, classified) != 0
+      && u64.bitAnd(flags, BuildRecord.FACT_FUNCTION + BuildRecord.FACT_APPLICATION) != BuildRecord.FACT_FUNCTION + BuildRecord.FACT_APPLICATION { return false }
+    if u64.bitAnd(flags, classified) == classified { return false }
+    at = at + usize.ONE
+  }
+  return (run WalkFragments.finiteClosed(record)) && (run WalkFragments.escapeFree(record))
+}
+
+/// Encodes one complete graph without copying or mutating the caller's record. Its global
+/// parent/position fields are capture metadata only; every selected view derives its own paths.
+pub effect fn encodeGraph(record: &BuildRecord.Record) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+  if !run validGraph(record, false) { return Option<Bytes>.none() }
+  return Option<Bytes>.some(run BuildRecord.normalizedGraphEncoding(record))
+}
+
+/// Authenticates a blob and rejects partial, malformed or boundary-dependent graphs. A missing
+/// blob is handled as refusal by the caller, never as an empty graph or a successful check.
+pub effect fn decodeGraph(bytes: &[u8], expected: ContentHash) -> Option<BuildRecord.Record> ! OutOfMemoryError ? &mut Allocator {
+  if !ContentHash.equals(ContentHash.of(bytes), expected) { return Option<BuildRecord.Record>.none() }
+  let record = match move run BuildRecord.decode(bytes) {
+    Option<BuildRecord.Record>.Some {value} => move value
+    Option<BuildRecord.Record>.None => { return Option<BuildRecord.Record>.none() }
+  }
+  if !run validGraph(&record, true) { return Option<BuildRecord.Record>.none() }
+  return Option<BuildRecord.Record>.some(move record)
+}
+
+fn fixtureKey(value: u64) -> ContentHash { return ContentHash {high: 17, low: value} }
+
+effect fn fixtureEntry(value: u64, targets: &[usize]) -> BuildRecord.Entry ! OutOfMemoryError ? &mut Allocator {
+  let mut facts = BuildRecord.unknownFacts()
+  facts.flags = BuildRecord.FACT_KNOWN + BuildRecord.FACT_SUMMARIZED + BuildRecord.FACT_KEY_BYTES
+    + BuildRecord.FACT_BOUNDARY_KEY + BuildRecord.FACT_CALLEES + BuildRecord.FACT_ELSEWHERE
+  facts.definition = fixtureKey(value)
+  facts.keyBytes = 32
+  let mut references = List<BuildRecord.Reference>.make()
+  let mut at = usize.ZERO
+  while at < targets.length {
+    run List<BuildRecord.Reference>.append(&mut references, BuildRecord.Reference {target: targets[at], edge: fixtureKey(99)})
+    run List<usize>.append(&mut facts.callees, at)
+    at = at + usize.ONE
+  }
+  return BuildRecord.Entry {exact: fixtureKey(value), hash: value, family: value, declaration: Bytes.make(),
+    parent: usize.MAX, position: 0, requested: false, alias: usize.MAX, leaf: 0,
+    references: move references, summary: fixtureKey(value), facts: move facts}
+}
+
+effect fn fixtureGraph() -> BuildRecord.Record ! OutOfMemoryError ? &mut Allocator {
+  let mut record = BuildRecord.make(false, false)
+  run List<ContentHash>.append(&mut record.roots, fixtureKey(1))
+  run List<ContentHash>.append(&mut record.roots, fixtureKey(3))
+  run List<BuildRecord.Entry>.append(&mut record.entries, run fixtureEntry(1, &[1]))
+  run List<BuildRecord.Entry>.append(&mut record.entries, run fixtureEntry(2, &[0]))
+  run List<BuildRecord.Entry>.append(&mut record.entries, run fixtureEntry(3, &[]))
+  let entries = List<BuildRecord.Entry>.asMutSlice(&mut record.entries)
+  entries[1].parent = usize.ZERO
+  entries[2].position = usize.ONE
+  return move record
+}
+
+effect fn descriptorClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut value = Descriptor {graph: fixtureKey(88), roots: List<ContentHash>.make()}
+  run List<ContentHash>.append(&mut value.roots, fixtureKey(3))
+  run List<ContentHash>.append(&mut value.roots, fixtureKey(1))
+  let written = run encodeDescriptor(&value)
+  let bytes = Bytes.asSlice(&written)
+  let decoded = match move run decodeDescriptor(bytes) {
+    Option<Descriptor>.Some {value} => move value
+    Option<Descriptor>.None => { run Testing.expect(false, "a descriptor decodes its ordered exact roots") return () }
+  }
+  run Testing.expect(ContentHash.equals(decoded.graph, value.graph) && List<ContentHash>.length(&decoded.roots) == 2
+    && ContentHash.equals(List<ContentHash>.get(&decoded.roots, 0), fixtureKey(3))
+    && ContentHash.equals(List<ContentHash>.get(&decoded.roots, 1), fixtureKey(1)),
+    "descriptor decoding preserves graph identity and source root order")
+  let mut end = usize.ZERO
+  while end < bytes.length {
+    run Testing.expect(match move run decodeAnswer(Slice.view<u8>(bytes, 0, end)) {
+      Option<Answer>.None => true _ => false }, "truncated answer counts cannot allocate fabricated roots")
+    end = end + usize.ONE
+  }
+  let mut trailing = run Bytes.copy(bytes)
+  run Encoding.word(&mut trailing, 0)
+  run Testing.expect(match move run decodeDescriptor(Bytes.asSlice(&trailing)) {
+    Option<Descriptor>.None => true _ => false }, "a descriptor consumes exactly its declared root count")
+  run List<ContentHash>.append(&mut value.roots, fixtureKey(3))
+  let duplicated = run encodeDescriptor(&value)
+  run Testing.expect(match move run decodeDescriptor(Bytes.asSlice(&duplicated)) {
+    Option<Descriptor>.None => true _ => false }, "duplicate roots cannot forge another coverage position")
+  let mut oversized = Bytes.make()
+  run Encoding.field(&mut oversized, answerTag())
+  run Encoding.word(&mut oversized, 1)
+  run Encoding.word(&mut oversized, 0)
+  run Encoding.word(&mut oversized, 0)
+  run Encoding.word(&mut oversized, u64.MAX)
+  run Testing.expect(match move run decodeDescriptor(Bytes.asSlice(&oversized)) {
+    Option<Descriptor>.None => true _ => false }, "an oversized root count is refused before allocation")
+  let empty = Descriptor {graph: value.graph, roots: List<ContentHash>.make()}
+  let emptyBytes = run encodeDescriptor(&empty)
+  run Testing.expect(match move run decodeDescriptor(Bytes.asSlice(&emptyBytes)) {
+    Option<Descriptor>.Some {value: decodedEmpty} => List<ContentHash>.length(&decodedEmpty.roots) == usize.ZERO
+    _ => false }, "an explicitly empty root roster remains distinct from a missing or malformed graph")
+  let key = run graphKey(value.graph)
+  run Testing.expect(match move readGraphKey(Bytes.asSlice(&key)) {
+    Option<ContentHash>.Some {value: found} => ContentHash.equals(found, value.graph) _ => false },
+    "graph keys carry exact full content identities")
+  let inline = run encodeInline(b"record bytes")
+  run Testing.expect(match move readInline(Bytes.asSlice(&inline)) {
+    Option<Span>.Some {value: span} => same(StableKey.view(Bytes.asSlice(&inline), span), b"record bytes") _ => false },
+    "inline answers borrow their exact payload without copying it")
+  run Testing.expect(match move run decodeDescriptor(Bytes.asSlice(&inline)) {
+    Option<Descriptor>.None => true _ => false }, "inline records do not masquerade as graph descriptors")
+  run Testing.expect(match move readInline(bytes) { Option<Span>.None => true _ => false },
+    "graph descriptors cannot be interpreted as ordinary inline records")
+  run Testing.expect(match move run decodeAnswer(b"record bytes") { Option<Answer>.None => true _ => false },
+    "legacy untagged records are not a second persisted answer format")
+}
+
+effect fn graphClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut original = run fixtureGraph()
+  let before = run BuildRecord.encode(&original)
+  let blob = match move run encodeGraph(&original) {
+    Option<Bytes>.Some {value} => move value
+    Option<Bytes>.None => { run Testing.expect(false, "a complete finite graph can be encoded once") return () }
+  }
+  let after = run BuildRecord.encode(&original)
+  run Testing.expect(same(Bytes.asSlice(&before), Bytes.asSlice(&after)), "graph encoding does not mutate the caller's capture")
+  let bytes = Bytes.asSlice(&blob)
+  let digest = ContentHash.of(bytes)
+  let restored = match move run decodeGraph(bytes, digest) {
+    Option<BuildRecord.Record>.Some {value} => move value
+    Option<BuildRecord.Record>.None => { run Testing.expect(false, "a matching content-addressed graph decodes") return () }
+  }
+  let entries = List<BuildRecord.Entry>.asSlice(&restored.entries)
+  run Testing.expect(entries.length == 3 && u64.bitAnd(entries[0].facts.flags, BuildRecord.FACT_ELSEWHERE) == 0
+    && u64.bitAnd(entries[0].facts.flags, BuildRecord.FACT_BOUNDARY_KEY) != 0
+    && List<BuildRecord.Reference>.asSlice(&entries[0].references)[0].target == 1,
+    "graph encoding removes only supplier pruning, preserving intrinsic classification and reference order")
+  run Testing.expect(match move run decodeGraph(bytes, fixtureKey(0)) {
+    Option<BuildRecord.Record>.None => true _ => false }, "a missing or substituted content address cannot authorize a view")
+  run Testing.expect(match move run decodeGraph(&[], digest) {
+    Option<BuildRecord.Record>.None => true _ => false }, "a missing graph never becomes a successful empty record")
+  let mut end = usize.ZERO
+  while end < bytes.length {
+    let truncated = Slice.view<u8>(bytes, 0, end)
+    run Testing.expect(match move run decodeGraph(truncated, ContentHash.of(truncated)) {
+      Option<BuildRecord.Record>.None => true _ => false }, "a malformed blob is refused even under its own matching digest")
+    end = end + usize.ONE
+  }
+  let index = run WalkFragments.indexGraph(&restored)
+  let selected = match move run WalkFragments.rooted(&restored, &index, &[fixtureKey(3)]) {
+    Option<BuildRecord.Record>.Some {value} => move value
+    Option<BuildRecord.Record>.None => { run Testing.expect(false, "a view resolves its exact root") return () }
+  }
+  let selectedEntries = List<BuildRecord.Entry>.asSlice(&selected.entries)
+  run Testing.expect(selectedEntries.length == usize.ONE && selectedEntries[0].parent == usize.MAX
+    && selectedEntries[0].position == usize.ZERO && ContentHash.equals(selectedEntries[0].exact, fixtureKey(3)),
+    "an unrelated cyclic component is not part of the selected check or its resource budget")
+  run Testing.expect(match move run WalkFragments.rooted(&restored, &index, &[fixtureKey(77)]) {
+    Option<BuildRecord.Record>.None => true _ => false }, "an absent descriptor root cannot acquire an empty proof")
+  let changed = List<BuildRecord.Entry>.asMutSlice(&mut original.entries)
+  changed[2].facts.flags = BuildRecord.FACT_KNOWN + BuildRecord.FACT_SUMMARIZED + BuildRecord.FACT_KEY_BYTES
+  let malformed = run BuildRecord.normalizedGraphEncoding(&original)
+  run Testing.expect(match move run decodeGraph(Bytes.asSlice(&malformed), ContentHash.of(Bytes.asSlice(&malformed))) {
+    Option<BuildRecord.Record>.None => true _ => false }, "a graph without immutable boundary classification is not reusable")
+  let changedAgain = List<BuildRecord.Entry>.asMutSlice(&mut original.entries)
+  changedAgain[2].facts.flags = BuildRecord.FACT_KNOWN + BuildRecord.FACT_SUMMARIZED + BuildRecord.FACT_KEY_BYTES + BuildRecord.FACT_BOUNDARY_KEY
+  changedAgain[2].leaf = WalkFragments.EXTERNAL
+  run Testing.expect(match move run encodeGraph(&original) {
+    Option<Bytes>.None => true _ => false }, "an unresolved worker placeholder is never a persistent graph")
+}
+
+test effect fn escapeGraphDescriptorsAreBoundedAndUnambiguous() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run descriptorClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn sharedEscapeGraphAuthenticatesCompleteSelectiveViews() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run graphClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
