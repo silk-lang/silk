@@ -2084,6 +2084,9 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     sides: List<Option<Sender<Forwarded>>>,
     // How many jobs share one connection; see `muxStreams`.
     muxStreams: usize,
+    // The origins whose connections speak HTTP/1.1, which a worker connects to without other jobs
+    // waiting for its connection. It has room for every worker.
+    plain: List<Origin>,
   }
 
   // A job for a worker, and the request it belongs to.
@@ -2167,7 +2170,19 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
       let _sender = List<Option<Sender<Forwarded>>>.appendWithinCapacity(&mut sides, Option<Sender<Forwarded>>.some(move sender))
       let _receiver = List<Receiver<Forwarded>>.appendWithinCapacity(&mut sideQueues, move receiver)
     }
-    let state = run Shared<BatchState>.make(BatchState {pool: move pool, trust: move trust, resolved: List<ResolvedOrigin>.make(), mux: move mux, sides: move sides, muxStreams: muxStreams(workers)})
+    // The kept HTTP/1.1 connections tell which origins speak it.
+    let mut plain = List<Origin>.make()
+    run List<Origin>.reserveExact(&mut plain, workers)
+    let kept = List<Box<IdleConnection>>.asSlice(&pool)
+    index = usize.ZERO
+    while index < kept.length {
+      if !isHttp2Connection(&kept[index]) {
+        addPlain(&mut plain, Box<IdleConnection>.get(&kept[index])[usize.ZERO].origin)
+      }
+      index = index + usize.ONE
+    }
+    drop kept
+    let state = run Shared<BatchState>.make(BatchState {pool: move pool, trust: move trust, resolved: List<ResolvedOrigin>.make(), mux: move mux, sides: move sides, muxStreams: muxStreams(workers), plain: move plain})
     let mut queues = List<Sender<Indexed>>.make()
     run List<Sender<Indexed>>.reserveExact(&mut queues, workers)
     // The workers without a job.
@@ -2315,23 +2330,50 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     let mut idle = List<Box<IdleConnection>>.make()
     // Every job comes from one client, so the workers share its trust source.
     let mut trust = JobTrust.Batch {state: Shared<BatchState>.clone(&state)}
+    // The jobs that waited for a connection this worker opened, which it hands on before it takes
+    // new ones.
+    let mut backlog = List<Forwarded>.make()
     while true {
-      let Indexed {index, pending} = match run jobs.receive() {
-        Option.None => { break }
+      let mut next = Option<Forwarded>.none()
+      if List<Forwarded>.length(&backlog) > usize.ZERO {
+        next = Option<Forwarded>.some(List<Forwarded>.remove(&mut backlog, usize.ZERO))
+      } else {
+        let Indexed {index, pending} = match run jobs.receive() {
+          Option.None => { break }
+          Option.Some {value} => move value
+        }
+        next = Option<Forwarded>.some(Forwarded {owner: worker, index: index, pending: move pending})
+      }
+      let taken = match move next {
         Option.Some {value} => move value
+        Option.None => { break }
       }
       // A worker driving an HTTP/2 connection to the job's origin takes it when it has room.
-      let handed = forward(&state, Forwarded {owner: worker, index: index, pending: move pending})
+      let handed = forward(&state, move taken)
       let job = match move handed {
         Option.None => { continue }
         Option.Some {value} => move value
       }
       match Shared<BatchState>.withMut<Checkout>(&state, checkOut(&Box<PendingJob>.get(&job.pending)[usize.ZERO])) {
-        Checkout.Fresh => run plainJob(&state, &mut idle, &mut trust, plan, done, move job, Option<Box<IdleConnection>>.none())
+        Checkout.Fresh => {
+          let origin = Box<PendingJob>.get(&job.pending)[usize.ZERO].request.origin()
+          // Over TLS the connection may speak HTTP/2, so the next jobs to the origin wait for it
+          // rather than each opening one.
+          if Origin.secure(&origin) && Shared<BatchState>.withMut<bool>(&state, claimConnect(origin, worker)) {
+            run plainJob(&state, &mut idle, &mut trust, plan, done, move job, Option<Box<IdleConnection>>.none())
+            backlog = match move run Effect.result(takeWaiting(&state, side, worker)) {
+              Result.Success {value} => move value
+              Result.Failure {..} => Intrinsic.trap("sendAll: out of memory while handing on waiting jobs")
+            }
+          } else {
+            run plainJob(&state, &mut idle, &mut trust, plan, done, move job, Option<Box<IdleConnection>>.none())
+          }
+        }
         Checkout.Reuse {connection: open} => {
           if isHttp2Connection(&open) {
             // This worker drives the connection, and the jobs to its origin share it.
-            let left = run Effect.result(muxLoop(&state, jobs, side, done, worker, move open, move job))
+            let more = Intrinsic.replace(backlog, List<Forwarded>.make())
+            let left = run Effect.result(muxLoop(&state, jobs, side, done, worker, move open, move job, move more))
             let mut retry = match move left {
               Result.Success {value} => move value
               Result.Failure {..} => Intrinsic.trap("sendAll: out of memory while sharing an HTTP/2 connection")
@@ -2348,6 +2390,8 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
               run plainJob(&state, &mut idle, &mut trust, plan, done, move again, move kept)
             }
           } else {
+            let origin = Box<IdleConnection>.get(&open)[usize.ZERO].origin
+            Shared<BatchState>.withMut<()>(&state, markPlain(origin))
             run plainJob(&state, &mut idle, &mut trust, plan, done, move job, Option<Box<IdleConnection>>.some(move open))
           }
         }
@@ -2375,6 +2419,53 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     // The root task takes every result before it closes the queue, so the send succeeds.
     let sent = run done.send(Settled {worker: owner, index: index, outcome: move outcome})
     drop sent
+  }
+
+  // Registers `worker` as opening a connection to `origin`, so that the next jobs to the origin
+  // wait for it, unless the origin speaks HTTP/1.1.
+  fn claimConnect(state: &mut BatchState, origin: Origin, worker: usize) -> bool {
+    let plain = List<Origin>.asSlice(&state.plain)
+    let mut index = usize.ZERO
+    while index < plain.length {
+      if Origin.equals(&plain[index], &origin) { return false }
+      index = index + usize.ONE
+    }
+    muxRegister(&mut state.*, MuxEntry {origin: origin, worker: worker, active: usize.ONE, open: true})
+    return true
+  }
+
+  fn markPlain(state: &mut BatchState, origin: Origin) -> () {
+    addPlain(&mut state.plain, origin)
+  }
+
+  fn addPlain(plain: &mut List<Origin>, origin: Origin) -> () {
+    let known = List<Origin>.asSlice(&plain.*)
+    let mut index = usize.ZERO
+    while index < known.length {
+      if Origin.equals(&known[index], &origin) { return () }
+      index = index + usize.ONE
+    }
+    let _added = List<Origin>.appendWithinCapacity(&mut plain.*, origin)
+  }
+
+  // Ends the claim of `worker` once its own job is done, and returns the jobs that waited for its
+  // connection. The caller hands them on: the first takes the connection from the pool.
+  effect fn takeWaiting(state: &Shared<BatchState>, side: &Receiver<Forwarded>, worker: usize) -> List<Forwarded>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+    Shared<BatchState>.withMut<()>(&state.*, muxClose(worker))
+    Shared<BatchState>.withMut<()>(&state.*, muxDone(worker))
+    let mut waiting = List<Forwarded>.make()
+    while true {
+      if let TryReceive.Received {value} = side.tryReceive() {
+        Shared<BatchState>.withMut<()>(&state.*, muxDone(worker))
+        run List<Forwarded>.append(&mut waiting, move value)
+        continue
+      }
+      break
+    }
+    Shared<BatchState>.withMut<()>(&state.*, muxRemove(worker))
+    return move waiting
   }
 
   // Up to this many requests of `sendAll` share one HTTP/2 connection. Servers allow at least
@@ -2843,15 +2934,16 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     worker: usize,
     connection: Box<IdleConnection>,
     first: Forwarded,
+    more: List<Forwarded>,
   ) -> List<Forwarded>
   ! OutOfMemoryError
   ? &mut Allocator | &mut MonotonicClock | &mut Random {
     let mut link = move connection
     let origin = Box<IdleConnection>.get(&link)[usize.ZERO].origin
     let secure = Origin.secure(&origin)
-    Shared<BatchState>.withMut<()>(&state.*, muxRegister(MuxEntry {origin: origin, worker: worker, active: usize.ONE, open: true}))
+    Shared<BatchState>.withMut<()>(&state.*, muxRegister(MuxEntry {origin: origin, worker: worker, active: usize.ONE + List<Forwarded>.length(&more), open: true}))
     let mut streams = List<MuxStream>.make()
-    let mut waiting = List<Forwarded>.make()
+    let mut waiting = move more
     let mut retry = List<Forwarded>.make()
     let mut deferred = Option<Indexed>.none()
     let mut alive = true
