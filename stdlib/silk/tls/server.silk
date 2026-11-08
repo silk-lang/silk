@@ -215,6 +215,9 @@ const HANDSHAKE_INITIAL_BYTES: usize = 4096
 const SCRATCH_LENGTH: usize = 512
 
 const FLIGHT_OVERHEAD: usize = 2048
+// The sender room that every call which can queue a control record makes first: a KeyUpdate
+// message or an alert.
+const CONTROL_ROOM: usize = 32
 
 const TICKET_LIFETIME_LIMIT: usize = 604800
 
@@ -1183,7 +1186,7 @@ impl Server {
     let serverName = run allocateBytes(SERVER_NAME_LIMIT)
     let scratch = run allocateBytes(SCRATCH_LENGTH)
     let flight = run allocateBytes(chainLength + FLIGHT_OVERHEAD)
-    let application = run allocateBytes(RECORD_CONTENT_LIMIT)
+    let application = Intrinsic.rawBufferEmpty<u8>()
     let sender = run TlsRecordSender.makePlaintext()
     let receiver = run TlsRecordReceiver.makePlaintext()
 
@@ -1412,6 +1415,9 @@ impl Server {
     if self.inputEnded {
       return invalidState(ServerOperation.FeedInput)
     }
+    // After `releaseIdle`, buffers come back sized for this input and for a control answer.
+    run TlsRecordReceiver.reserve(&mut self.receiver, input.length)
+    run TlsRecordSender.reserve(&mut self.sender, CONTROL_ROOM)
     let fed = TlsRecordReceiver.feedInput(&mut self.receiver, input)
     let progress = match move fed {
       Result<InputProgress, RecordError>.Failure { error } => {
@@ -1471,6 +1477,11 @@ impl Server {
     return success(0, 0, demand(&mut self.*))
   }
 
+  /// Returns how many bytes of decrypted application data wait for [`Server.readPlaintext`].
+  pub fn plaintextAvailable(self: &Self) -> usize {
+    return self.applicationLength - self.applicationRead
+  }
+
   /// Copies decrypted application data into `output`. `written` in the result tells how many
   /// bytes.
   ///
@@ -1495,8 +1506,8 @@ impl Server {
       }
       let mut copied = usize.ZERO
       while copied < count {
-        // `start + copied < applicationLength <= RECORD_CONTENT_LIMIT`, the application buffer's
-        // capacity. `allocateBytes` zero-fills every buffer, so all bytes are initialized.
+        // `start + copied < applicationLength`, and `handleReadyRecord` sized the application
+        // buffer to hold `applicationLength` bytes and wrote all of them.
         output[copied] = unsafe RawBuffer.read<u8>(&self.application, start + copied)
         copied = copied + usize.ONE
       }
@@ -1504,6 +1515,7 @@ impl Server {
       if self.applicationRead == self.applicationLength {
         self.applicationRead = 0
         self.applicationLength = 0
+        self.application = Intrinsic.rawBufferEmpty<u8>()
         if self.truncationPending {
           return success(0, count, ServerDemand.PlaintextReady)
         }
@@ -1523,7 +1535,9 @@ impl Server {
   /// # Details
   /// When TLS output is waiting, the server accepts no bytes. Send that output first. Do not give
   /// accepted bytes again, even if the transport sent only part of the record.
-  pub fn writePlaintext(self: &mut Self, input: &[u8]) -> Result<ServerProgress, ServerError> {
+  pub effect fn writePlaintext(self: &mut Self, input: &[u8]) -> Result<ServerProgress, ServerError>
+    ! OutOfMemoryError
+    ? &mut Allocator {
     if let Option<ServerError>.Some { value: error } = self.terminal {
       return Result<ServerProgress, ServerError>.failResult(error)
     }
@@ -1539,6 +1553,11 @@ impl Server {
     if input.length == 0 {
       return success(0, 0, demand(&mut self.*))
     }
+    let mut room = input.length
+    if room < CONTROL_ROOM {
+      room = CONTROL_ROOM
+    }
+    run TlsRecordSender.reserve(&mut self.sender, room)
     let queued = TlsRecordSender.queueRecord(&mut self.sender, ContentType.ApplicationData, input)
     let accepted = match move queued {
       Result<OutputProgress, RecordError>.Failure { error } => {
@@ -1552,10 +1571,13 @@ impl Server {
 
   /// Asks for a new local traffic key before the next application write. More calls before that
   /// write do nothing.
-  pub fn requestKeyUpdate(self: &mut Self) -> Result<ServerProgress, ServerError> {
+  pub effect fn requestKeyUpdate(self: &mut Self) -> Result<ServerProgress, ServerError>
+    ! OutOfMemoryError
+    ? &mut Allocator {
     if let Option<ServerError>.Some { value: error } = self.terminal {
       return Result<ServerProgress, ServerError>.failResult(error)
     }
+    run TlsRecordSender.reserve(&mut self.sender, CONTROL_ROOM)
     // TLS 1.2 has no KeyUpdate message.
     if self.state != ServerState.Traffic || self.localCloseRequested || self.tls12 {
       return invalidState(ServerOperation.RequestKeyUpdate)
@@ -1570,10 +1592,13 @@ impl Server {
   }
 
   /// Queues `close_notify` after the accepted output. More calls do nothing.
-  pub fn closeWrite(self: &mut Self) -> Result<ServerProgress, ServerError> {
+  pub effect fn closeWrite(self: &mut Self) -> Result<ServerProgress, ServerError>
+    ! OutOfMemoryError
+    ? &mut Allocator {
     if let Option<ServerError>.Some { value: error } = self.terminal {
       return Result<ServerProgress, ServerError>.failResult(error)
     }
+    run TlsRecordSender.reserve(&mut self.sender, CONTROL_ROOM)
     if self.state != ServerState.Traffic {
       return invalidState(ServerOperation.CloseWrite)
     }
@@ -1582,6 +1607,43 @@ impl Server {
       return progressFailure(&mut self.*, error)
     }
     return success(0, 0, demand(&mut self.*))
+  }
+
+  /// Drops the record buffers while the connection is quiet, and returns whether it did. The calls
+  /// that need buffers make them again, sized for their record.
+  ///
+  /// # When to use
+  /// Call it after the transport took all of [`Server.pendingOutput`] and the plaintext was read,
+  /// for example when a keep-alive connection waits for its next request. A server with many idle
+  /// connections then holds no record buffers for them.
+  ///
+  /// # Details
+  /// It does nothing during the handshake, while output, plaintext, session tickets, a KeyUpdate
+  /// or part of a record is pending.
+  pub fn releaseIdle(self: &mut Self) -> bool {
+    if self.state != ServerState.Traffic || !self.completePublished || self.terminal.isSome() {
+      return false
+    }
+    if self.applicationLength > self.applicationRead || self.ticketsPending || self.pendingKeyUpdate
+      || self.respondingKeyUpdate || self.pendingKind != PendingKind.None {
+      return false
+    }
+    if (self.localCloseRequested && !self.localClosed) || TlsRecordSender.pendingOutput(&self.sender).length > 0 {
+      return false
+    }
+    if !TlsRecordReceiver.release(&mut self.receiver) || !TlsRecordSender.release(&mut self.sender) {
+      return false
+    }
+    // The handshake is over and its tickets were sent, so the flight and scratch buffers have no
+    // further use. The handshake buffer grows again for a post-handshake message.
+    self.flight = Intrinsic.rawBufferEmpty<u8>()
+    self.flightLength = 0
+    self.flightOffset = 0
+    self.scratch = Intrinsic.rawBufferEmpty<u8>()
+    if self.handshakeLength == 0 {
+      self.handshake = Intrinsic.rawBufferEmpty<u8>()
+    }
+    return true
   }
 
   /// Tells the server that the transport has no more input. Pending output stays pending.
@@ -1682,12 +1744,11 @@ fn nonzero(length: usize) -> usize {
 effect fn allocateBytes(length: usize) -> Intrinsic.RawBuffer<u8>
   ! OutOfMemoryError
   ? &mut Allocator {
-  let allocation = run Allocator.allocate(Layout { bytes: length, alignment: usize.ONE })
-
+  // Zeroed storage from the allocator: large buffers come as fresh pages that cost nothing until
+  // they are used, so an idle connection keeps only the pages it touched.
+  let allocation = run Allocator.allocateZeroed(Layout { bytes: length, alignment: usize.ONE })
   // The allocation was requested for `length` bytes with byte alignment.
-  let mut buffer = unsafe RawBuffer.from<u8>(move allocation, length)
-  RawBuffer.fill(&mut buffer, 0, length, 0)
-  return move buffer
+  return unsafe RawBuffer.from<u8>(move allocation, length)
 }
 
 fn limitError(kind: ServerLimitKind, limit: usize) -> Option<ServerError> {
@@ -2405,8 +2466,12 @@ effect fn handleReadyRecord(server: &mut Server) -> Result<(), ServerError>
       return countEmptyRecord(&mut server.*)
     }
 
-    // The record receiver admits at most `RECORD_CONTENT_LIMIT` content bytes, the application
-    // buffer's capacity. `allocateBytes` zero-fills every buffer, so all bytes are initialized.
+    // The application buffer holds one record's content, and lives only while that content waits.
+    if RawBuffer.count<u8>(&server.application) < contentLength {
+      server.application = run allocateBytes(contentLength)
+    }
+    // The buffer holds at least `contentLength` bytes, as made above. `allocateBytes` zero-fills
+    // every buffer, so all bytes are initialized.
     let destination = unsafe RawBuffer.viewMut<u8>(&mut server.application, 0, contentLength)
     let consumed = TlsRecordReceiver.consumeRecordInto(&mut server.receiver, move destination)
     if let Result<usize, RecordError>.Failure { error } = move consumed {

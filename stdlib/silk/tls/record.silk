@@ -10,8 +10,10 @@
 //! 1.2 key block, as after `change_cipher_spec`.
 //!
 //! # Details
-//! Each direction allocates fixed buffers one time, when you make it. Later calls do not allocate
-//! and do not keep your buffers. The sender holds at most one encoded record: write
+//! Each direction allocates full-size buffers when you make it, and later calls do not allocate
+//! and do not keep your buffers. A long-lived endpoint with many idle connections can drop the
+//! buffers with `release` while nothing is in flight, and get buffers sized for the next record
+//! with `reserve`. The sender holds at most one encoded record: write
 //! [`TlsRecordSender.pendingOutput`] to the transport, and then call [`TlsRecordSender.ackWritten`]
 //! with the number of bytes that the transport took. The receiver takes input in pieces with
 //! [`TlsRecordReceiver.feedInput`], and gives you one complete, authenticated record at a time. A
@@ -116,6 +118,9 @@ const CONTENT_LIMIT: usize = 16384
 const INNER_LIMIT: usize = 16385
 const WIRE_LIMIT: usize = 16645
 const ENCRYPTED_PAYLOAD_LIMIT: usize = 16640
+// The bytes a sent record takes beyond its content: the header, the explicit nonce of TLS 1.2,
+// the inner content type and the tag, with room to spare.
+const RECORD_OVERHEAD: usize = 261
 const TAG_LENGTH: usize = 16
 
 /// The maximum number of records that one traffic key protects. After it, install a new key, for
@@ -653,10 +658,13 @@ impl TlsRecordSender {
   /// Encodes one record with up to 16384 bytes of `content`, and returns how many bytes it took.
   ///
   /// If a record is still pending, it takes nothing and returns `NeedOutput`. It does not keep
-  /// `content`.
+  /// `content`. After [`TlsRecordSender.release`] or a small [`TlsRecordSender.reserve`], it takes
+  /// at most [`TlsRecordSender.room`] bytes.
   ///
   /// # Errors
   /// - `InvalidContent` for empty handshake content or an alert that is not 2 bytes.
+  /// - `InvalidState` if the buffers have no room, or too little for a whole alert or
+  ///   change-cipher-spec record.
   /// - `KeyUsageExhausted` if the key is used up.
   pub fn queueRecord(
     self: &mut Self,
@@ -673,6 +681,15 @@ impl TlsRecordSender {
     let mut accepted = content.length
     if accepted > CONTENT_LIMIT {
       accepted = CONTENT_LIMIT
+    }
+    // Released or small buffers take a prefix of handshake or application content. An alert or
+    // change-cipher-spec record is never split.
+    let room = senderRoom(&self)
+    if accepted > room {
+      if room == 0 || (contentType != ContentType.Handshake && contentType != ContentType.ApplicationData) {
+        return Result<OutputProgress, RecordError>.failResult(RecordError.InvalidState)
+      }
+      accepted = room
     }
     if self.protected {
       if self.sequence >= self.limit {
@@ -735,6 +752,57 @@ impl TlsRecordSender {
     }
     return Result<(), RecordError>.succeed(())
   }
+
+  /// Returns how many content bytes the next record can take with the buffers held now.
+  pub fn room(self: &Self) -> usize {
+    return senderRoom(&self)
+  }
+
+  /// Makes room for a record with `content` bytes, at most 16384. It allocates only when the
+  /// buffers held now are smaller, and never while a record is pending.
+  ///
+  /// # When to use
+  /// Call it after [`TlsRecordSender.release`], before the next [`TlsRecordSender.queueRecord`].
+  ///
+  /// # Errors
+  /// - `OutOfMemoryError` if the `Allocator` fails. The old buffers stay.
+  pub effect fn reserve(self: &mut Self, content: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut wanted = content
+    if wanted > CONTENT_LIMIT {
+      wanted = CONTENT_LIMIT
+    }
+    if senderRoom(&self) >= wanted || self.acknowledged < self.pendingLength {
+      return ()
+    }
+    self.pending = run allocateBytes(wanted + RECORD_OVERHEAD)
+    self.staging = run allocateBytes(wanted + 1)
+    return ()
+  }
+
+  /// Drops the buffers when no record is pending, and returns whether it did. Then
+  /// [`TlsRecordSender.queueRecord`] takes nothing until [`TlsRecordSender.reserve`].
+  pub fn release(self: &mut Self) -> bool {
+    if self.acknowledged < self.pendingLength {
+      return false
+    }
+    self.pending = Intrinsic.rawBufferEmpty<u8>()
+    self.staging = Intrinsic.rawBufferEmpty<u8>()
+    return true
+  }
+}
+
+// The content bytes that the sender's buffers can frame and protect in one record.
+fn senderRoom(sender: &TlsRecordSender) -> usize {
+  let staging = RawBuffer.count<u8>(&sender.staging)
+  let pending = RawBuffer.count<u8>(&sender.pending)
+  if staging == 0 || pending < RECORD_OVERHEAD {
+    return 0
+  }
+  let mut room = staging - 1
+  if room > pending - RECORD_OVERHEAD {
+    room = pending - RECORD_OVERHEAD
+  }
+  return room
 }
 
 /// The receive direction of a TLS record layer. It holds at most one complete record.
@@ -780,10 +848,15 @@ fn takeWire(receiver: &mut TlsRecordReceiver, input: &[u8], consumed: usize, unt
   if take > input.length - consumed {
     take = input.length - consumed
   }
-  if until > RawBuffer.count<u8>(&receiver.wire) {
-    return Intrinsic.trap("TlsRecordReceiver: a record is longer than the wire buffer")
+  // Released or small buffers take what fits; `reserve` makes room for the rest.
+  let capacity = RawBuffer.count<u8>(&receiver.wire)
+  if receiver.wireLength + take > capacity {
+    take = capacity - receiver.wireLength
   }
-  // `wireLength + take <= until`, which fits the wire buffer as checked above.
+  if take == 0 {
+    return consumed
+  }
+  // `wireLength + take <= capacity`, which fits the wire buffer as checked above.
   unsafe RawBuffer.copy<u8>(&mut receiver.wire, receiver.wireLength, Slice.view<u8>(input, consumed, take), take)
   receiver.wireLength = receiver.wireLength + take
   return consumed + take
@@ -1019,6 +1092,54 @@ impl TlsRecordReceiver {
       self.skipBudget = 0
     }
     return inputProgress(consumed, InputDemand.RecordReady)
+  }
+
+  /// Makes room for the current record, or for up to `available` bytes of a record whose header has
+  /// not arrived. It allocates only when the buffers held now are smaller, and keeps the bytes
+  /// received so far.
+  ///
+  /// # When to use
+  /// Call it after [`TlsRecordReceiver.release`], before each [`TlsRecordReceiver.feedInput`]. With
+  /// smaller buffers, `feedInput` takes only what fits.
+  ///
+  /// # Errors
+  /// - `OutOfMemoryError` if the `Allocator` fails. The old buffers stay.
+  pub effect fn reserve(self: &mut Self, available: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    if self.ready || self.terminal {
+      return ()
+    }
+    let mut wanted = self.expectedLength
+    if wanted == 0 {
+      wanted = self.wireLength + available
+      if wanted < HEADER_LENGTH + 1 {
+        wanted = HEADER_LENGTH + 1
+      }
+      if wanted > WIRE_LIMIT {
+        wanted = WIRE_LIMIT
+      }
+    }
+    if RawBuffer.count<u8>(&self.wire) >= wanted {
+      return ()
+    }
+    let mut wire = run allocateBytes(wanted)
+    let plaintext = run allocateBytes(wanted - HEADER_LENGTH)
+    // `wireLength` bytes of the old wire buffer were received, and `wireLength < wanted`.
+    let received = unsafe RawBuffer.view<u8>(&self.wire, 0, self.wireLength)
+    unsafe RawBuffer.copy<u8>(&mut wire, 0, received, self.wireLength)
+    self.wire = move wire
+    self.plaintext = move plaintext
+    return ()
+  }
+
+  /// Drops the buffers when no part of a record is held, and returns whether it did. Then
+  /// [`TlsRecordReceiver.feedInput`] takes nothing until [`TlsRecordReceiver.reserve`].
+  pub fn release(self: &mut Self) -> bool {
+    if self.wireLength != 0 || self.ready {
+      return false
+    }
+    self.wire = Intrinsic.rawBufferEmpty<u8>()
+    self.plaintext = Intrinsic.rawBufferEmpty<u8>()
+    return true
   }
 
   /// Returns the ready record, or `None` if no record is complete.

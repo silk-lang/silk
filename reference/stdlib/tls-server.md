@@ -2066,6 +2066,16 @@ pub fn ackWritten(self: &mut Self, count: usize) -> Result<ServerProgress, Serve
 
 Tells the server that the transport sent the first `count` bytes of [`Server.pendingOutput`](#Server.impl.pendingOutput).
 
+<a id="Server.impl.plaintextAvailable"></a>
+
+### Method `plaintextAvailable`
+
+```silk
+pub fn plaintextAvailable(self: &Self) -> usize
+```
+
+Returns how many bytes of decrypted application data wait for [`Server.readPlaintext`](#Server.impl.readPlaintext).
+
 <a id="Server.impl.readPlaintext"></a>
 
 ### Method `readPlaintext`
@@ -2085,7 +2095,9 @@ An empty `output` returns the `EmptyBuffer` error. It never means the end of inp
 ### Method `writePlaintext`
 
 ```silk
-pub fn writePlaintext(self: &mut Self, input: &[u8]) -> Result<ServerProgress, ServerError>
+pub effect fn writePlaintext(self: &mut Self, input: &[u8]) -> Result<ServerProgress, ServerError>
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Encrypts a prefix of `input`, at most 16384 bytes. `consumed` in the result tells how many
@@ -2100,7 +2112,9 @@ accepted bytes again, even if the transport sent only part of the record.
 ### Method `requestKeyUpdate`
 
 ```silk
-pub fn requestKeyUpdate(self: &mut Self) -> Result<ServerProgress, ServerError>
+pub effect fn requestKeyUpdate(self: &mut Self) -> Result<ServerProgress, ServerError>
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Asks for a new local traffic key before the next application write. More calls before that
@@ -2111,10 +2125,32 @@ write do nothing.
 ### Method `closeWrite`
 
 ```silk
-pub fn closeWrite(self: &mut Self) -> Result<ServerProgress, ServerError>
+pub effect fn closeWrite(self: &mut Self) -> Result<ServerProgress, ServerError>
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Queues `close_notify` after the accepted output. More calls do nothing.
+
+<a id="Server.impl.releaseIdle"></a>
+
+### Method `releaseIdle`
+
+```silk
+pub fn releaseIdle(self: &mut Self) -> bool
+```
+
+Drops the record buffers while the connection is quiet, and returns whether it did. The calls
+that need buffers make them again, sized for their record.
+
+#### When to use
+Call it after the transport took all of [`Server.pendingOutput`](#Server.impl.pendingOutput) and the plaintext was read,
+for example when a keep-alive connection waits for its next request. A server with many idle
+connections then holds no record buffers for them.
+
+#### Details
+It does nothing during the handshake, while output, plaintext, session tickets, a KeyUpdate
+or part of a record is pending.
 
 <a id="Server.impl.endInput"></a>
 

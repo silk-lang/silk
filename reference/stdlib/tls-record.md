@@ -14,8 +14,10 @@ messages. The `make` functions take a TLS 1.3 traffic secret and encrypt with th
 1.2 key block, as after `change_cipher_spec`.
 
 ## Details
-Each direction allocates fixed buffers one time, when you make it. Later calls do not allocate
-and do not keep your buffers. The sender holds at most one encoded record: write
+Each direction allocates full-size buffers when you make it, and later calls do not allocate
+and do not keep your buffers. A long-lived endpoint with many idle connections can drop the
+buffers with `release` while nothing is in flight, and get buffers sized for the next record
+with `reserve`. The sender holds at most one encoded record: write
 [`TlsRecordSender.pendingOutput`](#TlsRecordSender.impl.pendingOutput) to the transport, and then call [`TlsRecordSender.ackWritten`](#TlsRecordSender.impl.ackWritten)
 with the number of bytes that the transport took. The receiver takes input in pieces with
 [`TlsRecordReceiver.feedInput`](#TlsRecordReceiver.impl.feedInput), and gives you one complete, authenticated record at a time. A
@@ -997,10 +999,13 @@ pub fn queueRecord(
 Encodes one record with up to 16384 bytes of `content`, and returns how many bytes it took.
 
 If a record is still pending, it takes nothing and returns `NeedOutput`. It does not keep
-`content`.
+`content`. After [`TlsRecordSender.release`](#TlsRecordSender.impl.release) or a small [`TlsRecordSender.reserve`](#TlsRecordSender.impl.reserve), it takes
+at most [`TlsRecordSender.room`](#TlsRecordSender.impl.room) bytes.
 
 #### Errors
 - `InvalidContent` for empty handshake content or an alert that is not 2 bytes.
+- `InvalidState` if the buffers have no room, or too little for a whole alert or
+  change-cipher-spec record.
 - `KeyUsageExhausted` if the key is used up.
 
 <a id="TlsRecordSender.impl.pendingOutput"></a>
@@ -1050,6 +1055,44 @@ Marks the first `count` pending bytes as written.
 
 #### Errors
 - `InvalidAcknowledgment` if `count` is more than the pending bytes. Nothing changes.
+
+<a id="TlsRecordSender.impl.room"></a>
+
+### Method `room`
+
+```silk
+pub fn room(self: &Self) -> usize
+```
+
+Returns how many content bytes the next record can take with the buffers held now.
+
+<a id="TlsRecordSender.impl.reserve"></a>
+
+### Method `reserve`
+
+```silk
+pub effect fn reserve(self: &mut Self, content: usize) -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Makes room for a record with `content` bytes, at most 16384. It allocates only when the
+buffers held now are smaller, and never while a record is pending.
+
+#### When to use
+Call it after [`TlsRecordSender.release`](#TlsRecordSender.impl.release), before the next [`TlsRecordSender.queueRecord`](#TlsRecordSender.impl.queueRecord).
+
+#### Errors
+- `OutOfMemoryError` if the `Allocator` fails. The old buffers stay.
+
+<a id="TlsRecordSender.impl.release"></a>
+
+### Method `release`
+
+```silk
+pub fn release(self: &mut Self) -> bool
+```
+
+Drops the buffers when no record is pending, and returns whether it did. Then
+[`TlsRecordSender.queueRecord`](#TlsRecordSender.impl.queueRecord) takes nothing until [`TlsRecordSender.reserve`](#TlsRecordSender.impl.reserve).
 
 <a id="TlsRecordReceiver"></a>
 
@@ -1189,6 +1232,36 @@ is still accepted.
 #### Errors
 - `RecordOverflow`, `InvalidContent`, or `AuthenticationFailed` for a bad record. These errors
   are permanent.
+
+<a id="TlsRecordReceiver.impl.reserve"></a>
+
+### Method `reserve`
+
+```silk
+pub effect fn reserve(self: &mut Self, available: usize) -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Makes room for the current record, or for up to `available` bytes of a record whose header has
+not arrived. It allocates only when the buffers held now are smaller, and keeps the bytes
+received so far.
+
+#### When to use
+Call it after [`TlsRecordReceiver.release`](#TlsRecordReceiver.impl.release), before each [`TlsRecordReceiver.feedInput`](#TlsRecordReceiver.impl.feedInput). With
+smaller buffers, `feedInput` takes only what fits.
+
+#### Errors
+- `OutOfMemoryError` if the `Allocator` fails. The old buffers stay.
+
+<a id="TlsRecordReceiver.impl.release"></a>
+
+### Method `release`
+
+```silk
+pub fn release(self: &mut Self) -> bool
+```
+
+Drops the buffers when no part of a record is held, and returns whether it did. Then
+[`TlsRecordReceiver.feedInput`](#TlsRecordReceiver.impl.feedInput) takes nothing until [`TlsRecordReceiver.reserve`](#TlsRecordReceiver.impl.reserve).
 
 <a id="TlsRecordReceiver.impl.record"></a>
 
