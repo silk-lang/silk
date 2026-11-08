@@ -602,6 +602,10 @@ fn frontierExperiment() -> bool {
   return !Pointer.isNullMany<u8>(unsafe FrontierHost.environment(Pointer.fromSlice<u8>(b"SILK_EXPERIMENT_FRONTIER\0")))
 }
 
+fn ephemeralFrontier() -> bool {
+  return !Pointer.isNullMany<u8>(unsafe FrontierHost.environment(Pointer.fromSlice<u8>(b"SILK_FRONTIER_EPHEMERAL\0")))
+}
+
 fn frontierWarm() -> usize {
   let found = Pointer.nonNullMany<u8>(unsafe FrontierHost.environment(Pointer.fromSlice<u8>(b"SILK_FRONTIER_WARM\0")))
   if let Option<[*]const u8>.Some {value} = move found {
@@ -654,6 +658,52 @@ effect fn selectFrontier(pending: &mut List<BackendVisit>, origins: &mut List<Vi
       }
     }
   }
+}
+
+// The ephemeral wire carries exact check keys and answers only: no dependency graph, source
+// fingerprints, compressed persistence keys, or cache-adoption records. Root is used as the
+// existing key/answer carrier; its node is ignored and this image is never adopted or persisted.
+effect fn writeFrontierPayload(fd: i32, roots: &[CacheImage.Root]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut bytes = Bytes.make()
+  run RuntimeEncoding.word(&mut bytes, usize.toU64(roots.length))
+  let mut at = usize.ZERO
+  while at < roots.length {
+    run RuntimeEncoding.field(&mut bytes, Bytes.asSlice(&roots[at].key))
+    run RuntimeEncoding.field(&mut bytes, Bytes.asSlice(&roots[at].answer))
+    at = at + usize.ONE
+  }
+  let written = Bytes.asSlice(&bytes)
+  at = usize.ZERO
+  while at < written.length {
+    let count = unsafe FrontierHost.write(fd, Pointer.fromSlice<u8>(Slice.view<u8>(written, at, written.length - at)), written.length - at)
+    if count <= 0 { CompilerBug.panic(b"frontier payload write failed") }
+    at = at + isize.toUsize(count)
+  }
+}
+
+effect fn readFrontierPayload(fd: i32) -> CacheImage.Image ! OutOfMemoryError ? &mut Allocator {
+  let size = unsafe FrontierHost.seek(fd, 0, 2)
+  if size < 0 || size > 536870912 { return CacheImage.make() }
+  drop unsafe FrontierHost.seek(fd, 0, 0)
+  let mut bytes = run Bytes.zeroed(i64.toUsize(size))
+  if !frontierRead(fd, Bytes.asMutSlice(&mut bytes)) { return CacheImage.make() }
+  let written = Bytes.asSlice(&bytes)
+  let mut reader = StableKey.reader()
+  let count = StableKey.readWord(written, &mut reader)
+  if count > 500000 { return CacheImage.make() }
+  let mut image = CacheImage.make()
+  let mut at: u64 = 0
+  while at < count {
+    let key = StableKey.readField(written, &mut reader)
+    let answer = StableKey.readField(written, &mut reader)
+    if StableKey.failed(&reader) { return CacheImage.make() }
+    run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {
+      key: run Bytes.copy(Slice.view<u8>(written, key.start, key.end - key.start)),
+      answer: run Bytes.copy(Slice.view<u8>(written, answer.start, answer.end - answer.start)), node: usize.ZERO})
+    at = at + 1
+  }
+  if !StableKey.finished(written, &reader) { return CacheImage.make() }
+  return move image
 }
 
 effect fn writeWorkerImage(fd: i32, image: &CacheImage.Image) -> () ! OutOfMemoryError ? &mut Allocator {
@@ -3287,6 +3337,9 @@ pub struct Semantic {
   frontierKeyDigests: DigestSet,
   frontierControl: i32,
   frontierCoverage: List<FrontierCoverage>,
+  // Completed worker sweeps valid only for this immutable source/profile selection. These
+  // units carry no revision evidence and must never become persistent cache roots.
+  frontierSweepUnits: List<usize>,
   frontierExpected: usize,
   specializationBudget: SpecializationBudget,
   frontierClaims: Option<[*]mut u64>,
@@ -92902,6 +92955,7 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
     frontierKeyDigests: DigestSet.make(),
     frontierControl: -1,
     frontierCoverage: List<FrontierCoverage>.make(),
+    frontierSweepUnits: List<usize>.make(),
     frontierExpected: usize.ZERO,
     specializationBudget: SpecializationBudget.make(),
     frontierClaims: Option<[*]mut u64>.none(),
@@ -93099,6 +93153,7 @@ impl Semantic {
     if !self.resolver.revisable { CompilerBug.panic(b"cannot update a store opened for one revision") }
     SpecializationBudget.clear(&mut self.specializationBudget)
     self.frontierCoverage = List<FrontierCoverage>.make()
+    self.frontierSweepUnits = List<usize>.make()
     // Prepare every history append before SourceIndex publishes the new revision. Modules are
     // precisely this session's observed/interned set, not the project's declaration catalog.
     let mut observations = List<List<Observation>>.make()
@@ -93445,6 +93500,7 @@ impl Semantic {
   ? &mut Allocator | &mut Types {
     SpecializationBudget.clear(&mut self.specializationBudget)
     self.frontierCoverage = List<FrontierCoverage>.make()
+    self.frontierSweepUnits = List<usize>.make()
     self.resolver.assemblyFacts = Option<InitialProfile>.none()
     let candidate = match move profile {
       Option<FinalProfile>.Some {value} => move value
@@ -93992,6 +94048,7 @@ impl Semantic {
     while at < sweeps.length {
       let memo = &sweeps[at]
       at = at + usize.ONE
+      if holdsUnit(List<usize>.asSlice(&self.frontierSweepUnits), memo.unit) { continue }
       if List<Shared<BackendGap>>.length(&memo.sweep.gaps) > usize.ZERO
         || List<UncheckedDeclaration>.length(&memo.sweep.unchecked) > usize.ZERO
         || List<UncheckedBody>.length(&memo.unchecked) > usize.ZERO
@@ -94735,7 +94792,35 @@ impl Semantic {
     run frontierTrace(b"module task count", self.frontierSplit, self.frontierWorker, modulesRun)
     run frontierTrace(b"worker-total-owned-skipped", self.frontierSplit, self.frontierOwned, self.frontierSkipped)
     run frontierTrace(b"worker-modules", self.frontierSplit, self.frontierWorker, usize.ZERO)
-    let mut image = run Semantic.cacheImage(&mut self.*)
+    let mut image = CacheImage.make()
+    if ephemeralFrontier() {
+      let sweeps = List<ModuleCheckMemo>.asSlice(&self.moduleMemos)
+      let mut sweepAt = usize.ZERO
+      while sweepAt < sweeps.length {
+        let memo = &sweeps[sweepAt]
+        sweepAt = sweepAt + usize.ONE
+        if List<Shared<BackendGap>>.length(&memo.sweep.gaps) != usize.ZERO
+          || List<UncheckedDeclaration>.length(&memo.sweep.unchecked) != usize.ZERO
+          || List<UncheckedBody>.length(&memo.unchecked) != usize.ZERO { unsafe _exit(3) }
+        let mut sites = List<ModuleId>.make()
+        let answer = match move run reportingAnswer(0, List<DeclarationId>.asSlice(&memo.sweep.concrete),
+          List<Shared<Rejection>>.asSlice(&memo.sweep.rejections), List<DeferredStaticTemplate>.asSlice(&memo.deferred), &mut sites) {
+          Option<Bytes>.Some {value} => move value
+          Option<Bytes>.None => { unsafe _exit(3) return CompilerBug.panic(b"frontier sweep cannot be transported") }
+        }
+        let key = match move run stableUnit(&self.resolver, memo.unit) {
+          Option<Bytes>.Some {value} => move value
+          Option<Bytes>.None => { unsafe _exit(3) return CompilerBug.panic(b"frontier sweep has no stable key") }
+        }
+        let check = match move run readCheckKey(Bytes.asSlice(&key)) {
+          Option<CheckKey>.Some {value} => move value
+          Option<CheckKey>.None => { unsafe _exit(3) return CompilerBug.panic(b"frontier sweep has invalid stable key") }
+        }
+        // Import-check memos share this table; the parent checks imports itself.
+        if check.name != usize.ZERO || check.member != usize.ZERO { continue }
+        run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: move key, answer: move answer, node: usize.ZERO})
+      }
+    } else { image = run Semantic.cacheImage(&mut self.*) }
     // Persistence fitness may omit a valid ephemeral walk proof. Transport every completed
     // capture and its exact concrete coverage independently; the parent never adopts these roots.
     let mut retained = List<CacheImage.Root>.make()
@@ -94779,7 +94864,8 @@ impl Semantic {
       }
     }
     run frontierTrace(b"transport captures", self.frontierSplit, self.frontierWorker, memos.length)
-    run writeWorkerImage(unsafe FrontierHost.descriptor(self.frontierOutput), &image)
+    if ephemeralFrontier() { run writeFrontierPayload(unsafe FrontierHost.descriptor(self.frontierOutput), List<CacheImage.Root>.asSlice(&image.roots)) }
+    else { run writeWorkerImage(unsafe FrontierHost.descriptor(self.frontierOutput), &image) }
     run frontierTrace(b"worker-transport", self.frontierSplit, self.frontierWorker, List<CacheImage.Root>.length(&image.roots))
     drop unsafe FrontierHost.closeFile(self.frontierOutput)
     run Semantic.serveFrontier(&mut self.*, &mut request.*)
@@ -94795,6 +94881,7 @@ impl Semantic {
       _ => { return CompilerBug.panic(b"frontier walk has no stable unit") }
     }
     let mut merge = Merge.make()
+    let mut completedSweeps = List<ModuleCheckMemo>.make()
     let mut records = List<BuildRecord.Record>.make()
     let mut coverage = List<FrontierCoverage>.make()
     let mut recordKeys = ExactSet.make()
@@ -94811,7 +94898,8 @@ impl Semantic {
         continue
       }
       run frontierTrace(b"waited", self.frontierSplit, shard, usize.ZERO)
-      let image = run readWorkerImage(unsafe FrontierHost.descriptor(workers[shard].stream))
+      let image = if ephemeralFrontier() { run readFrontierPayload(unsafe FrontierHost.descriptor(workers[shard].stream)) }
+        else { run readWorkerImage(unsafe FrontierHost.descriptor(workers[shard].stream)) }
       let roots = List<CacheImage.Root>.asSlice(&image.roots)
       let mut selected = List<usize>.make()
       let mut at = usize.ZERO
@@ -94857,7 +94945,33 @@ impl Semantic {
               }
             }
           }
-          if !escaped { run List<usize>.append(&mut selected, at) }
+          if !escaped && ephemeralFrontier() {
+            let checked = match move run readCheckKey(key) {
+              Option<CheckKey>.Some {value} => move value
+              Option<CheckKey>.None => { good = false at = at + usize.ONE continue }
+            }
+            let answer = match move run readCheckAnswer(Bytes.asSlice(&root.answer), Option<&ModuleId>.some(&checked.module)) {
+              Option<CheckAnswer>.Some {value} => move value
+              Option<CheckAnswer>.None => { good = false at = at + usize.ONE continue }
+            }
+            if checked.name != usize.ZERO || checked.member != usize.ZERO || answer.kind != 0 {
+              good = false at = at + usize.ONE continue
+            }
+            let module = run internModule(&mut self.resolver, &checked.module)
+            let word = run internKey(&mut self.resolver, Key {family: Family.ModuleCheck, module: module, name: usize.ZERO,
+              declaration: usize.MAX, member: usize.ZERO, external: false})
+            let unit = u64.toUsize(word.value)
+            let exact = match move run stableUnit(&self.resolver, unit) {
+              Option<Bytes>.Some {value} => same(Bytes.asSlice(&value), key)
+              Option<Bytes>.None => false
+            }
+            if !exact { good = false at = at + usize.ONE continue }
+            let mut sweep = Sweep.make()
+            sweep.concrete = move answer.concrete
+            sweep.rejections = move answer.rejections
+            run List<ModuleCheckMemo>.append(&mut completedSweeps, ModuleCheckMemo {unit: unit, sweep: move sweep,
+              deferred: move answer.deferred, unchecked: List<UncheckedBody>.make()})
+          } else { if !escaped { run List<usize>.append(&mut selected, at) } }
         }
         at = at + usize.ONE
       }
@@ -94866,7 +94980,7 @@ impl Semantic {
         good = false
       }
       run frontierTrace(b"decoded", self.frontierSplit, shard, roots.length)
-      run Merge.add(&mut merge, &image, List<usize>.asSlice(&selected))
+      if !ephemeralFrontier() { run Merge.add(&mut merge, &image, List<usize>.asSlice(&selected)) }
       drop unsafe FrontierHost.closeFile(workers[shard].stream)
       shard = shard + usize.ONE
     }
@@ -94900,7 +95014,13 @@ impl Semantic {
         return false
       }
       run frontierTrace(b"proved", self.frontierSplit, usize.ZERO, usize.ZERO)
-      drop run Semantic.adoptImage(&mut self.*, request, Merge.finish(move merge), false)
+      if ephemeralFrontier() {
+        while let Option<ModuleCheckMemo>.Some {value: memo} = move List<ModuleCheckMemo>.pop(&mut completedSweeps) {
+          if memoOf(List<ModuleCheckMemo>.asSlice(&self.moduleMemos), memo.unit) != usize.MAX { continue }
+          run List<usize>.append(&mut self.frontierSweepUnits, memo.unit)
+          run List<ModuleCheckMemo>.append(&mut self.moduleMemos, move memo)
+        }
+      } else { drop run Semantic.adoptImage(&mut self.*, request, Merge.finish(move merge), false) }
       self.frontierCoverage = move coverage
       run frontierTrace(b"adopted", self.frontierSplit, usize.ZERO, usize.ZERO)
       drop unsafe FrontierHost.write(2, Pointer.fromSlice<u8>(b"frontier accepted\n"), 18)
@@ -94931,6 +95051,7 @@ impl Semantic {
     ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
     ? &mut Allocator | &mut Types {
     self.frontierCoverage = List<FrontierCoverage>.make()
+    self.frontierSweepUnits = List<usize>.make()
     let selected = Option<ModuleId>.some(ModuleId.copy(runtime))
     if !Graph.recording(&self.resolver.graph) {
       let mut started = List<ModuleId>.make()
@@ -95235,7 +95356,7 @@ impl Semantic {
     let unit = u64.toUsize(word.value)
     let found = memoOf(List<ModuleCheckMemo>.asSlice(&self.moduleMemos), unit)
     if found != usize.MAX {
-      if run Semantic.unitCurrent(&mut self.*, unit) { return found }
+      if holdsUnit(List<usize>.asSlice(&self.frontierSweepUnits), unit) || run Semantic.unitCurrent(&mut self.*, unit) { return found }
       drop List<ModuleCheckMemo>.remove(&mut self.moduleMemos, found)
       uncarry(&mut self.carriedUnits, &mut self.carriedRoots, unit)
     }
@@ -95395,12 +95516,13 @@ impl Semantic {
     if guard != usize.MAX {
       drop run Graph.finishRun(&mut self.resolver.graph, guard, Option<ContentHash>.none())
       run Graph.record(&mut self.resolver.graph, unit, Dependee.UnitResult {unit: guard})
-      // What a body that lowers to nothing reports, a replay of the record reports again.
-      if !capture.unreplayable && List<UncheckedDeclaration>.length(&result.unchecked) == usize.ZERO {
-        let mut resting = usize.MAX
-        if capture.guarded { resting = guard }
-        captured = run BuildCapture.finish(move capture, resting)
-      }
+    }
+    // Worker proof capture is independent from persistent dependency recording.
+    if (guard != usize.MAX || self.frontierWorker != usize.MAX) && !capture.unreplayable
+      && List<UncheckedDeclaration>.length(&result.unchecked) == usize.ZERO {
+      let mut resting = usize.MAX
+      if capture.guarded && Graph.recording(&self.resolver.graph) { resting = guard }
+      captured = run BuildCapture.finish(move capture, resting)
     }
     drop run Graph.finishRun(&mut self.resolver.graph, unit, Option<ContentHash>.none())
     // A walk that records nothing, as one that reports does, leaves the adopted record to the next
@@ -96377,7 +96499,7 @@ impl Semantic {
   ) -> DeclarationCheckResult
     ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
     ? &mut Allocator | &mut Types {
-    let capturing = guard != usize.MAX
+    let capturing = guard != usize.MAX || self.frontierWorker != usize.MAX
     let mut pending = List<BackendVisit>.make()
     let mut inheritedRemaining = usize.ZERO
     let mut inheritedOrdinal = usize.ZERO
@@ -96505,6 +96627,14 @@ impl Semantic {
             self.frontierWorker = shard
             self.frontierOutput = stream
             self.frontierControl = sockets[1]
+            if ephemeralFrontier() {
+              // Updates queue changed sources until reconciliation marks their dependent units.
+              run reconcileSources(&mut self.resolver)
+              if Graph.freeze(&mut self.resolver.graph) {
+                SourceIndex.freeze(&mut self.resolver.source)
+                run frontierTrace(b"worker-ephemeral", self.frontierSplit, shard, usize.ZERO)
+              } else { run frontierTrace(b"worker-retains-revision-evidence", self.frontierSplit, shard, usize.ZERO) }
+            }
             let shared = match &self.frontierClaims { Option<[*]mut u64>.Some {..} => true _ => false }
             if dynamicFrontier() && shared {
               inheritedRemaining = List<BackendVisit>.length(&pending)
