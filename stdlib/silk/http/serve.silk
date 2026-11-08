@@ -1,4 +1,4 @@
-//! A fast HTTP/1.1 server: write one handler function, and serve it on every core.
+//! A fast HTTP/1.1 and HTTP/2 server: write one handler function, and serve it on every core.
 //!
 //! # When to use
 //! Use this module to answer HTTP requests with little code and high throughput. Write a handler
@@ -17,6 +17,13 @@
 //! the connection, `Connection: close` header fields. A request with `Expect: 100-continue` gets
 //! `100 Continue` before its body is read. A `HEAD` request gets the head of the response, without
 //! the body.
+//!
+//! A connection that starts with the HTTP/2 client preface speaks HTTP/2 (RFC 9113): over HTTPS
+//! when the client picks `h2` with ALPN, and over plain TCP when the client knows the server speaks
+//! it. The handler sees the same [`Request`] and [`Response`] for both versions. Streams on one
+//! connection are answered as each request completes, and response bodies follow flow control.
+//! [`Request.minorVersion`] returns 1 for an HTTP/2 request, and [`Response.closeConnection`] has
+//! no effect on HTTP/2.
 //!
 //! The connection closes after the response when the request asks for it, or when the request is
 //! HTTP/1.0 without `Connection: keep-alive`. A request that the server cannot read gets an error
@@ -91,6 +98,12 @@ import silk.num.u16
 import silk.num.u64
 import silk.num.u8
 import silk.num.usize
+import silk.num.u32
+import silk.collections.bytes { Bytes }
+import silk.http.hpack { Field, Header }
+import silk.http.http2 { Connection as Http2Connection, Event as Http2Event, Limits as Http2Limits, Role as Http2Role }
+import silk.http.http2_frame as Http2Frame
+import silk.http.http2_frame { ProtocolError }
 
 /// The position of one header field in the head of a [`Request`].
 struct FieldSpan {
@@ -245,6 +258,10 @@ pub struct Response<'a> {
   sent: bool,
   close: bool,
   omitBody: bool,
+  // HTTP/2: `send` writes only the body and its length, and the connection frames the status
+  // and fields.
+  http2: bool,
+  bodyLength: usize,
 }
 
 impl<'a> Response<'a> {
@@ -295,6 +312,12 @@ impl<'a> Response<'a> {
     if self.sent { return () }
     self.sent = true
     let output = &mut self.output.*
+    if self.http2 {
+      self.bodyLength = body.length
+      let bodyless = self.code < 200 || self.code == 204 || self.code == 304
+      if !self.omitBody && !bodyless { run List.appendBytes(&mut output.*, body) }
+      return ()
+    }
     run List.reserve(&mut output.*, 96 + List.length(&self.fields.*) + body.length)
     run List.appendBytes(&mut output.*, b"HTTP/1.1 ")
     run appendStatusLine(&mut output.*, self.code)
@@ -473,8 +496,8 @@ impl Server {
   /// Serves `handler` over HTTPS with the certificate and key of `config`, until a worker fails.
   ///
   /// # Details
-  /// Each connection runs TLS 1.3 with `silk.tls.server` (through `silk.tls.server_protocol`), then HTTP/1.1 over it, as
-  /// [`Server.serve`] does. Load `config` with `TlsServerConfig.fromPem`.
+  /// Each connection runs TLS 1.3 with `silk.tls.server` (through `silk.tls.server_protocol`), then
+  /// HTTP/2 when the client picks `h2` with ALPN, or HTTP/1.1, as [`Server.serve`] does. Load `config` with `TlsServerConfig.fromPem`.
   ///
   /// # Errors
   /// The same as [`Server.serve`].
@@ -520,6 +543,7 @@ struct HttpState {
   date: [u8; 37],
   dateSecond: i64,
   continueSent: bool,
+  h2: Option<Http2Session>,
 }
 
 struct HttpProtocol<H> {
@@ -535,6 +559,7 @@ impl<H: Handler> Protocol<HttpState> for HttpProtocol<H> {
       date: [0; 37],
       dateSecond: -1,
       continueSent: false,
+      h2: Option<Http2Session>.none(),
     }
   }
 
@@ -545,6 +570,9 @@ impl<H: Handler> Protocol<HttpState> for HttpProtocol<H> {
     ended: bool,
     output: &mut List<u8>,
   ) -> Received ! OutOfMemoryError ? &mut Allocator {
+    if Option.isSome(&state.h2) || startsWithPreface(Slice.view<u8>(&input, 0, input.length)) {
+      return run receiveHttp2<H>(&self.*, &mut state.*, Slice.view<u8>(&input, 0, input.length), ended, &mut output.*)
+    }
     let mut consumed: usize = 0
     let total = input.length
     // The lists are freed between reads; take their usual size in one step instead of growing.
@@ -625,6 +653,8 @@ effect fn answerRequest<H: Handler>(handler: &H, state: &mut HttpState, message:
     sent: false,
     close: head.close,
     omitBody: head.isHead,
+    http2: false,
+    bodyLength: 0,
   }
   let outcome = run Effect.result(Handler.handle(handler, &request, &mut response))
   return match move outcome {
@@ -1189,3 +1219,366 @@ fn formatDate(seconds: i64, output: &mut [u8; 37]) -> () {
 }
 
 fn digit(value: i64) -> u8 { return i64.toU8(value) + 48 }
+
+// ---- HTTP/2 ----
+//
+// A connection that starts with the client preface speaks HTTP/2: the client chose `h2` with ALPN,
+// or knew that the server speaks it. Each request is rewritten as an HTTP/1.1 message, so
+// `parseRequest`, `Request` and the handler serve both versions; the response is sent as HEADERS
+// and DATA frames.
+
+// The HTTP/2 state of one connection.
+struct Http2Session {
+  connection: Http2Connection,
+  streams: List<Http2Stream>,
+  closing: bool,
+}
+
+// One open stream. Before its answer, `message` collects the request head rewritten as HTTP/1.1
+// and `body` its body. After it, `body` holds the response body, sent as flow control allows.
+struct Http2Stream {
+  id: u32,
+  message: List<u8>,
+  body: List<u8>,
+  answered: bool,
+  sent: usize,
+}
+
+// Whether `input` starts with the HTTP/2 client preface, or with as much of it as arrived.
+fn startsWithPreface(input: &[u8]) -> bool {
+  let preface = Http2Frame.preface()
+  let count = if input.length < preface.length { input.length } else { preface.length }
+  if count == 0 { return false }
+  return bytesEqual(Slice.view<u8>(input, 0, count), Slice.view<u8>(preface, 0, count))
+}
+
+effect fn receiveHttp2<H: Handler>(
+  protocol: &HttpProtocol<H>,
+  state: &mut HttpState,
+  input: &[u8],
+  ended: bool,
+  output: &mut List<u8>,
+) -> Received ! OutOfMemoryError ? &mut Allocator {
+  if Option.isNone(&state.h2) {
+    if input.length < Http2Frame.preface().length {
+      return Received { consumed: 0, verdict: Verdict.KeepOpen }
+    }
+    let made = run Effect.result(Http2Connection.make(Http2Role.Server, Http2Limits.defaults()))
+    let connection = match move made {
+      Result.Success { value } => move value
+      Result.Failure { error } => match move error {
+        ProtocolError failure => {
+          drop failure
+          return Received { consumed: input.length, verdict: Verdict.Close }
+        }
+        OutOfMemoryError failure => { fail move failure }
+      }
+    }
+    state.h2 = Option<Http2Session>.some(Http2Session {
+      connection: move connection,
+      streams: List<Http2Stream>.make(),
+      closing: false,
+    })
+  }
+  refreshDate(&mut state.*)
+  let mut verdict = Verdict.KeepOpen
+  if let Option.Some { value: session } = &mut state.h2 {
+    let served = run Effect.result(serveHttp2<H>(protocol, &mut state.fields, &mut state.responseFields, &state.date, &mut session, input))
+    match move served {
+      Result.Success { value } => { drop value }
+      Result.Failure { error } => match move error {
+        ProtocolError failure => {
+          drop failure
+          verdict = Verdict.Close
+        }
+        OutOfMemoryError failure => { fail move failure }
+      }
+    }
+    let wire = Http2Connection.output(&session.connection)
+    let count = wire.length
+    run List.appendSlice(&mut output.*, wire)
+    let consumed = run Effect.result(Http2Connection.consumeOutput(&mut session.connection, count))
+    drop consumed
+    if ended || (session.closing && List.length(&session.streams) == 0) { verdict = Verdict.Close }
+  }
+  return Received { consumed: input.length, verdict: verdict }
+}
+
+// Feeds `input` to the connection and answers each request that is complete.
+effect fn serveHttp2<H: Handler>(
+  protocol: &HttpProtocol<H>,
+  spans: &mut List<FieldSpan>,
+  responseFields: &mut List<u8>,
+  date: &[u8; 37],
+  session: &mut Http2Session,
+  input: &[u8],
+) -> () ! ProtocolError | OutOfMemoryError ? &mut Allocator {
+  let mut consumed: usize = 0
+  while true {
+    let progress = run Http2Connection.receive(&mut session.connection, Slice.view<u8>(input, consumed, input.length - consumed))
+    let used = progress.consumed
+    consumed = consumed + used
+    let event = move progress.event
+    match move event {
+      Http2Event.None => {
+        if used == 0 || consumed == input.length { break }
+      }
+      Http2Event.Headers { stream, fields, endStream } => {
+        let index = findStream(&session.*, stream)
+        if index == List.length(&session.streams) {
+          let mut message = List<u8>.make()
+          run rewriteHead(&mut message, &fields)
+          run List.append(&mut session.streams, Http2Stream {
+            id: stream,
+            message: move message,
+            body: List<u8>.make(),
+            answered: false,
+            sent: 0,
+          })
+        }
+        if endStream { run answerHttp2<H>(protocol, &mut spans.*, &mut responseFields.*, date, &mut session.*, stream) }
+      }
+      Http2Event.Data { stream, bytes, endStream } => {
+        let index = findStream(&session.*, stream)
+        let count = Bytes.length(&bytes)
+        if index < List.length(&session.streams) {
+          let open = &mut List.asMutSlice(&mut session.streams)[index]
+          run List.appendSlice(&mut open.body, Bytes.asSlice(&bytes))
+        }
+        if count > 0 { run Http2Connection.release(&mut session.connection, stream, usize.toU32(count)) }
+        if endStream { run answerHttp2<H>(protocol, &mut spans.*, &mut responseFields.*, date, &mut session.*, stream) }
+      }
+      Http2Event.Reset { stream, code } => {
+        drop code
+        let index = findStream(&session.*, stream)
+        if index < List.length(&session.streams) { drop List.remove(&mut session.streams, index) }
+      }
+      Http2Event.Goaway { lastStream, code, debug } => {
+        drop lastStream
+        drop code
+        session.closing = true
+      }
+      Http2Event.StreamError { stream, code } => {
+        drop code
+        let index = findStream(&session.*, stream)
+        if index < List.length(&session.streams) { drop List.remove(&mut session.streams, index) }
+      }
+      _ => {}
+    }
+  }
+  run sendBodies(&mut session.*)
+  return ()
+}
+
+fn findStream(session: &Http2Session, id: u32) -> usize {
+  let streams = List.asSlice(&session.streams)
+  let mut index: usize = 0
+  while index < streams.length {
+    if streams[index].id == id { return index }
+    index = index + 1
+  }
+  return index
+}
+
+// Writes the request head of the decoded `fields` as HTTP/1.1, without the blank line that ends it.
+effect fn rewriteHead(message: &mut List<u8>, fields: &List<Header>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let all = List.asSlice(fields)
+  let method = pseudoField(all, b":method")
+  let path = pseudoField(all, b":path")
+  let authority = pseudoField(all, b":authority")
+  run List.appendBytes(&mut message.*, method)
+  run List.appendBytes(&mut message.*, b" ")
+  if path.length == 0 { run List.appendBytes(&mut message.*, b"/") } else { run List.appendBytes(&mut message.*, path) }
+  run List.appendBytes(&mut message.*, b" HTTP/1.1\r\n")
+  if authority.length > 0 {
+    run List.appendBytes(&mut message.*, b"host: ")
+    run List.appendBytes(&mut message.*, authority)
+    run List.appendBytes(&mut message.*, b"\r\n")
+  }
+  let mut index: usize = 0
+  while index < all.length {
+    let name = Bytes.asSlice(&all[index].name)
+    if name.length > 0 && name[0] != 58 && !isReserved(name) && !sameIgnoringCase(name, b"host") {
+      run List.appendBytes(&mut message.*, name)
+      run List.appendBytes(&mut message.*, b": ")
+      run List.appendBytes(&mut message.*, Bytes.asSlice(&all[index].value))
+      run List.appendBytes(&mut message.*, b"\r\n")
+    }
+    index = index + 1
+  }
+  return ()
+}
+
+fn pseudoField<'a>(fields: &'a [Header], name: &[u8]) -> &'a [u8] {
+  let mut index: usize = 0
+  while index < fields.length {
+    if bytesEqual(Bytes.asSlice(&fields[index].name), name) { return Bytes.asSlice(&fields[index].value) }
+    index = index + 1
+  }
+  return b""
+}
+
+// Calls the handler for the complete request on stream `id` and queues its response.
+effect fn answerHttp2<H: Handler>(
+  protocol: &HttpProtocol<H>,
+  spans: &mut List<FieldSpan>,
+  responseFields: &mut List<u8>,
+  date: &[u8; 37],
+  session: &mut Http2Session,
+  id: u32,
+) -> () ! ProtocolError | OutOfMemoryError ? &mut Allocator {
+  let index = findStream(&session.*, id)
+  if index == List.length(&session.streams) { return () }
+  let stream = &mut List.asMutSlice(&mut session.streams)[index]
+  // Finish the rewritten message: its body length, the blank line, and the body.
+  run List.appendBytes(&mut stream.message, b"content-length: ")
+  run appendDecimal(&mut stream.message, usize.toU64(List.length(&stream.body)))
+  run List.appendBytes(&mut stream.message, b"\r\n\r\n")
+  run List.appendSlice(&mut stream.message, List.asSlice(&stream.body))
+  List.clear(&mut stream.body)
+  List.clear(&mut spans.*)
+  List.clear(&mut responseFields.*)
+  let message = List.asSlice(&stream.message)
+  let parsed = run parseRequest(message, &protocol.options, &mut spans.*)
+  let head = match parsed {
+    Parsed.Complete { head } => head
+    Parsed.Incomplete {..} => { return run respondHttp2(&mut session.*, index, 400, 0, &mut responseFields.*, date) }
+    Parsed.Invalid { status } => { return run respondHttp2(&mut session.*, index, status, 0, &mut responseFields.*, date) }
+  }
+  let request = Request {
+    head: message,
+    methodLength: head.methodLength,
+    targetStart: head.targetStart,
+    targetLength: head.targetLength,
+    pathLength: head.pathLength,
+    minor: head.minorVersion,
+    fields: List.asSlice(&spans.*),
+    bodyBytes: Slice.view<u8>(message, head.headLength, head.bodyLength),
+  }
+  let mut response = Response {
+    output: &mut stream.body,
+    fields: &mut responseFields.*,
+    date: &date.*,
+    code: 200,
+    sent: false,
+    close: false,
+    omitBody: head.isHead,
+    http2: true,
+    bodyLength: 0,
+  }
+  let outcome = run Effect.result(Handler.handle(&protocol.handler, &request, &mut response))
+  let mut code = response.code
+  let mut length: usize = 0
+  match move outcome {
+    Result.Success { value } => {
+      drop value
+      if !response.sent { run Response.send(&mut response, b"") }
+      length = response.bodyLength
+    }
+    Result.Failure { error } => {
+      drop error
+      code = 500
+      List.clear(&mut stream.body)
+      List.clear(&mut responseFields.*)
+    }
+  }
+  List.clearAndFree(&mut stream.message)
+  return run respondHttp2(&mut session.*, index, code, length, &mut responseFields.*, date)
+}
+
+// Queues HEADERS for the stream at `index`, with `code`, `contentLength`, the `Name: value\r\n`
+// lines of `responseFields` and `date`, then as much of its body in `body` as flow control allows.
+effect fn respondHttp2(
+  session: &mut Http2Session,
+  index: usize,
+  code: u16,
+  contentLength: usize,
+  responseFields: &mut List<u8>,
+  date: &[u8; 37],
+) -> () ! ProtocolError | OutOfMemoryError ? &mut Allocator {
+  let stream = &mut List.asMutSlice(&mut session.streams)[index]
+  let id = stream.id
+  let bodyLength = List.length(&stream.body)
+  let bodyless = code < 200 || code == 204 || code == 304
+  // One field block, `name: value\r\n` per field: the status and the date first, then the
+  // handler's fields and the body length.
+  let mut block = List<u8>.make()
+  run List.reserve(&mut block, 64 + List.length(&responseFields.*))
+  let status: [u8; 3] = [u16.toU8(code / 100) + 48, u16.toU8(code / 10 % 10) + 48, u16.toU8(code % 10) + 48]
+  run List.appendBytes(&mut block, b":status: ")
+  run List.appendBytes(&mut block, &status)
+  // `date` is `Date: <value>\r\n`.
+  run List.appendBytes(&mut block, b"\r\ndate: ")
+  run List.appendBytes(&mut block, Slice.view<u8>(date, 6, 31))
+  run List.appendBytes(&mut block, List.asSlice(&responseFields.*))
+  if !bodyless {
+    run List.appendBytes(&mut block, b"content-length: ")
+    run appendDecimal(&mut block, usize.toU64(contentLength))
+    run List.appendBytes(&mut block, b"\r\n")
+  }
+  // HTTP/2 field names are lowercase.
+  let lines = List.asMutSlice(&mut block)
+  let mut at: usize = 1
+  let mut inName = true
+  while at < lines.length {
+    let byte = lines[at]
+    if inName {
+      if byte == 58 { inName = false } else if byte >= 65 && byte <= 90 { lines[at] = byte + 32 }
+    } else if byte == 10 {
+      inName = true
+    }
+    at = at + 1
+  }
+  let text = List.asSlice(&block)
+  let mut fields = List<Field<'_>>.make()
+  let mut start: usize = 0
+  while start < text.length {
+    let mut colon = start + 1
+    while colon < text.length && text[colon] != 58 { colon = colon + 1 }
+    let mut end = colon
+    while end < text.length && text[end] != 13 { end = end + 1 }
+    if end >= text.length || colon + 2 > end { break }
+    run List.append(&mut fields, Field {
+      name: Slice.view<u8>(text, start, colon - start),
+      value: Slice.view<u8>(text, colon + 2, end - colon - 2),
+      sensitive: false,
+    })
+    start = end + 2
+  }
+  let empty = bodyless || bodyLength == 0
+  run Http2Connection.sendHeaders(&mut session.connection, id, List.asSlice(&fields), empty)
+  drop fields
+  if empty {
+    drop List.remove(&mut session.streams, index)
+    return ()
+  }
+  let open = &mut List.asMutSlice(&mut session.streams)[index]
+  open.answered = true
+  open.sent = 0
+  run sendBodies(&mut session.*)
+  return ()
+}
+
+// Queues as much of each answered stream's body as flow control and output space allow.
+effect fn sendBodies(session: &mut Http2Session) -> () ! ProtocolError | OutOfMemoryError ? &mut Allocator {
+  let mut index: usize = 0
+  while index < List.length(&session.streams) {
+    let stream = &mut List.asMutSlice(&mut session.streams)[index]
+    if stream.answered {
+      let total = List.length(&stream.body)
+      // Each call queues at most one frame.
+      while stream.sent < total {
+        let rest = Slice.view<u8>(List.asSlice(&stream.body), stream.sent, total - stream.sent)
+        let wrote = run Http2Connection.sendData(&mut session.connection, stream.id, rest, true)
+        if wrote == 0 { break }
+        stream.sent = stream.sent + wrote
+      }
+      if stream.sent == total {
+        drop List.remove(&mut session.streams, index)
+        continue
+      }
+    }
+    index = index + 1
+  }
+  return ()
+}

@@ -14,8 +14,9 @@ Use [`TlsProtocol`](#TlsProtocol) to run any `silk.net.tcp_server` protocol over
 Each connection runs one `silk.tls.server` [`Server`](./tls-server.md#Server): the handshake, the record layer,
 KeyUpdate and `close_notify` all come from it. The protocol decrypts the bytes that arrive and
 gives them to the inner protocol, and encrypts what the inner protocol writes. When the inner
-protocol closes the connection, it sends `close_notify` first. The server offers ALPN
-`http/1.1` without requiring it.
+protocol closes the connection, it sends `close_notify` first. The server offers ALPN `h2`, then
+`http/1.1`, without requiring either, so the inner protocol must speak both, as
+`silk.http.serve` does.
 
 The private key is an ECDSA P-256 or P-384 key, in a `PRIVATE KEY` (PKCS #8) or
 `EC PRIVATE KEY` (SEC 1) block.
