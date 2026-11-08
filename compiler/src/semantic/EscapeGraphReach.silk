@@ -1,0 +1,440 @@
+//! Views a shared escape graph through one module's roots without copying entry payloads.
+import semantic.BuildRecord
+import semantic.ContentHash {ContentHash}
+import semantic.DeclarationId {DeclarationId}
+import semantic.FiniteBudget {Budget}
+import semantic.StableKey
+import semantic.InternIndex {InternIndex}
+import semantic.WalkFragments
+import silk.collections.bytes {Bytes}
+import silk.collections.hash {Hash}
+import silk.collections.list {List}
+import silk.core.effect {Effect}
+import silk.core.option {Option}
+import silk.core.result {Result}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.u64
+import silk.num.usize
+import silk.testing.testing {AssertionError, Testing}
+
+// Lookup positions are positions in `ordered`, so the result doubles as the visited set.
+// Memory is proportional to the selected closure, not the entire shared graph.
+fn position(ordered: &[usize], lookup: &InternIndex, entry: usize) -> usize {
+  let mut at = InternIndex.first(lookup, usize.toU64(entry))
+  while at != usize.MAX {
+    if ordered[at] == entry { return at }
+    at = InternIndex.after(lookup, at)
+  }
+  return usize.MAX
+}
+fn visited(ordered: &[usize], lookup: &InternIndex, entry: usize) -> bool {
+  return position(ordered, lookup, entry) != usize.MAX
+}
+
+/// Returns distinct original entry indices in exactly `WalkFragments.rooted` visitation order:
+/// roots are pushed in their supplied order and popped last-first; references are visited in
+/// their listed order. Root identities must exist and agree with the indexed record. Every
+/// reached reference must be in bounds. Unreached entries are not inspected or copied.
+/// This is a reference-closure view, not an escape/admission/NonParking proof. The caller owns
+/// the decoded immutable graph, its matching index, and all boundary or proof decisions.
+pub effect fn reachable(record: &BuildRecord.Record, index: &WalkFragments.GraphIndex,
+  roots: &[ContentHash]) -> Option<List<usize>> ! OutOfMemoryError ? &mut Allocator {
+  let entries = List<BuildRecord.Entry>.asSlice(&record.entries)
+  let mut pending = List<usize>.make()
+  let mut at = usize.ZERO
+  while at < roots.length {
+    let entry = WalkFragments.graphEntry(index, roots[at])
+    if entry >= entries.length || !ContentHash.equals(entries[entry].exact, roots[at]) {
+      return Option<List<usize>>.none()
+    }
+    run List<usize>.append(&mut pending, entry)
+    at = at + usize.ONE
+  }
+  let mut ordered = List<usize>.make()
+  let mut lookup = InternIndex.make()
+  while let Option<usize>.Some {value: entry} = move List<usize>.pop(&mut pending) {
+    if entry >= entries.length { return Option<List<usize>>.none() }
+    if visited(List<usize>.asSlice(&ordered), &lookup, entry) { continue }
+    run List<usize>.append(&mut ordered, entry)
+    run InternIndex.record(&mut lookup, usize.toU64(entry))
+    let references = List<BuildRecord.Reference>.asSlice(&entries[entry].references)
+    at = references.length
+    while at > usize.ZERO {
+      at = at - usize.ONE
+      let target = references[at].target
+      if target >= entries.length { return Option<List<usize>>.none() }
+      if !visited(List<usize>.asSlice(&ordered), &lookup, target) {
+        run List<usize>.append(&mut pending, target)
+      }
+    }
+  }
+  return Option<List<usize>>.some(move ordered)
+}
+
+fn hashed(value: ContentHash) -> u64 { return Hash.combine(value.high, value.low) }
+
+/// Applies `WalkFragments.escapeFree` to a reference-closed view without copying its entries.
+/// Callback definitions and provider-free identities resolve only within `selected`; a clean
+/// global graph cannot supply a callback body that this module's descriptor never reaches.
+/// Selection indices must be distinct, valid, and include every selected entry's reference.
+pub effect fn escapeFree(record: &BuildRecord.Record, selected: &[usize]) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  let entries = List<BuildRecord.Entry>.asSlice(&record.entries)
+  let mut positions = InternIndex.make()
+  let mut keys = List<ContentHash>.make()
+  let mut owners = List<usize>.make()
+  let mut lookup = InternIndex.make()
+  let mut at = usize.ZERO
+  while at < selected.length {
+    let original = selected[at]
+    if original >= entries.length || visited(selected, &positions, original) { return false }
+    run InternIndex.record(&mut positions, usize.toU64(original))
+    let entry = &entries[original]
+    if entry.leaf == WalkFragments.EXTERNAL { return false }
+    if entry.leaf == 0 && u64.bitAnd(entry.facts.flags, BuildRecord.FACT_KNOWN + BuildRecord.FACT_SUMMARIZED)
+      != BuildRecord.FACT_KNOWN + BuildRecord.FACT_SUMMARIZED { return false }
+    run List<ContentHash>.append(&mut keys, entry.facts.definition)
+    run List<usize>.append(&mut owners, at)
+    run InternIndex.record(&mut lookup, hashed(entry.facts.definition))
+    if u64.bitAnd(entry.facts.flags, BuildRecord.FACT_BARE) != 0 {
+      run List<ContentHash>.append(&mut keys, entry.facts.bare)
+      run List<usize>.append(&mut owners, at)
+      run InternIndex.record(&mut lookup, hashed(entry.facts.bare))
+    }
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < selected.length {
+    let references = List<BuildRecord.Reference>.asSlice(&entries[selected[at]].references)
+    let mut reference = usize.ZERO
+    while reference < references.length {
+      let target = references[reference].target
+      if target >= entries.length || position(selected, &positions, target) == usize.MAX { return false }
+      reference = reference + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  let mut pending = List<usize>.make()
+  let mut queued = List<bool>.make()
+  run List<bool>.appendRepeated(&mut queued, false, selected.length)
+  at = usize.ZERO
+  while at < selected.length {
+    let callbacks = List<ContentHash>.asSlice(&entries[selected[at]].facts.callbacks)
+    let mut callback = usize.ZERO
+    while callback < callbacks.length {
+      let mut named = InternIndex.first(&lookup, hashed(callbacks[callback]))
+      let mut found = false
+      while named != usize.MAX {
+        if ContentHash.equals(List<ContentHash>.get(&keys, named), callbacks[callback]) {
+          let target = List<usize>.get(&owners, named)
+          found = true
+          if !List<bool>.get(&queued, target) {
+            List<bool>.set(&mut queued, target, true)
+            run List<usize>.append(&mut pending, target)
+          }
+        }
+        named = InternIndex.after(&lookup, named)
+      }
+      if !found { return false }
+      callback = callback + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  let mut head = usize.ZERO
+  while head < List<usize>.length(&pending) {
+    let target = List<usize>.get(&pending, head)
+    head = head + usize.ONE
+    let entry = &entries[selected[target]]
+    if entry.leaf == BuildRecord.LEFT { return false }
+    if u64.bitAnd(entry.facts.flags, BuildRecord.FACT_ESCAPES) != 0 { return false }
+    if entry.leaf == BuildRecord.FOREIGN { continue }
+    if u64.bitAnd(entry.facts.flags, BuildRecord.FACT_CALLEES) == 0 { return false }
+    let references = List<BuildRecord.Reference>.asSlice(&entry.references)
+    let callees = List<usize>.asSlice(&entry.facts.callees)
+    let mut callee = usize.ZERO
+    while callee < callees.length {
+      if callees[callee] >= references.length { return false }
+      let called = position(selected, &positions, references[callees[callee]].target)
+      if called == usize.MAX { return false }
+      if !List<bool>.get(&queued, called) {
+        List<bool>.set(&mut queued, called, true)
+        run List<usize>.append(&mut pending, called)
+      }
+      callee = callee + usize.ONE
+    }
+  }
+  return true
+}
+
+/// Charges only the selected definitions, preserving live-walk maximum reference/key costs.
+/// Any refusal or allocation failure restores the budget's preceding checkpoint.
+pub effect fn includeBudget(budget: &mut Budget, record: &BuildRecord.Record, selected: &[usize]) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  let saved = Budget.checkpoint(&mut budget.*)
+  let result = run Effect.result(includeBudgetEntries(&mut budget.*, record, selected))
+  return match move result {
+    Result<bool, OutOfMemoryError>.Success {value} => {
+      if value { Budget.commit(&mut budget.*, move saved) }
+      else { Budget.rollback(&mut budget.*, move saved) }
+      return value
+    }
+    Result<bool, OutOfMemoryError>.Failure {error} => {
+      Budget.rollback(&mut budget.*, move saved)
+      fail move error
+    }
+  }
+}
+
+effect fn includeBudgetEntries(budget: &mut Budget, record: &BuildRecord.Record, selected: &[usize]) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  let entries = List<BuildRecord.Entry>.asSlice(&record.entries)
+  let mut positions = InternIndex.make()
+  let mut at = usize.ZERO
+  while at < selected.length {
+    let original = selected[at]
+    if original >= entries.length || visited(selected, &positions, original) { return false }
+    run InternIndex.record(&mut positions, usize.toU64(original))
+    let entry = &entries[original]
+    if entry.alias == usize.MAX && entry.leaf == 0 {
+      if u64.bitAnd(entry.facts.flags, BuildRecord.FACT_KNOWN + BuildRecord.FACT_KEY_BYTES)
+        != BuildRecord.FACT_KNOWN + BuildRecord.FACT_KEY_BYTES { return false }
+      let referenceCount = List<BuildRecord.Reference>.length(&entry.references)
+      let mut included = false
+      if u64.bitAnd(entry.facts.flags, BuildRecord.FACT_APPLICATION) != 0 {
+        let mut reader = StableKey.reader()
+        match move run StableKey.readDeclaration(Bytes.asSlice(&entry.declaration), &mut reader) {
+          Option<DeclarationId>.Some {value} => {
+            included = run Budget.include(&mut budget.*, entry.facts.definition, Option<&DeclarationId>.some(&value),
+              entry.facts.keyBytes, referenceCount)
+          }
+          Option<DeclarationId>.None => { return false }
+        }
+      } else {
+        included = run Budget.include(&mut budget.*, entry.facts.definition, Option<&DeclarationId>.none(),
+          entry.facts.keyBytes, referenceCount)
+      }
+      if !included { return false }
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn key(value: u64) -> ContentHash { return ContentHash {high: 0, low: value} }
+effect fn example(id: u64, references: &[usize]) -> BuildRecord.Entry ! OutOfMemoryError ? &mut Allocator {
+  let mut edges = List<BuildRecord.Reference>.make()
+  let mut at = usize.ZERO
+  while at < references.length {
+    run List<BuildRecord.Reference>.append(&mut edges, BuildRecord.Reference {target: references[at], edge: key(0)})
+    at = at + usize.ONE
+  }
+  return BuildRecord.Entry {exact: key(id), hash: id, family: 0, declaration: Bytes.make(),
+    parent: usize.MAX, position: usize.ZERO, requested: false, alias: usize.MAX, leaf: 0,
+    references: move edges, summary: key(id), facts: BuildRecord.unknownFacts()}
+}
+
+fn absent(value: &Option<List<usize>>) -> bool {
+  return match &value.* { Option<List<usize>>.Some {..} => false _ => true }
+}
+
+test effect fn escapeGraphReachMatchesRootedOrderAndKeepsCyclesDistinct() -> ()
+! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run orderClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+effect fn orderClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut graph = BuildRecord.make(false, false)
+  run List<BuildRecord.Entry>.append(&mut graph.entries, run example(1, &[1, 2, 1]))
+  run List<BuildRecord.Entry>.append(&mut graph.entries, run example(2, &[0]))
+  run List<BuildRecord.Entry>.append(&mut graph.entries, run example(3, &[1]))
+  run List<BuildRecord.Entry>.append(&mut graph.entries, run example(4, &[]))
+  // This unrelated malformed entry must not force validation or payload copying.
+  run List<BuildRecord.Entry>.append(&mut graph.entries, run example(5, &[usize.MAX]))
+  let index = run WalkFragments.indexGraph(&graph)
+  let roots = [key(1), key(4)]
+  let selected = match move run reachable(&graph, &index, &roots) {
+    Option<List<usize>>.Some {value} => move value
+    _ => { run Testing.expect(false, "valid selected closure accepts") return () }
+  }
+  let order = List<usize>.asSlice(&selected)
+  run Testing.expect(order.length == 4 && order[0] == 3 && order[1] == 0 && order[2] == 1 && order[3] == 2,
+    "last root first and forward reference DFS match rooted, despite duplicate edges and cycles")
+  let materialized = match move run WalkFragments.rooted(&graph, &index, &roots) {
+    Option<BuildRecord.Record>.Some {value} => move value
+    _ => { run Testing.expect(false, "existing rooted accepts the same selected closure") return () }
+  }
+  let original = List<BuildRecord.Entry>.asSlice(&graph.entries)
+  let copied = List<BuildRecord.Entry>.asSlice(&materialized.entries)
+  run Testing.expect(copied.length == order.length, "view and materialized closure have equal sizes")
+  let mut at = usize.ZERO
+  while at < order.length {
+    run Testing.expect(ContentHash.equals(original[order[at]].exact, copied[at].exact),
+      "each view position names exactly the old rooted traversal's entry")
+    at = at + usize.ONE
+  }
+  let repeated = match move run reachable(&graph, &index, &[key(1), key(1)]) {
+    Option<List<usize>>.Some {value} => move value
+    _ => { run Testing.expect(false, "duplicate roots are permitted") return () }
+  }
+  run Testing.expect(List<usize>.length(&repeated) == 3, "duplicate roots do not duplicate reached entries")
+  return ()
+}
+
+test effect fn escapeGraphReachRejectsMissingRootsAndReachedBounds() -> ()
+! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run refusalClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+effect fn refusalClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut graph = BuildRecord.make(false, false)
+  run List<BuildRecord.Entry>.append(&mut graph.entries, run example(1, &[1]))
+  run List<BuildRecord.Entry>.append(&mut graph.entries, run example(2, &[2]))
+  let index = run WalkFragments.indexGraph(&graph)
+  let missing = run reachable(&graph, &index, &[key(9)])
+  run Testing.expect(absent(&missing), "a descriptor cannot silently lose an absent root")
+  let bounds = run reachable(&graph, &index, &[key(1)])
+  run Testing.expect(absent(&bounds), "invalid reachable references refuse without indexing out of bounds")
+  let empty = match move run reachable(&graph, &index, &[]) {
+    Option<List<usize>>.Some {value} => move value
+    _ => { run Testing.expect(false, "no roots selects no entries") return () }
+  }
+  run Testing.expect(List<usize>.length(&empty) == 0, "empty selection does not inspect unrelated malformed entries")
+  let mut unrelated = BuildRecord.make(false, false)
+  run List<BuildRecord.Entry>.append(&mut unrelated.entries, run example(9, &[]))
+  run List<BuildRecord.Entry>.append(&mut unrelated.entries, run example(1, &[]))
+  let wrongIndex = run WalkFragments.indexGraph(&unrelated)
+  let mismatch = run reachable(&graph, &wrongIndex, &[key(1)])
+  run Testing.expect(absent(&mismatch), "an index must identify the requested root in this record")
+  return ()
+}
+
+effect fn proofEntry(id: u64, targets: &[usize]) -> BuildRecord.Entry ! OutOfMemoryError ? &mut Allocator {
+  let mut entry = run example(id, targets)
+  entry.facts.definition = key(id)
+  entry.facts.flags = BuildRecord.FACT_KNOWN + BuildRecord.FACT_SUMMARIZED
+    + BuildRecord.FACT_CALLEES + BuildRecord.FACT_KEY_BYTES
+  entry.facts.keyBytes = 1
+  let mut at = usize.ZERO
+  while at < targets.length {
+    run List<usize>.append(&mut entry.facts.callees, at)
+    at = at + usize.ONE
+  }
+  return move entry
+}
+
+effect fn expectEscapeParity(graph: &BuildRecord.Record, roots: &[ContentHash], expected: bool) -> ()
+! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let index = run WalkFragments.indexGraph(graph)
+  let selected = match move run reachable(graph, &index, roots) {
+    Option<List<usize>>.Some {value} => move value
+    _ => { run Testing.expect(false, "escape fixture has a closed reference view") return () }
+  }
+  let materialized = match move run WalkFragments.rooted(graph, &index, roots) {
+    Option<BuildRecord.Record>.Some {value} => move value
+    _ => { run Testing.expect(false, "escape fixture also materializes") return () }
+  }
+  run Testing.expect((run escapeFree(graph, List<usize>.asSlice(&selected))) == expected
+    && (run WalkFragments.escapeFree(&materialized)) == expected,
+    "selected proof agrees with the existing rooted escape proof")
+}
+
+test effect fn escapeGraphReachProvesOnlySelectedCallbackBodies() -> ()
+! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run escapeClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+effect fn escapeClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut graph = BuildRecord.make(false, false)
+  run List<BuildRecord.Entry>.append(&mut graph.entries, run proofEntry(1, &[1, 2]))
+  run List<BuildRecord.Entry>.append(&mut graph.entries, run proofEntry(2, &[2]))
+  run List<BuildRecord.Entry>.append(&mut graph.entries, run proofEntry(3, &[]))
+  let entries = List<BuildRecord.Entry>.asMutSlice(&mut graph.entries)
+  run List<ContentHash>.append(&mut entries[0].facts.callbacks, key(20))
+  entries[1].facts.flags = entries[1].facts.flags + BuildRecord.FACT_BARE
+  entries[1].facts.bare = key(20)
+  run expectEscapeParity(&graph, &[key(1)], true)
+  let escaping = List<BuildRecord.Entry>.asMutSlice(&mut graph.entries)
+  escaping[2].facts.flags = escaping[2].facts.flags + BuildRecord.FACT_ESCAPES
+  run expectEscapeParity(&graph, &[key(1)], false)
+  let indirect = List<BuildRecord.Entry>.asMutSlice(&mut graph.entries)
+  List<usize>.clear(&mut indirect[1].facts.callees)
+  run expectEscapeParity(&graph, &[key(1)], true)
+  let left = List<BuildRecord.Entry>.asMutSlice(&mut graph.entries)
+  left[1].leaf = BuildRecord.LEFT
+  run expectEscapeParity(&graph, &[key(1)], false)
+  let foreign = List<BuildRecord.Entry>.asMutSlice(&mut graph.entries)
+  foreign[1].leaf = BuildRecord.FOREIGN
+  List<BuildRecord.Reference>.clear(&mut foreign[1].references)
+  run expectEscapeParity(&graph, &[key(1)], true)
+  let external = List<BuildRecord.Entry>.asMutSlice(&mut graph.entries)
+  external[1].leaf = WalkFragments.EXTERNAL
+  run expectEscapeParity(&graph, &[key(1)], false)
+  let missing = List<BuildRecord.Entry>.asMutSlice(&mut graph.entries)
+  missing[1].leaf = 0
+  missing[2].facts.flags = missing[2].facts.flags - BuildRecord.FACT_ESCAPES
+  List<BuildRecord.Reference>.clear(&mut missing[0].references)
+  run List<BuildRecord.Reference>.append(&mut missing[0].references, BuildRecord.Reference {target: 2, edge: key(0)})
+  List<usize>.clear(&mut missing[0].facts.callees)
+  run List<usize>.append(&mut missing[0].facts.callees, 0)
+  run Testing.expect(run WalkFragments.escapeFree(&graph), "the whole graph can see the unselected callback body")
+  run expectEscapeParity(&graph, &[key(1)], false)
+  run Testing.expect(!run escapeFree(&graph, &[0, 1]), "a reference outside the selected view is refused")
+  run Testing.expect(!run escapeFree(&graph, &[0, 1, 2, 2]), "duplicate selected rows are refused")
+  run Testing.expect(!run escapeFree(&graph, &[99]), "invalid selected indices are refused")
+  let restored = List<BuildRecord.Entry>.asMutSlice(&mut graph.entries)
+  run List<BuildRecord.Reference>.append(&mut restored[0].references, BuildRecord.Reference {target: 1, edge: key(0)})
+  run List<usize>.append(&mut restored[1].facts.callees, 99)
+  run expectEscapeParity(&graph, &[key(1)], false)
+  return ()
+}
+
+test effect fn escapeGraphReachBudgetChargesSelectedMaximaAndRollsBack() -> ()
+! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run budgetClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+effect fn budgetClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut graph = BuildRecord.make(false, false)
+  run List<BuildRecord.Entry>.append(&mut graph.entries, run proofEntry(1, &[0]))
+  run List<BuildRecord.Entry>.append(&mut graph.entries, run proofEntry(2, &[1]))
+  run List<BuildRecord.Entry>.append(&mut graph.entries, run proofEntry(3, &[2]))
+  let entries = List<BuildRecord.Entry>.asMutSlice(&mut graph.entries)
+  entries[0].facts.keyBytes = 3
+  entries[1].facts.keyBytes = 4
+  entries[2].facts.keyBytes = 100
+  let mut budget = Budget.withLimits(2, 2, 4, 10)
+  run Testing.expect(run includeBudget(&mut budget, &graph, &[0]), "unselected expensive definitions are never charged")
+  run Testing.expect(run includeBudget(&mut budget, &graph, &[0]), "the same selected definition is not charged twice")
+  run Testing.expect(Budget.definitionCount(&budget) == 1 && Budget.referenceCount(&budget) == 1
+    && Budget.runtimeBytes(&budget) == 3, "initial selected costs are exact")
+  let index = run WalkFragments.indexGraph(&graph)
+  let materialized = match move run WalkFragments.rooted(&graph, &index, &[key(1)]) {
+    Option<BuildRecord.Record>.Some {value} => move value
+    _ => { run Testing.expect(false, "budget fixture has a rooted counterpart") return () }
+  }
+  let mut oldBudget = Budget.withLimits(2, 2, 4, 10)
+  run Testing.expect((run WalkFragments.includeBudget(&mut oldBudget, &materialized))
+    && Budget.referenceCount(&oldBudget) == Budget.referenceCount(&budget)
+    && Budget.runtimeBytes(&oldBudget) == Budget.runtimeBytes(&budget), "view costs match materialized costs")
+  let larger = List<BuildRecord.Entry>.asMutSlice(&mut graph.entries)
+  larger[0].facts.keyBytes = 5
+  run List<BuildRecord.Reference>.append(&mut larger[0].references, BuildRecord.Reference {target: 0, edge: key(0)})
+  run Testing.expect(run includeBudget(&mut budget, &graph, &[0]), "larger variants update reference and key maxima")
+  let refused = List<BuildRecord.Entry>.asMutSlice(&mut graph.entries)
+  refused[0].facts.keyBytes = 7
+  run List<BuildRecord.Reference>.append(&mut refused[0].references, BuildRecord.Reference {target: 0, edge: key(0)})
+  run Testing.expect(!run includeBudget(&mut budget, &graph, &[0, 2]), "a later oversized selected row refuses the transaction")
+  run Testing.expect(!Budget.exhausted(&budget) && Budget.definitionCount(&budget) == 1
+    && Budget.referenceCount(&budget) == 2 && Budget.runtimeBytes(&budget) == 5,
+    "refusal rolls back both newly charged definitions and maxima on existing definitions")
+  run Testing.expect(run includeBudget(&mut budget, &graph, &[1]), "accepted work can continue after a refused view")
+  let tooMany = List<BuildRecord.Entry>.asMutSlice(&mut graph.entries)
+  run List<BuildRecord.Reference>.append(&mut tooMany[1].references, BuildRecord.Reference {target: 1, edge: key(0)})
+  run List<BuildRecord.Reference>.append(&mut tooMany[1].references, BuildRecord.Reference {target: 1, edge: key(0)})
+  run Testing.expect(!run includeBudget(&mut budget, &graph, &[1]), "reference maxima retain the existing reference limit")
+  run Testing.expect(!run includeBudget(&mut budget, &graph, &[99]), "invalid selection rolls back without indexing")
+  run Testing.expect(!Budget.exhausted(&budget) && Budget.definitionCount(&budget) == 2
+    && Budget.referenceCount(&budget) == 3 && Budget.runtimeBytes(&budget) == 9,
+    "all later refusals leave preceding accepted costs intact")
+  return ()
+}
