@@ -13,7 +13,7 @@ until it returns none. This module does not write archives and does not decompre
 The reader understands ustar, GNU, and pax archives: the ustar `prefix` field, GNU long names,
 pax `path` records, and base-256 sizes. It does not allocate, and every member it returns
 borrows the archive. Each header's checksum is checked. A member's path is checked before the
-member is returned: an absolute path, a backslash, or a `..` segment refuses the archive, so a
+member is returned: an absolute path, a backslash, a NUL, or a `..` segment refuses the archive, so a
 caller that joins a path to a directory and creates no links never writes outside it. Empty and
 `.` segments are allowed, because `tar -C dir .` writes paths such as `./include/x.h`.
 
@@ -92,7 +92,7 @@ an octal or base-256 number.
 UnsafePath
 ```
 
-A member path is absolute, holds a backslash, or has a `..` segment.
+A member path is absolute, holds a backslash or a NUL, or has a `..` segment.
 
 <a id="TarError.impl"></a>
 
@@ -158,7 +158,7 @@ A regular file. Its bytes are the member's `content`.
 Directory
 ```
 
-A directory. Its path has no trailing `/`, and it has no content.
+A directory. Its `name` has no trailing `/`, and it has no content.
 
 <a id="TarKind.SymbolicLink"></a>
 
@@ -168,7 +168,8 @@ A directory. Its path has no trailing `/`, and it has no content.
 SymbolicLink
 ```
 
-A symbolic link to `link`, which the reader does not check.
+A symbolic link to `link`, which the reader does not check. A target longer than the
+100-byte header field comes back cut to that field.
 
 <a id="TarKind.HardLink"></a>
 
@@ -178,7 +179,8 @@ A symbolic link to `link`, which the reader does not check.
 HardLink
 ```
 
-A hard link to the earlier member `link`, which the reader does not check.
+A hard link to the earlier member `link`, which the reader does not check. A target longer
+than the 100-byte header field comes back cut to that field.
 
 <a id="TarKind.Other"></a>
 
@@ -201,7 +203,8 @@ pub struct TarMember<'a>
 One member of a tar archive: its checked path, its kind, and its content.
 
 ### Details
-The member's path is `prefix/name`, or `name` alone when `prefix` is empty. A GNU long name or a
+The member's path is `prefix/name`, `name` alone when `prefix` is empty, or `prefix` alone when
+`name` is empty, as ustar writes a long directory path. A GNU long name or a
 pax `path` record comes back as `name` with an empty `prefix`. The slices borrow the archive
 given to [`TarReader.open`](#TarReader.impl.open).
 
@@ -253,7 +256,8 @@ Whether the member is a file whose mode has an execute permission bit.
 pub link: &'a [u8]
 ```
 
-The target of a symbolic or hard link, or empty.
+The target of a symbolic or hard link from the header's 100-byte link field, or empty. GNU
+long link names and pax `linkpath` records are not read.
 
 <a id="TarMember.content"></a>
 
@@ -314,7 +318,7 @@ the bytes. GNU long-name and pax headers are read as part of the member they nam
 #### Errors
 - [`TarError`](#TarError) with `Truncated` when the archive ends inside a header or a member,
   `BadHeader` when a checksum or number is invalid, and `UnsafePath` when the member's path
-  is absolute, holds a backslash, or has a `..` segment.
+  is absolute, holds a backslash or a NUL, or has a `..` segment.
 
 
 Category: Data formats.
