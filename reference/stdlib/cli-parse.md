@@ -23,7 +23,9 @@ Subcommands are the variants of a union, named in kebab case: a field marked wit
 
 The parser accepts `--name value`, `--name=value`, `-n value`, `-n5`, flags such as `--loud`,
 grouped one-letter flags such as `-abc`, positional arguments, and `--`, after which every
-argument is positional. `--help` and `-h` give
+argument is positional. An option that takes one value, or a flag, may be given once; a
+`List` field takes each occurrence. An unknown option names the closest option, when one is
+close. `--help` and `-h` give
 [`Parsed.Help`](#Parsed.Help), and `--version` gives [`Parsed.Version`](#Parsed.Version) when the command has a version.
 
 Import as `Cli` with `import silk.cli.parse { Cli }`.
@@ -59,6 +61,37 @@ pub token: String
 ```
 
 The argument as given.
+
+<a id="CliError.UnknownOption.suggestion"></a>
+
+#### Field `suggestion`
+
+```silk
+pub suggestion: string<'static>
+```
+
+The option whose name is closest to the argument, such as `--name` for `--nmae`, or empty
+when no name is close.
+
+<a id="CliError.Repeated"></a>
+
+### `Repeated`
+
+```silk
+Repeated
+```
+
+An option that takes one value, or a flag, is given more than once.
+
+<a id="CliError.Repeated.option"></a>
+
+#### Field `option`
+
+```silk
+pub option: string<'static>
+```
+
+The option, such as `--name`.
 
 <a id="CliError.MissingValue"></a>
 
