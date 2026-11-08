@@ -4,7 +4,7 @@
 
 RFC 7541 Appendix A static fields and Appendix B Huffman decoding trie.
 
-Public declarations: 4.
+Public declarations: 5.
 
 <a id="field"></a>
 
@@ -48,6 +48,19 @@ pub fn symbol(node: usize) -> usize
 
 Returns a byte symbol, 256 for EOS, or 257 for an internal node. The node must be a valid trie
 index.
+
+<a id="huffmanStep"></a>
+
+## `huffmanStep`
+
+```silk
+pub fn huffmanStep(state: usize, nibble: usize) -> u32
+```
+
+Decodes four Huffman input bits from decoder state `state`, which starts at 0. Bits 0 to 7 of
+the result hold the next state, bits 8 to 15 a decoded byte, bit 16 says the byte is present,
+bit 17 says the input decoded EOS, and bit 18 says the input may end in the next state. The
+state must come from an earlier result, and `nibble` must be below 16.
 
 
 Category: HTTP.
