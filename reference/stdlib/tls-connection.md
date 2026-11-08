@@ -242,7 +242,8 @@ You called [`OwnedConnection.shutdownWrite`](#OwnedConnection.impl.shutdownWrite
 Invalid
 ```
 
-A TLS or transport error occurred. Later I/O fails. Call [`OwnedConnection.close`](#OwnedConnection.impl.close).
+A TLS or transport error occurred, or an operation was cancelled. Later I/O fails. Call
+[`OwnedConnection.close`](#OwnedConnection.impl.close).
 
 <a id="ConnectionPhase.Closed"></a>
 
@@ -400,8 +401,9 @@ wait without a limit. Use [`OwnedConnection.readSome`](#OwnedConnection.impl.rea
 [`OwnedConnection.flush`](#OwnedConnection.impl.flush) for application data.
 
 ### Gotchas
-After an I/O error or a cancellation, the connection closes its transport, so that no partial
-buffer is sent again. [`OwnedConnection.shutdownWrite`](#OwnedConnection.impl.shutdownWrite) sends `close_notify` and closes the
+After an I/O error or a cancellation, the phase is `Invalid` and all later I/O fails, so that
+no partial record is sent again. The transport stays open until [`OwnedConnection.close`](#OwnedConnection.impl.close) or
+until the connection is dropped. [`OwnedConnection.shutdownWrite`](#OwnedConnection.impl.shutdownWrite) sends `close_notify` and closes the
 write direction. [`OwnedConnection.close`](#OwnedConnection.impl.close) closes at once, without `close_notify`. You must call
 [`OwnedConnection.close`](#OwnedConnection.impl.close) on a connection from [`authenticateOwned`](#authenticateOwned).
 

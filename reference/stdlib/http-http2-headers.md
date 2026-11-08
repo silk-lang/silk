@@ -6,7 +6,7 @@ HTTP/2 field validation for requests, responses, and trailers under RFC 9113 sec
 
 Import as `Message` with `import silk.http.http2_headers { Message }`.
 
-Public declarations: 3.
+Public declarations: 4.
 
 <a id="Section"></a>
 
@@ -124,6 +124,25 @@ pub effect<'call> fn validate<'call, 'data: 'call>(
 Validates one complete decoded field section. Violations are stream PROTOCOL_ERRORs. It rejects
 invalid bytes, pseudo-header order and duplicates, connection fields, and conflicting
 Content-Length values.
+
+<a id="validateExcept"></a>
+
+## `validateExcept`
+
+```silk
+pub effect<'call> fn validateExcept<'call, 'data: 'call>(
+  fields: &'call [Field<'data>],
+  section: Section,
+  stream: u32,
+  checked: &[u8]
+) -> Message
+  ! ProtocolError
+```
+
+Validates like [`validate`](#validate), except that an `:authority` equal to `checked` is not parsed
+again. Pass an authority that an earlier validation accepted, such as the one of the previous
+request on the connection. An empty `checked` matches nothing. A CONNECT request and a request
+with a `Host` field always have their authority parsed.
 
 
 Category: HTTP.

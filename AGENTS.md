@@ -44,9 +44,6 @@ behavior, data format, build artifact, or internal representation is a compatibi
   must change. Readers are agents upgrading their libraries, so give the concrete edit, such as
   "Import `List` from `silk.collections.list` instead of `Vector` from `silk.vector`." Leave it out otherwise;
   no section means no action is needed.
-- Never edit `compiler/borrow-check-gap.txt` by hand: after a corpus run, write it with
-  `node .github/scripts/check-borrow-gap.mjs update <corpus log>`, and put the table that
-  `check-borrow-gap.mjs diff <old> <new>` prints in the PR description.
 
 ## Minimal compiler privilege
 

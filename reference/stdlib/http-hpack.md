@@ -11,7 +11,7 @@ indexed fields and literal strings, with dynamic indexing only when the field is
 
 Import as `Decoder` with `import silk.http.hpack { Decoder }`.
 
-Public declarations: 5.
+Public declarations: 6.
 
 <a id="Field"></a>
 
@@ -167,6 +167,78 @@ effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &m
 
 Writes the fields, as `HpackError { offset: ..., limit: ... }`.
 
+<a id="FieldBlock"></a>
+
+## `FieldBlock`
+
+```silk
+pub struct FieldBlock
+```
+
+A decoded field block: every name and value in one buffer, in wire order.
+
+<a id="FieldBlock.impl"></a>
+
+## Implementation `FieldBlock`
+
+```silk
+impl FieldBlock
+```
+
+<a id="FieldBlock.impl.make"></a>
+
+### Associated function `make`
+
+```silk
+pub fn make() -> FieldBlock
+```
+
+Returns an empty block. It allocates nothing.
+
+<a id="FieldBlock.impl.length"></a>
+
+### Method `length`
+
+```silk
+pub fn length(self: &Self) -> usize
+```
+
+Returns the number of fields.
+
+<a id="FieldBlock.impl.field"></a>
+
+### Method `field`
+
+```silk
+pub fn field(self: &Self, index: usize) -> Field<'_>
+```
+
+Borrows field `index`, counted from 0 in wire order. Requires `index < length()`.
+
+<a id="FieldBlock.impl.views"></a>
+
+### Method `views`
+
+```silk
+pub effect fn views(self: &Self) -> List<Field<'_>>
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Borrows every field, in wire order.
+
+<a id="FieldBlock.impl.headers"></a>
+
+### Method `headers`
+
+```silk
+pub effect fn headers(self: &Self) -> List<Header>
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Copies every field into its own `Header`, in wire order.
+
 <a id="Decoder"></a>
 
 ## `Decoder`
@@ -218,6 +290,19 @@ pub effect fn decode(self: &mut Self, input: &[u8]) -> List<Header>
 ```
 
 Decodes one complete field block and updates the dynamic table.
+A failure invalidates the compression context; close its HTTP/2 connection.
+
+<a id="Decoder.impl.decodeBlock"></a>
+
+### Method `decodeBlock`
+
+```silk
+pub effect fn decodeBlock(self: &mut Self, input: &[u8]) -> FieldBlock
+    ! HpackError | OutOfMemoryError
+    ? &mut Allocator
+```
+
+Decodes one complete field block into a single buffer and updates the dynamic table.
 A failure invalidates the compression context; close its HTTP/2 connection.
 
 <a id="Encoder"></a>
