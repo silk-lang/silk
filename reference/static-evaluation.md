@@ -712,3 +712,40 @@ field initialized twice, by two entries or by a written initializer and an entry
 
 **Evidence:** static field initializer checker tests,
 [field-by-field construction corpus program](../corpus/native/static-field-initializers/main.silk).
+
+### STATIC-018 — A string literal can be a checked field name
+
+**Status:** Confirmed
+
+`Intrinsic.FieldName<Owner>` is the name of one field of `Owner`. A string literal written where
+one is expected must name a field of `Owner` that the literal's module can see, and the editor links
+the literal to that field. A library takes a field name where its caller names one of its own
+fields, such as the field a command line option fills, and reads its text with
+`Reflect.fieldNameText` or its descriptor with `Reflect.fieldNamed`.
+
+```silk
+import silk.core.reflect {Reflect}
+
+struct Flags {
+  pub verbose: bool,
+}
+
+static fn optionName<T>(name: Intrinsic.FieldName<T>) -> string<'static> {
+  return Reflect.fieldNameText<T>(name)
+}
+
+static fn verbose() -> string<'static> {
+  return optionName<Flags>("verbose")
+}
+```
+
+A literal is checked once its owner is a closed type, so inside a generic body that still names its
+own parameter, a field name passes through and is checked where the caller writes it.
+
+**Boundary:** A field name exists only in static code, like other reflection descriptors. Only a
+literal becomes a field name; computed text does not.
+
+**Diagnostics:** A literal that names no visible field of `Owner` reports `SEM0022` at the literal.
+A field name in a runtime signature or value reports `SEM0176`.
+
+**Evidence:** field name checker and editor table tests.

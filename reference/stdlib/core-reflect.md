@@ -257,6 +257,53 @@ pub fn main() -> i32 {
 }
 ```
 
+<a id="Reflect.impl.fieldNameText"></a>
+
+### Associated function `fieldNameText`
+
+```silk
+pub static fn fieldNameText<Owner>(name: Intrinsic.FieldName<Owner>) -> string<'static>
+```
+
+Returns the text of `name`, a field name of `Owner` that was checked where it was written.
+
+#### When to use
+
+Take an `Intrinsic.FieldName<Owner>` parameter where a library asks for the name of one of the
+caller's fields, such as the field a command line option fills. A string literal passed there
+must name a field of `Owner`, so a misspelled name is an error at the literal, and the editor
+links the literal to the field.
+
+#### Examples
+```silk
+import silk.core.reflect { Reflect }
+
+struct Flags {
+  pub verbose: bool,
+}
+
+static fn optionName<T>(name: Intrinsic.FieldName<T>) -> string<'static> {
+  return Reflect.fieldNameText<T>(name)
+}
+
+pub fn main() -> i32 {
+  static if optionName<Flags>("verbose") != "verbose" {
+    compileError("the name is its text")
+  }
+  return 0
+}
+```
+
+<a id="Reflect.impl.fieldNamed"></a>
+
+### Associated function `fieldNamed`
+
+```silk
+pub static fn fieldNamed<Owner, Value>(name: Intrinsic.FieldName<Owner>) -> Intrinsic.Field<Owner, Value>
+```
+
+Returns the descriptor of the field that `name` names, whose type must be `Value`.
+
 <a id="Reflect.impl.typeKind"></a>
 
 ### Associated function `typeKind`

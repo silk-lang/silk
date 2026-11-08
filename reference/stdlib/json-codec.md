@@ -16,7 +16,7 @@ strings, `Option<T>`, and `List<T>`. `Option<T>` is `null` when absent.
 A `Serialize` implementation for a struct usually writes an object with
 `silk.json.object.JsonObject`, or uses `silk.json.reflect.JsonReflect.write`. A `Deserialize`
 implementation reads tokens from a `JsonScanner` and calls [`JsonCodec.deserializeOne`](#JsonCodec.impl.deserializeOne) for each
-field, or uses `silk.json.reflect.JsonReflect.read`.
+field.
 
 ## Errors
 - `JsonError` when the JSON does not match the type, a number does not fit, or a float that is
@@ -187,7 +187,7 @@ standard library implements it for `bool`, the integer types, `f32`, `f64`, stri
 
 ### Details
 An implementation for a struct reads tokens from the `JsonScanner` and calls
-[`JsonCodec.deserializeOne`](#JsonCodec.impl.deserializeOne) for each field, or calls `silk.json.reflect.JsonReflect.read`.
+[`JsonCodec.deserializeOne`](#JsonCodec.impl.deserializeOne) for each field.
 
 ### Gotchas
 `deserialize` reads exactly one value and leaves the next token, such as `,` or `]`, for the
