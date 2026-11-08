@@ -304,6 +304,18 @@ pub static fn fieldNamed<Owner, Value>(name: Intrinsic.FieldName<Owner>) -> Intr
 
 Returns the descriptor of the field that `name` names, whose type must be `Value`.
 
+<a id="Reflect.impl.variantNameText"></a>
+
+### Associated function `variantNameText`
+
+```silk
+pub static fn variantNameText<Union>(name: Intrinsic.VariantName<Union>) -> string<'static>
+```
+
+Returns the text of `name`, a variant name of `Union` that the compiler checked where it was
+written. A string literal is an `Intrinsic.VariantName<Union>` when that type is expected, and
+a literal that names no variant of `Union` is a compile error at the literal.
+
 <a id="Reflect.impl.typeKind"></a>
 
 ### Associated function `typeKind`

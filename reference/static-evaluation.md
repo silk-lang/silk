@@ -742,10 +742,60 @@ static fn verbose() -> string<'static> {
 A literal is checked once its owner is a closed type, so inside a generic body that still names its
 own parameter, a field name passes through and is checked where the caller writes it.
 
+For a union, a field name names a field of any of its variants. `Intrinsic.VariantName<Union>` is
+the name of one variant, checked the same way and read with `Reflect.variantNameText`.
+
 **Boundary:** A field name exists only in static code, like other reflection descriptors. Only a
 literal becomes a field name; computed text does not.
 
-**Diagnostics:** A literal that names no visible field of `Owner` reports `SEM0022` at the literal.
+**Diagnostics:** A literal that names no visible field of `Owner`, or no variant of `Union`, reports
+`SEM0022` at the literal.
 A field name in a runtime signature or value reports `SEM0176`.
 
 **Evidence:** field name checker and editor table tests.
+
+### STATIC-019 — `Union.[variant] { ... }` builds the variant a static descriptor selects
+
+**Status:** Confirmed
+
+`Union.[variant] { ... }` is a variant literal whose variant is chosen by `variant`, a static
+`Intrinsic.Variant<Union>` descriptor, such as an element of `Reflect.variants<Union>()`. Its body
+is the body of a written variant literal: named field initializers, a `static for` over
+`Reflect.variantFields(variant)` whose `[field]: value` entries initialize the variant's fields
+(STATIC-017), or both. `Union` may be a type parameter, so a generic body builds whichever variant
+its caller selects.
+
+```silk
+import silk.core.reflect {Reflect}
+
+union Shape {
+  Dot,
+  Circle {pub radius: u32},
+}
+
+fn zero<U, V>(static field: Intrinsic.Field<U, V>) -> u32 {
+  return 0
+}
+
+fn build<U>(static variant: Intrinsic.Variant<U>) -> U {
+  return U.[variant] { static for field in Reflect.variantFields(variant) { [field]: zero(field) } }
+}
+
+fn shapes() -> u32 {
+  let mut count: u32 = 0
+  static for variant in Reflect.variants<Shape>() {
+    let shape = build<Shape>(variant)
+    drop shape
+    count = count + 1
+  }
+  return count
+}
+```
+
+**Boundary:** The literal is runtime code; a static body cannot build a variant this way.
+
+**Diagnostics:** A descriptor that is not a variant of `Union` reports `SEM0022` at the descriptor.
+A key that is not a field of the selected variant reports `SEM0022` at the key, and a field the
+literal leaves out reports `SEM0024`.
+
+**Evidence:** variant selector checker test, corpus program `static-variant-literals`.
