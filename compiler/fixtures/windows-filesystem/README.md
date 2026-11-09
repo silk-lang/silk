@@ -46,8 +46,10 @@ has compiled and executed on Server 2025. No security, Developer Mode, or antivi
   Eight-character staging names avoid generated DOS short-name aliases. A conservative ASCII
   case comparison prevents a staging name from aliasing the requested destination; it does
   not normalize user paths or cache keys. Only name collisions retry, at most 128 times.
-- Removal uses handle disposition with DELETE and POSIX flags. It does not set
-  IGNORE_READONLY_ATTRIBUTE. A successful disposition is followed by closing the deleting
+- Removal uses handle disposition with DELETE, POSIX and IGNORE_READONLY_ATTRIBUTE flags, so a
+  read-only file is removed as on Unix, where a file's mode never stops its removal (Git for
+  Windows writes its object files read-only). Atomic replacement still refuses a read-only
+  destination. A successful disposition is followed by closing the deleting
   handle. Existing handles to replaced/deleted objects remain valid.
 - Directory durability has no established implementation. `syncDirectory` and synchronized
   publication return `Unsupported`; the latter does so before creating a temporary file.

@@ -148,12 +148,39 @@ Returns an extended Windows host name as canonical WTF-8, without a NUL terminat
 
 `/C:/...` becomes `\\?\C:\...`; `/UNC/server/share/...` becomes `\\?\UNC\server\share\...`.
 The extended prefix preserves trailing dots/spaces and avoids Win32's legacy path-length
-normalization. Other arguments to a process must not be passed through this conversion.
+normalization. Some tools, such as Git, refuse extended names in their arguments; give those
+the normal name [`WindowsPath.toArgumentBytes`](#WindowsPath.impl.toArgumentBytes) returns.
 
 #### Errors
 
 - `FileError` with `InvalidPath` if the path lacks a volume, has invalid WTF-8, or contains
   a backslash or a colon outside its drive prefix.
+- `OutOfMemoryError` if the host name cannot be allocated.
+
+<a id="WindowsPath.impl.toArgumentBytes"></a>
+
+### Associated function `toArgumentBytes`
+
+```silk
+pub effect fn toArgumentBytes(path: &Path) -> Bytes ! FileError | OutOfMemoryError ? &mut Allocator
+```
+
+Returns the normal Win32 name of `path`, as canonical WTF-8 without a NUL terminator, for a
+process argument or an environment value.
+
+#### Details
+
+`/C:/...` becomes `C:\...` and `/UNC/server/share/...` becomes `\\server\share\...`, the
+spelling a user types. Some tools, such as Git, refuse the extended
+`\\?\` names [`WindowsPath.toNativeBytes`](#WindowsPath.impl.toNativeBytes) returns. Win32 rewrites some normal names, so a
+path that would name another file is refused instead: a component that ends in a dot or a
+space, or a reserved device name such as `NUL` or `COM1.txt`. A name longer than 259 units
+works only with a tool that accepts long paths.
+
+#### Errors
+
+- `FileError` with `InvalidPath` if the path lacks a volume, has invalid WTF-8, contains a
+  backslash or a colon outside its drive prefix, or has a component Win32 would rewrite.
 - `OutOfMemoryError` if the host name cannot be allocated.
 
 

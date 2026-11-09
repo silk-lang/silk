@@ -177,8 +177,8 @@ pub effect fn command(root: &[u8], path: &[u8], command: i32, operation: i32) ->
 ```
 
 Creates a directory (0), removes a file or link (1), or removes an empty directory (2).
-Intermediate links resolve inside the root. Removal acts on the opened final object, preserves
-read-only attributes, and never follows a final link. Unsupported reparse tags or filesystem
+Intermediate links resolve inside the root. Removal acts on the opened final object, removes
+it even when it has the read-only attribute, and never follows a final link. Unsupported reparse tags or filesystem
 semantics produce `FileError` with reason `Unsupported`.
 
 <a id="WindowsFileSystem.impl.openDirectory"></a>
