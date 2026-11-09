@@ -1,0 +1,213 @@
+//! Authenticated resource directories and bounded retirement work for cache generations.
+//! This metadata names links, not filesystem ownership: the publication actor verifies catalogs,
+//! holds generation pins, commits completed unlink progress, and accounts for surviving hardlinks.
+
+import lexer.Span {Span}
+import semantic.ContentHash {ContentHash}
+import semantic.RuntimeEncoding as Encoding
+import semantic.StableKey
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.core.option {Option}
+import silk.core.ownership {Copy}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.u64
+import silk.num.usize
+
+/// One content-addressed resource and its declared payload size. This size is not reclaim credit:
+/// another generation may retain a hardlink to the same inode after this link is removed.
+pub struct Resource {pub digest: ContentHash, pub bytes: u64}
+impl Copy for Resource {}
+
+/// An unpublished directory nonce, exact generation packet and ordered resource rosters.
+/// Segment and pack digest namespaces are distinct; each roster must be unique within its kind.
+pub struct Draft {
+  pub directory: ContentHash,
+  pub generation: Bytes,
+  pub segments: List<Resource>,
+  pub packs: List<Resource>,
+}
+
+/// A validated packet whose resource lists and generation bytes cannot be changed by callers.
+pub struct Inventory {
+  packet: Bytes,
+  digest: ContentHash,
+  directoryId: ContentHash,
+  generationSpan: Span,
+  segmentList: List<Resource>,
+  packList: List<Resource>,
+}
+
+/// The resource namespace of a link in one generation directory.
+pub union Kind {Segment, Pack}
+impl Copy for Kind {}
+/// One resource link, with its namespace preserved even when digests coincide across kinds.
+pub struct Item {pub kind: Kind, pub resource: Resource}
+impl Copy for Item {}
+/// The next link ordinal in one retained inventory; the filesystem actor owns its association.
+pub struct Cursor {pub next: usize}
+impl Copy for Cursor {}
+/// A half-open link range. Obtaining a batch does not advance the caller's committed cursor.
+pub struct Batch {pub start: usize, pub end: usize, pub done: bool}
+impl Copy for Batch {}
+
+const MAX_GENERATION: usize = 16777216
+const MAX_SEGMENTS: usize = 256
+const MAX_PACKS: usize = 131072
+const MAX_PACKET: usize = 20971520
+
+fn greater(left: ContentHash, right: ContentHash) -> bool {
+  return left.high > right.high || (left.high == right.high && left.low > right.low)
+}
+fn swap(values: &mut [ContentHash], one: usize, two: usize) -> () {
+  let previous = values[one]
+  values[one] = values[two]
+  values[two] = previous
+}
+fn sift(values: &mut [ContentHash], start: usize, count: usize) -> () {
+  let mut parent = start
+  while parent < count / 2 {
+    let mut child = parent * 2 + usize.ONE
+    if child + usize.ONE < count && greater(values[child + usize.ONE], values[child]) { child = child + usize.ONE }
+    if !greater(values[child], values[parent]) { return () }
+    swap(&mut values.*, parent, child)
+    parent = child
+  }
+}
+// Sorting an independent digest index preserves authored roster order and bounds adversarial work.
+effect fn unique(resources: &[Resource]) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut hashes = run List<ContentHash>.makeWithCapacity(resources.length)
+  let mut at = usize.ZERO
+  while at < resources.length {
+    run List<ContentHash>.append(&mut hashes, resources[at].digest)
+    at = at + usize.ONE
+  }
+  let mut values = List<ContentHash>.asMutSlice(&mut hashes)
+  let mut heapAt = values.length / 2
+  while heapAt > usize.ZERO { heapAt = heapAt - usize.ONE sift(&mut values, heapAt, values.length) }
+  let mut count = values.length
+  while count > usize.ONE {
+    count = count - usize.ONE
+    swap(&mut values, usize.ZERO, count)
+    sift(&mut values, usize.ZERO, count)
+  }
+  at = usize.ONE
+  while at < values.length {
+    if ContentHash.equals(values[at - usize.ONE], values[at]) { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+effect fn pair(output: &mut Bytes, value: ContentHash) -> () ! OutOfMemoryError ? &mut Allocator {
+  run Encoding.word(&mut output.*, value.high)
+  return run Encoding.word(&mut output.*, value.low)
+}
+fn readPair(bytes: &[u8], reader: &mut StableKey.Reader) -> ContentHash {
+  let high = StableKey.readWord(bytes, &mut reader.*)
+  let low = StableKey.readWord(bytes, &mut reader.*)
+  return ContentHash {high: high, low: low}
+}
+effect fn writeResources(output: &mut Bytes, values: &[Resource]) -> () ! OutOfMemoryError ? &mut Allocator {
+  run Encoding.word(&mut output.*, usize.toU64(values.length))
+  let mut at = usize.ZERO
+  while at < values.length {
+    run pair(&mut output.*, values[at].digest)
+    run Encoding.word(&mut output.*, values[at].bytes)
+    at = at + usize.ONE
+  }
+}
+effect fn readResources(bytes: &[u8], reader: &mut StableKey.Reader, maximum: usize) -> Option<List<Resource>>
+! OutOfMemoryError ? &mut Allocator {
+  let count = StableKey.readWord(bytes, &mut reader.*)
+  if StableKey.failed(reader) || count > usize.toU64(maximum)
+    || count > usize.toU64((bytes.length - StableKey.offset(reader)) / 24) { return Option<List<Resource>>.none() }
+  let mut values = run List<Resource>.makeWithCapacity(u64.toUsize(count))
+  let mut at: u64 = 0
+  while at < count {
+    let digest = readPair(bytes, &mut reader.*)
+    let size = StableKey.readWord(bytes, &mut reader.*)
+    run List<Resource>.append(&mut values, Resource {digest: digest, bytes: size})
+    at = at + 1
+  }
+  if StableKey.failed(reader) || !(run unique(List<Resource>.asSlice(&values))) { return Option<List<Resource>>.none() }
+  return Option<List<Resource>>.some(move values)
+}
+
+/// Encodes bounded, unique resource metadata. The caller still validates its generation catalog
+/// and selected pack requirements; this codec does not read resource payloads or derive liveness.
+pub effect fn encode(draft: &Draft) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+  let segments = List<Resource>.asSlice(&draft.segments)
+  let packs = List<Resource>.asSlice(&draft.packs)
+  if Bytes.length(&draft.generation) > MAX_GENERATION || segments.length > MAX_SEGMENTS || packs.length > MAX_PACKS {
+    return Option<Bytes>.none()
+  }
+  if !(run unique(segments)) || !(run unique(packs)) { return Option<Bytes>.none() }
+  let mut output = Bytes.make()
+  run Encoding.field(&mut output, b"silk-cache-inventory-v1")
+  run pair(&mut output, draft.directory)
+  run Encoding.field(&mut output, Bytes.asSlice(&draft.generation))
+  run writeResources(&mut output, segments)
+  run writeResources(&mut output, packs)
+  if Bytes.length(&output) > MAX_PACKET { return Option<Bytes>.none() }
+  return Option<Bytes>.some(move output)
+}
+
+/// Authenticates the complete packet against its physical descriptor identity, then validates
+/// framing, bounds and uniqueness transactionally. Malformed packets publish no inventory.
+pub effect fn open(packet: Bytes, expectedFullPacketDigest: ContentHash) -> Option<Inventory>
+! OutOfMemoryError ? &mut Allocator {
+  let bytes = Bytes.asSlice(&packet)
+  if bytes.length > MAX_PACKET || !ContentHash.equals(ContentHash.of(bytes), expectedFullPacketDigest) {
+    return Option<Inventory>.none()
+  }
+  let mut reader = StableKey.reader()
+  let magic = StableKey.readField(bytes, &mut reader)
+  if StableKey.failed(&reader) || !Encoding.equals(StableKey.view(bytes, magic), b"silk-cache-inventory-v1") {
+    return Option<Inventory>.none()
+  }
+  let directoryId = readPair(bytes, &mut reader)
+  let generationSpan = StableKey.readField(bytes, &mut reader)
+  if StableKey.failed(&reader) || generationSpan.end - generationSpan.start > MAX_GENERATION { return Option<Inventory>.none() }
+  let segmentList = match move run readResources(bytes, &mut reader, MAX_SEGMENTS) {
+    Option<List<Resource>>.Some {value} => move value
+    _ => { return Option<Inventory>.none() }
+  }
+  let packList = match move run readResources(bytes, &mut reader, MAX_PACKS) {
+    Option<List<Resource>>.Some {value} => move value
+    _ => { return Option<Inventory>.none() }
+  }
+  if !StableKey.finished(bytes, &reader) { return Option<Inventory>.none() }
+  return Option<Inventory>.some(Inventory {packet: move packet, digest: expectedFullPacketDigest,
+    directoryId: directoryId, generationSpan: generationSpan, segmentList: move segmentList, packList: move packList})
+}
+
+/// The exact authenticated packet identity.
+pub fn identity(inventory: &Inventory) -> ContentHash { return inventory.digest }
+/// The unique physical publication directory nonce; it is distinct from the generation content.
+pub fn directory(inventory: &Inventory) -> ContentHash { return inventory.directoryId }
+/// Borrows the exact generation packet for separate semantic admission.
+pub fn generation(inventory: &Inventory) -> &[u8] { return StableKey.view(Bytes.asSlice(&inventory.packet), inventory.generationSpan) }
+/// Borrows the ordered segment resource roster.
+pub fn segments(inventory: &Inventory) -> &[Resource] { return List<Resource>.asSlice(&inventory.segmentList) }
+/// Borrows the ordered pack resource roster.
+pub fn packs(inventory: &Inventory) -> &[Resource] { return List<Resource>.asSlice(&inventory.packList) }
+/// Selects one resource link, with all segments preceding all packs.
+pub fn resourceAt(inventory: &Inventory, index: usize) -> Option<Item> {
+  let segments = List<Resource>.asSlice(&inventory.segmentList)
+  if index < segments.length { return Option<Item>.some(Item {kind: Kind.Segment, resource: segments[index]}) }
+  let remaining = index - segments.length
+  let packs = List<Resource>.asSlice(&inventory.packList)
+  if remaining < packs.length { return Option<Item>.some(Item {kind: Kind.Pack, resource: packs[remaining]}) }
+  return Option<Item>.none()
+}
+/// Plans at most `maxObjects` unlink attempts without mutating committed progress. Zero budget
+/// or a cursor past the inventory refuses; an end cursor yields an empty completed batch.
+pub fn batch(inventory: &Inventory, cursor: Cursor, maxObjects: usize) -> Option<Batch> {
+  let count = List<Resource>.length(&inventory.segmentList) + List<Resource>.length(&inventory.packList)
+  if maxObjects == usize.ZERO || cursor.next > count { return Option<Batch>.none() }
+  let remaining = count - cursor.next
+  let take = if maxObjects < remaining { maxObjects } else { remaining }
+  let end = cursor.next + take
+  return Option<Batch>.some(Batch {start: cursor.next, end: end, done: end == count})
+}
