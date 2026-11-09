@@ -29,6 +29,15 @@ impl Copy for LeafHandle {}
 pub struct Placement {pub source: LeafHandle, pub target: LeafHandle}
 impl Copy for Placement {}
 
+/// Guard dispositions verified under one exact source/request context. These never authorize
+/// an answer's family, key or payload: normal adoption checks still apply after anchor validation.
+pub struct Certificate {
+  pub context: Bytes,
+  pub exact: List<Selection>,
+  pub positionOnly: List<Selection>,
+  pub anchors: List<LeafHandle>,
+}
+
 /// The complete state published atomically after its immutable segments and packs exist.
 /// Catalog serials strictly increase, so every imported segment must precede its consumer.
 pub struct Generation {
@@ -37,18 +46,22 @@ pub struct Generation {
   pub selections: List<Selection>,
   /// Canonical source order: catalog ordinal first, then leaf index. Targets never chain.
   pub placements: List<Placement>,
+  /// Absent for roots without a current verification ledger. Publication alone proves nothing.
+  pub certificate: Option<Certificate>,
 }
 
 /// Pack digests required by selected answers after catalog and root validation.
 /// The filesystem owner must keep these resources alive; this value holds no reader lock.
 pub struct Requirements {pub packs: List<ContentHash>, pub roots: usize}
 
-const FORMAT: u64 = 2
+const FORMAT: u64 = 3
 const MAX_SEGMENTS: usize = 256
 const MAX_ROOTS: usize = 4194304
 const MAX_BYTES: usize = 16777216
 const MAX_STAMP: usize = 65536
 const MAX_PLACEMENTS: usize = 131072
+const MAX_CONTEXT: usize = 1048576
+const MAX_ANCHORS: usize = 131072
 
 fn sameDescriptor(a: &Descriptor, b: &Descriptor) -> bool {
   return ContentHash.equals(a.digest, b.digest) && a.serial == b.serial
@@ -120,6 +133,78 @@ pub fn setSelected(selection: &mut Selection, descriptor: &Descriptor, root: usi
   return true
 }
 
+fn selectionIndex(values: &[Selection], segment: ContentHash) -> usize {
+  let mut at = usize.ZERO
+  while at < values.length {
+    if ContentHash.equals(values[at].segment, segment) { return at }
+    at = at + usize.ONE
+  }
+  return usize.MAX
+}
+
+fn certificateSubset(catalog: &[Descriptor], selected: &[Selection], certified: &[Selection]) -> bool {
+  if certified.length > selected.length { return false }
+  let mut previous = usize.ZERO
+  let mut at = usize.ZERO
+  while at < certified.length {
+    let position = catalogPosition(catalog, certified[at].segment)
+    let parent = selectionIndex(selected, certified[at].segment)
+    if position == usize.MAX || parent == usize.MAX || (at > usize.ZERO && position <= previous) { return false }
+    let allowed = Bytes.asSlice(&selected[parent].roots)
+    let bits = Bytes.asSlice(&certified[at].roots)
+    if bits.length != allowed.length { return false }
+    let mut byte = usize.ZERO
+    while byte < bits.length {
+      if u64.bitAnd(u8.toU64(bits[byte]), u64.bitNot(u8.toU64(allowed[byte]))) != 0 { return false }
+      byte = byte + usize.ONE
+    }
+    previous = position
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn certificateShape(value: &Generation) -> bool {
+  let proof = match &value.certificate {
+    Option<Certificate>.Some {value: held} => &held
+    _ => { return true }
+  }
+  if Bytes.length(&proof.context) == usize.ZERO || Bytes.length(&proof.context) > MAX_CONTEXT { return false }
+  let catalog = List<Descriptor>.asSlice(&value.catalog)
+  let selected = List<Selection>.asSlice(&value.selections)
+  let exact = List<Selection>.asSlice(&proof.exact)
+  let positioned = List<Selection>.asSlice(&proof.positionOnly)
+  if !certificateSubset(catalog, selected, exact) || !certificateSubset(catalog, selected, positioned) { return false }
+  let mut at = usize.ZERO
+  while at < exact.length {
+    let other = selectionIndex(positioned, exact[at].segment)
+    if other != usize.MAX {
+      let left = Bytes.asSlice(&exact[at].roots)
+      let right = Bytes.asSlice(&positioned[other].roots)
+      let mut byte = usize.ZERO
+      while byte < left.length {
+        if u64.bitAnd(u8.toU64(left[byte]), u8.toU64(right[byte])) != 0 { return false }
+        byte = byte + usize.ONE
+      }
+    }
+    at = at + usize.ONE
+  }
+  let anchors = List<LeafHandle>.asSlice(&proof.anchors)
+  if anchors.length > MAX_ANCHORS { return false }
+  let mut previousSegment = usize.ZERO
+  let mut previousLeaf = usize.ZERO
+  at = usize.ZERO
+  while at < anchors.length {
+    let segment = catalogPosition(catalog, anchors[at].segment)
+    if segment == usize.MAX || anchors[at].index >= catalog[segment].leaves { return false }
+    if at > usize.ZERO && (segment < previousSegment || (segment == previousSegment && anchors[at].index <= previousLeaf)) { return false }
+    previousSegment = segment
+    previousLeaf = anchors[at].index
+    at = at + usize.ONE
+  }
+  return true
+}
+
 /// Validates descriptor and selection shape only. Import and key authority require `admit`.
 pub fn validShape(value: &Generation) -> bool {
   let catalog = List<Descriptor>.asSlice(&value.catalog)
@@ -177,7 +262,7 @@ pub fn validShape(value: &Generation) -> bool {
     if placementIndex(value, placements[at].target) != usize.MAX { return false }
     at = at + usize.ONE
   }
-  return true
+  return certificateShape(value)
 }
 
 effect fn digest(output: &mut Bytes, value: ContentHash) -> () ! OutOfMemoryError ? &mut Allocator {
@@ -188,6 +273,33 @@ fn readDigest(bytes: &[u8], reader: &mut StableKey.Reader) -> ContentHash {
   let high = StableKey.readWord(bytes, &mut reader.*)
   let low = StableKey.readWord(bytes, &mut reader.*)
   return ContentHash {high: high, low: low}
+}
+
+effect fn writeSelections(output: &mut Bytes, values: &[Selection]) -> () ! OutOfMemoryError ? &mut Allocator {
+  run Encoding.word(&mut output.*, usize.toU64(values.length))
+  let mut at = usize.ZERO
+  while at < values.length {
+    run digest(&mut output.*, values[at].segment)
+    run Encoding.field(&mut output.*, Bytes.asSlice(&values[at].roots))
+    at = at + usize.ONE
+  }
+}
+
+effect fn readSelections(bytes: &[u8], reader: &mut StableKey.Reader, limit: usize) -> Option<List<Selection>>
+! OutOfMemoryError ? &mut Allocator {
+  let count = StableKey.readWord(bytes, &mut reader.*)
+  if count > usize.toU64(limit) || StableKey.failed(&reader.*) { return Option<List<Selection>>.none() }
+  let mut values = List<Selection>.make()
+  let mut at: u64 = 0
+  while at < count {
+    let hash = readDigest(bytes, &mut reader.*)
+    let field = StableKey.readField(bytes, &mut reader.*)
+    let bits = StableKey.view(bytes, field)
+    if bits.length > MAX_ROOTS / 8 || StableKey.failed(&reader.*) { return Option<List<Selection>>.none() }
+    run List<Selection>.append(&mut values, Selection {segment: hash, roots: run Bytes.copy(bits)})
+    at = at + 1
+  }
+  return Option<List<Selection>>.some(move values)
 }
 
 /// Encodes one complete generation with a content seal; malformed selections are refused.
@@ -226,6 +338,23 @@ pub effect fn encode(value: &Generation) -> Option<Bytes> ! OutOfMemoryError ? &
     run digest(&mut bytes, placements[at].target.segment)
     run Encoding.word(&mut bytes, usize.toU64(placements[at].target.index))
     at = at + usize.ONE
+  }
+  match &value.certificate {
+    Option<Certificate>.None => { run Encoding.word(&mut bytes, 0) }
+    Option<Certificate>.Some {value: proof} => {
+      run Encoding.word(&mut bytes, 1)
+      run Encoding.field(&mut bytes, Bytes.asSlice(&proof.context))
+      run writeSelections(&mut bytes, List<Selection>.asSlice(&proof.exact))
+      run writeSelections(&mut bytes, List<Selection>.asSlice(&proof.positionOnly))
+      let anchors = List<LeafHandle>.asSlice(&proof.anchors)
+      run Encoding.word(&mut bytes, usize.toU64(anchors.length))
+      at = usize.ZERO
+      while at < anchors.length {
+        run digest(&mut bytes, anchors[at].segment)
+        run Encoding.word(&mut bytes, usize.toU64(anchors[at].index))
+        at = at + usize.ONE
+      }
+    }
   }
   let seal = ContentHash.of(Bytes.asSlice(&bytes))
   run digest(&mut bytes, seal)
@@ -292,9 +421,36 @@ pub effect fn decode(bytes: &[u8], expectedStamp: &[u8]) -> Option<Generation>
       target: LeafHandle {segment: target, index: u64.toUsize(targetIndex)}})
     at = at + 1
   }
+  let hasCertificate = StableKey.readWord(payload, &mut reader)
+  if hasCertificate > 1 || StableKey.failed(&reader) { return Option<Generation>.none() }
+  let mut certificate = Option<Certificate>.none()
+  if hasCertificate == 1 {
+    let contextSpan = StableKey.readField(payload, &mut reader)
+    let context = StableKey.view(payload, contextSpan)
+    if context.length > MAX_CONTEXT || StableKey.failed(&reader) { return Option<Generation>.none() }
+    let exact = match move run readSelections(payload, &mut reader, List<Descriptor>.length(&catalog)) {
+      Option<List<Selection>>.Some {value} => move value _ => { return Option<Generation>.none() }
+    }
+    let positioned = match move run readSelections(payload, &mut reader, List<Descriptor>.length(&catalog)) {
+      Option<List<Selection>>.Some {value} => move value _ => { return Option<Generation>.none() }
+    }
+    let anchorCount = StableKey.readWord(payload, &mut reader)
+    if anchorCount > usize.toU64(MAX_ANCHORS) || StableKey.failed(&reader) { return Option<Generation>.none() }
+    let mut anchors = List<LeafHandle>.make()
+    at = 0
+    while at < anchorCount {
+      let segment = readDigest(payload, &mut reader)
+      let index = StableKey.readWord(payload, &mut reader)
+      if index > usize.toU64(usize.MAX) || StableKey.failed(&reader) { return Option<Generation>.none() }
+      run List<LeafHandle>.append(&mut anchors, LeafHandle {segment: segment, index: u64.toUsize(index)})
+      at = at + 1
+    }
+    certificate = Option<Certificate>.some(Certificate {context: run Bytes.copy(context), exact: move exact,
+      positionOnly: move positioned, anchors: move anchors})
+  }
   if !StableKey.finished(payload, &reader) { return Option<Generation>.none() }
   let result = Generation {stamp: run Bytes.copy(stampBytes), catalog: move catalog, selections: move selections,
-    placements: move placements}
+    placements: move placements, certificate: move certificate}
   if !validShape(&result) { return Option<Generation>.none() }
   return Option<Generation>.some(move result)
 }
@@ -352,6 +508,25 @@ fn validPlacements(value: &Generation, segments: &[Frozen<SealedSegment>]) -> bo
   return true
 }
 
+fn validCertificateAnchors(value: &Generation, segments: &[Frozen<SealedSegment>]) -> bool {
+  let proof = match &value.certificate {
+    Option<Certificate>.Some {value: held} => &held _ => { return true }
+  }
+  let catalog = List<Descriptor>.asSlice(&value.catalog)
+  let anchors = List<LeafHandle>.asSlice(&proof.anchors)
+  let mut at = usize.ZERO
+  while at < anchors.length {
+    let owner = catalogPosition(catalog, anchors[at].segment)
+    let observed = match move Segments.observation(Frozen<SealedSegment>.get(&segments[owner]), anchors[at].index) {
+      Option<Segments.ObservationView>.Some {value: held} => move held _ => { return false }
+    }
+    // Input digest zero is CacheImage's changed-input sentinel, never successful evidence.
+    if observed.input && observed.digest.high == 0 && observed.digest.low == 0 { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
 /// Authenticates the exact sealed owners of a catalog, then checks selected key uniqueness.
 /// Only the returned requirements may retain packs; an unselected physical answer has no authority.
 pub effect fn admit(value: &Generation, segments: &[Frozen<SealedSegment>]) -> Option<Requirements>
@@ -369,6 +544,7 @@ pub effect fn admit(value: &Generation, segments: &[Frozen<SealedSegment>]) -> O
     at = at + usize.ONE
   }
   if !validPlacements(value, segments) { return Option<Requirements>.none() }
+  if !validCertificateAnchors(value, segments) { return Option<Requirements>.none() }
   let mut keys = InternIndex.make()
   let mut roots = List<RootPosition>.make()
   let mut packIndex = InternIndex.make()
