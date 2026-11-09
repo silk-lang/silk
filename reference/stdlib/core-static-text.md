@@ -132,7 +132,7 @@ of `text`, with `end` not included.
 
 When `text` is a string literal of the calling package, the error points inside the literal,
 at the characters those bytes are written as, escapes included. When `text` is the label
-`Reflect.fieldLabel` gives for a struct field, the error points at that part of the
+[`Reflect.fieldLabel`](./core-reflect.md#Reflect.impl.fieldLabel) gives for a struct field, the error points at that part of the
 field's name where the struct declares it. Otherwise, as for a text that
 [`StaticText.concat`](#StaticText.impl.concat) built, the error points at the call, like `compileError(message)`.
 Either way the error also names the call in the evaluated module that reached it.
@@ -191,8 +191,8 @@ link changes nothing in the build.
 
 #### Gotchas
 
-`start <= end <= byteLength(text)` must hold and `Owner` must be a struct with a field
-labeled `field`. Otherwise, static evaluation stops with an error instead.
+`start <= end <= byteLength(text)` must hold and `Owner` must have a field labeled `field`.
+Otherwise, static evaluation stops with an error at those bytes instead.
 
 Renaming the field does not edit the text. Pair the link with a check that reports a name
 the type lacks, so the build names each place that must follow.
