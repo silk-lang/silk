@@ -170,6 +170,64 @@ pub fn main() -> i32 {
 }
 ```
 
+<a id="StaticText.impl.link"></a>
+
+### Associated function `link`
+
+```silk
+pub static fn link<Owner>(text: string, start: usize, end: usize, field: string) -> ()
+```
+
+Tells the editor that bytes `start` to `end` of `text`, with `end` not included, name the
+field of `Owner` labeled `field`.
+
+#### Details
+
+When `text` is a string literal of the calling package, those characters of the literal act
+as a written use of the field: hovering them shows the field, go to definition opens it, find
+references on the field lists them, and an inlay hint after them shows the field's type. A
+text with no literal behind it, such as one [`StaticText.concat`](#StaticText.impl.concat) built, links nothing. The
+link changes nothing in the build.
+
+#### Gotchas
+
+`start <= end <= byteLength(text)` must hold and `Owner` must be a struct with a field
+labeled `field`. Otherwise, static evaluation stops with an error instead.
+
+Renaming the field does not edit the text. Pair the link with a check that reports a name
+the type lacks, so the build names each place that must follow.
+
+As for [`StaticText.errorAt`](#StaticText.impl.errorAt), a `static fn` whose body has a `static for` evaluates the
+statements before the loop apart from its caller, where a text parameter no longer knows its
+literal, so a link made there links nothing.
+
+The editor shows links of a constant's initializer.
+
+#### Examples
+##### Link each `{name}` of a template to the field it reads
+```silk
+import silk.core.static_text { StaticText }
+
+struct Greeting {
+  pub name: string<'static>,
+}
+
+static fn linked(template: string<'static>) -> string<'static> {
+  // `{name}` starts at byte 7 of "Hello, {name}"; the name is bytes 8 to 12.
+  StaticText.link<Greeting>(template, 8, 12, "name")
+  return template
+}
+
+const TEMPLATE: string<'static> = linked("Hello, {name}")
+
+pub fn main() -> i32 {
+  if StaticText.byteLength(TEMPLATE) != 13 {
+    return 1
+  }
+  return 0
+}
+```
+
 
 Category: Core.
 

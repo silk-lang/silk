@@ -346,6 +346,7 @@ import semantic.Type {
 }
 import semantic.TypedBody {
   SectionRetention,
+  LinkedName,
   Environment as BodyEnvironment,
   EnvironmentCapture as BodyEnvironmentCapture,
   ReferentCapture as BodyReferentCapture,
@@ -969,8 +970,9 @@ pub union Value {
   Signature {pub signature: Box<Signature>},
   /// A conformance's implementations in its contract's operation order.
   Witnesses {pub witnesses: List<Witness>},
-  /// A constant's initializer value at the type published by its `Constant` fact.
-  Initializer {pub value: Interned<StaticData>},
+  /// A constant's initializer value at the type published by its `Constant` fact, and, for a
+  /// store that selects editor tables, the literal ranges its evaluation linked to fields.
+  Initializer {pub value: Interned<StaticData>, pub links: Option<Shared<List<LinkedName>>>},
   /// Whether a module-level `static if` condition holds.
   Condition {pub holds: bool},
   /// Whether a type has no runtime layout (STATIC-009).
@@ -2647,6 +2649,9 @@ struct Resolver {
   linkOnlySupport: List<ModuleId>,
   /// Whether checked bodies keep the names they resolve for an editor (`selectEditorTables`).
   editorTables: bool,
+  /// The literal ranges static evaluations linked to fields while the current constant is
+  /// evaluated; filled only with `editorTables`.
+  staticLinks: List<StaticExecution.EditorLink>,
   /// The discovery root of a test build and its package-relative module directory (TEST-003).
   discovery: Option<Discovery>,
   /// The dependency names of every package in the build, which turn import paths into modules.
@@ -8704,7 +8709,7 @@ fn fingerprintValue(writer: &mut AnswerFingerprint.Writer, value: &Value) -> () 
     Value.StaticRouting {holds} => { AnswerFingerprint.flag(&mut writer.*, holds) }
     Value.ProfileInput {slot} => { AnswerFingerprint.count(&mut writer.*, slot) }
     Value.LayoutUnsupported => {}
-    Value.Initializer {value: published} => { StaticValue.fingerprint(&mut writer.*, &published) }
+    Value.Initializer {value: published, ..} => { StaticValue.fingerprint(&mut writer.*, &published) }
     _ => { AnswerFingerprint.incomplete(&mut writer.*) }
   }
   return ()
@@ -69608,7 +69613,7 @@ fn pointerSized(value: &Type) -> bool {
 fn initializerValue(answer: &Result<Answer, NoRejection>) -> Option<Interned<StaticData>> {
   return match & answer.* {
     Result<Answer, NoRejection>.Success {value} => match & value.outcome {
-      Outcome.Success {value: Value.Initializer {value: found}} => Option<
+      Outcome.Success {value: Value.Initializer {value: found, ..}} => Option<
         Interned<StaticData>,
       >.some(Interned<StaticData>.clone(&found))
       _ => Option<Interned<StaticData>>.none()
@@ -70081,6 +70086,38 @@ effect fn observedWholeDeclaration(resolver: &mut Resolver, module: &ModuleId, d
   }
   drop answer
   return run source(&mut resolver.*, module)
+}
+
+// The links of a constant's evaluation that point into its own initializer, located from the
+// declaration's anchor as its body's origins are.
+effect fn initializerLinks(resolver: &mut Resolver, module: &ModuleId, ordinal: usize, links: &[StaticExecution.EditorLink])
+-> List<LinkedName> ! Cycle | OutOfMemoryError ? &mut Allocator {
+  let mut kept = List<LinkedName>.make()
+  let answer = run observedDeclaration(&mut resolver.*, module, ordinal, SourceFacet.Body)
+  if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&resolver.*, &answer, module) {
+    let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
+    if ordinal >= declarations.length { return move kept }
+    let extent = Module.span(IndexedSource.authored(indexed), declarations[ordinal].local)
+    let anchor = match move IndexedSource.anchorOf(indexed, ordinal) {
+      Option<Anchor>.Some {value} => move value
+      Option<Anchor>.None => { return move kept }
+    }
+    let mut at = usize.ZERO
+    while at < links.length {
+      let link = &links[at]
+      if ModuleId.equals(&link.module, module) && extent.start <= link.literal.start && link.literal.end <= extent.end &&
+        link.literal.start <= link.span.start && link.span.end <= link.literal.end {
+        if let Option<Location>.Some {value: literal} = move Anchor.findLocation(&anchor, link.literal) {
+          run List<LinkedName>.append(&mut kept, LinkedName {
+            literal: literal, start: link.span.start - link.literal.start, end: link.span.end - link.literal.start,
+            owner: Interned<Type>.clone(&link.owner), index: link.index,
+          })
+        }
+      }
+      at = at + usize.ONE
+    }
+  }
+  return move kept
 }
 
 effect fn initializerSyntax(
@@ -70604,6 +70641,30 @@ effect fn staticExpression(
     ))
     match move outcome {
       Result<Interned<StaticData>, StaticDiagnostic | OutOfMemoryError>.Success {value} => {
+        let linked = StaticExecution.editorLinks(&machine)
+        if linked.length > usize.ZERO {
+          let mut copied = List<StaticExecution.EditorLink>.make()
+          let mut at = usize.ZERO
+          while at < linked.length {
+            run List<StaticExecution.EditorLink>.append(&mut copied, StaticExecution.EditorLink {
+              module: ModuleId.copy(&linked[at].module), literal: linked[at].literal, span: linked[at].span,
+              owner: Interned<Type>.clone(&linked[at].owner), index: linked[at].index,
+            })
+            at = at + usize.ONE
+          }
+          let port = StaticExecution.port(&mut machine)
+          if port.resolver.editorTables {
+            let mut moved = usize.ZERO
+            while moved < List<StaticExecution.EditorLink>.length(&copied) {
+              let link = &List<StaticExecution.EditorLink>.asSlice(&copied)[moved]
+              run List<StaticExecution.EditorLink>.append(&mut port.resolver.staticLinks, StaticExecution.EditorLink {
+                module: ModuleId.copy(&link.module), literal: link.literal, span: link.span,
+                owner: Interned<Type>.clone(&link.owner), index: link.index,
+              })
+              moved = moved + usize.ONE
+            }
+          }
+        }
         return Result<Interned<StaticData>, Shared<Rejection>>.succeed(move value)
       }
       Result<Interned<StaticData>, StaticDiagnostic | OutOfMemoryError>.Failure {error: evaluationFailure} => {
@@ -70687,16 +70748,24 @@ effect fn resolveInitializer(
     }
   }
   let declarationAccess152 = declarationPosition(&resolver.*, key)
+  let outerLinks = Intrinsic.replace(resolver.staticLinks, List<StaticExecution.EditorLink>.make())
   let attempted = run staticExpression(
     &mut resolver.*, &mut owner.*, &mut dependencies,
     &module, Option<usize>.some(declarationAccess152), expression,
     StaticRootExpectation.Resolved {ty: Interned<Type>.clone(&ty), mismatchCode: RejectionCode.InvalidConstant},
     &[], &[],
   )
+  let gathered = Intrinsic.replace(resolver.staticLinks, move outerLinks)
   match move attempted {
     Result<Interned<StaticData>, Shared<Rejection>>.Success {value} => {
       if run StaticConstant.admits(&ty, &value) {
-        return memberSuccess(Value.Initializer {value: move value}, move dependencies)
+        let mut links = Option<Shared<List<LinkedName>>>.none()
+        if List<StaticExecution.EditorLink>.length(&gathered) > usize.ZERO {
+          let kept = run initializerLinks(&mut resolver.*, &module, declarationAccess152,
+            List<StaticExecution.EditorLink>.asSlice(&gathered))
+          if List<LinkedName>.length(&kept) > usize.ZERO { links = Option<Shared<List<LinkedName>>>.some(run Shared<List<LinkedName>>.make(move kept)) }
+        }
+        return memberSuccess(Value.Initializer {value: move value, links: move links}, move dependencies)
       }
       let mut detail = run constantValueDetail(&module, &ty)
       run Bytes.append(&mut detail, b", holding no references, allocated memory or Drop cleanup")
@@ -92175,6 +92244,49 @@ impl<'source> StaticPort<'source> {
     return Option<StaticExecution.LocatedSite>.none()
   }
 
+  /// The declaration ordinal of the field of struct `ty` labeled `label`; none when `ty` is not a
+  /// struct or has no such field.
+  pub effect fn fieldOrdinal(self: &mut Self, ty: &Interned<Type>, label: &[u8]) -> Option<usize>
+  ! Cycle | OutOfMemoryError ? &mut Allocator {
+    let named = Interned<Type>.with<Option<DeclarationId>>(ty, fn(value: &Type) -> Option<DeclarationId> {
+      return match &value.* {
+        Type.Nominal {declaration, ..} => Option<DeclarationId>.some(DeclarationId.copy(&declaration))
+        _ => Option<DeclarationId>.none()
+      }
+    })
+    let owner = match move named {
+      Option<DeclarationId>.Some {value} => move value
+      Option<DeclarationId>.None => { return Option<usize>.none() }
+    }
+    let module = ModuleId.copy(DeclarationId.moduleId(&owner))
+    let answer = run source(&mut self.resolver.*, &module)
+    if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&self.resolver.*, &answer, &module) {
+      let hir = IndexedSource.authored(indexed)
+      let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
+      let mut at = usize.ZERO
+      while at < declarations.length {
+        if DeclarationId.equals(&declarations[at].identity, &owner) {
+          if let Node.Declaration {header, ..} = Module.node(hir, declarations[at].local) {
+            if let Node.StructHeader {fields, ..} = Module.node(hir, header) {
+              let mut index = usize.ZERO
+              while index < fields.length {
+                if let Node.Field {name, ..} = Module.node(hir, Module.child(hir, fields, index)) {
+                  if let Node.Name {text} = Module.node(hir, name) {
+                    if same(Module.text(hir, text), label) { return Option<usize>.some(index) }
+                  }
+                }
+                index = index + usize.ONE
+              }
+            }
+          }
+          return Option<usize>.none()
+        }
+        at = at + usize.ONE
+      }
+    }
+    return Option<usize>.none()
+  }
+
   /// Where bytes `start..end` of the text that the literal at `literal` of `module` decodes to are
   /// written, escapes included; none when the literal does not decode to `length` bytes, such as
   /// for a text built from it, or when the standard library writes it.
@@ -92439,6 +92551,30 @@ impl<'source> StaticPort<'source> {
       return Option<Shared<Result<Answer, NoRejection>>>.some(move answer)
     }
     return Option<Shared<Result<Answer, NoRejection>>>.none()
+  }
+  /// The literal ranges a constant's initializer linked to fields, read from its `Initializer`
+  /// answer in the active query; empty for a store without editor tables or a refused value.
+  pub effect fn constantLinks(self: &mut Self, declaration: &DeclarationId, span: Span) -> Option<Shared<List<LinkedName>>>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+    let module = DeclarationId.moduleId(declaration)
+    let identity = run Types.internDeclaration(DeclarationId.copy(declaration))
+    let selected = run ordinalOfIdentity(&mut self.resolver.*, module, &identity)
+    if let Option<usize>.Some {value: ordinal} = move selected {
+      let moduleOrdinal = run internModule(&mut self.resolver.*, module)
+      let request = Key {family: Family.Initializer, module: moduleOrdinal, name: usize.ZERO, declaration: ordinal, member: usize.ZERO, external: false}
+      let key = run internDeclaration(&mut self.resolver, request)
+      let answer = run demandChild(&mut self.resolver.*, &mut self.query.*, &mut self.dependencies.*, key, span)
+      return Shared<Result<Answer, NoRejection>>.with<Option<Shared<List<LinkedName>>>>(&answer, fn(held: &Result<Answer, NoRejection>) -> Option<Shared<List<LinkedName>>> {
+        if let Result<Answer, NoRejection>.Success {value} = &held.* {
+          if let Outcome.Success {value: Value.Initializer {links: Option<Shared<List<LinkedName>>>.Some {value: listed}, ..}} = &value.outcome {
+            return Option<Shared<List<LinkedName>>>.some(Shared<List<LinkedName>>.clone(&listed))
+          }
+        }
+        return Option<Shared<List<LinkedName>>>.none()
+      })
+    }
+    return Option<Shared<List<LinkedName>>>.none()
   }
   /// The module-level ordinal of one declaration in its own module, if it is still indexed.
   pub effect fn declarationOrdinal(self: &mut Self, declaration: &DeclarationId) -> Option<usize>
@@ -92748,6 +92884,7 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
       support: List<ModuleId>.make(),
       linkOnlySupport: List<ModuleId>.make(),
       editorTables: false,
+      staticLinks: List<StaticExecution.EditorLink>.make(),
       discovery: Option<Discovery>.none(),
       packages: PackageGraph.single(),
       profiles: List<FinalProfile>.make(),
