@@ -1,0 +1,449 @@
+//! Resource admission for the compiler's fixed four-worker process pool.
+//!
+//! This policy does not authorize forking: the caller must still be a single-threaded CLI
+//! invocation with an immutable store. Unknown host facts leave that invocation serial.
+
+import semantic.FrontierHost {FrontierHost}
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.collections.slice {Slice}
+import silk.core.effect {Effect}
+import silk.core.option {Option}
+import silk.core.ownership {Copy}
+import silk.core.result {Result}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.u8
+import silk.num.u64
+import silk.num.usize
+import silk.testing.testing {AssertionError, Testing}
+
+// Admission reserves additional headroom, not total machine RAM. The measured aggregate
+// check PSS was 4.35 GiB; round it to 5 GiB and reserve a further 1 GiB for backend/native
+// allocation overlap. This estimate is deliberately conservative, not a memory limit or an
+// OOM guarantee. The coordinator's current charge is already excluded from remaining memory.
+const fourWorkerReserveBytes: u64 = 6442450944
+
+struct Capacity { cpus: usize, memory: u64 }
+impl Copy for Capacity {}
+
+fn fits(capacity: &Option<Capacity>) -> bool {
+  return match &capacity.* {
+    Option<Capacity>.Some {value} => value.cpus >= 4 && value.memory >= fourWorkerReserveBytes
+    Option<Capacity>.None => false
+  }
+}
+
+fn intersect(left: Capacity, right: Capacity) -> Capacity {
+  return Capacity {cpus: if left.cpus < right.cpus { left.cpus } else { right.cpus },
+    memory: if left.memory < right.memory { left.memory } else { right.memory }}
+}
+
+fn whitespace(byte: u8) -> bool { return byte == 32 || byte == 9 || byte == 10 || byte == 13 }
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length { if left[at] != right[at] { return false } at = at + usize.ONE }
+  return true
+}
+
+fn token<'a>(bytes: &'a [u8], cursor: &mut usize) -> &'a [u8] {
+  while cursor.* < bytes.length && whitespace(bytes[cursor.*]) { cursor.* = cursor.* + usize.ONE }
+  let start = cursor.*
+  while cursor.* < bytes.length && !whitespace(bytes[cursor.*]) { cursor.* = cursor.* + usize.ONE }
+  return Slice.view<u8>(bytes, start, cursor.* - start)
+}
+
+fn number(bytes: &[u8]) -> Option<u64> {
+  if bytes.length == usize.ZERO { return Option<u64>.none() }
+  let mut value: u64 = 0
+  let mut at = usize.ZERO
+  while at < bytes.length {
+    let byte = bytes[at]
+    if byte < 48 || byte > 57 { return Option<u64>.none() }
+    let digit = u8.toU64(byte - 48)
+    if value > (u64.MAX - digit) / 10 { return Option<u64>.none() }
+    value = value * 10 + digit
+    at = at + usize.ONE
+  }
+  return Option<u64>.some(value)
+}
+
+fn singleNumber(bytes: &[u8]) -> Option<u64> {
+  let mut cursor = usize.ZERO
+  let value = number(token(bytes, &mut cursor))
+  if token(bytes, &mut cursor).length != usize.ZERO { return Option<u64>.none() }
+  return value
+}
+
+// Round quota down: a quota of 3.99 processors cannot admit four active compute leases.
+fn quota(bytes: &[u8]) -> Option<usize> {
+  let mut cursor = usize.ZERO
+  let amount = token(bytes, &mut cursor)
+  let period = match number(token(bytes, &mut cursor)) {
+    Option<u64>.Some {value} => value
+    Option<u64>.None => { return Option<usize>.none() }
+  }
+  if period == 0 || token(bytes, &mut cursor).length != usize.ZERO { return Option<usize>.none() }
+  if same(amount, b"max") { return Option<usize>.some(usize.MAX) }
+  return match number(amount) {
+    Option<u64>.Some {value} => {
+      let count = value / period
+      if count > usize.toU64(usize.MAX) { return Option<usize>.some(usize.MAX) }
+      Option<usize>.some(u64.toUsize(count))
+    }
+    Option<u64>.None => Option<usize>.none()
+  }
+}
+
+fn inactiveFile(bytes: &[u8]) -> Option<u64> {
+  let mut result = Option<u64>.none()
+  let mut at = usize.ZERO
+  while at < bytes.length {
+    let start = at
+    while at < bytes.length && bytes[at] != 10 { at = at + usize.ONE }
+    let line = Slice.view<u8>(bytes, start, at - start)
+    let mut cursor = usize.ZERO
+    if same(token(line, &mut cursor), b"inactive_file") {
+      if let Option<u64>.Some {..} = &result { return Option<u64>.none() }
+      result = number(token(line, &mut cursor))
+      if token(line, &mut cursor).length != usize.ZERO { return Option<u64>.none() }
+      if let Option<u64>.None = &result { return Option<u64>.none() }
+    }
+    if at < bytes.length { at = at + usize.ONE }
+  }
+  return result
+}
+
+fn remaining(limit: &[u8], current: &[u8], statistics: &[u8]) -> Option<u64> {
+  let used = match singleNumber(current) {
+    Option<u64>.Some {value} => value
+    Option<u64>.None => { return Option<u64>.none() }
+  }
+  let inactive = match inactiveFile(statistics) {
+    Option<u64>.Some {value} => value
+    Option<u64>.None => { return Option<u64>.none() }
+  }
+  // Inconsistent concurrent reads are unknown, rather than an excuse to invent headroom.
+  if inactive > used { return Option<u64>.none() }
+  let mut cursor = usize.ZERO
+  let maximum = token(limit, &mut cursor)
+  if token(limit, &mut cursor).length != usize.ZERO { return Option<u64>.none() }
+  if same(maximum, b"max") { return Option<u64>.some(u64.MAX) }
+  return match number(maximum) {
+    Option<u64>.Some {value} => {
+      let charged = used - inactive
+      Option<u64>.some(if charged >= value { 0 } else { value - charged })
+    }
+    Option<u64>.None => Option<u64>.none()
+  }
+}
+
+// Parsing mountinfo never treats its escaped path spelling as a literal host path.
+fn plainAbsolute(bytes: &[u8]) -> bool {
+  if bytes.length == usize.ZERO || bytes[0] != 47 { return false }
+  let mut at = usize.ONE
+  while at <= bytes.length {
+    let start = at
+    while at < bytes.length && bytes[at] != 47 {
+      if bytes[at] == 92 || bytes[at] == 0 { return false }
+      at = at + usize.ONE
+    }
+    let segment = Slice.view<u8>(bytes, start, at - start)
+    if same(segment, b".") || same(segment, b"..") { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn hasProcess(bytes: &[u8], pid: u64) -> bool {
+  let mut cursor = usize.ZERO
+  let mut found = false
+  while cursor < bytes.length {
+    let item = token(bytes, &mut cursor)
+    if item.length == usize.ZERO { break }
+    match number(item) {
+      Option<u64>.Some {value} => { if value == pid { found = true } }
+      Option<u64>.None => { return false }
+    }
+  }
+  return found
+}
+
+// Kernel cgroup_base_files marks cgroup.type and cgroup.events CFTYPE_NOT_ON_ROOT;
+// this tests the actual hierarchy root, not a cgroup namespace's displayed root.
+// https://docs.kernel.org/admin-guide/cgroup-v2.html#interface-files
+// https://github.com/torvalds/linux/blob/master/kernel/cgroup/cgroup.c
+// Controller files alone cannot prove unlimited capacity: a non-root may lack controllers.
+fn unlimitedRootNames(atMountRoot: bool, names: &[Bytes]) -> bool {
+  if !atMountRoot { return false }
+  let mut core: u64 = 0
+  let mut at = usize.ZERO
+  while at < names.length {
+    let name = Bytes.asSlice(&names[at])
+    if same(name, b"cgroup.type") || same(name, b"cgroup.events")
+      || same(name, b"cpu.max") || same(name, b"memory.max") { return false }
+    if same(name, b"cgroup.procs") { core = u64.bitOr(core, 1) }
+    if same(name, b"cgroup.controllers") { core = u64.bitOr(core, 2) }
+    if same(name, b"cgroup.subtree_control") { core = u64.bitOr(core, 4) }
+    if same(name, b"cgroup.stat") { core = u64.bitOr(core, 8) }
+    at = at + usize.ONE
+  }
+  return core == 15
+}
+
+// Both controllers must belong to this unified hierarchy. Otherwise a hybrid v1 hierarchy
+// could impose an invisible CPU or memory limit despite this v2 root being unrestricted.
+fn unifiedLimits(bytes: &[u8]) -> bool {
+  let mut found: u64 = 0
+  let mut cursor = usize.ZERO
+  while cursor < bytes.length {
+    let name = token(bytes, &mut cursor)
+    let bit: u64 = if same(name, b"cpu") { 1 } else if same(name, b"memory") { 2 } else { 0 }
+    if bit != 0 && u64.bitAnd(found, bit) != 0 { return false }
+    found = u64.bitOr(found, bit)
+  }
+  return found == 3
+}
+
+static if Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu"
+  && Intrinsic.profileText("libc") == "gnu"
+  && (Intrinsic.targetArchitecture() == "x86_64" || Intrinsic.targetArchitecture() == "aarch64") {
+  import silk.system.system_info {SystemInfo, SystemInfoError}
+  import silk.system.system_info_native {OsSystemInfo}
+  import silk.system.filesystem {DirectoryEntry, FileError, FileSystem, Path}
+  import silk.system.filesystem_machine {MachineFileSystem}
+  import silk.num.i32
+
+  effect fn read(path: &Path) -> Bytes ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+    return run FileSystem.readFile(path)
+  }
+
+  effect fn file(directory: &Path, name: string) -> Bytes ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+    let path = run Path.join(directory, name)
+    return run read(&path)
+  }
+
+  // A cgroup namespace can expose its parent mount (mountinfo root /..) while membership is
+  // reported as /. Verify actual PID membership instead of concatenating those incompatible
+  // paths. An unresolved layout is serial; at most 64 visible groups are searched.
+  effect fn member(root: &Path, pid: u64) -> Option<Path> ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+    let mut pending = List<Path>.make()
+    run List<Path>.append(&mut pending, run Path.fromBytes(Path.rawBytes(root)))
+    let mut at = usize.ZERO
+    while at < List<Path>.length(&pending) && at < 64 {
+      let directory = run Path.fromBytes(Path.rawBytes(&List<Path>.asSlice(&pending)[at]))
+      at = at + usize.ONE
+      let processes = run file(&directory, "cgroup.procs")
+      if hasProcess(Bytes.asSlice(&processes), pid) { return Option<Path>.some(move directory) }
+      let entries = run FileSystem.listDirectory(&directory)
+      let listed = List<DirectoryEntry>.asSlice(&entries)
+      let mut child = usize.ZERO
+      while child < listed.length {
+        if listed[child].kind.code == 1 {
+          if List<Path>.length(&pending) >= 64 { return Option<Path>.none() }
+          run List<Path>.append(&mut pending, run Path.fromBytes(Path.rawBytes(&listed[child].path)))
+        }
+        child = child + usize.ONE
+      }
+    }
+    return Option<Path>.none()
+  }
+
+  effect fn mountedRoot() -> Option<Path> ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+    let path = run Path.fromBytes(b"/proc/self/mountinfo")
+    let contents = run read(&path)
+    let bytes = Bytes.asSlice(&contents)
+    let mut result = Option<Path>.none()
+    let mut at = usize.ZERO
+    while at < bytes.length {
+      let start = at
+      while at < bytes.length && bytes[at] != 10 { at = at + usize.ONE }
+      let line = Slice.view<u8>(bytes, start, at - start)
+      let mut cursor = usize.ZERO
+      drop token(line, &mut cursor)
+      drop token(line, &mut cursor)
+      drop token(line, &mut cursor)
+      let mountRoot = token(line, &mut cursor)
+      let mounted = token(line, &mut cursor)
+      let mut separator = false
+      while cursor < line.length {
+        if same(token(line, &mut cursor), b"-") { separator = true break }
+      }
+      if separator && same(token(line, &mut cursor), b"cgroup2") {
+        if !plainAbsolute(mounted) { return Option<Path>.none() }
+        // A bind-mounted subtree hides possibly stricter parents. Accept the full visible
+        // hierarchy, or the namespace-parent view whose actual membership is verified by PID.
+        if !same(mountRoot, b"/") && !same(mountRoot, b"/..") { return Option<Path>.none() }
+        // Multiple views need mount-root reconciliation; leave that uncommon host serial.
+        if let Option<Path>.Some {..} = &result { return Option<Path>.none() }
+        result = Option<Path>.some(run Path.fromBytes(mounted))
+      }
+      if at < bytes.length { at = at + usize.ONE }
+    }
+    return move result
+  }
+
+  effect fn unlimitedRoot(directory: &Path) -> bool ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+    // A successful complete kernel directory listing distinguishes absent files from access
+    // failures. Only the already verified cgroup2 mount root can take this branch.
+    let entries = run FileSystem.listDirectory(directory)
+    let listed = List<DirectoryEntry>.asSlice(&entries)
+    let mut names = List<Bytes>.make()
+    let mut at = usize.ZERO
+    while at < listed.length {
+      let path = Path.rawBytes(&listed[at].path)
+      let mut start = path.length
+      while start > usize.ZERO && path[start - usize.ONE] != 47 { start = start - usize.ONE }
+      run List<Bytes>.append(&mut names, run Bytes.copy(Slice.view<u8>(path, start, path.length - start)))
+      at = at + usize.ONE
+    }
+    if !unlimitedRootNames(true, List<Bytes>.asSlice(&names)) { return false }
+    let controllers = run file(directory, "cgroup.controllers")
+    return unifiedLimits(Bytes.asSlice(&controllers))
+  }
+
+  effect fn capacity(affinity: usize) -> Option<Capacity>
+  ! FileError | OutOfMemoryError | SystemInfoError ? &mut FileSystem | &mut Allocator | &mut SystemInfo {
+    let memory = run SystemInfo.memory()
+    let mut result = Capacity {cpus: affinity, memory: memory.available}
+    if !fits(&Option<Capacity>.some(result)) { return Option<Capacity>.some(result) }
+    let root = match move run mountedRoot() {
+      Option<Path>.Some {value} => move value
+      Option<Path>.None => { return Option<Capacity>.none() }
+    }
+    let pid = i32.toU64(run SystemInfo.processId())
+    let current = match move run member(&root, pid) {
+      Option<Path>.Some {value} => move value
+      Option<Path>.None => { return Option<Capacity>.none() }
+    }
+    let full = Path.rawBytes(&current)
+    let rootLength = Path.rawBytes(&root).length
+    let mut length = full.length
+    while true {
+      let directory = run Path.fromBytes(Slice.view<u8>(full, usize.ZERO, length))
+      if length == rootLength && run unlimitedRoot(&directory) { break }
+      let cpu = run file(&directory, "cpu.max")
+      let maximum = run file(&directory, "memory.max")
+      let used = run file(&directory, "memory.current")
+      let statistics = run file(&directory, "memory.stat")
+      let cpus = match quota(Bytes.asSlice(&cpu)) {
+        Option<usize>.Some {value} => value
+        Option<usize>.None => { return Option<Capacity>.none() }
+      }
+      let available = match remaining(Bytes.asSlice(&maximum), Bytes.asSlice(&used), Bytes.asSlice(&statistics)) {
+        Option<u64>.Some {value} => value
+        Option<u64>.None => { return Option<Capacity>.none() }
+      }
+      result = intersect(result, Capacity {cpus: cpus, memory: available})
+      if length == rootLength { break }
+      while length > rootLength && full[length - usize.ONE] != 47 { length = length - usize.ONE }
+      if length <= rootLength { return Option<Capacity>.none() }
+      length = length - usize.ONE
+    }
+    // Migration during the probe invalidates the correspondence between limits and this process.
+    let verified = run file(&current, "cgroup.procs")
+    if !hasProcess(Bytes.asSlice(&verified), pid) { return Option<Capacity>.none() }
+    return Option<Capacity>.some(result)
+  }
+}
+
+/// Whether known host capacity admits four compiler compute workers and the estimated memory
+/// reserve. Unsupported hosts, missing probes and unsupported cgroup layouts answer false.
+/// The caller must separately retain CLI-only fork permission and immutable-store checks.
+pub effect fn eligible() -> bool ? &mut Allocator {
+  static if Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu"
+    && Intrinsic.profileText("libc") == "gnu"
+    && (Intrinsic.targetArchitecture() == "x86_64" || Intrinsic.targetArchitecture() == "aarch64") {
+    if !FrontierHost.available() { return false }
+    let mut system = OsSystemInfo.make()
+    let probed = run Effect.result(SystemInfo.availableParallelism()) |> Effect.provideMut<SystemInfo>(&mut system)
+    let affinity = match move probed {
+      Result<usize, SystemInfoError>.Success {value} => value
+      Result<usize, SystemInfoError>.Failure {error} => { drop error return false }
+    }
+    // A one-core invocation never constructs a filesystem provider or reads memory/cgroups.
+    if affinity < 4 { return false }
+    let mut files = match move run Effect.result(MachineFileSystem.make()) {
+      Result<MachineFileSystem, OutOfMemoryError>.Success {value} => move value
+      Result<MachineFileSystem, OutOfMemoryError>.Failure {error} => { drop error return false }
+    }
+    let attempted = run Effect.result(capacity(affinity)) |> Effect.provideMut<SystemInfo>(&mut system) |> Effect.provideMut<FileSystem>(&mut files)
+    return match move attempted {
+      Result<Option<Capacity>, FileError | OutOfMemoryError | SystemInfoError>.Success {value} => fits(&value)
+      Result<Option<Capacity>, FileError | OutOfMemoryError | SystemInfoError>.Failure {error} => { drop error false }
+    }
+  } else { return false }
+}
+
+test effect fn frontierPolicyRequiresCpuAndMemoryHeadroom() -> () ! AssertionError<'static> {
+  run Testing.expect(!fits(&Option<Capacity>.none()), "unknown capacity stays serial")
+  run Testing.expect(fits(&Option<Capacity>.some(Capacity {cpus: 4, memory: fourWorkerReserveBytes})), "exact capacity admits four leases")
+  run Testing.expect(!fits(&Option<Capacity>.some(Capacity {cpus: 3, memory: u64.MAX})), "affinity below four stays serial")
+  run Testing.expect(!fits(&Option<Capacity>.some(Capacity {cpus: 16, memory: fourWorkerReserveBytes - 1})), "memory below reserve stays serial")
+  let child = Capacity {cpus: usize.MAX, memory: u64.MAX}
+  let parent = Capacity {cpus: 2, memory: fourWorkerReserveBytes}
+  run Testing.expect(!fits(&Option<Capacity>.some(intersect(child, parent))), "unlimited leaf cannot override a restricted parent")
+  let host = Capacity {cpus: 4, memory: fourWorkerReserveBytes - 1}
+  run Testing.expect(!fits(&Option<Capacity>.some(intersect(host, child))), "unlimited group cannot override host available memory")
+  let constrained = Capacity {cpus: 8, memory: fourWorkerReserveBytes - 1}
+  run Testing.expect(!fits(&Option<Capacity>.some(intersect(child, constrained))), "a parent memory limit still binds an unlimited child")
+}
+
+test effect fn frontierPolicyQuotaRequiresFourWholeProcessors() -> () ! AssertionError<'static> {
+  run Testing.expect(match quota(b"400000 100000\n") { Option<usize>.Some {value} => value == 4 _ => false }, "exact quota")
+  run Testing.expect(match quota(b"399999 100000\n") { Option<usize>.Some {value} => value == 3 _ => false }, "fractional quota rounds down")
+  run Testing.expect(match quota(b"max 100000\n") { Option<usize>.Some {value} => value == usize.MAX _ => false }, "explicit unlimited quota")
+  run Testing.expect(match quota(b"400000 0") { Option<usize>.None => true _ => false }, "zero period is unknown")
+  run Testing.expect(match quota(b"18446744073709551616 1") { Option<usize>.None => true _ => false }, "overflow is unknown")
+  run Testing.expect(match quota(b"400000 100000 trailing") { Option<usize>.None => true _ => false }, "extra fields are unknown")
+}
+
+test effect fn frontierPolicyMemoryDiscountsOnlyKnownInactiveFileCache() -> () ! AssertionError<'static> {
+  run Testing.expect(match remaining(b"17179869184\n", b"15032385536\n", b"anon 6442450944\ninactive_file 8589934592\n") {
+    Option<u64>.Some {value} => value == 10737418240 _ => false }, "14 GiB charged with 8 GiB inactive cache leaves 10 GiB of a 16 GiB group")
+  run Testing.expect(match remaining(b"10", b"12", b"inactive_file 0\n") { Option<u64>.Some {value} => value == 0 _ => false }, "over-limit use saturates remaining memory")
+  run Testing.expect(match remaining(b"max", b"12", b"inactive_file 0\n") { Option<u64>.Some {value} => value == u64.MAX _ => false }, "explicit unlimited memory")
+  run Testing.expect(match remaining(b"10", b"9", b"active_file 8\n") { Option<u64>.None => true _ => false }, "missing reclaimable counter is unknown")
+  run Testing.expect(match remaining(b"10", b"9", b"inactive_file 8\ninactive_file 1\n") { Option<u64>.None => true _ => false }, "duplicate reclaimable counter is unknown")
+  run Testing.expect(match remaining(b"10", b"9", b"inactive_file 10\n") { Option<u64>.None => true _ => false }, "inconsistent memory reads are unknown")
+}
+
+test effect fn frontierPolicyMountAndMembershipSpellingIsExact() -> () ! AssertionError<'static> {
+  run Testing.expect(plainAbsolute(b"/sys/fs/cgroup") && !plainAbsolute(b"/sys/../cgroup") && !plainAbsolute(b"/sys/fs/cgroup\\040other"), "mount paths cannot silently reinterpret traversal or kernel escapes")
+  run Testing.expect(hasProcess(b"14\n123\n1234\n", 123) && !hasProcess(b"14\n1234\n", 123)
+    && !hasProcess(b"123\ninvalid\n", 123), "PID membership requires complete valid tokens")
+}
+
+
+effect fn hierarchyRootClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut names = List<Bytes>.make()
+  run List<Bytes>.append(&mut names, run Bytes.copy(b"cgroup.procs"))
+  run List<Bytes>.append(&mut names, run Bytes.copy(b"cgroup.controllers"))
+  run List<Bytes>.append(&mut names, run Bytes.copy(b"cgroup.subtree_control"))
+  run Testing.expect(!unlimitedRootNames(true, List<Bytes>.asSlice(&names)), "partial core listings never prove a hierarchy root")
+  run List<Bytes>.append(&mut names, run Bytes.copy(b"cgroup.stat"))
+  run Testing.expect(unlimitedRootNames(true, List<Bytes>.asSlice(&names)), "the actual unified hierarchy root has no local CPU or memory limit")
+  run Testing.expect(!unlimitedRootNames(false, List<Bytes>.asSlice(&names)), "a non-mount directory cannot omit ancestor limits")
+  run List<Bytes>.append(&mut names, run Bytes.copy(b"cgroup.type"))
+  run Testing.expect(!unlimitedRootNames(true, List<Bytes>.asSlice(&names)), "namespace-rooted non-root cgroups retain their kernel type file")
+  drop List<Bytes>.pop(&mut names)
+  run List<Bytes>.append(&mut names, run Bytes.copy(b"cgroup.events"))
+  run Testing.expect(!unlimitedRootNames(true, List<Bytes>.asSlice(&names)), "the independent non-root events marker also refuses")
+  drop List<Bytes>.pop(&mut names)
+  run List<Bytes>.append(&mut names, run Bytes.copy(b"cpu.max"))
+  run Testing.expect(!unlimitedRootNames(true, List<Bytes>.asSlice(&names)), "an exposed quota must be read, never assumed unlimited")
+  drop List<Bytes>.pop(&mut names)
+  run List<Bytes>.append(&mut names, run Bytes.copy(b"memory.max"))
+  run Testing.expect(!unlimitedRootNames(true, List<Bytes>.asSlice(&names)), "an exposed memory limit must be read, never assumed unlimited")
+  run Testing.expect(unifiedLimits(b"cpuset cpu io memory pids\n") && !unifiedLimits(b"cpuset io memory\n")
+    && !unifiedLimits(b"cpu pids\n") && !unifiedLimits(b"cpu memory cpu\n"),
+    "missing or ambiguous unified controllers cannot hide hybrid v1 limits")
+  let inherited = Capacity {cpus: 2, memory: fourWorkerReserveBytes}
+  run Testing.expect(!fits(&Option<Capacity>.some(intersect(inherited, Capacity {cpus: usize.MAX, memory: u64.MAX}))),
+    "an unlimited hierarchy root never erases a restrictive descendant quota")
+}
+
+test effect fn frontierPolicyDistinguishesHierarchyRootFromNamespaceRoot() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run hierarchyRootClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}

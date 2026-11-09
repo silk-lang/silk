@@ -212,11 +212,13 @@ impl NativeThread
 pub fn processorCount() -> usize
 ```
 
-Returns the number of processors online, at least one.
+Returns the number of processors available to size a worker pool, at least one.
 
 #### Details
-Use it to size a worker pool. The operating system can still run other work on those
-processors.
+
+On Linux this counts the calling thread's CPU affinity; other native hosts report online
+processors, and WebAssembly uses the host's parallelism. A failed probe returns one. CPU
+time quotas are not included, and the operating system can run other work on these processors.
 
 <a id="NativeThread.impl.yieldNow"></a>
 

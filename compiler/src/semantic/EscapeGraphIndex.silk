@@ -1,0 +1,377 @@
+//! Authenticated immutable record directories without per-entry owned payloads.
+//!
+//! The caller retains the exact bytes read by this directory. Entries carry scalar facts and
+//! ranges into flat adjacency tables; declarations are decoded only when a selected check needs
+//! their body identity. Shared graphs reset declaration compression every sixteen entries.
+//! Ordinary inline records keep their original compression and use a rolling reconstruction
+//! memo, so a sequential budget pass expands each declaration prefix at most once.
+
+import lexer.Span {Span}
+import semantic.BuildRecord
+import semantic.ContentHash {ContentHash}
+import semantic.DeclarationId {DeclarationId}
+import semantic.InternIndex {InternIndex}
+import semantic.StableKey
+import silk.collections.bytes {Bytes}
+import silk.collections.hash {Hash}
+import silk.collections.list {List}
+import silk.core.option {Option}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.u64
+import silk.num.usize
+
+pub struct Entry {
+  pub exact: ContentHash,
+  pub definition: ContentHash,
+  pub bare: ContentHash,
+  pub flags: u64,
+  pub keyBytes: usize,
+  pub leaf: u64,
+  pub alias: usize,
+  pub references: Span,
+  pub callbacks: Span,
+  pub callees: Span,
+  pub declarationPrefix: usize,
+  pub declarationSuffix: Span,
+  pub body: Option<DeclarationId>,
+}
+
+pub struct Index {
+  pub entries: List<Entry>,
+  pub roots: List<ContentHash>,
+  pub references: List<usize>,
+  pub callbacks: List<ContentHash>,
+  pub callees: List<usize>,
+  pub observing: bool,
+  pub patterns: bool,
+  pub guarded: bool,
+  lookup: InternIndex,
+  length: usize,
+  declarationAt: usize,
+  declarationMemo: Bytes,
+}
+
+fn make(length: usize) -> Index {
+  return Index {entries: List<Entry>.make(), roots: List<ContentHash>.make(), references: List<usize>.make(),
+    callbacks: List<ContentHash>.make(), callees: List<usize>.make(), observing: false, patterns: false, guarded: false,
+    lookup: InternIndex.make(), length: length, declarationAt: usize.MAX, declarationMemo: Bytes.make()}
+}
+fn hash(value: ContentHash) -> u64 { return Hash.combine(value.high, value.low) }
+
+/// Exact entry lookup for shared directories. Ordinary inline consumers use all original
+/// rows, so their reader builds no lookup and this function returns usize.MAX for them.
+pub fn graphEntry(index: &Index, key: ContentHash) -> usize {
+  let entries = List<Entry>.asSlice(&index.entries)
+  let mut at = InternIndex.first(&index.lookup, hash(key))
+  while at != usize.MAX {
+    if ContentHash.equals(entries[at].exact, key) { return at }
+    at = InternIndex.after(&index.lookup, at)
+  }
+  return usize.MAX
+}
+
+fn skip(bytes: &[u8], cursor: &mut BuildRecord.Cursor, count: usize) -> () {
+  if cursor.failed || count > bytes.length - cursor.at { cursor.failed = true return () }
+  cursor.at = cursor.at + count
+}
+fn field(bytes: &[u8], cursor: &mut BuildRecord.Cursor) -> Span {
+  let count = BuildRecord.readCount(bytes, &mut cursor.*)
+  let start = cursor.at
+  skip(bytes, &mut cursor.*, count)
+  return Span.make(start, cursor.at)
+}
+
+// Obligations are retained in the original blob for stale materialization. Green checks need
+// no owned lists, but every flag, digest, length and nested count still has to be well formed.
+fn skipObligations(bytes: &[u8], cursor: &mut BuildRecord.Cursor) -> () {
+  let count = BuildRecord.readCount(bytes, &mut cursor.*)
+  let mut at = usize.ZERO
+  while at < count && !cursor.failed {
+    let exact = BuildRecord.readVarint(bytes, &mut cursor.*)
+    if exact > 1 { cursor.failed = true return () }
+    let callees = BuildRecord.readCount(bytes, &mut cursor.*)
+    if callees > (bytes.length - cursor.at) / 32 { cursor.failed = true return () }
+    skip(bytes, &mut cursor.*, callees * 32)
+    let declarations = BuildRecord.readCount(bytes, &mut cursor.*)
+    let mut declaration = usize.ZERO
+    while declaration < declarations && !cursor.failed {
+      drop field(bytes, &mut cursor.*)
+      declaration = declaration + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+}
+
+effect fn directory(bytes: &[u8], shared: bool) -> Option<Index> ! OutOfMemoryError ? &mut Allocator {
+  let mut cursor = BuildRecord.Cursor {at: usize.ZERO, failed: false}
+  if BuildRecord.readFixed(bytes, &mut cursor) != BuildRecord.FORMAT || cursor.failed { return Option<Index>.none() }
+  let observed = BuildRecord.readVarint(bytes, &mut cursor)
+  let patterned = BuildRecord.readVarint(bytes, &mut cursor)
+  if observed > 3 || patterned > 1 || cursor.failed { return Option<Index>.none() }
+  let mut index = make(bytes.length)
+  index.observing = u64.bitAnd(observed, 1) != 0
+  index.guarded = u64.bitAnd(observed, 2) != 0
+  index.patterns = patterned == 1
+  if shared && (index.guarded || index.patterns) { return Option<Index>.none() }
+  let roots = BuildRecord.readCount(bytes, &mut cursor)
+  if cursor.failed || roots > (bytes.length - cursor.at) / 16 { return Option<Index>.none() }
+  run List<ContentHash>.reserveExact(&mut index.roots, roots)
+  let mut at = usize.ZERO
+  while at < roots {
+    run List<ContentHash>.append(&mut index.roots, BuildRecord.readDigest(bytes, &mut cursor))
+    at = at + usize.ONE
+  }
+  let edgeCount = BuildRecord.readCount(bytes, &mut cursor)
+  if cursor.failed || edgeCount > (bytes.length - cursor.at) / 16 { return Option<Index>.none() }
+  skip(bytes, &mut cursor, edgeCount * 16)
+  let count = BuildRecord.readCount(bytes, &mut cursor)
+  // Even an unknown, bodyless row needs fifty bytes of fixed fields and count markers.
+  if cursor.failed || count > (bytes.length - cursor.at) / 50 { return Option<Index>.none() }
+  run List<Entry>.reserveExact(&mut index.entries, count)
+  let mut previousLength = usize.ZERO
+  at = usize.ZERO
+  while at < count {
+    let exact = BuildRecord.readDigest(bytes, &mut cursor)
+    drop BuildRecord.readFixed(bytes, &mut cursor) // runtime hash
+    drop BuildRecord.readVarint(bytes, &mut cursor) // family
+    let prefix = BuildRecord.readVarint(bytes, &mut cursor)
+    let suffix = field(bytes, &mut cursor)
+    if cursor.failed || prefix > usize.toU64(previousLength) { return Option<Index>.none() }
+    let common = u64.toUsize(prefix)
+    if suffix.end - suffix.start > usize.MAX - common { return Option<Index>.none() }
+    previousLength = common + suffix.end - suffix.start
+    let parent = BuildRecord.readIndexed(bytes, &mut cursor, at)
+    drop BuildRecord.readIndexed(bytes, &mut cursor, usize.MAX) // origin position
+    let requested = BuildRecord.readVarint(bytes, &mut cursor)
+    let alias = BuildRecord.readIndexed(bytes, &mut cursor, at)
+    let leaf = BuildRecord.readVarint(bytes, &mut cursor)
+    let referenceCount = BuildRecord.readCount(bytes, &mut cursor)
+    if cursor.failed || requested > 1 || (requested == 1 && parent == usize.MAX) || leaf > 3 {
+      return Option<Index>.none()
+    }
+    let referencesStart = List<usize>.length(&index.references)
+    let mut reference = usize.ZERO
+    while reference < referenceCount {
+      let target = BuildRecord.readBelow(bytes, &mut cursor, count)
+      drop BuildRecord.readBelow(bytes, &mut cursor, edgeCount)
+      if cursor.failed { return Option<Index>.none() }
+      run List<usize>.append(&mut index.references, target)
+      reference = reference + usize.ONE
+    }
+    drop BuildRecord.readDigest(bytes, &mut cursor) // summary digest
+    let flags = BuildRecord.readVarint(bytes, &mut cursor)
+    let mut definition = ContentHash {high: 0, low: 0}
+    let mut bare = ContentHash {high: 0, low: 0}
+    let mut keyBytes = usize.ZERO
+    let callbacksStart = List<ContentHash>.length(&index.callbacks)
+    let calleesStart = List<usize>.length(&index.callees)
+    if u64.bitAnd(flags, BuildRecord.FACT_KNOWN) != 0 {
+      definition = BuildRecord.readDigest(bytes, &mut cursor)
+      if u64.bitAnd(flags, BuildRecord.FACT_BARE) != 0 { bare = BuildRecord.readDigest(bytes, &mut cursor) }
+      if u64.bitAnd(flags, BuildRecord.FACT_KEY_BYTES) != 0 {
+        let amount = BuildRecord.readVarint(bytes, &mut cursor)
+        if amount > usize.toU64(usize.MAX) { return Option<Index>.none() }
+        keyBytes = u64.toUsize(amount)
+      }
+      skipObligations(bytes, &mut cursor)
+      if u64.bitAnd(flags, BuildRecord.FACT_ACCESSES) != 0 {
+        let callbacks = BuildRecord.readCount(bytes, &mut cursor)
+        if cursor.failed || callbacks > (bytes.length - cursor.at) / 16 { return Option<Index>.none() }
+        let mut callback = usize.ZERO
+        while callback < callbacks {
+          run List<ContentHash>.append(&mut index.callbacks, BuildRecord.readDigest(bytes, &mut cursor))
+          callback = callback + usize.ONE
+        }
+      }
+      if u64.bitAnd(flags, BuildRecord.FACT_CALLEES) != 0 {
+        let callees = BuildRecord.readCount(bytes, &mut cursor)
+        let mut callee = usize.ZERO
+        while callee < callees && !cursor.failed {
+          run List<usize>.append(&mut index.callees, BuildRecord.readBelow(bytes, &mut cursor, referenceCount))
+          callee = callee + usize.ONE
+        }
+      }
+    }
+    if cursor.failed { return Option<Index>.none() }
+    if shared {
+      let required = BuildRecord.FACT_KNOWN + BuildRecord.FACT_KEY_BYTES + BuildRecord.FACT_BOUNDARY_KEY
+      let classified = BuildRecord.FACT_PLAIN_FUNCTION + BuildRecord.FACT_STATIC_ARGUMENTS
+      if u64.bitAnd(flags, required) != required || u64.bitAnd(flags, BuildRecord.FACT_ELSEWHERE) != 0
+        || alias != usize.MAX || (leaf != 0 && leaf != BuildRecord.FOREIGN) { return Option<Index>.none() }
+      if (u64.bitAnd(flags, BuildRecord.FACT_APPLICATION) != 0 && u64.bitAnd(flags, BuildRecord.FACT_CLOSED) == 0)
+        || (leaf == 0 && u64.bitAnd(flags, BuildRecord.FACT_SUMMARIZED) == 0)
+        || (leaf == BuildRecord.FOREIGN && referenceCount != usize.ZERO) { return Option<Index>.none() }
+      if (u64.bitAnd(flags, classified) != 0
+        && u64.bitAnd(flags, BuildRecord.FACT_FUNCTION + BuildRecord.FACT_APPLICATION) != BuildRecord.FACT_FUNCTION + BuildRecord.FACT_APPLICATION)
+        || u64.bitAnd(flags, classified) == classified { return Option<Index>.none() }
+      if graphEntry(&index, exact) != usize.MAX { return Option<Index>.none() }
+    }
+    if shared { run InternIndex.record(&mut index.lookup, hash(exact)) }
+    run List<Entry>.append(&mut index.entries, Entry {exact: exact, definition: definition, bare: bare, flags: flags,
+      keyBytes: keyBytes, leaf: leaf, alias: alias,
+      references: Span.make(referencesStart, List<usize>.length(&index.references)),
+      callbacks: Span.make(callbacksStart, List<ContentHash>.length(&index.callbacks)),
+      callees: Span.make(calleesStart, List<usize>.length(&index.callees)),
+      declarationPrefix: common, declarationSuffix: suffix, body: Option<DeclarationId>.none()})
+    at = at + usize.ONE
+  }
+  if cursor.at != bytes.length { return Option<Index>.none() }
+  if shared {
+    let named = List<ContentHash>.asSlice(&index.roots)
+    at = usize.ZERO
+    while at < named.length { if graphEntry(&index, named[at]) == usize.MAX { return Option<Index>.none() } at = at + usize.ONE }
+    let mut all = run List<usize>.makeWithCapacity(count)
+    at = usize.ZERO
+    while at < count { run List<usize>.append(&mut all, at) at = at + usize.ONE }
+    if !run escapeFree(&index, List<usize>.asSlice(&all)) { return Option<Index>.none() }
+  }
+  return Option<Index>.some(move index)
+}
+
+/// Authenticates and validates a complete normalized graph before any selected view uses it.
+pub effect fn read(bytes: &[u8], expected: ContentHash) -> Option<Index> ! OutOfMemoryError ? &mut Allocator {
+  if !ContentHash.equals(ContentHash.of(bytes), expected) { return Option<Index>.none() }
+  return run directory(bytes, true)
+}
+
+/// Validates the ordinary record format without pretending bounded leaves or aliases form a
+/// complete shared graph. Callers retain the original all-row green and budget semantics.
+pub effect fn readInline(bytes: &[u8]) -> Option<Index> ! OutOfMemoryError ? &mut Allocator {
+  return run directory(bytes, false)
+}
+
+/// Decodes a selected row's declaration once. `bytes` must be the original immutable payload
+/// authenticated/read by this directory; no pointer into it is retained. Shape suffixes follow
+/// the declaration and are deliberately left for full stale materialization.
+pub effect fn ensureDeclaration(index: &mut Index, bytes: &[u8], row: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
+  if bytes.length != index.length || row >= List<Entry>.length(&index.entries) { return false }
+  if let Option<DeclarationId>.Some {..} = &List<Entry>.asSlice(&index.entries)[row].body { return true }
+  let entries = List<Entry>.asSlice(&index.entries)
+  let mut start = row
+  if index.declarationAt != usize.MAX && index.declarationAt <= row {
+    start = index.declarationAt + usize.ONE
+  } else {
+    while start > usize.ZERO && entries[start].declarationPrefix != usize.ZERO { start = start - usize.ONE }
+    Bytes.clear(&mut index.declarationMemo)
+  }
+  // If reconstruction allocation fails, a later retry must not treat the partial bytes as
+  // a valid rolling prefix from the previously decoded row.
+  index.declarationAt = usize.MAX
+  while start <= row {
+    let entry = &entries[start]
+    if entry.declarationPrefix > Bytes.length(&index.declarationMemo) { return false }
+    Bytes.truncate(&mut index.declarationMemo, entry.declarationPrefix)
+    run Bytes.append(&mut index.declarationMemo, StableKey.view(bytes, entry.declarationSuffix))
+    start = start + usize.ONE
+  }
+  index.declarationAt = row
+  let mut reader = StableKey.reader()
+  let body = match move run StableKey.readDeclaration(Bytes.asSlice(&index.declarationMemo), &mut reader) {
+    Option<DeclarationId>.Some {value} => move value
+    Option<DeclarationId>.None => { return false }
+  }
+  let changed = List<Entry>.asMutSlice(&mut index.entries)
+  changed[row].body = Option<DeclarationId>.some(move body)
+  return true
+}
+
+fn position(selected: &[usize], lookup: &InternIndex, entry: usize) -> usize {
+  let mut at = InternIndex.first(lookup, usize.toU64(entry))
+  while at != usize.MAX {
+    if selected[at] == entry { return at }
+    at = InternIndex.after(lookup, at)
+  }
+  return usize.MAX
+}
+fn fits(span: Span, length: usize) -> bool { return span.start <= span.end && span.end <= length }
+
+/// Proves callback escape obligations using only selected rows. Every selected reference and
+/// callback definition must remain inside this closure; a clean unrelated component is not proof.
+pub effect fn escapeFree(index: &Index, selected: &[usize]) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let entries = List<Entry>.asSlice(&index.entries)
+  let references = List<usize>.asSlice(&index.references)
+  let callbacks = List<ContentHash>.asSlice(&index.callbacks)
+  let callees = List<usize>.asSlice(&index.callees)
+  let mut positions = InternIndex.make()
+  let mut keys = List<ContentHash>.make()
+  let mut owners = List<usize>.make()
+  let mut lookup = InternIndex.make()
+  let mut at = usize.ZERO
+  while at < selected.length {
+    let original = selected[at]
+    if original >= entries.length || position(selected, &positions, original) != usize.MAX { return false }
+    run InternIndex.record(&mut positions, usize.toU64(original))
+    let entry = &entries[original]
+    if entry.leaf > BuildRecord.LEFT || !fits(entry.references, references.length)
+      || !fits(entry.callbacks, callbacks.length) || !fits(entry.callees, callees.length) { return false }
+    if entry.leaf == 0 && u64.bitAnd(entry.flags, BuildRecord.FACT_KNOWN + BuildRecord.FACT_SUMMARIZED)
+      != BuildRecord.FACT_KNOWN + BuildRecord.FACT_SUMMARIZED { return false }
+    run List<ContentHash>.append(&mut keys, entry.definition)
+    run List<usize>.append(&mut owners, at)
+    run InternIndex.record(&mut lookup, hash(entry.definition))
+    if u64.bitAnd(entry.flags, BuildRecord.FACT_BARE) != 0 {
+      run List<ContentHash>.append(&mut keys, entry.bare)
+      run List<usize>.append(&mut owners, at)
+      run InternIndex.record(&mut lookup, hash(entry.bare))
+    }
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < selected.length {
+    let entry = &entries[selected[at]]
+    let mut reference = entry.references.start
+    while reference < entry.references.end {
+      if position(selected, &positions, references[reference]) == usize.MAX { return false }
+      reference = reference + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  let mut pending = List<usize>.make()
+  let mut queued = List<bool>.make()
+  run List<bool>.appendRepeated(&mut queued, false, selected.length)
+  at = usize.ZERO
+  while at < selected.length {
+    let entry = &entries[selected[at]]
+    let mut callback = entry.callbacks.start
+    while callback < entry.callbacks.end {
+      let mut named = InternIndex.first(&lookup, hash(callbacks[callback]))
+      let mut found = false
+      while named != usize.MAX {
+        if ContentHash.equals(List<ContentHash>.get(&keys, named), callbacks[callback]) {
+          let target = List<usize>.get(&owners, named)
+          found = true
+          if !List<bool>.get(&queued, target) {
+            List<bool>.set(&mut queued, target, true)
+            run List<usize>.append(&mut pending, target)
+          }
+        }
+        named = InternIndex.after(&lookup, named)
+      }
+      if !found { return false }
+      callback = callback + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  let mut head = usize.ZERO
+  while head < List<usize>.length(&pending) {
+    let target = List<usize>.get(&pending, head)
+    head = head + usize.ONE
+    let entry = &entries[selected[target]]
+    if entry.leaf == BuildRecord.LEFT || u64.bitAnd(entry.flags, BuildRecord.FACT_ESCAPES) != 0 { return false }
+    if entry.leaf == BuildRecord.FOREIGN { continue }
+    if u64.bitAnd(entry.flags, BuildRecord.FACT_CALLEES) == 0 { return false }
+    let mut callee = entry.callees.start
+    while callee < entry.callees.end {
+      let calledAt = callees[callee]
+      if calledAt >= entry.references.end - entry.references.start { return false }
+      let called = position(selected, &positions, references[entry.references.start + calledAt])
+      if called == usize.MAX { return false }
+      if !List<bool>.get(&queued, called) {
+        List<bool>.set(&mut queued, called, true)
+        run List<usize>.append(&mut pending, called)
+      }
+      callee = callee + usize.ONE
+    }
+  }
+  return true
+}
