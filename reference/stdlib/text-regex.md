@@ -25,7 +25,7 @@ and exhausted resource limits are errors, never a negative match.
 
 Import as `Regex` with `import silk.text.regex { Regex }`.
 
-Public declarations: 5.
+Public declarations: 8.
 
 <a id="RegexReason"></a>
 
@@ -256,6 +256,63 @@ match borrows `text`; its offsets count UTF-8 bytes even when the search ran on 
 - `OutOfMemoryError` if the allocator cannot supply converted text, backtracking storage or
   the capture offsets.
 
+<a id="Regex.impl.typed"></a>
+
+### Associated function `typed`
+
+```silk
+pub static fn typed<T>(pattern: string<'static>) -> Typed<T>
+```
+
+Checks a pattern against a capture struct at compile time.
+
+#### Details
+`T` is a struct with named fields, written at `'static`. Every named group of `pattern` must
+be a field of `T` and every field a named group; a field is `Option<string<'a>>` exactly when
+a match can leave its group unset (under `?`, `*` or `{0,n}`, in one alternative of `|`, in a
+negative lookaround, or a name two alternatives share) and `string<'a>` otherwise. Unnamed
+groups need no field. An invalid pattern or a mismatch is a compile error.
+
+#### Gotchas
+`Regex.typed` reads only whether a field type is a union. A field type that is neither
+`string<'a>` nor `Option<string<'a>>`, such as `i32`, is refused where the pattern is
+searched, by the [`Capture`](#Capture) bound of `find` and `whole`.
+
+#### Examples
+##### Read a version tag
+```silk
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.regex { Regex, RegexError, Typed }
+
+struct Version<'a> {
+  pub major: string<'a>,
+  pub minor: string<'a>,
+  pub patch: string<'a>,
+  pub pre: Option<string<'a>>,
+}
+
+const VERSION: Typed<Version<'static>> = Regex.typed<Version<'static>>(
+  "^v(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)(-(?<pre>[0-9a-z.]+))?$",
+)
+
+// The prerelease part of a tag such as v0.1.0-dev.58, if it is a version with one.
+effect fn prerelease<'a>(tag: string<'a>) -> Option<string<'a>>
+  ! RegexError | OutOfMemoryError
+  ? &mut Allocator {
+  let versions = run VERSION.compile()
+  let found = run versions.whole<Version<'a>>(tag)
+  match move found {
+    Option<Version<'a>>.Some { value } => {
+      return value.pre
+    }
+    Option<Version<'a>>.None => {
+      return Option<string<'a>>.none()
+    }
+  }
+}
+```
+
 <a id="Regex.impl.groupCount"></a>
 
 ### Associated function `groupCount`
@@ -356,6 +413,193 @@ Returns the text of group `index`, or none when the group took no part in the ma
 
 #### Gotchas
 The program traps if `index` is not less than `groupCount()`.
+
+<a id="Match.impl.named"></a>
+
+### Method `named`
+
+```silk
+pub fn named(self: &Self, pattern: &Pattern, name: string) -> Option<string<'a>>
+```
+
+Returns the text of the group named `name`, or none when no group of that name took part.
+
+#### Details
+`pattern` is the pattern this match came from. A name that two alternatives share, as in
+`(?<n>a)|(?<n>b)`, gives the text of whichever group took part.
+
+#### Gotchas
+The program traps if `pattern` has more groups than the match, a sign it is another pattern.
+
+<a id="Capture"></a>
+
+## `Capture`
+
+```silk
+pub interface Capture<'a>
+```
+
+A field type that a typed pattern fills from one named capture group.
+
+### Details
+`string<'a>` holds a group every match sets, and `Option<string<'a>>` a group a match can
+leave unset. `Regex.typed` requires a field to be optional exactly when its group can be
+unset, and counts a field type that is a union, such as `Option`, as optional.
+
+<a id="Capture.capture"></a>
+
+### Operation `capture`
+
+```silk
+fn capture(group: Option<string<'a>>) -> Self
+```
+
+Builds the value from the group's text, or from none when the group took no part.
+
+<a id="string.impl.Capture"></a>
+
+## Implementation `Capture<'a> for string<'a>`
+
+```silk
+impl<'a> Capture<'a> for string<'a>
+```
+
+<a id="string.impl.Capture.capture"></a>
+
+### Operation `capture`
+
+```silk
+fn capture(group: Option<string<'a>>) -> string<'a>
+```
+
+Returns the group's text. `Regex.typed` admits a string only for a group every match sets.
+
+<a id="Option.impl.Capture"></a>
+
+## Implementation `Capture<'a> for Option<string<'a>>`
+
+```silk
+impl<'a> Capture<'a> for Option<string<'a>>
+```
+
+<a id="Option.impl.Capture.capture"></a>
+
+### Operation `capture`
+
+```silk
+fn capture(group: Option<string<'a>>) -> Option<string<'a>>
+```
+
+Returns the group's text, or none when the group took no part in the match.
+
+<a id="Typed"></a>
+
+## `Typed`
+
+```silk
+pub struct Typed<T>
+```
+
+A pattern checked at compile time against `T`, a struct with one field per named group.
+
+### Details
+Build it with `Regex.typed`, usually as a `const`. `T` is the struct at `'static`; a search
+names the same struct at the text's lifetime, as in `matcher.find<Version<'a>>(tag)`.
+
+<a id="Typed.impl"></a>
+
+## Implementation `Typed<T>`
+
+```silk
+impl<T> Typed<T>
+```
+
+<a id="Typed.impl.pattern"></a>
+
+### Method `pattern`
+
+```silk
+pub fn pattern(self: &Self) -> string<'static>
+```
+
+Returns the pattern text.
+
+<a id="Typed.impl.compile"></a>
+
+### Method `compile`
+
+```silk
+pub effect fn compile(self: &Self) -> Matcher<T>
+    ! RegexError | OutOfMemoryError
+    ? &mut Allocator
+```
+
+Compiles the pattern for repeated typed searches.
+
+#### Errors
+- `RegexError` with `PatternLimit` for a limit only the compiled program reveals: too many
+  class ranges or nested quantifiers. `Regex.typed` has already rejected every syntax error.
+- `OutOfMemoryError` if the allocator cannot supply the programs.
+
+<a id="Matcher"></a>
+
+## `Matcher`
+
+```silk
+pub struct Matcher<T>
+```
+
+A compiled typed pattern: searches return the capture struct directly.
+
+<a id="Matcher.impl"></a>
+
+## Implementation `Matcher<T>`
+
+```silk
+impl<T> Matcher<T>
+```
+
+<a id="Matcher.impl.find"></a>
+
+### Method `find`
+
+```silk
+pub effect fn find<'a, U>(self: &Self, text: string<'a>) -> Option<U>
+    ! RegexError | OutOfMemoryError
+    ? &mut Allocator
+```
+
+Returns the first match in `text` as a `U`, the capture struct at the text's lifetime.
+
+#### Details
+`U` is the struct `Regex.typed` checked, named again with the lifetime of `text` because
+its fields borrow it: `matcher.find<Version<'a>>(tag)` for a `Matcher<Version<'static>>` and
+a `tag: string<'a>`. A `U` whose fields differ from `T`'s in name or optionality is a
+compile error.
+
+#### Errors
+- `RegexError` with `MatchLimit` after about 1,000,000 backtracking steps, never no match.
+- `OutOfMemoryError` if the allocator cannot supply search storage.
+
+<a id="Matcher.impl.whole"></a>
+
+### Method `whole`
+
+```silk
+pub effect fn whole<'a, U>(self: &Self, text: string<'a>) -> Option<U>
+    ! RegexError | OutOfMemoryError
+    ? &mut Allocator
+```
+
+Returns the match that spans all of `text` as a `U`, or none.
+
+#### Details
+As `find`, but the match must start at the beginning of `text` and end at its end, as if the
+pattern were written `^(?:pattern)$`.
+
+#### Errors
+- `RegexError` with `MatchLimit` after about 1,000,000 backtracking steps, never no match.
+- `OutOfMemoryError` if the allocator cannot supply search storage.
 
 
 Category: Text.
