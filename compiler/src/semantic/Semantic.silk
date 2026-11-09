@@ -103,6 +103,8 @@ import semantic.Specialization {
   Edge,
   OperandPass,
 }
+import backend.RuntimeProof {RuntimeProof, Control as PlanControl, Reference as PlanReference, Site as PlanSite, Obligation as PlanObligation, EscapeSite as PlanEscapeSite, EscapeKind as PlanEscapeKind}
+import backend.MirProof
 import backend.Mir {
   Lowered,
   Cancel as MirCancel,
@@ -2002,6 +2004,8 @@ pub enum Family {
   /// names the type by its lifetime-erased intern, so every body that holds the type shares one
   /// walk of its fields instead of each walking them again.
   CleanupFree,
+  /// Concrete ordered runtime proof before executable materialization.
+  RuntimePlan,
 }
 
 // The Tracy zone name of one query family's provider run.
@@ -2057,6 +2061,7 @@ fn familyName(family: Family) -> string<'static> {
     Family.LlvmText => "LlvmText"
     Family.ModuleCheck => "ModuleCheck"
     Family.CleanupFree => "CleanupFree"
+    Family.RuntimePlan => "RuntimePlan"
   }
 }
 
@@ -2459,6 +2464,8 @@ pub union Value {
   OriginPlan {pub index: usize},
   OriginEvidence {pub index: usize},
   Mir {pub index: usize},
+  /// One completed concrete runtime proof in this store.
+  RuntimePlan {pub index: usize},
   /// The position of a target layout answer in this store's immutable answer arena.
   Layout {pub index: usize},
   /// This target-neutral type has no layout in the current backend subset.
@@ -2978,7 +2985,7 @@ fn hashKey(hashed: u64, key: Key) -> u64 {
   let named = Hash.combine(Hash.combine(hashed, u8.toU64(Family.value(key.family))), usize.toU64(key.name))
   if key.family == Family.Layout || key.family == Family.LlvmText { return named }
   let placed = Hash.combine(Hash.combine(named, usize.toU64(key.module)), usize.toU64(key.declaration))
-  if key.family == Family.Mir || key.family == Family.EmissionInputs { return placed }
+  if key.family == Family.Mir || key.family == Family.RuntimePlan || key.family == Family.EmissionInputs { return placed }
   let member = Hash.combine(placed, usize.toU64(key.member))
   if key.external {
     return Hash.combine(member, 1)
@@ -4140,6 +4147,8 @@ struct Resolver {
   profiles: List<FinalProfile>,
   profileSlot: usize,
   mirValues: List<MirFunction>,
+  runtimePlans: List<RuntimeProof>,
+  runtimePlanMirs: List<usize>,
   // The `mirValues` index of each function the last whole-program walk emitted, in walk order.
   emittedMir: List<usize>,
   // Which lowered functions `releaseStaleMir` emptied, by index, and how many.
@@ -7080,6 +7089,7 @@ fn sameValue(left: &Value, right: &Value) -> bool {
       _ => false
     }
     Value.Mir {..} => false
+    Value.RuntimePlan {..} => false
     Value.Layout {..} => false
     Value.LayoutUnsupported => false
     Value.OriginPlan {..} => false
@@ -7375,7 +7385,7 @@ fn sameKey(left: Key, right: Key) -> bool {
   if left.family == Family.LlvmText || right.family == Family.LlvmText {
     return left.family == right.family && left.name == right.name
   }
-  if left.family == Family.Mir || left.family == Family.EmissionInputs || right.family == Family.Mir || right.family == Family.EmissionInputs {
+  if left.family == Family.Mir || left.family == Family.RuntimePlan || left.family == Family.EmissionInputs || right.family == Family.Mir || right.family == Family.RuntimePlan || right.family == Family.EmissionInputs {
     return left.family == right.family && left.name == right.name && left.module == right.module && left.declaration == right.declaration
   }
   return left.family == right.family && left.module == right.module && left.name == right.name && left.declaration == right.declaration && left.member == right.member && left.external == right.external
@@ -10243,6 +10253,7 @@ effect fn resolveOtherFamily(
     Family.OpaqueRealization => run resolveOpaqueRealization(&mut resolver.*, &mut owner.*, key)
     Family.CallableOrigin => run resolveCallableOrigin(&mut resolver.*, &mut owner.*, key)
     Family.Mir => run lowerMir(&mut resolver.*, &mut owner.*, key)
+    Family.RuntimePlan => run resolveRuntimePlan(&mut resolver.*, &mut owner.*, key)
     Family.Layout => run resolveLayout(&mut resolver.*, &mut owner.*, key)
     Family.PhaseOnly => run resolvePhaseOnly(&mut resolver.*, &mut owner.*, key)
     Family.StaticRouting => run resolveStaticRouting(&mut resolver.*, &mut owner.*, key)
@@ -31427,6 +31438,16 @@ fn answerMirIndex(answer: &Result<Answer, NoRejection>) -> Option<usize> {
   return match & answer.* {
     Result<Answer, NoRejection>.Success {value} => match & value.outcome {
       Outcome.Success {value: Value.Mir {index}} => Option<usize>.some(index)
+      _ => Option<usize>.none()
+    }
+    Result<Answer, NoRejection>.Failure {..} => Option<usize>.none()
+  }
+}
+
+fn answerRuntimePlanIndex(answer: &Result<Answer, NoRejection>) -> Option<usize> {
+  return match & answer.* {
+    Result<Answer, NoRejection>.Success {value} => match & value.outcome {
+      Outcome.Success {value: Value.RuntimePlan {index}} => Option<usize>.some(index)
       _ => Option<usize>.none()
     }
     Result<Answer, NoRejection>.Failure {..} => Option<usize>.none()
@@ -73763,6 +73784,36 @@ fn emptyMir(function: &mut MirFunction) -> () {
   return ()
 }
 
+// The parity-stage oracle consumes the finalized executable answer. The runtime proof has its
+// own query identity and exact dependency edge; no source or provider evidence is invented.
+effect fn resolveRuntimePlan(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, key: Key) -> Answer
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut dependencies = List<Dependency>.make()
+  let mirKey = Key {family: Family.Mir, module: key.module, name: key.name,
+    declaration: key.declaration, member: key.member, external: key.external}
+  let answer = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies, mirKey, Span.make(usize.ZERO, usize.ZERO))
+  if let Option<Shared<Rejection>>.Some {value: cause} = move Shared<Result<Answer, NoRejection>>.with<Option<Shared<Rejection>>>(&answer, answerCause) {
+    return Answer {outcome: Outcome.Unavailable {cause: move cause, partial: Option<Shared<TypedBody>>.none()}, dependencies: move dependencies}
+  }
+  if let Option<Shared<BackendGap>>.Some {value: gap} = move Shared<Result<Answer, NoRejection>>.with<Option<Shared<BackendGap>>>(&answer, answerBackendGap) {
+    return memberSuccess(Value.Unsupported {gap: move gap}, move dependencies)
+  }
+  if let Option<CanonicalizationFailure>.Some {value: reason} = move Shared<Result<Answer, NoRejection>>.with<Option<CanonicalizationFailure>>(&answer, answerCanonicalizationFailure) {
+    return memberSuccess(Value.CanonicalizationFailed {reason: reason}, move dependencies)
+  }
+  let lowered = match move Shared<Result<Answer, NoRejection>>.with<Option<usize>>(&answer, answerMirIndex) {
+    Option<usize>.Some {value} => value
+    _ => { return CompilerBug.panic(b"a completed runtime proof has no executable oracle") }
+  }
+  let proof = run MirProof.extract(&List<MirFunction>.asSlice(&resolver.mirValues)[lowered])
+  let index = List<RuntimeProof>.length(&resolver.runtimePlans)
+  run List<RuntimeProof>.reserve(&mut resolver.runtimePlans, usize.ONE)
+  run List<usize>.reserve(&mut resolver.runtimePlanMirs, usize.ONE)
+  drop List<RuntimeProof>.appendWithinCapacity(&mut resolver.runtimePlans, move proof)
+  drop List<usize>.appendWithinCapacity(&mut resolver.runtimePlanMirs, lowered)
+  return memberSuccess(Value.RuntimePlan {index: index}, move dependencies)
+}
+
 effect fn storeMir(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, function: MirFunction, dependencies: List<Dependency>) -> Answer
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
 ? &mut Allocator | &mut Types {
@@ -73780,7 +73831,13 @@ effect fn storeMir(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejectio
 // Helpers follow their creator, where their own queries find them.
 effect fn storeLowered(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, lowered: Lowered, dependencies: List<Dependency>) -> Answer
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
-  let Lowered {function, helpers} = move lowered
+  if let Option<PlanControl>.Some {..} = &lowered.control {
+    return CompilerBug.panic(b"a proof-only lowering cannot enter executable MIR storage")
+  }
+  if List<PlanControl>.length(&lowered.helperControls) != usize.ZERO {
+    return CompilerBug.panic(b"executable MIR cannot carry proof-only helper controls")
+  }
+  let Lowered {function, helpers, ..} = move lowered
   let mut read = move dependencies
   let mut coalesced = move helpers
   let mut changed = List<MirFunction>.asMutSlice(&mut coalesced)
@@ -86557,6 +86614,7 @@ fn missingRootName(family: Family) -> RejectionCode {
     Family.Signature => RejectionCode.UnknownFunction
     Family.Body => RejectionCode.UnknownFunction
     Family.Mir => RejectionCode.UnknownFunction
+    Family.RuntimePlan => RejectionCode.UnknownFunction
     Family.Constant => RejectionCode.UnknownName
     Family.Initializer => RejectionCode.UnknownName
     Family.ParameterSchema => RejectionCode.UnknownName
@@ -94440,6 +94498,8 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
       profiles: List<FinalProfile>.make(),
       profileSlot: profileSlot,
       mirValues: List<MirFunction>.make(),
+      runtimePlans: List<RuntimeProof>.make(),
+      runtimePlanMirs: List<usize>.make(),
       emittedMir: List<usize>.make(),
       mirReleased: List<bool>.make(),
       mirReleasedCount: usize.ZERO,
@@ -95718,6 +95778,7 @@ impl Semantic {
   pub effect fn stampTarget(self: &Self) -> Bytes ! OutOfMemoryError ? &mut Allocator {
     let mut output = Bytes.make()
     run RuntimeEncoding.field(&mut output, MachineTarget.name(&self.resolver.target))
+    run RuntimeEncoding.field(&mut output, b"checked-runtime-plan-v1")
     return move output
   }
   /// The roots of `image` that hold module checks and escape walks, which rest only on sources and
@@ -96369,6 +96430,11 @@ impl Semantic {
     let index = Shared<Result<Answer, NoRejection>>.with<Option<usize>>(answer, answerMirIndex)
     if let Option<usize>.Some {value} = move index {
       let references = List<MirReference>.length(&List<MirFunction>.asSlice(&self.resolver.mirValues)[value].references)
+      return run Semantic.includeInstanceBudget(&mut self.*, instance, references)
+    }
+    let plan = Shared<Result<Answer, NoRejection>>.with<Option<usize>>(answer, answerRuntimePlanIndex)
+    if let Option<usize>.Some {value} = move plan {
+      let references = List<PlanReference>.length(&List<RuntimeProof>.asSlice(&self.resolver.runtimePlans)[value].references)
       return run Semantic.includeInstanceBudget(&mut self.*, instance, references)
     }
     return true
@@ -97423,7 +97489,7 @@ impl Semantic {
   -> DeclarationCheckResult
     ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
     ? &mut Allocator | &mut Types {
-    let clock = run Progress.enterQuery(&mut self.resolver.progress, u8.toUsize(Family.value(Family.CleanupFree)) + 3, "RuntimeCheck")
+    let clock = run Progress.enterQuery(&mut self.resolver.progress, u8.toUsize(Family.value(Family.RuntimePlan)) + 3, "RuntimeCheck")
     let attempted = run Effect.result(Semantic.checkRuntimeTimed(&mut self.*, &mut request.*, runtime, checked))
     run Progress.leaveQuery(&mut self.resolver.progress, clock)
     return match move attempted {
@@ -98948,6 +99014,15 @@ impl Semantic {
     return run Semantic.demandMirOf(&mut self.*, &mut request.*, declaration)
   }
 
+  // A proof root has the same signature and provider admission as an executable root.
+  effect fn escapeRootPlan(self: &mut Self, request: &mut Request, declaration: &DeclarationId) -> Option<Shared<Result<Answer, NoRejection>>>
+    ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+    ? &mut Allocator | &mut Types {
+    let signature = run Semantic.demandSignatureOf(&mut self.*, &mut request.*, declaration)
+    if run signatureStartsNoWalk(&signature) { return Option<Shared<Result<Answer, NoRejection>>>.none() }
+    return run Semantic.demandRuntimePlanOf(&mut self.*, &mut request.*, declaration)
+  }
+
   // `declarationEscapes`, captured into `capture` as a record of the walk (`BuildRecord`) when
   // `guard` is a unit, which then holds the reads of the walk's growth guards and static closures.
   effect fn capturedEscapes(
@@ -98961,7 +99036,7 @@ impl Semantic {
   ) -> DeclarationCheckResult
     ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
     ? &mut Allocator | &mut Types {
-    let clock = run Progress.enterQuery(&mut self.resolver.progress, u8.toUsize(Family.value(Family.CleanupFree)) + 1, "EscapeWalk")
+    let clock = run Progress.enterQuery(&mut self.resolver.progress, u8.toUsize(Family.value(Family.RuntimePlan)) + 1, "EscapeWalk")
     let attempted = run Effect.result(Semantic.capturedEscapesTimed(&mut self.*, &mut request.*, declarations, extraRoots, boundary, &mut capture.*, guard))
     run Progress.leaveQuery(&mut self.resolver.progress, clock)
     return match move attempted {
@@ -99029,7 +99104,7 @@ impl Semantic {
           requester: Option<RelatedSite>.none()})
         continue
       }
-      let lowered = run Semantic.escapeRootMir(&mut self.*, &mut request.*, declaration)
+      let lowered = run Semantic.escapeRootPlan(&mut self.*, &mut request.*, declaration)
       if let Option<Shared<Result<Answer, NoRejection>>>.Some { value: rawAnswer } = move lowered {
         let span = run authoredRequestSpan(
           &mut self.resolver,
@@ -99042,7 +99117,7 @@ impl Semantic {
         let reportsBefore = List<Shared<Rejection>>.length(&result.rejections) + List<Shared<BackendGap>>.length(&result.gaps)
         run appendCheckedAnswer(&mut result.rejections, &mut result.gaps, &mut self.query, declaration, &answer)
         let reports = List<Shared<Rejection>>.length(&result.rejections) + List<Shared<BackendGap>>.length(&result.gaps) != reportsBefore
-        let index = Shared<Result<Answer, NoRejection>>.with<Option<usize>>(&answer, answerMirIndex)
+        let index = Shared<Result<Answer, NoRejection>>.with<Option<usize>>(&answer, answerRuntimePlanIndex)
         if let Option<usize>.Some { .. } = move index {
           if reports { capture.unreplayable = true }
           let module = DeclarationId.moduleId(declaration)
@@ -99426,7 +99501,7 @@ impl Semantic {
           run Semantic.specializationBudgetRejectionAt(&self.*, &budgetSite.module, budgetSite.span))
         return move result
       }
-      let answer = run Semantic.demandInstanceMir(
+      let answer = run Semantic.demandInstanceRuntimePlan(
         &mut self.*,
         &mut request.*,
         &instance,
@@ -99453,24 +99528,24 @@ impl Semantic {
         let own = run instanceExtent(&mut self.resolver, &instance)
         run relocateRequested(&mut result.rejections, reportedBefore, &site.module, site.span, callerIndependent(&instance), &own)
       }
-      let index = Shared<Result<Answer, NoRejection>>.with<Option<usize>>(&answer, answerMirIndex)
+      let index = Shared<Result<Answer, NoRejection>>.with<Option<usize>>(&answer, answerRuntimePlanIndex)
       if let Option<usize>.Some { value } = move index {
         if entryReports { capture.unreplayable = true }
         let anchor = run instanceAnchor(&mut self.resolver, &instance)
-        if capturing { BuildCapture.lowered(&mut capture.*, entry, run instanceMirUnit(&mut self.resolver, &instance, false)) }
+        if capturing { BuildCapture.lowered(&mut capture.*, entry, run instanceRuntimePlanUnit(&mut self.resolver, &instance, false)) }
         let module = DeclarationId.moduleId(&identity)
-        let functions = List<MirFunction>.asSlice(&self.resolver.mirValues)
+        let functions = List<RuntimeProof>.asSlice(&self.resolver.runtimePlans)
         let function = &functions[value]
-        let summary = run SuspensionSummary.make(function, &instance, module, &anchor, &entered.module, entered.span)
+        let summary = run SuspensionSummary.makeProof(function, &instance, module, &anchor, &entered.module, entered.span)
         if self.keepArtifactWorkers && speculativeFrontier() && !entryReports && !function.observes
           && !spanPresent(&summary.boundary) && !spanPresent(&summary.park)
-          && InternIndex.first(&self.artifactWarmCandidateLookup, usize.toU64(value)) == usize.MAX {
-          run List<usize>.append(&mut self.artifactWarmCandidates, value)
-          run InternIndex.record(&mut self.artifactWarmCandidateLookup, usize.toU64(value))
+          && InternIndex.first(&self.artifactWarmCandidateLookup, usize.toU64(List<usize>.get(&self.resolver.runtimePlanMirs, value))) == usize.MAX {
+          run List<usize>.append(&mut self.artifactWarmCandidates, List<usize>.get(&self.resolver.runtimePlanMirs, value))
+          run InternIndex.record(&mut self.artifactWarmCandidateLookup, usize.toU64(List<usize>.get(&self.resolver.runtimePlanMirs, value)))
         }
         if capturing {
           let digest = run summaryDigest(&summary, function.observes, capture.patterns)
-          run BuildCapture.references(&mut capture.*, entry, &instance, List<MirReference>.asSlice(&function.references), digest)
+          run BuildCapture.proofReferences(&mut capture.*, entry, &instance, List<PlanReference>.asSlice(&function.references), digest)
           run BuildCapture.walked(&mut capture.*, entry, &summary)
         }
         run List<SuspensionSummary>.append(&mut summaries, move summary)
@@ -99480,7 +99555,7 @@ impl Semantic {
             cleanup = Option<Interned<Type>>.some(move root)
           }
         }
-        let references = List<MirReference>.asSlice(&function.references)
+        let references = List<PlanReference>.asSlice(&function.references)
         at = references.length
         while at > usize.ZERO {
           at = at - usize.ONE
@@ -100970,6 +101045,32 @@ impl Semantic {
     run recordRoot(&mut request.*, Family.Mir, &module, b"", &answer)
     return Option<Shared<Result<Answer, NoRejection>>>.some(move answer)
   }
+  /// Demands a named runtime proof with the same provider admission as executable lowering.
+  pub effect fn demandRuntimePlanOf(self: &mut Self, request: &mut Request, declaration: &DeclarationId) -> Option<Shared<Result<Answer, NoRejection>>>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+    let signature = run Semantic.demandSignatureOf(&mut self.*, &mut request.*, declaration)
+    if run signatureRequiresProviders(&signature) { return Option<Shared<Result<Answer, NoRejection>>>.none() }
+    run selectRequest(&mut self.resolver, &request.*)
+    let span = Span.make(usize.ZERO, usize.ZERO)
+    let identity = run Types.internDeclaration(DeclarationId.copy(declaration))
+    let instance = run InstanceKey.named(&identity)
+    let module = ModuleId.copy(DeclarationId.moduleId(declaration))
+    let location = match move run locationOfInstance(&mut self.resolver, &instance) {
+      Option<InstanceLocation>.Some {value} => value
+      Option<InstanceLocation>.None => {
+        return Option<Shared<Result<Answer, NoRejection>>>.some(run Shared<Result<Answer, NoRejection>>.make(Result<Answer, NoRejection>.succeed(run memberRejected(
+          run reject(&self.resolver, &module, RejectionCode.IdentityUnavailable, span), List<Dependency>.make()))))
+      }
+    }
+    let name = run internBackendInstance(&mut self.resolver, &instance, false)
+    let declarationAccess267Request = Key {
+      family: Family.RuntimePlan, module: location.module, name: name, declaration: location.declaration, member: instanceMember(&instance), external: false,
+    }
+    let declarationAccess267 = run internDeclaration(&mut self.resolver, declarationAccess267Request)
+    let answer = run demandRaw(&mut self.resolver, &mut self.query, declarationAccess267, span)
+    run recordRoot(&mut request.*, Family.RuntimePlan, &module, b"", &answer)
+    return Option<Shared<Result<Answer, NoRejection>>>.some(move answer)
+  }
   /// Demands MIR for one complete semantic environment before runtime identity can be reused.
   /// Header validation and admission precede the exact-application query cache; target callees
   /// remain body-lazy. The instance key numbers the application's caller regions canonically;
@@ -101064,6 +101165,34 @@ impl Semantic {
         run Semantic.specializationBudgetRejection(&mut self.*, sourceOwner, span), List<Dependency>.make())))
     }
     run recordRoot(&mut request.*, Family.Mir, &module, b"", &answer)
+    return run anchorCanonicalAnswer(&mut self.resolver, &answer, sourceOwner, span)
+  }
+  /// Demands the concrete proof used by a runtime check, preserving its exact requester.
+  pub effect fn demandInstanceRuntimePlan(self: &mut Self, request: &mut Request, instance: &InstanceKey, sourceOwner: &DeclarationId, span: Span, observing: bool) -> Shared<Result<Answer, NoRejection>>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+    if !run Semantic.includeInstanceBudget(&mut self.*, instance, usize.ZERO) {
+      return run Shared<Result<Answer, NoRejection>>.make(Result<Answer, NoRejection>.succeed(run memberRejected(
+        run Semantic.specializationBudgetRejection(&mut self.*, sourceOwner, span), List<Dependency>.make())))
+    }
+    let declared = DeclarationId.copyShared(&InstanceKey.identity(instance))
+    let module = ModuleId.copy(DeclarationId.moduleId(&declared))
+    let querySpan = Span.make(usize.ZERO, usize.ZERO)
+    let location = match move run locationOfInstance(&mut self.resolver, instance) {
+      Option<InstanceLocation>.Some {value} => value
+      _ => { return run Shared<Result<Answer, NoRejection>>.make(Result<Answer, NoRejection>.succeed(run memberRejected(
+        run reject(&self.resolver, &module, RejectionCode.IdentityUnavailable, querySpan), List<Dependency>.make()))) }
+    }
+    let name = run internBackendInstance(&mut self.resolver, instance, observing)
+    let declarationAccess269Request = Key {
+      family: Family.RuntimePlan, module: location.module, name: name, declaration: location.declaration, member: instanceMember(instance), external: false,
+    }
+    let declarationAccess269 = run internDeclaration(&mut self.resolver, declarationAccess269Request)
+    let answer = run demandRaw(&mut self.resolver, &mut self.query, declarationAccess269, querySpan)
+    if !run Semantic.includeAnswerBudget(&mut self.*, instance, &answer) {
+      return run Shared<Result<Answer, NoRejection>>.make(Result<Answer, NoRejection>.succeed(run memberRejected(
+        run Semantic.specializationBudgetRejection(&mut self.*, sourceOwner, span), List<Dependency>.make())))
+    }
+    run recordRoot(&mut request.*, Family.RuntimePlan, &module, b"", &answer)
     return run anchorCanonicalAnswer(&mut self.resolver, &answer, sourceOwner, span)
   }
   /// Source-validates one instance and returns its immutable content-keyed LLVM answer.
@@ -102008,7 +102137,7 @@ impl Semantic {
     closureNodes: usize, observing: bool, frames: &Option<FrameSelection>) -> BackendBuild
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
   ? &mut Allocator | &mut Types {
-    let clock = run Progress.enterQuery(&mut self.resolver.progress, u8.toUsize(Family.value(Family.CleanupFree)) + 2, "BuildWalk")
+    let clock = run Progress.enterQuery(&mut self.resolver.progress, u8.toUsize(Family.value(Family.RuntimePlan)) + 2, "BuildWalk")
     let attempted = run Effect.result(Semantic.buildFromTimed(&mut self.*, module, runtimeSelected, roots, entrySpan, closureNodes, observing, frames))
     run Progress.leaveQuery(&mut self.resolver.progress, clock)
     return match move attempted {
@@ -106337,6 +106466,25 @@ impl BuildCapture {
     entries[entry].summary = summary
   }
 
+  effect fn proofReferences(self: &mut Self, entry: usize, instance: &InstanceKey, references: &[PlanReference], summary: ContentHash) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+    let owner = DeclarationId.copyShared(&InstanceKey.identity(instance))
+    let mut targets = List<ContentHash>.make()
+    let mut edges = List<ContentHash>.make()
+    run List<ContentHash>.reserveExact(&mut targets, references.length)
+    run List<ContentHash>.reserveExact(&mut edges, references.length)
+    let mut at = usize.ZERO
+    while at < references.length {
+      run List<ContentHash>.append(&mut targets, run keyDigest(&references[at].key, self.patterns))
+      run List<ContentHash>.append(&mut edges, recordDigest(Bytes.asSlice(&run Edge.recordBytes(&references[at].edge, &owner))))
+      at = at + usize.ONE
+    }
+    let entries = List<CaptureEntry>.asMutSlice(&mut self.entries)
+    entries[entry].targets = move targets
+    entries[entry].edges = move edges
+    entries[entry].summary = summary
+  }
+
   // The entry whose identity digest is `digest`, or `usize.MAX`.
   fn find(self: &Self, digest: ContentHash) -> usize {
     let entries = List<CaptureEntry>.asSlice(&self.entries)
@@ -106428,6 +106576,20 @@ effect fn instanceMirUnit(resolver: &mut Resolver, instance: &InstanceKey, obser
   }
   let name = run internBackendInstance(&mut resolver.*, instance, observing)
   let key = run internDeclaration(&mut resolver.*, Key {family: Family.Mir, module: location.module, name: name,
+    declaration: location.declaration, member: instanceMember(instance), external: false})
+  let word = run internKey(&mut resolver.*, key)
+  return u64.toUsize(word.value)
+}
+
+// The exact source dependency unit behind a runtime proof.
+effect fn instanceRuntimePlanUnit(resolver: &mut Resolver, instance: &InstanceKey, observing: bool) -> usize
+! Cycle | OutOfMemoryError ? &mut Allocator {
+  let location = match move run locationOfInstance(&mut resolver.*, instance) {
+    Option<InstanceLocation>.Some {value} => value
+    Option<InstanceLocation>.None => { return usize.MAX }
+  }
+  let name = run internBackendInstance(&mut resolver.*, instance, observing)
+  let key = run internDeclaration(&mut resolver.*, Key {family: Family.RuntimePlan, module: location.module, name: name,
     declaration: location.declaration, member: instanceMember(instance), external: false})
   let word = run internKey(&mut resolver.*, key)
   return u64.toUsize(word.value)
@@ -106948,6 +107110,117 @@ impl SuspensionSummary {
     while at < sites.length {
       if sites[at].kind == MirAccessEscape.Callback { notifies = true }
       run List<SummaryEscape>.append(&mut escapes, SummaryEscape {kind: sites[at].kind, span: anchoredSpan(anchor, sites[at].origin)})
+      at = at + usize.ONE
+    }
+    return SuspensionSummary {
+      key: InstanceKey.copy(instance),
+      module: ModuleId.copy(module),
+      boundary: move boundary,
+      park: move park,
+      nonParking: move nonParking,
+      indirect: move indirect,
+      notifies: notifies,
+      packages: move packages,
+      releases: function.releasesPackages,
+      callees: move callees,
+      calls: move calls,
+      callbacks: move callbacks,
+      accesses: move accesses,
+      escapes: move escapes,
+    }
+  }
+  effect fn makeProof(function: &RuntimeProof, instance: &InstanceKey, module: &ModuleId, anchor: &Option<Anchor>,
+    enteredModule: &ModuleId, entered: Span) -> SuspensionSummary
+  ! OutOfMemoryError ? &mut Allocator {
+    let mut callees = List<InstanceKey>.make()
+    let mut calls = List<Span>.make()
+    let mut callbacks = List<CallbackBoundary>.make()
+    let mut indirect = List<InstanceKey>.make()
+    let mut packages = List<InstanceKey>.make()
+    let direct = List<PlanSite>.asSlice(&function.callees)
+    let mut at = usize.ZERO
+    while at < direct.length {
+      run List<InstanceKey>.append(&mut callees, InstanceKey.copy(&direct[at].key))
+      run List<Span>.append(&mut calls, anchoredSpan(anchor, direct[at].origin))
+      at = at + usize.ONE
+    }
+    let formed = List<PlanSite>.asSlice(&function.callbacks)
+    at = usize.ZERO
+    while at < formed.length {
+      run List<CallbackBoundary>.append(&mut callbacks, CallbackBoundary {key: InstanceKey.copy(&formed[at].key), span: anchoredSpan(anchor, formed[at].origin)})
+      at = at + usize.ONE
+    }
+    let addressed = List<InstanceKey>.asSlice(&function.indirect)
+    at = usize.ZERO
+    while at < addressed.length {
+      run List<InstanceKey>.append(&mut indirect, InstanceKey.copy(&addressed[at]))
+      at = at + usize.ONE
+    }
+    let released = List<InstanceKey>.asSlice(&function.packages)
+    at = usize.ZERO
+    while at < released.length {
+      run List<InstanceKey>.append(&mut packages, InstanceKey.copy(&released[at]))
+      at = at + usize.ONE
+    }
+    let mut boundary = Option<Span>.none()
+    if let Option<BodyOrigin>.Some {value: origin} = &function.suspension { boundary = Option<Span>.some(anchoredSpan(anchor, origin)) }
+    let mut park = Option<Span>.none()
+    if let Option<BodyOrigin>.Some {value: origin} = &function.parks { park = Option<Span>.some(anchoredSpan(anchor, origin)) }
+    let mut nonParking = List<ParkObligation>.make()
+    let owed = List<PlanObligation>.asSlice(&function.nonParking)
+    at = usize.ZERO
+    while at < owed.length {
+      let mut callees = List<InstanceKey>.make()
+      let listed = List<InstanceKey>.asSlice(&owed[at].callees)
+      let mut callee = usize.ZERO
+      while callee < listed.length {
+        run List<InstanceKey>.append(&mut callees, InstanceKey.copy(&listed[callee]))
+        callee = callee + usize.ONE
+      }
+      let mut declarations = List<Interned<DeclarationId>>.make()
+      let named = List<Interned<DeclarationId>>.asSlice(&owed[at].declarations)
+      callee = usize.ZERO
+      while callee < named.length {
+        run List<Interned<DeclarationId>>.append(&mut declarations, Interned<DeclarationId>.clone(&named[callee]))
+        callee = callee + usize.ONE
+      }
+      let mut glues = List<Interned<Type>>.make()
+      let dropped = List<Interned<Type>>.asSlice(&owed[at].glues)
+      callee = usize.ZERO
+      while callee < dropped.length {
+        run List<Interned<Type>>.append(&mut glues, Interned<Type>.clone(&dropped[callee]))
+        callee = callee + usize.ONE
+      }
+      // A proof a toolchain body owes for its caller's value, as `Effect.provideMut` running a
+      // `@nonParking` operation, is reported at the authored call that entered it.
+      let reentered = toolchainModule(module) && !toolchainModule(enteredModule) && entered.end != usize.ZERO
+      let mut span = entered
+      let mut site = ModuleId.copy(enteredModule)
+      if let Option<BodyOrigin>.Some {value: origin} = &owed[at].origin {
+        if !reentered {
+          span = anchoredSpan(anchor, origin)
+          site = ModuleId.copy(module)
+        }
+      }
+      let obligation = ParkObligation {callees: move callees, glues: move glues,
+        declarations: move declarations, exact: owed[at].exact, module: move site, span: span}
+      run List<ParkObligation>.append(&mut nonParking, move obligation)
+      at = at + usize.ONE
+    }
+    let mut accesses = List<CallbackBoundary>.make()
+    let held = List<PlanSite>.asSlice(&function.accesses)
+    at = usize.ZERO
+    while at < held.length {
+      run List<CallbackBoundary>.append(&mut accesses, CallbackBoundary {key: InstanceKey.copy(&held[at].key), span: anchoredSpan(anchor, held[at].origin)})
+      at = at + usize.ONE
+    }
+    let mut escapes = List<SummaryEscape>.make()
+    let mut notifies = false
+    let sites = List<PlanEscapeSite>.asSlice(&function.escapes)
+    at = usize.ZERO
+    while at < sites.length {
+      if sites[at].kind == PlanEscapeKind.Callback { notifies = true }
+      run List<SummaryEscape>.append(&mut escapes, SummaryEscape {kind: match sites[at].kind { PlanEscapeKind.Suspension => MirAccessEscape.Suspension PlanEscapeKind.Callback => MirAccessEscape.Callback }, span: anchoredSpan(anchor, sites[at].origin)})
       at = at + usize.ONE
     }
     return SuspensionSummary {
@@ -113827,4 +114100,89 @@ test effect fn sharedEscapeViewsReuseGreenRootsWithoutFirstParentAssumptions() -
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut types = TypeTable.make()
   run sharedEscapeGreenRootClaims() |> Effect.provideMut<Types>(&mut types) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// The parity-stage proof is independently consumed by the check walk, then compared with the
+// executable oracle. Cache adoption exercises the plan unit's source dependency closure.
+effect fn runtimePlanOracleClaims() -> ()
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError | AssertionError<'static>
+? &mut Allocator | &mut Types {
+  let module = run ModuleId.make(b"memory", b"runtime-plan", b"roots.silk")
+  let source = Option<Bytes>.some(run Bytes.copy(
+    b"fn value() -> i32 { return 1 }\nfn caller() -> i32 { return value() }\n"))
+  let revision = run Revision.publish(&Revision.make(), &module, &source)
+  let target = MachineTarget.forId(TargetId.Aarch64AppleDarwin)
+  let mut store = Semantic.make(run Revision.copy(&revision), target, Option<FinalProfile>.none())
+  let mut request = Request.make()
+  let modules = [ModuleId.copy(&module)]
+  let checked = run Semantic.checkDeclarations(&mut store, &mut request, &modules, &Option<ModuleId>.none())
+  run Testing.expect(!checkRefuses(&checked), "the proof walk checks both concrete roots")
+  let proofs = List<RuntimeProof>.asSlice(&store.resolver.runtimePlans)
+  run Testing.expect(proofs.length >= 2, "ordinary check actually demands runtime proof queries")
+  let mut at = usize.ZERO
+  let mut sawCall = false
+  while at < proofs.length {
+    let proof = &proofs[at]
+    let mir = &List<MirFunction>.asSlice(&store.resolver.mirValues)[List<usize>.get(&store.resolver.runtimePlanMirs, at)]
+    let anchor = Option<Anchor>.none()
+    let entered = Span.make(17, 23)
+    let old = run SuspensionSummary.make(mir, &proof.key, &module, &anchor, &module, entered)
+    let current = run SuspensionSummary.makeProof(proof, &proof.key, &module, &anchor, &module, entered)
+    run Testing.expect(ContentHash.equals(run summaryDigest(&old, mir.observes, false),
+      run summaryDigest(&current, proof.observes, false)), "plan and executable oracle prove identical ordered runtime facts")
+    let mut originalCapture = BuildCapture.walk()
+    let mut planCapture = BuildCapture.walk()
+    let origin = VisitOrigin {parent: usize.MAX, position: usize.ZERO, requested: false}
+    run BuildCapture.enter(&mut originalCapture, &proof.key, origin)
+    run BuildCapture.enter(&mut planCapture, &proof.key, origin)
+    let digest = run summaryDigest(&current, proof.observes, false)
+    run BuildCapture.references(&mut originalCapture, usize.ZERO, &proof.key, List<MirReference>.asSlice(&mir.references), digest)
+    run BuildCapture.proofReferences(&mut planCapture, usize.ZERO, &proof.key, List<PlanReference>.asSlice(&proof.references), digest)
+    let before = &List<CaptureEntry>.asSlice(&originalCapture.entries)[0]
+    let after = &List<CaptureEntry>.asSlice(&planCapture.entries)[0]
+    let targets = List<ContentHash>.asSlice(&before.targets)
+    let wanted = List<ContentHash>.asSlice(&after.targets)
+    let edges = List<ContentHash>.asSlice(&before.edges)
+    let actualEdges = List<ContentHash>.asSlice(&after.edges)
+    run Testing.expect(targets.length == wanted.length && edges.length == actualEdges.length,
+      "the plan preserves reference multiplicity and finite-budget charges")
+    let mut edge = usize.ZERO
+    while edge < targets.length {
+      run Testing.expect(ContentHash.equals(targets[edge], wanted[edge]) && ContentHash.equals(edges[edge], actualEdges[edge]),
+        "reference targets and semantic edge identities keep exact order")
+      edge = edge + usize.ONE
+    }
+    sawCall = sawCall || List<PlanSite>.length(&proof.callees) > usize.ZERO
+    at = at + usize.ONE
+  }
+  run Testing.expect(sawCall, "the comparison includes a real direct call")
+  let image = run Semantic.completeCacheImage(&mut store)
+  let edited = run Revision.publish(&revision, &module, &Option<Bytes>.some(run Bytes.copy(
+    b"fn value() -> bool { return true }\nfn caller() -> i32 { return value() }\n")))
+  let mut warm = Semantic.make(run Revision.copy(&edited), target, Option<FinalProfile>.none())
+  drop run Semantic.adoptCache(&mut warm, &request, &image, false)
+  let actual = run Semantic.checkDeclarations(&mut warm, &mut request, &modules, &Option<ModuleId>.none())
+  let mut fresh = Semantic.make(move edited, target, Option<FinalProfile>.none())
+  let expected = run Semantic.checkDeclarations(&mut fresh, &mut request, &modules, &Option<ModuleId>.none())
+  let found = List<Shared<Rejection>>.asSlice(&actual.rejections)
+  let wanted = List<Shared<Rejection>>.asSlice(&expected.rejections)
+  run Testing.expect(found.length > usize.ZERO && found.length == wanted.length,
+    "a changed callee header invalidates the persisted runtime proof")
+  at = usize.ZERO
+  while at < found.length {
+    let mut left = Bytes.make()
+    let mut right = Bytes.make()
+    let mut sites = List<ModuleId>.make()
+    run Testing.expect((run RejectionImage.encode(&mut left, &found[at], &mut sites))
+      && (run RejectionImage.encode(&mut right, &wanted[at], &mut sites)), "complete diagnostics encode")
+    run Testing.expect(same(Bytes.asSlice(&left), Bytes.asSlice(&right)), "plan cache replay preserves complete ordered diagnostics")
+    at = at + usize.ONE
+  }
+}
+
+test effect fn checkedRuntimePlanPreservesOrderedProofAndCacheGuards() -> ()
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut types = TypeTable.make()
+  run runtimePlanOracleClaims() |> Effect.provideMut<Types>(&mut types) |> Effect.provideMut<Allocator>(&mut allocator)
 }
