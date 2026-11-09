@@ -6,6 +6,7 @@
 //! explicitly requested duplicate directory entries for callers that retain root ordinals.
 
 import semantic.CacheImage
+import semantic.CacheBundleLive
 import semantic.ContentHash {ContentHash}
 import semantic.InternIndex {InternIndex}
 import silk.collections.bytes {Bytes}
@@ -248,12 +249,14 @@ effect fn addAnchor(bundle: &mut Bundle, at: usize, key: &[u8]) -> () ! OutOfMem
 /// Every overlaid leaf becomes an anchor, so changing file/position evidence cannot skip placement.
 pub effect fn leafMut(bundle: &mut Bundle, at: usize) -> &mut CacheImage.Leaf ! OutOfMemoryError ? &mut Allocator {
   bundle.epoch = bundle.epoch + usize.ONE
-  let mut found = overrideAt(&bundle.*, at)
-  if found == usize.MAX {
-    let value = originalLeaf(&bundle.*, at)
+  if !hasAnchor(&bundle.*, at) {
     let mut cursor = keyCursor()
     let key = run Bytes.copy(run keyAt(&bundle.*, &mut cursor, at))
     run addAnchor(&mut bundle.*, at, Bytes.asSlice(&key))
+  }
+  let mut found = overrideAt(&bundle.*, at)
+  if found == usize.MAX {
+    let value = originalLeaf(&bundle.*, at)
     found = List<Override>.length(&bundle.overrides)
     run List<Override>.reserve(&mut bundle.overrides, usize.ONE)
     run InternIndex.record(&mut bundle.overrideLookup, usize.toU64(at))
@@ -263,11 +266,36 @@ pub effect fn leafMut(bundle: &mut Bundle, at: usize) -> &mut CacheImage.Leaf ! 
 }
 pub effect fn updateLeafEvidence(bundle: &mut Bundle, at: usize, digest: ContentHash, text: ContentHash, position: usize, file: usize) -> ()
 ! OutOfMemoryError ? &mut Allocator {
-  let value = run leafMut(&mut bundle.*, at)
+  let prior = leaf(&bundle.*, at)
+  let mut value = prior
   value.digest = digest
   value.text = text
   value.position = position
   value.file = file
+  if evidenceEquals(prior, value) { return () }
+  bundle.epoch = bundle.epoch + usize.ONE
+  if CacheImage.alwaysPlaced(&value) && !hasAnchor(&bundle.*, at) {
+    let mut cursor = keyCursor()
+    let key = run Bytes.copy(run keyAt(&bundle.*, &mut cursor, at))
+    run addAnchor(&mut bundle.*, at, Bytes.asSlice(&key))
+  }
+  let found = overrideAt(&bundle.*, at)
+  if found != usize.MAX {
+    List<Override>.set(&mut bundle.overrides, found, Override {at: at, value: value})
+  } else {
+    run List<Override>.reserve(&mut bundle.overrides, usize.ONE)
+    run InternIndex.record(&mut bundle.overrideLookup, usize.toU64(at))
+    run List<Override>.append(&mut bundle.overrides, Override {at: at, value: value})
+  }
+}
+
+fn hasAnchor(bundle: &Bundle, at: usize) -> bool {
+  let mut found = InternIndex.first(&bundle.anchorLookup, usize.toU64(at))
+  while found != usize.MAX {
+    if List<Anchor>.asSlice(&bundle.anchors)[found].at == at { return true }
+    found = InternIndex.after(&bundle.anchorLookup, found)
+  }
+  return false
 }
 
 pub struct AnswerCursor { part: usize, root: usize, bytes: Bytes, held: Option<Arc<Storage>> }
@@ -405,7 +433,7 @@ pub fn validate(bundle: &Bundle) -> bool {
   if !bundle.valid || nodeCount(bundle) > MAX_ITEMS || leafCount(bundle) > MAX_ITEMS || List<Part>.length(&bundle.parts) > MAX_PARTS { return false }
   let roots = List<CacheImage.Root>.asSlice(&bundle.roots)
   let sources = List<Source>.asSlice(&bundle.sources)
-  if roots.length != sources.length { return false }
+  if roots.length != sources.length || roots.length > MAX_ITEMS { return false }
   let parts = List<Part>.asSlice(&bundle.parts)
   let mut nodes = usize.ZERO
   let mut leaves = usize.ZERO
@@ -1073,7 +1101,7 @@ effect fn addBlob(blobs: &mut List<Blob>, refs: &mut List<BlobRef>, bytes: Arc<B
   return at
 }
 
-pub effect fn encodeFiles(bundle: &Bundle, stamp: &[u8]) -> Files ! OutOfMemoryError ? &mut Allocator {
+effect fn encodeRetainedFiles(bundle: &Bundle, stamp: &[u8]) -> Files ! OutOfMemoryError ? &mut Allocator {
   if !validate(bundle) { return Files {manifest: Bytes.make(), blobs: List<Blob>.make()} }
   let mut manifest = Manifest {stamp: run Bytes.copy(stamp), blobs: List<BlobRef>.make(), segments: List<Segment>.make(), roots: List<Directory>.make(), evidence: List<Evidence>.make()}
   let mut blobs = List<Blob>.make()
@@ -1127,7 +1155,18 @@ pub effect fn encodeFiles(bundle: &Bundle, stamp: &[u8]) -> Files ! OutOfMemoryE
       position: row.value.position, file: row.value.file})
     at = at + usize.ONE
   }
-  return Files {manifest: run manifestBytes(&manifest), blobs: move blobs}
+  if List<Segment>.length(&manifest.segments) > MAX_PARTS { return Files {manifest: Bytes.make(), blobs: List<Blob>.make()} }
+  let referenced = List<BlobRef>.asSlice(&manifest.blobs)
+  let mut total = usize.ZERO
+  at = usize.ZERO
+  while at < referenced.length {
+    if referenced[at].bytes > MAX_BYTES - total { return Files {manifest: Bytes.make(), blobs: List<Blob>.make()} }
+    total = total + referenced[at].bytes
+    at = at + usize.ONE
+  }
+  let encoded = run manifestBytes(&manifest)
+  if Bytes.length(&encoded) > MAX_BYTES { return Files {manifest: Bytes.make(), blobs: List<Blob>.make()} }
+  return Files {manifest: move encoded, blobs: move blobs}
 }
 
 pub effect fn encode(bundle: &Bundle, stamp: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
@@ -1280,11 +1319,19 @@ effect fn bundleClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &m
     Option<Bundle>.Some {value} => move value
     _ => { run Testing.expect(false, "worker shards persist under a different outer stamp without graph rewrites") return () }
   }
-  run Testing.expect(validate(&restored) && leaf(&restored, input).file == laterFile && leaf(&restored, input).position == 3 && leaf(&restored, file).digest.high == 71,
-    "coordinator evidence overlays and cross-part references survive persistence")
-  let mut cursor = edgeCursor(&restored, guard)
+  let restoredGuard = List<CacheImage.Root>.asSlice(&restored.roots)[findRoot(&restored, b"guarded")].node
+  let mut cursor = edgeCursor(&restored, restoredGuard)
   run Testing.expect(match nextEdge(&restored, &mut cursor) { Option<usize>.Some {value} => value == CacheImage.nodeEdge(0) _ => false },
-    "coordinator edges retain earlier shard addresses")
+    "coordinator edges retain the relocated earlier shard dependency")
+  let restoredInput = match nextEdge(&restored, &mut cursor) {
+    Option<usize>.Some {value} => CacheImage.target(value)
+    _ => { run Testing.expect(false, "the input guard survives relocation") return () }
+  }
+  let restoredLeaf = leaf(&restored, restoredInput)
+  run Testing.expect(validate(&restored) && restoredLeaf.position == 3 && leaf(&restored, restoredLeaf.file).digest.high == 70,
+    "coordinator evidence overlays and cross-part file references survive persistence")
+  run Testing.expect(List<CacheImage.Root>.length(&merged.roots) == 3 && List<CacheImage.Root>.length(&restored.roots) == 2,
+    "serialized first-key selection leaves held duplicate ordinal associations unchanged")
   let mut left = run copy(&decoded)
   let mut right = run copy(&decoded)
   run updateLeafEvidence(&mut left, 0, ContentHash {high: 20, low: 1}, ContentHash {high: 0, low: 0}, usize.MAX, usize.MAX)
@@ -1376,4 +1423,319 @@ pub effect fn answerCopy(bundle: &Bundle, root: usize) -> Option<Bytes> ! OutOfM
 
 fn storageIdentity(value: &Arc<Storage>) -> usize {
   return Pointer.address<Storage>(Pointer.fromRef<Storage>(Arc<Storage>.get(value)))
+}
+
+// A new serialized generation can relocate ranges; active held handles keep their old addresses.
+// Self-contained worker shards retain their entire local address space and bytes. Only the small
+// coordinator ranges with external edges need per-node/per-leaf maps and re-encoding.
+struct Relocation {
+  kept: bool,
+  local: bool,
+  oldLeaves: usize,
+  oldNodes: usize,
+  leaves: usize,
+  nodes: usize,
+  newLeaves: usize,
+  newNodes: usize,
+  leafCount: usize,
+  nodeCount: usize,
+  part: usize,
+  leafMap: List<usize>,
+  nodeMap: List<usize>,
+}
+fn relocatedLeaf(layout: &[Relocation], value: usize) -> usize {
+  let mut low = usize.ZERO
+  let mut high = layout.length
+  while low < high {
+    let middle = low + (high - low) / 2
+    if value < layout[middle].oldLeaves + layout[middle].leaves { high = middle } else { low = middle + usize.ONE }
+  }
+  if low == layout.length || !layout[low].kept { return usize.MAX }
+  let row = &layout[low]
+  if row.local { return row.newLeaves + value - row.oldLeaves }
+  return List<usize>.get(&row.leafMap, value - row.oldLeaves)
+}
+fn relocatedNode(layout: &[Relocation], value: usize) -> usize {
+  let mut low = usize.ZERO
+  let mut high = layout.length
+  while low < high {
+    let middle = low + (high - low) / 2
+    if value < layout[middle].oldNodes + layout[middle].nodes { high = middle } else { low = middle + usize.ONE }
+  }
+  if low == layout.length || !layout[low].kept { return usize.MAX }
+  let row = &layout[low]
+  if row.local { return row.newNodes + value - row.oldNodes }
+  return List<usize>.get(&row.nodeMap, value - row.oldNodes)
+}
+
+effect fn encodingLayout(bundle: &Bundle, live: &CacheBundleLive.Live) -> List<Relocation> ! OutOfMemoryError ? &mut Allocator {
+  let parts = List<Part>.asSlice(&bundle.parts)
+  let sources = List<Source>.asSlice(&bundle.sources)
+  let mut answers = List<bool>.make()
+  run List<bool>.appendRepeated(&mut answers, false, parts.length)
+  let mut at = usize.ZERO
+  while at < sources.length {
+    if CacheBundleLive.root(live, at) && sources[at].part != usize.MAX { List<bool>.set(&mut answers, sources[at].part, true) }
+    at = at + usize.ONE
+  }
+  let mut layout = List<Relocation>.make()
+  let mut newLeaves = usize.ZERO
+  let mut newNodes = usize.ZERO
+  let mut newPart = usize.ZERO
+  at = usize.ZERO
+  while at <= parts.length {
+    let oldLeaves = if at == parts.length { bundle.tailLeaves } else { parts[at].leafBase }
+    let oldNodes = if at == parts.length { bundle.tailNodes } else { parts[at].nodeBase }
+    let leaves = if at == parts.length { CacheImage.leafCount(&bundle.tail) } else { parts[at].leaves }
+    let nodes = if at == parts.length { CacheImage.nodeCount(&bundle.tail) } else { parts[at].nodes }
+    let local = at < parts.length && parts[at].leafShift == oldLeaves && parts[at].nodeShift == oldNodes
+    let mut leafMap = List<usize>.make()
+    let mut nodeMap = List<usize>.make()
+    let mut liveLeaves = usize.ZERO
+    let mut liveNodes = usize.ZERO
+    let mut ordinal = usize.ZERO
+    while ordinal < leaves {
+      if CacheBundleLive.leaf(live, oldLeaves + ordinal) {
+        if !local { run List<usize>.append(&mut leafMap, newLeaves + liveLeaves) }
+        liveLeaves = liveLeaves + usize.ONE
+      } else if !local { run List<usize>.append(&mut leafMap, usize.MAX) }
+      ordinal = ordinal + usize.ONE
+    }
+    ordinal = usize.ZERO
+    while ordinal < nodes {
+      if CacheBundleLive.node(live, oldNodes + ordinal) {
+        if !local { run List<usize>.append(&mut nodeMap, newNodes + liveNodes) }
+        liveNodes = liveNodes + usize.ONE
+      } else if !local { run List<usize>.append(&mut nodeMap, usize.MAX) }
+      ordinal = ordinal + usize.ONE
+    }
+    let kept = liveLeaves != usize.ZERO || liveNodes != usize.ZERO || (local && List<bool>.get(&answers, at))
+    let leafCount = if !kept { usize.ZERO } else if local { leaves } else { liveLeaves }
+    let nodeCount = if !kept { usize.ZERO } else if local { nodes } else { liveNodes }
+    run List<Relocation>.append(&mut layout, Relocation {kept: kept, local: local, oldLeaves: oldLeaves, oldNodes: oldNodes,
+      leaves: leaves, nodes: nodes, newLeaves: newLeaves, newNodes: newNodes, leafCount: leafCount, nodeCount: nodeCount,
+      part: newPart, leafMap: move leafMap, nodeMap: move nodeMap})
+    newLeaves = newLeaves + leafCount
+    newNodes = newNodes + nodeCount
+    if kept { newPart = newPart + usize.ONE }
+    at = at + usize.ONE
+  }
+  return move layout
+}
+
+/// Selects a new disk generation without mutating any held root/node/leaf association.
+/// Raw local shards remain byte-identical; dead parts and dead coordinator evidence are removed.
+effect fn compactForEncoding(bundle: &Bundle) -> Option<Bundle> ! OutOfMemoryError ? &mut Allocator {
+  if !validate(bundle) { return Option<Bundle>.none() }
+  let live = match move run CacheBundleLive.compute(bundle) {
+    Option<CacheBundleLive.Live>.Some {value} => move value
+    _ => { return Option<Bundle>.none() }
+  }
+  let plans = run encodingLayout(bundle, &live)
+  let layout = List<Relocation>.asSlice(&plans)
+  let original = List<Part>.asSlice(&bundle.parts)
+  let mut result = make()
+  let mut pending = List<Evidence>.make()
+  let mut keys = keyCursor()
+  let mut at = usize.ZERO
+  while at < layout.length {
+    let row = &layout[at]
+    if !row.kept { at = at + usize.ONE
+      continue }
+    if row.local {
+      let part = &original[at]
+      run List<Part>.append(&mut result.parts, Part {data: Arc<Storage>.clone(&part.data), leaves: row.leafCount, nodes: row.nodeCount,
+        leafBase: row.newLeaves, nodeBase: row.newNodes, leafShift: row.newLeaves, nodeShift: row.newNodes})
+    } else {
+      let mut image = CacheImage.make()
+      let mut ordinal = usize.ZERO
+      while ordinal < row.leaves {
+        let old = row.oldLeaves + ordinal
+        let mapped = List<usize>.get(&row.leafMap, ordinal)
+        if mapped != usize.MAX {
+          let value = leaf(bundle, old)
+          let file = if value.file == usize.MAX { usize.MAX } else { relocatedLeaf(layout, value.file) }
+          if value.file != usize.MAX && file == usize.MAX { return Option<Bundle>.none() }
+          // A local shard can name preceding files or its own files. Later files remain a
+          // manifest overlay, resolved before the common reader tests placement eligibility.
+          let storedFile = if file != usize.MAX && file >= row.newLeaves + row.leafCount { usize.MAX } else { file }
+          let key = run keyAt(bundle, &mut keys, old)
+          drop run CacheImage.addLeaf(&mut image, value.input, run Bytes.copy(key), value.digest, value.position, storedFile, value.text)
+          if storedFile != file {
+            run List<Evidence>.append(&mut pending, Evidence {at: mapped, digest: value.digest, text: value.text, position: value.position, file: file})
+          }
+        }
+        ordinal = ordinal + usize.ONE
+      }
+      ordinal = usize.ZERO
+      while ordinal < row.nodes {
+        if List<usize>.get(&row.nodeMap, ordinal) != usize.MAX {
+          let mut edges = List<usize>.make()
+          let mut cursor = edgeCursor(bundle, row.oldNodes + ordinal)
+          while let Option<usize>.Some {value: edge} = nextEdge(bundle, &mut cursor) {
+            let target = if CacheImage.namesNode(edge) { relocatedNode(layout, CacheImage.target(edge)) }
+              else { relocatedLeaf(layout, CacheImage.target(edge)) }
+            if target == usize.MAX { return Option<Bundle>.none() }
+            run List<usize>.append(&mut edges, if CacheImage.namesNode(edge) { CacheImage.nodeEdge(target) } else { CacheImage.leafEdge(target) })
+          }
+          drop run CacheImage.addNode(&mut image, List<usize>.asSlice(&edges))
+        }
+        ordinal = ordinal + usize.ONE
+      }
+      let data = run Arc<Storage>.make(Storage.Fresh {image: move image})
+      run List<Part>.append(&mut result.parts, Part {data: move data, leaves: row.leafCount, nodes: row.nodeCount,
+        leafBase: row.newLeaves, nodeBase: row.newNodes, leafShift: usize.ZERO, nodeShift: usize.ZERO})
+    }
+    result.tailLeaves = row.newLeaves + row.leafCount
+    result.tailNodes = row.newNodes + row.nodeCount
+    at = at + usize.ONE
+  }
+  // Raw local storage keeps its encoded leaf evidence; translate only the selected overlays.
+  let overrides = List<Override>.asSlice(&bundle.overrides)
+  at = usize.ZERO
+  while at < overrides.length {
+    let old = overrides[at].at
+    if CacheBundleLive.leaf(&live, old) {
+      let part = partForLeaf(bundle, old)
+      if layout[part].local {
+        let value = overrides[at].value
+        let mapped = relocatedLeaf(layout, old)
+        let file = if value.file == usize.MAX { usize.MAX } else { relocatedLeaf(layout, value.file) }
+        if mapped == usize.MAX || (value.file != usize.MAX && file == usize.MAX) { return Option<Bundle>.none() }
+        run List<Evidence>.append(&mut pending, Evidence {at: mapped, digest: value.digest, text: value.text, position: value.position, file: file})
+      }
+    }
+    at = at + usize.ONE
+  }
+  let evidence = List<Evidence>.asSlice(&pending)
+  at = usize.ZERO
+  while at < evidence.length {
+    let row = evidence[at]
+    run updateLeafEvidence(&mut result, row.at, row.digest, row.text, row.position, row.file)
+    at = at + usize.ONE
+  }
+  let anchors = List<Anchor>.asSlice(&bundle.anchors)
+  at = usize.ZERO
+  while at < anchors.length {
+    let old = anchors[at].at
+    if CacheBundleLive.leaf(&live, old) && CacheImage.alwaysPlaced(&leaf(bundle, old)) {
+      let mapped = relocatedLeaf(layout, old)
+      if mapped == usize.MAX { return Option<Bundle>.none() }
+      run addAnchor(&mut result, mapped, Bytes.asSlice(&anchors[at].key))
+    }
+    at = at + usize.ONE
+  }
+  let roots = List<CacheImage.Root>.asSlice(&bundle.roots)
+  let sources = List<Source>.asSlice(&bundle.sources)
+  at = usize.ZERO
+  while at < roots.length {
+    if CacheBundleLive.root(&live, at) {
+      let mapped = relocatedNode(layout, roots[at].node)
+      if mapped == usize.MAX { return Option<Bundle>.none() }
+      let source = sources[at]
+      if source.part != usize.MAX && layout[source.part].local {
+        let part = layout[source.part].part
+        drop run pushRoot(&mut result, CacheImage.Root {key: run Bytes.copy(Bytes.asSlice(&roots[at].key)), node: mapped, answer: Bytes.make()},
+          Source {part: part, root: source.root})
+      } else {
+        let answer = match move run answerCopy(bundle, at) {
+          Option<Bytes>.Some {value} => move value
+          _ => { return Option<Bundle>.none() }
+        }
+        drop run addRoot(&mut result, CacheImage.Root {key: run Bytes.copy(Bytes.asSlice(&roots[at].key)), node: mapped, answer: move answer})
+      }
+    }
+    at = at + usize.ONE
+  }
+  if !validate(&result) { return Option<Bundle>.none() }
+  return Option<Bundle>.some(move result)
+}
+
+/// Encodes only the selected live generation. Wholly dead shards disappear from the blob list;
+/// live raw shard bytes are shared unchanged and only coordinator ranges are relocated.
+pub effect fn encodeFiles(bundle: &Bundle, stamp: &[u8]) -> Files ! OutOfMemoryError ? &mut Allocator {
+  let compacted = match move run compactForEncoding(bundle) {
+    Option<Bundle>.Some {value} => move value
+    _ => { return Files {manifest: Bytes.make(), blobs: List<Blob>.make()} }
+  }
+  return run encodeRetainedFiles(&compacted, stamp)
+}
+
+effect fn pruningClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let shared = run fixture(b"shared", b"stable-answer")
+  let sharedFiles = run encodeFiles(&shared, b"independent-stamp")
+  let sharedBlob = &List<Blob>.asSlice(&sharedFiles.blobs)[0]
+  let mut current = run fixture(b"current", b"initial")
+  drop run appendSelected(&mut current, &shared, &[0])
+  let mut generation = usize.ZERO
+  while generation < 8 {
+    let sharedRoot = findRoot(&current, b"shared")
+    let mut fresh = run fixture(b"current", &[usize.toU8(generation)])
+    drop run appendSelected(&mut fresh, &current, &[sharedRoot])
+    let sharedNode = List<CacheImage.Root>.asSlice(&fresh.roots)[1].node
+    let input = run addLeaf(&mut fresh, true, run Bytes.copy(b"facet"), ContentHash {high: usize.toU64(generation) + 1, low: 2},
+      generation, usize.ZERO, ContentHash {high: 3, low: 4})
+    let joined = run addNode(&mut fresh, &[CacheImage.nodeEdge(0), CacheImage.nodeEdge(sharedNode), CacheImage.leafEdge(input)])
+    drop run addRoot(&mut fresh, CacheImage.Root {key: run Bytes.copy(b"joined"), node: joined, answer: run Bytes.copy(b"joined-answer")})
+    run seal(&mut fresh)
+    let file = run addLeaf(&mut fresh, false, run Bytes.copy(b"late-file"), ContentHash {high: 90, low: usize.toU64(generation)},
+      usize.MAX, usize.MAX, ContentHash {high: 0, low: 0})
+    let captured = leaf(&fresh, input)
+    run updateLeafEvidence(&mut fresh, input, captured.digest, captured.text, captured.position, file)
+    let heldNodes = nodeCount(&fresh)
+    let heldLeaves = leafCount(&fresh)
+    let files = run encodeFiles(&fresh, b"persistent-generation")
+    run Testing.expect(Bytes.length(&files.manifest) != usize.ZERO && List<Blob>.length(&files.blobs) <= 5,
+      "repeated replacements remove dead shard generations instead of accumulating blobs")
+    run Testing.expect(nodeCount(&fresh) == heldNodes && leafCount(&fresh) == heldLeaves,
+      "encoding never renumbers active held node or leaf associations")
+    let rows = List<Blob>.asSlice(&files.blobs)
+    let mut at = usize.ZERO
+    let mut sharedUnchanged = false
+    while at < rows.length {
+      if ContentHash.equals(rows[at].digest, sharedBlob.digest) && same(Bytes.asSlice(Arc<Bytes>.get(&rows[at].bytes)), Bytes.asSlice(Arc<Bytes>.get(&sharedBlob.bytes))) {
+        sharedUnchanged = true
+      }
+      at = at + usize.ONE
+    }
+    run Testing.expect(sharedUnchanged, "relocating a live self-contained shard preserves its exact encoded bytes")
+    let manifest = match move run readManifest(run Bytes.copy(Bytes.asSlice(&files.manifest)), b"persistent-generation") {
+      Option<Manifest>.Some {value} => move value
+      _ => { run Testing.expect(false, "the compacted manifest validates") return () }
+    }
+    let mut supplied = List<Blob>.make()
+    at = usize.ZERO
+    while at < rows.length {
+      run List<Blob>.append(&mut supplied, Blob {digest: rows[at].digest, bytes: Arc<Bytes>.clone(&rows[at].bytes)})
+      at = at + usize.ONE
+    }
+    current = match move run assemble(move manifest, move supplied) {
+      Option<Bundle>.Some {value} => move value
+      _ => { run Testing.expect(false, "every relocated generation decodes transactionally") return () }
+    }
+    run Testing.expect(nodeCount(&current) == 3 && leafCount(&current) == 4 && List<CacheImage.Root>.length(&current.roots) == 3,
+      "only two live raw nodes and their live coordinator dependency remain")
+    let joinedRoot = findRoot(&current, b"joined")
+    let rootNode = List<CacheImage.Root>.asSlice(&current.roots)[joinedRoot].node
+    let mut edges = edgeCursor(&current, rootNode)
+    let mut inputLeaf = usize.MAX
+    while let Option<usize>.Some {value: edge} = nextEdge(&current, &mut edges) {
+      if !CacheImage.namesNode(edge) { inputLeaf = CacheImage.target(edge) }
+    }
+    run Testing.expect(inputLeaf != usize.MAX && leaf(&current, inputLeaf).position == generation,
+      "the live input guard records this generation's evidence")
+    let fileLeaf = leaf(&current, inputLeaf).file
+    run Testing.expect(fileLeaf != usize.MAX && leaf(&current, fileLeaf).digest.high == 90
+      && leaf(&current, fileLeaf).digest.low == usize.toU64(generation), "forward recorded-file overlays retain the exact current file")
+    let mut answer = answerCursor()
+    run Testing.expect(match run answerAt(&current, &mut answer, findRoot(&current, b"shared")) {
+      Option<&[u8]>.Some {value} => same(value, b"stable-answer") _ => false
+    }, "shared immutable answers remain selected through coordinator relocation")
+    generation = generation + usize.ONE
+  }
+}
+
+test effect fn immutableCacheBundlePrunesReplacedGenerations() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run pruningClaims() |> Effect.provideMut<Allocator>(&mut allocator)
 }
