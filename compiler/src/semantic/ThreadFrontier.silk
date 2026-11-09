@@ -2,6 +2,14 @@
 //! A controller owns each join handle; closing or dropping it wakes the worker and joins it.
 //! Commands and replies are owned transferable values, never borrowed query-store state.
 
+import semantic.FrontierPolicy
+import semantic.FrontierHost {FrontierHost}
+import silk.mem.pointer {Pointer}
+import silk.num.u64
+import silk.collections.list {List}
+import silk.collections.hash {Hash}
+import silk.num.u8
+import silk.num.usize
 import silk.concurrency.sync {Arc, Mutex, Condition}
 import silk.concurrency.thread {Transferable}
 import silk.concurrency.thread_native {NativeThread, JoinHandle, SpawnError}
@@ -96,7 +104,7 @@ pub effect<'static> fn start<
 impl<C, R> Worker<C, R> {
   /// Queues one command without waiting. A closed or busy worker returns the original command.
   /// No allocation, payload destructor, or user callback executes while the channel is locked.
-  pub fn submit(self: &mut Self, command: C) -> Result<(), C> {
+  pub fn submit(self: &Self, command: C) -> Result<(), C> {
     let shared = Arc<Control<C, R>>.get(&self.control)
     let mut guard = Mutex<State<C, R>>.lock(&shared.state)
     if guard.get().closed || guard.get().finished || guard.get().outstanding {
@@ -113,7 +121,7 @@ impl<C, R> Worker<C, R> {
 
   /// Waits for the outstanding reply, or returns none after an early worker exit or cancellation.
   /// A completed reply remains available even if the entry routine has already returned.
-  pub fn receive(self: &mut Self) -> Option<R> {
+  pub fn receive(self: &Self) -> Option<R> {
     let shared = Arc<Control<C, R>>.get(&self.control)
     let mut guard = Mutex<State<C, R>>.lock(&shared.state)
     while true {
@@ -202,5 +210,94 @@ impl<C, R> Endpoint<C, R> {
     drop guard
     Condition.notifyAll(&shared.changed)
     return Result<(), R>.succeed(())
+  }
+}
+
+
+/// Explicit experimental opt-in. Host capacity and immutable source admission still apply.
+pub fn requested() -> bool {
+  return !Pointer.isNullMany<u8>(unsafe FrontierHost.environment(Pointer.fromSlice<u8>(b"SILK_EXPERIMENT_THREADS\0")))
+}
+/// Checks the same conservative CPU/memory admission as process workers before shared setup.
+/// A caller must refresh admission immediately before spawning its worker pool.
+pub effect fn admitted() -> bool ? &mut Allocator {
+  if !requested() || !available() { return false }
+  if run FrontierPolicy.eligible() { return true }
+  let refused = b"frontier host capacity refused ms=0 a=0 b=0\n"
+  drop unsafe FrontierHost.write(2, Pointer.fromSlice<u8>(refused), refused.length)
+  return false
+}
+
+struct TaskCursor {next: usize, count: usize, cancelled: bool}
+struct TaskClaim {high: u64, low: u64, owner: usize}
+/// A fixed invocation's uniquely assigned task ordinals. It owns no semantic/store state.
+/// Completion and proof authority remain in the coordinator's validated result directory.
+pub struct TaskQueue {cursor: Arc<Mutex<TaskCursor>>, claims: Arc<Mutex<List<TaskClaim>>>}
+impl TaskQueue {
+  pub effect fn make(count: usize) -> Self ! OutOfMemoryError ? &mut Allocator {
+    let mut claims = run List<TaskClaim>.makeWithCapacity(131072)
+    let mut at = usize.ZERO
+    while at < 131072 {
+      run List<TaskClaim>.append(&mut claims, TaskClaim {high: 0, low: 0, owner: usize.MAX})
+      at = at + usize.ONE
+    }
+    return Self {cursor: run Arc<Mutex<TaskCursor>>.make(run Mutex<TaskCursor>.make(
+      TaskCursor {next: usize.ZERO, count: count, cancelled: false})),
+      claims: run Arc<Mutex<List<TaskClaim>>>.make(run Mutex<List<TaskClaim>>.make(move claims))}
+  }
+  pub fn clone(self: &Self) -> Self { return Self {cursor: Arc<Mutex<TaskCursor>>.clone(&self.cursor),
+    claims: Arc<Mutex<List<TaskClaim>>>.clone(&self.claims)} }
+  /// Claims one ordinal exactly once; a miss never waits for another worker's provider.
+  pub fn take(self: &Self) -> Option<usize> {
+    let mut held = Mutex<TaskCursor>.lock(Arc<Mutex<TaskCursor>>.get(&self.cursor))
+    let cursor = held.getMut()
+    if cursor.cancelled || cursor.next >= cursor.count { return Option<usize>.none() }
+    let selected = cursor.next
+    cursor.next = selected + usize.ONE
+    return Option<usize>.some(selected)
+  }
+  /// Prevents further tasks from starting. Already executing work must still be joined.
+  pub fn cancel(self: &Self) -> () {
+    let mut held = Mutex<TaskCursor>.lock(Arc<Mutex<TaskCursor>>.get(&self.cursor))
+    let cursor = held.getMut()
+    cursor.cancelled = true
+  }
+}
+
+
+impl TaskQueue {
+  /// Claims a complete semantic definition identity for one worker, never a hash prefix.
+  /// A full bounded probe falls back to local work; global graph proof still checks duplicates.
+  pub fn claim(self: &Self, high: u64, low: u64, worker: usize) -> bool {
+    if worker == usize.MAX { return true }
+    let mut held = Mutex<List<TaskClaim>>.lock(Arc<Mutex<List<TaskClaim>>>.get(&self.claims))
+    let table = held.getMut()
+    let slots = List<TaskClaim>.asMutSlice(&mut table.*)
+    let mut at = u64.toUsize(Hash.combine(high, low)) % slots.length
+    let mut scanned = usize.ZERO
+    while scanned < 256 {
+      if slots[at].owner == usize.MAX {
+        slots[at] = TaskClaim {high: high, low: low, owner: worker}
+        return true
+      }
+      if slots[at].high == high && slots[at].low == low { return slots[at].owner == worker }
+      at = (at + usize.ONE) % slots.length
+      scanned = scanned + usize.ONE
+    }
+    return true
+  }
+  /// Returns a known producer, or no owner when local duplicate work was required.
+  pub fn owner(self: &Self, high: u64, low: u64) -> usize {
+    let held = Mutex<List<TaskClaim>>.lock(Arc<Mutex<List<TaskClaim>>>.get(&self.claims))
+    let slots = List<TaskClaim>.asSlice(held.get())
+    let mut at = u64.toUsize(Hash.combine(high, low)) % slots.length
+    let mut scanned = usize.ZERO
+    while scanned < 256 {
+      if slots[at].owner == usize.MAX { return usize.MAX }
+      if slots[at].high == high && slots[at].low == low { return slots[at].owner }
+      at = (at + usize.ONE) % slots.length
+      scanned = scanned + usize.ONE
+    }
+    return usize.MAX
   }
 }
