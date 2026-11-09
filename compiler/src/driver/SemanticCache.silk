@@ -945,39 +945,46 @@ pub effect fn save(store: &mut Semantic, file: &CacheFile) -> ()
 }
 
 /// As [`save`], but in a copy of the process (`DetachedWriter`), so a build links its units and
-/// exits without waiting for the write. Returns at once in the build; the copy writes the file,
-/// removes the packs no unit of `units` names when the build has units ([`prunePacks`]) and exits.
-/// Where no copy can start, both run here.
+/// exits without waiting for the write. Returns at once in the build; the copy writes new pack
+/// bodies, then the image that names them, removes packs no unit of `units` names and exits.
+/// Where no copy can start, the same writes run here.
 ///
 /// # Gotchas
-/// Call it on the build's only thread. Packs written beside the file before the call are the ones
-/// the file names.
+/// Call it on the build's only thread after semantic validation. Pack directories are prepared
+/// before the fork; the copy never recreates directories removed by a concurrent clean.
 pub effect fn saveDetached(store: &mut Semantic, file: &CacheFile, units: Option<&[CodegenUnit]>) -> ()
   ! Cycle | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  if current(&store.*, file) { return () }
+  if current(&store.*, file) {
+    // Preserve repair of a missing pack even when no new semantic image is needed.
+    if let Option<&[CodegenUnit]>.Some {value: built} = &units { run storePacks(file, built) }
+    return ()
+  }
+  if let Option<&[CodegenUnit]>.Some {..} = &units { drop run preparePacks(file) }
   let held = match move run DetachedWriter.hold(&file.lock) {
     Option<Held>.Some {value} => move value
-    Option<Held>.None => {
-      run persist(&mut store.*, file, true)
-      return run pruneBuilt(file, &units)
-    }
+    Option<Held>.None => { return run persistBuilt(&mut store.*, file, &units, true) }
   }
   match move DetachedWriter.handOff(move held) {
     Handoff.Original => {}
     Handoff.Copy {held: kept} => {
-      // The copy shares the build's call stack, so no failure may return into it.
-      let written = run Effect.result(persist(&mut store.*, file, false))
-      drop written
-      let pruned = run Effect.result(pruneBuilt(file, &units))
-      drop pruned
+      // The copy shares the build's call stack, so no failure may return into it. Packs and
+      // image share the writer lock; best-effort pruning remains the last step.
+      drop run Effect.result(persistBuilt(&mut store.*, file, &units, false))
       DetachedWriter.finish(move kept)
     }
     Handoff.Here {held: kept} => {
-      run persist(&mut store.*, file, true)
-      run pruneBuilt(file, &units)
+      run persistBuilt(&mut store.*, file, &units, true)
       drop kept
     }
   }
+}
+
+// The accepted IR bodies and their semantic image form one ordered writer operation.
+effect fn persistBuilt(store: &mut Semantic, file: &CacheFile, units: &Option<&[CodegenUnit]>, creating: bool) -> ()
+  ! Cycle | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  if let Option<&[CodegenUnit]>.Some {value: built} = &units.* { run storePacksIn(file, built, creating) }
+  run persist(&mut store.*, file, creating)
+  return run pruneBuilt(file, units)
 }
 
 // `prunePacks` for a build that has units.
@@ -1218,17 +1225,24 @@ effect fn packPath(directory: &Path, digest: ContentHash) -> Path ! FileError | 
 /// writes an image that names them. Best effort, as [`save`] is: a body that cannot be written
 /// leaves its definitions to be lowered again.
 pub effect fn storePacks(file: &CacheFile, units: &[CodegenUnit]) -> () ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  return run storePacksIn(file, units, true)
+}
+
+// The parent prepares directories before fork; detached copies only use existing directories.
+effect fn preparePacks(file: &CacheFile) -> bool ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
   let created = run Effect.result(FileSystem.createDirectoriesRecursively(&file.packs))
-  match move created {
-    Result<(), FileError | OutOfMemoryError>.Success {..} => {}
+  return match move created {
+    Result<(), FileError | OutOfMemoryError>.Success {..} => true
     Result<(), FileError | OutOfMemoryError>.Failure {error} => match move error {
-      FileError failure => {
-        drop failure
-        return ()
-      }
+      FileError failure => { drop failure return false }
       OutOfMemoryError exhausted => { fail move exhausted }
     }
   }
+}
+
+effect fn storePacksIn(file: &CacheFile, units: &[CodegenUnit], creating: bool) -> ()
+  ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  if creating && !run preparePacks(file) { return () }
   let mut at = usize.ZERO
   while at < units.length {
     let unit = &units[at]
@@ -1284,4 +1298,57 @@ pub effect fn prunePacks(file: &CacheFile, units: &[CodegenUnit]) -> () ! OutOfM
       drop removed
     }
   }
+}
+
+import silk.testing.testing {Testing, AssertionError}
+
+// The detached writer may race with an explicit clean. It writes only into the directory the
+// parent prepared, and pack storage neither truncates reusable bodies nor removes unrelated
+// packs before the image publication phase.
+effect fn detachedPackClaims() -> () ! FileError | OutOfMemoryError | AssertionError<'static>
+  ? &mut FileSystem | &mut Allocator {
+  let temporary = run Path.fromBytes(b"/tmp")
+  let root = run FileSystem.createTemporaryDirectory(&temporary, b"silk-detached-packs-")
+  let use = effect fn(directory: &mut Path) -> () ! FileError | OutOfMemoryError | AssertionError<'static>
+    ? &mut FileSystem | &mut Allocator {
+    let file = CacheFile {
+      path: run Path.join(&directory.*, "semantic"), packs: run Path.join(&directory.*, "semantic.packs"),
+      lock: run Path.join(&directory.*, "semantic.lock"), stamp: Bytes.make(), own: false,
+      adopted: Adopted {roots: 0, stale: 0, nodes: 0, changedLeaves: 0},
+    }
+    let digest = ContentHash {high: 1, low: 2}
+    let body = b"accepted LLVM body"
+    let units = [CodegenUnit {head: Bytes.make(), body: run Bytes.copy(body), digest: digest,
+      stored: false, exports: Option<Bytes>.none()}]
+    let path = run packPath(&file.packs, digest)
+    run Testing.expect(run preparePacks(&file), "the parent prepares the pack directory before handoff")
+    run storePacksIn(&file, &units, false)
+    let written = run FileSystem.readFile(&path)
+    let actual = Bytes.asSlice(&written)
+    let mut equal = actual.length == body.length
+    let mut at = usize.ZERO
+    while equal && at < body.length { equal = actual[at] == body[at] at = at + usize.ONE }
+    run Testing.expect(equal, "the detached writer publishes the accepted body's exact bytes")
+    let reused = [CodegenUnit {head: Bytes.make(), body: Bytes.make(), digest: digest,
+      stored: true, exports: Option<Bytes>.none()}]
+    run storePacksIn(&file, &reused, false)
+    let retained = run FileSystem.readFile(&path)
+    run Testing.expect(Bytes.length(&retained) == body.length, "stored units never replace a reusable body with empty bytes")
+    run FileSystem.removeDirectoryRecursively(&file.packs)
+    run storePacksIn(&file, &units, false)
+    run Testing.expect(!run FileSystem.exists(&file.packs), "a detached writer never resurrects a directory removed by clean")
+    run storePacks(&file, &units)
+    run Testing.expect(run FileSystem.exists(&path), "the synchronous writer can prepare its directory and repair a missing pack")
+  }
+  let release = effect fn(directory: &mut Path) -> () ? &mut FileSystem | &mut Allocator {
+    drop run Effect.result(FileSystem.removeDirectoryRecursively(&directory.*))
+  }
+  return run Effect.useReleaseNonParking(move root, move use, move release)
+}
+
+test effect fn detachedPacksPreserveAcceptedBodiesAndRespectClean() -> ()
+  ! FileError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut files = run MachineFileSystem.make() |> Effect.provideMut<Allocator>(&mut allocator)
+  return run detachedPackClaims() |> Effect.provideMut<FileSystem>(&mut files) |> Effect.provideMut<Allocator>(&mut allocator)
 }
