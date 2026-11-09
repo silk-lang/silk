@@ -169,6 +169,42 @@ fn hasProcess(bytes: &[u8], pid: u64) -> bool {
   return found
 }
 
+// Kernel cgroup_base_files marks cgroup.type and cgroup.events CFTYPE_NOT_ON_ROOT;
+// this tests the actual hierarchy root, not a cgroup namespace's displayed root.
+// https://docs.kernel.org/admin-guide/cgroup-v2.html#interface-files
+// https://github.com/torvalds/linux/blob/master/kernel/cgroup/cgroup.c
+// Controller files alone cannot prove unlimited capacity: a non-root may lack controllers.
+fn unlimitedRootNames(atMountRoot: bool, names: &[Bytes]) -> bool {
+  if !atMountRoot { return false }
+  let mut core: u64 = 0
+  let mut at = usize.ZERO
+  while at < names.length {
+    let name = Bytes.asSlice(&names[at])
+    if same(name, b"cgroup.type") || same(name, b"cgroup.events")
+      || same(name, b"cpu.max") || same(name, b"memory.max") { return false }
+    if same(name, b"cgroup.procs") { core = u64.bitOr(core, 1) }
+    if same(name, b"cgroup.controllers") { core = u64.bitOr(core, 2) }
+    if same(name, b"cgroup.subtree_control") { core = u64.bitOr(core, 4) }
+    if same(name, b"cgroup.stat") { core = u64.bitOr(core, 8) }
+    at = at + usize.ONE
+  }
+  return core == 15
+}
+
+// Both controllers must belong to this unified hierarchy. Otherwise a hybrid v1 hierarchy
+// could impose an invisible CPU or memory limit despite this v2 root being unrestricted.
+fn unifiedLimits(bytes: &[u8]) -> bool {
+  let mut found: u64 = 0
+  let mut cursor = usize.ZERO
+  while cursor < bytes.length {
+    let name = token(bytes, &mut cursor)
+    let bit: u64 = if same(name, b"cpu") { 1 } else if same(name, b"memory") { 2 } else { 0 }
+    if bit != 0 && u64.bitAnd(found, bit) != 0 { return false }
+    found = u64.bitOr(found, bit)
+  }
+  return found == 3
+}
+
 static if Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu"
   && Intrinsic.profileText("libc") == "gnu"
   && (Intrinsic.targetArchitecture() == "x86_64" || Intrinsic.targetArchitecture() == "aarch64") {
@@ -247,9 +283,27 @@ static if Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() 
     return move result
   }
 
-  effect fn capacity() -> Option<Capacity>
+  effect fn unlimitedRoot(directory: &Path) -> bool ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+    // A successful complete kernel directory listing distinguishes absent files from access
+    // failures. Only the already verified cgroup2 mount root can take this branch.
+    let entries = run FileSystem.listDirectory(directory)
+    let listed = List<DirectoryEntry>.asSlice(&entries)
+    let mut names = List<Bytes>.make()
+    let mut at = usize.ZERO
+    while at < listed.length {
+      let path = Path.rawBytes(&listed[at].path)
+      let mut start = path.length
+      while start > usize.ZERO && path[start - usize.ONE] != 47 { start = start - usize.ONE }
+      run List<Bytes>.append(&mut names, run Bytes.copy(Slice.view<u8>(path, start, path.length - start)))
+      at = at + usize.ONE
+    }
+    if !unlimitedRootNames(true, List<Bytes>.asSlice(&names)) { return false }
+    let controllers = run file(directory, "cgroup.controllers")
+    return unifiedLimits(Bytes.asSlice(&controllers))
+  }
+
+  effect fn capacity(affinity: usize) -> Option<Capacity>
   ! FileError | OutOfMemoryError | SystemInfoError ? &mut FileSystem | &mut Allocator | &mut SystemInfo {
-    let affinity = run SystemInfo.availableParallelism()
     let memory = run SystemInfo.memory()
     let mut result = Capacity {cpus: affinity, memory: memory.available}
     if !fits(&Option<Capacity>.some(result)) { return Option<Capacity>.some(result) }
@@ -267,6 +321,7 @@ static if Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() 
     let mut length = full.length
     while true {
       let directory = run Path.fromBytes(Slice.view<u8>(full, usize.ZERO, length))
+      if length == rootLength && run unlimitedRoot(&directory) { break }
       let cpu = run file(&directory, "cpu.max")
       let maximum = run file(&directory, "memory.max")
       let used = run file(&directory, "memory.current")
@@ -301,11 +356,18 @@ pub effect fn eligible() -> bool ? &mut Allocator {
     && (Intrinsic.targetArchitecture() == "x86_64" || Intrinsic.targetArchitecture() == "aarch64") {
     if !FrontierHost.available() { return false }
     let mut system = OsSystemInfo.make()
+    let probed = run Effect.result(SystemInfo.availableParallelism()) |> Effect.provideMut<SystemInfo>(&mut system)
+    let affinity = match move probed {
+      Result<usize, SystemInfoError>.Success {value} => value
+      Result<usize, SystemInfoError>.Failure {error} => { drop error return false }
+    }
+    // A one-core invocation never constructs a filesystem provider or reads memory/cgroups.
+    if affinity < 4 { return false }
     let mut files = match move run Effect.result(MachineFileSystem.make()) {
       Result<MachineFileSystem, OutOfMemoryError>.Success {value} => move value
       Result<MachineFileSystem, OutOfMemoryError>.Failure {error} => { drop error return false }
     }
-    let attempted = run Effect.result(capacity()) |> Effect.provideMut<SystemInfo>(&mut system) |> Effect.provideMut<FileSystem>(&mut files)
+    let attempted = run Effect.result(capacity(affinity)) |> Effect.provideMut<SystemInfo>(&mut system) |> Effect.provideMut<FileSystem>(&mut files)
     return match move attempted {
       Result<Option<Capacity>, FileError | OutOfMemoryError | SystemInfoError>.Success {value} => fits(&value)
       Result<Option<Capacity>, FileError | OutOfMemoryError | SystemInfoError>.Failure {error} => { drop error false }
@@ -350,4 +412,38 @@ test effect fn frontierPolicyMountAndMembershipSpellingIsExact() -> () ! Asserti
   run Testing.expect(plainAbsolute(b"/sys/fs/cgroup") && !plainAbsolute(b"/sys/../cgroup") && !plainAbsolute(b"/sys/fs/cgroup\\040other"), "mount paths cannot silently reinterpret traversal or kernel escapes")
   run Testing.expect(hasProcess(b"14\n123\n1234\n", 123) && !hasProcess(b"14\n1234\n", 123)
     && !hasProcess(b"123\ninvalid\n", 123), "PID membership requires complete valid tokens")
+}
+
+
+effect fn hierarchyRootClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut names = List<Bytes>.make()
+  run List<Bytes>.append(&mut names, run Bytes.copy(b"cgroup.procs"))
+  run List<Bytes>.append(&mut names, run Bytes.copy(b"cgroup.controllers"))
+  run List<Bytes>.append(&mut names, run Bytes.copy(b"cgroup.subtree_control"))
+  run Testing.expect(!unlimitedRootNames(true, List<Bytes>.asSlice(&names)), "partial core listings never prove a hierarchy root")
+  run List<Bytes>.append(&mut names, run Bytes.copy(b"cgroup.stat"))
+  run Testing.expect(unlimitedRootNames(true, List<Bytes>.asSlice(&names)), "the actual unified hierarchy root has no local CPU or memory limit")
+  run Testing.expect(!unlimitedRootNames(false, List<Bytes>.asSlice(&names)), "a non-mount directory cannot omit ancestor limits")
+  run List<Bytes>.append(&mut names, run Bytes.copy(b"cgroup.type"))
+  run Testing.expect(!unlimitedRootNames(true, List<Bytes>.asSlice(&names)), "namespace-rooted non-root cgroups retain their kernel type file")
+  drop List<Bytes>.pop(&mut names)
+  run List<Bytes>.append(&mut names, run Bytes.copy(b"cgroup.events"))
+  run Testing.expect(!unlimitedRootNames(true, List<Bytes>.asSlice(&names)), "the independent non-root events marker also refuses")
+  drop List<Bytes>.pop(&mut names)
+  run List<Bytes>.append(&mut names, run Bytes.copy(b"cpu.max"))
+  run Testing.expect(!unlimitedRootNames(true, List<Bytes>.asSlice(&names)), "an exposed quota must be read, never assumed unlimited")
+  drop List<Bytes>.pop(&mut names)
+  run List<Bytes>.append(&mut names, run Bytes.copy(b"memory.max"))
+  run Testing.expect(!unlimitedRootNames(true, List<Bytes>.asSlice(&names)), "an exposed memory limit must be read, never assumed unlimited")
+  run Testing.expect(unifiedLimits(b"cpuset cpu io memory pids\n") && !unifiedLimits(b"cpuset io memory\n")
+    && !unifiedLimits(b"cpu pids\n") && !unifiedLimits(b"cpu memory cpu\n"),
+    "missing or ambiguous unified controllers cannot hide hybrid v1 limits")
+  let inherited = Capacity {cpus: 2, memory: fourWorkerReserveBytes}
+  run Testing.expect(!fits(&Option<Capacity>.some(intersect(inherited, Capacity {cpus: usize.MAX, memory: u64.MAX}))),
+    "an unlimited hierarchy root never erases a restrictive descendant quota")
+}
+
+test effect fn frontierPolicyDistinguishesHierarchyRootFromNamespaceRoot() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run hierarchyRootClaims() |> Effect.provideMut<Allocator>(&mut allocator)
 }
