@@ -1,9 +1,11 @@
-//! Read the members of a tar archive held in memory.
+//! Read and write tar archives held in memory.
 //!
 //! # When to use
 //! Use a [`TarReader`] to unpack a `.tar` file, or a `.tar.gz` file after you decode it with
 //! `silk.compress.inflate`. Open the archive with [`TarReader.open`] and call [`TarReader.next`]
-//! until it returns none. This module does not write archives and does not decompress.
+//! until it returns none. Use a [`TarWriter`] to make one: add members with [`TarWriter.file`] and
+//! [`TarWriter.directory`], then take the bytes with [`TarWriter.finish`], and compress them with
+//! `silk.compress.deflate` for a `.tar.gz`. This module does not compress or decompress.
 //!
 //! # Details
 //! The reader understands ustar, GNU, and pax archives: the ustar `prefix` field, GNU long names,
@@ -47,7 +49,9 @@
 //!
 //! @category Data formats
 
+import silk.collections.bytes {Bytes}
 import silk.collections.slice {Slice}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
 import silk.core.option {Option}
 import silk.core.result {Result}
 import silk.io.writer {Writer, WriterError}
@@ -331,4 +335,218 @@ impl<'a> TarReader<'a> {
     }
     return Result<Option<TarMember<'a>>, TarError>.succeed(Option<TarMember<'a>>.none())
   }
+}
+
+/// A tar archive being written in memory, one member at a time.
+///
+/// # When to use
+/// Make one with [`TarWriter.make`], add members with [`TarWriter.file`] and
+/// [`TarWriter.directory`] in the order the archive should list them, and take the archive with
+/// [`TarWriter.finish`].
+///
+/// # Details
+/// The writer writes ustar headers with fixed metadata: modification time zero, owner and group
+/// zero with empty names, and mode 644 for a file, 755 for an executable file or a directory. The
+/// same members in the same order therefore always give the same bytes, on any host. A path
+/// longer than the 100-byte name field is split into the ustar prefix and name at a `/` when it
+/// fits, and is otherwise written in a pax `path` record. A file of 8 GiB or more records its size
+/// in base-256. [`TarReader`] reads every archive the writer makes.
+pub struct TarWriter {
+  bytes: Bytes,
+}
+
+// The ustar header of a member: its path fields (or a pax record already written), mode, size and
+// type flag.
+fn header(block: &mut [u8], name: &[u8], prefix: &[u8], mode: &[u8], size: u64, kind: u8) -> () {
+  put(&mut block, 0, name)
+  put(&mut block, 100, mode)
+  put(&mut block, 108, b"0000000")
+  put(&mut block, 116, b"0000000")
+  sizeField(&mut block, size)
+  put(&mut block, 136, b"00000000000")
+  block[156] = kind
+  put(&mut block, 257, b"ustar")
+  put(&mut block, 263, b"00")
+  put(&mut block, 329, b"0000000")
+  put(&mut block, 337, b"0000000")
+  put(&mut block, 345, prefix)
+  // The checksum counts its own eight bytes as spaces, and is six octal digits, a NUL and a space.
+  let mut sum: u64 = 0
+  let mut at: usize = 0
+  while at < BLOCK {
+    if at >= 148 && at < 156 { sum = sum + 32 } else { sum = sum + u8.toU64(block[at]) }
+    at = at + 1
+  }
+  octal(&mut block, 148, 6, sum)
+  block[154] = 0
+  block[155] = 32
+  return ()
+}
+
+fn put(block: &mut [u8], start: usize, text: &[u8]) -> () {
+  let mut at: usize = 0
+  while at < text.length {
+    block[start + at] = text[at]
+    at = at + 1
+  }
+  return ()
+}
+
+// Writes `value` as `digits` octal digits, zero padded, at `start`.
+fn octal(block: &mut [u8], start: usize, digits: usize, value: u64) -> () {
+  let mut rest = value
+  let mut at = digits
+  while at > 0 {
+    at = at - 1
+    block[start + at] = u64.toU8(rest % 8) + 48
+    rest = rest / 8
+  }
+  return ()
+}
+
+// The 12-byte size field: eleven octal digits and a NUL, or base-256 for 8 GiB and more.
+fn sizeField(block: &mut [u8], size: u64) -> () {
+  if size < 8589934592 {
+    octal(&mut block, 124, 11, size)
+    block[135] = 0
+    return ()
+  }
+  block[124] = 128
+  let mut rest = size
+  let mut at: usize = 12
+  while at > 1 {
+    at = at - 1
+    block[124 + at] = u64.toU8(rest % 256)
+    rest = rest / 256
+  }
+  return ()
+}
+
+// The `/` at which `path` splits into a prefix of at most 155 bytes and a nonempty name of at most
+// 100, or none.
+fn split(path: &[u8]) -> Option<usize> {
+  let mut at = path.length
+  while at > 0 {
+    at = at - 1
+    if path[at] == 47 && at <= 155 && path.length - at - 1 <= 100 && path.length - at - 1 > 0 {
+      return Option<usize>.some(at)
+    }
+  }
+  return Option<usize>.none()
+}
+
+// The number of decimal digits of `value`.
+fn decimalDigits(value: usize) -> usize {
+  let mut digits: usize = 1
+  let mut rest = value / 10
+  while rest > 0 {
+    digits = digits + 1
+    rest = rest / 10
+  }
+  return digits
+}
+
+impl TarWriter {
+  /// Returns a writer with no members.
+  pub fn make() -> TarWriter {
+    return TarWriter {bytes: Bytes.make()}
+  }
+
+  /// Adds the regular file `path` holding `content`, with mode 755 when `executable` and 644
+  /// otherwise.
+  ///
+  /// # Errors
+  /// - [`TarError`] with `UnsafePath` when `path` is empty, absolute, ends in `/`, or holds a
+  ///   backslash, a NUL, or a `..` segment. Nothing is added.
+  /// - `OutOfMemoryError` when the archive cannot grow.
+  pub effect fn file(self: &mut Self, path: &[u8], content: &[u8], executable: bool) -> ()
+    ! TarError | OutOfMemoryError
+    ? &mut Allocator {
+    let mode = if executable { b"0000755" } else { b"0000644" }
+    run member(&mut self.bytes, path, mode, content, 48)
+    return ()
+  }
+
+  /// Adds the directory `path`, with mode 755. Write it without a trailing `/`.
+  ///
+  /// # Errors
+  /// - [`TarError`] with `UnsafePath` when `path` is empty, absolute, ends in `/`, or holds a
+  ///   backslash, a NUL, or a `..` segment. Nothing is added.
+  /// - `OutOfMemoryError` when the archive cannot grow.
+  pub effect fn directory(self: &mut Self, path: &[u8]) -> ()
+    ! TarError | OutOfMemoryError
+    ? &mut Allocator {
+    run member(&mut self.bytes, path, b"0000755", b"", 53)
+    return ()
+  }
+
+  /// Ends the archive with its two zero blocks and returns its bytes.
+  ///
+  /// # Errors
+  /// - `OutOfMemoryError` when the archive cannot grow.
+  pub effect fn finish(self: TarWriter) -> Bytes
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut bytes = move self.bytes
+    let zero: [u8; 1024] = [0; 1024]
+    run Bytes.append(&mut bytes, &zero)
+    return move bytes
+  }
+}
+
+// Appends one member: its pax record when the path fits no ustar header, its header, its content,
+// and the padding to a whole block.
+effect fn member(bytes: &mut Bytes, path: &[u8], mode: &[u8], content: &[u8], kind: u8) -> ()
+  ! TarError | OutOfMemoryError
+  ? &mut Allocator {
+  if path.length == 0 || path[path.length - 1] == 47 || !safe(path) { fail TarError.UnsafePath }
+  let mut name = path
+  let mut prefix = Slice.view<u8>(path, 0, 0)
+  if path.length > 100 {
+    match split(path) {
+      Option<usize>.Some {value: at} => {
+        prefix = Slice.view<u8>(path, 0, at)
+        name = Slice.view<u8>(path, at + 1, path.length - at - 1)
+      }
+      Option<usize>.None => {
+        // The record is `<length> path=<path>\n`, its length counting its own digits.
+        let body = path.length + 7
+        let mut length = body + decimalDigits(body)
+        if decimalDigits(length) != decimalDigits(body) { length = body + decimalDigits(length) }
+        let mut record = Bytes.make()
+        run appendDecimal(&mut record, length)
+        run Bytes.append(&mut record, b" path=")
+        run Bytes.append(&mut record, path)
+        run Bytes.append(&mut record, b"\n")
+        let mut pax: [u8; 512] = [0; 512]
+        header(&mut pax, b"PaxHeader", b"", b"0000644", usize.toU64(Bytes.length(&record)), 120)
+        run Bytes.append(&mut bytes.*, &pax)
+        run padded(&mut bytes.*, Bytes.asSlice(&record))
+        name = Slice.view<u8>(path, path.length - 100, 100)
+      }
+    }
+  }
+  let mut block: [u8; 512] = [0; 512]
+  header(&mut block, name, prefix, mode, usize.toU64(content.length), kind)
+  run Bytes.append(&mut bytes.*, &block)
+  run padded(&mut bytes.*, content)
+  return ()
+}
+
+// Appends `content` and the zero bytes that end it on a block boundary.
+effect fn padded(bytes: &mut Bytes, content: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  run Bytes.append(&mut bytes.*, content)
+  let rest = content.length % BLOCK
+  if rest != 0 {
+    let zero: [u8; 512] = [0; 512]
+    run Bytes.append(&mut bytes.*, Slice.view<u8>(&zero, 0, BLOCK - rest))
+  }
+  return ()
+}
+
+effect fn appendDecimal(bytes: &mut Bytes, value: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  if value >= 10 { run appendDecimal(&mut bytes.*, value / 10) }
+  let digit: [u8; 1] = [usize.toU8(value % 10) + 48]
+  run Bytes.append(&mut bytes.*, &digit)
+  return ()
 }

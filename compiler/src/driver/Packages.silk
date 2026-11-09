@@ -22,6 +22,7 @@
 import driver.CommandPath
 import driver.GitCheckouts as Checkouts {FetchFailed}
 import driver.ManifestFields
+import driver.NativeArchive as NativeArchives
 import driver.ManifestText
 import driver.NativeLinkInput as NativeLinkInputs {Archive, ArchiveContext, Declarations, Declared, InvalidNativeLinkInput}
 import ReleaseVersion
@@ -32,7 +33,7 @@ import silk.mem.box {Box}
 import silk.collections.bytes {Bytes}
 import silk.core.effect {Effect}
 import silk.system.child_process {ChildProcess}
-import silk.system.filesystem {FileError, FileSystem, Path}
+import silk.system.filesystem {DirectoryEntry, FileError, FileSystem, Path}
 import silk.system.host_input {HostInput, HostInputError}
 import silk.core.option {Option}
 import silk.core.result {Result}
@@ -328,6 +329,54 @@ effect fn real(path: Path) -> Path ! FileError | OutOfMemoryError ? &mut Allocat
   }
 }
 
+/// Whether `url` is an archive URL a url dependency may name: HTTPS, or a `file://` URL of an
+/// absolute path, as a local mirror serves.
+pub fn isArchiveUrl(url: &[u8]) -> bool {
+  return (startsWith(url, b"https://") && url.length > 8) || (startsWith(url, b"file:///") && url.length > 8)
+}
+
+fn startsWith(text: &[u8], prefix: &[u8]) -> bool {
+  return text.length >= prefix.length && same(Slice.view<u8>(text, usize.ZERO, prefix.length), prefix)
+}
+
+// Whether `digest` is a SHA-256 in lowercase hexadecimal.
+fn isDigest(digest: &[u8]) -> bool {
+  if digest.length != 64 { return false }
+  let mut at = usize.ZERO
+  while at < digest.length {
+    let byte = digest[at]
+    if !((byte >= 48 && byte <= 57) || (byte >= 97 && byte <= 102)) { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+/// The directory of the archive with SHA-256 `digest` in the archive store beside the checkout
+/// store `store` (`$SILK_HOME/archives/<digest>`), or none.
+pub effect fn archiveDirectory(store: &Path, digest: &[u8]) -> Option<Path> ! FileError | OutOfMemoryError ? &mut Allocator {
+  return match move run Path.parent(store) {
+    Option<Path>.Some {value: home} => Option<Path>.some(run Path.joinBytes(&run Path.join(&home, "archives"), digest))
+    Option<Path>.None => Option<Path>.none()
+  }
+}
+
+/// The package root of an extracted archive: `directory` when it holds `silk.toml`, else its one
+/// entry when that is a directory, as an archive with a top directory such as `name-1.0.0/` holds.
+pub effect fn archiveRoot(directory: Path) -> Path ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let manifest = run Path.join(&directory, "silk.toml")
+  if let Result<bool, FileError>.Success {value: found} = move run Effect.result(FileSystem.exists(&manifest)) {
+    if found { return move directory }
+  }
+  let listed = run Effect.result(FileSystem.listDirectory(&directory))
+  if let Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Success {value: entries} = move listed {
+    let children = List<DirectoryEntry>.asSlice(&entries)
+    if children.length == usize.ONE && children[usize.ZERO].kind.code == FileSystem.entryKindCode(FileSystem.directory()) {
+      return run copyPath(&children[usize.ZERO].path)
+    }
+  }
+  return move directory
+}
+
 // Where a dependency's manifest is, and the checkout holding it.
 struct Located {
   directory: Path,
@@ -340,6 +389,64 @@ struct Located {
 // was read from one.
 effect fn locate(packages: &Packages, owner: &[u8], name: &[u8], entry: &TomlValue, ownerDirectory: &Path, ownerCheckout: &Option<Path>) -> Located
 ! InvalidDependency | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  if let Option<&TomlValue>.Some {..} = move Toml.field(entry, "url") {
+    let url = match move Toml.asString(Toml.field(entry, "url")) {
+      Option<string>.Some {value} => String.utf8Bytes(value)
+      Option<string>.None => b""
+    }
+    if !isArchiveUrl(url) {
+      run invalid(owner, name, b"url must be an https:// URL of the package's archive, or a file:/// URL, as url = \"https://example.com/library-1.0.0.tar.gz\"", ownerDirectory, b"url")
+    }
+    if let Option<&TomlValue>.Some {..} = move Toml.field(entry, "git") {
+      run invalid(owner, name, b"a dependency takes git or url, not both", ownerDirectory, b"url")
+    }
+    let digest = match move Toml.asString(Toml.field(entry, "sha256")) {
+      Option<string>.Some {value} => String.utf8Bytes(value)
+      Option<string>.None => run invalid(owner, name, b"a url dependency needs sha256, the SHA-256 of the archive; silk add <url> writes it", ownerDirectory, b"url")
+    }
+    if !isDigest(digest) {
+      run invalid(owner, name, b"sha256 must be 64 lowercase hexadecimal digits", ownerDirectory, b"sha256")
+    }
+    let store = match &packages.store {
+      Option<Path>.Some {value} => &value
+      Option<Path>.None => run invalid(owner, name, b"this command cannot read url dependencies: neither SILK_HOME nor HOME (USERPROFILE on Windows) names an absolute directory", ownerDirectory, b"url")
+    }
+    let extracted = match move run archiveDirectory(store, digest) {
+      Option<Path>.Some {value} => move value
+      Option<Path>.None => run invalid(owner, name, b"there is no archive store to read it from: set SILK_HOME or HOME", ownerDirectory, b"url")
+    }
+    let mut fetchedMarker = run Bytes.copy(Path.rawBytes(&extracted))
+    run Bytes.append(&mut fetchedMarker, b".fetched")
+    let present = match move run Effect.result(FileSystem.exists(&run Path.fromBytes(Bytes.asSlice(&fetchedMarker)))) {
+      Result<bool, FileError>.Success {value} => value
+      Result<bool, FileError>.Failure {error} => { drop error false }
+    }
+    if !present {
+      let mut reason = run Bytes.copy(b"the archive at ")
+      run Bytes.append(&mut reason, url)
+      run Bytes.append(&mut reason, b" is not fetched yet; silk build, check, test and run fetch it")
+      run invalid(owner, name, Bytes.asSlice(&reason), ownerDirectory, b"url")
+    }
+    let root = run real(run archiveRoot(move extracted))
+    let mut directory = run copyPath(&root)
+    if let Option<&TomlValue>.Some {..} = move Toml.field(entry, "path") {
+      let inner = match move Toml.asString(Toml.field(entry, "path")) {
+        Option<string>.Some {value} => String.utf8Bytes(value)
+        Option<string>.None => b"/"
+      }
+      if !contained(inner) {
+        run invalid(owner, name, b"path of a url dependency must name a directory inside the archive, relative to its root", ownerDirectory, b"path")
+      }
+      directory = run real(run Path.joinBytes(&root, inner))
+      if !within(Path.rawBytes(&root), Path.rawBytes(&directory)) {
+        run invalid(owner, name, b"path of a url dependency must name a directory inside the archive, relative to its root", ownerDirectory, b"path")
+      }
+    }
+    return Located {directory: move directory, checkout: Option<Path>.some(move root)}
+  }
+  if let Option<&TomlValue>.Some {..} = move Toml.field(entry, "sha256") {
+    run invalid(owner, name, b"sha256 pins a url dependency; add url, where the archive is", ownerDirectory, b"sha256")
+  }
   let rev = Toml.field(entry, "rev")
   if let Option<&TomlValue>.Some {..} = move Toml.field(entry, "git") {
     let url = match move Toml.asString(Toml.field(entry, "git")) {
@@ -436,7 +543,33 @@ effect fn fetchVisit(directory: &Path, document: &TomlValue, store: &Path, seen:
       let url = Toml.asString(Toml.field(&entry.value, "git"))
       let rev = Toml.asString(Toml.field(&entry.value, "rev"))
       let path = Toml.asString(Toml.field(&entry.value, "path"))
-      if let Option<string>.Some {value: written} = move url {
+      let archive = Toml.asString(Toml.field(&entry.value, "url"))
+      let digest = Toml.asString(Toml.field(&entry.value, "sha256"))
+      if let Option<string>.Some {value: located} = move archive {
+        let address = String.utf8Bytes(located)
+        if let Option<string>.Some {value: pinned} = move digest {
+          let sha = String.utf8Bytes(pinned)
+          if isArchiveUrl(address) && isDigest(sha) {
+            if let Option<Path>.Some {value: extracted} = move run archiveDirectory(store, sha) {
+              if let Option<Bytes>.Some {value: failure} = move run NativeArchives.ensureOne(name, address, sha, &extracted, usize.ZERO) {
+                let owner = match move run identityOf(document) {
+                  Option<Bytes>.Some {value} => move value
+                  Option<Bytes>.None => run Bytes.copy(Path.rawBytes(directory))
+                }
+                run invalid(Bytes.asSlice(&owner), name, Bytes.asSlice(&failure), directory, b"url")
+              }
+              let root = run archiveRoot(move extracted)
+              if let Option<string>.Some {value: inner} = move path {
+                if contained(String.utf8Bytes(inner)) {
+                  target = Option<Path>.some(run Path.joinBytes(&root, String.utf8Bytes(inner)))
+                }
+              } else {
+                target = Option<Path>.some(move root)
+              }
+            }
+          }
+        }
+      } else if let Option<string>.Some {value: written} = move url {
         if let Option<string>.Some {value: pinned} = move rev {
           let commit = String.utf8Bytes(pinned)
           if Checkouts.isCommit(commit) && Checkouts.isRepository(String.utf8Bytes(written)) {
@@ -601,19 +734,19 @@ effect fn visit(packages: &mut Packages, owner: usize, document: &TomlValue, sta
         while field < fields.length {
           if let TomlChild.Member {entry: written} = &fields[field] {
             let key = String.ownedUtf8Bytes(&written.key)
-            if !same(key, b"path") && !same(key, b"package") && !same(key, b"git") && !same(key, b"rev") {
+            if !same(key, b"path") && !same(key, b"package") && !same(key, b"git") && !same(key, b"rev") && !same(key, b"url") && !same(key, b"sha256") {
               // Other sources and their modifiers are reserved for a later release.
-              let reserved = same(key, b"url") || same(key, b"version") || same(key, b"tag")
+              let reserved = same(key, b"version") || same(key, b"tag")
                 || same(key, b"branch") || same(key, b"hash") || same(key, b"optional")
                 || same(key, b"workspace")
               let mut reason = run Bytes.copy(key)
               if reserved {
-                run Bytes.append(&mut reason, b" is not supported yet; a dependency takes only path, git, rev and package")
+                run Bytes.append(&mut reason, b" is not supported yet; a dependency takes only path, git, rev, url, sha256 and package")
                 if same(key, b"tag") || same(key, b"branch") {
                   run Bytes.append(&mut reason, b"; pin a git dependency to a full commit hash with rev")
                 }
               } else {
-                run Bytes.append(&mut reason, b" is not a supported field; a dependency takes only path, git, rev and package")
+                run Bytes.append(&mut reason, b" is not a supported field; a dependency takes only path, git, rev, url, sha256 and package")
               }
               run invalid(owned, name, Bytes.asSlice(&reason), &ownerManifest, key)
             }

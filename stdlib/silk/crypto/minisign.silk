@@ -1,0 +1,616 @@
+//! Sign and verify files with minisign, the Ed25519 signature format Silk releases use.
+//!
+//! # When to use
+//! Use [`verify`] to check a downloaded file against a publisher's minisign public key, and
+//! [`sign`] with a [`MinisignSecretKey`] to publish signatures that `minisign -V` and [`verify`]
+//! accept. Use `silk.crypto.ed25519` for raw Ed25519 signatures in another format.
+//!
+//! # Details
+//! A public key is the base64 text of `Ed`, an 8-byte key id and a 32-byte Ed25519 key. A signature
+//! file has four lines: an untrusted comment, the base64 of an algorithm, the key id and a 64-byte
+//! signature, `trusted comment: <text>`, and the base64 of a 64-byte global signature over the
+//! signature followed by the trusted comment text. The `ED` algorithm signs the BLAKE2b-512 digest
+//! of the content and the legacy `Ed` algorithm signs the content itself; [`sign`] writes `ED`.
+//!
+//! A secret key file holds the base64 of the algorithms, the scrypt salt and limits, and the key id,
+//! Ed25519 key and BLAKE2b-256 checksum, XORed with the scrypt output of the password when the key
+//! is encrypted. [`secretKeyFile`] encrypts with minisign's default limits, which make scrypt use
+//! 1 GiB of memory, or writes an unencrypted key like `minisign -G -W` without a password.
+//!
+//! # Gotchas
+//! Ed25519 signing is deterministic, so signing the same content with the same key and comment
+//! gives the same file. Secrets are not erased from memory.
+//!
+//! # Examples
+//! ## Sign and verify a message
+//! ```silk
+//! import silk.core.effect { Effect }
+//! import silk.core.result { Result }
+//! import silk.crypto.minisign as Minisign { MinisignError, MinisignKey, MinisignSecretKey }
+//! import silk.collections.bytes { Bytes }
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.system.random { Random }
+//! import silk.system.random_native { OsRandom }
+//!
+//! effect fn roundTrip() -> i32 ! OutOfMemoryError ? &mut Allocator | &mut Random {
+//!   let secret = run MinisignSecretKey.generate()
+//!   let signature = match run Minisign.sign(&secret, b"hello", b"greeting") {
+//!     Result<Bytes, MinisignError>.Success { value } => move value
+//!     Result<Bytes, MinisignError>.Failure { error } => { return 1 }
+//!   }
+//!   let public = match Minisign.key(&secret.publicKeyText()) {
+//!     Result<MinisignKey, MinisignError>.Success { value } => move value
+//!     Result<MinisignKey, MinisignError>.Failure { error } => { return 2 }
+//!   }
+//!   return match Minisign.verify(&public, Bytes.asSlice(&signature), b"hello") {
+//!     Result<&[u8], MinisignError>.Success { value } => 0
+//!     Result<&[u8], MinisignError>.Failure { error } => 3
+//!   }
+//! }
+//!
+//! pub effect fn main() -> i32 ! OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let mut random = OsRandom.make()
+//!   return run roundTrip()
+//!     |> Effect.provideMut<Random>(&mut random)
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//! }
+//! ```
+//!
+//! @category Cryptography
+
+import silk.encoding.base64 { Base64, Base64Error }
+import silk.crypto.blake2b { Blake2b256, Blake2b512 }
+import silk.crypto.ed25519 { Ed25519Error, Ed25519PrivateKey, Ed25519PublicKey }
+import silk.crypto.scrypt { Scrypt, ScryptError }
+import silk.collections.bytes { Bytes }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.collections.slice { Slice }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.random { Random }
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+
+/// Why a key or signature was refused.
+pub enum MinisignError {
+  /// The public key text is not the base64 of an Ed25519 minisign key.
+  InvalidKey,
+  /// The signature file does not have the four minisign lines.
+  MalformedSignature,
+  /// The signature names an algorithm other than `ED` or `Ed`.
+  UnsupportedAlgorithm,
+  /// The signature was made with a different key.
+  WrongKey,
+  /// The signature does not verify for this content.
+  InvalidSignature,
+  /// The global signature over the trusted comment does not verify.
+  InvalidTrustedComment,
+  /// The secret key text is not a minisign Ed25519 secret key, or its key derivation settings are
+  /// out of range.
+  InvalidSecretKey,
+  /// The secret key is encrypted and no password was given.
+  PasswordRequired,
+  /// The password does not decrypt the secret key: its checksum does not match.
+  WrongPassword,
+  /// A trusted comment to sign has a line break or is longer than 1024 bytes.
+  InvalidComment,
+}
+
+/// A decoded minisign public key.
+pub struct MinisignKey {
+  id: [u8; 8],
+  key: Ed25519PublicKey,
+}
+
+/// The longest trusted comment accepted, in bytes.
+const MAX_TRUSTED_COMMENT: usize = 1024
+
+/// A short description of `error` for messages.
+pub fn describe(error: MinisignError) -> &'static [u8] {
+  return match error {
+    MinisignError.InvalidKey => b"the public key is not a minisign Ed25519 key"
+    MinisignError.MalformedSignature => b"the signature file is not in minisign format"
+    MinisignError.UnsupportedAlgorithm => b"the signature uses an unsupported algorithm"
+    MinisignError.WrongKey => b"the signature was made with a different key"
+    MinisignError.InvalidSignature => b"the signature does not match the file"
+    MinisignError.InvalidTrustedComment => b"the trusted comment is not signed by the key"
+    MinisignError.InvalidSecretKey => b"the secret key is not a minisign Ed25519 secret key"
+    MinisignError.PasswordRequired => b"the secret key is encrypted and needs its password"
+    MinisignError.WrongPassword => b"the password does not decrypt the secret key"
+    MinisignError.InvalidComment => b"the trusted comment has a line break or is longer than 1024 bytes"
+  }
+}
+
+fn decode(text: &[u8], output: &mut [u8]) -> bool {
+  let expected = output.length
+  return match Base64.decodeInto(move output, text) {
+    Result<usize, Base64Error>.Success { value } => value == expected
+    Result<usize, Base64Error>.Failure { error } => false
+  }
+}
+
+/// Decodes the base64 public key `text`, such as the contents of `minisign.pub` after its comment
+/// line.
+pub fn key(text: &[u8]) -> Result<MinisignKey, MinisignError> {
+  if text.length != usize.add(0, 56) {
+    return Result<MinisignKey, MinisignError>.failResult(MinisignError.InvalidKey)
+  }
+  let mut raw: [u8; 42] = [0; 42]
+  if !decode(text, &mut raw) || raw[0] != 69 || raw[1] != 100 {
+    return Result<MinisignKey, MinisignError>.failResult(MinisignError.InvalidKey)
+  }
+  let mut id: [u8; 8] = [0; 8]
+  let mut at = usize.ZERO
+  while at < 8 {
+    id[at] = raw[2 + at]
+    at = at + usize.ONE
+  }
+  return match Ed25519PublicKey.fromBytes(
+    Slice.view<u8>(&raw, usize.add(0, 10), usize.add(0, 32))
+  ) {
+    Result<Ed25519PublicKey, Ed25519Error>.Success { value } => Result<
+      MinisignKey,
+      MinisignError
+    >.succeed(MinisignKey { id: id, key: move value })
+    Result<Ed25519PublicKey, Ed25519Error>.Failure { error } => Result<
+      MinisignKey,
+      MinisignError
+    >.failResult(MinisignError.InvalidKey)
+  }
+}
+
+// The line of `text` starting at `start`, without its line ending; `next` receives where the
+// following line starts.
+fn line<'t>(text: &'t [u8], start: usize, next: &mut usize) -> &'t [u8] {
+  let mut end = start
+  while end < text.length && text[end] != 10 {
+    end = end + usize.ONE
+  }
+  next.* = end
+  if end < text.length {
+    next.* = end + usize.ONE
+  }
+  let mut stop = end
+  if stop > start && text[stop - usize.ONE] == 13 {
+    stop = stop - usize.ONE
+  }
+  return Slice.view<u8>(text, start, stop - start)
+}
+
+fn startsWith(text: &[u8], prefix: &[u8]) -> bool {
+  if text.length < prefix.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < prefix.length {
+    if text[at] != prefix[at] {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn accepted(verified: Result<(), Ed25519Error>) -> bool {
+  return match move verified {
+    Result<(), Ed25519Error>.Success { value } => true
+    Result<(), Ed25519Error>.Failure { error } => false
+  }
+}
+
+/// Verifies the minisign `signature` file of `content` against `signer`, and returns its trusted
+/// comment.
+///
+/// Both the signature over the content and the global signature over the trusted comment must
+/// verify, so the returned comment is authenticated too.
+pub fn verify<'s>(signer: &MinisignKey, signature: &'s [u8], content: &[u8]) -> Result<
+  &'s [u8],
+  MinisignError
+> {
+  let mut next = usize.ZERO
+  let untrusted = line(signature, usize.ZERO, &mut next)
+  let encoded = line(signature, next, &mut next)
+  let trustedLine = line(signature, next, &mut next)
+  let globalEncoded = line(signature, next, &mut next)
+  let prefix = b"trusted comment: "
+  if !startsWith(untrusted, b"untrusted comment:") || !startsWith(trustedLine, prefix) {
+    return Result<&'s [u8], MinisignError>.failResult(MinisignError.MalformedSignature)
+  }
+  let mut raw: [u8; 74] = [0; 74]
+  let mut global: [u8; 64] = [0; 64]
+  if !decode(encoded, &mut raw) || !decode(globalEncoded, &mut global) {
+    return Result<&'s [u8], MinisignError>.failResult(MinisignError.MalformedSignature)
+  }
+  let prehashed = raw[0] == 69 && raw[1] == 68
+  if !prehashed && !(raw[0] == 69 && raw[1] == 100) {
+    return Result<&'s [u8], MinisignError>.failResult(MinisignError.UnsupportedAlgorithm)
+  }
+  let mut at = usize.ZERO
+  while at < 8 {
+    if raw[2 + at] != signer.id[at] {
+      return Result<&'s [u8], MinisignError>.failResult(MinisignError.WrongKey)
+    }
+    at = at + usize.ONE
+  }
+  let signed = Slice.view<u8>(&raw, usize.add(0, 10), usize.add(0, 64))
+  let mut valid = false
+  if prehashed {
+    let digest = Blake2b512.hash(content)
+    valid = accepted(signer.key.verify(&digest, signed))
+  } else {
+    valid = accepted(signer.key.verify(content, signed))
+  }
+  if !valid {
+    return Result<&'s [u8], MinisignError>.failResult(MinisignError.InvalidSignature)
+  }
+  let comment = Slice.view<u8>(trustedLine, prefix.length, trustedLine.length - prefix.length)
+  if comment.length > MAX_TRUSTED_COMMENT {
+    return Result<&'s [u8], MinisignError>.failResult(MinisignError.MalformedSignature)
+  }
+  let mut covered: [u8; 1088] = [0; 1088]
+  at = usize.ZERO
+  while at < 64 {
+    covered[at] = signed[at]
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < comment.length {
+    covered[64 + at] = comment[at]
+    at = at + usize.ONE
+  }
+  if !accepted(
+    signer.key.verify(
+      Slice.view<u8>(&covered, usize.ZERO, usize.add(0, 64) + comment.length),
+      &global
+    )
+  ) {
+    return Result<&'s [u8], MinisignError>.failResult(MinisignError.InvalidTrustedComment)
+  }
+  return Result<&'s [u8], MinisignError>.succeed(comment)
+}
+
+/// A minisign secret key: its key id and Ed25519 key.
+pub struct MinisignSecretKey {
+  id: [u8; 8],
+  key: Ed25519PrivateKey,
+}
+
+// The scrypt limits minisign writes: libsodium's sensitive limits, scrypt N = 2^20, r = 8, p = 1.
+const OPS_LIMIT: u64 = 33554432
+const MEMORY_LIMIT: u64 = 1073741824
+
+// The length of a decoded secret key: algorithms (6), salt (32), limits (16) and the key id, key
+// and checksum (104).
+const SECRET_LENGTH: usize = 158
+
+impl MinisignSecretKey {
+  /// Returns a new key with a random key id, from the `Random` provider.
+  ///
+  /// # Gotchas
+  /// Use a secure `Random` provider, such as `silk.system.random_native.OsRandom`.
+  pub effect fn generate() -> MinisignSecretKey ? &mut Random {
+    let mut id: [u8; 8] = [0; 8]
+    run Random.fillBytes(&mut id)
+    let key = run Ed25519PrivateKey.generate()
+    return MinisignSecretKey { id: id, key: move key }
+  }
+
+  /// Returns the 8-byte key id, which signatures carry to name their key.
+  pub fn keyId(self: &Self) -> [u8; 8] {
+    return self.id
+  }
+
+  /// Returns the key id as minisign prints it: 16 uppercase hexadecimal digits of the id read as a
+  /// little-endian number, such as `2EFCB60D3D0A7C1E`.
+  pub fn idText(self: &Self) -> [u8; 16] {
+    let digits = b"0123456789ABCDEF"
+    let mut text: [u8; 16] = [0; 16]
+    let mut at = usize.ZERO
+    while at < 8 {
+      let byte = self.id[7 - at]
+      text[2 * at] = digits[u8.toUsize(byte / 16)]
+      text[2 * at + 1] = digits[u8.toUsize(byte % 16)]
+      at = at + usize.ONE
+    }
+    return text
+  }
+
+  /// Returns the base64 public key, the second line of a `minisign.pub` file, which [`key`] reads.
+  pub fn publicKeyText(self: &Self) -> [u8; 56] {
+    let mut raw: [u8; 42] = [0; 42]
+    raw[0] = 69
+    raw[1] = 100
+    let public = self.key.publicKey()
+    let mut at = usize.ZERO
+    while at < 8 {
+      raw[2 + at] = self.id[at]
+      at = at + usize.ONE
+    }
+    at = usize.ZERO
+    while at < 32 {
+      raw[10 + at] = public[at]
+      at = at + usize.ONE
+    }
+    let mut text: [u8; 56] = [0; 56]
+    encode(&raw, &mut text)
+    return text
+  }
+}
+
+// Writes the base64 of `raw` into `text`, which has exactly its encoded length.
+fn encode(raw: &[u8], text: &mut [u8]) -> () {
+  return match Base64.encodeInto(move text, raw) {
+    Result<usize, Base64Error>.Success { value } => ()
+    Result<usize, Base64Error>.Failure { error } => Intrinsic.trap("minisign: the base64 buffer has the wrong length")
+  }
+}
+
+/// Returns the text of a `minisign.pub` file for `secret`'s public key: an untrusted comment naming
+/// the key id, then the base64 key.
+pub effect fn publicKeyFile(secret: &MinisignSecretKey) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut text = run Bytes.copy(b"untrusted comment: minisign public key ")
+  run Bytes.append(&mut text, &secret.idText())
+  run Bytes.append(&mut text, b"\n")
+  run Bytes.append(&mut text, &secret.publicKeyText())
+  run Bytes.append(&mut text, b"\n")
+  return move text
+}
+
+// The checksum minisign keeps of a secret key: BLAKE2b-256 of `Ed`, the key id and the 64-byte
+// secret key (seed, then public key).
+fn checksum(id: &[u8], secret: &[u8]) -> [u8; 32] {
+  let mut state = Blake2b256.make()
+  state.update(b"Ed")
+  state.update(id)
+  state.update(secret)
+  return state.finish()
+}
+
+// Writes `value` little-endian at `at`.
+fn storeU64(raw: &mut [u8], at: usize, value: u64) -> () {
+  let mut index = usize.ZERO
+  while index < 8 {
+    raw[at + index] = u64.toU8(u64.bitAnd(u64.shiftRight(value, usize.toU64(8 * index)), 255))
+    index = index + usize.ONE
+  }
+}
+
+fn loadU64(raw: &[u8], at: usize) -> u64 {
+  let mut value: u64 = 0
+  let mut index = usize.ZERO
+  while index < 8 {
+    value = u64.bitOr(value, u64.shiftLeft(u8.toU64(raw[at + index]), usize.toU64(8 * index)))
+    index = index + usize.ONE
+  }
+  return value
+}
+
+// The scrypt work for libsodium's `opslimit` and `memlimit`, as `crypto_pwhash_scryptsalsa208sha256`
+// picks it: the cost N as a power of two, r = 8, and p.
+struct ScryptWork {
+  cost: u64,
+  parallelism: u32,
+}
+
+fn pickWork(opsLimit: u64, memoryLimit: u64) -> ScryptWork {
+  let mut ops = opsLimit
+  if ops < 32768 { ops = 32768 }
+  let r: u64 = 8
+  let mut costLog: u64 = 1
+  if ops < memoryLimit / 32 {
+    let maxCost = ops / (r * 4)
+    while costLog < 63 && u64.shiftLeft(1, costLog) <= maxCost / 2 { costLog = costLog + 1 }
+    return ScryptWork { cost: u64.shiftLeft(1, costLog), parallelism: 1 }
+  }
+  let maxCost = memoryLimit / (r * 128)
+  while costLog < 63 && u64.shiftLeft(1, costLog) <= maxCost / 2 { costLog = costLog + 1 }
+  let mut maxProduct = (ops / 4) / u64.shiftLeft(1, costLog)
+  if maxProduct > 0x3fffffff { maxProduct = 0x3fffffff }
+  return ScryptWork { cost: u64.shiftLeft(1, costLog), parallelism: u64.toU32(maxProduct / r) }
+}
+
+// XORs the 104 key bytes at offset 54 of `raw` with the scrypt output of `password`.
+effect fn crypt(raw: &mut [u8], password: &[u8]) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut header: [u8; 54] = [0; 54]
+  let mut at = usize.ZERO
+  while at < 54 {
+    header[at] = raw[at]
+    at = at + usize.ONE
+  }
+  let work = pickWork(loadU64(&header, usize.add(0, 38)), loadU64(&header, usize.add(0, 46)))
+  let mut stream: [u8; 104] = [0; 104]
+  let derived = run Effect.result(
+    Scrypt.derive(password, Slice.view<u8>(&header, usize.add(0, 6), usize.add(0, 32)), work.cost, 8, work.parallelism, &mut stream)
+  )
+  match move derived {
+    Result<(), OutOfMemoryError | ScryptError>.Success { value } => ()
+    Result<(), OutOfMemoryError | ScryptError>.Failure { error } => match move error {
+      OutOfMemoryError exhausted => { fail move exhausted }
+      ScryptError _refused => { return false }
+    }
+  }
+  at = usize.ZERO
+  while at < 104 {
+    raw[54 + at] = u8.bitXor(raw[54 + at], stream[at])
+    at = at + usize.ONE
+  }
+  return true
+}
+
+/// Returns the text of a minisign secret key file for `secret`, encrypted with `password` as
+/// `minisign -G` writes it, or unencrypted as `minisign -G -W` writes it when `password` is `None`.
+///
+/// # Details
+/// Encrypting draws a random salt from `Random` and runs scrypt with minisign's default limits,
+/// which use 1 GiB of memory.
+pub effect fn secretKeyFile(secret: &MinisignSecretKey, password: Option<&[u8]>) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator | &mut Random {
+  let mut raw: [u8; 158] = [0; 158]
+  raw[0] = 69
+  raw[1] = 100
+  raw[4] = 66
+  raw[5] = 50
+  let seed = secret.key.seed()
+  let public = secret.key.publicKey()
+  let mut secretBytes: [u8; 64] = [0; 64]
+  let mut at = usize.ZERO
+  while at < 32 {
+    secretBytes[at] = seed[at]
+    secretBytes[32 + at] = public[at]
+    at = at + usize.ONE
+  }
+  let sum = checksum(&secret.id, &secretBytes)
+  at = usize.ZERO
+  while at < 8 {
+    raw[54 + at] = secret.id[at]
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < 64 {
+    raw[62 + at] = secretBytes[at]
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < 32 {
+    raw[126 + at] = sum[at]
+    at = at + usize.ONE
+  }
+  let mut comment: &[u8] = b"untrusted comment: minisign secret key\n"
+  if let Option<&[u8]>.Some { value } = password {
+    comment = b"untrusted comment: minisign encrypted secret key\n"
+    raw[2] = 83
+    raw[3] = 99
+    run Random.fillBytes(Slice.viewMut<u8>(&mut raw, usize.add(0, 6), usize.add(0, 32)))
+    storeU64(&mut raw, usize.add(0, 38), OPS_LIMIT)
+    storeU64(&mut raw, usize.add(0, 46), MEMORY_LIMIT)
+    if !(run crypt(&mut raw, value)) { Intrinsic.trap("minisign: the default scrypt limits are invalid") }
+  }
+  let mut encoded: [u8; 212] = [0; 212]
+  encode(&raw, &mut encoded)
+  let mut text = run Bytes.copy(comment)
+  run Bytes.append(&mut text, &encoded)
+  run Bytes.append(&mut text, b"\n")
+  return move text
+}
+
+/// Reads a minisign secret key file, decrypting it with `password` when it is encrypted.
+///
+/// # Errors
+/// - `InvalidSecretKey` when the text is not a minisign Ed25519 secret key.
+/// - `PasswordRequired` when the key is encrypted and `password` is `None`.
+/// - `WrongPassword` when the checksum does not match after decryption.
+///
+/// # Gotchas
+/// Decrypting runs scrypt with the limits the file names, 1 GiB of memory for minisign's defaults.
+pub effect fn secretKey(text: &[u8], password: Option<&[u8]>) -> Result<MinisignSecretKey, MinisignError>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut next = usize.ZERO
+  let untrusted = line(text, usize.ZERO, &mut next)
+  let encoded = line(text, next, &mut next)
+  let mut raw: [u8; 158] = [0; 158]
+  if !startsWith(untrusted, b"untrusted comment:") || !decode(encoded, &mut raw) || raw[0] != 69 || raw[1] != 100 || raw[4] != 66 || raw[5] != 50 {
+    return Result<MinisignSecretKey, MinisignError>.failResult(MinisignError.InvalidSecretKey)
+  }
+  let encrypted = raw[2] == 83 && raw[3] == 99
+  if !encrypted && !(raw[2] == 0 && raw[3] == 0) {
+    return Result<MinisignSecretKey, MinisignError>.failResult(MinisignError.InvalidSecretKey)
+  }
+  if encrypted {
+    let given = match password {
+      Option<&[u8]>.Some { value } => value
+      Option<&[u8]>.None => { return Result<MinisignSecretKey, MinisignError>.failResult(MinisignError.PasswordRequired) }
+    }
+    if !(run crypt(&mut raw, given)) {
+      return Result<MinisignSecretKey, MinisignError>.failResult(MinisignError.InvalidSecretKey)
+    }
+  }
+  let mut id: [u8; 8] = [0; 8]
+  let mut at = usize.ZERO
+  while at < 8 {
+    id[at] = raw[54 + at]
+    at = at + usize.ONE
+  }
+  let sum = checksum(&id, Slice.view<u8>(&raw, usize.add(0, 62), usize.add(0, 64)))
+  at = usize.ZERO
+  while at < 32 {
+    if sum[at] != raw[126 + at] {
+      let reason = if encrypted { MinisignError.WrongPassword } else { MinisignError.InvalidSecretKey }
+      return Result<MinisignSecretKey, MinisignError>.failResult(reason)
+    }
+    at = at + usize.ONE
+  }
+  let key = match Ed25519PrivateKey.fromSeed(Slice.view<u8>(&raw, usize.add(0, 62), usize.add(0, 32))) {
+    Result<Ed25519PrivateKey, Ed25519Error>.Success { value } => move value
+    Result<Ed25519PrivateKey, Ed25519Error>.Failure { error } => {
+      return Result<MinisignSecretKey, MinisignError>.failResult(MinisignError.InvalidSecretKey)
+    }
+  }
+  let public = key.publicKey()
+  at = usize.ZERO
+  while at < 32 {
+    if public[at] != raw[94 + at] {
+      return Result<MinisignSecretKey, MinisignError>.failResult(MinisignError.InvalidSecretKey)
+    }
+    at = at + usize.ONE
+  }
+  return Result<MinisignSecretKey, MinisignError>.succeed(MinisignSecretKey { id: id, key: move key })
+}
+
+/// Returns the minisign signature file of `content` for `secret`, with `trustedComment` signed too.
+///
+/// # Details
+/// The signature uses the `ED` algorithm, over the BLAKE2b-512 digest of `content`, which
+/// `minisign -V` and [`verify`] accept.
+///
+/// # Errors
+/// `InvalidComment` when `trustedComment` has a line break or is longer than 1024 bytes.
+pub effect fn sign(secret: &MinisignSecretKey, content: &[u8], trustedComment: &[u8]) -> Result<Bytes, MinisignError>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if trustedComment.length > MAX_TRUSTED_COMMENT {
+    return Result<Bytes, MinisignError>.failResult(MinisignError.InvalidComment)
+  }
+  let mut at = usize.ZERO
+  while at < trustedComment.length {
+    if trustedComment[at] == 10 || trustedComment[at] == 13 {
+      return Result<Bytes, MinisignError>.failResult(MinisignError.InvalidComment)
+    }
+    at = at + usize.ONE
+  }
+  let digest = Blake2b512.hash(content)
+  let signature = secret.key.sign(&digest)
+  let mut raw: [u8; 74] = [0; 74]
+  raw[0] = 69
+  raw[1] = 68
+  at = usize.ZERO
+  while at < 8 {
+    raw[2 + at] = secret.id[at]
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < 64 {
+    raw[10 + at] = signature[at]
+    at = at + usize.ONE
+  }
+  let mut covered = run Bytes.copy(&signature)
+  run Bytes.append(&mut covered, trustedComment)
+  let global = secret.key.sign(Bytes.asSlice(&covered))
+  let mut encoded: [u8; 100] = [0; 100]
+  encode(&raw, &mut encoded)
+  let mut globalEncoded: [u8; 88] = [0; 88]
+  encode(&global, &mut globalEncoded)
+  let mut text = run Bytes.copy(b"untrusted comment: signature from minisign secret key\n")
+  run Bytes.append(&mut text, &encoded)
+  run Bytes.append(&mut text, b"\ntrusted comment: ")
+  run Bytes.append(&mut text, trustedComment)
+  run Bytes.append(&mut text, b"\n")
+  run Bytes.append(&mut text, &globalEncoded)
+  run Bytes.append(&mut text, b"\n")
+  return Result<Bytes, MinisignError>.succeed(move text)
+}
