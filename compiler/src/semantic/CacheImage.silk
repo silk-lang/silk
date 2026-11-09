@@ -32,6 +32,7 @@ import semantic.InternIndex {InternIndex}
 import semantic.StableKey
 import silk.collections.hash {Hash}
 import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.mem.frozen {Frozen}
 import silk.collections.bytes {Bytes}
 import silk.collections.list {List}
 import silk.core.option {Option}
@@ -1149,6 +1150,8 @@ fn readVarint(bytes: &[u8], cursor: &mut Cursor) -> u64 {
       return 0
     }
     let byte = bytes[cursor.at]
+    if shift == 63 && byte > 1 { cursor.failed = true
+      return 0 }
     cursor.at = cursor.at + usize.ONE
     value = u64.bitOr(value, u64.shiftLeft(u8.toU64(byte % 128), shift))
     if byte < 128 { return value }
@@ -1580,4 +1583,277 @@ pub effect fn decode(bytes: &[u8], stamp: &[u8]) -> Option<Image> ! OutOfMemoryE
   let roots = run readRoots(bytes, &mut cursor, stamp)
   if cursor.failed || cursor.at != bytes.length { return Option<Image>.none() }
   return joined(move graph, move roots)
+}
+
+// Immutable shard access for CacheBundle. Offsets refer to the original compressed bytes; no
+// edge list or answer is expanded while validating a shard.
+pub struct IndexedRoot {
+  pub key: Bytes,
+  pub node: usize,
+  answerAt: usize,
+}
+
+pub struct IndexedShard {
+  file: Frozen<Bytes>,
+  pub digest: ContentHash,
+  pub roots: List<IndexedRoot>,
+  leafStarts: List<usize>,
+  nodeStarts: List<usize>,
+  anchors: List<Anchor>,
+  priorLeaves: usize,
+  priorNodes: usize,
+}
+
+pub struct IndexedEdges { at: usize, left: usize }
+
+const INDEX_BYTES: usize = 536870912
+const INDEX_ITEMS: usize = 8388608
+const INDEX_KEY: usize = 8388608
+const INDEX_ANSWERS: usize = 1073741824
+
+// Unlike the old lazy skip, this also validates every compressed run without expanding it.
+fn checkedPacked(bytes: &[u8], cursor: &mut Cursor) -> usize {
+  let length = readVarint(bytes, &mut cursor.*)
+  let written = readCount(bytes, &mut cursor.*)
+  if cursor.failed || length > usize.toU64(INDEX_ANSWERS) { cursor.failed = true
+    return usize.ZERO }
+  let expected = u64.toUsize(length)
+  let end = cursor.at + written
+  let mut produced = usize.ZERO
+  while cursor.at < end && !cursor.failed {
+    let byte = bytes[cursor.at]
+    cursor.at = cursor.at + usize.ONE
+    let mut amount = usize.ONE
+    if byte == 0 {
+      if cursor.at == end { cursor.failed = true
+    return usize.ZERO }
+      amount = u8.toUsize(bytes[cursor.at]) + usize.ONE
+      cursor.at = cursor.at + usize.ONE
+    }
+    if amount > expected - produced { cursor.failed = true
+    return usize.ZERO }
+    produced = produced + amount
+  }
+  if produced != expected { cursor.failed = true }
+  return expected
+}
+
+fn indexedLeafIn(bytes: &[u8], starts: &[usize], at: usize, total: usize) -> Leaf {
+  let mut cursor = Cursor {at: starts[at], failed: false}
+  let kind = readVarint(bytes, &mut cursor)
+  let keyAt = cursor.at
+  drop readVarint(bytes, &mut cursor)
+  drop checkedPacked(bytes, &mut cursor)
+  return readLeafFields(bytes, &mut cursor, kind, total, keyAt)
+}
+
+fn sameLeaf(left: Leaf, right: Leaf) -> bool {
+  return left.input == right.input && left.position == right.position && left.file == right.file
+    && left.selector == right.selector && ContentHash.equals(left.digest, right.digest)
+    && ContentHash.equals(left.text, right.text)
+}
+
+/// Validates a local shard, or a coordinator shard whose references include preceding ranges.
+/// The caller subsequently verifies external file-leaf references against those preceding ranges.
+pub effect fn indexed(file: Frozen<Bytes>, stamp: &[u8], priorLeaves: usize, priorNodes: usize)
+-> Option<IndexedShard> ! OutOfMemoryError ? &mut Allocator {
+  let bytes = Bytes.asSlice(Frozen<Bytes>.get(&file))
+  if bytes.length > INDEX_BYTES || priorLeaves > INDEX_ITEMS || priorNodes > INDEX_ITEMS { return Option<IndexedShard>.none() }
+  let parts = match move run graphParts(bytes, stamp) {
+    Option<GraphParts>.Some {value} => move value
+    Option<GraphParts>.None => { return Option<IndexedShard>.none() }
+  }
+  if parts.leaves > INDEX_ITEMS - priorLeaves { return Option<IndexedShard>.none() }
+  let totalLeaves = priorLeaves + parts.leaves
+  let mut headerCursor = Cursor {at: usize.ZERO, failed: false}
+  drop run readHeader(bytes, &mut headerCursor, stamp)
+  let graphBody = headerCursor.at
+  let mut leafCursor = Cursor {at: parts.leavesStart, failed: false}
+  let leafBytes = Slice.view<u8>(bytes, usize.ZERO, parts.leavesEnd)
+  let mut starts = List<usize>.make()
+  run List<usize>.reserveExact(&mut starts, parts.leaves)
+  let mut previous = usize.ZERO
+  let mut at = usize.ZERO
+  while at < parts.leaves && !leafCursor.failed {
+    run List<usize>.append(&mut starts, leafCursor.at)
+    let kind = readVarint(leafBytes, &mut leafCursor)
+    let packedAt = leafCursor.at
+    let common = readVarint(leafBytes, &mut leafCursor)
+    if at % RESTART == usize.ZERO { previous = usize.ZERO }
+    if common > usize.toU64(previous) { return Option<IndexedShard>.none() }
+    let length = checkedPacked(leafBytes, &mut leafCursor)
+    if length > INDEX_KEY - u64.toUsize(common) { return Option<IndexedShard>.none() }
+    previous = u64.toUsize(common) + length
+    drop readLeafFields(leafBytes, &mut leafCursor, kind, totalLeaves, packedAt)
+    at = at + usize.ONE
+  }
+  if leafCursor.failed || leafCursor.at != parts.leavesEnd { return Option<IndexedShard>.none() }
+  let leafStarts = List<usize>.asSlice(&starts)
+  at = usize.ZERO
+  while at < parts.leaves {
+    let value = indexedLeafIn(bytes, leafStarts, at, totalLeaves)
+    if value.file != usize.MAX && value.file >= priorLeaves {
+      if indexedLeafIn(bytes, leafStarts, value.file - priorLeaves, totalLeaves).input { return Option<IndexedShard>.none() }
+    }
+    at = at + usize.ONE
+  }
+  let summaryBytes = Slice.view<u8>(bytes, parts.summaryStart, parts.summaryLength)
+  let mut summaryCursor = Cursor {at: usize.ZERO, failed: false}
+  let anchored = readCount(summaryBytes, &mut summaryCursor)
+  if anchored > parts.leaves { return Option<IndexedShard>.none() }
+  let mut anchors = List<Anchor>.make()
+  run List<Anchor>.reserveExact(&mut anchors, anchored)
+  let mut next = usize.ZERO
+  at = usize.ZERO
+  while at < anchored && !summaryCursor.failed {
+    let ordinal = readVarint(summaryBytes, &mut summaryCursor)
+    if ordinal < usize.toU64(next) || ordinal >= usize.toU64(parts.leaves) { return Option<IndexedShard>.none() }
+    let kind = readVarint(summaryBytes, &mut summaryCursor)
+    let keyStart = summaryCursor.at
+    let keyLength = checkedPacked(summaryBytes, &mut summaryCursor)
+    if summaryCursor.failed || keyLength > INDEX_KEY { return Option<IndexedShard>.none() }
+    summaryCursor.at = keyStart
+    let key = run readPacked(summaryBytes, &mut summaryCursor, b"", usize.ZERO)
+    let value = readLeafFields(summaryBytes, &mut summaryCursor, kind, totalLeaves, usize.MAX)
+    if summaryCursor.failed { return Option<IndexedShard>.none() }
+    run List<Anchor>.append(&mut anchors, Anchor {at: u64.toUsize(ordinal), leaf: value, key: move key})
+    next = u64.toUsize(ordinal) + usize.ONE
+    at = at + usize.ONE
+  }
+  if summaryCursor.failed || summaryCursor.at != summaryBytes.length { return Option<IndexedShard>.none() }
+  let anchorRows = List<Anchor>.asSlice(&anchors)
+  let mut anchorAt = usize.ZERO
+  let mut key = Bytes.make()
+  at = usize.ZERO
+  while at < parts.leaves {
+    let value = indexedLeafIn(bytes, leafStarts, at, totalLeaves)
+    if alwaysPlaced(&value) {
+      if anchorAt >= anchorRows.length || anchorRows[anchorAt].at != at || !sameLeaf(value, anchorRows[anchorAt].leaf) { return Option<IndexedShard>.none() }
+      let whole = at - at % RESTART
+      Bytes.clear(&mut key)
+      let mut part = whole
+      while part <= at {
+        let selected = indexedLeafIn(bytes, leafStarts, part, totalLeaves)
+        run unpackKey(bytes, selected.packedAt, &mut key)
+        part = part + usize.ONE
+      }
+      if !sameBytes(Bytes.asSlice(&key), anchorKey(&anchorRows[anchorAt])) { return Option<IndexedShard>.none() }
+      anchorAt = anchorAt + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  if anchorAt != anchorRows.length { return Option<IndexedShard>.none() }
+  let nodeEnd = parts.nodesStart + parts.nodesLength
+  let nodeBytes = Slice.view<u8>(bytes, usize.ZERO, nodeEnd)
+  let mut nodeCursor = Cursor {at: parts.nodesStart, failed: false}
+  let nodes = readCount(nodeBytes, &mut nodeCursor)
+  let edges = readCount(nodeBytes, &mut nodeCursor)
+  if nodeCursor.failed || nodes > INDEX_ITEMS - priorNodes || edges > 67108864 { return Option<IndexedShard>.none() }
+  let mut nodeStarts = List<usize>.make()
+  run List<usize>.reserveExact(&mut nodeStarts, nodes)
+  let mut seen = usize.ZERO
+  at = usize.ZERO
+  while at < nodes && !nodeCursor.failed {
+    run List<usize>.append(&mut nodeStarts, nodeCursor.at)
+    let count = readCount(nodeBytes, &mut nodeCursor)
+    if count > edges - seen { return Option<IndexedShard>.none() }
+    seen = seen + count
+    let mut edge = usize.ZERO
+    while edge < count && !nodeCursor.failed {
+      let encoded = readVarint(nodeBytes, &mut nodeCursor)
+      let named = u64.shiftRight(encoded, 1)
+      let limit = if u64.bitAnd(encoded, 1) == 1 { priorNodes + at } else { totalLeaves }
+      if named >= usize.toU64(limit) { return Option<IndexedShard>.none() }
+      edge = edge + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  if nodeCursor.failed || nodeCursor.at != nodeEnd || seen != edges { return Option<IndexedShard>.none() }
+  let mut rootCursor = Cursor {at: parts.end, failed: false}
+  let sealed = run readHeader(bytes, &mut rootCursor, stamp)
+  let rootBody = rootCursor.at
+  if rootCursor.failed || !ContentHash.equals(parts.seal, sealed) { return Option<IndexedShard>.none() }
+  let count = readCount(bytes, &mut rootCursor)
+  if count > INDEX_ITEMS { return Option<IndexedShard>.none() }
+  let mut roots = List<IndexedRoot>.make()
+  run List<IndexedRoot>.reserveExact(&mut roots, count)
+  let mut expanded = usize.ZERO
+  at = usize.ZERO
+  while at < count && !rootCursor.failed {
+    let common = readVarint(bytes, &mut rootCursor)
+    let previousLength = indexedPreviousKey(List<IndexedRoot>.asSlice(&roots), at).length
+    if common > usize.toU64(previousLength) || common > usize.toU64(INDEX_KEY) { return Option<IndexedShard>.none() }
+    let keyStart = rootCursor.at
+    let length = checkedPacked(bytes, &mut rootCursor)
+    if rootCursor.failed || length > INDEX_KEY - u64.toUsize(common) { return Option<IndexedShard>.none() }
+    rootCursor.at = keyStart
+    let key = run readPacked(bytes, &mut rootCursor, indexedPreviousKey(List<IndexedRoot>.asSlice(&roots), at), u64.toUsize(common))
+    let node = readVarint(bytes, &mut rootCursor)
+    if node >= usize.toU64(priorNodes + nodes) { return Option<IndexedShard>.none() }
+    let answerAt = rootCursor.at
+    let answerLength = checkedPacked(bytes, &mut rootCursor)
+    if rootCursor.failed || answerLength > INDEX_ANSWERS - expanded { return Option<IndexedShard>.none() }
+    expanded = expanded + answerLength
+    run List<IndexedRoot>.append(&mut roots, IndexedRoot {key: move key, node: u64.toUsize(node), answerAt: answerAt})
+    at = at + usize.ONE
+  }
+  if rootCursor.failed || rootCursor.at != bytes.length { return Option<IndexedShard>.none() }
+  let mut stream = ContentHash.stream()
+  ContentHash.append(&mut stream, Slice.view<u8>(bytes, graphBody, parts.end - graphBody))
+  ContentHash.append(&mut stream, Slice.view<u8>(bytes, rootBody, bytes.length - rootBody))
+  if !ContentHash.equals(ContentHash.finish(move stream), sealed) { return Option<IndexedShard>.none() }
+  let digest = ContentHash.of(bytes)
+  return Option<IndexedShard>.some(IndexedShard {file: move file, digest: digest, roots: move roots,
+    leafStarts: move starts, nodeStarts: move nodeStarts, anchors: move anchors, priorLeaves: priorLeaves, priorNodes: priorNodes})
+}
+
+pub fn indexedBytes(index: &IndexedShard) -> &Frozen<Bytes> { return &index.file }
+pub fn indexedLeafCount(index: &IndexedShard) -> usize { return List<usize>.length(&index.leafStarts) }
+pub fn indexedNodeCount(index: &IndexedShard) -> usize { return List<usize>.length(&index.nodeStarts) }
+pub fn indexedAnchors(index: &IndexedShard) -> &[Anchor] { return List<Anchor>.asSlice(&index.anchors) }
+pub fn indexedLeaf(index: &IndexedShard, at: usize) -> Leaf {
+  return indexedLeafIn(Bytes.asSlice(Frozen<Bytes>.get(&index.file)), List<usize>.asSlice(&index.leafStarts), at, index.priorLeaves + indexedLeafCount(index))
+}
+
+pub effect fn indexedKeyAt<'a>(index: &'a IndexedShard, cursor: &'a mut KeyCursor, at: usize) -> &'a [u8]
+! OutOfMemoryError ? &mut Allocator {
+  if cursor.at != at {
+    let whole = at - at % RESTART
+    let mut next = whole
+    if cursor.at != usize.MAX && cursor.at < at && cursor.at >= whole { next = cursor.at + usize.ONE }
+    while next <= at {
+      let value = indexedLeaf(index, next)
+      run unpackKey(Bytes.asSlice(Frozen<Bytes>.get(&index.file)), value.packedAt, &mut cursor.key)
+      next = next + usize.ONE
+    }
+    cursor.at = at
+  }
+  return Bytes.asSlice(&cursor.key)
+}
+
+pub fn indexedEdges(index: &IndexedShard, node: usize) -> IndexedEdges {
+  let mut cursor = Cursor {at: List<usize>.get(&index.nodeStarts, node), failed: false}
+  let count = readCount(Bytes.asSlice(Frozen<Bytes>.get(&index.file)), &mut cursor)
+  return IndexedEdges {at: cursor.at, left: count}
+}
+
+pub fn indexedNextEdge(index: &IndexedShard, edges: &mut IndexedEdges) -> Option<usize> {
+  if edges.left == usize.ZERO { return Option<usize>.none() }
+  let mut cursor = Cursor {at: edges.at, failed: false}
+  let value = readVarint(Bytes.asSlice(Frozen<Bytes>.get(&index.file)), &mut cursor)
+  edges.at = cursor.at
+  edges.left = edges.left - usize.ONE
+  return Option<usize>.some(u64.toUsize(value))
+}
+
+pub fn indexedEdgeCount(index: &IndexedShard, node: usize) -> usize { return indexedEdges(index, node).left }
+
+pub effect fn indexedAnswer(index: &IndexedShard, root: usize) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut cursor = Cursor {at: List<IndexedRoot>.asSlice(&index.roots)[root].answerAt, failed: false}
+  return run readPacked(Bytes.asSlice(Frozen<Bytes>.get(&index.file)), &mut cursor, b"", usize.ZERO)
+}
+
+fn indexedPreviousKey(roots: &[IndexedRoot], at: usize) -> &[u8] {
+  if at == usize.ZERO { return b"" }
+  return Bytes.asSlice(&roots[at - usize.ONE].key)
 }
