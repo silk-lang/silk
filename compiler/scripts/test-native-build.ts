@@ -1215,8 +1215,10 @@ const program = Effect.gen(function* () {
     casing.stderr,
     /^src\/main\.silk:1:8: error\[MOD0001\] Unknown module util\.math\n  note: did you mean `util\.Math`\? Module paths match file names exactly, including letter case$/m,
   )
-  // Unused bindings are warnings: `check` and `build` report them and still succeed. Each command
-  // runs twice, so the second, warm run reports the warnings of a module it does not parse again.
+  // Unused bindings are warnings, and a warning fails `check` and `build` unless `--ignore-warnings`
+  // allows it. Each command runs at least twice, so a warm run reports the warnings of a module it
+  // does not parse again, and a build that reuses an allowed build's artifact fails for its
+  // warnings again. An interface import that only method syntax uses is not reported.
   yield* fs.makeDirectory(join(directory, 'unused/src'), { recursive: true })
   yield* fs.writeFileString(
     join(directory, 'unused/silk.toml'),
@@ -1224,20 +1226,33 @@ const program = Effect.gen(function* () {
   )
   yield* fs.writeFileString(
     join(directory, 'unused/src/main.silk'),
-    'import helper { value }\n\npub fn main() -> i32 {\n  let idle = 1\n  let _kept = 2\n  return value()\n}\n',
+    'import helper { value }\nimport shape { Area, Square }\n\npub fn main() -> i32 {\n  let idle = 1\n  let _kept = 2\n  let square = Square {side: 0}\n  return value() + square.area()\n}\n',
   )
   yield* fs.writeFileString(
     join(directory, 'unused/src/helper.silk'),
     'import silk.num.usize\n\npub fn value() -> i32 {\n  let spare = 1\n  return 0\n}\n',
   )
-  for (const command of ['check', 'check', 'build', 'build']) {
-    const unused = yield* invoke(silk, [command, '--stdlib', standardLibrary, ...(command === 'build' ? ['--clang', clang] : [])],
-      join(directory, 'unused'))
-    assert.equal(unused.status, 0, unused.stderr)
-    assert.match(unused.stderr, /^src\/main\.silk:4:7: warning\[SEM0255\] `idle` is never used/m)
+  yield* fs.writeFileString(
+    join(directory, 'unused/src/shape.silk'),
+    'pub interface Area {\n  fn area(self: &Self) -> i32\n}\n\npub struct Square {\n  pub side: i32,\n}\n\nimpl Area for Square {\n  fn area(self: &Self) -> i32 {\n    return self.side * self.side\n  }\n}\n',
+  )
+  const unusedRuns: ReadonlyArray<readonly [string, boolean]> = [
+    ['check', false], ['check', false], ['check', true],
+    ['build', true], ['build', false], ['build', false], ['build', true],
+  ]
+  for (const [command, ignored] of unusedRuns) {
+    const unused = yield* invoke(silk, [
+      command, '--stdlib', standardLibrary,
+      ...(command === 'build' ? ['--clang', clang] : []),
+      ...(ignored ? ['--ignore-warnings'] : []),
+    ], join(directory, 'unused'))
+    assert.equal(unused.status, ignored ? 0 : 1, unused.stderr)
+    assert.match(unused.stderr, /^src\/main\.silk:5:7: warning\[SEM0255\] `idle` is never used/m)
     assert.match(unused.stderr, /^src\/helper\.silk:4:7: warning\[SEM0255\] `spare` is never used/m)
     assert.match(unused.stderr, /^src\/helper\.silk:1:17: warning\[MOD0007\] Import `usize` is never used/m)
-    assert.doesNotMatch(unused.stderr, /_kept/)
+    assert.doesNotMatch(unused.stderr, /_kept|`Area`/)
+    if (ignored) assert.doesNotMatch(unused.stderr, /--ignore-warnings/)
+    else assert.match(unused.stderr, /^silk: warnings fail this command; fix them, or pass --ignore-warnings to allow them$/m)
   }
   // A package that cannot be loaded ends its load row as failed and still names itself on its
   // final line.

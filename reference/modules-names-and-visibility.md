@@ -204,8 +204,8 @@ overloads, or runtime providers. Interface-conformance availability is defined w
 specialization rules rather than by runtime import side effects.
 
 **Diagnostics:** A valid but unused import is not a compiler error. The compiler reports it as the
-`MOD0007` warning described under [Unused import warnings](#unused-import-warnings). Invalid
-bindings retain their import or name-resolution diagnostics even when no runtime expression uses
+`MOD0007` warning described under [Unused import warnings](#unused-import-warnings), which fails
+the command unless `--ignore-warnings` is given. Invalid bindings retain their import or name-resolution diagnostics even when no runtime expression uses
 them.
 
 **Evidence:** behavior-neutral imports,
@@ -1247,7 +1247,10 @@ Import declarations and comments are not uses. A `pub import` publishes its bind
 reported, and neither is a binding whose name starts with `_`, such as an import kept only to load
 a module of test cases: `import hir.UnusedCases as _cases`. A module whose top-level declarations
 are all imports, such as a `silk test` discovery root, reports none of its imports: such a module
-imports only to load the modules it names.
+imports only to load the modules it names. An import of an interface, or of a namespace whose module
+publishes one, is not reported either, because method syntax and `Type.operation` calls find the
+interface's operations through it without spelling it. Like every warning, `MOD0007` fails
+`silk check`, `silk build` and `silk test` unless `--ignore-warnings` is given.
 
 A warning does not reject the program: the command still succeeds, and its exit status is the
 one it would have without the warning. Only the root package's modules are reported, a module with
