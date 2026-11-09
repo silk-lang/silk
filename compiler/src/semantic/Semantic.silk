@@ -433,6 +433,8 @@ import silk.collections.list {List}
 import silk.collections.slice {Slice}
 
 import semantic.FrontierHost {FrontierHost}
+import semantic.QueryRunCensus
+import semantic.CacheWorkTrace
 
 /// The evidence a semantic store retains beyond its current answers.
 pub enum StoreMode {
@@ -4251,6 +4253,7 @@ struct Resolver {
   rootRecorder: usize,
   // The unit run in progress, numbered by `runs` when it began; zero while no unit runs.
   currentRun: usize,
+  queryRunCensus: QueryRunCensus.Census,
   bodySource: Option<BodySourceSnapshot>,
   // Each function body's resolved annotations and calls (`Family.BodyFacts`), until its checking
   // takes them, and its slot here by dense declaration handle, or `usize.MAX`. A rerun refills its
@@ -8592,10 +8595,183 @@ effect fn kindRejection(
   )
 }
 
+// These counters describe provider executions, not repeated walk/transport references.
+fn queryCensusFamily(family: Family) -> bool {
+  return family == Family.Body || family == Family.Mir || family == Family.EmissionInputs
+}
+
+effect fn recordQueryProvenance(resolver: &mut Resolver, unit: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  if unit < List<ScopedKey>.length(&resolver.keys) && queryCensusFamily(List<ScopedKey>.get(&resolver.keys, unit).key.family) {
+    run QueryRunCensus.record(&mut resolver.queryRunCensus, unit, 3)
+  }
+}
+
+// Scoped keys and every table these supported encodings read are append-only in an immutable
+// store. Query.forget/failed-query rollback never recycles a unit. Private transaction/condition
+// contexts and frame variants are explicitly excluded, not identified by process-local slots.
+effect fn queryCensusIdentity(resolver: &Resolver, unit: usize, reason: &mut usize) -> Bytes
+! OutOfMemoryError ? &mut Allocator {
+  reason.* = usize.ZERO
+  if unit >= List<ScopedKey>.length(&resolver.keys) { reason.* = 4 return Bytes.make() }
+  let scope = List<ScopedKey>.get(&resolver.keys, unit)
+  let key = scope.key
+  if scope.origin.slot != u32.MAX { reason.* = 1 return Bytes.make() }
+  if scope.condition != usize.MAX { reason.* = 2 return Bytes.make() }
+  let mut output = Bytes.make()
+  run RuntimeEncoding.word(&mut output, u8.toU64(Family.value(key.family)))
+  if scope.application == usize.MAX { run RuntimeEncoding.word(&mut output, 0) }
+  else {
+    if scope.application >= List<ModuleId>.length(&resolver.modules) { reason.* = 4 return Bytes.make() }
+    run RuntimeEncoding.word(&mut output, 1)
+    run StableKey.module(&mut output, &List<ModuleId>.asSlice(&resolver.modules)[scope.application])
+  }
+  if scope.profile == usize.ZERO { run RuntimeEncoding.word(&mut output, 0) }
+  else if scope.profile == usize.MAX { run RuntimeEncoding.word(&mut output, 1) }
+  else {
+    let mut profile = Option<&FinalProfile>.none()
+    if scope.profile == usize.ONE {
+      if let Option<FinalProfile>.Some {value} = &resolver.initialProfile { profile = Option<&FinalProfile>.some(&value) }
+    } else if scope.profile >= 2 && scope.profile - 2 < List<FinalProfile>.length(&resolver.profiles) {
+      profile = Option<&FinalProfile>.some(&List<FinalProfile>.asSlice(&resolver.profiles)[scope.profile - 2])
+    }
+    match move profile {
+      Option<&FinalProfile>.Some {value} => {
+        let mut identity = Bytes.make()
+        run FinalProfile.appendIdentity(value, &mut identity)
+        run RuntimeEncoding.word(&mut output, 2)
+        run RuntimeEncoding.field(&mut output, Bytes.asSlice(&identity))
+      }
+      _ => { reason.* = 3 return Bytes.make() }
+    }
+  }
+  if key.module >= List<ModuleId>.length(&resolver.modules) { reason.* = 4 return Bytes.make() }
+  run StableKey.module(&mut output, &List<ModuleId>.asSlice(&resolver.modules)[key.module])
+  if key.declaration == usize.MAX { run RuntimeEncoding.word(&mut output, 0) }
+  else {
+    let declared = match move DeclarationTable.identity(&resolver.declarations, key.declaration) {
+      Option<&DeclarationId>.Some {value} => value
+      _ => { reason.* = 4 return Bytes.make() }
+    }
+    run RuntimeEncoding.word(&mut output, 1)
+    run StableKey.declaration(&mut output, declared)
+  }
+  if key.family == Family.Body {
+    run RuntimeEncoding.word(&mut output, usize.toU64(key.name))
+    run RuntimeEncoding.word(&mut output, if key.external { 1 } else { 0 })
+    if key.member == usize.ZERO { run RuntimeEncoding.word(&mut output, 0) }
+    else {
+      let applications = List<Application>.asSlice(&resolver.selectedApplications)
+      if key.member - usize.ONE >= applications.length { reason.* = 4 return Bytes.make() }
+      let mut coordinates = RuntimeEncoding.limitedCoordinates(262144)
+      let selected = run Application.encoding(&applications[key.member - usize.ONE], true, &mut coordinates)
+      if coordinates.exceeded { reason.* = 6 return Bytes.make() }
+      run RuntimeEncoding.word(&mut output, 1)
+      run RuntimeEncoding.field(&mut output, Bytes.asSlice(&selected))
+    }
+  } else if key.family == Family.Mir || key.family == Family.EmissionInputs {
+    let instances = List<BackendInstance>.asSlice(&resolver.backendInstances)
+    if key.name >= instances.length { reason.* = 4 return Bytes.make() }
+    let instance = &instances[key.name]
+    if let Option<CoroutineFacts>.Some {..} = &instance.suspension { reason.* = 5 return Bytes.make() }
+    if run InstanceKey.runtimeLength(&instance.key) > 262144 { reason.* = 6 return Bytes.make() }
+    let runtime = run InstanceKey.runtimeEncoding(&instance.key)
+    let mut coordinates = RuntimeEncoding.limitedCoordinates(262144)
+    let exact = run InstanceKey.encodingAt(&instance.key, &mut coordinates)
+    if coordinates.exceeded { reason.* = 6 return Bytes.make() }
+    run RuntimeEncoding.field(&mut output, Bytes.asSlice(&runtime))
+    run RuntimeEncoding.field(&mut output, Bytes.asSlice(&exact))
+    run RuntimeEncoding.word(&mut output, if instance.observing { 1 } else { 0 })
+  } else { reason.* = 7 return Bytes.make() }
+  if Bytes.length(&output) > 1048576 { reason.* = 6 return Bytes.make() }
+  return move output
+}
+
+impl Semantic {
+  /// Dumps bounded expensive-provider counters for this process. Phase 0 precedes initial
+  /// worker transport, phase 1 follows retained serving, phase 2 is the parent before saving.
+  /// Exact key encoding and file writes are diagnostic overhead, never benchmark evidence.
+  pub effect fn traceQueryRuns(self: &Self, phase: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    let census = &self.resolver.queryRunCensus
+    if !census.enabled { return () }
+    CacheWorkTrace.point(b"query-census-dump-begin", phase, List<QueryRunCensus.Row>.length(&census.rows))
+    let dumpStarted = run CacheWorkTrace.begin()
+    let mut output = Bytes.make()
+    run RuntimeEncoding.field(&mut output, b"silk-query-runs-v1")
+    run RuntimeEncoding.word(&mut output, usize.toU64(QueryRunCensus.process()))
+    run RuntimeEncoding.word(&mut output, usize.toU64(self.frontierWorker))
+    run RuntimeEncoding.word(&mut output, usize.toU64(phase))
+    run RuntimeEncoding.word(&mut output, usize.toU64(census.preexistingUnits))
+    run RuntimeEncoding.word(&mut output, usize.toU64(census.dropped))
+    run RuntimeEncoding.field(&mut output, Bytes.asSlice(&run Semantic.stampIdentity(self)))
+    let rows = List<QueryRunCensus.Row>.asSlice(&census.rows)
+    run RuntimeEncoding.word(&mut output, usize.toU64(rows.length))
+    let mut at = usize.ZERO
+    while at < rows.length {
+      let row = rows[at]
+      let mut reason = usize.ZERO
+      let identity = if Bytes.length(&output) < 67108864 { run queryCensusIdentity(&self.resolver, row.unit, &mut reason) }
+        else { reason = 8 Bytes.make() }
+      let family = List<ScopedKey>.get(&self.resolver.keys, row.unit).key.family
+      run RuntimeEncoding.word(&mut output, u8.toU64(Family.value(family)))
+      run RuntimeEncoding.word(&mut output, usize.toU64(row.unit))
+      run RuntimeEncoding.word(&mut output, usize.toU64(reason))
+      run RuntimeEncoding.field(&mut output, Bytes.asSlice(&identity))
+      let values = [row.starts, row.finishes, row.hits, row.preexistingUnitHits, row.newUnitHits, row.unmatchedFinishes, row.provenanceMentions]
+      let mut count = usize.ZERO
+      while count < values.length { run RuntimeEncoding.word(&mut output, usize.toU64(values[count])) count = count + usize.ONE }
+      at = at + usize.ONE
+    }
+    run frontierDump(b"query-runs", Bytes.asSlice(&output), QueryRunCensus.process(), phase)
+    run CacheWorkTrace.end(b"query-census-dump-end", dumpStarted, phase, Bytes.length(&output))
+  }
+
+  // A provenance mention is never a provider run. Count source-local evidence requests once
+  // per packet construction; carried entries without a local query unit contribute no row.
+  effect fn censusQueryProvenance(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    if !self.resolver.queryRunCensus.enabled { return () }
+    let artifacts = List<ArtifactCacheEntry>.asSlice(&self.artifactCacheEntries)
+    let mut at = usize.ZERO
+    while at < artifacts.length {
+      run recordQueryProvenance(&mut self.resolver, artifacts[at].mirUnit)
+      run recordQueryProvenance(&mut self.resolver, artifacts[at].emissionUnit)
+      at = at + usize.ONE
+    }
+    let extensions = List<FrontierMirEvidence>.asSlice(&self.frontierExtensionEvidence)
+    at = usize.ZERO
+    while at < extensions.length { run recordQueryProvenance(&mut self.resolver, extensions[at].unit) at = at + usize.ONE }
+    let chunks = List<FrontierCacheCapture>.asSlice(&self.frontierCacheCaptures)
+    at = usize.ZERO
+    while at < chunks.length {
+      let entries = List<CapturedEntry>.asSlice(&chunks[at].capture.entries)
+      let mut entry = usize.ZERO
+      while entry < entries.length { run recordQueryProvenance(&mut self.resolver, entries[entry].mirUnit) entry = entry + usize.ONE }
+      at = at + usize.ONE
+    }
+    let memos = List<EscapeMemo>.asSlice(&self.escapeMemos)
+    at = usize.ZERO
+    while at < memos.length {
+      if let Option<CapturedBuild>.Some {value} = &memos[at].captured {
+        let entries = List<CapturedEntry>.asSlice(&value.entries)
+        let mut entry = usize.ZERO
+        while entry < entries.length { run recordQueryProvenance(&mut self.resolver, entries[entry].mirUnit) entry = entry + usize.ONE }
+      }
+      at = at + usize.ONE
+    }
+
+  }
+}
+
 @inlineAlways
 effect fn emit(resolver: &mut Resolver, kind: EventKind, key: Word) -> ()
 ! OutOfMemoryError
 ? &mut Allocator {
+  if resolver.queryRunCensus.enabled {
+    let selected = List<ScopedKey>.get(&resolver.keys, u64.toUsize(key.value)).key
+    if queryCensusFamily(selected.family) {
+      let event = match kind { EventKind.Start => usize.ZERO EventKind.Finish => usize.ONE EventKind.Hit => 2 }
+      if event != usize.MAX { run QueryRunCensus.record(&mut resolver.queryRunCensus, u64.toUsize(key.value), event) }
+    }
+  }
   if !resolver.tracing {
     return ()
   }
@@ -94506,6 +94682,7 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
       verifyMir: false,
       rootRecorder: usize.MAX,
       currentRun: usize.ZERO,
+      queryRunCensus: QueryRunCensus.make(!revisable),
       bodySource: Option<BodySourceSnapshot>.none(),
       impliedWalks: List<ImpliedWalk>.make(),
       impliedLookup: InternIndex.make(),
@@ -97048,12 +97225,14 @@ impl Semantic {
     if let Option<[*]mut u64>.Some {value: control} = &self.frontierForkControl {
       if !acquireFrontierLease(control, false) { Semantic.abortFrontierWorker(&self.*, false) }
     }
+    run Semantic.traceQueryRuns(&self.*, usize.ZERO)
     run writeFrontierPayload(unsafe FrontierHost.descriptor(self.frontierOutput), List<CacheImage.Root>.asSlice(&image.roots))
     run frontierTrace(b"worker-transport", self.frontierSplit, self.frontierWorker, List<CacheImage.Root>.length(&image.roots))
     drop unsafe FrontierHost.closeFile(self.frontierOutput)
     if let Option<[*]mut u64>.Some {value: control} = &self.frontierForkControl { releaseFrontierLease(control) }
     self.frontierServing = true
     let served = run Effect.result(Semantic.serveFrontier(&mut self.*, &mut request.*))
+    run Semantic.traceQueryRuns(&self.*, usize.ONE)
     stopFrontier(List<CheckWorker>.asSlice(&self.frontierChildren))
     if let Result<(), OutOfMemoryError>.Failure {error} = move served { drop error }
     drop unsafe FrontierHost.close(self.frontierControl)
@@ -99136,6 +99315,7 @@ impl Semantic {
               drop unsafe FrontierHost.closeFile(inherited[sibling].stream)
               sibling = sibling + usize.ONE
             }
+            QueryRunCensus.fork(&mut self.resolver.queryRunCensus, List<ScopedKey>.length(&self.resolver.keys))
             self.frontierWorker = shard
             donationAllowed = true
             // This frame began in the coordinator, before it had a worker identity. Its
@@ -99239,6 +99419,7 @@ impl Semantic {
                     drop unsafe FrontierHost.closeFile(self.frontierOutput)
                     self.frontierControl = sockets[1]
                     self.frontierOutput = stream
+                    QueryRunCensus.fork(&mut self.resolver.queryRunCensus, List<ScopedKey>.length(&self.resolver.keys))
                     self.frontierWorker = self.frontierWorker + 4 * sequence
                     self.frontierForkUsed = true
                   } else {
@@ -111746,6 +111927,7 @@ impl Semantic {
     // Frozen workers lack the observations needed for reuse after an edit. They may emit now,
     // but cannot create apparently green cache roots for those answers.
     if !Graph.recording(&self.resolver.graph) || !same(stamp, Bytes.asSlice(&run artifactCacheStamp(&self.*))) { return Bytes.make() }
+    run Semantic.censusQueryProvenance(&mut self.*)
     let census = cachePacketCensus()
     let started = if census { run frontierNow() } else { 0 }
     let mut image = run Semantic.completeCacheImageWithWalkRecords(&mut self.*, false)
