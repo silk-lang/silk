@@ -216,8 +216,8 @@ inputs and `config`. `[config]` contains project-tier package parameter values, 
 module's path and the parameter's name (`main.limit = 42`) and written as plain TOML that is checked
 against the parameter's declared type. A profile's `config` holds override-tier values. A profile
 that names no `target` builds for the host. Profile fields are kebab-case (`code-model`,
-`max-memory`, `stack-size`); the earlier `codeModel`, `maxMemory` and `bindings` are refused, naming the current
-spelling. A profile's `backend` (`--backend` on the command line) picks the code generator: `llvm`, the
+`max-memory`, `stack-size`); `codeModel` and `maxMemory` are unknown fields, and the message
+suggests `code-model` and `max-memory`. A profile's `backend` (`--backend` on the command line) picks the code generator: `llvm`, the
 default, or `direct`, which writes wasm32 executables itself, without Clang. A `wasm32-wasip2`
 component still needs wasm-tools and the Preview 1 adapter, as with `llvm`. `--profile-input` JSON keeps `codeModel`, `maxMemory`, `stackSize`, `codegenUnits` and tagged `bindings`. Without a table
 of that name, `dev` (unoptimized, with debug information) and `release` (optimized, without it) are

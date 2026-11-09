@@ -991,14 +991,17 @@ defaults to `0.0.0`. A name starts with a lowercase letter and holds lowercase l
 
 The canonical structural contract is
 [`compiler/manifest.schema.toml`](../compiler/manifest.schema.toml), a JSON Schema Draft 2020-12
-document written in TOML. The compiler embeds this schema and validates manifests before decoding
-them. Unknown fields are rejected outside `tool`.
+document written in TOML. The compiler embeds this schema and validates the root manifest, each
+workspace manifest and each dependency's manifest before decoding them. A dependency's manifest is
+validated after its `silk-version` is checked, so a dependency written for another Silk is refused
+for that first. Unknown fields are rejected outside `tool`. A field this schema does not list is
+an unknown field, whether a later Silk adds it or an earlier one had it: there are no aliases.
 
 `[package]` also accepts publishing metadata that builds never read: `description`, `license`,
 `repository`, `homepage` and `readme` as strings, `authors` and `keywords` as arrays of strings.
 `[tool.<name>]` belongs to other tools and is never validated. `[release]` belongs to
-`silk change`. Unsupported tables and fields, including `[dev-dependencies]`, `[target]`, `[lints]`,
-`[test]`, `[bench]`, `[bin]` and `[package].include`, are rejected.
+`silk change`. Unsupported tables and fields, such as `[dev-dependencies]`, are rejected as
+unknown fields.
 
 Validation maps TOML to the shared JSON value model without rounding numbers. TOML dates and times
 map to strings; mathematically integral floats satisfy JSON Schema's `integer` type. The compiler
@@ -1016,6 +1019,14 @@ have the same identity, and a module's identity never contains a host path.
 root module outside its source root is an invalid-manifest error from the build. The language server
 also reports TOML syntax and shared schema errors on unsaved `silk.toml` text, using `TOML` and
 `MANIFEST_SCHEMA` codes and source ranges. Build-only semantic checks are not schema diagnostics.
+A schema error names the field by its dotted path, such as `native.link[0].os`, and the rule it
+breaks: an unknown field with the closest field of its table (`package.nmae is not a supported
+field; did you mean package.name?`), a missing field (`package needs name`), or a value outside a
+type, a list of values or a schema `title` (`package.version must be a full semantic version, such
+as 0.1.0; it is "0.1"`). Unknown fields are reported first, then other values, then values that
+match none of the forms a field accepts; failures inside one of those forms are not reported. When
+the manifest's own `silk-version` names a Silk the running compiler cannot stand in for, each
+message adds that version, since a later Silk may accept the field.
 
 **Evidence:** [native package sources](../compiler/src/driver/ModuleSources.silk),
 [native manifest decoding](../compiler/src/driver/Project.silk),

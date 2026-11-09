@@ -3422,6 +3422,19 @@ const program = Effect.gen(function* () {
     notToml.stderr,
     /Invalid Silk project manifest .*packaged\/broken\/silk\.toml:4: /,
   )
+  // A dependency's silk.toml is checked against the manifest schema as the root's is.
+  yield* fs.writeFileString(join(directory, 'packaged/broken/silk.toml'), '[package]\nname = "broken"\nkind = "library"\nnmae = "x"\n')
+  const unknownField = yield* invoke(
+    silk,
+    ['run', '--stdlib', standardLibrary],
+    join(directory, 'packaged/app'),
+    { ...process.env, SILK_CLANG: sentinel },
+  )
+  assert.equal(unknownField.status, 2, 'a dependency with an unknown manifest field was accepted')
+  assert.match(
+    unknownField.stderr,
+    /Invalid Silk project manifest .*packaged\/broken\/silk\.toml:4: /,
+  )
   {
     // A git dependency pinned to a commit reads one package of a multi-package repository, fetched
     // once into $SILK_HOME/git, and builds again from that checkout without the repository.
