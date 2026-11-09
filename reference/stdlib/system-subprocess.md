@@ -501,6 +501,21 @@ pub fn pid(self: &Self) -> i32
 
 Returns the process ID of the child.
 
+<a id="Subprocess.impl.inheritEnvironment"></a>
+
+### Associated function `inheritEnvironment`
+
+```silk
+pub effect fn inheritEnvironment(request: &mut ProcessRequest) -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Adds every variable of this process's environment to `request`, so the child gets the
+caller's environment, as a shell gives it. Variables that `request` already sets are added
+again after them; set those after this call instead.
+
+#### Errors
+`OutOfMemoryError` if the `Allocator` cannot supply the copies.
+
 <a id="Subprocess.impl.takePipe"></a>
 
 ### Method `takePipe`
