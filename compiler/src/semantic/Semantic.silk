@@ -767,6 +767,10 @@ fn reuseCompletedFrontier() -> bool {
   return !Pointer.isNullMany<u8>(unsafe FrontierHost.environment(Pointer.fromSlice<u8>(b"SILK_FRONTIER_REUSE_COMPLETED\0")))
 }
 
+fn demandedClosureFrontier() -> bool {
+  return !Pointer.isNullMany<u8>(unsafe FrontierHost.environment(Pointer.fromSlice<u8>(b"SILK_FRONTIER_DEMANDED_CLOSURE\0")))
+}
+
 fn completeModuleFrontier() -> bool {
   return !Pointer.isNullMany<u8>(unsafe FrontierHost.environment(Pointer.fromSlice<u8>(b"SILK_FRONTIER_COMPLETE_MODULES\0")))
 }
@@ -4528,6 +4532,12 @@ pub struct Semantic {
   artifactWarmHits: usize,
   frontierKeys: List<InstanceKey>,
   frontierKeyDigests: DigestSet,
+  frontierClosureQueue: List<ContentHash>,
+  frontierClosureSeen: DigestSet,
+  frontierClosureHead: usize,
+  frontierClosureActive: bool,
+  frontierClosureEnabled: bool,
+  frontierClosureRecords: List<BuildRecord.Record>,
   frontierControl: i32,
   frontierCoverage: List<FrontierCoverage>,
   // Completed worker sweeps valid only for this immutable source/profile selection. These
@@ -94545,6 +94555,12 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
     artifactWarmHits: usize.ZERO,
     frontierKeys: List<InstanceKey>.make(),
     frontierKeyDigests: DigestSet.make(),
+    frontierClosureQueue: List<ContentHash>.make(),
+    frontierClosureSeen: DigestSet.make(),
+    frontierClosureHead: usize.ZERO,
+    frontierClosureActive: false,
+    frontierClosureEnabled: false,
+    frontierClosureRecords: List<BuildRecord.Record>.make(),
     frontierControl: -1,
     frontierCoverage: List<FrontierCoverage>.make(),
     frontierSweepUnits: List<usize>.make(),
@@ -94582,6 +94598,20 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
     frontierOutput: Pointer.null<u8>(),
     frontierUnit: usize.MAX,
     frontierUncachedUnit: usize.MAX,
+  }
+}
+
+// Only a LEFT row reached by a completed capture creates an early closure obligation.
+// EXTERNAL already has a supplier; foreign/full rows and duplicate exact keys add no work.
+effect fn appendFrontierClosure(queue: &mut List<ContentHash>, seen: &mut DigestSet, record: &BuildRecord.Record) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let entries = List<BuildRecord.Entry>.asSlice(&record.entries)
+  let mut at = usize.ZERO
+  while at < entries.length {
+    if entries[at].leaf == BuildRecord.LEFT && (run DigestSet.add(&mut seen.*, entries[at].exact)) {
+      run List<ContentHash>.append(&mut queue.*, entries[at].exact)
+    }
+    at = at + usize.ONE
   }
 }
 
@@ -96361,6 +96391,81 @@ impl Semantic {
     }
   }
 
+  effect fn queueFrontierClosureMemo(self: &mut Self, unit: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    if !self.frontierClosureEnabled { return () }
+    let memos = List<EscapeMemo>.asSlice(&self.escapeMemos)
+    let found = escapeMemoOf(memos, unit)
+    if found == usize.MAX { return () }
+    let memo = &memos[found]
+    if List<Shared<Rejection>>.length(&memo.result.rejections) != usize.ZERO
+      || List<Shared<BackendGap>>.length(&memo.result.gaps) != usize.ZERO
+      || List<UncheckedDeclaration>.length(&memo.result.unchecked) != usize.ZERO { return () }
+    if let Option<CapturedBuild>.Some {value: capture} = &memo.captured {
+      run appendFrontierClosure(&mut self.frontierClosureQueue, &mut self.frontierClosureSeen, &capture.record)
+    }
+  }
+
+  // The worker already holds one of the shared four compute leases. A bounded batch of exact
+  // roots is one scheduling quantum, followed by module/chunk work. Batching shares the normal
+  // walk's visited set and provenance guard; no extra process or thread is created.
+  effect fn advanceFrontierClosure(self: &mut Self, request: &mut Request) -> bool
+  ! OutOfMemoryError ? &mut Allocator | &mut Types {
+    let attempted = run Effect.result(Semantic.advanceFrontierClosureBatch(&mut self.*, &mut request.*))
+    return match move attempted {
+      Result<bool, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} => value
+      Result<bool, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} => {
+        drop move error
+        Semantic.abortFrontierWorker(&self.*, true)
+        false
+      }
+    }
+  }
+
+  effect fn advanceFrontierClosureBatch(self: &mut Self, request: &mut Request) -> bool
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+    if !self.frontierClosureEnabled { return false }
+    let mut requested = List<ContentHash>.make()
+    while self.frontierClosureHead < List<ContentHash>.length(&self.frontierClosureQueue)
+      && List<ContentHash>.length(&requested) < 16 {
+      let exact = List<ContentHash>.get(&self.frontierClosureQueue, self.frontierClosureHead)
+      self.frontierClosureHead = self.frontierClosureHead + usize.ONE
+      // A claimed definition is another capture's obligation, including an in-flight one.
+      // Skipping it is not proof: the coordinator still requires a supplied full row.
+      if artifactLogicalOwner(&self.frontierClaims, exact, usize.MAX) != usize.MAX { continue }
+      if DigestSet.find(&self.frontierKeyDigests, exact) == usize.MAX { continue }
+      run List<ContentHash>.append(&mut requested, exact)
+    }
+    if List<ContentHash>.length(&requested) > usize.ZERO {
+      let serving = self.frontierServing
+      let completed = self.frontierCompletedActive
+      self.frontierServing = true
+      self.frontierCompletedActive = false
+      self.frontierClosureActive = true
+      let attempted = run Effect.result(Semantic.frontierExtend(&mut self.*, &mut request.*, List<ContentHash>.asSlice(&requested)))
+      self.frontierServing = serving
+      self.frontierCompletedActive = completed
+      self.frontierClosureActive = false
+      let extended = match move attempted {
+        Result<Option<BuildRecord.Record>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} => move value
+        Result<Option<BuildRecord.Record>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} => {
+          drop move error
+          Semantic.abortFrontierWorker(&self.*, true)
+          return false
+        }
+      }
+      match move extended {
+        Option<BuildRecord.Record>.Some {value} => { run List<BuildRecord.Record>.append(&mut self.frontierClosureRecords, move value) }
+        Option<BuildRecord.Record>.None => { Semantic.abortFrontierWorker(&self.*, true) return false }
+      }
+      if let Option<[*]mut u64>.Some {value: control} = &self.frontierForkControl {
+        releaseFrontierLease(control)
+        if !acquireFrontierLease(control, false) { Semantic.abortFrontierWorker(&self.*, false) }
+      }
+      return true
+    }
+    return false
+  }
+
   effect fn frontierExtend(self: &mut Self, request: &mut Request, keys: &[ContentHash]) -> Option<BuildRecord.Record>
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
     let mut roots = List<InstanceKey>.make()
@@ -96818,6 +96923,9 @@ impl Semantic {
       Option<CapturedBuild>.Some {value} => move value
       Option<CapturedBuild>.None => { Semantic.abortFrontierWorker(&self.*, true) return () }
     }
+    if self.frontierClosureEnabled {
+      run appendFrontierClosure(&mut self.frontierClosureQueue, &mut self.frontierClosureSeen, &capture.record)
+    }
     let escapeKey = match move run stableUnit(&self.resolver, unit) {
       Option<Bytes>.Some {value} => move value
       Option<Bytes>.None => { Semantic.abortFrontierWorker(&self.*, true) return () }
@@ -96851,6 +96959,7 @@ impl Semantic {
   effect fn publishFrontier(self: &mut Self, request: &mut Request, modules: &[usize]) -> ()
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
     self.frontierAvailable = false
+    self.frontierClosureEnabled = demandedClosureFrontier() && !self.resolver.revisable
     run frontierTrace(b"worker-owned-skipped", self.frontierSplit, self.frontierOwned, self.frontierSkipped)
     run frontierTrace(b"worker-runtime", self.frontierSplit, self.frontierWorker, usize.ZERO)
     run frontierTrace(b"runtime task count", self.frontierSplit, self.frontierWorker, self.frontierTasks)
@@ -96866,13 +96975,22 @@ impl Semantic {
     self.frontierCompletedActive = self.frontierWorker < 4 && reuseCompletedFrontier() && !self.resolver.revisable
     let runtimeUnit = self.frontierUnit
     run Semantic.registerFrontierCompletedMemo(&mut self.*, runtimeUnit)
+    run Semantic.queueFrontierClosureMemo(&mut self.*, runtimeUnit)
+    let mut closureCredit = usize.ZERO
     let mut modulesRun = usize.ZERO
     let mut chunksRun = usize.ZERO
     while self.frontierWorker < 4 {
+      // Four ordinary tasks earn at most one closure quantum. Mandatory declaration coverage
+      // cannot be starved by a stream of newly discovered closure roots.
+      if closureCredit >= 4 {
+        closureCredit = usize.ZERO
+        drop run Semantic.advanceFrontierClosure(&mut self.*, &mut request.*)
+      }
       if let Option<[*]mut u64>.Some {value: table} = &self.frontierChunks {
         if let Option<FrontierChunkTask>.Some {value: task} = move takeFrontierChunk(table, modules.length) {
           run Semantic.frontierSweepChunk(&mut self.*, &mut request.*, modules, move task)
           chunksRun = chunksRun + usize.ONE
+          closureCredit = closureCredit + usize.ONE
           continue
         }
       }
@@ -96916,6 +97034,15 @@ impl Semantic {
         declaration: usize.MAX, member: usize.ONE, external: false})
       run List<usize>.append(&mut owned, u64.toUsize(word.value))
       run Semantic.registerFrontierCompletedMemo(&mut self.*, u64.toUsize(word.value))
+      run Semantic.queueFrontierClosureMemo(&mut self.*, u64.toUsize(word.value))
+      closureCredit = closureCredit + usize.ONE
+    }
+    // No declaration task remains locally. Drain supplied exact tickets; release/reacquire
+    // the existing lease between batches so pending descendant/runtime work keeps priority.
+    while run Semantic.advanceFrontierClosure(&mut self.*, &mut request.*) {}
+    if self.frontierClosureEnabled {
+      run frontierTrace(b"demanded closure", self.frontierSplit, List<ContentHash>.length(&self.frontierClosureQueue),
+        List<BuildRecord.Record>.length(&self.frontierClosureRecords))
     }
     run frontierTrace(b"completed body registry", self.frontierSplit, self.frontierCompletedRows, self.frontierCompletedHits)
     // Retained graph/emission commands construct their own records; they cannot borrow cuts
@@ -97028,6 +97155,13 @@ impl Semantic {
     }
     if let Option<[*]mut u64>.Some {value: control} = &self.frontierForkControl {
       if !acquireFrontierLease(control, false) { Semantic.abortFrontierWorker(&self.*, false) }
+    }
+    let completedClosures = List<BuildRecord.Record>.asSlice(&self.frontierClosureRecords)
+    let mut closureAt = usize.ZERO
+    while closureAt < completedClosures.length {
+      run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: run Bytes.copy(b"frontier-demanded-closure-v1"),
+        node: usize.ZERO, answer: run BuildRecord.encode(&completedClosures[closureAt])})
+      closureAt = closureAt + usize.ONE
     }
     run writeFrontierPayload(unsafe FrontierHost.descriptor(self.frontierOutput), List<CacheImage.Root>.asSlice(&image.roots))
     run frontierTrace(b"worker-transport", self.frontierSplit, self.frontierWorker, List<CacheImage.Root>.length(&image.roots))
@@ -97215,6 +97349,16 @@ impl Semantic {
       while at < roots.length {
         let root = &roots[at]
         let key = Bytes.asSlice(&root.key)
+        if same(key, b"frontier-demanded-closure-v1") {
+          if !demandedClosureFrontier() { good = false at = at + usize.ONE continue }
+          let extension = match move run BuildRecord.decode(Bytes.asSlice(&root.answer)) {
+            Option<BuildRecord.Record>.Some {value} => move value
+            Option<BuildRecord.Record>.None => { good = false at = at + usize.ONE continue }
+          }
+          run List<BuildRecord.Record>.append(&mut records, move extension)
+          at = at + usize.ONE
+          continue
+        }
         if same(key, b"frontier-sweep-chunk-v1") {
           let packet = match move run SweepFragments.decode(Bytes.asSlice(&root.answer)) {
             Option<SweepFragments.Packet>.Some {value} => move value
@@ -97432,6 +97576,12 @@ impl Semantic {
     self.deferredFrontierSubsets = List<DeferredFrontierSubset>.make()
     self.frontierExtensionEvidence = List<FrontierMirEvidence>.make()
     self.frontierExtensionReads = List<usize>.make()
+    self.frontierClosureQueue = List<ContentHash>.make()
+    self.frontierClosureSeen = DigestSet.make()
+    self.frontierClosureHead = usize.ZERO
+    self.frontierClosureActive = false
+    self.frontierClosureEnabled = false
+    self.frontierClosureRecords = List<BuildRecord.Record>.make()
     self.frontierCacheComplete = true
     self.frontierRosters = List<FrontierModuleRoster>.make()
     let selected = Option<ModuleId>.some(ModuleId.copy(runtime))
@@ -99361,6 +99511,13 @@ impl Semantic {
       }
       if let Option<[*]mut u64>.Some {value: table} = &self.frontierClaims {
         let exact = run keyDigest(&instance, false)
+        // Early closure is supplemental evidence, never a standalone check. Leave already
+        // owned rows to their original captures, including our earlier quanta. The final
+        // command-2 completion still materializes any claimed row absent from the union.
+        if self.frontierClosureActive && artifactLogicalOwner(&self.frontierClaims, exact, usize.MAX) != usize.MAX {
+          run BuildCapture.reached(&mut capture.*, &instance, origin, WalkFragments.EXTERNAL)
+          continue
+        }
         if !claimFrontier(table, exact, self.frontierWorker) {
           self.frontierSkipped = self.frontierSkipped + usize.ONE
 
@@ -111525,6 +111682,52 @@ effect fn privateFrontierPartitionClaims() -> () ! InvalidModulePath | OutOfMemo
   run Testing.expect(List<BackendVisit>.length(&later) == usize.ONE && List<VisitOrigin>.asSlice(&laterOrigins)[0].position == 3
     && List<VisitOrigin>.asSlice(&primaryOrigins)[0].position == 0 && List<VisitOrigin>.asSlice(&primaryOrigins)[1].position == 1,
     "second donation preserves the original inherited cursor and takes only still-owned private work")
+}
+
+effect fn demandedFrontierClosureClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut source = run sparseFrontierExample(false, false)
+  let first = ContentHash {high: 7, low: 11}
+  let second = ContentHash {high: 8, low: 11}
+  let entries = List<BuildRecord.Entry>.asMutSlice(&mut source.record.entries)
+  entries[0].exact = first
+  entries[0].leaf = BuildRecord.LEFT
+  entries[1].leaf = BuildRecord.FOREIGN
+  entries[2].leaf = WalkFragments.EXTERNAL
+  let mut queue = List<ContentHash>.make()
+  let mut seen = DigestSet.make()
+  run appendFrontierClosure(&mut queue, &mut seen, &source.record)
+  run appendFrontierClosure(&mut queue, &mut seen, &source.record)
+  run Testing.expect(List<ContentHash>.length(&queue) == usize.ONE
+    && ContentHash.equals(List<ContentHash>.get(&queue, usize.ZERO), first),
+    "only reached LEFT rows create tickets; foreign, externally owned and duplicate rows do not")
+  let changed = List<BuildRecord.Entry>.asMutSlice(&mut source.record.entries)
+  changed[0].leaf = 0
+  changed[1].leaf = BuildRecord.LEFT
+  changed[1].exact = second
+  run appendFrontierClosure(&mut queue, &mut seen, &source.record)
+  run Testing.expect(List<ContentHash>.length(&queue) == 2
+    && ContentHash.equals(List<ContentHash>.get(&queue, usize.ONE), second),
+    "queue identity preserves both digest words and completed full rows add no closure work")
+  // Early completion is only a fragment. The ordinary final merge must still obtain every
+  // external supplier; a missing supplier cannot become proof merely because its ticket ran.
+  let pending = run sparseFrontierExample(false, false)
+  let missing = run WalkFragments.missingBodies(&pending.record)
+  run Testing.expect(List<ContentHash>.length(&missing) > usize.ZERO
+    && !(run WalkFragments.finiteClosed(&pending.record)), "an early fragment cannot certify its unresolved external edges")
+  let completed = run sparseFrontierExample(true, false)
+  let mut fragments = List<BuildRecord.Record>.make()
+  run List<BuildRecord.Record>.append(&mut fragments, move pending.record)
+  run List<BuildRecord.Record>.append(&mut fragments, move completed.record)
+  let merged = run WalkFragments.mergeOpen(List<BuildRecord.Record>.asSlice(&fragments))
+  run Testing.expect(match &merged {
+    Option<BuildRecord.Record>.Some {value} => run WalkFragments.finiteClosed(&value)
+    Option<BuildRecord.Record>.None => false
+  }, "exact full supplier rows close the same graph through the normal final proof")
+}
+
+test effect fn demandedFrontierClosureKeepsExactObligationsAndProof() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run demandedFrontierClosureClaims() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
 test effect fn privateFrontierPreservesPartitionAndOrigins() -> () ! InvalidModulePath | OutOfMemoryError | AssertionError<'static> {
