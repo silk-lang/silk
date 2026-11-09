@@ -809,7 +809,7 @@ const program = Effect.gen(function* () {
       '  }',
       '}',
       'effect fn load(code: i32) -> i32 ! ConfigError { if code > 0 { fail ConfigError { code: code } } return code }',
-      'pub effect fn main() -> () ! ConfigError { let code = run load(7) }',
+      'pub effect fn main() -> () ! ConfigError { drop run load(7) }',
       '',
     ].join('\n'),
   )
@@ -1785,7 +1785,7 @@ const program = Effect.gen(function* () {
   )
   yield* fs.writeFileString(
     join(directory, 'libmsg/app/src/main.silk'),
-    'import geo.lib { BadSide, side }\n\npub effect fn main() -> i32 ! BadSide {\n  let length = run side(-1)\n  return 0\n}\n',
+    'import geo.lib { BadSide, side }\n\npub effect fn main() -> i32 ! BadSide {\n  let _length = run side(-1)\n  return 0\n}\n',
   )
   const escaped = yield* invoke(
     silk,
@@ -2016,7 +2016,7 @@ const program = Effect.gen(function* () {
   )
   yield* fs.writeFileString(
     join(directory, 'tested/src/util/check.silk'),
-    'import silk.testing.testing { AssertionError, Testing }\n\npub fn half(value: i32) -> i32 {\n  return value / 2\n}\n\ntest effect fn halvesEvenly() -> () ! AssertionError<\'static> {\n  run Testing.expect(half(84) == 42, "84 halves to 42")\n}\n\ntest effect fn failsOnPurpose() -> () ! AssertionError<\'static> {\n  run Testing.expect(half(3) == 2, "integer division truncates")\n}\n\ntest fn dividesByZero() -> () {\n  let zero: i32 = 0\n  let quotient = half(2) / zero\n}\n',
+    'import silk.testing.testing { AssertionError, Testing }\n\npub fn half(value: i32) -> i32 {\n  return value / 2\n}\n\ntest effect fn halvesEvenly() -> () ! AssertionError<\'static> {\n  run Testing.expect(half(84) == 42, "84 halves to 42")\n}\n\ntest effect fn failsOnPurpose() -> () ! AssertionError<\'static> {\n  run Testing.expect(half(3) == 2, "integer division truncates")\n}\n\ntest fn dividesByZero() -> () {\n  let zero: i32 = 0\n  let _quotient = half(2) / zero\n}\n',
   )
   const selectedTests = yield* invoke(
     silk,
@@ -2108,7 +2108,7 @@ const program = Effect.gen(function* () {
   )
   yield* fs.writeFileString(
     join(directory, 'stuck/src/main.silk'),
-    'fn deep(n: i64) -> i64 {\n  if n == 0 { return 0 }\n  return deep(n - 1) + 1\n}\n\npub fn main() -> i32 {\n  return 0\n}\n\ntest fn overflows() {\n  let depth = deep(100000000)\n}\n\ntest fn spins() {\n  let mut i: i64 = 0\n  while i >= 0 {\n    i = i - 1 + 1\n  }\n}\n\ntest fn zFinishes() {\n}\n',
+    'fn deep(n: i64) -> i64 {\n  if n == 0 { return 0 }\n  return deep(n - 1) + 1\n}\n\npub fn main() -> i32 {\n  return 0\n}\n\ntest fn overflows() {\n  let _depth = deep(100000000)\n}\n\ntest fn spins() {\n  let mut i: i64 = 0\n  while i >= 0 {\n    i = i - 1 + 1\n  }\n}\n\ntest fn zFinishes() {\n}\n',
   )
   const stuckTests = yield* invoke(
     silk,
