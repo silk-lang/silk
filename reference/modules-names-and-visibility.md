@@ -1020,11 +1020,13 @@ root module outside its source root is an invalid-manifest error from the build.
 also reports TOML syntax and shared schema errors on unsaved `silk.toml` text, using `TOML` and
 `MANIFEST_SCHEMA` codes and source ranges. Build-only semantic checks are not schema diagnostics.
 A schema error names the field by its dotted path, such as `native.link[0].os`, and the rule it
-breaks: an unknown field with the closest field of its table (`package.nmae is not a supported
-field; did you mean package.name?`), a missing field (`package needs name`), or a value outside a
+breaks: an unknown field with the closest field of its table that the manifest does not already set
+(`package.exprots is not a supported field; did you mean package.exports?`), a missing field (`package needs name`), or a value outside a
 type, a list of values or a schema `title` (`package.version must be a full semantic version, such
 as 0.1.0; it is "0.1"`). Unknown fields are reported first, then other values, then values that
-match none of the forms a field accepts; failures inside one of those forms are not reported. When
+match none of the forms a field accepts. Failures inside one of those forms are reported only when
+it is the one form that fits the value's shape, as `{ library = "ssl", mode = "shared" }` is a
+library entry with a refused `mode`. When
 the manifest's own `silk-version` names a Silk the running compiler cannot stand in for, each
 message adds that version, since a later Silk may accept the field.
 
