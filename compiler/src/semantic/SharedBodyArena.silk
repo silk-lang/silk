@@ -1,0 +1,217 @@
+//! Completed body capsules and their immutable guard DAG, shared only by one fork family.
+//! A ready directory word publishes all referenced append-only records. An unfinished producer
+//! never makes a consumer wait; missing, exhausted or unsupported records use local checking.
+import semantic.FrontierHost {FrontierHost}
+import semantic.ContentHash {ContentHash}
+import semantic.RuntimeEncoding
+import semantic.StableKey
+import silk.collections.hash {Hash}
+import silk.collections.bytes {Bytes}
+import silk.core.option {Option}
+import silk.concurrency.atomic {Atomic, CompareExchange, MemoryOrder}
+import silk.mem.pointer {Pointer}
+import silk.num.u8
+import silk.num.i32
+import silk.num.u64
+import silk.num.usize
+
+const slots: usize = 65536
+const firstRecord: usize = (slots + 1) * 8
+pub const capacity: usize = 134217728
+pub const maximumRecord: usize = 1048576
+
+pub struct Arena { mapping: Option<[*]mut u64> }
+pub struct Record<'a> { pub kind: u64, pub payload: &'a [u8] }
+pub fn empty() -> Arena { return Arena {mapping: Option<[*]mut u64>.none()} }
+pub fn enabled() -> bool {
+  return !Pointer.isNullMany<u8>(unsafe FrontierHost.environment(Pointer.fromSlice<u8>(b"SILK_SHARED_TYPED_BODIES\0")))
+}
+pub fn open(allowed: bool) -> Arena {
+  if !allowed || !FrontierHost.available() { return empty() }
+  let mapped = unsafe FrontierHost.mapShared(capacity)
+  if Pointer.addressMany<u64>(mapped) == usize.MAX { return empty() }
+  let mapping = Pointer.nonNullManyMut<u64>(mapped)
+  if let Option<[*]mut u64>.Some {value} = &mapping {
+    unsafe Atomic.store<u64>(unsafe Pointer.atMut<u64>(value, usize.ZERO), usize.toU64(firstRecord), MemoryOrder.Release)
+  }
+  return Arena {mapping: move mapping}
+}
+pub fn present(self: &Arena) -> bool { return match &self.mapping { Option<[*]mut u64>.Some {..} => true _ => false } }
+// The owner calls this only after every worker using the inherited mapping has been reaped.
+pub fn close(self: &mut Arena) -> () {
+  if let Option<[*]mut u64>.Some {value} = move self.mapping { drop unsafe FrontierHost.unmapShared(value, capacity) }
+  self.mapping = Option<[*]mut u64>.none()
+}
+pub fn used(self: &Arena) -> usize {
+  return match &self.mapping {
+    Option<[*]mut u64>.Some {value} => u64.toUsize(unsafe Atomic.load<u64>(unsafe Pointer.atMut<u64>(value, usize.ZERO), MemoryOrder.Acquire))
+    _ => usize.ZERO
+  }
+}
+// Offset-only records are immutable after publication. Guards are written before their parents,
+// and before the body READY word, so one acquire makes the complete reachable DAG visible.
+pub fn append(self: &Arena, kind: u64, payload: &[u8]) -> usize {
+  if payload.length > maximumRecord { return usize.MAX }
+  let mapping = match &self.mapping { Option<[*]mut u64>.Some {value} => value _ => { return usize.MAX } }
+  let amount = ((payload.length + 32 + 7) / 8) * 8
+  let cursor = unsafe Pointer.atMut<u64>(mapping, usize.ZERO)
+  let mut offset = u64.toUsize(unsafe Atomic.load<u64>(cursor, MemoryOrder.Acquire))
+  let mut attempts = usize.ZERO
+  while attempts < 64 {
+    if offset < firstRecord || offset > capacity || amount > capacity - offset { return usize.MAX }
+    match unsafe Atomic.compareExchange<u64>(cursor, usize.toU64(offset), usize.toU64(offset + amount), MemoryOrder.AcquireRelease, MemoryOrder.Acquire) {
+      CompareExchange<u64>.Exchanged => {
+        unsafe Pointer.write<u64>(unsafe Pointer.atMut<u64>(mapping, offset / 8), usize.toU64(payload.length))
+        unsafe Pointer.write<u64>(unsafe Pointer.atMut<u64>(mapping, offset / 8 + 1), kind)
+        let digest = sealed(kind, payload)
+        unsafe Pointer.write<u64>(unsafe Pointer.atMut<u64>(mapping, offset / 8 + 2), digest.high)
+        unsafe Pointer.write<u64>(unsafe Pointer.atMut<u64>(mapping, offset / 8 + 3), digest.low)
+        let bytes = unsafe Intrinsic.pointerRequalify<[*]mut u64, [*]mut u8>(mapping)
+        let mut at = usize.ZERO
+        while at < payload.length {
+          unsafe Pointer.write<u8>(unsafe Pointer.atMut<u8>(bytes, offset + 32 + at), payload[at])
+          at = at + usize.ONE
+        }
+        return offset
+      }
+      CompareExchange<u64>.Observed {value} => { offset = u64.toUsize(value) }
+    }
+    attempts = attempts + usize.ONE
+  }
+  return usize.MAX
+}
+// Call only for a record reached through an acquired READY body or a producer's completed local
+// append. No generic reader can inspect a merely reserved range in this arena.
+pub fn record<'a>(self: &'a Arena, offset: usize) -> Option<Record<'a>> {
+  if offset < firstRecord || offset % 8 != usize.ZERO || offset > capacity - 32 { return Option<Record<'a>>.none() }
+  let mapping = match &self.mapping { Option<[*]mut u64>.Some {value} => value _ => { return Option<Record<'a>>.none() } }
+  let length = u64.toUsize(unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(mapping, offset / 8)))
+  if length > maximumRecord || length > capacity - offset - 32 { return Option<Record<'a>>.none() }
+  let kind = unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(mapping, offset / 8 + 1))
+  let bytes = unsafe Intrinsic.pointerRequalify<[*]mut u64, [*]const u8>(mapping)
+  let payload = unsafe Pointer.borrowMany<Arena, u8>(self, unsafe Pointer.at<u8>(bytes, offset + 32), length)
+  return Option<Record<'a>>.some(Record<'a> {kind: kind, payload: payload})
+}
+fn sealed(kind: u64, payload: &[u8]) -> ContentHash {
+  let mut stream = ContentHash.stream()
+  RuntimeEncoding.hashWord(&mut stream, kind)
+  ContentHash.append(&mut stream, payload)
+  return ContentHash.finish(move stream)
+}
+/// Validates a ready record's content before structural decoding. This is a corruption check;
+/// the immutable epoch and completed producer are the semantic authority, never the checksum.
+pub fn checkedRecord<'a>(self: &'a Arena, offset: usize) -> Option<Record<'a>> {
+  let value = match move record(self, offset) { Option<Record>.Some {value} => value _ => { return Option<Record<'a>>.none() } }
+  let mapping = match &self.mapping { Option<[*]mut u64>.Some {value} => value _ => { return Option<Record<'a>>.none() } }
+  let expected = ContentHash {high: unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(mapping, offset / 8 + 2)),
+    low: unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(mapping, offset / 8 + 3))}
+  if !ContentHash.equals(sealed(value.kind, value.payload), expected) { return Option<Record<'a>>.none() }
+  return Option<Record<'a>>.some(move value)
+}
+fn equal(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length { if left[at] != right[at] { return false } at = at + usize.ONE }
+  return true
+}
+fn matches(self: &Arena, offset: usize, context: &[u8]) -> bool {
+  if let Option<Record>.Some {value} = move record(self, offset) {
+    if value.kind != 3 { return false }
+    let mut reader = StableKey.reader()
+    drop StableKey.readWord(value.payload, &mut reader)
+    let key = StableKey.readField(value.payload, &mut reader)
+    if StableKey.failed(&reader) { return false }
+    return equal(StableKey.view(value.payload, key), context)
+  }
+  return false
+}
+pub fn find(self: &Arena, context: &[u8]) -> usize {
+  let mapping = match &self.mapping { Option<[*]mut u64>.Some {value} => value _ => { return usize.MAX } }
+  let digest = ContentHash.of(context)
+  let mut slot = u64.toUsize(Hash.combine(digest.high, digest.low)) % slots
+  let mut probes = usize.ZERO
+  while probes < 128 {
+    let offset = u64.toUsize(unsafe Atomic.load<u64>(unsafe Pointer.atMut<u64>(mapping, slot + 1), MemoryOrder.Acquire))
+    if offset == usize.ZERO { return usize.MAX }
+    if offset != usize.ONE && matches(self, offset, context) { return offset }
+    slot = (slot + usize.ONE) % slots
+    probes = probes + usize.ONE
+  }
+  return usize.MAX
+}
+pub fn publish(self: &Arena, context: &[u8], offset: usize) -> bool {
+  if !matches(self, offset, context) { return false }
+  let mapping = match &self.mapping { Option<[*]mut u64>.Some {value} => value _ => { return false } }
+  let digest = ContentHash.of(context)
+  let mut slot = u64.toUsize(Hash.combine(digest.high, digest.low)) % slots
+  let mut probes = usize.ZERO
+  while probes < 128 {
+    let location = unsafe Pointer.atMut<u64>(mapping, slot + 1)
+    let ready = u64.toUsize(unsafe Atomic.load<u64>(location, MemoryOrder.Acquire))
+    if ready == usize.ZERO {
+      match unsafe Atomic.compareExchange<u64>(location, 0, 1, MemoryOrder.AcquireRelease, MemoryOrder.Acquire) {
+        CompareExchange<u64>.Exchanged => { unsafe Atomic.store<u64>(location, usize.toU64(offset), MemoryOrder.Release) return true }
+        CompareExchange<u64>.Observed {..} => {}
+      }
+    } else if ready != usize.ONE && matches(self, ready, context) { return false }
+    slot = (slot + usize.ONE) % slots
+    probes = probes + usize.ONE
+  }
+  return false
+}
+
+import silk.core.effect {Effect}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.testing.testing {AssertionError, Testing}
+
+effect fn arenaClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  if !FrontierHost.available() { return () }
+  let mut arena = open(true)
+  run Testing.expect(present(&arena), "a bounded shared arena is available")
+  let mut payload = Bytes.make()
+  run RuntimeEncoding.word(&mut payload, 0)
+  run RuntimeEncoding.field(&mut payload, b"exact-context")
+  run RuntimeEncoding.field(&mut payload, b"typed-body")
+  let offset = append(&arena, 3, Bytes.asSlice(&payload))
+  run Testing.expect(offset != usize.MAX && find(&arena, b"exact-context") == usize.MAX,
+    "an appended capsule remains invisible before its READY publication")
+  run Testing.expect(publish(&arena, b"exact-context", offset) && find(&arena, b"exact-context") == offset
+    && find(&arena, b"other-context") == usize.MAX, "ready lookup compares the complete context")
+  let checked = match move checkedRecord(&arena, offset) { Option<Record>.Some {..} => true _ => false }
+  run Testing.expect(checked, "the immutable record's kind and bytes match its seal")
+  if let Option<[*]mut u64>.Some {value} = &arena.mapping {
+    let bytes = unsafe Intrinsic.pointerRequalify<[*]mut u64, [*]mut u8>(value)
+    let last = unsafe Pointer.atMut<u8>(bytes, offset + 32 + Bytes.length(&payload) - usize.ONE)
+    unsafe Pointer.write<u8>(last, unsafe Pointer.read<u8>(last) + 1)
+  }
+  let damaged = match move checkedRecord(&arena, offset) { Option<Record>.Some {..} => false _ => true }
+  run Testing.expect(damaged, "a structurally valid payload mutation fails the completed producer seal")
+  close(&mut arena)
+  arena = open(true)
+  run Testing.expect(find(&arena, b"exact-context") == usize.MAX, "a new arena epoch cannot reuse old ready records")
+  let child = unsafe FrontierHost.fork()
+  if child == 0 {
+    let shared = append(&arena, 3, Bytes.asSlice(&payload))
+    let ready = shared != usize.MAX && publish(&arena, b"exact-context", shared)
+    unsafe FrontierHost.exit(if ready { 0 } else { 1 })
+  }
+  let mut status: i32 = 0
+  let reaped = if child > 0 { unsafe FrontierHost.wait(child, Pointer.fromMutRef<i32>(&mut status), 0) } else { -1 }
+  let inherited = find(&arena, b"exact-context")
+  let visible = match move checkedRecord(&arena, inherited) { Option<Record>.Some {..} => true _ => false }
+  run Testing.expect(child > 0 && reaped == child && status == 0 && visible,
+    "a completed child publishes bytes that remain valid after its process is reaped")
+  if let Option<[*]mut u64>.Some {value} = &arena.mapping {
+    let digest = ContentHash.of(b"busy")
+    let slot = u64.toUsize(Hash.combine(digest.high, digest.low)) % slots
+    unsafe Atomic.store<u64>(unsafe Pointer.atMut<u64>(value, slot + usize.ONE), 1, MemoryOrder.Release)
+    run Testing.expect(find(&arena, b"busy") == usize.MAX, "a reserved producer never blocks a consumer")
+    unsafe Atomic.store<u64>(unsafe Pointer.atMut<u64>(value, usize.ZERO), usize.toU64(capacity), MemoryOrder.Release)
+  }
+  run Testing.expect(append(&arena, 0, b"x") == usize.MAX, "capacity exhaustion refuses publication")
+  close(&mut arena)
+}
+test effect fn sharedBodyArenaPublicationEpochAndCorruption() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run arenaClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
