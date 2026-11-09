@@ -1,10 +1,11 @@
 //! Read and write your own types in any data format, from the types alone.
 //!
 //! # When to use
-//! Write `impl Schema for T {}` for a struct or a union of unit variants, and read or write it with
-//! a format such as `silk.schema.json.SchemaJson`. Give a type its own `read` and `write` when its
-//! wire form differs from its fields, such as a port written as text, and build them from a codec
-//! chain with [`Schemas.readVia`] and [`Schemas.writeVia`].
+//! Write `impl Schema for T {}` for a struct or a union, and read or write it with a format such
+//! as `silk.schema.json.SchemaJson`. Declare what the type cannot say, such as a wire name or a
+//! port range, in its [`Spec`]. Give a type its own `read`, `write` and `shape` when its wire form
+//! differs from its fields, such as a port written as text, and build them from a codec chain with
+//! [`Schemas.readVia`], [`Schemas.writeVia`] and [`Schemas.shapeVia`].
 //!
 //! # Details
 //! A type is declared once, and the schema derives what to do from it. The default `read` and
@@ -16,8 +17,11 @@
 //! member name. An `Option` field may be absent, or `null`, when it is `None`, and is left out when
 //! written.
 //!
-//! [`Spec`] holds what the types cannot say, such as a field whose name on the wire differs. A type
-//! returns its spec from `Schema.spec`.
+//! [`Spec`] holds what the types cannot say: a field whose name on the wire differs, the rules a
+//! field's value follows (`Spec.between`, `Spec.length`, `Spec.items`, `Spec.pattern`), a default,
+//! and whether unknown keys are rejected. The rules are data, so the same declaration checks a
+//! read, words its errors, and fills the type's [`silk.schema.shape.Shapes`], which JSON Schema
+//! and command line help are rendered from.
 //!
 //! A format implements [`SchemaReader`] and [`SchemaWriter`], so the same types read JSON today and
 //! other formats later without changes.
@@ -45,7 +49,7 @@
 //!
 //! impl Schema for User {
 //!   static fn spec() -> Spec<User> {
-//!     return Spec<User>.of() |> Spec<User>.rename("id", "user_id")
+//!     return Spec<User>.of() |> Spec<User>.rename("id", "user_id") |> Spec<User>.length("name", 1, 64)
 //!   }
 //! }
 //!
@@ -68,10 +72,15 @@
 //! @category Data formats
 
 import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
 import silk.core.reflect { Reflect, unionKind }
+import silk.core.result { Result }
 import silk.core.static_map { StaticMap }
+import silk.core.static_sequence { StaticSequence }
+import silk.core.static_text { StaticText }
 import silk.io.writer { Writer, WriterError }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.i16
@@ -83,93 +92,13 @@ import silk.num.u32
 import silk.num.u64
 import silk.num.u8
 import silk.num.usize
-import silk.schema.codec { Check, Codec }
-import silk.schema.issue { Issue, IssueReason }
-import silk.text.format { Format }
+import silk.schema.codec { Codec }
+import silk.schema.issue { Issue, IssueReason, Span, ValueKind }
+import silk.schema.path { PathSegment, SchemaPath }
+import silk.schema.shape { Bound, Constraint, FieldShape, Literal, Shape, ShapeOf, ShapeRef, Shapes, TypeInfo, VariantShape }
+import silk.text.regex { Regex, RegexError }
+import silk.text.regex_shape { RegexShape }
 import silk.text.string { String }
-import silk.collections.slice { Slice }
-
-/// One step of a [`SchemaPath`]: a struct field by its Silk name, or a list element by its index.
-pub union PathSegment {
-  /// A struct field.
-  Field {
-    /// The field's name in Silk, not its name on the wire.
-    pub name: string<'static>,
-  },
-  /// A list element.
-  Index {
-    /// The position of the element, from 0.
-    pub at: usize,
-  },
-}
-
-impl Copy for PathSegment {}
-
-/// The path from the root value to the part a reader is reading, such as `settings.ports[2]`.
-///
-/// # When to use
-///
-/// A format's [`SchemaReader`] keeps one and returns it from `SchemaReader.path`. The derived
-/// `read` operations push a segment before they read a part and pop it after, so when a read fails
-/// the path still names the part that failed.
-pub struct SchemaPath {
-  segments: List<PathSegment>,
-}
-
-impl SchemaPath {
-  /// Returns an empty path, which names the root value.
-  pub fn make() -> SchemaPath {
-    return SchemaPath {segments: List<PathSegment>.make()}
-  }
-
-  /// Adds `segment` at the end of the path.
-  ///
-  /// # Errors
-  ///
-  /// - `OutOfMemoryError` if the `Allocator` cannot grow the path.
-  pub effect fn push(self: &mut Self, segment: PathSegment) -> () ! OutOfMemoryError ? &mut Allocator {
-    return run List<PathSegment>.append(&mut self.segments, segment)
-  }
-
-  /// Removes the last segment. It does nothing to an empty path.
-  pub fn pop(self: &mut Self) -> () {
-    let removed = List<PathSegment>.pop(&mut self.segments)
-    drop removed
-  }
-
-  /// Returns the number of segments.
-  pub fn length(self: &Self) -> usize {
-    return List<PathSegment>.length(&self.segments)
-  }
-
-  /// Returns the path as text, such as `settings.ports[2]`. The root value is empty text.
-  ///
-  /// # Errors
-  ///
-  /// - `OutOfMemoryError` if the `Allocator` cannot supply the text.
-  pub effect fn text(self: &Self) -> String ! OutOfMemoryError ? &mut Allocator {
-    let mut result = String.make()
-    let segments = List<PathSegment>.asSlice(&self.segments)
-    let mut at = usize.ZERO
-    while at < segments.length {
-      match segments[at] {
-        PathSegment.Field {name} => {
-          if at > usize.ZERO { run String.append(&mut result, ".") }
-          run String.append(&mut result, name)
-        }
-        PathSegment.Index {at: index} => {
-          let mut digits: [u8; 24] = [0; 24]
-          let end = Format.writeU64Display(usize.toU64(index), &mut digits, usize.ZERO)
-          run String.append(&mut result, "[")
-          run String.append(&mut result, unsafe Intrinsic.stringFromUtf8Unchecked(Slice.view<u8>(&digits, usize.ZERO, end)))
-          run String.append(&mut result, "]")
-        }
-      }
-      at = at + usize.ONE
-    }
-    return move result
-  }
-}
 
 /// The reading side of a data format, in terms every format shares: scalars, text, lists and
 /// objects.
@@ -184,6 +113,11 @@ impl SchemaPath {
 /// The schema reads an object by calling `beginObject`, then `member` once for each field it
 /// needs, in its own order, and then `endObject`. `member` finds the member wherever it is in the
 /// object and leaves the reader at its value.
+///
+/// A reader that knows where values are in its input reports it through `lastSpan` and
+/// `lastKind`, so problems found after a value is read, such as a failed range, point at it. A
+/// reader that collects every problem, as `SchemaJson.decodeAll` does, returns `true` from
+/// `collecting`, records what `report` gives it, and moves past a failed part with `recover`.
 pub interface SchemaReader {
   /// Returns the path of the part being read.
   fn path(self: &mut Self) -> &mut SchemaPath
@@ -252,23 +186,72 @@ pub interface SchemaReader {
   /// returns `false` if the object has no such member.
   effect fn member(self: &mut Self, key: string) -> bool ! Issue | OutOfMemoryError ? &mut Allocator
 
-  /// Reads past the end of the object being read, whatever members were read.
-  effect fn endObject(self: &mut Self) -> () ! Issue | OutOfMemoryError ? &mut Allocator
-
-  /// Reports a check that failed on the value just read: on its field `field`, or on the whole
-  /// value when `field` is `None`. The default fails with it; a reader that collects every
-  /// problem records it and returns.
+  /// Reports every member of the object being read that no `member` call found, as
+  /// `IssueReason.UnexpectedKey` with `expected` naming the keys the type accepts. The default
+  /// reports nothing.
   ///
   /// # Errors
   ///
-  /// - `Issue` with `IssueReason.CheckFailed`, at the field's path.
-  /// - `OutOfMemoryError` if the path cannot grow.
-  effect fn checkFailed(self: &mut Self, field: Option<string<'static>>, expected: string<'static>)
-    -> () ! Issue | OutOfMemoryError ? &mut Allocator {
-    if let Option<string<'static>>.Some {value: name} = field {
-      run SchemaPath.push(SchemaReader.path(self), PathSegment.Field {name: name})
-    }
-    fail Issue.checkFailed(expected)
+  /// - `Issue` for the first unread member, unless the reader collects every problem.
+  effect fn rejectUnread(self: &mut Self, expected: string<'static>) -> () ! Issue | OutOfMemoryError ? &mut Allocator {
+    return ()
+  }
+
+  /// Reads past the end of the object being read, whatever members were read.
+  effect fn endObject(self: &mut Self) -> () ! Issue | OutOfMemoryError ? &mut Allocator
+
+  /// Returns the input bytes of the last complete value read, or of an object's opening when
+  /// `member` found no such key. The default knows none.
+  fn lastSpan(self: &Self) -> Option<Span> {
+    return Option<Span>.none()
+  }
+
+  /// Returns the kind of the last complete value read. The default knows none.
+  fn lastKind(self: &Self) -> ValueKind {
+    return ValueKind.Unknown
+  }
+
+  /// Reports a problem with the part at the current path. The default fails with it; a reader
+  /// that collects every problem records it and returns.
+  ///
+  /// # Errors
+  ///
+  /// - `Issue`, the one reported, unless the reader collects every problem.
+  /// - `OutOfMemoryError` if the reader cannot record it.
+  effect fn report(self: &mut Self, issue: Issue) -> () ! Issue | OutOfMemoryError ? &mut Allocator {
+    fail issue
+  }
+
+  /// Returns whether the reader records every problem and goes on after a part fails. The default
+  /// is `false`.
+  fn collecting(self: &Self) -> bool {
+    return false
+  }
+
+  /// Remembers the reader's position, before a part that may fail, and returns a mark for
+  /// `recover` or `release`. Only a collecting reader is asked.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the reader cannot remember it.
+  effect fn mark(self: &mut Self) -> usize ! OutOfMemoryError ? &mut Allocator {
+    return usize.ZERO
+  }
+
+  /// Returns to the position `mark` names after the part read from it failed, and when `skip` is
+  /// `true` reads past that part, so reading goes on with its next sibling. Forgets `mark` and
+  /// every later one.
+  ///
+  /// # Errors
+  ///
+  /// - `Issue` if the part is not well formed, so reading cannot go on.
+  effect fn recover(self: &mut Self, mark: usize, skip: bool) -> () ! Issue | OutOfMemoryError ? &mut Allocator {
+    fail Issue.make(IssueReason.Reported, "")
+  }
+
+  /// Forgets `mark` and every later one, after the part read from it succeeded.
+  fn release(self: &mut Self, mark: usize) -> () {
+    return ()
   }
 }
 
@@ -327,34 +310,60 @@ pub interface SchemaWriter {
   effect fn endObject(self: &mut Self) -> () ! Issue | WriterError ? &mut Writer
 }
 
-/// What a type's schema says beyond its declaration, such as a field whose name on the wire
-/// differs.
+/// One rule of a field, as a [`Spec`] holds it.
+pub struct FieldRule {
+  /// The field's name in Silk.
+  pub field: string<'static>,
+  /// The rule.
+  pub constraint: Constraint,
+}
+
+impl Copy for FieldRule {}
+
+/// What a type's schema says beyond its declaration: wire names, the rules a field's value
+/// follows, defaults, and whether unknown keys are rejected.
 ///
 /// # When to use
 ///
 /// Return one from `Schema.spec` and build it with pipes:
-/// `Spec<User>.of() |> Spec<User>.rename("id", "user_id")`.
+///
+/// ```text
+/// Spec<Server>.of()
+///   |> Spec<Server>.rename("idleSeconds", "idle_seconds")
+///   |> Spec<Server>.between("port", 1, 65535)
+///   |> Spec<Server>.between("idleSeconds", 1, 3600)
+///   |> Spec<Server>.expected("idleSeconds", "at most an hour")
+/// ```
 ///
 /// # Details
 ///
 /// A spec exists only during static evaluation. Field names are checked against `T` where they
-/// are written, and the editor links them to the field.
+/// are written, and the editor links them to the field. A rule applies to the field's value after
+/// it is read, and a value that breaks it fails with `IssueReason.CheckFailed` at the field's path,
+/// with text generated from the rule, such as `an integer from 1 to 65535`, unless `Spec.expected`
+/// gives the field its own. The same rules reach the type's shape, so JSON Schema shows them as
+/// `minimum`, `maxLength` and the like.
 pub struct Spec<T> {
   renames: StaticMap<string<'static>>,
   tagField: string<'static>,
+  rules: Intrinsic.StaticSequence<FieldRule>,
+  defaults: StaticMap<Literal>,
+  strictKeys: bool,
   owner: [T; 0],
 }
 
 impl<T> Spec<T> {
-  /// Returns the spec that keeps every field's own name.
+  /// Returns the spec that keeps every field's own name and adds no rules.
   pub static fn of() -> Self {
-    return Spec<T> {renames: StaticMap<string<'static>>.empty(), tagField: "type", owner: []}
+    return Spec<T> {renames: StaticMap<string<'static>>.empty(), tagField: "type", rules: StaticSequence.empty<FieldRule>(),
+      defaults: StaticMap<Literal>.empty(), strictKeys: false, owner: []}
   }
 
   /// Returns the spec in which `field` is called `wire` in the data format.
   pub static fn rename(self: Self, field: Intrinsic.FieldName<T>, wire: string<'static>) -> Self {
     let name = Reflect.fieldNameText<T>(field)
-    return Spec<T> {renames: StaticMap<string<'static>>.insert(self.renames, name, wire), tagField: self.tagField, owner: []}
+    return Spec<T> {renames: StaticMap<string<'static>>.insert(self.renames, name, wire), tagField: self.tagField, rules: self.rules,
+      defaults: self.defaults, strictKeys: self.strictKeys, owner: []}
   }
 
   /// Returns the spec in which a union's variant is named by the field `name`, instead of `type`.
@@ -364,7 +373,78 @@ impl<T> Spec<T> {
   /// A union with a variant that has fields is written as an object holding the variant's name in
   /// this field next to the variant's own fields, such as `{"type": "Circle", "radius": 2}`.
   pub static fn tag(self: Self, name: string<'static>) -> Self {
-    return Spec<T> {renames: self.renames, tagField: name, owner: []}
+    return Spec<T> {renames: self.renames, tagField: name, rules: self.rules, defaults: self.defaults, strictKeys: self.strictKeys, owner: []}
+  }
+
+  /// Returns the spec that rejects an object key no field names, as `IssueReason.UnexpectedKey`.
+  ///
+  /// # Details
+  ///
+  /// By default unknown keys are skipped, so a config written for a newer version still reads.
+  /// JSON Schema shows a strict type with `additionalProperties: false`.
+  pub static fn strict(self: Self) -> Self {
+    return Spec<T> {renames: self.renames, tagField: self.tagField, rules: self.rules, defaults: self.defaults, strictKeys: true, owner: []}
+  }
+
+  /// Returns the spec in which the number in `field` is from `min` to `max`, both included.
+  pub static fn between(self: Self, field: Intrinsic.FieldName<T>, min: i64, max: i64) -> Self {
+    return withRule<T>(self, Reflect.fieldNameText<T>(field), Constraint.Range {min: Bound.Signed {value: min}, max: Bound.Signed {value: max}})
+  }
+
+  /// Returns the spec in which the number in `field` is at least `min`.
+  pub static fn atLeast(self: Self, field: Intrinsic.FieldName<T>, min: i64) -> Self {
+    return withRule<T>(self, Reflect.fieldNameText<T>(field), Constraint.Range {min: Bound.Signed {value: min}, max: Bound.None})
+  }
+
+  /// Returns the spec in which the number in `field` is at most `max`.
+  pub static fn atMost(self: Self, field: Intrinsic.FieldName<T>, max: i64) -> Self {
+    return withRule<T>(self, Reflect.fieldNameText<T>(field), Constraint.Range {min: Bound.None, max: Bound.Signed {value: max}})
+  }
+
+  /// Returns the spec in which the text in `field` has `min` to `max` characters.
+  pub static fn length(self: Self, field: Intrinsic.FieldName<T>, min: usize, max: usize) -> Self {
+    return withRule<T>(self, Reflect.fieldNameText<T>(field), Constraint.Length {min: min, max: max})
+  }
+
+  /// Returns the spec in which the list in `field` has `min` to `max` elements.
+  pub static fn items(self: Self, field: Intrinsic.FieldName<T>, min: usize, max: usize) -> Self {
+    return withRule<T>(self, Reflect.fieldNameText<T>(field), Constraint.Items {min: min, max: max})
+  }
+
+  /// Returns the spec in which the text in `field` matches the regular expression `source`,
+  /// anywhere in the text unless `source` anchors it with `^` and `$`.
+  ///
+  /// # Details
+  ///
+  /// `source` uses `silk.text.regex` syntax, which is the JavaScript syntax JSON Schema's
+  /// `pattern` uses. An invalid expression is a compile error at the literal.
+  pub static fn pattern(self: Self, field: Intrinsic.FieldName<T>, source: string<'static>) -> Self {
+    let shape = RegexShape.of(source)
+    if !shape.valid {
+      let length = StaticText.byteLength(source)
+      let mut end = shape.offset + 1
+      if end > length { end = length }
+      StaticText.errorAt(source, shape.offset, end, StaticText.concat("invalid regex: ", shape.message))
+    }
+    return withRule<T>(self, Reflect.fieldNameText<T>(field), Constraint.Pattern {source: source})
+  }
+
+  /// Returns the spec in which a value of `field` that breaks a rule is reported as expecting
+  /// `text`, such as `"at most an hour"`, instead of the text generated from the rule.
+  pub static fn expected(self: Self, field: Intrinsic.FieldName<T>, text: string<'static>) -> Self {
+    return withRule<T>(self, Reflect.fieldNameText<T>(field), Constraint.Expected {text: text})
+  }
+
+  /// Returns the spec in which `field` may be absent or null, and then holds `value`.
+  ///
+  /// # Details
+  ///
+  /// `value` is read as if the input held it, so a text default fills a unit variant or a type read
+  /// from text, such as `Literal.Text {value: "Anonymous"}`.
+  pub static fn default(self: Self, field: Intrinsic.FieldName<T>, value: Literal) -> Self {
+    let name = Reflect.fieldNameText<T>(field)
+    return Spec<T> {renames: self.renames, tagField: self.tagField, rules: self.rules, defaults: StaticMap<Literal>.insert(self.defaults, name, value),
+      strictKeys: self.strictKeys, owner: []}
   }
 
   /// Returns the name of the field that holds a union's variant name.
@@ -379,6 +459,30 @@ impl<T> Spec<T> {
       Option<string<'static>>.None => label
     }
   }
+
+  /// Returns the rules of the field `label`, in the order they were added.
+  pub static fn rulesOf(self: &Self, label: string<'static>) -> Intrinsic.StaticSequence<Constraint> {
+    let mut found = StaticSequence.empty<Constraint>()
+    static for rule in self.rules {
+      if rule.field == label { found = StaticSequence.append<Constraint>(move found, rule.constraint) }
+    }
+    return move found
+  }
+
+  /// Returns the default of the field `label`, if it has one.
+  pub static fn defaultOf(self: &Self, label: string<'static>) -> Option<Literal> {
+    return StaticMap<Literal>.get(&self.defaults, label)
+  }
+
+  /// Returns whether unknown keys are rejected.
+  pub static fn isStrict(self: &Self) -> bool {
+    return self.strictKeys
+  }
+}
+
+static fn withRule<T>(spec: Spec<T>, field: string<'static>, constraint: Constraint) -> Spec<T> {
+  let rules = StaticSequence.append<FieldRule>(spec.rules, FieldRule {field: field, constraint: constraint})
+  return Spec<T> {renames: spec.renames, tagField: spec.tagField, rules: rules, defaults: spec.defaults, strictKeys: spec.strictKeys, owner: []}
 }
 
 /// A type that can be read from and written to any data format.
@@ -386,16 +490,17 @@ impl<T> Spec<T> {
 /// # When to use
 ///
 /// Write `impl Schema for T {}` for a struct or union whose fields are all public and implement
-/// `Schema`. Override `spec` to rename fields. Override `read` and
-/// `write` for a type whose wire form is not its fields, usually with [`Schemas.readVia`] and
-/// [`Schemas.writeVia`].
+/// `Schema`. Override `spec` to rename fields and declare their rules. Override `read`, `write`
+/// and `shape` for a type whose wire form is not its fields, usually with [`Schemas.readVia`],
+/// [`Schemas.writeVia`] and [`Schemas.shapeVia`].
 ///
 /// # Details
 ///
 /// The standard library implements it for `bool`, the integer types, `f64`, `String`, `Option<T>`
 /// and `List<T>`.
 pub interface Schema {
-  /// Returns what the type's schema says beyond its declaration. The default renames nothing.
+  /// Returns what the type's schema says beyond its declaration. The default renames nothing and
+  /// adds no rules.
   static fn spec() -> Spec<Self> {
     return Spec<Self>.of()
   }
@@ -424,6 +529,21 @@ pub interface Schema {
     return run derivedWrite<Self, W>(self, &mut writer.*)
   }
 
+  /// Adds the type's wire form to `shapes` and returns its node. The default describes a struct
+  /// or union from its fields, variants, doc comments and spec, once per type.
+  ///
+  /// # When to use
+  ///
+  /// Override it next to `read` and `write`, usually as `Schemas.shapeVia`, when the type is read
+  /// through a codec, so its shape describes what `read` accepts.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot grow the table.
+  effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator {
+    return ShapeOf<Self>.make(run derivedShape<Self>(&mut shapes.*))
+  }
+
   /// Returns the value of a field whose key is absent. The default fails, because the key is
   /// required; `Option` returns `None`.
   ///
@@ -440,26 +560,27 @@ pub interface Schema {
     return false
   }
 
+  /// Returns whether the value follows `constraint`, a rule its field's spec declares. The default
+  /// accepts every value; numbers, `String`, `List` and `Option` test the rules that apply to them.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if testing a pattern needs memory that the `Allocator` cannot supply.
+  effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator {
+    return true
+  }
+
   /// Checks a value after it is read. The default accepts every value.
   ///
   /// # When to use
   ///
-  /// Override it to state what the type alone cannot, such as a port between 1 and 65535 or a
-  /// name of at most 64 bytes, with [`Checks.field`] and [`Checks.that`]. A failed check becomes an
-  /// `Issue` at the path of the field it names: the read's only one, or one of all of them when
-  /// the format collects every problem, as `SchemaJson.decodeAll` does.
+  /// Override it for a rule no single field can state, such as two fields that exclude each other,
+  /// with [`Checks.that`]. A rule about one field belongs in its `Spec`, where JSON Schema and
+  /// command line help can show it. A failed check becomes an `Issue` at the value's path.
   fn check(self: &Self, checks: &mut Checks<Self>) -> () {
     return ()
   }
 }
-
-// A check that failed, and the field it named, if any.
-struct CheckFailure {
-  field: Option<string<'static>>,
-  expected: string<'static>,
-}
-
-impl Copy for CheckFailure {}
 
 // The most failed checks one value records; later ones are dropped.
 const checkCapacity: usize = 16
@@ -470,35 +591,34 @@ const checkCapacity: usize = 16
 ///
 /// ```silk
 /// import silk.core.effect { Effect }
+/// import silk.core.option { Option }
 /// import silk.core.result { Result }
 /// import silk.mem.allocator { Allocator, OutOfMemoryError }
-/// import silk.schema.codec { Between, Length }
 /// import silk.schema.issue { IssueReason, SchemaError }
 /// import silk.schema.json { SchemaJson }
 /// import silk.schema.schema { Checks, Schema }
 /// import silk.text.string { String }
 ///
-/// struct Server {
-///   pub host: String,
-///   pub port: u16,
+/// struct Login {
+///   pub token: Option<String>,
+///   pub password: Option<String>,
 /// }
 ///
-/// impl Schema for Server {
-///   fn check(self: &Self, checks: &mut Checks<Server>) -> () {
-///     checks.field(self, "host", Length {min: 1, max: 253, message: "a host name"})
-///     checks.field(self, "port", Between<u16> {low: 1, high: 65535, message: "a port"})
+/// impl Schema for Login {
+///   fn check(self: &Self, checks: &mut Checks<Login>) -> () {
+///     checks.that(self.token.isSome() != self.password.isSome(), "a token or a password, not both")
 ///   }
 /// }
 ///
-/// effect fn load() -> Server ! SchemaError | OutOfMemoryError ? &mut Allocator {
-///   return run SchemaJson.decode<Server>(b"{\"host\": \"silk.dev\", \"port\": 0}")
+/// effect fn load() -> Login ! SchemaError | OutOfMemoryError ? &mut Allocator {
+///   return run SchemaJson.decode<Login>(b"{}")
 /// }
 ///
 /// pub effect fn main() -> i32 ! OutOfMemoryError {
 ///   let mut allocator = Allocator.systemAllocatorProvider()
 ///   return match run Effect.result(load()) |> Effect.provideMut<Allocator>(&mut allocator) {
-///     Result<Server, SchemaError | OutOfMemoryError>.Failure {error: SchemaError {path, issue}} =>
-///       if path.view() == "port" && issue.reason == IssueReason.CheckFailed { 0 } else { 1 }
+///     Result<Login, SchemaError | OutOfMemoryError>.Failure {error: SchemaError {issue, ..}} =>
+///       if issue.reason == IssueReason.CheckFailed { 0 } else { 1 }
 ///     _ => 2
 ///   }
 /// }
@@ -508,7 +628,7 @@ const checkCapacity: usize = 16
 ///
 /// One value records at most 16 failed checks; later ones are dropped.
 pub struct Checks<T> {
-  failures: [CheckFailure; 16],
+  failures: [string<'static>; 16],
   count: usize,
   owner: [T; 0],
 }
@@ -516,43 +636,26 @@ pub struct Checks<T> {
 impl<T> Checks<T> {
   /// Returns the checks with nothing failed yet.
   pub fn make() -> Checks<T> {
-    let empty = CheckFailure {field: Option<string<'static>>.none(), expected: ""}
-    return Checks<T> {failures: [empty; 16], count: 0, owner: []}
-  }
-
-  /// Checks the field `name` of `owner` with `check`, whose type says the field's type, such as
-  /// `Between<u16>` for a `u16` field.
-  pub fn field<V, Owner, K: Check<V>>(self: &mut Self, owner: &Owner, static name: Intrinsic.FieldName<Owner>, check: K) -> () {
-    let static field = Reflect.fieldNamed<Owner, V>(name)
-    let value = Reflect.borrowField<Owner, V>(owner, field)
-    if !check.test(value) {
-      self.record(CheckFailure {field: Option<string<'static>>.some(Reflect.fieldLabel(field)), expected: check.message()})
-    }
-    return ()
+    return Checks<T> {failures: [""; 16], count: 0, owner: []}
   }
 
   /// Checks a condition on the whole value, such as two fields that must agree. `expected` says
   /// what the value must be when `holds` is `false`.
   pub fn that(self: &mut Self, holds: bool, expected: string<'static>) -> () {
-    if !holds { self.record(CheckFailure {field: Option<string<'static>>.none(), expected: expected}) }
-    return ()
-  }
-
-  fn record(self: &mut Self, failure: CheckFailure) -> () {
-    if self.count < checkCapacity {
-      self.failures[self.count] = failure
+    if !holds && self.count < checkCapacity {
+      self.failures[self.count] = expected
       self.count = self.count + 1
     }
     return ()
   }
 }
 
-/// The owner of the functions that read and write `Schema` types. It has no fields and is never
-/// constructed.
+/// The owner of the functions that read, write and describe `Schema` types. It has no fields and
+/// is never constructed.
 pub struct Schemas {}
 
 impl Schemas {
-  /// Reads a `T` with its `Schema` implementation.
+  /// Reads a `T` with its `Schema` implementation and runs its `Schema.check`.
   ///
   /// # Errors
   ///
@@ -564,11 +667,29 @@ impl Schemas {
     Schema.check(&value, &mut checks)
     let mut at: usize = 0
     while at < checks.count {
-      let failed = checks.failures[at]
-      run SchemaReader.checkFailed(&mut reader.*, failed.field, failed.expected)
+      let failed = Issue.checkFailed(checks.failures[at])
+      let located = failed.locate(SchemaReader.lastSpan(&reader.*), SchemaReader.lastKind(&reader.*))
+      run SchemaReader.report(&mut reader.*, located)
       at = at + 1
     }
     return move value
+  }
+
+  /// Reads the variant of the union `U` whose wire name is `name` from an object of its fields,
+  /// such as a tool call whose name and arguments arrive apart.
+  ///
+  /// # Errors
+  ///
+  /// - `Issue` with `IssueReason.UnknownVariant` if `U` has no variant `name`, or another issue if
+  ///   the object does not hold its fields.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the value.
+  pub effect fn readVariant<U: Schema, R: SchemaReader>(reader: &mut R, name: string) -> U ! Issue | OutOfMemoryError ? &mut Allocator {
+    static for variant in Reflect.variants<U>() {
+      if name == wireNameOf<U>(Reflect.variantLabel(variant)) {
+        return run variantRead<U, R>(&mut reader.*, variant)
+      }
+    }
+    fail Issue.make(IssueReason.UnknownVariant, variantChoices<U>())
   }
 
   /// Writes `value` with its `Schema` implementation.
@@ -582,6 +703,29 @@ impl Schemas {
     return run Schema.write(value, &mut writer.*)
   }
 
+  /// Returns the shape of `T`: its wire form, and that of every type it uses.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the table.
+  pub effect fn shape<T: Schema>() -> Shapes ! OutOfMemoryError ? &mut Allocator {
+    let mut shapes = Shapes.make()
+    let root = run Schemas.shapeOf<T>(&mut shapes)
+    shapes.setRoot(root)
+    return move shapes
+  }
+
+  /// Adds the shape of `T` to `shapes` and returns its node, as a type's own `shape` does for the
+  /// types of its parts.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot grow the table.
+  pub effect fn shapeOf<T: Schema>(shapes: &mut Shapes) -> ShapeRef ! OutOfMemoryError ? &mut Allocator {
+    let typed: ShapeOf<T> = run Schema.shape(&mut shapes.*)
+    return typed.at
+  }
+
   /// Returns the spec of `T`.
   pub static fn spec<T: Schema>() -> Spec<T> {
     return Schema.spec()
@@ -592,16 +736,26 @@ impl Schemas {
   /// # When to use
   ///
   /// Call it from the `read` of a type whose wire form is another type, such as a port written as
-  /// text.
+  /// text. Its `shape` is then [`Schemas.shapeVia`] with the same codec.
   ///
   /// # Errors
   ///
-  /// - `Issue` if the input does not hold an `I`, or if `codec` rejects it.
+  /// - `Issue` if the input does not hold an `I`, or if `codec` rejects it. A codec's issue points at
+  ///   the wire value.
   /// - `OutOfMemoryError` if the `Allocator` cannot supply the value.
   pub effect fn readVia<A, I: Schema, C: Codec<A, I>, R: SchemaReader>(codec: &C, reader: &mut R)
     -> A ! Issue | OutOfMemoryError ? &mut Allocator {
     let wire = run Schemas.read<I, R>(&mut reader.*)
-    return run Codec.decode(codec, move wire)
+    return match move run Effect.result(Codec.decode(codec, move wire)) {
+      Result<A, Issue | OutOfMemoryError>.Success {value} => move value
+      Result<A, Issue | OutOfMemoryError>.Failure {error} => match move error {
+        Issue {reason, expected, found, span} => {
+          let issue = Issue {reason: reason, expected: expected, found: found, span: span}
+          fail issue.locate(SchemaReader.lastSpan(&reader.*), SchemaReader.lastKind(&reader.*))
+        }
+        OutOfMemoryError {} => { fail OutOfMemoryError {} }
+      }
+    }
   }
 
   /// Encodes `value` into the wire form `I` with `codec` and writes it.
@@ -616,6 +770,25 @@ impl Schemas {
     let wire = run Codec.encode(codec, value)
     return run Schemas.write<I, W>(&wire, &mut writer.*)
   }
+
+  /// Adds the shape of a type read through `codec` from the wire form `I` to `shapes`: the shape of
+  /// `I`, with the rules and text the codec reports through `Codec.hints`.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot grow the table.
+  pub effect fn shapeVia<A, I: Schema, C: Codec<A, I>>(codec: &C, shapes: &mut Shapes) -> ShapeOf<A> ! OutOfMemoryError ? &mut Allocator {
+    let wire = run Schemas.shapeOf<I>(&mut shapes.*)
+    let mut constraints = List<Constraint>.make()
+    let mut notes = List<string<'static>>.make()
+    run Codec.hints(codec, &mut constraints, &mut notes, true)
+    return ShapeOf<A>.make(run shapes.add(Shape.Custom {wire: wire, constraints: move constraints, notes: move notes}))
+  }
+}
+
+fn pathDepth<R: SchemaReader>(reader: &mut R) -> usize {
+  let path = SchemaReader.path(&mut reader.*)
+  return SchemaPath.length(&path.*)
 }
 
 effect fn missingValue<T: Schema>() -> T ! Issue {
@@ -625,6 +798,28 @@ effect fn missingValue<T: Schema>() -> T ! Issue {
 static fn wireNameOf<T: Schema>(label: string<'static>) -> string<'static> {
   let spec = Schemas.spec<T>()
   return Spec<T>.wireName(&spec, label)
+}
+
+static fn rulesOf<T: Schema>(label: string<'static>) -> Intrinsic.StaticSequence<Constraint> {
+  let spec = Schemas.spec<T>()
+  return Spec<T>.rulesOf(&spec, label)
+}
+
+static fn defaultOf<T: Schema>(label: string<'static>) -> Option<Literal> {
+  let spec = Schemas.spec<T>()
+  return Spec<T>.defaultOf(&spec, label)
+}
+
+static fn strictOf<T: Schema>() -> bool {
+  let spec = Schemas.spec<T>()
+  return Spec<T>.isStrict(&spec)
+}
+
+static fn hasDefault<T: Schema>(label: string<'static>) -> bool {
+  return match defaultOf<T>(label) {
+    Option<Literal>.Some {..} => true
+    Option<Literal>.None => false
+  }
 }
 
 static fn variantFieldCount<U>(variant: Intrinsic.Variant<U>) -> usize {
@@ -649,31 +844,341 @@ static fn isUnion<T>() -> bool {
   return Reflect.typeKind(Reflect.typeOf<T>()) == unionKind
 }
 
+static fn quoted(text: string<'static>) -> string<'static> {
+  return StaticText.concat(StaticText.concat("\"", text), "\"")
+}
+
+// The text that names a choice of quoted names: `"A"`, or one of `"A", "B"`.
+static fn oneOf(names: Intrinsic.StaticSequence<string<'static>>) -> string<'static> {
+  let count = StaticSequence.length<string<'static>>(names)
+  if count == usize.ONE { return quoted(StaticSequence.at<string<'static>>(names, usize.ZERO)) }
+  let mut text = "one of "
+  let mut at = usize.ZERO
+  while at < count {
+    if at > usize.ZERO { text = StaticText.concat(text, ", ") }
+    text = StaticText.concat(text, quoted(StaticSequence.at<string<'static>>(names, at)))
+    at = at + usize.ONE
+  }
+  return text
+}
+
+// The wire names of the variants of `U`, as the text an unknown name expected.
+static fn variantChoices<U: Schema>() -> string<'static> {
+  let mut names = StaticSequence.empty<string<'static>>()
+  static for variant in Reflect.variants<U>() {
+    names = StaticSequence.append<string<'static>>(move names, wireNameOf<U>(Reflect.variantLabel(variant)))
+  }
+  return oneOf(move names)
+}
+
+// The keys a struct accepts, as the text an unexpected key expected.
+static fn keyChoices<T: Schema>() -> string<'static> {
+  let mut names = StaticSequence.empty<string<'static>>()
+  static for field in Reflect.fields<T>() {
+    names = StaticSequence.append<string<'static>>(move names, wireNameOf<T>(Reflect.fieldLabel(field)))
+  }
+  if StaticSequence.length<string<'static>>(names) == usize.ZERO { return "no keys" }
+  return oneOf(move names)
+}
+
+// The keys a variant's object accepts: the tag and the variant's fields.
+static fn variantKeyChoices<U: Schema>(variant: Intrinsic.Variant<U>) -> string<'static> {
+  let mut names = StaticSequence.empty<string<'static>>()
+  static if hasPayload<U>() { names = StaticSequence.append<string<'static>>(move names, tagOf<U>()) }
+  static for field in Reflect.variantFields(variant) {
+    names = StaticSequence.append<string<'static>>(move names, wireNameOf<U>(Reflect.fieldLabel(field)))
+  }
+  if StaticSequence.length<string<'static>>(names) == usize.ZERO { return "no keys" }
+  return oneOf(move names)
+}
+
+static fn decimal(value: u64) -> string<'static> {
+  if value == 0 { return "0" }
+  let mut text = ""
+  let mut rest = value
+  while rest > 0 {
+    let digit = u64.toUsize(rest % 10)
+    text = StaticText.concat(StaticText.slice("0123456789", digit, digit + usize.ONE), text)
+    rest = rest / 10
+  }
+  return text
+}
+
+static fn boundText(bound: Bound) -> string<'static> {
+  return match bound {
+    Bound.Signed {value} => if value < 0 { StaticText.concat("-", decimal(i64.toU64(0 - value))) } else { decimal(i64.toU64(value)) }
+    Bound.Unsigned {value} => decimal(value)
+    Bound.Float {..} => "the limit"
+    Bound.None => ""
+  }
+}
+
+static fn countText(count: usize, one: string<'static>, many: string<'static>) -> string<'static> {
+  let number = decimal(usize.toU64(count))
+  if count == usize.ONE { return StaticText.concat(StaticText.concat(number, " "), one) }
+  return StaticText.concat(StaticText.concat(number, " "), many)
+}
+
+static fn spanText(min: usize, max: usize, one: string<'static>, many: string<'static>) -> string<'static> {
+  if max == usize.MAX { return StaticText.concat("at least ", countText(min, one, many)) }
+  if min == usize.ZERO { return StaticText.concat("at most ", countText(max, one, many)) }
+  if min == max { return countText(min, one, many) }
+  return StaticText.concat(StaticText.concat(decimal(usize.toU64(min)), " to "), countText(max, one, many))
+}
+
+/// Returns the text a value that breaks `constraint` is reported with, such as
+/// `"an integer from 1 to 65535"` or `"text of 1 to 253 characters"`.
+pub static fn constraintText(constraint: Constraint) -> string<'static> {
+  return match constraint {
+    Constraint.Range {min, max} => {
+      let mut noun = "an integer"
+      if let Bound.Float {..} = min { noun = "a number" }
+      if let Bound.Float {..} = max { noun = "a number" }
+      match min {
+        Bound.None => StaticText.concat(StaticText.concat(noun, " of at most "), boundText(max))
+        _ => match max {
+          Bound.None => StaticText.concat(StaticText.concat(noun, " of at least "), boundText(min))
+          _ => StaticText.concat(StaticText.concat(StaticText.concat(StaticText.concat(noun, " from "), boundText(min)), " to "), boundText(max))
+        }
+      }
+    }
+    Constraint.Length {min, max} => StaticText.concat("text of ", spanText(min, max, "character", "characters"))
+    Constraint.Items {min, max} => StaticText.concat("a list of ", spanText(min, max, "element", "elements"))
+    Constraint.Pattern {source} => StaticText.concat(StaticText.concat("text that matches /", source), "/")
+    Constraint.Expected {text} => text
+  }
+}
+
+// The text a field whose value breaks `constraint` is reported with: the field's own from
+// `Spec.expected`, if it has one, else the text of the rule.
+static fn ruleText(rules: Intrinsic.StaticSequence<Constraint>, constraint: Constraint) -> string<'static> {
+  static for rule in rules {
+    if let Constraint.Expected {text} = rule { return text }
+  }
+  return constraintText(constraint)
+}
+
+// Reports every rule of `rules` that `value`, just read, breaks.
+effect fn checkRules<V: Schema, R: SchemaReader>(reader: &mut R, value: &V, static rules: Intrinsic.StaticSequence<Constraint>)
+  -> () ! Issue | OutOfMemoryError ? &mut Allocator {
+  static for rule in rules {
+    static if isRule(rule) {
+      if !run Schema.satisfies(value, rule) {
+        let static text = ruleText(rules, rule)
+        let failed = Issue.checkFailed(text)
+        let located = failed.locate(SchemaReader.lastSpan(&reader.*), SchemaReader.lastKind(&reader.*))
+        run SchemaReader.report(&mut reader.*, located)
+      }
+    }
+  }
+  return ()
+}
+
+static fn isRule(constraint: Constraint) -> bool {
+  return match constraint {
+    Constraint.Expected {..} => false
+    _ => true
+  }
+}
+
 effect fn derivedRead<T: Schema, R: SchemaReader>(reader: &mut R) -> T ! Issue | OutOfMemoryError ? &mut Allocator {
   static if isUnion<T>() {
     return run unionRead<T, R>(&mut reader.*)
   } else {
     run SchemaReader.beginObject(&mut reader.*)
+    if SchemaReader.collecting(&reader.*) { return run recoveringStructRead<T, R>(&mut reader.*) }
     let value = T {
       static for field in Reflect.fields<T>() { [field]: run fieldRead(&mut reader.*, field) },
     }
+    static if strictOf<T>() { run SchemaReader.rejectUnread(&mut reader.*, keyChoices<T>()) }
     run SchemaReader.endObject(&mut reader.*)
     return move value
   }
+}
+
+// Reads a struct's fields counting how many were started, so a recovery reads only the rest.
+effect fn countedFields<T: Schema, R: SchemaReader>(reader: &mut R, started: &mut usize) -> T ! Issue | OutOfMemoryError ? &mut Allocator {
+  return T {
+    static for field in Reflect.fields<T>() { [field]: run countedFieldRead(&mut reader.*, field, &mut started.*) },
+  }
+}
+
+effect fn countedFieldRead<R: SchemaReader, Owner: Schema, V: Schema>(reader: &mut R, static field: Intrinsic.Field<Owner, V>, started: &mut usize)
+  -> V ! Issue | OutOfMemoryError ? &mut Allocator {
+  started.* = started.* + usize.ONE
+  return run fieldRead(&mut reader.*, field)
+}
+
+// Records `issue`, the failure of the part at the reader's path, unless it was recorded already.
+effect fn noteFailure<R: SchemaReader>(reader: &mut R, issue: Issue) -> () ! Issue | OutOfMemoryError ? &mut Allocator {
+  if issue.reason == IssueReason.Reported { return () }
+  return run SchemaReader.report(&mut reader.*, issue)
+}
+
+// Reads a struct in a collecting reader: a failed field is recorded, and the fields after it are
+// still read so that their problems are recorded too; then the struct fails as already reported.
+effect fn recoveringStructRead<T: Schema, R: SchemaReader>(reader: &mut R) -> T ! Issue | OutOfMemoryError ? &mut Allocator {
+  let depth = pathDepth(&mut reader.*)
+  let start = run SchemaReader.mark(&mut reader.*)
+  let mut started = usize.ZERO
+  let read = run Effect.result(countedFields<T, R>(&mut reader.*, &mut started))
+  let settledValue = run settled<T, R>(&mut reader.*, move read, start, depth)
+  if settledValue.isNone() {
+    let mut at = usize.ZERO
+    static for field in Reflect.fields<T>() {
+      if at >= started { run probeField(&mut reader.*, field, depth) }
+      at = at + usize.ONE
+    }
+  }
+  static if strictOf<T>() { run SchemaReader.rejectUnread(&mut reader.*, keyChoices<T>()) }
+  run SchemaReader.endObject(&mut reader.*)
+  return run reportedUnless<T>(move settledValue)
+}
+
+// The value, or a failure whose problems are already recorded. Some instances of a function with a
+// static parameter reject a match on a type that names its type parameters (SEM0042), so the
+// recovering reads match here.
+effect fn reportedUnless<V>(value: Option<V>) -> V ! Issue {
+  return match move value {
+    Option<V>.Some {value: present} => move present
+    Option<V>.None => { fail Issue.make(IssueReason.Reported, "") }
+  }
+}
+
+// The value of a part read in a collecting reader, or none when it failed: then its problem is
+// recorded, the path is cut back to `depth`, and the reader is moved past the part.
+effect fn settled<V, R: SchemaReader>(reader: &mut R, read: Result<V, Issue | OutOfMemoryError>, start: usize, depth: usize)
+  -> Option<V> ! Issue | OutOfMemoryError ? &mut Allocator {
+  return match move read {
+    Result<V, Issue | OutOfMemoryError>.Success {value} => {
+      SchemaReader.release(&mut reader.*, start)
+      Option<V>.some(move value)
+    }
+    Result<V, Issue | OutOfMemoryError>.Failure {error} => match move error {
+      Issue {reason, expected, found, span} => {
+        run noteFailure(&mut reader.*, Issue {reason: reason, expected: expected, found: found, span: span})
+        SchemaPath.truncate(SchemaReader.path(&mut reader.*), depth)
+        run SchemaReader.recover(&mut reader.*, start, false)
+        Option<V>.none()
+      }
+      OutOfMemoryError {} => { fail OutOfMemoryError {} }
+    }
+  }
+}
+
+// Reads one field only to record its problems, and drops its value.
+effect fn probeField<R: SchemaReader, Owner: Schema, V: Schema>(reader: &mut R, static field: Intrinsic.Field<Owner, V>, depth: usize)
+  -> () ! Issue | OutOfMemoryError ? &mut Allocator {
+  let start = run SchemaReader.mark(&mut reader.*)
+  let read = run Effect.result(fieldRead<R, Owner, V>(&mut reader.*, field))
+  let value = run settled<V, R>(&mut reader.*, move read, start, depth)
+  drop value
+  return ()
 }
 
 effect fn fieldRead<R: SchemaReader, Owner: Schema, V: Schema>(reader: &mut R, static field: Intrinsic.Field<Owner, V>)
   -> V ! Issue | OutOfMemoryError ? &mut Allocator {
   let static label = Reflect.fieldLabel(field)
   let static wire = wireNameOf<Owner>(label)
-  run SchemaPath.push(SchemaReader.path(&mut reader.*), PathSegment.Field {name: label})
-  let value = if run SchemaReader.member(&mut reader.*, wire) {
+  let static rules = rulesOf<Owner>(label)
+  run SchemaPath.push(SchemaReader.path(&mut reader.*), PathSegment.Field {name: label, wire: wire})
+  let present = run SchemaReader.member(&mut reader.*, wire)
+  static if hasDefault<Owner>(label) {
+    let static fallback = defaultOf<Owner>(label)
+    let mut useDefault = !present
+    if present { useDefault = run SchemaReader.null(&mut reader.*) }
+    if useDefault {
+      let value = run defaultValue<V>(fallback)
+      SchemaPath.pop(SchemaReader.path(&mut reader.*))
+      return move value
+    }
+  }
+  let value = if present {
     run Schemas.read<V, R>(&mut reader.*)
   } else {
-    run missingValue<V>()
+    match move run Effect.result(missingValue<V>()) {
+      Result<V, Issue>.Success {value: absent} => move absent
+      Result<V, Issue>.Failure {error} => { fail error.locate(SchemaReader.lastSpan(&reader.*), ValueKind.Missing) }
+    }
   }
+  if present { run checkRules<V, R>(&mut reader.*, &value, rules) }
   SchemaPath.pop(SchemaReader.path(&mut reader.*))
   return move value
+}
+
+// The value of a field whose default is `fallback`, read as if the input held it.
+effect fn defaultValue<V: Schema>(fallback: Option<Literal>) -> V ! Issue | OutOfMemoryError ? &mut Allocator {
+  let literal = match fallback {
+    Option<Literal>.Some {value} => value
+    Option<Literal>.None => { fail Issue.missingKey() }
+  }
+  let mut reader = LiteralReader {literal: literal, path: SchemaPath.make()}
+  return run Schemas.read<V, LiteralReader>(&mut reader)
+}
+
+// A reader whose input is one literal, for a field's default.
+struct LiteralReader {
+  literal: Literal,
+  path: SchemaPath,
+}
+
+impl SchemaReader for LiteralReader {
+  fn path(self: &mut Self) -> &mut SchemaPath {
+    return &mut self.path
+  }
+
+  effect fn boolean(self: &mut Self) -> bool ! Issue | OutOfMemoryError ? &mut Allocator {
+    if let Literal.Boolean {value} = self.literal { return value }
+    fail Issue.invalidType("true or false")
+  }
+
+  effect fn signed(self: &mut Self) -> i64 ! Issue | OutOfMemoryError ? &mut Allocator {
+    if let Literal.Integer {value} = self.literal { return value }
+    fail Issue.invalidType("an integer")
+  }
+
+  effect fn unsigned(self: &mut Self) -> u64 ! Issue | OutOfMemoryError ? &mut Allocator {
+    if let Literal.Integer {value} = self.literal {
+      if value >= 0 { return i64.toU64(value) }
+      fail Issue.invalidValue("a non-negative integer")
+    }
+    fail Issue.invalidType("a non-negative integer")
+  }
+
+  effect fn float(self: &mut Self) -> f64 ! Issue | OutOfMemoryError ? &mut Allocator {
+    if let Literal.Number {value} = self.literal { return value }
+    if let Literal.Integer {value} = self.literal { return i64.toF64(value) }
+    fail Issue.invalidType("a number")
+  }
+
+  effect fn text(self: &mut Self) -> String ! Issue | OutOfMemoryError ? &mut Allocator {
+    if let Literal.Text {value} = self.literal { return run String.copy(value) }
+    fail Issue.invalidType("text")
+  }
+
+  effect fn null(self: &mut Self) -> bool ! Issue | OutOfMemoryError ? &mut Allocator {
+    return false
+  }
+
+  effect fn beginList(self: &mut Self) -> () ! Issue | OutOfMemoryError ? &mut Allocator {
+    fail Issue.invalidType("a list")
+  }
+
+  effect fn nextElement(self: &mut Self) -> bool ! Issue | OutOfMemoryError ? &mut Allocator {
+    return false
+  }
+
+  effect fn beginObject(self: &mut Self) -> () ! Issue | OutOfMemoryError ? &mut Allocator {
+    fail Issue.invalidType("an object")
+  }
+
+  effect fn member(self: &mut Self, key: string) -> bool ! Issue | OutOfMemoryError ? &mut Allocator {
+    return false
+  }
+
+  effect fn endObject(self: &mut Self) -> () ! Issue | OutOfMemoryError ? &mut Allocator {
+    return ()
+  }
 }
 
 effect fn unionRead<U: Schema, R: SchemaReader>(reader: &mut R) -> U ! Issue | OutOfMemoryError ? &mut Allocator {
@@ -684,7 +1189,8 @@ effect fn unionRead<U: Schema, R: SchemaReader>(reader: &mut R) -> U ! Issue | O
     static for variant in Reflect.variants<U>() {
       if name.view() == wireNameOf<U>(Reflect.variantLabel(variant)) { return U.[variant] {} }
     }
-    fail Issue.make(IssueReason.UnknownVariant, "the name of a variant")
+    let unknown = Issue.make(IssueReason.UnknownVariant, variantChoices<U>())
+    fail unknown.locate(SchemaReader.lastSpan(&reader.*), SchemaReader.lastKind(&reader.*))
   }
 }
 
@@ -693,20 +1199,70 @@ effect fn unionRead<U: Schema, R: SchemaReader>(reader: &mut R) -> U ! Issue | O
 effect fn taggedRead<U: Schema, R: SchemaReader>(reader: &mut R) -> U ! Issue | OutOfMemoryError ? &mut Allocator {
   run SchemaReader.beginObject(&mut reader.*)
   let static tag = tagOf<U>()
-  run SchemaPath.push(SchemaReader.path(&mut reader.*), PathSegment.Field {name: tag})
-  if !run SchemaReader.member(&mut reader.*, tag) { fail Issue.missingKey() }
+  run SchemaPath.push(SchemaReader.path(&mut reader.*), PathSegment.Field {name: tag, wire: tag})
+  if !run SchemaReader.member(&mut reader.*, tag) {
+    let missing = Issue.make(IssueReason.MissingKey, variantChoices<U>())
+    fail missing.locate(SchemaReader.lastSpan(&reader.*), ValueKind.Missing)
+  }
   let name = run SchemaReader.text(&mut reader.*)
   static for variant in Reflect.variants<U>() {
     if name.view() == wireNameOf<U>(Reflect.variantLabel(variant)) {
       SchemaPath.pop(SchemaReader.path(&mut reader.*))
-      let value = U.[variant] {
-        static for field in Reflect.variantFields(variant) { [field]: run fieldRead(&mut reader.*, field) },
-      }
-      run SchemaReader.endObject(&mut reader.*)
-      return move value
+      return run variantFieldsRead<U, R>(&mut reader.*, variant)
     }
   }
-  fail Issue.make(IssueReason.UnknownVariant, "the name of a variant")
+  let unknown = Issue.make(IssueReason.UnknownVariant, variantChoices<U>())
+  fail unknown.locate(SchemaReader.lastSpan(&reader.*), SchemaReader.lastKind(&reader.*))
+}
+
+// Reads the variant `variant` of `U` from an object of its fields.
+effect fn variantRead<U: Schema, R: SchemaReader>(reader: &mut R, static variant: Intrinsic.Variant<U>) -> U
+  ! Issue | OutOfMemoryError ? &mut Allocator {
+  run SchemaReader.beginObject(&mut reader.*)
+  return run variantFieldsRead<U, R>(&mut reader.*, variant)
+}
+
+// Reads the fields of `variant` from the object being read, then ends the object.
+effect fn variantFieldsRead<U: Schema, R: SchemaReader>(reader: &mut R, static variant: Intrinsic.Variant<U>) -> U
+  ! Issue | OutOfMemoryError ? &mut Allocator {
+  let static label = Reflect.variantLabel(variant)
+  run SchemaPath.push(SchemaReader.path(&mut reader.*), PathSegment.Variant {name: label, wire: wireNameOf<U>(label)})
+  if SchemaReader.collecting(&reader.*) { return run recoveringVariantRead<U, R>(&mut reader.*, variant) }
+  let value = U.[variant] {
+    static for field in Reflect.variantFields(variant) { [field]: run fieldRead(&mut reader.*, field) },
+  }
+  static if strictOf<U>() { run SchemaReader.rejectUnread(&mut reader.*, variantKeyChoices<U>(variant)) }
+  SchemaPath.pop(SchemaReader.path(&mut reader.*))
+  run SchemaReader.endObject(&mut reader.*)
+  return move value
+}
+
+effect fn countedVariantFields<U: Schema, R: SchemaReader>(reader: &mut R, static variant: Intrinsic.Variant<U>, started: &mut usize) -> U
+  ! Issue | OutOfMemoryError ? &mut Allocator {
+  return U.[variant] {
+    static for field in Reflect.variantFields(variant) { [field]: run countedFieldRead(&mut reader.*, field, &mut started.*) },
+  }
+}
+
+// Reads a variant's fields in a collecting reader, as `recoveringStructRead` reads a struct's.
+effect fn recoveringVariantRead<U: Schema, R: SchemaReader>(reader: &mut R, static variant: Intrinsic.Variant<U>) -> U
+  ! Issue | OutOfMemoryError ? &mut Allocator {
+  let depth = pathDepth(&mut reader.*)
+  let start = run SchemaReader.mark(&mut reader.*)
+  let mut started = usize.ZERO
+  let read = run Effect.result(countedVariantFields<U, R>(&mut reader.*, variant, &mut started))
+  let settledValue = run settled<U, R>(&mut reader.*, move read, start, depth)
+  if settledValue.isNone() {
+    let mut at = usize.ZERO
+    static for field in Reflect.variantFields(variant) {
+      if at >= started { run probeField(&mut reader.*, field, depth) }
+      at = at + usize.ONE
+    }
+  }
+  static if strictOf<U>() { run SchemaReader.rejectUnread(&mut reader.*, variantKeyChoices<U>(variant)) }
+  SchemaPath.pop(SchemaReader.path(&mut reader.*))
+  run SchemaReader.endObject(&mut reader.*)
+  return run reportedUnless<U>(move settledValue)
 }
 
 effect fn derivedWrite<T: Schema, W: SchemaWriter>(value: &T, writer: &mut W)
@@ -760,6 +1316,148 @@ effect fn variantFieldWrite<W: SchemaWriter, Owner: Schema, V: Schema>(owner: &O
   return run Schemas.write<V, W>(value, &mut writer.*)
 }
 
+effect fn derivedShape<T: Schema>(shapes: &mut Shapes) -> ShapeRef ! OutOfMemoryError ? &mut Allocator {
+  let static name = Reflect.typeName<T>()
+  if let Option<ShapeRef>.Some {value} = shapes.named(name) { return value }
+  let at = run shapes.reserve(name)
+  let info = TypeInfo {name: name, doc: Reflect.typeDoc<T>()}
+  static if isUnion<T>() {
+    let mut variants = List<VariantShape>.make()
+    static for variant in Reflect.variants<T>() {
+      let mut fields = List<FieldShape>.make()
+      static for field in Reflect.variantFields(variant) {
+        run List<FieldShape>.append(&mut fields, run fieldShape(&mut shapes.*, field))
+      }
+      let static label = Reflect.variantLabel(variant)
+      run List<VariantShape>.append(&mut variants, VariantShape {name: label, wire: wireNameOf<T>(label), doc: Reflect.variantDoc(variant),
+        fields: move fields})
+    }
+    static if hasPayload<T>() {
+      shapes.set(at, Shape.Tagged {info: info, tag: tagOf<T>(), variants: move variants})
+    } else {
+      shapes.set(at, Shape.Choice {info: info, variants: move variants})
+    }
+  } else {
+    let mut fields = List<FieldShape>.make()
+    static for field in Reflect.fields<T>() {
+      run List<FieldShape>.append(&mut fields, run fieldShape(&mut shapes.*, field))
+    }
+    shapes.set(at, Shape.Object {info: info, fields: move fields, strict: strictOf<T>()})
+  }
+  return at
+}
+
+effect fn fieldShape<Owner: Schema, V: Schema>(shapes: &mut Shapes, static field: Intrinsic.Field<Owner, V>) -> FieldShape
+  ! OutOfMemoryError ? &mut Allocator {
+  let static label = Reflect.fieldLabel(field)
+  let value = run Schemas.shapeOf<V>(&mut shapes.*)
+  let mut constraints = List<Constraint>.make()
+  static for rule in rulesOf<Owner>(label) {
+    run List<Constraint>.append(&mut constraints, rule)
+  }
+  let optional = match move run Effect.result(missingValue<V>()) {
+    Result<V, Issue>.Success {value: absent} => {
+      drop absent
+      true
+    }
+    Result<V, Issue>.Failure {..} => false
+  }
+  let default = defaultOf<Owner>(label)
+  return FieldShape {name: label, wire: wireNameOf<Owner>(label), doc: Reflect.fieldDoc(field), value: value,
+    required: !optional && default.isNone(), default: default, constraints: move constraints}
+}
+
+fn withinSigned(value: i64, constraint: Constraint) -> bool {
+  if let Constraint.Range {min, max} = constraint {
+    let low = match min {
+      Bound.Signed {value: limit} => value >= limit
+      Bound.Unsigned {value: limit} => value >= 0 && i64.toU64(value) >= limit
+      Bound.Float {value: limit} => i64.toF64(value) >= limit
+      Bound.None => true
+    }
+    let high = match max {
+      Bound.Signed {value: limit} => value <= limit
+      Bound.Unsigned {value: limit} => value < 0 || i64.toU64(value) <= limit
+      Bound.Float {value: limit} => i64.toF64(value) <= limit
+      Bound.None => true
+    }
+    return low && high
+  }
+  return true
+}
+
+fn withinUnsigned(value: u64, constraint: Constraint) -> bool {
+  if let Constraint.Range {min, max} = constraint {
+    let low = match min {
+      Bound.Signed {value: limit} => limit < 0 || value >= i64.toU64(limit)
+      Bound.Unsigned {value: limit} => value >= limit
+      Bound.Float {value: limit} => u64.toF64(value) >= limit
+      Bound.None => true
+    }
+    let high = match max {
+      Bound.Signed {value: limit} => limit >= 0 && value <= i64.toU64(limit)
+      Bound.Unsigned {value: limit} => value <= limit
+      Bound.Float {value: limit} => u64.toF64(value) <= limit
+      Bound.None => true
+    }
+    return low && high
+  }
+  return true
+}
+
+fn withinFloat(value: f64, constraint: Constraint) -> bool {
+  if let Constraint.Range {min, max} = constraint {
+    let low = match min {
+      Bound.Signed {value: limit} => value >= i64.toF64(limit)
+      Bound.Unsigned {value: limit} => value >= u64.toF64(limit)
+      Bound.Float {value: limit} => value >= limit
+      Bound.None => true
+    }
+    let high = match max {
+      Bound.Signed {value: limit} => value <= i64.toF64(limit)
+      Bound.Unsigned {value: limit} => value <= u64.toF64(limit)
+      Bound.Float {value: limit} => value <= limit
+      Bound.None => true
+    }
+    return low && high
+  }
+  return true
+}
+
+// The number of characters in `text`: its bytes that start a UTF-8 sequence.
+fn characters(text: string) -> usize {
+  let bytes = String.utf8Bytes(text)
+  let mut count = usize.ZERO
+  let mut at = usize.ZERO
+  while at < bytes.length {
+    if bytes[at] < 128 || bytes[at] >= 192 { count = count + usize.ONE }
+    at = at + usize.ONE
+  }
+  return count
+}
+
+effect fn textSatisfies(text: string, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator {
+  return match constraint {
+    Constraint.Length {min, max} => {
+      let count = characters(text)
+      count >= min && count <= max
+    }
+    Constraint.Pattern {source} => match move run Effect.result(Regex.matches(source, text)) {
+      Result<bool, RegexError | OutOfMemoryError>.Success {value} => value
+      Result<bool, RegexError | OutOfMemoryError>.Failure {error} => match move error {
+        RegexError {..} => false
+        OutOfMemoryError {} => { fail OutOfMemoryError {} }
+      }
+    }
+    _ => true
+  }
+}
+
+fn countWithin(count: usize, constraint: Constraint) -> bool {
+  if let Constraint.Items {min, max} = constraint { return count >= min && count <= max }
+  return true
+}
+
 impl Schema for bool {
   /// Reads `true` or `false`.
   effect fn read<R: SchemaReader>(reader: &mut R) -> bool ! Issue | OutOfMemoryError ? &mut Allocator {
@@ -771,6 +1469,15 @@ impl Schema for bool {
     -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
     return run SchemaWriter.boolean(&mut writer.*, self.*)
   }
+
+  /// Adds `Shape.Boolean`.
+  effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator {
+    return ShapeOf<Self>.make(run shapes.add(Shape.Boolean))
+  }
+}
+
+effect fn integerShape(shapes: &mut Shapes, min: Bound, max: Bound) -> ShapeRef ! OutOfMemoryError ? &mut Allocator {
+  return run shapes.add(Shape.Integer {min: min, max: max})
 }
 
 impl Schema for u64 {
@@ -783,6 +1490,16 @@ impl Schema for u64 {
   effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
     -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
     return run SchemaWriter.unsigned(&mut writer.*, self.*)
+  }
+
+  /// Adds an integer from 0 to `u64.MAX`.
+  effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator {
+    return ShapeOf<Self>.make(run integerShape(&mut shapes.*, Bound.Unsigned {value: 0}, Bound.Unsigned {value: u64.MAX}))
+  }
+
+  /// Tests a range.
+  effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator {
+    return withinUnsigned(self.*, constraint)
   }
 }
 
@@ -797,6 +1514,16 @@ impl Schema for i64 {
     -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
     return run SchemaWriter.signed(&mut writer.*, self.*)
   }
+
+  /// Adds an integer from `i64.MIN` to `i64.MAX`.
+  effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator {
+    return ShapeOf<Self>.make(run integerShape(&mut shapes.*, Bound.Signed {value: i64.MIN}, Bound.Signed {value: i64.MAX}))
+  }
+
+  /// Tests a range.
+  effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator {
+    return withinSigned(self.*, constraint)
+  }
 }
 
 impl Schema for f64 {
@@ -810,6 +1537,16 @@ impl Schema for f64 {
     -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
     return run SchemaWriter.float(&mut writer.*, self.*)
   }
+
+  /// Adds `Shape.Float`.
+  effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator {
+    return ShapeOf<Self>.make(run shapes.add(Shape.Float))
+  }
+
+  /// Tests a range.
+  effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator {
+    return withinFloat(self.*, constraint)
+  }
 }
 
 impl Schema for String {
@@ -822,6 +1559,16 @@ impl Schema for String {
   effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
     -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
     return run SchemaWriter.text(&mut writer.*, self.view())
+  }
+
+  /// Adds `Shape.Text`.
+  effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator {
+    return ShapeOf<Self>.make(run shapes.add(Shape.Text))
+  }
+
+  /// Tests a length in characters, or a pattern.
+  effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator {
+    return run textSatisfies(self.view(), constraint)
   }
 }
 
@@ -841,6 +1588,12 @@ impl<T: Schema> Schema for Option<T> {
     }
   }
 
+  /// Adds `Shape.Optional` around the shape of `T`.
+  effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator {
+    let value = run Schemas.shapeOf<T>(&mut shapes.*)
+    return ShapeOf<Self>.make(run shapes.add(Shape.Optional {value: value}))
+  }
+
   /// Returns `None`, so an `Option` field may be absent.
   effect fn missing() -> Option<T> ! Issue {
     return Option<T>.none()
@@ -850,21 +1603,53 @@ impl<T: Schema> Schema for Option<T> {
   fn omitted(self: &Self) -> bool {
     return Option<T>.isNone(self)
   }
+
+  /// Tests the value of `Some`; `None` follows every rule.
+  effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator {
+    return match &self.* {
+      Option<T>.Some {value} => run Schema.satisfies(&value, constraint)
+      Option<T>.None => true
+    }
+  }
 }
 
 impl<T: Schema> Schema for List<T> {
-  /// Reads a list, element by element.
+  /// Reads a list, element by element. A collecting reader records a failed element and goes on
+  /// with the next.
   effect fn read<R: SchemaReader>(reader: &mut R) -> List<T> ! Issue | OutOfMemoryError ? &mut Allocator {
     run SchemaReader.beginList(&mut reader.*)
     let mut values = List<T>.make()
     let mut index = usize.ZERO
+    let collecting = SchemaReader.collecting(&reader.*)
+    let mut failed = false
     while run SchemaReader.nextElement(&mut reader.*) {
       run SchemaPath.push(SchemaReader.path(&mut reader.*), PathSegment.Index {at: index})
-      let value = run Schemas.read<T, R>(&mut reader.*)
+      if collecting {
+        let depth = pathDepth(&mut reader.*)
+        let start = run SchemaReader.mark(&mut reader.*)
+        match move run Effect.result(Schemas.read<T, R>(&mut reader.*)) {
+          Result<T, Issue | OutOfMemoryError>.Success {value} => {
+            SchemaReader.release(&mut reader.*, start)
+            run List<T>.append(&mut values, move value)
+          }
+          Result<T, Issue | OutOfMemoryError>.Failure {error} => match move error {
+            Issue {reason, expected, found, span} => {
+              run noteFailure(&mut reader.*, Issue {reason: reason, expected: expected, found: found, span: span})
+              SchemaPath.truncate(SchemaReader.path(&mut reader.*), depth)
+              run SchemaReader.recover(&mut reader.*, start, true)
+              failed = true
+            }
+            OutOfMemoryError {} => { fail OutOfMemoryError {} }
+          }
+        }
+      } else {
+        let value = run Schemas.read<T, R>(&mut reader.*)
+        run List<T>.append(&mut values, move value)
+      }
       SchemaPath.pop(SchemaReader.path(&mut reader.*))
-      run List<T>.append(&mut values, move value)
       index = index + usize.ONE
     }
+    if failed { fail Issue.make(IssueReason.Reported, "") }
     return move values
   }
 
@@ -881,6 +1666,23 @@ impl<T: Schema> Schema for List<T> {
     }
     return run SchemaWriter.endList(&mut writer.*)
   }
+
+  /// Adds `Shape.List` of the shape of `T`.
+  effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator {
+    let element = run Schemas.shapeOf<T>(&mut shapes.*)
+    return ShapeOf<Self>.make(run shapes.add(Shape.List {element: element}))
+  }
+
+  /// Tests a number of elements.
+  effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator {
+    return countWithin(List<T>.length(self), constraint)
+  }
+}
+
+// An integer read as `wide` that does not fit the narrower type: the issue points at the value.
+effect fn outOfRange<R: SchemaReader>(reader: &R, expected: string<'static>) -> never ! Issue {
+  let issue = Issue.invalidValue(expected)
+  fail issue.locate(SchemaReader.lastSpan(&reader.*), ValueKind.Number)
 }
 
 impl Schema for u8 {
@@ -889,7 +1691,7 @@ impl Schema for u8 {
     let raw = run SchemaReader.unsigned(&mut reader.*)
     return match u64.checkedToU8(raw) {
       Option<u8>.Some {value} => value
-      Option<u8>.None => { fail Issue.invalidValue("an integer from 0 to 255") }
+      Option<u8>.None => run outOfRange(&reader.*, "an integer from 0 to 255")
     }
   }
 
@@ -897,6 +1699,16 @@ impl Schema for u8 {
   effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
     -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
     return run SchemaWriter.unsigned(&mut writer.*, u8.toU64(self.*))
+  }
+
+  /// Adds an integer from 0 to 255.
+  effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator {
+    return ShapeOf<Self>.make(run integerShape(&mut shapes.*, Bound.Unsigned {value: 0}, Bound.Unsigned {value: 255}))
+  }
+
+  /// Tests a range.
+  effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator {
+    return withinUnsigned(u8.toU64(self.*), constraint)
   }
 }
 
@@ -906,7 +1718,7 @@ impl Schema for u16 {
     let raw = run SchemaReader.unsigned(&mut reader.*)
     return match u64.checkedToU16(raw) {
       Option<u16>.Some {value} => value
-      Option<u16>.None => { fail Issue.invalidValue("an integer from 0 to 65535") }
+      Option<u16>.None => run outOfRange(&reader.*, "an integer from 0 to 65535")
     }
   }
 
@@ -914,6 +1726,16 @@ impl Schema for u16 {
   effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
     -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
     return run SchemaWriter.unsigned(&mut writer.*, u16.toU64(self.*))
+  }
+
+  /// Adds an integer from 0 to 65535.
+  effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator {
+    return ShapeOf<Self>.make(run integerShape(&mut shapes.*, Bound.Unsigned {value: 0}, Bound.Unsigned {value: 65535}))
+  }
+
+  /// Tests a range.
+  effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator {
+    return withinUnsigned(u16.toU64(self.*), constraint)
   }
 }
 
@@ -923,7 +1745,7 @@ impl Schema for u32 {
     let raw = run SchemaReader.unsigned(&mut reader.*)
     return match u64.checkedToU32(raw) {
       Option<u32>.Some {value} => value
-      Option<u32>.None => { fail Issue.invalidValue("an integer from 0 to 4294967295") }
+      Option<u32>.None => run outOfRange(&reader.*, "an integer from 0 to 4294967295")
     }
   }
 
@@ -931,6 +1753,16 @@ impl Schema for u32 {
   effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
     -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
     return run SchemaWriter.unsigned(&mut writer.*, u32.toU64(self.*))
+  }
+
+  /// Adds an integer from 0 to 4294967295.
+  effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator {
+    return ShapeOf<Self>.make(run integerShape(&mut shapes.*, Bound.Unsigned {value: 0}, Bound.Unsigned {value: 4294967295}))
+  }
+
+  /// Tests a range.
+  effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator {
+    return withinUnsigned(u32.toU64(self.*), constraint)
   }
 }
 
@@ -940,7 +1772,7 @@ impl Schema for usize {
     let raw = run SchemaReader.unsigned(&mut reader.*)
     return match u64.checkedToUsize(raw) {
       Option<usize>.Some {value} => value
-      Option<usize>.None => { fail Issue.invalidValue("a size that fits in usize") }
+      Option<usize>.None => run outOfRange(&reader.*, "a size that fits in usize")
     }
   }
 
@@ -948,6 +1780,16 @@ impl Schema for usize {
   effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
     -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
     return run SchemaWriter.unsigned(&mut writer.*, usize.toU64(self.*))
+  }
+
+  /// Adds an integer from 0 to `usize.MAX`.
+  effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator {
+    return ShapeOf<Self>.make(run integerShape(&mut shapes.*, Bound.Unsigned {value: 0}, Bound.Unsigned {value: usize.toU64(usize.MAX)}))
+  }
+
+  /// Tests a range.
+  effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator {
+    return withinUnsigned(usize.toU64(self.*), constraint)
   }
 }
 
@@ -957,7 +1799,7 @@ impl Schema for i8 {
     let raw = run SchemaReader.signed(&mut reader.*)
     return match i64.checkedToI8(raw) {
       Option<i8>.Some {value} => value
-      Option<i8>.None => { fail Issue.invalidValue("an integer from -128 to 127") }
+      Option<i8>.None => run outOfRange(&reader.*, "an integer from -128 to 127")
     }
   }
 
@@ -965,6 +1807,16 @@ impl Schema for i8 {
   effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
     -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
     return run SchemaWriter.signed(&mut writer.*, i8.toI64(self.*))
+  }
+
+  /// Adds an integer from -128 to 127.
+  effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator {
+    return ShapeOf<Self>.make(run integerShape(&mut shapes.*, Bound.Signed {value: -128}, Bound.Signed {value: 127}))
+  }
+
+  /// Tests a range.
+  effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator {
+    return withinSigned(i8.toI64(self.*), constraint)
   }
 }
 
@@ -974,7 +1826,7 @@ impl Schema for i16 {
     let raw = run SchemaReader.signed(&mut reader.*)
     return match i64.checkedToI16(raw) {
       Option<i16>.Some {value} => value
-      Option<i16>.None => { fail Issue.invalidValue("an integer from -32768 to 32767") }
+      Option<i16>.None => run outOfRange(&reader.*, "an integer from -32768 to 32767")
     }
   }
 
@@ -982,6 +1834,16 @@ impl Schema for i16 {
   effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
     -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
     return run SchemaWriter.signed(&mut writer.*, i16.toI64(self.*))
+  }
+
+  /// Adds an integer from -32768 to 32767.
+  effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator {
+    return ShapeOf<Self>.make(run integerShape(&mut shapes.*, Bound.Signed {value: -32768}, Bound.Signed {value: 32767}))
+  }
+
+  /// Tests a range.
+  effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator {
+    return withinSigned(i16.toI64(self.*), constraint)
   }
 }
 
@@ -991,7 +1853,7 @@ impl Schema for i32 {
     let raw = run SchemaReader.signed(&mut reader.*)
     return match i64.checkedToI32(raw) {
       Option<i32>.Some {value} => value
-      Option<i32>.None => { fail Issue.invalidValue("an integer from -2147483648 to 2147483647") }
+      Option<i32>.None => run outOfRange(&reader.*, "an integer from -2147483648 to 2147483647")
     }
   }
 
@@ -999,5 +1861,15 @@ impl Schema for i32 {
   effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
     -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
     return run SchemaWriter.signed(&mut writer.*, i32.toI64(self.*))
+  }
+
+  /// Adds an integer from -2147483648 to 2147483647.
+  effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator {
+    return ShapeOf<Self>.make(run integerShape(&mut shapes.*, Bound.Signed {value: -2147483648}, Bound.Signed {value: 2147483647}))
+  }
+
+  /// Tests a range.
+  effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator {
+    return withinSigned(i32.toI64(self.*), constraint)
   }
 }

@@ -1,0 +1,1092 @@
+//! Describe a `Schema` type as a JSON Schema, for validators, editors, and AI tools.
+//!
+//! # When to use
+//! Call [`JsonSchemas.write`] with the `silk.schema.shape.Shapes` of a type, from
+//! `silk.schema.schema.Schemas.shape`, to write its JSON Schema to the ambient `Writer`. Pick a
+//! [`JsonSchemaDialect`] for where the schema goes: `Standard` for validators and MCP tools, and
+//! the strict dialects for a model's structured output or tool parameters. Call
+//! [`JsonSchemas.writeVariant`] for the parameters of one tool, when a union lists the tools.
+//!
+//! # Details
+//! The output is JSON Schema draft 2020-12. Structs are objects with their fields' wire names, unit
+//! unions are an `enum` of names, and unions with fields are a `oneOf` of one object per variant,
+//! whose tag property holds the variant's name. A named type that the root uses is an entry in
+//! `$defs`, used through `$ref`, so recursive types work; the root itself is written in place. Doc
+//! comments become `description`. `Spec` rules become `minimum`, `maxLength`, `pattern` and the
+//! like, and a field's default becomes `default`.
+//!
+//! A rule the dialect has no keyword for, a codec's check, or a rule about a value after a codec
+//! changed it, goes into `description` as text instead, and the schema is then approximate: it
+//! accepts at least what the decoder accepts, never less. [`JsonSchemas.write`] returns whether it
+//! is exact, and an approximate schema uses `anyOf` where an exact one uses `oneOf`.
+//!
+//! The dialects follow the providers' documented subsets:
+//!
+//! - `Standard`: all of the above, with `$schema`. MCP tool schemas use it.
+//! - `OpenAiStrict`: the root is an object, every property is required and a field that may be
+//!   absent is nullable instead, every object has `additionalProperties: false`, and `const`,
+//!   `oneOf`, `minLength`, `maxLength` and `default` are not used.
+//! - `AnthropicStrict`: every object has `additionalProperties: false`, and there are no numeric,
+//!   length or count keywords and no `default`. A recursive type is an error.
+//! - `Gemini`: no `const`, `oneOf`, `pattern`, length keywords or `default`.
+//!
+//! # Examples
+//! ## Write the JSON Schema of a config
+//! ```silk
+//! import silk.core.effect { Effect }
+//! import silk.io.writer { Writer, WriterError }
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.schema.json_schema { JsonSchemaDialect, JsonSchemaError, JsonSchemaOptions, JsonSchemas }
+//! import silk.schema.schema { Schema, Schemas, Spec }
+//!
+//! /// A server to start.
+//! struct Server {
+//!   /// The port to listen on.
+//!   pub port: u16,
+//! }
+//!
+//! impl Schema for Server {
+//!   static fn spec() -> Spec<Server> {
+//!     return Spec<Server>.of() |> Spec<Server>.between("port", 1, 65535)
+//!   }
+//! }
+//!
+//! struct Capture {
+//!   length: usize,
+//! }
+//!
+//! impl Writer for Capture {
+//!   effect fn writeAll(self: &mut Self, val: &[u8]) -> () ! WriterError ? &mut Writer {
+//!     self.length = self.length + val.length
+//!     return ()
+//!   }
+//!   effect fn flush(self: &mut Self) -> () ! WriterError ? &mut Writer { return () }
+//! }
+//!
+//! effect fn check() -> bool ! JsonSchemaError | WriterError | OutOfMemoryError ? &mut Allocator {
+//!   let shapes = run Schemas.shape<Server>()
+//!   let mut capture = Capture {length: 0}
+//!   // {"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":
+//!   //  {"port":{"type":"integer","minimum":1,"maximum":65535,"description":"The port to listen on."}},
+//!   //  "required":["port"],"description":"A server to start."}
+//!   let exact = run JsonSchemas.write(&shapes, JsonSchemaOptions.of(JsonSchemaDialect.Standard))
+//!     |> Effect.provideMut<Writer>(&mut capture)
+//!   return exact && capture.length > 0
+//! }
+//!
+//! pub effect fn main() -> i32 ! JsonSchemaError | WriterError | OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let exact = run check() |> Effect.provideMut<Allocator>(&mut allocator)
+//!   return if exact { 0 } else { 1 }
+//! }
+//! ```
+//!
+//! @category Data formats
+
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.io.writer { Writer, WriterError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.i64
+import silk.num.u8
+import silk.num.u64
+import silk.num.usize
+import silk.schema.shape { Bound, Constraint, FieldShape, Literal, Shape, ShapeRef, Shapes, VariantShape }
+import silk.text.format { Debug, Format, Formatter }
+import silk.text.string { String }
+
+/// Which subset of JSON Schema to write, for where the schema goes.
+pub enum JsonSchemaDialect {
+  /// Draft 2020-12, for validators, editors, and MCP tools.
+  Standard,
+  /// OpenAI structured outputs and strict function calling.
+  OpenAiStrict,
+  /// Anthropic strict tool use and structured outputs.
+  AnthropicStrict,
+  /// Gemini response and function parameter schemas.
+  Gemini,
+}
+
+/// How [`JsonSchemas.write`] writes a schema.
+pub struct JsonSchemaOptions {
+  /// The subset of JSON Schema to write.
+  pub dialect: JsonSchemaDialect,
+}
+
+impl Copy for JsonSchemaOptions {}
+
+impl JsonSchemaOptions {
+  /// Returns options for `dialect`.
+  pub fn of(dialect: JsonSchemaDialect) -> JsonSchemaOptions {
+    return JsonSchemaOptions {dialect: dialect}
+  }
+}
+
+/// Why a type has no schema in a dialect.
+pub enum JsonSchemaProblem {
+  /// The dialect needs an object at the root, and the type is not a struct.
+  RootNotObject,
+  /// The dialect has no recursive references, and the type contains itself.
+  Recursive,
+}
+
+/// A type that has no schema in the dialect asked for.
+pub struct JsonSchemaError {
+  /// Why it has none.
+  pub problem: JsonSchemaProblem,
+  /// The name of the type, or empty text for a type with no name.
+  pub name: string<'static>,
+}
+
+impl Debug for JsonSchemaProblem {
+  /// Writes the name of the problem, such as `Recursive`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    let name = match self.* {
+      JsonSchemaProblem.RootNotObject => "RootNotObject"
+      JsonSchemaProblem.Recursive => "Recursive"
+    }
+    return run Format.writeText(&mut formatter, name)
+  }
+}
+
+impl Debug for JsonSchemaError {
+  /// Writes the fields, as `JsonSchemaError { problem: ..., name: ... }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return run Format.debugFields(self, "JsonSchemaError", &mut formatter)
+  }
+}
+
+/// Writes JSON Schemas from shapes.
+pub struct JsonSchemas {}
+
+impl JsonSchemas {
+  /// Writes the JSON Schema of the root of `shapes` to the ambient `Writer`, as compact JSON, and
+  /// returns whether it is exact: whether every rule became a keyword.
+  ///
+  /// # Errors
+  ///
+  /// - `JsonSchemaError` if the dialect cannot describe the type.
+  /// - `WriterError` if the `Writer` fails.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the bookkeeping.
+  pub effect fn write(shapes: &Shapes, options: JsonSchemaOptions) -> bool
+    ! JsonSchemaError | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
+    let root = shapes.root()
+    let mut render = run Render.make(shapes, options.dialect, root.index)
+    run reachRoot(&mut render, shapes, root)
+    if strictDialect(options.dialect) {
+      let base = wireOf(shapes, root)
+      if let Shape.Object {..} = &shapes.get(base).* {} else {
+        fail JsonSchemaError {problem: JsonSchemaProblem.RootNotObject, name: shapes.nameOf(root)}
+      }
+    }
+    if options.dialect == JsonSchemaDialect.AnthropicStrict && render.recursive {
+      fail JsonSchemaError {problem: JsonSchemaProblem.Recursive, name: shapes.nameOf(root)}
+    }
+    run rootDocument(&mut render, shapes, root)
+    let exact = render.exact
+    render.writing = true
+    render.approximate = !exact
+    run rootDocument(&mut render, shapes, root)
+    return exact
+  }
+
+  /// Writes the JSON Schema of the object of `variant`'s fields, without its tag, as the
+  /// parameters of a tool. `shapes` holds the shapes `variant` refers to. Returns whether it is
+  /// exact.
+  ///
+  /// # Errors
+  ///
+  /// - `JsonSchemaError` if the dialect cannot describe a field's type.
+  /// - `WriterError` if the `Writer` fails.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the bookkeeping.
+  pub effect fn writeVariant(shapes: &Shapes, variant: &VariantShape, options: JsonSchemaOptions) -> bool
+    ! JsonSchemaError | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
+    let mut render = run Render.make(shapes, options.dialect, usize.MAX)
+    let fields = List<FieldShape>.asSlice(&variant.fields)
+    let mut at = usize.ZERO
+    while at < fields.length {
+      run reach(&mut render, shapes, fields[at].value)
+      at = at + usize.ONE
+    }
+    if options.dialect == JsonSchemaDialect.AnthropicStrict && render.recursive {
+      fail JsonSchemaError {problem: JsonSchemaProblem.Recursive, name: variant.name}
+    }
+    run variantDocument(&mut render, shapes, variant)
+    let exact = render.exact
+    render.writing = true
+    render.approximate = !exact
+    run variantDocument(&mut render, shapes, variant)
+    return exact
+  }
+}
+
+// The state of one render. It runs twice: first without writing, to learn whether the schema is
+// exact, then writing, so that unions can say `oneOf` only when it is.
+struct Render {
+  dialect: JsonSchemaDialect,
+  writing: bool,
+  exact: bool,
+  approximate: bool,
+  root: usize,
+  recursive: bool,
+  // For each shape: 0 not reached, 1 being reached, 2 reached.
+  states: List<u8>,
+  // For each shape: whether it is an entry of `$defs`.
+  defined: List<bool>,
+}
+
+impl Render {
+  effect fn make(shapes: &Shapes, dialect: JsonSchemaDialect, root: usize) -> Render ! OutOfMemoryError ? &mut Allocator {
+    let mut render = Render {dialect: dialect, writing: false, exact: true, approximate: false, root: root, recursive: false,
+      states: List<u8>.make(), defined: List<bool>.make()}
+    let mut at = usize.ZERO
+    while at < shapes.length() {
+      run List<u8>.append(&mut render.states, 0)
+      run List<bool>.append(&mut render.defined, false)
+      at = at + usize.ONE
+    }
+    return move render
+  }
+}
+
+fn setAt<T>(list: &mut List<T>, at: usize, value: T) -> () {
+  let items = List<T>.asMutSlice(&mut list.*)
+  items[at] = move value
+  return ()
+}
+
+fn strictDialect(dialect: JsonSchemaDialect) -> bool {
+  return dialect == JsonSchemaDialect.OpenAiStrict || dialect == JsonSchemaDialect.AnthropicStrict
+}
+
+// The shape a value is written as: a codec's wire shape, through every codec.
+fn wireOf(shapes: &Shapes, at: ShapeRef) -> ShapeRef {
+  let mut current = at
+  while true {
+    if let Shape.Custom {wire, ..} = &shapes.get(current).* { current = wire } else { return current }
+  }
+  return current
+}
+
+// Marks the named shapes the root refers to, and whether one contains itself.
+effect fn reachRoot(render: &mut Render, shapes: &Shapes, root: ShapeRef) -> () ! OutOfMemoryError ? &mut Allocator {
+  setAt<u8>(&mut render.states, root.index, 1)
+  run reachParts(&mut render.*, shapes, root)
+  setAt<u8>(&mut render.states, root.index, 2)
+  return ()
+}
+
+effect fn reach(render: &mut Render, shapes: &Shapes, at: ShapeRef) -> () ! OutOfMemoryError ? &mut Allocator {
+  if shapes.nameOf(at) == "" { return run reachParts(&mut render.*, shapes, at) }
+  let state = List<u8>.asSlice(&render.states)[at.index]
+  if state == 1 {
+    render.recursive = true
+    return ()
+  }
+  if state == 2 || at.index == render.root { return () }
+  setAt<u8>(&mut render.states, at.index, 1)
+  setAt<bool>(&mut render.defined, at.index, true)
+  run reachParts(&mut render.*, shapes, at)
+  setAt<u8>(&mut render.states, at.index, 2)
+  return ()
+}
+
+effect fn reachParts(render: &mut Render, shapes: &Shapes, at: ShapeRef) -> () ! OutOfMemoryError ? &mut Allocator {
+  match &shapes.get(at).* {
+    Shape.Optional {value} => { run reach(&mut render.*, shapes, value) }
+    Shape.List {element} => { run reach(&mut render.*, shapes, element) }
+    Shape.Custom {wire, ..} => { run reach(&mut render.*, shapes, wire) }
+    Shape.Object {fields, ..} => { run reachFields(&mut render.*, shapes, List<FieldShape>.asSlice(&fields)) }
+    Shape.Choice {variants, ..} => { run reachVariants(&mut render.*, shapes, List<VariantShape>.asSlice(&variants)) }
+    Shape.Tagged {variants, ..} => { run reachVariants(&mut render.*, shapes, List<VariantShape>.asSlice(&variants)) }
+    _ => {}
+  }
+  return ()
+}
+
+effect fn reachFields(render: &mut Render, shapes: &Shapes, fields: &[FieldShape]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < fields.length {
+    run reach(&mut render.*, shapes, fields[at].value)
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+effect fn reachVariants(render: &mut Render, shapes: &Shapes, variants: &[VariantShape]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < variants.length {
+    run reachFields(&mut render.*, shapes, List<FieldShape>.asSlice(&variants[at].fields))
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// What a field adds to the schema of its value: its doc, rules, and default.
+struct Facets {
+  doc: string<'static>,
+  // Rules about the JSON value itself.
+  wire: List<Constraint>,
+  // Rules about the value after a codec read it, which JSON Schema cannot state.
+  decoded: List<Constraint>,
+  // Text about the value a codec's checks add.
+  notes: List<string<'static>>,
+  default: Option<Literal>,
+}
+
+impl Facets {
+  fn none() -> Facets {
+    return Facets {doc: "", wire: List<Constraint>.make(), decoded: List<Constraint>.make(), notes: List<string<'static>>.make(),
+      default: Option<Literal>.none()}
+  }
+
+  effect fn ofField(field: &FieldShape) -> Facets ! OutOfMemoryError ? &mut Allocator {
+    let mut facets = Facets.none()
+    facets.doc = field.doc
+    facets.default = field.default
+    run appendAll(&mut facets.wire, List<Constraint>.asSlice(&field.constraints))
+    return move facets
+  }
+}
+
+effect fn appendAll(list: &mut List<Constraint>, items: &[Constraint]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < items.length {
+    run List<Constraint>.append(&mut list.*, items[at])
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+effect fn rootDocument(render: &mut Render, shapes: &Shapes, root: ShapeRef) -> () ! WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
+  render.exact = true
+  run node(&mut render.*, shapes, root, Facets.none(), true)
+  return run emit(&render.*, b"\n")
+}
+
+effect fn variantDocument(render: &mut Render, shapes: &Shapes, variant: &VariantShape) -> () ! WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
+  render.exact = true
+  run emit(&render.*, b"{")
+  let mut first = true
+  run documentStart(&render.*, &mut first)
+  run objectBody(&mut render.*, shapes, &mut first, List<FieldShape>.asSlice(&variant.fields), false, "", "")
+  let mut text = Description {open: false}
+  if variant.doc != "" {
+    run text.next(&render.*, &mut first)
+    run emitEscaped(&render.*, variant.doc)
+  }
+  run text.close(&render.*)
+  run definitions(&mut render.*, shapes, &mut first)
+  return run emit(&render.*, b"}\n")
+}
+
+effect fn documentStart(render: &Render, first: &mut bool) -> () ! WriterError ? &mut Writer {
+  if render.dialect != JsonSchemaDialect.Standard { return () }
+  run key(render, &mut first.*, "$schema")
+  return run emit(render, b"\"https://json-schema.org/draft/2020-12/schema\"")
+}
+
+effect fn definitions(render: &mut Render, shapes: &Shapes, first: &mut bool) -> () ! WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
+  let count = List<bool>.length(&render.defined)
+  let mut opened = false
+  let mut at = usize.ZERO
+  while at < count {
+    if List<bool>.asSlice(&render.defined)[at] {
+      if opened { run emit(&render.*, b",") } else {
+        run key(&render.*, &mut first.*, "$defs")
+        run emit(&render.*, b"{")
+        opened = true
+      }
+      run emit(&render.*, b"\"")
+      run emitDefinitionName(&render.*, shapes.nameOf(ShapeRef {index: at}))
+      run emit(&render.*, b"\":")
+      run node(&mut render.*, shapes, ShapeRef {index: at}, Facets.none(), false)
+    }
+    at = at + usize.ONE
+  }
+  if opened { run emit(&render.*, b"}") }
+  return ()
+}
+
+// Writes the schema of a value of shape `at`: a reference for a named shape, else the shape.
+effect fn schema(render: &mut Render, shapes: &Shapes, at: ShapeRef, facets: Facets) -> () ! WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
+  if let Shape.Custom {wire, constraints, notes} = &shapes.get(at).* {
+    // The codec's own hints are about its wire value; the field's rules are about the decoded one.
+    let mut inner = Facets.none()
+    inner.doc = facets.doc
+    inner.default = facets.default
+    run appendAll(&mut inner.wire, List<Constraint>.asSlice(&constraints))
+    run appendAll(&mut inner.decoded, List<Constraint>.asSlice(&facets.wire))
+    run appendAll(&mut inner.decoded, List<Constraint>.asSlice(&facets.decoded))
+    let given = List<string<'static>>.asSlice(&facets.notes)
+    let mut at = usize.ZERO
+    while at < given.length {
+      run List<string<'static>>.append(&mut inner.notes, given[at])
+      at = at + usize.ONE
+    }
+    let added = List<string<'static>>.asSlice(&notes)
+    at = usize.ZERO
+    while at < added.length {
+      run List<string<'static>>.append(&mut inner.notes, added[at])
+      at = at + usize.ONE
+    }
+    return run schema(&mut render.*, shapes, wire, move inner)
+  }
+  if shapes.nameOf(at) == "" { return run node(&mut render.*, shapes, at, move facets, false) }
+  run emit(&render.*, b"{\"$ref\":\"#")
+  if at.index != render.root {
+    run emit(&render.*, b"/$defs/")
+    run emitDefinitionName(&render.*, shapes.nameOf(at))
+  }
+  run emit(&render.*, b"\"")
+  let mut first = false
+  // A rule on a named type cannot apply to it; it is only described.
+  if !strictDialect(render.dialect) {
+    run describe(&mut render.*, &mut first, Kind.Other, &facets)
+  } else if List<Constraint>.length(&facets.wire) != usize.ZERO || List<Constraint>.length(&facets.decoded) != usize.ZERO {
+    render.exact = false
+  }
+  return run emit(&render.*, b"}")
+}
+
+// What a value's keywords can state.
+enum Kind {
+  Integer,
+  Float,
+  Text,
+  List,
+  Other,
+}
+
+// Writes shape `at` itself, as one JSON object.
+effect fn node(render: &mut Render, shapes: &Shapes, at: ShapeRef, facets: Facets, top: bool) -> () ! WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
+  run emit(&render.*, b"{")
+  let mut first = true
+  if top { run documentStart(&render.*, &mut first) }
+  let mut kind = Kind.Other
+  let mut described = true
+  match &shapes.get(at).* {
+    Shape.Boolean => { run typed(&render.*, &mut first, "boolean") }
+    Shape.Integer {min, max} => {
+      kind = Kind.Integer
+      run typed(&render.*, &mut first, "integer")
+      run bounds(&mut render.*, &mut first, min, max, &facets)
+    }
+    Shape.Float => {
+      kind = Kind.Float
+      run typed(&render.*, &mut first, "number")
+      run bounds(&mut render.*, &mut first, Bound.None, Bound.None, &facets)
+    }
+    Shape.Text => {
+      kind = Kind.Text
+      run typed(&render.*, &mut first, "string")
+      run textRules(&mut render.*, &mut first, &facets)
+    }
+    Shape.List {element} => {
+      kind = Kind.List
+      run typed(&render.*, &mut first, "array")
+      run key(&render.*, &mut first, "items")
+      run schema(&mut render.*, shapes, element, Facets.none())
+      run itemRules(&mut render.*, &mut first, &facets)
+    }
+    Shape.Optional {value} => {
+      // The rules apply to the value inside; the doc and default describe the whole.
+      let mut inner = Facets.none()
+      run appendAll(&mut inner.wire, List<Constraint>.asSlice(&facets.wire))
+      run appendAll(&mut inner.decoded, List<Constraint>.asSlice(&facets.decoded))
+      let given = List<string<'static>>.asSlice(&facets.notes)
+      let mut index = usize.ZERO
+      while index < given.length {
+        run List<string<'static>>.append(&mut inner.notes, given[index])
+        index = index + usize.ONE
+      }
+      run key(&render.*, &mut first, "anyOf")
+      run emit(&render.*, b"[")
+      run schema(&mut render.*, shapes, value, move inner)
+      run emit(&render.*, b",{\"type\":\"null\"}]")
+      described = false
+    }
+    Shape.Object {info, fields, strict} => {
+      run objectBody(&mut render.*, shapes, &mut first, List<FieldShape>.asSlice(&fields), strict, "", "")
+      if info.doc != "" {
+        let mut text = Description {open: false}
+        run text.next(&render.*, &mut first)
+        run emitEscaped(&render.*, info.doc)
+        run text.close(&render.*)
+      }
+    }
+    Shape.Choice {info, variants} => {
+      run typed(&render.*, &mut first, "string")
+      run key(&render.*, &mut first, "enum")
+      run emit(&render.*, b"[")
+      let choices = List<VariantShape>.asSlice(&variants)
+      let mut index = usize.ZERO
+      while index < choices.length {
+        if index > usize.ZERO { run emit(&render.*, b",") }
+        run emitString(&render.*, choices[index].wire)
+        index = index + usize.ONE
+      }
+      run emit(&render.*, b"]")
+      run choiceDescription(&render.*, &mut first, info.doc, choices)
+    }
+    Shape.Tagged {info, tag, variants} => {
+      let keyword = if render.approximate || render.dialect != JsonSchemaDialect.Standard { "anyOf" } else { "oneOf" }
+      run key(&render.*, &mut first, keyword)
+      run emit(&render.*, b"[")
+      let choices = List<VariantShape>.asSlice(&variants)
+      let mut index = usize.ZERO
+      while index < choices.length {
+        if index > usize.ZERO { run emit(&render.*, b",") }
+        run emit(&render.*, b"{")
+        let mut inner = true
+        run objectBody(&mut render.*, shapes, &mut inner, List<FieldShape>.asSlice(&choices[index].fields), false, tag, choices[index].wire)
+        if choices[index].doc != "" {
+          let mut text = Description {open: false}
+          run text.next(&render.*, &mut inner)
+          run emitEscaped(&render.*, choices[index].doc)
+          run text.close(&render.*)
+        }
+        run emit(&render.*, b"}")
+        index = index + usize.ONE
+      }
+      run emit(&render.*, b"]")
+      if info.doc != "" {
+        let mut text = Description {open: false}
+        run text.next(&render.*, &mut first)
+        run emitEscaped(&render.*, info.doc)
+        run text.close(&render.*)
+      }
+    }
+    Shape.Custom {..} => {}
+    Shape.Pending => {}
+  }
+  if described {
+    run describe(&mut render.*, &mut first, kind, &facets)
+  } else {
+    let mut docOnly = Facets.none()
+    docOnly.doc = facets.doc
+    docOnly.default = facets.default
+    run describe(&mut render.*, &mut first, Kind.Other, &docOnly)
+  }
+  if top { run definitions(&mut render.*, shapes, &mut first) }
+  return run emit(&render.*, b"}")
+}
+
+// Writes `"type": ...`, `"properties"`, `"required"` and `"additionalProperties"` of an object,
+// with a tag property first when `tag` is not empty.
+effect fn objectBody(render: &mut Render, shapes: &Shapes, first: &mut bool, fields: &[FieldShape], strict: bool, tag: string<'static>,
+  variant: string<'static>) -> () ! WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
+  run typed(&render.*, &mut first.*, "object")
+  run key(&render.*, &mut first.*, "properties")
+  run emit(&render.*, b"{")
+  let mut separate = false
+  if tag != "" {
+    run emitString(&render.*, tag)
+    if render.dialect == JsonSchemaDialect.Standard || render.dialect == JsonSchemaDialect.AnthropicStrict {
+      run emit(&render.*, b":{\"const\":")
+      run emitString(&render.*, variant)
+      run emit(&render.*, b"}")
+    } else {
+      run emit(&render.*, b":{\"type\":\"string\",\"enum\":[")
+      run emitString(&render.*, variant)
+      run emit(&render.*, b"]}")
+    }
+    separate = true
+  }
+  let allRequired = render.dialect == JsonSchemaDialect.OpenAiStrict
+  let mut at = usize.ZERO
+  while at < fields.length {
+    if separate { run emit(&render.*, b",") }
+    separate = true
+    run emitString(&render.*, fields[at].wire)
+    run emit(&render.*, b":")
+    let facets = run Facets.ofField(&fields[at])
+    // A strict dialect lists every field as required, so one that may be absent takes null.
+    let nullable = allRequired && !fields[at].required && !isOptional(shapes, fields[at].value)
+    if nullable { run emit(&render.*, b"{\"anyOf\":[") }
+    run schema(&mut render.*, shapes, fields[at].value, move facets)
+    if nullable { run emit(&render.*, b",{\"type\":\"null\"}]}") }
+    at = at + usize.ONE
+  }
+  run emit(&render.*, b"}")
+  let mut count = usize.ZERO
+  at = usize.ZERO
+  while at < fields.length {
+    if allRequired || fields[at].required { count = count + usize.ONE }
+    at = at + usize.ONE
+  }
+  if tag != "" || count > usize.ZERO || allRequired {
+    run key(&render.*, &mut first.*, "required")
+    run emit(&render.*, b"[")
+    separate = false
+    if tag != "" {
+      run emitString(&render.*, tag)
+      separate = true
+    }
+    at = usize.ZERO
+    while at < fields.length {
+      if allRequired || fields[at].required {
+        if separate { run emit(&render.*, b",") }
+        separate = true
+        run emitString(&render.*, fields[at].wire)
+      }
+      at = at + usize.ONE
+    }
+    run emit(&render.*, b"]")
+  }
+  if strict || strictDialect(render.dialect) {
+    run key(&render.*, &mut first.*, "additionalProperties")
+    run emit(&render.*, b"false")
+  }
+  return ()
+}
+
+fn isOptional(shapes: &Shapes, at: ShapeRef) -> bool {
+  if let Shape.Optional {..} = &shapes.get(wireOf(shapes, at)).* { return true }
+  return false
+}
+
+effect fn choiceDescription(render: &Render, first: &mut bool, doc: string<'static>, choices: &[VariantShape]) -> () ! WriterError ? &mut Writer {
+  let mut text = Description {open: false}
+  if doc != "" {
+    run text.next(render, &mut first.*)
+    run emitEscaped(render, doc)
+  }
+  let mut at = usize.ZERO
+  while at < choices.length {
+    if choices[at].doc != "" {
+      run text.next(render, &mut first.*)
+      run emitEscaped(render, choices[at].wire)
+      run emitEscaped(render, ": ")
+      run emitEscaped(render, choices[at].doc)
+    }
+    at = at + usize.ONE
+  }
+  return run text.close(render)
+}
+
+// Whether `constraint` is a keyword of `kind` in the dialect.
+fn expressible(dialect: JsonSchemaDialect, kind: Kind, constraint: Constraint) -> bool {
+  return match constraint {
+    Constraint.Range {..} => (kind == Kind.Integer || kind == Kind.Float) && dialect != JsonSchemaDialect.AnthropicStrict
+    Constraint.Length {..} => kind == Kind.Text && dialect == JsonSchemaDialect.Standard
+    Constraint.Pattern {..} => kind == Kind.Text && dialect != JsonSchemaDialect.Gemini
+    Constraint.Items {..} => kind == Kind.List && dialect != JsonSchemaDialect.AnthropicStrict
+    Constraint.Expected {..} => false
+  }
+}
+
+fn isRule(constraint: Constraint) -> bool {
+  if let Constraint.Expected {..} = constraint { return false }
+  return true
+}
+
+effect fn bounds(render: &mut Render, first: &mut bool, typeMin: Bound, typeMax: Bound, facets: &Facets) -> () ! WriterError ? &mut Writer {
+  let mut min = typeMin
+  let mut max = typeMax
+  let rules = List<Constraint>.asSlice(&facets.wire)
+  let mut at = usize.ZERO
+  while at < rules.length {
+    if let Constraint.Range {min: low, max: high} = rules[at] {
+      min = tighterMin(min, low)
+      max = tighterMax(max, high)
+    }
+    at = at + usize.ONE
+  }
+  if render.dialect == JsonSchemaDialect.AnthropicStrict {
+    if bounded(min) || bounded(max) { render.exact = false }
+    return ()
+  }
+  if bounded(min) {
+    run key(&render.*, &mut first.*, "minimum")
+    run emitBound(&render.*, min)
+  }
+  if bounded(max) {
+    run key(&render.*, &mut first.*, "maximum")
+    run emitBound(&render.*, max)
+  }
+  return ()
+}
+
+effect fn textRules(render: &mut Render, first: &mut bool, facets: &Facets) -> () ! WriterError ? &mut Writer {
+  let rules = List<Constraint>.asSlice(&facets.wire)
+  let mut at = usize.ZERO
+  while at < rules.length {
+    if expressible(render.dialect, Kind.Text, rules[at]) {
+      match rules[at] {
+        Constraint.Length {min, max} => {
+          if min > usize.ZERO {
+            run key(&render.*, &mut first.*, "minLength")
+            run emitUnsigned(&render.*, usize.toU64(min))
+          }
+          if max != usize.MAX {
+            run key(&render.*, &mut first.*, "maxLength")
+            run emitUnsigned(&render.*, usize.toU64(max))
+          }
+        }
+        Constraint.Pattern {source} => {
+          run key(&render.*, &mut first.*, "pattern")
+          run emitString(&render.*, source)
+        }
+        _ => {}
+      }
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+effect fn itemRules(render: &mut Render, first: &mut bool, facets: &Facets) -> () ! WriterError ? &mut Writer {
+  let rules = List<Constraint>.asSlice(&facets.wire)
+  let mut at = usize.ZERO
+  while at < rules.length {
+    if expressible(render.dialect, Kind.List, rules[at]) {
+      if let Constraint.Items {min, max} = rules[at] {
+        if min > usize.ZERO {
+          run key(&render.*, &mut first.*, "minItems")
+          run emitUnsigned(&render.*, usize.toU64(min))
+        }
+        if max != usize.MAX {
+          run key(&render.*, &mut first.*, "maxItems")
+          run emitUnsigned(&render.*, usize.toU64(max))
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Writes the description and default: the doc, then the text of every rule no keyword states,
+// the codec's notes, and the field's expected text, one per line.
+effect fn describe(render: &mut Render, first: &mut bool, kind: Kind, facets: &Facets) -> () ! WriterError ? &mut Writer {
+  let mut text = Description {open: false}
+  if facets.doc != "" {
+    run text.next(&render.*, &mut first.*)
+    run emitEscaped(&render.*, facets.doc)
+  }
+  let wire = List<Constraint>.asSlice(&facets.wire)
+  let decoded = List<Constraint>.asSlice(&facets.decoded)
+  let mut expected = false
+  let mut at = usize.ZERO
+  while at < wire.length {
+    if let Constraint.Expected {..} = wire[at] { expected = true }
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < decoded.length {
+    if let Constraint.Expected {..} = decoded[at] { expected = true }
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < wire.length {
+    if isRule(wire[at]) && !expressible(render.dialect, kind, wire[at]) {
+      render.exact = false
+      if !expected { run ruleLine(&render.*, &mut text, &mut first.*, wire[at]) }
+    }
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < decoded.length {
+    if isRule(decoded[at]) {
+      render.exact = false
+      if !expected { run ruleLine(&render.*, &mut text, &mut first.*, decoded[at]) }
+    }
+    at = at + usize.ONE
+  }
+  let notes = List<string<'static>>.asSlice(&facets.notes)
+  at = usize.ZERO
+  while at < notes.length {
+    render.exact = false
+    run text.next(&render.*, &mut first.*)
+    run emitEscaped(&render.*, "Expected ")
+    run emitEscaped(&render.*, notes[at])
+    run emitEscaped(&render.*, ".")
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < wire.length {
+    if let Constraint.Expected {text: wanted} = wire[at] { run expectedLine(&render.*, &mut text, &mut first.*, wanted) }
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < decoded.length {
+    if let Constraint.Expected {text: wanted} = decoded[at] { run expectedLine(&render.*, &mut text, &mut first.*, wanted) }
+    at = at + usize.ONE
+  }
+  if let Option<Literal>.Some {value} = facets.default {
+    if render.dialect != JsonSchemaDialect.Standard {
+      run text.next(&render.*, &mut first.*)
+      run emitEscaped(&render.*, "Default: ")
+      run emitLiteralText(&render.*, value)
+      run emitEscaped(&render.*, ".")
+    }
+  }
+  run text.close(&render.*)
+  if let Option<Literal>.Some {value} = facets.default {
+    if render.dialect == JsonSchemaDialect.Standard {
+      run key(&render.*, &mut first.*, "default")
+      run emitLiteral(&render.*, value)
+    }
+  }
+  return ()
+}
+
+effect fn ruleLine(render: &Render, text: &mut Description, first: &mut bool, rule: Constraint) -> () ! WriterError ? &mut Writer {
+  run text.next(render, &mut first.*)
+  run emitEscaped(render, "Expected ")
+  run emitConstraintText(render, rule)
+  return run emitEscaped(render, ".")
+}
+
+effect fn expectedLine(render: &Render, text: &mut Description, first: &mut bool, wanted: string<'static>) -> () ! WriterError ? &mut Writer {
+  run text.next(render, &mut first.*)
+  run emitEscaped(render, "Expected ")
+  run emitEscaped(render, wanted)
+  return run emitEscaped(render, ".")
+}
+
+// A `"description"` written in parts, one line each.
+struct Description {
+  open: bool,
+}
+
+impl Description {
+  effect fn next(self: &mut Self, render: &Render, first: &mut bool) -> () ! WriterError ? &mut Writer {
+    if self.open { return run emit(render, b"\\n") }
+    self.open = true
+    run key(render, &mut first.*, "description")
+    return run emit(render, b"\"")
+  }
+
+  effect fn close(self: &mut Self, render: &Render) -> () ! WriterError ? &mut Writer {
+    if !self.open { return () }
+    self.open = false
+    return run emit(render, b"\"")
+  }
+}
+
+// Writes the text of a rule, as `silk.schema.schema.constraintText` gives it.
+effect fn emitConstraintText(render: &Render, constraint: Constraint) -> () ! WriterError ? &mut Writer {
+  match constraint {
+    Constraint.Range {min, max} => {
+      let mut float = false
+      if let Bound.Float {..} = min { float = true }
+      if let Bound.Float {..} = max { float = true }
+      run emit(render, if float { b"a number" } else { b"an integer" })
+      if !bounded(min) {
+        run emit(render, b" of at most ")
+        run emitBound(render, max)
+      } else if !bounded(max) {
+        run emit(render, b" of at least ")
+        run emitBound(render, min)
+      } else {
+        run emit(render, b" from ")
+        run emitBound(render, min)
+        run emit(render, b" to ")
+        run emitBound(render, max)
+      }
+    }
+    Constraint.Length {min, max} => {
+      run emit(render, b"text of ")
+      run emitSpan(render, min, max, "character", "characters")
+    }
+    Constraint.Items {min, max} => {
+      run emit(render, b"a list of ")
+      run emitSpan(render, min, max, "element", "elements")
+    }
+    Constraint.Pattern {source} => {
+      run emit(render, b"text that matches /")
+      run emitEscaped(render, source)
+      run emit(render, b"/")
+    }
+    Constraint.Expected {text} => { run emitEscaped(render, text) }
+  }
+  return ()
+}
+
+effect fn emitSpan(render: &Render, min: usize, max: usize, one: string<'static>, many: string<'static>) -> () ! WriterError ? &mut Writer {
+  if max == usize.MAX {
+    run emit(render, b"at least ")
+    return run emitCount(render, min, one, many)
+  }
+  if min == usize.ZERO {
+    run emit(render, b"at most ")
+    return run emitCount(render, max, one, many)
+  }
+  if min == max { return run emitCount(render, min, one, many) }
+  run emitUnsigned(render, usize.toU64(min))
+  run emit(render, b" to ")
+  return run emitCount(render, max, one, many)
+}
+
+effect fn emitCount(render: &Render, count: usize, one: string<'static>, many: string<'static>) -> () ! WriterError ? &mut Writer {
+  run emitUnsigned(render, usize.toU64(count))
+  run emit(render, b" ")
+  return run emitEscaped(render, if count == usize.ONE { one } else { many })
+}
+
+fn bounded(bound: Bound) -> bool {
+  if let Bound.None = bound { return false }
+  return true
+}
+
+// Whether bound `left` is below bound `right`; neither is `Bound.None`.
+fn below(left: Bound, right: Bound) -> bool {
+  return match left {
+    Bound.Signed {value: a} => match right {
+      Bound.Signed {value: b} => a < b
+      Bound.Unsigned {value: b} => a < 0 || i64.toU64(a) < b
+      Bound.Float {value: b} => i64.toF64(a) < b
+      Bound.None => false
+    }
+    Bound.Unsigned {value: a} => match right {
+      Bound.Signed {value: b} => b >= 0 && a < i64.toU64(b)
+      Bound.Unsigned {value: b} => a < b
+      Bound.Float {value: b} => u64.toF64(a) < b
+      Bound.None => false
+    }
+    Bound.Float {value: a} => match right {
+      Bound.Signed {value: b} => a < i64.toF64(b)
+      Bound.Unsigned {value: b} => a < u64.toF64(b)
+      Bound.Float {value: b} => a < b
+      Bound.None => false
+    }
+    Bound.None => false
+  }
+}
+
+fn tighterMin(current: Bound, rule: Bound) -> Bound {
+  if !bounded(rule) { return current }
+  if !bounded(current) || below(current, rule) { return rule }
+  return current
+}
+
+fn tighterMax(current: Bound, rule: Bound) -> Bound {
+  if !bounded(rule) { return current }
+  if !bounded(current) || below(rule, current) { return rule }
+  return current
+}
+
+effect fn emit(render: &Render, bytes: &[u8]) -> () ! WriterError ? &mut Writer {
+  if !render.writing { return () }
+  return run Writer.writeAll(bytes)
+}
+
+effect fn key(render: &Render, first: &mut bool, name: string) -> () ! WriterError ? &mut Writer {
+  if !first.* { run emit(render, b",") }
+  first.* = false
+  run emitString(render, name)
+  return run emit(render, b":")
+}
+
+effect fn typed(render: &Render, first: &mut bool, name: string) -> () ! WriterError ? &mut Writer {
+  run key(render, &mut first.*, "type")
+  return run emitString(render, name)
+}
+
+effect fn emitString(render: &Render, text: string) -> () ! WriterError ? &mut Writer {
+  run emit(render, b"\"")
+  run emitEscaped(render, text)
+  return run emit(render, b"\"")
+}
+
+// Writes `text` as the inside of a JSON string.
+effect fn emitEscaped(render: &Render, text: string) -> () ! WriterError ? &mut Writer {
+  let bytes = String.utf8Bytes(text)
+  let mut start = usize.ZERO
+  let mut at = usize.ZERO
+  while at < bytes.length {
+    let byte = bytes[at]
+    if byte == 34 || byte == 92 || byte < 32 {
+      run emit(render, Slice.view<u8>(bytes, start, at - start))
+      if byte == 34 {
+        run emit(render, b"\\\"")
+      } else if byte == 92 {
+        run emit(render, b"\\\\")
+      } else if byte == 10 {
+        run emit(render, b"\\n")
+      } else if byte == 9 {
+        run emit(render, b"\\t")
+      } else if byte == 13 {
+        run emit(render, b"\\r")
+      } else {
+        let hex = b"0123456789abcdef"
+        run emit(render, b"\\u00")
+        run emit(render, Slice.view<u8>(hex, u8.toUsize(byte / 16), usize.ONE))
+        run emit(render, Slice.view<u8>(hex, u8.toUsize(byte % 16), usize.ONE))
+      }
+      start = at + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return run emit(render, Slice.view<u8>(bytes, start, bytes.length - start))
+}
+
+// Writes a type name as a `$defs` key that a `$ref` can name without escapes: `Box<List<u16>>`
+// becomes `Box_List_u16`.
+effect fn emitDefinitionName(render: &Render, name: string) -> () ! WriterError ? &mut Writer {
+  let bytes = String.utf8Bytes(name)
+  let mut at = usize.ZERO
+  while at < bytes.length {
+    let byte = bytes[at]
+    let letter = (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95
+    if letter {
+      run emit(render, Slice.view<u8>(bytes, at, usize.ONE))
+    } else if byte == 60 || byte == 44 {
+      run emit(render, b"_")
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+effect fn emitUnsigned(render: &Render, value: u64) -> () ! WriterError ? &mut Writer {
+  let mut digits: [u8; 24] = [0; 24]
+  let end = Format.writeU64Display(value, &mut digits, usize.ZERO)
+  return run emit(render, Slice.view<u8>(&digits, usize.ZERO, end))
+}
+
+effect fn emitSigned(render: &Render, value: i64) -> () ! WriterError ? &mut Writer {
+  let mut digits: [u8; 24] = [0; 24]
+  let end = Format.writeI64Display(value, &mut digits, usize.ZERO)
+  return run emit(render, Slice.view<u8>(&digits, usize.ZERO, end))
+}
+
+effect fn emitFloat(render: &Render, value: f64) -> () ! WriterError ? &mut Writer {
+  let mut digits: [u8; 32] = [0; 32]
+  let end = Format.writeF64Debug(value, &mut digits, usize.ZERO)
+  return run emit(render, Slice.view<u8>(&digits, usize.ZERO, end))
+}
+
+effect fn emitBound(render: &Render, bound: Bound) -> () ! WriterError ? &mut Writer {
+  return match bound {
+    Bound.Signed {value} => run emitSigned(render, value)
+    Bound.Unsigned {value} => run emitUnsigned(render, value)
+    Bound.Float {value} => run emitFloat(render, value)
+    Bound.None => ()
+  }
+}
+
+effect fn emitLiteral(render: &Render, literal: Literal) -> () ! WriterError ? &mut Writer {
+  return match literal {
+    Literal.Boolean {value} => run emit(render, if value { b"true" } else { b"false" })
+    Literal.Integer {value} => run emitSigned(render, value)
+    Literal.Number {value} => run emitFloat(render, value)
+    Literal.Text {value} => run emitString(render, value)
+  }
+}
+
+// Writes a literal inside a JSON string, as JSON would show it.
+effect fn emitLiteralText(render: &Render, literal: Literal) -> () ! WriterError ? &mut Writer {
+  return match literal {
+    Literal.Text {value} => {
+      run emit(render, b"\\\"")
+      run emitEscaped(render, value)
+      run emit(render, b"\\\"")
+    }
+    _ => run emitLiteral(render, literal)
+  }
+}
