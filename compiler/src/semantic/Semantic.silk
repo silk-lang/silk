@@ -10943,23 +10943,40 @@ effect fn observeSuccessLocations(resolver: &mut Resolver, value: &Value) -> ()
 // recordSourceInput already does. Request/resolution snapshots are checked eagerly on import.
 struct PendingSharedBody {unit: usize, context: Bytes, payload: Bytes}
 struct ImportedBodyGuard {offset: usize, unit: usize}
+enum SharedGuardRefusal { None, Semantic, Limit, Exhausted, Unavailable, Contention }
+struct SharedGuardSlot {offset: usize, refusal: SharedGuardRefusal, imported: bool}
+impl Copy for SharedGuardSlot {}
+fn sharedGuardReady(offset: usize) -> SharedGuardSlot {
+  return SharedGuardSlot {offset: offset, refusal: SharedGuardRefusal.None, imported: false}
+}
+fn sharedGuardRefused(reason: SharedGuardRefusal) -> SharedGuardSlot {
+  return SharedGuardSlot {offset: unfit(), refusal: reason, imported: false}
+}
+effect fn sharedGuardSlotFor(slots: &mut List<SharedGuardSlot>, at: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  while List<SharedGuardSlot>.length(&slots.*) <= at { run List<SharedGuardSlot>.append(&mut slots.*, sharedGuardReady(unreached())) }
+}
 struct SharedBodies {
   arena: SharedBodyArena.Arena,
   active: bool,
-  units: List<usize>, files: List<usize>, inputs: List<usize>,
+  units: List<SharedGuardSlot>, files: List<SharedGuardSlot>, inputs: List<SharedGuardSlot>,
   imported: List<ImportedBodyGuard>, importedLookup: InternIndex,
   pending: List<PendingSharedBody>,
   eligible: usize, misses: usize, encoded: usize, refused: usize,
   guardRefused: usize, guardContextNodes: usize, guardCycleNodes: usize, guardLimitNodes: usize,
   published: usize, avoided: usize, bytes: usize,
   codecReasons: [usize; 9],
+  appendAttempts: [usize; 4], appendBytes: [usize; 4],
+  guardSemantic: usize, guardLimit: usize, guardExhausted: usize, guardUnavailable: usize, guardContention: usize,
+  guardImportRefused: usize, importedGuardReuses: usize,
 }
 fn noSharedBodies() -> SharedBodies {
   return SharedBodies {arena: SharedBodyArena.empty(), active: false,
-    units: List<usize>.make(), files: List<usize>.make(), inputs: List<usize>.make(),
+    units: List<SharedGuardSlot>.make(), files: List<SharedGuardSlot>.make(), inputs: List<SharedGuardSlot>.make(),
     imported: List<ImportedBodyGuard>.make(), importedLookup: InternIndex.make(), pending: List<PendingSharedBody>.make(),
     eligible: 0, misses: 0, encoded: 0, refused: 0, guardRefused: 0, guardContextNodes: 0, guardCycleNodes: 0, guardLimitNodes: 0,
-    published: 0, avoided: 0, bytes: 0, codecReasons: [0, 0, 0, 0, 0, 0, 0, 0, 0]}
+    published: 0, avoided: 0, bytes: 0, codecReasons: [0, 0, 0, 0, 0, 0, 0, 0, 0],
+    appendAttempts: [0, 0, 0, 0], appendBytes: [0, 0, 0, 0], guardSemantic: 0, guardLimit: 0,
+    guardExhausted: 0, guardUnavailable: 0, guardContention: 0, guardImportRefused: 0, importedGuardReuses: 0}
 }
 fn closeSharedBodies(resolver: &mut Resolver) -> () {
   SharedBodyArena.close(&mut resolver.sharedBodies.arena)
@@ -10973,6 +10990,9 @@ fn childSharedBodies(resolver: &mut Resolver) -> () {
   state.guardRefused = 0 state.guardContextNodes = 0 state.guardCycleNodes = 0 state.guardLimitNodes = 0
   state.published = 0 state.avoided = 0 state.bytes = 0
   state.codecReasons = [0, 0, 0, 0, 0, 0, 0, 0, 0]
+  state.appendAttempts = [0, 0, 0, 0] state.appendBytes = [0, 0, 0, 0]
+  state.guardSemantic = 0 state.guardLimit = 0 state.guardExhausted = 0
+  state.guardUnavailable = 0 state.guardContention = 0 state.guardImportRefused = 0 state.importedGuardReuses = 0
 }
 effect fn sharedBodyContext(resolver: &Resolver, unit: usize) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
   if !resolver.sharedBodies.active || resolver.revisable || !Graph.recording(&resolver.graph)
@@ -11004,25 +11024,60 @@ effect fn sharedBodyContext(resolver: &Resolver, unit: usize) -> Option<Bytes> !
   if Bytes.length(&context) > 65536 { return Option<Bytes>.none() }
   return Option<Bytes>.some(move context)
 }
-effect fn sharedGuardLeaf(resolver: &mut Resolver, dependee: Dependee) -> usize ! OutOfMemoryError ? &mut Allocator {
+// Per-process aggregate counters, reset on private forks. Bytes count successful physical
+// appends including headers/alignment; directory publication and payload counters remain separate.
+fn appendSharedBodyRecord(resolver: &mut Resolver, kind: u64, bytes: &[u8]) -> SharedGuardSlot {
+  let index = u64.toUsize(kind)
+  resolver.sharedBodies.appendAttempts[index] = resolver.sharedBodies.appendAttempts[index] + usize.ONE
+  let result = SharedBodyArena.appendDetailed(&resolver.sharedBodies.arena, kind, bytes)
+  if result.offset != usize.MAX {
+    resolver.sharedBodies.appendBytes[index] = resolver.sharedBodies.appendBytes[index] + ((bytes.length + 39) / 8) * 8
+    return sharedGuardReady(result.offset)
+  }
+  return sharedGuardRefused(match result.refusal {
+    SharedBodyArena.AppendRefusal.Exhausted => SharedGuardRefusal.Exhausted
+    SharedBodyArena.AppendRefusal.Contention => SharedGuardRefusal.Contention
+    SharedBodyArena.AppendRefusal.TooLarge => SharedGuardRefusal.Limit
+    _ => SharedGuardRefusal.Unavailable
+  })
+}
+fn countSharedGuardRefusal(resolver: &mut Resolver, reason: SharedGuardRefusal) -> () {
+  let state = &mut resolver.sharedBodies
+  state.guardRefused = state.guardRefused + usize.ONE
+  match reason {
+    SharedGuardRefusal.Semantic => { state.guardSemantic = state.guardSemantic + usize.ONE }
+    SharedGuardRefusal.Limit => { state.guardLimit = state.guardLimit + usize.ONE }
+    SharedGuardRefusal.Exhausted => { state.guardExhausted = state.guardExhausted + usize.ONE }
+    SharedGuardRefusal.Unavailable => { state.guardUnavailable = state.guardUnavailable + usize.ONE }
+    SharedGuardRefusal.Contention => { state.guardContention = state.guardContention + usize.ONE }
+    SharedGuardRefusal.None => {}
+  }
+}
+effect fn sharedGuardLeaf(resolver: &mut Resolver, dependee: Dependee) -> SharedGuardSlot ! OutOfMemoryError ? &mut Allocator {
   match dependee {
     Dependee.SourceFile {module} => {
-      run slotFor(&mut resolver.sharedBodies.files, module)
-      let previous = List<usize>.get(&resolver.sharedBodies.files, module)
-      if previous != unreached() { return previous }
-      if module >= List<ModuleId>.length(&resolver.modules) { return unfit() }
+      run sharedGuardSlotFor(&mut resolver.sharedBodies.files, module)
+      let previous = List<SharedGuardSlot>.get(&resolver.sharedBodies.files, module)
+      if previous.offset != unreached() { return previous }
+      if module >= List<ModuleId>.length(&resolver.modules) { return sharedGuardRefused(SharedGuardRefusal.Semantic) }
       let mut bytes = Bytes.make()
       run StableKey.module(&mut bytes, &List<ModuleId>.asSlice(&resolver.modules)[module])
-      let added = SharedBodyArena.append(&resolver.sharedBodies.arena, 1, Bytes.asSlice(&bytes))
-      let result = if added == usize.MAX { unfit() } else { added }
-      List<usize>.set(&mut resolver.sharedBodies.files, module, result)
+      let result = appendSharedBodyRecord(&mut resolver.*, 1, Bytes.asSlice(&bytes))
+      List<SharedGuardSlot>.set(&mut resolver.sharedBodies.files, module, result)
       return result
     }
     Dependee.SourceInput {input, ..} => {
-      run slotFor(&mut resolver.sharedBodies.inputs, input)
-      let previous = List<usize>.get(&resolver.sharedBodies.inputs, input)
-      if previous != unreached() { return previous }
-      let key = match move run stableInput(&resolver.*, input) { Option<Bytes>.Some {value} => move value _ => { return unfit() } }
+      run sharedGuardSlotFor(&mut resolver.sharedBodies.inputs, input)
+      let previous = List<SharedGuardSlot>.get(&resolver.sharedBodies.inputs, input)
+      if previous.offset != unreached() { return previous }
+      let key = match move run stableInput(&resolver.*, input) {
+        Option<Bytes>.Some {value} => move value
+        _ => {
+          let refused = sharedGuardRefused(SharedGuardRefusal.Semantic)
+          List<SharedGuardSlot>.set(&mut resolver.sharedBodies.inputs, input, refused)
+          return refused
+        }
+      }
       let value = &List<Inputs.Input>.asSlice(&resolver.sourceInputs.inputs)[input]
       let mut bytes = Bytes.make()
       run RuntimeEncoding.field(&mut bytes, Bytes.asSlice(&key))
@@ -11031,78 +11086,83 @@ effect fn sharedGuardLeaf(resolver: &mut Resolver, dependee: Dependee) -> usize 
       run RuntimeEncoding.word(&mut bytes, value.digest.low)
       run RuntimeEncoding.word(&mut bytes, value.text.high)
       run RuntimeEncoding.word(&mut bytes, value.text.low)
-      let added = SharedBodyArena.append(&resolver.sharedBodies.arena, 2, Bytes.asSlice(&bytes))
-      let result = if added == usize.MAX { unfit() } else { added }
-      List<usize>.set(&mut resolver.sharedBodies.inputs, input, result)
+      let result = appendSharedBodyRecord(&mut resolver.*, 2, Bytes.asSlice(&bytes))
+      List<SharedGuardSlot>.set(&mut resolver.sharedBodies.inputs, input, result)
       return result
     }
-    Dependee.UnitResult {..} => { return unfit() }
+    Dependee.UnitResult {..} => { return sharedGuardRefused(SharedGuardRefusal.Semantic) }
   }
 }
-// Memoized DAG export, never a per-body transitive flatten. A backedge or unsupported mutable
-// scope refuses the capsule; a partial append remains unreachable until a complete READY body.
-effect fn sharedGuardUnit(resolver: &mut Resolver, unit: usize, depth: usize, remaining: &mut usize) -> usize
+// Memoized DAG export, never a per-body transitive flatten. Failure reasons travel through
+// cached entries too: arena exhaustion must not later be counted as a semantic restriction.
+effect fn sharedGuardUnit(resolver: &mut Resolver, unit: usize, depth: usize, remaining: &mut usize) -> SharedGuardSlot
 ! OutOfMemoryError ? &mut Allocator {
   if depth >= 256 || remaining.* == usize.ZERO || unit >= List<ScopedKey>.length(&resolver.keys) {
     resolver.sharedBodies.guardLimitNodes = resolver.sharedBodies.guardLimitNodes + usize.ONE
-    return unfit()
+    return sharedGuardRefused(SharedGuardRefusal.Limit)
   }
   remaining.* = remaining.* - usize.ONE
-  run slotFor(&mut resolver.sharedBodies.units, unit)
-  let previous = List<usize>.get(&resolver.sharedBodies.units, unit)
-  if previous != unreached() {
-    if previous == entered() { resolver.sharedBodies.guardCycleNodes = resolver.sharedBodies.guardCycleNodes + usize.ONE return unfit() }
+  run sharedGuardSlotFor(&mut resolver.sharedBodies.units, unit)
+  let previous = List<SharedGuardSlot>.get(&resolver.sharedBodies.units, unit)
+  if previous.offset != unreached() {
+    if previous.offset == entered() {
+      resolver.sharedBodies.guardCycleNodes = resolver.sharedBodies.guardCycleNodes + usize.ONE
+      return sharedGuardRefused(SharedGuardRefusal.Semantic)
+    }
+    if previous.imported { resolver.sharedBodies.importedGuardReuses = resolver.sharedBodies.importedGuardReuses + usize.ONE }
     return previous
   }
   let scope = List<ScopedKey>.get(&resolver.keys, unit)
   if Graph.state(&resolver.graph, unit) != UnitState.UpToDate {
     resolver.sharedBodies.guardCycleNodes = resolver.sharedBodies.guardCycleNodes + usize.ONE
-    List<usize>.set(&mut resolver.sharedBodies.units, unit, unfit())
-    return unfit()
+    let refused = sharedGuardRefused(SharedGuardRefusal.Semantic)
+    List<SharedGuardSlot>.set(&mut resolver.sharedBodies.units, unit, refused)
+    return refused
   }
   // Adopted named checks can carry evidence outside their local Graph node. Only our
   // synthetic name8 conjunctions are self-contained ModuleCheck guards.
   if scope.origin.slot != u32.MAX || scope.condition != usize.MAX || readsDemandPath(scope.key)
     || (scope.key.family == Family.ModuleCheck && scope.key.name != 8) {
     resolver.sharedBodies.guardContextNodes = resolver.sharedBodies.guardContextNodes + usize.ONE
-    List<usize>.set(&mut resolver.sharedBodies.units, unit, unfit())
-    return unfit()
+    let refused = sharedGuardRefused(SharedGuardRefusal.Semantic)
+    List<SharedGuardSlot>.set(&mut resolver.sharedBodies.units, unit, refused)
+    return refused
   }
-  List<usize>.set(&mut resolver.sharedBodies.units, unit, entered())
+  List<SharedGuardSlot>.set(&mut resolver.sharedBodies.units, unit, sharedGuardReady(entered()))
   let mut children = List<usize>.make()
   let mut edge = Graph.firstEdgeOf(&resolver.graph, unit)
-  let mut fit = true
-  while edge != usize.MAX && fit {
-    if List<usize>.length(&children) >= 8192 { fit = false break }
+  let mut refusal = SharedGuardRefusal.None
+  while edge != usize.MAX && refusal == SharedGuardRefusal.None {
+    if List<usize>.length(&children) >= 8192 { refusal = SharedGuardRefusal.Limit break }
     let dependee = Graph.dependeeOf(&resolver.graph, edge)
     edge = Graph.nextEdgeOf(&resolver.graph, edge)
     let child = match dependee {
       Dependee.UnitResult {unit: nested} => run sharedGuardUnit(&mut resolver.*, nested, depth + usize.ONE, &mut remaining.*)
       _ => run sharedGuardLeaf(&mut resolver.*, dependee)
     }
-    if child >= unfit() { fit = false } else { run List<usize>.append(&mut children, child) }
+    if child.refusal != SharedGuardRefusal.None { refusal = child.refusal }
+    else { run List<usize>.append(&mut children, child.offset) }
   }
-  let mut result = unfit()
-  if fit {
+  let mut result = sharedGuardRefused(refusal)
+  if refusal == SharedGuardRefusal.None {
     let mut bytes = Bytes.make()
     run RuntimeEncoding.word(&mut bytes, usize.toU64(List<usize>.length(&children)))
     let values = List<usize>.asSlice(&children)
     let mut at = usize.ZERO
     while at < values.length { run RuntimeEncoding.word(&mut bytes, usize.toU64(values[at])) at = at + usize.ONE }
-    let added = SharedBodyArena.append(&resolver.sharedBodies.arena, 0, Bytes.asSlice(&bytes))
-    if added != usize.MAX { result = added }
+    result = appendSharedBodyRecord(&mut resolver.*, 0, Bytes.asSlice(&bytes))
   }
-  List<usize>.set(&mut resolver.sharedBodies.units, unit, result)
+  List<SharedGuardSlot>.set(&mut resolver.sharedBodies.units, unit, result)
   return result
 }
-// Check and memoize completed children before paying for typed payload encoding. The Body
-// itself is still running; its final node and any later positional reads are exported on finish.
-effect fn prepareSharedBodyGuard(resolver: &mut Resolver, unit: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
+// Check completed children before encoding. The Body's final node and later positional reads
+// are exported only after finishRun; this preflight never publishes its unfinished root.
+effect fn prepareSharedBodyGuard(resolver: &mut Resolver, unit: usize) -> SharedGuardRefusal ! OutOfMemoryError ? &mut Allocator {
   let mut remaining: usize = 8192
   let mut edge = Graph.firstEdgeOf(&resolver.graph, unit)
   let mut inspected = usize.ZERO
   while edge != usize.MAX {
-    if inspected >= 8192 { resolver.sharedBodies.guardLimitNodes = resolver.sharedBodies.guardLimitNodes + usize.ONE return false }
+    if inspected >= 8192 { resolver.sharedBodies.guardLimitNodes = resolver.sharedBodies.guardLimitNodes + usize.ONE return SharedGuardRefusal.Limit }
     inspected = inspected + usize.ONE
     let dependee = Graph.dependeeOf(&resolver.graph, edge)
     edge = Graph.nextEdgeOf(&resolver.graph, edge)
@@ -11110,9 +11170,9 @@ effect fn prepareSharedBodyGuard(resolver: &mut Resolver, unit: usize) -> bool !
       Dependee.UnitResult {unit: child} => run sharedGuardUnit(&mut resolver.*, child, usize.ONE, &mut remaining)
       _ => run sharedGuardLeaf(&mut resolver.*, dependee)
     }
-    if ready >= unfit() { return false }
+    if ready.refusal != SharedGuardRefusal.None { return ready.refusal }
   }
-  return true
+  return SharedGuardRefusal.None
 }
 // Encodes while the provider still owns the final TypedBody; Shared's exclusive callback is not
 // crossed by effectful serialization. The publication hook runs only after Graph.finishRun.
@@ -11120,10 +11180,8 @@ effect fn stageSharedBody(resolver: &mut Resolver, body: &TypedBody) -> () ! Out
   let unit = recordingUnit(&resolver.*)
   let context = match move run sharedBodyContext(&resolver.*, unit) { Option<Bytes>.Some {value} => move value _ => { return () } }
   if SharedBodyArena.find(&resolver.sharedBodies.arena, Bytes.asSlice(&context)) != usize.MAX { return () }
-  if !run prepareSharedBodyGuard(&mut resolver.*, unit) {
-    resolver.sharedBodies.guardRefused = resolver.sharedBodies.guardRefused + usize.ONE
-    return ()
-  }
+  let guardRefusal = run prepareSharedBodyGuard(&mut resolver.*, unit)
+  if guardRefusal != SharedGuardRefusal.None { countSharedGuardRefusal(&mut resolver.*, guardRefusal) return () }
   let encoded = run BodyCapsule.encodeDetailed(body, Bytes.asSlice(&context))
   let reason = if encoded.reason > BodyWire.NONE && encoded.reason < BodyWire.REASON_COUNT { encoded.reason } else { BodyWire.OTHER }
   let bytes = match move encoded.bytes {
@@ -11147,13 +11205,14 @@ effect fn publishSharedBody(resolver: &mut Resolver, unit: usize) -> () ! OutOfM
   let held = List<PendingSharedBody>.remove(&mut resolver.sharedBodies.pending, at)
   let mut remaining: usize = 8192
   let guard = run sharedGuardUnit(&mut resolver.*, unit, usize.ZERO, &mut remaining)
-  if guard >= unfit() { resolver.sharedBodies.guardRefused = resolver.sharedBodies.guardRefused + usize.ONE return () }
+  if guard.refusal != SharedGuardRefusal.None { countSharedGuardRefusal(&mut resolver.*, guard.refusal) return () }
   let mut bytes = Bytes.make()
-  run RuntimeEncoding.word(&mut bytes, usize.toU64(guard))
+  run RuntimeEncoding.word(&mut bytes, usize.toU64(guard.offset))
   run RuntimeEncoding.field(&mut bytes, Bytes.asSlice(&held.context))
   run RuntimeEncoding.field(&mut bytes, Bytes.asSlice(&held.payload))
-  let offset = SharedBodyArena.append(&resolver.sharedBodies.arena, 3, Bytes.asSlice(&bytes))
-  if offset != usize.MAX && SharedBodyArena.publish(&resolver.sharedBodies.arena, Bytes.asSlice(&held.context), offset) {
+  let stored = appendSharedBodyRecord(&mut resolver.*, 3, Bytes.asSlice(&bytes))
+  let offset = stored.offset
+  if stored.refusal == SharedGuardRefusal.None && SharedBodyArena.publish(&resolver.sharedBodies.arena, Bytes.asSlice(&held.context), offset) {
     resolver.sharedBodies.published = resolver.sharedBodies.published + usize.ONE
     resolver.sharedBodies.bytes = resolver.sharedBodies.bytes + Bytes.length(&bytes)
   }
@@ -11168,6 +11227,21 @@ impl Semantic {
     run frontierTrace(b"body-share encoded", self.frontierSplit, self.frontierWorker, state.encoded)
     run frontierTrace(b"body-share unsupported", self.frontierSplit, self.frontierWorker, state.refused)
     run frontierTrace(b"body-share guard-refused", self.frontierSplit, self.frontierWorker, state.guardRefused)
+    run frontierTrace(b"body-share guard-semantic", self.frontierSplit, self.frontierWorker, state.guardSemantic)
+    run frontierTrace(b"body-share guard-resource", self.frontierSplit, self.frontierWorker, state.guardLimit)
+    run frontierTrace(b"body-share guard-exhausted", self.frontierSplit, self.frontierWorker, state.guardExhausted)
+    run frontierTrace(b"body-share guard-unavailable", self.frontierSplit, self.frontierWorker, state.guardUnavailable)
+    run frontierTrace(b"body-share guard-contention", self.frontierSplit, self.frontierWorker, state.guardContention)
+    run frontierTrace(b"body-share guard-import-invalid", self.frontierSplit, self.frontierWorker, state.guardImportRefused)
+    run frontierTrace(b"body-share guard-imported-offset-reuse", self.frontierSplit, self.frontierWorker, state.importedGuardReuses)
+    run frontierTrace(b"body-share append-dag-attempts", self.frontierSplit, self.frontierWorker, state.appendAttempts[0])
+    run frontierTrace(b"body-share append-dag-bytes", self.frontierSplit, self.frontierWorker, state.appendBytes[0])
+    run frontierTrace(b"body-share append-file-attempts", self.frontierSplit, self.frontierWorker, state.appendAttempts[1])
+    run frontierTrace(b"body-share append-file-bytes", self.frontierSplit, self.frontierWorker, state.appendBytes[1])
+    run frontierTrace(b"body-share append-input-attempts", self.frontierSplit, self.frontierWorker, state.appendAttempts[2])
+    run frontierTrace(b"body-share append-input-bytes", self.frontierSplit, self.frontierWorker, state.appendBytes[2])
+    run frontierTrace(b"body-share append-body-attempts", self.frontierSplit, self.frontierWorker, state.appendAttempts[3])
+    run frontierTrace(b"body-share append-body-bytes", self.frontierSplit, self.frontierWorker, state.appendBytes[3])
     run frontierTrace(b"body-share guard-context-nodes", self.frontierSplit, self.frontierWorker, state.guardContextNodes)
     run frontierTrace(b"body-share guard-cycle-nodes", self.frontierSplit, self.frontierWorker, state.guardCycleNodes)
     run frontierTrace(b"body-share guard-limit-nodes", self.frontierSplit, self.frontierWorker, state.guardLimitNodes)
@@ -11265,6 +11339,9 @@ effect fn importSharedGuard(resolver: &mut Resolver, offset: usize, depth: usize
   let mut at = usize.ZERO
   while at < edges.length { run Graph.record(&mut resolver.graph, unit, edges[at]) at = at + usize.ONE }
   drop run Graph.finishRun(&mut resolver.graph, unit, Option<ContentHash>.none())
+  run sharedGuardSlotFor(&mut resolver.sharedBodies.units, unit)
+  List<SharedGuardSlot>.set(&mut resolver.sharedBodies.units, unit,
+    SharedGuardSlot {offset: offset, refusal: SharedGuardRefusal.None, imported: true})
   run List<ImportedBodyGuard>.append(&mut resolver.sharedBodies.imported, ImportedBodyGuard {offset: offset, unit: unit})
   run InternIndex.record(&mut resolver.sharedBodies.importedLookup, usize.toU64(offset))
   return unit
@@ -11289,13 +11366,22 @@ effect fn importSharedBody(resolver: &mut Resolver, unit: usize) -> Option<Answe
   }
   let mut remaining: usize = 8192
   let imported = run importSharedGuard(&mut resolver.*, guard, usize.ZERO, &mut remaining)
-  if imported == usize.MAX { resolver.sharedBodies.guardRefused = resolver.sharedBodies.guardRefused + usize.ONE return Option<Answer>.none() }
+  if imported == usize.MAX {
+    resolver.sharedBodies.guardRefused = resolver.sharedBodies.guardRefused + usize.ONE
+    resolver.sharedBodies.guardImportRefused = resolver.sharedBodies.guardImportRefused + usize.ONE
+    return Option<Answer>.none()
+  }
   // Allocate the answer before marking its unit current. An unsuccessful import publishes no
   // Body result; completed intermediate guard nodes are independent, valid and safe to retain.
   let answer = Answer {outcome: Outcome.Success {value: Value.Body {body: run Shared<TypedBody>.make(move body)}}, dependencies: List<Dependency>.make()}
   run Graph.startRun(&mut resolver.graph, unit)
   run Graph.record(&mut resolver.graph, unit, Dependee.UnitResult {unit: imported})
   drop run Graph.finishRun(&mut resolver.graph, unit, Option<ContentHash>.none())
+  // The completed imported Body has exactly the imported guard as its sole dependency.
+  // Its immutable local node must re-export that authenticated conjunction, not wrap/copy it.
+  run sharedGuardSlotFor(&mut resolver.sharedBodies.units, unit)
+  List<SharedGuardSlot>.set(&mut resolver.sharedBodies.units, unit,
+    SharedGuardSlot {offset: guard, refusal: SharedGuardRefusal.None, imported: true})
   resolver.sharedBodies.avoided = resolver.sharedBodies.avoided + usize.ONE
   resolver.hits = resolver.hits + usize.ONE
   return Option<Answer>.some(move answer)
@@ -114270,6 +114356,62 @@ effect fn sharedTypedBodyClaims() -> ()
     |> Effect.provideMut<Types>(&mut consumerTypes)
   run Testing.expect(!checkRefuses(&imported) && consumer.resolver.sharedBodies.avoided == usize.ONE,
     "a distinct type store imports the exact completed body without running its provider")
+  // Both the synthetic graph and its imported Body unit must retain their authenticated
+  // original offset. A later dependent body adds its own conjunction without copying this DAG.
+  let mut importedBody = usize.MAX
+  let mut importedOffset = usize.MAX
+  let mut candidate = usize.ZERO
+  while candidate < List<ScopedKey>.length(&consumer.resolver.keys) {
+    let key = List<ScopedKey>.get(&consumer.resolver.keys, candidate).key
+    if key.family == Family.Body && key.member == usize.ZERO && candidate < List<SharedGuardSlot>.length(&consumer.resolver.sharedBodies.units) {
+      let kept = List<SharedGuardSlot>.get(&consumer.resolver.sharedBodies.units, candidate)
+      if kept.imported {
+        importedBody = candidate
+        let context = match move run sharedBodyContext(&consumer.resolver, candidate) {
+          Option<Bytes>.Some {value} => move value
+          _ => { run Testing.expect(false, "the imported Body retains its exact context") return () }
+        }
+        let record = SharedBodyArena.find(&consumer.resolver.sharedBodies.arena, Bytes.asSlice(&context))
+        if let Option<SharedBodyArena.Record>.Some {value: held} = move SharedBodyArena.checkedRecord(&consumer.resolver.sharedBodies.arena, record) {
+          let mut reader = StableKey.reader()
+          importedOffset = u64.toUsize(StableKey.readWord(held.payload, &mut reader))
+        }
+        let mut remaining: usize = 8192
+        let reused = run sharedGuardUnit(&mut consumer.resolver, candidate, usize.ZERO, &mut remaining)
+        run Testing.expect(reused.refusal == SharedGuardRefusal.None && reused.offset == importedOffset,
+          "an imported ordinary Body re-exports the authenticated original guard offset")
+      }
+    }
+    candidate = candidate + usize.ONE
+  }
+  run Testing.expect(importedBody != usize.MAX && importedOffset != usize.MAX, "the offset assertion covers an actually imported Body")
+  let guardCount = List<ImportedBodyGuard>.length(&consumer.resolver.sharedBodies.imported)
+  let mut each = usize.ZERO
+  while each < guardCount {
+    let guards = List<ImportedBodyGuard>.asSlice(&consumer.resolver.sharedBodies.imported)
+    let saved = ImportedBodyGuard {offset: guards[each].offset, unit: guards[each].unit}
+    let mut remaining: usize = 8192
+    let reused = run sharedGuardUnit(&mut consumer.resolver, saved.unit, usize.ZERO, &mut remaining)
+    run Testing.expect(reused.refusal == SharedGuardRefusal.None && reused.offset == saved.offset,
+      "each reconstructed synthetic guard re-exports its authenticated original offset")
+    each = each + usize.ONE
+  }
+  let dependent = run internKey(&mut consumer.resolver, Key {family: Family.Body, module: usize.ZERO, name: 99,
+    declaration: usize.MAX, member: usize.ZERO, external: false})
+  let dependentUnit = u64.toUsize(dependent.value)
+  run Graph.startRun(&mut consumer.resolver.graph, dependentUnit)
+  run Graph.record(&mut consumer.resolver.graph, dependentUnit, Dependee.UnitResult {unit: importedBody})
+  drop run Graph.finishRun(&mut consumer.resolver.graph, dependentUnit, Option<ContentHash>.none())
+  let mut remaining: usize = 8192
+  let exported = run sharedGuardUnit(&mut consumer.resolver, dependentUnit, usize.ZERO, &mut remaining)
+  run Testing.expect(exported.refusal == SharedGuardRefusal.None, "a new completed body's guard can depend on the imported body")
+  if let Option<SharedBodyArena.Record>.Some {value: held} = move SharedBodyArena.checkedRecord(&consumer.resolver.sharedBodies.arena, exported.offset) {
+    let mut reader = StableKey.reader()
+    let count = StableKey.readWord(held.payload, &mut reader)
+    let childOffset = u64.toUsize(StableKey.readWord(held.payload, &mut reader))
+    run Testing.expect(held.kind == 0 && count == 1 && childOffset == importedOffset && StableKey.finished(held.payload, &reader),
+      "the new guard references the original imported DAG rather than re-encoding it")
+  } else { run Testing.expect(false, "the dependent guard is authenticated") }
   let image = run Semantic.completeCacheImage(&mut consumer)
   closeSharedBodies(&mut consumer.resolver)
   let changed = run Revision.publish(&revision, &module, &Option<Bytes>.some(run Bytes.copy(b"fn value() -> i32 { return true }\n")))
@@ -114311,7 +114453,7 @@ effect fn sharedBodyGuardCycleClaims() -> () ! InvalidModulePath | OutOfMemoryEr
   drop run Graph.finishRun(&mut store.resolver.graph, right, Option<ContentHash>.none())
   let mut budget: usize = 8192
   let rejected = run sharedGuardUnit(&mut store.resolver, left, usize.ZERO, &mut budget)
-  run Testing.expect(rejected >= unfit() && store.resolver.sharedBodies.guardCycleNodes == usize.ONE,
+  run Testing.expect(rejected.refusal == SharedGuardRefusal.Semantic && store.resolver.sharedBodies.guardCycleNodes == usize.ONE,
     "a completed-looking guard backedge cannot publish a shared body")
   let condition = run internKey(&mut store.resolver, Key {family: Family.Condition, module: ordinal, name: 0, declaration: usize.MAX, member: 0, external: false})
   let conditionUnit = u64.toUsize(condition.value)
@@ -114319,14 +114461,14 @@ effect fn sharedBodyGuardCycleClaims() -> () ! InvalidModulePath | OutOfMemoryEr
   drop run Graph.finishRun(&mut store.resolver.graph, conditionUnit, Option<ContentHash>.none())
   budget = 8192
   let conditionGuard = run sharedGuardUnit(&mut store.resolver, conditionUnit, usize.ZERO, &mut budget)
-  run Testing.expect(conditionGuard >= unfit(), "retained availability Condition ledger edges cannot be erased by an imported body")
+  run Testing.expect(conditionGuard.refusal == SharedGuardRefusal.Semantic, "retained availability Condition ledger edges cannot be erased by an imported body")
   let opaque = run internKey(&mut store.resolver, Key {family: Family.ModuleCheck, module: ordinal, name: 0, declaration: usize.MAX, member: 0, external: false})
   let opaqueUnit = u64.toUsize(opaque.value)
   run Graph.startRun(&mut store.resolver.graph, opaqueUnit)
   drop run Graph.finishRun(&mut store.resolver.graph, opaqueUnit, Option<ContentHash>.none())
   budget = 8192
   let opaqueGuard = run sharedGuardUnit(&mut store.resolver, opaqueUnit, usize.ZERO, &mut budget)
-  run Testing.expect(opaqueGuard >= unfit(), "an adopted named check's empty local graph is not its complete guard")
+  run Testing.expect(opaqueGuard.refusal == SharedGuardRefusal.Semantic, "an adopted named check's empty local graph is not its complete guard")
   closeSharedBodies(&mut store.resolver)
 }
 test effect fn sharedTypedBodyGuardsRefuseDependencyCycles() -> () ! InvalidModulePath | OutOfMemoryError | AssertionError<'static> {
