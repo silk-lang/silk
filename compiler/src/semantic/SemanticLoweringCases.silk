@@ -15,11 +15,14 @@ import backend.InstanceText
 import backend.EmissionPlan {EmissionPlan, Identity as EmissionIdentity}
 import backend.Layout {
   Abi as LayoutAbi,
+  Metrics as LayoutMetrics,
   Field as LayoutField,
   Storage as LayoutStorage,
   Layout as BackendLayout,
   TypeLayout,
 }
+import backend.LoweringPlan
+import backend.LoweringPlan {Callable as OutcomeCallable, Lane as OutcomeLane}
 import backend.CAbi
 import silk.collections.slice {Slice}
 import backend.Gap {Code as GapCode, Gap as BackendGap, Source as GapSource}
@@ -151,6 +154,7 @@ import silk.num.u8
 import silk.num.usize
 import silk.num.u64
 import silk.collections.list {List}
+import backend.MirCoalesce
 import backend.StackLifetimes
 import backend.Mir {Place as MirPlace, Variable as MirVariable}
 import backend.MirVerification
@@ -14030,6 +14034,23 @@ static if false {
     "a one-shot store emits the same module as a revisable store and keeps none of its source observations")
   run Testing.expect(Semantic.digestedLlvmInputs(&store) > usize.ZERO && Semantic.digestedLlvmInputs(&single) == usize.ZERO,
     "a revisable store names its LLVM inputs by content digest; a one-shot store hashes none")
+  // Immutable cache writers keep all source evidence without constructing content subjects
+  // that could only be re-found by a later revision of this same process.
+  let cachedRevision = run Revision.publish(&second, &lanes, &laneSource)
+  let mut cached = Semantic.cached(move cachedRevision, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu), Option<FinalProfile>.none())
+  let mut cachedRequest = Request.forApplication(ModuleId.copy(&application))
+  let cachedBuilt = run printedArtifact(&mut cached, &mut cachedRequest, Option<&ModuleId>.some(&runtime), &roots, &roots, staticClosureNodes)
+  let mut cacheAgrees = false
+  if let BackendBuild.Module {text, ..} = &built {
+    if let BackendBuild.Module {text: cachedText, ..} = &cachedBuilt {
+      cacheAgrees = sameBytes(Bytes.asSlice(&text), Bytes.asSlice(&cachedText))
+    }
+  }
+  let mut cachedProbe = Request.make()
+  let _cachedAnswer = run Semantic.demandSignature(&mut cached, &mut cachedProbe, &application, b"answer")
+  run Testing.expect(cacheAgrees && Semantic.digestedLlvmInputs(&cached) == usize.ZERO
+    && Semantic.requestDiscovered(&mut cached, &cachedProbe, &application),
+    "immutable cached emission matches revisable code and retains source observations without content hashing")
   let armRuntime = run Revision.publish(&Revision.make(), &runtime, &runtimeSource)
   let armRevision = run Revision.publish(&armRuntime, &application, &applicationSource)
   let mut arm = Semantic.traced(move armRevision, MachineTarget.forId(TargetId.Aarch64UnknownLinuxGnu), Option<FinalProfile>.none())
@@ -16352,7 +16373,8 @@ test effect fn scalarTemporaryStorageRequiresLocalValueUses() -> ()
         if scenario == 4 || scenario == 9 {
           run List<MirVariable>.append(&mut function.variables, MirVariable {local: if scenario == 9 { usize.MAX } else { usize.ONE }, name: run Bytes.copy(b"visible") |> Effect.provideMut<Allocator>(&mut allocator), place: 16777217, argument: usize.ZERO}) |> Effect.provideMut<Allocator>(&mut allocator)
         }
-        let candidates = run StackLifetimes.scalarTemporaries(&function) |> Effect.provideMut<Allocator>(&mut allocator)
+        let storage = run StackLifetimes.storage(&function, true) |> Effect.provideMut<Allocator>(&mut allocator)
+        let candidates = move storage.registers
         run Testing.expect(List<bool>.get(&candidates, usize.ONE) == (scenario == usize.ZERO || scenario == 9) && !List<bool>.get(&candidates, usize.ZERO),
           "only a single same-block unnamed value definition loses storage; repeated writes, borrows, cross-block reads, debug variables, user locals, parameters, projected writes and early reads keep it")
         if scenario == usize.ZERO || scenario == 1 || scenario == 3 || scenario == 5 || scenario == 9 {
@@ -16376,6 +16398,80 @@ test effect fn scalarTemporaryStorageRequiresLocalValueUses() -> ()
 }
 
 
+// Coalescing leaves local identities in place. Only slots with no remaining obligation disappear.
+test effect fn unusedTemporaryStoragePreservesImplicitAndDebugLocals() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> | BackendGap {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut typeTable = TypeTable.make()
+  let target = MachineTarget.forId(TargetId.X8664UnknownLinuxGnu)
+  let id = run module("unused-temporary-storage.silk") |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut store = run staticSemantic(&id, "fn value() -> bool { return true }", target) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut request = Request.make()
+  let answer = run Semantic.demandMir(&mut store, &mut request, &id, b"value") |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+  let index = Shared<Result<Answer, NoRejection>>.with<Option<usize>>(&answer, selectedMirIndex)
+  let mut exercised = false
+  if let Option<usize>.Some {value: selected} = move index {
+    if let Option<&MirFunction>.Some {value: original} = move Semantic.mirAt(&store, selected) {
+      let mut scenario = usize.ZERO
+      while scenario < 11 {
+        let mut function = run copyMirShape(original) |> Effect.provideMut<Allocator>(&mut allocator)
+        let origin = List<MirLocal>.asSlice(&function.locals)[0].origin
+        function.locals = List<MirLocal>.make()
+        run List<MirLocal>.append(&mut function.locals, MirLocal {ty: Interned<Type>.clone(&function.result), kind: MirLocalKind.Return, origin: origin}) |> Effect.provideMut<Allocator>(&mut allocator)
+        let kind = if scenario == 2 { MirLocalKind.User {index: usize.ZERO} }
+          else { if scenario == 3 { MirLocalKind.Parameter {index: usize.ZERO} }
+          else { if scenario == 4 { MirLocalKind.Observer } else { MirLocalKind.Temp } } }
+        run List<MirLocal>.append(&mut function.locals, MirLocal {ty: Interned<Type>.clone(&function.result), kind: move kind, origin: origin}) |> Effect.provideMut<Allocator>(&mut allocator)
+        run List<MirLocal>.append(&mut function.locals, MirLocal {ty: Interned<Type>.clone(&function.result), kind: MirLocalKind.Temp, origin: origin}) |> Effect.provideMut<Allocator>(&mut allocator)
+        function.variables = List<MirVariable>.make()
+        if scenario == 1 || scenario == 9 {
+          run List<MirVariable>.append(&mut function.variables, MirVariable {local: if scenario == 9 { usize.MAX } else { usize.ONE },
+            name: run Bytes.copy(b"visible") |> Effect.provideMut<Allocator>(&mut allocator), place: 16777217, argument: usize.ZERO}) |> Effect.provideMut<Allocator>(&mut allocator)
+        }
+        function.blocks = List<MirBlock>.make()
+        let mut statements = List<MirStatement>.make()
+        if scenario == 6 || scenario == 10 {
+          run List<MirStatement>.append(&mut statements, MirStatement.Assign {
+            destination: MirPlace {local: usize.ONE, projections: List<MirProjection>.make()},
+            value: MirRvalue.Use {value: MirOperand.Boolean {value: true}}, origin: origin}) |> Effect.provideMut<Allocator>(&mut allocator)
+        }
+        if scenario == 5 || scenario == 7 || scenario == 8 || scenario == 10 {
+          let mut projections = List<MirProjection>.make()
+          if scenario == 7 { run List<MirProjection>.append(&mut projections, MirProjection.Index {local: 2}) |> Effect.provideMut<Allocator>(&mut allocator) }
+          let place = MirPlace {local: usize.ONE, projections: move projections}
+          let value = if scenario == 8 { MirRvalue.Ref {access: Access.Shared, place: move place} }
+            else { MirRvalue.Use {value: MirOperand.Copy {place: move place}} }
+          run List<MirStatement>.append(&mut statements, MirStatement.Assign {
+            destination: MirPlace {local: usize.ZERO, projections: List<MirProjection>.make()}, value: move value, origin: origin}) |> Effect.provideMut<Allocator>(&mut allocator)
+        }
+        if scenario == 5 {
+          // No edge reaches the next block. Its uninitialized read still requires an address;
+          // this storage pass neither validates initialization nor deletes unreachable code.
+          run List<MirBlock>.append(&mut function.blocks, MirBlock {statements: List<MirStatement>.make(), terminator: MirTerminator.Return {origin: origin}}) |> Effect.provideMut<Allocator>(&mut allocator)
+        }
+        run List<MirBlock>.append(&mut function.blocks, MirBlock {statements: move statements, terminator: MirTerminator.Return {origin: origin}}) |> Effect.provideMut<Allocator>(&mut allocator)
+        if scenario == 10 {
+          let before = run StackLifetimes.storage(&function, false) |> Effect.provideMut<Allocator>(&mut allocator)
+          run Testing.expect(List<bool>.get(&before.required, usize.ONE), "a copied temporary has storage before coalescing removes all of its uses")
+          run MirCoalesce.coalesce(&mut function) |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+        }
+        let storage = run StackLifetimes.storage(&function, true) |> Effect.provideMut<Allocator>(&mut allocator)
+        let optimized = run StackLifetimes.storage(&function, false) |> Effect.provideMut<Allocator>(&mut allocator)
+        let needed = scenario != 0 && scenario != 9 && scenario != 10
+        run Testing.expect(List<bool>.get(&storage.required, usize.ZERO) && List<bool>.get(&storage.required, usize.ONE) == needed,
+          "unused and coalesced temporaries lose storage; debug, user, parameter, hidden, written, addressed and unreachable-use locals retain it")
+        run Testing.expect(List<bool>.get(&storage.required, 2) == (scenario == 7), "projection indices are uses even when their locals have no whole-place operands")
+        run Testing.expect(List<bool>.get(&optimized.required, usize.ONE) == needed && List<bool>.length(&optimized.registers) == 0,
+          "unused storage is independent of the scalar SSA emission mode")
+        run Testing.expect(List<MirLocal>.length(&function.locals) == 3, "omitting storage preserves every MIR local identity")
+        scenario = scenario + usize.ONE
+      }
+      exercised = true
+    }
+  }
+  run Testing.expect(exercised, "unused-storage cases start from a checked closed instance")
+}
+
 // Numeric lowering validates the source type without requiring a proven value's address.
 test effect fn scalarArithmeticTemporariesRemainNumericValues() -> ()
 ! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> | BackendGap {
@@ -16397,7 +16493,8 @@ fn converted(a: i8) -> f64 { return Intrinsic.i8ToF64(Intrinsic.i8Negate(a)) }
     let mut emitted = false
     if let Option<usize>.Some {value: selected} = move index {
       if let Option<&MirFunction>.Some {value: function} = move Semantic.mirAt(&store, selected) {
-        let candidates = run StackLifetimes.scalarTemporaries(function) |> Effect.provideMut<Allocator>(&mut allocator)
+        let storage = run StackLifetimes.storage(function, true) |> Effect.provideMut<Allocator>(&mut allocator)
+        let candidates = move storage.registers
         let locals = List<MirLocal>.asSlice(&function.locals)
         let mut layouts = List<TypeLayout>.make()
         let mut eligible = false
@@ -16454,7 +16551,8 @@ test effect fn scalarProjectedReadsKeepOnlyTheSourceAddress() -> ()
       run List<MirStatement>.append(&mut statements, MirStatement.Assign {destination: MirPlace {local: 0, projections: List<MirProjection>.make()}, value: MirRvalue.Use {value: MirOperand.Copy {place: MirPlace {local: 3, projections: List<MirProjection>.make()}}}, origin: origin}) |> Effect.provideMut<Allocator>(&mut allocator)
       function.blocks = List<MirBlock>.make()
       run List<MirBlock>.append(&mut function.blocks, MirBlock {statements: move statements, terminator: MirTerminator.Return {origin: origin}}) |> Effect.provideMut<Allocator>(&mut allocator)
-      let candidates = run StackLifetimes.scalarTemporaries(&function) |> Effect.provideMut<Allocator>(&mut allocator)
+      let storage = run StackLifetimes.storage(&function, true) |> Effect.provideMut<Allocator>(&mut allocator)
+      let candidates = move storage.registers
       run Testing.expect(!List<bool>.get(&candidates, 2) && List<bool>.get(&candidates, 3), "a projected source stays addressable while its scalar destination has only value uses")
       let mut layouts = List<TypeLayout>.make()
       let locals = List<MirLocal>.asSlice(&function.locals)
@@ -16523,7 +16621,8 @@ test effect fn scalarCallArgumentsExcludeAddressConventions() -> ()
         let mut continued = List<MirStatement>.make()
         run List<MirStatement>.append(&mut continued, MirStatement.Assign {destination: MirPlace {local: 0, projections: List<MirProjection>.make()}, value: MirRvalue.Use {value: MirOperand.Copy {place: MirPlace {local: 3, projections: List<MirProjection>.make()}}}, origin: origin}) |> Effect.provideMut<Allocator>(&mut allocator)
         run List<MirBlock>.append(&mut function.blocks, MirBlock {statements: move continued, terminator: MirTerminator.Return {origin: origin}}) |> Effect.provideMut<Allocator>(&mut allocator)
-        let candidates = run StackLifetimes.scalarTemporaries(&function) |> Effect.provideMut<Allocator>(&mut allocator)
+        let storage = run StackLifetimes.storage(&function, true) |> Effect.provideMut<Allocator>(&mut allocator)
+        let candidates = move storage.registers
         run Testing.expect(List<bool>.get(&candidates, 2) == (scenario == 0) && !List<bool>.get(&candidates, 3), "only ordinary direct value arguments are promoted; foreign, indirect, failure, provider and diagnostic conventions and all call results retain storage")
         if scenario == 0 {
           let mut layouts = List<TypeLayout>.make()
@@ -16541,5 +16640,99 @@ test effect fn scalarCallArgumentsExcludeAddressConventions() -> ()
     }
   }
   run Testing.expect(exercised, "the ordinary call storage cases have a checked function identity")
+  return ()
+}
+
+// Payload storage follows target metrics, independently of fallibility and diagnostic context.
+test effect fn zeroStorageOutcomeShapesKeepControlLanes() -> ()
+! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let sizes = [usize.ZERO, usize.ONE, 8, 24]
+  let facts = OutcomeCallable {parameters: 2, providers: 1, observed: true, fallible: true}
+  let mut resultAt = usize.ZERO
+  while resultAt < sizes.length {
+    let mut failureAt = usize.ZERO
+    while failureAt < sizes.length {
+      let result = LayoutMetrics {size: sizes[resultAt], alignment: usize.ONE,
+        abi: if resultAt == 1 { LayoutAbi.Integer } else { LayoutAbi.Indirect }, tagged: false, head: usize.ZERO}
+      let failure = LayoutMetrics {size: sizes[failureAt], alignment: usize.ONE,
+        abi: if failureAt == 2 { LayoutAbi.Integer } else { LayoutAbi.Indirect }, tagged: false, head: usize.ZERO}
+      let storage = LoweringPlan.outcomeStorage(result, Option<LayoutMetrics>.some(failure))
+      run Testing.expect(storage.result == (resultAt != usize.ZERO) && storage.failure == (failureAt != usize.ZERO),
+        "zero-byte records omit payloads while subword scalars and nonempty aggregates retain them")
+      let ordinary = run LoweringPlan.ordinaryShape(facts, false, storage) |> Effect.provideMut<Allocator>(&mut allocator)
+      let enter = run LoweringPlan.enterShape(facts, storage) |> Effect.provideMut<Allocator>(&mut allocator)
+      let count = 7 + (if storage.result { usize.ONE } else { usize.ZERO }) + (if storage.failure { usize.ONE } else { usize.ZERO })
+      let lanes = List<OutcomeLane>.asSlice(&ordinary.lanes)
+      let entered = List<OutcomeLane>.asSlice(&enter.lanes)
+      run Testing.expect(lanes.length == count && entered.length == count + usize.ONE &&
+        (match lanes[lanes.length - usize.ONE] { OutcomeLane.Context => true _ => false }) &&
+        (match entered[usize.ZERO] { OutcomeLane.Transfer => true _ => false }) &&
+        (match entered[entered.length - usize.ONE] { OutcomeLane.Context => true _ => false }),
+        "ordinary and coroutine calls retain context, observation, providers and control when both payloads disappear")
+      failureAt = failureAt + usize.ONE
+    }
+    resultAt = resultAt + usize.ONE
+  }
+  return ()
+}
+
+// Recursive ordinary calls exercise both the signature and its call site in one closed plan.
+test effect fn zeroStorageFallibleCallsKeepStatusAndNonemptyPayloads() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> | BackendGap {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut typeTable = TypeTable.make()
+  let target = MachineTarget.forId(TargetId.X8664UnknownLinuxGnu)
+  let id = run module("zero-storage-outcomes.silk") |> Effect.provideMut<Allocator>(&mut allocator)
+  let text = """
+effect fn empty(depth: i32) -> () ! () {
+  if depth < 0 { return () }
+  if depth == 0 { fail () }
+  return run empty(depth - 1)
+}
+effect fn scalar(depth: i32) -> i32 ! () {
+  if depth < 0 { return 17 }
+  if depth == 0 { fail () }
+  return run scalar(depth - 1)
+}
+effect fn failure(depth: i32) -> () ! i64 {
+  if depth < 0 { return () }
+  if depth == 0 { fail 23 }
+  return run failure(depth - 1)
+}
+"""
+  let mut store = run staticSemantic(&id, text, target) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut request = Request.make()
+  let names = [b"empty", b"scalar", b"failure"]
+  let mut scenario = usize.ZERO
+  while scenario < names.length {
+    let answer = run Semantic.demandMir(&mut store, &mut request, &id, names[scenario]) |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+    let selected = Shared<Result<Answer, NoRejection>>.with<Option<usize>>(&answer, selectedMirIndex)
+    let mut emitted = false
+    if let Option<usize>.Some {value: index} = move selected {
+      if let Option<&MirFunction>.Some {value: function} = move Semantic.mirAt(&store, index) {
+        let locals = List<MirLocal>.asSlice(&function.locals)
+        let mut layouts = List<TypeLayout>.make()
+        let mut at = usize.ZERO
+        while at < locals.length {
+          if let Option<BackendLayout>.Some {value: facts} = move BackendLayout.scalar(&locals[at].ty, &target) {
+            let layout = run Shared<BackendLayout>.make(move facts) |> Effect.provideMut<Allocator>(&mut allocator)
+            run List<TypeLayout>.append(&mut layouts, TypeLayout {ty: Interned<Type>.clone(&locals[at].ty), layout: move layout}) |> Effect.provideMut<Allocator>(&mut allocator)
+          }
+          at = at + usize.ONE
+        }
+        let foreign = List<CAbi.Signature>.make()
+        let llvm = run emitClosedMirShaped(function, &target, List<TypeLayout>.asSlice(&layouts), List<CAbi.Signature>.asSlice(&foreign), true) |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+        let ir = Bytes.asSlice(&llvm)
+        emitted = containsIr(ir, b"define zeroext i1 @") && containsIr(ir, b"call zeroext i1 @") &&
+          containsIr(ir, b"ret i1 true") && containsIr(ir, b"ret i1 false") && containsIr(ir, b"br i1 ")
+        if scenario == 0 { emitted = emitted && containsIr(ir, b"(i32 %p0)") && !containsIr(ir, b"%out") && !containsIr(ir, b"%fail") }
+        if scenario == 1 { emitted = emitted && containsIr(ir, b"i32 %p0, ptr noalias %out)") && !containsIr(ir, b"%fail") }
+        if scenario == 2 { emitted = emitted && containsIr(ir, b"i32 %p0, ptr %fail)") && !containsIr(ir, b"%out") }
+      }
+    }
+    run Testing.expect(emitted, "zero-byte payload omission retains failure status and each nonempty scalar payload at definition and call")
+    scenario = scenario + usize.ONE
+  }
   return ()
 }
