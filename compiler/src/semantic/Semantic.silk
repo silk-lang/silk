@@ -5,7 +5,11 @@
 //! The store reads an import target only when a requested fact needs its binding.
 
 import semantic.Published {Published}
-import semantic.Types {TypeTable, Types}
+import semantic.ThreadFrontier
+import semantic.ThreadBodies
+import semantic.SourceEpoch {SourceEpoch}
+import silk.concurrency.thread_native {NativeThread, SpawnError}
+import semantic.Types {TypeTable, Types, SharedTypePool}
 import semantic.CacheImage {Merge}
 import semantic.WalkFragments
 import semantic.ArtifactGraph
@@ -2380,7 +2384,7 @@ pub union Value {
   /// Unsupported; cached glue preparation does not retain another caller's module or span.
   CanonicalizationFailed {pub reason: CanonicalizationFailure},
   /// The complete syntactic name bucket, including an empty bucket.
-  Name {pub bucket: Shared<NameObservation>},
+  Name {pub bucket: Published<NameObservation>},
   /// A namespace import's target module.
   Namespace {pub module: ModuleId, pub ordinal: usize},
   /// A selected import's canonical target declaration.
@@ -4116,6 +4120,8 @@ struct Resolver {
   // Body query selects again with it (`resolveBody`).
   discoveredStaticCall: Option<StaticCallHint>,
   source: SourceIndex,
+  threadBodies: ThreadBodyState,
+  nextThreadBodyGuard: usize,
   // Whether this process will revise sources, independently of disk-cache recording.
   revisable: bool,
   baseTarget: MachineTarget,
@@ -4516,6 +4522,7 @@ pub struct Semantic {
   artifactCacheEntries: List<ArtifactCacheEntry>,
   artifactCacheDigests: DigestSet,
   artifactWorkers: List<CheckWorker>,
+  threadWorkers: List<ThreadFrontier.Worker<Bytes, Bytes>>,
   deferredFrontierGraph: Option<BuildRecord.Record>,
   deferredFrontierSubsets: List<DeferredFrontierSubset>,
   artifactCacheRoots: List<usize>,
@@ -5464,8 +5471,8 @@ fn sameAllocation<T>(left: &Shared<T>, right: &Shared<T>) -> bool {
   return first == second
 }
 
-fn sameBucketWith(first: &NameObservation, other: &Shared<NameObservation>) -> bool {
-  return Shared<NameObservation>.with<bool>(
+fn sameBucketWith(first: &NameObservation, other: &Published<NameObservation>) -> bool {
+  return Published<NameObservation>.with<bool>(
     other,
     fn(second: &NameObservation) -> bool {
       return NameObservation.equals(first, second)
@@ -5473,11 +5480,11 @@ fn sameBucketWith(first: &NameObservation, other: &Shared<NameObservation>) -> b
   )
 }
 
-fn sameBuckets(left: &Shared<NameObservation>, right: &Shared<NameObservation>) -> bool {
+fn sameBuckets(left: &Published<NameObservation>, right: &Published<NameObservation>) -> bool {
   if sameAllocation<NameObservation>(left, right) {
     return true
   }
-  return Shared<NameObservation>.with<bool>(
+  return Published<NameObservation>.with<bool>(
     left,
     fn(first: &NameObservation) -> bool {
       return sameBucketWith(first, right)
@@ -7585,10 +7592,12 @@ effect fn selectRequest(resolver: &mut Resolver, request: &Request) -> ()
 ! Cycle | OutOfMemoryError
 ? &mut Allocator {
   run reconcileSources(&mut resolver.*)
+  let previousApplication = resolver.currentApplication
   resolver.currentApplication = usize.MAX
   if let Option<ModuleId>.Some {value: application} = &request.application {
     resolver.currentApplication = run internModule(&mut resolver.*, &application)
   }
+  if previousApplication != resolver.currentApplication { threadRequestChanged(&mut resolver.*) }
   return ()
 }
 
@@ -10934,6 +10943,310 @@ effect fn observeSuccessLocations(resolver: &mut Resolver, value: &Value) -> ()
   }
 }
 
+// Store-private memo tables retain immutable global guards. A guard identity is only used while
+// its Published handle remains retained; allocation addresses can never be rebound by reuse.
+union ThreadGuardSlot {
+  Empty,
+  Entered,
+  Refused,
+  Ready {guard: Published<ThreadBodies.Guard>},
+}
+struct ImportedThreadGuard {guard: Published<ThreadBodies.Guard>, unit: usize}
+struct ThreadBodyState {
+  registry: Option<ThreadBodies.Registry>,
+  started: bool,
+  units: List<ThreadGuardSlot>,
+  inputs: List<ThreadGuardSlot>,
+  files: List<ThreadGuardSlot>,
+  imported: List<ImportedThreadGuard>,
+  lookup: InternIndex,
+  eligible: usize,
+  avoided: usize,
+  published: usize,
+  refused: usize,
+}
+fn noThreadBodies() -> ThreadBodyState {
+  return ThreadBodyState {registry: Option<ThreadBodies.Registry>.none(), started: false,
+    units: List<ThreadGuardSlot>.make(), inputs: List<ThreadGuardSlot>.make(), files: List<ThreadGuardSlot>.make(),
+    imported: List<ImportedThreadGuard>.make(), lookup: InternIndex.make(), eligible: usize.ZERO,
+    avoided: usize.ZERO, published: usize.ZERO, refused: usize.ZERO}
+}
+fn threadRequestChanged(resolver: &mut Resolver) -> () {
+  // Existing completed answers remain owned by the store. Future sharing is disabled, so a
+  // previously authenticated request guard cannot be reused under changed request facts.
+  if resolver.threadBodies.started { resolver.threadBodies.registry = Option<ThreadBodies.Registry>.none() }
+}
+effect fn threadGuardSlot(slots: &mut List<ThreadGuardSlot>, at: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  while List<ThreadGuardSlot>.length(&slots.*) <= at {
+    run List<ThreadGuardSlot>.append(&mut slots.*, ThreadGuardSlot.Empty)
+  }
+}
+fn threadGuardCopy(slot: &ThreadGuardSlot) -> Option<Published<ThreadBodies.Guard>> {
+  return match &slot.* {
+    ThreadGuardSlot.Ready {guard} => Option<Published<ThreadBodies.Guard>>.some(Published<ThreadBodies.Guard>.clone(&guard))
+    _ => Option<Published<ThreadBodies.Guard>>.none()
+  }
+}
+fn threadRegistry(resolver: &Resolver) -> Option<ThreadBodies.Registry> {
+  return match &resolver.threadBodies.registry {
+    Option<ThreadBodies.Registry>.Some {value} => Option<ThreadBodies.Registry>.some(ThreadBodies.Registry.clone(&value))
+    _ => Option<ThreadBodies.Registry>.none()
+  }
+}
+fn threadBodyKey(resolver: &Resolver, unit: usize) -> Option<ThreadBodies.Key> {
+  if resolver.revisable || !Graph.recording(&resolver.graph) || resolver.editorTables
+    || unit >= List<ScopedKey>.length(&resolver.keys) { return Option<ThreadBodies.Key>.none() }
+  let registry = match &resolver.threadBodies.registry {
+    Option<ThreadBodies.Registry>.Some {value} => &value
+    _ => { return Option<ThreadBodies.Key>.none() }
+  }
+  if let Option<InitialProfile>.Some {..} = &resolver.assemblyFacts { return Option<ThreadBodies.Key>.none() }
+  let scope = List<ScopedKey>.get(&resolver.keys, unit)
+  if scope.key.family != Family.Body || scope.key.member != usize.ZERO || scope.key.name != usize.ZERO
+    || scope.origin.slot != u32.MAX || scope.condition != usize.MAX { return Option<ThreadBodies.Key>.none() }
+  if scope.profile != usize.ZERO && scope.profile != usize.MAX && scope.profile != usize.ONE {
+    return Option<ThreadBodies.Key>.none()
+  }
+  let target = ThreadBodies.Registry.target(registry)
+  if MachineTarget.id(&target) != MachineTarget.id(&resolver.target)
+    || MachineTarget.revision(&target) != MachineTarget.revision(&resolver.target) { return Option<ThreadBodies.Key>.none() }
+  match ThreadBodies.Registry.application(registry) {
+    Option<ModuleId>.Some {value} => {
+      if scope.application >= List<ModuleId>.length(&resolver.modules)
+        || !ModuleId.equals(&value, &List<ModuleId>.asSlice(&resolver.modules)[scope.application]) {
+        return Option<ThreadBodies.Key>.none()
+      }
+    }
+    Option<ModuleId>.None => { if scope.application != usize.MAX { return Option<ThreadBodies.Key>.none() } }
+  }
+  let identity = match move DeclarationTable.identity(&resolver.declarations, scope.key.declaration) {
+    Option<&DeclarationId>.Some {value} => value
+    _ => { return Option<ThreadBodies.Key>.none() }
+  }
+  return Option<ThreadBodies.Key>.some(ThreadBodies.Key {declaration: DeclarationId.copy(identity),
+    profile: scope.profile, name: usize.ZERO, external: scope.key.external})
+}
+effect fn threadGuardLeaf(resolver: &mut Resolver, registry: &ThreadBodies.Registry, dependee: Dependee)
+  -> Option<Published<ThreadBodies.Guard>> ! OutOfMemoryError ? &mut Allocator {
+  match dependee {
+    Dependee.SourceFile {module} => {
+      if module >= List<ModuleId>.length(&resolver.modules) { return Option<Published<ThreadBodies.Guard>>.none() }
+      run threadGuardSlot(&mut resolver.threadBodies.files, module)
+      if let ThreadGuardSlot.Empty = &List<ThreadGuardSlot>.asSlice(&resolver.threadBodies.files)[module] {} else {
+        return threadGuardCopy(&List<ThreadGuardSlot>.asSlice(&resolver.threadBodies.files)[module])
+      }
+      List<ThreadGuardSlot>.set(&mut resolver.threadBodies.files, module, ThreadGuardSlot.Refused)
+      if !ThreadBodies.Registry.reserveGuard(registry, 256) { return Option<Published<ThreadBodies.Guard>>.none() }
+      let guard = run Published<ThreadBodies.Guard>.make(ThreadBodies.Guard.File {
+        module: ModuleId.copy(&List<ModuleId>.asSlice(&resolver.modules)[module])})
+      List<ThreadGuardSlot>.set(&mut resolver.threadBodies.files, module,
+        ThreadGuardSlot.Ready {guard: Published<ThreadBodies.Guard>.clone(&guard)})
+      return Option<Published<ThreadBodies.Guard>>.some(move guard)
+    }
+    Dependee.SourceInput {input, ..} => {
+      if input >= List<Inputs.Input>.length(&resolver.sourceInputs.inputs) { return Option<Published<ThreadBodies.Guard>>.none() }
+      run threadGuardSlot(&mut resolver.threadBodies.inputs, input)
+      if let ThreadGuardSlot.Empty = &List<ThreadGuardSlot>.asSlice(&resolver.threadBodies.inputs)[input] {} else {
+        return threadGuardCopy(&List<ThreadGuardSlot>.asSlice(&resolver.threadBodies.inputs)[input])
+      }
+      List<ThreadGuardSlot>.set(&mut resolver.threadBodies.inputs, input, ThreadGuardSlot.Refused)
+      let value = &List<Inputs.Input>.asSlice(&resolver.sourceInputs.inputs)[input]
+      if value.module >= List<ModuleId>.length(&resolver.modules) { return Option<Published<ThreadBodies.Guard>>.none() }
+      let bytes = ThreadBodies.selectorBytes(&value.selector)
+      if bytes > 65536 || !ThreadBodies.Registry.reserveGuard(registry, 384 + bytes) { return Option<Published<ThreadBodies.Guard>>.none() }
+      let mut declaration = Option<DeclarationId>.none()
+      let handle = Inputs.handle(&value.selector)
+      if handle != usize.MAX {
+        let identity = match move DeclarationTable.identity(&resolver.declarations, handle) {
+          Option<&DeclarationId>.Some {value} => value
+          _ => { return Option<Published<ThreadBodies.Guard>>.none() }
+        }
+        declaration = Option<DeclarationId>.some(DeclarationId.copy(identity))
+      } else {
+        // A missing handle for a handle-bearing selector is not a Presence observation.
+        match &value.selector {
+          SourceSelector.Member {..} => { return Option<Published<ThreadBodies.Guard>>.none() }
+          SourceSelector.Declaration {..} => { return Option<Published<ThreadBodies.Guard>>.none() }
+          SourceSelector.Location {..} => { return Option<Published<ThreadBodies.Guard>>.none() }
+          _ => {}
+        }
+      }
+      let guard = run Published<ThreadBodies.Guard>.make(ThreadBodies.Guard.Input {input: ThreadBodies.Input {
+        module: ModuleId.copy(&List<ModuleId>.asSlice(&resolver.modules)[value.module]),
+        selector: run ThreadBodies.copySelector(&value.selector), declaration: move declaration,
+        digest: value.digest, text: value.text}})
+      List<ThreadGuardSlot>.set(&mut resolver.threadBodies.inputs, input,
+        ThreadGuardSlot.Ready {guard: Published<ThreadBodies.Guard>.clone(&guard)})
+      return Option<Published<ThreadBodies.Guard>>.some(move guard)
+    }
+    Dependee.UnitResult {..} => { return Option<Published<ThreadBodies.Guard>>.none() }
+  }
+}
+effect fn threadGuardUnit(resolver: &mut Resolver, registry: &ThreadBodies.Registry, unit: usize,
+  depth: usize, remaining: &mut usize) -> Option<Published<ThreadBodies.Guard>> ! OutOfMemoryError ? &mut Allocator {
+  if depth >= 256 || remaining.* == usize.ZERO || unit >= List<ScopedKey>.length(&resolver.keys) {
+    return Option<Published<ThreadBodies.Guard>>.none()
+  }
+  remaining.* = remaining.* - usize.ONE
+  run threadGuardSlot(&mut resolver.threadBodies.units, unit)
+  if let ThreadGuardSlot.Empty = &List<ThreadGuardSlot>.asSlice(&resolver.threadBodies.units)[unit] {} else {
+    return threadGuardCopy(&List<ThreadGuardSlot>.asSlice(&resolver.threadBodies.units)[unit])
+  }
+  List<ThreadGuardSlot>.set(&mut resolver.threadBodies.units, unit, ThreadGuardSlot.Refused)
+  let scope = List<ScopedKey>.get(&resolver.keys, unit)
+  if Graph.state(&resolver.graph, unit) != UnitState.UpToDate || scope.origin.slot != u32.MAX
+    || scope.condition != usize.MAX || readsDemandPath(scope.key)
+    || scope.key.family == Family.ModuleCheck { return Option<Published<ThreadBodies.Guard>>.none() }
+  List<ThreadGuardSlot>.set(&mut resolver.threadBodies.units, unit, ThreadGuardSlot.Entered)
+  let mut children = List<Published<ThreadBodies.Guard>>.make()
+  let mut edge = Graph.firstEdgeOf(&resolver.graph, unit)
+  while edge != usize.MAX {
+    if List<Published<ThreadBodies.Guard>>.length(&children) >= 8192 { return Option<Published<ThreadBodies.Guard>>.none() }
+    let dependee = Graph.dependeeOf(&resolver.graph, edge)
+    edge = Graph.nextEdgeOf(&resolver.graph, edge)
+    let child = match dependee {
+      Dependee.UnitResult {unit: nested} => run threadGuardUnit(&mut resolver.*, registry, nested, depth + usize.ONE, &mut remaining.*)
+      _ => run threadGuardLeaf(&mut resolver.*, registry, dependee)
+    }
+    let held = match move child {
+      Option<Published<ThreadBodies.Guard>>.Some {value} => move value
+      _ => { return Option<Published<ThreadBodies.Guard>>.none() }
+    }
+    run List<Published<ThreadBodies.Guard>>.append(&mut children, move held)
+  }
+  let count = List<Published<ThreadBodies.Guard>>.length(&children)
+  if !ThreadBodies.Registry.reserveGuard(registry, 128 + count * 16) { return Option<Published<ThreadBodies.Guard>>.none() }
+  let guard = run Published<ThreadBodies.Guard>.make(ThreadBodies.Guard.All {children: move children})
+  List<ThreadGuardSlot>.set(&mut resolver.threadBodies.units, unit,
+    ThreadGuardSlot.Ready {guard: Published<ThreadBodies.Guard>.clone(&guard)})
+  return Option<Published<ThreadBodies.Guard>>.some(move guard)
+}
+effect fn publishThreadBody(resolver: &mut Resolver, unit: usize, answer: &Answer) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let body = match &answer.outcome {
+    Outcome.Success {value: Value.Body {body}} => Published<TypedBody>.clone(&body)
+    _ => { return () }
+  }
+  let key = match move threadBodyKey(&resolver.*, unit) {
+    Option<ThreadBodies.Key>.Some {value} => move value _ => { return () }
+  }
+  let registry = match move threadRegistry(&resolver.*) {
+    Option<ThreadBodies.Registry>.Some {value} => move value _ => { return () }
+  }
+  if let Option<Published<ThreadBodies.Entry>>.Some {..} = move ThreadBodies.Registry.find(&registry, &key) { return () }
+  let mut remaining: usize = 8192
+  let guard = match move run threadGuardUnit(&mut resolver.*, &registry, unit, usize.ZERO, &mut remaining) {
+    Option<Published<ThreadBodies.Guard>>.Some {value} => move value
+    _ => { resolver.threadBodies.refused = resolver.threadBodies.refused + usize.ONE return () }
+  }
+  let entry = run Published<ThreadBodies.Entry>.make(ThreadBodies.Entry {key: move key, body: move body, guard: move guard})
+  if ThreadBodies.Registry.publish(&registry, move entry) { resolver.threadBodies.published = resolver.threadBodies.published + usize.ONE }
+}
+effect fn importThreadGuard(resolver: &mut Resolver, guard: &Published<ThreadBodies.Guard>,
+  depth: usize, remaining: &mut usize) -> usize ! Cycle | OutOfMemoryError ? &mut Allocator {
+  let identity = Published<ThreadBodies.Guard>.address(guard)
+  let mut known = InternIndex.first(&resolver.threadBodies.lookup, usize.toU64(identity))
+  while known != usize.MAX {
+    let previous = &List<ImportedThreadGuard>.asSlice(&resolver.threadBodies.imported)[known]
+    if Published<ThreadBodies.Guard>.same(&previous.guard, guard) { return previous.unit }
+    known = InternIndex.after(&resolver.threadBodies.lookup, known)
+  }
+  if depth >= 256 || remaining.* == usize.ZERO { return usize.MAX }
+  remaining.* = remaining.* - usize.ONE
+  let mut edges = List<Dependee>.make()
+  match Published<ThreadBodies.Guard>.get(guard) {
+    ThreadBodies.Guard.All {children} => {
+      let children = List<Published<ThreadBodies.Guard>>.asSlice(&children)
+      let mut at = usize.ZERO
+      while at < children.length {
+        let unit = run importThreadGuard(&mut resolver.*, &children[at], depth + usize.ONE, &mut remaining.*)
+        if unit == usize.MAX { return usize.MAX }
+        run List<Dependee>.append(&mut edges, Dependee.UnitResult {unit: unit})
+        at = at + usize.ONE
+      }
+    }
+    ThreadBodies.Guard.File {module} => {
+      let ordinal = run internModule(&mut resolver.*, &module)
+      run List<Dependee>.append(&mut edges, Dependee.SourceFile {module: ordinal})
+    }
+    ThreadBodies.Guard.Input {input: value} => {
+      let module = run internModule(&mut resolver.*, &value.module)
+      let mut selector = run ThreadBodies.copySelector(&value.selector)
+      if let Option<DeclarationId>.Some {value: declared} = &value.declaration {
+        if !ModuleId.equals(DeclarationId.moduleId(&declared), &value.module) { return usize.MAX }
+        let source = run demandSource(&mut resolver.*, &value.module)
+        let indexed = match move SourceIndex.source(&resolver.source, &source, &value.module) {
+          Option<&IndexedSource>.Some {value} => value _ => { return usize.MAX }
+        }
+        let position = match move ModuleIndex.ordinalOf(IndexedSource.moduleIndex(indexed), &declared) {
+          Option<usize>.Some {value} => value _ => { return usize.MAX }
+        }
+        let handle = run DeclarationTable.intern(&mut resolver.declarations, module, position, &declared)
+        selector = StableKey.withHandle(move selector, handle)
+      }
+      let mut input = Inputs.find(&resolver.sourceInputs, module, &selector)
+      if Inputs.authored(&selector) {
+        if input == usize.MAX { input = run Inputs.addDeferred(&mut resolver.sourceInputs, module, move selector) }
+      } else {
+        let current = match &selector {
+          SourceSelector.Request {fact} => run captureRequest(&resolver.*, Bytes.asSlice(&fact))
+          SourceSelector.Resolution {path} => run captureResolution(&resolver.*, &value.module, Bytes.asSlice(&path))
+          _ => { return usize.MAX }
+        }
+        let digest = ContentHash.of(Bytes.asSlice(&current))
+        if !ContentHash.equals(digest, value.digest) { return usize.MAX }
+        if input == usize.MAX { input = run Inputs.add(&mut resolver.sourceInputs, module, move selector, digest, value.text) }
+      }
+      run List<Dependee>.append(&mut edges, Dependee.SourceInput {input: input, module: module})
+    }
+  }
+  let ordinal = resolver.nextThreadBodyGuard
+  resolver.nextThreadBodyGuard = ordinal + usize.ONE
+  let word = run internKey(&mut resolver.*, Key {family: Family.ModuleCheck, module: usize.ZERO,
+    name: 8, declaration: usize.MAX, member: ordinal, external: false})
+  let unit = u64.toUsize(word.value)
+  run Graph.startRun(&mut resolver.graph, unit)
+  let values = List<Dependee>.asSlice(&edges)
+  let mut at = usize.ZERO
+  while at < values.length { run Graph.record(&mut resolver.graph, unit, values[at]) at = at + usize.ONE }
+  drop run Graph.finishRun(&mut resolver.graph, unit, Option<ContentHash>.none())
+  run threadGuardSlot(&mut resolver.threadBodies.units, unit)
+  List<ThreadGuardSlot>.set(&mut resolver.threadBodies.units, unit,
+    ThreadGuardSlot.Ready {guard: Published<ThreadBodies.Guard>.clone(guard)})
+  run List<ImportedThreadGuard>.append(&mut resolver.threadBodies.imported,
+    ImportedThreadGuard {guard: Published<ThreadBodies.Guard>.clone(guard), unit: unit})
+  run InternIndex.record(&mut resolver.threadBodies.lookup, usize.toU64(identity))
+  return unit
+}
+effect fn importThreadBody(resolver: &mut Resolver, unit: usize) -> Option<Answer>
+! Cycle | OutOfMemoryError ? &mut Allocator {
+  let key = match move threadBodyKey(&resolver.*, unit) {
+    Option<ThreadBodies.Key>.Some {value} => move value _ => { return Option<Answer>.none() }
+  }
+  resolver.threadBodies.started = true
+  resolver.threadBodies.eligible = resolver.threadBodies.eligible + usize.ONE
+  let registry = match move threadRegistry(&resolver.*) {
+    Option<ThreadBodies.Registry>.Some {value} => move value _ => { return Option<Answer>.none() }
+  }
+  let entry = match move ThreadBodies.Registry.find(&registry, &key) {
+    Option<Published<ThreadBodies.Entry>>.Some {value} => move value _ => { return Option<Answer>.none() }
+  }
+  let supplied = Published<ThreadBodies.Entry>.get(&entry)
+  let mut remaining: usize = 8192
+  let imported = run importThreadGuard(&mut resolver.*, &supplied.guard, usize.ZERO, &mut remaining)
+  if imported == usize.MAX { resolver.threadBodies.refused = resolver.threadBodies.refused + usize.ONE return Option<Answer>.none() }
+  let answer = Answer {outcome: Outcome.Success {value: Value.Body {body: Published<TypedBody>.clone(&supplied.body)}}, dependencies: List<Dependency>.make()}
+  run Graph.startRun(&mut resolver.graph, unit)
+  run Graph.record(&mut resolver.graph, unit, Dependee.UnitResult {unit: imported})
+  drop run Graph.finishRun(&mut resolver.graph, unit, Option<ContentHash>.none())
+  run threadGuardSlot(&mut resolver.threadBodies.units, unit)
+  List<ThreadGuardSlot>.set(&mut resolver.threadBodies.units, unit,
+    ThreadGuardSlot.Ready {guard: Published<ThreadBodies.Guard>.clone(&supplied.guard)})
+  resolver.threadBodies.avoided = resolver.threadBodies.avoided + usize.ONE
+  resolver.hits = resolver.hits + usize.ONE
+  return Option<Answer>.some(move answer)
+}
+
 effect fn withRunning<'a, 'b>(
   resolver: &'a mut Resolver,
   query: &'b mut Query<Answer, NoRejection>,
@@ -10980,6 +11293,7 @@ effect fn withRunning<'a, 'b>(
     let mut fingerprint = Option<ContentHash>.none()
     if resource.resolver.revisable { fingerprint = answerFingerprint(&claimed) }
     drop run Graph.finishRun(&mut resource.resolver.*.graph, unit, move fingerprint)
+    if selected.family == Family.Body { run publishThreadBody(&mut resource.resolver.*, unit, &claimed) }
     return Result<Answer, NoRejection>.succeed(move claimed)
   }
   let release = effect fn(resource: &mut Running<'a, 'b>) -> () {
@@ -11902,6 +12216,9 @@ effect fn demandAfresh(
       Answer,
       NoRejection,
     > ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError | StaticBudgetRefusal ? &mut Allocator | &mut Types {
+      if let Option<Answer>.Some {value} = move run importThreadBody(&mut resolver.*, u64.toUsize(demanded.value)) {
+        return Result<Answer, NoRejection>.succeed(move value)
+      }
       run emit(&mut resolver.*, EventKind.Start, demanded)
       let zone = Profiler.zone(String.utf8Bytes(familyName(key.family)))
       static if Profiler.enabled {
@@ -12190,7 +12507,7 @@ effect fn resolveBucket(
     &module,
     Bytes.asSlice(&name),
   )
-  if let Option<Shared<NameObservation>>.Some {value} = move bucket {
+  if let Option<Published<NameObservation>>.Some {value} = move bucket {
     return Answer {
       outcome: Outcome.Success {value: Value.Name {bucket: move value}},
       dependencies: List<Dependency>.make(),
@@ -94424,6 +94741,8 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
       staticDemandLimit: usize.MAX,
       discoveredStaticCall: Option<StaticCallHint>.none(),
       source: move source,
+      threadBodies: noThreadBodies(),
+      nextThreadBodyGuard: usize.ZERO,
       revisable: revisable,
       baseTarget: target,
       target: selectedTarget,
@@ -94550,6 +94869,7 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
     artifactCacheEntries: List<ArtifactCacheEntry>.make(),
     artifactCacheDigests: DigestSet.make(),
     artifactWorkers: List<CheckWorker>.make(),
+    threadWorkers: List<ThreadFrontier.Worker<Bytes, Bytes>>.make(),
     deferredFrontierGraph: Option<BuildRecord.Record>.none(),
     deferredFrontierSubsets: List<DeferredFrontierSubset>.make(),
     artifactCacheRoots: List<usize>.make(),
@@ -94627,6 +94947,22 @@ impl Semantic {
   pub fn cached(revision: Revision, target: MachineTarget, profile: Option<FinalProfile>) -> Semantic {
     return openStore(SourceIndex.make(move revision), target, move profile, false, false)
   }
+  /// Constructs a private immutable query store on its owning thread. The caller supplies
+  /// Registry.provider() as this store's Types service. No Semantic value crosses threads.
+  pub effect fn threadWorker(registry: &ThreadBodies.Registry) -> Semantic ! OutOfMemoryError ? &mut Allocator {
+    let profile = match ThreadBodies.Registry.profile(registry) {
+      Option<FinalProfile>.Some {value} => Option<FinalProfile>.some(run FinalProfile.copy(&value))
+      _ => Option<FinalProfile>.none()
+    }
+    let mut store = openStore(SourceIndex.inEpoch(ThreadBodies.Registry.epoch(registry)),
+      ThreadBodies.Registry.target(registry), move profile, false, false)
+    store.resolver.graph = Graph.make(true)
+    store.resolver.threadBodies.registry = Option<ThreadBodies.Registry>.some(ThreadBodies.Registry.clone(registry))
+    store.processWorkersAllowed = false
+    return move store
+  }
+  /// Actual ordinary Body provider runs avoided by this store's ready-only registry.
+  pub fn threadBodyReuseCount(self: &Self) -> usize { return self.resolver.threadBodies.avoided }
   /// Creates a store for a one-shot build whose revision holds the whole program.
   ///
   /// # Details
@@ -94685,23 +95021,27 @@ impl Semantic {
   }
   /// Selects the execution-storage component a build binds when a reached instance suspends.
   pub fn selectExecutionStorage(self: &mut Self, storage: ExecutionStorage) -> () {
+    threadRequestChanged(&mut self.resolver)
     self.resolver.executionStorage = Option<ExecutionStorage>.some(move storage)
   }
   /// Adds one of the target's support modules, such as the standard library's C library for a
   /// target without one, whose C exports an executable roots beside its runtime's, whatever that
   /// runtime is. Unless `hosted`, those exports are link symbols the module does not export.
   pub effect fn selectSupport(self: &mut Self, module: ModuleId, hosted: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+    threadRequestChanged(&mut self.resolver)
     if !hosted { run List<ModuleId>.append(&mut self.resolver.linkOnlySupport, ModuleId.copy(&module)) }
     return run List<ModuleId>.append(&mut self.resolver.support, move module)
   }
   /// Selects the composition's explicit retention roots, which an artifact build keeps beside its
   /// exports (ARTIFACT-003).
   pub fn selectRetention(self: &mut Self, roots: List<RetentionRoot>) -> () {
+    threadRequestChanged(&mut self.resolver)
     self.resolver.retention = move roots
   }
   /// Selects whether checked bodies keep the names they resolve, which an editor reads to answer
   /// hover and go to definition. A build leaves it off and keeps no table.
   pub fn selectEditorTables(self: &mut Self, enabled: bool) -> () {
+    threadRequestChanged(&mut self.resolver)
     self.resolver.editorTables = enabled
   }
   /// Hands the store the reporter that checking and emission advance; `takeProgress` returns it.
@@ -94724,15 +95064,18 @@ impl Semantic {
   /// Selects the package graph of a build that spans several packages (PACKAGE-002). Without a
   /// selection every import path names a module of its importer's own package.
   pub fn selectPackages(self: &mut Self, packages: PackageGraph) -> () {
+    threadRequestChanged(&mut self.resolver)
     self.resolver.packages = move packages
   }
   pub fn selectDiscovery(self: &mut Self, root: ModuleId, directory: Bytes) -> () {
+    threadRequestChanged(&mut self.resolver)
     self.resolver.discovery = Option<Discovery>.some(Discovery {root: move root, directory: move directory,
       exports: List<ModuleId>.make()})
   }
   /// Adds the package's exported modules to the selected discovery root, so their tests are
   /// discovered even when the root imports none of them (TEST-003).
   pub fn selectDiscoveryExports(self: &mut Self, exports: List<ModuleId>) -> () {
+    threadRequestChanged(&mut self.resolver)
     match &mut self.resolver.discovery {
       Option<Discovery>.Some {value} => { value.exports = move exports }
       Option<Discovery>.None => { drop exports }
@@ -95009,6 +95352,7 @@ impl Semantic {
   pub effect fn bindAssemblyFacts(self: &mut Self, facts: &InitialProfile) -> bool
   ! OutOfMemoryError
   ? &mut Allocator {
+    threadRequestChanged(&mut self.resolver)
     let selectedTarget = InitialProfile.target(facts)
     if MachineTarget.id(selectedTarget) != MachineTarget.id(&self.resolver.target) {
       return false
@@ -95030,6 +95374,7 @@ impl Semantic {
   }
   /// Opens one fresh effective-default graph. The caller closes it through a release provider.
   pub fn beginParameterAssembly(self: &mut Self, parameters: List<DeclarationId>, bindings: List<ProfileEntry>) -> usize {
+    threadRequestChanged(&mut self.resolver)
     let previous = self.resolver.profileSlot
     self.resolver.nextAssembly = self.resolver.nextAssembly + usize.ONE
     self.resolver.profileSlot = usize.MAX - self.resolver.nextAssembly
@@ -95040,12 +95385,14 @@ impl Semantic {
   }
   /// Restores the previous complete-profile scope after success, rejection, or cancellation.
   pub fn endParameterAssembly(self: &mut Self, previous: usize) -> () {
+    threadRequestChanged(&mut self.resolver)
     self.resolver.parameterAssembly = Option<ParameterAssembly>.none()
     self.resolver.profileSlot = previous
     return ()
   }
   /// Replaces effective bindings with the complete map before any final predicates execute.
   pub fn selectAssemblyValues(self: &mut Self, values: List<ProfileEntry>) -> () {
+    threadRequestChanged(&mut self.resolver)
     if let Option<ParameterAssembly>.Some {value} = &mut self.resolver.parameterAssembly {
       replaceAssemblyValues(&mut value, move values)
     }
@@ -95130,6 +95477,7 @@ impl Semantic {
   pub effect fn reviseProfile(self: &mut Self, profile: Option<FinalProfile>) -> ()
   ! OutOfMemoryError
   ? &mut Allocator | &mut Types {
+    threadRequestChanged(&mut self.resolver)
     SpecializationBudget.clear(&mut self.specializationBudget)
     self.frontierCoverage = List<FrontierCoverage>.make()
     self.frontierSweepUnits = List<usize>.make()
@@ -101245,7 +101593,31 @@ impl Semantic {
     return run Semantic.prepareArtifactWithCache(&mut self.*, &mut request.*, runtime, rootPackage, checked, closureNodes, true)
   }
 
+  /// Whether this store still owns a live native semantic worker. Process workers are separate.
+  pub fn threadFrontierRunning(self: &Self) -> bool {
+    let workers = List<ThreadFrontier.Worker<Bytes, Bytes>>.asSlice(&self.threadWorkers)
+    let mut at = usize.ZERO
+    while at < workers.length {
+      if !ThreadFrontier.Worker<Bytes, Bytes>.joined(&workers[at]) { return true }
+      at = at + usize.ONE
+    }
+    return false
+  }
+
+  /// Cancels and joins native workers before any process fork. Imported immutable answers and
+  /// their local dependency guards remain valid; callers export needed worker evidence first.
+  pub fn stopThreadFrontier(self: &mut Self) -> () {
+    let workers = List<ThreadFrontier.Worker<Bytes, Bytes>>.asMutSlice(&mut self.threadWorkers)
+    let mut at = usize.ZERO
+    while at < workers.length {
+      ThreadFrontier.Worker<Bytes, Bytes>.close(&mut workers[at])
+      at = at + usize.ONE
+    }
+    List<ThreadFrontier.Worker<Bytes, Bytes>>.clear(&mut self.threadWorkers)
+  }
+
   fn stopArtifactWorkers(self: &mut Self) -> () {
+    Semantic.stopThreadFrontier(&mut self.*)
     stopFrontier(List<CheckWorker>.asSlice(&self.artifactWorkers))
     List<CheckWorker>.clear(&mut self.artifactWorkers)
     self.deferredFrontierGraph = Option<BuildRecord.Record>.none()
@@ -113828,4 +114200,184 @@ test effect fn sharedEscapeViewsReuseGreenRootsWithoutFirstParentAssumptions() -
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut types = TypeTable.make()
   run sharedEscapeGreenRootClaims() |> Effect.provideMut<Types>(&mut types) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Actual provider sharing, not merely ownership transfer: the producer constructs its mutable
+// store on a native thread and drops it before join; the consumer constructs a different store.
+effect fn produceThreadRegistryBody(registry: &ThreadBodies.Registry, module: &ModuleId) -> bool
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut store = run Semantic.threadWorker(registry)
+  let mut request = Request.make()
+  let checked = run Semantic.checkModule(&mut store, &mut request, module, &Option<ModuleId>.none())
+  return !checkRefuses(&checked) && store.resolver.threadBodies.published > usize.ZERO
+}
+fn threadRegistryProducer(registry: ThreadBodies.Registry, module: ModuleId) -> bool {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut types = ThreadBodies.Registry.provider(&registry)
+  let attempted = run Effect.result(produceThreadRegistryBody(&registry, &module))
+    |> Effect.provideMut<Types>(&mut types) |> Effect.provideMut<Allocator>(&mut allocator)
+  return match move attempted {
+    Result<bool, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} => value
+    _ => false
+  }
+}
+effect fn directThreadBodyClaims() -> ()
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError | SpawnError | AssertionError<'static> ? &mut Allocator {
+  if !ThreadFrontier.available() { return () }
+  let caller = run ModuleId.make(b"memory", b"thread-registry", b"caller.silk")
+  let callee = run ModuleId.make(b"memory", b"thread-registry", b"callee.silk")
+  let callerText = Option<Bytes>.some(run Bytes.copy(b"import callee\npub fn caller() -> i32 { return callee.helper() }\n"))
+  let calleeText = Option<Bytes>.some(run Bytes.copy(b"pub fn helper() -> i32 { return 1 }\n"))
+  let initial = run Revision.publish(&Revision.make(), &caller, &callerText)
+  let revision = run Revision.publish(&initial, &callee, &calleeText)
+  let target = MachineTarget.forId(TargetId.Aarch64AppleDarwin)
+  let epoch = run SourceEpoch.make(run Revision.copy(&revision))
+  let registry = run ThreadBodies.Registry.make(move epoch, target, Option<FinalProfile>.none(),
+    Option<ModuleId>.none(), run SharedTypePool.make())
+  let workerRegistry = ThreadBodies.Registry.clone(&registry)
+  let workerModule = ModuleId.copy(&caller)
+  let worker = run NativeThread.spawn(fn() -> bool { return threadRegistryProducer(move workerRegistry, move workerModule) })
+  run Testing.expect(worker.join(), "a real native worker publishes completed bodies and guards before its private store drops")
+  let mut consumer = run Semantic.threadWorker(&registry)
+  let mut types = ThreadBodies.Registry.provider(&registry)
+  let mut request = Request.make()
+  let checked = run Semantic.checkModule(&mut consumer, &mut request, &caller, &Option<ModuleId>.none())
+    |> Effect.provideMut<Types>(&mut types)
+  run Testing.expect(!checkRefuses(&checked) && Semantic.threadBodyReuseCount(&consumer) > usize.ZERO,
+    "the receiving private store avoids actual Body providers using direct immutable publications")
+  run Testing.expect(!consumer.processWorkersAllowed && !Semantic.threadFrontierRunning(&consumer),
+    "a native worker's private store cannot fork an inner process pool")
+  let mut bodies = usize.ZERO
+  let mut at = usize.ZERO
+  while at < List<ScopedKey>.length(&consumer.resolver.keys) {
+    let key = List<ScopedKey>.get(&consumer.resolver.keys, at).key
+    if key.family == Family.Body && key.member == usize.ZERO {
+      if let Option<ThreadBodies.Key>.Some {value: exact} = move threadBodyKey(&consumer.resolver, at) {
+        if let Option<Published<ThreadBodies.Entry>>.Some {value: entry} = move ThreadBodies.Registry.find(&registry, &exact) {
+          let supplied = Published<ThreadBodies.Entry>.get(&entry)
+          let mut remaining: usize = 8192
+          if let Option<Published<ThreadBodies.Guard>>.Some {value: guard} = move run threadGuardUnit(
+            &mut consumer.resolver, &registry, at, usize.ZERO, &mut remaining) {
+            run Testing.expect(Published<ThreadBodies.Guard>.same(&guard, &supplied.guard),
+              "an imported Body re-exports exactly its retained global guard identity")
+            let before = List<ImportedThreadGuard>.length(&consumer.resolver.threadBodies.imported)
+            remaining = 8192
+            drop run importThreadGuard(&mut consumer.resolver, &guard, usize.ZERO, &mut remaining)
+            run Testing.expect(before == List<ImportedThreadGuard>.length(&consumer.resolver.threadBodies.imported),
+              "a second import reuses the local guard rather than growing another DAG")
+            bodies = bodies + usize.ONE
+          }
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+  run Testing.expect(bodies > usize.ZERO, "guard identity assertions cover an actually reused ordinary Body")
+  let image = run Semantic.completeCacheImage(&mut consumer)
+  // The saved image must remain valid after every worker/registry disappears, and must retain
+  // dependency reads below a caller whose own source bytes do not change.
+  let trials = [b"pub fn helper() -> bool { return true }\n", b"pub fn renamed() -> i32 { return 1 }\n"]
+  let mut trial = usize.ZERO
+  while trial < trials.length {
+    let changed = run Revision.publish(&revision, &callee, &Option<Bytes>.some(run Bytes.copy(trials[trial])))
+    let mut replay = Semantic.cached(run Revision.copy(&changed), target, Option<FinalProfile>.none())
+    let mut replayTypes = TypeTable.make()
+    drop run Semantic.adoptCache(&mut replay, &request, &image, false) |> Effect.provideMut<Types>(&mut replayTypes)
+    let actual = run Semantic.checkModule(&mut replay, &mut request, &caller, &Option<ModuleId>.none())
+      |> Effect.provideMut<Types>(&mut replayTypes)
+    let mut fresh = Semantic.cached(move changed, target, Option<FinalProfile>.none())
+    let mut freshTypes = TypeTable.make()
+    let expected = run Semantic.checkModule(&mut fresh, &mut request, &caller, &Option<ModuleId>.none())
+      |> Effect.provideMut<Types>(&mut freshTypes)
+    let found = List<Shared<Rejection>>.asSlice(&actual.rejections)
+    let wanted = List<Shared<Rejection>>.asSlice(&expected.rejections)
+    run Testing.expect(found.length > usize.ZERO && found.length == wanted.length,
+      "callee signature/roster edits invalidate a shared caller whose own text is unchanged")
+    at = usize.ZERO
+    while at < found.length {
+      let mut left = Bytes.make()
+      let mut right = Bytes.make()
+      let mut sites = List<ModuleId>.make()
+      run Testing.expect((run RejectionImage.encode(&mut left, &found[at], &mut sites))
+        && (run RejectionImage.encode(&mut right, &wanted[at], &mut sites)), "complete dependency diagnostics encode")
+      run Testing.expect(same(Bytes.asSlice(&left), Bytes.asSlice(&right)),
+        "direct thread sharing preserves full ordered fresh diagnostics after cache adoption")
+      at = at + usize.ONE
+    }
+    trial = trial + usize.ONE
+  }
+  // A new epoch never inherits ready entries, even if an unrelated allocator reuses an address.
+  let nextEpoch = run SourceEpoch.make(run Revision.copy(&revision))
+  let other = run ThreadBodies.Registry.make(move nextEpoch, target, Option<FinalProfile>.none(),
+    Option<ModuleId>.none(), run SharedTypePool.make())
+  run Testing.expect(!ThreadBodies.Registry.same(&registry, &other), "separate source invocations own separate ready directories")
+  let mut newStore = run Semantic.threadWorker(&other)
+  let mut newTypes = ThreadBodies.Registry.provider(&other)
+  drop run Semantic.checkModule(&mut newStore, &mut request, &caller, &Option<ModuleId>.none())
+    |> Effect.provideMut<Types>(&mut newTypes)
+  run Testing.expect(Semantic.threadBodyReuseCount(&newStore) == usize.ZERO, "an empty new epoch does not borrow a previous invocation's body")
+  // Mutating a request after successful import leaves owned answers alive but disables sharing.
+  Semantic.selectEditorTables(&mut consumer, true)
+  run Testing.expect(match &consumer.resolver.threadBodies.registry { Option<ThreadBodies.Registry>.None => true _ => false },
+    "request mutation cannot reuse previously authenticated guard memo entries")
+}
+test effect fn directThreadBodiesAvoidProvidersAndPreserveFineCacheGuards() -> ()
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError | SpawnError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run directThreadBodyClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn directThreadGuardClaims() -> () ! Cycle | InvalidModulePath | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let module = run ModuleId.make(b"memory", b"thread-guard", b"cycle.silk")
+  let registry = run ThreadBodies.Registry.make(run SourceEpoch.make(Revision.make()),
+    MachineTarget.forId(TargetId.Aarch64AppleDarwin), Option<FinalProfile>.none(), Option<ModuleId>.none(), run SharedTypePool.make())
+  let mut store = run Semantic.threadWorker(&registry)
+  let ordinal = run internModule(&mut store.resolver, &module)
+  let leftKey = run internKey(&mut store.resolver, Key {family: Family.Signature, module: ordinal,
+    name: 99, declaration: usize.MAX, member: 0, external: false})
+  let rightKey = run internKey(&mut store.resolver, Key {family: Family.Signature, module: ordinal,
+    name: 99, declaration: usize.MAX, member: 1, external: false})
+  let left = u64.toUsize(leftKey.value)
+  let right = u64.toUsize(rightKey.value)
+  run Graph.startRun(&mut store.resolver.graph, left)
+  run Graph.record(&mut store.resolver.graph, left, Dependee.UnitResult {unit: right})
+  drop run Graph.finishRun(&mut store.resolver.graph, left, Option<ContentHash>.none())
+  run Graph.startRun(&mut store.resolver.graph, right)
+  run Graph.record(&mut store.resolver.graph, right, Dependee.UnitResult {unit: left})
+  drop run Graph.finishRun(&mut store.resolver.graph, right, Option<ContentHash>.none())
+  let mut remaining: usize = 8192
+  let cyclic = run threadGuardUnit(&mut store.resolver, &registry, left, usize.ZERO, &mut remaining)
+  run Testing.expect(match &cyclic { Option<Published<ThreadBodies.Guard>>.None => true _ => false },
+    "completed-looking query backedges cannot become an immutable published DAG")
+  let refused = [Family.Condition, Family.ModuleCheck]
+  let mut at = usize.ZERO
+  while at < refused.length {
+    let key = run internKey(&mut store.resolver, Key {family: refused[at], module: ordinal,
+      name: 0, declaration: usize.MAX, member: 0, external: false})
+    let unit = u64.toUsize(key.value)
+    run Graph.startRun(&mut store.resolver.graph, unit)
+    drop run Graph.finishRun(&mut store.resolver.graph, unit, Option<ContentHash>.none())
+    remaining = 8192
+    let guard = run threadGuardUnit(&mut store.resolver, &registry, unit, usize.ZERO, &mut remaining)
+    run Testing.expect(match &guard { Option<Published<ThreadBodies.Guard>>.None => true _ => false },
+      "availability-ledger conditions and opaque adopted checks cannot be erased by a body import")
+    at = at + usize.ONE
+  }
+  let requestInput = run observedSource(&mut store.resolver, &module, SourceSelector.Request {fact: run Bytes.copy(b"application")})
+  drop requestInput
+  let input = List<Inputs.Input>.length(&store.resolver.sourceInputs.inputs) - usize.ONE
+  let source = &List<Inputs.Input>.asSlice(&store.resolver.sourceInputs.inputs)[input]
+  let wrong = run Published<ThreadBodies.Guard>.make(ThreadBodies.Guard.Input {input: ThreadBodies.Input {
+    module: ModuleId.copy(&module), selector: run ThreadBodies.copySelector(&source.selector), declaration: Option<DeclarationId>.none(),
+    digest: ContentHash {high: source.digest.high, low: source.digest.low + 1}, text: source.text}})
+  let before = List<ImportedThreadGuard>.length(&store.resolver.threadBodies.imported)
+  remaining = 8192
+  let result = run importThreadGuard(&mut store.resolver, &wrong, usize.ZERO, &mut remaining)
+  run Testing.expect(result == usize.MAX && List<ImportedThreadGuard>.length(&store.resolver.threadBodies.imported) == before,
+    "mismatched request evidence publishes no imported guard")
+}
+test effect fn directThreadBodyGuardsRefuseCyclesAndWrongRequests() -> ()
+! Cycle | InvalidModulePath | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run directThreadGuardClaims() |> Effect.provideMut<Allocator>(&mut allocator)
 }

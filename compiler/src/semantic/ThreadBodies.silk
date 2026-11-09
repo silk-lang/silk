@@ -1,0 +1,191 @@
+//! Ready-only completed bodies in one retained immutable source/type epoch.
+//! No query stores, local declaration slots, unfinished providers or borrowed pointers cross
+//! this boundary. Guard DAGs preserve ordered conjunctions and exact source selectors.
+import semantic.Published {Published}
+import semantic.SourceEpoch {SourceEpoch}
+import semantic.DeclarationId {DeclarationId}
+import semantic.ModuleId {ModuleId}
+import semantic.SourceInputs {Selector}
+import semantic.ContentHash {ContentHash}
+import semantic.FinalProfile {FinalProfile}
+import semantic.Target {Target}
+import semantic.Types {SharedTypePool, ThreadTypes}
+import semantic.TypedBody {TypedBody}
+import silk.concurrency.sync {Mutex}
+import silk.collections.list {List}
+import silk.collections.bytes {Bytes}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.core.option {Option}
+import silk.num.usize
+import silk.num.u64
+
+/// A local handle is replaced by its stable declaration before publication.
+pub struct Input {
+  pub module: ModuleId,
+  pub selector: Selector,
+  pub declaration: Option<DeclarationId>,
+  pub digest: ContentHash,
+  pub text: ContentHash,
+}
+/// Constructed only from completed query graph nodes in this registry's immutable epoch.
+pub union Guard {
+  File {pub module: ModuleId},
+  Input {pub input: Input},
+  All {pub children: List<Published<Guard>>},
+}
+/// Ordinary Body key. Target/application/selected profile are fixed by Registry, while the
+/// absent, profile-independent, and selected-profile scope categories remain distinct.
+pub struct Key {
+  pub declaration: DeclarationId,
+  pub profile: usize,
+  pub name: usize,
+  pub external: bool,
+}
+pub struct Entry {
+  pub key: Key,
+  pub body: Published<TypedBody>,
+  pub guard: Published<Guard>,
+}
+struct Directory {
+  slots: List<Option<Published<Entry>>>,
+  count: usize,
+  guardBytes: usize,
+  bodyNodes: usize,
+}
+struct Context {
+  epoch: SourceEpoch,
+  target: Target,
+  profile: Option<FinalProfile>,
+  application: Option<ModuleId>,
+  pool: SharedTypePool,
+  directory: Mutex<Directory>,
+}
+/// A clone retains precisely one source epoch, request context and canonical type pool.
+pub struct Registry { context: Published<Context> }
+
+fn sameKey(left: &Key, right: &Key) -> bool {
+  return left.profile == right.profile && left.name == right.name && left.external == right.external
+    && DeclarationId.equals(&left.declaration, &right.declaration)
+}
+fn firstSlot(key: &Key, count: usize) -> usize {
+  // Hash only selects candidates; the complete structural key decides equality.
+  return u64.toUsize(DeclarationId.hash(&key.declaration)) % count
+}
+impl Registry {
+  pub effect fn make(epoch: SourceEpoch, target: Target, profile: Option<FinalProfile>,
+    application: Option<ModuleId>, pool: SharedTypePool) -> Self ! OutOfMemoryError ? &mut Allocator {
+    let mut slots = List<Option<Published<Entry>>>.make()
+    run List<Option<Published<Entry>>>.reserveExact(&mut slots, 65536)
+    let mut at = usize.ZERO
+    while at < 65536 {
+      run List<Option<Published<Entry>>>.append(&mut slots, Option<Published<Entry>>.none())
+      at = at + usize.ONE
+    }
+    let directory = run Mutex<Directory>.make(Directory {slots: move slots, count: usize.ZERO,
+      guardBytes: usize.ZERO, bodyNodes: usize.ZERO})
+    return Self {context: run Published<Context>.make(Context {epoch: move epoch, target: target,
+      profile: move profile, application: move application, pool: move pool, directory: move directory})}
+  }
+  pub fn clone(self: &Self) -> Self { return Self {context: Published<Context>.clone(&self.context)} }
+  pub fn epoch(self: &Self) -> &SourceEpoch { return &Published<Context>.get(&self.context).epoch }
+  pub fn target(self: &Self) -> Target { return Published<Context>.get(&self.context).target }
+  pub fn profile(self: &Self) -> &Option<FinalProfile> { return &Published<Context>.get(&self.context).profile }
+  pub fn application(self: &Self) -> &Option<ModuleId> { return &Published<Context>.get(&self.context).application }
+  pub fn provider(self: &Self) -> ThreadTypes { return SharedTypePool.provider(&Published<Context>.get(&self.context).pool) }
+  pub fn same(left: &Self, right: &Self) -> bool { return Published<Context>.same(&left.context, &right.context) }
+
+  /// Returns only a retained completed entry. A miss never waits for another provider.
+  pub fn find(self: &Self, key: &Key) -> Option<Published<Entry>> {
+    let held = Mutex<Directory>.lock(&Published<Context>.get(&self.context).directory)
+    let slots = List<Option<Published<Entry>>>.asSlice(&held.get().slots)
+    let mut at = firstSlot(key, slots.length)
+    let mut visited = usize.ZERO
+    while visited < slots.length {
+      match &slots[at] {
+        Option<Published<Entry>>.Some {value} => {
+          if sameKey(&Published<Entry>.get(&value).key, key) {
+            return Option<Published<Entry>>.some(Published<Entry>.clone(&value))
+          }
+        }
+        Option<Published<Entry>>.None => { return Option<Published<Entry>>.none() }
+      }
+      at = (at + usize.ONE) % slots.length
+      visited = visited + usize.ONE
+    }
+    return Option<Published<Entry>>.none()
+  }
+  /// Reserves conservative bytes before constructing a guard node. Failed allocations may
+  /// consume budget but cannot publish evidence or exceed it; there is no reclamation race.
+  pub fn reserveGuard(self: &Self, bytes: usize) -> bool {
+    let mut held = Mutex<Directory>.lock(&Published<Context>.get(&self.context).directory)
+    let directory = held.getMut()
+    if bytes > 134217728 - directory.guardBytes { return false }
+    directory.guardBytes = directory.guardBytes + bytes
+    return true
+  }
+  /// Insertion never allocates or drops a payload under the directory lock. Racing duplicate
+  /// providers keep the first completed supplier and discard their private entry after unlock.
+  pub fn publish(self: &Self, entry: Published<Entry>) -> bool {
+    let nodes = TypedBody.nodeSlice(Published<TypedBody>.get(&Published<Entry>.get(&entry).body)).length
+    let mut held = Mutex<Directory>.lock(&Published<Context>.get(&self.context).directory)
+    let directory = held.getMut()
+    if directory.count >= 32768 || nodes > 65536 || nodes > 4194304 - directory.bodyNodes {
+      drop held
+      return false
+    }
+    let slots = List<Option<Published<Entry>>>.asMutSlice(&mut directory.slots)
+    let mut at = firstSlot(&Published<Entry>.get(&entry).key, slots.length)
+    let mut visited = usize.ZERO
+    while visited < slots.length {
+      match &slots[at] {
+        Option<Published<Entry>>.Some {value} => {
+          if sameKey(&Published<Entry>.get(&value).key, &Published<Entry>.get(&entry).key) {
+            drop held
+            return false
+          }
+        }
+        Option<Published<Entry>>.None => {
+          slots[at] = Option<Published<Entry>>.some(move entry)
+          directory.count = directory.count + usize.ONE
+          directory.bodyNodes = directory.bodyNodes + nodes
+          return true
+        }
+      }
+      at = (at + usize.ONE) % slots.length
+      visited = visited + usize.ONE
+    }
+    drop held
+    return false
+  }
+}
+
+/// Copies just the structural selector. Handle-bearing variants remain unbound until Semantic
+/// resolves Input.declaration in its own source index; no dense slot crosses stores.
+pub effect fn copySelector(value: &Selector) -> Selector ! OutOfMemoryError ? &mut Allocator {
+  return match &value.* {
+    Selector.Presence => Selector.Presence
+    Selector.Implementations => Selector.Implementations
+    Selector.Inherents => Selector.Inherents
+    Selector.Imports => Selector.Imports
+    Selector.VisibleNames {namespaces, external} => Selector.VisibleNames {namespaces: namespaces, external: external}
+    Selector.Identity {identity} => Selector.Identity {identity: DeclarationId.copy(&identity)}
+    Selector.Member {ordinal, ..} => Selector.Member {handle: usize.MAX, ordinal: ordinal}
+    Selector.Name {spelling} => Selector.Name {spelling: run Bytes.copy(Bytes.asSlice(&spelling))}
+    Selector.Selection {spelling} => Selector.Selection {spelling: run Bytes.copy(Bytes.asSlice(&spelling))}
+    Selector.Declaration {facet, ..} => Selector.Declaration {handle: usize.MAX, facet: facet}
+    Selector.Location {location, ..} => Selector.Location {handle: usize.MAX, location: location}
+    Selector.Prefix {end} => Selector.Prefix {end: end}
+    Selector.Resolution {path} => Selector.Resolution {path: run Bytes.copy(Bytes.asSlice(&path))}
+    Selector.Request {fact} => Selector.Request {fact: run Bytes.copy(Bytes.asSlice(&fact))}
+  }
+}
+/// Dynamic bytes copied for a leaf, in addition to a conservative fixed node/identity charge.
+pub fn selectorBytes(value: &Selector) -> usize {
+  return match &value.* {
+    Selector.Name {spelling} => Bytes.length(&spelling)
+    Selector.Selection {spelling} => Bytes.length(&spelling)
+    Selector.Resolution {path} => Bytes.length(&path)
+    Selector.Request {fact} => Bytes.length(&fact)
+    _ => usize.ZERO
+  }
+}
