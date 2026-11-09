@@ -3154,10 +3154,9 @@ const program = Effect.gen(function* () {
       assert.equal(relocatedRun.status, 0, relocatedRun.stderr)
     }
   }
-  // Profile fields the native build cannot honor yet, a profile artifact other than the one
-  // [package].kind requests, unknown manifest fields and reserved module names are refused
-  // before anything is built, naming the manifest line.
-  const refusedProfiles = ['sanitizers = ["address"]', 'unwind = "native"', 'artifact = "object"', 'opt = "speed"']
+  // Profile fields the native build cannot honor yet, unknown manifest fields and reserved module
+  // names are refused before anything is built, naming the manifest line.
+  const refusedProfiles = ['sanitizers = ["address"]', 'unwind = "native"', 'opt = "speed"']
   for (const field of refusedProfiles) {
     yield* fs.writeFileString(
       join(tuned, 'silk.toml'),
