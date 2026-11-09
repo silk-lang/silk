@@ -3,20 +3,24 @@
 //! The root `tool` member is deliberately excluded before conversion: its TOML values are opaque.
 
 import CompilerBug
+import driver.ManifestFields
 import driver.ManifestText
+import ReleaseVersion
 import lexer.Span { Span }
 import silk.build.source { Source }
 import silk.collections.bytes { Bytes }
 import silk.collections.list { List }
 import silk.collections.slice { Slice }
 import silk.core.effect { Effect }
+import silk.core.option { Option }
 import silk.core.result { Result }
 import silk.json.schema { JsonSchema, Draft, Output, JsonSchemaError, Diagnostic as SchemaDiagnostic }
 import silk.json.schema_resolver { SchemaResolver, SchemaRegistry, SchemaResolutionError }
 import silk.json.schema_value { SchemaValue, ValueError }
-import silk.json.value { Value, JsonEntry }
+import silk.json.value { Json, Value, JsonEntry }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.mem.box { Box }
+import silk.num.u8
 import silk.num.usize
 import silk.text.regex { RegexError }
 import silk.text.string { String }
@@ -59,6 +63,13 @@ pub effect fn diagnose(text: &[u8]) -> List<Diagnostic> ! OutOfMemoryError ? &mu
 /// Validates the already parsed `document` corresponding to `text`, without reparsing TOML.
 /// Numbers retain their exact spelling and magnitude. Nonfinite numbers outside `tool` are
 /// diagnosed as JSON data-model incompatibilities; schema/evaluator faults are compiler bugs.
+/// Each failure is worded in the manifest's own terms, such as `package.nmae is not a supported
+/// field; did you mean package.name?`. Unknown fields come first, then other refused values, then
+/// values that match none of a field's accepted forms; each group keeps source order. Failures
+/// inside the alternatives of a field are left out, as only the field's own verdict is certain,
+/// unless exactly one alternative fits the value's shape: then its failures are reported instead.
+/// When the manifest's `silk-version` pins a Silk this compiler cannot stand in for, each message
+/// also says so, since a later Silk may accept what this one refuses.
 pub effect fn validate(text: &[u8], document: &TomlValue) -> List<Diagnostic>
   ! OutOfMemoryError ? &mut Allocator {
   let converted = run Effect.result(instance(document))
@@ -69,10 +80,18 @@ pub effect fn validate(text: &[u8], document: &TomlValue) -> List<Diagnostic>
       ValueError problem => { return run conversionDiagnostics(text, problem) }
     }
   }
-  let evaluated = run Effect.result(evaluate(&value))
+  let parsed = run Effect.result(SchemaValue.parseToml(Source.read("manifest.schema.toml")))
+  let schema = match move parsed {
+    Result<Value, TomlError | ValueError | OutOfMemoryError>.Success { value: tree } => move tree
+    Result<Value, TomlError | ValueError | OutOfMemoryError>.Failure { error } => match move error {
+      OutOfMemoryError exhausted => { fail move exhausted }
+      _ => CompilerBug.panic(b"embedded manifest schema is not valid TOML")
+    }
+  }
+  let evaluated = run Effect.result(evaluate(&schema, &value))
   let output = match move evaluated {
-    Result<Output, TomlError | ValueError | JsonSchemaError | SchemaResolutionError | RegexError | OutOfMemoryError>.Success { value: result } => move result
-    Result<Output, TomlError | ValueError | JsonSchemaError | SchemaResolutionError | RegexError | OutOfMemoryError>.Failure { error } => match move error {
+    Result<Output, JsonSchemaError | SchemaResolutionError | RegexError | OutOfMemoryError>.Success { value: result } => move result
+    Result<Output, JsonSchemaError | SchemaResolutionError | RegexError | OutOfMemoryError>.Failure { error } => match move error {
       OutOfMemoryError exhausted => { fail move exhausted }
       _ => CompilerBug.panic(b"embedded manifest schema compilation or evaluation failed")
     }
@@ -80,36 +99,681 @@ pub effect fn validate(text: &[u8], document: &TomlValue) -> List<Diagnostic>
   let mut diagnostics = List<Diagnostic>.make()
   if output.valid { return move diagnostics }
   let locations = run sourceLocations(text)
+  let listed = List<Location>.asSlice(&locations)
+  let hint = run versionHint(document)
   let errors = List<SchemaDiagnostic>.asSlice(&output.errors)
+  let chosen = run branches(errors, &schema)
+  let taken = List<Choice>.asSlice(&chosen)
+  let mut problems = List<Problem>.make()
   let mut at: usize = 0
   while at < errors.length {
     let error = &errors[at]
+    let keyword = String.utf8Bytes(String.view(&error.keywordLocation))
     let path = String.utf8Bytes(String.view(&error.instanceLocation))
-    let mut message = Bytes.make()
-    if path.length == 0 { run Bytes.append(&mut message, b"manifest") }
-    else { run Bytes.append(&mut message, path) }
-    run Bytes.append(&mut message, b": ")
-    run Bytes.append(&mut message, String.utf8Bytes(String.view(&error.error)))
-    run Bytes.append(&mut message, b" (constraint ")
-    run Bytes.append(&mut message, String.utf8Bytes(String.view(&error.keywordLocation)))
-    run Bytes.append(&mut message, b")")
+    if visible(keyword, path, taken) && !decided(keyword, path, taken)
+      && !aggregate(lastSegment(keyword), String.utf8Bytes(String.view(&error.error))) {
+      let span = location(listed, path, text.length)
+      let mut message = Bytes.make()
+      let rank = run word(&mut message, text, span, &schema, &value, error)
+      run Bytes.append(&mut message, Bytes.asSlice(&hint))
+      let known = List<Problem>.asSlice(&problems)
+      if !reported(known, span, Bytes.asSlice(&message)) {
+        let place = placeOf(known, rank, span.start)
+        run List<Problem>.insert(&mut problems, place, Problem { rank: rank, span: span, message: move message })
+      }
+    }
+    at = at + 1
+  }
+  let worded = List<Problem>.asSlice(&problems)
+  at = 0
+  while at < worded.length {
     run List<Diagnostic>.append(&mut diagnostics, Diagnostic {
-      span: location(List<Location>.asSlice(&locations), path, text.length),
-      code: run Bytes.copy(b"MANIFEST_SCHEMA"), message: move message,
+      span: worded[at].span, code: run Bytes.copy(b"MANIFEST_SCHEMA"), message: run Bytes.copy(Bytes.asSlice(&worded[at].message)),
     })
     at = at + 1
+  }
+  if List<Diagnostic>.length(&diagnostics) == 0 && errors.length > 0 {
+    // Every failure was inside an alternative; report the first as the evaluator words it.
+    let path = String.utf8Bytes(String.view(&errors[0].instanceLocation))
+    let mut message = Bytes.make()
+    run appendPath(&mut message, &value, path)
+    run Bytes.append(&mut message, b" is not accepted: ")
+    run Bytes.append(&mut message, String.utf8Bytes(String.view(&errors[0].error)))
+    run Bytes.append(&mut message, Bytes.asSlice(&hint))
+    run List<Diagnostic>.append(&mut diagnostics, Diagnostic {
+      span: location(listed, path, text.length), code: run Bytes.copy(b"MANIFEST_SCHEMA"), message: move message,
+    })
   }
   return move diagnostics
 }
 
-// The schema borrows its tree; keep it in this frame until evaluation has completed.
-effect fn evaluate(instance: &Value) -> Output
-  ! TomlError | ValueError | JsonSchemaError | SchemaResolutionError | RegexError | OutOfMemoryError ? &mut Allocator {
-  let schema = run SchemaValue.parseToml(Source.read("manifest.schema.toml"))
+// The compiled schema borrows `schema`; it is dropped before this frame returns.
+effect fn evaluate(schema: &Value, instance: &Value) -> Output
+  ! JsonSchemaError | SchemaResolutionError | RegexError | OutOfMemoryError ? &mut Allocator {
   let mut registry = SchemaRegistry.make()
-  let compiled = run JsonSchema.compile(&schema, "https://silklang.org/schemas/manifest",
+  let compiled = run JsonSchema.compile(schema, "https://silklang.org/schemas/manifest",
     JsonSchema.options(Draft.Draft202012)) |> Effect.provideMut<SchemaResolver>(&mut registry)
   return run JsonSchema.validate(&compiled, instance)
+}
+
+// One worded failure. Lower ranks are reported first: 0 an unknown field, 1 another refused
+// value, 2 a value that matches none of the forms its field accepts.
+struct Problem { rank: usize, span: Span, message: Bytes }
+
+// Whether `problems` already holds `message` at `span`, as two failures can word alike.
+fn reported(problems: &[Problem], span: Span, message: &[u8]) -> bool {
+  let mut at: usize = 0
+  while at < problems.length {
+    if problems[at].span.start == span.start && problems[at].span.end == span.end
+      && same(Bytes.asSlice(&problems[at].message), message) { return true }
+    at = at + 1
+  }
+  return false
+}
+
+// Where a problem of `rank` starting at `start` goes in the sorted `problems`.
+fn placeOf(problems: &[Problem], rank: usize, start: usize) -> usize {
+  let mut at: usize = 0
+  while at < problems.length {
+    if problems[at].rank > rank || (problems[at].rank == rank && problems[at].span.start > start) { return at }
+    at = at + 1
+  }
+  return problems.length
+}
+
+// An alternative chosen in place of a failed `oneOf` or `anyOf`: `branch` is `.../oneOf/<index>/`
+// and `instance` is where the alternatives were applied, as one keyword applies to every entry
+// of an array.
+struct Choice { instance: Bytes, branch: Bytes }
+
+// Whether `path` is `ancestor` or a JSON Pointer below it.
+fn below(path: &[u8], ancestor: &[u8]) -> bool {
+  if path.length < ancestor.length || !same(Slice.view<u8>(path, 0, ancestor.length), ancestor) { return false }
+  return path.length == ancestor.length || path[ancestor.length] == 47
+}
+
+// Whether `chosen` holds `branch` applied at `instance` or above it.
+fn choosing(chosen: &[Choice], branch: &[u8], instance: &[u8]) -> bool {
+  let mut at: usize = 0
+  while at < chosen.length {
+    if same(Bytes.asSlice(&chosen[at].branch), branch) && below(instance, Bytes.asSlice(&chosen[at].instance)) { return true }
+    at = at + 1
+  }
+  return false
+}
+
+// Whether every `oneOf` or `anyOf` alternative that the evaluation path `keyword` passes through,
+// to reach `instance`, is in `chosen`. A failure inside another alternative only says that
+// alternative did not match, not what is wrong.
+fn visible(keyword: &[u8], instance: &[u8], chosen: &[Choice]) -> bool {
+  let mut at: usize = 0
+  while at + 7 <= keyword.length {
+    let part = Slice.view<u8>(keyword, at, 7)
+    if same(part, b"/oneOf/") || same(part, b"/anyOf/") {
+      let mut end = at + 7
+      while end < keyword.length && keyword[end] != 47 { end = end + 1 }
+      if end == keyword.length { return true }
+      if !choosing(chosen, Slice.view<u8>(keyword, 0, end + 1), instance) { return false }
+      at = end
+    } else {
+      at = at + 1
+    }
+  }
+  return true
+}
+
+// Whether the alternatives failure at `keyword` and `instance` had one alternative chosen in its
+// place.
+fn decided(keyword: &[u8], instance: &[u8], chosen: &[Choice]) -> bool {
+  let last = lastSegment(keyword)
+  if !same(last, b"oneOf") && !same(last, b"anyOf") { return false }
+  let mut at: usize = 0
+  while at < chosen.length {
+    let written = Bytes.asSlice(&chosen[at].branch)
+    if same(Bytes.asSlice(&chosen[at].instance), instance) && written.length > keyword.length + 1
+      && same(Slice.view<u8>(written, 0, keyword.length), keyword) && written[keyword.length] == 47 { return true }
+    at = at + 1
+  }
+  return false
+}
+
+// Whether `settled` already holds the alternatives at `keyword` and `instance`.
+fn settledAt(settled: &[Choice], keyword: &[u8], instance: &[u8]) -> bool {
+  let mut at: usize = 0
+  while at < settled.length {
+    if same(Bytes.asSlice(&settled[at].branch), keyword) && same(Bytes.asSlice(&settled[at].instance), instance) { return true }
+    at = at + 1
+  }
+  return false
+}
+
+// Whether `error` says alternative `prefix` (`.../oneOf/<index>/`) does not fit the shape of the
+// value at `instance`: a missing field, an unknown field, or a wrong type, constant, value or
+// negation of the value itself. Failures of nested alternatives do not count.
+fn structural(error: &SchemaDiagnostic, prefix: &[u8], instance: &[u8]) -> bool {
+  let keyword = String.utf8Bytes(String.view(&error.keywordLocation))
+  if keyword.length <= prefix.length || !same(Slice.view<u8>(keyword, 0, prefix.length), prefix) { return false }
+  let rest = Slice.view<u8>(keyword, prefix.length, keyword.length - prefix.length)
+  if contains(rest, b"oneOf/") || contains(rest, b"anyOf/") { return false }
+  let last = lastSegment(keyword)
+  let path = String.utf8Bytes(String.view(&error.instanceLocation))
+  if same(last, b"additionalProperties") {
+    return same(String.utf8Bytes(String.view(&error.error)), b"boolean schema is false") && same(parentPointer(path), instance)
+  }
+  return same(path, instance) && (same(last, b"required") || same(last, b"type") || same(last, b"const")
+    || same(last, b"enum") || same(last, b"not"))
+}
+
+// The alternatives chosen in place of failed `oneOf` and `anyOf` keywords, as `.../oneOf/<index>/`:
+// where exactly one alternative fits the value's shape, its own failures are what is wrong, as a
+// `{ library = "ssl", mode = "shared" }` link entry is a library entry with a bad mode. Outer
+// alternatives are chosen before the ones inside them.
+effect fn branches(errors: &[SchemaDiagnostic], schema: &Value) -> List<Choice> ! OutOfMemoryError ? &mut Allocator {
+  let mut chosen = List<Choice>.make()
+  let mut settled = List<Choice>.make()
+  let mut changed = true
+  while changed {
+    changed = false
+    let mut at: usize = 0
+    while at < errors.length {
+      let keyword = String.utf8Bytes(String.view(&errors[at].keywordLocation))
+      let last = lastSegment(keyword)
+      let instance = String.utf8Bytes(String.view(&errors[at].instanceLocation))
+      if (same(last, b"oneOf") || same(last, b"anyOf")) && !settledAt(List<Choice>.asSlice(&settled), keyword, instance)
+        && visible(keyword, instance, List<Choice>.asSlice(&chosen)) {
+        run List<Choice>.append(&mut settled, Choice { instance: run Bytes.copy(instance), branch: run Bytes.copy(keyword) })
+        changed = true
+        let mut count: usize = 0
+        match move run pointed(schema, fragment(String.utf8Bytes(String.view(&errors[at].absoluteKeywordLocation)))) {
+          Option<&Value>.Some { value: listed } => {
+            match &listed.* {
+              Value.Array { values } => { count = List<Value>.length(&values) }
+              _ => {}
+            }
+          }
+          Option<&Value>.None => {}
+        }
+        let mut fitting: usize = 0
+        let mut fit = Bytes.make()
+        let mut branch: usize = 0
+        while branch < count {
+          let mut prefix = run Bytes.copy(keyword)
+          run Bytes.append(&mut prefix, b"/")
+          run decimal(&mut prefix, branch)
+          run Bytes.append(&mut prefix, b"/")
+          let mut fits = true
+          let mut other: usize = 0
+          while other < errors.length && fits {
+            if structural(&errors[other], Bytes.asSlice(&prefix), instance) { fits = false }
+            other = other + 1
+          }
+          if fits {
+            fitting = fitting + 1
+            fit = move prefix
+          }
+          branch = branch + 1
+        }
+        if fitting == 1 { run List<Choice>.append(&mut chosen, Choice { instance: run Bytes.copy(instance), branch: move fit }) }
+      }
+      at = at + 1
+    }
+  }
+  return move chosen
+}
+
+// Whether a failure of keyword `last` only collects the failures below it, which are reported on
+// their own. `additionalProperties` is a leaf when its subschema is `false`: an unknown field.
+fn aggregate(last: &[u8], error: &[u8]) -> bool {
+  if same(last, b"additionalProperties") { return !same(error, b"boolean schema is false") }
+  return same(last, b"allOf") || same(last, b"$ref") || same(last, b"properties")
+    || same(last, b"patternProperties") || same(last, b"items") || same(last, b"prefixItems")
+    || same(last, b"then") || same(last, b"else") || same(last, b"if") || same(last, b"propertyNames")
+    || same(last, b"dependentSchemas") || same(last, b"contains")
+}
+
+fn contains(text: &[u8], part: &[u8]) -> bool {
+  let mut at: usize = 0
+  while at + part.length <= text.length {
+    if same(Slice.view<u8>(text, at, part.length), part) { return true }
+    at = at + 1
+  }
+  return false
+}
+
+// The last segment of the JSON Pointer `pointer`, still escaped.
+fn lastSegment(pointer: &[u8]) -> &[u8] {
+  let mut start = pointer.length
+  while start > 0 && pointer[start - 1] != 47 { start = start - 1 }
+  return Slice.view<u8>(pointer, start, pointer.length - start)
+}
+
+// `pointer` without its last segment.
+fn parentPointer(pointer: &[u8]) -> &[u8] {
+  let mut end = pointer.length
+  while end > 0 && pointer[end - 1] != 47 { end = end - 1 }
+  if end == 0 { return pointer }
+  return Slice.view<u8>(pointer, 0, end - 1)
+}
+
+// The JSON Pointer fragment of the absolute keyword location `absolute`, or empty without one.
+fn fragment(absolute: &[u8]) -> &[u8] {
+  let mut at: usize = 0
+  while at < absolute.length {
+    if absolute[at] == 35 { return Slice.view<u8>(absolute, at + 1, absolute.length - at - 1) }
+    at = at + 1
+  }
+  return Slice.view<u8>(absolute, 0, 0)
+}
+
+// The member `key` of the object `value`.
+fn member<'a>(value: &'a Value, key: &[u8]) -> Option<&'a Value> {
+  match &value.* {
+    Value.Object { entries } => {
+      let members = List<JsonEntry>.asSlice(&entries)
+      let mut at: usize = 0
+      while at < members.length {
+        if same(String.utf8Bytes(String.view(&members[at].key)), key) { return Option<&'a Value>.some(&members[at].value) }
+        at = at + 1
+      }
+    }
+    _ => {}
+  }
+  return Option<&'a Value>.none()
+}
+
+// The decimal array index `segment`, or `usize.MAX` when it is not one.
+fn index(segment: &[u8]) -> usize {
+  if segment.length == 0 || segment.length > 9 { return usize.MAX }
+  let mut value: usize = 0
+  let mut at: usize = 0
+  while at < segment.length {
+    if segment[at] < 48 || segment[at] > 57 { return usize.MAX }
+    value = value * 10 + u8.toUsize(segment[at] - 48)
+    at = at + 1
+  }
+  return value
+}
+
+// The JSON Pointer segment `segment` with `~1` and `~0` decoded.
+effect fn unescaped(segment: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut out = Bytes.make()
+  let mut at: usize = 0
+  while at < segment.length {
+    if segment[at] == 126 && at + 1 < segment.length && segment[at + 1] == 49 {
+      run Bytes.append(&mut out, b"/")
+      at = at + 2
+    } else if segment[at] == 126 && at + 1 < segment.length && segment[at + 1] == 48 {
+      run Bytes.append(&mut out, b"~")
+      at = at + 2
+    } else {
+      run Bytes.append(&mut out, Slice.view<u8>(segment, at, 1))
+      at = at + 1
+    }
+  }
+  return move out
+}
+
+// One step down from `value`: the member or element the escaped segment `segment` names.
+effect fn child<'a>(value: &'a Value, segment: &[u8]) -> Option<&'a Value> ! OutOfMemoryError ? &mut Allocator {
+  match &value.* {
+    Value.Array {..} => {
+      let at = index(segment)
+      if at == usize.MAX { return Option<&'a Value>.none() }
+      return Json.item(value, at)
+    }
+    _ => {
+      let key = run unescaped(segment)
+      return member(value, Bytes.asSlice(&key))
+    }
+  }
+}
+
+// The value the JSON Pointer `pointer` names below `root`.
+effect fn pointed<'a>(root: &'a Value, pointer: &[u8]) -> Option<&'a Value> ! OutOfMemoryError ? &mut Allocator {
+  let mut current = root
+  let mut start: usize = 1
+  if pointer.length == 0 { return Option<&'a Value>.some(current) }
+  let mut at: usize = 1
+  while at <= pointer.length {
+    if at == pointer.length || pointer[at] == 47 {
+      match move run child(current, Slice.view<u8>(pointer, start, at - start)) {
+        Option<&'a Value>.Some { value } => { current = value }
+        Option<&'a Value>.None => { return Option<&'a Value>.none() }
+      }
+      start = at + 1
+    }
+    at = at + 1
+  }
+  return Option<&'a Value>.some(current)
+}
+
+// Whether `key` can be written bare in a dotted TOML key.
+fn bare(key: &[u8]) -> bool {
+  if key.length == 0 { return false }
+  let mut at: usize = 0
+  while at < key.length {
+    let byte = key[at]
+    if !(byte >= 48 && byte <= 57 || byte >= 65 && byte <= 90 || byte >= 97 && byte <= 122 || byte == 45 || byte == 95) { return false }
+    at = at + 1
+  }
+  return true
+}
+
+// Appends the instance location `pointer` below `root` as the manifest spells it, such as
+// `native.link[0].os`, or `manifest` for the whole document.
+effect fn appendPath(out: &mut Bytes, root: &Value, pointer: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  if pointer.length == 0 {
+    run Bytes.append(&mut out.*, b"manifest")
+    return
+  }
+  let mut current = Option<&Value>.some(root)
+  let mut first = true
+  let mut start: usize = 1
+  let mut at: usize = 1
+  while at <= pointer.length {
+    if at == pointer.length || pointer[at] == 47 {
+      let segment = Slice.view<u8>(pointer, start, at - start)
+      let mut element = false
+      if let Option<&Value>.Some { value: parent } = current {
+        match &parent.* {
+          Value.Array {..} => { element = true }
+          _ => {}
+        }
+        current = run child(parent, segment)
+      }
+      if element {
+        run Bytes.append(&mut out.*, b"[")
+        run Bytes.append(&mut out.*, segment)
+        run Bytes.append(&mut out.*, b"]")
+      } else {
+        if !first { run Bytes.append(&mut out.*, b".") }
+        let key = run unescaped(segment)
+        if bare(Bytes.asSlice(&key)) { run Bytes.append(&mut out.*, Bytes.asSlice(&key)) }
+        else {
+          run Bytes.append(&mut out.*, b"\"")
+          let quoted = Bytes.asSlice(&key)
+          let mut byte: usize = 0
+          while byte < quoted.length {
+            if quoted[byte] == 34 || quoted[byte] == 92 { run Bytes.append(&mut out.*, b"\\") }
+            run Bytes.append(&mut out.*, Slice.view<u8>(quoted, byte, 1))
+            byte = byte + 1
+          }
+          run Bytes.append(&mut out.*, b"\"")
+        }
+      }
+      first = false
+      start = at + 1
+    }
+    at = at + 1
+  }
+}
+
+// Appends a scalar schema value as TOML writes it: a quoted string, a boolean or an integer.
+effect fn appendScalar(out: &mut Bytes, value: &Value) -> () ! OutOfMemoryError ? &mut Allocator {
+  match &value.* {
+    Value.String { text } => {
+      run Bytes.append(&mut out.*, b"\"")
+      run Bytes.append(&mut out.*, String.utf8Bytes(String.view(&text)))
+      run Bytes.append(&mut out.*, b"\"")
+    }
+    Value.Bool { value: flag } => { run Bytes.append(&mut out.*, if flag { b"true" } else { b"false" }) }
+    Value.Number { value: number } => {
+      match Json.asUsizeNumber(&number) {
+        Option<usize>.Some { value: whole } => { run decimal(&mut out.*, whole) }
+        Option<usize>.None => { run Bytes.append(&mut out.*, b"a number") }
+      }
+    }
+    _ => { run Bytes.append(&mut out.*, b"a value") }
+  }
+}
+
+// Appends the schema type name `name` as TOML calls it, with its article.
+effect fn appendType(out: &mut Bytes, name: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  if same(name, b"object") { run Bytes.append(&mut out.*, b"a table") }
+  else if same(name, b"array") { run Bytes.append(&mut out.*, b"an array") }
+  else if same(name, b"integer") { run Bytes.append(&mut out.*, b"an integer") }
+  else if same(name, b"string") { run Bytes.append(&mut out.*, b"a string") }
+  else if same(name, b"boolean") { run Bytes.append(&mut out.*, b"a boolean") }
+  else if same(name, b"number") { run Bytes.append(&mut out.*, b"a number") }
+  else { run Bytes.append(&mut out.*, name) }
+}
+
+// Appends each of `values` with `appendScalar`, or each type name with `appendType`, joined as
+// `a, b or c`.
+effect fn appendChoices(out: &mut Bytes, values: &Value, types: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  match &values.* {
+    Value.Array { values: listed } => {
+      let items = List<Value>.asSlice(&listed)
+      let mut at: usize = 0
+      while at < items.length {
+        if at > 0 {
+          if at + 1 == items.length { run Bytes.append(&mut out.*, b" or ") }
+          else { run Bytes.append(&mut out.*, b", ") }
+        }
+        if types {
+          match &items[at] {
+            Value.String { text } => { run appendType(&mut out.*, String.utf8Bytes(String.view(&text))) }
+            _ => { run appendScalar(&mut out.*, &items[at]) }
+          }
+        } else { run appendScalar(&mut out.*, &items[at]) }
+        at = at + 1
+      }
+    }
+    Value.String { text } => {
+      if types { run appendType(&mut out.*, String.utf8Bytes(String.view(&text))) }
+      else { run appendScalar(&mut out.*, values) }
+    }
+    _ => { run appendScalar(&mut out.*, values) }
+  }
+}
+
+// The `title` of the schema object at `pointer`, or of the alternative or negation it sits in:
+// the noun phrase a refusal names, such as `a package name: ...`.
+effect fn title<'a>(schema: &'a Value, pointer: &[u8]) -> Option<string<'a>> ! OutOfMemoryError ? &mut Allocator {
+  let mut at = pointer
+  // The root's own title describes the whole schema, never one failure.
+  while at.length > 0 {
+    if let Option<&'a Value>.Some { value: node } = move run pointed(schema, at) {
+      if let Option<string<'a>>.Some { value: written } = move Json.asString(member(node, b"title")) {
+        return Option<string<'a>>.some(written)
+      }
+    }
+    let last = lastSegment(at)
+    let parent = parentPointer(at)
+    if same(last, b"not") || same(last, b"then") || same(last, b"else") {
+      at = parent
+    } else if index(last) != usize.MAX && (same(lastSegment(parent), b"allOf") || same(lastSegment(parent), b"anyOf") || same(lastSegment(parent), b"oneOf")) {
+      at = parentPointer(parent)
+    } else {
+      break
+    }
+  }
+  return Option<string<'a>>.none()
+}
+
+// Appends `; it is <value>` with the source spelling at `span`, when that is short and one line.
+effect fn appendWritten(out: &mut Bytes, text: &[u8], span: Span) -> () ! OutOfMemoryError ? &mut Allocator {
+  if span.end <= span.start || span.end > text.length || span.end - span.start > 64 { return }
+  let written = Slice.view<u8>(text, span.start, span.end - span.start)
+  let mut at: usize = 0
+  while at < written.length {
+    if written[at] == 10 || written[at] == 13 { return }
+    at = at + 1
+  }
+  run Bytes.append(&mut out.*, b"; it is ")
+  run Bytes.append(&mut out.*, written)
+}
+
+// Writes the manifest's wording of the schema failure `error` to `out`, and returns its rank.
+// `span` is the source range of the failing value in `text`; `instance` is the whole manifest.
+effect fn word(out: &mut Bytes, text: &[u8], span: Span, schema: &Value, instance: &Value, error: &SchemaDiagnostic) -> usize
+  ! OutOfMemoryError ? &mut Allocator {
+  let keyword = String.utf8Bytes(String.view(&error.keywordLocation))
+  let path = String.utf8Bytes(String.view(&error.instanceLocation))
+  let last = lastSegment(keyword)
+  let pointer = fragment(String.utf8Bytes(String.view(&error.absoluteKeywordLocation)))
+  let container = parentPointer(pointer)
+  let constraint = run pointed(schema, pointer)
+  if same(last, b"additionalProperties") {
+    run appendPath(&mut out.*, instance, path)
+    run Bytes.append(&mut out.*, b" is not a supported field")
+    let written = run unescaped(lastSegment(path))
+    if let Option<&Value>.Some { value: node } = move run pointed(schema, container) {
+      if let Option<&Value>.Some { value: properties } = move member(node, b"properties") {
+        let mut present = false
+        if let Option<Bytes>.Some { value: nearest } = move run closest(Bytes.asSlice(&written), properties) {
+          if let Option<&Value>.Some { value: table } = move run pointed(instance, parentPointer(path)) {
+            if let Option<&Value>.Some {..} = member(table, Bytes.asSlice(&nearest)) { present = true }
+          }
+        }
+        if let Option<Bytes>.Some { value: nearest } = move run closest(Bytes.asSlice(&written), properties) {
+          if present { return 0 }
+          run Bytes.append(&mut out.*, b"; did you mean ")
+          let parent = parentPointer(path)
+          if parent.length > 0 {
+            run appendPath(&mut out.*, instance, parent)
+            run Bytes.append(&mut out.*, b".")
+          }
+          run Bytes.append(&mut out.*, Bytes.asSlice(&nearest))
+          run Bytes.append(&mut out.*, b"?")
+        }
+      }
+    }
+    return 0
+  }
+  if contains(keyword, b"/propertyNames/") {
+    run Bytes.append(&mut out.*, b"a name in ")
+    run appendPath(&mut out.*, instance, path)
+    run Bytes.append(&mut out.*, b" must be ")
+    match move run title(schema, container) {
+      Option<string>.Some { value: phrase } => { run Bytes.append(&mut out.*, String.utf8Bytes(phrase)) }
+      Option<string>.None => { run Bytes.append(&mut out.*, b"of another form") }
+    }
+    return 1
+  }
+  run appendPath(&mut out.*, instance, path)
+  if same(last, b"required") {
+    run Bytes.append(&mut out.*, b" needs ")
+    let mut named = false
+    if let Option<&Value>.Some { value: required } = constraint {
+      if let Option<&Value>.Some { value: table } = move run pointed(instance, path) {
+        match &required.* {
+          Value.Array { values } => {
+            let keys = List<Value>.asSlice(&values)
+            let mut at: usize = 0
+            while at < keys.length && !named {
+              if let Option<string>.Some { value: key } = move Json.asString(Option<&Value>.some(&keys[at])) {
+                if let Option<&Value>.None = member(table, String.utf8Bytes(key)) {
+                  run Bytes.append(&mut out.*, String.utf8Bytes(key))
+                  named = true
+                }
+              }
+              at = at + 1
+            }
+          }
+          _ => {}
+        }
+      }
+    }
+    if !named { run Bytes.append(&mut out.*, b"another field") }
+    return 1
+  }
+  if same(last, b"type") || same(last, b"enum") || same(last, b"const") {
+    run Bytes.append(&mut out.*, b" must be ")
+    if let Option<&Value>.Some { value: allowed } = constraint {
+      run appendChoices(&mut out.*, allowed, same(last, b"type"))
+    }
+    run appendWritten(&mut out.*, text, span)
+    return 1
+  }
+  if same(last, b"minimum") || same(last, b"maximum") || same(last, b"minItems") || same(last, b"maxItems")
+    || same(last, b"minProperties") || same(last, b"maxProperties") {
+    let mut bound: usize = usize.MAX
+    if let Option<&Value>.Some { value: limit } = constraint {
+      match &limit.* {
+        Value.Number { value: number } => {
+          if let Option<usize>.Some { value: whole } = move Json.asUsizeNumber(&number) { bound = whole }
+        }
+        _ => {}
+      }
+    }
+    if bound == 0 && (same(last, b"maxItems") || same(last, b"maxProperties")) {
+      run Bytes.append(&mut out.*, b" must be ")
+      match move run title(schema, container) {
+        Option<string>.Some { value: phrase } => { run Bytes.append(&mut out.*, String.utf8Bytes(phrase)) }
+        Option<string>.None => { run Bytes.append(&mut out.*, b"empty") }
+      }
+    } else if same(last, b"minimum") || same(last, b"maximum") {
+      run Bytes.append(&mut out.*, if same(last, b"minimum") { b" must be at least " } else { b" must be at most " })
+      run decimal(&mut out.*, bound)
+      run appendWritten(&mut out.*, text, span)
+    } else {
+      let fewest = same(last, b"minItems") || same(last, b"minProperties")
+      run Bytes.append(&mut out.*, if fewest { b" needs at least " } else { b" takes at most " })
+      run decimal(&mut out.*, bound)
+      let items = same(last, b"minItems") || same(last, b"maxItems")
+      if bound == 1 { run Bytes.append(&mut out.*, if items { b" entry" } else { b" field" }) }
+      else { run Bytes.append(&mut out.*, if items { b" entries" } else { b" fields" }) }
+    }
+    return 1
+  }
+  let alternatives = same(last, b"oneOf") || same(last, b"anyOf")
+  match move run title(schema, container) {
+    Option<string>.Some { value: named } => {
+      run Bytes.append(&mut out.*, b" must be ")
+      run Bytes.append(&mut out.*, String.utf8Bytes(named))
+    }
+    Option<string>.None => {
+      if alternatives { run Bytes.append(&mut out.*, b" matches none of the forms it accepts") }
+      else {
+        run Bytes.append(&mut out.*, b" is not accepted: ")
+        run Bytes.append(&mut out.*, String.utf8Bytes(String.view(&error.error)))
+      }
+    }
+  }
+  if !alternatives { run appendWritten(&mut out.*, text, span) }
+  return if alternatives { 2 } else { 1 }
+}
+
+// The key of `properties` closest to the unknown `written`, within a third of its length in
+// edits (at least one): the suggestion for a misspelled field.
+effect fn closest(written: &[u8], properties: &Value) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+  match &properties.* {
+    Value.Object { entries } => {
+      let members = List<JsonEntry>.asSlice(&entries)
+      let mut names = List<&[u8]>.make()
+      let mut at: usize = 0
+      while at < members.length {
+        run List<&[u8]>.append(&mut names, String.utf8Bytes(String.view(&members[at].key)))
+        at = at + 1
+      }
+      let found = run ManifestText.closest(written, List<&[u8]>.asSlice(&names))
+      if found == usize.MAX { return Option<Bytes>.none() }
+      return Option<Bytes>.some(run Bytes.copy(List<&[u8]>.asSlice(&names)[found]))
+    }
+    _ => { return Option<Bytes>.none() }
+  }
+}
+
+// `; ...` naming the manifest's pinned Silk when this compiler cannot stand in for it, as a later
+// Silk may add fields and values this one refuses. Empty for no pin or a compatible one.
+effect fn versionHint(document: &TomlValue) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut hint = Bytes.make()
+  let mut pin = Toml.asString(Toml.fieldAt(Toml.field(document, "workspace"), "silk-version"))
+  if let Option<string>.None = pin { pin = Toml.asString(Toml.fieldAt(Toml.field(document, "package"), "silk-version")) }
+  if let Option<string>.Some { value: written } = move pin {
+    let pinned = String.utf8Bytes(written)
+    if !ManifestFields.compatible(ReleaseVersion.value(), pinned) {
+      run Bytes.append(&mut hint, b"; the manifest pins Silk ")
+      run Bytes.append(&mut hint, pinned)
+      run Bytes.append(&mut hint, b" with silk-version, and this is Silk ")
+      run Bytes.append(&mut hint, ReleaseVersion.value())
+      run Bytes.append(&mut hint, b": build it with Silk ")
+      run Bytes.append(&mut hint, pinned)
+      run Bytes.append(&mut hint, b" (silk use installs it)")
+    }
+  }
+  return move hint
 }
 
 // Only the manifest-specific opaque member is projected away. All remaining conversion is owned
