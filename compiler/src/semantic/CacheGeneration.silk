@@ -1,0 +1,279 @@
+//! An authoritative selection of roots in immutable cache segments.
+//! A generation names its complete segment catalog and selected roots directly; reading it
+//! never follows older generations. Unselected stored answers confer no reuse authority.
+
+import semantic.CacheSegments as Segments {Descriptor, Segment, Admission}
+import semantic.ContentHash {ContentHash}
+import semantic.InternIndex {InternIndex}
+import semantic.RuntimeEncoding as Encoding
+import semantic.StableKey
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.collections.slice {Slice}
+import silk.core.option {Option}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.u8
+import silk.num.u64
+import silk.num.usize
+
+/// Roots authorized from one exact segment. Bits are low-bit first; unused high bits are zero.
+pub struct Selection {pub segment: ContentHash, pub roots: Bytes}
+
+/// The complete state published atomically after its immutable segments and packs exist.
+/// Catalog serials strictly increase, so every imported segment must precede its consumer.
+pub struct Generation {
+  pub stamp: Bytes,
+  pub catalog: List<Descriptor>,
+  pub selections: List<Selection>,
+}
+
+/// Packs pinned by selected answers, after complete catalog and root authority validation.
+pub struct Pins {pub packs: List<ContentHash>, pub roots: usize}
+
+const FORMAT: u64 = 1
+const MAX_SEGMENTS: usize = 256
+const MAX_ROOTS: usize = 4194304
+const MAX_BYTES: usize = 16777216
+const MAX_STAMP: usize = 65536
+
+fn sameDescriptor(a: &Descriptor, b: &Descriptor) -> bool {
+  return ContentHash.equals(a.digest, b.digest) && a.serial == b.serial
+    && a.leaves == b.leaves && a.nodes == b.nodes && a.roots == b.roots
+}
+
+fn catalogPosition(catalog: &[Descriptor], digest: ContentHash) -> usize {
+  let mut at = usize.ZERO
+  while at < catalog.length {
+    if ContentHash.equals(catalog[at].digest, digest) { return at }
+    at = at + usize.ONE
+  }
+  return usize.MAX
+}
+
+/// Whether the exact root ordinal is selected; an out-of-range ordinal is never selected.
+pub fn selected(selection: &Selection, root: usize) -> bool {
+  let bytes = Bytes.asSlice(&selection.roots)
+  let byte = root / 8
+  if byte >= bytes.length { return false }
+  return u64.bitAnd(u8.toU64(bytes[byte]), u64.shiftLeft(1, usize.toU64(root % 8))) != 0
+}
+
+/// Makes an empty root selection for a bounded segment descriptor.
+pub effect fn selection(descriptor: &Descriptor) -> Option<Selection>
+! OutOfMemoryError ? &mut Allocator {
+  if descriptor.roots > MAX_ROOTS { return Option<Selection>.none() }
+  let mut roots = Bytes.make()
+  let length = descriptor.roots / 8 + if descriptor.roots % 8 == 0 { usize.ZERO } else { usize.ONE }
+  let mut at = usize.ZERO
+  while at < length { run Bytes.append(&mut roots, &[0]) at = at + usize.ONE }
+  return Option<Selection>.some(Selection {segment: descriptor.digest, roots: move roots})
+}
+
+/// Changes one authorized root bit without changing segment content or source observations.
+pub fn setSelected(selection: &mut Selection, descriptor: &Descriptor, root: usize, value: bool) -> bool {
+  if !ContentHash.equals(selection.segment, descriptor.digest) || root >= descriptor.roots { return false }
+  let bytes = Bytes.asMutSlice(&mut selection.roots)
+  let byte = root / 8
+  if byte >= bytes.length { return false }
+  let mask = u64.shiftLeft(1, usize.toU64(root % 8))
+  bytes[byte] = u64.toU8(if value { u64.bitOr(u8.toU64(bytes[byte]), mask) }
+    else { u64.bitAnd(u8.toU64(bytes[byte]), u64.bitNot(mask)) })
+  return true
+}
+
+/// Validates descriptor and selection shape only. Import and key authority require `admit`.
+pub fn validShape(value: &Generation) -> bool {
+  let catalog = List<Descriptor>.asSlice(&value.catalog)
+  let selections = List<Selection>.asSlice(&value.selections)
+  if catalog.length > MAX_SEGMENTS || selections.length > catalog.length
+    || Bytes.length(&value.stamp) > MAX_STAMP { return false }
+  let mut total = usize.ZERO
+  let mut at = usize.ZERO
+  while at < catalog.length {
+    if catalog[at].roots > MAX_ROOTS - total { return false }
+    total = total + catalog[at].roots
+    if at > usize.ZERO && catalog[at - usize.ONE].serial >= catalog[at].serial { return false }
+    let mut earlier = usize.ZERO
+    while earlier < at {
+      if ContentHash.equals(catalog[earlier].digest, catalog[at].digest) { return false }
+      earlier = earlier + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < selections.length {
+    let position = catalogPosition(catalog, selections[at].segment)
+    if position == usize.MAX { return false }
+    let count = catalog[position].roots
+    let bytes = Bytes.asSlice(&selections[at].roots)
+    let length = count / 8 + if count % 8 == 0 { usize.ZERO } else { usize.ONE }
+    if bytes.length != length { return false }
+    if count % 8 != 0 && u64.shiftRight(u8.toU64(bytes[length - usize.ONE]), usize.toU64(count % 8)) != 0 { return false }
+    let mut earlier = usize.ZERO
+    while earlier < at {
+      if ContentHash.equals(selections[earlier].segment, selections[at].segment) { return false }
+      earlier = earlier + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+effect fn digest(output: &mut Bytes, value: ContentHash) -> () ! OutOfMemoryError ? &mut Allocator {
+  run Encoding.word(&mut output.*, value.high)
+  return run Encoding.word(&mut output.*, value.low)
+}
+fn readDigest(bytes: &[u8], reader: &mut StableKey.Reader) -> ContentHash {
+  let high = StableKey.readWord(bytes, &mut reader.*)
+  let low = StableKey.readWord(bytes, &mut reader.*)
+  return ContentHash {high: high, low: low}
+}
+
+/// Encodes one complete generation with a content seal; malformed selections are refused.
+pub effect fn encode(value: &Generation) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+  if !validShape(value) { return Option<Bytes>.none() }
+  let mut bytes = Bytes.make()
+  run Encoding.field(&mut bytes, b"silk-cache-generation")
+  run Encoding.word(&mut bytes, FORMAT)
+  run Encoding.field(&mut bytes, Bytes.asSlice(&value.stamp))
+  let catalog = List<Descriptor>.asSlice(&value.catalog)
+  run Encoding.word(&mut bytes, usize.toU64(catalog.length))
+  let mut at = usize.ZERO
+  while at < catalog.length {
+    let entry = &catalog[at]
+    run digest(&mut bytes, entry.digest)
+    run Encoding.word(&mut bytes, entry.serial)
+    run Encoding.word(&mut bytes, usize.toU64(entry.leaves))
+    run Encoding.word(&mut bytes, usize.toU64(entry.nodes))
+    run Encoding.word(&mut bytes, usize.toU64(entry.roots))
+    at = at + usize.ONE
+  }
+  let selections = List<Selection>.asSlice(&value.selections)
+  run Encoding.word(&mut bytes, usize.toU64(selections.length))
+  at = usize.ZERO
+  while at < selections.length {
+    run digest(&mut bytes, selections[at].segment)
+    run Encoding.field(&mut bytes, Bytes.asSlice(&selections[at].roots))
+    at = at + usize.ONE
+  }
+  let seal = ContentHash.of(Bytes.asSlice(&bytes))
+  run digest(&mut bytes, seal)
+  if Bytes.length(&bytes) > MAX_BYTES { return Option<Bytes>.none() }
+  return Option<Bytes>.some(move bytes)
+}
+
+/// Reads a bounded sealed descriptor. Successful decoding alone does not admit its segments.
+pub effect fn decode(bytes: &[u8], expectedStamp: &[u8]) -> Option<Generation>
+! OutOfMemoryError ? &mut Allocator {
+  if bytes.length < 16 || bytes.length > MAX_BYTES { return Option<Generation>.none() }
+  let payload = Slice.view<u8>(bytes, usize.ZERO, bytes.length - 16)
+  let mut sealReader = StableKey.reader()
+  let stored = readDigest(Slice.view<u8>(bytes, bytes.length - 16, 16), &mut sealReader)
+  if !ContentHash.equals(stored, ContentHash.of(payload)) { return Option<Generation>.none() }
+  let mut reader = StableKey.reader()
+  let magic = StableKey.readField(payload, &mut reader)
+  if !Encoding.equals(StableKey.view(payload, magic), b"silk-cache-generation")
+    || StableKey.readWord(payload, &mut reader) != FORMAT { return Option<Generation>.none() }
+  let stamp = StableKey.readField(payload, &mut reader)
+  let stampBytes = StableKey.view(payload, stamp)
+  if stampBytes.length > MAX_STAMP || !Encoding.equals(stampBytes, expectedStamp) { return Option<Generation>.none() }
+  let count = StableKey.readWord(payload, &mut reader)
+  if count > usize.toU64(MAX_SEGMENTS) || StableKey.failed(&reader) { return Option<Generation>.none() }
+  let mut catalog = List<Descriptor>.make()
+  let mut at: u64 = 0
+  while at < count {
+    let hash = readDigest(payload, &mut reader)
+    let serial = StableKey.readWord(payload, &mut reader)
+    let leaves = StableKey.readWord(payload, &mut reader)
+    let nodes = StableKey.readWord(payload, &mut reader)
+    let roots = StableKey.readWord(payload, &mut reader)
+    if leaves > usize.toU64(usize.MAX) || nodes > usize.toU64(usize.MAX)
+      || roots > usize.toU64(MAX_ROOTS) || StableKey.failed(&reader) { return Option<Generation>.none() }
+    run List<Descriptor>.append(&mut catalog, Descriptor {digest: hash, serial: serial,
+      leaves: u64.toUsize(leaves), nodes: u64.toUsize(nodes), roots: u64.toUsize(roots)})
+    at = at + 1
+  }
+  let selectionCount = StableKey.readWord(payload, &mut reader)
+  if selectionCount > usize.toU64(List<Descriptor>.length(&catalog)) || StableKey.failed(&reader) { return Option<Generation>.none() }
+  let mut selections = List<Selection>.make()
+  at = 0
+  while at < selectionCount {
+    let hash = readDigest(payload, &mut reader)
+    let field = StableKey.readField(payload, &mut reader)
+    let bits = StableKey.view(payload, field)
+    if bits.length > MAX_ROOTS / 8 || StableKey.failed(&reader) { return Option<Generation>.none() }
+    run List<Selection>.append(&mut selections, Selection {segment: hash, roots: run Bytes.copy(bits)})
+    at = at + 1
+  }
+  if !StableKey.finished(payload, &reader) { return Option<Generation>.none() }
+  let result = Generation {stamp: run Bytes.copy(stampBytes), catalog: move catalog, selections: move selections}
+  if !validShape(&result) { return Option<Generation>.none() }
+  return Option<Generation>.some(move result)
+}
+
+struct RootPosition {segment: usize, root: usize}
+
+/// Authenticates a catalog ordered exactly as its decoded segments and admissions, then checks
+/// selected key uniqueness and returns only the packs those selected answers authorize.
+/// Admissions must describe the supplied segment bytes, not descriptors asserted by imports.
+pub effect fn admit(value: &Generation, segments: &[Segment], admissions: &[Admission]) -> Option<Pins>
+! OutOfMemoryError ? &mut Allocator {
+  if !validShape(value) { return Option<Pins>.none() }
+  let catalog = List<Descriptor>.asSlice(&value.catalog)
+  if segments.length != catalog.length || admissions.length != catalog.length { return Option<Pins>.none() }
+  let mut at = usize.ZERO
+  while at < catalog.length {
+    let segment = &segments[at]
+    if !sameDescriptor(&catalog[at], &admissions[at].descriptor)
+      || catalog[at].serial != segment.serial || catalog[at].leaves != segment.leaves.length()
+      || catalog[at].nodes != segment.nodes.length() || catalog[at].roots != segment.roots.length()
+      || !Encoding.equals(Bytes.asSlice(&value.stamp), Bytes.asSlice(&segment.stamp))
+      || !Segments.validateImports(segment, Slice.view<Admission>(admissions, usize.ZERO, at)) { return Option<Pins>.none() }
+    at = at + usize.ONE
+  }
+  let mut keys = InternIndex.make()
+  let mut roots = List<RootPosition>.make()
+  let mut packIndex = InternIndex.make()
+  let mut packs = List<ContentHash>.make()
+  let selections = List<Selection>.asSlice(&value.selections)
+  at = usize.ZERO
+  while at < selections.length {
+    let segment = catalogPosition(catalog, selections[at].segment)
+    let entries = List<Segments.Root>.asSlice(&segments[segment].roots)
+    let mut root = usize.ZERO
+    while root < entries.length {
+      if selected(&selections[at], root) {
+        let key = Bytes.asSlice(&entries[root].key)
+        let hash = ContentHash.of(key)
+        let mut known = InternIndex.first(&keys, hash.low)
+        while known != usize.MAX {
+          let previous = &List<RootPosition>.asSlice(&roots)[known]
+          let old = &List<Segments.Root>.asSlice(&segments[previous.segment].roots)[previous.root]
+          if Encoding.equals(key, Bytes.asSlice(&old.key)) { return Option<Pins>.none() }
+          known = InternIndex.after(&keys, known)
+        }
+        run InternIndex.record(&mut keys, hash.low)
+        run List<RootPosition>.append(&mut roots, RootPosition {segment: segment, root: root})
+        let heldPacks = List<ContentHash>.asSlice(&entries[root].packs)
+        let mut pack = usize.ZERO
+        while pack < heldPacks.length {
+          let hash = heldPacks[pack]
+          let mut known = InternIndex.first(&packIndex, hash.low)
+          let mut found = false
+          while known != usize.MAX {
+            if ContentHash.equals(List<ContentHash>.get(&packs, known), hash) { found = true break }
+            known = InternIndex.after(&packIndex, known)
+          }
+          if !found {
+            run InternIndex.record(&mut packIndex, hash.low)
+            run List<ContentHash>.append(&mut packs, hash)
+          }
+          pack = pack + usize.ONE
+        }
+      }
+      root = root + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return Option<Pins>.some(Pins {packs: move packs, roots: List<RootPosition>.length(&roots)})
+}
