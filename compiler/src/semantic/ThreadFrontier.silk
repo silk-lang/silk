@@ -1,0 +1,206 @@
+//! Bounded command transport for native workers whose mutable compiler stores stay private.
+//! A controller owns each join handle; closing or dropping it wakes the worker and joins it.
+//! Commands and replies are owned transferable values, never borrowed query-store state.
+
+import silk.concurrency.sync {Arc, Mutex, Condition}
+import silk.concurrency.thread {Transferable}
+import silk.concurrency.thread_native {NativeThread, JoinHandle, SpawnError}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.core.option {Option}
+import silk.core.result {Result}
+import silk.core.ownership {Drop}
+
+struct State<C, R> {
+  command: Option<C>,
+  response: Option<R>,
+  outstanding: bool,
+  executing: bool,
+  closed: bool,
+  finished: bool,
+}
+
+struct Control<C, R> {
+  state: Mutex<State<C, R>>,
+  changed: Condition,
+}
+
+/// The coordinator's single owner of a persistent worker and its bounded command channel.
+/// Dropping it cancels pending transport and joins the thread without holding its channel lock.
+pub struct Worker<C, R> {
+  control: Arc<Control<C, R>>,
+  thread: Option<JoinHandle<()>>,
+}
+
+/// The worker's command endpoint. Its private Semantic and provider values are built after spawn.
+/// Each received command must be answered before the worker receives another command.
+pub struct Endpoint<C, R> { control: Arc<Control<C, R>> }
+
+// This guard is constructed inside the worker. Every ordinary return marks the endpoint closed,
+// including failures caught by the entry routine before it could send a reply.
+struct Finished<C, R> { control: Arc<Control<C, R>> }
+impl<C, R> Drop for Finished<C, R> {
+  fn drop(self: &mut Self) -> () {
+    let shared = Arc<Control<C, R>>.get(&self.control)
+    let mut guard = Mutex<State<C, R>>.lock(&shared.state)
+    let state = guard.getMut()
+    state.finished = true
+    state.closed = true
+    drop guard
+    Condition.notifyAll(&shared.changed)
+  }
+}
+
+/// Whether this host can run the native worker lane. Single-thread Wasm keeps serial semantics.
+pub fn available() -> bool {
+  static if Intrinsic.targetObjectFormat() == "wasm" && Intrinsic.profileText("threading") != "multi" {
+    return false
+  } else {
+    static if (Intrinsic.targetOperatingSystem() == "darwin"
+        && (Intrinsic.targetArchitecture() == "x86_64" || Intrinsic.targetArchitecture() == "aarch64")
+        && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system")
+      || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu"
+        && (Intrinsic.targetArchitecture() == "x86_64" || Intrinsic.targetArchitecture() == "aarch64"))
+      || (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArchitecture() == "x86_64"
+        && Intrinsic.targetAbi() == "msvc" && Intrinsic.profileText("libc") == "system")
+      || Intrinsic.targetObjectFormat() == "wasm" {
+      return true
+    } else { return false }
+  }
+}
+
+/// Starts a worker with an empty one-command/one-reply channel.
+/// The entry routine catches its own semantic failures and creates all mutable services locally.
+pub effect<'static> fn start<
+  C: 'static + Transferable, R: 'static + Transferable,
+  F: 'static + once fn(Endpoint<C, R>) -> () + Intrinsic.Detached + Transferable
+>(entry: F) -> Worker<C, R> ! OutOfMemoryError | SpawnError ? &mut Allocator {
+  static if Intrinsic.targetObjectFormat() == "wasm" && Intrinsic.profileText("threading") != "multi" {
+    fail SpawnError {code: 58}
+  } else {
+    let state = run Mutex<State<C, R>>.make(State<C, R> {
+      command: Option<C>.none(), response: Option<R>.none(), outstanding: false,
+      executing: false, closed: false, finished: false,
+    })
+    let control = run Arc<Control<C, R>>.make(Control<C, R> {state: move state, changed: run Condition.make()})
+    let endpoint = Endpoint<C, R> {control: Arc<Control<C, R>>.clone(&control)}
+    let completion = Arc<Control<C, R>>.clone(&control)
+    let thread = run NativeThread.spawn(fn() -> () {
+      let finished = Finished<C, R> {control: move completion}
+      entry(move endpoint)
+      drop finished
+    })
+    return Worker<C, R> {control: move control, thread: Option<JoinHandle<()>>.some(move thread)}
+  }
+}
+
+impl<C, R> Worker<C, R> {
+  /// Queues one command without waiting. A closed or busy worker returns the original command.
+  /// No allocation, payload destructor, or user callback executes while the channel is locked.
+  pub fn submit(self: &mut Self, command: C) -> Result<(), C> {
+    let shared = Arc<Control<C, R>>.get(&self.control)
+    let mut guard = Mutex<State<C, R>>.lock(&shared.state)
+    if guard.get().closed || guard.get().finished || guard.get().outstanding {
+      drop guard
+      return Result<(), C>.failResult(move command)
+    }
+    let state = guard.getMut()
+    state.command = Option<C>.some(move command)
+    state.outstanding = true
+    drop guard
+    Condition.notifyAll(&shared.changed)
+    return Result<(), C>.succeed(())
+  }
+
+  /// Waits for the outstanding reply, or returns none after an early worker exit or cancellation.
+  /// A completed reply remains available even if the entry routine has already returned.
+  pub fn receive(self: &mut Self) -> Option<R> {
+    let shared = Arc<Control<C, R>>.get(&self.control)
+    let mut guard = Mutex<State<C, R>>.lock(&shared.state)
+    while true {
+      let state = guard.getMut()
+      let response = Intrinsic.replace(state.response, Option<R>.none())
+      if let Option<R>.Some {value} = move response {
+        state.outstanding = false
+        drop guard
+        Condition.notifyAll(&shared.changed)
+        return Option<R>.some(move value)
+      }
+      if state.closed || state.finished || !state.outstanding {
+        drop guard
+        return Option<R>.none()
+      }
+      Condition.wait(&shared.changed, &mut guard)
+    }
+    return Option<R>.none()
+  }
+
+  /// Cancels pending transport and joins the native thread. It is safe to call more than once.
+  /// An executing semantic operation finishes before join returns; it is not killed mid-query.
+  pub fn close(self: &mut Self) -> () {
+    let shared = Arc<Control<C, R>>.get(&self.control)
+    let mut guard = Mutex<State<C, R>>.lock(&shared.state)
+    let state = guard.getMut()
+    state.closed = true
+    let command = Intrinsic.replace(state.command, Option<C>.none())
+    let response = Intrinsic.replace(state.response, Option<R>.none())
+    drop guard
+    Condition.notifyAll(&shared.changed)
+    // Payload cleanup may call allocators; it is deliberately outside the channel lock.
+    drop command
+    drop response
+    if let Option<JoinHandle<()>>.Some {value: thread} = move Intrinsic.replace(self.thread, Option<JoinHandle<()>>.none()) {
+      thread.join()
+    }
+  }
+
+  /// Whether the controller has joined the native thread, making this worker safe across fork.
+  pub fn joined(self: &Self) -> bool {
+    return match &self.thread { Option<JoinHandle<()>>.None => true _ => false }
+  }
+}
+
+impl<C, R> Drop for Worker<C, R> {
+  fn drop(self: &mut Self) -> () { Worker<C, R>.close(&mut self.*) }
+}
+
+impl<C, R> Endpoint<C, R> {
+  /// Waits for a command, or returns none after cancellation. Calling twice without a reply closes
+  /// the channel so protocol mistakes become a refused result instead of silently losing work.
+  pub fn next(self: &mut Self) -> Option<C> {
+    let shared = Arc<Control<C, R>>.get(&self.control)
+    let mut guard = Mutex<State<C, R>>.lock(&shared.state)
+    while true {
+      let state = guard.getMut()
+      if state.closed || state.executing {
+        state.closed = true
+        drop guard
+        Condition.notifyAll(&shared.changed)
+        return Option<C>.none()
+      }
+      let command = Intrinsic.replace(state.command, Option<C>.none())
+      if let Option<C>.Some {value} = move command {
+        state.executing = true
+        drop guard
+        return Option<C>.some(move value)
+      }
+      Condition.wait(&shared.changed, &mut guard)
+    }
+    return Option<C>.none()
+  }
+
+  /// Publishes the current command's reply without allocation. Cancellation returns the payload.
+  pub fn reply(self: &mut Self, response: R) -> Result<(), R> {
+    let shared = Arc<Control<C, R>>.get(&self.control)
+    let mut guard = Mutex<State<C, R>>.lock(&shared.state)
+    if guard.get().closed || !guard.get().executing {
+      drop guard
+      return Result<(), R>.failResult(move response)
+    }
+    let state = guard.getMut()
+    state.response = Option<R>.some(move response)
+    state.executing = false
+    drop guard
+    Condition.notifyAll(&shared.changed)
+    return Result<(), R>.succeed(())
+  }
+}
