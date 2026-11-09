@@ -742,6 +742,22 @@ A `static for` among the initializers generates `[key]: value` initializers from
 descriptors, so a generic function can construct its own type parameter field by field
 ([STATIC-017](static-evaluation.md#static-017--a-struct-literal-initializes-fields-from-a-static-sequence-of-field-descriptors)).
 
+An initializer written as a bare name is field shorthand: `Point { x, y }` means
+`Point { x: x, y: y }`. The name is read as an ordinary identifier expression, so it resolves to the
+binding, parameter, or constant of that name in scope, and shorthand and `name: value` initializers
+mix in one literal. The same holds in variant literals and contextual `.{ x }` records.
+
+```silk
+fn at(x: i32) -> Point {
+  let y = x + 1
+  return Point { x, y }
+}
+```
+
+A shorthand whose name resolves to nothing reports `SEM0006` at the name, as `x: x` would. A
+shorthand reads its binding without `move`, so a value that needs an explicit move, such as a
+`Bytes`, is written out as `name: move name`; the shorthand reports `OWN0003` like `name: name`.
+
 **Boundary:** Unknown, duplicate, missing, inaccessible, or mistyped initializers produce no
 partially initialized value. Construction fills a left-out field only through `Omittable`, never
 with another default. A diagnostic
