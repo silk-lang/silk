@@ -8,7 +8,7 @@ import backend.DropGlue {Child as GlueChild, Children as GlueChildren, Remainder
 import backend.CleanupNeeds {CleanupNeeds}
 import backend.CAbi
 import backend.Gap {Code as GapCode, Gap}
-import backend.InstanceKey {HelperRole, InstanceKey, NameOrder}
+import backend.InstanceKey {HelperRole, InstanceKey, NameOrder, StorageShape, StorageRole}
 import backend.RuntimeType
 import backend.UnionProjection
 import backend.UnionProjection {Placement as UnionPlacement}
@@ -32,13 +32,13 @@ import hir.Hir {Access, CallableMode, HirId, InfixOperator, Module, Multiplicity
 import lexer.Span {Span}
 import semantic.Anchor {Anchor}
 import semantic.Lifetime {CanonicalizationFailure, Lifetime}
-import semantic.ModuleId {ModuleId}
+import semantic.ModuleId {ModuleId, InvalidModulePath}
 import semantic.DeclarationId {DeclarationId}
 import semantic.InternIndex {InternIndex}
 import semantic.Type {Argument, Binding, ArrayShape, CallableEnvironment, CallableFieldInput, Row, Type}
 import semantic.Intrinsic as CheckedIntrinsic
 import semantic.SealedCore
-import semantic.SealedCore {Field as CoreField, Lifecycle}
+import semantic.SealedCore {Core as SealedKind, Field as CoreField, Lifecycle}
 import semantic.StorageOperation {StorageOperation}
 import semantic.Intrinsic {MemoryOrder, Member as IntrinsicMember, Primitive as IntrinsicPrimitive, VectorForm}
 import semantic.NativeAssembly
@@ -961,6 +961,8 @@ pub struct NodePlan {
 /// layouts and prepares targets.
 pub struct StoragePlan {
   pub node: BodyNodeId,
+  /// A self-contained shared implementation, prepared only after typed storage validation.
+  pub helper: Option<InstanceKey>,
   /// The measured size (`layoutOf<T>`, `T`'s control block for `sharedLayout` and
   /// `sharedFromAllocation`, or the complete package for `executionLayout` and
   /// `executionFromAllocation`) or element stride (`rawBufferFrom`, `rawBufferCopy`).
@@ -7091,6 +7093,87 @@ effect fn callAllocator(builder: &mut Builder, plan: &StoragePlan, selected: usi
   return output
 }
 
+// Invokes a sealed shared implementation through its ordinary MIR dependency. Its raw
+// header address is borrowed only for this call; the typed wrapper keeps ownership of storage.
+effect fn callStorageResize(builder: &mut Builder, key: &InstanceKey, buffer: &Place, requested: Operand,
+  ty: &Interned<Type>, origin: Origin) -> Operand ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let word = run storagePrimitive(b"usize")
+  let address = run SealedCore.bytes()
+  let bits = run storageValue(&mut builder.*, &word, Rvalue.AddressIntegerConversion {
+    operand: Operand.Copy {place: run copyPlace(buffer)}, destinationType: Interned<Type>.clone(&word)}, origin)
+  let pointer = run storageValue(&mut builder.*, &address, Rvalue.AddressIntegerConversion {
+    operand: Operand.Copy {place: place(bits)}, destinationType: Interned<Type>.clone(&address)}, origin)
+  let mut arguments = List<Operand>.make()
+  run List<Operand>.append(&mut arguments, Operand.Copy {place: place(pointer)})
+  run List<Operand>.append(&mut arguments, move requested)
+  return run callStorageHelper(&mut builder.*, key, move arguments, ty, origin)
+}
+
+effect fn callStorageHelper(builder: &mut Builder, key: &InstanceKey, arguments: List<Operand>,
+  ty: &Interned<Type>, origin: Origin) -> Operand ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  run List<Reference>.append(&mut builder.*.function.references,
+    Reference {key: InstanceKey.copy(key), edge: Edge.Direct, origin: origin})
+  let output = run temporary(&mut builder.*, ty, origin)
+  let continuation = run block(&mut builder.*, origin)
+  terminate(&mut builder.*, Terminator.Call {callee: Callee.Instance {key: InstanceKey.copy(key)}, arguments: move arguments,
+    providers: List<Operand>.make(), diagnostics: Option<Diagnostics>.none(), destination: place(output),
+    normal: continuation, failure: Option<FailureEdge>.none(), origin: origin})
+  resume(&mut builder.*, continuation)
+  return Operand.Copy {place: place(output)}
+}
+
+// The shared copy returns refusal before touching bytes. The typed caller emits the original
+// source trap, keeping observer context and source attribution out of this generated body.
+effect fn lowerBufferCopyResult(builder: &mut Builder, plan: &StoragePlan, buffer: &Place,
+  offset: usize, source: usize, available: usize, length: usize, result: &Interned<Type>, origin: Origin)
+  -> Operand ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let word = run storagePrimitive(b"usize")
+  let output = run storageValue(&mut builder.*, result, Rvalue.Use {value: Operand.Boolean {value: false}}, origin)
+  let done = run block(&mut builder.*, origin)
+  let count = run storageValue(&mut builder.*, &word, Rvalue.Use {value: Operand.Copy {place:
+    run storagePlace(buffer, true, &[SealedCore.ordinal(CoreField.BufferCount)])}}, origin)
+  let starts = run storageCondition(&mut builder.*, InfixOperator.LessOrEqual, Operand.Copy {place: place(offset)},
+    Operand.Copy {place: place(count)}, origin)
+  let remainingBlock = run block(&mut builder.*, origin)
+  terminate(&mut builder.*, Terminator.Branch {condition: move starts, thenBlock: remainingBlock, elseBlock: done, origin: origin})
+  resume(&mut builder.*, remainingBlock)
+  let remaining = run storageValue(&mut builder.*, &word, Rvalue.Binary {operation: InfixOperator.Subtract,
+    left: Operand.Copy {place: place(count)}, right: Operand.Copy {place: place(offset)}}, origin)
+  let fits = run storageCondition(&mut builder.*, InfixOperator.LessOrEqual, Operand.Copy {place: place(length)},
+    Operand.Copy {place: place(remaining)}, origin)
+  let suppliedBlock = run block(&mut builder.*, origin)
+  terminate(&mut builder.*, Terminator.Branch {condition: move fits, thenBlock: suppliedBlock, elseBlock: done, origin: origin})
+  resume(&mut builder.*, suppliedBlock)
+  let supplied = run storageCondition(&mut builder.*, InfixOperator.LessOrEqual, Operand.Copy {place: place(length)},
+    Operand.Copy {place: place(available)}, origin)
+  let moving = run block(&mut builder.*, origin)
+  terminate(&mut builder.*, Terminator.Branch {condition: move supplied, thenBlock: moving, elseBlock: done, origin: origin})
+  resume(&mut builder.*, moving)
+  let address = run SealedCore.bytes()
+  let octet = run storagePrimitive(b"u8")
+  let base = run bufferBase(&mut builder.*, buffer, &octet, origin)
+  // PointerOffset<T> used an unchecked target-word stride multiply. Preserve that operation
+  // when expressing the same offset through bytes, including on narrow targets.
+  let displacement = run storageValue(&mut builder.*, &word, Rvalue.ScalarBinary {operation: ScalarBinary.WrappingMultiply,
+    left: Operand.Copy {place: place(offset)}, right: run wordOperand(plan.size)}, origin)
+  let destination = run storageValue(&mut builder.*, &address, Rvalue.PointerOffset {pointer: Operand.Copy {place: place(base)},
+    index: Operand.Copy {place: place(displacement)}, element: Interned<Type>.clone(&octet)}, origin)
+  // A valid sealed header's count*stride fits the target word: rawBufferFrom checks it and
+  // resize guards its allocation arithmetic. The successful range checks bound length by
+  // that count, so this original byte-count multiply cannot raise a generated-source trap.
+  let bytes = run storageValue(&mut builder.*, &word, Rvalue.Binary {operation: InfixOperator.Multiply,
+    left: Operand.Copy {place: place(length)}, right: run wordOperand(plan.size)}, origin)
+  let mut arguments = List<Operand>.make()
+  run List<Operand>.append(&mut arguments, Operand.Copy {place: place(destination)})
+  run List<Operand>.append(&mut arguments, Operand.Copy {place: place(source)})
+  run List<Operand>.append(&mut arguments, Operand.Copy {place: place(bytes)})
+  drop run callAllocator(&mut builder.*, plan, 2, move arguments, &address, origin)
+  run assign(&mut builder.*, place(output), Rvalue.Use {value: Operand.Boolean {value: true}}, origin)
+  terminate(&mut builder.*, Terminator.Goto {target: done, origin: origin})
+  resume(&mut builder.*, done)
+  return Operand.Copy {place: place(output)}
+}
+
 // `rawBufferResize<T>(buffer, count)`: system storage (reclaim 0 with a nonzero context, the
 // address `malloc` returned) grows with `realloc` to `count` slots plus the alignment padding
 // `systemAllocationAcquire` adds, and the base is aligned again inside the result. `realloc` keeps
@@ -7650,6 +7733,41 @@ effect fn copyConstants(values: &[ConstantValue]) -> List<ConstantValue> ! OutOf
     at = at + usize.ONE
   }
   return move copied
+}
+
+// A generated storage implementation has no caller bindings, source variables, providers or
+// diagnostic context. Range traps stay in the typed wrapper; resize only returns refusal.
+effect fn storageBuilder(key: InstanceKey, result: &Interned<Type>, parameters: List<Interned<Type>>, origin: Origin)
+  -> Builder ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut locals = List<Local>.make()
+  run List<Local>.append(&mut locals, Local {ty: Interned<Type>.clone(result), kind: LocalKind.Return, origin: origin})
+  let listed = List<Interned<Type>>.asSlice(&parameters)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    run List<Local>.append(&mut locals, Local {ty: Interned<Type>.clone(&listed[at]),
+      kind: LocalKind.Parameter {index: at}, origin: origin})
+    at = at + usize.ONE
+  }
+  return Builder {
+    bindings: List<Binding>.make(), projections: List<RuntimeProjection>.make(), calls: List<CallTarget>.make(),
+    function: MirFunction {key: move key, borrow: BodyBorrowStatus.Checked, result: Interned<Type>.clone(result), parameters: move parameters,
+      locals: move locals, blocks: List<Block>.make(), references: List<Reference>.make(), externs: List<Interned<DeclarationId>>.make(),
+      observes: false, contexts: List<ContextText>.make(), traps: List<TrapSite>.make(), suspension: Option<Origin>.none(), parks: Option<Origin>.none(), releasesPackages: false, nonParking: List<NonParkingRun>.make(), cancels: List<Cancel>.make(), accesses: List<SharedAccess>.make(), escapes: List<EscapeSite>.make(), features: Bytes.make(), inlining: Inlining.Default, optimizeSize: false, frame: Bytes.make(), lines: List<u64>.make(), variables: List<Variable>.make()},
+    current: usize.ZERO, live: true, loops: List<LoopTargets>.make(), scrutinees: List<Scrutinee>.make(), narrowed: List<Narrowed>.make(),
+    owners: List<Owner>.make(), cleanup: List<CleanupNode>.make(), states: List<usize>.make(), dropPlans: List<List<usize>>.make(), scopes: List<usize>.make(), temporaries: List<Pending>.make(),
+    remainders: List<Remainder>.make(), needs: CleanupNeeds {locals: List<bool>.make(), nodes: List<bool>.make()},
+    failure: usize.MAX, plans: List<NodePlan>.make(), storage: List<StoragePlan>.make(), carriers: List<CarrierPlan>.make(),
+    providers: List<usize>.make(), diagnostics: Option<DiagnosticPlaces>.none(), sites: Option<SiteText>.none(), anchor: run Anchor.generated(),
+    witnessIntrinsics: List<WitnessIntrinsic>.make(), helpers: List<MirFunction>.make(),
+    exits: List<ExitStep>.make(), left: List<LeftExit>.make(), suspending: Option<List<InstanceKey>>.none(),
+    cancelEveryCall: false,
+    held: List<HeldFailure>.make(),
+    cancelScopes: List<CancelScope>.make(),
+    interrupts: List<InterruptBoundary>.make(),
+    landing: false,
+    constants: List<ConstantValue>.make(),
+    written: List<Interned<Type>>.make(), closed: List<Interned<Type>>.make(), writtenLookup: InternIndex.make(),
+  }
 }
 
 // Lowers one erased package helper. Its one parameter addresses the package as erased bytes; it
@@ -8397,6 +8515,27 @@ effect fn lowerStorage(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Mo
       return Operand.Copy {place: place(output)}
     }
     StorageOperation.RawBufferCopy => {
+      if let Option<InstanceKey>.Some {value: helper} = &plan.helper {
+        let offset = List<Operand>.remove(&mut operands, usize.ZERO)
+        let source = run operandPlace(&owner, List<Operand>.remove(&mut operands, usize.ZERO), origin)
+        let length = List<Operand>.remove(&mut operands, usize.ZERO)
+        let bits = run storageValue(&mut builder.*, &word, Rvalue.AddressIntegerConversion {
+          operand: Operand.Copy {place: run copyPlace(&first)}, destinationType: Interned<Type>.clone(&word)}, origin)
+        let destination = run storageValue(&mut builder.*, &address, Rvalue.AddressIntegerConversion {
+          operand: Operand.Copy {place: place(bits)}, destinationType: Interned<Type>.clone(&address)}, origin)
+        let available = run storageValue(&mut builder.*, &word, Rvalue.SliceLength {place: run copyPlace(&source)}, origin)
+        let data = run storageValue(&mut builder.*, &address, Rvalue.SliceData {place: move source}, origin)
+        let mut arguments = List<Operand>.make()
+        run List<Operand>.append(&mut arguments, Operand.Copy {place: place(destination)})
+        run List<Operand>.append(&mut arguments, move offset)
+        run List<Operand>.append(&mut arguments, Operand.Copy {place: place(data)})
+        run List<Operand>.append(&mut arguments, Operand.Copy {place: place(available)})
+        run List<Operand>.append(&mut arguments, move length)
+        let boolean = run storagePrimitive(b"bool")
+        let success = run callStorageHelper(&mut builder.*, &helper, move arguments, &boolean, origin)
+        run trapUnless(&mut builder.*, move success, TrapReason.RawBufferRangeOutOfBounds, origin)
+        return Operand.Unit
+      }
       let offset = run storageValue(&mut builder.*, &word, Rvalue.Use {value: List<Operand>.remove(&mut operands, usize.ZERO)}, origin)
       let source = run operandPlace(&owner, List<Operand>.remove(&mut operands, usize.ZERO), origin)
       let length = run storageValue(&mut builder.*, &word, Rvalue.Use {value: List<Operand>.remove(&mut operands, usize.ZERO)}, origin)
@@ -8422,6 +8561,9 @@ effect fn lowerStorage(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Mo
       return Operand.Unit
     }
     StorageOperation.RawBufferResize => {
+      if let Option<InstanceKey>.Some {value: helper} = &plan.helper {
+        return run callStorageResize(&mut builder.*, &helper, &first, List<Operand>.remove(&mut operands, usize.ZERO), ty, origin)
+      }
       return run lowerBufferResize(&mut builder.*, &plan, &first, List<Operand>.remove(&mut operands, usize.ZERO), ty, origin)
     }
     StorageOperation.RawBufferFill => {
@@ -11006,6 +11148,59 @@ impl MirFunction {
     let mut output = List<BodyNodeId>.make()
     drop run collectCallNodes(body, bodyRoot(body), &mut output)
     return move output
+  }
+  /// Builds a shared sealed storage implementation directly from its complete key. The typed
+  /// caller already proved its storage contract; this body accesses only the fixed header.
+  pub effect fn storageHelper(key: InstanceKey, shape: &Shared<StorageShape>) -> MirFunction
+  ! InvalidModulePath | OutOfMemoryError ? &mut Allocator | &mut Types {
+    let origin = Origin {node: usize.ZERO, location: Location.generated()}
+    let word = run storagePrimitive(b"usize")
+    let address = run SealedCore.bytes()
+    let result = run storagePrimitive(b"bool")
+    let operation = Shared<StorageShape>.with<StorageRole>(shape, fn(value: &StorageShape) -> StorageRole { return value.operation })
+    let mut parameters = List<Interned<Type>>.make()
+    run List<Interned<Type>>.append(&mut parameters, Interned<Type>.clone(&address))
+    run List<Interned<Type>>.append(&mut parameters, Interned<Type>.clone(&word))
+    if operation == StorageRole.Copy {
+      run List<Interned<Type>>.append(&mut parameters, Interned<Type>.clone(&address))
+      run List<Interned<Type>>.append(&mut parameters, Interned<Type>.clone(&word))
+      run List<Interned<Type>>.append(&mut parameters, Interned<Type>.clone(&word))
+    }
+    let mut builder = run storageBuilder(move key, &result, move parameters, origin)
+    let entry = run block(&mut builder, origin)
+    resume(&mut builder, entry)
+    let octet = run storagePrimitive(b"u8")
+    let header = run SealedCore.applied(SealedKind.RawBuffer, &octet)
+    let headerPointer = run SealedCore.address(&header)
+    let bits = run storageValue(&mut builder, &word, Rvalue.AddressIntegerConversion {
+      operand: Operand.Copy {place: place(usize.ONE)}, destinationType: Interned<Type>.clone(&word)}, origin)
+    let buffer = run storageValue(&mut builder, &headerPointer, Rvalue.AddressIntegerConversion {
+      operand: Operand.Copy {place: place(bits)}, destinationType: Interned<Type>.clone(&headerPointer)}, origin)
+    let mut externs = List<Interned<DeclarationId>>.make()
+    let count = Shared<StorageShape>.with<usize>(shape, fn(value: &StorageShape) -> usize {
+      return List<Interned<DeclarationId>>.length(&value.externs)
+    })
+    let mut at = usize.ZERO
+    while at < count {
+      let target = Shared<StorageShape>.with<Interned<DeclarationId>>(shape, fn(value: &StorageShape) -> Interned<DeclarationId> {
+        return Interned<DeclarationId>.clone(&List<Interned<DeclarationId>>.asSlice(&value.externs)[at])
+      })
+      run List<Interned<DeclarationId>>.append(&mut externs, move target)
+      at = at + usize.ONE
+    }
+    let plan = StoragePlan {node: BodyNodeId {index: usize.ZERO}, helper: Option<InstanceKey>.none(),
+      size: Shared<StorageShape>.with<usize>(shape, fn(value: &StorageShape) -> usize { return value.size }),
+      alignment: Shared<StorageShape>.with<usize>(shape, fn(value: &StorageShape) -> usize { return value.alignment }),
+      externs: move externs, cleanup: false,
+      targets: List<CallTarget>.make(), results: List<Interned<Type>>.make(), steps: List<RunPlan>.make()}
+    let output = if operation == StorageRole.Resize {
+      run lowerBufferResize(&mut builder, &plan, &place(buffer), Operand.Copy {place: place(2)}, &result, origin)
+    } else {
+      run lowerBufferCopyResult(&mut builder, &plan, &place(buffer), 2, 3, 4, 5, &result, origin)
+    }
+    run assign(&mut builder, place(usize.ZERO), Rvalue.Use {value: move output}, origin)
+    terminate(&mut builder, Terminator.Return {origin: origin})
+    return move builder.function
   }
   /// Makes one C export shim as ordinary MIR: its C-classified scalar and pointer lanes pass
   /// unchanged to the exported function's ordinary Silk instance, whose result it returns.
