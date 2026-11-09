@@ -1,0 +1,313 @@
+//! Transactions and lifetime pins for immutable semantic-cache generations.
+//! A physical token is remembered even when semantic admission refuses the stored generation.
+//! Stale writers never replace a different physical generation, and pins do not expire by time.
+
+import semantic.ContentHash {ContentHash}
+import semantic.CacheGeneration as Generations {Generation}
+import semantic.RuntimeEncoding as Encoding
+import semantic.StableKey
+import lexer.Span {Span}
+import silk.collections.bytes {Bytes}
+import silk.core.effect {Effect}
+import silk.core.option {Option}
+import silk.core.ownership {Copy, Drop}
+import silk.core.result {Result}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.mem.pointer {Pointer}
+import silk.system.filesystem {Path, FileSystem, FileError, AtomicWriteError}
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+
+/// The namespace incarnation and exact physical current-file state observed by a reader.
+/// `present` distinguishes an absent file from any present packet, including a malformed one.
+pub struct Token {pub incarnation: ContentHash, pub present: bool, pub physical: ContentHash}
+impl Copy for Token {}
+
+/// Whether two readers observed the same namespace and physical publication state.
+pub fn sameToken(left: Token, right: Token) -> bool {
+  return ContentHash.equals(left.incarnation, right.incarnation) && left.present == right.present
+    && (!left.present || ContentHash.equals(left.physical, right.physical))
+}
+
+fn zero() -> ContentHash { return ContentHash {high: 0, low: 0} }
+fn same(left: &[u8], right: &[u8]) -> bool { return Encoding.equals(left, right) }
+effect fn wordPair(output: &mut Bytes, value: ContentHash) -> () ! OutOfMemoryError ? &mut Allocator {
+  run Encoding.word(&mut output.*, value.high)
+  return run Encoding.word(&mut output.*, value.low)
+}
+fn readPair(bytes: &[u8], reader: &mut StableKey.Reader) -> ContentHash {
+  let high = StableKey.readWord(bytes, &mut reader.*)
+  let low = StableKey.readWord(bytes, &mut reader.*)
+  return ContentHash {high: high, low: low}
+}
+
+/// Encodes an atomic pointer to one immutable generation descriptor in its namespace.
+pub effect fn pointer(incarnation: ContentHash, generation: ContentHash) -> Bytes
+! OutOfMemoryError ? &mut Allocator {
+  let mut output = Bytes.make()
+  run Encoding.field(&mut output, b"silk-generation-current-v1")
+  run wordPair(&mut output, incarnation)
+  run wordPair(&mut output, generation)
+  let seal = ContentHash.of(Bytes.asSlice(&output))
+  run wordPair(&mut output, seal)
+  return move output
+}
+
+/// Authenticates a current pointer and rejects a packet from another cache incarnation.
+pub fn readPointer(bytes: &[u8], incarnation: ContentHash) -> Option<ContentHash> {
+  if bytes.length > 256 || bytes.length < 16 { return Option<ContentHash>.none() }
+  let mut reader = StableKey.reader()
+  let magic = StableKey.readField(bytes, &mut reader)
+  if StableKey.failed(&reader) || !same(StableKey.view(bytes, magic), b"silk-generation-current-v1") {
+    return Option<ContentHash>.none()
+  }
+  let namespace = readPair(bytes, &mut reader)
+  let generation = readPair(bytes, &mut reader)
+  let checksum = readPair(bytes, &mut reader)
+  if !StableKey.finished(bytes, &reader) || !ContentHash.equals(namespace, incarnation) { return Option<ContentHash>.none() }
+  // Encoding.word is fixed width; the final pair seals every preceding byte.
+  if !ContentHash.equals(checksum, ContentHash.of(StableKey.view(bytes,
+    Span.make(usize.ZERO, bytes.length - 16)))) { return Option<ContentHash>.none() }
+  return Option<ContentHash>.some(generation)
+}
+
+// Locks are native handles rather than marker files or timestamps. Closing the last inherited
+// handle releases the pin, including after process failure. Unsupported hosts refuse safely.
+static if Intrinsic.targetOperatingSystem() == "linux" || Intrinsic.targetOperatingSystem() == "darwin" {
+  @foreign(noCapture: .("path"))
+  unsafe extern "C" fn open(path: ?[*]const u8, flags: i32, ...) -> i32
+  unsafe extern "C" fn close(fd: i32) -> i32
+  unsafe extern "C" fn flock(fd: i32, operation: i32) -> i32
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    unsafe extern "C" fn __error() -> *mut i32
+    unsafe fn currentError() -> i32 { unsafe { return Pointer.read<i32>(__error()) } }
+    const CREATE: i32 = 512
+    const CLOEXEC: i32 = 16777216
+  } else {
+    unsafe extern "C" fn __errno_location() -> *mut i32
+    unsafe fn currentError() -> i32 { unsafe { return Pointer.read<i32>(__errno_location()) } }
+    const CREATE: i32 = 64
+    const CLOEXEC: i32 = 524288
+  }
+  /// A lifetime pin or transaction lock; dropping closes the owned native descriptor.
+  pub struct Lease {fd: i32}
+  impl Drop for Lease {
+    fn drop(self: &mut Lease) -> () {
+      let fd = Intrinsic.replace(self.fd, -1)
+      if fd >= 0 { drop unsafe close(fd) }
+    }
+  }
+  effect fn acquire(path: &Path, exclusive: bool, wait: bool) -> Option<Lease>
+  ! OutOfMemoryError ? &mut Allocator {
+    let mut name = run Bytes.copy(Path.rawBytes(path))
+    run Bytes.append(&mut name, &[0])
+    let fd = unsafe open(Pointer.fromSlice<u8>(Bytes.asSlice(&name)), 2 + CREATE + CLOEXEC, 438)
+    if fd < 0 { return Option<Lease>.none() }
+    let owned = Lease {fd: fd}
+    let operation = (if exclusive { 2 } else { 1 }) + if wait { 0 } else { 4 }
+    while true {
+      if unsafe flock(fd, operation) == 0 { return Option<Lease>.some(move owned) }
+      if unsafe currentError() != 4 { return Option<Lease>.none() }
+    }
+  }
+} else {
+  // A platform implementation is required before segmented publication can be enabled there.
+  /// A refused-host placeholder; no successful lock can be constructed on this host.
+  pub struct Lease {}
+  effect fn acquire(path: &Path, exclusive: bool, wait: bool) -> Option<Lease>
+  ! OutOfMemoryError ? &mut Allocator {
+    drop path
+    drop exclusive
+    drop wait
+    return Option<Lease>.none()
+  }
+}
+
+/// Takes a shared generation pin. Acquisition is completed under the publication lock.
+pub effect fn pin(path: &Path) -> Option<Lease> ! OutOfMemoryError ? &mut Allocator {
+  return run acquire(path, false, true)
+}
+/// Takes the exclusive publication transaction lock; failure refuses the transaction.
+pub effect fn transaction(path: &Path) -> Option<Lease> ! OutOfMemoryError ? &mut Allocator {
+  return run acquire(path, true, true)
+}
+/// Tries to retire an old generation without blocking a live reader or writer pin.
+pub effect fn tryRetire(path: &Path) -> Option<Lease> ! OutOfMemoryError ? &mut Allocator {
+  return run acquire(path, true, false)
+}
+
+// Absence is a physical state. Permission or other read errors must not masquerade as absence.
+effect fn read(path: &Path) -> Option<Bytes> ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  return match move run Effect.result(FileSystem.readFile(path)) {
+    Result<Bytes, FileError | OutOfMemoryError>.Success {value} => Option<Bytes>.some(move value)
+    Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError missing => {
+        if missing.reason.code == FileSystem.reasonCode(FileSystem.notFound()) { drop missing return Option<Bytes>.none() }
+        fail move missing
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+/// A remembered physical publication state. Malformed contents still have a distinct token.
+pub effect fn observe(path: &Path, incarnation: ContentHash) -> Token
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  if let Option<Bytes>.Some {value} = move run read(path) {
+    return Token {incarnation: incarnation, present: true, physical: ContentHash.of(Bytes.asSlice(&value))}
+  }
+  return Token {incarnation: incarnation, present: false, physical: zero()}
+}
+
+/// Whether a writer's expected physical token is still current while it owns the transaction.
+/// The caller obtains `incarnation` from the namespace marker, never from its old snapshot.
+pub effect fn current(path: &Path, incarnation: ContentHash, expected: Token) -> bool
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  return sameToken(run observe(path, incarnation), expected)
+}
+
+fn hexDigit(value: u64) -> u8 {
+  return u64.toU8(value) + if value < 10 { 48 } else { 87 }
+}
+effect fn named(directory: &Path, prefix: &[u8], digest: ContentHash) -> Path
+! FileError | OutOfMemoryError ? &mut Allocator {
+  let mut name = run Bytes.copy(prefix)
+  let words = [digest.high, digest.low]
+  let mut part = usize.ZERO
+  while part < 2 {
+    let mut digit = usize.ZERO
+    while digit < 16 {
+      let byte = hexDigit(u64.bitAnd(u64.shiftRight(words[part], usize.toU64((15 - digit) * 4)), 15))
+      run Bytes.append(&mut name, &[byte])
+      digit = digit + usize.ONE
+    }
+    part = part + usize.ONE
+  }
+  return run Path.joinBytes(directory, Bytes.asSlice(&name))
+}
+
+/// Names an immutable generation descriptor by the digest of its complete encoded bytes.
+pub effect fn generationPath(directory: &Path, digest: ContentHash) -> Path
+! FileError | OutOfMemoryError ? &mut Allocator { return run named(directory, b"generation-", digest) }
+/// Names the lifetime lock for a generation. The lock file is not itself a resource pin.
+pub effect fn pinPath(directory: &Path, digest: ContentHash) -> Path
+! FileError | OutOfMemoryError ? &mut Allocator { return run named(directory, b"pin-", digest) }
+
+/// Establishes a namespace once. `nonce` must be freshly chosen for a newly created directory;
+/// a valid existing incarnation wins concurrent initialization. A malformed marker is refused.
+pub effect fn initialize(directory: &Path, nonce: ContentHash) -> Option<ContentHash>
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  run FileSystem.createDirectoriesRecursively(directory)
+  let path = run Path.join(directory, "incarnation")
+  let mut bytes = Bytes.make()
+  run wordPair(&mut bytes, nonce)
+  let created = run Effect.result(FileSystem.writeFileAtomic(&path, Bytes.asSlice(&bytes),
+    FileSystem.createNew(), FileSystem.buffered()))
+  match move created {
+    Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Success {..} => {}
+    Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Failure {error} => match move error {
+      OutOfMemoryError exhausted => { fail move exhausted }
+      FileError failed => { drop failed }
+      AtomicWriteError failed => { drop failed }
+    }
+  }
+  return run incarnation(directory)
+}
+
+effect fn incarnation(directory: &Path) -> Option<ContentHash>
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let path = run Path.join(directory, "incarnation")
+  let bytes = match move run read(&path) {
+    Option<Bytes>.Some {value} => move value
+    _ => { return Option<ContentHash>.none() }
+  }
+  if Bytes.length(&bytes) != 16 { return Option<ContentHash>.none() }
+  let mut reader = StableKey.reader()
+  let value = readPair(Bytes.asSlice(&bytes), &mut reader)
+  if !StableKey.finished(Bytes.asSlice(&bytes), &reader) { return Option<ContentHash>.none() }
+  return Option<ContentHash>.some(value)
+}
+
+/// A physical snapshot and its generation lifetime pin. A missing or malformed descriptor
+/// leaves `takeGeneration` empty without forgetting the physical state expected by a writer.
+/// Keep this owner alive while Semantic or any writer borrows the generation's resources.
+pub struct Snapshot {
+  pub expected: Token,
+  generation: Option<Generation>,
+  pin: Option<Lease>,
+}
+
+/// Moves the decoded generation into a lazy semantic view while retaining its OS pin.
+pub fn takeGeneration(snapshot: &mut Snapshot) -> Option<Generation> {
+  return Intrinsic.replace(snapshot.generation, Option<Generation>.none())
+}
+
+/// Reads one current pointer and pins its generation before releasing the transaction lock.
+/// Immutable segment packets are loaded later while this returned owner remains alive.
+pub effect fn snapshot(directory: &Path, stamp: &[u8]) -> Option<Snapshot>
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let lockPath = run Path.join(directory, "transaction.lock")
+  let lock = match move run pin(&lockPath) {
+    Option<Lease>.Some {value} => move value
+    _ => { return Option<Snapshot>.none() }
+  }
+  let namespace = match move run incarnation(directory) {
+    Option<ContentHash>.Some {value} => value
+    _ => { return Option<Snapshot>.none() }
+  }
+  let currentPath = run Path.join(directory, "current")
+  let bytes = run read(&currentPath)
+  let mut expected = Token {incarnation: namespace, present: false, physical: zero()}
+  let mut identity = Option<ContentHash>.none()
+  if let Option<Bytes>.Some {value} = &bytes {
+    expected.present = true
+    expected.physical = ContentHash.of(Bytes.asSlice(&value))
+    identity = readPointer(Bytes.asSlice(&value), namespace)
+  }
+  let identity = match move identity {
+    Option<ContentHash>.Some {value} => value
+    _ => { return Option<Snapshot>.some(Snapshot {expected: expected,
+      generation: Option<Generation>.none(), pin: Option<Lease>.none()}) }
+  }
+  let leasePath = run pinPath(directory, identity)
+  let lease = match move run pin(&leasePath) {
+    Option<Lease>.Some {value} => move value
+    _ => { return Option<Snapshot>.none() }
+  }
+  // Publication can now proceed; it cannot reclaim this descriptor or its resource union.
+  drop lock
+  let path = run generationPath(directory, identity)
+  let descriptor = match move run read(&path) {
+    Option<Bytes>.Some {value} => move value
+    _ => { return Option<Snapshot>.some(Snapshot {expected: expected,
+      generation: Option<Generation>.none(), pin: Option<Lease>.some(move lease)}) }
+  }
+  let valid = ContentHash.equals(ContentHash.of(Bytes.asSlice(&descriptor)), identity)
+  let generation = if valid { run Generations.decode(Bytes.asSlice(&descriptor), stamp) } else { Option<Generation>.none() }
+  return Option<Snapshot>.some(Snapshot {expected: expected, generation: move generation,
+    pin: Option<Lease>.some(move lease)})
+}
+
+/// Exclusive ownership of a publication whose prior physical state has been checked.
+/// The source snapshot's separate pin must survive through this writer's completion.
+pub struct Writer {directory: Path, expected: Token, lock: Lease}
+
+/// Starts a transaction only if both namespace incarnation and current physical token agree.
+/// Lock/read failure or a stale token never falls back to an unlocked write.
+pub effect fn begin(directory: &Path, expected: Token) -> Option<Writer>
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let path = run Path.join(directory, "transaction.lock")
+  let lock = match move run transaction(&path) {
+    Option<Lease>.Some {value} => move value
+    _ => { return Option<Writer>.none() }
+  }
+  let namespace = match move run incarnation(directory) {
+    Option<ContentHash>.Some {value} => value
+    _ => { return Option<Writer>.none() }
+  }
+  let path = run Path.join(directory, "current")
+  if !(run current(&path, namespace, expected)) { return Option<Writer>.none() }
+  return Option<Writer>.some(Writer {directory: run Path.fromBytes(Path.rawBytes(directory)),
+    expected: expected, lock: move lock})
+}
