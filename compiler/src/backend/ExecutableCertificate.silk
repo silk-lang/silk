@@ -1,0 +1,211 @@
+//! Structural proofs for a small set of parametric executable bodies.
+//! These certificates consume checked bodies, not declaration names. Exact call-site typing,
+//! loans and logical applications remain authoritative; a certificate is not a type erasure rule.
+import backend.ExecutableKey {Schema}
+import hir.Hir {Access}
+import semantic.SealedCore
+import semantic.SealedCore {Core}
+import semantic.StorageOperation {StorageOperation}
+import semantic.Type {Type}
+import semantic.TypedBody {TypedBody, Node, NodeId, NodeKind, Expression, BorrowStatus, Environment}
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.core.option {Option}
+import silk.mem.interned {Interned}
+import silk.num.usize
+
+/// The only implementation operation and its original typed node.
+pub struct Certificate { pub schema: Schema, pub operation: NodeId }
+
+fn primitive(ty: &Interned<Type>, spelling: &[u8]) -> bool {
+  return Interned<Type>.with<bool>(ty, fn(value: &Type) -> bool {
+    if let Type.Primitive {name} = &value.* {
+      let bytes = Bytes.asSlice(&name)
+      if bytes.length != spelling.length { return false }
+      let mut at = usize.ZERO
+      while at < bytes.length { if bytes[at] != spelling[at] { return false } at = at + usize.ONE }
+      return true
+    }
+    return false
+  })
+}
+
+fn buffer(ty: &Interned<Type>, mutable: bool) -> bool {
+  return Interned<Type>.with<bool>(ty, fn(value: &Type) -> bool {
+    return match &value.* {
+      Type.Reference {referent, access, ..} => (!mutable || access == Access.Mutable) && SealedCore.isCore(&referent, Core.RawBuffer)
+      _ => false
+    }
+  })
+}
+
+fn mark(nodes: &[Node], visited: &mut [bool], node: NodeId) -> bool {
+  if node.index >= nodes.length || visited[node.index] { return false }
+  visited[node.index] = true
+  return true
+}
+
+// A direct parameter or a reborrow of that parameter's referent, never its own pointer slot.
+fn parameter(nodes: &[Node], visited: &mut [bool], node: NodeId, ordinal: usize, reborrow: bool) -> bool {
+  if !mark(nodes, &mut visited.*, node) { return false }
+  return match &nodes[node.index].kind {
+    NodeKind.Expression {form: Expression.Local {local}, ..} => local.index == ordinal
+    NodeKind.Expression {form: Expression.Borrow {value, ..}, ..} => {
+      if !reborrow || !mark(nodes, &mut visited.*, value) { return false }
+      return match &nodes[value.index].kind {
+        NodeKind.Expression {form: Expression.Dereference {value: source}, ..} => parameter(nodes, &mut visited.*, source, ordinal, false)
+        _ => false
+      }
+    }
+    _ => false
+  }
+}
+
+/// Proves a complete body is only a sealed count/resize operation on borrowed header storage.
+/// Additional statements, unreachable nodes, locals, implicit ownership and captures refuse.
+pub fn inspect(body: &TypedBody) -> Option<Certificate> {
+  if TypedBody.borrowStatus(body) != BorrowStatus.Checked || TypedBody.staticIterations(body).length != usize.ZERO
+    || TypedBody.runtimeBodies(body).length != usize.ZERO || TypedBody.foreignHandles(body).length != usize.ZERO {
+    return Option<Certificate>.none()
+  }
+  if let Option<Environment>.Some {..} = &TypedBody.environmentOf(body).* { return Option<Certificate>.none() }
+  let locals = TypedBody.localSlice(body)
+  if locals.length == usize.ZERO || locals.length > 2 { return Option<Certificate>.none() }
+  let nodes = TypedBody.nodeSlice(body)
+  // This schema has no loop; a bounded node count also prevents malformed cycles from recursing.
+  if nodes.length > 12 || nodes.length == usize.ZERO { return Option<Certificate>.none() }
+  let mut marks: [bool; 12] = [false; 12]
+  let visited: &mut [bool] = &mut marks
+  let mut node = TypedBody.rootNode(body)
+  let mut returning = false
+  while true {
+    if !mark(nodes, &mut visited.*, node) { return Option<Certificate>.none() }
+    match &nodes[node.index].kind {
+      NodeKind.Block {statements, value, ..} => {
+        let listed = List<NodeId>.asSlice(&statements)
+        if listed.length == usize.ONE {
+          if let Option<NodeId>.Some {..} = &value { return Option<Certificate>.none() }
+          node = listed[0]
+        } else if listed.length == usize.ZERO {
+          match &value {
+            Option<NodeId>.Some {value: yielded} => { node = yielded returning = true }
+            _ => { return Option<Certificate>.none() }
+          }
+        } else { return Option<Certificate>.none() }
+      }
+      NodeKind.Return {value} => {
+        if returning { return Option<Certificate>.none() }
+        match &value {
+          Option<NodeId>.Some {value: yielded} => { node = yielded returning = true }
+          _ => { return Option<Certificate>.none() }
+        }
+      }
+      NodeKind.Expression {ty, form: Expression.StorageCall {operation, typeArguments, arguments}} => {
+        if !returning || List<Interned<Type>>.length(&typeArguments) != usize.ONE { return Option<Certificate>.none() }
+        let resizing = operation == StorageOperation.RawBufferResize
+        if operation != StorageOperation.RawBufferCount && !resizing { return Option<Certificate>.none() }
+        let expected = if resizing { 2 } else { usize.ONE }
+        let args = List<NodeId>.asSlice(&arguments)
+        if args.length != expected || locals.length != expected || !buffer(&locals[0].ty, resizing)
+          || locals[0].mutable || !primitive(&ty, if resizing { b"bool" } else { b"usize" }) {
+          return Option<Certificate>.none()
+        }
+        if !parameter(nodes, &mut visited.*, args[0], usize.ZERO, resizing) { return Option<Certificate>.none() }
+        if resizing && (locals[1].mutable || !primitive(&locals[1].ty, b"usize")
+          || !parameter(nodes, &mut visited.*, args[1], usize.ONE, false)) { return Option<Certificate>.none() }
+        let mut at = usize.ZERO
+        while at < nodes.length { if !visited[at] { return Option<Certificate>.none() } at = at + usize.ONE }
+        return Option<Certificate>.some(Certificate {schema: if resizing { Schema.BufferResize } else { Schema.BufferCount }, operation: node})
+      }
+      _ => { return Option<Certificate>.none() }
+    }
+  }
+}
+
+import semantic.DeclarationId {DeclarationId, OwnerStep}
+import semantic.ModuleId {ModuleId, InvalidModulePath}
+import semantic.SourceLocations {Location}
+import semantic.Lifetime {Lifetime}
+import semantic.Types {Types, TypeTable}
+import semantic.TypedBody {Local, LocalId, Origin, Stage, SignatureDependency, StaticIteration}
+import silk.core.effect {Effect}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.testing.testing {Testing, AssertionError}
+
+// Variants independently exercise the certificate's safety boundaries, not its machine output.
+effect fn fixture(variant: usize) -> TypedBody
+! InvalidModulePath | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let declaration = run DeclarationId.fromParts(run ModuleId.make(b"memory", b"certificate", b"body"), List<OwnerStep>.make())
+  let origin = Origin {node: usize.ZERO, location: Location.generated()}
+  let element = run Types.intern(Type.Primitive {name: run Bytes.copy(b"i32")})
+  let raw = if variant == 3 { Interned<Type>.clone(&element) } else { run SealedCore.applied(Core.RawBuffer, &element) }
+  let resizing = variant >= 8
+  let parameterType = run Types.intern(Type.Reference {referent: move raw,
+    access: if resizing { Access.Mutable } else { Access.Shared }, lifetime: run Types.internLifetime(Lifetime.Static)})
+  let word = run Types.intern(Type.Primitive {name: run Bytes.copy(b"usize")})
+  let result = if resizing { run Types.intern(Type.Primitive {name: run Bytes.copy(b"bool")}) }
+    else { Interned<Type>.clone(&word) }
+  let mut locals = List<Local>.make()
+  run List<Local>.append(&mut locals, Local {origin: origin, ty: Interned<Type>.clone(&parameterType),
+    mutable: variant == 4, meetDepth: Option<usize>.none(), written: true})
+  if resizing {
+    run List<Local>.append(&mut locals, Local {origin: origin, ty: Interned<Type>.clone(&word), mutable: false,
+      meetDepth: Option<usize>.none(), written: true})
+  }
+  let mut nodes = List<Node>.make()
+  run List<Node>.append(&mut nodes, Node {origin: origin, kind: NodeKind.Expression {ty: move parameterType,
+    form: Expression.Local {local: LocalId {index: if variant == 5 { 1 } else { usize.ZERO }}}}})
+  let mut arguments = List<NodeId>.make()
+  run List<NodeId>.append(&mut arguments, NodeId {index: usize.ZERO})
+  if resizing {
+    run List<Node>.append(&mut nodes, Node {origin: origin, kind: NodeKind.Expression {ty: Interned<Type>.clone(&word),
+      form: if variant == 9 { Expression.Integer {literal: usize.ZERO} } else { Expression.Local {local: LocalId {index: usize.ONE}} }}})
+    run List<NodeId>.append(&mut arguments, NodeId {index: usize.ONE})
+  }
+  let mut types = List<Interned<Type>>.make()
+  run List<Interned<Type>>.append(&mut types, move element)
+  let operation = NodeId {index: List<Node>.length(&nodes)}
+  run List<Node>.append(&mut nodes, Node {origin: origin, kind: NodeKind.Expression {
+    ty: if variant == 7 { run Types.intern(Type.Unit) } else { move result },
+    form: Expression.StorageCall {operation: if resizing { StorageOperation.RawBufferResize } else { StorageOperation.RawBufferCount },
+      typeArguments: move types, arguments: move arguments}}})
+  let returned = NodeId {index: List<Node>.length(&nodes)}
+  run List<Node>.append(&mut nodes, Node {origin: origin, kind: NodeKind.Return {
+    value: if variant == 6 { Option<NodeId>.none() } else { Option<NodeId>.some(operation) }}})
+  let mut statements = List<NodeId>.make()
+  run List<NodeId>.append(&mut statements, returned)
+  let root = NodeId {index: List<Node>.length(&nodes)}
+  run List<Node>.append(&mut nodes, Node {origin: origin, kind: NodeKind.Block {statements: move statements,
+    value: Option<NodeId>.none(), canComplete: false}})
+  if variant == 2 {
+    run List<Node>.append(&mut nodes, Node {origin: origin, kind: NodeKind.Drop {value: NodeId {index: usize.ZERO}}})
+  }
+  return run TypedBody.make(&declaration, move locals, move nodes, root, List<SignatureDependency>.make(),
+    List<DeclarationId>.make(), if variant == 1 { Stage.ContractTyped } else { Stage.FullyChecked }, List<StaticIteration>.make())
+}
+
+effect fn certificateClaims() -> () ! InvalidModulePath | OutOfMemoryError | AssertionError<'static> ? &mut Allocator | &mut Types {
+  let mut variant = usize.ZERO
+  while variant < 10 {
+    let body = run fixture(variant)
+    let found = inspect(&body)
+    if variant == usize.ZERO || variant == 8 {
+      match move found {
+        Option<Certificate>.Some {value} => run Testing.expect(value.schema == if variant == 8 { Schema.BufferResize } else { Schema.BufferCount },
+          "a complete checked intrinsic wrapper carries its exact schema")
+        _ => run Testing.expect(false, "a complete checked wrapper certifies")
+      }
+    } else {
+      run Testing.expect(match move found { Option<Certificate>.None => true _ => false },
+        "unchecked, extra cleanup, wrong storage, mutable own slot, reordered parameters and changed computation refuse")
+    }
+    variant = variant + usize.ONE
+  }
+}
+
+test effect fn executableCertificatesPreserveLogicalSafetyBoundaries() -> ()
+! InvalidModulePath | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut types = TypeTable.make()
+  return run certificateClaims() |> Effect.provideMut<Types>(&mut types) |> Effect.provideMut<Allocator>(&mut allocator)
+}
