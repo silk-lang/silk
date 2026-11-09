@@ -1,0 +1,192 @@
+//! Ordered reachability and transactional budgets over immutable indexed escape records.
+import semantic.BuildRecord
+import semantic.ContentHash {ContentHash}
+import semantic.DeclarationId {DeclarationId, OwnerStep}
+import semantic.EscapeGraphIndex
+import semantic.EscapeGraphIndex {Index}
+import semantic.FiniteBudget {Budget}
+import semantic.InternIndex {InternIndex}
+import silk.collections.list {List}
+import silk.core.effect {Effect}
+import silk.core.option {Option}
+import silk.core.result {Result}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.u64
+import silk.num.usize
+import semantic.ModuleId {InvalidModulePath, ModuleId}
+import semantic.StableKey
+import semantic.WalkFragments
+import silk.collections.bytes {Bytes}
+import silk.testing.testing {AssertionError, Testing}
+
+fn visited(ordered: &[usize], lookup: &InternIndex, entry: usize) -> bool {
+  let mut at = InternIndex.first(lookup, usize.toU64(entry))
+  while at != usize.MAX {
+    if ordered[at] == entry { return true }
+    at = InternIndex.after(lookup, at)
+  }
+  return false
+}
+
+/// Same root and reference order as WalkFragments.rooted, with no payload ownership changes.
+pub effect fn reachable(index: &Index, roots: &[ContentHash]) -> Option<List<usize>>
+! OutOfMemoryError ? &mut Allocator {
+  let entries = List<EscapeGraphIndex.Entry>.asSlice(&index.entries)
+  let references = List<usize>.asSlice(&index.references)
+  let mut pending = List<usize>.make()
+  let mut at = usize.ZERO
+  while at < roots.length {
+    let entry = EscapeGraphIndex.graphEntry(index, roots[at])
+    if entry >= entries.length || !ContentHash.equals(entries[entry].exact, roots[at]) { return Option<List<usize>>.none() }
+    run List<usize>.append(&mut pending, entry)
+    at = at + usize.ONE
+  }
+  let mut ordered = List<usize>.make()
+  let mut lookup = InternIndex.make()
+  while let Option<usize>.Some {value: entry} = move List<usize>.pop(&mut pending) {
+    if entry >= entries.length { return Option<List<usize>>.none() }
+    if visited(List<usize>.asSlice(&ordered), &lookup, entry) { continue }
+    run List<usize>.append(&mut ordered, entry)
+    run InternIndex.record(&mut lookup, usize.toU64(entry))
+    let edges = entries[entry].references
+    if edges.start > edges.end || edges.end > references.length { return Option<List<usize>>.none() }
+    at = edges.end
+    while at > edges.start {
+      at = at - usize.ONE
+      let target = references[at]
+      if target >= entries.length { return Option<List<usize>>.none() }
+      if !visited(List<usize>.asSlice(&ordered), &lookup, target) { run List<usize>.append(&mut pending, target) }
+    }
+  }
+  return Option<List<usize>>.some(move ordered)
+}
+
+/// The selected set may overlap previous checks, but repeated definitions still validate
+/// exact original-body equality and contribute the maximum observed key and reference cost.
+pub effect fn includeBudget(index: &mut Index, bytes: &[u8], budget: &mut Budget, selected: &[usize]) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  let saved = Budget.checkpoint(&mut budget.*)
+  let result = run Effect.result(includeEntries(&mut index.*, bytes, &mut budget.*, selected))
+  return match move result {
+    Result<bool, OutOfMemoryError>.Success {value} => {
+      if value { Budget.commit(&mut budget.*, move saved) }
+      else { Budget.rollback(&mut budget.*, move saved) }
+      return value
+    }
+    Result<bool, OutOfMemoryError>.Failure {error} => {
+      Budget.rollback(&mut budget.*, move saved)
+      fail move error
+    }
+  }
+}
+
+effect fn includeEntries(index: &mut Index, bytes: &[u8], budget: &mut Budget, selected: &[usize]) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  let mut positions = InternIndex.make()
+  let mut at = usize.ZERO
+  while at < selected.length {
+    let original = selected[at]
+    if original >= List<EscapeGraphIndex.Entry>.length(&index.entries) || visited(selected, &positions, original) { return false }
+    run InternIndex.record(&mut positions, usize.toU64(original))
+    let entry = &List<EscapeGraphIndex.Entry>.asSlice(&index.entries)[original]
+    if entry.alias == usize.MAX && entry.leaf == 0 {
+      if u64.bitAnd(entry.flags, BuildRecord.FACT_KNOWN + BuildRecord.FACT_KEY_BYTES)
+        != BuildRecord.FACT_KNOWN + BuildRecord.FACT_KEY_BYTES { return false }
+      let applied = u64.bitAnd(entry.flags, BuildRecord.FACT_APPLICATION) != 0
+      if applied && !(run EscapeGraphIndex.ensureDeclaration(&mut index.*, bytes, original)) { return false }
+      let item = &List<EscapeGraphIndex.Entry>.asSlice(&index.entries)[original]
+      let body = if applied {
+        match &item.body {
+          Option<DeclarationId>.Some {value} => Option<&DeclarationId>.some(&value)
+          Option<DeclarationId>.None => { return false }
+        }
+      } else { Option<&DeclarationId>.none() }
+      if item.references.end < item.references.start || item.references.end > List<usize>.length(&index.references) { return false }
+      if !run Budget.include(&mut budget.*, item.definition, body, item.keyBytes,
+        item.references.end - item.references.start) { return false }
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+
+fn fixtureKey(value: u64) -> ContentHash { return ContentHash {high: 7, low: value} }
+
+effect fn fixtureEntry(exact: u64, definition: u64, body: &DeclarationId, bytes: usize, target: usize) -> BuildRecord.Entry
+! OutOfMemoryError ? &mut Allocator {
+  let mut declaration = Bytes.make()
+  run StableKey.declaration(&mut declaration, body)
+  let mut references = List<BuildRecord.Reference>.make()
+  if target != usize.MAX {
+    run List<BuildRecord.Reference>.append(&mut references, BuildRecord.Reference {target: target, edge: fixtureKey(90)})
+  }
+  let mut facts = BuildRecord.unknownFacts()
+  facts.flags = BuildRecord.FACT_KNOWN + BuildRecord.FACT_KEY_BYTES + BuildRecord.FACT_APPLICATION
+    + BuildRecord.FACT_CLOSED + BuildRecord.FACT_SUMMARIZED + BuildRecord.FACT_BOUNDARY_KEY
+  facts.definition = fixtureKey(definition)
+  facts.keyBytes = bytes
+  return BuildRecord.Entry {exact: fixtureKey(exact), hash: exact, family: definition, declaration: move declaration,
+    parent: usize.MAX, position: usize.ZERO, requested: false, alias: usize.MAX, leaf: 0,
+    references: move references, summary: fixtureKey(exact), facts: move facts}
+}
+
+effect fn indexedBudgetClaims() -> () ! InvalidModulePath | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let body = run DeclarationId.fromParts(run ModuleId.make(b"memory", b"indexed", b"body"), List<OwnerStep>.make())
+  let other = run DeclarationId.fromParts(run ModuleId.make(b"memory", b"indexed", b"other"), List<OwnerStep>.make())
+  let mut record = BuildRecord.make(false, false)
+  run List<ContentHash>.append(&mut record.roots, fixtureKey(1))
+  run List<BuildRecord.Entry>.append(&mut record.entries, run fixtureEntry(1, 1, &body, 8, 1))
+  run List<BuildRecord.Entry>.append(&mut record.entries, run fixtureEntry(2, 1, &body, 12, usize.MAX))
+  let bytes = run BuildRecord.encode(&record)
+  let mut index = match move run EscapeGraphIndex.readInline(Bytes.asSlice(&bytes)) {
+    Option<Index>.Some {value} => move value
+    _ => { run Testing.expect(false, "the inline index accepts a structurally valid record") return () }
+  }
+  let mut expected = Budget.withLimits(4, 2, 4, 100)
+  let mut actual = Budget.withLimits(4, 2, 4, 100)
+  run Testing.expect(run WalkFragments.includeBudget(&mut expected, &record), "ordinary record budget accepts")
+  run Testing.expect(run includeBudget(&mut index, Bytes.asSlice(&bytes), &mut actual, &[0, 1]), "indexed budget accepts the same rows")
+  run Testing.expect(Budget.definitionCount(&actual) == Budget.definitionCount(&expected)
+    && Budget.runtimeBytes(&actual) == Budget.runtimeBytes(&expected)
+    && Budget.referenceCount(&actual) == Budget.referenceCount(&expected), "repeated variants charge identical maxima")
+  run Testing.expect(run includeBudget(&mut index, Bytes.asSlice(&bytes), &mut actual, &[1, 0]),
+    "repeated membership reuses identities and preserves order-independent maxima")
+  run Testing.expect(Budget.definitionCount(&actual) == 1 && Budget.runtimeBytes(&actual) == 12 && Budget.referenceCount(&actual) == 1,
+    "revisiting indexed rows does not double-charge")
+  run Testing.expect(!(run includeBudget(&mut index, Bytes.asSlice(&bytes), &mut actual, &[0, 0])), "duplicate selected rows refuse")
+  run Testing.expect(!Budget.exhausted(&actual) && Budget.runtimeBytes(&actual) == 12, "selection refusal rolls back all budget state")
+  let shared = match move run EscapeGraphIndex.read(Bytes.asSlice(&bytes), ContentHash.of(Bytes.asSlice(&bytes))) {
+    Option<Index>.Some {value} => move value
+    _ => { run Testing.expect(false, "the complete fixture also satisfies shared graph proof") return () }
+  }
+  let selected = match move run reachable(&shared, &[fixtureKey(1)]) {
+    Option<List<usize>>.Some {value} => move value
+    _ => { run Testing.expect(false, "selected reachability accepts complete indexed adjacency") return () }
+  }
+  run Testing.expect(List<usize>.length(&selected) == 2 && List<usize>.get(&selected, 0) == 0 && List<usize>.get(&selected, 1) == 1,
+    "selected index order follows original reference order")
+  let mut conflict = BuildRecord.make(false, false)
+  run List<ContentHash>.append(&mut conflict.roots, fixtureKey(3))
+  run List<BuildRecord.Entry>.append(&mut conflict.entries, run fixtureEntry(3, 1, &other, 30, usize.MAX))
+  let conflictingBytes = run BuildRecord.encode(&conflict)
+  let mut conflicting = match move run EscapeGraphIndex.readInline(Bytes.asSlice(&conflictingBytes)) {
+    Option<Index>.Some {value} => move value
+    _ => { run Testing.expect(false, "conflicting body identity is structurally readable") return () }
+  }
+  run Testing.expect(!(run includeBudget(&mut conflicting, Bytes.asSlice(&conflictingBytes), &mut actual, &[0])),
+    "an already charged definition cannot hide a different original body")
+  run Testing.expect(!Budget.exhausted(&actual) && Budget.runtimeBytes(&actual) == 12 && Budget.referenceCount(&actual) == 1,
+    "body conflict is transactional even after a different indexed graph was read")
+  let mut tight = Budget.withLimits(1, 1, 1, 10)
+  run Testing.expect(!(run includeBudget(&mut index, Bytes.asSlice(&bytes), &mut tight, &[0, 1])), "maxima exceeding remaining budget refuse")
+  run Testing.expect(Budget.definitionCount(&tight) == 0 && Budget.runtimeBytes(&tight) == 0 && !Budget.exhausted(&tight),
+    "failed complete accounting removes newly charged definitions and maxima")
+  return ()
+}
+
+test effect fn indexedEscapeBudgetPreservesBodiesMaximaAndRollback() -> ()
+! InvalidModulePath | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run indexedBudgetClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
