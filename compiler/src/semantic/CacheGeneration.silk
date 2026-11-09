@@ -11,6 +11,8 @@ import silk.collections.bytes {Bytes}
 import silk.collections.list {List}
 import silk.collections.slice {Slice}
 import silk.core.option {Option}
+import silk.core.ownership {Copy}
+import silk.mem.frozen {Frozen}
 import silk.mem.allocator {Allocator, OutOfMemoryError}
 import silk.num.u8
 import silk.num.u64
@@ -19,23 +21,34 @@ import silk.num.usize
 /// Roots authorized from one exact segment. Bits are low-bit first; unused high bits are zero.
 pub struct Selection {pub segment: ContentHash, pub roots: Bytes}
 
+/// One immutable observation, addressed independently of a reader's local catalog ordinals.
+pub struct LeafHandle {pub segment: ContentHash, pub index: usize}
+impl Copy for LeafHandle {}
+
+/// New placement evidence for an unchanged input digest. The original dependency stays intact.
+pub struct Placement {pub source: LeafHandle, pub target: LeafHandle}
+impl Copy for Placement {}
+
 /// The complete state published atomically after its immutable segments and packs exist.
 /// Catalog serials strictly increase, so every imported segment must precede its consumer.
 pub struct Generation {
   pub stamp: Bytes,
   pub catalog: List<Descriptor>,
   pub selections: List<Selection>,
+  /// Canonical source order: catalog ordinal first, then leaf index. Targets never chain.
+  pub placements: List<Placement>,
 }
 
 /// Pack digests required by selected answers after catalog and root validation.
 /// The filesystem owner must keep these resources alive; this value holds no reader lock.
 pub struct Requirements {pub packs: List<ContentHash>, pub roots: usize}
 
-const FORMAT: u64 = 1
+const FORMAT: u64 = 2
 const MAX_SEGMENTS: usize = 256
 const MAX_ROOTS: usize = 4194304
 const MAX_BYTES: usize = 16777216
 const MAX_STAMP: usize = 65536
+const MAX_PLACEMENTS: usize = 131072
 
 fn sameDescriptor(a: &Descriptor, b: &Descriptor) -> bool {
   return ContentHash.equals(a.digest, b.digest) && a.serial == b.serial
@@ -49,6 +62,31 @@ fn catalogPosition(catalog: &[Descriptor], digest: ContentHash) -> usize {
     at = at + usize.ONE
   }
   return usize.MAX
+}
+
+fn placementIndex(value: &Generation, source: LeafHandle) -> usize {
+  let catalog = List<Descriptor>.asSlice(&value.catalog)
+  let segment = catalogPosition(catalog, source.segment)
+  if segment == usize.MAX { return usize.MAX }
+  let entries = List<Placement>.asSlice(&value.placements)
+  let mut start = usize.ZERO
+  let mut end = entries.length
+  while start < end {
+    let middle = start + (end - start) / 2
+    let found = catalogPosition(catalog, entries[middle].source.segment)
+    if found < segment || (found == segment && entries[middle].source.index < source.index) { start = middle + usize.ONE }
+    else { end = middle }
+  }
+  if start < entries.length && ContentHash.equals(entries[start].source.segment, source.segment)
+    && entries[start].source.index == source.index { return start }
+  return usize.MAX
+}
+
+/// Returns one already-admitted placement override. Whole-file dependency reads never use it.
+pub fn placement(value: &Generation, source: LeafHandle) -> Option<LeafHandle> {
+  let index = placementIndex(value, source)
+  if index == usize.MAX { return Option<LeafHandle>.none() }
+  return Option<LeafHandle>.some(List<Placement>.get(&value.placements, index).target)
 }
 
 /// Whether the exact root ordinal is selected; an out-of-range ordinal is never selected.
@@ -117,6 +155,28 @@ pub fn validShape(value: &Generation) -> bool {
     }
     at = at + usize.ONE
   }
+  let placements = List<Placement>.asSlice(&value.placements)
+  if placements.length > MAX_PLACEMENTS { return false }
+  let mut previousSegment = usize.ZERO
+  let mut previousLeaf = usize.ZERO
+  at = usize.ZERO
+  while at < placements.length {
+    let item = &placements[at]
+    let source = catalogPosition(catalog, item.source.segment)
+    let target = catalogPosition(catalog, item.target.segment)
+    if source == usize.MAX || target == usize.MAX
+      || item.source.index >= catalog[source].leaves || item.target.index >= catalog[target].leaves { return false }
+    if source == target && item.source.index == item.target.index { return false }
+    if at > usize.ZERO && (source < previousSegment || (source == previousSegment && item.source.index <= previousLeaf)) { return false }
+    previousSegment = source
+    previousLeaf = item.source.index
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < placements.length {
+    if placementIndex(value, placements[at].target) != usize.MAX { return false }
+    at = at + usize.ONE
+  }
   return true
 }
 
@@ -155,6 +215,16 @@ pub effect fn encode(value: &Generation) -> Option<Bytes> ! OutOfMemoryError ? &
   while at < selections.length {
     run digest(&mut bytes, selections[at].segment)
     run Encoding.field(&mut bytes, Bytes.asSlice(&selections[at].roots))
+    at = at + usize.ONE
+  }
+  let placements = List<Placement>.asSlice(&value.placements)
+  run Encoding.word(&mut bytes, usize.toU64(placements.length))
+  at = usize.ZERO
+  while at < placements.length {
+    run digest(&mut bytes, placements[at].source.segment)
+    run Encoding.word(&mut bytes, usize.toU64(placements[at].source.index))
+    run digest(&mut bytes, placements[at].target.segment)
+    run Encoding.word(&mut bytes, usize.toU64(placements[at].target.index))
     at = at + usize.ONE
   }
   let seal = ContentHash.of(Bytes.asSlice(&bytes))
@@ -206,30 +276,99 @@ pub effect fn decode(bytes: &[u8], expectedStamp: &[u8]) -> Option<Generation>
     run List<Selection>.append(&mut selections, Selection {segment: hash, roots: run Bytes.copy(bits)})
     at = at + 1
   }
+  let placementCount = StableKey.readWord(payload, &mut reader)
+  if placementCount > usize.toU64(MAX_PLACEMENTS) || StableKey.failed(&reader) { return Option<Generation>.none() }
+  let mut placements = List<Placement>.make()
+  at = 0
+  while at < placementCount {
+    let source = readDigest(payload, &mut reader)
+    let sourceIndex = StableKey.readWord(payload, &mut reader)
+    let target = readDigest(payload, &mut reader)
+    let targetIndex = StableKey.readWord(payload, &mut reader)
+    if sourceIndex > usize.toU64(usize.MAX) || targetIndex > usize.toU64(usize.MAX)
+      || StableKey.failed(&reader) { return Option<Generation>.none() }
+    run List<Placement>.append(&mut placements, Placement {
+      source: LeafHandle {segment: source, index: u64.toUsize(sourceIndex)},
+      target: LeafHandle {segment: target, index: u64.toUsize(targetIndex)}})
+    at = at + 1
+  }
   if !StableKey.finished(payload, &reader) { return Option<Generation>.none() }
-  let result = Generation {stamp: run Bytes.copy(stampBytes), catalog: move catalog, selections: move selections}
+  let result = Generation {stamp: run Bytes.copy(stampBytes), catalog: move catalog, selections: move selections,
+    placements: move placements}
   if !validShape(&result) { return Option<Generation>.none() }
   return Option<Generation>.some(move result)
 }
 
 struct RootPosition {segment: usize, root: usize}
 
+fn fileObservation<'a>(segments: &'a [Frozen<SealedSegment>], owner: usize, reference: Segments.Reference) -> Option<Segments.ObservationView<'a>> {
+  let mut selected = owner
+  if reference.segment != usize.ZERO {
+    let imported = Segments.imports(Frozen<SealedSegment>.get(&segments[owner]))
+    if reference.segment > imported.length { return Option<Segments.ObservationView<'a>>.none() }
+    let expected = imported[reference.segment - usize.ONE]
+    selected = usize.MAX
+    let mut at = usize.ZERO
+    while at < segments.length {
+      let actual = Segments.descriptor(Frozen<SealedSegment>.get(&segments[at]))
+      if sameDescriptor(&actual, &expected) { selected = at break }
+      at = at + usize.ONE
+    }
+  }
+  if selected == usize.MAX { return Option<Segments.ObservationView<'a>>.none() }
+  return Segments.observation(Frozen<SealedSegment>.get(&segments[selected]), reference.index)
+}
+
+fn validPlacements(value: &Generation, segments: &[Frozen<SealedSegment>]) -> bool {
+  let catalog = List<Descriptor>.asSlice(&value.catalog)
+  let entries = List<Placement>.asSlice(&value.placements)
+  let mut at = usize.ZERO
+  while at < entries.length {
+    let sourceOwner = catalogPosition(catalog, entries[at].source.segment)
+    let targetOwner = catalogPosition(catalog, entries[at].target.segment)
+    let source = match move Segments.observation(Frozen<SealedSegment>.get(&segments[sourceOwner]), entries[at].source.index) {
+      Option<Segments.ObservationView>.Some {value: held} => move held _ => { return false }
+    }
+    let target = match move Segments.observation(Frozen<SealedSegment>.get(&segments[targetOwner]), entries[at].target.index) {
+      Option<Segments.ObservationView>.Some {value: held} => move held _ => { return false }
+    }
+    if !source.input || !target.input || source.selector != target.selector
+      || !ContentHash.equals(source.digest, target.digest) || !Encoding.equals(source.key, target.key) { return false }
+    let sourceFile = match move source.file {
+      Option<Segments.Reference>.Some {value: held} => held _ => { return false }
+    }
+    let targetFile = match move target.file {
+      Option<Segments.Reference>.Some {value: held} => held _ => { return false }
+    }
+    let old = match move fileObservation(segments, sourceOwner, sourceFile) {
+      Option<Segments.ObservationView>.Some {value: held} => move held _ => { return false }
+    }
+    let fresh = match move fileObservation(segments, targetOwner, targetFile) {
+      Option<Segments.ObservationView>.Some {value: held} => move held _ => { return false }
+    }
+    if old.input || fresh.input || !Encoding.equals(old.key, fresh.key) { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
 /// Authenticates the exact sealed owners of a catalog, then checks selected key uniqueness.
 /// Only the returned requirements may retain packs; an unselected physical answer has no authority.
-pub effect fn admit(value: &Generation, segments: &[SealedSegment]) -> Option<Requirements>
+pub effect fn admit(value: &Generation, segments: &[Frozen<SealedSegment>]) -> Option<Requirements>
 ! OutOfMemoryError ? &mut Allocator {
   if !validShape(value) { return Option<Requirements>.none() }
   let catalog = List<Descriptor>.asSlice(&value.catalog)
   if segments.length != catalog.length { return Option<Requirements>.none() }
   let mut at = usize.ZERO
   while at < catalog.length {
-    let segment = &segments[at]
+    let segment = Frozen<SealedSegment>.get(&segments[at])
     let actual = Segments.descriptor(segment)
     if !sameDescriptor(&catalog[at], &actual)
       || !Encoding.equals(Bytes.asSlice(&value.stamp), Segments.stamp(segment))
-      || !Segments.authenticateImports(segment, Slice.view<SealedSegment>(segments, usize.ZERO, at)) { return Option<Requirements>.none() }
+      || !Segments.authenticateImports(segment, Slice.view<Frozen<SealedSegment>>(segments, usize.ZERO, at)) { return Option<Requirements>.none() }
     at = at + usize.ONE
   }
+  if !validPlacements(value, segments) { return Option<Requirements>.none() }
   let mut keys = InternIndex.make()
   let mut roots = List<RootPosition>.make()
   let mut packIndex = InternIndex.make()
@@ -241,7 +380,7 @@ pub effect fn admit(value: &Generation, segments: &[SealedSegment]) -> Option<Re
     let mut root = usize.ZERO
     while root < catalog[segment].roots {
       if selected(&selections[at], root) {
-        let key = match move Segments.rootKey(&segments[segment], root) {
+        let key = match move Segments.rootKey(Frozen<SealedSegment>.get(&segments[segment]), root) {
           Option<&[u8]>.Some {value: bytes} => bytes
           _ => { return Option<Requirements>.none() }
         }
@@ -249,7 +388,7 @@ pub effect fn admit(value: &Generation, segments: &[SealedSegment]) -> Option<Re
         let mut known = InternIndex.first(&keys, hash.low)
         while known != usize.MAX {
           let previous = &List<RootPosition>.asSlice(&roots)[known]
-          let old = match move Segments.rootKey(&segments[previous.segment], previous.root) {
+          let old = match move Segments.rootKey(Frozen<SealedSegment>.get(&segments[previous.segment]), previous.root) {
             Option<&[u8]>.Some {value: bytes} => bytes
             _ => { return Option<Requirements>.none() }
           }
@@ -258,10 +397,10 @@ pub effect fn admit(value: &Generation, segments: &[SealedSegment]) -> Option<Re
         }
         run InternIndex.record(&mut keys, hash.low)
         run List<RootPosition>.append(&mut roots, RootPosition {segment: segment, root: root})
-        let packCount = Segments.rootPackCount(&segments[segment], root)
+        let packCount = Segments.rootPackCount(Frozen<SealedSegment>.get(&segments[segment]), root)
         let mut pack = usize.ZERO
         while pack < packCount {
-          let hash = match move Segments.rootPack(&segments[segment], root, pack) {
+          let hash = match move Segments.rootPack(Frozen<SealedSegment>.get(&segments[segment]), root, pack) {
             Option<ContentHash>.Some {value: held} => held
             _ => { return Option<Requirements>.none() }
           }
