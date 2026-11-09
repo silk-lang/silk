@@ -1,0 +1,211 @@
+//! Private native unit compilation overlapping retained semantic cache validation.
+//! The coordinator is a process, so the parent remains single-threaded until its cache writer
+//! forks. Only a successful, reaped coordinator whose semantic preview was accepted publishes
+//! digest-named objects; all other attempts leave ordinary native compilation authoritative.
+
+import semantic.FrontierHost {FrontierHost}
+import driver.CodegenCache
+import driver.HostRename
+import silk.mem.pointer {Pointer}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.collections.list {List}
+import silk.collections.slice {Slice}
+import silk.system.filesystem {FileSystem, FileError, Path, DirectoryEntry}
+import silk.system.filesystem_machine {MachineFileSystem}
+import silk.core.effect {Effect}
+import silk.core.option {Option}
+import silk.core.result {Result}
+import silk.num.usize
+
+pub struct Pending {
+  pub directory: Path,
+  pub output: Path,
+  process: i32,
+  success: bool,
+}
+
+static if Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.profileText("libc") == "gnu"
+  && (Intrinsic.targetArchitecture() == "x86_64" || Intrinsic.targetArchitecture() == "aarch64") {
+  unsafe extern "C" fn duplicateDescriptor(source: i32, target: i32) -> i32 as "dup2"
+  unsafe extern "C" fn errorLocation() -> *mut i32 as "__errno_location"
+}
+
+/// Whether the native-only overlap experiment is enabled on this compiler host.
+pub fn enabled() -> bool {
+  return FrontierHost.available() && !Pointer.isNullMany<u8>(unsafe FrontierHost.environment(
+    Pointer.fromSlice<u8>(b"SILK_NATIVE_BUILD_PIPELINE\0")))
+}
+
+/// Makes a private staging directory beside the final output. No published object lives here.
+pub effect fn prepare(output: &Path) -> Pending ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let parent = match move run Path.parent(output) {
+    Option<Path>.Some {value} => move value
+    Option<Path>.None => run Path.fromBytes(b".")
+  }
+  let directory = run FileSystem.createTemporaryDirectory(&parent, b".silk-native-")
+  let attempted = run Effect.result(Path.join(&directory, "program"))
+  let privateOutput = match move attempted {
+    Result<Path, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<Path, FileError | OutOfMemoryError>.Failure {error} => {
+      drop run Effect.result(FileSystem.removeDirectoryRecursively(&directory))
+      fail move error
+    }
+  }
+  return Pending {directory: move directory, output: move privateOutput, process: -1, success: false}
+}
+
+/// Forks before the parent starts threads. Zero selects the child; negative means serial fallback.
+pub fn start(pending: &mut Pending) -> i32 {
+  let process = unsafe FrontierHost.fork()
+  if process > 0 {
+    pending.process = process
+    let message = b"frontier native coordinator started\n"
+    drop unsafe FrontierHost.write(2, Pointer.fromSlice<u8>(message), message.length)
+  }
+  return process
+}
+
+/// Silences speculative native errors. Ordinary compilation reports them if staging fails.
+pub fn silenceChild() -> () {
+  if !Pointer.isNullMany<u8>(unsafe FrontierHost.environment(Pointer.fromSlice<u8>(b"SILK_NATIVE_BUILD_PIPELINE_FAIL\0"))) {
+    unsafe FrontierHost.exit(1)
+    return ()
+  }
+  static if Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.profileText("libc") == "gnu"
+    && (Intrinsic.targetArchitecture() == "x86_64" || Intrinsic.targetArchitecture() == "aarch64") {
+    let stream = unsafe FrontierHost.openFile(Pointer.fromSlice<u8>(b"/dev/null\0"), Pointer.fromSlice<u8>(b"wb\0"))
+    if Pointer.isNull<u8>(stream) { unsafe FrontierHost.exit(1) return () }
+    let fd = unsafe FrontierHost.descriptor(stream)
+    if unsafe duplicateDescriptor(fd, 1) < 0 || unsafe duplicateDescriptor(fd, 2) < 0 { unsafe FrontierHost.exit(1) return () }
+    if fd > 2 { drop unsafe FrontierHost.closeFile(stream) }
+  }
+}
+
+/// Exits the coordinator without dropping inherited semantic stores or running parent cleanup.
+pub fn finishChild(status: i32) -> () { unsafe FrontierHost.exit(status) }
+
+fn wait(pending: &mut Pending) -> bool {
+  if pending.process <= 0 { return pending.success }
+  let mut status: i32 = -1
+  let mut waited = unsafe FrontierHost.wait(pending.process, Pointer.fromMutRef<i32>(&mut status), 0)
+  static if Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.profileText("libc") == "gnu"
+    && (Intrinsic.targetArchitecture() == "x86_64" || Intrinsic.targetArchitecture() == "aarch64") {
+    while waited < 0 && unsafe Pointer.read<i32>(unsafe errorLocation()) == 4 {
+      waited = unsafe FrontierHost.wait(pending.process, Pointer.fromMutRef<i32>(&mut status), 0)
+    }
+  }
+  pending.success = waited == pending.process && status == 0
+  pending.process = -1
+  return pending.success
+}
+
+fn objectName(bytes: &[u8]) -> bool {
+  if bytes.length != 34 || bytes[32] != '.' || bytes[33] != 'o' { return false }
+  let mut at = usize.ZERO
+  while at < 32 {
+    let byte = bytes[at]
+    if !(byte >= '0' && byte <= '9') && !(byte >= 'a' && byte <= 'f') { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+/// Reaps the child and promotes only completed digest-named objects after semantic acceptance.
+/// A partial promotion remains safe: ordinary compilation fills any missing objects.
+pub effect fn publish(pending: &mut Pending, output: &Path) -> ()
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  if !wait(&mut pending.*) {
+    let message = b"frontier native coordinator refused\n"
+    drop unsafe FrontierHost.write(2, Pointer.fromSlice<u8>(message), message.length)
+    return ()
+  }
+  let privateDirectory = run CodegenCache.directoryFor(&pending.output)
+  let directory = run CodegenCache.directoryFor(output)
+  let listed = run FileSystem.listDirectory(&privateDirectory)
+  run FileSystem.createDirectoriesRecursively(&directory)
+  let entries = List<DirectoryEntry>.asSlice(&listed)
+  let mut promoted = usize.ZERO
+  let mut at = usize.ZERO
+  while at < entries.length {
+    let raw = Path.rawBytes(&entries[at].path)
+    let mut start = raw.length
+    while start > usize.ZERO && raw[start - usize.ONE] != '/' { start = start - usize.ONE }
+    let name = Slice.view<u8>(raw, start, raw.length - start)
+    if objectName(name) {
+      let target = run Path.joinBytes(&directory, name)
+      if run HostRename.replaceFile(&entries[at].path, &target) { promoted = promoted + usize.ONE }
+    }
+    at = at + usize.ONE
+  }
+  if promoted > usize.ZERO {
+    let message = b"frontier native objects published\n"
+    drop unsafe FrontierHost.write(2, Pointer.fromSlice<u8>(message), message.length)
+  }
+}
+
+/// Always reaps the coordinator and removes its private files, including on parent failure.
+pub effect fn discard(pending: &mut Pending) -> () ? &mut FileSystem | &mut Allocator {
+  drop wait(&mut pending.*)
+  drop run Effect.result(FileSystem.removeDirectoryRecursively(&pending.directory))
+}
+
+import silk.testing.testing {Testing, AssertionError}
+import silk.collections.bytes {Bytes}
+
+// Files stand in for successfully compiled units: the lifecycle must publish only after a
+// successful child and explicit acceptance, independently of the native compiler's behavior.
+effect fn lifecycleClaims() -> () ! FileError | OutOfMemoryError | AssertionError<'static> ? &mut FileSystem | &mut Allocator {
+  if !FrontierHost.available() { return () }
+  let temporary = run Path.fromBytes(b"/tmp")
+  let root = run FileSystem.createTemporaryDirectory(&temporary, b"silk-native-lifecycle-")
+  let use = effect fn(directory: &mut Path) -> () ! FileError | OutOfMemoryError | AssertionError<'static> ? &mut FileSystem | &mut Allocator {
+    let mut scenario = usize.ZERO
+    while scenario < 3 {
+      let name = if scenario == 0 { "accepted" } else { if scenario == 1 { "failed" } else { "discarded" } }
+      let output = run Path.join(&directory.*, name)
+      let mut pending = run prepare(&output)
+      let privateDirectory = run CodegenCache.directoryFor(&pending.output)
+      run FileSystem.createDirectoriesRecursively(&privateDirectory)
+      let objectName = "0123456789abcdef0123456789abcdef.o"
+      let privateObject = run Path.join(&privateDirectory, objectName)
+      let partial = run Path.join(&privateDirectory, "0123456789abcdef0123456789abcdef.o.partial")
+      run FileSystem.writeFile(&privateObject, b"completed unit")
+      run FileSystem.writeFile(&partial, b"unfinished unit")
+      let process = start(&mut pending)
+      if process == 0 { finishChild(if scenario == 1 { 7 } else { 0 }) }
+      if process > 0 && scenario != 2 { drop run Effect.result(publish(&mut pending, &output)) }
+      run discard(&mut pending)
+      run Testing.expect(process > 0, "the fixture starts a native coordinator")
+      let finalDirectory = run CodegenCache.directoryFor(&output)
+      let finalObject = run Path.join(&finalDirectory, objectName)
+      let exists = run FileSystem.exists(&finalObject)
+      run Testing.expect(exists == (scenario == 0), "failed or unaccepted coordinators never publish their private objects")
+      if exists {
+        let content = run FileSystem.readFile(&finalObject)
+        let expected: &[u8] = b"completed unit"
+        let actual = Bytes.asSlice(&content)
+        let mut equal = actual.length == expected.length
+        let mut byte = usize.ZERO
+        while equal && byte < expected.length { equal = actual[byte] == expected[byte] byte = byte + usize.ONE }
+        run Testing.expect(equal, "accepted objects preserve their completed contents")
+        let forbidden = run Path.join(&finalDirectory, "0123456789abcdef0123456789abcdef.o.partial")
+        run Testing.expect(!run FileSystem.exists(&forbidden), "unfinished native files never enter the object cache")
+      }
+      run Testing.expect(!run FileSystem.exists(&pending.directory), "every completion path removes private staging")
+      let mut status: i32 = 0
+      run Testing.expect(unsafe FrontierHost.wait(process, Pointer.fromMutRef<i32>(&mut status), 1) < 0,
+        "accepted, failed, and discarded children are already reaped")
+      scenario = scenario + usize.ONE
+    }
+  }
+  let release = effect fn(directory: &mut Path) -> () ? &mut FileSystem | &mut Allocator {
+    drop run Effect.result(FileSystem.removeDirectoryRecursively(&directory.*))
+  }
+  return run Effect.useReleaseNonParking(move root, move use, move release)
+}
+
+test effect fn nativeCoordinatorRequiresSuccessAndExplicitPublication() -> () ! FileError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut files = run MachineFileSystem.make() |> Effect.provideMut<Allocator>(&mut allocator)
+  return run lifecycleClaims() |> Effect.provideMut<FileSystem>(&mut files) |> Effect.provideMut<Allocator>(&mut allocator)
+}
