@@ -10,7 +10,7 @@ selects. So editors, scripts and habit reach the pinned compiler too.
 silk use                    # install the version this project pins
 silk use 0.1.0-dev.11       # install a version and make it your default (never edits a project)
 silk use latest             # the newest stable release as your default (--dev: include dev releases)
-silk set latest             # pin this project to the newest stable release; downloads nothing
+silk set latest             # pin this project to the newest stable release and install it (--no-install: only pin)
 silk use list               # installed versions; which one is selected, pinned and the default
 silk use which              # the version selected here, and why
 silk use uninstall 0.1.0-dev.11
