@@ -18,7 +18,7 @@
 //! unmarked because the companion's address escapes.
 //! A suspendable instance keeps its frame plan and gets no markers.
 //! Unoptimized emission instead uses [`storage`] to keep unnamed, single-definition
-//! scalar values directly when all uses follow the definition in the same basic block.
+//! scalar values directly when a single definition dominates every direct value use.
 //! Emission writes no markers for a local whose slot is a scalar without a context companion,
 //! which SROA promotes, so the caller names those locals and the plan leaves them out. A function
 //! with no other candidate skips the analysis.
@@ -168,15 +168,19 @@ pub effect fn storage(function: &MirFunction, directScalars: bool) -> Storage ! 
   return Storage {required: move required, registers: move registers, effects: move effects}
 }
 
-// Temporaries defined once and read only later in the same block through direct value operands.
+// Temporaries defined once and read only through direct value operands dominated by that write.
+// LLVM blocks currently emit in MIR index order; definitions must also precede their consumers
+// in that order so the direct LLVM value has already been constructed.
 effect fn scalarTemporaries(function: &MirFunction, effects: &Effects) -> List<bool> ! OutOfMemoryError ? &mut Allocator {
   let locals = List<Local>.asSlice(&function.locals)
   let mut selected = List<bool>.make()
   let mut defined = List<usize>.make()
+  let mut definitionAt = List<usize>.make()
   let mut local = usize.ZERO
   while local < locals.length {
     run List<bool>.append(&mut selected, match &locals[local].kind { LocalKind.Temp => true _ => false })
     run List<usize>.append(&mut defined, usize.MAX)
+    run List<usize>.append(&mut definitionAt, usize.MAX)
     local = local + usize.ONE
   }
   let variables = List<Variable>.asSlice(&function.variables)
@@ -217,7 +221,7 @@ effect fn scalarTemporaries(function: &MirFunction, effects: &Effects) -> List<b
       let reads = usesOf(effects, mentions[at])
       local = usize.ZERO
       while local < reads.length {
-        if !direct || List<usize>.get(&defined, reads[local]) != block { List<bool>.set(&mut selected, reads[local], false) }
+        if !direct { List<bool>.set(&mut selected, reads[local], false) }
         local = local + usize.ONE
       }
       let writes = wholeOf(effects, mentions[at])
@@ -226,6 +230,7 @@ effect fn scalarTemporaries(function: &MirFunction, effects: &Effects) -> List<b
         let index = writes[local]
         if !definition || at == statements.length || List<usize>.get(&defined, index) != usize.MAX { List<bool>.set(&mut selected, index, false) }
         List<usize>.set(&mut defined, index, block)
+        List<usize>.set(&mut definitionAt, index, at)
         local = local + usize.ONE
       }
       let partial = partialOf(effects, mentions[at])
@@ -238,12 +243,161 @@ effect fn scalarTemporaries(function: &MirFunction, effects: &Effects) -> List<b
     }
     block = block + usize.ONE
   }
+  // A function with no remaining value candidate needs no control-flow analysis.
+  let mut any = false
   local = usize.ZERO
   while local < locals.length {
-    if List<usize>.get(&defined, local) == usize.MAX { List<bool>.set(&mut selected, local, false) }
+    any = any || (List<bool>.get(&selected, local) && List<usize>.get(&defined, local) != usize.MAX)
     local = local + usize.ONE
   }
+  if !any {
+    local = usize.ZERO
+    while local < locals.length { List<bool>.set(&mut selected, local, false) local = local + usize.ONE }
+    return move selected
+  }
+  // Two passes distinguish a forward block reference from an actually missing definition.
+  // Unreachable blocks never provide or consume a promoted definition, even if their local
+  // statement order looks valid. Repeated, partial and hidden writes were rejected above.
+  let dominance = run scalarDominance(function)
+  local = usize.ZERO
+  while local < locals.length {
+    let definition = List<usize>.get(&defined, local)
+    if definition == usize.MAX || List<usize>.get(&dominance, definition) == usize.MAX {
+      List<bool>.set(&mut selected, local, false)
+    }
+    local = local + usize.ONE
+  }
+  block = usize.ZERO
+  while block < blocks.length {
+    let mentions = blockMentions(effects, block)
+    let mut at = usize.ZERO
+    while at < mentions.length {
+      let reads = usesOf(effects, mentions[at])
+      local = usize.ZERO
+      while local < reads.length {
+        let index = reads[local]
+        if List<bool>.get(&selected, index) {
+          let definition = List<usize>.get(&defined, index)
+          let available = if definition == block { List<usize>.get(&definitionAt, index) < at }
+            else { definition < block && scalarDominates(List<usize>.asSlice(&dominance), definition, block) }
+          if !available { List<bool>.set(&mut selected, index, false) }
+        }
+        local = local + usize.ONE
+      }
+      at = at + usize.ONE
+    }
+    block = block + usize.ONE
+  }
   return move selected
+}
+
+// Cooper-Harvey-Kennedy immediate dominators. MAX marks unreachable blocks. The storage proof
+// uses the actual CFG (including failure edges), never numeric block order as a dominance proxy.
+effect fn scalarDominance(function: &MirFunction) -> List<usize> ! OutOfMemoryError ? &mut Allocator {
+  let count = List<Block>.length(&function.blocks)
+  let mut dominators = List<usize>.make()
+  run List<usize>.appendRepeated(&mut dominators, usize.MAX, count)
+  if count == usize.ZERO { return move dominators }
+  // A single block cannot need cross-block availability. Its self edges do not change dominance.
+  if count == usize.ONE {
+    List<usize>.set(&mut dominators, usize.ZERO, usize.ZERO)
+    return move dominators
+  }
+  let following = run successorLists(function)
+  let edges = List<List<usize>>.asSlice(&following)
+  let mut order = List<usize>.make()
+  run List<usize>.appendRepeated(&mut order, usize.MAX, count)
+  let mut visited = List<bool>.make()
+  run List<bool>.appendRepeated(&mut visited, false, count)
+  let mut stack = List<usize>.make()
+  let mut cursors = List<usize>.make()
+  let mut postorder = List<usize>.make()
+  run List<usize>.append(&mut stack, usize.ZERO)
+  run List<usize>.append(&mut cursors, usize.ZERO)
+  List<bool>.set(&mut visited, usize.ZERO, true)
+  while List<usize>.length(&stack) != usize.ZERO {
+    let top = List<usize>.length(&stack) - usize.ONE
+    let block = List<usize>.get(&stack, top)
+    let next = List<usize>.get(&cursors, top)
+    let targets = List<usize>.asSlice(&edges[block])
+    if next < targets.length {
+      List<usize>.set(&mut cursors, top, next + usize.ONE)
+      let target = targets[next]
+      // Invalid MIR cannot establish a proof. Keep all slots if any target is out of range.
+      if target >= count { return move dominators }
+      if !List<bool>.get(&visited, target) {
+        List<bool>.set(&mut visited, target, true)
+        run List<usize>.append(&mut stack, target)
+        run List<usize>.append(&mut cursors, usize.ZERO)
+      }
+    } else {
+      run List<usize>.append(&mut postorder, block)
+      drop List<usize>.pop(&mut stack)
+      drop List<usize>.pop(&mut cursors)
+    }
+  }
+  let reached = List<usize>.length(&postorder)
+  let mut preceding = List<List<usize>>.make()
+  let mut block = usize.ZERO
+  while block < count {
+    run List<List<usize>>.append(&mut preceding, List<usize>.make())
+    block = block + usize.ONE
+  }
+  let mut step = usize.ZERO
+  while step < reached {
+    let node = List<usize>.get(&postorder, reached - usize.ONE - step)
+    List<usize>.set(&mut order, node, step)
+    let targets = List<usize>.asSlice(&edges[node])
+    let mut edge = usize.ZERO
+    while edge < targets.length {
+      run List<usize>.append(&mut List<List<usize>>.asMutSlice(&mut preceding)[targets[edge]], node)
+      edge = edge + usize.ONE
+    }
+    step = step + usize.ONE
+  }
+  List<usize>.set(&mut dominators, usize.ZERO, usize.ZERO)
+  let mut changed = true
+  while changed {
+    changed = false
+    step = usize.ONE
+    while step < reached {
+      let node = List<usize>.get(&postorder, reached - usize.ONE - step)
+      let incoming = List<usize>.asSlice(&List<List<usize>>.asSlice(&preceding)[node])
+      let mut chosen = usize.MAX
+      let mut edge = usize.ZERO
+      while edge < incoming.length {
+        let from = incoming[edge]
+        if List<usize>.get(&dominators, from) != usize.MAX {
+          if chosen == usize.MAX { chosen = from }
+          else {
+            let mut other = from
+            while chosen != other {
+              while List<usize>.get(&order, chosen) > List<usize>.get(&order, other) { chosen = List<usize>.get(&dominators, chosen) }
+              while List<usize>.get(&order, other) > List<usize>.get(&order, chosen) { other = List<usize>.get(&dominators, other) }
+            }
+          }
+        }
+        edge = edge + usize.ONE
+      }
+      if chosen != List<usize>.get(&dominators, node) {
+        List<usize>.set(&mut dominators, node, chosen)
+        changed = true
+      }
+      step = step + usize.ONE
+    }
+  }
+  return move dominators
+}
+
+fn scalarDominates(dominators: &[usize], definition: usize, consumer: usize) -> bool {
+  let mut block = consumer
+  while block != usize.MAX {
+    if block == definition { return true }
+    let parent = dominators[block]
+    if parent == block { return false }
+    block = parent
+  }
+  return false
 }
 
 // The locals one statement or terminator reads, writes whole, writes in part, or exposes by address,
