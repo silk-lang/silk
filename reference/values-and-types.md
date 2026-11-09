@@ -753,7 +753,9 @@ fn at(x: i32) -> Point {
 }
 ```
 
-A shorthand whose name resolves to nothing reports `SEM0006` at the name, as `x: x` would.
+A shorthand whose name resolves to nothing reports `SEM0006` at the name, as `x: x` would. A
+shorthand reads its binding without `move`, so a value that needs an explicit move, such as a
+`Bytes`, is written out as `name: move name`; the shorthand reports `OWN0003` like `name: name`.
 
 **Boundary:** Unknown, duplicate, missing, inaccessible, or mistyped initializers produce no
 partially initialized value. Construction never fills omitted fields with defaults. A diagnostic
