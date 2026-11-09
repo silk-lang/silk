@@ -12,11 +12,11 @@ Call [`SchemaReport.write`](#SchemaReport.impl.write) with the `silk.schema.issu
 matchers, and [`ReportOptions.json`](#ReportOptions.impl.json) for tools and for sending the problems back to a model.
 
 ## Details
-A report cuts the found value out of the input by its span, at most 40 bytes of it, and counts
-lines and columns only while it writes: lines and columns start at 1, and columns count
-characters, as editors do. [`ReportOptions.redacted`](#ReportOptions.impl.redacted) writes only the kind of each found value,
-such as `got text`, for input that may hold secrets. A snippet shows at most about 80 characters
-of a long line, around the problem.
+A report cuts the found value out of the input by its span, at most 40 bytes of its first line,
+and counts lines and columns only while it writes: lines and columns start at 1, and columns
+count characters, as editors do. [`ReportOptions.redacted`](#ReportOptions.impl.redacted) writes only the kind of each found
+value, such as `got text`, for input that may hold secrets. A snippet shows at most about 80
+characters of a long line, around the problem.
 
 The snippet form looks like this:
 

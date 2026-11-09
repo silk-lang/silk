@@ -354,6 +354,22 @@ pub static fn typeDoc<Owner>() -> string<'static>
 Returns the `///` comment written on the declaration of `Owner`, without its slashes and with
 its lines joined by newlines, or empty text when it has none or is not a named type.
 
+<a id="Reflect.impl.privateField"></a>
+
+### Associated function `privateField`
+
+```silk
+pub static fn privateField<Owner>() -> string<'static>
+```
+
+Returns the name of the first field of the struct `Owner` that is not `pub`, or empty text
+when every field is `pub` or `Owner` is no struct.
+
+#### When to use
+
+Refuse, at compile time, a type that a library must construct from outside its module. An
+`errorAt` on the returned text points at that field's declaration.
+
 <a id="Reflect.impl.fieldKind"></a>
 
 ### Associated function `fieldKind`

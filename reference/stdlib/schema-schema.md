@@ -75,7 +75,7 @@ pub effect fn main() -> i32 ! OutOfMemoryError {
 
 Import as `Schema` with `import silk.schema.schema { Schema }`.
 
-Public declarations: 8.
+Public declarations: 9.
 
 <a id="SchemaReader"></a>
 
@@ -779,6 +779,60 @@ pub static fn isStrict(self: &Self) -> bool
 
 Returns whether unknown keys are rejected.
 
+<a id="KindOf"></a>
+
+## `KindOf`
+
+```silk
+pub struct KindOf<T>
+```
+
+The kind of value a type's schema reads, and the text a missing value of it expects.
+
+### Details
+
+The type parameter says whose kind it is, as `ShapeOf` does. A spec refuses a rule the kind
+cannot follow, such as `Spec.between` on a field that holds text, and a missing key reports
+`expected` unless the field's rules say more.
+
+<a id="KindOf.value"></a>
+
+### Field `value`
+
+```silk
+pub value: ValueKind
+```
+
+The kind of value read, or `ValueKind.Unknown` when the type does not say.
+
+<a id="KindOf.expected"></a>
+
+### Field `expected`
+
+```silk
+pub expected: string<'static>
+```
+
+What the value is, such as `an integer`.
+
+<a id="KindOf.impl"></a>
+
+## Implementation `KindOf<T>`
+
+```silk
+impl<T> KindOf<T>
+```
+
+<a id="KindOf.impl.of"></a>
+
+### Associated function `of`
+
+```silk
+pub static fn of(value: ValueKind, expected: string<'static>) -> KindOf<T>
+```
+
+Returns `value` and `expected` as the kind of `T`.
+
 <a id="Schema"></a>
 
 ## `Schema`
@@ -811,6 +865,22 @@ static fn spec() -> Spec<Self>
 
 Returns what the type's schema says beyond its declaration. The default renames nothing and
 adds no rules.
+
+<a id="Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns the kind of value the type reads. The default does not say, so every rule may apply
+and a missing key expects `a value`.
+
+#### When to use
+
+Override it next to `read` for a type read from one kind of value, usually as
+[`Schemas.kindVia`](#Schemas.impl.kindVia) for a type read through a codec.
 
 <a id="Schema.read"></a>
 
@@ -1109,6 +1179,27 @@ pub static fn spec<T: Schema>() -> Spec<T>
 
 Returns the spec of `T`.
 
+<a id="Schemas.impl.kind"></a>
+
+### Associated function `kind`
+
+```silk
+pub static fn kind<T: Schema>() -> KindOf<T>
+```
+
+Returns the kind of value `T` reads.
+
+<a id="Schemas.impl.kindVia"></a>
+
+### Associated function `kindVia`
+
+```silk
+pub static fn kindVia<A, I: Schema>() -> KindOf<A>
+```
+
+Returns the kind of the wire form `I` as the kind of `A`, for the `kind` of a type read
+through a codec with [`Schemas.readVia`](#Schemas.impl.readVia).
+
 <a id="Schemas.impl.readVia"></a>
 
 ### Associated function `readVia`
@@ -1182,6 +1273,16 @@ Returns the text a value that breaks `constraint` is reported with, such as
 impl Schema for bool
 ```
 
+<a id="bool.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns `ValueKind.Boolean`.
+
 <a id="bool.impl.Schema.read"></a>
 
 ### Operation `read`
@@ -1220,6 +1321,16 @@ Adds `Shape.Boolean`.
 ```silk
 impl Schema for u64
 ```
+
+<a id="u64.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns `ValueKind.Number`.
 
 <a id="u64.impl.Schema.read"></a>
 
@@ -1270,6 +1381,16 @@ Tests a range.
 impl Schema for i64
 ```
 
+<a id="i64.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns `ValueKind.Number`.
+
 <a id="i64.impl.Schema.read"></a>
 
 ### Operation `read`
@@ -1318,6 +1439,16 @@ Tests a range.
 ```silk
 impl Schema for f64
 ```
+
+<a id="f64.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns `ValueKind.Number`.
 
 <a id="f64.impl.Schema.read"></a>
 
@@ -1368,6 +1499,16 @@ Tests a range.
 impl Schema for String
 ```
 
+<a id="String.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns `ValueKind.Text`.
+
 <a id="String.impl.Schema.read"></a>
 
 ### Operation `read`
@@ -1416,6 +1557,16 @@ Tests a length in characters, or a pattern.
 ```silk
 impl<T: Schema> Schema for Option<T>
 ```
+
+<a id="Option.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns the kind of `T`.
 
 <a id="Option.impl.Schema.read"></a>
 
@@ -1486,6 +1637,16 @@ Tests the value of `Some`; `None` follows every rule.
 impl<T: Schema> Schema for List<T>
 ```
 
+<a id="List.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns `ValueKind.List`.
+
 <a id="List.impl.Schema.read"></a>
 
 ### Operation `read`
@@ -1536,6 +1697,16 @@ Tests a number of elements.
 impl Schema for u8
 ```
 
+<a id="u8.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns `ValueKind.Number`.
+
 <a id="u8.impl.Schema.read"></a>
 
 ### Operation `read`
@@ -1584,6 +1755,16 @@ Tests a range.
 ```silk
 impl Schema for u16
 ```
+
+<a id="u16.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns `ValueKind.Number`.
 
 <a id="u16.impl.Schema.read"></a>
 
@@ -1634,6 +1815,16 @@ Tests a range.
 impl Schema for u32
 ```
 
+<a id="u32.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns `ValueKind.Number`.
+
 <a id="u32.impl.Schema.read"></a>
 
 ### Operation `read`
@@ -1682,6 +1873,16 @@ Tests a range.
 ```silk
 impl Schema for usize
 ```
+
+<a id="usize.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns `ValueKind.Number`.
 
 <a id="usize.impl.Schema.read"></a>
 
@@ -1732,6 +1933,16 @@ Tests a range.
 impl Schema for i8
 ```
 
+<a id="i8.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns `ValueKind.Number`.
+
 <a id="i8.impl.Schema.read"></a>
 
 ### Operation `read`
@@ -1781,6 +1992,16 @@ Tests a range.
 impl Schema for i16
 ```
 
+<a id="i16.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns `ValueKind.Number`.
+
 <a id="i16.impl.Schema.read"></a>
 
 ### Operation `read`
@@ -1829,6 +2050,16 @@ Tests a range.
 ```silk
 impl Schema for i32
 ```
+
+<a id="i32.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns `ValueKind.Number`.
 
 <a id="i32.impl.Schema.read"></a>
 

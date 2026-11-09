@@ -525,6 +525,17 @@ pub issue: Issue
 
 The problem.
 
+<a id="SchemaError.got"></a>
+
+### Field `got`
+
+```silk
+pub got: Option<String>
+```
+
+The value found, when the input bytes do not hold it, such as the unknown variant name
+`silk.schema.json.SchemaJson.decodeVariant` was given apart from its arguments.
+
 <a id="SchemaError.impl.Debug"></a>
 
 ## Implementation `Debug for SchemaError`
@@ -541,7 +552,7 @@ impl Debug for SchemaError
 effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
 ```
 
-Writes the fields, as `SchemaError { path: ..., issue: ... }`.
+Writes the fields, as `SchemaError { path: ..., issue: ..., got: ... }`.
 
 <a id="MAX_PROBLEMS"></a>
 

@@ -40,7 +40,7 @@ effect fn check() -> i32 ! OutOfMemoryError ? &mut Allocator {
   return match move run Effect.result(SchemaJson.decode<Limits>(b"{\"ports\": [80, 70000]}")) {
     Result<Limits, SchemaError | OutOfMemoryError>.Success {..} => 1
     Result<Limits, SchemaError | OutOfMemoryError>.Failure {error} => match move error {
-      SchemaError {path, issue} => {
+      SchemaError {path, issue, ..} => {
         let pointer = run path.pointer()
         if pointer.view() == "/ports/1" && issue.reason == IssueReason.InvalidValue { 0 } else { 2 }
       }
