@@ -30,8 +30,11 @@
 
 import backend.CodegenUnits {CodegenUnit}
 import driver.CacheStamp
+import driver.CachePublication as Publication {Snapshot, Prepared, Published}
+import semantic.CachePolicy
+import semantic.CacheView {View}
 import diagnostic.JsonText
-import driver.DetachedWriter as DetachedWriter {Handoff, Held}
+import driver.DetachedWriter as DetachedWriter {Handoff, Held, Start}
 import driver.ImportSummaries as Summaries {ImportSummaries}
 import semantic.BuildRecord
 import semantic.CacheImage
@@ -47,6 +50,7 @@ import silk.system.filesystem {AtomicWriteError, DirectoryEntry, FileError, File
 import silk.collections.list {List}
 import silk.concurrency.thread_native {JoinHandle, NativeThread, SpawnError}
 import silk.core.option {Option}
+import silk.core.ownership {Drop}
 import silk.system.filesystem_machine {MachineFileSystem}
 import silk.core.result {Result}
 import silk.collections.slice {Slice}
@@ -69,6 +73,24 @@ pub struct CacheFile {
   /// Whether the store adopted this file's own image, not a dependency's or none. Only then do the
   /// files the store parses tell the next load which files it will parse again.
   pub own: bool,
+  segmented: Option<Segmented>,
+}
+
+// The driver, not Semantic's immutable view, owns all filesystem lifetime pins.
+struct Segmented {directory: Path, snapshot: Snapshot}
+
+/// One cache writer and its prepared immutable owners/future pin. Drop joins before releasing
+/// those owners. Ordinary detached callers leave duplicate pins in the child until it exits.
+pub struct Completion {writer: DetachedWriter.Completion, pending: Option<Prepared>}
+/// An already completed cache save, with no outstanding native writer or publication pin.
+pub fn completed() -> Completion { return Completion {writer: DetachedWriter.completed(), pending: Option<Prepared>.none()} }
+/// Waits for this writer alone. The prepared pin remains until the completion owner is dropped.
+pub fn join(completion: &mut Completion) -> () { DetachedWriter.join(&mut completion.writer) }
+impl Drop for Completion { fn drop(self: &mut Completion) -> () { join(&mut self.*) } }
+fn detach(completion: Completion) -> () {
+  let mut owned = move completion
+  let writer = Intrinsic.replace(owned.writer, DetachedWriter.completed())
+  DetachedWriter.detach(move writer)
 }
 
 fn hexDigit(value: u64) -> u8 {
@@ -186,6 +208,8 @@ struct Fetched {
 /// when `cache` cannot name the record; `openPrefetched` then reads the file itself, as it does
 /// when no thread starts or the threads read another file.
 pub effect fn prefetch(cache: &Path, building: bool, profile: &[u8]) -> Option<Prefetch> ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  // Segmented loading owns its pins before reading packets; never prefetch an unpinned image.
+  if CachePolicy.enabled() { return Option<Prefetch>.none() }
   let choice = match move run choicePath(cache, profile) {
     Option<Path>.Some {value} => move value
     Option<Path>.None => { return Option<Prefetch>.none() }
@@ -527,6 +551,29 @@ pub effect fn openPrefetched(store: &mut Semantic, request: &Request, cache: &Pa
     // The next prefetch for this profile reads this file.
     if !guessed { run remember(&choice, Bytes.asSlice(&imageFile)) }
   }
+  if CachePolicy.enabled() {
+    let directory = match move run suffixed(Path.rawBytes(&path), b".segments") {
+      Option<Path>.Some {value} => move value
+      Option<Path>.None => { return Option<CacheFile>.none() }
+    }
+    let opened = run Effect.result(openSegments(&mut store.*, request, &directory, Bytes.asSlice(&stamp), linked, building))
+    let selected = match move opened {
+      Result<Option<OpenedSegments>, Cycle | FileError | OutOfMemoryError>.Success {value} => move value
+      Result<Option<OpenedSegments>, Cycle | FileError | OutOfMemoryError>.Failure {error} => match move error {
+        FileError refused => { drop refused return Option<CacheFile>.none() }
+        Cycle cycle => { fail move cycle }
+        OutOfMemoryError exhausted => { fail move exhausted }
+      }
+    }
+    return match move selected {
+      Option<OpenedSegments>.Some {value} => {
+        let OpenedSegments {snapshot, adopted: accepted, own} = move value
+        Option<CacheFile>.some(CacheFile {path: move path, packs: move packs, lock: move lock, stamp: move stamp,
+          adopted: move accepted, own: own, segmented: Option<Segmented>.some(Segmented {directory: move directory, snapshot: move snapshot})})
+      }
+      Option<OpenedSegments>.None => Option<CacheFile>.none()
+    }
+  }
   if let Option<Fetched>.Some {value: read} = move fetched {
     if same(Bytes.asSlice(&read.path), Path.rawBytes(&path)) && same(Bytes.asSlice(&read.stamp), Bytes.asSlice(&stamp)) {
       let Fetched {path: _, stamp: _, graph, packs: bodies} = move read
@@ -535,7 +582,7 @@ pub effect fn openPrefetched(store: &mut Semantic, request: &Request, cache: &Pa
           if building { Semantic.offerPacks(&mut store.*, move bodies) }
           adopted = run Semantic.adoptImage(&mut store.*, request, move image, linked)
           return Option<CacheFile>.some(CacheFile {path: move path, packs: move packs, lock: move lock, stamp: move stamp,
-            adopted: move adopted, own: true})
+            adopted: move adopted, own: true, segmented: Option<Segmented>.none()})
         }
       }
     }
@@ -555,7 +602,37 @@ pub effect fn openPrefetched(store: &mut Semantic, request: &Request, cache: &Pa
     }
   }
   return Option<CacheFile>.some(CacheFile {path: move path, packs: move packs, lock: move lock, stamp: move stamp, adopted: move adopted,
-    own: own})
+    own: own, segmented: Option<Segmented>.none()})
+}
+
+struct OpenedSegments {snapshot: Snapshot, adopted: Adopted, own: bool}
+effect fn openSegments(store: &mut Semantic, request: &Request, directory: &Path, stamp: &[u8], linked: bool, building: bool)
+-> Option<OpenedSegments> ! Cycle | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator | &mut Types {
+  if let Option<ContentHash>.None = move run Publication.ensure(directory) { return Option<OpenedSegments>.none() }
+  let mut snapshot = match move run Publication.snapshot(directory, stamp) {
+    Option<Snapshot>.Some {value} => move value
+    Option<Snapshot>.None => { return Option<OpenedSegments>.none() }
+  }
+  let mut adopted = Adopted {roots: 0, stale: 0, nodes: 0, changedLeaves: 0}
+  let mut own = false
+  if let Option<View>.Some {value} = move run Publication.load(&mut snapshot) {
+    if building {
+      let mut bodies = List<BuildRecord.PackBody>.make()
+      let mut at = usize.ZERO
+      while at < Publication.packCount(&snapshot) {
+        if let Option<ContentHash>.Some {value: digest} = move Publication.packAt(&snapshot, at) {
+          if let Option<Bytes>.Some {value: bytes} = move run Publication.readPack(&mut snapshot, digest) {
+            run List<BuildRecord.PackBody>.append(&mut bodies, BuildRecord.PackBody {digest: digest, bytes: move bytes})
+          }
+        }
+        at = at + usize.ONE
+      }
+      Semantic.offerPacks(&mut store.*, move bodies)
+    }
+    adopted = run Semantic.adoptView(&mut store.*, request, move value, linked)
+    own = true
+  }
+  return Option<OpenedSegments>.some(OpenedSegments {snapshot: move snapshot, adopted: move adopted, own: own})
 }
 
 /// Records that the cache file `file` holds the escape walk of a runtime, as an executable's
@@ -935,12 +1012,16 @@ effect fn rootsPath(path: &[u8]) -> Option<Path> ! OutOfMemoryError ? &mut Alloc
 /// from the file carried over, unless it ran no module check, every check in the file was
 /// reused and its last build lowered nothing the file lacks, so the file already holds what it
 /// would write.
-pub effect fn save(store: &mut Semantic, file: &CacheFile) -> ()
+pub effect fn save(store: &mut Semantic, file: &mut CacheFile) -> ()
   ! Cycle | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  if current(&store.*, file) { return () }
+  if let Option<Segmented>.Some {..} = &file.segmented {
+    drop run saveSegments(&mut store.*, &mut file.*, Option<&[CodegenUnit]>.none(), false)
+    return ()
+  }
+  if current(&store.*, &file.*) { return () }
   // A copy of an earlier build may still be writing the file.
   let held = run DetachedWriter.hold(&file.lock)
-  run persist(&mut store.*, file, true)
+  run persist(&mut store.*, &file.*, true)
   drop held
 }
 
@@ -952,44 +1033,118 @@ pub effect fn save(store: &mut Semantic, file: &CacheFile) -> ()
 /// # Gotchas
 /// Call it on the build's only thread after semantic validation. Pack directories are prepared
 /// before the fork; the copy never recreates directories removed by a concurrent clean.
-pub effect fn saveDetached(store: &mut Semantic, file: &CacheFile, units: Option<&[CodegenUnit]>) -> ()
+pub effect fn saveDetached(store: &mut Semantic, file: &mut CacheFile, units: Option<&[CodegenUnit]>) -> ()
   ! Cycle | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  let completion = run saveTracked(&mut store.*, file, move units)
-  DetachedWriter.detach(move completion)
+  let completion = run saveTracked(&mut store.*, &mut file.*, move units)
+  detach(move completion)
 }
 
 /// Starts the accepted pack/image write and returns ownership of its completion. The caller
 /// retains the token through native publication; dropping it joins this writer on success or
 /// failure. Call only on the parent's sole thread after semantic workers have closed.
-pub effect fn saveTracked(store: &mut Semantic, file: &CacheFile, units: Option<&[CodegenUnit]>) -> DetachedWriter.Completion
+pub effect fn saveTracked(store: &mut Semantic, file: &mut CacheFile, units: Option<&[CodegenUnit]>) -> Completion
   ! Cycle | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  if current(&store.*, file) {
-    // Preserve repair of a missing pack even when no new semantic image is needed.
-    if let Option<&[CodegenUnit]>.Some {value: built} = &units { run storePacks(file, built) }
-    return DetachedWriter.completed()
+  if let Option<Segmented>.Some {..} = &file.segmented {
+    return run saveSegments(&mut store.*, &mut file.*, move units, true)
   }
-  if let Option<&[CodegenUnit]>.Some {..} = &units { drop run preparePacks(file) }
+  if current(&store.*, &file.*) {
+    // Preserve repair of a missing pack even when no new semantic image is needed.
+    if let Option<&[CodegenUnit]>.Some {value: built} = &units { run storePacks(&file.*, built) }
+    return completed()
+  }
+  if let Option<&[CodegenUnit]>.Some {..} = &units { drop run preparePacks(&file.*) }
   let held = match move run DetachedWriter.hold(&file.lock) {
     Option<Held>.Some {value} => move value
     Option<Held>.None => {
-      run persistBuilt(&mut store.*, file, &units, true)
-      return DetachedWriter.completed()
+      run persistBuilt(&mut store.*, &file.*, &units, true)
+      return completed()
     }
   }
   match move DetachedWriter.handOff(move held) {
-    Handoff.Original {completion} => { return move completion }
+    Handoff.Original {completion} => { return Completion {writer: move completion, pending: Option<Prepared>.none()} }
     Handoff.Copy {held: kept} => {
       // The copy shares the build's call stack, so no failure may return into it. Packs and
       // image share the writer lock; best-effort pruning remains the last step.
-      drop run Effect.result(persistBuilt(&mut store.*, file, &units, false))
+      drop run Effect.result(persistBuilt(&mut store.*, &file.*, &units, false))
       DetachedWriter.finish(move kept)
     }
     Handoff.Here {held: kept} => {
-      run persistBuilt(&mut store.*, file, &units, true)
+      run persistBuilt(&mut store.*, &file.*, &units, true)
       drop kept
-      return DetachedWriter.completed()
+      return completed()
     }
   }
+}
+
+// The returned completion retains the parent's future pin until native completion or detach.
+// Synchronous LSP writes settle immediately, advancing both expected token and source provenance.
+effect fn saveSegments(store: &mut Semantic, file: &mut CacheFile, units: Option<&[CodegenUnit]>, detached: bool) -> Completion
+! Cycle | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let mut repair = false
+  if let Option<&[CodegenUnit]>.Some {value} = &units {
+    let mut at = usize.ZERO
+    while at < value.length { if !value[at].stored { repair = true } at = at + usize.ONE }
+  }
+  if current(&store.*, &file.*) && !repair { return completed() }
+  let view = match move run Semantic.completeCacheView(&mut store.*, Bytes.asSlice(&file.stamp)) {
+    Option<View>.Some {value} => move value
+    Option<View>.None => { return completed() }
+  }
+  let state = match &mut file.segmented {
+    Option<Segmented>.Some {value} => &mut value
+    Option<Segmented>.None => { return completed() }
+  }
+  let result = run Effect.result(saveSegmentView(&mut state.*, &view, &units, detached))
+  return match move result {
+    Result<Completion, FileError | AtomicWriteError | OutOfMemoryError>.Success {value} => move value
+    Result<Completion, FileError | AtomicWriteError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError refused => { drop refused completed() }
+      AtomicWriteError refused => { drop refused completed() }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+effect fn saveSegmentView(state: &mut Segmented, view: &View, units: &Option<&[CodegenUnit]>, detached: bool) -> Completion
+! FileError | AtomicWriteError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let prepared = match move run Publication.prepare(&state.snapshot, view) {
+    Option<Prepared>.Some {value} => move value
+    Option<Prepared>.None => { return completed() }
+  }
+  let writer = match move run Publication.begin(&state.directory, state.snapshot.expected) {
+    Option<Publication.Writer>.Some {value} => move value
+    Option<Publication.Writer>.None => { return completed() }
+  }
+  let mut packs = List<Publication.Pack>.make()
+  if let Option<&[CodegenUnit]>.Some {value} = &units.* {
+    let mut at = usize.ZERO
+    while at < value.length {
+      if !value[at].stored { run List<Publication.Pack>.append(&mut packs,
+        Publication.Pack {digest: value[at].digest, bytes: Bytes.asSlice(&value[at].body)}) }
+      at = at + usize.ONE
+    }
+  }
+  if detached {
+    match move DetachedWriter.start() {
+      Start.Original {completion} => {
+        // Only the child's copy keeps the CAS flock. Both processes retain source/future pins.
+        drop writer
+        return Completion {writer: move completion, pending: Option<Prepared>.some(move prepared)}
+      }
+      Start.Copy => {
+        drop run Effect.result(Publication.publish(move writer, &state.snapshot, &prepared,
+          List<Publication.Pack>.asSlice(&packs), 2147483648))
+        DetachedWriter.finishCopy()
+      }
+      Start.Here => {}
+    }
+  }
+  let published = run Publication.publish(move writer, &state.snapshot, &prepared,
+    List<Publication.Pack>.asSlice(&packs), 2147483648)
+  if let Published.Committed {..} = &published {
+    if let Option<Snapshot>.Some {value} = move run Publication.settle(move prepared) { state.snapshot = move value }
+  }
+  return completed()
 }
 
 // The accepted IR bodies and their semantic image form one ordered writer operation.
@@ -1327,7 +1482,7 @@ effect fn detachedPackClaims() -> () ! FileError | OutOfMemoryError | AssertionE
     let file = CacheFile {
       path: run Path.join(&directory.*, "semantic"), packs: run Path.join(&directory.*, "semantic.packs"),
       lock: run Path.join(&directory.*, "semantic.lock"), stamp: Bytes.make(), own: false,
-      adopted: Adopted {roots: 0, stale: 0, nodes: 0, changedLeaves: 0},
+      adopted: Adopted {roots: 0, stale: 0, nodes: 0, changedLeaves: 0}, segmented: Option<Segmented>.none(),
     }
     let digest = ContentHash {high: 1, low: 2}
     let body = b"accepted LLVM body"
