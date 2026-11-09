@@ -508,6 +508,22 @@ fn stopFrontier(workers: &[CheckWorker]) -> () {
   }
 }
 
+// A forked native coordinator must not keep the parent's worker channels alive. Closing the
+// inherited descriptors is deliberately different from stopFrontier: no command, signal or wait.
+fn closeInheritedWorkers(workers: &mut List<CheckWorker>) -> () {
+  let held = List<CheckWorker>.asMutSlice(&mut workers.*)
+  let mut at = usize.ZERO
+  while at < held.length {
+    if held[at].control >= 0 { drop unsafe FrontierHost.close(held[at].control) }
+    held[at].control = -1
+    if !Pointer.isNull<u8>(held[at].stream) { drop unsafe FrontierHost.closeFile(held[at].stream) }
+    held[at].stream = Pointer.null<u8>()
+    at = at + usize.ONE
+  }
+  drop held
+  List<CheckWorker>.clear(&mut workers.*)
+}
+
 // Two trailing words schedule inherited runtime tasks and checked modules independently.
 const frontierClaimBytes: usize = 4194320
 const frontierRuntimeCursor: usize = 524288
@@ -1496,7 +1512,51 @@ effect fn appendArtifactIdentity(bytes: &mut Bytes, exact: ContentHash, definiti
 }
 
 impl Semantic {
-  effect fn retainedArtifact(self: &mut Self, roots: &[BuildRoot], module: &ModuleId, span: Span) -> Option<BackendBuild>
+  // The cache evidence of a proved, emitted retained graph. Cache transfer failure leaves the
+  // caller free to discard speculative native work and use the ordinary serial build path.
+  effect fn captureArtifactReplay(self: &mut Self, replay: BuildRecord.Record, started: u64) -> Option<CapturedBuild>
+  ! Cycle | OutOfMemoryError ? &mut Allocator | &mut Types {
+    let imported = match move run Semantic.importArtifactCache(&mut self.*) {
+      Option<List<ArtifactImportedRoot>>.Some {value} => move value
+      Option<List<ArtifactImportedRoot>>.None => { return Option<CapturedBuild>.none() }
+    }
+    let incoming = List<ArtifactImportedRoot>.asSlice(&imported)
+    let mut lookup = DigestSet.make()
+    let mut importedPositions = List<usize>.make()
+    let mut at = usize.ZERO
+    while at < incoming.length {
+      if run DigestSet.add(&mut lookup, incoming[at].exact) {
+        run List<usize>.append(&mut importedPositions, incoming[at].root)
+      }
+      at = at + usize.ONE
+    }
+    let capturedEntries = List<BuildRecord.Entry>.asSlice(&replay.entries)
+    let mut rested = List<CapturedEntry>.make()
+    at = usize.ZERO
+    while at < capturedEntries.length {
+      let entry = &capturedEntries[at]
+      let mut carried = usize.MAX
+      if entry.alias == usize.MAX {
+        let found = DigestSet.find(&lookup, entry.exact)
+        if found == usize.MAX {
+          run frontierTrace(b"artifact cache entry missing", started, at, incoming.length)
+          return Option<CapturedBuild>.none()
+        }
+        carried = List<usize>.get(&importedPositions, found)
+      }
+      run List<CapturedEntry>.append(&mut rested, CapturedEntry {value: usize.MAX, mirUnit: usize.MAX,
+        emissionUnit: usize.MAX, carried: carried})
+      at = at + usize.ONE
+    }
+    let capturedCount = capturedEntries.length
+    let captured = CapturedBuild {record: move replay, entries: move rested,
+      guard: usize.MAX, carriedRecord: usize.MAX}
+    run frontierTrace(b"artifact replay captured", started, capturedCount, incoming.length)
+    return Option<CapturedBuild>.some(move captured)
+  }
+
+  effect fn retainedArtifact(self: &mut Self, roots: &[BuildRoot], module: &ModuleId, span: Span,
+    deferCache: bool, pending: &mut Option<BuildRecord.Record>) -> Option<BackendBuild>
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
     let started = run frontierNow()
     let workers = List<CheckWorker>.asSlice(&self.artifactWorkers)
@@ -1658,7 +1718,7 @@ impl Semantic {
         }
         self.artifactObserving = true
         run frontierTrace(b"artifact observing restart", started, rounds, List<ArtifactJob>.length(&jobs))
-        return run Semantic.retainedArtifact(&mut self.*, roots, module, span)
+        return run Semantic.retainedArtifact(&mut self.*, roots, module, span, deferCache, &mut pending.*)
       }
       if !healthy { run frontierTrace(b"artifact graph refused", started, rounds, List<ArtifactJob>.length(&jobs))
         return Option<BackendBuild>.none() }
@@ -1740,7 +1800,7 @@ impl Semantic {
     }
     if !healthy || !run DefinitionFragments.valid(List<DefinitionFragments.Entry>.asSlice(&definitions)) { return Option<BackendBuild>.none() }
     run frontierTrace(b"artifact emitted", started, List<DefinitionFragments.Entry>.length(&definitions), usize.ZERO)
-    let mut persisted = Option<CapturedBuild>.none()
+    let mut replayed = Option<BuildRecord.Record>.none()
     if retainedCacheExperiment() {
       let mut exactRoots = List<ContentHash>.make()
       at = usize.ZERO
@@ -1756,42 +1816,7 @@ impl Semantic {
           return Option<BackendBuild>.none()
         }
       }
-      let imported = match move run Semantic.importArtifactCache(&mut self.*) {
-        Option<List<ArtifactImportedRoot>>.Some {value} => move value
-        Option<List<ArtifactImportedRoot>>.None => { return Option<BackendBuild>.none() }
-      }
-      let incoming = List<ArtifactImportedRoot>.asSlice(&imported)
-      let mut lookup = DigestSet.make()
-      let mut importedPositions = List<usize>.make()
-      at = usize.ZERO
-      while at < incoming.length {
-        if run DigestSet.add(&mut lookup, incoming[at].exact) {
-          run List<usize>.append(&mut importedPositions, incoming[at].root)
-        }
-        at = at + usize.ONE
-      }
-      let capturedEntries = List<BuildRecord.Entry>.asSlice(&replay.entries)
-      let mut rested = List<CapturedEntry>.make()
-      at = usize.ZERO
-      while at < capturedEntries.length {
-        let entry = &capturedEntries[at]
-        let mut carried = usize.MAX
-        if entry.alias == usize.MAX {
-          let found = DigestSet.find(&lookup, entry.exact)
-          if found == usize.MAX {
-            run frontierTrace(b"artifact cache entry missing", started, at, incoming.length)
-            return Option<BackendBuild>.none()
-          }
-          carried = List<usize>.get(&importedPositions, found)
-        }
-        run List<CapturedEntry>.append(&mut rested, CapturedEntry {value: usize.MAX, mirUnit: usize.MAX,
-          emissionUnit: usize.MAX, carried: carried})
-        at = at + usize.ONE
-      }
-      let capturedCount = capturedEntries.length
-      persisted = Option<CapturedBuild>.some(CapturedBuild {record: move replay, entries: move rested,
-        guard: usize.MAX, carriedRecord: usize.MAX})
-      run frontierTrace(b"artifact replay captured", started, capturedCount, incoming.length)
+      replayed = Option<BuildRecord.Record>.some(move replay)
     }
     let mut collected = List<CollectedText>.make()
     while let Option<DefinitionFragments.Entry>.Some {value} = move List<DefinitionFragments.Entry>.pop(&mut definitions) {
@@ -1802,10 +1827,32 @@ impl Semantic {
     }
     let mut packed = PackedBuild.make()
     let built = run assembleEmission(&self.resolver, List<CollectedText>.asSlice(&collected), roots, module, span, &mut packed)
+    let mut canDefer = deferCache && self.resolver.codegenUnits && !self.resolver.revisable
+    if let BackendBuild.Module {units, ..} = &built {
+      let listed = List<CodegenUnit>.asSlice(&units)
+      if listed.length == usize.ZERO { canDefer = false }
+      let mut unit = usize.ZERO
+      while unit < listed.length {
+        if listed[unit].stored { canDefer = false }
+        unit = unit + usize.ONE
+      }
+    } else { canDefer = false }
+    let mut persisted = Option<CapturedBuild>.none()
+    if let Option<BuildRecord.Record>.Some {value: replay} = move replayed {
+      if canDefer { pending.* = Option<BuildRecord.Record>.some(move replay) }
+      else {
+        persisted = run Semantic.captureArtifactReplay(&mut self.*, move replay, started)
+        if let Option<CapturedBuild>.None = &persisted { return Option<BackendBuild>.none() }
+      }
+    }
     self.packedBuild = move packed
     self.capturedBuild = move persisted
-    self.freshBuild = true
-    run frontierTrace(b"artifact accepted", started, List<CollectedText>.length(&collected), usize.ZERO)
+    self.freshBuild = match &pending.* { Option<BuildRecord.Record>.None => true _ => false }
+    if let Option<BuildRecord.Record>.None = &pending.* {
+      run frontierTrace(b"artifact accepted", started, List<CollectedText>.length(&collected), usize.ZERO)
+    } else {
+      run frontierTrace(b"artifact prepared", started, List<CollectedText>.length(&collected), usize.ZERO)
+    }
     return Option<BackendBuild>.some(move built)
   }
 }
@@ -2423,6 +2470,31 @@ pub union BackendBuild {
   /// A refused instance contributes no references, so the walk continues past it and reports
   /// each independent refusal once.
   Rejected {pub first: Shared<Rejection>, pub further: List<Shared<Rejection>>, pub gaps: List<Shared<BackendGap>>},
+}
+
+/// A proved and assembled artifact whose retained cache evidence may still await adoption.
+/// Only [`Semantic.finishBuildArtifact`] releases the owned build for publication.
+pub struct ArtifactPreparation {
+  build: BackendBuild,
+  replay: Option<BuildRecord.Record>,
+}
+
+impl ArtifactPreparation {
+  /// Borrows exact assembled units for private native compilation before final cache adoption.
+  pub fn preview(self: &Self) -> &BackendBuild { return &self.build }
+  /// Whether cache adoption remains pending. Every unit in this case has its body in memory;
+  /// none refers to a stored pack. Synchronous and warm builds return false.
+  pub fn deferred(self: &Self) -> bool {
+    return match &self.replay { Option<BuildRecord.Record>.Some {..} => true _ => false }
+  }
+}
+
+/// The completed artifact and whether it is the same artifact that preparation previewed.
+pub struct ArtifactCompletion {
+  pub build: BackendBuild,
+  /// False when cache transfer failed and serial fallback replaced the preview. Discard every
+  /// pending native product in that case, even if individual units happen to match.
+  pub accepted: bool,
 }
 
 // A build refused before or after the instance walk, by one diagnostic.
@@ -101008,6 +101080,110 @@ impl Semantic {
     rootPackage: &[ModuleId], checked: &[ModuleId], closureNodes: usize) -> BackendBuild
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
   ? &mut Allocator | &mut Types {
+    let prepared = run Semantic.prepareArtifactWithCache(&mut self.*, &mut request.*, runtime, rootPackage, checked, closureNodes, false)
+    return move prepared.build
+  }
+
+  /// Checks and assembles an artifact, leaving only an admitted cold retained build's cache
+  /// evidence pending. The caller must finish or abandon the preparation before reusing the store.
+  pub effect fn prepareBuildArtifact(self: &mut Self, request: &mut Request, runtime: Option<&ModuleId>,
+    rootPackage: &[ModuleId], checked: &[ModuleId], closureNodes: usize) -> ArtifactPreparation
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+    return run Semantic.prepareArtifactWithCache(&mut self.*, &mut request.*, runtime, rootPackage, checked, closureNodes, true)
+  }
+
+  fn stopArtifactWorkers(self: &mut Self) -> () {
+    stopFrontier(List<CheckWorker>.asSlice(&self.artifactWorkers))
+    List<CheckWorker>.clear(&mut self.artifactWorkers)
+    self.deferredFrontierGraph = Option<BuildRecord.Record>.none()
+    self.deferredFrontierSubsets = List<DeferredFrontierSubset>.make()
+    if let Option<[*]mut u64>.Some {value} = move self.frontierClaims { drop unsafe FrontierHost.unmapShared(value, frontierClaimBytes) }
+    self.frontierClaims = Option<[*]mut u64>.none()
+    if let Option<[*]mut u64>.Some {value} = move self.frontierForkControl { drop unsafe FrontierHost.unmapShared(value, 4096) }
+    self.frontierForkControl = Option<[*]mut u64>.none()
+    self.keepArtifactWorkers = false
+  }
+
+  effect fn finishArtifactWorkers(self: &mut Self) -> () ! Cycle | OutOfMemoryError ? &mut Allocator | &mut Types {
+    let cached = run Effect.result(Semantic.flushDeferredFrontierCache(&mut self.*))
+    Semantic.stopArtifactWorkers(&mut self.*)
+    match move cached {
+      Result<(), Cycle | OutOfMemoryError>.Success {..} => {}
+      Result<(), Cycle | OutOfMemoryError>.Failure {error} => { fail move error }
+    }
+  }
+
+  /// Closes inherited worker descriptors in a newly forked native coordinator. Call only in
+  /// the child: it sends no stop request and never waits for or signals the parent's workers.
+  pub fn closeInheritedWorkerChannels(self: &mut Self) -> () {
+    closeInheritedWorkers(&mut self.artifactWorkers)
+    closeInheritedWorkers(&mut self.frontierChildren)
+    if self.frontierControl >= 0 { drop unsafe FrontierHost.close(self.frontierControl) }
+    self.frontierControl = -1
+  }
+
+  /// Discards an unfinished preparation and closes its workers without publishing build evidence.
+  pub fn abandonBuildArtifact(self: &mut Self, prepared: &mut ArtifactPreparation) -> () {
+    prepared.replay = Option<BuildRecord.Record>.none()
+    self.capturedBuild = Option<CapturedBuild>.none()
+    self.freshBuild = false
+    self.packedBuild = PackedBuild.make()
+    Semantic.stopArtifactWorkers(&mut self.*)
+  }
+
+  /// Adopts the exact cache proof and closes retained workers. Failed transport discards the
+  /// preview and retries the ordinary build without process workers; it never authorizes pending
+  /// native output from the discarded preparation. The request and roots must match preparation.
+  pub effect fn finishBuildArtifact(self: &mut Self, request: &mut Request, runtime: Option<&ModuleId>,
+    rootPackage: &[ModuleId], checked: &[ModuleId], closureNodes: usize, prepared: ArtifactPreparation) -> ArtifactCompletion
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+    let ArtifactPreparation {build, replay} = move prepared
+    let record = match move replay {
+      Option<BuildRecord.Record>.Some {value} => move value
+      Option<BuildRecord.Record>.None => { return ArtifactCompletion {build: move build, accepted: true} }
+    }
+    let started = self.frontierSplit
+    let captured = run Effect.result(Semantic.captureArtifactReplay(&mut self.*, move record, started))
+    let mut accepted = false
+    match move captured {
+      Result<Option<CapturedBuild>, Cycle | OutOfMemoryError>.Success {value} => {
+        if let Option<CapturedBuild>.Some {value: proof} = move value {
+          self.capturedBuild = Option<CapturedBuild>.some(move proof)
+          self.freshBuild = true
+          accepted = true
+        }
+      }
+      Result<Option<CapturedBuild>, Cycle | OutOfMemoryError>.Failure {error} => {
+        Semantic.stopArtifactWorkers(&mut self.*)
+        fail move error
+      }
+    }
+    run Semantic.finishArtifactWorkers(&mut self.*)
+    if accepted {
+      run frontierTrace(b"artifact accepted", started, usize.ZERO, usize.ZERO)
+      return ArtifactCompletion {build: move build, accepted: true}
+    }
+    drop build
+    self.capturedBuild = Option<CapturedBuild>.none()
+    self.freshBuild = false
+    self.packedBuild = PackedBuild.make()
+    let allowed = self.processWorkersAllowed
+    self.processWorkersAllowed = false
+    let retried = run Effect.result(Semantic.buildArtifact(&mut self.*, &mut request.*, runtime, rootPackage, checked, closureNodes))
+    self.processWorkersAllowed = allowed
+    return match move retried {
+      Result<BackendBuild, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} =>
+        ArtifactCompletion {build: move value, accepted: false}
+      Result<BackendBuild, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} => { fail move error }
+    }
+  }
+
+  effect fn prepareArtifactWithCache(self: &mut Self, request: &mut Request, runtime: Option<&ModuleId>,
+    rootPackage: &[ModuleId], checked: &[ModuleId], closureNodes: usize, deferCache: bool) -> ArtifactPreparation
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
     self.keepArtifactWorkers = retainedBuildExperiment()
     self.artifactWarmCandidates = List<usize>.make()
     self.artifactWarmCandidateLookup = InternIndex.make()
@@ -101020,30 +101196,24 @@ impl Semantic {
     // declaration checks and replayBuild repair its changed nodes instead of rechecking a
     // whole runtime frontier before the build's existing validation path can reuse it.
     if let Option<ReplayState>.Some {..} = &self.replay { self.frontierAvailable = false }
-    let attempted = run Effect.result(Semantic.buildArtifactHeld(&mut self.*, &mut request.*, runtime, rootPackage, checked, closureNodes))
-    let cached = run Effect.result(Semantic.flushDeferredFrontierCache(&mut self.*))
-    stopFrontier(List<CheckWorker>.asSlice(&self.artifactWorkers))
-    List<CheckWorker>.clear(&mut self.artifactWorkers)
-    self.deferredFrontierGraph = Option<BuildRecord.Record>.none()
-    self.deferredFrontierSubsets = List<DeferredFrontierSubset>.make()
-    if let Option<[*]mut u64>.Some {value} = move self.frontierClaims { drop unsafe FrontierHost.unmapShared(value, frontierClaimBytes) }
-    self.frontierClaims = Option<[*]mut u64>.none()
-    if let Option<[*]mut u64>.Some {value} = move self.frontierForkControl { drop unsafe FrontierHost.unmapShared(value, 4096) }
-    self.frontierForkControl = Option<[*]mut u64>.none()
-    self.keepArtifactWorkers = false
-    return match move attempted {
-      Result<BackendBuild, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} => {
-        match move cached {
-          Result<(), Cycle | OutOfMemoryError>.Success {..} => move value
-          Result<(), Cycle | OutOfMemoryError>.Failure {error} => { fail move error }
-        }
+    let mut pending = Option<BuildRecord.Record>.none()
+    let attempted = run Effect.result(Semantic.buildArtifactHeld(&mut self.*, &mut request.*, runtime, rootPackage, checked, closureNodes,
+      deferCache, &mut pending))
+    let build = match move attempted {
+      Result<BackendBuild, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} => move value
+      Result<BackendBuild, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} => {
+        let flushed = run Effect.result(Semantic.finishArtifactWorkers(&mut self.*))
+        drop flushed
+        fail move error
       }
-      Result<BackendBuild, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} => { fail move error }
     }
+    if let Option<BuildRecord.Record>.None = &pending { run Semantic.finishArtifactWorkers(&mut self.*) }
+    return ArtifactPreparation {build: move build, replay: move pending}
   }
 
   effect fn buildArtifactHeld(self: &mut Self, request: &mut Request, runtime: Option<&ModuleId>,
-    rootPackage: &[ModuleId], checked: &[ModuleId], closureNodes: usize) -> BackendBuild
+    rootPackage: &[ModuleId], checked: &[ModuleId], closureNodes: usize, deferCache: bool,
+    pending: &mut Option<BuildRecord.Record>) -> BackendBuild
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
   ? &mut Allocator | &mut Types {
     run selectRequest(&mut self.resolver, &request.*)
@@ -101263,7 +101433,7 @@ impl Semantic {
     }
     self.replay = Option<ReplayState>.none()
     if List<CheckWorker>.length(&self.artifactWorkers) > usize.ZERO {
-      if let Option<BackendBuild>.Some {value} = move run Semantic.retainedArtifact(&mut self.*, List<BuildRoot>.asSlice(&roots), &module, origin) {
+      if let Option<BackendBuild>.Some {value} = move run Semantic.retainedArtifact(&mut self.*, List<BuildRoot>.asSlice(&roots), &module, origin, deferCache, &mut pending.*) {
         drop emitting
         return run withUnemittedBodies(move value, List<UncheckedDeclaration>.asSlice(&checked.unchecked))
       }
@@ -112830,4 +113000,45 @@ test effect fn indexedEscapeFailedReplacementDoesNotRebindAuthenticatedViews() -
 ! OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run indexedEscapeFailedReplacementClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// A lost retained-cache packet must never authorize native products from its preview.
+effect fn artifactPreparationClaims() -> ()
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError | AssertionError<'static>
+? &mut Allocator | &mut Types {
+  let module = run ModuleId.make(b"memory", b"staged", b"entry.silk")
+  let source = Option<Bytes>.some(run Bytes.copy(b"export \"C\" fn answer() -> i32 { return 7 }\n"))
+  let revision = run Revision.publish(&Revision.make(), &module, &source)
+  let mut store = Semantic.make(move revision, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu), Option<FinalProfile>.none())
+  let mut request = Request.forApplication(ModuleId.copy(&module))
+  let modules = [ModuleId.copy(&module)]
+  Semantic.selectCodegenUnits(&mut store, true)
+  let prepared = run Semantic.prepareBuildArtifact(&mut store, &mut request, Option<&ModuleId>.none(), &modules, &modules, 16)
+  run Testing.expect(!ArtifactPreparation.deferred(&prepared), "a synchronous build does not leave cache evidence or workers pending")
+  run Testing.expect(match ArtifactPreparation.preview(&prepared) { BackendBuild.Module {..} => true _ => false },
+    "the source export is proved and assembled before completion")
+  let completed = run Semantic.finishBuildArtifact(&mut store, &mut request, Option<&ModuleId>.none(), &modules, &modules, 16, move prepared)
+  run Testing.expect(completed.accepted && match &completed.build { BackendBuild.Module {..} => true _ => false },
+    "ordinary completion preserves the exact preview")
+  let lost = ArtifactPreparation {build: BackendBuild.Unsupported {gaps: List<Shared<BackendGap>>.make()},
+    replay: Option<BuildRecord.Record>.some(BuildRecord.make(false, true))}
+  Semantic.allowProcessWorkers(&mut store)
+  let retried = run Semantic.finishBuildArtifact(&mut store, &mut request, Option<&ModuleId>.none(), &modules, &modules, 16, move lost)
+  run Testing.expect(!retried.accepted && match &retried.build { BackendBuild.Module {..} => true _ => false },
+    "missing cache transport discards the preview and rebuilds the actual source serially")
+  run Testing.expect(store.processWorkersAllowed && List<CheckWorker>.length(&store.artifactWorkers) == 0,
+    "serial fallback restores the caller's process policy and leaves no retained workers")
+  let mut abandoned = ArtifactPreparation {build: BackendBuild.Unsupported {gaps: List<Shared<BackendGap>>.make()},
+    replay: Option<BuildRecord.Record>.some(BuildRecord.make(false, true))}
+  Semantic.abandonBuildArtifact(&mut store, &mut abandoned)
+  run Testing.expect(!ArtifactPreparation.deferred(&abandoned) && !store.freshBuild
+    && match &store.capturedBuild { Option<CapturedBuild>.None => true _ => false },
+    "abandonment cannot leave captured build evidence or authorize private native output")
+}
+
+test effect fn artifactPreparationRequiresAcceptedCacheCompletion() -> ()
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut types = TypeTable.make()
+  run artifactPreparationClaims() |> Effect.provideMut<Types>(&mut types) |> Effect.provideMut<Allocator>(&mut allocator)
 }
