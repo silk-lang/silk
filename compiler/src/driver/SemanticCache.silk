@@ -79,12 +79,12 @@ pub struct CacheFile {
 // The driver, not Semantic's immutable view, owns all filesystem lifetime pins.
 struct Segmented {directory: Path, snapshot: Snapshot}
 
-/// One cache writer and its prepared immutable owners/future pin. Drop joins before releasing
-/// those owners. Ordinary detached callers leave duplicate pins in the child until it exits.
-pub struct Completion {writer: DetachedWriter.Completion, pending: Option<Prepared>}
-/// An already completed cache save, with no outstanding native writer or publication pin.
-pub fn completed() -> Completion { return Completion {writer: DetachedWriter.completed(), pending: Option<Prepared>.none()} }
-/// Waits for this writer alone. The prepared pin remains until the completion owner is dropped.
+/// One cache writer. Its child process retains inherited source pins and any prepared future
+/// pin until exit; dropping the parent token joins before native checkpoint completion.
+pub struct Completion {writer: DetachedWriter.Completion}
+/// An already completed cache save, with no outstanding native writer.
+pub fn completed() -> Completion { return Completion {writer: DetachedWriter.completed()} }
+/// Waits for this writer alone; the child releases its pins only when its work has ended.
 pub fn join(completion: &mut Completion) -> () { DetachedWriter.join(&mut completion.writer) }
 impl Drop for Completion { fn drop(self: &mut Completion) -> () { join(&mut self.*) } }
 fn detach(completion: Completion) -> () {
@@ -1061,7 +1061,7 @@ pub effect fn saveTracked(store: &mut Semantic, file: &mut CacheFile, units: Opt
     }
   }
   match move DetachedWriter.handOff(move held) {
-    Handoff.Original {completion} => { return Completion {writer: move completion, pending: Option<Prepared>.none()} }
+    Handoff.Original {completion} => { return Completion {writer: move completion} }
     Handoff.Copy {held: kept} => {
       // The copy shares the build's call stack, so no failure may return into it. Packs and
       // image share the writer lock; best-effort pruning remains the last step.
@@ -1076,8 +1076,9 @@ pub effect fn saveTracked(store: &mut Semantic, file: &mut CacheFile, units: Opt
   }
 }
 
-// The returned completion retains the parent's future pin until native completion or detach.
-// Synchronous LSP writes settle immediately, advancing both expected token and source provenance.
+// Parent work before fork is bounded to current status and the expected-prior CAS lock.
+// Complete view export/admission and packet preparation stay in the child, just as ordinary
+// image preparation does. The child inherits the source snapshot's OS pin with the process.
 effect fn saveSegments(store: &mut Semantic, file: &mut CacheFile, units: Option<&[CodegenUnit]>, detached: bool) -> Completion
 ! Cycle | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
   let mut repair = false
@@ -1086,34 +1087,60 @@ effect fn saveSegments(store: &mut Semantic, file: &mut CacheFile, units: Option
     while at < value.length { if !value[at].stored { repair = true } at = at + usize.ONE }
   }
   if current(&store.*, &file.*) && !repair { return completed() }
-  let view = match move run Semantic.completeCacheView(&mut store.*, Bytes.asSlice(&file.stamp)) {
-    Option<View>.Some {value} => move value
-    Option<View>.None => { return completed() }
-  }
-  let state = match &mut file.segmented {
-    Option<Segmented>.Some {value} => &mut value
-    Option<Segmented>.None => { return completed() }
-  }
-  let result = run Effect.result(saveSegmentView(&mut state.*, &view, &units, detached))
+  let result = run Effect.result(startSegmentSave(&mut store.*, &mut file.*, &units, detached))
   return match move result {
-    Result<Completion, FileError | AtomicWriteError | OutOfMemoryError>.Success {value} => move value
-    Result<Completion, FileError | AtomicWriteError | OutOfMemoryError>.Failure {error} => match move error {
+    Result<Completion, Cycle | FileError | AtomicWriteError | OutOfMemoryError>.Success {value} => move value
+    Result<Completion, Cycle | FileError | AtomicWriteError | OutOfMemoryError>.Failure {error} => match move error {
       FileError refused => { drop refused completed() }
       AtomicWriteError refused => { drop refused completed() }
+      Cycle cycle => { fail move cycle }
       OutOfMemoryError exhausted => { fail move exhausted }
     }
   }
 }
 
-effect fn saveSegmentView(state: &mut Segmented, view: &View, units: &Option<&[CodegenUnit]>, detached: bool) -> Completion
-! FileError | AtomicWriteError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  let prepared = match move run Publication.prepare(&state.snapshot, view) {
-    Option<Prepared>.Some {value} => move value
-    Option<Prepared>.None => { return completed() }
+effect fn startSegmentSave(store: &mut Semantic, file: &mut CacheFile, units: &Option<&[CodegenUnit]>, detached: bool) -> Completion
+! Cycle | FileError | AtomicWriteError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let writer = match &file.segmented {
+    Option<Segmented>.Some {value: state} => match move run Publication.begin(&state.directory, state.snapshot.expected) {
+      Option<Publication.Writer>.Some {value} => move value
+      Option<Publication.Writer>.None => { return completed() }
+    }
+    Option<Segmented>.None => { return completed() }
   }
-  let writer = match move run Publication.begin(&state.directory, state.snapshot.expected) {
-    Option<Publication.Writer>.Some {value} => move value
-    Option<Publication.Writer>.None => { return completed() }
+  if detached {
+    match move DetachedWriter.start() {
+      Start.Original {completion} => {
+        // Only the child's descriptor retains the CAS flock; the next invocation waits for it.
+        drop writer
+        return Completion {writer: move completion}
+      }
+      Start.Copy => {
+        drop run Effect.result(writeSegmentSave(&mut store.*, &mut file.*, units, move writer, false))
+        DetachedWriter.finishCopy()
+      }
+      Start.Here => {}
+    }
+  }
+  // Synchronous LSP saves (and a refused fork) update the same driver's expected snapshot.
+  run writeSegmentSave(&mut store.*, &mut file.*, units, move writer, true)
+  return completed()
+}
+
+effect fn writeSegmentSave(store: &mut Semantic, file: &mut CacheFile, units: &Option<&[CodegenUnit]>,
+  writer: Publication.Writer, advance: bool) -> ()
+! Cycle | FileError | AtomicWriteError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let view = match move run Semantic.completeCacheView(&mut store.*, Bytes.asSlice(&file.stamp)) {
+    Option<View>.Some {value} => move value
+    Option<View>.None => { return () }
+  }
+  let state = match &mut file.segmented {
+    Option<Segmented>.Some {value} => &mut value
+    Option<Segmented>.None => { return () }
+  }
+  let prepared = match move run Publication.prepareUnder(&writer, &state.snapshot, &view) {
+    Option<Prepared>.Some {value} => move value
+    Option<Prepared>.None => { return () }
   }
   let mut packs = List<Publication.Pack>.make()
   if let Option<&[CodegenUnit]>.Some {value} = &units.* {
@@ -1124,27 +1151,13 @@ effect fn saveSegmentView(state: &mut Segmented, view: &View, units: &Option<&[C
       at = at + usize.ONE
     }
   }
-  if detached {
-    match move DetachedWriter.start() {
-      Start.Original {completion} => {
-        // Only the child's copy keeps the CAS flock. Both processes retain source/future pins.
-        drop writer
-        return Completion {writer: move completion, pending: Option<Prepared>.some(move prepared)}
-      }
-      Start.Copy => {
-        drop run Effect.result(Publication.publish(move writer, &state.snapshot, &prepared,
-          List<Publication.Pack>.asSlice(&packs), 2147483648))
-        DetachedWriter.finishCopy()
-      }
-      Start.Here => {}
-    }
-  }
   let published = run Publication.publish(move writer, &state.snapshot, &prepared,
     List<Publication.Pack>.asSlice(&packs), 2147483648)
-  if let Published.Committed {..} = &published {
-    if let Option<Snapshot>.Some {value} = move run Publication.settle(move prepared) { state.snapshot = move value }
+  if advance {
+    if let Published.Committed {..} = &published {
+      if let Option<Snapshot>.Some {value} = move run Publication.settle(move prepared) { state.snapshot = move value }
+    }
   }
-  return completed()
 }
 
 // The accepted IR bodies and their semantic image form one ordered writer operation.
