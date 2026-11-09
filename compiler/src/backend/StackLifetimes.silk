@@ -2,7 +2,8 @@
 //!
 //! # Details
 //!
-//! Locals without a direct scalar value proof get an `alloca`. Without lifetime markers LLVM cannot share stack slots
+//! Referenced locals without a direct scalar value proof get an `alloca`. Unnamed temporaries
+//! left entirely unused after MIR rewrites need no storage. Without lifetime markers LLVM cannot share stack slots
 //! between locals whose lives do not overlap, so a function that lowers many expressions keeps a
 //! slot for every temporary it ever names: `Mir.expression` alone needed about 23 KB per active
 //! frame, which bounded how deeply the compiler could recurse over nested syntax.
@@ -16,7 +17,7 @@
 //! call's failure write, a context carry, or a `ContextOf`, and `ContextOf` leaves the slot
 //! unmarked because the companion's address escapes.
 //! A suspendable instance keeps its frame plan and gets no markers.
-//! Unoptimized emission instead uses [`scalarTemporaries`] to keep unnamed, single-definition
+//! Unoptimized emission instead uses [`storage`] to keep unnamed, single-definition
 //! scalar values directly when all uses follow the definition in the same basic block.
 //! Emission writes no markers for a local whose slot is a scalar without a context companion,
 //! which SROA promotes, so the caller names those locals and the plan leaves them out. A function
@@ -125,10 +126,50 @@ fn directScalarCall(callee: &Callee, arguments: &List<Operand>, providers: &List
   return true
 }
 
-/// Temporaries defined once and read only later in the same block through direct value operands.
-/// This is a storage proof, not a type/layout decision: emission must additionally require a
-/// scalar representation and an ordinary, non-coroutine function. Source variables keep slots.
-pub effect fn scalarTemporaries(function: &MirFunction) -> List<bool> ! OutOfMemoryError ? &mut Allocator {
+/// Storage obligations for an ordinary function, without renumbering MIR locals.
+pub struct Storage {
+  /// Locals with instruction, ABI, hidden-state, or debug obligations. Only unused temporaries
+  /// can be false; coroutine frames must retain their separately planned storage.
+  pub required: List<bool>,
+  /// Unnamed scalar candidates used as direct values when `directScalars` is enabled. The
+  /// emitter additionally checks their type's representation before dispensing with an address.
+  pub registers: List<bool>,
+  // Shared with optimized lifetime planning; MIR operands are gathered only once.
+  effects: Effects,
+}
+
+/// Classifies ordinary local storage using every MIR read, write, and exposed address, including
+/// unreachable blocks. Debug variables and all non-temporary locals retain their storage.
+pub effect fn storage(function: &MirFunction, directScalars: bool) -> Storage ! OutOfMemoryError ? &mut Allocator {
+  let effects = run blockEffects(function)
+  let locals = List<Local>.asSlice(&function.locals)
+  let mut required = List<bool>.make()
+  let mut local = usize.ZERO
+  while local < locals.length {
+    let retained = local <= List<Interned<Type>>.length(&function.parameters)
+      || match &locals[local].kind { LocalKind.Temp => false _ => true }
+    run List<bool>.append(&mut required, retained)
+    local = local + usize.ONE
+  }
+  let mentioned = List<usize>.asSlice(&effects.locals)
+  local = usize.ZERO
+  while local < mentioned.length {
+    List<bool>.set(&mut required, mentioned[local], true)
+    local = local + usize.ONE
+  }
+  let variables = List<Variable>.asSlice(&function.variables)
+  local = usize.ZERO
+  while local < variables.length {
+    if variables[local].local < locals.length { List<bool>.set(&mut required, variables[local].local, true) }
+    local = local + usize.ONE
+  }
+  let mut registers = List<bool>.make()
+  if directScalars { registers = run scalarTemporaries(function, &effects) }
+  return Storage {required: move required, registers: move registers, effects: move effects}
+}
+
+// Temporaries defined once and read only later in the same block through direct value operands.
+effect fn scalarTemporaries(function: &MirFunction, effects: &Effects) -> List<bool> ! OutOfMemoryError ? &mut Allocator {
   let locals = List<Local>.asSlice(&function.locals)
   let mut selected = List<bool>.make()
   let mut defined = List<usize>.make()
@@ -146,12 +187,11 @@ pub effect fn scalarTemporaries(function: &MirFunction) -> List<bool> ! OutOfMem
     if variables[local].local < locals.length { List<bool>.set(&mut selected, variables[local].local, false) }
     local = local + usize.ONE
   }
-  let effects = run blockEffects(function)
   let blocks = List<Block>.asSlice(&function.blocks)
   let mut block = usize.ZERO
   while block < blocks.length {
     let statements = List<Statement>.asSlice(&blocks[block].statements)
-    let mentions = blockMentions(&effects, block)
+    let mentions = blockMentions(effects, block)
     let mut at = usize.ZERO
     while at < mentions.length {
       let mut direct = false
@@ -174,13 +214,13 @@ pub effect fn scalarTemporaries(function: &MirFunction) -> List<bool> ! OutOfMem
           _ => false
         }
       }
-      let reads = usesOf(&effects, mentions[at])
+      let reads = usesOf(effects, mentions[at])
       local = usize.ZERO
       while local < reads.length {
         if !direct || List<usize>.get(&defined, reads[local]) != block { List<bool>.set(&mut selected, reads[local], false) }
         local = local + usize.ONE
       }
-      let writes = wholeOf(&effects, mentions[at])
+      let writes = wholeOf(effects, mentions[at])
       local = usize.ZERO
       while local < writes.length {
         let index = writes[local]
@@ -188,10 +228,10 @@ pub effect fn scalarTemporaries(function: &MirFunction) -> List<bool> ! OutOfMem
         List<usize>.set(&mut defined, index, block)
         local = local + usize.ONE
       }
-      let partial = partialOf(&effects, mentions[at])
+      let partial = partialOf(effects, mentions[at])
       local = usize.ZERO
       while local < partial.length { List<bool>.set(&mut selected, partial[local], false) local = local + usize.ONE }
-      let escapes = escapesOf(&effects, mentions[at])
+      let escapes = escapesOf(effects, mentions[at])
       local = usize.ZERO
       while local < escapes.length { List<bool>.set(&mut selected, escapes[local], false) local = local + usize.ONE }
       at = at + usize.ONE
@@ -824,19 +864,20 @@ effect fn reversed(markers: &List<Marker>) -> List<Marker> ! OutOfMemoryError ? 
 }
 
 /// Plans the lifetime markers of an ordinary instance's simple temporaries and named locals,
-/// leaving out each local whose `skip` entry is set. A plan with no marked local has no blocks.
-pub effect fn plan(function: &MirFunction, skip: &[bool]) -> Markers ! OutOfMemoryError ? &mut Allocator {
+/// reusing the same function's storage analysis and leaving out each local whose `skip` entry is
+/// set. A plan with no marked local has no blocks.
+pub effect fn plan(function: &MirFunction, storage: &Storage, skip: &[bool]) -> Markers ! OutOfMemoryError ? &mut Allocator {
   let blocks = List<Block>.asSlice(&function.blocks)
   if !anyMarkable(List<Local>.asSlice(&function.locals), skip) { return Markers {blocks: List<BlockMarkers>.make()} }
   let words = (List<Local>.length(&function.locals) + 63) / 64
-  let effects = run blockEffects(function)
-  let mut eligible = run candidates(function, &effects, skip)
+  let effects = &storage.effects
+  let mut eligible = run candidates(function, effects, skip)
   if empty(List<u64>.asSlice(&eligible)) { return Markers {blocks: List<BlockMarkers>.make()} }
   let edges = run successorLists(function)
   let following = List<List<usize>>.asSlice(&edges)
-  let live = run liveness(&effects, following, words)
+  let live = run liveness(effects, following, words)
   let liveSets = List<u64>.asSlice(&live)
-  run dropLiveAtWrite(&effects, following, liveSets, words, &mut eligible)
+  run dropLiveAtWrite(effects, following, liveSets, words, &mut eligible)
   let chosen = List<u64>.asSlice(&eligible)
   if empty(chosen) { return Markers {blocks: List<BlockMarkers>.make()} }
   let mut result = run emptyMarkers(blocks.length)
@@ -846,14 +887,14 @@ pub effect fn plan(function: &MirFunction, skip: &[bool]) -> Markers ! OutOfMemo
   while block < blocks.length {
     let successors = List<usize>.asSlice(&following[block])
     liveOut(liveSets, successors, words, &mut current)
-    let listed = blockMentions(&effects, block)
+    let listed = blockMentions(effects, block)
     let mut starts = List<Marker>.make()
     let mut ends = List<Marker>.make()
     let mut step = listed.length
     while step > usize.ZERO {
       step = step - usize.ONE
       let terminator = step + usize.ONE == listed.length
-      run mentioned(&effects, listed[step], &mut names)
+      run mentioned(effects, listed[step], &mut names)
       let named = List<usize>.asSlice(&names)
       let mut index = usize.ZERO
       while index < named.length {
@@ -874,13 +915,13 @@ pub effect fn plan(function: &MirFunction, skip: &[bool]) -> Markers ! OutOfMemo
         }
         index = index + usize.ONE
       }
-      let whole = wholeOf(&effects, listed[step])
+      let whole = wholeOf(effects, listed[step])
       index = usize.ZERO
       while index < whole.length {
         if isSet(chosen, whole[index]) { run List<Marker>.append(&mut starts, Marker {at: step, local: whole[index]}) }
         index = index + usize.ONE
       }
-      liveBefore(&mut current, &effects, listed[step])
+      liveBefore(&mut current, effects, listed[step])
     }
     let slot = &mut List<BlockMarkers>.asMutSlice(&mut result)[block]
     slot.starts = run reversed(&starts)
