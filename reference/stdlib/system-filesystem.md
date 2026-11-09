@@ -940,7 +940,8 @@ effect fn removeFile(path: &Path) -> () ! FileError ? &mut FileSystem
 ```
 
 Removes the regular file or symbolic link at `path`. A link is removed itself, not what it
-points to.
+points to. A read-only file is removed too, on every host: on Windows the read-only attribute
+does not stop it, just as a file's mode does not on Unix.
 
 #### Errors
 

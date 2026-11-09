@@ -193,6 +193,7 @@ void FsFixtureInternalLinks(void) {
 HANDLE FsFixtureHoldOld(void) { return win_open((const WCHAR *)L"root\\old",0x80000000,7,3,0x80); }
 HANDLE FsFixtureBlockDelete(void) { return win_open((const WCHAR *)L"root\\old",0x80000000,3,3,0x80); }
 void FsFixtureReadOnly(uint32_t enabled) { CHECK(SetFileAttributesW(path((const WCHAR *)L"root\\old"),enabled?1:128)); }
+void FsFixtureReadOnlyChild(void) { CHECK(SetFileAttributesW(path((const WCHAR *)L"root\\dir\\child"),1)); }
 uint32_t FsFixtureOldByte(HANDLE handle) { return (uint8_t)read_byte(handle); }
 void FsFixtureClose(HANDLE handle) { CHECK(CloseHandle(handle)); }
 uint32_t FsFixtureOutsideByte(void) { HANDLE h=win_open((const WCHAR *)L"outside\\sentinel",0x80000000,7,3,0x80); char c=read_byte(h); CHECK(CloseHandle(h)); return (uint8_t)c; }
