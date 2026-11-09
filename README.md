@@ -136,7 +136,8 @@ member pins along with it.
 ```sh
 silk use                    # install the version this project pins
 silk use 0.1.0-dev.11       # install a version and make it your default
-silk set latest             # pin this project to the newest stable release (--dev: include dev releases)
+silk set latest             # pin this project to the newest stable release and install it
+                            # (--dev: include dev releases, --no-install: only pin)
 silk use list               # installed versions, and which one is selected here
 silk use which              # the version selected here, and why
 silk +0.1.0-dev.11 build    # run one command with an installed version
