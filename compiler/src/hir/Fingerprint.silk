@@ -60,11 +60,14 @@
 //! and emission — and none of its byte layout, because the vocabularies differ.
 
 import hir.Hir
+import semantic.ContentHash {ContentHash, Stream as ContentStream}
 import lexer.Token
 import hir.Hir {CallableContract, HirId, HirRef, Module, Node, OwnerKey, Range, RangeRef}
 import hir.Intern {StringTable, Symbol, SymbolRef}
 import silk.mem.allocator {Allocator, OutOfMemoryError}
 import silk.core.ownership {Copy}
+import silk.core.effect {Effect}
+import silk.testing.testing {AssertionError, Testing}
 import silk.crypto.sha2 {Sha256}
 import silk.text.string {String}
 import silk.num.u32
@@ -166,6 +169,8 @@ impl Copy for NodeOrdinal {}
 /// holds the ordinal of each position from `lowest` on, zero for none.
 struct EncodeState {
   bytes: List<u8>,
+  hashing: bool,
+  hash: ContentStream,
   ordinals: List<NodeOrdinal>,
   next: usize,
   emit: bool,
@@ -191,6 +196,11 @@ effect fn openFrame(state: &mut EncodeState, tag: Tag) -> usize
   if !state.emit {
     return usize.ZERO
   }
+  if state.hashing {
+    ContentHash.appendByte(&mut state.hash, 2)
+    ContentHash.appendByte(&mut state.hash, tagByte(tag))
+    return usize.ZERO
+  }
   run List<u8>.append(&mut state.bytes, tagByte(tag))
   let patch = List<u8>.length(&state.bytes)
   run appendLength(&mut state.*, usize.ZERO)
@@ -202,6 +212,7 @@ fn closeFrame(state: &mut EncodeState, patch: usize) -> () {
   if !state.emit {
     return ()
   }
+  if state.hashing { ContentHash.appendByte(&mut state.hash, 3) return () }
   let size = List<u8>.length(&state.bytes) - patch - usize.add(0, 4)
   let wide = usize.toU32(size)
   List<u8>.set(&mut state.bytes, patch, u32.toU8(u32.shiftRight(wide, 24)))
@@ -215,6 +226,13 @@ effect fn frameBytes(state: &mut EncodeState, tag: Tag, payload: &[u8]) -> ()
 ! OutOfMemoryError
 ? &mut Allocator {
   if !state.emit {
+    return ()
+  }
+  if state.hashing {
+    ContentHash.appendByte(&mut state.hash, 1)
+    ContentHash.appendByte(&mut state.hash, tagByte(tag))
+    ContentHash.appendWord(&mut state.hash, usize.toU64(payload.length), 8)
+    ContentHash.append(&mut state.hash, payload)
     return ()
   }
   run List<u8>.append(&mut state.bytes, tagByte(tag))
@@ -241,12 +259,11 @@ effect fn encodeBool(state: &mut EncodeState, value: bool) -> ()
   if !state.emit {
     return ()
   }
+  let mut byte: u8 = 0
+  if value { byte = 1 }
+  if state.hashing { return run frameBytes(&mut state.*, Tag.Boolean, &[byte]) }
   run List<u8>.append(&mut state.bytes, tagByte(Tag.Boolean))
   run appendLength(&mut state.*, usize.ONE)
-  let mut byte: u8 = 0
-  if value {
-    byte = 1
-  }
   return run List<u8>.append(&mut state.bytes, byte)
 }
 
@@ -1025,8 +1042,14 @@ effect fn encodeFields(state: &mut EncodeState, module: &Module, node: Node) -> 
 
 /// Opens an encoding state over `ordinals` and frames its domain and version.
 effect fn beginEncoding(domain: Domain, emit: bool, ordinals: List<NodeOrdinal>) -> EncodeState
-! OutOfMemoryError
-? &mut Allocator {
+! OutOfMemoryError ? &mut Allocator {
+  return run beginOutput(domain, emit, false, move ordinals)
+}
+
+// The event sink has one stream for the whole value, not one hash per node. Composite events
+// are delimited; leaf payloads retain explicit lengths, so marker bytes inside text are data.
+effect fn beginOutput(domain: Domain, emit: bool, hashing: bool, ordinals: List<NodeOrdinal>) -> EncodeState
+! OutOfMemoryError ? &mut Allocator {
   // A declaration's nodes sit together in the arena, so its positions span about as many slots
   // as it has nodes. The last preorder visit of a position that appears again keeps its slot.
   let recorded = List<NodeOrdinal>.asSlice(&ordinals)
@@ -1059,12 +1082,15 @@ effect fn beginEncoding(domain: Domain, emit: bool, ordinals: List<NodeOrdinal>)
   }
   let mut state = EncodeState {
     bytes: List<u8>.make(),
+    hashing: hashing,
+    hash: ContentHash.stream(),
     ordinals: move ordinals,
     next: usize.ONE,
     emit: emit,
     lowest: lowest,
     slots: move slots,
   }
+  if hashing { ContentHash.append(&mut state.hash, b"silk.hir.events.v1\0") }
   run frameBytes(&mut state, Tag.Domain, String.utf8Bytes(domainName(domain)))
   run encodeNumber(&mut state, VERSION)
   return move state
@@ -1107,7 +1133,7 @@ effect fn ordinalsOf(module: &Module, id: HirId) -> List<NodeOrdinal>
 ? &mut Allocator {
   let mut state = run beginEncoding(Domain.Header, false, List<NodeOrdinal>.make())
   run encodeNode(&mut state, module, id)
-  let EncodeState {bytes, ordinals, next: _, emit: _, lowest: _, slots: _} = move state
+  let EncodeState {hashing: _, hash: _, bytes, ordinals, next: _, emit: _, lowest: _, slots: _} = move state
   drop bytes
   return move ordinals
 }
@@ -1143,7 +1169,7 @@ pub effect fn header(module: &Module, id: HirId) -> List<u8>
   } else {
     run encodeNode(&mut state, module, headerOf(module, id))
   }
-  let EncodeState {bytes, ordinals: spent, next: _, emit: _, lowest: _, slots: _} = move state
+  let EncodeState {hashing: _, hash: _, bytes, ordinals: spent, next: _, emit: _, lowest: _, slots: _} = move state
   drop spent
   return move bytes
 }
@@ -1174,9 +1200,23 @@ pub effect fn body(module: &Module, id: HirId) -> List<u8>
   let ordinals = run ordinalsOf(module, id)
   let mut state = run beginEncoding(Domain.Body, true, move ordinals)
   run encodeNode(&mut state, module, bodyOf(module, id))
-  let EncodeState {bytes, ordinals: spent, next: _, emit: _, lowest: _, slots: _} = move state
+  let EncodeState {hashing: _, hash: _, bytes, ordinals: spent, next: _, emit: _, lowest: _, slots: _} = move state
   drop spent
   return move bytes
+}
+
+/// Hashes the exact authored Body projection without retaining its expanded framed bytes.
+/// This is a separate cache identity, not SHA-256(body()) or its historical byte format.
+/// The same ordinal prepass and encodeNode traversal preserve binders, recovery causes and
+/// nested declaration content. Only the output grammar differs: OPEN(tag), LEAF(tag,len,data),
+/// CLOSE. No per-node cryptographic hash or additional sizing pass is performed.
+pub effect fn streamedBodyDigest(module: &Module, id: HirId) -> ContentHash
+! OutOfMemoryError ? &mut Allocator {
+  let ordinals = run ordinalsOf(module, id)
+  let mut state = run beginOutput(Domain.Body, true, true, move ordinals)
+  run encodeNode(&mut state, module, bodyOf(module, id))
+  let EncodeState {hash, bytes: _, ordinals: _, next: _, emit: _, lowest: _, slots: _, hashing: _} = move state
+  return ContentHash.finish(move hash)
 }
 
 /// Returns the canonical bytes of the directives of the declaration `id` names.
@@ -1197,10 +1237,10 @@ pub effect fn directives(module: &Module, id: HirId) -> List<u8>
   if let Node.Declaration {directives: written, ..} = Module.node(module, id) {
     let mut at = usize.ZERO
     while at < written.length {
-      let mut one = EncodeState {bytes: List<u8>.make(), ordinals: List<NodeOrdinal>.make(), next: usize.ONE,
+      let mut one = EncodeState {bytes: List<u8>.make(), hashing: false, hash: ContentHash.stream(), ordinals: List<NodeOrdinal>.make(), next: usize.ONE,
         emit: true, lowest: usize.ZERO, slots: List<usize>.make()}
       run encodeNode(&mut one, module, Module.child(module, written, at))
-      let EncodeState {bytes, ordinals: spent, slots: unused, next: _, emit: _, lowest: _} = move one
+      let EncodeState {hashing: _, hash: _, bytes, ordinals: spent, slots: unused, next: _, emit: _, lowest: _} = move one
       drop spent
       drop unused
       let mut position = usize.ZERO
@@ -1222,7 +1262,7 @@ pub effect fn directives(module: &Module, id: HirId) -> List<u8>
   }
   closeFrame(&mut state, patch)
   drop sorted
-  let EncodeState {bytes, ordinals: spent, next: _, emit: _, lowest: _, slots: _} = move state
+  let EncodeState {hashing: _, hash: _, bytes, ordinals: spent, next: _, emit: _, lowest: _, slots: _} = move state
   drop spent
   return move bytes
 }
@@ -1280,7 +1320,7 @@ pub effect fn moduleDigest(module: &Module) -> [u8; 32] ! OutOfMemoryError ? &mu
     index = index + usize.ONE
   }
   closeFrame(&mut state, patch)
-  let EncodeState {bytes, ordinals, next: _, emit: _, lowest: _, slots: _} = move state
+  let EncodeState {hashing: _, hash: _, bytes, ordinals, next: _, emit: _, lowest: _, slots: _} = move state
   drop ordinals
   let digest = Sha256.hash(List<u8>.asSlice(&bytes))
   drop bytes
@@ -1358,4 +1398,58 @@ pub effect fn writeFingerprints(module: &Module) -> () ! OutOfMemoryError | Writ
     index = index + usize.ONE
   }
   return ()
+}
+
+// Exercise the sink grammar independently of a particular parser projection. In particular,
+// absence is not empty text, empty lists are not absent, and payload markers are not structure.
+effect fn streamingGrammarExample(kind: usize) -> ContentHash
+! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut state = run beginOutput(Domain.Body, true, true, List<NodeOrdinal>.make())
+  if kind == 0 { run encodeAbsent(&mut state) }
+  if kind == 1 { run frameBytes(&mut state, Tag.Text, b"") }
+  if kind == 2 {
+    let patch = run openFrame(&mut state, Tag.Sequence)
+    run encodeNumber(&mut state, 0)
+    closeFrame(&mut state, patch)
+  }
+  if kind == 3 {
+    let patch = run openFrame(&mut state, Tag.Sequence)
+    run encodeNumber(&mut state, 1)
+    run encodeAbsent(&mut state)
+    closeFrame(&mut state, patch)
+  }
+  if kind == 4 { run frameBytes(&mut state, Tag.Text, &[1, 2, 3, 0]) }
+  if kind == 5 {
+    run frameBytes(&mut state, Tag.Text, &[1, 2])
+    run frameBytes(&mut state, Tag.Text, &[3, 0])
+  }
+  run Testing.expect(List<u8>.length(&state.bytes) == 0,
+    "the streaming sink retains no expanded canonical byte buffer")
+  let EncodeState {hash, bytes: _, ordinals: _, next: _, emit: _, lowest: _, slots: _, hashing: _} = move state
+  return ContentHash.finish(move hash)
+}
+
+effect fn streamingGrammarClaims() -> ()
+! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut values = List<ContentHash>.make()
+  let mut at: usize = 0
+  while at < 6 {
+    let value = run streamingGrammarExample(at)
+    let held = List<ContentHash>.asSlice(&values)
+    let mut previous: usize = 0
+    while previous < held.length {
+      run Testing.expect(!ContentHash.equals(value, held[previous]),
+        "optional, empty, sequence and marker-bearing payload events remain distinct")
+      previous = previous + 1
+    }
+    run List<ContentHash>.append(&mut values, value)
+    at = at + 1
+  }
+  return ()
+}
+
+test effect fn streamedFingerprintGrammarIsUnambiguous() -> ()
+! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run streamingGrammarClaims() |> Effect.provideMut<Allocator>(&mut allocator)
 }
