@@ -293,6 +293,17 @@ pub token: String
 
 The argument as given.
 
+<a id="CliError.UnknownCommand.suggestion"></a>
+
+#### Field `suggestion`
+
+```silk
+pub suggestion: string<'static>
+```
+
+The subcommand whose name is closest to the argument, such as `push` for `pushh`, or empty
+when no name is close.
+
 <a id="Parsed"></a>
 
 ## `Parsed`

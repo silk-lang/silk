@@ -7,7 +7,7 @@ and working directory, wait for the image, and return its exact exit status to t
 
 Import as `WindowsProcessImage` with `import silk.platform.windows.process_image as WindowsProcessImage`.
 
-Public declarations: 5.
+Public declarations: 6.
 
 <a id="setVariableBytes"></a>
 
@@ -62,11 +62,32 @@ The presence check and update are separate calls; concurrent environment writers
 ## `replace`
 
 ```silk
-pub effect fn replace(program: &Path, arguments: &[Bytes]) -> bool ! OutOfMemoryError ? &mut Allocator
+pub effect fn replace(program: &Path, arguments: &[Bytes], directory: Option<&Path>) -> bool ! OutOfMemoryError ? &mut Allocator
 ```
 
-Runs an explicit executable with inherited standard streams, environment and working directory.
-Returns false if setup fails. On successful launch it waits and exits with the child's DWORD.
+Runs an explicit executable with inherited standard streams and environment, in `directory`
+when one is given and otherwise in this process's working directory. Returns false if setup
+fails. On successful launch it waits and exits with the child's DWORD.
+
+<a id="execute"></a>
+
+## `execute`
+
+```silk
+pub effect fn execute(program: &Path, arguments: &[Bytes], directory: Option<&Path>) -> Option<u32> ! OutOfMemoryError ? &mut Allocator
+```
+
+Runs an explicit executable with inherited standard streams and environment, in `directory`
+when one is given and otherwise in this process's working directory, waits for it, and returns
+its DWORD exit status.
+
+### Details
+The executable gets duplicates of this process's standard handles and no others. While it
+runs, this process ignores Ctrl+C, so the child handles it.
+
+### Gotchas
+Returns none when setup fails, or the executable is a batch script (`.bat` or `.cmd`), which
+would need a shell.
 
 
 Category: Windows platform.

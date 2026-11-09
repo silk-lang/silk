@@ -3154,10 +3154,9 @@ const program = Effect.gen(function* () {
       assert.equal(relocatedRun.status, 0, relocatedRun.stderr)
     }
   }
-  // Profile fields the native build cannot honor yet, a profile artifact other than the one
-  // [package].kind requests, unknown manifest fields and reserved module names are refused
-  // before anything is built, naming the manifest line.
-  const refusedProfiles = ['sanitizers = ["address"]', 'unwind = "native"', 'artifact = "object"', 'opt = "speed"']
+  // Profile fields the native build cannot honor yet, unknown manifest fields and reserved module
+  // names are refused before anything is built, naming the manifest line.
+  const refusedProfiles = ['sanitizers = ["address"]', 'unwind = "native"', 'opt = "speed"']
   for (const field of refusedProfiles) {
     yield* fs.writeFileString(
       join(tuned, 'silk.toml'),
@@ -3420,6 +3419,19 @@ const program = Effect.gen(function* () {
   assert.equal(notToml.status, 2, 'a dependency that is not TOML was accepted')
   assert.match(
     notToml.stderr,
+    /Invalid Silk project manifest .*packaged\/broken\/silk\.toml:4: /,
+  )
+  // A dependency's silk.toml is checked against the manifest schema as the root's is.
+  yield* fs.writeFileString(join(directory, 'packaged/broken/silk.toml'), '[package]\nname = "broken"\nkind = "library"\nnmae = "x"\n')
+  const unknownField = yield* invoke(
+    silk,
+    ['run', '--stdlib', standardLibrary],
+    join(directory, 'packaged/app'),
+    { ...process.env, SILK_CLANG: sentinel },
+  )
+  assert.equal(unknownField.status, 2, 'a dependency with an unknown manifest field was accepted')
+  assert.match(
+    unknownField.stderr,
     /Invalid Silk project manifest .*packaged\/broken\/silk\.toml:4: /,
   )
   {
