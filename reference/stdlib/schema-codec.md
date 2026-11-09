@@ -104,6 +104,28 @@ Converts `value` back into its wire form.
 
 - `OutOfMemoryError` if the wire form needs memory that the `Allocator` cannot supply.
 
+<a id="Codec.hints"></a>
+
+### Operation `hints`
+
+```silk
+effect fn hints(self: &Self, constraints: &mut List<Constraint>, notes: &mut List<string<'static>>, onWire: bool)
+    -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Reports what the step accepts, for a type's shape: rules about the wire value itself go in
+`constraints` when `onWire` is `true`, and anything else in `notes` as text for a person. The
+default reports nothing.
+
+#### When to use
+
+Override it so JSON Schema and help text can say what a codec-backed type accepts, as
+`NumberText` reports a digits pattern. `Schemas.shapeVia` calls it.
+
+#### Errors
+
+- `OutOfMemoryError` if the `Allocator` cannot grow the lists.
+
 <a id="Check"></a>
 
 ## `Check`
@@ -138,6 +160,22 @@ fn message(self: &Self) -> string<'static>
 ```
 
 Returns what the check expects, as one line for a person, such as `"between 1 and 64"`.
+
+<a id="Check.hints"></a>
+
+### Operation `hints`
+
+```silk
+effect fn hints(self: &Self, constraints: &mut List<Constraint>, notes: &mut List<string<'static>>, onWire: bool)
+    -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Reports the check for a type's shape, as `Codec.hints` does. The default adds its message to
+`notes`.
+
+#### Errors
+
+- `OutOfMemoryError` if the `Allocator` cannot grow the lists.
 
 <a id="Chain2"></a>
 
@@ -230,6 +268,17 @@ effect fn encode(self: &Self, value: &A) -> I ! OutOfMemoryError ? &mut Allocato
 ```
 
 Encodes with each step, from `step2` to `step1`.
+
+<a id="Chain2.impl.Codec.hints"></a>
+
+### Operation `hints`
+
+```silk
+effect fn hints(self: &Self, constraints: &mut List<Constraint>, notes: &mut List<string<'static>>, onWire: bool)
+    -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Reports each step's hints, from `step1`; only `step1` reads the wire value itself.
 
 <a id="Chain3"></a>
 
@@ -342,6 +391,17 @@ effect fn encode(self: &Self, value: &A) -> I ! OutOfMemoryError ? &mut Allocato
 ```
 
 Encodes with each step, from `step3` to `step1`.
+
+<a id="Chain3.impl.Codec.hints"></a>
+
+### Operation `hints`
+
+```silk
+effect fn hints(self: &Self, constraints: &mut List<Constraint>, notes: &mut List<string<'static>>, onWire: bool)
+    -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Reports each step's hints, from `step1`; only `step1` reads the wire value itself.
 
 <a id="Chain4"></a>
 
@@ -474,6 +534,17 @@ effect fn encode(self: &Self, value: &A) -> I ! OutOfMemoryError ? &mut Allocato
 ```
 
 Encodes with each step, from `step4` to `step1`.
+
+<a id="Chain4.impl.Codec.hints"></a>
+
+### Operation `hints`
+
+```silk
+effect fn hints(self: &Self, constraints: &mut List<Constraint>, notes: &mut List<string<'static>>, onWire: bool)
+    -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Reports each step's hints, from `step1`; only `step1` reads the wire value itself.
 
 <a id="Chain5"></a>
 
@@ -626,6 +697,17 @@ effect fn encode(self: &Self, value: &A) -> I ! OutOfMemoryError ? &mut Allocato
 ```
 
 Encodes with each step, from `step5` to `step1`.
+
+<a id="Chain5.impl.Codec.hints"></a>
+
+### Operation `hints`
+
+```silk
+effect fn hints(self: &Self, constraints: &mut List<Constraint>, notes: &mut List<string<'static>>, onWire: bool)
+    -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Reports each step's hints, from `step1`; only `step1` reads the wire value itself.
 
 <a id="Chain6"></a>
 
@@ -799,6 +881,17 @@ effect fn encode(self: &Self, value: &A) -> I ! OutOfMemoryError ? &mut Allocato
 
 Encodes with each step, from `step6` to `step1`.
 
+<a id="Chain6.impl.Codec.hints"></a>
+
+### Operation `hints`
+
+```silk
+effect fn hints(self: &Self, constraints: &mut List<Constraint>, notes: &mut List<string<'static>>, onWire: bool)
+    -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Reports each step's hints, from `step1`; only `step1` reads the wire value itself.
+
 <a id="Refine"></a>
 
 ## `Refine`
@@ -880,6 +973,17 @@ effect fn encode(self: &Self, value: &A) -> I ! OutOfMemoryError ? &mut Allocato
 ```
 
 Encodes with the codec. The check does not run.
+
+<a id="Refine.impl.Codec.hints"></a>
+
+### Operation `hints`
+
+```silk
+effect fn hints(self: &Self, constraints: &mut List<Constraint>, notes: &mut List<string<'static>>, onWire: bool)
+    -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Reports the codec's hints, then the check's, which is about the decoded value.
 
 <a id="Identity"></a>
 
@@ -1030,6 +1134,17 @@ effect fn encode(self: &Self, value: &u8) -> String ! OutOfMemoryError ? &mut Al
 
 Writes the decimal digits.
 
+<a id="NumberText.impl.Codec.hints"></a>
+
+### Operation `hints`
+
+```silk
+effect fn hints(self: &Self, constraints: &mut List<Constraint>, notes: &mut List<string<'static>>, onWire: bool)
+    -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Reports a pattern of decimal digits about the wire text.
+
 <a id="NumberText.impl.Codec-2"></a>
 
 ## Implementation `Codec<u16, String> for NumberText<u16>`
@@ -1057,6 +1172,17 @@ effect fn encode(self: &Self, value: &u16) -> String ! OutOfMemoryError ? &mut A
 ```
 
 Writes the decimal digits.
+
+<a id="NumberText.impl.Codec.hints-2"></a>
+
+### Operation `hints`
+
+```silk
+effect fn hints(self: &Self, constraints: &mut List<Constraint>, notes: &mut List<string<'static>>, onWire: bool)
+    -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Reports a pattern of decimal digits about the wire text.
 
 <a id="NumberText.impl.Codec-3"></a>
 
@@ -1086,6 +1212,17 @@ effect fn encode(self: &Self, value: &u32) -> String ! OutOfMemoryError ? &mut A
 
 Writes the decimal digits.
 
+<a id="NumberText.impl.Codec.hints-3"></a>
+
+### Operation `hints`
+
+```silk
+effect fn hints(self: &Self, constraints: &mut List<Constraint>, notes: &mut List<string<'static>>, onWire: bool)
+    -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Reports a pattern of decimal digits about the wire text.
+
 <a id="NumberText.impl.Codec-4"></a>
 
 ## Implementation `Codec<u64, String> for NumberText<u64>`
@@ -1113,6 +1250,17 @@ effect fn encode(self: &Self, value: &u64) -> String ! OutOfMemoryError ? &mut A
 ```
 
 Writes the decimal digits.
+
+<a id="NumberText.impl.Codec.hints-4"></a>
+
+### Operation `hints`
+
+```silk
+effect fn hints(self: &Self, constraints: &mut List<Constraint>, notes: &mut List<string<'static>>, onWire: bool)
+    -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Reports a pattern of decimal digits about the wire text.
 
 <a id="NumberText.impl.Codec-5"></a>
 
@@ -1142,6 +1290,17 @@ effect fn encode(self: &Self, value: &usize) -> String ! OutOfMemoryError ? &mut
 
 Writes the decimal digits.
 
+<a id="NumberText.impl.Codec.hints-5"></a>
+
+### Operation `hints`
+
+```silk
+effect fn hints(self: &Self, constraints: &mut List<Constraint>, notes: &mut List<string<'static>>, onWire: bool)
+    -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Reports a pattern of decimal digits about the wire text.
+
 <a id="NumberText.impl.Codec-6"></a>
 
 ## Implementation `Codec<i8, String> for NumberText<i8>`
@@ -1169,6 +1328,17 @@ effect fn encode(self: &Self, value: &i8) -> String ! OutOfMemoryError ? &mut Al
 ```
 
 Writes the decimal digits, with `-` for a negative value.
+
+<a id="NumberText.impl.Codec.hints-6"></a>
+
+### Operation `hints`
+
+```silk
+effect fn hints(self: &Self, constraints: &mut List<Constraint>, notes: &mut List<string<'static>>, onWire: bool)
+    -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Reports a pattern of decimal digits about the wire text.
 
 <a id="NumberText.impl.Codec-7"></a>
 
@@ -1198,6 +1368,17 @@ effect fn encode(self: &Self, value: &i16) -> String ! OutOfMemoryError ? &mut A
 
 Writes the decimal digits, with `-` for a negative value.
 
+<a id="NumberText.impl.Codec.hints-7"></a>
+
+### Operation `hints`
+
+```silk
+effect fn hints(self: &Self, constraints: &mut List<Constraint>, notes: &mut List<string<'static>>, onWire: bool)
+    -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Reports a pattern of decimal digits about the wire text.
+
 <a id="NumberText.impl.Codec-8"></a>
 
 ## Implementation `Codec<i32, String> for NumberText<i32>`
@@ -1226,6 +1407,17 @@ effect fn encode(self: &Self, value: &i32) -> String ! OutOfMemoryError ? &mut A
 
 Writes the decimal digits, with `-` for a negative value.
 
+<a id="NumberText.impl.Codec.hints-8"></a>
+
+### Operation `hints`
+
+```silk
+effect fn hints(self: &Self, constraints: &mut List<Constraint>, notes: &mut List<string<'static>>, onWire: bool)
+    -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Reports a pattern of decimal digits about the wire text.
+
 <a id="NumberText.impl.Codec-9"></a>
 
 ## Implementation `Codec<i64, String> for NumberText<i64>`
@@ -1253,6 +1445,17 @@ effect fn encode(self: &Self, value: &i64) -> String ! OutOfMemoryError ? &mut A
 ```
 
 Writes the decimal digits, with `-` for a negative value.
+
+<a id="NumberText.impl.Codec.hints-9"></a>
+
+### Operation `hints`
+
+```silk
+effect fn hints(self: &Self, constraints: &mut List<Constraint>, notes: &mut List<string<'static>>, onWire: bool)
+    -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Reports a pattern of decimal digits about the wire text.
 
 <a id="Between"></a>
 
@@ -1330,7 +1533,7 @@ Returns `message`.
 pub struct Length
 ```
 
-The check that text has between `min` and `max` bytes of UTF-8, both included.
+The check that text has between `min` and `max` characters, both included.
 
 <a id="Length.min"></a>
 
@@ -1340,7 +1543,7 @@ The check that text has between `min` and `max` bytes of UTF-8, both included.
 pub min: usize
 ```
 
-The smallest accepted length in bytes.
+The smallest accepted length in characters.
 
 <a id="Length.max"></a>
 
@@ -1350,7 +1553,7 @@ The smallest accepted length in bytes.
 pub max: usize
 ```
 
-The largest accepted length in bytes.
+The largest accepted length in characters.
 
 <a id="Length.message"></a>
 
@@ -1360,7 +1563,7 @@ The largest accepted length in bytes.
 pub message: string<'static>
 ```
 
-What a person sees when the check fails, such as `"1 to 64 bytes"`.
+What a person sees when the check fails, such as `"1 to 64 characters"`.
 
 <a id="Length.impl.Check"></a>
 
@@ -1389,6 +1592,17 @@ fn message(self: &Self) -> string<'static>
 ```
 
 Returns `message`.
+
+<a id="Length.impl.Check.hints"></a>
+
+### Operation `hints`
+
+```silk
+effect fn hints(self: &Self, constraints: &mut List<Constraint>, notes: &mut List<string<'static>>, onWire: bool)
+    -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Reports a length about the wire text, or the message about a later value.
 
 <a id="Items"></a>
 
@@ -1449,6 +1663,17 @@ fn message(self: &Self) -> string<'static>
 ```
 
 Returns the message.
+
+<a id="Items.impl.Check.hints"></a>
+
+### Operation `hints`
+
+```silk
+effect fn hints(self: &Self, constraints: &mut List<Constraint>, notes: &mut List<string<'static>>, onWire: bool)
+    -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Reports a number of elements about the wire list, or the message about a later value.
 
 <a id="Codecs"></a>
 

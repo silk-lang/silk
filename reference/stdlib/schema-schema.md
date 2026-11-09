@@ -5,10 +5,11 @@
 Read and write your own types in any data format, from the types alone.
 
 ## When to use
-Write `impl Schema for T {}` for a struct or a union of unit variants, and read or write it with
-a format such as `silk.schema.json.SchemaJson`. Give a type its own `read` and `write` when its
-wire form differs from its fields, such as a port written as text, and build them from a codec
-chain with [`Schemas.readVia`](#Schemas.impl.readVia) and [`Schemas.writeVia`](#Schemas.impl.writeVia).
+Write `impl Schema for T {}` for a struct or a union, and read or write it with a format such
+as `silk.schema.json.SchemaJson`. Declare what the type cannot say, such as a wire name or a
+port range, in its [`Spec`](#Spec). Give a type its own `read`, `write` and `shape` when its wire form
+differs from its fields, such as a port written as text, and build them from a codec chain with
+[`Schemas.readVia`](#Schemas.impl.readVia), [`Schemas.writeVia`](#Schemas.impl.writeVia) and [`Schemas.shapeVia`](#Schemas.impl.shapeVia).
 
 ## Details
 A type is declared once, and the schema derives what to do from it. The default `read` and
@@ -20,8 +21,11 @@ that variant's fields, such as `{"type": "Circle", "radius": 2}`; `Spec.tag` pic
 member name. An `Option` field may be absent, or `null`, when it is `None`, and is left out when
 written.
 
-[`Spec`](#Spec) holds what the types cannot say, such as a field whose name on the wire differs. A type
-returns its spec from `Schema.spec`.
+[`Spec`](#Spec) holds what the types cannot say: a field whose name on the wire differs, the rules a
+field's value follows (`Spec.between`, `Spec.length`, `Spec.items`, `Spec.pattern`), a default,
+and whether unknown keys are rejected. The rules are data, so the same declaration checks a
+read, words its errors, and fills the type's `silk.schema.shape.Shapes`, which JSON Schema
+and command line help are rendered from.
 
 A format implements [`SchemaReader`](#SchemaReader) and [`SchemaWriter`](#SchemaWriter), so the same types read JSON today and
 other formats later without changes.
@@ -49,7 +53,7 @@ struct User {
 
 impl Schema for User {
   static fn spec() -> Spec<User> {
-    return Spec<User>.of() |> Spec<User>.rename("id", "user_id")
+    return Spec<User>.of() |> Spec<User>.rename("id", "user_id") |> Spec<User>.length("name", 1, 64)
   }
 }
 
@@ -71,147 +75,7 @@ pub effect fn main() -> i32 ! OutOfMemoryError {
 
 Import as `Schema` with `import silk.schema.schema { Schema }`.
 
-Public declarations: 8.
-
-<a id="PathSegment"></a>
-
-## `PathSegment`
-
-```silk
-pub union PathSegment
-```
-
-One step of a [`SchemaPath`](#SchemaPath): a struct field by its Silk name, or a list element by its index.
-
-<a id="PathSegment.Field"></a>
-
-### `Field`
-
-```silk
-Field
-```
-
-A struct field.
-
-<a id="PathSegment.Field.name"></a>
-
-#### Field `name`
-
-```silk
-pub name: string<'static>
-```
-
-The field's name in Silk, not its name on the wire.
-
-<a id="PathSegment.Index"></a>
-
-### `Index`
-
-```silk
-Index
-```
-
-A list element.
-
-<a id="PathSegment.Index.at"></a>
-
-#### Field `at`
-
-```silk
-pub at: usize
-```
-
-The position of the element, from 0.
-
-<a id="PathSegment.impl.Copy"></a>
-
-## Implementation `Copy for PathSegment`
-
-```silk
-impl Copy for PathSegment
-```
-
-<a id="SchemaPath"></a>
-
-## `SchemaPath`
-
-```silk
-pub struct SchemaPath
-```
-
-The path from the root value to the part a reader is reading, such as `settings.ports[2]`.
-
-### When to use
-
-A format's [`SchemaReader`](#SchemaReader) keeps one and returns it from `SchemaReader.path`. The derived
-`read` operations push a segment before they read a part and pop it after, so when a read fails
-the path still names the part that failed.
-
-<a id="SchemaPath.impl"></a>
-
-## Implementation `SchemaPath`
-
-```silk
-impl SchemaPath
-```
-
-<a id="SchemaPath.impl.make"></a>
-
-### Associated function `make`
-
-```silk
-pub fn make() -> SchemaPath
-```
-
-Returns an empty path, which names the root value.
-
-<a id="SchemaPath.impl.push"></a>
-
-### Method `push`
-
-```silk
-pub effect fn push(self: &mut Self, segment: PathSegment) -> () ! OutOfMemoryError ? &mut Allocator
-```
-
-Adds `segment` at the end of the path.
-
-#### Errors
-
-- `OutOfMemoryError` if the `Allocator` cannot grow the path.
-
-<a id="SchemaPath.impl.pop"></a>
-
-### Method `pop`
-
-```silk
-pub fn pop(self: &mut Self) -> ()
-```
-
-Removes the last segment. It does nothing to an empty path.
-
-<a id="SchemaPath.impl.length"></a>
-
-### Method `length`
-
-```silk
-pub fn length(self: &Self) -> usize
-```
-
-Returns the number of segments.
-
-<a id="SchemaPath.impl.text"></a>
-
-### Method `text`
-
-```silk
-pub effect fn text(self: &Self) -> String ! OutOfMemoryError ? &mut Allocator
-```
-
-Returns the path as text, such as `settings.ports[2]`. The root value is empty text.
-
-#### Errors
-
-- `OutOfMemoryError` if the `Allocator` cannot supply the text.
+Public declarations: 9.
 
 <a id="SchemaReader"></a>
 
@@ -234,6 +98,11 @@ point, such as `silk.schema.json.SchemaJson.decode`, rather than these operation
 The schema reads an object by calling `beginObject`, then `member` once for each field it
 needs, in its own order, and then `endObject`. `member` finds the member wherever it is in the
 object and leaves the reader at its value.
+
+A reader that knows where values are in its input reports it through `lastSpan` and
+`lastKind`, so problems found after a value is read, such as a failed range, point at it. A
+reader that collects every problem, as `SchemaJson.decodeAll` does, returns `true` from
+`collecting`, records what `report` gives it, and moves past a failed part with `recover`.
 
 <a id="SchemaReader.path"></a>
 
@@ -379,6 +248,22 @@ effect fn member(self: &mut Self, key: string) -> bool ! Issue | OutOfMemoryErro
 Finds the member `key` of the object being read and leaves the reader at its value, or
 returns `false` if the object has no such member.
 
+<a id="SchemaReader.rejectUnread"></a>
+
+### Operation `rejectUnread`
+
+```silk
+effect fn rejectUnread(self: &mut Self, expected: string<'static>) -> () ! Issue | OutOfMemoryError ? &mut Allocator
+```
+
+Reports every member of the object being read that no `member` call found, as
+`IssueReason.UnexpectedKey` with `expected` naming the keys the type accepts. The default
+reports nothing.
+
+#### Errors
+
+- `Issue` for the first unread member, unless the reader collects every problem.
+
 <a id="SchemaReader.endObject"></a>
 
 ### Operation `endObject`
@@ -389,23 +274,94 @@ effect fn endObject(self: &mut Self) -> () ! Issue | OutOfMemoryError ? &mut All
 
 Reads past the end of the object being read, whatever members were read.
 
-<a id="SchemaReader.checkFailed"></a>
+<a id="SchemaReader.lastSpan"></a>
 
-### Operation `checkFailed`
+### Operation `lastSpan`
 
 ```silk
-effect fn checkFailed(self: &mut Self, field: Option<string<'static>>, expected: string<'static>)
-    -> () ! Issue | OutOfMemoryError ? &mut Allocator
+fn lastSpan(self: &Self) -> Option<Span>
 ```
 
-Reports a check that failed on the value just read: on its field `field`, or on the whole
-value when `field` is `None`. The default fails with it; a reader that collects every
-problem records it and returns.
+Returns the input bytes of the last complete value read, or of an object's opening when
+`member` found no such key. The default knows none.
+
+<a id="SchemaReader.lastKind"></a>
+
+### Operation `lastKind`
+
+```silk
+fn lastKind(self: &Self) -> ValueKind
+```
+
+Returns the kind of the last complete value read. The default knows none.
+
+<a id="SchemaReader.report"></a>
+
+### Operation `report`
+
+```silk
+effect fn report(self: &mut Self, issue: Issue) -> () ! Issue | OutOfMemoryError ? &mut Allocator
+```
+
+Reports a problem with the part at the current path. The default fails with it; a reader
+that collects every problem records it and returns.
 
 #### Errors
 
-- `Issue` with `IssueReason.CheckFailed`, at the field's path.
-- `OutOfMemoryError` if the path cannot grow.
+- `Issue`, the one reported, unless the reader collects every problem.
+- `OutOfMemoryError` if the reader cannot record it.
+
+<a id="SchemaReader.collecting"></a>
+
+### Operation `collecting`
+
+```silk
+fn collecting(self: &Self) -> bool
+```
+
+Returns whether the reader records every problem and goes on after a part fails. The default
+is `false`.
+
+<a id="SchemaReader.mark"></a>
+
+### Operation `mark`
+
+```silk
+effect fn mark(self: &mut Self) -> usize ! OutOfMemoryError ? &mut Allocator
+```
+
+Remembers the reader's position, before a part that may fail, and returns a mark for
+`recover` or `release`. Only a collecting reader is asked.
+
+#### Errors
+
+- `OutOfMemoryError` if the reader cannot remember it.
+
+<a id="SchemaReader.recover"></a>
+
+### Operation `recover`
+
+```silk
+effect fn recover(self: &mut Self, mark: usize, skip: bool) -> () ! Issue | OutOfMemoryError ? &mut Allocator
+```
+
+Returns to the position `mark` names after the part read from it failed, and when `skip` is
+`true` reads past that part, so reading goes on with its next sibling. Forgets `mark` and
+every later one.
+
+#### Errors
+
+- `Issue` if the part is not well formed, so reading cannot go on.
+
+<a id="SchemaReader.release"></a>
+
+### Operation `release`
+
+```silk
+fn release(self: &mut Self, mark: usize) -> ()
+```
+
+Forgets `mark` and every later one, after the part read from it succeeded.
 
 <a id="SchemaWriter"></a>
 
@@ -553,6 +509,44 @@ effect fn endObject(self: &mut Self) -> () ! Issue | WriterError ? &mut Writer
 
 Ends the object being written.
 
+<a id="FieldRule"></a>
+
+## `FieldRule`
+
+```silk
+pub struct FieldRule
+```
+
+One rule of a field, as a [`Spec`](#Spec) holds it.
+
+<a id="FieldRule.field"></a>
+
+### Field `field`
+
+```silk
+pub field: string<'static>
+```
+
+The field's name in Silk.
+
+<a id="FieldRule.constraint"></a>
+
+### Field `constraint`
+
+```silk
+pub constraint: Constraint
+```
+
+The rule.
+
+<a id="FieldRule.impl.Copy"></a>
+
+## Implementation `Copy for FieldRule`
+
+```silk
+impl Copy for FieldRule
+```
+
 <a id="Spec"></a>
 
 ## `Spec`
@@ -561,18 +555,29 @@ Ends the object being written.
 pub struct Spec<T>
 ```
 
-What a type's schema says beyond its declaration, such as a field whose name on the wire
-differs.
+What a type's schema says beyond its declaration: wire names, the rules a field's value
+follows, defaults, and whether unknown keys are rejected.
 
 ### When to use
 
 Return one from `Schema.spec` and build it with pipes:
-`Spec<User>.of() |> Spec<User>.rename("id", "user_id")`.
+
+```text
+Spec<Server>.of()
+  |> Spec<Server>.rename("idleSeconds", "idle_seconds")
+  |> Spec<Server>.between("port", 1, 65535)
+  |> Spec<Server>.between("idleSeconds", 1, 3600)
+  |> Spec<Server>.expected("idleSeconds", "at most an hour")
+```
 
 ### Details
 
 A spec exists only during static evaluation. Field names are checked against `T` where they
-are written, and the editor links them to the field.
+are written, and the editor links them to the field. A rule applies to the field's value after
+it is read, and a value that breaks it fails with `IssueReason.CheckFailed` at the field's path,
+with text generated from the rule, such as `an integer from 1 to 65535`, unless `Spec.expected`
+gives the field its own. The same rules reach the type's shape, so JSON Schema shows them as
+`minimum`, `maxLength` and the like.
 
 <a id="Spec.impl"></a>
 
@@ -590,7 +595,7 @@ impl<T> Spec<T>
 pub static fn of() -> Self
 ```
 
-Returns the spec that keeps every field's own name.
+Returns the spec that keeps every field's own name and adds no rules.
 
 <a id="Spec.impl.rename"></a>
 
@@ -617,6 +622,113 @@ Returns the spec in which a union's variant is named by the field `name`, instea
 A union with a variant that has fields is written as an object holding the variant's name in
 this field next to the variant's own fields, such as `{"type": "Circle", "radius": 2}`.
 
+<a id="Spec.impl.strict"></a>
+
+### Method `strict`
+
+```silk
+pub static fn strict(self: Self) -> Self
+```
+
+Returns the spec that rejects an object key no field names, as `IssueReason.UnexpectedKey`.
+
+#### Details
+
+By default unknown keys are skipped, so a config written for a newer version still reads.
+JSON Schema shows a strict type with `additionalProperties: false`.
+
+<a id="Spec.impl.between"></a>
+
+### Method `between`
+
+```silk
+pub static fn between(self: Self, field: Intrinsic.FieldName<T>, min: i64, max: i64) -> Self
+```
+
+Returns the spec in which the number in `field` is from `min` to `max`, both included.
+
+<a id="Spec.impl.atLeast"></a>
+
+### Method `atLeast`
+
+```silk
+pub static fn atLeast(self: Self, field: Intrinsic.FieldName<T>, min: i64) -> Self
+```
+
+Returns the spec in which the number in `field` is at least `min`.
+
+<a id="Spec.impl.atMost"></a>
+
+### Method `atMost`
+
+```silk
+pub static fn atMost(self: Self, field: Intrinsic.FieldName<T>, max: i64) -> Self
+```
+
+Returns the spec in which the number in `field` is at most `max`.
+
+<a id="Spec.impl.length"></a>
+
+### Method `length`
+
+```silk
+pub static fn length(self: Self, field: Intrinsic.FieldName<T>, min: usize, max: usize) -> Self
+```
+
+Returns the spec in which the text in `field` has `min` to `max` characters.
+
+<a id="Spec.impl.items"></a>
+
+### Method `items`
+
+```silk
+pub static fn items(self: Self, field: Intrinsic.FieldName<T>, min: usize, max: usize) -> Self
+```
+
+Returns the spec in which the list in `field` has `min` to `max` elements.
+
+<a id="Spec.impl.pattern"></a>
+
+### Method `pattern`
+
+```silk
+pub static fn pattern(self: Self, field: Intrinsic.FieldName<T>, source: string<'static>) -> Self
+```
+
+Returns the spec in which the text in `field` matches the regular expression `source`,
+anywhere in the text unless `source` anchors it with `^` and `$`.
+
+#### Details
+
+`source` uses `silk.text.regex` syntax, which is the JavaScript syntax JSON Schema's
+`pattern` uses. An invalid expression is a compile error at the literal.
+
+<a id="Spec.impl.expected"></a>
+
+### Method `expected`
+
+```silk
+pub static fn expected(self: Self, field: Intrinsic.FieldName<T>, text: string<'static>) -> Self
+```
+
+Returns the spec in which a value of `field` that breaks a rule is reported as expecting
+`text`, such as `"at most an hour"`, instead of the text generated from the rule.
+
+<a id="Spec.impl.default"></a>
+
+### Method `default`
+
+```silk
+pub static fn default(self: Self, field: Intrinsic.FieldName<T>, value: Literal) -> Self
+```
+
+Returns the spec in which `field` may be absent or null, and then holds `value`.
+
+#### Details
+
+`value` is read as if the input held it, so a text default fills a unit variant or a type read
+from text, such as `Literal.Text {value: "Anonymous"}`.
+
 <a id="Spec.impl.tagName"></a>
 
 ### Method `tagName`
@@ -637,6 +749,90 @@ pub static fn wireName(self: &Self, label: string<'static>) -> string<'static>
 
 Returns the name of the field `label` in the data format.
 
+<a id="Spec.impl.rulesOf"></a>
+
+### Method `rulesOf`
+
+```silk
+pub static fn rulesOf(self: &Self, label: string<'static>) -> Intrinsic.StaticSequence<Constraint>
+```
+
+Returns the rules of the field `label`, in the order they were added.
+
+<a id="Spec.impl.defaultOf"></a>
+
+### Method `defaultOf`
+
+```silk
+pub static fn defaultOf(self: &Self, label: string<'static>) -> Option<Literal>
+```
+
+Returns the default of the field `label`, if it has one.
+
+<a id="Spec.impl.isStrict"></a>
+
+### Method `isStrict`
+
+```silk
+pub static fn isStrict(self: &Self) -> bool
+```
+
+Returns whether unknown keys are rejected.
+
+<a id="KindOf"></a>
+
+## `KindOf`
+
+```silk
+pub struct KindOf<T>
+```
+
+The kind of value a type's schema reads, and the text a missing value of it expects.
+
+### Details
+
+The type parameter says whose kind it is, as `ShapeOf` does. A spec refuses a rule the kind
+cannot follow, such as `Spec.between` on a field that holds text, and a missing key reports
+`expected` unless the field's rules say more.
+
+<a id="KindOf.value"></a>
+
+### Field `value`
+
+```silk
+pub value: ValueKind
+```
+
+The kind of value read, or `ValueKind.Unknown` when the type does not say.
+
+<a id="KindOf.expected"></a>
+
+### Field `expected`
+
+```silk
+pub expected: string<'static>
+```
+
+What the value is, such as `an integer`.
+
+<a id="KindOf.impl"></a>
+
+## Implementation `KindOf<T>`
+
+```silk
+impl<T> KindOf<T>
+```
+
+<a id="KindOf.impl.of"></a>
+
+### Associated function `of`
+
+```silk
+pub static fn of(value: ValueKind, expected: string<'static>) -> KindOf<T>
+```
+
+Returns `value` and `expected` as the kind of `T`.
+
 <a id="Schema"></a>
 
 ## `Schema`
@@ -650,9 +846,9 @@ A type that can be read from and written to any data format.
 ### When to use
 
 Write `impl Schema for T {}` for a struct or union whose fields are all public and implement
-`Schema`. Override `spec` to rename fields. Override `read` and
-`write` for a type whose wire form is not its fields, usually with [`Schemas.readVia`](#Schemas.impl.readVia) and
-[`Schemas.writeVia`](#Schemas.impl.writeVia).
+`Schema`. Override `spec` to rename fields and declare their rules. Override `read`, `write`
+and `shape` for a type whose wire form is not its fields, usually with [`Schemas.readVia`](#Schemas.impl.readVia),
+[`Schemas.writeVia`](#Schemas.impl.writeVia) and [`Schemas.shapeVia`](#Schemas.impl.shapeVia).
 
 ### Details
 
@@ -667,7 +863,24 @@ and `List<T>`.
 static fn spec() -> Spec<Self>
 ```
 
-Returns what the type's schema says beyond its declaration. The default renames nothing.
+Returns what the type's schema says beyond its declaration. The default renames nothing and
+adds no rules.
+
+<a id="Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns the kind of value the type reads. The default does not say, so every rule may apply
+and a missing key expects `a value`.
+
+#### When to use
+
+Override it next to `read` for a type read from one kind of value, usually as
+[`Schemas.kindVia`](#Schemas.impl.kindVia) for a type read through a codec.
 
 <a id="Schema.read"></a>
 
@@ -703,6 +916,26 @@ variant name, and any other union as an object tagged with its variant name.
 - `WriterError` if the `Writer` fails.
 - `OutOfMemoryError` if a codec needs memory that the `Allocator` cannot supply.
 
+<a id="Schema.shape"></a>
+
+### Operation `shape`
+
+```silk
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator
+```
+
+Adds the type's wire form to `shapes` and returns its node. The default describes a struct
+or union from its fields, variants, doc comments and spec, once per type.
+
+#### When to use
+
+Override it next to `read` and `write`, usually as `Schemas.shapeVia`, when the type is read
+through a codec, so its shape describes what `read` accepts.
+
+#### Errors
+
+- `OutOfMemoryError` if the `Allocator` cannot grow the table.
+
 <a id="Schema.missing"></a>
 
 ### Operation `missing`
@@ -729,6 +962,21 @@ fn omitted(self: &Self) -> bool
 Returns whether a field holding the value is left out when written. The default is `false`;
 `Option` returns `true` for `None`.
 
+<a id="Schema.satisfies"></a>
+
+### Operation `satisfies`
+
+```silk
+effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator
+```
+
+Returns whether the value follows `constraint`, a rule its field's spec declares. The default
+accepts every value; numbers, `String`, `List` and `Option` test the rules that apply to them.
+
+#### Errors
+
+- `OutOfMemoryError` if testing a pattern needs memory that the `Allocator` cannot supply.
+
 <a id="Schema.check"></a>
 
 ### Operation `check`
@@ -741,10 +989,9 @@ Checks a value after it is read. The default accepts every value.
 
 #### When to use
 
-Override it to state what the type alone cannot, such as a port between 1 and 65535 or a
-name of at most 64 bytes, with [`Checks.field`](#Checks.impl.field) and [`Checks.that`](#Checks.impl.that). A failed check becomes an
-`Issue` at the path of the field it names: the read's only one, or one of all of them when
-the format collects every problem, as `SchemaJson.decodeAll` does.
+Override it for a rule no single field can state, such as two fields that exclude each other,
+with [`Checks.that`](#Checks.impl.that). A rule about one field belongs in its `Spec`, where JSON Schema and
+command line help can show it. A failed check becomes an `Issue` at the value's path.
 
 <a id="Checks"></a>
 
@@ -760,35 +1007,34 @@ The checks of one value of `T`, run by [`Schema.check`](#Schema.check) after the
 
 ```silk
 import silk.core.effect { Effect }
+import silk.core.option { Option }
 import silk.core.result { Result }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
-import silk.schema.codec { Between, Length }
 import silk.schema.issue { IssueReason, SchemaError }
 import silk.schema.json { SchemaJson }
 import silk.schema.schema { Checks, Schema }
 import silk.text.string { String }
 
-struct Server {
-  pub host: String,
-  pub port: u16,
+struct Login {
+  pub token: Option<String>,
+  pub password: Option<String>,
 }
 
-impl Schema for Server {
-  fn check(self: &Self, checks: &mut Checks<Server>) -> () {
-    checks.field(self, "host", Length {min: 1, max: 253, message: "a host name"})
-    checks.field(self, "port", Between<u16> {low: 1, high: 65535, message: "a port"})
+impl Schema for Login {
+  fn check(self: &Self, checks: &mut Checks<Login>) -> () {
+    checks.that(self.token.isSome() != self.password.isSome(), "a token or a password, not both")
   }
 }
 
-effect fn load() -> Server ! SchemaError | OutOfMemoryError ? &mut Allocator {
-  return run SchemaJson.decode<Server>(b"{\"host\": \"silk.dev\", \"port\": 0}")
+effect fn load() -> Login ! SchemaError | OutOfMemoryError ? &mut Allocator {
+  return run SchemaJson.decode<Login>(b"{}")
 }
 
 pub effect fn main() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   return match run Effect.result(load()) |> Effect.provideMut<Allocator>(&mut allocator) {
-    Result<Server, SchemaError | OutOfMemoryError>.Failure {error: SchemaError {path, issue}} =>
-      if path.view() == "port" && issue.reason == IssueReason.CheckFailed { 0 } else { 1 }
+    Result<Login, SchemaError | OutOfMemoryError>.Failure {error: SchemaError {issue, ..}} =>
+      if issue.reason == IssueReason.CheckFailed { 0 } else { 1 }
     _ => 2
   }
 }
@@ -816,17 +1062,6 @@ pub fn make() -> Checks<T>
 
 Returns the checks with nothing failed yet.
 
-<a id="Checks.impl.field"></a>
-
-### Method `field`
-
-```silk
-pub fn field<V, Owner, K: Check<V>>(self: &mut Self, owner: &Owner, static name: Intrinsic.FieldName<Owner>, check: K) -> ()
-```
-
-Checks the field `name` of `owner` with `check`, whose type says the field's type, such as
-`Between<u16>` for a `u16` field.
-
 <a id="Checks.impl.that"></a>
 
 ### Method `that`
@@ -846,8 +1081,8 @@ what the value must be when `holds` is `false`.
 pub struct Schemas
 ```
 
-The owner of the functions that read and write `Schema` types. It has no fields and is never
-constructed.
+The owner of the functions that read, write and describe `Schema` types. It has no fields and
+is never constructed.
 
 <a id="Schemas.impl"></a>
 
@@ -865,11 +1100,28 @@ impl Schemas
 pub effect fn read<T: Schema, R: SchemaReader>(reader: &mut R) -> T ! Issue | OutOfMemoryError ? &mut Allocator
 ```
 
-Reads a `T` with its `Schema` implementation.
+Reads a `T` with its `Schema` implementation and runs its `Schema.check`.
 
 #### Errors
 
 - `Issue` if the input does not hold a value of the type.
+- `OutOfMemoryError` if the `Allocator` cannot supply the value.
+
+<a id="Schemas.impl.readVariant"></a>
+
+### Associated function `readVariant`
+
+```silk
+pub effect fn readVariant<U: Schema, R: SchemaReader>(reader: &mut R, name: string) -> U ! Issue | OutOfMemoryError ? &mut Allocator
+```
+
+Reads the variant of the union `U` whose wire name is `name` from an object of its fields,
+such as a tool call whose name and arguments arrive apart.
+
+#### Errors
+
+- `Issue` with `IssueReason.UnknownVariant` if `U` has no variant `name`, or another issue if
+  the object does not hold its fields.
 - `OutOfMemoryError` if the `Allocator` cannot supply the value.
 
 <a id="Schemas.impl.write"></a>
@@ -888,6 +1140,35 @@ Writes `value` with its `Schema` implementation.
 - `Issue` if the format cannot hold the value.
 - `WriterError` if the `Writer` fails.
 
+<a id="Schemas.impl.shape"></a>
+
+### Associated function `shape`
+
+```silk
+pub effect fn shape<T: Schema>() -> Shapes ! OutOfMemoryError ? &mut Allocator
+```
+
+Returns the shape of `T`: its wire form, and that of every type it uses.
+
+#### Errors
+
+- `OutOfMemoryError` if the `Allocator` cannot supply the table.
+
+<a id="Schemas.impl.shapeOf"></a>
+
+### Associated function `shapeOf`
+
+```silk
+pub effect fn shapeOf<T: Schema>(shapes: &mut Shapes) -> ShapeRef ! OutOfMemoryError ? &mut Allocator
+```
+
+Adds the shape of `T` to `shapes` and returns its node, as a type's own `shape` does for the
+types of its parts.
+
+#### Errors
+
+- `OutOfMemoryError` if the `Allocator` cannot grow the table.
+
 <a id="Schemas.impl.spec"></a>
 
 ### Associated function `spec`
@@ -897,6 +1178,27 @@ pub static fn spec<T: Schema>() -> Spec<T>
 ```
 
 Returns the spec of `T`.
+
+<a id="Schemas.impl.kind"></a>
+
+### Associated function `kind`
+
+```silk
+pub static fn kind<T: Schema>() -> KindOf<T>
+```
+
+Returns the kind of value `T` reads.
+
+<a id="Schemas.impl.kindVia"></a>
+
+### Associated function `kindVia`
+
+```silk
+pub static fn kindVia<A, I: Schema>() -> KindOf<A>
+```
+
+Returns the kind of the wire form `I` as the kind of `A`, for the `kind` of a type read
+through a codec with [`Schemas.readVia`](#Schemas.impl.readVia).
 
 <a id="Schemas.impl.readVia"></a>
 
@@ -912,11 +1214,12 @@ Reads the wire form `I` and decodes it into an `A` with `codec`.
 #### When to use
 
 Call it from the `read` of a type whose wire form is another type, such as a port written as
-text.
+text. Its `shape` is then [`Schemas.shapeVia`](#Schemas.impl.shapeVia) with the same codec.
 
 #### Errors
 
-- `Issue` if the input does not hold an `I`, or if `codec` rejects it.
+- `Issue` if the input does not hold an `I`, or if `codec` rejects it. A codec's issue points at
+  the wire value.
 - `OutOfMemoryError` if the `Allocator` cannot supply the value.
 
 <a id="Schemas.impl.writeVia"></a>
@@ -936,6 +1239,32 @@ Encodes `value` into the wire form `I` with `codec` and writes it.
 - `OutOfMemoryError` if `codec` needs memory that the `Allocator` cannot supply.
 - `WriterError` if the `Writer` fails.
 
+<a id="Schemas.impl.shapeVia"></a>
+
+### Associated function `shapeVia`
+
+```silk
+pub effect fn shapeVia<A, I: Schema, C: Codec<A, I>>(codec: &C, shapes: &mut Shapes) -> ShapeOf<A> ! OutOfMemoryError ? &mut Allocator
+```
+
+Adds the shape of a type read through `codec` from the wire form `I` to `shapes`: the shape of
+`I`, with the rules and text the codec reports through `Codec.hints`.
+
+#### Errors
+
+- `OutOfMemoryError` if the `Allocator` cannot grow the table.
+
+<a id="constraintText"></a>
+
+## `constraintText`
+
+```silk
+pub static fn constraintText(constraint: Constraint) -> string<'static>
+```
+
+Returns the text a value that breaks `constraint` is reported with, such as
+`"an integer from 1 to 65535"` or `"text of 1 to 253 characters"`.
+
 <a id="bool.impl.Schema"></a>
 
 ## Implementation `Schema for bool`
@@ -943,6 +1272,16 @@ Encodes `value` into the wire form `I` with `codec` and writes it.
 ```silk
 impl Schema for bool
 ```
+
+<a id="bool.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns `ValueKind.Boolean`.
 
 <a id="bool.impl.Schema.read"></a>
 
@@ -965,6 +1304,16 @@ effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
 
 Writes `true` or `false`.
 
+<a id="bool.impl.Schema.shape"></a>
+
+### Operation `shape`
+
+```silk
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator
+```
+
+Adds `Shape.Boolean`.
+
 <a id="u64.impl.Schema"></a>
 
 ## Implementation `Schema for u64`
@@ -972,6 +1321,16 @@ Writes `true` or `false`.
 ```silk
 impl Schema for u64
 ```
+
+<a id="u64.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns `ValueKind.Number`.
 
 <a id="u64.impl.Schema.read"></a>
 
@@ -994,6 +1353,26 @@ effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
 
 Writes the number.
 
+<a id="u64.impl.Schema.shape"></a>
+
+### Operation `shape`
+
+```silk
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator
+```
+
+Adds an integer from 0 to `u64.MAX`.
+
+<a id="u64.impl.Schema.satisfies"></a>
+
+### Operation `satisfies`
+
+```silk
+effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator
+```
+
+Tests a range.
+
 <a id="i64.impl.Schema"></a>
 
 ## Implementation `Schema for i64`
@@ -1001,6 +1380,16 @@ Writes the number.
 ```silk
 impl Schema for i64
 ```
+
+<a id="i64.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns `ValueKind.Number`.
 
 <a id="i64.impl.Schema.read"></a>
 
@@ -1023,6 +1412,26 @@ effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
 
 Writes the number.
 
+<a id="i64.impl.Schema.shape"></a>
+
+### Operation `shape`
+
+```silk
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator
+```
+
+Adds an integer from `i64.MIN` to `i64.MAX`.
+
+<a id="i64.impl.Schema.satisfies"></a>
+
+### Operation `satisfies`
+
+```silk
+effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator
+```
+
+Tests a range.
+
 <a id="f64.impl.Schema"></a>
 
 ## Implementation `Schema for f64`
@@ -1030,6 +1439,16 @@ Writes the number.
 ```silk
 impl Schema for f64
 ```
+
+<a id="f64.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns `ValueKind.Number`.
 
 <a id="f64.impl.Schema.read"></a>
 
@@ -1052,6 +1471,26 @@ effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
 
 Writes the number. A format that cannot hold a NaN or an infinity fails with an `Issue`.
 
+<a id="f64.impl.Schema.shape"></a>
+
+### Operation `shape`
+
+```silk
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator
+```
+
+Adds `Shape.Float`.
+
+<a id="f64.impl.Schema.satisfies"></a>
+
+### Operation `satisfies`
+
+```silk
+effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator
+```
+
+Tests a range.
+
 <a id="String.impl.Schema"></a>
 
 ## Implementation `Schema for String`
@@ -1059,6 +1498,16 @@ Writes the number. A format that cannot hold a NaN or an infinity fails with an 
 ```silk
 impl Schema for String
 ```
+
+<a id="String.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns `ValueKind.Text`.
 
 <a id="String.impl.Schema.read"></a>
 
@@ -1081,6 +1530,26 @@ effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
 
 Writes the text.
 
+<a id="String.impl.Schema.shape"></a>
+
+### Operation `shape`
+
+```silk
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator
+```
+
+Adds `Shape.Text`.
+
+<a id="String.impl.Schema.satisfies"></a>
+
+### Operation `satisfies`
+
+```silk
+effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator
+```
+
+Tests a length in characters, or a pattern.
+
 <a id="Option.impl.Schema"></a>
 
 ## Implementation `Schema for Option<T>`
@@ -1088,6 +1557,16 @@ Writes the text.
 ```silk
 impl<T: Schema> Schema for Option<T>
 ```
+
+<a id="Option.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns the kind of `T`.
 
 <a id="Option.impl.Schema.read"></a>
 
@@ -1110,6 +1589,16 @@ effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
 
 Writes the value of `Some`, or a null value for `None`. A `None` field is left out instead.
 
+<a id="Option.impl.Schema.shape"></a>
+
+### Operation `shape`
+
+```silk
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator
+```
+
+Adds `Shape.Optional` around the shape of `T`.
+
 <a id="Option.impl.Schema.missing"></a>
 
 ### Operation `missing`
@@ -1130,6 +1619,16 @@ fn omitted(self: &Self) -> bool
 
 Returns `true` for `None`, so a `None` field is left out.
 
+<a id="Option.impl.Schema.satisfies"></a>
+
+### Operation `satisfies`
+
+```silk
+effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator
+```
+
+Tests the value of `Some`; `None` follows every rule.
+
 <a id="List.impl.Schema"></a>
 
 ## Implementation `Schema for List<T>`
@@ -1137,6 +1636,16 @@ Returns `true` for `None`, so a `None` field is left out.
 ```silk
 impl<T: Schema> Schema for List<T>
 ```
+
+<a id="List.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns `ValueKind.List`.
 
 <a id="List.impl.Schema.read"></a>
 
@@ -1146,7 +1655,8 @@ impl<T: Schema> Schema for List<T>
 effect fn read<R: SchemaReader>(reader: &mut R) -> List<T> ! Issue | OutOfMemoryError ? &mut Allocator
 ```
 
-Reads a list, element by element.
+Reads a list, element by element. A collecting reader records a failed element and goes on
+with the next.
 
 <a id="List.impl.Schema.write"></a>
 
@@ -1159,6 +1669,26 @@ effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
 
 Writes the list, element by element.
 
+<a id="List.impl.Schema.shape"></a>
+
+### Operation `shape`
+
+```silk
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator
+```
+
+Adds `Shape.List` of the shape of `T`.
+
+<a id="List.impl.Schema.satisfies"></a>
+
+### Operation `satisfies`
+
+```silk
+effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator
+```
+
+Tests a number of elements.
+
 <a id="u8.impl.Schema"></a>
 
 ## Implementation `Schema for u8`
@@ -1166,6 +1696,16 @@ Writes the list, element by element.
 ```silk
 impl Schema for u8
 ```
+
+<a id="u8.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns `ValueKind.Number`.
 
 <a id="u8.impl.Schema.read"></a>
 
@@ -1188,6 +1728,26 @@ effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
 
 Writes the number.
 
+<a id="u8.impl.Schema.shape"></a>
+
+### Operation `shape`
+
+```silk
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator
+```
+
+Adds an integer from 0 to 255.
+
+<a id="u8.impl.Schema.satisfies"></a>
+
+### Operation `satisfies`
+
+```silk
+effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator
+```
+
+Tests a range.
+
 <a id="u16.impl.Schema"></a>
 
 ## Implementation `Schema for u16`
@@ -1195,6 +1755,16 @@ Writes the number.
 ```silk
 impl Schema for u16
 ```
+
+<a id="u16.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns `ValueKind.Number`.
 
 <a id="u16.impl.Schema.read"></a>
 
@@ -1217,6 +1787,26 @@ effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
 
 Writes the number.
 
+<a id="u16.impl.Schema.shape"></a>
+
+### Operation `shape`
+
+```silk
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator
+```
+
+Adds an integer from 0 to 65535.
+
+<a id="u16.impl.Schema.satisfies"></a>
+
+### Operation `satisfies`
+
+```silk
+effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator
+```
+
+Tests a range.
+
 <a id="u32.impl.Schema"></a>
 
 ## Implementation `Schema for u32`
@@ -1224,6 +1814,16 @@ Writes the number.
 ```silk
 impl Schema for u32
 ```
+
+<a id="u32.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns `ValueKind.Number`.
 
 <a id="u32.impl.Schema.read"></a>
 
@@ -1246,6 +1846,26 @@ effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
 
 Writes the number.
 
+<a id="u32.impl.Schema.shape"></a>
+
+### Operation `shape`
+
+```silk
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator
+```
+
+Adds an integer from 0 to 4294967295.
+
+<a id="u32.impl.Schema.satisfies"></a>
+
+### Operation `satisfies`
+
+```silk
+effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator
+```
+
+Tests a range.
+
 <a id="usize.impl.Schema"></a>
 
 ## Implementation `Schema for usize`
@@ -1253,6 +1873,16 @@ Writes the number.
 ```silk
 impl Schema for usize
 ```
+
+<a id="usize.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns `ValueKind.Number`.
 
 <a id="usize.impl.Schema.read"></a>
 
@@ -1275,6 +1905,26 @@ effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
 
 Writes the number.
 
+<a id="usize.impl.Schema.shape"></a>
+
+### Operation `shape`
+
+```silk
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator
+```
+
+Adds an integer from 0 to `usize.MAX`.
+
+<a id="usize.impl.Schema.satisfies"></a>
+
+### Operation `satisfies`
+
+```silk
+effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator
+```
+
+Tests a range.
+
 <a id="i8.impl.Schema"></a>
 
 ## Implementation `Schema for i8`
@@ -1282,6 +1932,16 @@ Writes the number.
 ```silk
 impl Schema for i8
 ```
+
+<a id="i8.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns `ValueKind.Number`.
 
 <a id="i8.impl.Schema.read"></a>
 
@@ -1304,6 +1964,26 @@ effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
 
 Writes the number.
 
+<a id="i8.impl.Schema.shape"></a>
+
+### Operation `shape`
+
+```silk
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator
+```
+
+Adds an integer from -128 to 127.
+
+<a id="i8.impl.Schema.satisfies"></a>
+
+### Operation `satisfies`
+
+```silk
+effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator
+```
+
+Tests a range.
+
 <a id="i16.impl.Schema"></a>
 
 ## Implementation `Schema for i16`
@@ -1311,6 +1991,16 @@ Writes the number.
 ```silk
 impl Schema for i16
 ```
+
+<a id="i16.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns `ValueKind.Number`.
 
 <a id="i16.impl.Schema.read"></a>
 
@@ -1333,6 +2023,26 @@ effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
 
 Writes the number.
 
+<a id="i16.impl.Schema.shape"></a>
+
+### Operation `shape`
+
+```silk
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator
+```
+
+Adds an integer from -32768 to 32767.
+
+<a id="i16.impl.Schema.satisfies"></a>
+
+### Operation `satisfies`
+
+```silk
+effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator
+```
+
+Tests a range.
+
 <a id="i32.impl.Schema"></a>
 
 ## Implementation `Schema for i32`
@@ -1340,6 +2050,16 @@ Writes the number.
 ```silk
 impl Schema for i32
 ```
+
+<a id="i32.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns `ValueKind.Number`.
 
 <a id="i32.impl.Schema.read"></a>
 
@@ -1361,6 +2081,26 @@ effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
 ```
 
 Writes the number.
+
+<a id="i32.impl.Schema.shape"></a>
+
+### Operation `shape`
+
+```silk
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator
+```
+
+Adds an integer from -2147483648 to 2147483647.
+
+<a id="i32.impl.Schema.satisfies"></a>
+
+### Operation `satisfies`
+
+```silk
+effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator
+```
+
+Tests a range.
 
 
 Category: Data formats.

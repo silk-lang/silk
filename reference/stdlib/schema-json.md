@@ -6,14 +6,17 @@ Read and write `Schema` types as JSON.
 
 ## When to use
 Call [`SchemaJson.decode`](#SchemaJson.impl.decode) to read a value of a `silk.schema.schema.Schema` type from JSON text,
-and [`SchemaJson.encode`](#SchemaJson.impl.encode) to write one to the ambient `Writer`. Use `silk.json.value.Json` to
-work with a JSON document whose shape is not known in advance.
+[`SchemaJson.decodeAll`](#SchemaJson.impl.decodeAll) to report every problem in the text at once, and [`SchemaJson.encode`](#SchemaJson.impl.encode)
+to write a value to the ambient `Writer`. Show the problems with
+`silk.schema.report.SchemaReport`. Use `silk.json.value.Json` to work with a JSON document whose
+shape is not known in advance.
 
 ## Details
 Decoding streams over the text with `silk.json.scanner.JsonScanner` and builds the value
-directly, with no tree of JSON values in between. Object members may come in any order, and
-members the type does not name are skipped. Encoding writes compact JSON, with struct fields in
-declaration order.
+directly, with no tree of JSON values in between. Each object is scanned once into an index of
+its members, so members may come in any order, and members the type does not name are skipped,
+or reported when its spec is `Spec.strict`. Every problem carries the span of the bytes it is
+about. Encoding writes compact JSON, with struct fields in declaration order.
 
 ## Examples
 ### Report where a value failed
@@ -25,6 +28,7 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.schema.issue { IssueReason, SchemaError }
 import silk.schema.json { SchemaJson }
 import silk.schema.schema { Schema }
+import silk.text.string { String }
 
 struct Limits {
   pub ports: List<u16>,
@@ -32,17 +36,22 @@ struct Limits {
 
 impl Schema for Limits {}
 
-pub effect fn main() -> i32 ! OutOfMemoryError {
-  let mut allocator = Allocator.systemAllocatorProvider()
-  let decoded = run Effect.result(SchemaJson.decode<Limits>(b"{\"ports\": [80, 70000]}"))
-    |> Effect.provideMut<Allocator>(&mut allocator)
-  return match move decoded {
+effect fn check() -> i32 ! OutOfMemoryError ? &mut Allocator {
+  return match move run Effect.result(SchemaJson.decode<Limits>(b"{\"ports\": [80, 70000]}")) {
     Result<Limits, SchemaError | OutOfMemoryError>.Success {..} => 1
     Result<Limits, SchemaError | OutOfMemoryError>.Failure {error} => match move error {
-      SchemaError {path, issue} => if path.view() == "ports[1]" && issue.reason == IssueReason.InvalidValue { 0 } else { 2 }
+      SchemaError {path, issue, ..} => {
+        let pointer = run path.pointer()
+        if pointer.view() == "/ports/1" && issue.reason == IssueReason.InvalidValue { 0 } else { 2 }
+      }
       OutOfMemoryError {} => 3
     }
   }
+}
+
+pub effect fn main() -> i32 ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run check() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 ```
 
@@ -76,7 +85,7 @@ impl SchemaJson
 pub effect fn decode<T: Schema>(bytes: &[u8]) -> T ! SchemaError | OutOfMemoryError ? &mut Allocator
 ```
 
-Reads one value of type `T` from the JSON text `bytes`.
+Reads one value of type `T` from the JSON text `bytes`, stopping at the first problem.
 
 #### Details
 
@@ -85,7 +94,7 @@ The whole input must be one JSON value, with optional white space around it.
 #### Errors
 
 - `SchemaError` if the text is not valid JSON or does not hold a `T`. Its `path` names the part
-  that failed, and its issue has the byte offset when the problem is in the text.
+  that failed, and its issue has the span of the bytes it is about.
 - `OutOfMemoryError` if the `Allocator` cannot supply the value.
 
 <a id="SchemaJson.impl.decodeAll"></a>
@@ -96,17 +105,40 @@ The whole input must be one JSON value, with optional white space around it.
 pub effect fn decodeAll<T: Schema>(bytes: &[u8]) -> T ! SchemaErrors | OutOfMemoryError ? &mut Allocator
 ```
 
-Reads one value of type `T` from the JSON text `bytes`, reporting every failed check.
+Reads one value of type `T` from the JSON text `bytes`, reporting every problem.
 
 #### Details
 
-Each failed `Schema.check` is recorded and reading goes on, so one call lists every field
-that is out of range. Reading stops at the first part whose shape is wrong, such as text
-where a number belongs, which is listed last.
+A field, element or variant that fails is recorded and skipped, and reading goes on with the
+next one, so one call lists every problem, in input order: a missing key, a wrong type, a
+number out of range and a failed rule alike. Text that is not valid JSON is the one problem
+reported. At most `MAX_PROBLEMS` (64) are listed.
 
 #### Errors
 
-- `SchemaErrors` with every problem found, in input order.
+- `SchemaErrors` with every problem found.
+- `OutOfMemoryError` if the `Allocator` cannot supply the value.
+
+<a id="SchemaJson.impl.decodeVariant"></a>
+
+### Associated function `decodeVariant`
+
+```silk
+pub effect fn decodeVariant<U: Schema>(name: string, bytes: &[u8]) -> U ! SchemaErrors | OutOfMemoryError ? &mut Allocator
+```
+
+Reads the variant of the union `U` whose wire name is `name` from the JSON object `bytes` of its
+fields, reporting every problem.
+
+#### When to use
+
+Read a call whose name and arguments arrive apart, such as a tool call from a model, into the
+union whose variants are the tools.
+
+#### Errors
+
+- `SchemaErrors` with every problem found, as `decodeAll` reports them, or
+  `IssueReason.UnknownVariant` if `U` has no variant `name`.
 - `OutOfMemoryError` if the `Allocator` cannot supply the value.
 
 <a id="SchemaJson.impl.encode"></a>
@@ -168,8 +200,8 @@ Returns a reader at the start of `input`.
 pub fn collectingAll(input: &'input [u8]) -> JsonSchemaReader<'input>
 ```
 
-Returns a reader at the start of `input` that records every failed check instead of
-stopping at the first. Read them with [`JsonSchemaReader.intoErrors`](#JsonSchemaReader.impl.intoErrors).
+Returns a reader at the start of `input` that records every problem instead of stopping at
+the first. Read them with [`JsonSchemaReader.intoErrors`](#JsonSchemaReader.impl.intoErrors).
 
 <a id="JsonSchemaReader.impl.intoErrors"></a>
 
@@ -179,7 +211,15 @@ stopping at the first. Read them with [`JsonSchemaReader.intoErrors`](#JsonSchem
 pub fn intoErrors(self: Self) -> List<SchemaError>
 ```
 
-Returns the failed checks the reader recorded, in the order they were found.
+Returns the problems the reader recorded, in the order they were found.
+
+<a id="JsonSchemaReader.impl-2"></a>
+
+## Implementation `JsonSchemaReader<'input>`
+
+```silk
+impl<'input> JsonSchemaReader<'input>
+```
 
 <a id="JsonSchemaReader.impl.SchemaReader"></a>
 
@@ -199,16 +239,76 @@ fn path(self: &mut Self) -> &mut SchemaPath
 
 Returns the path of the part being read.
 
-<a id="JsonSchemaReader.impl.SchemaReader.checkFailed"></a>
+<a id="JsonSchemaReader.impl.SchemaReader.report"></a>
 
-### Operation `checkFailed`
+### Operation `report`
 
 ```silk
-effect fn checkFailed(self: &mut Self, field: Option<string<'static>>, expected: string<'static>)
-    -> () ! Issue | OutOfMemoryError ? &mut Allocator
+effect fn report(self: &mut Self, issue: Issue) -> () ! Issue | OutOfMemoryError ? &mut Allocator
 ```
 
-Fails with the check, or records it and returns when the reader collects every problem.
+Fails with the issue, or records it and returns when the reader collects every problem.
+
+<a id="JsonSchemaReader.impl.SchemaReader.collecting"></a>
+
+### Operation `collecting`
+
+```silk
+fn collecting(self: &Self) -> bool
+```
+
+Returns whether the reader records every problem.
+
+<a id="JsonSchemaReader.impl.SchemaReader.lastSpan"></a>
+
+### Operation `lastSpan`
+
+```silk
+fn lastSpan(self: &Self) -> Option<Span>
+```
+
+Returns the span of the last complete value read.
+
+<a id="JsonSchemaReader.impl.SchemaReader.lastKind"></a>
+
+### Operation `lastKind`
+
+```silk
+fn lastKind(self: &Self) -> ValueKind
+```
+
+Returns the kind of the last complete value read.
+
+<a id="JsonSchemaReader.impl.SchemaReader.mark"></a>
+
+### Operation `mark`
+
+```silk
+effect fn mark(self: &mut Self) -> usize ! OutOfMemoryError ? &mut Allocator
+```
+
+Remembers the open objects and lists and the scanner's position.
+
+<a id="JsonSchemaReader.impl.SchemaReader.recover"></a>
+
+### Operation `recover`
+
+```silk
+effect fn recover(self: &mut Self, mark: usize, skip: bool) -> () ! Issue | OutOfMemoryError ? &mut Allocator
+```
+
+Returns to the mark, closing the objects and lists opened since, and reads past the value
+there when `skip` is `true`.
+
+<a id="JsonSchemaReader.impl.SchemaReader.release"></a>
+
+### Operation `release`
+
+```silk
+fn release(self: &mut Self, mark: usize) -> ()
+```
+
+Forgets the mark and every later one.
 
 <a id="JsonSchemaReader.impl.SchemaReader.boolean"></a>
 
@@ -298,7 +398,7 @@ Returns `true` at the next element, or reads past `]` and returns `false`.
 effect fn beginObject(self: &mut Self) -> () ! Issue | OutOfMemoryError ? &mut Allocator
 ```
 
-Checks that an object comes next and remembers where it starts.
+Reads the object's members into an index once, so `member` finds each without scanning.
 
 <a id="JsonSchemaReader.impl.SchemaReader.member"></a>
 
@@ -308,7 +408,18 @@ Checks that an object comes next and remembers where it starts.
 effect fn member(self: &mut Self, key: string) -> bool ! Issue | OutOfMemoryError ? &mut Allocator
 ```
 
-Searches the object being read for the member `key` and leaves the reader at its value.
+Finds the member `key` in the object's index and leaves the reader at its value. A missing key
+leaves the object's opening brace as the last span.
+
+<a id="JsonSchemaReader.impl.SchemaReader.rejectUnread"></a>
+
+### Operation `rejectUnread`
+
+```silk
+effect fn rejectUnread(self: &mut Self, expected: string<'static>) -> () ! Issue | OutOfMemoryError ? &mut Allocator
+```
+
+Reports every member no `member` call found, at its key.
 
 <a id="JsonSchemaReader.impl.SchemaReader.endObject"></a>
 
@@ -318,7 +429,7 @@ Searches the object being read for the member `key` and leaves the reader at its
 effect fn endObject(self: &mut Self) -> () ! Issue | OutOfMemoryError ? &mut Allocator
 ```
 
-Reads past the whole object being read.
+Jumps past the whole object being read.
 
 <a id="JsonSchemaWriter"></a>
 
