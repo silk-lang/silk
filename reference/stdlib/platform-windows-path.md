@@ -148,9 +148,8 @@ Returns an extended Windows host name as canonical WTF-8, without a NUL terminat
 
 `/C:/...` becomes `\\?\C:\...`; `/UNC/server/share/...` becomes `\\?\UNC\server\share\...`.
 The extended prefix preserves trailing dots/spaces and avoids Win32's legacy path-length
-normalization. Use it for direct filesystem calls; a process argument or environment value
-takes the normal name [`WindowsPath.toArgumentBytes`](#WindowsPath.impl.toArgumentBytes) returns, since some tools, such as Git,
-refuse extended names.
+normalization. Some tools, such as Git, refuse extended names in their arguments; give those
+the normal name [`WindowsPath.toArgumentBytes`](#WindowsPath.impl.toArgumentBytes) returns.
 
 #### Errors
 
@@ -172,7 +171,7 @@ process argument or an environment value.
 #### Details
 
 `/C:/...` becomes `C:\...` and `/UNC/server/share/...` becomes `\\server\share\...`, the
-spelling a user types and every tool accepts. Some tools, such as Git, refuse the extended
+spelling a user types. Some tools, such as Git, refuse the extended
 `\\?\` names [`WindowsPath.toNativeBytes`](#WindowsPath.impl.toNativeBytes) returns. Win32 rewrites some normal names, so a
 path that would name another file is refused instead: a component that ends in a dot or a
 space, or a reserved device name such as `NUL` or `COM1.txt`. A name longer than 259 units
