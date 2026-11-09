@@ -1,0 +1,168 @@
+//! Removes unreachable immutable segment owners using generation metadata alone.
+//!
+//! This does not compact mixed live/dead segments or reclaim filesystem objects. Selected
+//! roots, live certificate anchors, imports and placements of live sources retain owners.
+//! Final CacheView admission still validates selected keys, packs and observation bindings.
+
+import semantic.CacheGeneration as Generation {Generation as GenerationData, Selection, Placement, Certificate, LeafHandle}
+import semantic.CacheSegments as Segments {Descriptor, SealedSegment}
+import semantic.ContentHash {ContentHash}
+import semantic.InternIndex {InternIndex}
+import semantic.RuntimeEncoding
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.core.option {Option}
+import silk.mem.frozen {Frozen}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.usize
+
+/// Logical segment ownership before and after trimming; these are not reclaimed disk bytes.
+pub struct Statistics {pub beforeSegments: usize, pub afterSegments: usize, pub beforeBytes: usize, pub afterBytes: usize}
+/// Metadata and original immutable owners after dependency closure, awaiting full view admission.
+pub struct Retained {pub generation: GenerationData, pub owners: List<Frozen<SealedSegment>>, pub stats: Statistics}
+
+fn same(left: Descriptor, right: Descriptor) -> bool {
+  return ContentHash.equals(left.digest, right.digest) && left.serial == right.serial
+    && left.leaves == right.leaves && left.nodes == right.nodes && left.roots == right.roots
+}
+fn position(catalog: &[Descriptor], index: &InternIndex, digest: ContentHash) -> usize {
+  let mut at = InternIndex.first(index, digest.low)
+  while at != usize.MAX {
+    if ContentHash.equals(catalog[at].digest, digest) { return at }
+    at = InternIndex.after(index, at)
+  }
+  return usize.MAX
+}
+fn nonempty(selection: &Selection) -> bool {
+  let bytes = Bytes.asSlice(&selection.roots)
+  let mut at = usize.ZERO
+  while at < bytes.length { if bytes[at] != 0 { return true } at = at + usize.ONE }
+  return false
+}
+fn any(values: &[Selection]) -> bool {
+  let mut at = usize.ZERO
+  while at < values.length { if nonempty(&values[at]) { return true } at = at + usize.ONE }
+  return false
+}
+fn dropEmpty(values: &mut List<Selection>) -> () {
+  let mut at = List<Selection>.length(&values.*)
+  while at > 0 {
+    at = at - usize.ONE
+    if !nonempty(&List<Selection>.asSlice(&values.*)[at]) { drop List<Selection>.remove(&mut values.*, at) }
+  }
+}
+effect fn mark(live: &mut List<bool>, pending: &mut List<usize>, at: usize) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  if List<bool>.get(&live.*, at) { return () }
+  run List<usize>.append(&mut pending.*, at)
+  List<bool>.set(&mut live.*, at, true)
+}
+
+/// Consumes an unpublished generation and drops owners outside its metadata dependency closure.
+/// Missing imports, mismatched owners or invalid generation shape refuse the entire candidate.
+/// No answer is copied, no graph edge is visited, and no sealed payload is hashed or re-encoded.
+pub effect fn trim(generation: GenerationData, owners: List<Frozen<SealedSegment>>) -> Option<Retained>
+! OutOfMemoryError ? &mut Allocator {
+  let mut value = move generation
+  let mut held = move owners
+  if !Generation.validShape(&value) { return Option<Retained>.none() }
+  let count = List<Descriptor>.length(&value.catalog)
+  if List<Frozen<SealedSegment>>.length(&held) != count { return Option<Retained>.none() }
+  let mut index = InternIndex.make()
+  let mut beforeBytes = usize.ZERO
+  let mut at = usize.ZERO
+  while at < count {
+    let expected = List<Descriptor>.get(&value.catalog, at)
+    let owner = Frozen<SealedSegment>.get(&List<Frozen<SealedSegment>>.asSlice(&held)[at])
+    if !same(expected, Segments.descriptor(owner))
+      || !RuntimeEncoding.equals(Bytes.asSlice(&value.stamp), Segments.stamp(owner)) { return Option<Retained>.none() }
+    let imports = Segments.imports(owner)
+    let mut imported = usize.ZERO
+    while imported < imports.length {
+      let found = position(List<Descriptor>.asSlice(&value.catalog), &index, imports[imported].digest)
+      if found == usize.MAX || !same(imports[imported], List<Descriptor>.get(&value.catalog, found)) { return Option<Retained>.none() }
+      imported = imported + usize.ONE
+    }
+    beforeBytes = beforeBytes + Segments.encoded(owner).length
+    run InternIndex.record(&mut index, expected.digest.low)
+    at = at + usize.ONE
+  }
+  let mut live = List<bool>.make()
+  let mut starts = List<usize>.make()
+  let mut ends = List<usize>.make()
+  run List<bool>.appendRepeated(&mut live, false, count)
+  run List<usize>.appendRepeated(&mut starts, usize.MAX, count)
+  run List<usize>.appendRepeated(&mut ends, usize.ZERO, count)
+  let mut pending = List<usize>.make()
+  let catalog = List<Descriptor>.asSlice(&value.catalog)
+  let selections = List<Selection>.asSlice(&value.selections)
+  at = usize.ZERO
+  while at < selections.length {
+    if nonempty(&selections[at]) { run mark(&mut live, &mut pending, position(catalog, &index, selections[at].segment)) }
+    at = at + usize.ONE
+  }
+  let mut certified = false
+  if let Option<Certificate>.Some {value: proof} = &value.certificate {
+    certified = any(List<Selection>.asSlice(&proof.exact)) || any(List<Selection>.asSlice(&proof.positionOnly))
+    if certified {
+      let anchors = List<LeafHandle>.asSlice(&proof.anchors)
+      at = usize.ZERO
+      while at < anchors.length { run mark(&mut live, &mut pending, position(catalog, &index, anchors[at].segment)) at = at + usize.ONE }
+    }
+  }
+  // Placements are canonical by source owner. Visit each live owner's range only once.
+  let placements = List<Placement>.asSlice(&value.placements)
+  at = usize.ZERO
+  while at < placements.length {
+    let source = position(catalog, &index, placements[at].source.segment)
+    if List<usize>.get(&starts, source) == usize.MAX { List<usize>.set(&mut starts, source, at) }
+    List<usize>.set(&mut ends, source, at + usize.ONE)
+    at = at + usize.ONE
+  }
+  let mut next = usize.ZERO
+  while next < List<usize>.length(&pending) {
+    let segment = List<usize>.get(&pending, next)
+    let owner = Frozen<SealedSegment>.get(&List<Frozen<SealedSegment>>.asSlice(&held)[segment])
+    let imports = Segments.imports(owner)
+    at = usize.ZERO
+    while at < imports.length { run mark(&mut live, &mut pending, position(catalog, &index, imports[at].digest)) at = at + usize.ONE }
+    at = List<usize>.get(&starts, segment)
+    let end = List<usize>.get(&ends, segment)
+    while at < end {
+      run mark(&mut live, &mut pending, position(catalog, &index, placements[at].target.segment))
+      at = at + usize.ONE
+    }
+    next = next + usize.ONE
+  }
+  // Copy only tiny placement records, preserving their canonical order. Owner bytes stay put.
+  let mut kept = usize.ZERO
+  at = usize.ZERO
+  while at < List<Placement>.length(&value.placements) {
+    let entry = List<Placement>.get(&value.placements, at)
+    if List<bool>.get(&live, position(List<Descriptor>.asSlice(&value.catalog), &index, entry.source.segment)) {
+      List<Placement>.set(&mut value.placements, kept, entry)
+      kept = kept + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  List<Placement>.truncate(&mut value.placements, kept)
+  dropEmpty(&mut value.selections)
+  if !certified { value.certificate = Option<Certificate>.none() }
+  else if let Option<Certificate>.Some {value: proof} = &mut value.certificate {
+    dropEmpty(&mut proof.exact)
+    dropEmpty(&mut proof.positionOnly)
+  }
+  let mut afterBytes = usize.ZERO
+  at = count
+  while at > 0 {
+    at = at - usize.ONE
+    if List<bool>.get(&live, at) {
+      afterBytes = afterBytes + Segments.encoded(Frozen<SealedSegment>.get(&List<Frozen<SealedSegment>>.asSlice(&held)[at])).length
+    } else {
+      drop List<Descriptor>.remove(&mut value.catalog, at)
+      drop List<Frozen<SealedSegment>>.remove(&mut held, at)
+    }
+  }
+  let stats = Statistics {beforeSegments: count, afterSegments: List<Descriptor>.length(&value.catalog), beforeBytes: beforeBytes, afterBytes: afterBytes}
+  return Option<Retained>.some(Retained {generation: move value, owners: move held, stats: move stats})
+}
