@@ -273,6 +273,11 @@ a match can leave its group unset (under `?`, `*` or `{0,n}`, in one alternative
 negative lookaround, or a name two alternatives share) and `string<'a>` otherwise. Unnamed
 groups need no field. An invalid pattern or a mismatch is a compile error.
 
+#### Gotchas
+`Regex.typed` reads only whether a field type is a union. A field type that is neither
+`string<'a>` nor `Option<string<'a>>`, such as `i32`, is refused where the pattern is
+searched, by the [`Capture`](#Capture) bound of `find` and `whole`.
+
 #### Examples
 ##### Read a version tag
 ```silk

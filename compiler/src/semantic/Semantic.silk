@@ -2410,6 +2410,8 @@ struct IterationFacts {
 union ResolvedTarget {
   Function {target: CallTarget},
   Constant {declaration: DeclarationId, ty: Interned<Type>},
+  /// The constant written as the receiver of `C.m()`: the call is `m` on the constant's value.
+  ConstantReceiver {declaration: DeclarationId, ty: Interned<Type>},
   /// An imported C static read by value, with its admitted scalar or pointer type.
   ForeignStatic {declaration: DeclarationId, ty: Interned<Type>},
   Intrinsic {member: IntrinsicMember, typeArguments: List<Interned<Type>>},
@@ -33052,24 +33054,16 @@ effect fn collectInvocation(hir: &Module, expression: HirId, input: CallInput, a
         pipeline: pipeline,
       },
     )
+    // `C.m<T>()` reads as a qualified call, but a constant `C` makes it a receiver call whose
+    // written types bind `m`'s own binders, so they resolve beside the annotations too.
+    if let Node.FieldExpression {..} = Module.node(hir, callee) {
+      run collectMemberTypeArguments(hir, generics, &mut annotations.*)
+    }
   } else if let Node.FieldExpression {subject, ..} = Module.node(hir, callee) {
     run collectCall(hir, subject, &mut annotations.*, &mut calls.*)
     // A receiver call's written types bind its member's own binders. The member is known only
     // once the receiver is typed, so they resolve in the caller's binders beside its annotations.
-    if generics.present {
-      if let Node.TypeArguments {arguments: written, ..} = Module.node(hir, generics.id) {
-        let mut writtenAt = usize.ZERO
-        while writtenAt < written.length {
-          let argument = Module.child(hir, written, writtenAt)
-          match Module.node(hir, argument) {
-            Node.Lifetime {..} => ()
-            Node.RequirementSelector {..} => ()
-            _ => run List<HirId>.append(&mut annotations.*, argument)
-          }
-          writtenAt = writtenAt + usize.ONE
-        }
-      }
-    }
+    run collectMemberTypeArguments(hir, generics, &mut annotations.*)
   }
 
   if callableExpressionTarget(Module.node(hir, callee)) {
@@ -33079,6 +33073,25 @@ effect fn collectInvocation(hir: &Module, expression: HirId, input: CallInput, a
   while at < CallArguments.length(arguments) {
     run collectCall(hir, CallArguments.child(arguments, hir, at), &mut annotations.*, &mut calls.*)
     at = at + usize.ONE
+  }
+  return ()
+}
+
+// The written type arguments of a member call, which resolve in the caller's binders.
+effect fn collectMemberTypeArguments(hir: &Module, generics: HirRef, annotations: &mut List<HirId>) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  if !generics.present { return () }
+  if let Node.TypeArguments {arguments: written, ..} = Module.node(hir, generics.id) {
+    let mut writtenAt = usize.ZERO
+    while writtenAt < written.length {
+      let argument = Module.child(hir, written, writtenAt)
+      match Module.node(hir, argument) {
+        Node.Lifetime {..} => ()
+        Node.RequirementSelector {..} => ()
+        _ => run List<HirId>.append(&mut annotations.*, argument)
+      }
+      writtenAt = writtenAt + usize.ONE
+    }
   }
   return ()
 }
@@ -33931,6 +33944,7 @@ effect fn localizedTarget(target: ResolvedTarget, caller: &DeclarationId, origin
     }
     ResolvedTarget.Function {target: selected} => ResolvedTarget.Function {target: move selected}
     ResolvedTarget.Constant {declaration, ty} => ResolvedTarget.Constant {declaration: move declaration, ty: move ty}
+    ResolvedTarget.ConstantReceiver {declaration, ty} => ResolvedTarget.ConstantReceiver {declaration: move declaration, ty: move ty}
     ResolvedTarget.ForeignStatic {declaration, ty} => ResolvedTarget.ForeignStatic {declaration: move declaration, ty: move ty}
     ResolvedTarget.Selected {fact} => ResolvedTarget.Selected {fact: move fact}
   }
@@ -34801,8 +34815,13 @@ effect fn qualifiedNominalCallTarget(
     if !syntax.value && !application.present {
       if let Option<HeaderSyntax>.Some {value} = move run scopedHeader(&mut resolver.*, &qualifierModule, qualifier.ordinal) {
         if let Node.ConstantHeader {..} = value.header {
-          return run callConstantTarget(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, &qualifierModule,
+          let resolved = run callConstantTarget(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, &qualifierModule,
             &qualifier, subjectSpan)
+          return match move resolved {
+            Result<ResolvedTarget, Shared<Rejection>>.Success {value: ResolvedTarget.Constant {declaration, ty}} =>
+              Result<ResolvedTarget, Shared<Rejection>>.succeed(ResolvedTarget.ConstantReceiver {declaration: move declaration, ty: move ty})
+            Result<ResolvedTarget, Shared<Rejection>> other => move other
+          }
         }
       }
     }
@@ -35878,6 +35897,9 @@ effect fn resolveNamedRepresentation(
     ResolvedTarget.Constant {..} => {
       return run invalidExactRepresentation(&resolver.*, module, span)
     }
+    ResolvedTarget.ConstantReceiver {..} => {
+      return run invalidExactRepresentation(&resolver.*, module, span)
+    }
     ResolvedTarget.ForeignStatic {..} => {
       return run invalidExactRepresentation(&resolver.*, module, span)
     }
@@ -36110,6 +36132,10 @@ effect fn copyResolvedTarget(value: &ResolvedTarget) -> ResolvedTarget
     ResolvedTarget.Storage {operation, typeArguments} => ResolvedTarget.Storage {operation: operation,
       typeArguments: run copyTypes(List<Interned<Type>>.asSlice(&typeArguments))}
     ResolvedTarget.Constant {declaration, ty} => ResolvedTarget.Constant {
+      declaration: DeclarationId.copy(&declaration),
+      ty: Interned<Type>.clone(&ty),
+    }
+    ResolvedTarget.ConstantReceiver {declaration, ty} => ResolvedTarget.ConstantReceiver {
       declaration: DeclarationId.copy(&declaration),
       ty: Interned<Type>.clone(&ty),
     }
@@ -38318,15 +38344,6 @@ effect fn checkReceiverCall<'scope>(
 ) -> Result<BodyNodeId, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
 ? &mut Allocator | &mut Types {
-  let span = run bodySpan(&resolver.source, cursor, expression)
-  let memberSpan = run bodySpan(&resolver.source, cursor, field)
-  let memberSymbol = match run bodyNode(&resolver.source, cursor, field) {
-    Node.Name {text} => text
-    _ => {
-      return run bodyRejection(&resolver.*, module, RejectionCode.Undetermined, memberSpan)
-    }
-  }
-  let member = run bodyText(&resolver.source, cursor, memberSymbol)
   let checkedReceiver = run checkExpression(
     &mut resolver.*,
     &mut owner.*,
@@ -59613,7 +59630,10 @@ effect fn checkInvocationOnce<'scope>(
         constraints, contractBody, staticBody, unsafeAllowed,
       )
     }
-    ResolvedTarget.Constant {declaration, ty: constantType} => {
+    ResolvedTarget.Constant {..} => {
+      return run bodyRejection(&resolver.*, module, RejectionCode.NotCallable, span)
+    }
+    ResolvedTarget.ConstantReceiver {declaration, ty: constantType} => {
       // A written `C.m()` whose `C` names a constant calls `m` on the constant's value, as
       // `C.field` reads its field.
       if !receiverSpelling {
