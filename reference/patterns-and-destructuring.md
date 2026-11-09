@@ -293,8 +293,10 @@ if let Token { kind } = &event {
 
 The test observes the union member and projects `kind`; it invokes no `Token` operation.
 
-**Boundary:** Literal, range, alternative, negated, or user-authored extractor patterns require a
-separate language direction.
+Literal and range patterns (PATT-024) compare an integer, `char` or `bool` value with constants
+the compiler already knows; they call no `==` or comparison operation either.
+
+**Boundary:** Negated or user-authored extractor patterns require a separate language direction.
 
 **Diagnostics:** A syntax unavailable in the current pattern grammar receives a parser-owned
 diagnostic and is not reinterpreted as an expression.
@@ -353,7 +355,8 @@ exhaustive matching specification.
 Initial destructuring is available in match arms, irrefutable local `let`, refutable `if let`, and
 the pattern loop `while let` (PATT-022).
 Destructuring assignment, parameter patterns, `let ... else`, aliases binding both a
-whole value and fields, pattern chains, and additional pattern operators remain unavailable.
+whole value and fields, pattern chains, and pattern operators other than `|` (PATT-023) and the
+range forms (PATT-024) remain unavailable.
 
 **Boundary:** These omissions do not reserve implementation-specific behavior or permit a parser to
 accept them without defined semantics.
@@ -626,3 +629,91 @@ Pattern, field, binding, and ownership errors keep the ordinary codes of the equ
 **Evidence:** [conditional patterns](#patt-007--if-let-tests-one-refutable-pattern),
 [loop ownership](functions-callables-and-control-flow.md#loop-001--while-is-a-boolean-pre-test-loop),
 pattern loop corpus programs.
+
+## PATT-023 — Alternatives joined with `|` select any one of their patterns
+
+**Status:** Confirmed
+
+A `match` arm pattern may list alternatives joined with `|`. The arm is selected when any
+alternative matches; alternatives are tried left to right and the arm's guard runs once, whichever
+alternative matched.
+
+```silk
+fn weekend(day: Day) -> bool {
+  return match day {
+    Day.Saturday | Day.Sunday => true
+    _ => false
+  }
+}
+```
+
+An unguarded arm covers every value its alternatives cover. An alternative that earlier arms or
+earlier alternatives of the same arm already cover is unreachable.
+
+**Boundary:** Alternatives form a whole arm pattern only; a field's pattern cannot list them. An
+alternative binds no name, so a variant alternative omits its fields with `..` or `_`. `|` keeps its
+meaning as bitwise or in expressions, including guards.
+
+**Diagnostics:** An alternative that binds a name reports `SEM0258`. Alternatives inside a field
+pattern report `SEM0259`. A covered alternative reports `SEM0043`, or `SEM0159` for a repeated
+scalar enum member.
+
+**Evidence:** `rangeLiteralAndAlternativePatterns` semantic cases,
+`match-ranges-and-alternatives` corpus program.
+
+## PATT-024 — Literal and range patterns select scalar values
+
+**Status:** Confirmed
+
+A `match` on an integer, `char` or `bool` value may test literal patterns: an integer literal with an
+optional leading `-`, a character literal, `true` or `false`. A range pattern selects the integer or
+`char` values between two literal bounds: `low..=high` includes both, `low..high` excludes `high`,
+`low..` reaches the type's maximum, and `..=high` starts at its minimum.
+
+```silk
+fn kind(c: char) -> i32 {
+  return match c {
+    '0'..='9' => 0
+    'a'..='z' | 'A'..='Z' => 1
+    _ => 2
+  }
+}
+```
+
+**Boundary:** A literal or range is a whole arm pattern, or one alternative of it; a field pattern
+does not test values. Bounds are literals, not constants or expressions. A literal's kind must match
+the scrutinee: a character pattern cannot test an integer, nor an integer pattern a `char`.
+
+**Diagnostics:** A literal of the wrong kind reports `SEM0256`. A bound outside the scrutinee type
+reports `SEM0002`. A range that selects no value, such as `9..=3` or `3..3`, reports `SEM0257`. An
+integer literal against a scalar enum reports `SEM0162`.
+
+**Evidence:** `rangeLiteralAndAlternativePatterns` semantic cases,
+`match-ranges-and-alternatives` corpus program.
+
+## PATT-025 — Covering every scalar value makes a match exhaustive
+
+**Status:** Confirmed
+
+Coverage of an integer, `char` or `bool` scrutinee is the set of values its unguarded literal and
+range arms select. When that set is every value the type holds, the match is exhaustive without
+`_`, and any later arm is unreachable. `char` covers `'\0'..='\u{D7FF}'` and `'\u{E000}'..`;
+the surrogate gap holds no value.
+
+```silk
+fn sign(v: i8) -> i32 {
+  return match v {
+    ..=-1 => -1
+    0 => 0
+    1.. => 1
+  }
+}
+```
+
+**Boundary:** A guarded arm covers nothing (MATCH-003). An arm whose every value earlier arms
+already select is unreachable even when it is not `_`.
+
+**Diagnostics:** A match that leaves a value uncovered reports `SEM0044`. An arm with no uncovered
+value reports `SEM0043`.
+
+**Evidence:** `match-range-gap` and `match-alternative-binding` invalid corpus programs.
