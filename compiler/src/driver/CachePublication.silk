@@ -187,6 +187,11 @@ effect fn named(directory: &Path, prefix: &[u8], digest: ContentHash) -> Path
   return run Path.joinBytes(directory, Bytes.asSlice(&name))
 }
 
+/// Names the immutable namespace incarnation. Writers use this exact directory and never
+/// recreate it, so clean/recreation cannot redirect an old lock holder into a new namespace.
+pub effect fn namespacePath(directory: &Path, incarnation: ContentHash) -> Path
+! FileError | OutOfMemoryError ? &mut Allocator { return run named(directory, b"incarnation-", incarnation) }
+
 /// Names an immutable generation descriptor by the digest of its complete encoded bytes.
 pub effect fn generationPath(directory: &Path, digest: ContentHash) -> Path
 ! FileError | OutOfMemoryError ? &mut Allocator { return run named(directory, b"generation-", digest) }
@@ -199,6 +204,14 @@ pub effect fn pinPath(directory: &Path, digest: ContentHash) -> Path
 pub effect fn initialize(directory: &Path, nonce: ContentHash) -> Option<ContentHash>
 ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
   run FileSystem.createDirectoriesRecursively(directory)
+  if let Option<ContentHash>.Some {value} = move run incarnation(directory) {
+    let existing = run namespacePath(directory, value)
+    if run FileSystem.exists(&existing) { return Option<ContentHash>.some(value) }
+    // Never resurrect an old incarnation directory after clean removed it.
+    return Option<ContentHash>.none()
+  }
+  let scoped = run namespacePath(directory, nonce)
+  run FileSystem.createDirectoriesRecursively(&scoped)
   let path = run Path.join(directory, "incarnation")
   let mut bytes = Bytes.make()
   run wordPair(&mut bytes, nonce)
@@ -247,16 +260,17 @@ pub fn takeGeneration(snapshot: &mut Snapshot) -> Option<Generation> {
 /// Immutable segment packets are loaded later while this returned owner remains alive.
 pub effect fn snapshot(directory: &Path, stamp: &[u8]) -> Option<Snapshot>
 ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  let lockPath = run Path.join(directory, "transaction.lock")
-  let lock = match move run pin(&lockPath) {
-    Option<Lease>.Some {value} => move value
-    _ => { return Option<Snapshot>.none() }
-  }
   let namespace = match move run incarnation(directory) {
     Option<ContentHash>.Some {value} => value
     _ => { return Option<Snapshot>.none() }
   }
-  let currentPath = run Path.join(directory, "current")
+  let scoped = run namespacePath(directory, namespace)
+  let lockPath = run Path.join(&scoped, "transaction.lock")
+  let lock = match move run pin(&lockPath) {
+    Option<Lease>.Some {value} => move value
+    _ => { return Option<Snapshot>.none() }
+  }
+  let currentPath = run Path.join(&scoped, "current")
   let bytes = run read(&currentPath)
   let mut expected = Token {incarnation: namespace, present: false, physical: zero()}
   let mut identity = Option<ContentHash>.none()
@@ -270,14 +284,14 @@ pub effect fn snapshot(directory: &Path, stamp: &[u8]) -> Option<Snapshot>
     _ => { return Option<Snapshot>.some(Snapshot {expected: expected,
       generation: Option<Generation>.none(), pin: Option<Lease>.none()}) }
   }
-  let leasePath = run pinPath(directory, identity)
+  let leasePath = run pinPath(&scoped, identity)
   let lease = match move run pin(&leasePath) {
     Option<Lease>.Some {value} => move value
     _ => { return Option<Snapshot>.none() }
   }
   // Publication can now proceed; it cannot reclaim this descriptor or its resource union.
   drop lock
-  let path = run generationPath(directory, identity)
+  let path = run generationPath(&scoped, identity)
   let descriptor = match move run read(&path) {
     Option<Bytes>.Some {value} => move value
     _ => { return Option<Snapshot>.some(Snapshot {expected: expected,
@@ -297,17 +311,80 @@ pub struct Writer {directory: Path, expected: Token, lock: Lease}
 /// Lock/read failure or a stale token never falls back to an unlocked write.
 pub effect fn begin(directory: &Path, expected: Token) -> Option<Writer>
 ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  let path = run Path.join(directory, "transaction.lock")
-  let lock = match move run transaction(&path) {
-    Option<Lease>.Some {value} => move value
-    _ => { return Option<Writer>.none() }
-  }
   let namespace = match move run incarnation(directory) {
     Option<ContentHash>.Some {value} => value
     _ => { return Option<Writer>.none() }
   }
-  let path = run Path.join(directory, "current")
+  if !ContentHash.equals(namespace, expected.incarnation) { return Option<Writer>.none() }
+  let scoped = run namespacePath(directory, namespace)
+  let path = run Path.join(&scoped, "transaction.lock")
+  let lock = match move run transaction(&path) {
+    Option<Lease>.Some {value} => move value
+    _ => { return Option<Writer>.none() }
+  }
+  let path = run Path.join(&scoped, "current")
   if !(run current(&path, namespace, expected)) { return Option<Writer>.none() }
-  return Option<Writer>.some(Writer {directory: run Path.fromBytes(Path.rawBytes(directory)),
+  return Option<Writer>.some(Writer {directory: move scoped,
     expected: expected, lock: move lock})
+}
+
+// The final publication step uses the Writer's bound incarnation path, never a path resolved
+// again through the mutable root marker. All immutable resources must already be admitted and
+// present before this private operation is reached by the prepared-publication layer.
+effect fn publishPointer(writer: &Writer, generation: ContentHash) -> ()
+! FileError | AtomicWriteError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let path = run Path.join(&writer.directory, "current")
+  let bytes = run pointer(writer.expected.incarnation, generation)
+  return run FileSystem.writeFileAtomic(&path, Bytes.asSlice(&bytes), FileSystem.replaceExisting(), FileSystem.buffered())
+}
+
+import silk.system.filesystem_machine {MachineFileSystem}
+import silk.testing.testing {Testing, AssertionError}
+
+effect fn recreationDuringTransaction(directory: &mut Path) -> ()
+! FileError | OutOfMemoryError | AssertionError<'static> ? &mut FileSystem | &mut Allocator {
+  let old = ContentHash {high: 31, low: 37}
+  let fresh = ContentHash {high: 41, low: 43}
+  drop run initialize(&directory.*, old)
+  let snapshot = match move run snapshot(&directory.*, b"stamp") {
+    Option<Snapshot>.Some {value} => move value
+    _ => { return run Testing.expect(false, "the initialized namespace has a snapshot") }
+  }
+  let writer = match move run begin(&directory.*, snapshot.expected) {
+    Option<Writer>.Some {value} => move value
+    _ => { return run Testing.expect(false, "the writer owns the old transaction before clean") }
+  }
+  // The old native lock is still held on its unlinked inode throughout clean and recreation.
+  run FileSystem.removeDirectoryRecursively(&directory.*)
+  drop run initialize(&directory.*, fresh)
+  let stale = run Effect.result(publishPointer(&writer, ContentHash {high: 47, low: 53}))
+  run Testing.expect(match &stale {
+    Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Failure {..} => true _ => false },
+    "a held old lock cannot publish through the newly created namespace path")
+  let newDirectory = run namespacePath(&directory.*, fresh)
+  let newCurrent = run Path.join(&newDirectory, "current")
+  let oldDirectory = run namespacePath(&directory.*, old)
+  run Testing.expect(!(run FileSystem.exists(&newCurrent)) && !(run FileSystem.exists(&oldDirectory)),
+    "old publication neither touches new current nor resurrects its removed incarnation")
+}
+
+effect fn recreationClaims() -> () ! FileError | OutOfMemoryError | AssertionError<'static>
+? &mut FileSystem | &mut Allocator {
+  let temporary = run Path.fromBytes(b"/tmp")
+  let root = run FileSystem.createTemporaryDirectory(&temporary, b"silk-cache-recreation-")
+  let use = effect fn(path: &mut Path) -> () ! FileError | OutOfMemoryError | AssertionError<'static>
+    ? &mut FileSystem | &mut Allocator { return run recreationDuringTransaction(&mut path.*) }
+  let release = effect fn(path: &mut Path) -> () ? &mut FileSystem | &mut Allocator {
+    drop run Effect.result(FileSystem.removeDirectoryRecursively(&path.*))
+  }
+  return run Effect.useReleaseNonParking(move root, move use, move release)
+}
+
+test effect fn heldGenerationTransactionCannotPublishIntoRecreatedNamespace() -> ()
+! FileError | OutOfMemoryError | AssertionError<'static> {
+  static if Intrinsic.targetOperatingSystem() == "linux" || Intrinsic.targetOperatingSystem() == "darwin" {
+    let mut allocator = Allocator.systemAllocatorProvider()
+    let mut files = run MachineFileSystem.make() |> Effect.provideMut<Allocator>(&mut allocator)
+    return run recreationClaims() |> Effect.provideMut<FileSystem>(&mut files) |> Effect.provideMut<Allocator>(&mut allocator)
+  } else { return () }
 }
