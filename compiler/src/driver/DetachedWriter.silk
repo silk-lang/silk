@@ -24,12 +24,46 @@ import silk.core.option {Option}
 import silk.core.ownership {Drop}
 import silk.mem.pointer {Pointer}
 
+/// Ownership of one writer process. Dropping it waits for that writer alone; [`detach`]
+/// releases that obligation for ordinary builds whose cache write may outlive the command.
+/// Synchronous writes return an already completed token.
+pub struct Completion { process: i32 }
+
+/// An already completed write, including platforms that save synchronously.
+pub fn completed() -> Completion { return Completion {process: -1} }
+
+/// Waits for and reaps this writer alone, retrying interrupted waits. Cache writes are best
+/// effort, so writer failure is not a build failure. Repeated joins do nothing.
+pub fn join(completion: &mut Completion) -> () {
+  let process = Intrinsic.replace(completion.process, -1)
+  if process <= 0 { return () }
+  static if Intrinsic.targetOperatingSystem() == "darwin" || Intrinsic.targetOperatingSystem() == "linux" {
+    let mut status: i32 = 0
+    let mut result = unsafe waitpid(process, Pointer.fromMutRef<i32>(&mut status), 0)
+    while result < 0 && unsafe currentError() == INTERRUPTED {
+      result = unsafe waitpid(process, Pointer.fromMutRef<i32>(&mut status), 0)
+    }
+  }
+}
+
+impl Drop for Completion {
+  fn drop(self: &mut Completion) -> () { join(&mut self.*) }
+}
+
+/// Leaves the writer running independently, preserving ordinary detached-cache behavior.
+pub fn detach(completion: Completion) -> () {
+  let mut owned = move completion
+  owned.process = -1
+}
+
 static if Intrinsic.targetOperatingSystem() == "darwin" || Intrinsic.targetOperatingSystem() == "linux" {
   @foreign(noCapture: .("path"))
   unsafe extern "C" fn open(path: ?[*]const u8, flags: i32, ...) -> i32
   unsafe extern "C" fn close(fd: i32) -> i32
   unsafe extern "C" fn flock(fd: i32, operation: i32) -> i32
   unsafe extern "C" fn fork() -> i32
+  @foreign(noCapture: .("status"))
+  unsafe extern "C" fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32
   unsafe extern "C" fn setsid() -> i32
   unsafe extern "C" fn dup2(from: i32, to: i32) -> i32
   unsafe extern "C" fn _exit(status: i32) -> ()
@@ -93,7 +127,7 @@ static if Intrinsic.targetOperatingSystem() == "darwin" || Intrinsic.targetOpera
   /// Where the write runs after [`handOff`].
   pub union Handoff {
     /// In the copy. The build returns without writing.
-    Original,
+    Original {pub completion: Completion},
     /// This is the copy: write, then call [`finish`].
     Copy {pub held: Held},
     /// No copy could start: write here, then drop the lock.
@@ -123,7 +157,7 @@ static if Intrinsic.targetOperatingSystem() == "darwin" || Intrinsic.targetOpera
   pub fn handOff(held: Held) -> Handoff {
     let child = unsafe fork()
     if child < 0 { return Handoff.Here {held: move held} }
-    if child > 0 { return Handoff.Original }
+    if child > 0 { return Handoff.Original {completion: Completion {process: child}} }
     let _detached = unsafe setsid()
     let empty = unsafe open(Pointer.fromSlice<u8>(b"/dev/null\0"), READ_WRITE)
     if empty < 0 { return finish(move held) }
@@ -178,7 +212,7 @@ static if Intrinsic.targetOperatingSystem() == "windows" {
   /// The process that owns the cache write. Windows writes synchronously under the lock here.
   pub union Handoff {
     /// The writer runs in another process.
-    Original,
+    Original {pub completion: Completion},
     /// A copied process owns the lock.
     Copy {pub held: Held},
     /// The calling process owns the lock and writes before returning.
@@ -233,7 +267,7 @@ static if Intrinsic.targetOperatingSystem() == "windows" {
   /// Where the write runs after [`handOff`].
   pub union Handoff {
     /// In the copy. The build returns without writing.
-    Original,
+    Original {pub completion: Completion},
     /// This is the copy: write, then call [`finish`].
     Copy {pub held: Held},
     /// No copy could start: write here, then drop the lock.
@@ -261,4 +295,51 @@ static if Intrinsic.targetOperatingSystem() == "windows" {
   }
 }
 
+}
+
+import silk.testing.testing {Testing, AssertionError}
+import silk.core.effect {Effect}
+import silk.core.result {Result}
+
+effect fn completionClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  static if Intrinsic.targetOperatingSystem() == "darwin" || Intrinsic.targetOperatingSystem() == "linux" {
+    let first = unsafe fork()
+    if first == 0 { unsafe _exit(0) return () }
+    run Testing.expect(first > 0, "the fixture starts its owned writer")
+    let mut completion = Completion {process: first}
+    let other = unsafe fork()
+    if other == 0 { unsafe _exit(7) return () }
+    join(&mut completion)
+    join(&mut completion)
+    let mut status: i32 = 0
+    let absent = unsafe waitpid(first, Pointer.fromMutRef<i32>(&mut status), 1)
+    let independent = if other > 0 { unsafe waitpid(other, Pointer.fromMutRef<i32>(&mut status), 0) } else { -1 }
+    run Testing.expect(absent < 0 && independent == other && other > 0,
+      "completion reaps its exact child once, without consuming an unrelated process")
+
+    let detached = unsafe fork()
+    if detached == 0 { unsafe _exit(0) return () }
+    run Testing.expect(detached > 0, "the fixture starts an ordinary detached writer")
+    detach(Completion {process: detached})
+    run Testing.expect(unsafe waitpid(detached, Pointer.fromMutRef<i32>(&mut status), 0) == detached,
+      "ordinary detach preserves the existing asynchronous ownership policy")
+
+    let failed = unsafe fork()
+    if failed == 0 { unsafe _exit(0) return () }
+    run Testing.expect(failed > 0, "the fixture starts a writer before an injected parent failure")
+    let failing = effect fn() -> () ! OutOfMemoryError {
+      let _owned = Completion {process: failed}
+      fail OutOfMemoryError {}
+    }
+    let attempted = run Effect.result(failing())
+    run Testing.expect(match &attempted { Result<(), OutOfMemoryError>.Failure {..} => true _ => false },
+      "the injected parent failure leaves through the cleanup path")
+    run Testing.expect(unsafe waitpid(failed, Pointer.fromMutRef<i32>(&mut status), 1) < 0,
+      "a parent failure still joins and reaps its owned writer")
+  }
+}
+
+test effect fn cacheCompletionOwnsOnlyItsWriterAndJoinsOnFailure() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run completionClaims() |> Effect.provideMut<Allocator>(&mut allocator)
 }
