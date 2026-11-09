@@ -57,6 +57,10 @@ import semantic.TypedBody {uncheckedReasonCount, uncheckedReasonName}
 import driver.ModuleSources as ModuleSourceFiles {InvalidBuildComposition, InvalidSourceRoot, MissingManifest, MissingStandardLibrary, ModuleSources, SourceSnapshot}
 import driver.GitCheckouts
 import driver.Packages as PackageSources {InvalidDependency}
+import driver.PackArchive as PackArchives {Packed, PackRefused}
+import silk.crypto.minisign as Minisign {MinisignError, MinisignSecretKey}
+import silk.system.random {Random}
+import silk.system.random_native {OsRandom}
 import driver.HeapRelease
 import driver.MemberChecks as MemberChecks {Captured as MemberCapture, Exited as MemberExit, Started as MemberStart}
 import driver.ManifestFields
@@ -100,7 +104,7 @@ import driver.BuildInputs
 import driver.CacheStamp
 import driver.SemanticCache as SemanticCache {CacheFile}
 import driver.ImportSummaries {ImportSummaries}
-import driver.ProjectCommand as ProjectCommands {Add as AddCommand, Build as BuildCommand, Check as CheckCommand, Clean as CleanCommand, Generate as GenerateCommand, Hash as HashCommand, Init as InitCommand, InvalidProjectCommand, Options as ProjectOptions, Remove as RemoveCommand, Run as RunCommand, Dump as DumpCommand, SourceBuild as SourceBuildCommand, SourceTest as SourceTestCommand, Test as TestCommand}
+import driver.ProjectCommand as ProjectCommands {Add as AddCommand, Build as BuildCommand, Check as CheckCommand, Clean as CleanCommand, Generate as GenerateCommand, Hash as HashCommand, Init as InitCommand, InvalidProjectCommand, Options as ProjectOptions, Pack as PackCommand, Remove as RemoveCommand, Run as RunCommand, Dump as DumpCommand, SourceBuild as SourceBuildCommand, SourceTest as SourceTestCommand, Test as TestCommand}
 import driver.ProjectProfile as ProjectProfiles {Code as ProfileCode}
 import driver.ProjectPlan as ProjectPlans {PlanError, ProjectPlan}
 import driver.ProjectInitializer as ProjectInitializers {InitializationError, Initialized, Kind as InitKind}
@@ -211,6 +215,7 @@ union Request {
   ProjectTest {command: TestCommand},
   Check {command: CheckCommand},
   Hash {command: HashCommand},
+  Pack {command: PackCommand},
   Help,
   Version,
 }
@@ -484,7 +489,7 @@ effect fn debugRequest(count: usize) -> RunCommand
 // The overview that `silk help` and `--help` print, and that a malformed command line repeats:
 // one line for each command, project commands first.
 fn usage() -> &'static [u8] {
-  return b"usage: silk <command> [options]\n\nProject commands:\n  init           Create a package or a workspace\n  build          Build the package or the workspace members\n  run            Build the package and run it\n  debug          Build the package and run it under a debugger\n  test           Run the package's tests\n  check          Report errors without building\n  hash           Print a digest of everything a build reads\n  format         Format Silk source and TOML files\n  clean          Remove the build directory\n  generate       Run the package's generators, or check their committed output\n  add            Add a path dependency\n  remove         Remove a dependency\n\nTools:\n  doc            Write the package's documentation as JSON\n  doctest        Check and run the examples in documentation comments\n  doc-reference  Write the standard library reference pages\n  lsp            Start the language server\n  dump           Print a source file's tokens, syntax tree, HIR or MIR\n  help           Show this help, or the options of one command\n\nOptions:\n  -h, --help     Show this help\n  -v, --version  Show the Silk version\n\nRun `silk help <command>` to see the options of a command.\n"
+  return b"usage: silk <command> [options]\n\nProject commands:\n  init           Create a package or a workspace\n  build          Build the package or the workspace members\n  run            Build the package and run it\n  debug          Build the package and run it under a debugger\n  test           Run the package's tests\n  check          Report errors without building\n  hash           Print a digest of everything a build reads\n  format         Format Silk source and TOML files\n  clean          Remove the build directory\n  pack           Check the package and write its release archives and checksums\n  generate       Run the package's generators, or check their committed output\n  add            Add a dependency on a package directory or a package archive URL\n  remove         Remove a dependency\n\nTools:\n  doc            Write the package's documentation as JSON\n  doctest        Check and run the examples in documentation comments\n  doc-reference  Write the standard library reference pages\n  lsp            Start the language server\n  dump           Print a source file's tokens, syntax tree, HIR or MIR\n  help           Show this help, or the options of one command\n\nOptions:\n  -h, --help     Show this help\n  -v, --version  Show the Silk version\n\nRun `silk help <command>` to see the options of a command.\n"
 }
 
 // The synopsis of every command that `silk.cli` does not describe, one `silk <command> ...` line
@@ -628,6 +633,17 @@ effect fn request() -> Request
         Result<GenerateCommand, InvalidProjectCommand | OutOfMemoryError>.Success {value} => Request.Generate {command: move value}
         Result<GenerateCommand, InvalidProjectCommand | OutOfMemoryError>.Failure {error} => match move error {
           InvalidProjectCommand invalid => run invalidCommand(b"generate", move invalid)
+          OutOfMemoryError exhausted => { fail move exhausted }
+        }
+      }
+    }
+    if same(Bytes.asSlice(&command), b"pack") {
+      let arguments = run commandArguments(count)
+      let parsed = run Effect.result(ProjectCommands.parsePack(List<Bytes>.asSlice(&arguments)))
+      return match move parsed {
+        Result<PackCommand, InvalidProjectCommand | OutOfMemoryError>.Success {value} => Request.Pack {command: move value}
+        Result<PackCommand, InvalidProjectCommand | OutOfMemoryError>.Failure {error} => match move error {
+          InvalidProjectCommand invalid => run invalidCommand(b"pack", move invalid)
           OutOfMemoryError exhausted => { fail move exhausted }
         }
       }
@@ -7013,6 +7029,457 @@ effect fn hashProject(working: &Path, command: HashCommand) -> i32
   return status
 }
 
+// `silk pack`: for each selected package that is released (`[package].publish` is not `false`),
+// checks its manifest and source as `silk check` does, then writes `<name>-<version>.tar.gz` to
+// `--output` or `build/package` and prints its path and SHA-256. A workspace selection skips
+// unreleased members; a package selected by name or alone that is not released is refused. With
+// `--list` it prints the files each archive would hold and writes nothing.
+effect fn packProject(working: &Path, command: PackCommand) -> i32
+! ApplicationError | InitialProfileProblem | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | InvalidDependency | MissingManifest | InvalidBuildComposition | MissingStandardLibrary | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
+? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types | &mut Writer {
+  let PackCommand {options, list, output, json, bin, sign, newKey} = move command
+  if ProjectCommands.conflicting(&options) {
+    run reportOptimizationConflict(&options)
+    return 2
+  }
+  if let Option<Bytes>.Some {value: keyPath} = &newKey {
+    let mut random = OsRandom.make()
+    return run newSigningKey(&run pathArgument(working, Bytes.asSlice(&keyPath))) |> Effect.provideMut<Random>(&mut random)
+  }
+  // `--list` writes nothing, so it reads no key.
+  let signer = if list { Option<MinisignSecretKey>.none() } else { match move run signingKey(working, &sign) {
+    Option<Option<MinisignSecretKey>>.Some {value} => move value
+    Option<Option<MinisignSecretKey>>.None => { return 2 }
+  } }
+  let selection = match move run selectProjects(working, &options) {
+    Option<Selection>.Some {value} => move value
+    Option<Selection>.None => { return 2 }
+  }
+  let standardLibrary = run standardLibraryFor(working, &options.standardLibrary)
+  let compiler = run CacheStamp.compiler()
+  let mut snapshot = ModuleSourceFiles.snapshot()
+  let settings = silentProgress()
+  let noEdits = Option<List<Edit>>.none()
+  // A workspace or `--workspace` packs its released members; naming a package asks for that one.
+  let named = List<Bytes>.length(&options.packages) > usize.ZERO
+  let projects = List<Project>.asSlice(&selection.projects)
+  let mut status = 0
+  let mut packedCount = usize.ZERO
+  let mut document = run Bytes.copy(b"{\"archives\":[")
+  let mut sums = List<SumsFile>.make()
+  let clang = if bin { run clangFor(working, &options.clang) } else { Option<Bytes>.none() }
+  let mut at = usize.ZERO
+  while at < projects.length {
+    let project = &projects[at]
+    at = at + usize.ONE
+    let manifest = run Projects.document(project)
+    if !PackArchives.publishes(&manifest) {
+      if selection.members && !named { continue }
+      let mut line = run Bytes.copy(b"silk pack: ")
+      run Bytes.append(&mut line, Projects.name(project))
+      run Bytes.append(&mut line, b" sets publish = false in [package], so it is not packed\n")
+      run writeError(Bytes.asSlice(&line))
+      status = worse(status, 1)
+      continue
+    }
+    let listed = run Effect.result(packFiles(project, &manifest))
+    let files = match move listed {
+      Result<List<Bytes>, PackRefused | FileError | TomlError | OutOfMemoryError>.Success {value} => move value
+      Result<List<Bytes>, PackRefused | FileError | TomlError | OutOfMemoryError>.Failure {error} => match move error {
+        PackRefused refused => {
+          run reportPackRefused(project, &refused)
+          status = worse(status, 1)
+          continue
+        }
+        FileError failure => { fail move failure }
+        TomlError malformed => { fail move malformed }
+        OutOfMemoryError exhausted => { fail move exhausted }
+      }
+    }
+    if list {
+      if projects.length > usize.ONE {
+        let mut header = run Bytes.copy(b"# ")
+        run Bytes.append(&mut header, Projects.name(project))
+        run Bytes.append(&mut header, b"\n")
+        run writeOutput(Bytes.asSlice(&header))
+      }
+      let names = List<Bytes>.asSlice(&files)
+      let mut one = usize.ZERO
+      while one < names.length {
+        let mut line = run Bytes.copy(Bytes.asSlice(&names[one]))
+        run Bytes.append(&mut line, b"\n")
+        run writeOutput(Bytes.asSlice(&line))
+        one = one + usize.ONE
+      }
+      continue
+    }
+    let mut memberTypes = TypeTable.make()
+    let checked = run memberStatus(run Effect.result(checkOne(project, &options, &standardLibrary, false, false, &settings, &noEdits, false, true, &compiler, &mut snapshot)
+      |> Effect.provideMut<Types>(&mut memberTypes)))
+    drop memberTypes
+    HeapRelease.release()
+    if checked != 0 {
+      status = worse(status, checked)
+      continue
+    }
+    let made = run Effect.result(PackArchives.archive(project, List<Bytes>.asSlice(&files)))
+    let packed = match move made {
+      Result<Packed, PackRefused | FileError | TomlError | OutOfMemoryError>.Success {value} => move value
+      Result<Packed, PackRefused | FileError | TomlError | OutOfMemoryError>.Failure {error} => match move error {
+        PackRefused refused => {
+          run reportPackRefused(project, &refused)
+          status = worse(status, 1)
+          continue
+        }
+        FileError failure => { fail move failure }
+        TomlError malformed => { fail move malformed }
+        OutOfMemoryError exhausted => { fail move exhausted }
+      }
+    }
+    let directory = match &output {
+      Option<Bytes>.Some {value} => run pathArgument(working, Bytes.asSlice(&value))
+      Option<Bytes>.None => run Path.join(Projects.outputDirectory(project), "package")
+    }
+    run FileSystem.createDirectoriesRecursively(&directory)
+    let mut label = run Bytes.copy(Projects.name(project))
+    run Bytes.append(&mut label, b" ")
+    run Bytes.append(&mut label, ManifestFields.version(&manifest))
+    let WrittenAsset {path, digest} = run writeAsset(&directory, Bytes.asSlice(&packed.fileName), Bytes.asSlice(&packed.bytes), Bytes.asSlice(&label), &signer, &mut sums)
+    // The documentation sits beside the archive, a release asset of its own that a build of the
+    // archive never reads.
+    let mut documentationPath = Option<Path>.none()
+    if let Option<Path>.Some {value: library} = &standardLibrary {
+      let mut documentationTypes = TypeTable.make()
+      let documented = run Effect.result(DocumentationCommand.packageDocumentation(project, run Path.fromBytes(Path.rawBytes(&library)))
+        |> Effect.provideMut<Types>(&mut documentationTypes))
+      drop documentationTypes
+      HeapRelease.release()
+      match move documented {
+        Result<Bytes, DocumentationError>.Success {value: encoded} => {
+          let mut name = run Bytes.copy(Bytes.asSlice(&packed.stem))
+          run Bytes.append(&mut name, b".docs.json")
+          let written = run writeAsset(&directory, Bytes.asSlice(&name), Bytes.asSlice(&encoded), Bytes.asSlice(&label), &signer, &mut sums)
+          documentationPath = Option<Path>.some(move written.path)
+        }
+        Result<Bytes, DocumentationError>.Failure {error} => {
+          status = worse(status, run DocumentationCommand.failed(b"pack", move error))
+          continue
+        }
+      }
+    }
+    // Binaries come from an executable; a library's archive is its only release asset.
+    let mut binaries = List<WrittenBinary>.make()
+    if bin && Projects.form(project) == Form.Executable {
+      let PackedBinaries {status: built, archives} = run packBinaries(project, &options, List<Bytes>.asSlice(&files), &directory, &standardLibrary, &clang, &compiler, Bytes.asSlice(&label), &signer, &mut sums)
+      status = worse(status, built)
+      binaries = move archives
+    }
+    if json {
+      if packedCount > usize.ZERO { run Bytes.append(&mut document, b",") }
+      run Bytes.append(&mut document, b"{\"name\":")
+      run JsonText.appendString(&mut document, Projects.name(project))
+      run Bytes.append(&mut document, b",\"version\":")
+      run JsonText.appendString(&mut document, ManifestFields.version(&manifest))
+      run Bytes.append(&mut document, b",\"path\":")
+      run JsonText.appendString(&mut document, Path.rawBytes(&path))
+      run Bytes.append(&mut document, b",\"sha256\":")
+      run JsonText.appendString(&mut document, Bytes.asSlice(&digest))
+      run Bytes.append(&mut document, b",\"documentation\":")
+      match &documentationPath {
+        Option<Path>.Some {value: written} => run JsonText.appendString(&mut document, Path.rawBytes(&written))
+        Option<Path>.None => run Bytes.append(&mut document, b"null")
+      }
+      run Bytes.append(&mut document, b",\"files\":[")
+      let names = List<Bytes>.asSlice(&files)
+      let mut one = usize.ZERO
+      while one < names.length {
+        if one > usize.ZERO { run Bytes.append(&mut document, b",") }
+        run JsonText.appendString(&mut document, Bytes.asSlice(&names[one]))
+        one = one + usize.ONE
+      }
+      run Bytes.append(&mut document, b"],\"binaries\":[")
+      let built = List<WrittenBinary>.asSlice(&binaries)
+      let mut each = usize.ZERO
+      while each < built.length {
+        if each > usize.ZERO { run Bytes.append(&mut document, b",") }
+        run Bytes.append(&mut document, b"{\"platform\":")
+        run JsonText.appendString(&mut document, Bytes.asSlice(&built[each].platform))
+        run Bytes.append(&mut document, b",\"path\":")
+        run JsonText.appendString(&mut document, Path.rawBytes(&built[each].path))
+        run Bytes.append(&mut document, b",\"sha256\":")
+        run JsonText.appendString(&mut document, Bytes.asSlice(&built[each].digest))
+        run Bytes.append(&mut document, b"}")
+        each = each + usize.ONE
+      }
+      run Bytes.append(&mut document, b"]}")
+    } else {
+      let mut line = run Bytes.copy(b"wrote ")
+      run Bytes.append(&mut line, Path.rawBytes(&path))
+      run Bytes.append(&mut line, b" (")
+      run appendCount(&mut line, packed.files)
+      run Bytes.append(&mut line, if packed.files == usize.ONE { b" file, " } else { b" files, " })
+      run appendCount(&mut line, Bytes.length(&packed.bytes))
+      run Bytes.append(&mut line, b" bytes)\nsha256 ")
+      run Bytes.append(&mut line, Bytes.asSlice(&digest))
+      run Bytes.append(&mut line, b"\n")
+      if let Option<Path>.Some {value: written} = &documentationPath {
+        run Bytes.append(&mut line, b"wrote ")
+        run Bytes.append(&mut line, Path.rawBytes(&written))
+        run Bytes.append(&mut line, b"\n")
+      }
+      let built = List<WrittenBinary>.asSlice(&binaries)
+      let mut each = usize.ZERO
+      while each < built.length {
+        run Bytes.append(&mut line, b"wrote ")
+        run Bytes.append(&mut line, Path.rawBytes(&built[each].path))
+        run Bytes.append(&mut line, b" (")
+        run appendCount(&mut line, built[each].size)
+        run Bytes.append(&mut line, b" bytes)\nsha256 ")
+        run Bytes.append(&mut line, Bytes.asSlice(&built[each].digest))
+        run Bytes.append(&mut line, b"\n")
+        each = each + usize.ONE
+      }
+      run writeOutput(Bytes.asSlice(&line))
+    }
+    packedCount = packedCount + usize.ONE
+  }
+  // Each output directory gets a `SHA256SUMS` of every asset this run wrote there.
+  let listed = List<SumsFile>.asSlice(&sums)
+  let mut one = usize.ZERO
+  while one < listed.length {
+    let sumsPath = run Path.join(&listed[one].directory, "SHA256SUMS")
+    run FileSystem.writeFile(&sumsPath, Bytes.asSlice(&listed[one].text))
+    if let Option<MinisignSecretKey>.Some {value: secret} = &signer {
+      run writeSignature(&sumsPath, Bytes.asSlice(&listed[one].text), b"SHA256SUMS", &secret)
+    }
+    one = one + usize.ONE
+  }
+  if json {
+    run Bytes.append(&mut document, b"]}\n")
+    run writeOutput(Bytes.asSlice(&document))
+  }
+  return status
+}
+
+// The `SHA256SUMS` text `silk pack` writes in one output directory, in `sha256sum` format.
+struct SumsFile {
+  directory: Path,
+  text: Bytes,
+}
+
+// One file `silk pack` wrote, and its SHA-256 in lowercase hexadecimal.
+struct WrittenAsset {
+  path: Path,
+  digest: Bytes,
+}
+
+// One binary archive `silk pack --bin` wrote: its `<target>[-<profile>]` platform, path, SHA-256
+// and size.
+struct WrittenBinary {
+  platform: Bytes,
+  path: Path,
+  digest: Bytes,
+  size: usize,
+}
+
+// The binary archives `silk pack --bin` wrote for one package, and the worst build status.
+struct PackedBinaries {
+  status: i32,
+  archives: List<WrittenBinary>,
+}
+
+// Writes `content` to `directory`/`name`, signs it with `signer` in `<name>.minisig` with the
+// trusted comment `<label> <name>`, and adds its line to the directory's `SHA256SUMS`.
+effect fn writeAsset(directory: &Path, name: &[u8], content: &[u8], label: &[u8], signer: &Option<MinisignSecretKey>, sums: &mut List<SumsFile>) -> WrittenAsset
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let path = run Path.joinBytes(directory, name)
+  run FileSystem.writeFile(&path, content)
+  if let Option<MinisignSecretKey>.Some {value: secret} = &signer.* {
+    let mut comment = run Bytes.copy(label)
+    run Bytes.append(&mut comment, b" ")
+    run Bytes.append(&mut comment, name)
+    run writeSignature(&path, content, Bytes.asSlice(&comment), &secret)
+  }
+  let mut digest = Bytes.make()
+  run appendSha256Hex(&mut digest, content)
+  let mut line = run Bytes.copy(Bytes.asSlice(&digest))
+  run Bytes.append(&mut line, b"  ")
+  run Bytes.append(&mut line, name)
+  run Bytes.append(&mut line, b"\n")
+  let files = List<SumsFile>.asMutSlice(&mut sums.*)
+  let mut at = usize.ZERO
+  while at < files.length {
+    if same(Path.rawBytes(&files[at].directory), Path.rawBytes(directory)) {
+      run Bytes.append(&mut files[at].text, Bytes.asSlice(&line))
+      return WrittenAsset {path: move path, digest: move digest}
+    }
+    at = at + usize.ONE
+  }
+  run List<SumsFile>.append(&mut sums.*, SumsFile {directory: run Path.fromBytes(Path.rawBytes(directory)), text: move line})
+  return WrittenAsset {path: move path, digest: move digest}
+}
+
+// Writes the minisign signature of the file `path` holding `content` to `<path>.minisig`.
+effect fn writeSignature(path: &Path, content: &[u8], comment: &[u8], secret: &MinisignSecretKey) -> ()
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let signature = match move run Minisign.sign(secret, content, comment) {
+    Result<Bytes, MinisignError>.Success {value} => move value
+    // Names of packed files hold no line break and stay far below the comment limit.
+    Result<Bytes, MinisignError>.Failure {..} => { fail OutOfMemoryError {} }
+  }
+  let mut signed = run Bytes.copy(Path.rawBytes(path))
+  run Bytes.append(&mut signed, b".minisig")
+  return run FileSystem.writeFile(&run Path.fromBytes(Bytes.asSlice(&signed)), Bytes.asSlice(&signature))
+}
+
+// The key `silk pack` signs with: the minisign secret key file `--sign` names, else the key text
+// of `SILK_SIGNING_KEY`, decrypted with `SILK_SIGNING_PASSWORD` when it is encrypted. `Some(None)`
+// signs nothing; `None` after reporting why the key cannot be read.
+effect fn signingKey(working: &Path, named: &Option<Bytes>) -> Option<Option<MinisignSecretKey>>
+! ApplicationError | FileError | HostInputError | OutOfMemoryError | WriterError ? &mut FileSystem | &mut HostInput | &mut Allocator {
+  let text = match &named.* {
+    Option<Bytes>.Some {value} => run FileSystem.readFile(&run pathArgument(working, Bytes.asSlice(&value)))
+    Option<Bytes>.None => match move run HostInput.variableNamed("SILK_SIGNING_KEY") {
+      Option<Bytes>.Some {value} => move value
+      Option<Bytes>.None => { return Option<Option<MinisignSecretKey>>.some(Option<MinisignSecretKey>.none()) }
+    }
+  }
+  let password = run HostInput.variableNamed("SILK_SIGNING_PASSWORD")
+  let given = match &password {
+    Option<Bytes>.Some {value} => Option<&[u8]>.some(Bytes.asSlice(&value))
+    Option<Bytes>.None => Option<&[u8]>.none()
+  }
+  return match move run Minisign.secretKey(Bytes.asSlice(&text), given) {
+    Result<MinisignSecretKey, MinisignError>.Success {value} => Option<Option<MinisignSecretKey>>.some(Option<MinisignSecretKey>.some(move value))
+    Result<MinisignSecretKey, MinisignError>.Failure {error} => {
+      let mut line = run Bytes.copy(b"silk pack: cannot sign: ")
+      run Bytes.append(&mut line, Minisign.describe(error))
+      if error == MinisignError.PasswordRequired { run Bytes.append(&mut line, b"; set SILK_SIGNING_PASSWORD") }
+      run Bytes.append(&mut line, b"\n")
+      run writeError(Bytes.asSlice(&line))
+      Option<Option<MinisignSecretKey>>.none()
+    }
+  }
+}
+
+// `silk pack --new-key <path>`: writes a new minisign secret key to `path`, encrypted with
+// `SILK_SIGNING_PASSWORD` when it is set, and its public key to `path` with `.key` replaced by, or
+// else followed by, `.pub`. Refuses to replace either file.
+effect fn newSigningKey(path: &Path) -> i32
+! FileError | HostInputError | OutOfMemoryError | WriterError ? &mut FileSystem | &mut HostInput | &mut Allocator | &mut Writer | &mut Random {
+  let secretPath = Path.rawBytes(path)
+  let mut publicText = Bytes.make()
+  if secretPath.length > 4 && same(Slice.view<u8>(secretPath, secretPath.length - 4, 4), b".key") {
+    run Bytes.append(&mut publicText, Slice.view<u8>(secretPath, usize.ZERO, secretPath.length - 4))
+  } else {
+    run Bytes.append(&mut publicText, secretPath)
+  }
+  run Bytes.append(&mut publicText, b".pub")
+  let publicPath = run Path.fromBytes(Bytes.asSlice(&publicText))
+  let secretExists = run FileSystem.exists(path)
+  let publicExists = run FileSystem.exists(&publicPath)
+  if secretExists || publicExists {
+    let mut line = run Bytes.copy(b"silk pack: ")
+    run Bytes.append(&mut line, if secretExists { secretPath } else { Bytes.asSlice(&publicText) })
+    run Bytes.append(&mut line, b" already exists; remove it or choose another path\n")
+    run writeError(Bytes.asSlice(&line))
+    return 2
+  }
+  let secret = run MinisignSecretKey.generate()
+  let password = run HostInput.variableNamed("SILK_SIGNING_PASSWORD")
+  let given = match &password {
+    Option<Bytes>.Some {value} => Option<&[u8]>.some(Bytes.asSlice(&value))
+    Option<Bytes>.None => Option<&[u8]>.none()
+  }
+  if let Option<Path>.Some {value: directory} = move run Path.parent(path) {
+    run FileSystem.createDirectoriesRecursively(&directory)
+  }
+  run FileSystem.writeFile(path, Bytes.asSlice(&run Minisign.secretKeyFile(&secret, given)))
+  run FileSystem.writeFile(&publicPath, Bytes.asSlice(&run Minisign.publicKeyFile(&secret)))
+  let mut line = run Bytes.copy(b"wrote ")
+  run Bytes.append(&mut line, secretPath)
+  if Option<Bytes>.isNone(&password) { run Bytes.append(&mut line, b" (not encrypted; set SILK_SIGNING_PASSWORD to encrypt it)") }
+  run Bytes.append(&mut line, b"\nwrote ")
+  run Bytes.append(&mut line, Bytes.asSlice(&publicText))
+  run Bytes.append(&mut line, b"\nkey id ")
+  run Bytes.append(&mut line, &secret.idText())
+  run Bytes.append(&mut line, b"\npublic key ")
+  run Bytes.append(&mut line, &secret.publicKeyText())
+  run Bytes.append(&mut line, b"\n")
+  run writeOutput(Bytes.asSlice(&line))
+  return 0
+}
+
+// `silk pack --bin` for one executable package: builds each planned target as `silk build` does
+// and writes its binary archive (see `PackArchive.binaryArchive`) to `directory`. A named profile
+// joins the target in the archive's name.
+effect fn packBinaries(project: &Project, options: &ProjectOptions, files: &[Bytes], directory: &Path, standardLibrary: &Option<Path>, clang: &Option<Bytes>, compiler: &Option<Bytes>, label: &[u8], signer: &Option<MinisignSecretKey>, sums: &mut List<SumsFile>) -> PackedBinaries
+! ApplicationError | InitialProfileProblem | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | InvalidDependency | MissingManifest | InvalidBuildComposition | MissingStandardLibrary | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
+? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types | &mut Writer {
+  let mut archives = List<WrittenBinary>.make()
+  let mut plans = match move run projectPlans(project, options, Projects.targets(project)) {
+    Option<List<ProjectPlan>>.Some {value} => move value
+    Option<List<ProjectPlan>>.None => { return PackedBinaries {status: 2, archives: move archives} }
+  }
+  let packages = run progressSettings(options, usize.ONE)
+  let settings = unitSettings(&packages, List<ProjectPlan>.length(&plans))
+  let mut status = 0
+  while List<ProjectPlan>.length(&plans) > usize.ZERO {
+    let plan = List<ProjectPlan>.remove(&mut plans, usize.ZERO)
+    let artifact = run buildProjectTarget(project, move plan, standardLibrary, clang, true, false, &settings, compiler)
+    if artifact.status != 0 {
+      status = worse(status, artifact.status)
+      continue
+    }
+    let mut platform = run Bytes.copy(Target.name(&artifact.target))
+    if let Option<Bytes>.Some {value} = &options.profile {
+      run Bytes.append(&mut platform, b"-")
+      run Bytes.append(&mut platform, Bytes.asSlice(&value))
+    }
+    let made = run Effect.result(PackArchives.binaryArchive(project, Bytes.asSlice(&platform), &artifact.path, files))
+    let packed = match move made {
+      Result<Packed, PackRefused | FileError | TomlError | OutOfMemoryError>.Success {value} => move value
+      Result<Packed, PackRefused | FileError | TomlError | OutOfMemoryError>.Failure {error} => match move error {
+        PackRefused refused => {
+          run reportPackRefused(project, &refused)
+          status = worse(status, 1)
+          continue
+        }
+        FileError failure => { fail move failure }
+        TomlError malformed => { fail move malformed }
+        OutOfMemoryError exhausted => { fail move exhausted }
+      }
+    }
+    let WrittenAsset {path, digest} = run writeAsset(directory, Bytes.asSlice(&packed.fileName), Bytes.asSlice(&packed.bytes), label, signer, &mut sums.*)
+    run List<WrittenBinary>.append(&mut archives, WrittenBinary {platform: move platform, path: move path, digest: move digest, size: Bytes.length(&packed.bytes)})
+  }
+  return PackedBinaries {status: status, archives: move archives}
+}
+
+// The files of `project`'s archive, after checking its manifest `document` can be packed.
+effect fn packFiles(project: &Project, document: &TomlValue) -> List<Bytes>
+! PackRefused | FileError | TomlError | OutOfMemoryError
+? &mut FileSystem | &mut Allocator {
+  run PackArchives.checkManifest(document)
+  return run PackArchives.files(project)
+}
+
+effect fn reportPackRefused(project: &Project, refused: &PackRefused) -> () ! WriterError | OutOfMemoryError ? &mut Allocator {
+  let mut line = run Bytes.copy(b"silk pack: ")
+  run Bytes.append(&mut line, Projects.name(project))
+  run Bytes.append(&mut line, b": ")
+  run Bytes.append(&mut line, Bytes.asSlice(&refused.detail))
+  run Bytes.append(&mut line, b"\n")
+  return run writeError(Bytes.asSlice(&line))
+}
+
+// Appends `value` in decimal.
+effect fn appendCount(out: &mut Bytes, value: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  if value >= usize.add(0, 10) { run appendCount(&mut out.*, usize.divide(value, usize.add(0, 10))) }
+  let digit: [u8; 1] = [usize.toU8(usize.add(0, 48) + usize.remainder(value, usize.add(0, 10)))]
+  return run Bytes.append(&mut out.*, &digit)
+}
+
 // What `silk hash` reads for one project: the text it digests, and the artifact each planned build
 // writes (none for a library, whose build only checks it).
 struct HashedProject {
@@ -7864,12 +8331,14 @@ effect fn rootPackage(directory: &Path, document: &TomlValue) -> RootPackage ! F
 }
 
 // Adds the package at `command.path` to the located manifest's `[dependencies]`, by the path
-// from the manifest's directory, under `--name` or else its package name with `-` spelled `_`.
+// from the manifest's directory, under `--name` or else its package name with `-` spelled `_`. A
+// URL instead names the package's archive: it is downloaded into the archive store and added by
+// its URL and SHA-256.
 // The edited manifest's dependencies are loaded and checked before it is written.
 effect fn addedDependency(working: &Path, command: AddCommand, store: Option<&Path>) -> ()
 ! ApplicationError | ProjectError | InvalidDependency | ManifestEditRefused | FileError | OutOfMemoryError | WriterError
-? &mut FileSystem | &mut Allocator | &mut Writer {
-  let AddCommand {path, name, manifestPath} = move command
+? &mut FileSystem | &mut HostInput | &mut Allocator | &mut Writer {
+  let AddCommand {path, sha256: expected, name, manifestPath} = move command
   let manifest = run manifestFor(working, &manifestPath)
   let document = run Projects.parsed(&manifest)
   drop run packageTable(&manifest, &document)
@@ -7877,7 +8346,65 @@ effect fn addedDependency(working: &Path, command: AddCommand, store: Option<&Pa
     Option<Path>.Some {value} => move value
     Option<Path>.None => run Path.root()
   }
-  let dependency = run pathArgument(working, Bytes.asSlice(&path))
+  // A URL names a package archive: it is downloaded into the archive store and pinned by its
+  // SHA-256, as a build would fetch it.
+  let archived = PackageSources.isArchiveUrl(Bytes.asSlice(&path))
+  let mut digest = Bytes.make()
+  let dependency = if archived {
+    let url = Bytes.asSlice(&path)
+    let body = match move run Effect.result(NativeArchives.retrieve(url)) {
+      Result<Result<Bytes, Bytes>, FileError | HostInputError | OutOfMemoryError>.Success {value} => match move value {
+        Result<Bytes, Bytes>.Success {value: content} => move content
+        Result<Bytes, Bytes>.Failure {error} => {
+          let mut reason = run Bytes.copy(b"cannot fetch ")
+          run Bytes.append(&mut reason, url)
+          run Bytes.append(&mut reason, b": ")
+          run Bytes.append(&mut reason, Bytes.asSlice(&error))
+          run refusedDependency(url, Bytes.asSlice(&reason))
+        }
+      }
+      Result<Result<Bytes, Bytes>, FileError | HostInputError | OutOfMemoryError>.Failure {error} => match move error {
+        FileError failure => { fail move failure }
+        HostInputError unread => { drop unread run refusedDependency(url, b"the proxy or certificate settings in the environment cannot be read") }
+        OutOfMemoryError exhausted => { fail move exhausted }
+      }
+    }
+    digest = run NativeArchives.sha256Hex(Bytes.asSlice(&body))
+    if let Option<Bytes>.Some {value: pinned} = &expected {
+      if !same(Bytes.asSlice(&pinned), Bytes.asSlice(&digest)) {
+        let mut reason = run Bytes.copy(b"the archive has SHA-256 ")
+        run Bytes.append(&mut reason, Bytes.asSlice(&digest))
+        run Bytes.append(&mut reason, b", not the ")
+        run Bytes.append(&mut reason, Bytes.asSlice(&pinned))
+        run Bytes.append(&mut reason, b" --sha256 expects")
+        run refusedDependency(url, Bytes.asSlice(&reason))
+      }
+    }
+    let checkouts = match &store {
+      Option<&Path>.Some {value} => value
+      Option<&Path>.None => run refusedDependency(url, b"there is no archive store to download it into: set SILK_HOME or HOME")
+    }
+    let extracted = match move run PackageSources.archiveDirectory(checkouts, Bytes.asSlice(&digest)) {
+      Option<Path>.Some {value} => move value
+      Option<Path>.None => run refusedDependency(url, b"there is no archive store to download it into: set SILK_HOME or HOME")
+    }
+    // The digest names the content, so an archive already in the store is the same one.
+    let mut markerText = run Bytes.copy(Path.rawBytes(&extracted))
+    run Bytes.append(&mut markerText, b".fetched")
+    let marker = run Path.fromBytes(Bytes.asSlice(&markerText))
+    let present = run FileSystem.exists(&marker)
+    if !present {
+      if let Option<Bytes>.Some {value: failure} = move run NativeArchives.store(url, url, Bytes.asSlice(&body), &extracted, usize.ZERO) {
+        run refusedDependency(url, Bytes.asSlice(&failure))
+      }
+    }
+    run PackageSources.archiveRoot(move extracted)
+  } else {
+    if let Option<Bytes>.Some {..} = &expected {
+      run refusedDependency(Bytes.asSlice(&path), b"--sha256 checks an archive URL; a package directory has no archive")
+    }
+    run pathArgument(working, Bytes.asSlice(&path))
+  }
   let dependencyManifest = run Path.join(&dependency, "silk.toml")
   let dependencyDocument = run Projects.parsed(&dependencyManifest)
   run notWorkspace(Bytes.asSlice(&path), &dependencyDocument)
@@ -7896,13 +8423,21 @@ effect fn addedDependency(working: &Path, command: AddCommand, store: Option<&Pa
   if hasDependency(&document, dependencyKey) {
     return run refusedDependency(dependencyKey, b"the package already has a dependency of that name")
   }
-  let relative = run CommandPath.relative(&directory, &dependency)
-  if Bytes.length(&relative) == usize.ZERO {
-    return run refusedDependency(dependencyKey, b"a package cannot depend on itself")
+  let mut value = Bytes.make()
+  if archived {
+    run Bytes.append(&mut value, b"{ url = ")
+    run Bytes.append(&mut value, Bytes.asSlice(&run ManifestEdits.quoted(Bytes.asSlice(&path))))
+    run Bytes.append(&mut value, b", sha256 = ")
+    run Bytes.append(&mut value, Bytes.asSlice(&run ManifestEdits.quoted(Bytes.asSlice(&digest))))
+  } else {
+    let relative = run CommandPath.relative(&directory, &dependency)
+    if Bytes.length(&relative) == usize.ZERO {
+      return run refusedDependency(dependencyKey, b"a package cannot depend on itself")
+    }
+    run Bytes.append(&mut value, b"{ path = ")
+    let quotedPath = run ManifestEdits.quoted(Bytes.asSlice(&relative))
+    run Bytes.append(&mut value, Bytes.asSlice(&quotedPath))
   }
-  let mut value = run Bytes.copy(b"{ path = ")
-  let quotedPath = run ManifestEdits.quoted(Bytes.asSlice(&relative))
-  run Bytes.append(&mut value, Bytes.asSlice(&quotedPath))
   if !same(dependencyKey, packageName) {
     let quotedPackage = run ManifestEdits.quoted(packageName)
     run Bytes.append(&mut value, b", package = ")
@@ -8338,6 +8873,12 @@ effect fn program() -> i32
     Request.Check {command: invocation} => {
       let mut process = OsChildProcess.make()
       return run checkProject(&working, move invocation)
+        |> Effect.provideMut<FileSystem>(&mut files)
+        |> Effect.provideMut<ChildProcess>(&mut process)
+    }
+    Request.Pack {command: invocation} => {
+      let mut process = OsChildProcess.make()
+      return run packProject(&working, move invocation)
         |> Effect.provideMut<FileSystem>(&mut files)
         |> Effect.provideMut<ChildProcess>(&mut process)
     }
