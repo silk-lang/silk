@@ -4,10 +4,15 @@
 
 import semantic.ContentHash {ContentHash}
 import semantic.CacheGeneration as Generations {Generation}
+import semantic.CacheSegments as Segments {SealedSegment, Descriptor}
+import semantic.CacheView as Views {View}
+import semantic.InternIndex {InternIndex}
 import semantic.RuntimeEncoding as Encoding
 import semantic.StableKey
 import lexer.Span {Span}
 import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.mem.frozen {Frozen}
 import silk.core.effect {Effect}
 import silk.core.option {Option}
 import silk.core.ownership {Copy, Drop}
@@ -133,6 +138,8 @@ pub effect fn transaction(path: &Path) -> Option<Lease> ! OutOfMemoryError ? &mu
   return run acquire(path, true, true)
 }
 /// Tries to retire an old generation without blocking a live reader or writer pin.
+/// Pin-file inodes must remain for the whole incarnation, even after resource retirement;
+/// unlinking and reopening a pin could split live owners across two unrelated native locks.
 pub effect fn tryRetire(path: &Path) -> Option<Lease> ! OutOfMemoryError ? &mut Allocator {
   return run acquire(path, true, false)
 }
@@ -211,8 +218,23 @@ pub effect fn initialize(directory: &Path, nonce: ContentHash) -> Option<Content
     // Never resurrect an old incarnation directory after clean removed it.
     return Option<ContentHash>.none()
   }
+  let markerPath = run Path.join(directory, "incarnation")
+  if let Option<Bytes>.Some {value} = move run read(&markerPath) {
+    drop value
+    return Option<ContentHash>.none()
+  }
   let scoped = run namespacePath(directory, nonce)
   run FileSystem.createDirectoriesRecursively(&scoped)
+  // Initialize accounting before exposing the namespace. A missing ledger in an existing
+  // incarnation is corruption, not permission to start counting from zero.
+  let ledgerPath = run Path.join(&scoped, "space")
+  let ledger = run spacePacket(nonce, 1024)
+  let initialized = run Effect.result(FileSystem.writeFileAtomic(&ledgerPath, Bytes.asSlice(&ledger),
+    FileSystem.createNew(), FileSystem.synchronized()))
+  match move initialized {
+    Result<(), AtomicWriteError>.Success {..} => {}
+    Result<(), AtomicWriteError>.Failure {error} => { drop error return Option<ContentHash>.none() }
+  }
   let path = run Path.join(directory, "incarnation")
   let mut bytes = Bytes.make()
   run wordPair(&mut bytes, nonce)
@@ -246,6 +268,10 @@ pub struct Snapshot {
   pub expected: Token,
   generation: Option<Generation>,
   pin: Option<Lease>,
+  directory: Path,
+  inheritedSegments: Digests,
+  inheritedPacks: Digests,
+  refusedPacks: Digests,
 }
 
 /// Moves the decoded generation into a lazy semantic view while retaining its OS pin.
@@ -279,7 +305,8 @@ pub effect fn snapshot(directory: &Path, stamp: &[u8]) -> Option<Snapshot>
   let chosen = match move identity {
     Option<ContentHash>.Some {value} => value
     _ => { return Option<Snapshot>.some(Snapshot {expected: expected,
-      generation: Option<Generation>.none(), pin: Option<Lease>.none()}) }
+      generation: Option<Generation>.none(), pin: Option<Lease>.none(), directory: move scoped,
+      inheritedSegments: digests(), inheritedPacks: digests(), refusedPacks: digests()}) }
   }
   let leasePath = run pinPath(&scoped, chosen)
   let lease = match move run pin(&leasePath) {
@@ -292,12 +319,14 @@ pub effect fn snapshot(directory: &Path, stamp: &[u8]) -> Option<Snapshot>
   let descriptor = match move run read(&path) {
     Option<Bytes>.Some {value} => move value
     _ => { return Option<Snapshot>.some(Snapshot {expected: expected,
-      generation: Option<Generation>.none(), pin: Option<Lease>.some(move lease)}) }
+      generation: Option<Generation>.none(), pin: Option<Lease>.some(move lease), directory: move scoped,
+      inheritedSegments: digests(), inheritedPacks: digests(), refusedPacks: digests()}) }
   }
   let valid = ContentHash.equals(ContentHash.of(Bytes.asSlice(&descriptor)), chosen)
   let generation = if valid { run Generations.decode(Bytes.asSlice(&descriptor), stamp) } else { Option<Generation>.none() }
   return Option<Snapshot>.some(Snapshot {expected: expected, generation: move generation,
-    pin: Option<Lease>.some(move lease)})
+    pin: Option<Lease>.some(move lease), directory: move scoped,
+    inheritedSegments: digests(), inheritedPacks: digests(), refusedPacks: digests()})
 }
 
 /// Exclusive ownership of a publication whose prior physical state has been checked.
@@ -333,6 +362,276 @@ effect fn publishPointer(writer: &Writer, generation: ContentHash) -> ()
   let path = run Path.join(&writer.directory, "current")
   let bytes = run pointer(writer.expected.incarnation, generation)
   return run FileSystem.writeFileAtomic(&path, Bytes.asSlice(&bytes), FileSystem.replaceExisting(), FileSystem.buffered())
+}
+
+// Only the loader can establish inherited provenance. These small identity sets do not copy
+// segment packets, observations, graph nodes, answers, or pack bodies.
+struct Digests {values: List<ContentHash>, index: InternIndex}
+fn digests() -> Digests { return Digests {values: List<ContentHash>.make(), index: InternIndex.make()} }
+fn contains(values: &Digests, digest: ContentHash) -> bool {
+  let entries = List<ContentHash>.asSlice(&values.values)
+  let mut at = InternIndex.first(&values.index, digest.low)
+  while at != usize.MAX {
+    if ContentHash.equals(entries[at], digest) { return true }
+    at = InternIndex.after(&values.index, at)
+  }
+  return false
+}
+effect fn remember(values: &mut Digests, digest: ContentHash) -> () ! OutOfMemoryError ? &mut Allocator {
+  if contains(values, digest) { return () }
+  run InternIndex.record(&mut values.index, digest.low)
+  return run List<ContentHash>.append(&mut values.values, digest)
+}
+
+/// The exact sealed segment object in a namespace; its filename digest is the segment seal.
+pub effect fn segmentPath(directory: &Path, digest: ContentHash) -> Path
+! FileError | OutOfMemoryError ? &mut Allocator { return run named(directory, b"segment-", digest) }
+/// A native pack object named by the digest of its full payload.
+pub effect fn packPath(directory: &Path, digest: ContentHash) -> Path
+! FileError | OutOfMemoryError ? &mut Allocator { return run named(directory, b"pack-", digest) }
+
+/// Loads sealed packets under the snapshot pin and admits their selected authority exactly once.
+/// Each packet remains its original owned bytes; no answers or graph payloads are flattened.
+/// The returned view may be moved into Semantic while `snapshot` keeps its filesystem pin.
+pub effect fn load(snapshot: &mut Snapshot) -> Option<View>
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let generation = match move takeGeneration(&mut snapshot.*) {
+    Option<Generation>.Some {value} => move value
+    Option<Generation>.None => { return Option<View>.none() }
+  }
+  let mut owners = List<Frozen<SealedSegment>>.make()
+  let catalog = List<Descriptor>.asSlice(&generation.catalog)
+  let mut at = usize.ZERO
+  while at < catalog.length {
+    let path = run segmentPath(&snapshot.directory, catalog[at].digest)
+    let bytes = match move run read(&path) {
+      Option<Bytes>.Some {value} => move value
+      Option<Bytes>.None => { return Option<View>.none() }
+    }
+    let sealed = match move run Segments.open(move bytes, Bytes.asSlice(&generation.stamp)) {
+      Option<SealedSegment>.Some {value} => move value
+      Option<SealedSegment>.None => { return Option<View>.none() }
+    }
+    if !Segments.sameDescriptor(Segments.descriptor(&sealed), catalog[at]) { return Option<View>.none() }
+    // This loader runs on the owner thread. Future prefetch must join raw-byte workers before
+    // freezing; Frozen handles must never cross a native thread boundary.
+    run List<Frozen<SealedSegment>>.append(&mut owners, run Frozen<SealedSegment>.make(move sealed))
+    at = at + usize.ONE
+  }
+  drop catalog
+  let view = match move run Views.make(move generation, move owners) {
+    Option<View>.Some {value} => move value
+    Option<View>.None => { return Option<View>.none() }
+  }
+  let held = Views.segments(&view)
+  let mut knownSegments = digests()
+  at = usize.ZERO
+  while at < held.length {
+    run remember(&mut knownSegments, Segments.descriptor(Frozen<SealedSegment>.get(&held[at])).digest)
+    at = at + usize.ONE
+  }
+  let mut knownPacks = digests()
+  let packs = Views.requiredPacks(&view)
+  at = usize.ZERO
+  while at < packs.length { run remember(&mut knownPacks, packs[at]) at = at + usize.ONE }
+  // Commit provenance together only after all allocating validation succeeds. Pack bodies are
+  // lazy: protocol publication made them present, and this generation pin prevents reclamation.
+  snapshot.inheritedSegments = move knownSegments
+  snapshot.inheritedPacks = move knownPacks
+  return Option<View>.some(move view)
+}
+
+/// Loads one admitted pack on demand. Missing or corrupt external bytes refuse reuse and revoke
+/// inherited presence, so a subsequent writer needs repaired bytes for any still-selected answer.
+pub effect fn readPack(snapshot: &mut Snapshot, digest: ContentHash) -> Option<Bytes>
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  if !contains(&snapshot.inheritedPacks, digest) { return Option<Bytes>.none() }
+  let path = run packPath(&snapshot.directory, digest)
+  if let Option<Bytes>.Some {value} = move run read(&path) {
+    if ContentHash.equals(ContentHash.of(Bytes.asSlice(&value)), digest) { return Option<Bytes>.some(move value) }
+  }
+  run remember(&mut snapshot.refusedPacks, digest)
+  return Option<Bytes>.none()
+}
+
+/// Borrowed new or repaired pack bytes. Publication never copies these payloads.
+pub struct Pack<'a> {pub digest: ContentHash, pub bytes: &'a [u8]}
+
+/// A refused transaction leaves the old complete generation and every reachable object intact.
+pub enum Refusal {Stale, Invalid, MissingPack, Space, Accounting}
+/// A successful pointer may be visible even if the final atomic-write cleanup reported an error.
+/// All objects remain retained in either result; no caller should delete them on a later error.
+pub union Published {
+  Committed {generation: ContentHash, token: Token, warning: Option<AtomicWriteError>},
+  Refused {reason: Refusal},
+}
+
+// This is an upper bound on stored payload bytes, including retired pinned generations,
+// unpublished files and temporary atomic-write payloads. It is not an OS free-space estimate.
+// Failed staging retains its reservation. Bounded maintenance may later retire proven-dead
+// resources and release their charge; no publication performs an unbounded directory scan.
+effect fn spacePacket(incarnation: ContentHash, used: u64) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut bytes = Bytes.make()
+  run Encoding.field(&mut bytes, b"silk-generation-space-v1")
+  run wordPair(&mut bytes, incarnation)
+  run Encoding.word(&mut bytes, used)
+  let seal = ContentHash.of(Bytes.asSlice(&bytes))
+  run wordPair(&mut bytes, seal)
+  return move bytes
+}
+fn readSpace(bytes: &[u8], incarnation: ContentHash) -> Option<u64> {
+  if bytes.length < 16 || bytes.length > 256 { return Option<u64>.none() }
+  let mut reader = StableKey.reader()
+  let magic = StableKey.readField(bytes, &mut reader)
+  let namespace = readPair(bytes, &mut reader)
+  let used = StableKey.readWord(bytes, &mut reader)
+  let seal = readPair(bytes, &mut reader)
+  if !StableKey.finished(bytes, &reader) || !same(StableKey.view(bytes, magic), b"silk-generation-space-v1")
+    || !ContentHash.equals(namespace, incarnation)
+    || !ContentHash.equals(seal, ContentHash.of(StableKey.view(bytes, Span.make(usize.ZERO, bytes.length - 16)))) {
+    return Option<u64>.none()
+  }
+  return Option<u64>.some(used)
+}
+fn charge(total: &mut u64, amount: usize) -> bool {
+  let added = usize.toU64(amount)
+  if total.* > u64.MAX - added { return false }
+  total.* = total.* + added
+  return true
+}
+// Missing/malformed ledgers refuse: a current pointer cannot authorize resetting physical debt.
+effect fn reserve(writer: &Writer, amount: u64, limit: u64) -> Option<Refusal>
+! FileError | AtomicWriteError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let path = run Path.join(&writer.directory, "space")
+  let packet = match move run read(&path) {
+    Option<Bytes>.Some {value} => move value
+    Option<Bytes>.None => { return Option<Refusal>.some(Refusal.Accounting) }
+  }
+  let used = match move readSpace(Bytes.asSlice(&packet), writer.expected.incarnation) {
+    Option<u64>.Some {value} => value
+    Option<u64>.None => { return Option<Refusal>.some(Refusal.Accounting) }
+  }
+  if used > limit || amount > limit - used { return Option<Refusal>.some(Refusal.Space) }
+  let next = run spacePacket(writer.expected.incarnation, used + amount)
+  // Reserve durably before any new resource is created. A post-rename error aborts staging,
+  // preserving the conservative charge even if the ledger itself became visible.
+  run FileSystem.writeFileAtomic(&path, Bytes.asSlice(&next), FileSystem.replaceExisting(), FileSystem.synchronized())
+  return Option<Refusal>.none()
+}
+
+effect fn store(path: &Path, bytes: &[u8]) -> ()
+! FileError | AtomicWriteError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  if let Option<Bytes>.Some {value} = move run read(path) {
+    if same(Bytes.asSlice(&value), bytes) { return () }
+  }
+  // A colliding pathname is not proof of valid content. Exact trusted bytes repair corruption;
+  // atomic replacement preserves readers of the previous inode and never exposes a short file.
+  return run FileSystem.writeFileAtomic(path, bytes, FileSystem.replaceExisting(), FileSystem.buffered())
+}
+fn offered(packs: &[Pack<'_>], index: &InternIndex, digest: ContentHash) -> usize {
+  let mut at = InternIndex.first(index, digest.low)
+  while at != usize.MAX {
+    if ContentHash.equals(packs[at].digest, digest) { return at }
+    at = InternIndex.after(index, at)
+  }
+  return usize.MAX
+}
+
+/// Publishes an already-admitted view under an exclusive expected-prior transaction. The source
+/// snapshot remains pinned throughout this call; only fresh sealed objects and offered repairs
+/// are written. Pack authority comes from every selected answer, not this invocation's units.
+/// `limit` bounds conservatively reserved stored payload bytes, including failed/retired work.
+/// No resources are removed here. Maintenance must prove reachability and obtain retirement pins
+/// before deleting anything or reducing the reservation ledger.
+pub effect fn publish(writer: Writer, source: &Snapshot, view: &View, packs: &[Pack<'_>], limit: u64) -> Published
+! FileError | AtomicWriteError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  if !sameToken(writer.expected, source.expected) || !same(Path.rawBytes(&writer.directory), Path.rawBytes(&source.directory)) {
+    return Published.Refused {reason: Refusal.Stale}
+  }
+  let currentPath = run Path.join(&writer.directory, "current")
+  if !(run current(&currentPath, writer.expected.incarnation, writer.expected)) { return Published.Refused {reason: Refusal.Stale} }
+  let descriptor = match move run Generations.encode(Views.generation(view)) {
+    Option<Bytes>.Some {value} => move value
+    Option<Bytes>.None => { return Published.Refused {reason: Refusal.Invalid} }
+  }
+  let identity = ContentHash.of(Bytes.asSlice(&descriptor))
+  let pointerBytes = run pointer(writer.expected.incarnation, identity)
+  let mut packIndex = InternIndex.make()
+  let mut at = usize.ZERO
+  while at < packs.length {
+    if offered(packs, &packIndex, packs[at].digest) != usize.MAX
+      || !ContentHash.equals(ContentHash.of(packs[at].bytes), packs[at].digest) { return Published.Refused {reason: Refusal.Invalid} }
+    run InternIndex.record(&mut packIndex, packs[at].digest.low)
+    at = at + usize.ONE
+  }
+  // The constant covers ledger/current atomic temporary packets and descriptor/pin metadata.
+  let mut needed: u64 = 1024
+  if !charge(&mut needed, Bytes.length(&descriptor)) || !charge(&mut needed, Bytes.length(&pointerBytes)) {
+    return Published.Refused {reason: Refusal.Space}
+  }
+  let held = Views.segments(view)
+  at = usize.ZERO
+  while at < held.length {
+    let segment = Frozen<SealedSegment>.get(&held[at])
+    if !contains(&source.inheritedSegments, Segments.descriptor(segment).digest)
+      && !charge(&mut needed, Segments.encoded(segment).length) { return Published.Refused {reason: Refusal.Space} }
+    at = at + usize.ONE
+  }
+  let required = Views.requiredPacks(view)
+  at = usize.ZERO
+  while at < required.length {
+    let supplied = offered(packs, &packIndex, required[at])
+    if supplied != usize.MAX {
+      if !charge(&mut needed, packs[supplied].bytes.length) { return Published.Refused {reason: Refusal.Space} }
+    } else if !contains(&source.inheritedPacks, required[at]) || contains(&source.refusedPacks, required[at]) {
+      // A selected pack absent from the original admitted snapshot must be supplied or already
+      // exist with correct bytes. This path is fresh-only, never an inherited full-pack reread.
+      let path = run packPath(&writer.directory, required[at])
+      let bytes = match move run read(&path) {
+        Option<Bytes>.Some {value} => move value
+        Option<Bytes>.None => { return Published.Refused {reason: Refusal.MissingPack} }
+      }
+      if !ContentHash.equals(ContentHash.of(Bytes.asSlice(&bytes)), required[at]) { return Published.Refused {reason: Refusal.MissingPack} }
+    }
+    at = at + usize.ONE
+  }
+  if let Option<Refusal>.Some {value} = move run reserve(&writer, needed, limit) { return Published.Refused {reason: value} }
+  at = usize.ZERO
+  while at < held.length {
+    let segment = Frozen<SealedSegment>.get(&held[at])
+    let digest = Segments.descriptor(segment).digest
+    if !contains(&source.inheritedSegments, digest) {
+      let path = run segmentPath(&writer.directory, digest)
+      run store(&path, Segments.encoded(segment))
+    }
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < required.length {
+    let supplied = offered(packs, &packIndex, required[at])
+    if supplied != usize.MAX {
+      let path = run packPath(&writer.directory, required[at])
+      run store(&path, packs[supplied].bytes)
+    }
+    at = at + usize.ONE
+  }
+  let path = run generationPath(&writer.directory, identity)
+  run store(&path, Bytes.asSlice(&descriptor))
+  let published = run Effect.result(FileSystem.writeFileAtomic(&currentPath, Bytes.asSlice(&pointerBytes),
+    FileSystem.replaceExisting(), FileSystem.buffered()))
+  let warning = match move published {
+    Result<(), AtomicWriteError>.Success {..} => Option<AtomicWriteError>.none()
+    Result<(), AtomicWriteError>.Failure {error} => {
+      if !error.published { fail move error }
+      // The rename completed. Never delete resources or blindly retry publication after this
+      // boundary. Verify the visible pointer under the same lock, then report cleanup uncertainty.
+      let visible = run observe(&currentPath, writer.expected.incarnation)
+      if !visible.present || !ContentHash.equals(visible.physical, ContentHash.of(Bytes.asSlice(&pointerBytes))) { fail move error }
+      Option<AtomicWriteError>.some(move error)
+    }
+  }
+  return Published.Committed {generation: identity,
+    token: Token {incarnation: writer.expected.incarnation, present: true, physical: ContentHash.of(Bytes.asSlice(&pointerBytes))}, warning: move warning}
 }
 
 import silk.system.filesystem_machine {MachineFileSystem}
