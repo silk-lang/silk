@@ -1,0 +1,188 @@
+//! Sparse, context-local validation of an immutable cache dependency DAG.
+//!
+//! Recreate a walker whenever source, request, application or profile validation context
+//! changes. Its borrowed view cannot be replaced. A supplied observation disposition is
+//! authoritative only for this one context; this module does not validate source evidence.
+//! Completed node and observation results survive successive roots. No graph is flattened
+//! or scanned in advance. Memory is proportional to visited handles plus the DFS depth.
+
+import semantic.CacheView as CacheView {Handle, View}
+import semantic.InternIndex {InternIndex}
+import semantic.CacheSegments {ObservationView}
+import silk.collections.hash {Hash}
+import silk.collections.list {List}
+import silk.core.option {Option}
+import silk.core.ownership {Copy}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.usize
+import silk.num.u64
+
+/// Position-only evidence is weaker than exact validity and never suppresses other edges.
+pub enum Disposition { Exact, PositionOnly, Stale }
+/// A leaf request must be answered before calling `step` again. Refusal is sticky.
+pub union Step { NeedLeaf {pub handle: Handle}, Done {pub disposition: Disposition}, Refused }
+
+struct NodeMemo {handle: Handle, done: bool, disposition: Disposition}
+impl Copy for NodeMemo {}
+struct LeafMemo {handle: Handle, disposition: Disposition}
+impl Copy for LeafMemo {}
+struct Frame {memo: usize, next: usize, count: usize, disposition: Disposition}
+impl Copy for Frame {}
+
+/// One validation context over one immutable view. Constructing it allocates nothing.
+pub struct Walker<'v> {
+  view: &'v View,
+  nodeIndex: InternIndex,
+  nodes: List<NodeMemo>,
+  leafIndex: InternIndex,
+  leaves: List<LeafMemo>,
+  stack: List<Frame>,
+  waiting: Option<Handle>,
+  ready: Option<Disposition>,
+  running: bool,
+  refused: bool,
+}
+
+pub fn make<'v>(view: &'v View) -> Walker<'v> {
+  return Walker {view: view, nodeIndex: InternIndex.make(), nodes: List<NodeMemo>.make(),
+    leafIndex: InternIndex.make(), leaves: List<LeafMemo>.make(), stack: List<Frame>.make(),
+    waiting: Option<Handle>.none(), ready: Option<Disposition>.none(), running: false, refused: false}
+}
+fn same(left: Handle, right: Handle) -> bool { return left.segment == right.segment && left.index == right.index }
+fn hash(handle: Handle) -> u64 { return Hash.combine(usize.toU64(handle.segment), usize.toU64(handle.index)) }
+fn nodeAt(walker: &Walker, handle: Handle) -> usize {
+  let mut at = InternIndex.first(&walker.nodeIndex, hash(handle))
+  while at != usize.MAX {
+    if same(List<NodeMemo>.get(&walker.nodes, at).handle, handle) { return at }
+    at = InternIndex.after(&walker.nodeIndex, at)
+  }
+  return usize.MAX
+}
+fn leafAt(walker: &Walker, handle: Handle) -> usize {
+  let mut at = InternIndex.first(&walker.leafIndex, hash(handle))
+  while at != usize.MAX {
+    if same(List<LeafMemo>.get(&walker.leaves, at).handle, handle) { return at }
+    at = InternIndex.after(&walker.leafIndex, at)
+  }
+  return usize.MAX
+}
+fn stale(value: Disposition) -> bool { return match value { Disposition.Stale => true _ => false } }
+fn combine(left: Disposition, right: Disposition) -> Disposition {
+  if stale(left) || stale(right) { return Disposition.Stale }
+  return match left {
+    Disposition.PositionOnly => Disposition.PositionOnly
+    _ => right
+  }
+}
+fn refuse(walker: &mut Walker) -> bool { walker.refused = true return false }
+
+// Reserve all fallible storage before index publication. Caught OOM can retry without
+// skipping an edge, leaving an orphan Active memo, or publishing a partial leaf result.
+effect fn push(walker: &mut Walker, handle: Handle) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let count = match move CacheView.edgeCount(walker.view, handle) {
+    Option<usize>.Some {value} => value
+    Option<usize>.None => { return refuse(&mut walker.*) }
+  }
+  let index = List<NodeMemo>.length(&walker.nodes)
+  run List<NodeMemo>.reserve(&mut walker.nodes, usize.ONE)
+  run List<Frame>.reserve(&mut walker.stack, usize.ONE)
+  run InternIndex.record(&mut walker.nodeIndex, hash(handle))
+  drop List<NodeMemo>.appendWithinCapacity(&mut walker.nodes, NodeMemo {handle: handle, done: false, disposition: Disposition.Exact})
+  drop List<Frame>.appendWithinCapacity(&mut walker.stack, Frame {memo: index, next: 0, count: count, disposition: Disposition.Exact})
+  return true
+}
+
+/// Starts a new root only initially or after `Done` was returned. All previous memoized
+/// results remain usable. An invalid handle or overlapping request poisons this walker.
+pub effect fn begin(walker: &mut Walker, node: Handle) -> bool ! OutOfMemoryError ? &mut Allocator {
+  if walker.refused || walker.running { return refuse(&mut walker.*) }
+  let found = nodeAt(&walker.*, node)
+  if found != usize.MAX {
+    let memo = List<NodeMemo>.get(&walker.nodes, found)
+    if !memo.done { return refuse(&mut walker.*) }
+    walker.ready = Option<Disposition>.some(memo.disposition)
+  } else if !run push(&mut walker.*, node) { return false }
+  walker.running = true
+  return true
+}
+
+fn accept(walker: &mut Walker, value: Disposition) -> () {
+  let index = List<Frame>.length(&walker.stack) - usize.ONE
+  let mut frame = List<Frame>.get(&walker.stack, index)
+  frame.disposition = combine(frame.disposition, value)
+  frame.next = frame.next + usize.ONE
+  List<Frame>.set(&mut walker.stack, index, frame)
+}
+
+/// Advances iteratively until one observation needs validation or the root is complete.
+/// A malformed lazy edge or active-node revisit refuses; it is never a green empty node.
+pub effect fn step(walker: &mut Walker) -> Step ! OutOfMemoryError ? &mut Allocator {
+  if walker.refused || !walker.running { drop refuse(&mut walker.*) return Step.Refused }
+  if let Option<Handle>.Some {..} = &walker.waiting { drop refuse(&mut walker.*) return Step.Refused }
+  if let Option<Disposition>.Some {value} = &walker.ready {
+    let result = value
+    walker.ready = Option<Disposition>.none()
+    walker.running = false
+    return Step.Done {disposition: result}
+  }
+  while List<Frame>.length(&walker.stack) > 0 {
+    let frame = List<Frame>.get(&walker.stack, List<Frame>.length(&walker.stack) - usize.ONE)
+    let memo = List<NodeMemo>.get(&walker.nodes, frame.memo)
+    if stale(frame.disposition) || frame.next == frame.count {
+      List<NodeMemo>.set(&mut walker.nodes, frame.memo, NodeMemo {handle: memo.handle, done: true, disposition: frame.disposition})
+      drop List<Frame>.pop(&mut walker.stack)
+      if List<Frame>.length(&walker.stack) == 0 {
+        walker.running = false
+        return Step.Done {disposition: frame.disposition}
+      }
+      continue
+    }
+    let dependency = match move CacheView.edge(walker.view, memo.handle, frame.next) {
+      Option<CacheView.Dependency>.Some {value} => value
+      Option<CacheView.Dependency>.None => { drop refuse(&mut walker.*) return Step.Refused }
+    }
+    if dependency.node {
+      let found = nodeAt(&walker.*, dependency.target)
+      if found == usize.MAX {
+        if !run push(&mut walker.*, dependency.target) { return Step.Refused }
+      } else {
+        let target = List<NodeMemo>.get(&walker.nodes, found)
+        if !target.done { drop refuse(&mut walker.*) return Step.Refused }
+        accept(&mut walker.*, target.disposition)
+      }
+    } else {
+      let found = leafAt(&walker.*, dependency.target)
+      if found != usize.MAX {
+        let value = List<LeafMemo>.get(&walker.leaves, found).disposition
+        accept(&mut walker.*, value)
+      }
+      else {
+        match move CacheView.observation(walker.view, dependency.target) {
+          Option<ObservationView>.Some {..} => {}
+          Option<ObservationView>.None => { drop refuse(&mut walker.*) return Step.Refused }
+        }
+        walker.waiting = Option<Handle>.some(dependency.target)
+        return Step.NeedLeaf {handle: dependency.target}
+      }
+    }
+  }
+  drop refuse(&mut walker.*)
+  return Step.Refused
+}
+
+/// Supplies exactly the outstanding original observation handle, once in this context.
+/// Placement/source validation belongs to the caller; a different handle is a protocol error.
+pub effect fn supplyLeaf(walker: &mut Walker, handle: Handle, disposition: Disposition) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  if walker.refused || !walker.running { return refuse(&mut walker.*) }
+  let expected = match &walker.waiting {
+    Option<Handle>.Some {value} => value
+    Option<Handle>.None => { return refuse(&mut walker.*) }
+  }
+  if !same(expected, handle) || leafAt(&walker.*, handle) != usize.MAX { return refuse(&mut walker.*) }
+  run List<LeafMemo>.reserve(&mut walker.leaves, usize.ONE)
+  run InternIndex.record(&mut walker.leafIndex, hash(handle))
+  drop List<LeafMemo>.appendWithinCapacity(&mut walker.leaves, LeafMemo {handle: handle, disposition: disposition})
+  walker.waiting = Option<Handle>.none()
+  return true
+}
