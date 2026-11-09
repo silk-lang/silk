@@ -15,8 +15,9 @@
 //! inside is stamped with the compiler too ([`CacheStamp`]), and another compiler's file reads as
 //! empty and is replaced.
 //!
-//! The image is two files ([`CacheImage.Files`]): its leaves and nodes at that path, and its roots
-//! at `semantic-<digest>.roots`, which [`prefetch`] reads and decodes on threads of their own.
+//! The file is an atomic manifest. Its immutable dependency shards live in
+//! `semantic-<digest>.shards`, named by content digest. [`prefetch`] stages the manifest and
+//! every required shard on a background thread; adoption publishes their roots together.
 //! [`prefetch`] starts before the store that names the file is loaded, so it finds the file through
 //! `profile-<digest>`, which names the file the target and profile the command line selects last
 //! opened.
@@ -34,8 +35,9 @@ import diagnostic.JsonText
 import driver.DetachedWriter as DetachedWriter {Handoff, Held}
 import driver.ImportSummaries as Summaries {ImportSummaries}
 import semantic.BuildRecord
-import semantic.CacheImage
-import semantic.CacheImage {Merge as ImageMerge}
+import semantic.CacheBundle
+import semantic.CacheBundle {Bundle}
+import driver.CacheBundles
 import semantic.ContentHash {ContentHash}
 import semantic.Semantic {Adopted, Request, Semantic}
 import semantic.Query {Cycle}
@@ -166,8 +168,6 @@ pub struct Prefetch {
 struct Reading {
   path: Bytes,
   handle: JoinHandle<Option<Fetched>>,
-  // The roots file, read on a thread of its own beside the graph file.
-  roots: JoinHandle<Option<CacheImage.Roots>>,
 }
 
 // What a prefetch read: the file's path, the stamp it was written under, its leaves and nodes,
@@ -175,7 +175,7 @@ struct Reading {
 struct Fetched {
   path: Bytes,
   stamp: Bytes,
-  graph: CacheImage.Graph,
+  image: Bundle,
   packs: List<BuildRecord.PackBody>,
 }
 
@@ -229,36 +229,16 @@ pub effect fn prefetch(cache: &Path, building: bool, profile: &[u8]) -> Option<P
   return Option<Prefetch>.some(Prefetch {choice: move choice, reading: run startReading(move path, building)})
 }
 
-// Starts the threads that read the image at `path`; none when either cannot start.
+// Starts the manifest/shard read on its own thread; none when it cannot start.
 effect fn startReading(path: Bytes, building: bool) -> Option<Reading> ! OutOfMemoryError ? &mut Allocator {
-  let rootsPath = run Bytes.copy(Bytes.asSlice(&path))
-  let roots = match move run Effect.result(NativeThread.spawn(
-    fn() -> Option<CacheImage.Roots> {
-      return run fetchRootsDetached(move rootsPath)
-    }
-  )) {
-    Result<JoinHandle<Option<CacheImage.Roots>>, OutOfMemoryError | SpawnError>.Success {value} => move value
-    Result<JoinHandle<Option<CacheImage.Roots>>, OutOfMemoryError | SpawnError>.Failure {error} => match move error {
-      SpawnError unstarted => {
-        drop unstarted
-        return Option<Reading>.none()
-      }
-      OutOfMemoryError exhausted => { fail move exhausted }
-    }
-  }
-  let graphPath = run Bytes.copy(Bytes.asSlice(&path))
+  let readingPath = run Bytes.copy(Bytes.asSlice(&path))
   return match move run Effect.result(NativeThread.spawn(
-    fn() -> Option<Fetched> {
-      return run fetchDetached(move graphPath, building)
-    }
+    fn() -> Option<Fetched> { return run fetchDetached(move readingPath, building) }
   )) {
-    Result<JoinHandle<Option<Fetched>>, OutOfMemoryError | SpawnError>.Success {value} => Option<Reading>.some(Reading {path: move path,
-      handle: move value, roots: move roots})
+    Result<JoinHandle<Option<Fetched>>, OutOfMemoryError | SpawnError>.Success {value} =>
+      Option<Reading>.some(Reading {path: move path, handle: move value})
     Result<JoinHandle<Option<Fetched>>, OutOfMemoryError | SpawnError>.Failure {error} => match move error {
-      SpawnError unstarted => {
-        drop unstarted
-        return Option<Reading>.none()
-      }
+      SpawnError unstarted => { drop unstarted return Option<Reading>.none() }
       OutOfMemoryError exhausted => { fail move exhausted }
     }
   }
@@ -357,24 +337,11 @@ effect fn fetch(path: &Bytes, building: bool) -> Option<Fetched> ! OutOfMemoryEr
   if let Result<Path, FileError | OutOfMemoryError>.Success {value: lock} = move run Effect.result(Path.fromBytes(Bytes.asSlice(&lockName))) {
     run DetachedWriter.waitFor(&lock)
   }
-  let bytes = match move run Effect.result(FileSystem.readFile(&located)) {
-    Result<Bytes, FileError | OutOfMemoryError>.Success {value} => move value
-    Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
-      FileError failure => {
-        drop failure
-        return Option<Fetched>.none()
-      }
-      OutOfMemoryError exhausted => { fail move exhausted }
-    }
+  let loaded = match move run CacheBundles.read(&located, Option<&[u8]>.none()) {
+    Option<CacheBundles.Loaded>.Some {value} => move value
+    _ => { return Option<Fetched>.none() }
   }
-  let stamp = match move run CacheImage.writtenStamp(Bytes.asSlice(&bytes)) {
-    Option<Bytes>.Some {value} => move value
-    Option<Bytes>.None => { return Option<Fetched>.none() }
-  }
-  let graph = match move run graphOf(move bytes, Bytes.asSlice(&stamp)) {
-    Option<CacheImage.Graph>.Some {value} => move value
-    Option<CacheImage.Graph>.None => { return Option<Fetched>.none() }
-  }
+  let CacheBundles.Loaded {stamp, image} = move loaded
   let mut packs = List<BuildRecord.PackBody>.make()
   if building {
     let mut named = run Bytes.copy(Bytes.asSlice(&path.*))
@@ -383,73 +350,7 @@ effect fn fetch(path: &Bytes, building: bool) -> Option<Fetched> ! OutOfMemoryEr
       packs = run readPacks(&directory)
     }
   }
-  return Option<Fetched>.some(Fetched {path: run Bytes.copy(Bytes.asSlice(&path.*)), stamp: move stamp, graph: move graph, packs: move packs})
-}
-
-// The graph file `bytes` under `stamp`. Its leaves past its anchors and its nodes stay in the file
-// until an adoption needs them (`CacheImage.readLeaves`, `CacheImage.readNodes`).
-effect fn graphOf(bytes: Bytes, stamp: &[u8]) -> Option<CacheImage.Graph> ! OutOfMemoryError ? &mut Allocator {
-  let parts = match move run CacheImage.graphParts(Bytes.asSlice(&bytes), stamp) {
-    Option<CacheImage.GraphParts>.Some {value} => move value
-    Option<CacheImage.GraphParts>.None => { return Option<CacheImage.Graph>.none() }
-  }
-  return match move run CacheImage.decodeSummary(Bytes.asSlice(&bytes), &parts) {
-    Option<CacheImage.Summary>.Some {value: read} => CacheImage.assembled(&parts, move read, move bytes)
-    Option<CacheImage.Summary>.None => Option<CacheImage.Graph>.none()
-  }
-}
-
-
-// `fetchRoots` on a thread of its own, with its own allocator and file system.
-effect fn fetchRootsDetached(path: Bytes) -> Option<CacheImage.Roots> {
-  let mut allocator = Allocator.systemAllocatorProvider()
-  let fetched = run Effect.result(fetchRootsOpened(&path) |> Effect.provideMut<Allocator>(&mut allocator))
-  return match move fetched {
-    Result<Option<CacheImage.Roots>, OutOfMemoryError>.Success {value} => move value
-    Result<Option<CacheImage.Roots>, OutOfMemoryError>.Failure {error} => {
-      drop error
-      return Option<CacheImage.Roots>.none()
-    }
-  }
-}
-
-effect fn fetchRootsOpened(path: &Bytes) -> Option<CacheImage.Roots> ! OutOfMemoryError ? &mut Allocator {
-  let mut files = run MachineFileSystem.make()
-  return run fetchRoots(path) |> Effect.provideMut<FileSystem>(&mut files)
-}
-
-// Reads and decodes the roots file beside the cache file at `path`, under the stamp it was
-// written with; joining it to the graph file checks they are one image's.
-effect fn fetchRoots(path: &Bytes) -> Option<CacheImage.Roots> ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  let mut lockName = run Bytes.copy(Bytes.asSlice(&path.*))
-  run Bytes.append(&mut lockName, b".lock")
-  if let Result<Path, FileError | OutOfMemoryError>.Success {value: lock} = move run Effect.result(Path.fromBytes(Bytes.asSlice(&lockName))) {
-    run DetachedWriter.waitFor(&lock)
-  }
-  return match move run rootsPath(Bytes.asSlice(&path.*)) {
-    Option<Path>.Some {value: located} => run readRoots(&located)
-    Option<Path>.None => Option<CacheImage.Roots>.none()
-  }
-}
-
-// The roots the roots file at `path` holds under the stamp it was written with; none when it
-// cannot be read or decoded.
-effect fn readRoots(path: &Path) -> Option<CacheImage.Roots> ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  let bytes = match move run Effect.result(FileSystem.readFile(path)) {
-    Result<Bytes, FileError | OutOfMemoryError>.Success {value} => move value
-    Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
-      FileError failure => {
-        drop failure
-        return Option<CacheImage.Roots>.none()
-      }
-      OutOfMemoryError exhausted => { fail move exhausted }
-    }
-  }
-  let stamp = match move run CacheImage.writtenStamp(Bytes.asSlice(&bytes)) {
-    Option<Bytes>.Some {value} => move value
-    Option<Bytes>.None => { return Option<CacheImage.Roots>.none() }
-  }
-  return run CacheImage.decodeRoots(Bytes.asSlice(&bytes), Bytes.asSlice(&stamp))
+  return Option<Fetched>.some(Fetched {path: run Bytes.copy(Bytes.asSlice(&path.*)), stamp: move stamp, image: move image, packs: move packs})
 }
 
 /// Opens the cache file of `store` in the cache directory `cache` ([`directory`]) and adopts what
@@ -514,41 +415,35 @@ pub effect fn openPrefetched(store: &mut Semantic, request: &Request, cache: &Pa
   }
   let mut adopted = Adopted {roots: usize.ZERO, stale: usize.ZERO, nodes: usize.ZERO, changedLeaves: usize.ZERO}
   let mut fetched = Option<Fetched>.none()
-  let mut fetchedRoots = Option<CacheImage.Roots>.none()
   if let Option<Prefetch>.Some {value: started} = move prefetched {
     let Prefetch {choice, reading} = move started
     let mut guessed = false
     if let Option<Reading>.Some {value: read} = move reading {
-      let Reading {path: readPath, handle, roots: rootsHandle} = move read
+      let Reading {path: readPath, handle} = move read
       guessed = same(Bytes.asSlice(&readPath), Path.rawBytes(&path))
       fetched = handle.join()
-      fetchedRoots = rootsHandle.join()
     }
     // The next prefetch for this profile reads this file.
     if !guessed { run remember(&choice, Bytes.asSlice(&imageFile)) }
   }
   if let Option<Fetched>.Some {value: read} = move fetched {
     if same(Bytes.asSlice(&read.path), Path.rawBytes(&path)) && same(Bytes.asSlice(&read.stamp), Bytes.asSlice(&stamp)) {
-      let Fetched {path: _, stamp: _, graph, packs: bodies} = move read
-      if let Option<CacheImage.Roots>.Some {value: roots} = move fetchedRoots {
-        if let Option<CacheImage.Image>.Some {value: image} = move CacheImage.joined(move graph, move roots) {
-          if building { Semantic.offerPacks(&mut store.*, move bodies) }
-          adopted = run Semantic.adoptImage(&mut store.*, request, move image, linked)
-          return Option<CacheFile>.some(CacheFile {path: move path, packs: move packs, lock: move lock, stamp: move stamp,
-            adopted: move adopted, own: true})
-        }
-      }
+      let Fetched {path: _, stamp: _, image, packs: bodies} = move read
+      if building { Semantic.offerPacks(&mut store.*, move bodies) }
+      adopted = run Semantic.adoptImage(&mut store.*, request, move image, linked)
+      return Option<CacheFile>.some(CacheFile {path: move path, packs: move packs, lock: move lock, stamp: move stamp,
+        adopted: move adopted, own: true})
     }
   }
   run DetachedWriter.waitFor(&lock)
   if building { Semantic.offerPacks(&mut store.*, run readPacks(&packs)) }
   let mut own = false
-  if let Option<CacheImage.Image>.Some {value: image} = move run readImage(&path, Bytes.asSlice(&stamp)) {
+  if let Option<Bundle>.Some {value: image} = move run readImage(&path, Bytes.asSlice(&stamp)) {
     adopted = run Semantic.adoptImage(&mut store.*, request, move image, linked)
     own = true
   } else {
     let walked = run runtimeImage(&path, runtime)
-    if let Option<CacheImage.Image>.Some {value: image} = move run dependencyImage(&store.*, compiler, dependencies, &walked) {
+    if let Option<Bundle>.Some {value: image} = move run dependencyImage(&store.*, compiler, dependencies, &walked) {
       // The image is held as if read from this file, so the checks adopted from it are carried
       // into the file the store writes.
       adopted = run Semantic.adoptImage(&mut store.*, request, move image, linked)
@@ -755,9 +650,9 @@ effect fn runtimeImage(image: &Path, packages: &[Path]) -> Option<Path> ! OutOfM
 /// executable's walk from the runtime's roots rests on what it reached, never on which package
 /// roots the check, so a package checked for the first time walks again only what the last
 /// executable's walk did not reach (`Semantic.escapeRoots`).
-effect fn dependencyImage(store: &Semantic, compiler: &[u8], dependencies: &[Path], walked: &Option<Path>) -> Option<CacheImage.Image>
+effect fn dependencyImage(store: &Semantic, compiler: &[u8], dependencies: &[Path], walked: &Option<Path>) -> Option<Bundle>
   ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  let mut merged = ImageMerge.make()
+  let mut merged = CacheBundle.make()
   let mut found = false
   let mut at = usize.ZERO
   while at < dependencies.length {
@@ -770,33 +665,24 @@ effect fn dependencyImage(store: &Semantic, compiler: &[u8], dependencies: &[Pat
       let named = Path.rawBytes(&files[file].path)
       file = file + usize.ONE
       if !imageName(named) { continue }
-      if let Option<CacheImage.Image>.Some {value: read} = move run dependencyFile(store, compiler, named) {
-        let mut image = move read
-        // A merge copies leaves by key and walks nodes, so the leaves and nodes are read; their
-        // keys are read packed. An image whose leaves or nodes do not read is passed over.
-        if !run CacheImage.readLeaves(&mut image) { continue }
-        if !run CacheImage.readNodes(&mut image) { continue }
+      if let Option<Bundle>.Some {value: image} = move run dependencyFile(store, compiler, named) {
         let roots = run Semantic.checkRoots(&image)
-        run ImageMerge.add(&mut merged, &image, List<usize>.asSlice(&roots))
-        taken = true
-        found = true
+        if let Option<usize>.Some {..} = move run CacheBundle.collectSelected(&mut merged, &image, List<usize>.asSlice(&roots)) {
+          taken = true
+          found = true
+        }
       }
     }
   }
-  // Added last, so a dependency's own walk of a module wins over the copy carried here.
+  // Dependency-owned roots retain first-key authority over the runtime's carried copy.
   if let Option<Path>.Some {value: sibling} = &walked.* {
-    if let Option<CacheImage.Image>.Some {value: read} = move run dependencyFile(store, compiler, Path.rawBytes(&sibling)) {
-      let mut image = move read
-      let leaves = run CacheImage.readLeaves(&mut image)
-      if leaves && run CacheImage.readNodes(&mut image) {
-        let roots = run Semantic.escapeRoots(&image)
-        run ImageMerge.add(&mut merged, &image, List<usize>.asSlice(&roots))
-        found = true
-      }
+    if let Option<Bundle>.Some {value: image} = move run dependencyFile(store, compiler, Path.rawBytes(&sibling)) {
+      let roots = run Semantic.escapeRoots(&image)
+      if let Option<usize>.Some {..} = move run CacheBundle.collectSelected(&mut merged, &image, List<usize>.asSlice(&roots)) { found = true }
     }
   }
-  if !found { return Option<CacheImage.Image>.none() }
-  return Option<CacheImage.Image>.some(ImageMerge.finish(move merged))
+  if !found { return Option<Bundle>.none() }
+  return Option<Bundle>.some(move merged)
 }
 
 // The entries of the cache directory `directory` once no process writes a file in it. A writer
@@ -822,41 +708,24 @@ effect fn settledEntries(directory: &Path) -> List<DirectoryEntry> ! OutOfMemory
 
 // The image whose graph file is at `path`, once no process is writing it, when the running
 // compiler wrote it for the store's target (`CacheStamp.sameTarget`).
-effect fn dependencyFile(store: &Semantic, compiler: &[u8], path: &[u8]) -> Option<CacheImage.Image>
+effect fn dependencyFile(store: &Semantic, compiler: &[u8], path: &[u8]) -> Option<Bundle>
   ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
   if let Option<Path>.Some {value: lock} = move run suffixed(path, b".lock") { run DetachedWriter.waitFor(&lock) }
   let located = match move run suffixed(path, b"") {
     Option<Path>.Some {value} => move value
-    Option<Path>.None => { return Option<CacheImage.Image>.none() }
+    _ => { return Option<Bundle>.none() }
   }
-  let bytes = match move run Effect.result(FileSystem.readFile(&located)) {
-    Result<Bytes, FileError | OutOfMemoryError>.Success {value} => move value
-    Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
-      FileError failure => {
-        drop failure
-        return Option<CacheImage.Image>.none()
-      }
-      OutOfMemoryError exhausted => { fail move exhausted }
-    }
-  }
-  let written = match move run CacheImage.writtenStamp(Bytes.asSlice(&bytes)) {
+  let written = match move run CacheBundles.stamp(&located) {
     Option<Bytes>.Some {value} => move value
-    Option<Bytes>.None => { return Option<CacheImage.Image>.none() }
+    _ => { return Option<Bundle>.none() }
   }
-  if !run CacheStamp.sameTarget(store, compiler, Bytes.asSlice(&written)) { return Option<CacheImage.Image>.none() }
-  let graph = match move run CacheImage.decodeGraph(Bytes.asSlice(&bytes), Bytes.asSlice(&written)) {
-    Option<CacheImage.Graph>.Some {value} => move value
-    Option<CacheImage.Graph>.None => { return Option<CacheImage.Image>.none() }
+  if !run CacheStamp.sameTarget(store, compiler, Bytes.asSlice(&written)) { return Option<Bundle>.none() }
+  let loaded = match move run CacheBundles.read(&located, Option<&[u8]>.some(Bytes.asSlice(&written))) {
+    Option<CacheBundles.Loaded>.Some {value} => move value
+    _ => { return Option<Bundle>.none() }
   }
-  drop bytes
-  let rooted = match move run rootsPath(path) {
-    Option<Path>.Some {value} => move value
-    Option<Path>.None => { return Option<CacheImage.Image>.none() }
-  }
-  return match move run readRoots(&rooted) {
-    Option<CacheImage.Roots>.Some {value: roots} => CacheImage.joined(move graph, move roots)
-    Option<CacheImage.Roots>.None => Option<CacheImage.Image>.none()
-  }
+  let CacheBundles.Loaded {stamp: _, image} = move loaded
+  return Option<Bundle>.some(move image)
 }
 
 // The path `path` names with `suffix` appended; none when no such path can be formed.
@@ -887,47 +756,14 @@ effect fn remember(choice: &Path, name: &[u8]) -> () ! OutOfMemoryError ? &mut F
   }
 }
 
-// The image whose graph file is at `path` and whose roots file is beside it, under `stamp`; none
-// when either cannot be read or decoded, or they are not one image's.
-effect fn readImage(path: &Path, stamp: &[u8]) -> Option<CacheImage.Image> ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  let bytes = match move run Effect.result(FileSystem.readFile(path)) {
-    Result<Bytes, FileError | OutOfMemoryError>.Success {value} => move value
-    Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
-      FileError failure => {
-        drop failure
-        return Option<CacheImage.Image>.none()
-      }
-      OutOfMemoryError exhausted => { fail move exhausted }
+// The complete manifest and immutable shards under the expected compiler/profile stamp.
+effect fn readImage(path: &Path, stamp: &[u8]) -> Option<Bundle> ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  return match move run CacheBundles.read(path, Option<&[u8]>.some(stamp)) {
+    Option<CacheBundles.Loaded>.Some {value} => {
+      let CacheBundles.Loaded {stamp: _, image} = move value
+      Option<Bundle>.some(move image)
     }
-  }
-  let graph = match move run CacheImage.decodeGraph(Bytes.asSlice(&bytes), stamp) {
-    Option<CacheImage.Graph>.Some {value} => move value
-    Option<CacheImage.Graph>.None => { return Option<CacheImage.Image>.none() }
-  }
-  drop bytes
-  let located = match move run rootsPath(Path.rawBytes(path)) {
-    Option<Path>.Some {value} => move value
-    Option<Path>.None => { return Option<CacheImage.Image>.none() }
-  }
-  return match move run readRoots(&located) {
-    Option<CacheImage.Roots>.Some {value: roots} => CacheImage.joined(move graph, move roots)
-    Option<CacheImage.Roots>.None => Option<CacheImage.Image>.none()
-  }
-}
-
-// The roots file beside the graph file at `path`; none when no such path can be formed.
-effect fn rootsPath(path: &[u8]) -> Option<Path> ! OutOfMemoryError ? &mut Allocator {
-  let mut named = run Bytes.copy(path)
-  run Bytes.append(&mut named, b".roots")
-  return match move run Effect.result(Path.fromBytes(Bytes.asSlice(&named))) {
-    Result<Path, FileError | OutOfMemoryError>.Success {value} => Option<Path>.some(move value)
-    Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
-      FileError failure => {
-        drop failure
-        return Option<Path>.none()
-      }
-      OutOfMemoryError exhausted => { fail move exhausted }
-    }
+    _ => Option<Bundle>.none()
   }
 }
 
@@ -969,6 +805,7 @@ pub effect fn saveTracked(store: &mut Semantic, file: &CacheFile, units: Option<
     return DetachedWriter.completed()
   }
   if let Option<&[CodegenUnit]>.Some {..} = &units { drop run preparePacks(file) }
+  if !run CacheBundles.prepare(&file.path) { return DetachedWriter.completed() }
   let held = match move run DetachedWriter.hold(&file.lock) {
     Option<Held>.Some {value} => move value
     Option<Held>.None => {
@@ -1021,7 +858,7 @@ effect fn persist(store: &mut Semantic, file: &CacheFile, creating: bool) -> ()
 
 // An image `save` writes, with the stamp and the path it is written under.
 struct Pending {
-  image: CacheImage.Image,
+  image: Bundle,
   stamp: Bytes,
   path: Bytes,
 }
@@ -1031,43 +868,16 @@ effect fn prepare(store: &mut Semantic, file: &CacheFile) -> Option<Pending>
   ! Cycle | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
   if current(&store.*, file) { return Option<Pending>.none() }
   let completed = run Semantic.completeCacheImage(&mut store.*)
-  let image = run CacheImage.compactDuplicateRoots(move completed)
+  let image = run CacheBundle.compactDuplicateRoots(move completed)
   return Option<Pending>.some(Pending {image: move image, stamp: run Bytes.copy(Bytes.asSlice(&file.stamp)),
     path: run Bytes.copy(Path.rawBytes(&file.path))})
 }
 
-// Encodes `pending` and writes it over its two files, the roots file first; a file that cannot be
-// written is left as it was, and a graph file left beside roots of another image reads as none.
+// Publish blobs before the manifest; the caller holds the per-cache writer lock throughout.
 effect fn writePending(pending: &Pending, creating: bool) -> () ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  let files = run CacheImage.encodeFiles(&pending.image, Bytes.asSlice(&pending.stamp))
-  let mut rootsName = run Bytes.copy(Bytes.asSlice(&pending.path))
-  run Bytes.append(&mut rootsName, b".roots")
-  if !run written(Bytes.asSlice(&rootsName), Bytes.asSlice(&files.roots), creating) { return () }
-  drop run written(Bytes.asSlice(&pending.path), Bytes.asSlice(&files.graph), creating)
-}
-
-// Writes `bytes` over the file at `path` and returns whether it could.
-effect fn written(path: &[u8], bytes: &[u8], creating: bool) -> bool ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  return match move run Effect.result(writeAt(path, bytes, creating)) {
-    Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Success {..} => true
-    Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Failure {error} => match move error {
-      FileError failure => {
-        drop failure
-        return false
-      }
-      AtomicWriteError failure => {
-        drop failure
-        return false
-      }
-      OutOfMemoryError exhausted => { fail move exhausted }
-    }
+  if let Option<Path>.Some {value: path} = move run suffixed(Bytes.asSlice(&pending.path), b"") {
+    run CacheBundles.write(&path, &pending.image, Bytes.asSlice(&pending.stamp), creating)
   }
-}
-
-effect fn writeAt(path: &[u8], bytes: &[u8], creating: bool) -> () ! FileError | AtomicWriteError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  let target = run Path.fromBytes(path)
-  if creating { return run write(&target, bytes) }
-  return run FileSystem.writeFileAtomic(&target, bytes, FileSystem.replaceExisting(), FileSystem.buffered())
 }
 
 /// The import summaries kept in the cache directory `cache` for `compiler`, from

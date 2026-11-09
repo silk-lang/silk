@@ -1,0 +1,329 @@
+//! Atomic cache manifests and their content-addressed immutable dependency shards.
+//!
+//! The caller holds its semantic-cache writer lock through publication and pruning. A read
+//! stages every referenced shard before returning a bundle; a missing or corrupt shard is a miss.
+import semantic.CacheBundle {Bundle, Blob}
+import semantic.CacheBundle
+import semantic.CacheImage
+import semantic.ContentHash {ContentHash}
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.core.effect {Effect}
+import silk.core.option {Option}
+import silk.core.result {Result}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.concurrency.sync {Arc}
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+import silk.system.filesystem {AtomicWriteError, DirectoryEntry, FileError, FileSystem, Path}
+import silk.system.filesystem_native {OsFileSystem}
+import silk.testing.testing {AssertionError, Testing}
+
+pub struct Loaded {pub stamp: Bytes, pub image: Bundle}
+
+/// Reads only the manifest's stamp, so an unrelated target or compiler can be refused before
+/// loading its dependency blobs. A subsequent read still checks this expected stamp.
+pub effect fn stamp(path: &Path) -> Option<Bytes> ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  return match move run readBytes(path) {
+    Option<Bytes>.Some {value} => run CacheBundle.writtenStamp(Bytes.asSlice(&value))
+    _ => Option<Bytes>.none()
+  }
+}
+
+/// Reads one manifest and all its shards. `expected` refuses another compiler/profile before
+/// reading its blobs; a prefetch may omit it and compare the returned stamp after joining.
+pub effect fn read(path: &Path, expected: Option<&[u8]>) -> Option<Loaded>
+! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let bytes = match move run readBytes(path) {
+    Option<Bytes>.Some {value} => move value
+    _ => { return Option<Loaded>.none() }
+  }
+  let stamp = match move run CacheBundle.writtenStamp(Bytes.asSlice(&bytes)) {
+    Option<Bytes>.Some {value} => move value
+    _ => { return Option<Loaded>.none() }
+  }
+  if let Option<&[u8]>.Some {value} = &expected {
+    if !same(Bytes.asSlice(&stamp), value) { return Option<Loaded>.none() }
+  }
+  let manifest = match move run CacheBundle.readManifest(move bytes, Bytes.asSlice(&stamp)) {
+    Option<CacheBundle.Manifest>.Some {value} => move value
+    _ => { return Option<Loaded>.none() }
+  }
+  let directory = match move run shardDirectory(path) {
+    Option<Path>.Some {value} => move value
+    _ => { return Option<Loaded>.none() }
+  }
+  let wanted = CacheBundle.requiredBlobs(&manifest)
+  let mut blobs = List<Blob>.make()
+  let mut at = usize.ZERO
+  while at < wanted.length {
+    let located = match move run blobPath(&directory, wanted[at].digest) {
+      Option<Path>.Some {value} => move value
+      _ => { return Option<Loaded>.none() }
+    }
+    let data = match move run readBytes(&located) {
+      Option<Bytes>.Some {value} => move value
+      _ => { return Option<Loaded>.none() }
+    }
+    if Bytes.length(&data) != wanted[at].bytes { return Option<Loaded>.none() }
+    run List<Blob>.append(&mut blobs, Blob {digest: wanted[at].digest, bytes: run Arc<Bytes>.make(move data)})
+    at = at + usize.ONE
+  }
+  // Assembly verifies digests, framing, indexes and references before exposing any root.
+  return match move run CacheBundle.assemble(move manifest, move blobs) {
+    Option<Bundle>.Some {value} => Option<Loaded>.some(Loaded {stamp: move stamp, image: move value})
+    _ => Option<Loaded>.none()
+  }
+}
+
+/// Creates the shard directory before a detached writer starts. Its copy must not recreate a
+/// cache directory removed by a later clean command.
+pub effect fn prepare(path: &Path) -> bool ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let directory = match move run shardDirectory(path) {
+    Option<Path>.Some {value} => move value
+    _ => { return false }
+  }
+  return match move run Effect.result(FileSystem.createDirectoriesRecursively(&directory)) {
+    Result<(), FileError | OutOfMemoryError>.Success {..} => true
+    Result<(), FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => { drop failure return false }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+/// Writes missing or damaged blobs, then atomically replaces the manifest. A failed blob write
+/// leaves the previous manifest and its referenced blobs intact. Pruning follows publication.
+pub effect fn write(path: &Path, image: &Bundle, stamp: &[u8], creating: bool) -> ()
+! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  if creating && !run prepare(path) { return () }
+  let directory = match move run shardDirectory(path) {
+    Option<Path>.Some {value} => move value
+    _ => { return () }
+  }
+  let files = run CacheBundle.encodeFiles(image, stamp)
+  if Bytes.length(&files.manifest) == usize.ZERO { return () }
+  let blobs = List<Blob>.asSlice(&files.blobs)
+  let mut at = usize.ZERO
+  while at < blobs.length {
+    let located = match move run blobPath(&directory, blobs[at].digest) {
+      Option<Path>.Some {value} => move value
+      _ => { return () }
+    }
+    let data = Bytes.asSlice(Arc<Bytes>.get(&blobs[at].bytes))
+    let mut present = false
+    if let Option<Bytes>.Some {value: prior} = move run readBytes(&located) {
+      present = Bytes.length(&prior) == data.length && ContentHash.equals(ContentHash.of(Bytes.asSlice(&prior)), blobs[at].digest)
+    }
+    if !present && !run written(&located, data) { return () }
+    at = at + usize.ONE
+  }
+  if !run written(path, Bytes.asSlice(&files.manifest)) { return () }
+  run prune(&directory, blobs)
+}
+
+effect fn readBytes(path: &Path) -> Option<Bytes> ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  return match move run Effect.result(FileSystem.readFile(path)) {
+    Result<Bytes, FileError | OutOfMemoryError>.Success {value} => Option<Bytes>.some(move value)
+    Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => { drop failure return Option<Bytes>.none() }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+effect fn written(path: &Path, bytes: &[u8]) -> bool ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  return match move run Effect.result(FileSystem.writeFileAtomic(path, bytes, FileSystem.replaceExisting(), FileSystem.buffered())) {
+    Result<(), AtomicWriteError>.Success {..} => true
+    Result<(), AtomicWriteError>.Failure {error} => { drop error return false }
+  }
+}
+
+effect fn shardDirectory(path: &Path) -> Option<Path> ! OutOfMemoryError ? &mut Allocator {
+  let bytes = run Bytes.copy(Path.rawBytes(path))
+  let mut name = move bytes
+  run Bytes.append(&mut name, b".shards")
+  return run located(Bytes.asSlice(&name))
+}
+
+effect fn blobPath(directory: &Path, digest: ContentHash) -> Option<Path> ! OutOfMemoryError ? &mut Allocator {
+  let mut name = run Bytes.copy(Path.rawBytes(directory))
+  run Bytes.append(&mut name, b"/")
+  run appendHex(&mut name, digest.high)
+  run appendHex(&mut name, digest.low)
+  return run located(Bytes.asSlice(&name))
+}
+
+effect fn located(bytes: &[u8]) -> Option<Path> ! OutOfMemoryError ? &mut Allocator {
+  return match move run Effect.result(Path.fromBytes(bytes)) {
+    Result<Path, FileError | OutOfMemoryError>.Success {value} => Option<Path>.some(move value)
+    Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => { drop failure return Option<Path>.none() }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+effect fn appendHex(bytes: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < 16 {
+    let digit = u64.toU8(u64.bitAnd(u64.shiftRight(value, usize.toU64((15 - at) * 4)), 15))
+    run Bytes.append(&mut bytes.*, &[if digit < 10 { digit + 48 } else { digit + 87 }])
+    at = at + usize.ONE
+  }
+}
+
+fn namedDigest(path: &[u8]) -> Option<ContentHash> {
+  if path.length < 32 { return Option<ContentHash>.none() }
+  let start = path.length - 32
+  if start > usize.ZERO && path[start - usize.ONE] != 47 { return Option<ContentHash>.none() }
+  let mut high: u64 = 0
+  let mut low: u64 = 0
+  let mut at = usize.ZERO
+  while at < 32 {
+    let byte = path[start + at]
+    let digit = if byte >= 48 && byte <= 57 { u8.toU64(byte - 48) }
+      else if byte >= 97 && byte <= 102 { u8.toU64(byte - 87) } else { 16 }
+    if digit == 16 { return Option<ContentHash>.none() }
+    if at < 16 { high = high * 16 + digit } else { low = low * 16 + digit }
+    at = at + usize.ONE
+  }
+  return Option<ContentHash>.some(ContentHash {high: high, low: low})
+}
+
+effect fn prune(directory: &Path, kept: &[Blob]) -> () ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let found = match move run Effect.result(FileSystem.listDirectory(directory)) {
+    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => { drop failure return () }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let entries = List<DirectoryEntry>.asSlice(&found)
+  let mut at = usize.ZERO
+  while at < entries.length {
+    let path = &entries[at].path
+    at = at + usize.ONE
+    let digest = match move namedDigest(Path.rawBytes(path)) {
+      Option<ContentHash>.Some {value} => value
+      _ => { continue }
+    }
+    let mut present = false
+    let mut candidate = usize.ZERO
+    while candidate < kept.length && !present {
+      present = ContentHash.equals(kept[candidate].digest, digest)
+      candidate = candidate + usize.ONE
+    }
+    if !present { drop run Effect.result(FileSystem.removeFile(path)) }
+  }
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+effect fn fixture(answer: &[u8]) -> Bundle ! OutOfMemoryError ? &mut Allocator {
+  let mut image = CacheImage.make()
+  let node = run CacheImage.addNode(&mut image, &[])
+  run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {
+    key: run Bytes.copy(b"root"), node: node, answer: run Bytes.copy(answer)})
+  return run CacheBundle.fromImage(move image)
+}
+
+effect fn holds(path: &Path, expected: &[u8]) -> bool ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let found = match move run read(path, Option<&[u8]>.some(b"stamp")) {
+    Option<Loaded>.Some {value} => move value
+    _ => { return false }
+  }
+  let mut loaded = move found
+  if List<CacheImage.Root>.length(&loaded.image.roots) != 1 || !run CacheBundle.ensureAnswer(&mut loaded.image, 0) { return false }
+  return same(Bytes.asSlice(&List<CacheImage.Root>.asSlice(&loaded.image.roots)[0].answer), expected)
+}
+
+effect fn publicationClaims(temporary: &Path) -> ()
+! FileError | OutOfMemoryError | AssertionError<'static> ? &mut FileSystem | &mut Allocator {
+  let cache = run Path.join(temporary, "cache")
+  let path = run Path.join(&cache, "manifest")
+  let old = run fixture(b"before")
+  let next = run fixture(b"after")
+  run write(&path, &old, b"stamp", true)
+  run Testing.expect(run holds(&path, b"before"), "a complete manifest publishes its exact shard answer")
+  let mut invalid = CacheBundle.make()
+  drop run CacheBundle.addNode(&mut invalid, &[CacheImage.nodeEdge(usize.ZERO)])
+  run write(&path, &invalid, b"stamp", true)
+  run Testing.expect(run holds(&path, b"before"), "refused serialization preserves the previous manifest and its shards")
+  run Testing.expect(match move run read(&path, Option<&[u8]>.some(b"another stamp")) {
+    Option<Loaded>.None => true _ => false }, "another compiler/profile never adopts these roots")
+  let directory = match move run shardDirectory(&path) {
+    Option<Path>.Some {value} => move value
+    _ => { run Testing.expect(false, "fixture shard directory is valid") return () }
+  }
+  let oldFiles = run CacheBundle.encodeFiles(&old, b"stamp")
+  let oldBlobs = List<Blob>.asSlice(&oldFiles.blobs)
+  run Testing.expect(oldBlobs.length > usize.ZERO, "fixture retains a physical immutable shard")
+  if oldBlobs.length == usize.ZERO { return () }
+  let oldPath = match move run blobPath(&directory, oldBlobs[0].digest) {
+    Option<Path>.Some {value} => move value
+    _ => { run Testing.expect(false, "fixture blob path is valid") return () }
+  }
+  run FileSystem.writeFile(&oldPath, b"corrupt")
+  run Testing.expect(!run holds(&path, b"before"), "a corrupt required shard refuses the whole staged bundle")
+  run write(&path, &old, b"stamp", true)
+  run Testing.expect(run holds(&path, b"before"), "publication repairs a damaged content-addressed file")
+  run FileSystem.removeFile(&oldPath)
+  run Testing.expect(!run holds(&path, b"before"), "a missing shard cannot leave a partially adopted directory")
+  run write(&path, &old, b"stamp", true)
+  run Testing.expect(run holds(&path, b"before"), "a later write restores a missing shard")
+  let nextFiles = run CacheBundle.encodeFiles(&next, b"stamp")
+  let nextBlobs = List<Blob>.asSlice(&nextFiles.blobs)
+  run Testing.expect(nextBlobs.length > usize.ZERO, "the replacement also retains an immutable shard")
+  if nextBlobs.length == usize.ZERO { return () }
+  let blocked = match move run blobPath(&directory, nextBlobs[0].digest) {
+    Option<Path>.Some {value} => move value
+    _ => { run Testing.expect(false, "replacement blob path is valid") return () }
+  }
+  // An existing directory cannot be replaced by the blob's atomic file publication.
+  run FileSystem.createDirectory(&blocked)
+  run write(&path, &next, b"stamp", true)
+  run Testing.expect(run holds(&path, b"before"), "failed blob publication keeps the previous manifest and its evidence")
+  run FileSystem.removeDirectoryRecursively(&blocked)
+  let unrelated = run Path.join(&directory, "notes")
+  run FileSystem.writeFile(&unrelated, b"keep")
+  run write(&path, &next, b"stamp", true)
+  run Testing.expect(run holds(&path, b"after"), "the replacement becomes visible only with all its blobs")
+  run Testing.expect(match move run readBytes(&oldPath) { Option<Bytes>.None => true _ => false },
+    "only after publication may an unreferenced old blob be pruned")
+  let kept = run FileSystem.readFile(&unrelated)
+  run Testing.expect(same(Bytes.asSlice(&kept), b"keep"), "pruning ignores names outside the owned digest namespace")
+  run FileSystem.removeDirectoryRecursively(&cache)
+  run write(&path, &next, b"stamp", false)
+  let absent = run Effect.result(FileSystem.listDirectory(&cache))
+  run Testing.expect(match &absent { Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Failure {..} => true _ => false },
+    "a detached writer does not recreate a cache removed after it started")
+}
+
+effect fn ignoreCleanup(error: FileError | OutOfMemoryError) -> () { return () }
+effect fn cleanup(path: &Path) -> () ? &mut FileSystem | &mut Allocator {
+  return run Effect.catchAll(FileSystem.removeDirectoryRecursively(path), ignoreCleanup)
+}
+effect fn publicationFixture() -> () ! FileError | OutOfMemoryError | AssertionError<'static> ? &mut FileSystem | &mut Allocator {
+  let parent = run Path.make(temporaryParent())
+  let temporary = run FileSystem.temporaryDirectory(&parent, "silk-cache-bundle-publication")
+  return run Effect.ensuring(publicationClaims(&temporary.path), cleanup(&temporary.path))
+}
+fn temporaryParent() -> string<'static> {
+  static if Intrinsic.targetOperatingSystem() == "darwin" { return "/private/tmp" }
+  else { return "/tmp" }
+}
+test effect fn cacheBundleManifestPublishesOnlyCompleteShardSets() -> () ! FileError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut files = run OsFileSystem.make("/") |> Effect.provideMut<Allocator>(&mut allocator)
+  run publicationFixture() |> Effect.provideMut<FileSystem>(&mut files) |> Effect.provideMut<Allocator>(&mut allocator)
+}

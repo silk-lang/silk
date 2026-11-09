@@ -5,7 +5,9 @@
 //! The store reads an import target only when a requested fact needs its binding.
 
 import semantic.Types {TypeTable, Types}
-import semantic.CacheImage {Merge}
+import semantic.CacheBundle
+import semantic.CacheInputProof
+import semantic.CacheBundleLive
 import semantic.WalkFragments
 import semantic.ArtifactGraph
 import semantic.ArtifactReplay
@@ -721,6 +723,10 @@ fn claimFrontier(table: [*]mut u64, digest: ContentHash, worker: usize) -> bool 
 effect fn frontierNow() -> u64 {
   let instant = run NativeClock.now(true)
   return i64.toU64(SystemClock.seconds(&instant)) * 1000000000 + i64.toU64(SystemClock.nanoseconds(&instant))
+}
+
+fn bundleAdoptionTrace() -> bool {
+  return !Pointer.isNullMany<u8>(unsafe FrontierHost.environment(Pointer.fromSlice<u8>(b"SILK_CACHE_BUNDLE_TRACE\0")))
 }
 
 effect fn frontierTrace(label: &[u8], start: u64, first: usize, second: usize) -> ()
@@ -4481,8 +4487,10 @@ pub struct Semantic {
   carriedUnits: List<usize>,
   carriedRoots: List<usize>,
   // The image the store adopted, which the image it writes next carries checks from.
-  heldImage: Option<CacheImage.Image>,
+  heldImage: Option<CacheBundle.Bundle>,
   heldImageCorrupt: bool,
+  // Linked adopted-node query identities are never reused by a replacement bundle.
+  nextAdoptedNode: usize,
   // A prior check supplied at least one still-valid check or MIR-entry dependency root.
   reusableAdoptedChecks: bool,
   // The declaration check roots of the adopted image an unlinked store reused without reading
@@ -4750,19 +4758,21 @@ struct CachedEscapeGraph {
   // replacing or failing adoption clears the directory and this ordinal together.
   root: usize,
   directory: EscapeGraphIndex.Index,
+  // Decoded shared payload is kept once per authenticated graph; its bundle answer stays packed.
+  payload: Bytes,
   replay: Option<CachedEscapeRecord>,
   views: List<CachedEscapeView>,
   viewLookup: InternIndex,
 }
 
-fn heldImageReference<'a>(image: &'a Option<CacheImage.Image>) -> Option<&'a CacheImage.Image> {
+fn heldImageReference<'a>(image: &'a Option<CacheBundle.Bundle>) -> Option<&'a CacheBundle.Bundle> {
   return match &image.* {
-    Option<CacheImage.Image>.Some {value} => Option<&CacheImage.Image>.some(&value)
-    Option<CacheImage.Image>.None => Option<&CacheImage.Image>.none()
+    Option<CacheBundle.Bundle>.Some {value} => Option<&CacheBundle.Bundle>.some(&value)
+    Option<CacheBundle.Bundle>.None => Option<&CacheBundle.Bundle>.none()
   }
 }
 
-fn escapeGraphRoot(image: &CacheImage.Image, digest: ContentHash) -> usize {
+fn escapeGraphRoot(image: &CacheBundle.Bundle, digest: ContentHash) -> usize {
   let roots = List<CacheImage.Root>.asSlice(&image.roots)
   let mut at = usize.ZERO
   while at < roots.length {
@@ -4788,11 +4798,11 @@ effect fn cachedEscapeBytes(cache: &mut List<CachedEscapeGraph>, bytes: &[u8], d
     Option<EscapeGraphIndex.Index>.None => { return usize.MAX }
   }
   run List<CachedEscapeGraph>.append(&mut cache.*, CachedEscapeGraph {digest: digest, shared: shared, root: usize.MAX, directory: move directory,
-    replay: Option<CachedEscapeRecord>.none(), views: List<CachedEscapeView>.make(), viewLookup: InternIndex.make()})
+    payload: Bytes.make(), replay: Option<CachedEscapeRecord>.none(), views: List<CachedEscapeView>.make(), viewLookup: InternIndex.make()})
   return at
 }
 
-effect fn cachedEscapeGraph(image: &CacheImage.Image, cache: &mut List<CachedEscapeGraph>, digest: ContentHash) -> usize
+effect fn cachedEscapeGraph(image: &CacheBundle.Bundle, cache: &mut List<CachedEscapeGraph>, digest: ContentHash) -> usize
 ! OutOfMemoryError ? &mut Allocator {
   let known = List<CachedEscapeGraph>.asSlice(&cache.*)
   let mut at = usize.ZERO
@@ -4802,21 +4812,26 @@ effect fn cachedEscapeGraph(image: &CacheImage.Image, cache: &mut List<CachedEsc
   }
   let root = escapeGraphRoot(image, digest)
   if root == usize.MAX { return usize.MAX }
-  let found = run cachedEscapeBytes(&mut cache.*, Bytes.asSlice(&List<CacheImage.Root>.asSlice(&image.roots)[root].answer), digest, true)
+  let payload = match move run CacheBundle.answerCopy(image, root) {
+    Option<Bytes>.Some {value} => move value
+    _ => { return usize.MAX }
+  }
+  let found = run cachedEscapeBytes(&mut cache.*, Bytes.asSlice(&payload), digest, true)
   if found != usize.MAX {
     let entries = List<CachedEscapeGraph>.asMutSlice(&mut cache.*)
+    entries[found].payload = move payload
     entries[found].root = root
   }
   return found
 }
 
-effect fn cachedEscapeRecord(image: &CacheImage.Image, graph: &mut CachedEscapeGraph) -> bool
+effect fn cachedEscapeRecord(graph: &mut CachedEscapeGraph) -> bool
 ! OutOfMemoryError ? &mut Allocator {
   if let Option<CachedEscapeRecord>.Some {..} = &graph.replay { return true }
   let root = graph.root
-  if root == usize.MAX || root >= List<CacheImage.Root>.length(&image.roots) { return false }
+  if root == usize.MAX { return false }
   // The immutable directory already authenticated and validated this exact payload.
-  let record = match move run BuildRecord.decode(Bytes.asSlice(&List<CacheImage.Root>.asSlice(&image.roots)[root].answer)) {
+  let record = match move run BuildRecord.decode(Bytes.asSlice(&graph.payload)) {
     Option<BuildRecord.Record>.Some {value} => move value
     Option<BuildRecord.Record>.None => { return false }
   }
@@ -4872,7 +4887,7 @@ effect fn cachedEscapeView(graph: &mut CachedEscapeGraph, roots: &[ContentHash],
 
 struct CachedEscapeSelection {graph: usize, view: usize, root: usize, span: Span}
 
-effect fn cachedEscapeAnswer(image: Option<&CacheImage.Image>, cache: &mut List<CachedEscapeGraph>, bytes: &[u8])
+effect fn cachedEscapeAnswer(image: Option<&CacheBundle.Bundle>, cache: &mut List<CachedEscapeGraph>, bytes: &[u8])
   -> Option<CachedEscapeSelection> ! OutOfMemoryError ? &mut Allocator {
   let answer = match move run EscapeGraph.decodeAnswer(bytes) {
     Option<EscapeAnswer>.Some {value} => move value
@@ -4888,7 +4903,7 @@ effect fn cachedEscapeAnswer(image: Option<&CacheImage.Image>, cache: &mut List<
     return Option<CachedEscapeSelection>.some(CachedEscapeSelection {graph: found, view: selected, root: usize.MAX, span: record})
   }
   if let EscapeAnswer.View {value: descriptor} = &answer {
-    let held = match image { Option<&CacheImage.Image>.Some {value} => value _ => { return Option<CachedEscapeSelection>.none() } }
+    let held = match image { Option<&CacheBundle.Bundle>.Some {value} => value _ => { return Option<CachedEscapeSelection>.none() } }
     let found = run cachedEscapeGraph(held, &mut cache.*, descriptor.graph)
     if found == usize.MAX { return Option<CachedEscapeSelection>.none() }
     let graph = &mut List<CachedEscapeGraph>.asMutSlice(&mut cache.*)[found]
@@ -4901,9 +4916,9 @@ effect fn cachedEscapeAnswer(image: Option<&CacheImage.Image>, cache: &mut List<
 }
 
 // Binding a green memo needs exact selected entry evidence, not owned replay payloads.
-effect fn escapeAnswerGreen(image: &CacheImage.Image, cache: &mut List<CachedEscapeGraph>, bytes: &[u8], green: &DigestSet) -> bool
+effect fn escapeAnswerGreen(image: &CacheBundle.Bundle, cache: &mut List<CachedEscapeGraph>, bytes: &[u8], green: &DigestSet) -> bool
 ! OutOfMemoryError ? &mut Allocator {
-  let selected = match move run cachedEscapeAnswer(Option<&CacheImage.Image>.some(image), &mut cache.*, bytes) {
+  let selected = match move run cachedEscapeAnswer(Option<&CacheBundle.Bundle>.some(image), &mut cache.*, bytes) {
     Option<CachedEscapeSelection>.Some {value} => move value
     _ => { return false }
   }
@@ -4926,25 +4941,22 @@ effect fn escapeAnswerGreen(image: &CacheImage.Image, cache: &mut List<CachedEsc
 
 // The selected check charges only its reachable definitions. Interned body identities are
 // immutable directory data; the command's budget and its rollback boundary remain separate.
-effect fn escapeAnswerBudget(image: Option<&CacheImage.Image>, cache: &mut List<CachedEscapeGraph>, budget: &mut SpecializationBudget,
+effect fn escapeAnswerBudget(image: Option<&CacheBundle.Bundle>, cache: &mut List<CachedEscapeGraph>, budget: &mut SpecializationBudget,
   bytes: &[u8]) -> bool ! OutOfMemoryError ? &mut Allocator {
   let selected = match move run cachedEscapeAnswer(image, &mut cache.*, bytes) {
     Option<CachedEscapeSelection>.Some {value} => move value
     _ => { return false }
   }
-  let payload = if selected.root == usize.MAX { StableKey.view(bytes, selected.span) }
-    else {
-      let held = match image { Option<&CacheImage.Image>.Some {value} => value _ => { return false } }
-      Bytes.asSlice(&List<CacheImage.Root>.asSlice(&held.roots)[selected.root].answer)
-    }
   let graph = &mut List<CachedEscapeGraph>.asMutSlice(&mut cache.*)[selected.graph]
+  let payload = if selected.root == usize.MAX { StableKey.view(bytes, selected.span) }
+    else { Bytes.asSlice(&graph.payload) }
   return run EscapeGraphIndexReach.includeBudget(&mut graph.directory, payload, &mut budget.*,
     List<usize>.asSlice(&List<CachedEscapeView>.asSlice(&graph.views)[selected.view].entries))
 }
 
 // Only a demanded stale view gets an owned record. Ordinary replay reconstructs keys and
 // diagnostic requester paths without mutating shared rows or cached closure membership.
-effect fn materializeEscapeAnswer(image: Option<&CacheImage.Image>, cache: &mut List<CachedEscapeGraph>, bytes: &[u8],
+effect fn materializeEscapeAnswer(image: Option<&CacheBundle.Bundle>, cache: &mut List<CachedEscapeGraph>, bytes: &[u8],
   boundary: &Option<WalkBoundary>) -> Option<BuildRecord.Record> ! OutOfMemoryError ? &mut Allocator {
   let answer = match move run EscapeGraph.decodeAnswer(bytes) {
     Option<EscapeAnswer>.Some {value} => move value
@@ -4952,11 +4964,11 @@ effect fn materializeEscapeAnswer(image: Option<&CacheImage.Image>, cache: &mut 
   }
   if let EscapeAnswer.Inline {record} = &answer { return run BuildRecord.decode(StableKey.view(bytes, record)) }
   if let EscapeAnswer.View {value: descriptor} = &answer {
-    let held = match image { Option<&CacheImage.Image>.Some {value} => value _ => { return Option<BuildRecord.Record>.none() } }
+    let held = match image { Option<&CacheBundle.Bundle>.Some {value} => value _ => { return Option<BuildRecord.Record>.none() } }
     let found = run cachedEscapeGraph(held, &mut cache.*, descriptor.graph)
     if found == usize.MAX { return Option<BuildRecord.Record>.none() }
     let graph = &mut List<CachedEscapeGraph>.asMutSlice(&mut cache.*)[found]
-    if !run cachedEscapeRecord(held, &mut graph.*) { return Option<BuildRecord.Record>.none() }
+    if !run cachedEscapeRecord(&mut graph.*) { return Option<BuildRecord.Record>.none() }
     let replay = match &graph.replay {
       Option<CachedEscapeRecord>.Some {value} => &value
       _ => { return Option<BuildRecord.Record>.none() }
@@ -4974,7 +4986,7 @@ effect fn materializeEscapeAnswer(image: Option<&CacheImage.Image>, cache: &mut 
 }
 
 // Reuses the same closure membership as green attachment and budget accounting.
-effect fn nameEscapeAnswer(image: Option<&CacheImage.Image>, cache: &mut List<CachedEscapeGraph>, bytes: &[u8], named: &mut DigestSet) -> bool
+effect fn nameEscapeAnswer(image: Option<&CacheBundle.Bundle>, cache: &mut List<CachedEscapeGraph>, bytes: &[u8], named: &mut DigestSet) -> bool
 ! OutOfMemoryError ? &mut Allocator {
   let selected = match move run cachedEscapeAnswer(image, &mut cache.*, bytes) {
     Option<CachedEscapeSelection>.Some {value} => move value
@@ -4992,7 +5004,7 @@ effect fn nameEscapeAnswer(image: Option<&CacheImage.Image>, cache: &mut List<Ca
 }
 
 // Root-answer references are explicit: dependency node edges cannot carry another root's blob.
-effect fn includeEscapeBlobs(image: &CacheImage.Image, selected: &mut List<usize>) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn includeEscapeBlobs(image: &CacheBundle.Bundle, selected: &mut List<usize>) -> () ! OutOfMemoryError ? &mut Allocator {
   let roots = List<CacheImage.Root>.asSlice(&image.roots)
   let count = List<usize>.length(&selected.*)
   let mut blobs = DigestSet.make()
@@ -5008,6 +5020,7 @@ effect fn includeEscapeBlobs(image: &CacheImage.Image, selected: &mut List<usize
     }
     at = at + usize.ONE
   }
+  let mut cursor = CacheBundle.answerCursor()
   at = usize.ZERO
   while at < count {
     let index = List<usize>.get(&selected.*, at)
@@ -5015,7 +5028,11 @@ effect fn includeEscapeBlobs(image: &CacheImage.Image, selected: &mut List<usize
     if index >= roots.length { continue }
     let mut named = Span.make(usize.ZERO, usize.ZERO)
     if buildRootKind(Bytes.asSlice(&roots[index].key), &mut named) != 3 { continue }
-    if let Option<EscapeGraph.Descriptor>.Some {value} = move run EscapeGraph.decodeDescriptor(Bytes.asSlice(&roots[index].answer)) {
+    let answer = match move run CacheBundle.answerAt(image, &mut cursor, index) {
+      Option<&[u8]>.Some {value} => value
+      _ => { continue }
+    }
+    if let Option<EscapeGraph.Descriptor>.Some {value} = move run EscapeGraph.decodeDescriptor(answer) {
       if run DigestSet.add(&mut blobs, value.graph) {
         let blob = escapeGraphRoot(image, value.graph)
         if blob != usize.MAX { run List<usize>.append(&mut selected.*, blob) }
@@ -5026,30 +5043,39 @@ effect fn includeEscapeBlobs(image: &CacheImage.Image, selected: &mut List<usize
 
 // Fresh-first check roots choose one descriptor. Keep only blobs referenced by those winners,
 // so repeated edits cannot accumulate unreferenced generations in the published image.
-effect fn pruneEscapeBlobs(image: &mut CacheImage.Image) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn pruneEscapeBlobs(image: &mut CacheBundle.Bundle) -> () ! OutOfMemoryError ? &mut Allocator {
   let mut named = ExactSet.make()
   let mut live = DigestSet.make()
   let roots = List<CacheImage.Root>.asSlice(&image.roots)
+  let mut cursor = CacheBundle.answerCursor()
   let mut at = usize.ZERO
   while at < roots.length {
     let root = &roots[at]
+    let index = at
     at = at + usize.ONE
     let mut identity = Span.make(usize.ZERO, usize.ZERO)
     if buildRootKind(Bytes.asSlice(&root.key), &mut identity) != 3 || !(run ExactSet.add(&mut named, Bytes.asSlice(&root.key))) { continue }
-    if let Option<EscapeGraph.Descriptor>.Some {value} = move run EscapeGraph.decodeDescriptor(Bytes.asSlice(&root.answer)) {
+    let answer = match move run CacheBundle.answerAt(&image.*, &mut cursor, index) {
+      Option<&[u8]>.Some {value} => value
+      _ => { continue }
+    }
+    if let Option<EscapeGraph.Descriptor>.Some {value} = move run EscapeGraph.decodeDescriptor(answer) {
       drop run DigestSet.add(&mut live, value.graph)
     }
   }
-  let mut kept = List<CacheImage.Root>.make()
-  while let Option<CacheImage.Root>.Some {value} = move List<CacheImage.Root>.pop(&mut image.roots) {
-    if let Option<ContentHash>.Some {value: digest} = EscapeGraph.readGraphKey(Bytes.asSlice(&value.key)) {
+  let mut kept = List<usize>.make()
+  let mut selectedKeys = ExactSet.make()
+  at = usize.ZERO
+  while at < roots.length {
+    let index = at
+    at = at + usize.ONE
+    if !run ExactSet.add(&mut selectedKeys, Bytes.asSlice(&roots[index].key)) { continue }
+    if let Option<ContentHash>.Some {value: digest} = EscapeGraph.readGraphKey(Bytes.asSlice(&roots[index].key)) {
       if DigestSet.find(&live, digest) == usize.MAX { continue }
     }
-    run List<CacheImage.Root>.append(&mut kept, move value)
+    run List<usize>.append(&mut kept, index)
   }
-  while let Option<CacheImage.Root>.Some {value} = move List<CacheImage.Root>.pop(&mut kept) {
-    run List<CacheImage.Root>.append(&mut image.roots, move value)
-  }
+  if !run CacheBundle.retainRoots(&mut image.*, List<usize>.asSlice(&kept)) { image.* = CacheBundle.make() }
 }
 
 struct EscapeImage {
@@ -5071,9 +5097,9 @@ impl EscapeImage {
   }
 
   // Takes the record of the check whose stable unit key is `unit`, if the image holds one.
-  fn take(self: &mut Self, image: &Option<CacheImage.Image>, unit: &[u8]) -> Option<EscapeRecordRoot> {
+  fn take(self: &mut Self, image: &Option<CacheBundle.Bundle>, unit: &[u8]) -> Option<EscapeRecordRoot> {
     let mut found = usize.MAX
-    if let Option<CacheImage.Image>.Some {value: adopted} = &image.* {
+    if let Option<CacheBundle.Bundle>.Some {value: adopted} = &image.* {
       let roots = List<CacheImage.Root>.asSlice(&adopted.roots)
       let held = List<EscapeRecordRoot>.asSlice(&self.records)
       let mut at = usize.ZERO
@@ -11212,16 +11238,7 @@ struct LeafPlacement {
 }
 
 // Whether `image` holds a build record, which a replay reads with its node's edges.
-fn recordsBuild(image: &CacheImage.Image) -> bool {
-  let roots = List<CacheImage.Root>.asSlice(&image.roots)
-  let mut exact = Span.make(usize.ZERO, usize.ZERO)
-  let mut at = usize.ZERO
-  while at < roots.length {
-    if buildRootKind(Bytes.asSlice(&roots[at].key), &mut exact) == 1 { return true }
-    at = at + usize.ONE
-  }
-  return false
-}
+
 
 pub struct Adopted {
   /// Module checks reused without sweeping.
@@ -11332,7 +11349,7 @@ fn unfit() -> usize { return usize.MAX - 2 }
 
 // The image under construction, with the node or leaf each unit and dependee became.
 struct ImageBuild {
-  image: CacheImage.Image,
+  image: CacheBundle.Bundle,
   nodes: List<usize>,
   files: List<usize>,
   inputs: List<usize>,
@@ -11378,7 +11395,7 @@ effect fn imageLeaf(resolver: &Resolver, build: &mut ImageBuild, dependee: Depen
       let modules = List<ModuleId>.asSlice(&resolver.modules)
       let mut key = Bytes.make()
       run StableKey.module(&mut key, &modules[module])
-      let leaf = run CacheImage.addLeaf(&mut build.image, false, move key, ContentHash {high: 0, low: 0}, usize.MAX, usize.MAX,
+      let leaf = run CacheBundle.addLeaf(&mut build.image, false, move key, ContentHash {high: 0, low: 0}, usize.MAX, usize.MAX,
         ContentHash {high: 0, low: 0})
       run List<usize>.append(&mut build.fileModules, module)
       List<usize>.set(&mut build.files, module, leaf)
@@ -11397,7 +11414,7 @@ effect fn imageLeaf(resolver: &Resolver, build: &mut ImageBuild, dependee: Depen
         let handle = Inputs.handle(&values[input].selector)
         let mut position = usize.MAX
         if handle != usize.MAX { position = DeclarationTable.position(&resolver.declarations, handle) }
-        found = run CacheImage.addLeaf(&mut build.image, true, move key, values[input].digest, position, file, values[input].text)
+        found = run CacheBundle.addLeaf(&mut build.image, true, move key, values[input].digest, position, file, values[input].text)
       }
       List<usize>.set(&mut build.inputs, input, found)
       return found
@@ -11457,7 +11474,7 @@ effect fn imageUnit(resolver: &Resolver, build: &mut ImageBuild, root: usize) ->
       edge = Graph.nextEdgeOf(&resolver.graph, edge)
     }
     if fit {
-      let node = run CacheImage.addNode(&mut build.image, List<usize>.asSlice(&edges))
+      let node = run CacheBundle.addNode(&mut build.image, List<usize>.asSlice(&edges))
       List<usize>.set(&mut build.nodes, unit, node)
     } else {
       List<usize>.set(&mut build.nodes, unit, unfit())
@@ -11551,7 +11568,7 @@ effect fn imageRoot(resolver: &Resolver, build: &mut ImageBuild, unit: usize, an
   if unitNode >= unfit() { return Option<Bytes>.some(move answer) }
   let node = run sitedNode(&resolver.*, &mut build.*, unitNode, sites)
   if node == usize.MAX { return Option<Bytes>.none() }
-  run List<CacheImage.Root>.append(&mut build.image.roots, CacheImage.Root {key: move key, node: node, answer: move answer})
+  drop run CacheBundle.addRoot(&mut build.image, CacheImage.Root {key: move key, node: node, answer: move answer})
   return Option<Bytes>.none()
 }
 
@@ -11570,7 +11587,7 @@ effect fn sitedNode(resolver: &Resolver, build: &mut ImageBuild, node: usize, si
     if !holdsUnit(List<usize>.asSlice(&edges), edge) { run List<usize>.append(&mut edges, edge) }
     at = at + usize.ONE
   }
-  return run CacheImage.addNode(&mut build.image, List<usize>.asSlice(&edges))
+  return run CacheBundle.addNode(&mut build.image, List<usize>.asSlice(&edges))
 }
 
 // The digest of one module's source bytes, or zero when the module has no source.
@@ -11591,6 +11608,25 @@ fn changedInput() -> ContentHash {
 // leaf's module ordinal, or an input leaf's input, interned with its value when this store has not
 // captured it yet. `fileModule` is the module of the file leaf an input leaf names when that file
 // reads the same, or `usize.MAX`.
+// Verifies one recorded leaf at most once across shards during this adoption. The memo key
+// retains exact old file identity/digest and position; it never treats a current selector alone
+// as proof that every old snapshot agrees.
+effect fn placeBundleLeaf(resolver: &mut Resolver, image: &CacheBundle.Bundle, proofs: &mut CacheInputProof.Memo,
+  keys: &mut CacheBundle.KeyCursor, index: usize, fileModule: usize) -> usize ! Cycle | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let leaf = CacheBundle.leaf(image, index)
+  let key = run CacheBundle.keyAt(image, &mut keys.*, index)
+  let mut fileKeys = CacheBundle.keyCursor()
+  let empty = Bytes.make()
+  let fileKey = if leaf.file == usize.MAX { Bytes.asSlice(&empty) } else { run CacheBundle.keyAt(image, &mut fileKeys, leaf.file) }
+  let fileDigest = if leaf.file == usize.MAX { ContentHash {high: 0, low: 0} } else { CacheBundle.leaf(image, leaf.file).digest }
+  let prior = CacheInputProof.find(&proofs.*, key, &leaf, fileKey, fileDigest)
+  if prior != usize.MAX { return CacheInputProof.placed(&proofs.*, prior) }
+  let placed = run placeLeaf(&mut resolver.*, &leaf, key, fileModule)
+  run CacheInputProof.remember(&mut proofs.*, key, &leaf, fileKey, fileDigest, placed,
+    placed == usize.MAX && positionalLeaf(&leaf))
+  return placed
+}
+
 effect fn placeLeaf(resolver: &mut Resolver, leaf: &CacheImage.Leaf, key: &[u8], fileModule: usize) -> usize ! Cycle | OutOfMemoryError ? &mut Allocator {
   let unchangedFile = fileModule != usize.MAX
   if leaf.input && ContentHash.equals(leaf.digest, changedInput()) { return usize.MAX }
@@ -11703,9 +11739,12 @@ fn declarationRootModule(key: &[u8]) -> Span {
 }
 
 // A copy of the answer of root `root` of the adopted image `image`; empty without one.
-effect fn adoptedAnswer(image: &Option<CacheImage.Image>, root: usize) -> Bytes ! OutOfMemoryError ? &mut Allocator {
-  if let Option<CacheImage.Image>.Some {value} = &image.* {
-    return run Bytes.copy(Bytes.asSlice(&List<CacheImage.Root>.asSlice(&value.roots)[root].answer))
+effect fn adoptedAnswer(image: &Option<CacheBundle.Bundle>, root: usize) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  if let Option<CacheBundle.Bundle>.Some {value} = &image.* {
+    let mut cursor = CacheBundle.answerCursor()
+    if let Option<&[u8]>.Some {value: bytes} = move run CacheBundle.answerAt(&value, &mut cursor, root) {
+      return run Bytes.copy(bytes)
+    }
   }
   return Bytes.make()
 }
@@ -94511,8 +94550,9 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
     replayReports: List<ReplayReport>.make(),
     carriedUnits: List<usize>.make(),
     carriedRoots: List<usize>.make(),
-    heldImage: Option<CacheImage.Image>.none(),
+    heldImage: Option<CacheBundle.Bundle>.none(),
     heldImageCorrupt: false,
+    nextAdoptedNode: usize.ZERO,
     reusableAdoptedChecks: false,
     pendingLookup: InternIndex.make(),
     pendingRoots: List<usize>.make(),
@@ -94864,12 +94904,12 @@ impl Semantic {
   }
   /// The roots of the image an unlinked `adoptCache` read that this store still holds as they
   /// were: they rest on nothing here, so the image this store writes next carries them over
-  /// (`CacheImage.carry`).
+  /// (`CacheBundle.appendSelected`).
   pub fn carried(self: &Self) -> &[usize] {
     return List<usize>.asSlice(&self.carriedRoots)
   }
   /// The build roots of the image an adoption read that the image `cacheImage` wrote last
-  /// carries over (`CacheImage.carry`): the definitions a replayed build took from that image.
+  /// carries over (`CacheBundle.appendSelected`): the definitions a replayed build took from that image.
   pub fn carriedDefinitions(self: &Self) -> &[usize] {
     return List<usize>.asSlice(&self.carriedBuild)
   }
@@ -95244,13 +95284,13 @@ impl Semantic {
   ///
   /// A store that is never revised passes `linked` false: its reused checks then rest on nothing,
   /// and no node becomes a unit, which spares recording the image's edges again.
-  pub effect fn adoptCache(self: &mut Self, request: &Request, image: &CacheImage.Image, linked: bool) -> Adopted
+  pub effect fn adoptCache(self: &mut Self, request: &Request, image: &CacheBundle.Bundle, linked: bool) -> Adopted
     ! Cycle | OutOfMemoryError ? &mut Allocator | &mut Types {
-    return run Semantic.adoptImage(&mut self.*, request, run CacheImage.copy(image), linked)
+    return run Semantic.adoptImage(&mut self.*, request, run CacheBundle.copy(image), linked)
   }
   /// As [`adoptCache`], keeping `image`, which [`adoptedImage`] gives back for the image this
   /// store writes next to carry its reused checks from.
-  pub effect fn adoptImage(self: &mut Self, request: &Request, image: CacheImage.Image, linked: bool) -> Adopted
+  pub effect fn adoptImage(self: &mut Self, request: &Request, image: CacheBundle.Bundle, linked: bool) -> Adopted
     ! Cycle | OutOfMemoryError ? &mut Allocator | &mut Types {
     // Record indices belong to exactly one held image, including when an existing store adopts another.
     Semantic.clearEscapeAdoption(&mut self.*)
@@ -95261,7 +95301,7 @@ impl Semantic {
   }
   // The replacement image does not become authoritative until adoption finishes. In
   // particular, a failed replacement cannot leave directories authenticated against it.
-  effect fn finishAdoption(self: &mut Self, held: CacheImage.Image, attempted: Result<Option<Adopted>, Cycle | OutOfMemoryError>) -> Adopted
+  effect fn finishAdoption(self: &mut Self, held: CacheBundle.Bundle, attempted: Result<Option<Adopted>, Cycle | OutOfMemoryError>) -> Adopted
     ! Cycle | OutOfMemoryError {
     let adopted = match move attempted {
       Result<Option<Adopted>, Cycle | OutOfMemoryError>.Success {value} => move value
@@ -95276,7 +95316,7 @@ impl Semantic {
     return match move adopted {
       Option<Adopted>.Some {value} => {
         self.reusableAdoptedChecks = value.roots > usize.ZERO || List<usize>.length(&self.escapeImage.roots) > usize.ZERO
-        self.heldImage = Option<CacheImage.Image>.some(move held)
+        self.heldImage = Option<CacheBundle.Bundle>.some(move held)
         self.heldImageCorrupt = false
         move value
       }
@@ -95287,11 +95327,30 @@ impl Semantic {
     }
   }
   fn clearEscapeAdoption(self: &mut Self) -> () {
+    // These ordinals belong to one association. Appending immutable shards preserves them;
+    // replacing or refusing that association cannot leave a pointer into a future generation.
     self.escapeGraphs = List<CachedEscapeGraph>.make()
+    self.escapeImage = EscapeImage.make()
+    self.carriedRoots = List<usize>.make()
+    self.carriedUnits = List<usize>.make()
+    self.carriedBuild = List<usize>.make()
+    self.artifactCacheRoots = List<usize>.make()
+    self.pendingRoots = List<usize>.make()
+    self.pendingLookup = InternIndex.make()
+    self.replay = Option<ReplayState>.none()
+    self.resolver.packs = List<HeldPack>.make()
+    self.packedBuild = PackedBuild.make()
+    self.pendingImage = Option<PendingImage>.none()
+    self.replayReports = List<ReplayReport>.make()
+    self.capturedBuild = Option<CapturedBuild>.none()
+    self.freshBuild = false
     let memos = List<EscapeMemo>.asMutSlice(&mut self.escapeMemos)
     let mut at = usize.ZERO
     while at < memos.length {
       memos[at].budgetRecord = usize.MAX
+      // Owned semantic answers remain valid under their ordinary query dependencies, but a
+      // retained capture may contain per-entry carried ordinals from the previous bundle.
+      memos[at].captured = Option<CapturedBuild>.none()
       if let Option<usize>.Some {..} = &memos[at].replayGuard {
         // The evidence is still required, but no index from the replaced image may address it.
         memos[at].replayGuard = Option<usize>.some(usize.MAX)
@@ -95299,132 +95358,121 @@ impl Semantic {
       at = at + usize.ONE
     }
   }
-  /// Reads the leaves of the image the store adopted, expands their keys and reads its nodes, so
-  /// a carry can copy its leaves and nodes (`CacheImage.readLeaves`, `CacheImage.expandKeys`,
-  /// `CacheImage.readNodes`). An image whose leaves or nodes do not read is let go, and nothing is
-  /// carried from it.
-  pub effect fn unpackAdoptedImage(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
-    let mut read = true
-    if let Option<CacheImage.Image>.Some {value: image} = &mut self.heldImage {
-      read = run CacheImage.readLeaves(&mut image)
-      if read {
-        run CacheImage.expandKeys(&mut image)
-        read = run CacheImage.readNodes(&mut image)
-      }
+  /// Validates held immutable shards and coordinator references without copying or expanding
+  /// their graphs. Refusal drops the association and invalidates all generation-owned handles.
+  pub effect fn validateAdoptedBundle(self: &mut Self) -> () ! OutOfMemoryError {
+    let valid = match &self.heldImage {
+      Option<CacheBundle.Bundle>.Some {value} => CacheBundle.validate(&value)
+      Option<CacheBundle.Bundle>.None => true
     }
-    if !read {
-      self.heldImage = Option<CacheImage.Image>.none()
+    if !valid {
+      self.heldImage = Option<CacheBundle.Bundle>.none()
       Semantic.clearEscapeAdoption(&mut self.*)
-      // Existing carried indexes must never become indexes into a later appended image.
       self.heldImageCorrupt = true
     }
   }
   /// The image the store adopted ([`adoptImage`]), if any.
-  pub fn adoptedImage<'a>(self: &'a Self) -> Option<&'a CacheImage.Image> {
+  pub fn adoptedImage<'a>(self: &'a Self) -> Option<&'a CacheBundle.Bundle> {
     return match &self.heldImage {
-      Option<CacheImage.Image>.Some {value} => Option<&CacheImage.Image>.some(&value)
-      Option<CacheImage.Image>.None => Option<&CacheImage.Image>.none()
+      Option<CacheBundle.Bundle>.Some {value} => Option<&CacheBundle.Bundle>.some(&value)
+      Option<CacheBundle.Bundle>.None => Option<&CacheBundle.Bundle>.none()
     }
   }
-  // Adopts `image`, or none when its nodes, which it reads only when a leaf changed or the store
-  // is linked or a build record needs them (`CacheImage.readNodes`), do not read.
-  effect fn adoptFrom(self: &mut Self, request: &Request, image: &mut CacheImage.Image, linked: bool) -> Option<Adopted>
+  // Adopts a structurally validated bundle with source checks scoped to its selected roots.
+  effect fn adoptFrom(self: &mut Self, request: &Request, image: &mut CacheBundle.Bundle, linked: bool) -> Option<Adopted>
     ! Cycle | OutOfMemoryError ? &mut Allocator | &mut Types {
     run selectRequest(&mut self.resolver, request)
     run reconcileSources(&mut self.resolver)
-    // An unlinked store whose anchors all stand where the image recorded them finds every leaf
-    // unchanged without reading the others (`placeAnchors`).
-    if !linked && !CacheImage.leavesRead(&image.*) && run Semantic.placeAnchors(&mut self.*, &image.*) {
-      if recordsBuild(&image.*) {
-        if !run CacheImage.readNodes(&mut image.*) { return Option<Adopted>.none() }
-      }
-      let unchanged = LeafPlacement {placed: List<usize>.make(), positional: List<bool>.make(), changed: usize.ZERO}
-      return Option<Adopted>.some(run Semantic.adoptNodes(&mut self.*, &image.*, linked, move unchanged))
+    let traced = bundleAdoptionTrace()
+    let beganValidation = if traced { run frontierNow() } else { 0 }
+    if !CacheBundle.validate(&image.*) { return Option<Adopted>.none() }
+    if traced { run frontierTrace(b"bundle validation", beganValidation, CacheBundle.nodeCount(&image.*), CacheBundle.leafCount(&image.*)) }
+    let beganLive = if traced { run frontierNow() } else { 0 }
+    let live = match move run CacheBundleLive.compute(&image.*) {
+      Option<CacheBundleLive.Live>.Some {value} => move value
+      _ => { return Option<Adopted>.none() }
     }
-    // Placing a leaf again finds what an anchor placed (`placeLeaf`).
-    if !run CacheImage.readLeaves(&mut image.*) { return Option<Adopted>.none() }
-    let placement = run Semantic.placeImageLeaves(&mut self.*, &image.*, linked)
-    if linked || placement.changed > usize.ZERO || recordsBuild(&image.*) {
-      if !run CacheImage.readNodes(&mut image.*) { return Option<Adopted>.none() }
-    }
-    return Option<Adopted>.some(run Semantic.adoptNodes(&mut self.*, &image.*, linked, move placement))
+    if traced { run frontierTrace(b"bundle liveness", beganLive, CacheBundle.nodeCount(&image.*), CacheBundle.leafCount(&image.*)) }
+    // Proofs are local to this exact revision/request/profile. A failed attempt drops them;
+    // file identity and recorded evidence distinguish equal selectors from different shards.
+    let mut proofs = CacheInputProof.make()
+    let beganAnchors = if traced { run frontierNow() } else { 0 }
+    let unchanged = !linked && run Semantic.placeAnchors(&mut self.*, &image.*, &live, &mut proofs)
+    if traced { run frontierTrace(b"bundle anchors", beganAnchors, CacheBundle.anchorCount(&image.*), CacheInputProof.count(&proofs)) }
+    let beganLeaves = if traced { run frontierNow() } else { 0 }
+    let placement = if unchanged {
+      LeafPlacement {placed: List<usize>.make(), positional: List<bool>.make(), changed: usize.ZERO}
+    } else { run Semantic.placeImageLeaves(&mut self.*, &image.*, &live, linked, &mut proofs) }
+    if traced { run frontierTrace(b"bundle leaves", beganLeaves, CacheInputProof.count(&proofs), placement.changed) }
+    let beganNodes = if traced { run frontierNow() } else { 0 }
+    let adopted = run Semantic.adoptNodes(&mut self.*, &image.*, &live, linked, move placement)
+    if traced { run frontierTrace(b"bundle attach", beganNodes, adopted.roots, adopted.stale) }
+    return Option<Adopted>.some(move adopted)
   }
-  // Whether the anchors of `image`, whose other leaves are not read, all stand where the image
-  // recorded them, placed as `placeImageLeaves` places them: files first, then inputs, each in
-  // index order. Every other leaf is an input of an unchanged file that is not always placed
-  // (`CacheImage.alwaysPlaced`), which an unlinked store takes as unchanged without placing it.
-  effect fn placeAnchors(self: &mut Self, image: &CacheImage.Image) -> bool ! Cycle | OutOfMemoryError ? &mut Allocator | &mut Types {
-    let anchors = CacheImage.anchors(image)
-    let mut placed = List<usize>.make()
-    run List<usize>.appendRepeated(&mut placed, usize.MAX, anchors.length)
+
+  // Anchor summaries include Request/Resolution and every other always-placed fact, not only
+  // authored files. Scalar overrides are observed through the same Bundle leaf accessor.
+  effect fn placeAnchors(self: &mut Self, image: &CacheBundle.Bundle, live: &CacheBundleLive.Live, proofs: &mut CacheInputProof.Memo) -> bool
+    ! Cycle | OutOfMemoryError ? &mut Allocator | &mut Types {
     let mut at = usize.ZERO
-    while at < anchors.length {
-      if !anchors[at].leaf.input {
-        let found = run placeLeaf(&mut self.resolver, &anchors[at].leaf, CacheImage.anchorKey(&anchors[at]), usize.MAX)
-        if found == usize.MAX { return false }
-        List<usize>.set(&mut placed, at, found)
-      }
+    let mut keys = CacheBundle.keyCursor()
+    while at < CacheBundle.anchorCount(image) {
+      let index = CacheBundle.anchorIndex(image, at)
+      let leaf = CacheBundle.leaf(image, index)
       at = at + usize.ONE
-    }
-    at = usize.ZERO
-    while at < anchors.length {
-      if anchors[at].leaf.input {
-        let mut fileModule = usize.MAX
-        if anchors[at].leaf.file != usize.MAX { fileModule = List<usize>.get(&placed, CacheImage.anchorIndex(anchors, anchors[at].leaf.file)) }
-        let found = run placeLeaf(&mut self.resolver, &anchors[at].leaf, CacheImage.anchorKey(&anchors[at]), fileModule)
-        if found == usize.MAX { return false }
+      // Evidence overlays conservatively add anchors. Only the resolved always-placed facts
+      // participate in this shortcut; ordinary refreshed facets follow their unchanged file.
+      if !CacheBundleLive.leaf(live, index) || !CacheImage.alwaysPlaced(&leaf) { continue }
+      let mut fileModule = usize.MAX
+      if leaf.input && leaf.file != usize.MAX {
+        fileModule = run placeBundleLeaf(&mut self.resolver, image, &mut proofs.*, &mut keys, leaf.file, usize.MAX)
       }
-      at = at + usize.ONE
+      if (run placeBundleLeaf(&mut self.resolver, image, &mut proofs.*, &mut keys, index, fileModule)) == usize.MAX { return false }
     }
     return true
   }
-  // Where each leaf of `image` stands now (`placeLeaf`), and whether each changed one records only
-  // where a span sits (`positionalLeaf`).
-  effect fn placeImageLeaves(self: &mut Self, image: &CacheImage.Image, linked: bool) -> LeafPlacement
+
+  effect fn placeImageLeaves(self: &mut Self, image: &CacheBundle.Bundle, live: &CacheBundleLive.Live, linked: bool, proofs: &mut CacheInputProof.Memo) -> LeafPlacement
     ! Cycle | OutOfMemoryError ? &mut Allocator | &mut Types {
-    let leaves = CacheImage.leaves(image)
+    let count = CacheBundle.leafCount(image)
     let mut changed = usize.ZERO
     let mut placed = List<usize>.make()
-    // Files first: an input read from a file that reads as the image recorded is unchanged too.
-    // Another leaf of the same module can record other bytes: a carried input names the file it
-    // was read from, which an edit since can have changed.
-    // Only the keys of the leaves placed are read (`CacheImage.keyAt`).
-    let mut keys = CacheImage.keyCursor()
+    let mut keys = CacheBundle.keyCursor()
     let mut at = usize.ZERO
-    while at < leaves.length {
-      let mut dependee = usize.MAX
-      if !leaves[at].input { dependee = run placeLeaf(&mut self.resolver, &leaves[at], run CacheImage.keyAt(image, &mut keys, at), usize.MAX) }
-      run List<usize>.append(&mut placed, dependee)
+    while at < count {
+      let leaf = CacheBundle.leaf(image, at)
+      let result = if leaf.input || !CacheBundleLive.leaf(live, at) { usize.MAX } else {
+        run placeBundleLeaf(&mut self.resolver, image, &mut proofs.*, &mut keys, at, usize.MAX)
+      }
+      run List<usize>.append(&mut placed, result)
       at = at + usize.ONE
     }
-    // Whether each changed leaf records only where a span sits (`positionalLeaf`).
     let mut positional = List<bool>.make()
-    run List<bool>.appendRepeated(&mut positional, false, leaves.length)
+    run List<bool>.appendRepeated(&mut positional, false, count)
     at = usize.ZERO
-    while at < leaves.length {
-      if leaves[at].input {
-        let file = leaves[at].file
-        let mut fileModule = usize.MAX
-        if file != usize.MAX { fileModule = List<usize>.get(&placed, file) }
-        // An unlinked store records no edge to an input, so an input that reads as the image
-        // recorded needs no input of its own here: a check that runs again captures what it reads.
-        // Its key is not read either.
-        if !linked && unchangedLeaf(&leaves[at], fileModule) {
+    while at < count {
+      if !CacheBundleLive.leaf(live, at) { at = at + usize.ONE continue }
+      let leaf = CacheBundle.leaf(image, at)
+      if leaf.input {
+        let file = leaf.file
+        let fileModule = if file == usize.MAX { usize.MAX } else { List<usize>.get(&placed, file) }
+        if !linked && unchangedLeaf(&leaf, fileModule) {
           List<usize>.set(&mut placed, at, unplacedInput())
-          run carryInput(&mut self.resolver.carried, run CacheImage.keyAt(image, &mut keys, at), &leaves[at], fileModule,
-            leaves[file].digest)
+          run carryInput(&mut self.resolver.carried, run CacheBundle.keyAt(image, &mut keys, at), &leaf, fileModule,
+            CacheBundle.leaf(image, file).digest)
         } else {
-          List<usize>.set(&mut placed, at, run placeLeaf(&mut self.resolver, &leaves[at], run CacheImage.keyAt(image, &mut keys, at), fileModule))
+          List<usize>.set(&mut placed, at, run placeBundleLeaf(&mut self.resolver, image, &mut proofs.*, &mut keys, at, fileModule))
         }
-        if List<usize>.get(&placed, at) == usize.MAX { List<bool>.set(&mut positional, at, positionalLeaf(&leaves[at])) }
+        if List<usize>.get(&placed, at) == usize.MAX { List<bool>.set(&mut positional, at, positionalLeaf(&leaf)) }
       }
       if List<usize>.get(&placed, at) == usize.MAX { changed = changed + usize.ONE }
       at = at + usize.ONE
     }
     return LeafPlacement {placed: move placed, positional: move positional, changed: changed}
   }
+
   // Adopts the nodes and roots of `image` whose leaves stand as `placement` finds them.
-  effect fn adoptNodes(self: &mut Self, image: &CacheImage.Image, linked: bool, placement: LeafPlacement) -> Adopted
+  effect fn adoptNodes(self: &mut Self, image: &CacheBundle.Bundle, live: &CacheBundleLive.Live, linked: bool, placement: LeafPlacement) -> Adopted
     ! Cycle | OutOfMemoryError ? &mut Allocator | &mut Types {
     let LeafPlacement {placed, positional, changed} = move placement
     let mut adopted = Adopted {roots: usize.ZERO, stale: usize.ZERO, nodes: usize.ZERO, changedLeaves: changed}
@@ -95433,31 +95481,34 @@ impl Semantic {
     // Whether a node reads the same once positions are set aside: every leaf it reaches reads as
     // the image recorded, or records only where a span sits (`positionalLeaf`).
     let mut settled = List<bool>.make()
-    let nodes = CacheImage.nodeCount(image)
-    // In an unlinked store with every leaf reading as the image recorded, every node is green.
-    if !linked && adopted.changedLeaves == usize.ZERO {
-      run List<usize>.reserveExact(&mut units, nodes)
-      run List<bool>.appendRepeated(&mut settled, true, nodes)
-      while at < nodes {
-        run List<usize>.append(&mut units, at)
-        at = at + usize.ONE
-      }
+    let nodes = CacheBundle.nodeCount(image)
+    let nodeBase = self.nextAdoptedNode
+    if linked {
+      if nodes > usize.MAX - nodeBase { fail OutOfMemoryError {} }
+      self.nextAdoptedNode = nodeBase + nodes
     }
-    while at < nodes {
-      let edges = CacheImage.edgesOf(image, at)
+    // In an unlinked store with every leaf reading as the image recorded, every node is green.
+    let uniform = !linked && adopted.changedLeaves == usize.ZERO
+    while at < nodes && !uniform {
+      if !CacheBundleLive.node(live, at) {
+        run List<usize>.append(&mut units, usize.MAX)
+        run List<bool>.append(&mut settled, false)
+        at = at + usize.ONE
+        continue
+      }
+      let mut edges = CacheBundle.edgeCursor(image, at)
       let mut green = true
       let mut still = true
-      let mut edge = usize.ZERO
-      while edge < edges.length && still {
-        let named = CacheImage.target(edges[edge])
-        if CacheImage.namesNode(edges[edge]) {
+      while let Option<usize>.Some {value: edge} = move CacheBundle.nextEdge(image, &mut edges) {
+        if !still { break }
+        let named = CacheImage.target(edge)
+        if CacheImage.namesNode(edge) {
           green = green && List<usize>.get(&units, named) != usize.MAX
           still = List<bool>.get(&settled, named)
         } else if List<usize>.get(&placed, named) == usize.MAX {
           green = false
           still = List<bool>.get(&positional, named)
         }
-        edge = edge + usize.ONE
       }
       run List<bool>.append(&mut settled, still)
       let mut unit = usize.MAX
@@ -95466,22 +95517,21 @@ impl Semantic {
         unit = at
       } else if green {
         let word = run internKey(&mut self.resolver, Key {family: Family.ModuleCheck, module: usize.ZERO, name: 2,
-          declaration: usize.MAX, member: at, external: false})
+          declaration: usize.MAX, member: nodeBase + at, external: false})
         unit = u64.toUsize(word.value)
         run Graph.startRun(&mut self.resolver.graph, unit)
-        edge = usize.ZERO
-        while edge < edges.length {
-          let named = CacheImage.target(edges[edge])
-          if CacheImage.namesNode(edges[edge]) {
+        edges = CacheBundle.edgeCursor(image, at)
+        while let Option<usize>.Some {value: edge} = move CacheBundle.nextEdge(image, &mut edges) {
+          let named = CacheImage.target(edge)
+          if CacheImage.namesNode(edge) {
             run Graph.record(&mut self.resolver.graph, unit, Dependee.UnitResult {unit: List<usize>.get(&units, named)})
-          } else if CacheImage.leaves(image)[named].input {
+          } else if CacheBundle.leaf(image, named).input {
             let input = List<usize>.get(&placed, named)
             let module = List<Inputs.Input>.asSlice(&self.resolver.sourceInputs.inputs)[input].module
             run Graph.record(&mut self.resolver.graph, unit, Dependee.SourceInput {input: input, module: module})
           } else {
             run Graph.record(&mut self.resolver.graph, unit, Dependee.SourceFile {module: List<usize>.get(&placed, named)})
           }
-          edge = edge + usize.ONE
         }
         drop run Graph.finishRun(&mut self.resolver.graph, unit, Option<ContentHash>.none())
         adopted.nodes = adopted.nodes + usize.ONE
@@ -95490,6 +95540,7 @@ impl Semantic {
       at = at + usize.ONE
     }
     let roots = List<CacheImage.Root>.asSlice(&image.roots)
+    let mut answers = CacheBundle.answerCursor()
     // The build record and the definitions of a build walk sit beside the checks; a build
     // replays them (`replayBuild`).
     let mut recordRoot = usize.MAX
@@ -95503,9 +95554,10 @@ impl Semantic {
     let mut budgetEntries = DigestSet.make()
     at = usize.ZERO
     while at < roots.length {
+      if !CacheBundleLive.root(live, at) { at = at + usize.ONE continue }
       let root = &roots[at]
       at = at + usize.ONE
-      let node = List<usize>.get(&units, root.node)
+      let node = if uniform { root.node } else { List<usize>.get(&units, root.node) }
       let mut exact = Span.make(usize.ZERO, usize.ZERO)
       let kind = buildRootKind(Bytes.asSlice(&root.key), &mut exact)
       if kind == 6 { continue }
@@ -95518,7 +95570,7 @@ impl Semantic {
       // the file, rest on the whole file. So an unlinked store reuses a definition when only where
       // its declaration sits moved, as when a line is inserted above it.
       if kind == 2 {
-        if node != usize.MAX || (!linked && List<bool>.get(&settled, root.node)) {
+        if node != usize.MAX || (!linked && (uniform || List<bool>.get(&settled, root.node))) {
           run List<usize>.append(&mut greenDefinitions, at - usize.ONE)
         }
         continue
@@ -95527,7 +95579,11 @@ impl Semantic {
       if kind == 5 {
         if node != usize.MAX {
           run List<usize>.append(&mut packRoots, at - usize.ONE)
-          if !linked && self.resolver.packing { run Semantic.holdPack(&mut self.*, at - usize.ONE, Bytes.asSlice(&root.answer)) }
+          if !linked && self.resolver.packing {
+            if let Option<&[u8]>.Some {value: answer} = move run CacheBundle.answerAt(image, &mut answers, at - usize.ONE) {
+              run Semantic.holdPack(&mut self.*, at - usize.ONE, answer)
+            }
+          }
         }
         continue
       }
@@ -95535,11 +95591,11 @@ impl Semantic {
       // digest and the exact keys it reaches, and a replay finds every site from the anchors of
       // the source it reads now.
       if kind == 3 || kind == 4 {
-        if node != usize.MAX || List<bool>.get(&settled, root.node) {
+        if node != usize.MAX || (uniform || List<bool>.get(&settled, root.node)) {
           if kind == 3 { run List<usize>.append(&mut budgetRecords, at - usize.ONE) }
           else { drop run DigestSet.add(&mut budgetEntries, digestOfBytes(StableKey.view(Bytes.asSlice(&root.key), exact))) }
         }
-        if (node != usize.MAX || List<bool>.get(&settled, root.node)) && !linked {
+        if (node != usize.MAX || (uniform || List<bool>.get(&settled, root.node))) && !linked {
           let named = StableKey.view(Bytes.asSlice(&root.key), exact)
           if kind == 3 {
             run List<EscapeRecordRoot>.append(&mut self.escapeImage.records, EscapeRecordRoot {unit: exact, root: at - usize.ONE})
@@ -95551,7 +95607,7 @@ impl Semantic {
       }
       // An unlinked store reads a declaration's check root only when a sweep of its module runs:
       // a sweep that is reused reads none of them.
-      if !linked && (node != usize.MAX || List<bool>.get(&settled, root.node)) {
+      if !linked && (node != usize.MAX || (uniform || List<bool>.get(&settled, root.node))) {
         let module = declarationRootModule(Bytes.asSlice(&root.key))
         if module.end > module.start {
           run InternIndex.record(&mut self.pendingLookup, InternIndex.hashBytes(0, StableKey.view(Bytes.asSlice(&root.key), module)))
@@ -95563,15 +95619,19 @@ impl Semantic {
         }
       }
       let key = run readCheckKey(Bytes.asSlice(&root.key))
+      let encoded = match move run CacheBundle.answerAt(image, &mut answers, at - usize.ONE) {
+        Option<&[u8]>.Some {value} => value
+        _ => { adopted.stale = adopted.stale + usize.ONE continue }
+      }
       let answer = match &key {
-        Option<CheckKey>.Some {value: checked} => run readCheckAnswer(Bytes.asSlice(&root.answer), Option<&ModuleId>.some(&checked.module))
-        Option<CheckKey>.None => run readCheckAnswer(Bytes.asSlice(&root.answer), Option<&ModuleId>.none())
+        Option<CheckKey>.Some {value: checked} => run readCheckAnswer(encoded, Option<&ModuleId>.some(&checked.module))
+        Option<CheckKey>.None => run readCheckAnswer(encoded, Option<&ModuleId>.none())
       }
       let mut reused = false
       // A check root holds no position but the spans it reports, which rest on the whole files
       // they point into (`sitedNode`). So an unlinked store reuses it when only where other spans
       // sit moved, as when a line is inserted above it. A linked store needs each node current.
-      let positioned = !linked && List<bool>.get(&settled, root.node)
+      let positioned = !linked && (uniform || List<bool>.get(&settled, root.node))
       if let Option<CheckKey>.Some {value: check} = move key {
         if let Option<CheckAnswer>.Some {value: kept} = move answer {
           if node != usize.MAX || positioned {
@@ -95595,14 +95655,19 @@ impl Semantic {
     return move adopted
   }
 
-  effect fn attachEscapeBudgets(self: &mut Self, image: &CacheImage.Image, candidates: &[usize], green: &DigestSet) -> ()
+  effect fn attachEscapeBudgets(self: &mut Self, image: &CacheBundle.Bundle, candidates: &[usize], green: &DigestSet) -> ()
   ! OutOfMemoryError ? &mut Allocator {
     let roots = List<CacheImage.Root>.asSlice(&image.roots)
+    let mut answers = CacheBundle.answerCursor()
     let mut at = usize.ZERO
     while at < candidates.length {
       let root = candidates[at]
       at = at + usize.ONE
-      if !(run escapeAnswerGreen(image, &mut self.escapeGraphs, Bytes.asSlice(&roots[root].answer), green)) { continue }
+      let encoded = match move run CacheBundle.answerAt(image, &mut answers, root) {
+        Option<&[u8]>.Some {value} => value
+        _ => { continue }
+      }
+      if !(run escapeAnswerGreen(image, &mut self.escapeGraphs, encoded, green)) { continue }
       let mut exact = Span.make(usize.ZERO, usize.ZERO)
       if buildRootKind(Bytes.asSlice(&roots[root].key), &mut exact) != 3 { continue }
       let key = StableKey.view(Bytes.asSlice(&roots[root].key), exact)
@@ -95704,12 +95769,12 @@ impl Semantic {
   /// The roots of `image` that hold module checks and escape walks, which rest only on sources and
   /// the source inputs they record, not its build records, definitions or packs, which also rest
   /// on the profile that wrote them.
-  pub effect fn checkRoots(image: &CacheImage.Image) -> List<usize> ! OutOfMemoryError ? &mut Allocator {
+  pub effect fn checkRoots(image: &CacheBundle.Bundle) -> List<usize> ! OutOfMemoryError ? &mut Allocator {
     return run rootsOfKinds(image, true)
   }
   /// The roots of `image` that hold escape walks: each walk's record and the entries it reached,
   /// which a check that walks the same module again rewalks from (`rewalkEscapes`).
-  pub effect fn escapeRoots(image: &CacheImage.Image) -> List<usize> ! OutOfMemoryError ? &mut Allocator {
+  pub effect fn escapeRoots(image: &CacheBundle.Bundle) -> List<usize> ! OutOfMemoryError ? &mut Allocator {
     return run rootsOfKinds(image, false)
   }
   /// The image of this store's module checks for a cache on disk: each current module sweep and
@@ -95717,18 +95782,21 @@ impl Semantic {
   /// reports, which also rest on the files their spans point into. A check that left a gap or an
   /// unchecked body, or reported what an image does not carry (`RejectionImage.encode`), is left
   /// out and runs again in the next process. So is a check an unlinked `adoptCache` reused: it
-  /// rests on nothing here, and its image carries it (`CacheImage.carry` with `Adopted.carried`).
-  pub effect fn cacheImage(self: &mut Self) -> CacheImage.Image ! Cycle | OutOfMemoryError ? &mut Allocator {
+  /// rests on nothing here, and its image carries it (`CacheBundle.appendSelected` with `Adopted.carried`).
+  pub effect fn cacheImage(self: &mut Self) -> CacheBundle.Bundle ! Cycle | OutOfMemoryError ? &mut Allocator {
     return run Semantic.cacheImageWithWalkRecords(&mut self.*, true)
   }
   // Worker transport never publishes partition walk records; its coordinator supplies the
   // complete proved records. Both purposes share exact declaration and per-MIR dependencies.
-  effect fn cacheImageWithWalkRecords(self: &mut Self, includeWalkRecords: bool) -> CacheImage.Image
+  effect fn cacheImageWithWalkRecords(self: &mut Self, includeWalkRecords: bool) -> CacheBundle.Bundle
   ! Cycle | OutOfMemoryError ? &mut Allocator {
     // Input digests and the file digests beside them must describe the same bytes.
     run reconcileSources(&mut self.resolver)
     run settleSourceInputs(&mut self.resolver)
-    let mut build = ImageBuild {image: CacheImage.make(), nodes: List<usize>.make(), files: List<usize>.make(),
+    // Every inherited guard below sees one immutable source snapshot. Repeated imports can
+    // reuse its address translation rather than duplicating the held graph range.
+    if let Option<CacheBundle.Bundle>.Some {value: held} = &mut self.heldImage { run CacheBundle.seal(&mut held) }
+    let mut build = ImageBuild {image: CacheBundle.make(), nodes: List<usize>.make(), files: List<usize>.make(),
       inputs: List<usize>.make(), fileModules: List<usize>.make()}
     // A reused check rests on nothing here, so a check resting on it waits for its carried node.
     let reused = List<usize>.asSlice(&self.carriedUnits)
@@ -95849,18 +95917,18 @@ impl Semantic {
         let mut node = usize.MAX
         let mut answer = Bytes.make()
         if entry.value == usize.MAX {
-          node = run CacheImage.addNode(&mut build.image, &[CacheImage.nodeEdge(mirNode)])
+          node = run CacheBundle.addNode(&mut build.image, &[CacheImage.nodeEdge(mirNode)])
         } else {
           // A definition also rests on every layout its text was emitted against, which its MIR
           // need not read: a generic body indexes or views its element at the element's stride.
           let mut edges = List<usize>.make()
           run List<usize>.append(&mut edges, CacheImage.nodeEdge(mirNode))
           if !run emittedLayoutEdges(&self.resolver, &mut build, entry.emissionUnit, &mut edges) { continue }
-          node = run CacheImage.addNode(&mut build.image, List<usize>.asSlice(&edges))
+          node = run CacheBundle.addNode(&mut build.image, List<usize>.asSlice(&edges))
           let values = List<InstanceDefinition>.asSlice(&self.resolver.llvmValues)
           answer = run BuildRecord.encodeDefinition(&values[entry.value])
         }
-        run List<CacheImage.Root>.append(&mut build.image.roots, CacheImage.Root {key: run buildEntryKey(exact), node: node,
+        drop run CacheBundle.addRoot(&mut build.image, CacheImage.Root {key: run buildEntryKey(exact), node: node,
           answer: move answer})
       }
       // Each pack the build assembled rests on nothing: a replay holds it only for the definitions
@@ -95868,8 +95936,8 @@ impl Semantic {
       let fresh = List<BuildRecord.Pack>.asSlice(&self.packedBuild.fresh)
       at = usize.ZERO
       while at < fresh.length {
-        let node = run CacheImage.addNode(&mut build.image, &[])
-        run List<CacheImage.Root>.append(&mut build.image.roots, CacheImage.Root {key: run buildPackKey(fresh[at].digest), node: node,
+        let node = run CacheBundle.addNode(&mut build.image, &[])
+        drop run CacheBundle.addRoot(&mut build.image, CacheImage.Root {key: run buildPackKey(fresh[at].digest), node: node,
           answer: run BuildRecord.encodePack(&fresh[at])})
         at = at + usize.ONE
       }
@@ -95886,13 +95954,13 @@ impl Semantic {
         } else {
           let mut node = usize.MAX
           if captured.guard == usize.MAX {
-            node = run CacheImage.addNode(&mut build.image, &[])
+            node = run CacheBundle.addNode(&mut build.image, &[])
           } else {
             let guardNode = run imageUnit(&self.resolver, &mut build, captured.guard)
-            if guardNode < unfit() { node = run CacheImage.addNode(&mut build.image, &[CacheImage.nodeEdge(guardNode)]) }
+            if guardNode < unfit() { node = run CacheBundle.addNode(&mut build.image, &[CacheImage.nodeEdge(guardNode)]) }
           }
           if node != usize.MAX {
-            run List<CacheImage.Root>.append(&mut build.image.roots, CacheImage.Root {key: run buildRecordKey(), node: node,
+            drop run CacheBundle.addRoot(&mut build.image, CacheImage.Root {key: run buildRecordKey(), node: node,
               answer: run BuildRecord.encode(&captured.record)})
           }
         }
@@ -95928,24 +95996,22 @@ impl Semantic {
       let module = resolvedModule(&self.resolver, List<usize>.get(&build.fileModules, file))
       let leaf = List<usize>.get(&build.files, List<usize>.get(&build.fileModules, file))
       let digest = run sourceDigest(&mut self.resolver, &module)
-      let mut leaves = CacheImage.leavesMut(&mut build.image)
-      leaves[leaf].digest = digest
+      let saved = CacheBundle.leaf(&build.image, leaf)
+      run CacheBundle.updateLeafEvidence(&mut build.image, leaf, digest, saved.text, saved.position, saved.file)
       file = file + usize.ONE
     }
   }
   /// Finishes a cache image with exactly the previously verified roots this store reused.
   /// Both disk publication and retained-worker transport use the same carry rules.
-  pub effect fn completeCacheImage(self: &mut Self) -> CacheImage.Image ! Cycle | OutOfMemoryError ? &mut Allocator {
+  pub effect fn completeCacheImage(self: &mut Self) -> CacheBundle.Bundle ! Cycle | OutOfMemoryError ? &mut Allocator {
     return run Semantic.completeCacheImageWithWalkRecords(&mut self.*, true)
   }
-  effect fn completeCacheImageWithWalkRecords(self: &mut Self, includeWalkRecords: bool) -> CacheImage.Image
+  effect fn completeCacheImageWithWalkRecords(self: &mut Self, includeWalkRecords: bool) -> CacheBundle.Bundle
   ! Cycle | OutOfMemoryError ? &mut Allocator {
     let mut image = run Semantic.cacheImageWithWalkRecords(&mut self.*, includeWalkRecords)
-    run Semantic.unpackAdoptedImage(&mut self.*)
     let mut adopted = false
     let mut nodes = List<usize>.make()
-    if let Option<&CacheImage.Image>.Some {value: read} = Semantic.adoptedImage(&self.*) {
-      adopted = true
+    if let Option<&CacheBundle.Bundle>.Some {value: read} = Semantic.adoptedImage(&self.*) {
       let mut carried = run copySlots(Semantic.carried(&self.*))
       let definitions = Semantic.carriedDefinitions(&self.*)
       let mut at = usize.ZERO
@@ -95954,29 +96020,36 @@ impl Semantic {
         at = at + usize.ONE
       }
       run includeEscapeBlobs(read, &mut carried)
-      nodes = run CacheImage.carry(&mut image, read, List<usize>.asSlice(&carried))
+      if let Option<usize>.Some {value: base} = move run CacheBundle.appendSelected(&mut image, read, List<usize>.asSlice(&carried)) {
+        adopted = true
+        let roots = List<CacheImage.Root>.asSlice(&image.roots)
+        at = usize.ZERO
+        while at < List<usize>.length(&carried) {
+          run List<usize>.append(&mut nodes, roots[base + at].node)
+          at = at + usize.ONE
+        }
+      }
     }
     if adopted {
       run Semantic.imageCarriedChecks(&mut self.*, &mut image, List<usize>.asSlice(&nodes))
       run Semantic.imageReplayedChecks(&self.*, &mut image)
       run Semantic.imageCarriedFiles(&mut self.*, &mut image)
-    }
-    run pruneEscapeBlobs(&mut image)
+    } else { run pruneEscapeBlobs(&mut image) }
     return move image
   }
 
-  /// Adds to `image`, once `CacheImage.carry` has copied into it what this store reused and given
+  /// Adds to `image`, once `CacheBundle.appendSelected` has copied into it what this store reused and given
   /// `nodes`, the node of each check in `carried` order, the checks `cacheImage` could not write
   /// because they rest on a reused check: such a check rests on that check's carried node, so a
   /// module swept again after an edit keeps its root although it reused its other declarations.
-  pub effect fn imageCarriedChecks(self: &mut Self, image: &mut CacheImage.Image, nodes: &[usize]) -> ()
+  pub effect fn imageCarriedChecks(self: &mut Self, image: &mut CacheBundle.Bundle, nodes: &[usize]) -> ()
     ! Cycle | OutOfMemoryError ? &mut Allocator {
     let held = match move Intrinsic.replace(self.pendingImage, Option<PendingImage>.none()) {
       Option<PendingImage>.Some {value} => move value
       Option<PendingImage>.None => { return () }
     }
     let PendingImage {nodes: built, files, inputs, fileModules, checks} = move held
-    let mut build = ImageBuild {image: Intrinsic.replace(image.*, CacheImage.make()), nodes: move built, files: move files,
+    let mut build = ImageBuild {image: Intrinsic.replace(image.*, CacheBundle.make()), nodes: move built, files: move files,
       inputs: move inputs, fileModules: move fileModules}
     // A unit unfit only for a reused check it reached is looked at again.
     let mut slots = List<usize>.asMutSlice(&mut build.nodes)
@@ -96004,7 +96077,7 @@ impl Semantic {
     run Semantic.fileDigests(&mut self.*, &mut build, filled)
     image.* = move build.image
   }
-  /// Adds to `image`, once `CacheImage.carry` has copied into it what this store reused, the root of
+  /// Adds to `image`, once `CacheBundle.appendSelected` has copied into it what this store reused, the root of
   /// each escape check a replay made current (`replayEscapes`). The root rests on the walk's record
   /// and on the root of every entry the record names, so it stays green while a replay would
   /// agree again, and the next check takes it without replaying. The root of a replay that reports
@@ -96012,7 +96085,7 @@ impl Semantic {
   /// and the files its reports point into, which `cacheImage` wrote: a broken body that lowers to
   /// nothing has no entry root, but its MIR is among what the replay demanded. A check whose
   /// record or entries `image` lacks is left out, and replays again.
-  pub effect fn imageReplayedChecks(self: &Self, image: &mut CacheImage.Image) -> () ! OutOfMemoryError ? &mut Allocator {
+  pub effect fn imageReplayedChecks(self: &Self, image: &mut CacheBundle.Bundle) -> () ! OutOfMemoryError ? &mut Allocator {
     let memos = List<EscapeMemo>.asSlice(&self.escapeMemos)
     let reports = List<ReplayReport>.asSlice(&self.replayReports)
     let mut replayed = List<usize>.make()
@@ -96079,25 +96152,32 @@ impl Semantic {
           entry = entry + usize.ONE
         }
         if !whole { continue }
-        let node = run CacheImage.addNode(&mut image.*, List<usize>.asSlice(&edges))
+        let node = run CacheBundle.addNode(&mut image.*, List<usize>.asSlice(&edges))
         let mut answer = Bytes.make()
         if report != usize.MAX { answer = run Bytes.copy(Bytes.asSlice(&reports[report].answer)) }
         else { answer = run checkAnswer(1, List<DeclarationId>.asSlice(&memo.concrete)) }
-        run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: move stable, node: node, answer: move answer})
+        drop run CacheBundle.addRoot(&mut image, CacheImage.Root {key: move stable, node: node, answer: move answer})
       }
     }
   }
-  /// Points each input `image` carries at its module's file as it reads now, once `CacheImage.carry`
+  /// Points each input `image` carries at its module's file as it reads now, once `CacheBundle.appendSelected`
   /// has copied into it what this store reused. A carried input names the file leaf of the image it
   /// came from. When that file changed since and this store holds the input with the same digest,
   /// the input takes its declaration's position now and the file leaf of the bytes now, so the next
   /// adoption places it without indexing the module again. Otherwise it keeps its old file, which
   /// no longer reads the same, and the next adoption captures it again.
-  pub effect fn imageCarriedFiles(self: &mut Self, image: &mut CacheImage.Image) -> () ! Cycle | OutOfMemoryError ? &mut Allocator {
+  pub effect fn imageCarriedFiles(self: &mut Self, image: &mut CacheBundle.Bundle) -> () ! Cycle | OutOfMemoryError ? &mut Allocator {
     run settleSourceInputs(&mut self.resolver)
+    // Publication chooses one authoritative answer before refreshing its live source evidence.
+    run pruneEscapeBlobs(&mut image.*)
+    let live = match move run CacheBundleLive.compute(&image.*) {
+      Option<CacheBundleLive.Live>.Some {value} => move value
+      Option<CacheBundleLive.Live>.None => { image.* = CacheBundle.make() return () }
+    }
     // The leaf of each module's file as it reads now, by module ordinal, added when first needed.
     let mut current = List<usize>.make()
-    let count = CacheImage.leafCount(&image.*)
+    let count = CacheBundle.leafCount(&image.*)
+    let mut keyCursor = CacheBundle.keyCursor()
     // The same by the file leaf an input names, so an input of a module whose file reads as it did
     // is passed over without reading its key.
     let mut byFile = List<usize>.make()
@@ -96106,11 +96186,11 @@ impl Semantic {
     while at < count {
       let slot = at
       at = at + usize.ONE
-      if !CacheImage.leaves(&image.*)[slot].input { continue }
-      let file = CacheImage.leaves(&image.*)[slot].file
+      if !CacheBundleLive.leaf(&live, slot) || !CacheBundle.leaf(&image.*, slot).input { continue }
+      let file = CacheBundle.leaf(&image.*, slot).file
       if file != usize.MAX && file < count && List<usize>.get(&byFile, file) == file { continue }
-      let key = run Bytes.copy(CacheImage.key(&image.*, slot))
-      let digest = CacheImage.leaves(&image.*)[slot].digest
+      let key = run Bytes.copy(run CacheBundle.keyAt(&image.*, &mut keyCursor, slot))
+      let digest = CacheBundle.leaf(&image.*, slot).digest
       let mut reader = StableKey.reader()
       let module = match move run StableKey.readModule(Bytes.asSlice(&key), &mut reader) {
         Option<ModuleId>.Some {value} => move value
@@ -96121,19 +96201,19 @@ impl Semantic {
       let mut now = List<usize>.get(&current, ordinal)
       if now == unreached() {
         let read = run sourceDigest(&mut self.resolver, &module)
-        if file != usize.MAX && ContentHash.equals(CacheImage.leaves(&image.*)[file].digest, read) {
+        if file != usize.MAX && ContentHash.equals(CacheBundle.leaf(&image.*, file).digest, read) {
           now = file
         } else {
           let mut fileKey = Bytes.make()
           run StableKey.module(&mut fileKey, &module)
-          now = run CacheImage.addLeaf(&mut image.*, false, move fileKey, read, usize.MAX, usize.MAX, ContentHash {high: 0, low: 0})
+          now = run CacheBundle.addLeaf(&mut image.*, false, move fileKey, read, usize.MAX, usize.MAX, ContentHash {high: 0, low: 0})
         }
         List<usize>.set(&mut current, ordinal, now)
       }
       if file != usize.MAX && file < count { List<usize>.set(&mut byFile, file, now) }
       if file == now { continue }
-      if file != usize.MAX && ContentHash.equals(CacheImage.leaves(&image.*)[file].digest,
-        CacheImage.leaves(&image.*)[now].digest) { continue }
+      if file != usize.MAX && ContentHash.equals(CacheBundle.leaf(&image.*, file).digest,
+        CacheBundle.leaf(&image.*, now).digest) { continue }
       let read = match move run StableKey.readSelector(Bytes.asSlice(&key), &mut reader) {
         Option<StableKey.ReadSelector>.Some {value} => move value
         Option<StableKey.ReadSelector>.None => { continue }
@@ -96154,16 +96234,17 @@ impl Semantic {
       }
       let input = Inputs.find(&self.resolver.sourceInputs, ordinal, &held)
       if input == usize.MAX { continue }
-      let mut leaves = CacheImage.leavesMut(&mut image.*)
+      let previous = CacheBundle.leaf(&image.*, slot)
+      let mut refreshedDigest = previous.digest
       // An input that reads otherwise now, such as where a declaration below an edit sits, is
       // marked changed, so the next adoption knows it without indexing the module again.
       if !ContentHash.equals(List<Inputs.Input>.asSlice(&self.resolver.sourceInputs.inputs)[input].digest, digest) {
-        leaves[slot].digest = changedInput()
+        refreshedDigest = changedInput()
       }
-      leaves[slot].file = now
-      leaves[slot].position = position
+      run CacheBundle.updateLeafEvidence(&mut image.*, slot, refreshedDigest, previous.text, position, now)
     }
-    run CacheImage.dropUnusedLeaves(&mut image.*)
+    // Immutable shards retain their original evidence. Scalar overlays refresh only inputs
+    // actually placed above; selected-root closure determines which evidence is live.
   }
   // Writes each escape walk record a check here captured, with a root on the MIR of each entry a
   // walk here lowered. A record a replay took from the image this store read, each record no check
@@ -96173,16 +96254,7 @@ impl Semantic {
     let mut written = DigestSet.make()
     let mut named = DigestSet.make()
     let mut carried = List<usize>.make()
-    // Composing inherited guard nodes requires decoded leaves/nodes. Refusal preserves the
-    // required-but-unavailable marker, so no fresh-only proof can replace missing evidence.
-    let mut needsGuard = false
-    let guardedMemos = List<EscapeMemo>.asSlice(&self.escapeMemos)
-    let mut guardAt = usize.ZERO
-    while guardAt < guardedMemos.length {
-      if let Option<usize>.Some {..} = &guardedMemos[guardAt].replayGuard { needsGuard = true }
-      guardAt = guardAt + usize.ONE
-    }
-    if needsGuard { run Semantic.unpackAdoptedImage(&mut self.*) }
+    // Inherited guards remain immutable dependency graphs; composition only links their root nodes.
     let memos = List<EscapeMemo>.asSlice(&self.escapeMemos)
     let mut at = usize.ZERO
     while at < memos.length {
@@ -97374,7 +97446,7 @@ impl Semantic {
       let word = run internKey(&mut self.resolver, Key {family: Family.ModuleCheck, module: runtime, name: usize.ONE,
         declaration: usize.MAX, member: usize.ONE, external: false})
       if let Option<Bytes>.Some {value: stable} = move run stableUnit(&self.resolver, u64.toUsize(word.value)) {
-        if let Option<CacheImage.Image>.Some {value: image} = &self.heldImage {
+        if let Option<CacheBundle.Bundle>.Some {value: image} = &self.heldImage {
           if frontierUsesReplay(&image, Bytes.asSlice(&stable), self.reusableAdoptedChecks, self.heldImageCorrupt) { return false }
         }
       }
@@ -98194,42 +98266,59 @@ impl Semantic {
       entry = InternIndex.after(&self.pendingLookup, entry)
     }
     if List<usize>.length(&found) == usize.ZERO { return () }
-    let held = Intrinsic.replace(self.heldImage, Option<CacheImage.Image>.none())
-    if let Option<CacheImage.Image>.Some {value: image} = &held {
-      let roots = List<CacheImage.Root>.asSlice(&image.roots)
-      let listed = List<usize>.asSlice(&found)
-      let mut at = usize.ZERO
-      while at < listed.length {
-        let root = List<usize>.get(&self.pendingRoots, listed[at])
-        at = at + usize.ONE
-        let key = Bytes.asSlice(&roots[root].key)
-        let module = declarationRootModule(key)
-        if !same(StableKey.view(key, module), Bytes.asSlice(&named)) { continue }
-        List<usize>.set(&mut self.pendingRoots, listed[at - usize.ONE], usize.MAX)
-        // Its placeholder leaves the carried lists; a root this store reuses rejoins them.
-        let carried = List<usize>.asSlice(&self.carriedRoots)
-        let mut slot = usize.ZERO
-        while slot < carried.length && !(carried[slot] == root && List<usize>.get(&self.carriedUnits, slot) == usize.MAX) {
-          slot = slot + usize.ONE
-        }
-        if slot < carried.length {
-          drop List<usize>.remove(&mut self.carriedUnits, slot)
-          drop List<usize>.remove(&mut self.carriedRoots, slot)
-        }
-        let check = match move run readCheckKey(key) {
-          Option<CheckKey>.Some {value} => move value
-          Option<CheckKey>.None => { continue }
-        }
-        let answer = match move run readCheckAnswer(Bytes.asSlice(&roots[root].answer), Option<&ModuleId>.some(&check.module)) {
-          Option<CheckAnswer>.Some {value} => move value
-          Option<CheckAnswer>.None => { continue }
-        }
-        if run Semantic.adoptCheck(&mut self.*, usize.MAX, key, move check, move answer) {
-          run List<usize>.append(&mut self.carriedRoots, root)
-        }
+    let held = Intrinsic.replace(self.heldImage, Option<CacheBundle.Bundle>.none())
+    let attempted = match &held {
+      Option<CacheBundle.Bundle>.Some {value: image} => run Effect.result(Semantic.readPendingBundle(&mut self.*, &image,
+        Bytes.asSlice(&named), List<usize>.asSlice(&found)))
+      Option<CacheBundle.Bundle>.None => Result<(), OutOfMemoryError>.succeed(())
+    }
+    // Every exit restores the same immutable association; a failed lazy answer allocation
+    // cannot drop its bundle while leaving carried ordinals in the semantic store.
+    self.heldImage = move held
+    match move attempted {
+      Result<(), OutOfMemoryError>.Success {..} => {}
+      Result<(), OutOfMemoryError>.Failure {error} => { fail move error }
+    }
+  }
+
+  effect fn readPendingBundle(self: &mut Self, image: &CacheBundle.Bundle, named: &[u8], listed: &[usize]) -> ()
+  ! OutOfMemoryError ? &mut Allocator | &mut Types {
+    let roots = List<CacheImage.Root>.asSlice(&image.roots)
+    let mut answers = CacheBundle.answerCursor()
+    let mut at = usize.ZERO
+    while at < listed.length {
+      let root = List<usize>.get(&self.pendingRoots, listed[at])
+      at = at + usize.ONE
+      let key = Bytes.asSlice(&roots[root].key)
+      let module = declarationRootModule(key)
+      if !same(StableKey.view(key, module), named) { continue }
+      List<usize>.set(&mut self.pendingRoots, listed[at - usize.ONE], usize.MAX)
+      // Its placeholder leaves the carried lists; a root this store reuses rejoins them.
+      let carried = List<usize>.asSlice(&self.carriedRoots)
+      let mut slot = usize.ZERO
+      while slot < carried.length && !(carried[slot] == root && List<usize>.get(&self.carriedUnits, slot) == usize.MAX) {
+        slot = slot + usize.ONE
+      }
+      if slot < carried.length {
+        drop List<usize>.remove(&mut self.carriedUnits, slot)
+        drop List<usize>.remove(&mut self.carriedRoots, slot)
+      }
+      let check = match move run readCheckKey(key) {
+        Option<CheckKey>.Some {value} => move value
+        Option<CheckKey>.None => { continue }
+      }
+      let encoded = match move run CacheBundle.answerAt(image, &mut answers, root) {
+        Option<&[u8]>.Some {value} => value
+        _ => { continue }
+      }
+      let answer = match move run readCheckAnswer(encoded, Option<&ModuleId>.some(&check.module)) {
+        Option<CheckAnswer>.Some {value} => move value
+        Option<CheckAnswer>.None => { continue }
+      }
+      if run Semantic.adoptCheck(&mut self.*, usize.MAX, key, move check, move answer) {
+        run List<usize>.append(&mut self.carriedRoots, root)
       }
     }
-    self.heldImage = move held
   }
 
   effect fn sweepModule(
@@ -105966,10 +106055,15 @@ impl ReplayState {
   // The replay state of `image`'s record root, with `green` its definition roots whose nodes are
   // green, or only moved (`adoptCache`), and `packs` the packs held beside it; none when the
   // record does not decode.
-  effect fn read(image: &CacheImage.Image, recordRoot: usize, green: &[usize], packs: &[HeldPack], packRoots: List<usize>)
+  effect fn read(image: &CacheBundle.Bundle, recordRoot: usize, green: &[usize], packs: &[HeldPack], packRoots: List<usize>)
     -> Option<ReplayState> ! OutOfMemoryError ? &mut Allocator {
     let roots = List<CacheImage.Root>.asSlice(&image.roots)
-    let record = match move run BuildRecord.decode(Bytes.asSlice(&roots[recordRoot].answer)) {
+    let mut answers = CacheBundle.answerCursor()
+    let encoded = match move run CacheBundle.answerAt(image, &mut answers, recordRoot) {
+      Option<&[u8]>.Some {value} => value
+      _ => { return Option<ReplayState>.none() }
+    }
+    let record = match move run BuildRecord.decode(encoded) {
       Option<BuildRecord.Record>.Some {value} => move value
       Option<BuildRecord.Record>.None => { return Option<ReplayState>.none() }
     }
@@ -106012,9 +106106,13 @@ impl ReplayState {
       while entry != usize.MAX {
         if ContentHash.equals(entries[entry].exact, exact) && entries[entry].alias == usize.MAX {
           List<usize>.set(&mut definitionRoots, entry, green[at])
-          if Bytes.length(&root.answer) == usize.ZERO {
+          let encoded = match move run CacheBundle.answerAt(image, &mut answers, green[at]) {
+            Option<&[u8]>.Some {value} => value
+            _ => { break }
+          }
+          if encoded.length == usize.ZERO {
             List<bool>.set(&mut held, entry, true)
-          } else if let Option<InstanceDefinition>.Some {value: definition} = move run BuildRecord.decodeDefinition(Bytes.asSlice(&root.answer)) {
+          } else if let Option<InstanceDefinition>.Some {value: definition} = move run BuildRecord.decodeDefinition(encoded) {
             let place = heldPlace(packs, List<TextPlace>.asSlice(&members), &memberLookup, Bytes.asSlice(&definition.symbol))
             if place.pack != usize.MAX {
               List<TextPlace>.set(&mut places, entry, place)
@@ -106028,7 +106126,7 @@ impl ReplayState {
       }
       at = at + usize.ONE
     }
-    let guarded = CacheImage.edgesOf(image, roots[recordRoot].node).length > usize.ZERO
+    let guarded = CacheBundle.edgeCount(image, roots[recordRoot].node) > usize.ZERO
     return Option<ReplayState>.some(ReplayState {record: move record, recordRoot: recordRoot, roots: move definitionRoots,
       definitions: move definitions, places: move places, held: move held, packRoots: move packRoots, guarded: guarded})
   }
@@ -106090,8 +106188,8 @@ effect fn imageEscapeEntries(resolver: &Resolver, build: &mut ImageBuild, captur
     if mirUnit == usize.MAX || DigestSet.find(&written.*, exact) != usize.MAX { continue }
     let mirNode = run imageUnit(&resolver.*, &mut build.*, mirUnit)
     if mirNode >= unfit() { continue }
-    let node = run CacheImage.addNode(&mut build.image, &[CacheImage.nodeEdge(mirNode)])
-    run List<CacheImage.Root>.append(&mut build.image.roots, CacheImage.Root {key: run escapeEntryKey(exact), node: node,
+    let node = run CacheBundle.addNode(&mut build.image, &[CacheImage.nodeEdge(mirNode)])
+    drop run CacheBundle.addRoot(&mut build.image, CacheImage.Root {key: run escapeEntryKey(exact), node: node,
       answer: Bytes.make()})
     drop run DigestSet.add(&mut written.*, exact)
   }
@@ -106100,7 +106198,7 @@ effect fn imageEscapeEntries(resolver: &Resolver, build: &mut ImageBuild, captur
 // Writes the escape walk record `captured` of the check whose stable unit key is `unit` into
 // `build`, with a root for each entry whose MIR a walk here lowered and that `written` does not
 // hold yet. `named` gains every entered entry; a record taken from the image read joins `carried`.
-effect fn imageEscapeRecord(resolver: &Resolver, held: &Option<CacheImage.Image>, inheritedGuard: &Option<usize>,
+effect fn imageEscapeRecord(resolver: &Resolver, held: &Option<CacheBundle.Bundle>, inheritedGuard: &Option<usize>,
   build: &mut ImageBuild, captured: &CapturedBuild, unit: &[u8], written: &mut DigestSet,
   named: &mut DigestSet, carried: &mut List<usize>) -> () ! OutOfMemoryError ? &mut Allocator {
   run imageEscapeEntries(resolver, &mut build.*, captured, &mut written.*, &mut named.*)
@@ -106110,17 +106208,17 @@ effect fn imageEscapeRecord(resolver: &Resolver, held: &Option<CacheImage.Image>
   }
   let mut node = usize.MAX
   if captured.guard == usize.MAX {
-    node = run CacheImage.addNode(&mut build.image, &[])
+    node = run CacheBundle.addConjunction(&mut build.image, &[])
   } else {
     let guardNode = run imageUnit(&resolver.*, &mut build.*, captured.guard)
-    if guardNode < unfit() { node = run CacheImage.addNode(&mut build.image, &[CacheImage.nodeEdge(guardNode)]) }
+    if guardNode < unfit() { node = run CacheBundle.addConjunction(&mut build.image, &[CacheImage.nodeEdge(guardNode)]) }
   }
   if node != usize.MAX {
     node = match move run composeEscapeGuard(held, &mut build.image, inheritedGuard, node) {
       Option<usize>.Some {value} => value
       Option<usize>.None => { return () }
     }
-    run List<CacheImage.Root>.append(&mut build.image.roots, CacheImage.Root {key: run escapeRecordKey(unit), node: node,
+    drop run CacheBundle.addRoot(&mut build.image, CacheImage.Root {key: run escapeRecordKey(unit), node: node,
       answer: run EscapeGraph.encodeInline(Bytes.asSlice(&run BuildRecord.encode(&captured.record)))})
   }
 }
@@ -106130,20 +106228,22 @@ effect fn imageEscapeRecord(resolver: &Resolver, held: &Option<CacheImage.Image>
 // cannot win publication over the reconstructed trace. Adoption offers records only after their
 // guard validates. Only unlinked adoption offers these raw indexes; adoptCache's caller contract
 // requires that such a store is never revised, even when its constructor supports revisions.
-effect fn composeEscapeGuard(held: &Option<CacheImage.Image>, image: &mut CacheImage.Image, inherited: &Option<usize>, fresh: usize)
+effect fn composeEscapeGuard(held: &Option<CacheBundle.Bundle>, image: &mut CacheBundle.Bundle, inherited: &Option<usize>, fresh: usize)
 -> Option<usize> ! OutOfMemoryError ? &mut Allocator {
   let inherited = match &inherited.* { Option<usize>.Some {value} => value _ => { return Option<usize>.some(fresh) } }
   let previous = match &held.* {
-    Option<CacheImage.Image>.Some {value} => &value
-    Option<CacheImage.Image>.None => { return Option<usize>.none() }
+    Option<CacheBundle.Bundle>.Some {value} => &value
+    Option<CacheBundle.Bundle>.None => { return Option<usize>.none() }
   }
   let roots = List<CacheImage.Root>.asSlice(&previous.roots)
   if inherited >= roots.length { return Option<usize>.none() }
   let mut identity = Span.make(usize.ZERO, usize.ZERO)
   if buildRootKind(Bytes.asSlice(&roots[inherited].key), &mut identity) != 3 { return Option<usize>.none() }
-  let nodes = run CacheImage.carry(&mut image.*, previous, &[inherited])
-  drop List<CacheImage.Root>.pop(&mut image.roots)
-  return Option<usize>.some(run CacheImage.addNode(&mut image.*, &[CacheImage.nodeEdge(fresh),
+  let nodes = match move run CacheBundle.appendGraph(&mut image.*, previous, &[inherited]) {
+    Option<List<usize>>.Some {value} => move value
+    Option<List<usize>>.None => { return Option<usize>.none() }
+  }
+  return Option<usize>.some(run CacheBundle.addConjunction(&mut image.*, &[CacheImage.nodeEdge(fresh),
     CacheImage.nodeEdge(List<usize>.get(&nodes, usize.ZERO))]))
 }
 
@@ -106169,7 +106269,7 @@ effect fn escapeEntryKey(exact: ContentHash) -> Bytes ! OutOfMemoryError ? &mut 
 // unit key, and for a pack its digest.
 // The roots of `image` that hold escape walks (kinds 3 and 4), and its module checks (kind 0)
 // too when `checks`.
-effect fn rootsOfKinds(image: &CacheImage.Image, checks: bool) -> List<usize> ! OutOfMemoryError ? &mut Allocator {
+effect fn rootsOfKinds(image: &CacheBundle.Bundle, checks: bool) -> List<usize> ! OutOfMemoryError ? &mut Allocator {
   let roots = List<CacheImage.Root>.asSlice(&image.roots)
   let mut kept = List<usize>.make()
   let mut at = usize.ZERO
@@ -106683,16 +106783,16 @@ effect fn indexedEscapeSelectionBoundary(directory: &mut EscapeGraphIndex.Index,
 // The application module affects export-only pruning but is intentionally absent from its
 // stable check key. Bind the normalized record to this request input, just like an ordinary
 // recordApplicationRead. Request inputs are always revalidated; they need no file shortcut.
-effect fn frontierBoundaryGuard(image: &mut CacheImage.Image, walk: &WalkBoundary, application: &[u8], guard: usize) -> usize
+effect fn frontierBoundaryGuard(image: &mut CacheBundle.Bundle, walk: &WalkBoundary, application: &[u8], guard: usize) -> usize
 ! OutOfMemoryError ? &mut Allocator {
   if !walk.staticsOnly { return guard }
   let mut key = Bytes.make()
   run StableKey.module(&mut key, &walk.own)
   let selector = SourceSelector.Request {fact: run Bytes.copy(b"application")}
   if !run StableKey.selector(&mut key, &selector, Option<&DeclarationId>.none()) { return usize.MAX }
-  let leaf = run CacheImage.addLeaf(&mut image.*, true, move key, ContentHash.of(application), usize.MAX, usize.MAX,
+  let leaf = run CacheBundle.addLeaf(&mut image.*, true, move key, ContentHash.of(application), usize.MAX, usize.MAX,
     ContentHash {high: 0, low: 0})
-  return run CacheImage.addNode(&mut image.*, &[CacheImage.nodeEdge(guard), CacheImage.leafEdge(leaf)])
+  return run CacheBundle.addConjunction(&mut image.*, &[CacheImage.nodeEdge(guard), CacheImage.leafEdge(leaf)])
 }
 
 // Whether `application` supplies only lifetimes, which leave the body its module walks unchanged.
@@ -111622,17 +111722,11 @@ effect fn artifactCacheStamp(store: &Semantic) -> Bytes ! OutOfMemoryError ? &mu
   return move stamp
 }
 
-effect fn readArtifactCache(bytes: &[u8], stamp: &[u8]) -> Option<CacheImage.Image> ! OutOfMemoryError ? &mut Allocator {
-  let mut image = match move run CacheImage.decode(bytes, stamp) {
-    Option<CacheImage.Image>.Some {value} => move value
-    Option<CacheImage.Image>.None => { return Option<CacheImage.Image>.none() }
-  }
-  if !(run CacheImage.readLeaves(&mut image)) || !(run CacheImage.readNodes(&mut image)) { return Option<CacheImage.Image>.none() }
-  run CacheImage.expandKeys(&mut image)
-  return Option<CacheImage.Image>.some(move image)
+effect fn readArtifactCache(bytes: &[u8], stamp: &[u8]) -> Option<CacheBundle.Bundle> ! OutOfMemoryError ? &mut Allocator {
+  return run CacheBundle.decode(run Bytes.copy(bytes), stamp)
 }
 
-effect fn artifactCacheSelections(image: &CacheImage.Image, proof: bool) -> List<usize> ! OutOfMemoryError ? &mut Allocator {
+effect fn artifactCacheSelections(image: &CacheBundle.Bundle, proof: bool) -> List<usize> ! OutOfMemoryError ? &mut Allocator {
   let mut selected = List<usize>.make()
   let roots = List<CacheImage.Root>.asSlice(&image.roots)
   let mut at = usize.ZERO
@@ -111659,25 +111753,14 @@ effect fn artifactCacheSelections(image: &CacheImage.Image, proof: bool) -> List
 }
 
 // Selection is ordered, so roots can be moved rather than copied through a local graph merge.
-effect fn retainArtifactCacheRoots(image: &mut CacheImage.Image) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn retainArtifactCacheRoots(image: &mut CacheBundle.Bundle) -> bool ! OutOfMemoryError ? &mut Allocator {
   let selected = run artifactCacheSelections(&image.*, true)
-  let positions = List<usize>.asSlice(&selected)
-  let mut remaining = positions.length
-  let mut kept = List<CacheImage.Root>.make()
-  while let Option<CacheImage.Root>.Some {value} = move List<CacheImage.Root>.pop(&mut image.roots) {
-    if remaining > usize.ZERO && positions[remaining - usize.ONE] == List<CacheImage.Root>.length(&image.roots) {
-      run List<CacheImage.Root>.append(&mut kept, move value)
-      remaining = remaining - usize.ONE
-    }
-  }
-  while let Option<CacheImage.Root>.Some {value} = move List<CacheImage.Root>.pop(&mut kept) {
-    run List<CacheImage.Root>.append(&mut image.roots, move value)
-  }
+  return run CacheBundle.retainRoots(&mut image.*, List<usize>.asSlice(&selected))
 }
 
-// This is the only structural merge in the worker transport. Each image is independently
-// validated against the current fork's source/profile stamp before any roots are admitted.
-effect fn mergeArtifactCachePacket(merge: &mut Merge, count: &mut usize, bytes: &[u8], stamp: &[u8]) -> bool
+// Each worker bundle is authenticated against the current fork's source/profile stamp.
+// Its immutable dependency graph is retained; only exact root directories are combined.
+effect fn mergeArtifactCachePacket(bundle: &mut CacheBundle.Bundle, count: &mut usize, bytes: &[u8], stamp: &[u8]) -> bool
 ! OutOfMemoryError ? &mut Allocator {
   let spans = match move run CachePackets.read(bytes) {
     Option<List<Span>>.Some {value} => move value
@@ -111688,12 +111771,14 @@ effect fn mergeArtifactCachePacket(merge: &mut Merge, count: &mut usize, bytes: 
   count.* = count.* + fields.length
   let mut at = usize.ZERO
   while at < fields.length {
+    // Validate each immutable graph without materializing a dense dependency image. Only
+    // reusable exact roots join the directory; rejected packets never reach publication.
     let image = match move run readArtifactCache(StableKey.view(bytes, fields[at]), stamp) {
-      Option<CacheImage.Image>.Some {value} => move value
-      Option<CacheImage.Image>.None => { return false }
+      Option<CacheBundle.Bundle>.Some {value} => move value
+      Option<CacheBundle.Bundle>.None => { return false }
     }
     let selected = run artifactCacheSelections(&image, true)
-    run Merge.add(&mut merge.*, &image, List<usize>.asSlice(&selected))
+    if let Option<usize>.None = move run CacheBundle.collectSelected(&mut bundle.*, &image, List<usize>.asSlice(&selected)) { return false }
     at = at + usize.ONE
   }
   return true
@@ -111717,8 +111802,8 @@ impl Semantic {
       run List<usize>.append(&mut dependencies, CacheImage.nodeEdge(mir))
       if entry.value >= values.length || !(run emittedLayoutEdges(&self.resolver, &mut build.*, entry.emissionUnit, &mut dependencies)) { continue }
       let answer = run BuildRecord.encodeDefinition(&values[entry.value])
-      let node = run CacheImage.addNode(&mut build.image, List<usize>.asSlice(&dependencies))
-      run List<CacheImage.Root>.append(&mut build.image.roots, CacheImage.Root {key: run buildEntryKey(entry.exact), node: node, answer: move answer})
+      let node = run CacheBundle.addNode(&mut build.image, List<usize>.asSlice(&dependencies))
+      drop run CacheBundle.addRoot(&mut build.image, CacheImage.Root {key: run buildEntryKey(entry.exact), node: node, answer: move answer})
     }
   }
 
@@ -111731,18 +111816,18 @@ impl Semantic {
     let mut image = run Semantic.completeCacheImageWithWalkRecords(&mut self.*, false)
     if census { run frontierTrace(b"cache image built", started, self.frontierWorker, List<CacheImage.Root>.length(&image.roots)) }
     if !self.frontierCacheComplete { return Bytes.make() }
-    // Move only reusable roots into the envelope. Leaves and nodes keep their local numbering;
-    // the coordinator alone traverses, compacts and interns their reachable dependency graph.
-    run retainArtifactCacheRoots(&mut image)
+    // Export reusable roots over immutable local graphs. The coordinator combines directories
+    // and adds the complete proof; it does not decode or reintern worker dependency graphs.
+    if !run retainArtifactCacheRoots(&mut image) { return Bytes.make() }
     // Partition records were removed above; their old replay blobs have no IPC consumers.
     run pruneEscapeBlobs(&mut image)
     if census {
       run frontierTrace(b"cache image roots", started, self.frontierWorker, List<CacheImage.Root>.length(&image.roots))
-      run frontierTrace(b"cache image leaves", started, self.frontierWorker, CacheImage.leafCount(&image))
-      run frontierTrace(b"cache image nodes", started, self.frontierWorker, CacheImage.nodeCount(&image))
+      run frontierTrace(b"cache image leaves", started, self.frontierWorker, CacheBundle.leafCount(&image))
+      run frontierTrace(b"cache image nodes", started, self.frontierWorker, CacheBundle.nodeCount(&image))
     }
     let encodingStarted = if census { run frontierNow() } else { 0 }
-    let encoded = run CacheImage.encode(&image, stamp)
+    let encoded = run CacheBundle.encode(&image, stamp)
     if census { run frontierTrace(b"cache image encoded bytes", encodingStarted, self.frontierWorker, Bytes.length(&encoded)) }
     let mut packet = run CachePackets.make()
     if !(run CachePackets.append(&mut packet, Bytes.asSlice(&encoded))) { return Bytes.make() }
@@ -111789,15 +111874,12 @@ impl Semantic {
 
   // Both check and artifact imports append to the same index space. A rejected lazy image
   // leaves old carried indexes behind, so even a later append must refuse until adoption resets it.
-  effect fn appendFrontierImage(self: &mut Self, image: &CacheImage.Image, selected: &[usize]) -> Option<usize>
+  effect fn appendFrontierImage(self: &mut Self, image: &CacheBundle.Bundle, selected: &[usize]) -> Option<usize>
   ! OutOfMemoryError ? &mut Allocator {
-    run Semantic.unpackAdoptedImage(&mut self.*)
     if self.heldImageCorrupt { return Option<usize>.none() }
-    if let Option<CacheImage.Image>.None = &self.heldImage { self.heldImage = Option<CacheImage.Image>.some(CacheImage.make()) }
-    if let Option<CacheImage.Image>.Some {value: held} = &mut self.heldImage {
-      let base = List<CacheImage.Root>.length(&held.roots)
-      drop run CacheImage.carry(&mut held, image, selected)
-      return Option<usize>.some(base)
+    if let Option<CacheBundle.Bundle>.None = &self.heldImage { self.heldImage = Option<CacheBundle.Bundle>.some(CacheBundle.make()) }
+    if let Option<CacheBundle.Bundle>.Some {value: held} = &mut self.heldImage {
+      return run CacheBundle.appendSelected(&mut held, image, selected)
     }
     return Option<usize>.none()
   }
@@ -111810,8 +111892,8 @@ impl Semantic {
     let stamp = run artifactCacheStamp(&self.*)
     let workers = List<CheckWorker>.asSlice(&self.artifactWorkers)
     let mut image = match move run fetchFrontierCache(workers, Bytes.asSlice(&stamp)) {
-      Option<CacheImage.Image>.Some {value} => move value
-      Option<CacheImage.Image>.None => { return Option<List<ArtifactImportedRoot>>.none() }
+      Option<CacheBundle.Bundle>.Some {value} => move value
+      Option<CacheBundle.Bundle>.None => { return Option<List<ArtifactImportedRoot>>.none() }
     }
     let selected = match &self.deferredFrontierGraph {
       Option<BuildRecord.Record>.Some {value: graph} => run Semantic.completeFrontierChecks(&self.*, &mut image,
@@ -111838,7 +111920,7 @@ impl Semantic {
     self.deferredFrontierSubsets = List<DeferredFrontierSubset>.make()
   }
 
-  effect fn appendArtifactImage(self: &mut Self, image: &CacheImage.Image, positions: &[usize]) -> Option<List<ArtifactImportedRoot>>
+  effect fn appendArtifactImage(self: &mut Self, image: &CacheBundle.Bundle, positions: &[usize]) -> Option<List<ArtifactImportedRoot>>
   ! OutOfMemoryError ? &mut Allocator {
     let roots = List<CacheImage.Root>.asSlice(&image.roots)
     let base = match move run Semantic.appendFrontierImage(&mut self.*, image, positions) {
@@ -111863,7 +111945,7 @@ impl Semantic {
 
 // Exact module/profile/scope identity keeps an unrelated dependency image from making a new
 // runtime appear warm. The old runtime root may be stale: ordinary replay still checks it.
-fn frontierUsesReplay(image: &CacheImage.Image, stable: &[u8], reusable: bool, corrupt: bool) -> bool {
+fn frontierUsesReplay(image: &CacheBundle.Bundle, stable: &[u8], reusable: bool, corrupt: bool) -> bool {
   if !reusable || corrupt { return false }
   let roots = List<CacheImage.Root>.asSlice(&image.roots)
   let mut at = usize.ZERO
@@ -111894,13 +111976,13 @@ effect fn frontierWarmPolicyClaims() -> () ! InvalidModulePath | OutOfMemoryErro
   let runtime = run ModuleId.make(b"memory", b"application", b"main")
   let dependency = run ModuleId.make(b"memory", b"dependency", b"library")
   let stable = run artifactCacheCheckKey(&runtime, 1)
-  let mut image = CacheImage.make()
+  let mut image = CacheBundle.make()
   run Testing.expect(!frontierUsesReplay(&image, Bytes.asSlice(&stable), true, false), "empty images leave a runtime cold")
-  let node = run CacheImage.addNode(&mut image, &[])
-  run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {
+  let node = run CacheBundle.addNode(&mut image, &[])
+  drop run CacheBundle.addRoot(&mut image, CacheImage.Root {
     key: run artifactCacheCheckKey(&dependency, 1), answer: Bytes.make(), node: node})
   run Testing.expect(!frontierUsesReplay(&image, Bytes.asSlice(&stable), true, false), "a reusable dependency does not warm an unrelated runtime")
-  run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {
+  drop run CacheBundle.addRoot(&mut image, CacheImage.Root {
     key: run Bytes.copy(Bytes.asSlice(&stable)), answer: Bytes.make(), node: node})
   run Testing.expect(frontierUsesReplay(&image, Bytes.asSlice(&stable), true, false), "an earlier runtime with reusable dependency evidence uses serial replay")
   run Testing.expect(!frontierUsesReplay(&image, Bytes.asSlice(&stable), false, false), "an entirely invalid image cannot disable a cold frontier")
@@ -111908,8 +111990,8 @@ effect fn frontierWarmPolicyClaims() -> () ! InvalidModulePath | OutOfMemoryErro
   let mut anotherScope = run Bytes.copy(Bytes.asSlice(&stable))
   run RuntimeEncoding.word(&mut anotherScope, 7)
   run Testing.expect(!frontierUsesReplay(&image, Bytes.asSlice(&anotherScope), true, false), "runtime scope and profile identity must match exactly")
-  drop List<CacheImage.Root>.remove(&mut image.roots, usize.ONE)
-  run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {
+  run Testing.expect(run CacheBundle.retainRoots(&mut image, &[0]), "the fresh directory can replace a check with its record")
+  drop run CacheBundle.addRoot(&mut image, CacheImage.Root {
     key: run escapeRecordKey(Bytes.asSlice(&stable)), answer: Bytes.make(), node: node})
   run Testing.expect(frontierUsesReplay(&image, Bytes.asSlice(&stable), true, false), "a prior runtime record remains useful when its aggregate check is stale")
 }
@@ -111920,55 +112002,238 @@ test effect fn frontierWarmPolicyKeepsColdAndUnrelatedRuntimesParallel() -> ()
   return run frontierWarmPolicyClaims() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
+effect fn artifactCacheProof(image: &CacheBundle.Bundle, root: usize) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let selected = &List<CacheImage.Root>.asSlice(&image.roots)[root]
+  let mut proof = run Bytes.copy(Bytes.asSlice(&selected.key))
+  let mut answers = CacheBundle.answerCursor()
+  if let Option<&[u8]>.Some {value} = move run CacheBundle.answerAt(image, &mut answers, root) {
+    run RuntimeEncoding.field(&mut proof, value)
+  }
+  let mut pending = List<usize>.make()
+  run List<usize>.append(&mut pending, CacheImage.nodeEdge(selected.node))
+  let mut keys = CacheBundle.keyCursor()
+  while let Option<usize>.Some {value: edge} = move List<usize>.pop(&mut pending) {
+    let target = CacheImage.target(edge)
+    if CacheImage.namesNode(edge) {
+      run RuntimeEncoding.word(&mut proof, 1)
+      let mut cursor = CacheBundle.edgeCursor(image, target)
+      let mut count = usize.ZERO
+      while let Option<usize>.Some {value} = move CacheBundle.nextEdge(image, &mut cursor) {
+        run List<usize>.append(&mut pending, value)
+        count = count + usize.ONE
+      }
+      run RuntimeEncoding.word(&mut proof, usize.toU64(count))
+    } else {
+      run RuntimeEncoding.word(&mut proof, 0)
+      let leaf = CacheBundle.leaf(image, target)
+      run RuntimeEncoding.field(&mut proof, run CacheBundle.keyAt(image, &mut keys, target))
+      run RuntimeEncoding.field(&mut proof, Bytes.asSlice(&run digestBytes(leaf.digest)))
+    }
+  }
+  return move proof
+}
+
+// Uses the actual record-export path with a fresh reconstructed record, rather than carrying
+// an old descriptor root directly. Every generation is encoded/decoded before it is imported.
+effect fn bundleGuardObservations(image: &CacheBundle.Bundle, first: ContentHash, second: ContentHash, applicationKey: &[u8]) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  let live = match move run CacheBundleLive.compute(image) {
+    Option<CacheBundleLive.Live>.Some {value} => move value
+    _ => { return false }
+  }
+  let mut keys = CacheBundle.keyCursor()
+  let mut foundFirst = false
+  let mut foundSecond = false
+  let mut foundApplication = applicationKey.length == usize.ZERO
+  let mut at = usize.ZERO
+  while at < CacheBundle.leafCount(image) {
+    if CacheBundleLive.leaf(&live, at) {
+      let leaf = CacheBundle.leaf(image, at)
+      let key = run CacheBundle.keyAt(image, &mut keys, at)
+      if leaf.file != usize.MAX || leaf.position != usize.MAX { return false }
+      if !leaf.input && same(key, b"prior-source") && ContentHash.equals(leaf.digest, first) { foundFirst = true }
+      else if !leaf.input && same(key, b"current-source") && ContentHash.equals(leaf.digest, second) { foundSecond = true }
+      else if leaf.input && applicationKey.length != usize.ZERO && same(key, applicationKey)
+        && ContentHash.equals(leaf.digest, ContentHash.of(b"guard-application")) { foundApplication = true }
+      else { return false }
+    }
+    at = at + usize.ONE
+  }
+  return foundFirst && foundSecond && foundApplication
+}
+
+effect fn bundleRebuiltGuardGenerations(initial: &CacheBundle.Bundle, first: ContentHash, second: ContentHash) -> ()
+! InvalidModulePath | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut held = Option<CacheBundle.Bundle>.some(run CacheBundle.copy(initial))
+  let store = Semantic.make(Revision.make(), MachineTarget.forId(TargetId.Aarch64AppleDarwin), Option<FinalProfile>.none())
+  let module = run ModuleId.make(b"memory", b"guard", b"runtime")
+  let walk = WalkBoundary {package: ModuleId.copy(&module), own: ModuleId.copy(&module),
+    checked: List<ModuleId>.make(), lookup: InternIndex.make(), staticsOnly: true}
+  let mut applicationKey = Bytes.make()
+  run StableKey.module(&mut applicationKey, &module)
+  let selector = SourceSelector.Request {fact: run Bytes.copy(b"application")}
+  run Testing.expect(run StableKey.selector(&mut applicationKey, &selector, Option<&DeclarationId>.none()),
+    "the fixture has the same stable application selector as the record producer")
+  let mut stableNodes = usize.MAX
+  let mut stableLeaves = usize.MAX
+  let mut generation = usize.ZERO
+  while generation < 8 {
+    let mut build = artifactCacheTestImageBuild()
+    // A newly executed guard can reconstruct an equivalent ordinary dependency node with
+    // entirely new virtual IDs. It must not retain another historical copy after saving.
+    let observation = run CacheBundle.addLeaf(&mut build.image, false, run Bytes.copy(b"current-source"), second,
+      usize.MAX, usize.MAX, ContentHash {high: 0, low: 0})
+    let query = run CacheBundle.addNode(&mut build.image, &[CacheImage.leafEdge(observation)])
+    run List<usize>.append(&mut build.nodes, query)
+    let captured = CapturedBuild {record: BuildRecord.make(false, false), entries: List<CapturedEntry>.make(),
+      guard: usize.ZERO, carriedRecord: usize.MAX}
+    let mut written = DigestSet.make()
+    let mut named = DigestSet.make()
+    let mut carried = List<usize>.make()
+    run imageEscapeRecord(&store.resolver, &held, &Option<usize>.some(0), &mut build, &captured,
+      b"rebuilt-check", &mut written, &mut named, &mut carried)
+    run Testing.expect(List<CacheImage.Root>.length(&build.image.roots) == usize.ONE && List<usize>.length(&carried) == usize.ZERO,
+      "a reconstructed record imports its prior guard without carrying the old answer")
+    let previous = List<CacheImage.Root>.asSlice(&build.image.roots)[0].node
+    let application = run frontierBoundaryGuard(&mut build.image, &walk, b"guard-application", previous)
+    let root = run CacheBundle.rootMut(&mut build.image, usize.ZERO)
+    root.node = application
+    let encoded = run CacheBundle.encode(&build.image, b"guard-generation")
+    let next = match move run CacheBundle.decode(move encoded, b"guard-generation") {
+      Option<CacheBundle.Bundle>.Some {value} => move value
+      _ => { run Testing.expect(false, "each saved reconstructed guard can be adopted again") return () }
+    }
+    run Testing.expect(Bytes.length(&List<CacheImage.Root>.asSlice(&next.roots)[0].answer) == usize.ZERO,
+      "the next generation imports encoded lazy answers, not a fresh in-memory root")
+    run Testing.expect(run bundleGuardObservations(&next, first, second, Bytes.asSlice(&applicationKey)),
+      "rewriting retains exactly both independently required source observations")
+    if generation == usize.ZERO {
+      stableNodes = CacheBundle.nodeCount(&next)
+      stableLeaves = CacheBundle.leafCount(&next)
+    } else {
+      run Testing.expect(CacheBundle.nodeCount(&next) == stableNodes && CacheBundle.leafCount(&next) == stableLeaves,
+        "rebuilding an unchanged inherited guard cannot retain a new historical wrapper generation")
+    }
+    held = Option<CacheBundle.Bundle>.some(move next)
+    generation = generation + usize.ONE
+  }
+}
+
+// A rebuilt guard joins immutable prior reads and newly observed reads. Neither the old
+// answer nor a missing prior dependency can silently become a new clean check.
+effect fn bundleGuardCompositionClaims() -> () ! InvalidModulePath | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let priorDigest = ContentHash {high: 13, low: 17}
+  let currentDigest = ContentHash {high: 19, low: 23}
+  let mut prior = CacheBundle.make()
+  let oldLeaf = run CacheBundle.addLeaf(&mut prior, false, run Bytes.copy(b"prior-source"), priorDigest,
+    usize.MAX, usize.MAX, ContentHash {high: 0, low: 0})
+  let oldNode = run CacheBundle.addNode(&mut prior, &[CacheImage.leafEdge(oldLeaf)])
+  drop run CacheBundle.addRoot(&mut prior, CacheImage.Root {key: run escapeRecordKey(b"prior-check"), node: oldNode,
+    answer: run Bytes.copy(b"prior-superset-answer")})
+  run CacheBundle.seal(&mut prior)
+  let held = Option<CacheBundle.Bundle>.some(move prior)
+  let mut fresh = CacheBundle.make()
+  let file = run CacheBundle.addLeaf(&mut fresh, false, run Bytes.copy(b"current-source"), ContentHash {high: 0, low: 0},
+    usize.MAX, usize.MAX, ContentHash {high: 0, low: 0})
+  let freshNode = run CacheBundle.addNode(&mut fresh, &[CacheImage.leafEdge(file)])
+  let combined = match move run composeEscapeGuard(&held, &mut fresh, &Option<usize>.some(0), freshNode) {
+    Option<usize>.Some {value} => value
+    _ => { run Testing.expect(false, "validated prior guard composes with current reads") return () }
+  }
+  run Testing.expect(List<CacheImage.Root>.length(&fresh.roots) == usize.ZERO,
+    "guard-only import cannot publish a prior superset record answer")
+  // Appending an immutable part can seal the fresh segment before fileDigests runs.
+  run CacheBundle.updateLeafEvidence(&mut fresh, file, currentDigest, ContentHash {high: 0, low: 0}, usize.MAX, usize.MAX)
+  drop run CacheBundle.addRoot(&mut fresh, CacheImage.Root {key: run escapeRecordKey(b"rebuilt-check"), node: combined,
+    answer: run Bytes.copy(b"rebuilt-answer")})
+  let mut edges = CacheBundle.edgeCursor(&fresh, combined)
+  let current = match CacheBundle.nextEdge(&fresh, &mut edges) { Option<usize>.Some {value} => value _ => usize.MAX }
+  let inherited = match CacheBundle.nextEdge(&fresh, &mut edges) { Option<usize>.Some {value} => value _ => usize.MAX }
+  run Testing.expect(current == CacheImage.nodeEdge(freshNode) && inherited != usize.MAX && CacheImage.namesNode(inherited),
+    "the current and inherited dependency nodes both remain required")
+  let repeated = match move run composeEscapeGuard(&held, &mut fresh, &Option<usize>.some(0), freshNode) {
+    Option<usize>.Some {value} => value
+    _ => { run Testing.expect(false, "the same immutable guard can be reused") return () }
+  }
+  let mut repeatedEdges = CacheBundle.edgeCursor(&fresh, repeated)
+  drop CacheBundle.nextEdge(&fresh, &mut repeatedEdges)
+  run Testing.expect(match CacheBundle.nextEdge(&fresh, &mut repeatedEdges) {
+    Option<usize>.Some {value} => value == inherited _ => false },
+    "repeated guard composition retains one inherited virtual node identity")
+  let mut oldEdges = CacheBundle.edgeCursor(&fresh, CacheImage.target(inherited))
+  let oldEdge = match CacheBundle.nextEdge(&fresh, &mut oldEdges) { Option<usize>.Some {value} => value _ => usize.MAX }
+  run Testing.expect(oldEdge != usize.MAX && !CacheImage.namesNode(oldEdge)
+    && ContentHash.equals(CacheBundle.leaf(&fresh, CacheImage.target(oldEdge)).digest, priorDigest)
+    && ContentHash.equals(CacheBundle.leaf(&fresh, file).digest, currentDigest),
+    "late file finishing updates only current evidence and preserves the imported guard")
+  let encoded = run CacheBundle.encode(&fresh, b"guard-proof")
+  let decoded = match move run CacheBundle.decode(move encoded, b"guard-proof") {
+    Option<CacheBundle.Bundle>.Some {value} => move value
+    _ => { run Testing.expect(false, "mixed fresh and inherited proof roundtrips") return () }
+  }
+  run Testing.expect(run bundleGuardObservations(&decoded, priorDigest, currentDigest, &[]),
+    "guard normalization preserves both exact source snapshots without requiring historical wrapper shape")
+  run bundleRebuiltGuardGenerations(&decoded, priorDigest, currentDigest)
+  run Testing.expect(match move run composeEscapeGuard(&held, &mut fresh, &Option<usize>.some(99), freshNode) {
+    Option<usize>.None => true _ => false }, "missing prior evidence cannot be replaced by the fresh-only guard")
+}
+
+test effect fn cacheBundleGuardCompositionPreservesInheritedAndFreshEvidence() -> () ! InvalidModulePath | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run bundleGuardCompositionClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
 effect fn artifactCacheTransportClaims() -> () ! InvalidModulePath | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
   let module = run ModuleId.make(b"memory", b"cache", b"worker")
-  let mut image = CacheImage.make()
-  let node = run CacheImage.addNode(&mut image, &[])
+  let mut image = CacheBundle.make()
+  let node = run CacheBundle.addNode(&mut image, &[])
   let exact = ContentHash {high: 3, low: 7}
   let check = run artifactCacheCheckKey(&module, 1)
-  run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: run buildRecordKey(), answer: Bytes.make(), node: node})
-  run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: run buildEntryKey(exact), answer: Bytes.make(), node: node})
-  run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: run escapeRecordKey(Bytes.asSlice(&check)), answer: Bytes.make(), node: node})
-  run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: move check, answer: Bytes.make(), node: node})
-  run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: run artifactCacheCheckKey(&module, 0), answer: Bytes.make(), node: node})
+  drop run CacheBundle.addRoot(&mut image, CacheImage.Root {key: run buildRecordKey(), answer: Bytes.make(), node: node})
+  drop run CacheBundle.addRoot(&mut image, CacheImage.Root {key: run buildEntryKey(exact), answer: Bytes.make(), node: node})
+  drop run CacheBundle.addRoot(&mut image, CacheImage.Root {key: run escapeRecordKey(Bytes.asSlice(&check)), answer: Bytes.make(), node: node})
+  drop run CacheBundle.addRoot(&mut image, CacheImage.Root {key: move check, answer: Bytes.make(), node: node})
+  drop run CacheBundle.addRoot(&mut image, CacheImage.Root {key: run artifactCacheCheckKey(&module, 0), answer: Bytes.make(), node: node})
   let selected = run artifactCacheSelections(&image, false)
   run Testing.expect(sameSlots(List<usize>.asSlice(&selected), &[1, 4]),
     "worker images retain final definitions and complete sweeps, never partition walks or escape checks")
-  let encoded = run CacheImage.encode(&image, b"profile-a")
+  let encoded = run CacheBundle.encode(&image, b"profile-a")
   run Testing.expect(match move run readArtifactCache(Bytes.asSlice(&encoded), b"profile-b") {
-    Option<CacheImage.Image>.None => true _ => false }, "dependency images cannot cross profile stamps")
+    Option<CacheBundle.Bundle>.None => true _ => false }, "dependency images cannot cross profile stamps")
   let decoded = match move run readArtifactCache(Bytes.asSlice(&encoded), b"profile-a") {
-    Option<CacheImage.Image>.Some {value} => move value
-    Option<CacheImage.Image>.None => { run Testing.expect(false, "same-profile dependency image decodes") return () }
+    Option<CacheBundle.Bundle>.Some {value} => move value
+    Option<CacheBundle.Bundle>.None => { run Testing.expect(false, "same-profile dependency image decodes") return () }
   }
-  let mut held = CacheImage.make()
-  let oldNode = run CacheImage.addNode(&mut held, &[])
-  run List<CacheImage.Root>.append(&mut held.roots, CacheImage.Root {key: run Bytes.copy(b"old-carried-index"), answer: run Bytes.copy(b"old-answer"), node: oldNode})
-  drop run CacheImage.carry(&mut held, &decoded, List<usize>.asSlice(&selected))
+  let mut held = CacheBundle.make()
+  let oldNode = run CacheBundle.addNode(&mut held, &[])
+  drop run CacheBundle.addRoot(&mut held, CacheImage.Root {key: run Bytes.copy(b"old-carried-index"), answer: run Bytes.copy(b"old-answer"), node: oldNode})
+  drop run CacheBundle.appendSelected(&mut held, &decoded, List<usize>.asSlice(&selected))
   let firstRoots = List<CacheImage.Root>.asSlice(&held.roots)
   run Testing.expect(firstRoots.length == 3 && same(Bytes.asSlice(&firstRoots[0].key), b"old-carried-index")
     && same(Bytes.asSlice(&firstRoots[0].answer), b"old-answer") && same(Bytes.asSlice(&firstRoots[1].key), Bytes.asSlice(&run buildEntryKey(exact))),
     "appending worker evidence preserves prior root indices and the returned definition index")
-  let mut second = CacheImage.make()
-  let leaf = run CacheImage.addLeaf(&mut second, false, run Bytes.copy(b"another-source"), ContentHash {high: 9, low: 11},
+  let mut second = CacheBundle.make()
+  let leaf = run CacheBundle.addLeaf(&mut second, false, run Bytes.copy(b"another-source"), ContentHash {high: 9, low: 11},
     usize.MAX, usize.MAX, ContentHash {high: 0, low: 0})
-  let dependency = run CacheImage.addNode(&mut second, &[CacheImage.leafEdge(leaf)])
+  let dependency = run CacheBundle.addNode(&mut second, &[CacheImage.leafEdge(leaf)])
   let another = ContentHash {high: 3, low: 8}
-  run List<CacheImage.Root>.append(&mut second.roots, CacheImage.Root {key: run buildEntryKey(another), answer: Bytes.make(), node: dependency})
-  drop run CacheImage.carry(&mut held, &second, &[0])
+  drop run CacheBundle.addRoot(&mut second, CacheImage.Root {key: run buildEntryKey(another), answer: Bytes.make(), node: dependency})
+  drop run CacheBundle.appendSelected(&mut held, &second, &[0])
   let roots = List<CacheImage.Root>.asSlice(&held.roots)
   run Testing.expect(roots.length == 4 && same(Bytes.asSlice(&roots[0].key), b"old-carried-index")
     && same(Bytes.asSlice(&roots[1].key), Bytes.asSlice(&run buildEntryKey(exact)))
     && same(Bytes.asSlice(&roots[3].key), Bytes.asSlice(&run buildEntryKey(another))),
     "another descendant append leaves all prior carried and imported root indices stable")
-  let dependencies = CacheImage.edgesOf(&held, roots[3].node)
-  run Testing.expect(dependencies.length == usize.ONE && !CacheImage.namesNode(dependencies[0])
-    && ContentHash.equals(CacheImage.leaves(&held)[CacheImage.target(dependencies[0])].digest, ContentHash {high: 9, low: 11}),
+  let mut edges = CacheBundle.edgeCursor(&held, roots[3].node)
+  let importedEdge = match CacheBundle.nextEdge(&held, &mut edges) { Option<usize>.Some {value} => value _ => usize.MAX }
+  run Testing.expect(importedEdge != usize.MAX && !CacheImage.namesNode(importedEdge)
+    && ContentHash.equals(CacheBundle.leaf(&held, CacheImage.target(importedEdge)).digest, ContentHash {high: 9, low: 11})
+    && match CacheBundle.nextEdge(&held, &mut edges) { Option<usize>.None => true _ => false },
     "the second descendant's exact source dependency survives appended node and leaf numbering")
 }
 
 fn artifactCacheTestImageBuild() -> ImageBuild {
-  return ImageBuild {image: CacheImage.make(), nodes: List<usize>.make(), files: List<usize>.make(),
+  return ImageBuild {image: CacheBundle.make(), nodes: List<usize>.make(), files: List<usize>.make(),
     inputs: List<usize>.make(), fileModules: List<usize>.make()}
 }
 
@@ -111992,17 +112257,15 @@ effect fn artifactCacheEntryExportClaims() -> () ! OutOfMemoryError | AssertionE
   let mut fullWritten = DigestSet.make()
   let mut fullNamed = DigestSet.make()
   let mut carried = List<usize>.make()
-  run imageEscapeRecord(&store.resolver, &Option<CacheImage.Image>.none(), &Option<usize>.none(), &mut full, &capture, b"ordinary-walk", &mut fullWritten, &mut fullNamed, &mut carried)
+  run imageEscapeRecord(&store.resolver, &Option<CacheBundle.Bundle>.none(), &Option<usize>.none(), &mut full, &capture, b"ordinary-walk", &mut fullWritten, &mut fullNamed, &mut carried)
   let mut portable = artifactCacheTestImageBuild()
   let mut portableWritten = DigestSet.make()
   let mut portableNamed = DigestSet.make()
   run imageEscapeEntries(&store.resolver, &mut portable, &capture, &mut portableWritten, &mut portableNamed)
   run Testing.expect(List<CacheImage.Root>.length(&full.image.roots) == 2 && List<CacheImage.Root>.length(&portable.image.roots) == usize.ONE,
     "ordinary disk publication keeps its walk record while worker export emits only exact entry evidence")
-  let mut kept = Merge.make()
-  run Merge.add(&mut kept, &full.image, &[0])
-  let ordinary = run CacheImage.encode(&Merge.finish(move kept), b"entry-evidence")
-  let exported = run CacheImage.encode(&portable.image, b"entry-evidence")
+  let ordinary = run artifactCacheProof(&full.image, 0)
+  let exported = run artifactCacheProof(&portable.image, 0)
   run Testing.expect(same(Bytes.asSlice(&ordinary), Bytes.asSlice(&exported))
     && DigestSet.find(&portableWritten, exact) != usize.MAX && DigestSet.find(&portableNamed, exact) != usize.MAX,
     "entries-only export preserves every MIR dependency and exact identity of the ordinary path")
@@ -112022,32 +112285,30 @@ test effect fn artifactCacheEntryExportPreservesMirEvidenceWithoutPartialRecords
 
 effect fn artifactCacheLeafPacketClaims() -> () ! InvalidModulePath | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
   let module = run ModuleId.make(b"memory", b"cache", b"leaf-packet")
-  let mut first = CacheImage.make()
-  let leaf = run CacheImage.addLeaf(&mut first, false, run Bytes.copy(b"source-a"), ContentHash {high: 17, low: 23},
+  let mut first = CacheBundle.make()
+  let leaf = run CacheBundle.addLeaf(&mut first, false, run Bytes.copy(b"source-a"), ContentHash {high: 17, low: 23},
     usize.MAX, usize.MAX, ContentHash {high: 0, low: 0})
-  let node = run CacheImage.addNode(&mut first, &[CacheImage.leafEdge(leaf)])
-  run List<CacheImage.Root>.append(&mut first.roots, CacheImage.Root {
+  let node = run CacheBundle.addNode(&mut first, &[CacheImage.leafEdge(leaf)])
+  drop run CacheBundle.addRoot(&mut first, CacheImage.Root {
     key: run buildRecordKey(), answer: run Bytes.copy(b"partial-proof"), node: node})
-  run List<CacheImage.Root>.append(&mut first.roots, CacheImage.Root {
+  drop run CacheBundle.addRoot(&mut first, CacheImage.Root {
     key: run buildEntryKey(ContentHash {high: 3, low: 7}), answer: run Bytes.copy(b"emitted-definition"), node: node})
-  run List<CacheImage.Root>.append(&mut first.roots, CacheImage.Root {
+  drop run CacheBundle.addRoot(&mut first, CacheImage.Root {
     key: run artifactCacheCheckKey(&module, 0), answer: run Bytes.copy(b"complete-sweep"), node: node})
-  let mut second = CacheImage.make()
-  let otherLeaf = run CacheImage.addLeaf(&mut second, false, run Bytes.copy(b"source-b"), ContentHash {high: 19, low: 29},
+  let mut second = CacheBundle.make()
+  let otherLeaf = run CacheBundle.addLeaf(&mut second, false, run Bytes.copy(b"source-b"), ContentHash {high: 19, low: 29},
     usize.MAX, usize.MAX, ContentHash {high: 0, low: 0})
-  let otherNode = run CacheImage.addNode(&mut second, &[CacheImage.leafEdge(otherLeaf)])
-  run List<CacheImage.Root>.append(&mut second.roots, CacheImage.Root {
+  let otherNode = run CacheBundle.addNode(&mut second, &[CacheImage.leafEdge(otherLeaf)])
+  drop run CacheBundle.addRoot(&mut second, CacheImage.Root {
     key: run buildEntryKey(ContentHash {high: 3, low: 8}), answer: run Bytes.copy(b"descendant-definition"), node: otherNode})
-  let mut expected = Merge.make()
-  run Merge.add(&mut expected, &first, &[1, 2])
-  run Merge.add(&mut expected, &second, &[0])
-  let expectedBytes = run CacheImage.encode(&Merge.finish(move expected), b"leaf-test")
-  run retainArtifactCacheRoots(&mut first)
+  let firstProof = run artifactCacheProof(&first, 1)
+  let secondProof = run artifactCacheProof(&second, 0)
+  run Testing.expect(run retainArtifactCacheRoots(&mut first), "fresh worker root selection succeeds")
   run Testing.expect(List<CacheImage.Root>.length(&first.roots) == 2
     && same(Bytes.asSlice(&List<CacheImage.Root>.asSlice(&first.roots)[0].answer), b"emitted-definition"),
     "leaf selection moves ordered complete roots and discards partition proofs")
-  let firstBytes = run CacheImage.encode(&first, b"leaf-test")
-  let secondBytes = run CacheImage.encode(&second, b"leaf-test")
+  let firstBytes = run CacheBundle.encode(&first, b"leaf-test")
+  let secondBytes = run CacheBundle.encode(&second, b"leaf-test")
   let mut descendant = run CachePackets.make()
   drop run CachePackets.append(&mut descendant, Bytes.asSlice(&firstBytes))
   drop run CachePackets.append(&mut descendant, Bytes.asSlice(&secondBytes))
@@ -112062,18 +112323,19 @@ effect fn artifactCacheLeafPacketClaims() -> () ! InvalidModulePath | OutOfMemor
     Option<Bytes>.Some {value} => move value
     Option<Bytes>.None => { run Testing.expect(false, "ancestor envelope finishes") return () }
   }
-  let mut actual = Merge.make()
+  let mut actual = CacheBundle.make()
   let mut count = usize.ZERO
   run Testing.expect(run mergeArtifactCachePacket(&mut actual, &mut count, Bytes.asSlice(&packet), b"leaf-test"),
     "coordinator validates every forwarded image")
-  let actualBytes = run CacheImage.encode(&Merge.finish(move actual), b"leaf-test")
-  run Testing.expect(count == 3 && same(Bytes.asSlice(&actualBytes), Bytes.asSlice(&expectedBytes)),
-    "one coordinator merge preserves exact roots, answers and dependency graph despite duplicate leaf stores")
-  let mut wrong = Merge.make()
+  run Testing.expect(count == 3 && List<CacheImage.Root>.length(&actual.roots) == 3
+    && same(Bytes.asSlice(&run artifactCacheProof(&actual, 0)), Bytes.asSlice(&firstProof))
+    && same(Bytes.asSlice(&run artifactCacheProof(&actual, 2)), Bytes.asSlice(&secondProof)),
+    "the coordinator preserves exact roots, answers and dependency evidence without flattening duplicate worker graphs")
+  let mut wrong = CacheBundle.make()
   count = usize.ZERO
   run Testing.expect(!(run mergeArtifactCachePacket(&mut wrong, &mut count, Bytes.asSlice(&packet), b"other-profile")),
     "an opaque forwarded image cannot bypass source/profile validation")
-  let mut excessive = Merge.make()
+  let mut excessive = CacheBundle.make()
   count = CachePackets.MAX_IMAGES - usize.ONE
   run Testing.expect(!(run mergeArtifactCachePacket(&mut excessive, &mut count, Bytes.asSlice(&packet), b"leaf-test")),
     "the coordinator bounds the combined store count across all root-worker packets")
@@ -112082,16 +112344,12 @@ effect fn artifactCacheLeafPacketClaims() -> () ! InvalidModulePath | OutOfMemor
   run List<CacheImage.Root>.append(&mut corrupt.roots, CacheImage.Root {
     key: run buildEntryKey(ContentHash {high: 9, low: 9}), answer: Bytes.make(), node: invalid})
   let corruptBytes = run CacheImage.encode(&corrupt, b"leaf-test")
-  let mut corruptPacket = run CachePackets.make()
-  drop run CachePackets.append(&mut corruptPacket, Bytes.asSlice(&corruptBytes))
-  let corruptEnvelope = match move run CachePackets.finish(move corruptPacket) {
-    Option<Bytes>.Some {value} => move value
-    Option<Bytes>.None => { run Testing.expect(false, "opaque malformed image can be framed") return () }
-  }
-  let mut refused = Merge.make()
-  count = usize.ZERO
-  run Testing.expect(!(run mergeArtifactCachePacket(&mut refused, &mut count, Bytes.asSlice(&corruptEnvelope), b"leaf-test")),
-    "coordinator refuses malformed dependency edges even when envelope and stamp are valid")
+  let mut refused = CacheBundle.make()
+  run Testing.expect(match move run CacheBundle.addEncoded(&mut refused, move corruptBytes, b"leaf-test", true) {
+    Option<usize>.None => true _ => false },
+    "malformed dependency edges cannot enter a bundle even with a valid local stamp")
+  run Testing.expect(List<CacheImage.Root>.length(&refused.roots) == usize.ZERO,
+    "failed local graph authentication publishes no selected directory roots")
 }
 
 test effect fn artifactCacheLeafPacketsPreserveMergeAndValidateEvidence() -> ()
@@ -112101,31 +112359,30 @@ test effect fn artifactCacheLeafPacketsPreserveMergeAndValidateEvidence() -> ()
 }
 
 effect fn frontierCacheCorruptAppendClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
-  // Keep the envelope valid while encoding an invalid self-edge. Decoding defers reading
-  // graph edges, just as a cache adopted without changed inputs may defer their validation.
   let mut invalid = CacheImage.make()
   let node = run CacheImage.addNode(&mut invalid, &[CacheImage.nodeEdge(usize.ZERO)])
   run List<CacheImage.Root>.append(&mut invalid.roots, CacheImage.Root {
     key: run Bytes.copy(b"old-carried-index"), answer: Bytes.make(), node: node})
   let encoded = run CacheImage.encode(&invalid, b"corrupt-append")
-  let lazy = match move run CacheImage.decode(Bytes.asSlice(&encoded), b"corrupt-append") {
-    Option<CacheImage.Image>.Some {value} => move value
-    Option<CacheImage.Image>.None => { run Testing.expect(false, "the corrupt graph envelope decodes lazily") return () }
-  }
+  let mut invalidBundle = CacheBundle.make()
+  run Testing.expect(match move run CacheBundle.addEncoded(&mut invalidBundle, move encoded, b"corrupt-append", false) {
+    Option<usize>.None => true _ => false }, "a corrupt dependency graph is refused before directory publication")
   let mut store = Semantic.make(Revision.make(), MachineTarget.forId(TargetId.Aarch64AppleDarwin), Option<FinalProfile>.none())
-  store.heldImage = Option<CacheImage.Image>.some(move lazy)
+  // Adoption failure has already invalidated the held generation, while callers may still
+  // retain old ordinal associations. A later import must not make those ordinals meaningful.
+  store.heldImageCorrupt = true
   run List<usize>.append(&mut store.carriedRoots, usize.ZERO)
   run List<usize>.append(&mut store.carriedBuild, usize.ZERO)
-  let mut fresh = CacheImage.make()
-  let freshNode = run CacheImage.addNode(&mut fresh, &[])
-  run List<CacheImage.Root>.append(&mut fresh.roots, CacheImage.Root {
+  let mut fresh = CacheBundle.make()
+  let freshNode = run CacheBundle.addNode(&mut fresh, &[])
+  drop run CacheBundle.addRoot(&mut fresh, CacheImage.Root {
     key: run Bytes.copy(b"different-worker-root"), answer: Bytes.make(), node: freshNode})
   let mut attempt = usize.ZERO
   while attempt < 2 {
     let imported = run Semantic.appendFrontierImage(&mut store, &fresh, &[0])
     run Testing.expect(match imported { Option<usize>.None => true _ => false },
       "neither the first nor a repeated worker import may rebind indexes from a corrupt adopted graph")
-    run Testing.expect(match &store.heldImage { Option<CacheImage.Image>.None => true _ => false },
+    run Testing.expect(match &store.heldImage { Option<CacheBundle.Bundle>.None => true _ => false },
       "refusing an append leaves no replacement image for stale indexes to address")
     run Testing.expect(store.heldImageCorrupt && List<usize>.get(&store.carriedRoots, usize.ZERO) == usize.ZERO
       && List<usize>.get(&store.carriedBuild, usize.ZERO) == usize.ZERO,
@@ -112156,7 +112413,7 @@ fn cachePacketCensus() -> bool {
   return !Pointer.isNullMany<u8>(unsafe FrontierHost.environment(Pointer.fromSlice<u8>(b"SILK_CACHE_PACKET_CENSUS\0")))
 }
 
-effect fn fetchFrontierCache(workers: &[CheckWorker], stamp: &[u8]) -> Option<CacheImage.Image>
+effect fn fetchFrontierCache(workers: &[CheckWorker], stamp: &[u8]) -> Option<CacheBundle.Bundle>
 ! OutOfMemoryError ? &mut Allocator {
     let census = cachePacketCensus()
     let started = if census { run frontierNow() } else { 0 }
@@ -112169,7 +112426,7 @@ effect fn fetchFrontierCache(workers: &[CheckWorker], stamp: &[u8]) -> Option<Ca
       run List<bool>.append(&mut sent, dispatched)
       at = at + usize.ONE
     }
-    let mut merge = Merge.make()
+    let mut merge = CacheBundle.make()
     let mut imageCount = usize.ZERO
     at = usize.ZERO
     while at < workers.length {
@@ -112185,14 +112442,14 @@ effect fn fetchFrontierCache(workers: &[CheckWorker], stamp: &[u8]) -> Option<Ca
       }
       at = at + usize.ONE
     }
-    if !good { return Option<CacheImage.Image>.none() }
-    let image = Merge.finish(move merge)
+    if !good { return Option<CacheBundle.Bundle>.none() }
+    let image = move merge
     if census {
       run frontierTrace(b"cache merged roots", started, imageCount, List<CacheImage.Root>.length(&image.roots))
-      run frontierTrace(b"cache merged leaves", started, imageCount, CacheImage.leafCount(&image))
-      run frontierTrace(b"cache merged nodes", started, imageCount, CacheImage.nodeCount(&image))
+      run frontierTrace(b"cache merged leaves", started, imageCount, CacheBundle.leafCount(&image))
+      run frontierTrace(b"cache merged nodes", started, imageCount, CacheBundle.nodeCount(&image))
     }
-    return Option<CacheImage.Image>.some(move image)
+    return Option<CacheBundle.Bundle>.some(move image)
 
 }
 
@@ -112358,7 +112615,7 @@ effect fn retainFrontierMirEvidence(evidence: &mut List<FrontierMirEvidence>, ca
 
 // A replay's old graph remains justified by its old record guard and its green entry roots.
 // Copy those precise nodes as well as the new non-MIR reads; never replace them by empty evidence.
-effect fn carryFrontierReads(held: &Option<CacheImage.Image>, image: &mut CacheImage.Image, fresh: usize, capture: &CapturedBuild)
+effect fn carryFrontierReads(held: &Option<CacheBundle.Bundle>, image: &mut CacheBundle.Bundle, fresh: usize, capture: &CapturedBuild)
 -> Option<usize> ! OutOfMemoryError ? &mut Allocator {
   let mut selected = List<usize>.make()
   if capture.carriedRecord != usize.MAX { run List<usize>.append(&mut selected, capture.carriedRecord) }
@@ -112370,8 +112627,8 @@ effect fn carryFrontierReads(held: &Option<CacheImage.Image>, image: &mut CacheI
   }
   if List<usize>.length(&selected) == usize.ZERO { return Option<usize>.some(fresh) }
   let previous = match &held.* {
-    Option<CacheImage.Image>.Some {value} => &value
-    Option<CacheImage.Image>.None => { return Option<usize>.none() }
+    Option<CacheBundle.Bundle>.Some {value} => &value
+    Option<CacheBundle.Bundle>.None => { return Option<usize>.none() }
   }
   let roots = List<CacheImage.Root>.asSlice(&previous.roots)
   let picked = List<usize>.asSlice(&selected)
@@ -112385,9 +112642,13 @@ effect fn carryFrontierReads(held: &Option<CacheImage.Image>, image: &mut CacheI
     at = at + usize.ONE
   }
   run includeEscapeBlobs(previous, &mut selected)
-  let nodes = run CacheImage.carry(&mut image.*, previous, List<usize>.asSlice(&selected))
+  let base = match move run CacheBundle.appendSelected(&mut image.*, previous, List<usize>.asSlice(&selected)) {
+    Option<usize>.Some {value} => value
+    Option<usize>.None => { return Option<usize>.none() }
+  }
   if capture.carriedRecord == usize.MAX { return Option<usize>.some(fresh) }
-  return Option<usize>.some(run CacheImage.addNode(&mut image.*, &[CacheImage.nodeEdge(fresh), CacheImage.nodeEdge(List<usize>.get(&nodes, usize.ZERO))]))
+  let priorGuard = List<CacheImage.Root>.asSlice(&image.roots)[base].node
+  return Option<usize>.some(run CacheBundle.addConjunction(&mut image.*, &[CacheImage.nodeEdge(fresh), CacheImage.nodeEdge(priorGuard)]))
 }
 
 impl Semantic {
@@ -112404,7 +112665,6 @@ impl Semantic {
 
   effect fn imageFrontierReads(self: &mut Self, build: &mut ImageBuild) -> () ! OutOfMemoryError ? &mut Allocator {
     if self.frontierWorker == usize.MAX || !retainedCacheExperiment() { return () }
-    run Semantic.unpackAdoptedImage(&mut self.*)
     let extensions = List<FrontierMirEvidence>.asSlice(&self.frontierExtensionEvidence)
     let mut emitted = DigestSet.make()
     let mut extended = usize.ZERO
@@ -112415,8 +112675,8 @@ impl Semantic {
       if DigestSet.find(&emitted, evidence.exact) != usize.MAX { continue }
       let mir = run imageUnit(&self.resolver, &mut build.*, evidence.unit)
       if mir >= unfit() { continue }
-      let node = run CacheImage.addNode(&mut build.image, &[CacheImage.nodeEdge(mir)])
-      run List<CacheImage.Root>.append(&mut build.image.roots, CacheImage.Root {
+      let node = run CacheBundle.addNode(&mut build.image, &[CacheImage.nodeEdge(mir)])
+      drop run CacheBundle.addRoot(&mut build.image, CacheImage.Root {
         key: run escapeEntryKey(evidence.exact), node: node, answer: Bytes.make()})
       drop run DigestSet.add(&mut emitted, evidence.exact)
       extended = extended + usize.ONE
@@ -112452,7 +112712,7 @@ impl Semantic {
         Option<usize>.Some {value} => value
         Option<usize>.None => { self.frontierCacheComplete = false continue }
       }
-      run List<CacheImage.Root>.append(&mut build.image.roots, CacheImage.Root {
+      drop run CacheBundle.addRoot(&mut build.image, CacheImage.Root {
         key: run frontierReadsKey(Bytes.asSlice(&stable), self.frontierWorker, ordinal), node: node, answer: Bytes.make()})
       ordinal = ordinal + usize.ONE
     }
@@ -112470,7 +112730,7 @@ impl Semantic {
         Option<usize>.None => { self.frontierCacheComplete = false continue }
       }
       let key = run frontierReadsKey(Bytes.asSlice(&part.stable), self.frontierWorker, ordinal)
-      run List<CacheImage.Root>.append(&mut build.image.roots, CacheImage.Root {key: run Bytes.copy(Bytes.asSlice(&key)),
+      drop run CacheBundle.addRoot(&mut build.image, CacheImage.Root {key: run Bytes.copy(Bytes.asSlice(&key)),
         node: node, answer: Bytes.make()})
       // The coordinator supplies the complete proved record. Only independently reusable
       // entry evidence belongs here; do not encode a partition record only to discard it.
@@ -112485,7 +112745,7 @@ impl Semantic {
       while at < extensionReads.length {
         let node = run imageUnit(&self.resolver, &mut build.*, extensionReads[at])
         if node >= unfit() { self.frontierCacheComplete = false return () }
-        run List<CacheImage.Root>.append(&mut build.image.roots, CacheImage.Root {
+        drop run CacheBundle.addRoot(&mut build.image, CacheImage.Root {
           key: run frontierReadsKey(b"frontier-extension-reads-v1", self.frontierWorker, ordinal), node: node, answer: Bytes.make()})
         ordinal = ordinal + usize.ONE
         at = at + usize.ONE
@@ -112500,7 +112760,7 @@ impl Semantic {
       if query >= unfit() { continue }
       let node = run sitedNode(&self.resolver, &mut build.*, query, List<ModuleId>.asSlice(&part.sites))
       if node == usize.MAX { continue }
-      run List<CacheImage.Root>.append(&mut build.image.roots, CacheImage.Root {
+      drop run CacheBundle.addRoot(&mut build.image, CacheImage.Root {
         key: run frontierReadsKey(Bytes.asSlice(&part.key), self.frontierWorker, ordinal), node: node, answer: Bytes.make()})
       ordinal = ordinal + usize.ONE
     }
@@ -112512,8 +112772,8 @@ impl Semantic {
     if self.resolver.revisable || graph.guarded || !self.frontierCacheComplete { return () }
     let stamp = run artifactCacheStamp(&self.*)
     let mut image = match move run fetchFrontierCache(workers, Bytes.asSlice(&stamp)) {
-      Option<CacheImage.Image>.Some {value} => move value
-      Option<CacheImage.Image>.None => { run frontierTrace(b"check cache unavailable", self.frontierSplit, usize.ZERO, usize.ZERO) return () }
+      Option<CacheBundle.Bundle>.Some {value} => move value
+      Option<CacheBundle.Bundle>.None => { run frontierTrace(b"check cache unavailable", self.frontierSplit, usize.ZERO, usize.ZERO) return () }
     }
     let selected = run Semantic.completeFrontierChecks(&self.*, &mut image, graph, coverage)
     drop run Semantic.appendArtifactImage(&mut self.*, &image, List<usize>.asSlice(&selected))
@@ -112549,7 +112809,7 @@ impl Semantic {
 
   // Validates portable records against their exact MIR and root-read evidence before any root
   // is published. Both check-only and deferred build publication use this one proof path.
-  effect fn completeFrontierChecks(self: &Self, image: &mut CacheImage.Image,
+  effect fn completeFrontierChecks(self: &Self, image: &mut CacheBundle.Bundle,
     graph: &BuildRecord.Record, coverage: &[FrontierCoverage]) -> List<usize>
   ! OutOfMemoryError ? &mut Allocator | &mut Types {
     if graph.guarded { return run artifactCacheSelections(&image.*, false) }
@@ -112647,7 +112907,7 @@ impl Semantic {
       if !complete { noEntries = noEntries + usize.ONE continue }
       // Root/signature reads remain separate from per-MIR validity, just as a normal record's
       // growth guard does. The check root additionally rests on every entry's exact MIR inputs.
-      let readNode = run CacheImage.addNode(&mut image.*, List<usize>.asSlice(&reads))
+      let readNode = run CacheBundle.addNode(&mut image.*, List<usize>.asSlice(&reads))
       let application = run captureRequest(&self.resolver, b"application")
       let recordNode = run frontierBoundaryGuard(&mut image.*, &walk, Bytes.asSlice(&application), readNode)
       if recordNode == usize.MAX { continue }
@@ -112655,17 +112915,17 @@ impl Semantic {
       let encoded = run EscapeGraph.encodeDescriptor(&descriptor)
       persistedEntries = persistedEntries + selectedEntries.length
       persistedBytes = persistedBytes + Bytes.asSlice(&encoded).length
-      run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: run escapeRecordKey(Bytes.asSlice(&covered.stable)),
+      drop run CacheBundle.addRoot(&mut image, CacheImage.Root {key: run escapeRecordKey(Bytes.asSlice(&covered.stable)),
         node: recordNode, answer: move encoded})
       run List<usize>.append(&mut dependencies, CacheImage.nodeEdge(recordNode))
-      let checked = run CacheImage.addNode(&mut image.*, List<usize>.asSlice(&dependencies))
-      run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: run Bytes.copy(Bytes.asSlice(&covered.stable)),
+      let checked = run CacheBundle.addNode(&mut image.*, List<usize>.asSlice(&dependencies))
+      drop run CacheBundle.addRoot(&mut image, CacheImage.Root {key: run Bytes.copy(Bytes.asSlice(&covered.stable)),
         node: checked, answer: run checkAnswer(1, concrete)})
       persisted = persisted + usize.ONE
     }
     if persisted > usize.ZERO {
-      let node = run CacheImage.addNode(&mut image.*, &[])
-      run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {
+      let node = run CacheBundle.addNode(&mut image.*, &[])
+      drop run CacheBundle.addRoot(&mut image, CacheImage.Root {
         key: run EscapeGraph.graphKey(graphDigest), node: node, answer: move graphBytes})
     }
     let sweeps = List<FrontierSweepProof>.asSlice(&self.frontierSweepProofs)
@@ -112679,8 +112939,8 @@ impl Semantic {
         Option<List<usize>>.Some {value} => move value
         Option<List<usize>>.None => { continue }
       }
-      let node = run CacheImage.addNode(&mut image.*, List<usize>.asSlice(&dependencies))
-      run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: run Bytes.copy(Bytes.asSlice(&sweep.stable)),
+      let node = run CacheBundle.addNode(&mut image.*, List<usize>.asSlice(&dependencies))
+      drop run CacheBundle.addRoot(&mut image, CacheImage.Root {key: run Bytes.copy(Bytes.asSlice(&sweep.stable)),
         node: node, answer: run Bytes.copy(Bytes.asSlice(&sweep.answer))})
       sweepCount = sweepCount + usize.ONE
     }
@@ -112758,12 +113018,11 @@ impl Semantic {
   // Give that distinct cache key its own root slice so the next command can replay it directly.
   effect fn persistFrontierSubset(self: &mut Self, full: &[u8], selected: &[u8], concrete: &[DeclarationId]) -> ()
   ! OutOfMemoryError ? &mut Allocator | &mut Types {
-    run Semantic.unpackAdoptedImage(&mut self.*)
     let recordKey = run escapeRecordKey(full)
     let mut source = usize.MAX
     let mut entries = DigestSet.make()
     let mut nodes = List<usize>.make()
-    if let Option<CacheImage.Image>.Some {value: held} = &self.heldImage {
+    if let Option<CacheBundle.Bundle>.Some {value: held} = &self.heldImage {
       let roots = List<CacheImage.Root>.asSlice(&held.roots)
       let imported = List<usize>.asSlice(&self.artifactCacheRoots)
       let mut at = usize.ZERO
@@ -112784,7 +113043,8 @@ impl Semantic {
       Option<WalkBoundary>.None => { return () }
     }
     let application = run captureRequest(&self.resolver, b"application")
-    if let Option<CacheImage.Image>.Some {value: held} = &mut self.heldImage {
+    if let Option<CacheBundle.Bundle>.Some {value: held} = &mut self.heldImage {
+      if !run CacheBundle.ensureAnswer(&mut held, source) { return () }
       let root = &List<CacheImage.Root>.asSlice(&held.roots)[source]
       let sourceGuard = root.node
       let descriptor = match move run EscapeGraph.decodeDescriptor(Bytes.asSlice(&root.answer)) {
@@ -112795,7 +113055,6 @@ impl Semantic {
       if found == usize.MAX { return () }
       let blobRoot = List<CachedEscapeGraph>.asSlice(&self.escapeGraphs)[found].root
       if blobRoot == usize.MAX { return () }
-      let payload = Bytes.asSlice(&List<CacheImage.Root>.asSlice(&held.roots)[blobRoot].answer)
       let cached = &mut List<CachedEscapeGraph>.asMutSlice(&mut self.escapeGraphs)[found]
       let mut available = DigestSet.make()
       let originalRoots = List<ContentHash>.asSlice(&descriptor.roots)
@@ -112814,6 +113073,7 @@ impl Semantic {
       let selectedView = run cachedEscapeView(&mut cached.*, List<ContentHash>.asSlice(&wanted), false)
       if selectedView == usize.MAX { return () }
       let picked = List<usize>.asSlice(&List<CachedEscapeView>.asSlice(&cached.views)[selectedView].entries)
+      let payload = Bytes.asSlice(&cached.payload)
       if !(run indexedEscapeSelectionBoundary(&mut cached.directory, payload, picked, &walk))
         || !(run EscapeGraphIndex.escapeFree(&cached.directory, picked)) { return () }
       let guard = run frontierBoundaryGuard(&mut held, &walk, Bytes.asSlice(&application), sourceGuard)
@@ -112832,10 +113092,10 @@ impl Semantic {
       }
       let base = List<CacheImage.Root>.length(&held.roots)
       let subset = EscapeGraph.Descriptor {graph: descriptor.graph, roots: move wanted}
-      run List<CacheImage.Root>.append(&mut held.roots, CacheImage.Root {key: run escapeRecordKey(selected), node: guard,
+      drop run CacheBundle.addRoot(&mut held, CacheImage.Root {key: run escapeRecordKey(selected), node: guard,
         answer: run EscapeGraph.encodeDescriptor(&subset)})
-      let checked = run CacheImage.addNode(&mut held, List<usize>.asSlice(&dependencies))
-      run List<CacheImage.Root>.append(&mut held.roots, CacheImage.Root {key: run Bytes.copy(selected), node: checked,
+      let checked = run CacheBundle.addNode(&mut held, List<usize>.asSlice(&dependencies))
+      drop run CacheBundle.addRoot(&mut held, CacheImage.Root {key: run Bytes.copy(selected), node: checked,
         answer: run checkAnswer(1, concrete)})
       run List<usize>.append(&mut self.artifactCacheRoots, base)
       run List<usize>.append(&mut self.artifactCacheRoots, base + usize.ONE)
@@ -113100,13 +113360,14 @@ effect fn frontierBoundaryFactsClaims() -> ()
   let applicationB = run internModule(&mut store.resolver, &owner)
   store.resolver.currentApplication = applicationA
   let application = run captureRequest(&store.resolver, b"application")
-  let mut image = CacheImage.make()
-  let emptyGuard = run CacheImage.addNode(&mut image, &[])
+  let mut image = CacheBundle.make()
+  let emptyGuard = run CacheBundle.addNode(&mut image, &[])
   let guarded = run frontierBoundaryGuard(&mut image, &walk, Bytes.asSlice(&application), emptyGuard)
-  run Testing.expect(guarded != emptyGuard && CacheImage.leafCount(&image) == usize.ONE,
+  run Testing.expect(guarded != emptyGuard && CacheBundle.leafCount(&image) == usize.ONE,
     "export-only normalized records explicitly depend on the selected application")
-  let leaf = CacheImage.leaves(&image)[0]
-  let key = CacheImage.key(&image, 0)
+  let leaf = CacheBundle.leaf(&image, 0)
+  let mut keyCursor = CacheBundle.keyCursor()
+  let key = run CacheBundle.keyAt(&image, &mut keyCursor, 0)
   run Testing.expect((run placeLeaf(&mut store.resolver, &leaf, key, usize.MAX)) != usize.MAX,
     "the application guard adopts under the original request")
   store.resolver.currentApplication = applicationB
@@ -113131,6 +113392,26 @@ test effect fn frontierRecordsRebindPruningToDestinationBoundary() -> ()
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut types = TypeTable.make()
   run frontierBoundaryFactsClaims() |> Effect.provideMut<Types>(&mut types) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Exercises the actual lazy disk representation: every answer is still in its immutable
+// encoded shard when a new store begins adoption, including reconstructed inline traces.
+effect fn persistedEscapeFixture(bundle: &CacheBundle.Bundle) -> CacheBundle.Bundle
+! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let encoded = run CacheBundle.encode(bundle, b"escape-adoption-fixture")
+  let restored = match move run CacheBundle.decode(move encoded, b"escape-adoption-fixture") {
+    Option<CacheBundle.Bundle>.Some {value} => move value
+    _ => { run Testing.expect(false, "a complete check bundle persists and reopens") return CacheBundle.make() }
+  }
+  let roots = List<CacheImage.Root>.asSlice(&restored.roots)
+  run Testing.expect(roots.length > usize.ZERO, "the persisted fixture retains its selected directory")
+  let mut at = usize.ZERO
+  while at < roots.length {
+    run Testing.expect(Bytes.length(&roots[at].answer) == usize.ZERO,
+      "fresh-process adoption starts with lazy answer placeholders, not accidentally materialized test payloads")
+    at = at + usize.ONE
+  }
+  return move restored
 }
 
 effect fn sharedEscapeViewClaims() -> ()
@@ -113168,19 +113449,21 @@ effect fn sharedEscapeViewClaims() -> ()
   let descriptor = EscapeGraph.Descriptor {graph: digest, roots: move selected}
   let written = run EscapeGraph.encodeDescriptor(&descriptor)
   let mut records = usize.ZERO
-  let cacheRoots = List<CacheImage.Root>.asMutSlice(&mut image.roots)
+  let rootCount = List<CacheImage.Root>.length(&image.roots)
   at = usize.ZERO
-  while at < cacheRoots.length {
+  while at < rootCount {
+    let root = run CacheBundle.rootMut(&mut image, at)
     let mut identity = Span.make(usize.ZERO, usize.ZERO)
-    if buildRootKind(Bytes.asSlice(&cacheRoots[at].key), &mut identity) == 3 {
-      cacheRoots[at].answer = run Bytes.copy(Bytes.asSlice(&written))
+    if buildRootKind(Bytes.asSlice(&root.key), &mut identity) == 3 {
+      root.answer = run Bytes.copy(Bytes.asSlice(&written))
       records = records + usize.ONE
     }
     at = at + usize.ONE
   }
   run Testing.expect(records == usize.ONE, "one ordinary record becomes a shared view without changing its guard")
-  let blobNode = run CacheImage.addNode(&mut image, &[])
-  run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: run EscapeGraph.graphKey(digest), node: blobNode, answer: move blob})
+  let blobNode = run CacheBundle.addNode(&mut image, &[])
+  drop run CacheBundle.addRoot(&mut image, CacheImage.Root {key: run EscapeGraph.graphKey(digest), node: blobNode, answer: move blob})
+  image = run persistedEscapeFixture(&image)
   let changed = run Revision.publish(&revision, &module, &Option<Bytes>.some(run Bytes.copy(
     b"fn value() -> i32 { return 2 }\nfn caller() -> i32 { return value() }\n")))
   let mut warm = Semantic.make(run Revision.copy(&changed), MachineTarget.forId(TargetId.Aarch64AppleDarwin), Option<FinalProfile>.none())
@@ -113191,7 +113474,7 @@ effect fn sharedEscapeViewClaims() -> ()
   run Testing.expect(match &indexed.replay { Option<CachedEscapeRecord>.None => true _ => false },
     "even stale adoption allocates only the compact directory until replay is demanded")
   let mut named = DigestSet.make()
-  run Testing.expect(run nameEscapeAnswer(Option<&CacheImage.Image>.some(&image), &mut warm.escapeGraphs,
+  run Testing.expect(run nameEscapeAnswer(Option<&CacheBundle.Bundle>.some(&image), &mut warm.escapeGraphs,
     Bytes.asSlice(&written), &mut named), "naming shares the adopted descriptor's membership")
   let indexedAgain = &List<CachedEscapeGraph>.asSlice(&warm.escapeGraphs)[0]
   run Testing.expect(List<CachedEscapeView>.length(&indexedAgain.views) == usize.ONE,
@@ -113201,15 +113484,21 @@ effect fn sharedEscapeViewClaims() -> ()
   let warmOrdinal = run internModule(&mut warm.resolver, &module)
   let replayed = run Semantic.keptEscapes(&mut warm, &mut request, warmOrdinal, &[warmOrdinal], &roots, false)
   run Testing.expect(!checkRefuses(&replayed), "a body-only edit replays the shared view")
-  let rewritten = run Semantic.completeCacheImage(&mut warm)
+  let saved = run Semantic.completeCacheImage(&mut warm)
+  let rewritten = run persistedEscapeFixture(&saved)
   // A boundary-aware rewalk may replace this view with its own inline trace. Any descriptor
   // retained alongside it must still carry its blob into the next generation.
   let rewrittenRoots = List<CacheImage.Root>.asSlice(&rewritten.roots)
+  let mut answers = CacheBundle.answerCursor()
   at = usize.ZERO
   while at < rewrittenRoots.length {
     let mut identity = Span.make(usize.ZERO, usize.ZERO)
     if buildRootKind(Bytes.asSlice(&rewrittenRoots[at].key), &mut identity) == 3 {
-      if let Option<EscapeAnswer>.Some {value: answer} = move run EscapeGraph.decodeAnswer(Bytes.asSlice(&rewrittenRoots[at].answer)) {
+      let encoded = match move run CacheBundle.answerAt(&rewritten, &mut answers, at) {
+        Option<&[u8]>.Some {value} => value
+        _ => { run Testing.expect(false, "a published record answer is readable") return () }
+      }
+      if let Option<EscapeAnswer>.Some {value: answer} = move run EscapeGraph.decodeAnswer(encoded) {
         if let EscapeAnswer.View {value: view} = &answer {
           run Testing.expect(escapeGraphRoot(&rewritten, view.graph) != usize.MAX,
             "every remaining descriptor carries its shared blob into the next image")
@@ -113236,9 +113525,16 @@ effect fn sharedEscapeViewClaims() -> ()
   run Testing.expect(Shared<Rejection>.with<bool>(&List<Shared<Rejection>>.asSlice(&rejected.rejections)[0], fn(value: &Rejection) -> bool {
     return value.code == RejectionCode.ReturnTypeMismatch && value.span.start == 27 && value.span.end == 31
   }), "lazy view materialization retains ordinary diagnostic code and authored location")
-  let mut missing = run CacheImage.copy(&image)
+  let mut missing = run CacheBundle.copy(&image)
   let absent = escapeGraphRoot(&missing, digest)
-  drop List<CacheImage.Root>.remove(&mut missing.roots, absent)
+  let mut remaining = List<usize>.make()
+  at = usize.ZERO
+  while at < List<CacheImage.Root>.length(&missing.roots) {
+    if at != absent { run List<usize>.append(&mut remaining, at) }
+    at = at + usize.ONE
+  }
+  run Testing.expect(run CacheBundle.retainRoots(&mut missing, List<usize>.asSlice(&remaining)),
+    "removing a blob preserves all other immutable root associations")
   let mut fallback = Semantic.make(run Revision.copy(&revision), MachineTarget.forId(TargetId.Aarch64AppleDarwin), Option<FinalProfile>.none())
   drop run Semantic.adoptCache(&mut fallback, &request, &missing, false)
   let memos = List<EscapeMemo>.asSlice(&fallback.escapeMemos)
@@ -113263,18 +113559,18 @@ test effect fn sharedEscapeViewsReplayBodyEditsAndRefuseMissingEvidence() -> ()
 effect fn sharedEscapeLivenessClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
   let old = ContentHash {high: 1, low: 11}
   let fresh = ContentHash {high: 2, low: 22}
-  let mut image = CacheImage.make()
-  let node = run CacheImage.addNode(&mut image, &[])
+  let mut image = CacheBundle.make()
+  let node = run CacheBundle.addNode(&mut image, &[])
   let first = EscapeGraph.Descriptor {graph: fresh, roots: List<ContentHash>.make()}
   let second = EscapeGraph.Descriptor {graph: old, roots: List<ContentHash>.make()}
-  run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: run escapeRecordKey(b"check-a"), node: node,
+  drop run CacheBundle.addRoot(&mut image, CacheImage.Root {key: run escapeRecordKey(b"check-a"), node: node,
     answer: run EscapeGraph.encodeDescriptor(&first)})
-  run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: run escapeRecordKey(b"check-b"), node: node,
+  drop run CacheBundle.addRoot(&mut image, CacheImage.Root {key: run escapeRecordKey(b"check-b"), node: node,
     answer: run EscapeGraph.encodeDescriptor(&second)})
-  run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: run escapeRecordKey(b"check-a"), node: node,
+  drop run CacheBundle.addRoot(&mut image, CacheImage.Root {key: run escapeRecordKey(b"check-a"), node: node,
     answer: run EscapeGraph.encodeDescriptor(&second)})
-  run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: run EscapeGraph.graphKey(old), node: node, answer: run Bytes.copy(b"old")})
-  run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: run EscapeGraph.graphKey(fresh), node: node, answer: run Bytes.copy(b"fresh")})
+  drop run CacheBundle.addRoot(&mut image, CacheImage.Root {key: run EscapeGraph.graphKey(old), node: node, answer: run Bytes.copy(b"old")})
+  drop run CacheBundle.addRoot(&mut image, CacheImage.Root {key: run EscapeGraph.graphKey(fresh), node: node, answer: run Bytes.copy(b"fresh")})
   let mut selected = List<usize>.make()
   run List<usize>.append(&mut selected, 1)
   run includeEscapeBlobs(&image, &mut selected)
@@ -113283,22 +113579,23 @@ effect fn sharedEscapeLivenessClaims() -> () ! OutOfMemoryError | AssertionError
   run Testing.expect(sameSlots(List<usize>.asSlice(&selected), &[1, 3]), "including graph references twice does not duplicate an existing blob root")
   let checkRoots = run rootsOfKinds(&image, true)
   let escapeRoots = run rootsOfKinds(&image, false)
-  let mut filtered = CacheImage.make()
-  drop run CacheImage.carry(&mut filtered, &image, List<usize>.asSlice(&escapeRoots))
+  let mut filtered = CacheBundle.make()
+  drop run CacheBundle.appendSelected(&mut filtered, &image, List<usize>.asSlice(&escapeRoots))
   run Testing.expect(List<usize>.length(&checkRoots) == List<usize>.length(&escapeRoots)
     && escapeGraphRoot(&filtered, old) != usize.MAX && escapeGraphRoot(&filtered, fresh) != usize.MAX,
     "filtered check/escape images retain every graph their descriptors reference")
   run pruneEscapeBlobs(&mut image)
   run Testing.expect(escapeGraphRoot(&image, old) != usize.MAX && escapeGraphRoot(&image, fresh) != usize.MAX,
     "unchanged and refreshed checks may retain different immutable generations")
-  let mut roots = List<CacheImage.Root>.asMutSlice(&mut image.roots)
-  roots[1].answer = run EscapeGraph.encodeDescriptor(&first)
+  let selectedRoot = run CacheBundle.rootMut(&mut image, 1)
+  selectedRoot.answer = run EscapeGraph.encodeDescriptor(&first)
   run pruneEscapeBlobs(&mut image)
   run Testing.expect(escapeGraphRoot(&image, old) == usize.MAX && escapeGraphRoot(&image, fresh) != usize.MAX,
     "only winning descriptors determine liveness; a superseded duplicate cannot pin an old generation")
-  let mut rootsAgain = List<CacheImage.Root>.asMutSlice(&mut image.roots)
-  rootsAgain[0].answer = run EscapeGraph.encodeInline(Bytes.asSlice(&run BuildRecord.encode(&BuildRecord.make(false, false))))
-  rootsAgain[1].answer = run EscapeGraph.encodeInline(Bytes.asSlice(&run BuildRecord.encode(&BuildRecord.make(false, false))))
+  let firstRoot = run CacheBundle.rootMut(&mut image, 0)
+  firstRoot.answer = run EscapeGraph.encodeInline(Bytes.asSlice(&run BuildRecord.encode(&BuildRecord.make(false, false))))
+  let secondRoot = run CacheBundle.rootMut(&mut image, 1)
+  secondRoot.answer = run EscapeGraph.encodeInline(Bytes.asSlice(&run BuildRecord.encode(&BuildRecord.make(false, false))))
   run pruneEscapeBlobs(&mut image)
   run Testing.expect(escapeGraphRoot(&image, fresh) == usize.MAX, "a blob disappears after its final current view is replaced")
 }
@@ -113320,14 +113617,23 @@ effect fn indexedEscapeFailedReplacementClaims() -> () ! OutOfMemoryError | Asse
   let changed = Bytes.asMutSlice(&mut malformed)
   changed[0] = if changed[0] == 0 { 1 } else { 0 }
   run Testing.expect(Bytes.length(&malformed) == Bytes.length(&blob), "old and new payloads have equal lengths")
-  let mut old = CacheImage.make()
-  let oldNode = run CacheImage.addNode(&mut old, &[])
-  run List<CacheImage.Root>.append(&mut old.roots, CacheImage.Root {key: run EscapeGraph.graphKey(digest), node: oldNode, answer: move malformed})
-  let mut fresh = CacheImage.make()
-  let freshNode = run CacheImage.addNode(&mut fresh, &[])
-  run List<CacheImage.Root>.append(&mut fresh.roots, CacheImage.Root {key: run EscapeGraph.graphKey(digest), node: freshNode, answer: move blob})
+  let mut old = CacheBundle.make()
+  let oldNode = run CacheBundle.addNode(&mut old, &[])
+  drop run CacheBundle.addRoot(&mut old, CacheImage.Root {key: run EscapeGraph.graphKey(digest), node: oldNode, answer: move malformed})
+  let mut fresh = CacheBundle.make()
+  let freshNode = run CacheBundle.addNode(&mut fresh, &[])
+  drop run CacheBundle.addRoot(&mut fresh, CacheImage.Root {key: run EscapeGraph.graphKey(digest), node: freshNode, answer: move blob})
   let mut store = Semantic.make(Revision.make(), MachineTarget.forId(TargetId.Aarch64AppleDarwin), Option<FinalProfile>.none())
-  store.heldImage = Option<CacheImage.Image>.some(move old)
+  store.heldImage = Option<CacheBundle.Bundle>.some(move old)
+  run List<usize>.append(&mut store.carriedRoots, 0)
+  run List<usize>.append(&mut store.carriedUnits, usize.MAX)
+  run List<usize>.append(&mut store.carriedBuild, 0)
+  run List<usize>.append(&mut store.pendingRoots, 0)
+  run List<usize>.append(&mut store.artifactCacheRoots, 0)
+  run List<usize>.append(&mut store.packedBuild.kept, 0)
+  run List<ReplayReport>.append(&mut store.replayReports, ReplayReport {unit: 0, node: 0, answer: Bytes.make()})
+  store.pendingImage = Option<PendingImage>.some(PendingImage {nodes: List<usize>.make(), files: List<usize>.make(),
+    inputs: List<usize>.make(), fileModules: List<usize>.make(), checks: List<PendingCheck>.make()})
   let found = run cachedEscapeGraph(&fresh, &mut store.escapeGraphs, digest)
   run Testing.expect(found != usize.MAX, "replacement adoption authenticates its new graph")
   if found == usize.MAX { return () }
@@ -113338,7 +113644,15 @@ effect fn indexedEscapeFailedReplacementClaims() -> () ! OutOfMemoryError | Asse
     "injected late adoption failure follows the production replacement cleanup")
   run Testing.expect(List<CachedEscapeGraph>.length(&store.escapeGraphs) == usize.ZERO,
     "failed replacement discards directories, decoded body identities and cached selected views")
-  if let Option<CacheImage.Image>.Some {value: held} = &store.heldImage {
+  run Testing.expect(List<usize>.length(&store.carriedRoots) == usize.ZERO
+    && List<usize>.length(&store.carriedUnits) == usize.ZERO && List<usize>.length(&store.carriedBuild) == usize.ZERO
+    && List<usize>.length(&store.pendingRoots) == usize.ZERO && List<usize>.length(&store.artifactCacheRoots) == usize.ZERO,
+    "late adoption failure cannot leave ordinals that a later bundle could rebind")
+  run Testing.expect(List<usize>.length(&store.packedBuild.kept) == usize.ZERO
+    && List<ReplayReport>.length(&store.replayReports) == usize.ZERO
+    && match &store.pendingImage { Option<PendingImage>.None => true _ => false },
+    "failed replacement discards held pack roots and partially assembled export node maps")
+  if let Option<CacheBundle.Bundle>.Some {value: held} = &store.heldImage {
     run Testing.expect((run cachedEscapeGraph(&held, &mut store.escapeGraphs, digest)) == usize.MAX,
       "old same-length malformed bytes cannot borrow the attempted replacement's authentication")
   } else { run Testing.expect(false, "failed replacement retains the prior held image") }
@@ -113350,6 +113664,51 @@ test effect fn indexedEscapeFailedReplacementDoesNotRebindAuthenticatedViews() -
   run indexedEscapeFailedReplacementClaims() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
+effect fn linkedBundleGenerationClaims() -> ()
+! Cycle | InvalidModulePath | OutOfMemoryError | AssertionError<'static> ? &mut Allocator | &mut Types {
+  let left = run ModuleId.make(b"memory", b"bundle-generation", b"left.silk")
+  let right = run ModuleId.make(b"memory", b"bundle-generation", b"right.silk")
+  let text = b"fn value() -> i32 { return 1 }\n"
+  let firstRevision = run Revision.publish(&Revision.make(), &left, &Option<Bytes>.some(run Bytes.copy(text)))
+  let revision = run Revision.publish(&firstRevision, &right, &Option<Bytes>.some(run Bytes.copy(text)))
+  let mut store = Semantic.make(move revision, MachineTarget.forId(TargetId.Aarch64AppleDarwin), Option<FinalProfile>.none())
+  let request = Request.make()
+  let mut at = usize.ZERO
+  while at < 2 {
+    let selected = if at == usize.ZERO { &left } else { &right }
+    let mut key = Bytes.make()
+    run StableKey.module(&mut key, selected)
+    let mut bundle = CacheBundle.make()
+    let leaf = run CacheBundle.addLeaf(&mut bundle, false, move key, ContentHash.of(text), usize.MAX, usize.MAX,
+      ContentHash {high: 0, low: 0})
+    let node = run CacheBundle.addNode(&mut bundle, &[CacheImage.leafEdge(leaf)])
+    drop run CacheBundle.addRoot(&mut bundle, CacheImage.Root {key: run Bytes.copy(b"generation-fixture"), node: node, answer: Bytes.make()})
+    drop run Semantic.adoptCache(&mut store, &request, &bundle, true)
+    at = at + usize.ONE
+  }
+  let old = run internKey(&mut store.resolver, Key {family: Family.ModuleCheck, module: usize.ZERO, name: 2,
+    declaration: usize.MAX, member: 0, external: false})
+  let fresh = run internKey(&mut store.resolver, Key {family: Family.ModuleCheck, module: usize.ZERO, name: 2,
+    declaration: usize.MAX, member: 1, external: false})
+  let oldUnit = u64.toUsize(old.value)
+  let freshUnit = u64.toUsize(fresh.value)
+  run Testing.expect(oldUnit != freshUnit && Graph.state(&store.resolver.graph, oldUnit) == UnitState.UpToDate
+    && Graph.state(&store.resolver.graph, freshUnit) == UnitState.UpToDate,
+    "two bundles' local node zero becomes two distinct linked dependency units")
+  let module = run internModule(&mut store.resolver, &left)
+  run Graph.sourceChanged(&mut store.resolver.graph, module)
+  run Testing.expect(Graph.state(&store.resolver.graph, oldUnit) == UnitState.Outdated
+    && Graph.state(&store.resolver.graph, freshUnit) == UnitState.UpToDate,
+    "replacing the bundle cannot redirect an old query's dependencies to unrelated new source")
+}
+
+test effect fn linkedBundleReplacementPreservesQueryDependencyIdentity() -> ()
+! Cycle | InvalidModulePath | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut types = TypeTable.make()
+  run linkedBundleGenerationClaims() |> Effect.provideMut<Types>(&mut types) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
 effect fn authenticatedEscapeRootClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
   let blob = match move run EscapeGraph.encodeGraph(&BuildRecord.make(false, false)) {
     Option<Bytes>.Some {value} => move value
@@ -113357,37 +113716,38 @@ effect fn authenticatedEscapeRootClaims() -> () ! OutOfMemoryError | AssertionEr
   }
   let digest = ContentHash.of(Bytes.asSlice(&blob))
   let wrong = ContentHash {high: digest.high, low: u64.bitXor(digest.low, 1)}
-  let mut image = CacheImage.make()
-  let node = run CacheImage.addNode(&mut image, &[])
-  run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: run Bytes.copy(b"unrelated"), node: node, answer: Bytes.make()})
-  run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: run EscapeGraph.graphKey(digest), node: node,
+  let mut image = CacheBundle.make()
+  let node = run CacheBundle.addNode(&mut image, &[])
+  drop run CacheBundle.addRoot(&mut image, CacheImage.Root {key: run Bytes.copy(b"unrelated"), node: node, answer: Bytes.make()})
+  drop run CacheBundle.addRoot(&mut image, CacheImage.Root {key: run EscapeGraph.graphKey(digest), node: node,
     answer: run Bytes.copy(Bytes.asSlice(&blob))})
   let mut cache = List<CachedEscapeGraph>.make()
   let first = run cachedEscapeGraph(&image, &mut cache, digest)
   run Testing.expect(first != usize.MAX, "the original blob authenticates")
   if first == usize.MAX { return () }
   run Testing.expect(List<CachedEscapeGraph>.asSlice(&cache)[first].root == 1, "the handle retains the selected immutable payload root")
-  run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: run EscapeGraph.graphKey(digest), node: node,
+  drop run CacheBundle.addRoot(&mut image, CacheImage.Root {key: run EscapeGraph.graphKey(digest), node: node,
     answer: run Bytes.copy(Bytes.asSlice(&blob))})
-  run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: run EscapeGraph.graphKey(wrong), node: node,
+  drop run CacheBundle.addRoot(&mut image, CacheImage.Root {key: run EscapeGraph.graphKey(wrong), node: node,
     answer: run Bytes.copy(Bytes.asSlice(&blob))})
   let answer = run EscapeGraph.encodeDescriptor(&EscapeGraph.Descriptor {graph: digest, roots: List<ContentHash>.make()})
-  let selected = run cachedEscapeAnswer(Option<&CacheImage.Image>.some(&image), &mut cache, Bytes.asSlice(&answer))
+  let selected = run cachedEscapeAnswer(Option<&CacheBundle.Bundle>.some(&image), &mut cache, Bytes.asSlice(&answer))
   run Testing.expect(match &selected {
     Option<CachedEscapeSelection>.Some {value} => value.graph == first && value.root == 1
     _ => false }, "appended duplicate and unrelated roots do not retarget an authenticated descriptor")
   run Testing.expect((run cachedEscapeGraph(&image, &mut cache, wrong)) == usize.MAX,
     "a different declared digest cannot borrow another blob's authenticated directory")
   // A first malformed duplicate must refuse rather than silently trying a later valid copy.
-  let mut malformed = run CacheImage.copy(&image)
-  let payload = Bytes.asMutSlice(&mut List<CacheImage.Root>.asMutSlice(&mut malformed.roots)[1].answer)
+  let mut malformed = run CacheBundle.copy(&image)
+  let malformedRoot = run CacheBundle.rootMut(&mut malformed, 1)
+  let payload = Bytes.asMutSlice(&mut malformedRoot.answer)
   payload[0] = if payload[0] == 0 { 1 } else { 0 }
   let mut fresh = List<CachedEscapeGraph>.make()
   run Testing.expect((run cachedEscapeGraph(&malformed, &mut fresh, digest)) == usize.MAX,
     "a malformed first duplicate cannot be bypassed by a valid later duplicate")
   run Testing.expect(List<CachedEscapeGraph>.length(&fresh) == usize.ZERO,
     "refused authentication publishes no reusable root handle")
-  let missing = CacheImage.make()
+  let missing = CacheBundle.make()
   run Testing.expect((run cachedEscapeGraph(&missing, &mut fresh, digest)) == usize.MAX,
     "a missing blob cannot authorize a descriptor in a fresh generation")
 }
@@ -113452,7 +113812,7 @@ effect fn sharedEscapeOrderClaims() -> ()
   let mut changedRecords = usize.ZERO
   at = usize.ZERO
   while at < List<CacheImage.Root>.length(&image.roots) {
-    let root = &mut List<CacheImage.Root>.asMutSlice(&mut image.roots)[at]
+    let root = run CacheBundle.rootMut(&mut image, at)
     if same(Bytes.asSlice(&root.key), Bytes.asSlice(&recordKey)) {
       let inline = match move EscapeGraph.readInline(Bytes.asSlice(&root.answer)) {
         Option<Span>.Some {value} => value
@@ -113477,27 +113837,27 @@ effect fn sharedEscapeOrderClaims() -> ()
     Option<Bytes>.Some {value} => ContentHash.of(Bytes.asSlice(&value))
     _ => ContentHash {high: 0, low: 0}
   }
-  let rosterLeaf = run CacheImage.addLeaf(&mut image, false, move rosterKey, rosterDigest, usize.MAX, usize.MAX,
+  let rosterLeaf = run CacheBundle.addLeaf(&mut image, false, move rosterKey, rosterDigest, usize.MAX, usize.MAX,
     ContentHash {high: 0, low: 0})
   at = usize.ZERO
   while at < List<CacheImage.Root>.length(&image.roots) {
     let root = &List<CacheImage.Root>.asSlice(&image.roots)[at]
     if same(Bytes.asSlice(&root.key), Bytes.asSlice(&recordKey)) {
       let prior = root.node
-      let guardedRecord = run CacheImage.addNode(&mut image, &[CacheImage.nodeEdge(prior), CacheImage.leafEdge(rosterLeaf)])
-      let roots = List<CacheImage.Root>.asMutSlice(&mut image.roots)
-      roots[at].node = guardedRecord
+      let guardedRecord = run CacheBundle.addNode(&mut image, &[CacheImage.nodeEdge(prior), CacheImage.leafEdge(rosterLeaf)])
+      let changedRoot = run CacheBundle.rootMut(&mut image, at)
+      changedRoot.node = guardedRecord
     }
     at = at + usize.ONE
   }
   // Frontier checks conservatively guard all selected MIR, including the supplied module.
   let callerNode = List<CacheImage.Root>.asSlice(&image.roots)[callerCheck].node
   let calleeNode = List<CacheImage.Root>.asSlice(&image.roots)[calleeCheck].node
-  let guarded = run CacheImage.addNode(&mut image, &[CacheImage.nodeEdge(callerNode), CacheImage.nodeEdge(calleeNode)])
-  let guardedRoots = List<CacheImage.Root>.asMutSlice(&mut image.roots)
-  guardedRoots[callerCheck].node = guarded
-  let blobNode = run CacheImage.addNode(&mut image, &[])
-  run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: run EscapeGraph.graphKey(digest), node: blobNode, answer: move blob})
+  let guarded = run CacheBundle.addNode(&mut image, &[CacheImage.nodeEdge(callerNode), CacheImage.nodeEdge(calleeNode)])
+  let guardedRoot = run CacheBundle.rootMut(&mut image, callerCheck)
+  guardedRoot.node = guarded
+  let blobNode = run CacheBundle.addNode(&mut image, &[])
+  drop run CacheBundle.addRoot(&mut image, CacheImage.Root {key: run EscapeGraph.graphKey(digest), node: blobNode, answer: move blob})
   // Also offer this closure to the export-only boundary. Its first replay below must write
   // a newly observed application guard, since the reconstructed trace changes with it.
   let coldCaller = run internModule(&mut cold.resolver, &caller)
@@ -113519,8 +113879,9 @@ effect fn sharedEscapeOrderClaims() -> ()
     at = at + usize.ONE
   }
   run Testing.expect(exportNode != usize.MAX, "the fixture offers the same authenticated closure")
-  run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: run escapeRecordKey(Bytes.asSlice(&exportStable)),
+  drop run CacheBundle.addRoot(&mut image, CacheImage.Root {key: run escapeRecordKey(Bytes.asSlice(&exportStable)),
     node: exportNode, answer: move exportAnswer})
+  image = run persistedEscapeFixture(&image)
   let broken = run Revision.publish(&revision, &callee, &Option<Bytes>.some(run Bytes.copy(
     b"pub fn first() -> i32 { return true }\npub fn second() -> i32 { return false }\n")))
   let mut warm = Semantic.make(run Revision.copy(&broken), MachineTarget.forId(TargetId.Aarch64AppleDarwin), Option<FinalProfile>.none())
@@ -113559,7 +113920,8 @@ effect fn sharedEscapeOrderClaims() -> ()
   let restrictedAgain = run Semantic.keptEscapes(&mut exports, &mut applicationA, own, &[own, other],
     List<DeclarationId>.asSlice(&concrete), true)
   run Testing.expect(!checkRefuses(&restrictedAgain), "reusing the reconstructed trace in the same command remains clean")
-  let savedExports = run Semantic.completeCacheImage(&mut exports)
+  let completedExports = run Semantic.completeCacheImage(&mut exports)
+  let savedExports = run persistedEscapeFixture(&completedExports)
   let mut applicationB = Request.forApplication(ModuleId.copy(&callee))
   let mut selected = Semantic.make(run Revision.copy(&broken), MachineTarget.forId(TargetId.Aarch64AppleDarwin), Option<FinalProfile>.none())
   drop run Semantic.adoptCache(&mut selected, &applicationB, &savedExports, false)
