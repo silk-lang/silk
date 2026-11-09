@@ -8,6 +8,8 @@
 //! Each source demand uses [`Query`](semantic.Query.Query) for typed reservation and completed
 //! answers. Events record actual query starts, hits, finishes, and source map reads.
 
+import semantic.Published {Published}
+import semantic.SourceEpoch {SourceEpoch}
 import semantic.Types {Types}
 import silk.mem.interned {Interned}
 import semantic.Anchor {Anchor}
@@ -38,11 +40,27 @@ import silk.collections.list {List}
 /// A completed source demand with retained bytes and a syntax-only index.
 pub struct IndexedSource {
   observation: Observation,
-  unit: SourceUnit,
-  index: ModuleIndex,
-  // One shared canonical identity per declaration ordinal, made on first request.
+  payload: ParsedPayload,
+  // Private per-store memo: only immutable parsed data is published to other workers.
   identities: List<Option<Interned<DeclarationId>>>,
-  headers: HeaderPlaces,
+}
+
+/// Complete immutable syntax/HIR, declaration/name index and header placement for exact bytes.
+/// Builders own all fields until SourceEpoch publication. No query, cursor or lazy identity memo
+/// is stored here. SourceEpoch authenticates unit bytes before accepting a completed payload.
+pub struct ParsedSource { unit: SourceUnit, index: ModuleIndex, headers: HeaderPlaces }
+impl ParsedSource {
+  pub fn unit(self: &Self) -> &SourceUnit { return &self.unit }
+}
+union ParsedPayload {
+  Owned {value: ParsedSource},
+  Published {value: Published<ParsedSource>},
+}
+fn parsedSource(source: &IndexedSource) -> &ParsedSource {
+  return match &source.payload {
+    ParsedPayload.Owned {value} => &value
+    ParsedPayload.Published {value} => Published<ParsedSource>.get(&value)
+  }
 }
 
 /// The aggregate members of a written header, each one a direct child of it.
@@ -231,6 +249,7 @@ effect fn demandSource(
   key: Word,
   fingerprinted: bool,
   parsed: &mut List<SourceUnit>,
+  epoch: &Option<SourceEpoch>,
 ) -> Shared<Result<SourceResult, NoRejection>> ! Cycle | OutOfMemoryError ? &mut Allocator {
   return run Query.demand(
     move query,
@@ -243,22 +262,11 @@ effect fn demandSource(
       let observed = run Revision.observe(revision, id)
       let present = Observation.isPresent(&observed)
       run record(&mut events.*, EventKind.SourceRead, id, number, present)
-      let content = run Observation.copyContent(&observed)
-      if let Option<Bytes>.Some {value} = move content {
-        let mut unit = match move takeParsed(&mut parsed.*, id, number, Bytes.asSlice(&value)) {
-          Option<SourceUnit>.Some {value: taken} => move taken
-          Option<SourceUnit>.None => run SourceUnit.parse(id, number, move value)
-        }
-        let index = run ModuleIndex.build(&unit, fingerprinted)
-        // The index holds everything later readers take from the tokens.
-        SourceUnit.releaseTokens(&mut unit)
-        let headers = run placeHeaders(&unit.authored, &index)
+      if present {
+        let payload = run sourcePayload(&observed, id, number, fingerprinted, &mut parsed.*, epoch)
         let source = IndexedSource {
-          observation: run Observation.copy(&observed),
-          unit: move unit,
-          index: move index,
+          observation: run Observation.copy(&observed), payload: move payload,
           identities: List<Option<Interned<DeclarationId>>>.make(),
-          headers: move headers,
         }
         let slot = List<SourceSlot>.length(&sources.*)
         run List<SourceSlot>.append(
@@ -274,6 +282,44 @@ effect fn demandSource(
       )
     },
   )
+}
+
+effect fn sourcePayload(observed: &Observation, id: &ModuleId, number: usize, fingerprinted: bool,
+  offered: &mut List<SourceUnit>, epoch: &Option<SourceEpoch>) -> ParsedPayload
+! OutOfMemoryError ? &mut Allocator {
+  let mut prepared = Option<SourceUnit>.none()
+  if let Option<SourceEpoch>.Some {value: held} = &epoch.* {
+    if let Option<Published<ParsedSource>>.Some {value} = move SourceEpoch.parsed(&held, id) {
+      return ParsedPayload.Published {value: move value}
+    }
+    prepared = SourceEpoch.takeParsed(&held, id)
+  }
+  let mut unit = match move prepared {
+    Option<SourceUnit>.Some {value} => move value
+    Option<SourceUnit>.None => {
+      let content = match move run Observation.copyContent(observed) {
+        Option<Bytes>.Some {value} => move value
+        _ => Intrinsic.trap("a present source observation retains its bytes")
+      }
+      match move takeParsed(&mut offered.*, id, number, Bytes.asSlice(&content)) {
+        Option<SourceUnit>.Some {value} => move value
+        _ => run SourceUnit.parse(id, number, move content)
+      }
+    }
+  }
+  unit.revision = number
+  let index = run ModuleIndex.build(&unit, fingerprinted)
+  SourceUnit.releaseTokens(&mut unit)
+  let headers = run placeHeaders(&unit.authored, &index)
+  let payload = ParsedSource {unit: move unit, index: move index, headers: move headers}
+  if let Option<SourceEpoch>.Some {value: held} = &epoch.* {
+    let ready = run Published<ParsedSource>.make(move payload)
+    return match move SourceEpoch.keep(&held, &ready) {
+      Option<Published<ParsedSource>>.Some {value} => ParsedPayload.Published {value: move value}
+      _ => Intrinsic.trap("a parser result belongs to the exact held source epoch")
+    }
+  }
+  return ParsedPayload.Owned {value: move payload}
 }
 
 fn sameBytes(left: &[u8], right: &[u8]) -> bool {
@@ -302,7 +348,7 @@ fn takeParsed(parsed: &mut List<SourceUnit>, id: &ModuleId, number: usize, conte
   return Option<SourceUnit>.none()
 }
 
-effect fn withPublication<'a, 'b, 'c, 'd, 'e, 'f>(
+effect fn withPublication<'a, 'b, 'c, 'd, 'e, 'f, 'g>(
   sources: &'a mut List<SourceSlot>,
   query: &'b mut Query<SourceResult, NoRejection>,
   events: &'c mut List<Event>,
@@ -312,6 +358,7 @@ effect fn withPublication<'a, 'b, 'c, 'd, 'e, 'f>(
   key: Word,
   fingerprinted: bool,
   parsed: &'f mut List<SourceUnit>,
+  epoch: &'g Option<SourceEpoch>,
 ) -> Shared<Result<SourceResult, NoRejection>> ! Cycle | OutOfMemoryError ? &mut Allocator {
   let base = List<SourceSlot>.length(&sources.*)
   let publication = SourcePublication {
@@ -334,6 +381,7 @@ effect fn withPublication<'a, 'b, 'c, 'd, 'e, 'f>(
       selected,
       fingerprinted,
       move parsed,
+      epoch,
     )
   }
   let release = effect fn(resource: &mut SourcePublication<'a, 'b>) -> () {
@@ -351,7 +399,7 @@ struct NameSelection {
   valid: bool,
   present: bool,
   slot: usize,
-  found: Option<Shared<NameObservation>>,
+  found: Option<Published<NameObservation>>,
 }
 
 /// An empty semantic rejection type for source queries that return presence or absence.
@@ -402,6 +450,7 @@ pub enum Environment {
 pub struct SourceIndex {
   environment: Environment,
   revision: Revision,
+  epoch: Option<SourceEpoch>,
   keys: List<ModuleId>,
   keyLookup: InternIndex,
   // The key `keyFor` found last, or `usize.MAX`: consecutive demands mostly name one module.
@@ -509,7 +558,7 @@ fn invalidNameSelection() -> NameSelection {
     valid: false,
     present: false,
     slot: usize.ZERO,
-    found: Option<Shared<NameObservation>>.none(),
+    found: Option<Published<NameObservation>>.none(),
   }
 }
 
@@ -533,11 +582,11 @@ fn presentNameSelection(
   // A filled slot's observation matches the held revision: a slot is kept only once its answer
   // completes, and `revise` empties the slot of every completed answer the new revision changes.
   // So an answer observing the same bytes as the slot matches the held revision too.
-  if !ModuleId.equals(&source.unit.id, id) || !Observation.equals(observation, &source.observation) {
+  if !ModuleId.equals(&parsedSource(source).unit.id, id) || !Observation.equals(observation, &source.observation) {
     return invalidNameSelection()
   }
-  let mut found = Option<Shared<NameObservation>>.none()
-  if lookup { found = ModuleIndex.cachedName(&source.index, name) }
+  let mut found = Option<Published<NameObservation>>.none()
+  if lookup { found = ModuleIndex.cachedName(&parsedSource(source).index, name) }
   return NameSelection {valid: true, present: true, slot: slot, found: move found}
 }
 
@@ -550,7 +599,7 @@ fn absentNameSelection(observation: &Observation, id: &ModuleId, held: &Revision
       valid: true,
       present: false,
       slot: usize.ZERO,
-      found: Option<Shared<NameObservation>>.none(),
+      found: Option<Published<NameObservation>>.none(),
     }
   }
   return invalidNameSelection()
@@ -561,7 +610,7 @@ fn absentNameSelection(observation: &Observation, id: &ModuleId, held: &Revision
 fn presentSlot(answer: &Result<SourceResult, NoRejection>, sources: &[SourceSlot], id: &ModuleId) -> usize {
   if let Result<SourceResult, NoRejection>.Success {value: SourceResult.Present {slot, observation}} = &answer.* {
     if let Option<&IndexedSource>.Some {value: source} = move sourceAtSlot(sources, slot) {
-      if ModuleId.equals(&source.unit.id, id) && Observation.equals(&observation, &source.observation) { return slot }
+      if ModuleId.equals(&parsedSource(source).unit.id, id) && Observation.equals(&observation, &source.observation) { return slot }
     }
   }
   return usize.MAX
@@ -589,8 +638,8 @@ fn selectName(
 
 effect fn identityOf(indexed: &mut IndexedSource, ordinal: usize) -> Option<Interned<DeclarationId>>
 ! OutOfMemoryError ? &mut Allocator | &mut Types {
-  let declarations = ModuleIndex.listDeclarations(&indexed.index)
-  if ordinal >= declarations.length {
+  let count = ModuleIndex.listDeclarations(&parsedSource(&indexed.*).index).length
+  if ordinal >= count {
     return Option<Interned<DeclarationId>>.none()
   }
   while List<Option<Interned<DeclarationId>>>.length(&indexed.identities) <= ordinal {
@@ -603,7 +652,8 @@ effect fn identityOf(indexed: &mut IndexedSource, ordinal: usize) -> Option<Inte
   if let Option<Interned<DeclarationId>>.Some {value: cached} = &identities[ordinal] {
     return Option<Interned<DeclarationId>>.some(Interned<DeclarationId>.clone(&cached))
   }
-  let identity = run Types.internDeclaration(DeclarationId.copy(&declarations[ordinal].identity))
+  let declaration = DeclarationId.copy(&ModuleIndex.listDeclarations(&parsedSource(&indexed.*).index)[ordinal].identity)
+  let identity = run Types.internDeclaration(move declaration)
   List<Option<Interned<DeclarationId>>>.set(
     &mut indexed.identities,
     ordinal,
@@ -616,12 +666,12 @@ impl IndexedSource {
   /// The anchor of the declaration at `ordinal`; an anonymous literal takes the anchor of its
   /// nearest enclosing named declaration, whose analysis it belongs to.
   pub fn anchorOf(self: &Self, ordinal: usize) -> Option<Anchor> {
-    let declarations = ModuleIndex.listDeclarations(&self.index)
+    let declarations = ModuleIndex.listDeclarations(&parsedSource(self).index)
     let mut at = ordinal
     while at < declarations.length {
       let kind = DeclarationId.kind(&declarations[at].identity)
       if kind != OwnerKind.Literal {
-        return Anchor.of(&self.unit.authored, &self.unit.locations, declarations[at].local)
+        return Anchor.of(&parsedSource(self).unit.authored, &parsedSource(self).unit.locations, declarations[at].local)
       }
       at = match &declarations[at].parent {
         Option<usize>.Some {value} => value
@@ -636,25 +686,32 @@ impl IndexedSource {
   }
   /// Borrows the retained bytes, syntax tree, and authored HIR for this indexed source.
   pub fn sourceUnit(self: &Self) -> &SourceUnit {
-    return &self.unit
+    return &parsedSource(self).unit
   }
   /// Borrows the authored HIR retained by this indexed source.
   pub fn authored(self: &Self) -> &Module {
-    return &self.unit.authored
+    return &parsedSource(self).unit.authored
   }
   /// Borrows the syntax-only declarations and name candidates for this indexed source.
   pub fn moduleIndex(self: &Self) -> &ModuleIndex {
-    return &self.index
+    return &parsedSource(self).index
   }
   /// The innermost indexed header holding `id`, with its member; absent outside every header.
   pub fn headerPlace(self: &Self, id: HirId) -> Option<HeaderPlace> {
-    let nodes = List<usize>.asSlice(&self.headers.nodes)
-    let mut at = InternIndex.first(&self.headers.lookup, usize.toU64(id.index))
+    let nodes = List<usize>.asSlice(&parsedSource(self).headers.nodes)
+    let mut at = InternIndex.first(&parsedSource(self).headers.lookup, usize.toU64(id.index))
     while at != usize.MAX {
-      if nodes[at] == id.index { return Option<HeaderPlace>.some(List<HeaderPlace>.asSlice(&self.headers.places)[at]) }
-      at = InternIndex.after(&self.headers.lookup, at)
+      if nodes[at] == id.index { return Option<HeaderPlace>.some(List<HeaderPlace>.asSlice(&parsedSource(self).headers.places)[at]) }
+      at = InternIndex.after(&parsedSource(self).headers.lookup, at)
     }
     return Option<HeaderPlace>.none()
+  }
+}
+
+fn heldRevision(self: &SourceIndex) -> &Revision {
+  return match &self.epoch {
+    Option<SourceEpoch>.Some {value} => SourceEpoch.revision(&value)
+    _ => &self.revision
   }
 }
 
@@ -662,6 +719,7 @@ fn openIndex(revision: Revision, revisions: bool) -> SourceIndex {
   return SourceIndex {
     environment: Environment.Final,
     revision: move revision,
+    epoch: Option<SourceEpoch>.none(),
     keys: List<ModuleId>.make(),
     keyLookup: InternIndex.make(),
     lastKey: usize.MAX,
@@ -681,6 +739,14 @@ fn oneShotRevised() -> () {
 }
 
 impl SourceIndex {
+  /// Creates a private immutable query store over the common source epoch. No Query, local
+  /// source ordinal, declaration-handle memo or AuthoredCursor token crosses the boundary.
+  pub fn inEpoch(epoch: &SourceEpoch) -> SourceIndex {
+    let mut store = openIndex(Revision.make(), false)
+    store.epoch = Option<SourceEpoch>.some(SourceEpoch.clone(epoch))
+    return move store
+  }
+
   /// Creates a source-query store for one held in-memory revision and fixed Final environment.
   pub fn make(revision: Revision) -> SourceIndex {
     return openIndex(move revision, true)
@@ -744,7 +810,10 @@ impl SourceIndex {
             let mut sources = List<SourceSlot>.asMutSlice(&mut self.sources)
             let held = Intrinsic.replace(sources[slot].source, Option<IndexedSource>.none())
             if let Option<IndexedSource>.Some {value: prior} = move held {
-              previous = Option<ModuleIndex>.some(move prior.index)
+              previous = match move prior.payload {
+                ParsedPayload.Owned {value} => Option<ModuleIndex>.some(move value.index)
+                ParsedPayload.Published {..} => Intrinsic.trap("a source epoch store cannot be revised")
+              }
             }
           }
           Query.forget(&mut self.query, key)
@@ -760,7 +829,7 @@ impl SourceIndex {
   }
   /// Reports whether this store's held revision has bytes for one module path.
   pub fn presents(self: &Self, id: &ModuleId) -> bool {
-    return Revision.presents(&self.revision, id)
+    return Revision.presents(heldRevision(self), id)
   }
   /// Returns the fixed Final environment selected for this M1 store.
   pub fn queryEnvironment(self: &Self) -> Environment {
@@ -782,7 +851,7 @@ impl SourceIndex {
     let slots = List<SourceSlot>.asSlice(&self.sources)
     if at < slots.length {
       if let Option<IndexedSource>.Some {value: indexed} = &slots[at].source {
-        return Option<&ModuleId>.some(&indexed.unit.id)
+        return Option<&ModuleId>.some(&parsedSource(&indexed).unit.id)
       }
     }
     return Option<&ModuleId>.none()
@@ -794,17 +863,17 @@ impl SourceIndex {
     while at < slots.length {
       if let Option<IndexedSource>.Some {value: indexed} = &slots[at].source {
         let mut position = usize.ZERO
-        while position < SourceUnit.diagnosticCount(&indexed.unit) {
-          let diagnostic = SourceUnit.diagnostic(&indexed.unit, position)
+        while position < SourceUnit.diagnosticCount(&parsedSource(&indexed).unit) {
+          let diagnostic = SourceUnit.diagnostic(&parsedSource(&indexed).unit, position)
           if diagnostic.code == CauseCode.MissingToken || diagnostic.code == CauseCode.UnexpectedToken
             || diagnostic.code == CauseCode.NestingLimit || diagnostic.code == CauseCode.ReservedTemplate
             || diagnostic.code == CauseCode.ReservedImportBinding || diagnostic.code == CauseCode.LoopStatement
             || diagnostic.code == CauseCode.OptionalTypeSyntax || diagnostic.code == CauseCode.TupleTypeSyntax
             || diagnostic.code == CauseCode.IfExpression || diagnostic.code == CauseCode.ForeignSpelling
             || diagnostic.code == CauseCode.WithClause || diagnostic.code == CauseCode.LexicalError {
-            let holes = run sourceHoles(diagnostic.detail, SourceUnit.bytes(&indexed.unit))
+            let holes = run sourceHoles(diagnostic.detail, SourceUnit.bytes(&parsedSource(&indexed).unit))
             run List<SyntaxProblem>.append(&mut problems, SyntaxProblem {
-              module: ModuleId.copy(&indexed.unit.id), span: diagnostic.span, code: diagnostic.code,
+              module: ModuleId.copy(&parsedSource(&indexed).unit.id), span: diagnostic.span, code: diagnostic.code,
               detail: diagnostic.detail, holes: move holes,
             })
           }
@@ -824,7 +893,7 @@ impl SourceIndex {
   pub effect fn captureObservation(self: &Self, id: &ModuleId) -> Observation
   ! OutOfMemoryError
   ? &mut Allocator {
-    return run Revision.observe(&self.revision, id)
+    return run Revision.observe(heldRevision(self), id)
   }
   /// Requests one source and its complete syntax index through the typed query store.
   ///
@@ -837,6 +906,15 @@ impl SourceIndex {
   /// Hands the store units a driver already parsed. The first demand of a module whose bytes in
   /// this revision equal a unit's takes that unit instead of parsing again.
   pub fn offerParsed(self: &mut Self, units: List<SourceUnit>) -> () {
+    if let Option<SourceEpoch>.Some {value} = &self.epoch {
+      let mut remaining = move units
+      while List<SourceUnit>.length(&remaining) > 0 {
+        let last = List<SourceUnit>.length(&remaining) - 1
+        let unit = List<SourceUnit>.remove(&mut remaining, last)
+        SourceEpoch.offerParsed(&value, move unit)
+      }
+      return ()
+    }
     self.parsed = move units
   }
   pub effect fn demand(self: &mut Self, id: &ModuleId) -> Shared<Result<SourceResult, NoRejection>>
@@ -855,17 +933,26 @@ impl SourceIndex {
   effect fn publishDemand(self: &mut Self, id: &ModuleId, key: Word) -> Shared<Result<SourceResult, NoRejection>>
   ! Cycle | OutOfMemoryError
   ? &mut Allocator {
-    let number = Revision.revisionNumber(&self.revision)
+    let epoch = match &self.epoch {
+      Option<SourceEpoch>.Some {value} => Option<SourceEpoch>.some(SourceEpoch.clone(&value))
+      _ => Option<SourceEpoch>.none()
+    }
+    let revision = match &epoch {
+      Option<SourceEpoch>.Some {value} => SourceEpoch.revision(&value)
+      _ => &self.revision
+    }
+    let number = Revision.revisionNumber(revision)
     let answer = run withPublication(
       &mut self.sources,
       &mut self.query,
       &mut self.events,
-      &self.revision,
+      revision,
       id,
       number,
       key,
       self.revisions,
       &mut self.parsed,
+      &epoch,
     )
     run record(&mut self.events, EventKind.QueryFinish, id, number, false)
     return move answer
@@ -887,8 +974,8 @@ impl SourceIndex {
     answer: &Shared<Result<SourceResult, NoRejection>>,
     id: &ModuleId,
     name: &[u8],
-  ) -> Option<Shared<NameObservation>> ! RevisionMismatch | OutOfMemoryError ? &mut Allocator {
-    let held = &self.revision
+  ) -> Option<Published<NameObservation>> ! RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+    let held = heldRevision(&self.*)
     let sources = List<SourceSlot>.asSlice(&self.sources)
     let selected = Shared<Result<SourceResult, NoRejection>>.with<NameSelection>(
       answer,
@@ -900,15 +987,15 @@ impl SourceIndex {
       fail RevisionMismatch {}
     }
     if !selected.present {
-      return Option<Shared<NameObservation>>.none()
+      return Option<Published<NameObservation>>.none()
     }
     let observed = match move selected.found {
-      Option<Shared<NameObservation>>.Some {value} => move value
-      Option<Shared<NameObservation>>.None => run Shared<NameObservation>.make(
+      Option<Published<NameObservation>>.Some {value} => move value
+      Option<Published<NameObservation>>.None => run Published<NameObservation>.make(
         run NameObservation.empty(id, name),
       )
     }
-    return Option<Shared<NameObservation>>.some(move observed)
+    return Option<Published<NameObservation>>.some(move observed)
   }
   /// Borrows the one parsed unit and syntax index from a completed present answer.
   ///
