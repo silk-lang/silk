@@ -1,0 +1,241 @@
+//! A selected immutable cache generation without flattening its dependency graph or answers.
+//!
+//! A view owns shared segment handles and small lookup tables. Handles in this module are
+//! local to exactly one view; persistence uses content digests and segment-local indexes.
+//! Filesystem leases are held by the driver for the entire lifetime of a view and its users.
+
+import semantic.CacheGeneration as Generation {Generation as GenerationData, Requirements}
+import semantic.CacheSegments as Segments {SealedSegment, Reference, ObservationView}
+import semantic.ContentHash {ContentHash}
+import semantic.InternIndex {InternIndex}
+import semantic.RuntimeEncoding
+import silk.collections.list {List}
+import silk.core.option {Option}
+import silk.core.ownership {Copy}
+import silk.mem.frozen {Frozen}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.usize
+
+/// A node or observation in one view. The segment ordinal is never written to persistent storage.
+pub struct Handle {pub segment: usize, pub index: usize}
+impl Copy for Handle {}
+
+/// One validated dependency, resolved into the owning view's catalog.
+pub struct Dependency {pub node: bool, pub target: Handle}
+impl Copy for Dependency {}
+
+struct Placed {source: Handle, target: Handle}
+impl Copy for Placed {}
+
+/// An authoritative root selection and its immutable segments. It owns memory, not OS pins.
+pub struct View {
+  generation: GenerationData,
+  owners: List<Frozen<SealedSegment>>,
+  requirements: Requirements,
+  catalogIndex: InternIndex,
+  rootIndex: InternIndex,
+  roots: List<Handle>,
+  placements: List<Placed>,
+}
+
+/// The authoritative descriptor to publish, without rebuilding its immutable segments.
+pub fn generation(view: &View) -> &GenerationData { return &view.generation }
+/// Read-only shared segment owners. Handles may be cloned on the owning process thread.
+pub fn segments(view: &View) -> &[Frozen<SealedSegment>] { return List<Frozen<SealedSegment>>.asSlice(&view.owners) }
+/// Pack requirements of selected answers; the driver must separately retain these objects.
+pub fn requiredPacks(view: &View) -> &[ContentHash] { return List<ContentHash>.asSlice(&view.requirements.packs) }
+/// Number of roots authorized by this exact generation.
+pub fn rootCount(view: &View) -> usize { return List<Handle>.length(&view.roots) }
+
+/// Finds an exact content identity in this view's catalog.
+pub fn segmentIndex(view: &View, digest: ContentHash) -> Option<usize> {
+  let catalog = List<Segments.Descriptor>.asSlice(&view.generation.catalog)
+  let mut at = InternIndex.first(&view.catalogIndex, digest.low)
+  while at != usize.MAX {
+    if ContentHash.equals(catalog[at].digest, digest) { return Option<usize>.some(at) }
+    at = InternIndex.after(&view.catalogIndex, at)
+  }
+  return Option<usize>.none()
+}
+
+fn owner<'a>(view: &'a View, segment: usize) -> Option<&'a SealedSegment> {
+  let held = segments(view)
+  if segment >= held.length { return Option<&SealedSegment>.none() }
+  return Option<&SealedSegment>.some(Frozen<SealedSegment>.get(&held[segment]))
+}
+
+/// Resolves a segment-local or imported reference without changing the referenced identity.
+pub fn resolve(view: &View, source: usize, reference: Reference) -> Option<Handle> {
+  let held = match move owner(view, source) { Option<&SealedSegment>.Some {value} => value Option<&SealedSegment>.None => { return Option<Handle>.none() } }
+  if reference.segment == usize.ZERO { return Option<Handle>.some(Handle {segment: source, index: reference.index}) }
+  let imports = Segments.imports(held)
+  if reference.segment > imports.length { return Option<Handle>.none() }
+  return match move segmentIndex(view, imports[reference.segment - usize.ONE].digest) {
+    Option<usize>.Some {value} => Option<Handle>.some(Handle {segment: value, index: reference.index})
+    Option<usize>.None => Option<Handle>.none()
+  }
+}
+
+/// Constructs lookup metadata only after exact catalog, selected-root and placement admission.
+/// It never copies root answers, expands node edges or creates a flattened cache image.
+pub effect fn make(generation: GenerationData, owners: List<Frozen<SealedSegment>>) -> Option<View>
+! OutOfMemoryError ? &mut Allocator {
+  let requirements = match move run Generation.admit(&generation, List<Frozen<SealedSegment>>.asSlice(&owners)) {
+    Option<Requirements>.Some {value} => move value
+    Option<Requirements>.None => { return Option<View>.none() }
+  }
+  let mut view = View {generation: move generation, owners: move owners, requirements: move requirements,
+    catalogIndex: InternIndex.make(), rootIndex: InternIndex.make(), roots: List<Handle>.make(), placements: List<Placed>.make()}
+  let catalog = List<Segments.Descriptor>.asSlice(&view.generation.catalog)
+  let mut at = usize.ZERO
+  while at < catalog.length { run InternIndex.record(&mut view.catalogIndex, catalog[at].digest.low) at = at + usize.ONE }
+  let selections = List<Generation.Selection>.asSlice(&view.generation.selections)
+  at = usize.ZERO
+  while at < selections.length {
+    let segment = match move segmentIndex(&view, selections[at].segment) {
+      Option<usize>.Some {value} => value Option<usize>.None => { return Option<View>.none() }
+    }
+    let held = Frozen<SealedSegment>.get(&List<Frozen<SealedSegment>>.asSlice(&view.owners)[segment])
+    let descriptor = Segments.descriptor(held)
+    let mut root = usize.ZERO
+    while root < descriptor.roots {
+      if Generation.selected(&selections[at], root) {
+        let key = match move Segments.rootKey(held, root) {
+          Option<&[u8]>.Some {value} => value Option<&[u8]>.None => { return Option<View>.none() }
+        }
+        run InternIndex.record(&mut view.rootIndex, ContentHash.of(key).low)
+        run List<Handle>.append(&mut view.roots, Handle {segment: segment, index: root})
+      }
+      root = root + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  let placements = List<Generation.Placement>.asSlice(&view.generation.placements)
+  at = usize.ZERO
+  while at < placements.length {
+    let source = match move segmentIndex(&view, placements[at].source.segment) {
+      Option<usize>.Some {value} => value Option<usize>.None => { return Option<View>.none() }
+    }
+    let target = match move segmentIndex(&view, placements[at].target.segment) {
+      Option<usize>.Some {value} => value Option<usize>.None => { return Option<View>.none() }
+    }
+    run List<Placed>.append(&mut view.placements, Placed {source: Handle {segment: source, index: placements[at].source.index},
+      target: Handle {segment: target, index: placements[at].target.index}})
+    at = at + usize.ONE
+  }
+  return Option<View>.some(move view)
+}
+
+/// Clones only shared owner handles, allowing a new generation to retain unchanged bytes.
+pub effect fn cloneSegments(view: &View) -> List<Frozen<SealedSegment>> ! OutOfMemoryError ? &mut Allocator {
+  let held = segments(view)
+  let mut result = List<Frozen<SealedSegment>>.make()
+  run List<Frozen<SealedSegment>>.reserveExact(&mut result, held.length)
+  let mut at = usize.ZERO
+  while at < held.length { run List<Frozen<SealedSegment>>.append(&mut result, Frozen<SealedSegment>.clone(&held[at])) at = at + usize.ONE }
+  return move result
+}
+
+/// The exact stored root selected at an ordinal of this view's authoritative root table.
+pub fn rootHandle(view: &View, at: usize) -> Option<Handle> {
+  let roots = List<Handle>.asSlice(&view.roots)
+  if at >= roots.length { return Option<Handle>.none() }
+  return Option<Handle>.some(roots[at])
+}
+/// Borrows the key of a selected root; unselected physical roots have no entry here.
+pub fn rootKey<'a>(view: &'a View, at: usize) -> Option<&'a [u8]> {
+  let root = match move rootHandle(view, at) { Option<Handle>.Some {value} => value Option<Handle>.None => { return Option<&[u8]>.none() } }
+  return Segments.rootKey(Frozen<SealedSegment>.get(&segments(view)[root.segment]), root.index)
+}
+/// Borrows a selected answer without copying its payload.
+pub fn rootAnswer<'a>(view: &'a View, at: usize) -> Option<&'a [u8]> {
+  let root = match move rootHandle(view, at) { Option<Handle>.Some {value} => value Option<Handle>.None => { return Option<&[u8]>.none() } }
+  return Segments.rootAnswer(Frozen<SealedSegment>.get(&segments(view)[root.segment]), root.index)
+}
+/// Finds an exact selected key; stored obsolete answers are never considered.
+pub fn findRoot(view: &View, key: &[u8]) -> Option<usize> {
+  let mut at = InternIndex.first(&view.rootIndex, ContentHash.of(key).low)
+  while at != usize.MAX {
+    if let Option<&[u8]>.Some {value: held} = move rootKey(view, at) {
+      if RuntimeEncoding.equals(key, held) { return Option<usize>.some(at) }
+    }
+    at = InternIndex.after(&view.rootIndex, at)
+  }
+  return Option<usize>.none()
+}
+/// Resolves the original dependency guard of a selected answer.
+pub fn rootNode(view: &View, at: usize) -> Option<Handle> {
+  let root = match move rootHandle(view, at) { Option<Handle>.Some {value} => value Option<Handle>.None => { return Option<Handle>.none() } }
+  let reference = match move Segments.rootNode(Frozen<SealedSegment>.get(&segments(view)[root.segment]), root.index) {
+    Option<Reference>.Some {value} => value Option<Reference>.None => { return Option<Handle>.none() }
+  }
+  return resolve(view, root.segment, reference)
+}
+
+/// Reads the original immutable observation, including an original whole-file dependency.
+pub fn observation<'a>(view: &'a View, handle: Handle) -> Option<ObservationView<'a>> {
+  let held = match move owner(view, handle.segment) {
+    Option<&SealedSegment>.Some {value} => value Option<&SealedSegment>.None => { return Option<ObservationView>.none() }
+  }
+  return Segments.observation(held, handle.index)
+}
+/// Finds direct equivalent input placement evidence. Generation admission excludes chains,
+/// whole-file overrides and changes to exact key, expected input digest or selector.
+pub fn placement(view: &View, source: Handle) -> Option<Handle> {
+  let entries = List<Placed>.asSlice(&view.placements)
+  let mut low = usize.ZERO
+  let mut high = entries.length
+  while low < high {
+    let middle = low + (high - low) / 2
+    let key = entries[middle].source
+    if key.segment < source.segment || (key.segment == source.segment && key.index < source.index) { low = middle + usize.ONE }
+    else { high = middle }
+  }
+  if low < entries.length && entries[low].source.segment == source.segment && entries[low].source.index == source.index {
+    return Option<Handle>.some(entries[low].target)
+  }
+  return Option<Handle>.none()
+}
+/// The owner handle of current equivalent input placement evidence, or the original handle.
+pub fn placedHandle(view: &View, source: Handle) -> Handle {
+  return match move placement(view, source) { Option<Handle>.Some {value} => value Option<Handle>.None => source }
+}
+/// Borrows validated input placement evidence. Guard comparisons still use the original input
+/// identity and digest; whole-file dependency edges always read `observation` instead.
+pub fn placedObservation<'a>(view: &'a View, source: Handle) -> Option<ObservationView<'a>> {
+  return observation(view, placedHandle(view, source))
+}
+/// Resolves the recorded file of the effective input observation, without rebinding any
+/// independent whole-file dependency to that newer file.
+pub fn placementFile(view: &View, source: Handle) -> Option<Handle> {
+  let effective = placedHandle(view, source)
+  let observed = match move observation(view, effective) {
+    Option<ObservationView>.Some {value} => move value Option<ObservationView>.None => { return Option<Handle>.none() }
+  }
+  return match &observed.file {
+    Option<Reference>.Some {value} => resolve(view, effective.segment, value)
+    Option<Reference>.None => Option<Handle>.none()
+  }
+}
+
+/// Number of a node's lazily indexed edges, without expanding the edge payload.
+pub fn edgeCount(view: &View, node: Handle) -> Option<usize> {
+  let held = match move owner(view, node.segment) {
+    Option<&SealedSegment>.Some {value} => value Option<&SealedSegment>.None => { return Option<usize>.none() }
+  }
+  return Segments.edgeCount(held, node.index)
+}
+/// Reads one dependency and resolves imported ownership. Invalid payloads refuse the guard;
+/// callers must not interpret absence as an empty dependency list.
+pub fn edge(view: &View, node: Handle, at: usize) -> Option<Dependency> {
+  let held = match move owner(view, node.segment) {
+    Option<&SealedSegment>.Some {value} => value Option<&SealedSegment>.None => { return Option<Dependency>.none() }
+  }
+  let edge = match move Segments.edge(held, node.index, at) {
+    Option<Segments.Edge>.Some {value} => value Option<Segments.Edge>.None => { return Option<Dependency>.none() }
+  }
+  let target = match move resolve(view, node.segment, edge.target) {
+    Option<Handle>.Some {value} => value Option<Handle>.None => { return Option<Dependency>.none() }
+  }
+  return Option<Dependency>.some(Dependency {node: edge.node, target: target})
+}
