@@ -92,7 +92,7 @@ pub fn main() -> i32 {
 
 Import as `Option` with `import silk.core.option { Option }`.
 
-Public declarations: 5.
+Public declarations: 6.
 
 <a id="Option"></a>
 
@@ -173,6 +173,42 @@ pub value: T
 
 The owned present value.
 
+<a id="Omittable"></a>
+
+## `Omittable`
+
+```silk
+pub type Omittable = Intrinsic.Omittable
+```
+
+The interface that lets a struct or variant literal leave out a field of the implementing type.
+
+### Details
+
+A conformance `impl Omittable for T` gives the member `omitted() -> T`. A literal such as
+`Config { name: "web" }` may leave out any field whose type implements `Omittable`, and the
+field holds `omitted()`. A field whose type does not implement it must be written. `Option<T>`
+implements it with [`None`](#Option.None), so every `Option` field is optional.
+
+### Examples
+
+```silk
+import silk.core.option { Option }
+
+struct Server {
+  name: string<'static>,
+  port: Option<u16>,
+}
+
+pub fn main() -> i32 {
+  let server = Server { name: "web" }
+  if Option<u16>.isSome(&server.port) {
+    return 1
+  }
+  return 0
+}
+```
+
 <a id="Option.impl.Copy"></a>
 
 ## Implementation `Copy for Option<T>`
@@ -217,6 +253,24 @@ pub fn main() -> i32 {
 
 ```silk
 fn equals(left: &Self, right: &Self) -> bool
+```
+
+<a id="Option.impl.Omittable"></a>
+
+## Implementation `Omittable for Option<T>`
+
+```silk
+impl<T> Omittable for Option<T>
+```
+
+A literal may leave out an `Option` field, which then holds `None`.
+
+<a id="Option.impl.Omittable.omitted"></a>
+
+### Operation `omitted`
+
+```silk
+fn omitted() -> Self
 ```
 
 <a id="Option.impl"></a>

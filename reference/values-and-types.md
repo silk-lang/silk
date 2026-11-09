@@ -719,8 +719,9 @@ reports `SEM0019`; inline recursive layouts report `SEM0020`.
 **Status:** Confirmed
 
 A raw struct literal is available wherever every required field is visible. It must initialize
-every field exactly once with a compatible value. Initializers evaluate in source order, while the
-completed value retains canonical declaration field order.
+every field exactly once with a compatible value, except that it may leave out a field whose type
+implements `Omittable` (STRUCT-007). Initializers evaluate in source order, while the completed
+value retains canonical declaration field order.
 
 ```silk
 struct Point {
@@ -742,13 +743,14 @@ descriptors, so a generic function can construct its own type parameter field by
 ([STATIC-017](static-evaluation.md#static-017--a-struct-literal-initializes-fields-from-a-static-sequence-of-field-descriptors)).
 
 **Boundary:** Unknown, duplicate, missing, inaccessible, or mistyped initializers produce no
-partially initialized value. Construction never fills omitted fields with defaults. A diagnostic
+partially initialized value. Construction fills a left-out field only through `Omittable`, never
+with another default. A diagnostic
 for hidden required fields does not expose their names or types. A declarationless opaque nominal
 type, such as a runtime handle, has no source constructor; an empty semantic field list does not
 turn it into an ordinary zero-field struct.
 
 **Diagnostics:** Unknown fields report `SEM0022`; duplicates `SEM0023`; missing visible fields
-`SEM0024`; incompatible field values `SEM0025`. Inaccessible construction needs one stable semantic
+whose types do not implement `Omittable` `SEM0024`; incompatible field values `SEM0025`. Inaccessible construction needs one stable semantic
 code that does not reveal hidden field details.
 
 **Current compiler:** Aligned. Construction resolves every named initializer to its canonical field,
@@ -873,6 +875,43 @@ and the shared target-layout catalog is the single authority used before native 
 **Evidence:** C-layout record specification,
 target layout specification,
 [layout implementation](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Layout.ts).
+
+### STRUCT-007 — A literal may leave out a field whose type implements `Omittable`
+
+**Status:** Confirmed
+
+A struct literal, a braced variant literal, or a contextual record literal may leave out a field
+whose type implements the sealed interface `Intrinsic.Omittable`, which `silk.core.option`
+exports as `Omittable`. The left-out field holds `Omittable.omitted()` of its type, called after
+the written initializers. `Option<T>` implements it with `None`, so every `Option` field is
+optional.
+
+```silk
+import silk.core.option { Option }
+
+struct Server {
+  pub name: string<'static>,
+  pub port: Option<u16>,
+}
+
+fn web() -> Server {
+  return Server { name: "web" }
+}
+```
+
+`web().port` is `Option<u16>.None`. A type opts in with an ordinary conformance in its own module:
+`impl Omittable for Flags { fn omitted() -> Self { ... } }`. Generic arguments the literal
+infers come from the written fields or the expected type, never from a left-out field, and the
+field's type is the completed application's.
+
+**Boundary:** Only the field's type decides whether it may be left out; there is no per-field
+default and no `..` spread. A field of a type that does not implement `Omittable`, including a
+bare type parameter, must be written. `omitted()` is an ordinary interface operation, which static evaluation does
+not run, so a literal that static evaluation reaches, such as a `const` initializer, writes
+every field.
+
+**Diagnostics:** A left-out field whose type does not implement `Omittable` reports `SEM0024`,
+naming only such fields. Static evaluation of a literal that leaves out a field reports `SEM0176`.
 
 ## Tuples and contextual aggregate literals
 
@@ -1047,8 +1086,10 @@ fn fail(error: string) -> Result<i32, string> {
 have; the declared result type supplies no implicit inference. The success constructor therefore
 writes both arguments. The failure constructor writes `A` and infers `E` from its `error` field.
 
-Every named field must be initialized exactly once. Initializers evaluate in source order and are
-stored in declaration order. A unit variant has no initializer body. Parent and field visibility
+Every named field must be initialized exactly once, except that a braced literal may leave out a
+field whose type implements `Omittable`, as a struct literal may (STRUCT-007). Initializers
+evaluate in source order and are stored in declaration order. A unit variant has no initializer
+body, and a variant with fields is written with braces even when every field may be left out. Parent and field visibility
 use the same module rules as structs: a private required field prevents raw construction outside
 the defining module without disclosing hidden field details.
 
