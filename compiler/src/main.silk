@@ -5845,6 +5845,54 @@ effect fn packageCaches(project: &Project, sources: &ModuleSources) -> List<Path
   return move directories
 }
 
+// The complete result of a check of one immutable loaded world after loading and tool execution.
+struct WholeCheck {
+  status: i32,
+  diagnostics: Bytes,
+}
+
+effect fn wholeCheckRead(path: &Path, key: &[u8]) -> Option<WholeCheck> ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let stored = match move run Effect.result(FileSystem.readFile(path)) {
+    Result<Bytes, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError unavailable => { drop unavailable return Option<WholeCheck>.none() }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let payload = match move run BuildInputs.unchanged(Bytes.asSlice(&stored), key) {
+    Option<Bytes>.Some {value} => move value
+    Option<Bytes>.None => { return Option<WholeCheck>.none() }
+  }
+  let bytes = Bytes.asSlice(&payload)
+  if bytes.length < 8 { return Option<WholeCheck>.none() }
+  let status = readWord(bytes, 0)
+  let mut at: usize = 8
+  if status > 2 { return Option<WholeCheck>.none() }
+  let diagnostics = match move passField(bytes, &mut at) {
+    Option<&[u8]>.Some {value} => run Bytes.copy(value)
+    Option<&[u8]>.None => { return Option<WholeCheck>.none() }
+  }
+  if at != bytes.length { return Option<WholeCheck>.none() }
+  return Option<WholeCheck>.some(WholeCheck {status: u64.toI32(status), diagnostics: move diagnostics})
+}
+
+effect fn wholeCheckWrite(path: &Path, key: &[u8], status: i32, diagnostics: &[u8], recorder: &BuildInputs.Recorder) -> () ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  if !BuildInputs.complete(recorder) { return () }
+  let mut payload = Bytes.make()
+  run RuntimeEncoding.word(&mut payload, i32.toU64(status))
+  run appendPassBytes(&mut payload, diagnostics)
+  let record = run BuildInputs.encode(key, Bytes.asSlice(&payload), recorder)
+  let written = run Effect.result(FileSystem.writeFileAtomic(path, Bytes.asSlice(&record), FileSystem.replaceExisting(), FileSystem.buffered()))
+  drop written
+  return ()
+}
+
+effect fn wholeCheckModule(out: &mut Bytes, module: &ModuleId) -> () ! OutOfMemoryError ? &mut Allocator {
+  run RuntimeEncoding.field(&mut out.*, Bytes.asSlice(&run ModuleId.copyOrigin(module)))
+  run RuntimeEncoding.field(&mut out.*, Bytes.asSlice(&run ModuleId.copyPackage(module)))
+  return run RuntimeEncoding.field(&mut out.*, Bytes.asSlice(&run ModuleId.copyPath(module)))
+}
+
 effect fn checkTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Option<Path>, json: bool, roots: bool, abandon: bool, settings: &ProgressSettings, compiler: &Option<Bytes>, snapshot: &mut SourceSnapshot) -> ProjectArtifact
 ! ApplicationError | InitialProfileProblem | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | InvalidDependency | MissingManifest | InvalidBuildComposition | MissingStandardLibrary | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
 ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types {
@@ -5867,6 +5915,8 @@ effect fn checkTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Op
   if json { format = DiagnosticFormat.Json {target: run Bytes.copy(Target.name(&target))} }
   let mut out = Bytes.make()
   let mut progress = run startProgress(settings, b"Checking", project, &target, b"")
+  let wholeEligible = !roots && List<Supplied>.length(&bindings) == usize.ZERO
+    && Option<Bytes>.isSome(&run HostInput.variableNamed("SILK_EXPERIMENT_WHOLE_CHECK"))
   // A compiler that can stamp a cache records dependencies for the next command without
   // retaining answer fingerprints for source edits in this process.
   let mut mode = StoreMode.Transient
@@ -5881,13 +5931,82 @@ effect fn checkTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Op
       prefetched = run SemanticCache.prefetch(&directory, false, Bytes.asSlice(&identity)) |> Effect.provideMut<FileSystem>(&mut cacheFiles)
     }
   }
-  let prepared = run prepare(Projects.entry(project), Option<&Path>.some(Projects.manifest(project)), move library, &profile, move bindings, false, mode, Option<&[u8]>.none(), borrowedPath(&cacheHome), compiler, &mut snapshot.*, &format, &mut out, &mut progress)
+  let mut recorder = run BuildInputs.recorder()
+  let prepared = if wholeEligible {
+    run prepare(Projects.entry(project), Option<&Path>.some(Projects.manifest(project)), move library, &profile, move bindings, false, mode, Option<&[u8]>.none(), borrowedPath(&cacheHome), compiler, &mut snapshot.*, &format, &mut out, &mut progress) |> Effect.provideMut<FileSystem>(&mut recorder)
+  } else {
+    run prepare(Projects.entry(project), Option<&Path>.some(Projects.manifest(project)), move library, &profile, move bindings, false, mode, Option<&[u8]>.none(), borrowedPath(&cacheHome), compiler, &mut snapshot.*, &format, &mut out, &mut progress)
+  }
   let analysis = match move prepared {
     Prepared.Ready {analysis} => move analysis
     Prepared.Finished {status} => {
       run writeDiagnostics(&target, json, &out, &mut progress)
       run Progress.finish(&mut progress, Projects.name(project), status == 0)
       return ProjectArtifact {status: status, target: target, path: move path}
+    }
+  }
+  let preparedDiagnosticBytes = Bytes.length(&out)
+  let mut wholeKey = Option<Bytes>.none()
+  let mut wholePath = Option<Path>.none()
+  if wholeEligible && BuildInputs.complete(&recorder) {
+    if let Option<Bytes>.Some {value: stamped} = &compiler.* {
+      if let Option<Path>.Some {value: directory} = &cacheHome {
+        let mut key = run Bytes.copy(b"silk-whole-check-2")
+        run RuntimeEncoding.field(&mut key, Bytes.asSlice(&stamped))
+        run RuntimeEncoding.field(&mut key, Bytes.asSlice(&run Semantic.stampIdentity(&analysis.store)))
+        run RuntimeEncoding.field(&mut key, Path.rawBytes(Projects.entry(project)))
+        run RuntimeEncoding.field(&mut key, Path.rawBytes(Projects.manifest(project)))
+        run RuntimeEncoding.field(&mut key, humanRoot(&format))
+        run RuntimeEncoding.word(&mut key, if json { 1 } else { 0 })
+        run appendPassSelection(&mut key, &run HostInput.variableNamed("SILK_VERIFY_MIR"))
+        let slot = ContentHash.of(Bytes.asSlice(&key))
+        let mut filename = run Bytes.copy(b"check-whole-")
+        run appendDigestHex(&mut filename, slot)
+        run Bytes.append(&mut filename, b".bin")
+        wholePath = Option<Path>.some(run Path.joinBytes(&directory, Bytes.asSlice(&filename)))
+        // Files served from the shared SourceSnapshot bypass the recorder; immutable revision
+        // digests authenticate them, including generated modules and explicitly absent sources.
+        let revision = run ModuleSourceFiles.revision(&analysis.sources)
+        run Revision.appendSnapshotIdentity(&revision, &mut key)
+        run wholeCheckModule(&mut key, &analysis.identity)
+        let checked = List<ModuleId>.asSlice(&analysis.checked)
+        run RuntimeEncoding.word(&mut key, usize.toU64(checked.length))
+        let mut at = usize.ZERO
+        while at < checked.length {
+          run wholeCheckModule(&mut key, &checked[at])
+          at = at + usize.ONE
+        }
+        let owned = List<ModuleId>.asSlice(&analysis.rootPackage)
+        run RuntimeEncoding.word(&mut key, usize.toU64(owned.length))
+        at = usize.ZERO
+        while at < owned.length {
+          run wholeCheckModule(&mut key, &owned[at])
+          at = at + usize.ONE
+        }
+        run RuntimeEncoding.word(&mut key, if Option<ModuleId>.isSome(&analysis.runtime) { 1 } else { 0 })
+        if let Option<ModuleId>.Some {value} = &analysis.runtime { run wholeCheckModule(&mut key, &value) }
+        // Current loading observations include manifests, missing-file probes, directory
+        // inventories, build plans and tool inputs. They never reread held syntax.
+        let observed = run BuildInputs.encode(b"", b"", &recorder)
+        run RuntimeEncoding.field(&mut key, Bytes.asSlice(&observed))
+        let digest = ContentHash.of(Bytes.asSlice(&key))
+        let mut encoded = run Bytes.copy(b"silk-whole-check-2")
+        run RuntimeEncoding.word(&mut encoded, digest.high)
+        run RuntimeEncoding.word(&mut encoded, digest.low)
+        wholeKey = Option<Bytes>.some(move encoded)
+      }
+    }
+  }
+  if let Option<Path>.Some {value: recordPath} = &wholePath {
+    if let Option<Bytes>.Some {value: key} = &wholeKey {
+      if let Option<WholeCheck>.Some {value} = move run wholeCheckRead(&recordPath, Bytes.asSlice(&key)) |> Effect.provideMut<FileSystem>(&mut cacheFiles) {
+        run writeError(b"whole-check hit\n")
+        run Bytes.append(&mut out, Bytes.asSlice(&value.diagnostics))
+        run writeDiagnostics(&target, json, &out, &mut progress)
+        run Progress.finish(&mut progress, Projects.name(project), value.status == 0)
+        if abandon { run abandonValue(move analysis) }
+        return ProjectArtifact {status: value.status, target: target, path: move path}
+      }
     }
   }
   let Analysis {sources, store: analyzed, request: requested, rootPackage, checked: sweptModules, identity, runtime} = move analysis
@@ -5905,6 +6024,7 @@ effect fn checkTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Op
         List<Path>.asSlice(&dependencies), List<Path>.asSlice(&loadedCaches)) |> Effect.provideMut<FileSystem>(&mut cacheFiles)
     }
   }
+  let mut diagnosticRecorder = run BuildInputs.recorder()
   let mut status = 0
   let mut checkedModules = List<ModuleId>.length(&sweptModules)
   if let Option<ModuleId>.Some {..} = &runtime { checkedModules = checkedModules + usize.ONE }
@@ -5922,7 +6042,7 @@ effect fn checkTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Op
     while refusal < refused.length {
       if let Option<Shared<Rejection>>.Some {value: moved} = move run entryRejection(&mut store, &mut request, &sources, &identity, &runtime, &refused[refusal]) {
         if !run repeated(&mut seen, &moved) {
-          status = worse(status, run reportRejection(&sources, &moved, &format, &mut out))
+          status = worse(status, run reportRejection(&sources, &moved, &format, &mut out) |> Effect.provideMut<FileSystem>(&mut diagnosticRecorder))
         }
       }
       refusal = refusal + usize.ONE
@@ -5935,12 +6055,12 @@ effect fn checkTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Op
   let mut at = usize.ZERO
   while at < malformed.length {
     if !run repeated(&mut seen, &malformed[at]) {
-      status = worse(status, run reportRejection(&sources, &malformed[at], &format, &mut out))
+      status = worse(status, run reportRejection(&sources, &malformed[at], &format, &mut out) |> Effect.provideMut<FileSystem>(&mut diagnosticRecorder))
     }
     at = at + usize.ONE
   }
   let importRejected = run Semantic.importRejections(&mut store, &mut request)
-  status = worse(status, run reportedImportRejections(List<Shared<Rejection>>.asSlice(&importRejected), &sources, &format, &mut out, &mut seen))
+  status = worse(status, run reportedImportRejections(List<Shared<Rejection>>.asSlice(&importRejected), &sources, &format, &mut out, &mut seen) |> Effect.provideMut<FileSystem>(&mut diagnosticRecorder))
   // Malformed syntax leaves later phases without a complete tree, so their refusals of the
   // recovered constructs are not reported next to the syntax errors that caused them.
   let parsed = malformed.length == usize.ZERO
@@ -5954,7 +6074,7 @@ effect fn checkTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Op
         Option<Shared<Rejection>>.None => Shared<Rejection>.clone(&rejected[at])
       }
       if !run repeated(&mut seen, &shown) {
-        status = worse(status, run reportRejection(&sources, &shown, &format, &mut out))
+        status = worse(status, run reportRejection(&sources, &shown, &format, &mut out) |> Effect.provideMut<FileSystem>(&mut diagnosticRecorder))
       }
     }
     at = at + usize.ONE
@@ -5966,7 +6086,7 @@ effect fn checkTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Op
     at = usize.ZERO
     while at < listed.length {
       if !refusedAt(&listed[at], List<Shared<Rejection>>.asSlice(&importRejected)) && !refusedAt(&listed[at], rejected) {
-        drop run reportRejection(&sources, &listed[at], &format, &mut out)
+        drop run reportRejection(&sources, &listed[at], &format, &mut out) |> Effect.provideMut<FileSystem>(&mut diagnosticRecorder)
       }
       at = at + usize.ONE
     }
@@ -5977,7 +6097,7 @@ effect fn checkTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Op
     if json {
       message = run gapSummary(List<Shared<Gap>>.asSlice(&checked.gaps))
     } else {
-      message = run gapLines(&sources, List<Shared<Gap>>.asSlice(&checked.gaps), List<ReportedSite>.asSlice(&seen), humanRoot(&format))
+      message = run gapLines(&sources, List<Shared<Gap>>.asSlice(&checked.gaps), List<ReportedSite>.asSlice(&seen), humanRoot(&format)) |> Effect.provideMut<FileSystem>(&mut diagnosticRecorder)
     }
     run Bytes.append(&mut out, Bytes.asSlice(&message))
     status = 2
@@ -5987,6 +6107,13 @@ effect fn checkTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Op
     run Bytes.append(&mut out, Bytes.asSlice(&compared.report))
     if compared.differences > usize.ZERO {
       status = worse(status, 1)
+    }
+  }
+  if let Option<Path>.Some {value: recordPath} = &wholePath {
+    if let Option<Bytes>.Some {value: key} = &wholeKey {
+      run wholeCheckWrite(&recordPath, Bytes.asSlice(&key), status,
+        Slice.view<u8>(Bytes.asSlice(&out), preparedDiagnosticBytes, Bytes.length(&out) - preparedDiagnosticBytes),
+        &diagnosticRecorder) |> Effect.provideMut<FileSystem>(&mut cacheFiles)
     }
   }
   // A copy of the process writes the image, and the check returns without waiting for it.
