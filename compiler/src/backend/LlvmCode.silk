@@ -19,6 +19,7 @@ import backend.Gap {Code as GapCode, Gap, Source as GapSource}
 import backend.LoweringPlan
 import backend.LoweringPlan {
   Callable,
+  OutcomeStorage,
   Lane,
   Step,
   CopyLeaves,
@@ -149,6 +150,9 @@ struct Writer {
   /// Per MIR local, whether its slot is a scalar `alloca`. SROA promotes every marked local of
   /// that shape to a register, so its lifetime markers would only cost parse and pass time.
   scalars: List<bool>,
+  /// Unnamed scalar temporaries with one definition and only later reads in their own block.
+  registers: List<bool>,
+  registerValues: List<Option<Value>>,
   /// Per MIR local, the alignment of its storage, or `usize.MAX` where `emitSlots` read no layout.
   /// Places rooted at a local start from it instead of looking the layout up again.
   alignments: List<usize>,
@@ -238,7 +242,7 @@ effect fn writerFor(target: &Target, fastPath: bool) -> Writer ! OutOfMemoryErro
 effect fn writerOfWidth(pointerBits: usize, fastPath: bool) -> Writer ! OutOfMemoryError ? &mut Allocator {
   return Writer {module: Module.make(), located: usize.ZERO, symbol: Bytes.make(), lines: List<u64>.make(), trap: Option<TrapReport>.none(), observerLocal: usize.MAX, causeLocal: usize.MAX, siteLocal: usize.MAX, fastPath: fastPath,
     pointerBits: pointerBits, coff: false, slots: List<u64>.make(), companions: List<u64>.make(),
-    blocks: List<u64>.make(), scalars: List<bool>.make(), alignments: List<usize>.make(), copies: List<CallerCopy>.make(), dropCopies: List<DropCopy>.make(), parameters: List<u64>.make(), extras: List<u64>.make(), providers: List<u64>.make(),
+    blocks: List<u64>.make(), scalars: List<bool>.make(), registers: List<bool>.make(), registerValues: List<Option<Value>>.make(), alignments: List<usize>.make(), copies: List<CallerCopy>.make(), dropCopies: List<DropCopy>.make(), parameters: List<u64>.make(), extras: List<u64>.make(), providers: List<u64>.make(),
     out: Bitcode.none(), failure: Bitcode.none(), context: Bitcode.none(), observer: Bitcode.none(), cause: Bitcode.none(),
     site: Bitcode.none(), transfer: Bitcode.none(), frame: Bitcode.none(), steps: Bitcode.none(), threaded: List<bool>.make(), cold: List<bool>.make(),
     direct: List<usize>.make(), skipped: List<usize>.make(), tables: List<JumpTable>.make()}
@@ -502,7 +506,12 @@ effect fn directBindings(writer: &mut Writer, function: &MirFunction, layouts: &
   return ()
 }
 
-// The storage address of MIR local `index`.
+// Whether a MIR temporary has a checked direct-value storage plan.
+fn registerLocal(writer: &Writer, index: usize) -> bool {
+  return index < List<bool>.length(&writer.registers) && List<bool>.get(&writer.registers, index)
+}
+
+// The storage address of a MIR local whose plan retains an address.
 fn slotOf(writer: &Writer, index: usize) -> u64 {
   return List<u64>.get(&writer.slots, index)
 }
@@ -2060,6 +2069,7 @@ effect fn emitPlace(
   layouts: &TypeLayouts,
   place: &Place,
 ) -> Address ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  if registerLocal(&writer.*, place.local) { return CompilerBug.panic(b"a register temporary escaped by address") }
   let mut rootAlignment = usize.MAX
   if place.local < List<usize>.length(&writer.alignments) { rootAlignment = List<usize>.get(&writer.alignments, place.local) }
   let path = run LoweringPlan.placePath(function, target, layouts, place, rootAlignment)
@@ -2089,6 +2099,13 @@ effect fn loadPlace(
   layouts: &TypeLayouts,
   place: &Place,
 ) -> Value ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  if registerLocal(&writer.*, place.local) {
+    if List<Projection>.length(&place.projections) != usize.ZERO { return CompilerBug.panic(b"a register temporary was addressed") }
+    return match List<Option<Value>>.get(&writer.registerValues, place.local) {
+      Option<Value>.Some {value} => value
+      Option<Value>.None => CompilerBug.panic(b"a register temporary was read before its definition")
+    }
+  }
   let address = run emitPlace(&mut writer.*, function, target, layouts, place)
   return run loadAddress(&mut writer.*, &address)
 }
@@ -2155,6 +2172,21 @@ effect fn emitArgument(writer: &mut Writer, function: &MirFunction, target: &Tar
 // else its one value, which is unit for a unit argument.
 effect fn appendArgument(writer: &mut Writer, function: &MirFunction, target: &Target,
   layouts: &TypeLayouts, operand: &Operand, foreign: bool, lanes: &mut List<Value>) -> () ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let direct = match &operand.* {
+    Operand.Copy {place} => registerLocal(&writer.*, place.local)
+    Operand.Move {place} => registerLocal(&writer.*, place.local)
+    _ => false
+  }
+  if direct {
+    // The storage proof admits only ordinary scalar value arguments. In particular, a foreign
+    // ABI may request an address even for a value whose surface type looks scalar.
+    if foreign { return CompilerBug.panic(b"a register temporary reached a foreign argument") }
+    let value = run emitOperand(&mut writer.*, function, target, layouts, operand)
+    if value.scalar.aggregate || value.scalar.unit || value.scalar.lanes != usize.ZERO || passedIndirectly(value.scalar) {
+      return CompilerBug.panic(b"a register temporary reached an indirect argument")
+    }
+    return run List<Value>.append(&mut lanes.*, value)
+  }
   let mut place = Option<Address>.none()
   if let Operand.Copy {place: source} = &operand.* {
     place = Option<Address>.some(run emitPlace(&mut writer.*, function, target, layouts, &source))
@@ -2276,12 +2308,22 @@ effect fn emitNumeric(
 ) -> Value ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
   match &operand.* {
     Operand.Copy {place} => {
-      let address = run emitPlace(&mut writer.*, function, target, layouts, &place)
-      if numericValue(&address.ty) { return run loadAddress(&mut writer.*, &address) }
+      if registerLocal(&writer.*, place.local) {
+        let ty = &List<Local>.asSlice(&function.locals)[place.local].ty
+        if numericValue(ty) { return run loadPlace(&mut writer.*, function, target, layouts, &place) }
+      } else {
+        let address = run emitPlace(&mut writer.*, function, target, layouts, &place)
+        if numericValue(&address.ty) { return run loadAddress(&mut writer.*, &address) }
+      }
     }
     Operand.Move {place} => {
-      let address = run emitPlace(&mut writer.*, function, target, layouts, &place)
-      if numericValue(&address.ty) { return run loadAddress(&mut writer.*, &address) }
+      if registerLocal(&writer.*, place.local) {
+        let ty = &List<Local>.asSlice(&function.locals)[place.local].ty
+        if numericValue(ty) { return run loadPlace(&mut writer.*, function, target, layouts, &place) }
+      } else {
+        let address = run emitPlace(&mut writer.*, function, target, layouts, &place)
+        if numericValue(&address.ty) { return run loadAddress(&mut writer.*, &address) }
+      }
     }
     Operand.Integer {ty, ..} => {
       if numericValue(&ty) { return run emitOperand(&mut writer.*, function, target, layouts, operand) }
@@ -3591,6 +3633,18 @@ effect fn emitAssign(
   span: Location,
   ordinary: bool,
 ) -> () ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  if registerLocal(&writer.*, destination.local) {
+    if List<Projection>.length(&destination.projections) != usize.ZERO { return CompilerBug.panic(b"a register temporary was partly assigned") }
+    let selected = run emitScalarRvalue(&mut writer.*, function, target, layouts, value, span)
+    // A memory read carried the destination's representation, including signedness. Preserve
+    // that contract even when the checked MIR value can bypass its store and load.
+    let ty = &List<Local>.asSlice(&function.locals)[destination.local].ty
+    let facts = run layoutOf(layouts, ty, function, span)
+    let kind = storageRepresentation(ty, target, facts)
+    List<Option<Value>>.set(&mut writer.registerValues, destination.local,
+      Option<Value>.some(Value {scalar: kind, value: selected.value}))
+    return ()
+  }
   let address = run emitPlace(&mut writer.*, function, target, layouts, destination)
   if let Rvalue.Aggregate {fields} = &value.* {
     run clearPadding(&mut writer.*, layouts, &address)
@@ -3754,7 +3808,7 @@ effect fn emitReturn(
     return run Module.retVoid(&mut writer.*.module)
   }
   let fallible = failureLocal(function) != usize.MAX
-  if kind.unit {
+  if resultLayout.size == usize.ZERO {
     if fallible { return run returnStatus(&mut writer.*, false) }
     return run Module.retVoid(&mut writer.*.module)
   }
@@ -3916,7 +3970,7 @@ effect fn emitFail(writer: &mut Writer, function: &MirFunction, target: &Target,
   let locals = List<Local>.asSlice(&function.locals)
   let failureLayout = run layoutOf(layouts, &locals[local].ty, function, span)
   let kind = storageRepresentation(&locals[local].ty, target, failureLayout)
-  if !kind.unit {
+  if failureLayout.size != usize.ZERO {
     let failed = Operand.Copy {place: Place {local: local, projections: List<Projection>.make()}}
     let value = run emitOperand(&mut writer.*, function, target, layouts, &failed)
     let output = Address {ty: Interned<Type>.clone(&locals[local].ty), value: writer.failure,
@@ -4464,13 +4518,17 @@ effect fn emitCallInner(
 ) -> () ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
   let output = run emitPlace(&mut writer.*, function, target, layouts, destination)
   let kind = output.representation
-  // A fallible callee takes success and failure out-addresses after its arguments and returns a
-  // status: 0 continues at `normal`, 1 at the failure edge (D3).
+  let resultFacts = run layoutOf(layouts, &output.ty, function, span)
+  let mut failureFacts = Option<Metrics>.none()
+  // A fallible callee takes nonempty success and failure payload addresses after its arguments
+  // and always returns a status: 0 continues at `normal`, 1 at the failure edge (D3).
   let mut failed = Option<Address>.none()
   let mut context = Bitcode.none()
   let mut handler = usize.MAX
   if let Option<FailureEdge>.Some {value: edge} = &failure.* {
-    failed = Option<Address>.some(run emitPlace(&mut writer.*, function, target, layouts, &edge.destination))
+    let failureSlot = run emitPlace(&mut writer.*, function, target, layouts, &edge.destination)
+    failureFacts = Option<Metrics>.some(run layoutOf(layouts, &failureSlot.ty, function, span))
+    failed = Option<Address>.some(move failureSlot)
     // In a program that observes diagnostics the callee also writes the destination's companion (N3).
     if let Option<Diagnostics>.Some {..} = &diagnostics.* {
       context = companionAddress(&writer.*, function, edge.destination.local)
@@ -4483,6 +4541,7 @@ effect fn emitCallInner(
     indirect = loaded.value
   }
   let fallible = handler != usize.MAX
+  let storage = LoweringPlan.outcomeStorage(resultFacts, move failureFacts)
   // Provider addresses follow the written arguments (D2).
   let mut addresses = List<u64>.make()
   let hidden = List<Operand>.asSlice(providers)
@@ -4521,7 +4580,7 @@ effect fn emitCallInner(
   if fallible {
     resultType = run integerType(&mut writer.*, usize.ONE)
     extended = writer.fastPath
-  } else if !outward {
+  } else if !outward && storage.result {
     resultType = run typeOf(&mut writer.*, kind)
     extended = extendedFlag(&writer.*, kind)
   }
@@ -4533,7 +4592,7 @@ effect fn emitCallInner(
   let addressed = List<u64>.asSlice(&addresses)
   let facts = Callable {parameters: values.length, providers: hidden.length, observed: hidden.length < addressed.length,
     fallible: fallible}
-  let shape = run LoweringPlan.ordinaryShape(facts, outward)
+  let shape = run LoweringPlan.ordinaryShape(facts, outward, storage)
   let order = List<Lane>.asSlice(&shape.lanes)
   let mut step = usize.ZERO
   while step < order.length {
@@ -4579,7 +4638,7 @@ effect fn emitCallInner(
     let onSuccess = blockAt(&writer.*, normal)
     return run branchUnlikely(&mut writer.*, returned, onFailure, onSuccess)
   }
-  if !kind.unit && !outward {
+  if storage.result && !outward {
     run storeValue(&mut writer.*, &output, &Value {scalar: kind, value: returned})
   }
   let next = blockAt(&writer.*, normal)
@@ -5097,15 +5156,16 @@ effect fn compareChain(writer: &mut Writer, tested: &Value, cases: &[SwitchCase]
   }
 }
 
-/// Emits the entry-block stack slots for every local and spills each parameter into its slot.
+/// Emits required entry-block local storage and spills each parameter into its slot.
 effect fn emitEntrySlots(
   writer: &mut Writer,
   function: &MirFunction,
   target: &Target,
   layouts: &TypeLayouts,
   foreign: &[CAbi.Signature],
+  required: &[bool],
 ) -> () ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
-  run emitSlots(&mut writer.*, function, target, layouts, &Option<Suspended>.none())
+  run emitSlots(&mut writer.*, function, target, layouts, &Option<Suspended>.none(), required)
   run emitCCopySlots(&mut writer.*, function, target, layouts, foreign)
   if !writer.fastPath { run emitDropCopySlots(&mut writer.*, function, target, layouts) }
   let locals = List<Local>.asSlice(&function.locals)
@@ -5169,14 +5229,15 @@ effect fn emitEntrySlots(
   return run emitHiddenStores(&mut writer.*, function)
 }
 
-/// Emits one storage address per local: a stack slot, or for a suspended step the frame slot of a
-/// frame-resident local. Then each failure slot's context companion.
+/// Emits storage for locals that need addresses: a stack slot, or for a suspended step the frame
+/// slot of a frame-resident local. Then each failure slot's context companion.
 effect fn emitSlots(
   writer: &mut Writer,
   function: &MirFunction,
   target: &Target,
   layouts: &TypeLayouts,
   suspended: &Option<Suspended>,
+  required: &[bool],
 ) -> () ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
   let locals = List<Local>.asSlice(&function.locals)
   let frame = writer.frame
@@ -5190,7 +5251,12 @@ effect fn emitSlots(
     let mut named = true
     let mut scalarSlot = false
     let mut aligned = usize.MAX
-    if resident != usize.MAX {
+    if required.length != usize.ZERO && !required[local] {
+      // No instruction, debug variable, or implicit ABI state can ask for this temporary.
+      // Keep its index but no address or layout, and exclude it from lifetime markers.
+      named = false
+      scalarSlot = true
+    } else if resident != usize.MAX {
       slot = run byteOffset(&mut writer.*, frame, resident)
     } else {
       let localLayout = run layoutOf(
@@ -5201,6 +5267,9 @@ effect fn emitSlots(
       )
       aligned = localLayout.alignment
       let kind = storageRepresentation(&locals[local].ty, target, localLayout)
+      if registerLocal(&writer.*, local) && (kind.aggregate || kind.unit || kind.lanes != usize.ZERO) {
+        List<bool>.set(&mut writer.registers, local, false)
+      }
       let mut owned = usize.MAX
       let mut outward = false
       if let Option<Suspended>.None = &suspended.* {
@@ -5210,7 +5279,11 @@ effect fn emitSlots(
         }
         outward = local == usize.ZERO && writer.out != Bitcode.none() && resultInOut(function, kind)
       }
-      if owned != usize.MAX {
+      if registerLocal(&writer.*, local) {
+        // The checked same-block value is kept directly; no address is ever requested for it.
+        named = false
+        scalarSlot = true
+      } else if owned != usize.MAX {
         // The caller's storage is the slot itself.
         slot = List<u64>.get(&writer.parameters, owned)
         named = false
@@ -5229,6 +5302,9 @@ effect fn emitSlots(
       Module.setName(&mut writer.*.module, slot, Bitcode.named(Bitcode.prefixLocal(), local))
     }
     run List<u64>.append(&mut writer.*.slots, slot)
+    if List<bool>.length(&writer.registers) != usize.ZERO {
+      run List<Option<Value>>.append(&mut writer.registerValues, Option<Value>.none())
+    }
     run List<bool>.append(&mut writer.*.scalars, scalarSlot)
     run List<usize>.append(&mut writer.*.alignments, aligned)
     run List<u64>.append(&mut writer.*.companions, Bitcode.none())
@@ -5606,6 +5682,8 @@ pub effect fn emit(
     cParameters = run classifiedParameters(function, target, layouts, parameters, &returned, locals[usize.ZERO].origin.location)
     cResult = Option<CAbi.Lane>.some(move returned)
   }
+  let outcomes = if exported { OutcomeStorage {result: true, failure: true} }
+    else { run LoweringPlan.functionOutcomes(function, layouts) }
   let pointer = run pointerType(&mut writer)
   let mut lanes = signature()
   let mut resultType = run voidType(&mut writer)
@@ -5621,13 +5699,13 @@ pub effect fn emit(
   } else if fallible {
     resultType = run integerType(&mut writer, usize.ONE)
     if fastPath { run addAttributes(&mut lanes, Bitcode.positionResult(), &[0, Bitcode.attrZeroExt()]) }
-  } else if !outward {
+  } else if !outward && outcomes.result {
     resultType = run typeOf(&mut writer, result)
     if extendedFlag(&writer, result) { run addAttributes(&mut lanes, Bitcode.positionResult(), &[0, Bitcode.attrZeroExt()]) }
   }
   let symbol = run InstanceIdentity.name(identities, &function.key)
   writer.symbol = move symbol
-  let shape = run LoweringPlan.ordinaryShape(LoweringPlan.callable(function), outward)
+  let shape = run LoweringPlan.ordinaryShape(LoweringPlan.callable(function), outward, outcomes)
   let order = List<Lane>.asSlice(&shape.lanes)
   let mut step = usize.ZERO
   while step < order.length {
@@ -5775,16 +5853,18 @@ pub effect fn emit(
     run directBindings(&mut writer, function, layouts)
   }
   noteDiagnosticLocals(&mut writer, function)
+  let mut storage = run StackLifetimes.storage(function, fastPath)
+  writer.registers = Intrinsic.replace(storage.registers, List<bool>.make())
   let mut at = usize.ZERO
   while at < blocks.length {
     let handle = blockAt(&writer, at)
     startBlock(&mut writer, handle)
     if at == usize.ZERO {
-      run emitEntrySlots(&mut writer, function, target, layouts, foreign)
+      run emitEntrySlots(&mut writer, function, target, layouts, foreign, List<bool>.asSlice(&storage.required))
       // An unoptimized compile never reads lifetime markers, so a fast-path function plans none.
       if !fastPath {
         let skip = run unmarkedSlots(&writer, List<usize>.asSlice(&companions))
-        lifetimes = run StackLifetimes.plan(function, List<bool>.asSlice(&skip))
+        lifetimes = run StackLifetimes.plan(function, &storage, List<bool>.asSlice(&skip))
       }
     }
     run emitBlock(&mut writer, function, target, layouts, &blocks[at], foreign, identities, &ordinary, at,
@@ -5996,23 +6076,16 @@ effect fn loadHidden(writer: &mut Writer, name: u64, offset: usize) -> u64 ! Out
   return loaded
 }
 
-effect fn takesResult(function: &MirFunction, target: &Target, layouts: &TypeLayouts) -> bool
-! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
-  let locals = List<Local>.asSlice(&function.locals)
-  let facts = run layoutOf(layouts, &function.result, function, locals[usize.ZERO].origin.location)
-  return failureLocal(function) != usize.MAX || !storageRepresentation(&function.result, target, facts).unit
-}
-
 // The `$enter` signature: the transfer record, the written parameter lanes, then the hidden
-// provider, observer and cause addresses, then the result (when `takes`), failure and context
-// addresses. Records the arguments in `writer` as a definition's own are.
-effect fn enterSignature(writer: &mut Writer, function: &MirFunction, target: &Target, layouts: &TypeLayouts, takes: bool)
+// provider, observer and cause addresses, then nonempty result and failure payloads and the
+// independent failure context. Records the arguments in `writer` as a definition's own are.
+effect fn enterSignature(writer: &mut Writer, function: &MirFunction, target: &Target, layouts: &TypeLayouts, storage: OutcomeStorage)
 -> Signature ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
   let pointer = run pointerType(&mut writer.*)
   let mut lanes = signature()
   let locals = List<Local>.asSlice(&function.locals)
   let parameters = List<Interned<Type>>.asSlice(&function.parameters)
-  let shape = run LoweringPlan.enterShape(LoweringPlan.callable(function), takes)
+  let shape = run LoweringPlan.enterShape(LoweringPlan.callable(function), storage)
   let order = List<Lane>.asSlice(&shape.lanes)
   let mut step = usize.ZERO
   while step < order.length {
@@ -6075,10 +6148,9 @@ effect fn callEnter(writer: &mut Writer, symbol: &[u8], transfer: u64, out: u64)
     run List<u64>.append(&mut arguments, writer.site)
   }
   if out != Bitcode.none() { run List<u64>.append(&mut arguments, out) }
-  if writer.failure != Bitcode.none() {
-    run List<u64>.append(&mut arguments, writer.failure)
-    if writer.context != Bitcode.none() { run List<u64>.append(&mut arguments, writer.context) }
-  }
+  if writer.failure != Bitcode.none() { run List<u64>.append(&mut arguments, writer.failure) }
+  // A zero-byte failure still carries an observed failure's diagnostic context.
+  if writer.context != Bitcode.none() { run List<u64>.append(&mut arguments, writer.context) }
   return run callSuffixed(&mut writer.*, symbol, b"$enter", List<u64>.asSlice(&arguments))
 }
 
@@ -6216,8 +6288,8 @@ effect fn emitDriver(writer: &mut Writer, function: &MirFunction, target: &Targe
   let clear = run integerOf(&mut writer.*, 8, 0)
   run storeOf(&mut writer.*, clear, failed, usize.ZERO)
   let mut out = Bitcode.none()
-  if fallible || result.aggregate || passedIndirectly(result) { out = writer.out }
-  else if !result.unit {
+  if resultFacts.size != usize.ZERO && (fallible || result.aggregate || passedIndirectly(result)) { out = writer.out }
+  else if resultFacts.size != usize.ZERO {
     let ty = run typeOf(&mut writer.*, result)
     out = run Module.alloca(&mut writer.*.module, ty, usize.toU64(resultFacts.alignment))
     Module.setName(&mut writer.*.module, out, hiddenName(b"result"))
@@ -6305,8 +6377,8 @@ effect fn emitPackageDriver(writer: &mut Writer, function: &MirFunction, target:
 effect fn emitEnter(writer: &mut Writer, function: &MirFunction, target: &Target, layouts: &TypeLayouts,
   stepping: &Suspended, symbol: &[u8]) -> () ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
   let word = wordSize(target)
-  let takes = run takesResult(function, target, layouts)
-  let lanes = run enterSignature(&mut writer.*, function, target, layouts, takes)
+  let storage = run LoweringPlan.functionOutcomes(function, layouts)
+  let lanes = run enterSignature(&mut writer.*, function, target, layouts, storage)
   let void = run voidType(&mut writer.*)
   let ty = run functionType(&mut writer.*, void, List<u64>.asSlice(&lanes.types))
   let name = run suffixed(symbol, b"$enter")
@@ -6395,11 +6467,9 @@ effect fn emitEnter(writer: &mut Writer, function: &MirFunction, target: &Target
   let observed = diagnosticLocal(function, usize.ZERO) != usize.MAX
   let fallible = failureLocal(function) != usize.MAX
   let hidden = [writer.out, writer.failure, writer.context, writer.observer, writer.cause, writer.site]
-  if takes { run storeWordAt(&mut writer.*, hidden[0], frame, Coroutine.outOffset(word)) }
-  if fallible {
-    run storeWordAt(&mut writer.*, hidden[1], frame, Coroutine.failOffset(word))
-    if observed { run storeWordAt(&mut writer.*, hidden[2], frame, Coroutine.contextOffset(word)) }
-  }
+  if storage.result { run storeWordAt(&mut writer.*, hidden[0], frame, Coroutine.outOffset(word)) }
+  if storage.failure { run storeWordAt(&mut writer.*, hidden[1], frame, Coroutine.failOffset(word)) }
+  if fallible && observed { run storeWordAt(&mut writer.*, hidden[2], frame, Coroutine.contextOffset(word)) }
   if observed {
     run storeWordAt(&mut writer.*, hidden[3], frame, Coroutine.observerOffset(word))
     run storeWordAt(&mut writer.*, hidden[4], frame, Coroutine.causeOffset(word))
@@ -6494,16 +6564,15 @@ effect fn emitStep(writer: &mut Writer, function: &MirFunction, target: &Target,
   let entry = run labelled(&mut writer.*, b"entry")
   run addBlocks(&mut writer.*, blocks.length)
   startBlock(&mut writer.*, entry)
-  run emitSlots(&mut writer.*, function, target, layouts, suspended)
+  run emitSlots(&mut writer.*, function, target, layouts, suspended, &[])
   run emitCCopySlots(&mut writer.*, function, target, layouts, foreign)
   writer.steps = run stepRecord(&mut writer.*, word)
   let observed = diagnosticLocal(function, usize.ZERO) != usize.MAX
   let fallible = failureLocal(function) != usize.MAX
-  if run takesResult(function, target, layouts) { writer.out = run loadHidden(&mut writer.*, hiddenName(b"out"), Coroutine.outOffset(word)) }
-  if fallible {
-    writer.failure = run loadHidden(&mut writer.*, hiddenName(b"fail"), Coroutine.failOffset(word))
-    if observed { writer.context = run loadHidden(&mut writer.*, hiddenName(b"context"), Coroutine.contextOffset(word)) }
-  }
+  let storage = run LoweringPlan.functionOutcomes(function, layouts)
+  if storage.result { writer.out = run loadHidden(&mut writer.*, hiddenName(b"out"), Coroutine.outOffset(word)) }
+  if storage.failure { writer.failure = run loadHidden(&mut writer.*, hiddenName(b"fail"), Coroutine.failOffset(word)) }
+  if fallible && observed { writer.context = run loadHidden(&mut writer.*, hiddenName(b"context"), Coroutine.contextOffset(word)) }
   if observed {
     writer.observer = run loadHidden(&mut writer.*, hiddenName(b"observer"), Coroutine.observerOffset(word))
     writer.cause = run loadHidden(&mut writer.*, hiddenName(b"cause"), Coroutine.causeOffset(word))
@@ -6682,7 +6751,7 @@ effect fn emitStepReturn(writer: &mut Writer, function: &MirFunction, target: &T
   stepping: &Suspended, span: Location) -> () ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
   let resultLayout = run layoutOf(layouts, &function.result, function, span)
   let kind = storageRepresentation(&function.result, target, resultLayout)
-  if !kind.unit {
+  if resultLayout.size != usize.ZERO {
     let returned = Operand.Copy {place: Place {local: usize.ZERO, projections: List<Projection>.make()}}
     let value = run emitOperand(&mut writer.*, function, target, layouts, &returned)
     let output = Address {ty: Interned<Type>.clone(&function.result), value: writer.out,
@@ -6705,7 +6774,7 @@ effect fn emitStepFail(writer: &mut Writer, function: &MirFunction, target: &Tar
   let locals = List<Local>.asSlice(&function.locals)
   let failureLayout = run layoutOf(layouts, &locals[local].ty, function, span)
   let kind = storageRepresentation(&locals[local].ty, target, failureLayout)
-  if !kind.unit {
+  if failureLayout.size != usize.ZERO {
     let failedValue = Operand.Copy {place: Place {local: local, projections: List<Projection>.make()}}
     let value = run emitOperand(&mut writer.*, function, target, layouts, &failedValue)
     let output = Address {ty: Interned<Type>.clone(&locals[local].ty), value: writer.failure,
@@ -6774,11 +6843,14 @@ effect fn emitSuspendingCall(
     fail Gap.relative(GapCode.TypedForm, &owner, span)
   }
   let output = run emitPlace(&mut writer.*, function, target, layouts, destination)
+  let resultFacts = run layoutOf(layouts, &output.ty, function, span)
+  let mut failureFacts = Option<Metrics>.none()
   let mut failed = Bitcode.none()
   let mut context = Bitcode.none()
   if let Option<FailureEdge>.Some {value: edge} = &failure.* {
     let failureSlot = run emitPlace(&mut writer.*, function, target, layouts, &edge.destination)
     failed = failureSlot.value
+    failureFacts = Option<Metrics>.some(run layoutOf(layouts, &failureSlot.ty, function, span))
     if let Option<Diagnostics>.Some {..} = &diagnostics.* {
       context = companionAddress(&writer.*, function, edge.destination.local)
     }
@@ -6809,12 +6881,11 @@ effect fn emitSuspendingCall(
     run appendDiagnostics(&mut writer.*, function, target, layouts, &observed, &mut passed)
   }
   if transfers { run suspendAt(&mut writer.*, target, stepping, state) }
-  let fallible = failed != Bitcode.none()
-  if fallible || !output.representation.unit { run List<u64>.append(&mut passed, output.value) }
-  if fallible {
-    run List<u64>.append(&mut passed, failed)
-    if context != Bitcode.none() { run List<u64>.append(&mut passed, context) }
-  }
+  let fallible = match &failure.* { Option<FailureEdge>.Some {..} => true _ => false }
+  let storage = LoweringPlan.outcomeStorage(resultFacts, move failureFacts)
+  if storage.result { run List<u64>.append(&mut passed, output.value) }
+  if storage.failure { run List<u64>.append(&mut passed, failed) }
+  if fallible && context != Bitcode.none() { run List<u64>.append(&mut passed, context) }
   run callSuffixed(&mut writer.*, Bytes.asSlice(&symbol), b"$enter", List<u64>.asSlice(&passed))
   if transfers {
     let pushed = run integerOf(&mut writer.*, 32, 1)

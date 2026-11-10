@@ -1,0 +1,146 @@
+//! Bounded envelopes that forward immutable worker dependency images without decoding them.
+//! The coordinator separately validates every contained image and its source/profile stamp.
+import lexer.Span {Span}
+import semantic.RuntimeEncoding as Encoding
+import semantic.StableKey
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.collections.slice {Slice}
+import silk.core.effect {Effect}
+import silk.core.option {Option}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.u64
+import silk.num.usize
+import silk.testing.testing {Testing, AssertionError}
+
+/// Maximum resident image stores: four original workers and four donated workers.
+pub const MAX_IMAGES: usize = 8
+const MAX_BYTES: usize = 1073741824
+const HEADER: usize = 16
+
+/// An in-progress bounded envelope of encoded dependency images.
+pub struct Packet {bytes: Bytes, count: usize}
+
+/// Creates an empty envelope; it becomes a valid packet after an image is appended.
+pub effect fn make() -> Packet ! OutOfMemoryError ? &mut Allocator {
+  let mut bytes = Bytes.make()
+  run Encoding.word(&mut bytes, 1)
+  run Encoding.word(&mut bytes, 0)
+  return Packet {bytes: move bytes, count: usize.ZERO}
+}
+
+/// Appends one opaque encoded image without examining or changing its dependency evidence.
+pub effect fn append(packet: &mut Packet, image: &[u8]) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let length = Bytes.length(&packet.bytes)
+  if packet.count >= MAX_IMAGES || image.length == usize.ZERO || length > MAX_BYTES - 8
+    || image.length > MAX_BYTES - length - 8 { return false }
+  run Encoding.field(&mut packet.bytes, image)
+  packet.count = packet.count + usize.ONE
+  return true
+}
+
+/// Finds each image in a complete envelope, rejecting excessive counts, lengths and trailing bytes.
+/// Returning slices instead of copied images keeps validation and merging at the coordinator.
+pub effect fn read(bytes: &[u8]) -> Option<List<Span>> ! OutOfMemoryError ? &mut Allocator {
+  if bytes.length > MAX_BYTES { return Option<List<Span>>.none() }
+  let mut reader = StableKey.reader()
+  if StableKey.readWord(bytes, &mut reader) != 1 { return Option<List<Span>>.none() }
+  let count = StableKey.readWord(bytes, &mut reader)
+  if StableKey.failed(&reader) || count == 0 || count > usize.toU64(MAX_IMAGES) { return Option<List<Span>>.none() }
+  let mut images = List<Span>.make()
+  let mut at: u64 = 0
+  while at < count {
+    let field = StableKey.readField(bytes, &mut reader)
+    if StableKey.failed(&reader) || field.start == field.end { return Option<List<Span>>.none() }
+    run List<Span>.append(&mut images, field)
+    at = at + 1
+  }
+  if !StableKey.finished(bytes, &reader) { return Option<List<Span>>.none() }
+  return Option<List<Span>>.some(move images)
+}
+
+/// Forwards every image in a validated envelope. Refusal leaves the destination unchanged.
+/// Cache images themselves remain opaque here, so ancestor workers do no graph merge or decoding.
+pub effect fn forward(packet: &mut Packet, bytes: &[u8]) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let spans = match move run read(bytes) {
+    Option<List<Span>>.Some {value} => move value
+    Option<List<Span>>.None => { return false }
+  }
+  let added = List<Span>.length(&spans)
+  let length = Bytes.length(&packet.bytes)
+  if added > MAX_IMAGES - packet.count || bytes.length - HEADER > MAX_BYTES - length { return false }
+  run Bytes.append(&mut packet.bytes, Slice.view<u8>(bytes, HEADER, bytes.length - HEADER))
+  packet.count = packet.count + added
+  return true
+}
+
+/// Finishes an envelope, or refuses one that never received an image.
+pub effect fn finish(packet: Packet) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+  let Packet {bytes: payload, count} = move packet
+  if count == usize.ZERO { return Option<Bytes>.none() }
+  let mut bytes = move payload
+  let mut encoded = Bytes.make()
+  run Encoding.word(&mut encoded, usize.toU64(count))
+  let word = Bytes.asSlice(&encoded)
+  let mut output = Bytes.asMutSlice(&mut bytes)
+  let mut at = usize.ZERO
+  while at < 8 { output[8 + at] = word[at] at = at + usize.ONE }
+  return Option<Bytes>.some(move bytes)
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length { if left[at] != right[at] { return false } at = at + usize.ONE }
+  return true
+}
+
+effect fn packetClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut child = run make()
+  run Testing.expect(run append(&mut child, b"child-image"), "a leaf image enters its envelope")
+  let childBytes = match move run finish(move child) {
+    Option<Bytes>.Some {value} => move value
+    Option<Bytes>.None => { run Testing.expect(false, "a nonempty envelope finishes") return () }
+  }
+  let mut parent = run make()
+  run Testing.expect((run append(&mut parent, &[0, 255, 1])) && (run forward(&mut parent, Bytes.asSlice(&childBytes))),
+    "opaque local and descendant bytes can share a flat envelope")
+  let encoded = match move run finish(move parent) {
+    Option<Bytes>.Some {value} => move value
+    Option<Bytes>.None => { run Testing.expect(false, "a forwarded envelope finishes") return () }
+  }
+  let fields = match move run read(Bytes.asSlice(&encoded)) {
+    Option<List<Span>>.Some {value} => move value
+    Option<List<Span>>.None => { run Testing.expect(false, "a complete envelope decodes") return () }
+  }
+  let listed = List<Span>.asSlice(&fields)
+  run Testing.expect(listed.length == 2 && same(StableKey.view(Bytes.asSlice(&encoded), listed[0]), &[0, 255, 1])
+    && same(StableKey.view(Bytes.asSlice(&encoded), listed[1]), b"child-image"), "forwarding preserves leaf bytes and order exactly")
+  let mut cut = usize.ZERO
+  while cut < Bytes.length(&encoded) {
+    let truncated = run read(Slice.view<u8>(Bytes.asSlice(&encoded), usize.ZERO, cut))
+    run Testing.expect(match move truncated { Option<List<Span>>.None => true _ => false }, "every incomplete packet is refused")
+    cut = cut + usize.ONE
+  }
+  let mut full = run make()
+  let mut at = usize.ZERO
+  while at < MAX_IMAGES { drop run append(&mut full, b"image") at = at + usize.ONE }
+  let before = Bytes.length(&full.bytes)
+  run Testing.expect(!(run forward(&mut full, Bytes.asSlice(&childBytes))) && full.count == MAX_IMAGES
+    && Bytes.length(&full.bytes) == before, "excess donated images are refused before changing the envelope")
+  let mut extra = run Bytes.copy(Bytes.asSlice(&childBytes))
+  run Bytes.append(&mut extra, &[0])
+  run Testing.expect(match move run read(Bytes.asSlice(&extra)) { Option<List<Span>>.None => true _ => false },
+    "trailing bytes cannot hide another uncounted image")
+  let mut overflow = Bytes.make()
+  run Encoding.word(&mut overflow, 1)
+  run Encoding.word(&mut overflow, 1)
+  run Encoding.word(&mut overflow, u64.MAX)
+  run Testing.expect(match move run read(Bytes.asSlice(&overflow)) { Option<List<Span>>.None => true _ => false },
+    "oversized image lengths are refused before allocation")
+}
+
+test effect fn cachePacketsForwardOpaqueImagesAndRejectMalformedBounds() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run packetClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
