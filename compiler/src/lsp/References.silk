@@ -9,7 +9,7 @@
 import hir.Hir { HirId, Module, Node }
 import lexer.Span { Span }
 import lsp.Features
-import lsp.Names as Names { NameAt, Named, Site }
+import lsp.Names as Names { DeclaredField, FieldSite, NameAt, Named, Site }
 import semantic.DeclarationId { DeclarationId }
 import semantic.ModuleId { InvalidModulePath, ModuleId }
 import semantic.ModuleIndex { ModuleIndex }
@@ -17,12 +17,14 @@ import semantic.Query { Cycle }
 import semantic.Semantic { Dependency, Semantic, StaticPort }
 import semantic.SourceIndex { AuthoredCursor, IndexedSource, RevisionMismatch }
 import semantic.SourceUnit { SourceUnit }
+import semantic.Type { Type }
 import semantic.Types { Types }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.collections.bytes { Bytes }
 import silk.collections.list { List }
 import silk.core.option { Option }
 import silk.collections.slice { Slice }
+import silk.mem.interned { Interned }
 import silk.num.usize
 
 /// What a search looks for.
@@ -31,6 +33,8 @@ pub union Sought {
   Declaration { pub identity: DeclarationId },
   /// A local or generic parameter of a body in `module`, by its binder's span.
   Local { pub module: ModuleId, pub binder: Span },
+  /// A field of the struct `identity`, by its declaration ordinal.
+  Field { pub identity: DeclarationId, pub index: usize },
 }
 
 /// What a search looks for and the name it is written with.
@@ -44,6 +48,10 @@ pub struct Found {
   pub module: ModuleId,
   pub text: Bytes,
   pub spans: List<Span>,
+  /// The places in the module that write a field shorthand spelled as the target, as `x` in
+  /// `Point {x}` for `Point {x: x}`. A rename spells such a place out as `x: renamed`, so the
+  /// field it names stays the same.
+  pub shorthands: List<Span>,
 }
 
 /// One declaration a workspace symbol search lists: its name, its SymbolKind number and the span
@@ -72,6 +80,9 @@ struct Spelled {
 
   // Import members that spell it, with the name each binds in the module.
   imported: List<ImportedName>,
+
+  // Field shorthands that spell it, each one name for the field and the value or binder.
+  shorthands: List<Span>,
 }
 
 struct Candidate {
@@ -93,8 +104,9 @@ struct ImportedName {
 }
 
 /// What the name at `offset` of `module` refers to, as a search target: the name a body or header
-/// writes, a declaration's own name, an import member, or the binder of a local or generic
-/// parameter. Absent for a field, a namespace or a place that names nothing.
+/// writes, a declaration's own name, an import member, the binder of a local or generic
+/// parameter, or a field, by a use or its declared name. Absent for a namespace or a place that
+/// names nothing.
 pub effect fn target(store: &mut Semantic, module: &ModuleId, offset: usize) -> Option<Target>
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
   ? &mut Allocator | &mut Types {
@@ -103,8 +115,15 @@ pub effect fn target(store: &mut Semantic, module: &ModuleId, offset: usize) -> 
       Named.Declaration { identity } => run declarationTarget(&mut store.*, move identity)
       Named.Local { binder, .. } => run localTarget(&mut store.*, module, binder)
       Named.Binder { binder } => run localTarget(&mut store.*, module, binder)
+      Named.Field { owner, index } => match move Names.structOf(&owner) {
+        Option<DeclarationId>.Some { value } => run fieldTarget(&mut store.*, move value, index)
+        Option<DeclarationId>.None => Option<Target>.none()
+      }
       _ => Option<Target>.none()
     }
+  }
+  if let Option<DeclaredField>.Some { value: field } = move run Names.fieldDeclaredAt(&mut store.*, module, offset) {
+    return run fieldTarget(&mut store.*, move field.identity, field.index)
   }
   if let Option<NameAt>.Some { value: declared } = move run Names.declaredAt(&mut store.*, module, offset) {
     if let Named.Declaration { identity } = move declared.named {
@@ -161,6 +180,14 @@ pub effect fn target(store: &mut Semantic, module: &ModuleId, offset: usize) -> 
 pub effect fn references(store: &mut Semantic, modules: &[ModuleId], target: &Target, declaration: bool) -> List<Found>
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
   ? &mut Allocator | &mut Types {
+  return run referencesWith(&mut store.*, modules, target, declaration, true)
+}
+
+/// [`references`], with the ranges of constant literals that `StaticText.link` tied to a field
+/// only when `linked` is set. A rename leaves them out: it does not edit text.
+pub effect fn referencesWith(store: &mut Semantic, modules: &[ModuleId], target: &Target, declaration: bool, linked: bool) -> List<Found>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
   let mut found = List<Found>.make()
   let spelling = Bytes.asSlice(&target.spelling)
   let mut at = usize.ZERO
@@ -172,9 +199,14 @@ pub effect fn references(store: &mut Semantic, modules: &[ModuleId], target: &Ta
     }
     if searched {
       if let Option<Spelled>.Some { value: spelled } = move run spelled(&mut store.*, module, spelling) {
-        let spans = run referencesIn(&mut store.*, module, &spelled, target, declaration)
+        let spans = run referencesIn(&mut store.*, module, &spelled, target, declaration, linked)
         if List<Span>.length(&spans) > usize.ZERO {
-          run List<Found>.append(&mut found, Found { module: ModuleId.copy(module), text: move spelled.text, spans: move spans })
+          run List<Found>.append(&mut found, Found {
+            module: ModuleId.copy(module),
+            text: move spelled.text,
+            spans: move spans,
+            shorthands: move spelled.shorthands,
+          })
         }
       }
     }
@@ -230,7 +262,7 @@ pub effect fn declarations(store: &mut Semantic, module: &ModuleId, query: &[u8]
 }
 
 // The places in one module's spelled names that name `target`, in source order.
-effect fn referencesIn(store: &mut Semantic, module: &ModuleId, spelled: &Spelled, target: &Target, declaration: bool) -> List<Span>
+effect fn referencesIn(store: &mut Semantic, module: &ModuleId, spelled: &Spelled, target: &Target, declaration: bool, linked: bool) -> List<Span>
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
   ? &mut Allocator | &mut Types {
   let mut spans = List<Span>.make()
@@ -297,9 +329,66 @@ effect fn referencesIn(store: &mut Semantic, module: &ModuleId, spelled: &Spelle
         at = at + usize.ONE
       }
     }
+    Sought.Field { identity, index } => {
+      if declaration && ModuleId.equals(DeclarationId.moduleId(&identity), module) {
+        if let Option<FieldSite>.Some { value: site } = move run Names.fieldSiteOf(&mut store.*, &identity, index, Option<&Interned<Type>>.none()) {
+          run List<Span>.append(&mut spans, site.name)
+        }
+      }
+      let names = List<Candidate>.asSlice(&spelled.names)
+      let mut at = usize.ZERO
+      while at < names.length {
+        if let Option<NameAt>.Some { value: use } = move run Names.at(&mut store.*, module, names[at].span.start) {
+          if fieldOf(&use.named, &identity, index) {
+            run List<Span>.append(&mut spans, names[at].span)
+          }
+        }
+        at = at + usize.ONE
+      }
+      if linked {
+        let links = run Names.links(&mut store.*, module)
+        let listed = List<NameAt>.asSlice(&links)
+        at = usize.ZERO
+        while at < listed.length {
+          if fieldOf(&listed[at].named, &identity, index) {
+            run List<Span>.append(&mut spans, listed[at].span)
+          }
+          at = at + usize.ONE
+        }
+      }
+    }
   }
   sortSpans(List<Span>.asMutSlice(&mut spans))
   return move spans
+}
+
+// Whether a name is field `index` of the struct `identity`, at any of its applications.
+fn fieldOf(named: &Named, identity: &DeclarationId, index: usize) -> bool {
+  if let Named.Field { owner, index: used } = &named.* {
+    if used != index {
+      return false
+    }
+    if let Option<DeclarationId>.Some { value } = move Names.structOf(&owner) {
+      return DeclarationId.equals(&value, identity)
+    }
+  }
+  return false
+}
+
+effect fn fieldTarget(store: &mut Semantic, identity: DeclarationId, index: usize) -> Option<Target>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let site = match move run Names.fieldSiteOf(&mut store.*, &identity, index, Option<&Interned<Type>>.none()) {
+    Option<FieldSite>.Some { value } => move value
+    Option<FieldSite>.None => {
+      return Option<Target>.none()
+    }
+  }
+  if site.name.end > Bytes.length(&site.text) || site.name.start >= site.name.end {
+    return Option<Target>.none()
+  }
+  let spelling = run Bytes.copy(Slice.view<u8>(Bytes.asSlice(&site.text), site.name.start, site.name.end - site.name.start))
+  return Option<Target>.some(Target { sought: Sought.Field { identity: move identity, index: index }, spelling: move spelling })
 }
 
 effect fn declarationTarget(store: &mut Semantic, identity: DeclarationId) -> Option<Target>
@@ -457,6 +546,7 @@ effect fn spelled(store: &mut Semantic, module: &ModuleId, spelling: &[u8]) -> O
   let mut imported = List<ImportedName>.make()
   let mut skipped = List<usize>.make()
   let mut expressions = List<usize>.make()
+  let mut shorthands = List<Span>.make()
   let count = Module.length(hir)
   at = usize.ZERO
   while at < count {
@@ -477,6 +567,27 @@ effect fn spelled(store: &mut Semantic, module: &ModuleId, spelling: &[u8]) -> O
         }
       }
       Node.IdentifierExpression { name, .. } => run List<usize>.append(&mut expressions, name.index)
+      // A shorthand `{x}` writes one name twice, for the field and for the value it reads; the
+      // value's name is the reference, so the field's is skipped.
+      Node.FieldInitializer { name, value } => {
+        if let Node.IdentifierExpression { name: read, .. } = Module.node(hir, value) {
+          let span = Module.span(hir, name)
+          if sameSpan(span, Module.span(hir, read)) {
+            run List<usize>.append(&mut skipped, name.index)
+            if spells(text, span, spelling) {
+              run List<Span>.append(&mut shorthands, span)
+            }
+          }
+        }
+      }
+      Node.PatternField { name, pattern } => {
+        if let Node.BindingPattern { name: bound, .. } = Module.node(hir, pattern) {
+          let span = Module.span(hir, name)
+          if sameSpan(span, Module.span(hir, bound)) && spells(text, span, spelling) {
+            run List<Span>.append(&mut shorthands, span)
+          }
+        }
+      }
       _ => ()
     }
     at = at + usize.ONE
@@ -498,7 +609,12 @@ effect fn spelled(store: &mut Semantic, module: &ModuleId, spelling: &[u8]) -> O
     names: move names,
     declared: move declared,
     imported: move imported,
+    shorthands: move shorthands,
   })
+}
+
+fn sameSpan(left: Span, right: Span) -> bool {
+  return left.start == right.start && left.end == right.end
 }
 
 fn binderOf(named: &Named) -> Option<Span> {

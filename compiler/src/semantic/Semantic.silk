@@ -351,6 +351,7 @@ import semantic.Type {
 }
 import semantic.TypedBody {
   SectionRetention,
+  LinkedName,
   Environment as BodyEnvironment,
   EnvironmentCapture as BodyEnvironmentCapture,
   ReferentCapture as BodyReferentCapture,
@@ -385,6 +386,7 @@ import semantic.TypedBody {
   MatchSyntax as BodyMatchSyntax,
   Pattern as BodyPattern,
   UnionMember as BodyUnionMember,
+  Alternative as BodyAlternative,
   PlaceStep as BodyPlaceStep,
   ConsumedPlace as BodyConsumedPlace,
   PlaceRoot as BodyPlaceRoot,
@@ -2324,8 +2326,9 @@ pub union Value {
   Signature {pub signature: Box<Signature>},
   /// A conformance's implementations in its contract's operation order.
   Witnesses {pub witnesses: List<Witness>},
-  /// A constant's initializer value at the type published by its `Constant` fact.
-  Initializer {pub value: Interned<StaticData>},
+  /// A constant's initializer value at the type published by its `Constant` fact, and, for a
+  /// store that selects editor tables, the literal ranges its evaluation linked to fields.
+  Initializer {pub value: Interned<StaticData>, pub links: Option<Shared<List<LinkedName>>>},
   /// Whether a module-level `static if` condition holds.
   Condition {pub holds: bool},
   /// Whether a type has no runtime layout (STATIC-009).
@@ -3764,6 +3767,8 @@ struct IterationFacts {
 union ResolvedTarget {
   Function {target: CallTarget},
   Constant {declaration: DeclarationId, ty: Interned<Type>},
+  /// The constant written as the receiver of `C.m()`: the call is `m` on the constant's value.
+  ConstantReceiver {declaration: DeclarationId, ty: Interned<Type>},
   /// An imported C static read by value, with its admitted scalar or pointer type.
   ForeignStatic {declaration: DeclarationId, ty: Interned<Type>},
   Intrinsic {member: IntrinsicMember, typeArguments: List<Interned<Type>>},
@@ -3999,6 +4004,9 @@ struct Resolver {
   linkOnlySupport: List<ModuleId>,
   /// Whether checked bodies keep the names they resolve for an editor (`selectEditorTables`).
   editorTables: bool,
+  /// The literal ranges static evaluations linked to fields while the current constant is
+  /// evaluated; filled only with `editorTables`.
+  staticLinks: Option<List<StaticExecution.EditorLink>>,
   /// The discovery root of a test build and its package-relative module directory (TEST-003).
   discovery: Option<Discovery>,
   /// The dependency names of every package in the build, which turn import paths into modules.
@@ -7737,28 +7745,40 @@ fn foreignFaultCall(diagnostic: &StaticDiagnostic, module: &ModuleId) -> Option<
 // function the evaluation called, belongs to that function's module. When that module is owned
 // elsewhere, by the toolchain or another package, this module locates the refusal at the
 // outermost call frame of the fault's trace, with the refusal's own site related. A refusal in
-// this package's own source stays where it is, as does one whose trace has no call frame.
+// this package's own source stays where it is, as does one whose trace has no call frame. So does
+// one in a caller's package that a toolchain module's evaluation reached, such as a `compileError`
+// at the literal a caller wrote: that site is where the caller fixes it.
 effect fn relocatedStaticRejection(module: &ModuleId, rejected: Shared<Rejection>, trace: &List<StaticExecution.TraceStep>)
 -> Shared<Rejection> ! OutOfMemoryError ? &mut Allocator {
   let foreign = Shared<Rejection>.with<bool>(&rejected, fn(value: &Rejection) -> bool {
+    if toolchainModule(module) && !toolchainModule(&value.module) { return false }
     return !ModuleId.samePackage(&value.module, module) || (toolchainModule(&value.module) && !toolchainModule(module))
   })
   if !foreign { return move rejected }
-  let steps = List<StaticExecution.TraceStep>.asSlice(trace)
-  let mut call = Option<Span>.none()
-  let mut at = usize.ZERO
-  while at < steps.length {
-    if let Option<ModuleId>.Some {..} = &steps[at].module {
-      call = Option<Span>.some(steps[at].span)
-      break
-    }
-    at = at + usize.ONE
-  }
+  // The refusal is located at the innermost call `module` makes itself: a call frame whose caller is
+  // `module`, the first frame's caller being the evaluated expression in `module`.
+  let call = innermostCallBy(List<StaticExecution.TraceStep>.asSlice(trace), true, module)
   let span = match move call {
     Option<Span>.Some {value} => value
     Option<Span>.None => { return move rejected }
   }
   return run rejectionAtCall(module, span, move rejected)
+}
+
+// The span of the last call frame among `steps` whose caller is `module`. `startsInModule` says
+// whether the first frame's caller is.
+fn innermostCallBy(steps: &[StaticExecution.TraceStep], startsInModule: bool, module: &ModuleId) -> Option<Span> {
+  let mut callerIsModule = startsInModule
+  let mut call = Option<Span>.none()
+  let mut at = usize.ZERO
+  while at < steps.length {
+    if let Option<ModuleId>.Some {value: frame} = &steps[at].module {
+      if callerIsModule { call = Option<Span>.some(steps[at].span) }
+      callerIsModule = ModuleId.equals(&frame, module)
+    }
+    at = at + usize.ONE
+  }
+  return move call
 }
 
 // Whether every argument of `application` and of its scopes is a lifetime, and none is static.
@@ -7829,6 +7849,15 @@ effect fn requestedRejection(module: &ModuleId, span: Span, rejected: Shared<Rej
   })
   if toolchainModule(module) || span.end == usize.ZERO { return move rejected }
   if foreign { return run rejectionAtCall(module, span, move rejected) }
+  // A `compileError` at the requester's own source that a standard-library body reached relates
+  // the requester's call, not that body's code.
+  let internallyRelated = Shared<Rejection>.with<bool>(&rejected, fn(value: &Rejection) -> bool {
+    if let Option<RelatedSite>.Some {value: site} = &value.related {
+      return value.code == RejectionCode.SelectedCompileError && toolchainModule(&site.module)
+    }
+    return false
+  })
+  if internallyRelated { return run rejectionRelatingCall(module, span, move rejected) }
   // A `compileError` a static branch of this package selected stays at its own site and relates
   // the call whose static arguments selected it.
   let unrelated = Shared<Rejection>.with<bool>(&rejected, fn(value: &Rejection) -> bool {
@@ -7848,6 +7877,20 @@ effect fn rejectionRelating(module: &ModuleId, span: Span, rejected: Shared<Reje
   let code = Shared<Rejection>.with<RejectionCode>(&rejected, fn(value: &Rejection) -> RejectionCode { return value.code })
   let site = Shared<Rejection>.with<Span>(&rejected, fn(value: &Rejection) -> Span { return value.span })
   let mut diagnostic = run makeRejection(code, module, site)
+  diagnostic.related = Option<RelatedSite>.some(RelatedSite {module: ModuleId.copy(module), span: span})
+  run copySharedArguments(&rejected, &mut diagnostic)
+  return run Shared<Rejection>.make(move diagnostic)
+}
+
+// `rejected` at its own site in its own module, relating `span` of `module`, the call that
+// requested its body.
+effect fn rejectionRelatingCall(module: &ModuleId, span: Span, rejected: Shared<Rejection>) -> Shared<Rejection>
+! OutOfMemoryError ? &mut Allocator {
+  let code = Shared<Rejection>.with<RejectionCode>(&rejected, fn(value: &Rejection) -> RejectionCode { return value.code })
+  let site = Shared<Rejection>.with<RelatedSite>(&rejected, fn(value: &Rejection) -> RelatedSite {
+    return RelatedSite {module: ModuleId.copy(&value.module), span: value.span}
+  })
+  let mut diagnostic = run makeRejection(code, &site.module, site.span)
   diagnostic.related = Option<RelatedSite>.some(RelatedSite {module: ModuleId.copy(module), span: span})
   run copySharedArguments(&rejected, &mut diagnostic)
   return run Shared<Rejection>.make(move diagnostic)
@@ -7919,6 +7962,31 @@ effect fn sharedArgumentBytes(rejection: &Shared<Rejection>, index: usize, name:
   return move copied
 }
 
+// A call that code outside the toolchain makes during a static evaluation.
+struct PackageCall {
+  module: ModuleId,
+  span: Span,
+}
+
+// The innermost call frame of a static fault's trace whose caller is a module outside the
+// toolchain, with that caller; `module` is the first frame's caller.
+fn innermostPackageCall(diagnostic: &StaticDiagnostic, module: &ModuleId) -> Option<PackageCall> {
+  let steps = List<StaticExecution.TraceStep>.asSlice(&diagnostic.trace)
+  let mut found = Option<PackageCall>.none()
+  let mut caller = ModuleId.copy(module)
+  let mut at = usize.ZERO
+  while at < steps.length {
+    if let Option<ModuleId>.Some {value: frame} = &steps[at].module {
+      if !toolchainModule(&caller) {
+        found = Option<PackageCall>.some(PackageCall {module: ModuleId.copy(&caller), span: steps[at].span})
+      }
+      caller = ModuleId.copy(&frame)
+    }
+    at = at + usize.ONE
+  }
+  return move found
+}
+
 effect fn rejectStatic(resolver: &Resolver, module: &ModuleId, diagnostic: StaticDiagnostic) -> Shared<
   Rejection,
 > ! OutOfMemoryError ? &mut Allocator {
@@ -7927,6 +7995,18 @@ effect fn rejectStatic(resolver: &Resolver, module: &ModuleId, diagnostic: Stati
   // A fault reached in the body of another module's function has a span in that module; this
   // module locates it at its outermost call, the first call frame of the trace.
   if let Option<Span>.Some {value: call} = move foreignFaultCall(&diagnostic, module) { span = call }
+  // A fault the standard library reaches while running code a package wrote, such as an `Opt.short`
+  // call in that package's description of its command line, belongs to that package: it is located
+  // at the innermost call the package's code makes, not at the library's own call.
+  let mut owner = ModuleId.copy(module)
+  let mut relocated = false
+  if toolchainModule(module) {
+    if let Option<PackageCall>.Some {value: call} = move innermostPackageCall(&diagnostic, module) {
+      owner = move call.module
+      span = call.span
+      relocated = true
+    }
+  }
   // A selected `compileError` names its own text (SEM0177 `{detail}`), and the outermost frame of
   // the static call trace is the call in the evaluated module that selected it.
   let mut arguments = List<MessageArgument>.make()
@@ -7958,13 +8038,15 @@ effect fn rejectStatic(resolver: &Resolver, module: &ModuleId, diagnostic: Stati
     }
   }
   let mut related = Option<RelatedSite>.none()
-  if let Option<Span>.Some {value: call} = move outermostStaticCall(&diagnostic) {
-    related = Option<RelatedSite>.some(RelatedSite {module: ModuleId.copy(module), span: call})
+  if !relocated {
+    if let Option<Span>.Some {value: call} = move outermostStaticCall(&diagnostic) {
+      related = Option<RelatedSite>.some(RelatedSite {module: ModuleId.copy(module), span: call})
+    }
   }
   return run Shared<Rejection>.make(
     Rejection {
       code: code,
-      module: ModuleId.copy(module),
+      module: move owner,
       span: span,
       related: move related,
       path: List<Interned<DeclarationId>>.make(),
@@ -10148,7 +10230,7 @@ fn fingerprintValue(writer: &mut AnswerFingerprint.Writer, value: &Value) -> () 
     Value.StaticRouting {holds} => { AnswerFingerprint.flag(&mut writer.*, holds) }
     Value.ProfileInput {slot} => { AnswerFingerprint.count(&mut writer.*, slot) }
     Value.LayoutUnsupported => {}
-    Value.Initializer {value: published} => { StaticValue.fingerprint(&mut writer.*, &published) }
+    Value.Initializer {value: published, ..} => { StaticValue.fingerprint(&mut writer.*, &published) }
     _ => { AnswerFingerprint.incomplete(&mut writer.*) }
   }
   return ()
@@ -34501,20 +34583,7 @@ effect fn collectInvocation(hir: &Module, expression: HirId, input: CallInput, a
     run collectCall(hir, subject, &mut annotations.*, &mut calls.*)
     // A receiver call's written types bind its member's own binders. The member is known only
     // once the receiver is typed, so they resolve in the caller's binders beside its annotations.
-    if generics.present {
-      if let Node.TypeArguments {arguments: written, ..} = Module.node(hir, generics.id) {
-        let mut writtenAt = usize.ZERO
-        while writtenAt < written.length {
-          let argument = Module.child(hir, written, writtenAt)
-          match Module.node(hir, argument) {
-            Node.Lifetime {..} => ()
-            Node.RequirementSelector {..} => ()
-            _ => run List<HirId>.append(&mut annotations.*, argument)
-          }
-          writtenAt = writtenAt + usize.ONE
-        }
-      }
-    }
+    run collectMemberTypeArguments(hir, generics, &mut annotations.*)
   }
 
   if callableExpressionTarget(Module.node(hir, callee)) {
@@ -34524,6 +34593,37 @@ effect fn collectInvocation(hir: &Module, expression: HirId, input: CallInput, a
   while at < CallArguments.length(arguments) {
     run collectCall(hir, CallArguments.child(arguments, hir, at), &mut annotations.*, &mut calls.*)
     at = at + usize.ONE
+  }
+  return ()
+}
+
+// The written type arguments of the type argument list `generics`, without its lifetimes and
+// requirements.
+effect fn memberTypeArguments(resolver: &mut Resolver, module: &ModuleId, generics: HirId) -> List<HirId>
+! Cycle | OutOfMemoryError ? &mut Allocator {
+  let mut ids = List<HirId>.make()
+  let answer = run observedSyntax(&mut resolver.*, module, generics)
+  if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&resolver.*, &answer, module) {
+    run collectMemberTypeArguments(IndexedSource.authored(indexed), HirRef.of(generics), &mut ids)
+  }
+  return move ids
+}
+
+// The written type arguments of a member call, which resolve in the caller's binders.
+effect fn collectMemberTypeArguments(hir: &Module, generics: HirRef, annotations: &mut List<HirId>) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  if !generics.present { return () }
+  if let Node.TypeArguments {arguments: written, ..} = Module.node(hir, generics.id) {
+    let mut writtenAt = usize.ZERO
+    while writtenAt < written.length {
+      let argument = Module.child(hir, written, writtenAt)
+      match Module.node(hir, argument) {
+        Node.Lifetime {..} => ()
+        Node.RequirementSelector {..} => ()
+        _ => run List<HirId>.append(&mut annotations.*, argument)
+      }
+      writtenAt = writtenAt + usize.ONE
+    }
   }
   return ()
 }
@@ -35376,6 +35476,7 @@ effect fn localizedTarget(target: ResolvedTarget, caller: &DeclarationId, origin
     }
     ResolvedTarget.Function {target: selected} => ResolvedTarget.Function {target: move selected}
     ResolvedTarget.Constant {declaration, ty} => ResolvedTarget.Constant {declaration: move declaration, ty: move ty}
+    ResolvedTarget.ConstantReceiver {declaration, ty} => ResolvedTarget.ConstantReceiver {declaration: move declaration, ty: move ty}
     ResolvedTarget.ForeignStatic {declaration, ty} => ResolvedTarget.ForeignStatic {declaration: move declaration, ty: move ty}
     ResolvedTarget.Selected {fact} => ResolvedTarget.Selected {fact: move fact}
   }
@@ -36241,6 +36342,21 @@ effect fn qualifiedNominalCallTarget(
     }
   }
   if !nominal {
+    // `C.m()` on a constant `C` calls the method on the constant's value: the call's target is
+    // the constant, its receiver. A value read `C.field` keeps its own field fallback.
+    if !syntax.value && !application.present {
+      if let Option<HeaderSyntax>.Some {value} = move run scopedHeader(&mut resolver.*, &qualifierModule, qualifier.ordinal) {
+        if let Node.ConstantHeader {..} = value.header {
+          let resolved = run callConstantTarget(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, &qualifierModule,
+            &qualifier, subjectSpan)
+          return match move resolved {
+            Result<ResolvedTarget, Shared<Rejection>>.Success {value: ResolvedTarget.Constant {declaration, ty}} =>
+              Result<ResolvedTarget, Shared<Rejection>>.succeed(ResolvedTarget.ConstantReceiver {declaration: move declaration, ty: move ty})
+            Result<ResolvedTarget, Shared<Rejection>> other => move other
+          }
+        }
+      }
+    }
     return Result<ResolvedTarget, Shared<Rejection>>.failResult(
       run reject(&resolver.*, module, RejectionCode.NotCallable, subjectSpan),
     )
@@ -37313,6 +37429,9 @@ effect fn resolveNamedRepresentation(
     ResolvedTarget.Constant {..} => {
       return run invalidExactRepresentation(&resolver.*, module, span)
     }
+    ResolvedTarget.ConstantReceiver {..} => {
+      return run invalidExactRepresentation(&resolver.*, module, span)
+    }
     ResolvedTarget.ForeignStatic {..} => {
       return run invalidExactRepresentation(&resolver.*, module, span)
     }
@@ -37545,6 +37664,10 @@ effect fn copyResolvedTarget(value: &ResolvedTarget) -> ResolvedTarget
     ResolvedTarget.Storage {operation, typeArguments} => ResolvedTarget.Storage {operation: operation,
       typeArguments: run copyTypes(List<Interned<Type>>.asSlice(&typeArguments))}
     ResolvedTarget.Constant {declaration, ty} => ResolvedTarget.Constant {
+      declaration: DeclarationId.copy(&declaration),
+      ty: Interned<Type>.clone(&ty),
+    }
+    ResolvedTarget.ConstantReceiver {declaration, ty} => ResolvedTarget.ConstantReceiver {
       declaration: DeclarationId.copy(&declaration),
       ty: Interned<Type>.clone(&ty),
     }
@@ -39753,15 +39876,6 @@ effect fn checkReceiverCall<'scope>(
 ) -> Result<BodyNodeId, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
 ? &mut Allocator | &mut Types {
-  let span = run bodySpan(&resolver.source, cursor, expression)
-  let memberSpan = run bodySpan(&resolver.source, cursor, field)
-  let memberSymbol = match run bodyNode(&resolver.source, cursor, field) {
-    Node.Name {text} => text
-    _ => {
-      return run bodyRejection(&resolver.*, module, RejectionCode.Undetermined, memberSpan)
-    }
-  }
-  let member = run bodyText(&resolver.source, cursor, memberSymbol)
   let checkedReceiver = run checkExpression(
     &mut resolver.*,
     &mut owner.*,
@@ -39788,6 +39902,52 @@ effect fn checkReceiverCall<'scope>(
       return Result<BodyNodeId, Shared<Rejection>>.failResult(move error)
     }
   }
+  return run checkReceiverCallOn(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*,
+    module, cursor, caller, &mut statementScope.*, calls, &mut nodes.*, &mut signatures.*, &mut requiredBodies.*,
+    expression, callee, subject, field, generics, arguments, pipeline, expected, mismatchCode, constraints,
+    contractBody, staticBody, unsafeAllowed, callAcknowledged, receiverNode)
+}
+
+// Checks a receiver call whose receiver is already checked as `receiverNode`.
+effect fn checkReceiverCallOn<'scope>(
+  resolver: &mut Resolver,
+  owner: &mut Query<Answer, NoRejection>,
+  request: &mut Request,
+  dependencies: &mut List<Dependency>,
+  module: &ModuleId,
+  cursor: &AuthoredCursor,
+  caller: &DeclarationId,
+  statementScope: &mut StatementScope<'scope>,
+  calls: &[ResolvedCall],
+  nodes: &mut List<BodyNode>,
+  signatures: &mut List<SignatureDependency>,
+  requiredBodies: &mut List<DeclarationId>,
+  expression: HirId,
+  callee: HirId,
+  subject: HirId,
+  field: HirId,
+  generics: HirRef,
+  arguments: CallArguments,
+  pipeline: bool,
+  expected: &Option<Interned<Type>>, mismatchCode: RejectionCode,
+  constraints: &[Constraint],
+  contractBody: bool,
+  staticBody: bool,
+  unsafeAllowed: bool,
+  callAcknowledged: bool,
+  receiverNode: BodyNodeId,
+) -> Result<BodyNodeId, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator | &mut Types {
+  let span = run bodySpan(&resolver.source, cursor, expression)
+  let memberSpan = run bodySpan(&resolver.source, cursor, field)
+  let memberSymbol = match run bodyNode(&resolver.source, cursor, field) {
+    Node.Name {text} => text
+    _ => {
+      return run bodyRejection(&resolver.*, module, RejectionCode.Undetermined, memberSpan)
+    }
+  }
+  let member = run bodyText(&resolver.source, cursor, memberSymbol)
   let receiverType = match & List<BodyNode>.asSlice(&nodes.*)[receiverNode.index].kind {
     BodyNodeKind.Expression {ty, ..} => Interned<Type>.clone(&ty)
     _ => {
@@ -40636,6 +40796,131 @@ effect fn missingFieldsRejection(module: &ModuleId, span: Span, names: &[Bytes],
   run List<MessageArgument>.append(&mut diagnostic.arguments, MessageArgument {name: run Bytes.copy(b"template"), value: run Bytes.copy(b"1")})
   run List<MessageArgument>.append(&mut diagnostic.arguments, MessageArgument {name: run Bytes.copy(b"missing"), value: move text})
   return run Shared<Rejection>.make(move diagnostic)
+}
+
+// The sealed `Intrinsic.Omittable` interface and its `omitted` operation, which supply the value a
+// struct or variant literal stores for a field it leaves out (STRUCT-002).
+struct OmittableContract {
+  contract: Interned<Type>,
+  operation: DeclarationId,
+}
+
+effect fn omittableContract(
+  resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut List<Dependency>,
+  module: &ModuleId, span: Span,
+) -> Option<OmittableContract> ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let siteOrdinal = run internModule(&mut resolver.*, module)
+  let visibleRequest = Key {family: Family.OperatorInterfaces, module: siteOrdinal, name: usize.ZERO,
+    declaration: usize.ZERO, member: usize.ZERO, external: false}
+  let visibleKey = run internDeclaration(&mut resolver.*, visibleRequest)
+  let visible = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies.*, visibleKey, span)
+  let count = Shared<Result<Answer, NoRejection>>.with<usize>(&visible, operatorInterfaceCount)
+  let mut at = usize.ZERO
+  while at < count {
+    let found = Shared<Result<Answer, NoRejection>>.with<Option<Interned<DeclarationId>>>(&visible,
+      fn(answer: &Result<Answer, NoRejection>) -> Option<Interned<DeclarationId>> { return operatorInterfaceAt(answer, at) })
+    if let Option<Interned<DeclarationId>>.Some {value: shared} = move found {
+      let named = Interned<DeclarationId>.with<bool>(&shared, fn(value: &DeclarationId) -> bool { return DeclarationId.named(value, b"Omittable") })
+      if named {
+        let identity = DeclarationId.copyShared(&shared)
+        let moduleOrdinal = knownModuleOrdinal(&resolver.*, DeclarationId.moduleId(&identity))
+        if moduleOrdinal == usize.MAX { return Option<OmittableContract>.none() }
+        let contractModule = resolvedModule(&resolver.*, moduleOrdinal)
+        let interfaceOrdinal = match move run ordinalOfIdentity(&mut resolver.*, &contractModule, &shared) {
+          Option<usize>.Some {value} => value
+          Option<usize>.None => { return Option<OmittableContract>.none() }
+        }
+        let operationsRequest = Key {family: Family.Operations, module: moduleOrdinal, name: usize.ZERO,
+          declaration: interfaceOrdinal, member: usize.ZERO, external: false}
+        let operationsKey = run internDeclaration(&mut resolver.*, operationsRequest)
+        let listed = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies.*, operationsKey, span)
+        let operation = match move Shared<Result<Answer, NoRejection>>.with<Option<Interned<DeclarationId>>>(&listed,
+          fn(answer: &Result<Answer, NoRejection>) -> Option<Interned<DeclarationId>> { return listedOperation(answer, usize.ZERO) }) {
+          Option<Interned<DeclarationId>>.Some {value} => DeclarationId.copyShared(&value)
+          Option<Interned<DeclarationId>>.None => { return Option<OmittableContract>.none() }
+        }
+        let contract = run Types.intern(Type.Nominal {declaration: move identity, isPublic: true, arguments: List<Argument>.make()})
+        return Option<OmittableContract>.some(OmittableContract {contract: move contract, operation: move operation})
+      }
+    }
+    at = at + usize.ONE
+  }
+  return Option<OmittableContract>.none()
+}
+
+// Whether a literal may leave out a field of type `field`: the type implements `Omittable`.
+effect fn omittableField(
+  resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut List<Dependency>,
+  module: &ModuleId, field: &Interned<Type>, constraints: &[Constraint], span: Span,
+) -> Result<bool, Shared<Rejection>> ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  if Interned<Type>.with<bool>(field, neverType) { return Result<bool, Shared<Rejection>>.succeed(false) }
+  let selected = match move run omittableContract(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, span) {
+    Option<OmittableContract>.Some {value} => move value
+    Option<OmittableContract>.None => { return Result<bool, Shared<Rejection>>.succeed(false) }
+  }
+  return run providerConforms(&mut resolver.*, &mut owner.*, &mut dependencies.*, field, &selected.contract,
+    constraints, module, span)
+}
+
+// The value a literal stores for a field of type `field` it leaves out: `Omittable.omitted()` of
+// that type's conformance, an ordinary interface call.
+effect fn omittedFieldValue(
+  resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, request: &mut Request,
+  dependencies: &mut List<Dependency>, module: &ModuleId, cursor: &AuthoredCursor, caller: &DeclarationId,
+  nodes: &mut List<BodyNode>, signatures: &mut List<SignatureDependency>, requiredBodies: &mut List<DeclarationId>,
+  field: &Interned<Type>, origin: HirId, constraints: &[Constraint], unsafeAllowed: bool, span: Span,
+) -> Result<BodyNodeId, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let selected = match move run omittableContract(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, span) {
+    Option<OmittableContract>.Some {value} => move value
+    Option<OmittableContract>.None => { return run bodyRejection(&resolver.*, module, RejectionCode.Undetermined, span) }
+  }
+  let OmittableContract {contract, operation} = move selected
+  let chosen = run selectOperationCall(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*, true,
+    &contract, field, &operation, constraints, module, span)
+  let call = match move chosen {
+    Result<OperationCall, Shared<Rejection>>.Success {value} => move value
+    Result<OperationCall, Shared<Rejection>>.Failure {error} => { return Result<BodyNodeId, Shared<Rejection>>.failResult(move error) }
+  }
+  let typed = run checkedOperatorCall(&mut resolver.*, &mut owner.*, &mut dependencies.*, caller,
+    List<BodyNode>.asSlice(&nodes.*), constraints,
+    SelectedOperator {contract: move contract, provider: Interned<Type>.clone(field), call: move call},
+    List<BodyNodeId>.make(), &mut signatures.*, &mut requiredBodies.*, module, span, unsafeAllowed)
+  let CheckedOperatorCall {ty, form} = match move typed {
+    Result<CheckedOperatorCall, Shared<Rejection>>.Success {value} => move value
+    Result<CheckedOperatorCall, Shared<Rejection>>.Failure {error} => { return Result<BodyNodeId, Shared<Rejection>>.failResult(move error) }
+  }
+  // The call has no syntax of its own. It is recorded at `origin` (the literal's written type, or
+  // the literal itself when it has none) with an empty span at the literal's end. Static
+  // evaluation rejects a literal with omitted fields before it uses the literal's type, and
+  // hover skips empty spans.
+  let index = List<BodyNode>.length(&nodes.*)
+  run List<BodyNode>.append(&mut nodes.*, BodyNode {
+    origin: run originAt(cursor, origin, Span.make(span.end, span.end)),
+    kind: BodyNodeKind.Expression {ty: move ty, form: move form},
+  })
+  return run checkExpectedValue(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, caller, constraints, &mut nodes.*,
+    BodyNodeId {index: index}, &Option<Interned<Type>>.some(Interned<Type>.clone(field)), RejectionCode.TypeMismatch, span)
+}
+
+// Whether the literal already initializes the field at declaration position `index`.
+fn aggregateFieldPresent(fields: &[BodyAggregateField], index: usize) -> bool {
+  let mut at = usize.ZERO
+  while at < fields.length {
+    if fields[at].index == index { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+effect fn copyAggregateFields(fields: &[BodyAggregateField]) -> List<BodyAggregateField> ! OutOfMemoryError ? &mut Allocator {
+  let mut copied = run List<BodyAggregateField>.makeWithCapacity(fields.length)
+  let mut at = usize.ZERO
+  while at < fields.length {
+    run List<BodyAggregateField>.append(&mut copied, BodyAggregateField {index: fields[at].index, value: fields[at].value})
+    at = at + usize.ONE
+  }
+  return move copied
 }
 
 // Whether `module` may name every field of a struct declaration: all fields are public, or the
@@ -46913,7 +47198,13 @@ effect fn checkReflectionCall<'scope>(
   if nameLabel {descriptor = run CheckedIntrinsic.fieldNameType(&typeArguments[usize.ZERO])}
   let variantNameLabel = CheckedIntrinsic.isPrimitive(member, IntrinsicPrimitive.VariantNameLabel)
   if variantNameLabel {descriptor = run CheckedIntrinsic.variantNameType(&typeArguments[usize.ZERO])}
-  let variantLabel = CheckedIntrinsic.isPrimitive(member, IntrinsicPrimitive.ReflectVariantLabel)
+  let variantLabel = CheckedIntrinsic.isPrimitive(member, IntrinsicPrimitive.ReflectVariantLabel) ||
+    CheckedIntrinsic.isPrimitive(member, IntrinsicPrimitive.ReflectVariantDoc)
+  // `reflectTypeName`, `reflectTypeDoc` and `reflectPrivateField` take the type's own descriptor,
+  // as `reflectTypeKind` does.
+  let typeText = CheckedIntrinsic.isPrimitive(member, IntrinsicPrimitive.ReflectTypeName) ||
+    CheckedIntrinsic.isPrimitive(member, IntrinsicPrimitive.ReflectTypeDoc) ||
+    CheckedIntrinsic.isPrimitive(member, IntrinsicPrimitive.ReflectPrivateField)
   let variantFields = CheckedIntrinsic.isPrimitive(member, IntrinsicPrimitive.ReflectVariantFields)
   if variantLabel || variantFields {descriptor = run CheckedIntrinsic.variantType(&typeArguments[usize.ZERO])}
   if CheckedIntrinsic.isPrimitive(member, IntrinsicPrimitive.ReflectVariants) {descriptor = run CheckedIntrinsic.variantsType(&typeArguments[usize.ZERO])}
@@ -46962,7 +47253,7 @@ effect fn checkReflectionCall<'scope>(
     run List<BodyNodeId>.append(&mut checkedArguments, argumentNode)
     ty = run primitiveType(b"u8")
     if CheckedIntrinsic.isPrimitive(member, IntrinsicPrimitive.ReflectFieldOrdinal) {ty = run primitiveType(b"usize")}
-    if CheckedIntrinsic.isPrimitive(member, IntrinsicPrimitive.ReflectFieldLabel) || variantLabel || nameLabel || variantNameLabel || fieldDoc {
+    if CheckedIntrinsic.isPrimitive(member, IntrinsicPrimitive.ReflectFieldLabel) || variantLabel || nameLabel || variantNameLabel || fieldDoc || typeText {
       ty = run Types.intern(Type.String {lifetime: run Types.internLifetime(Lifetime.Static)})
     }
     if variantFields {ty = run CheckedIntrinsic.fieldsType(&typeArguments[usize.ZERO])}
@@ -47018,6 +47309,276 @@ effect fn extendedPath(path: &List<BodyPlaceStep>, step: BodyPlaceStep) -> List<
   let mut extended = run copySteps(path)
   run List<BodyPlaceStep>.append(&mut extended, move step)
   return move extended
+}
+
+// The values a literal or range pattern can select, by the matched scalar type. An opaque subject,
+// such as a float, has no literal patterns.
+enum PatternDomain { Opaque, Integer, Character, Boolean }
+
+// One inclusive run of scalar values in sign-magnitude form; a `char` is its scalar value and a
+// `bool` is 0 or 1. Zero is never negative.
+struct ValueRun {
+  lowNegative: bool,
+  lowMagnitude: u64,
+  highNegative: bool,
+  highMagnitude: u64,
+}
+
+impl Copy for ValueRun {}
+
+// The value after `negative magnitude`; the caller never asks past the largest `u64`.
+fn nextValue(negative: bool, magnitude: u64) -> ValueRun {
+  if negative && magnitude > 1 { return ValueRun {lowNegative: true, lowMagnitude: magnitude - 1, highNegative: false, highMagnitude: 0} }
+  if negative { return ValueRun {lowNegative: false, lowMagnitude: 0, highNegative: false, highMagnitude: 0} }
+  return ValueRun {lowNegative: false, lowMagnitude: magnitude + 1, highNegative: false, highMagnitude: 0}
+}
+
+// The value before `negative magnitude`; the caller never asks below the smallest `i64`.
+fn previousValue(negative: bool, magnitude: u64) -> ValueRun {
+  if !negative && magnitude > 0 { return ValueRun {lowNegative: false, lowMagnitude: magnitude - 1, highNegative: false, highMagnitude: 0} }
+  return ValueRun {lowNegative: true, lowMagnitude: magnitude + 1, highNegative: false, highMagnitude: 0}
+}
+
+// Whether every value of `selected` is in `covered`, whose runs are sorted, disjoint and never
+// adjacent (`insertRun`), so one run must hold all of `selected`.
+fn runCovered(covered: &[ValueRun], selected: ValueRun) -> bool {
+  let mut at = usize.ZERO
+  while at < covered.length {
+    let candidate = covered[at]
+    if StaticValue.atMost(selected.lowNegative, selected.lowMagnitude, candidate.highNegative, candidate.highMagnitude) {
+      return StaticValue.atMost(candidate.lowNegative, candidate.lowMagnitude, selected.lowNegative, selected.lowMagnitude)
+        && StaticValue.atMost(selected.highNegative, selected.highMagnitude, candidate.highNegative, candidate.highMagnitude)
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// Whether `later` starts no further than the value after `earlier` ends, so the two form one run.
+fn runsTouch(earlier: ValueRun, later: ValueRun) -> bool {
+  if StaticValue.atMost(later.lowNegative, later.lowMagnitude, earlier.highNegative, earlier.highMagnitude) { return true }
+  // Nothing follows the largest `u64`.
+  if !earlier.highNegative && earlier.highMagnitude == u64.MAX { return true }
+  let next = nextValue(earlier.highNegative, earlier.highMagnitude)
+  return StaticValue.atMost(later.lowNegative, later.lowMagnitude, next.lowNegative, next.lowMagnitude)
+}
+
+// Adds `selected` to `covered`, merging every run it overlaps or adjoins, so `covered` stays
+// sorted, disjoint and never adjacent; consecutive literal arms keep it one run long.
+effect fn insertRun(covered: &mut List<ValueRun>, selected: ValueRun) -> () ! OutOfMemoryError ? &mut Allocator {
+  let runs = List<ValueRun>.asSlice(&covered.*)
+  let mut result = List<ValueRun>.make()
+  let mut merged = selected
+  let mut placed = false
+  let mut at = usize.ZERO
+  while at < runs.length {
+    let existing = runs[at]
+    if !placed && !runsTouch(existing, merged)
+      && StaticValue.atMost(existing.highNegative, existing.highMagnitude, merged.lowNegative, merged.lowMagnitude) {
+      run List<ValueRun>.append(&mut result, existing)
+    } else if placed || !runsTouch(merged, existing) {
+      if !placed {
+        run List<ValueRun>.append(&mut result, merged)
+        placed = true
+      }
+      run List<ValueRun>.append(&mut result, existing)
+    } else {
+      if StaticValue.atMost(existing.lowNegative, existing.lowMagnitude, merged.lowNegative, merged.lowMagnitude) {
+        merged.lowNegative = existing.lowNegative
+        merged.lowMagnitude = existing.lowMagnitude
+      }
+      if StaticValue.atMost(merged.highNegative, merged.highMagnitude, existing.highNegative, existing.highMagnitude) {
+        merged.highNegative = existing.highNegative
+        merged.highMagnitude = existing.highMagnitude
+      }
+    }
+    at = at + usize.ONE
+  }
+  if !placed { run List<ValueRun>.append(&mut result, merged) }
+  covered.* = move result
+  return ()
+}
+
+// Whether every value of `selected` that the subject type can hold is in `covered`. A `char`
+// range may span the surrogates, which no `char` holds.
+fn domainRunCovered(covered: &[ValueRun], domain: &[ValueRun], selected: ValueRun) -> bool {
+  let mut at = usize.ZERO
+  while at < domain.length {
+    let held = domain[at]
+    let mut part = selected
+    if StaticValue.atMost(part.lowNegative, part.lowMagnitude, held.lowNegative, held.lowMagnitude) {
+      part.lowNegative = held.lowNegative
+      part.lowMagnitude = held.lowMagnitude
+    }
+    if StaticValue.atMost(held.highNegative, held.highMagnitude, part.highNegative, part.highMagnitude) {
+      part.highNegative = held.highNegative
+      part.highMagnitude = held.highMagnitude
+    }
+    if StaticValue.atMost(part.lowNegative, part.lowMagnitude, part.highNegative, part.highMagnitude) && !runCovered(covered, part) {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// Whether `covered` holds every value of the subject type.
+fn domainCovered(covered: &[ValueRun], domain: &[ValueRun]) -> bool {
+  if domain.length == usize.ZERO { return false }
+  let mut at = usize.ZERO
+  while at < domain.length {
+    if !runCovered(covered, domain[at]) { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn patternDomain(value: &Type) -> PatternDomain {
+  if fixedIntegerType(value) || pointerSizedIntegerType(value) { return PatternDomain.Integer }
+  return match &value.* {
+    Type.Primitive {name} => {
+      if same(Bytes.asSlice(&name), b"char") { return PatternDomain.Character }
+      if same(Bytes.asSlice(&name), b"bool") { return PatternDomain.Boolean }
+      return PatternDomain.Opaque
+    }
+    _ => PatternDomain.Opaque
+  }
+}
+
+// The runs of values the subject type holds; empty for an opaque subject.
+effect fn domainRuns(resolver: &Resolver, subjectType: &Interned<Type>, domain: PatternDomain) -> List<ValueRun>
+! OutOfMemoryError ? &mut Allocator {
+  let mut runs = List<ValueRun>.make()
+  if domain == PatternDomain.Boolean {
+    run List<ValueRun>.append(&mut runs, ValueRun {lowNegative: false, lowMagnitude: 0, highNegative: false, highMagnitude: 1})
+  } else if domain == PatternDomain.Character {
+    run List<ValueRun>.append(&mut runs, ValueRun {lowNegative: false, lowMagnitude: 0, highNegative: false, highMagnitude: 55295})
+    run List<ValueRun>.append(&mut runs, ValueRun {lowNegative: false, lowMagnitude: 57344, highNegative: false, highMagnitude: 1114111})
+  } else if domain == PatternDomain.Integer {
+    let name = Interned<Type>.with<&'static [u8]>(subjectType, fn(resolved: &Type) -> &'static [u8] { return integerTypeName(resolved) })
+    let wide = resolver.target.pointerBits() == 64
+    let low = integerMinimum(name, wide)
+    let high = integerMaximum(name, wide)
+    let negative = low.length > usize.ZERO && low[usize.ZERO] == 45
+    let mut digits = low
+    if negative { digits = Slice.view<u8>(low, usize.ONE, low.length - usize.ONE) }
+    if let Option<u64>.Some {value: lowMagnitude} = decimalU64(digits) {
+      if let Option<u64>.Some {value: highMagnitude} = decimalU64(high) {
+        run List<ValueRun>.append(&mut runs, ValueRun {lowNegative: negative, lowMagnitude: lowMagnitude, highNegative: false, highMagnitude: highMagnitude})
+      }
+    }
+  }
+  return move runs
+}
+
+// A literal or range pattern whose literal kind, such as `character`, cannot hold the subject's
+// type (SEM0256).
+effect fn patternLiteralMismatch(module: &ModuleId, span: Span, literal: &[u8], subjectType: &Interned<Type>) -> Shared<Rejection>
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut diagnostic = run makeRejection(RejectionCode.PatternLiteralMismatch, module, span)
+  run vectorArgument(&mut diagnostic, b"literal", literal)
+  if let Option<Bytes>.Some {value: shown} = move run TypeText.display(subjectType, module) {
+    run vectorArgument(&mut diagnostic, b"type", Bytes.asSlice(&shown))
+  }
+  return run Shared<Rejection>.make(move diagnostic)
+}
+
+// The value one literal of a literal or range pattern selects, checked against the subject.
+effect fn literalPatternValue(resolver: &Resolver, module: &ModuleId, cursor: &AuthoredCursor, value: HirId,
+  domain: PatternDomain, subjectType: &Interned<Type>, span: Span) -> Result<ValueRun, Shared<Rejection>>
+! RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  return match run bodyNode(&resolver.source, cursor, value) {
+    Node.IntegerLiteral {sign, magnitude, ..} => {
+      if domain != PatternDomain.Integer {
+        return Result<ValueRun, Shared<Rejection>>.failResult(run patternLiteralMismatch(module, span, b"integer", subjectType))
+      }
+      let digits = run bodyText(&resolver.source, cursor, magnitude)
+      let fits = Interned<Type>.with<bool>(subjectType, fn(resolved: &Type) -> bool {
+        return match &resolved.* {
+          Type.Primitive {name} => fitsInteger(&resolver.target, Bytes.asSlice(&name), sign, Bytes.asSlice(&digits))
+          _ => false
+        }
+      })
+      if !fits {
+        let name = Interned<Type>.with<&'static [u8]>(subjectType, fn(resolved: &Type) -> &'static [u8] {
+          return integerTypeName(resolved)
+        })
+        return Result<ValueRun, Shared<Rejection>>.failResult(run integerRangeRejection(resolver, module, name, sign, Bytes.asSlice(&digits), span))
+      }
+      let parsed = match move decimalU64(Bytes.asSlice(&digits)) {
+        Option<u64>.Some {value: held} => held
+        Option<u64>.None => { return Result<ValueRun, Shared<Rejection>>.failResult(run reject(resolver, module, RejectionCode.IntegerOutOfRange, span)) }
+      }
+      let negative = sign == Sign.Negative && parsed != 0
+      return Result<ValueRun, Shared<Rejection>>.succeed(ValueRun {lowNegative: negative, lowMagnitude: parsed, highNegative: negative, highMagnitude: parsed})
+    }
+    Node.CharacterLiteral {scalar} => {
+      if domain != PatternDomain.Character {
+        return Result<ValueRun, Shared<Rejection>>.failResult(run patternLiteralMismatch(module, span, b"character", subjectType))
+      }
+      let held = u32.toU64(scalar)
+      return Result<ValueRun, Shared<Rejection>>.succeed(ValueRun {lowNegative: false, lowMagnitude: held, highNegative: false, highMagnitude: held})
+    }
+    Node.BooleanLiteral {value: written} => {
+      if domain != PatternDomain.Boolean {
+        return Result<ValueRun, Shared<Rejection>>.failResult(run patternLiteralMismatch(module, span, b"boolean", subjectType))
+      }
+      let mut held: u64 = 0
+      if written { held = 1 }
+      return Result<ValueRun, Shared<Rejection>>.succeed(ValueRun {lowNegative: false, lowMagnitude: held, highNegative: false, highMagnitude: held})
+    }
+    _ => {
+      // A literal that lexes but does not decode, such as a surrogate `'\u{D800}'` (TEXT-001).
+      if SourceIndex.authoredHasCause(&resolver.source, cursor, value, CauseCode.InvalidStaticLiteral) {
+        return Result<ValueRun, Shared<Rejection>>.failResult(run reject(resolver, module, RejectionCode.InvalidStaticLiteral, span))
+      }
+      return Result<ValueRun, Shared<Rejection>>.failResult(run reject(resolver, module, RejectionCode.Undetermined, span))
+    }
+  }
+}
+
+// The values a range pattern selects: an absent bound is the subject type's extreme, and an
+// exclusive upper bound is replaced by the value before it. An empty range reports SEM0257.
+effect fn rangePatternValues(resolver: &Resolver, module: &ModuleId, cursor: &AuthoredCursor, low: HirRef, high: HirRef,
+  inclusive: bool, domain: PatternDomain, domainValues: &[ValueRun], subjectType: &Interned<Type>, span: Span)
+-> Result<ValueRun, Shared<Rejection>> ! RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  // A bool has two values and no order a range could name.
+  if domain == PatternDomain.Boolean || domain == PatternDomain.Opaque || domainValues.length == usize.ZERO {
+    return Result<ValueRun, Shared<Rejection>>.failResult(run patternLiteralMismatch(module, span, b"range", subjectType))
+  }
+  let first = domainValues[usize.ZERO]
+  let last = domainValues[domainValues.length - usize.ONE]
+  let mut selected = ValueRun {lowNegative: first.lowNegative, lowMagnitude: first.lowMagnitude,
+    highNegative: last.highNegative, highMagnitude: last.highMagnitude}
+  if low.present {
+    let bound = match move run literalPatternValue(resolver, module, cursor, low.id, domain, subjectType, span) {
+      Result<ValueRun, Shared<Rejection>>.Success {value} => value
+      Result<ValueRun, Shared<Rejection>>.Failure {error} => { return Result<ValueRun, Shared<Rejection>>.failResult(move error) }
+    }
+    selected.lowNegative = bound.lowNegative
+    selected.lowMagnitude = bound.lowMagnitude
+  }
+  if high.present {
+    let bound = match move run literalPatternValue(resolver, module, cursor, high.id, domain, subjectType, span) {
+      Result<ValueRun, Shared<Rejection>>.Success {value} => value
+      Result<ValueRun, Shared<Rejection>>.Failure {error} => { return Result<ValueRun, Shared<Rejection>>.failResult(move error) }
+    }
+    if !inclusive {
+      if StaticValue.atMost(bound.highNegative, bound.highMagnitude, selected.lowNegative, selected.lowMagnitude) {
+        return Result<ValueRun, Shared<Rejection>>.failResult(run reject(resolver, module, RejectionCode.EmptyRangePattern, span))
+      }
+      let before = previousValue(bound.highNegative, bound.highMagnitude)
+      selected.highNegative = before.lowNegative
+      selected.highMagnitude = before.lowMagnitude
+    } else {
+      selected.highNegative = bound.highNegative
+      selected.highMagnitude = bound.highMagnitude
+    }
+  }
+  if !StaticValue.atMost(selected.lowNegative, selected.lowMagnitude, selected.highNegative, selected.highMagnitude) {
+    return Result<ValueRun, Shared<Rejection>>.failResult(run reject(resolver, module, RejectionCode.EmptyRangePattern, span))
+  }
+  return Result<ValueRun, Shared<Rejection>>.succeed(selected)
 }
 
 // Coverage mirrors the bootstrap row model: the uncovered values are rows, each a top-level member
@@ -47138,6 +47699,59 @@ effect fn subtractRow(row: &CoverageRow, tests: &List<BodyPatternTest>, residual
     matched = run constrainedRow(&matched, test, move only)
     at = at + usize.ONE
   }
+}
+
+effect fn copiedRows(rows: &List<CoverageRow>) -> List<CoverageRow> ! OutOfMemoryError ? &mut Allocator {
+  let mut copied = List<CoverageRow>.make()
+  let listed = List<CoverageRow>.asSlice(rows)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    run List<CoverageRow>.append(&mut copied, run copiedRow(&listed[at]))
+    at = at + usize.ONE
+  }
+  return move copied
+}
+
+effect fn copiedRuns(runs: &[ValueRun]) -> List<ValueRun> ! OutOfMemoryError ? &mut Allocator {
+  let mut copied = List<ValueRun>.make()
+  let mut at = usize.ZERO
+  while at < runs.length {
+    run List<ValueRun>.append(&mut copied, runs[at])
+    at = at + usize.ONE
+  }
+  return move copied
+}
+
+// Removes what one checked alternative selects from the uncovered values: its literal or range
+// values, every value for a universal pattern, or its member's rows less its nested tests.
+// Selecting every value of a scalar subject leaves nothing for a later arm, as `_` would.
+effect fn coverAlternative(rows: &mut List<CoverageRow>, covered: &mut List<ValueRun>, universal: &mut bool, domainValues: &[ValueRun],
+  ordinal: usize, values: Option<ValueRun>, tests: &List<BodyPatternTest>) ! OutOfMemoryError ? &mut Allocator {
+  if let Option<ValueRun>.Some {value: selected} = values {
+    run insertRun(&mut covered.*, selected)
+    if domainCovered(List<ValueRun>.asSlice(&covered.*), domainValues) {
+      universal.* = true
+      rows.* = List<CoverageRow>.make()
+    }
+    return
+  }
+  if ordinal == usize.MAX {
+    universal.* = true
+    rows.* = List<CoverageRow>.make()
+    return
+  }
+  let mut remaining = List<CoverageRow>.make()
+  let uncovered = List<CoverageRow>.asSlice(&rows.*)
+  let mut scan = usize.ZERO
+  while scan < uncovered.length {
+    if uncovered[scan].member == ordinal {
+      run subtractRow(&uncovered[scan], tests, &mut remaining)
+    } else {
+      run List<CoverageRow>.append(&mut remaining, run copiedRow(&uncovered[scan]))
+    }
+    scan = scan + usize.ONE
+  }
+  rows.* = move remaining
 }
 
 effect fn copiedRow(row: &CoverageRow) -> CoverageRow ! OutOfMemoryError ? &mut Allocator {
@@ -47746,11 +48360,11 @@ effect fn rejectPatternMember(resolver: &Resolver, module: &ModuleId, member: &P
 }
 
 // What one arm's pattern selects: its checked pattern, the member it covers (`usize.MAX` for a
-// universal arm), and the integer value an integer pattern selects.
+// universal arm), and the values a literal or range pattern selects.
 struct ArmPattern {
   pattern: BodyPattern,
   ordinal: usize,
-  integerCase: Option<Bytes>,
+  values: Option<ValueRun>,
 }
 
 effect fn armPatternRejection(resolver: &Resolver, module: &ModuleId, code: RejectionCode, span: Span)
@@ -47782,7 +48396,7 @@ effect fn checkArmPattern(
   module: &ModuleId, cursor: &AuthoredCursor, caller: &DeclarationId, constraints: &[Constraint],
   annotations: &[ResolvedAnnotation], elided: &DeclarationId, nodes: &mut List<BodyNode>,
   subjectNode: BodyNodeId, subjectType: &Interned<Type>, access: MatchAccess, members: &[Interned<Type>],
-  rows: &List<CoverageRow>, integerCases: &[Bytes], integerSubject: bool, isNominal: bool, isUnion: bool,
+  rows: &List<CoverageRow>, covered: &[ValueRun], domain: PatternDomain, domainValues: &[ValueRun], isNominal: bool, isUnion: bool,
   open: bool, universal: bool, fallback: bool, writtenPattern: Node, pattern: HirId, patternSpan: Span, unreachableSpan: Span,
   armTests: &mut List<BodyPatternTest>,
 ) -> Result<ArmPattern, Shared<Rejection>>
@@ -47792,47 +48406,36 @@ effect fn checkArmPattern(
   }
   let mut checkedPattern = BodyPattern.Universal
   let mut ordinal = usize.MAX
-  let mut integerCase = Option<Bytes>.none()
+  let mut values = Option<ValueRun>.none()
   match writtenPattern {
-    // An integer literal selects one value of an integer scrutinee at the scrutinee's type.
-    Node.IntegerPattern {value} => {
-      // A bool scrutinee has no integer values, so the arm can never select one (SEM0043).
-      if !integerSubject { return run armPatternRejection(&resolver.*, module, RejectionCode.UnreachableMatchArm, unreachableSpan) }
-      if let Node.IntegerLiteral {sign, magnitude, ..} = run bodyNode(&resolver.source, cursor, value) {
-        let digits = run bodyText(&resolver.source, cursor, magnitude)
-        let fits = Interned<Type>.with<bool>(subjectType, fn(resolved: &Type) -> bool {
-          return match &resolved.* {
-            Type.Primitive {name} => fitsInteger(&resolver.target, Bytes.asSlice(&name), sign, Bytes.asSlice(&digits))
-            _ => false
-          }
-        })
-        if !fits {
-          let name = Interned<Type>.with<&'static [u8]>(subjectType, fn(resolved: &Type) -> &'static [u8] {
-            return integerTypeName(resolved)
-          })
-          return Result<ArmPattern, Shared<Rejection>>.failResult(
-            run integerRangeRejection(&resolver.*, module, name, sign, Bytes.asSlice(&digits), patternSpan))
-        }
-        let negative = sign == Sign.Negative && !zeroDigits(Bytes.asSlice(&digits))
-        let mut key = Bytes.make()
-        if negative { run Bytes.append(&mut key, b"-") }
-        run Bytes.append(&mut key, Bytes.asSlice(&digits))
-        let seen = integerCases
-        let mut scan = usize.ZERO
-        while scan < seen.length {
-          if same(Bytes.asSlice(&seen[scan]), Bytes.asSlice(&key)) { return run armPatternRejection(&resolver.*, module, RejectionCode.UnreachableMatchArm, unreachableSpan) }
-          scan = scan + usize.ONE
-        }
-        let magnitude = match move decimalU64(Bytes.asSlice(&digits)) {
-          Option<u64>.Some {value: parsed} => parsed
-          Option<u64>.None => { return run armPatternRejection(&resolver.*, module, RejectionCode.IntegerOutOfRange, patternSpan) }
-        }
-        integerCase = Option<Bytes>.some(move key)
-        checkedPattern = BodyPattern.Integer {magnitude: magnitude, negative: negative}
+    // A literal selects one value of an integer, `char` or `bool` scrutinee at the scrutinee's type.
+    Node.LiteralPattern {value} => {
+      let selected = match move run literalPatternValue(&resolver.*, module, cursor, value, domain, subjectType, patternSpan) {
+        Result<ValueRun, Shared<Rejection>>.Success {value: found} => found
+        Result<ValueRun, Shared<Rejection>>.Failure {error} => { return Result<ArmPattern, Shared<Rejection>>.failResult(move error) }
+      }
+      if domainRunCovered(covered, domainValues, selected) { return run armPatternRejection(&resolver.*, module, RejectionCode.UnreachableMatchArm, unreachableSpan) }
+      values = Option<ValueRun>.some(selected)
+      if domain == PatternDomain.Boolean {
+        checkedPattern = BodyPattern.Boolean {value: selected.lowMagnitude == 1}
       } else {
-        return run armPatternRejection(&resolver.*, module, RejectionCode.Undetermined, patternSpan)
+        checkedPattern = BodyPattern.Integer {magnitude: selected.lowMagnitude, negative: selected.lowNegative}
       }
     }
+    // A range selects the integer or `char` values between its bounds (PATT-024).
+    Node.RangePattern {low, high, inclusive} => {
+      let selected = match move run rangePatternValues(&resolver.*, module, cursor, low, high, inclusive, domain, domainValues,
+        subjectType, patternSpan) {
+        Result<ValueRun, Shared<Rejection>>.Success {value: found} => found
+        Result<ValueRun, Shared<Rejection>>.Failure {error} => { return Result<ArmPattern, Shared<Rejection>>.failResult(move error) }
+      }
+      if domainRunCovered(covered, domainValues, selected) { return run armPatternRejection(&resolver.*, module, RejectionCode.UnreachableMatchArm, unreachableSpan) }
+      values = Option<ValueRun>.some(selected)
+      checkedPattern = BodyPattern.Range {lowMagnitude: selected.lowMagnitude, lowNegative: selected.lowNegative,
+        highMagnitude: selected.highMagnitude, highNegative: selected.highNegative}
+    }
+    // Alternatives reach here only inside another alternative's place; the arm splits its own.
+    Node.AlternativePattern {..} => { return run armPatternRejection(&resolver.*, module, RejectionCode.NestedAlternativePattern, patternSpan) }
     Node.UniversalPattern {name} => {
       if name.present { return run armPatternRejection(&resolver.*, module, RejectionCode.Undetermined, patternSpan) }
     }
@@ -47862,7 +48465,7 @@ effect fn checkArmPattern(
               declared: Interned<Type>.clone(subjectType)}},
         })
         return Result<ArmPattern, Shared<Rejection>>.succeed(ArmPattern {pattern: BodyPattern.Universal, ordinal: usize.MAX,
-          integerCase: Option<Bytes>.none()})
+          values: Option<ValueRun>.none()})
       }
       let chosen = run patternMember(&writtenType, members, elided)
       let mut tag = usize.ZERO
@@ -48055,7 +48658,7 @@ effect fn checkArmPattern(
     }
     if !reachable { return run armPatternRejection(&resolver.*, module, RejectionCode.UnreachableMatchArm, unreachableSpan) }
   }
-  return Result<ArmPattern, Shared<Rejection>>.succeed(ArmPattern {pattern: move checkedPattern, ordinal: ordinal, integerCase: move integerCase})
+  return Result<ArmPattern, Shared<Rejection>>.succeed(ArmPattern {pattern: move checkedPattern, ordinal: ordinal, values: values})
 }
 
 // A selected variant must belong to the matched subject's own union.
@@ -48461,6 +49064,10 @@ effect fn checkRecordPatternFields(
             constraints, annotations, elided, &mut nodes.*, subject, &nestedOrigin, nestedFields, &fieldPath, access, &mut tests.*, subpatternSpan)
           if let Option<Shared<Rejection>>.Some {value} = move failed { return Option<Shared<Rejection>>.some(move value) }
         }
+        // Only a whole pattern lists alternatives (PATT-023).
+        Node.AlternativePattern {..} => {
+          return Option<Shared<Rejection>>.some(run reject(&resolver.*, module, RejectionCode.NestedAlternativePattern, subpatternSpan))
+        }
         _ => { return Option<Shared<Rejection>>.some(run reject(&resolver.*, module, RejectionCode.Undetermined, subpatternSpan)) }
       }
     }
@@ -48540,7 +49147,7 @@ effect fn checkVariantConstruct<'scope>(
   dependencies: &mut List<Dependency>, module: &ModuleId, cursor: &AuthoredCursor,
   caller: &DeclarationId, statementScope: &mut StatementScope<'scope>, calls: &[ResolvedCall], nodes: &mut List<BodyNode>,
   signatures: &mut List<SignatureDependency>, requiredBodies: &mut List<DeclarationId>,
-  expression: HirId, chosen: Result<SelectedVariant, Shared<Rejection>>, fields: Range,
+  expression: HirId, chosen: Result<SelectedVariant, Shared<Rejection>>, fields: Range, omittedOrigin: Option<HirId>,
   expected: &Option<Interned<Type>>, mismatchCode: RejectionCode, constraints: &[Constraint], contractBody: bool, staticBody: bool, unsafeAllowed: bool, span: Span,
 ) -> Result<BodyNodeId, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
@@ -48630,9 +49237,35 @@ effect fn checkVariantConstruct<'scope>(
     run List<BodyAggregateField>.append(&mut operands, BodyAggregateField {index: index, value: operand})
     at = at + usize.ONE
   }
+  // A field the literal leaves out holds `Omittable.omitted()` when its type implements it; any
+  // other left-out field is missing. A variant written without braces leaves out nothing.
+  let mut omitted = List<usize>.make()
+  let mut origin = HirId {index: usize.ZERO}
+  let mut omits = false
+  if let Option<HirId>.Some {value} = omittedOrigin {
+    origin = value
+    omits = true
+  }
   if List<BodyAggregateField>.length(&operands) != names.length {
-    return Result<BodyNodeId, Shared<Rejection>>.failResult(run missingFieldsRejection(module, span, names,
-      List<BodyAggregateField>.asSlice(&operands)))
+    let mut covered = run copyAggregateFields(List<BodyAggregateField>.asSlice(&operands))
+    let mut index = usize.ZERO
+    while index < names.length && omits {
+      if !aggregateFieldPresent(List<BodyAggregateField>.asSlice(&operands), index) {
+        let omittable = match move run omittableField(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, &types[index], constraints, span) {
+          Result<bool, Shared<Rejection>>.Success {value} => value
+          Result<bool, Shared<Rejection>>.Failure {error} => { return Result<BodyNodeId, Shared<Rejection>>.failResult(move error) }
+        }
+        if omittable {
+          run List<usize>.append(&mut omitted, index)
+          run List<BodyAggregateField>.append(&mut covered, BodyAggregateField {index: index, value: BodyNodeId {index: usize.ZERO}})
+        }
+      }
+      index = index + usize.ONE
+    }
+    if List<BodyAggregateField>.length(&covered) != names.length {
+      return Result<BodyNodeId, Shared<Rejection>>.failResult(run missingFieldsRejection(module, span, names,
+        List<BodyAggregateField>.asSlice(&covered)))
+    }
   }
   let completed = match move run completeAggregateInference(
     &mut resolver.*, &mut owner.*, &mut dependencies.*, module, &variant.ty, &variant.inference,
@@ -48642,6 +49275,30 @@ effect fn checkVariantConstruct<'scope>(
     Result<Interned<Type>, Shared<Rejection>>.Success {value} => move value
     Result<Interned<Type>, Shared<Rejection>>.Failure {error} => {
       return Result<BodyNodeId, Shared<Rejection>>.failResult(move error)
+    }
+  }
+  // The left-out fields take the completed application, after the written fields in source order.
+  let left = List<usize>.asSlice(&omitted)
+  if left.length > usize.ZERO {
+    let mut applied = List<Binding>.make()
+    if let Option<InferredAggregateTarget>.Some {value: target} = &variant.inference {
+      let mut variables = List<Interned<DeclarationId>>.make()
+      run List<Interned<DeclarationId>>.append(&mut variables, Interned<DeclarationId>.clone(&target.owner))
+      let unified = run Type.unify(&variant.ty, &completed, List<Interned<DeclarationId>>.asSlice(&variables),
+        Comparison.Exact, &mut applied)
+      drop unified
+    }
+    let mut omittedAt = usize.ZERO
+    while omittedAt < left.length {
+      let field = run Type.applyBindings(&types[left[omittedAt]], List<Binding>.asSlice(&applied), true)
+      let value = match move run omittedFieldValue(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*,
+        module, cursor, caller, &mut nodes.*, &mut signatures.*, &mut requiredBodies.*, &field, origin,
+        constraints, unsafeAllowed, span) {
+        Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
+        Result<BodyNodeId, Shared<Rejection>>.Failure {error} => { return Result<BodyNodeId, Shared<Rejection>>.failResult(move error) }
+      }
+      run List<BodyAggregateField>.append(&mut operands, BodyAggregateField {index: left[omittedAt], value: value})
+      omittedAt = omittedAt + usize.ONE
     }
   }
   let index = List<BodyNode>.length(&nodes.*)
@@ -49487,11 +50144,11 @@ effect fn checkRecordMatch<'scope>(
     Option<Interned<Type>>.None => Option<Interned<Type>>.none()
   }
   let mut join = emptyArmJoin()
-  // Integer values an unguarded earlier arm already selected; a repeat is a duplicate pattern.
-  let mut integerCases = List<Bytes>.make()
-  let integerSubject = Interned<Type>.with<bool>(subjectType, fn(value: &Type) -> bool {
-    return fixedIntegerType(value) || pointerSizedIntegerType(value)
-  })
+  // The literal and range values unguarded earlier arms already selected, and every value the
+  // subject type holds: once they are all selected the match needs no `_` (PATT-025).
+  let mut covered = List<ValueRun>.make()
+  let literalDomain = Interned<Type>.with<PatternDomain>(subjectType, patternDomain)
+  let domainValues = run domainRuns(&resolver.*, subjectType, literalDomain)
   let mut checkedArms = List<BodyMatchArm>.make()
   let mut failedArms = List<Shared<Rejection>>.make()
   let armCount = matchArmCount(arms)
@@ -49536,24 +50193,81 @@ effect fn checkRecordMatch<'scope>(
     }
     let mut writtenPattern = Node.UniversalPattern {name: HirRef.absent()}
     if !fallback { writtenPattern = run bodyNode(&resolver.source, cursor, pattern) }
-    let mut armTests = List<BodyPatternTest>.make()
+    // `A | B` checks each alternative in order against what earlier arms and alternatives leave
+    // (PATT-023); any other pattern is its own single alternative.
+    let mut written = List<HirId>.make()
+    let mut alternativeForm = false
+    if let Node.AlternativePattern {alternatives} = &writtenPattern {
+      alternativeForm = true
+      let mut child = usize.ZERO
+      while child < alternatives.length {
+        run List<HirId>.append(&mut written, run bodyChild(&resolver.source, cursor, alternatives, child))
+        child = child + usize.ONE
+      }
+    } else {
+      run List<HirId>.append(&mut written, pattern)
+    }
+    let mut armRows = run copiedRows(&rows)
+    let mut armCovered = run copiedRuns(List<ValueRun>.asSlice(&covered))
+    let mut armUniversal = universal
+    let mut checkedAlternatives = List<BodyAlternative>.make()
+    let mut armFailure = Option<Shared<Rejection>>.none()
     // Pattern checking appends exactly the nodes that declare this arm's bindings.
     let bindingsFrom = List<BodyNode>.length(&nodes.*)
-    let checkedArm = run checkArmPattern(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, caller,
-      constraints, statementScope.annotations, &elided, &mut nodes.*, subjectNode, subjectType, access,
-      List<Interned<Type>>.asSlice(&members), &rows, List<Bytes>.asSlice(&integerCases), integerSubject, isNominal,
-      isUnion, open, universal, fallback, writtenPattern, pattern, patternSpan, unreachableSpan, &mut armTests)
+    let writtenIds = List<HirId>.asSlice(&written)
+    let mut alternative = usize.ZERO
+    while alternative < writtenIds.length {
+      let alternativeId = writtenIds[alternative]
+      let mut alternativePattern = Node.UniversalPattern {name: HirRef.absent()}
+      if !fallback { alternativePattern = run bodyNode(&resolver.source, cursor, alternativeId) }
+      let mut alternativeSpan = patternSpan
+      let mut alternativeUnreachable = unreachableSpan
+      if alternativeForm {
+        alternativeSpan = run bodySpan(&resolver.source, cursor, alternativeId)
+        alternativeUnreachable = alternativeSpan
+      }
+      let mut alternativeTests = List<BodyPatternTest>.make()
+      let declaredBefore = List<BodyNode>.length(&nodes.*)
+      let checkedAlternative = run checkArmPattern(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, caller,
+        constraints, statementScope.annotations, &elided, &mut nodes.*, subjectNode, subjectType, access,
+        List<Interned<Type>>.asSlice(&members), &armRows, List<ValueRun>.asSlice(&armCovered), literalDomain, List<ValueRun>.asSlice(&domainValues),
+        isNominal, isUnion, open, armUniversal, fallback, alternativePattern, alternativeId, alternativeSpan, alternativeUnreachable,
+        &mut alternativeTests)
+      let selection = match move checkedAlternative {
+        Result<ArmPattern, Shared<Rejection>>.Success {value} => move value
+        Result<ArmPattern, Shared<Rejection>>.Failure {error} => {
+          armFailure = Option<Shared<Rejection>>.some(move error)
+          break
+        }
+      }
+      // An alternative's guard and result cannot tell which alternative matched, so none binds.
+      if alternativeForm && List<BodyNode>.length(&nodes.*) != declaredBefore {
+        armFailure = Option<Shared<Rejection>>.some(run reject(&resolver.*, module, RejectionCode.AlternativePatternBinding, alternativeSpan))
+        break
+      }
+      let ArmPattern {pattern: checkedPattern, ordinal, values} = move selection
+      run coverAlternative(&mut armRows, &mut armCovered, &mut armUniversal, List<ValueRun>.asSlice(&domainValues), ordinal, values,
+        &alternativeTests)
+      run List<BodyAlternative>.append(&mut checkedAlternatives, BodyAlternative {pattern: move checkedPattern, tests: move alternativeTests})
+      alternative = alternative + usize.ONE
+    }
     // An arm whose pattern fails covers nothing and joins no result; the arms after it are still
     // checked, and the match fails once they are (MATCH-001).
-    let selection = match move checkedArm {
-      Result<ArmPattern, Shared<Rejection>>.Success {value} => move value
-      Result<ArmPattern, Shared<Rejection>>.Failure {error} => {
-        run List<Shared<Rejection>>.append(&mut failedArms, move error)
-        at = at + usize.ONE
-        continue
-      }
+    if let Option<Shared<Rejection>>.Some {value: failed} = move armFailure {
+      run List<Shared<Rejection>>.append(&mut failedArms, move failed)
+      at = at + usize.ONE
+      continue
     }
-    let ArmPattern {pattern: checkedPattern, ordinal, integerCase} = move selection
+    let mut checkedPattern = BodyPattern.Universal
+    let mut armTests = List<BodyPatternTest>.make()
+    if alternativeForm {
+      checkedPattern = BodyPattern.Alternatives {alternatives: move checkedAlternatives}
+    } else {
+      let only = List<BodyAlternative>.remove(&mut checkedAlternatives, usize.ZERO)
+      let BodyAlternative {pattern: selectedPattern, tests: selectedTests} = move only
+      checkedPattern = move selectedPattern
+      armTests = move selectedTests
+    }
     let armBindings = run declaredBindings(List<BodyNode>.asSlice(&nodes.*), bindingsFrom, subjectNode)
     let mut checkedGuard = Option<BodyNodeId>.none()
     if guard.present {
@@ -49578,26 +50292,11 @@ effect fn checkRecordMatch<'scope>(
         return run guardTypeRejection(&resolver.*, module, run bodySpan(&resolver.source, cursor, guard.id), &guardType)
       }
       checkedGuard = Option<BodyNodeId>.some(guardNode)
-    } else if let Option<Bytes>.Some {value: selectedCase} = move integerCase {
-      run List<Bytes>.append(&mut integerCases, move selectedCase)
     } else {
-      if ordinal == usize.MAX {
-        universal = true
-        rows = List<CoverageRow>.make()
-      } else {
-        let mut remaining = List<CoverageRow>.make()
-        let uncovered = List<CoverageRow>.asSlice(&rows)
-        let mut scan = usize.ZERO
-        while scan < uncovered.length {
-          if uncovered[scan].member == ordinal {
-            run subtractRow(&uncovered[scan], &armTests, &mut remaining)
-          } else {
-            run List<CoverageRow>.append(&mut remaining, run copiedRow(&uncovered[scan]))
-          }
-          scan = scan + usize.ONE
-        }
-        rows = move remaining
-      }
+      // Only an unguarded arm covers what its alternatives select.
+      rows = move armRows
+      covered = move armCovered
+      universal = armUniversal
     }
     let yields = yieldsArms(&statementScope.*, expression)
     let checkedResult = run checkArmResult(&mut resolver.*, &mut owner.*, &mut request.*,
@@ -50476,7 +51175,7 @@ effect fn checkRecordFields<'scope>(
   caller: &DeclarationId, statementScope: &mut StatementScope<'scope>, calls: &[ResolvedCall], nodes: &mut List<BodyNode>,
   signatures: &mut List<SignatureDependency>, requiredBodies: &mut List<DeclarationId>,
   recordType: &Interned<Type>, inference: &Option<InferredAggregateTarget>, fields: Range, expression: HirId,
-  constraints: &[Constraint], contractBody: bool, staticBody: bool,
+  omittedOrigin: HirId, constraints: &[Constraint], contractBody: bool, staticBody: bool,
   unsafeAllowed: bool, span: Span,
 ) -> Result<CheckedRecordFields, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
@@ -50578,10 +51277,36 @@ effect fn checkRecordFields<'scope>(
       BodyAggregateField {index: member.index, value: operand})
     at = at + usize.ONE
   }
+  // A field the literal leaves out holds `Omittable.omitted()` when its type implements it; any
+  // other left-out field is missing.
+  let mut names = List<Bytes>.make()
+  let mut omitted = List<usize>.make()
   if count != List<BodyAggregateField>.length(&operands) {
-    let names = run recordFieldNames(&mut resolver.*, &shape)
-    return Result<CheckedRecordFields, Shared<Rejection>>.failResult(run missingFieldsRejection(module, span,
-      List<Bytes>.asSlice(&names), List<BodyAggregateField>.asSlice(&operands)))
+    names = run recordFieldNames(&mut resolver.*, &shape)
+    let mut covered = run copyAggregateFields(List<BodyAggregateField>.asSlice(&operands))
+    let written = List<Bytes>.asSlice(&names)
+    let mut index = usize.ZERO
+    while index < written.length {
+      if !aggregateFieldPresent(List<BodyAggregateField>.asSlice(&operands), index) {
+        let declared = run checkedRecordMember(&mut resolver.*, &mut owner.*, &mut dependencies.*,
+          module, &shape, Bytes.asSlice(&written[index]), span, FieldLookupPurpose.NamedFields)
+        if let Result<CheckedRecordMember, Shared<Rejection>>.Success {value: member} = move declared {
+          let omittable = match move run omittableField(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, &member.ty, constraints, span) {
+            Result<bool, Shared<Rejection>>.Success {value} => value
+            Result<bool, Shared<Rejection>>.Failure {error} => { return Result<CheckedRecordFields, Shared<Rejection>>.failResult(move error) }
+          }
+          if omittable {
+            run List<usize>.append(&mut omitted, index)
+            run List<BodyAggregateField>.append(&mut covered, BodyAggregateField {index: index, value: BodyNodeId {index: usize.ZERO}})
+          }
+        }
+      }
+      index = index + usize.ONE
+    }
+    if count != List<BodyAggregateField>.length(&covered) {
+      return Result<CheckedRecordFields, Shared<Rejection>>.failResult(run missingFieldsRejection(module, span,
+        written, List<BodyAggregateField>.asSlice(&covered)))
+    }
   }
   let completed = match move run completeAggregateInference(
     &mut resolver.*, &mut owner.*, &mut dependencies.*, module, recordType, inference,
@@ -50592,6 +51317,27 @@ effect fn checkRecordFields<'scope>(
     Result<Interned<Type>, Shared<Rejection>>.Failure {error} => {
       return Result<CheckedRecordFields, Shared<Rejection>>.failResult(move error)
     }
+  }
+  // The left-out fields take the completed application, after the written fields in source order.
+  let mut applied = Interned<Type>.clone(&shape)
+  if let Option<InferredAggregateTarget>.Some {..} = &inference.* { applied = Interned<Type>.clone(&completed) }
+  let left = List<usize>.asSlice(&omitted)
+  let mut omittedAt = usize.ZERO
+  while omittedAt < left.length {
+    let declared = run checkedRecordMember(&mut resolver.*, &mut owner.*, &mut dependencies.*,
+      module, &applied, Bytes.asSlice(&List<Bytes>.asSlice(&names)[left[omittedAt]]), span, FieldLookupPurpose.NamedFields)
+    let member = match move declared {
+      Result<CheckedRecordMember, Shared<Rejection>>.Success {value} => move value
+      Result<CheckedRecordMember, Shared<Rejection>>.Failure {error} => { return Result<CheckedRecordFields, Shared<Rejection>>.failResult(move error) }
+    }
+    let value = match move run omittedFieldValue(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*,
+      module, cursor, caller, &mut nodes.*, &mut signatures.*, &mut requiredBodies.*, &member.ty, omittedOrigin,
+      constraints, unsafeAllowed, span) {
+      Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
+      Result<BodyNodeId, Shared<Rejection>>.Failure {error} => { return Result<CheckedRecordFields, Shared<Rejection>>.failResult(move error) }
+    }
+    run List<BodyAggregateField>.append(&mut operands, BodyAggregateField {index: member.index, value: value})
+    omittedAt = omittedAt + usize.ONE
   }
   return Result<CheckedRecordFields, Shared<Rejection>>.succeed(
     CheckedRecordFields {ty: move completed, fields: move operands},
@@ -53255,7 +54001,7 @@ effect fn checkFieldAccess<'scope>(
       return run checkVariantConstruct(
         &mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*, module, cursor,
         caller, &mut statementScope.*, calls, &mut nodes.*, &mut signatures.*, &mut requiredBodies.*,
-        expression, Result<SelectedVariant, Shared<Rejection>>.succeed(move variant), Range.empty(),
+        expression, Result<SelectedVariant, Shared<Rejection>>.succeed(move variant), Range.empty(), Option<HirId>.none(),
         expected, mismatchCode, constraints, contractBody, false, unsafeAllowed, span,
       )
     }
@@ -53528,12 +54274,24 @@ effect fn checkScalarEnumPattern(
           Bytes.asSlice(&pair.namespace), Bytes.asSlice(&pair.member)),
       )
     }
-    Node.IntegerPattern {value} => {
+    Node.RangePattern {..} => Result<CheckedScalarPattern, Shared<Rejection>>.failResult(
+      run patternLiteralMismatch(module, patternSpan, b"range", subjectType),
+    )
+    Node.LiteralPattern {value} => {
       let mut written = Bytes.make()
-      if let Node.IntegerLiteral {sign, magnitude, ..} = run bodyNode(&resolver.source, cursor, value) {
-        if sign == Sign.Negative { run Bytes.append(&mut written, b"-") }
-        let digits = run bodyText(&resolver.source, cursor, magnitude)
-        run Bytes.append(&mut written, Bytes.asSlice(&digits))
+      match run bodyNode(&resolver.source, cursor, value) {
+        Node.IntegerLiteral {sign, magnitude, ..} => {
+          if sign == Sign.Negative { run Bytes.append(&mut written, b"-") }
+          let digits = run bodyText(&resolver.source, cursor, magnitude)
+          run Bytes.append(&mut written, Bytes.asSlice(&digits))
+        }
+        Node.CharacterLiteral {..} => {
+          return Result<CheckedScalarPattern, Shared<Rejection>>.failResult(run patternLiteralMismatch(module, patternSpan, b"character", subjectType))
+        }
+        Node.BooleanLiteral {..} => {
+          return Result<CheckedScalarPattern, Shared<Rejection>>.failResult(run patternLiteralMismatch(module, patternSpan, b"boolean", subjectType))
+        }
+        _ => {}
       }
       return Result<CheckedScalarPattern, Shared<Rejection>>.failResult(
         run enumPatternRejection(&resolver.*, module, RejectionCode.IntegerPatternOnEnum, patternSpan, subjectType,
@@ -56878,7 +57636,7 @@ effect fn checkSourceRecordExpression<'scope>(
   if let Option<InferredAggregateTarget>.Some {value} = &inference { recordType = Interned<Type>.clone(&value.ty) }
   let checkedFields = run checkRecordFields(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*,
     module, cursor, caller, &mut statementScope.*, calls, &mut nodes.*, &mut signatures.*, &mut requiredBodies.*,
-    &recordType, &inference, fields, expression, constraints, contractBody, staticBody, unsafeAllowed, span)
+    &recordType, &inference, fields, expression, expression, constraints, contractBody, staticBody, unsafeAllowed, span)
   let completed = match move checkedFields {
     Result<CheckedRecordFields, Shared<Rejection>>.Success {value} => move value
     Result<CheckedRecordFields, Shared<Rejection>>.Failure {error} => {
@@ -56999,10 +57757,14 @@ effect fn checkSourceMemberExpression<'scope>(
     }
   }
   let mut writtenFields = Range.empty()
-  if fields.present { writtenFields = fields.range }
+  let mut omittedOrigin = Option<HirId>.none()
+  if fields.present {
+    writtenFields = fields.range
+    omittedOrigin = Option<HirId>.some(expression)
+  }
   return run checkVariantConstruct(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*,
     module, cursor, caller, &mut statementScope.*, calls, &mut nodes.*, &mut signatures.*, &mut requiredBodies.*,
-    expression, move chosen, writtenFields, expected, mismatchCode, constraints, contractBody, staticBody, unsafeAllowed, span)
+    expression, move chosen, writtenFields, omittedOrigin, expected, mismatchCode, constraints, contractBody, staticBody, unsafeAllowed, span)
 
 }
 
@@ -57067,7 +57829,7 @@ effect fn checkSourceVariantSelect<'scope>(
   variantChoice.ty = move written
   return run checkVariantConstruct(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*,
     module, cursor, caller, &mut statementScope.*, calls, &mut nodes.*, &mut signatures.*, &mut requiredBodies.*,
-    expression, Result<SelectedVariant, Shared<Rejection>>.succeed(move variantChoice), fields, expected, mismatchCode,
+    expression, Result<SelectedVariant, Shared<Rejection>>.succeed(move variantChoice), fields, Option<HirId>.some(expression), expected, mismatchCode,
     constraints, contractBody, staticBody, unsafeAllowed, span)
 }
 
@@ -57111,7 +57873,7 @@ effect fn checkSourceStructExpression<
     if let Option<Result<SelectedVariant, Shared<Rejection>>>.Some {value: chosen} = move selection {
       return run checkVariantConstruct(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*,
         module, cursor, caller, &mut statementScope.*, calls, &mut nodes.*, &mut signatures.*, &mut requiredBodies.*,
-        expression, move chosen, fields, expected, mismatchCode, constraints, contractBody, staticBody, unsafeAllowed, span)
+        expression, move chosen, fields, Option<HirId>.some(annotation), expected, mismatchCode, constraints, contractBody, staticBody, unsafeAllowed, span)
     }
   }
   let inferredTarget = run inferredRecordAnnotation(
@@ -57143,7 +57905,7 @@ effect fn checkSourceStructExpression<
   }
   let checkedFields = run checkRecordFields(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*,
     module, cursor, caller, &mut statementScope.*, calls, &mut nodes.*, &mut signatures.*, &mut requiredBodies.*,
-    &recordType, &inference, fields, expression, constraints, contractBody, staticBody, unsafeAllowed, span)
+    &recordType, &inference, fields, expression, annotation, constraints, contractBody, staticBody, unsafeAllowed, span)
   let completed = match move checkedFields {
     Result<CheckedRecordFields, Shared<Rejection>>.Success {value} => move value
     Result<CheckedRecordFields, Shared<Rejection>>.Failure {error} => {
@@ -57271,6 +58033,7 @@ effect fn checkSourceFieldExpression<'scope>(
         expression,
         Result<SelectedVariant, Shared<Rejection>>.succeed(move variant),
         Range.empty(),
+        Option<HirId>.none(),
         expected,
         mismatchCode,
         constraints,
@@ -57579,60 +58342,112 @@ effect fn checkScalarEnumMatch<'scope>(
     if universal && !fallback {
       return run bodyRejection(&resolver.*, module, RejectionCode.EnumMatchArmAfterWildcard, armSpan)
     }
-    let mut checkedScalar = CheckedScalarPattern {pattern: BodyPattern.Universal, ordinal: usize.MAX}
-    let bindingsFrom = List<BodyNode>.length(&nodes.*)
-    let mut binder = false
+    let unreachableSpan = match arms {
+      MatchArms.Written {..} => armSpan
+      _ => patternSpan
+    }
+    // `A | B` checks each alternative in order against what earlier arms and alternatives leave
+    // (PATT-023); any other pattern is its own single alternative.
+    let mut written = List<HirId>.make()
+    let mut alternativeForm = false
     if !fallback {
-      // `Color c` binds the whole enum value and, like `_`, covers every member.
-      if let Node.BindingPattern {annotation, name, shadowsLocal} = run bodyNode(&resolver.source, cursor, pattern) {
-        if shadowsLocal {
-          return Result<BodyNodeId, Shared<Rejection>>.failResult(
-            run bindingConflictRejection(module, run bodySpan(&resolver.source, cursor, name), b""))
+      if let Node.AlternativePattern {alternatives} = run bodyNode(&resolver.source, cursor, pattern) {
+        alternativeForm = true
+        let mut child = usize.ZERO
+        while child < alternatives.length {
+          run List<HirId>.append(&mut written, run bodyChild(&resolver.source, cursor, alternatives, child))
+          child = child + usize.ONE
         }
-        if !annotation.present { return run bodyRejection(&resolver.*, module, RejectionCode.Undetermined, patternSpan) }
-        let written = run patternMemberType(&mut resolver.*, module, statementScope.annotations, annotation.id, patternSpan)
-        let writtenType = match move written {
-          Result<Interned<Type>, Shared<Rejection>>.Success {value} => move value
-          Result<Interned<Type>, Shared<Rejection>>.Failure {error} => { return Result<BodyNodeId, Shared<Rejection>>.failResult(move error) }
-        }
-        if !run Type.equalsShared(&writtenType, subjectType) {
-          return run bodyRejection(&resolver.*, module, RejectionCode.MatchMemberNotInScrutinee, patternSpan)
-        }
-        run List<BodyNode>.append(&mut nodes.*, BodyNode {
-          origin: run originAt(cursor, pattern, patternSpan),
-          kind: BodyNodeKind.Expression {ty: Interned<Type>.clone(subjectType),
-            form: BodyExpression.PatternBinding {subject: subjectNode, path: List<BodyPlaceStep>.make(), access: bindingAccess(access),
-              declared: Interned<Type>.clone(subjectType)}},
-        })
-        binder = true
       }
     }
-    if binder && coveredCount == count {
-      let unreachableSpan = match arms {
-        MatchArms.Written {..} => armSpan
-        _ => patternSpan
-      }
-      return run bodyRejection(&resolver.*, module, RejectionCode.UnreachableMatchArm, unreachableSpan)
+    if !alternativeForm { run List<HirId>.append(&mut written, pattern) }
+    let mut armCovering = List<Option<Span>>.make()
+    let held = List<Option<Span>>.asSlice(&covering)
+    let mut mark = usize.ZERO
+    while mark < held.length {
+      run List<Option<Span>>.append(&mut armCovering, held[mark])
+      mark = mark + usize.ONE
     }
-    if !fallback && !binder {
-      let scalar = run checkScalarEnumPattern(&mut resolver.*, &mut owner.*, &mut dependencies.*,
-        module, cursor, pattern, patternSpan, subjectType, List<Option<Span>>.asSlice(&covering))
-      checkedScalar = match move scalar {
-        Result<CheckedScalarPattern, Shared<Rejection>>.Success {value} => move value
-        Result<CheckedScalarPattern, Shared<Rejection>>.Failure {error} => {
-          return Result<BodyNodeId, Shared<Rejection>>.failResult(move error)
+    let mut armCoveredCount = coveredCount
+    let mut armUniversal = universal
+    let mut checkedAlternatives = List<BodyAlternative>.make()
+    let bindingsFrom = List<BodyNode>.length(&nodes.*)
+    let writtenIds = List<HirId>.asSlice(&written)
+    let mut alternative = usize.ZERO
+    while alternative < writtenIds.length {
+      let alternativeId = writtenIds[alternative]
+      let mut alternativeSpan = patternSpan
+      let mut alternativeUnreachable = unreachableSpan
+      if alternativeForm {
+        alternativeSpan = run bodySpan(&resolver.source, cursor, alternativeId)
+        alternativeUnreachable = alternativeSpan
+        if armUniversal {
+          return run bodyRejection(&resolver.*, module, RejectionCode.EnumMatchArmAfterWildcard, alternativeSpan)
         }
       }
-      if coveredCount == count {
-        let unreachableSpan = match arms {
-          MatchArms.Written {..} => armSpan
-          _ => patternSpan
+      let mut checkedScalar = CheckedScalarPattern {pattern: BodyPattern.Universal, ordinal: usize.MAX}
+      let mut binder = false
+      if !fallback {
+        // `Color c` binds the whole enum value and, like `_`, covers every member.
+        if let Node.BindingPattern {annotation, name, shadowsLocal} = run bodyNode(&resolver.source, cursor, alternativeId) {
+          // An alternative's guard and result cannot tell which alternative matched, so none binds.
+          if alternativeForm { return run bodyRejection(&resolver.*, module, RejectionCode.AlternativePatternBinding, alternativeSpan) }
+          if shadowsLocal {
+            return Result<BodyNodeId, Shared<Rejection>>.failResult(
+              run bindingConflictRejection(module, run bodySpan(&resolver.source, cursor, name), b""))
+          }
+          if !annotation.present { return run bodyRejection(&resolver.*, module, RejectionCode.Undetermined, patternSpan) }
+          let writtenType = match move run patternMemberType(&mut resolver.*, module, statementScope.annotations, annotation.id, patternSpan) {
+            Result<Interned<Type>, Shared<Rejection>>.Success {value} => move value
+            Result<Interned<Type>, Shared<Rejection>>.Failure {error} => { return Result<BodyNodeId, Shared<Rejection>>.failResult(move error) }
+          }
+          if !run Type.equalsShared(&writtenType, subjectType) {
+            return run bodyRejection(&resolver.*, module, RejectionCode.MatchMemberNotInScrutinee, patternSpan)
+          }
+          run List<BodyNode>.append(&mut nodes.*, BodyNode {
+            origin: run originAt(cursor, alternativeId, patternSpan),
+            kind: BodyNodeKind.Expression {ty: Interned<Type>.clone(subjectType),
+              form: BodyExpression.PatternBinding {subject: subjectNode, path: List<BodyPlaceStep>.make(), access: bindingAccess(access),
+                declared: Interned<Type>.clone(subjectType)}},
+          })
+          binder = true
         }
-        return run bodyRejection(&resolver.*, module, RejectionCode.UnreachableMatchArm, unreachableSpan)
       }
+      if binder && armCoveredCount == count {
+        return run bodyRejection(&resolver.*, module, RejectionCode.UnreachableMatchArm, alternativeUnreachable)
+      }
+      if !fallback && !binder {
+        let scalar = run checkScalarEnumPattern(&mut resolver.*, &mut owner.*, &mut dependencies.*,
+          module, cursor, alternativeId, alternativeSpan, subjectType, List<Option<Span>>.asSlice(&armCovering))
+        checkedScalar = match move scalar {
+          Result<CheckedScalarPattern, Shared<Rejection>>.Success {value} => move value
+          Result<CheckedScalarPattern, Shared<Rejection>>.Failure {error} => {
+            return Result<BodyNodeId, Shared<Rejection>>.failResult(move error)
+          }
+        }
+        if armCoveredCount == count {
+          return run bodyRejection(&resolver.*, module, RejectionCode.UnreachableMatchArm, alternativeUnreachable)
+        }
+      }
+      let selectedOrdinal = checkedScalar.ordinal
+      if selectedOrdinal == usize.MAX {
+        armUniversal = true
+      } else {
+        let mut marks = List<Option<Span>>.asMutSlice(&mut armCovering)
+        marks[selectedOrdinal] = Option<Span>.some(alternativeSpan)
+        armCoveredCount = armCoveredCount + usize.ONE
+      }
+      run List<BodyAlternative>.append(&mut checkedAlternatives, BodyAlternative {pattern: move checkedScalar.pattern, tests: List<BodyPatternTest>.make()})
+      alternative = alternative + usize.ONE
     }
-    let ordinal = checkedScalar.ordinal
-    let checkedPattern = move checkedScalar.pattern
+    let mut checkedPattern = BodyPattern.Universal
+    if alternativeForm {
+      checkedPattern = BodyPattern.Alternatives {alternatives: move checkedAlternatives}
+    } else {
+      let only = List<BodyAlternative>.remove(&mut checkedAlternatives, usize.ZERO)
+      let BodyAlternative {pattern: selectedPattern, ..} = move only
+      checkedPattern = move selectedPattern
+    }
     let armBindings = run declaredBindings(List<BodyNode>.asSlice(&nodes.*), bindingsFrom, subjectNode)
     let mut checkedGuard = Option<BodyNodeId>.none()
     if guard.present {
@@ -57646,12 +58461,11 @@ effect fn checkScalarEnumMatch<'scope>(
         }
       }
       checkedGuard = Option<BodyNodeId>.some(guardNode)
-    } else if ordinal == usize.MAX {
-      universal = true
     } else {
-      let mut marks = List<Option<Span>>.asMutSlice(&mut covering)
-      marks[ordinal] = Option<Span>.some(patternSpan)
-      coveredCount = coveredCount + usize.ONE
+      // Only an unguarded arm covers what its alternatives select.
+      covering = move armCovering
+      coveredCount = armCoveredCount
+      universal = armUniversal
     }
     let yields = yieldsArms(&statementScope.*, expression)
     let checkedResult = run checkArmResult(&mut resolver.*, &mut owner.*, &mut request.*,
@@ -61001,6 +61815,28 @@ effect fn checkInvocationOnce<'scope>(
       )
     }
     ResolvedTarget.Constant {..} => {
+      return run bodyRejection(&resolver.*, module, RejectionCode.NotCallable, span)
+    }
+    ResolvedTarget.ConstantReceiver {declaration, ty: constantType} => {
+      // A written `C.m()` whose `C` names a constant calls `m` on the constant's value, as
+      // `C.field` reads its field.
+      if !receiverSpelling {
+        if let Node.FieldExpression {subject, field} = run bodyNode(&resolver.source, cursor, callee) {
+          let subjectSpan = run bodySpan(&resolver.source, cursor, subject)
+          let checkedReceiver = run finishExpression(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, caller,
+            constraints, &mut nodes.*, subject, subjectSpan, move constantType,
+            BodyExpression.Constant {declaration: run Types.internDeclaration(move declaration)},
+            false, &Option<Interned<Type>>.none(), RejectionCode.TypeMismatch, contractBody, staticBody)
+          let receiverNode = match move checkedReceiver {
+            Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
+            Result<BodyNodeId, Shared<Rejection>>.Failure {error} => { return Result<BodyNodeId, Shared<Rejection>>.failResult(move error) }
+          }
+          return run checkReceiverCallOn(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*,
+            module, cursor, caller, &mut statementScope.*, calls, &mut nodes.*, &mut signatures.*, &mut requiredBodies.*,
+            expression, callee, subject, field, generics, arguments, pipeline, expected, mismatchCode, constraints,
+            contractBody, staticBody, unsafeAllowed, callAcknowledged, receiverNode)
+        }
+      }
       return run bodyRejection(&resolver.*, module, RejectionCode.NotCallable, span)
     }
     ResolvedTarget.ForeignStatic {..} => {
@@ -68678,6 +69514,28 @@ effect fn resolveBodyFacts(
     )
     callAt = callAt + usize.ONE
   }
+  // `C.m<T>()` on a constant `C` reads as a qualified call, so its written types were not
+  // collected; they bind `m`'s own binders, so they resolve here beside the annotations.
+  let resolvedListed = List<ResolvedCall>.asSlice(&resolvedCalls)
+  callAt = usize.ZERO
+  while callAt < callSyntax.length {
+    let receiver = match &resolvedListed[callAt].result {
+      Result<ResolvedTarget, Shared<Rejection>>.Success {value: ResolvedTarget.ConstantReceiver {..}} => true
+      _ => false
+    }
+    if receiver && callSyntax[callAt].generics.present {
+      let written = run memberTypeArguments(&mut resolver.*, module, callSyntax[callAt].generics.id)
+      let ids = List<HirId>.asSlice(&written)
+      let mut idAt = usize.ZERO
+      while idAt < ids.length {
+        let result = run resolveType(&mut resolver.*, &mut owner.*, &mut dependencies.*, moduleOrdinal, ids[idAt],
+          List<Binder>.asSlice(&binders), &mut bodyElision)
+        run List<ResolvedAnnotation>.append(&mut annotations, ResolvedAnnotation {id: ids[idAt], result: move result})
+        idAt = idAt + usize.ONE
+      }
+    }
+    callAt = callAt + usize.ONE
+  }
   return Result<BodyFacts, Shared<Rejection>>.succeed(
     BodyFacts {annotations: move annotations, calls: move resolvedCalls},
   )
@@ -70926,7 +71784,7 @@ fn pointerSized(value: &Type) -> bool {
 fn initializerValue(answer: &Result<Answer, NoRejection>) -> Option<Interned<StaticData>> {
   return match & answer.* {
     Result<Answer, NoRejection>.Success {value} => match & value.outcome {
-      Outcome.Success {value: Value.Initializer {value: found}} => Option<
+      Outcome.Success {value: Value.Initializer {value: found, ..}} => Option<
         Interned<StaticData>,
       >.some(Interned<StaticData>.clone(&found))
       _ => Option<Interned<StaticData>>.none()
@@ -71399,6 +72257,38 @@ effect fn observedWholeDeclaration(resolver: &mut Resolver, module: &ModuleId, d
   }
   drop answer
   return run source(&mut resolver.*, module)
+}
+
+// The links of a constant's evaluation that point into its own initializer, located from the
+// declaration's anchor as its body's origins are.
+effect fn initializerLinks(resolver: &mut Resolver, module: &ModuleId, ordinal: usize, links: &[StaticExecution.EditorLink])
+-> List<LinkedName> ! Cycle | OutOfMemoryError ? &mut Allocator {
+  let mut kept = List<LinkedName>.make()
+  let answer = run observedDeclaration(&mut resolver.*, module, ordinal, SourceFacet.Body)
+  if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&resolver.*, &answer, module) {
+    let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
+    if ordinal >= declarations.length { return move kept }
+    let extent = Module.span(IndexedSource.authored(indexed), declarations[ordinal].local)
+    let anchor = match move IndexedSource.anchorOf(indexed, ordinal) {
+      Option<Anchor>.Some {value} => move value
+      Option<Anchor>.None => { return move kept }
+    }
+    let mut at = usize.ZERO
+    while at < links.length {
+      let link = &links[at]
+      if ModuleId.equals(&link.module, module) && extent.start <= link.literal.start && link.literal.end <= extent.end &&
+        link.literal.start <= link.span.start && link.span.end <= link.literal.end {
+        if let Option<Location>.Some {value: literal} = move Anchor.findLocation(&anchor, link.literal) {
+          run List<LinkedName>.append(&mut kept, LinkedName {
+            literal: literal, start: link.span.start - link.literal.start, end: link.span.end - link.literal.start,
+            owner: Interned<Type>.clone(&link.owner), index: link.index,
+          })
+        }
+      }
+      at = at + usize.ONE
+    }
+  }
+  return move kept
 }
 
 effect fn initializerSyntax(
@@ -71922,6 +72812,31 @@ effect fn staticExpression(
     ))
     match move outcome {
       Result<Interned<StaticData>, StaticDiagnostic | OutOfMemoryError>.Success {value} => {
+        // Links reach the editor only for a constant initializer that is collecting them.
+        let linked = StaticExecution.editorLinks(&machine)
+        if linked.length > usize.ZERO {
+          let mut copied = List<StaticExecution.EditorLink>.make()
+          let mut at = usize.ZERO
+          while at < linked.length {
+            run List<StaticExecution.EditorLink>.append(&mut copied, StaticExecution.EditorLink {
+              module: ModuleId.copy(&linked[at].module), literal: linked[at].literal, span: linked[at].span,
+              owner: Interned<Type>.clone(&linked[at].owner), index: linked[at].index,
+            })
+            at = at + usize.ONE
+          }
+          let port = StaticExecution.port(&mut machine)
+          if let Option<List<StaticExecution.EditorLink>>.Some {value: collecting} = &mut port.resolver.staticLinks {
+            let mut moved = usize.ZERO
+            while moved < List<StaticExecution.EditorLink>.length(&copied) {
+              let link = &List<StaticExecution.EditorLink>.asSlice(&copied)[moved]
+              run List<StaticExecution.EditorLink>.append(&mut collecting, StaticExecution.EditorLink {
+                module: ModuleId.copy(&link.module), literal: link.literal, span: link.span,
+                owner: Interned<Type>.clone(&link.owner), index: link.index,
+              })
+              moved = moved + usize.ONE
+            }
+          }
+        }
         return Result<Interned<StaticData>, Shared<Rejection>>.succeed(move value)
       }
       Result<Interned<StaticData>, StaticDiagnostic | OutOfMemoryError>.Failure {error: evaluationFailure} => {
@@ -72005,16 +72920,33 @@ effect fn resolveInitializer(
     }
   }
   let declarationAccess152 = declarationPosition(&resolver.*, key)
-  let attempted = run staticExpression(
+  let mut collecting = Option<List<StaticExecution.EditorLink>>.none()
+  if resolver.editorTables { collecting = Option<List<StaticExecution.EditorLink>>.some(List<StaticExecution.EditorLink>.make()) }
+  let outerLinks = Intrinsic.replace(resolver.staticLinks, move collecting)
+  let evaluated = run Effect.result(staticExpression(
     &mut resolver.*, &mut owner.*, &mut dependencies,
     &module, Option<usize>.some(declarationAccess152), expression,
     StaticRootExpectation.Resolved {ty: Interned<Type>.clone(&ty), mismatchCode: RejectionCode.InvalidConstant},
     &[], &[],
-  )
+  ))
+  let gathered = match move Intrinsic.replace(resolver.staticLinks, move outerLinks) {
+    Option<List<StaticExecution.EditorLink>>.Some {value} => move value
+    Option<List<StaticExecution.EditorLink>>.None => List<StaticExecution.EditorLink>.make()
+  }
+  let attempted = match move evaluated {
+    Result<Result<Interned<StaticData>, Shared<Rejection>>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} => move value
+    Result<Result<Interned<StaticData>, Shared<Rejection>>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} => { fail move error }
+  }
   match move attempted {
     Result<Interned<StaticData>, Shared<Rejection>>.Success {value} => {
       if run StaticConstant.admits(&ty, &value) {
-        return memberSuccess(Value.Initializer {value: move value}, move dependencies)
+        let mut links = Option<Shared<List<LinkedName>>>.none()
+        if List<StaticExecution.EditorLink>.length(&gathered) > usize.ZERO {
+          let kept = run initializerLinks(&mut resolver.*, &module, declarationAccess152,
+            List<StaticExecution.EditorLink>.asSlice(&gathered))
+          if List<LinkedName>.length(&kept) > usize.ZERO { links = Option<Shared<List<LinkedName>>>.some(run Shared<List<LinkedName>>.make(move kept)) }
+        }
+        return memberSuccess(Value.Initializer {value: move value, links: move links}, move dependencies)
       }
       let mut detail = run constantValueDetail(&module, &ty)
       run Bytes.append(&mut detail, b", holding no references, allocated memory or Drop cleanup")
@@ -90602,6 +91534,65 @@ effect fn appendDecimal(output: &mut Bytes, value: usize) -> () ! OutOfMemoryErr
 
 // Standard-library modules are toolchain-owned: they never contribute tests, and discovery does
 // not descend into them (TEST-003).
+// The source span of bytes `start..end` of the text a literal token at `literal` decodes to, or
+// none when its decoded text is not `length` bytes long. An escape is one unit: a range that ends
+// inside the bytes `\u{...}` decodes to ends after the escape.
+fn literalRange(source: &[u8], literal: Span, start: usize, end: usize, length: usize) -> Option<Span> {
+  if literal.end > source.length || literal.start >= literal.end { return Option<Span>.none() }
+  let mut at = literal.start
+  let mut raw = false
+  if source[at] == 114 {
+    raw = true
+    at = at + usize.ONE
+  } else if source[at] == 98 {
+    at = at + usize.ONE
+  }
+  if at >= literal.end || source[at] != 34 { return Option<Span>.none() }
+  let mut width = usize.ONE
+  if literal.end - at >= 6 && source[at + usize.ONE] == 34 && source[at + 2] == 34 { width = 3 }
+  let contentEnd = literal.end - width
+  let mut index = at + width
+  let mut decoded = usize.ZERO
+  let mut from = usize.MAX
+  let mut to = usize.MAX
+  while index < contentEnd {
+    if decoded == start && from == usize.MAX { from = index }
+    if decoded == end && to == usize.MAX { to = index }
+    let mut written = usize.ONE
+    let mut produced = usize.ONE
+    if !raw && source[index] == 92 && index + usize.ONE < contentEnd {
+      let escaped = source[index + usize.ONE]
+      written = 2
+      if escaped == 120 { written = 4 }
+      if escaped == 117 {
+        let mut close = index + 2
+        let mut scalar: u64 = 0
+        while close < contentEnd && source[close] != 125 {
+          let digit = source[close]
+          if digit >= 48 && digit <= 57 { scalar = scalar * 16 + u8.toU64(digit - 48) }
+          if digit >= 97 && digit <= 102 { scalar = scalar * 16 + u8.toU64(digit - 87) }
+          if digit >= 65 && digit <= 70 { scalar = scalar * 16 + u8.toU64(digit - 55) }
+          close = close + usize.ONE
+        }
+        written = close + usize.ONE - index
+        if scalar >= 128 { produced = 2 }
+        if scalar >= 2048 { produced = 3 }
+        if scalar >= 65536 { produced = 4 }
+      }
+    } else if width == 3 && source[index] == 13 && index + usize.ONE < contentEnd && source[index + usize.ONE] == 10 {
+      written = 2
+    }
+    if start > decoded && start < decoded + produced && from == usize.MAX { from = index }
+    decoded = decoded + produced
+    index = index + written
+    if end > decoded - produced && end < decoded && to == usize.MAX { to = index }
+  }
+  if decoded != length { return Option<Span>.none() }
+  if from == usize.MAX { from = index }
+  if to == usize.MAX { to = index }
+  return Option<Span>.some(Span.make(from, to))
+}
+
 fn toolchainModule(module: &ModuleId) -> bool {
   return ModuleId.withPath<bool>(module, fn(path: &[u8]) -> bool {
     let prefix = b"silk/"
@@ -93335,6 +94326,70 @@ impl<'source> StaticPort<'source> {
   /// for documentation see a comment edit.
   pub effect fn fieldDocumentation(self: &mut Self, ty: &Interned<Type>, label: &[u8]) -> Bytes
   ! Cycle | OutOfMemoryError ? &mut Allocator {
+    return run documentationOf(&mut self.resolver.*, ty, DocumentedPart.Field, label, usize.ZERO)
+  }
+
+  /// The `///` text of the field `label` at position `ordinal` of a variant of the union `ty`, as
+  /// `fieldDocumentation` reads a struct field's. A variant field's descriptor does not name its
+  /// variant, so the first variant with that field at that position owns the text.
+  pub effect fn variantFieldDocumentation(self: &mut Self, ty: &Interned<Type>, label: &[u8], ordinal: usize) -> Bytes
+  ! Cycle | OutOfMemoryError ? &mut Allocator {
+    return run documentationOf(&mut self.resolver.*, ty, DocumentedPart.VariantField, label, ordinal)
+  }
+
+  /// The `///` text of the nominal type `ty`'s own declaration, as `fieldDocumentation` reads a
+  /// field's.
+  pub effect fn typeDocumentation(self: &mut Self, ty: &Interned<Type>) -> Bytes
+  ! Cycle | OutOfMemoryError ? &mut Allocator {
+    return run documentationOf(&mut self.resolver.*, ty, DocumentedPart.Type, b"", usize.ZERO)
+  }
+
+  /// The name of the first field of the struct `ty` that is not `pub`, empty when every field is
+  /// or `ty` is no struct.
+  pub effect fn privateField(self: &mut Self, ty: &Interned<Type>) -> Bytes
+  ! Cycle | OutOfMemoryError ? &mut Allocator {
+    return run privateFieldOf(&mut self.resolver.*, ty)
+  }
+
+  /// The `///` text of the variant `label` of the union `ty`, as `fieldDocumentation` reads a
+  /// field's.
+  pub effect fn variantDocumentation(self: &mut Self, ty: &Interned<Type>, label: &[u8]) -> Bytes
+  ! Cycle | OutOfMemoryError ? &mut Allocator {
+    return run documentationOf(&mut self.resolver.*, ty, DocumentedPart.Variant, label, usize.ZERO)
+  }
+
+  /// The written name of `ty` without module paths, such as `Page<String>` for
+  /// `app.main.Page<silk.text.string.String>`; none when the type has no spelling.
+  pub effect fn typeName(ty: &Interned<Type>, viewer: &ModuleId) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+    let written = match move run TypeText.display(ty, viewer) {
+      Option<Bytes>.Some {value} => move value
+      Option<Bytes>.None => { return Option<Bytes>.none() }
+    }
+    // A path segment is a name followed by `.`; the last name of each path stays.
+    let bytes = Bytes.asSlice(&written)
+    let mut short = Bytes.make()
+    let mut segment = usize.ZERO
+    let mut at = usize.ZERO
+    while at <= bytes.length {
+      let boundary = at == bytes.length || !nameByte(bytes[at])
+      if boundary {
+        if at < bytes.length && bytes[at] == 46 {
+          segment = at + usize.ONE
+        } else {
+          run Bytes.append(&mut short, Slice.view<u8>(bytes, segment, at - segment))
+          if at < bytes.length { run Bytes.append(&mut short, Slice.view<u8>(bytes, at, usize.ONE)) }
+          segment = at + usize.ONE
+        }
+      }
+      at = at + usize.ONE
+    }
+    return Option<Bytes>.some(move short)
+  }
+
+  /// Where bytes `start..end` of the declared name of field `label` of struct `ty` are, in its
+  /// module; none for a field the standard library declares, or a label that is not the name.
+  pub effect fn fieldNameSite(self: &mut Self, ty: &Interned<Type>, label: &[u8], start: usize, end: usize)
+  -> Option<StaticExecution.LocatedSite> ! Cycle | OutOfMemoryError ? &mut Allocator {
     let named = Interned<Type>.with<Option<DeclarationId>>(ty, fn(value: &Type) -> Option<DeclarationId> {
       return match &value.* {
         Type.Nominal {declaration, ..} => Option<DeclarationId>.some(DeclarationId.copy(&declaration))
@@ -93343,9 +94398,10 @@ impl<'source> StaticPort<'source> {
     })
     let owner = match move named {
       Option<DeclarationId>.Some {value} => move value
-      Option<DeclarationId>.None => { return Bytes.make() }
+      Option<DeclarationId>.None => { return Option<StaticExecution.LocatedSite>.none() }
     }
     let module = ModuleId.copy(DeclarationId.moduleId(&owner))
+    if toolchainModule(&module) { return Option<StaticExecution.LocatedSite>.none() }
     let answer = run source(&mut self.resolver.*, &module)
     if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&self.resolver.*, &answer, &module) {
       let hir = IndexedSource.authored(indexed)
@@ -93360,15 +94416,10 @@ impl<'source> StaticPort<'source> {
                 let field = Module.child(hir, fields, index)
                 if let Node.Field {name, ..} = Module.node(hir, field) {
                   if let Node.Name {text} = Module.node(hir, name) {
-                    if same(Module.text(hir, text), label) {
-                      // The reference generator's own attachment rule, so `fieldDoc` and the
-                      // generated reference agree on which comment a field owns.
-                      let tree = run SourceUnit.syntaxTree(IndexedSource.sourceUnit(indexed))
-                      let lines = run Attached.lines(Bytes.asSlice(&tree.source))
-                      return match move run Attached.declaration(&tree, Module.span(hir, field).start, List<usize>.asSlice(&lines)) {
-                        Option<Document>.Some {value} => move value.markdown
-                        Option<Document>.None => Bytes.make()
-                      }
+                    let written = Module.span(hir, name)
+                    if same(Module.text(hir, text), label) && written.end - written.start == label.length && end <= label.length {
+                      return Option<StaticExecution.LocatedSite>.some(StaticExecution.LocatedSite {module: move module,
+                        span: Span.make(written.start + start, written.start + end)})
                     }
                   }
                 }
@@ -93376,12 +94427,45 @@ impl<'source> StaticPort<'source> {
               }
             }
           }
-          return Bytes.make()
+          return Option<StaticExecution.LocatedSite>.none()
         }
         at = at + usize.ONE
       }
     }
-    return Bytes.make()
+    return Option<StaticExecution.LocatedSite>.none()
+  }
+
+  /// Whether this resolution keeps editor facts, such as linked literal ranges.
+  pub fn editorTables(self: &Self) -> bool {
+    return self.resolver.editorTables
+  }
+
+  /// Where bytes `start..end` of the text that the literal at `literal` of `module` decodes to are
+  /// written, escapes included; none when the literal does not decode to `length` bytes, such as
+  /// for a text built from it, or when the standard library writes it.
+  pub effect fn literalSite(self: &mut Self, module: &ModuleId, literal: Span, start: usize, end: usize, length: usize)
+  -> Option<StaticExecution.LocatedSite> ! Cycle | OutOfMemoryError ? &mut Allocator {
+    if toolchainModule(module) { return Option<StaticExecution.LocatedSite>.none() }
+    let answer = run source(&mut self.resolver.*, module)
+    if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&self.resolver.*, &answer, module) {
+      let bytes = SourceUnit.bytes(IndexedSource.sourceUnit(indexed))
+      if let Option<Span>.Some {value: span} = move literalRange(bytes, literal, start, end, length) {
+        return Option<StaticExecution.LocatedSite>.some(StaticExecution.LocatedSite {module: ModuleId.copy(module), span: span})
+      }
+    }
+    return Option<StaticExecution.LocatedSite>.none()
+  }
+
+  /// A selected `compileError` reported at `located`, relating the call that reached it.
+  pub effect fn locatedCompileError(self: &mut Self, located: StaticExecution.LocatedSite,
+    related: Option<StaticExecution.LocatedSite>, message: &[u8]) -> Shared<Rejection>
+  ! OutOfMemoryError ? &mut Allocator {
+    let mut diagnostic = run makeRejection(RejectionCode.SelectedCompileError, &located.module, located.span)
+    run List<MessageArgument>.append(&mut diagnostic.arguments, MessageArgument {name: run Bytes.copy(b"detail"), value: run Bytes.copy(message)})
+    if let Option<StaticExecution.LocatedSite>.Some {value: call} = move related {
+      diagnostic.related = Option<RelatedSite>.some(RelatedSite {module: move call.module, span: call.span})
+    }
+    return run Shared<Rejection>.make(move diagnostic)
   }
 
   /// Reflects one closed aggregate through tracked members and exact applied member shapes.
@@ -93621,6 +94705,30 @@ impl<'source> StaticPort<'source> {
     }
     return Option<Shared<Result<Answer, NoRejection>>>.none()
   }
+  /// The literal ranges a constant's initializer linked to fields, read from its `Initializer`
+  /// answer in the active query; empty for a store without editor tables or a refused value.
+  pub effect fn constantLinks(self: &mut Self, declaration: &DeclarationId, span: Span) -> Option<Shared<List<LinkedName>>>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+    let module = DeclarationId.moduleId(declaration)
+    let identity = run Types.internDeclaration(DeclarationId.copy(declaration))
+    let selected = run ordinalOfIdentity(&mut self.resolver.*, module, &identity)
+    if let Option<usize>.Some {value: ordinal} = move selected {
+      let moduleOrdinal = run internModule(&mut self.resolver.*, module)
+      let request = Key {family: Family.Initializer, module: moduleOrdinal, name: usize.ZERO, declaration: ordinal, member: usize.ZERO, external: false}
+      let key = run internDeclaration(&mut self.resolver, request)
+      let answer = run demandChild(&mut self.resolver.*, &mut self.query.*, &mut self.dependencies.*, key, span)
+      return Shared<Result<Answer, NoRejection>>.with<Option<Shared<List<LinkedName>>>>(&answer, fn(held: &Result<Answer, NoRejection>) -> Option<Shared<List<LinkedName>>> {
+        if let Result<Answer, NoRejection>.Success {value} = &held.* {
+          if let Outcome.Success {value: Value.Initializer {links: Option<Shared<List<LinkedName>>>.Some {value: listed}, ..}} = &value.outcome {
+            return Option<Shared<List<LinkedName>>>.some(Shared<List<LinkedName>>.clone(&listed))
+          }
+        }
+        return Option<Shared<List<LinkedName>>>.none()
+      })
+    }
+    return Option<Shared<List<LinkedName>>>.none()
+  }
   /// The module-level ordinal of one declaration in its own module, if it is still indexed.
   pub effect fn declarationOrdinal(self: &mut Self, declaration: &DeclarationId) -> Option<usize>
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
@@ -93717,6 +94825,45 @@ impl<'source> StaticPort<'source> {
       return Option<DocumentationBinding>.some(DocumentationBinding.Namespace {module: move target, isPublic: false})
     }
     return Option<DocumentationBinding>.none()
+  }
+
+  /// Whether the module-private import binding `name` of `module` can serve calls that never
+  /// spell it: an interface, whose operations method syntax and `Type.operation` calls find
+  /// through the import, or a namespace whose module publishes an interface. The unused-import
+  /// warning (MOD0007) leaves such a binding unreported; a refused import reports its error.
+  pub effect fn importServesCalls(self: &mut Self, module: &ModuleId, name: &[u8]) -> bool
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+    let bound = match move run StaticPort.documentationBinding(&mut self.*, module, name, false) {
+      Result<Option<DocumentationBinding>, Shared<Rejection>>.Success {value} => move value
+      Result<Option<DocumentationBinding>, Shared<Rejection>>.Failure {..} => { return false }
+    }
+    let binding = match move bound {
+      Option<DocumentationBinding>.Some {value} => move value
+      Option<DocumentationBinding>.None => { return false }
+    }
+    return match move binding {
+      DocumentationBinding.Declaration {identity, ..} => {
+        let interned = run Types.internDeclaration(DeclarationId.copy(&identity))
+        let owner = DeclarationId.moduleId(&identity)
+        match move run ordinalOfIdentity(&mut self.resolver.*, owner, &interned) {
+          Option<usize>.Some {value: ordinal} => match move run scopedHeader(&mut self.resolver.*, owner, ordinal) {
+            Option<HeaderSyntax>.Some {value: written} => match written.header {
+              Node.InterfaceHeader {..} => true
+              _ => false
+            }
+            Option<HeaderSyntax>.None => false
+          }
+          Option<usize>.None => false
+        }
+      }
+      DocumentationBinding.Namespace {module: target, ..} => {
+        let ordinal = run internModule(&mut self.resolver.*, &target)
+        let mut names = List<VisibleName>.make()
+        run appendInterfaceNames(&mut self.resolver.*, &target, ordinal, true, &mut names)
+        List<VisibleName>.length(&names) > usize.ZERO
+      }
+    }
   }
 
   /// Resolves an inherent member through publication, without demanding its signature. Invalid
@@ -93929,6 +95076,7 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
       support: List<ModuleId>.make(),
       linkOnlySupport: List<ModuleId>.make(),
       editorTables: false,
+      staticLinks: Option<List<StaticExecution.EditorLink>>.none(),
       discovery: Option<Discovery>.none(),
       packages: PackageGraph.single(),
       profiles: List<FinalProfile>.make(),
@@ -110331,4 +111479,141 @@ test effect fn privateFrontierPreservesPartitionAndOrigins() -> () ! InvalidModu
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut types = TypeTable.make()
   run privateFrontierPartitionClaims() |> Effect.provideMut<Types>(&mut types) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Which declaration's `///` block a documentation read wants.
+enum DocumentedPart {
+  Type,
+  Field,
+  Variant,
+  VariantField,
+}
+
+// Whether `byte` can be part of a name in a written type.
+fn nameByte(byte: u8) -> bool {
+  return (byte >= 97 && byte <= 122) || (byte >= 65 && byte <= 90) || (byte >= 48 && byte <= 57) || byte == 95
+}
+
+// The name of the first field of the struct `ty` that is not `pub`, empty when there is none.
+effect fn privateFieldOf(resolver: &mut Resolver, ty: &Interned<Type>) -> Bytes ! Cycle | OutOfMemoryError ? &mut Allocator {
+  let named = Interned<Type>.with<Option<DeclarationId>>(ty, fn(value: &Type) -> Option<DeclarationId> {
+    return match &value.* {
+      Type.Nominal {declaration, ..} => Option<DeclarationId>.some(DeclarationId.copy(&declaration))
+      _ => Option<DeclarationId>.none()
+    }
+  })
+  let owner = match move named {
+    Option<DeclarationId>.Some {value} => move value
+    Option<DeclarationId>.None => { return Bytes.make() }
+  }
+  let module = ModuleId.copy(DeclarationId.moduleId(&owner))
+  let answer = run source(&mut resolver.*, &module)
+  if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&resolver.*, &answer, &module) {
+    let hir = IndexedSource.authored(indexed)
+    let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
+    let mut at = usize.ZERO
+    while at < declarations.length {
+      if DeclarationId.equals(&declarations[at].identity, &owner) {
+        if let Node.Declaration {header, ..} = Module.node(hir, declarations[at].local) {
+          if let Node.StructHeader {fields, ..} = Module.node(hir, header) {
+            let mut index = usize.ZERO
+            while index < fields.length {
+              if let Node.Field {name, isPublic, ..} = Module.node(hir, Module.child(hir, fields, index)) {
+                if !isPublic {
+                  if let Node.Name {text} = Module.node(hir, name) { return run Bytes.copy(Module.text(hir, text)) }
+                }
+              }
+              index = index + usize.ONE
+            }
+          }
+        }
+        return Bytes.make()
+      }
+      at = at + usize.ONE
+    }
+  }
+  return Bytes.make()
+}
+
+// The `///` text of `ty`'s declaration, or of its field or variant `label`, without slashes;
+// empty when none was written. The reference generator's own attachment rule decides which
+// comment a declaration owns, so reflection and the generated reference agree.
+effect fn documentationOf(resolver: &mut Resolver, ty: &Interned<Type>, part: DocumentedPart, label: &[u8], ordinal: usize) -> Bytes
+! Cycle | OutOfMemoryError ? &mut Allocator {
+  let named = Interned<Type>.with<Option<DeclarationId>>(ty, fn(value: &Type) -> Option<DeclarationId> {
+    return match &value.* {
+      Type.Nominal {declaration, ..} => Option<DeclarationId>.some(DeclarationId.copy(&declaration))
+      _ => Option<DeclarationId>.none()
+    }
+  })
+  let owner = match move named {
+    Option<DeclarationId>.Some {value} => move value
+    Option<DeclarationId>.None => { return Bytes.make() }
+  }
+  let module = ModuleId.copy(DeclarationId.moduleId(&owner))
+  let answer = run source(&mut resolver.*, &module)
+  if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&resolver.*, &answer, &module) {
+    let hir = IndexedSource.authored(indexed)
+    let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
+    let mut at = usize.ZERO
+    while at < declarations.length {
+      if DeclarationId.equals(&declarations[at].identity, &owner) {
+        let mut documented = Option<usize>.none()
+        if part == DocumentedPart.Type { documented = Option<usize>.some(Module.span(hir, declarations[at].local).start) }
+        if let Node.Declaration {header, ..} = Module.node(hir, declarations[at].local) {
+          let mut members = Option<Range>.none()
+          if part == DocumentedPart.Field {
+            if let Node.StructHeader {fields, ..} = Module.node(hir, header) { members = Option<Range>.some(fields) }
+          }
+          if part == DocumentedPart.Variant {
+            if let Node.UnionHeader {variants, ..} = Module.node(hir, header) { members = Option<Range>.some(variants) }
+          }
+          if part == DocumentedPart.VariantField {
+            if let Node.UnionHeader {variants, ..} = Module.node(hir, header) {
+              let mut variant = usize.ZERO
+              while variant < variants.length && documented.isNone() {
+                if let Node.Variant {fields, ..} = Module.node(hir, Module.child(hir, variants, variant)) {
+                  if ordinal < fields.length {
+                    let field = Module.child(hir, fields, ordinal)
+                    if let Node.Field {name, ..} = Module.node(hir, field) {
+                      if let Node.Name {text} = Module.node(hir, name) {
+                        if same(Module.text(hir, text), label) { documented = Option<usize>.some(Module.span(hir, field).start) }
+                      }
+                    }
+                  }
+                }
+                variant = variant + usize.ONE
+              }
+            }
+          }
+          if let Option<Range>.Some {value: range} = members {
+            let mut index = usize.ZERO
+            while index < range.length {
+              let member = Module.child(hir, range, index)
+              let mut nameNode = Option<HirId>.none()
+              if let Node.Field {name, ..} = Module.node(hir, member) { nameNode = Option<HirId>.some(name) }
+              if let Node.Variant {name, ..} = Module.node(hir, member) { nameNode = Option<HirId>.some(name) }
+              if let Option<HirId>.Some {value: name} = nameNode {
+                if let Node.Name {text} = Module.node(hir, name) {
+                  if same(Module.text(hir, text), label) { documented = Option<usize>.some(Module.span(hir, member).start) }
+                }
+              }
+              index = index + usize.ONE
+            }
+          }
+        }
+        if let Option<usize>.Some {value: start} = documented {
+          let tree = run SourceUnit.syntaxTree(IndexedSource.sourceUnit(indexed))
+          let lines = run Attached.lines(Bytes.asSlice(&tree.source))
+          return match move run Attached.declaration(&tree, start, List<usize>.asSlice(&lines)) {
+            Option<Document>.Some {value} => move value.markdown
+            Option<Document>.None => Bytes.make()
+          }
+        }
+        return Bytes.make()
+      }
+      at = at + usize.ONE
+    }
+  }
+  return Bytes.make()
 }

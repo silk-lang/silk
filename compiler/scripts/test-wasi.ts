@@ -313,7 +313,7 @@ const program = Effect.gen(function* () {
         '}',
         'effect fn load(code: i32) -> i32 ! ConfigError { if code > 0 { fail ConfigError { code: code } } return code }',
         'effect fn configure(code: i32) -> i32 ! ConfigError { return run load(code) }',
-        'pub effect fn main() -> () ! ConfigError { let code = run configure(7) }',
+        'pub effect fn main() -> () ! ConfigError { let _code = run configure(7) }',
         '',
       ].join('\n'),
     )

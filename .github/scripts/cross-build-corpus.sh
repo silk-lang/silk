@@ -6,7 +6,8 @@
 #
 # usage: cross-build-corpus.sh <compiler> <target> <output> <platform-supply TOML or ''> [programs...]
 # Without programs, every corpus program that needs no C units, splices, profiles, runs,
-# libraries or components and completes normally is built.
+# libraries or components and completes normally is built. Corpus programs test code generation,
+# not lint, so warnings are allowed here as in the receipt-counted corpus harness.
 set -euo pipefail
 compiler=$1
 target=$2
@@ -44,7 +45,7 @@ build() {
   printf '[package]\nname = "corpus"\nversion = "0.0.0"\nsource = "."\n' > "$package/silk.toml"
   if [ -n "$supply" ]; then printf '\n[native]\nplatform-supply = %s\n' "$supply" >> "$package/silk.toml"; fi
   if ! "$compiler" build "$package/main.silk" -o "$output/$name/program" --target "$target" --stdlib "$PWD/stdlib" \
-    --optimization none --debug false > "$package/build.log" 2>&1; then
+    --optimization none --debug false --ignore-warnings > "$package/build.log" 2>&1; then
     echo "FAIL $name"
     sed 's/^/  /' "$package/build.log"
     rm -rf -- "$output/$name"

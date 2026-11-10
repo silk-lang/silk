@@ -117,6 +117,117 @@ included.
 `start` and `end` must be at character boundaries, with `start <= end <= byteLength(value)`.
 Otherwise, static evaluation stops and the compiler reports an error.
 
+<a id="StaticText.impl.errorAt"></a>
+
+### Associated function `errorAt`
+
+```silk
+pub static fn errorAt(text: string, start: usize, end: usize, message: string) -> never
+```
+
+Stops static evaluation with the compile error `message`, reported at bytes `start` to `end`
+of `text`, with `end` not included.
+
+#### Details
+
+When `text` is a string literal of the calling package, the error points inside the literal,
+at the characters those bytes are written as, escapes included. When `text` is the label
+[`Reflect.fieldLabel`](./core-reflect.md#Reflect.impl.fieldLabel) gives for a struct field, the error points at that part of the
+field's name where the struct declares it. Otherwise, as for a text that
+[`StaticText.concat`](#StaticText.impl.concat) built, the error points at the call, like `compileError(message)`.
+Either way the error also names the call in the evaluated module that reached it.
+
+#### Gotchas
+
+`start <= end <= byteLength(text)` must hold. Otherwise, static evaluation stops with an
+out-of-range error instead.
+
+A `static fn` whose body has a `static for` evaluates the statements before the loop apart
+from its caller, where a text parameter no longer knows its literal, so the error points at
+the call. Report from a function without such a loop, and move the loop into a helper.
+
+#### Examples
+##### Point at the bad character of a template
+```silk
+import silk.core.static_text { StaticText }
+
+static fn checked(template: string<'static>) -> string<'static> {
+  let length = StaticText.byteLength(template)
+  let mut at: usize = 0
+  while at < length {
+    // 37 is the byte of `%`.
+    if StaticText.byteAt(template, at) == 37 {
+      StaticText.errorAt(template, at, at + 1, "use {} instead of %")
+    }
+    at = at + 1
+  }
+  return template
+}
+
+pub fn main() -> i32 {
+  let text = checked("{} items")
+  return 0
+}
+```
+
+<a id="StaticText.impl.link"></a>
+
+### Associated function `link`
+
+```silk
+pub static fn link<Owner>(text: string, start: usize, end: usize, field: string) -> ()
+```
+
+Tells the editor that bytes `start` to `end` of `text`, with `end` not included, name the
+field of `Owner` labeled `field`.
+
+#### Details
+
+When `text` is a string literal of the calling package, those characters of the literal act
+as a written use of the field: hovering them shows the field, go to definition opens it, find
+references on the field lists them, and an inlay hint after them shows the field's type. A
+text with no literal behind it, such as one [`StaticText.concat`](#StaticText.impl.concat) built, links nothing. The
+link changes nothing in the build.
+
+#### Gotchas
+
+`start <= end <= byteLength(text)` must hold and `Owner` must have a field labeled `field`.
+Otherwise, static evaluation stops with an error at those bytes instead.
+
+Renaming the field does not edit the text. Pair the link with a check that reports a name
+the type lacks, so the build names each place that must follow.
+
+As for [`StaticText.errorAt`](#StaticText.impl.errorAt), a `static fn` whose body has a `static for` evaluates the
+statements before the loop apart from its caller, where a text parameter no longer knows its
+literal, so a link made there links nothing.
+
+The editor shows links of a constant's initializer.
+
+#### Examples
+##### Link each `{name}` of a template to the field it reads
+```silk
+import silk.core.static_text { StaticText }
+
+struct Greeting {
+  pub name: string<'static>,
+}
+
+static fn linked(template: string<'static>) -> string<'static> {
+  // `{name}` starts at byte 7 of "Hello, {name}"; the name is bytes 8 to 12.
+  StaticText.link<Greeting>(template, 8, 12, "name")
+  return template
+}
+
+const TEMPLATE: string<'static> = linked("Hello, {name}")
+
+pub fn main() -> i32 {
+  if StaticText.byteLength(TEMPLATE) != 13 {
+    return 1
+  }
+  return 0
+}
+```
+
 
 Category: Core.
 

@@ -1,0 +1,524 @@
+//! Show the problems a schema found, as source snippets, one line each, or JSON.
+//!
+//! # When to use
+//! Call [`SchemaReport.write`] with the `silk.schema.issue.SchemaErrors` from
+//! `silk.schema.json.SchemaJson.decodeAll`, or [`SchemaReport.writeOne`] with the one
+//! `SchemaError` from `SchemaJson.decode`, and the input they were read from. Pick
+//! [`ReportOptions.snippet`] for a terminal, [`ReportOptions.line`] for logs and editors' problem
+//! matchers, and [`ReportOptions.json`] for tools and for sending the problems back to a model.
+//!
+//! # Details
+//! A report cuts the found value out of the input by its span, at most 40 bytes of its first line,
+//! and counts lines and columns only while it writes: lines and columns start at 1, and columns
+//! count characters, as editors do. [`ReportOptions.redacted`] writes only the kind of each found
+//! value, such as `got text`, for input that may hold secrets. A snippet shows at most about 80
+//! characters of a long line, around the problem.
+//!
+//! The snippet form looks like this:
+//!
+//! ```text
+//!  --> server.json:3:11 at port
+//!   |
+//! 3 |   "port": 0,
+//!   |           ^ expected an integer from 1 to 65535, got 0
+//! ```
+//!
+//! The line form writes `server.json:3:11: port: expected an integer from 1 to 65535, got 0`, and
+//! the JSON form writes one object, `{"problems": [...], "dropped": 0}`, whose paths are JSON
+//! Pointers into the input.
+//!
+//! # Examples
+//! ## Write every problem of a config
+//! ```silk
+//! import silk.collections.list { List }
+//! import silk.core.effect { Effect }
+//! import silk.core.result { Result }
+//! import silk.io.writer { Writer, WriterError }
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.schema.issue { SchemaErrors }
+//! import silk.schema.json { SchemaJson }
+//! import silk.schema.report { ReportOptions, SchemaReport }
+//! import silk.schema.schema { Schema, Spec }
+//!
+//! struct Server {
+//!   pub port: u16,
+//!   pub workers: u8,
+//! }
+//!
+//! impl Schema for Server {
+//!   static fn spec() -> Spec<Server> {
+//!     return Spec<Server>.of() |> Spec<Server>.between("port", 1, 65535)
+//!   }
+//! }
+//!
+//! struct Capture {
+//!   bytes: [u8; 512],
+//!   length: usize,
+//! }
+//!
+//! impl Writer for Capture {
+//!   effect fn writeAll(self: &mut Self, val: &[u8]) -> () ! WriterError ? &mut Writer {
+//!     let mut at: usize = 0
+//!     while at < val.length {
+//!       if self.length < 512 { self.bytes[self.length] = val[at] }
+//!       self.length = self.length + 1
+//!       at = at + 1
+//!     }
+//!     return ()
+//!   }
+//!   effect fn flush(self: &mut Self) -> () ! WriterError ? &mut Writer { return () }
+//! }
+//!
+//! effect fn check() -> usize ! OutOfMemoryError | WriterError ? &mut Allocator {
+//!   let input = b"{\"port\": 0, \"workers\": 300}"
+//!   let mut capture = Capture {bytes: [0; 512], length: 0}
+//!   match move run Effect.result(SchemaJson.decodeAll<Server>(input)) {
+//!     Result<Server, SchemaErrors | OutOfMemoryError>.Failure {error} => match move error {
+//!       SchemaErrors problems => {
+//!         run SchemaReport.write(&problems, input, "server.json", ReportOptions.line()) |> Effect.provideMut<Writer>(&mut capture)
+//!       }
+//!       OutOfMemoryError {} => { fail OutOfMemoryError {} }
+//!     }
+//!     _ => {}
+//!   }
+//!   // server.json:1:10: port: expected an integer from 1 to 65535, got 0
+//!   // server.json:1:24: workers: expected an integer from 0 to 255, got 300
+//!   return capture.length
+//! }
+//!
+//! pub effect fn main() -> i32 ! OutOfMemoryError | WriterError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let written = run check() |> Effect.provideMut<Allocator>(&mut allocator)
+//!   return if written > 0 { 0 } else { 1 }
+//! }
+//! ```
+//!
+//! @category Data formats
+
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.io.writer { Writer, WriterError }
+import silk.json.output { JsonOutput }
+import silk.num.u8
+import silk.num.usize
+import silk.schema.issue { Issue, IssueReason, SchemaError, SchemaErrors, Span, ValueKind }
+import silk.schema.path { PathSegment, SchemaPath }
+import silk.text.format { Format }
+import silk.text.string { String }
+
+/// How a report lays out each problem.
+pub enum ReportStyle {
+  /// The line of input with a caret under the problem, for a terminal.
+  Snippet,
+  /// One line per problem, `source:line:column: path: message`, for logs and problem matchers.
+  Line,
+  /// One JSON object that lists the problems, for tools and models.
+  Json,
+}
+
+/// How [`SchemaReport.write`] writes problems.
+pub struct ReportOptions {
+  /// The layout.
+  pub style: ReportStyle,
+  /// Whether to write only the kind of each found value, never its text.
+  pub redact: bool,
+}
+
+impl Copy for ReportOptions {}
+
+impl ReportOptions {
+  /// Returns options for source snippets.
+  pub fn snippet() -> ReportOptions {
+    return ReportOptions {style: ReportStyle.Snippet, redact: false}
+  }
+
+  /// Returns options for one line per problem.
+  pub fn line() -> ReportOptions {
+    return ReportOptions {style: ReportStyle.Line, redact: false}
+  }
+
+  /// Returns options for one JSON object.
+  pub fn json() -> ReportOptions {
+    return ReportOptions {style: ReportStyle.Json, redact: false}
+  }
+
+  /// Returns the same options, but writing only the kind of each found value.
+  pub fn redacted(self: Self) -> ReportOptions {
+    return ReportOptions {style: self.style, redact: true}
+  }
+}
+
+/// The most bytes of a found value a report quotes.
+pub const MAX_QUOTED: usize = 40
+
+/// Writes schema problems for a person or a tool.
+pub struct SchemaReport {}
+
+impl SchemaReport {
+  /// Writes every problem in `errors`, read from `input`, to the ambient `Writer`. `source` names
+  /// the input, such as a file name, in each location.
+  ///
+  /// # Errors
+  ///
+  /// - `WriterError` if the `Writer` fails.
+  pub effect fn write(errors: &SchemaErrors, input: &[u8], source: string, options: ReportOptions) -> () ! WriterError ? &mut Writer {
+    return run writeProblems(List<SchemaError>.asSlice(&errors.errors), errors.dropped, input, source, options)
+  }
+
+  /// Writes one problem, as [`SchemaReport.write`] does.
+  ///
+  /// # Errors
+  ///
+  /// - `WriterError` if the `Writer` fails.
+  pub effect fn writeOne(error: &SchemaError, input: &[u8], source: string, options: ReportOptions) -> () ! WriterError ? &mut Writer {
+    if options.style == ReportStyle.Json { run Writer.writeAll(b"{\"problems\":[") }
+    run writeProblem(error, input, source, options, true)
+    if options.style == ReportStyle.Json { run Writer.writeAll(b"],\"dropped\":0}\n") }
+    return ()
+  }
+}
+
+effect fn writeProblems(errors: &[SchemaError], dropped: usize, input: &[u8], source: string, options: ReportOptions) -> () ! WriterError ? &mut Writer {
+  if options.style == ReportStyle.Json { run Writer.writeAll(b"{\"problems\":[") }
+  let mut at = usize.ZERO
+  let mut first = true
+  while at < errors.length {
+    if errors[at].issue.reason != IssueReason.Reported {
+      run writeProblem(&errors[at], input, source, options, first)
+      first = false
+    }
+    at = at + usize.ONE
+  }
+  if options.style == ReportStyle.Json {
+    run Writer.writeAll(b"],\"dropped\":")
+    run writeNumber(dropped)
+    return run Writer.writeAll(b"}\n")
+  }
+  if dropped == usize.ZERO { return () }
+  run Writer.writeAll(b"and ")
+  run writeNumber(dropped)
+  if dropped == usize.ONE { return run Writer.writeAll(b" more problem\n") }
+  return run Writer.writeAll(b" more problems\n")
+}
+
+effect fn writeProblem(error: &SchemaError, input: &[u8], source: string, options: ReportOptions, first: bool) -> () ! WriterError ? &mut Writer {
+  return match options.style {
+    ReportStyle.Snippet => run writeSnippet(error, input, source, options.redact)
+    ReportStyle.Line => run writeLine(error, input, source, options.redact)
+    ReportStyle.Json => run writeJson(error, input, options.redact, first)
+  }
+}
+
+// Where a span starts: its line and column, from 1, and the bytes of its line.
+struct Place {
+  line: usize,
+  column: usize,
+  lineStart: usize,
+  lineEnd: usize,
+}
+
+impl Copy for Place {}
+
+fn placeOf(input: &[u8], offset: usize) -> Place {
+  let mut line = usize.ONE
+  let mut column = usize.ONE
+  let mut lineStart = usize.ZERO
+  let end = smaller(offset, input.length)
+  let mut at = usize.ZERO
+  while at < end {
+    if input[at] == 10 {
+      line = line + usize.ONE
+      column = usize.ONE
+      lineStart = at + usize.ONE
+    } else if startsCharacter(input[at]) {
+      column = column + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  let mut lineEnd = lineStart
+  while lineEnd < input.length && input[lineEnd] != 10 { lineEnd = lineEnd + usize.ONE }
+  if lineEnd > lineStart && input[lineEnd - usize.ONE] == 13 { lineEnd = lineEnd - usize.ONE }
+  return Place {line: line, column: column, lineStart: lineStart, lineEnd: lineEnd}
+}
+
+fn smaller(left: usize, right: usize) -> usize {
+  return if left < right { left } else { right }
+}
+
+fn larger(left: usize, right: usize) -> usize {
+  return if left > right { left } else { right }
+}
+
+fn startsCharacter(byte: u8) -> bool {
+  return byte < 128 || byte >= 192
+}
+
+effect fn writeNumber(value: usize) -> () ! WriterError ? &mut Writer {
+  let mut digits: [u8; 24] = [0; 24]
+  let end = Format.writeU64Display(usize.toU64(value), &mut digits, usize.ZERO)
+  return run Writer.writeAll(Slice.view<u8>(&digits, usize.ZERO, end))
+}
+
+// Writes the path with wire names, such as `auth.Basic.user` or `ports[2]`.
+effect fn writePath(path: &SchemaPath) -> () ! WriterError ? &mut Writer {
+  let segments = path.segments()
+  let mut at = usize.ZERO
+  while at < segments.length {
+    match segments[at] {
+      PathSegment.Field {wire, ..} => {
+        if at > usize.ZERO { run Writer.writeAll(b".") }
+        run Writer.writeString(wire)
+      }
+      PathSegment.Variant {wire, ..} => {
+        if at > usize.ZERO { run Writer.writeAll(b".") }
+        run Writer.writeString(wire)
+      }
+      PathSegment.Index {at: index} => {
+        run Writer.writeAll(b"[")
+        run writeNumber(index)
+        run Writer.writeAll(b"]")
+      }
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Whether the found value can be quoted from the input: one with a span inside the input.
+fn quotable(issue: Issue, input: &[u8], redact: bool) -> bool {
+  if redact { return false }
+  let scalar = match issue.found {
+    ValueKind.Text => true
+    ValueKind.Number => true
+    ValueKind.Boolean => true
+    ValueKind.Null => true
+    // A list or an object is quoted too, cut like long text, so a rule about its elements shows
+    // what it got, such as `[]`.
+    ValueKind.List => true
+    ValueKind.Object => true
+    _ => false
+  }
+  if !scalar { return false }
+  return match issue.span {
+    Option<Span>.Some {value} => value.start < value.end && value.end <= input.length
+    Option<Span>.None => false
+  }
+}
+
+// The end of the quoted part of `span`: at most `MAX_QUOTED` bytes and none of a line after the
+// first, cut at a character boundary.
+fn quotedEnd(input: &[u8], span: Span) -> usize {
+  let mut at = span.start
+  while at < span.end {
+    if input[at] == 10 || input[at] == 13 { return at }
+    at = at + usize.ONE
+  }
+  if span.end - span.start <= MAX_QUOTED { return span.end }
+  let mut end = span.start + MAX_QUOTED
+  while end > span.start && !startsCharacter(input[end]) { end = end - usize.ONE }
+  return end
+}
+
+// Writes `expected X, got Y`.
+effect fn writeMessage(error: &SchemaError, input: &[u8], redact: bool) -> () ! WriterError ? &mut Writer {
+  let issue = error.issue
+  run Writer.writeAll(b"expected ")
+  run Writer.writeString(issue.expected)
+  run Writer.writeAll(b", got ")
+  if let Option<String>.Some {value: got} = &error.got {
+    if !redact { return run JsonOutput.writeString(String.view(&got)) }
+  }
+  if let Option<Span>.Some {value: span} = issue.span {
+    if quotable(issue, input, redact) {
+      let end = quotedEnd(input, span)
+      run Writer.writeAll(Slice.view<u8>(input, span.start, end - span.start))
+      if end < span.end { run Writer.writeAll(b"...") }
+      return ()
+    }
+  }
+  return run Writer.writeString(ValueKind.noun(issue.found))
+}
+
+effect fn writeLocation(error: &SchemaError, input: &[u8], source: string) -> () ! WriterError ? &mut Writer {
+  run Writer.writeString(source)
+  if let Option<Span>.Some {value: span} = error.issue.span {
+    let place = placeOf(input, span.start)
+    run Writer.writeAll(b":")
+    run writeNumber(place.line)
+    run Writer.writeAll(b":")
+    run writeNumber(place.column)
+  }
+  return ()
+}
+
+effect fn writeLine(error: &SchemaError, input: &[u8], source: string, redact: bool) -> () ! WriterError ? &mut Writer {
+  run writeLocation(error, input, source)
+  run Writer.writeAll(b": ")
+  if error.path.length() > usize.ZERO {
+    run writePath(&error.path)
+    run Writer.writeAll(b": ")
+  }
+  run writeMessage(error, input, redact)
+  return run Writer.writeAll(b"\n")
+}
+
+// About how many characters of a long line a snippet shows on each side of the problem.
+const CONTEXT: usize = 40
+
+effect fn writeSnippet(error: &SchemaError, input: &[u8], source: string, redact: bool) -> () ! WriterError ? &mut Writer {
+  run Writer.writeAll(b" --> ")
+  run writeLocation(error, input, source)
+  if error.path.length() > usize.ZERO {
+    run Writer.writeAll(b" at ")
+    run writePath(&error.path)
+  }
+  run Writer.writeAll(b"\n")
+  let span = match error.issue.span {
+    Option<Span>.Some {value} => value
+    Option<Span>.None => {
+      run Writer.writeAll(b"  = ")
+      run writeMessage(error, input, redact)
+      return run Writer.writeAll(b"\n")
+    }
+  }
+  let place = placeOf(input, span.start)
+  let start = smaller(span.start, place.lineEnd)
+  // Show up to `CONTEXT` characters before the problem and after its start.
+  let mut shownStart = start
+  let mut before = usize.ZERO
+  while shownStart > place.lineStart && before < CONTEXT {
+    shownStart = shownStart - usize.ONE
+    if startsCharacter(input[shownStart]) { before = before + usize.ONE }
+  }
+  let mut shownEnd = start
+  let mut after = usize.ZERO
+  while shownEnd < place.lineEnd && after < CONTEXT {
+    shownEnd = shownEnd + usize.ONE
+    while shownEnd < place.lineEnd && !startsCharacter(input[shownEnd]) { shownEnd = shownEnd + usize.ONE }
+    after = after + usize.ONE
+  }
+  let caretEnd = larger(smaller(span.end, shownEnd), start)
+
+  let mut number: [u8; 24] = [0; 24]
+  let width = Format.writeU64Display(usize.toU64(place.line), &mut number, usize.ZERO)
+  run writeGutter(width)
+  run Writer.writeAll(b"\n")
+  run Writer.writeAll(Slice.view<u8>(&number, usize.ZERO, width))
+  run Writer.writeAll(b" | ")
+  if shownStart > place.lineStart { run Writer.writeAll(b"...") }
+  run Writer.writeAll(Slice.view<u8>(input, shownStart, shownEnd - shownStart))
+  if shownEnd < place.lineEnd { run Writer.writeAll(b"...") }
+  run Writer.writeAll(b"\n")
+  run writeGutter(width)
+  run Writer.writeAll(b" ")
+  if shownStart > place.lineStart { run Writer.writeAll(b"   ") }
+  // Indent under the problem, keeping tabs so the caret lines up.
+  let mut at = shownStart
+  while at < start {
+    if input[at] == 9 { run Writer.writeAll(b"\t") } else if startsCharacter(input[at]) { run Writer.writeAll(b" ") }
+    at = at + usize.ONE
+  }
+  run Writer.writeAll(b"^")
+  at = start + usize.ONE
+  while at < caretEnd {
+    if startsCharacter(input[at]) { run Writer.writeAll(b"^") }
+    at = at + usize.ONE
+  }
+  run Writer.writeAll(b" ")
+  run writeMessage(error, input, redact)
+  return run Writer.writeAll(b"\n")
+}
+
+effect fn writeGutter(width: usize) -> () ! WriterError ? &mut Writer {
+  let mut at = usize.ZERO
+  while at < width {
+    run Writer.writeAll(b" ")
+    at = at + usize.ONE
+  }
+  return run Writer.writeAll(b" |")
+}
+
+effect fn writeJson(error: &SchemaError, input: &[u8], redact: bool, first: bool) -> () ! WriterError ? &mut Writer {
+  if !first { run Writer.writeAll(b",") }
+  run Writer.writeAll(b"{\"path\":\"")
+  run writePointer(&error.path)
+  run Writer.writeAll(b"\",\"reason\":\"")
+  run Writer.writeString(IssueReason.name(error.issue.reason))
+  run Writer.writeAll(b"\",\"expected\":")
+  run JsonOutput.writeString(error.issue.expected)
+  run Writer.writeAll(b",\"found\":")
+  run JsonOutput.writeString(ValueKind.noun(error.issue.found))
+  if let Option<String>.Some {value: got} = &error.got {
+    if !redact {
+      run Writer.writeAll(b",\"value\":")
+      run JsonOutput.writeString(String.view(&got))
+    }
+  }
+  if let Option<Span>.Some {value: span} = error.issue.span {
+    if error.got.isNone() && quotable(error.issue, input, redact) {
+      let end = quotedEnd(input, span)
+      run Writer.writeAll(b",\"value\":")
+      run JsonOutput.writeString(unsafe Intrinsic.stringFromUtf8Unchecked(Slice.view<u8>(input, span.start, end - span.start)))
+    }
+    let place = placeOf(input, span.start)
+    run Writer.writeAll(b",\"line\":")
+    run writeNumber(place.line)
+    run Writer.writeAll(b",\"column\":")
+    run writeNumber(place.column)
+    run Writer.writeAll(b",\"start\":")
+    run writeNumber(span.start)
+    run Writer.writeAll(b",\"end\":")
+    run writeNumber(span.end)
+  }
+  return run Writer.writeAll(b"}")
+}
+
+// Writes the path as a JSON Pointer inside a JSON string: `~` as `~0`, `/` as `~1`, and the JSON
+// escapes a key needs.
+effect fn writePointer(path: &SchemaPath) -> () ! WriterError ? &mut Writer {
+  let segments = path.segments()
+  let mut at = usize.ZERO
+  while at < segments.length {
+    match segments[at] {
+      PathSegment.Field {wire, ..} => {
+        run Writer.writeAll(b"/")
+        run writePointerName(wire)
+      }
+      PathSegment.Variant {..} => {}
+      PathSegment.Index {at: index} => {
+        run Writer.writeAll(b"/")
+        run writeNumber(index)
+      }
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+effect fn writePointerName(name: string) -> () ! WriterError ? &mut Writer {
+  let bytes = String.utf8Bytes(name)
+  let mut at = usize.ZERO
+  while at < bytes.length {
+    let byte = bytes[at]
+    if byte == 126 {
+      run Writer.writeAll(b"~0")
+    } else if byte == 47 {
+      run Writer.writeAll(b"~1")
+    } else if byte == 34 {
+      run Writer.writeAll(b"\\\"")
+    } else if byte == 92 {
+      run Writer.writeAll(b"\\\\")
+    } else if byte < 32 {
+      run Writer.writeAll(b"\\u00")
+      let hex = b"0123456789abcdef"
+      run Writer.writeAll(Slice.view<u8>(hex, u8.toUsize(byte / 16), usize.ONE))
+      run Writer.writeAll(Slice.view<u8>(hex, u8.toUsize(byte % 16), usize.ONE))
+    } else {
+      run Writer.writeAll(Slice.view<u8>(bytes, at, usize.ONE))
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}

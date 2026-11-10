@@ -1037,6 +1037,10 @@ A nominal union begins with one coverage leaf for each variant of its complete a
 When the parent is itself a structural-union member, coverage retains the outer member and inner
 variant path rather than flattening either identity.
 
+An integer, `char` or `bool` scrutinee begins with every value its type holds. Unguarded literal,
+range and alternative arms remove the values they select, so arms that select every value need no
+`_` ([PATT-025](patterns-and-destructuring.md#patt-025--covering-every-scalar-value-makes-a-match-exhaustive)).
+
 **Boundary:** A match missing any member is invalid. A duplicate unguarded member, an arm after `_`,
 or another arm made impossible by earlier coverage is unreachable. A guarded arm alone never makes
 a member exhaustive.

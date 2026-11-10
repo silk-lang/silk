@@ -6,8 +6,8 @@
 //! use the ECMA-262 Unicode (`u`) grammar, not shell glob syntax.
 //!
 //! # Details
-//! The engine is the QuickJS regular-expression compiler and backtracking matcher as SilkJS ports
-//! it to Silk (QuickJS is Copyright (c) 2017-2021 Fabrice Bellard and Charlie Gordon, under the MIT
+//! The engine is Silk's own regular-expression compiler and backtracking matcher. It started from
+//! the QuickJS engine (Copyright (c) 2017-2021 Fabrice Bellard and Charlie Gordon, under the MIT
 //! license in `licenses/quickjs.txt`). A pattern compiles to bytecode once; a search then runs it
 //! with search hints (literal runs, anchors and first-character sets) and a heap backtracking
 //! stack, so long text never exhausts the native stack. Matching supports captures, named and
@@ -26,6 +26,9 @@ import silk.collections.slice { Slice }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
+import silk.core.reflect { Reflect, namedKind, unionKind }
+import silk.core.static_sequence { StaticSequence }
+import silk.core.static_text { StaticText }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.mem.pointer { Pointer }
 import silk.mem.stack { Stack }
@@ -41,6 +44,7 @@ import silk.simd.mask16
 import silk.simd.mask8
 import silk.simd.u16x8
 import silk.simd.u8x16
+import silk.text.regex_shape { RegexGroup, RegexShape }
 import silk.text.regex_unicode {
   CharRange,
   RangeOperation,
@@ -169,35 +173,608 @@ impl Regex {
   pub effect fn test(pattern: &Pattern, text: string) -> bool
     ! RegexError | OutOfMemoryError
     ? &mut Allocator {
-    let code = pattern.program.asSlice()
-    let bytes = String.utf8Bytes(text)
-    let mut ascii = true
+    let mut captures = Captures.empty()
+    return run search(pattern, text, &mut captures)
+  }
+
+  /// Returns the first match of a compiled pattern in `text`, with its capture groups.
+  ///
+  /// # Details
+  /// The search is the one `Regex.test` runs: unanchored unless the pattern supplies anchors, with
+  /// ECMAScript backtracking order deciding which match is first and what each group holds. The
+  /// match borrows `text`; its offsets count UTF-8 bytes even when the search ran on UTF-16.
+  ///
+  /// # Errors
+  /// - `RegexError` with `MatchLimit` after about 1,000,000 backtracking steps. Exhaustion is
+  ///   never reported as no match.
+  /// - `OutOfMemoryError` if the allocator cannot supply converted text, backtracking storage or
+  ///   the capture offsets.
+  pub effect fn find<'a>(pattern: &Pattern, text: string<'a>) -> Option<Match<'a>>
+    ! RegexError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut captures = Captures.empty()
+    if !run search(pattern, text, &mut captures) {
+      return Option<Match<'a>>.none()
+    }
+    return Option<Match<'a>>.some(Match { source: text, offsets: move captures })
+  }
+
+  /// Checks a pattern against a capture struct at compile time.
+  ///
+  /// # Details
+  /// `T` is a struct with named fields, written at `'static`. Every named group of `pattern` must
+  /// be a field of `T` and every field a named group; a field is `Option<string<'a>>` exactly when
+  /// a match can leave its group unset (under `?`, `*` or `{0,n}`, in one alternative of `|`, in a
+  /// negative lookaround, or a name two alternatives share) and `string<'a>` otherwise. Unnamed
+  /// groups need no field. An invalid pattern or a mismatch is a compile error.
+  ///
+  /// In the editor, each group name of a constant's pattern acts as a use of its field: an inlay
+  /// hint shows the field's type, hover shows the field and its doc, and find references on the
+  /// field lists the group.
+  ///
+  /// # Gotchas
+  /// `Regex.typed` reads only whether a field type is a union. A field type that is neither
+  /// `string<'a>` nor `Option<string<'a>>`, such as `i32`, is refused where the pattern is
+  /// searched, by the [`Capture`] bound of `find` and `whole`.
+  ///
+  /// # Examples
+  /// ## Read a version tag
+  /// ```silk
+  /// import silk.core.option { Option }
+  /// import silk.mem.allocator { Allocator, OutOfMemoryError }
+  /// import silk.text.regex { Regex, RegexError, Typed }
+  ///
+  /// struct Version<'a> {
+  ///   pub major: string<'a>,
+  ///   pub minor: string<'a>,
+  ///   pub patch: string<'a>,
+  ///   pub pre: Option<string<'a>>,
+  /// }
+  ///
+  /// const VERSION: Typed<Version<'static>> = Regex.typed<Version<'static>>(
+  ///   "^v(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)(-(?<pre>[0-9a-z.]+))?$",
+  /// )
+  ///
+  /// // The prerelease part of a tag such as v0.1.0-dev.58, if it is a version with one.
+  /// effect fn prerelease<'a>(tag: string<'a>) -> Option<string<'a>>
+  ///   ! RegexError | OutOfMemoryError
+  ///   ? &mut Allocator {
+  ///   let versions = run VERSION.compile()
+  ///   let found = run versions.whole<Version<'a>>(tag)
+  ///   match move found {
+  ///     Option<Version<'a>>.Some { value } => {
+  ///       return value.pre
+  ///     }
+  ///     Option<Version<'a>>.None => {
+  ///       return Option<string<'a>>.none()
+  ///     }
+  ///   }
+  /// }
+  /// ```
+  pub static fn typed<T>(pattern: string<'static>) -> Typed<T> {
+    if Reflect.typeKind(Reflect.typeOf<T>()) != namedKind {
+      compileError("Regex.typed needs a struct with named fields")
+    }
+    let shape = RegexShape.of(pattern)
+    if !shape.valid {
+      if shape.limit {
+        compileError("the pattern exceeds a regex limit")
+      }
+      let length = StaticText.byteLength(pattern)
+      let mut end = shape.offset + 1
+      if end > length {
+        end = length
+      }
+      // Cover the whole character, not only its first byte.
+      while end < length && StaticText.byteAt(pattern, end) >= 128 && StaticText.byteAt(pattern, end) < 192 {
+        end = end + 1
+      }
+      StaticText.errorAt(pattern, shape.offset, end, StaticText.concat("invalid regex: ", shape.message))
+    }
+    // In a helper, so this body has no `static for` and runs where `pattern` keeps its literal.
+    checkFields<T>(shape.groups)
+    let count = StaticSequence.length<RegexGroup>(shape.groups)
     let mut at: usize = 0
-    while at < bytes.length {
-      if bytes[at] >= 128 {
-        ascii = false
-        break
+    while at < count {
+      let group = StaticSequence.at<RegexGroup>(shape.groups, at)
+      if group.name != "" && fieldState<T>(group.name) != 0 {
+        // The editor shows the field a group name fills: its type after the name, its doc on hover.
+        let named = group.offset + 3
+        StaticText.link<T>(pattern, named, named + StaticText.byteLength(group.name), group.name)
+      }
+      if group.name != "" && fieldState<T>(group.name) == 0 {
+        let mut parts = StaticSequence.empty<string<'static>>()
+        parts = StaticSequence.append<string<'static>>(move parts, "the pattern captures ")
+        parts = StaticSequence.append<string<'static>>(move parts, group.name)
+        parts = StaticSequence.append<string<'static>>(move parts, " but the struct has no field ")
+        parts = StaticSequence.append<string<'static>>(move parts, group.name)
+        // The name starts after `(?<`.
+        let start = group.offset + 3
+        StaticText.errorAt(pattern, start, start + StaticText.byteLength(group.name), join(move parts))
       }
       at = at + 1
     }
-    if ascii {
-      return run Effect.catch<RegExpTimeout>(searchNarrow(code, bytes), budgetFailure)
+    let anchored = StaticText.concat(StaticText.concat("^(?:", pattern), ")$")
+    return Typed<T> { source: pattern, anchored: anchored, owner: [] }
+  }
+
+  /// Returns the number of capture groups in a compiled pattern, counting group 0, the whole match.
+  pub fn groupCount(pattern: &Pattern) -> usize {
+    return pattern.program.captureCount()
+  }
+
+  /// Returns the number of the first capture group named `name`, or none.
+  ///
+  /// # Details
+  /// Groups are numbered from 1 in the order their `(` appears; group 0 is the whole match. A name
+  /// that ECMAScript lets two alternatives share, as in `(?<n>a)|(?<n>b)`, gives the first group.
+  pub fn groupIndex(pattern: &Pattern, name: string) -> Option<usize> {
+    let records = pattern.program.groupNames()
+    let wanted = String.utf8Bytes(name)
+    let mut group: usize = 1
+    let mut at: usize = 0
+    while at < records.length {
+      let start = at
+      while records[at] != 0 {
+        at = at + 1
+      }
+      if at - start == wanted.length && wanted.length != 0 {
+        let mut same = true
+        let mut index: usize = 0
+        while index < wanted.length {
+          if records[start + index] != wanted[index] {
+            same = false
+            break
+          }
+          index = index + 1
+        }
+        if same {
+          return Option<usize>.some(group)
+        }
+      }
+
+      // The NUL, then the scope byte.
+      at = at + 2
+      group = group + 1
     }
-    let mut units = List<u16>.make()
-    run units.reserve(bytes.length)
-    at = 0
-    while at < bytes.length {
-      let decoded = utf8_scan.decode(bytes, at)
-      let scalar = decoded.scalar
-      if scalar < 65536 {
-        run units.append(u32.toU16(scalar))
+    return Option<usize>.none()
+  }
+}
+
+/// One match of a compiled pattern in a text: the matched span and the span of each capture group.
+///
+/// # Details
+/// Group 0 is the whole match; groups 1 and up are the pattern's capture groups, numbered in the
+/// order their `(` appears. A group that took no part in the match has no text. Offsets count
+/// UTF-8 bytes of the searched text, so they cut it with `String.slice`. The match borrows the
+/// text it was found in.
+pub struct Match<'a> {
+  source: string<'a>,
+  offsets: Captures
+}
+
+impl<'a> Match<'a> {
+  /// Returns the number of groups, counting group 0, the whole match.
+  pub fn groupCount(self: &Self) -> usize {
+    return self.offsets.length() / 2
+  }
+
+  /// Returns the byte offset where the match starts.
+  pub fn start(self: &Self) -> usize {
+    return i32.toUsize(self.offsets.get(0))
+  }
+
+  /// Returns the byte offset just past the end of the match.
+  pub fn end(self: &Self) -> usize {
+    return i32.toUsize(self.offsets.get(1))
+  }
+
+  /// Returns the matched text.
+  pub fn text(self: &Self) -> string<'a> {
+    let start = self.start()
+    return String.slice(self.source, start, self.end() - start)
+  }
+
+  /// Returns the text of group `index`, or none when the group took no part in the match.
+  ///
+  /// # Gotchas
+  /// The program traps if `index` is not less than `groupCount()`.
+  pub fn group(self: &Self, index: usize) -> Option<string<'a>> {
+    if index >= self.groupCount() {
+      Intrinsic.trap("Match.group: index past the last group")
+    }
+    let start = self.offsets.get(index * 2)
+    let end = self.offsets.get(index * 2 + 1)
+    if start < 0 || end < 0 {
+      return Option<string<'a>>.none()
+    }
+    let first = i32.toUsize(start)
+    return Option<string<'a>>.some(String.slice(self.source, first, i32.toUsize(end) - first))
+  }
+
+  /// Returns the text of the group named `name`, or none when no group of that name took part.
+  ///
+  /// # Details
+  /// `pattern` is the pattern this match came from. A name that two alternatives share, as in
+  /// `(?<n>a)|(?<n>b)`, gives the text of whichever group took part.
+  ///
+  /// # Gotchas
+  /// The program traps if `pattern` has more groups than the match, a sign it is another pattern.
+  pub fn named(self: &Self, pattern: &Pattern, name: string) -> Option<string<'a>> {
+    let records = pattern.program.groupNames()
+    let wanted = String.utf8Bytes(name)
+    let mut group: usize = 1
+    let mut at: usize = 0
+    while at < records.length {
+      let start = at
+      while records[at] != 0 {
+        at = at + 1
+      }
+      if at - start == wanted.length && wanted.length != 0 {
+        let mut same = true
+        let mut index: usize = 0
+        while index < wanted.length {
+          if records[start + index] != wanted[index] {
+            same = false
+            break
+          }
+          index = index + 1
+        }
+        if same {
+          let text = self.group(group)
+          if text.isSome() {
+            return text
+          }
+        }
+      }
+
+      // The NUL, then the scope byte.
+      at = at + 2
+      group = group + 1
+    }
+    return Option<string<'a>>.none()
+  }
+}
+
+/// A field type that a typed pattern fills from one named capture group.
+///
+/// # Details
+/// `string<'a>` holds a group every match sets, and `Option<string<'a>>` a group a match can
+/// leave unset. `Regex.typed` requires a field to be optional exactly when its group can be
+/// unset, and counts a field type that is a union, such as `Option`, as optional.
+pub interface Capture<'a> {
+  /// Builds the value from the group's text, or from none when the group took no part.
+  fn capture(group: Option<string<'a>>) -> Self
+}
+
+impl<'a> Capture<'a> for string<'a> {
+  /// Returns the group's text. `Regex.typed` admits a string only for a group every match sets.
+  fn capture(group: Option<string<'a>>) -> string<'a> {
+    match move group {
+      Option<string<'a>>.Some { value } => {
+        return value
+      }
+      Option<string<'a>>.None => {
+        Intrinsic.trap("Capture: a required group took no part in the match")
+      }
+    }
+  }
+}
+
+impl<'a> Capture<'a> for Option<string<'a>> {
+  /// Returns the group's text, or none when the group took no part in the match.
+  fn capture(group: Option<string<'a>>) -> Option<string<'a>> {
+    return group
+  }
+}
+
+/// A pattern checked at compile time against `T`, a struct with one field per named group.
+///
+/// # Details
+/// Build it with `Regex.typed`, usually as a `const`. `T` is the struct at `'static`; a search
+/// names the same struct at the text's lifetime, as in `matcher.find<Version<'a>>(tag)`.
+pub struct Typed<T> {
+  source: string<'static>,
+  anchored: string<'static>,
+  owner: [T; 0]
+}
+
+impl<T> Typed<T> {
+  /// Returns the pattern text.
+  pub fn pattern(self: &Self) -> string<'static> {
+    return self.source
+  }
+
+  /// Compiles the pattern for repeated typed searches.
+  ///
+  /// # Errors
+  /// - `RegexError` with `PatternLimit` for a limit only the compiled program reveals: too many
+  ///   class ranges or nested quantifiers. `Regex.typed` has already rejected every syntax error.
+  /// - `OutOfMemoryError` if the allocator cannot supply the programs.
+  pub effect fn compile(self: &Self) -> Matcher<T>
+    ! RegexError | OutOfMemoryError
+    ? &mut Allocator {
+    let search = run Regex.compile(self.source)
+    let anchored = run Regex.compile(self.anchored)
+    return Matcher<T> { search: move search, anchored: move anchored, owner: [] }
+  }
+}
+
+/// A compiled typed pattern: searches return the capture struct directly.
+pub struct Matcher<T> {
+  search: Pattern,
+  anchored: Pattern,
+  owner: [T; 0]
+}
+
+impl<T> Matcher<T> {
+  /// Returns the first match in `text` as a `U`, the capture struct at the text's lifetime.
+  ///
+  /// # Details
+  /// `U` is the struct `Regex.typed` checked, named again with the lifetime of `text` because
+  /// its fields borrow it: `matcher.find<Version<'a>>(tag)` for a `Matcher<Version<'static>>` and
+  /// a `tag: string<'a>`. A `U` whose fields differ from `T`'s in name or optionality is a
+  /// compile error.
+  ///
+  /// # Errors
+  /// - `RegexError` with `MatchLimit` after about 1,000,000 backtracking steps, never no match.
+  /// - `OutOfMemoryError` if the allocator cannot supply search storage.
+  pub effect fn find<'a, U>(self: &Self, text: string<'a>) -> Option<U>
+    ! RegexError | OutOfMemoryError
+    ? &mut Allocator {
+    return run typedSearch<'a, T, U>(&self.search, text)
+  }
+
+  /// Returns the match that spans all of `text` as a `U`, or none.
+  ///
+  /// # Details
+  /// As `find`, but the match must start at the beginning of `text` and end at its end, as if the
+  /// pattern were written `^(?:pattern)$`.
+  ///
+  /// # Errors
+  /// - `RegexError` with `MatchLimit` after about 1,000,000 backtracking steps, never no match.
+  /// - `OutOfMemoryError` if the allocator cannot supply search storage.
+  pub effect fn whole<'a, U>(self: &Self, text: string<'a>) -> Option<U>
+    ! RegexError | OutOfMemoryError
+    ? &mut Allocator {
+    return run typedSearch<'a, T, U>(&self.anchored, text)
+  }
+}
+
+// Searches with a typed pattern checked against T, reading the match into U, T's struct at the
+// text's lifetime.
+effect fn typedSearch<'a, T, U>(pattern: &Pattern, text: string<'a>) -> Option<U>
+  ! RegexError | OutOfMemoryError
+  ? &mut Allocator {
+  static if !sameCaptures<T, U>() {
+    compileError("a typed search needs the struct its pattern was checked against")
+  }
+  let found = run Regex.find(pattern, text)
+  match move found {
+    Option<Match<'a>>.Some { value } => {
+      return Option<U>.some(
+        U { static for field in Reflect.fields<U>() { [field]: captured(pattern, &value, field) } },
+      )
+    }
+    Option<Match<'a>>.None => {
+      return Option<U>.none()
+    }
+  }
+}
+
+fn captured<'a, Owner, V: Capture<'a>>(
+  pattern: &Pattern,
+  found: &Match<'a>,
+  static field: Intrinsic.Field<Owner, V>,
+) -> V {
+  let static label = Reflect.fieldLabel(field)
+  return Capture.capture(found.named(pattern, label))
+}
+
+// Whether a capture field's type holds a group a match can leave unset.
+static fn optionalType<V>() -> bool {
+  return Reflect.typeKind(Reflect.typeOf<V>()) == unionKind
+}
+
+static fn fieldOptional<Owner, V>(field: Intrinsic.Field<Owner, V>) -> bool {
+  return optionalType<V>()
+}
+
+static fn fieldCount<T>() -> usize {
+  let mut count: usize = 0
+  static for _field in Reflect.fields<T>() {
+    count = count + 1
+  }
+  return count
+}
+
+// 0 when T has no field `label`, 1 for a required field, 2 for an optional one.
+static fn fieldState<T>(label: string) -> u8 {
+  let mut state: u8 = 0
+  static for field in Reflect.fields<T>() {
+    if Reflect.fieldLabel(field) == label {
+      state = 1
+      if fieldOptional(field) {
+        state = 2
+      }
+    }
+  }
+  return state
+}
+
+// Whether U has T's fields, by name and optionality: the same capture struct at another lifetime.
+static fn sameCaptures<T, U>() -> bool {
+  if fieldCount<T>() != fieldCount<U>() {
+    return false
+  }
+  static for field in Reflect.fields<U>() {
+    let mut state: u8 = 1
+    if fieldOptional(field) {
+      state = 2
+    }
+    if fieldState<T>(Reflect.fieldLabel(field)) != state {
+      return false
+    }
+  }
+  return true
+}
+
+// 0 when no group is named `name`, 1 when one is and every match sets it, 2 when a match can
+// leave it unset: it is optional, or two alternatives share the name.
+static fn groupState(groups: Intrinsic.StaticSequence<RegexGroup>, name: string) -> u8 {
+  let mut state: u8 = 0
+  let count = StaticSequence.length<RegexGroup>(groups)
+  let mut at: usize = 0
+  while at < count {
+    let group = StaticSequence.at<RegexGroup>(groups, at)
+    if group.name == name {
+      if state != 0 || group.optional {
+        state = 2
       } else {
-        run units.append(u32.toU16(55232 + u32.shiftRight(scalar, 10)))
-        run units.append(u32.toU16(56320 + u32.bitAnd(scalar, 1023)))
+        state = 1
+      }
+    }
+    at = at + 1
+  }
+  return state
+}
+
+static fn join(parts: Intrinsic.StaticSequence<string<'static>>) -> string<'static> {
+  let mut text = ""
+  let count = StaticSequence.length<string<'static>>(parts)
+  let mut at: usize = 0
+  while at < count {
+    text = StaticText.concat(text, StaticSequence.at<string<'static>>(parts, at))
+    at = at + 1
+  }
+  return text
+}
+
+static fn checkFields<T>(groups: Intrinsic.StaticSequence<RegexGroup>) -> () {
+  static for field in Reflect.fields<T>() {
+    checkField(groups, field)
+  }
+  return ()
+}
+
+static fn checkField<Owner, V>(
+  groups: Intrinsic.StaticSequence<RegexGroup>,
+  field: Intrinsic.Field<Owner, V>,
+) -> () {
+  let label = Reflect.fieldLabel(field)
+  let state = groupState(groups, label)
+  let mut parts = StaticSequence.empty<string<'static>>()
+  if state == 0 {
+    parts = StaticSequence.append<string<'static>>(move parts, "field ")
+    parts = StaticSequence.append<string<'static>>(move parts, label)
+    parts = StaticSequence.append<string<'static>>(
+      move parts,
+      " has no capture group in the pattern; name one (?<",
+    )
+    parts = StaticSequence.append<string<'static>>(move parts, label)
+    parts = StaticSequence.append<string<'static>>(move parts, ">...)")
+    StaticText.errorAt(label, 0, StaticText.byteLength(label), join(move parts))
+  }
+  let optional = optionalType<V>()
+  if state == 2 && !optional {
+    parts = StaticSequence.append<string<'static>>(move parts, label)
+    parts = StaticSequence.append<string<'static>>(
+      move parts,
+      " can be absent, so declare it Option<string>",
+    )
+    StaticText.errorAt(label, 0, StaticText.byteLength(label), join(move parts))
+  }
+  if state == 1 && optional {
+    parts = StaticSequence.append<string<'static>>(move parts, label)
+    parts = StaticSequence.append<string<'static>>(
+      move parts,
+      " is always present, so declare it string",
+    )
+    StaticText.errorAt(label, 0, StaticText.byteLength(label), join(move parts))
+  }
+  return ()
+}
+
+// Runs one search of text, leaving the match's offsets in captures as UTF-8 byte offsets.
+effect fn search(pattern: &Pattern, text: string, captures: &mut Captures) -> bool
+  ! RegexError | OutOfMemoryError
+  ? &mut Allocator {
+  let code = pattern.program.asSlice()
+  let bytes = String.utf8Bytes(text)
+  let mut ascii = true
+  let mut at: usize = 0
+  while at < bytes.length {
+    if bytes[at] >= 128 {
+      ascii = false
+      break
+    }
+    at = at + 1
+  }
+  if ascii {
+    return run Effect.catch<RegExpTimeout>(searchNarrow(code, bytes, &mut captures), budgetFailure)
+  }
+  let mut units = List<u16>.make()
+  run units.reserve(bytes.length)
+  at = 0
+  while at < bytes.length {
+    let decoded = utf8_scan.decode(bytes, at)
+    let scalar = decoded.scalar
+    if scalar < 65536 {
+      run units.append(u32.toU16(scalar))
+    } else {
+      run units.append(u32.toU16(55232 + u32.shiftRight(scalar, 10)))
+      run units.append(u32.toU16(56320 + u32.bitAnd(scalar, 1023)))
+    }
+    at = decoded.next
+  }
+  let matched = run Effect.catch<RegExpTimeout>(
+    searchWide(code, units.asSlice(), &mut captures),
+    budgetFailure,
+  )
+  if matched {
+    run unitsToBytes(bytes, &mut captures)
+  }
+  return matched
+}
+
+// Rewrites the UTF-16 unit offsets in captures as UTF-8 byte offsets into bytes, in one pass over
+// the text: the offsets are visited in increasing order. An unset offset (-1) stays unset.
+effect fn unitsToBytes(bytes: &[u8], captures: &mut Captures) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let count = captures.length()
+  let mut order = List<usize>.make()
+  run order.reserve(count)
+  let mut slot: usize = 0
+  while slot < count {
+    let value = captures.get(slot)
+    if value >= 0 {
+      // Insertion sort: a match has few offsets, and they are mostly in order already.
+      let mut place = order.length()
+      while place > 0 && captures.get(order.get(place - 1)) > value {
+        place = place - 1
+      }
+      run order.insert(place, slot)
+    }
+    slot = slot + 1
+  }
+  let mut unit: usize = 0
+  let mut at: usize = 0
+  let mut next: usize = 0
+  while next < order.length() {
+    let index = order.get(next)
+    let target = i32.toUsize(captures.get(index))
+    while unit < target && at < bytes.length {
+      let decoded = utf8_scan.decode(bytes, at)
+      if decoded.scalar < 65536 {
+        unit = unit + 1
+      } else {
+        unit = unit + 2
       }
       at = decoded.next
     }
-    return run Effect.catch<RegExpTimeout>(searchWide(code, units.asSlice()), budgetFailure)
+    captures.set(index, usize.toI32(at))
+    next = next + 1
   }
 }
 
@@ -211,11 +788,10 @@ fn spend(polls: &mut usize) -> bool {
 }
 
 // Each closure literal instantiates its own copy of the matcher, so each width has one call site.
-effect fn searchNarrow(code: &[u8], text: &[u8]) -> bool
+effect fn searchNarrow(code: &[u8], text: &[u8], captures: &mut Captures) -> bool
   ! OutOfMemoryError | RegExpTimeout
   ? &mut Allocator {
   let mut polls: usize = 0
-  let mut captures = Captures.empty()
   return run RegExpExecutor.match8(
     code,
     text,
@@ -228,11 +804,10 @@ effect fn searchNarrow(code: &[u8], text: &[u8]) -> bool
   )
 }
 
-effect fn searchWide(code: &[u8], text: &[u16]) -> bool
+effect fn searchWide(code: &[u8], text: &[u16], captures: &mut Captures) -> bool
   ! OutOfMemoryError | RegExpTimeout
   ? &mut Allocator {
   let mut polls: usize = 0
-  let mut captures = Captures.empty()
   return run RegExpExecutor.match16(
     code,
     text,
@@ -345,7 +920,7 @@ const REOP_STAR: u8 = 48
 
 const REOP_PLUS: u8 = 49
 
-/// Compiler-produced bytecode with its original QuickJS header and name trailer.
+/// Compiler-produced bytecode with its header and name trailer.
 /// Bytecode passed to the executor must be a complete, unmodified compiler result.
 struct RegExpProgram {
   pub bytecode: List<u8>
@@ -1221,7 +1796,7 @@ impl CompilerState {
     self.depth = self.depth + 1
   }
 
-  // QuickJS parses a group's disjunction by recursion, a few native frames per level, which a
+  // Parsing a group's disjunction by recursion costs a few native frames per level, which a
   // wasm engine's call stack holds only so many of. This parser keeps the open groups in a list
   // instead, so nesting costs heap rather than stack and maxDepth is the only nesting bound.
   effect fn disjunction(self: &mut Self, input: &[u8], backward: bool) -> ()
@@ -3280,7 +3855,7 @@ impl RegExpStrings {
 }
 
 // From SilkJS src/regexp_exec.silk.
-//! Native execution of the pinned QuickJS RegExp bytecode, including its undo-log VM.
+//! Native execution of the RegExp bytecode, including its undo-log VM.
 //! Inputs are Latin-1 bytes or UTF-16 code units, never UTF-8. Capture offsets are
 //! code-unit indices; -1 denotes an unset capture. Valid compiler bytecode and a
 //! start index no greater than the input length are preconditions. In Unicode
@@ -4089,7 +4664,7 @@ fn rangeContains(bytecode: &[u8], offset: usize, count: usize, code: u32, wide: 
     stride = 8
   }
   if offset > bytecode.length || (bytecode.length - offset) / stride < count {
-    Intrinsic.trap("QuickJS invariant violated")
+    Intrinsic.trap("regex invariant violated")
   }
 
   // The whole table is in bounds, so the search reads it without per-entry checks.
@@ -4879,7 +5454,7 @@ effect fn execute<U: Units, 'env>(
   ! OutOfMemoryError | RegExpTimeout
   ? &mut Allocator {
   if bytecode.length <= RE_HEADER_LEN {
-    Intrinsic.trap("QuickJS invariant violated")
+    Intrinsic.trap("regex invariant violated")
   }
   let ops = opcodes(bytecode)
 
@@ -5403,10 +5978,10 @@ effect fn execute<U: Units, 'env>(
 
       // REOP_invalid and unknown bytes violate the compiler-bytecode precondition.
       0 => {
-        Intrinsic.trap("QuickJS invariant violated")
+        Intrinsic.trap("regex invariant violated")
       }
       45 => {
-        Intrinsic.trap("QuickJS invariant violated")
+        Intrinsic.trap("regex invariant violated")
       }
       46 => { // REOP_CLASS
         let count = u16.toUsize(unsafe rangeU16(ops, pc))
@@ -5431,49 +6006,49 @@ effect fn execute<U: Units, 'env>(
         pc = usize.wrappingAdd(pc, 2) + count * 4 + CLASS_BITS_LENGTH
       }
       50 => {
-        Intrinsic.trap("QuickJS invariant violated")
+        Intrinsic.trap("regex invariant violated")
       }
       51 => {
-        Intrinsic.trap("QuickJS invariant violated")
+        Intrinsic.trap("regex invariant violated")
       }
       52 => {
-        Intrinsic.trap("QuickJS invariant violated")
+        Intrinsic.trap("regex invariant violated")
       }
       53 => {
-        Intrinsic.trap("QuickJS invariant violated")
+        Intrinsic.trap("regex invariant violated")
       }
       54 => {
-        Intrinsic.trap("QuickJS invariant violated")
+        Intrinsic.trap("regex invariant violated")
       }
       55 => {
-        Intrinsic.trap("QuickJS invariant violated")
+        Intrinsic.trap("regex invariant violated")
       }
       56 => {
-        Intrinsic.trap("QuickJS invariant violated")
+        Intrinsic.trap("regex invariant violated")
       }
       57 => {
-        Intrinsic.trap("QuickJS invariant violated")
+        Intrinsic.trap("regex invariant violated")
       }
       58 => {
-        Intrinsic.trap("QuickJS invariant violated")
+        Intrinsic.trap("regex invariant violated")
       }
       59 => {
-        Intrinsic.trap("QuickJS invariant violated")
+        Intrinsic.trap("regex invariant violated")
       }
       60 => {
-        Intrinsic.trap("QuickJS invariant violated")
+        Intrinsic.trap("regex invariant violated")
       }
       61 => {
-        Intrinsic.trap("QuickJS invariant violated")
+        Intrinsic.trap("regex invariant violated")
       }
       62 => {
-        Intrinsic.trap("QuickJS invariant violated")
+        Intrinsic.trap("regex invariant violated")
       }
       63 => {
-        Intrinsic.trap("QuickJS invariant violated")
+        Intrinsic.trap("regex invariant violated")
       }
       _ => {
-        Intrinsic.trap("QuickJS invariant violated")
+        Intrinsic.trap("regex invariant violated")
       }
     }
     if failed {
@@ -5726,7 +6301,7 @@ impl ByteBuffer {
     ? &mut Allocator {
     let size = self.count
     if offset > size || length > size - offset {
-      Intrinsic.trap("QuickJS invariant violated")
+      Intrinsic.trap("regex invariant violated")
     }
     run self.ensure(length)
 
@@ -5761,7 +6336,7 @@ impl ByteBuffer {
     ? &mut Allocator {
     let oldLength = self.count
     if offset > oldLength {
-      Intrinsic.trap("QuickJS invariant violated")
+      Intrinsic.trap("regex invariant violated")
     }
     if length == 0 {
       return ()
@@ -5921,13 +6496,13 @@ fn operand(bytes: &[u8], offset: usize, width: usize) -> [*]const u8 {
 }
 
 // From SilkJS src/utf8.silk.
-/// One decoded QuickJS code point and the number of input bytes consumed.
+/// One decoded code point and the number of input bytes consumed.
 struct Decoded {
   pub codePoint: u32,
   pub length: usize
 }
 
-/// QuickJS's extended UTF-8 codec, including surrogates and 31-bit values.
+/// The engine's extended UTF-8 codec, including surrogates and 31-bit values.
 /// This is not a validator for Silk strings: five/six-byte sequences and isolated
 /// surrogates are deliberately accepted, matching unicode_from_utf8 upstream.
 struct Utf8 {}
@@ -6058,7 +6633,7 @@ fn upper(c: u8) -> u8 {
 }
 
 // From SilkJS src/native_stack.silk.
-//! Native frame sampling for QuickJS's downward-growing stack guards.
+//! Native frame sampling for the downward-growing stack guards.
 
 /// Returns this call site's current native frame address, not a dereferenceable pointer.
 /// Compare samples only within the same running native stack; inlining can merge frames.

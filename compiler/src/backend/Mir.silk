@@ -55,6 +55,7 @@ import semantic.TypedBody {
   MatchArm as BodyMatchArm,
   MatchSyntax as BodyMatchSyntax,
   Pattern as BodyPattern,
+  Alternative as BodyAlternative,
   SubjectAccess as BodySubjectAccess,
   UnionMember as BodyUnionMember,
   PlaceStep as BodyPlaceStep,
@@ -70,7 +71,6 @@ import silk.collections.bytes {Bytes}
 import silk.core.option {Option}
 import silk.mem.shared {Shared}
 import silk.mem.interned {Interned}
-import silk.mem.frozen {Frozen}
 import silk.num.u8
 import silk.num.usize
 import silk.collections.list {List}
@@ -621,26 +621,41 @@ struct ExitDrop {
 
 impl Copy for ExitDrop {}
 
-// How an exit path ends: returning, failing, or abandoning a cancelled frame.
+// How an exit path ends: returning, failing, forwarding a callee's failure through the shared
+// forward block, or abandoning a cancelled frame.
 enum ExitKind {
   Returns,
   Fails,
+  Forwards,
   Abandons,
 }
 
 // One node of the function-exit drop trie. Each exit's drops, read outermost first, form a path
 // from a root (`next` is usize.MAX) that returns, fails or abandons the frame; exits whose remaining drops agree share
 // the end of that path. `count` exits pass through the step, and `block` is its shared block once
-// one is needed.
+// one is needed. A root that forwards names the forward block its paths end in as `forward`.
 struct ExitStep {
   next: usize,
   released: ExitDrop,
   kind: ExitKind,
+  forward: usize,
   count: usize,
   entries: usize,
   block: usize,
   origin: Origin,
   children: List<usize>,
+}
+
+// The forward block that records frames for the observer at `observer`.
+struct ForwardBlock {
+  observer: Place,
+  block: usize,
+}
+
+// The slot run sites catch failures of type `ty` in, on their way out of the function.
+struct CaughtSlot {
+  ty: Interned<Type>,
+  local: usize,
 }
 
 // A `return`, `fail` or failure propagation whose block is completed once the function ends: its
@@ -1044,6 +1059,17 @@ struct Builder {
   // those exits in lowering order.
   exits: List<ExitStep>,
   left: List<LeftExit>,
+  // The blocks forwarded failures' drop paths end in, one per observer place, each recording the
+  // forwarding site as the failure's next frame and failing; the one the exit being left ends in;
+  // and the local holding that site's label, usize.MAX until a run site in a program that observes
+  // diagnostics forwards a failure. Sharing the blocks keeps the observer glue out of each run site.
+  forwards: List<ForwardBlock>,
+  forward: usize,
+  forwardSite: usize,
+  // The slot each failure type a run site forwards is caught in. Only one failure is in flight at
+  // a time and each site moves it out at once, so the sites of one type share a slot and its
+  // context companion instead of each keeping its own for the whole frame.
+  caught: List<CaughtSlot>,
   // The remaining children of each partial consuming site, keyed by body node.
   remainders: List<Remainder>,
   // Which typed-body locals and node values need cleanup, answered by semantic analysis.
@@ -2994,8 +3020,10 @@ fn sameExitDrop(left: ExitDrop, right: ExitDrop) -> bool {
   return left.node == right.node && left.state == right.state && left.plan == right.plan && left.temporary == right.temporary
 }
 
-fn exitTerminator(kind: ExitKind, origin: Origin) -> Terminator {
+// How an exit of `kind` ends; a forwarding one jumps to forward block `forward`.
+fn exitTerminator(kind: ExitKind, forward: usize, origin: Origin) -> Terminator {
   if kind == ExitKind.Fails { return Terminator.Fail {origin: origin} }
+  if kind == ExitKind.Forwards { return Terminator.Goto {target: forward, origin: origin} }
   if kind == ExitKind.Abandons { return Terminator.Abandon {origin: origin} }
   return Terminator.Return {origin: origin}
 }
@@ -3003,7 +3031,9 @@ fn exitTerminator(kind: ExitKind, origin: Origin) -> Terminator {
 effect fn exitStep(builder: &mut Builder, next: usize, released: ExitDrop, kind: ExitKind, origin: Origin) -> usize
 ! OutOfMemoryError ? &mut Allocator {
   let index = List<ExitStep>.length(&builder.exits)
-  run List<ExitStep>.append(&mut builder.*.exits, ExitStep {next: next, released: released, kind: kind,
+  let mut forward = usize.MAX
+  if kind == ExitKind.Forwards { forward = builder.forward }
+  run List<ExitStep>.append(&mut builder.*.exits, ExitStep {next: next, released: released, kind: kind, forward: forward,
     count: usize.ZERO, entries: usize.ZERO, block: usize.MAX, origin: origin, children: List<usize>.make()})
   if next != usize.MAX {
     let mut steps = List<ExitStep>.asMutSlice(&mut builder.*.exits)
@@ -3012,12 +3042,15 @@ effect fn exitStep(builder: &mut Builder, next: usize, released: ExitDrop, kind:
   return index
 }
 
-// The root step that returns, fails or abandons, created once per function and kind.
+// The root step that returns, fails or abandons, created once per function and kind, and for a
+// forwarding exit once per forward block.
 effect fn exitRoot(builder: &mut Builder, kind: ExitKind, origin: Origin) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let mut forward = usize.MAX
+  if kind == ExitKind.Forwards { forward = builder.forward }
   let steps = List<ExitStep>.asSlice(&builder.exits)
   let mut at = usize.ZERO
   while at < steps.length {
-    if steps[at].next == usize.MAX && steps[at].kind == kind { return at }
+    if steps[at].next == usize.MAX && steps[at].kind == kind && steps[at].forward == forward { return at }
     at = at + usize.ONE
   }
   return run exitStep(&mut builder.*, usize.MAX, ExitDrop {node: usize.MAX, state: usize.MAX, plan: usize.MAX, temporary: usize.MAX}, kind, origin)
@@ -3057,7 +3090,8 @@ effect fn leaveFunction(builder: &mut Builder, kind: ExitKind, origin: Origin) -
   let drops = run exitDrops(&mut builder.*)
   let listed = List<ExitDrop>.asSlice(&drops)
   if listed.length == usize.ZERO {
-    terminate(&mut builder.*, exitTerminator(kind, origin))
+    let forward = builder.forward
+    terminate(&mut builder.*, exitTerminator(kind, forward, origin))
     return ()
   }
   // An owner of an open abstract type is reported at the exit that needs its drop, as inline
@@ -3327,8 +3361,9 @@ effect fn walkExit(builder: &mut Builder, start: usize, owned: bool, queue: &mut
     let kind = steps[step].kind
     let shared = steps[step].count > usize.ONE
     let released = steps[step].released
+    let forward = steps[step].forward
     if next == usize.MAX {
-      terminate(&mut builder.*, exitTerminator(kind, origin))
+      terminate(&mut builder.*, exitTerminator(kind, forward, origin))
       return ()
     }
     if !inline && shared {
@@ -3951,6 +3986,21 @@ effect fn materializeEmbedded(builder: &mut Builder, value: &Interned<StaticData
     }
     return Option<Operand>.none()
   }
+  // A value stored in a structural union field is built as its member, then injected under the
+  // member's tag.
+  match move run staticPlacement(value, ty) {
+    StaticPlacement.Plain => {}
+    StaticPlacement.Member {tag, ty: stored} => {
+      let inner = match move run materializeEmbedded(&mut builder.*, value, &stored, origin) {
+        Option<Operand>.Some {value: built} => move built
+        Option<Operand>.None => { return Option<Operand>.none() }
+      }
+      let output = run temporary(&mut builder.*, ty, origin)
+      run assign(&mut builder.*, place(output), Rvalue.Inject {tag: tag, value: move inner}, origin)
+      return Option<Operand>.some(Operand.Move {place: place(output)})
+    }
+    StaticPlacement.Unplaced => { return Option<Operand>.none() }
+  }
   let scalar = run embeddedOperand(value, Interned<Type>.clone(ty))
   if let Option<Operand>.Some {value: operand} = move scalar { return Option<Operand>.some(move operand) }
   let mut text = run StaticValue.textBytes(value)
@@ -4047,7 +4097,33 @@ effect fn materializeEmbedded(builder: &mut Builder, value: &Interned<StaticData
 // The runtime representation type of one embedded struct field's value: an aggregate's own type,
 // a scalar's primitive, `char`, unit, `'static` text, a `&'static [u8]` byte view, or a scalar
 // enum's representation integer.
-effect fn representationType(value: &Interned<StaticData>) -> Option<Interned<Type>> ! OutOfMemoryError ? &mut Allocator | &mut Types {
+/// Where a static value is stored in storage of type `ty`.
+pub union StaticPlacement {
+  /// `ty` is not a structural union, or is normalized to the value's own type: the value is the storage.
+  Plain,
+  /// Under this tag of the structural union `ty`, as a value of the member type `ty`.
+  Member {pub tag: usize, pub ty: Interned<Type>},
+  /// The value's type is not a member the storage can place.
+  Unplaced,
+}
+
+/// Where `value` sits when stored as `ty`: a value held by a structural union field is one of its
+/// members, so it is stored under that member's tag.
+pub effect fn staticPlacement(value: &Interned<StaticData>, ty: &Interned<Type>) -> StaticPlacement
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  if let Option<List<Interned<Type>>>.None = move run Type.canonicalUnionMembers(ty) { return StaticPlacement.Plain }
+  let member = match move run representationType(value) {
+    Option<Interned<Type>>.Some {value: found} => move found
+    Option<Interned<Type>>.None => { return StaticPlacement.Unplaced }
+  }
+  return match move run UnionProjection.within(ty, &member) {
+    Option<UnionPlacement>.Some {value: UnionPlacement.Whole} => StaticPlacement.Plain
+    Option<UnionPlacement>.Some {value: UnionPlacement.Tagged {tag, ty: stored}} => StaticPlacement.Member {tag: tag, ty: move stored}
+    _ => StaticPlacement.Unplaced
+  }
+}
+
+pub effect fn representationType(value: &Interned<StaticData>) -> Option<Interned<Type>> ! OutOfMemoryError ? &mut Allocator | &mut Types {
   let aggregate = Interned<StaticData>.with<Option<Interned<Type>>>(value, fn(data: &StaticData) -> Option<Interned<Type>> {
     return match & data.* {
       StaticData.Aggregate {ty, ..} => Option<Interned<Type>>.some(Interned<Type>.clone(&ty))
@@ -4997,6 +5073,25 @@ effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
     View.Boolean {value, origin: _} => Operand.Boolean {value: value}
     View.Unit {origin: _} => Operand.Unit
     View.Embedded {value, ty, origin} => {
+      // A struct or variant constant is copied from its program-lifetime image, which lays out
+      // each field at its declared type: a field the value alone does not type, such as a
+      // structural union holding one member, is stored as the layout says.
+      let nominal = Interned<StaticData>.with<bool>(&value, StaticValue.isStruct)
+        || Option<usize>.isSome(&Interned<StaticData>.with<Option<usize>>(&value, StaticValue.variantTag))
+      if nominal {
+        let referenceType = run Types.intern(Type.Reference {referent: Interned<Type>.clone(&ty), access: Access.Shared,
+          lifetime: run Types.internLifetime(Lifetime.Static)})
+        let address = run temporary(&mut builder.*, &referenceType, origin)
+        run assign(&mut builder.*, place(address), Rvalue.Use {value: Operand.StaticValue {
+          value: Interned<StaticData>.clone(&value), ty: Interned<Type>.clone(&ty),
+        }}, origin)
+        let mut stored = place(address)
+        run List<Projection>.append(&mut stored.projections, Projection.Deref)
+        // The image is read-only program storage: a use gets its own copy, as any place read does.
+        let output = run temporary(&mut builder.*, &ty, origin)
+        run assign(&mut builder.*, place(output), Rvalue.Use {value: Operand.Copy {place: move stored}}, origin)
+        return Operand.Move {place: place(output)}
+      }
       let selected = run materializeEmbedded(&mut builder.*, &value, &ty, origin)
       return match move selected {
         Option<Operand>.Some {value: operand} => move operand
@@ -6096,9 +6191,11 @@ effect fn operandPlace(owner: &Interned<DeclarationId>, value: Operand, origin: 
 }
 
 // An owned copy of one checked arm, so lowering never holds a body loan; its nested tests are read
-// piecewise by `armTestTag` and `armTestStepAt`.
+// piecewise by `armTestTag` and `armTestStepAt`. An arm written with `|` has `alternatives` rows,
+// read by `alternativeView`, and its own pattern is `_`.
 struct ArmView {
   pattern: BodyPattern,
+  alternatives: usize,
   tests: usize,
   guard: Option<BodyNodeId>,
   result: BodyNodeId,
@@ -6112,21 +6209,71 @@ fn copyMember(member: &Option<BodyUnionMember>) -> Option<BodyUnionMember> {
   }
 }
 
+// A copy of a pattern that is not `Pattern.Alternatives`, which needs no allocation; alternatives
+// copy as `_`.
+fn flatPattern(written: &BodyPattern) -> BodyPattern {
+  return match &written.* {
+    BodyPattern.Universal => BodyPattern.Universal
+    BodyPattern.EnumMember {member} => BodyPattern.EnumMember {member: member}
+    BodyPattern.Record {member} => BodyPattern.Record {member: copyMember(&member)}
+    BodyPattern.Variant {tag} => BodyPattern.Variant {tag: tag}
+    BodyPattern.Integer {magnitude, negative} => BodyPattern.Integer {magnitude: magnitude, negative: negative}
+    BodyPattern.Boolean {value: selected} => BodyPattern.Boolean {value: selected}
+    BodyPattern.Range {lowMagnitude, lowNegative, highMagnitude, highNegative} => BodyPattern.Range {lowMagnitude: lowMagnitude,
+      lowNegative: lowNegative, highMagnitude: highMagnitude, highNegative: highNegative}
+    BodyPattern.Alternatives {..} => BodyPattern.Universal
+  }
+}
+
+fn alternativeCount(written: &BodyPattern) -> usize {
+  return match &written.* {
+    BodyPattern.Alternatives {alternatives} => List<BodyAlternative>.length(&alternatives)
+    _ => usize.ZERO
+  }
+}
+
+// The nested tests of arm `arm`, or of its alternative `alternative` when that is not `usize.MAX`.
+fn rowTests(arm: &BodyMatchArm, alternative: usize) -> &[BodyPatternTest] {
+  if alternative != usize.MAX {
+    if let BodyPattern.Alternatives {alternatives} = &arm.pattern {
+      return List<BodyPatternTest>.asSlice(&List<BodyAlternative>.asSlice(&alternatives)[alternative].tests)
+    }
+  }
+  return List<BodyPatternTest>.asSlice(&arm.tests)
+}
+
+// One alternative of an arm written with `|`: its pattern and how many nested tests it has.
+struct AlternativeView {
+  pattern: BodyPattern,
+  tests: usize,
+}
+
+fn alternativeView(body: &Shared<TypedBody>, node: BodyNodeId, arm: usize, alternative: usize) -> Option<AlternativeView> {
+  return Shared<TypedBody>.with<Option<AlternativeView>>(body, fn(value: &TypedBody) -> Option<AlternativeView> {
+    let nodes = TypedBody.nodeSlice(value)
+    if let BodyNodeKind.Expression {form: BodyExpression.Match {arms, ..}, ..} = &nodes[node.index].kind {
+      let written = List<BodyMatchArm>.asSlice(&arms)
+      if let BodyPattern.Alternatives {alternatives} = &written[arm].pattern {
+        let listed = List<BodyAlternative>.asSlice(&alternatives)
+        return Option<AlternativeView>.some(AlternativeView {pattern: flatPattern(&listed[alternative].pattern),
+          tests: List<BodyPatternTest>.length(&listed[alternative].tests)})
+      }
+    }
+    return Option<AlternativeView>.none()
+  })
+}
+
 fn armView(body: &Shared<TypedBody>, node: BodyNodeId, at: usize) -> Option<ArmView> {
   return Shared<TypedBody>.with<Option<ArmView>>(body, fn(value: &TypedBody) -> Option<ArmView> {
     let nodes = TypedBody.nodeSlice(value)
     if let BodyNodeKind.Expression {form: BodyExpression.Match {arms, ..}, ..} = &nodes[node.index].kind {
       let written = List<BodyMatchArm>.asSlice(&arms)
       if at < written.length {
-        let mut pattern = BodyPattern.Universal
-        if let BodyPattern.EnumMember {member} = &written[at].pattern { pattern = BodyPattern.EnumMember {member: member} }
-        if let BodyPattern.Record {member} = &written[at].pattern { pattern = BodyPattern.Record {member: copyMember(&member)} }
-        if let BodyPattern.Variant {tag} = &written[at].pattern { pattern = BodyPattern.Variant {tag: tag} }
-        if let BodyPattern.Integer {magnitude, negative} = &written[at].pattern { pattern = BodyPattern.Integer {magnitude: magnitude, negative: negative} }
-        if let BodyPattern.Boolean {value: selected} = &written[at].pattern { pattern = BodyPattern.Boolean {value: selected} }
+        let pattern = flatPattern(&written[at].pattern)
         let mut guard = Option<BodyNodeId>.none()
         if let Option<BodyNodeId>.Some {value: tested} = &written[at].guard { guard = Option<BodyNodeId>.some(tested) }
-        return Option<ArmView>.some(ArmView {pattern: move pattern, tests: List<BodyPatternTest>.length(&written[at].tests),
+        return Option<ArmView>.some(ArmView {pattern: move pattern, alternatives: alternativeCount(&written[at].pattern),
+          tests: List<BodyPatternTest>.length(&written[at].tests),
           guard: move guard, result: written[at].result, origin: written[at].origin})
       }
     }
@@ -6142,12 +6289,12 @@ struct ArmTestTag {
   scalar: Option<BodyScalarTest>,
 }
 
-fn armTestTag(body: &Shared<TypedBody>, node: BodyNodeId, arm: usize, test: usize) -> Option<ArmTestTag> {
+fn armTestTag(body: &Shared<TypedBody>, node: BodyNodeId, arm: usize, alternative: usize, test: usize) -> Option<ArmTestTag> {
   return Shared<TypedBody>.with<Option<ArmTestTag>>(body, fn(value: &TypedBody) -> Option<ArmTestTag> {
     let nodes = TypedBody.nodeSlice(value)
     if let BodyNodeKind.Expression {form: BodyExpression.Match {arms, ..}, ..} = &nodes[node.index].kind {
       let written = List<BodyMatchArm>.asSlice(&arms)
-      let tests = List<BodyPatternTest>.asSlice(&written[arm].tests)
+      let tests = rowTests(&written[arm], alternative)
       let scalar = match &tests[test].scalar {
         Option<BodyScalarTest>.Some {value: selected} => Option<BodyScalarTest>.some(BodyScalarTest {member: selected.member, ty: Interned<Type>.clone(&selected.ty)})
         Option<BodyScalarTest>.None => Option<BodyScalarTest>.none()
@@ -6159,12 +6306,12 @@ fn armTestTag(body: &Shared<TypedBody>, node: BodyNodeId, arm: usize, test: usiz
   })
 }
 
-fn armTestStepAt(body: &Shared<TypedBody>, node: BodyNodeId, arm: usize, test: usize, at: usize) -> Option<BodyPlaceStep> {
+fn armTestStepAt(body: &Shared<TypedBody>, node: BodyNodeId, arm: usize, alternative: usize, test: usize, at: usize) -> Option<BodyPlaceStep> {
   return Shared<TypedBody>.with<Option<BodyPlaceStep>>(body, fn(value: &TypedBody) -> Option<BodyPlaceStep> {
     let nodes = TypedBody.nodeSlice(value)
     if let BodyNodeKind.Expression {form: BodyExpression.Match {arms, ..}, ..} = &nodes[node.index].kind {
       let written = List<BodyMatchArm>.asSlice(&arms)
-      let tests = List<BodyPatternTest>.asSlice(&written[arm].tests)
+      let tests = rowTests(&written[arm], alternative)
       return copyStep(&tests[test].path, at)
     }
     return Option<BodyPlaceStep>.none()
@@ -6200,6 +6347,8 @@ union Selector {
   Any,
   Case {decimal: Bytes, negative: bool},
   Tags {tags: List<usize>},
+  /// The values from `low` through `high`, both included, tested by comparison.
+  Range {low: Bytes, lowNegative: bool, high: Bytes, highNegative: bool},
 }
 
 effect fn selectorOf(builder: &Builder, pattern: &BodyPattern) -> Selector ! OutOfMemoryError ? &mut Allocator | &mut Types {
@@ -6217,6 +6366,10 @@ effect fn selectorOf(builder: &Builder, pattern: &BodyPattern) -> Selector ! Out
     }
     BodyPattern.Integer {magnitude, negative} => Selector.Case {decimal: run decimalBytes(magnitude), negative: negative}
     BodyPattern.Boolean {value} => Selector.Case {decimal: run Type.extentText(booleanCase(value)), negative: false}
+    BodyPattern.Range {lowMagnitude, lowNegative, highMagnitude, highNegative} => Selector.Range {low: run decimalBytes(lowMagnitude),
+      lowNegative: lowNegative, high: run decimalBytes(highMagnitude), highNegative: highNegative}
+    // An arm's alternatives are dispatched as rows of their own.
+    BodyPattern.Alternatives {..} => Selector.Any
   }
 }
 
@@ -6239,35 +6392,60 @@ fn sameDecimal(left: &[u8], right: &[u8]) -> bool {
   return true
 }
 
-effect fn dispatchArms(builder: &mut Builder, selectors: &[Selector], entries: &[usize], switched: usize,
-  from: usize, origin: Origin) -> () ! OutOfMemoryError ? &mut Allocator {
-  let mut cases = List<SwitchCase>.make()
-  let mut otherwise = usize.MAX
+effect fn dispatchArms(builder: &mut Builder, selectors: &[Selector], entries: &[usize], switched: usize, switchedType: &Interned<Type>,
+  from: usize, origin: Origin) -> () ! OutOfMemoryError ? &mut Allocator | &mut Types {
   let mut at = from
-  while at < selectors.length && otherwise == usize.MAX {
-    match &selectors[at] {
-      Selector.Any => { otherwise = entries[at] }
-      Selector.Case {decimal, negative} => run routeCase(&mut cases, Bytes.asSlice(&decimal), negative, entries[at])
-      Selector.Tags {tags} => {
-        let listed = List<usize>.asSlice(&tags)
-        let mut tag = usize.ZERO
-        while tag < listed.length {
-          let decimal = run Type.extentText(listed[tag])
-          run routeCase(&mut cases, Bytes.asSlice(&decimal), false, entries[at])
-          tag = tag + usize.ONE
+  // Each pass switches over the rows up to the next range; a value no case routes then meets the
+  // range, and a value outside it continues with the rows after the range.
+  while true {
+    let mut cases = List<SwitchCase>.make()
+    let mut otherwise = usize.MAX
+    let mut range = usize.MAX
+    while at < selectors.length && otherwise == usize.MAX && range == usize.MAX {
+      match &selectors[at] {
+        Selector.Any => { otherwise = entries[at] }
+        Selector.Case {decimal, negative} => run routeCase(&mut cases, Bytes.asSlice(&decimal), negative, entries[at])
+        Selector.Tags {tags} => {
+          let listed = List<usize>.asSlice(&tags)
+          let mut tag = usize.ZERO
+          while tag < listed.length {
+            let decimal = run Type.extentText(listed[tag])
+            run routeCase(&mut cases, Bytes.asSlice(&decimal), false, entries[at])
+            tag = tag + usize.ONE
+          }
         }
+        Selector.Range {..} => { range = at }
       }
+      at = at + usize.ONE
     }
-    at = at + usize.ONE
+    if otherwise == usize.MAX { otherwise = run block(&mut builder.*, origin) }
+    if List<SwitchCase>.length(&cases) == usize.ZERO {
+      terminate(&mut builder.*, Terminator.Goto {target: otherwise, origin: origin})
+    } else {
+      terminate(&mut builder.*, Terminator.Switch {
+        value: Operand.Copy {place: place(switched)}, cases: move cases, otherwise: otherwise, origin: origin,
+      })
+    }
+    if range == usize.MAX { return () }
+    resume(&mut builder.*, otherwise)
+    if let Selector.Range {low, lowNegative, high, highNegative} = &selectors[range] {
+      let boolean = run CheckedIntrinsic.scalarType(Scalar.Bool)
+      let rest = run block(&mut builder.*, origin)
+      let upper = run block(&mut builder.*, origin)
+      let above = run temporary(&mut builder.*, &boolean, origin)
+      run assign(&mut builder.*, place(above), Rvalue.Binary {operation: InfixOperator.LessOrEqual,
+        left: Operand.Integer {decimal: run Bytes.copy(Bytes.asSlice(&low)), negative: lowNegative, ty: Interned<Type>.clone(switchedType)},
+        right: Operand.Copy {place: place(switched)}}, origin)
+      terminate(&mut builder.*, Terminator.Branch {condition: Operand.Copy {place: place(above)}, thenBlock: upper, elseBlock: rest, origin: origin})
+      resume(&mut builder.*, upper)
+      let below = run temporary(&mut builder.*, &boolean, origin)
+      run assign(&mut builder.*, place(below), Rvalue.Binary {operation: InfixOperator.LessOrEqual,
+        left: Operand.Copy {place: place(switched)},
+        right: Operand.Integer {decimal: run Bytes.copy(Bytes.asSlice(&high)), negative: highNegative, ty: Interned<Type>.clone(switchedType)}}, origin)
+      terminate(&mut builder.*, Terminator.Branch {condition: Operand.Copy {place: place(below)}, thenBlock: entries[range], elseBlock: rest, origin: origin})
+      resume(&mut builder.*, rest)
+    }
   }
-  if otherwise == usize.MAX { otherwise = run block(&mut builder.*, origin) }
-  if List<SwitchCase>.length(&cases) == usize.ZERO {
-    terminate(&mut builder.*, Terminator.Goto {target: otherwise, origin: origin})
-    return ()
-  }
-  terminate(&mut builder.*, Terminator.Switch {
-    value: Operand.Copy {place: place(switched)}, cases: move cases, otherwise: otherwise, origin: origin,
-  })
   return ()
 }
 
@@ -6473,9 +6651,15 @@ effect fn lowerMatch(
   let valued = Interned<Type>.with<bool>(ty, storedMatchValue)
   let mut output = usize.MAX
   if valued { output = run temporary(&mut builder.*, ty, origin) }
+  // Dispatch tests rows in order: one per arm, or one per alternative of an arm written with `|`.
+  // A row's entry runs its nested tests; a row without tests enters its arm's guard, or its result.
   let mut arms = List<ArmView>.make()
   let mut selectors = List<Selector>.make()
   let mut entries = List<usize>.make()
+  let mut rowAlternatives = List<usize>.make()
+  let mut rowTestCounts = List<usize>.make()
+  let mut firstRows = List<usize>.make()
+  let mut guardBlocks = List<usize>.make()
   let mut results = List<usize>.make()
   let mut at = usize.ZERO
   while at < count {
@@ -6484,120 +6668,163 @@ effect fn lowerMatch(
       Option<ArmView>.None => { return run unsupported(&owner, origin, GapCode.TypedForm) }
     }
     let resultBlock = run block(&mut builder.*, arm.origin)
-    let mut entry = resultBlock
-    let guarded = match &arm.guard {
-      Option<BodyNodeId>.Some {..} => true
-      Option<BodyNodeId>.None => false
+    let mut guardBlock = resultBlock
+    if let Option<BodyNodeId>.Some {..} = &arm.guard { guardBlock = run block(&mut builder.*, arm.origin) }
+    run List<usize>.append(&mut firstRows, List<Selector>.length(&selectors))
+    if arm.alternatives == usize.ZERO {
+      let mut entry = guardBlock
+      if arm.tests != usize.ZERO { entry = run block(&mut builder.*, arm.origin) }
+      run List<Selector>.append(&mut selectors, run selectorOf(&builder.*, &arm.pattern))
+      run List<usize>.append(&mut entries, entry)
+      run List<usize>.append(&mut rowAlternatives, usize.MAX)
+      run List<usize>.append(&mut rowTestCounts, arm.tests)
+    } else {
+      let mut alternative = usize.ZERO
+      while alternative < arm.alternatives {
+        let view = match move alternativeView(body, node, at, alternative) {
+          Option<AlternativeView>.Some {value} => move value
+          Option<AlternativeView>.None => { return run unsupported(&owner, origin, GapCode.TypedForm) }
+        }
+        let mut entry = guardBlock
+        if view.tests != usize.ZERO { entry = run block(&mut builder.*, arm.origin) }
+        run List<Selector>.append(&mut selectors, run selectorOf(&builder.*, &view.pattern))
+        run List<usize>.append(&mut entries, entry)
+        run List<usize>.append(&mut rowAlternatives, alternative)
+        run List<usize>.append(&mut rowTestCounts, view.tests)
+        alternative = alternative + usize.ONE
+      }
     }
-    if guarded || arm.tests != usize.ZERO { entry = run block(&mut builder.*, arm.origin) }
-    run List<Selector>.append(&mut selectors, run selectorOf(&builder.*, &arm.pattern))
-    run List<usize>.append(&mut entries, entry)
+    run List<usize>.append(&mut guardBlocks, guardBlock)
     run List<usize>.append(&mut results, resultBlock)
     run List<ArmView>.append(&mut arms, move arm)
     at = at + usize.ONE
   }
+  run List<usize>.append(&mut firstRows, List<Selector>.length(&selectors))
   let join = run block(&mut builder.*, origin)
   let entryStates = run ownerStates(&builder.*)
   let mut arrivals = List<Arrival>.make()
   let armSlice = List<ArmView>.asSlice(&arms)
   let selectorSlice = List<Selector>.asSlice(&selectors)
   let entrySlice = List<usize>.asSlice(&entries)
+  let rowAlternativeSlice = List<usize>.asSlice(&rowAlternatives)
+  let rowTestSlice = List<usize>.asSlice(&rowTestCounts)
+  let firstRowSlice = List<usize>.asSlice(&firstRows)
+  let guardSlice = List<usize>.asSlice(&guardBlocks)
   let resultSlice = List<usize>.asSlice(&results)
-  run dispatchArms(&mut builder.*, selectorSlice, entrySlice, switched, usize.ZERO, origin)
+  run dispatchArms(&mut builder.*, selectorSlice, entrySlice, switched, &subjectType, usize.ZERO, origin)
   let mut joined = false
   at = usize.ZERO
   while at < count {
     let armOrigin = armSlice[at].origin
     let result = armSlice[at].result
     let resultBlock = resultSlice[at]
+    let guardBlock = guardSlice[at]
     let selecting = declaring || (ifLet && at != usize.ZERO)
     // Every arm starts from the owner states at dispatch; guards and tests cannot consume.
     run restoreOwners(&mut builder.*, &entryStates)
-    // Nested tests, then the guard, run in order; the first that fails resumes dispatch at the next arm.
-    if entrySlice[at] != resultBlock {
-      resume(&mut builder.*, entrySlice[at])
-      let fallback = run block(&mut builder.*, armOrigin)
-      let mut test = usize.ZERO
-      while test < armSlice[at].tests {
-        let required = match move armTestTag(body, node, at, test) {
-          Option<ArmTestTag>.Some {value} => move value
-          Option<ArmTestTag>.None => { return run unsupported(&owner, armOrigin, GapCode.TypedForm) }
+    // A failed guard resumes dispatch at the next arm; so does a failed test of the arm's last row,
+    // through the same block.
+    let mut guardFallback = usize.MAX
+    if let Option<BodyNodeId>.Some {..} = &armSlice[at].guard { guardFallback = run block(&mut builder.*, armOrigin) }
+    // Each row's nested tests run in order; the first that fails resumes dispatch at the next row.
+    let mut row = firstRowSlice[at]
+    while row < firstRowSlice[at + usize.ONE] {
+      if rowTestSlice[row] != usize.ZERO {
+        let alternative = rowAlternativeSlice[row]
+        let last = row + usize.ONE == firstRowSlice[at + usize.ONE]
+        resume(&mut builder.*, entrySlice[row])
+        let mut fallback = guardFallback
+        if !last || fallback == usize.MAX { fallback = run block(&mut builder.*, armOrigin) }
+        let mut test = usize.ZERO
+        while test < rowTestSlice[row] {
+          let required = match move armTestTag(body, node, at, alternative, test) {
+            Option<ArmTestTag>.Some {value} => move value
+            Option<ArmTestTag>.None => { return run unsupported(&owner, armOrigin, GapCode.TypedForm) }
+          }
+          let mut projected = run copyPlace(&tested)
+          let mut step = usize.ZERO
+          while true {
+            let selected = match move armTestStepAt(body, node, at, alternative, test, step) {
+              Option<BodyPlaceStep>.Some {value} => move value
+              Option<BodyPlaceStep>.None => { break }
+            }
+            run lowerStep(&builder.*, &selected, &mut projected.projections)
+            step = step + usize.ONE
+          }
+          let next = run block(&mut builder.*, armOrigin)
+          let mut cases = List<SwitchCase>.make()
+          let mut read = usize.MAX
+          if let Option<BodyScalarTest>.Some {value: scalar} = &required.scalar {
+            // A scalar enum field is its representation value; the test compares it with the member's.
+            read = run temporary(&mut builder.*, &scalar.ty, armOrigin)
+            run assign(&mut builder.*, place(read), Rvalue.Use {value: Operand.Copy {place: move projected}}, armOrigin)
+            run List<SwitchCase>.append(&mut cases, SwitchCase {decimal: run magnitudeText(scalar.member.magnitude),
+              negative: scalar.member.negative, target: next})
+          } else if let Option<BodyUnionMember>.Some {value: selectedMember} = &required.member {
+            // A structural member test reads the instance's own tags (UNION-001): a member the
+            // instance stores whole always passes, and one that is itself a union passes on any of
+            // its members' tags.
+            let mut selected = List<usize>.make()
+            let mut whole = false
+            match move run instancePlacement(&builder.*, &selectedMember.source, &selectedMember.ty) {
+              UnionPlacement.Whole => { whole = true }
+              UnionPlacement.Tagged {tag, ..} => run List<usize>.append(&mut selected, tag)
+              UnionPlacement.Spread {tags: spread, ..} => { selected = move spread }
+            }
+            if whole {
+              terminate(&mut builder.*, Terminator.Goto {target: next, origin: armOrigin})
+              resume(&mut builder.*, next)
+              test = test + usize.ONE
+              continue
+            }
+            let storage = run RuntimeType.applyBindings(&selectedMember.source, List<Binding>.asSlice(&builder.bindings),
+              List<RuntimeProjection>.asSlice(&builder.projections))
+            let tags = match move run Type.canonicalUnionMembers(&storage) {
+              Option<List<Interned<Type>>>.Some {value} => List<Interned<Type>>.length(&value)
+              Option<List<Interned<Type>>>.None => CompilerBug.panic(b"a tested union member's storage is not a union")
+            }
+            let tagged = run Layout.tagType(tags)
+            read = run temporary(&mut builder.*, &tagged, armOrigin)
+            run assign(&mut builder.*, place(read), Rvalue.Discriminant {place: move projected}, armOrigin)
+            let listed = List<usize>.asSlice(&selected)
+            let mut pick = usize.ZERO
+            while pick < listed.length {
+              run List<SwitchCase>.append(&mut cases, SwitchCase {decimal: run Type.extentText(listed[pick]), negative: false, target: next})
+              pick = pick + usize.ONE
+            }
+          } else {
+            let tagged = run Layout.tagType(required.tags)
+            read = run temporary(&mut builder.*, &tagged, armOrigin)
+            run assign(&mut builder.*, place(read), Rvalue.Discriminant {place: move projected}, armOrigin)
+            run List<SwitchCase>.append(&mut cases, SwitchCase {decimal: run Type.extentText(required.tag), negative: false, target: next})
+          }
+          terminate(&mut builder.*, Terminator.Switch {value: Operand.Copy {place: place(read)}, cases: move cases, otherwise: fallback, origin: armOrigin})
+          resume(&mut builder.*, next)
+          test = test + usize.ONE
         }
-        let mut projected = run copyPlace(&tested)
-        let mut step = usize.ZERO
-        while true {
-          let selected = match move armTestStepAt(body, node, at, test, step) {
-            Option<BodyPlaceStep>.Some {value} => move value
-            Option<BodyPlaceStep>.None => { break }
-          }
-          run lowerStep(&builder.*, &selected, &mut projected.projections)
-          step = step + usize.ONE
+        terminate(&mut builder.*, Terminator.Goto {target: guardBlock, origin: armOrigin})
+        if fallback != guardFallback {
+          resume(&mut builder.*, fallback)
+          run dispatchArms(&mut builder.*, selectorSlice, entrySlice, switched, &subjectType, row + usize.ONE, armOrigin)
         }
-        let next = run block(&mut builder.*, armOrigin)
-        let mut cases = List<SwitchCase>.make()
-        let mut read = usize.MAX
-        if let Option<BodyScalarTest>.Some {value: scalar} = &required.scalar {
-          // A scalar enum field is its representation value; the test compares it with the member's.
-          read = run temporary(&mut builder.*, &scalar.ty, armOrigin)
-          run assign(&mut builder.*, place(read), Rvalue.Use {value: Operand.Copy {place: move projected}}, armOrigin)
-          run List<SwitchCase>.append(&mut cases, SwitchCase {decimal: run magnitudeText(scalar.member.magnitude),
-            negative: scalar.member.negative, target: next})
-        } else if let Option<BodyUnionMember>.Some {value: selectedMember} = &required.member {
-          // A structural member test reads the instance's own tags (UNION-001): a member the
-          // instance stores whole always passes, and one that is itself a union passes on any of
-          // its members' tags.
-          let mut selected = List<usize>.make()
-          let mut whole = false
-          match move run instancePlacement(&builder.*, &selectedMember.source, &selectedMember.ty) {
-            UnionPlacement.Whole => { whole = true }
-            UnionPlacement.Tagged {tag, ..} => run List<usize>.append(&mut selected, tag)
-            UnionPlacement.Spread {tags: spread, ..} => { selected = move spread }
-          }
-          if whole {
-            terminate(&mut builder.*, Terminator.Goto {target: next, origin: armOrigin})
-            resume(&mut builder.*, next)
-            test = test + usize.ONE
-            continue
-          }
-          let storage = run RuntimeType.applyBindings(&selectedMember.source, List<Binding>.asSlice(&builder.bindings),
-            List<RuntimeProjection>.asSlice(&builder.projections))
-          let tags = match move run Type.canonicalUnionMembers(&storage) {
-            Option<List<Interned<Type>>>.Some {value} => List<Interned<Type>>.length(&value)
-            Option<List<Interned<Type>>>.None => CompilerBug.panic(b"a tested union member's storage is not a union")
-          }
-          let tagged = run Layout.tagType(tags)
-          read = run temporary(&mut builder.*, &tagged, armOrigin)
-          run assign(&mut builder.*, place(read), Rvalue.Discriminant {place: move projected}, armOrigin)
-          let listed = List<usize>.asSlice(&selected)
-          let mut pick = usize.ZERO
-          while pick < listed.length {
-            run List<SwitchCase>.append(&mut cases, SwitchCase {decimal: run Type.extentText(listed[pick]), negative: false, target: next})
-            pick = pick + usize.ONE
-          }
-        } else {
-          let tagged = run Layout.tagType(required.tags)
-          read = run temporary(&mut builder.*, &tagged, armOrigin)
-          run assign(&mut builder.*, place(read), Rvalue.Discriminant {place: move projected}, armOrigin)
-          run List<SwitchCase>.append(&mut cases, SwitchCase {decimal: run Type.extentText(required.tag), negative: false, target: next})
-        }
-        terminate(&mut builder.*, Terminator.Switch {value: Operand.Copy {place: place(read)}, cases: move cases, otherwise: fallback, origin: armOrigin})
-        resume(&mut builder.*, next)
-        test = test + usize.ONE
       }
-      if let Option<BodyNodeId>.Some {value: condition} = &armSlice[at].guard {
-        // A guard's temporaries end before it selects the arm or resumes dispatch.
-        let guardPending = List<Pending>.length(&builder.temporaries)
-        let evaluated = run expression(&mut builder.*, body, hir, condition)
-        // The ownership check keeps a guard from moving, dropping or storing a place declared
-        // outside it (OWN0008), so a failed guard resumes dispatch with the arm's entry states.
-        if !sameStates(&builder.*, &entryStates) { return CompilerBug.panic(b"a match guard changed an owner's state") }
-        let passed = run settledCondition(&mut builder.*, move evaluated, guardPending, armOrigin)
-        terminate(&mut builder.*, Terminator.Branch {condition: move passed, thenBlock: resultBlock, elseBlock: fallback, origin: armOrigin})
-      } else {
-        terminate(&mut builder.*, Terminator.Goto {target: resultBlock, origin: armOrigin})
-      }
+      row = row + usize.ONE
+    }
+    // The guard runs once whichever row selected the arm; when it fails, dispatch resumes at the
+    // next arm, since every alternative shares it and binds nothing.
+    if let Option<BodyNodeId>.Some {value: condition} = &armSlice[at].guard {
+      resume(&mut builder.*, guardBlock)
+      let fallback = guardFallback
+      // A guard's temporaries end before it selects the arm or resumes dispatch.
+      let guardPending = List<Pending>.length(&builder.temporaries)
+      let evaluated = run expression(&mut builder.*, body, hir, condition)
+      // The ownership check keeps a guard from moving, dropping or storing a place declared
+      // outside it (OWN0008), so a failed guard resumes dispatch with the arm's entry states.
+      if !sameStates(&builder.*, &entryStates) { return CompilerBug.panic(b"a match guard changed an owner's state") }
+      let passed = run settledCondition(&mut builder.*, move evaluated, guardPending, armOrigin)
+      terminate(&mut builder.*, Terminator.Branch {condition: move passed, thenBlock: resultBlock, elseBlock: fallback, origin: armOrigin})
       resume(&mut builder.*, fallback)
-      run dispatchArms(&mut builder.*, selectorSlice, entrySlice, switched, at + usize.ONE, armOrigin)
+      run dispatchArms(&mut builder.*, selectorSlice, entrySlice, switched, &subjectType, firstRowSlice[at + usize.ONE], armOrigin)
     }
     resume(&mut builder.*, resultBlock)
     run narrowBindings(&mut builder.*, body, node, at, subject, consumes, armOrigin)
@@ -7630,7 +7857,7 @@ effect fn helperBuilder(creator: &Builder, key: InstanceKey, result: &Interned<T
     failure: usize.MAX, plans: List<NodePlan>.make(), storage: List<StoragePlan>.make(), carriers: List<CarrierPlan>.make(),
     providers: List<usize>.make(), diagnostics: move diagnostics, sites: Option<SiteText>.none(), anchor: Anchor.copy(&creator.anchor),
     witnessIntrinsics: List<WitnessIntrinsic>.make(), helpers: List<MirFunction>.make(),
-    exits: List<ExitStep>.make(), left: List<LeftExit>.make(), suspending: Option<List<InstanceKey>>.none(),
+    exits: List<ExitStep>.make(), left: List<LeftExit>.make(), forwards: List<ForwardBlock>.make(), forward: usize.MAX, forwardSite: usize.MAX, caught: List<CaughtSlot>.make(), suspending: Option<List<InstanceKey>>.none(),
     cancelEveryCall: cancellable,
     held: List<HeldFailure>.make(),
     cancelScopes: List<CancelScope>.make(),
@@ -8647,7 +8874,7 @@ effect fn lowerRun(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Module
   let mut handler = usize.MAX
   if !Interned<Type>.with<bool>(&calleeFailure, neverType) {
     if builder.failure == usize.MAX { return run unsupported(&owner, origin, GapCode.TypedForm) }
-    caught = run temporary(&mut builder.*, &calleeFailure, origin)
+    caught = run caughtSlot(&mut builder.*, &calleeFailure, origin)
     handler = run block(&mut builder.*, origin)
     edge = Option<FailureEdge>.some(FailureEdge {destination: place(caught), target: handler,
 })
@@ -8677,15 +8904,73 @@ fn continueAfter(builder: &mut Builder, continuation: usize, output: usize, ty: 
   return Operand.Copy {place: place(output)}
 }
 
+// The slot a run site catches a forwarded failure of type `ty` in, shared by every such site.
+effect fn caughtSlot(builder: &mut Builder, ty: &Interned<Type>, origin: Origin) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let slots = List<CaughtSlot>.asSlice(&builder.caught)
+  let mut at = usize.ZERO
+  while at < slots.length {
+    if Interned<Type>.same(&slots[at].ty, ty) { return slots[at].local }
+    at = at + usize.ONE
+  }
+  let local = run temporary(&mut builder.*, ty, origin)
+  run List<CaughtSlot>.append(&mut builder.*.caught, CaughtSlot {ty: Interned<Type>.clone(ty), local: local})
+  return local
+}
+
 // Moves a caught failure into `Failure`, widening it into the caller's failure union, then leaves
-// every open scope innermost first and fails.
+// every open scope innermost first and fails. In a program that observes diagnostics the exit ends
+// in the shared forward block, which records this site as the failure's next frame.
 effect fn propagateFailure(builder: &mut Builder, caught: usize, from: &Interned<Type>, origin: Origin) -> ()
 ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
   let destination = builder.failure
   run widenInto(&mut builder.*, caught, from, destination, origin)
   run carry(&mut builder.*, caught, destination, origin)
-  run frame(&mut builder.*, destination, origin)
-  return run leaveFunction(&mut builder.*, ExitKind.Fails, origin)
+  if !run forwardFrom(&mut builder.*, origin) { return run leaveFunction(&mut builder.*, ExitKind.Fails, origin) }
+  return run leaveFunction(&mut builder.*, ExitKind.Forwards, origin)
+}
+
+// Names the current block's run site as the forwarded failure's next frame, for the shared forward
+// block to record after the site's drops, and reports whether there is a frame to record: only a
+// program that observes diagnostics records one. The current observer selects the block, since an
+// observed body runs under an observer of its own; its first forwarding site creates it.
+effect fn forwardFrom(builder: &mut Builder, origin: Origin) -> bool
+! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
+  if !builder.live { return false }
+  let observer = match &builder.diagnostics {
+    Option<DiagnosticPlaces>.Some {value} => run copyPlace(&value.observer)
+    Option<DiagnosticPlaces>.None => { return false }
+  }
+  let label = match &builder.sites {
+    Option<SiteText>.Some {value: sites} => run siteLabel(&sites, &builder.anchor, origin)
+    Option<SiteText>.None => { return false }
+  }
+  if builder.forwardSite == usize.MAX { builder.forwardSite = run temporary(&mut builder.*, &run reportTextType(), origin) }
+  builder.forward = usize.MAX
+  let blocks = List<ForwardBlock>.asSlice(&builder.forwards)
+  let mut at = usize.ZERO
+  while at < blocks.length {
+    if blocks[at].observer.local == observer.local
+      && sameProjections(List<Projection>.asSlice(&blocks[at].observer.projections), List<Projection>.asSlice(&observer.projections)) {
+      builder.forward = blocks[at].block
+    }
+    at = at + usize.ONE
+  }
+  if builder.forward == usize.MAX {
+    let site = builder.current
+    let shared = run block(&mut builder.*, origin)
+    let text = builder.forwardSite
+    let slot = builder.failure
+    resume(&mut builder.*, shared)
+    run frame(&mut builder.*, slot, text, origin)
+    terminate(&mut builder.*, Terminator.Fail {origin: origin})
+    resume(&mut builder.*, site)
+    builder.forward = shared
+    run List<ForwardBlock>.append(&mut builder.*.forwards, ForwardBlock {observer: move observer, block: shared})
+  }
+  let count = run usizeOperand(usize.toU64(Bytes.length(&label)))
+  let named = builder.forwardSite
+  run assign(&mut builder.*, place(named), Rvalue.Slice {data: Operand.StaticBytes {bytes: move label}, count: move count}, origin)
+  return true
 }
 
 // Moves `caught`, of type `from`, into `destination`: as itself, injected under its tag, or, when
@@ -10023,17 +10308,11 @@ effect fn chainCause(builder: &mut Builder, handle: usize, origin: Origin) -> ()
   return ()
 }
 
-// A failure that leaves this function through a run site gains that site as its next logical
-// frame (event 1), which takes over the previous node's reference (event 4, N7).
-effect fn frame(builder: &mut Builder, slot: usize, origin: Origin) -> () ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
-  if let Option<DiagnosticPlaces>.None = &builder.diagnostics { return () }
-  let label = match &builder.sites {
-    Option<SiteText>.Some {value: sites} => run siteLabel(&sites, &builder.anchor, origin)
-    Option<SiteText>.None => { return () }
-  }
+// A failure that leaves this function through a run site gains that site, labeled by local `site`,
+// as its next logical frame (event 1), which takes over the previous node's reference (event 4, N7).
+effect fn frame(builder: &mut Builder, slot: usize, site: usize, origin: Origin) -> () ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
   let address = run companion(&mut builder.*, slot, origin)
   let previous = run handleOf(&mut builder.*, address, origin)
-  let site = run reportText(&mut builder.*, Bytes.asSlice(&label), origin)
   let unlabeled = run reportText(&mut builder.*, b"", origin)
   let handle = run observerEvent(&mut builder.*, 1, Operand.Copy {place: place(previous)}, run usizeOperand(0),
     Operand.Copy {place: place(site)}, Operand.Copy {place: place(unlabeled)}, origin)
@@ -11188,6 +11467,10 @@ impl MirFunction {
       temporaries: List<Pending>.make(),
       exits: List<ExitStep>.make(),
       left: List<LeftExit>.make(),
+      forwards: List<ForwardBlock>.make(),
+      forward: usize.MAX,
+      forwardSite: usize.MAX,
+      caught: List<CaughtSlot>.make(),
       remainders: move remainders,
       needs: move needs,
       failure: failureLocal,

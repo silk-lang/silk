@@ -328,6 +328,48 @@ Returns the kind of type that `descriptor` describes: [`namedKind`](#namedKind),
 [`anonymousNamedKind`](#anonymousNamedKind), [`anonymousPositionalKind`](#anonymousPositionalKind), [`arrayKind`](#arrayKind), or [`otherKind`](#otherKind). Every
 type has a kind, so a generic function can branch on the kind of its type parameter.
 
+<a id="Reflect.impl.typeName"></a>
+
+### Associated function `typeName`
+
+```silk
+pub static fn typeName<Owner>() -> string<'static>
+```
+
+Returns the declared name of `Owner` with its type arguments and without module paths, such as
+`Server` or `Page<String>`.
+
+#### When to use
+
+Name a type where a library describes it to someone else, such as a JSON Schema definition.
+
+<a id="Reflect.impl.typeDoc"></a>
+
+### Associated function `typeDoc`
+
+```silk
+pub static fn typeDoc<Owner>() -> string<'static>
+```
+
+Returns the `///` comment written on the declaration of `Owner`, without its slashes and with
+its lines joined by newlines, or empty text when it has none or is not a named type.
+
+<a id="Reflect.impl.privateField"></a>
+
+### Associated function `privateField`
+
+```silk
+pub static fn privateField<Owner>() -> string<'static>
+```
+
+Returns the name of the first field of the struct `Owner` that is not `pub`, or empty text
+when every field is `pub` or `Owner` is no struct.
+
+#### When to use
+
+Refuse, at compile time, a type that a library must construct from outside its module. An
+`errorAt` on the returned text points at that field's declaration.
+
 <a id="Reflect.impl.fieldKind"></a>
 
 ### Associated function `fieldKind`
@@ -362,8 +404,8 @@ Use this function only for a field where [`Reflect.fieldKind`](#Reflect.impl.fie
 pub static fn fieldDoc<Owner, Value>(field: Intrinsic.Field<Owner, Value>) -> string<'static>
 ```
 
-Returns the `///` comment written on a named struct field, without its slashes and with its
-lines joined by newlines, or empty text when the field has none.
+Returns the `///` comment written on a named struct field or a variant field, without its
+slashes and with its lines joined by newlines, or empty text when the field has none.
 
 #### When to use
 
@@ -373,7 +415,9 @@ the command line option the field fills, so the comment is written once.
 #### Gotchas
 
 Editing the comment changes what the program shows, as it would for a string literal. A
-field of a union variant, a positional field and an anonymous field give empty text.
+positional field and an anonymous field give empty text. A variant field's descriptor does not
+name its variant, so when two variants have a field of the same name at the same position, both
+read the first one's comment.
 
 #### Examples
 ```silk
@@ -540,6 +584,17 @@ pub static fn variantLabel<Union>(variant: Intrinsic.Variant<Union>) -> string<'
 ```
 
 Returns the name of a variant, as written in the union declaration.
+
+<a id="Reflect.impl.variantDoc"></a>
+
+### Associated function `variantDoc`
+
+```silk
+pub static fn variantDoc<Union>(variant: Intrinsic.Variant<Union>) -> string<'static>
+```
+
+Returns the `///` comment written on a variant, without its slashes and with its lines joined
+by newlines, or empty text when the variant has none.
 
 <a id="Reflect.impl.variantFields"></a>
 
