@@ -1,0 +1,10 @@
+# Integrated frontier V3 helper validation
+
+Frozen source `24e8e8302`; binary `.scratch/frontier-integrated-v3`, SHA256 `1000d42772fea2a1bd355999513a8cb81711f61bb7a5abe105b4a17b6ff551db`.
+
+- Semantic helper runner (`--optimization none`) passed 10/10: budget allocation atomicity, finite budgets, nonconsuming host socket readiness and EOF, exact module coverage, private partition/origins, sparse inherited cycle proof, finite Admission key bounds, complete graph/escape obligations, fragment remapping, graph extension. Runtime 5ms. Log `.scratch/integrated-frontier-helper-tests.log`.
+- Callable-body range planner and packet coverage helpers passed 2/2 on V2 source (same functions in V3), including overflow, zero-cost tails, indivisible large declaration, and exact roster/name coverage.
+- Four source fixtures with 320 padded callable bodies each exercised actual cost-based chunks with complete-module and reshare flags. Serial versus two enabled runs: 8/8 full structured JSON comparisons identical. Valid and real unused-local warning both accepted seven chunks; unused invalid body and duplicate name both refused/fell back after six chunks. Logs/results `.scratch/cost-chunk-parity-v3/`.
+- Full frozen compiler workload with one appended unused invalid Semantic function exercised module failure after two real private descendants. Enabled worker2 failed its assigned module chunk; parent refused incomplete proof and serial retry emitted exactly the same error (SEM0129 at the authored return) and warnings as disabled. All worker descendants were reaped, only a normal cache writer detached and exited0. No 60s lease stall. Correctness samples: serial20.842s/settled22.223s; enabled29.412s/settled31.479s (not performance claims). `.scratch/frontier-module-error-fixture/results.json` and off/on logs.
+
+All compilers ran under the shared performance lock; no benchmark ran concurrently. Full-workload V3 performance, actual second descendant routing, speculative emission hit/waste, and final native artifacts are separate gates owned by root/worker_forks.

@@ -1,0 +1,81 @@
+# Copy-on-write check experiments
+
+All experiments below are scratch only, based on a63f61215, without production one-shot/profiling optimizations. Compiler is optimized speed-four (ThinLTO4), same binary env off/on, fresh source snapshots, four CPU quota, exclusive timing slot. Foreground excludes detached cache settlement; settled includes it.
+
+| Experiment | Workload | Serial foreground | Parallel foreground | Speedup | Serial settled | Parallel settled |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Post-runtime module shards | compiler |22.516s|22.896s|0.98x|see JSON|see JSON|
+| Post-runtime module shards |harfrust|7.727s|5.093s|1.52x|see JSON|see JSON|
+| Runtime frontier complete subtrees |compiler|22.946s|41.863s|0.55x|23.489s|42.448s|
+| Runtime frontier complete subtrees |harfrust|7.864s|4.744s|1.66x|8.271s|5.100s|
+
+Post-runtime result JSON: `.scratch/benchmarks/fork-rf7wmlal/results.jsonl`.
+Runtime frontier result JSON: `.scratch/benchmarks/frontier-vuimf3f4/results.jsonl`.
+
+Runtime frontier primes256 reached instances, then forks4 inherited stores with subsets of pending traversal tasks and inherited Admission ancestry. Workers finish whole assigned subtrees and one-quarter module checks. Cache images and walk fragments merge in parent; conservative callback escape union proves clean. Partial runtime record omitted from persistent image. All child errors/refusals must fallback to original serial traversal for deterministic diagnostics. Neither approach transfers typed MIR, so they improve only check path; build would require child emission of portable backend definitions.
+
+Compiler runtime frontier: prefix198ms,395 pending tasks. Four runtime workers14.69–15.68s (heavy duplicate common MIR). Modules+serialization16.95–18.05s; image decode+merge18.96s. Walk fragment merge refused, hence serial fallback and total41.86s. CPU89.49s vs21.76s primary. Even successful merge could only yield ~1.15x without ownership.
+
+Harfrust runtime frontier (historical accepted result, **correctness unvalidated** after the admission-certificate counterexample below): prefix107ms,123 pending tasks. Runtime workers25ms–1.42s. Modules+serialization1.92–3.58s; parent image merge4.03s, proof4.035s, adopt4.084s. Accepted; total4.744s. Primary CPU11.80s vs7.52s.
+
+Correctness smoke:41module valid fixture splits18 tasks with warm0, succeeds; static-if wrong type, return type mismatch, and recursive type aliases give exact same JSON diagnostics and ordering off/on repeated twice. Focused WalkFragments test validates graph remap, recursive graph, unresolved external rejection, crossworker callback escape detection, indirect ref not invoked. This is prototype evidence, not full production acceptance.
+
+Next experiment in progress:4MiB mmap table uses atomic publication + full128digest equality to assign MIR definition ownership dynamically. Foreign ownership becomes external placeholder; parent requires conservative whole-graph admission proof as well as escape proof. Saturated hash table computes locally. Any unresolved or unprovable fact falls back serial.
+
+## Shared ownership runtime-only result
+
+Source and binary: scratch `parallel-check-experiment`; runnable binary in `fork-candidate-package/.../speed-four/silk-compiler`, previous static-frontier binary saved `.scratch/N-frontier-static`. Shared mode enables `SILK_EXPERIMENT_FRONTIER=1 SILK_FRONTIER_SHARED=1`. Results `.scratch/benchmarks/shared-frontier-d3xr3tjw/results.jsonl`.
+
+Compiler22.538→40.330s; settled23.153→40.981s; aggregate CPU23.87→69.07s including fallback. Harfrust7.815→11.244s; settled8.267→11.713s; aggregateCPU8.48→19.47s including fallback. All exit0. Both merged graphs succeed but conservative admission fastpath rejects a same-body different-instance comparison, causing serial fallback.
+
+Compiler ownership runtime:32975 unique claims and48692 external skips across4workers. Worker times2.14,3.76,4.54,7.71s (versus14.7–15.7s whole-subtree experiment). Module checks still disable ownership; expensive workers re-lower otherworkers MIR (2.14→16.61s and7.71→14.20s). Parent image merge17.90s. Harfrust runtime1489 unique/891skipped; slowest1.22s; parentmerge3.41s. Small valid/error fixture repeats accepted proofs and identical diagnostics; helper admission/cycle/barrier tests passed.
+
+Next code-only iteration while authoritative benchmarks reserve CPUs: retain sharedclaims through assignedmodule escape walks, skip eager root MIR lowering in sharedworkers, gather all module/runtime fragment roots globally, preserve complete module sweeps but exclude incomplete escape roots from cache adoption. Parent may skip escape checks only after exact stable-unit + ordered concrete-declaration coverage match and successful graph proof. Helper adds exact child ancestry certificates and separate proof traversal per original rootgroup.
+
+## All-root shared ownership and retained admission workers
+
+All module escape walks now share instance ownership with runtime traversal. Complete declaration sweeps retain their diagnostics; clean walk records are transported directly, independently of persistent cache fitness. Parent coverage is matched by stable module unit and ordered concrete declarations. Runtime and every distinct module root group receive separate admission replay over the merged graph. No partial escape records are persisted. This removed the previous duplicated module MIR work, reaching roughly44,920 unique compiler instances once across workers, but exposed conservative proof gaps.
+
+Transport uncovered a pre-existing `BuildRecord.readFacts` decoder bug: direct-callee reference indices were incorrectly bounded by remaining encoded bytes rather than the entry reference count. A real final-entry index2 with zero bytes remaining was valid. Corrected decoder passes valid/malformed tests; production has a separate minimal fix. Portable family signatures and exact full ancestry certificates now allow the complete compiler graph to merge, but need additional admission evidence.
+
+Workers now remain alive on socketpairs after publishing captures. Parent batches missing ancestor/target digest pairs; workers resolve retained local instance keys and run the existing pure strict-runtime-subterm predicate. Only positive evidence is accepted; unknown or negative responses fall back to the serial walk. All inherited unrelated control endpoints are closed, `MSG_NOSIGNAL` avoids child death on parent cleanup, and parent closes/reaps all workers before success or fallback. Definition identity erases region patterns, so region-sensitive exact failure-union inclusion is deliberately excluded from portable certificates.
+
+Latest frozen pool binary SHA256: `bcf74507e9289a42815a89ea39bb165843a689e0732259594882639b4c059893`. Source patch `.scratch/frontier-pool-snapshot.patch`. Compiler trial `.scratch/frontier-pool-compiler.json`: foreground36.737s, settled37.359s, aggregate CPU54.604s, **serial fallback** after13.797s worker/merge stage; only2/562 required pairs certified. Harfrust `.scratch/frontier-pool-harfrust.json`: foreground11.164s, settled11.630s, **serial fallback** after3.302s stage;6/10 pairs certified. These are diagnostic experiments, not speedups. Reported maximum RSS is a single-process maximum, not aggregate fork memory.
+
+Current next source iteration adds relation diagnostics (missing key, runtime reuse, static change, strict subterm, exact subset, retained producer, non-growing, contextual), plus the existing region-invariant retained-producer positive branch. Runtime reuse needs a distinct decision kind because it does not push an admission frame; it must never be represented as an ordinary entered descent. No acceptance has yet been obtained for the complete shared-ownership compiler path. Load balancing and build-worker emission remain deferred until semantic proof succeeds.
+
+Proof review found two reasons the earlier accepted 1.66× Harfrust experiment cannot establish a correct speedup. First, an exact ancestry certificate may represent runtime reuse (no new admission frame), while the prototype pushed an Entered frame; an argument-free frame can then hide a different active family. Second, region-erased definition identities cannot certify region-sensitive exact failure-union decisions even on matching recorded paths. Current fixes preserve explicit Entered/Reused decisions, and ambiguous path certificates must be disabled until exact identity evidence is transported. Production is unaffected.
+
+## Typed decisions and conservative boundary audit
+
+Frozen binary4493f2dec97ad02fe1859bf6ca205db6460007730a3577a13c1e9404eac1a3b6 adds typed Entered/Reused positive certificates and iterative replay. Definition-only ancestry certificates are completely disabled. Parent refuses conflicting positive decision kinds and requires a final replay with no unknowns. A final guard also refuses records whose bounded traversal is not yet reconstructed.
+
+Compiler diagnostic `.scratch/frontier-decisions-compiler.json`: merge12.483s; initial614pairs yields20positives (8reuse,8strictsubterm,4retainedproducer), second round4positives, final594unknown (331nonGrowing,25contextualother,238missingco-residentkeys). Proof87ms including4msIPC. Serialfallback35.493s foreground/36.107s settled,54.890s CPU. Harfrust `.scratch/frontier-decisions-harfrust.json`: merge3.473s,11pairs yields6strict positives,5nonGrowing remain. Proof19ms; fallback11.475s/11.939s settled. Both exit0, with no accepted acceleration claim. Full mergedrecord and per-round oracle requests/replies are retained under corresponding `-oracle` directories.
+
+New unbuilt source has faithful bounded traversal descriptors, declaration/function/plain/static metadata, preserved visited state and callback restart order; focused tests passed4/0. A canonical-key snapshot augments workers' retained maps before the first oracle request to reduce cross-owner missing pairs. Contextual witness support is being added using existing pure nonGrowing, runtime application identity, actual witness-edge positions, propagated cleanup presence, and active-path repeat checks. These changes require the next focused test and native benchmark before any acceptance claim.
+
+## Complete finite graph policy and bounded discovery (in progress)
+
+The user explicitly authorized accepting proven finite specialization graphs if sound and measurably faster. The common serial/parallel checker and build admission policy is now being changed together: closed canonical instances enter discovery, exact provider-sensitive definition identity closes cycles, and a complete graph plus ordinary local type/borrow/effect checks and global escape analysis supplies the acceptance proof. The old ancestry shape heuristic is no longer the intended language rule. Existing semantic call-site region checks and definition interning are preserved; runtime graph identity is not substituted for those obligations.
+
+The last ancestry-preserving binary (SHA256 `17f9afb0b40f087376e43970101981db927a90d21d93a181816263c202845a4b`) correctly refused both compiler and Harfrust because global callback closure needed LEFT bodies no individual shard resumed. New GraphExtend command2 asks retained workers to walk missing definition roots, merges deltas, and repeats until all LEFT/EXTERNAL nodes have full summaries. A round must increase the full-definition count; unknown keys, diagnostics, missing summaries, no progress, or the128-round ceiling cause serial fallback. This source has not yet produced a native acceptance result.
+
+Discovery now has a shared command-wide FiniteBudget:250000 unique definitions,4096 definitions per exact original function declaration,4000000 MIR reference slots,536870912 retained runtime-key bytes. Duplicate definitions charge the maximum observed reference/key cost, independent of traversal order. Worker subsets and parent union use the same accounting; cached current records contribute their costs. Semantic revisions clear counts while preserving explicitly configured test limits. Existing per-key canonicalization limits remain. Resource exhaustion reports a finite-graph proof limit, not a claim that the graph is infinite.
+
+Budget hooks cover live check MIR demands, direct build walks before lowering and after selected frame references, and both check/build replay paths that can discover new keys after edits. Parent acceptance applies the configured global budget after complete graph closure. Focused compilation succeeded and8tests passed; one new400-deep raw-identity fixture stopped its test process, so stack diagnosis is pending before an optimized finite-policy compiler or default infinite-growth smoke. No finite-policy speedup is claimed yet. The obsolete ancestry oracle and its per-node metadata are mapped for deletion in `.scratch/finite-admission-cleanup-audit.md` after the first valid run and before performance claims.
+
+The deep raw-identity crash was a genuine host-stack overflow: the unoptimized Type rewrite dispatcher reserved47,400 bytes per recursive frame. Splitting22 recursive variants into smaller helpers fixed it without changing identity limits; all9 focused tests now pass. Optimized finite compiler built in102s, SHA256 `4c41f3e72f50d3f4c21f2599d9f5144385c2b6ab366ef184c193c6111c5ac8fd`; complete tracked+untracked source snapshot `.scratch/frontier-finite-snapshot.patch`.
+
+Native safety checks: new finite Inner→Outer→Outer cycle checks/builds and returns42. Infinite static n+1 stops at4096 definitions/body with SEM0053 (check0.377s99MB peak single-process RSS, build0.252s84MB). Infinite type-growing arrays terminate quickly but currently report internal Undetermined instead of a resource diagnostic; investigation remains open. Source policy cases6/8 passed; cleanup synthetic-source anchoring fix is saved after the frozen binary and pending validation. Therefore the policy is not ready for production.
+
+First complete compiler frontend graph now ACCEPTED with no serial fallback: `.scratch/frontier-finite-compiler.{log,json}`,47,156 full definitions. Initial union had3,627 LEFT bodies; a single GraphExtend round filled them, and finiteClosed/escapeFree/global budget all passed. This was a correctness/classification run sharing CPU with a source probe, not an authoritative speed measurement:18.839s foreground,19.203s settled,37.742s aggregate CPU. Largest per-process RSS1,925,780KiB is not aggregate PSS. Obsolete ancestry metadata remains enabled in this build and static frontier buckets remain imbalanced; those are next performance work after diagnostic safety is fixed.
+
+## Final accepted checkpoint and isolated measurements
+
+Local checkpoint commit `2e0c210b2` on `codex/parallel-finite-check-experiment` is not pushed. Stable binary `.scratch/frontier-finite-final` SHA256 `59e447ccd541732c41efb1cebf27e5e28d1d8f690d82261f40aee81eff8e4945`. Detailed handoff: `.scratch/parallel-finite-checkpoint.md`.
+
+Two alternating same-binary pairs, exclusive4-core measurement, all enabled trials accepted: compiler23.403→16.389s (**1.428×**), Harfrust7.971→4.158s (**1.917×**) foreground. Settled24.031→16.757s and8.427→4.469s. AggregateCPU rises~46%; compiler worker2 remains about twice as slow as the other shards. **3× is not achieved**, and no parallel-build speed claim is made. Separate sampled compiler peakaggregatePSS4.63GiB, summedRSS6.30GiB.
+
+Focused9/9, selectedpolicy9/9, eight native finite/resource invocations, and36/36 repeated enabled diagnostic comparisons pass. All20valid parallel corpus invocations accept;16invalid invocations explicitlyfall back. One pre-existing stockcompiler/corpus expectation mismatch is retained in the parityreport rather than masked. CanonicalResource diagnostics now preserve preparation failure reasons; generatedcleanup retains its authored source and stops onlatchedexhaustion. Fullproductiontests/reference/platformcleanup remain pending.
+
+An attempted omission of canonical-key augmentation made one compiler placeholder unavailable and correctly triggered fallback; augmentation is restored in the final binary. Family/runtime/witness metadata extraction and the empty per-step family allocation are removed, but unused ancestrycode remains for explicit cleanup beforepromotion.

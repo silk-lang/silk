@@ -1,0 +1,1 @@
+Not language-level aliasing coverage: Pointer.borrowMany forbids mutation during the source borrow. Reuse C memmove oracle only with a direct generated-helper raw-pointer ABI call; do not invoke the authored borrowed-slice wrapper on overlapping ranges.
