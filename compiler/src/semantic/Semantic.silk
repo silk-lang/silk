@@ -5,6 +5,7 @@
 //! The store reads an import target only when a requested fact needs its binding.
 
 import semantic.Types {TypeTable, Types}
+import semantic.DefinitionFragments
 import semantic.SourceSyntax
 import semantic.SyntaxNames {primitive}
 import semantic.TypeText
@@ -69,7 +70,7 @@ import backend.InstanceText {InstanceText as InstanceDefinition}
 import backend.InstanceText
 import hir.Fingerprint
 import hir.Unused { Unused as UnusedBinding, UnusedKind }
-import backend.EmissionPlan {EmissionPlan, Identity as EmissionIdentity, Replayed}
+import backend.EmissionPlan {EmissionPlan, Identity as EmissionIdentity, Replayed, exactDigest}
 import backend.Layout {
   Abi as BackendAbi,
   FieldInput as LayoutFieldInput,
@@ -408,6 +409,8 @@ import silk.crypto.sha2 {Sha256}
 import silk.testing.testing {AssertionError, Testing}
 import silk.num.u8
 import silk.num.u32
+import silk.num.i64
+import silk.num.isize
 import silk.num.usize
 import silk.num.u64
 import silk.collections.list {List}
@@ -421,6 +424,237 @@ pub enum StoreMode {
   Cached,
   /// Records a persistent cache and supports source edits in this process.
   Revisable,
+}
+
+// Scratch fork transport: no runtime service or borrowed query state is shared between workers.
+unsafe extern "C" fn fork() -> i32
+unsafe extern "C" fn _exit(status: i32) -> ()
+@foreign(noCapture: .("status"))
+unsafe extern "C" fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32
+unsafe extern "C" fn tmpfile() -> ?*mut u8
+unsafe extern "C" fn fileno(stream: ?*mut u8) -> i32
+unsafe extern "C" fn fclose(stream: ?*mut u8) -> i32
+unsafe extern "C" fn lseek(fd: i32, offset: i64, whence: i32) -> i64
+@foreign(noCapture: .("buffer"))
+unsafe extern "C" fn read(fd: i32, buffer: ?[*]mut u8, count: usize) -> isize
+@foreign(noCapture: .("buffer"))
+unsafe extern "C" fn write(fd: i32, buffer: ?[*]const u8, count: usize) -> isize
+@foreign(noCapture: .("name"))
+unsafe extern "C" fn getenv(name: ?[*]const u8) -> ?[*]const u8
+
+struct DeferredText { input: usize, index: usize }
+struct EmissionWorker { process: i32, stream: ?*mut u8 }
+
+fn parallelEmission() -> bool {
+  return !Pointer.isNullMany<u8>(unsafe getenv(Pointer.fromSlice<u8>(b"SILK_PARALLEL_EMIT\0")))
+}
+
+// This pending definition is local build state, never a successful LlvmText query answer.
+effect fn deferDefinition(resolver: &mut Resolver, inputIndex: usize) -> usize
+! OutOfMemoryError ? &mut Allocator {
+  let input = &List<EmissionInputs>.asSlice(&resolver.emissionInputs)[inputIndex]
+  let function = &List<MirFunction>.asSlice(&resolver.mirValues)[input.mir]
+  let identities = List<InstanceIdentity>.asSlice(&input.identities)
+  let definition = InstanceDefinition {encoding: run digestBytes(recordDigest(Bytes.asSlice(&input.encoding))),
+    symbol: run Bytes.copy(Bytes.asSlice(&identities[usize.ZERO].symbol)), text: Bytes.make(),
+    foreign: List<LlvmCode.Declaration>.make(), borrow: function.borrow}
+  let index = List<InstanceDefinition>.length(&resolver.llvmValues)
+  run List<InstanceDefinition>.append(&mut resolver.llvmValues, move definition)
+  return index
+}
+
+effect fn completeDeferred(resolver: &Resolver, job: &DeferredText) -> InstanceDefinition
+! BackendGap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let input = &List<EmissionInputs>.asSlice(&resolver.emissionInputs)[job.input]
+  let result = run Effect.result(completeDeferredRaw(resolver, job))
+  return match move result {
+    Result<InstanceDefinition, BackendGap | OutOfMemoryError>.Success {value} => move value
+    Result<InstanceDefinition, BackendGap | OutOfMemoryError>.Failure {error} => match move error {
+      BackendGap {code, owner, source} => {
+        let raised = BackendGap {code: code, owner: move owner, source: move source}
+        let placed = match &input.anchor {
+          Option<Anchor>.Some {value} => BackendGap.anchored(move raised, &value)
+          Option<Anchor>.None => move raised
+        }
+        fail move placed
+      }
+      OutOfMemoryError {} => { fail OutOfMemoryError {} }
+    }
+  }
+}
+
+effect fn completeDeferredRaw(resolver: &Resolver, job: &DeferredText) -> InstanceDefinition
+! BackendGap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let input = &List<EmissionInputs>.asSlice(&resolver.emissionInputs)[job.input]
+  let function = &List<MirFunction>.asSlice(&resolver.mirValues)[input.mir]
+  let mut hostExport = true
+  if let InstanceKey.Export {function: declaration, ..} = &function.key {
+    let linkOnly = List<ModuleId>.asSlice(&resolver.linkOnlySupport)
+    let mut at = usize.ZERO
+    while at < linkOnly.length {
+      let support = &linkOnly[at]
+      if Interned<DeclarationId>.with<bool>(&declaration, fn(identity: &DeclarationId) -> bool {
+        return ModuleId.equals(DeclarationId.moduleId(identity), support)
+      }) { hostExport = false }
+      at = at + usize.ONE
+    }
+  }
+  let text = run emitInstance(resolver, function, input, hostExport)
+  let foreign = run foreignDeclarationsFor(resolver, List<CAbi.Signature>.asSlice(&input.foreign))
+  let pending = &List<InstanceDefinition>.asSlice(&resolver.llvmValues)[job.index]
+  return InstanceDefinition {encoding: run Bytes.copy(Bytes.asSlice(&pending.encoding)),
+    symbol: run Bytes.copy(Bytes.asSlice(&pending.symbol)), text: move text, foreign: move foreign, borrow: function.borrow}
+}
+
+effect fn emitDeferredPacket(resolver: &Resolver, jobs: &[DeferredText], shard: usize) -> Bytes
+! BackendGap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut count = usize.ZERO
+  let mut at = shard
+  while at < jobs.length { count = count + usize.ONE
+    at = at + 4 }
+  // The packet belongs to this fork's immutable closed snapshot and its anonymous result file.
+  let mut packet = run DefinitionFragments.begin(b"closed-fork-emission", count)
+  at = shard
+  while at < jobs.length {
+    let definition = run completeDeferred(resolver, &jobs[at])
+    let input = &List<EmissionInputs>.asSlice(&resolver.emissionInputs)[jobs[at].input]
+    let key = &List<MirFunction>.asSlice(&resolver.mirValues)[input.mir].key
+    let identity = Replayed {exact: run exactDigest(key), hash: InstanceKey.runtimeHash(key),
+      declaration: DeclarationId.copyShared(&InstanceKey.identity(key)), family: EmissionPlan.familyName(key)}
+    run DefinitionFragments.append(&mut packet, &identity, &definition, Bytes.asSlice(&definition.text))
+    at = at + 4
+  }
+  return move packet
+}
+
+fn writeEmissionPacket(fd: i32, bytes: &[u8]) -> bool {
+  let mut at = usize.ZERO
+  while at < bytes.length {
+    let count = unsafe write(fd, Pointer.fromSlice<u8>(Slice.view<u8>(bytes, at, bytes.length - at)), bytes.length - at)
+    if count <= 0 { return false }
+    at = at + isize.toUsize(count)
+  }
+  return true
+}
+
+effect fn readEmissionPacket(fd: i32) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+  let size = unsafe lseek(fd, 0, 2)
+  if size < 0 || unsafe lseek(fd, 0, 0) < 0 { return Option<Bytes>.none() }
+  let mut bytes = run Bytes.zeroed(i64.toUsize(size))
+  let mut at = usize.ZERO
+  while at < Bytes.length(&bytes) {
+    let remaining = Bytes.length(&bytes) - at
+    let count = unsafe read(fd, Pointer.fromMutSlice<u8>(Slice.viewMut<u8>(Bytes.asMutSlice(&mut bytes), at, remaining)), remaining)
+    if count <= 0 { return Option<Bytes>.none() }
+    at = at + isize.toUsize(count)
+  }
+  return Option<Bytes>.some(move bytes)
+}
+
+// Workers return only immutable fragments. Join every child before failure reconstruction.
+effect fn finishDeferred(resolver: &mut Resolver, jobs: &[DeferredText]) -> bool
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut workers = List<EmissionWorker>.make()
+  let mut healthy = true
+  let mut shard: usize = 1
+  while shard < 4 {
+    let stream = unsafe tmpfile()
+    if Pointer.isNull<u8>(stream) { healthy = false
+      break }
+    let process = unsafe fork()
+    if process < 0 { drop unsafe fclose(stream)
+      healthy = false
+      break }
+    if process == 0 {
+      let packet = run Effect.result(emitDeferredPacket(&resolver.*, jobs, shard))
+      let mut status: i32 = 2
+      if let Result<Bytes, BackendGap | OutOfMemoryError>.Success {value} = &packet {
+        if writeEmissionPacket(unsafe fileno(stream), Bytes.asSlice(&value)) { status = 0 }
+      }
+      unsafe _exit(status)
+      return CompilerBug.panic(b"emission worker exit returned")
+    }
+    run List<EmissionWorker>.append(&mut workers, EmissionWorker {process: process, stream: stream})
+    shard = shard + usize.ONE
+  }
+  let own = run Effect.result(emitDeferredPacket(&resolver.*, jobs, usize.ZERO))
+  let mut packets = List<Bytes>.make()
+  match move own {
+    Result<Bytes, BackendGap | OutOfMemoryError>.Success {value} => { run List<Bytes>.append(&mut packets, move value) }
+    Result<Bytes, BackendGap | OutOfMemoryError>.Failure {..} => { healthy = false }
+  }
+  let listed = List<EmissionWorker>.asSlice(&workers)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let mut status: i32 = 0
+    let waited = unsafe waitpid(listed[at].process, Pointer.fromMutRef<i32>(&mut status), 0)
+    if waited != listed[at].process || status != 0 { healthy = false }
+    if healthy {
+      let packet = run readEmissionPacket(unsafe fileno(listed[at].stream))
+      match move packet {
+        Option<Bytes>.Some {value} => { run List<Bytes>.append(&mut packets, move value) }
+        Option<Bytes>.None => { healthy = false }
+      }
+    }
+    drop unsafe fclose(listed[at].stream)
+    at = at + usize.ONE
+  }
+  let mut completed = List<DefinitionFragments.Entry>.make()
+  let mut positions = List<usize>.make()
+  if healthy {
+    let outputs = List<Bytes>.asSlice(&packets)
+    shard = usize.ZERO
+    while shard < outputs.length {
+      let parsed = run DefinitionFragments.read(Bytes.asSlice(&outputs[shard]), b"closed-fork-emission")
+      match move parsed {
+        Option<List<DefinitionFragments.Entry>>.Some {value} => {
+          let mut entries = move value
+          let mut count = List<DefinitionFragments.Entry>.length(&entries)
+          let mut expected = usize.ZERO
+          at = shard
+          while at < jobs.length { expected = expected + usize.ONE
+            at = at + 4 }
+          if count != expected { healthy = false
+            break }
+          while count > usize.ZERO {
+            count = count - usize.ONE
+            run List<DefinitionFragments.Entry>.append(&mut completed, List<DefinitionFragments.Entry>.remove(&mut entries, count))
+            run List<usize>.append(&mut positions, shard + count * 4)
+          }
+        }
+        Option<List<DefinitionFragments.Entry>>.None => { healthy = false
+          break }
+      }
+      shard = shard + usize.ONE
+    }
+    if healthy { healthy = run DefinitionFragments.valid(List<DefinitionFragments.Entry>.asSlice(&completed)) }
+    if healthy {
+      let entries = List<DefinitionFragments.Entry>.asSlice(&completed)
+      let pending = List<InstanceDefinition>.asSlice(&resolver.llvmValues)
+      at = usize.ZERO
+      while at < entries.length {
+        let expected = &pending[jobs[List<usize>.get(&positions, at)].index]
+        if !same(Bytes.asSlice(&expected.encoding), Bytes.asSlice(&entries[at].definition.encoding))
+          || !same(Bytes.asSlice(&expected.symbol), Bytes.asSlice(&entries[at].definition.symbol)) { healthy = false }
+        at = at + usize.ONE
+      }
+    }
+  }
+  if healthy {
+    let mut count = List<DefinitionFragments.Entry>.length(&completed)
+    while count > usize.ZERO {
+      count = count - usize.ONE
+      let entry = List<DefinitionFragments.Entry>.remove(&mut completed, count)
+      let job = &jobs[List<usize>.get(&positions, count)]
+      List<InstanceDefinition>.set(&mut resolver.llvmValues, job.index, move entry.definition)
+    }
+    drop unsafe write(2, Pointer.fromSlice<u8>(b"parallel emit accepted\n"), 23)
+    return true
+  }
+  drop unsafe write(2, Pointer.fromSlice<u8>(b"parallel emit retry\n"), 20)
+  // Retry the ordinary walk: an unsupported function may have stopped traversal before its
+  // descendants, so retrying only raw emission would not preserve complete diagnostic ordering.
+  return false
 }
 
 /// The semantic fact selected by a query key.
@@ -2974,6 +3208,7 @@ pub struct Statistics {
 /// Semantic rejections are completed answers. Provider failures leave a key available for retry.
 /// This actor keeps query events and direct dependencies for later request replay.
 pub struct Semantic {
+  failedParallelEmission: bool,
   resolver: Resolver,
   query: Query<Answer, NoRejection>,
   deferredTemplates: List<DeferredStaticTemplate>,
@@ -92302,6 +92537,7 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
     Option<FinalProfile>.None => target
   }
   return Semantic {
+    failedParallelEmission: false,
     resolver: Resolver {
       staticDemandDepth: usize.ZERO,
       staticDemandLimit: usize.MAX,
@@ -98193,6 +98429,8 @@ impl Semantic {
     let mut visited = List<InstanceKey>.make()
     let mut visitedLookup = InternIndex.make()
     let mut emitted = List<CollectedText>.make()
+    let mut deferred = List<DeferredText>.make()
+    let deferText = parallelEmission() && !self.failedParallelEmission
     let mut gaps = List<Shared<BackendGap>>.make()
     let mut refusals = List<Shared<Rejection>>.make()
     // Each cleanup root's owned-structure answers reached during this build.
@@ -98444,7 +98682,21 @@ impl Semantic {
           key,
           Span.make(usize.ZERO, usize.ZERO),
         )
-        let answer = run demandPreparedText(&mut self.resolver, &mut self.query, key, &prepared)
+        let mut pendingText = Option<usize>.none()
+        if deferText {
+          let input = Shared<Result<Answer, NoRejection>>.with<Option<usize>>(&prepared, answerEmissionInputsIndex)
+          if let Option<usize>.Some {value} = move input {
+            let index = run deferDefinition(&mut self.resolver, value)
+            run List<DeferredText>.append(&mut deferred, DeferredText {input: value, index: index})
+            pendingText = Option<usize>.some(index)
+          }
+        }
+        // A pending definition is explicit local state. Its query still reports prepared inputs,
+        // and no empty text is ever published as a successful LlvmText query.
+        let answer = match &pendingText {
+          Option<usize>.Some {..} => Shared<Result<Answer, NoRejection>>.clone(&prepared)
+          Option<usize>.None => run demandPreparedText(&mut self.resolver, &mut self.query, key, &prepared)
+        }
         let canonicalFailure = Shared<Result<Answer, NoRejection>>.with<Option<CanonicalizationFailure>>(&answer, answerCanonicalizationFailure)
         if let Option<CanonicalizationFailure>.Some {..} = move canonicalFailure {
           run List<Shared<Rejection>>.append(&mut refusals, run reject(&self.resolver, &entered.module,
@@ -98486,10 +98738,10 @@ impl Semantic {
           run List<Shared<BackendGap>>.append(&mut gaps, move value)
           continue
         }
-        let index = Shared<Result<Answer, NoRejection>>.with<Option<usize>>(
-          &answer,
-          answerLlvmTextIndex,
-        )
+        let index = match move pendingText {
+          Option<usize>.Some {value} => Option<usize>.some(value)
+          Option<usize>.None => Shared<Result<Answer, NoRejection>>.with<Option<usize>>(&answer, answerLlvmTextIndex)
+        }
         if let Option<usize>.Some {value} = move index {
           run List<CollectedText>.append(
             &mut emitted,
@@ -98707,10 +98959,19 @@ impl Semantic {
           closureNodes, observing, &chosen)
       }
     }
+    let mut portable = List<CollectedText>.make()
+    if deferText {
+      if !run finishDeferred(&mut self.resolver, List<DeferredText>.asSlice(&deferred)) {
+        self.failedParallelEmission = true
+        return run Semantic.buildFrom(&mut self.*, module, runtimeSelected, roots, entrySpan, closureNodes, observing, frames)
+      }
+      portable = run keylessDefinitions(List<CollectedText>.asSlice(&emitted))
+    }
+    let finalDefinitions = if deferText { List<CollectedText>.asSlice(&portable) } else { List<CollectedText>.asSlice(&emitted) }
     let mut packed = PackedBuild.make()
     let assembled = run assembleEmission(
       &self.resolver,
-      List<CollectedText>.asSlice(&emitted),
+      finalDefinitions,
       roots,
       module,
       entrySpan,
@@ -100822,6 +101083,30 @@ struct CollectedText {
   // lowered here.
   pack: usize,
   member: usize,
+}
+
+// The parent already owns these jobs; exact application aliases reuse the returned definition
+// while assembly needs only stable identities, never worker-local MIR or type handles.
+effect fn keylessDefinitions(reached: &[CollectedText]) -> List<CollectedText>
+! OutOfMemoryError ? &mut Allocator {
+  let mut result = List<CollectedText>.make()
+  let mut at = usize.ZERO
+  while at < reached.length {
+    let collected = &reached[at]
+    let identity = match &collected.key {
+      Option<InstanceKey>.Some {value} => Replayed {exact: run exactDigest(&value),
+        hash: InstanceKey.runtimeHash(&value), declaration: collectedDeclaration(collected), family: EmissionPlan.familyName(&value)}
+      Option<InstanceKey>.None => match &collected.replayed {
+        Option<Replayed>.Some {value} => Replayed {exact: run Bytes.copy(Bytes.asSlice(&value.exact)), hash: value.hash,
+          declaration: DeclarationId.copy(&value.declaration), family: value.family}
+        Option<Replayed>.None => { return CompilerBug.panic(b"definition has no stable identity") }
+      }
+    }
+    run List<CollectedText>.append(&mut result, CollectedText {key: Option<InstanceKey>.none(),
+      replayed: Option<Replayed>.some(move identity), index: collected.index, pack: collected.pack, member: collected.member})
+    at = at + usize.ONE
+  }
+  return move result
 }
 
 // The text of one collected definition: a slice of its held pack's body, or its own.
