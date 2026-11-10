@@ -813,7 +813,8 @@ effect fn roll() -> u32 ? &mut Random {
 not, since their access is the contract implementations follow. An entry no `run` needs is not
 reported, and a body that runs an Effect with an open row is not checked.
 
-**Diagnostics:** `SEM0254` is a warning: the command still succeeds.
+**Diagnostics:** `SEM0254` is a warning. Like every warning, it fails `silk build` unless
+`--ignore-warnings` is given.
 
 **Current compiler:** Aligned.
 

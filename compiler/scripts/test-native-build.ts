@@ -809,7 +809,7 @@ const program = Effect.gen(function* () {
       '  }',
       '}',
       'effect fn load(code: i32) -> i32 ! ConfigError { if code > 0 { fail ConfigError { code: code } } return code }',
-      'pub effect fn main() -> () ! ConfigError { let code = run load(7) }',
+      'pub effect fn main() -> () ! ConfigError { drop run load(7) }',
       '',
     ].join('\n'),
   )
@@ -1215,8 +1215,10 @@ const program = Effect.gen(function* () {
     casing.stderr,
     /^src\/main\.silk:1:8: error\[MOD0001\] Unknown module util\.math\n  note: did you mean `util\.Math`\? Module paths match file names exactly, including letter case$/m,
   )
-  // Unused bindings are warnings: `check` and `build` report them and still succeed. Each command
-  // runs twice, so the second, warm run reports the warnings of a module it does not parse again.
+  // Unused bindings are warnings, and a warning fails `check` and `build` unless `--ignore-warnings`
+  // allows it. Each command runs at least twice, so a warm run reports the warnings of a module it
+  // does not parse again, and a build that reuses an allowed build's artifact fails for its
+  // warnings again. An interface import that only method syntax uses is not reported.
   yield* fs.makeDirectory(join(directory, 'unused/src'), { recursive: true })
   yield* fs.writeFileString(
     join(directory, 'unused/silk.toml'),
@@ -1224,20 +1226,33 @@ const program = Effect.gen(function* () {
   )
   yield* fs.writeFileString(
     join(directory, 'unused/src/main.silk'),
-    'import helper { value }\n\npub fn main() -> i32 {\n  let idle = 1\n  let _kept = 2\n  return value()\n}\n',
+    'import helper { value }\nimport shape { Area, Square }\n\npub fn main() -> i32 {\n  let idle = 1\n  let _kept = 2\n  let square = Square {side: 0}\n  return value() + square.area()\n}\n',
   )
   yield* fs.writeFileString(
     join(directory, 'unused/src/helper.silk'),
     'import silk.num.usize\n\npub fn value() -> i32 {\n  let spare = 1\n  return 0\n}\n',
   )
-  for (const command of ['check', 'check', 'build', 'build']) {
-    const unused = yield* invoke(silk, [command, '--stdlib', standardLibrary, ...(command === 'build' ? ['--clang', clang] : [])],
-      join(directory, 'unused'))
-    assert.equal(unused.status, 0, unused.stderr)
-    assert.match(unused.stderr, /^src\/main\.silk:4:7: warning\[SEM0255\] `idle` is never used/m)
+  yield* fs.writeFileString(
+    join(directory, 'unused/src/shape.silk'),
+    'pub interface Area {\n  fn area(self: &Self) -> i32\n}\n\npub struct Square {\n  pub side: i32,\n}\n\nimpl Area for Square {\n  fn area(self: &Self) -> i32 {\n    return self.side * self.side\n  }\n}\n',
+  )
+  const unusedRuns: ReadonlyArray<readonly [string, boolean]> = [
+    ['check', false], ['check', false], ['check', true],
+    ['build', true], ['build', false], ['build', false], ['build', true],
+  ]
+  for (const [command, ignored] of unusedRuns) {
+    const unused = yield* invoke(silk, [
+      command, '--stdlib', standardLibrary,
+      ...(command === 'build' ? ['--clang', clang] : []),
+      ...(ignored ? ['--ignore-warnings'] : []),
+    ], join(directory, 'unused'))
+    assert.equal(unused.status, ignored ? 0 : 1, unused.stderr)
+    assert.match(unused.stderr, /^src\/main\.silk:5:7: warning\[SEM0255\] `idle` is never used/m)
     assert.match(unused.stderr, /^src\/helper\.silk:4:7: warning\[SEM0255\] `spare` is never used/m)
     assert.match(unused.stderr, /^src\/helper\.silk:1:17: warning\[MOD0007\] Import `usize` is never used/m)
-    assert.doesNotMatch(unused.stderr, /_kept/)
+    assert.doesNotMatch(unused.stderr, /_kept|`Area`/)
+    if (ignored) assert.doesNotMatch(unused.stderr, /--ignore-warnings/)
+    else assert.match(unused.stderr, /^silk: warnings fail this command; fix them, or pass --ignore-warnings to allow them$/m)
   }
   // A package that cannot be loaded ends its load row as failed and still names itself on its
   // final line.
@@ -1770,7 +1785,7 @@ const program = Effect.gen(function* () {
   )
   yield* fs.writeFileString(
     join(directory, 'libmsg/app/src/main.silk'),
-    'import geo.lib { BadSide, side }\n\npub effect fn main() -> i32 ! BadSide {\n  let length = run side(-1)\n  return 0\n}\n',
+    'import geo.lib { BadSide, side }\n\npub effect fn main() -> i32 ! BadSide {\n  let _length = run side(-1)\n  return 0\n}\n',
   )
   const escaped = yield* invoke(
     silk,
@@ -2001,7 +2016,7 @@ const program = Effect.gen(function* () {
   )
   yield* fs.writeFileString(
     join(directory, 'tested/src/util/check.silk'),
-    'import silk.testing.testing { AssertionError, Testing }\n\npub fn half(value: i32) -> i32 {\n  return value / 2\n}\n\ntest effect fn halvesEvenly() -> () ! AssertionError<\'static> {\n  run Testing.expect(half(84) == 42, "84 halves to 42")\n}\n\ntest effect fn failsOnPurpose() -> () ! AssertionError<\'static> {\n  run Testing.expect(half(3) == 2, "integer division truncates")\n}\n\ntest fn dividesByZero() -> () {\n  let zero: i32 = 0\n  let quotient = half(2) / zero\n}\n',
+    'import silk.testing.testing { AssertionError, Testing }\n\npub fn half(value: i32) -> i32 {\n  return value / 2\n}\n\ntest effect fn halvesEvenly() -> () ! AssertionError<\'static> {\n  run Testing.expect(half(84) == 42, "84 halves to 42")\n}\n\ntest effect fn failsOnPurpose() -> () ! AssertionError<\'static> {\n  run Testing.expect(half(3) == 2, "integer division truncates")\n}\n\ntest fn dividesByZero() -> () {\n  let zero: i32 = 0\n  let _quotient = half(2) / zero\n}\n',
   )
   const selectedTests = yield* invoke(
     silk,
@@ -2093,7 +2108,7 @@ const program = Effect.gen(function* () {
   )
   yield* fs.writeFileString(
     join(directory, 'stuck/src/main.silk'),
-    'fn deep(n: i64) -> i64 {\n  if n == 0 { return 0 }\n  return deep(n - 1) + 1\n}\n\npub fn main() -> i32 {\n  return 0\n}\n\ntest fn overflows() {\n  let depth = deep(100000000)\n}\n\ntest fn spins() {\n  let mut i: i64 = 0\n  while i >= 0 {\n    i = i - 1 + 1\n  }\n}\n\ntest fn zFinishes() {\n}\n',
+    'fn deep(n: i64) -> i64 {\n  if n == 0 { return 0 }\n  return deep(n - 1) + 1\n}\n\npub fn main() -> i32 {\n  return 0\n}\n\ntest fn overflows() {\n  let _depth = deep(100000000)\n}\n\ntest fn spins() {\n  let mut i: i64 = 0\n  while i >= 0 {\n    i = i - 1 + 1\n  }\n}\n\ntest fn zFinishes() {\n}\n',
   )
   const stuckTests = yield* invoke(
     silk,
