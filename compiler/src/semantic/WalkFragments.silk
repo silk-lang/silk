@@ -1,0 +1,801 @@
+//! Scratch composition of independently checked escape-walk frontiers.
+
+import semantic.BuildRecord
+import semantic.ContentHash {ContentHash}
+import semantic.InternIndex {InternIndex}
+import silk.collections.bytes {Bytes}
+import silk.collections.hash {Hash}
+import silk.collections.list {List}
+import silk.core.option {Option}
+import silk.core.effect {Effect}
+import silk.testing.testing {AssertionError, Testing}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.mem.pointer {Pointer}
+import silk.num.u64
+import silk.num.usize
+import silk.num.isize
+
+/// A frontier omitted by one worker and supplied by another worker's complete entry.
+pub const EXTERNAL: u64 = 3
+/// This external target passed local admission before another worker claimed its body.
+pub const ADMITTED: u64 = 4096
+/// Actual worker admission decision, retained for diagnostics only.
+pub const ENTERED: u64 = 32768
+/// Actual worker reuse decision, retained for diagnostics only.
+pub const REUSED: u64 = 65536
+
+/// A malformed capture index, diagnosed before transport encoding.
+pub struct FragmentFault {pub entry: usize, pub code: usize, pub value: usize}
+
+/// Checks the index constraints enforced by the BuildRecord decoder and fragment merger.
+pub fn structuralFailure(record: &BuildRecord.Record) -> Option<FragmentFault> {
+  let entries = List<BuildRecord.Entry>.asSlice(&record.entries)
+  let mut at = usize.ZERO
+  while at < entries.length {
+    let entry = &entries[at]
+    if entry.parent != usize.MAX && entry.parent >= at {
+      return Option<FragmentFault>.some(FragmentFault {entry: at, code: 1, value: entry.parent})
+    }
+    if entry.alias != usize.MAX && entry.alias >= at {
+      return Option<FragmentFault>.some(FragmentFault {entry: at, code: 2, value: entry.alias})
+    }
+    if entry.requested && entry.parent == usize.MAX {
+      return Option<FragmentFault>.some(FragmentFault {entry: at, code: 3, value: entry.position})
+    }
+    if entry.leaf > EXTERNAL {
+      return Option<FragmentFault>.some(FragmentFault {entry: at, code: 4, value: u64.toUsize(entry.leaf)})
+    }
+    let references = List<BuildRecord.Reference>.asSlice(&entry.references)
+    let mut reference = usize.ZERO
+    while reference < references.length {
+      if references[reference].target >= entries.length {
+        return Option<FragmentFault>.some(FragmentFault {entry: at, code: 5, value: references[reference].target})
+      }
+      reference = reference + usize.ONE
+    }
+    let callees = List<usize>.asSlice(&entry.facts.callees)
+    reference = usize.ZERO
+    while reference < callees.length {
+      if callees[reference] >= references.length {
+        return Option<FragmentFault>.some(FragmentFault {entry: at, code: 6, value: callees[reference]})
+      }
+      reference = reference + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return Option<FragmentFault>.none()
+}
+
+/// An exact pair whose ordinary descent must be proved by a worker retaining both applications.
+pub struct AdmissionPair {pub ancestor: ContentHash, pub target: ContentHash}
+/// A region-invariant worker proof: decision 1 enters, decision 2 reuses without pushing a frame.
+pub struct AdmissionCertificate {pub ancestor: ContentHash, pub target: ContentHash, pub decision: u64}
+
+fn pairHash(pair: &AdmissionPair) -> u64 { return Hash.combine(hashed(pair.ancestor), hashed(pair.target)) }
+fn containsPair(pairs: &[AdmissionPair], lookup: &InternIndex, pair: &AdmissionPair) -> bool {
+  let mut at = InternIndex.first(lookup, pairHash(pair))
+  while at != usize.MAX {
+    if ContentHash.equals(pairs[at].ancestor, pair.ancestor) && ContentHash.equals(pairs[at].target, pair.target) { return true }
+    at = InternIndex.after(lookup, at)
+  }
+  return false
+}
+
+fn certificateDecision(certificates: &[AdmissionCertificate], lookup: &InternIndex, pair: &AdmissionPair) -> u64 {
+  let mut at = InternIndex.first(lookup, pairHash(pair))
+  while at != usize.MAX {
+    if ContentHash.equals(certificates[at].ancestor, pair.ancestor) && ContentHash.equals(certificates[at].target, pair.target) {
+      return certificates[at].decision
+    }
+    at = InternIndex.after(lookup, at)
+  }
+  return 0
+}
+
+struct Source {record: usize, entry: usize}
+struct Visit {entry: usize, parent: usize, position: usize}
+struct AdmissionVisit {entry: usize, parent: usize, position: usize, leave: bool}
+struct AdmissionFrame {entry: usize, body: u64, free: bool}
+
+@foreign(noCapture: .("buffer"))
+unsafe extern "C" fn write(fd: i32, buffer: ?[*]const u8, count: usize) -> isize
+
+fn refused(label: &[u8]) -> Option<BuildRecord.Record> {
+  drop unsafe write(2, Pointer.fromSlice<u8>(label), label.length)
+  return Option<BuildRecord.Record>.none()
+}
+fn refuseProof(label: &[u8]) -> bool {
+  drop unsafe write(2, Pointer.fromSlice<u8>(label), label.length)
+  return false
+}
+
+fn hashed(value: ContentHash) -> u64 { return Hash.combine(value.high, value.low) }
+fn find(keys: &[ContentHash], lookup: &InternIndex, key: ContentHash) -> usize {
+  let mut at = InternIndex.first(lookup, hashed(key))
+  while at != usize.MAX {
+    if ContentHash.equals(keys[at], key) { return at }
+    at = InternIndex.after(lookup, at)
+  }
+  return usize.MAX
+}
+fn rank(leaf: u64) -> usize {
+  if leaf == EXTERNAL { return usize.ZERO }
+  if leaf == BuildRecord.LEFT { return usize.ONE }
+  return 2
+}
+
+fn sameDefinition(firstEntries: &[BuildRecord.Entry], first: &BuildRecord.Entry,
+  secondEntries: &[BuildRecord.Entry], second: &BuildRecord.Entry) -> bool {
+  if !ContentHash.equals(first.summary, second.summary) { return refuseProof(b"frontier duplicate summary differs\n") }
+  let left = List<BuildRecord.Reference>.asSlice(&first.references)
+  let right = List<BuildRecord.Reference>.asSlice(&second.references)
+  if left.length != right.length { return refuseProof(b"frontier duplicate reference count differs\n") }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at].target >= firstEntries.length || right[at].target >= secondEntries.length { return false }
+    if !ContentHash.equals(firstEntries[left[at].target].exact, secondEntries[right[at].target].exact)
+      || !ContentHash.equals(left[at].edge, right[at].edge) { return refuseProof(b"frontier duplicate reference differs\n") }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+/// Joins the roots of escape fragments, resolves omitted frontier entries, and remaps
+/// every reference. Entries are ordered by deterministic root/reference DFS. This graph can
+/// prove a clean union; bounded LEFT/full occurrences are collapsed, so it is not a cache image.
+pub effect fn merge(records: &[BuildRecord.Record]) -> Option<BuildRecord.Record>
+! OutOfMemoryError ? &mut Allocator {
+  if records.length == usize.ZERO { return refused(b"frontier merge refused: empty records\n") }
+  if records[usize.ZERO].patterns { return refused(b"frontier merge refused: root patterns\n") }
+  let mut rootKeys = List<ContentHash>.make()
+  let mut rootLookup = InternIndex.make()
+  let mut keys = List<ContentHash>.make()
+  let mut chosen = List<Source>.make()
+  let mut lookup = InternIndex.make()
+  let mut mappings = List<List<usize>>.make()
+  let mut guarded = false
+  let mut recordAt = usize.ZERO
+  while recordAt < records.length {
+    let record = &records[recordAt]
+    if record.patterns || record.observing != records[usize.ZERO].observing { return refused(b"frontier merge refused: record mode\n") }
+    guarded = guarded || record.guarded
+    let listedRoots = List<ContentHash>.asSlice(&record.roots)
+    let mut at = usize.ZERO
+    while at < listedRoots.length {
+      if find(List<ContentHash>.asSlice(&rootKeys), &rootLookup, listedRoots[at]) == usize.MAX {
+        run List<ContentHash>.append(&mut rootKeys, listedRoots[at])
+        run InternIndex.record(&mut rootLookup, hashed(listedRoots[at]))
+      }
+      at = at + usize.ONE
+    }
+    let entries = List<BuildRecord.Entry>.asSlice(&record.entries)
+    let mut mapping = List<usize>.make()
+    at = usize.ZERO
+    while at < entries.length {
+      let entry = &entries[at]
+      if entry.alias != usize.MAX || entry.leaf > EXTERNAL { return refused(b"frontier merge refused: alias or leaf\n") }
+      let mut selected = find(List<ContentHash>.asSlice(&keys), &lookup, entry.exact)
+      if selected == usize.MAX {
+        selected = List<ContentHash>.length(&keys)
+        run List<ContentHash>.append(&mut keys, entry.exact)
+        run InternIndex.record(&mut lookup, hashed(entry.exact))
+        run List<Source>.append(&mut chosen, Source {record: recordAt, entry: at})
+      } else {
+        let prior = &List<Source>.asSlice(&chosen)[selected]
+        let known = &List<BuildRecord.Entry>.asSlice(&records[prior.record].entries)[prior.entry]
+        if entry.leaf != EXTERNAL && known.leaf != EXTERNAL
+          && ((entry.leaf == BuildRecord.FOREIGN && known.leaf != BuildRecord.FOREIGN)
+            || (known.leaf == BuildRecord.FOREIGN && entry.leaf != BuildRecord.FOREIGN)) { return refused(b"frontier merge refused: foreign conflict\n") }
+        if entry.leaf == 0 && known.leaf == 0
+          && !sameDefinition(entries, entry, List<BuildRecord.Entry>.asSlice(&records[prior.record].entries), known) {
+          return refused(b"frontier merge refused: definition conflict\n")
+        }
+        if rank(entry.leaf) > rank(known.leaf) { List<Source>.set(&mut chosen, selected, Source {record: recordAt, entry: at}) }
+      }
+      run List<usize>.append(&mut mapping, selected)
+      at = at + usize.ONE
+    }
+    run List<List<usize>>.append(&mut mappings, move mapping)
+    recordAt = recordAt + usize.ONE
+  }
+  let sources = List<Source>.asSlice(&chosen)
+  let maps = List<List<usize>>.asSlice(&mappings)
+  let mut at = usize.ZERO
+  while at < sources.length {
+    let source = &sources[at]
+    if List<BuildRecord.Entry>.asSlice(&records[source.record].entries)[source.entry].leaf == EXTERNAL {
+      return refused(b"frontier merge refused: external unresolved\n")
+    }
+    at = at + usize.ONE
+  }
+  let mut result = BuildRecord.make(records[usize.ZERO].observing, false)
+  result.guarded = guarded
+  let mut pending = List<Visit>.make()
+  let roots = List<ContentHash>.asSlice(&rootKeys)
+  at = usize.ZERO
+  while at < roots.length {
+    run List<ContentHash>.append(&mut result.roots, roots[at])
+    let entry = find(List<ContentHash>.asSlice(&keys), &lookup, roots[at])
+    if entry == usize.MAX { return refused(b"frontier merge refused: root missing\n") }
+    run List<Visit>.append(&mut pending, Visit {entry: entry, parent: usize.MAX, position: at})
+    at = at + usize.ONE
+  }
+  let mut placed = List<usize>.make()
+  run List<usize>.appendRepeated(&mut placed, usize.MAX, sources.length)
+  while true {
+    let visit = match move List<Visit>.pop(&mut pending) {
+      Option<Visit>.Some {value} => move value
+      Option<Visit>.None => { break }
+    }
+    if List<usize>.get(&placed, visit.entry) != usize.MAX { continue }
+    let source = &sources[visit.entry]
+    let entry = &List<BuildRecord.Entry>.asSlice(&records[source.record].entries)[source.entry]
+    let mapping = List<usize>.asSlice(&maps[source.record])
+    let next = List<BuildRecord.Entry>.length(&result.entries)
+    List<usize>.set(&mut placed, visit.entry, next)
+    let mut references = List<BuildRecord.Reference>.make()
+    let original = List<BuildRecord.Reference>.asSlice(&entry.references)
+    at = usize.ZERO
+    while at < original.length {
+      if original[at].target >= mapping.length { return refused(b"frontier merge refused: target bounds\n") }
+      run List<BuildRecord.Reference>.append(&mut references, BuildRecord.Reference {target: mapping[original[at].target], edge: original[at].edge})
+      at = at + usize.ONE
+    }
+    let callees = List<usize>.asSlice(&entry.facts.callees)
+    at = usize.ZERO
+    while at < callees.length {
+      if callees[at] >= original.length { return refused(b"frontier merge refused: callee bounds\n") }
+      at = at + usize.ONE
+    }
+    run List<BuildRecord.Entry>.append(&mut result.entries, BuildRecord.Entry {
+      exact: entry.exact, hash: entry.hash, family: entry.family, declaration: run Bytes.copy(Bytes.asSlice(&entry.declaration)),
+      parent: visit.parent, position: visit.position, requested: false, alias: usize.MAX, leaf: entry.leaf,
+      references: move references, summary: entry.summary, facts: run BuildRecord.copyFacts(&entry.facts)})
+    at = original.length
+    while at > usize.ZERO {
+      at = at - usize.ONE
+      run List<Visit>.append(&mut pending, Visit {entry: mapping[original[at].target], parent: next, position: at})
+    }
+  }
+  let entries = List<BuildRecord.Entry>.asMutSlice(&mut result.entries)
+  at = usize.ZERO
+  while at < entries.length {
+    let references = List<BuildRecord.Reference>.asMutSlice(&mut entries[at].references)
+    let mut reference = usize.ZERO
+    while reference < references.length {
+      let target = List<usize>.get(&placed, references[reference].target)
+      if target == usize.MAX { return refused(b"frontier merge refused: unplaced target\n") }
+      references[reference].target = target
+      reference = reference + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return Option<BuildRecord.Record>.some(move result)
+}
+
+/// Proves every admission edge in the deterministic union walk from immutable application facts.
+/// A different instance of an active body requires a worker's region-invariant application
+/// proof. Definition-only ancestry records do not bind exact semantic region inputs and cannot
+/// authorize admission. Admission precedes the visited check on every edge.
+pub effect fn admissionFree(record: &BuildRecord.Record, records: &[BuildRecord.Record]) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut missing = List<AdmissionPair>.make()
+  let valid = run reviewAdmission(record, records, &[], &mut missing)
+  return valid && List<AdmissionPair>.length(&missing) == usize.ZERO
+}
+
+/// Checks all original walks and collects novel ordinary-descent pairs. Unproved pairs are
+/// tentatively entered to collect a batch. Certified reuse suppresses its frame, so a caller
+/// retries after acquiring decisions: changing the active ancestry can remove tentative requests.
+/// Acceptance requires true and an empty `missing` list. Definition-only path certificates are
+/// never accepted; `certified` contains region-invariant decisions, and `missing` is replaced.
+pub effect fn reviewAdmission(record: &BuildRecord.Record, records: &[BuildRecord.Record], certified: &[AdmissionCertificate],
+  missing: &mut List<AdmissionPair>) -> bool ! OutOfMemoryError ? &mut Allocator {
+  List<AdmissionPair>.clear(&mut missing.*)
+  let mut missingLookup = InternIndex.make()
+  let mut positiveLookup = InternIndex.make()
+  let mut positiveAt = usize.ZERO
+  while positiveAt < certified.length {
+    let certificate = &certified[positiveAt]
+    if certificate.decision != 1 && certificate.decision != 2 { return false }
+    let pair = AdmissionPair {ancestor: certificate.ancestor, target: certificate.target}
+    let previous = certificateDecision(certified, &positiveLookup, &pair)
+    if previous != 0 && previous != certificate.decision { return false }
+    run InternIndex.record(&mut positiveLookup, pairHash(&pair))
+    positiveAt = positiveAt + usize.ONE
+  }
+  let entries = List<BuildRecord.Entry>.asSlice(&record.entries)
+  let mut keys = List<ContentHash>.make()
+  let mut lookup = InternIndex.make()
+  let mut at = usize.ZERO
+  while at < entries.length {
+    run List<ContentHash>.append(&mut keys, entries[at].exact)
+    run InternIndex.record(&mut lookup, hashed(entries[at].exact))
+    at = at + usize.ONE
+  }
+  if records.length == usize.ZERO {
+    return run admissionRoots(entries, List<ContentHash>.asSlice(&keys), &lookup, List<ContentHash>.asSlice(&record.roots),
+      certified, &positiveLookup, &mut missing.*, &mut missingLookup)
+  }
+  let mut recordAt = usize.ZERO
+  while recordAt < records.length {
+    let roots = List<ContentHash>.asSlice(&records[recordAt].roots)
+    let mut duplicate = false
+    let mut prior = usize.ZERO
+    while prior < recordAt && !duplicate {
+      duplicate = sameRoots(roots, List<ContentHash>.asSlice(&records[prior].roots))
+      prior = prior + usize.ONE
+    }
+    if !duplicate && !run admissionRoots(entries, List<ContentHash>.asSlice(&keys), &lookup, roots,
+      certified, &positiveLookup, &mut missing.*, &mut missingLookup) { return false }
+    recordAt = recordAt + usize.ONE
+  }
+  return true
+}
+
+// Incomplete family evidence deliberately matches any profile of the same body, as
+// Specialization.sameFamilyProfile does. Only two complete signatures establish a difference.
+fn matchingFamily(left: &BuildRecord.Facts, right: &BuildRecord.Facts) -> bool {
+  let complete = BuildRecord.FACT_FAMILY + BuildRecord.FACT_FAMILY_COMPLETE
+  if u64.bitAnd(left.flags, complete) != complete || u64.bitAnd(right.flags, complete) != complete { return true }
+  return ContentHash.equals(left.family, right.family)
+}
+
+fn sameRoots(left: &[ContentHash], right: &[ContentHash]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if !ContentHash.equals(left[at], right[at]) { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// Each module/runtime walk starts with a fresh admission path and visited set. Sharing visited
+// state across their roots can hide a growth decision below a cross-worker cut in another module.
+effect fn admissionRoots(entries: &[BuildRecord.Entry], keys: &[ContentHash], lookup: &InternIndex,
+  roots: &[ContentHash], certified: &[AdmissionCertificate], positiveLookup: &InternIndex, missing: &mut List<AdmissionPair>, missingLookup: &mut InternIndex) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  let mut pending = List<AdmissionVisit>.make()
+  let mut at = usize.ZERO
+  while at < roots.length {
+    let entry = find(keys, lookup, roots[at])
+    if entry == usize.MAX { return refuseProof(b"frontier admission root missing\n") }
+    run List<AdmissionVisit>.append(&mut pending, AdmissionVisit {entry: entry, parent: usize.MAX, position: at, leave: false})
+    at = at + usize.ONE
+  }
+  let mut frames = List<AdmissionFrame>.make()
+  let mut visited = List<bool>.make()
+  run List<bool>.appendRepeated(&mut visited, false, entries.length)
+  while true {
+    let visit = match move List<AdmissionVisit>.pop(&mut pending) {
+      Option<AdmissionVisit>.Some {value} => move value
+      Option<AdmissionVisit>.None => { break }
+    }
+    if visit.leave {
+      drop move List<AdmissionFrame>.pop(&mut frames)
+      continue
+    }
+    if visit.entry >= entries.length { return refuseProof(b"frontier admission edge bounds\n") }
+    let entry = &entries[visit.entry]
+    if entry.leaf == EXTERNAL { return refuseProof(b"frontier admission external\n") }
+    if entry.leaf == BuildRecord.FOREIGN || entry.leaf == BuildRecord.LEFT { continue }
+    if u64.bitAnd(entry.facts.flags, BuildRecord.FACT_KNOWN) == 0 { return refuseProof(b"frontier admission facts missing\n") }
+    let application = u64.bitAnd(entry.facts.flags, BuildRecord.FACT_APPLICATION) != 0
+    let mut entered = application
+    if application {
+      let active = List<AdmissionFrame>.asSlice(&frames)
+      at = active.length
+      while at > usize.ZERO {
+        at = at - usize.ONE
+        if active[at].body == entry.facts.body && matchingFamily(&entries[active[at].entry].facts, &entry.facts) {
+          if active[at].entry == visit.entry { entered = false }
+          else {
+            let pair = AdmissionPair {ancestor: entries[active[at].entry].exact, target: entry.exact}
+            let decision = certificateDecision(certified, positiveLookup, &pair)
+            if decision == 2 { entered = false }
+            if decision == 0 && !containsPair(List<AdmissionPair>.asSlice(&missing.*), &missingLookup.*, &pair) {
+              run InternIndex.record(&mut missingLookup.*, pairHash(&pair))
+              run List<AdmissionPair>.append(&mut missing.*, move pair)
+            }
+          }
+          break
+        }
+        if active[at].free { break }
+      }
+    }
+    if List<bool>.get(&visited, visit.entry) { continue }
+    List<bool>.set(&mut visited, visit.entry, true)
+    if entered {
+      run List<AdmissionFrame>.append(&mut frames, AdmissionFrame {entry: visit.entry, body: entry.facts.body,
+        free: u64.bitAnd(entry.facts.flags, BuildRecord.FACT_ARGUMENT_FREE) != 0})
+      run List<AdmissionVisit>.append(&mut pending, AdmissionVisit {entry: visit.entry, parent: usize.MAX, position: usize.ZERO, leave: true})
+    }
+    let references = List<BuildRecord.Reference>.asSlice(&entry.references)
+    at = references.length
+    while at > usize.ZERO {
+      at = at - usize.ONE
+      run List<AdmissionVisit>.append(&mut pending, AdmissionVisit {entry: references[at].target, parent: visit.entry, position: at, leave: false})
+    }
+  }
+  return true
+}
+
+/// Proves that no access callback reaches an escape through direct calls in the union. Missing
+/// call facts or a possible escape request a serial diagnostic walk. The caller must have
+/// completed all frontier and bounded callbacks.
+pub effect fn escapeFree(record: &BuildRecord.Record) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let entries = List<BuildRecord.Entry>.asSlice(&record.entries)
+  let mut keys = List<ContentHash>.make()
+  let mut owners = List<usize>.make()
+  let mut lookup = InternIndex.make()
+  let mut at = usize.ZERO
+  while at < entries.length {
+    if entries[at].leaf == EXTERNAL { return false }
+    if entries[at].leaf == 0 && u64.bitAnd(entries[at].facts.flags, BuildRecord.FACT_KNOWN + BuildRecord.FACT_SUMMARIZED)
+      != BuildRecord.FACT_KNOWN + BuildRecord.FACT_SUMMARIZED { return false }
+    run List<ContentHash>.append(&mut keys, entries[at].facts.definition)
+    run List<usize>.append(&mut owners, at)
+    run InternIndex.record(&mut lookup, hashed(entries[at].facts.definition))
+    if u64.bitAnd(entries[at].facts.flags, BuildRecord.FACT_BARE) != 0 {
+      run List<ContentHash>.append(&mut keys, entries[at].facts.bare)
+      run List<usize>.append(&mut owners, at)
+      run InternIndex.record(&mut lookup, hashed(entries[at].facts.bare))
+    }
+    at = at + usize.ONE
+  }
+  let mut pending = List<usize>.make()
+  let mut queued = List<bool>.make()
+  run List<bool>.appendRepeated(&mut queued, false, entries.length)
+  at = usize.ZERO
+  while at < entries.length {
+    let callbacks = List<ContentHash>.asSlice(&entries[at].facts.callbacks)
+    let mut callback = usize.ZERO
+    while callback < callbacks.length {
+      let mut named = InternIndex.first(&lookup, hashed(callbacks[callback]))
+      let mut found = false
+      while named != usize.MAX {
+        if ContentHash.equals(List<ContentHash>.get(&keys, named), callbacks[callback]) {
+          let target = List<usize>.get(&owners, named)
+          found = true
+          if !List<bool>.get(&queued, target) {
+            List<bool>.set(&mut queued, target, true)
+            run List<usize>.append(&mut pending, target)
+          }
+        }
+        named = InternIndex.after(&lookup, named)
+      }
+      if !found { return false }
+      callback = callback + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  let mut head = usize.ZERO
+  while head < List<usize>.length(&pending) {
+    let target = List<usize>.get(&pending, head)
+    head = head + usize.ONE
+    let entry = &entries[target]
+    if entry.leaf == BuildRecord.LEFT { return false }
+    if u64.bitAnd(entry.facts.flags, BuildRecord.FACT_ESCAPES) != 0 { return false }
+    if entry.leaf == BuildRecord.FOREIGN { continue }
+    if u64.bitAnd(entry.facts.flags, BuildRecord.FACT_CALLEES) == 0 { return false }
+    let references = List<BuildRecord.Reference>.asSlice(&entry.references)
+    let callees = List<usize>.asSlice(&entry.facts.callees)
+    let mut callee = usize.ZERO
+    while callee < callees.length {
+      if callees[callee] >= references.length { return false }
+      let called = references[callees[callee]].target
+      if called >= entries.length { return false }
+      if !List<bool>.get(&queued, called) {
+        List<bool>.set(&mut queued, called, true)
+        run List<usize>.append(&mut pending, called)
+      }
+      callee = callee + usize.ONE
+    }
+  }
+  return true
+}
+
+fn exampleKey(id: u64) -> ContentHash { return ContentHash {high: 0, low: id} }
+effect fn exampleEntry(id: u64, leaf: u64, targets: &[usize]) -> BuildRecord.Entry ! OutOfMemoryError ? &mut Allocator {
+  let mut references = List<BuildRecord.Reference>.make()
+  let mut at = usize.ZERO
+  while at < targets.length {
+    run List<BuildRecord.Reference>.append(&mut references, BuildRecord.Reference {target: targets[at], edge: exampleKey(0)})
+    at = at + usize.ONE
+  }
+  let mut facts = BuildRecord.unknownFacts()
+  facts.definition = exampleKey(id)
+  facts.flags = BuildRecord.FACT_KNOWN + BuildRecord.FACT_SUMMARIZED + BuildRecord.FACT_CALLEES
+  at = usize.ZERO
+  while at < targets.length {
+    run List<usize>.append(&mut facts.callees, at)
+    at = at + usize.ONE
+  }
+  return BuildRecord.Entry {exact: exampleKey(id), hash: id, family: id, declaration: Bytes.make(), parent: usize.MAX,
+    position: usize.ZERO, requested: false, alias: usize.MAX, leaf: leaf, references: move references,
+    summary: exampleKey(id), facts: move facts}
+}
+
+effect fn fragmentClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut first = BuildRecord.make(false, false)
+  run List<ContentHash>.append(&mut first.roots, exampleKey(1))
+  run List<BuildRecord.Entry>.append(&mut first.entries, run exampleEntry(1, 0, &[1, 2]))
+  run List<BuildRecord.Entry>.append(&mut first.entries, run exampleEntry(2, 0, &[2]))
+  run List<BuildRecord.Entry>.append(&mut first.entries, run exampleEntry(3, EXTERNAL, &[]))
+  let mut second = BuildRecord.make(false, false)
+  run List<ContentHash>.append(&mut second.roots, exampleKey(1))
+  run List<BuildRecord.Entry>.append(&mut second.entries, run exampleEntry(1, 0, &[2, 1]))
+  run List<BuildRecord.Entry>.append(&mut second.entries, run exampleEntry(3, 0, &[2]))
+  run List<BuildRecord.Entry>.append(&mut second.entries, run exampleEntry(2, EXTERNAL, &[]))
+  let mut records = List<BuildRecord.Record>.make()
+  run List<BuildRecord.Record>.append(&mut records, move first)
+  let incomplete = run merge(List<BuildRecord.Record>.asSlice(&records))
+  run Testing.expect(match &incomplete { Option<BuildRecord.Record>.None => true _ => false }, "an unresolved frontier cannot establish a complete walk")
+  run List<BuildRecord.Record>.append(&mut records, move second)
+  let combined = run merge(List<BuildRecord.Record>.asSlice(&records))
+  if let Option<BuildRecord.Record>.Some {value} = move combined {
+    let mut joined = move value
+    let entries = List<BuildRecord.Entry>.asSlice(&joined.entries)
+    run Testing.expect(entries.length == 3 && ContentHash.equals(entries[1].exact, exampleKey(2))
+      && ContentHash.equals(entries[2].exact, exampleKey(3)) && entries[1].parent == 0 && entries[2].parent == 1,
+      "fragment-local indexes become deterministic DFS parents")
+    run Testing.expect(List<BuildRecord.Reference>.asSlice(&entries[2].references)[0].target == 1,
+      "a cross-fragment back edge points to the merged recursive component")
+    let applications = List<BuildRecord.Entry>.asMutSlice(&mut joined.entries)
+    let mut applicationAt = usize.ZERO
+    while applicationAt < applications.length {
+      applications[applicationAt].facts.flags = u64.bitOr(applications[applicationAt].facts.flags, BuildRecord.FACT_APPLICATION)
+      applications[applicationAt].facts.body = usize.toU64(applicationAt + usize.ONE)
+      applicationAt = applicationAt + usize.ONE
+    }
+    run Testing.expect(run admissionFree(&joined, &[]), "exact recursive applications reuse an active frame")
+    let changedBody = List<BuildRecord.Entry>.asMutSlice(&mut joined.entries)
+    changedBody[2].facts.body = 2
+    run Testing.expect(!run admissionFree(&joined, &[]), "distinct instances of the same active body need argument comparison")
+    let barrier = List<BuildRecord.Entry>.asMutSlice(&mut joined.entries)
+    barrier[2].facts.body = 1
+    barrier[1].facts.flags = u64.bitOr(barrier[1].facts.flags, BuildRecord.FACT_ARGUMENT_FREE)
+    run Testing.expect(!run admissionFree(&joined, &[]), "admission checks an already visited target reached without the barrier")
+    let boundedPath = List<BuildRecord.Entry>.asMutSlice(&mut joined.entries)
+    drop move List<BuildRecord.Reference>.remove(&mut boundedPath[0].references, 1)
+    drop move List<usize>.remove(&mut boundedPath[0].facts.callees, 1)
+    run Testing.expect(run admissionFree(&joined, &[]), "an argument-free frame bounds the admission ancestry")
+    let noBarrier = List<BuildRecord.Entry>.asMutSlice(&mut joined.entries)
+    noBarrier[1].facts.flags =
+      BuildRecord.FACT_KNOWN + BuildRecord.FACT_SUMMARIZED + BuildRecord.FACT_CALLEES + BuildRecord.FACT_APPLICATION
+    run Testing.expect(!run admissionFree(&joined, &[]), "removing the barrier exposes cross-worker ancestor growth")
+    run Testing.expect(run escapeFree(&joined), "a complete graph without escape sites is clean")
+    let edited = List<BuildRecord.Entry>.asMutSlice(&mut joined.entries)
+    edited[0].facts.flags = u64.bitOr(edited[0].facts.flags, BuildRecord.FACT_ACCESSES)
+    run List<ContentHash>.append(&mut edited[0].facts.callbacks, exampleKey(2))
+    edited[2].facts.flags = u64.bitOr(edited[2].facts.flags, BuildRecord.FACT_ESCAPES)
+    run Testing.expect(!run escapeFree(&joined), "a callback in one fragment reaches an escape from another fragment")
+    let indirect = List<BuildRecord.Entry>.asMutSlice(&mut joined.entries)
+    List<usize>.clear(&mut indirect[1].facts.callees)
+    run Testing.expect(run escapeFree(&joined), "an indirect reference does not invoke an escape during a held access")
+  } else {
+    run Testing.expect(false, "complementary fragments resolve each other's frontier")
+  }
+}
+
+// The facts of a worker-accepted descending generic path; its argument payload stays in the
+// worker. The parent can use that decision only under exactly the recorded incoming ancestry.
+effect fn certificateExample() -> BuildRecord.Record ! OutOfMemoryError ? &mut Allocator {
+  let mut record = BuildRecord.make(false, false)
+  run List<ContentHash>.append(&mut record.roots, exampleKey(1))
+  run List<BuildRecord.Entry>.append(&mut record.entries, run exampleEntry(1, 0, &[1]))
+  run List<BuildRecord.Entry>.append(&mut record.entries, run exampleEntry(2, 0, &[2]))
+  run List<BuildRecord.Entry>.append(&mut record.entries, run exampleEntry(3, 0, &[]))
+  let entries = List<BuildRecord.Entry>.asMutSlice(&mut record.entries)
+  entries[1].parent = 0
+  entries[2].parent = 1
+  entries[1].facts.flags = u64.bitOr(entries[1].facts.flags, BuildRecord.FACT_APPLICATION)
+  entries[2].facts.flags = u64.bitOr(entries[2].facts.flags, BuildRecord.FACT_APPLICATION)
+  entries[1].facts.body = 20
+  entries[2].facts.body = 20
+  return move record
+}
+
+effect fn certificateClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let record = run certificateExample()
+  run Testing.expect(!run admissionFree(&record, &[]), "argument growth requires evidence")
+  let mut evidence = List<BuildRecord.Record>.make()
+  run List<BuildRecord.Record>.append(&mut evidence, run certificateExample())
+  run Testing.expect(!run admissionFree(&record, List<BuildRecord.Record>.asSlice(&evidence)),
+    "definition-only ancestry cannot certify exact semantic admission")
+  let placeholders = List<BuildRecord.Record>.asMutSlice(&mut evidence)
+  let placeholderEntries = List<BuildRecord.Entry>.asMutSlice(&mut placeholders[0].entries)
+  placeholderEntries[2].leaf = EXTERNAL
+  run Testing.expect(!run admissionFree(&record, List<BuildRecord.Record>.asSlice(&evidence)),
+    "a statically omitted frontier target was not locally admitted")
+  let admitted = List<BuildRecord.Record>.asMutSlice(&mut evidence)
+  let admittedEntries = List<BuildRecord.Entry>.asMutSlice(&mut admitted[0].entries)
+  admittedEntries[2].facts.flags = u64.bitOr(admittedEntries[2].facts.flags, ADMITTED)
+  run Testing.expect(!run admissionFree(&record, List<BuildRecord.Record>.asSlice(&evidence)),
+    "an admitted external still lacks exact semantic region-pattern evidence")
+  let changedRecords = List<BuildRecord.Record>.asMutSlice(&mut evidence)
+  let changedEntries = List<BuildRecord.Entry>.asMutSlice(&mut changedRecords[0].entries)
+  let changedEdges = List<BuildRecord.Reference>.asMutSlice(&mut changedEntries[1].references)
+  changedEdges[0].edge = exampleKey(99)
+  run Testing.expect(!run admissionFree(&record, List<BuildRecord.Record>.asSlice(&evidence)),
+    "changed witness or cleanup edges cannot reuse an admission certificate")
+  let restoredRecords = List<BuildRecord.Record>.asMutSlice(&mut evidence)
+  let restoredEntries = List<BuildRecord.Entry>.asMutSlice(&mut restoredRecords[0].entries)
+  let restoredEdges = List<BuildRecord.Reference>.asMutSlice(&mut restoredEntries[1].references)
+  restoredEdges[0].edge = exampleKey(0)
+  restoredEntries[2].leaf = 0
+  restoredEntries[1].facts.flags = u64.bitOr(restoredEntries[1].facts.flags, BuildRecord.FACT_ELSEWHERE)
+  run Testing.expect(!run admissionFree(&record, List<BuildRecord.Record>.asSlice(&evidence)),
+    "a bounded callback restart does not attest its original parent ancestry")
+  let mut other = BuildRecord.make(false, false)
+  run List<ContentHash>.append(&mut other.roots, exampleKey(4))
+  run List<BuildRecord.Entry>.append(&mut other.entries, run exampleEntry(4, 0, &[]))
+  run List<BuildRecord.Record>.append(&mut evidence, move other)
+  let combined = run merge(List<BuildRecord.Record>.asSlice(&evidence))
+  if let Option<BuildRecord.Record>.Some {value} = move combined {
+    run Testing.expect(List<ContentHash>.length(&value.roots) == 2 && List<BuildRecord.Entry>.length(&value.entries) == 4,
+      "module fragments contribute distinct roots to one complete graph")
+  } else { run Testing.expect(false, "disjoint module roots merge") }
+}
+
+effect fn separateRootClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut first = BuildRecord.make(false, false)
+  run List<ContentHash>.append(&mut first.roots, exampleKey(1))
+  run List<BuildRecord.Entry>.append(&mut first.entries, run exampleEntry(1, 0, &[1]))
+  run List<BuildRecord.Entry>.append(&mut first.entries, run exampleEntry(2, 0, &[2]))
+  run List<BuildRecord.Entry>.append(&mut first.entries, run exampleEntry(3, 0, &[]))
+  let initial = List<BuildRecord.Entry>.asMutSlice(&mut first.entries)
+  initial[1].parent = 0
+  initial[2].parent = 1
+  initial[2].facts.flags = u64.bitOr(initial[2].facts.flags, BuildRecord.FACT_APPLICATION)
+  initial[2].facts.body = 20
+  let mut second = BuildRecord.make(false, false)
+  run List<ContentHash>.append(&mut second.roots, exampleKey(4))
+  run List<BuildRecord.Entry>.append(&mut second.entries, run exampleEntry(4, 0, &[1]))
+  run List<BuildRecord.Entry>.append(&mut second.entries, run exampleEntry(2, EXTERNAL, &[]))
+  let later = List<BuildRecord.Entry>.asMutSlice(&mut second.entries)
+  later[0].facts.flags = u64.bitOr(later[0].facts.flags, BuildRecord.FACT_APPLICATION)
+  later[0].facts.body = 20
+  later[1].parent = 0
+  let mut records = List<BuildRecord.Record>.make()
+  // Root 1 pops first in the combined traversal, hiding root 4's deeper edge if visited is shared.
+  run List<BuildRecord.Record>.append(&mut records, move second)
+  run List<BuildRecord.Record>.append(&mut records, move first)
+  if let Option<BuildRecord.Record>.Some {value} = move run merge(List<BuildRecord.Record>.asSlice(&records)) {
+    run Testing.expect(run admissionFree(&value, &[]), "one combined visited set can skip another root's deeper ancestry")
+    run Testing.expect(!run admissionFree(&value, List<BuildRecord.Record>.asSlice(&records)),
+      "independent module roots require fresh visited sets after cross-worker cuts")
+  } else { run Testing.expect(false, "separate module root fragments merge") }
+}
+
+effect fn familyFactClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut record = run certificateExample()
+  let entries = List<BuildRecord.Entry>.asMutSlice(&mut record.entries)
+  entries[1].facts.flags = u64.bitOr(entries[1].facts.flags, BuildRecord.FACT_FAMILY + BuildRecord.FACT_FAMILY_COMPLETE)
+  entries[2].facts.flags = u64.bitOr(entries[2].facts.flags, BuildRecord.FACT_FAMILY + BuildRecord.FACT_FAMILY_COMPLETE)
+  entries[1].facts.family = exampleKey(10)
+  entries[2].facts.family = exampleKey(20)
+  run Testing.expect(run admissionFree(&record, &[]), "distinct complete producer families may run the same body on one path")
+  let encoded = run BuildRecord.encode(&record)
+  if let Option<BuildRecord.Record>.Some {value} = move run BuildRecord.decode(Bytes.asSlice(&encoded)) {
+    run Testing.expect(run admissionFree(&value, &[]), "portable family evidence survives fragment transport")
+  } else { run Testing.expect(false, "family facts decode") }
+  let incomplete = List<BuildRecord.Entry>.asMutSlice(&mut record.entries)
+  incomplete[2].facts.flags = BuildRecord.FACT_KNOWN + BuildRecord.FACT_APPLICATION + BuildRecord.FACT_SUMMARIZED
+    + BuildRecord.FACT_CALLEES + BuildRecord.FACT_FAMILY
+  run Testing.expect(!run admissionFree(&record, &[]), "incomplete family evidence keeps the conservative same-body comparison")
+}
+
+effect fn finalCalleeClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut record = BuildRecord.make(false, false)
+  run List<ContentHash>.append(&mut record.roots, exampleKey(2))
+  run List<BuildRecord.Entry>.append(&mut record.entries, run exampleEntry(1, 0, &[]))
+  let mut targets = List<usize>.make()
+  run List<usize>.appendRepeated(&mut targets, usize.ZERO, 41)
+  run List<BuildRecord.Entry>.append(&mut record.entries, run exampleEntry(2, 0, List<usize>.asSlice(&targets)))
+  let entries = List<BuildRecord.Entry>.asMutSlice(&mut record.entries)
+  List<usize>.clear(&mut entries[1].facts.callees)
+  run List<usize>.append(&mut entries[1].facts.callees, 40)
+  let encoded = run BuildRecord.encode(&record)
+  if let Option<BuildRecord.Record>.Some {value} = move run BuildRecord.decode(Bytes.asSlice(&encoded)) {
+    let lastEntry = &List<BuildRecord.Entry>.asSlice(&value.entries)[1]
+    run Testing.expect(List<usize>.length(&lastEntry.facts.callees) == 1 && List<usize>.get(&lastEntry.facts.callees, 0) == 40,
+      "the final entry preserves a direct callee near the end of its reference list")
+  } else { run Testing.expect(false, "a final direct callee index is not a remaining byte count") }
+  let invalid = List<BuildRecord.Entry>.asMutSlice(&mut record.entries)
+  List<usize>.set(&mut invalid[1].facts.callees, 0, 41)
+  let malformed = run BuildRecord.encode(&record)
+  let decoded = run BuildRecord.decode(Bytes.asSlice(&malformed))
+  run Testing.expect(match &decoded { Option<BuildRecord.Record>.None => true _ => false },
+    "direct callee positions must refer to the entry's reference list")
+}
+
+effect fn admissionBatchClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut record = run certificateExample()
+  run List<BuildRecord.Entry>.append(&mut record.entries, run exampleEntry(4, 0, &[]))
+  let entries = List<BuildRecord.Entry>.asMutSlice(&mut record.entries)
+  entries[3].facts.flags = u64.bitOr(entries[3].facts.flags, BuildRecord.FACT_APPLICATION)
+  entries[3].facts.body = 20
+  run List<BuildRecord.Reference>.append(&mut entries[2].references, BuildRecord.Reference {target: 3, edge: exampleKey(0)})
+  run List<usize>.append(&mut entries[2].facts.callees, 0)
+  let mut missing = List<AdmissionPair>.make()
+  let collected = run reviewAdmission(&record, &[], &[], &mut missing)
+  run Testing.expect(collected && List<AdmissionPair>.length(&missing) == 2,
+    "one tentative traversal collects both nested ordinary-descent requests")
+  let required = List<AdmissionPair>.asSlice(&missing)
+  run Testing.expect(ContentHash.equals(required[0].ancestor, exampleKey(2)) && ContentHash.equals(required[0].target, exampleKey(3))
+    && ContentHash.equals(required[1].ancestor, exampleKey(3)) && ContentHash.equals(required[1].target, exampleKey(4)),
+    "certificates name exact directed ancestor and target pairs")
+  let mut certified = List<AdmissionCertificate>.make()
+  run List<AdmissionCertificate>.append(&mut certified, AdmissionCertificate {ancestor: exampleKey(2), target: exampleKey(3), decision: 1})
+  let partial = run reviewAdmission(&record, &[], List<AdmissionCertificate>.asSlice(&certified), &mut missing)
+  run Testing.expect(partial && List<AdmissionPair>.length(&missing) == 1, "one positive certificate cannot authorize another descent")
+  run List<AdmissionCertificate>.append(&mut certified, AdmissionCertificate {ancestor: exampleKey(3), target: exampleKey(4), decision: 1})
+  let complete = run reviewAdmission(&record, &[], List<AdmissionCertificate>.asSlice(&certified), &mut missing)
+  run Testing.expect(complete && List<AdmissionPair>.length(&missing) == 0, "the complete positive batch proves every required ordinary descent")
+  let repeated = List<BuildRecord.Entry>.asMutSlice(&mut record.entries)
+  run List<BuildRecord.Reference>.append(&mut repeated[1].references, BuildRecord.Reference {target: 2, edge: exampleKey(0)})
+  let deduplicated = run reviewAdmission(&record, &[], &[], &mut missing)
+  run Testing.expect(deduplicated && List<AdmissionPair>.length(&missing) == 2,
+    "repeated incoming edges request each exact pair only once")
+}
+
+effect fn reusedFrameClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut record = BuildRecord.make(false, false)
+  run List<ContentHash>.append(&mut record.roots, exampleKey(1))
+  run List<BuildRecord.Entry>.append(&mut record.entries, run exampleEntry(1, 0, &[1]))
+  run List<BuildRecord.Entry>.append(&mut record.entries, run exampleEntry(2, 0, &[2]))
+  run List<BuildRecord.Entry>.append(&mut record.entries, run exampleEntry(3, 0, &[3]))
+  run List<BuildRecord.Entry>.append(&mut record.entries, run exampleEntry(4, 0, &[]))
+  let entries = List<BuildRecord.Entry>.asMutSlice(&mut record.entries)
+  let mut at = usize.ZERO
+  while at < entries.length {
+    entries[at].facts.flags = u64.bitOr(entries[at].facts.flags, BuildRecord.FACT_APPLICATION)
+    entries[at].facts.body = 20
+    at = at + usize.ONE
+  }
+  entries[0].facts.body = 10
+  entries[2].facts.body = 10
+  entries[0].facts.flags = u64.bitOr(entries[0].facts.flags, BuildRecord.FACT_ARGUMENT_FREE)
+  entries[2].facts.flags = u64.bitOr(entries[2].facts.flags, BuildRecord.FACT_ARGUMENT_FREE)
+  let mut missing = List<AdmissionPair>.make()
+  let first = run reviewAdmission(&record, &[], &[], &mut missing)
+  run Testing.expect(first && List<AdmissionPair>.length(&missing) == 1,
+    "a tentative argument-free entry hides a deeper ancestor until its actual decision is known")
+  let mut certified = List<AdmissionCertificate>.make()
+  run List<AdmissionCertificate>.append(&mut certified, AdmissionCertificate {ancestor: exampleKey(1), target: exampleKey(3), decision: 2})
+  let replayed = run reviewAdmission(&record, &[], List<AdmissionCertificate>.asSlice(&certified), &mut missing)
+  let required = List<AdmissionPair>.asSlice(&missing)
+  run Testing.expect(replayed && required.length == 1 && ContentHash.equals(required[0].ancestor, exampleKey(2))
+    && ContentHash.equals(required[0].target, exampleKey(4)),
+    "reused applications cannot push an argument-free barrier that hides an intervening growth check")
+  let mut cycle = BuildRecord.make(false, false)
+  run List<ContentHash>.append(&mut cycle.roots, exampleKey(1))
+  run List<BuildRecord.Entry>.append(&mut cycle.entries, run exampleEntry(1, 0, &[1]))
+  run List<BuildRecord.Entry>.append(&mut cycle.entries, run exampleEntry(3, 0, &[0]))
+  let cycleEntries = List<BuildRecord.Entry>.asMutSlice(&mut cycle.entries)
+  cycleEntries[0].facts.flags = u64.bitOr(cycleEntries[0].facts.flags, BuildRecord.FACT_APPLICATION)
+  cycleEntries[1].facts.flags = u64.bitOr(cycleEntries[1].facts.flags, BuildRecord.FACT_APPLICATION)
+  cycleEntries[0].facts.body = 10
+  cycleEntries[1].facts.body = 10
+  let tentative = run reviewAdmission(&cycle, &[], &[], &mut missing)
+  run Testing.expect(tentative && List<AdmissionPair>.length(&missing) == 2,
+    "tentative entry can create a provisional reverse-pair request")
+  let reused = run reviewAdmission(&cycle, &[], List<AdmissionCertificate>.asSlice(&certified), &mut missing)
+  run Testing.expect(reused && List<AdmissionPair>.length(&missing) == 0,
+    "replaying a reuse certificate removes the unneeded provisional reverse pair")
+  run List<AdmissionCertificate>.append(&mut certified, AdmissionCertificate {ancestor: exampleKey(1), target: exampleKey(3), decision: 1})
+  run Testing.expect(!run reviewAdmission(&cycle, &[], List<AdmissionCertificate>.asSlice(&certified), &mut missing),
+    "conflicting worker admission decisions cannot establish a proof")
+}
+
+test effect fn frontierFragmentsRemapCyclesAndFindCrossWorkerEscapes() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run fragmentClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+  run certificateClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+  run separateRootClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+  run familyFactClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+  run finalCalleeClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+  run admissionBatchClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+  run reusedFrameClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
