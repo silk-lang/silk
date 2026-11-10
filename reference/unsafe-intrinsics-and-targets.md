@@ -1260,7 +1260,8 @@ strip = 1
 `[native].function-order` names a text file below the manifest's directory that lists function
 symbols, one per line, such as `silk_1f3a9c...`; blank lines and lines starting with `#` are
 ignored. Write each symbol as the program's LLVM IR and a Linux `nm` spell it, without the leading
-underscore Mach-O adds. A debug build writes these names beside its output in `<output>.symbols`.
+underscore Mach-O adds. Every build writes these names beside its output in `<output>.symbols`, one
+line per symbol: the symbol, its kind and the declaration it belongs to.
 A Silk function's symbol derives from its declaration, not its body, so editing a body keeps it
 while renaming the function or changing its signature does not. A Linux or macOS executable link
 places the listed functions first, in the listed order, so code that runs together, such as a
