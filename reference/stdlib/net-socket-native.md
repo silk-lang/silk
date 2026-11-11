@@ -530,16 +530,6 @@ EmptyPath
 
 The path is empty.
 
-<a id="InvalidBindReason.RelativePath"></a>
-
-### `RelativePath`
-
-```silk
-RelativePath
-```
-
-The path does not start with `/`.
-
 <a id="InvalidBindReason.NulPath"></a>
 
 ### `NulPath`
@@ -548,7 +538,7 @@ The path does not start with `/`.
 NulPath
 ```
 
-The path has a NUL byte.
+The path has a NUL byte after the first byte.
 
 <a id="InvalidBindReason.AbstractPath"></a>
 
@@ -558,7 +548,8 @@ The path has a NUL byte.
 AbstractPath
 ```
 
-The path is an abstract socket address, which is not supported.
+The path starts with a NUL byte, which names an abstract socket address. Only Linux has
+abstract addresses, so other systems return this.
 
 <a id="InvalidBindReason.impl.Debug"></a>
 
@@ -704,16 +695,6 @@ EmptyPath
 
 The path is empty.
 
-<a id="InvalidEndpointReason.RelativePath"></a>
-
-### `RelativePath`
-
-```silk
-RelativePath
-```
-
-The path does not start with `/`.
-
 <a id="InvalidEndpointReason.NulPath"></a>
 
 ### `NulPath`
@@ -722,7 +703,7 @@ The path does not start with `/`.
 NulPath
 ```
 
-The path has a NUL byte.
+The path has a NUL byte after the first byte.
 
 <a id="InvalidEndpointReason.PathTooLong"></a>
 
@@ -742,7 +723,8 @@ The path is too long for a socket address.
 AbstractPath
 ```
 
-The path is an abstract socket address, which is not supported.
+The path starts with a NUL byte, which names an abstract socket address. Only Linux has
+abstract addresses, so other systems return this.
 
 <a id="InvalidEndpointReason.impl.Debug"></a>
 
@@ -2095,6 +2077,10 @@ pub effect fn listenUnix(path: &[u8], options: ListenOptions) -> Listener ! Nati
 
 Makes a Unix socket listener at `path`.
 
+`path` is a file path, relative to the current directory unless it starts with `/`. On Linux, a
+`path` that starts with a NUL byte is an abstract name: the bytes after the NUL name the socket
+and no file is made. Other systems reject an abstract name with `AbstractPath`.
+
 It does not remove an old file at `path` before, or the file after close.
 
 ### Errors
@@ -2210,6 +2196,10 @@ pub effect fn connectUnixOwned(
 
 Connects to the Unix socket at `path`, and returns the connection.
 
+`path` is a file path, relative to the current directory unless it starts with `/`. On Linux, a
+`path` that starts with a NUL byte is an abstract name: the bytes after the NUL name the socket
+and no file is used. Other systems reject an abstract name with `AbstractPath`.
+
 ### Errors
 `InvalidEndpoint` if `path` is not valid. `Timeout` if `deadline` passes.
 Windows returns `FamilyUnsupported` for Unix-domain sockets before creating a socket.
@@ -2260,6 +2250,10 @@ where CallbackRequirements in Without<CallbackRequirements, ByteDuplex>
 
 Connects to the Unix socket at `path`, lends the connection to `callback`, and closes it after,
 also on error or cancellation. A trap does not close it.
+
+`path` is a file path, relative to the current directory unless it starts with `/`. On Linux, a
+`path` that starts with a NUL byte is an abstract name: the bytes after the NUL name the socket
+and no file is used. Other systems reject an abstract name with `AbstractPath`.
 
 ### Errors
 - The error of `callback`.
@@ -2391,6 +2385,10 @@ pub effect fn startConnectUnix(path: &[u8], options: ConnectOptions) -> Connecti
 ```
 
 Makes a Unix socket for `path`, and starts its connect without waiting.
+
+`path` is a file path, relative to the current directory unless it starts with `/`. On Linux, a
+`path` that starts with a NUL byte is an abstract name: the bytes after the NUL name the socket
+and no file is used. Other systems reject an abstract name with `AbstractPath`.
 
 ### When to use
 Use it when your own loop waits for sockets, such as with `silk.io.reactor`. Use

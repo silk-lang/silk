@@ -764,8 +764,10 @@ int silk_listener_connect_unix(const unsigned char *path, size_t length) {
   if (!silk_listener_copy_path(address.sun_path, sizeof(address.sun_path), path, length)) return 4;
   silk_listener_client = socket(AF_UNIX, SOCK_STREAM, 0);
   if (silk_listener_client < 0) return 5;
+  // A path is passed with its NUL terminator; an abstract name (a leading NUL) without one.
+  size_t terminator = path[0] == 0 ? 0 : 1;
   if (connect(silk_listener_client, (const struct sockaddr *)&address,
-      (socklen_t)(offsetof(struct sockaddr_un, sun_path) + length + 1)) != 0) return 6;
+      (socklen_t)(offsetof(struct sockaddr_un, sun_path) + length + terminator)) != 0) return 6;
   if (write(silk_listener_client, "x", 1) != 1) return 7;
   return 42;
 }
