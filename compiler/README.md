@@ -174,6 +174,43 @@ selfhost compilation failures: it checks compiler-placed drops before MIR compac
 of source borrow checking. Lifetime facts follow only feasible edges for literal or known Boolean
 conditions; unknown conditions retain both paths.
 
+## Wasm corpus and benchmark
+
+[`scripts/WasmCorpus.ts`](scripts/WasmCorpus.ts) builds `corpus/native` programs for
+`wasm32-wasip1` and runs them under `node:wasi`. It is a developer tool for work on the direct
+wasm backend: no CI workflow runs it. It uses the checkout's `stdlib` unless `--stdlib` names
+another, builds at most `--jobs` programs at once (default 2), and writes its results as JSON with
+`--json <file>`.
+
+The `corpus` mode builds every program, or only the `--only a,b` programs, with one
+`--backend` (`direct` or `llvm`, default `direct`) and `--optimization` (`none`, `speed` or `size`,
+default `speed`). It checks each run's exit status, trap, stdout and stderr against the program's
+expected outcome, and prints one line per program: `PASS`, `FAIL` (wrong outcome), `BUILD` (the
+build failed) or `SKIP` (C units, components or dynamic libraries, which cannot run this way).
+Many programs fail on wasm for reasons the backend does not cause, such as file system access, so
+compare with an earlier run instead: with `--baseline <earlier corpus json>` it lists every program
+that passed then and does not now, and exits 1 if there is one.
+
+```sh
+node compiler/scripts/WasmCorpus.ts corpus --compiler <silkc> --json before.json
+node compiler/scripts/WasmCorpus.ts corpus --compiler <new silkc> --baseline before.json
+```
+
+The `bench` mode builds each program in
+[`scripts/wasm-benchmark-track.json`](scripts/wasm-benchmark-track.json) with LLVM and with the
+direct backend, at `speed` and at `size`, then checks that all four builds produce the program's
+expected outcome and agree with each other. It times each build's best of `--runs` runs (default
+5); a run starts a fresh Node process and times only the module's `_start`, after V8 has compiled
+every function with its optimizing tier. It prints the times, the direct/LLVM ratio and its
+geometric mean over programs that take more than 2 ms under LLVM, then module sizes and function
+counts. With `--baseline <earlier bench json>` it also prints each program's change, to show what
+an optimization bought. Times depend on the machine, so keep benchmark JSON outside the repository.
+
+```sh
+node compiler/scripts/WasmCorpus.ts bench --compiler <silkc> --json base.json
+node compiler/scripts/WasmCorpus.ts bench --compiler <new silkc> --baseline base.json
+```
+
 ## Toolchains
 
 The compiler, `silkc` in a release, knows nothing about Silk versions: it runs itself. The
