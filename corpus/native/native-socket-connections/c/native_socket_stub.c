@@ -305,11 +305,18 @@ int connect(silk_socket fd, const struct sockaddr *address, socklen_t length) {
   }
   if (address != NULL && address->sa_family == AF_UNIX) {
     const struct sockaddr_un *local = (const struct sockaddr_un *)address;
-    static const char expected[] = "/tmp/silk-jul-146.sock";
-    if (length != offsetof(struct sockaddr_un, sun_path) + sizeof(expected)
-      || memcmp(local->sun_path, expected, sizeof(expected)) != 0) {
-      silk_configuration_ok = 0;
-    }
+    // A path is passed with its NUL terminator; an abstract name (Linux) without one.
+    static const char absolute[] = "/tmp/silk-jul-146.sock";
+    static const char relative[] = "relative.sock";
+    static const char abstract[] = "\0silk";
+    size_t base = offsetof(struct sockaddr_un, sun_path);
+    int matches = (length == base + sizeof(absolute) && memcmp(local->sun_path, absolute, sizeof(absolute)) == 0)
+      || (length == base + sizeof(relative) && memcmp(local->sun_path, relative, sizeof(relative)) == 0);
+#if defined(__linux__)
+    matches = matches
+      || (length == base + sizeof(abstract) - 1 && memcmp(local->sun_path, abstract, sizeof(abstract) - 1) == 0);
+#endif
+    if (!matches) silk_configuration_ok = 0;
   }
   if (silk_mode == 1 && silk_connects == 1) { errno = ECONNREFUSED; return -1; }
   if (silk_mode == 2 || silk_mode == 4 || silk_mode == 6) { errno = EINPROGRESS; return -1; }
