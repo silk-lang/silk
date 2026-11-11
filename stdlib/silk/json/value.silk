@@ -2693,10 +2693,13 @@ static if Target.arch() == Arch.X86_64 {
   // Reads the number at `at` when it has one of the common shapes: whole digits and an optional
   // fraction, of at most 16 digits each and 19 in all, and no exponent. Returns its length and
   // sets `kind` and `payload` to its slot, or returns `usize.MAX` for any other number, which
-  // `treeNumber` then reads. Reads at most 53 bytes.
+  // `treeNumber` then reads. For a number with a fraction, `payload` is all its digits as one
+  // integer and `scale` is the count of fraction digits, plus `FLOAT_NEGATIVE` after a minus sign:
+  // `wideFloats` turns the two into the `f64` later. `scale` is 0 for every other number. Reads
+  // at most 53 bytes.
   @features("avx2", "bmi", "bmi2", "lzcnt", "popcnt", "pclmul")
   @inlineAlways
-  unsafe fn wideNumber(base: [*]const u8, at: usize, kind: &mut u64, payload: &mut u64) -> usize {
+  unsafe fn wideNumber(base: [*]const u8, at: usize, kind: &mut u64, payload: &mut u64, scale: &mut u64) -> usize {
     let sign = unsafe rawByte(base, at) == 45
     let mut negative: u64 = 0
     if sign { negative = 1 }
@@ -2730,7 +2733,8 @@ static if Target.arch() == Arch.X86_64 {
       }
       let digits = u64.wrappingAdd(u64.wrappingMultiply(significand, WIDE_POWERS[fraction]), unsafe wideDigits16(base, fractionStart, fraction))
       kind.* = SLOT_FLOAT
-      payload.* = u64.bitOr(f64.toBits(Format.f64FromDecimal(digits, -usize.toI64(fraction))), u64.shiftLeft(negative, 63))
+      payload.* = digits
+      scale.* = u64.bitOr(usize.toU64(fraction), u64.shiftLeft(negative, 7))
       return usize.wrappingAdd(usize.wrappingAdd(signed, whole), usize.wrappingAdd(fraction, 1))
     }
     if u8.bitOr(after, 32) == 101 { return usize.MAX }
@@ -2744,6 +2748,36 @@ static if Target.arch() == Arch.X86_64 {
       }
     }
     return usize.wrappingAdd(signed, whole)
+  }
+
+  // The bit of a queued float that says the number had a minus sign.
+  const FLOAT_NEGATIVE: u64 = 128
+
+  // The floats that wait in the queue of `wideParse` before `wideFloats` converts them. Converting
+  // them in a loop of their own keeps the steps of one number from waiting on another.
+  const FLOAT_QUEUE: usize = 64
+
+  // Converts the floats in `queue` and empties it. The first word of `queue` is the count of
+  // entries after it. An entry is the index of a slot whose payload holds the digits of the
+  // number and whose count holds the `scale` that `wideNumber` gave: the slot becomes a float
+  // slot with the bits of the `f64`. The count of entries lives in the queue, not in a variable
+  // of `wideParse`, so that the loop there has no more state to keep in registers.
+  @features("avx2", "bmi", "bmi2", "lzcnt", "popcnt", "pclmul")
+  @inlineNever
+  unsafe fn wideFloats(slots: [*]mut DocumentSlot, queue: [*]mut u64) -> () {
+    let count = u64.toUsize(unsafe frameRead(queue, usize.ZERO))
+    unsafe frameWrite(queue, usize.ZERO, 0)
+    let mut index = usize.ONE
+    while index <= count {
+      let place = u64.toUsize(unsafe frameRead(queue, index))
+      let slot = unsafe rawSlotRead(slots, place)
+      let scale = u64.shiftRight(slot.info, 8)
+      let fraction = u64.wrappingToI64(u64.bitAnd(scale, 127))
+      let bits = u64.bitOr(f64.toBits(Format.f64FromDecimal(slot.payload, -fraction)), u64.shiftLeft(u64.bitAnd(scale, FLOAT_NEGATIVE), 56))
+      unsafe rawSlot(slots, place, SLOT_FLOAT, 0, bits)
+      index = usize.wrappingAdd(index, 1)
+    }
+    return ()
   }
 
   // A hash of the `size` bytes at `text`, from the length and the first and last 8 bytes. There
@@ -2864,6 +2898,8 @@ static if Target.arch() == Arch.X86_64 {
     let mut objects: u64 = 0
     // The values so far in the innermost open array or object.
     let mut count: u64 = 0
+    let mut waiting: [u64; FLOAT_QUEUE + 1] = [0; FLOAT_QUEUE + 1]
+    let queue = unsafe Intrinsic.pointerRequalify<?[*]mut u64, [*]mut u64>(Intrinsic.pointerFromMutSlice<u64>(Slice.viewMut<u64>(&mut waiting, usize.ZERO, FLOAT_QUEUE + 1)))
     let mut at = unsafe rawIndex(token)
     token = unsafe tokenAfter(token)
     while true {
@@ -2927,55 +2963,70 @@ static if Target.arch() == Arch.X86_64 {
           count = 0
           continue
         }
+      } else if byte == 45 || u8.wrappingSubtract(byte, 48) <= 9 {
+        // A number near the end of the text has no room for the wide reads.
+        let mut wide = at < safe
+        if wide {
+          let mut kind: u64 = 0
+          let mut payload: u64 = 0
+          let mut scale: u64 = 0
+          let length = unsafe wideNumber(base, at, &mut kind, &mut payload, &mut scale)
+          if length == usize.MAX {
+            wide = false
+          } else {
+            if !(unsafe wideEnds(token, at, length, unsafe rawByte(base, usize.wrappingAdd(at, length)))) { return false }
+            // The slot is written before the queue can fill and read it.
+            let following = unsafe pushRaw(slot, kind, scale, payload)
+            if scale != 0 {
+              let queued = usize.wrappingAdd(u64.toUsize(unsafe frameRead(queue, usize.ZERO)), 1)
+              unsafe frameWrite(queue, usize.ZERO, usize.toU64(queued))
+              unsafe frameWrite(queue, queued, usize.toU64(slotIndex(slots, slot)))
+              if queued == FLOAT_QUEUE { unsafe wideFloats(slots, queue) }
+            }
+            slot = following
+          }
+        }
+        if !wide {
+          let slow = run unsafe wideSlowNumber(bytes, at, to)
+          if slow.length == usize.MAX { return false }
+          let mut after: u8 = 0
+          if at + slow.length < bytes.length { after = bytes[at + slow.length] }
+          if !(unsafe wideEnds(token, at, slow.length, after)) { return false }
+          slot = unsafe pushRaw(slot, slow.kind, slow.count, slow.payload)
+          if slow.kind == SLOT_DECIMAL {
+            unsafe rawSlot(slots, usize.wrappingSubtract(slotIndex(slots, slot), 1), SLOT_DECIMAL, slow.count,
+              usize.toU64(usize.wrappingSubtract(Intrinsic.pointerAddress<[*]mut u8>(to), outAddress)))
+            to = unsafe rawAfter(to, u64.toUsize(slow.count))
+          }
+        }
       } else {
-        // A number or a literal, which is read from the padded copy near the end of the text.
+        // A literal, which is read from the padded copy near the end of the text.
         let mut from = base
         let mut local = at
         if at >= safe {
           from = tail
           local = usize.wrappingSubtract(at, safe)
         }
-        if byte == 45 || u8.wrappingSubtract(byte, 48) <= 9 {
-          let mut kind: u64 = 0
-          let mut payload: u64 = 0
-          let length = unsafe wideNumber(from, local, &mut kind, &mut payload)
-          if length != usize.MAX {
-            if !(unsafe wideEnds(token, at, length, unsafe rawByte(from, usize.wrappingAdd(local, length)))) { return false }
-            slot = unsafe pushRaw(slot, kind, 0, payload)
-          } else {
-            let slow = run unsafe wideSlowNumber(bytes, at, to)
-            if slow.length == usize.MAX { return false }
-            let mut after: u8 = 0
-            if at + slow.length < bytes.length { after = bytes[at + slow.length] }
-            if !(unsafe wideEnds(token, at, slow.length, after)) { return false }
-            slot = unsafe pushRaw(slot, slow.kind, slow.count, slow.payload)
-            if slow.kind == SLOT_DECIMAL {
-              unsafe rawSlot(slots, usize.wrappingSubtract(slotIndex(slots, slot), 1), SLOT_DECIMAL, slow.count,
-                usize.toU64(usize.wrappingSubtract(Intrinsic.pointerAddress<[*]mut u8>(to), outAddress)))
-              to = unsafe rawAfter(to, u64.toUsize(slow.count))
-            }
-          }
-        } else {
-          let word = unsafe rawWord(from, local)
-          let mut kind = SLOT_NULL
-          let mut length: usize = 4
-          if u64.bitAnd(word, 0xFFFFFFFF) == 0x65757274 {
-            kind = SLOT_TRUE
-          } else if u64.bitAnd(word, 0xFFFFFFFFFF) == 0x65736C6166 {
-            kind = SLOT_FALSE
-            length = 5
-          } else if u64.bitAnd(word, 0xFFFFFFFF) != 0x6C6C756E {
-            return false
-          }
-          if !(unsafe wideEnds(token, at, length, unsafe rawByte(from, usize.wrappingAdd(local, length)))) { return false }
-          slot = unsafe pushRaw(slot, kind, 0, 0)
+        let word = unsafe rawWord(from, local)
+        let mut kind = SLOT_NULL
+        let mut length: usize = 4
+        if u64.bitAnd(word, 0xFFFFFFFF) == 0x65757274 {
+          kind = SLOT_TRUE
+        } else if u64.bitAnd(word, 0xFFFFFFFFFF) == 0x65736C6166 {
+          kind = SLOT_FALSE
+          length = 5
+        } else if u64.bitAnd(word, 0xFFFFFFFF) != 0x6C6C756E {
+          return false
         }
+        if !(unsafe wideEnds(token, at, length, unsafe rawByte(from, usize.wrappingAdd(local, length)))) { return false }
+        slot = unsafe pushRaw(slot, kind, 0, 0)
       }
       // After a value: a comma and the next value, or the ends of the arrays and objects that the
       // value is last in.
       while true {
         count = u64.wrappingAdd(count, 1)
         if level == usize.ZERO {
+          unsafe wideFloats(slots, queue)
           unsafe List<DocumentSlot>.setLength(&mut document.slots, slotIndex(slots, slot))
           unsafe Bytes.setLength(&mut document.text, usize.wrappingSubtract(Intrinsic.pointerAddress<[*]mut u8>(to), outAddress))
           // Nothing but blanks may follow the value.
