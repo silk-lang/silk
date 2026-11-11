@@ -1,0 +1,883 @@
+//! The shape of MIR, written once: every place and operand a statement, rvalue or terminator
+//! names, with how it uses each, and every block a terminator can continue to.
+//!
+//! # When to use
+//!
+//! Use this module for any pass that reads or rewrites the places of a MIR body: counting the
+//! names of a local, gathering liveness, renaming a local, substituting an operand, or retargeting
+//! blocks. A pass that walks the slots here keeps working when a variant gains an operand.
+//!
+//! # Details
+//!
+//! A statement, rvalue or terminator has numbered slots, from 0 below [`statementSlots`],
+//! [`rvalueSlots`] or [`terminatorSlots`]. A slot is an operand, or a place used directly with an
+//! [`Access`]. Slots come in evaluation order:
+//!
+//! - An assignment's rvalue slots, then its destination.
+//! - A drop's destination, then its diagnostic operands (observer, cause, site).
+//! - A failure context's destination, then its source.
+//! - A call's indirect callee address, its arguments, providers and diagnostic operands, then its
+//!   destination and its failure destination.
+//!
+//! A terminator's successors are numbered the same way, from 0 below [`successorCount`]: a
+//! branch's then and else blocks, a call's normal and failure blocks, a switch's cases in order and
+//! then its otherwise block.
+//!
+//! # Gotchas
+//!
+//! A place's runtime index projections name locals too; [`placeNames`] counts them, and a rename
+//! must rewrite them. A `Return` reads the result local and a `Fail` the failure local without
+//! naming them in a slot. A suspension point's cancel exit is a successor of its block that only
+//! [`appendSuccessors`] lists, since it lives in `MirFunction.cancels`, not in the terminator.
+
+import CompilerBug
+import backend.CAbi
+import backend.InstanceKey {InstanceKey}
+import backend.Mir {
+  copyPlace,
+  AggregateField,
+  AssemblyFragment,
+  Block,
+  Callee,
+  Cancel,
+  Diagnostics,
+  FailureEdge,
+  MirFunction,
+  Operand,
+  Place,
+  Projection,
+  Rvalue,
+  Statement,
+  SwitchCase,
+  Terminator,
+}
+import semantic.DeclarationId {DeclarationId}
+import semantic.StaticValue {Value as StaticData}
+import semantic.Type {Type}
+import semantic.TypedBody {Origin}
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.core.option {Option}
+import silk.mem.interned {Interned}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.mem.box {Box}
+import silk.num.usize
+
+/// How a slot uses the place it names directly.
+pub enum Access {
+  /// Read and left in place: a `copy` operand, or a place whose length, data address or tag is read.
+  Copy,
+  /// Read and moved out: a `move` operand.
+  Move,
+  /// Written whole: a destination without projections, whose earlier value is dead.
+  Write,
+  /// Written in part: a destination with projections; the rest of its local keeps its value.
+  PartialWrite,
+  /// Borrowed or its address taken (`Ref`, `AddressOf`, `ContextOf`): the storage may be reached
+  /// later through the result.
+  Borrow,
+  /// Dropped through its drop glue.
+  Drop,
+  /// Its failure slot's context companion is written or read (`Statement.FailureContext`).
+  Context,
+}
+
+/// One slot of a statement, rvalue or terminator: an operand, or a place with how it is used.
+pub union Slot<'a> {
+  Operand {pub operand: &'a Operand},
+  Place {pub place: &'a Place, pub access: Access},
+}
+
+/// One slot of a statement, rvalue or terminator, open for rewriting.
+pub union SlotMut<'a> {
+  Operand {pub operand: &'a mut Operand},
+  Place {pub place: &'a mut Place, pub access: Access},
+}
+
+/// The access of a destination place: `Write` without projections, `PartialWrite` with them.
+pub fn written(place: &Place) -> Access {
+  if List<Projection>.length(&place.projections) == usize.ZERO { return Access.Write }
+  return Access.PartialWrite
+}
+
+/// The place a slot names, directly or through a `copy` or `move` operand; none for a constant.
+pub fn slotPlace<'a>(slot: Slot<'a>) -> Option<&'a Place> {
+  return match move slot {
+    Slot.Operand {operand} => match &operand.* {
+      Operand.Copy {place} => Option<&Place>.some(&place)
+      Operand.Move {place} => Option<&Place>.some(&place)
+      _ => Option<&Place>.none()
+    }
+    Slot.Place {place, ..} => Option<&Place>.some(move place)
+  }
+}
+
+/// The place a slot names, open for rewriting; none for a constant operand.
+pub fn slotPlaceMut<'a>(slot: SlotMut<'a>) -> Option<&'a mut Place> {
+  return match move slot {
+    SlotMut.Operand {operand} => match &mut operand.* {
+      Operand.Copy {place} => Option<&mut Place>.some(&mut place)
+      Operand.Move {place} => Option<&mut Place>.some(&mut place)
+      _ => Option<&mut Place>.none()
+    }
+    SlotMut.Place {place, ..} => Option<&mut Place>.some(move place)
+  }
+}
+
+/// How a slot uses the place it names: an operand's `Copy` or `Move`, or a direct place's access.
+/// A constant operand reports `Copy` and names no place.
+pub fn slotAccess<'a>(slot: &Slot<'a>) -> Access {
+  return match &slot.* {
+    Slot.Operand {operand} => match &operand.* {
+      Operand.Move {..} => Access.Move
+      _ => Access.Copy
+    }
+    Slot.Place {access, ..} => access
+  }
+}
+
+/// How many times `place` names `local`: as its own local and as each runtime index.
+pub fn placeNames(place: &Place, local: usize) -> usize {
+  let mut count = usize.ZERO
+  if place.local == local { count = usize.ONE }
+  let steps = List<Projection>.asSlice(&place.projections)
+  let mut at = usize.ZERO
+  while at < steps.length {
+    if let Projection.Index {local: index} = &steps[at] {
+      if index == local { count = count + usize.ONE }
+    }
+    at = at + usize.ONE
+  }
+  return count
+}
+
+/// How many times a slot names `local`; zero for a constant operand.
+pub fn slotNames<'a>(slot: Slot<'a>, local: usize) -> usize {
+  return match slotPlace(move slot) {
+    Option<&Place>.Some {value} => placeNames(value, local)
+    Option<&Place>.None => usize.ZERO
+  }
+}
+
+fn listSlots(operands: &List<Operand>) -> usize {
+  return List<Operand>.length(operands)
+}
+
+fn fieldSlot<'a>(fields: &'a List<AggregateField>, at: usize) -> Slot<'a> {
+  return Slot.Operand {operand: &List<AggregateField>.asSlice(fields)[at].value}
+}
+
+fn fieldSlotMut<'a>(fields: &'a mut List<AggregateField>, at: usize) -> SlotMut<'a> {
+  return SlotMut.Operand {operand: &mut List<AggregateField>.asMutSlice(&mut fields.*)[at].value}
+}
+
+fn listSlot<'a>(operands: &'a List<Operand>, at: usize) -> Slot<'a> {
+  return Slot.Operand {operand: &List<Operand>.asSlice(operands)[at]}
+}
+
+fn listSlotMut<'a>(operands: &'a mut List<Operand>, at: usize) -> SlotMut<'a> {
+  return SlotMut.Operand {operand: &mut List<Operand>.asMutSlice(&mut operands.*)[at]}
+}
+
+fn pairSlot<'a>(first: &'a Operand, second: &'a Operand, at: usize) -> Slot<'a> {
+  if at == usize.ZERO { return Slot.Operand {operand: first} }
+  return Slot.Operand {operand: second}
+}
+
+fn pairSlotMut<'a>(first: &'a mut Operand, second: &'a mut Operand, at: usize) -> SlotMut<'a> {
+  if at == usize.ZERO { return SlotMut.Operand {operand: move first} }
+  return SlotMut.Operand {operand: move second}
+}
+
+/// How many slots `value` has. Every variant is listed, so a new one must say what it names.
+pub fn rvalueSlots(value: &Rvalue) -> usize {
+  return match &value.* {
+    Rvalue.Aggregate {fields} => List<AggregateField>.length(&fields)
+    Rvalue.Slice {..} => 2
+    Rvalue.SliceLength {..} => usize.ONE
+    Rvalue.SliceData {..} => usize.ONE
+    Rvalue.PointerOffset {..} => 2
+    Rvalue.Use {..} => usize.ONE
+    Rvalue.Ref {..} => usize.ONE
+    Rvalue.AddressOf {..} => usize.ONE
+    Rvalue.Unary {..} => usize.ONE
+    Rvalue.Binary {..} => 2
+    Rvalue.ScalarBinary {..} => 2
+    Rvalue.ScalarUnary {..} => usize.ONE
+    Rvalue.Convert {..} => usize.ONE
+    Rvalue.Fits {..} => usize.ONE
+    Rvalue.AddressIntegerConversion {..} => usize.ONE
+    Rvalue.Bitcast {..} => usize.ONE
+    Rvalue.Discriminant {..} => usize.ONE
+    Rvalue.Inject {..} => usize.ONE
+    Rvalue.Variant {fields, ..} => List<AggregateField>.length(&fields)
+    Rvalue.FunctionAddress {..} => usize.ZERO
+    Rvalue.ContextOf {..} => usize.ONE
+    Rvalue.ContextHandle {..} => usize.ONE
+    Rvalue.ForeignStatic {..} => usize.ZERO
+    Rvalue.RunningPackage => usize.ZERO
+    Rvalue.FrameAddress => usize.ZERO
+    Rvalue.ProcessWord => usize.ZERO
+    Rvalue.StackAllocate {..} => usize.ONE
+    Rvalue.Wasm {operands, ..} => listSlots(&operands)
+    Rvalue.Fill {..} => usize.ZERO
+    Rvalue.Assembly {fragment} => listSlots(&Box<AssemblyFragment>.get(&fragment)[0].inputs)
+    Rvalue.Atomic {operands, ..} => listSlots(&operands)
+    Rvalue.Vector {operands, ..} => listSlots(&operands)
+  }
+}
+
+/// Slot `at` of `value`, below [`rvalueSlots`].
+pub fn rvalueSlot<'a>(value: &'a Rvalue, at: usize) -> Slot<'a> {
+  return match &value.* {
+    Rvalue.Aggregate {fields} => fieldSlot(&fields, at)
+    Rvalue.Slice {data, count} => pairSlot(&data, &count, at)
+    Rvalue.SliceLength {place} => Slot.Place {place: &place, access: Access.Copy}
+    Rvalue.SliceData {place} => Slot.Place {place: &place, access: Access.Copy}
+    Rvalue.PointerOffset {pointer, index, ..} => pairSlot(&pointer, &index, at)
+    Rvalue.Use {value: used} => Slot.Operand {operand: &used}
+    Rvalue.Ref {place, ..} => Slot.Place {place: &place, access: Access.Borrow}
+    Rvalue.AddressOf {place, ..} => Slot.Place {place: &place, access: Access.Borrow}
+    Rvalue.Unary {value: used, ..} => Slot.Operand {operand: &used}
+    Rvalue.Binary {left, right, ..} => pairSlot(&left, &right, at)
+    Rvalue.ScalarBinary {left, right, ..} => pairSlot(&left, &right, at)
+    Rvalue.ScalarUnary {value: used, ..} => Slot.Operand {operand: &used}
+    Rvalue.Convert {value: used, ..} => Slot.Operand {operand: &used}
+    Rvalue.Fits {value: used, ..} => Slot.Operand {operand: &used}
+    Rvalue.AddressIntegerConversion {operand, ..} => Slot.Operand {operand: &operand}
+    Rvalue.Bitcast {value: used, ..} => Slot.Operand {operand: &used}
+    Rvalue.Discriminant {place} => Slot.Place {place: &place, access: Access.Copy}
+    Rvalue.Inject {value: used, ..} => Slot.Operand {operand: &used}
+    Rvalue.Variant {fields, ..} => fieldSlot(&fields, at)
+    Rvalue.ContextOf {place} => Slot.Place {place: &place, access: Access.Borrow}
+    Rvalue.ContextHandle {address} => Slot.Operand {operand: &address}
+    Rvalue.StackAllocate {count, ..} => Slot.Operand {operand: &count}
+    Rvalue.Wasm {operands, ..} => listSlot(&operands, at)
+    Rvalue.Assembly {fragment} => listSlot(&Box<AssemblyFragment>.get(&fragment)[0].inputs, at)
+    Rvalue.Atomic {operands, ..} => listSlot(&operands, at)
+    Rvalue.Vector {operands, ..} => listSlot(&operands, at)
+    _ => CompilerBug.panic(b"a MIR rvalue slot past its last")
+  }
+}
+
+/// Slot `at` of `value`, below [`rvalueSlots`], open for rewriting.
+pub fn rvalueSlotMut<'a>(value: &'a mut Rvalue, at: usize) -> SlotMut<'a> {
+  return match &mut value.* {
+    Rvalue.Aggregate {fields} => fieldSlotMut(&mut fields, at)
+    Rvalue.Slice {data, count} => pairSlotMut(&mut data, &mut count, at)
+    Rvalue.SliceLength {place} => SlotMut.Place {place: &mut place, access: Access.Copy}
+    Rvalue.SliceData {place} => SlotMut.Place {place: &mut place, access: Access.Copy}
+    Rvalue.PointerOffset {pointer, index, ..} => pairSlotMut(&mut pointer, &mut index, at)
+    Rvalue.Use {value: used} => SlotMut.Operand {operand: &mut used}
+    Rvalue.Ref {place, ..} => SlotMut.Place {place: &mut place, access: Access.Borrow}
+    Rvalue.AddressOf {place, ..} => SlotMut.Place {place: &mut place, access: Access.Borrow}
+    Rvalue.Unary {value: used, ..} => SlotMut.Operand {operand: &mut used}
+    Rvalue.Binary {left, right, ..} => pairSlotMut(&mut left, &mut right, at)
+    Rvalue.ScalarBinary {left, right, ..} => pairSlotMut(&mut left, &mut right, at)
+    Rvalue.ScalarUnary {value: used, ..} => SlotMut.Operand {operand: &mut used}
+    Rvalue.Convert {value: used, ..} => SlotMut.Operand {operand: &mut used}
+    Rvalue.Fits {value: used, ..} => SlotMut.Operand {operand: &mut used}
+    Rvalue.AddressIntegerConversion {operand, ..} => SlotMut.Operand {operand: &mut operand}
+    Rvalue.Bitcast {value: used, ..} => SlotMut.Operand {operand: &mut used}
+    Rvalue.Discriminant {place} => SlotMut.Place {place: &mut place, access: Access.Copy}
+    Rvalue.Inject {value: used, ..} => SlotMut.Operand {operand: &mut used}
+    Rvalue.Variant {fields, ..} => fieldSlotMut(&mut fields, at)
+    Rvalue.ContextOf {place} => SlotMut.Place {place: &mut place, access: Access.Borrow}
+    Rvalue.ContextHandle {address} => SlotMut.Operand {operand: &mut address}
+    Rvalue.StackAllocate {count, ..} => SlotMut.Operand {operand: &mut count}
+    Rvalue.Wasm {operands, ..} => listSlotMut(&mut operands, at)
+    Rvalue.Assembly {fragment} => listSlotMut(&mut Box<AssemblyFragment>.getMut(&mut fragment)[0].inputs, at)
+    Rvalue.Atomic {operands, ..} => listSlotMut(&mut operands, at)
+    Rvalue.Vector {operands, ..} => listSlotMut(&mut operands, at)
+    _ => CompilerBug.panic(b"a MIR rvalue slot past its last")
+  }
+}
+
+fn diagnosticSlots(diagnostics: &Option<Diagnostics>) -> usize {
+  return match &diagnostics.* {
+    Option<Diagnostics>.Some {..} => 3
+    Option<Diagnostics>.None => usize.ZERO
+  }
+}
+
+fn diagnosticSlot<'a>(diagnostics: &'a Option<Diagnostics>, at: usize) -> Slot<'a> {
+  if let Option<Diagnostics>.Some {value} = &diagnostics.* {
+    if at == usize.ZERO { return Slot.Operand {operand: Diagnostics.observer(&value)} }
+    if at == usize.ONE { return Slot.Operand {operand: Diagnostics.cause(&value)} }
+    return Slot.Operand {operand: Diagnostics.site(&value)}
+  }
+  return CompilerBug.panic(b"a MIR diagnostics slot without diagnostics")
+}
+
+fn diagnosticSlotMut<'a>(diagnostics: &'a mut Option<Diagnostics>, at: usize) -> SlotMut<'a> {
+  if let Option<Diagnostics>.Some {value} = &mut diagnostics.* {
+    if at == usize.ZERO { return SlotMut.Operand {operand: Diagnostics.observerMut(&mut value)} }
+    if at == usize.ONE { return SlotMut.Operand {operand: Diagnostics.causeMut(&mut value)} }
+    return SlotMut.Operand {operand: Diagnostics.siteMut(&mut value)}
+  }
+  return CompilerBug.panic(b"a MIR diagnostics slot without diagnostics")
+}
+
+/// How many slots `statement` has.
+pub fn statementSlots(statement: &Statement) -> usize {
+  return match &statement.* {
+    Statement.Assign {value, ..} => rvalueSlots(&value) + usize.ONE
+    Statement.Drop {diagnostics, ..} => usize.ONE + diagnosticSlots(&diagnostics)
+    Statement.FailureContext {source, ..} => match &source {
+      Option<Place>.Some {..} => 2
+      Option<Place>.None => usize.ONE
+    }
+    Statement.SetContextHandle {..} => 2
+  }
+}
+
+/// Slot `at` of `statement`, below [`statementSlots`].
+pub fn statementSlot<'a>(statement: &'a Statement, at: usize) -> Slot<'a> {
+  return match &statement.* {
+    Statement.Assign {destination, value, ..} => {
+      if at < rvalueSlots(&value) { return rvalueSlot(&value, at) }
+      return Slot.Place {place: &destination, access: written(&destination)}
+    }
+    Statement.Drop {destination, diagnostics, ..} => {
+      if at == usize.ZERO { return Slot.Place {place: &destination, access: Access.Drop} }
+      return diagnosticSlot(&diagnostics, at - usize.ONE)
+    }
+    Statement.FailureContext {destination, source, ..} => {
+      if at == usize.ZERO { return Slot.Place {place: &destination, access: Access.Context} }
+      if let Option<Place>.Some {value: from} = &source { return Slot.Place {place: &from, access: Access.Context} }
+      return CompilerBug.panic(b"a MIR failure context slot past its last")
+    }
+    Statement.SetContextHandle {address, value, ..} => pairSlot(&address, &value, at)
+  }
+}
+
+/// Slot `at` of `statement`, below [`statementSlots`], open for rewriting.
+pub fn statementSlotMut<'a>(statement: &'a mut Statement, at: usize) -> SlotMut<'a> {
+  return match &mut statement.* {
+    Statement.Assign {destination, value, ..} => {
+      if at < rvalueSlots(&value) { return rvalueSlotMut(&mut value, at) }
+      let access = written(&destination)
+      return SlotMut.Place {place: &mut destination, access: access}
+    }
+    Statement.Drop {destination, diagnostics, ..} => {
+      if at == usize.ZERO { return SlotMut.Place {place: &mut destination, access: Access.Drop} }
+      return diagnosticSlotMut(&mut diagnostics, at - usize.ONE)
+    }
+    Statement.FailureContext {destination, source, ..} => {
+      if at == usize.ZERO { return SlotMut.Place {place: &mut destination, access: Access.Context} }
+      if let Option<Place>.Some {value: from} = &mut source { return SlotMut.Place {place: &mut from, access: Access.Context} }
+      return CompilerBug.panic(b"a MIR failure context slot past its last")
+    }
+    Statement.SetContextHandle {address, value, ..} => pairSlotMut(&mut address, &mut value, at)
+  }
+}
+
+fn calleeSlots(callee: &Callee) -> usize {
+  return match &callee.* {
+    Callee.Instance {..} => usize.ZERO
+    Callee.Extern {..} => usize.ZERO
+    Callee.Indirect {..} => usize.ONE
+    Callee.NativeIndirect {..} => usize.ONE
+  }
+}
+
+/// How many slots `terminator` has. Every variant is listed, so a new one must say what it names.
+pub fn terminatorSlots(terminator: &Terminator) -> usize {
+  return match &terminator.* {
+    Terminator.Goto {..} => usize.ZERO
+    Terminator.Branch {..} => usize.ONE
+    Terminator.Return {..} => usize.ZERO
+    Terminator.Call {callee, arguments, providers, diagnostics, failure, ..} => {
+      let mut count = calleeSlots(&callee) + List<Operand>.length(&arguments) + List<Operand>.length(&providers)
+        + diagnosticSlots(&diagnostics) + usize.ONE
+      if let Option<FailureEdge>.Some {..} = &failure { count = count + usize.ONE }
+      return count
+    }
+    Terminator.Fail {..} => usize.ZERO
+    Terminator.Trap {..} => usize.ZERO
+    Terminator.TrapText {..} => usize.ONE
+    Terminator.Unreachable {..} => usize.ZERO
+    Terminator.Switch {..} => usize.ONE
+    Terminator.Relinquish {..} => usize.ZERO
+    Terminator.Abandon {..} => usize.ZERO
+  }
+}
+
+/// Slot `at` of `terminator`, below [`terminatorSlots`].
+pub fn terminatorSlot<'a>(terminator: &'a Terminator, at: usize) -> Slot<'a> {
+  return match &terminator.* {
+    Terminator.Branch {condition, ..} => Slot.Operand {operand: &condition}
+    Terminator.Switch {value, ..} => Slot.Operand {operand: &value}
+    Terminator.TrapText {reason, ..} => Slot.Operand {operand: &reason}
+    Terminator.Call {callee, arguments, providers, diagnostics, destination, failure, ..} => {
+      let mut index = at
+      match &callee {
+        Callee.Indirect {address} => {
+          if index == usize.ZERO { return Slot.Operand {operand: &address} }
+          index = index - usize.ONE
+        }
+        Callee.NativeIndirect {address, ..} => {
+          if index == usize.ZERO { return Slot.Operand {operand: &address} }
+          index = index - usize.ONE
+        }
+        _ => ()
+      }
+      let passed = List<Operand>.length(&arguments)
+      if index < passed { return listSlot(&arguments, index) }
+      index = index - passed
+      let provided = List<Operand>.length(&providers)
+      if index < provided { return listSlot(&providers, index) }
+      index = index - provided
+      let hidden = diagnosticSlots(&diagnostics)
+      if index < hidden { return diagnosticSlot(&diagnostics, index) }
+      index = index - hidden
+      if index == usize.ZERO { return Slot.Place {place: &destination, access: written(&destination)} }
+      if let Option<FailureEdge>.Some {value: edge} = &failure {
+        return Slot.Place {place: &edge.destination, access: written(&edge.destination)}
+      }
+      return CompilerBug.panic(b"a MIR call slot past its last")
+    }
+    _ => CompilerBug.panic(b"a MIR terminator slot past its last")
+  }
+}
+
+/// Slot `at` of `terminator`, below [`terminatorSlots`], open for rewriting.
+pub fn terminatorSlotMut<'a>(terminator: &'a mut Terminator, at: usize) -> SlotMut<'a> {
+  return match &mut terminator.* {
+    Terminator.Branch {condition, ..} => SlotMut.Operand {operand: &mut condition}
+    Terminator.Switch {value, ..} => SlotMut.Operand {operand: &mut value}
+    Terminator.TrapText {reason, ..} => SlotMut.Operand {operand: &mut reason}
+    Terminator.Call {callee, arguments, providers, diagnostics, destination, failure, ..} => {
+      let mut index = at
+      match &mut callee {
+        Callee.Indirect {address} => {
+          if index == usize.ZERO { return SlotMut.Operand {operand: &mut address} }
+          index = index - usize.ONE
+        }
+        Callee.NativeIndirect {address, ..} => {
+          if index == usize.ZERO { return SlotMut.Operand {operand: &mut address} }
+          index = index - usize.ONE
+        }
+        _ => ()
+      }
+      let passed = List<Operand>.length(&arguments)
+      if index < passed { return listSlotMut(&mut arguments, index) }
+      index = index - passed
+      let provided = List<Operand>.length(&providers)
+      if index < provided { return listSlotMut(&mut providers, index) }
+      index = index - provided
+      let hidden = diagnosticSlots(&diagnostics)
+      if index < hidden { return diagnosticSlotMut(&mut diagnostics, index) }
+      index = index - hidden
+      if index == usize.ZERO {
+        let access = written(&destination)
+        return SlotMut.Place {place: &mut destination, access: access}
+      }
+      if let Option<FailureEdge>.Some {value: edge} = &mut failure {
+        let access = written(&edge.destination)
+        return SlotMut.Place {place: &mut edge.destination, access: access}
+      }
+      return CompilerBug.panic(b"a MIR call slot past its last")
+    }
+    _ => CompilerBug.panic(b"a MIR terminator slot past its last")
+  }
+}
+
+/// How many times `value` names `local` in its slots.
+pub fn rvalueNames(value: &Rvalue, local: usize) -> usize {
+  let count = rvalueSlots(value)
+  let mut names = usize.ZERO
+  let mut at = usize.ZERO
+  while at < count {
+    names = names + slotNames(rvalueSlot(value, at), local)
+    at = at + usize.ONE
+  }
+  return names
+}
+
+/// How many times `statement` names `local` in its slots.
+pub fn statementNames(statement: &Statement, local: usize) -> usize {
+  let count = statementSlots(statement)
+  let mut names = usize.ZERO
+  let mut at = usize.ZERO
+  while at < count {
+    names = names + slotNames(statementSlot(statement, at), local)
+    at = at + usize.ONE
+  }
+  return names
+}
+
+/// How many times `terminator` names `local` in its slots.
+pub fn terminatorNames(terminator: &Terminator, local: usize) -> usize {
+  let count = terminatorSlots(terminator)
+  let mut names = usize.ZERO
+  let mut at = usize.ZERO
+  while at < count {
+    names = names + slotNames(terminatorSlot(terminator, at), local)
+    at = at + usize.ONE
+  }
+  return names
+}
+
+/// How many blocks `terminator` can continue to, counted with repeats.
+pub fn successorCount(terminator: &Terminator) -> usize {
+  return match &terminator.* {
+    Terminator.Goto {..} => usize.ONE
+    Terminator.Branch {..} => 2
+    Terminator.Return {..} => usize.ZERO
+    Terminator.Call {failure, ..} => match &failure {
+      Option<FailureEdge>.Some {..} => 2
+      Option<FailureEdge>.None => usize.ONE
+    }
+    Terminator.Fail {..} => usize.ZERO
+    Terminator.Trap {..} => usize.ZERO
+    Terminator.TrapText {..} => usize.ZERO
+    Terminator.Unreachable {..} => usize.ZERO
+    Terminator.Switch {cases, ..} => List<SwitchCase>.length(&cases) + usize.ONE
+    Terminator.Relinquish {..} => usize.ONE
+    Terminator.Abandon {..} => usize.ZERO
+  }
+}
+
+/// Successor `at` of `terminator`, below [`successorCount`].
+pub fn successor(terminator: &Terminator, at: usize) -> usize {
+  return match &terminator.* {
+    Terminator.Goto {target, ..} => target
+    Terminator.Branch {thenBlock, elseBlock, ..} => if at == usize.ZERO { thenBlock } else { elseBlock }
+    Terminator.Call {normal, failure, ..} => {
+      if at == usize.ZERO { return normal }
+      if let Option<FailureEdge>.Some {value: edge} = &failure { return edge.target }
+      return CompilerBug.panic(b"a MIR successor past its last")
+    }
+    Terminator.Switch {cases, otherwise, ..} => {
+      let listed = List<SwitchCase>.asSlice(&cases)
+      if at < listed.length { return listed[at].target }
+      return otherwise
+    }
+    Terminator.Relinquish {resume, ..} => resume
+    _ => CompilerBug.panic(b"a MIR successor past its last")
+  }
+}
+
+/// Makes successor `at` of `terminator`, below [`successorCount`], continue to `target`.
+pub fn setSuccessor(terminator: &mut Terminator, at: usize, target: usize) -> () {
+  match &mut terminator.* {
+    Terminator.Goto {target: next, ..} => { next = target }
+    Terminator.Branch {thenBlock, elseBlock, ..} => {
+      if at == usize.ZERO { thenBlock = target } else { elseBlock = target }
+    }
+    Terminator.Call {normal, failure, ..} => {
+      if at == usize.ZERO {
+        normal = target
+      } else if let Option<FailureEdge>.Some {value: edge} = &mut failure {
+        edge.target = target
+      }
+    }
+    Terminator.Switch {cases, otherwise, ..} => {
+      let mut listed = List<SwitchCase>.asMutSlice(&mut cases)
+      if at < listed.length { listed[at].target = target } else { otherwise = target }
+    }
+    Terminator.Relinquish {resume, ..} => { resume = target }
+    _ => CompilerBug.panic(b"a MIR successor past its last")
+  }
+  return ()
+}
+
+/// Appends the successors of `terminator` to `into`, in successor order.
+pub effect fn appendTerminatorSuccessors(terminator: &Terminator, into: &mut List<usize>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let count = successorCount(terminator)
+  let mut at = usize.ZERO
+  while at < count {
+    run List<usize>.append(&mut into.*, successor(terminator, at))
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+/// The blocks `block` of `function` can continue to: its terminator's successors, then the cancel
+/// exit of a suspension point, since a cancelled frame restores the point's state and drops what
+/// is live there.
+pub effect fn successors(function: &MirFunction, block: usize) -> List<usize> ! OutOfMemoryError ? &mut Allocator {
+  let mut result = List<usize>.make()
+  run appendSuccessors(function, block, &mut result)
+  return move result
+}
+
+/// Appends the blocks `block` of `function` can continue to, as [`successors`] lists them, to
+/// `into`.
+pub effect fn appendSuccessors(function: &MirFunction, block: usize, into: &mut List<usize>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let blocks = List<Block>.asSlice(&function.blocks)
+  run appendTerminatorSuccessors(&blocks[block].terminator, &mut into.*)
+  let cancels = List<Cancel>.asSlice(&function.cancels)
+  let mut at = usize.ZERO
+  while at < cancels.length {
+    if cancels[at].point == block { run List<usize>.append(&mut into.*, cancels[at].entry) }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+/// A copy of `operand`.
+pub effect fn copyOperand(operand: &Operand) -> Operand ! OutOfMemoryError ? &mut Allocator {
+  return match &operand.* {
+    Operand.Copy {place} => Operand.Copy {place: run copyPlace(&place)}
+    Operand.Move {place} => Operand.Move {place: run copyPlace(&place)}
+    Operand.Integer {decimal, negative, ty} => Operand.Integer {decimal: run Bytes.copy(Bytes.asSlice(&decimal)), negative: negative,
+      ty: Interned<Type>.clone(&ty)}
+    Operand.Float {bits, ty} => Operand.Float {bits: bits, ty: Interned<Type>.clone(&ty)}
+    Operand.Boolean {value} => Operand.Boolean {value: value}
+    Operand.Unit => Operand.Unit
+    Operand.StaticBytes {bytes} => Operand.StaticBytes {bytes: run Bytes.copy(Bytes.asSlice(&bytes))}
+    Operand.StaticText {bytes} => Operand.StaticText {bytes: run Bytes.copy(Bytes.asSlice(&bytes))}
+    Operand.StaticValue {value, ty} => Operand.StaticValue {value: Interned<StaticData>.clone(&value), ty: Interned<Type>.clone(&ty)}
+    Operand.Null {ty} => Operand.Null {ty: Interned<Type>.clone(&ty)}
+  }
+}
+
+effect fn copyOperands(operands: &List<Operand>) -> List<Operand> ! OutOfMemoryError ? &mut Allocator {
+  let listed = List<Operand>.asSlice(operands)
+  let mut result = run List<Operand>.makeWithCapacity(listed.length)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    run List<Operand>.append(&mut result, run copyOperand(&listed[at]))
+    at = at + usize.ONE
+  }
+  return move result
+}
+
+effect fn copyFields(fields: &List<AggregateField>) -> List<AggregateField> ! OutOfMemoryError ? &mut Allocator {
+  let listed = List<AggregateField>.asSlice(fields)
+  let mut result = run List<AggregateField>.makeWithCapacity(listed.length)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    run List<AggregateField>.append(&mut result, AggregateField {index: listed[at].index, value: run copyOperand(&listed[at].value)})
+    at = at + usize.ONE
+  }
+  return move result
+}
+
+/// A copy of `value`.
+pub effect fn copyRvalue(value: &Rvalue) -> Rvalue ! OutOfMemoryError ? &mut Allocator {
+  return match &value.* {
+    Rvalue.Aggregate {fields} => Rvalue.Aggregate {fields: run copyFields(&fields)}
+    Rvalue.Slice {data, count} => Rvalue.Slice {data: run copyOperand(&data), count: run copyOperand(&count)}
+    Rvalue.SliceLength {place} => Rvalue.SliceLength {place: run copyPlace(&place)}
+    Rvalue.SliceData {place} => Rvalue.SliceData {place: run copyPlace(&place)}
+    Rvalue.PointerOffset {pointer, index, element} => Rvalue.PointerOffset {pointer: run copyOperand(&pointer),
+      index: run copyOperand(&index), element: Interned<Type>.clone(&element)}
+    Rvalue.Use {value: used} => Rvalue.Use {value: run copyOperand(&used)}
+    Rvalue.Ref {access, place} => Rvalue.Ref {access: access, place: run copyPlace(&place)}
+    Rvalue.AddressOf {access, place} => Rvalue.AddressOf {access: access, place: run copyPlace(&place)}
+    Rvalue.Unary {operation, value: used} => Rvalue.Unary {operation: operation, value: run copyOperand(&used)}
+    Rvalue.Binary {operation, left, right} => Rvalue.Binary {operation: operation, left: run copyOperand(&left),
+      right: run copyOperand(&right)}
+    Rvalue.ScalarBinary {operation, left, right} => Rvalue.ScalarBinary {operation: operation, left: run copyOperand(&left),
+      right: run copyOperand(&right)}
+    Rvalue.ScalarUnary {operation, value: used} => Rvalue.ScalarUnary {operation: operation, value: run copyOperand(&used)}
+    Rvalue.Convert {value: used, ty} => Rvalue.Convert {value: run copyOperand(&used), ty: Interned<Type>.clone(&ty)}
+    Rvalue.Fits {value: used, ty} => Rvalue.Fits {value: run copyOperand(&used), ty: Interned<Type>.clone(&ty)}
+    Rvalue.AddressIntegerConversion {operand, destinationType} => Rvalue.AddressIntegerConversion {operand: run copyOperand(&operand),
+      destinationType: Interned<Type>.clone(&destinationType)}
+    Rvalue.Bitcast {value: used, ty} => Rvalue.Bitcast {value: run copyOperand(&used), ty: Interned<Type>.clone(&ty)}
+    Rvalue.Discriminant {place} => Rvalue.Discriminant {place: run copyPlace(&place)}
+    Rvalue.Inject {tag, value: used} => Rvalue.Inject {tag: tag, value: run copyOperand(&used)}
+    Rvalue.Variant {tag, fields} => Rvalue.Variant {tag: tag, fields: run copyFields(&fields)}
+    Rvalue.FunctionAddress {key} => Rvalue.FunctionAddress {key: InstanceKey.copy(&key)}
+    Rvalue.ContextOf {place} => Rvalue.ContextOf {place: run copyPlace(&place)}
+    Rvalue.ContextHandle {address} => Rvalue.ContextHandle {address: run copyOperand(&address)}
+    Rvalue.ForeignStatic {declaration, address} => Rvalue.ForeignStatic {declaration: Interned<DeclarationId>.clone(&declaration),
+      address: address}
+    Rvalue.RunningPackage => Rvalue.RunningPackage
+    Rvalue.FrameAddress => Rvalue.FrameAddress
+    Rvalue.ProcessWord => Rvalue.ProcessWord
+    Rvalue.StackAllocate {count, element} => Rvalue.StackAllocate {count: run copyOperand(&count), element: Interned<Type>.clone(&element)}
+    Rvalue.Wasm {primitive, operands} => Rvalue.Wasm {primitive: primitive, operands: run copyOperands(&operands)}
+    Rvalue.Fill {byte} => Rvalue.Fill {byte: byte}
+    Rvalue.Assembly {fragment} => {
+      let held = &Box<AssemblyFragment>.get(&fragment)[0]
+      let copied = AssemblyFragment {template: run Bytes.copy(Bytes.asSlice(&held.template)),
+        constraints: run Bytes.copy(Bytes.asSlice(&held.constraints)), clobbers: run Bytes.copy(Bytes.asSlice(&held.clobbers)),
+        memory: held.memory, sideEffects: held.sideEffects, noReturn: held.noReturn, inputs: run copyOperands(&held.inputs),
+        ty: Interned<Type>.clone(&held.ty)}
+      Rvalue.Assembly {fragment: run Box<AssemblyFragment>.make(move copied)}
+    }
+    Rvalue.Atomic {primitive, operands, success, failure, element} => Rvalue.Atomic {primitive: primitive,
+      operands: run copyOperands(&operands), success: success, failure: failure, element: Interned<Type>.clone(&element)}
+    Rvalue.Vector {primitive, operands, ty} => Rvalue.Vector {primitive: primitive, operands: run copyOperands(&operands),
+      ty: Interned<Type>.clone(&ty)}
+  }
+}
+
+/// A copy of `diagnostics`.
+pub effect fn copyDiagnostics(diagnostics: &Option<Diagnostics>) -> Option<Diagnostics> ! OutOfMemoryError ? &mut Allocator {
+  if let Option<Diagnostics>.Some {value} = &diagnostics.* {
+    return Option<Diagnostics>.some(run Diagnostics.make(run copyOperand(Diagnostics.observer(&value)),
+      run copyOperand(Diagnostics.cause(&value)), run copyOperand(Diagnostics.site(&value))))
+  }
+  return Option<Diagnostics>.none()
+}
+
+/// A copy of `statement`.
+pub effect fn copyStatement(statement: &Statement) -> Statement ! OutOfMemoryError ? &mut Allocator {
+  return match &statement.* {
+    Statement.Assign {destination, value, origin} => Statement.Assign {destination: run copyPlace(&destination),
+      value: run copyRvalue(&value), origin: origin}
+    Statement.Drop {destination, glue, diagnostics, origin} => Statement.Drop {destination: run copyPlace(&destination),
+      glue: InstanceKey.copy(&glue), diagnostics: run copyDiagnostics(&diagnostics), origin: origin}
+    Statement.FailureContext {destination, source, origin} => {
+      let mut from = Option<Place>.none()
+      if let Option<Place>.Some {value} = &source { from = Option<Place>.some(run copyPlace(&value)) }
+      Statement.FailureContext {destination: run copyPlace(&destination), source: move from, origin: origin}
+    }
+    Statement.SetContextHandle {address, value, origin} => Statement.SetContextHandle {address: run copyOperand(&address),
+      value: run copyOperand(&value), origin: origin}
+  }
+}
+
+/// A copy of `callee`.
+pub effect fn copyCallee(callee: &Callee) -> Callee ! OutOfMemoryError ? &mut Allocator {
+  return match &callee.* {
+    Callee.Instance {key} => Callee.Instance {key: InstanceKey.copy(&key)}
+    Callee.Extern {declaration, variadicArguments} => {
+      let listed = List<CAbi.VariadicArgument>.asSlice(&variadicArguments)
+      let mut tails = run List<CAbi.VariadicArgument>.makeWithCapacity(listed.length)
+      let mut at = usize.ZERO
+      while at < listed.length {
+        run List<CAbi.VariadicArgument>.append(&mut tails, CAbi.VariadicArgument {sourceType: Interned<Type>.clone(&listed[at].sourceType),
+          promotedType: Interned<Type>.clone(&listed[at].promotedType)})
+        at = at + usize.ONE
+      }
+      Callee.Extern {declaration: Interned<DeclarationId>.clone(&declaration), variadicArguments: move tails}
+    }
+    Callee.Indirect {address} => Callee.Indirect {address: run copyOperand(&address)}
+    Callee.NativeIndirect {address, signature} => Callee.NativeIndirect {address: run copyOperand(&address),
+      signature: Interned<Type>.clone(&signature)}
+  }
+}
+
+/// A copy of `terminator`.
+pub effect fn copyTerminator(terminator: &Terminator) -> Terminator ! OutOfMemoryError ? &mut Allocator {
+  return match &terminator.* {
+    Terminator.Goto {target, origin} => Terminator.Goto {target: target, origin: origin}
+    Terminator.Branch {condition, thenBlock, elseBlock, origin} => Terminator.Branch {condition: run copyOperand(&condition),
+      thenBlock: thenBlock, elseBlock: elseBlock, origin: origin}
+    Terminator.Return {origin} => Terminator.Return {origin: origin}
+    Terminator.Call {callee, arguments, providers, diagnostics, destination, normal, failure, origin} => {
+      let mut failed = Option<FailureEdge>.none()
+      if let Option<FailureEdge>.Some {value: edge} = &failure {
+        failed = Option<FailureEdge>.some(FailureEdge {destination: run copyPlace(&edge.destination), target: edge.target})
+      }
+      Terminator.Call {callee: run copyCallee(&callee), arguments: run copyOperands(&arguments), providers: run copyOperands(&providers),
+        diagnostics: run copyDiagnostics(&diagnostics), destination: run copyPlace(&destination), normal: normal, failure: move failed,
+        origin: origin}
+    }
+    Terminator.Fail {origin} => Terminator.Fail {origin: origin}
+    Terminator.Trap {reason, origin} => Terminator.Trap {reason: reason, origin: origin}
+    Terminator.TrapText {reason, origin} => Terminator.TrapText {reason: run copyOperand(&reason), origin: origin}
+    Terminator.Unreachable {origin} => Terminator.Unreachable {origin: origin}
+    Terminator.Switch {value, cases, otherwise, origin} => {
+      let listed = List<SwitchCase>.asSlice(&cases)
+      let mut copied = run List<SwitchCase>.makeWithCapacity(listed.length)
+      let mut at = usize.ZERO
+      while at < listed.length {
+        run List<SwitchCase>.append(&mut copied, SwitchCase {decimal: run Bytes.copy(Bytes.asSlice(&listed[at].decimal)),
+          negative: listed[at].negative, target: listed[at].target})
+        at = at + usize.ONE
+      }
+      Terminator.Switch {value: run copyOperand(&value), cases: move copied, otherwise: otherwise, origin: origin}
+    }
+    Terminator.Relinquish {resume, origin} => Terminator.Relinquish {resume: resume, origin: origin}
+    Terminator.Abandon {origin} => Terminator.Abandon {origin: origin}
+  }
+}
+
+/// The origin of `statement`.
+pub fn statementOrigin(statement: &Statement) -> Origin {
+  return match &statement.* {
+    Statement.Assign {origin, ..} => origin
+    Statement.Drop {origin, ..} => origin
+    Statement.FailureContext {origin, ..} => origin
+    Statement.SetContextHandle {origin, ..} => origin
+  }
+}
+
+/// Gives `statement` the origin `origin`.
+pub fn setStatementOrigin(statement: &mut Statement, origin: Origin) -> () {
+  match &mut statement.* {
+    Statement.Assign {origin: at, ..} => { at = origin }
+    Statement.Drop {origin: at, ..} => { at = origin }
+    Statement.FailureContext {origin: at, ..} => { at = origin }
+    Statement.SetContextHandle {origin: at, ..} => { at = origin }
+  }
+  return ()
+}
+
+/// The origin of `terminator`.
+pub fn terminatorOrigin(terminator: &Terminator) -> Origin {
+  return match &terminator.* {
+    Terminator.Goto {origin, ..} => origin
+    Terminator.Branch {origin, ..} => origin
+    Terminator.Return {origin} => origin
+    Terminator.Call {origin, ..} => origin
+    Terminator.Fail {origin} => origin
+    Terminator.Trap {origin, ..} => origin
+    Terminator.TrapText {origin, ..} => origin
+    Terminator.Unreachable {origin} => origin
+    Terminator.Switch {origin, ..} => origin
+    Terminator.Relinquish {origin, ..} => origin
+    Terminator.Abandon {origin} => origin
+  }
+}
+
+/// Gives `terminator` the origin `origin`.
+pub fn setTerminatorOrigin(terminator: &mut Terminator, origin: Origin) -> () {
+  match &mut terminator.* {
+    Terminator.Goto {origin: at, ..} => { at = origin }
+    Terminator.Branch {origin: at, ..} => { at = origin }
+    Terminator.Return {origin: at} => { at = origin }
+    Terminator.Call {origin: at, ..} => { at = origin }
+    Terminator.Fail {origin: at} => { at = origin }
+    Terminator.Trap {origin: at, ..} => { at = origin }
+    Terminator.TrapText {origin: at, ..} => { at = origin }
+    Terminator.Unreachable {origin: at} => { at = origin }
+    Terminator.Switch {origin: at, ..} => { at = origin }
+    Terminator.Relinquish {origin: at, ..} => { at = origin }
+    Terminator.Abandon {origin: at} => { at = origin }
+  }
+  return ()
+}
+
+/// Renames every local `place` names, as its own local and as each runtime index, to its entry in
+/// `locals`.
+pub fn renamePlace(place: &mut Place, locals: &[usize]) -> () {
+  place.local = locals[place.local]
+  let mut steps = List<Projection>.asMutSlice(&mut place.projections)
+  let mut at = usize.ZERO
+  while at < steps.length {
+    if let Projection.Index {local} = &mut steps[at] { local = locals[local] }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+/// Renames every local `statement` names to its entry in `locals`.
+pub fn renameStatement(statement: &mut Statement, locals: &[usize]) -> () {
+  let count = statementSlots(&statement.*)
+  let mut at = usize.ZERO
+  while at < count {
+    if let Option<&mut Place>.Some {value: place} = slotPlaceMut(statementSlotMut(&mut statement.*, at)) { renamePlace(move place, locals) }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+/// Renames every local `terminator` names to its entry in `locals`.
+pub fn renameTerminator(terminator: &mut Terminator, locals: &[usize]) -> () {
+  let count = terminatorSlots(&terminator.*)
+  let mut at = usize.ZERO
+  while at < count {
+    if let Option<&mut Place>.Some {value: place} = slotPlaceMut(terminatorSlotMut(&mut terminator.*, at)) { renamePlace(move place, locals) }
+    at = at + usize.ONE
+  }
+  return ()
+}
