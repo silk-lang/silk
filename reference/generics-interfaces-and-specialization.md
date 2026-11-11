@@ -374,7 +374,28 @@ fn visit<Owner, Sub>(static field: Intrinsic.Field<Owner, Option<Sub>>) -> i32 {
 ```
 
 `count<Root>` reaches `count<Branch>` when `Root` has a field `branch: Option<Branch>`. Static
-arguments may change along such a descent. The owned structure of a type is finite, because a
+arguments may change along such a descent.
+
+A type parameter that a bound on another type parameter names, such as `M` in `B: Block<M>`, may
+change to any type along the descent of the parameter that fixes it, because the conformance
+selected for that argument decides it. A walk over a tree of blocks whose message types are
+unrelated therefore descends:
+
+```silk,ignore
+fn walk<B: Block<M>, M>(value: &B) -> i32 {
+  let mut total = 1
+  static for field in Reflect.fields<B>() {
+    static if Reflect.fieldLabel(field) == "child" {
+      total = total + walk(Reflect.borrowField(value, field))
+    }
+  }
+  return total
+}
+```
+
+`walk<Root, RootMessage>` reaches `walk<Leaf, LeafMessage>` when `Leaf` is a field type of `Root`.
+The parameter that fixes `M` must itself change and descend, and the descent may not return to an
+active application whose other type arguments it repeats, whatever `M` is there. The owned structure of a type is finite, because a
 declaration unfolds beneath itself only at a strictly smaller application, and a descent may not
 return to an active application whose type arguments it repeats, so these re-entries stay finite.
 A recursive type such as `Node { next: Option<Box<Node>> }` admits `count<Box<Node>>` below
@@ -393,8 +414,9 @@ fn grow<T>(value: T) -> i32 {
 Each step would require another specialization and no finite static family follows from the source.
 Mutual recursion is subject to the same rule across the complete cycle.
 
-**Diagnostics:** A disallowed recursive call reports a polymorphic-recursion diagnostic at that
-call and shows the current and requested applications. It must be rejected before instance
+**Diagnostics:** A disallowed recursive call reports a polymorphic-recursion diagnostic (SEM0053)
+at the declaration of the function that makes it, and names the earlier and the requested
+applications of the recursive function. It must be rejected before instance
 discovery recursively expands the family.
 
 **Evidence:** runtime specialization requirement,
