@@ -1,0 +1,346 @@
+//! WebAssembly code for one finished `SsaFunction`: the direct backend's last step, which drives
+//! the wasm body builder (`WasmBody`) instruction by instruction.
+//!
+//! # When to use
+//! Use [`emit`] on a function the direct backend lowered and promoted, for the body its fragment
+//! lists. Use [`wasmKind`] for the wasm kind of an SSA kind, such as a C signature's.
+//!
+//! # Details
+//! Each SSA value becomes one `WasmBody` value: an argument a parameter, an instruction result
+//! the result of the matching body operation, a constant a body constant, and a block parameter a
+//! variable. An address is an integer as wide as the memory's addresses, an `i128` two `i64`
+//! lanes. Blocks are emitted in reverse postorder, so every value is made before any use.
+//!
+//! An edge that passes arguments assigns its target's variables: before the jump for a jump, and
+//! in a block of its own for a branch or switch arm. The assignments of one edge happen at once:
+//! an argument that is itself a parameter of the target is copied first, so no assignment reads a
+//! parameter another one already overwrote.
+//!
+//! An optimized function is emitted twice: a survey that finds which frame slots are only loaded
+//! and stored, then the body that keeps them in wasm locals (`Body.survey`, `Body.adopt`).
+
+import CompilerBug
+import backend.SsaFunction {
+  Block,
+  ConstantForm,
+  Edge,
+  Exit,
+  Form,
+  Instruction,
+  Kind as SsaKind,
+  Operation,
+  SsaFunction,
+  none,
+}
+import backend.SsaGraph {SsaGraph}
+import backend.WasmBody
+import backend.WasmBody {Body, Kind, Promotion}
+import backend.WasmObject {Translated, Unsupported}
+import silk.collections.list {List}
+import silk.collections.slice {Slice}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.u64
+import silk.num.usize
+
+/// The `WasmBody` kind of SSA kind `kind` on a target whose addresses are `addressBits` wide: an
+/// address is an integer that wide.
+pub fn wasmKind(kind: SsaKind, addressBits: usize) -> Kind {
+  if kind.isUnit() { return Kind.unit() }
+  let mut element = Kind.integer(kind.bits)
+  if kind.form == Form.Float { element = Kind.float(kind.bits) }
+  if kind.form == Form.Address { element = Kind.integer(addressBits) }
+  if kind.isVector() { return Kind.vector(element, kind.elements) }
+  return element
+}
+
+/// The finished wasm body of `function`, for a memory threads share when `threaded`. An
+/// `optimized` body keeps each frame slot only loaded and stored in wasm locals.
+///
+/// # Errors
+///
+/// - `Unsupported` when the body builder cannot express an operation, such as a 128-bit
+///   division.
+pub effect fn emit(function: &SsaFunction, threaded: bool, optimized: bool) -> Translated ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let graph = run SsaGraph.of(function)
+  let mut plan = Promotion.none()
+  if optimized {
+    let mut surveyed = run Body.make(function.name(), function.addressBits == 64, threaded)
+    surveyed.survey()
+    run emitInto(&mut surveyed, function, &graph)
+    plan = run surveyed.promotion()
+  }
+  let mut body = run Body.make(function.name(), function.addressBits == 64, threaded)
+  body.adopt(move plan)
+  run emitInto(&mut body, function, &graph)
+  return run WasmBody.finish(&mut body)
+}
+
+// The state of one emission: the body value of each SSA value, the body block of each SSA block,
+// and the body slot of each stack slot, made at its first address.
+struct Emitter {
+  values: List<u64>,
+  blocks: List<usize>,
+  slots: List<u64>,
+  addressBits: usize,
+  place: u64,
+}
+
+effect fn emitInto(body: &mut Body, function: &SsaFunction, graph: &SsaGraph) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let bits = function.addressBits
+  let mut emitter = Emitter {values: List<u64>.make(), blocks: List<usize>.make(), slots: List<u64>.make(), addressBits: bits, place: 0}
+  run List<u64>.appendRepeated(&mut emitter.values, none(), function.valueCount())
+  run List<u64>.appendRepeated(&mut emitter.slots, none(), function.slotCount())
+  run body.result(wasmKind(function.result, bits))
+  let arguments = List<u64>.asSlice(&function.arguments)
+  let mut at = usize.ZERO
+  while at < arguments.length {
+    let made = run body.parameter(wasmKind(function.kindOf(arguments[at]), bits))
+    List<u64>.set(&mut emitter.values, u64.toUsize(arguments[at]), made)
+    at = at + usize.ONE
+  }
+  let count = function.blockCount()
+  at = usize.ZERO
+  while at < count {
+    run List<usize>.append(&mut emitter.blocks, run WasmBody.newBlock(&mut body.*))
+    at = at + usize.ONE
+  }
+  let sequence = graph.reversePostorder()
+  at = usize.ZERO
+  while at < sequence.length {
+    let parameters = List<u64>.asSlice(&function.block(sequence[at]).parameters)
+    let mut position = usize.ZERO
+    while position < parameters.length {
+      let made = run WasmBody.variable(&mut body.*, wasmKind(function.kindOf(parameters[position]), bits))
+      List<u64>.set(&mut emitter.values, u64.toUsize(parameters[position]), made)
+      position = position + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < sequence.length {
+    run emitBlock(&mut body.*, function, &mut emitter, sequence[at])
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+effect fn locate(body: &mut Body, emitter: &mut Emitter, place: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  if place == 0 || place == emitter.place { return () }
+  emitter.place = place
+  return run WasmBody.locate(&mut body.*, place)
+}
+
+effect fn emitBlock(body: &mut Body, function: &SsaFunction, emitter: &mut Emitter, block: usize) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let found = function.block(block)
+  run locate(&mut body.*, &mut emitter.*, found.startPlace)
+  run WasmBody.startBlock(&mut body.*, List<usize>.get(&emitter.blocks, block))
+  let listed = List<usize>.asSlice(&found.instructions)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let instruction = function.instruction(listed[at])
+    run locate(&mut body.*, &mut emitter.*, instruction.place)
+    run emitInstruction(&mut body.*, function, &mut emitter.*, listed[at], instruction)
+    at = at + usize.ONE
+  }
+  run locate(&mut body.*, &mut emitter.*, found.place)
+  return run emitExit(&mut body.*, function, &mut emitter.*, found)
+}
+
+// The body value of `value`: the one made for it, or a constant made now.
+effect fn operand(body: &mut Body, function: &SsaFunction, emitter: &mut Emitter, value: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  if value == none() { return none() }
+  let made = List<u64>.get(&emitter.values, u64.toUsize(value))
+  if made != none() { return made }
+  if !function.isConstant(value) { return CompilerBug.panic(b"WasmEmission: a value used before its definition") }
+  let kind = function.kindOf(value)
+  let constant = function.constantOf(value)
+  let wasm = wasmKind(kind, emitter.addressBits)
+  let mut handle = none()
+  if constant.form == ConstantForm.Bits {
+    handle = run WasmBody.constant(&mut body.*, wasm, constant.low, constant.high)
+  } else if constant.form == ConstantForm.Link {
+    handle = run WasmBody.linkConstant(&mut body.*, function.symbolName(constant.symbol))
+  } else {
+    handle = run WasmBody.symbolAddress(&mut body.*, function.symbolName(constant.symbol), constant.low, constant.form == ConstantForm.ThreadLocal)
+  }
+  List<u64>.set(&mut emitter.values, u64.toUsize(value), handle)
+  return handle
+}
+
+effect fn operands(body: &mut Body, function: &SsaFunction, emitter: &mut Emitter, instruction: usize) -> List<u64> ! OutOfMemoryError ? &mut Allocator {
+  let listed = function.operandsOf(instruction)
+  let mut out = run List<u64>.makeWithCapacity(listed.length)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    run List<u64>.append(&mut out, run operand(&mut body.*, function, &mut emitter.*, listed[at]))
+    at = at + usize.ONE
+  }
+  return move out
+}
+
+effect fn emitInstruction(body: &mut Body, function: &SsaFunction, emitter: &mut Emitter, number: usize, instruction: Instruction) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let made = run operands(&mut body.*, function, &mut emitter.*, number)
+  let of = List<u64>.asSlice(&made)
+  let kind = wasmKind(instruction.kind, emitter.addressBits)
+  let mut result = none()
+  let mut second = none()
+  match instruction.operation {
+    Operation.Binary {operation} => { result = run WasmBody.binary(&mut body.*, operation, of[0], of[1]) }
+    Operation.Negate => { result = run WasmBody.negate(&mut body.*, of[0]) }
+    Operation.Compare {predicate} => { result = run WasmBody.compare(&mut body.*, predicate, of[0], of[1]) }
+    Operation.Select => { result = run WasmBody.select(&mut body.*, of[0], of[1], of[2]) }
+    Operation.Cast {operation} => { result = run WasmBody.cast(&mut body.*, operation, of[0], kind) }
+    Operation.Load {offset, ..} => { result = run WasmBody.load(&mut body.*, kind, of[0], offset) }
+    Operation.Store {offset, ..} => { run WasmBody.store(&mut body.*, of[0], of[1], offset) }
+    Operation.Offset {offset} => { result = run WasmBody.offset(&mut body.*, of[0], offset) }
+    Operation.Index => { result = run WasmBody.indexed(&mut body.*, of[0], of[1]) }
+    Operation.CopyBytes {size} => { run WasmBody.copyBytes(&mut body.*, of[0], of[1], size) }
+    Operation.Fill {byte, size} => { run WasmBody.fill(&mut body.*, of[0], byte, size) }
+    Operation.SlotAddress {slot} => {
+      result = List<u64>.get(&emitter.slots, slot)
+      if result == none() {
+        let declared = function.slot(slot)
+        result = run WasmBody.slot(&mut body.*, declared.size, declared.alignment)
+        List<u64>.set(&mut emitter.slots, slot, result)
+      }
+    }
+    Operation.FrameAddress => { result = run WasmBody.frameAddress(&mut body.*) }
+    Operation.DynamicSlot {alignment} => { result = run WasmBody.dynamicSlot(&mut body.*, of[0], alignment) }
+    Operation.Call {symbol, fixed} => {
+      if fixed == usize.MAX {
+        result = run WasmBody.call(&mut body.*, function.symbolName(symbol), of, kind)
+      } else {
+        result = run WasmBody.callVariadic(&mut body.*, function.symbolName(symbol), Slice.view<u64>(of, usize.ZERO, fixed),
+          Slice.view<u64>(of, fixed, of.length - fixed), kind)
+      }
+    }
+    Operation.CallIndirect => {
+      result = run WasmBody.callIndirect(&mut body.*, of[0], Slice.view<u64>(of, usize.ONE, of.length - usize.ONE), kind)
+    }
+    Operation.Overflow {operation, signed} => {
+      let pair = run WasmBody.overflowing(&mut body.*, operation, signed, of[0], of[1])
+      result = pair.value
+      second = pair.overflow
+    }
+    Operation.Saturate {operation, signed} => { result = run WasmBody.saturating(&mut body.*, operation, signed, of[0], of[1]) }
+    Operation.Rotate {left} => { result = run WasmBody.rotate(&mut body.*, left, of[0], of[1]) }
+    Operation.Count {which} => { result = run WasmBody.countBits(&mut body.*, which, of[0]) }
+    Operation.Extreme {which} => { result = run WasmBody.extreme(&mut body.*, which, of[0], of[1]) }
+    Operation.FusedMultiplyAdd => { result = run WasmBody.fusedMultiplyAdd(&mut body.*, of[0], of[1], of[2]) }
+    Operation.SquareRoot => { result = run WasmBody.squareRoot(&mut body.*, of[0]) }
+    Operation.Reduce {which} => {
+      let mut start = none()
+      if of.length == 2 { start = of[1] }
+      result = run WasmBody.reduce(&mut body.*, which, of[0], start)
+    }
+    Operation.Shuffle {start, count} => { result = run WasmBody.shuffle(&mut body.*, of[0], of[1], function.immediatesAt(start, count)) }
+    Operation.Extract => { result = run WasmBody.extractElement(&mut body.*, of[0], of[1]) }
+    Operation.Insert => { result = run WasmBody.insertElement(&mut body.*, of[0], of[1], of[2]) }
+    Operation.Splat {count} => { result = run WasmBody.splat(&mut body.*, of[0], count) }
+    Operation.AtomicLoad => { result = run WasmBody.atomicLoad(&mut body.*, kind, of[0]) }
+    Operation.AtomicStore => { run WasmBody.atomicStore(&mut body.*, of[0], of[1]) }
+    Operation.AtomicModify {which} => { result = run WasmBody.atomicModify(&mut body.*, which, of[0], of[1]) }
+    Operation.CompareExchange => {
+      let pair = run WasmBody.compareExchange(&mut body.*, of[0], of[1], of[2])
+      result = pair.value
+      second = pair.overflow
+    }
+    Operation.Fence => { run WasmBody.fence(&mut body.*) }
+    Operation.WasmGlobalGet {index} => { result = run WasmBody.globalGet(&mut body.*, index, kind) }
+    Operation.WasmGlobalSet {index} => { run WasmBody.globalSet(&mut body.*, index, of[0]) }
+    Operation.WasmMemorySize => { result = run WasmBody.memorySize(&mut body.*) }
+    Operation.WasmMemoryGrow => { result = run WasmBody.memoryGrow(&mut body.*, of[0]) }
+    Operation.WasmWait => { result = run WasmBody.atomicWait(&mut body.*, of[0], of[1], of[2]) }
+    Operation.WasmNotify => { result = run WasmBody.atomicNotify(&mut body.*, of[0], of[1]) }
+  }
+  if instruction.result != none() {
+    List<u64>.set(&mut emitter.values, u64.toUsize(instruction.result), result)
+    if second != none() { List<u64>.set(&mut emitter.values, u64.toUsize(instruction.result) + usize.ONE, second) }
+  }
+  return ()
+}
+
+effect fn emitExit(body: &mut Body, function: &SsaFunction, emitter: &mut Emitter, found: &Block) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let edges = List<Edge>.asSlice(&found.edges)
+  if found.exit == Exit.Return {
+    let value = run operand(&mut body.*, function, &mut emitter.*, found.value)
+    return run WasmBody.ret(&mut body.*, value)
+  }
+  if found.exit == Exit.Trap || found.exit == Exit.Unreachable { return run WasmBody.trap(&mut body.*) }
+  if found.exit == Exit.Jump {
+    run passArguments(&mut body.*, function, &mut emitter.*, &edges[usize.ZERO])
+    return run WasmBody.jump(&mut body.*, List<usize>.get(&emitter.blocks, edges[usize.ZERO].block))
+  }
+  let value = run operand(&mut body.*, function, &mut emitter.*, found.value)
+  // Each arm that passes arguments goes through a block of its own that assigns them.
+  let mut targets = run List<usize>.makeWithCapacity(edges.length)
+  let mut at = usize.ZERO
+  while at < edges.length {
+    if List<u64>.length(&edges[at].arguments) == usize.ZERO {
+      run List<usize>.append(&mut targets, List<usize>.get(&emitter.blocks, edges[at].block))
+    } else {
+      run List<usize>.append(&mut targets, run WasmBody.newBlock(&mut body.*))
+    }
+    at = at + usize.ONE
+  }
+  if found.exit == Exit.Branch {
+    run WasmBody.branchIf(&mut body.*, value, List<usize>.get(&targets, usize.ZERO), List<usize>.get(&targets, usize.ONE))
+  } else {
+    let cases = List<u64>.asSlice(&found.cases)
+    let mut pairs = run List<u64>.makeWithCapacity(cases.length * 2)
+    at = usize.ZERO
+    while at < cases.length {
+      run List<u64>.append(&mut pairs, cases[at])
+      run List<u64>.append(&mut pairs, usize.toU64(List<usize>.get(&targets, at + usize.ONE)))
+      at = at + usize.ONE
+    }
+    run WasmBody.switch(&mut body.*, value, List<u64>.asSlice(&pairs), List<usize>.get(&targets, usize.ZERO))
+  }
+  at = usize.ZERO
+  while at < edges.length {
+    if List<u64>.length(&edges[at].arguments) != usize.ZERO {
+      run WasmBody.startBlock(&mut body.*, List<usize>.get(&targets, at))
+      run passArguments(&mut body.*, function, &mut emitter.*, &edges[at])
+      run WasmBody.jump(&mut body.*, List<usize>.get(&emitter.blocks, edges[at].block))
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Assigns edge `edge`'s arguments to its target's parameters at once.
+effect fn passArguments(body: &mut Body, function: &SsaFunction, emitter: &mut Emitter, edge: &Edge) -> () ! OutOfMemoryError ? &mut Allocator {
+  let parameters = List<u64>.asSlice(&function.block(edge.block).parameters)
+  let arguments = List<u64>.asSlice(&edge.arguments)
+  let mut sources = run List<u64>.makeWithCapacity(arguments.length)
+  let mut at = usize.ZERO
+  while at < arguments.length {
+    let mut source = run operand(&mut body.*, function, &mut emitter.*, arguments[at])
+    // A parameter of the target that another assignment overwrites is read before any of them.
+    if arguments[at] != parameters[at] && isAmong(parameters, arguments[at]) {
+      let copied = run WasmBody.variable(&mut body.*, wasmKind(function.kindOf(arguments[at]), emitter.addressBits))
+      run WasmBody.assign(&mut body.*, copied, source)
+      source = copied
+    }
+    run List<u64>.append(&mut sources, source)
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < arguments.length {
+    if arguments[at] != parameters[at] {
+      run WasmBody.assign(&mut body.*, List<u64>.get(&emitter.values, u64.toUsize(parameters[at])), List<u64>.get(&sources, at))
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+fn isAmong(values: &[u64], value: u64) -> bool {
+  let mut at = usize.ZERO
+  while at < values.length {
+    if values[at] == value { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
