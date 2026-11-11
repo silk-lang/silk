@@ -1139,12 +1139,16 @@ unsafe extern "C" fn g() -> i32 as "__silk_foreign_personality"
 ```
 
 **Boundary:** Agreement is judged on the classified C signature, not the Silk spelling. `isize` on
-a 64-bit target and `i64` classify to the same C type and therefore agree. Unreachable source declarations do not enter executable identity. Supplied behavioral interfaces are checked against one another and against the executable inventory, with both origins retained.
+a 64-bit target and `i64` classify to the same C type and therefore agree, as do raw pointers that
+differ only in pointee type, nullability or many-ness, such as `*mut u8` and `?[*]mut u64`. A
+declaration's `@foreign(noCapture: ...)` list is that declaration's own assertion and does not enter
+agreement; its `memory`, `locality` and callback directives do. Unreachable source declarations do not enter executable identity. Supplied behavioral interfaces are checked against one another and against the executable inventory, with both origins retained.
 
 **Diagnostics:** An invalid spelling reports `SEM0190` at the `as` string or, without `as`, at the
 declaration. A reserved symbol reports `SEM0191` at the same position. A conflicting redeclaration
-reports `SEM0192` at one declaration with a note relating the other; planning constructs no
-artifact. A symbol the native backend also declares for its own use, with a disagreeing signature,
+reports `SEM0192` at one declaration, naming the symbol and whether the C types or the contracts
+differ, with a note relating the other declaration, in whichever package it is; planning constructs
+no artifact. A symbol the native backend also declares for its own use, with a disagreeing signature,
 is a backend diagnostic naming the symbol.
 
 **Current compiler:** Aligned. Spelling and reservation are checked per module; signature
