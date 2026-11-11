@@ -692,6 +692,16 @@ pub fn bytes<'a>(self: &'a Self) -> &'a [u8]
 
 Returns the bytes of the head, ending with the empty line.
 
+<a id="PreparedRequest.impl.duplicate"></a>
+
+### Method `duplicate`
+
+```silk
+pub effect fn duplicate(self: &Self) -> PreparedRequest ! OutOfMemoryError ? &mut Allocator
+```
+
+Returns a copy of the request that owns its own memory, as the same request sent again needs.
+
 <a id="PreparedRequest.impl.head"></a>
 
 ### Method `head`
