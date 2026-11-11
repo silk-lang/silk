@@ -4579,6 +4579,18 @@ const program = Effect.gen(function* () {
   const releasedAt = (yield* fs.stat(releaseExecutable)).mtime
   yield* releaseBuild()
   assert.deepEqual((yield* fs.stat(releaseExecutable)).mtime, releasedAt, 'an unchanged release rebuild leaves the executable as it was')
+  // Every build names its content-derived symbols beside its output, so a frame an optimized
+  // program's backtrace shows by symbol leads to its declaration.
+  const releaseMap = yield* fs.readFileString(`${releaseExecutable}.symbols`)
+  assert.match(releaseMap, /^silk_[0-9a-f]+\tfunction\tsplit@0\.1\.0:helper\.silk::value$/m, releaseMap)
+  // Clang compiling and linking a macOS debug build in one step keeps its DWARF in a dSYM bundle,
+  // which the build keeps beside the executable.
+  if (process.platform === 'darwin') {
+    const debugged = yield* invoke(silk, ['build', '--optimization', 'release-with-debug', '--stdlib', standardLibrary], split, splitEnvironment)
+    assert.equal(debugged.status, 0, debugged.stderr)
+    const bundle = join(split, `build/llvm/${hostTarget}/release-with-debug/split.dSYM`)
+    assert.ok(yield* fs.exists(bundle), 'a macOS debug build keeps its dSYM bundle beside the executable')
+  }
   // Workspace members share one output directory, and each keeps a cache of its own there, so
   // building one member never replaces the cache another member's next build reads.
   const pair = join(directory, 'pair')
