@@ -1,0 +1,762 @@
+//! Memory optimizations of one SSA function: small copies and fills as loads and stores,
+//! store-to-load forwarding, redundant load and store removal, and stores to stack slots that
+//! nothing reads.
+//!
+//! # When to use
+//! Run [`expandCopies`] once before an optimized build's promotion, so the slots that copies and
+//! fills touch can become values, and [`forward`] with the scalar passes on what promotion left
+//! in memory: aggregates indexed at run time, slots whose address escapes, and memory behind
+//! addresses.
+//!
+//! # Details
+//! An address is a base and an offset ([`Place`]): `Offset` and `Index` by a constant add to the
+//! offset, an `Index` by anything else leaves it unknown, and the base is a stack slot, a
+//! symbol, a constant address, or any other value (an argument, a parameter, a loaded or
+//! returned address).
+//!
+//! The alias rule decides whether two accesses can touch a common byte:
+//!
+//! - A slot escapes when its address, or one derived from it, is used other than as the address
+//!   of a load, store, copy or fill, or as the base of an `Offset` or `Index`: passed to a call,
+//!   stored, compared, converted, passed along an edge or returned. Every slot escapes when the
+//!   function takes `FrameAddress` or reads the stack pointer global, either of which reaches
+//!   every slot.
+//! - Two accesses to different slots never alias. A slot that does not escape aliases nothing
+//!   but itself: only an address derived from its `SlotAddress` can reach it, and no callee can.
+//! - Two accesses from one base alias when both offsets are known and their byte ranges overlap,
+//!   modulo the address width, or when either offset is unknown.
+//! - Any other two accesses may alias: two different values, symbols or constants can hold or
+//!   reach the same address.
+//! - A call, an atomic operation, a fence, a wait, a notification or a memory growth may read and
+//!   write every byte but a slot that does not escape: a callee or another thread can reach all
+//!   other memory, and a suspendable function's frame is memory behind an address, so nothing
+//!   about it survives a call. Between two such operations a thread-shared byte is assumed
+//!   unchanged by other threads, as a data-race-free program guarantees.
+//!
+//! [`forward`] walks the dominator tree, carrying what memory holds from a block into each block
+//! whose only predecessor it is, and starting from nothing at every merge. A load of the place,
+//! size and kind a store wrote, or an earlier load read, with no aliasing write or clobbering
+//! operation between, becomes that value; a store of the value a place already holds goes. Both
+//! removed accesses touch exactly the bytes of an earlier access that did not trap, so neither
+//! could trap. Then each store, fill or copy into a slot that does not escape is removed when no
+//! load or copy in the function reads the bytes it writes: no other code can.
+//!
+//! [`expandCopies`] turns a `CopyBytes` or `Fill` of at most its limit into loads, then stores,
+//! in pieces: the fields the destination slot's (or else the source slot's) loads and stores
+//! use, where those fields tile the range, and 8, 4, 2 and 1-byte integers for the rest. All
+//! loads come before all stores, so overlapping copies stay correct. A copy that traps on its
+//! destination may now trap after writing its first bytes, which no code of the program can see.
+
+import backend.SsaDeadCode
+import backend.SsaFunction {
+  ConstantForm,
+  Edge,
+  Kind,
+  Operation,
+  SsaFunction,
+  masked,
+  none,
+}
+import backend.SsaGraph {SsaGraph}
+import silk.collections.list {List}
+import silk.core.option {Option}
+import silk.core.ownership {Copy}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+
+/// What an address's base is.
+pub enum BaseForm {
+  /// Stack slot `Place.base`.
+  Slot,
+  /// The value `Place.base`, whatever address it holds.
+  Value,
+  /// The symbol at position `Place.base` among the function's symbols.
+  Symbol,
+  /// Address zero: the offset is the address.
+  Absolute,
+}
+
+/// Where an address points: `offset` bytes past its base, when `known`.
+pub struct Place {
+  pub form: BaseForm,
+  pub base: u64,
+  pub offset: u64,
+  pub known: bool,
+}
+
+impl Copy for Place {}
+
+/// The place `address` plus `offset` points at, in `function`.
+pub fn placeOf(function: &SsaFunction, address: u64, offset: u64) -> Place {
+  let bits = function.addressBits
+  let mut at = address
+  let mut moved = masked(offset, bits)
+  let mut known = true
+  let mut steps = usize.ZERO
+  while steps < 64 {
+    if function.isConstant(at) {
+      let constant = function.constantOf(at)
+      if constant.form == ConstantForm.Bits { return Place {form: BaseForm.Absolute, base: 0, offset: masked(u64.wrappingAdd(moved, constant.low), bits), known: known} }
+      if constant.form == ConstantForm.Symbol {
+        return Place {form: BaseForm.Symbol, base: usize.toU64(constant.symbol), offset: masked(u64.wrappingAdd(moved, constant.low), bits), known: known}
+      }
+      return Place {form: BaseForm.Value, base: at, offset: moved, known: known}
+    }
+    let producer = function.producerOf(at)
+    if producer == usize.MAX { return Place {form: BaseForm.Value, base: at, offset: moved, known: known} }
+    let operands = function.operandsOf(producer)
+    match function.instruction(producer).operation {
+      Operation.SlotAddress {slot} => { return Place {form: BaseForm.Slot, base: usize.toU64(slot), offset: moved, known: known} }
+      Operation.Offset {offset: step} => {
+        moved = masked(u64.wrappingAdd(moved, step), bits)
+        at = operands[usize.ZERO]
+      }
+      Operation.Index => {
+        let index = operands[usize.ONE]
+        if function.isBits(index) { moved = masked(u64.wrappingAdd(moved, function.constantOf(index).low), bits) } else { known = false }
+        at = operands[usize.ZERO]
+      }
+      _ => { return Place {form: BaseForm.Value, base: at, offset: moved, known: known} }
+    }
+    steps = steps + usize.ONE
+  }
+  return Place {form: BaseForm.Value, base: at, offset: moved, known: false}
+}
+
+// Whether `size` bytes at `first` and `otherSize` bytes at `second`, offsets from one base, share
+// a byte, modulo `bits`-wide addresses.
+fn overlaps(first: Place, size: u64, second: Place, otherSize: u64, bits: usize) -> bool {
+  if !first.known || !second.known { return true }
+  let ahead = masked(u64.wrappingSubtract(second.offset, first.offset), bits)
+  let behind = masked(u64.wrappingSubtract(first.offset, second.offset), bits)
+  return ahead < size || behind < otherSize
+}
+
+/// Whether `size` bytes at `first` and `otherSize` bytes at `second` may share a byte, given
+/// which slots `escaped`.
+pub fn mayAlias(first: Place, size: u64, second: Place, otherSize: u64, escaped: &[bool], bits: usize) -> bool {
+  if first.form == BaseForm.Slot && second.form == BaseForm.Slot {
+    if first.base != second.base { return false }
+    return overlaps(first, size, second, otherSize, bits)
+  }
+  if first.form == BaseForm.Slot { return escaped[u64.toUsize(first.base)] }
+  if second.form == BaseForm.Slot { return escaped[u64.toUsize(second.base)] }
+  if first.form == second.form && first.base == second.base { return overlaps(first, size, second, otherSize, bits) }
+  return true
+}
+
+/// Which slots of `function` escape, by slot.
+pub effect fn escapedSlots(function: &SsaFunction) -> List<bool> ! OutOfMemoryError ? &mut Allocator {
+  let slots = function.slotCount()
+  let mut escaped = run List<bool>.makeWithCapacity(slots)
+  run List<bool>.appendRepeated(&mut escaped, false, slots)
+  if slots == usize.ZERO { return move escaped }
+  // The slot each address value is derived from, by value; definitions dominate uses, so one
+  // walk in reverse postorder sees each base first.
+  let graph = run SsaGraph.of(function)
+  let mut derived = run List<usize>.makeWithCapacity(function.valueCount())
+  run List<usize>.appendRepeated(&mut derived, usize.MAX, function.valueCount())
+  let mut everything = false
+  let sequence = graph.reversePostorder()
+  let mut step = usize.ZERO
+  while step < sequence.length {
+    let listed = List<usize>.asSlice(&function.block(sequence[step]).instructions)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      let found = function.instruction(listed[at])
+      match found.operation {
+        Operation.SlotAddress {slot} => { List<usize>.set(&mut derived, u64.toUsize(found.result), slot) }
+        Operation.Offset {..} => {
+          let from = slotOf(&derived, function.operandsOf(listed[at])[usize.ZERO])
+          List<usize>.set(&mut derived, u64.toUsize(found.result), from)
+        }
+        Operation.Index => {
+          let from = slotOf(&derived, function.operandsOf(listed[at])[usize.ZERO])
+          List<usize>.set(&mut derived, u64.toUsize(found.result), from)
+        }
+        Operation.FrameAddress => { everything = true }
+        Operation.WasmGlobalGet {index} => { if index == usize.ZERO { everything = true } }
+        _ => {}
+      }
+      at = at + usize.ONE
+    }
+    step = step + usize.ONE
+  }
+  if everything {
+    List<bool>.truncate(&mut escaped, usize.ZERO)
+    run List<bool>.appendRepeated(&mut escaped, true, slots)
+    return move escaped
+  }
+  let mut block = usize.ZERO
+  while block < function.blockCount() {
+    let found = function.block(block)
+    let listed = List<usize>.asSlice(&found.instructions)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      let operation = function.instruction(listed[at]).operation
+      let operands = function.operandsOf(listed[at])
+      let mut operand = usize.ZERO
+      while operand < operands.length {
+        let from = slotOf(&derived, operands[operand])
+        if from != usize.MAX && !addressUse(operation, operand) { List<bool>.set(&mut escaped, from, true) }
+        operand = operand + usize.ONE
+      }
+      at = at + usize.ONE
+    }
+    let mut from = slotOf(&derived, found.value)
+    if from != usize.MAX { List<bool>.set(&mut escaped, from, true) }
+    let edges = List<Edge>.asSlice(&found.edges)
+    let mut edge = usize.ZERO
+    while edge < edges.length {
+      let arguments = List<u64>.asSlice(&edges[edge].arguments)
+      let mut argument = usize.ZERO
+      while argument < arguments.length {
+        from = slotOf(&derived, arguments[argument])
+        if from != usize.MAX { List<bool>.set(&mut escaped, from, true) }
+        argument = argument + usize.ONE
+      }
+      edge = edge + usize.ONE
+    }
+    block = block + usize.ONE
+  }
+  return move escaped
+}
+
+fn slotOf(derived: &List<usize>, value: u64) -> usize {
+  if value == none() || u64.toUsize(value) >= List<usize>.length(&derived.*) { return usize.MAX }
+  return List<usize>.get(&derived.*, u64.toUsize(value))
+}
+
+// Whether operand `operand` of an `operation` instruction uses an address only to reach memory
+// there or to derive another address from it.
+fn addressUse(operation: Operation, operand: usize) -> bool {
+  return match operation {
+    Operation.Load {..} => true
+    Operation.Store {..} => operand == usize.ONE
+    Operation.CopyBytes {..} => true
+    Operation.Fill {..} => true
+    Operation.Offset {..} => true
+    Operation.Index => operand == usize.ZERO
+    _ => false
+  }
+}
+
+// Whether an `operation` instruction may read or write any memory a callee or another thread can
+// reach.
+fn clobbers(operation: Operation) -> bool {
+  return match operation {
+    Operation.Call {..} => true
+    Operation.CallIndirect => true
+    Operation.AtomicLoad => true
+    Operation.AtomicStore => true
+    Operation.AtomicModify {..} => true
+    Operation.CompareExchange => true
+    Operation.Fence => true
+    Operation.WasmMemoryGrow => true
+    Operation.WasmWait => true
+    Operation.WasmNotify => true
+    _ => false
+  }
+}
+
+// Copy expansion.
+
+// One piece of an expanded copy: its offset in the range and its kind.
+struct Piece {
+  offset: u64,
+  kind: Kind,
+}
+
+impl Copy for Piece {}
+
+// Whether a load and a store of `kind` carry every bit of its bytes unchanged.
+fn carriesBytes(kind: Kind) -> bool {
+  if kind.isUnit() { return false }
+  if kind.isVector() { return kind.bits % 8 == usize.ZERO && kind.bits <= 64 }
+  if kind.bits > 64 { return kind.bits == 128 }
+  return kind.bits == usize.ONE || kind.bits == kind.storeSize() * 8
+}
+
+/// Turns each `CopyBytes` and `Fill` of `function` of at most `limit` bytes into loads and
+/// stores; answers whether it turned any.
+pub effect fn expandCopies(function: &mut SsaFunction, limit: u64) -> bool ! OutOfMemoryError ? &mut Allocator {
+  // The fields each slot's loads and stores use.
+  let slots = function.slotCount()
+  let mut fields = run List<List<Piece>>.makeWithCapacity(slots)
+  let mut at = usize.ZERO
+  while at < slots {
+    run List<List<Piece>>.append(&mut fields, List<Piece>.make())
+    at = at + usize.ONE
+  }
+  let mut found = List<usize>.make()
+  let mut block = usize.ZERO
+  while block < function.blockCount() {
+    let listed = List<usize>.asSlice(&function.block(block).instructions)
+    at = usize.ZERO
+    while at < listed.length {
+      let instruction = listed[at]
+      let operands = function.operandsOf(instruction)
+      let current = function.instruction(instruction)
+      match current.operation {
+        Operation.Load {offset, ..} => { run notePiece(&function.*, &mut fields, operands[usize.ZERO], offset, current.kind) }
+        Operation.Store {offset, ..} => { run notePiece(&function.*, &mut fields, operands[usize.ONE], offset, function.kindOf(operands[usize.ZERO])) }
+        Operation.CopyBytes {size} => { if size != 0 && size <= limit { run List<usize>.append(&mut found, instruction) } }
+        Operation.Fill {size, ..} => { if size != 0 && size <= limit { run List<usize>.append(&mut found, instruction) } }
+        _ => {}
+      }
+      at = at + usize.ONE
+    }
+    block = block + usize.ONE
+  }
+  let copies = List<usize>.asSlice(&found)
+  at = usize.ZERO
+  while at < copies.length {
+    run expandOne(&mut function.*, List<List<Piece>>.asSlice(&fields), copies[at])
+    at = at + usize.ONE
+  }
+  function.sweep()
+  return copies.length != usize.ZERO
+}
+
+effect fn notePiece(function: &SsaFunction, fields: &mut List<List<Piece>>, address: u64, offset: u64, kind: Kind) -> () ! OutOfMemoryError ? &mut Allocator {
+  let place = placeOf(function, address, offset)
+  if place.form != BaseForm.Slot || !place.known || !carriesBytes(kind) { return () }
+  let listed = &mut List<List<Piece>>.asMutSlice(&mut fields.*)[u64.toUsize(place.base)]
+  let pieces = List<Piece>.asSlice(&listed.*)
+  let mut at = usize.ZERO
+  while at < pieces.length {
+    if pieces[at].offset == place.offset && pieces[at].kind.equals(kind) { return () }
+    at = at + usize.ONE
+  }
+  return run List<Piece>.append(&mut listed.*, Piece {offset: place.offset, kind: kind})
+}
+
+// The pieces `size` bytes from `start` of a slot with `fields` split into: the fields inside the
+// range where they do not overlap one another, and integers for the gaps. Empty when two fields
+// in the range overlap or none lies in it.
+effect fn tile(fields: &[Piece], start: u64, size: u64) -> List<Piece> ! OutOfMemoryError ? &mut Allocator {
+  let mut pieces = List<Piece>.make()
+  // A range no field lies in has nothing to follow.
+  let mut inside = false
+  let mut at = usize.ZERO
+  while at < fields.length {
+    if fields[at].offset >= start && fields[at].offset - start < size { inside = true }
+    at = at + usize.ONE
+  }
+  if !inside { return move pieces }
+  let mut cursor: u64 = 0
+  while cursor < size {
+    // The field that starts here, if one lies inside the range.
+    let mut chosen = usize.MAX
+    at = usize.ZERO
+    while at < fields.length {
+      let field = fields[at]
+      let width = usize.toU64(field.kind.storeSize())
+      if field.offset >= start && field.offset - start == cursor && cursor + width <= size {
+        if chosen != usize.MAX { return List<Piece>.make() }
+        chosen = at
+      }
+      at = at + usize.ONE
+    }
+    if chosen != usize.MAX {
+      run List<Piece>.append(&mut pieces, Piece {offset: cursor, kind: fields[chosen].kind})
+      cursor = cursor + usize.toU64(fields[chosen].kind.storeSize())
+      continue
+    }
+    // A field that covers this byte without starting here overlaps the tiling.
+    at = usize.ZERO
+    while at < fields.length {
+      let field = fields[at]
+      let width = usize.toU64(field.kind.storeSize())
+      if field.offset < start + cursor && field.offset + width > start + cursor && field.offset >= start && field.offset + width <= start + size {
+        return List<Piece>.make()
+      }
+      at = at + usize.ONE
+    }
+    // The widest integer up to the next field's start.
+    let mut room = size - cursor
+    at = usize.ZERO
+    while at < fields.length {
+      let field = fields[at]
+      if field.offset > start + cursor && field.offset < start + cursor + room { room = field.offset - start - cursor }
+      at = at + usize.ONE
+    }
+    let mut width: u64 = 8
+    while width > room { width = width / 2 }
+    run List<Piece>.append(&mut pieces, Piece {offset: cursor, kind: Kind.integer(u64.toUsize(width * 8))})
+    cursor = cursor + width
+  }
+  return move pieces
+}
+
+// Integers of 8, 4, 2 and 1 bytes covering `size` bytes.
+effect fn plainPieces(size: u64) -> List<Piece> ! OutOfMemoryError ? &mut Allocator {
+  let mut pieces = List<Piece>.make()
+  let mut cursor: u64 = 0
+  while cursor < size {
+    let mut width: u64 = 8
+    while width > size - cursor { width = width / 2 }
+    run List<Piece>.append(&mut pieces, Piece {offset: cursor, kind: Kind.integer(u64.toUsize(width * 8))})
+    cursor = cursor + width
+  }
+  return move pieces
+}
+
+effect fn piecesFor(function: &SsaFunction, fields: &[List<Piece>], address: u64, size: u64) -> List<Piece> ! OutOfMemoryError ? &mut Allocator {
+  let place = placeOf(function, address, 0)
+  if place.form != BaseForm.Slot || !place.known { return List<Piece>.make() }
+  return run tile(List<Piece>.asSlice(&fields[u64.toUsize(place.base)]), place.offset, size)
+}
+
+effect fn expandOne(function: &mut SsaFunction, fields: &[List<Piece>], instruction: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let found = function.instruction(instruction)
+  let destination = function.operandsOf(instruction)[usize.ZERO]
+  let mut source = none()
+  let mut size: u64 = 0
+  let mut byte: u64 = 0
+  match found.operation {
+    Operation.CopyBytes {size: copied} => {
+      size = copied
+      source = function.operandsOf(instruction)[usize.ONE]
+    }
+    Operation.Fill {byte: filler, size: filled} => {
+      size = filled
+      byte = u8.toU64(filler)
+    }
+    _ => { return () }
+  }
+  // A fill of another byte than zero writes integers, whose constants hold any byte pattern.
+  let mut pieces = List<Piece>.make()
+  if source != none() || byte == 0 { pieces = run piecesFor(&function.*, fields, destination, size) }
+  if List<Piece>.length(&pieces) == usize.ZERO && source != none() { pieces = run piecesFor(&function.*, fields, source, size) }
+  if List<Piece>.length(&pieces) == usize.ZERO { pieces = run plainPieces(size) }
+  let block = found.block
+  let mut position = positionIn(&function.*, block, instruction)
+  let listed = List<Piece>.asSlice(&pieces)
+  let mut values = run List<u64>.makeWithCapacity(listed.length)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let piece = listed[at]
+    let mut value = none()
+    if source != none() {
+      let operands = [source]
+      value = run function.insertInstruction(block, position, Operation.Load {offset: piece.offset, alignment: usize.ONE}, piece.kind, &operands, found.place)
+      position = position + usize.ONE
+    } else {
+      value = run fillValue(&mut function.*, piece.kind, byte)
+    }
+    run List<u64>.append(&mut values, value)
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < listed.length {
+    let operands = [List<u64>.get(&values, at), destination]
+    drop run function.insertInstruction(block, position, Operation.Store {offset: listed[at].offset, alignment: usize.ONE}, Kind.unit(), &operands, found.place)
+    position = position + usize.ONE
+    at = at + usize.ONE
+  }
+  function.remove(instruction)
+  return ()
+}
+
+// The constant of `kind` whose every byte is `byte`: a zero of any kind, or an integer of up to 8
+// bytes, which are the pieces a fill of another byte uses.
+effect fn fillValue(function: &mut SsaFunction, kind: Kind, byte: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  if byte == 0 { return run function.constant(kind, 0) }
+  let mut pattern: u64 = 0
+  let mut at = usize.ZERO
+  while at < 8 {
+    pattern = u64.bitOr(u64.shiftLeft(pattern, 8), byte)
+    at = at + usize.ONE
+  }
+  return run function.constant(kind, pattern)
+}
+
+fn positionIn(function: &SsaFunction, block: usize, instruction: usize) -> usize {
+  let listed = List<usize>.asSlice(&function.block(block).instructions)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if listed[at] == instruction { return at }
+    at = at + usize.ONE
+  }
+  return listed.length
+}
+
+// Forwarding.
+
+// What memory holds at a place: `size` bytes of `kind`, the value `value`.
+struct Held {
+  place: Place,
+  size: u64,
+  kind: Kind,
+  value: u64,
+  alive: bool,
+}
+
+impl Copy for Held {}
+
+// How many of the newest held entries an access is checked against.
+fn window() -> usize { return 128 }
+
+struct Forwarding {
+  held: List<Held>,
+  // Entries below `floor` are not visible: a merge started from nothing.
+  floor: usize,
+  killed: List<usize>,
+  substitution: List<u64>,
+  escaped: List<bool>,
+  bits: usize,
+  changed: bool,
+}
+
+/// Forwards stored and loaded values to the loads that read them again, removes stores of the
+/// value a place holds, then removes stores into slots that do not escape that nothing reads;
+/// answers whether it changed anything.
+pub effect fn forward(function: &mut SsaFunction) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let graph = run SsaGraph.of(&function.*)
+  let escaped = run escapedSlots(&function.*)
+  let mut state = Forwarding {held: List<Held>.make(), floor: usize.ZERO, killed: List<usize>.make(), substitution: List<u64>.make(), escaped: move escaped,
+    bits: function.addressBits, changed: false}
+  run List<u64>.appendRepeated(&mut state.substitution, none(), function.valueCount())
+  // Entries: a block to enter, or `usize.MAX - mark` to leave the mark at that position.
+  let mut marks = List<usize>.make()
+  let mut walk = List<usize>.make()
+  run List<usize>.append(&mut walk, usize.ZERO)
+  let blocks = function.blockCount()
+  while let Option<usize>.Some {value: next} = List<usize>.pop(&mut walk) {
+    if next > blocks {
+      let mark = usize.MAX - next
+      let held = List<usize>.get(&marks, mark)
+      let killed = List<usize>.get(&marks, mark + usize.ONE)
+      state.floor = List<usize>.get(&marks, mark + 2)
+      List<Held>.truncate(&mut state.held, held)
+      while List<usize>.length(&state.killed) > killed {
+        let last = List<usize>.length(&state.killed) - usize.ONE
+        let revived = List<usize>.get(&state.killed, last)
+        if revived < List<Held>.length(&state.held) {
+          let held = List<Held>.asMutSlice(&mut state.held)
+          held[revived].alive = true
+        }
+        List<usize>.truncate(&mut state.killed, last)
+      }
+      List<usize>.truncate(&mut marks, mark)
+      continue
+    }
+    let block = next
+    let mark = List<usize>.length(&marks)
+    run List<usize>.append(&mut marks, List<Held>.length(&state.held))
+    run List<usize>.append(&mut marks, List<usize>.length(&state.killed))
+    run List<usize>.append(&mut marks, state.floor)
+    run List<usize>.append(&mut walk, usize.MAX - mark)
+    if graph.predecessorsOf(block).length != usize.ONE { state.floor = List<Held>.length(&state.held) }
+    run forwardBlock(&mut state, &mut function.*, block)
+    let children = graph.childrenOf(block)
+    let mut child = children.length
+    while child > usize.ZERO {
+      child = child - usize.ONE
+      run List<usize>.append(&mut walk, children[child])
+    }
+  }
+  if state.changed {
+    function.substitute(&mut state.substitution)
+    function.sweep()
+  }
+  let removed = run removeUnreadStores(&mut function.*, List<bool>.asSlice(&state.escaped))
+  return state.changed || removed
+}
+
+fn resolved(state: &Forwarding, value: u64) -> u64 {
+  let mut at = value
+  while at != none() && u64.toUsize(at) < List<u64>.length(&state.substitution) && List<u64>.get(&state.substitution, u64.toUsize(at)) != none() {
+    at = List<u64>.get(&state.substitution, u64.toUsize(at))
+  }
+  return at
+}
+
+// The newest visible entry holding exactly `size` bytes of `kind` at `place`, or `usize.MAX`.
+fn heldAt(state: &Forwarding, place: Place, size: u64, kind: Kind) -> usize {
+  if !place.known { return usize.MAX }
+  let held = List<Held>.asSlice(&state.held)
+  let mut at = held.length
+  let mut seen = usize.ZERO
+  while at > state.floor && seen < window() {
+    at = at - usize.ONE
+    seen = seen + usize.ONE
+    let entry = held[at]
+    if entry.alive && entry.place.known && entry.place.form == place.form && entry.place.base == place.base && entry.place.offset == place.offset
+      && entry.size == size && entry.kind.equals(kind) {
+      return at
+    }
+  }
+  return usize.MAX
+}
+
+// Forgets the visible entries `size` bytes at `place` may overwrite.
+effect fn kill(state: &mut Forwarding, place: Place, size: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let length = List<Held>.length(&state.held)
+  let mut at = length
+  let mut seen = usize.ZERO
+  while at > state.floor && seen < window() {
+    at = at - usize.ONE
+    seen = seen + usize.ONE
+    let entry = List<Held>.get(&state.held, at)
+    if entry.alive && mayAlias(entry.place, entry.size, place, size, List<bool>.asSlice(&state.escaped), state.bits) {
+      let held = List<Held>.asMutSlice(&mut state.held)
+      held[at].alive = false
+      run List<usize>.append(&mut state.killed, at)
+    }
+  }
+  return ()
+}
+
+// Forgets every visible entry but those of slots that do not escape.
+effect fn clobber(state: &mut Forwarding) -> () ! OutOfMemoryError ? &mut Allocator {
+  let length = List<Held>.length(&state.held)
+  let mut at = length
+  let mut seen = usize.ZERO
+  while at > state.floor && seen < window() {
+    at = at - usize.ONE
+    seen = seen + usize.ONE
+    let entry = List<Held>.get(&state.held, at)
+    let private = entry.place.form == BaseForm.Slot && !List<bool>.get(&state.escaped, u64.toUsize(entry.place.base))
+    if entry.alive && !private {
+      let held = List<Held>.asMutSlice(&mut state.held)
+      held[at].alive = false
+      run List<usize>.append(&mut state.killed, at)
+    }
+  }
+  return ()
+}
+
+effect fn forwardBlock(state: &mut Forwarding, function: &mut SsaFunction, block: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let count = List<usize>.length(&function.block(block).instructions)
+  let mut at = usize.ZERO
+  while at < count {
+    let instruction = List<usize>.get(&function.block(block).instructions, at)
+    let found = function.instruction(instruction)
+    match found.operation {
+      Operation.Load {offset, ..} => {
+        let place = placeOf(&function.*, resolved(&state.*, function.operandsOf(instruction)[usize.ZERO]), offset)
+        let size = usize.toU64(found.kind.storeSize())
+        let earlier = heldAt(&state.*, place, size, found.kind)
+        if earlier != usize.MAX {
+          List<u64>.set(&mut state.substitution, u64.toUsize(found.result), List<Held>.get(&state.held, earlier).value)
+          function.remove(instruction)
+          state.changed = true
+        } else if place.known {
+          run List<Held>.append(&mut state.held, Held {place: place, size: size, kind: found.kind, value: found.result, alive: true})
+        }
+      }
+      Operation.Store {offset, ..} => {
+        let operands = function.operandsOf(instruction)
+        let value = resolved(&state.*, operands[usize.ZERO])
+        let place = placeOf(&function.*, resolved(&state.*, operands[usize.ONE]), offset)
+        let kind = function.kindOf(value)
+        let size = usize.toU64(kind.storeSize())
+        let earlier = heldAt(&state.*, place, size, kind)
+        if earlier != usize.MAX && resolved(&state.*, List<Held>.get(&state.held, earlier).value) == value {
+          function.remove(instruction)
+          state.changed = true
+        } else {
+          run kill(&mut state.*, place, size)
+          if place.known { run List<Held>.append(&mut state.held, Held {place: place, size: size, kind: kind, value: value, alive: true}) }
+        }
+      }
+      Operation.CopyBytes {size} => {
+        let place = placeOf(&function.*, resolved(&state.*, function.operandsOf(instruction)[usize.ZERO]), 0)
+        run kill(&mut state.*, place, size)
+      }
+      Operation.Fill {size, ..} => {
+        let place = placeOf(&function.*, resolved(&state.*, function.operandsOf(instruction)[usize.ZERO]), 0)
+        run kill(&mut state.*, place, size)
+      }
+      _ => { if clobbers(found.operation) { run clobber(&mut state.*) } }
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Removes each store, fill and copy into a slot that does not escape whose bytes no load or copy
+// of the function reads; answers whether it removed any.
+effect fn removeUnreadStores(function: &mut SsaFunction, escaped: &[bool]) -> bool ! OutOfMemoryError ? &mut Allocator {
+  if function.slotCount() == usize.ZERO { return false }
+  // The places each read covers.
+  let mut reads = List<Place>.make()
+  let mut readSizes = List<u64>.make()
+  let mut writes = List<usize>.make()
+  let mut block = usize.ZERO
+  while block < function.blockCount() {
+    let listed = List<usize>.asSlice(&function.block(block).instructions)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      let instruction = listed[at]
+      let found = function.instruction(instruction)
+      let operands = function.operandsOf(instruction)
+      match found.operation {
+        Operation.Load {offset, ..} => {
+          let place = placeOf(&function.*, operands[usize.ZERO], offset)
+          if place.form == BaseForm.Slot {
+            run List<Place>.append(&mut reads, place)
+            run List<u64>.append(&mut readSizes, usize.toU64(found.kind.storeSize()))
+          }
+        }
+        Operation.CopyBytes {size} => {
+          let from = placeOf(&function.*, operands[usize.ONE], 0)
+          if from.form == BaseForm.Slot {
+            run List<Place>.append(&mut reads, from)
+            run List<u64>.append(&mut readSizes, size)
+          }
+          if writesPrivately(&function.*, escaped, operands[usize.ZERO]) && SsaDeadCode.inFrame(&function.*, operands[usize.ONE]) { run List<usize>.append(&mut writes, instruction) }
+        }
+        Operation.Store {..} => { if writesPrivately(&function.*, escaped, operands[usize.ONE]) { run List<usize>.append(&mut writes, instruction) } }
+        Operation.Fill {..} => { if writesPrivately(&function.*, escaped, operands[usize.ZERO]) { run List<usize>.append(&mut writes, instruction) } }
+        _ => {}
+      }
+      at = at + usize.ONE
+    }
+    block = block + usize.ONE
+  }
+  let candidates = List<usize>.asSlice(&writes)
+  let read = List<Place>.asSlice(&reads)
+  let sizes = List<u64>.asSlice(&readSizes)
+  let mut removed = false
+  let mut at = usize.ZERO
+  while at < candidates.length {
+    let instruction = candidates[at]
+    let found = function.instruction(instruction)
+    let operands = function.operandsOf(instruction)
+    let mut place = placeOf(&function.*, operands[usize.ZERO], 0)
+    let mut size: u64 = 0
+    match found.operation {
+      Operation.Store {offset, ..} => {
+        place = placeOf(&function.*, operands[usize.ONE], offset)
+        size = usize.toU64(function.kindOf(operands[usize.ZERO]).storeSize())
+      }
+      Operation.Fill {size: filled, ..} => { size = filled }
+      Operation.CopyBytes {size: copied} => { size = copied }
+      _ => {}
+    }
+    let mut unread = true
+    let mut other = usize.ZERO
+    while other < read.length && unread {
+      if mayAlias(read[other], sizes[other], place, size, escaped, function.addressBits) { unread = false }
+      other = other + usize.ONE
+    }
+    if unread {
+      function.remove(instruction)
+      removed = true
+    }
+    at = at + usize.ONE
+  }
+  if removed { function.sweep() }
+  return removed
+}
+
+// Whether `address` is in a slot that does not escape.
+fn writesPrivately(function: &SsaFunction, escaped: &[bool], address: u64) -> bool {
+  let place = placeOf(function, address, 0)
+  return place.form == BaseForm.Slot && !escaped[u64.toUsize(place.base)]
+}

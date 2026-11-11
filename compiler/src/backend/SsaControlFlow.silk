@@ -1,0 +1,259 @@
+//! Control flow simplification of one SSA function: branches on constants become jumps, a block
+//! joins its only predecessor, jumps skip empty blocks, and unreachable blocks and parameters
+//! that pass one value go away.
+//!
+//! # When to use
+//! Run [`simplify`] in an optimized build after promotion and after each pass that can decide a
+//! branch, such as value numbering. A lowering ends a block at every MIR call and check, so
+//! merging gives the later passes and the emitter longer blocks to work in.
+//!
+//! # Details
+//! One round of [`simplify`] does, in order:
+//!
+//! 1. A branch on a constant, or whose two edges go to one block with the same arguments, becomes
+//!    a jump; so does a switch on a constant (to the first case it equals, else the default) or
+//!    whose edges all agree.
+//! 2. An edge into a block that holds no instruction and jumps on goes straight to that block's
+//!    target, with the arguments it would have passed, when the skipped block's parameters feed
+//!    nothing but its own jump.
+//! 3. A block whose only predecessor jumps to it is appended to that predecessor, its parameters
+//!    replaced by the arguments of that jump.
+//! 4. The blocks no path from the entry reaches are removed (`SsaFunction.compact`), and block
+//!    parameters every edge passes one value for, or that feed nothing, are removed
+//!    (`SsaPromotion.pruneParameters`).
+//!
+//! Rounds repeat until one changes nothing, at most [`rounds`] times. Nothing here changes what
+//! an instruction computes or the order of the instructions on any path, so traps and side
+//! effects happen as before; a trap block that becomes unreachable is one no execution could
+//! reach. Blocks keep their relative order, so numbering depends only on the function.
+
+import backend.SsaFunction {Edge, Exit, SsaFunction, none}
+import backend.SsaGraph {SsaGraph}
+import backend.SsaPromotion
+import silk.collections.list {List}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.u64
+import silk.num.usize
+
+/// The most rounds one [`simplify`] runs.
+pub fn rounds() -> usize { return 8 }
+
+/// Simplifies the control flow of `function` until a round changes nothing, at most [`rounds`]
+/// times; answers whether it changed anything.
+pub effect fn simplify(function: &mut SsaFunction) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut changed = false
+  let mut round = usize.ZERO
+  while round < rounds() {
+    let mut now = run foldExits(&mut function.*)
+    if run threadJumps(&mut function.*) { now = true }
+    if run function.compact() { now = true }
+    if run mergeBlocks(&mut function.*) { now = true }
+    if run function.compact() { now = true }
+    let parameters = parameterCount(&function.*)
+    run SsaPromotion.pruneParameters(&mut function.*)
+    if parameterCount(&function.*) != parameters { now = true }
+    if !now { break }
+    changed = true
+    round = round + usize.ONE
+  }
+  return changed
+}
+
+fn parameterCount(function: &SsaFunction) -> usize {
+  let mut total = usize.ZERO
+  let mut block = usize.ZERO
+  while block < function.blockCount() {
+    total = total + List<u64>.length(&function.block(block).parameters)
+    block = block + usize.ONE
+  }
+  return total
+}
+
+fn sameArguments(left: &Edge, right: &Edge) -> bool {
+  if left.block != right.block { return false }
+  let a = List<u64>.asSlice(&left.arguments)
+  let b = List<u64>.asSlice(&right.arguments)
+  if a.length != b.length { return false }
+  let mut at = usize.ZERO
+  while at < a.length {
+    if a[at] != b[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+/// Turns each branch and switch whose edge is decided into a jump along it; answers whether it
+/// changed any.
+pub effect fn foldExits(function: &mut SsaFunction) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut changed = false
+  let mut block = usize.ZERO
+  while block < function.blockCount() {
+    let taken = decidedEdge(&function.*, block)
+    if taken != usize.MAX {
+      let edge = run edgeCopy(&function.*, block, taken)
+      run function.setJump(block, edge.block, List<u64>.asSlice(&edge.arguments))
+      changed = true
+    }
+    block = block + usize.ONE
+  }
+  return changed
+}
+
+// The edge a branch or switch of `block` always takes, or `usize.MAX`.
+fn decidedEdge(function: &SsaFunction, block: usize) -> usize {
+  let found = function.block(block)
+  if found.exit != Exit.Branch && found.exit != Exit.Switch { return usize.MAX }
+  let edges = List<Edge>.asSlice(&found.edges)
+  if function.isBits(found.value) {
+    let bits = function.constantOf(found.value).low
+    if found.exit == Exit.Branch {
+      if bits != 0 { return usize.ZERO }
+      return usize.ONE
+    }
+    let cases = List<u64>.asSlice(&found.cases)
+    let mut at = usize.ZERO
+    while at < cases.length {
+      if cases[at] == bits { return at + usize.ONE }
+      at = at + usize.ONE
+    }
+    return usize.ZERO
+  }
+  let mut at = usize.ONE
+  while at < edges.length {
+    if !sameArguments(&edges[usize.ZERO], &edges[at]) { return usize.MAX }
+    at = at + usize.ONE
+  }
+  return usize.ZERO
+}
+
+// Whether `block` holds no instruction, jumps on to another block, and its parameters feed
+// nothing but that jump's arguments.
+fn skippable(function: &SsaFunction, uses: &[usize], block: usize) -> bool {
+  let found = function.block(block)
+  if block == usize.ZERO || found.exit != Exit.Jump || List<usize>.length(&found.instructions) != usize.ZERO { return false }
+  let edge = &List<Edge>.asSlice(&found.edges)[usize.ZERO]
+  if edge.block == block { return false }
+  let parameters = List<u64>.asSlice(&found.parameters)
+  let arguments = List<u64>.asSlice(&edge.arguments)
+  let mut at = usize.ZERO
+  while at < parameters.length {
+    let mut inJump = usize.ZERO
+    let mut argument = usize.ZERO
+    while argument < arguments.length {
+      if arguments[argument] == parameters[at] { inJump = inJump + usize.ONE }
+      argument = argument + usize.ONE
+    }
+    if uses[u64.toUsize(parameters[at])] != inJump { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+/// Points every edge into a skippable empty block at that block's target; answers whether it
+/// moved any.
+pub effect fn threadJumps(function: &mut SsaFunction) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let uses = run function.useCounts()
+  let count = function.blockCount()
+  let mut changed = false
+  let mut from = usize.ZERO
+  while from < count {
+    let edges = List<Edge>.length(&function.block(from).edges)
+    let mut edge = usize.ZERO
+    while edge < edges {
+      let through = List<Edge>.asSlice(&function.block(from).edges)[edge].block
+      if through != from && skippable(&function.*, List<usize>.asSlice(&uses), through) {
+        let threaded = run threadedEdge(&function.*, from, edge, through)
+        run function.setEdge(from, edge, threaded.block, List<u64>.asSlice(&threaded.arguments))
+        changed = true
+      }
+      edge = edge + usize.ONE
+    }
+    from = from + usize.ONE
+  }
+  return changed
+}
+
+// The target of `block`'s jump, or `usize.MAX` when it does not end in one.
+fn jumpTarget(function: &SsaFunction, block: usize) -> usize {
+  let found = function.block(block)
+  if found.exit != Exit.Jump { return usize.MAX }
+  return List<Edge>.asSlice(&found.edges)[usize.ZERO].block
+}
+
+// Edge `edge` of `from`, which leads to the skippable block `through`, led on to that block's
+// target with the arguments it would have passed.
+effect fn threadedEdge(function: &SsaFunction, from: usize, edge: usize, through: usize) -> Edge ! OutOfMemoryError ? &mut Allocator {
+  let skipped = function.block(through)
+  let onward = &List<Edge>.asSlice(&skipped.edges)[usize.ZERO]
+  let parameters = List<u64>.asSlice(&skipped.parameters)
+  let incoming = List<u64>.asSlice(&List<Edge>.asSlice(&function.block(from).edges)[edge].arguments)
+  let passed = List<u64>.asSlice(&onward.arguments)
+  let mut arguments = run List<u64>.makeWithCapacity(passed.length)
+  let mut at = usize.ZERO
+  while at < passed.length {
+    let mut value = passed[at]
+    let mut position = usize.ZERO
+    while position < parameters.length {
+      if parameters[position] == passed[at] { value = incoming[position] }
+      position = position + usize.ONE
+    }
+    run List<u64>.append(&mut arguments, value)
+    at = at + usize.ONE
+  }
+  return Edge {block: onward.block, arguments: move arguments}
+}
+
+// A copy of edge `edge` of `block`.
+effect fn edgeCopy(function: &SsaFunction, block: usize, edge: usize) -> Edge ! OutOfMemoryError ? &mut Allocator {
+  let found = &List<Edge>.asSlice(&function.block(block).edges)[edge]
+  let mut arguments = List<u64>.make()
+  run List<u64>.appendSlice(&mut arguments, List<u64>.asSlice(&found.arguments))
+  return Edge {block: found.block, arguments: move arguments}
+}
+
+/// Appends each block whose only predecessor jumps to it to that predecessor; answers whether it
+/// merged any. The merged blocks are left unreachable for `SsaFunction.compact`.
+pub effect fn mergeBlocks(function: &mut SsaFunction) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let graph = run SsaGraph.of(&function.*)
+  let count = function.blockCount()
+  let mut incoming = run List<usize>.makeWithCapacity(count)
+  let mut block = usize.ZERO
+  while block < count {
+    run List<usize>.append(&mut incoming, graph.predecessorsOf(block).length)
+    block = block + usize.ONE
+  }
+  let mut merged = run List<bool>.makeWithCapacity(count)
+  run List<bool>.appendRepeated(&mut merged, false, count)
+  let mut substitution = run List<u64>.makeWithCapacity(function.valueCount())
+  run List<u64>.appendRepeated(&mut substitution, none(), function.valueCount())
+  let mut changed = false
+  block = usize.ZERO
+  while block < count {
+    if !List<bool>.get(&merged, block) && graph.reaches(block) {
+      while true {
+        let target = jumpTarget(&function.*, block)
+        if target == usize.MAX { break }
+        if target == block || target == usize.ZERO || List<usize>.get(&incoming, target) != usize.ONE { break }
+        // The target's parameters become the jump's arguments.
+        let parameters = List<u64>.length(&function.block(target).parameters)
+        let mut at = usize.ZERO
+        while at < parameters {
+          let parameter = List<u64>.get(&function.block(target).parameters, at)
+          let argument = List<u64>.get(&List<Edge>.asSlice(&function.block(block).edges)[usize.ZERO].arguments, at)
+          List<u64>.set(&mut substitution, u64.toUsize(parameter), argument)
+          at = at + usize.ONE
+        }
+        while List<u64>.length(&function.block(target).parameters) > usize.ZERO {
+          let last = List<u64>.length(&function.block(target).parameters) - usize.ONE
+          function.removeParameter(target, last)
+        }
+        run function.mergeBlock(block, target)
+        List<bool>.set(&mut merged, target, true)
+        changed = true
+      }
+    }
+    block = block + usize.ONE
+  }
+  if changed { function.substitute(&mut substitution) }
+  return changed
+}
