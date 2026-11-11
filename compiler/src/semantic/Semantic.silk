@@ -527,6 +527,10 @@ pub enum Family {
   OriginValidate,
   /// A backend-neutral control-flow graph for one closed runtime instance.
   Mir,
+  /// What an inlining caller needs to know of one instance's un-inlined MIR before it reads the
+  /// body: whether it is inlinable, and the instances it then calls. Its answer has an exact
+  /// fingerprint, so an edit that leaves it equal does not lower the callers again.
+  InlineSummary,
   /// Backend-neutral storage, field offsets and ABI facts for one type on this store's target.
   Layout,
   /// Whether one type has no runtime layout (STATIC-009). The key names the type by its
@@ -592,6 +596,7 @@ fn familyName(family: Family) -> string<'static> {
     Family.OriginSolve => "OriginSolve"
     Family.OriginValidate => "OriginValidate"
     Family.Mir => "Mir"
+    Family.InlineSummary => "InlineSummary"
     Family.Layout => "Layout"
     Family.PhaseOnly => "PhaseOnly"
     Family.StaticRouting => "StaticRouting"
@@ -1003,6 +1008,10 @@ pub union Value {
   OriginPlan {pub index: usize},
   OriginEvidence {pub index: usize},
   Mir {pub index: usize},
+  /// Whether an instance's un-inlined MIR is inlinable at a call that is not a suspension point
+  /// and, when it is, the instances it calls with their encodings in order. Nothing else of the
+  /// body is in it, so an edit that keeps both does not lower the callers that read it again.
+  InlineSummary {pub inlinable: bool, pub callees: List<InstanceKey>, pub encodings: Bytes},
   /// The position of a target layout answer in this store's immutable answer arena.
   Layout {pub index: usize},
   /// This target-neutral type has no layout in the current backend subset.
@@ -1497,7 +1506,7 @@ fn hashKey(hashed: u64, key: Key) -> u64 {
   let named = Hash.combine(Hash.combine(hashed, u8.toU64(Family.value(key.family))), usize.toU64(key.name))
   if key.family == Family.Layout || key.family == Family.LlvmText { return named }
   let placed = Hash.combine(Hash.combine(named, usize.toU64(key.module)), usize.toU64(key.declaration))
-  if key.family == Family.Mir || key.family == Family.EmissionInputs { return placed }
+  if key.family == Family.Mir || key.family == Family.InlineSummary || key.family == Family.EmissionInputs { return placed }
   let member = Hash.combine(placed, usize.toU64(key.member))
   if key.external {
     return Hash.combine(member, 1)
@@ -5160,6 +5169,7 @@ fn sameValue(left: &Value, right: &Value) -> bool {
       _ => false
     }
     Value.Mir {..} => false
+    Value.InlineSummary {..} => false
     Value.Layout {..} => false
     Value.LayoutUnsupported => false
     Value.OriginPlan {..} => false
@@ -5456,7 +5466,8 @@ fn sameKey(left: Key, right: Key) -> bool {
   if left.family == Family.LlvmText || right.family == Family.LlvmText {
     return left.family == right.family && left.name == right.name
   }
-  if left.family == Family.Mir || left.family == Family.EmissionInputs || right.family == Family.Mir || right.family == Family.EmissionInputs {
+  if left.family == Family.Mir || left.family == Family.InlineSummary || left.family == Family.EmissionInputs
+    || right.family == Family.Mir || right.family == Family.InlineSummary || right.family == Family.EmissionInputs {
     return left.family == right.family && left.name == right.name && left.module == right.module && left.declaration == right.declaration
   }
   return left.family == right.family && left.module == right.module && left.name == right.name && left.declaration == right.declaration && left.member == right.member && left.external == right.external
@@ -8402,6 +8413,7 @@ effect fn resolveOtherFamily(
     Family.OpaqueRealization => run resolveOpaqueRealization(&mut resolver.*, &mut owner.*, key)
     Family.CallableOrigin => run resolveCallableOrigin(&mut resolver.*, &mut owner.*, key)
     Family.Mir => run lowerMir(&mut resolver.*, &mut owner.*, key)
+    Family.InlineSummary => run resolveInlineSummary(&mut resolver.*, &mut owner.*, key)
     Family.Layout => run resolveLayout(&mut resolver.*, &mut owner.*, key)
     Family.PhaseOnly => run resolvePhaseOnly(&mut resolver.*, &mut owner.*, key)
     Family.StaticRouting => run resolveStaticRouting(&mut resolver.*, &mut owner.*, key)
@@ -8689,6 +8701,7 @@ fn valueTag(value: &Value) -> u64 {
     Value.InherentMember {..} => 26
     Value.StaticRouting {..} => 27
     Value.CleanupFree {..} => 28
+    Value.InlineSummary {..} => 29
     _ => 0
   }
 }
@@ -8798,6 +8811,11 @@ fn fingerprintValue(writer: &mut AnswerFingerprint.Writer, value: &Value) -> () 
     Value.ProfileInput {slot} => { AnswerFingerprint.count(&mut writer.*, slot) }
     Value.LayoutUnsupported => {}
     Value.Initializer {value: published, ..} => { StaticValue.fingerprint(&mut writer.*, &published) }
+    Value.InlineSummary {inlinable, callees, encodings} => {
+      AnswerFingerprint.flag(&mut writer.*, inlinable)
+      AnswerFingerprint.count(&mut writer.*, List<InstanceKey>.length(&callees))
+      AnswerFingerprint.text(&mut writer.*, Bytes.asSlice(&encodings))
+    }
     _ => { AnswerFingerprint.incomplete(&mut writer.*) }
   }
   return ()
@@ -79781,6 +79799,86 @@ struct InlineVerdict {
   closed: bool,
 }
 
+// Summarizes the un-inlined MIR of the instance `key` names (`Family.InlineSummary`).
+effect fn resolveInlineSummary(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, key: Key) -> Answer
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut dependencies = List<Dependency>.make()
+  let lowered = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies, Key {family: Family.Mir, module: key.module,
+    declaration: key.declaration, member: key.member, name: key.name, external: false}, Span.make(usize.ZERO, usize.ZERO))
+  let mut inlinable = false
+  let mut callees = List<InstanceKey>.make()
+  let mut encodings = Bytes.make()
+  if let Option<usize>.Some {value: index} = move Shared<Result<Answer, NoRejection>>.with<Option<usize>>(&lowered, answerMirIndex) {
+    let function = &List<MirFunction>.asSlice(&resolver.mirValues)[index]
+    inlinable = MirInline.inlinable(function)
+    let blocks = List<MirBlock>.asSlice(&function.blocks)
+    let mut at = usize.ZERO
+    while inlinable && at < blocks.length {
+      if let MirTerminator.Call {callee: MirCallee.Instance {key: called}, ..} = &blocks[at].terminator {
+        let encoded = run InstanceKey.encoding(&called)
+        run Bytes.append(&mut encodings, Bytes.asSlice(&encoded))
+        run List<InstanceKey>.append(&mut callees, InstanceKey.copy(&called))
+      }
+      at = at + usize.ONE
+    }
+  }
+  return memberSuccess(Value.InlineSummary {inlinable: inlinable, callees: move callees, encodings: move encodings},
+    move dependencies)
+}
+
+// The inline summary of `selected`'s un-inlined MIR, as a recorded dependency of the caller: whether
+// it is inlinable, and its callees. None when it has no MIR.
+struct InlineFacts {
+  inlinable: bool,
+  callees: List<InstanceKey>,
+}
+
+effect fn inlineFacts(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut List<Dependency>,
+  selected: &InstanceKey, observing: bool, facts: &Option<CoroutineFacts>) -> Option<InlineFacts>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let location = match move run locationOfInstance(&mut resolver.*, selected) {
+    Option<InstanceLocation>.Some {value} => value
+    Option<InstanceLocation>.None => { return Option<InlineFacts>.none() }
+  }
+  let variant = run exactBackendVariant(&mut resolver.*, selected, observing, facts, true)
+  let request = run internDeclaration(&mut resolver.*, Key {family: Family.InlineSummary, module: location.module,
+    declaration: location.declaration, member: instanceMember(selected), name: variant, external: false})
+  let answer = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies.*, request, Span.make(usize.ZERO, usize.ZERO))
+  let listed = Shared<Result<Answer, NoRejection>>.with<usize>(&answer, fn(held: &Result<Answer, NoRejection>) -> usize {
+    if let Result<Answer, NoRejection>.Success {value} = &held.* {
+      if let Outcome.Success {value: Value.InlineSummary {callees, ..}} = &value.outcome { return List<InstanceKey>.length(&callees) }
+    }
+    return usize.ZERO
+  })
+  let mut inlinable = false
+  let mut present = false
+  Shared<Result<Answer, NoRejection>>.with<()>(&answer, fn(held: &Result<Answer, NoRejection>) -> () {
+    if let Result<Answer, NoRejection>.Success {value} = &held.* {
+      if let Outcome.Success {value: Value.InlineSummary {inlinable: candidate, ..}} = &value.outcome {
+        inlinable = candidate
+        present = true
+      }
+    }
+    return ()
+  })
+  if !present { return Option<InlineFacts>.none() }
+  let mut callees = run List<InstanceKey>.makeWithCapacity(listed)
+  let mut at = usize.ZERO
+  while at < listed {
+    let key = Shared<Result<Answer, NoRejection>>.with<Option<InstanceKey>>(&answer, fn(held: &Result<Answer, NoRejection>) -> Option<InstanceKey> {
+      if let Result<Answer, NoRejection>.Success {value} = &held.* {
+        if let Outcome.Success {value: Value.InlineSummary {callees: named, ..}} = &value.outcome {
+          return Option<InstanceKey>.some(InstanceKey.copy(&List<InstanceKey>.asSlice(&named)[at]))
+        }
+      }
+      return Option<InstanceKey>.none()
+    })
+    if let Option<InstanceKey>.Some {value} = move key { run List<InstanceKey>.append(&mut callees, move value) }
+    at = at + usize.ONE
+  }
+  return Option<InlineFacts>.some(InlineFacts {inlinable: inlinable, callees: move callees})
+}
+
 // The un-inlined MIR of `selected` that an inlining caller reads, as a recorded dependency of
 // the caller; none when it has none.
 effect fn rawMir(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut List<Dependency>,
@@ -79811,22 +79909,12 @@ effect fn closedBody(resolver: &mut Resolver, owner: &mut Query<Answer, NoReject
     if run InstanceKey.sameInstance(&known[at].key, selected) { return known[at].closed }
     at = at + usize.ONE
   }
-  let index = match move run rawMir(&mut resolver.*, &mut owner.*, &mut dependencies.*, selected, observing, facts) {
-    Option<usize>.Some {value} => value
-    Option<usize>.None => { return false }
+  let summary = match move run inlineFacts(&mut resolver.*, &mut owner.*, &mut dependencies.*, selected, observing, facts) {
+    Option<InlineFacts>.Some {value} => move value
+    Option<InlineFacts>.None => { return false }
   }
-  let mut closed = MirInline.inlinable(&List<MirFunction>.asSlice(&resolver.mirValues)[index])
-  let mut callees = List<InstanceKey>.make()
-  if closed {
-    let blocks = List<MirBlock>.asSlice(&List<MirFunction>.asSlice(&resolver.mirValues)[index].blocks)
-    at = usize.ZERO
-    while at < blocks.length {
-      if let MirTerminator.Call {callee: MirCallee.Instance {key}, ..} = &blocks[at].terminator {
-        run List<InstanceKey>.append(&mut callees, InstanceKey.copy(&key))
-      }
-      at = at + usize.ONE
-    }
-  }
+  let mut closed = summary.inlinable
+  let callees = move summary.callees
   run List<InstanceKey>.append(&mut chain.*, InstanceKey.copy(selected))
   let listed = List<InstanceKey>.asSlice(&callees)
   at = usize.ZERO
@@ -79960,21 +80048,29 @@ effect fn inlineCalls(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejec
       ancestor = prior[ancestor].parent
     }
     if recursive { continue }
+    // A call that is not a suspension point reads the callee's summary first, so the caller
+    // depends on the body of a callee it does not inline only through that summary.
+    if !suspending && !framed {
+      let mut chain = List<InstanceKey>.make()
+      if !run closedBody(&mut resolver.*, &mut owner.*, &mut dependencies.*, &selected, observing, &rawFacts, &mut chain,
+        &mut verdicts) { continue }
+    }
     let index = match move run rawMir(&mut resolver.*, &mut owner.*, &mut dependencies.*, &selected, observing, &rawFacts) {
       Option<usize>.Some {value} => value
       Option<usize>.None => { continue }
     }
     let functions = List<MirFunction>.asSlice(&resolver.mirValues)
     if MirInline.size(&function.*) + MirInline.size(&functions[index]) > limit { continue }
-    let mut allowed = false
+    let mut allowed = !suspending && !framed
     if suspending {
       allowed = MirInline.eligible(&functions[index])
-    } else if framed && MirInline.valueForwarder(&functions[index]) {
-      allowed = true
-    } else {
-      let mut chain = List<InstanceKey>.make()
-      allowed = run closedBody(&mut resolver.*, &mut owner.*, &mut dependencies.*, &selected, observing, &rawFacts, &mut chain,
-        &mut verdicts)
+    } else if framed {
+      allowed = MirInline.valueForwarder(&functions[index])
+      if !allowed {
+        let mut chain = List<InstanceKey>.make()
+        allowed = run closedBody(&mut resolver.*, &mut owner.*, &mut dependencies.*, &selected, observing, &rawFacts, &mut chain,
+          &mut verdicts)
+      }
     }
     if !allowed { continue }
     let bodies = List<MirFunction>.asSlice(&resolver.mirValues)
