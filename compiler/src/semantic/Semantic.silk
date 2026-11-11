@@ -160,6 +160,7 @@ import semantic.DeclarationTable
 import semantic.StableKey
 import semantic.CacheImage
 import semantic.BuildRecord
+import semantic.WalkShare {WalkShared}
 import semantic.FinalProfile {Entry as ProfileEntry, FinalProfile}
 import semantic.InitialProfile {InitialProfile}
 import semantic.NativeAssembly
@@ -3030,6 +3031,57 @@ pub struct Semantic {
   // replaces a record (see `replayEscapes`), and whether a replay lowered anything they lack.
   escapeImage: EscapeImage,
   freshEscapes: bool,
+  // How many copies of the process a cold build's walk is shared between (`SharedWalk`), and how
+  // many instances the walk enters before it starts them; fewer than two copies share nothing.
+  walkWorkers: usize,
+  walkFrontier: usize,
+  // Whether this process is a copy a shared walk started, which ends with the walk.
+  walkCopy: bool,
+  // The last build when copies of the process lowered it: what `recordSharedBuild` walks again
+  // for the record that build could not keep.
+  unrecorded: Option<UnrecordedBuild>,
+}
+
+// A build whose walk copies of the process shared, as `buildFrom` takes it.
+struct UnrecordedBuild {
+  module: ModuleId,
+  runtimeSelected: bool,
+  roots: List<BuildRoot>,
+  entrySpan: Span,
+  closureNodes: usize,
+}
+
+// How a build walk is shared between copies of the process (`WalkShared`), and what it found.
+struct SharedWalk {
+  // How many copies walk, the process that starts them among them; fewer than two shares nothing.
+  workers: usize,
+  // How many instances the walk enters before it starts the copies, so each starts with those
+  // instances' pending references and what the walk has lowered so far.
+  frontier: usize,
+  started: bool,
+  // What each copy lowered (`sharedPart`), the starting process's first.
+  parts: List<Bytes>,
+  // Whether a copy failed or the walk read a growth guard, so the parts are not the whole walk.
+  failed: bool,
+}
+
+// What a build walk that may be shared gave: the build, when it ended before any copy started;
+// else what the copies lowered, or neither when that is not the whole walk.
+struct SharedBuild {
+  built: Option<BackendBuild>,
+  state: Option<ReplayState>,
+}
+
+// A walk no copy of the process shares.
+fn unshared() -> SharedWalk {
+  return SharedWalk {workers: usize.ZERO, frontier: usize.ZERO, started: false, parts: List<Bytes>.make(), failed: false}
+}
+
+// The leaf a shared walk's record holds for the instance `exact` names when no copy entered it.
+fn absentEntry(exact: ContentHash) -> BuildRecord.Entry {
+  return BuildRecord.Entry {exact: exact, hash: 0, family: 0, declaration: Bytes.make(), parent: usize.MAX, position: usize.ZERO,
+    requested: false, alias: usize.MAX, leaf: BuildRecord.ABSENT, references: List<BuildRecord.Reference>.make(),
+    summary: ContentHash {high: 0, low: 0}, facts: BuildRecord.unknownFacts()}
 }
 
 // What one module's sweep found, kept until its unit is no longer current.
@@ -93809,6 +93861,10 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
     carriedBuild: List<usize>.make(),
     escapeImage: EscapeImage.make(),
     freshEscapes: false,
+    walkWorkers: usize.ZERO,
+    walkFrontier: usize.ZERO,
+    walkCopy: false,
+    unrecorded: Option<UnrecordedBuild>.none(),
   }
 }
 
@@ -95321,6 +95377,55 @@ impl Semantic {
       at = at + usize.ONE
     }
     return count
+  }
+  /// Whether copies of the process lowered the last build (`shareWalks`) and its record has not
+  /// been walked for yet (`recordSharedBuild`), so `cacheImage` would write no record of it.
+  pub fn sharedBuildUnrecorded(self: &Self) -> bool {
+    return match &self.unrecorded {
+      Option<UnrecordedBuild>.Some {..} => true
+      Option<UnrecordedBuild>.None => false
+    }
+  }
+  /// Walks the last build again in this process when copies of the process lowered it
+  /// (`shareWalks`), so the store holds the build's record and every unit it rests on, as a build
+  /// that shared nothing does, and `cacheImage` writes them. It lowers each instance a copy
+  /// lowered, which the shared build saved the caller from waiting for; a cache writer that runs
+  /// after the build returned calls it. Does nothing after any other build, and leaves the store
+  /// without a record when the walk fails where the build did not.
+  pub effect fn recordSharedBuild(self: &mut Self) -> ()
+  ! Cycle | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+    let pending = match move Intrinsic.replace(self.unrecorded, Option<UnrecordedBuild>.none()) {
+      Option<UnrecordedBuild>.Some {value} => move value
+      Option<UnrecordedBuild>.None => { return () }
+    }
+    // The packs are the ones the build assembled and its caller stored.
+    let packed = Intrinsic.replace(self.packedBuild, PackedBuild.make())
+    let walked = run Effect.result(Semantic.buildFrom(&mut self.*, &pending.module, pending.runtimeSelected,
+      List<BuildRoot>.asSlice(&pending.roots), pending.entrySpan, pending.closureNodes, false, &Option<FrameSelection>.none(), &mut unshared()))
+    self.packedBuild = move packed
+    // A walk that fails where the build did not leaves the store without a record.
+    match move walked {
+      Result<BackendBuild, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} => { drop value }
+      Result<BackendBuild, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} => match move error {
+        Cycle cycle => { fail move cycle }
+        OutOfMemoryError exhausted => { fail move exhausted }
+        InvalidModulePath invalid => { drop invalid }
+        RevisionMismatch mismatch => { drop mismatch }
+      }
+    }
+  }
+  /// Shares the walk of each later cold `buildArtifact` between `workers` copies of the process,
+  /// the calling one among them, started once the walk has entered `frontier` instances. The
+  /// copies lower the instances side by side, and the build emits what one process would. Fewer
+  /// than two workers, the default, share nothing, and so does a build that replays a record.
+  ///
+  /// # Gotchas
+  /// Set it only where the process has one thread and may start copies of itself: a copy has no
+  /// other thread, and exits once its part of the walk is done.
+  pub fn shareWalks(self: &mut Self, workers: usize, frontier: usize) -> () {
+    self.walkWorkers = workers
+    self.walkFrontier = frontier
   }
   /// The syntax errors of every source this store has loaded, as rejections in load order and
   /// then source order. A loaded module is parsed whole, so its syntax errors reject the program
@@ -99139,15 +99244,42 @@ impl Semantic {
           return run withUnemittedBodies(move replayed, List<UncheckedDeclaration>.asSlice(&checked.unchecked))
         }
         if let Option<BackendBuild>.Some {value: rewalked} = move run Semantic.rewalkBuild(&mut self.*, move replaying, &module,
-          List<BuildRoot>.asSlice(&roots), origin) {
+          List<BuildRoot>.asSlice(&roots), origin, false) {
           drop emitting
           return run withUnemittedBodies(move rewalked, List<UncheckedDeclaration>.asSlice(&checked.unchecked))
         }
       }
     }
     self.replay = Option<ReplayState>.none()
+    // A cold build lowers every instance it reaches, which copies of the process share; the walk
+    // itself then runs over what they lowered, and walks alone where that does not decide it.
+    if self.walkWorkers > usize.ONE && Graph.recording(&self.resolver.graph) {
+      let SharedBuild {built: whole, state: lowered} = move run Semantic.sharedBuildState(&mut self.*, &module, runtimeSelected,
+        List<BuildRoot>.asSlice(&roots), origin, closureNodes)
+      if let Option<BackendBuild>.Some {value: built} = move whole {
+        drop emitting
+        return run withUnemittedBodies(move built, List<UncheckedDeclaration>.asSlice(&checked.unchecked))
+      }
+      if let Option<ReplayState>.Some {value: state} = move lowered {
+        if let Option<BackendBuild>.Some {value: rewalked} = move run Semantic.rewalkBuild(&mut self.*, move state, &module,
+          List<BuildRoot>.asSlice(&roots), origin, true) {
+          drop emitting
+          let mut kept = List<BuildRoot>.make()
+          let listed = List<BuildRoot>.asSlice(&roots)
+          let mut rootAt = usize.ZERO
+          while rootAt < listed.length {
+            run List<BuildRoot>.append(&mut kept, BuildRoot {key: InstanceKey.copy(&listed[rootAt].key), span: listed[rootAt].span,
+              retained: listed[rootAt].retained})
+            rootAt = rootAt + usize.ONE
+          }
+          self.unrecorded = Option<UnrecordedBuild>.some(UnrecordedBuild {module: ModuleId.copy(&module), runtimeSelected: runtimeSelected,
+            roots: move kept, entrySpan: origin, closureNodes: closureNodes})
+          return run withUnemittedBodies(move rewalked, List<UncheckedDeclaration>.asSlice(&checked.unchecked))
+        }
+      }
+    }
     let built = run Semantic.buildFrom(&mut self.*, &module, runtimeSelected, List<BuildRoot>.asSlice(&roots), origin,
-      closureNodes, false, &Option<FrameSelection>.none())
+      closureNodes, false, &Option<FrameSelection>.none(), &mut unshared())
     drop emitting
     return run withUnemittedBodies(move built, List<UncheckedDeclaration>.asSlice(&checked.unchecked))
   }
@@ -99556,12 +99688,19 @@ impl Semantic {
   // walked again with every function observing diagnostics (failure observer note N1). A program
   // that reaches a suspension boundary is walked again with its closed suspendable set and the
   // selected execution-storage exports as further roots (SUSP private lowering model).
+  //
+  // A walk `sharing` shares starts copies of the process once it has entered `sharing.frontier`
+  // instances (`WalkShared`); one that ends sooner is the walk of one process. Each copy lowers the instances it claims, and with nothing left of
+  // its own, the ones another copy has claimed and not finished. Such a walk only lowers: it runs
+  // no program-wide check and assembles nothing, and leaves what each copy lowered in
+  // `sharing.parts`, which `rewalkBuild` walks in the order one process would.
   effect fn buildFrom(self: &mut Self, module: &ModuleId, runtimeSelected: bool, roots: &[BuildRoot], entrySpan: Span,
-    closureNodes: usize, observing: bool, frames: &Option<FrameSelection>) -> BackendBuild
+    closureNodes: usize, observing: bool, frames: &Option<FrameSelection>, sharing: &mut SharedWalk) -> BackendBuild
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
   ? &mut Allocator | &mut Types {
     let clock = run Progress.enterQuery(&mut self.resolver.progress, u8.toUsize(Family.value(Family.CleanupFree)) + 2, "BuildWalk")
-    let attempted = run Effect.result(Semantic.buildFromTimed(&mut self.*, module, runtimeSelected, roots, entrySpan, closureNodes, observing, frames))
+    let attempted = run Effect.result(Semantic.buildFromTimed(&mut self.*, module, runtimeSelected, roots, entrySpan, closureNodes, observing, frames,
+      &mut sharing.*))
     run Progress.leaveQuery(&mut self.resolver.progress, clock)
     return match move attempted {
       Result<BackendBuild, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} => move value
@@ -99570,9 +99709,28 @@ impl Semantic {
   }
 
   effect fn buildFromTimed(self: &mut Self, module: &ModuleId, runtimeSelected: bool, roots: &[BuildRoot], entrySpan: Span,
-    closureNodes: usize, observing: bool, frames: &Option<FrameSelection>) -> BackendBuild
+    closureNodes: usize, observing: bool, frames: &Option<FrameSelection>, sharing: &mut SharedWalk) -> BackendBuild
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
   ? &mut Allocator | &mut Types {
+    // Until copies start, the walk is the walk of one process, and a program too small to start
+    // them ends as one.
+    let mayShare = sharing.workers > usize.ONE
+    let mut sharedWalk = false
+    let mut share = WalkShared.none()
+    // The visits whose instance another copy claimed first, each with its claim's key, which
+    // this copy takes over once it has nothing else and the claim is still unfinished.
+    let mut lostVisits = List<BackendVisit>.make()
+    let mut lostOrigins = List<VisitOrigin>.make()
+    let mut lostKeys = List<u64>.make()
+    // This copy's unfinished claims, innermost last: the slot and key of each, and how many
+    // visits were pending when it was made, below which everything under it has been walked.
+    let mut claimLengths = List<usize>.make()
+    let mut claimSlots = List<usize>.make()
+    let mut claimKeys = List<u64>.make()
+    // Whether the visit about to be popped is one taken over from another copy.
+    let mut takeOver = false
+    // Whether this copy lowered each capture entry's instance without a report.
+    let mut lowerings = List<bool>.make()
     let mut pending = List<BackendVisit>.make()
     self.resolver.emittedMir = List<usize>.make()
     // A revisable store's whole-program walk is captured as a build record (see `BuildRecord`):
@@ -99634,7 +99792,63 @@ impl Semantic {
     let mut requested = List<InstanceKey>.make()
     let mut walking = true
     while walking {
-      while List<BackendVisit>.length(&pending) > usize.ZERO {
+      while true {
+        if mayShare {
+          if !sharing.started && capturing && List<InstanceKey>.length(&visited) >= sharing.frontier {
+            sharing.started = true
+            share = run WalkShared.start(sharing.workers)
+            sharedWalk = WalkShared.active(&share)
+            if WalkShared.isCopy(&share) {
+              self.walkCopy = true
+              self.resolver.progress = Progress.off()
+            }
+          }
+          if WalkShared.active(&share) {
+            while List<usize>.length(&claimLengths) > usize.ZERO
+              && List<usize>.get(&claimLengths, List<usize>.length(&claimLengths) - usize.ONE) >= List<BackendVisit>.length(&pending) {
+              let last = List<usize>.length(&claimLengths) - usize.ONE
+              WalkShared.done(&share, List<usize>.get(&claimSlots, last), List<u64>.get(&claimKeys, last))
+              drop List<usize>.pop(&mut claimLengths)
+              drop List<usize>.pop(&mut claimSlots)
+              drop List<u64>.pop(&mut claimKeys)
+            }
+            if List<BackendVisit>.length(&pending) == usize.ZERO {
+              while !takeOver {
+                let lost = match move List<BackendVisit>.pop(&mut lostVisits) {
+                  Option<BackendVisit>.Some {value} => move value
+                  _ => { break }
+                }
+                let lostOrigin = match move List<VisitOrigin>.pop(&mut lostOrigins) {
+                  Option<VisitOrigin>.Some {value} => value
+                  Option<VisitOrigin>.None => { return CompilerBug.panic(b"a lost build visit has no origin") }
+                }
+                let lostKey = match move List<u64>.pop(&mut lostKeys) {
+                  Option<u64>.Some {value} => value
+                  Option<u64>.None => { return CompilerBug.panic(b"a lost build visit has no claim") }
+                }
+                if WalkShared.inProgress(&share, lostKey) {
+                  run List<BackendVisit>.append(&mut pending, move lost)
+                  run List<VisitOrigin>.append(&mut origins, lostOrigin)
+                  takeOver = true
+                }
+              }
+              if !takeOver {
+                if WalkShared.isCopy(&share) {
+                  let unfit = capture.guarded || List<Shared<Rejection>>.length(&refusals) > usize.ZERO
+                    || List<Shared<BackendGap>>.length(&gaps) > usize.ZERO
+                  let sent = run sharedPart(Intrinsic.replace(capture, run BuildCapture.make(false, &[])), List<bool>.asSlice(&lowerings),
+                    List<InstanceDefinition>.asSlice(&self.resolver.llvmValues), unfit)
+                  WalkShared.send(&share, Bytes.asSlice(&sent))
+                }
+                match move run WalkShared.collect(Intrinsic.replace(share, WalkShared.none())) {
+                  Option<List<Bytes>>.Some {value} => { sharing.parts = move value }
+                  Option<List<Bytes>>.None => { sharing.failed = true }
+                }
+              }
+            }
+          }
+        }
+        if List<BackendVisit>.length(&pending) == usize.ZERO { break }
         let visit = match move List<BackendVisit>.pop(&mut pending) {
           Option<BackendVisit>.Some {value} => move value
           Option<BackendVisit>.None => {
@@ -99660,6 +99874,11 @@ impl Semantic {
           }
         }
         let instance = move entered.key
+        // A visit taken over is entered whoever claimed it, and was found visited when it was lost.
+        let taken = takeOver
+        takeOver = false
+        let mut lostEdge = Option<Edge>.none()
+        if WalkShared.active(&share) && !taken { lostEdge = Option<Edge>.some(Edge.copy(&entered.edge)) }
         let mut leave = false
         // Entry shims and drop glue carry no application to admit; only function instances specialize.
         if let Option<Interned<Application>>.Some {..} = move InstanceKey.application(&instance) {
@@ -99763,11 +99982,36 @@ impl Semantic {
             }
           }
         }
-        if run applicationVisited(List<InstanceKey>.asSlice(&visited), &visitedLookup, &instance) {
+        if !taken && run applicationVisited(List<InstanceKey>.asSlice(&visited), &visitedLookup, &instance) {
           if leave {
             Admission.leave(&mut admission)
           }
           continue
+        }
+        if let Option<Edge>.Some {value: reached} = move lostEdge {
+          // A later region pattern of an application this copy lowered shares its definition.
+          let named = run internBackendInstance(&mut self.resolver, &instance, observing)
+          let mine = named < List<bool>.length(&walked) && List<bool>.get(&walked, named)
+          if !mine {
+            let claimed = run definitionDigest(&instance)
+            let slot = WalkShared.claim(&share, claimed.low)
+            if slot == usize.MAX {
+              if leave { Admission.leave(&mut admission) }
+              // The entry tells the walk that reads the parts what admission compares of the key.
+              run BuildCapture.enter(&mut capture, &instance, origin)
+              run List<bool>.append(&mut lowerings, false)
+              run List<InstanceKey>.append(&mut visited, InstanceKey.copy(&instance))
+              run InternIndex.record(&mut visitedLookup, InstanceKey.runtimeHash(&instance))
+              run List<BackendVisit>.append(&mut lostVisits, BackendVisit.Enter {key: move instance, edge: move reached, span: entered.span,
+                module: move entered.module, cleanup: move entered.cleanup, requester: move entered.requester})
+              run List<VisitOrigin>.append(&mut lostOrigins, origin)
+              run List<u64>.append(&mut lostKeys, claimed.low)
+              continue
+            }
+            run List<usize>.append(&mut claimLengths, List<BackendVisit>.length(&pending))
+            run List<usize>.append(&mut claimSlots, slot)
+            run List<u64>.append(&mut claimKeys, claimed.low)
+          }
         }
         if leave {
           run List<BackendVisit>.append(&mut pending, BackendVisit.Leave)
@@ -99775,6 +100019,7 @@ impl Semantic {
         }
         let entry = List<CaptureEntry>.length(&capture.entries)
         if capturing { run BuildCapture.enter(&mut capture, &instance, origin) }
+        if mayShare && capturing { run List<bool>.append(&mut lowerings, false) }
         run List<InstanceKey>.append(&mut visited, InstanceKey.copy(&instance))
         run InternIndex.record(&mut visitedLookup, InstanceKey.runtimeHash(&instance))
         if Progress.timing(&self.resolver.progress) || run Progress.due(&self.resolver.progress) {
@@ -99934,13 +100179,14 @@ impl Semantic {
           BuildCapture.lowered(&mut capture, entry, u64.toUsize(mirWord.value))
         }
         run recordText(&mut owners, lowered, entry)
+        if mayShare && capturing { List<bool>.set(&mut lowerings, entry, true) }
         if let Option<usize>.Some {value: selectedMir} = move mirIndex {
           let anchor = run instanceAnchor(&mut self.resolver, &instance)
           let functions = List<MirFunction>.asSlice(&self.resolver.mirValues)
           if functions[selectedMir].observes { observes = true }
           // A program that observes diagnostics is emitted from the observing walk, so the rest of
           // this one would be thrown away.
-          if observes && !observing { break }
+          if observes && !observing && !sharedWalk { break }
           run List<usize>.append(&mut self.resolver.emittedMir, selectedMir)
           let callerModule = resolvedModule(&self.resolver, location.module)
           let _instances = List<BackendInstance>.asSlice(&self.resolver.backendInstances)
@@ -99993,7 +100239,7 @@ impl Semantic {
       }
       // A NonParking value the program never runs is still proved, as the bootstrap does: the
       // instances that would run it join the walk.
-      if observes && !observing {
+      if sharedWalk || (observes && !observing) {
         walking = false
       } else {
         walking = run requestUnreached(List<SuspensionSummary>.asSlice(&summaries), List<usize>.asSlice(&summarized), &mut requested,
@@ -100001,9 +100247,19 @@ impl Semantic {
       }
     }
     run Progress.endItem(&mut self.resolver.progress)
+    if sharedWalk {
+      let unfit = capture.guarded || List<Shared<Rejection>>.length(&refusals) > usize.ZERO
+        || List<Shared<BackendGap>>.length(&gaps) > usize.ZERO
+      if !sharing.failed {
+        let own = run sharedPart(move capture, List<bool>.asSlice(&lowerings), List<InstanceDefinition>.asSlice(&self.resolver.llvmValues), unfit)
+        run List<Bytes>.append(&mut sharing.parts, move own)
+      }
+      return BackendBuild.Unsupported {gaps: List<Shared<BackendGap>>.make()}
+    }
     // The observing walk reports every refusal and gap itself.
     if observes && !observing {
-      return run Semantic.buildFrom(&mut self.*, module, runtimeSelected, roots, entrySpan, closureNodes, true, frames)
+      // The walk met the observation before it started any copy, so the observing walk may share.
+      return run Semantic.buildFrom(&mut self.*, module, runtimeSelected, roots, entrySpan, closureNodes, true, frames, &mut sharing.*)
     }
     if List<Shared<Rejection>>.length(&refusals) > usize.ZERO {
       let first = List<Shared<Rejection>>.remove(&mut refusals, usize.ZERO)
@@ -100134,7 +100390,7 @@ impl Semantic {
         }
         let chosen = Option<FrameSelection>.some(move selection)
         return run Semantic.buildFrom(&mut self.*, module, runtimeSelected, List<BuildRoot>.asSlice(&extended), entrySpan,
-          closureNodes, observing, &chosen)
+          closureNodes, observing, &chosen, &mut unshared())
       }
     }
     let mut packed = PackedBuild.make()
@@ -100159,6 +100415,155 @@ impl Semantic {
       }
     }
     return move assembled
+  }
+
+  // Lowers every instance a build from `roots` reaches, shared between copies of the process
+  // (`SharedWalk`), and gives what they lowered as the state of a record to walk again
+  // (`rewalkBuild`): each instance's facts and references, and its definition where a copy
+  // emitted one. A walk that ended before it started any copy is the build itself. Neither when
+  // the copies did not lower the whole walk between them.
+  effect fn sharedBuildState(self: &mut Self, module: &ModuleId, runtimeSelected: bool, roots: &[BuildRoot], entrySpan: Span,
+    closureNodes: usize) -> SharedBuild
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+    let mut sharing = SharedWalk {workers: self.walkWorkers, frontier: self.walkFrontier, started: false, parts: List<Bytes>.make(),
+      failed: false}
+    let walked = run Effect.result(Semantic.buildFrom(&mut self.*, module, runtimeSelected, roots, entrySpan, closureNodes, false,
+      &Option<FrameSelection>.none(), &mut sharing))
+    // A copy ends in the walk; one that left it failed, and must not go on as the build.
+    if self.walkCopy { WalkShared.abandon() }
+    let built = match move walked {
+      Result<BackendBuild, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} => move value
+      Result<BackendBuild, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} => { fail move error }
+    }
+    if List<Bytes>.length(&sharing.parts) == usize.ZERO && !sharing.failed {
+      return SharedBuild {built: Option<BackendBuild>.some(move built), state: Option<ReplayState>.none()}
+    }
+    drop built
+    let mut state = Option<ReplayState>.none()
+    if !sharing.failed { state = run sharedState(List<Bytes>.asSlice(&sharing.parts), roots) }
+    return SharedBuild {built: Option<BackendBuild>.none(), state: move state}
+  }
+
+  // The edge a walk over what copies of the process lowered followed to reach reference
+  // `position` of node `parent`, read from that node's MIR, which is lowered here when no key of
+  // the walk needed it yet; a direct edge for a root or a requested target. None when the node's
+  // key is not found again.
+  effect fn rewalkFollowedEdge(self: &mut Self, entries: &[BuildRecord.Entry], nodes: &[RewalkNode], parent: usize, position: usize, asked: bool,
+    keys: &mut List<Option<InstanceKey>>, mirs: &mut List<usize>, roots: &[BuildRoot], observing: bool, entrySpan: Span) -> Option<Edge>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+    if parent == usize.MAX || asked { return Option<Edge>.some(Edge.Direct) }
+    // A reference of drop glue is followed as the cleanup of the value the outermost glue above
+    // it drops, as `buildFrom` passes that root down.
+    if u64.bitAnd(nodes[parent].facts.flags, BuildRecord.FACT_GLUE) != 0 {
+      let mut outer = parent
+      while nodes[outer].parent != usize.MAX && !nodes[outer].requested
+        && u64.bitAnd(nodes[nodes[outer].parent].facts.flags, BuildRecord.FACT_GLUE) != 0 {
+        outer = nodes[outer].parent
+      }
+      let mut glue = Option<InstanceKey>.none()
+      if let Option<InstanceKey>.Some {value} = &nodes[outer].key {
+        glue = Option<InstanceKey>.some(InstanceKey.copy(&value))
+      } else if nodes[outer].entry != usize.MAX {
+        glue = run Semantic.rewalkKey(&mut self.*, entries, &mut keys.*, &mut mirs.*, roots, nodes[outer].entry, observing, entrySpan)
+      }
+      if let Option<InstanceKey>.Some {value: known} = move glue {
+        if let Option<Interned<Type>>.Some {value: owner} = move InstanceKey.glueType(&known) {
+          return Option<Edge>.some(Edge.Cleanup {owner: move owner})
+        }
+      }
+      return Option<Edge>.none()
+    }
+    let node = &nodes[parent]
+    let mut found = Option<InstanceKey>.none()
+    if let Option<InstanceKey>.Some {value} = &node.key {
+      found = Option<InstanceKey>.some(InstanceKey.copy(&value))
+    } else if node.entry != usize.MAX {
+      found = run Semantic.rewalkKey(&mut self.*, entries, &mut keys.*, &mut mirs.*, roots, node.entry, observing, entrySpan)
+    }
+    let key = match move found {
+      Option<InstanceKey>.Some {value} => move value
+      Option<InstanceKey>.None => { return Option<Edge>.none() }
+    }
+    let mut mir = usize.MAX
+    if node.entry != usize.MAX { mir = List<usize>.get(&mirs.*, node.entry) }
+    if mir == usize.MAX {
+      mir = match move run Semantic.replayMir(&mut self.*, &key, observing) {
+        Option<ReplayMir>.Some {value} => value.mir
+        Option<ReplayMir>.None => { return Option<Edge>.none() }
+      }
+      if node.entry != usize.MAX { List<usize>.set(&mut mirs.*, node.entry, mir) }
+    }
+    let functions = List<MirFunction>.asSlice(&self.resolver.mirValues)
+    let references = List<MirReference>.asSlice(&functions[mir].references)
+    if position >= references.length { return Option<Edge>.none() }
+    return Option<Edge>.some(Edge.copy(&references[position].edge))
+  }
+
+  // `rewalkBuildDecide` for a walk over what copies of the process lowered, whose nodes hold no
+  // key until one is needed: each frame's key, and the reached instance's, is found again through
+  // the MIR of the entries that reference it (`rewalkKey`), and so is the edge that reached each
+  // (`rewalkFollowedEdge`), so admission decides as the walk of one process does, owned descent included.
+  // An edge under drop glue, which that walk follows as a cleanup edge, is refused.
+  effect fn rewalkDecideKeyed(self: &mut Self, entries: &[BuildRecord.Entry], nodes: &[RewalkNode], frames: &[RewalkFrame],
+    reached: &Option<InstanceKey>, parent: usize, position: usize, asked: bool, keys: &mut List<Option<InstanceKey>>,
+    mirs: &mut List<usize>, roots: &[BuildRoot], observing: bool, entrySpan: Span) -> u64
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+    let key = match &reached.* {
+      Option<InstanceKey>.Some {value} => &value
+      Option<InstanceKey>.None => {
+        return REWALK_REFUSED
+      }
+    }
+    let mut first = frames.length
+    while first > usize.ZERO {
+      first = first - usize.ONE
+      if frames[first].free { break }
+    }
+    let mut admission = Admission.make()
+    let mut at = first
+    while at < frames.length {
+      let node = &nodes[frames[at].node]
+      let mut found = Option<InstanceKey>.none()
+      if let Option<InstanceKey>.Some {value} = &node.key {
+        found = Option<InstanceKey>.some(InstanceKey.copy(&value))
+      } else if node.entry != usize.MAX {
+        found = run Semantic.rewalkKey(&mut self.*, entries, &mut keys.*, &mut mirs.*, roots, node.entry, observing, entrySpan)
+      }
+      let framed = match move found {
+        Option<InstanceKey>.Some {value} => move value
+        Option<InstanceKey>.None => {
+          return REWALK_REFUSED
+        }
+      }
+      let followed = match move run Semantic.rewalkFollowedEdge(&mut self.*, entries, nodes, node.parent, node.position, node.requested,
+        &mut keys.*, &mut mirs.*, roots, observing, entrySpan) {
+        Option<Edge>.Some {value} => move value
+        Option<Edge>.None => {
+          return REWALK_REFUSED
+        }
+      }
+      run Admission.enterChain(&mut admission, &run InstanceKey.selected(&framed), move followed)
+      at = at + usize.ONE
+    }
+    let edge = match move run Semantic.rewalkFollowedEdge(&mut self.*, entries, nodes, parent, position, asked, &mut keys.*, &mut mirs.*, roots,
+      observing, entrySpan) {
+      Option<Edge>.Some {value} => move value
+      Option<Edge>.None => {
+        return REWALK_REFUSED
+      }
+    }
+    let application = run InstanceKey.selected(key)
+    let entering = Edge.copy(&edge)
+    let refused = run Admission.enter(&mut admission, &application, move edge)
+    return match move run admitOwnedDescent(&mut self.resolver, &mut self.query, &mut admission, &application, &entering, move refused) {
+      Decision.Entered => REWALK_ENTERED
+      // The walk follows a reused application no further, whichever region pattern of it is active.
+      Decision.Reused {..} => REWALK_REUSED
+      _ => REWALK_REFUSED
+    }
   }
 
   // Replays the build record an adoption read instead of walking the program again, when the
@@ -100445,7 +100850,12 @@ impl Semantic {
   // program-wide checks would then report, the walk reports it.
   //
   // Gives none when the walk cannot be proved to be the cold one, and the build walks.
-  effect fn rewalkBuild(self: &mut Self, state: ReplayState, module: &ModuleId, roots: &[BuildRoot], entrySpan: Span)
+  //
+  // With `shared`, the record is what copies of the process lowered of this build (`sharedState`)
+  // rather than an earlier walk: it decided no edge, so none is trusted, an entry no copy gave a
+  // definition for (`BuildRecord.ABSENT`) is lowered here from its key, and the keys admission
+  // needs are found again through MIR (`rewalkDecideKeyed`).
+  effect fn rewalkBuild(self: &mut Self, state: ReplayState, module: &ModuleId, roots: &[BuildRoot], entrySpan: Span, shared: bool)
     -> Option<BackendBuild>
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
   ? &mut Allocator | &mut Types {
@@ -100462,7 +100872,9 @@ impl Semantic {
     let mut entryLookup = InternIndex.make()
     let mut at = usize.ZERO
     while at < entries.length {
-      if u64.bitAnd(entries[at].facts.flags, BuildRecord.FACT_KNOWN) == 0 { return Option<BackendBuild>.none() }
+      if u64.bitAnd(entries[at].facts.flags, BuildRecord.FACT_KNOWN) == 0 && entries[at].leaf != BuildRecord.ABSENT {
+        return Option<BackendBuild>.none()
+      }
       run InternIndex.record(&mut entryLookup, digestHash(entries[at].exact))
       at = at + usize.ONE
     }
@@ -100494,7 +100906,7 @@ impl Semantic {
       let exact = run instanceDigest(&roots[at].key)
       let entry = rewalkEntry(entries, &entryLookup, exact)
       let mut same = false
-      if entry != usize.MAX { same = entries[entry].parent == usize.MAX && entries[entry].position == at }
+      if entry != usize.MAX && !shared { same = entries[entry].parent == usize.MAX && entries[entry].position == at }
       run List<RewalkVisit>.append(&mut pending, RewalkVisit {leave: false, entry: entry, key: Option<InstanceKey>.some(InstanceKey.copy(&roots[at].key)),
         exact: exact, parent: usize.MAX, position: at, requested: false, trusted: same, same: same})
     }
@@ -100505,15 +100917,27 @@ impl Semantic {
           Option<RewalkVisit>.Some {value} => move value
           Option<RewalkVisit>.None => { break }
         }
-        let RewalkVisit {leave, entry, key: reachedKey, exact: reachedExact, parent, position, requested: asked, trusted, same: onPath} = move visit
+        let RewalkVisit {leave, entry, key: visitKey, exact: reachedExact, parent, position, requested: asked, trusted, same: onPath} = move visit
         if leave {
           drop List<RewalkFrame>.pop(&mut frames)
           continue
         }
         let visited = rewalkVisited(List<RewalkNode>.asSlice(&nodes), &visitedLookup, reachedExact)
+        let mut reachedKey = move visitKey
+        // An entry no copy lowered tells nothing the key does not: the walk finds the key.
+        let absent = entry != usize.MAX && entries[entry].leaf == BuildRecord.ABSENT
+        if absent {
+          if let Option<InstanceKey>.None = &reachedKey {
+            reachedKey = run Semantic.rewalkKey(&mut self.*, entries, &mut keys, &mut mirs, roots, entry, observing, entrySpan)
+          }
+          if let Option<InstanceKey>.None = &reachedKey {
+            return Option<BackendBuild>.none()
+          }
+        }
+        let recorded = entry != usize.MAX && !absent
         // What admission compares of the target's application, from the record or its key.
         let mut facts = BuildRecord.unknownFacts()
-        if entry != usize.MAX {
+        if recorded {
           facts = run BuildRecord.copyFacts(&entries[entry].facts)
         } else if let Option<InstanceKey>.Some {value: known} = &reachedKey {
           facts = run keyFacts(&known)
@@ -100527,7 +100951,7 @@ impl Semantic {
             // is reached for the first time.
             entered = visited == usize.MAX
           } else {
-            if entry == usize.MAX {
+            if !recorded {
               let closed = match &reachedKey {
                 Option<InstanceKey>.Some {value: known} => run rewalkClosed(&known)
                 Option<InstanceKey>.None => false
@@ -100535,11 +100959,19 @@ impl Semantic {
               if !closed { return Option<BackendBuild>.none() }
             }
             let mut decision = rewalkAdmits(List<RewalkFrame>.asSlice(&frames), facts.body, visited)
-            if decision == REWALK_REFUSED {
+            if decision == REWALK_REFUSED && shared {
+              if let Option<InstanceKey>.None = &reachedKey {
+                reachedKey = run Semantic.rewalkKey(&mut self.*, entries, &mut keys, &mut mirs, roots, entry, observing, entrySpan)
+              }
+              decision = run Semantic.rewalkDecideKeyed(&mut self.*, entries, List<RewalkNode>.asSlice(&nodes), List<RewalkFrame>.asSlice(&frames),
+                &reachedKey, parent, position, asked, &mut keys, &mut mirs, roots, observing, entrySpan)
+            } else if decision == REWALK_REFUSED {
               decision = run rewalkBuildDecide(entries, List<RewalkNode>.asSlice(&nodes), List<RewalkFrame>.asSlice(&frames), &reachedKey,
                 visited)
             }
-            if decision == REWALK_REFUSED { return Option<BackendBuild>.none() }
+            if decision == REWALK_REFUSED {
+              return Option<BackendBuild>.none()
+            }
             entered = decision == REWALK_ENTERED
           }
         }
@@ -100557,7 +100989,7 @@ impl Semantic {
         // nothing of their own.
         let owner = rewalkOwner(List<RewalkNode>.asSlice(&nodes), List<usize>.asSlice(&owners), &ownerLookup, facts.definition)
         if owner != usize.MAX {
-          if entry == usize.MAX {
+          if !recorded {
             let known = match &key {
               Option<InstanceKey>.Some {value} => &value
               Option<InstanceKey>.None => { return Option<BackendBuild>.none() }
@@ -100611,16 +101043,22 @@ impl Semantic {
         }
         let instance = match move key {
           Option<InstanceKey>.Some {value} => move value
-          Option<InstanceKey>.None => { return Option<BackendBuild>.none() }
+          Option<InstanceKey>.None => {
+            return Option<BackendBuild>.none()
+          }
         }
         let lowered = match move run Semantic.replayMir(&mut self.*, &instance, observing) {
           Option<ReplayMir>.Some {value} => value
-          Option<ReplayMir>.None => { return Option<BackendBuild>.none() }
+          Option<ReplayMir>.None => {
+            return Option<BackendBuild>.none()
+          }
         }
         if entry != usize.MAX { List<usize>.set(&mut mirs, entry, lowered.mir) }
         let text = match move run Semantic.replayText(&mut self.*, &instance, lowered, observing) {
           Option<CapturedEntry>.Some {value} => value
-          Option<CapturedEntry>.None => { return Option<BackendBuild>.none() }
+          Option<CapturedEntry>.None => {
+            return Option<BackendBuild>.none()
+          }
         }
         run Progress.advance(&mut self.resolver.progress)
         let anchor = run instanceAnchor(&mut self.resolver, &instance)
@@ -100751,7 +101189,7 @@ impl Semantic {
         parent: walked.parent, position: walked.position, requested: walked.requested, alias: walked.alias, leaf: 0,
         references: List<BuildRecord.Reference>.make(), summary: walked.summary, facts: run BuildRecord.copyFacts(&walked.facts)}
       let mut replayed = Option<Replayed>.none()
-      if walked.entry != usize.MAX {
+      if walked.entry != usize.MAX && entries[walked.entry].leaf != BuildRecord.ABSENT {
         let recorded = &entries[walked.entry]
         entry.hash = recorded.hash
         entry.family = recorded.family
@@ -100820,8 +101258,14 @@ impl Semantic {
     let assembled = run assembleEmission(&self.resolver, List<CollectedText>.asSlice(&emitted), roots, module, entrySpan, &mut packed)
     self.packedBuild = move packed
     if let BackendBuild.Module {..} = &assembled {
-      self.capturedBuild = Option<CapturedBuild>.some(CapturedBuild {record: move rewritten, entries: move rested, guard: usize.MAX,
-        carriedRecord: usize.MAX})
+      // The entries copies lowered rest on units this process never ran, so this walk keeps no
+      // record; `recordSharedBuild` walks for one.
+      if shared {
+        self.capturedBuild = Option<CapturedBuild>.none()
+      } else {
+        self.capturedBuild = Option<CapturedBuild>.some(CapturedBuild {record: move rewritten, entries: move rested, guard: usize.MAX,
+          carriedRecord: usize.MAX})
+      }
       self.freshBuild = true
       return Option<BackendBuild>.some(move assembled)
     }
@@ -102944,6 +103388,255 @@ fn requestedTarget(summary: &SuspensionSummary, position: usize) -> Option<&Inst
     at = at + usize.ONE
   }
   return Option<&InstanceKey>.none()
+}
+
+// What one copy of the process lowered of a shared build walk, as bytes another process reads
+// (`sharedState`): whether the copy read a growth guard or reported anything (`unfit`), a record no walk order holds together,
+// and the definition and text of each entry that emitted one. An entry is entered (leaf zero)
+// when `lowered` says this copy lowered its instance without a report; any other, and each
+// referenced instance this copy never entered, is an absent leaf.
+effect fn sharedPart(capture: BuildCapture, lowered: &[bool], values: &[InstanceDefinition], unfit: bool) -> Bytes
+! OutOfMemoryError ? &mut Allocator {
+  let mut record = BuildRecord.make(capture.observing, true)
+  let mut captured = move capture
+  let count = List<CaptureEntry>.length(&captured.entries)
+  let mut absent = DigestSet.make()
+  let mut missing = List<ContentHash>.make()
+  let mut emitted = List<usize>.make()
+  run List<BuildRecord.Entry>.reserveExact(&mut record.entries, count)
+  let mut at = usize.ZERO
+  while at < count {
+    let entry = &List<CaptureEntry>.asSlice(&captured.entries)[at]
+    let owned = at < lowered.length && lowered[at] && entry.alias == usize.MAX
+    let mut references = List<BuildRecord.Reference>.make()
+    if owned {
+      let targets = List<ContentHash>.asSlice(&entry.targets)
+      let edges = List<ContentHash>.asSlice(&entry.edges)
+      run List<BuildRecord.Reference>.reserveExact(&mut references, targets.length)
+      let mut reference = usize.ZERO
+      while reference < targets.length {
+        let mut target = BuildCapture.find(&captured, targets[reference])
+        if target == usize.MAX {
+          let mut place = DigestSet.find(&absent, targets[reference])
+          if place == usize.MAX {
+            place = List<ContentHash>.length(&missing)
+            drop run DigestSet.add(&mut absent, targets[reference])
+            run List<ContentHash>.append(&mut missing, targets[reference])
+          }
+          target = count + place
+        }
+        run List<BuildRecord.Reference>.append(&mut references, BuildRecord.Reference {target: target, edge: edges[reference]})
+        reference = reference + usize.ONE
+      }
+      run List<usize>.append(&mut emitted, entry.value)
+    }
+    let mut leaf = BuildRecord.ABSENT
+    if owned { leaf = 0 }
+    let taken = &mut List<CaptureEntry>.asMutSlice(&mut captured.entries)[at]
+    let exact = taken.digest
+    let declaration = Intrinsic.replace(taken.declaration, Bytes.make())
+    let facts = Intrinsic.replace(taken.facts, BuildRecord.unknownFacts())
+    let kept = &List<CaptureEntry>.asSlice(&captured.entries)[at]
+    at = at + usize.ONE
+    run List<BuildRecord.Entry>.append(&mut record.entries, BuildRecord.Entry {exact: exact, hash: kept.hash, family: kept.family,
+      declaration: move declaration, parent: usize.MAX, position: usize.ZERO, requested: false, alias: usize.MAX, leaf: leaf,
+      references: move references, summary: kept.summary, facts: move facts})
+  }
+  let named = List<ContentHash>.asSlice(&missing)
+  at = usize.ZERO
+  while at < named.length {
+    run List<BuildRecord.Entry>.append(&mut record.entries, absentEntry(named[at]))
+    at = at + usize.ONE
+  }
+  let mut output = Bytes.make()
+  let mut flag: u64 = 0
+  if unfit { flag = 1 }
+  run RuntimeEncoding.word(&mut output, flag)
+  let encoded = run BuildRecord.encode(&record)
+  run RuntimeEncoding.field(&mut output, Bytes.asSlice(&encoded))
+  let texts = List<usize>.asSlice(&emitted)
+  at = usize.ZERO
+  while at < texts.length {
+    if texts[at] == usize.MAX {
+      run RuntimeEncoding.word(&mut output, 0)
+    } else {
+      run RuntimeEncoding.word(&mut output, 1)
+      let definition = run BuildRecord.encodeDefinition(&values[texts[at]])
+      run RuntimeEncoding.field(&mut output, Bytes.asSlice(&definition))
+      run RuntimeEncoding.field(&mut output, Bytes.asSlice(&values[texts[at]].text))
+    }
+    at = at + usize.ONE
+  }
+  return move output
+}
+
+// The parts copies of the process lowered of one shared build walk from `roots` (`sharedPart`), as
+// the state of one record for `rewalkBuild`: the entry of each instance a copy lowered, once,
+// with its definition held; an absent leaf for each other instance a copy reached or a reference
+// names; and each entry's parent the first entry found to reference it, walking out from the
+// roots, so a key the walk needs is found through that entry's MIR (`rewalkKey`). None when a
+// part does not decode, rests on a growth guard or a report, or lowered a body that suspends, or
+// one that observes diagnostics in a walk that did not, which only a walk of its own decides.
+effect fn sharedState(parts: &[Bytes], roots: &[BuildRoot]) -> Option<ReplayState> ! OutOfMemoryError ? &mut Allocator {
+  let mut merged = BuildRecord.make(false, true)
+  let mut definitions = List<Option<InstanceDefinition>>.make()
+  let mut held = List<bool>.make()
+  // Each placed digest sits at its entry's index in `merged`.
+  let mut placed = DigestSet.make()
+  // The part each merged entry came from, whose indexes its references still hold.
+  let mut sources = List<usize>.make()
+  let mut exacts = List<List<ContentHash>>.make()
+  let mut records = List<BuildRecord.Record>.make()
+  let mut refused = BuildRecord.FACT_SUSPENDS
+  let mut part = usize.ZERO
+  while part < parts.length {
+    let bytes = Bytes.asSlice(&parts[part])
+    let mut reader = StableKey.reader()
+    let unfit = StableKey.readWord(bytes, &mut reader)
+    let recorded = StableKey.readField(bytes, &mut reader)
+    if StableKey.failed(&reader) || unfit != 0 { return Option<ReplayState>.none() }
+    let mut record = match move run BuildRecord.decode(StableKey.view(bytes, recorded)) {
+      Option<BuildRecord.Record>.Some {value} => move value
+      Option<BuildRecord.Record>.None => { return Option<ReplayState>.none() }
+    }
+    // Every copy walked in one mode: observing diagnostics, or lowering nothing that observes them.
+    if part == usize.ZERO {
+      merged.observing = record.observing
+      if !record.observing { refused = refused + BuildRecord.FACT_OBSERVES }
+    } else if record.observing != merged.observing {
+      return Option<ReplayState>.none()
+    }
+    let entries = List<BuildRecord.Entry>.asMutSlice(&mut record.entries)
+    let mut names = List<ContentHash>.make()
+    let mut at = usize.ZERO
+    while at < entries.length {
+      let exact = entries[at].exact
+      run List<ContentHash>.append(&mut names, exact)
+      if entries[at].leaf == 0 {
+        // The definition is read whether or not another part gave the instance first.
+        let mut definition = Option<InstanceDefinition>.none()
+        if StableKey.readWord(bytes, &mut reader) == 1 {
+          let described = StableKey.readField(bytes, &mut reader)
+          let text = StableKey.readField(bytes, &mut reader)
+          if StableKey.failed(&reader) { return Option<ReplayState>.none() }
+          let mut read = match move run BuildRecord.decodeDefinition(StableKey.view(bytes, described)) {
+            Option<InstanceDefinition>.Some {value} => move value
+            Option<InstanceDefinition>.None => { return Option<ReplayState>.none() }
+          }
+          read.text = run Bytes.copy(StableKey.view(bytes, text))
+          definition = Option<InstanceDefinition>.some(move read)
+        }
+        if StableKey.failed(&reader) || u64.bitAnd(entries[at].facts.flags, refused) != 0 { return Option<ReplayState>.none() }
+        if run DigestSet.add(&mut placed, exact) {
+          let taken = &mut entries[at]
+          run List<BuildRecord.Entry>.append(&mut merged.entries, Intrinsic.replace(taken.*, absentEntry(exact)))
+          run List<Option<InstanceDefinition>>.append(&mut definitions, move definition)
+          run List<bool>.append(&mut held, true)
+          run List<usize>.append(&mut sources, part)
+        }
+      }
+      at = at + usize.ONE
+    }
+    if !StableKey.finished(bytes, &reader) { return Option<ReplayState>.none() }
+    run List<List<ContentHash>>.append(&mut exacts, move names)
+    run List<BuildRecord.Record>.append(&mut records, move record)
+    part = part + usize.ONE
+  }
+  let lowered = List<BuildRecord.Entry>.length(&merged.entries)
+  // An absent leaf that names what admission compares of its key, for an instance no part lowered.
+  let listed = List<BuildRecord.Record>.asMutSlice(&mut records)
+  part = usize.ZERO
+  while part < listed.length {
+    let entries = List<BuildRecord.Entry>.asMutSlice(&mut listed[part].entries)
+    let mut at = usize.ZERO
+    while at < entries.length {
+      let exact = entries[at].exact
+      if u64.bitAnd(entries[at].facts.flags, BuildRecord.FACT_KNOWN) != 0 && run DigestSet.add(&mut placed, exact) {
+        let taken = &mut entries[at]
+        run List<BuildRecord.Entry>.append(&mut merged.entries, Intrinsic.replace(taken.*, absentEntry(exact)))
+        run List<Option<InstanceDefinition>>.append(&mut definitions, Option<InstanceDefinition>.none())
+        run List<bool>.append(&mut held, false)
+      }
+      at = at + usize.ONE
+    }
+    part = part + usize.ONE
+  }
+  let mut absent = List<ContentHash>.make()
+  let known = List<BuildRecord.Entry>.length(&merged.entries)
+  let from = List<usize>.asSlice(&sources)
+  let named = List<List<ContentHash>>.asSlice(&exacts)
+  let resolved = List<BuildRecord.Entry>.asMutSlice(&mut merged.entries)
+  let mut at = usize.ZERO
+  while at < lowered {
+    let names = List<ContentHash>.asSlice(&named[from[at]])
+    let references = List<BuildRecord.Reference>.asMutSlice(&mut resolved[at].references)
+    let mut reference = usize.ZERO
+    while reference < references.length {
+      let target = names[references[reference].target]
+      let mut found = DigestSet.find(&placed, target)
+      if found == usize.MAX {
+        found = known + List<ContentHash>.length(&absent)
+        drop run DigestSet.add(&mut placed, target)
+        run List<ContentHash>.append(&mut absent, target)
+      }
+      references[reference].target = found
+      reference = reference + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  let unnamed = List<ContentHash>.asSlice(&absent)
+  at = usize.ZERO
+  while at < unnamed.length {
+    run List<BuildRecord.Entry>.append(&mut merged.entries, absentEntry(unnamed[at]))
+    run List<Option<InstanceDefinition>>.append(&mut definitions, Option<InstanceDefinition>.none())
+    run List<bool>.append(&mut held, false)
+    at = at + usize.ONE
+  }
+  // Each entry's parent: none for a root, else the first entry found to reference it.
+  let total = List<BuildRecord.Entry>.length(&merged.entries)
+  let mut reached = List<bool>.make()
+  run List<bool>.appendRepeated(&mut reached, false, total)
+  let mut queue = List<usize>.make()
+  let all = List<BuildRecord.Entry>.asMutSlice(&mut merged.entries)
+  at = usize.ZERO
+  while at < total {
+    all[at].parent = usize.MAX
+    all[at].position = usize.MAX
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < roots.length {
+    let entry = DigestSet.find(&placed, run instanceDigest(&roots[at].key))
+    if entry != usize.MAX && !List<bool>.get(&reached, entry) {
+      List<bool>.set(&mut reached, entry, true)
+      all[entry].position = at
+      run List<usize>.append(&mut queue, entry)
+    }
+    at = at + usize.ONE
+  }
+  let mut next = usize.ZERO
+  while next < List<usize>.length(&queue) {
+    let entry = List<usize>.get(&queue, next)
+    next = next + usize.ONE
+    let count = List<BuildRecord.Reference>.length(&all[entry].references)
+    let mut reference = usize.ZERO
+    while reference < count {
+      let target = List<BuildRecord.Reference>.asSlice(&all[entry].references)[reference].target
+      if !List<bool>.get(&reached, target) {
+        List<bool>.set(&mut reached, target, true)
+        all[target].parent = entry
+        all[target].position = reference
+        run List<usize>.append(&mut queue, target)
+      }
+      reference = reference + usize.ONE
+    }
+  }
+  let mut definitionRoots = List<usize>.make()
+  run List<usize>.appendRepeated(&mut definitionRoots, usize.MAX, total)
+  let mut places = List<TextPlace>.make()
+  run List<TextPlace>.appendRepeated(&mut places, TextPlace {pack: usize.MAX, member: usize.MAX}, total)
+  return Option<ReplayState>.some(ReplayState {record: move merged, recordRoot: usize.MAX, roots: move definitionRoots,
+    definitions: move definitions, places: move places, held: move held, packRoots: List<usize>.make(), guarded: false})
 }
 
 // One reached instance of a captured walk, before its references are resolved to entries.
