@@ -24,6 +24,7 @@ import silk.core.effect {Effect}
 import silk.system.filesystem {DirectoryEntry, DirectoryInfo, FileError, FileInfo, FileSystem, Path}
 import silk.collections.list {List}
 import silk.concurrency.thread_native {JoinHandle, NativeThread, SpawnError}
+import silk.concurrency.work_queue {Injector}
 import silk.core.option {Option}
 import silk.system.child_process_native {OsChildProcess}
 import silk.system.filesystem_machine {MachineFileSystem}
@@ -118,32 +119,37 @@ pub struct Job {
   pub request: ProcessRequest,
 }
 
+// One job in the shared queue, and its place in the caller's list.
+struct Queued {
+  index: usize,
+  job: Job,
+}
+
+// What one worker thread ran: the place of each job it took, and each one's exit status, in the
+// order it took them. A thread that stops early holds a place without a status.
+struct Ran {
+  indexes: List<usize>,
+  statuses: List<i32>,
+}
+
 /// Encodes each job's fragments to its input and runs its command, on up to `workers` threads,
 /// and answers each command's exit status in order: -1 when its input could not be written, or
 /// its command did not start or did not exit.
 ///
 /// # Details
-/// `sizes` weighs each job by the size of its fragments. The heaviest job goes first, to the
-/// thread with the least weight so far, so one large unit never waits behind a queue of small ones.
+/// The threads take jobs from one queue, so a thread that finishes early takes the next job
+/// instead of waiting for the others. `sizes` weighs each job by the size of its fragments, and
+/// the queue holds the heaviest first: the large units start while every thread is busy, and the
+/// last jobs to finish are small ones.
 pub effect fn runAll(jobs: List<Job>, sizes: &[usize], workers: usize) -> List<i32> ! OutOfMemoryError | SpawnError ? &mut Allocator {
   let count = List<Job>.length(&jobs)
   let mut threads = workers
   if threads > count { threads = count }
   if threads == usize.ZERO { threads = usize.ONE }
-  let mut batches = List<List<Job>>.make()
-  let mut loads = List<usize>.make()
-  while List<List<Job>>.length(&batches) < threads {
-    run List<List<Job>>.append(&mut batches, List<Job>.make())
-    run List<usize>.append(&mut loads, usize.ZERO)
-  }
-  // Each command's thread and its place in that thread's batch.
-  let mut owners = List<usize>.make()
-  let mut slots = List<usize>.make()
+  let queue = run Injector<Queued>.make()
   let mut taken = List<bool>.make()
   let mut at = usize.ZERO
   while at < count {
-    run List<usize>.append(&mut owners, usize.ZERO)
-    run List<usize>.append(&mut slots, usize.ZERO)
     run List<bool>.append(&mut taken, false)
     at = at + usize.ONE
   }
@@ -156,16 +162,7 @@ pub effect fn runAll(jobs: List<Job>, sizes: &[usize], workers: usize) -> List<i
       if !List<bool>.get(&taken, at) && (heaviest == usize.MAX || weightOf(sizes, at) > weightOf(sizes, heaviest)) { heaviest = at }
       at = at + usize.ONE
     }
-    let mut lightest = usize.ZERO
-    let mut worker = usize.ONE
-    while worker < threads {
-      if List<usize>.get(&loads, worker) < List<usize>.get(&loads, lightest) { lightest = worker }
-      worker = worker + usize.ONE
-    }
-    let slot = List<Job>.length(&List<List<Job>>.asSlice(&batches)[lightest])
-    List<usize>.set(&mut slots, heaviest, slot)
-    List<usize>.set(&mut owners, heaviest, lightest)
-    // Pending jobs retain original order with previously assigned jobs removed.
+    // Pending jobs retain original order with previously queued jobs removed.
     let mut pendingIndex = usize.ZERO
     let mut before = usize.ZERO
     while before < heaviest {
@@ -173,39 +170,38 @@ pub effect fn runAll(jobs: List<Job>, sizes: &[usize], workers: usize) -> List<i
       before = before + usize.ONE
     }
     List<bool>.set(&mut taken, heaviest, true)
-    let load = List<usize>.get(&loads, lightest) + weightOf(sizes, heaviest)
-    List<usize>.set(&mut loads, lightest, load)
     let job = List<Job>.remove(&mut pending, pendingIndex)
-    let mut writable = List<List<Job>>.asMutSlice(&mut batches)
-    run List<Job>.append(&mut writable[lightest], move job)
+    run Injector<Queued>.push(&queue, Queued {index: heaviest, job: move job})
     placed = placed + usize.ONE
   }
-  let mut handles = List<JoinHandle<List<i32>>>.make()
-  while List<List<Job>>.length(&batches) > usize.ZERO {
-    let batch = List<List<Job>>.remove(&mut batches, usize.ZERO)
+  let mut handles = List<JoinHandle<Ran>>.make()
+  let mut started = usize.ZERO
+  while started < threads {
+    let shared = Injector<Queued>.clone(&queue)
     let handle = run NativeThread.spawn(
-      fn() -> List<i32> {
-        return run runBatch(move batch)
+      fn() -> Ran {
+        return run runQueued(move shared)
       }
     )
-    run List<JoinHandle<List<i32>>>.append(&mut handles, move handle)
-  }
-  let mut finished = List<List<i32>>.make()
-  while List<JoinHandle<List<i32>>>.length(&handles) > usize.ZERO {
-    let handle = List<JoinHandle<List<i32>>>.remove(&mut handles, usize.ZERO)
-    run List<List<i32>>.append(&mut finished, handle.join())
+    run List<JoinHandle<Ran>>.append(&mut handles, move handle)
+    started = started + usize.ONE
   }
   let mut statuses = List<i32>.make()
   at = usize.ZERO
   while at < count {
-    let results = List<List<i32>>.asSlice(&finished)
-    let owner = List<usize>.get(&owners, at)
-    let slot = List<usize>.get(&slots, at)
-    let mut status: i32 = -1
-    // A worker that failed early answers fewer statuses than it had commands.
-    if slot < List<i32>.length(&results[owner]) { status = List<i32>.get(&results[owner], slot) }
-    run List<i32>.append(&mut statuses, status)
+    run List<i32>.append(&mut statuses, -1)
     at = at + usize.ONE
+  }
+  while List<JoinHandle<Ran>>.length(&handles) > usize.ZERO {
+    let handle = List<JoinHandle<Ran>>.remove(&mut handles, usize.ZERO)
+    let ran = handle.join()
+    let indexes = List<usize>.asSlice(&ran.indexes)
+    let answered = List<i32>.asSlice(&ran.statuses)
+    let mut done = usize.ZERO
+    while done < indexes.length && done < answered.length {
+      List<i32>.set(&mut statuses, indexes[done], answered[done])
+      done = done + usize.ONE
+    }
   }
   return move statuses
 }
@@ -216,51 +212,66 @@ fn weightOf(sizes: &[usize], at: usize) -> usize {
   return usize.ZERO
 }
 
-// A worker thread's jobs, run one at a time with services of its own.
-effect fn runBatch(batch: List<Job>) -> List<i32> {
+// A worker thread: takes jobs from the shared queue until it is empty, with services of its own.
+effect fn runQueued(queue: Injector<Queued>) -> Ran {
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut process = OsChildProcess.make()
-  let ran = run Effect.result(
-    runEach(&batch) |> Effect.provideMut<ChildProcess>(&mut process)
+  let mut ran = Ran {indexes: List<usize>.make(), statuses: List<i32>.make()}
+  // A thread that runs out of memory stops; the jobs it leaves answer -1 or go to another thread.
+  drop run Effect.result(
+    runTaken(&queue, &mut ran) |> Effect.provideMut<ChildProcess>(&mut process)
       |> Effect.provideMut<Allocator>(&mut allocator)
   )
-  return match move ran {
-    Result<List<i32>, FileError | OutOfMemoryError>.Success {value} => move value
-    Result<List<i32>, FileError | OutOfMemoryError>.Failure {error: _} => List<i32>.make()
-  }
+  return move ran
 }
 
-effect fn runEach(batch: &List<Job>) -> List<i32> ! FileError | OutOfMemoryError ? &mut ChildProcess | &mut Allocator {
-  let jobs = List<Job>.asSlice(batch)
+effect fn runTaken(queue: &Injector<Queued>, ran: &mut Ran) -> () ! OutOfMemoryError ? &mut ChildProcess | &mut Allocator {
   let mut files = run MachineFileSystem.make()
-  let mut statuses = List<i32>.make()
-  let mut at = usize.ZERO
-  while at < jobs.length {
-    let mut bitcode = Bytes.make()
-    if let Option<Bytes>.Some {value: exports} = &jobs[at].exports {
-      bitcode = run Bitcode.compileUnit(Bytes.asSlice(&jobs[at].fragments), Bytes.asSlice(&exports))
-    } else if Bytes.length(&jobs[at].debug) == usize.ZERO {
-      bitcode = run Bitcode.compile(Bytes.asSlice(&jobs[at].fragments))
-    } else {
-      bitcode = run Bitcode.compileDebug(Bytes.asSlice(&jobs[at].fragments), Bytes.asSlice(&jobs[at].debug))
+  while true {
+    let taken = match move Injector<Queued>.pop(queue) {
+      Option<Queued>.Some {value} => move value
+      Option<Queued>.None => { break }
     }
-    let input = run Path.fromBytes(Bytes.asSlice(&jobs[at].input))
-    run FileSystem.writeFile(&input, Bytes.asSlice(&bitcode)) |> Effect.provideMut<FileSystem>(&mut files)
-    let submitted = run Effect.result(ChildProcess.submit(&jobs[at].request))
+    run List<usize>.append(&mut ran.indexes, taken.index)
     let mut status: i32 = -1
-    match move submitted {
-      Result<ProcessOutcome, ProcessError | OutOfMemoryError>.Success {value: outcome} => {
-        if let Option<i32>.Some {value} = move ChildProcess.exitCode(&outcome) { status = value }
-      }
-      Result<ProcessOutcome, ProcessError | OutOfMemoryError>.Failure {error} => match move error {
-        ProcessError failed => { drop failed }
+    match move run Effect.result(runOne(&taken.job, &mut files)) {
+      Result<i32, FileError | OutOfMemoryError>.Success {value} => { status = value }
+      Result<i32, FileError | OutOfMemoryError>.Failure {error} => match move error {
+        // The input could not be written: this job answers -1 and the thread takes the next.
+        FileError failed => { drop failed }
         OutOfMemoryError exhausted => { fail move exhausted }
       }
     }
-    run List<i32>.append(&mut statuses, status)
-    at = at + usize.ONE
+    run List<i32>.append(&mut ran.statuses, status)
   }
-  return move statuses
+  return ()
+}
+
+// Writes one job's input and runs its command: the command's exit status, or -1 when it did not
+// start or did not exit.
+effect fn runOne(job: &Job, files: &mut MachineFileSystem) -> i32 ! FileError | OutOfMemoryError ? &mut ChildProcess | &mut Allocator {
+  let mut bitcode = Bytes.make()
+  if let Option<Bytes>.Some {value: exports} = &job.exports {
+    bitcode = run Bitcode.compileUnit(Bytes.asSlice(&job.fragments), Bytes.asSlice(&exports))
+  } else if Bytes.length(&job.debug) == usize.ZERO {
+    bitcode = run Bitcode.compile(Bytes.asSlice(&job.fragments))
+  } else {
+    bitcode = run Bitcode.compileDebug(Bytes.asSlice(&job.fragments), Bytes.asSlice(&job.debug))
+  }
+  let input = run Path.fromBytes(Bytes.asSlice(&job.input))
+  run FileSystem.writeFile(&input, Bytes.asSlice(&bitcode)) |> Effect.provideMut<FileSystem>(&mut files.*)
+  let submitted = run Effect.result(ChildProcess.submit(&job.request))
+  let mut status: i32 = -1
+  match move submitted {
+    Result<ProcessOutcome, ProcessError | OutOfMemoryError>.Success {value: outcome} => {
+      if let Option<i32>.Some {value} = move ChildProcess.exitCode(&outcome) { status = value }
+    }
+    Result<ProcessOutcome, ProcessError | OutOfMemoryError>.Failure {error} => match move error {
+      ProcessError failed => { drop failed }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  return status
 }
 
 /// Removes the objects and leftover partial compiles in `directory` that no path of `kept` names,
