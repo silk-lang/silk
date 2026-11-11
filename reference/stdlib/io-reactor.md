@@ -547,9 +547,9 @@ passes. Writes the ready descriptors to the start of `events`, and returns their
 
 #### Details
 `timeout` is in nanoseconds. `none` waits with no limit, and `some(0)` checks once and does
-not block. On Linux, a timeout is rounded up to whole milliseconds. A wake ends the wait and
-is not written to `events`, so a wait can return 0 before the timeout. A signal that interrupts
-the wait also returns 0. At most `events.length` events are returned; the others stay for the
+not block. On Linux before 5.11 (no `epoll_pwait2`), a timeout is rounded up to whole
+milliseconds. A wake ends the wait and is not written to `events`, so a wait can return 0
+before the timeout. A signal that interrupts the wait also returns 0. At most `events.length` events are returned; the others stay for the
 next wait.
 
 #### Errors
