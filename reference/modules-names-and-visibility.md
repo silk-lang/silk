@@ -161,6 +161,13 @@ Bodies with unsupplied static inputs or generic-dependent static expansion defer
 The standard library can itself be compiled as the root package to check its otherwise unreached
 closed declarations under the same rule.
 
+`silk check` also follows each checked declaration into the instances it selects, so it reports
+what only a concrete instance can refuse: a selected `compileError`, a recursive specialization
+that never closes, or a local-shared access that escapes. `silk build` checks every declaration as
+its source writes it, then walks from the artifact's roots and checks each instance it emits. An
+instance no root of the artifact reaches is therefore not checked by a build, and what it refuses
+is an error of `silk check` alone.
+
 **Boundary:** Loading still parses the whole source and makes its declarations available for static
 analysis. Declaration checking does not make every function executable or include it in the emitted
 program. Runtime reachability is a separate property beginning at the selected entry point.
