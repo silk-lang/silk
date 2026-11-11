@@ -78,7 +78,7 @@ integration/json-schema-conformance/check-json-schema
 The driver downloads a checksum-pinned suite, builds the native runner, and reports failures
 without skips. `--draft draft2020-12` or `--match unevaluated` narrows an investigation;
 `--runner /path/to/runner` reuses a build. IDNA data is reproducible with
-`scripts/unicode/generate-schema-idna`. The `pattern` engine is `silk.text.regex`, Silk's
+`scripts/unicode/generate-idna`. The `pattern` engine is `silk.text.regex`, Silk's
 own regular-expression engine; its Unicode tables come from SilkJS's
 `scripts/generate_unicode.py`.
 

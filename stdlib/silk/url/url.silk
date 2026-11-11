@@ -1,0 +1,1824 @@
+//! Parse, serialize, and change URLs as the WHATWG URL Standard specifies, the way web browsers
+//! and JavaScript's `URL` do.
+//!
+//! # When to use
+//! Use [`Url`] for URLs that come from the web or from people: links, `fetch` targets, and
+//! request URLs. It accepts what browsers accept and normalizes it the same way. For strict RFC
+//! 3986 URIs, use `silk.uri.uri`.
+//!
+//! # Details
+//! A [`Url`] holds one ASCII string, its serialization, and the positions of its components, so
+//! reading a component does not allocate. [`Url.parse`] resolves a relative input against a base.
+//! The setters, such as [`Url.setPathname`], follow the URL Standard's API setters: an input that
+//! cannot change the component leaves the URL as it is. Non-ASCII text is percent-encoded as UTF-8
+//! and domains are converted with UTS #46, so the serialization is always ASCII.
+//!
+//! # Errors
+//! - `OutOfMemoryError` from every function that allocates.
+//!
+//! # Examples
+//! ## Parse a URL and read its parts
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.core.effect { Effect }
+//! import silk.core.option { Option }
+//! import silk.url.url { Url }
+//!
+//! pub effect fn main() -> i32
+//!   ! OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let parsed = run Url.parse("HTTPS://Example.COM:443/a/./b/../c?x=1#top", Option<&Url>.none())
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!   let url = match move parsed {
+//!     Option<Url>.Some { value } => move value
+//!     Option<Url>.None => { return 1 }
+//!   }
+//!   if Url.href(&url) != "https://example.com/a/c?x=1#top" || Url.pathname(&url) != "/a/c" {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.ownership { Copy }
+import silk.core.option { Option }
+import silk.collections.bytes { Bytes }
+import silk.collections.slice { Slice }
+import silk.text.string { String }
+import silk.url.host { UrlHost, UrlHostKind }
+import silk.url.percent { UrlPercent, UrlEncodeSet }
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+
+// The scheme of a URL, by the rules it selects. Special schemes have default ports and hosts.
+enum Scheme {
+  Other,
+  Http,
+  Https,
+  Ws,
+  Wss,
+  Ftp,
+  File,
+}
+
+const ABSENT: usize = 0xFFFFFFFFFFFFFFFF
+
+const NO_PORT: u32 = 0x10000
+
+/// A URL as the WHATWG URL Standard defines it: its serialization and the positions of its
+/// components.
+///
+/// # Details
+/// The serialization is `scheme:`, then `//`, user information, the host, and the port when the URL
+/// has a host, then the path, `?` and the query, and `#` and the fragment. A `Url` owns it. The
+/// getters return views of it, with the same text as the getters of JavaScript's `URL`.
+///
+/// # Gotchas
+/// A URL with an opaque path, such as `mailto:a@example.com`, has a path that is one string, not
+/// segments, and [`Url.setPathname`] does not change it.
+pub struct Url {
+  bytes: Bytes,
+  // The positions of the parts of `href`. `schemeEnd` is the position of the `:` after the scheme.
+  // Credentials are [userStart, usernameEnd) and [usernameEnd + 1, passwordEnd) with `@` at
+  // passwordEnd when present. The host is [hostStart, hostEnd), then `:` and the port when
+  // `port` is not NO_PORT. A path that starts with an empty segment and has no host is written
+  // after `/.`, which `pathStart` skips.
+  schemeEnd: usize,
+  userStart: usize,
+  usernameEnd: usize,
+  passwordEnd: usize,
+  hostStart: usize,
+  hostEnd: usize,
+  portValue: u32,
+  pathStart: usize,
+  queryStart: usize,
+  fragmentStart: usize,
+  hostType: UrlHostKind,
+  kind: Scheme,
+  opaque: bool,
+}
+
+impl Url {
+  /// Parses `input` as a URL, relative to `base` when it is given. Returns `None` if `input` is
+  /// not a valid URL.
+  ///
+  /// # Details
+  /// It is the URL Standard's basic URL parser with UTF-8 encoding. Leading and trailing C0 controls
+  /// and spaces are removed, and so are all tabs and newlines. `input` can be relative only when
+  /// `base` is given.
+  ///
+  /// # Errors
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  pub effect fn parse(input: string, base: Option<&Url>) -> Option<Url>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let raw = String.utf8Bytes(input)
+    let mut start: usize = 0
+    let mut end = raw.length
+    while start < end && raw[start] <= 32 {
+      start = start + 1
+    }
+    while end > start && raw[end - 1] <= 32 {
+      end = end - 1
+    }
+    let trimmed = Slice.view<u8>(raw, start, end - start)
+    if !hasTabOrNewline(trimmed) {
+      return run parseClean(trimmed, base)
+    }
+    let mut cleaned = run withoutTabOrNewline(trimmed)
+    return run parseClean(Bytes.asSlice(&cleaned), base)
+  }
+
+  /// Returns whether `input` is a valid URL, relative to `base` when it is given.
+  ///
+  /// # Errors
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  pub effect fn canParse(input: string, base: Option<&Url>) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match run Url.parse(input, base) {
+      Option<Url>.Some { .. } => true
+      Option<Url>.None => false
+    }
+  }
+
+  /// Returns a copy of `self`.
+  ///
+  /// # Errors
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  pub effect fn copy(self: &Self) -> Url
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let href = run Bytes.copy(Bytes.asSlice(&self.bytes))
+    return Url {
+      bytes: move href,
+      schemeEnd: self.schemeEnd,
+      userStart: self.userStart,
+      usernameEnd: self.usernameEnd,
+      passwordEnd: self.passwordEnd,
+      hostStart: self.hostStart,
+      hostEnd: self.hostEnd,
+      portValue: self.portValue,
+      pathStart: self.pathStart,
+      queryStart: self.queryStart,
+      fragmentStart: self.fragmentStart,
+      hostType: self.hostType,
+      kind: self.kind,
+      opaque: self.opaque,
+    }
+  }
+
+  /// Returns the serialization of the URL, as JavaScript's `URL.href` does. It is ASCII.
+  pub fn href(self: &Self) -> string {
+    return self.text(0, Bytes.length(&self.bytes))
+  }
+
+  /// Returns the serialization without the fragment and its `#`.
+  pub fn hrefWithoutFragment(self: &Self) -> string {
+    return self.text(0, self.pathEnd2())
+  }
+
+  /// Returns the scheme followed by `:`, as JavaScript's `URL.protocol` does: `https:`.
+  pub fn protocol(self: &Self) -> string {
+    return self.text(0, self.schemeEnd + 1)
+  }
+
+  /// Returns the scheme, without the `:`: `https`. It is lowercase.
+  pub fn scheme(self: &Self) -> string {
+    return self.text(0, self.schemeEnd)
+  }
+
+  /// Returns the percent-encoded user name, or an empty string.
+  pub fn username(self: &Self) -> string {
+    return self.text(self.userStart, self.usernameEnd)
+  }
+
+  /// Returns the percent-encoded password, or an empty string.
+  pub fn password(self: &Self) -> string {
+    if self.passwordEnd == self.usernameEnd {
+      return ""
+    }
+    return self.text(self.usernameEnd + 1, self.passwordEnd)
+  }
+
+  /// Returns the serialized host and the port after `:` if the URL has a port, as JavaScript's
+  /// `URL.host` does: `example.com:8080`. It is empty when the URL has no host.
+  pub fn host(self: &Self) -> string {
+    if self.hostType == UrlHostKind.Absent {
+      return ""
+    }
+    return self.text(self.hostStart, self.pathStart)
+  }
+
+  /// Returns the serialized host, as JavaScript's `URL.hostname` does. An IPv6 address is in
+  /// brackets. It is empty when the URL has no host.
+  pub fn hostname(self: &Self) -> string {
+    return self.text(self.hostStart, self.hostEnd)
+  }
+
+  /// Returns the kind of the host.
+  pub fn hostKind(self: &Self) -> UrlHostKind {
+    return self.hostType
+  }
+
+  /// Returns the port in decimal, or an empty string when the URL has no port or the port is the
+  /// default of the scheme.
+  pub fn port(self: &Self) -> string {
+    if self.portValue == NO_PORT {
+      return ""
+    }
+    return self.text(self.hostEnd + 1, self.pathStart)
+  }
+
+  /// Returns the port, or `None` when the URL has no port or the port is the default of the scheme.
+  pub fn portNumber(self: &Self) -> Option<u16> {
+    if self.portValue == NO_PORT {
+      return Option<u16>.none()
+    }
+    return Option<u16>.some(u32.toU16(self.portValue))
+  }
+
+  /// Returns the path, as JavaScript's `URL.pathname` does: `/a/b`, or the opaque path.
+  pub fn pathname(self: &Self) -> string {
+    return self.text(self.pathStart, self.pathEnd())
+  }
+
+  /// Returns `?` and the query, or an empty string when the query is absent or empty, as
+  /// JavaScript's `URL.search` does.
+  pub fn search(self: &Self) -> string {
+    if self.queryStart == ABSENT {
+      return ""
+    }
+    let end = self.pathEnd2()
+    if end - self.queryStart <= 1 {
+      return ""
+    }
+    return self.text(self.queryStart, end)
+  }
+
+  /// Returns the query without `?`, or `None` when the URL has no query.
+  pub fn query(self: &Self) -> Option<string> {
+    if self.queryStart == ABSENT {
+      return Option<string>.none()
+    }
+    return Option<string>.some(self.text(self.queryStart + 1, self.pathEnd2()))
+  }
+
+  /// Returns `#` and the fragment, or an empty string when the fragment is absent or empty, as
+  /// JavaScript's `URL.hash` does.
+  pub fn hash(self: &Self) -> string {
+    if self.fragmentStart == ABSENT {
+      return ""
+    }
+    let end = Bytes.length(&self.bytes)
+    if end - self.fragmentStart <= 1 {
+      return ""
+    }
+    return self.text(self.fragmentStart, end)
+  }
+
+  /// Returns the fragment without `#`, or `None` when the URL has no fragment.
+  pub fn fragment(self: &Self) -> Option<string> {
+    if self.fragmentStart == ABSENT {
+      return Option<string>.none()
+    }
+    return Option<string>.some(self.text(self.fragmentStart + 1, Bytes.length(&self.bytes)))
+  }
+
+  /// Returns whether the URL has an opaque path, such as `mailto:a@example.com`.
+  pub fn hasOpaquePath(self: &Self) -> bool {
+    return self.opaque
+  }
+
+  /// Returns whether the scheme is special: `http`, `https`, `ws`, `wss`, `ftp`, or `file`.
+  pub fn isSpecial(self: &Self) -> bool {
+    return self.kind != Scheme.Other
+  }
+
+  /// Appends the serialization of the URL's origin to `output`, as JavaScript's `URL.origin` does.
+  ///
+  /// # Details
+  /// The origin of an `http`, `https`, `ws`, `wss`, or `ftp` URL is its scheme, host, and port:
+  /// `https://example.com:8443`. A `blob` URL has the origin of the URL in its path when that URL is
+  /// `http` or `https`. Every other URL has an opaque origin, serialized as `null`.
+  ///
+  /// # Errors
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  pub effect fn appendOrigin(self: &Self, output: &mut String) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.kind != Scheme.Other && self.kind != Scheme.File {
+      run String.append(&mut output.*, self.protocol())
+      run String.append(&mut output.*, "//")
+      return run String.append(&mut output.*, self.host())
+    }
+    if self.kind == Scheme.Other && self.scheme() == "blob" {
+      let inner = run Url.parse(self.pathname(), Option<&Url>.none())
+      match move inner {
+        Option<Url>.Some { value } => {
+          if value.kind == Scheme.Http || value.kind == Scheme.Https {
+            return run value.appendOrigin(&mut output.*)
+          }
+        }
+        Option<Url>.None => {}
+      }
+    }
+    return run String.append(&mut output.*, "null")
+  }
+
+  /// Replaces the URL with `input` parsed with no base, and returns `true`. Returns `false` and
+  /// leaves the URL as it is when `input` is not a valid URL, as JavaScript's `href` setter does.
+  ///
+  /// # Errors
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  pub effect fn setHref(self: &mut Self, input: string) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match run Url.parse(input, Option<&Url>.none()) {
+      Option<Url>.Some { value } => {
+        self.* = move value
+        true
+      }
+      Option<Url>.None => false
+    }
+  }
+
+  /// Sets the scheme from `input` up to its first `:`, as JavaScript's `protocol` setter does.
+  ///
+  /// # Details
+  /// A special scheme cannot change to a scheme that is not special or the reverse, a URL with
+  /// credentials or a port cannot become a `file` URL, and a `file` URL with an empty host keeps
+  /// its scheme. A port that is the new scheme's default is removed.
+  ///
+  /// # Errors
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  pub effect fn setProtocol(self: &mut Self, input: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let raw = run withoutTabOrNewline(String.utf8Bytes(input))
+    let bytes = Bytes.asSlice(&raw)
+    if bytes.length == 0 || !alpha(bytes[0]) {
+      return ()
+    }
+    let mut end: usize = 1
+    while end < bytes.length && schemeByte(bytes[end]) {
+      end = end + 1
+    }
+    if end < bytes.length && bytes[end] != 58 {
+      return ()
+    }
+    let mut scheme = run Bytes.copy(Slice.view<u8>(bytes, 0, end))
+    lowercase(Bytes.asMutSlice(&mut scheme))
+    let kind = schemeKind(Bytes.asSlice(&scheme))
+    if (self.kind == Scheme.Other) != (kind == Scheme.Other) {
+      return ()
+    }
+    if kind == Scheme.File
+      && (self.usernameEnd != self.userStart || self.passwordEnd != self.usernameEnd
+        || self.portValue != NO_PORT) {
+      return ()
+    }
+    if self.kind == Scheme.File && self.hostType == UrlHostKind.Empty {
+      return ()
+    }
+    let removePort = self.portValue != NO_PORT && self.portValue == defaultPort(kind)
+    let mut parts = self.parts()
+    parts.scheme = Bytes.asSlice(&scheme)
+    if removePort {
+      parts.port = ""
+    }
+    let newPort = if removePort {
+      NO_PORT
+    } else {
+      self.portValue
+    }
+    let rebuilt = run Url.rebuildFrom(&parts, kind, self.hostType, newPort, self.opaque)
+    self.* = move rebuilt
+    return ()
+  }
+
+  /// Sets the user name to `input`, percent-encoded, as JavaScript's `username` setter does. A URL
+  /// with no host, an empty host, or the `file` scheme keeps its user name.
+  ///
+  /// # Errors
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  pub effect fn setUsername(self: &mut Self, input: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.cannotHaveCredentialsOrPort() {
+      return ()
+    }
+    let mut encoded = Bytes.make()
+    run UrlPercent.appendEncoded(&mut encoded, String.utf8Bytes(input), UrlEncodeSet.Userinfo)
+    let mut parts = self.parts()
+    parts.username = unsafe String.fromUtf8Unchecked(Bytes.asSlice(&encoded))
+    let rebuilt = run Url.rebuildFrom(&parts, self.kind, self.hostType, self.portValue, self.opaque)
+    self.* = move rebuilt
+    return ()
+  }
+
+  /// Sets the password to `input`, percent-encoded, as JavaScript's `password` setter does. A URL
+  /// with no host, an empty host, or the `file` scheme keeps its password.
+  ///
+  /// # Errors
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  pub effect fn setPassword(self: &mut Self, input: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.cannotHaveCredentialsOrPort() {
+      return ()
+    }
+    let mut encoded = Bytes.make()
+    run UrlPercent.appendEncoded(&mut encoded, String.utf8Bytes(input), UrlEncodeSet.Userinfo)
+    let mut parts = self.parts()
+    parts.password = unsafe String.fromUtf8Unchecked(Bytes.asSlice(&encoded))
+    let rebuilt = run Url.rebuildFrom(&parts, self.kind, self.hostType, self.portValue, self.opaque)
+    self.* = move rebuilt
+    return ()
+  }
+
+  /// Sets the host and, after a `:`, the port from `input`, as JavaScript's `host` setter does.
+  /// An invalid host, or a URL with an opaque path, leaves the URL as it is.
+  ///
+  /// # Errors
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  pub effect fn setHost(self: &mut Self, input: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run self.setHostWith(input, true)
+  }
+
+  /// Sets the host from `input`, without the port, as JavaScript's `hostname` setter does. An
+  /// invalid host, or a URL with an opaque path, leaves the URL as it is.
+  ///
+  /// # Errors
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  pub effect fn setHostname(self: &mut Self, input: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run self.setHostWith(input, false)
+  }
+
+  /// Sets the port from the digits at the start of `input`, as JavaScript's `port` setter does.
+  ///
+  /// # Details
+  /// An empty `input` removes the port. A port that is the scheme's default is removed. Text that
+  /// does not start with a digit, or a value above 65535, leaves the URL as it is. A URL with no
+  /// host, an empty host, or the `file` scheme keeps its port.
+  ///
+  /// # Errors
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  pub effect fn setPort(self: &mut Self, input: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.cannotHaveCredentialsOrPort() {
+      return ()
+    }
+    let raw = run withoutTabOrNewline(String.utf8Bytes(input))
+    let bytes = Bytes.asSlice(&raw)
+    let mut port = NO_PORT
+    if String.byteLength(input) > 0 {
+      let mut value: u32 = 0
+      let mut i: usize = 0
+      while i < bytes.length && bytes[i] >= 48 && bytes[i] <= 57 {
+        value = value * 10 + u8.toU32(bytes[i]) - 48
+        if value > 65535 {
+          return ()
+        }
+        i = i + 1
+      }
+      if i == 0 {
+        return ()
+      }
+      port = value
+      if port == defaultPort(self.kind) {
+        port = NO_PORT
+      }
+    }
+    return run self.replacePort(port)
+  }
+
+  /// Sets the path from `input`, as JavaScript's `pathname` setter does. `.` and `..` segments are
+  /// resolved. A URL with an opaque path keeps its path.
+  ///
+  /// # Errors
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  pub effect fn setPathname(self: &mut Self, input: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.opaque {
+      return ()
+    }
+    let raw = run withoutTabOrNewline(String.utf8Bytes(input))
+    let bytes = Bytes.asSlice(&raw)
+    let mut draft = run self.draftBeforePath()
+    let mut p: usize = 0
+
+    // The path start state, with a state override.
+    if draft.kind != Scheme.Other {
+      if p < bytes.length && (bytes[p] == 47 || bytes[p] == 92) {
+        p = p + 1
+      }
+      run pathState(bytes, p, &mut draft, true)
+    } else if p < bytes.length {
+      if bytes[p] == 47 {
+        p = p + 1
+      }
+      run pathState(bytes, p, &mut draft, true)
+    } else if draft.hostType == UrlHostKind.Absent {
+      run Bytes.append(&mut draft.bytes, b"/")
+    }
+    let rest = self.text(self.pathEnd(), Bytes.length(&self.bytes))
+    let finished = run Url.finishDraft(move draft, String.utf8Bytes(rest))
+    self.* = move finished
+    return ()
+  }
+
+  /// Sets the query from `input`, without a leading `?`, as JavaScript's `search` setter does. An
+  /// empty `input` removes the query.
+  ///
+  /// # Errors
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  pub effect fn setSearch(self: &mut Self, input: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut given = String.utf8Bytes(input)
+    if given.length > 0 && given[0] == 63 {
+      given = Slice.view<u8>(given, 1, given.length - 1)
+    }
+    let raw = run withoutTabOrNewline(given)
+    let bytes = Bytes.asSlice(&raw)
+    let mut query = Bytes.make()
+    let empty = String.byteLength(input) == 0
+    if !empty {
+      run Bytes.append(&mut query, b"?")
+      let set = if self.kind != Scheme.Other {
+        UrlEncodeSet.SpecialQuery
+      } else {
+        UrlEncodeSet.Query
+      }
+      run UrlPercent.appendEncoded(&mut query, bytes, set)
+    }
+    let mut parts = self.parts()
+    parts.query = unsafe String.fromUtf8Unchecked(Bytes.asSlice(&query))
+    if empty {
+      run self.stripOpaqueTrail(&mut parts, true)
+    }
+    let rebuilt = run Url.rebuildFrom(&parts, self.kind, self.hostType, self.portValue, self.opaque)
+    self.* = move rebuilt
+    return ()
+  }
+
+  /// Sets the fragment from `input`, without a leading `#`, as JavaScript's `hash` setter does. An
+  /// empty `input` removes the fragment.
+  ///
+  /// # Errors
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  pub effect fn setHash(self: &mut Self, input: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut given = String.utf8Bytes(input)
+    if given.length > 0 && given[0] == 35 {
+      given = Slice.view<u8>(given, 1, given.length - 1)
+    }
+    let raw = run withoutTabOrNewline(given)
+    let bytes = Bytes.asSlice(&raw)
+    let mut fragment = Bytes.make()
+    let empty = String.byteLength(input) == 0
+    if !empty {
+      run Bytes.append(&mut fragment, b"#")
+      run UrlPercent.appendEncoded(&mut fragment, bytes, UrlEncodeSet.Fragment)
+    }
+    let mut parts = self.parts()
+    parts.fragment = unsafe String.fromUtf8Unchecked(Bytes.asSlice(&fragment))
+    if empty {
+      run self.stripOpaqueTrail(&mut parts, false)
+    }
+    let rebuilt = run Url.rebuildFrom(&parts, self.kind, self.hostType, self.portValue, self.opaque)
+    self.* = move rebuilt
+    return ()
+  }
+
+  fn text(self: &Self, start: usize, end: usize) -> string {
+    return unsafe String.fromUtf8Unchecked(
+      Slice.view<u8>(Bytes.asSlice(&self.bytes), start, end - start),
+    )
+  }
+
+  // The end of the path: the start of the query or the fragment, or the end.
+  fn pathEnd(self: &Self) -> usize {
+    if self.queryStart != ABSENT {
+      return self.queryStart
+    }
+    return self.pathEnd2()
+  }
+
+  // The end of the path and query: the start of the fragment, or the end.
+  fn pathEnd2(self: &Self) -> usize {
+    if self.fragmentStart != ABSENT {
+      return self.fragmentStart
+    }
+    return Bytes.length(&self.bytes)
+  }
+
+  fn cannotHaveCredentialsOrPort(self: &Self) -> bool {
+    return self.hostType == UrlHostKind.Absent || self.hostType == UrlHostKind.Empty
+      || self.kind == Scheme.File
+  }
+
+  fn parts(self: &Self) -> Parts<'_> {
+    let hasPort = self.portValue != NO_PORT
+    return Parts {
+      scheme: Slice.view<u8>(Bytes.asSlice(&self.bytes), 0, self.schemeEnd),
+      username: self.username(),
+      password: self.password(),
+      host: self.hostname(),
+      port: if hasPort {
+        self.port()
+      } else {
+        ""
+      },
+      path: self.pathname(),
+      query: self.text(
+        if self.queryStart == ABSENT {
+          self.pathEnd2()
+        } else {
+          self.queryStart
+        },
+        self.pathEnd2(),
+      ),
+      fragment: self.text(
+        if self.fragmentStart == ABSENT {
+          Bytes.length(&self.bytes)
+        } else {
+          self.fragmentStart
+        },
+        Bytes.length(&self.bytes),
+      ),
+    }
+  }
+
+  // Writes a new serialization from `parts` and replaces `self` with it.
+  effect fn rebuildFrom(
+    parts: &Parts<'_>,
+    scheme: Scheme,
+    hostKind: UrlHostKind,
+    port: u32,
+    opaque: bool,
+  ) -> Url
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut draft = run Draft.make(64)
+    draft.kind = scheme
+    draft.opaque = opaque
+    run Bytes.append(&mut draft.bytes, parts.scheme)
+    run Bytes.append(&mut draft.bytes, b":")
+    draft.schemeEnd = parts.scheme.length
+    draft.userStart = draft.schemeEnd + 1
+    draft.usernameEnd = draft.userStart
+    draft.passwordEnd = draft.userStart
+    draft.hostStart = draft.userStart
+    draft.hostEnd = draft.userStart
+    draft.hostType = hostKind
+    if hostKind != UrlHostKind.Absent {
+      run Bytes.append(&mut draft.bytes, b"//")
+      draft.userStart = draft.schemeEnd + 3
+      run Bytes.append(&mut draft.bytes, String.utf8Bytes(parts.username))
+      draft.usernameEnd = Bytes.length(&draft.bytes)
+      if String.byteLength(parts.password) > 0 {
+        run Bytes.append(&mut draft.bytes, b":")
+        run Bytes.append(&mut draft.bytes, String.utf8Bytes(parts.password))
+      }
+      draft.passwordEnd = Bytes.length(&draft.bytes)
+      if draft.passwordEnd > draft.userStart {
+        run Bytes.append(&mut draft.bytes, b"@")
+      }
+      draft.hostStart = Bytes.length(&draft.bytes)
+      run Bytes.append(&mut draft.bytes, String.utf8Bytes(parts.host))
+      draft.hostEnd = Bytes.length(&draft.bytes)
+      draft.portValue = port
+      if port != NO_PORT {
+        run Bytes.append(&mut draft.bytes, b":")
+        run Bytes.append(&mut draft.bytes, String.utf8Bytes(parts.port))
+      }
+    }
+    draft.pathStart = Bytes.length(&draft.bytes)
+    run Bytes.append(&mut draft.bytes, String.utf8Bytes(parts.path))
+    let tail = Bytes.length(&draft.bytes)
+    run Bytes.append(&mut draft.bytes, String.utf8Bytes(parts.query))
+    run Bytes.append(&mut draft.bytes, String.utf8Bytes(parts.fragment))
+    run draft.markTail(tail)
+    run draft.finishPath()
+    return draft.intoUrl()
+  }
+
+  // A URL with an opaque path loses the trailing spaces of its path when its query or fragment is
+  // removed and nothing follows the path.
+  effect fn stripOpaqueTrail(self: &Self, parts: &mut Parts<'_>, query: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.opaque {
+      return ()
+    }
+    if query && String.byteLength(parts.fragment) > 0 {
+      return ()
+    }
+    if !query && String.byteLength(parts.query) > 0 {
+      return ()
+    }
+    let path = String.utf8Bytes(parts.path)
+    let mut end = path.length
+    while end > 0 && path[end - 1] == 32 {
+      end = end - 1
+    }
+    parts.path = unsafe String.fromUtf8Unchecked(Slice.view<u8>(path, 0, end))
+    return ()
+  }
+
+  effect fn replacePort(self: &mut Self, port: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut digits = Bytes.make()
+    if port != NO_PORT {
+      run appendDecimal(&mut digits, port)
+    }
+    let mut parts = self.parts()
+    parts.port = unsafe String.fromUtf8Unchecked(Bytes.asSlice(&digits))
+    let rebuilt = run Url.rebuildFrom(&parts, self.kind, self.hostType, port, self.opaque)
+    self.* = move rebuilt
+    return ()
+  }
+
+  // A draft that holds the serialization up to the end of the host and port, with an empty path.
+  effect fn draftBeforePath(self: &Self) -> Draft
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut draft = run Draft.make(Bytes.length(&self.bytes) + 16)
+    let start = self.pathStart
+    let mut authorityEnd = start
+
+    // `/.` before a path is part of the path's serialization, not of the host.
+    if self.hostType == UrlHostKind.Absent && start == self.schemeEnd + 3 {
+      authorityEnd = self.schemeEnd + 1
+    }
+    run Bytes.append(&mut draft.bytes, Slice.view<u8>(Bytes.asSlice(&self.bytes), 0, authorityEnd))
+    draft.schemeEnd = self.schemeEnd
+    draft.userStart = self.userStart
+    draft.usernameEnd = self.usernameEnd
+    draft.passwordEnd = self.passwordEnd
+    draft.hostStart = self.hostStart
+    draft.hostEnd = self.hostEnd
+    draft.portValue = self.portValue
+    draft.hostType = self.hostType
+    draft.kind = self.kind
+    draft.pathStart = authorityEnd
+    return move draft
+  }
+
+  // Appends `rest` (the query and fragment, with their `?` and `#`) to `draft` and replaces `self`.
+  effect fn finishDraft(draft: Draft, rest: &[u8]) -> Url
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut done = move draft
+    let tail = Bytes.length(&done.bytes)
+    run Bytes.append(&mut done.bytes, rest)
+    run done.markTail(tail)
+    run done.finishPath()
+    return done.intoUrl()
+  }
+
+  effect fn setHostWith(self: &mut Self, input: string, withPort: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.opaque {
+      return ()
+    }
+    let raw = run withoutTabOrNewline(String.utf8Bytes(input))
+    let bytes = Bytes.asSlice(&raw)
+    let special = self.kind != Scheme.Other
+    if self.kind == Scheme.File {
+      // The file host state, with a state override.
+      let mut end: usize = 0
+      while end < bytes.length && bytes[end] != 47 && bytes[end] != 92 && bytes[end] != 63
+        && bytes[end] != 35 {
+        end = end + 1
+      }
+      let buffer = Slice.view<u8>(bytes, 0, end)
+      let mut host = Bytes.make()
+      let mut kind = UrlHostKind.Empty
+      if buffer.length > 0 {
+        kind = match run UrlHost.parse(buffer, false, &mut host) {
+          Option<UrlHostKind>.Some { value } => value
+          Option<UrlHostKind>.None => {
+            return ()
+          }
+        }
+        if Bytes.asSlice(&host) == b"localhost" {
+          Bytes.clear(&mut host)
+          kind = UrlHostKind.Empty
+        }
+      }
+      let mut parts = self.parts()
+      parts.host = unsafe String.fromUtf8Unchecked(Bytes.asSlice(&host))
+      let rebuilt = run Url.rebuildFrom(&parts, self.kind, kind, self.portValue, self.opaque)
+      self.* = move rebuilt
+      return ()
+    }
+
+    // The host and hostname states, with a state override.
+    let mut end: usize = 0
+    let mut brackets = false
+    let mut colon = false
+    while end < bytes.length {
+      let c = bytes[end]
+      if c == 58 && !brackets {
+        colon = true
+        break
+      }
+      if c == 47 || c == 63 || c == 35 || (special && c == 92) {
+        break
+      }
+      if c == 91 {
+        brackets = true
+      }
+      if c == 93 {
+        brackets = false
+      }
+      end = end + 1
+    }
+    let buffer = Slice.view<u8>(bytes, 0, end)
+    if colon && !withPort {
+      return ()
+    }
+    if colon && buffer.length == 0 {
+      return ()
+    }
+    if !colon && special && buffer.length == 0 {
+      return ()
+    }
+    if !colon && buffer.length == 0
+      && (self.usernameEnd != self.userStart || self.passwordEnd != self.usernameEnd
+        || self.portValue != NO_PORT) {
+      return ()
+    }
+    let mut host = Bytes.make()
+    let kind = match run UrlHost.parse(buffer, !special, &mut host) {
+      Option<UrlHostKind>.Some { value } => value
+      Option<UrlHostKind>.None => {
+        return ()
+      }
+    }
+    let mut port = self.portValue
+    let mut digits = Bytes.make()
+    let mut changePort = false
+    if colon {
+      // The port state, with a state override: digits up to the first other byte.
+      let mut p = end + 1
+      let mut value: u32 = 0
+      let mut count: usize = 0
+      while p < bytes.length && bytes[p] >= 48 && bytes[p] <= 57 {
+        value = value * 10 + u8.toU32(bytes[p]) - 48
+        if value > 65535 {
+          // The host is set; the port stays.
+          value = NO_PORT
+          break
+        }
+        p = p + 1
+        count = count + 1
+      }
+      if value != NO_PORT && count > 0 {
+        changePort = true
+        port = if value == defaultPort(self.kind) {
+          NO_PORT
+        } else {
+          value
+        }
+      }
+    }
+    if port != NO_PORT {
+      run appendDecimal(&mut digits, port)
+    }
+    let mut parts = self.parts()
+    parts.host = unsafe String.fromUtf8Unchecked(Bytes.asSlice(&host))
+    if changePort {
+      parts.port = unsafe String.fromUtf8Unchecked(Bytes.asSlice(&digits))
+    }
+    let rebuilt = run Url.rebuildFrom(&parts, self.kind, kind, port, self.opaque)
+    self.* = move rebuilt
+    return ()
+  }
+}
+
+// Views of the serialized components of a URL, for rebuilding it with one component replaced.
+struct Parts<'a> {
+  scheme: &'a [u8],
+  username: string<'a>,
+  password: string<'a>,
+  host: string<'a>,
+  port: string<'a>,
+  path: string<'a>,
+  // With its `?` or `#`, or empty when absent.
+  query: string<'a>,
+  fragment: string<'a>,
+}
+
+// A URL being written. The parser appends each component in order.
+struct Draft {
+  bytes: Bytes,
+  schemeEnd: usize,
+  userStart: usize,
+  usernameEnd: usize,
+  passwordEnd: usize,
+  hostStart: usize,
+  hostEnd: usize,
+  portValue: u32,
+  pathStart: usize,
+  queryStart: usize,
+  fragmentStart: usize,
+  hostType: UrlHostKind,
+  kind: Scheme,
+  opaque: bool,
+}
+
+impl Draft {
+  effect fn make(capacity: usize) -> Draft
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let href = run Bytes.makeWithCapacity(capacity)
+    return Draft {
+      bytes: move href,
+      schemeEnd: 0,
+      userStart: 0,
+      usernameEnd: 0,
+      passwordEnd: 0,
+      hostStart: 0,
+      hostEnd: 0,
+      portValue: NO_PORT,
+      pathStart: 0,
+      queryStart: ABSENT,
+      fragmentStart: ABSENT,
+      hostType: UrlHostKind.Absent,
+      kind: Scheme.Other,
+      opaque: false,
+    }
+  }
+
+  fn intoUrl(self: Self) -> Url {
+    return Url {
+      bytes: move self.bytes,
+      schemeEnd: self.schemeEnd,
+      userStart: self.userStart,
+      usernameEnd: self.usernameEnd,
+      passwordEnd: self.passwordEnd,
+      hostStart: self.hostStart,
+      hostEnd: self.hostEnd,
+      portValue: self.portValue,
+      pathStart: self.pathStart,
+      queryStart: self.queryStart,
+      fragmentStart: self.fragmentStart,
+      hostType: self.hostType,
+      kind: self.kind,
+      opaque: self.opaque,
+    }
+  }
+
+  // Records the positions of `?` and `#` in the serialization from `from` on.
+  effect fn markTail(self: &mut Self, from: usize) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.queryStart = ABSENT
+    self.fragmentStart = ABSENT
+    let bytes = Bytes.asSlice(&self.bytes)
+    let mut i = from
+    if i < bytes.length && bytes[i] == 63 {
+      self.queryStart = i
+      i = i + 1
+      while i < bytes.length && bytes[i] != 35 {
+        i = i + 1
+      }
+    }
+    if i < bytes.length && bytes[i] == 35 {
+      self.fragmentStart = i
+    }
+    return ()
+  }
+
+  // Writes `/.` before a path that starts with an empty segment when there is no host, so the
+  // serialization does not read as a host.
+  effect fn finishPath(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.opaque || self.hostType != UrlHostKind.Absent {
+      return ()
+    }
+    let bytes = Bytes.asSlice(&self.bytes)
+    let start = self.pathStart
+    let end = if self.queryStart != ABSENT {
+      self.queryStart
+    } else if self.fragmentStart != ABSENT {
+      self.fragmentStart
+    } else {
+      bytes.length
+    }
+    if end - start < 2 || bytes[start] != 47 || bytes[start + 1] != 47 {
+      return ()
+    }
+    let mut rebuilt = run Bytes.makeWithCapacity(bytes.length + 2)
+    run Bytes.append(&mut rebuilt, Slice.view<u8>(bytes, 0, start))
+    run Bytes.append(&mut rebuilt, b"/.")
+    run Bytes.append(&mut rebuilt, Slice.view<u8>(bytes, start, bytes.length - start))
+    self.bytes = move rebuilt
+    self.pathStart = start + 2
+    if self.queryStart != ABSENT {
+      self.queryStart = self.queryStart + 2
+    }
+    if self.fragmentStart != ABSENT {
+      self.fragmentStart = self.fragmentStart + 2
+    }
+    return ()
+  }
+
+  fn length(self: &Self) -> usize {
+    return Bytes.length(&self.bytes)
+  }
+
+  // Writes the scheme of `base`, its authority, and with `path` its path, as the relative states
+  // copy them.
+  effect fn copyBase(self: &mut Self, base: &Url, path: bool, query: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let source = Bytes.asSlice(&base.bytes)
+    let mut authorityEnd = base.pathStart
+    if base.hostType == UrlHostKind.Absent && !base.opaque && base.pathStart == base.schemeEnd + 3 {
+      authorityEnd = base.schemeEnd + 1
+    }
+    Bytes.truncate(&mut self.bytes, 0)
+    run Bytes.append(&mut self.bytes, Slice.view<u8>(source, 0, authorityEnd))
+    self.schemeEnd = base.schemeEnd
+    self.userStart = base.userStart
+    self.usernameEnd = base.usernameEnd
+    self.passwordEnd = base.passwordEnd
+    self.hostStart = base.hostStart
+    self.hostEnd = base.hostEnd
+    self.portValue = base.portValue
+    self.hostType = base.hostType
+    self.kind = base.kind
+    self.pathStart = authorityEnd
+    if path {
+      run Bytes.append(
+        &mut self.bytes,
+        Slice.view<u8>(source, base.pathStart, base.pathEnd() - base.pathStart),
+      )
+    }
+    if query && base.queryStart != ABSENT {
+      self.queryStart = Bytes.length(&self.bytes)
+      run Bytes.append(
+        &mut self.bytes,
+        Slice.view<u8>(source, base.queryStart, base.pathEnd2() - base.queryStart),
+      )
+    }
+    return ()
+  }
+
+  // Writes only the scheme of `base`, before an authority.
+  effect fn copyScheme(self: &mut Self, base: &Url) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    Bytes.truncate(&mut self.bytes, 0)
+    run Bytes.append(
+      &mut self.bytes,
+      Slice.view<u8>(Bytes.asSlice(&base.bytes), 0, base.schemeEnd + 1),
+    )
+    self.schemeEnd = base.schemeEnd
+    self.kind = base.kind
+    return ()
+  }
+
+  // Removes the last path segment, except a normalized Windows drive letter that is the only
+  // segment of a `file` URL.
+  fn shortenPath(self: &mut Self) -> () {
+    let bytes = Bytes.asSlice(&self.bytes)
+    let start = self.pathStart
+    let end = bytes.length
+    if end == start {
+      return ()
+    }
+    let mut last = end - 1
+    while last > start && bytes[last] != 47 {
+      last = last - 1
+    }
+    if self.kind == Scheme.File && last == start && end - start == 3 && alpha(bytes[start + 1])
+      && bytes[start + 2] == 58 {
+      return ()
+    }
+    Bytes.truncate(&mut self.bytes, last)
+    return ()
+  }
+
+  fn pathIsEmpty(self: &Self) -> bool {
+    return Bytes.length(&self.bytes) == self.pathStart
+  }
+}
+
+fn hasTabOrNewline(bytes: &[u8]) -> bool {
+  let mut i: usize = 0
+  while i < bytes.length {
+    let c = bytes[i]
+    if c == 9 || c == 10 || c == 13 {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+effect fn withoutTabOrNewline(bytes: &[u8]) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut cleaned = run Bytes.makeWithCapacity(bytes.length)
+  let mut i: usize = 0
+  while i < bytes.length {
+    let start = i
+    while i < bytes.length && bytes[i] != 9 && bytes[i] != 10 && bytes[i] != 13 {
+      i = i + 1
+    }
+    if i > start {
+      run Bytes.append(&mut cleaned, Slice.view<u8>(bytes, start, i - start))
+    }
+    i = i + 1
+  }
+  return move cleaned
+}
+
+fn alpha(c: u8) -> bool {
+  return (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+}
+
+fn schemeByte(c: u8) -> bool {
+  return alpha(c) || (c >= 48 && c <= 57) || c == 43 || c == 45 || c == 46
+}
+
+fn lowercase(bytes: &mut [u8]) -> () {
+  let mut i: usize = 0
+  while i < bytes.length {
+    if bytes[i] >= 65 && bytes[i] <= 90 {
+      bytes[i] = bytes[i] + 32
+    }
+    i = i + 1
+  }
+  return ()
+}
+
+fn schemeKind(scheme: &[u8]) -> Scheme {
+  if scheme == b"http" {
+    return Scheme.Http
+  }
+  if scheme == b"https" {
+    return Scheme.Https
+  }
+  if scheme == b"ws" {
+    return Scheme.Ws
+  }
+  if scheme == b"wss" {
+    return Scheme.Wss
+  }
+  if scheme == b"ftp" {
+    return Scheme.Ftp
+  }
+  if scheme == b"file" {
+    return Scheme.File
+  }
+  return Scheme.Other
+}
+
+fn defaultPort(scheme: Scheme) -> u32 {
+  return match scheme {
+    Scheme.Http => 80
+    Scheme.Https => 443
+    Scheme.Ws => 80
+    Scheme.Wss => 443
+    Scheme.Ftp => 21
+    Scheme.File => NO_PORT
+    Scheme.Other => NO_PORT
+  }
+}
+
+effect fn appendDecimal(output: &mut Bytes, value: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut digits: [u8; 10] = [0; 10]
+  let mut n = value
+  let mut count: usize = 0
+  while true {
+    digits[9 - count] = u32.toU8(n % 10) + 48
+    count = count + 1
+    n = n / 10
+    if n == 0 {
+      break
+    }
+  }
+  return run Bytes.append(&mut output.*, Slice.view<u8>(&digits, 10 - count, count))
+}
+
+fn windowsDriveLetter(bytes: &[u8], at: usize) -> bool {
+  return at + 1 < bytes.length && alpha(bytes[at]) && (bytes[at + 1] == 58 || bytes[at + 1] == 124)
+}
+
+// Whether the input from `at` starts with a Windows drive letter followed by nothing, `/`, `\`,
+// `?`, or `#`.
+fn startsWithDriveLetter(bytes: &[u8], at: usize) -> bool {
+  if !windowsDriveLetter(bytes, at) {
+    return false
+  }
+  if at + 2 == bytes.length {
+    return true
+  }
+  let c = bytes[at + 2]
+  return c == 47 || c == 92 || c == 63 || c == 35
+}
+
+fn special(draft: &Draft) -> bool {
+  return draft.kind != Scheme.Other
+}
+
+effect fn parseClean(input: &[u8], base: Option<&Url>) -> Option<Url>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut draft = run Draft.make(input.length + 8)
+  let n = input.length
+
+  // The scheme start and scheme states.
+  if n > 0 && alpha(input[0]) {
+    let mut end: usize = 1
+    while end < n && schemeByte(input[end]) {
+      end = end + 1
+    }
+    if end < n && input[end] == 58 {
+      run Bytes.append(&mut draft.bytes, Slice.view<u8>(input, 0, end + 1))
+      lowercase(Bytes.asMutSlice(&mut draft.bytes))
+      draft.schemeEnd = end
+      draft.kind = schemeKind(Slice.view<u8>(Bytes.asSlice(&draft.bytes), 0, end))
+      draft.userStart = end + 1
+      draft.usernameEnd = end + 1
+      draft.passwordEnd = end + 1
+      draft.hostStart = end + 1
+      draft.hostEnd = end + 1
+      draft.pathStart = end + 1
+      let p = end + 1
+      let mut ok = true
+      if draft.kind == Scheme.File {
+        ok = run fileState(input, p, &mut draft, base)
+      } else if draft.kind != Scheme.Other {
+        let mut relativeBase = false
+        match base {
+          Option<&Url>.Some { value } => {
+            relativeBase = value.scheme()
+              == unsafe String.fromUtf8Unchecked(
+                Slice.view<u8>(Bytes.asSlice(&draft.bytes), 0, end),
+              )
+              && !(p + 1 < n && input[p] == 47 && input[p + 1] == 47)
+
+            // The special relative or authority state, without two slashes.
+            if relativeBase {
+              ok = run relativeState(input, p, &mut draft, value)
+            }
+          }
+          Option<&Url>.None => {}
+        }
+        if !relativeBase {
+          // The special authority slashes and ignore slashes states.
+          let mut q = p
+          while q < n && (input[q] == 47 || input[q] == 92) {
+            q = q + 1
+          }
+          ok = run authorityState(input, q, &mut draft)
+        }
+      } else if p < n && input[p] == 47 {
+        // The path or authority state.
+        if p + 1 < n && input[p + 1] == 47 {
+          ok = run authorityState(input, p + 2, &mut draft)
+        } else {
+          run pathState(input, p + 1, &mut draft, false)
+        }
+      } else {
+        draft.opaque = true
+        run opaquePathState(input, p, &mut draft)
+      }
+      if !ok {
+        return Option<Url>.none()
+      }
+      run draft.finishPath()
+      return Option<Url>.some(draft.intoUrl())
+    }
+  }
+
+  // The no scheme state.
+  let baseUrl = match base {
+    Option<&Url>.Some { value } => value
+    Option<&Url>.None => {
+      return Option<Url>.none()
+    }
+  }
+  if baseUrl.opaque {
+    if n == 0 || input[0] != 35 {
+      return Option<Url>.none()
+    }
+    run draft.copyBase(baseUrl, true, true)
+    draft.opaque = true
+    run fragmentState(input, 1, &mut draft)
+    return Option<Url>.some(draft.intoUrl())
+  }
+  let mut ok = true
+  if baseUrl.kind == Scheme.File {
+    run Bytes.append(&mut draft.bytes, b"file:")
+    draft.schemeEnd = 4
+    draft.kind = Scheme.File
+    ok = run fileState(input, 0, &mut draft, base)
+  } else {
+    ok = run relativeState(input, 0, &mut draft, baseUrl)
+  }
+  if !ok {
+    return Option<Url>.none()
+  }
+  run draft.finishPath()
+  return Option<Url>.some(draft.intoUrl())
+}
+
+// The relative and relative slash states: `input` from `p` is relative to `base`, which has the
+// same scheme and a path that is not opaque.
+effect fn relativeState(input: &[u8], p: usize, draft: &mut Draft, base: &Url) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let n = input.length
+  let isSpecial = base.kind != Scheme.Other
+  if p < n && (input[p] == 47 || (isSpecial && input[p] == 92)) {
+    let q = p + 1
+    if isSpecial && q < n && (input[q] == 47 || input[q] == 92) {
+      run draft.copyScheme(base)
+      let mut r = q
+      while r < n && (input[r] == 47 || input[r] == 92) {
+        r = r + 1
+      }
+      return run authorityState(input, r, &mut draft.*)
+    }
+    if !isSpecial && q < n && input[q] == 47 {
+      run draft.copyScheme(base)
+      return run authorityState(input, q + 1, &mut draft.*)
+    }
+    run draft.copyBase(base, false, false)
+    run pathState(input, q, &mut draft.*, false)
+    return true
+  }
+  if p == n {
+    run draft.copyBase(base, true, true)
+    return true
+  }
+  if input[p] == 63 {
+    run draft.copyBase(base, true, false)
+    run queryState(input, p + 1, &mut draft.*)
+    return true
+  }
+  if input[p] == 35 {
+    run draft.copyBase(base, true, true)
+    run fragmentState(input, p + 1, &mut draft.*)
+    return true
+  }
+  run draft.copyBase(base, true, false)
+  draft.shortenPath()
+  run pathState(input, p, &mut draft.*, false)
+  return true
+}
+
+// The authority state from `p`, which is after the slashes. Writes `//`, the credentials, the host,
+// and the port, then parses the path.
+effect fn authorityState(input: &[u8], p: usize, draft: &mut Draft) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let n = input.length
+  let isSpecial = special(&draft.*)
+  let mut end = p
+  let mut at = ABSENT
+  while end < n {
+    let c = input[end]
+    if c == 47 || c == 63 || c == 35 || (isSpecial && c == 92) {
+      break
+    }
+    if c == 64 {
+      at = end
+    }
+    end = end + 1
+  }
+  run Bytes.append(&mut draft.bytes, b"//")
+  draft.userStart = draft.length()
+  draft.usernameEnd = draft.userStart
+  draft.passwordEnd = draft.userStart
+  let mut hostFrom = p
+  if at != ABSENT {
+    if at + 1 == end {
+      return false
+    }
+    let credentials = Slice.view<u8>(input, p, at - p)
+    let mut colon = credentials.length
+    let mut i: usize = 0
+    while i < credentials.length {
+      if credentials[i] == 58 {
+        colon = i
+        break
+      }
+      i = i + 1
+    }
+    run UrlPercent.appendEncoded(
+      &mut draft.bytes,
+      Slice.view<u8>(credentials, 0, colon),
+      UrlEncodeSet.Userinfo,
+    )
+    draft.usernameEnd = draft.length()
+    if colon + 1 < credentials.length {
+      run Bytes.append(&mut draft.bytes, b":")
+      run UrlPercent.appendEncoded(
+        &mut draft.bytes,
+        Slice.view<u8>(credentials, colon + 1, credentials.length - colon - 1),
+        UrlEncodeSet.Userinfo,
+      )
+    }
+    draft.passwordEnd = draft.length()
+    if draft.passwordEnd > draft.userStart {
+      run Bytes.append(&mut draft.bytes, b"@")
+    }
+    hostFrom = at + 1
+  }
+  return run hostState(input, hostFrom, end, &mut draft.*)
+}
+
+// The host state: `input` from `p` to `end` is the host and the port.
+effect fn hostState(input: &[u8], p: usize, end: usize, draft: &mut Draft) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let isSpecial = special(&draft.*)
+  let mut colon = end
+  let mut brackets = false
+  let mut i = p
+  while i < end {
+    let c = input[i]
+    if c == 58 && !brackets {
+      colon = i
+      break
+    }
+    if c == 91 {
+      brackets = true
+    }
+    if c == 93 {
+      brackets = false
+    }
+    i = i + 1
+  }
+  let buffer = Slice.view<u8>(input, p, colon - p)
+  if colon < end && buffer.length == 0 {
+    return false
+  }
+  if colon == end && isSpecial && buffer.length == 0 {
+    return false
+  }
+  draft.hostStart = draft.length()
+  let kind = match run UrlHost.parse(buffer, !isSpecial, &mut draft.bytes) {
+    Option<UrlHostKind>.Some { value } => value
+    Option<UrlHostKind>.None => {
+      return false
+    }
+  }
+  draft.hostType = kind
+  draft.hostEnd = draft.length()
+  if colon < end {
+    // The port state.
+    let mut value: u32 = 0
+    let mut j = colon + 1
+    while j < end {
+      let c = input[j]
+      if c < 48 || c > 57 {
+        return false
+      }
+      value = value * 10 + u8.toU32(c) - 48
+      if value > 65535 {
+        return false
+      }
+      j = j + 1
+    }
+    if j > colon + 1 && value != defaultPort(draft.kind) {
+      draft.portValue = value
+      run Bytes.append(&mut draft.bytes, b":")
+      run appendDecimal(&mut draft.bytes, value)
+    }
+  }
+  draft.pathStart = draft.length()
+  run pathStartState(input, end, &mut draft.*)
+  return true
+}
+
+// The path start state, without a state override.
+effect fn pathStartState(input: &[u8], p: usize, draft: &mut Draft) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let n = input.length
+  if special(&draft.*) {
+    let mut q = p
+    if q < n && (input[q] == 47 || input[q] == 92) {
+      q = q + 1
+    }
+    return run pathState(input, q, &mut draft.*, false)
+  }
+  if p == n {
+    return ()
+  }
+  if input[p] == 63 {
+    return run queryState(input, p + 1, &mut draft.*)
+  }
+  if input[p] == 35 {
+    return run fragmentState(input, p + 1, &mut draft.*)
+  }
+  let q = if input[p] == 47 {
+    p + 1
+  } else {
+    p
+  }
+  return run pathState(input, q, &mut draft.*, false)
+}
+
+// The file, file slash, and file host states.
+effect fn fileState(input: &[u8], p: usize, draft: &mut Draft, base: Option<&Url>) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let n = input.length
+  let mut fileBase = false
+  match base {
+    Option<&Url>.Some { value } => {
+      fileBase = value.kind == Scheme.File
+    }
+    Option<&Url>.None => {}
+  }
+  if p < n && (input[p] == 47 || input[p] == 92) {
+    let q = p + 1
+    if q < n && (input[q] == 47 || input[q] == 92) {
+      // The file host state.
+      let mut end = q + 1
+      while end < n && input[end] != 47 && input[end] != 92 && input[end] != 63
+        && input[end] != 35 {
+        end = end + 1
+      }
+      run Bytes.append(&mut draft.bytes, b"//")
+      draft.userStart = draft.length()
+      draft.usernameEnd = draft.userStart
+      draft.passwordEnd = draft.userStart
+      draft.hostStart = draft.userStart
+      let buffer = Slice.view<u8>(input, q + 1, end - q - 1)
+      if windowsDriveLetter(buffer, 0) && buffer.length == 2 {
+        draft.hostType = UrlHostKind.Empty
+        draft.hostEnd = draft.hostStart
+        draft.pathStart = draft.length()
+        run pathState(input, q + 1, &mut draft.*, false)
+        return true
+      }
+      if buffer.length == 0 {
+        draft.hostType = UrlHostKind.Empty
+      } else {
+        let kind = match run UrlHost.parse(buffer, false, &mut draft.bytes) {
+          Option<UrlHostKind>.Some { value } => value
+          Option<UrlHostKind>.None => {
+            return false
+          }
+        }
+        draft.hostType = kind
+        let written = Slice.view<u8>(
+          Bytes.asSlice(&draft.bytes),
+          draft.hostStart,
+          draft.length() - draft.hostStart,
+        )
+        if written == b"localhost" {
+          Bytes.truncate(&mut draft.bytes, draft.hostStart)
+          draft.hostType = UrlHostKind.Empty
+        }
+      }
+      draft.hostEnd = draft.length()
+      draft.pathStart = draft.length()
+      run pathStartState(input, end, &mut draft.*)
+      return true
+    }
+
+    // The file slash state, with no second slash.
+    run Bytes.append(&mut draft.bytes, b"//")
+    draft.userStart = draft.length()
+    draft.usernameEnd = draft.userStart
+    draft.passwordEnd = draft.userStart
+    draft.hostStart = draft.userStart
+    draft.hostEnd = draft.userStart
+    draft.hostType = UrlHostKind.Empty
+    draft.pathStart = draft.length()
+    if fileBase {
+      match base {
+        Option<&Url>.Some { value } => {
+          run draft.copyBase(value, false, false)
+          let path = String.utf8Bytes(value.pathname())
+          if !startsWithDriveLetter(input, q) && path.length >= 3 && path[0] == 47 && alpha(path[1])
+            && path[2] == 58
+            && (path.length == 3 || path[3] == 47) {
+            run Bytes.append(&mut draft.bytes, Slice.view<u8>(path, 0, 3))
+          }
+        }
+        Option<&Url>.None => {}
+      }
+    }
+    run pathState(input, q, &mut draft.*, false)
+    return true
+  }
+  if fileBase {
+    let value = match base {
+      Option<&Url>.Some { value } => value
+      Option<&Url>.None => {
+        return false
+      }
+    }
+    if p == n {
+      run draft.copyBase(value, true, true)
+      return true
+    }
+    if input[p] == 63 {
+      run draft.copyBase(value, true, false)
+      run queryState(input, p + 1, &mut draft.*)
+      return true
+    }
+    if input[p] == 35 {
+      run draft.copyBase(value, true, true)
+      run fragmentState(input, p + 1, &mut draft.*)
+      return true
+    }
+    if startsWithDriveLetter(input, p) {
+      run draft.copyBase(value, false, false)
+    } else {
+      run draft.copyBase(value, true, false)
+      draft.shortenPath()
+    }
+    run pathState(input, p, &mut draft.*, false)
+    return true
+  }
+  run Bytes.append(&mut draft.bytes, b"//")
+  draft.userStart = draft.length()
+  draft.usernameEnd = draft.userStart
+  draft.passwordEnd = draft.userStart
+  draft.hostStart = draft.userStart
+  draft.hostEnd = draft.userStart
+  draft.hostType = UrlHostKind.Empty
+  draft.pathStart = draft.length()
+  run pathState(input, p, &mut draft.*, false)
+  return true
+}
+
+fn isSingleDot(segment: &[u8]) -> bool {
+  if segment.length == 1 {
+    return segment[0] == 46
+  }
+  return segment.length == 3 && segment[0] == 37 && segment[1] == 50
+    && (segment[2] == 101 || segment[2] == 69)
+}
+
+fn isDoubleDot(segment: &[u8]) -> bool {
+  if segment.length == 2 {
+    return segment[0] == 46 && segment[1] == 46
+  }
+  if segment.length == 4 {
+    let first = segment[0] == 46 && isSingleDot(Slice.view<u8>(segment, 1, 3))
+    let second = segment[3] == 46 && isSingleDot(Slice.view<u8>(segment, 0, 3))
+    return first || second
+  }
+  if segment.length == 6 {
+    return isSingleDot(Slice.view<u8>(segment, 0, 3)) && isSingleDot(Slice.view<u8>(segment, 3, 3))
+  }
+  return false
+}
+
+// The path state from `p`. With `override`, `?` and `#` are part of the path.
+effect fn pathState(input: &[u8], p: usize, draft: &mut Draft, override: bool) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let n = input.length
+  let isSpecial = special(&draft.*)
+  let mut i = p
+  while true {
+    let segmentStart = i
+    while i < n {
+      let c = input[i]
+      if c == 47 || (isSpecial && c == 92) {
+        break
+      }
+      if !override && (c == 63 || c == 35) {
+        break
+      }
+      i = i + 1
+    }
+    let atEnd = i == n || (!override && (input[i] == 63 || input[i] == 35))
+    let segment = Slice.view<u8>(input, segmentStart, i - segmentStart)
+    if isDoubleDot(segment) {
+      draft.shortenPath()
+      if atEnd {
+        run Bytes.append(&mut draft.bytes, b"/")
+      }
+    } else if isSingleDot(segment) {
+      if atEnd {
+        run Bytes.append(&mut draft.bytes, b"/")
+      }
+    } else {
+      let segmentOut = draft.length() + 1
+      run Bytes.append(&mut draft.bytes, b"/")
+      if draft.kind == Scheme.File && segmentOut == draft.pathStart + 1 && segment.length == 2
+        && windowsDriveLetter(segment, 0) {
+        let drive = [segment[0], u8.toU8(58)]
+        run Bytes.append(&mut draft.bytes, &drive)
+      } else {
+        run UrlPercent.appendEncoded(&mut draft.bytes, segment, UrlEncodeSet.Path)
+      }
+    }
+    if atEnd {
+      break
+    }
+    i = i + 1
+  }
+  if i < n && input[i] == 63 {
+    return run queryState(input, i + 1, &mut draft.*)
+  }
+  if i < n && input[i] == 35 {
+    return run fragmentState(input, i + 1, &mut draft.*)
+  }
+  return ()
+}
+
+effect fn opaquePathState(input: &[u8], p: usize, draft: &mut Draft) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let n = input.length
+  let mut end = p
+  while end < n && input[end] != 63 && input[end] != 35 {
+    end = end + 1
+  }
+  let mut i = p
+  while i < end {
+    let start = i
+    while i < end && input[i] != 32 {
+      i = i + 1
+    }
+    run UrlPercent.appendEncoded(
+      &mut draft.bytes,
+      Slice.view<u8>(input, start, i - start),
+      UrlEncodeSet.C0Control,
+    )
+    if i < end {
+      // A space just before `?` or `#` is encoded, so it does not end the path.
+      if i + 1 == end && end < n {
+        run Bytes.append(&mut draft.bytes, b"%20")
+      } else {
+        run Bytes.append(&mut draft.bytes, b" ")
+      }
+      i = i + 1
+    }
+  }
+  if end < n && input[end] == 63 {
+    return run queryState(input, end + 1, &mut draft.*)
+  }
+  if end < n && input[end] == 35 {
+    return run fragmentState(input, end + 1, &mut draft.*)
+  }
+  return ()
+}
+
+effect fn queryState(input: &[u8], p: usize, draft: &mut Draft) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let n = input.length
+  let mut end = p
+  while end < n && input[end] != 35 {
+    end = end + 1
+  }
+  draft.queryStart = draft.length()
+  run Bytes.append(&mut draft.bytes, b"?")
+  let set = if special(&draft.*) {
+    UrlEncodeSet.SpecialQuery
+  } else {
+    UrlEncodeSet.Query
+  }
+  run UrlPercent.appendEncoded(&mut draft.bytes, Slice.view<u8>(input, p, end - p), set)
+  if end < n {
+    return run fragmentState(input, end + 1, &mut draft.*)
+  }
+  return ()
+}
+
+effect fn fragmentState(input: &[u8], p: usize, draft: &mut Draft) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  draft.fragmentStart = draft.length()
+  run Bytes.append(&mut draft.bytes, b"#")
+  return run UrlPercent.appendEncoded(
+    &mut draft.bytes,
+    Slice.view<u8>(input, p, input.length - p),
+    UrlEncodeSet.Fragment,
+  )
+}
