@@ -75,7 +75,7 @@ import backend.Mir {
   TrapSite,
 }
 import backend.WasmBody
-import backend.WasmBody {Binary, Body, Cast, Count, Extreme, Kind, Modify, Predicate, Reduction, none}
+import backend.WasmBody {Binary, Body, Cast, Count, Extreme, Kind, Modify, Predicate, Promotion, Reduction, none}
 import backend.WasmObject
 import backend.WasmObject {Fragment, Function as WasmFunction, Import as WasmImport, Object, Pointer as ObjectPointer, Unsupported}
 import hir.Hir {Access, InfixOperator, PrefixOperator}
@@ -169,6 +169,10 @@ struct Writer {
   frame: u64,
   /// A step's own step record (`stepRecord`), which its direct callee steps run published in.
   steps: u64,
+  /// An optimized build lowers each definition twice: a survey that records which frame slots
+  /// can live in wasm locals, then the lowering it emits, whose bodies adopt `plans` in order.
+  surveying: bool,
+  plans: List<Promotion>,
 }
 
 /// An observed trap's report inputs: the observer and selected-cause local addresses, the site
@@ -199,7 +203,7 @@ effect fn writerFor(target: &Target, shared: bool) -> Writer ! OutOfMemoryError 
     siteLocal: usize.MAX, pointerBits: bits, shared: shared, slots: List<u64>.make(), companions: List<u64>.make(),
     blocks: List<usize>.make(), alignments: List<usize>.make(), copies: List<CallerCopy>.make(), parameters: List<u64>.make(),
     extras: List<u64>.make(), providers: List<u64>.make(), out: none(), failure: none(), context: none(), observer: none(),
-    cause: none(), site: none(), transfer: none(), frame: none(), steps: none()}
+    cause: none(), site: none(), transfer: none(), frame: none(), steps: none(), surveying: false, plans: List<Promotion>.make()}
 }
 
 // Finds the hidden diagnostic locals of `function`, whose blocks are about to be emitted.
@@ -252,6 +256,11 @@ fn same(a: &[u8], b: &[u8]) -> bool {
 effect fn beginBody(writer: &mut Writer, symbol: &[u8]) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
   let wide = writer.pointerBits == 64
   writer.body = run Body.make(symbol, wide, writer.shared)
+  if writer.surveying {
+    writer.body.survey()
+  } else if List<Promotion>.length(&writer.plans) != usize.ZERO {
+    writer.body.adopt(List<Promotion>.remove(&mut writer.*.plans, usize.ZERO))
+  }
   return ()
 }
 
@@ -262,6 +271,7 @@ effect fn parameterOf(writer: &mut Writer, kind: Kind) -> u64 ! Unsupported | Ou
 
 // Finishes the body being built into the fragment, exported as `exported` when not empty.
 effect fn endBody(writer: &mut Writer, exported: &[u8]) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  if writer.surveying { run List<Promotion>.append(&mut writer.*.plans, run writer.body.promotion()) }
   let translated = run WasmBody.finish(&mut writer.*.body)
   return run List<WasmFunction>.append(&mut writer.*.fragment.functions, WasmFunction {body: move translated, exported: run Bytes.copy(exported)})
 }
@@ -4005,8 +4015,9 @@ pub effect fn emit(
   suspension: &Option<Facts>,
   shared: bool,
   hostExport: bool,
+  optimized: bool,
 ) -> Bytes ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
-  match move run Effect.result(emitChecked(function, target, supplied, foreign, identities, suspension, shared, hostExport)) {
+  match move run Effect.result(emitOptimized(function, target, supplied, foreign, identities, suspension, shared, hostExport, optimized)) {
     Result<Bytes, Gap | Unsupported | OutOfMemoryError>.Success {value} => { return move value }
     Result<Bytes, Gap | Unsupported | OutOfMemoryError>.Failure {error} => match move error {
       Unsupported refused => { return run refusedFragment(move refused) }
@@ -4016,6 +4027,29 @@ pub effect fn emit(
   }
 }
 
+// Lowers one definition. An optimized build first surveys a lowering of it, then lowers it again
+// with every frame slot whose address is only loaded and stored kept in wasm locals, as LLVM's
+// mem2reg and SROA would: an unoptimized lowering gives every MIR local a frame slot.
+effect fn emitOptimized(
+  function: &MirFunction,
+  target: &Target,
+  supplied: &[TypeLayout],
+  foreign: &[CAbi.Signature],
+  identities: &[InstanceIdentity],
+  suspension: &Option<Facts>,
+  shared: bool,
+  hostExport: bool,
+  optimized: bool,
+) -> Bytes ! Gap | Unsupported | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut plans = List<Promotion>.make()
+  if optimized {
+    drop run emitChecked(function, target, supplied, foreign, identities, suspension, shared, hostExport, true, &mut plans)
+  }
+  return run emitChecked(function, target, supplied, foreign, identities, suspension, shared, hostExport, false, &mut plans)
+}
+
+// Lowers one definition; a survey (`surveying`) leaves its bodies' plans in `plans`, and a
+// lowering adopts the plans there.
 effect fn emitChecked(
   function: &MirFunction,
   target: &Target,
@@ -4025,11 +4059,17 @@ effect fn emitChecked(
   suspension: &Option<Facts>,
   shared: bool,
   hostExport: bool,
+  surveying: bool,
+  plans: &mut List<Promotion>,
 ) -> Bytes ! Gap | Unsupported | OutOfMemoryError ? &mut Allocator | &mut Types {
   // The lookup index lives only while this instance's code is built.
   let indexed = run TypeLayouts.copyOf(supplied)
   let layouts = &indexed
   let mut writer = run writerFor(target, shared)
+  writer.surveying = surveying
+  while List<Promotion>.length(&plans.*) != usize.ZERO {
+    run List<Promotion>.append(&mut writer.plans, List<Promotion>.remove(&mut plans.*, usize.ZERO))
+  }
   run List<u64>.appendSlice(&mut writer.lines, List<u64>.asSlice(&function.lines))
   let locals = List<Local>.asSlice(&function.locals)
   let resultFacts = run layoutOf(layouts, &function.result, function, locals[usize.ZERO].origin.location)
@@ -4136,6 +4176,7 @@ effect fn emitChecked(
       run emitStep(&mut writer, function, target, layouts, foreign, identities, &suspended, &stepping, Bytes.asSlice(&base))
     }
     run frameEntry(&mut writer, function, target, b"")
+    run handOver(&mut writer, &mut plans.*)
     return run writer.fragment.encode()
   }
   let ordinary = Option<Suspended>.none()
@@ -4155,7 +4196,17 @@ effect fn emitChecked(
   if exported && same(Bytes.asSlice(&writer.symbol), threadEntrySymbol()) {
     run defineThreadStart(&mut writer, Bytes.asSlice(&base))
   }
+  run handOver(&mut writer, &mut plans.*)
   return run writer.fragment.encode()
+}
+
+// Moves a survey's plans out of `writer` into `plans`.
+effect fn handOver(writer: &mut Writer, plans: &mut List<Promotion>) -> () ! OutOfMemoryError ? &mut Allocator {
+  if !writer.surveying { return () }
+  while List<Promotion>.length(&writer.plans) != usize.ZERO {
+    run List<Promotion>.append(&mut plans.*, List<Promotion>.remove(&mut writer.*.plans, usize.ZERO))
+  }
+  return ()
 }
 
 // The symbol of the wasm32 entry module's thread entry, which `wasi_thread_start` calls.
