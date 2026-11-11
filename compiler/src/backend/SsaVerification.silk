@@ -1,0 +1,539 @@
+//! The structural checks of one finished `SsaFunction`, which a defect in the lowering or a pass
+//! breaks.
+//!
+//! # When to use
+//! Use [`verify`] after lowering and after each pass when the build asked for verification
+//! (`SILK_VERIFY_MIR`); it stops the compiler with the function's listing on the first violation.
+//! Use [`check`] to learn which rule a function breaks without stopping.
+//!
+//! # Details
+//! A function is well formed when every block is reached from the entry block 0, nothing jumps to
+//! the entry, every block has exactly one exit whose edges and value fit its kind, every edge
+//! passes one argument of the right kind per parameter of its target, every value is defined
+//! exactly once and before each use along every path, every operand has the kind its operation
+//! takes, and every slot and symbol named is declared. A violation is a compiler bug, never a
+//! diagnostic about the program.
+
+import CompilerBug
+import backend.SsaFunction {
+  Binary,
+  Cast,
+  Definition,
+  Edge,
+  Exit,
+  Kind,
+  Operation,
+  SsaFunction,
+  none,
+}
+import backend.SsaGraph {SsaGraph}
+import backend.SsaText
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.core.option {Option}
+import silk.core.ownership {Copy}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.u64
+import silk.num.usize
+
+/// A rule a function breaks.
+pub enum Rule {
+  /// A block has no exit.
+  OpenBlock,
+  /// An exit's edge count or value does not fit its kind, or a returned value is not of the
+  /// function's result kind.
+  ExitShape,
+  /// An edge leads outside the function or to the entry.
+  EdgeTarget,
+  /// An edge passes a different number of arguments than its target has parameters.
+  ArgumentCount,
+  /// An edge passes an argument of another kind than its parameter's.
+  ArgumentKind,
+  /// No path from the entry reaches a block.
+  Unreached,
+  /// A use names no value, a builder variable, a value of a removed instruction, or a value whose
+  /// definition does not list it.
+  UndefinedValue,
+  /// A value is used where its definition does not dominate the use.
+  UseBeforeDefinition,
+  /// An instruction is listed in no block, twice, in a block it does not name, or removed.
+  Placement,
+  /// An instruction has the wrong number of operands.
+  OperandCount,
+  /// An operand's kind is not one its operation takes.
+  OperandKind,
+  /// An instruction's result kind does not follow from its operation and operands.
+  ResultKind,
+  /// An instruction names a slot or a symbol the function does not declare.
+  Range,
+}
+
+/// One violation: the rule, and the block, instruction and value it concerns, each `usize.MAX` or
+/// `none()` when it concerns none.
+pub struct Violation {
+  pub rule: Rule,
+  pub block: usize,
+  pub instruction: usize,
+  pub value: u64,
+}
+
+impl Copy for Violation {}
+
+/// Stops the compiler when `function` breaks a rule: a compiler bug whose report names `stage`,
+/// the lowering or the pass that ran last, the rule, and the function's listing.
+pub effect fn verify(function: &SsaFunction, stage: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let found = run check(function)
+  let violation = match found {
+    Option<Violation>.Some {value} => value
+    Option<Violation>.None => { return () }
+  }
+  let mut reason = run Bytes.copy(b"SSA of ")
+  run Bytes.append(&mut reason, function.name())
+  run Bytes.append(&mut reason, b" after ")
+  run Bytes.append(&mut reason, stage)
+  run Bytes.append(&mut reason, b" breaks rule ")
+  run SsaText.appendDecimal(&mut reason, ruleNumber(violation.rule))
+  run Bytes.append(&mut reason, b" at block ")
+  run SsaText.appendDecimal(&mut reason, usize.toU64(violation.block))
+  run Bytes.append(&mut reason, b", instruction ")
+  run SsaText.appendDecimal(&mut reason, usize.toU64(violation.instruction))
+  run Bytes.append(&mut reason, b", value ")
+  run SsaText.appendValue(function, violation.value, &mut reason)
+  run Bytes.append(&mut reason, b":\n")
+  run SsaText.append(function, &mut reason)
+  return CompilerBug.panic(Bytes.asSlice(&reason))
+}
+
+fn ruleNumber(rule: Rule) -> u64 {
+  return match rule {
+    Rule.OpenBlock => 1
+    Rule.ExitShape => 2
+    Rule.EdgeTarget => 3
+    Rule.ArgumentCount => 4
+    Rule.ArgumentKind => 5
+    Rule.Unreached => 6
+    Rule.UndefinedValue => 7
+    Rule.UseBeforeDefinition => 8
+    Rule.Placement => 9
+    Rule.OperandCount => 10
+    Rule.OperandKind => 11
+    Rule.ResultKind => 12
+    Rule.Range => 13
+  }
+}
+
+fn violation(rule: Rule, block: usize, instruction: usize, value: u64) -> Option<Violation> {
+  return Option<Violation>.some(Violation {rule: rule, block: block, instruction: instruction, value: value})
+}
+
+/// The first rule `function` breaks, or none when it is well formed.
+pub effect fn check(function: &SsaFunction) -> Option<Violation> ! OutOfMemoryError ? &mut Allocator {
+  let blocks = function.blockCount()
+  if blocks == usize.ZERO { return violation(Rule.Unreached, usize.ZERO, usize.MAX, none()) }
+  // Exits and edges.
+  let mut block = usize.ZERO
+  while block < blocks {
+    let found = run checkExit(function, block)
+    if Option<Violation>.isSome(&found) { return found }
+    block = block + usize.ONE
+  }
+  let graph = run SsaGraph.of(function)
+  block = usize.ZERO
+  while block < blocks {
+    if !graph.reaches(block) { return violation(Rule.Unreached, block, usize.MAX, none()) }
+    block = block + usize.ONE
+  }
+  // Each instruction lies in exactly one block, at one position.
+  let instructions = function.instructionCount()
+  let mut position = run List<usize>.makeWithCapacity(instructions)
+  run List<usize>.appendRepeated(&mut position, usize.MAX, instructions)
+  block = usize.ZERO
+  while block < blocks {
+    let listed = List<usize>.asSlice(&function.block(block).instructions)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      let instruction = listed[at]
+      if instruction >= instructions { return violation(Rule.Placement, block, instruction, none()) }
+      let found = function.instruction(instruction)
+      if found.removed || found.block != block || List<usize>.get(&position, instruction) != usize.MAX {
+        return violation(Rule.Placement, block, instruction, none())
+      }
+      List<usize>.set(&mut position, instruction, at)
+      at = at + usize.ONE
+    }
+    block = block + usize.ONE
+  }
+  // Parameters name their block and position.
+  block = usize.ZERO
+  while block < blocks {
+    let parameters = List<u64>.asSlice(&function.block(block).parameters)
+    let mut at = usize.ZERO
+    while at < parameters.length {
+      let value = parameters[at]
+      if value >= usize.toU64(function.valueCount()) { return violation(Rule.UndefinedValue, block, usize.MAX, value) }
+      let defined = function.value(value)
+      if defined.definition != Definition.Parameter || defined.owner != block || defined.index != at || defined.kind.isUnit() {
+        return violation(Rule.UndefinedValue, block, usize.MAX, value)
+      }
+      at = at + usize.ONE
+    }
+    block = block + usize.ONE
+  }
+  // Uses, operand kinds and results.
+  block = usize.ZERO
+  while block < blocks {
+    let listed = List<usize>.asSlice(&function.block(block).instructions)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      let instruction = listed[at]
+      let operands = function.operandsOf(instruction)
+      let mut operand = usize.ZERO
+      while operand < operands.length {
+        let found = useViolation(function, &graph, List<usize>.asSlice(&position), block, at, instruction, operands[operand])
+        if Option<Violation>.isSome(&found) { return found }
+        operand = operand + usize.ONE
+      }
+      let typed = run checkInstruction(function, instruction)
+      if Option<Violation>.isSome(&typed) { return typed }
+      at = at + usize.ONE
+    }
+    let found = function.block(block)
+    let end = List<usize>.length(&found.instructions)
+    if found.value != none() {
+      let used = useViolation(function, &graph, List<usize>.asSlice(&position), block, end, usize.MAX, found.value)
+      if Option<Violation>.isSome(&used) { return used }
+    }
+    let edges = List<Edge>.asSlice(&found.edges)
+    let mut edge = usize.ZERO
+    while edge < edges.length {
+      let arguments = List<u64>.asSlice(&edges[edge].arguments)
+      let mut argument = usize.ZERO
+      while argument < arguments.length {
+        let used = useViolation(function, &graph, List<usize>.asSlice(&position), block, end, usize.MAX, arguments[argument])
+        if Option<Violation>.isSome(&used) { return used }
+        argument = argument + usize.ONE
+      }
+      edge = edge + usize.ONE
+    }
+    // Argument kinds, now that every argument is defined.
+    edge = usize.ZERO
+    while edge < edges.length {
+      let parameters = List<u64>.asSlice(&function.block(edges[edge].block).parameters)
+      let arguments = List<u64>.asSlice(&edges[edge].arguments)
+      let mut argument = usize.ZERO
+      while argument < arguments.length {
+        if !function.kindOf(arguments[argument]).equals(function.kindOf(parameters[argument])) {
+          return violation(Rule.ArgumentKind, block, usize.MAX, arguments[argument])
+        }
+        argument = argument + usize.ONE
+      }
+      edge = edge + usize.ONE
+    }
+    let returned = run checkExitValue(function, block)
+    if Option<Violation>.isSome(&returned) { return returned }
+    block = block + usize.ONE
+  }
+  return Option<Violation>.none()
+}
+
+// The edges of block `block`'s exit: their count, targets and argument counts.
+effect fn checkExit(function: &SsaFunction, block: usize) -> Option<Violation> ! OutOfMemoryError ? &mut Allocator {
+  let found = function.block(block)
+  let edges = List<Edge>.asSlice(&found.edges)
+  let mut wanted = usize.ZERO
+  if found.exit == Exit.Open { return violation(Rule.OpenBlock, block, usize.MAX, none()) }
+  if found.exit == Exit.Jump { wanted = usize.ONE }
+  if found.exit == Exit.Branch { wanted = 2 }
+  if found.exit == Exit.Switch { wanted = List<u64>.length(&found.cases) + usize.ONE }
+  if edges.length != wanted { return violation(Rule.ExitShape, block, usize.MAX, none()) }
+  let needsValue = found.exit == Exit.Branch || found.exit == Exit.Switch
+  if needsValue && found.value == none() { return violation(Rule.ExitShape, block, usize.MAX, none()) }
+  if (found.exit == Exit.Jump || found.exit == Exit.Trap || found.exit == Exit.Unreachable) && found.value != none() {
+    return violation(Rule.ExitShape, block, usize.MAX, found.value)
+  }
+  let mut edge = usize.ZERO
+  while edge < edges.length {
+    let target = edges[edge].block
+    if target >= function.blockCount() || target == usize.ZERO { return violation(Rule.EdgeTarget, block, usize.MAX, none()) }
+    if List<u64>.length(&edges[edge].arguments) != List<u64>.length(&function.block(target).parameters) {
+      return violation(Rule.ArgumentCount, block, usize.MAX, none())
+    }
+    edge = edge + usize.ONE
+  }
+  return Option<Violation>.none()
+}
+
+// The kind of block `block`'s exit value: a branch's flag, a switch's integer, or the returned
+// value of the function's result kind.
+effect fn checkExitValue(function: &SsaFunction, block: usize) -> Option<Violation> ! OutOfMemoryError ? &mut Allocator {
+  let found = function.block(block)
+  let kind = function.kindOf(found.value)
+  if found.exit == Exit.Branch && !kind.equals(Kind.flag()) { return violation(Rule.ExitShape, block, usize.MAX, found.value) }
+  if found.exit == Exit.Switch && (!kind.isInteger() || kind.isVector()) { return violation(Rule.ExitShape, block, usize.MAX, found.value) }
+  if found.exit == Exit.Return && !kind.equals(function.result) { return violation(Rule.ExitShape, block, usize.MAX, found.value) }
+  return Option<Violation>.none()
+}
+
+// Whether the use of `value` at position `at` of block `block`, by `instruction` or the exit, sees
+// one definition that dominates it.
+fn useViolation(function: &SsaFunction, graph: &SsaGraph, position: &[usize], block: usize, at: usize, instruction: usize, value: u64)
+  -> Option<Violation> {
+  if value == none() || value >= usize.toU64(function.valueCount()) { return violation(Rule.UndefinedValue, block, instruction, value) }
+  let defined = function.value(value)
+  if defined.definition == Definition.Constant { return Option<Violation>.none() }
+  if defined.definition == Definition.Variable { return violation(Rule.UndefinedValue, block, instruction, value) }
+  if defined.definition == Definition.Argument {
+    let arguments = List<u64>.asSlice(&function.arguments)
+    if defined.owner >= arguments.length || arguments[defined.owner] != value { return violation(Rule.UndefinedValue, block, instruction, value) }
+    return Option<Violation>.none()
+  }
+  if defined.definition == Definition.Parameter {
+    let parameters = List<u64>.asSlice(&function.block(defined.owner).parameters)
+    if defined.index >= parameters.length || parameters[defined.index] != value { return violation(Rule.UndefinedValue, block, instruction, value) }
+    if !graph.dominates(defined.owner, block) { return violation(Rule.UseBeforeDefinition, block, instruction, value) }
+    return Option<Violation>.none()
+  }
+  // An instruction result.
+  if defined.owner >= function.instructionCount() { return violation(Rule.UndefinedValue, block, instruction, value) }
+  let producer = function.instruction(defined.owner)
+  if producer.removed || producer.result + usize.toU64(defined.index) != value || position[defined.owner] == usize.MAX {
+    return violation(Rule.UndefinedValue, block, instruction, value)
+  }
+  if producer.block == block {
+    if position[defined.owner] >= at { return violation(Rule.UseBeforeDefinition, block, instruction, value) }
+    return Option<Violation>.none()
+  }
+  if !graph.dominates(producer.block, block) { return violation(Rule.UseBeforeDefinition, block, instruction, value) }
+  return Option<Violation>.none()
+}
+
+// The operand and result kinds of `instruction`.
+effect fn checkInstruction(function: &SsaFunction, instruction: usize) -> Option<Violation> ! OutOfMemoryError ? &mut Allocator {
+  let found = function.instruction(instruction)
+  let operands = function.operandsOf(instruction)
+  let block = found.block
+  let kind = found.kind
+  let address = function.addressKind()
+  let count = operands.length
+  let mut kinds = List<Kind>.make()
+  let mut at = usize.ZERO
+  while at < count {
+    run List<Kind>.append(&mut kinds, function.kindOf(operands[at]))
+    at = at + usize.ONE
+  }
+  let of = List<Kind>.asSlice(&kinds)
+  let bad = violation(Rule.OperandKind, block, instruction, none())
+  let wrongCount = violation(Rule.OperandCount, block, instruction, none())
+  let wrongResult = violation(Rule.ResultKind, block, instruction, found.result)
+  if found.result != none() {
+    let first = function.value(found.result)
+    if first.definition != Definition.Result || first.owner != instruction || first.index != usize.ZERO || !first.kind.equals(kind) {
+      return violation(Rule.UndefinedValue, block, instruction, found.result)
+    }
+  }
+  if found.operation.resultCount(kind) == usize.ZERO && found.result != none() { return wrongResult }
+  if found.operation.resultCount(kind) != usize.ZERO && found.result == none() { return wrongResult }
+  match found.operation {
+    Operation.Binary {..} => {
+      if count != 2 { return wrongCount }
+      if !arithmetic(of[0]) || !of[0].equals(of[1]) { return bad }
+      if !kind.equals(of[0]) { return wrongResult }
+    }
+    Operation.Negate => {
+      if count != usize.ONE { return wrongCount }
+      if !of[0].isFloat() { return bad }
+      if !kind.equals(of[0]) { return wrongResult }
+    }
+    Operation.Compare {..} => {
+      if count != 2 { return wrongCount }
+      if !of[0].equals(of[1]) || of[0].isUnit() { return bad }
+      if !kind.equals(of[0].flags()) { return wrongResult }
+    }
+    Operation.Select => {
+      if count != 3 { return wrongCount }
+      if !of[1].equals(of[2]) || !of[0].isInteger() || of[0].bits != usize.ONE { return bad }
+      if of[0].isVector() && of[0].elements != of[1].elements { return bad }
+      if !kind.equals(of[1]) { return wrongResult }
+    }
+    Operation.Cast {operation} => {
+      if count != usize.ONE { return wrongCount }
+      if of[0].count() != kind.count() && operation != Cast.Bitcast { return bad }
+      if !castFits(operation, of[0], kind) { return bad }
+    }
+    Operation.Load {..} => {
+      if count != usize.ONE { return wrongCount }
+      if !of[0].equals(address) { return bad }
+      if kind.isUnit() { return wrongResult }
+    }
+    Operation.Store {..} => {
+      if count != 2 { return wrongCount }
+      if of[0].isUnit() || !of[1].equals(address) { return bad }
+    }
+    Operation.Offset {..} => {
+      if count != usize.ONE { return wrongCount }
+      if !of[0].equals(address) { return bad }
+      if !kind.equals(address) { return wrongResult }
+    }
+    Operation.Index => {
+      if count != 2 { return wrongCount }
+      if !of[0].equals(address) || !of[1].isInteger() || of[1].isVector() { return bad }
+      if !kind.equals(address) { return wrongResult }
+    }
+    Operation.CopyBytes {..} => {
+      if count != 2 { return wrongCount }
+      if !of[0].equals(address) || !of[1].equals(address) { return bad }
+    }
+    Operation.Fill {..} => {
+      if count != usize.ONE { return wrongCount }
+      if !of[0].equals(address) { return bad }
+    }
+    Operation.SlotAddress {slot} => {
+      if count != usize.ZERO { return wrongCount }
+      if slot >= function.slotCount() { return violation(Rule.Range, block, instruction, none()) }
+      if !kind.equals(address) { return wrongResult }
+    }
+    Operation.FrameAddress => {
+      if count != usize.ZERO { return wrongCount }
+      if !kind.equals(address) { return wrongResult }
+    }
+    Operation.DynamicSlot {..} => {
+      if count != usize.ONE { return wrongCount }
+      if !of[0].isInteger() || of[0].isVector() { return bad }
+      if !kind.equals(address) { return wrongResult }
+    }
+    Operation.Call {symbol, fixed} => {
+      if symbol >= function.symbolCount() { return violation(Rule.Range, block, instruction, none()) }
+      if fixed != usize.MAX && fixed > count { return wrongCount }
+    }
+    Operation.CallIndirect => {
+      if count == usize.ZERO { return wrongCount }
+      if !of[0].equals(address) { return bad }
+    }
+    Operation.Overflow {..} => {
+      if count != 2 { return wrongCount }
+      if !of[0].isInteger() || !of[0].equals(of[1]) { return bad }
+      if !kind.equals(of[0]) || !function.kindOf(found.result + 1).equals(of[0].flags()) { return wrongResult }
+    }
+    Operation.Saturate {..} => {
+      if count != 2 { return wrongCount }
+      if !of[0].isInteger() || !of[0].equals(of[1]) { return bad }
+      if !kind.equals(of[0]) { return wrongResult }
+    }
+    Operation.Rotate {..} => {
+      if count != 2 { return wrongCount }
+      if !of[0].isInteger() || !of[0].equals(of[1]) { return bad }
+      if !kind.equals(of[0]) { return wrongResult }
+    }
+    Operation.Count {..} => {
+      if count != usize.ONE { return wrongCount }
+      if !of[0].isInteger() { return bad }
+      if !kind.equals(of[0]) { return wrongResult }
+    }
+    Operation.Extreme {..} => {
+      if count != 2 { return wrongCount }
+      if !arithmetic(of[0]) || !of[0].equals(of[1]) { return bad }
+      if !kind.equals(of[0]) { return wrongResult }
+    }
+    Operation.FusedMultiplyAdd => {
+      if count != 3 { return wrongCount }
+      if !of[0].isFloat() || !of[0].equals(of[1]) || !of[0].equals(of[2]) { return bad }
+      if !kind.equals(of[0]) { return wrongResult }
+    }
+    Operation.SquareRoot => {
+      if count != usize.ONE { return wrongCount }
+      if !of[0].isFloat() { return bad }
+      if !kind.equals(of[0]) { return wrongResult }
+    }
+    Operation.Reduce {..} => {
+      if count != usize.ONE && count != 2 { return wrongCount }
+      if !of[0].isVector() { return bad }
+      if count == 2 && !of[1].equals(of[0].element()) { return bad }
+      if !kind.equals(of[0].element()) { return wrongResult }
+    }
+    Operation.Shuffle {start, count: entries} => {
+      if count != 2 { return wrongCount }
+      if !of[0].isVector() || !of[0].equals(of[1]) { return bad }
+      if !kind.equals(Kind.vector(of[0].element(), entries)) { return wrongResult }
+      let mask = function.immediatesAt(start, entries)
+      let mut entry = usize.ZERO
+      while entry < mask.length {
+        if mask[entry] != u64.MAX && mask[entry] >= usize.toU64(of[0].elements * 2) { return violation(Rule.Range, block, instruction, none()) }
+        entry = entry + usize.ONE
+      }
+    }
+    Operation.Extract => {
+      if count != 2 { return wrongCount }
+      if !of[0].isVector() || !of[1].isInteger() || of[1].isVector() { return bad }
+      if !kind.equals(of[0].element()) { return wrongResult }
+    }
+    Operation.Insert => {
+      if count != 3 { return wrongCount }
+      if !of[0].isVector() || !of[1].equals(of[0].element()) || !of[2].isInteger() || of[2].isVector() { return bad }
+      if !kind.equals(of[0]) { return wrongResult }
+    }
+    Operation.Splat {count: elements} => {
+      if count != usize.ONE { return wrongCount }
+      if of[0].isVector() || of[0].isUnit() { return bad }
+      if !kind.equals(Kind.vector(of[0], elements)) { return wrongResult }
+    }
+    Operation.AtomicLoad => {
+      if count != usize.ONE { return wrongCount }
+      if !of[0].equals(address) { return bad }
+      if !(kind.isInteger() || kind.isAddress()) || kind.isVector() { return wrongResult }
+    }
+    Operation.AtomicStore => {
+      if count != 2 { return wrongCount }
+      if !(of[0].isInteger() || of[0].isAddress()) || of[0].isVector() || !of[1].equals(address) { return bad }
+    }
+    Operation.AtomicModify {..} => {
+      if count != 2 { return wrongCount }
+      if !of[0].equals(address) || !(of[1].isInteger() || of[1].isAddress()) || of[1].isVector() { return bad }
+      if !kind.equals(of[1]) { return wrongResult }
+    }
+    Operation.CompareExchange => {
+      if count != 3 { return wrongCount }
+      if !of[0].equals(address) || !of[1].equals(of[2]) || !(of[1].isInteger() || of[1].isAddress()) || of[1].isVector() { return bad }
+      if !kind.equals(of[1]) || !function.kindOf(found.result + 1).equals(Kind.flag()) { return wrongResult }
+    }
+    Operation.Fence => { if count != usize.ZERO { return wrongCount } }
+    Operation.WasmGlobalGet {..} => { if count != usize.ZERO { return wrongCount } }
+    Operation.WasmGlobalSet {..} => { if count != usize.ONE { return wrongCount } }
+    Operation.WasmMemorySize => {
+      if count != usize.ZERO { return wrongCount }
+      if !kind.equals(Kind.integer(function.addressBits)) { return wrongResult }
+    }
+    Operation.WasmMemoryGrow => {
+      if count != usize.ONE { return wrongCount }
+      if !of[0].equals(Kind.integer(function.addressBits)) { return bad }
+      if !kind.equals(Kind.integer(function.addressBits)) { return wrongResult }
+    }
+    Operation.WasmWait => {
+      if count != 3 { return wrongCount }
+      if !of[0].equals(address) || !of[1].isInteger() || !of[2].equals(Kind.integer(64)) { return bad }
+      if !kind.equals(Kind.integer(32)) { return wrongResult }
+    }
+    Operation.WasmNotify => {
+      if count != 2 { return wrongCount }
+      if !of[0].equals(address) || !of[1].equals(Kind.integer(32)) { return bad }
+      if !kind.equals(Kind.integer(32)) { return wrongResult }
+    }
+  }
+  return Option<Violation>.none()
+}
+
+// Whether arithmetic applies to `kind`: an integer or a float, scalar or vector.
+fn arithmetic(kind: Kind) -> bool { return kind.isInteger() || kind.isFloat() }
+
+// Whether `operation` converts a value of `source` to one of `output`, element by element.
+fn castFits(operation: Cast, source: Kind, output: Kind) -> bool {
+  if operation == Cast.Trunc { return source.isInteger() && output.isInteger() && output.bits < source.bits }
+  if operation == Cast.ZExt || operation == Cast.SExt { return source.isInteger() && output.isInteger() && output.bits > source.bits }
+  if operation == Cast.FPToSI || operation == Cast.FPToUI { return source.isFloat() && output.isInteger() }
+  if operation == Cast.SIToFP || operation == Cast.UIToFP { return source.isInteger() && output.isFloat() }
+  if operation == Cast.FPTrunc { return source.isFloat() && output.isFloat() && output.bits < source.bits }
+  if operation == Cast.FPExt { return source.isFloat() && output.isFloat() && output.bits > source.bits }
+  if operation == Cast.IntToPtr { return source.isInteger() && output.isAddress() && !source.isVector() }
+  if operation == Cast.PtrToInt { return source.isAddress() && output.isInteger() && !output.isVector() }
+  // A bitcast keeps the store size.
+  return !source.isUnit() && !output.isUnit() && source.storeSize() == output.storeSize()
+}
