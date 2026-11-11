@@ -206,6 +206,27 @@ pub fn capacity(self: &Self) -> usize
 
 Returns the number of elements that fit in the current storage before the next growth.
 
+<a id="List.impl.storage"></a>
+
+### Method `storage`
+
+```silk
+pub unsafe fn storage(self: &mut Self) -> ?[*]mut T
+```
+
+Returns a pointer to the first element of the storage, which has room for [`List.capacity`](#List.impl.capacity)
+elements.
+
+#### When to use
+
+Use it with [`List.setLength`](#List.impl.setLength) in code that fills many elements with no check for each, such
+as a parser: reserve the room, write the elements through the pointer, then set the length.
+
+#### Gotchas
+
+The pointer is null while the capacity is 0. Any call that grows, shrinks or frees the storage
+makes the pointer stale. Only the first [`List.length`](#List.impl.length) elements are initialized.
+
 <a id="List.impl.asSlice"></a>
 
 ### Method `asSlice`
@@ -550,6 +571,25 @@ storage for exactly the length. The length does not change.
 ```silk
 impl<T: Copy> List<T>
 ```
+
+<a id="List.impl.setLength"></a>
+
+### Method `setLength`
+
+```silk
+pub unsafe fn setLength(self: &mut Self, length: usize) -> ()
+```
+
+Sets the number of elements to `length` without writing or dropping any element.
+
+#### When to use
+
+Use it after code wrote elements through [`List.storage`](#List.impl.storage), to make them part of the list.
+
+#### Gotchas
+
+The caller must prove that `length` is at most [`List.capacity`](#List.impl.capacity) and that the first `length`
+elements of the storage are initialized.
 
 <a id="List.impl.get"></a>
 

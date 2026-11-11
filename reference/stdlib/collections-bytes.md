@@ -276,6 +276,46 @@ pub fn capacity(self: &Self) -> usize
 
 Returns the number of bytes the storage holds before the next append allocates.
 
+<a id="Bytes.impl.storage"></a>
+
+### Method `storage`
+
+```silk
+pub unsafe fn storage(self: &mut Self) -> ?[*]mut u8
+```
+
+Returns a pointer to the first byte of the storage, which has room for [`Bytes.capacity`](#Bytes.impl.capacity)
+bytes.
+
+#### When to use
+
+Use it with [`Bytes.setLength`](#Bytes.impl.setLength) in code that fills many bytes with no check for each, such as
+a decoder: reserve the room, write the bytes through the pointer, then set the length.
+
+#### Gotchas
+
+The pointer is null while the capacity is 0. Any call that grows, shrinks or frees the storage
+makes the pointer stale. Only the first [`Bytes.length`](#Bytes.impl.length) bytes are initialized.
+
+<a id="Bytes.impl.setLength"></a>
+
+### Method `setLength`
+
+```silk
+pub unsafe fn setLength(self: &mut Self, length: usize) -> ()
+```
+
+Sets the number of bytes to `length` without writing any byte.
+
+#### When to use
+
+Use it after code wrote bytes through [`Bytes.storage`](#Bytes.impl.storage), to make them part of the value.
+
+#### Gotchas
+
+The caller must prove that `length` is at most [`Bytes.capacity`](#Bytes.impl.capacity) and that the first `length`
+bytes of the storage are initialized.
+
 <a id="Bytes.impl.clear"></a>
 
 ### Method `clear`

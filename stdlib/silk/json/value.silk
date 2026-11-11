@@ -97,6 +97,11 @@ import silk.simd.simd
 import silk.simd.mask16
 import silk.simd.u8x16
 import silk.simd.u8x32
+import silk.simd.i32x4
+import silk.simd.u16x8
+import silk.simd.i16x8
+import silk.simd.i8x16
+import silk.simd.u64x2
 import silk.simd.mask32
 import silk.simd.cpu { CpuFeatures }
 import silk.core.target { Arch, Target }
@@ -1730,16 +1735,16 @@ impl JsonDocument {
   /// - `OutOfMemoryError` if the `Allocator` cannot supply the buffers.
   pub effect fn parse(bytes: &[u8]) -> JsonDocument ! JsonError | OutOfMemoryError ? &mut Allocator {
     static if Target.arch() == Arch.X86_64 {
-      if CpuFeatures.available("avx2") && CpuFeatures.available("bmi") && CpuFeatures.available("popcnt") {
-        let inside = unsafe wideTextCheck(bytes)
-        if inside != usize.ZERO {
-          // Room for every string at once, so they are copied 32 bytes at a time without a check.
-          let mut wide = JsonDocument { slots: List<DocumentSlot>.make(), text: run Bytes.zeroed(inside + 64) }
-          run List<DocumentSlot>.reserve(&mut wide.slots, bytes.length / 8 + 4)
-          let mut wideKeys = List<u64>.make()
-          let parsed = run unsafe wideParse(bytes, &mut wide, &mut wideKeys)
+      if CpuFeatures.available("avx2") && CpuFeatures.available("bmi") && CpuFeatures.available("bmi2") && CpuFeatures.available("lzcnt") &&
+        CpuFeatures.available("popcnt") && CpuFeatures.available("pclmul") {
+        if bytes.length < 4000000000 {
+          let mut wide = JsonDocument { slots: List<DocumentSlot>.make(), text: Bytes.make() }
+          let parsed = run unsafe wideParse(bytes, &mut wide)
           if parsed { return move wide }
           drop wide
+          // The scanner path reports the error where it is.
+          let refused = run parseScanned(bytes, false)
+          return run JsonDocument.fromValue(&refused)
         }
       }
     }
@@ -2127,12 +2132,16 @@ fn closeSlot(document: &mut JsonDocument, open: usize, kind: u64, count: usize) 
     DocumentSlot { info: u64.bitOr(kind, u64.shiftLeft(usize.toU64(count), 8)), payload: usize.toU64(end) })
 }
 
-// Parsing on AVX2: `wideTextCheck` checks the UTF-8 of the whole text 64 bytes at a time and counts
-// the bytes inside strings, so `wideParse` then only scans each string for its end and copies it,
-// 32 bytes at a time, into a buffer of that size. `JsonDocument.parse` calls them when
-// `CpuFeatures` finds the features; any failure falls back to the parser above.
+// Parsing on AVX2, in two passes (Langdale and Lemire, "Parsing Gigabytes of JSON per Second",
+// 2019). `wideIndex` checks the UTF-8 of the whole text 64 bytes at a time and writes the index of
+// each token: with the tokens known up front, the parser does not wait for one value to end to find
+// the next. `wideParse` then reads the tokens in one loop with no call for each value: it keeps the
+// open arrays and objects in a table of its own, reads and writes through pointers with no bounds
+// checks, and copies each string 32 bytes at a time into a buffer that has room for the whole text.
+// `JsonDocument.parse` calls them when `CpuFeatures` finds the features, and reports the error of a
+// text that they refuse with the scanner path.
 static if Target.arch() == Arch.X86_64 {
-  @features("avx2", "bmi", "popcnt")
+  @features("avx2", "bmi", "bmi2", "lzcnt", "popcnt", "pclmul")
   @inlineAlways
   unsafe fn wideUtf8Errors(lanes: simd<u8, 32>, previous: simd<u8, 32>) -> simd<u8, 32> {
     let one = u8x32.shuffle(previous, lanes, [31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
@@ -2153,42 +2162,37 @@ static if Target.arch() == Arch.X86_64 {
     return (firstHigh & firstLow & secondHigh) ^ continuation
   }
 
-  const EVEN_BITS: u64 = 0x5555555555555555
-
   // A byte is whitespace when it equals the entry of this table for its low nibble. The other
   // entries are 255, which no lane matches: a lane with its high bit set looks up 0.
   const BLANK_TABLE: [u8; 32] = [32, 255, 255, 255, 255, 255, 255, 255, 255, 9, 10, 255, 255, 13, 255, 255,
     32, 255, 255, 255, 255, 255, 255, 255, 255, 9, 10, 255, 255, 13, 255, 255]
 
-  // What `wideTextCheck` carries from one 64-byte block to the next.
-  struct TextScan {
+  // A byte is `:`, `,`, `{`, `}`, `[` or `]` when the byte with bit 32 set equals the entry of this
+  // table for its low nibble. Two control bytes match too; the parser reads the byte itself.
+  const MARK_TABLE: [u8; 32] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 58, 123, 44, 125, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 58, 123, 44, 125, 0, 0]
+
+  const EVEN_BITS: u64 = 0x5555555555555555
+
+  // What `wideIndex` carries from one 64-byte block to the next.
+  struct IndexScan {
     previous: simd<u8, 32>,
     errors: simd<u8, 32>,
     pending: bool,
     escapedCarry: u64,
     inString: u64,
-    inside: usize,
+    scalarCarry: u64,
+    // The tokens that make a slot: all but the commas, colons and closing brackets.
+    slots: usize,
   }
 
+  // The bits of the 64 bytes `first` and `second` where a token starts: a punctuation mark or an
+  // opening quote outside strings, or the first byte of a number or a literal (Langdale and
+  // Lemire, "Parsing Gigabytes of JSON per Second", 2019). Also checks the UTF-8 of the bytes
+  // (Keiser and Lemire, "Validating UTF-8 In Less Than One Instruction Per Byte", 2021).
+  @features("avx2", "bmi", "bmi2", "lzcnt", "popcnt", "pclmul")
   @inlineAlways
-  fn prefixXor(value: u64) -> u64 {
-    let mut x = value
-    x = u64.bitXor(x, u64.shiftLeft(x, 1))
-    x = u64.bitXor(x, u64.shiftLeft(x, 2))
-    x = u64.bitXor(x, u64.shiftLeft(x, 4))
-    x = u64.bitXor(x, u64.shiftLeft(x, 8))
-    x = u64.bitXor(x, u64.shiftLeft(x, 16))
-    x = u64.bitXor(x, u64.shiftLeft(x, 32))
-    return x
-  }
-
-  // Checks the UTF-8 of the 64 bytes `first` and `second` (Keiser and Lemire, "Validating UTF-8 In
-  // Less Than One Instruction Per Byte", 2021), and counts the bytes in them that are inside strings,
-  // with the escape rule of simdjson (Langdale and Lemire, "Parsing Gigabytes of JSON per Second",
-  // 2019).
-  @features("avx2", "bmi", "popcnt")
-  @inlineAlways
-  unsafe fn wideTextBlock(scan: &mut TextScan, first: simd<u8, 32>, second: simd<u8, 32>) -> () {
+  unsafe fn wideIndexBlock(scan: &mut IndexScan, first: simd<u8, 32>, second: simd<u8, 32>) -> u64 {
     if mask32.any(u8x32.lanesGreaterOrEqual(first | second, u8x32.splat(128))) || scan.pending {
       scan.errors = scan.errors | unsafe wideUtf8Errors(first, scan.previous) | unsafe wideUtf8Errors(second, first)
       // A character that the last bytes start and the next block must finish.
@@ -2216,222 +2220,368 @@ static if Target.arch() == Arch.X86_64 {
       escaped = u64.bitAnd(u64.bitXor(EVEN_BITS, u64.shiftLeft(sum, 1)), follows)
     }
     let quote = u64.bitAnd(quotes, u64.bitNot(escaped))
-    // Set from each opening quote up to, not including, its closing quote.
-    let strings = u64.bitXor(prefixXor(quote), scan.inString)
+    // Set from each opening quote up to, not including, its closing quote: the carry-less product
+    // with all ones is the xor of the bits at and below each bit.
+    let spread = u64x2.extract(Intrinsic.x86CarrylessMultiply<simd<u64, 2>>(u64x2.fromArray([quote, 0]), u64x2.splat(u64.MAX)), 0)
+    let strings = u64.bitXor(spread, scan.inString)
     scan.inString = u64.wrappingSubtract(0, u64.shiftRight(strings, 63))
-    scan.inside = scan.inside + u32.toUsize(u64.countOnes(u64.bitAnd(strings, u64.bitNot(quote))))
+    let blankTable = u8x32.fromArray(BLANK_TABLE)
+    let markTable = u8x32.fromArray(MARK_TABLE)
+    let curly = u8x32.splat(32)
+    let blank = u64.bitOr(mask32.toBits(u8x32.lanesEqual(first, Intrinsic.x86ShuffleBytes<simd<u8, 32>>(blankTable, first))),
+      u64.shiftLeft(mask32.toBits(u8x32.lanesEqual(second, Intrinsic.x86ShuffleBytes<simd<u8, 32>>(blankTable, second))), 32))
+    let mark = u64.bitOr(mask32.toBits(u8x32.lanesEqual(first | curly, Intrinsic.x86ShuffleBytes<simd<u8, 32>>(markTable, first))),
+      u64.shiftLeft(mask32.toBits(u8x32.lanesEqual(second | curly, Intrinsic.x86ShuffleBytes<simd<u8, 32>>(markTable, second))), 32))
+    // A number or a literal starts at a byte that is neither blank nor a mark and follows one that
+    // is, or follows a quote.
+    let scalar = u64.bitNot(u64.bitOr(mark, blank))
+    let plain = u64.bitAnd(scalar, u64.bitNot(quote))
+    let follows = u64.bitOr(u64.shiftLeft(plain, 1), scan.scalarCarry)
+    scan.scalarCarry = u64.shiftRight(plain, 63)
+    let starts = u64.bitOr(mark, u64.bitAnd(scalar, u64.bitNot(follows)))
+    // Not inside a string, and not a closing quote.
+    let outside = u64.bitNot(u64.bitXor(strings, quote))
+    let tokens = u64.bitAnd(starts, outside)
+    // `[` with bit 32 set is `{`.
+    let openLanes = u8x32.splat(123)
+    let opens = u64.bitOr(mask32.toBits(u8x32.lanesEqual(first | curly, openLanes)),
+      u64.shiftLeft(mask32.toBits(u8x32.lanesEqual(second | curly, openLanes)), 32))
+    scan.slots = usize.wrappingAdd(scan.slots, u32.toUsize(u64.countOnes(u64.bitAnd(tokens, u64.bitOr(u64.bitNot(mark), opens)))))
+    return tokens
   }
 
-  // Returns 0 if `bytes` is not valid UTF-8 or ends inside a string, and otherwise 1 more than the
-  // number of bytes inside its strings, which no decoded string is longer than.
-  @features("avx2", "bmi", "popcnt")
-  unsafe fn wideTextCheck(bytes: &[u8]) -> usize {
-    let mut scan = TextScan {
+  // Writes the index of each set bit of `marks`, the bits of the 64 bytes from `at`, at `count` in
+  // `out`, which has room for 64 more. Returns the new count. Writes 8 at a time, past the set
+  // bits, so that the common counts take no branch for each bit.
+  @features("avx2", "bmi", "bmi2", "lzcnt", "popcnt", "pclmul")
+  @inlineAlways
+  unsafe fn wideFlatten(out: [*]mut u32, count: usize, at: usize, marks: u64) -> usize {
+    if marks == 0 { return count }
+    let total = u32.toUsize(u64.countOnes(marks))
+    let position = usize.wrappingToU32(at)
+    let mut bits = marks
+    let mut to = count
+    while true {
+      let mut lane = usize.ZERO
+      while lane < 8 {
+        unsafe { Intrinsic.pointerWrite<u32>(Intrinsic.pointerAtMut<u32>(out, usize.wrappingAdd(to, lane)), u32.wrappingAdd(position, u64.trailingZeros(bits))) }
+        bits = u64.bitAnd(bits, u64.wrappingSubtract(bits, 1))
+        lane = usize.wrappingAdd(lane, 1)
+      }
+      if bits == 0 { break }
+      to = usize.wrappingAdd(to, 8)
+    }
+    return usize.wrappingAdd(count, total)
+  }
+
+  // The token indexes are kept in the spare room of the buffer for the decoded strings, after the
+  // room for the strings themselves, so a parse makes two allocations and both stay with the
+  // document: an allocation that is released each time makes the host allocator give memory back
+  // to the system and fetch it again for every document.
+
+  // The pointer to the index at the byte `room` of the storage of `text`.
+  @inlineAlways
+  unsafe fn wideIndexes(text: &mut Bytes, room: usize) -> [*]mut u32 {
+    unsafe {
+      let base = Intrinsic.pointerRequalify<?[*]mut u8, [*]mut u8>(Bytes.storage(&mut text.*))
+      return Intrinsic.pointerRequalify<*mut u32, [*]mut u32>(
+        Intrinsic.pointerReinterpret<*mut u8, *mut u32>(Intrinsic.pointerAtMut<u8>(base, room)))
+    }
+  }
+
+  // Makes room for more indexes after the `count` that are written from the byte `room` on.
+  @inlineNever
+  effect fn wideGrowIndexes(text: &mut Bytes, room: usize, count: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    // The indexes count as bytes of `text` while it grows, so they move with it.
+    unsafe Bytes.setLength(&mut text.*, room + count * 4)
+    run Bytes.reserve(&mut text.*, count * 2 + 1024)
+    unsafe Bytes.setLength(&mut text.*, usize.ZERO)
+  }
+
+  // What `wideIndex` found: whether the text can be parsed, and the tokens that make a slot.
+  struct IndexTotals {
+    valid: bool,
+    tokens: usize,
+    slots: usize,
+  }
+
+  // Writes the index of the first byte of each token of `bytes` to the storage of `text` from the
+  // byte `room` on, 4 bytes each, and then `WIDE_SENTINELS` entries more. `text` stays empty. The
+  // result is not `valid` if `bytes` is not valid UTF-8, ends inside a string, has no token, or has
+  // more than one token and does not end with `]` or `}`.
+  @features("avx2", "bmi", "bmi2", "lzcnt", "popcnt", "pclmul")
+  @inlineNever
+  unsafe effect fn wideIndex(bytes: &[u8], text: &mut Bytes, room: usize) -> IndexTotals ! OutOfMemoryError ? &mut Allocator {
+    let mut scan = IndexScan {
       previous: u8x32.splat(0),
       errors: u8x32.splat(0),
       pending: false,
       escapedCarry: 0,
       inString: 0,
-      inside: usize.ZERO,
+      scalarCarry: 0,
+      slots: usize.ZERO,
     }
+    run Bytes.reserveExact(&mut text.*, room + (bytes.length / 6 + 256) * 4)
+    let mut out = unsafe wideIndexes(&mut text.*, room)
+    let mut limit = (Bytes.capacity(&text.*) - room) / 4
+    let mut count = usize.ZERO
     let mut at = usize.ZERO
-    while at + 64 <= bytes.length {
-      unsafe wideTextBlock(&mut scan, u8x32.load(bytes, at), u8x32.load(bytes, at + 32))
-      at = at + 64
+    if bytes.length >= 64 {
+      let base = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Intrinsic.pointerFromSlice<u8>(bytes))
+      let last = bytes.length - 64
+      while at <= last {
+        if limit - count < 72 + WIDE_SENTINELS {
+          run wideGrowIndexes(&mut text.*, room, count)
+          out = unsafe wideIndexes(&mut text.*, room)
+          limit = (Bytes.capacity(&text.*) - room) / 4
+        }
+        let marks = unsafe wideIndexBlock(&mut scan, unsafe rawLanes(base, at), unsafe rawLanes(base, at + 32))
+        count = unsafe wideFlatten(out, count, at, marks)
+        at = at + 64
+      }
+    }
+    if limit - count < 72 + WIDE_SENTINELS {
+      run wideGrowIndexes(&mut text.*, room, count)
+      out = unsafe wideIndexes(&mut text.*, room)
     }
     if at < bytes.length || scan.pending {
       // The last bytes, padded with spaces, which also end a character that is cut off.
-      let mut last: [u8; 64] = [32; 64]
+      let mut rest: [u8; 64] = [32; 64]
       let mut index = usize.ZERO
       while at + index < bytes.length {
-        last[index] = bytes[at + index]
+        rest[index] = bytes[at + index]
         index = index + usize.ONE
       }
-      unsafe wideTextBlock(&mut scan, u8x32.load(&last, 0), u8x32.load(&last, 32))
+      let marks = unsafe wideIndexBlock(&mut scan, u8x32.load(&rest, 0), u8x32.load(&rest, 32))
+      count = unsafe wideFlatten(out, count, at, marks)
     }
-    if scan.inString != 0 || mask32.any(u8x32.lanesGreater(scan.errors, u8x32.splat(0))) { return usize.ZERO }
-    return scan.inside + usize.ONE
+    if scan.inString != 0 || mask32.any(u8x32.lanesGreater(scan.errors, u8x32.splat(0))) {
+      return IndexTotals { valid: false, tokens: usize.ZERO, slots: usize.ZERO }
+    }
+    if count == usize.ZERO { return IndexTotals { valid: false, tokens: usize.ZERO, slots: usize.ZERO } }
+    // The entries after the last token repeat it when it closes an array or object, and are the
+    // end of the text otherwise. A text of more than one token that does not end with `]` or `}`
+    // is not valid, so no entry is read as the index of a byte that is not in the text.
+    let last = unsafe Intrinsic.pointerRead<u32>(unsafe Intrinsic.pointerAtMut<u32>(out, count - usize.ONE))
+    let mut entry = usize.wrappingToU32(bytes.length)
+    if u8.bitOr(bytes[u32.toUsize(last)], 32) == 125 {
+      entry = last
+    } else if count != usize.ONE || u8.bitOr(bytes[u32.toUsize(last)], 32) == 123 {
+      return IndexTotals { valid: false, tokens: usize.ZERO, slots: usize.ZERO }
+    }
+    let mut extra = usize.ZERO
+    while extra < WIDE_SENTINELS {
+      unsafe { Intrinsic.pointerWrite<u32>(Intrinsic.pointerAtMut<u32>(out, count + extra), entry) }
+      extra = extra + usize.ONE
+    }
+    return IndexTotals { valid: true, tokens: count, slots: scan.slots }
   }
 
-  // The first byte at or after `at` that is not whitespace.
-  @features("avx2", "bmi", "popcnt")
+  // A string, number or literal that starts in the last `WIDE_TAIL` bytes of the text is read from
+  // a copy of those bytes that `WIDE_PAD` zero bytes follow, and a string that reaches them moves
+  // on to the copy. No read reaches more than `WIDE_PAD` bytes past where its token starts, so no
+  // read leaves the text or the copy. A zero byte ends every token and starts none.
+  const WIDE_TAIL: usize = 64
+  const WIDE_PAD: usize = 64
+
+  // The entries that follow the token indexes. When the tokens run out inside an array or object,
+  // each entry is read as one more token, and the parser fails or closes one level for each but
+  // the first, so 2 more than the deepest nesting are enough.
+  const WIDE_SENTINELS: usize = MAX_DEPTH + 8
+
   @inlineAlways
-  unsafe fn wideSkip(bytes: &[u8], at: usize) -> usize {
-    // Most values follow a separator directly, or the one space after it in formatted text.
-    if at < bytes.length && bytes[at] > 32 { return at }
-    if at + usize.ONE < bytes.length && bytes[at] == 32 && bytes[at + usize.ONE] > 32 { return at + usize.ONE }
-    // An indent and its newline mostly fit in one block of 32.
-    if at + 32 <= bytes.length {
-      let lanes = u8x32.load(bytes, at)
-      let blank = mask32.toBits(u8x32.lanesEqual(lanes, Intrinsic.x86ShuffleBytes<simd<u8, 32>>(u8x32.fromArray(BLANK_TABLE), lanes)))
-      if blank != 0xFFFFFFFF { return at + u32.toUsize(u64.trailingZeros(u64.bitNot(blank))) }
-    }
-    return unsafe wideBlankRun(bytes, at)
+  unsafe fn rawByte(base: [*]const u8, at: usize) -> u8 {
+    unsafe { return Intrinsic.pointerRead<u8>(Intrinsic.pointerAt<u8>(base, at)) }
   }
 
-  @features("avx2", "bmi", "popcnt")
-  unsafe fn wideBlankRun(bytes: &[u8], start: usize) -> usize {
-    let table = u8x32.fromArray(BLANK_TABLE)
-    let mut at = start
-    while at + 32 <= bytes.length {
-      let lanes = u8x32.load(bytes, at)
-      let blank = mask32.toBits(u8x32.lanesEqual(lanes, Intrinsic.x86ShuffleBytes<simd<u8, 32>>(table, lanes)))
-      if blank != 0xFFFFFFFF { return at + u32.toUsize(u64.trailingZeros(u64.bitNot(blank))) }
-      at = at + 32
-    }
-    return JsonSyntax.skipWhitespace(bytes, at)
-  }
-
-  // Appends the number at `at`. Arrays of numbers call it in their loop, without a call to
-  // `wideItem` for each.
-  @features("avx2", "bmi", "popcnt")
+  // The 8 bytes at `at` as a little-endian word.
   @inlineAlways
-  unsafe effect fn wideNumber(bytes: &[u8], cursor: &mut TreeCursor, document: &mut JsonDocument, at: usize)
-    -> () ! JsonError | OutOfMemoryError ? &mut Allocator {
-    // The common shapes, a few whole digits and an optional fraction of at most 19 digits in all,
-    // are read here; anything else goes to `treeNumber`.
-    let mut index = at
-    let negative = bytes[index] == 45
-    if negative { index = index + usize.ONE }
-    let wholeStart = index
-    let mut significand: u64 = 0
-    while index < bytes.length {
-      let digit = u8.wrappingSubtract(bytes[index], 48)
-      if digit > 9 { break }
-      significand = significand * 10 + u8.toU64(digit)
-      index = index + usize.ONE
-      if index - wholeStart == 3 {
-        // Longer runs, like ids, go 8 digits at a time.
-        index = digitRun(bytes, index, &mut significand)
-        break
-      }
-    }
-    let whole = index - wholeStart
-    let simple = whole != usize.ZERO && whole <= 18 && (bytes[wholeStart] != 48 || whole == usize.ONE)
-    if simple && (index >= bytes.length || (bytes[index] != 101 && bytes[index] != 69)) {
-      if index < bytes.length && bytes[index] == 46 {
-        let fractionStart = index + usize.ONE
-        let end = digitRun(bytes, fractionStart, &mut significand)
-        let fraction = end - fractionStart
-        if fraction != usize.ZERO && whole + fraction <= 19 &&
-          (end >= bytes.length || (bytes[end] != 101 && bytes[end] != 69)) {
-          let mut value = Format.f64FromDecimal(significand, -usize.toI64(fraction))
-          if negative { value = -value }
-          cursor.index = end
-          return run pushSlot(&mut document.*, SLOT_FLOAT, usize.ZERO, f64.toBits(value))
-        }
-      } else {
-        cursor.index = index
-        if negative {
-          if significand == 0 { return run pushSlot(&mut document.*, SLOT_FLOAT, usize.ZERO, f64.toBits(-0.0)) }
-          return run pushSlot(&mut document.*, SLOT_INTEGER, usize.ZERO, i64.wrappingToU64(0 - u64.toI64(significand)))
-        }
-        return run pushSlot(&mut document.*, SLOT_INTEGER, usize.ZERO, significand)
-      }
-    }
-    let number = run treeNumber(bytes, &mut cursor.*, at)
-    if cursor.failed { return () }
-    return match move number {
-      JsonNumber.Integer { value } => run pushSlot(&mut document.*, SLOT_INTEGER, usize.ZERO, i64.wrappingToU64(value))
-      JsonNumber.Unsigned { value } => run pushSlot(&mut document.*, SLOT_UNSIGNED, usize.ZERO, value)
-      JsonNumber.Float { value } => run pushSlot(&mut document.*, SLOT_FLOAT, usize.ZERO, f64.toBits(value))
-      JsonNumber.Decimal { text } => run copyDecimal(&mut document.*, String.view(&text))
+  unsafe fn rawWord(base: [*]const u8, at: usize) -> u64 {
+    unsafe {
+      let wide = Intrinsic.pointerReinterpret<*const u8, *const align(1) u64>(Intrinsic.pointerAt<u8>(base, at))
+      return Intrinsic.pointerReadUnaligned<u64>(wide)
     }
   }
 
-  @features("avx2", "bmi", "popcnt")
-  unsafe effect fn wideItem(bytes: &[u8], cursor: &mut TreeCursor, document: &mut JsonDocument, used: &mut usize, keys: &mut List<u64>)
-    -> () ! JsonError | OutOfMemoryError ? &mut Allocator {
-    let at = unsafe wideSkip(bytes, cursor.index)
-    if at >= bytes.length { return markFailed(&mut cursor.*) }
-    let byte = bytes[at]
-    if byte == 34 { return run unsafe wideString(bytes, &mut cursor.*, &mut document.*, &mut used.*, at) }
-    if byte == 45 || (byte >= 48 && byte <= 57) { return run unsafe wideNumber(bytes, &mut cursor.*, &mut document.*, at) }
-    if byte == 91 { return run unsafe wideArray(bytes, &mut cursor.*, &mut document.*, &mut used.*, &mut keys.*, at + usize.ONE) }
-    if byte == 123 { return run unsafe wideObject(bytes, &mut cursor.*, &mut document.*, &mut used.*, &mut keys.*, at + usize.ONE) }
-    let mut kind = SLOT_NULL
-    let mut length: usize = 4
-    if byte == 116 && wordAt(bytes, at, b"true") {
-      kind = SLOT_TRUE
-    } else if byte == 102 && wordAt(bytes, at, b"false") {
-      kind = SLOT_FALSE
-      length = 5
-    } else if !(byte == 110 && wordAt(bytes, at, b"null")) {
-      return markFailed(&mut cursor.*)
+  @features("avx2", "bmi", "bmi2", "lzcnt", "popcnt", "pclmul")
+  @inlineAlways
+  unsafe fn rawLanes(base: [*]const u8, at: usize) -> simd<u8, 32> {
+    unsafe {
+      return u8x32.loadUnchecked(Intrinsic.pointerRequalify<*const u8, [*]const u8>(Intrinsic.pointerAt<u8>(base, at)))
     }
-    cursor.index = at + length
-    return run pushSlot(&mut document.*, kind, usize.ZERO, 0)
   }
 
-  // Appends the string whose quote is at `at` at `used` in `document.text`, which has room for the
-  // whole input and 64 bytes more. The UTF-8 of the text is already checked, so the string is only
-  // scanned for its quote, escapes and control bytes, and copied 32 bytes at a time as it goes.
-  @features("avx2", "bmi", "popcnt")
-  unsafe effect fn wideString(bytes: &[u8], cursor: &mut TreeCursor, document: &mut JsonDocument, used: &mut usize, at: usize)
-    -> () ! OutOfMemoryError ? &mut Allocator {
-    let offset = used.*
-    let out = Bytes.asMutSlice(&mut document.text)
-    let quote = u8x32.splat(34)
-    let backslash = u8x32.splat(92)
-    let space = u8x32.splat(32)
-    let mut index = at + usize.ONE
-    // A decoded string is never longer than its text, so `to` stays at most `index`.
-    let mut to = offset
+  @inlineAlways
+  unsafe fn rawPut(out: [*]mut u8, to: usize, byte: u8) -> () {
+    unsafe { Intrinsic.pointerWrite<u8>(Intrinsic.pointerAtMut<u8>(out, to), byte) }
+  }
+
+  // The pointer `count` bytes after `to`.
+  @inlineAlways
+  unsafe fn rawAfter(to: [*]mut u8, count: usize) -> [*]mut u8 {
+    unsafe { return Intrinsic.pointerRequalify<*mut u8, [*]mut u8>(Intrinsic.pointerAtMut<u8>(to, count)) }
+  }
+
+  @inlineAlways
+  unsafe fn rawRead(text: [*]mut u8) -> [*]const u8 {
+    unsafe { return Intrinsic.pointerRequalify<[*]mut u8, [*]const u8>(text) }
+  }
+
+  @inlineAlways
+  unsafe fn rawSlotRead(slots: [*]mut DocumentSlot, index: usize) -> DocumentSlot {
+    unsafe { return Intrinsic.pointerRead<DocumentSlot>(Intrinsic.pointerAtMut<DocumentSlot>(slots, index)) }
+  }
+
+  @inlineAlways
+  unsafe fn rawSlot(slots: [*]mut DocumentSlot, index: usize, kind: u64, count: u64, payload: u64) -> () {
+    unsafe {
+      Intrinsic.pointerWrite<DocumentSlot>(Intrinsic.pointerAtMut<DocumentSlot>(slots, index),
+        DocumentSlot { info: u64.bitOr(kind, u64.shiftLeft(count, 8)), payload: payload })
+    }
+  }
+
+  // Writes a slot at `slot` and returns the place after it.
+  @inlineAlways
+  unsafe fn pushRaw(slot: [*]mut DocumentSlot, kind: u64, count: u64, payload: u64) -> [*]mut DocumentSlot {
+    unsafe {
+      rawSlot(slot, usize.ZERO, kind, count, payload)
+      return Intrinsic.pointerRequalify<*mut DocumentSlot, [*]mut DocumentSlot>(Intrinsic.pointerAtMut<DocumentSlot>(slot, usize.ONE))
+    }
+  }
+
+  // The number of slots from `slots` up to `slot`.
+  @inlineAlways
+  fn slotIndex(slots: [*]mut DocumentSlot, slot: [*]mut DocumentSlot) -> usize {
+    return usize.shiftRight(
+      usize.wrappingSubtract(Intrinsic.pointerAddress<[*]mut DocumentSlot>(slot), Intrinsic.pointerAddress<[*]mut DocumentSlot>(slots)), 4)
+  }
+
+  @inlineAlways
+  unsafe fn frameRead(frames: [*]mut u64, index: usize) -> u64 {
+    unsafe { return Intrinsic.pointerRead<u64>(Intrinsic.pointerAtMut<u64>(frames, index)) }
+  }
+
+  @inlineAlways
+  unsafe fn frameWrite(frames: [*]mut u64, index: usize, value: u64) -> () {
+    unsafe { Intrinsic.pointerWrite<u64>(Intrinsic.pointerAtMut<u64>(frames, index), value) }
+  }
+
+  // The index in the text of the token at `token`.
+  @inlineAlways
+  unsafe fn rawIndex(token: [*]mut u32) -> usize {
+    unsafe { return u32.toUsize(Intrinsic.pointerRead<u32>(Intrinsic.pointerAtMut<u32>(token, usize.ZERO))) }
+  }
+
+  // The place of the token after `token`.
+  @inlineAlways
+  unsafe fn tokenAfter(token: [*]mut u32) -> [*]mut u32 {
+    unsafe { return Intrinsic.pointerRequalify<*mut u32, [*]mut u32>(Intrinsic.pointerAtMut<u32>(token, usize.ONE)) }
+  }
+
+  // `true` if the number or literal that starts at `at` in the text and is `length` bytes long
+  // ends its token: the token at `token` starts right after it, or a blank follows it. `after` is
+  // the byte that follows it.
+  @inlineAlways
+  unsafe fn wideEnds(token: [*]mut u32, at: usize, length: usize, after: u8) -> bool {
+    let next = unsafe rawIndex(token)
+    let ended = usize.wrappingAdd(at, length)
+    if ended == next { return true }
+    return ended < next && (after == 32 || after == 10 || after == 13 || after == 9)
+  }
+
+  // The bits of the 32 bytes `lanes` that end a run of plain string bytes: a quote, a backslash or
+  // a control byte.
+  @features("avx2", "bmi", "bmi2", "lzcnt", "popcnt", "pclmul")
+  @inlineAlways
+  unsafe fn wideStops(lanes: simd<u8, 32>) -> u64 {
+    let zero = u8x32.splat(0)
+    let ones = u8x32.splat(255)
+    // With bit 1 flipped, the quote is 32 and the control bytes stay below 32.
+    let ending = u8x32.select(u8x32.lanesLessOrEqual(lanes ^ u8x32.splat(2), u8x32.splat(32)), ones, zero) |
+      u8x32.select(u8x32.lanesEqual(lanes, u8x32.splat(92)), ones, zero)
+    return mask32.toBits(u8x32.lanesNotEqual(ending, zero))
+  }
+
+  // Copies the string whose opening quote is at `at` of the text `base` to `out` and decodes its
+  // escapes. Returns the length of the copy, or `usize.MAX` if the string is not valid. Sets
+  // `plain` if the string holds no quote, backslash or control byte. `tail` is the padded copy of
+  // the text from the index `safe` on. The UTF-8 of the text is already checked, so the string is
+  // only scanned for its quote, escapes and control bytes, and copied 32 bytes at a time as it
+  // goes: `out` has room for every string and 64 bytes more. A string with an escape, or one that
+  // reaches the last bytes of the text, is finished by `wideStringRest`.
+  @features("avx2", "bmi", "bmi2", "lzcnt", "popcnt", "pclmul")
+  @inlineAlways
+  unsafe fn wideString(base: [*]const u8, tail: [*]const u8, safe: usize, at: usize, out: [*]mut u8, plain: &mut bool) -> usize {
+    let mut index = usize.wrappingAdd(at, 1)
+    // A decoded string is never longer than its text.
+    let mut to = out
+    while index < safe {
+      let lanes = unsafe rawLanes(base, index)
+      unsafe { u8x32.storeUnchecked(to, lanes) }
+      let stops = unsafe wideStops(lanes)
+      if stops == 0 {
+        index = usize.wrappingAdd(index, 32)
+        to = unsafe rawAfter(to, 32)
+        continue
+      }
+      let length = u32.toUsize(u64.trailingZeros(stops))
+      if unsafe rawByte(base, usize.wrappingAdd(index, length)) != 34 { break }
+      plain.* = true
+      return usize.wrappingAdd(usize.wrappingSubtract(Intrinsic.pointerAddress<[*]mut u8>(to), Intrinsic.pointerAddress<[*]mut u8>(out)), length)
+    }
+    return unsafe wideStringRest(base, tail, safe, index, out, to, &mut plain.*)
+  }
+
+  // Finishes for `wideString` the string whose next byte is at `start` of the text and whose copy
+  // so far ends at `copied`.
+  @features("avx2", "bmi", "bmi2", "lzcnt", "popcnt", "pclmul")
+  @inlineNever
+  unsafe fn wideStringRest(base: [*]const u8, tail: [*]const u8, safe: usize, start: usize, out: [*]mut u8, copied: [*]mut u8,
+    plain: &mut bool) -> usize {
+    let mut from = base
+    let mut limit = safe
+    let mut index = start
+    let mut to = copied
     let mut escaped = false
     while true {
-      let mut stop = bytes.length
-      // `out` has room by the count of `wideTextCheck`; the checks on `to` only keep a broken text from
-      // writing past it.
-      while index + 32 <= bytes.length && to + 32 <= out.length {
-        let lanes = u8x32.load(bytes, index)
-        u8x32.store(&mut out, to, lanes)
-        let stops = u64.bitOr(u64.bitOr(mask32.toBits(u8x32.lanesEqual(lanes, quote)), mask32.toBits(u8x32.lanesEqual(lanes, backslash))),
-          mask32.toBits(u8x32.lanesLess(lanes, space)))
-        if stops != 0 {
-          let length = u32.toUsize(u64.trailingZeros(stops))
-          stop = index + length
-          to = to + length
-          break
-        }
-        index = index + 32
-        to = to + 32
+      if index >= limit {
+        from = tail
+        index = usize.wrappingSubtract(index, safe)
+        limit = usize.MAX
       }
-      if stop == bytes.length {
-        while index < bytes.length && to < out.length && bytes[index] != 34 && bytes[index] != 92 && bytes[index] >= 32 {
-          out[to] = bytes[index]
-          index = index + usize.ONE
-          to = to + usize.ONE
-        }
-        if index >= bytes.length || to >= out.length { return markFailed(&mut cursor.*) }
-        stop = index
+      let lanes = unsafe rawLanes(from, index)
+      unsafe { u8x32.storeUnchecked(to, lanes) }
+      let stops = unsafe wideStops(lanes)
+      if stops == 0 {
+        index = usize.wrappingAdd(index, 32)
+        to = unsafe rawAfter(to, 32)
+        continue
       }
-      let byte = bytes[stop]
+      let length = u32.toUsize(u64.trailingZeros(stops))
+      index = usize.wrappingAdd(index, length)
+      to = unsafe rawAfter(to, length)
+      let byte = unsafe rawByte(from, index)
       if byte == 34 {
-        cursor.index = stop + usize.ONE
-        used.* = to
-        // `escaped` is set once the string holds a quote, a backslash or a control byte.
-        let mut kind = SLOT_STRING
-        if !escaped { kind = u64.bitOr(SLOT_STRING, SLOT_PLAIN) }
-        return run pushSlot(&mut document.*, kind, to - offset, usize.toU64(offset))
+        plain.* = !escaped
+        return usize.wrappingSubtract(Intrinsic.pointerAddress<[*]mut u8>(to), Intrinsic.pointerAddress<[*]mut u8>(out))
       }
-      if byte != 92 || to + 4 > out.length { return markFailed(&mut cursor.*) }
-      let width = decodeEscape(&mut out, to, bytes, stop)
-      if width == 0 { return markFailed(&mut cursor.*) }
+      if byte != 92 { return usize.MAX }
+      let width = unsafe wideEscape(to, from, index)
+      if width == 0 { return usize.MAX }
       // Only the first byte that an escape writes can be a quote, a backslash or a control byte.
-      let first = out[to]
+      let first = unsafe rawByte(unsafe rawRead(to), usize.ZERO)
       if first < 32 || first == 34 || first == 92 { escaped = true }
-      to = to + u64.toUsize(u64.bitAnd(width, 255))
-      index = stop + u64.toUsize(u64.shiftRight(width, 8))
+      to = unsafe rawAfter(to, u64.toUsize(u64.bitAnd(width, 255)))
+      index = usize.wrappingAdd(index, u64.toUsize(u64.shiftRight(width, 8)))
     }
-    return ()
+    return usize.MAX
   }
 
-  // Writes what the escape whose backslash is at `at` stands for at `to` in `out`. Returns the
-  // length of the escape in `bytes` times 256 plus the number of bytes written, or 0 if it is not
-  // valid. An escape is never shorter than what it stands for.
-  fn decodeEscape(out: &mut [u8], to: usize, bytes: &[u8], at: usize) -> u64 {
-    if at + usize.ONE >= bytes.length { return 0 }
-    let next = bytes[at + usize.ONE]
+  // Writes what the escape whose backslash is at `at` of `base` stands for at `out`. Returns the
+  // length of the escape times 256 plus the number of bytes written, or 0 if it is not valid. An
+  // escape is never shorter than what it stands for. Reads at most 12 bytes.
+  unsafe fn wideEscape(out: [*]mut u8, base: [*]const u8, at: usize) -> u64 {
+    let next = unsafe rawByte(base, at + usize.ONE)
     let mut decoded: u8 = next
     if next == 110 { decoded = 10 }
     else if next == 116 { decoded = 9 }
@@ -2439,52 +2589,51 @@ static if Target.arch() == Arch.X86_64 {
     else if next == 98 { decoded = 8 }
     else if next == 102 { decoded = 12 }
     else if next == 117 {
-      let mut scalar = hexScalar(bytes, at + 2)
+      let mut scalar = unsafe rawHex(base, at + 2)
       let mut width: u64 = 6
       if scalar >= 65536 || (scalar >= 56320 && scalar <= 57343) { return 0 }
       if scalar >= 55296 && scalar <= 56319 {
         // A high surrogate, which a low one must follow.
-        if at + 7 >= bytes.length || bytes[at + 6] != 92 || bytes[at + 7] != 117 { return 0 }
-        let low = hexScalar(bytes, at + 8)
+        if unsafe rawByte(base, at + 6) != 92 || unsafe rawByte(base, at + 7) != 117 { return 0 }
+        let low = unsafe rawHex(base, at + 8)
         if low < 56320 || low > 57343 { return 0 }
         scalar = 65536 + (scalar - 55296) * 1024 + (low - 56320)
         width = 12
       }
       if scalar < 128 {
-        out[to] = u32.toU8(scalar)
+        unsafe rawPut(out, 0, u32.toU8(scalar))
         return width * 256 + 1
       }
       if scalar < 2048 {
-        out[to] = u32.toU8(192 + scalar / 64)
-        out[to + usize.ONE] = u32.toU8(128 + scalar % 64)
+        unsafe rawPut(out, 0, u32.toU8(192 + scalar / 64))
+        unsafe rawPut(out, 1, u32.toU8(128 + scalar % 64))
         return width * 256 + 2
       }
       if scalar < 65536 {
-        out[to] = u32.toU8(224 + scalar / 4096)
-        out[to + usize.ONE] = u32.toU8(128 + scalar / 64 % 64)
-        out[to + 2] = u32.toU8(128 + scalar % 64)
+        unsafe rawPut(out, 0, u32.toU8(224 + scalar / 4096))
+        unsafe rawPut(out, 1, u32.toU8(128 + scalar / 64 % 64))
+        unsafe rawPut(out, 2, u32.toU8(128 + scalar % 64))
         return width * 256 + 3
       }
-      out[to] = u32.toU8(240 + scalar / 262144)
-      out[to + usize.ONE] = u32.toU8(128 + scalar / 4096 % 64)
-      out[to + 2] = u32.toU8(128 + scalar / 64 % 64)
-      out[to + 3] = u32.toU8(128 + scalar % 64)
+      unsafe rawPut(out, 0, u32.toU8(240 + scalar / 262144))
+      unsafe rawPut(out, 1, u32.toU8(128 + scalar / 4096 % 64))
+      unsafe rawPut(out, 2, u32.toU8(128 + scalar / 64 % 64))
+      unsafe rawPut(out, 3, u32.toU8(128 + scalar % 64))
       return width * 256 + 4
     } else if next != 34 && next != 92 && next != 47 {
       return 0
     }
-    out[to] = decoded
+    unsafe rawPut(out, 0, decoded)
     return 2 * 256 + 1
   }
 
   // The value of the 4 hex digits at `at`, or 65536 or more if they are not 4 hex digits; a value
   // from 56320 up is not a valid escape on its own either.
-  fn hexScalar(bytes: &[u8], at: usize) -> u32 {
-    if at + 4 > bytes.length { return 65536 }
+  unsafe fn rawHex(base: [*]const u8, at: usize) -> u32 {
     let mut total: u32 = 0
     let mut index = at
     while index < at + 4 {
-      let byte = bytes[index]
+      let byte = unsafe rawByte(base, index)
       let lower = u8.bitOr(byte, 32)
       let mut digit: u32 = 16
       if byte >= 48 && byte <= 57 { digit = u8.toU32(byte) - 48 }
@@ -2496,118 +2645,410 @@ static if Target.arch() == Arch.X86_64 {
     return total
   }
 
-  @features("avx2", "bmi", "popcnt")
-  unsafe effect fn wideArray(bytes: &[u8], cursor: &mut TreeCursor, document: &mut JsonDocument, used: &mut usize, keys: &mut List<u64>, start: usize)
-    -> () ! JsonError | OutOfMemoryError ? &mut Allocator {
-    if cursor.depth == MAX_DEPTH { return markFailed(&mut cursor.*) }
-    let open = List<DocumentSlot>.length(&document.slots)
-    run pushSlot(&mut document.*, SLOT_ARRAY, usize.ZERO, usize.toU64(open + usize.ONE))
-    let mut at = unsafe wideSkip(bytes, start)
-    if at < bytes.length && bytes[at] == 93 {
-      cursor.index = at + usize.ONE
-      return ()
-    }
-    if at >= bytes.length { return markFailed(&mut cursor.*) }
-    cursor.depth = cursor.depth + usize.ONE
-    cursor.index = at
-    let mut count = usize.ZERO
-    while true {
-      let byte = bytes[at]
-      if byte == 45 || (byte >= 48 && byte <= 57) {
-        run unsafe wideNumber(bytes, &mut cursor.*, &mut document.*, at)
-      } else if byte == 34 {
-        run unsafe wideString(bytes, &mut cursor.*, &mut document.*, &mut used.*, at)
-      } else {
-        cursor.index = at
-        run unsafe wideItem(bytes, &mut cursor.*, &mut document.*, &mut used.*, &mut keys.*)
-      }
-      if cursor.failed { return () }
-      count = count + usize.ONE
-      at = unsafe wideSkip(bytes, cursor.index)
-      if at >= bytes.length { break }
-      let next = bytes[at]
-      cursor.index = at + usize.ONE
-      if next == 93 {
-        cursor.depth = cursor.depth - usize.ONE
-        return closeSlot(&mut document.*, open, SLOT_ARRAY, count)
-      }
-      if next != 44 { break }
-      at = unsafe wideSkip(bytes, cursor.index)
-      if at >= bytes.length { break }
-    }
-    return markFailed(&mut cursor.*)
+  // Row `count` moves the first `count` of 16 lanes to the end and fills the lanes before them
+  // with zero: a lane index with its high bit set selects zero.
+  const DIGIT_ALIGN: [u8; 272] = [
+    128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128,
+    128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 0,
+    128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 0, 1,
+    128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 0, 1, 2,
+    128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 0, 1, 2, 3,
+    128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 0, 1, 2, 3, 4,
+    128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 0, 1, 2, 3, 4, 5,
+    128, 128, 128, 128, 128, 128, 128, 128, 128, 0, 1, 2, 3, 4, 5, 6,
+    128, 128, 128, 128, 128, 128, 128, 128, 0, 1, 2, 3, 4, 5, 6, 7,
+    128, 128, 128, 128, 128, 128, 128, 0, 1, 2, 3, 4, 5, 6, 7, 8,
+    128, 128, 128, 128, 128, 128, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+    128, 128, 128, 128, 128, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+    128, 128, 128, 128, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+    128, 128, 128, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+    128, 128, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
+    128, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+  ]
+
+  const WIDE_POWERS: [u64; 17] = [1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000, 10000000000,
+    100000000000, 1000000000000, 10000000000000, 100000000000000, 1000000000000000, 10000000000000000]
+
+  // The value of the `count` decimal digits at `at`, for a `count` of at most 16. Pairs of digits,
+  // then fours, then eights are combined with multiply-and-add instructions. Reads 16 bytes.
+  @features("avx2", "bmi", "bmi2", "lzcnt", "popcnt", "pclmul")
+  @inlineAlways
+  unsafe fn wideDigits16(base: [*]const u8, at: usize, count: usize) -> u64 {
+    let digits = u8x16.wrappingSubtract(
+      unsafe u8x16.loadUnchecked(unsafe Intrinsic.pointerRequalify<*const u8, [*]const u8>(unsafe Intrinsic.pointerAt<u8>(base, at))),
+      u8x16.splat(48))
+    // `count` is at most 16, so the row is inside the table.
+    let rows = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Intrinsic.pointerFromSlice<u8>(Slice.view<u8>(&DIGIT_ALIGN, usize.ZERO, 272)))
+    let row = unsafe u8x16.loadUnchecked(unsafe Intrinsic.pointerRequalify<*const u8, [*]const u8>(unsafe Intrinsic.pointerAt<u8>(rows, count * 16)))
+    let aligned = Intrinsic.x86ShuffleBytes<simd<u8, 16>>(digits, row)
+    let pairs = Intrinsic.x86MultiplyAddBytes<simd<u8, 16>>(aligned, i8x16.fromArray([10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1]))
+    let fours = Intrinsic.x86MultiplyAddWords<simd<i16, 8>>(pairs, i16x8.fromArray([100, 1, 100, 1, 100, 1, 100, 1]))
+    let packed = Intrinsic.x86PackUnsignedSaturate<simd<i32, 4>>(fours, fours)
+    let eights = Intrinsic.x86MultiplyAddWords<simd<i16, 8>>(u16x8.bitcastToI16x8(packed), i16x8.fromArray([10000, 1, 10000, 1, 10000, 1, 10000, 1]))
+    let both = u64x2.extract(i32x4.bitcastToU64x2(eights), 0)
+    return u64.wrappingAdd(u64.wrappingMultiply(u64.bitAnd(both, 0xFFFFFFFF), 100000000), u64.shiftRight(both, 32))
   }
 
-  @features("avx2", "bmi", "popcnt")
-  unsafe effect fn wideObject(bytes: &[u8], cursor: &mut TreeCursor, document: &mut JsonDocument, used: &mut usize, keys: &mut List<u64>, start: usize)
-    -> () ! JsonError | OutOfMemoryError ? &mut Allocator {
-    if cursor.depth == MAX_DEPTH { return markFailed(&mut cursor.*) }
-    let open = List<DocumentSlot>.length(&document.slots)
-    run pushSlot(&mut document.*, SLOT_OBJECT, usize.ZERO, usize.toU64(open + usize.ONE))
-    let mut at = unsafe wideSkip(bytes, start)
-    if at < bytes.length && bytes[at] == 125 {
-      cursor.index = at + usize.ONE
-      return ()
+  // Reads the number at `at` when it has one of the common shapes: whole digits and an optional
+  // fraction, of at most 16 digits each and 19 in all, and no exponent. Returns its length and
+  // sets `kind` and `payload` to its slot, or returns `usize.MAX` for any other number, which
+  // `treeNumber` then reads. For a number with a fraction, `payload` is all its digits as one
+  // integer and `scale` is the count of fraction digits, plus `FLOAT_NEGATIVE` after a minus sign:
+  // `wideFloats` turns the two into the `f64` later. `scale` is 0 for every other number. Reads
+  // at most 53 bytes.
+  @features("avx2", "bmi", "bmi2", "lzcnt", "popcnt", "pclmul")
+  @inlineAlways
+  unsafe fn wideNumber(base: [*]const u8, at: usize, kind: &mut u64, payload: &mut u64, scale: &mut u64) -> usize {
+    let sign = unsafe rawByte(base, at) == 45
+    let mut negative: u64 = 0
+    if sign { negative = 1 }
+    let signed = u64.toUsize(negative)
+    let start = usize.wrappingAdd(at, signed)
+    // A set bit for each of the 32 bytes that is not a digit, and for every byte after them.
+    let others = u64.bitNot(mask32.toBits(u8x32.lanesLessOrEqual(u8x32.wrappingSubtract(unsafe rawLanes(base, start), u8x32.splat(48)),
+      u8x32.splat(9))))
+    let whole = u32.toUsize(u64.trailingZeros(others))
+    // The digits after the byte that follows the whole part, which count only after a point.
+    let fraction = u32.toUsize(u64.trailingZeros(u64.shiftRight(others, usize.toU64(usize.wrappingAdd(whole, 1)))))
+    let wholeEnd = usize.wrappingAdd(start, whole)
+    let after = unsafe rawByte(base, wholeEnd)
+    if usize.wrappingSubtract(whole, 1) > 15 || (unsafe rawByte(base, start) == 48 && whole != usize.ONE) {
+      // An integer of 17 or 18 digits, such as an identifier, fits an `i64` too.
+      if whole < 17 || whole > 18 || unsafe rawByte(base, start) == 48 || after == 46 || u8.bitOr(after, 32) == 101 { return usize.MAX }
+      let rest = usize.wrappingSubtract(whole, 16)
+      let long = u64.wrappingAdd(u64.wrappingMultiply(unsafe wideDigits16(base, start, 16), WIDE_POWERS[rest]),
+        unsafe wideDigits16(base, usize.wrappingAdd(start, 16), rest))
+      kind.* = SLOT_INTEGER
+      payload.* = long
+      if sign { payload.* = u64.wrappingSubtract(0, long) }
+      return usize.wrappingAdd(signed, whole)
     }
-    cursor.depth = cursor.depth + usize.ONE
-    let mut count = usize.ZERO
-    let mut seen: [u64; 4] = [0, 0, 0, 0]
-    let base = List<u64>.length(&keys.*)
-    while true {
-      if at >= bytes.length || bytes[at] != 34 { break }
-      let key = List<DocumentSlot>.length(&document.slots)
-      run unsafe wideString(bytes, &mut cursor.*, &mut document.*, &mut used.*, at)
-      if cursor.failed { return () }
-      let hash = keyHash(&document.*, key)
-      let bit = u64.shiftRight(hash, 56)
-      let word = u64.toUsize(u64.shiftRight(bit, 6))
-      let mask = u64.shiftLeft(1, u64.bitAnd(bit, 63))
-      if u64.bitAnd(seen[word], mask) != 0 && sameHash(&keys.*, base, hash)
-        && repeatedKey(&document.*, open + usize.ONE, key) {
-        break
+    let significand = unsafe wideDigits16(base, start, whole)
+    if after == 46 {
+      let fractionStart = usize.wrappingAdd(wholeEnd, 1)
+      if usize.wrappingSubtract(fraction, 1) > 15 || usize.wrappingAdd(whole, fraction) > 19 ||
+        u8.bitOr(unsafe rawByte(base, usize.wrappingAdd(fractionStart, fraction)), 32) == 101 {
+        return usize.MAX
       }
-      seen[word] = u64.bitOr(seen[word], mask)
-      run List<u64>.append(&mut keys.*, hash)
-      at = unsafe wideSkip(bytes, cursor.index)
-      if at >= bytes.length || bytes[at] != 58 { break }
-      at = unsafe wideSkip(bytes, at + usize.ONE)
-      if at >= bytes.length { break }
-      let value = bytes[at]
-      if value == 34 {
-        run unsafe wideString(bytes, &mut cursor.*, &mut document.*, &mut used.*, at)
-      } else if value == 45 || (value >= 48 && value <= 57) {
-        run unsafe wideNumber(bytes, &mut cursor.*, &mut document.*, at)
-      } else {
-        cursor.index = at
-        run unsafe wideItem(bytes, &mut cursor.*, &mut document.*, &mut used.*, &mut keys.*)
-      }
-      if cursor.failed { return () }
-      count = count + usize.ONE
-      at = unsafe wideSkip(bytes, cursor.index)
-      if at >= bytes.length { break }
-      let byte = bytes[at]
-      cursor.index = at + usize.ONE
-      if byte == 125 {
-        cursor.depth = cursor.depth - usize.ONE
-        List<u64>.truncate(&mut keys.*, base)
-        return closeSlot(&mut document.*, open, SLOT_OBJECT, count)
-      }
-      if byte != 44 { break }
-      at = unsafe wideSkip(bytes, cursor.index)
+      let digits = u64.wrappingAdd(u64.wrappingMultiply(significand, WIDE_POWERS[fraction]), unsafe wideDigits16(base, fractionStart, fraction))
+      kind.* = SLOT_FLOAT
+      payload.* = digits
+      scale.* = u64.bitOr(usize.toU64(fraction), u64.shiftLeft(negative, 7))
+      return usize.wrappingAdd(usize.wrappingAdd(signed, whole), usize.wrappingAdd(fraction, 1))
     }
-    return markFailed(&mut cursor.*)
+    if u8.bitOr(after, 32) == 101 { return usize.MAX }
+    kind.* = SLOT_INTEGER
+    payload.* = significand
+    if sign {
+      payload.* = u64.wrappingSubtract(0, significand)
+      if significand == 0 {
+        kind.* = SLOT_FLOAT
+        payload.* = f64.toBits(-0.0)
+      }
+    }
+    return usize.wrappingAdd(signed, whole)
   }
 
-  // Parses `bytes` into `document`, whose text has room for every string. Returns `false` when
-  // the text is not valid, and the caller then reports the error with the scanner path.
-  @features("avx2", "bmi", "popcnt")
-  unsafe effect fn wideParse(bytes: &[u8], document: &mut JsonDocument, keys: &mut List<u64>) -> bool
+  // The bit of a queued float that says the number had a minus sign.
+  const FLOAT_NEGATIVE: u64 = 128
+
+  // The floats that wait in the queue of `wideParse` before `wideFloats` converts them. Converting
+  // them in a loop of their own keeps the steps of one number from waiting on another.
+  const FLOAT_QUEUE: usize = 64
+
+  // Converts the floats in `queue` and empties it. The first word of `queue` is the count of
+  // entries after it. An entry is the index of a slot whose payload holds the digits of the
+  // number and whose count holds the `scale` that `wideNumber` gave: the slot becomes a float
+  // slot with the bits of the `f64`. The count of entries lives in the queue, not in a variable
+  // of `wideParse`, so that the loop there has no more state to keep in registers.
+  @features("avx2", "bmi", "bmi2", "lzcnt", "popcnt", "pclmul")
+  @inlineNever
+  unsafe fn wideFloats(slots: [*]mut DocumentSlot, queue: [*]mut u64) -> () {
+    let count = u64.toUsize(unsafe frameRead(queue, usize.ZERO))
+    unsafe frameWrite(queue, usize.ZERO, 0)
+    let mut index = usize.ONE
+    while index <= count {
+      let place = u64.toUsize(unsafe frameRead(queue, index))
+      let slot = unsafe rawSlotRead(slots, place)
+      let scale = u64.shiftRight(slot.info, 8)
+      let fraction = u64.wrappingToI64(u64.bitAnd(scale, 127))
+      let bits = u64.bitOr(f64.toBits(Format.f64FromDecimal(slot.payload, -fraction)), u64.shiftLeft(u64.bitAnd(scale, FLOAT_NEGATIVE), 56))
+      unsafe rawSlot(slots, place, SLOT_FLOAT, 0, bits)
+      index = usize.wrappingAdd(index, 1)
+    }
+    return ()
+  }
+
+  // A hash of the `size` bytes at `text`, from the length and the first and last 8 bytes. There
+  // are 8 bytes to read at `text` even when the key is shorter.
+  @inlineAlways
+  unsafe fn wideKeyHash(text: [*]const u8, size: usize) -> u64 {
+    let mut mixed = usize.toU64(size)
+    if size >= 8 {
+      mixed = u64.bitXor(mixed, u64.bitXor(unsafe rawWord(text, usize.ZERO), u64.rotateLeft(unsafe rawWord(text, usize.wrappingSubtract(size, 8)), 29)))
+    } else {
+      // The bytes after the key are masked off.
+      let kept = u64.wrappingSubtract(u64.shiftLeft(1, usize.toU64(size * 8)), 1)
+      mixed = u64.bitXor(mixed, u64.shiftLeft(u64.bitAnd(unsafe rawWord(text, usize.ZERO), kept), 8))
+    }
+    let product = u64.wrappingMultiply(mixed, 11400714819323198485)
+    return u64.bitXor(product, u64.shiftRight(product, 29))
+  }
+
+  // `true` if a key of the object whose first key is the slot `first` is the same text as the key
+  // at the slot `key`. `text` is the start of the strings.
+  @inlineNever
+  unsafe fn wideRepeated(slots: [*]mut DocumentSlot, text: [*]const u8, first: usize, key: usize) -> bool {
+    let wanted = unsafe rawSlotRead(slots, key)
+    let size = u64.toUsize(u64.shiftRight(wanted.info, 8))
+    let mut index = first
+    while index < key {
+      let slot = unsafe rawSlotRead(slots, index)
+      if u64.shiftRight(slot.info, 8) == u64.shiftRight(wanted.info, 8) {
+        let mut same = usize.ZERO
+        while same < size && unsafe rawByte(text, u64.toUsize(slot.payload) + same) == unsafe rawByte(text, u64.toUsize(wanted.payload) + same) {
+          same = same + usize.ONE
+        }
+        if same == size { return true }
+      }
+      // The value of the key, and everything in it.
+      let value = unsafe rawSlotRead(slots, index + usize.ONE)
+      let kind = u64.bitAnd(value.info, SLOT_KIND)
+      if kind == SLOT_ARRAY || kind == SLOT_OBJECT { index = u64.toUsize(value.payload) } else { index = index + 2 }
+    }
+    return false
+  }
+
+  // The words of the table of `wideParse` for each open array or object: the slot that opens it,
+  // the count of the values before it in its parent, and from `FRAME_SEEN` the `FRAME_SEEN_WORDS`
+  // words with a bit for each key hash that it has seen.
+  const FRAME_OPEN: usize = 0
+  const FRAME_COUNT: usize = 1
+  const FRAME_SEEN: usize = 2
+  const FRAME_SEEN_WORDS: usize = 32
+  const FRAME_WORDS: usize = FRAME_SEEN + FRAME_SEEN_WORDS
+  const FRAME_TABLE: usize = (MAX_DEPTH + 1) * FRAME_WORDS
+
+  // What `wideSlowNumber` read: the length of the number in the text, or `usize.MAX` if it is not
+  // valid, and its slot. The slot of a decimal number has the count of its digits, which are
+  // written where the next string goes.
+  struct SlowNumber {
+    length: usize,
+    kind: u64,
+    count: u64,
+    payload: u64,
+  }
+
+  // Reads the number at `at` of `bytes` that `wideNumber` leaves out, with `treeNumber`.
+  @inlineNever
+  unsafe effect fn wideSlowNumber(bytes: &[u8], at: usize, to: [*]mut u8) -> SlowNumber ! JsonError | OutOfMemoryError ? &mut Allocator {
+    let mut slow = TreeCursor { index: usize.ZERO, depth: usize.ZERO, failed: false }
+    let number = run treeNumber(bytes, &mut slow, at)
+    if slow.failed { return SlowNumber { length: usize.MAX, kind: 0, count: 0, payload: 0 } }
+    let length = slow.index - at
+    match move number {
+      JsonNumber.Integer { value } => { return SlowNumber { length: length, kind: SLOT_INTEGER, count: 0, payload: i64.wrappingToU64(value) } }
+      JsonNumber.Unsigned { value } => { return SlowNumber { length: length, kind: SLOT_UNSIGNED, count: 0, payload: value } }
+      JsonNumber.Float { value } => { return SlowNumber { length: length, kind: SLOT_FLOAT, count: 0, payload: f64.toBits(value) } }
+      JsonNumber.Decimal { text } => {
+        // The digits of a number are never longer than its text.
+        let digits = String.utf8Bytes(String.view(&text))
+        let mut index = usize.ZERO
+        while index < digits.length {
+          unsafe rawPut(to, index, digits[index])
+          index = index + usize.ONE
+        }
+        return SlowNumber { length: length, kind: SLOT_DECIMAL, count: usize.toU64(digits.length), payload: 0 }
+      }
+    }
+  }
+
+  // Parses `bytes` into `document`, which is empty. Returns `false` when the text is not valid,
+  // and the caller then reports the error with the scanner path.
+  @features("avx2", "bmi", "bmi2", "lzcnt", "popcnt", "pclmul")
+  unsafe effect fn wideParse(bytes: &[u8], document: &mut JsonDocument) -> bool
     ! JsonError | OutOfMemoryError ? &mut Allocator {
-    let mut used = usize.ZERO
-    let mut cursor = TreeCursor { index: usize.ZERO, depth: usize.ZERO, failed: false }
-    run unsafe wideItem(bytes, &mut cursor, &mut document.*, &mut used, &mut keys.*)
-    Bytes.truncate(&mut document.text, used)
-    return !cursor.failed && JsonSyntax.skipWhitespace(bytes, cursor.index) == bytes.length
+    // The decoded strings are never longer than the text, and are written 32 bytes at a time, so
+    // with `WIDE_PAD` bytes more they never reach the indexes that follow them.
+    let room = (bytes.length + WIDE_PAD + 3) / 4 * 4
+    let totals = run unsafe wideIndex(bytes, &mut document.text, room)
+    if !totals.valid { return false }
+    // Room for every slot at once, so the slots are written without a check too.
+    run List<DocumentSlot>.reserveExact(&mut document.slots, totals.slots + usize.ONE)
+    let mut token = unsafe wideIndexes(&mut document.text, room)
+    let tokenEnd = Intrinsic.pointerAddress<[*]mut u32>(token) + totals.tokens * 4
+    let mut copy: [u8; 128] = [0; 128]
+    let mut copied = bytes.length
+    if copied > WIDE_TAIL { copied = WIDE_TAIL }
+    let safe = bytes.length - copied
+    Slice.copyInto<u8>(&mut copy, usize.ZERO, Slice.view<u8>(bytes, safe, copied))
+    let tail = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Intrinsic.pointerFromSlice<u8>(Slice.view<u8>(&copy, usize.ZERO, 128)))
+    let base = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Intrinsic.pointerFromSlice<u8>(bytes))
+    let out = unsafe Intrinsic.pointerRequalify<?[*]mut u8, [*]mut u8>(unsafe Bytes.storage(&mut document.text))
+    let outAddress = Intrinsic.pointerAddress<[*]mut u8>(out)
+    let mut to = out
+    let slots = unsafe Intrinsic.pointerRequalify<?[*]mut DocumentSlot, [*]mut DocumentSlot>(unsafe List<DocumentSlot>.storage(&mut document.slots))
+    let mut slot = slots
+    let mut table: [u64; FRAME_TABLE] = [0; FRAME_TABLE]
+    let frames = unsafe Intrinsic.pointerRequalify<?[*]mut u64, [*]mut u64>(Intrinsic.pointerFromMutSlice<u64>(Slice.viewMut<u64>(&mut table, usize.ZERO, FRAME_TABLE)))
+    // The place in `table` of the innermost open array or object, or 0 outside all of them.
+    let mut level = usize.ZERO
+    // A bit for each open array or object, the innermost lowest: set for an object.
+    let mut objects: u64 = 0
+    // The values so far in the innermost open array or object.
+    let mut count: u64 = 0
+    let mut waiting: [u64; FLOAT_QUEUE + 1] = [0; FLOAT_QUEUE + 1]
+    let queue = unsafe Intrinsic.pointerRequalify<?[*]mut u64, [*]mut u64>(Intrinsic.pointerFromMutSlice<u64>(Slice.viewMut<u64>(&mut waiting, usize.ZERO, FLOAT_QUEUE + 1)))
+    let mut at = unsafe rawIndex(token)
+    token = unsafe tokenAfter(token)
+    while true {
+      if u64.bitAnd(objects, 1) != 0 {
+        if unsafe rawByte(base, at) != 34 { return false }
+        let mut plain = false
+        let size = unsafe wideString(base, tail, safe, at, to, &mut plain)
+        if size == usize.MAX { return false }
+        let mut kind = SLOT_STRING
+        if plain { kind = u64.bitOr(SLOT_STRING, SLOT_PLAIN) }
+        // A key can only repeat an earlier one with the same bit in the words of the object, so
+        // most keys skip the comparison with the earlier keys.
+        let hash = unsafe wideKeyHash(unsafe rawRead(to), size)
+        let bit = u64.shiftRight(hash, 53)
+        let word = usize.wrappingAdd(usize.wrappingAdd(level, FRAME_SEEN), u64.toUsize(u64.shiftRight(bit, 6)))
+        let mask = u64.shiftLeft(1, u64.bitAnd(bit, 63))
+        let seen = unsafe frameRead(frames, word)
+        unsafe frameWrite(frames, word, u64.bitOr(seen, mask))
+        if u64.bitAnd(seen, mask) != 0 {
+          unsafe rawSlot(slot, usize.ZERO, kind, usize.toU64(size), usize.toU64(usize.wrappingSubtract(Intrinsic.pointerAddress<[*]mut u8>(to), outAddress)))
+          let first = u64.toUsize(unsafe frameRead(frames, usize.wrappingAdd(level, FRAME_OPEN))) + usize.ONE
+          if unsafe wideRepeated(slots, unsafe rawRead(out), first, slotIndex(slots, slot)) { return false }
+        }
+        slot = unsafe pushRaw(slot, kind, usize.toU64(size), usize.toU64(usize.wrappingSubtract(Intrinsic.pointerAddress<[*]mut u8>(to), outAddress)))
+        to = unsafe rawAfter(to, size)
+        if unsafe rawByte(base, unsafe rawIndex(token)) != 58 { return false }
+        at = unsafe rawIndex(unsafe tokenAfter(token))
+        token = unsafe tokenAfter(unsafe tokenAfter(token))
+      }
+      let byte = unsafe rawByte(base, at)
+      if byte == 34 {
+        let mut plain = false
+        let size = unsafe wideString(base, tail, safe, at, to, &mut plain)
+        if size == usize.MAX { return false }
+        let mut kind = SLOT_STRING
+        if plain { kind = u64.bitOr(SLOT_STRING, SLOT_PLAIN) }
+        slot = unsafe pushRaw(slot, kind, usize.toU64(size), usize.toU64(usize.wrappingSubtract(Intrinsic.pointerAddress<[*]mut u8>(to), outAddress)))
+        to = unsafe rawAfter(to, size)
+      } else if u8.bitOr(byte, 32) == 123 {
+        // `[` or `{`.
+        if level == MAX_DEPTH * FRAME_WORDS { return false }
+        let open = slotIndex(slots, slot)
+        let isObject = u64.shiftRight(u8.toU64(byte), 5) - 2
+        // An array or object with no values keeps this slot: it ends at the next one.
+        slot = unsafe pushRaw(slot, SLOT_ARRAY + isObject, 0, usize.toU64(usize.wrappingAdd(open, 1)))
+        at = unsafe rawIndex(token)
+        token = unsafe tokenAfter(token)
+        // `]` is 93 and `}` is 125.
+        if unsafe rawByte(base, at) != u8.wrappingAdd(byte, 2) {
+          level = usize.wrappingAdd(level, FRAME_WORDS)
+          unsafe frameWrite(frames, usize.wrappingAdd(level, FRAME_OPEN), usize.toU64(open))
+          unsafe frameWrite(frames, usize.wrappingAdd(level, FRAME_COUNT), count)
+          if isObject != 0 {
+            let mut seen = usize.ZERO
+            while seen < FRAME_SEEN_WORDS {
+              unsafe frameWrite(frames, usize.wrappingAdd(level, usize.wrappingAdd(FRAME_SEEN, seen)), 0)
+              seen = usize.wrappingAdd(seen, 1)
+            }
+          }
+          objects = u64.bitOr(u64.shiftLeft(objects, 1), isObject)
+          count = 0
+          continue
+        }
+      } else if byte == 45 || u8.wrappingSubtract(byte, 48) <= 9 {
+        // A number near the end of the text has no room for the wide reads.
+        let mut wide = at < safe
+        if wide {
+          let mut kind: u64 = 0
+          let mut payload: u64 = 0
+          let mut scale: u64 = 0
+          let length = unsafe wideNumber(base, at, &mut kind, &mut payload, &mut scale)
+          if length == usize.MAX {
+            wide = false
+          } else {
+            if !(unsafe wideEnds(token, at, length, unsafe rawByte(base, usize.wrappingAdd(at, length)))) { return false }
+            // The slot is written before the queue can fill and read it.
+            let following = unsafe pushRaw(slot, kind, scale, payload)
+            if scale != 0 {
+              let queued = usize.wrappingAdd(u64.toUsize(unsafe frameRead(queue, usize.ZERO)), 1)
+              unsafe frameWrite(queue, usize.ZERO, usize.toU64(queued))
+              unsafe frameWrite(queue, queued, usize.toU64(slotIndex(slots, slot)))
+              if queued == FLOAT_QUEUE { unsafe wideFloats(slots, queue) }
+            }
+            slot = following
+          }
+        }
+        if !wide {
+          let slow = run unsafe wideSlowNumber(bytes, at, to)
+          if slow.length == usize.MAX { return false }
+          let mut after: u8 = 0
+          if at + slow.length < bytes.length { after = bytes[at + slow.length] }
+          if !(unsafe wideEnds(token, at, slow.length, after)) { return false }
+          slot = unsafe pushRaw(slot, slow.kind, slow.count, slow.payload)
+          if slow.kind == SLOT_DECIMAL {
+            unsafe rawSlot(slots, usize.wrappingSubtract(slotIndex(slots, slot), 1), SLOT_DECIMAL, slow.count,
+              usize.toU64(usize.wrappingSubtract(Intrinsic.pointerAddress<[*]mut u8>(to), outAddress)))
+            to = unsafe rawAfter(to, u64.toUsize(slow.count))
+          }
+        }
+      } else {
+        // A literal, which is read from the padded copy near the end of the text.
+        let mut from = base
+        let mut local = at
+        if at >= safe {
+          from = tail
+          local = usize.wrappingSubtract(at, safe)
+        }
+        let word = unsafe rawWord(from, local)
+        let mut kind = SLOT_NULL
+        let mut length: usize = 4
+        if u64.bitAnd(word, 0xFFFFFFFF) == 0x65757274 {
+          kind = SLOT_TRUE
+        } else if u64.bitAnd(word, 0xFFFFFFFFFF) == 0x65736C6166 {
+          kind = SLOT_FALSE
+          length = 5
+        } else if u64.bitAnd(word, 0xFFFFFFFF) != 0x6C6C756E {
+          return false
+        }
+        if !(unsafe wideEnds(token, at, length, unsafe rawByte(from, usize.wrappingAdd(local, length)))) { return false }
+        slot = unsafe pushRaw(slot, kind, 0, 0)
+      }
+      // After a value: a comma and the next value, or the ends of the arrays and objects that the
+      // value is last in.
+      while true {
+        count = u64.wrappingAdd(count, 1)
+        if level == usize.ZERO {
+          unsafe wideFloats(slots, queue)
+          unsafe List<DocumentSlot>.setLength(&mut document.slots, slotIndex(slots, slot))
+          unsafe Bytes.setLength(&mut document.text, usize.wrappingSubtract(Intrinsic.pointerAddress<[*]mut u8>(to), outAddress))
+          // Nothing but blanks may follow the value.
+          return Intrinsic.pointerAddress<[*]mut u32>(token) == tokenEnd
+        }
+        let next = unsafe rawByte(base, unsafe rawIndex(token))
+        if next == 44 {
+          at = unsafe rawIndex(unsafe tokenAfter(token))
+          token = unsafe tokenAfter(unsafe tokenAfter(token))
+          break
+        }
+        token = unsafe tokenAfter(token)
+        let isObject = u64.bitAnd(objects, 1)
+        if u8.toU64(next) != 93 + u64.shiftLeft(isObject, 5) { return false }
+        let open = u64.toUsize(unsafe frameRead(frames, usize.wrappingAdd(level, FRAME_OPEN)))
+        unsafe rawSlot(slots, open, SLOT_ARRAY + isObject, count, usize.toU64(slotIndex(slots, slot)))
+        count = unsafe frameRead(frames, usize.wrappingAdd(level, FRAME_COUNT))
+        level = usize.wrappingSubtract(level, FRAME_WORDS)
+        objects = u64.shiftRight(objects, 1)
+      }
+    }
+    return false
   }
 }
 
