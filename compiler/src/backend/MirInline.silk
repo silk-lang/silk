@@ -1,15 +1,27 @@
-//! Inlines closed forwarding calls before suspendable frames are laid out.
+//! Splices a callee's checked MIR into its caller at one call.
 //!
 //! # Details
 //!
-//! The caller supplies an acyclic selection of callees. Each splice shares the caller's success
-//! and failure destinations, gives the callee's other locals fresh slots, and chains the callee's
-//! cancellation cleanup into the caller's cancellation exit. Hidden diagnostic operands and
-//! carried failure contexts follow their original edges. Bodies with their own observed trap or
-//! failure sites, and builds with source line tables, retain their call boundaries.
+//! A splice shares the caller's success and failure destinations, gives the callee's other locals
+//! fresh slots, and chains the callee's cancellation cleanup into the caller's cancellation exit.
+//! Hidden diagnostic operands and carried failure contexts follow their original edges.
+//!
+//! What the callee reports stays the callee's. Each statement of the spliced body gets an origin
+//! of its own in the caller, distinct from every origin the caller already has, and the callee's
+//! trap sites and failure contexts are copied to the caller's tables at those origins. A copied
+//! trap site names the locals that hold the observer, cause and entry site the call passed, so a
+//! trap inside the spliced body reports the callee's label through the same observer, with the
+//! same entry site, as the call would have.
+//!
+//! The obligations the callee's body owes travel with it: its external C declarations, its local
+//! shared accesses and escapes, whether it releases execution packages or observes diagnostics,
+//! and the instances it references.
+//!
+//! Which callees may be spliced is the caller's decision, through [`inlinable`], [`eligible`] and
+//! [`valueForwarder`], each of which reads the callee alone. The caller must also exclude
+//! recursive expansions.
 
 import CompilerBug
-import hir.Hir { InfixOperator }
 import backend.InstanceKey { InstanceKey }
 import backend.Mir
 import backend.MirWalk
@@ -17,22 +29,27 @@ import backend.Mir {
   Block,
   Callee,
   Cancel,
+  ContextText,
+  Diagnostics,
+  EscapeSite,
   FailureEdge,
   Inlining,
   Local,
   LocalKind,
   MirFunction,
+  NonParkingRun,
   Operand,
   Place,
   Projection,
   Reference,
   Rvalue,
+  SharedAccess,
   Statement,
   Terminator,
+  TrapSite,
   Variable,
-  Diagnostics,
-  ContextText,
 }
+import semantic.DeclarationId { DeclarationId }
 import semantic.Specialization { Edge }
 import semantic.Type { Type }
 import silk.num.u64
@@ -41,12 +58,55 @@ import silk.collections.bytes { Bytes }
 import silk.collections.list { List }
 import silk.core.option { Option }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
-import silk.mem.interned {Interned}
+import silk.mem.interned { Interned }
 import silk.num.usize
 
-/// Whether a body may share its caller's frame. The caller must also exclude recursive targets.
+/// The largest body, in statements and blocks, that a call inlines without a directive. Numeric
+/// wrappers, accessors and forwarding functions fit; anything with a loop of its own rarely does.
+pub const smallBody: usize = 12
+
+/// The largest body an `@inline` function may have and still be inlined.
+pub const hintedBody: usize = 40
+
+/// The largest body an `@inlineAlways` function may have and still be inlined.
+pub const alwaysBody: usize = 256
+
+/// The size of a body for inlining: its statements and its blocks.
+pub fn size(function: &MirFunction) -> usize {
+  let blocks = List<Block>.asSlice(&function.blocks)
+  let mut total = blocks.length
+  let mut at = usize.ZERO
+  while at < blocks.length {
+    total = total + List<Statement>.length(&blocks[at].statements)
+    at = at + usize.ONE
+  }
+  return total
+}
+
+/// Whether a body may share its caller's frame at a suspension point. The caller must also
+/// exclude recursive targets.
 pub fn eligible(function: &MirFunction) -> bool {
   return function.inlining == Inlining.Always && safeBody(function)
+}
+
+/// Whether an optimized build may inline a call of `function` that is not a suspension point:
+/// its directive allows it, its body is small enough for the directive, it suspends and parks
+/// nowhere, and it owes no `Intrinsic.NonParking` proof of its own. Reads `function` alone, so the
+/// decision never depends on the callers. The caller must also exclude recursive expansions and
+/// check that every call the body makes is inlined too (`closed`).
+pub fn inlinable(function: &MirFunction) -> bool {
+  let limit = match function.inlining {
+    Inlining.Default => smallBody
+    Inlining.Hint => hintedBody
+    Inlining.Always => alwaysBody
+    Inlining.Never => usize.ZERO
+    Inlining.Cold => usize.ZERO
+  }
+  if size(function) > limit || !safeBody(function) || List<Cancel>.length(&function.cancels) != usize.ZERO {
+    return false
+  }
+  // A non-parking proof names the instance it is owed for, which must stay reached.
+  return List<NonParkingRun>.length(&function.nonParking) == usize.ZERO
 }
 
 /// Whether a small synchronous constructor or value-forwarding body can be spliced before frame
@@ -109,13 +169,17 @@ pub fn valueForwarder(function: &MirFunction) -> bool {
   return true
 }
 
+// What no splice may move into another function. Traps, checked arithmetic and originated failure
+// contexts may be spliced: they keep their labels and diagnostic operands (module details).
 fn safeBody(function: &MirFunction) -> bool {
-  if function.optimizeSize || Bytes.length(&function.features) != 0
-    || List<ContextText>.length(&function.contexts) != 0
+  // `@optimizeSize` asks for this function's own size-optimized code, which only its own
+  // definition has. Line tables and debug variables describe the function's own frame.
+  if function.optimizeSize
     || List<Variable>.length(&function.variables) != 0
     || List<u64>.length(&function.lines) != 0 {
     return false
   }
+  // A suspension origin or an external park needs a frame of its own.
   if let Option<Origin>.Some { .. } = &function.suspension {
     return false
   }
@@ -128,56 +192,15 @@ fn safeBody(function: &MirFunction) -> bool {
   }
   let mut at = usize.ZERO
   while at < blocks.length {
-    match &blocks[at].terminator {
-      Terminator.Call { callee: Callee.Extern { .. }, .. } => {
-        return false
-      }
-      Terminator.Call { callee: Callee.NativeIndirect { .. }, .. } => {
-        return false
-      }
-      Terminator.Relinquish { .. } => {
-        return false
-      }
-      Terminator.Trap { .. } => {
-        return false
-      }
-      Terminator.TrapText { .. } => {
-        return false
-      }
-      _ => ()
+    if let Terminator.Relinquish { .. } = &blocks[at].terminator {
+      return false
     }
     let statements = List<Statement>.asSlice(&blocks[at].statements)
     let mut statement = usize.ZERO
     while statement < statements.length {
       match &statements[statement] {
-        // Diagnostic forwarding compares pointers to null. Those comparisons cannot trap,
-        // even though lowering records a site for every Binary. Other checked operations keep
-        // their own function's observer, cause and site when reporting a trap.
-        Statement.Assign { value: Rvalue.Binary { operation, .. }, .. } => {
-          if Bytes.length(&function.frame) != 0 && !comparison(operation) {
-            return false
-          }
-        }
-        Statement.Assign { value: Rvalue.Unary { .. }, .. } => {
-          if Bytes.length(&function.frame) != 0 {
-            return false
-          }
-        }
-        Statement.Assign { value: Rvalue.ScalarBinary { .. }, .. } => {
-          if Bytes.length(&function.frame) != 0 {
-            return false
-          }
-        }
-        Statement.Assign { value: Rvalue.Convert { .. }, .. } => {
-          if Bytes.length(&function.frame) != 0 {
-            return false
-          }
-        }
-        Statement.Assign { value: Rvalue.Vector { .. }, .. } => {
-          if Bytes.length(&function.frame) != 0 {
-            return false
-          }
-        }
+        // Each of these names the running function itself: its frame, its process word, its
+        // stack allocations, which live until it returns, or its execution package.
         Statement.Assign { value: Rvalue.FrameAddress, .. } => {
           return false
         }
@@ -190,10 +213,8 @@ fn safeBody(function: &MirFunction) -> bool {
         Statement.Assign { value: Rvalue.RunningPackage, .. } => {
           return false
         }
+        // A machine fragment's constraints are written for the function they appear in.
         Statement.Assign { value: Rvalue.Assembly { .. }, .. } => {
-          return false
-        }
-        Statement.FailureContext { source: Option.None, .. } => {
           return false
         }
         _ => ()
@@ -205,18 +226,6 @@ fn safeBody(function: &MirFunction) -> bool {
   return true
 }
 
-fn comparison(operation: InfixOperator) -> bool {
-  return match operation {
-    InfixOperator.Equals => true
-    InfixOperator.NotEquals => true
-    InfixOperator.LessThan => true
-    InfixOperator.LessOrEqual => true
-    InfixOperator.GreaterThan => true
-    InfixOperator.GreaterOrEqual => true
-    _ => false
-  }
-}
-
 struct Splice {
   locals: List<usize>,
   blocks: usize,
@@ -224,6 +233,69 @@ struct Splice {
   failure: usize,
   cancel: usize,
   origin: Origin,
+  // The first node of the origins this splice gives the callee's statements, and the callee's
+  // trap and context sites in the order their fresh nodes count from it.
+  base: usize,
+  sites: List<Origin>,
+}
+
+fn sameSite(left: Origin, right: Origin) -> bool {
+  return left.node == right.node && left.location.start == right.location.start
+}
+
+effect fn noteSite(sites: &mut List<Origin>, origin: Origin) -> () ! OutOfMemoryError ? &mut Allocator {
+  let listed = List<Origin>.asSlice(&sites.*)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if sameSite(listed[at], origin) { return () }
+    at = at + usize.ONE
+  }
+  return run List<Origin>.append(&mut sites.*, origin)
+}
+
+// The origin a statement of the callee at `origin` gets in the caller: a fresh node for each of
+// the callee's trap and context sites, and one more for every other statement, all at the call's
+// location so a gap still points at the call.
+fn mapOrigin(splice: &Splice, origin: Origin) -> Origin {
+  let listed = List<Origin>.asSlice(&splice.sites)
+  let mut at = usize.ZERO
+  while at < listed.length && !sameSite(listed[at], origin) { at = at + usize.ONE }
+  return Origin { node: splice.base + at, location: splice.origin.location }
+}
+
+fn originNode(origin: Origin, highest: usize) -> usize {
+  if origin.node > highest { return origin.node }
+  return highest
+}
+
+// One more than the highest origin node `function` uses.
+fn freshNode(function: &MirFunction) -> usize {
+  let mut highest = usize.ZERO
+  let blocks = List<Block>.asSlice(&function.blocks)
+  let mut block = usize.ZERO
+  while block < blocks.length {
+    let statements = List<Statement>.asSlice(&blocks[block].statements)
+    let mut at = usize.ZERO
+    while at < statements.length {
+      highest = originNode(MirWalk.statementOrigin(&statements[at]), highest)
+      at = at + usize.ONE
+    }
+    highest = originNode(MirWalk.terminatorOrigin(&blocks[block].terminator), highest)
+    block = block + usize.ONE
+  }
+  let traps = List<TrapSite>.asSlice(&function.traps)
+  let mut at = usize.ZERO
+  while at < traps.length {
+    highest = originNode(traps[at].origin, highest)
+    at = at + usize.ONE
+  }
+  let contexts = List<ContextText>.asSlice(&function.contexts)
+  at = usize.ZERO
+  while at < contexts.length {
+    highest = originNode(contexts[at].origin, highest)
+    at = at + usize.ONE
+  }
+  return highest + usize.ONE
 }
 
 effect fn statement(source: &Statement, splice: &Splice) -> Statement
@@ -231,20 +303,19 @@ effect fn statement(source: &Statement, splice: &Splice) -> Statement
   ? &mut Allocator {
   let mut copied = run MirWalk.copyStatement(source)
   MirWalk.renameStatement(&mut copied, List<usize>.asSlice(&splice.locals))
-  MirWalk.setStatementOrigin(&mut copied, splice.origin)
+  MirWalk.setStatementOrigin(&mut copied, mapOrigin(splice, MirWalk.statementOrigin(source)))
   return move copied
 }
 
 effect fn terminator(source: &Terminator, splice: &Splice) -> Terminator
   ! OutOfMemoryError
   ? &mut Allocator {
+  let origin = mapOrigin(splice, MirWalk.terminatorOrigin(source))
   match &source.* {
-    Terminator.Return { .. } => { return Terminator.Goto { target: splice.normal, origin: splice.origin } }
-    Terminator.Fail { .. } => { return Terminator.Goto { target: splice.failure, origin: splice.origin } }
-    Terminator.Abandon { .. } => { return Terminator.Goto { target: splice.cancel, origin: splice.origin } }
+    Terminator.Return { .. } => { return Terminator.Goto { target: splice.normal, origin: origin } }
+    Terminator.Fail { .. } => { return Terminator.Goto { target: splice.failure, origin: origin } }
+    Terminator.Abandon { .. } => { return Terminator.Goto { target: splice.cancel, origin: origin } }
     Terminator.Relinquish { .. } => { return CompilerBug.panic(b"a parking origin reached inlining") }
-    Terminator.Call { callee: Callee.Extern { .. }, .. } => { return CompilerBug.panic(b"a foreign call reached inlining") }
-    Terminator.Call { callee: Callee.NativeIndirect { .. }, .. } => { return CompilerBug.panic(b"a foreign call reached inlining") }
     _ => ()
   }
   let mut copied = run MirWalk.copyTerminator(source)
@@ -256,7 +327,7 @@ effect fn terminator(source: &Terminator, splice: &Splice) -> Terminator
     MirWalk.setSuccessor(&mut copied, at, splice.blocks + target)
     at = at + usize.ONE
   }
-  MirWalk.setTerminatorOrigin(&mut copied, splice.origin)
+  MirWalk.setTerminatorOrigin(&mut copied, origin)
   return move copied
 }
 
@@ -267,14 +338,132 @@ fn whole(place: &Place) -> usize {
   return place.local
 }
 
-/// Replaces a direct call at `point` with `callee`'s checked body and cancellation exits.
+// The callee local of hidden kind `kind`, mapped into the caller, or `usize.MAX`.
+fn hiddenLocal(callee: &MirFunction, splice: &Splice, observer: bool, cause: bool) -> usize {
+  let locals = List<Local>.asSlice(&callee.locals)
+  let mut at = usize.ZERO
+  while at < locals.length {
+    let found = match &locals[at].kind {
+      LocalKind.Observer => observer
+      LocalKind.Cause => cause
+      LocalKind.Site => !observer && !cause
+      _ => false
+    }
+    if found { return List<usize>.get(&splice.locals, at) }
+    at = at + usize.ONE
+  }
+  return usize.MAX
+}
+
+// A local of the callee as the caller names it: a callee table names `usize.MAX` for its own
+// hidden local, which is `own` in the caller.
+fn mapped(splice: &Splice, local: usize, own: usize) -> usize {
+  if local == usize.MAX { return own }
+  return List<usize>.get(&splice.locals, local)
+}
+
+// Copies the callee's report tables and obligations to the caller, at the splice's origins.
+effect fn mergeTables(caller: &mut MirFunction, callee: &MirFunction, splice: &Splice) -> () ! OutOfMemoryError ? &mut Allocator {
+  let observer = hiddenLocal(callee, splice, true, false)
+  let cause = hiddenLocal(callee, splice, false, true)
+  let site = hiddenLocal(callee, splice, false, false)
+  let traps = List<TrapSite>.asSlice(&callee.traps)
+  let mut at = usize.ZERO
+  while at < traps.length {
+    run List<TrapSite>.append(&mut caller.traps, TrapSite {
+      origin: mapOrigin(splice, traps[at].origin),
+      label: run Bytes.copy(Bytes.asSlice(&traps[at].label)),
+      observer: mapped(splice, traps[at].observer, observer),
+      cause: mapped(splice, traps[at].cause, cause),
+      site: mapped(splice, traps[at].site, site),
+    })
+    at = at + usize.ONE
+  }
+  let contexts = List<ContextText>.asSlice(&callee.contexts)
+  at = usize.ZERO
+  while at < contexts.length {
+    let identities = List<Bytes>.asSlice(&contexts[at].identities)
+    let mut copied = List<Bytes>.make()
+    let mut identity = usize.ZERO
+    while identity < identities.length {
+      run List<Bytes>.append(&mut copied, run Bytes.copy(Bytes.asSlice(&identities[identity])))
+      identity = identity + usize.ONE
+    }
+    run List<ContextText>.append(&mut caller.contexts, ContextText {
+      origin: mapOrigin(splice, contexts[at].origin),
+      identities: move copied,
+      label: run Bytes.copy(Bytes.asSlice(&contexts[at].label)),
+    })
+    at = at + usize.ONE
+  }
+  let externs = List<Interned<DeclarationId>>.asSlice(&callee.externs)
+  at = usize.ZERO
+  while at < externs.length {
+    let known = List<Interned<DeclarationId>>.asSlice(&caller.externs)
+    let mut seen = false
+    let mut prior = usize.ZERO
+    while prior < known.length && !seen {
+      seen = Interned<DeclarationId>.same(&known[prior], &externs[at])
+      prior = prior + usize.ONE
+    }
+    if !seen { run List<Interned<DeclarationId>>.append(&mut caller.externs, Interned<DeclarationId>.clone(&externs[at])) }
+    at = at + usize.ONE
+  }
+  let accesses = List<SharedAccess>.asSlice(&callee.accesses)
+  at = usize.ZERO
+  while at < accesses.length {
+    run List<SharedAccess>.append(&mut caller.accesses, SharedAccess {
+      callback: InstanceKey.copy(&accesses[at].callback),
+      origin: splice.origin,
+    })
+    at = at + usize.ONE
+  }
+  let escapes = List<EscapeSite>.asSlice(&callee.escapes)
+  at = usize.ZERO
+  while at < escapes.length {
+    run List<EscapeSite>.append(&mut caller.escapes, EscapeSite { kind: escapes[at].kind, origin: splice.origin })
+    at = at + usize.ONE
+  }
+  caller.observes = caller.observes || callee.observes
+  caller.releasesPackages = caller.releasesPackages || callee.releasesPackages
+  let references = List<Reference>.asSlice(&callee.references)
+  at = usize.ZERO
+  while at < references.length {
+    run List<Reference>.append(
+      &mut caller.references,
+      Reference {
+        key: InstanceKey.copy(&references[at].key),
+        edge: Edge.copy(&references[at].edge),
+        origin: splice.origin,
+      },
+    )
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+fn sameFeatures(left: &Bytes, right: &Bytes) -> bool {
+  let first = Bytes.asSlice(left)
+  let second = Bytes.asSlice(right)
+  if first.length != second.length { return false }
+  let mut at = usize.ZERO
+  while at < first.length {
+    if first[at] != second[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+/// Replaces the direct call ending block `point` with `callee`'s checked body.
 ///
-/// The callee must be an eligible acyclic frame body or a synchronous value forwarder. Returns false when the call's destinations are not
-/// whole locals or when expanding it would exceed the caller's bounded inlining budget.
+/// At a suspension point the callee's cancellation exits chain into the point's own, and the
+/// splice is refused once the caller would exceed 256 blocks. Returns false, changing nothing,
+/// when the call's destinations are not whole locals, when the callee compiles for other target
+/// features than the caller, or when a suspension point's splice is refused.
 pub effect fn call(caller: &mut MirFunction, point: usize, callee: &MirFunction) -> bool
   ! OutOfMemoryError
   ? &mut Allocator {
-  if List<Block>.length(&caller.blocks) + List<Block>.length(&callee.blocks) > 256 {
+  if !sameFeatures(&caller.features, &callee.features) {
     return false
   }
   let mut cancel = usize.MAX
@@ -287,7 +476,10 @@ pub effect fn call(caller: &mut MirFunction, point: usize, callee: &MirFunction)
     }
     cancelAt = cancelAt + 1
   }
-  if cancel == usize.MAX && !valueForwarder(callee) {
+  if cancel != usize.MAX && List<Block>.length(&caller.blocks) + List<Block>.length(&callee.blocks) > 256 {
+    return false
+  }
+  if cancel == usize.MAX && List<Cancel>.length(&callee.cancels) != usize.ZERO {
     return false
   }
   let mut mapping = List<usize>.make()
@@ -382,10 +574,23 @@ pub effect fn call(caller: &mut MirFunction, point: usize, callee: &MirFunction)
           },
         )
       }
-      at = at + 1
+      at = at + usize.ONE
     }
   } else {
     return false
+  }
+  let mut sites = List<Origin>.make()
+  let traps = List<TrapSite>.asSlice(&callee.traps)
+  let mut at = usize.ZERO
+  while at < traps.length {
+    run noteSite(&mut sites, traps[at].origin)
+    at = at + usize.ONE
+  }
+  let contexts = List<ContextText>.asSlice(&callee.contexts)
+  at = usize.ZERO
+  while at < contexts.length {
+    run noteSite(&mut sites, contexts[at].origin)
+    at = at + usize.ONE
   }
   let splice = Splice {
     locals: move mapping,
@@ -394,10 +599,12 @@ pub effect fn call(caller: &mut MirFunction, point: usize, callee: &MirFunction)
     failure: failure,
     cancel: cancel,
     origin: origin,
+    base: freshNode(&caller.*),
+    sites: move sites,
   }
 
   // Preserve the flags' association with the moved owner and its projected cleanup component.
-  let mut at = usize.ZERO
+  at = usize.ZERO
   while at < locals.length {
     if let LocalKind.DropFlag { local, path: steps } = &locals[at].kind {
       let mut changed = List<Local>.asMutSlice(&mut fresh)
@@ -454,18 +661,6 @@ pub effect fn call(caller: &mut MirFunction, point: usize, callee: &MirFunction)
     )
     at = at + 1
   }
-  let references = List<Reference>.asSlice(&callee.references)
-  at = usize.ZERO
-  while at < references.length {
-    run List<Reference>.append(
-      &mut caller.references,
-      Reference {
-        key: InstanceKey.copy(&references[at].key),
-        edge: Edge.copy(&references[at].edge),
-        origin: origin,
-      },
-    )
-    at = at + 1
-  }
+  run mergeTables(&mut caller.*, callee, &splice)
   return true
 }

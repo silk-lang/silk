@@ -86,6 +86,7 @@ import semantic.TypedBody {
   UnionMember as BodyUnionMember,
 }
 import backend.Mir {
+  TrapSite as MirTrapSite,
   Cancel as MirCancel,
   SwitchCase as MirSwitchCase,
   FailureEdge as MirFailureEdge,
@@ -2271,6 +2272,7 @@ export "C" fn destroy(state: usize) -> () { return () }
     |> Effect.provideMut<Allocator>(&mut allocator)
   let storage = run storageIn(&id) |> Effect.provideMut<Allocator>(&mut allocator)
   Semantic.selectExecutionStorage(&mut store, move storage)
+  Semantic.selectInlining(&mut store, true)
   let mut request = Request.forApplication(ModuleId.copy(&id))
   let built = run buildApplication(&mut store, &mut request, staticClosureNodes)
     |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
@@ -2308,6 +2310,151 @@ export "C" fn destroy(state: usize) -> () { return () }
   }
   run Testing.expect(found && expanded, "stored exact forwarding effects run their leaf directly in the caller frame")
   run Testing.expect(kept && recursive, "explicit no-inline calls and recursive SCCs keep their frame boundaries")
+  return ()
+}
+
+// Whether `function` is an instance of the declaration named `name`.
+fn instanceOf(function: &MirFunction, name: &[u8]) -> bool {
+  let identity = InstanceKey.identity(&function.key)
+  return Interned<DeclarationId>.with<bool>(&identity, fn(value: &DeclarationId) -> bool { return DeclarationId.named(value, name) })
+}
+
+fn keyNamed(key: &InstanceKey, name: &[u8]) -> bool {
+  let identity = InstanceKey.identity(key)
+  return Interned<DeclarationId>.with<bool>(&identity, fn(value: &DeclarationId) -> bool { return DeclarationId.named(value, name) })
+}
+
+// Whether `function` calls an instance of the declaration named `name`.
+fn callsNamed(function: &MirFunction, name: &[u8]) -> bool {
+  let blocks = List<MirBlock>.asSlice(&function.blocks)
+  let mut at = usize.ZERO
+  while at < blocks.length {
+    if let MirTerminator.Call {callee: MirCallee.Instance {key}, ..} = &blocks[at].terminator {
+      if keyNamed(&key, name) { return true }
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn referencesNamed(function: &MirFunction, name: &[u8]) -> bool {
+  let references = List<MirReference>.asSlice(&function.references)
+  let mut at = usize.ZERO
+  while at < references.length {
+    if keyNamed(&references[at].key, name) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn inlinedNamed(function: &MirFunction, name: &[u8]) -> bool {
+  let inlined = List<InstanceKey>.asSlice(&function.inlined)
+  let mut at = usize.ZERO
+  while at < inlined.length {
+    if keyNamed(&inlined[at], name) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// Whether a trap site of `function` reports a label containing `needle` through locals of its own,
+// as a trap of an inlined body does.
+fn reportsInlinedTrap(function: &MirFunction, needle: &[u8]) -> bool {
+  let traps = List<MirTrapSite>.asSlice(&function.traps)
+  let mut at = usize.ZERO
+  while at < traps.length {
+    if traps[at].observer != usize.MAX && containsIr(Bytes.asSlice(&traps[at].label), needle) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn inliningSource() -> string<'static> {
+  return """
+fn bump(value: u8) -> u8 { return value + 200 }
+@inlineNever
+fn kept(value: u8) -> u8 { return value + 1 }
+fn count(value: u32) -> u32 {
+  if value == 0 { return 0 }
+  return count(value - 1) + 1
+}
+effect fn exercise() -> i32 {
+  let bumped = bump(1)
+  let held = kept(bumped)
+  let counted = count(3)
+  if held == 0 && counted == 0 { return 1 }
+  return 0
+}
+fn observing<'env, S: 'env, A, ?R, F: fn<'static>(&mut S, u8, usize, usize, string<'static>, string<'static>) -> usize + Intrinsic.NonParking>(
+  state: S, callback: F, body: once Effect<'env; A ? R>) -> once Effect<'env; A ? R> {
+  return Intrinsic.observeDiagnostics<S, A, R, F>(move state, move callback, move body)
+}
+fn quiet(state: &mut i32, event: u8, first: usize, second: usize, identity: string<'static>, label: string<'static>) -> usize { return 0 }
+pub fn main() -> i32 { return run observing(0, quiet, exercise()) }
+"""
+}
+
+// An optimized build splices a small callee into its caller before code generation, through
+// the callee's un-inlined MIR; `@inlineNever` and a recursive callee keep their calls. A trap of
+// the spliced body keeps the callee's site label and reports through the operands the call
+// passed, and the callee, called nowhere else, is no longer a reference of the caller.
+test effect fn optimizedBuildsInlineSmallCallees() -> ()
+! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut typeTable = TypeTable.make()
+  let id = run module("inline-small-callees.silk") |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut store = run applicationSemantic(&id, inliningSource(), MachineTarget.forId(TargetId.X8664UnknownLinuxGnu))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  Semantic.selectInlining(&mut store, true)
+  let mut request = Request.forApplication(ModuleId.copy(&id))
+  let built = run buildApplication(&mut store, &mut request, staticClosureNodes)
+    |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(match &built { BackendBuild.Module {..} => true _ => false }, "the inlining fixture builds")
+  let mut spliced = false
+  let mut kept = false
+  let mut recursive = false
+  let mut unreferenced = false
+  let mut trap = false
+  let mut index = usize.ZERO
+  while let Option<&MirFunction>.Some {value: function} = move Semantic.mirAt(&store, index) {
+    index = index + usize.ONE
+    if !instanceOf(function, b"exercise") || !inlinedNamed(function, b"bump") { continue }
+    spliced = !callsNamed(function, b"bump")
+    kept = callsNamed(function, b"kept")
+    recursive = callsNamed(function, b"count")
+    unreferenced = !referencesNamed(function, b"bump")
+    trap = reportsInlinedTrap(function, b"bump")
+  }
+  run Testing.expect(spliced, "the small callee's body replaces its call")
+  run Testing.expect(kept && recursive, "an @inlineNever callee and a recursive callee keep their calls")
+  run Testing.expect(trap, "the spliced overflow check reports the callee's site through the call's diagnostic operands")
+  run Testing.expect(unreferenced, "a callee inlined at its only call is no longer referenced")
+  return ()
+}
+
+// An unoptimized build inlines nothing.
+test effect fn unoptimizedBuildsKeepEveryCall() -> ()
+! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut typeTable = TypeTable.make()
+  let id = run module("inline-unoptimized.silk") |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut store = run applicationSemantic(&id, inliningSource(), MachineTarget.forId(TargetId.X8664UnknownLinuxGnu))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  Semantic.selectInlining(&mut store, false)
+  let mut request = Request.forApplication(ModuleId.copy(&id))
+  let built = run buildApplication(&mut store, &mut request, staticClosureNodes)
+    |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(match &built { BackendBuild.Module {..} => true _ => false }, "the inlining fixture builds")
+  let mut found = false
+  let mut calls = true
+  let mut index = usize.ZERO
+  while let Option<&MirFunction>.Some {value: function} = move Semantic.mirAt(&store, index) {
+    index = index + usize.ONE
+    if !instanceOf(function, b"exercise") { continue }
+    found = true
+    calls = calls && callsNamed(function, b"bump") && List<InstanceKey>.length(&function.inlined) == usize.ZERO
+  }
+  run Testing.expect(found && calls, "every lowered caller keeps its call")
   return ()
 }
 
@@ -2357,6 +2504,7 @@ export "C" fn destroy(state: usize) -> () { return () }
   let mut store = run applicationSemantic(&id, source, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu))
     |> Effect.provideMut<Allocator>(&mut allocator)
   Semantic.selectExecutionStorage(&mut store, run storageIn(&id) |> Effect.provideMut<Allocator>(&mut allocator))
+  Semantic.selectInlining(&mut store, true)
   let mut request = Request.forApplication(ModuleId.copy(&id))
   let built = run buildApplication(&mut store, &mut request, staticClosureNodes)
     |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
