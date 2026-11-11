@@ -1,0 +1,588 @@
+//! Parse and serialize the host of a URL as the WHATWG URL Standard specifies: domains, IPv4 and
+//! IPv6 addresses, and opaque hosts.
+//!
+//! # When to use
+//! Use [`UrlHost.parse`] to check and normalize a host name outside a full URL, such as the
+//! `Host` of a request. `silk.url.url` calls it for every URL.
+//!
+//! # Details
+//! A host of a special URL, such as `http`, is percent-decoded and converted with UTS #46 (see
+//! `silk.text.idna`). A domain that ends in a number is an IPv4 address, which can be written in
+//! decimal, octal, or hexadecimal parts. A host in brackets is an IPv6 address. The host of a
+//! URL that is not special is opaque: it is only checked and percent-encoded.
+//!
+//! # Examples
+//! ## Normalize hosts
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.core.effect { Effect }
+//! import silk.core.option { Option }
+//! import silk.collections.bytes { Bytes }
+//! import silk.url.host { UrlHost, UrlHostKind }
+//!
+//! pub effect fn main() -> i32
+//!   ! OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let mut output = Bytes.make()
+//!   let kind = run UrlHost.parse(b"0x7f.1", false, &mut output)
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!   let ipv4 = match kind {
+//!     Option<UrlHostKind>.Some { value } => value == UrlHostKind.Ipv4
+//!     Option<UrlHostKind>.None => false
+//!   }
+//!   if !ipv4 || Bytes.asSlice(&output) != b"127.0.0.1" {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.ownership { Copy }
+import silk.core.option { Option }
+import silk.collections.bytes { Bytes }
+import silk.collections.slice { Slice }
+import silk.text.string { String }
+import silk.text.idna { Idna, IdnaOptions }
+import silk.url.percent { UrlPercent, UrlEncodeSet }
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+
+/// The kind of the host of a URL.
+pub enum UrlHostKind {
+  /// The URL has no host, such as `mailto:a@example.com`.
+  Absent,
+  /// A domain, in ASCII: `example.com`.
+  Domain,
+  /// An IPv4 address, serialized in dotted decimal: `127.0.0.1`.
+  Ipv4,
+  /// An IPv6 address, serialized in brackets: `[::1]`.
+  Ipv6,
+  /// The host of a URL that is not special, percent-encoded: `host` in `git://host/repo`.
+  Opaque,
+  /// An empty host, such as the host of `file:///tmp`.
+  Empty,
+}
+
+/// Functions that parse and serialize URL hosts.
+pub struct UrlHost {}
+
+impl UrlHost {
+  /// Parses `input` as the host of a URL and appends its serialization to `output`. Returns the
+  /// kind of the host, or `None` if `input` is not a valid host.
+  ///
+  /// # Details
+  /// `opaque` is `true` for the host of a URL that is not special. Then `input` is checked for
+  /// forbidden host code points and percent-encoded, unless it is an IPv6 address in brackets.
+  /// Otherwise `input` is percent-decoded, converted to ASCII, and read as an IPv4 address when it
+  /// ends in a number. An empty `input` gives `Empty` only when `opaque` is `true`. On failure,
+  /// `output` can hold a part of the result.
+  ///
+  /// # Errors
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  pub effect fn parse(input: &[u8], opaque: bool, output: &mut Bytes) -> Option<UrlHostKind>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if input.length > 0 && input[0] == 91 {
+      if input[input.length - 1] != 93 {
+        return Option<UrlHostKind>.none()
+      }
+      let mut address: [u16; 8] = [0; 8]
+      if !parseIpv6(Slice.view<u8>(input, 1, input.length - 2), &mut address) {
+        return Option<UrlHostKind>.none()
+      }
+      run Bytes.append(&mut output.*, b"[")
+      run appendIpv6(&mut output.*, &address)
+      run Bytes.append(&mut output.*, b"]")
+      return Option<UrlHostKind>.some(UrlHostKind.Ipv6)
+    }
+    if opaque {
+      let mut i: usize = 0
+      while i < input.length {
+        if forbiddenHost(input[i]) {
+          return Option<UrlHostKind>.none()
+        }
+        i = i + 1
+      }
+      run UrlPercent.appendEncoded(&mut output.*, input, UrlEncodeSet.C0Control)
+      if input.length == 0 {
+        return Option<UrlHostKind>.some(UrlHostKind.Empty)
+      }
+      return Option<UrlHostKind>.some(UrlHostKind.Opaque)
+    }
+    let start = Bytes.length(&output.*)
+
+    // Common case: ASCII without escapes is lowercased in place, with no decoding.
+    let mut simple = true
+    let mut i: usize = 0
+    while i < input.length {
+      let c = input[i]
+      if c >= 128 || c == 37 {
+        simple = false
+        break
+      }
+      i = i + 1
+    }
+    if simple {
+      if !(run appendAsciiDomain(&mut output.*, input)) {
+        return Option<UrlHostKind>.none()
+      }
+    } else {
+      let mut decoded = String.make()
+      run UrlPercent.appendDecodedText(&mut decoded, input, false)
+      if !(run UrlHost.domainToAscii(String.view(&decoded), &mut output.*)) {
+        return Option<UrlHostKind>.none()
+      }
+    }
+    let domain = Slice.view<u8>(Bytes.asSlice(&output.*), start, Bytes.length(&output.*) - start)
+    if !endsInNumber(domain) {
+      return Option<UrlHostKind>.some(UrlHostKind.Domain)
+    }
+    let address = match parseIpv4(domain) {
+      Option<u32>.Some { value } => value
+      Option<u32>.None => {
+        return Option<UrlHostKind>.none()
+      }
+    }
+    Bytes.truncate(&mut output.*, start)
+    run appendIpv4(&mut output.*, address)
+    return Option<UrlHostKind>.some(UrlHostKind.Ipv4)
+  }
+
+  /// Converts `domain` to ASCII as the URL Standard's domain to ASCII does, and appends it to
+  /// `output`. Returns `false` if `domain` is not a valid domain.
+  ///
+  /// # Details
+  /// ASCII input is only lowercased. Other input goes through UTS #46 ToASCII with the bidi and
+  /// joiner checks. An empty result, or one with a forbidden domain code point, is not valid. On
+  /// failure, `output` can hold a part of the result.
+  ///
+  /// # Errors
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  pub effect fn domainToAscii(domain: string, output: &mut Bytes) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let bytes = String.utf8Bytes(domain)
+    let mut ascii = true
+    let mut i: usize = 0
+    while i < bytes.length {
+      if bytes[i] >= 128 {
+        ascii = false
+        break
+      }
+      i = i + 1
+    }
+    if ascii {
+      return run appendAsciiDomain(&mut output.*, bytes)
+    }
+    let mut converted = String.make()
+    if !(run Idna.toAscii(domain, IdnaOptions.lenient(), &mut converted)) {
+      return false
+    }
+    let result = String.ownedUtf8Bytes(&converted)
+    if result.length == 0 {
+      return false
+    }
+    i = 0
+    while i < result.length {
+      if forbiddenDomain(result[i]) {
+        return false
+      }
+      i = i + 1
+    }
+    run Bytes.append(&mut output.*, result)
+    return true
+  }
+}
+
+effect fn appendAsciiDomain(output: &mut Bytes, input: &[u8]) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if input.length == 0 {
+    return false
+  }
+  let start = Bytes.length(&output.*)
+  run Bytes.append(&mut output.*, input)
+  let target = Bytes.asMutSlice(&mut output.*)
+  let mut i = start
+  while i < target.length {
+    let c = target[i]
+    if forbiddenDomain(c) {
+      return false
+    }
+    if c >= 65 && c <= 90 {
+      target[i] = c + 32
+    }
+    i = i + 1
+  }
+  return true
+}
+
+/// Returns whether `c` is a forbidden host code point.
+fn forbiddenHost(c: u8) -> bool {
+  return c == 0 || c == 9 || c == 10 || c == 13 || c == 32 || c == 35 || c == 47 || c == 58
+    || c == 60
+    || c == 62
+    || c == 63
+    || c == 64
+    || c == 91
+    || c == 92
+    || c == 93
+    || c == 94
+    || c == 124
+}
+
+/// Returns whether `c` is a forbidden domain code point.
+fn forbiddenDomain(c: u8) -> bool {
+  return c <= 31 || c == 37 || c == 127 || forbiddenHost(c)
+}
+
+// The last label of `domain`, without one trailing dot.
+fn lastLabel(domain: &[u8]) -> &[u8] {
+  let mut end = domain.length
+  if end > 0 && domain[end - 1] == 46 {
+    end = end - 1
+  }
+  let mut start = end
+  while start > 0 && domain[start - 1] != 46 {
+    start = start - 1
+  }
+  return Slice.view<u8>(domain, start, end - start)
+}
+
+fn endsInNumber(domain: &[u8]) -> bool {
+  if domain.length == 0 {
+    return false
+  }
+
+  // A domain of one dot has one empty label and no number.
+  if domain.length == 1 && domain[0] == 46 {
+    return false
+  }
+  let last = lastLabel(domain)
+  if last.length == 0 {
+    return false
+  }
+  let mut digits = true
+  let mut i: usize = 0
+  while i < last.length {
+    if last[i] < 48 || last[i] > 57 {
+      digits = false
+    }
+    i = i + 1
+  }
+  if digits {
+    return true
+  }
+  return ipv4Number(last) != NOT_A_NUMBER
+}
+
+// Values above 0xFFFFFFFF saturate at TOO_BIG; NOT_A_NUMBER marks text that is not a number.
+const TOO_BIG: u64 = 0x100000000
+
+const NOT_A_NUMBER: u64 = 0xFFFFFFFFFFFFFFFF
+
+fn ipv4Number(text: &[u8]) -> u64 {
+  if text.length == 0 {
+    return NOT_A_NUMBER
+  }
+  let mut start: usize = 0
+  let mut radix: u64 = 10
+  if text.length >= 2 && text[0] == 48 && (text[1] == 120 || text[1] == 88) {
+    start = 2
+    radix = 16
+  } else if text.length >= 2 && text[0] == 48 {
+    start = 1
+    radix = 8
+  }
+  let mut value: u64 = 0
+  let mut i = start
+  while i < text.length {
+    let c = text[i]
+    let mut d: u64 = 99
+    if c >= 48 && c <= 57 {
+      d = u8.toU64(c) - 48
+    } else if c >= 97 && c <= 102 {
+      d = u8.toU64(c) - 87
+    } else if c >= 65 && c <= 70 {
+      d = u8.toU64(c) - 55
+    }
+    if d >= radix {
+      return NOT_A_NUMBER
+    }
+    value = value * radix + d
+    if value > TOO_BIG {
+      value = TOO_BIG
+    }
+    i = i + 1
+  }
+  return value
+}
+
+fn parseIpv4(domain: &[u8]) -> Option<u32> {
+  let mut end = domain.length
+  if end > 0 && domain[end - 1] == 46 {
+    end = end - 1
+  }
+  let mut numbers: [u64; 4] = [0; 4]
+  let mut count: usize = 0
+  let mut start: usize = 0
+  let mut i: usize = 0
+  while i <= end {
+    if i < end && domain[i] != 46 {
+      i = i + 1
+      continue
+    }
+    if count == 4 {
+      return Option<u32>.none()
+    }
+    let n = ipv4Number(Slice.view<u8>(domain, start, i - start))
+    if n == NOT_A_NUMBER {
+      return Option<u32>.none()
+    }
+    numbers[count] = n
+    count = count + 1
+    start = i + 1
+    i = i + 1
+  }
+  let mut j: usize = 0
+  while j + 1 < count {
+    if numbers[j] > 255 {
+      return Option<u32>.none()
+    }
+    j = j + 1
+  }
+  let limit = u64.shiftLeft(1, usize.toU64(8 * (5 - count)))
+  if numbers[count - 1] >= limit {
+    return Option<u32>.none()
+  }
+  let mut address = numbers[count - 1]
+  j = 0
+  while j + 1 < count {
+    address = address + u64.shiftLeft(numbers[j], usize.toU64(8 * (3 - j)))
+    j = j + 1
+  }
+  return Option<u32>.some(u64.toU32(address))
+}
+
+effect fn appendDecimal(output: &mut Bytes, value: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut digits: [u8; 10] = [0; 10]
+  let mut n = value
+  let mut count: usize = 0
+  while true {
+    digits[9 - count] = u32.toU8(n % 10) + 48
+    count = count + 1
+    n = n / 10
+    if n == 0 {
+      break
+    }
+  }
+  return run Bytes.append(&mut output.*, Slice.view<u8>(&digits, 10 - count, count))
+}
+
+effect fn appendIpv4(output: &mut Bytes, address: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut shift: u32 = 24
+  while true {
+    run appendDecimal(&mut output.*, u32.shiftRight(address, shift) & 255)
+    if shift == 0 {
+      break
+    }
+    run Bytes.append(&mut output.*, b".")
+    shift = shift - 8
+  }
+  return ()
+}
+
+fn hexValue(c: u8) -> u32 {
+  if c >= 48 && c <= 57 {
+    return u8.toU32(c) - 48
+  }
+  if c >= 97 && c <= 102 {
+    return u8.toU32(c) - 87
+  }
+  if c >= 65 && c <= 70 {
+    return u8.toU32(c) - 55
+  }
+  return 16
+}
+
+fn parseIpv6(input: &[u8], address: &mut [u16; 8]) -> bool {
+  let n = input.length
+  let mut piece: usize = 0
+  let mut compress: usize = 9
+  let mut p: usize = 0
+  if n > 0 && input[0] == 58 {
+    if n < 2 || input[1] != 58 {
+      return false
+    }
+    p = 2
+    piece = 1
+    compress = 1
+  }
+  while p < n {
+    if piece == 8 {
+      return false
+    }
+    if input[p] == 58 {
+      if compress != 9 {
+        return false
+      }
+      p = p + 1
+      piece = piece + 1
+      compress = piece
+      continue
+    }
+    let mut value: u32 = 0
+    let mut length: usize = 0
+    while length < 4 && p < n && hexValue(input[p]) < 16 {
+      value = value * 16 + hexValue(input[p])
+      p = p + 1
+      length = length + 1
+    }
+    if p < n && input[p] == 46 {
+      if length == 0 {
+        return false
+      }
+      p = p - length
+      if piece > 6 {
+        return false
+      }
+      let mut seen: usize = 0
+      while p < n {
+        let mut part: u32 = 0
+        let mut hasPart = false
+        if seen > 0 {
+          if input[p] == 46 && seen < 4 {
+            p = p + 1
+          } else {
+            return false
+          }
+        }
+        if p >= n || input[p] < 48 || input[p] > 57 {
+          return false
+        }
+        while p < n && input[p] >= 48 && input[p] <= 57 {
+          let digit = u8.toU32(input[p]) - 48
+          if !hasPart {
+            part = digit
+            hasPart = true
+          } else if part == 0 {
+            return false
+          } else {
+            part = part * 10 + digit
+          }
+          if part > 255 {
+            return false
+          }
+          p = p + 1
+        }
+        address[piece] = u32.toU16(u16.toU32(address[piece]) * 256 + part)
+        seen = seen + 1
+        if seen == 2 || seen == 4 {
+          piece = piece + 1
+        }
+      }
+      if seen != 4 {
+        return false
+      }
+      break
+    } else if p < n && input[p] == 58 {
+      p = p + 1
+      if p >= n {
+        return false
+      }
+    } else if p < n {
+      return false
+    }
+    address[piece] = u32.toU16(value)
+    piece = piece + 1
+  }
+  if compress != 9 {
+    let mut swaps = piece - compress
+    piece = 7
+    while piece != 0 && swaps > 0 {
+      let temp = address[compress + swaps - 1]
+      address[compress + swaps - 1] = address[piece]
+      address[piece] = temp
+      piece = piece - 1
+      swaps = swaps - 1
+    }
+  } else if piece != 8 {
+    return false
+  }
+  return true
+}
+
+effect fn appendIpv6(output: &mut Bytes, address: &[u16; 8]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  // The first longest run of two or more zero pieces is compressed to `::`.
+  let mut compress: usize = 9
+  let mut longest: usize = 1
+  let mut i: usize = 0
+  while i < 8 {
+    if address[i] != 0 {
+      i = i + 1
+      continue
+    }
+    let start = i
+    while i < 8 && address[i] == 0 {
+      i = i + 1
+    }
+    if i - start > longest {
+      longest = i - start
+      compress = start
+    }
+  }
+  let digits = b"0123456789abcdef"
+  let mut ignore = false
+  i = 0
+  while i < 8 {
+    if ignore && address[i] == 0 {
+      i = i + 1
+      continue
+    }
+    ignore = false
+    if compress == i {
+      run Bytes.append(
+        &mut output.*,
+        if i == 0 {
+          b"::"
+        } else {
+          b":"
+        },
+      )
+      ignore = true
+      i = i + 1
+      continue
+    }
+    let value = u16.toU32(address[i])
+    let mut buffer: [u8; 4] = [0; 4]
+    let mut count: usize = 0
+    let mut shift: u32 = 12
+    while true {
+      let d = u32.shiftRight(value, shift) & 15
+      if count > 0 || d != 0 || shift == 0 {
+        buffer[count] = digits[u32.toUsize(d)]
+        count = count + 1
+      }
+      if shift == 0 {
+        break
+      }
+      shift = shift - 4
+    }
+    run Bytes.append(&mut output.*, Slice.view<u8>(&buffer, 0, count))
+    if i != 7 {
+      run Bytes.append(&mut output.*, b":")
+    }
+    i = i + 1
+  }
+  return ()
+}
