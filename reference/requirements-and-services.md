@@ -718,22 +718,44 @@ header and nothing else. A union named `Option` in any other module is not a req
 otherwise. Both effects share the other requirements `R`, and `R` must not contain `S`. Only
 `present` may use `S`.
 
-`Option<P>` provides `Option<S>` when `&P` provides `S`. `Option<P>.some(provider)` is present. The
-explicit absent provider is `Option<never>.none()`: `never` conforms to every service, since no
-value of it exists, and a call dispatched to a `never` provider is unreachable. `provideSome<&S>`
-lifts a borrowed provider of `S` into a present one.
+An optional service needs no provider. A `run` owes its enclosing signature every requirement of
+the Effect except the optional ones: an `&Option<&S>` that neither the signature nor a provision
+around the run provides is absent for that run.
 
 ```silk
-let none = Option<never>.none()
-let absent = run Effect.provide(measure(), &none)
-let present = run provideSome<&Tracer>(measure(), &offset)
+effect fn untraced() -> i32 ? &Base {
+  return run measure()
+}
+
+effect fn forwarded() -> i32 ? &Base | &Option<&Tracer> {
+  return run measure()
+}
 ```
 
-**Boundary:** Absence is never implicit: every `Option<&S>` requirement needs an explicit present or
-absent provider before the Effect runs. A plain provider of `S` does not satisfy `&Option<&S>`.
+`untraced` runs `measure` without a tracer, whatever its own caller provides. `forwarded` names the
+optional service, so `measure` uses the provider that `forwarded` receives, if any.
+
+`Option<P>` provides `Option<S>` when `&P` provides `S`. `Option<P>.some(provider)` is present.
+`provideSome<&S>` lifts a borrowed provider of `S` into a present one. `Option<P>.None` is absent,
+which hides an outer provider. `Option<never>.none()` is an absent provider for any service:
+`never` conforms to every service, since no value of it exists, and a call dispatched to a `never`
+provider is unreachable.
+
+```silk
+let absent = run measure()
+let present = run provideSome<&Tracer>(measure(), &offset)
+let none = Option<never>.none()
+let hidden = run Effect.provide(measure(), &none)
+```
+
+**Boundary:** A plain provider of `S` does not satisfy `&Option<&S>`. Only a `run` supplies
+absence: an Effect value that still requires `&Option<&S>` does not fit a contract whose row lacks
+that key. Provision stays strict, so a provider given for an optional service that the Effect does
+not require is refused.
 
 **Diagnostics:** A plain provider of `S` given for `Option<&S>` reports `SEM0123`, as any provider
-that conforms to no required key does. Diagnostics and types name the service, `OptionService`.
+that conforms to no required key does. `SEM0071` never names an optional service. Diagnostics and
+types name the service, `OptionService`.
 
 **Evidence:** [option standard library](../stdlib/silk/core/option.silk),
 `standardOptionIsARequirementKey` and `partialSourcePremisesAndNeverProvidersDecideProvision`

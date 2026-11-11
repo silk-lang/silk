@@ -47,9 +47,9 @@ pub fn main() -> i32 {
 ```
 
 ### Make a service optional
-An effect that requires `&Option<&S>` runs with or without a provider of `S`. See [`withSome`](#withSome).
+An effect that requires `&Option<&S>` runs with or without a provider of `S`, and needs no
+provider to run without one. See [`withSome`](#withSome).
 ```silk
-import silk.core.effect { Effect }
 import silk.core.option { Option, provideSome, withSome }
 
 service Tracer {
@@ -80,9 +80,8 @@ effect fn measure() -> i32 ? &Option<&Tracer> {
 
 pub fn main() -> i32 {
   let offset = Offset {amount: 10}
-  let none = Option<never>.none()
   let present = run provideSome<&Tracer>(measure(), &offset)
-  let absent = run Effect.provide(measure(), &none)
+  let absent = run measure()
   if present != 11 || absent != 1 {
     return 1
   }
@@ -117,7 +116,7 @@ different custom behavior. The option owns its value, so dropping a present opti
 the value.
 
 In a requirement row, `&Option<&S>` is an optional service: the effect runs with or without a
-provider of `S`. Branch on it with [`withSome`](#withSome).
+provider of `S`, and is absent when nothing provides it. Branch on it with [`withSome`](#withSome).
 
 ### Examples
 
@@ -549,10 +548,12 @@ with [`withSome`](#withSome). Diagnostics name this service where they name the 
 
 ### Details
 
-`Option<&S>` is an ordinary requirement key, separate from `S`. An `Option<P>` provides it when
-`&P` provides `S`: `Option<P>.some(provider)` is present and `Option<P>.None` is absent. The
-explicit absent provider is `Option<never>.none()`, because `never` serves every service and has
-no values. [`provideSome`](#provideSome) lifts a borrowed provider of `S` into a present one.
+`Option<&S>` is a requirement key separate from `S`, and the one kind of key that needs no
+provider: a `run` whose enclosing signature does not provide it runs with the service absent.
+An `Option<P>` provides it when `&P` provides `S`: `Option<P>.some(provider)` is present and
+`Option<P>.None` is absent. [`provideSome`](#provideSome) lifts a borrowed provider of `S` into a present one.
+`Option<never>.none()` is an absent provider for any `S`, because `never` serves every service
+and has no values. Provide it to hide an outer provider.
 
 <a id="OptionService.select"></a>
 
@@ -615,13 +616,17 @@ and without `S`, for example optional tracing or metrics.
 ### Details
 
 The type argument is the requirement entry, such as `withSome<&Tracer>`. The provider decides
-the branch at runtime with one tag check. The branch that does not run is dropped. Both branches
-share the other requirements `R`, which must not contain `S`, and only `present` may use `S`.
+the branch at runtime with one tag check, and `absent` runs when nothing provides the optional
+service. The branch that does not run is dropped. Both branches share the other requirements
+`R`, which must not contain `S`, and only `present` may use `S`.
 
 ### Gotchas
 
-A provider of `S` does not satisfy `&Option<&S>`. Provide `Option<P>.some(provider)`,
-`Option<never>.none()`, or use [`provideSome`](#provideSome).
+A provider of `S` does not satisfy `&Option<&S>`. Provide `Option<P>.some(provider)` or use
+[`provideSome`](#provideSome).
+
+A caller forwards its own provider only when its signature also requires `&Option<&S>`. A
+caller that does not name the optional service runs this effect with the service absent.
 
 <a id="Present"></a>
 
