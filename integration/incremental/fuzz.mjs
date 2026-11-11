@@ -223,9 +223,12 @@ function mutate(round) {
   return done;
 }
 
-function run() {
+// A warm check is answered by the check server the last one left behind; a cold one checks in its
+// own process.
+function run(cold = false) {
   const started = Date.now();
-  const ran = spawnSync(options.silk, [options.command, '--package', options.package, '--stdlib', stdlib, '--progress', 'never'], {
+  const flags = cold && options.command === 'check' ? ['--no-server'] : [];
+  const ran = spawnSync(options.silk, [options.command, '--package', options.package, '--stdlib', stdlib, '--progress', 'never', ...flags], {
     cwd: tree,
     encoding: 'utf8',
     maxBuffer: 1 << 28,
@@ -267,7 +270,7 @@ for (let round = 1; round <= Number(options.iterations); round += 1) {
   history.push({ round, applied });
   const warm = run();
   renameSync(join(tree, 'build'), aside);
-  const cold = run();
+  const cold = run(true);
   const agreed = warm.status === cold.status && warm.output === cold.output && warm.executable === cold.executable;
   console.log(`round ${round}: ${agreed ? 'same' : 'DIFFERENT'} status ${warm.status}/${cold.status}, warm ${warm.seconds.toFixed(1)} s, cold ${cold.seconds.toFixed(1)} s; ${applied.map((edit) => `${edit.file}: ${edit.edit}`).join('; ')}`);
   if (!agreed) {
