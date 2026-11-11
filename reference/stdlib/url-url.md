@@ -33,8 +33,8 @@ pub effect fn main() -> i32
   let mut allocator = Allocator.systemAllocatorProvider()
   let parsed = run Url.parse("HTTPS://Example.COM:443/a/./b/../c?x=1#top", Option<&Url>.none())
     |> Effect.provideMut<Allocator>(&mut allocator)
-  let url = match parsed {
-    Option<Url>.Some { value } => value
+  let url = match move parsed {
+    Option<Url>.Some { value } => move value
     Option<Url>.None => { return 1 }
   }
   if Url.href(&url) != "https://example.com/a/c?x=1#top" || Url.pathname(&url) != "/a/c" {
@@ -46,7 +46,132 @@ pub effect fn main() -> i32
 
 Import as `Url` with `import silk.url.url { Url }`.
 
-Public declarations: 1.
+Public declarations: 2.
+
+<a id="UrlComponents"></a>
+
+## `UrlComponents`
+
+```silk
+pub struct UrlComponents
+```
+
+The positions of the parts of a URL's serialization, from [`Url.components`](#Url.impl.components).
+
+### Details
+Every position is a byte offset into [`Url.href`](#Url.impl.href). They let code that keeps the serialization as
+its own string, such as a JavaScript binding, take each getter's text as a slice.
+
+<a id="UrlComponents.schemeEnd"></a>
+
+### Field `schemeEnd`
+
+```silk
+pub schemeEnd: usize
+```
+
+The position of the `:` after the scheme.
+
+<a id="UrlComponents.userStart"></a>
+
+### Field `userStart`
+
+```silk
+pub userStart: usize
+```
+
+The start of the user name. The user name is `[userStart, usernameEnd)`.
+
+<a id="UrlComponents.usernameEnd"></a>
+
+### Field `usernameEnd`
+
+```silk
+pub usernameEnd: usize
+```
+
+The end of the user name.
+
+<a id="UrlComponents.passwordEnd"></a>
+
+### Field `passwordEnd`
+
+```silk
+pub passwordEnd: usize
+```
+
+The end of the password. The password is `[usernameEnd + 1, passwordEnd)` when `passwordEnd` is
+greater than `usernameEnd`, and empty otherwise.
+
+<a id="UrlComponents.hostStart"></a>
+
+### Field `hostStart`
+
+```silk
+pub hostStart: usize
+```
+
+The start of the host.
+
+<a id="UrlComponents.hostEnd"></a>
+
+### Field `hostEnd`
+
+```silk
+pub hostEnd: usize
+```
+
+The end of the host. The port follows it after `:` when the URL has one.
+
+<a id="UrlComponents.hostKind"></a>
+
+### Field `hostKind`
+
+```silk
+pub hostKind: UrlHostKind
+```
+
+The kind of the host. The host and port text is `[hostStart, pathStart)` unless it is `Absent`.
+
+<a id="UrlComponents.port"></a>
+
+### Field `port`
+
+```silk
+pub port: Option<u16>
+```
+
+The port, or `None` when the URL has no port or the port is the default of the scheme.
+
+<a id="UrlComponents.pathStart"></a>
+
+### Field `pathStart`
+
+```silk
+pub pathStart: usize
+```
+
+The start of the path.
+
+<a id="UrlComponents.queryStart"></a>
+
+### Field `queryStart`
+
+```silk
+pub queryStart: Option<usize>
+```
+
+The position of the `?` before the query, or `None` when the URL has no query.
+
+<a id="UrlComponents.fragmentStart"></a>
+
+### Field `fragmentStart`
+
+```silk
+pub fragmentStart: Option<usize>
+```
+
+The position of the `#` before the fragment, or `None` when the URL has no fragment.
 
 <a id="Url"></a>
 
@@ -208,6 +333,16 @@ pub fn hostname(self: &Self) -> string
 
 Returns the serialized host, as JavaScript's `URL.hostname` does. An IPv6 address is in
 brackets. It is empty when the URL has no host.
+
+<a id="Url.impl.components"></a>
+
+### Method `components`
+
+```silk
+pub fn components(self: &Self) -> UrlComponents
+```
+
+Returns the positions of the parts of [`Url.href`](#Url.impl.href).
 
 <a id="Url.impl.hostKind"></a>
 
