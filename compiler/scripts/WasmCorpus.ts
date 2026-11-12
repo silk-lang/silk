@@ -96,6 +96,10 @@ export const skipReason = (program: Corpus.Program): string | undefined => {
   return undefined
 }
 
+/** `text` as a JSON string, cut to 400 characters with a note of how many were left out. */
+const quoted = (text: string): string =>
+  text.length <= 400 ? JSON.stringify(text) : `${JSON.stringify(text.slice(0, 400))} (${text.length - 400} more characters)`
+
 /** How a run differs from what the program's `outcome.json` and expected output files require. */
 export const compareOutcome = (
   program: Corpus.Program,
@@ -111,9 +115,9 @@ export const compareOutcome = (
       return `exit ${observed.exit}, expected ${expected.exitCode}`
   } else return 'a native program must complete or trap'
   if (program.stdout !== undefined && observed.stdout !== program.stdout)
-    return `stdout: expected ${JSON.stringify(program.stdout.slice(0, 80))}, got ${JSON.stringify(observed.stdout.slice(0, 80))}`
+    return `stdout: expected ${quoted(program.stdout)}, got ${quoted(observed.stdout)}`
   if (!invocation.closeStderr && program.stderr !== undefined && observed.stderr !== program.stderr)
-    return `stderr: expected ${JSON.stringify(program.stderr.slice(0, 80))}, got ${JSON.stringify(observed.stderr.slice(0, 80))}`
+    return `stderr: expected ${quoted(program.stderr)}, got ${quoted(observed.stderr)}`
   return undefined
 }
 

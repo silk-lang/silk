@@ -53,6 +53,14 @@ it.effect('compares exit status, traps and output against the outcome', () =>
     assert.equal(WasmCorpus.compareOutcome(traps, {}, observed({ exit: 1, stderr: 'panic\n' })), undefined)
     assert.match(WasmCorpus.compareOutcome(traps, {}, observed({ exit: 0, stderr: 'panic\n' })) ?? '', /expected a trap/)
     assert.match(WasmCorpus.compareOutcome(traps, {}, observed({ exit: 1, stderr: '' })) ?? '', /^stderr/)
+    // A difference past the start of a long report is shown, and a cut is named.
+    const report = `${'x'.repeat(90)}\n`
+    const longer = program({ outcome: { schemaVersion: 1, expected: { kind: 'trap' } }, stderr: report })
+    assert.match(WasmCorpus.compareOutcome(longer, {}, observed({ exit: 1, stderr: `${report}  at caller\n` })) ?? '', /at caller/)
+    assert.match(
+      WasmCorpus.compareOutcome(longer, {}, observed({ exit: 1, stderr: 'y'.repeat(500) })) ?? '',
+      /\(100 more characters\)/,
+    )
     // A run with stderr closed has no stderr to compare.
     assert.equal(WasmCorpus.compareOutcome(traps, { closeStderr: true }, observed({ exit: 1 })), undefined)
   }),
