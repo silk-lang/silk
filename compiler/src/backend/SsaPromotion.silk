@@ -1,0 +1,497 @@
+//! SSA construction from stack slots: the pass that turns a slot only loaded and stored into
+//! values, with block parameters where its stores meet, as LLVM's mem2reg and SROA do.
+//!
+//! # When to use
+//! Run [`promote`] once on every finished `SsaFunction`: it always promotes the builder's variable
+//! slots, and with `all` every other slot it can, which an optimized build asks for.
+//!
+//! # Details
+//! A slot is promotable when every use of its address, directly or through `Offset`, is the
+//! address operand of a `Load` or `Store`, and its accesses fall on fields that do not overlap
+//! and each have one kind; a `FrameAddress` anywhere can reach every slot but a variable's, so
+//! none of those is promotable then. Each field becomes a variable. Block parameters go on the
+//! iterated dominance frontier of its stores (Cytron et al.), and a walk of the dominator tree
+//! replaces each load with the value last stored on its path, or a zero of the field's kind before
+//! any store, and passes the current values along each edge. Parameters that end up passing one
+//! value, or feeding nothing, are removed (`pruneParameters`).
+
+import backend.SsaFunction {
+  Definition,
+  Edge,
+  Kind,
+  Operation,
+  SsaFunction,
+  none,
+}
+import backend.SsaGraph {SsaGraph}
+import silk.collections.list {List}
+import silk.core.option {Option}
+import silk.core.ownership {Copy}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.u64
+import silk.num.usize
+
+// One scalar field of a slot: its offset in the slot and its kind.
+struct Field {
+  offset: u64,
+  kind: Kind,
+}
+
+impl Copy for Field {}
+
+// Adds access `access` to a slot's distinct `fields`; answers false when it overlaps a field it
+// does not match, so the slot stays in memory.
+effect fn addField(fields: &mut List<Field>, access: Field) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let listed = List<Field>.asSlice(&fields.*)
+  let size = usize.toU64(access.kind.storeSize())
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let other = listed[at]
+    if other.offset == access.offset && other.kind.equals(access.kind) { return true }
+    let otherSize = usize.toU64(other.kind.storeSize())
+    if access.offset < other.offset + otherSize && other.offset < access.offset + size { return false }
+    at = at + usize.ONE
+  }
+  run List<Field>.append(&mut fields.*, access)
+  return true
+}
+
+fn fieldAt(fields: &[Field], offset: u64) -> usize {
+  let mut at = usize.ZERO
+  while at < fields.length {
+    if fields[at].offset == offset { return at }
+    at = at + usize.ONE
+  }
+  return usize.MAX
+}
+
+/// Promotes the builder's variable slots of `function`, and with `all` every other slot whose
+/// address is only loaded and stored, to values and block parameters; then prunes the parameters
+/// that pass one value or feed nothing.
+pub effect fn promote(function: &mut SsaFunction, all: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  let slots = function.slotCount()
+  if slots == usize.ZERO { return () }
+  let values = function.valueCount()
+  let blocks = function.blockCount()
+  let graph = run SsaGraph.of(&function.*)
+  // The slot and offset each address value is derived from, by value.
+  let mut derivedSlot = run List<usize>.makeWithCapacity(values)
+  run List<usize>.appendRepeated(&mut derivedSlot, usize.MAX, values)
+  let mut derivedOffset = run List<u64>.makeWithCapacity(values)
+  run List<u64>.appendRepeated(&mut derivedOffset, 0, values)
+  let mut framed = false
+  let sequence = graph.reversePostorder()
+  let mut step = usize.ZERO
+  while step < sequence.length {
+    let listed = List<usize>.asSlice(&function.block(sequence[step]).instructions)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      let found = function.instruction(listed[at])
+      match found.operation {
+        Operation.SlotAddress {slot} => { List<usize>.set(&mut derivedSlot, u64.toUsize(found.result), slot) }
+        Operation.Offset {offset} => {
+          let base = function.operandsOf(listed[at])[usize.ZERO]
+          let from = List<usize>.get(&derivedSlot, u64.toUsize(base))
+          if from != usize.MAX {
+            List<usize>.set(&mut derivedSlot, u64.toUsize(found.result), from)
+            let moved = u64.wrappingAdd(List<u64>.get(&derivedOffset, u64.toUsize(base)), offset)
+            List<u64>.set(&mut derivedOffset, u64.toUsize(found.result), moved)
+          }
+        }
+        Operation.FrameAddress => { framed = true }
+        _ => {}
+      }
+      at = at + usize.ONE
+    }
+    step = step + usize.ONE
+  }
+  // Which slots escape, and the fields of the others.
+  let mut escaped = run List<bool>.makeWithCapacity(slots)
+  let mut fields = run List<List<Field>>.makeWithCapacity(slots)
+  let mut slot = usize.ZERO
+  while slot < slots {
+    let declared = function.slot(slot)
+    run List<bool>.append(&mut escaped, !(declared.variable || all) || (framed && !declared.variable))
+    run List<List<Field>>.append(&mut fields, List<Field>.make())
+    slot = slot + usize.ONE
+  }
+  let derived = List<usize>.asSlice(&derivedSlot)
+  let offsets = List<u64>.asSlice(&derivedOffset)
+  let mut block = usize.ZERO
+  while block < blocks {
+    let listed = List<usize>.asSlice(&function.block(block).instructions)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      let found = function.instruction(listed[at])
+      let operands = function.operandsOf(listed[at])
+      let mut operand = usize.ZERO
+      while operand < operands.length {
+        let from = derived[u64.toUsize(operands[operand])]
+        if from != usize.MAX && !List<bool>.get(&escaped, from) {
+          let base = offsets[u64.toUsize(operands[operand])]
+          let mut access = Option<Field>.none()
+          match found.operation {
+            Operation.Load {offset, ..} => { access = Option<Field>.some(Field {offset: u64.wrappingAdd(base, offset), kind: found.kind}) }
+            Operation.Store {offset, ..} => {
+              if operand == usize.ONE { access = Option<Field>.some(Field {offset: u64.wrappingAdd(base, offset), kind: function.kindOf(operands[usize.ZERO])}) }
+            }
+            _ => {}
+          }
+          let mut keeps = false
+          if let Operation.Offset {..} = found.operation { keeps = true }
+          if let Option<Field>.Some {value: field} = access {
+            keeps = run addField(&mut List<List<Field>>.asMutSlice(&mut fields)[from], field)
+          }
+          if !keeps { List<bool>.set(&mut escaped, from, true) }
+        }
+        operand = operand + usize.ONE
+      }
+      at = at + usize.ONE
+    }
+    let exit = function.block(block)
+    if exit.value != none() {
+      let from = derived[u64.toUsize(exit.value)]
+      if from != usize.MAX { List<bool>.set(&mut escaped, from, true) }
+    }
+    let edges = List<Edge>.asSlice(&exit.edges)
+    let mut edge = usize.ZERO
+    while edge < edges.length {
+      let arguments = List<u64>.asSlice(&edges[edge].arguments)
+      let mut argument = usize.ZERO
+      while argument < arguments.length {
+        let from = derived[u64.toUsize(arguments[argument])]
+        if from != usize.MAX { List<bool>.set(&mut escaped, from, true) }
+        argument = argument + usize.ONE
+      }
+      edge = edge + usize.ONE
+    }
+    block = block + usize.ONE
+  }
+  // One variable per field of a promoted slot.
+  let mut firstVariable = run List<usize>.makeWithCapacity(slots)
+  let mut kinds = List<Kind>.make()
+  slot = usize.ZERO
+  while slot < slots {
+    run List<usize>.append(&mut firstVariable, List<Kind>.length(&kinds))
+    if !List<bool>.get(&escaped, slot) {
+      let listed = List<Field>.asSlice(&List<List<Field>>.asSlice(&fields)[slot])
+      let mut at = usize.ZERO
+      while at < listed.length {
+        run List<Kind>.append(&mut kinds, listed[at].kind)
+        at = at + usize.ONE
+      }
+    }
+    slot = slot + usize.ONE
+  }
+  let variables = List<Kind>.length(&kinds)
+  if variables == usize.ZERO { return () }
+  // The variable each access reaches, by instruction, and the stores' blocks per variable.
+  let instructions = function.instructionCount()
+  let mut reached = run List<usize>.makeWithCapacity(instructions)
+  run List<usize>.appendRepeated(&mut reached, usize.MAX, instructions)
+  let mut stored = run List<List<usize>>.makeWithCapacity(variables)
+  let mut variable = usize.ZERO
+  while variable < variables {
+    run List<List<usize>>.append(&mut stored, List<usize>.make())
+    variable = variable + usize.ONE
+  }
+  let mut removable = run List<bool>.makeWithCapacity(instructions)
+  run List<bool>.appendRepeated(&mut removable, false, instructions)
+  block = usize.ZERO
+  while block < blocks {
+    let listed = List<usize>.asSlice(&function.block(block).instructions)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      let instruction = listed[at]
+      let found = function.instruction(instruction)
+      let operands = function.operandsOf(instruction)
+      match found.operation {
+        Operation.SlotAddress {slot: of} => { if !List<bool>.get(&escaped, of) { List<bool>.set(&mut removable, instruction, true) } }
+        Operation.Offset {..} => {
+          let from = derived[u64.toUsize(operands[usize.ZERO])]
+          if from != usize.MAX && !List<bool>.get(&escaped, from) { List<bool>.set(&mut removable, instruction, true) }
+        }
+        Operation.Load {offset, ..} => {
+          let from = derived[u64.toUsize(operands[usize.ZERO])]
+          if from != usize.MAX && !List<bool>.get(&escaped, from) {
+            let field = fieldAt(List<Field>.asSlice(&List<List<Field>>.asSlice(&fields)[from]), u64.wrappingAdd(offsets[u64.toUsize(operands[usize.ZERO])], offset))
+            List<usize>.set(&mut reached, instruction, List<usize>.get(&firstVariable, from) + field)
+          }
+        }
+        Operation.Store {offset, ..} => {
+          let from = derived[u64.toUsize(operands[usize.ONE])]
+          if from != usize.MAX && !List<bool>.get(&escaped, from) {
+            let field = fieldAt(List<Field>.asSlice(&List<List<Field>>.asSlice(&fields)[from]), u64.wrappingAdd(offsets[u64.toUsize(operands[usize.ONE])], offset))
+            let target = List<usize>.get(&firstVariable, from) + field
+            List<usize>.set(&mut reached, instruction, target)
+            let blocksOf = &mut List<List<usize>>.asMutSlice(&mut stored)[target]
+            let length = List<usize>.length(&blocksOf.*)
+            if length == usize.ZERO || List<usize>.get(&blocksOf.*, length - usize.ONE) != block { run List<usize>.append(&mut blocksOf.*, block) }
+          }
+        }
+        _ => {}
+      }
+      at = at + usize.ONE
+    }
+    block = block + usize.ONE
+  }
+  // Block parameters on each variable's iterated dominance frontier.
+  let frontiers = run graph.frontiers()
+  let mut placedVariables = run List<List<usize>>.makeWithCapacity(blocks)
+  let mut placedParameters = run List<List<u64>>.makeWithCapacity(blocks)
+  block = usize.ZERO
+  while block < blocks {
+    run List<List<usize>>.append(&mut placedVariables, List<usize>.make())
+    run List<List<u64>>.append(&mut placedParameters, List<u64>.make())
+    block = block + usize.ONE
+  }
+  let mut placedFor = run List<usize>.makeWithCapacity(blocks)
+  run List<usize>.appendRepeated(&mut placedFor, usize.MAX, blocks)
+  let mut queuedFor = run List<usize>.makeWithCapacity(blocks)
+  run List<usize>.appendRepeated(&mut queuedFor, usize.MAX, blocks)
+  let mut work = List<usize>.make()
+  variable = usize.ZERO
+  while variable < variables {
+    let defining = List<usize>.asSlice(&List<List<usize>>.asSlice(&stored)[variable])
+    let mut at = usize.ZERO
+    while at < defining.length {
+      List<usize>.set(&mut queuedFor, defining[at], variable)
+      run List<usize>.append(&mut work, defining[at])
+      at = at + usize.ONE
+    }
+    let kind = List<Kind>.get(&kinds, variable)
+    while let Option<usize>.Some {value: from} = List<usize>.pop(&mut work) {
+      let frontier = List<usize>.asSlice(&List<List<usize>>.asSlice(&frontiers)[from])
+      let mut entry = usize.ZERO
+      while entry < frontier.length {
+        let joined = frontier[entry]
+        if List<usize>.get(&placedFor, joined) != variable {
+          List<usize>.set(&mut placedFor, joined, variable)
+          let parameter = run function.addParameter(joined, kind)
+          run List<usize>.append(&mut List<List<usize>>.asMutSlice(&mut placedVariables)[joined], variable)
+          run List<u64>.append(&mut List<List<u64>>.asMutSlice(&mut placedParameters)[joined], parameter)
+          if List<usize>.get(&queuedFor, joined) != variable {
+            List<usize>.set(&mut queuedFor, joined, variable)
+            run List<usize>.append(&mut work, joined)
+          }
+        }
+        entry = entry + usize.ONE
+      }
+    }
+    variable = variable + usize.ONE
+  }
+  // The renaming walk over the dominator tree, with an undo log of each block's definitions.
+  let mut current = run List<u64>.makeWithCapacity(variables)
+  run List<u64>.appendRepeated(&mut current, none(), variables)
+  let mut zeros = run List<u64>.makeWithCapacity(variables)
+  run List<u64>.appendRepeated(&mut zeros, none(), variables)
+  let mut substitution = run List<u64>.makeWithCapacity(function.valueCount())
+  run List<u64>.appendRepeated(&mut substitution, none(), function.valueCount())
+  let mut undoVariable = List<usize>.make()
+  let mut undoValue = List<u64>.make()
+  // Entries: a block to enter, or `usize.MAX - mark` to undo back to `mark` definitions.
+  let mut walk = List<usize>.make()
+  run List<usize>.append(&mut walk, usize.ZERO)
+  while let Option<usize>.Some {value: next} = List<usize>.pop(&mut walk) {
+    if next > blocks {
+      let mark = usize.MAX - next
+      while List<usize>.length(&undoVariable) > mark {
+        let undone = List<usize>.length(&undoVariable) - usize.ONE
+        List<u64>.set(&mut current, List<usize>.get(&undoVariable, undone), List<u64>.get(&undoValue, undone))
+        drop List<usize>.pop(&mut undoVariable)
+        drop List<u64>.pop(&mut undoValue)
+      }
+      continue
+    }
+    let entered = next
+    run List<usize>.append(&mut walk, usize.MAX - List<usize>.length(&undoVariable))
+    let placedHere = List<usize>.asSlice(&List<List<usize>>.asSlice(&placedVariables)[entered])
+    let parametersHere = List<u64>.asSlice(&List<List<u64>>.asSlice(&placedParameters)[entered])
+    let mut at = usize.ZERO
+    while at < placedHere.length {
+      run List<usize>.append(&mut undoVariable, placedHere[at])
+      run List<u64>.append(&mut undoValue, List<u64>.get(&current, placedHere[at]))
+      List<u64>.set(&mut current, placedHere[at], parametersHere[at])
+      at = at + usize.ONE
+    }
+    let count = List<usize>.length(&function.block(entered).instructions)
+    at = usize.ZERO
+    while at < count {
+      let instruction = List<usize>.get(&function.block(entered).instructions, at)
+      let target = List<usize>.get(&reached, instruction)
+      if target != usize.MAX {
+        let found = function.instruction(instruction)
+        if let Operation.Store {..} = found.operation {
+          let value = resolve(List<u64>.asSlice(&substitution), function.operandsOf(instruction)[usize.ZERO])
+          run List<usize>.append(&mut undoVariable, target)
+          run List<u64>.append(&mut undoValue, List<u64>.get(&current, target))
+          List<u64>.set(&mut current, target, value)
+        } else {
+          let value = run currentValue(&mut function.*, &mut current, &mut zeros, List<Kind>.asSlice(&kinds), target)
+          List<u64>.set(&mut substitution, u64.toUsize(found.result), value)
+        }
+        function.remove(instruction)
+      } else if List<bool>.get(&removable, instruction) {
+        function.remove(instruction)
+      }
+      at = at + usize.ONE
+    }
+    // Each edge passes the current values to its target's placed parameters.
+    let edgeCount = List<Edge>.length(&function.block(entered).edges)
+    let mut edge = usize.ZERO
+    while edge < edgeCount {
+      let target = List<Edge>.asSlice(&function.block(entered).edges)[edge].block
+      let wanted = List<usize>.length(&List<List<usize>>.asSlice(&placedVariables)[target])
+      let mut position = usize.ZERO
+      while position < wanted {
+        let of = List<usize>.get(&List<List<usize>>.asSlice(&placedVariables)[target], position)
+        let value = run currentValue(&mut function.*, &mut current, &mut zeros, List<Kind>.asSlice(&kinds), of)
+        run function.appendArgument(entered, edge, value)
+        position = position + usize.ONE
+      }
+      edge = edge + usize.ONE
+    }
+    let children = graph.childrenOf(entered)
+    let mut child = children.length
+    while child > usize.ZERO {
+      child = child - usize.ONE
+      run List<usize>.append(&mut walk, children[child])
+    }
+  }
+  function.substitute(&mut substitution)
+  function.sweep()
+  return run pruneParameters(&mut function.*)
+}
+
+// `value` after the loads already replaced: the end of its substitution chain.
+fn resolve(substitution: &[u64], value: u64) -> u64 {
+  let mut at = value
+  while at != none() && u64.toUsize(at) < substitution.length && substitution[u64.toUsize(at)] != none() { at = substitution[u64.toUsize(at)] }
+  return at
+}
+
+// The current value of `variable`, or the zero of its kind before any store.
+effect fn currentValue(function: &mut SsaFunction, current: &mut List<u64>, zeros: &mut List<u64>, kinds: &[Kind], variable: usize) -> u64
+! OutOfMemoryError ? &mut Allocator {
+  let value = List<u64>.get(&current.*, variable)
+  if value != none() { return value }
+  let zero = List<u64>.get(&zeros.*, variable)
+  if zero != none() { return zero }
+  let made = run function.constant(kinds[variable], 0)
+  List<u64>.set(&mut zeros.*, variable, made)
+  return made
+}
+
+/// Removes the block parameters of `function` that every edge passes one value for, apart from
+/// the parameter itself, replacing each with that value, then those whose value feeds no
+/// instruction, exit or other kept parameter.
+pub effect fn pruneParameters(function: &mut SsaFunction) -> () ! OutOfMemoryError ? &mut Allocator {
+  let graph = run SsaGraph.of(&function.*)
+  let blocks = function.blockCount()
+  // Trivial parameters, until none is left.
+  let mut changed = true
+  while changed {
+    changed = false
+    let mut substitution = run List<u64>.makeWithCapacity(function.valueCount())
+    run List<u64>.appendRepeated(&mut substitution, none(), function.valueCount())
+    let mut block = usize.ONE
+    while block < blocks {
+      let mut position = List<u64>.length(&function.block(block).parameters)
+      while position > usize.ZERO {
+        position = position - usize.ONE
+        let parameter = List<u64>.get(&function.block(block).parameters, position)
+        let only = onlyArgument(&function.*, &graph, block, position, parameter)
+        if only != none() {
+          List<u64>.set(&mut substitution, u64.toUsize(parameter), only)
+          function.substitute(&mut substitution)
+          List<u64>.set(&mut substitution, u64.toUsize(parameter), none())
+          function.removeParameter(block, position)
+          changed = true
+        }
+      }
+      block = block + usize.ONE
+    }
+  }
+  // Parameters that feed nothing, found by marking what instructions and exits use.
+  let values = function.valueCount()
+  let mut live = run List<bool>.makeWithCapacity(values)
+  run List<bool>.appendRepeated(&mut live, false, values)
+  let mut work = List<u64>.make()
+  let mut block = usize.ZERO
+  while block < blocks {
+    let found = function.block(block)
+    let listed = List<usize>.asSlice(&found.instructions)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      let operands = function.operandsOf(listed[at])
+      let mut operand = usize.ZERO
+      while operand < operands.length {
+        run markLive(&mut live, &mut work, operands[operand])
+        operand = operand + usize.ONE
+      }
+      at = at + usize.ONE
+    }
+    if found.value != none() { run markLive(&mut live, &mut work, found.value) }
+    block = block + usize.ONE
+  }
+  // A live parameter keeps the arguments every edge passes it.
+  while let Option<u64>.Some {value: kept} = List<u64>.pop(&mut work) {
+    let defined = function.value(kept)
+    if defined.definition != Definition.Parameter { continue }
+    let incoming = graph.predecessorsOf(defined.owner)
+    let mut at = usize.ZERO
+    while at < incoming.length {
+      let edges = List<Edge>.asSlice(&function.block(incoming[at]).edges)
+      let mut edge = usize.ZERO
+      while edge < edges.length {
+        if edges[edge].block == defined.owner {
+          run markLive(&mut live, &mut work, List<u64>.get(&edges[edge].arguments, defined.index))
+        }
+        edge = edge + usize.ONE
+      }
+      at = at + usize.ONE
+    }
+  }
+  block = usize.ONE
+  while block < blocks {
+    let mut position = List<u64>.length(&function.block(block).parameters)
+    while position > usize.ZERO {
+      position = position - usize.ONE
+      let parameter = List<u64>.get(&function.block(block).parameters, position)
+      if !List<bool>.get(&live, u64.toUsize(parameter)) { function.removeParameter(block, position) }
+    }
+    block = block + usize.ONE
+  }
+  return ()
+}
+
+effect fn markLive(live: &mut List<bool>, work: &mut List<u64>, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  if value == none() || u64.toUsize(value) >= List<bool>.length(&live.*) { return () }
+  if List<bool>.get(&live.*, u64.toUsize(value)) { return () }
+  List<bool>.set(&mut live.*, u64.toUsize(value), true)
+  return run List<u64>.append(&mut work.*, value)
+}
+
+// The one value every edge into `block` passes for its parameter `position`, other than the
+// parameter itself, or `none()` when the edges pass two.
+fn onlyArgument(function: &SsaFunction, graph: &SsaGraph, block: usize, position: usize, parameter: u64) -> u64 {
+  let mut only = none()
+  let incoming = graph.predecessorsOf(block)
+  let mut at = usize.ZERO
+  while at < incoming.length {
+    // A predecessor with two edges into the block is listed twice; each pass checks all of them.
+    let edges = List<Edge>.asSlice(&function.block(incoming[at]).edges)
+    let mut edge = usize.ZERO
+    while edge < edges.length {
+      if edges[edge].block == block {
+        let passed = List<u64>.get(&edges[edge].arguments, position)
+        if passed != parameter {
+          if only == none() { only = passed } else if only != passed { return none() }
+        }
+      }
+      edge = edge + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return only
+}

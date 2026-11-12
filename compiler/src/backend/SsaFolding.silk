@@ -1,0 +1,471 @@
+//! Constant folding and algebraic simplification of one SSA instruction: what a value numbering
+//! walk asks of each instruction before it looks for an equal one.
+//!
+//! # When to use
+//! Call [`simplify`] on an instruction whose operands are already the values they stand for. It
+//! answers the values its results equal, and may rewrite the instruction in place into a simpler
+//! one over the same operand count (`ZExt` of a `ZExt` reads the inner operand); it never removes
+//! or moves an instruction, which is the caller's to do.
+//!
+//! # Details
+//! Folding follows the semantics `SsaFunction` gives each operation, at the operand's width:
+//!
+//! - Integer constants up to 64 bits wide fold, wrapping at their width. A signed operation reads
+//!   its operands sign-extended from their width.
+//! - A division or remainder that would trap (a zero divisor, or the signed minimum divided by
+//!   -1) never folds, so the trap stays. A shift or rotation folds only for an amount below the
+//!   width, where every reading of "modulo the width" agrees.
+//! - Floats fold only where IEEE 754 leaves no choice: a negation of a negation and a bit
+//!   reinterpretation. `x + 0.0`, `x * 1.0`, `x - x` and a comparison of a float with itself are
+//!   left alone, for NaN and signed zero.
+//! - Identities (`x + 0`, `x * 1`, `x & x`, `x ^ x`, a shift by zero, a comparison of a value
+//!   with itself, a select of two equal values or on a constant, casts that cancel, offsets that
+//!   add up) hold for every width and for vectors element by element.
+//!
+//! Nothing here reads memory or depends on anything but the instruction and the constants and
+//! producers of its operands, so a fold is the same wherever the instruction stands.
+
+import backend.SsaFunction {
+  Binary,
+  Cast,
+  ConstantForm,
+  Count,
+  Extreme,
+  Kind,
+  Operation,
+  Predicate,
+  SsaFunction,
+  masked,
+  none,
+}
+import silk.collections.bytes {Bytes}
+import silk.core.ownership {Copy}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.i64
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+
+/// What an instruction's results equal: a value for each, or `none()` for a result that does not
+/// simplify.
+pub struct Folded {
+  pub value: u64,
+  pub second: u64,
+}
+
+impl Copy for Folded {}
+
+fn kept() -> Folded { return Folded {value: none(), second: none()} }
+
+fn to(value: u64) -> Folded { return Folded {value: value, second: none()} }
+
+// A constant result of an evaluation: whether there is one, and its bits.
+struct Evaluated {
+  valid: bool,
+  bits: u64,
+  overflow: bool,
+}
+
+impl Copy for Evaluated {}
+
+fn invalid() -> Evaluated { return Evaluated {valid: false, bits: 0, overflow: false} }
+
+fn valid(bits: u64) -> Evaluated { return Evaluated {valid: true, bits: bits, overflow: false} }
+
+/// The values the results of `instruction` of `function` equal, after rewriting it in place when
+/// a simpler instruction computes the same results.
+pub effect fn simplify(function: &mut SsaFunction, instruction: usize) -> Folded ! OutOfMemoryError ? &mut Allocator {
+  let found = function.instruction(instruction)
+  let a = operandAt(&function.*, instruction, usize.ZERO)
+  let b = operandAt(&function.*, instruction, usize.ONE)
+  let c = operandAt(&function.*, instruction, 2)
+  return match found.operation {
+    Operation.Binary {operation} => run binary(&mut function.*, found.kind, operation, a, b)
+    Operation.Negate => run negation(&mut function.*, a)
+    Operation.Compare {predicate} => run comparison(&mut function.*, found.kind, predicate, a, b)
+    Operation.Select => selection(&function.*, a, b, c)
+    Operation.Cast {operation} => run conversion(&mut function.*, instruction, found.kind, operation, a)
+    Operation.Offset {offset} => run offsetOf(&mut function.*, instruction, offset, a)
+    Operation.Overflow {operation, signed} => run overflowing(&mut function.*, found.kind, operation, signed, a, b)
+    Operation.Rotate {left} => run rotation(&mut function.*, found.kind, left, a, b)
+    Operation.Count {which} => run counting(&mut function.*, found.kind, which, a)
+    Operation.Extreme {which} => run extreme(&mut function.*, found.kind, which, a, b)
+    _ => kept()
+  }
+}
+
+fn operandAt(function: &SsaFunction, instruction: usize, at: usize) -> u64 {
+  let operands = function.operandsOf(instruction)
+  if at >= operands.length { return none() }
+  return operands[at]
+}
+
+// Whether `value` is a scalar integer or address constant of plain bits, at most 64 bits wide.
+fn small(function: &SsaFunction, value: u64) -> bool {
+  if !function.isBits(value) { return false }
+  let kind = function.kindOf(value)
+  return !kind.isVector() && !kind.isFloat() && kind.bits <= 64
+}
+
+fn bitsOf(function: &SsaFunction, value: u64) -> u64 { return masked(function.constantOf(value).low, function.kindOf(value).bits) }
+
+// Whether `value` is an integer constant whose every element is zero, one, or all ones.
+fn isZero(function: &SsaFunction, value: u64) -> bool {
+  if !function.isBits(value) || !function.kindOf(value).isInteger() { return false }
+  let constant = function.constantOf(value)
+  return constant.low == 0 && constant.high == 0
+}
+
+fn isOne(function: &SsaFunction, value: u64) -> bool {
+  if !function.isBits(value) || !function.kindOf(value).isInteger() { return false }
+  let constant = function.constantOf(value)
+  return constant.low == 1 && constant.high == 0
+}
+
+fn isAllOnes(function: &SsaFunction, value: u64) -> bool {
+  if !function.isBits(value) || !function.kindOf(value).isInteger() { return false }
+  let constant = function.constantOf(value)
+  let bits = function.kindOf(value).bits
+  if bits > 64 { return constant.low == u64.MAX && constant.high == u64.MAX }
+  return constant.low == masked(u64.MAX, bits)
+}
+
+/// `value`, the low `bits` bits of a two's complement integer, sign-extended to 64 bits.
+pub fn signExtended(value: u64, bits: usize) -> u64 {
+  if bits >= 64 || bits == usize.ZERO { return value }
+  let sign = u64.shiftLeft(1, usize.toU64(bits - usize.ONE))
+  if u64.bitAnd(value, sign) == 0 { return value }
+  return u64.bitOr(value, u64.bitNot(masked(u64.MAX, bits)))
+}
+
+// Whether `left` is below `right` read as signed 64-bit integers.
+fn signedBelow(left: u64, right: u64) -> bool {
+  let flip: u64 = 9223372036854775808
+  return u64.bitXor(left, flip) < u64.bitXor(right, flip)
+}
+
+// The signed minimum of a `bits`-wide integer, as its low `bits` bits.
+fn signedMinimum(bits: usize) -> u64 { return u64.shiftLeft(1, usize.toU64(bits - usize.ONE)) }
+
+// `left op right` of `bits`-wide integers, when it is defined and does not trap.
+fn evaluate(operation: Binary, left: u64, right: u64, bits: usize) -> Evaluated {
+  let width = usize.toU64(bits)
+  if operation == Binary.Add { return valid(masked(u64.wrappingAdd(left, right), bits)) }
+  if operation == Binary.Sub { return valid(masked(u64.wrappingSubtract(left, right), bits)) }
+  if operation == Binary.Mul { return valid(masked(u64.wrappingMultiply(left, right), bits)) }
+  if operation == Binary.And { return valid(u64.bitAnd(left, right)) }
+  if operation == Binary.Or { return valid(u64.bitOr(left, right)) }
+  if operation == Binary.Xor { return valid(u64.bitXor(left, right)) }
+  if operation == Binary.UDiv || operation == Binary.URem {
+    if right == 0 { return invalid() }
+    if operation == Binary.UDiv { return valid(u64.divide(left, right)) }
+    return valid(u64.remainder(left, right))
+  }
+  if operation == Binary.SDiv || operation == Binary.SRem {
+    if right == 0 { return invalid() }
+    if left == signedMinimum(bits) && right == masked(u64.MAX, bits) { return invalid() }
+    let dividend = u64.wrappingToI64(signExtended(left, bits))
+    let divisor = u64.wrappingToI64(signExtended(right, bits))
+    if operation == Binary.SDiv { return valid(masked(i64.wrappingToU64(i64.divide(dividend, divisor)), bits)) }
+    return valid(masked(i64.wrappingToU64(i64.remainder(dividend, divisor)), bits))
+  }
+  // A shift folds only below the width.
+  if right >= width { return invalid() }
+  if operation == Binary.Shl { return valid(masked(u64.shiftLeft(left, right), bits)) }
+  if operation == Binary.LShr { return valid(u64.shiftRight(left, right)) }
+  let extended = signExtended(left, bits)
+  if signedBelow(extended, 0) { return valid(masked(u64.bitNot(u64.shiftRight(u64.bitNot(extended), right)), bits)) }
+  return valid(u64.shiftRight(extended, right))
+}
+
+effect fn binary(function: &mut SsaFunction, kind: Kind, operation: Binary, left: u64, right: u64) -> Folded ! OutOfMemoryError ? &mut Allocator {
+  if !kind.isInteger() { return kept() }
+  if !kind.isVector() && kind.bits <= 64 && small(&function.*, left) && small(&function.*, right) {
+    let folded = evaluate(operation, bitsOf(&function.*, left), bitsOf(&function.*, right), kind.bits)
+    if folded.valid { return to(run function.constant(kind, folded.bits)) }
+    return kept()
+  }
+  if operation == Binary.Add {
+    if isZero(&function.*, right) { return to(left) }
+    if isZero(&function.*, left) { return to(right) }
+  } else if operation == Binary.Sub {
+    if isZero(&function.*, right) { return to(left) }
+    if left == right { return to(run function.constant(kind, 0)) }
+  } else if operation == Binary.Mul {
+    if isOne(&function.*, right) { return to(left) }
+    if isOne(&function.*, left) { return to(right) }
+    if isZero(&function.*, right) { return to(right) }
+    if isZero(&function.*, left) { return to(left) }
+  } else if operation == Binary.UDiv || operation == Binary.SDiv {
+    if isOne(&function.*, right) { return to(left) }
+  } else if operation == Binary.URem || operation == Binary.SRem {
+    if isOne(&function.*, right) { return to(run function.constant(kind, 0)) }
+  } else if operation == Binary.Shl || operation == Binary.LShr || operation == Binary.AShr {
+    if isZero(&function.*, right) || isZero(&function.*, left) { return to(left) }
+  } else if operation == Binary.And {
+    if isZero(&function.*, right) || isAllOnes(&function.*, left) { return to(right) }
+    if isZero(&function.*, left) || isAllOnes(&function.*, right) || left == right { return to(left) }
+  } else if operation == Binary.Or {
+    if isZero(&function.*, right) || isAllOnes(&function.*, left) || left == right { return to(left) }
+    if isZero(&function.*, left) || isAllOnes(&function.*, right) { return to(right) }
+  } else if operation == Binary.Xor {
+    if isZero(&function.*, right) { return to(left) }
+    if isZero(&function.*, left) { return to(right) }
+    if left == right { return to(run function.constant(kind, 0)) }
+  }
+  return kept()
+}
+
+// `-(-x)` is `x`: a negation flips the sign bit alone.
+effect fn negation(function: &mut SsaFunction, value: u64) -> Folded ! OutOfMemoryError ? &mut Allocator {
+  let producer = function.producerOf(value)
+  if producer == usize.MAX { return kept() }
+  if let Operation.Negate = function.instruction(producer).operation { return to(operandAt(&function.*, producer, usize.ZERO)) }
+  return kept()
+}
+
+/// Whether `predicate` holds between the `bits`-wide integers `left` and `right`; a float
+/// predicate answers false.
+pub fn holds(predicate: Predicate, left: u64, right: u64, bits: usize) -> bool {
+  let signedLeft = signExtended(left, bits)
+  let signedRight = signExtended(right, bits)
+  return match predicate {
+    Predicate.Eq => left == right
+    Predicate.Ne => left != right
+    Predicate.Ugt => left > right
+    Predicate.Uge => left >= right
+    Predicate.Ult => left < right
+    Predicate.Ule => left <= right
+    Predicate.Sgt => signedBelow(signedRight, signedLeft)
+    Predicate.Sge => !signedBelow(signedLeft, signedRight)
+    Predicate.Slt => signedBelow(signedLeft, signedRight)
+    Predicate.Sle => !signedBelow(signedRight, signedLeft)
+    _ => false
+  }
+}
+
+/// Whether `predicate` is an integer or address one, which the folding understands.
+pub fn isIntegerPredicate(predicate: Predicate) -> bool {
+  return match predicate {
+    Predicate.Eq => true
+    Predicate.Ne => true
+    Predicate.Ugt => true
+    Predicate.Uge => true
+    Predicate.Ult => true
+    Predicate.Ule => true
+    Predicate.Sgt => true
+    Predicate.Sge => true
+    Predicate.Slt => true
+    Predicate.Sle => true
+    _ => false
+  }
+}
+
+effect fn comparison(function: &mut SsaFunction, kind: Kind, predicate: Predicate, left: u64, right: u64) -> Folded ! OutOfMemoryError ? &mut Allocator {
+  if !isIntegerPredicate(predicate) || function.kindOf(left).isFloat() { return kept() }
+  if small(&function.*, left) && small(&function.*, right) {
+    let bits = function.kindOf(left).bits
+    if holds(predicate, bitsOf(&function.*, left), bitsOf(&function.*, right), bits) { return to(run function.constant(kind, 1)) }
+    return to(run function.constant(kind, 0))
+  }
+  if left == right {
+    // A value compared with itself: equal, and not below or above itself.
+    if predicate == Predicate.Eq || predicate == Predicate.Uge || predicate == Predicate.Ule || predicate == Predicate.Sge || predicate == Predicate.Sle {
+      return to(run function.constant(kind, 1))
+    }
+    return to(run function.constant(kind, 0))
+  }
+  // Nothing is unsigned below zero.
+  if function.kindOf(left).isInteger() {
+    if (predicate == Predicate.Ult && isZero(&function.*, right)) || (predicate == Predicate.Ugt && isZero(&function.*, left)) {
+      return to(run function.constant(kind, 0))
+    }
+    if (predicate == Predicate.Uge && isZero(&function.*, right)) || (predicate == Predicate.Ule && isZero(&function.*, left)) {
+      return to(run function.constant(kind, 1))
+    }
+  }
+  return kept()
+}
+
+fn selection(function: &SsaFunction, condition: u64, chosen: u64, otherwise: u64) -> Folded {
+  if chosen == otherwise { return to(chosen) }
+  if function.isBits(condition) {
+    let constant = function.constantOf(condition)
+    if constant.low != 0 { return to(chosen) }
+    return to(otherwise)
+  }
+  return kept()
+}
+
+effect fn conversion(function: &mut SsaFunction, instruction: usize, kind: Kind, operation: Cast, value: u64) -> Folded
+! OutOfMemoryError ? &mut Allocator {
+  let source = function.kindOf(value)
+  if source.equals(kind) && (operation == Cast.Bitcast || operation == Cast.ZExt || operation == Cast.SExt || operation == Cast.Trunc) { return to(value) }
+  if !source.isVector() && !kind.isVector() && function.isBits(value) && !source.isFloat() && source.bits <= 64 && kind.bits <= 64 {
+    let bits = bitsOf(&function.*, value)
+    if operation == Cast.Trunc || operation == Cast.ZExt || operation == Cast.IntToPtr || operation == Cast.PtrToInt {
+      if !kind.isFloat() { return to(run function.constant(kind, masked(bits, kind.bits))) }
+    }
+    if operation == Cast.SExt && !kind.isFloat() { return to(run function.constant(kind, masked(signExtended(bits, source.bits), kind.bits))) }
+    if operation == Cast.Bitcast {
+      if kind.isFloat() { return to(run function.exactConstant(kind, bits, 0)) }
+      return to(run function.constant(kind, bits))
+    }
+  }
+  if operation == Cast.Bitcast && function.isBits(value) && source.isFloat() && !source.isVector() && !kind.isVector() && kind.isInteger() {
+    let bits = masked(function.constantOf(value).low, kind.bits)
+    return to(run function.constant(kind, bits))
+  }
+  let producer = function.producerOf(value)
+  if producer == usize.MAX { return kept() }
+  let inner = match function.instruction(producer).operation {
+    Operation.Cast {operation: first} => first
+    _ => { return kept() }
+  }
+  let original = operandAt(&function.*, producer, usize.ZERO)
+  let originalKind = function.kindOf(original)
+  // Casts that cancel.
+  if originalKind.equals(kind) {
+    if operation == Cast.Trunc && (inner == Cast.ZExt || inner == Cast.SExt) { return to(original) }
+    if operation == Cast.Bitcast && inner == Cast.Bitcast { return to(original) }
+    if operation == Cast.PtrToInt && inner == Cast.IntToPtr && originalKind.bits == function.addressBits { return to(original) }
+    if operation == Cast.IntToPtr && inner == Cast.PtrToInt && function.kindOf(value).bits == function.addressBits { return to(original) }
+  }
+  // Extensions and truncations that compose into one.
+  let both = (operation == Cast.ZExt && inner == Cast.ZExt) || (operation == Cast.SExt && inner == Cast.SExt) || (operation == Cast.Trunc && inner == Cast.Trunc)
+  if both {
+    function.setOperand(instruction, usize.ZERO, original)
+    return kept()
+  }
+  if operation == Cast.SExt && inner == Cast.ZExt && originalKind.bits < function.kindOf(value).bits {
+    // The widened value's sign bit is clear, so sign extension extends with zeros.
+    function.setOperand(instruction, usize.ZERO, original)
+    function.setOperation(instruction, Operation.Cast {operation: Cast.ZExt})
+    return kept()
+  }
+  return kept()
+}
+
+effect fn offsetOf(function: &mut SsaFunction, instruction: usize, offset: u64, base: u64) -> Folded ! OutOfMemoryError ? &mut Allocator {
+  let bits = function.addressBits
+  let moved = masked(offset, bits)
+  if moved == 0 { return to(base) }
+  if function.isConstant(base) {
+    let constant = function.constantOf(base)
+    let added = masked(u64.wrappingAdd(constant.low, moved), bits)
+    if constant.form == ConstantForm.Bits {
+      let kind = function.kindOf(base)
+      return to(run function.constant(kind, added))
+    }
+    if constant.form == ConstantForm.Symbol || constant.form == ConstantForm.ThreadLocal {
+      let name = run Bytes.copy(function.symbolName(constant.symbol))
+      return to(run function.symbolAddress(Bytes.asSlice(&name), added, constant.form == ConstantForm.ThreadLocal))
+    }
+    return kept()
+  }
+  let producer = function.producerOf(base)
+  if producer == usize.MAX { return kept() }
+  if let Operation.Offset {offset: inner} = function.instruction(producer).operation {
+    let total = masked(u64.wrappingAdd(masked(inner, bits), moved), bits)
+    let original = operandAt(&function.*, producer, usize.ZERO)
+    if total == 0 { return to(original) }
+    function.setOperand(instruction, usize.ZERO, original)
+    function.setOperation(instruction, Operation.Offset {offset: total})
+  }
+  return kept()
+}
+
+effect fn overflowing(function: &mut SsaFunction, kind: Kind, operation: Binary, signed: bool, left: u64, right: u64) -> Folded
+! OutOfMemoryError ? &mut Allocator {
+  if !kind.isVector() && kind.bits <= 64 && small(&function.*, left) && small(&function.*, right) {
+    let folded = checked(operation, signed, bitsOf(&function.*, left), bitsOf(&function.*, right), kind.bits)
+    if !folded.valid { return kept() }
+    let value = run function.constant(kind, folded.bits)
+    let flag = run function.flag(folded.overflow)
+    return Folded {value: value, second: flag}
+  }
+  let mut same = none()
+  if operation == Binary.Add || operation == Binary.Sub {
+    if isZero(&function.*, right) { same = left }
+    if operation == Binary.Add && isZero(&function.*, left) { same = right }
+  } else if operation == Binary.Mul {
+    if isOne(&function.*, right) { same = left }
+    if isOne(&function.*, left) { same = right }
+    if isZero(&function.*, right) { same = right }
+    if isZero(&function.*, left) { same = left }
+  }
+  if same == none() { return kept() }
+  let clear = run function.constant(kind.flags(), 0)
+  return Folded {value: same, second: clear}
+}
+
+// `left op right` of `bits`-wide integers, wrapped, and whether the exact result does not fit.
+fn checked(operation: Binary, signed: bool, left: u64, right: u64, bits: usize) -> Evaluated {
+  let wrapped = evaluate(operation, left, right, bits)
+  if !wrapped.valid { return invalid() }
+  let mut overflow = false
+  if !signed {
+    if operation == Binary.Add { overflow = masked(u64.wrappingAdd(left, right), bits) < left }
+    else if operation == Binary.Sub { overflow = right > left }
+    else if operation == Binary.Mul {
+      overflow = u64.multiplyHigh(left, right) != 0 || masked(u64.wrappingMultiply(left, right), bits) != u64.wrappingMultiply(left, right)
+    } else { return invalid() }
+  } else {
+    let a = signExtended(left, bits)
+    let b = signExtended(right, bits)
+    let result = signExtended(wrapped.bits, bits)
+    if operation == Binary.Add {
+      // Operands of one sign whose wrapped sum has the other.
+      overflow = signedBelow(a, 0) == signedBelow(b, 0) && signedBelow(result, 0) != signedBelow(a, 0)
+    } else if operation == Binary.Sub {
+      overflow = signedBelow(a, 0) != signedBelow(b, 0) && signedBelow(result, 0) != signedBelow(a, 0)
+    } else if operation == Binary.Mul {
+      // Up to 32 bits the exact product fits in 64.
+      if bits > 32 { return invalid() }
+      let exact = u64.wrappingMultiply(a, b)
+      overflow = signExtended(masked(exact, bits), bits) != exact
+    } else { return invalid() }
+  }
+  return Evaluated {valid: true, bits: wrapped.bits, overflow: overflow}
+}
+
+effect fn rotation(function: &mut SsaFunction, kind: Kind, toLeft: bool, value: u64, amount: u64) -> Folded ! OutOfMemoryError ? &mut Allocator {
+  if isZero(&function.*, amount) || isZero(&function.*, value) || isAllOnes(&function.*, value) { return to(value) }
+  if small(&function.*, value) && small(&function.*, amount) && (kind.bits == 32 || kind.bits == 64) {
+    let bits = bitsOf(&function.*, value)
+    let count = bitsOf(&function.*, amount)
+    if count >= usize.toU64(kind.bits) { return kept() }
+    let width = usize.toU64(kind.bits)
+    let mut rotated = u64.bitOr(masked(u64.shiftLeft(bits, count), kind.bits), u64.shiftRight(bits, u64.wrappingSubtract(width, count) % width))
+    if !toLeft { rotated = u64.bitOr(u64.shiftRight(bits, count), masked(u64.shiftLeft(bits, u64.wrappingSubtract(width, count) % width), kind.bits)) }
+    return to(run function.constant(kind, rotated))
+  }
+  return kept()
+}
+
+effect fn counting(function: &mut SsaFunction, kind: Kind, which: Count, value: u64) -> Folded ! OutOfMemoryError ? &mut Allocator {
+  if !small(&function.*, value) { return kept() }
+  let bits = bitsOf(&function.*, value)
+  let width = usize.toU64(kind.bits)
+  let mut count: u64 = 0
+  if which == Count.Ones { count = u32.toU64(u64.countOnes(bits)) }
+  else if which == Count.LeadingZeros { count = u32.toU64(u64.leadingZeros(bits)) - (64 - width) }
+  else {
+    count = u32.toU64(u64.trailingZeros(bits))
+    if count > width { count = width }
+  }
+  return to(run function.constant(kind, count))
+}
+
+effect fn extreme(function: &mut SsaFunction, kind: Kind, which: Extreme, left: u64, right: u64) -> Folded ! OutOfMemoryError ? &mut Allocator {
+  if left == right { return to(left) }
+  if which == Extreme.FloatMinimum || which == Extreme.FloatMaximum { return kept() }
+  if !small(&function.*, left) || !small(&function.*, right) { return kept() }
+  let a = bitsOf(&function.*, left)
+  let b = bitsOf(&function.*, right)
+  let mut below = a < b
+  if which == Extreme.SignedMinimum || which == Extreme.SignedMaximum { below = signedBelow(signExtended(a, kind.bits), signExtended(b, kind.bits)) }
+  let wantsSmaller = which == Extreme.SignedMinimum || which == Extreme.UnsignedMinimum
+  if below == wantsSmaller { return to(left) }
+  return to(right)
+}

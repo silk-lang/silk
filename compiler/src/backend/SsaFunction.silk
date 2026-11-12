@@ -1,0 +1,1823 @@
+//! One function in the direct backends' target-neutral SSA form: typed values, basic blocks with
+//! parameters, and explicit memory, between MIR and a target's code.
+//!
+//! # When to use
+//! Build an [`SsaFunction`] with [`SsaFunction.make`], its arguments, blocks and instructions,
+//! then call [`SsaFunction.finish`] before any pass, printer, verifier or emitter reads it. A
+//! direct backend lowers MIR into one, `SsaPromotion` turns its stack slots into values, and a
+//! target's emitter (`WasmEmission`) turns it into code.
+//!
+//! # Details
+//! A value is a function argument, a block parameter, an instruction result or a constant, and
+//! is defined exactly once. Every value has a [`Kind`]: an integer of 1 to 128 bits, a float of
+//! 32 or 64 bits, an address as wide as the target's, or a vector of one of those. An aggregate is
+//! never a value: it lives in a stack slot or behind an address.
+//!
+//! A block lists its parameters, its instructions in order, and one exit: a jump, a branch, a
+//! switch, a return, a trap or an unreachable end. Each edge of an exit passes one argument per
+//! parameter of its target block, which is how a value joins at a merge instead of a phi.
+//!
+//! Memory is explicit. A stack slot is declared on the function with its size and alignment, and
+//! `SlotAddress` yields its address. A load or store names its kind, its alignment and a constant
+//! offset from its address operand.
+//!
+//! The IR is concrete for one target, as LLVM IR is: the lowering has already consumed the
+//! target's pointer width, layouts and C ABI. A few operations are specific to WebAssembly
+//! (`WasmGlobalGet`, `WasmMemoryGrow`, ...); only a wasm emitter accepts them.
+//!
+//! Numbers are positions in one function. Values, instructions, slots and symbols are numbered in
+//! the order the builder made them, and blocks in the order they were started, the entry first, so
+//! every number depends only on the function being lowered.
+//!
+//! The builder's variables (`variable`, `assign`) are stack slots marked as variables, read and
+//! written by loads and stores the builder emits at each use: `SsaPromotion.promote` turns them
+//! into values and block parameters.
+//!
+//! # Gotchas
+//! A function is not well formed until `finish` has closed every block, removed the blocks no path
+//! from the entry reaches and given the entry no predecessors. `SsaVerification.verify` checks a
+//! finished function.
+
+import CompilerBug
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.collections.slice {Slice}
+import silk.core.option {Option}
+import silk.core.ownership {Copy}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.u64
+import silk.num.usize
+
+/// The handle of no value: the result of an operation that yields nothing, such as a call that
+/// returns no value, or a missing optional operand.
+pub fn none() -> u64 { return u64.MAX }
+
+/// What sort of value a [`Kind`] describes.
+pub enum Form {
+  /// No value: the result kind of an operation or function that yields nothing.
+  Unit,
+  /// A two's complement integer `bits` wide, 1 to 128; signedness belongs to operations.
+  Integer,
+  /// An IEEE 754 binary float of 32 or 64 bits.
+  Float,
+  /// A memory address, as wide as the target's addresses.
+  Address,
+}
+
+/// The kind of a value: its form, its width in bits, and for a vector its element count.
+///
+/// # Details
+///
+/// A scalar has `elements` zero. A vector has `elements` above zero, each element of `form` and
+/// `bits`. In memory an `i1` is one byte holding 0 or 1, any other integer or float takes its
+/// width rounded up to bytes, and a vector of elements whose width is not a whole number of bytes
+/// is packed bits, element `i` at bit `i * bits`.
+pub struct Kind {
+  /// The form of the value or of each of its elements.
+  pub form: Form,
+  /// The width of the value or of each element in bits; zero for `Unit`.
+  pub bits: usize,
+  /// The element count of a vector, or zero for a scalar.
+  pub elements: usize,
+}
+
+impl Copy for Kind {}
+
+impl Kind {
+  /// The kind of no value.
+  pub fn unit() -> Kind { return Kind {form: Form.Unit, bits: usize.ZERO, elements: usize.ZERO} }
+
+  /// An integer `bits` wide.
+  pub fn integer(bits: usize) -> Kind { return Kind {form: Form.Integer, bits: bits, elements: usize.ZERO} }
+
+  /// A `bool`: an `i1`.
+  pub fn flag() -> Kind { return Kind.integer(usize.ONE) }
+
+  /// A float `bits` wide, 32 or 64.
+  pub fn float(bits: usize) -> Kind { return Kind {form: Form.Float, bits: bits, elements: usize.ZERO} }
+
+  /// An address `bits` wide, the target's address width.
+  pub fn address(bits: usize) -> Kind { return Kind {form: Form.Address, bits: bits, elements: usize.ZERO} }
+
+  /// A vector of `count` elements of the scalar kind `element`; a `count` of zero is `element`
+  /// itself.
+  pub fn vector(element: Kind, count: usize) -> Kind { return Kind {form: element.form, bits: element.bits, elements: count} }
+
+  /// The kind of one element of a vector, or a scalar kind itself.
+  pub fn element(self: Self) -> Kind { return Kind {form: self.form, bits: self.bits, elements: usize.ZERO} }
+
+  /// Whether the kind is `Unit`, no value.
+  pub fn isUnit(self: Self) -> bool { return self.form == Form.Unit }
+
+  /// Whether the value or each of its elements is an integer.
+  pub fn isInteger(self: Self) -> bool { return self.form == Form.Integer }
+
+  /// Whether the value or each of its elements is a float.
+  pub fn isFloat(self: Self) -> bool { return self.form == Form.Float }
+
+  /// Whether the value is an address, or a vector of them.
+  pub fn isAddress(self: Self) -> bool { return self.form == Form.Address }
+
+  /// Whether the value is a vector.
+  pub fn isVector(self: Self) -> bool { return self.elements != usize.ZERO }
+
+  /// The element count: a vector's elements, or one for a scalar.
+  pub fn count(self: Self) -> usize {
+    if self.elements == usize.ZERO { return usize.ONE }
+    return self.elements
+  }
+
+  /// Whether two kinds are the same.
+  pub fn equals(self: Self, other: Kind) -> bool {
+    return self.form == other.form && self.bits == other.bits && self.elements == other.elements
+  }
+
+  /// The kind of a comparison of values of this kind: a flag, or a vector of flags of the same
+  /// element count.
+  pub fn flags(self: Self) -> Kind { return Kind.vector(Kind.flag(), self.elements) }
+
+  /// The bytes one element occupies in memory: one for a `bool` or any width up to 8 bits, else
+  /// the width rounded up to bytes.
+  pub fn elementBytes(self: Self) -> usize {
+    if self.bits <= 8 { return usize.ONE }
+    return (self.bits + 7) / 8
+  }
+
+  /// The bytes a load or store of the whole value reads or writes; zero for `Unit`. A vector of
+  /// elements whose width is not a whole number of bytes is packed bits.
+  pub fn storeSize(self: Self) -> usize {
+    if self.form == Form.Unit { return usize.ZERO }
+    if self.elements == usize.ZERO { return self.elementBytes() }
+    if self.bits % 8 != usize.ZERO { return (self.elements * self.bits + 7) / 8 }
+    return self.elements * self.elementBytes()
+  }
+}
+
+/// A binary arithmetic or bitwise operation, element by element.
+///
+/// # Details
+///
+/// On integers, `UDiv`, `SDiv`, `URem` and `SRem` trap on a zero divisor, and the signed ones on
+/// the signed minimum divided by -1; a shift amount is taken modulo the width. On floats `Add`,
+/// `Sub` and `Mul` are IEEE 754's, `UDiv` and `SDiv` divide, and `URem` and `SRem` are C's `fmod`.
+pub enum Binary { Add, Sub, Mul, UDiv, SDiv, URem, SRem, Shl, LShr, AShr, And, Or, Xor }
+
+/// A comparison predicate: integer and address equality and unsigned and signed orders, and
+/// floats' ordered (`O`) and unordered (`U`, and `Ugtf` to `Ulef` for the orders) ones.
+pub enum Predicate { Eq, Ne, Ugt, Uge, Ult, Ule, Sgt, Sge, Slt, Sle, Oeq, One, Ogt, Oge, Olt, Ole, Ord, Ueq, Une, Ugtf, Ugef, Ultf, Ulef, Uno }
+
+/// A conversion, element by element.
+///
+/// # Details
+///
+/// `Trunc`, `ZExt` and `SExt` change an integer's width; `FPToSI` and `FPToUI` convert a float to
+/// an integer, saturating at the integer's range with NaN as zero; `SIToFP` and `UIToFP` convert
+/// an integer to the nearest float; `FPTrunc` and `FPExt` change a float's width; `Bitcast`
+/// reinterprets the bits of a value of the same store size; `IntToPtr` and `PtrToInt` convert
+/// between an integer and an address, truncating or zero-extending.
+pub enum Cast { Trunc, ZExt, SExt, FPToSI, FPToUI, SIToFP, UIToFP, FPTrunc, FPExt, Bitcast, IntToPtr, PtrToInt }
+
+/// A bit count: set bits, or zeros above the highest or below the lowest set bit; a zero's count
+/// is its width.
+pub enum Count { Ones, LeadingZeros, TrailingZeros }
+
+/// The smaller or larger of two values. A float's are IEEE 754 minimum and maximum: NaN
+/// propagates, and -0 is below +0.
+pub enum Extreme { SignedMinimum, SignedMaximum, UnsignedMinimum, UnsignedMaximum, FloatMinimum, FloatMaximum }
+
+/// A fold of a vector's elements in order.
+pub enum Reduction { Add, Mul, And, Or, Xor, SignedMinimum, SignedMaximum, UnsignedMinimum, UnsignedMaximum, FloatAdd, FloatMul, FloatMinimum, FloatMaximum }
+
+/// The operation of an atomic read-modify-write.
+pub enum Modify { Exchange, Add, Sub, And, Or, Xor, SignedMinimum, SignedMaximum, UnsignedMinimum, UnsignedMaximum }
+
+/// What one instruction does. Its operands are the instruction's operand list, in the order each
+/// variant states; its result kinds follow from its `Instruction.kind`.
+pub union Operation {
+  /// `left op right`, both of the result kind: integers, floats, or vectors of them.
+  Binary {pub operation: Binary},
+  /// `-value` of a float or float vector.
+  Negate,
+  /// `left predicate right`: a flag, or a vector of flags, of two operands of one kind.
+  Compare {pub predicate: Predicate},
+  /// `condition ? chosen : otherwise`; a vector condition selects element by element.
+  Select,
+  /// The operand converted to the result kind.
+  Cast {pub operation: Cast},
+  /// The value of the result kind stored `offset` bytes past the address operand, which is aligned
+  /// to `alignment` bytes there.
+  Load {pub offset: u64, pub alignment: usize},
+  /// Stores the value operand `offset` bytes past the address operand: operands value, address.
+  Store {pub offset: u64, pub alignment: usize},
+  /// The address `offset` bytes past the address operand.
+  Offset {pub offset: u64},
+  /// The address an integer operand's bytes past an address: operands address, index.
+  Index,
+  /// Copies `size` bytes from the second address operand to the first; they may overlap.
+  CopyBytes {pub size: u64},
+  /// Sets `size` bytes at the address operand to `byte`.
+  Fill {pub byte: u8, pub size: u64},
+  /// The address of stack slot `slot`.
+  SlotAddress {pub slot: usize},
+  /// The address of the running function's frame, which every call it makes lies below; it can
+  /// reach every stack slot.
+  FrameAddress,
+  /// The address of an integer operand's bytes of fresh stack, aligned to `alignment` and at least
+  /// 16, which the function's return gives back.
+  DynamicSlot {pub alignment: u64},
+  /// Calls function `symbol` with the operands. A C variadic call passes its first `fixed`
+  /// operands as fixed arguments and the rest as its variadic tail; `fixed` is `usize.MAX` for an
+  /// ordinary call.
+  Call {pub symbol: usize, pub fixed: usize},
+  /// Calls the function at the first operand's address with the rest. Its signature is the kinds
+  /// of those operands and the result kind.
+  CallIndirect,
+  /// `left op right`, `Add`, `Sub` or `Mul`, wrapped, and whether the exact result does not fit
+  /// the type, signed or unsigned: two results, the value and a flag or flag vector.
+  Overflow {pub operation: Binary, pub signed: bool},
+  /// `left op right`, `Add` or `Sub`, clamped to the type's signed or unsigned range.
+  Saturate {pub operation: Binary, pub signed: bool},
+  /// The first operand rotated left, or right, by the second modulo its width.
+  Rotate {pub left: bool},
+  /// The bits of the operand `which` counts.
+  Count {pub which: Count},
+  /// The smaller or larger of the two operands.
+  Extreme {pub which: Extreme},
+  /// `left * right + addend` rounded once, as C's `fma`.
+  FusedMultiplyAdd,
+  /// The square root of a float.
+  SquareRoot,
+  /// The elements of a vector folded by `which`; a second operand, when present, starts a float
+  /// sum or product.
+  Reduce {pub which: Reduction},
+  /// The vector of the first vector's elements followed by the second's, picked by the `count`
+  /// mask entries at `start` in the function's immediates: each result element is the one its
+  /// entry numbers, or zero for `u64.MAX`.
+  Shuffle {pub start: usize, pub count: usize},
+  /// Element `index` of a vector: operands vector, index; an index out of range gives zero.
+  Extract,
+  /// A vector with element `index` replaced: operands vector, element, index.
+  Insert,
+  /// A vector of `count` copies of the scalar operand.
+  Splat {pub count: usize},
+  /// An atomic load of the integer result kind at the address operand.
+  AtomicLoad,
+  /// An atomic store: operands value, address.
+  AtomicStore,
+  /// Applies `which` with the value to the integer at the address atomically and answers the old
+  /// value: operands address, value.
+  AtomicModify {pub which: Modify},
+  /// Replaces the integer at the address by the replacement when it holds the expected value,
+  /// atomically: operands address, expected, replacement. Two results: the old value and whether
+  /// it was replaced.
+  CompareExchange,
+  /// A sequentially consistent fence.
+  Fence,
+  /// WebAssembly only: the value of global `index` (0 `__stack_pointer`, 1 `__tls_base`).
+  WasmGlobalGet {pub index: usize},
+  /// WebAssembly only: sets global `index` to the operand.
+  WasmGlobalSet {pub index: usize},
+  /// WebAssembly only: the memory's size in pages, an address-sized integer.
+  WasmMemorySize,
+  /// WebAssembly only: grows the memory by the operand's pages; the old size, or all ones.
+  WasmMemoryGrow,
+  /// WebAssembly only: `memory.atomic.wait32(address, expected, timeout)`.
+  WasmWait,
+  /// WebAssembly only: `memory.atomic.notify(address, count)`.
+  WasmNotify,
+}
+
+impl Copy for Operation {}
+
+impl Operation {
+  /// Whether running the operation can change memory, a global or the stack, or otherwise be
+  /// observed beyond its results, so a pass may not delete it when its results are unused nor
+  /// move it across another such operation.
+  pub fn hasSideEffects(self: Self) -> bool {
+    return match self {
+      Operation.Store {..} => true
+      Operation.CopyBytes {..} => true
+      Operation.Fill {..} => true
+      Operation.DynamicSlot {..} => true
+      Operation.Call {..} => true
+      Operation.CallIndirect => true
+      Operation.AtomicLoad => true
+      Operation.AtomicStore => true
+      Operation.AtomicModify {..} => true
+      Operation.CompareExchange => true
+      Operation.Fence => true
+      Operation.WasmGlobalSet {..} => true
+      Operation.WasmMemoryGrow => true
+      Operation.WasmWait => true
+      Operation.WasmNotify => true
+      _ => false
+    }
+  }
+
+  /// Whether the operation reads state another operation can change: memory, a global or the
+  /// memory's size. Such an operation may not move across one with side effects.
+  pub fn readsState(self: Self) -> bool {
+    return match self {
+      Operation.Load {..} => true
+      Operation.WasmGlobalGet {..} => true
+      Operation.WasmMemorySize => true
+      _ => self.hasSideEffects()
+    }
+  }
+
+  /// Whether the operation can trap: a memory access out of bounds, an integer division by zero
+  /// or of the signed minimum by -1, or a call. `onIntegers` says whether the operands are
+  /// integers, which decides a division's.
+  pub fn canTrap(self: Self, onIntegers: bool) -> bool {
+    return match self {
+      Operation.Binary {operation} => onIntegers && (operation == Binary.UDiv || operation == Binary.SDiv
+        || operation == Binary.URem || operation == Binary.SRem)
+      Operation.Load {..} => true
+      Operation.Store {..} => true
+      Operation.CopyBytes {..} => true
+      Operation.Fill {..} => true
+      Operation.Call {..} => true
+      Operation.CallIndirect => true
+      Operation.AtomicLoad => true
+      Operation.AtomicStore => true
+      Operation.AtomicModify {..} => true
+      Operation.CompareExchange => true
+      Operation.WasmWait => true
+      Operation.WasmNotify => true
+      _ => false
+    }
+  }
+
+  /// Whether the operation depends on nothing but its operands and changes nothing: no side
+  /// effects and no state read, so two of them over the same operands yield the same results.
+  /// A pure operation can still trap (`canTrap`).
+  pub fn isPure(self: Self) -> bool { return !self.readsState() }
+
+  /// How many results the operation yields when its first result's kind is `kind`: none for a
+  /// unit kind, two for `Overflow` and `CompareExchange`, one otherwise.
+  pub fn resultCount(self: Self, kind: Kind) -> usize {
+    if kind.isUnit() { return usize.ZERO }
+    return match self {
+      Operation.Overflow {..} => 2
+      Operation.CompareExchange => 2
+      _ => usize.ONE
+    }
+  }
+}
+
+/// Where a value comes from.
+pub enum Definition {
+  /// A function argument: `Value.owner` is its position.
+  Argument,
+  /// A block parameter: `Value.owner` is the block, `Value.index` its position.
+  Parameter,
+  /// An instruction result: `Value.owner` is the instruction, `Value.index` which result.
+  Result,
+  /// A constant: `Value.owner` is its position in the function's constants.
+  Constant,
+  /// A builder variable, never an operand of a finished function: `Value.owner` is its slot.
+  Variable,
+}
+
+/// One value: its kind and its definition.
+pub struct Value {
+  pub kind: Kind,
+  pub definition: Definition,
+  pub owner: usize,
+  pub index: usize,
+}
+
+impl Copy for Value {}
+
+/// What a constant holds.
+pub enum ConstantForm {
+  /// Its bits: `Constant.low`, and an `i128`'s high 64 bits in `Constant.high`. A float's bits are
+  /// its own width's, and every element of a vector constant holds them.
+  Bits,
+  /// The address of `Constant.symbol` plus the addend `Constant.low`, which the link fills in.
+  Symbol,
+  /// The address of this thread's copy of the thread-local object `Constant.symbol`, plus the
+  /// addend `Constant.low`; in a program whose threads do not share memory, the object's own.
+  ThreadLocal,
+  /// A 32-bit value the link knows only once it lays out the program, such as the thread-local
+  /// block's size: what it gives `Constant.symbol`.
+  Link,
+}
+
+/// One constant value's content. A constant is defined at function entry and dominates every
+/// block.
+pub struct Constant {
+  pub form: ConstantForm,
+  pub low: u64,
+  pub high: u64,
+  /// The position of a symbol in the function's symbols, for every form but `Bits`.
+  pub symbol: usize,
+}
+
+impl Copy for Constant {}
+
+/// One instruction: its operation, its first result's kind, its operands and results, and the
+/// source place its code comes from.
+pub struct Instruction {
+  pub operation: Operation,
+  /// The kind of its first result, or `Kind.unit()` when it yields none. A store's or a call's
+  /// is what it yields, not what it reads.
+  pub kind: Kind,
+  /// Its operands are `operandCount` entries from `operandStart` in the function's operand pool.
+  pub operandStart: usize,
+  pub operandCount: usize,
+  /// Its first result, `none()` without one; a second result is the next value.
+  pub result: u64,
+  /// The block it lies in.
+  pub block: usize,
+  /// The source place, `line << 24 | column`, or zero for none.
+  pub place: u64,
+  /// Whether a pass removed it; `SsaFunction.sweep` drops it from its block.
+  pub removed: bool,
+}
+
+impl Copy for Instruction {}
+
+/// How a block ends.
+pub enum Exit {
+  /// Not ended yet: only while the builder fills the block.
+  Open,
+  /// A jump along edge 0.
+  Jump,
+  /// Along edge 0 when the flag `Block.value` holds, else along edge 1.
+  Branch,
+  /// Along the edge of the first case whose bits the integer `Block.value` equals, case `i`
+  /// taking edge `i + 1`, else along edge 0.
+  Switch,
+  /// Returns `Block.value`, or nothing when it is `none()`.
+  Return,
+  /// Stops the program.
+  Trap,
+  /// Never reached: the end of a block that no execution leaves, such as one after a call that
+  /// never returns.
+  Unreachable,
+}
+
+/// One edge of a block's exit: its target and one argument per parameter of the target.
+pub struct Edge {
+  pub block: usize,
+  pub arguments: List<u64>,
+}
+
+/// One basic block.
+pub struct Block {
+  /// Its parameters, which each edge into it binds.
+  pub parameters: List<u64>,
+  /// Its instructions, by position in the function's instructions, in order.
+  pub instructions: List<usize>,
+  pub exit: Exit,
+  /// A branch's condition, a switch's value or a return's value; `none()` otherwise.
+  pub value: u64,
+  /// The exit's edges: a jump's target, a branch's two, or a switch's default then its cases'.
+  pub edges: List<Edge>,
+  /// A switch's case bits, one per case edge.
+  pub cases: List<u64>,
+  /// The source place of its exit, and the one its code starts at.
+  pub place: u64,
+  pub startPlace: u64,
+  /// Whether the builder started it, and when: its position among the blocks started.
+  started: bool,
+  order: usize,
+}
+
+/// One stack slot: `size` bytes aligned to `alignment`, live for the whole call. A `variable` slot
+/// holds a builder variable.
+pub struct Slot {
+  pub size: u64,
+  pub alignment: u64,
+  pub variable: bool,
+}
+
+impl Copy for Slot {}
+
+/// The two results of an `Overflow` or a `CompareExchange`: the value, and the overflow flag or
+/// whether the exchange happened.
+pub struct Checked {
+  pub value: u64,
+  pub overflow: u64,
+}
+
+impl Copy for Checked {}
+
+/// The bits of the `float` nearest below the `double` whose bits are `double`, as a conversion of
+/// a constant truncates them.
+pub fn singleBits(double: u64) -> u64 {
+  let sign = u64.shiftLeft(u64.shiftRight(double, 63), 31)
+  let exponent = u64.bitAnd(u64.shiftRight(double, 52), 2047)
+  let mantissa = u64.bitAnd(double, 4503599627370495)
+  if exponent == 2047 {
+    let mut kept = u64.shiftRight(mantissa, 29)
+    if mantissa != 0 && kept == 0 { kept = 1 }
+    return u64.bitOr(sign, u64.bitOr(2139095040, kept))
+  }
+  if exponent == 0 { return sign }
+  if exponent > 896 {
+    return u64.bitOr(sign, u64.bitOr(u64.shiftLeft(exponent - 896, 23), u64.shiftRight(mantissa, 29)))
+  }
+  // A subnormal single.
+  let shift = 29 + (897 - exponent)
+  if shift >= 64 { return sign }
+  return u64.bitOr(sign, u64.shiftRight(u64.bitOr(mantissa, 4503599627370496), shift))
+}
+
+/// `value`'s low `bits` bits.
+pub fn masked(value: u64, bits: usize) -> u64 {
+  if bits >= 64 { return value }
+  return value & (u64.shiftLeft(1, usize.toU64(bits)) - 1)
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn emptyBlock() -> Block {
+  return Block {parameters: List<u64>.make(), instructions: List<usize>.make(), exit: Exit.Open, value: none(), edges: List<Edge>.make(),
+    cases: List<u64>.make(), place: 0, startPlace: 0, started: false, order: usize.ZERO}
+}
+
+/// One function in SSA form, and the state of the builder that makes it.
+///
+/// # Details
+///
+/// Its arguments, values, instructions, blocks, slots and symbols are numbered by position. The
+/// entry is block 0 once `finish` ran. The builder appends each instruction to the block it is
+/// filling and records the source place `locate` last set.
+pub struct SsaFunction {
+  /// The symbol the function defines.
+  pub symbol: Bytes,
+  /// The target's address width in bits, 32 or 64.
+  pub addressBits: usize,
+  /// The argument values, in order.
+  pub arguments: List<u64>,
+  /// What the function returns: `Kind.unit()` for nothing.
+  pub result: Kind,
+  values: List<Value>,
+  constants: List<Constant>,
+  instructions: List<Instruction>,
+  operands: List<u64>,
+  immediates: List<u64>,
+  blocks: List<Block>,
+  slots: List<Slot>,
+  symbols: List<Bytes>,
+  /// The block the builder fills, or `usize.MAX`, and how many blocks it started.
+  current: usize,
+  startedCount: usize,
+  /// The source place of what the builder makes next.
+  place: u64,
+}
+
+impl SsaFunction {
+  /// An empty function defining `symbol` for a target whose addresses are `addressBits` wide.
+  pub effect fn make(symbol: &[u8], addressBits: usize) -> SsaFunction ! OutOfMemoryError ? &mut Allocator {
+    return SsaFunction {symbol: run Bytes.copy(symbol), addressBits: addressBits, arguments: List<u64>.make(), result: Kind.unit(),
+      values: List<Value>.make(), constants: List<Constant>.make(), instructions: List<Instruction>.make(), operands: List<u64>.make(),
+      immediates: List<u64>.make(), blocks: List<Block>.make(), slots: List<Slot>.make(), symbols: List<Bytes>.make(),
+      current: usize.MAX, startedCount: usize.ZERO, place: 0}
+  }
+
+  // Queries.
+
+  /// The symbol the function defines.
+  pub fn name(self: &Self) -> &[u8] { return Bytes.asSlice(&self.symbol) }
+
+  /// The kind of an address on the function's target.
+  pub fn addressKind(self: &Self) -> Kind { return Kind.address(self.addressBits) }
+
+  /// How many values the function numbers, including those of removed instructions.
+  pub fn valueCount(self: &Self) -> usize { return List<Value>.length(&self.values) }
+
+  /// Value `value`'s kind and definition.
+  pub fn value(self: &Self, value: u64) -> Value { return List<Value>.get(&self.values, u64.toUsize(value)) }
+
+  /// The kind of `value`, or `Kind.unit()` for `none()`.
+  pub fn kindOf(self: &Self, value: u64) -> Kind {
+    if value == none() { return Kind.unit() }
+    return List<Value>.get(&self.values, u64.toUsize(value)).kind
+  }
+
+  /// Whether `value` is a constant.
+  pub fn isConstant(self: &Self, value: u64) -> bool {
+    if value == none() { return false }
+    return List<Value>.get(&self.values, u64.toUsize(value)).definition == Definition.Constant
+  }
+
+  /// Whether `value` is a constant of plain bits, and so `constantOf(value).low` its bits.
+  pub fn isBits(self: &Self, value: u64) -> bool {
+    if !self.isConstant(value) { return false }
+    return self.constantOf(value).form == ConstantForm.Bits
+  }
+
+  /// The content of the constant `value`.
+  pub fn constantOf(self: &Self, value: u64) -> Constant {
+    return List<Constant>.get(&self.constants, List<Value>.get(&self.values, u64.toUsize(value)).owner)
+  }
+
+  /// How many instructions the function numbers, including removed ones.
+  pub fn instructionCount(self: &Self) -> usize { return List<Instruction>.length(&self.instructions) }
+
+  /// Instruction `instruction`.
+  pub fn instruction(self: &Self, instruction: usize) -> Instruction { return List<Instruction>.get(&self.instructions, instruction) }
+
+  /// The operands of `instruction`, in its operation's order.
+  pub fn operandsOf(self: &Self, instruction: usize) -> &[u64] {
+    let found = List<Instruction>.get(&self.instructions, instruction)
+    let all = List<u64>.asSlice(&self.operands)
+    return Slice.view<u64>(all, found.operandStart, found.operandCount)
+  }
+
+  /// The second result of `instruction`, which yields two.
+  pub fn secondResult(self: &Self, instruction: usize) -> u64 {
+    return List<Instruction>.get(&self.instructions, instruction).result + 1
+  }
+
+  /// The `count` immediates at `start`, such as a shuffle's mask.
+  pub fn immediatesAt(self: &Self, start: usize, count: usize) -> &[u64] {
+    return Slice.view<u64>(List<u64>.asSlice(&self.immediates), start, count)
+  }
+
+  /// How many blocks the function has.
+  pub fn blockCount(self: &Self) -> usize { return List<Block>.length(&self.blocks) }
+
+  /// Block `block`.
+  pub fn block(self: &Self, block: usize) -> &Block { return &List<Block>.asSlice(&self.blocks)[block] }
+
+  /// How many stack slots the function declares.
+  pub fn slotCount(self: &Self) -> usize { return List<Slot>.length(&self.slots) }
+
+  /// Stack slot `slot`.
+  pub fn slot(self: &Self, slot: usize) -> Slot { return List<Slot>.get(&self.slots, slot) }
+
+  /// How many symbols the function names.
+  pub fn symbolCount(self: &Self) -> usize { return List<Bytes>.length(&self.symbols) }
+
+  /// The name of symbol `symbol`.
+  pub fn symbolName(self: &Self, symbol: usize) -> &[u8] { return Bytes.asSlice(&List<Bytes>.asSlice(&self.symbols)[symbol]) }
+
+  // Numbering.
+
+  effect fn addValue(self: &mut Self, kind: Kind, definition: Definition, owner: usize, index: usize) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let number = List<Value>.length(&self.values)
+    run List<Value>.append(&mut self.values, Value {kind: kind, definition: definition, owner: owner, index: index})
+    return usize.toU64(number)
+  }
+
+  /// The position of symbol `name` in the function's symbols, adding it on first use.
+  pub effect fn symbolIndex(self: &mut Self, name: &[u8]) -> usize ! OutOfMemoryError ? &mut Allocator {
+    let listed = List<Bytes>.asSlice(&self.symbols)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      if same(Bytes.asSlice(&listed[at]), name) { return at }
+      at = at + usize.ONE
+    }
+    let index = listed.length
+    run List<Bytes>.append(&mut self.symbols, run Bytes.copy(name))
+    return index
+  }
+
+  // Arguments and the result.
+
+  /// Adds an argument of `kind` after the others; answers its value, or `none()` for a unit kind,
+  /// which takes no argument.
+  pub effect fn argument(self: &mut Self, kind: Kind) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    if kind.isUnit() { return none() }
+    let position = List<u64>.length(&self.arguments)
+    let made = run self.addValue(kind, Definition.Argument, position, usize.ZERO)
+    run List<u64>.append(&mut self.arguments, made)
+    return made
+  }
+
+  /// Sets what the function returns; `Kind.unit()` returns nothing.
+  pub fn setResult(self: &mut Self, kind: Kind) -> () {
+    self.result = kind
+    return ()
+  }
+
+  // Constants.
+
+  effect fn addConstant(self: &mut Self, kind: Kind, constant: Constant) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let position = List<Constant>.length(&self.constants)
+    run List<Constant>.append(&mut self.constants, constant)
+    return run self.addValue(kind, Definition.Constant, position, usize.ZERO)
+  }
+
+  /// The constant `bits` of `kind`, every element `bits` for a vector, or `none()` for a unit
+  /// kind. An integer keeps its low `bits` bits, and an `i128`'s high 64 bits are the sign of
+  /// `bits`. A float's `bits` are binary64 and narrow to a `float`'s.
+  pub effect fn constant(self: &mut Self, kind: Kind, bits: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    if kind.isUnit() { return none() }
+    let mut low = bits
+    let mut high: u64 = 0
+    if kind.isFloat() {
+      if kind.bits == 32 { low = singleBits(bits) }
+    } else if kind.bits > 64 {
+      if (bits & 9223372036854775808) != 0 { high = u64.MAX }
+    } else {
+      low = masked(bits, kind.bits)
+    }
+    return run self.addConstant(kind, Constant {form: ConstantForm.Bits, low: low, high: high, symbol: usize.ZERO})
+  }
+
+  /// The constant whose bits are `low` and `high` of `kind`, exactly: an `i128`'s low and high 64
+  /// bits, or a float's own bits in `low`.
+  pub effect fn exactConstant(self: &mut Self, kind: Kind, low: u64, high: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    return run self.addConstant(kind, Constant {form: ConstantForm.Bits, low: low, high: high, symbol: usize.ZERO})
+  }
+
+  /// The `i128` constant whose low and high 64 bits are `low` and `high`.
+  pub effect fn wideConstant(self: &mut Self, low: u64, high: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    return run self.exactConstant(Kind.integer(128), low, high)
+  }
+
+  /// The integer constant `value`, `bits` wide.
+  pub effect fn integer(self: &mut Self, bits: usize, value: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    return run self.constant(Kind.integer(bits), value)
+  }
+
+  /// The integer constant `value`, as wide as an address.
+  pub effect fn word(self: &mut Self, value: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let bits = self.addressBits
+    return run self.constant(Kind.integer(bits), value)
+  }
+
+  /// The null address.
+  pub effect fn null(self: &mut Self) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let bits = self.addressBits
+    return run self.constant(Kind.address(bits), 0)
+  }
+
+  /// The `bool` constant `value`.
+  pub effect fn flag(self: &mut Self, value: bool) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    if value { return run self.constant(Kind.flag(), 1) }
+    return run self.constant(Kind.flag(), 0)
+  }
+
+  /// The address of the object or function `symbol` plus `addend`: a function's address is its
+  /// table slot. With `local`, the address of this thread's copy of the thread-local object
+  /// `symbol`, which in a program whose threads do not share memory is the object itself.
+  pub effect fn symbolAddress(self: &mut Self, symbol: &[u8], addend: u64, local: bool) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let index = run self.symbolIndex(symbol)
+    let mut form = ConstantForm.Symbol
+    if local { form = ConstantForm.ThreadLocal }
+    let kind = self.addressKind()
+    return run self.addConstant(kind, Constant {form: form, low: addend, high: 0, symbol: index})
+  }
+
+  /// A 32-bit integer the link knows only once it lays out the program, such as the thread-local
+  /// block's size (`__tls_size`) or alignment (`__tls_align`): the value it gives `symbol`.
+  pub effect fn linkConstant(self: &mut Self, symbol: &[u8]) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let index = run self.symbolIndex(symbol)
+    return run self.addConstant(Kind.integer(32), Constant {form: ConstantForm.Link, low: 0, high: 0, symbol: index})
+  }
+
+  // Blocks.
+
+  /// A new block, which `startBlock` later fills.
+  pub effect fn newBlock(self: &mut Self) -> usize ! OutOfMemoryError ? &mut Allocator {
+    let index = List<Block>.length(&self.blocks)
+    run List<Block>.append(&mut self.blocks, emptyBlock())
+    return index
+  }
+
+  /// Starts filling `block`, which leaves the block filled before open until `finish` ends it as
+  /// unreachable. The first block started is the entry. A block is started once.
+  pub fn startBlock(self: &mut Self, block: usize) -> () {
+    let order = self.startedCount
+    let place = self.place
+    let blocks = List<Block>.asMutSlice(&mut self.blocks)
+    if blocks[block].started { return CompilerBug.panic(b"SsaFunction: a block started twice") }
+    blocks[block].started = true
+    blocks[block].order = order
+    blocks[block].startPlace = place
+    self.startedCount = order + usize.ONE
+    self.current = block
+    return ()
+  }
+
+  /// Whether the builder is filling a block: the last one started has not ended.
+  pub fn isOpen(self: &Self) -> bool { return self.current != usize.MAX }
+
+  /// The block the builder is filling. An instruction made after an exit and before the next
+  /// `startBlock` goes into a fresh block nothing reaches, which `finish` removes.
+  effect fn currentBlock(self: &mut Self) -> usize ! OutOfMemoryError ? &mut Allocator {
+    if self.current != usize.MAX { return self.current }
+    let block = run self.newBlock()
+    self.startBlock(block)
+    return block
+  }
+
+  /// Adds a parameter of `kind` to `block`; answers its value.
+  pub effect fn addParameter(self: &mut Self, block: usize, kind: Kind) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let position = List<u64>.length(&List<Block>.asSlice(&self.blocks)[block].parameters)
+    let made = run self.addValue(kind, Definition.Parameter, block, position)
+    run List<u64>.append(&mut List<Block>.asMutSlice(&mut self.blocks)[block].parameters, made)
+    return made
+  }
+
+  /// Marks what the builder makes next as coming from source place `place`, `line << 24 |
+  /// column`.
+  pub fn locate(self: &mut Self, place: u64) -> () {
+    self.place = place
+    return ()
+  }
+
+  // Exits.
+
+  effect fn endWith(self: &mut Self, exit: Exit, value: u64) -> usize ! OutOfMemoryError ? &mut Allocator {
+    let resolved = run self.resolved(value)
+    let block = run self.currentBlock()
+    let place = self.place
+    let blocks = List<Block>.asMutSlice(&mut self.blocks)
+    blocks[block].exit = exit
+    blocks[block].value = resolved
+    blocks[block].place = place
+    self.current = usize.MAX
+    return block
+  }
+
+  effect fn addEdge(self: &mut Self, block: usize, target: usize, arguments: &[u64]) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut passed = run List<u64>.makeWithCapacity(arguments.length)
+    let mut at = usize.ZERO
+    while at < arguments.length {
+      run List<u64>.append(&mut passed, run self.resolved(arguments[at]))
+      at = at + usize.ONE
+    }
+    return run List<Edge>.append(&mut List<Block>.asMutSlice(&mut self.blocks)[block].edges, Edge {block: target, arguments: move passed})
+  }
+
+  /// Ends the current block with a jump to `target`, passing `arguments` to its parameters.
+  pub effect fn jumpWith(self: &mut Self, target: usize, arguments: &[u64]) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut resolved = List<u64>.make()
+    let mut at = usize.ZERO
+    while at < arguments.length {
+      run List<u64>.append(&mut resolved, run self.resolved(arguments[at]))
+      at = at + usize.ONE
+    }
+    let block = run self.endWith(Exit.Jump, none())
+    return run self.addEdge(block, target, List<u64>.asSlice(&resolved))
+  }
+
+  /// Ends the current block with a jump to `target`, which takes no parameters.
+  pub effect fn jump(self: &mut Self, target: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    return run self.jumpWith(target, &[])
+  }
+
+  /// Ends the current block with a branch to `onTrue`, passing `trueArguments`, when the flag
+  /// `condition` holds, else to `onFalse`, passing `falseArguments`.
+  pub effect fn branchWith(self: &mut Self, condition: u64, onTrue: usize, trueArguments: &[u64], onFalse: usize, falseArguments: &[u64]) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+    let mut taken = List<u64>.make()
+    let mut otherwise = List<u64>.make()
+    let mut at = usize.ZERO
+    while at < trueArguments.length {
+      run List<u64>.append(&mut taken, run self.resolved(trueArguments[at]))
+      at = at + usize.ONE
+    }
+    at = usize.ZERO
+    while at < falseArguments.length {
+      run List<u64>.append(&mut otherwise, run self.resolved(falseArguments[at]))
+      at = at + usize.ONE
+    }
+    let block = run self.endWith(Exit.Branch, condition)
+    run self.addEdge(block, onTrue, List<u64>.asSlice(&taken))
+    return run self.addEdge(block, onFalse, List<u64>.asSlice(&otherwise))
+  }
+
+  /// Ends the current block with a branch to `onTrue` when the flag `condition` holds, else to
+  /// `onFalse`; neither takes parameters. Two equal targets are a jump.
+  pub effect fn branchIf(self: &mut Self, condition: u64, onTrue: usize, onFalse: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    if onTrue == onFalse { return run self.jump(onTrue) }
+    return run self.branchWith(condition, onTrue, &[], onFalse, &[])
+  }
+
+  /// Ends the current block with a switch on the integer `value`: to the block of the first case
+  /// pair in `cases`, its bits then its block, whose bits `value` equals, else to `otherwise`. No
+  /// target takes parameters.
+  pub effect fn switch(self: &mut Self, value: u64, cases: &[u64], otherwise: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    let block = run self.endWith(Exit.Switch, value)
+    run self.addEdge(block, otherwise, &[])
+    let mut at = usize.ZERO
+    while at + usize.ONE < cases.length {
+      run List<u64>.append(&mut List<Block>.asMutSlice(&mut self.blocks)[block].cases, cases[at])
+      run self.addEdge(block, u64.toUsize(cases[at + usize.ONE]), &[])
+      at = at + 2
+    }
+    return ()
+  }
+
+  /// Ends the current block by returning `value`, or nothing for `none()`.
+  pub effect fn ret(self: &mut Self, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+    drop run self.endWith(Exit.Return, value)
+    return ()
+  }
+
+  /// Ends the current block with a trap.
+  pub effect fn trap(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    drop run self.endWith(Exit.Trap, none())
+    return ()
+  }
+
+  /// Ends the current block as never reached.
+  pub effect fn unreachable(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    drop run self.endWith(Exit.Unreachable, none())
+    return ()
+  }
+
+  // Variables.
+
+  /// A new variable of `kind`, which `assign` sets and which starts zero: a value that is any
+  /// operand the builder takes reads where the builder takes it. It is a stack slot that
+  /// `SsaPromotion.promote` turns into values.
+  pub effect fn variable(self: &mut Self, kind: Kind) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    if kind.isUnit() { return none() }
+    let size = usize.toU64(kind.storeSize())
+    let mut alignment: u64 = 1
+    while alignment < size && alignment < 16 { alignment = alignment * 2 }
+    let slot = List<Slot>.length(&self.slots)
+    run List<Slot>.append(&mut self.slots, Slot {size: size, alignment: alignment, variable: true})
+    return run self.addValue(kind, Definition.Variable, slot, usize.ZERO)
+  }
+
+  /// Sets `variable` to `value`, which has its kind.
+  pub effect fn assign(self: &mut Self, variable: u64, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+    if variable == none() { return () }
+    let found = self.value(variable)
+    if found.definition != Definition.Variable { return CompilerBug.panic(b"SsaFunction: an assignment to a value that is not a variable") }
+    let resolved = run self.resolved(value)
+    let addressKind = self.addressKind()
+    let alignment = u64.toUsize(self.slot(found.owner).alignment)
+    let address = run self.addInstruction(Operation.SlotAddress {slot: found.owner}, addressKind, &[])
+    let operands = [resolved, address]
+    drop run self.addInstruction(Operation.Store {offset: 0, alignment: alignment}, Kind.unit(), &operands)
+    return ()
+  }
+
+  // The value `value` stands for at this point: a variable's current value is a load of its slot.
+  effect fn resolved(self: &mut Self, value: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    if value == none() { return value }
+    let found = self.value(value)
+    if found.definition != Definition.Variable { return value }
+    let addressKind = self.addressKind()
+    let alignment = u64.toUsize(self.slot(found.owner).alignment)
+    let address = run self.addInstruction(Operation.SlotAddress {slot: found.owner}, addressKind, &[])
+    let operands = [address]
+    return run self.addInstruction(Operation.Load {offset: 0, alignment: alignment}, found.kind, &operands)
+  }
+
+  // Instructions.
+
+  /// Appends to the current block an instruction of `operation` whose first result is of `kind`
+  /// over `operands`, each read where the builder takes it; answers its first result, or `none()`.
+  pub effect fn addInstruction(self: &mut Self, operation: Operation, kind: Kind, operands: &[u64]) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let mut resolved = run List<u64>.makeWithCapacity(operands.length)
+    let mut at = usize.ZERO
+    while at < operands.length {
+      run List<u64>.append(&mut resolved, run self.resolved(operands[at]))
+      at = at + usize.ONE
+    }
+    let block = run self.currentBlock()
+    let number = List<Instruction>.length(&self.instructions)
+    let start = List<u64>.length(&self.operands)
+    run List<u64>.appendSlice(&mut self.operands, List<u64>.asSlice(&resolved))
+    let count = operation.resultCount(kind)
+    let mut result = none()
+    if count != usize.ZERO { result = run self.addValue(kind, Definition.Result, number, usize.ZERO) }
+    if count == 2 {
+      let mut second = kind.flags()
+      if let Operation.CompareExchange = operation { second = Kind.flag() }
+      drop run self.addValue(second, Definition.Result, number, usize.ONE)
+    }
+    run List<Instruction>.append(&mut self.instructions, Instruction {operation: operation, kind: kind, operandStart: start, operandCount: operands.length,
+      result: result, block: block, place: self.place, removed: false})
+    run List<usize>.append(&mut List<Block>.asMutSlice(&mut self.blocks)[block].instructions, number)
+    return result
+  }
+
+  /// `left op right`, element by element, of the kind of `left`.
+  pub effect fn binary(self: &mut Self, operation: Binary, left: u64, right: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let operands = [left, right]
+    let resultKind = self.kindOf(left)
+    return run self.addInstruction(Operation.Binary {operation: operation}, resultKind, &operands)
+  }
+
+  /// `-value` of a float, element by element.
+  pub effect fn negate(self: &mut Self, value: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let operands = [value]
+    let resultKind = self.kindOf(value)
+    return run self.addInstruction(Operation.Negate, resultKind, &operands)
+  }
+
+  /// `left predicate right`, element by element: a flag, or a vector of them.
+  pub effect fn compare(self: &mut Self, predicate: Predicate, left: u64, right: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let operands = [left, right]
+    let resultKind = self.kindOf(left).flags()
+    return run self.addInstruction(Operation.Compare {predicate: predicate}, resultKind, &operands)
+  }
+
+  /// `condition ? chosen : otherwise`, element by element when `condition` is a vector.
+  pub effect fn select(self: &mut Self, condition: u64, chosen: u64, otherwise: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let operands = [condition, chosen, otherwise]
+    let resultKind = self.kindOf(chosen)
+    return run self.addInstruction(Operation.Select, resultKind, &operands)
+  }
+
+  /// `value` converted to `output` by `operation`, element by element.
+  pub effect fn cast(self: &mut Self, operation: Cast, value: u64, output: Kind) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let operands = [value]
+    return run self.addInstruction(Operation.Cast {operation: operation}, output, &operands)
+  }
+
+  /// The `kind` value stored `offset` bytes past `address`, aligned to `alignment` there; `none()`
+  /// for a unit kind, which reads nothing.
+  pub effect fn load(self: &mut Self, kind: Kind, address: u64, offset: u64, alignment: usize) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    if kind.isUnit() { return none() }
+    let operands = [address]
+    return run self.addInstruction(Operation.Load {offset: offset, alignment: alignment}, kind, &operands)
+  }
+
+  /// Stores `value` `offset` bytes past `address`, aligned to `alignment` there; a unit value
+  /// stores nothing.
+  pub effect fn store(self: &mut Self, value: u64, address: u64, offset: u64, alignment: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    if value == none() { return () }
+    let operands = [value, address]
+    drop run self.addInstruction(Operation.Store {offset: offset, alignment: alignment}, Kind.unit(), &operands)
+    return ()
+  }
+
+  /// The address `offset` bytes past `base`; `base` itself for zero.
+  pub effect fn offset(self: &mut Self, base: u64, offset: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    if offset == 0 { return run self.resolved(base) }
+    let operands = [base]
+    let resultKind = self.addressKind()
+    return run self.addInstruction(Operation.Offset {offset: offset}, resultKind, &operands)
+  }
+
+  /// The address `index` bytes past `base`, for an integer `index`.
+  pub effect fn indexed(self: &mut Self, base: u64, index: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let operands = [base, index]
+    let resultKind = self.addressKind()
+    return run self.addInstruction(Operation.Index, resultKind, &operands)
+  }
+
+  /// Copies `size` bytes from `source` to `destination`; the two may overlap.
+  pub effect fn copyBytes(self: &mut Self, destination: u64, source: u64, size: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+    let operands = [destination, source]
+    drop run self.addInstruction(Operation.CopyBytes {size: size}, Kind.unit(), &operands)
+    return ()
+  }
+
+  /// Sets `size` bytes at `destination` to `byte`.
+  pub effect fn fill(self: &mut Self, destination: u64, byte: u8, size: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+    let operands = [destination]
+    drop run self.addInstruction(Operation.Fill {byte: byte, size: size}, Kind.unit(), &operands)
+    return ()
+  }
+
+  /// Declares a stack slot of `size` bytes aligned to `alignment`; answers its position.
+  pub effect fn declareSlot(self: &mut Self, size: u64, alignment: u64) -> usize ! OutOfMemoryError ? &mut Allocator {
+    let mut aligned = alignment
+    if aligned == 0 { aligned = 1 }
+    let slot = List<Slot>.length(&self.slots)
+    run List<Slot>.append(&mut self.slots, Slot {size: size, alignment: aligned, variable: false})
+    return slot
+  }
+
+  /// The address of stack slot `slot`.
+  pub effect fn slotAddress(self: &mut Self, slot: usize) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let resultKind = self.addressKind()
+    return run self.addInstruction(Operation.SlotAddress {slot: slot}, resultKind, &[])
+  }
+
+  /// Declares a stack slot of `size` bytes aligned to `alignment`; answers its address.
+  pub effect fn slotOf(self: &mut Self, size: u64, alignment: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let slot = run self.declareSlot(size, alignment)
+    return run self.slotAddress(slot)
+  }
+
+  /// The address of the function's frame, which every call made while it runs lies below.
+  pub effect fn frameAddress(self: &mut Self) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let resultKind = self.addressKind()
+    return run self.addInstruction(Operation.FrameAddress, resultKind, &[])
+  }
+
+  /// `count` bytes, an integer, of fresh stack aligned to `alignment` and at least 16; the
+  /// function's return gives them back.
+  pub effect fn dynamicSlot(self: &mut Self, count: u64, alignment: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let operands = [count]
+    let resultKind = self.addressKind()
+    return run self.addInstruction(Operation.DynamicSlot {alignment: alignment}, resultKind, &operands)
+  }
+
+  /// Calls the function `symbol` with `arguments`; answers its result of kind `result`, or
+  /// `none()` for a unit one.
+  pub effect fn call(self: &mut Self, symbol: &[u8], arguments: &[u64], result: Kind) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let index = run self.symbolIndex(symbol)
+    return run self.addInstruction(Operation.Call {symbol: index, fixed: usize.MAX}, result, arguments)
+  }
+
+  /// Calls the variadic C function `symbol` with its `fixed` arguments and its variadic `tail`;
+  /// answers its result of kind `result`, or `none()` for a unit one.
+  pub effect fn callVariadic(self: &mut Self, symbol: &[u8], fixed: &[u64], tail: &[u64], result: Kind) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let index = run self.symbolIndex(symbol)
+    let mut arguments = List<u64>.make()
+    run List<u64>.appendSlice(&mut arguments, fixed)
+    run List<u64>.appendSlice(&mut arguments, tail)
+    return run self.addInstruction(Operation.Call {symbol: index, fixed: fixed.length}, result, List<u64>.asSlice(&arguments))
+  }
+
+  /// Calls the function at address `callee` with `arguments`; answers its result of kind
+  /// `result`, or `none()` for a unit one. The callee's signature is the arguments' kinds and
+  /// `result`.
+  pub effect fn callIndirect(self: &mut Self, callee: u64, arguments: &[u64], result: Kind) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let mut operands = List<u64>.make()
+    run List<u64>.append(&mut operands, callee)
+    run List<u64>.appendSlice(&mut operands, arguments)
+    return run self.addInstruction(Operation.CallIndirect, result, List<u64>.asSlice(&operands))
+  }
+
+  /// `left operation right`, `Add`, `Sub` or `Mul`, wrapped, and whether the exact result does
+  /// not fit, signed when `signed`.
+  pub effect fn overflowing(self: &mut Self, operation: Binary, signed: bool, left: u64, right: u64) -> Checked ! OutOfMemoryError ? &mut Allocator {
+    let operands = [left, right]
+    let resultKind = self.kindOf(left)
+    let value = run self.addInstruction(Operation.Overflow {operation: operation, signed: signed}, resultKind, &operands)
+    return Checked {value: value, overflow: value + 1}
+  }
+
+  /// `left operation right`, `Add` or `Sub`, clamped to the type's range, signed when `signed`.
+  pub effect fn saturating(self: &mut Self, operation: Binary, signed: bool, left: u64, right: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let operands = [left, right]
+    let resultKind = self.kindOf(left)
+    return run self.addInstruction(Operation.Saturate {operation: operation, signed: signed}, resultKind, &operands)
+  }
+
+  /// `value` rotated left, or right, by `amount` modulo its width.
+  pub effect fn rotate(self: &mut Self, toLeft: bool, value: u64, amount: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let operands = [value, amount]
+    let resultKind = self.kindOf(value)
+    return run self.addInstruction(Operation.Rotate {left: toLeft}, resultKind, &operands)
+  }
+
+  /// The bits of `value` `which` counts, element by element; a zero's count is the width.
+  pub effect fn countBits(self: &mut Self, which: Count, value: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let operands = [value]
+    let resultKind = self.kindOf(value)
+    return run self.addInstruction(Operation.Count {which: which}, resultKind, &operands)
+  }
+
+  /// The smaller or larger of `left` and `right`, element by element.
+  pub effect fn extreme(self: &mut Self, which: Extreme, left: u64, right: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let operands = [left, right]
+    let resultKind = self.kindOf(left)
+    return run self.addInstruction(Operation.Extreme {which: which}, resultKind, &operands)
+  }
+
+  /// `left * right + addend` rounded once, element by element.
+  pub effect fn fusedMultiplyAdd(self: &mut Self, left: u64, right: u64, addend: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let operands = [left, right, addend]
+    let resultKind = self.kindOf(left)
+    return run self.addInstruction(Operation.FusedMultiplyAdd, resultKind, &operands)
+  }
+
+  /// The square root of a float, element by element.
+  pub effect fn squareRoot(self: &mut Self, value: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let operands = [value]
+    let resultKind = self.kindOf(value)
+    return run self.addInstruction(Operation.SquareRoot, resultKind, &operands)
+  }
+
+  /// The elements of `vector` folded in order by `which`, from `start` for a float sum or product
+  /// when it is not `none()`.
+  pub effect fn reduce(self: &mut Self, which: Reduction, vector: u64, start: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let element = self.kindOf(vector).element()
+    if start == none() {
+      let operands = [vector]
+      return run self.addInstruction(Operation.Reduce {which: which}, element, &operands)
+    }
+    let operands = [vector, start]
+    return run self.addInstruction(Operation.Reduce {which: which}, element, &operands)
+  }
+
+  /// The vector of `vector`'s elements followed by `other`'s, picked by `mask`: each result
+  /// element is the one its entry numbers, or zero for `u64.MAX`.
+  pub effect fn shuffle(self: &mut Self, vector: u64, other: u64, mask: &[u64]) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let start = List<u64>.length(&self.immediates)
+    run List<u64>.appendSlice(&mut self.immediates, mask)
+    let operands = [vector, other]
+    let kind = Kind.vector(self.kindOf(vector).element(), mask.length)
+    return run self.addInstruction(Operation.Shuffle {start: start, count: mask.length}, kind, &operands)
+  }
+
+  /// Element `index` of `vector`, an integer; an index out of range gives zero.
+  pub effect fn extractElement(self: &mut Self, vector: u64, index: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let operands = [vector, index]
+    let resultKind = self.kindOf(vector).element()
+    return run self.addInstruction(Operation.Extract, resultKind, &operands)
+  }
+
+  /// `vector` with element `index` replaced by `inserted`.
+  pub effect fn insertElement(self: &mut Self, vector: u64, inserted: u64, index: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let operands = [vector, inserted, index]
+    let resultKind = self.kindOf(vector)
+    return run self.addInstruction(Operation.Insert, resultKind, &operands)
+  }
+
+  /// A vector of `count` elements, each `value`.
+  pub effect fn splat(self: &mut Self, value: u64, count: usize) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let operands = [value]
+    let resultKind = Kind.vector(self.kindOf(value), count)
+    return run self.addInstruction(Operation.Splat {count: count}, resultKind, &operands)
+  }
+
+  /// An atomic load of the integer `kind` at `address`.
+  pub effect fn atomicLoad(self: &mut Self, kind: Kind, address: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let operands = [address]
+    return run self.addInstruction(Operation.AtomicLoad, kind, &operands)
+  }
+
+  /// An atomic store of `value` at `address`.
+  pub effect fn atomicStore(self: &mut Self, value: u64, address: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+    let operands = [value, address]
+    drop run self.addInstruction(Operation.AtomicStore, Kind.unit(), &operands)
+    return ()
+  }
+
+  /// Applies `which` with `value` to the integer at `address` atomically; answers the old value.
+  pub effect fn atomicModify(self: &mut Self, which: Modify, address: u64, value: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let operands = [address, value]
+    let resultKind = self.kindOf(value)
+    return run self.addInstruction(Operation.AtomicModify {which: which}, resultKind, &operands)
+  }
+
+  /// Replaces the integer at `address` by `replacement` when it holds `expected`, atomically;
+  /// answers the old value and whether it was replaced.
+  pub effect fn compareExchange(self: &mut Self, address: u64, expected: u64, replacement: u64) -> Checked ! OutOfMemoryError ? &mut Allocator {
+    let operands = [address, expected, replacement]
+    let resultKind = self.kindOf(expected)
+    let value = run self.addInstruction(Operation.CompareExchange, resultKind, &operands)
+    return Checked {value: value, overflow: value + 1}
+  }
+
+  /// A sequentially consistent fence.
+  pub effect fn fence(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    drop run self.addInstruction(Operation.Fence, Kind.unit(), &[])
+    return ()
+  }
+
+  /// WebAssembly only: the value of global `index`, of `kind`.
+  pub effect fn globalGet(self: &mut Self, index: usize, kind: Kind) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    return run self.addInstruction(Operation.WasmGlobalGet {index: index}, kind, &[])
+  }
+
+  /// WebAssembly only: sets global `index` to `value`.
+  pub effect fn globalSet(self: &mut Self, index: usize, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+    let operands = [value]
+    drop run self.addInstruction(Operation.WasmGlobalSet {index: index}, Kind.unit(), &operands)
+    return ()
+  }
+
+  /// WebAssembly only: the memory's size in pages, an address-sized integer.
+  pub effect fn memorySize(self: &mut Self) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let resultKind = Kind.integer(self.addressBits)
+    return run self.addInstruction(Operation.WasmMemorySize, resultKind, &[])
+  }
+
+  /// WebAssembly only: grows the memory by `pages`, an address-sized integer; answers the old size,
+  /// or all ones.
+  pub effect fn memoryGrow(self: &mut Self, pages: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let operands = [pages]
+    let resultKind = Kind.integer(self.addressBits)
+    return run self.addInstruction(Operation.WasmMemoryGrow, resultKind, &operands)
+  }
+
+  /// WebAssembly only: `memory.atomic.wait32(address, expected, timeout)`: 0 when woken, 1 when the
+  /// word differed, 2 on timeout.
+  pub effect fn atomicWait(self: &mut Self, address: u64, expected: u64, timeout: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let operands = [address, expected, timeout]
+    return run self.addInstruction(Operation.WasmWait, Kind.integer(32), &operands)
+  }
+
+  /// WebAssembly only: `memory.atomic.notify(address, count)`: how many waiters it woke.
+  pub effect fn atomicNotify(self: &mut Self, address: u64, count: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let operands = [address, count]
+    return run self.addInstruction(Operation.WasmNotify, Kind.integer(32), &operands)
+  }
+
+  // Finishing.
+
+  /// Ends the function's construction: every block still open, or never started, ends as
+  /// unreachable; the blocks are renumbered in the order they were started, the entry first, and
+  /// those no path from the entry reaches are removed with their instructions; and when an edge
+  /// leads back to the entry, a new entry block jumps to it, so the entry has no predecessors.
+  pub effect fn finish(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    self.current = usize.MAX
+    if List<Block>.length(&self.blocks) == usize.ZERO {
+      let only = run self.newBlock()
+      self.startBlock(only)
+    }
+    let count = List<Block>.length(&self.blocks)
+    // Started blocks in start order, then the others in their own order.
+    let mut sequence = run List<usize>.makeWithCapacity(count)
+    run List<usize>.appendRepeated(&mut sequence, usize.MAX, count)
+    let mut unstarted = List<usize>.make()
+    let mut entry = usize.MAX
+    let mut at = usize.ZERO
+    while at < count {
+      let blocks = List<Block>.asMutSlice(&mut self.blocks)
+      if blocks[at].exit == Exit.Open {
+        blocks[at].exit = Exit.Unreachable
+        blocks[at].value = none()
+      }
+      if blocks[at].started {
+        List<usize>.set(&mut sequence, blocks[at].order, at)
+        if blocks[at].order == usize.ZERO { entry = at }
+      } else {
+        run List<usize>.append(&mut unstarted, at)
+      }
+      at = at + usize.ONE
+    }
+    if entry == usize.MAX { entry = List<usize>.get(&unstarted, usize.ZERO) }
+    // Reachability from the entry.
+    let mut reached = run List<bool>.makeWithCapacity(count)
+    run List<bool>.appendRepeated(&mut reached, false, count)
+    let mut stack = List<usize>.make()
+    run List<usize>.append(&mut stack, entry)
+    List<bool>.set(&mut reached, entry, true)
+    let mut backToEntry = false
+    while let Option<usize>.Some {value: node} = List<usize>.pop(&mut stack) {
+      let edges = List<Edge>.asSlice(&List<Block>.asSlice(&self.blocks)[node].edges)
+      let mut edge = usize.ZERO
+      while edge < edges.length {
+        let target = edges[edge].block
+        if target == entry { backToEntry = true }
+        if !List<bool>.get(&reached, target) {
+          List<bool>.set(&mut reached, target, true)
+          run List<usize>.append(&mut stack, target)
+        }
+        edge = edge + usize.ONE
+      }
+    }
+    // The new numbering: a fresh entry first when one is needed, then the reached blocks.
+    let mut renumbered = run List<usize>.makeWithCapacity(count)
+    run List<usize>.appendRepeated(&mut renumbered, usize.MAX, count)
+    let mut order = List<usize>.make()
+    let mut next = usize.ZERO
+    if backToEntry { next = usize.ONE }
+    at = usize.ZERO
+    while at < count + List<usize>.length(&unstarted) {
+      let mut block = usize.MAX
+      if at < count { block = List<usize>.get(&sequence, at) } else { block = List<usize>.get(&unstarted, at - count) }
+      if block != usize.MAX && List<bool>.get(&reached, block) && List<usize>.get(&renumbered, block) == usize.MAX {
+        List<usize>.set(&mut renumbered, block, next)
+        run List<usize>.append(&mut order, block)
+        next = next + usize.ONE
+      }
+      at = at + usize.ONE
+    }
+    run self.renumberBlocks(List<usize>.asSlice(&renumbered), List<usize>.asSlice(&order), backToEntry)
+    return ()
+  }
+
+  // Rebuilds the blocks as `order` lists them, block `order[i]` becoming block `renumbered` of it,
+  // after a fresh entry jumping to the old one when `freshEntry`. Every other block is dropped
+  // with its instructions.
+  effect fn renumberBlocks(self: &mut Self, renumbered: &[usize], order: &[usize], freshEntry: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut rebuilt = List<Block>.make()
+    if freshEntry {
+      let mut opening = emptyBlock()
+      opening.exit = Exit.Jump
+      opening.started = true
+      let mut edges = List<Edge>.make()
+      run List<Edge>.append(&mut edges, Edge {block: usize.ONE, arguments: List<u64>.make()})
+      opening.edges = move edges
+      opening.startPlace = List<Block>.asSlice(&self.blocks)[order[usize.ZERO]].startPlace
+      opening.place = opening.startPlace
+      run List<Block>.append(&mut rebuilt, move opening)
+    }
+    let mut at = usize.ZERO
+    while at < order.length {
+      let blocks = List<Block>.asMutSlice(&mut self.blocks)
+      let mut moved = Intrinsic.replace(blocks[order[at]], emptyBlock())
+      let edges = List<Edge>.asMutSlice(&mut moved.edges)
+      let mut edge = usize.ZERO
+      while edge < edges.length {
+        edges[edge].block = renumbered[edges[edge].block]
+        edge = edge + usize.ONE
+      }
+      run List<Block>.append(&mut rebuilt, move moved)
+      at = at + usize.ONE
+    }
+    // What the dropped blocks held is removed.
+    let mut dropped = usize.ZERO
+    let old = List<Block>.asSlice(&self.blocks)
+    while dropped < old.length {
+      if renumbered[dropped] == usize.MAX {
+        let listed = List<usize>.asSlice(&old[dropped].instructions)
+        let mut position = usize.ZERO
+        while position < listed.length {
+          let instructions = List<Instruction>.asMutSlice(&mut self.instructions)
+          instructions[listed[position]].removed = true
+          position = position + usize.ONE
+        }
+      }
+      dropped = dropped + usize.ONE
+    }
+    self.blocks = move rebuilt
+    // Each instruction and parameter names its new block.
+    let blocks = List<Block>.asSlice(&self.blocks)
+    let mut block = usize.ZERO
+    while block < blocks.length {
+      let listed = List<usize>.asSlice(&blocks[block].instructions)
+      let mut position = usize.ZERO
+      while position < listed.length {
+        let instructions = List<Instruction>.asMutSlice(&mut self.instructions)
+        instructions[listed[position]].block = block
+        position = position + usize.ONE
+      }
+      let parameters = List<u64>.asSlice(&blocks[block].parameters)
+      position = usize.ZERO
+      while position < parameters.length {
+        let values = List<Value>.asMutSlice(&mut self.values)
+        values[u64.toUsize(parameters[position])].owner = block
+        position = position + usize.ONE
+      }
+      block = block + usize.ONE
+    }
+    return ()
+  }
+
+  // Passes.
+
+  /// Sets operand `at` of `instruction` to `value`.
+  pub fn setOperand(self: &mut Self, instruction: usize, at: usize, value: u64) -> () {
+    let found = List<Instruction>.get(&self.instructions, instruction)
+    if at >= found.operandCount { return CompilerBug.panic(b"SsaFunction: an operand past the instruction's operands") }
+    return List<u64>.set(&mut self.operands, found.operandStart + at, value)
+  }
+
+  /// Replaces the operation of `instruction` by `operation`, which must take the same operands
+  /// and yield results of the same kinds.
+  pub fn setOperation(self: &mut Self, instruction: usize, operation: Operation) -> () {
+    let instructions = List<Instruction>.asMutSlice(&mut self.instructions)
+    instructions[instruction].operation = operation
+    return ()
+  }
+
+  /// Marks `instruction` removed; `sweep` drops it from its block. Its results must have no uses
+  /// left by then.
+  pub fn remove(self: &mut Self, instruction: usize) -> () {
+    let instructions = List<Instruction>.asMutSlice(&mut self.instructions)
+    instructions[instruction].removed = true
+    return ()
+  }
+
+  /// Drops every removed instruction from its block.
+  pub fn sweep(self: &mut Self) -> () {
+    let count = List<Block>.length(&self.blocks)
+    let mut block = usize.ZERO
+    while block < count {
+      let blocks = List<Block>.asMutSlice(&mut self.blocks)
+      let listed = List<usize>.asMutSlice(&mut blocks[block].instructions)
+      let mut kept = usize.ZERO
+      let mut at = usize.ZERO
+      while at < listed.length {
+        if !List<Instruction>.get(&self.instructions, listed[at]).removed {
+          listed[kept] = listed[at]
+          kept = kept + usize.ONE
+        }
+        at = at + usize.ONE
+      }
+      List<usize>.truncate(&mut blocks[block].instructions, kept)
+      block = block + usize.ONE
+    }
+    return ()
+  }
+
+  /// Appends `value` to the arguments of edge `edge` of `block`'s exit.
+  pub effect fn appendArgument(self: &mut Self, block: usize, edge: usize, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+    let blocks = List<Block>.asMutSlice(&mut self.blocks)
+    return run List<u64>.append(&mut List<Edge>.asMutSlice(&mut blocks[block].edges)[edge].arguments, value)
+  }
+
+  /// Sets the condition, switch value or returned value of `block`'s exit to `value`.
+  pub fn setExitValue(self: &mut Self, block: usize, value: u64) -> () {
+    let blocks = List<Block>.asMutSlice(&mut self.blocks)
+    blocks[block].value = value
+    return ()
+  }
+
+  /// Sets argument `at` of edge `edge` of `block`'s exit to `value`.
+  pub fn setArgument(self: &mut Self, block: usize, edge: usize, at: usize, value: u64) -> () {
+    let blocks = List<Block>.asMutSlice(&mut self.blocks)
+    return List<u64>.set(&mut List<Edge>.asMutSlice(&mut blocks[block].edges)[edge].arguments, at, value)
+  }
+
+  /// Removes parameter `at` of `block`, and the argument every edge into it passes for it. Its
+  /// value must have no uses left.
+  pub fn removeParameter(self: &mut Self, block: usize, at: usize) -> () {
+    let count = List<Block>.length(&self.blocks)
+    let blocks = List<Block>.asMutSlice(&mut self.blocks)
+    drop List<u64>.remove(&mut blocks[block].parameters, at)
+    let parameters = List<u64>.asSlice(&blocks[block].parameters)
+    let mut position = at
+    while position < parameters.length {
+      let values = List<Value>.asMutSlice(&mut self.values)
+      values[u64.toUsize(parameters[position])].index = position
+      position = position + usize.ONE
+    }
+    let mut from = usize.ZERO
+    while from < count {
+      let edges = List<Edge>.asMutSlice(&mut blocks[from].edges)
+      let mut edge = usize.ZERO
+      while edge < edges.length {
+        if edges[edge].block == block { drop List<u64>.remove(&mut edges[edge].arguments, at) }
+        edge = edge + usize.ONE
+      }
+      from = from + usize.ONE
+    }
+    return ()
+  }
+
+  /// Replaces every use of each value `v` with `substitution[v]`, where it is not `none()`: every
+  /// instruction operand, exit value and edge argument. A substitute that is itself substituted
+  /// is followed to its end.
+  pub fn substitute(self: &mut Self, substitution: &mut List<u64>) -> () {
+    // Each chain is followed once and shortened to its end.
+    let map = List<u64>.asMutSlice(&mut substitution.*)
+    let mut at = usize.ZERO
+    while at < map.length {
+      let mut end = map[at]
+      while end != none() && u64.toUsize(end) < map.length && map[u64.toUsize(end)] != none() { end = map[u64.toUsize(end)] }
+      map[at] = end
+      at = at + usize.ONE
+    }
+    let operands = List<u64>.asMutSlice(&mut self.operands)
+    at = usize.ZERO
+    while at < operands.length {
+      let used = operands[at]
+      if used != none() && u64.toUsize(used) < map.length && map[u64.toUsize(used)] != none() { operands[at] = map[u64.toUsize(used)] }
+      at = at + usize.ONE
+    }
+    let blocks = List<Block>.asMutSlice(&mut self.blocks)
+    let mut block = usize.ZERO
+    while block < blocks.length {
+      let value = blocks[block].value
+      if value != none() && u64.toUsize(value) < map.length && map[u64.toUsize(value)] != none() { blocks[block].value = map[u64.toUsize(value)] }
+      let edges = List<Edge>.asMutSlice(&mut blocks[block].edges)
+      let mut edge = usize.ZERO
+      while edge < edges.length {
+        let arguments = List<u64>.asMutSlice(&mut edges[edge].arguments)
+        let mut argument = usize.ZERO
+        while argument < arguments.length {
+          let used = arguments[argument]
+          if used != none() && u64.toUsize(used) < map.length && map[u64.toUsize(used)] != none() { arguments[argument] = map[u64.toUsize(used)] }
+          argument = argument + usize.ONE
+        }
+        edge = edge + usize.ONE
+      }
+      block = block + usize.ONE
+    }
+    return ()
+  }
+
+  /// Replaces every use of `from` with `to`.
+  pub effect fn replaceAllUses(self: &mut Self, from: u64, to: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut substitution = run List<u64>.makeWithCapacity(List<Value>.length(&self.values))
+    run List<u64>.appendRepeated(&mut substitution, none(), List<Value>.length(&self.values))
+    List<u64>.set(&mut substitution, u64.toUsize(from), to)
+    return self.substitute(&mut substitution)
+  }
+
+  /// The instruction whose result `value` is, or `usize.MAX` for an argument, a parameter, a
+  /// constant or `none()`.
+  pub fn producerOf(self: &Self, value: u64) -> usize {
+    if value == none() { return usize.MAX }
+    let found = List<Value>.get(&self.values, u64.toUsize(value))
+    if found.definition != Definition.Result { return usize.MAX }
+    return found.owner
+  }
+
+  /// Whether `instruction` can trap: as its operation's `canTrap` says, except that an integer
+  /// division by a constant other than zero, and for a signed one other than all ones, never
+  /// traps.
+  pub fn mayTrap(self: &Self, instruction: usize) -> bool {
+    let found = List<Instruction>.get(&self.instructions, instruction)
+    if !found.operation.canTrap(found.kind.isInteger()) { return false }
+    if let Operation.Binary {operation} = found.operation {
+      let divisor = self.operandsOf(instruction)[usize.ONE]
+      if !self.isBits(divisor) { return true }
+      let constant = self.constantOf(divisor)
+      if constant.low == 0 && constant.high == 0 { return true }
+      if operation == Binary.SDiv || operation == Binary.SRem {
+        let bits = found.kind.bits
+        if bits > 64 { return constant.low == u64.MAX && constant.high == u64.MAX }
+        return constant.low == masked(u64.MAX, bits)
+      }
+      return false
+    }
+    return true
+  }
+
+  /// How many times each value is used, by value: once per instruction operand, exit value and
+  /// edge argument naming it, in the blocks as they are now.
+  pub effect fn useCounts(self: &Self) -> List<usize> ! OutOfMemoryError ? &mut Allocator {
+    let mut counts = run List<usize>.makeWithCapacity(List<Value>.length(&self.values))
+    run List<usize>.appendRepeated(&mut counts, usize.ZERO, List<Value>.length(&self.values))
+    let blocks = List<Block>.asSlice(&self.blocks)
+    let mut block = usize.ZERO
+    while block < blocks.length {
+      let listed = List<usize>.asSlice(&blocks[block].instructions)
+      let mut at = usize.ZERO
+      while at < listed.length {
+        let operands = self.operandsOf(listed[at])
+        let mut operand = usize.ZERO
+        while operand < operands.length {
+          countUse(&mut counts, operands[operand])
+          operand = operand + usize.ONE
+        }
+        at = at + usize.ONE
+      }
+      countUse(&mut counts, blocks[block].value)
+      let edges = List<Edge>.asSlice(&blocks[block].edges)
+      let mut edge = usize.ZERO
+      while edge < edges.length {
+        let arguments = List<u64>.asSlice(&edges[edge].arguments)
+        let mut argument = usize.ZERO
+        while argument < arguments.length {
+          countUse(&mut counts, arguments[argument])
+          argument = argument + usize.ONE
+        }
+        edge = edge + usize.ONE
+      }
+      block = block + usize.ONE
+    }
+    return move counts
+  }
+
+  /// Inserts into `block`, before the instruction at `position` of its list (its length to
+  /// append), a new instruction of `operation` whose first result is of `kind` over `operands`,
+  /// from source place `place`; answers its first result, or `none()`.
+  ///
+  /// # Details
+  ///
+  /// The new instruction and its results take the next numbers, so a pass that inserts in a fixed
+  /// order numbers them by the function alone. Its operands must be values of the finished
+  /// function, never builder variables.
+  pub effect fn insertInstruction(self: &mut Self, block: usize, position: usize, operation: Operation, kind: Kind, operands: &[u64], place: u64) -> u64
+  ! OutOfMemoryError ? &mut Allocator {
+    let number = List<Instruction>.length(&self.instructions)
+    let start = List<u64>.length(&self.operands)
+    run List<u64>.appendSlice(&mut self.operands, operands)
+    let count = operation.resultCount(kind)
+    let mut result = none()
+    if count != usize.ZERO { result = run self.addValue(kind, Definition.Result, number, usize.ZERO) }
+    if count == 2 {
+      let mut second = kind.flags()
+      if let Operation.CompareExchange = operation { second = Kind.flag() }
+      drop run self.addValue(second, Definition.Result, number, usize.ONE)
+    }
+    run List<Instruction>.append(&mut self.instructions, Instruction {operation: operation, kind: kind, operandStart: start, operandCount: operands.length,
+      result: result, block: block, place: place, removed: false})
+    let one = [number]
+    run List<usize>.insertSlice(&mut List<Block>.asMutSlice(&mut self.blocks)[block].instructions, position, &one)
+    return result
+  }
+
+  /// Moves `instruction` out of its block into `block`, before the instruction at `position` of
+  /// that block's list once `instruction` has left it (its length to append).
+  pub effect fn moveInstruction(self: &mut Self, instruction: usize, block: usize, position: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    let from = List<Instruction>.get(&self.instructions, instruction).block
+    let blocks = List<Block>.asMutSlice(&mut self.blocks)
+    let listed = List<usize>.asSlice(&blocks[from].instructions)
+    let mut at = usize.ZERO
+    while at < listed.length && listed[at] != instruction { at = at + usize.ONE }
+    if at == listed.length { return CompilerBug.panic(b"SsaFunction: a moved instruction is not in its block") }
+    drop List<usize>.remove(&mut blocks[from].instructions, at)
+    let one = [instruction]
+    run List<usize>.insertSlice(&mut blocks[block].instructions, position, &one)
+    let instructions = List<Instruction>.asMutSlice(&mut self.instructions)
+    instructions[instruction].block = block
+    return ()
+  }
+
+  /// Replaces `block`'s exit with a jump to `target` passing `arguments`.
+  pub effect fn setJump(self: &mut Self, block: usize, target: usize, arguments: &[u64]) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut passed = run List<u64>.makeWithCapacity(arguments.length)
+    run List<u64>.appendSlice(&mut passed, arguments)
+    let mut edges = List<Edge>.make()
+    run List<Edge>.append(&mut edges, Edge {block: target, arguments: move passed})
+    let blocks = List<Block>.asMutSlice(&mut self.blocks)
+    blocks[block].exit = Exit.Jump
+    blocks[block].value = none()
+    blocks[block].edges = move edges
+    blocks[block].cases = List<u64>.make()
+    return ()
+  }
+
+  /// Points edge `edge` of `block`'s exit at `target`, passing `arguments`.
+  pub effect fn setEdge(self: &mut Self, block: usize, edge: usize, target: usize, arguments: &[u64]) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut passed = run List<u64>.makeWithCapacity(arguments.length)
+    run List<u64>.appendSlice(&mut passed, arguments)
+    let blocks = List<Block>.asMutSlice(&mut self.blocks)
+    let edges = List<Edge>.asMutSlice(&mut blocks[block].edges)
+    edges[edge].block = target
+    edges[edge].arguments = move passed
+    return ()
+  }
+
+  /// Appends block `from`'s instructions to block `into` and gives `into` the exit of `from`,
+  /// which is left empty and ending as unreachable, for `compact` to drop once no edge leads to
+  /// it. `from` must have no parameters left, and `into` must be its only predecessor, ending in
+  /// a jump to it.
+  pub effect fn mergeBlock(self: &mut Self, into: usize, from: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    let blocks = List<Block>.asMutSlice(&mut self.blocks)
+    if List<u64>.length(&blocks[from].parameters) != usize.ZERO { return CompilerBug.panic(b"SsaFunction: a merged block keeps parameters") }
+    let moved = Intrinsic.replace(blocks[from].instructions, List<usize>.make())
+    let listed = List<usize>.asSlice(&moved)
+    run List<usize>.appendSlice(&mut blocks[into].instructions, listed)
+    blocks[into].exit = blocks[from].exit
+    blocks[into].value = blocks[from].value
+    blocks[into].place = blocks[from].place
+    blocks[into].edges = Intrinsic.replace(blocks[from].edges, List<Edge>.make())
+    blocks[into].cases = Intrinsic.replace(blocks[from].cases, List<u64>.make())
+    blocks[from].exit = Exit.Unreachable
+    blocks[from].value = none()
+    let instructions = List<Instruction>.asMutSlice(&mut self.instructions)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      instructions[listed[at]].block = into
+      at = at + usize.ONE
+    }
+    return ()
+  }
+
+  /// A new block after the others, ending in a jump to `target` that passes `arguments`, for a
+  /// pass that splits an edge or adds a loop preheader.
+  pub effect fn addJumpBlock(self: &mut Self, target: usize, arguments: &[u64], place: u64) -> usize ! OutOfMemoryError ? &mut Allocator {
+    let block = run self.newBlock()
+    let blocks = List<Block>.asMutSlice(&mut self.blocks)
+    blocks[block].started = true
+    blocks[block].startPlace = place
+    blocks[block].place = place
+    run self.setJump(block, target, arguments)
+    return block
+  }
+
+  /// Removes the blocks no path from the entry reaches, with their instructions, and numbers the
+  /// others in their present order; answers whether it removed any.
+  pub effect fn compact(self: &mut Self) -> bool ! OutOfMemoryError ? &mut Allocator {
+    let count = List<Block>.length(&self.blocks)
+    let mut reached = run List<bool>.makeWithCapacity(count)
+    run List<bool>.appendRepeated(&mut reached, false, count)
+    let mut stack = List<usize>.make()
+    run List<usize>.append(&mut stack, usize.ZERO)
+    List<bool>.set(&mut reached, usize.ZERO, true)
+    let mut kept = usize.ONE
+    while let Option<usize>.Some {value: node} = List<usize>.pop(&mut stack) {
+      let edges = List<Edge>.asSlice(&List<Block>.asSlice(&self.blocks)[node].edges)
+      let mut edge = usize.ZERO
+      while edge < edges.length {
+        let target = edges[edge].block
+        if !List<bool>.get(&reached, target) {
+          List<bool>.set(&mut reached, target, true)
+          run List<usize>.append(&mut stack, target)
+          kept = kept + usize.ONE
+        }
+        edge = edge + usize.ONE
+      }
+    }
+    if kept == count { return false }
+    let mut renumbered = run List<usize>.makeWithCapacity(count)
+    let mut order = run List<usize>.makeWithCapacity(kept)
+    let mut at = usize.ZERO
+    while at < count {
+      if List<bool>.get(&reached, at) {
+        run List<usize>.append(&mut renumbered, List<usize>.length(&order))
+        run List<usize>.append(&mut order, at)
+      } else {
+        run List<usize>.append(&mut renumbered, usize.MAX)
+      }
+      at = at + usize.ONE
+    }
+    run self.renumberBlocks(List<usize>.asSlice(&renumbered), List<usize>.asSlice(&order), false)
+    return true
+  }
+}
+
+fn countUse(counts: &mut List<usize>, value: u64) -> () {
+  if value == none() || u64.toUsize(value) >= List<usize>.length(&counts.*) { return () }
+  let index = u64.toUsize(value)
+  let counted = List<usize>.get(&counts.*, index) + usize.ONE
+  List<usize>.set(&mut counts.*, index, counted)
+  return ()
+}

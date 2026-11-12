@@ -1,0 +1,273 @@
+//! Loop-invariant code motion for one SSA function: instructions a loop computes the same way on
+//! every iteration move to a block that runs once before it.
+//!
+//! # When to use
+//! Run [`hoist`] in a build optimized for speed after the scalar passes, then run them again on
+//! what it moved. A build optimized for size skips it, since a loop may need a new preheader
+//! block and a hoisted value lives across the whole loop.
+//!
+//! # Details
+//! A natural loop is a header and the blocks that reach one of its back edges (an edge to a block
+//! that dominates its source) without passing the header. Its preheader is the one block outside
+//! the loop that jumps to the header, or a new block that takes the header's parameters, which
+//! every edge from outside the loop then goes through. Loops are visited from the last header in
+//! reverse postorder, so an inner loop's invariants reach its preheader, inside the outer loop,
+//! before the outer loop is visited.
+//!
+//! An instruction moves to the end of the preheader when each operand is defined outside the
+//! loop or by an instruction already moved, and:
+//!
+//! - it is pure (`Operation.isPure`) and cannot trap (`SsaFunction.mayTrap`), so running it when
+//!   the loop body would not have changes nothing observable; or
+//! - it is a load no write in the loop can reach: the loop holds no call, atomic operation, fence,
+//!   wait, notification or memory growth unless the load is from a slot that does not escape, and
+//!   no store, copy or fill in the loop may alias it (`SsaMemory.mayAlias`). A load that can trap
+//!   moves only from the header, and only when nothing before it in the header has side effects
+//!   or can trap: the header runs whenever the preheader leaves, so the load ran there first, in
+//!   the same memory, before anything observable.
+//!
+//! A trapping division, a call or a store never moves. Blocks are only added after the others,
+//! and instructions keep their numbers, so the result depends only on the function.
+
+import backend.SsaDeadCode
+import backend.SsaFunction {Definition, Edge, Exit, Operation, SsaFunction, none}
+import backend.SsaGraph {SsaGraph}
+import backend.SsaMemory
+import backend.SsaMemory {BaseForm, Place}
+import silk.collections.list {List}
+import silk.core.option {Option}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.u64
+import silk.num.usize
+
+/// Moves the loop-invariant instructions of every natural loop of `function` to its preheader,
+/// adding preheaders where needed; answers whether it moved any.
+pub effect fn hoist(function: &mut SsaFunction) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let graph = run SsaGraph.of(&function.*)
+  let mut headers = List<usize>.make()
+  let sequence = graph.reversePostorder()
+  let mut step = usize.ZERO
+  while step < sequence.length {
+    let block = sequence[step]
+    if isHeader(&function.*, &graph, block) { run List<usize>.append(&mut headers, block) }
+    step = step + usize.ONE
+  }
+  let mut changed = false
+  let mut at = List<usize>.length(&headers)
+  while at > usize.ZERO {
+    at = at - usize.ONE
+    if run hoistLoop(&mut function.*, List<usize>.get(&headers, at)) { changed = true }
+  }
+  return changed
+}
+
+// Whether an edge into `block` comes from a block it dominates.
+fn isHeader(function: &SsaFunction, graph: &SsaGraph, block: usize) -> bool {
+  let incoming = graph.predecessorsOf(block)
+  let mut at = usize.ZERO
+  while at < incoming.length {
+    if graph.dominates(block, incoming[at]) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+effect fn hoistLoop(function: &mut SsaFunction, header: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let graph = run SsaGraph.of(&function.*)
+  // The loop's blocks, by a walk back from the back edges' sources.
+  let count = function.blockCount()
+  let mut inLoop = run List<bool>.makeWithCapacity(count)
+  run List<bool>.appendRepeated(&mut inLoop, false, count)
+  List<bool>.set(&mut inLoop, header, true)
+  let mut stack = List<usize>.make()
+  let incoming = graph.predecessorsOf(header)
+  let mut at = usize.ZERO
+  while at < incoming.length {
+    if graph.dominates(header, incoming[at]) && !List<bool>.get(&inLoop, incoming[at]) {
+      List<bool>.set(&mut inLoop, incoming[at], true)
+      run List<usize>.append(&mut stack, incoming[at])
+    }
+    at = at + usize.ONE
+  }
+  if List<usize>.length(&stack) == usize.ZERO && !selfLoop(&function.*, header) { return false }
+  while let Option<usize>.Some {value: block} = List<usize>.pop(&mut stack) {
+    let before = graph.predecessorsOf(block)
+    let mut edge = usize.ZERO
+    while edge < before.length {
+      if !List<bool>.get(&inLoop, before[edge]) && graph.reaches(before[edge]) {
+        List<bool>.set(&mut inLoop, before[edge], true)
+        run List<usize>.append(&mut stack, before[edge])
+      }
+      edge = edge + usize.ONE
+    }
+  }
+  // The loop's blocks in reverse postorder, and what writes memory in it.
+  let mut body = List<usize>.make()
+  let sequence = graph.reversePostorder()
+  at = usize.ZERO
+  while at < sequence.length {
+    if List<bool>.get(&inLoop, sequence[at]) { run List<usize>.append(&mut body, sequence[at]) }
+    at = at + usize.ONE
+  }
+  let escaped = run SsaMemory.escapedSlots(&function.*)
+  let mut writes = List<Place>.make()
+  let mut writeSizes = List<u64>.make()
+  let mut clobbered = false
+  at = usize.ZERO
+  while at < List<usize>.length(&body) {
+    let listed = List<usize>.asSlice(&function.block(List<usize>.get(&body, at)).instructions)
+    let mut position = usize.ZERO
+    while position < listed.length {
+      let instruction = listed[position]
+      let found = function.instruction(instruction)
+      let operands = function.operandsOf(instruction)
+      match found.operation {
+        Operation.Store {offset, ..} => {
+          run List<Place>.append(&mut writes, SsaMemory.placeOf(&function.*, operands[usize.ONE], offset))
+          run List<u64>.append(&mut writeSizes, usize.toU64(function.kindOf(operands[usize.ZERO]).storeSize()))
+        }
+        Operation.CopyBytes {size} => {
+          run List<Place>.append(&mut writes, SsaMemory.placeOf(&function.*, operands[usize.ZERO], 0))
+          run List<u64>.append(&mut writeSizes, size)
+        }
+        Operation.Fill {size, ..} => {
+          run List<Place>.append(&mut writes, SsaMemory.placeOf(&function.*, operands[usize.ZERO], 0))
+          run List<u64>.append(&mut writeSizes, size)
+        }
+        _ => { if found.operation.hasSideEffects() { clobbered = true } }
+      }
+      position = position + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  // The candidates, in order, each of whose operands is defined outside the loop or by an
+  // earlier candidate.
+  let mut moved = run List<bool>.makeWithCapacity(function.instructionCount())
+  run List<bool>.appendRepeated(&mut moved, false, function.instructionCount())
+  let mut chosen = List<usize>.make()
+  at = usize.ZERO
+  while at < List<usize>.length(&body) {
+    let block = List<usize>.get(&body, at)
+    let listed = List<usize>.asSlice(&function.block(block).instructions)
+    let mut quiet = block == header
+    let mut position = usize.ZERO
+    while position < listed.length {
+      let instruction = listed[position]
+      if invariantOperands(&function.*, List<bool>.asSlice(&inLoop), List<bool>.asSlice(&moved), instruction)
+        && movable(&function.*, instruction, quiet, clobbered, List<bool>.asSlice(&escaped), List<Place>.asSlice(&writes), List<u64>.asSlice(&writeSizes)) {
+        List<bool>.set(&mut moved, instruction, true)
+        run List<usize>.append(&mut chosen, instruction)
+      } else if function.instruction(instruction).operation.hasSideEffects() || function.mayTrap(instruction) {
+        quiet = false
+      }
+      position = position + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  if List<usize>.length(&chosen) == usize.ZERO { return false }
+  let preheader = run preheaderOf(&mut function.*, &graph, List<bool>.asSlice(&inLoop), header)
+  at = usize.ZERO
+  while at < List<usize>.length(&chosen) {
+    let end = List<usize>.length(&function.block(preheader).instructions)
+    run function.moveInstruction(List<usize>.get(&chosen, at), preheader, end)
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn selfLoop(function: &SsaFunction, block: usize) -> bool {
+  let edges = List<Edge>.asSlice(&function.block(block).edges)
+  let mut at = usize.ZERO
+  while at < edges.length {
+    if edges[at].block == block { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// Whether every operand of `instruction` is defined outside the loop or by a moved instruction.
+fn invariantOperands(function: &SsaFunction, inLoop: &[bool], moved: &[bool], instruction: usize) -> bool {
+  let operands = function.operandsOf(instruction)
+  let mut at = usize.ZERO
+  while at < operands.length {
+    let value = function.value(operands[at])
+    let producer = function.producerOf(operands[at])
+    if producer != usize.MAX {
+      if inLoop[function.instruction(producer).block] && !moved[producer] { return false }
+    } else if value.definition == Definition.Parameter {
+      if inLoop[value.owner] { return false }
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// Whether `instruction`, whose operands are invariant, computes the same on every iteration and
+// may run before the loop.
+fn movable(function: &SsaFunction, instruction: usize, quiet: bool, clobbered: bool, escaped: &[bool], writes: &[Place], sizes: &[u64]) -> bool {
+  let found = function.instruction(instruction)
+  if found.result == none() { return false }
+  if found.operation.isPure() { return !function.mayTrap(instruction) }
+  let offset = match found.operation {
+    Operation.Load {offset, ..} => offset
+    _ => { return false }
+  }
+  let address = function.operandsOf(instruction)[usize.ZERO]
+  let place = SsaMemory.placeOf(function, address, offset)
+  let private = place.form == BaseForm.Slot && !escaped[u64.toUsize(place.base)]
+  if clobbered && !private { return false }
+  if !SsaDeadCode.inFrame(function, address) && !quiet { return false }
+  let size = usize.toU64(found.kind.storeSize())
+  let mut at = usize.ZERO
+  while at < writes.length {
+    if SsaMemory.mayAlias(writes[at], sizes[at], place, size, escaped, function.addressBits) { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// The block that runs once before the loop at `header`: the one outside block that jumps to it,
+// or a new block taking the header's parameters that every edge from outside goes through.
+effect fn preheaderOf(function: &mut SsaFunction, graph: &SsaGraph, inLoop: &[bool], header: usize) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let incoming = graph.predecessorsOf(header)
+  let mut outside = usize.MAX
+  let mut count = usize.ZERO
+  let mut at = usize.ZERO
+  while at < incoming.length {
+    if !inLoop[incoming[at]] {
+      outside = incoming[at]
+      count = count + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  if count == usize.ONE && function.block(outside).exit == Exit.Jump { return outside }
+  let place = function.block(header).startPlace
+  let made = run function.addJumpBlock(header, &[], place)
+  let mut parameters = List<u64>.make()
+  let kinds = List<u64>.length(&function.block(header).parameters)
+  at = usize.ZERO
+  while at < kinds {
+    let kind = function.kindOf(List<u64>.get(&function.block(header).parameters, at))
+    run List<u64>.append(&mut parameters, run function.addParameter(made, kind))
+    at = at + usize.ONE
+  }
+  run function.setJump(made, header, List<u64>.asSlice(&parameters))
+  let blocks = function.blockCount()
+  let mut from = usize.ZERO
+  while from < blocks {
+    if from != made && (from >= inLoop.length || !inLoop[from]) {
+      let edges = List<Edge>.length(&function.block(from).edges)
+      let mut edge = usize.ZERO
+      while edge < edges {
+        if List<Edge>.asSlice(&function.block(from).edges)[edge].block == header {
+          let mut arguments = List<u64>.make()
+          run List<u64>.appendSlice(&mut arguments, List<u64>.asSlice(&List<Edge>.asSlice(&function.block(from).edges)[edge].arguments))
+          run function.setEdge(from, edge, made, List<u64>.asSlice(&arguments))
+        }
+        edge = edge + usize.ONE
+      }
+    }
+    from = from + usize.ONE
+  }
+  return made
+}

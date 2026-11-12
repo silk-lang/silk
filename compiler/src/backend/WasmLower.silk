@@ -74,8 +74,13 @@ import backend.Mir {
   Terminator,
   TrapSite,
 }
+import backend.SsaFunction {Binary, Cast, Checked, Count, Extreme, Kind, Modify, Predicate, Reduction, SsaFunction, none, singleBits}
+import backend.SsaPipeline
+import backend.SsaPipeline {Level}
+import backend.SsaVerification
 import backend.WasmBody
-import backend.WasmBody {Binary, Body, Cast, Count, Extreme, Kind, Modify, Predicate, Promotion, Reduction, none}
+import backend.WasmBody {Kind as WasmKind}
+import backend.WasmEmission
 import backend.WasmObject
 import backend.WasmObject {Fragment, Function as WasmFunction, Import as WasmImport, Object, Pointer as ObjectPointer, Unsupported}
 import hir.Hir {Access, InfixOperator, PrefixOperator}
@@ -119,9 +124,9 @@ struct Value {
 impl Copy for Value {}
 
 struct Writer {
-  /// The fragment the definition goes into, and the body being built in it.
+  /// The fragment the definition goes into, and the function being built for it.
   fragment: Fragment,
-  body: Body,
+  function: SsaFunction,
   /// The last fresh number a private object's name took.
   counter: usize,
   /// The last location marker the body got, as `Origin.location.start` plus one, or zero.
@@ -169,10 +174,10 @@ struct Writer {
   frame: u64,
   /// A step's own step record (`stepRecord`), which its direct callee steps run published in.
   steps: u64,
-  /// An optimized build lowers each definition twice: a survey that records which frame slots
-  /// can live in wasm locals, then the lowering it emits, whose bodies adopt `plans` in order.
-  surveying: bool,
-  plans: List<Promotion>,
+  /// How hard the build optimizes the functions it emits, and whether it verifies each one's SSA
+  /// form after lowering and after each pass.
+  level: Level,
+  verify: bool,
 }
 
 /// An observed trap's report inputs: the observer and selected-cause local addresses, the site
@@ -198,12 +203,12 @@ impl Copy for CallerCopy {}
 // A writer for `target`, whose memory threads share when `shared`.
 effect fn writerFor(target: &Target, shared: bool) -> Writer ! OutOfMemoryError ? &mut Allocator {
   let bits = u32.toUsize(Target.pointerBits(target))
-  return Writer {fragment: Fragment.make(), body: run Body.make(b"", bits == 64, shared), counter: usize.ZERO, located: usize.ZERO,
+  return Writer {fragment: Fragment.make(), function: run SsaFunction.make(b"", bits), counter: usize.ZERO, located: usize.ZERO,
     symbol: Bytes.make(), lines: List<u64>.make(), trap: Option<TrapReport>.none(), observerLocal: usize.MAX, causeLocal: usize.MAX,
     siteLocal: usize.MAX, pointerBits: bits, shared: shared, slots: List<u64>.make(), companions: List<u64>.make(),
     blocks: List<usize>.make(), alignments: List<usize>.make(), copies: List<CallerCopy>.make(), parameters: List<u64>.make(),
     extras: List<u64>.make(), providers: List<u64>.make(), out: none(), failure: none(), context: none(), observer: none(),
-    cause: none(), site: none(), transfer: none(), frame: none(), steps: none(), surveying: false, plans: List<Promotion>.make()}
+    cause: none(), site: none(), transfer: none(), frame: none(), steps: none(), level: Level.None, verify: false}
 }
 
 // Finds the hidden diagnostic locals of `function`, whose blocks are about to be emitted.
@@ -252,27 +257,26 @@ fn same(a: &[u8], b: &[u8]) -> bool {
 
 // Functions.
 
-// Starts the body of the function `symbol`; its parameters and result follow.
+// Starts the function `symbol`; its parameters and result follow.
 effect fn beginBody(writer: &mut Writer, symbol: &[u8]) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
-  let wide = writer.pointerBits == 64
-  writer.body = run Body.make(symbol, wide, writer.shared)
-  if writer.surveying {
-    writer.body.survey()
-  } else if List<Promotion>.length(&writer.plans) != usize.ZERO {
-    writer.body.adopt(List<Promotion>.remove(&mut writer.*.plans, usize.ZERO))
-  }
+  writer.function = run SsaFunction.make(symbol, writer.pointerBits)
   return ()
 }
 
-// Adds a parameter of `kind` to the body being built; answers its value.
+// Adds a parameter of `kind` to the function being built; answers its value.
 effect fn parameterOf(writer: &mut Writer, kind: Kind) -> u64 ! Unsupported | OutOfMemoryError ? &mut Allocator {
-  return run writer.body.parameter(kind)
+  return run writer.function.argument(kind)
 }
 
-// Finishes the body being built into the fragment, exported as `exported` when not empty.
+// Finishes the function being built and adds its wasm body to the fragment, exported as
+// `exported` when not empty: its SSA form is finished, the passes of the build's level run on it
+// (`SsaPipeline.prepare`), and then it is emitted. A build that verifies checks the SSA form
+// after lowering and after each pass.
 effect fn endBody(writer: &mut Writer, exported: &[u8]) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
-  if writer.surveying { run List<Promotion>.append(&mut writer.*.plans, run writer.body.promotion()) }
-  let translated = run WasmBody.finish(&mut writer.*.body)
+  run writer.function.finish()
+  if writer.verify { run SsaVerification.verify(&writer.function, b"lowering") }
+  run SsaPipeline.prepare(&mut writer.*.function, writer.level, writer.verify)
+  let translated = run WasmEmission.emit(&writer.function, writer.shared)
   return run List<WasmFunction>.append(&mut writer.*.fragment.functions, WasmFunction {body: move translated, exported: run Bytes.copy(exported)})
 }
 
@@ -283,7 +287,7 @@ effect fn integerType(writer: &mut Writer, bits: usize) -> Kind ! Unsupported | 
 }
 
 effect fn pointerType(writer: &mut Writer) -> Kind ! Unsupported | OutOfMemoryError ? &mut Allocator {
-  return Kind.integer(writer.pointerBits)
+  return Kind.address(writer.pointerBits)
 }
 
 effect fn voidType(writer: &mut Writer) -> Kind ! Unsupported | OutOfMemoryError ? &mut Allocator {
@@ -303,7 +307,7 @@ effect fn laneTypeOf(writer: &mut Writer, value: Representation) -> Kind ! Unsup
 
 // The kind of a value: an aggregate's is its address.
 effect fn typeOf(writer: &mut Writer, value: Representation) -> Kind ! Unsupported | OutOfMemoryError ? &mut Allocator {
-  if value.aggregate || value.pointer { return Kind.integer(writer.pointerBits) }
+  if value.aggregate || value.pointer { return Kind.address(writer.pointerBits) }
   if value.unit { return Kind.unit() }
   let lane = run laneTypeOf(&mut writer.*, value)
   if value.lanes != usize.ZERO { return Kind.vector(lane, value.lanes) }
@@ -322,36 +326,36 @@ effect fn appendDecimal(text: &mut Bytes, value: u64) -> () ! Unsupported | OutO
 // The integer constant `value` of `kind`, every lane `value` for a vector.
 effect fn intOf(writer: &mut Writer, kind: Representation, value: u64) -> u64 ! Unsupported | OutOfMemoryError ? &mut Allocator {
   let ty = run typeOf(&mut writer.*, kind)
-  return run WasmBody.constant(&mut writer.*.body, ty, value)
+  return run writer.function.constant(ty, value)
 }
 
 // The integer constant `value` of `bits` bits.
 effect fn integerOf(writer: &mut Writer, bits: usize, value: u64) -> u64 ! Unsupported | OutOfMemoryError ? &mut Allocator {
-  return run WasmBody.integer(&mut writer.*.body, bits, value)
+  return run writer.function.integer(bits, value)
 }
 
 // The constant `value` of kind `ty`.
 effect fn constantOf(writer: &mut Writer, ty: Kind, value: u64) -> u64 ! Unsupported | OutOfMemoryError ? &mut Allocator {
-  return run WasmBody.constant(&mut writer.*.body, ty, value)
+  return run writer.function.constant(ty, value)
 }
 
 // The target word constant `value`.
 effect fn wordOf(writer: &mut Writer, value: usize) -> u64 ! Unsupported | OutOfMemoryError ? &mut Allocator {
-  return run WasmBody.word(&mut writer.*.body, usize.toU64(value))
+  return run writer.function.word(usize.toU64(value))
 }
 
 // The floating constant of `kind` equal to the binary64 `bits`, every lane for a vector.
 effect fn floatOf(writer: &mut Writer, kind: Representation, bits: u64) -> u64 ! Unsupported | OutOfMemoryError ? &mut Allocator {
   let ty = run typeOf(&mut writer.*, kind)
-  return run WasmBody.constant(&mut writer.*.body, ty, bits)
+  return run writer.function.constant(ty, bits)
 }
 
 effect fn boolOf(writer: &mut Writer, value: bool) -> u64 ! Unsupported | OutOfMemoryError ? &mut Allocator {
-  return run WasmBody.flag(&mut writer.*.body, value)
+  return run writer.function.flag(value)
 }
 
 effect fn nullOf(writer: &mut Writer) -> u64 ! Unsupported | OutOfMemoryError ? &mut Allocator {
-  return run WasmBody.word(&mut writer.*.body, 0)
+  return run writer.function.null()
 }
 
 // The two's complement bits of a decimal literal, negated when `negative`.
@@ -395,15 +399,16 @@ fn decimalWide(digits: &[u8], negative: bool) -> [u64; 2] {
 
 // A new block; `text` names it in LLVM's form, which wasm has no use for.
 effect fn labelled(writer: &mut Writer, text: &[u8]) -> usize ! Unsupported | OutOfMemoryError ? &mut Allocator {
-  return run WasmBody.newBlock(&mut writer.*.body)
+  return run writer.function.newBlock()
 }
 
 effect fn labelledNumber(writer: &mut Writer, text: &[u8], number: usize) -> usize ! Unsupported | OutOfMemoryError ? &mut Allocator {
-  return run WasmBody.newBlock(&mut writer.*.body)
+  return run writer.function.newBlock()
 }
 
 effect fn startBlock(writer: &mut Writer, handle: usize) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
-  return run WasmBody.startBlock(&mut writer.*.body, handle)
+  writer.function.startBlock(handle)
+  return ()
 }
 
 // The block of MIR block `index`.
@@ -419,15 +424,15 @@ fn slotOf(writer: &Writer, index: usize) -> u64 {
 // Instructions.
 
 effect fn binaryOf(writer: &mut Writer, op: Binary, left: u64, right: u64) -> u64 ! Unsupported | OutOfMemoryError ? &mut Allocator {
-  return run WasmBody.binary(&mut writer.*.body, op, left, right)
+  return run SsaFunction.binary(&mut writer.*.function, op, left, right)
 }
 
 effect fn compareOf(writer: &mut Writer, predicate: Predicate, left: u64, right: u64) -> u64 ! Unsupported | OutOfMemoryError ? &mut Allocator {
-  return run WasmBody.compare(&mut writer.*.body, predicate, left, right)
+  return run SsaFunction.compare(&mut writer.*.function, predicate, left, right)
 }
 
 effect fn selectOf(writer: &mut Writer, condition: u64, chosen: u64, otherwise: u64) -> u64 ! Unsupported | OutOfMemoryError ? &mut Allocator {
-  return run WasmBody.select(&mut writer.*.body, condition, chosen, otherwise)
+  return run SsaFunction.select(&mut writer.*.function, condition, chosen, otherwise)
 }
 
 // `xor` of `value` with all ones: the negation of a flag.
@@ -440,108 +445,108 @@ effect fn notOf(writer: &mut Writer, kind: Representation, value: u64) -> u64 ! 
 // the byte.
 effect fn loadOf(writer: &mut Writer, kind: Representation, address: u64, alignment: usize) -> u64 ! Unsupported | OutOfMemoryError ? &mut Allocator {
   let ty = run typeOf(&mut writer.*, kind)
-  return run WasmBody.load(&mut writer.*.body, ty, address, 0)
+  return run writer.function.load(ty, address, 0, alignment)
 }
 
 // Loads a value of kind `ty`.
 effect fn loadKind(writer: &mut Writer, ty: Kind, address: u64) -> u64 ! Unsupported | OutOfMemoryError ? &mut Allocator {
-  return run WasmBody.load(&mut writer.*.body, ty, address, 0)
+  return run writer.function.load(ty, address, 0, usize.ONE)
 }
 
 effect fn loadPointer(writer: &mut Writer, address: u64, alignment: usize) -> u64 ! Unsupported | OutOfMemoryError ? &mut Allocator {
   let ty = run pointerType(&mut writer.*)
-  return run WasmBody.load(&mut writer.*.body, ty, address, 0)
+  return run writer.function.load(ty, address, 0, alignment)
 }
 
 effect fn storeOf(writer: &mut Writer, value: u64, address: u64, alignment: usize) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
-  return run WasmBody.store(&mut writer.*.body, value, address, 0)
+  return run writer.function.store(value, address, 0, alignment)
 }
 
 effect fn castOf(writer: &mut Writer, op: Cast, input: &Value, output: Representation) -> Value ! Unsupported | OutOfMemoryError ? &mut Allocator {
   let ty = run typeOf(&mut writer.*, output)
-  return Value {scalar: output, value: run WasmBody.cast(&mut writer.*.body, op, input.value, ty)}
+  return Value {scalar: output, value: run SsaFunction.cast(&mut writer.*.function, op, input.value, ty)}
 }
 
 // `value` converted to kind `ty` by `op`.
 effect fn castTo(writer: &mut Writer, op: Cast, value: u64, ty: Kind) -> u64 ! Unsupported | OutOfMemoryError ? &mut Allocator {
-  return run WasmBody.cast(&mut writer.*.body, op, value, ty)
+  return run SsaFunction.cast(&mut writer.*.function, op, value, ty)
 }
 
 // The address `offset` bytes past `base`.
 effect fn byteOffset(writer: &mut Writer, base: u64, offset: usize) -> u64 ! Unsupported | OutOfMemoryError ? &mut Allocator {
-  return run WasmBody.offset(&mut writer.*.body, base, usize.toU64(offset))
+  return run SsaFunction.offset(&mut writer.*.function, base, usize.toU64(offset))
 }
 
 effect fn wordOffset(writer: &mut Writer, base: u64, offset: usize) -> u64 ! Unsupported | OutOfMemoryError ? &mut Allocator {
-  return run WasmBody.offset(&mut writer.*.body, base, usize.toU64(offset))
+  return run SsaFunction.offset(&mut writer.*.function, base, usize.toU64(offset))
 }
 
 // The address `index` bytes past `base`.
 effect fn indexedOffset(writer: &mut Writer, base: u64, index: u64) -> u64 ! Unsupported | OutOfMemoryError ? &mut Allocator {
-  return run WasmBody.indexed(&mut writer.*.body, base, index)
+  return run SsaFunction.indexed(&mut writer.*.function, base, index)
 }
 
 // Calls the function `name` with `arguments`; answers its `result`.
 effect fn callNamed(writer: &mut Writer, name: &[u8], result: Kind, arguments: &[u64]) -> u64
 ! Unsupported | OutOfMemoryError ? &mut Allocator {
-  return run WasmBody.call(&mut writer.*.body, name, arguments, result)
+  return run SsaFunction.call(&mut writer.*.function, name, arguments, result)
 }
 
 // Calls the function at address `callee` with `arguments`; answers its `result`.
 effect fn callAddress(writer: &mut Writer, callee: u64, arguments: &[u64], result: Kind) -> u64
 ! Unsupported | OutOfMemoryError ? &mut Allocator {
-  return run WasmBody.callIndirect(&mut writer.*.body, callee, arguments, result)
+  return run SsaFunction.callIndirect(&mut writer.*.function, callee, arguments, result)
 }
 
 // A trap, which ends the block.
 effect fn trapHere(writer: &mut Writer) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
-  return run WasmBody.trap(&mut writer.*.body)
+  return run SsaFunction.trap(&mut writer.*.function)
 }
 
 effect fn branch(writer: &mut Writer, target: usize) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
-  return run WasmBody.jump(&mut writer.*.body, target)
+  return run SsaFunction.jump(&mut writer.*.function, target)
 }
 
 effect fn branchIf(writer: &mut Writer, condition: u64, onTrue: usize, onFalse: usize) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
-  return run WasmBody.branchIf(&mut writer.*.body, condition, onTrue, onFalse)
+  return run SsaFunction.branchIf(&mut writer.*.function, condition, onTrue, onFalse)
 }
 
 effect fn returnValue(writer: &mut Writer, value: u64) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
-  return run WasmBody.ret(&mut writer.*.body, value)
+  return run SsaFunction.ret(&mut writer.*.function, value)
 }
 
 effect fn returnVoid(writer: &mut Writer) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
-  return run WasmBody.ret(&mut writer.*.body, none())
+  return run SsaFunction.ret(&mut writer.*.function, none())
 }
 
 // A variable of kind `ty`, which `assignOf` sets: what LLVM spells as a `phi`.
 effect fn variableOf(writer: &mut Writer, ty: Kind) -> u64 ! Unsupported | OutOfMemoryError ? &mut Allocator {
-  return run WasmBody.variable(&mut writer.*.body, ty)
+  return run SsaFunction.variable(&mut writer.*.function, ty)
 }
 
 effect fn assignOf(writer: &mut Writer, variable: u64, value: u64) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
-  return run WasmBody.assign(&mut writer.*.body, variable, value)
+  return run SsaFunction.assign(&mut writer.*.function, variable, value)
 }
 
 // A frame slot of `size` bytes aligned to `alignment`: what LLVM spells as an `alloca`.
 effect fn allocaOf(writer: &mut Writer, size: usize, alignment: usize) -> u64 ! Unsupported | OutOfMemoryError ? &mut Allocator {
   let mut aligned = alignment
   if aligned == usize.ZERO { aligned = usize.ONE }
-  return run WasmBody.slot(&mut writer.*.body, usize.toU64(size), usize.toU64(aligned))
+  return run writer.function.slotOf(usize.toU64(size), usize.toU64(aligned))
 }
 
 // Copies `size` bytes from `source` to `destination`; the two may overlap.
 effect fn copyCall(writer: &mut Writer, destination: u64, alignment: usize, source: u64, size: usize, distinct: bool) -> ()
 ! Unsupported | OutOfMemoryError ? &mut Allocator {
   if size == usize.ZERO { return () }
-  return run WasmBody.copyBytes(&mut writer.*.body, destination, source, usize.toU64(size))
+  return run SsaFunction.copyBytes(&mut writer.*.function, destination, source, usize.toU64(size))
 }
 
 // Sets `size` bytes at `destination` to `byte`.
 effect fn fillCall(writer: &mut Writer, destination: u64, alignment: usize, byte: u8, size: usize) -> ()
 ! Unsupported | OutOfMemoryError ? &mut Allocator {
   if size == usize.ZERO { return () }
-  return run WasmBody.fill(&mut writer.*.body, destination, byte, usize.toU64(size))
+  return run SsaFunction.fill(&mut writer.*.function, destination, byte, usize.toU64(size))
 }
 
 // Objects.
@@ -566,7 +571,7 @@ effect fn defineObject(writer: &mut Writer, symbol: &[u8], alignment: usize, ima
 
 // The address of the object or function `symbol`.
 effect fn addressOf(writer: &mut Writer, symbol: &[u8]) -> u64 ! Unsupported | OutOfMemoryError ? &mut Allocator {
-  return run WasmBody.symbolAddress(&mut writer.*.body, symbol, 0, false)
+  return run writer.function.symbolAddress(symbol, 0, false)
 }
 
 // The name of a private object of `content` alone: `stem`, then the 128-bit hash of `content` in
@@ -832,22 +837,23 @@ effect fn staticObject(writer: &mut Writer, function: &MirFunction, target: &Tar
 
 // The checked `stem` (`add`, `sub` or `mul`) of `left` and `right`, signed when `kind` is: the
 // wrapped value and whether it overflowed.
-effect fn overflowPair(writer: &mut Writer, stem: &[u8], kind: Representation, left: u64, right: u64) -> WasmBody.Checked
+effect fn overflowPair(writer: &mut Writer, stem: &[u8], kind: Representation, left: u64, right: u64) -> Checked
 ! Unsupported | OutOfMemoryError ? &mut Allocator {
   let mut operation = Binary.Add
   if same(stem, b"sub") { operation = Binary.Sub }
   if same(stem, b"mul") { operation = Binary.Mul }
-  return run WasmBody.overflowing(&mut writer.*.body, operation, kind.signed, left, right)
+  return run SsaFunction.overflowing(&mut writer.*.function, operation, kind.signed, left, right)
 }
 
 /// Shared definitions, emitted into every unit, which the link keeps once: the fatal dispatch
-/// helper, its frame walk over the step records (the frame table lookup, the report of one listed
-/// frame, the chain of a stepped frame's suspended callers), and the guard of an adopted
-/// allocation's reclaim call.
+/// helper and the guard of an adopted allocation's reclaim call. An unoptimized build (`frames`),
+/// which lists its functions in the frame table, also gets the helper's frame walk over the step
+/// records: the table lookup, the report of one listed frame, and the chain of a stepped frame's
+/// suspended callers.
 ///
 /// A construct the body builder cannot express leaves a fragment that records the refusal.
-pub effect fn declarations(target: &Target, shared: bool) -> Bytes ! OutOfMemoryError ? &mut Allocator {
-  match move run Effect.result(declarationsChecked(target, shared)) {
+pub effect fn declarations(target: &Target, shared: bool, frames: bool, verify: bool) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  match move run Effect.result(declarationsChecked(target, shared, frames, verify)) {
     Result<Bytes, Unsupported | OutOfMemoryError>.Success {value} => { return move value }
     Result<Bytes, Unsupported | OutOfMemoryError>.Failure {error} => match move error {
       Unsupported refused => { return run refusedFragment(move refused) }
@@ -863,12 +869,16 @@ effect fn refusedFragment(refused: Unsupported) -> Bytes ! OutOfMemoryError ? &m
   return run fragment.encode()
 }
 
-effect fn declarationsChecked(target: &Target, shared: bool) -> Bytes ! Unsupported | OutOfMemoryError ? &mut Allocator {
+effect fn declarationsChecked(target: &Target, shared: bool, frames: bool, verify: bool) -> Bytes
+! Unsupported | OutOfMemoryError ? &mut Allocator {
   let mut writer = run writerFor(target, shared)
-  run defineFatalDispatch(&mut writer, target)
-  run defineFrameName(&mut writer, target)
-  run defineFrameReport(&mut writer, target)
-  run defineStepChain(&mut writer, target)
+  writer.verify = verify
+  run defineFatalDispatch(&mut writer, target, frames)
+  if frames {
+    run defineFrameName(&mut writer, target)
+    run defineFrameReport(&mut writer, target)
+    run defineStepChain(&mut writer, target)
+  }
   run defineGuardedReclaim(&mut writer)
   return run writer.fragment.encode()
 }
@@ -893,11 +903,11 @@ effect fn defineGuardedReclaim(writer: &mut Writer) -> () ! Unsupported | OutOfM
 // null observer reports nothing. A record without an adapter is an execution's trap record, which
 // forwards to the observer of the drive running it, without a cause.
 //
-// Event 6 then carries no cause: the helper reports each listed caller frame as event 8 with its
-// name, and the cause last as event 9, so the call chain reads right below the trap site. A wasm
-// target has no unwinder, so the walk follows the step records alone: each one names its stepped
-// frame, then the suspended callers it leads to (`defineStepChain`).
-effect fn defineFatalDispatch(writer: &mut Writer, target: &Target) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
+// With `frames`, event 6 carries no cause. The helper then reports each listed caller frame as
+// event 8 with its name, and the cause last as event 9, so the call chain reads right below the
+// trap site. A wasm target has no unwinder, so the walk follows the step records alone: each one
+// names its stepped frame, then the suspended callers it leads to (`defineStepChain`).
+effect fn defineFatalDispatch(writer: &mut Writer, target: &Target, frames: bool) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
   let word = wordSize(target)
   let bits = word * 8
   let pointer = run pointerType(&mut writer.*)
@@ -959,8 +969,16 @@ effect fn defineFatalDispatch(writer: &mut Writer, target: &Target) -> () ! Unsu
   let originLengthAddress = run byteOffset(&mut writer.*, origin, word)
   let originLength = run loadKind(&mut writer.*, wordTy, originLengthAddress)
   let event = run integerOf(&mut writer.*, 8, 6)
-  let arguments = [callable, state, event, zero, zero, reasonData, reasonLength, originData, originLength, null, null, null]
+  let mut reported = first
+  if frames { reported = zero }
+  let arguments = [callable, state, event, reported, zero, reasonData, reasonLength, originData, originLength, null, null, null]
   drop run callAddress(&mut writer.*, callback, &arguments, wordTy)
+  if !frames {
+    run branch(&mut writer.*, done)
+    run startBlock(&mut writer.*, done)
+    run returnVoid(&mut writer.*)
+    return run endBody(&mut writer.*, b"")
+  }
   // The walk record `{callback, callable, state, count, site, site length, steps}` the frame walk
   // reads, `steps` the innermost step record it has yet to chain.
   let walk = run allocaOf(&mut writer.*, word * 7, word)
@@ -1019,7 +1037,7 @@ effect fn defineFrameName(writer: &mut Writer, target: &Target) -> () ! Unsuppor
   let word = wordSize(target)
   let pointer = run pointerType(&mut writer.*)
   run beginBody(&mut writer.*, b"silk.diagnostic.name")
-  run writer.body.result(pointer)
+  writer.function.setResult(pointer)
   let code = run parameterOf(&mut writer.*, pointer)
   let entry = run labelled(&mut writer.*, b"entry")
   let scan = run labelled(&mut writer.*, b"scan")
@@ -1230,10 +1248,11 @@ fn frameLimit() -> usize { return 64 }
 
 // Adds the entry `{defined, name}` of a function that has a frame name to the frame table the
 // fatal helper's walk reads (`defineFrameName`). `suffix` follows the function's symbol in the
-// defined function's, as `$step` does for the frame's step.
+// defined function's, as `$step` does for the frame's step. Only an unoptimized build lists its
+// functions, since only its fatal helper walks the table.
 effect fn frameEntry(writer: &mut Writer, function: &MirFunction, target: &Target, suffix: &[u8]) -> ()
 ! Unsupported | OutOfMemoryError ? &mut Allocator {
-  if Bytes.length(&function.frame) == usize.ZERO { return () }
+  if writer.level != Level.None || Bytes.length(&function.frame) == usize.ZERO { return () }
   let word = wordSize(target)
   let label = run stringObject(&mut writer.*, Bytes.asSlice(&function.frame), word * 8)
   let mut defined = run Bytes.copy(Bytes.asSlice(&writer.symbol))
@@ -1289,10 +1308,18 @@ effect fn trapReport(writer: &Writer, function: &MirFunction, target: &Target, o
   let mut at = usize.ZERO
   while at < sites.length {
     if sites[at].origin.node == origin.node && sites[at].origin.location.start == origin.location.start {
-      let site = writer.siteLocal
+      // A trap of an inlined body names the locals holding what its call passed.
+      let mut site = writer.siteLocal
+      let mut held = observer
+      let mut cause = writer.causeLocal
+      if sites[at].observer != usize.MAX {
+        site = sites[at].site
+        held = sites[at].observer
+        cause = sites[at].cause
+      }
       let mut entry = none()
       if site != usize.MAX { entry = slotOf(writer, site) }
-      return Option<TrapReport>.some(TrapReport {observer: slotOf(writer, observer), cause: slotOf(writer, writer.causeLocal),
+      return Option<TrapReport>.some(TrapReport {observer: slotOf(writer, held), cause: slotOf(writer, cause),
         label: run Bytes.copy(Bytes.asSlice(&sites[at].label)), bits: wordSize(target) * 8, entry: entry})
     }
     at = at + usize.ONE
@@ -1352,7 +1379,7 @@ fn flags(kind: Representation) -> Representation {
 // Whether any lane of `flag` (the flags of a `kind` operation) is set; a scalar flag is itself.
 effect fn anyLane(writer: &mut Writer, flag: u64, kind: Representation) -> u64 ! Unsupported | OutOfMemoryError ? &mut Allocator {
   if kind.lanes == usize.ZERO { return flag }
-  return run WasmBody.reduce(&mut writer.*.body, Reduction.Or, flag, none())
+  return run SsaFunction.reduce(&mut writer.*.function, Reduction.Or, flag, none())
 }
 
 // The one `bool` of a comparison whose lane flags are `flag`: `==` holds when every lane is equal
@@ -1361,7 +1388,7 @@ effect fn wholeVector(writer: &mut Writer, flag: u64, kind: Representation, oper
 ! Unsupported | OutOfMemoryError ? &mut Allocator {
   if kind.lanes == usize.ZERO { return flag }
   if operation != InfixOperator.Equals { return run anyLane(&mut writer.*, flag, kind) }
-  return run WasmBody.reduce(&mut writer.*.body, Reduction.And, flag, none())
+  return run SsaFunction.reduce(&mut writer.*.function, Reduction.And, flag, none())
 }
 
 // The bits of the smallest value of a signed integer of `bits`, or zero for a width without one.
@@ -1880,7 +1907,7 @@ effect fn emitScalarUnary(writer: &mut Writer, function: &MirFunction, target: &
   let input = run emitNumeric(&mut writer.*, function, target, layouts, operand, span)
   if !isFloating(input.scalar) { return run typedFormGap(function, span) }
   if operation == ScalarUnary.Sqrt {
-    return Value {scalar: input.scalar, value: run WasmBody.squareRoot(&mut writer.*.body, input.value)}
+    return Value {scalar: input.scalar, value: run SsaFunction.squareRoot(&mut writer.*.function, input.value)}
   }
   let raw = run castOf(&mut writer.*, Cast.Bitcast, &input, integerRepresentation(input.scalar.bits, false))
   let integer = raw.scalar
@@ -1985,12 +2012,12 @@ effect fn emitScalarBinary(writer: &mut Writer, function: &MirFunction, target: 
     return run castOf(&mut writer.*, Cast.Trunc, &high, kind)
   }
   if operation == ScalarBinary.RotateLeft || operation == ScalarBinary.RotateRight {
-    return Value {scalar: kind, value: run WasmBody.rotate(&mut writer.*.body, operation == ScalarBinary.RotateLeft, l, r)}
+    return Value {scalar: kind, value: run SsaFunction.rotate(&mut writer.*.function, operation == ScalarBinary.RotateLeft, l, r)}
   }
   if operation == ScalarBinary.SaturatingAdd || operation == ScalarBinary.SaturatingSubtract {
     let mut saturated = Binary.Add
     if operation == ScalarBinary.SaturatingSubtract { saturated = Binary.Sub }
-    return Value {scalar: kind, value: run WasmBody.saturating(&mut writer.*.body, saturated, kind.signed, l, r)}
+    return Value {scalar: kind, value: run SsaFunction.saturating(&mut writer.*.function, saturated, kind.signed, l, r)}
   }
   // A saturating product clamps an overflowing result toward the sign of the exact product.
   let pair = run overflowPair(&mut writer.*, b"mul", kind, l, r)
@@ -2113,7 +2140,7 @@ effect fn emitVector(
       run List<u64>.append(&mut lanes, index)
       lane = lane + usize.ONE
     }
-    return Value {scalar: kind, value: run WasmBody.shuffle(&mut writer.*.body, lowered[usize.ZERO].value, lowered[usize.ONE].value,
+    return Value {scalar: kind, value: run SsaFunction.shuffle(&mut writer.*.function, lowered[usize.ZERO].value, lowered[usize.ONE].value,
       List<u64>.asSlice(&lanes))}
   }
   if primitive == IntrinsicPrimitive.SimdPointerStore {
@@ -2122,7 +2149,7 @@ effect fn emitVector(
     return Value {scalar: kind, value: none()}
   }
   if primitive == IntrinsicPrimitive.SimdSplat {
-    return Value {scalar: kind, value: run WasmBody.splat(&mut writer.*.body, lowered[usize.ZERO].value, kind.lanes)}
+    return Value {scalar: kind, value: run SsaFunction.splat(&mut writer.*.function, lowered[usize.ZERO].value, kind.lanes)}
   }
   let first = lowered[usize.ZERO]
   let input = first.scalar
@@ -2130,9 +2157,9 @@ effect fn emitVector(
     primitive == IntrinsicPrimitive.SimdMulAdd {
     let mut result = none()
     if primitive == IntrinsicPrimitive.SimdMulAdd {
-      result = run WasmBody.fusedMultiplyAdd(&mut writer.*.body, lowered[usize.ZERO].value, lowered[usize.ONE].value, lowered[2].value)
+      result = run SsaFunction.fusedMultiplyAdd(&mut writer.*.function, lowered[usize.ZERO].value, lowered[usize.ONE].value, lowered[2].value)
     } else {
-      result = run WasmBody.extreme(&mut writer.*.body, lanewiseExtreme(primitive, kind), lowered[usize.ZERO].value, lowered[usize.ONE].value)
+      result = run SsaFunction.extreme(&mut writer.*.function, lanewiseExtreme(primitive, kind), lowered[usize.ZERO].value, lowered[usize.ONE].value)
     }
     if primitive == IntrinsicPrimitive.SimdMulAdd || !kind.floating { return Value {scalar: kind, value: result} }
     return Value {scalar: kind, value: run canonicalNaN(&mut writer.*, result, kind)}
@@ -2154,7 +2181,7 @@ effect fn emitVector(
     if primitive != IntrinsicPrimitive.SimdMaskToBits {
       let mut which = Count.Ones
       if primitive == IntrinsicPrimitive.SimdMaskFirstSet { which = Count.TrailingZeros }
-      counted = Value {scalar: counted.scalar, value: run WasmBody.countBits(&mut writer.*.body, which, counted.value)}
+      counted = Value {scalar: counted.scalar, value: run SsaFunction.countBits(&mut writer.*.function, which, counted.value)}
     }
     return run resize(&mut writer.*, &counted, kind)
   }
@@ -2165,7 +2192,7 @@ effect fn emitVector(
     let widened = run resize(&mut writer.*, &first, wide)
     let mut sum = wide
     sum.lanes = usize.ZERO
-    let total = Value {scalar: sum, value: run WasmBody.reduce(&mut writer.*.body, Reduction.Add, widened.value, none())}
+    let total = Value {scalar: sum, value: run SsaFunction.reduce(&mut writer.*.function, Reduction.Add, widened.value, none())}
     run integerRangeGuard(&mut writer.*, &total, kind)
     return run castOf(&mut writer.*, Cast.Trunc, &total, kind)
   }
@@ -2175,15 +2202,15 @@ effect fn emitVector(
     let started = primitive == IntrinsicPrimitive.SimdReduceAdd || primitive == IntrinsicPrimitive.SimdReduceAddUnordered
     let mut start = none()
     if started { start = run floatOf(&mut writer.*, kind, 0x8000000000000000) }
-    let result = run WasmBody.reduce(&mut writer.*.body, reduction, first.value, start)
+    let result = run SsaFunction.reduce(&mut writer.*.function, reduction, first.value, start)
     if !kind.floating || started { return Value {scalar: kind, value: result} }
     return Value {scalar: kind, value: run canonicalNaN(&mut writer.*, result, kind)}
   }
   if primitive == IntrinsicPrimitive.SimdExtract {
-    return Value {scalar: kind, value: run WasmBody.extractElement(&mut writer.*.body, first.value, lowered[usize.ONE].value)}
+    return Value {scalar: kind, value: run SsaFunction.extractElement(&mut writer.*.function, first.value, lowered[usize.ONE].value)}
   }
   if primitive == IntrinsicPrimitive.SimdInsert {
-    return Value {scalar: kind, value: run WasmBody.insertElement(&mut writer.*.body, first.value, lowered[2].value,
+    return Value {scalar: kind, value: run SsaFunction.insertElement(&mut writer.*.function, first.value, lowered[2].value,
       lowered[usize.ONE].value)}
   }
   if primitive == IntrinsicPrimitive.SimdSelect {
@@ -2314,7 +2341,7 @@ effect fn emitAtomic(
   let unit = Value {scalar: Representation {aggregate: false, size: usize.ZERO, bits: usize.ZERO, signed: false, unit: true,
     pointer: false, floating: false, lanes: usize.ZERO, unionAlignment: usize.ZERO, head: usize.ZERO}, value: none()}
   if primitive == IntrinsicPrimitive.AtomicFence {
-    run WasmBody.fence(&mut writer.*.body)
+    run SsaFunction.fence(&mut writer.*.function)
     return unit
   }
   let listed = List<Operand>.asSlice(operands)
@@ -2330,20 +2357,20 @@ effect fn emitAtomic(
   let pointer = lowered[usize.ZERO].value
   if primitive == IntrinsicPrimitive.AtomicLoad {
     let ty = run typeOf(&mut writer.*, kind)
-    return Value {scalar: kind, value: run WasmBody.atomicLoad(&mut writer.*.body, ty, pointer)}
+    return Value {scalar: kind, value: run SsaFunction.atomicLoad(&mut writer.*.function, ty, pointer)}
   }
   if primitive == IntrinsicPrimitive.AtomicStore {
-    run WasmBody.atomicStore(&mut writer.*.body, lowered[usize.ONE].value, pointer)
+    run SsaFunction.atomicStore(&mut writer.*.function, lowered[usize.ONE].value, pointer)
     return unit
   }
   if primitive == IntrinsicPrimitive.AtomicCompareExchange || primitive == IntrinsicPrimitive.AtomicCompareExchangeWeak {
     let expected = lowered[usize.ONE].value
     let current = run loadOf(&mut writer.*, kind, expected, kind.bits / 8)
-    let pair = run WasmBody.compareExchange(&mut writer.*.body, pointer, current, lowered[2].value)
+    let pair = run SsaFunction.compareExchange(&mut writer.*.function, pointer, current, lowered[2].value)
     run storeOf(&mut writer.*, pair.value, expected, kind.bits / 8)
     return Value {scalar: booleanRepresentation(), value: pair.overflow}
   }
-  return Value {scalar: kind, value: run WasmBody.atomicModify(&mut writer.*.body, atomicReadModifyWrite(primitive, kind.signed), pointer,
+  return Value {scalar: kind, value: run SsaFunction.atomicModify(&mut writer.*.function, atomicReadModifyWrite(primitive, kind.signed), pointer,
     lowered[usize.ONE].value)}
 }
 
@@ -2405,10 +2432,10 @@ effect fn emitAssembly(writer: &mut Writer, function: &MirFunction, target: &Tar
       if global != usize.MAX {
         if same(mnemonic, b"global.get") {
           let pointer = run pointerType(&mut writer.*)
-          run List<u64>.append(&mut stack, run WasmBody.globalGet(&mut writer.*.body, global, pointer))
+          run List<u64>.append(&mut stack, run SsaFunction.globalGet(&mut writer.*.function, global, pointer))
           done = true
         } else if let Option<u64>.Some {value} = List<u64>.pop(&mut stack) {
-          run WasmBody.globalSet(&mut writer.*.body, global, value)
+          run SsaFunction.globalSet(&mut writer.*.function, global, value)
           done = true
         }
       }
@@ -2479,7 +2506,7 @@ effect fn emitScalarRvalue(
       let owner = InstanceKey.identity(&function.key)
       fail Gap.relative(GapCode.TypedForm, &owner, span)
     }
-    Rvalue.FrameAddress => Value {scalar: pointerRepresentation(target), value: run WasmBody.frameAddress(&mut writer.*.body)}
+    Rvalue.FrameAddress => Value {scalar: pointerRepresentation(target), value: run SsaFunction.frameAddress(&mut writer.*.function)}
     // The word is a hidden zero-initialized object named after the instance's own symbol, so it
     // is defined exactly where the instance is, once per program.
     Rvalue.ProcessWord => {
@@ -2508,7 +2535,7 @@ effect fn emitScalarRvalue(
       run trapWhen(&mut writer.*, overflow, b"arithmetic overflow")
       let bytes = pair.value
       return Value {scalar: pointerRepresentation(target),
-        value: run WasmBody.dynamicSlot(&mut writer.*.body, bytes, usize.toU64(facts.alignment))}
+        value: run SsaFunction.dynamicSlot(&mut writer.*.function, bytes, usize.toU64(facts.alignment))}
     }
     // A frame-based instance's step reads its transfer record's package word.
     // An ordinary emission of such an instance, which only selects the suspendable set, has no
@@ -2591,7 +2618,7 @@ effect fn emitScalarRvalue(
     Rvalue.Unary {operation, value} => {
       let input = run emitOperand(&mut writer.*, function, target, layouts, &value)
       if input.scalar.floating && operation == PrefixOperator.Negate {
-        return Value {scalar: input.scalar, value: run WasmBody.negate(&mut writer.*.body, input.value)}
+        return Value {scalar: input.scalar, value: run SsaFunction.negate(&mut writer.*.function, input.value)}
       }
       if input.scalar.floating || input.scalar.pointer {
         let owner = InstanceKey.identity(&function.key)
@@ -3388,7 +3415,7 @@ effect fn emitCCall(writer: &mut Writer, function: &MirFunction, target: &Target
   } else if address != none() {
     result = run callAddress(&mut writer.*, address, List<u64>.asSlice(&passed), resultKind)
   } else if signature.variadic {
-    result = run WasmBody.callVariadic(&mut writer.*.body, Bytes.asSlice(&signature.symbol), List<u64>.asSlice(&passed),
+    result = run SsaFunction.callVariadic(&mut writer.*.function, Bytes.asSlice(&signature.symbol), List<u64>.asSlice(&passed),
       List<u64>.asSlice(&trailing), resultKind)
   } else {
     result = run callNamed(&mut writer.*, Bytes.asSlice(&signature.symbol), resultKind, List<u64>.asSlice(&passed))
@@ -3744,10 +3771,9 @@ effect fn emitBlock(
       let report = run trapReport(&writer.*, function, target, origin)
       writer.trap = move report
       // A source trap is a violated precondition of the package's API, so it reports at the call
-      // that entered the package (TERM-008).
+      // that entered the package (TERM-008), which its trap site's entry local holds.
       let mut entry = none()
-      let site = diagnosticLocal(function, 2)
-      if site != usize.MAX { entry = slotOf(&writer.*, site) }
+      if let Option<TrapReport>.Some {value} = &writer.trap { entry = value.entry }
       run reportTrapDescriptor(&mut writer.*, text.value, entry)
       writer.trap = Option<TrapReport>.none()
       run trapHere(&mut writer.*)
@@ -4005,7 +4031,11 @@ effect fn cLaneResult(writer: &mut Writer, lane: &CAbi.Lane) -> Kind ! Unsupport
 ///
 /// A suspendable instance's `suspension` facts make its ordinary symbol a driver and add its
 /// `$enter` and `$step` definitions (`backend.Coroutine`). `shared` says the memory is shared
-/// between threads.
+/// between threads. Each function is lowered to SSA form (`SsaFunction`), prepared by the passes
+/// of `level` (`SsaPipeline`): an unoptimized build only promotes its variables to values, an
+/// optimized one runs the scalar optimizations. Then it is emitted as wasm (`WasmEmission`). With
+/// `verify`, each function's SSA form is checked after lowering and after each pass
+/// (`SsaVerification`).
 pub effect fn emit(
   function: &MirFunction,
   target: &Target,
@@ -4015,9 +4045,10 @@ pub effect fn emit(
   suspension: &Option<Facts>,
   shared: bool,
   hostExport: bool,
-  optimized: bool,
+  level: Level,
+  verify: bool,
 ) -> Bytes ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
-  match move run Effect.result(emitOptimized(function, target, supplied, foreign, identities, suspension, shared, hostExport, optimized)) {
+  match move run Effect.result(emitChecked(function, target, supplied, foreign, identities, suspension, shared, hostExport, level, verify)) {
     Result<Bytes, Gap | Unsupported | OutOfMemoryError>.Success {value} => { return move value }
     Result<Bytes, Gap | Unsupported | OutOfMemoryError>.Failure {error} => match move error {
       Unsupported refused => { return run refusedFragment(move refused) }
@@ -4027,29 +4058,7 @@ pub effect fn emit(
   }
 }
 
-// Lowers one definition. An optimized build first surveys a lowering of it, then lowers it again
-// with every frame slot whose address is only loaded and stored kept in wasm locals, as LLVM's
-// mem2reg and SROA would: an unoptimized lowering gives every MIR local a frame slot.
-effect fn emitOptimized(
-  function: &MirFunction,
-  target: &Target,
-  supplied: &[TypeLayout],
-  foreign: &[CAbi.Signature],
-  identities: &[InstanceIdentity],
-  suspension: &Option<Facts>,
-  shared: bool,
-  hostExport: bool,
-  optimized: bool,
-) -> Bytes ! Gap | Unsupported | OutOfMemoryError ? &mut Allocator | &mut Types {
-  let mut plans = List<Promotion>.make()
-  if optimized {
-    drop run emitChecked(function, target, supplied, foreign, identities, suspension, shared, hostExport, true, &mut plans)
-  }
-  return run emitChecked(function, target, supplied, foreign, identities, suspension, shared, hostExport, false, &mut plans)
-}
-
-// Lowers one definition; a survey (`surveying`) leaves its bodies' plans in `plans`, and a
-// lowering adopts the plans there.
+// Lowers one definition, each of its functions prepared by the passes of `level`.
 effect fn emitChecked(
   function: &MirFunction,
   target: &Target,
@@ -4059,17 +4068,15 @@ effect fn emitChecked(
   suspension: &Option<Facts>,
   shared: bool,
   hostExport: bool,
-  surveying: bool,
-  plans: &mut List<Promotion>,
+  level: Level,
+  verify: bool,
 ) -> Bytes ! Gap | Unsupported | OutOfMemoryError ? &mut Allocator | &mut Types {
   // The lookup index lives only while this instance's code is built.
   let indexed = run TypeLayouts.copyOf(supplied)
   let layouts = &indexed
   let mut writer = run writerFor(target, shared)
-  writer.surveying = surveying
-  while List<Promotion>.length(&plans.*) != usize.ZERO {
-    run List<Promotion>.append(&mut writer.plans, List<Promotion>.remove(&mut plans.*, usize.ZERO))
-  }
+  writer.level = level
+  writer.verify = verify
   run List<u64>.appendSlice(&mut writer.lines, List<u64>.asSlice(&function.lines))
   let locals = List<Local>.asSlice(&function.locals)
   let resultFacts = run layoutOf(layouts, &function.result, function, locals[usize.ZERO].origin.location)
@@ -4103,7 +4110,7 @@ effect fn emitChecked(
   }
   let base = run Bytes.copy(Bytes.asSlice(&writer.symbol))
   run beginFunction(&mut writer, Bytes.asSlice(&base))
-  run writer.body.result(resultType)
+  writer.function.setResult(resultType)
   let shape = run LoweringPlan.ordinaryShape(LoweringPlan.callable(function), outward)
   let order = List<Lane>.asSlice(&shape.lanes)
   let mut step = usize.ZERO
@@ -4176,7 +4183,6 @@ effect fn emitChecked(
       run emitStep(&mut writer, function, target, layouts, foreign, identities, &suspended, &stepping, Bytes.asSlice(&base))
     }
     run frameEntry(&mut writer, function, target, b"")
-    run handOver(&mut writer, &mut plans.*)
     return run writer.fragment.encode()
   }
   let ordinary = Option<Suspended>.none()
@@ -4196,17 +4202,7 @@ effect fn emitChecked(
   if exported && same(Bytes.asSlice(&writer.symbol), threadEntrySymbol()) {
     run defineThreadStart(&mut writer, Bytes.asSlice(&base))
   }
-  run handOver(&mut writer, &mut plans.*)
   return run writer.fragment.encode()
-}
-
-// Moves a survey's plans out of `writer` into `plans`.
-effect fn handOver(writer: &mut Writer, plans: &mut List<Promotion>) -> () ! OutOfMemoryError ? &mut Allocator {
-  if !writer.surveying { return () }
-  while List<Promotion>.length(&writer.plans) != usize.ZERO {
-    run List<Promotion>.append(&mut plans.*, List<Promotion>.remove(&mut writer.*.plans, usize.ZERO))
-  }
-  return ()
 }
 
 // The symbol of the wasm32 entry module's thread entry, which `wasi_thread_start` calls.
@@ -4233,23 +4229,27 @@ effect fn defineThreadStart(writer: &mut Writer, entry: &[u8]) -> () ! Unsupport
   let top = run loadPointer(&mut writer.*, handle, 4)
   // The block: the thread-local size below the top, aligned down; the stack: below the block,
   // aligned to 16.
-  let size = run WasmBody.linkConstant(&mut writer.*.body, b"__tls_size")
-  let align = run WasmBody.linkConstant(&mut writer.*.body, b"__tls_align")
-  let below = run binaryOf(&mut writer.*, Binary.Sub, top, size)
+  let size = run SsaFunction.linkConstant(&mut writer.*.function, b"__tls_size")
+  let align = run SsaFunction.linkConstant(&mut writer.*.function, b"__tls_align")
+  // An address takes no integer arithmetic, so the carving is done on the top as a word.
+  let topWord = run castTo(&mut writer.*, Cast.PtrToInt, top, int32)
+  let below = run binaryOf(&mut writer.*, Binary.Sub, topWord, size)
   let zero = run integerOf(&mut writer.*, 32, 0)
   let mask = run binaryOf(&mut writer.*, Binary.Sub, zero, align)
-  let block = run binaryOf(&mut writer.*, Binary.And, below, mask)
+  let blockWord = run binaryOf(&mut writer.*, Binary.And, below, mask)
   let sixteen = run integerOf(&mut writer.*, 32, 4294967280)
-  let stack = run binaryOf(&mut writer.*, Binary.And, block, sixteen)
-  run WasmBody.globalSet(&mut writer.*.body, usize.ZERO, stack)
+  let stackWord = run binaryOf(&mut writer.*, Binary.And, blockWord, sixteen)
+  let block = run castTo(&mut writer.*, Cast.IntToPtr, blockWord, pointer)
+  let stack = run castTo(&mut writer.*, Cast.IntToPtr, stackWord, pointer)
+  run SsaFunction.globalSet(&mut writer.*.function, usize.ZERO, stack)
   let blockArguments = [block]
   drop run callNamed(&mut writer.*, b"__wasm_init_tls", Kind.unit(), &blockArguments)
   let entryArguments = [handle]
   let done = run callNamed(&mut writer.*, entry, pointer, &entryArguments)
   let one = run integerOf(&mut writer.*, 32, 1)
-  run WasmBody.atomicStore(&mut writer.*.body, one, done)
+  run SsaFunction.atomicStore(&mut writer.*.function, one, done)
   let count = run integerOf(&mut writer.*, 32, 4294967295)
-  drop run WasmBody.atomicNotify(&mut writer.*.body, done, count)
+  drop run SsaFunction.atomicNotify(&mut writer.*.function, done, count)
   run returnVoid(&mut writer.*)
   return run endBody(&mut writer.*, b"wasi_thread_start")
 }
@@ -4274,16 +4274,16 @@ effect fn emitWasm(writer: &mut Writer, function: &MirFunction, target: &Target,
   let values = List<u64>.asSlice(&arguments)
   if primitive == IntrinsicPrimitive.WasmMemorySize {
     representation = lengthRepresentation(target)
-    return Value {scalar: representation, value: run WasmBody.memorySize(&mut writer.*.body)}
+    return Value {scalar: representation, value: run SsaFunction.memorySize(&mut writer.*.function)}
   }
   if primitive == IntrinsicPrimitive.WasmMemoryGrow {
     representation = lengthRepresentation(target)
-    return Value {scalar: representation, value: run WasmBody.memoryGrow(&mut writer.*.body, values[usize.ZERO])}
+    return Value {scalar: representation, value: run SsaFunction.memoryGrow(&mut writer.*.function, values[usize.ZERO])}
   }
   if primitive == IntrinsicPrimitive.WasmAtomicWait32 {
-    return Value {scalar: representation, value: run WasmBody.atomicWait(&mut writer.*.body, values[usize.ZERO], values[usize.ONE], values[2])}
+    return Value {scalar: representation, value: run SsaFunction.atomicWait(&mut writer.*.function, values[usize.ZERO], values[usize.ONE], values[2])}
   }
-  return Value {scalar: representation, value: run WasmBody.atomicNotify(&mut writer.*.body, values[usize.ZERO], values[usize.ONE])}
+  return Value {scalar: representation, value: run SsaFunction.atomicNotify(&mut writer.*.function, values[usize.ZERO], values[usize.ONE])}
 }
 
 // Makes the blocks of `count` MIR blocks.
@@ -4504,8 +4504,9 @@ effect fn stepFrame(writer: &mut Writer, resume: u64, transfer: u64, top: u64, s
 // The step record of a driver, `{top, outer}`. While a driver steps a frame, its record holds that
 // frame and the record it hides, and the thread's innermost record (`activeSteps`) is it, so a
 // trap's report can name the suspended callers of the frame, which only the frame chain knows
-// (`defineStepChain`).
+// (`defineStepChain`). An optimized build, whose traps report no callers, has none: `none()`.
 effect fn stepRecord(writer: &mut Writer, word: usize) -> u64 ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  if writer.level != Level.None { return none() }
   return run allocaOf(&mut writer.*, word * 2, word)
 }
 
@@ -4520,7 +4521,7 @@ effect fn activeSteps(writer: &mut Writer, word: usize) -> u64 ! Unsupported | O
     at = at + usize.ONE
   }
   if !defined { run defineObject(&mut writer.*, b"__silk_active_steps", word, run Bytes.zeroed(word), List<ObjectPointer>.make(), false, true) }
-  return run WasmBody.symbolAddress(&mut writer.*.body, b"__silk_active_steps", 0, true)
+  return run writer.function.symbolAddress(b"__silk_active_steps", 0, true)
 }
 
 // Whether `value` is the null address.
@@ -4691,7 +4692,10 @@ effect fn emitEnter(writer: &mut Writer, function: &MirFunction, target: &Target
   if stepping.coroutine.alignment <= word {
     let cursor = run loadPointer(&mut writer.*, state, usize.ZERO)
     let end = run loadWordAt(&mut writer.*, state, word)
-    let room = run binaryOf(&mut writer.*, Binary.Sub, end, cursor)
+    let wordTy = run wordType(&mut writer.*)
+    let endWord = run castTo(&mut writer.*, Cast.PtrToInt, end, wordTy)
+    let cursorWord = run castTo(&mut writer.*, Cast.PtrToInt, cursor, wordTy)
+    let room = run binaryOf(&mut writer.*, Binary.Sub, endWord, cursorWord)
     let fits = run compareOf(&mut writer.*, Predicate.Ule, size, room)
     let carve = run labelled(&mut writer.*, b"carve")
     run branchIf(&mut writer.*, fits, carve, provide)
@@ -4809,7 +4813,7 @@ effect fn emitStep(writer: &mut Writer, function: &MirFunction, target: &Target,
   run beginFunction(&mut writer.*, Bytes.asSlice(&name))
   writer.transfer = run parameterOf(&mut writer.*, pointer)
   writer.frame = run parameterOf(&mut writer.*, pointer)
-  run writer.body.result(int32)
+  writer.function.setResult(int32)
   let transfer = writer.transfer
   let frame = writer.frame
   let blocks = List<Block>.asSlice(&function.blocks)
@@ -4888,7 +4892,7 @@ effect fn emitStep(writer: &mut Writer, function: &MirFunction, target: &Target,
     run List<u64>.append(&mut table, usize.toU64(List<usize>.get(&cancels, point - usize.ONE)))
     point = point + usize.ONE
   }
-  run WasmBody.switch(&mut writer.*.body, state, List<u64>.asSlice(&table), invalid)
+  run SsaFunction.switch(&mut writer.*.function, state, List<u64>.asSlice(&table), invalid)
   run startBlock(&mut writer.*, dispatch)
   List<u64>.clear(&mut table)
   point = usize.ONE
@@ -4897,7 +4901,7 @@ effect fn emitStep(writer: &mut Writer, function: &MirFunction, target: &Target,
     run List<u64>.append(&mut table, usize.toU64(List<usize>.get(&resumes, point - usize.ONE)))
     point = point + usize.ONE
   }
-  run WasmBody.switch(&mut writer.*.body, state, List<u64>.asSlice(&table), invalid)
+  run SsaFunction.switch(&mut writer.*.function, state, List<u64>.asSlice(&table), invalid)
   run startBlock(&mut writer.*, invalid)
   run trapHere(&mut writer.*)
   run startBlock(&mut writer.*, start)
@@ -5054,7 +5058,7 @@ effect fn emitRelinquish(writer: &mut Writer, target: &Target, stepping: &Suspen
   let activation = run byteOffset(&mut writer.*, package, Coroutine.packageActivation(word))
   // A waking thread reads the activation atomically, so the owner writes it atomically (EXEC-009).
   let relinquished = run wordOf(&mut writer.*, SealedCore.lifecycleWord(Lifecycle.Relinquished))
-  run WasmBody.atomicStore(&mut writer.*.body, relinquished, activation)
+  run SsaFunction.atomicStore(&mut writer.*.function, relinquished, activation)
   let parked = run integerOf(&mut writer.*, 32, 2)
   return run returnValue(&mut writer.*, parked)
 }
@@ -5231,7 +5235,14 @@ effect fn cFunctionType(writer: &mut Writer, called: &CAbi.Signature) -> Bytes !
     at = at + usize.ONE
   }
   if called.variadic { run List<Kind>.append(&mut types, run pointerType(&mut writer.*)) }
-  return run WasmBody.signatureOf(List<Kind>.asSlice(&types), result)
+  let mut lanes = run List<WasmKind>.makeWithCapacity(List<Kind>.length(&types))
+  let listed = List<Kind>.asSlice(&types)
+  let mut lane = usize.ZERO
+  while lane < listed.length {
+    run List<WasmKind>.append(&mut lanes, WasmEmission.wasmKind(listed[lane], writer.pointerBits))
+    lane = lane + usize.ONE
+  }
+  return run WasmBody.signatureOf(List<WasmKind>.asSlice(&lanes), WasmEmission.wasmKind(result, writer.pointerBits))
 }
 
 // Coercion registers can be wider than the final bytes of a record on AAPCS64. Load only the
@@ -5361,7 +5372,7 @@ effect fn exportedObjectChecked(target: &Target, signature: &CAbi.Signature, con
     ObjectConstant.Float {bits, single} => binary64(bits, single)
   }
   if let ObjectConstant.Float {..} = &constant.* {
-    if size == 4 { bits = WasmBody.singleBits(bits) }
+    if size == 4 { bits = singleBits(bits) }
   }
   let mut image = run Bytes.zeroed(size)
   writeWord(&mut image, usize.ZERO, size, bits)
@@ -5443,5 +5454,6 @@ effect fn locate(writer: &mut Writer, origin: Option<Origin>) -> () ! Unsupporte
     if found < wanted { low = middle + usize.ONE } else { high = middle }
   }
   if place == 0 { return () }
-  return run WasmBody.locate(&mut writer.*.body, place)
+  writer.function.locate(place)
+  return ()
 }

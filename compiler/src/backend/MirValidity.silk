@@ -1,0 +1,347 @@
+//! Structural validity of one MIR function: what every pass must leave true and both backends
+//! assume without checking.
+//!
+//! # When to use
+//!
+//! Call [`check`] after a pass rewrites a function, such as coalescing or inlining. A violation is
+//! a compiler defect, never a property of the program being compiled.
+//!
+//! # Details
+//!
+//! A valid function satisfies all of these:
+//!
+//! - It has a block, and every successor of every terminator, every switch target and every cancel
+//!   exit names a block that exists.
+//! - Local 0, and no other local, is the `Return` local, and the parameters follow it in order:
+//!   local `1 + i` is parameter `i`, one for each entry of `MirFunction.parameters`.
+//! - At most one local is the failure slot, the observer, the cause or the site, and a block that
+//!   ends in `Fail` has a failure slot to write.
+//! - Every place names locals that exist, as its own local and as each runtime index, and so does
+//!   every drop flag's guarded place. No drop flag guards another drop flag.
+//! - Each cancel exit belongs to a block that ends in a call or a relinquish, and no block has two.
+//! - A call of a C function or a C pointer passes no providers and no diagnostic operands.
+//! - A switch lists each value once.
+//! - A failure context that originates a context has a `MirFunction.contexts` entry at its origin,
+//!   which the backends look up to write the context's identity and label.
+//! - Every instance the body calls, drops through, or takes the address of is one of its
+//!   `references`, so the build reaches and emits it.
+//! - Every debug variable names a local that exists.
+
+import backend.InstanceKey {InstanceKey}
+import backend.Mir {
+  Block,
+  Callee,
+  Cancel,
+  ContextText,
+  Local,
+  LocalKind,
+  MirFunction,
+  Operand,
+  Place,
+  Projection,
+  Reference,
+  Rvalue,
+  Statement,
+  SwitchCase,
+  Terminator,
+  Variable,
+}
+import backend.MirWalk
+import semantic.InternIndex {InternIndex}
+import semantic.Type {Type}
+import semantic.TypedBody {Origin}
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.core.option {Option}
+import silk.core.ownership {Copy}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.mem.interned {Interned}
+import silk.num.usize
+
+/// What a structurally invalid MIR function gets wrong.
+pub enum Defect {
+  /// The function has no entry block.
+  NoBlocks,
+  /// Local 0 is not the `Return` local, or another local is.
+  ReturnLocal,
+  /// The parameter locals do not follow local 0 in order, one per `MirFunction.parameters` entry.
+  Parameters,
+  /// Two locals are the failure slot, the observer, the cause or the site.
+  DuplicateHidden,
+  /// A place, a drop flag or a debug variable names a local that does not exist.
+  LocalRange,
+  /// A drop flag guards another drop flag.
+  FlagOfFlag,
+  /// A successor or a cancel exit names a block that does not exist.
+  BlockRange,
+  /// A block ends in `Fail` but the function has no failure slot.
+  FailWithoutSlot,
+  /// A cancel exit belongs to a block that ends in neither a call nor a relinquish, or a block has
+  /// two.
+  CancelPoint,
+  /// A call of a C function or pointer passes providers or diagnostic operands.
+  ForeignHidden,
+  /// A switch lists one value twice.
+  SwitchRepeat,
+  /// A failure context that originates a context has no `contexts` entry at its origin.
+  MissingContext,
+  /// The body calls, drops through, or takes the address of an instance its references omit.
+  Unreferenced,
+}
+
+/// One violation: its defect, and where: block `block` and its statement `at`, where `at` equal to
+/// the block's statement count is its terminator. A violation of the function as a whole has
+/// `block` equal to `usize.MAX`.
+pub struct Violation {
+  pub defect: Defect,
+  pub block: usize,
+  pub at: usize,
+}
+
+impl Copy for Violation {}
+
+/// The text that names `defect` in a compiler defect report.
+pub fn describe(defect: Defect) -> &'static [u8] {
+  return match defect {
+    Defect.NoBlocks => b"has no entry block"
+    Defect.ReturnLocal => b"does not have exactly one return local, at local 0"
+    Defect.Parameters => b"does not list its parameters in order after the return local"
+    Defect.DuplicateHidden => b"has two failure, observer, cause or site locals"
+    Defect.LocalRange => b"names a local that does not exist"
+    Defect.FlagOfFlag => b"has a drop flag that guards a drop flag"
+    Defect.BlockRange => b"continues to a block that does not exist"
+    Defect.FailWithoutSlot => b"fails without a failure slot"
+    Defect.CancelPoint => b"has a cancel exit that does not belong to exactly one suspension point"
+    Defect.ForeignHidden => b"passes providers or diagnostics to a C callee"
+    Defect.SwitchRepeat => b"lists one switch value twice"
+    Defect.MissingContext => b"originates a failure context without a context entry"
+    Defect.Unreferenced => b"uses an instance its references omit"
+  }
+}
+
+fn whole(defect: Defect) -> Option<Violation> {
+  return Option<Violation>.some(Violation {defect: defect, block: usize.MAX, at: usize.MAX})
+}
+
+fn at(defect: Defect, block: usize, index: usize) -> Option<Violation> {
+  return Option<Violation>.some(Violation {defect: defect, block: block, at: index})
+}
+
+fn placeInRange(place: &Place, count: usize) -> bool {
+  if place.local >= count { return false }
+  let steps = List<Projection>.asSlice(&place.projections)
+  let mut step = usize.ZERO
+  while step < steps.length {
+    if let Projection.Index {local} = &steps[step] {
+      if local >= count { return false }
+    }
+    step = step + usize.ONE
+  }
+  return true
+}
+
+fn hiddenKind(kind: &LocalKind) -> usize {
+  return match &kind.* {
+    LocalKind.Failure => usize.ZERO
+    LocalKind.Observer => usize.ONE
+    LocalKind.Cause => 2
+    LocalKind.Site => 3
+    _ => usize.MAX
+  }
+}
+
+// The first violation in the locals' own shape.
+fn localsViolation(function: &MirFunction) -> Option<Violation> {
+  let locals = List<Local>.asSlice(&function.locals)
+  if locals.length == usize.ZERO { return whole(Defect.ReturnLocal) }
+  let parameters = List<Interned<Type>>.length(&function.parameters)
+  let mut hidden: [bool; 4] = [false, false, false, false]
+  let mut local = usize.ZERO
+  while local < locals.length {
+    let isReturn = match &locals[local].kind { LocalKind.Return => true _ => false }
+    if isReturn != (local == usize.ZERO) { return whole(Defect.ReturnLocal) }
+    let parameter = match &locals[local].kind {
+      LocalKind.Parameter {index} => index
+      _ => usize.MAX
+    }
+    let expected = local >= usize.ONE && local <= parameters
+    if expected && parameter != local - usize.ONE { return whole(Defect.Parameters) }
+    if !expected && parameter != usize.MAX { return whole(Defect.Parameters) }
+    let kind = hiddenKind(&locals[local].kind)
+    if kind != usize.MAX {
+      if hidden[kind] { return whole(Defect.DuplicateHidden) }
+      hidden[kind] = true
+    }
+    if let LocalKind.DropFlag {local: guarded, path} = &locals[local].kind {
+      let place = Place {local: guarded, projections: List<Projection>.make()}
+      if !placeInRange(&place, locals.length) { return whole(Defect.LocalRange) }
+      let steps = List<Projection>.asSlice(&path)
+      let mut step = usize.ZERO
+      while step < steps.length {
+        if let Projection.Index {local: index} = &steps[step] {
+          if index >= locals.length { return whole(Defect.LocalRange) }
+        }
+        step = step + usize.ONE
+      }
+      if let LocalKind.DropFlag {..} = &locals[guarded].kind { return whole(Defect.FlagOfFlag) }
+    }
+    local = local + usize.ONE
+  }
+  let variables = List<Variable>.asSlice(&function.variables)
+  let mut variable = usize.ZERO
+  while variable < variables.length {
+    if variables[variable].local >= locals.length && variables[variable].local != usize.MAX { return whole(Defect.LocalRange) }
+    variable = variable + usize.ONE
+  }
+  return Option<Violation>.none()
+}
+
+// Whether `key` is one of the references `lookup` indexes by runtime hash.
+effect fn referenced(references: &[Reference], lookup: &InternIndex, key: &InstanceKey) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut entry = InternIndex.first(lookup, InstanceKey.runtimeHash(key))
+  while entry != usize.MAX {
+    if run InstanceKey.sameInstance(&references[entry].key, key) { return true }
+    entry = InternIndex.after(lookup, entry)
+  }
+  return false
+}
+
+fn contextAt(contexts: &[ContextText], origin: Origin) -> bool {
+  let mut at = usize.ZERO
+  while at < contexts.length {
+    if contexts[at].origin.node == origin.node && contexts[at].origin.location.start == origin.location.start { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn sameCase(left: &SwitchCase, right: &SwitchCase) -> bool {
+  if left.negative != right.negative { return false }
+  let first = Bytes.asSlice(&left.decimal)
+  let second = Bytes.asSlice(&right.decimal)
+  if first.length != second.length { return false }
+  let mut at = usize.ZERO
+  while at < first.length {
+    if first[at] != second[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// The instance a statement uses without a call: the glue a drop runs, or a function whose address
+// it forms.
+fn usedKey(statement: &Statement) -> Option<&InstanceKey> {
+  return match &statement.* {
+    Statement.Drop {glue, ..} => Option<&InstanceKey>.some(&glue)
+    Statement.Assign {value: Rvalue.FunctionAddress {key}, ..} => Option<&InstanceKey>.some(&key)
+    _ => Option<&InstanceKey>.none()
+  }
+}
+
+/// The first structural violation in `function`, or none when it is well formed.
+pub effect fn check(function: &MirFunction) -> Option<Violation> ! OutOfMemoryError ? &mut Allocator {
+  let blocks = List<Block>.asSlice(&function.blocks)
+  if blocks.length == usize.ZERO { return whole(Defect.NoBlocks) }
+  if let Option<Violation>.Some {value} = localsViolation(function) { return Option<Violation>.some(value) }
+  let locals = List<Local>.asSlice(&function.locals)
+  let mut failing = false
+  let mut local = usize.ZERO
+  while local < locals.length {
+    if let LocalKind.Failure = &locals[local].kind { failing = true }
+    local = local + usize.ONE
+  }
+  let references = List<Reference>.asSlice(&function.references)
+  let mut lookup = InternIndex.make()
+  let mut entry = usize.ZERO
+  while entry < references.length {
+    run InternIndex.record(&mut lookup, InstanceKey.runtimeHash(&references[entry].key))
+    entry = entry + usize.ONE
+  }
+  let contexts = List<ContextText>.asSlice(&function.contexts)
+  let mut block = usize.ZERO
+  while block < blocks.length {
+    let statements = List<Statement>.asSlice(&blocks[block].statements)
+    let mut index = usize.ZERO
+    while index < statements.length {
+      let statement = &statements[index]
+      let count = MirWalk.statementSlots(statement)
+      let mut slot = usize.ZERO
+      while slot < count {
+        if let Option<&Place>.Some {value: place} = MirWalk.slotPlace(MirWalk.statementSlot(statement, slot)) {
+          if !placeInRange(place, locals.length) { return at(Defect.LocalRange, block, index) }
+        }
+        slot = slot + usize.ONE
+      }
+      if let Statement.FailureContext {source: Option.None, origin, ..} = &statement.* {
+        if !contextAt(contexts, origin) { return at(Defect.MissingContext, block, index) }
+      }
+      if let Option<&InstanceKey>.Some {value: key} = usedKey(statement) {
+        if !run referenced(references, &lookup, key) { return at(Defect.Unreferenced, block, index) }
+      }
+      index = index + usize.ONE
+    }
+    let terminator = &blocks[block].terminator
+    let count = MirWalk.terminatorSlots(terminator)
+    let mut slot = usize.ZERO
+    while slot < count {
+      if let Option<&Place>.Some {value: place} = MirWalk.slotPlace(MirWalk.terminatorSlot(terminator, slot)) {
+        if !placeInRange(place, locals.length) { return at(Defect.LocalRange, block, statements.length) }
+      }
+      slot = slot + usize.ONE
+    }
+    let successors = MirWalk.successorCount(terminator)
+    let mut next = usize.ZERO
+    while next < successors {
+      if MirWalk.successor(terminator, next) >= blocks.length { return at(Defect.BlockRange, block, statements.length) }
+      next = next + usize.ONE
+    }
+    match &terminator.* {
+      Terminator.Fail {..} => {
+        if !failing { return at(Defect.FailWithoutSlot, block, statements.length) }
+      }
+      Terminator.Call {callee, providers, diagnostics, ..} => {
+        let foreign = match &callee {
+          Callee.Extern {..} => true
+          Callee.NativeIndirect {..} => true
+          _ => false
+        }
+        let hidden = match &diagnostics { Option.Some {..} => true Option.None => false }
+        if foreign && (hidden || List<Operand>.length(&providers) != usize.ZERO) {
+          return at(Defect.ForeignHidden, block, statements.length)
+        }
+        if let Callee.Instance {key} = &callee {
+          if !run referenced(references, &lookup, &key) { return at(Defect.Unreferenced, block, statements.length) }
+        }
+      }
+      Terminator.Switch {cases, ..} => {
+        let listed = List<SwitchCase>.asSlice(&cases)
+        let mut first = usize.ZERO
+        while first < listed.length {
+          let mut second = first + usize.ONE
+          while second < listed.length {
+            if sameCase(&listed[first], &listed[second]) { return at(Defect.SwitchRepeat, block, statements.length) }
+            second = second + usize.ONE
+          }
+          first = first + usize.ONE
+        }
+      }
+      _ => ()
+    }
+    block = block + usize.ONE
+  }
+  let cancels = List<Cancel>.asSlice(&function.cancels)
+  let mut cancel = usize.ZERO
+  while cancel < cancels.length {
+    let point = cancels[cancel].point
+    if point >= blocks.length || cancels[cancel].entry >= blocks.length { return whole(Defect.BlockRange) }
+    let suspends = match &blocks[point].terminator { Terminator.Call {..} => true Terminator.Relinquish {..} => true _ => false }
+    if !suspends { return at(Defect.CancelPoint, point, List<Statement>.length(&blocks[point].statements)) }
+    let mut other = cancel + usize.ONE
+    while other < cancels.length {
+      if cancels[other].point == point { return at(Defect.CancelPoint, point, List<Statement>.length(&blocks[point].statements)) }
+      other = other + usize.ONE
+    }
+    cancel = cancel + usize.ONE
+  }
+  return Option<Violation>.none()
+}

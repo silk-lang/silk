@@ -60,6 +60,7 @@ import backend.Bitcode
 import backend.Mir
 import backend.MirInline
 import backend.MirCoalesce
+import backend.MirValidity
 import backend.MirVerification
 import backend.MirVerification {UseAfterDrop}
 import backend.InstanceRecipe {InstanceRecipe}
@@ -80,6 +81,7 @@ import backend.Layout {
 import backend.TypeLayouts {TypeLayouts}
 import backend.LlvmCode
 import backend.LlvmCode {ObjectConstant}
+import backend.SsaPipeline {Level as SsaLevel}
 import backend.WasmLower
 import backend.WasmLower {Declaration as WasmDeclaration, ObjectConstant as WasmConstant}
 import backend.WasmObject
@@ -527,6 +529,10 @@ pub enum Family {
   OriginValidate,
   /// A backend-neutral control-flow graph for one closed runtime instance.
   Mir,
+  /// What an inlining caller needs to know of one instance's un-inlined MIR before it reads the
+  /// body: whether it is inlinable, and the instances it then calls. Its answer has an exact
+  /// fingerprint, so an edit that leaves it equal does not lower the callers again.
+  InlineSummary,
   /// Backend-neutral storage, field offsets and ABI facts for one type on this store's target.
   Layout,
   /// Whether one type has no runtime layout (STATIC-009). The key names the type by its
@@ -592,6 +598,7 @@ fn familyName(family: Family) -> string<'static> {
     Family.OriginSolve => "OriginSolve"
     Family.OriginValidate => "OriginValidate"
     Family.Mir => "Mir"
+    Family.InlineSummary => "InlineSummary"
     Family.Layout => "Layout"
     Family.PhaseOnly => "PhaseOnly"
     Family.StaticRouting => "StaticRouting"
@@ -1003,6 +1010,10 @@ pub union Value {
   OriginPlan {pub index: usize},
   OriginEvidence {pub index: usize},
   Mir {pub index: usize},
+  /// Whether an instance's un-inlined MIR is inlinable at a call that is not a suspension point
+  /// and, when it is, the instances it calls with their encodings in order. Nothing else of the
+  /// body is in it, so an edit that keeps both does not lower the callers that read it again.
+  InlineSummary {pub inlinable: bool, pub callees: List<InstanceKey>, pub encodings: Bytes},
   /// The position of a target layout answer in this store's immutable answer arena.
   Layout {pub index: usize},
   /// This target-neutral type has no layout in the current backend subset.
@@ -1497,7 +1508,7 @@ fn hashKey(hashed: u64, key: Key) -> u64 {
   let named = Hash.combine(Hash.combine(hashed, u8.toU64(Family.value(key.family))), usize.toU64(key.name))
   if key.family == Family.Layout || key.family == Family.LlvmText { return named }
   let placed = Hash.combine(Hash.combine(named, usize.toU64(key.module)), usize.toU64(key.declaration))
-  if key.family == Family.Mir || key.family == Family.EmissionInputs { return placed }
+  if key.family == Family.Mir || key.family == Family.InlineSummary || key.family == Family.EmissionInputs { return placed }
   let member = Hash.combine(placed, usize.toU64(key.member))
   if key.external {
     return Hash.combine(member, 1)
@@ -2682,10 +2693,15 @@ struct Resolver {
   codegenUnits: bool,
   // Whether LLVM text is shaped for an unoptimized compile (`LlvmCode.Writer.fastPath`).
   fastPathIr: bool,
+  // Whether lowering inlines callees into their callers (`inlineCalls`, by `inlineRule`): an
+  // optimized build without line tables (`selectInlining`).
+  inlining: bool,
   // Whether instances lower to wasm fragments for the direct backend (`WasmLower`) instead of
-  // LLVM text, and whether its memory is shared between threads.
+  // LLVM text, whether its memory is shared between threads, and whether an optimized build
+  // optimizes them for size rather than speed.
   direct: bool,
   threads: bool,
+  directSize: bool,
   // Whether lowered functions carry their source lines (`MirFunction.lines`) for line tables.
   lineTables: bool,
   // Whether an assembled module is split into packs for a cache to store beside its image
@@ -5208,6 +5224,7 @@ fn sameValue(left: &Value, right: &Value) -> bool {
       _ => false
     }
     Value.Mir {..} => false
+    Value.InlineSummary {..} => false
     Value.Layout {..} => false
     Value.LayoutUnsupported => false
     Value.OriginPlan {..} => false
@@ -5504,7 +5521,8 @@ fn sameKey(left: Key, right: Key) -> bool {
   if left.family == Family.LlvmText || right.family == Family.LlvmText {
     return left.family == right.family && left.name == right.name
   }
-  if left.family == Family.Mir || left.family == Family.EmissionInputs || right.family == Family.Mir || right.family == Family.EmissionInputs {
+  if left.family == Family.Mir || left.family == Family.InlineSummary || left.family == Family.EmissionInputs
+    || right.family == Family.Mir || right.family == Family.InlineSummary || right.family == Family.EmissionInputs {
     return left.family == right.family && left.name == right.name && left.module == right.module && left.declaration == right.declaration
   }
   return left.family == right.family && left.module == right.module && left.name == right.name && left.declaration == right.declaration && left.member == right.member && left.external == right.external
@@ -5584,6 +5602,9 @@ struct BackendInstance {
   key: InstanceKey,
   observing: bool,
   suspension: Option<CoroutineFacts>,
+  // Whether this is the instance's un-inlined MIR, which an inlining caller reads. It inlines
+  // nothing itself, so reading it never demands another function's inlined MIR.
+  raw: bool,
 }
 
 effect fn sameSuspension(left: &Option<CoroutineFacts>, right: &Option<CoroutineFacts>) -> bool
@@ -5608,11 +5629,11 @@ effect fn copySuspension(value: &Option<CoroutineFacts>) -> Option<CoroutineFact
 effect fn internBackendInstance(resolver: &mut Resolver, instance: &InstanceKey, observing: bool) -> usize
 ! OutOfMemoryError
 ? &mut Allocator {
-  return run internBackendVariant(&mut resolver.*, instance, observing, &Option<CoroutineFacts>.none())
+  return run internBackendVariant(&mut resolver.*, instance, observing, &Option<CoroutineFacts>.none(), false)
 }
 
 effect fn internBackendVariant(resolver: &mut Resolver, instance: &InstanceKey, observing: bool,
-  suspension: &Option<CoroutineFacts>) -> usize
+  suspension: &Option<CoroutineFacts>, raw: bool) -> usize
 ! OutOfMemoryError
 ? &mut Allocator {
   let hashed = InstanceKey.runtimeHash(instance)
@@ -5620,14 +5641,14 @@ effect fn internBackendVariant(resolver: &mut Resolver, instance: &InstanceKey, 
   let mut at = InternIndex.first(&resolver.backendInstanceLookup, hashed)
   while at != usize.MAX {
     let sameVariant = run sameSuspension(&known[at].suspension, suspension)
-    if sameVariant && known[at].observing == observing && run InstanceKey.sameInstance(&known[at].key, instance) {
+    if sameVariant && known[at].observing == observing && known[at].raw == raw && run InstanceKey.sameInstance(&known[at].key, instance) {
       return at
     }
     at = InternIndex.after(&resolver.backendInstanceLookup, at)
   }
   let interned = known.length
   run List<BackendInstance>.append(&mut resolver.*.backendInstances,
-    BackendInstance {key: InstanceKey.copy(instance), observing: observing, suspension: run copySuspension(suspension)})
+    BackendInstance {key: InstanceKey.copy(instance), observing: observing, suspension: run copySuspension(suspension), raw: raw})
   run InternIndex.record(&mut resolver.backendInstanceLookup, hashed)
   return interned
 }
@@ -5639,7 +5660,7 @@ effect fn internBackendVariant(resolver: &mut Resolver, instance: &InstanceKey, 
 // pattern's own MIR, so what it reaches, and what its record replays, never depends on which
 // pattern a check interned first.
 effect fn exactBackendVariant(resolver: &mut Resolver, instance: &InstanceKey, observing: bool,
-  suspension: &Option<CoroutineFacts>) -> usize
+  suspension: &Option<CoroutineFacts>, raw: bool) -> usize
 ! OutOfMemoryError
 ? &mut Allocator {
   let hashed = InstanceKey.runtimeHash(instance)
@@ -5647,14 +5668,14 @@ effect fn exactBackendVariant(resolver: &mut Resolver, instance: &InstanceKey, o
   let mut at = InternIndex.first(&resolver.backendInstanceLookup, hashed)
   while at != usize.MAX {
     let sameVariant = run sameSuspension(&known[at].suspension, suspension)
-    if sameVariant && known[at].observing == observing && run InstanceKey.sameApplication(&known[at].key, instance) {
+    if sameVariant && known[at].observing == observing && known[at].raw == raw && run InstanceKey.sameApplication(&known[at].key, instance) {
       return at
     }
     at = InternIndex.after(&resolver.backendInstanceLookup, at)
   }
   let interned = known.length
   run List<BackendInstance>.append(&mut resolver.*.backendInstances,
-    BackendInstance {key: InstanceKey.copy(instance), observing: observing, suspension: run copySuspension(suspension)})
+    BackendInstance {key: InstanceKey.copy(instance), observing: observing, suspension: run copySuspension(suspension), raw: raw})
   run InternIndex.record(&mut resolver.backendInstanceLookup, hashed)
   return interned
 }
@@ -8454,6 +8475,7 @@ effect fn resolveOtherFamily(
     Family.OpaqueRealization => run resolveOpaqueRealization(&mut resolver.*, &mut owner.*, key)
     Family.CallableOrigin => run resolveCallableOrigin(&mut resolver.*, &mut owner.*, key)
     Family.Mir => run lowerMir(&mut resolver.*, &mut owner.*, key)
+    Family.InlineSummary => run resolveInlineSummary(&mut resolver.*, &mut owner.*, key)
     Family.Layout => run resolveLayout(&mut resolver.*, &mut owner.*, key)
     Family.PhaseOnly => run resolvePhaseOnly(&mut resolver.*, &mut owner.*, key)
     Family.StaticRouting => run resolveStaticRouting(&mut resolver.*, &mut owner.*, key)
@@ -8732,6 +8754,7 @@ fn valueTag(value: &Value) -> u64 {
     Value.InherentMember {..} => 26
     Value.StaticRouting {..} => 27
     Value.CleanupFree {..} => 28
+    Value.InlineSummary {..} => 29
     _ => 0
   }
 }
@@ -8841,9 +8864,29 @@ fn fingerprintValue(writer: &mut AnswerFingerprint.Writer, value: &Value) -> () 
     Value.ProfileInput {slot} => { AnswerFingerprint.count(&mut writer.*, slot) }
     Value.LayoutUnsupported => {}
     Value.Initializer {value: published, ..} => { StaticValue.fingerprint(&mut writer.*, &published) }
+    Value.InlineSummary {inlinable, callees, encodings} => {
+      AnswerFingerprint.flag(&mut writer.*, inlinable)
+      AnswerFingerprint.count(&mut writer.*, List<InstanceKey>.length(&callees))
+      AnswerFingerprint.text(&mut writer.*, Bytes.asSlice(&encodings))
+    }
     _ => { AnswerFingerprint.incomplete(&mut writer.*) }
   }
   return ()
+}
+
+// The fingerprint of an inline summary's value alone, which names no unit of the process that
+// computed it, so another process compares it (`imageSummaries`); none for any other answer.
+fn summaryFingerprint(held: &Result<Answer, NoRejection>) -> Option<ContentHash> {
+  if let Result<Answer, NoRejection>.Success {value} = &held.* {
+    if let Outcome.Success {value: summary} = &value.outcome {
+      if let Value.InlineSummary {..} = &summary {
+        let mut writer = AnswerFingerprint.writer()
+        fingerprintValue(&mut writer, &summary)
+        return AnswerFingerprint.finish(move writer)
+      }
+    }
+  }
+  return Option<ContentHash>.none()
 }
 
 // Keeps the first occurrence of each direct dependency. A provider records one edge per demand,
@@ -9426,6 +9469,122 @@ fn recordsBuild(image: &CacheImage.Image) -> bool {
     at = at + usize.ONE
   }
   return false
+}
+
+// The most inline summaries one node of an adopted image may wait on (`summaryConditions`); a
+// node that would wait on more is stale.
+const conditionLimit: usize = 32
+
+// What each node of an adopted image waits on when it is stale only through inline summaries: the
+// summary roots (`imageSummaries`) whose answers decide it, by node. A node is green, stale, or
+// conditional, waiting on at least one such root; it is green again exactly when each of those
+// roots' summaries answers as it did (`summaryAgrees`).
+struct SummaryConditions {
+  stale: List<bool>,
+  ends: List<usize>,
+  roots: List<usize>,
+}
+
+impl SummaryConditions {
+  // Conditions of no node: every node they are asked about is unconditional.
+  fn make() -> SummaryConditions {
+    return SummaryConditions {stale: List<bool>.make(), ends: List<usize>.make(), roots: List<usize>.make()}
+  }
+
+  // Whether `node` waits on summaries alone.
+  fn conditional(self: &Self, node: usize) -> bool {
+    return node < List<bool>.length(&self.stale) && !List<bool>.get(&self.stale, node)
+      && SummaryConditions.of(self, node).length > usize.ZERO
+  }
+
+  // The summary roots `node` waits on, in no particular order; empty for a green node.
+  fn of(self: &Self, node: usize) -> &[usize] {
+    let ends = List<usize>.asSlice(&self.ends)
+    let mut start = usize.ZERO
+    if node > usize.ZERO { start = ends[node - usize.ONE] }
+    return Slice.view<usize>(List<usize>.asSlice(&self.roots), start, ends[node] - start)
+  }
+}
+
+// The conditions of each node of `image`, adopted unlinked with `units` its green nodes and
+// `placed` where its leaves stand. A node that names a changed leaf, or a stale node that is not
+// a summary's, is stale. A stale node that a summary root rests on (`imageSummaries`) gives the
+// nodes that name it that root to wait on instead of its own staleness: their unit read only the
+// summary's answer, so it lowers as it did while that answer holds. Any other node waits on what
+// the nodes it names wait on.
+effect fn summaryConditions(image: &CacheImage.Image, units: &[usize], placed: &[usize]) -> SummaryConditions
+  ! OutOfMemoryError ? &mut Allocator {
+  let nodes = CacheImage.nodeCount(image)
+  let mut summaryRoot = List<usize>.make()
+  run List<usize>.appendRepeated(&mut summaryRoot, usize.MAX, nodes)
+  let roots = List<CacheImage.Root>.asSlice(&image.roots)
+  let mut found = false
+  let mut at = usize.ZERO
+  while at < roots.length {
+    let summary = Option<&[u8]>.isSome(&rootIdentity(Bytes.asSlice(&roots[at].key), 6))
+    if summary && List<usize>.get(&summaryRoot, roots[at].node) == usize.MAX {
+      List<usize>.set(&mut summaryRoot, roots[at].node, at)
+      found = true
+    }
+    at = at + usize.ONE
+  }
+  let mut conditions = SummaryConditions.make()
+  if !found { return move conditions }
+  run List<bool>.reserveExact(&mut conditions.stale, nodes)
+  run List<usize>.reserveExact(&mut conditions.ends, nodes)
+  let mut node = usize.ZERO
+  while node < nodes {
+    let start = List<usize>.length(&conditions.roots)
+    let mut stale = false
+    if units[node] == usize.MAX {
+      let edges = CacheImage.edgesOf(image, node)
+      let mut edge = usize.ZERO
+      while edge < edges.length && !stale {
+        let named = CacheImage.target(edges[edge])
+        edge = edge + usize.ONE
+        if !CacheImage.namesNode(edges[edge - usize.ONE]) {
+          stale = placed[named] == usize.MAX
+          continue
+        }
+        if units[named] != usize.MAX { continue }
+        if List<usize>.get(&summaryRoot, named) != usize.MAX {
+          stale = !run waitOn(&mut conditions.roots, start, List<usize>.get(&summaryRoot, named))
+        } else if List<bool>.get(&conditions.stale, named) {
+          stale = true
+        } else {
+          let ends = List<usize>.asSlice(&conditions.ends)
+          let mut from = usize.ZERO
+          if named > usize.ZERO { from = ends[named - usize.ONE] }
+          let to = ends[named]
+          while from < to && !stale {
+            let root = List<usize>.get(&conditions.roots, from)
+            stale = !run waitOn(&mut conditions.roots, start, root)
+            from = from + usize.ONE
+          }
+        }
+      }
+    }
+    // A stale node waits on nothing.
+    if stale { List<usize>.truncate(&mut conditions.roots, start) }
+    run List<bool>.append(&mut conditions.stale, stale)
+    run List<usize>.append(&mut conditions.ends, List<usize>.length(&conditions.roots))
+    node = node + usize.ONE
+  }
+  return move conditions
+}
+
+// Adds `root` to the roots a node waits on, `roots` from `start` on, unless it is there; false
+// when that would make more than `conditionLimit`.
+effect fn waitOn(roots: &mut List<usize>, start: usize, root: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let listed = List<usize>.asSlice(&roots.*)
+  let mut at = start
+  while at < listed.length {
+    if listed[at] == root { return true }
+    at = at + usize.ONE
+  }
+  if listed.length - start >= conditionLimit { return false }
+  run List<usize>.append(&mut roots.*, root)
+  return true
 }
 
 pub struct Adopted {
@@ -72463,6 +72622,21 @@ effect fn verifyLowered(resolver: &mut Resolver, owner: &mut Query<Answer, NoRej
   function: &MirFunction) -> ()
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
   if !resolver.verifyMir { return () }
+  if let Option<MirValidity.Violation>.Some {value: violation} = move run MirValidity.check(function) {
+    let mut reason = run Bytes.copy(b"lowered MIR of ")
+    let symbol = run InstanceKey.runtimeName(&function.key)
+    run Bytes.append(&mut reason, Bytes.asSlice(&symbol))
+    run Bytes.append(&mut reason, b" ")
+    run Bytes.append(&mut reason, MirValidity.describe(violation.defect))
+    run Bytes.append(&mut reason, b" (block ")
+    run appendDecimal(&mut reason, violation.block)
+    run Bytes.append(&mut reason, b", statement ")
+    run appendDecimal(&mut reason, violation.at)
+    run Bytes.append(&mut reason, b"):")
+    let listing = run MirVerification.describe(function)
+    run Bytes.append(&mut reason, Bytes.asSlice(&listing))
+    return CompilerBug.panic(Bytes.asSlice(&reason))
+  }
   if !(run MirVerification.callDestinationsFresh(function)) {
     let mut reason = run Bytes.copy(b"lowered MIR of ")
     let symbol = run InstanceKey.encoding(&function.key)
@@ -72872,6 +73046,7 @@ fn emptyMir(function: &mut MirFunction) -> () {
   function.cancels = List<Mir.Cancel>.make()
   function.accesses = List<MirSharedAccess>.make()
   function.escapes = List<MirEscapeSite>.make()
+  function.inlined = List<InstanceKey>.make()
   return ()
 }
 
@@ -79798,16 +79973,258 @@ struct InlineExpansion {
   parent: usize,
 }
 
-// A frame variant can read another variant's checked cancellation paths without recursively
-// expanding it. The selection carries the transitive suspension mask of all eligible wrappers.
-effect fn inlineFrameCalls(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>,
-  dependencies: &mut List<Dependency>, function: &mut MirFunction, facts: &CoroutineFacts, observing: bool) -> ()
+// Whether a callee's un-inlined MIR, read for inlining, closes over inlinable bodies: every
+// instance it calls is itself inlinable and closed, so splicing it leaves no call of a function
+// the caller did not see. Only such a body may be inlined at a call that is not a suspension
+// point: frame selection decides which instances suspend from the calls the reached bodies make,
+// and a call that only an inlined body made would be one it never saw.
+struct InlineVerdict {
+  key: InstanceKey,
+  closed: bool,
+}
+
+// Summarizes the un-inlined MIR of the instance `key` names (`Family.InlineSummary`).
+effect fn resolveInlineSummary(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, key: Key) -> Answer
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
-  let candidates = List<InstanceKey>.asSlice(&facts.inline)
-  if candidates.length == usize.ZERO { return () }
-  let mut raw = run CoroutineFacts.copy(facts)
-  raw.inline = List<InstanceKey>.make()
-  let rawFacts = Option<CoroutineFacts>.some(move raw)
+  let mut dependencies = List<Dependency>.make()
+  let lowered = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies, Key {family: Family.Mir, module: key.module,
+    declaration: key.declaration, member: key.member, name: key.name, external: false}, Span.make(usize.ZERO, usize.ZERO))
+  let mut inlinable = false
+  let mut callees = List<InstanceKey>.make()
+  let mut encodings = Bytes.make()
+  if let Option<usize>.Some {value: index} = move Shared<Result<Answer, NoRejection>>.with<Option<usize>>(&lowered, answerMirIndex) {
+    let function = &List<MirFunction>.asSlice(&resolver.mirValues)[index]
+    inlinable = MirInline.inlinable(function)
+    let blocks = List<MirBlock>.asSlice(&function.blocks)
+    let mut at = usize.ZERO
+    while inlinable && at < blocks.length {
+      if let MirTerminator.Call {callee: MirCallee.Instance {key: called}, ..} = &blocks[at].terminator {
+        let encoded = run InstanceKey.encoding(&called)
+        run Bytes.append(&mut encodings, Bytes.asSlice(&encoded))
+        run List<InstanceKey>.append(&mut callees, InstanceKey.copy(&called))
+      }
+      at = at + usize.ONE
+    }
+  }
+  return memberSuccess(Value.InlineSummary {inlinable: inlinable, callees: move callees, encodings: move encodings},
+    move dependencies)
+}
+
+// The inline summary of `selected`'s un-inlined MIR, as a recorded dependency of the caller: whether
+// it is inlinable, and its callees. None when it has no MIR.
+struct InlineFacts {
+  inlinable: bool,
+  callees: List<InstanceKey>,
+}
+
+effect fn inlineFacts(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut List<Dependency>,
+  selected: &InstanceKey, observing: bool, facts: &Option<CoroutineFacts>) -> Option<InlineFacts>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let location = match move run locationOfInstance(&mut resolver.*, selected) {
+    Option<InstanceLocation>.Some {value} => value
+    Option<InstanceLocation>.None => { return Option<InlineFacts>.none() }
+  }
+  let variant = run exactBackendVariant(&mut resolver.*, selected, observing, facts, true)
+  let request = run internDeclaration(&mut resolver.*, Key {family: Family.InlineSummary, module: location.module,
+    declaration: location.declaration, member: instanceMember(selected), name: variant, external: false})
+  let answer = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies.*, request, Span.make(usize.ZERO, usize.ZERO))
+  let listed = Shared<Result<Answer, NoRejection>>.with<usize>(&answer, fn(held: &Result<Answer, NoRejection>) -> usize {
+    if let Result<Answer, NoRejection>.Success {value} = &held.* {
+      if let Outcome.Success {value: Value.InlineSummary {callees, ..}} = &value.outcome { return List<InstanceKey>.length(&callees) }
+    }
+    return usize.ZERO
+  })
+  let mut inlinable = false
+  let mut present = false
+  Shared<Result<Answer, NoRejection>>.with<()>(&answer, fn(held: &Result<Answer, NoRejection>) -> () {
+    if let Result<Answer, NoRejection>.Success {value} = &held.* {
+      if let Outcome.Success {value: Value.InlineSummary {inlinable: candidate, ..}} = &value.outcome {
+        inlinable = candidate
+        present = true
+      }
+    }
+    return ()
+  })
+  if !present { return Option<InlineFacts>.none() }
+  let mut callees = run List<InstanceKey>.makeWithCapacity(listed)
+  let mut at = usize.ZERO
+  while at < listed {
+    let key = Shared<Result<Answer, NoRejection>>.with<Option<InstanceKey>>(&answer, fn(held: &Result<Answer, NoRejection>) -> Option<InstanceKey> {
+      if let Result<Answer, NoRejection>.Success {value} = &held.* {
+        if let Outcome.Success {value: Value.InlineSummary {callees: named, ..}} = &value.outcome {
+          return Option<InstanceKey>.some(InstanceKey.copy(&List<InstanceKey>.asSlice(&named)[at]))
+        }
+      }
+      return Option<InstanceKey>.none()
+    })
+    if let Option<InstanceKey>.Some {value} = move key { run List<InstanceKey>.append(&mut callees, move value) }
+    at = at + usize.ONE
+  }
+  return Option<InlineFacts>.some(InlineFacts {inlinable: inlinable, callees: move callees})
+}
+
+// The un-inlined MIR of `selected` that an inlining caller reads, as a recorded dependency of
+// the caller; none when it has none.
+effect fn rawMir(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut List<Dependency>,
+  selected: &InstanceKey, observing: bool, facts: &Option<CoroutineFacts>) -> Option<usize>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let location = match move run locationOfInstance(&mut resolver.*, selected) {
+    Option<InstanceLocation>.Some {value} => value
+    Option<InstanceLocation>.None => { return Option<usize>.none() }
+  }
+  let variant = run exactBackendVariant(&mut resolver.*, selected, observing, facts, true)
+  let request = run internDeclaration(&mut resolver.*, Key {family: Family.Mir, module: location.module,
+    declaration: location.declaration, member: instanceMember(selected), name: variant, external: false})
+  let answer = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies.*, request, Span.make(usize.ZERO, usize.ZERO))
+  return Shared<Result<Answer, NoRejection>>.with<Option<usize>>(&answer, answerMirIndex)
+}
+
+// Whether `selected` may be inlined at a call that is not a suspension point: it is inlinable and
+// every call its un-inlined body makes is to a closed, inlinable instance that is not one of
+// `chain`, the instances whose bodies are being followed. A call back into `chain` is a cycle, so
+// every verdict is a property of `selected` alone and `verdicts` keeps each one.
+effect fn closedBody(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut List<Dependency>,
+  selected: &InstanceKey, observing: bool, facts: &Option<CoroutineFacts>, chain: &mut List<InstanceKey>,
+  verdicts: &mut List<InlineVerdict>) -> bool
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let known = List<InlineVerdict>.asSlice(&verdicts.*)
+  let mut at = usize.ZERO
+  while at < known.length {
+    if run InstanceKey.sameInstance(&known[at].key, selected) { return known[at].closed }
+    at = at + usize.ONE
+  }
+  let summary = match move run inlineFacts(&mut resolver.*, &mut owner.*, &mut dependencies.*, selected, observing, facts) {
+    Option<InlineFacts>.Some {value} => move value
+    Option<InlineFacts>.None => { return false }
+  }
+  let mut closed = summary.inlinable
+  let callees = move summary.callees
+  run List<InstanceKey>.append(&mut chain.*, InstanceKey.copy(selected))
+  let listed = List<InstanceKey>.asSlice(&callees)
+  at = usize.ZERO
+  while at < listed.length && closed {
+    let ancestors = List<InstanceKey>.asSlice(&chain.*)
+    let mut ancestor = usize.ZERO
+    while ancestor < ancestors.length && closed {
+      if run InstanceKey.sameInstance(&ancestors[ancestor], &listed[at]) { closed = false }
+      ancestor = ancestor + usize.ONE
+    }
+    if closed { closed = run closedBody(&mut resolver.*, &mut owner.*, &mut dependencies.*, &listed[at], observing, facts, &mut chain.*, &mut verdicts.*) }
+    at = at + usize.ONE
+  }
+  drop List<InstanceKey>.pop(&mut chain.*)
+  run List<InlineVerdict>.append(&mut verdicts.*, InlineVerdict {key: InstanceKey.copy(selected), closed: closed})
+  return closed
+}
+
+// Whether `function` still calls, drops through, takes the address of, or owes a proof for `key`.
+effect fn stillUses(function: &MirFunction, key: &InstanceKey) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let blocks = List<MirBlock>.asSlice(&function.blocks)
+  let mut block = usize.ZERO
+  while block < blocks.length {
+    let statements = List<MirStatement>.asSlice(&blocks[block].statements)
+    let mut at = usize.ZERO
+    while at < statements.length {
+      let used = match &statements[at] {
+        MirStatement.Drop {glue, ..} => run InstanceKey.sameInstance(&glue, key)
+        MirStatement.Assign {value: MirRvalue.FunctionAddress {key: addressed}, ..} => run InstanceKey.sameInstance(&addressed, key)
+        _ => false
+      }
+      if used { return true }
+      at = at + usize.ONE
+    }
+    if let MirTerminator.Call {callee: MirCallee.Instance {key: called}, ..} = &blocks[block].terminator {
+      if run InstanceKey.sameInstance(&called, key) { return true }
+    }
+    block = block + usize.ONE
+  }
+  let runs = List<MirNonParkingRun>.asSlice(&function.nonParking)
+  let mut owed = usize.ZERO
+  while owed < runs.length {
+    let callees = List<InstanceKey>.asSlice(&runs[owed].callees)
+    let mut at = usize.ZERO
+    while at < callees.length {
+      if run InstanceKey.sameInstance(&callees[at], key) { return true }
+      at = at + usize.ONE
+    }
+    owed = owed + usize.ONE
+  }
+  let accesses = List<MirSharedAccess>.asSlice(&function.accesses)
+  let mut at = usize.ZERO
+  while at < accesses.length {
+    if run InstanceKey.sameInstance(&accesses[at].callback, key) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// Which callees one call may inline, by backend and kind of call (`inlineRule`).
+enum InlineRule {
+  // None: the call keeps its callee.
+  Never,
+  // A callee frame selection chose for this suspension point (`MirInline.eligible`).
+  Frame,
+  // A value forwarder (`MirInline.valueForwarder`).
+  Forwarder,
+  // A closed, inlinable callee (`closedBody`).
+  Closed,
+  // Either of the last two.
+  ForwarderOrClosed,
+}
+
+// The one inlining rule of a call. A suspension point of a frame variant inlines only what frame
+// selection chose, and a frame variant's other calls inline a value forwarder, whatever the
+// backend: LLVM inlines too late to coalesce these into the frame. An LLVM build does so only in a
+// frame for which selection chose a callee (`selected`). Beyond that only the direct backend
+// inlines, a closed inlinable callee at any call that is not a suspension point; LLVM inlines
+// such callees itself, and splicing them in MIR first only costs an LLVM build time and memory.
+fn inlineRule(direct: bool, framed: bool, selected: bool, suspending: bool) -> InlineRule {
+  if suspending { return InlineRule.Frame }
+  if framed && direct { return InlineRule.ForwarderOrClosed }
+  if framed && selected { return InlineRule.Forwarder }
+  if direct { return InlineRule.Closed }
+  return InlineRule.Never
+}
+
+// Inlines calls of the instance being lowered, in an optimized build without line tables, under
+// each call's `inlineRule`.
+//
+// A closed callee's un-inlined MIR is inlinable and every call it makes is to a closed callee
+// (`closedBody`). A value forwarder in a frame variant can call nothing that suspends, since the
+// call itself does not. A suspension point of a frame variant
+// inlines a callee frame selection chose (`facts.inline`), lowered with this frame's facts so its
+// own points have cancel exits, which chain into the point's. Every decision reads the callee
+// alone. The caller reads only un-inlined MIR, a recorded dependency, which inlines nothing, so
+// inlining demands no other function's inlined MIR. A spliced body's own calls are candidates in
+// turn, recursion is cut by ancestry, and the caller grows by at most a bound that depends only on
+// its own size. Afterwards an inlined instance the body no longer uses is no longer referenced,
+// so the build does not emit it for this caller.
+effect fn inlineCalls(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>,
+  dependencies: &mut List<Dependency>, function: &mut MirFunction, facts: &Option<CoroutineFacts>, observing: bool) -> ()
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  if !resolver.inlining || resolver.lineTables { return () }
+  // An LLVM build inlines only in a frame for which selection chose a callee (`inlineRule`).
+  let mut selectedVariant = false
+  if let Option<CoroutineFacts>.Some {value} = &facts.* { selectedVariant = List<InstanceKey>.length(&value.inline) != usize.ZERO }
+  if !resolver.direct && !selectedVariant { return () }
+  let mut candidates = List<InstanceKey>.make()
+  let mut rawFacts = Option<CoroutineFacts>.none()
+  let mut framed = false
+  if let Option<CoroutineFacts>.Some {value} = &facts.* {
+    framed = true
+    let listed = List<InstanceKey>.asSlice(&value.inline)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      run List<InstanceKey>.append(&mut candidates, InstanceKey.copy(&listed[at]))
+      at = at + usize.ONE
+    }
+    let mut raw = run CoroutineFacts.copy(&value)
+    raw.inline = List<InstanceKey>.make()
+    rawFacts = Option<CoroutineFacts>.some(move raw)
+  }
+  let limit = MirInline.size(&function.*) + inlineGrowth(MirInline.size(&function.*))
+  let mut verdicts = List<InlineVerdict>.make()
+  let mut inlined = List<InstanceKey>.make()
   let mut ancestry = List<usize>.make()
   run List<usize>.appendRepeated(&mut ancestry, usize.MAX, List<MirBlock>.length(&function.blocks))
   let mut expansions = List<InlineExpansion>.make()
@@ -79823,12 +80240,6 @@ effect fn inlineFrameCalls(resolver: &mut Resolver, owner: &mut Query<Answer, No
       Option<InstanceKey>.Some {value} => move value
       Option<InstanceKey>.None => { continue }
     }
-    let mut candidate = usize.ZERO
-    let mut found = false
-    while candidate < candidates.length && !found {
-      found = run InstanceKey.sameInstance(&candidates[candidate], &selected)
-      candidate = candidate + usize.ONE
-    }
     let mut suspending = false
     let cancels = List<MirCancel>.asSlice(&function.cancels)
     let mut cancel = usize.ZERO
@@ -79836,7 +80247,16 @@ effect fn inlineFrameCalls(resolver: &mut Resolver, owner: &mut Query<Answer, No
       if cancels[cancel].point == point { suspending = true }
       cancel = cancel + usize.ONE
     }
-    if !found && suspending { continue }
+    if suspending {
+      let listed = List<InstanceKey>.asSlice(&candidates)
+      let mut candidate = usize.ZERO
+      let mut found = false
+      while candidate < listed.length && !found {
+        found = run InstanceKey.sameInstance(&listed[candidate], &selected)
+        candidate = candidate + usize.ONE
+      }
+      if !found { continue }
+    }
     let mut recursive = run InstanceKey.sameInstance(&function.key, &selected)
     let mut ancestor = List<usize>.get(&ancestry, point)
     let prior = List<InlineExpansion>.asSlice(&expansions)
@@ -79845,27 +80265,77 @@ effect fn inlineFrameCalls(resolver: &mut Resolver, owner: &mut Query<Answer, No
       ancestor = prior[ancestor].parent
     }
     if recursive { continue }
-    let location = match move run locationOfInstance(&mut resolver.*, &selected) {
-      Option<InstanceLocation>.Some {value} => value
-      Option<InstanceLocation>.None => { continue }
+    let rule = inlineRule(resolver.direct, framed, List<InstanceKey>.length(&candidates) != usize.ZERO, suspending)
+    if rule == InlineRule.Never { continue }
+    // A closed callee's summary is read first, so the caller depends on the body of a callee it
+    // does not inline only through that summary.
+    if rule == InlineRule.Closed {
+      let mut chain = List<InstanceKey>.make()
+      if !run closedBody(&mut resolver.*, &mut owner.*, &mut dependencies.*, &selected, observing, &rawFacts, &mut chain,
+        &mut verdicts) { continue }
     }
-    let variant = run exactBackendVariant(&mut resolver.*, &selected, observing, &rawFacts)
-    let request = run internDeclaration(&mut resolver.*, Key {family: Family.Mir, module: location.module,
-      declaration: location.declaration, member: instanceMember(&selected), name: variant, external: false})
-    let answer = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies.*, request, Span.make(usize.ZERO, usize.ZERO))
-    if let Option<usize>.Some {value: index} = move Shared<Result<Answer, NoRejection>>.with<Option<usize>>(&answer, answerMirIndex) {
-      let functions = List<MirFunction>.asSlice(&resolver.mirValues)
-      let allowed = if suspending { MirInline.eligible(&functions[index]) } else { MirInline.valueForwarder(&functions[index]) }
-      if allowed && run MirInline.call(&mut function.*, point, &functions[index]) {
-        let parent = List<usize>.get(&ancestry, point)
-        let expansion = List<InlineExpansion>.length(&expansions)
-        run List<InlineExpansion>.append(&mut expansions, InlineExpansion {key: InstanceKey.copy(&selected), parent: parent})
-        let added = List<MirBlock>.length(&function.blocks) - List<usize>.length(&ancestry)
-        run List<usize>.appendRepeated(&mut ancestry, expansion, added)
-      }
+    let index = match move run rawMir(&mut resolver.*, &mut owner.*, &mut dependencies.*, &selected, observing, &rawFacts) {
+      Option<usize>.Some {value} => value
+      Option<usize>.None => { continue }
+    }
+    let functions = List<MirFunction>.asSlice(&resolver.mirValues)
+    if MirInline.size(&function.*) + MirInline.size(&functions[index]) > limit { continue }
+    let mut allowed = rule == InlineRule.Closed
+    if rule == InlineRule.Frame { allowed = MirInline.eligible(&functions[index], resolver.direct) }
+    if rule == InlineRule.Forwarder || rule == InlineRule.ForwarderOrClosed { allowed = MirInline.valueForwarder(&functions[index], resolver.direct) }
+    if !allowed && rule == InlineRule.ForwarderOrClosed {
+      let mut chain = List<InstanceKey>.make()
+      allowed = run closedBody(&mut resolver.*, &mut owner.*, &mut dependencies.*, &selected, observing, &rawFacts, &mut chain,
+        &mut verdicts)
+    }
+    if !allowed { continue }
+    let bodies = List<MirFunction>.asSlice(&resolver.mirValues)
+    if run MirInline.call(&mut function.*, point, &bodies[index], resolver.direct) {
+      let parent = List<usize>.get(&ancestry, point)
+      let expansion = List<InlineExpansion>.length(&expansions)
+      run List<InlineExpansion>.append(&mut expansions, InlineExpansion {key: InstanceKey.copy(&selected), parent: parent})
+      let added = List<MirBlock>.length(&function.blocks) - List<usize>.length(&ancestry)
+      run List<usize>.appendRepeated(&mut ancestry, expansion, added)
+      run List<InstanceKey>.append(&mut inlined, move selected)
     }
   }
-  return ()
+  if List<InstanceKey>.length(&inlined) == usize.ZERO { return () }
+  let listed = List<InstanceKey>.asSlice(&inlined)
+  let mut each = usize.ZERO
+  while each < listed.length {
+    let known = List<InstanceKey>.asSlice(&function.inlined)
+    let mut seen = false
+    let mut prior = usize.ZERO
+    while prior < known.length && !seen {
+      seen = run InstanceKey.sameInstance(&known[prior], &listed[each])
+      prior = prior + usize.ONE
+    }
+    if !seen { run List<InstanceKey>.append(&mut function.inlined, InstanceKey.copy(&listed[each])) }
+    each = each + usize.ONE
+  }
+  // An LLVM build keeps the references of its frames' spliced callees, as it always did; LLVM
+  // drops a definition that nothing calls any more itself.
+  if !resolver.direct { return () }
+  let spliced = List<InstanceKey>.asSlice(&function.inlined)
+  let mut key = usize.ZERO
+  while key < spliced.length {
+    if !run stillUses(&function.*, &spliced[key]) {
+      let mut kept = List<MirReference>.make()
+      while List<MirReference>.length(&function.references) != usize.ZERO {
+        let reference = List<MirReference>.remove(&mut function.references, usize.ZERO)
+        if !run InstanceKey.sameInstance(&reference.key, &spliced[key]) { run List<MirReference>.append(&mut kept, move reference) }
+      }
+      function.references = move kept
+    }
+    key = key + usize.ONE
+  }
+  return run MirFunction.sortReferences(&mut function.references)
+}
+
+// How much an inlining caller of `size` statements and blocks may grow: enough for a small
+// function to absorb its helpers, and in proportion for a large one.
+fn inlineGrowth(size: usize) -> usize {
+  return 256 + size
 }
 
 effect fn lowerMir(
@@ -80712,10 +81182,9 @@ effect fn lowerMir(
   completed.function.inlining = run declarationInlining(&mut resolver.*, &module, declarationAccess182)
   completed.function.optimizeSize = run declarationOptimizeSize(&mut resolver.*, &module, declarationAccess182)
   let variants = List<BackendInstance>.asSlice(&resolver.backendInstances)
+  let raw = variants[key.name].raw
   let expanded = run copySuspension(&variants[key.name].suspension)
-  if let Option<CoroutineFacts>.Some {value: facts} = &expanded {
-    run inlineFrameCalls(&mut resolver.*, &mut owner.*, &mut dependencies, &mut completed.function, &facts, observing)
-  }
+  if !raw { run inlineCalls(&mut resolver.*, &mut owner.*, &mut dependencies, &mut completed.function, &expanded, observing) }
   return run storeLowered(&mut resolver.*, &mut owner.*, move completed, move dependencies)
 }
 
@@ -82831,6 +83300,14 @@ effect fn observeLlvmGap(resolver: &mut Resolver, subject: usize) -> ()
   return run Graph.record(&mut resolver.graph, unit, Dependee.UnitResult {unit: producer})
 }
 
+// How hard the direct backend optimizes: not at all in an unoptimized build, else for size or
+// speed as the build asked.
+fn directLevel(resolver: &Resolver) -> SsaLevel {
+  if resolver.fastPathIr { return SsaLevel.None }
+  if resolver.directSize { return SsaLevel.Size }
+  return SsaLevel.Speed
+}
+
 // One instance's text: LLVM text, or for the direct backend a wasm fragment (`WasmLower`).
 effect fn emitInstance(resolver: &Resolver, function: &MirFunction, input: &EmissionInputs, hostExport: bool) -> Bytes
 ! BackendGap | OutOfMemoryError ? &mut Allocator | &mut Types {
@@ -82844,7 +83321,8 @@ effect fn emitInstance(resolver: &Resolver, function: &MirFunction, input: &Emis
       &input.suspension,
       resolver.threads,
       hostExport,
-      !resolver.fastPathIr,
+      directLevel(resolver),
+      resolver.verifyMir,
     )
   }
   return run LlvmCode.emit(
@@ -83029,7 +83507,7 @@ effect fn resolveEmissionInputs(
   // A suspendable instance emits its frame variant's MIR, which carries the cancel exits.
   let mut lowered = key.name
   if let Option<CoroutineFacts>.None = &suspension {
-    lowered = run exactBackendVariant(&mut resolver.*, &variantKey, variantObserving, &Option<CoroutineFacts>.none())
+    lowered = run exactBackendVariant(&mut resolver.*, &variantKey, variantObserving, &Option<CoroutineFacts>.none(), false)
   }
   let mir = run demandChild(
     &mut resolver.*,
@@ -93769,8 +94247,10 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
       llvmValues: List<InstanceDefinition>.make(),
       codegenUnits: false,
       fastPathIr: false,
+      inlining: false,
       direct: false,
       threads: false,
+      directSize: false,
       lineTables: false,
       packing: false,
       offeredBodies: List<BuildRecord.PackBody>.make(),
@@ -94146,7 +94626,8 @@ impl Semantic {
     return List<usize>.asSlice(&self.carriedRoots)
   }
   /// The build roots of the image an adoption read that the image `cacheImage` wrote last
-  /// carries over (`CacheImage.carry`): the definitions a replayed build took from that image.
+  /// carries over (`CacheImage.carry`): the definitions a replayed build took from that image,
+  /// and the inline summary roots they reach, whose fingerprints a later adoption compares.
   pub fn carriedDefinitions(self: &Self) -> &[usize] {
     return List<usize>.asSlice(&self.carriedBuild)
   }
@@ -94721,10 +95202,15 @@ impl Semantic {
       at = at + usize.ONE
     }
     let roots = List<CacheImage.Root>.asSlice(&image.roots)
+    let mut conditions = SummaryConditions.make()
+    if !linked && adopted.changedLeaves > usize.ZERO {
+      conditions = run summaryConditions(image, List<usize>.asSlice(&units), List<usize>.asSlice(&placed))
+    }
     // The build record and the definitions of a build walk sit beside the checks; a build
     // replays them (`replayBuild`).
     let mut recordRoot = usize.MAX
     let mut greenDefinitions = List<usize>.make()
+    let mut conditionalDefinitions = List<usize>.make()
     let mut packRoots = List<usize>.make()
     self.resolver.packs = List<HeldPack>.make()
     // Escape walk records sit beside them too; a check replays them (`replayEscapes`). A linked
@@ -94748,9 +95234,12 @@ impl Semantic {
       if kind == 2 {
         if node != usize.MAX || (!linked && List<bool>.get(&settled, root.node)) {
           run List<usize>.append(&mut greenDefinitions, at - usize.ONE)
+        } else if SummaryConditions.conditional(&conditions, root.node) {
+          run List<usize>.append(&mut conditionalDefinitions, at - usize.ONE)
         }
         continue
       }
+      if kind == 6 { continue }
       // A pack's text is held only with the body the cache offered for it.
       if kind == 5 {
         if node != usize.MAX {
@@ -94813,7 +95302,7 @@ impl Semantic {
     self.replay = Option<ReplayState>.none()
     if recordRoot != usize.MAX {
       self.replay = run ReplayState.read(image, recordRoot, List<usize>.asSlice(&greenDefinitions),
-        List<HeldPack>.asSlice(&self.resolver.packs), move packRoots)
+        List<usize>.asSlice(&conditionalDefinitions), &conditions, List<HeldPack>.asSlice(&self.resolver.packs), move packRoots)
     }
     return move adopted
   }
@@ -95093,12 +95582,63 @@ impl Semantic {
         at = at + usize.ONE
       }
     }
+    // The summaries the definitions just written read.
+    if let Option<CapturedBuild>.Some {..} = &self.capturedBuild { run Semantic.imageSummaries(&mut self.*, &mut build) }
+    run Semantic.carrySummaries(&mut self.*)
     run Semantic.imageEscapes(&mut self.*, &mut build)
     run Semantic.fileDigests(&mut self.*, &mut build, usize.ZERO)
     let ImageBuild {image, nodes, files, inputs, fileModules} = move build
     self.pendingImage = Option<PendingImage>.some(PendingImage {nodes: move nodes, files: move files, inputs: move inputs,
       fileModules: move fileModules, checks: move pending})
     return move image
+  }
+  // Adds a root for each inline summary unit the image holds a node for, which a caller lowered
+  // outside any frame read, with the fingerprint of its answer (`fingerprintValue`). A later
+  // adoption that finds the summary's node stale computes the summary again and compares
+  // (`summaryAgrees`), so a definition whose MIR rests on that node and is stale only through such
+  // summaries is still taken when each answers as it did (`summaryConditions`).
+  effect fn imageSummaries(self: &mut Self, build: &mut ImageBuild) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut unit = usize.ZERO
+    while unit < List<usize>.length(&build.nodes) {
+      let node = List<usize>.get(&build.nodes, unit)
+      let at = unit
+      unit = unit + usize.ONE
+      if node >= unfit() || List<ScopedKey>.get(&self.resolver.keys, at).key.family != Family.InlineSummary { continue }
+      let variant = List<ScopedKey>.get(&self.resolver.keys, at).key.name
+      let instances = List<BackendInstance>.asSlice(&self.resolver.backendInstances)
+      if variant >= instances.length || !instances[variant].raw { continue }
+      if let Option<CoroutineFacts>.Some {..} = &instances[variant].suspension { continue }
+      let held = match move Query.completed(&mut self.query, Word {value: usize.toU64(at)}) {
+        Option<Shared<Result<Answer, NoRejection>>>.Some {value} => move value
+        Option<Shared<Result<Answer, NoRejection>>>.None => { continue }
+      }
+      let fingerprint = Shared<Result<Answer, NoRejection>>.with<Option<ContentHash>>(&held, summaryFingerprint)
+      if let Option<ContentHash>.Some {value} = move fingerprint {
+        let key = run buildSummaryKey(&instances[variant].key, instances[variant].observing)
+        run List<CacheImage.Root>.append(&mut build.image.roots, CacheImage.Root {key: move key, node: node,
+          answer: run digestBytes(value)})
+      }
+    }
+  }
+  // Adds to the roots the image written next carries from the image this store read each summary
+  // root that a carried root reaches, so a definition carried again keeps the fingerprints its MIR
+  // rests on (`imageSummaries`).
+  effect fn carrySummaries(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    if List<usize>.length(&self.carriedBuild) == usize.ZERO { return () }
+    let read = match &self.heldImage {
+      Option<CacheImage.Image>.Some {value} => &value
+      Option<CacheImage.Image>.None => { return () }
+    }
+    if !CacheImage.nodesRead(read) { return () }
+    let reached = run CacheImage.reachedNodes(read, List<usize>.asSlice(&self.carriedBuild))
+    let roots = List<CacheImage.Root>.asSlice(&read.roots)
+    let mut at = usize.ZERO
+    while at < roots.length {
+      if Option<&[u8]>.isSome(&rootIdentity(Bytes.asSlice(&roots[at].key), 6)) && List<bool>.get(&reached, roots[at].node) {
+        run List<usize>.append(&mut self.carriedBuild, at)
+      }
+      at = at + usize.ONE
+    }
   }
   // Fills the digest of each file leaf from the `from`th on with the bytes its module holds now,
   // read once the walk is done.
@@ -95571,6 +96111,16 @@ impl Semantic {
     self.resolver.codegenUnits = split
   }
 
+  /// Selects whether lowering inlines callees into their callers before code generation, as an
+  /// optimized build does: a build for the direct backend inlines small callees, and an LLVM
+  /// build only the calls of suspendable frames that LLVM inlines too late. A build with line
+  /// tables inlines nothing whatever this says.
+  /// The cache keeps one image per profile, so MIR lowered under one choice is never adopted under
+  /// the other.
+  pub fn selectInlining(self: &mut Self, inlining: bool) -> () {
+    self.resolver.inlining = inlining
+  }
+
   /// Selects whether emitted LLVM text is shaped for Clang's unoptimized `-O0` compile, whose fast
   /// instruction selector it then stays on, and whether the run sites of one lowered function
   /// share the slot they catch each failure type in, which only a frame without stack coloring
@@ -95581,11 +96131,14 @@ impl Semantic {
   }
 
   /// Selects whether instances lower to wasm fragments for the direct backend (`WasmLower`)
-  /// instead of LLVM text, and whether that module's memory is shared between threads
-  /// (`threads`). The cache keeps one image per profile, as for `selectFastPathIr`.
-  pub fn selectDirect(self: &mut Self, direct: bool, threads: bool) -> () {
+  /// instead of LLVM text, whether that module's memory is shared between threads (`threads`),
+  /// and whether a build that is not unoptimized (`selectFastPathIr`) optimizes them for size
+  /// (`size`) rather than speed (`SsaPipeline.Level`). The cache keeps one image per profile, as
+  /// for `selectFastPathIr`.
+  pub fn selectDirect(self: &mut Self, direct: bool, threads: bool, size: bool) -> () {
     self.resolver.direct = direct
     self.resolver.threads = direct && threads
+    self.resolver.directSize = direct && size
   }
 
   /// Selects whether lowered functions carry the line and column of each position their location
@@ -99236,6 +99789,7 @@ impl Semantic {
     if let Option<ReplayState>.Some {value: state} = move taken {
       if Graph.recording(&self.resolver.graph) {
         let mut replaying = move state
+        run Semantic.settleSummaries(&mut self.*, &mut replaying)
         if let Option<BackendBuild>.Some {value: replayed} = move run Semantic.replayBuild(&mut self.*, &mut replaying, &module,
           List<BuildRoot>.asSlice(&roots), origin) {
           drop emitting
@@ -100055,7 +100609,7 @@ impl Semantic {
         let declarationAccess274Request = Key {
             family: Family.Mir,
             module: location.module,
-            name: run exactBackendVariant(&mut self.resolver, &instance, observing, &Option<CoroutineFacts>.none()),
+            name: run exactBackendVariant(&mut self.resolver, &instance, observing, &Option<CoroutineFacts>.none(), false),
             declaration: location.declaration,
             member: member,
             external: false,
@@ -100077,7 +100631,7 @@ impl Semantic {
             }
           }
         }
-        let backendName = run exactBackendVariant(&mut self.resolver, &instance, observing, &suspension)
+        let backendName = run exactBackendVariant(&mut self.resolver, &instance, observing, &suspension, false)
         // A frame variant's cancel exits can drop owners its other paths move away, so its own MIR
         // names the references to visit.
         if let Option<CoroutineFacts>.Some {..} = &suspension {
@@ -100363,7 +100917,7 @@ impl Semantic {
         at = usize.ZERO
         while at < current.length {
           let body = current[at]
-          if !self.resolver.fastPathIr && !self.resolver.lineTables && MirInline.eligible(&ordinary[body]) {
+          if self.resolver.inlining && !self.resolver.lineTables && MirInline.eligible(&ordinary[body], self.resolver.direct) {
             let position = run FrameSelection.position(&selection, &ordinary[body].key)
             if position != usize.MAX { List<usize>.set(&mut selection.bodies, position, body) }
           }
@@ -100564,6 +101118,73 @@ impl Semantic {
     }
   }
 
+  // Keeps each definition `state` took only while inline summaries answer as they did
+  // (`ReplayState.waiting`) when every one of them still does, and gives up the others, which the
+  // replay then lowers again. A caller's MIR read nothing of such a callee but its summary, so one
+  // that answers as it did leaves the caller's MIR, and the definition emitted from it, as it was.
+  // A callee the caller inlined is read through its un-inlined MIR as well, which leaves the
+  // caller stale and never waiting.
+  effect fn settleSummaries(self: &mut Self, state: &mut ReplayState) -> ()
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+    let summaries = List<SummaryRoot>.length(&state.summaries)
+    if summaries == usize.ZERO { return () }
+    // Each summary's verdict once asked: 0 not yet, 1 answers as it did, 2 does not.
+    let mut verdicts = List<u8>.make()
+    run List<u8>.appendRepeated(&mut verdicts, 0, summaries)
+    let waiting = Intrinsic.replace(state.waiting, List<WaitingEntry>.make())
+    let listed = List<WaitingEntry>.asSlice(&waiting)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      let mut agrees = true
+      let mut each = listed[at].start
+      while agrees && each < listed[at].end {
+        let summary = List<usize>.get(&state.waitedOn, each)
+        if List<u8>.get(&verdicts, summary) == 0 {
+          let mut verdict: u8 = 2
+          if run Semantic.summaryAgrees(&mut self.*, &List<SummaryRoot>.asSlice(&state.summaries)[summary]) { verdict = 1 }
+          List<u8>.set(&mut verdicts, summary, verdict)
+        }
+        agrees = List<u8>.get(&verdicts, summary) == 1
+        each = each + usize.ONE
+      }
+      if !agrees { ReplayState.release(&mut state.*, listed[at].entry) }
+      at = at + usize.ONE
+    }
+  }
+
+  // Whether the inline summary `summary` names answers as it did when its root was written: the
+  // key its identity names is made again from its declaration (`recordedKey`), and the summary of
+  // that key's un-inlined MIR, outside any frame, fingerprints as the root records.
+  effect fn summaryAgrees(self: &mut Self, summary: &SummaryRoot) -> bool
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+    let identity = Bytes.asSlice(&summary.identity)
+    let mut reader = StableKey.reader()
+    let observing = StableKey.readWord(identity, &mut reader) == 1
+    let high = StableKey.readWord(identity, &mut reader)
+    let low = StableKey.readWord(identity, &mut reader)
+    if StableKey.failed(&reader) { return false }
+    let start = StableKey.offset(&reader)
+    let instance = match move run recordedKey(Slice.view<u8>(identity, start, identity.length - start)) {
+      Option<InstanceKey>.Some {value} => move value
+      Option<InstanceKey>.None => { return false }
+    }
+    if !ContentHash.equals(run instanceDigest(&instance), ContentHash {high: high, low: low}) { return false }
+    let location = match move run locationOfInstance(&mut self.resolver, &instance) {
+      Option<InstanceLocation>.Some {value} => value
+      Option<InstanceLocation>.None => { return false }
+    }
+    let variant = run exactBackendVariant(&mut self.resolver, &instance, observing, &Option<CoroutineFacts>.none(), true)
+    let key = run internDeclaration(&mut self.resolver, Key {family: Family.InlineSummary, module: location.module,
+      declaration: location.declaration, member: instanceMember(&instance), name: variant, external: false})
+    let answer = run demandRaw(&mut self.resolver, &mut self.query, key, Span.make(usize.ZERO, usize.ZERO))
+    return match Shared<Result<Answer, NoRejection>>.with<Option<ContentHash>>(&answer, summaryFingerprint) {
+      Option<ContentHash>.Some {value} => ContentHash.equals(value, summary.fingerprint)
+      Option<ContentHash>.None => false
+    }
+  }
+
   // Replays the build record an adoption read instead of walking the program again, when the
   // record still describes this build (see `BuildRecord`). The keys of stale entries are found
   // again through their parents' MIR, which reads as it did for every green parent; each stale
@@ -100761,7 +101382,7 @@ impl Semantic {
       Option<InstanceLocation>.None => { return Option<ReplayMir>.none() }
     }
     let member = instanceMember(instance)
-    let lowered = run exactBackendVariant(&mut self.resolver, instance, observing, &Option<CoroutineFacts>.none())
+    let lowered = run exactBackendVariant(&mut self.resolver, instance, observing, &Option<CoroutineFacts>.none(), false)
     let mirKey = run internDeclaration(&mut self.resolver, Key {family: Family.Mir, module: location.module, name: lowered,
       declaration: location.declaration, member: member, external: false})
     let answer = run demandRaw(&mut self.resolver, &mut self.query, mirKey, Span.make(usize.ZERO, usize.ZERO))
@@ -100779,7 +101400,7 @@ impl Semantic {
   effect fn replayText(self: &mut Self, instance: &InstanceKey, lowered: ReplayMir, observing: bool) -> Option<CapturedEntry>
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
   ? &mut Allocator | &mut Types {
-    let backendName = run exactBackendVariant(&mut self.resolver, instance, observing, &Option<CoroutineFacts>.none())
+    let backendName = run exactBackendVariant(&mut self.resolver, instance, observing, &Option<CoroutineFacts>.none(), false)
     let key = run internDeclaration(&mut self.resolver, Key {family: Family.EmissionInputs, module: lowered.location.module,
       name: backendName, declaration: lowered.location.declaration, member: lowered.member, external: false})
     let prepared = run demandRaw(&mut self.resolver, &mut self.query, key, Span.make(usize.ZERO, usize.ZERO))
@@ -100857,7 +101478,8 @@ impl Semantic {
     -> Option<BackendBuild>
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
   ? &mut Allocator | &mut Types {
-    let ReplayState {record, recordRoot: _, roots: definitionRoots, definitions, places, held, packRoots: _, guarded} = move state
+    let ReplayState {record, recordRoot: _, roots: definitionRoots, definitions, places, held, packRoots: _, guarded, waiting: _,
+      waitedOn: _, summaries: _} = move state
     let entries = List<BuildRecord.Entry>.asSlice(&record.entries)
     // A replay that took the image's definitions leaves none to take, and a record resting on
     // growth guard reads cannot be replaced by one that does not.
@@ -103046,7 +103668,7 @@ effect fn assembleEmissionChecked(
     }
   }
   let mut text = Bytes.make()
-  if resolver.direct { text = run WasmLower.declarations(&resolver.target, resolver.threads) }
+  if resolver.direct { text = run WasmLower.declarations(&resolver.target, resolver.threads, resolver.fastPathIr, resolver.verifyMir) }
   else { text = run LlvmCode.declarations(&resolver.target, resolver.fastPathIr) }
   run appendEmissionDeclarations(&mut text, &bound)
   let header = run Bytes.copy(Bytes.asSlice(&text))
@@ -103634,7 +104256,8 @@ effect fn sharedState(parts: &[Bytes], roots: &[BuildRoot]) -> Option<ReplayStat
   let mut places = List<TextPlace>.make()
   run List<TextPlace>.appendRepeated(&mut places, TextPlace {pack: usize.MAX, member: usize.MAX}, total)
   return Option<ReplayState>.some(ReplayState {record: move merged, recordRoot: usize.MAX, roots: move definitionRoots,
-    definitions: move definitions, places: move places, held: move held, packRoots: List<usize>.make(), guarded: false})
+    definitions: move definitions, places: move places, held: move held, packRoots: List<usize>.make(), guarded: false,
+    waiting: List<WaitingEntry>.make(), waitedOn: List<usize>.make(), summaries: List<SummaryRoot>.make()})
 }
 
 // One reached instance of a captured walk, before its references are resolved to entries.
@@ -104778,7 +105401,8 @@ impl Copy for ReplayMir {}
 struct ReplayState {
   record: BuildRecord.Record,
   recordRoot: usize,
-  // Each entry's definition root in the image, when that root's node is green; `usize.MAX` for
+  // Each entry's definition root in the image, when that root's node is green or waits on inline
+  // summaries alone (`waiting`); `usize.MAX` for
   // an alias or a stale entry. An image written later carries these.
   roots: List<usize>,
   // Each entry a replay takes from the image: its definition without its text, and where a held
@@ -104792,14 +105416,38 @@ struct ReplayState {
   packRoots: List<usize>,
   // Whether the record rests on growth guard reads, which a record a rewalk writes cannot carry.
   guarded: bool,
+  // The entries taken above only while inline summaries answer as they did, each with the
+  // `summaries` it waits on, and those summaries; `settleSummaries` keeps or drops each entry
+  // before a replay reads the others.
+  waiting: List<WaitingEntry>,
+  waitedOn: List<usize>,
+  summaries: List<SummaryRoot>,
+}
+
+// A replayed entry whose definition is taken only while summaries `waitedOn[start..end]` of its
+// replay state answer as they did.
+struct WaitingEntry {
+  entry: usize,
+  start: usize,
+  end: usize,
+}
+
+impl Copy for WaitingEntry {}
+
+// An image's summary root (`imageSummaries`): the identity `buildSummaryKey` writes and the
+// fingerprint of the answer it recorded.
+struct SummaryRoot {
+  identity: Bytes,
+  fingerprint: ContentHash,
 }
 
 impl ReplayState {
   // The replay state of `image`'s record root, with `green` its definition roots whose nodes are
-  // green, or only moved (`adoptCache`), and `packs` the packs held beside it; none when the
-  // record does not decode.
-  effect fn read(image: &CacheImage.Image, recordRoot: usize, green: &[usize], packs: &[HeldPack], packRoots: List<usize>)
-    -> Option<ReplayState> ! OutOfMemoryError ? &mut Allocator {
+  // green, or only moved (`adoptCache`), `waiting` those whose nodes wait on inline summaries
+  // alone, as `conditions` says, and `packs` the packs held beside it; none when the record does
+  // not decode.
+  effect fn read(image: &CacheImage.Image, recordRoot: usize, green: &[usize], waiting: &[usize], conditions: &SummaryConditions,
+    packs: &[HeldPack], packRoots: List<usize>) -> Option<ReplayState> ! OutOfMemoryError ? &mut Allocator {
     let roots = List<CacheImage.Root>.asSlice(&image.roots)
     let record = match move run BuildRecord.decode(Bytes.asSlice(&roots[recordRoot].answer)) {
       Option<BuildRecord.Record>.Some {value} => move value
@@ -104821,48 +105469,89 @@ impl ReplayState {
     }
     let entries = List<BuildRecord.Entry>.asSlice(&record.entries)
     let mut lookup = InternIndex.make()
-    let mut definitionRoots = List<usize>.make()
-    let mut definitions = List<Option<InstanceDefinition>>.make()
-    let mut places = List<TextPlace>.make()
-    let mut held = List<bool>.make()
+    let mut state = ReplayState {record: BuildRecord.make(false, false), recordRoot: recordRoot, roots: List<usize>.make(),
+      definitions: List<Option<InstanceDefinition>>.make(), places: List<TextPlace>.make(), held: List<bool>.make(),
+      packRoots: move packRoots, guarded: CacheImage.edgesOf(image, roots[recordRoot].node).length > usize.ZERO,
+      waiting: List<WaitingEntry>.make(), waitedOn: List<usize>.make(), summaries: List<SummaryRoot>.make()}
     let mut at = usize.ZERO
     while at < entries.length {
       run InternIndex.record(&mut lookup, digestHash(entries[at].exact))
-      run List<usize>.append(&mut definitionRoots, usize.MAX)
-      run List<Option<InstanceDefinition>>.append(&mut definitions, Option<InstanceDefinition>.none())
-      run List<TextPlace>.append(&mut places, TextPlace {pack: usize.MAX, member: usize.MAX})
-      run List<bool>.append(&mut held, false)
+      run List<usize>.append(&mut state.roots, usize.MAX)
+      run List<Option<InstanceDefinition>>.append(&mut state.definitions, Option<InstanceDefinition>.none())
+      run List<TextPlace>.append(&mut state.places, TextPlace {pack: usize.MAX, member: usize.MAX})
+      run List<bool>.append(&mut state.held, false)
       at = at + usize.ONE
     }
+    // Each image summary root a waiting entry names, by its index in `summaries`.
+    let mut named = List<usize>.make()
     at = usize.ZERO
-    while at < green.length {
-      let root = &roots[green[at]]
-      let mut span = Span.make(usize.ZERO, usize.ZERO)
-      drop buildRootKind(Bytes.asSlice(&root.key), &mut span)
-      let exact = digestOfBytes(StableKey.view(Bytes.asSlice(&root.key), span))
-      let mut entry = InternIndex.first(&lookup, digestHash(exact))
-      while entry != usize.MAX {
-        if ContentHash.equals(entries[entry].exact, exact) && entries[entry].alias == usize.MAX {
-          List<usize>.set(&mut definitionRoots, entry, green[at])
-          if Bytes.length(&root.answer) == usize.ZERO {
-            List<bool>.set(&mut held, entry, true)
-          } else if let Option<InstanceDefinition>.Some {value: definition} = move run BuildRecord.decodeDefinition(Bytes.asSlice(&root.answer)) {
-            let place = heldPlace(packs, List<TextPlace>.asSlice(&members), &memberLookup, Bytes.asSlice(&definition.symbol))
-            if place.pack != usize.MAX {
-              List<TextPlace>.set(&mut places, entry, place)
-              List<bool>.set(&mut held, entry, true)
-              List<Option<InstanceDefinition>>.set(&mut definitions, entry, Option<InstanceDefinition>.some(move definition))
-            }
-          }
-          break
-        }
-        entry = InternIndex.after(&lookup, entry)
-      }
+    while at < green.length + waiting.length {
+      let mut root = usize.MAX
+      if at < green.length { root = green[at] } else { root = waiting[at - green.length] }
       at = at + usize.ONE
+      let entry = run ReplayState.hold(&mut state, entries, &lookup, roots, root, packs, List<TextPlace>.asSlice(&members), &memberLookup)
+      if entry == usize.MAX || at <= green.length { continue }
+      let start = List<usize>.length(&state.waitedOn)
+      let listed = SummaryConditions.of(conditions, roots[root].node)
+      let mut each = usize.ZERO
+      while each < listed.length {
+        let mut known = usize.ZERO
+        while known < List<usize>.length(&named) && List<usize>.get(&named, known) != listed[each] { known = known + usize.ONE }
+        if known == List<usize>.length(&named) {
+          run List<usize>.append(&mut named, listed[each])
+          let summary = &roots[listed[each]]
+          let mut identity = Bytes.make()
+          if let Option<&[u8]>.Some {value} = rootIdentity(Bytes.asSlice(&summary.key), 6) { identity = run Bytes.copy(value) }
+          run List<SummaryRoot>.append(&mut state.summaries, SummaryRoot {identity: move identity,
+            fingerprint: digestOfBytes(Bytes.asSlice(&summary.answer))})
+        }
+        run List<usize>.append(&mut state.waitedOn, known)
+        each = each + usize.ONE
+      }
+      run List<WaitingEntry>.append(&mut state.waiting, WaitingEntry {entry: entry, start: start, end: List<usize>.length(&state.waitedOn)})
     }
-    let guarded = CacheImage.edgesOf(image, roots[recordRoot].node).length > usize.ZERO
-    return Option<ReplayState>.some(ReplayState {record: move record, recordRoot: recordRoot, roots: move definitionRoots,
-      definitions: move definitions, places: move places, held: move held, packRoots: move packRoots, guarded: guarded})
+    state.record = move record
+    return Option<ReplayState>.some(move state)
+  }
+
+  // Takes the definition of the image's definition root `root` for the entry it names, which
+  // `lookup` finds among `entries`, and returns that entry, or `usize.MAX` when no entry is named.
+  // A definition whose text no pack in `packs` holds is not taken.
+  effect fn hold(self: &mut Self, entries: &[BuildRecord.Entry], lookup: &InternIndex, roots: &[CacheImage.Root], root: usize,
+    packs: &[HeldPack], members: &[TextPlace], memberLookup: &InternIndex) -> usize ! OutOfMemoryError ? &mut Allocator {
+    let held = &roots[root]
+    let exact = match rootIdentity(Bytes.asSlice(&held.key), 2) {
+      Option<&[u8]>.Some {value} => digestOfBytes(value)
+      Option<&[u8]>.None => { return usize.MAX }
+    }
+    let mut entry = InternIndex.first(lookup, digestHash(exact))
+    while entry != usize.MAX {
+      if ContentHash.equals(entries[entry].exact, exact) && entries[entry].alias == usize.MAX {
+        List<usize>.set(&mut self.roots, entry, root)
+        if Bytes.length(&held.answer) == usize.ZERO {
+          List<bool>.set(&mut self.held, entry, true)
+        } else if let Option<InstanceDefinition>.Some {value: definition} = move run BuildRecord.decodeDefinition(Bytes.asSlice(&held.answer)) {
+          let place = heldPlace(packs, members, memberLookup, Bytes.asSlice(&definition.symbol))
+          if place.pack != usize.MAX {
+            List<TextPlace>.set(&mut self.places, entry, place)
+            List<bool>.set(&mut self.held, entry, true)
+            List<Option<InstanceDefinition>>.set(&mut self.definitions, entry, Option<InstanceDefinition>.some(move definition))
+          }
+        }
+        return entry
+      }
+      entry = InternIndex.after(lookup, entry)
+    }
+    return usize.MAX
+  }
+
+  // Gives up the definition taken for `entry`, which a replay then lowers again.
+  fn release(self: &mut Self, entry: usize) -> () {
+    List<usize>.set(&mut self.roots, entry, usize.MAX)
+    List<bool>.set(&mut self.held, entry, false)
+    List<TextPlace>.set(&mut self.places, entry, TextPlace {pack: usize.MAX, member: usize.MAX})
+    let mut slots = List<Option<InstanceDefinition>>.asMutSlice(&mut self.definitions)
+    drop Intrinsic.replace(slots[entry], Option<InstanceDefinition>.none())
   }
 }
 
@@ -104903,6 +105592,22 @@ effect fn buildEntryKey(exact: ContentHash) -> Bytes ! OutOfMemoryError ? &mut A
   let mut key = Bytes.make()
   run RuntimeEncoding.field(&mut key, b"silk.build.entry")
   run RuntimeEncoding.field(&mut key, Bytes.asSlice(&run digestBytes(exact)))
+  return move key
+}
+
+// The stable key of the root holding the fingerprint of the inline summary of `instance`'s
+// un-inlined MIR, as a caller lowered for `observing` and outside any frame reads it. Its identity
+// is the observing word, the key's exact digest, and its declaration with the shape
+// `appendRecordedShape` writes, from which `summaryAgrees` makes the key again.
+effect fn buildSummaryKey(instance: &InstanceKey, observing: bool) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut named = Bytes.make()
+  if observing { run RuntimeEncoding.word(&mut named, 1) } else { run RuntimeEncoding.word(&mut named, 0) }
+  run Bytes.append(&mut named, Bytes.asSlice(&run digestBytes(run instanceDigest(instance))))
+  run StableKey.declaration(&mut named, &DeclarationId.copyShared(&InstanceKey.identity(instance)))
+  run appendRecordedShape(&mut named, instance)
+  let mut key = Bytes.make()
+  run RuntimeEncoding.field(&mut key, b"silk.build.summary")
+  run RuntimeEncoding.field(&mut key, Bytes.asSlice(&named))
   return move key
 }
 
@@ -104962,10 +105667,6 @@ effect fn escapeEntryKey(exact: ContentHash) -> Bytes ! OutOfMemoryError ? &mut 
   return move key
 }
 
-// What a cache image root's key names: a module check (0), the build record (1), a build entry's
-// definition (2), an escape walk record (3), an escape entry (4) or a pack (5). For a build or
-// escape entry, `exact` then spans its exact identity, for an escape record its check's stable
-// unit key, and for a pack its digest.
 // The roots of `image` that hold escape walks (kinds 3 and 4), and its module checks (kind 0)
 // too when `checks`.
 effect fn rootsOfKinds(image: &CacheImage.Image, checks: bool) -> List<usize> ! OutOfMemoryError ? &mut Allocator {
@@ -104981,6 +105682,18 @@ effect fn rootsOfKinds(image: &CacheImage.Image, checks: bool) -> List<usize> ! 
   return move kept
 }
 
+// What a cache image root's key names: a module check (0), the build record (1), a build entry's
+// definition (2), an escape walk record (3), an escape entry (4), a pack (5) or an inline
+// summary's fingerprint (6). For a build or escape entry, `exact` then spans its exact identity,
+// for an escape record its check's stable unit key, for a pack its digest, and for a summary the
+// identity `buildSummaryKey` writes.
+// The identity `buildRootKind` finds in a root key of kind `kind`; none for a key of another kind.
+fn rootIdentity<'a>(key: &'a [u8], kind: u64) -> Option<&'a [u8]> {
+  let mut span = Span.make(usize.ZERO, usize.ZERO)
+  if buildRootKind(key, &mut span) != kind { return Option<&[u8]>.none() }
+  return Option<&[u8]>.some(StableKey.view(key, span))
+}
+
 fn buildRootKind(key: &[u8], exact: &mut Span) -> u64 {
   let mut reader = StableKey.reader()
   let named = StableKey.readField(key, &mut reader)
@@ -104992,6 +105705,7 @@ fn buildRootKind(key: &[u8], exact: &mut Span) -> u64 {
   if same(name, b"silk.escape.record") { kind = 3 }
   if same(name, b"silk.escape.entry") { kind = 4 }
   if same(name, b"silk.build.pack") { kind = 5 }
+  if same(name, b"silk.build.summary") { kind = 6 }
   if kind == 0 { return 0 }
   let identity = StableKey.readField(key, &mut reader)
   if !StableKey.finished(key, &reader) { return 0 }
@@ -105339,6 +106053,8 @@ struct SuspensionSummary {
   callbacks: List<CallbackBoundary>,
   accesses: List<CallbackBoundary>,
   escapes: List<SummaryEscape>,
+  // The instances whose bodies this one inlined; their code runs, and parks, as part of this one.
+  inlined: List<InstanceKey>,
 }
 
 // Where a module's escape walk stops: at the plain instance of a declaration in another module of
@@ -105654,8 +106370,20 @@ impl SuspensionSummary {
       callbacks: move callbacks,
       accesses: move accesses,
       escapes: move escapes,
+      inlined: run copyKeys(&function.inlined),
     }
   }
+}
+
+effect fn copyKeys(keys: &List<InstanceKey>) -> List<InstanceKey> ! OutOfMemoryError ? &mut Allocator {
+  let listed = List<InstanceKey>.asSlice(keys)
+  let mut copied = run List<InstanceKey>.makeWithCapacity(listed.length)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    run List<InstanceKey>.append(&mut copied, InstanceKey.copy(&listed[at]))
+    at = at + usize.ONE
+  }
+  return move copied
 }
 
 // Rejects each `export "C"` function that can park externally (SEM0201), at its declaration. C
@@ -106223,6 +106951,19 @@ effect fn nonParkingViolations(resolver: &Resolver, summaries: &[SuspensionSumma
           if sameDeclaration(&identity, &named[declaration]) {
             reached = true
             if marked[target] { proved = false }
+          }
+          // An instance inlined everywhere has no summary of its own; it runs, and so may park,
+          // only as part of a function that inlined it. `requestUnreached` enters an exact callee
+          // of an obligation that no summary runs, so only a declaration's instances need this.
+          let spliced = List<InstanceKey>.asSlice(&summaries[target].inlined)
+          let mut each = usize.ZERO
+          while each < spliced.length {
+            let inlined = InstanceKey.identity(&spliced[each])
+            if sameDeclaration(&inlined, &named[declaration]) {
+              reached = true
+              if marked[target] { proved = false }
+            }
+            each = each + usize.ONE
           }
           target = target + usize.ONE
         }

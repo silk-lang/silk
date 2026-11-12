@@ -1,0 +1,525 @@
+//! Dominator-based value numbering of one SSA function: folding, common subexpressions, and the
+//! checks an earlier branch already decided.
+//!
+//! # When to use
+//! Run [`number`] in an optimized build after promotion and after each pass that exposes new
+//! equalities, such as forwarding loads. It leaves branches on constants for the control flow
+//! pass to fold.
+//!
+//! # Details
+//! A walk of the dominator tree in preorder visits each instruction once, with its operands
+//! already replaced by the values they equal:
+//!
+//! - `SsaFolding.simplify` folds it or rewrites it into a simpler instruction.
+//! - A pure instruction (no side effect, no state read: `Operation.isPure`) equal to one in a
+//!   dominating position, by operation, immediates, kind and operands, is replaced by it. A pure
+//!   division can trap, but an equal one already ran without trapping, so the later one cannot
+//!   trap either. Loads, calls and every other instruction that reads or changes state are never
+//!   merged here; `SsaMemory` forwards loads.
+//! - Commutative integer operations and integer comparisons put their operands in value order
+//!   first, a comparison swapping its predicate, so `a < b` and `b > a` are one value.
+//! - A block whose only predecessor ends in a branch knows the branch's condition: true along the
+//!   first edge, false along the second, everywhere the block dominates. A switch case's block
+//!   knows the switch value equals the case. The known value replaces each use there, and when
+//!   the condition is an integer comparison, another comparison of the same operands that it
+//!   implies or refutes folds too (`i < n` decides a later `i >= n`). So a check dominated by an
+//!   identical check that passed is decided, and its trap path becomes unreachable once the
+//!   control flow pass folds the branch.
+//!
+//! A replaced instruction is removed; nothing is moved. Numbering is the function's own: the
+//! walk's order, and so every constant it makes, depends only on the function.
+
+import backend.SsaFolding
+import backend.SsaFolding {isIntegerPredicate}
+import backend.SsaFunction {
+  Binary,
+  Edge,
+  Exit,
+  Operation,
+  Predicate,
+  SsaFunction,
+  none,
+}
+import backend.SsaGraph {SsaGraph}
+import silk.collections.list {List}
+import silk.core.option {Option}
+import silk.core.ownership {Copy}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.u64
+import silk.num.usize
+
+// One entry of the table of available instructions: the instruction, the bucket it hangs in, and
+// the entry below it in that bucket.
+struct Entry {
+  instruction: usize,
+  bucket: usize,
+  next: usize,
+}
+
+impl Copy for Entry {}
+
+// A comparison known to hold or not where the walk stands.
+struct Fact {
+  predicate: Predicate,
+  left: u64,
+  right: u64,
+  truth: bool,
+}
+
+impl Copy for Fact {}
+
+// A value known to equal another where the walk stands, and what it was known as before.
+struct Known {
+  value: u64,
+  previous: u64,
+}
+
+impl Copy for Known {}
+
+// How many of the newest facts a comparison is checked against.
+fn factWindow() -> usize { return 64 }
+
+struct Numbering {
+  // The value each value was replaced by for good, by value, or `none()`.
+  substitution: List<u64>,
+  // The value each value equals in the blocks the walk is in, by value, or `none()`.
+  known: List<u64>,
+  knownLog: List<Known>,
+  facts: List<Fact>,
+  buckets: List<usize>,
+  entries: List<Entry>,
+  trueFlag: u64,
+  falseFlag: u64,
+  changed: bool,
+}
+
+/// Numbers the values of `function`: folds, merges equal pure instructions and decides the
+/// comparisons a dominating branch decided; answers whether it changed anything.
+pub effect fn number(function: &mut SsaFunction) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let graph = run SsaGraph.of(&function.*)
+  let mut size: usize = 16
+  while size < function.instructionCount() * 2 { size = size * 2 }
+  let mut state = Numbering {substitution: List<u64>.make(), known: List<u64>.make(), knownLog: List<Known>.make(), facts: List<Fact>.make(),
+    buckets: List<usize>.make(), entries: List<Entry>.make(), trueFlag: none(), falseFlag: none(), changed: false}
+  run List<usize>.appendRepeated(&mut state.buckets, usize.MAX, size)
+  run List<u64>.appendRepeated(&mut state.substitution, none(), function.valueCount())
+  run List<u64>.appendRepeated(&mut state.known, none(), function.valueCount())
+  // Entries: a block to enter, or `usize.MAX - n` to leave the n-th mark.
+  let mut marks = List<usize>.make()
+  let mut walk = List<usize>.make()
+  run List<usize>.append(&mut walk, usize.ZERO)
+  let blocks = function.blockCount()
+  while let Option<usize>.Some {value: next} = List<usize>.pop(&mut walk) {
+    if next > blocks {
+      let mark = usize.MAX - next
+      leave(&mut state, List<usize>.asSlice(&marks), mark)
+      List<usize>.truncate(&mut marks, mark)
+      continue
+    }
+    let block = next
+    let mark = List<usize>.length(&marks)
+    run List<usize>.append(&mut marks, List<Entry>.length(&state.entries))
+    run List<usize>.append(&mut marks, List<Known>.length(&state.knownLog))
+    run List<usize>.append(&mut marks, List<Fact>.length(&state.facts))
+    run List<usize>.append(&mut walk, usize.MAX - mark)
+    run learnFromPredecessor(&mut state, &mut function.*, &graph, block)
+    run visitBlock(&mut state, &mut function.*, block)
+    let children = graph.childrenOf(block)
+    let mut child = children.length
+    while child > usize.ZERO {
+      child = child - usize.ONE
+      run List<usize>.append(&mut walk, children[child])
+    }
+  }
+  function.sweep()
+  return state.changed
+}
+
+// Undoes what the walk learned since mark `mark`: the entries, the known values and the facts.
+fn leave(state: &mut Numbering, marks: &[usize], mark: usize) -> () {
+  let entries = marks[mark]
+  while List<Entry>.length(&state.entries) > entries {
+    let last = List<Entry>.length(&state.entries) - usize.ONE
+    let entry = List<Entry>.get(&state.entries, last)
+    List<usize>.set(&mut state.buckets, entry.bucket, entry.next)
+    List<Entry>.truncate(&mut state.entries, last)
+  }
+  let known = marks[mark + usize.ONE]
+  while List<Known>.length(&state.knownLog) > known {
+    let last = List<Known>.length(&state.knownLog) - usize.ONE
+    let undone = List<Known>.get(&state.knownLog, last)
+    List<u64>.set(&mut state.known, u64.toUsize(undone.value), undone.previous)
+    List<Known>.truncate(&mut state.knownLog, last)
+  }
+  List<Fact>.truncate(&mut state.facts, marks[mark + 2])
+  return ()
+}
+
+// What a block learns from its only predecessor's branch or switch.
+effect fn learnFromPredecessor(state: &mut Numbering, function: &mut SsaFunction, graph: &SsaGraph, block: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let incoming = graph.predecessorsOf(block)
+  if incoming.length != usize.ONE { return () }
+  let from = function.block(incoming[usize.ZERO])
+  let edges = List<Edge>.asSlice(&from.edges)
+  let mut taken = usize.MAX
+  let mut at = usize.ZERO
+  while at < edges.length {
+    if edges[at].block == block { taken = at }
+    at = at + usize.ONE
+  }
+  if taken == usize.MAX { return () }
+  let condition = resolve(&state.*, from.value)
+  if from.exit == Exit.Branch {
+    if function.isConstant(condition) { return () }
+    let truth = taken == usize.ZERO
+    let flag = run flagOf(&mut state.*, &mut function.*, truth)
+    run learn(&mut state.*, condition, flag)
+    let producer = function.producerOf(condition)
+    if producer != usize.MAX {
+      if let Operation.Compare {predicate} = function.instruction(producer).operation {
+        let operands = function.operandsOf(producer)
+        if isIntegerPredicate(predicate) {
+          run List<Fact>.append(&mut state.facts, Fact {predicate: predicate, left: operands[usize.ZERO], right: operands[usize.ONE], truth: truth})
+        }
+      }
+    }
+  } else if from.exit == Exit.Switch && taken != usize.ZERO {
+    // A case's block, unless the default reaches it too, knows the value is the case's bits:
+    // the only predecessor counted each edge, so one edge leads here.
+    if function.isConstant(condition) { return () }
+    let bits = List<u64>.get(&from.cases, taken - usize.ONE)
+    let kind = function.kindOf(condition)
+    let equal = run function.constant(kind, bits)
+    run learn(&mut state.*, condition, equal)
+  }
+  return ()
+}
+
+// The flag constant `truth`, made once per walk.
+effect fn flagOf(state: &mut Numbering, function: &mut SsaFunction, truth: bool) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  if truth {
+    if state.trueFlag == none() { state.trueFlag = run function.flag(true) }
+    return state.trueFlag
+  }
+  if state.falseFlag == none() { state.falseFlag = run function.flag(false) }
+  return state.falseFlag
+}
+
+effect fn learn(state: &mut Numbering, value: u64, equal: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  if equal == none() { return () }
+  run grow(&mut state.*, value)
+  let previous = List<u64>.get(&state.known, u64.toUsize(value))
+  run List<Known>.append(&mut state.knownLog, Known {value: value, previous: previous})
+  List<u64>.set(&mut state.known, u64.toUsize(value), equal)
+  return ()
+}
+
+effect fn grow(state: &mut Numbering, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let wanted = u64.toUsize(value) + usize.ONE
+  let substituted = List<u64>.length(&state.substitution)
+  if substituted < wanted { run List<u64>.appendRepeated(&mut state.substitution, none(), wanted - substituted) }
+  let known = List<u64>.length(&state.known)
+  if known < wanted { run List<u64>.appendRepeated(&mut state.known, none(), wanted - known) }
+  return ()
+}
+
+// The value `value` stands for where the walk is: its replacement, then what it is known as.
+fn resolve(state: &Numbering, value: u64) -> u64 {
+  let mut at = value
+  let mut steps = usize.ZERO
+  while at != none() && steps < 64 {
+    let index = u64.toUsize(at)
+    let mut next = none()
+    if index < List<u64>.length(&state.substitution) { next = List<u64>.get(&state.substitution, index) }
+    if next == none() && index < List<u64>.length(&state.known) { next = List<u64>.get(&state.known, index) }
+    if next == none() { return at }
+    at = next
+    steps = steps + usize.ONE
+  }
+  return at
+}
+
+effect fn replace(state: &mut Numbering, value: u64, by: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  run grow(&mut state.*, value)
+  List<u64>.set(&mut state.substitution, u64.toUsize(value), by)
+  state.changed = true
+  return ()
+}
+
+effect fn visitBlock(state: &mut Numbering, function: &mut SsaFunction, block: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let count = List<usize>.length(&function.block(block).instructions)
+  let mut at = usize.ZERO
+  while at < count {
+    let instruction = List<usize>.get(&function.block(block).instructions, at)
+    run visitInstruction(&mut state.*, &mut function.*, instruction)
+    at = at + usize.ONE
+  }
+  // The exit's value and arguments.
+  let value = function.block(block).value
+  if value != none() {
+    let resolved = resolve(&state.*, value)
+    if resolved != value {
+      function.setExitValue(block, resolved)
+      state.changed = true
+    }
+  }
+  let edges = List<Edge>.length(&function.block(block).edges)
+  let mut edge = usize.ZERO
+  while edge < edges {
+    let arguments = List<u64>.length(&List<Edge>.asSlice(&function.block(block).edges)[edge].arguments)
+    let mut argument = usize.ZERO
+    while argument < arguments {
+      let passed = List<u64>.get(&List<Edge>.asSlice(&function.block(block).edges)[edge].arguments, argument)
+      let resolved = resolve(&state.*, passed)
+      if resolved != passed {
+        function.setArgument(block, edge, argument, resolved)
+        state.changed = true
+      }
+      argument = argument + usize.ONE
+    }
+    edge = edge + usize.ONE
+  }
+  return ()
+}
+
+effect fn visitInstruction(state: &mut Numbering, function: &mut SsaFunction, instruction: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let operandCount = function.operandsOf(instruction).length
+  let mut at = usize.ZERO
+  while at < operandCount {
+    let used = function.operandsOf(instruction)[at]
+    let resolved = resolve(&state.*, used)
+    if resolved != used {
+      function.setOperand(instruction, at, resolved)
+      state.changed = true
+    }
+    at = at + usize.ONE
+  }
+  let found = function.instruction(instruction)
+  if !found.operation.isPure() || found.result == none() { return () }
+  let two = found.operation.resultCount(found.kind) == 2
+  let folded = run SsaFolding.simplify(&mut function.*, instruction)
+  if folded.value != none() && (!two || folded.second != none()) {
+    run replace(&mut state.*, found.result, folded.value)
+    if two { run replace(&mut state.*, found.result + 1, folded.second) }
+    function.remove(instruction)
+    return ()
+  }
+  normalize(&mut function.*, instruction)
+  // A comparison a known fact decides.
+  let decided = decidedByFacts(&state.*, &function.*, instruction)
+  if decided != usize.MAX {
+    let flag = run flagOf(&mut state.*, &mut function.*, decided == usize.ONE)
+    run replace(&mut state.*, found.result, flag)
+    function.remove(instruction)
+    return ()
+  }
+  // An equal instruction in a dominating position.
+  let hash = hashOf(&function.*, instruction)
+  let bucket = u64.toUsize(u64.bitAnd(hash, usize.toU64(List<usize>.length(&state.buckets) - usize.ONE)))
+  let mut entry = List<usize>.get(&state.buckets, bucket)
+  while entry != usize.MAX {
+    let listed = List<Entry>.get(&state.entries, entry)
+    if equal(&function.*, listed.instruction, instruction) {
+      let earlier = function.instruction(listed.instruction)
+      run replace(&mut state.*, found.result, earlier.result)
+      if two { run replace(&mut state.*, found.result + 1, earlier.result + 1) }
+      function.remove(instruction)
+      return ()
+    }
+    entry = listed.next
+  }
+  let head = List<usize>.get(&state.buckets, bucket)
+  List<usize>.set(&mut state.buckets, bucket, List<Entry>.length(&state.entries))
+  run List<Entry>.append(&mut state.entries, Entry {instruction: instruction, bucket: bucket, next: head})
+  return ()
+}
+
+// Puts the operands of a commutative integer operation, or of an integer comparison, in value
+// order.
+fn normalize(function: &mut SsaFunction, instruction: usize) -> () {
+  let found = function.instruction(instruction)
+  let operands = function.operandsOf(instruction)
+  if operands.length != 2 { return () }
+  let left = operands[usize.ZERO]
+  let right = operands[usize.ONE]
+  if left <= right || !function.kindOf(left).isInteger() && !function.kindOf(left).isAddress() { return () }
+  match found.operation {
+    Operation.Binary {operation} => {
+      if operation != Binary.Add && operation != Binary.Mul && operation != Binary.And && operation != Binary.Or && operation != Binary.Xor { return () }
+      if !function.kindOf(left).isInteger() { return () }
+    }
+    Operation.Compare {predicate} => {
+      if !isIntegerPredicate(predicate) { return () }
+      function.setOperation(instruction, Operation.Compare {predicate: swapped(predicate)})
+    }
+    _ => { return () }
+  }
+  function.setOperand(instruction, usize.ZERO, right)
+  function.setOperand(instruction, usize.ONE, left)
+  return ()
+}
+
+/// The predicate that holds of `b, a` when `predicate` holds of `a, b`.
+pub fn swapped(predicate: Predicate) -> Predicate {
+  return match predicate {
+    Predicate.Ugt => Predicate.Ult
+    Predicate.Uge => Predicate.Ule
+    Predicate.Ult => Predicate.Ugt
+    Predicate.Ule => Predicate.Uge
+    Predicate.Sgt => Predicate.Slt
+    Predicate.Sge => Predicate.Sle
+    Predicate.Slt => Predicate.Sgt
+    Predicate.Sle => Predicate.Sge
+    _ => predicate
+  }
+}
+
+/// The integer predicate that holds exactly when `predicate` does not.
+pub fn inverse(predicate: Predicate) -> Predicate {
+  return match predicate {
+    Predicate.Eq => Predicate.Ne
+    Predicate.Ne => Predicate.Eq
+    Predicate.Ugt => Predicate.Ule
+    Predicate.Uge => Predicate.Ult
+    Predicate.Ult => Predicate.Uge
+    Predicate.Ule => Predicate.Ugt
+    Predicate.Sgt => Predicate.Sle
+    Predicate.Sge => Predicate.Slt
+    Predicate.Slt => Predicate.Sge
+    Predicate.Sle => Predicate.Sgt
+    _ => predicate
+  }
+}
+
+/// Whether integer predicate `known` holding of two operands implies `asked` holds of them.
+pub fn implies(known: Predicate, asked: Predicate) -> bool {
+  if known == asked { return true }
+  return match known {
+    Predicate.Eq => asked == Predicate.Ule || asked == Predicate.Uge || asked == Predicate.Sle || asked == Predicate.Sge
+    Predicate.Ult => asked == Predicate.Ule || asked == Predicate.Ne
+    Predicate.Ugt => asked == Predicate.Uge || asked == Predicate.Ne
+    Predicate.Slt => asked == Predicate.Sle || asked == Predicate.Ne
+    Predicate.Sgt => asked == Predicate.Sge || asked == Predicate.Ne
+    _ => false
+  }
+}
+
+// 1 when a known fact proves comparison `instruction` holds, 0 when it proves it does not, else
+// `usize.MAX`.
+fn decidedByFacts(state: &Numbering, function: &SsaFunction, instruction: usize) -> usize {
+  let asked = match function.instruction(instruction).operation {
+    Operation.Compare {predicate} => predicate
+    _ => { return usize.MAX }
+  }
+  if !isIntegerPredicate(asked) { return usize.MAX }
+  let operands = function.operandsOf(instruction)
+  let left = operands[usize.ZERO]
+  let right = operands[usize.ONE]
+  let facts = List<Fact>.asSlice(&state.facts)
+  let mut at = facts.length
+  let mut seen = usize.ZERO
+  while at > usize.ZERO && seen < factWindow() {
+    at = at - usize.ONE
+    seen = seen + usize.ONE
+    let fact = facts[at]
+    let mut holding = fact.predicate
+    if !fact.truth { holding = inverse(fact.predicate) }
+    let mut matched = false
+    if resolve(&state.*, fact.left) == left && resolve(&state.*, fact.right) == right { matched = true }
+    else if resolve(&state.*, fact.left) == right && resolve(&state.*, fact.right) == left {
+      holding = swapped(holding)
+      matched = true
+    }
+    if matched {
+      if implies(holding, asked) { return usize.ONE }
+      if implies(holding, inverse(asked)) { return usize.ZERO }
+    }
+  }
+  return usize.MAX
+}
+
+// A tag per operation variant and its immediates, for the hash.
+fn tagOf(operation: Operation) -> u64 {
+  return match operation {
+    Operation.Binary {..} => 1
+    Operation.Negate => 2
+    Operation.Compare {..} => 3
+    Operation.Select => 4
+    Operation.Cast {..} => 5
+    Operation.Offset {offset} => u64.wrappingAdd(6, u64.wrappingMultiply(offset, 1099511628211))
+    Operation.Index => 7
+    Operation.SlotAddress {slot} => u64.wrappingAdd(8, u64.wrappingMultiply(usize.toU64(slot), 1099511628211))
+    Operation.FrameAddress => 9
+    Operation.Overflow {..} => 10
+    Operation.Saturate {..} => 11
+    Operation.Rotate {..} => 12
+    Operation.Count {..} => 13
+    Operation.Extreme {..} => 14
+    Operation.FusedMultiplyAdd => 15
+    Operation.SquareRoot => 16
+    Operation.Reduce {..} => 17
+    Operation.Shuffle {..} => 18
+    Operation.Extract => 19
+    Operation.Insert => 20
+    Operation.Splat {..} => 21
+    _ => 22
+  }
+}
+
+fn hashOf(function: &SsaFunction, instruction: usize) -> u64 {
+  let found = function.instruction(instruction)
+  let mut hash = u64.wrappingMultiply(tagOf(found.operation), 11400714819323198485)
+  hash = u64.wrappingMultiply(u64.bitXor(hash, usize.toU64(found.kind.bits * 131 + found.kind.elements)), 1099511628211)
+  let operands = function.operandsOf(instruction)
+  let mut at = usize.ZERO
+  while at < operands.length {
+    hash = u64.wrappingMultiply(u64.bitXor(hash, operands[at]), 11400714819323198485)
+    at = at + usize.ONE
+  }
+  return u64.bitXor(hash, u64.shiftRight(hash, 29))
+}
+
+// Whether two pure instructions compute the same results: one operation with the same
+// immediates, one kind, and the same operands.
+fn equal(function: &SsaFunction, first: usize, second: usize) -> bool {
+  let a = function.instruction(first)
+  let b = function.instruction(second)
+  if !a.kind.equals(b.kind) || !sameOperation(a.operation, b.operation) { return false }
+  let left = function.operandsOf(first)
+  let right = function.operandsOf(second)
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn sameOperation(first: Operation, second: Operation) -> bool {
+  match first {
+    Operation.Binary {operation} => { if let Operation.Binary {operation: other} = second { return operation == other } }
+    Operation.Negate => { if let Operation.Negate = second { return true } }
+    Operation.Compare {predicate} => { if let Operation.Compare {predicate: other} = second { return predicate == other } }
+    Operation.Select => { if let Operation.Select = second { return true } }
+    Operation.Cast {operation} => { if let Operation.Cast {operation: other} = second { return operation == other } }
+    Operation.Offset {offset} => { if let Operation.Offset {offset: other} = second { return offset == other } }
+    Operation.Index => { if let Operation.Index = second { return true } }
+    Operation.SlotAddress {slot} => { if let Operation.SlotAddress {slot: other} = second { return slot == other } }
+    Operation.FrameAddress => { if let Operation.FrameAddress = second { return true } }
+    Operation.Overflow {operation, signed} => { if let Operation.Overflow {operation: other, signed: otherSigned} = second { return operation == other && signed == otherSigned } }
+    Operation.Saturate {operation, signed} => { if let Operation.Saturate {operation: other, signed: otherSigned} = second { return operation == other && signed == otherSigned } }
+    Operation.Rotate {left} => { if let Operation.Rotate {left: other} = second { return left == other } }
+    Operation.Count {which} => { if let Operation.Count {which: other} = second { return which == other } }
+    Operation.Extreme {which} => { if let Operation.Extreme {which: other} = second { return which == other } }
+    Operation.FusedMultiplyAdd => { if let Operation.FusedMultiplyAdd = second { return true } }
+    Operation.SquareRoot => { if let Operation.SquareRoot = second { return true } }
+    Operation.Reduce {which} => { if let Operation.Reduce {which: other} = second { return which == other } }
+    Operation.Shuffle {start, count} => { if let Operation.Shuffle {start: otherStart, count: otherCount} = second { return start == otherStart && count == otherCount } }
+    Operation.Extract => { if let Operation.Extract = second { return true } }
+    Operation.Insert => { if let Operation.Insert = second { return true } }
+    Operation.Splat {count} => { if let Operation.Splat {count: other} = second { return count == other } }
+    _ => {}
+  }
+  return false
+}
