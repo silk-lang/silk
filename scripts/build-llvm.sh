@@ -18,7 +18,9 @@ if [ "$#" -ne 2 ]; then
   echo "usage: build-llvm.sh SOURCE OUTPUT" >&2
   exit 2
 fi
-source=$(cd "$1" && pwd)
+# Native Windows tools need `D:/...` paths, which Git Bash's `pwd -W` gives.
+native_pwd() { case "$(uname -s)" in MINGW* | MSYS*) pwd -W ;; *) pwd ;; esac; }
+source=$(cd "$1" && native_pwd)
 output=$2
 if [ -e "$output" ]; then
   echo "build-llvm.sh: $output already exists" >&2
@@ -103,7 +105,7 @@ cmake -S "$source/llvm" -B "$build" "${flags[@]}"
 ninja -C "$build" -j "$jobs" llvm-driver clang-resource-headers
 
 mkdir -p "$output/bin"
-output=$(cd "$output" && pwd)
+output=$(cd "$output" && native_pwd)
 cp "$build/bin/llvm$suffix" "$output/bin/llvm$suffix"
 # An MSVC executable keeps its symbols in a separate PDB already.
 if [ -z "$suffix" ]; then strip "$output/bin/llvm" 2> /dev/null || strip -x "$output/bin/llvm"; fi
