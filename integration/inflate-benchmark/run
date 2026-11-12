@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""Gzip decode and CRC-32 throughput of Silk against zlib, zlib-ng and libdeflate (not a CI gate).
+
+Decodes the pinned npm tarballs of `corpus.lock.json` in memory with `silk.compress.inflate`
+and with the three C libraries, and checksums the decoded bytes with `silk.compress.checksum`
+and with each library's CRC-32. It prints MB/s of output and, with --callgrind, instructions
+per output byte.
+
+Requires a C compiler, cmake, zlib and libdeflate development files, and valgrind for
+--callgrind. Set SILK to the silk command (default `silk`) that builds this checkout's stdlib.
+
+Usage: integration/inflate-benchmark/run [--rounds N] [--callgrind] [--json PATH] [--relock]
+
+The modes: `chunk` decodes into a 64 KiB output buffer that it reuses, `whole` into one buffer
+that holds the output, `crc` only checksums the decoded bytes. Times are the fastest of the
+rounds per tarball; a group's MB/s is its output bytes over the sum of those times. libdeflate
+has no streaming decoder, so it has no `chunk` row. Instructions per byte are the difference
+between a callgrind run of two rounds and of one, so they exclude startup and the pack read.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import shlex
+import struct
+import subprocess
+import sys
+import tarfile
+import urllib.request
+import zlib
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parents[1]
+BUILD = ROOT / "build/inflate-benchmark"
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(HERE))
+import corpus  # noqa: E402
+
+ZLIB_NG = "2.2.4"
+ZLIB_NG_URL = f"https://github.com/zlib-ng/zlib-ng/archive/refs/tags/{ZLIB_NG}.tar.gz"
+ZLIB_NG_SHA256 = "a73343c3093e5cdc50d9377997c3815b878fd110bf6511c2c7759f2afb90f5a3"
+MODES = ["chunk", "whole", "crc"]
+
+
+def sh(command, **options):
+    return subprocess.run([str(part) for part in command], check=True, text=True, capture_output=True, **options)
+
+
+def zlib_ng():
+    """Builds the pinned zlib-ng as a static library with its native API and returns its prefix."""
+    prefix = BUILD / f"zlib-ng-{ZLIB_NG}"
+    if (prefix / "lib/libz-ng.a").exists():
+        return prefix
+    archive = BUILD / f"zlib-ng-{ZLIB_NG}.tar.gz"
+    if not archive.exists():
+        archive.write_bytes(urllib.request.urlopen(ZLIB_NG_URL, timeout=120).read())
+    if hashlib.sha256(archive.read_bytes()).hexdigest() != ZLIB_NG_SHA256:
+        raise SystemExit(f"SHA256 mismatch for {archive}")
+    source = BUILD / f"zlib-ng-{ZLIB_NG}-source"
+    with tarfile.open(archive) as tar:
+        tar.extractall(source, filter="data")
+    tree = source / f"zlib-ng-{ZLIB_NG}"
+    sh(["cmake", "-S", tree, "-B", source / "build", "-DCMAKE_BUILD_TYPE=Release", "-DBUILD_SHARED_LIBS=OFF",
+        "-DZLIB_ENABLE_TESTS=OFF", "-DZLIBNG_ENABLE_TESTS=OFF", "-DWITH_GTEST=OFF",
+        f"-DCMAKE_INSTALL_PREFIX={prefix}", "-DCMAKE_INSTALL_LIBDIR=lib"])
+    sh(["cmake", "--build", source / "build", "-j", str(os.cpu_count())])
+    sh(["cmake", "--install", source / "build"])
+    return prefix
+
+
+def build():
+    """Returns the command of each implementation, without the mode, rounds and pack."""
+    compiler = os.environ.get("CC", "cc")
+    ng = zlib_ng()
+    sh([compiler, "-O2", "-o", BUILD / "baseline", HERE / "baseline.c", "-lz", "-ldeflate"])
+    sh([compiler, "-O2", "-DUSE_ZLIB_NG", f"-I{ng}/include", "-o", BUILD / "baseline-ng", HERE / "baseline.c",
+        f"{ng}/lib/libz-ng.a", "-ldeflate"])
+    silk = shlex.split(os.environ.get("SILK", "silk")) + [
+        "build", str(HERE / "src/main.silk"), "-o", str(BUILD / "silk-bench"), "--stdlib", str(ROOT / "stdlib"),
+        "--optimization", "speed", "--debug", "false"]
+    subprocess.run(silk, cwd=HERE, check=True, stdout=subprocess.DEVNULL)
+    return {
+        "silk": [BUILD / "silk-bench"],
+        "zlib": [BUILD / "baseline", "zlib"],
+        "zlib-ng": [BUILD / "baseline-ng", "zlib-ng"],
+        "libdeflate": [BUILD / "baseline", "libdeflate"],
+    }
+
+
+def pack(entries, path):
+    """Writes the pack that both programs read and returns each entry's decoded length."""
+    lengths = {}
+    with open(path, "wb") as out:
+        out.write(b"SILKGZ1\0" + struct.pack("<I", len(entries)))
+        for entry in entries:
+            data = entry["path"].read_bytes()
+            raw = len(zlib.decompress(data, 31))
+            name = entry["name"].encode()
+            out.write(struct.pack("<I", len(name)) + name + struct.pack("<QQ", len(data), raw) + data)
+            lengths[entry["name"]] = raw
+    return lengths
+
+
+def measure(command, mode, rounds, path):
+    rows = {}
+    for line in sh(command + [mode, rounds, path]).stdout.splitlines():
+        name, compressed, raw, best, crc = line.split("\t")
+        rows[name] = {"compressed": int(compressed), "raw": int(raw), "ns": int(best), "crc": int(crc)}
+    return rows
+
+
+def instructions(command, mode, rounds, path):
+    out = BUILD / "callgrind.out"
+    sh(["valgrind", "--tool=callgrind", f"--callgrind-out-file={out}"] + command + [mode, rounds, path])
+    return int(re.search(r"^summary:\s+(\d+)", out.read_text(), re.M).group(1))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--rounds", type=int, default=7)
+    parser.add_argument("--callgrind", action="store_true")
+    parser.add_argument("--json", type=Path)
+    parser.add_argument("--relock", action="store_true", help="rebuild corpus.lock.json from the registry")
+    arguments = parser.parse_args()
+    BUILD.mkdir(parents=True, exist_ok=True)
+    if arguments.relock:
+        corpus.relock()
+    entries = corpus.fetch(BUILD / "corpus")
+    commands = build()
+    path = BUILD / "corpus.pack"
+    lengths = pack(entries, path)
+    large = [entry["name"] for entry in entries if entry["group"] == "large"]
+    small = [entry["name"] for entry in entries if entry["group"] == "small"]
+    groups = [(name, [name]) for name in large] + [(f"{len(small)} small", small), ("all", large + small)]
+    results = {}
+    reference = None
+    for name, command in commands.items():
+        for mode in MODES:
+            if name == "libdeflate" and mode == "chunk":
+                continue
+            rows = measure(command, mode, arguments.rounds, path)
+            crcs = {key: row["crc"] for key, row in rows.items()}
+            reference = reference or crcs
+            if crcs != reference or any(rows[key]["raw"] != lengths[key] for key in rows):
+                raise SystemExit(f"{name} {mode}: output differs from the reference")
+            result = {"groups": {
+                label: sum(lengths[key] for key in keys) * 1000 / sum(rows[key]["ns"] for key in keys)
+                for label, keys in groups}}
+            if arguments.callgrind:
+                result["instructionsPerByte"] = (
+                    instructions(command, mode, 2, path) - instructions(command, mode, 1, path)
+                ) / sum(lengths.values())
+            results[f"{name} {mode}"] = result
+    total = sum(lengths.values())
+    print(f"{platform.machine()}, {len(entries)} tarballs, {total / 1e6:.1f} MB decoded, "
+          f"fastest of {arguments.rounds} rounds, MB/s of output\n")
+    labels = [label for label, _ in groups]
+    header = ["", *labels] + (["instr/byte"] if arguments.callgrind else [])
+    print("| " + " | ".join(header) + " |")
+    print("|" + "---|" * len(header))
+    for name, result in results.items():
+        cells = [name] + [f"{result['groups'][label]:.0f}" for label in labels]
+        if arguments.callgrind:
+            cells.append(f"{result['instructionsPerByte']:.2f}")
+        print("| " + " | ".join(cells) + " |")
+    if arguments.json:
+        arguments.json.write_text(json.dumps({"machine": platform.machine(), "rounds": arguments.rounds,
+                                              "decodedBytes": total, "results": results}, indent=1) + "\n")
+
+
+if __name__ == "__main__":
+    main()

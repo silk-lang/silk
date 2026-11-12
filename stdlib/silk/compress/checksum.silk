@@ -6,14 +6,20 @@
 //! arrives in parts.
 //!
 //! # Details
-//! No function allocates. CRC-32 uses a 256-entry table and processes one byte per lookup.
+//! No function allocates. CRC-32 folds 64 bytes per step with carry-less multiplication when the
+//! running CPU has it (`pclmul` on x86-64, `aes` on AArch64), and otherwise reads eight table
+//! entries per 8 bytes. Both paths return the same value.
 //!
 //! @category Data formats
 
 import silk.collections.slice { Slice }
+import silk.core.target { Arch, Target }
 import silk.num.u8
 import silk.num.u32
 import silk.num.u64
+import silk.simd.cpu { CpuFeatures }
+import silk.simd.u64x2
+import silk.simd.u8x16
 
 const CRC32_TABLE: [u32; 256] = [
   0x00000000,
@@ -503,6 +509,143 @@ const CRC32_SLICES: [u32; 1792] = [
   0x2c8e0fff, 0xe0240f61, 0x6eab0882, 0xa201081c, 0xa8c40105, 0x646e019b, 0xeae10678, 0x264b06e6,
 ]
 
+// Returns the CRC-32 register `value` after `bytes`, 8 bytes per step (slice-by-8). The register
+// is the checksum with all bits inverted.
+fn crc32Tables(register: u32, bytes: &[u8]) -> u32 {
+  let mut value = register
+  let mut index: usize = 0
+  while index + 8 <= bytes.length {
+    let chunk = Slice.view<u8>(bytes, index, 8)
+    let one = value ^ (u8.toU32(chunk[0]) | u32.shiftLeft(u8.toU32(chunk[1]), 8)
+      | u32.shiftLeft(u8.toU32(chunk[2]), 16)
+      | u32.shiftLeft(u8.toU32(chunk[3]), 24))
+    let two = u8.toU32(chunk[4]) | u32.shiftLeft(u8.toU32(chunk[5]), 8)
+      | u32.shiftLeft(u8.toU32(chunk[6]), 16)
+      | u32.shiftLeft(u8.toU32(chunk[7]), 24)
+    value = CRC32_SLICES[1536 + u32.toUsize(one & 255)]
+      ^ CRC32_SLICES[1280 + u32.toUsize(u32.shiftRight(one, 8) & 255)]
+      ^ CRC32_SLICES[1024 + u32.toUsize(u32.shiftRight(one, 16) & 255)]
+      ^ CRC32_SLICES[768 + u32.toUsize(u32.shiftRight(one, 24))]
+      ^ CRC32_SLICES[512 + u32.toUsize(two & 255)]
+      ^ CRC32_SLICES[256 + u32.toUsize(u32.shiftRight(two, 8) & 255)]
+      ^ CRC32_SLICES[u32.toUsize(u32.shiftRight(two, 16) & 255)]
+      ^ CRC32_TABLE[u32.toUsize(u32.shiftRight(two, 24))]
+    index = index + 8
+  }
+  while index < bytes.length {
+    let slot = u32.toUsize((value ^ u8.toU32(bytes[index])) & 255)
+    value = CRC32_TABLE[slot] ^ u32.shiftRight(value, 8)
+    index = index + 1
+  }
+  return value
+}
+
+// CRC-32 by folding (Gopal and others, "Fast CRC Computation for Generic Polynomials Using
+// PCLMULQDQ Instruction", Intel, 2009). The data is a polynomial over GF(2). Four 128-bit
+// accumulators each hold a value congruent to the data so far, 128 bits apart. A fold replaces an
+// accumulator by its two halves times the constants x^(d+32) and x^(d-32) modulo the CRC
+// polynomial, for a distance of d bits, which moves it d bits ahead, where it adds to the next
+// data. The last accumulator is 16 bytes with the same CRC as all the data, which the tables
+// reduce.
+
+// The fewest bytes that the folding path takes: the four accumulators.
+const FOLD_MINIMUM: usize = 64
+
+// x^(512+32) and x^(512-32) modulo the polynomial, bit-reflected, for a fold over 64 bytes.
+const FOLD_64: [u64; 2] = [0x0154442bd4, 0x01c6e41596]
+
+// x^(128+32) and x^(128-32) modulo the polynomial, bit-reflected, for a fold over 16 bytes.
+const FOLD_16: [u64; 2] = [0x01751997d0, 0x00ccaa009e]
+
+static if Target.arch() == Arch.X86_64 {
+  // Returns `value` moved ahead by the distance of `constants`, plus `next`.
+  @features("pclmul")
+  @inlineAlways
+  unsafe fn fold(value: simd<u64, 2>, constants: simd<u64, 2>, next: simd<u64, 2>) -> simd<u64, 2> {
+    let low = Intrinsic.x86CarrylessMultiply<simd<u64, 2>>(value, constants)
+    let high = Intrinsic.x86CarrylessMultiply<simd<u64, 2>>(
+      u64x2.shuffle(value, value, [1, 0]),
+      u64x2.shuffle(constants, constants, [1, 0]),
+    )
+    return low ^ high ^ next
+  }
+
+  // Returns the CRC-32 register `register` after `bytes`, whose length is a multiple of 16 and
+  // at least `FOLD_MINIMUM`. The caller must know that the CPU has `pclmul`.
+  @features("pclmul")
+  unsafe fn crc32Fold(register: u32, bytes: &[u8]) -> u32 {
+    let far = u64x2.fromArray(FOLD_64)
+    let near = u64x2.fromArray(FOLD_16)
+    let mut one = block(bytes, 0) ^ u64x2.fromArray([u32.toU64(register), 0])
+    let mut two = block(bytes, 16)
+    let mut three = block(bytes, 32)
+    let mut four = block(bytes, 48)
+    let mut index: usize = 64
+    while bytes.length - index >= 64 {
+      one = unsafe fold(one, far, block(bytes, index))
+      two = unsafe fold(two, far, block(bytes, index + 16))
+      three = unsafe fold(three, far, block(bytes, index + 32))
+      four = unsafe fold(four, far, block(bytes, index + 48))
+      index = index + 64
+    }
+    one = unsafe fold(one, near, two)
+    one = unsafe fold(one, near, three)
+    one = unsafe fold(one, near, four)
+    while bytes.length - index >= 16 {
+      one = unsafe fold(one, near, block(bytes, index))
+      index = index + 16
+    }
+    let last = u8x16.toArray(u64x2.bitcastToU8x16(one))
+    return crc32Tables(0, &last)
+  }
+}
+
+static if Target.arch() == Arch.Aarch64 {
+  // Returns `value` moved ahead by the distance of `constants`, plus `next`.
+  @features("aes")
+  @inlineAlways
+  unsafe fn fold(value: simd<u64, 2>, constants: simd<u64, 2>, next: simd<u64, 2>) -> simd<u64, 2> {
+    let low = Intrinsic.aarch64PolynomialMultiply<simd<u64, 2>>(value, constants)
+    let high = Intrinsic.aarch64PolynomialMultiplyHigh<simd<u64, 2>>(value, constants)
+    return low ^ high ^ next
+  }
+
+  // Returns the CRC-32 register `register` after `bytes`, whose length is a multiple of 16 and
+  // at least `FOLD_MINIMUM`. The caller must know that the CPU has `aes`, which includes PMULL.
+  @features("aes")
+  unsafe fn crc32Fold(register: u32, bytes: &[u8]) -> u32 {
+    let far = u64x2.fromArray(FOLD_64)
+    let near = u64x2.fromArray(FOLD_16)
+    let mut one = block(bytes, 0) ^ u64x2.fromArray([u32.toU64(register), 0])
+    let mut two = block(bytes, 16)
+    let mut three = block(bytes, 32)
+    let mut four = block(bytes, 48)
+    let mut index: usize = 64
+    while bytes.length - index >= 64 {
+      one = unsafe fold(one, far, block(bytes, index))
+      two = unsafe fold(two, far, block(bytes, index + 16))
+      three = unsafe fold(three, far, block(bytes, index + 32))
+      four = unsafe fold(four, far, block(bytes, index + 48))
+      index = index + 64
+    }
+    one = unsafe fold(one, near, two)
+    one = unsafe fold(one, near, three)
+    one = unsafe fold(one, near, four)
+    while bytes.length - index >= 16 {
+      one = unsafe fold(one, near, block(bytes, index))
+      index = index + 16
+    }
+    let last = u8x16.toArray(u64x2.bitcastToU8x16(one))
+    return crc32Tables(0, &last)
+  }
+}
+
+// Returns the 16 bytes of `bytes` at `offset` as two little-endian words.
+@inlineAlways
+fn block(bytes: &[u8], offset: usize) -> simd<u64, 2> {
+  return u8x16.bitcastToU64x2(u8x16.load(bytes, offset))
+}
+
 /// Allocation-free container checksums.
 pub struct CompressionChecksum {}
 
@@ -520,31 +663,22 @@ impl CompressionChecksum {
   /// `crc32Update(crc32(a), b)` equals the CRC-32 of `a` followed by `b`.
   pub fn crc32Update(crc: u32, bytes: &[u8]) -> u32 {
     let mut value = crc ^ 0xffffffff
-    let mut index: usize = 0
-    while index + 8 <= bytes.length {
-      let chunk = Slice.view<u8>(bytes, index, 8)
-      let one = value ^ (u8.toU32(chunk[0]) | u32.shiftLeft(u8.toU32(chunk[1]), 8)
-        | u32.shiftLeft(u8.toU32(chunk[2]), 16)
-        | u32.shiftLeft(u8.toU32(chunk[3]), 24))
-      let two = u8.toU32(chunk[4]) | u32.shiftLeft(u8.toU32(chunk[5]), 8)
-        | u32.shiftLeft(u8.toU32(chunk[6]), 16)
-        | u32.shiftLeft(u8.toU32(chunk[7]), 24)
-      value = CRC32_SLICES[1536 + u32.toUsize(one & 255)]
-        ^ CRC32_SLICES[1280 + u32.toUsize(u32.shiftRight(one, 8) & 255)]
-        ^ CRC32_SLICES[1024 + u32.toUsize(u32.shiftRight(one, 16) & 255)]
-        ^ CRC32_SLICES[768 + u32.toUsize(u32.shiftRight(one, 24))]
-        ^ CRC32_SLICES[512 + u32.toUsize(two & 255)]
-        ^ CRC32_SLICES[256 + u32.toUsize(u32.shiftRight(two, 8) & 255)]
-        ^ CRC32_SLICES[u32.toUsize(u32.shiftRight(two, 16) & 255)]
-        ^ CRC32_TABLE[u32.toUsize(u32.shiftRight(two, 24))]
-      index = index + 8
+    let mut rest = bytes
+    static if Target.arch() == Arch.X86_64 {
+      if bytes.length >= FOLD_MINIMUM && CpuFeatures.available("pclmul") {
+        let whole = bytes.length - bytes.length % 16
+        value = unsafe crc32Fold(value, Slice.view<u8>(bytes, 0, whole))
+        rest = Slice.view<u8>(bytes, whole, bytes.length - whole)
+      }
     }
-    while index < bytes.length {
-      let slot = u32.toUsize((value ^ u8.toU32(bytes[index])) & 255)
-      value = CRC32_TABLE[slot] ^ u32.shiftRight(value, 8)
-      index = index + 1
+    static if Target.arch() == Arch.Aarch64 {
+      if bytes.length >= FOLD_MINIMUM && CpuFeatures.available("aes") {
+        let whole = bytes.length - bytes.length % 16
+        value = unsafe crc32Fold(value, Slice.view<u8>(bytes, 0, whole))
+        rest = Slice.view<u8>(bytes, whole, bytes.length - whole)
+      }
     }
-    return value ^ 0xffffffff
+    return crc32Tables(value, rest) ^ 0xffffffff
   }
 
   /// Returns the Adler-32 of `bytes`, as zlib stores it.

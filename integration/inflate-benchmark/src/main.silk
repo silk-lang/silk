@@ -1,0 +1,327 @@
+// The Silk side of the inflate benchmark: `silk.compress.inflate` and `silk.compress.checksum`
+// on the pack that `baseline.c` reads, with the same modes and the same output lines.
+//
+//   inflate-benchmark <chunk|whole|crc> <rounds> <pack>
+//
+// `chunk` decodes into a 64 KiB buffer that it reuses, `whole` into one buffer that holds the
+// output, and `crc` only checksums the decoded bytes. Each mode prints one line per entry: name,
+// compressed bytes, output bytes, the fastest round in nanoseconds and the CRC-32 of the output in decimal.
+
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.collections.slice {Slice}
+import silk.compress.checksum {CompressionChecksum}
+import silk.compress.inflate {DecodeError, Decoder, Format, Limits, MEMORY_BOUND, Progress, Status}
+import silk.core.effect {Effect}
+import silk.core.option {Option}
+import silk.core.result {Result}
+import silk.encoding.endian
+import silk.io.writer {Writer, WriterError}
+import silk.io.writer_native {StderrWriter, StdoutWriter}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.i64
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.system.filesystem {FileError, FileSystem, Path}
+import silk.system.filesystem_native {OsFileSystem}
+import silk.system.host_input {HostInput, HostInputError}
+import silk.system.monotonic_clock {MonotonicClock}
+import silk.system.monotonic_clock_native {OsMonotonicClock}
+import silk.system.system_clock {Instant, SystemClock}
+import silk.text.format {Format as TextFormat}
+
+const CHUNK: usize = 65536
+
+const MODE_CHUNK: u32 = 0
+const MODE_WHOLE: u32 = 1
+const MODE_CRC: u32 = 2
+
+/// The arguments are not `<chunk|whole|crc> <rounds> <pack>`, or the pack is not a pack.
+struct UsageError {}
+
+struct Entry {
+  nameAt: usize,
+  nameLength: usize,
+  gzipAt: usize,
+  gzipLength: usize,
+  rawLength: usize,
+  best: u64,
+  crc: u32,
+}
+
+fn elapsed(start: &Instant, end: &Instant) -> u64 {
+  return i64.toU64(
+    (SystemClock.seconds(end) - SystemClock.seconds(start)) * 1000000000 + SystemClock.nanoseconds(end)
+      - SystemClock.nanoseconds(start),
+  )
+}
+
+fn limits() -> Limits {
+  return Limits {
+    maxInputBytes: u64.MAX,
+    maxOutputBytes: u64.MAX,
+    maxMembers: 1,
+    maxHeaderBytes: 65536,
+    maxMemoryBytes: MEMORY_BOUND,
+  }
+}
+
+// Decodes `gzip` with one step per `width` bytes of `output`, which holds at least `width` bytes.
+// With `advance`, each step writes after the last; otherwise each step reuses the first `width`
+// bytes. Returns the number of bytes written.
+fn decode(decoder: &mut Decoder, gzip: &[u8], output: &mut [u8], width: usize, advance: bool) -> Result<
+  usize,
+  DecodeError,
+> {
+  match Decoder.reset(&mut decoder, Format.Gzip, limits()) {
+    Result<(), DecodeError>.Success {..} => {}
+    Result<(), DecodeError>.Failure {error} => {
+      return Result<usize, DecodeError>.failResult(move error)
+    }
+  }
+  let mut consumed: usize = 0
+  let mut written: usize = 0
+  while true {
+    let mut at: usize = 0
+    if advance {
+      at = written
+    }
+    let room = Slice.viewMut<u8>(&mut output, at, width)
+    let rest = Slice.view<u8>(gzip, consumed, gzip.length - consumed)
+    match Decoder.step(&mut decoder, rest, &mut room, true) {
+      Result<Progress, DecodeError>.Success {value} => {
+        consumed = consumed + value.consumed
+        written = written + value.written
+        if value.status == Status.Finished {
+          return Result<usize, DecodeError>.succeed(written)
+        }
+      }
+      Result<Progress, DecodeError>.Failure {error} => {
+        return Result<usize, DecodeError>.failResult(move error)
+      }
+    }
+  }
+  return Result<usize, DecodeError>.succeed(written)
+}
+
+effect fn argument(index: usize) -> Bytes
+! HostInputError | OutOfMemoryError | UsageError
+? &mut HostInput | &mut Allocator {
+  return match run HostInput.argument(index) {
+    Option<Bytes>.Some {value} => move value
+    Option<Bytes>.None => {
+      fail UsageError {}
+    }
+  }
+}
+
+// Writes a tab and then `value` in decimal.
+effect fn field(value: u64) -> () ! WriterError ? &mut Writer {
+  let mut text: [u8; 21] = [9; 21]
+  let end = TextFormat.writeU64Display(value, &mut text, 1)
+  run Writer.writeAll(Slice.view<u8>(&text, 0, end))
+}
+
+effect fn report(pack: &[u8], entries: &[Entry]) -> () ! WriterError ? &mut Writer {
+  let mut index: usize = 0
+  while index < entries.length {
+    let entry = &entries[index]
+    run Writer.writeAll(Slice.view<u8>(pack, entry.nameAt, entry.nameLength))
+    run field(usize.toU64(entry.gzipLength))
+    run field(usize.toU64(entry.rawLength))
+    run field(entry.best)
+    run field(u32.toU64(entry.crc))
+    run Writer.writeAll(b"\n")
+    index = index + 1
+  }
+}
+
+effect fn program() -> i32
+! HostInputError | OutOfMemoryError | FileError | DecodeError | WriterError | UsageError
+? &mut HostInput | &mut Allocator | &mut FileSystem | &mut MonotonicClock | &mut Writer {
+  let modeName = run argument(1)
+  let roundsText = run argument(2)
+  let packPath = run argument(3)
+  let mut mode = MODE_CHUNK
+  if Bytes.asSlice(&modeName) == b"whole" {
+    mode = MODE_WHOLE
+  } else if Bytes.asSlice(&modeName) == b"crc" {
+    mode = MODE_CRC
+  } else if Bytes.asSlice(&modeName) != b"chunk" {
+    fail UsageError {}
+  }
+  let mut rounds: usize = 0
+  let digits = Bytes.asSlice(&roundsText)
+  let mut digit: usize = 0
+  while digit < digits.length {
+    rounds = rounds * 10 + u8.toUsize(digits[digit] - 48)
+    digit = digit + 1
+  }
+  let path = run Path.fromBytes(Bytes.asSlice(&packPath))
+  let packBytes = run FileSystem.readFile(&path)
+  let pack = Bytes.asSlice(&packBytes)
+  if pack.length < 12 || Slice.view<u8>(pack, 0, 8) != b"SILKGZ1\0" {
+    fail UsageError {}
+  }
+  let count = u32.toUsize(endian.readU32LittleEndian(pack, 8))
+  let mut entries = List<Entry>.make()
+  let mut at: usize = 12
+  let mut largest: usize = CHUNK
+  let mut total: usize = 0
+  let mut index: usize = 0
+  while index < count {
+    let nameLength = u32.toUsize(endian.readU32LittleEndian(pack, at))
+    let gzipLength = u64.toUsize(endian.readU64LittleEndian(pack, at + 4 + nameLength))
+    let rawLength = u64.toUsize(endian.readU64LittleEndian(pack, at + 12 + nameLength))
+    run List<Entry>.append(
+      &mut entries,
+      Entry {
+        nameAt: at + 4,
+        nameLength: nameLength,
+        gzipAt: at + 20 + nameLength,
+        gzipLength: gzipLength,
+        rawLength: rawLength,
+        best: u64.MAX,
+        crc: 0,
+      },
+    )
+    if rawLength > largest {
+      largest = rawLength
+    }
+    total = total + rawLength
+    at = at + 20 + nameLength + gzipLength
+    index = index + 1
+  }
+  let mut outputBytes = run Bytes.zeroed(largest)
+  let output = Bytes.asMutSlice(&mut outputBytes)
+  let mut decoder = run Decoder.make(Format.Gzip, limits())
+  // The `crc` mode decodes every entry once, before the rounds, so a round is only checksums.
+  let mut decodedBytes = Bytes.make()
+  if mode == MODE_CRC {
+    decodedBytes = run Bytes.zeroed(total)
+    let decoded = Bytes.asMutSlice(&mut decodedBytes)
+    let mut start: usize = 0
+    index = 0
+    while index < count {
+      let entry = &List<Entry>.asSlice(&entries)[index]
+      let gzip = Slice.view<u8>(pack, entry.gzipAt, entry.gzipLength)
+      let room = Slice.viewMut<u8>(&mut decoded, start, entry.rawLength)
+      match decode(&mut decoder, gzip, &mut room, entry.rawLength, true) {
+        Result<usize, DecodeError>.Success {..} => {}
+        Result<usize, DecodeError>.Failure {error} => {
+          fail move error
+        }
+      }
+      start = start + entry.rawLength
+      index = index + 1
+    }
+  }
+  let decoded = Bytes.asSlice(&decodedBytes)
+  let mut round: usize = 0
+  while round < rounds {
+    let mut decodedAt: usize = 0
+    index = 0
+    while index < count {
+      let entry = &mut List<Entry>.asMutSlice(&mut entries)[index]
+      let gzip = Slice.view<u8>(pack, entry.gzipAt, entry.gzipLength)
+      let mut took: u64 = 0
+      let mut crc: u32 = 0
+      if mode == MODE_CRC {
+        let bytes = Slice.view<u8>(decoded, decodedAt, entry.rawLength)
+        decodedAt = decodedAt + entry.rawLength
+        let start = run MonotonicClock.now()
+        crc = CompressionChecksum.crc32(bytes)
+        let end = run MonotonicClock.now()
+        took = elapsed(&start, &end)
+      } else {
+        let mut width = CHUNK
+        if mode == MODE_WHOLE {
+          width = largest
+        }
+        let start = run MonotonicClock.now()
+        let outcome = decode(&mut decoder, gzip, &mut output, width, false)
+        let end = run MonotonicClock.now()
+        took = elapsed(&start, &end)
+        let written = match move outcome {
+          Result<usize, DecodeError>.Success {value} => value
+          Result<usize, DecodeError>.Failure {error} => {
+            fail move error
+          }
+        }
+        if written != entry.rawLength {
+          fail UsageError {}
+        }
+        // The gzip trailer the decoder verified holds the CRC-32 of the output.
+        crc = endian.readU32LittleEndian(gzip, gzip.length - 8)
+      }
+      if took < entry.best {
+        entry.best = took
+      }
+      entry.crc = crc
+      index = index + 1
+    }
+    round = round + 1
+  }
+  run report(pack, List<Entry>.asSlice(&entries))
+  return 0
+}
+
+effect fn provided() -> i32
+! HostInputError | OutOfMemoryError | FileError | DecodeError | WriterError | UsageError
+? &mut HostInput | &mut Allocator {
+  let mut files = run OsFileSystem.make("/")
+  let mut clock = OsMonotonicClock.make()
+  let mut out = StdoutWriter.make()
+  return run program()
+    |> Effect.provideMut<FileSystem>(&mut files)
+    |> Effect.provideMut<MonotonicClock>(&mut clock)
+    |> Effect.provideMut<Writer>(&mut out)
+}
+
+// Writes what failed to the standard error stream.
+effect fn explain(error: HostInputError | OutOfMemoryError | FileError | DecodeError | WriterError | UsageError) -> ()
+! WriterError
+? &mut Writer {
+  match move error {
+    DecodeError failed => {
+      run Writer.writeString("inflate-benchmark: the decoder failed: ")
+      run TextFormat.debug<DecodeError>(&failed)
+      run Writer.writeString("\n")
+    }
+    UsageError usage => {
+      drop usage
+      run Writer.writeString("usage: inflate-benchmark <chunk|whole|crc> <rounds> <pack>\n")
+    }
+    FileError file => {
+      drop file
+      run Writer.writeString("inflate-benchmark: cannot read the pack; give its absolute path\n")
+    }
+    HostInputError host => {
+      drop host
+      run Writer.writeString("inflate-benchmark: cannot read the arguments\n")
+    }
+    OutOfMemoryError exhausted => {
+      drop exhausted
+      run Writer.writeString("inflate-benchmark: out of memory\n")
+    }
+    WriterError broken => {
+      drop broken
+    }
+  }
+}
+
+pub effect fn main() -> i32 ? &mut HostInput {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let outcome = run Effect.result(provided() |> Effect.provideMut<Allocator>(&mut allocator))
+  return match move outcome {
+    Result.Success {value} => value
+    Result.Failure {error} => {
+      let mut err = StderrWriter.make()
+      let reported = run Effect.result(explain(move error) |> Effect.provideMut<Writer>(&mut err))
+      drop reported
+      return 1
+    }
+  }
+}
