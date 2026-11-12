@@ -13,6 +13,9 @@
 // each message to `options.onLog(level, text)`, where `level` is one of `LOG_LEVELS`, and by
 // default to the console method of the level.
 //
+// A module that reads `OsRandom`, `OsSystemClock` or `OsMonotonicClock` imports `silk.random`
+// (from `crypto.getRandomValues`) and `silk.clock` (from `performance`).
+//
 // Every Worker is created by the top-level thread, never by another Worker, so a thread that
 // returns cannot take the threads it started with it. `main` never runs on the top-level thread,
 // because a browser's main thread may not block in `memory.atomic.wait32`.
@@ -134,12 +137,37 @@ const consoleMethods = { trace: 'debug', debug: 'debug', info: 'info', warning: 
 
 const decoder = new TextDecoder()
 
+// `crypto.getRandomValues` fills at most 65536 bytes, and never a view of shared memory, so the
+// bytes go through a buffer of this Worker's own.
+const randomBuffer = new Uint8Array(65536)
+
+// `silk.random` and `silk.clock` of the providers in `silk.platform.wasm.host`. `origin` is the
+// `performance.timeOrigin` of the top-level thread, so every Worker reads the same monotonic
+// clock.
+const hostImportsFor = (reading, origin) => ({
+  random: (address, length) => {
+    let at = word(address)
+    let left = word(length)
+    while (left > 0) {
+      const part = randomBuffer.subarray(0, Math.min(left, randomBuffer.length))
+      crypto.getRandomValues(part)
+      new Uint8Array(reading.exports.memory.buffer, at, part.length).set(part)
+      at += part.length
+      left -= part.length
+    }
+  },
+  clock: (monotonic) => {
+    const now = performance.timeOrigin + performance.now()
+    return monotonic ? Math.max(0, now - origin) : now
+  },
+})
+
 // The imports one instance needs. `spawn` starts a thread from a start argument and answers its
 // positive id, or a negative error; `log` takes the parts of one console message.
-const importsFor = (memory, spawn, parallelism, log) => ({
+const importsFor = (memory, spawn, parallelism, log, host) => ({
   env: memory === undefined ? {} : { memory },
   wasi: { 'thread-spawn': spawn },
-  silk: { 'thread-parallelism': () => parallelism, console: log },
+  silk: { 'thread-parallelism': () => parallelism, console: log, ...host },
 })
 
 // One Worker's work: `main`, whose status it reports, or one thread.
@@ -166,7 +194,7 @@ const runRole = (data, post) => {
   }
   const instance = new WebAssembly.Instance(
     data.module,
-    importsFor(data.memory, spawn, data.parallelism, log),
+    importsFor(data.memory, spawn, data.parallelism, log, hostImportsFor(reading, data.origin)),
   )
   reading.exports = data.memory === undefined ? instance.exports : { ...instance.exports, memory: data.memory }
   const before = data.role === 'main' ? reportLength(reading) : data.before
@@ -214,7 +242,7 @@ export const runWasm = async (bytes, options = {}) => {
       settle(value)
     }
     const start = async (role) => {
-      const data = { ...role, module, memory, threads, parallelism, wide }
+      const data = { ...role, module, memory, threads, parallelism, wide, origin: performance.timeOrigin }
       const worker = await createWorker(workerUrl, data)
       workers.add(worker)
       listen(worker, (message) => {
