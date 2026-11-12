@@ -89,13 +89,13 @@ The compression modules cover the formats in Zig's `lib/std/compress` (reference
 
 | Format | Encode | Decode |
 | --- | --- | --- |
-| Raw DEFLATE, zlib, gzip | `silk.compress.deflate.Encoder` | `silk.compress.inflate.Decoder` |
+| Raw DEFLATE, zlib, gzip | `silk.compress.deflate.Encoder`, `EncodeWriter` | `silk.compress.inflate.Decoder` |
 | LZMA-alone (`.lzma`) | — | `silk.compress.lzma.Lzma.decode` |
 | Raw LZMA2 | — | `silk.compress.lzma2.Lzma2.decode` |
 | XZ (`.xz`, single LZMA2 filter per block) | — | `silk.compress.xz.Xz.decode` |
 | Zstandard | `silk.compress.zstd_encode.ZstdEncoder` | `silk.compress.zstd.Zstd` |
 | Brotli | `silk.compress.brotli_encode.BrotliEncoder` | `silk.compress.brotli.Brotli` |
-| Tar archives (ustar, GNU, pax) | — | `silk.compress.tar.TarReader` |
+| Tar archives (ustar, GNU, pax), streamed | `silk.compress.tar.TarWriter` | `silk.compress.tar.TarReader` |
 | ZIP archives (stored or DEFLATE members, ZIP64) | — | `silk.compress.zip.ZipReader` |
 
 DEFLATE encoding follows zlib: levels 0 to 9, its strategies and flush modes, preset dictionaries,
