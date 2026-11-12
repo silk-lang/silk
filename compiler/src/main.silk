@@ -84,6 +84,7 @@ import driver.WindowsLink
 import driver.DarwinLink
 import driver.LinuxLink
 import driver.CodegenCache
+import driver.DetachedWriter
 import backend.Bitcode
 import backend.BitcodeText
 import backend.WasmText
@@ -1232,6 +1233,13 @@ effect fn compileIr(ir: &Bytes, debugInfo: &[u8], unitLines: Option<&EmissionPla
     Option<Path>.Some {value} => move value
     Option<Path>.None => run Path.fromBytes(Path.rawBytes(output))
   }
+  // The caches beside `output` (its codegen units' objects, its native sources' objects and its
+  // link stamp) are pruned and replaced by each build, so the commands take turns on the lock
+  // file beside it: a build that waited finds the output the other one linked.
+  let mut lockName = run Bytes.copy(Path.rawBytes(output))
+  run Bytes.append(&mut lockName, b".lock")
+  let lock = run Path.fromBytes(Bytes.asSlice(&lockName))
+  let held = run DetachedWriter.hold(&lock)
   let scratch = run FileSystem.createTemporaryDirectory(&parent, b".silk-")
   let use = effect fn(resource: &mut Path) -> i32
   ! FileError | ProcessError | HostInputError | InvalidNativeLinkInput | OutOfMemoryError | WriterError
@@ -1244,7 +1252,9 @@ effect fn compileIr(ir: &Bytes, debugInfo: &[u8], unitLines: Option<&EmissionPla
     drop removed
     return ()
   }
-  return run Effect.useReleaseNonParking(move scratch, move use, move release)
+  let status = run Effect.useReleaseNonParking(move scratch, move use, move release)
+  drop held
+  return status
 }
 
 // The line tables of `module`, as `DebugInfo.encode` writes them: a subprogram for each function
@@ -1782,7 +1792,35 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
     }
     nativeInputs = List<NativeLinkInput>.asSlice(&compiledInputs)
   }
-  if units.length == usize.ZERO {
+  // A native executable built as one optimized module compiles it to an object cached by the
+  // module's digest, then links that object: an unchanged module, as in a build whose only change
+  // is a link input, links in seconds instead of being optimized again. A debug module keeps the
+  // one-step compile and link, which gathers its DWARF on macOS.
+  let irDigest = ContentHash.of(Bytes.asSlice(ir))
+  let mut wholeObject = Option<Path>.none()
+  if units.length == usize.ZERO && linked && !freestanding && !windows && !debug && debugInfo.length == usize.ZERO {
+    if let Option<Bytes>.None = &probed {
+      match move run probeClang(&clang, origin, minimumClang, &mut progress.*) {
+        ClangVersion.Answered {output: answer} => { probed = Option<Bytes>.some(move answer) }
+        ClangVersion.Failed {status} => { return status }
+      }
+    }
+    let mut identity = run Bytes.copy(Path.rawBytes(&clang))
+    if let Option<Bytes>.Some {value: answer} = &probed {
+      run Bytes.append(&mut identity, b"\n")
+      run Bytes.append(&mut identity, Bytes.asSlice(&answer))
+    }
+    flag = usize.ZERO
+    while flag < shared.length {
+      run Bytes.append(&mut identity, b"\n")
+      run Bytes.append(&mut identity, Bytes.asSlice(&shared[flag]))
+      flag = flag + usize.ONE
+    }
+    let directory = run CodegenCache.directoryFor(output)
+    let object = run CodegenCache.wholeObject(&directory, Bytes.asSlice(&identity), irDigest)
+    run NativeToolchain.addPathArgument(&mut process, &object)
+    wholeObject = Option<Path>.some(move object)
+  } else if units.length == usize.ZERO {
     run ChildProcess.addArgument(&mut process, "-x")
     run ChildProcess.addArgument(&mut process, "ir")
     run NativeToolchain.addPathArgument(&mut process, &irPath)
@@ -1892,7 +1930,7 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
   // the command names them as it names a split build's objects.
   let stamped = linked && !windows && !archive && NativeLinkInputs.onlySources(linkInputs) && Target.id(target) != TargetId.Wasm32Wasip2
   let mut command = run linkCommand(&process, Bytes.asSlice(&stem))
-  if units.length == usize.ZERO { run appendDigest(&mut command, ContentHash.of(Bytes.asSlice(ir))) }
+  if units.length == usize.ZERO { run appendDigest(&mut command, irDigest) }
   if debugInfo.length > usize.ZERO { run appendDigest(&mut command, ContentHash.of(debugInfo)) }
   // A renamed function changes the published names even when its symbol stays the same.
   if FunctionNames.length(functionNames) > usize.ZERO { run appendDigest(&mut command, FunctionNames.digest(functionNames)) }
@@ -1938,7 +1976,12 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
       if run debugFilesExist(output) { return 0 }
     }
     run CodegenCache.forgetLink(&unitDirectory)
-    if units.length == usize.ZERO {
+    if let Option<Path>.Some {value: object} = &wholeObject {
+      if !run FileSystem.exists(&object) {
+        let optimized = run optimizeModule(&clang, origin, ir, &resource.*, &object, List<Bytes>.asSlice(&common), &mut progress.*)
+        if optimized != 0 { return optimized }
+      }
+    } else if units.length == usize.ZERO {
       if let Option<Bytes>.None = &probed {
         if let ClangVersion.Failed {status} = run probeClang(&clang, origin, minimumClang, &mut progress.*) { return status }
       }
@@ -1975,6 +2018,11 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
     }
     if compiled != 0 { return compiled }
     if units.length > usize.ZERO { run CodegenCache.prune(&unitDirectory, linkedObjects) }
+    if let Option<Path>.Some {value: object} = &wholeObject {
+      let mut kept = List<Path>.make()
+      run List<Path>.append(&mut kept, run Path.fromBytes(Path.rawBytes(&object)))
+      run CodegenCache.prune(&unitDirectory, List<Path>.asSlice(&kept))
+    }
     // Engines print the name section in their traces, so a debug module names its functions as
     // the source does, before a component wraps it.
     if freestanding && FunctionNames.length(functionNames) > usize.ZERO {
@@ -2310,6 +2358,56 @@ effect fn unitDebugInfo(plan: Option<&EmissionPlan>, sources: &ModuleSources, fr
     return run debugInfoOf(value, sources, &module, false)
   }
   return Bytes.make()
+}
+
+// Compiles the whole module `ir`, encoded as bitcode to `input`, to the cached `object` with the
+// shared code `flags`, and answers Clang's status. Clang optimizes the whole program here, so the
+// step shows as its own `optimize` phase before the link resumes.
+effect fn optimizeModule(clang: &Path, origin: &[u8], ir: &Bytes, input: &Path, object: &Path, flags: &[Bytes], progress: &mut Progress) -> i32
+! FileError | ProcessError | HostInputError | OutOfMemoryError | WriterError
+? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
+  run Progress.retitle(&mut progress.*, ProgressPhase.Optimize)
+  run Progress.show(&mut progress.*, b"clang")
+  let bitcode = run Bitcode.compileProgram(Bytes.asSlice(ir))
+  run FileSystem.writeFile(input, Bytes.asSlice(&bitcode))
+  drop bitcode
+  let partial = run CodegenCache.pending(object)
+  let mut request = run NativeToolchain.request(clang)
+  run ChildProcess.addArgument(&mut request, "-c")
+  run ChildProcess.addArgument(&mut request, "-Wno-unused-command-line-argument")
+  let mut flag = usize.ZERO
+  while flag < flags.length {
+    run ChildProcess.addArgumentBytes(&mut request, Bytes.asSlice(&flags[flag]))
+    flag = flag + usize.ONE
+  }
+  run ChildProcess.addArgument(&mut request, "-x")
+  run ChildProcess.addArgument(&mut request, "ir")
+  run NativeToolchain.addPathArgument(&mut request, input)
+  run ChildProcess.addArgument(&mut request, "-o")
+  run NativeToolchain.addPathArgument(&mut request, &partial)
+  let compiled = match move run Effect.result(submitted(&request, &mut progress.*)) {
+    Result<i32, ProcessError | OutOfMemoryError | WriterError>.Success {value} => value
+    Result<i32, ProcessError | OutOfMemoryError | WriterError>.Failure {error} => match move error {
+      ProcessError unstarted => {
+        drop unstarted
+        return run unstartedClang(clang, origin, &mut progress.*)
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+      WriterError broken => { fail move broken }
+    }
+  }
+  if compiled != 0 { return compiled }
+  if !run CodegenCache.publish(object) {
+    run Progress.clear(&mut progress.*)
+    run writeError(b"silk: cannot write ")
+    run writeError(Path.rawBytes(object))
+    run writeError(b"\n")
+    return 2
+  }
+  run Progress.end(&mut progress.*, b"clang")
+  run Progress.begin(&mut progress.*, ProgressPhase.Link, usize.ZERO)
+  run Progress.show(&mut progress.*, b"clang")
+  return 0
 }
 
 // Compiles each codegen unit whose object the cache beside `output` lacks, on worker threads, with
@@ -6214,13 +6312,18 @@ effect fn serveChecks(socket: &[u8], key: &[u8], store: &mut Semantic, request: 
   let shape = run programShape(&sources.*)
   run releaseReplayed(&mut store.*, &mut request.*)
   let mut checked = usize.ZERO
+  // Whether the server leaves because the program changed shape or went away.
+  let mut reshaped = false
   let mut idle = 0
   while true {
     let client = CheckServer.next(listener, CheckServer.WATCH_MILLISECONDS)
     if client == CheckServer.TIMED_OUT {
       idle = idle + CheckServer.WATCH_MILLISECONDS
       if idle >= CheckServer.IDLE_MILLISECONDS { break }
-      if !ContentHash.equals(run programShape(&sources.*), shape) { break }
+      if !ContentHash.equals(run programShape(&sources.*), shape) {
+        reshaped = true
+        break
+      }
       continue
     }
     if client < 0 { break }
@@ -6242,6 +6345,7 @@ effect fn serveChecks(socket: &[u8], key: &[u8], store: &mut Semantic, request: 
     let now = run programShape(&sources.*)
     if !ContentHash.equals(now, shape) {
       CheckServer.decline(client)
+      reshaped = true
       break
     }
     let refreshed = run Effect.result(ModuleSourceFiles.refreshFromDisk(&mut sources.*))
@@ -6280,8 +6384,10 @@ effect fn serveChecks(socket: &[u8], key: &[u8], store: &mut Semantic, request: 
     checked = checked + usize.ONE
   }
   run CheckServer.remove(socket)
-  // The checks it answered are written once, as it leaves, for the next process to read.
-  if checked > usize.ZERO {
+  // The checks it answered are written once, as it leaves, for the next process to read. A server
+  // that leaves because the program changed shape writes nothing: its answers describe a program
+  // that is gone, the next check writes its own cache, and a removed project is not written back.
+  if checked > usize.ZERO && !reshaped {
     drop run Effect.result(saveCheckCache(&mut store.*, &sources.*, runtime, cache, cacheHome, loadedCaches))
   }
   return ()
