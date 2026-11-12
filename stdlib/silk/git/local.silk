@@ -1,0 +1,404 @@
+//! Read the references of a local Git repository from its `.git` directory: `HEAD`, the loose
+//! references under `refs/`, and `packed-refs`.
+//!
+//! # When to use
+//! Call [`LocalRefs.read`] with the Git directory to get a `RefList` from `silk.git.refs`, then
+//! look up the current branch with `RefList.head` or a name with `RefList.resolve`. Use
+//! [`LocalRefs.gitDirectory`] to find the Git directory of a working tree, which is `.git` or the
+//! directory that a `.git` file names. It reads files through the `FileSystem` service of
+//! `silk.system.filesystem`, so tests can give files in memory.
+//!
+//! # Details
+//! A loose reference file holds an object id, or `ref: ` and the name of another reference. A loose
+//! reference replaces a packed one of the same name. Symbolic references, such as `HEAD` on a
+//! branch, have the name as their target and the id that the chain of names ends at. The result
+//! has `HEAD` first, then the other references sorted by name, as `git show-ref` lists them. For a
+//! linked worktree, `HEAD` comes from its own Git directory and the other references from the
+//! common directory that its `commondir` file names.
+//!
+//! # Errors
+//! - `GitRefError` from `silk.git.refs` if `packed-refs` or `HEAD` is malformed, a chain of
+//!   symbolic references loops, or the repository uses the `reftable` format.
+//! - `FileError` if a file or directory cannot be read.
+//! - `OutOfMemoryError` if the `Allocator` fails.
+//!
+//! # Gotchas
+//! Loose reference files that cannot be read as an id or a `ref: ` line are skipped, as Git skips
+//! them, and so are `.lock` files. Only references are read: this does not read objects, so a tag is
+//! peeled only when `packed-refs` records it.
+//!
+//! @category Version control
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.git.refs { GitRefError, ObjectId, Ref, RefList }
+import silk.system.filesystem {
+  DirectoryEntry,
+  DirectoryInfo,
+  FileError,
+  FileInfo,
+  FileSystem,
+  Path
+}
+import silk.text.string { InvalidUtf8, String }
+
+/// Functions that read the references of a local repository.
+pub struct LocalRefs {}
+
+impl LocalRefs {
+  /// Returns the Git directory of the working tree at `worktree`.
+  ///
+  /// # Details
+  ///
+  /// When `worktree/.git` is a directory, that is the Git directory. When it is a file, as in a
+  /// linked worktree or a submodule, the file holds `gitdir: ` and a path, absolute or relative to
+  /// `worktree`, and that path is the Git directory.
+  ///
+  /// # Errors
+  ///
+  /// - `FileError` with reason `NotFound` if `worktree/.git` does not exist, or another reason if it
+  ///   cannot be read.
+  /// - `GitRefError.Malformed` if the `.git` file does not start with `gitdir: `.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the path.
+  pub effect fn gitDirectory(worktree: &Path) -> Path
+    ! GitRefError | FileError | OutOfMemoryError
+    ? &mut FileSystem | &mut Allocator {
+    let dotGit = run Path.join(worktree, ".git")
+    let info = run FileSystem.stat(&dotGit)
+    return match move info {
+      DirectoryInfo _ => move dotGit
+      FileInfo _ => {
+        let contents = run FileSystem.readFile(&dotGit)
+        let line = trimLine(Bytes.asSlice(&contents))
+        if startsWith(line, b"gitdir: ") == false {
+          fail GitRefError.Malformed { offset: 0 }
+        }
+        return run pathFrom(worktree, Slice.view<u8>(line, 8, line.length - 8))
+      }
+    }
+  }
+
+  /// Returns the references of the repository whose Git directory is `gitDir`: `HEAD` first, then
+  /// the loose and packed references sorted by name.
+  ///
+  /// # Details
+  ///
+  /// A loose reference under `refs/` replaces a packed reference of the same name. A symbolic
+  /// reference, such as `HEAD` when a branch is checked out, has the name it points at as its
+  /// `target` and the id that the chain ends at. Its `id` is `None` when the chain ends at a
+  /// reference that does not exist, such as the branch of a new repository. A detached `HEAD` has
+  /// an id and no target. A tag has a `peeled` id when `packed-refs` records it.
+  ///
+  /// For a linked worktree, whose Git directory has a `commondir` file, `HEAD` is read from `gitDir`
+  /// and the other references from the common directory.
+  ///
+  /// # Errors
+  ///
+  /// - `GitRefError.Malformed` if `HEAD` or `packed-refs` is broken.
+  /// - `GitRefError.SymbolicLoop` if a chain of symbolic references is longer than five.
+  /// - `GitRefError.Unsupported` if the repository uses the `reftable` format.
+  /// - `FileError` if `HEAD` or a directory under `refs/` cannot be read.
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  ///
+  /// # Gotchas
+  ///
+  /// Loose reference files that hold neither an id nor a `ref: ` line are skipped, and so are
+  /// `.lock` files, as Git does. Per-worktree references other than `HEAD`, such as
+  /// `refs/bisect/`, are not read.
+  pub effect fn read(gitDir: &Path) -> RefList
+    ! GitRefError | FileError | OutOfMemoryError
+    ? &mut FileSystem | &mut Allocator {
+    let common = run commonDirectory(gitDir)
+    let reftable = run Path.join(&common, "reftable")
+    if run FileSystem.exists(&reftable) {
+      fail GitRefError.Unsupported
+    }
+    let packedPath = run Path.join(&common, "packed-refs")
+    let mut refs = RefList.make()
+    if run FileSystem.exists(&packedPath) {
+      let packed = run FileSystem.readFile(&packedPath)
+      refs = run LocalRefs.parsePackedRefs(Bytes.asSlice(&packed))
+    }
+    run addLoose(&mut refs, &common)
+    let headPath = run Path.join(gitDir, "HEAD")
+    let headFile = run FileSystem.readFile(&headPath)
+    let head = match run looseRef("HEAD", Bytes.asSlice(&headFile)) {
+      Option<Ref>.Some { value } => move value
+      Option<Ref>.None => {
+        fail GitRefError.Malformed { offset: 0 }
+      }
+    }
+    let _placed = run refs.insertSorted(move head)
+    run resolveSymbolic(&mut refs)
+    return move refs
+  }
+
+  /// Returns the references of the `packed-refs` file `contents`, sorted by name.
+  ///
+  /// # Details
+  ///
+  /// The file has an optional `# pack-refs with:` line, then one `<id> <name>` line for each
+  /// reference. A line `^<id>` sets the peeled id of the reference before it.
+  ///
+  /// # Errors
+  ///
+  /// - `GitRefError.Malformed` with the offset of the first broken line.
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  pub effect fn parsePackedRefs(contents: &[u8]) -> RefList
+    ! GitRefError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut refs = RefList.make()
+    let mut last: Option<usize> = Option<usize>.none()
+    let mut offset: usize = 0
+    while offset < contents.length {
+      let end = indexOf(contents, 10, offset)
+      let mut line = Slice.view<u8>(contents, offset, end - offset)
+      if line.length > 0 && line[line.length - 1] == 13 {
+        line = Slice.view<u8>(line, 0, line.length - 1)
+      }
+      if line.length == 0 || line[0] == 35 {
+        // A comment, such as the `# pack-refs with:` header.
+      } else if line[0] == 94 {
+        let peeled = run objectId(Slice.view<u8>(line, 1, line.length - 1), offset)
+        let index = match last {
+          Option<usize>.Some { value } => value
+          Option<usize>.None => {
+            fail GitRefError.Malformed { offset: offset }
+          }
+        }
+        let slots = refs.asMutSlice()
+        slots[index].peeled = Option<ObjectId>.some(peeled)
+      } else {
+        let space = indexOf(line, 32, 0)
+        if space == line.length {
+          fail GitRefError.Malformed { offset: offset }
+        }
+        let id = run objectId(Slice.view<u8>(line, 0, space), offset)
+        let name = run text(Slice.view<u8>(line, space + 1, line.length - space - 1), offset)
+        let entry = run Ref.make(name, Option<ObjectId>.some(id))
+        last = Option<usize>.some(run refs.insertSorted(move entry))
+      }
+      offset = end + 1
+    }
+    return move refs
+  }
+}
+
+// The directory that holds the shared references: the one that `gitDir/commondir` names, or
+// `gitDir` itself.
+effect fn commonDirectory(gitDir: &Path) -> Path
+  ! GitRefError | FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let commondir = run Path.join(gitDir, "commondir")
+  if run FileSystem.exists(&commondir) {
+    let contents = run FileSystem.readFile(&commondir)
+    return run pathFrom(gitDir, trimLine(Bytes.asSlice(&contents)))
+  }
+  return run Path.fromBytes(Path.rawBytes(gitDir))
+}
+
+// `relative` resolved against `base`, or `relative` itself when it is absolute.
+effect fn pathFrom(base: &Path, relative: &[u8]) -> Path
+  ! GitRefError | FileError | OutOfMemoryError
+  ? &mut Allocator {
+  if relative.length == 0 {
+    fail GitRefError.Malformed { offset: 0 }
+  }
+  if relative[0] == 47 {
+    let root = run Path.root()
+    return run Path.resolveBytes(&root, Slice.view<u8>(relative, 1, relative.length - 1))
+  }
+  return run Path.resolveBytes(base, relative)
+}
+
+// Adds every loose reference under `common/refs`, replacing packed ones of the same name.
+effect fn addLoose(refs: &mut RefList, common: &Path) -> ()
+  ! GitRefError | FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let top = run Path.join(common, "refs")
+  let present = run FileSystem.exists(&top)
+  if present == false {
+    return ()
+  }
+  let prefixLength = Path.rawBytes(common).length + 1
+  let mut pending = List<Path>.make()
+  run List<Path>.append(&mut pending, move top)
+  while List<Path>.length(&pending) > 0 {
+    let directory = match List<Path>.pop(&mut pending) {
+      Option<Path>.Some { value } => move value
+      Option<Path>.None => {
+        return ()
+      }
+    }
+    let entries = run FileSystem.listDirectory(&directory)
+    let listed = List<DirectoryEntry>.asSlice(&entries)
+    let mut index: usize = 0
+    while index < listed.length {
+      let kind = listed[index].kind.code
+      let path = Path.rawBytes(&listed[index].path)
+      if kind == FileSystem.entryKindCode(FileSystem.directory()) {
+        run List<Path>.append(&mut pending, run Path.fromBytes(path))
+      } else if kind == FileSystem.entryKindCode(FileSystem.file())
+        && endsWith(path, b".lock") == false {
+        let nameBytes = Slice.view<u8>(path, prefixLength, path.length - prefixLength)
+        if let Result.Success { value } = String.fromUtf8(nameBytes) {
+          let contents = run FileSystem.readFile(&listed[index].path)
+          if let Option.Some { value: entry } = run looseRef(value, Bytes.asSlice(&contents)) {
+            let _placed = run refs.insertSorted(move entry)
+          }
+        }
+      }
+      index = index + 1
+    }
+  }
+  return ()
+}
+
+// The reference `name` that a loose file with `contents` holds, or `None` if it holds neither an id
+// nor a `ref: ` line.
+effect fn looseRef(name: string, contents: &[u8]) -> Option<Ref>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let line = trimLine(contents)
+  if startsWith(line, b"ref: ") {
+    let target = match String.fromUtf8(Slice.view<u8>(line, 5, line.length - 5)) {
+      Result<string, InvalidUtf8>.Success { value } => value
+      Result<string, InvalidUtf8>.Failure { .. } => {
+        return Option<Ref>.none()
+      }
+    }
+    let mut entry = run Ref.make(name, Option<ObjectId>.none())
+    entry.target = Option<String>.some(run String.copy(String.trim(target)))
+    return Option<Ref>.some(move entry)
+  }
+  return match ObjectId.parseHex(line) {
+    Option<ObjectId>.Some { value } => Option<Ref>.some(
+      run Ref.make(name, Option<ObjectId>.some(value)),
+    )
+    Option<ObjectId>.None => Option<Ref>.none()
+  }
+}
+
+// Sets the id of each symbolic reference to the id that its chain of targets ends at.
+effect fn resolveSymbolic(refs: &mut RefList) -> ()
+  ! GitRefError | OutOfMemoryError
+  ? &mut Allocator {
+  let count = refs.length()
+  let mut index: usize = 0
+  while index < count {
+    if refs.asSlice()[index].target.isSome() {
+      let mut name = run String.copy(String.view(&refs.asSlice()[index].name))
+      let mut resolved = Option<ObjectId>.none()
+      let mut depth: usize = 0
+      let mut walking = true
+      while walking {
+        let next = match refs.find(String.view(&name)) {
+          Option<&Ref>.None => Option<String>.none()
+          Option<&Ref>.Some { value } => match &value.target {
+            Option<String>.Some { value: target } => Option<String>.some(
+              run String.copy(String.view(&target)),
+            )
+            Option<String>.None => {
+              resolved = value.id
+              Option<String>.none()
+            }
+          }
+        }
+        if let Option.Some { value } = move next {
+          depth = depth + 1
+          if depth > 5 {
+            fail GitRefError.SymbolicLoop
+          }
+          name = move value
+        } else {
+          walking = false
+        }
+      }
+      let slots = refs.asMutSlice()
+      slots[index].id = resolved
+    }
+    index = index + 1
+  }
+  return ()
+}
+
+effect fn objectId(hex: &[u8], offset: usize) -> ObjectId
+  ! GitRefError {
+  return match ObjectId.parseHex(hex) {
+    Option<ObjectId>.Some { value } => value
+    Option<ObjectId>.None => {
+      fail GitRefError.Malformed { offset: offset }
+    }
+  }
+}
+
+effect fn text<'a>(bytes: &'a [u8], offset: usize) -> string<'a>
+  ! GitRefError {
+  return match String.fromUtf8(bytes) {
+    Result<string<'a>, InvalidUtf8>.Success { value } => value
+    Result<string<'a>, InvalidUtf8>.Failure { .. } => {
+      fail GitRefError.Malformed { offset: offset }
+    }
+  }
+}
+
+// `bytes` without its spaces, tabs, CR, and LF at either end.
+fn trimLine(bytes: &[u8]) -> &[u8] {
+  let mut start: usize = 0
+  let mut end = bytes.length
+  while start < end && blank(bytes[start]) {
+    start = start + 1
+  }
+  while end > start && blank(bytes[end - 1]) {
+    end = end - 1
+  }
+  return Slice.view<u8>(bytes, start, end - start)
+}
+
+fn blank(byte: u8) -> bool {
+  return byte == 32 || byte == 9 || byte == 10 || byte == 13
+}
+
+// The offset of the first `byte` at or after `from`, or `bytes.length`.
+fn indexOf(bytes: &[u8], byte: u8, from: usize) -> usize {
+  let mut index = from
+  while index < bytes.length {
+    if bytes[index] == byte {
+      return index
+    }
+    index = index + 1
+  }
+  return bytes.length
+}
+
+fn startsWith(bytes: &[u8], prefix: &[u8]) -> bool {
+  if bytes.length < prefix.length {
+    return false
+  }
+  return same(Slice.view<u8>(bytes, 0, prefix.length), prefix)
+}
+
+fn endsWith(bytes: &[u8], suffix: &[u8]) -> bool {
+  if bytes.length < suffix.length {
+    return false
+  }
+  return same(Slice.view<u8>(bytes, bytes.length - suffix.length, suffix.length), suffix)
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut index: usize = 0
+  while index < left.length {
+    if left[index] != right[index] {
+      return false
+    }
+    index = index + 1
+  }
+  return true
+}
