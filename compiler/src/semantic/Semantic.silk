@@ -2692,8 +2692,8 @@ struct Resolver {
   codegenUnits: bool,
   // Whether LLVM text is shaped for an unoptimized compile (`LlvmCode.Writer.fastPath`).
   fastPathIr: bool,
-  // Whether lowering inlines small callees into their callers (`inlineCalls`): an optimized build
-  // without line tables (`selectInlining`).
+  // Whether lowering inlines callees into their callers (`inlineCalls`, by `inlineRule`): an
+  // optimized build without line tables (`selectInlining`).
   inlining: bool,
   // Whether instances lower to wasm fragments for the direct backend (`WasmLower`) instead of
   // LLVM text, whether its memory is shared between threads, and whether an optimized build
@@ -79977,11 +79977,40 @@ effect fn stillUses(function: &MirFunction, key: &InstanceKey) -> bool ! OutOfMe
   return false
 }
 
-// Inlines calls of the instance being lowered, in an optimized build without line tables.
+// Which callees one call may inline, by backend and kind of call (`inlineRule`).
+enum InlineRule {
+  // None: the call keeps its callee.
+  Never,
+  // A callee frame selection chose for this suspension point (`MirInline.eligible`).
+  Frame,
+  // A value forwarder (`MirInline.valueForwarder`).
+  Forwarder,
+  // A closed, inlinable callee (`closedBody`).
+  Closed,
+  // Either of the last two.
+  ForwarderOrClosed,
+}
+
+// The one inlining rule of a call. A suspension point of a frame variant inlines only what frame
+// selection chose, and a frame variant's other calls inline a value forwarder, whatever the
+// backend: LLVM inlines too late to coalesce these into the frame. An LLVM build does so only in a
+// frame for which selection chose a callee (`selected`). Beyond that only the direct backend
+// inlines, a closed inlinable callee at any call that is not a suspension point; LLVM inlines
+// such callees itself, and splicing them in MIR first only costs an LLVM build time and memory.
+fn inlineRule(direct: bool, framed: bool, selected: bool, suspending: bool) -> InlineRule {
+  if suspending { return InlineRule.Frame }
+  if framed && direct { return InlineRule.ForwarderOrClosed }
+  if framed && selected { return InlineRule.Forwarder }
+  if direct { return InlineRule.Closed }
+  return InlineRule.Never
+}
+
+// Inlines calls of the instance being lowered, in an optimized build without line tables, under
+// each call's `inlineRule`.
 //
-// A call that is not a suspension point inlines a callee whose un-inlined MIR is inlinable and
-// closed (`closedBody`); in a frame variant it also inlines a value forwarder, which can call
-// nothing that suspends since the call itself does not. A suspension point of a frame variant
+// A closed callee's un-inlined MIR is inlinable and every call it makes is to a closed callee
+// (`closedBody`). A value forwarder in a frame variant can call nothing that suspends, since the
+// call itself does not. A suspension point of a frame variant
 // inlines a callee frame selection chose (`facts.inline`), lowered with this frame's facts so its
 // own points have cancel exits, which chain into the point's. Every decision reads the callee
 // alone. The caller reads only un-inlined MIR, a recorded dependency, which inlines nothing, so
@@ -79993,6 +80022,10 @@ effect fn inlineCalls(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejec
   dependencies: &mut List<Dependency>, function: &mut MirFunction, facts: &Option<CoroutineFacts>, observing: bool) -> ()
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
   if !resolver.inlining || resolver.lineTables { return () }
+  // An LLVM build inlines only in a frame for which selection chose a callee (`inlineRule`).
+  let mut selectedVariant = false
+  if let Option<CoroutineFacts>.Some {value} = &facts.* { selectedVariant = List<InstanceKey>.length(&value.inline) != usize.ZERO }
+  if !resolver.direct && !selectedVariant { return () }
   let mut candidates = List<InstanceKey>.make()
   let mut rawFacts = Option<CoroutineFacts>.none()
   let mut framed = false
@@ -80051,9 +80084,11 @@ effect fn inlineCalls(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejec
       ancestor = prior[ancestor].parent
     }
     if recursive { continue }
-    // A call that is not a suspension point reads the callee's summary first, so the caller
-    // depends on the body of a callee it does not inline only through that summary.
-    if !suspending && !framed {
+    let rule = inlineRule(resolver.direct, framed, List<InstanceKey>.length(&candidates) != usize.ZERO, suspending)
+    if rule == InlineRule.Never { continue }
+    // A closed callee's summary is read first, so the caller depends on the body of a callee it
+    // does not inline only through that summary.
+    if rule == InlineRule.Closed {
       let mut chain = List<InstanceKey>.make()
       if !run closedBody(&mut resolver.*, &mut owner.*, &mut dependencies.*, &selected, observing, &rawFacts, &mut chain,
         &mut verdicts) { continue }
@@ -80064,20 +80099,17 @@ effect fn inlineCalls(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejec
     }
     let functions = List<MirFunction>.asSlice(&resolver.mirValues)
     if MirInline.size(&function.*) + MirInline.size(&functions[index]) > limit { continue }
-    let mut allowed = !suspending && !framed
-    if suspending {
-      allowed = MirInline.eligible(&functions[index])
-    } else if framed {
-      allowed = MirInline.valueForwarder(&functions[index])
-      if !allowed {
-        let mut chain = List<InstanceKey>.make()
-        allowed = run closedBody(&mut resolver.*, &mut owner.*, &mut dependencies.*, &selected, observing, &rawFacts, &mut chain,
-          &mut verdicts)
-      }
+    let mut allowed = rule == InlineRule.Closed
+    if rule == InlineRule.Frame { allowed = MirInline.eligible(&functions[index], resolver.direct) }
+    if rule == InlineRule.Forwarder || rule == InlineRule.ForwarderOrClosed { allowed = MirInline.valueForwarder(&functions[index], resolver.direct) }
+    if !allowed && rule == InlineRule.ForwarderOrClosed {
+      let mut chain = List<InstanceKey>.make()
+      allowed = run closedBody(&mut resolver.*, &mut owner.*, &mut dependencies.*, &selected, observing, &rawFacts, &mut chain,
+        &mut verdicts)
     }
     if !allowed { continue }
     let bodies = List<MirFunction>.asSlice(&resolver.mirValues)
-    if run MirInline.call(&mut function.*, point, &bodies[index]) {
+    if run MirInline.call(&mut function.*, point, &bodies[index], resolver.direct) {
       let parent = List<usize>.get(&ancestry, point)
       let expansion = List<InlineExpansion>.length(&expansions)
       run List<InlineExpansion>.append(&mut expansions, InlineExpansion {key: InstanceKey.copy(&selected), parent: parent})
@@ -80100,6 +80132,9 @@ effect fn inlineCalls(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejec
     if !seen { run List<InstanceKey>.append(&mut function.inlined, InstanceKey.copy(&listed[each])) }
     each = each + usize.ONE
   }
+  // An LLVM build keeps the references of its frames' spliced callees, as it always did; LLVM
+  // drops a definition that nothing calls any more itself.
+  if !resolver.direct { return () }
   let spliced = List<InstanceKey>.asSlice(&function.inlined)
   let mut key = usize.ZERO
   while key < spliced.length {
@@ -95782,8 +95817,10 @@ impl Semantic {
     self.resolver.codegenUnits = split
   }
 
-  /// Selects whether lowering inlines small callees into their callers before code generation,
-  /// as an optimized build does. A build with line tables inlines nothing whatever this says.
+  /// Selects whether lowering inlines callees into their callers before code generation, as an
+  /// optimized build does: a build for the direct backend inlines small callees, and an LLVM
+  /// build only the calls of suspendable frames that LLVM inlines too late. A build with line
+  /// tables inlines nothing whatever this says.
   /// The cache keeps one image per profile, so MIR lowered under one choice is never adopted under
   /// the other.
   pub fn selectInlining(self: &mut Self, inlining: bool) -> () {
@@ -100434,7 +100471,7 @@ impl Semantic {
         at = usize.ZERO
         while at < current.length {
           let body = current[at]
-          if self.resolver.inlining && !self.resolver.lineTables && MirInline.eligible(&ordinary[body]) {
+          if self.resolver.inlining && !self.resolver.lineTables && MirInline.eligible(&ordinary[body], self.resolver.direct) {
             let position = run FrameSelection.position(&selection, &ordinary[body].key)
             if position != usize.MAX { List<usize>.set(&mut selection.bodies, position, body) }
           }

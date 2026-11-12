@@ -2,4 +2,4 @@
 bump: patch
 ---
 
-Optimized builds inline small functions before code generation, so direct WebAssembly builds run faster.
+Optimized direct-backend WebAssembly builds inline small functions before code generation, so they run faster.
