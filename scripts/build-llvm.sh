@@ -55,7 +55,6 @@ flags=(
   -DLLVM_INCLUDE_UTILS=OFF
   -DCLANG_INCLUDE_TESTS=OFF
   -DCLANG_INCLUDE_DOCS=OFF
-  -DCLANG_ENABLE_ARCMT=OFF
   -DCLANG_ENABLE_STATIC_ANALYZER=OFF
   -DCLANG_ENABLE_OBJC_REWRITER=OFF
   -DCLANG_PLUGIN_SUPPORT=OFF
@@ -97,7 +96,7 @@ case "$(uname -s)" in
   MINGW* | MSYS*)
     # Git Bash inside an MSVC developer environment (vcvars64), with CC and CXX `cl`. The static
     # CRT keeps the executable free of the Visual C++ redistributable.
-    flags+=(-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded)
+    flags+=(-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DLLVM_BUILD_LLVM_C_DYLIB=OFF)
     suffix=.exe
     ;;
 esac
