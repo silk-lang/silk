@@ -124,6 +124,14 @@ argument: OsHostInput.argument
 variable: OsHostInput.variable
 ```
 
+<a id="OsHostInput.impl.HostInput.variableNames"></a>
+
+### Operation `variableNames`
+
+```silk
+variableNames: OsHostInput.variableNames
+```
+
 <a id="OsHostInput.impl.HostInput.workingDirectory"></a>
 
 ### Operation `workingDirectory`

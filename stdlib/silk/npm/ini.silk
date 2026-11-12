@@ -1,0 +1,522 @@
+//! Parse the ini text of an `.npmrc` file into keys and values, the way npm reads it.
+//!
+//! # When to use
+//! Use [`NpmIni.parse`] to read one `.npmrc` file, or any other file in the ini dialect of npm's
+//! `ini` package. Find a key with [`NpmIni.find`]. To read npm's whole configuration, with
+//! environment variables, scoped registries, credentials, and the user, project, and global files,
+//! use `silk.npm.config` instead.
+//!
+//! # Details
+//! Each line is a comment, a `[section]` header, or a `key = value` assignment:
+//!
+//! - A line whose first non-blank character is `;` or `#` is a comment. Blank lines are skipped.
+//! - `[name]` at the start of a line opens a section. npm reads only the keys before the first
+//!   header; find them with [`NpmIni.find`], and keys in a section with [`NpmIni.findIn`].
+//! - `key = value` splits at the first `=`. A line without `=` sets the key to `true`. A line that
+//!   starts with `=` is skipped.
+//! - Keys and values are trimmed. A value in `"` quotes that is a valid JSON string is decoded as
+//!   JSON. A value in `'` quotes loses the quotes, and is decoded as JSON if what is left is a JSON
+//!   string. In an unquoted value, `;` or `#` starts a comment, and `\;`, `\#`, and `\\` stand for
+//!   `;`, `#`, and `\`.
+//! - After that, the text `true`, `false`, or `null` becomes a boolean or a null.
+//! - A key that ends with `[]` is a list. Each assignment adds one item.
+//! - When a key is assigned again, the last value wins, and the entry keeps the place of the first.
+//! - The key and section `__proto__` are ignored, as npm ignores them.
+//!
+//! The input is read as UTF-8, and each invalid sequence becomes U+FFFD. A byte order mark stays,
+//! as it does in npm: it is trimmed from a key, but a `[section]` header right after it is read as
+//! a key.
+//!
+//! # Errors
+//! - `OutOfMemoryError` if the `Allocator` cannot supply the entries. Parsing has no other error:
+//!   like npm, it skips the lines it cannot read.
+//!
+//! # Gotchas
+//! The text of a value is not checked against npm's types: `2` stays the text `2`. Dots in a
+//! section name are kept. npm does not nest sections in its configuration.
+//!
+//! # Examples
+//! ## Read a token and a list
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.core.effect { Effect }
+//! import silk.core.option { Option }
+//! import silk.npm.ini { NpmEntry, NpmIni, NpmScalar }
+//! import silk.collections.list { List }
+//!
+//! pub effect fn main() -> i32
+//!   ! OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let source = b"//registry.npmjs.org/:_authToken = abc ; a comment\nca[] = one\nca[] = two\n"
+//!   let entries = run NpmIni.parse(source) |> Effect.provideMut<Allocator>(&mut allocator)
+//!   let token = NpmIni.text(&entries, "//registry.npmjs.org/:_authToken") |> Option<string>.unwrapOr("")
+//!   let count = match NpmIni.find(&entries, "ca") {
+//!     Option<&NpmEntry>.Some { value } => List<NpmScalar>.length(&value.values)
+//!     Option<&NpmEntry>.None => 0
+//!   }
+//!   if token != "abc" || count != 2 {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! @category Data formats
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.json.scanner { JsonError, JsonSyntax }
+import silk.json.text { JsonText }
+import silk.text.string { String }
+import silk.url.percent { UrlPercent }
+import silk.num.usize
+
+/// One value of an ini entry: text, a boolean, or a null.
+pub union NpmScalar {
+  /// The text `null`.
+  Null,
+  /// The text `true` or `false`.
+  Boolean {
+    /// The boolean.
+    pub value: bool
+  },
+  /// Any other text, with quotes, escapes, and comments removed.
+  Text {
+    /// The decoded text.
+    pub text: String
+  },
+}
+
+/// One key of an ini file, with its section and its values.
+pub struct NpmEntry {
+  /// The name of the section, or `""` for keys before the first `[section]` header.
+  pub section: String,
+  /// `false` for keys before the first `[section]` header. A header `[]` opens a section named
+  /// `""`, which is not the same as no section.
+  pub sectioned: bool,
+  /// The decoded key. For a list, the `[]` at the end is removed.
+  pub key: String,
+  /// The values in source order. A key that is not a list has exactly one value.
+  pub values: List<NpmScalar>,
+  /// `true` if the key was written with `[]` at the end.
+  pub list: bool,
+}
+
+/// Functions that parse the ini text of `.npmrc` files and find keys in the result.
+///
+/// # When to use
+///
+/// Use [`NpmIni.parse`] to read one `.npmrc` file, and [`NpmIni.find`] or [`NpmIni.text`] to read a
+/// key. Use `silk.npm.config` to read npm's whole configuration.
+pub struct NpmIni {}
+
+impl NpmIni {
+  /// Returns the entries of the ini text `bytes`, in the order of their first assignment.
+  ///
+  /// # Details
+  ///
+  /// Each line is a comment (first non-blank character `;` or `#`), a `[section]` header at the
+  /// start of the line, or a `key = value` assignment split at the first `=`. A line without `=`
+  /// sets the key to `true`. Keys and values are trimmed. A value in `"` quotes that is a valid JSON
+  /// string is decoded as JSON. A value in `'` quotes loses the quotes, and is decoded as JSON if
+  /// what is left is a JSON string. In an unquoted value, `;` or `#` starts a comment, and `\;`,
+  /// `\#`, and `\\` stand for `;`, `#`, and `\`. The text `true`, `false`, or `null` then becomes a
+  /// boolean or a null. A key that ends with `[]` is a list, and each assignment adds one item. For
+  /// other keys the last assignment wins. The key and section `__proto__` are ignored.
+  ///
+  /// The input is read as UTF-8, and each invalid sequence becomes U+FFFD. A byte order mark stays,
+  /// as it does in npm: it is trimmed from a key, but a `[section]` header right after it is read as
+  /// a key.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the entries. Lines that cannot be read
+  ///   are skipped, as npm skips them.
+  pub effect fn parse(bytes: &[u8]) -> List<NpmEntry>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut decoded = String.make()
+    run UrlPercent.appendUtf8Lossy(&mut decoded, bytes)
+    let text = String.view(&decoded)
+    let raw = String.utf8Bytes(text)
+    let mut entries = List<NpmEntry>.make()
+    let mut section = String.make()
+    let mut sectioned = false
+    let mut ignored = false
+    let mut at = usize.ZERO
+    while at < raw.length {
+      let mut end = at
+      while end < raw.length && raw[end] != 10 && raw[end] != 13 {
+        end = end + usize.ONE
+      }
+      if end > at {
+        let line = String.slice(text, at, end - at)
+        run parseLine(&mut entries, &mut section, &mut sectioned, &mut ignored, line)
+      }
+      at = end + usize.ONE
+    }
+    return move entries
+  }
+
+  /// Returns the entry for `key` before the first `[section]` header, or `None` if there is no
+  /// such key.
+  ///
+  /// # Details
+  ///
+  /// npm reads only these keys. `key` is the decoded key; for a list, leave out the `[]`. Keys
+  /// compare byte for byte, so case matters.
+  pub fn find<'a>(entries: &'a List<NpmEntry>, key: string) -> Option<&'a NpmEntry> {
+    return lookup(entries, false, "", key)
+  }
+
+  /// Returns the entry for `key` in the section `section`, or `None` if there is no such key.
+  ///
+  /// # Details
+  ///
+  /// It finds only keys after a `[section]` header with the decoded name `section`. Use
+  /// [`NpmIni.find`] for keys before the first header. `key` is the decoded key; for a list, leave
+  /// out the `[]`. Names compare byte for byte, so case matters.
+  pub fn findIn<'a>(entries: &'a List<NpmEntry>, section: string, key: string) -> Option<
+    &'a NpmEntry
+  > {
+    return lookup(entries, true, section, key)
+  }
+
+  /// Returns the text of the first value of `key` before the first `[section]` header.
+  ///
+  /// # Details
+  ///
+  /// Returns `None` if there is no such key, or if its first value is a boolean or a null. The text
+  /// borrows from `entries`.
+  pub fn text<'a>(entries: &'a List<NpmEntry>, key: string) -> Option<string<'a>> {
+    return match NpmIni.find(entries, key) {
+      Option<&'a NpmEntry>.None => Option<string<'a>>.none()
+      Option<&'a NpmEntry>.Some { value } => NpmIni.firstText(value)
+    }
+  }
+
+  /// Returns the text of the first value of `entry`, or `None` if that value is a boolean or a
+  /// null. The text borrows from `entry`.
+  pub fn firstText<'a>(entry: &'a NpmEntry) -> Option<string<'a>> {
+    let values = List<NpmScalar>.asSlice(&entry.values)
+    if values.length == usize.ZERO {
+      return Option<string<'a>>.none()
+    }
+    return match &values[0] {
+      NpmScalar.Text { text } => Option<string<'a>>.some(String.view(&text))
+      _ => Option<string<'a>>.none()
+    }
+  }
+}
+
+// Reads one non-empty line into `entries`, as `ini.decode` of npm's `ini` package does.
+effect fn parseLine(
+  entries: &mut List<NpmEntry>,
+  section: &mut String,
+  sectioned: &mut bool,
+  ignored: &mut bool,
+  line: string,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let trimmed = trimStart(line)
+  if String.byteLength(trimmed) == usize.ZERO {
+    return ()
+  }
+  let lead = String.utf8Bytes(trimmed)[0]
+  if lead == 59 || lead == 35 {
+    return ()
+  }
+  let bytes = String.utf8Bytes(line)
+  if bytes[0] == 91 {
+    let header = trimEnd(line)
+    let headerBytes = String.utf8Bytes(header)
+    let last = headerBytes.length - usize.ONE
+    let mut closed = last > usize.ZERO && headerBytes[last] == 93
+    let mut index = usize.ONE
+    while closed && index < last {
+      if headerBytes[index] == 93 {
+        closed = false
+      }
+      index = index + usize.ONE
+    }
+    if closed {
+      let name = run unquote(String.slice(header, usize.ONE, last - usize.ONE))
+      ignored.* = String.view(&name) == "__proto__"
+        || claimSection(&mut entries.*, String.view(&name))
+      sectioned.* = true
+      let previous = Intrinsic.replace(section.*, move name)
+      drop previous
+      return ()
+    }
+  }
+  let mut equals = usize.ZERO
+  while equals < bytes.length && bytes[equals] != 61 {
+    equals = equals + usize.ONE
+  }
+  if equals == usize.ZERO {
+    return ()
+  }
+  let rawKey = String.slice(line, usize.ZERO, equals)
+  let mut key = run unquote(rawKey)
+  let mut value = NpmScalar.Boolean { value: true }
+  if equals < bytes.length {
+    // JavaScript's `.` does not match U+2028 or U+2029, so npm skips a line with one in its value.
+    if hasLineSeparator(Slice.view<u8>(bytes, equals, bytes.length - equals)) {
+      return ()
+    }
+    let rawValue = String.slice(line, equals + usize.ONE, bytes.length - equals - usize.ONE)
+    let decoded = run unquote(rawValue)
+    value = scalar(move decoded)
+  }
+  let mut list = false
+  let keyLength = String.ownedByteLength(&key)
+  if keyLength > 2 && String.endsWith(String.view(&key), "[]") {
+    list = true
+    let mut shortened = String.make()
+    run String.append(&mut shortened, String.slice(String.view(&key), usize.ZERO, keyLength - 2))
+    key = move shortened
+  }
+  if ignored.* || String.view(&key) == "__proto__" {
+    return ()
+  }
+  run assign(&mut entries.*, sectioned.*, String.view(&section.*), move key, move value, list)
+}
+
+// Stores one assignment: a list key adds an item, any other key replaces the values.
+effect fn assign(
+  entries: &mut List<NpmEntry>,
+  sectioned: bool,
+  section: string,
+  key: String,
+  value: NpmScalar,
+  list: bool,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let all = List<NpmEntry>.asMutSlice(&mut entries.*)
+  let mut index = usize.ZERO
+  while index < all.length {
+    if same(&all[index], sectioned, section, String.view(&key)) {
+      if list || all[index].list {
+        // A list stays a list: a later assignment without `[]` adds an item too.
+        run List<NpmScalar>.append(&mut all[index].values, move value)
+        all[index].list = true
+      } else {
+        List<NpmScalar>.clear(&mut all[index].values)
+        run List<NpmScalar>.append(&mut all[index].values, move value)
+        all[index].list = false
+      }
+      return ()
+    }
+    index = index + usize.ONE
+  }
+  let mut values = List<NpmScalar>.make()
+  run List<NpmScalar>.append(&mut values, move value)
+  let owned = run String.copy(section)
+  run List<NpmEntry>.append(
+    &mut entries.*,
+    NpmEntry {
+      section: move owned,
+      sectioned: sectioned,
+      key: move key,
+      values: move values,
+      list: list,
+    },
+  )
+}
+
+// npm keeps sections and top-level keys in one object. A section named like a top-level key whose
+// value is true in JavaScript (non-empty text, `true`, or a list) cannot be opened, so its keys are
+// dropped. A key whose value is false in JavaScript (empty text, `false`, or `null`) is replaced by
+// the section. Returns `true` if the keys of the section must be dropped.
+fn claimSection(entries: &mut List<NpmEntry>, name: string) -> bool {
+  let all = List<NpmEntry>.asSlice(&entries.*)
+  let mut index = usize.ZERO
+  while index < all.length {
+    if same(&all[index], false, "", name) {
+      if all[index].list {
+        return true
+      }
+      let truthy = match &List<NpmScalar>.asSlice(&all[index].values)[0] {
+        NpmScalar.Null => false
+        NpmScalar.Boolean { value } => value
+        NpmScalar.Text { text } => String.ownedByteLength(&text) != usize.ZERO
+      }
+      if truthy {
+        return true
+      }
+      let removed = List<NpmEntry>.remove(&mut entries.*, index)
+      drop removed
+      return false
+    }
+    index = index + usize.ONE
+  }
+  return false
+}
+
+fn lookup<'a>(entries: &'a List<NpmEntry>, sectioned: bool, section: string, key: string) -> Option<
+  &'a NpmEntry
+> {
+  let all = List<NpmEntry>.asSlice(entries)
+  let mut index = usize.ZERO
+  while index < all.length {
+    if same(&all[index], sectioned, section, key) {
+      return Option<&'a NpmEntry>.some(&all[index])
+    }
+    index = index + usize.ONE
+  }
+  return Option<&'a NpmEntry>.none()
+}
+
+fn same(entry: &NpmEntry, sectioned: bool, section: string, key: string) -> bool {
+  return entry.sectioned == sectioned && String.view(&entry.key) == key
+    && String.view(&entry.section) == section
+}
+
+// The text `true`, `false`, and `null` become typed values; other text stays text.
+fn scalar(text: String) -> NpmScalar {
+  let view = String.view(&text)
+  if view == "true" {
+    return NpmScalar.Boolean { value: true }
+  }
+  if view == "false" {
+    return NpmScalar.Boolean { value: false }
+  }
+  if view == "null" {
+    return NpmScalar.Null
+  }
+  return NpmScalar.Text { text: move text }
+}
+
+// Decodes a raw key or value as the `unsafe` function of npm's `ini` package does.
+effect fn unquote(raw: string) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let value = trim(raw)
+  let bytes = String.utf8Bytes(value)
+  let length = bytes.length
+  if length > usize.ZERO
+    && ((bytes[0] == 34 && bytes[length - usize.ONE] == 34)
+      || (bytes[0] == 39 && bytes[length - usize.ONE] == 39)) {
+    let mut inner = value
+    if bytes[0] == 39 {
+      if length < 2 {
+        return String.make()
+      }
+      inner = String.slice(value, usize.ONE, length - 2)
+    }
+    return run decodeJsonString(inner)
+  }
+  let mut output = Bytes.make()
+  let mut escaped = false
+  let mut index = usize.ZERO
+  let mut segment = usize.ZERO
+  while index < length {
+    let byte = bytes[index]
+    if escaped {
+      if byte != 92 && byte != 59 && byte != 35 {
+        run Bytes.append(&mut output, b"\\")
+      }
+      segment = index
+      escaped = false
+    } else if byte == 59 || byte == 35 {
+      break
+    } else if byte == 92 {
+      run Bytes.append(&mut output, Slice.view<u8>(bytes, segment, index - segment))
+      escaped = true
+    }
+    index = index + usize.ONE
+  }
+  if !escaped {
+    run Bytes.append(&mut output, Slice.view<u8>(bytes, segment, index - segment))
+  } else {
+    run Bytes.append(&mut output, b"\\")
+  }
+  let text = unsafe String.fromBytesUnchecked(move output)
+  let trimmed = trim(String.view(&text))
+  if String.byteLength(trimmed) == String.ownedByteLength(&text) {
+    return move text
+  }
+  return run String.copy(trimmed)
+}
+
+// Returns the decoded text of `value` if all of it, without surrounding blanks, is one JSON
+// string. Otherwise returns a copy of `value`, as `JSON.parse` failing leaves it.
+effect fn decodeJsonString(value: string) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let candidate = jsonTrim(value)
+  let bytes = String.utf8Bytes(candidate)
+  if bytes.length >= 2 && bytes[0] == 34 {
+    let mut escaped = false
+    let end = JsonSyntax.stringEnd(bytes, usize.ONE, &mut escaped)
+    if end == bytes.length {
+      let decoded = run Intrinsic.catchFailure<JsonError>(
+        JsonText.decode(bytes, usize.ZERO, escaped),
+        invalidJson,
+      )
+      return unsafe String.fromBytesUnchecked(move decoded)
+    }
+  }
+  return run String.copy(value)
+}
+
+effect fn invalidJson(error: JsonError) -> Bytes {
+  drop error
+  return Bytes.make()
+}
+
+// JavaScript's `trim` removes Unicode white space and U+FEFF; `String.trim` keeps U+FEFF.
+fn trim(value: string) -> string {
+  return trimEnd(trimStart(value))
+}
+
+fn trimStart(value: string) -> string {
+  let mut rest = String.trimStart(value)
+  while String.startsWith(rest, "\u{FEFF}") {
+    rest = String.trimStart(String.slice(rest, 3, String.byteLength(rest) - 3))
+  }
+  return rest
+}
+
+fn trimEnd(value: string) -> string {
+  let mut rest = String.trimEnd(value)
+  while String.endsWith(rest, "\u{FEFF}") {
+    rest = String.trimEnd(String.slice(rest, usize.ZERO, String.byteLength(rest) - 3))
+  }
+  return rest
+}
+
+// `JSON.parse` skips only space, tab, line feed, and carriage return around a value.
+fn jsonTrim(value: string) -> string {
+  let bytes = String.utf8Bytes(value)
+  let mut start = usize.ZERO
+  let mut end = bytes.length
+  while start < end && jsonBlank(bytes[start]) {
+    start = start + usize.ONE
+  }
+  while end > start && jsonBlank(bytes[end - usize.ONE]) {
+    end = end - usize.ONE
+  }
+  return String.slice(value, start, end - start)
+}
+
+fn jsonBlank(byte: u8) -> bool {
+  return byte == 32 || byte == 9 || byte == 10 || byte == 13
+}
+
+fn hasLineSeparator(bytes: &[u8]) -> bool {
+  let mut index = usize.ZERO
+  while index + 2 < bytes.length {
+    if bytes[index] == 226 && bytes[index + usize.ONE] == 128
+      && (bytes[index + 2] == 168 || bytes[index + 2] == 169) {
+      return true
+    }
+    index = index + usize.ONE
+  }
+  return false
+}

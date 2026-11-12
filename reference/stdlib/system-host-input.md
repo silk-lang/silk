@@ -29,6 +29,7 @@ import silk.collections.bytes { Bytes }
 import silk.core.effect { Effect }
 import silk.system.host_input { HostInput, HostInputError }
 import silk.core.option { Option }
+import silk.collections.list { List }
 
 struct FixedInput {}
 
@@ -52,6 +53,12 @@ effect fn variable(self: &mut FixedInput, name: &[u8]) -> Option<Bytes>
   return Option<Bytes>.none()
 }
 
+effect fn variableNames(self: &mut FixedInput) -> List<Bytes>
+  ! HostInputError | OutOfMemoryError
+  ? &mut Allocator {
+  return List<Bytes>.make()
+}
+
 effect fn workingDirectory(self: &mut FixedInput) -> Bytes
   ! HostInputError | OutOfMemoryError
   ? &mut Allocator {
@@ -64,6 +71,8 @@ impl HostInput for FixedInput {
   argument: FixedInput.argument
 
   variable: FixedInput.variable
+
+  variableNames: FixedInput.variableNames
 
   workingDirectory: FixedInput.workingDirectory
 }
@@ -193,6 +202,31 @@ the variable is not set.
 
 - [`HostInputError`](#HostInputError) if the provider cannot read the environment.
 - `OutOfMemoryError` if the `Allocator` cannot supply the copy.
+
+<a id="HostInput.variableNames"></a>
+
+### Operation `variableNames`
+
+```silk
+effect fn variableNames() -> List<Bytes> ! HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator
+```
+
+Returns copies of the names of all environment variables, in the order of the host.
+
+#### When to use
+
+Use it to find variables by a pattern, such as every name that starts with `npm_config_`.
+Read a value with `HostInput.variable`.
+
+#### Details
+
+Each name appears once. An entry without `=` is not a variable, so it is left out. On Windows,
+names keep their case, and `HostInput.variable` compares them without case.
+
+#### Errors
+
+- [`HostInputError`](#HostInputError) if the provider cannot read the environment.
+- `OutOfMemoryError` if the `Allocator` cannot supply the copies.
 
 <a id="HostInput.workingDirectory"></a>
 

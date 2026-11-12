@@ -1,0 +1,619 @@
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.io.writer_native { StderrWriter }
+import silk.npm.config {
+  DEFAULT_REGISTRY,
+  NpmConfig,
+  NpmConfigOptions,
+  NpmConfigSource,
+  NpmCredentials
+}
+import silk.npm.ini { NpmEntry, NpmIni, NpmScalar }
+import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.system.filesystem_native { OsFileSystem }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.text.string { String }
+import silk.num.usize
+
+static if Intrinsic.targetOperatingSystem() == "windows" {
+  import silk.platform.windows.wtf8 { Wtf8 }
+  import silk.collections.slice { Slice }
+  import silk.num.u32
+  unsafe extern "C" fn GetTempPathW(length: u32, buffer: ?[*]mut u16) -> u32
+} else static if Intrinsic.targetOperatingSystem() == "darwin" {
+  const HOST_ROOT: string = "/private/tmp"
+} else {
+  const HOST_ROOT: string = "/tmp"
+}
+
+effect fn hostRoot() -> Bytes
+  ! Failed | OutOfMemoryError
+  ? &mut Allocator {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    let mut buffer: [u16; 32768] = [0; 32768]
+    let count = unsafe GetTempPathW(32768, Pointer.fromMutSlice(&mut buffer))
+    run expect(count > 0 && count < 32768, "the fixture obtains its Windows temporary root")
+    let mut length = u32.toUsize(count)
+    if length > 3 && buffer[length - 1] == 92 {
+      length = length - 1
+    }
+    return run Wtf8.encode(Slice.view(&buffer, 0, length))
+  } else {
+    return run Bytes.copy(String.utf8Bytes(HOST_ROOT))
+  }
+}
+
+// A failed expectation, reported on standard error before the program exits with 1.
+struct Failed {
+  message: string<'static>,
+}
+
+effect fn expect(condition: bool, message: string<'static>) -> ()
+  ! Failed {
+  if !condition {
+    fail Failed { message: message }
+  }
+}
+
+// An environment with fixed variables and a fixed working directory.
+struct Environment {
+  names: List<Bytes>,
+  values: List<Bytes>,
+  directory: Bytes,
+}
+
+effect fn define(environment: &mut Environment, name: string, value: &[u8]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run List<Bytes>.append(&mut environment.names, run Bytes.copy(String.utf8Bytes(name)))
+  run List<Bytes>.append(&mut environment.values, run Bytes.copy(value))
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut index = usize.ZERO
+  while index < left.length {
+    if left[index] != right[index] {
+      return false
+    }
+    index = index + usize.ONE
+  }
+  return true
+}
+
+impl Environment {
+  effect fn argumentCount(self: &mut Self) -> usize
+    ! HostInputError {
+    return 0
+  }
+
+  effect fn argument(self: &mut Self, index: usize) -> Option<Bytes>
+    ! HostInputError | OutOfMemoryError
+    ? &mut Allocator {
+    return Option<Bytes>.none()
+  }
+
+  effect fn variable(self: &mut Self, name: &[u8]) -> Option<Bytes>
+    ! HostInputError | OutOfMemoryError
+    ? &mut Allocator {
+    let names = List<Bytes>.asSlice(&self.names)
+    let values = List<Bytes>.asSlice(&self.values)
+    let mut index = usize.ZERO
+    while index < names.length {
+      if same(Bytes.asSlice(&names[index]), name) {
+        return Option<Bytes>.some(run Bytes.copy(Bytes.asSlice(&values[index])))
+      }
+      index = index + usize.ONE
+    }
+    return Option<Bytes>.none()
+  }
+
+  effect fn variableNames(self: &mut Self) -> List<Bytes>
+    ! HostInputError | OutOfMemoryError
+    ? &mut Allocator {
+    let names = List<Bytes>.asSlice(&self.names)
+    let mut copies = List<Bytes>.make()
+    let mut index = usize.ZERO
+    while index < names.length {
+      run List<Bytes>.append(&mut copies, run Bytes.copy(Bytes.asSlice(&names[index])))
+      index = index + usize.ONE
+    }
+    return move copies
+  }
+
+  effect fn workingDirectory(self: &mut Self) -> Bytes
+    ! HostInputError | OutOfMemoryError
+    ? &mut Allocator {
+    return run Bytes.copy(Bytes.asSlice(&self.directory))
+  }
+}
+
+impl HostInput for Environment {
+  argumentCount: Environment.argumentCount
+
+  argument: Environment.argument
+
+  variable: Environment.variable
+
+  variableNames: Environment.variableNames
+
+  workingDirectory: Environment.workingDirectory
+}
+
+fn textIs(entries: &List<NpmEntry>, key: string, expected: string) -> bool {
+  return match NpmIni.text(entries, key) {
+    Option<string>.Some { value } => value == expected
+    Option<string>.None => false
+  }
+}
+
+fn scalarCode(entries: &List<NpmEntry>, key: string) -> i32 {
+  return match NpmIni.find(entries, key) {
+    Option<&NpmEntry>.Some { value } => match &List<NpmScalar>.asSlice(&value.values)[0] {
+      NpmScalar.Null => 0
+      NpmScalar.Boolean { value: set } => {
+        if set {
+          return 1
+        }
+        return 2
+      }
+      NpmScalar.Text { .. } => 3
+    }
+    Option<&NpmEntry>.None => -1
+  }
+}
+
+fn configText(config: &NpmConfig, key: string, expected: string) -> bool {
+  return match NpmConfig.text(config, key) {
+    Option<string>.Some { value } => value == expected
+    Option<string>.None => false
+  }
+}
+
+effect fn parseCases() -> ()
+  ! Failed | OutOfMemoryError
+  ? &mut Allocator {
+  let source = b"; comment\n  # comment\n  key = value ; trailing\nquoted = \"a\\u00e9 ; b\"\nsingle = ' x '\nesc = a\\;b\\#c\\\\d\\q\nflag\nempty=\non = true\noff=false\nnone=null\nlist[] = one\nlist[] = two\nlist = three\nlast=1\r\nlast=2\n__proto__=x\n=skipped\nsep=a\xE2\x80\xA8b\n[sec]\nkey = inner\n"
+  let entries = run NpmIni.parse(source)
+  run expect(
+    textIs(&entries, "key", "value"),
+    "an unquoted value ends at an inline comment and is trimmed",
+  )
+  run expect(
+    textIs(&entries, "quoted", "a\u{e9} ; b"),
+    "a double-quoted value is decoded as a JSON string",
+  )
+  run expect(textIs(&entries, "single", " x "), "single quotes are removed and keep inner blanks")
+  run expect(textIs(&entries, "esc", "a;b#c\\d\\q"), "backslash escapes only ; # and backslash")
+  run expect(scalarCode(&entries, "flag") == 1, "a key without = is true")
+  run expect(textIs(&entries, "empty", ""), "a key with = and no value is empty text")
+  run expect(
+    scalarCode(&entries, "on") == 1 && scalarCode(&entries, "off") == 2
+      && scalarCode(&entries, "none") == 0,
+    "true, false and null become typed values",
+  )
+  let listed = match NpmIni.find(&entries, "list") {
+    Option<&NpmEntry>.Some { value } => value.list && List<NpmScalar>.length(&value.values) == 3
+    Option<&NpmEntry>.None => false
+  }
+  run expect(listed, "a [] key collects items, and a later plain assignment adds to the list")
+  run expect(textIs(&entries, "last", "2"), "the last plain assignment wins")
+  run expect(Option<&NpmEntry>.isNone(&NpmIni.find(&entries, "__proto__")), "__proto__ is ignored")
+  run expect(
+    Option<&NpmEntry>.isNone(&NpmIni.find(&entries, "sep")),
+    "a value with U+2028 is skipped as npm skips it",
+  )
+  run expect(textIs(&entries, "key", "value"), "a section key does not replace a top-level key")
+  let inner = match NpmIni.findIn(&entries, "sec", "key") {
+    Option<&NpmEntry>.Some { value } => &NpmIni.firstText(value) == &Option<string>.some("inner")
+    Option<&NpmEntry>.None => false
+  }
+  run expect(inner, "a key in a section is found with findIn")
+  let claimed = run NpmIni.parse(b"a=1\nb=\n[a]\nx=1\n[b]\ny=2\n")
+  run expect(
+    Option<&NpmEntry>.isNone(&NpmIni.findIn(&claimed, "a", "x")),
+    "a section named like a set key is dropped",
+  )
+  run expect(
+    Option<&NpmEntry>.isNone(&NpmIni.find(&claimed, "b")),
+    "an empty key is replaced by a section of its name",
+  )
+  run expect(
+    Option<&NpmEntry>.isSome(&NpmIni.findIn(&claimed, "b", "y")),
+    "the section that replaces an empty key keeps its keys",
+  )
+  let marked = run NpmIni.parse(b"\xEF\xBB\xBF[s]\nk=v\n")
+  run expect(
+    scalarCode(&marked, "[s]") == 1 && textIs(&marked, "k", "v"),
+    "a byte order mark stays, so the header is a key",
+  )
+}
+
+effect fn expandCases() -> ()
+  ! Failed | HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator {
+  let plain = run NpmConfig.expand("x${TOK}y")
+  run expect(String.view(&plain) == "xabcy", "a set variable is expanded")
+  let missing = run NpmConfig.expand("${MISSING}")
+  run expect(String.view(&missing) == "${MISSING}", "an unset variable stays")
+  let escaped = run NpmConfig.expand("\\${TOK}")
+  run expect(String.view(&escaped) == "${TOK}", "one backslash stops the expansion and is removed")
+  let doubled = run NpmConfig.expand("\\\\${TOK}")
+  run expect(
+    String.view(&doubled) == "\\abc",
+    "two backslashes become one and the variable is expanded",
+  )
+  let empty = run NpmConfig.expand("${EMPTY}x")
+  run expect(String.view(&empty) == "x", "a variable set to empty text expands to nothing")
+  let nested = run NpmConfig.expand("${a${TOK}}")
+  run expect(String.view(&nested) == "${aabc}", "a name cannot contain $ or {")
+}
+
+effect fn environmentCases() -> ()
+  ! Failed | HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator {
+  let layer = run NpmConfig.environmentLayer()
+  let mut config = NpmConfig.make()
+  run NpmConfig.addLayer(&mut config, move layer)
+  run expect(
+    &NpmConfig.flag(&config, "save-exact") == &Option<bool>.some(true),
+    "npm_config_save_exact sets save-exact to true",
+  )
+  run expect(
+    configText(&config, "registry", "https://env.test/"),
+    "the npm_config_ prefix matches in any case and the name is lowercased",
+  )
+  run expect(
+    configText(&config, "//env.test/:_authToken", "t-abc"),
+    "a // name keeps its case and its value is expanded",
+  )
+  run expect(configText(&config, "_under", "x"), "a leading _ is kept")
+  run expect(
+    Option<&NpmEntry>.isNone(&NpmConfig.get(&config, "empty")),
+    "an empty variable is skipped",
+  )
+}
+
+effect fn write(root: &Path, relative: string, text: &[u8]) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let path = run Path.resolve(root, relative)
+  run FileSystem.writeFileWithParents(&path, text)
+}
+
+fn layerFile(config: &NpmConfig, source: NpmConfigSource) -> Option<&Path> {
+  let layers = NpmConfig.layers(config)
+  let mut index = usize.ZERO
+  while index < layers.length {
+    let matches = match source {
+      NpmConfigSource.Project => match layers[index].source {
+        NpmConfigSource.Project => true
+        _ => false
+      }
+      NpmConfigSource.User => match layers[index].source {
+        NpmConfigSource.User => true
+        _ => false
+      }
+      NpmConfigSource.Global => match layers[index].source {
+        NpmConfigSource.Global => true
+        _ => false
+      }
+      _ => false
+    }
+    if matches {
+      return match &layers[index].file {
+        Option<Path>.Some { value } => Option<&Path>.some(&value)
+        Option<Path>.None => Option<&Path>.none()
+      }
+    }
+    index = index + usize.ONE
+  }
+  return Option<&Path>.none()
+}
+
+effect fn fileIs(config: &NpmConfig, source: NpmConfigSource, root: &Path, relative: string) -> bool
+  ! FileError | OutOfMemoryError
+  ? &mut Allocator {
+  let expected = run Path.resolve(root, relative)
+  return match layerFile(config, source) {
+    Option<&Path>.Some { value } => same(Path.rawBytes(value), Path.rawBytes(&expected))
+    Option<&Path>.None => false
+  }
+}
+
+effect fn withDirectory(environment: &mut Environment, root: &Path, relative: string) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let path = run Path.resolve(root, relative)
+  run FileSystem.createDirectoriesRecursively(&path)
+  environment.directory = run Bytes.copy(Path.rawBytes(&path))
+}
+
+effect fn credentials(config: &NpmConfig, url: string, package: string) -> Option<NpmCredentials>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return run NpmConfig.credentialsFor(config, url, NpmConfig.registryFor(config, package))
+}
+
+fn keyIs(found: &Option<NpmCredentials>, key: string) -> bool {
+  return match &found.* {
+    Option<NpmCredentials>.Some { value } => String.view(&value.registryKey) == key
+    Option<NpmCredentials>.None => false
+  }
+}
+
+fn bearerIs(found: &Option<NpmCredentials>, token: string) -> bool {
+  return match &found.* {
+    Option<NpmCredentials>.Some { value } => &NpmCredentials.token(&value)
+      == &Option<string>.some(token)
+    Option<NpmCredentials>.None => false
+  }
+}
+
+fn basicIs(found: &Option<NpmCredentials>, basic: string) -> bool {
+  return match &found.* {
+    Option<NpmCredentials>.Some { value } => match &value.basic {
+      Option<String>.Some { value: text } => String.view(&text) == basic
+      Option<String>.None => false
+    }
+    Option<NpmCredentials>.None => false
+  }
+}
+
+effect fn layerCases(root: &Path) -> ()
+  ! Failed | FileError | HostInputError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  run write(
+    root,
+    "home/.npmrc",
+    b"registry=https://user.test/\nuser-only=u\n//user.test/:_authToken=${TOK}\n",
+  )
+  run write(
+    root,
+    "prefix/etc/npmrc",
+    b"registry=https://global.test/\nglobal-only=g\nshared=global\n",
+  )
+  run write(root, "work/package.json", b"{\"workspaces\": [\"packages/*\"]}")
+  run write(
+    root,
+    "work/.npmrc",
+    b"shared=project\n@acme:registry=https://acme.test/npm/\n//acme.test/npm/:username=bob\n//acme.test/npm/:_password=c2VjcmV0\n",
+  )
+  run write(root, "work/packages/app/package.json", b"{}")
+  run write(root, "work/packages/app/.npmrc", b"ignored=yes\n")
+  let home = run Path.resolve(root, "home")
+  let prefix = run Path.resolve(root, "prefix")
+  let mut environment = Environment {
+    names: List<Bytes>.make(),
+    values: List<Bytes>.make(),
+    directory: Bytes.make(),
+  }
+  run define(&mut environment, "HOME", Path.rawBytes(&home))
+  run define(&mut environment, "PREFIX", Path.rawBytes(&prefix))
+  run define(&mut environment, "TOK", b"abc")
+  run withDirectory(&mut environment, root, "work/packages/app/src")
+  let commandLine = run NpmIni.parse(b"cli-only=c\n")
+  let config = run NpmConfig.load(
+    NpmConfigOptions { commandLine: Option<List<NpmEntry>>.some(move commandLine) },
+  )
+    |> Effect.provideMut<HostInput>(&mut environment)
+  run expect(
+    configText(&config, "registry", "https://user.test/"),
+    "the user file wins over the global file",
+  )
+  run expect(configText(&config, "shared", "project"), "the project file wins over the global file")
+  run expect(
+    configText(&config, "user-only", "u") && configText(&config, "global-only", "g")
+      && configText(&config, "cli-only", "c"),
+    "keys of every layer are visible",
+  )
+  run expect(
+    Option<&NpmEntry>.isNone(&NpmConfig.get(&config, "ignored")),
+    "a workspace .npmrc is not read",
+  )
+  run expect(
+    run fileIs(&config, NpmConfigSource.Project, root, "work/.npmrc"),
+    "the workspace root is the project directory",
+  )
+  run expect(
+    run fileIs(&config, NpmConfigSource.Global, root, "prefix/etc/npmrc"),
+    "the global file is in PREFIX/etc",
+  )
+  run expect(
+    NpmConfig.registryFor(&config, "@acme/x") == "https://acme.test/npm/",
+    "a scope uses its registry",
+  )
+  run expect(
+    NpmConfig.registryFor(&config, "left") == "https://user.test/",
+    "a plain package uses registry",
+  )
+  let user = run credentials(&config, "https://user.test/left/-/left-1.tgz", "left")
+  run expect(
+    keyIs(&user, "//user.test/") && bearerIs(&user, "abc"),
+    "the token of the registry covers its tarballs",
+  )
+  let acme = run credentials(&config, "https://acme.test/npm/@acme%2fx", "@acme/x")
+  run expect(basicIs(&acme, "Ym9iOnNlY3JldA=="), "username and _password become basic credentials")
+  let header = match &acme {
+    Option<NpmCredentials>.Some { value } => run NpmCredentials.authorization(&value)
+    Option<NpmCredentials>.None => Option<String>.none()
+  }
+  let headerOk = match &header {
+    Option<String>.Some { value } => String.view(&value) == "Basic Ym9iOnNlY3JldA=="
+    Option<String>.None => false
+  }
+  run expect(headerOk, "the authorization header of basic credentials")
+  let tarball = run credentials(&config, "https://acme.test/tarballs/x.tgz", "@acme/x")
+  run expect(
+    basicIs(&tarball, "Ym9iOnNlY3JldA=="),
+    "a URL on the registry host falls back to the registry credentials",
+  )
+  let other = run credentials(&config, "https://other.test/x.tgz", "@acme/x")
+  run expect(Option<NpmCredentials>.isNone(&other), "another host gets no credentials")
+
+  let globalLine = run NpmIni.parse(b"global=true\nuserconfig=~/alt.npmrc\n")
+  let globalConfig = run NpmConfig.load(
+    NpmConfigOptions { commandLine: Option<List<NpmEntry>>.some(move globalLine) },
+  )
+    |> Effect.provideMut<HostInput>(&mut environment)
+  run expect(
+    Option<&Path>.isNone(&layerFile(&globalConfig, NpmConfigSource.Project)),
+    "global mode skips the project file",
+  )
+  run expect(
+    run fileIs(&globalConfig, NpmConfigSource.User, root, "home/alt.npmrc"),
+    "userconfig moves the user file",
+  )
+  let missing = NpmConfig.layers(&globalConfig)
+  let mut recorded = false
+  let mut index = usize.ZERO
+  while index < missing.length {
+    match missing[index].source {
+      NpmConfigSource.User => {
+        recorded = Option<FileError>.isSome(&missing[index].error)
+          && List<NpmEntry>.length(&missing[index].entries) == 0
+      }
+      _ => {}
+    }
+    index = index + usize.ONE
+  }
+  run expect(recorded, "a missing file is an empty layer with its error")
+
+  run write(root, "nm/node_modules/.keep", b"")
+  run withDirectory(&mut environment, root, "nm/deep")
+  let modules = run NpmConfig.load(NpmConfigOptions {})
+    |> Effect.provideMut<HostInput>(&mut environment)
+  run expect(
+    run fileIs(&modules, NpmConfigSource.Project, root, "nm/.npmrc"),
+    "a node_modules directory marks the project",
+  )
+
+  run write(root, "home/node_modules/.keep", b"")
+  run withDirectory(&mut environment, root, "home")
+  let inHome = run NpmConfig.load(NpmConfigOptions {})
+    |> Effect.provideMut<HostInput>(&mut environment)
+  run expect(
+    Option<&Path>.isNone(&layerFile(&inHome, NpmConfigSource.Project)),
+    "the project file is skipped when it is the user file",
+  )
+}
+
+effect fn credentialCases() -> ()
+  ! Failed | HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator {
+  let text = b"//r.test/team/:_authToken=team\n//r.test/:_auth=YWJjOmRlZg==\n//r.test:8443/:certfile=/c.pem\n//r.test:8443/:keyfile=/k.pem\n_authToken=hostwide\n//empty.test/:_authToken=\n"
+  let layer = run NpmConfig.parseLayer(NpmConfigSource.User, Option<Path>.none(), text)
+  let mut config = NpmConfig.make()
+  run NpmConfig.addLayer(&mut config, move layer)
+  run expect(NpmConfig.registry(&config) == DEFAULT_REGISTRY, "the default registry")
+  let team = run NpmConfig.credentialsFor(&config, "https://r.test/team/pkg", DEFAULT_REGISTRY)
+  run expect(
+    keyIs(&team, "//r.test/team/") && bearerIs(&team, "team"),
+    "the longest key prefix wins",
+  )
+  let auth = run NpmConfig.credentialsFor(&config, "https://r.test/other", DEFAULT_REGISTRY)
+  run expect(
+    keyIs(&auth, "//r.test/") && basicIs(&auth, "YWJjOmRlZg=="),
+    "_auth is sent as basic credentials",
+  )
+  let certificate = run NpmConfig.credentialsFor(
+    &config,
+    "https://user:pw@r.test:8443/x?q#f",
+    DEFAULT_REGISTRY,
+  )
+  let certificateOk = match &certificate {
+    Option<NpmCredentials>.Some { value } => String.view(&value.registryKey) == "//r.test:8443/"
+      && Option<String>.isNone(&value.bearer)
+      && Option<String>.isSome(&value.certificateFile)
+      && Option<String>.isSome(&value.keyFile)
+    Option<NpmCredentials>.None => false
+  }
+  run expect(
+    certificateOk,
+    "a port, user, query and fragment are handled and a client certificate is found",
+  )
+  let empty = run NpmConfig.credentialsFor(&config, "https://empty.test/x", DEFAULT_REGISTRY)
+  run expect(
+    Option<NpmCredentials>.isNone(&empty),
+    "an empty token and a host-wide token are not used",
+  )
+  let nerf = run NpmConfig.nerfDart("https://registry.npmjs.org:443/a/b?c")
+  let nerfOk = match &nerf {
+    Option<String>.Some { value } => String.view(&value) == "//registry.npmjs.org/a/"
+    Option<String>.None => false
+  }
+  run expect(nerfOk, "nerfDart keeps the host and the directory of the path")
+}
+
+effect fn program() -> i32
+  ! Failed | FileError | HostInputError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  run parseCases()
+  let mut environment = Environment {
+    names: List<Bytes>.make(),
+    values: List<Bytes>.make(),
+    directory: Bytes.make(),
+  }
+  run define(&mut environment, "TOK", b"abc")
+  run define(&mut environment, "EMPTY", b"")
+  run define(&mut environment, "npm_config_save_exact", b"true")
+  run define(&mut environment, "NPM_CONFIG_Registry", b"https://env.test/")
+  run define(&mut environment, "npm_config_//env.test/:_authToken", b"t-${TOK}")
+  run define(&mut environment, "npm_config__under", b"x")
+  run define(&mut environment, "npm_config_empty", b"")
+  run expandCases() |> Effect.provideMut<HostInput>(&mut environment)
+  run environmentCases() |> Effect.provideMut<HostInput>(&mut environment)
+  run credentialCases() |> Effect.provideMut<HostInput>(&mut environment)
+  let root = run Path.root()
+  let scratch = run FileSystem.temporaryDirectory(&root, "silk-npm-config-")
+  let tree = run Path.fromBytes(Path.rawBytes(&scratch.path))
+  let outcome = run Effect.result(layerCases(&tree))
+  run FileSystem.release(move scratch)
+  return match move outcome {
+    Result<(), Failed | FileError | HostInputError | OutOfMemoryError>.Success { .. } => 0
+    Result<(), Failed | FileError | HostInputError | OutOfMemoryError>.Failure { error } => {
+      fail move error
+    }
+  }
+}
+
+effect fn failed(error: Failed | FileError | HostInputError | OutOfMemoryError) -> i32 {
+  return match move error {
+    Failed failure => {
+      StderrWriter.print("failed: {}\n", &.(failure.message))
+      return 1
+    }
+    FileError file => {
+      drop file
+      return 2
+    }
+    HostInputError input => {
+      drop input
+      return 3
+    }
+    OutOfMemoryError exhausted => {
+      drop exhausted
+      return 4
+    }
+  }
+}
+
+effect fn withFiles() -> i32
+  ! Failed | FileError | HostInputError | OutOfMemoryError
+  ? &mut Allocator {
+  let host = run hostRoot()
+  let mut files = run OsFileSystem.makeBytes(Bytes.asSlice(&host))
+  return run program() |> Effect.provideMut<FileSystem>(&mut files)
+}
+
+pub fn main() -> i32 {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(withFiles(), failed) |> Effect.provideMut<Allocator>(&mut allocator)
+}

@@ -91,6 +91,14 @@ argument: WindowsHostInput.argument
 variable: WindowsHostInput.variable
 ```
 
+<a id="WindowsHostInput.impl.HostInput.variableNames"></a>
+
+### Operation `variableNames`
+
+```silk
+variableNames: WindowsHostInput.variableNames
+```
+
 <a id="WindowsHostInput.impl.HostInput.workingDirectory"></a>
 
 ### Operation `workingDirectory`
