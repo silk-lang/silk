@@ -12,10 +12,11 @@
 
 import driver.ManifestFields
 import driver.Project as Projects {Project}
-import silk.compress.deflate {EncodeError, Encoder, Options as DeflateOptions}
+import silk.compress.deflate {EncodeError, EncodeWriter, Options as DeflateOptions}
 import silk.compress.inflate {Format}
 import silk.compress.tar {TarError, TarWriter}
-import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.io.writer {Writer, WriterError}
+import silk.mem.allocator {Allocator, OutOfMemoryError, SystemAllocator}
 import silk.mem.box {Box}
 import silk.collections.bytes {Bytes}
 import silk.collections.list {List}
@@ -386,6 +387,7 @@ pub effect fn archive(project: &Project, files: &[Bytes]) -> Packed
   run Bytes.append(&mut top, b"-")
   run Bytes.append(&mut top, version)
   let mut writer = TarWriter.make()
+  let mut gzip = run compressor()
   let mut at = usize.ZERO
   while at < files.length {
     let relative = Bytes.asSlice(&files[at])
@@ -394,40 +396,76 @@ pub effect fn archive(project: &Project, files: &[Bytes]) -> Packed
     let mut member = run Bytes.copy(Bytes.asSlice(&top))
     run Bytes.append(&mut member, b"/")
     run Bytes.append(&mut member, relative)
-    match move run Effect.result(TarWriter.file(&mut writer, Bytes.asSlice(&member), Bytes.asSlice(&content), false)) {
-      Result<(), TarError | OutOfMemoryError>.Success {..} => ()
-      Result<(), TarError | OutOfMemoryError>.Failure {error} => match move error {
-        TarError _unsafe => { fail run refuse(&[relative, b" cannot be stored in a tar archive"]) }
-        OutOfMemoryError exhausted => { fail move exhausted }
-      }
-    }
+    run store(&mut writer, &mut gzip, Bytes.asSlice(&member), relative, Bytes.asSlice(&content), false)
   }
-  let tar = run TarWriter.finish(move writer)
-  let bytes = run gzip(Bytes.asSlice(&tar))
+  let bytes = run finished(move writer, move gzip)
   let mut fileName = run Bytes.copy(Bytes.asSlice(&top))
   run Bytes.append(&mut fileName, b".tar.gz")
   return Packed {stem: move top, fileName: move fileName, bytes: move bytes, files: files.length}
 }
 
-/// The gzip stream of `data` at the best compression level, with the zero timestamp the encoder
-/// always writes.
-pub effect fn gzip(data: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
-  let bound = match Encoder.encodedBound(data.length, Format.Gzip) {
-    Option<usize>.Some {value} => value
-    Option<usize>.None => { fail OutOfMemoryError {} }
+// A `Writer` that keeps a packed archive's gzip stream in memory.
+struct Collected {
+  bytes: Bytes,
+  allocator: SystemAllocator,
+}
+
+impl Writer for Collected {
+  effect fn writeAll(self: &mut Self, value: &[u8]) -> () ! WriterError ? &mut Writer {
+    let appended = run Effect.result(Bytes.append(&mut self.bytes, value) |> Effect.provideMut<Allocator>(&mut self.allocator))
+    match move appended {
+      Result<(), OutOfMemoryError>.Success {..} => ()
+      Result<(), OutOfMemoryError>.Failure {..} => { fail Writer.failure() }
+    }
   }
-  let mut output = run Bytes.zeroed(bound)
-  let encoded = run Effect.result(Encoder.encode(data, Bytes.asMutSlice(&mut output), Format.Gzip, DeflateOptions.make(9)))
-  let written = match move encoded {
-    Result<usize, OutOfMemoryError | EncodeError>.Success {value} => value
-    Result<usize, OutOfMemoryError | EncodeError>.Failure {error} => match move error {
+
+  effect fn flush(self: &mut Self) -> () ! WriterError ? &mut Writer { return () }
+}
+
+// The gzip writer a packed archive's tar stream goes through, at the best compression level,
+// with the zero timestamp the encoder always writes.
+effect fn compressor() -> EncodeWriter<Collected> ! OutOfMemoryError ? &mut Allocator {
+  let sink = Collected {bytes: Bytes.make(), allocator: Allocator.systemAllocatorProvider()}
+  let made = run Effect.result(EncodeWriter<Collected>.make(move sink, Format.Gzip, DeflateOptions.make(9)))
+  return match move made {
+    Result<EncodeWriter<Collected>, OutOfMemoryError | EncodeError>.Success {value} => move value
+    Result<EncodeWriter<Collected>, OutOfMemoryError | EncodeError>.Failure {error} => match move error {
       OutOfMemoryError exhausted => { fail move exhausted }
-      // A buffer of `encodedBound` bytes never fills, and level 9 is a valid option.
+      // Level 9 is a valid option.
       EncodeError _impossible => { fail OutOfMemoryError {} }
     }
   }
-  Bytes.truncate(&mut output, written)
-  return move output
+}
+
+// Adds one file to the archive, refusing a path tar cannot store. `shown` names the file in the
+// refusal.
+effect fn store(writer: &mut TarWriter, gzip: &mut EncodeWriter<Collected>, member: &[u8], shown: &[u8], content: &[u8], executable: bool) -> ()
+  ! PackRefused | OutOfMemoryError
+  ? &mut Allocator {
+  let added = run Effect.result(TarWriter.file(&mut writer.*, member, content, executable) |> Effect.provideMut<Writer>(&mut gzip.*))
+  return match move added {
+    Result<(), TarError | WriterError>.Success {..} => ()
+    Result<(), TarError | WriterError>.Failure {error} => match move error {
+      TarError _unsafe => { fail run refuse(&[shown, b" cannot be stored in a tar archive"]) }
+      // Only the in-memory stream can fail, when it cannot grow.
+      WriterError _full => { fail OutOfMemoryError {} }
+    }
+  }
+}
+
+// Ends the archive and returns its gzip stream.
+effect fn finished(writer: TarWriter, gzip: EncodeWriter<Collected>) -> Bytes ! OutOfMemoryError {
+  let mut stream = move gzip
+  let ended = run Effect.result(TarWriter.finish(move writer) |> Effect.provideMut<Writer>(&mut stream))
+  match move ended {
+    Result<(), TarError | WriterError>.Success {..} => ()
+    // Every file got all its content, and only the in-memory stream can fail.
+    Result<(), TarError | WriterError>.Failure {..} => { fail OutOfMemoryError {} }
+  }
+  return match move run Effect.result(EncodeWriter<Collected>.finish(move stream)) {
+    Result<Collected, WriterError>.Success {value} => move value.bytes
+    Result<Collected, WriterError>.Failure {..} => { fail OutOfMemoryError {} }
+  }
 }
 
 /// The binary archive of `project` for one built executable at `executable`: the
@@ -449,12 +487,13 @@ pub effect fn binaryArchive(project: &Project, platform: &[u8], executable: &Pat
   run Bytes.append(&mut top, b"-")
   run Bytes.append(&mut top, platform)
   let mut writer = TarWriter.make()
+  let mut gzip = run compressor()
   let mut count = usize.ZERO
   let program = run FileSystem.readFile(executable)
   let mut member = run Bytes.copy(Bytes.asSlice(&top))
   run Bytes.append(&mut member, b"/bin/")
   run Bytes.append(&mut member, lastName(Path.rawBytes(executable)))
-  run store(&mut writer, Bytes.asSlice(&member), Bytes.asSlice(&program), true)
+  run store(&mut writer, &mut gzip, Bytes.asSlice(&member), Bytes.asSlice(&member), Bytes.asSlice(&program), true)
   count = count + usize.ONE
   let mut at = usize.ZERO
   while at < files.length {
@@ -465,23 +504,11 @@ pub effect fn binaryArchive(project: &Project, platform: &[u8], executable: &Pat
     let mut named = run Bytes.copy(Bytes.asSlice(&top))
     run Bytes.append(&mut named, b"/")
     run Bytes.append(&mut named, relative)
-    run store(&mut writer, Bytes.asSlice(&named), Bytes.asSlice(&content), false)
+    run store(&mut writer, &mut gzip, Bytes.asSlice(&named), Bytes.asSlice(&named), Bytes.asSlice(&content), false)
     count = count + usize.ONE
   }
-  let tar = run TarWriter.finish(move writer)
-  let bytes = run gzip(Bytes.asSlice(&tar))
+  let bytes = run finished(move writer, move gzip)
   let mut fileName = run Bytes.copy(Bytes.asSlice(&top))
   run Bytes.append(&mut fileName, b".tar.gz")
   return Packed {stem: move top, fileName: move fileName, bytes: move bytes, files: count}
-}
-
-// Adds one file to `writer`, refusing a path tar cannot store.
-effect fn store(writer: &mut TarWriter, member: &[u8], content: &[u8], executable: bool) -> () ! PackRefused | OutOfMemoryError ? &mut Allocator {
-  return match move run Effect.result(TarWriter.file(&mut writer.*, member, content, executable)) {
-    Result<(), TarError | OutOfMemoryError>.Success {..} => ()
-    Result<(), TarError | OutOfMemoryError>.Failure {error} => match move error {
-      TarError _unsafe => { fail run refuse(&[member, b" cannot be stored in a tar archive"]) }
-      OutOfMemoryError exhausted => { fail move exhausted }
-    }
-  }
 }

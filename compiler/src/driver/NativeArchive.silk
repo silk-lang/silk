@@ -18,7 +18,7 @@ import driver.NativeLinkInput as NativeLinkInputs {Archive, NativeLinkInput}
 import silk.mem.allocator {Allocator, OutOfMemoryError}
 import silk.collections.bytes {Bytes}
 import silk.core.effect {Effect}
-import silk.compress.tar {TarError, TarKind, TarMember, TarReader}
+import silk.compress.tar {TarError, TarKind, TarProgress, TarReader, TarStatus}
 import silk.compress.zip {ZipError, ZipKind, ZipMember, ZipReader}
 import silk.compress.inflate {DecodeError, Decoder, Format as InflateFormat, Limits as InflateLimits, MEMORY_BOUND as INFLATE_MEMORY_BOUND, Progress, Status as InflateStatus}
 import silk.crypto.sha2 {Sha256}
@@ -192,18 +192,14 @@ pub effect fn extractArchive(content: &[u8], destination: &Path, strip: usize) -
     && ((content[usize.add(0, 2)] == 3 && content[usize.add(0, 3)] == 4) || (content[usize.add(0, 2)] == 5 && content[usize.add(0, 3)] == 6)) {
     return run extractZip(content, destination, strip)
   }
-  let mut tar = Bytes.make()
+  let mut extraction = Extraction {reader: TarReader.make(), target: Option<Path>.none(), file: Bytes.make()}
   if content.length >= usize.add(0, 2) && content[usize.ZERO] == 31 && content[usize.ONE] == 139 {
-    tar = match move run gunzip(content) {
-      Option<Bytes>.Some {value} => move value
-      Option<Bytes>.None => { return Option<Bytes>.some(run Bytes.copy(b"it is not valid gzip")) }
-    }
-  } else if content.length > usize.add(0, 262) && same(Slice.view<u8>(content, usize.add(0, 257), usize.add(0, 5)), b"ustar") {
-    tar = run Bytes.copy(content)
-  } else {
-    return Option<Bytes>.some(run Bytes.copy(b"it is neither a gzip-compressed or plain tar archive nor a ZIP archive"))
+    return run extractGzip(content, &mut extraction, destination, strip)
   }
-  return run extract(Bytes.asSlice(&tar), destination, strip)
+  if content.length > usize.add(0, 262) && same(Slice.view<u8>(content, usize.add(0, 257), usize.add(0, 5)), b"ustar") {
+    return run extractTar(&mut extraction, content, true, destination, strip)
+  }
+  return Option<Bytes>.some(run Bytes.copy(b"it is neither a gzip-compressed or plain tar archive nor a ZIP archive"))
 }
 
 // Extracts the ZIP archive `zip` into `destination`, answering why it was refused, or none.
@@ -300,8 +296,10 @@ effect fn download(url: &[u8]) -> Result<Bytes, Bytes> ! HostInputError | OutOfM
   }
 }
 
-// The tar stream inside the gzip file `data`, or none when it is not valid gzip.
-effect fn gunzip(data: &[u8]) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+// Decodes the gzip file `data` and extracts the tar stream inside it as it is decoded, so the
+// whole tar stream is never held in memory. Answers why the archive was refused, or none.
+effect fn extractGzip(data: &[u8], extraction: &mut Extraction, destination: &Path, strip: usize) -> Option<Bytes>
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
   let limits = InflateLimits {
     maxInputBytes: usize.toU64(data.length),
     maxOutputBytes: MAX_EXTRACTED_BYTES,
@@ -314,24 +312,26 @@ effect fn gunzip(data: &[u8]) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocat
     Result<Decoder, OutOfMemoryError | DecodeError>.Success {value} => move value
     Result<Decoder, OutOfMemoryError | DecodeError>.Failure {error} => match move error {
       OutOfMemoryError exhausted => { fail move exhausted }
-      DecodeError _invalid => { return Option<Bytes>.none() }
+      DecodeError _invalid => { return Option<Bytes>.some(run Bytes.copy(b"it is not valid gzip")) }
     }
   }
-  let mut output = Bytes.make()
   let mut chunk: [u8; 65536] = [0; 65536]
   let mut offset = usize.ZERO
   while true {
     let input = Slice.view<u8>(data, offset, data.length - offset)
     let progress = match Decoder.step(&mut decoder, input, &mut chunk, true) {
       Result<Progress, DecodeError>.Success {value} => move value
-      Result<Progress, DecodeError>.Failure {..} => { return Option<Bytes>.none() }
+      Result<Progress, DecodeError>.Failure {..} => { return Option<Bytes>.some(run Bytes.copy(b"it is not valid gzip")) }
     }
     offset = offset + progress.consumed
-    run Bytes.append(&mut output, Slice.view<u8>(&chunk, usize.ZERO, progress.written))
-    if progress.status == InflateStatus.Finished { return Option<Bytes>.some(move output) }
-    if progress.consumed == usize.ZERO && progress.written == usize.ZERO { return Option<Bytes>.none() }
+    let finished = progress.status == InflateStatus.Finished
+    let refusal = run extractTar(&mut extraction.*, Slice.view<u8>(&chunk, usize.ZERO, progress.written), finished, destination, strip)
+    if Option<Bytes>.isSome(&refusal) || finished { return move refusal }
+    if progress.consumed == usize.ZERO && progress.written == usize.ZERO {
+      return Option<Bytes>.some(run Bytes.copy(b"it is not valid gzip"))
+    }
   }
-  return Option<Bytes>.some(move output)
+  return Option<Bytes>.none()
 }
 
 // The path below the archive directory that member `path` extracts to, after dropping `strip`
@@ -361,37 +361,69 @@ effect fn memberPath(path: &[u8], strip: usize) -> Result<Option<Bytes>, Bytes> 
   return Result<Option<Bytes>, Bytes>.succeed(Option<Bytes>.some(move kept))
 }
 
-// Extracts the tar stream `tar` into `destination`, answering why it was refused, or none.
-effect fn extract(tar: &[u8], destination: &Path, strip: usize) -> Option<Bytes>
+// A tar stream being extracted: its reader, and the file whose content is arriving with the
+// bytes it has so far.
+struct Extraction {
+  reader: TarReader,
+  target: Option<Path>,
+  file: Bytes,
+}
+
+// Gives `input`, the next bytes of the tar stream, to the reader, and writes each directory and
+// file it completes below `destination`. `last` marks the end of the stream. Answers why the
+// archive was refused, or none.
+effect fn extractTar(extraction: &mut Extraction, input: &[u8], last: bool, destination: &Path, strip: usize) -> Option<Bytes>
 ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  let mut reader = TarReader.open(tar)
+  let mut offset = usize.ZERO
   while true {
-    let next = match TarReader.next(&mut reader) {
-      Result.Success {value} => move value
-      Result.Failure {error} => { return Option<Bytes>.some(run Bytes.copy(String.utf8Bytes(TarError.describe(error)))) }
+    let rest = Slice.view<u8>(input, offset, input.length - offset)
+    let progress = match TarReader.step(&mut extraction.reader, rest, last) {
+      Result<TarProgress, TarError>.Success {value} => value
+      Result<TarProgress, TarError>.Failure {error} => { return Option<Bytes>.some(run Bytes.copy(String.utf8Bytes(TarError.describe(error)))) }
     }
-    let member = match move next {
-      Option<TarMember>.Some {value} => move value
-      Option<TarMember>.None => { return Option<Bytes>.none() }
+    offset = offset + progress.consumed
+    if progress.status == TarStatus.NeedInput || progress.status == TarStatus.End { return Option<Bytes>.none() }
+    if progress.status == TarStatus.Content && Option<Path>.isSome(&extraction.target) {
+      run Bytes.append(&mut extraction.file, Slice.view<u8>(rest, usize.ZERO, progress.consumed))
     }
-    if member.kind == TarKind.File || member.kind == TarKind.Directory {
-      let mut path = run Bytes.copy(member.prefix)
-      if member.prefix.length > usize.ZERO && member.name.length > usize.ZERO { run Bytes.append(&mut path, b"/") }
-      run Bytes.append(&mut path, member.name)
-      let relative = match move run memberPath(Bytes.asSlice(&path), strip) {
-        Result<Option<Bytes>, Bytes>.Success {value} => move value
-        Result<Option<Bytes>, Bytes>.Failure {error} => { return Option<Bytes>.some(move error) }
+    if progress.status == TarStatus.Member {
+      Bytes.clear(&mut extraction.file)
+      extraction.target = match move run started(&extraction.reader, destination, strip) {
+        Result<Option<Path>, Bytes>.Success {value} => move value
+        Result<Option<Path>, Bytes>.Failure {error} => { return Option<Bytes>.some(move error) }
       }
-      if let Option<Bytes>.Some {value: below} = move relative {
-        let target = run Path.joinBytes(destination, Bytes.asSlice(&below))
-        if member.kind == TarKind.Directory {
-          run FileSystem.createDirectoriesRecursively(&target)
-        } else {
-          if let Option<Path>.Some {value: parent} = move run Path.parent(&target) { run FileSystem.createDirectoriesRecursively(&parent) }
-          run FileSystem.writeFile(&target, member.content)
-        }
-      }
+    }
+    if TarReader.remaining(&extraction.reader) == usize.toU64(usize.ZERO) {
+      let target = Intrinsic.replace(extraction.target, Option<Path>.none())
+      if let Option<Path>.Some {value} = move target { run FileSystem.writeFile(&value, Bytes.asSlice(&extraction.file)) }
     }
   }
   return Option<Bytes>.none()
+}
+
+// Starts the member the reader just reported: creates a directory, or creates a file's parent
+// directories and answers the path its content goes to. Answers none for a link, a special member,
+// or a member the strip removes, and a refusal for an unsafe path.
+effect fn started(reader: &TarReader, destination: &Path, strip: usize) -> Result<Option<Path>, Bytes>
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let member = TarReader.member(reader)
+  if member.kind != TarKind.File && member.kind != TarKind.Directory { return Result<Option<Path>, Bytes>.succeed(Option<Path>.none()) }
+  let mut path = run Bytes.copy(member.prefix)
+  if member.prefix.length > usize.ZERO && member.name.length > usize.ZERO { run Bytes.append(&mut path, b"/") }
+  run Bytes.append(&mut path, member.name)
+  let relative = match move run memberPath(Bytes.asSlice(&path), strip) {
+    Result<Option<Bytes>, Bytes>.Success {value} => move value
+    Result<Option<Bytes>, Bytes>.Failure {error} => { return Result<Option<Path>, Bytes>.failResult(move error) }
+  }
+  let below = match move relative {
+    Option<Bytes>.Some {value} => move value
+    Option<Bytes>.None => { return Result<Option<Path>, Bytes>.succeed(Option<Path>.none()) }
+  }
+  let target = run Path.joinBytes(destination, Bytes.asSlice(&below))
+  if member.kind == TarKind.Directory {
+    run FileSystem.createDirectoriesRecursively(&target)
+    return Result<Option<Path>, Bytes>.succeed(Option<Path>.none())
+  }
+  if let Option<Path>.Some {value: parent} = move run Path.parent(&target) { run FileSystem.createDirectoriesRecursively(&parent) }
+  return Result<Option<Path>, Bytes>.succeed(Option<Path>.some(move target))
 }

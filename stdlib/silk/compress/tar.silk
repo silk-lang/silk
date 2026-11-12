@@ -1,19 +1,24 @@
-//! Read and write tar archives held in memory.
+//! Read and write tar archives as streams, one block of bytes at a time.
 //!
 //! # When to use
-//! Use a [`TarReader`] to unpack a `.tar` file, or a `.tar.gz` file after you decode it with
-//! `silk.compress.inflate`. Open the archive with [`TarReader.open`] and call [`TarReader.next`]
-//! until it returns none. Use a [`TarWriter`] to make one: add members with [`TarWriter.file`] and
-//! [`TarWriter.directory`], then take the bytes with [`TarWriter.finish`], and compress them with
-//! `silk.compress.deflate` for a `.tar.gz`. This module does not compress or decompress.
+//! Use a [`TarReader`] to unpack a `.tar` file, or a `.tar.gz` file as a
+//! `silk.compress.inflate.Decoder` decodes it. Give it the archive in pieces of any size with
+//! [`TarReader.step`]: it reports each member's header, then the member's content, and it never
+//! holds more than one header block. Use a [`TarWriter`] to write an archive to the ambient
+//! `silk.io.writer.Writer`: add members with [`TarWriter.file`] and [`TarWriter.directory`], or
+//! send a large file in pieces with [`TarWriter.beginFile`] and [`TarWriter.writeContent`], and
+//! end the archive with [`TarWriter.finish`]. For a `.tar.gz`, provide a
+//! `silk.compress.deflate.EncodeWriter` as the `Writer`. This module does not compress or
+//! decompress.
 //!
 //! # Details
-//! The reader understands ustar, GNU, and pax archives: the ustar `prefix` field, GNU long names,
-//! pax `path` records, and base-256 sizes. It does not allocate, and every member it returns
-//! borrows the archive. Each header's checksum is checked. A member's path is checked before the
-//! member is returned: an absolute path, a backslash, a NUL, or a `..` segment refuses the archive, so a
-//! caller that joins a path to a directory and creates no links never writes outside it. Empty and
-//! `.` segments are allowed, because `tar -C dir .` writes paths such as `./include/x.h`.
+//! The reader understands ustar, GNU, and pax archives: the ustar `prefix` field, GNU long names
+//! and long link names, pax `path`, `linkpath`, and `size` records, and base-256 numbers. It does
+//! not allocate and does not keep a borrow of your input. Each header's checksum is checked. A
+//! member's path is checked before the member is reported: an absolute path, a backslash, a NUL,
+//! or a `..` segment refuses the archive, so a caller that joins a path to a directory and creates
+//! no links never writes outside it. Empty and `.` segments are allowed, because `tar -C dir .`
+//! writes paths such as `./include/x.h`.
 //!
 //! The writer writes ustar headers with fixed metadata: modification time 0, owner and group 0
 //! with no names, and mode 644, or 755 for an executable file or a directory. A path longer than
@@ -22,30 +27,35 @@
 //! the archive names its content.
 //!
 //! # Errors
-//! - [`TarError`] from [`TarReader.next`] when a header is corrupt, the archive ends inside a
-//!   member, or a path is unsafe.
-//! - [`TarError`] from [`TarWriter.file`] and [`TarWriter.directory`] when a path is one the
-//!   reader would refuse: empty, absolute, ending in `/`, or with a backslash, a NUL or a `..`
-//!   segment.
+//! - [`TarError`] from [`TarReader.step`] when a header is corrupt, the archive ends inside a
+//!   member, a path is unsafe, or a long path does not fit the reader.
+//! - [`TarError`] from the writer when a path is one the reader would refuse, or when the members
+//!   and their content come in the wrong order.
+//! - `WriterError` from the writer when the ambient `Writer` fails.
 //!
 //! # Examples
+//! ## Count the files of an archive given in small pieces
 //! ```silk
-//! import silk.compress.tar {TarError, TarKind, TarMember, TarReader}
-//! import silk.core.option {Option}
+//! import silk.collections.slice {Slice}
+//! import silk.compress.tar {TarError, TarKind, TarProgress, TarReader, TarStatus}
 //! import silk.core.result {Result}
 //!
-//! // Counts the regular files of `archive`, or answers -1 when it is not a valid tar archive.
+//! // Counts the regular files of `archive`, or answers -1 when it is not a valid tar archive. It
+//! // gives the reader 100 bytes at a time, as a network or a decompressor would.
 //! fn files(archive: &[u8]) -> i32 {
-//!   let mut reader = TarReader.open(archive)
+//!   let mut reader = TarReader.make()
 //!   let mut count = 0
+//!   let mut offset: usize = 0
 //!   while true {
-//!     match TarReader.next(&mut reader) {
-//!       Result<Option<TarMember>, TarError>.Success {value} => match move value {
-//!         Option<TarMember>.Some {value: member} => { if member.kind == TarKind.File { count = count + 1 } }
-//!         Option<TarMember>.None => { return count }
-//!       }
-//!       Result<Option<TarMember>, TarError>.Failure {..} => { return -1 }
+//!     let length = if archive.length - offset < 100 { archive.length - offset } else { 100 }
+//!     let last = offset + length == archive.length
+//!     let progress = match TarReader.step(&mut reader, Slice.view<u8>(archive, offset, length), last) {
+//!       Result<TarProgress, TarError>.Success {value} => value
+//!       Result<TarProgress, TarError>.Failure {..} => { return -1 }
 //!     }
+//!     offset = offset + progress.consumed
+//!     if progress.status == TarStatus.Member && TarReader.member(&reader).kind == TarKind.File { count = count + 1 }
+//!     if progress.status == TarStatus.End { return count }
 //!   }
 //!   return count
 //! }
@@ -58,34 +68,54 @@
 //!
 //! ## Write an archive and read it back
 //! ```silk
-//! import silk.collections.bytes {Bytes}
-//! import silk.compress.tar {TarError, TarMember, TarReader, TarWriter}
+//! import silk.collections.slice {Slice}
+//! import silk.compress.tar {TarError, TarProgress, TarReader, TarStatus, TarWriter}
 //! import silk.core.effect {Effect}
-//! import silk.core.option {Option}
 //! import silk.core.result {Result}
-//! import silk.mem.allocator {Allocator, OutOfMemoryError}
+//! import silk.io.writer {Writer, WriterError}
 //!
-//! effect fn archive() -> Bytes ! TarError | OutOfMemoryError ? &mut Allocator {
+//! // A `Writer` that keeps up to 8 KiB in memory.
+//! struct Memory {
+//!   bytes: [u8; 8192],
+//!   length: usize,
+//! }
+//!
+//! impl Writer for Memory {
+//!   effect fn writeAll(self: &mut Self, value: &[u8]) -> () ! WriterError ? &mut Writer {
+//!     if value.length > 8192 - self.length { fail Writer.failure() }
+//!     Slice.copyInto<u8>(&mut self.bytes, self.length, value)
+//!     self.length = self.length + value.length
+//!   }
+//!
+//!   effect fn flush(self: &mut Self) -> () ! WriterError ? &mut Writer { return () }
+//! }
+//!
+//! effect fn archive() -> () ! TarError | WriterError ? &mut Writer {
 //!   let mut writer = TarWriter.make()
 //!   run TarWriter.directory(&mut writer, b"app/bin")
 //!   run TarWriter.file(&mut writer, b"app/bin/run", b"#!/bin/sh\n", true)
-//!   run TarWriter.file(&mut writer, b"app/README", b"hello\n", false)
+//!   // A file whose content arrives in pieces.
+//!   run TarWriter.beginFile(&mut writer, b"app/README", 6, false)
+//!   run TarWriter.writeContent(&mut writer, b"hel")
+//!   run TarWriter.writeContent(&mut writer, b"lo\n")
 //!   return run TarWriter.finish(move writer)
 //! }
 //!
-//! pub effect fn main() -> i32 ! TarError | OutOfMemoryError {
-//!   let mut allocator = Allocator.systemAllocatorProvider()
-//!   let bytes = run archive() |> Effect.provideMut<Allocator>(&mut allocator)
-//!   let mut reader = TarReader.open(Bytes.asSlice(&bytes))
+//! pub effect fn main() -> i32 ! TarError | WriterError {
+//!   let mut memory = Memory {bytes: [0; 8192], length: 0}
+//!   run archive() |> Effect.provideMut<Writer>(&mut memory)
+//!   let mut reader = TarReader.make()
+//!   let mut offset: usize = 0
 //!   let mut members = 0
 //!   while true {
-//!     match TarReader.next(&mut reader) {
-//!       Result<Option<TarMember>, TarError>.Success {value} => match move value {
-//!         Option<TarMember>.Some {..} => { members = members + 1 }
-//!         Option<TarMember>.None => { break }
-//!       }
-//!       Result<Option<TarMember>, TarError>.Failure {..} => { return 1 }
+//!     let input = Slice.view<u8>(&memory.bytes, offset, memory.length - offset)
+//!     let progress = match TarReader.step(&mut reader, input, true) {
+//!       Result<TarProgress, TarError>.Success {value} => value
+//!       Result<TarProgress, TarError>.Failure {..} => { return 1 }
 //!     }
+//!     offset = offset + progress.consumed
+//!     if progress.status == TarStatus.Member { members = members + 1 }
+//!     if progress.status == TarStatus.End { break }
 //!   }
 //!   return if members == 3 { 0 } else { 2 }
 //! }
@@ -93,10 +123,9 @@
 //!
 //! @category Data formats
 
-import silk.collections.bytes {Bytes}
 import silk.collections.slice {Slice}
-import silk.mem.allocator {Allocator, OutOfMemoryError}
 import silk.core.option {Option}
+import silk.core.ownership {Copy}
 import silk.core.result {Result}
 import silk.io.writer {Writer, WriterError}
 import silk.text.format {Debug, Format as TextFormat, Formatter}
@@ -104,15 +133,22 @@ import silk.num.u8
 import silk.num.u64
 import silk.num.usize
 
-/// The reason a tar archive was refused.
+/// The reason a tar archive was refused, or a reader or writer was used out of order.
 pub enum TarError {
   /// The archive ends inside a header or inside a member's content.
   Truncated,
-  /// A header's checksum does not match its bytes, or a number field holds something other than
-  /// an octal or base-256 number.
+  /// A header's checksum does not match its bytes, a number field holds something other than an
+  /// octal or base-256 number, or a pax record is malformed.
   BadHeader,
   /// A member path is absolute, holds a backslash or a NUL, or has a `..` segment.
   UnsafePath,
+  /// A GNU long name or long link name, or a pax `path` or `linkpath` record, is longer than
+  /// [`PATH_LIMIT`] bytes.
+  PathTooLong,
+  /// A [`TarWriter`] call came in the wrong order: a new member or the end of the archive before
+  /// the current file got all its content, or more content than the file's size. Or a
+  /// [`TarReader`] was used after it failed.
+  InvalidUse,
 }
 
 impl TarError {
@@ -122,6 +158,8 @@ impl TarError {
       TarError.Truncated => "the tar archive is truncated"
       TarError.BadHeader => "a tar header is corrupt"
       TarError.UnsafePath => "the tar archive holds a path outside its directory"
+      TarError.PathTooLong => "the tar archive holds a path longer than 4096 bytes"
+      TarError.InvalidUse => "the tar reader or writer was used out of order"
     }
   }
 }
@@ -133,33 +171,37 @@ impl Debug for TarError {
       TarError.Truncated => run TextFormat.write(&mut formatter, b"Truncated")
       TarError.BadHeader => run TextFormat.write(&mut formatter, b"BadHeader")
       TarError.UnsafePath => run TextFormat.write(&mut formatter, b"UnsafePath")
+      TarError.PathTooLong => run TextFormat.write(&mut formatter, b"PathTooLong")
+      TarError.InvalidUse => run TextFormat.write(&mut formatter, b"InvalidUse")
     }
   }
 }
 
+/// The longest path or link target, in bytes, that a GNU long-name header or a pax record can give
+/// a [`TarReader`]: 4096, the `PATH_MAX` of Linux.
+pub const PATH_LIMIT: usize = 4096
+
 /// What a tar member is.
 pub enum TarKind {
-  /// A regular file. Its bytes are the member's `content`.
+  /// A regular file. Its bytes come as `Content` progress after its `Member` progress.
   File,
   /// A directory. Its `name` has no trailing `/`, and it has no content.
   Directory,
-  /// A symbolic link to `link`, which the reader does not check. A target longer than the
-  /// 100-byte header field comes back cut to that field.
+  /// A symbolic link to `link`, which the reader does not check.
   SymbolicLink,
-  /// A hard link to the earlier member `link`, which the reader does not check. A target longer
-  /// than the 100-byte header field comes back cut to that field.
+  /// A hard link to the earlier member `link`, which the reader does not check.
   HardLink,
   /// A device, a FIFO, or a type this module does not know.
   Other,
 }
 
-/// One member of a tar archive: its checked path, its kind, and its content.
+/// The header of one member of a tar archive: its checked path, its kind, and its size.
 ///
 /// # Details
 /// The member's path is `prefix/name`, `name` alone when `prefix` is empty, or `prefix` alone when
-/// `name` is empty, as ustar writes a long directory path. A GNU long name or a
-/// pax `path` record comes back as `name` with an empty `prefix`. The slices borrow the archive
-/// given to [`TarReader.open`].
+/// `name` is empty, as ustar writes a long directory path. A GNU long name or a pax `path` record
+/// comes back as `name` with an empty `prefix`. The slices borrow the [`TarReader`], so copy what
+/// you keep before the next [`TarReader.step`].
 pub struct TarMember<'a> {
   /// The ustar `prefix` field, or empty.
   pub prefix: &'a [u8],
@@ -169,33 +211,113 @@ pub struct TarMember<'a> {
   pub kind: TarKind,
   /// Whether the member is a file whose mode has an execute permission bit.
   pub executable: bool,
-  /// The target of a symbolic or hard link from the header's 100-byte link field, or empty. GNU
-  /// long link names and pax `linkpath` records are not read.
+  /// The target of a symbolic or hard link, from a GNU long link name, a pax `linkpath` record, or
+  /// the header's 100-byte link field. It is empty for other kinds.
   pub link: &'a [u8],
-  /// The bytes of a regular file. It is empty for a directory or a link.
-  pub content: &'a [u8],
+  /// The number of content bytes of a regular file. It is zero for other kinds.
+  pub size: u64,
 }
 
-/// A position in a tar archive held in memory.
+/// What a successful [`TarReader.step`] found.
+pub enum TarStatus {
+  /// All input is consumed and the archive goes on. Call again with more input.
+  NeedInput,
+  /// A member's header is complete. Read it with [`TarReader.member`] before the next step. The
+  /// content of a file follows as `Content` progress.
+  Member,
+  /// The first `consumed` bytes of the input are content of the current file, in order. Call
+  /// [`TarReader.remaining`] to learn how many more follow.
+  Content,
+  /// The archive ended, at its end-of-archive block or at the end of the final input. Later steps
+  /// return `End` and consume nothing.
+  End,
+}
+
+/// The result of one successful [`TarReader.step`].
+pub struct TarProgress {
+  /// The number of input bytes that this call consumed, from the start of the input.
+  pub consumed: usize,
+  /// What the reader found.
+  pub status: TarStatus,
+}
+
+impl Copy for TarProgress {}
+
+/// A tar reader that takes the archive in pieces of any size.
 ///
 /// # When to use
-/// Make one with [`TarReader.open`] and call [`TarReader.next`] until it returns none.
+/// Make one with [`TarReader.make`] and call [`TarReader.step`] with the archive's bytes until it
+/// returns `End`. Each call consumes a prefix of its input, and the next call takes the input
+/// after that prefix. The archive can come from memory, a file, a socket, or a
+/// `silk.compress.inflate.Decoder`.
 ///
 /// # Details
-/// The reader does not allocate and borrows the archive. It stops at the first all-zero block or at
-/// the end of the bytes. After a failure, discard the reader.
-pub struct TarReader<'a> {
-  archive: &'a [u8],
-  offset: usize,
+/// The reader does not allocate and does not borrow your input. It holds one 512-byte header and
+/// room for a long path and a long link target, [`PATH_LIMIT`] bytes each. Content is not copied:
+/// a `Content` progress names a prefix of the input that you gave. When you give the whole
+/// archive at once, each file's content comes back in one piece. The reader stops at the first
+/// all-zero block. After a failure, each step fails with `InvalidUse`.
+pub struct TarReader {
+  header: [u8; 512],
+  filled: usize,
+  phase: u32,
+  // The content or skipped bytes left in this phase, and the padding to the next block after them.
+  pending: u64,
+  padding: u64,
+  // The kind of the extended header being read: `L`, `K`, or `x`.
+  extended: u8,
+  // Long names, and the overrides they give the next member.
+  name: [u8; 4096],
+  nameLength: usize,
+  link: [u8; 4096],
+  linkLength: usize,
+  hasName: bool,
+  hasLink: bool,
+  hasSize: bool,
+  paxSize: u64,
+  // The pax record being parsed.
+  recordLength: usize,
+  recordRead: usize,
+  recordPhase: u32,
+  keyword: [u8; 8],
+  keywordLength: usize,
+  valueLength: usize,
+  sizeValue: u64,
+  // The current member.
+  kind: TarKind,
+  executable: bool,
+  size: u64,
+  prefixLength: usize,
+  headerNameLength: usize,
+  nameFromBuffer: bool,
+  headerLinkLength: usize,
+  linkFromBuffer: bool,
 }
 
 const BLOCK: usize = 512
 
-// The bytes of a NUL-terminated header field.
-fn field<'a>(header: &'a [u8], start: usize, width: usize) -> &'a [u8] {
+const PHASE_HEADER: u32 = 0
+const PHASE_CONTENT: u32 = 1
+const PHASE_SKIP: u32 = 2
+const PHASE_PAD: u32 = 3
+const PHASE_EXTENDED: u32 = 4
+const PHASE_END: u32 = 5
+const PHASE_FAILED: u32 = 6
+
+const RECORD_LENGTH: u32 = 0
+const RECORD_KEYWORD: u32 = 1
+const RECORD_VALUE: u32 = 2
+
+const TARGET_NONE: u32 = 0
+const TARGET_PATH: u32 = 1
+const TARGET_LINK: u32 = 2
+const TARGET_SIZE: u32 = 3
+
+// The length of the NUL-terminated text in a header field.
+fn fieldLength(header: &[u8], start: usize, width: usize) -> usize {
   let mut length: usize = 0
   while length < width && header[start + length] != 0 { length = length + 1 }
-  return Slice.view<u8>(header, start, length)
+  return length
 }
 
 // The number in a header field: octal, after leading spaces and before a space or NUL, or base-256
@@ -259,144 +381,422 @@ fn safe(path: &[u8]) -> bool {
   return true
 }
 
-// The value of the `path` record in pax extended header records, or none.
-fn paxPath<'a>(records: &'a [u8]) -> Option<&'a [u8]> {
-  let mut at: usize = 0
-  while at < records.length {
-    let mut space = at
-    let mut length: usize = 0
-    while space < records.length && records[space] >= 48 && records[space] <= 57 && length <= records.length {
-      length = length * 10 + u8.toUsize(records[space] - 48)
-      space = space + 1
-    }
-    if length == 0 || length > records.length - at || space >= at + length || records[space] != 32 { return Option<&'a [u8]>.none() }
-    // The record is `<length> path=<value>\n`.
-    let record = Slice.view<u8>(records, space + 1, at + length - space - 1)
-    if startsWith(record, b"path=") && record.length > 6 {
-      return Option<&'a [u8]>.some(Slice.view<u8>(record, 5, record.length - 6))
-    }
-    at = at + length
-  }
-  return Option<&'a [u8]>.none()
+// The zero bytes after `size` bytes of content that end it on a block boundary.
+fn padFor(size: u64) -> u64 {
+  let rest = size % 512
+  return if rest == 0 { 0 } else { 512 - rest }
 }
 
-impl<'a> TarReader<'a> {
-  /// Returns a reader at the start of `archive`.
-  pub fn open(archive: &'a [u8]) -> TarReader<'a> {
-    return TarReader<'a> {archive: archive, offset: 0}
+fn smaller(left: u64, available: usize) -> usize {
+  return if left < usize.toU64(available) { u64.toUsize(left) } else { available }
+}
+
+impl TarReader {
+  /// Returns a reader at the start of an archive.
+  pub fn make() -> TarReader {
+    return TarReader {
+      header: [0; 512],
+      filled: 0,
+      phase: PHASE_HEADER,
+      pending: 0,
+      padding: 0,
+      extended: 0,
+      name: [0; 4096],
+      nameLength: 0,
+      link: [0; 4096],
+      linkLength: 0,
+      hasName: false,
+      hasLink: false,
+      hasSize: false,
+      paxSize: 0,
+      recordLength: 0,
+      recordRead: 0,
+      recordPhase: RECORD_LENGTH,
+      keyword: [0; 8],
+      keywordLength: 0,
+      valueLength: 0,
+      sizeValue: 0,
+      kind: TarKind.Other,
+      executable: false,
+      size: 0,
+      prefixLength: 0,
+      headerNameLength: 0,
+      nameFromBuffer: false,
+      headerLinkLength: 0,
+      linkFromBuffer: false,
+    }
   }
 
-  /// Returns the next member in archive order, or none at the end-of-archive blocks or the end of
-  /// the bytes. GNU long-name and pax headers are read as part of the member they name.
+  /// Reads from the start of `input` and returns how much it consumed and what it found.
+  ///
+  /// # Details
+  /// On the next call, give only the input after the consumed prefix, followed by any new bytes.
+  /// The call returns at the first member header (`Member`), with the content of the current file
+  /// (`Content`, always from the start of `input`), at the end of the archive (`End`), or when it
+  /// consumed all of `input` (`NeedInput`). Set `last` when `input` holds the rest of the archive:
+  /// then the archive may end without its end-of-archive blocks, at a member boundary or after a
+  /// file's content without its final padding. GNU long-name and pax headers are read as part of
+  /// the member they name, and pax global headers are skipped.
   ///
   /// # Errors
-  /// - [`TarError`] with `Truncated` when the archive ends inside a header or a member,
-  ///   `BadHeader` when a checksum or number is invalid, and `UnsafePath` when the member's path
-  ///   is absolute, holds a backslash or a NUL, or has a `..` segment.
-  pub fn next(self: &mut TarReader<'a>) -> Result<Option<TarMember<'a>>, TarError> {
-    let archive = self.archive
-    let mut longName = Option<&'a [u8]>.none()
-    while true {
-      if self.offset == archive.length { return Result<Option<TarMember<'a>>, TarError>.succeed(Option<TarMember<'a>>.none()) }
-      if archive.length - self.offset < BLOCK { return Result<Option<TarMember<'a>>, TarError>.failResult(TarError.Truncated) }
-      let header = Slice.view<u8>(archive, self.offset, BLOCK)
-      if allZero(header) {
-        self.offset = archive.length
-        return Result<Option<TarMember<'a>>, TarError>.succeed(Option<TarMember<'a>>.none())
+  /// - [`TarError`] with `Truncated` when `last` is set and the archive ends inside a header or a
+  ///   member, `BadHeader` when a checksum, number, or pax record is invalid, `UnsafePath` when
+  ///   the member's path is absolute, holds a backslash or a NUL, or has a `..` segment, and
+  ///   `PathTooLong` for a long path over [`PATH_LIMIT`] bytes. After a failure, each step fails
+  ///   with `InvalidUse`.
+  pub fn step(self: &mut Self, input: &[u8], last: bool) -> Result<TarProgress, TarError> {
+    if self.phase == PHASE_END { return progress(0, TarStatus.End) }
+    if self.phase == PHASE_FAILED { return Result<TarProgress, TarError>.failResult(TarError.InvalidUse) }
+    if self.phase == PHASE_CONTENT {
+      if self.pending > 0 {
+        if input.length == 0 {
+          if last { return failure(&mut self, TarError.Truncated) }
+          return progress(0, TarStatus.NeedInput)
+        }
+        let count = smaller(self.pending, input.length)
+        self.pending = self.pending - usize.toU64(count)
+        if self.pending == 0 {
+          self.phase = PHASE_PAD
+          self.pending = self.padding
+        }
+        return progress(count, TarStatus.Content)
       }
-      // The checksum counts its own eight bytes as spaces.
-      let mut sum: u64 = 0
-      let mut at: usize = 0
-      while at < BLOCK {
-        if at >= 148 && at < 156 { sum = sum + 32 } else { sum = sum + u8.toU64(header[at]) }
-        at = at + 1
-      }
-      let recorded = match number(header, 148, 8) {
-        Option<u64>.Some {value} => value
-        Option<u64>.None => { return Result<Option<TarMember<'a>>, TarError>.failResult(TarError.BadHeader) }
-      }
-      if recorded != sum { return Result<Option<TarMember<'a>>, TarError>.failResult(TarError.BadHeader) }
-      let size = match number(header, 124, 12) {
-        Option<u64>.Some {value} => value
-        Option<u64>.None => { return Result<Option<TarMember<'a>>, TarError>.failResult(TarError.BadHeader) }
-      }
-      let start = self.offset + BLOCK
-      if size > usize.toU64(archive.length - start) { return Result<Option<TarMember<'a>>, TarError>.failResult(TarError.Truncated) }
-      let length = u64.toUsize(size)
-      let content = Slice.view<u8>(archive, start, length)
-      // The content is padded to whole blocks; a missing final pad is accepted.
-      let padded = (length + BLOCK - 1) / BLOCK * BLOCK
-      self.offset = if padded > archive.length - start { archive.length } else { start + padded }
-      let kind = header[156]
-      // A GNU long name (`L`) or a pax `path` record (`x`) names the next member, a GNU long link
-      // name (`K`) is not used, and a pax global header (`g`) applies to no one member here.
-      if kind == 76 {
-        longName = Option<&'a [u8]>.some(field(content, 0, content.length))
-        continue
-      }
-      if kind == 120 {
-        if let Option<&'a [u8]>.Some {value} = paxPath(content) { longName = Option<&'a [u8]>.some(value) }
-        continue
-      }
-      if kind == 75 || kind == 103 { continue }
-      let mut prefix = Slice.view<u8>(header, 0, 0)
-      let mut name = field(header, 0, 100)
-      if startsWith(Slice.view<u8>(header, 257, 6), b"ustar\x00") { prefix = field(header, 345, 155) }
-      if let Option<&'a [u8]>.Some {value} = longName {
-        name = value
-        prefix = Slice.view<u8>(header, 0, 0)
-      }
-      if !safe(prefix) || !safe(name) {
-        return Result<Option<TarMember<'a>>, TarError>.failResult(TarError.UnsafePath)
-      }
-      let mut memberKind = TarKind.Other
-      if kind == 48 || kind == 0 || kind == 55 {
-        memberKind = TarKind.File
-      } else if kind == 53 {
-        memberKind = TarKind.Directory
-      } else if kind == 50 {
-        memberKind = TarKind.SymbolicLink
-      } else if kind == 49 {
-        memberKind = TarKind.HardLink
-      }
-      // An old archive marks a directory only by the trailing `/` of a file member's name.
-      if memberKind == TarKind.File && name.length > 0 && name[name.length - 1] == 47 { memberKind = TarKind.Directory }
-      while memberKind == TarKind.Directory && name.length > 0 && name[name.length - 1] == 47 {
-        name = Slice.view<u8>(name, 0, name.length - 1)
-      }
-      let mode = match number(header, 100, 8) {
-        Option<u64>.Some {value} => value
-        Option<u64>.None => { return Result<Option<TarMember<'a>>, TarError>.failResult(TarError.BadHeader) }
-      }
-      return Result<Option<TarMember<'a>>, TarError>.succeed(Option<TarMember<'a>>.some(TarMember<'a> {
-        prefix: prefix,
-        name: name,
-        kind: memberKind,
-        executable: memberKind == TarKind.File && (mode & 73) != 0,
-        link: field(header, 157, 100),
-        content: if memberKind == TarKind.File { content } else { Slice.view<u8>(content, 0, 0) },
-      }))
+      self.phase = PHASE_PAD
+      self.pending = self.padding
     }
-    return Result<Option<TarMember<'a>>, TarError>.succeed(Option<TarMember<'a>>.none())
+    let mut at: usize = 0
+    while true {
+      if self.phase == PHASE_PAD || self.phase == PHASE_SKIP {
+        if self.pending == 0 {
+          if self.phase == PHASE_SKIP {
+            self.phase = PHASE_PAD
+            self.pending = self.padding
+          } else {
+            self.phase = PHASE_HEADER
+          }
+          continue
+        }
+        if at == input.length { break }
+        let count = smaller(self.pending, input.length - at)
+        at = at + count
+        self.pending = self.pending - usize.toU64(count)
+        continue
+      }
+      if self.phase == PHASE_EXTENDED {
+        if self.pending == 0 {
+          if let Option<TarError>.Some {value} = finishExtended(&mut self) { return failure(&mut self, value) }
+          self.phase = PHASE_PAD
+          self.pending = self.padding
+          continue
+        }
+        if at == input.length { break }
+        let count = smaller(self.pending, input.length - at)
+        if let Option<TarError>.Some {value} = extendedBytes(&mut self, Slice.view<u8>(input, at, count)) {
+          return failure(&mut self, value)
+        }
+        at = at + count
+        self.pending = self.pending - usize.toU64(count)
+        continue
+      }
+      // A header.
+      if at == input.length { break }
+      let wanted = BLOCK - self.filled
+      let count = if wanted < input.length - at { wanted } else { input.length - at }
+      Slice.copyInto<u8>(&mut self.header, self.filled, Slice.view<u8>(input, at, count))
+      at = at + count
+      self.filled = self.filled + count
+      if self.filled < BLOCK { break }
+      self.filled = 0
+      let status = match headerDone(&mut self) {
+        Result<TarStatus, TarError>.Success {value} => value
+        Result<TarStatus, TarError>.Failure {error} => { return failure(&mut self, error) }
+      }
+      if status != TarStatus.NeedInput { return progress(at, status) }
+    }
+    if last {
+      if (self.phase == PHASE_HEADER && self.filled == 0) || self.phase == PHASE_PAD {
+        self.phase = PHASE_END
+        return progress(at, TarStatus.End)
+      }
+      return failure(&mut self, TarError.Truncated)
+    }
+    return progress(at, TarStatus.NeedInput)
+  }
+
+  /// Returns the header of the member that the last step reported with `Member`.
+  ///
+  /// # Details
+  /// The member borrows the reader. It is valid until the next [`TarReader.step`], which may
+  /// overwrite the bytes it names. Before the first `Member`, it returns an empty member of kind
+  /// `Other`.
+  pub fn member<'a>(self: &'a Self) -> TarMember<'a> {
+    let header = &self.header
+    let mut prefix = Slice.view<u8>(header, 345, self.prefixLength)
+    let mut name = Slice.view<u8>(header, 0, self.headerNameLength)
+    if self.nameFromBuffer {
+      prefix = Slice.view<u8>(header, 0, 0)
+      name = Slice.view<u8>(&self.name, 0, self.nameLength)
+    }
+    let link = if self.linkFromBuffer { Slice.view<u8>(&self.link, 0, self.linkLength) } else { Slice.view<u8>(header, 157, self.headerLinkLength) }
+    return TarMember<'a> {
+      prefix: prefix,
+      name: name,
+      kind: self.kind,
+      executable: self.executable,
+      link: link,
+      size: self.size,
+    }
+  }
+
+  /// Returns the number of content bytes of the current file that no step has reported yet. It is
+  /// zero between members, and after a file's last `Content` progress.
+  pub fn remaining(self: &Self) -> u64 {
+    return if self.phase == PHASE_CONTENT { self.pending } else { 0 }
   }
 }
 
-/// A tar archive being written in memory, one member at a time.
+fn progress(consumed: usize, status: TarStatus) -> Result<TarProgress, TarError> {
+  return Result<TarProgress, TarError>.succeed(TarProgress {consumed: consumed, status: status})
+}
+
+fn failure(reader: &mut TarReader, error: TarError) -> Result<TarProgress, TarError> {
+  reader.phase = PHASE_FAILED
+  return Result<TarProgress, TarError>.failResult(error)
+}
+
+// Checks the complete header block and starts the phase it begins. Answers `Member` or `End` for
+// the caller to report, or `NeedInput` for an extended or skipped header.
+fn headerDone(reader: &mut TarReader) -> Result<TarStatus, TarError> {
+  let header = &reader.header
+  if allZero(header) {
+    reader.phase = PHASE_END
+    return Result<TarStatus, TarError>.succeed(TarStatus.End)
+  }
+  // The checksum counts its own eight bytes as spaces.
+  let mut sum: u64 = 0
+  let mut at: usize = 0
+  while at < BLOCK {
+    if at >= 148 && at < 156 { sum = sum + 32 } else { sum = sum + u8.toU64(header[at]) }
+    at = at + 1
+  }
+  let recorded = match number(header, 148, 8) {
+    Option<u64>.Some {value} => value
+    Option<u64>.None => { return Result<TarStatus, TarError>.failResult(TarError.BadHeader) }
+  }
+  if recorded != sum { return Result<TarStatus, TarError>.failResult(TarError.BadHeader) }
+  let headerSize = match number(header, 124, 12) {
+    Option<u64>.Some {value} => value
+    Option<u64>.None => { return Result<TarStatus, TarError>.failResult(TarError.BadHeader) }
+  }
+  let kind = header[156]
+  // A GNU long name (`L`) or long link name (`K`), or a pax record set (`x`), applies to the next
+  // member. A pax global header (`g`) applies to no one member here, so it is skipped.
+  if kind == 76 || kind == 75 || kind == 120 {
+    reader.phase = PHASE_EXTENDED
+    reader.extended = kind
+    reader.pending = headerSize
+    reader.padding = padFor(headerSize)
+    if kind == 76 {
+      reader.nameLength = 0
+      reader.hasName = false
+    } else if kind == 75 {
+      reader.linkLength = 0
+      reader.hasLink = false
+    } else {
+      reader.recordLength = 0
+      reader.recordRead = 0
+      reader.recordPhase = RECORD_LENGTH
+    }
+    return Result<TarStatus, TarError>.succeed(TarStatus.NeedInput)
+  }
+  if kind == 103 {
+    reader.phase = PHASE_SKIP
+    reader.pending = headerSize
+    reader.padding = padFor(headerSize)
+    return Result<TarStatus, TarError>.succeed(TarStatus.NeedInput)
+  }
+  let size = if reader.hasSize { reader.paxSize } else { headerSize }
+  let mode = match number(header, 100, 8) {
+    Option<u64>.Some {value} => value
+    Option<u64>.None => { return Result<TarStatus, TarError>.failResult(TarError.BadHeader) }
+  }
+  let mut prefixLength: usize = 0
+  if startsWith(Slice.view<u8>(header, 257, 6), b"ustar\x00") { prefixLength = fieldLength(header, 345, 155) }
+  let mut nameLength = fieldLength(header, 0, 100)
+  let fromBuffer = reader.hasName
+  if fromBuffer {
+    prefixLength = 0
+    nameLength = reader.nameLength
+  }
+  let name = if fromBuffer { Slice.view<u8>(&reader.name, 0, nameLength) } else { Slice.view<u8>(header, 0, nameLength) }
+  if !safe(Slice.view<u8>(header, 345, prefixLength)) || !safe(name) {
+    return Result<TarStatus, TarError>.failResult(TarError.UnsafePath)
+  }
+  let mut memberKind = TarKind.Other
+  if kind == 48 || kind == 0 || kind == 55 {
+    memberKind = TarKind.File
+  } else if kind == 53 {
+    memberKind = TarKind.Directory
+  } else if kind == 50 {
+    memberKind = TarKind.SymbolicLink
+  } else if kind == 49 {
+    memberKind = TarKind.HardLink
+  }
+  // An old archive marks a directory only by the trailing `/` of a file member's name.
+  if memberKind == TarKind.File && nameLength > 0 && name[nameLength - 1] == 47 { memberKind = TarKind.Directory }
+  while memberKind == TarKind.Directory && nameLength > 0 && name[nameLength - 1] == 47 { nameLength = nameLength - 1 }
+  let linked = memberKind == TarKind.SymbolicLink || memberKind == TarKind.HardLink
+  reader.kind = memberKind
+  reader.executable = memberKind == TarKind.File && (mode & 73) != 0
+  reader.size = if memberKind == TarKind.File { size } else { 0 }
+  reader.prefixLength = prefixLength
+  reader.nameFromBuffer = fromBuffer
+  if fromBuffer { reader.nameLength = nameLength } else { reader.headerNameLength = nameLength }
+  reader.linkFromBuffer = linked && reader.hasLink
+  reader.headerLinkLength = if linked { fieldLength(header, 157, 100) } else { 0 }
+  if !linked { reader.linkLength = 0 }
+  reader.hasName = false
+  reader.hasLink = false
+  reader.hasSize = false
+  reader.pending = size
+  reader.padding = padFor(size)
+  reader.phase = if memberKind == TarKind.File { PHASE_CONTENT } else { PHASE_SKIP }
+  return Result<TarStatus, TarError>.succeed(TarStatus.Member)
+}
+
+// Takes the next bytes of an extended header's content.
+fn extendedBytes(reader: &mut TarReader, bytes: &[u8]) -> Option<TarError> {
+  if reader.extended == 76 || reader.extended == 75 {
+    // A GNU long name is the content up to its first NUL.
+    let mut at: usize = 0
+    while at < bytes.length {
+      let length = if reader.extended == 76 { reader.nameLength } else { reader.linkLength }
+      if length == PATH_LIMIT {
+        if bytes[at] != 0 { return Option<TarError>.some(TarError.PathTooLong) }
+      } else if reader.extended == 76 {
+        reader.name[length] = bytes[at]
+        reader.nameLength = length + 1
+      } else {
+        reader.link[length] = bytes[at]
+        reader.linkLength = length + 1
+      }
+      at = at + 1
+    }
+    return Option<TarError>.none()
+  }
+  // pax records are `<length> <keyword>=<value>\n`, the length counting the whole record.
+  let mut at: usize = 0
+  while at < bytes.length {
+    let byte = bytes[at]
+    at = at + 1
+    reader.recordRead = reader.recordRead + 1
+    if reader.recordPhase == RECORD_LENGTH {
+      if byte == 32 && reader.recordLength > 0 {
+        reader.recordPhase = RECORD_KEYWORD
+        reader.keywordLength = 0
+      } else if byte >= 48 && byte <= 57 && reader.recordLength < 1073741824 {
+        reader.recordLength = reader.recordLength * 10 + u8.toUsize(byte - 48)
+      } else {
+        return Option<TarError>.some(TarError.BadHeader)
+      }
+      continue
+    }
+    if reader.recordRead > reader.recordLength { return Option<TarError>.some(TarError.BadHeader) }
+    if reader.recordPhase == RECORD_KEYWORD {
+      if reader.recordRead == reader.recordLength { return Option<TarError>.some(TarError.BadHeader) }
+      if byte == 61 {
+        reader.recordPhase = RECORD_VALUE
+        reader.valueLength = 0
+        reader.sizeValue = 0
+        if target(&reader.*) == TARGET_PATH { reader.hasName = false }
+        if target(&reader.*) == TARGET_LINK { reader.hasLink = false }
+      } else if reader.keywordLength < 8 {
+        reader.keyword[reader.keywordLength] = byte
+        reader.keywordLength = reader.keywordLength + 1
+      } else {
+        reader.keywordLength = 9
+      }
+      continue
+    }
+    if reader.recordRead == reader.recordLength {
+      if byte != 10 { return Option<TarError>.some(TarError.BadHeader) }
+      let chosen = target(&reader.*)
+      if reader.valueLength > 0 {
+        if chosen == TARGET_PATH {
+          reader.nameLength = reader.valueLength
+          reader.hasName = true
+        } else if chosen == TARGET_LINK {
+          reader.linkLength = reader.valueLength
+          reader.hasLink = true
+        } else if chosen == TARGET_SIZE {
+          reader.paxSize = reader.sizeValue
+          reader.hasSize = true
+        }
+      }
+      reader.recordPhase = RECORD_LENGTH
+      reader.recordLength = 0
+      reader.recordRead = 0
+      continue
+    }
+    let chosen = target(&reader.*)
+    if chosen == TARGET_PATH || chosen == TARGET_LINK {
+      if reader.valueLength == PATH_LIMIT { return Option<TarError>.some(TarError.PathTooLong) }
+      if chosen == TARGET_PATH { reader.name[reader.valueLength] = byte } else { reader.link[reader.valueLength] = byte }
+    } else if chosen == TARGET_SIZE {
+      if byte < 48 || byte > 57 || reader.sizeValue >= 72057594037927936 / 10 { return Option<TarError>.some(TarError.BadHeader) }
+      reader.sizeValue = reader.sizeValue * 10 + u8.toU64(byte - 48)
+    }
+    reader.valueLength = reader.valueLength + 1
+  }
+  return Option<TarError>.none()
+}
+
+// Ends an extended header once all its content is read.
+fn finishExtended(reader: &mut TarReader) -> Option<TarError> {
+  if reader.extended == 76 {
+    reader.nameLength = fieldLength(&reader.name, 0, reader.nameLength)
+    reader.hasName = true
+  } else if reader.extended == 75 {
+    reader.linkLength = fieldLength(&reader.link, 0, reader.linkLength)
+    reader.hasLink = true
+  } else if reader.recordPhase != RECORD_LENGTH || reader.recordRead != 0 {
+    return Option<TarError>.some(TarError.BadHeader)
+  }
+  return Option<TarError>.none()
+}
+
+// Which member field the pax record being read sets.
+fn target(reader: &TarReader) -> u32 {
+  let keyword = Slice.view<u8>(&reader.keyword, 0, if reader.keywordLength > 8 { 0 } else { reader.keywordLength })
+  if reader.keywordLength == 4 && startsWith(keyword, b"path") { return TARGET_PATH }
+  if reader.keywordLength == 8 && startsWith(keyword, b"linkpath") { return TARGET_LINK }
+  if reader.keywordLength == 4 && startsWith(keyword, b"size") { return TARGET_SIZE }
+  return TARGET_NONE
+}
+
+/// A tar archive being written to the ambient `Writer`, one member at a time.
 ///
 /// # When to use
-/// Make one with [`TarWriter.make`], add members with [`TarWriter.file`] and
-/// [`TarWriter.directory`] in the order the archive should list them, and take the archive with
-/// [`TarWriter.finish`].
+/// Make one with [`TarWriter.make`], add members in the order the archive should list them, and
+/// end the archive with [`TarWriter.finish`]. Use [`TarWriter.file`] for a file whose content is
+/// in memory, and [`TarWriter.beginFile`] then [`TarWriter.writeContent`] for a file whose content
+/// comes in pieces.
 ///
 /// # Details
-/// The writer writes ustar headers with fixed metadata: modification time zero, owner and group
-/// zero with empty names, and mode 644 for a file, 755 for an executable file or a directory. The
-/// same members in the same order therefore always give the same bytes, on any host. A path
-/// longer than the 100-byte name field is split into the ustar prefix and name at a `/` when it
-/// fits, and is otherwise written in a pax `path` record. A file of 8 GiB or more records its size
-/// in base-256. [`TarReader`] reads every archive the writer makes.
+/// The writer holds no buffer: each header, each piece of content, and each block's padding goes
+/// to the `Writer` as it comes. It writes ustar headers with fixed metadata: modification time
+/// zero, owner and group zero with empty names, and mode 644 for a file, 755 for an executable
+/// file or a directory. The same members in the same order therefore always give the same bytes,
+/// on any host. A path longer than the 100-byte name field is split into the ustar prefix and name
+/// at a `/` when it fits, and is otherwise written in a pax `path` record. A file of 8 GiB or more
+/// records its size in base-256. [`TarReader`] reads every archive the writer makes.
+///
+/// # Gotchas
+/// The writer does not flush the `Writer`. Flush or finish the provider after
+/// [`TarWriter.finish`].
 pub struct TarWriter {
-  bytes: Bytes,
+  remaining: u64,
+  size: u64,
 }
 
 // The ustar header of a member: its path fields (or a pax record already written), mode, size and
@@ -493,7 +893,7 @@ fn decimalDigits(value: usize) -> usize {
 impl TarWriter {
   /// Returns a writer with no members.
   pub fn make() -> TarWriter {
-    return TarWriter {bytes: Bytes.make()}
+    return TarWriter {remaining: 0, size: 0}
   }
 
   /// Adds the regular file `path` holding `content`, with mode 755 when `executable` and 644
@@ -501,13 +901,50 @@ impl TarWriter {
   ///
   /// # Errors
   /// - [`TarError`] with `UnsafePath` when `path` is empty, absolute, ends in `/`, or holds a
-  ///   backslash, a NUL, or a `..` segment. Nothing is added.
-  /// - `OutOfMemoryError` when the archive cannot grow.
+  ///   backslash, a NUL, or a `..` segment, and `InvalidUse` when the last file begun with
+  ///   [`TarWriter.beginFile`] did not get all its content. Nothing is written.
+  /// - `WriterError` when the `Writer` fails.
   pub effect fn file(self: &mut Self, path: &[u8], content: &[u8], executable: bool) -> ()
-    ! TarError | OutOfMemoryError
-    ? &mut Allocator {
+    ! TarError | WriterError
+    ? &mut Writer {
+    run TarWriter.beginFile(&mut self, path, usize.toU64(content.length), executable)
+    return run TarWriter.writeContent(&mut self, content)
+  }
+
+  /// Writes the header of the regular file `path` of `size` bytes, with mode 755 when
+  /// `executable` and 644 otherwise. Send its content with [`TarWriter.writeContent`].
+  ///
+  /// # Errors
+  /// - [`TarError`] with `UnsafePath` when `path` is empty, absolute, ends in `/`, or holds a
+  ///   backslash, a NUL, or a `..` segment, and `InvalidUse` when the last file did not get all
+  ///   its content. Nothing is written.
+  /// - `WriterError` when the `Writer` fails.
+  pub effect fn beginFile(self: &mut Self, path: &[u8], size: u64, executable: bool) -> ()
+    ! TarError | WriterError
+    ? &mut Writer {
+    if self.remaining != 0 { fail TarError.InvalidUse }
     let mode = if executable { b"0000755" } else { b"0000644" }
-    run member(&mut self.bytes, path, mode, content, 48)
+    run member(path, mode, size, 48)
+    self.remaining = size
+    self.size = size
+    return ()
+  }
+
+  /// Writes the next `content` bytes of the file that [`TarWriter.beginFile`] began, and the
+  /// padding to a whole block after its last byte.
+  ///
+  /// # Errors
+  /// - [`TarError`] with `InvalidUse` when `content` is longer than the bytes the file still
+  ///   needs. Nothing is written.
+  /// - `WriterError` when the `Writer` fails.
+  pub effect fn writeContent(self: &mut Self, content: &[u8]) -> ()
+    ! TarError | WriterError
+    ? &mut Writer {
+    if usize.toU64(content.length) > self.remaining { fail TarError.InvalidUse }
+    if content.length == 0 { return () }
+    run Writer.writeAll(content)
+    self.remaining = self.remaining - usize.toU64(content.length)
+    if self.remaining == 0 { return run padding(self.size) }
     return ()
   }
 
@@ -515,34 +952,39 @@ impl TarWriter {
   ///
   /// # Errors
   /// - [`TarError`] with `UnsafePath` when `path` is empty, absolute, ends in `/`, or holds a
-  ///   backslash, a NUL, or a `..` segment. Nothing is added.
-  /// - `OutOfMemoryError` when the archive cannot grow.
+  ///   backslash, a NUL, or a `..` segment, and `InvalidUse` when the last file did not get all
+  ///   its content. Nothing is written.
+  /// - `WriterError` when the `Writer` fails.
   pub effect fn directory(self: &mut Self, path: &[u8]) -> ()
-    ! TarError | OutOfMemoryError
-    ? &mut Allocator {
-    run member(&mut self.bytes, path, b"0000755", b"", 53)
-    return ()
+    ! TarError | WriterError
+    ? &mut Writer {
+    if self.remaining != 0 { fail TarError.InvalidUse }
+    return run member(path, b"0000755", 0, 53)
   }
 
-  /// Ends the archive with its two zero blocks and returns its bytes.
+  /// Ends the archive with its two zero blocks.
   ///
   /// # Errors
-  /// - `OutOfMemoryError` when the archive cannot grow.
-  pub effect fn finish(self: TarWriter) -> Bytes
-    ! OutOfMemoryError
-    ? &mut Allocator {
-    let mut bytes = move self.bytes
+  /// - [`TarError`] with `InvalidUse` when the last file did not get all its content. Nothing is
+  ///   written.
+  /// - `WriterError` when the `Writer` fails.
+  pub effect fn finish(self: TarWriter) -> ()
+    ! TarError | WriterError
+    ? &mut Writer {
+    let writer = move self
+    let remaining = writer.remaining
+    drop writer
+    if remaining != 0 { fail TarError.InvalidUse }
     let zero: [u8; 1024] = [0; 1024]
-    run Bytes.append(&mut bytes, &zero)
-    return move bytes
+    return run Writer.writeAll(&zero)
   }
 }
 
-// Appends one member: its pax record when the path fits no ustar header, its header, its content,
-// and the padding to a whole block.
-effect fn member(bytes: &mut Bytes, path: &[u8], mode: &[u8], content: &[u8], kind: u8) -> ()
-  ! TarError | OutOfMemoryError
-  ? &mut Allocator {
+// Writes one member's headers: its pax record when the path fits no ustar header, then its ustar
+// header. The padding after the content is written by the caller.
+effect fn member(path: &[u8], mode: &[u8], size: u64, kind: u8) -> ()
+  ! TarError | WriterError
+  ? &mut Writer {
   if path.length == 0 || path[path.length - 1] == 47 || !safe(path) { fail TarError.UnsafePath }
   let mut name = path
   let mut prefix = Slice.view<u8>(path, 0, 0)
@@ -557,40 +999,36 @@ effect fn member(bytes: &mut Bytes, path: &[u8], mode: &[u8], content: &[u8], ki
         let body = path.length + 7
         let mut length = body + decimalDigits(body)
         if decimalDigits(length) != decimalDigits(body) { length = body + decimalDigits(length) }
-        let mut record = Bytes.make()
-        run appendDecimal(&mut record, length)
-        run Bytes.append(&mut record, b" path=")
-        run Bytes.append(&mut record, path)
-        run Bytes.append(&mut record, b"\n")
         let mut pax: [u8; 512] = [0; 512]
-        header(&mut pax, b"PaxHeader", b"", b"0000644", usize.toU64(Bytes.length(&record)), 120)
-        run Bytes.append(&mut bytes.*, &pax)
-        run padded(&mut bytes.*, Bytes.asSlice(&record))
+        header(&mut pax, b"PaxHeader", b"", b"0000644", usize.toU64(length), 120)
+        run Writer.writeAll(&pax)
+        let mut digits: [u8; 20] = [0; 20]
+        let count = decimalDigits(length)
+        let mut rest = length
+        let mut at = count
+        while at > 0 {
+          at = at - 1
+          digits[at] = usize.toU8(rest % 10) + 48
+          rest = rest / 10
+        }
+        run Writer.writeAll(Slice.view<u8>(&digits, 0, count))
+        run Writer.writeAll(b" path=")
+        run Writer.writeAll(path)
+        run Writer.writeAll(b"\n")
+        run padding(usize.toU64(length))
         name = Slice.view<u8>(path, path.length - 100, 100)
       }
     }
   }
   let mut block: [u8; 512] = [0; 512]
-  header(&mut block, name, prefix, mode, usize.toU64(content.length), kind)
-  run Bytes.append(&mut bytes.*, &block)
-  run padded(&mut bytes.*, content)
-  return ()
+  header(&mut block, name, prefix, mode, size, kind)
+  return run Writer.writeAll(&block)
 }
 
-// Appends `content` and the zero bytes that end it on a block boundary.
-effect fn padded(bytes: &mut Bytes, content: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
-  run Bytes.append(&mut bytes.*, content)
-  let rest = content.length % BLOCK
-  if rest != 0 {
-    let zero: [u8; 512] = [0; 512]
-    run Bytes.append(&mut bytes.*, Slice.view<u8>(&zero, 0, BLOCK - rest))
-  }
-  return ()
-}
-
-effect fn appendDecimal(bytes: &mut Bytes, value: usize) -> () ! OutOfMemoryError ? &mut Allocator {
-  if value >= 10 { run appendDecimal(&mut bytes.*, value / 10) }
-  let digit: [u8; 1] = [usize.toU8(value % 10) + 48]
-  run Bytes.append(&mut bytes.*, &digit)
-  return ()
+// Writes the zero bytes that end `size` bytes of content on a block boundary.
+effect fn padding(size: u64) -> () ! WriterError ? &mut Writer {
+  let rest = u64.toUsize(padFor(size))
+  if rest == 0 { return () }
+  let zero: [u8; 512] = [0; 512]
+  return run Writer.writeAll(Slice.view<u8>(&zero, 0, rest))
 }
