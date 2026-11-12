@@ -1,0 +1,633 @@
+//! Semantic versions: strict SemVer 2.0.0 parsing, precedence, and display.
+//!
+//! # When to use
+//!
+//! Use [`Version.parse`] to read a version such as `1.4.0-beta.2+build.7`, and compare versions with
+//! `<`, `==`, or [`Version.comparePrecedence`]. To test a version against a requirement such as
+//! `^1.2` or `>=1.0.0, <2.0.0`, use `silk.semver.range`.
+//!
+//! # Details
+//!
+//! A [`Version`] holds the three numbers as `u64` values and borrows the pre-release and build text
+//! from the parsed input. Parsing does not allocate. The parser accepts exactly the grammar of
+//! SemVer 2.0.0: no `v` prefix, no spaces, and no leading zeros in numbers.
+//!
+//! Precedence follows SemVer 2.0.0: numbers compare numerically, a pre-release version is lower than
+//! its release, and build metadata does not change precedence. `==` and `<` also compare build
+//! metadata after precedence, so two versions are equal only if their text is the same.
+//!
+//! # Gotchas
+//!
+//! `1.0.0+a` and `1.0.0+b` have the same precedence, but `==` returns `false` for them. Use
+//! [`Version.comparePrecedence`] to compare versions as SemVer 2.0.0 does.
+//!
+//! # Examples
+//!
+//! ## Find the newer of two versions
+//!
+//! ```silk
+//! import silk.core.result { Result }
+//! import silk.semver.version { Version, SemverError }
+//!
+//! pub fn main() -> i32 {
+//!   let release = match Version.parse("1.4.0") {
+//!     Result<Version, SemverError>.Success { value } => value
+//!     Result<Version, SemverError>.Failure { error: _ } => { return 1 }
+//!   }
+//!   let beta = match Version.parse("1.4.0-beta.2+build.7") {
+//!     Result<Version, SemverError>.Success { value } => value
+//!     Result<Version, SemverError>.Failure { error: _ } => { return 1 }
+//!   }
+//!   if !(&beta < &release) || beta.prerelease != "beta.2" || beta.build != "build.7" {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! # See also
+//!
+//! [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html) defines the grammar and the
+//! precedence rules.
+//!
+//! @category Data formats
+
+import silk.core.equal { Equal }
+import silk.core.order { Order, Ordering }
+import silk.core.ownership { Copy }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.io.writer { Writer, WriterError }
+import silk.text.format { Debug, Display, Format, Formatter }
+import silk.text.string { String }
+import silk.collections.slice { Slice }
+import silk.num.u8
+import silk.num.u64
+import silk.num.usize
+
+/// The cause of a [`SemverError`].
+pub enum SemverErrorReason {
+  /// The text is empty.
+  Empty,
+  /// The text ends where a number, an identifier, or a version must start.
+  UnexpectedEnd,
+  /// The byte at the error offset is not valid in that position.
+  UnexpectedCharacter,
+  /// A number, or a numeric pre-release identifier, has a leading zero, as `01`.
+  LeadingZero,
+  /// A number is larger than the largest `u64`, 18446744073709551615.
+  NumberTooLarge,
+  /// A pre-release or build identifier is empty, as in `1.0.0-` or `1.0.0-a..b`.
+  EmptyIdentifier,
+  /// A Cargo requirement has more than 32 comparators.
+  TooManyComparators,
+}
+
+impl Debug for SemverErrorReason {
+  /// Writes the name of the variant, such as `LeadingZero`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return match &self.* {
+      SemverErrorReason.Empty => run Format.write(&mut formatter, b"Empty")
+      SemverErrorReason.UnexpectedEnd => run Format.write(&mut formatter, b"UnexpectedEnd")
+      SemverErrorReason.UnexpectedCharacter => run Format.write(
+        &mut formatter,
+        b"UnexpectedCharacter",
+      )
+      SemverErrorReason.LeadingZero => run Format.write(&mut formatter, b"LeadingZero")
+      SemverErrorReason.NumberTooLarge => run Format.write(&mut formatter, b"NumberTooLarge")
+      SemverErrorReason.EmptyIdentifier => run Format.write(&mut formatter, b"EmptyIdentifier")
+      SemverErrorReason.TooManyComparators => run Format.write(
+        &mut formatter,
+        b"TooManyComparators",
+      )
+    }
+  }
+}
+
+/// A version or range syntax error: the cause and the byte position.
+pub struct SemverError {
+  /// The cause of the error.
+  pub reason: SemverErrorReason,
+  /// The position of the first byte that is not valid, from the start of the text. If the text
+  /// ends too early, it is the length of the text.
+  pub offset: usize,
+}
+
+impl Copy for SemverError {}
+
+impl Debug for SemverError {
+  /// Writes the fields, as `SemverError { reason: LeadingZero, offset: 2 }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return run Format.debugFields(self, "SemverError", &mut formatter)
+  }
+}
+
+/// A semantic version, `MAJOR.MINOR.PATCH` with an optional pre-release and build metadata.
+///
+/// # Details
+///
+/// The pre-release and build fields borrow the text that was parsed, without the `-` or `+`. They
+/// are empty when the version has none. The value is `Copy` and cannot live longer than its text.
+///
+/// `==` and `<` compare precedence first and then build metadata, so `==` is `true` only for
+/// versions with the same text. Build identifiers compare in the same way as pre-release
+/// identifiers.
+///
+/// # Gotchas
+///
+/// A value made with a struct literal is not checked. Use [`Version.parse`] or [`Version.make`] to
+/// get a valid version.
+pub struct Version<'text> {
+  /// The major version. It changes for incompatible API changes.
+  pub major: u64,
+  /// The minor version. It changes for compatible additions.
+  pub minor: u64,
+  /// The patch version. It changes for compatible fixes.
+  pub patch: u64,
+  /// The pre-release identifiers without the `-`, as `beta.2`, or empty for a release.
+  pub prerelease: string<'text>,
+  /// The build metadata without the `+`, as `build.7`, or empty if there is none.
+  pub build: string<'text>,
+}
+
+impl<'text> Copy for Version<'text> {}
+
+impl<'text> Version<'text> {
+  /// Returns the release version `major.minor.patch`, with no pre-release and no build metadata.
+  pub fn make(major: u64, minor: u64, patch: u64) -> Version<'static> {
+    return Version<'static> { major: major, minor: minor, patch: patch, prerelease: "", build: "" }
+  }
+
+  /// Parses a SemVer 2.0.0 version, such as `1.4.0-beta.2+build.7`.
+  ///
+  /// # Details
+  ///
+  /// The text must be exactly `MAJOR.MINOR.PATCH`, then optionally `-` and dot-separated
+  /// pre-release identifiers, then optionally `+` and dot-separated build identifiers. Identifiers
+  /// use ASCII letters, digits, and `-`. A number fits in `u64`. The result borrows `text`. Nothing
+  /// is allocated.
+  ///
+  /// # Errors
+  ///
+  /// - `SemverError` with the reason and the byte offset of the first problem:
+  ///   - `Empty` for empty text.
+  ///   - `UnexpectedEnd` if a part is missing, as in `1.2`.
+  ///   - `UnexpectedCharacter` for a byte that is not valid there, as the `v` of `v1.2.3`.
+  ///   - `LeadingZero` for a number or numeric pre-release identifier such as `01`.
+  ///   - `NumberTooLarge` for a number above 18446744073709551615.
+  ///   - `EmptyIdentifier` for an empty identifier, as in `1.2.3-` or `1.2.3+a..b`.
+  ///
+  /// # Gotchas
+  ///
+  /// Leading and trailing spaces and a `v` prefix are errors. Version requirements accept a `v`
+  /// prefix, but versions do not.
+  pub fn parse(text: string<'text>) -> Result<Version<'text>, SemverError> {
+    let bytes = String.utf8Bytes(text)
+    if bytes.length == 0 {
+      return Result<Version<'text>, SemverError>.failResult(syntaxError(SemverErrorReason.Empty, 0))
+    }
+    let mut numbers: [u64; 3] = [0; 3]
+    let mut at: usize = 0
+    let mut part: usize = 0
+    while part < 3 {
+      if part > 0 {
+        if at >= bytes.length {
+          return Result<Version<'text>, SemverError>.failResult(
+            syntaxError(SemverErrorReason.UnexpectedEnd, at),
+          )
+        }
+        if bytes[at] != 46 {
+          return Result<Version<'text>, SemverError>.failResult(
+            syntaxError(SemverErrorReason.UnexpectedCharacter, at),
+          )
+        }
+        at = at + 1
+      }
+      match readNumber(bytes, at) {
+        Result<usize, SemverError>.Success { value } => {
+          numbers[part] = numberValue(bytes, at, value)
+          at = value
+        }
+        Result<usize, SemverError>.Failure { error } => {
+          return Result<Version<'text>, SemverError>.failResult(error)
+        }
+      }
+      part = part + 1
+    }
+    let mut prerelease = ""
+    let mut build = ""
+    if at < bytes.length && bytes[at] == 45 {
+      let start = at + 1
+      match identifiers(bytes, start, true) {
+        Result<usize, SemverError>.Success { value } => {
+          prerelease = String.slice(text, start, value - start)
+          at = value
+        }
+        Result<usize, SemverError>.Failure { error } => {
+          return Result<Version<'text>, SemverError>.failResult(error)
+        }
+      }
+    }
+    if at < bytes.length && bytes[at] == 43 {
+      let start = at + 1
+      match identifiers(bytes, start, false) {
+        Result<usize, SemverError>.Success { value } => {
+          build = String.slice(text, start, value - start)
+          at = value
+        }
+        Result<usize, SemverError>.Failure { error } => {
+          return Result<Version<'text>, SemverError>.failResult(error)
+        }
+      }
+    }
+    if at < bytes.length {
+      return Result<Version<'text>, SemverError>.failResult(
+        syntaxError(SemverErrorReason.UnexpectedCharacter, at),
+      )
+    }
+    return Result<Version<'text>, SemverError>.succeed(
+      Version<'text> {
+        major: numbers[0],
+        minor: numbers[1],
+        patch: numbers[2],
+        prerelease: prerelease,
+        build: build,
+      },
+    )
+  }
+
+  /// Returns `true` if the version has pre-release identifiers, as `1.0.0-rc.1` has.
+  pub fn isPrerelease(self: &Self) -> bool {
+    return String.utf8Bytes(self.prerelease).length > 0
+  }
+
+  /// Compares the SemVer 2.0.0 precedence of two versions. Build metadata does not count.
+  ///
+  /// # Details
+  ///
+  /// The major, minor, and patch numbers compare numerically, in that order. Then a version without
+  /// a pre-release is greater than one with a pre-release. Pre-release identifiers compare one at a
+  /// time from the left: numeric identifiers compare as numbers, other identifiers compare by ASCII
+  /// byte order, and a numeric identifier is lower than a non-numeric one. If all shared
+  /// identifiers are equal, the version with more identifiers is greater. So
+  /// `1.0.0-alpha < 1.0.0-alpha.1 < 1.0.0-beta < 1.0.0-beta.2 < 1.0.0-beta.11 < 1.0.0`.
+  ///
+  /// # Gotchas
+  ///
+  /// `1.0.0+a` and `1.0.0+b` have `Equal` precedence, but `==` on them returns `false` because `==`
+  /// also compares build metadata.
+  pub fn comparePrecedence(left: &Version<'_>, right: &Version<'_>) -> Ordering {
+    let core = compareCore(left, right)
+    if core != Ordering.Equal {
+      return core
+    }
+    return comparePrerelease(left.prerelease, right.prerelease)
+  }
+
+  /// Returns the next major release: `major + 1` with `0.0`, or the same numbers for a pre-release
+  /// of `X.0.0`.
+  ///
+  /// # Details
+  ///
+  /// The result has no pre-release and no build metadata. `1.4.2` becomes `2.0.0`, and
+  /// `2.0.0-rc.1` becomes `2.0.0`, because `2.0.0` is the release that `2.0.0-rc.1` comes before.
+  ///
+  /// # Gotchas
+  ///
+  /// The program traps if the major number is 18446744073709551615 and must increase.
+  pub fn nextMajor(self: &Self) -> Version<'static> {
+    if self.isPrerelease() && self.minor == 0 && self.patch == 0 {
+      return Version.make(self.major, 0, 0)
+    }
+    return Version.make(self.major + 1, 0, 0)
+  }
+
+  /// Returns the next minor release: `minor + 1` with patch 0, or the same numbers for a
+  /// pre-release of `X.Y.0`.
+  ///
+  /// # Details
+  ///
+  /// The result has no pre-release and no build metadata. `1.4.2` becomes `1.5.0`, and
+  /// `1.5.0-rc.1` becomes `1.5.0`.
+  ///
+  /// # Gotchas
+  ///
+  /// The program traps if the minor number is 18446744073709551615 and must increase.
+  pub fn nextMinor(self: &Self) -> Version<'static> {
+    if self.isPrerelease() && self.patch == 0 {
+      return Version.make(self.major, self.minor, 0)
+    }
+    return Version.make(self.major, self.minor + 1, 0)
+  }
+
+  /// Returns the next patch release: `patch + 1`, or the same numbers for a pre-release.
+  ///
+  /// # Details
+  ///
+  /// The result has no pre-release and no build metadata. `1.4.2` becomes `1.4.3`, and
+  /// `1.4.3-rc.1` becomes `1.4.3`.
+  ///
+  /// # Gotchas
+  ///
+  /// The program traps if the patch number is 18446744073709551615 and must increase.
+  pub fn nextPatch(self: &Self) -> Version<'static> {
+    if self.isPrerelease() {
+      return Version.make(self.major, self.minor, self.patch)
+    }
+    return Version.make(self.major, self.minor, self.patch + 1)
+  }
+
+  fn same(left: &Version<'_>, right: &Version<'_>) -> bool {
+    return left.major == right.major && left.minor == right.minor && left.patch == right.patch
+      && left.prerelease == right.prerelease
+      && left.build == right.build
+  }
+
+  fn compare(left: &Version<'_>, right: &Version<'_>) -> Ordering {
+    let precedence = Version.comparePrecedence(left, right)
+    if precedence != Ordering.Equal {
+      return precedence
+    }
+    return compareIdentifiers(left.build, right.build)
+  }
+}
+
+impl<'text> Equal for Version<'text> {
+  equals: Version.same
+}
+
+impl<'text> Order for Version<'text> {
+  compare: Version.compare
+}
+
+impl<'text> Display for Version<'text> {
+  /// Writes the version text, as `1.4.0-beta.2+build.7`. Writer failures propagate unchanged.
+  effect fn display(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    run writeNumber(&mut formatter, self.major)
+    run Format.write(&mut formatter, b".")
+    run writeNumber(&mut formatter, self.minor)
+    run Format.write(&mut formatter, b".")
+    run writeNumber(&mut formatter, self.patch)
+    if String.utf8Bytes(self.prerelease).length > 0 {
+      run Format.write(&mut formatter, b"-")
+      run Format.writeText(&mut formatter, self.prerelease)
+    }
+    if String.utf8Bytes(self.build).length > 0 {
+      run Format.write(&mut formatter, b"+")
+      run Format.writeText(&mut formatter, self.build)
+    }
+    return ()
+  }
+}
+
+impl<'text> Debug for Version<'text> {
+  /// Writes the version text, as `1.4.0-beta.2+build.7`. Writer failures propagate unchanged.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return run Display.display(self, &mut formatter)
+  }
+}
+
+effect fn writeNumber(formatter: &mut Formatter, value: u64) -> ()
+  ! WriterError
+  ? &mut Writer {
+  let mut digits: [u8; 20] = [0; 20]
+  let mut at: usize = 20
+  let mut rest = value
+  while true {
+    at = at - 1
+    digits[at] = u64.toU8(rest % 10) + 48
+    rest = rest / 10
+    if rest == 0 {
+      break
+    }
+  }
+  return run Format.write(&mut formatter, Slice.view<u8>(&digits, at, 20 - at))
+}
+
+fn syntaxError(reason: SemverErrorReason, offset: usize) -> SemverError {
+  return SemverError { reason: reason, offset: offset }
+}
+
+fn isDigit(byte: u8) -> bool {
+  return byte >= 48 && byte <= 57
+}
+
+fn isIdentifierByte(byte: u8) -> bool {
+  return isDigit(byte) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 45
+}
+
+// Reads the digits of a number that starts at `start` and returns the offset after them. The value
+// comes from `numberValue`, which can then not overflow.
+fn readNumber(bytes: &[u8], start: usize) -> Result<usize, SemverError> {
+  if start >= bytes.length {
+    return Result<usize, SemverError>.failResult(
+      syntaxError(SemverErrorReason.UnexpectedEnd, start),
+    )
+  }
+  if !isDigit(bytes[start]) {
+    return Result<usize, SemverError>.failResult(
+      syntaxError(SemverErrorReason.UnexpectedCharacter, start),
+    )
+  }
+  let mut at = start
+  let mut value: u64 = 0
+  while at < bytes.length && isDigit(bytes[at]) {
+    if at > start && bytes[start] == 48 {
+      return Result<usize, SemverError>.failResult(
+        syntaxError(SemverErrorReason.LeadingZero, start),
+      )
+    }
+    let digit = u8.toU64(bytes[at] - 48)
+    if value > (u64.MAX - digit) / 10 {
+      return Result<usize, SemverError>.failResult(
+        syntaxError(SemverErrorReason.NumberTooLarge, start),
+      )
+    }
+    value = value * 10 + digit
+    at = at + 1
+  }
+  return Result<usize, SemverError>.succeed(at)
+}
+
+fn numberValue(bytes: &[u8], start: usize, end: usize) -> u64 {
+  let mut value: u64 = 0
+  let mut at = start
+  while at < end {
+    value = value * 10 + u8.toU64(bytes[at] - 48)
+    at = at + 1
+  }
+  return value
+}
+
+// Reads dot-separated identifiers from `start` and returns the offset after the last one. Numeric
+// pre-release identifiers must not have leading zeros; build identifiers can.
+fn identifiers(bytes: &[u8], start: usize, prerelease: bool) -> Result<usize, SemverError> {
+  let mut at = start
+  while true {
+    let first = at
+    let mut numeric = true
+    while at < bytes.length && isIdentifierByte(bytes[at]) {
+      if !isDigit(bytes[at]) {
+        numeric = false
+      }
+      at = at + 1
+    }
+    if at == first {
+      return Result<usize, SemverError>.failResult(
+        syntaxError(SemverErrorReason.EmptyIdentifier, at),
+      )
+    }
+    if prerelease && numeric && at - first > 1 && bytes[first] == 48 {
+      return Result<usize, SemverError>.failResult(
+        syntaxError(SemverErrorReason.LeadingZero, first),
+      )
+    }
+    if at < bytes.length && bytes[at] == 46 {
+      at = at + 1
+    } else {
+      break
+    }
+  }
+  return Result<usize, SemverError>.succeed(at)
+}
+
+fn compareNumbers(left: u64, right: u64) -> Ordering {
+  if left < right {
+    return Ordering.Less
+  }
+  if left > right {
+    return Ordering.Greater
+  }
+  return Ordering.Equal
+}
+
+fn compareCore(left: &Version<'_>, right: &Version<'_>) -> Ordering {
+  let major = compareNumbers(left.major, right.major)
+  if major != Ordering.Equal {
+    return major
+  }
+  let minor = compareNumbers(left.minor, right.minor)
+  if minor != Ordering.Equal {
+    return minor
+  }
+  return compareNumbers(left.patch, right.patch)
+}
+
+// A release, with no identifiers, is greater than any pre-release.
+fn comparePrerelease(left: string, right: string) -> Ordering {
+  let leftEmpty = String.utf8Bytes(left).length == 0
+  let rightEmpty = String.utf8Bytes(right).length == 0
+  if leftEmpty && rightEmpty {
+    return Ordering.Equal
+  }
+  if leftEmpty {
+    return Ordering.Greater
+  }
+  if rightEmpty {
+    return Ordering.Less
+  }
+  return compareIdentifiers(left, right)
+}
+
+// Compares dot-separated identifiers by SemVer 2.0.0 rules. An empty list is the lowest. Numeric
+// identifiers compare by value, with any leading zeros skipped, and then by length.
+fn compareIdentifiers(left: string, right: string) -> Ordering {
+  let a = String.utf8Bytes(left)
+  let b = String.utf8Bytes(right)
+  let mut i: usize = 0
+  let mut j: usize = 0
+  while i < a.length && j < b.length {
+    let aEnd = identifierEnd(a, i)
+    let bEnd = identifierEnd(b, j)
+    let order = compareIdentifier(Slice.view<u8>(a, i, aEnd - i), Slice.view<u8>(b, j, bEnd - j))
+    if order != Ordering.Equal {
+      return order
+    }
+    i = aEnd + 1
+    j = bEnd + 1
+  }
+  let aDone = i >= a.length
+  let bDone = j >= b.length
+  if aDone && bDone {
+    return Ordering.Equal
+  }
+  if aDone {
+    return Ordering.Less
+  }
+  return Ordering.Greater
+}
+
+fn identifierEnd(bytes: &[u8], start: usize) -> usize {
+  let mut at = start
+  while at < bytes.length && bytes[at] != 46 {
+    at = at + 1
+  }
+  return at
+}
+
+fn allDigits(bytes: &[u8]) -> bool {
+  let mut at: usize = 0
+  while at < bytes.length {
+    if !isDigit(bytes[at]) {
+      return false
+    }
+    at = at + 1
+  }
+  return bytes.length > 0
+}
+
+fn compareIdentifier(left: &[u8], right: &[u8]) -> Ordering {
+  let leftNumeric = allDigits(left)
+  let rightNumeric = allDigits(right)
+  if leftNumeric && rightNumeric {
+    let mut i: usize = 0
+    while i + 1 < left.length && left[i] == 48 {
+      i = i + 1
+    }
+    let mut j: usize = 0
+    while j + 1 < right.length && right[j] == 48 {
+      j = j + 1
+    }
+    let order = compareNumbers(usize.toU64(left.length - i), usize.toU64(right.length - j))
+    if order != Ordering.Equal {
+      return order
+    }
+    let digits = compareBytes(
+      Slice.view<u8>(left, i, left.length - i),
+      Slice.view<u8>(right, j, right.length - j),
+    )
+    if digits != Ordering.Equal {
+      return digits
+    }
+    return compareNumbers(usize.toU64(left.length), usize.toU64(right.length))
+  }
+  if leftNumeric {
+    return Ordering.Less
+  }
+  if rightNumeric {
+    return Ordering.Greater
+  }
+  return compareBytes(left, right)
+}
+
+fn compareBytes(left: &[u8], right: &[u8]) -> Ordering {
+  let mut at: usize = 0
+  while at < left.length && at < right.length {
+    if left[at] < right[at] {
+      return Ordering.Less
+    }
+    if left[at] > right[at] {
+      return Ordering.Greater
+    }
+    at = at + 1
+  }
+  return compareNumbers(usize.toU64(left.length), usize.toU64(right.length))
+}
