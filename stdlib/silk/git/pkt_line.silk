@@ -1,0 +1,294 @@
+//! Read and write pkt-lines, the length-prefixed framing of the Git wire protocol.
+//!
+//! # When to use
+//! Use [`PktLine.read`] to walk the packets of a Git protocol message, such as the body of a
+//! `git-upload-pack` response, and [`PktLine.appendData`] with [`PktLine.appendFlush`] and
+//! [`PktLine.appendDelimiter`] to build a request body. Most programs use `silk.git.remote`, which
+//! does this for you.
+//!
+//! # Details
+//! Each packet starts with four hexadecimal digits that give its length, the four digits included.
+//! `0000` is a flush packet, `0001` a delimiter, and `0002` a response end. A longer length is a
+//! data packet of at most 65516 payload bytes. [`PktLine.read`] returns a [`Packet`] of offsets
+//! into the input, so nothing is copied. [`PktLine.line`] returns the payload without its final
+//! LF, the form in which most Git text lines are sent.
+//!
+//! # Errors
+//! - [`PktLineError`] for a length that is not four hexadecimal digits, is 3, or runs past the
+//!   input, and for a payload that is too long to write.
+//! - `OutOfMemoryError` from the append functions.
+//!
+//! # Examples
+//! ## Write two packets and read them back
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.collections.bytes { Bytes }
+//! import silk.core.effect { Effect }
+//! import silk.core.result { Result }
+//! import silk.git.pkt_line { Packet, PacketKind, PktLine, PktLineError }
+//!
+//! effect fn roundTrip() -> bool ! PktLineError | OutOfMemoryError ? &mut Allocator {
+//!   let mut body = Bytes.make()
+//!   run PktLine.appendData(&mut body, b"command=ls-refs\n")
+//!   run PktLine.appendFlush(&mut body)
+//!   let input = Bytes.asSlice(&body)
+//!   let first = match PktLine.read(input, 0) {
+//!     Result<Packet, PktLineError>.Success { value } => value
+//!     Result<Packet, PktLineError>.Failure { error } => { fail move error }
+//!   }
+//!   let line = PktLine.line(input, &first)
+//!   let second = match PktLine.read(input, first.next) {
+//!     Result<Packet, PktLineError>.Success { value } => value
+//!     Result<Packet, PktLineError>.Failure { error } => { fail move error }
+//!   }
+//!   let flushed = match second.kind {
+//!     PacketKind.Flush => true
+//!     _ => false
+//!   }
+//!   return line.length == 15 && flushed && second.next == input.length
+//! }
+//!
+//! pub effect fn main() -> i32 ! PktLineError | OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   if run roundTrip() |> Effect.provideMut<Allocator>(&mut allocator) {
+//!     return 0
+//!   }
+//!   return 1
+//! }
+//! ```
+//!
+//! @category Version control
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.collections.slice { Slice }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.num.u8
+import silk.text.format { Debug, Format, Formatter }
+import silk.io.writer { Writer, WriterError }
+
+/// The largest payload of one data packet, in bytes: 65520 minus the four length digits.
+pub const MAX_PAYLOAD: usize = 65516
+
+/// What a [`Packet`] is.
+pub enum PacketKind {
+  /// A data packet, `0005` or longer. Its payload is from `start` to `end`.
+  Data,
+  /// The flush packet `0000`, which ends a message or a section.
+  Flush,
+  /// The delimiter packet `0001`, which separates sections in protocol version 2.
+  Delimiter,
+  /// The response-end packet `0002`, which ends a stateless response in protocol version 2.
+  ResponseEnd,
+}
+
+impl Debug for PacketKind {
+  /// Writes the name of the variant, such as `Flush`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return match &self.* {
+      PacketKind.Data => run Format.write(&mut formatter, b"Data")
+      PacketKind.Flush => run Format.write(&mut formatter, b"Flush")
+      PacketKind.Delimiter => run Format.write(&mut formatter, b"Delimiter")
+      PacketKind.ResponseEnd => run Format.write(&mut formatter, b"ResponseEnd")
+    }
+  }
+}
+
+/// One packet, as offsets into the input that [`PktLine.read`] read.
+///
+/// # Details
+///
+/// The payload is from `start` to `end`, after the four length digits. A packet that is not
+/// `Data` has an empty payload. The next packet starts at `next`.
+pub struct Packet {
+  /// What the packet is.
+  pub kind: PacketKind,
+  /// The offset of the first payload byte.
+  pub start: usize,
+  /// The offset after the last payload byte.
+  pub end: usize,
+  /// The offset after the packet, where the next one starts.
+  pub next: usize,
+}
+
+impl Copy for Packet {}
+
+/// The reason that a [`PktLine`] function rejected its input.
+pub union PktLineError {
+  /// The input ends inside the packet that starts at `offset`.
+  Truncated {
+    /// The offset of the packet.
+    pub offset: usize,
+  },
+  /// The length at `offset` is not four hexadecimal digits, or it is 3, which no packet has.
+  InvalidLength {
+    /// The offset of the packet.
+    pub offset: usize,
+  },
+  /// A payload to write is longer than [`MAX_PAYLOAD`] bytes.
+  PayloadTooLong,
+}
+
+impl Debug for PktLineError {
+  /// Writes the variant and its offset, such as `Truncated { offset: 4 }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return match &self.* {
+      PktLineError.Truncated { offset } => {
+        let mut record = run Format.debugRecord("Truncated", &mut formatter)
+        run Format.debugField(&mut record, "offset", &offset, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      PktLineError.InvalidLength { offset } => {
+        let mut record = run Format.debugRecord("InvalidLength", &mut formatter)
+        run Format.debugField(&mut record, "offset", &offset, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      PktLineError.PayloadTooLong => run Format.write(&mut formatter, b"PayloadTooLong")
+    }
+  }
+}
+
+/// Functions that read and write pkt-lines.
+pub struct PktLine {}
+
+impl PktLine {
+  /// Returns the packet that starts at `offset` of `input`.
+  ///
+  /// # Details
+  ///
+  /// The four length digits can be upper or lower case. Nothing is copied: the [`Packet`] holds
+  /// offsets into `input`. Read the next packet at `packet.next`.
+  ///
+  /// # Errors
+  ///
+  /// - `Truncated` if fewer than four bytes start at `offset`, or the payload runs past the end.
+  /// - `InvalidLength` if the length is not four hexadecimal digits, or it is 3.
+  pub fn read(input: &[u8], offset: usize) -> Result<Packet, PktLineError> {
+    if offset > input.length || input.length - offset < 4 {
+      return Result<Packet, PktLineError>.failResult(PktLineError.Truncated { offset: offset })
+    }
+    let mut length: usize = 0
+    let mut index: usize = 0
+    while index < 4 {
+      let digit = hexValue(input[offset + index])
+      if digit > 15 {
+        return Result<Packet, PktLineError>.failResult(
+          PktLineError.InvalidLength { offset: offset },
+        )
+      }
+      length = length * 16 + digit
+      index = index + 1
+    }
+    let start = offset + 4
+    if length < 4 {
+      let kind = match length {
+        0 => PacketKind.Flush
+        1 => PacketKind.Delimiter
+        2 => PacketKind.ResponseEnd
+        _ => {
+          return Result<Packet, PktLineError>.failResult(
+            PktLineError.InvalidLength { offset: offset },
+          )
+        }
+      }
+      return Result<Packet, PktLineError>.succeed(
+        Packet { kind: kind, start: start, end: start, next: start },
+      )
+    }
+    if input.length - offset < length {
+      return Result<Packet, PktLineError>.failResult(PktLineError.Truncated { offset: offset })
+    }
+    let end = offset + length
+    return Result<Packet, PktLineError>.succeed(
+      Packet { kind: PacketKind.Data, start: start, end: end, next: end },
+    )
+  }
+
+  /// Returns the payload of `packet` in `input`. It is empty for a packet that is not `Data`.
+  pub fn payload<'a>(input: &'a [u8], packet: &Packet) -> &'a [u8] {
+    return Slice.view<u8>(input, packet.start, packet.end - packet.start)
+  }
+
+  /// Returns the payload of `packet` in `input` without its final LF, if it has one.
+  ///
+  /// # When to use
+  ///
+  /// Use it for the text lines of the protocol, which a sender may end with LF or not.
+  pub fn line<'a>(input: &'a [u8], packet: &Packet) -> &'a [u8] {
+    let mut end = packet.end
+    if end > packet.start && input[end - 1] == 10 {
+      end = end - 1
+    }
+    return Slice.view<u8>(input, packet.start, end - packet.start)
+  }
+
+  /// Appends a data packet with `payload` to `output`: its four length digits in lower case, then
+  /// the payload.
+  ///
+  /// # Errors
+  ///
+  /// - `PayloadTooLong` if `payload` has more than [`MAX_PAYLOAD`] bytes. `output` does not change.
+  /// - `OutOfMemoryError` if the `Allocator` cannot grow `output`.
+  pub effect fn appendData(output: &mut Bytes, payload: &[u8]) -> ()
+    ! PktLineError | OutOfMemoryError
+    ? &mut Allocator {
+    if payload.length > MAX_PAYLOAD {
+      fail PktLineError.PayloadTooLong
+    }
+    run appendLength(&mut output, payload.length + 4)
+    return run Bytes.append(&mut output, payload)
+  }
+
+  /// Appends the flush packet `0000` to `output`.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot grow `output`.
+  pub effect fn appendFlush(output: &mut Bytes) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run Bytes.append(&mut output, b"0000")
+  }
+
+  /// Appends the delimiter packet `0001` to `output`.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot grow `output`.
+  pub effect fn appendDelimiter(output: &mut Bytes) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run Bytes.append(&mut output, b"0001")
+  }
+}
+
+// The value of one hexadecimal digit, or 16 for another byte.
+fn hexValue(byte: u8) -> usize {
+  if byte >= 48 && byte <= 57 {
+    return u8.toUsize(byte) - 48
+  }
+  if byte >= 97 && byte <= 102 {
+    return u8.toUsize(byte) - 87
+  }
+  if byte >= 65 && byte <= 70 {
+    return u8.toUsize(byte) - 55
+  }
+  return 16
+}
+
+effect fn appendLength(output: &mut Bytes, length: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let digits = b"0123456789abcdef"
+  let mut text: [u8; 4] = [0; 4]
+  text[0] = digits[(length / 4096) % 16]
+  text[1] = digits[(length / 256) % 16]
+  text[2] = digits[(length / 16) % 16]
+  text[3] = digits[length % 16]
+  return run Bytes.append(&mut output, &text)
+}

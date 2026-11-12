@@ -1,0 +1,849 @@
+//! List the branches, tags, and other references of a remote Git repository over HTTP or HTTPS,
+//! like `git ls-remote`.
+//!
+//! # When to use
+//! Call [`GitRemote.listRefs`] with the URL of a repository, such as
+//! `https://github.com/silk-lang/silk.git`, to get its references as a `RefList` from
+//! `silk.git.refs`. Then look up a branch or a tag, or find the default branch with
+//! `RefList.head`. Narrow the list with [`ListOptions.prefix`], such as `refs/tags/`, which large
+//! repositories answer much faster. The request goes through the `Http` service of
+//! `silk.http.client`, so tests can give a fake server.
+//!
+//! # Details
+//! It speaks the smart HTTP protocol of Git. By default it asks for protocol version 2 and sends an
+//! `ls-refs` command with the prefixes, so the server filters the list. A server that answers with
+//! version 0 sends all references in its first response, and the list is filtered on the client.
+//! A dumb HTTP server, which serves the `info/refs` file, is read too. For each annotated tag the
+//! result has the peeled object, and `HEAD` has the default branch as its target when the server
+//! reports it. Redirects of the first request are followed, and the second request goes to the
+//! URL that the first one ended at.
+//!
+//! The functions [`GitRemote.parseAdvertisement`], [`GitRemote.parseLsRefs`], and
+//! [`GitRemote.parseDumbRefs`] read a response body that you got another way.
+//!
+//! # Errors
+//! - `GitRefError` from `silk.git.refs` if the response is not a reference advertisement, is
+//!   malformed, or is an `ERR` packet from the server.
+//! - `HttpError` from `silk.http.client` if the request fails or the status is not from 200 to
+//!   299. A private repository without credentials usually answers 401 or 404.
+//! - `OutOfMemoryError` if the `Allocator` fails.
+//!
+//! # Gotchas
+//! The URL is used as given, so it must be the repository URL that `git clone` accepts, without
+//! `/info/refs`. Only HTTP and HTTPS URLs work, not SSH or `git://`. For a private repository, set
+//! the `Authorization` header with [`ListOptions.authorization`], such as `Basic` with a token.
+//!
+//! # Examples
+//! ## List the tags of a repository from a fake server
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.core.effect { Effect }
+//! import silk.collections.list { List }
+//! import silk.core.option { Option }
+//! import silk.core.result { Result }
+//! import silk.git.refs { GitRefError, Ref }
+//! import silk.git.remote { GitRemote, ListOptions }
+//! import silk.http.client { Http, HttpError, Request, Response }
+//!
+//! struct DumbServer {}
+//!
+//! impl Http for DumbServer {
+//!   effect fn sendAll(self: &mut Self, requests: List<Request<'_>>) -> List<Result<Response, HttpError>>
+//!     ! OutOfMemoryError
+//!     ? &mut Allocator {
+//!     return run Http.sendEach(move requests) |> Effect.provideMut<Http>(&mut self.*)
+//!   }
+//!
+//!   effect fn send(self: &mut Self, request: Request<'_>) -> Response
+//!     ! HttpError | OutOfMemoryError
+//!     ? &mut Allocator {
+//!     return run Response.make(200, b"95d09f2b10159347eece71399a7e2e907ea3df4f\trefs/tags/v1.0.0\n")
+//!   }
+//! }
+//!
+//! effect fn tagged() -> bool ! GitRefError | HttpError | OutOfMemoryError ? &mut Http | &mut Allocator {
+//!   let mut options = ListOptions.make()
+//!   run options.prefix("refs/tags/")
+//!   let refs = run GitRemote.listRefs("https://git.example.com/app.git", &options)
+//!   return match refs.resolve("v1.0.0") {
+//!     Option<&Ref>.Some { value } => value.isTag()
+//!     Option<&Ref>.None => false
+//!   }
+//! }
+//!
+//! pub effect fn main() -> i32 ! GitRefError | HttpError | OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let mut server = DumbServer {}
+//!   let found = run tagged() |> Effect.provideMut<Http>(&mut server)
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!   if found {
+//!     return 0
+//!   }
+//!   return 1
+//! }
+//! ```
+//!
+//! @category Version control
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.git.pkt_line { Packet, PacketKind, PktLine, PktLineError }
+import silk.git.refs { GitRefError, ObjectId, Ref, RefList }
+import silk.http.client { Http, HttpError, Request, Response }
+import silk.text.format { Debug, Format, Formatter }
+import silk.text.string { InvalidUtf8, String }
+import silk.io.writer { Writer, WriterError }
+
+/// The default limit of each response body, in bytes: 64 MiB.
+pub const DEFAULT_MAX_BODY_BYTES: usize = 67108864
+
+/// The Git protocol version that [`GitRemote.listRefs`] asks for.
+pub enum GitProtocol {
+  /// Ask for version 2, and fall back to version 0 when the server does not speak it. The server
+  /// filters the references by prefix. This is the default.
+  Version2,
+  /// Ask for version 0 only. The server sends all references in one response, and the client
+  /// filters them.
+  Version0,
+}
+
+impl Debug for GitProtocol {
+  /// Writes the name of the variant, such as `Version2`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return match &self.* {
+      GitProtocol.Version2 => run Format.write(&mut formatter, b"Version2")
+      GitProtocol.Version0 => run Format.write(&mut formatter, b"Version0")
+    }
+  }
+}
+
+/// What [`GitRemote.listRefs`] asks for: the prefixes of the names to list, the credentials, the
+/// protocol, and the body limit.
+///
+/// # Details
+///
+/// [`ListOptions.make`] lists every reference with protocol version 2, no credentials, and a limit
+/// of [`DEFAULT_MAX_BODY_BYTES`] for each response body. A reference is listed when its full name
+/// starts with one of the prefixes, or always when there are none. So `refs/tags/` lists the tags
+/// and `refs/heads/` the branches. `HEAD` is listed only with no prefixes or with a prefix that it
+/// starts with, such as `HEAD`.
+pub struct ListOptions {
+  prefixList: List<String>,
+  authorizationValue: Option<String>,
+  protocolValue: GitProtocol,
+  maxBodyValue: usize,
+}
+
+impl ListOptions {
+  /// Returns the options that list every reference with protocol version 2, no credentials, and a
+  /// limit of [`DEFAULT_MAX_BODY_BYTES`] for each response body. It does not allocate.
+  pub fn make() -> ListOptions {
+    return ListOptions {
+      prefixList: List<String>.make(),
+      authorizationValue: Option<String>.none(),
+      protocolValue: GitProtocol.Version2,
+      maxBodyValue: DEFAULT_MAX_BODY_BYTES,
+    }
+  }
+
+  /// Adds `prefix` to the prefixes of the names to list, such as `refs/tags/` or `refs/heads/`.
+  ///
+  /// # Details
+  ///
+  /// A reference is listed when its full name starts with any of the prefixes. The comparison is of
+  /// bytes, so `refs/heads/v` also matches `refs/heads/v2-dev`.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the copy of `prefix`.
+  pub effect fn prefix(self: &mut Self, prefix: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let copied = run String.copy(prefix)
+    return run List<String>.append(&mut self.prefixList, move copied)
+  }
+
+  /// Sets the value of the `Authorization` header of each request, such as `Basic` and the Base64
+  /// of `user:token`, or `Bearer` and a token.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the copy of `value`.
+  ///
+  /// # Gotchas
+  ///
+  /// The `Http` provider does not send the header to another origin after a redirect.
+  pub effect fn authorization(self: &mut Self, value: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.authorizationValue = Option<String>.some(run String.copy(value))
+    return ()
+  }
+
+  /// Returns the options with the protocol version `protocol`.
+  pub fn protocol(self: Self, protocol: GitProtocol) -> ListOptions {
+    let mut next = move self
+    next.protocolValue = protocol
+    return move next
+  }
+
+  /// Returns the options with the limit of each response body set to `limit` bytes.
+  pub fn maxBodyBytes(self: Self, limit: usize) -> ListOptions {
+    let mut next = move self
+    next.maxBodyValue = limit
+    return move next
+  }
+
+  /// Returns the prefixes of the names to list, in the order they were added.
+  pub fn prefixes(self: &Self) -> &[String] {
+    return List<String>.asSlice(&self.prefixList)
+  }
+}
+
+/// Functions that list the references of a remote repository.
+pub struct GitRemote {}
+
+impl GitRemote {
+  /// Returns the references of the repository at `url` that `options` selects, like
+  /// `git ls-remote`.
+  ///
+  /// # Details
+  ///
+  /// It sends `GET <url>/info/refs?service=git-upload-pack`. With protocol version 2, it asks for
+  /// version 2 in the `Git-Protocol` header. When the server answers with version 2, it then sends
+  /// `POST <url>/git-upload-pack` with an `ls-refs` command that has the prefixes and asks for
+  /// peeled tags and symbolic targets. A server that answers with version 0 or 1 lists all
+  /// references in its first answer, and they are filtered here. A dumb server answers with the
+  /// plain `info/refs` file, which has no `HEAD`.
+  ///
+  /// A trailing `/` of `url` is removed. When the first request is redirected, the second goes to
+  /// the URL where the first one ended. The references are in the order of the server: `HEAD`
+  /// first, then by name.
+  ///
+  /// # Errors
+  ///
+  /// - `GitRefError.NotGitRepository` if the answer is not a reference advertisement.
+  /// - `GitRefError.Malformed` if the advertisement is broken.
+  /// - `GitRefError.ServerError` if the server answers with an `ERR` packet.
+  /// - `GitRefError.Unsupported` if a version 2 server does not offer `ls-refs`.
+  /// - `HttpError` if a request fails, or the status is not from 200 to 299.
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  pub effect fn listRefs(url: string, options: &ListOptions) -> RefList
+    ! GitRefError | HttpError | OutOfMemoryError
+    ? &mut Http | &mut Allocator {
+    let base = trimSlash(url)
+    let mut infoUrl = run String.copy(base)
+    run String.append(&mut infoUrl, INFO_REFS)
+    let mut request = Request.get(String.view(&infoUrl)).maxBodyBytes(options.maxBodyValue)
+    let wantsVersion2 = match options.protocolValue {
+      GitProtocol.Version2 => true
+      GitProtocol.Version0 => false
+    }
+    if wantsVersion2 {
+      run request.header("Git-Protocol", "version=2")
+    }
+    if let Option.Some { value } = &options.authorizationValue {
+      run request.header("Authorization", String.view(&value))
+    }
+    let response = run Http.send(move request)
+    let checked = run response.expectOk()
+    let body = checked.body()
+    let prefixes = List<String>.asSlice(&options.prefixList)
+    let start = match serviceEnd(body) {
+      Option<usize>.Some { value } => value
+      Option<usize>.None => {
+        if smartContentType(&checked) {
+          fail GitRefError.NotGitRepository
+        }
+        return run GitRemote.parseDumbRefs(body, prefixes)
+      }
+    }
+    if version2At(body, start) == false {
+      return run GitRemote.parseAdvertisement(body, prefixes)
+    }
+    let capabilities = run readCapabilities(body, start)
+    if capabilities.lsRefs == false {
+      fail GitRefError.Unsupported
+    }
+
+    // Send the command to where the first request ended, after a redirect.
+    let mut commandUrl = run String.copy(baseOf(checked.url(), base))
+    run String.append(&mut commandUrl, "/git-upload-pack")
+    let command = run lsRefsCommand(&capabilities, prefixes)
+    let mut post = Request.post(String.view(&commandUrl)).bytes(
+      Bytes.asSlice(&command),
+      "application/x-git-upload-pack-request",
+    ).maxBodyBytes(options.maxBodyValue).maxRedirects(0)
+    run post.header("Accept", "application/x-git-upload-pack-result")
+    run post.header("Git-Protocol", "version=2")
+    if let Option.Some { value } = &options.authorizationValue {
+      run post.header("Authorization", String.view(&value))
+    }
+    let answer = run Http.send(move post)
+    let answered = run answer.expectOk()
+    return run GitRemote.parseLsRefs(answered.body(), prefixes)
+  }
+
+  /// Returns the references of a version 0 or version 1 advertisement in `body` whose names start
+  /// with one of `prefixes`, or all of them when `prefixes` is empty.
+  ///
+  /// # Details
+  ///
+  /// `body` is the answer to `GET <url>/info/refs?service=git-upload-pack` or the start of the
+  /// output of `git-upload-pack`: an optional `# service=` packet and flush, an optional
+  /// `version 1` packet, then one packet for each reference, and a flush. The first reference has
+  /// the capabilities after a NUL byte. A `symref=HEAD:<target>` capability sets the target of
+  /// `HEAD`, and a line `<id> <name>^{}` sets the peeled object of the reference before it. An
+  /// empty repository advertises no references, and the result then has only an unborn `HEAD` when
+  /// the server reports its target.
+  ///
+  /// # Errors
+  ///
+  /// - `GitRefError.Malformed` if a packet or a line is broken.
+  /// - `GitRefError.ServerError` if the body has an `ERR` packet.
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  pub effect fn parseAdvertisement(body: &[u8], prefixes: &[String]) -> RefList
+    ! GitRefError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut offset = match serviceEnd(body) {
+      Option<usize>.Some { value } => value
+      Option<usize>.None => 0
+    }
+    let mut collector = Collector.make()
+    let mut first = true
+    let mut sawReference = false
+    while true {
+      let packet = run readPacket(body, offset)
+      offset = packet.next
+      match packet.kind {
+        PacketKind.Flush => {
+          if sawReference == false {
+            run collector.addUnbornHead(prefixes)
+          }
+          return run collector.finish(prefixes)
+        }
+        PacketKind.Data => {}
+        _ => {
+          fail GitRefError.Malformed { offset: packet.start - 4 }
+        }
+      }
+      let line = PktLine.line(body, &packet)
+      run failOnError(line)
+      if first && same(line, b"version 1") {
+        continue
+      }
+      if startsWith(line, b"shallow ") {
+        continue
+      }
+      let space = indexOf(line, 32, 0)
+      if space == line.length {
+        fail GitRefError.Malformed { offset: packet.start }
+      }
+      let id = run objectId(Slice.view<u8>(line, 0, space), packet.start)
+      let mut nameEnd = line.length
+      if first {
+        nameEnd = indexOf(line, 0, space + 1)
+        if nameEnd < line.length {
+          run collector.readCapabilities(
+            Slice.view<u8>(line, nameEnd + 1, line.length - nameEnd - 1),
+            packet.start,
+          )
+        }
+      }
+      first = false
+      let name = run text(
+        Slice.view<u8>(line, space + 1, nameEnd - space - 1),
+        packet.start + space + 1,
+      )
+      if name == "capabilities^{}" {
+        continue
+      }
+      sawReference = true
+      run collector.add(name, id, prefixes)
+    }
+    return run collector.finish(prefixes)
+  }
+
+  /// Returns the references in `body`, the answer of a version 2 server to an `ls-refs` command,
+  /// whose names start with one of `prefixes`, or all of them when `prefixes` is empty.
+  ///
+  /// # Details
+  ///
+  /// Each packet is `<id> <name>`, then optional `symref-target:<target>` and `peeled:<id>`
+  /// attributes, and a flush ends the list. A line that starts with `unborn` instead of an id is a
+  /// symbolic reference whose target does not exist yet, so its `id` is `None`.
+  ///
+  /// # Errors
+  ///
+  /// - `GitRefError.Malformed` if a packet or a line is broken.
+  /// - `GitRefError.ServerError` if the body has an `ERR` packet.
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  pub effect fn parseLsRefs(body: &[u8], prefixes: &[String]) -> RefList
+    ! GitRefError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut refs = RefList.make()
+    let mut offset: usize = 0
+    while true {
+      let packet = run readPacket(body, offset)
+      offset = packet.next
+      match packet.kind {
+        PacketKind.Flush => {
+          return move refs
+        }
+        PacketKind.Data => {}
+        _ => {
+          fail GitRefError.Malformed { offset: packet.start - 4 }
+        }
+      }
+      let line = PktLine.line(body, &packet)
+      run failOnError(line)
+      let space = indexOf(line, 32, 0)
+      if space == line.length {
+        fail GitRefError.Malformed { offset: packet.start }
+      }
+      let mut id = Option<ObjectId>.none()
+      let idText = Slice.view<u8>(line, 0, space)
+      if same(idText, b"unborn") == false {
+        id = Option<ObjectId>.some(run objectId(idText, packet.start))
+      }
+      let nameEnd = indexOf(line, 32, space + 1)
+      let name = run text(
+        Slice.view<u8>(line, space + 1, nameEnd - space - 1),
+        packet.start + space + 1,
+      )
+      if selected(name, prefixes) {
+        let mut entry = run Ref.make(name, id)
+        let mut at = nameEnd
+        while at < line.length {
+          let attributeEnd = indexOf(line, 32, at + 1)
+          let attribute = Slice.view<u8>(line, at + 1, attributeEnd - at - 1)
+          if startsWith(attribute, b"symref-target:") {
+            let target = run text(
+              Slice.view<u8>(attribute, 14, attribute.length - 14),
+              packet.start + at + 15,
+            )
+            entry.target = Option<String>.some(run String.copy(target))
+          } else if startsWith(attribute, b"peeled:") {
+            let peeled = run objectId(
+              Slice.view<u8>(attribute, 7, attribute.length - 7),
+              packet.start + at + 8,
+            )
+            entry.peeled = Option<ObjectId>.some(peeled)
+          }
+          at = attributeEnd
+        }
+        run refs.add(move entry)
+      }
+    }
+    return move refs
+  }
+
+  /// Returns the references in `body`, the `info/refs` file of a dumb HTTP server, whose names
+  /// start with one of `prefixes`, or all of them when `prefixes` is empty.
+  ///
+  /// # Details
+  ///
+  /// Each line is `<id>`, a tab, and the name, and ends with LF. A line whose name ends with `^{}`
+  /// sets the peeled object of the reference before it. The file has no `HEAD`.
+  ///
+  /// # Errors
+  ///
+  /// - `GitRefError.NotGitRepository` if a line is not an id, a tab, and a name, for example in an
+  ///   HTML page.
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  pub effect fn parseDumbRefs(body: &[u8], prefixes: &[String]) -> RefList
+    ! GitRefError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut collector = Collector.make()
+    let mut offset: usize = 0
+    while offset < body.length {
+      let end = indexOf(body, 10, offset)
+      let line = Slice.view<u8>(body, offset, end - offset)
+      let tab = indexOf(line, 9, 0)
+      if tab == line.length {
+        fail GitRefError.NotGitRepository
+      }
+      let id = match ObjectId.parseHex(Slice.view<u8>(line, 0, tab)) {
+        Option<ObjectId>.Some { value } => value
+        Option<ObjectId>.None => {
+          fail GitRefError.NotGitRepository
+        }
+      }
+      let name = run text(Slice.view<u8>(line, tab + 1, line.length - tab - 1), offset + tab + 1)
+      run collector.add(name, id, prefixes)
+      offset = end + 1
+    }
+    return run collector.finish(prefixes)
+  }
+}
+
+// The suffix of the first request.
+const INFO_REFS: string<'static> = "/info/refs?service=git-upload-pack"
+
+// What a version 2 server offers.
+struct Capabilities {
+  lsRefs: bool,
+  unborn: bool,
+  objectFormat: Option<String>,
+}
+
+// Gathers references, attaching each peeled line to the reference before it, and the symbolic
+// targets that the capabilities report.
+struct Collector {
+  refs: RefList,
+  pending: Option<Ref>,
+  // Pairs of a symbolic reference and its target.
+  symbolic: List<String>,
+}
+
+impl Collector {
+  fn make() -> Collector {
+    return Collector {
+      refs: RefList.make(),
+      pending: Option<Ref>.none(),
+      symbolic: List<String>.make(),
+    }
+  }
+
+  effect fn readCapabilities(self: &mut Self, capabilities: &[u8], offset: usize) -> ()
+    ! GitRefError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut at: usize = 0
+    while at < capabilities.length {
+      let end = indexOf(capabilities, 32, at)
+      let capability = Slice.view<u8>(capabilities, at, end - at)
+      if startsWith(capability, b"symref=") {
+        let colon = indexOf(capability, 58, 7)
+        if colon == capability.length {
+          fail GitRefError.Malformed { offset: offset }
+        }
+        let source = run text(Slice.view<u8>(capability, 7, colon - 7), offset)
+        let target = run text(
+          Slice.view<u8>(capability, colon + 1, capability.length - colon - 1),
+          offset,
+        )
+        run List<String>.append(&mut self.symbolic, run String.copy(source))
+        run List<String>.append(&mut self.symbolic, run String.copy(target))
+      }
+      at = end + 1
+    }
+    return ()
+  }
+
+  // Adds the reference `name`, or sets the peeled object of the reference before it when `name`
+  // ends with `^{}`.
+  effect fn add(self: &mut Self, name: string, id: ObjectId, prefixes: &[String]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if String.endsWith(name, "^{}") {
+      let base = String.slice(name, 0, String.byteLength(name) - 3)
+      if let Option.Some { value } = &mut self.pending {
+        if String.view(&value.name) == base {
+          value.peeled = Option<ObjectId>.some(id)
+        }
+      }
+      return ()
+    }
+    run self.flush(prefixes)
+    let mut entry = run Ref.make(name, Option<ObjectId>.some(id))
+    entry.target = run self.targetOf(name)
+    self.pending = Option<Ref>.some(move entry)
+    return ()
+  }
+
+  // Adds `HEAD` with no object when the capabilities name its target.
+  effect fn addUnbornHead(self: &mut Self, prefixes: &[String]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let target = run self.targetOf("HEAD")
+    if target.isSome() {
+      run self.flush(prefixes)
+      let mut entry = run Ref.make("HEAD", Option<ObjectId>.none())
+      entry.target = move target
+      self.pending = Option<Ref>.some(move entry)
+    }
+    return ()
+  }
+
+  effect fn targetOf(self: &Self, name: string) -> Option<String>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let pairs = List<String>.asSlice(&self.symbolic)
+    let mut index: usize = 0
+    while index + 1 < pairs.length {
+      if String.view(&pairs[index]) == name {
+        return Option<String>.some(run String.copy(String.view(&pairs[index + 1])))
+      }
+      index = index + 2
+    }
+    return Option<String>.none()
+  }
+
+  effect fn flush(self: &mut Self, prefixes: &[String]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let previous = Intrinsic.replace(self.pending, Option<Ref>.none())
+    if let Option.Some { value } = move previous {
+      if selected(String.view(&value.name), prefixes) {
+        run self.refs.add(move value)
+      }
+    }
+    return ()
+  }
+
+  effect fn finish(self: Self, prefixes: &[String]) -> RefList
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut collector = move self
+    run collector.flush(prefixes)
+    return move collector.refs
+  }
+}
+
+// Reads the capabilities of a version 2 server, from the `version 2` packet at `offset` to the
+// flush.
+effect fn readCapabilities(body: &[u8], offset: usize) -> Capabilities
+  ! GitRefError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut capabilities = Capabilities {
+    lsRefs: false,
+    unborn: false,
+    objectFormat: Option<String>.none(),
+  }
+  let mut at = offset
+  while true {
+    let packet = run readPacket(body, at)
+    at = packet.next
+    match packet.kind {
+      PacketKind.Flush => {
+        return move capabilities
+      }
+      PacketKind.Data => {}
+      _ => {
+        fail GitRefError.Malformed { offset: packet.start - 4 }
+      }
+    }
+    let line = PktLine.line(body, &packet)
+    run failOnError(line)
+    if same(line, b"ls-refs") {
+      capabilities.lsRefs = true
+    } else if startsWith(line, b"ls-refs=") {
+      capabilities.lsRefs = true
+      capabilities.unborn = hasWord(Slice.view<u8>(line, 8, line.length - 8), b"unborn")
+    } else if startsWith(line, b"object-format=") {
+      let format = run text(Slice.view<u8>(line, 14, line.length - 14), packet.start + 14)
+      capabilities.objectFormat = Option<String>.some(run String.copy(format))
+    }
+  }
+  return move capabilities
+}
+
+// The body of an `ls-refs` command.
+effect fn lsRefsCommand(capabilities: &Capabilities, prefixes: &[String]) -> Bytes
+  ! GitRefError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut body = Bytes.make()
+  run appendLine(&mut body, "command=ls-refs", "")
+  if let Option.Some { value } = &capabilities.objectFormat {
+    run appendLine(&mut body, "object-format=", String.view(&value))
+  }
+  run PktLine.appendDelimiter(&mut body)
+  run appendLine(&mut body, "peel", "")
+  run appendLine(&mut body, "symrefs", "")
+  if capabilities.unborn {
+    run appendLine(&mut body, "unborn", "")
+  }
+  let mut index: usize = 0
+  while index < prefixes.length {
+    run appendLine(&mut body, "ref-prefix ", String.view(&prefixes[index]))
+    index = index + 1
+  }
+  run PktLine.appendFlush(&mut body)
+  return move body
+}
+
+effect fn appendLine(body: &mut Bytes, head: string, tail: string) -> ()
+  ! GitRefError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut line = run String.copy(head)
+  run String.append(&mut line, tail)
+  run String.append(&mut line, "\n")
+  let written = run Effect.result(PktLine.appendData(&mut body, String.ownedUtf8Bytes(&line)))
+  return match move written {
+    Result.Success { .. } => ()
+    Result.Failure { error } => match move error {
+      PktLineError _ => {
+        fail GitRefError.Malformed { offset: 0 }
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+}
+
+effect fn readPacket(body: &[u8], offset: usize) -> Packet
+  ! GitRefError {
+  return match PktLine.read(body, offset) {
+    Result<Packet, PktLineError>.Success { value } => value
+    Result<Packet, PktLineError>.Failure { .. } => {
+      fail GitRefError.Malformed { offset: offset }
+    }
+  }
+}
+
+effect fn failOnError(line: &[u8]) -> ()
+  ! GitRefError | OutOfMemoryError
+  ? &mut Allocator {
+  if startsWith(line, b"ERR ") {
+    let message = match String.fromUtf8(Slice.view<u8>(line, 4, line.length - 4)) {
+      Result<string, InvalidUtf8>.Success { value } => run String.copy(value)
+      Result<string, InvalidUtf8>.Failure { .. } => String.make()
+    }
+    fail GitRefError.ServerError { message: move message }
+  }
+  return ()
+}
+
+effect fn objectId(hex: &[u8], offset: usize) -> ObjectId
+  ! GitRefError {
+  return match ObjectId.parseHex(hex) {
+    Option<ObjectId>.Some { value } => value
+    Option<ObjectId>.None => {
+      fail GitRefError.Malformed { offset: offset }
+    }
+  }
+}
+
+effect fn text<'a>(bytes: &'a [u8], offset: usize) -> string<'a>
+  ! GitRefError {
+  return match String.fromUtf8(bytes) {
+    Result<string<'a>, InvalidUtf8>.Success { value } => value
+    Result<string<'a>, InvalidUtf8>.Failure { .. } => {
+      fail GitRefError.Malformed { offset: offset }
+    }
+  }
+}
+
+// The offset after the `# service=` packet and its flush, 0 for a body that starts with a
+// `version` packet, or `None` for a body that is not a smart advertisement.
+fn serviceEnd(body: &[u8]) -> Option<usize> {
+  let packet = match PktLine.read(body, 0) {
+    Result<Packet, PktLineError>.Success { value } => value
+    Result<Packet, PktLineError>.Failure { .. } => {
+      return Option<usize>.none()
+    }
+  }
+  let line = PktLine.line(body, &packet)
+  if startsWith(line, b"version ") {
+    return Option<usize>.some(0)
+  }
+  if startsWith(line, b"# service=") == false {
+    return Option<usize>.none()
+  }
+  return match PktLine.read(body, packet.next) {
+    Result<Packet, PktLineError>.Success { value } => match value.kind {
+      PacketKind.Flush => Option<usize>.some(value.next)
+      _ => Option<usize>.some(packet.next)
+    }
+    Result<Packet, PktLineError>.Failure { .. } => Option<usize>.some(packet.next)
+  }
+}
+
+fn version2At(body: &[u8], offset: usize) -> bool {
+  return match PktLine.read(body, offset) {
+    Result<Packet, PktLineError>.Success { value } => same(PktLine.line(body, &value), b"version 2")
+    Result<Packet, PktLineError>.Failure { .. } => false
+  }
+}
+
+fn smartContentType(response: &Response) -> bool {
+  return match response.header("content-type") {
+    Option<&[u8]>.Some { value } => startsWith(value, b"application/x-git-")
+    Option<&[u8]>.None => false
+  }
+}
+
+// The repository URL that `finalUrl` of the first request names, or `base` if it does not end with
+// the first request's suffix.
+fn baseOf<'a>(finalUrl: string<'a>, base: string<'a>) -> string<'a> {
+  if String.endsWith(finalUrl, INFO_REFS) {
+    return String.slice(finalUrl, 0, String.byteLength(finalUrl) - String.byteLength(INFO_REFS))
+  }
+  return base
+}
+
+fn trimSlash(url: string) -> string {
+  let mut length = String.byteLength(url)
+  while length > 0 && String.endsWith(String.slice(url, 0, length), "/") {
+    length = length - 1
+  }
+  return String.slice(url, 0, length)
+}
+
+fn selected(name: string, prefixes: &[String]) -> bool {
+  if prefixes.length == 0 {
+    return true
+  }
+  let mut index: usize = 0
+  while index < prefixes.length {
+    if String.startsWith(name, String.view(&prefixes[index])) {
+      return true
+    }
+    index = index + 1
+  }
+  return false
+}
+
+fn hasWord(words: &[u8], word: &[u8]) -> bool {
+  let mut at: usize = 0
+  while at <= words.length {
+    let end = indexOf(words, 32, at)
+    if same(Slice.view<u8>(words, at, end - at), word) {
+      return true
+    }
+    at = end + 1
+  }
+  return false
+}
+
+// The offset of the first `byte` at or after `from`, or `bytes.length`.
+fn indexOf(bytes: &[u8], byte: u8, from: usize) -> usize {
+  let mut index = from
+  while index < bytes.length {
+    if bytes[index] == byte {
+      return index
+    }
+    index = index + 1
+  }
+  return bytes.length
+}
+
+fn startsWith(bytes: &[u8], prefix: &[u8]) -> bool {
+  if bytes.length < prefix.length {
+    return false
+  }
+  return same(Slice.view<u8>(bytes, 0, prefix.length), prefix)
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut index: usize = 0
+  while index < left.length {
+    if left[index] != right[index] {
+      return false
+    }
+    index = index + 1
+  }
+  return true
+}

@@ -1,0 +1,746 @@
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.git.local { LocalRefs }
+import silk.git.pkt_line { Packet, PacketKind, PktLine, PktLineError }
+import silk.git.refs { GitRefError, ObjectId, Ref, RefList }
+import silk.git.remote { GitProtocol, GitRemote, ListOptions }
+import silk.http.client { Http, HttpError, Request, Response }
+import silk.http.headers { Limits as ValueLimits }
+import silk.http.message { Header }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.filesystem {
+  AtomicWriteError,
+  DirectoryEntry,
+  DirectoryInfo,
+  Durability,
+  FileError,
+  FileInfo,
+  FileSystem,
+  Path,
+  PublicationPolicy,
+}
+import silk.text.string { String }
+
+// Git reference listing against a scripted smart HTTP server, the three advertisement formats, and
+// a repository on an in-memory file system.
+
+const MAIN: string<'static> = "95d09f2b10159347eece71399a7e2e907ea3df4f"
+
+const TAG: string<'static> = "1111111111111111111111111111111111111111"
+
+const COMMIT: string<'static> = "2222222222222222222222222222222222222222"
+
+const OTHER: string<'static> = "3333333333333333333333333333333333333333"
+
+enum Mode {
+  Version2,
+  Version0,
+  Empty,
+  Rejected,
+  Html,
+}
+
+struct Server {
+  mode: Mode,
+  calls: i32,
+  askedVersion2: bool,
+  postUrl: Bytes,
+  postBody: Bytes,
+}
+
+impl Http for Server {
+  effect fn sendAll(self: &mut Self, requests: List<Request<'_>>) -> List<
+    Result<Response, HttpError>
+  >
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run Http.sendEach(move requests) |> Effect.provideMut<Http>(&mut self.*)
+  }
+
+  effect fn send(self: &mut Self, request: Request<'_>) -> Response
+    ! HttpError | OutOfMemoryError
+    ? &mut Allocator {
+    self.calls = self.calls + 1
+    if request.hasBody() {
+      self.postUrl = run Bytes.copy(String.utf8Bytes(request.url()))
+      self.postBody = run Bytes.copy(request.bodyBytes())
+      let mut body = Bytes.make()
+      run data(&mut body, "unborn HEAD symref-target:refs/heads/next")
+      run data(&mut body, "95d09f2b10159347eece71399a7e2e907ea3df4f refs/heads/main")
+      run data(
+        &mut body,
+        "1111111111111111111111111111111111111111 refs/tags/v1.0.0 peeled:2222222222222222222222222222222222222222",
+      )
+      run PktLine.appendFlush(&mut body)
+      return run typed(Bytes.asSlice(&body), "application/x-git-upload-pack-result")
+    }
+    let mut index: usize = 0
+    while index < request.headerCount() {
+      let field = request.headerAt(index)
+      if field.name == "Git-Protocol" && field.value == "version=2" {
+        self.askedVersion2 = true
+      }
+      index = index + 1
+    }
+    let mut body = Bytes.make()
+    match self.mode {
+      Mode.Html => {
+        return run typed(b"<html>not here</html>", "text/html")
+      }
+      _ => {}
+    }
+    run data(&mut body, "# service=git-upload-pack")
+    run PktLine.appendFlush(&mut body)
+    match self.mode {
+      Mode.Version2 => {
+        run data(&mut body, "version 2")
+        run data(&mut body, "agent=git/2.47.0")
+        run data(&mut body, "ls-refs=unborn")
+        run data(&mut body, "fetch=shallow")
+        run data(&mut body, "object-format=sha1")
+      }
+      Mode.Version0 => {
+        let mut first = Bytes.make()
+        run Bytes.append(
+          &mut first,
+          b"95d09f2b10159347eece71399a7e2e907ea3df4f HEAD\x00multi_ack symref=HEAD:refs/heads/main agent=git/2.47.0\n",
+        )
+        run raw(&mut body, Bytes.asSlice(&first))
+        run data(&mut body, "3333333333333333333333333333333333333333 refs/heads/dev")
+        run data(&mut body, "95d09f2b10159347eece71399a7e2e907ea3df4f refs/heads/main")
+        run data(&mut body, "1111111111111111111111111111111111111111 refs/tags/v1.0.0")
+        run data(&mut body, "2222222222222222222222222222222222222222 refs/tags/v1.0.0^{}")
+        run data(&mut body, "3333333333333333333333333333333333333333 refs/tags/v2.0.0")
+      }
+      Mode.Empty => {
+        run raw(
+          &mut body,
+          b"0000000000000000000000000000000000000000 capabilities^{}\x00symref=HEAD:refs/heads/main\n",
+        )
+      }
+      Mode.Rejected => {
+        run data(&mut body, "ERR access denied")
+      }
+      Mode.Html => {}
+    }
+    run PktLine.appendFlush(&mut body)
+    return run typed(Bytes.asSlice(&body), "application/x-git-upload-pack-advertisement")
+  }
+}
+
+effect fn data(body: &mut Bytes, line: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = run String.copy(line)
+  run String.append(&mut text, "\n")
+  return run raw(&mut body, String.ownedUtf8Bytes(&text))
+}
+
+effect fn raw(body: &mut Bytes, payload: &[u8]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match run Effect.result(PktLine.appendData(&mut body, payload)) {
+    Result.Success { .. } => ()
+    Result.Failure { error } => match move error {
+      PktLineError _ => Intrinsic.trap("the scripted lines are short")
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+}
+
+effect fn typed(body: &[u8], contentType: string) -> Response
+  ! HttpError | OutOfMemoryError
+  ? &mut Allocator {
+  let limits = ValueLimits {
+    maxMethodBytes: 32,
+    maxTargetBytes: 256,
+    maxNameBytes: 64,
+    maxValueBytes: 256,
+    maxFields: 8,
+    maxFieldBytes: 512,
+    maxOwnedBytes: 2048,
+  }
+  let header = match Header.make("Content-Type", String.utf8Bytes(contentType), limits) {
+    Result.Success { value } => value
+    Result.Failure { .. } => Intrinsic.trap("the content type is a valid field")
+  }
+  let headers: [Header; 1] = [header]
+  return run Response.withHeaders(200, &headers, body)
+}
+
+fn server(mode: Mode) -> Server {
+  return Server {
+    mode: mode,
+    calls: 0,
+    askedVersion2: false,
+    postUrl: Bytes.make(),
+    postBody: Bytes.make(),
+  }
+}
+
+fn id(text: string) -> ObjectId {
+  return match ObjectId.parseHex(String.utf8Bytes(text)) {
+    Option<ObjectId>.Some { value } => value
+    Option<ObjectId>.None => Intrinsic.trap("the test ids are hexadecimal")
+  }
+}
+
+fn hasId(entry: &Ref, text: string) -> bool {
+  return match &entry.id {
+    Option<ObjectId>.Some { value } => value.equals(&id(text))
+    Option<ObjectId>.None => false
+  }
+}
+
+fn hasPeeled(entry: &Ref, text: string) -> bool {
+  return match &entry.peeled {
+    Option<ObjectId>.Some { value } => value.equals(&id(text))
+    Option<ObjectId>.None => false
+  }
+}
+
+fn hasTarget(entry: &Ref, name: string) -> bool {
+  return match &entry.target {
+    Option<String>.Some { value } => String.view(&value) == name
+    Option<String>.None => false
+  }
+}
+
+fn named(refs: &RefList, index: usize, name: string) -> bool {
+  return index < refs.length() && String.view(&refs.asSlice()[index].name) == name
+}
+
+effect fn listWith(mode: Mode, options: &ListOptions, server: &mut Server) -> RefList
+  ! GitRefError | HttpError | OutOfMemoryError
+  ? &mut Allocator {
+  return run GitRemote.listRefs("https://git.example.com/app.git/", options)
+    |> Effect.provideMut<Http>(&mut server.*)
+}
+
+// Version 2: the server filters, and the command carries the prefixes and the options it offers.
+effect fn version2() -> i32
+  ! GitRefError | HttpError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut fake = server(Mode.Version2)
+  let mut options = ListOptions.make()
+  run options.prefix("HEAD")
+  run options.prefix("refs/heads/")
+  run options.prefix("refs/tags/")
+  let refs = run listWith(Mode.Version2, &options, &mut fake)
+  if fake.calls != 2 || fake.askedVersion2 == false {
+    return 10
+  }
+  if Bytes.asSlice(&fake.postUrl)
+    != String.utf8Bytes("https://git.example.com/app.git/git-upload-pack") {
+    return 11
+  }
+  let mut expected = Bytes.make()
+  run data(&mut expected, "command=ls-refs")
+  run data(&mut expected, "object-format=sha1")
+  run PktLine.appendDelimiter(&mut expected)
+  run data(&mut expected, "peel")
+  run data(&mut expected, "symrefs")
+  run data(&mut expected, "unborn")
+  run data(&mut expected, "ref-prefix HEAD")
+  run data(&mut expected, "ref-prefix refs/heads/")
+  run data(&mut expected, "ref-prefix refs/tags/")
+  run PktLine.appendFlush(&mut expected)
+  if Bytes.asSlice(&fake.postBody) != Bytes.asSlice(&expected) {
+    return 12
+  }
+  if refs.length() != 3 || named(&refs, 0, "HEAD") == false {
+    return 13
+  }
+  let head = &refs.asSlice()[0]
+  if head.id.isSome() || hasTarget(head, "refs/heads/next") == false {
+    return 14
+  }
+  let tag = match refs.resolve("v1.0.0") {
+    Option<&Ref>.Some { value } => value
+    Option<&Ref>.None => {
+      return 15
+    }
+  }
+  if tag.isTag() == false || hasId(tag, TAG) == false || hasPeeled(tag, COMMIT) == false {
+    return 16
+  }
+  if tag.shortName() != "v1.0.0" {
+    return 17
+  }
+  let peeled = match tag.commit() {
+    Option<ObjectId>.Some { value } => value
+    Option<ObjectId>.None => {
+      return 18
+    }
+  }
+  if peeled.equals(&id(COMMIT)) == false {
+    return 18
+  }
+  return 0
+}
+
+// Version 0: one answer with every reference, filtered here, with the symbolic HEAD and peeled tags.
+effect fn version0() -> i32
+  ! GitRefError | HttpError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut fake = server(Mode.Version0)
+  let all = run listWith(Mode.Version0, &ListOptions.make(), &mut fake)
+  if fake.calls != 1 {
+    return 20
+  }
+  if all.length() != 5 || named(&all, 0, "HEAD") == false
+    || named(&all, 4, "refs/tags/v2.0.0") == false {
+    return 21
+  }
+  let head = match all.head() {
+    Option<&Ref>.Some { value } => value
+    Option<&Ref>.None => {
+      return 22
+    }
+  }
+  if hasTarget(head, "refs/heads/main") == false || hasId(head, MAIN) == false {
+    return 22
+  }
+  let tag = match all.find("refs/tags/v1.0.0") {
+    Option<&Ref>.Some { value } => value
+    Option<&Ref>.None => {
+      return 23
+    }
+  }
+  if hasPeeled(tag, COMMIT) == false {
+    return 23
+  }
+  match all.find("refs/tags/v2.0.0") {
+    Option<&Ref>.Some { value } => {
+      if value.peeled.isSome() {
+        return 24
+      }
+    }
+    Option<&Ref>.None => {
+      return 24
+    }
+  }
+  let mut fake0 = server(Mode.Version0)
+  let mut options = ListOptions.make().protocol(GitProtocol.Version0)
+  run options.prefix("refs/tags/")
+  let tags = run listWith(Mode.Version0, &options, &mut fake0)
+  if fake0.askedVersion2 {
+    return 25
+  }
+  if tags.length() != 2 || named(&tags, 0, "refs/tags/v1.0.0") == false
+    || hasPeeled(&tags.asSlice()[0], COMMIT) == false {
+    return 26
+  }
+
+  // A tag wins over a branch of the same short name, and remotes come last.
+  let mut mixed = RefList.make()
+  run mixed.add(run Ref.make("refs/heads/v1", Option<ObjectId>.some(id(MAIN))))
+  run mixed.add(run Ref.make("refs/remotes/origin/HEAD", Option<ObjectId>.some(id(OTHER))))
+  run mixed.add(run Ref.make("refs/tags/v1", Option<ObjectId>.some(id(TAG))))
+  match mixed.resolve("v1") {
+    Option<&Ref>.Some { value } => {
+      if value.isTag() == false {
+        return 27
+      }
+    }
+    Option<&Ref>.None => {
+      return 27
+    }
+  }
+  match mixed.resolve("origin") {
+    Option<&Ref>.Some { value } => {
+      if value.isRemoteBranch() == false || value.shortName() != "origin/HEAD" {
+        return 28
+      }
+    }
+    Option<&Ref>.None => {
+      return 28
+    }
+  }
+  if mixed.resolve("v").isSome() {
+    return 29
+  }
+  return 0
+}
+
+// An empty repository, an ERR packet, a page that is not a repository, and the dumb format.
+effect fn edges() -> i32
+  ! GitRefError | HttpError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut empty = server(Mode.Empty)
+  let none = run listWith(
+    Mode.Empty,
+    &ListOptions.make().protocol(GitProtocol.Version0),
+    &mut empty,
+  )
+  if none.length() != 1 || none.asSlice()[0].id.isSome()
+    || hasTarget(&none.asSlice()[0], "refs/heads/main") == false {
+    return 30
+  }
+  let mut rejected = server(Mode.Rejected)
+  let refused = run Effect.result(listWith(Mode.Rejected, &ListOptions.make(), &mut rejected))
+  let sawError = match move refused {
+    Result.Failure { error } => match move error {
+      GitRefError failure => match move failure {
+        GitRefError.ServerError { message } => String.view(&message) == "access denied"
+        _ => false
+      }
+      _ => false
+    }
+    Result.Success { .. } => false
+  }
+  if sawError == false {
+    return 31
+  }
+  let mut html = server(Mode.Html)
+  let page = run Effect.result(listWith(Mode.Html, &ListOptions.make(), &mut html))
+  let notRepository = match move page {
+    Result.Failure { error } => match move error {
+      GitRefError failure => match move failure {
+        GitRefError.NotGitRepository => true
+        _ => false
+      }
+      _ => false
+    }
+    Result.Success { .. } => false
+  }
+  if notRepository == false {
+    return 32
+  }
+  let dumb = run GitRemote.parseDumbRefs(
+    b"95d09f2b10159347eece71399a7e2e907ea3df4f\trefs/heads/main\n1111111111111111111111111111111111111111\trefs/tags/v1.0.0\n2222222222222222222222222222222222222222\trefs/tags/v1.0.0^{}\n",
+    &[],
+  )
+  if dumb.length() != 2 || hasPeeled(&dumb.asSlice()[1], COMMIT) == false || dumb.head().isSome() {
+    return 33
+  }
+  let broken = run Effect.result(
+    GitRemote.parseAdvertisement(b"001enot-an-id refs/heads/main\n", &[]),
+  )
+  let malformed = match move broken {
+    Result.Failure { error } => match move error {
+      GitRefError failure => match move failure {
+        GitRefError.Malformed { offset } => offset == 4
+        _ => false
+      }
+      _ => false
+    }
+    Result.Success { .. } => false
+  }
+  if malformed == false {
+    return 34
+  }
+
+  // SHA-256 ids and the hexadecimal text.
+  let long = match ObjectId.parseHex(
+    b"AB00000000000000000000000000000000000000000000000000000000000001",
+  ) {
+    Option<ObjectId>.Some { value } => value
+    Option<ObjectId>.None => {
+      return 35
+    }
+  }
+  let text = run long.hex()
+  if long.isSha256() == false || long.bytes().length != 32
+    || String.view(&text) != "ab00000000000000000000000000000000000000000000000000000000000001" {
+    return 35
+  }
+  if ObjectId.parseHex(b"95d09f2b").isSome()
+    || ObjectId.parseHex(b"zz5d09f2b10159347eece71399a7e2e907ea3df4f").isSome() {
+    return 36
+  }
+
+  // Packet framing.
+  let packet = match PktLine.read(b"0000", 0) {
+    Result<Packet, PktLineError>.Success { value } => value
+    Result<Packet, PktLineError>.Failure { .. } => {
+      return 37
+    }
+  }
+  let flushed = match packet.kind {
+    PacketKind.Flush => true
+    _ => false
+  }
+  if flushed == false || packet.next != 4 {
+    return 37
+  }
+  if rejects(b"0003") == false || rejects(b"0009abc") == false || rejects(b"00g0") == false {
+    return 38
+  }
+  return 0
+}
+
+fn rejects(input: &[u8]) -> bool {
+  return match PktLine.read(input, 0) {
+    Result<Packet, PktLineError>.Success { .. } => false
+    Result<Packet, PktLineError>.Failure { .. } => true
+  }
+}
+
+struct StoredFile {
+  path: Bytes,
+  contents: Bytes,
+}
+
+struct Files {
+  files: List<StoredFile>,
+}
+
+impl Files {
+  effect fn put(self: &mut Self, path: string, contents: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let stored = StoredFile {
+      path: run Bytes.copy(String.utf8Bytes(path)),
+      contents: run Bytes.copy(String.utf8Bytes(contents)),
+    }
+    return run List<StoredFile>.append(&mut self.files, move stored)
+  }
+
+  effect fn readFile(self: &mut Self, path: &Path) -> Bytes
+    ! FileError | OutOfMemoryError
+    ? &mut Allocator {
+    let stored = List<StoredFile>.asSlice(&self.files)
+    let mut index: usize = 0
+    while index < stored.length {
+      if Bytes.asSlice(&stored[index].path) == Path.rawBytes(path) {
+        return run Bytes.copy(Bytes.asSlice(&stored[index].contents))
+      }
+      index = index + 1
+    }
+    fail FileSystem.error(FileSystem.readFileOperation(), FileSystem.notFound())
+  }
+
+  effect fn stat(self: &mut Self, path: &Path) -> FileInfo | DirectoryInfo
+    ! FileError {
+    let wanted = Path.rawBytes(path)
+    let stored = List<StoredFile>.asSlice(&self.files)
+    let mut index: usize = 0
+    while index < stored.length {
+      let candidate = Bytes.asSlice(&stored[index].path)
+      if candidate == wanted {
+        return FileSystem.fileInfo(Bytes.length(&stored[index].contents))
+      }
+      if candidate.length > wanted.length && Slice.view<u8>(candidate, 0, wanted.length) == wanted
+        && candidate[wanted.length] == 47 {
+        return FileSystem.directoryInfo()
+      }
+      index = index + 1
+    }
+    fail FileSystem.error(FileSystem.statOperation(), FileSystem.notFound())
+  }
+
+  effect fn listDirectory(self: &mut Self, path: &Path) -> List<DirectoryEntry>
+    ! FileError | OutOfMemoryError
+    ? &mut Allocator {
+    let wanted = Path.rawBytes(path)
+    let stored = List<StoredFile>.asSlice(&self.files)
+    let mut entries = List<DirectoryEntry>.make()
+    let mut index: usize = 0
+    while index < stored.length {
+      let candidate = Bytes.asSlice(&stored[index].path)
+      if candidate.length > wanted.length && Slice.view<u8>(candidate, 0, wanted.length) == wanted
+        && candidate[wanted.length] == 47 {
+        let mut end = wanted.length + 1
+        while end < candidate.length && candidate[end] != 47 {
+          end = end + 1
+        }
+        let child = Slice.view<u8>(candidate, 0, end)
+        let mut kind = FileSystem.file()
+        if end < candidate.length {
+          kind = FileSystem.directory()
+        }
+        let listed = List<DirectoryEntry>.asSlice(&entries)
+        let mut seen = false
+        let mut at: usize = 0
+        while at < listed.length {
+          if Path.rawBytes(&listed[at].path) == child {
+            seen = true
+          }
+          at = at + 1
+        }
+        if seen == false {
+          run List<DirectoryEntry>.append(
+            &mut entries,
+            FileSystem.directoryEntry(run Path.fromBytes(child), move kind),
+          )
+        }
+      }
+      index = index + 1
+    }
+    return move entries
+  }
+
+  effect fn writeFile(self: &mut Self, path: &Path, bytes: &[u8]) -> ()
+    ! FileError {
+    fail FileSystem.error(FileSystem.writeFileOperation(), FileSystem.unsupported())
+  }
+
+  effect fn writeFileAtomic(
+    self: &mut Self,
+    path: &Path,
+    bytes: &[u8],
+    policy: PublicationPolicy,
+    durability: Durability,
+  ) -> ()
+    ! AtomicWriteError {
+    Intrinsic.trap("the references are only read")
+  }
+
+  effect fn createDirectory(self: &mut Self, path: &Path) -> ()
+    ! FileError {
+    fail FileSystem.error(FileSystem.createDirectoryOperation(), FileSystem.unsupported())
+  }
+
+  effect fn createTemporaryDirectory(self: &mut Self, path: &Path, prefix: &[u8]) -> Path
+    ! FileError | OutOfMemoryError
+    ? &mut Allocator {
+    fail FileSystem.error(FileSystem.createTemporaryDirectoryOperation(), FileSystem.unsupported())
+  }
+}
+
+impl FileSystem for Files {
+  readFile: Files.readFile
+
+  writeFile: Files.writeFile
+
+  createFile: Files.writeFile
+
+  writeFileAtomic: Files.writeFileAtomic
+
+  syncDirectory: Files.createDirectory
+
+  stat: Files.stat
+
+  listDirectory: Files.listDirectory
+
+  createDirectory: Files.createDirectory
+
+  removeFile: Files.createDirectory
+
+  removeDirectory: Files.createDirectory
+
+  createTemporaryDirectory: Files.createTemporaryDirectory
+}
+
+// A linked worktree: its own HEAD, and loose references that replace packed ones in the common
+// directory.
+effect fn local() -> i32
+  ! GitRefError | FileError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut files = Files { files: List<StoredFile>.make() }
+  run files.put("/work/.git", "gitdir: ../repo/.git/worktrees/work\n")
+  run files.put("/repo/.git/worktrees/work/HEAD", "ref: refs/heads/feature\n")
+  run files.put("/repo/.git/worktrees/work/commondir", "../..\n")
+  run files.put("/repo/.git/HEAD", "ref: refs/heads/main\n")
+  run files.put(
+    "/repo/.git/packed-refs",
+    "# pack-refs with: peeled fully-peeled sorted \n95d09f2b10159347eece71399a7e2e907ea3df4f refs/heads/main\n3333333333333333333333333333333333333333 refs/heads/old\n1111111111111111111111111111111111111111 refs/tags/v1.0.0\n^2222222222222222222222222222222222222222\n",
+  )
+  run files.put("/repo/.git/refs/heads/feature", "3333333333333333333333333333333333333333\n")
+  run files.put("/repo/.git/refs/heads/old", "95d09f2b10159347eece71399a7e2e907ea3df4f\n")
+  run files.put("/repo/.git/refs/heads/old.lock", "1111111111111111111111111111111111111111\n")
+  run files.put("/repo/.git/refs/heads/broken", "not an id\n")
+  run files.put("/repo/.git/refs/remotes/origin/HEAD", "ref: refs/remotes/origin/main\n")
+  run files.put("/repo/.git/refs/remotes/origin/main", "95d09f2b10159347eece71399a7e2e907ea3df4f\n")
+  let worktree = run Path.make("/work")
+  let gitDir = run LocalRefs.gitDirectory(&worktree) |> Effect.provideMut<FileSystem>(&mut files)
+  if Path.rawBytes(&gitDir) != String.utf8Bytes("/repo/.git/worktrees/work") {
+    return 40
+  }
+  let refs = run LocalRefs.read(&gitDir) |> Effect.provideMut<FileSystem>(&mut files)
+  if refs.length() != 7 {
+    return 41
+  }
+  if named(&refs, 0, "HEAD") == false || named(&refs, 1, "refs/heads/feature") == false
+    || named(&refs, 6, "refs/tags/v1.0.0") == false {
+    return 42
+  }
+  let head = &refs.asSlice()[0]
+  if hasTarget(head, "refs/heads/feature") == false || hasId(head, OTHER) == false {
+    return 43
+  }
+  match refs.find("refs/heads/old") {
+    Option<&Ref>.Some { value } => {
+      if hasId(value, MAIN) == false {
+        return 44
+      }
+    }
+    Option<&Ref>.None => {
+      return 44
+    }
+  }
+  match refs.find("refs/remotes/origin/HEAD") {
+    Option<&Ref>.Some { value } => {
+      if hasTarget(value, "refs/remotes/origin/main") == false || hasId(value, MAIN) == false {
+        return 45
+      }
+    }
+    Option<&Ref>.None => {
+      return 45
+    }
+  }
+  match refs.resolve("v1.0.0") {
+    Option<&Ref>.Some { value } => {
+      if hasPeeled(value, COMMIT) == false {
+        return 46
+      }
+    }
+    Option<&Ref>.None => {
+      return 46
+    }
+  }
+
+  // The main repository: HEAD on main, and a loop of symbolic references.
+  let mainDir = run LocalRefs.gitDirectory(&run Path.make("/repo"))
+    |> Effect.provideMut<FileSystem>(&mut files)
+  let mainRefs = run LocalRefs.read(&mainDir) |> Effect.provideMut<FileSystem>(&mut files)
+  if hasTarget(&mainRefs.asSlice()[0], "refs/heads/main") == false
+    || hasId(&mainRefs.asSlice()[0], MAIN) == false {
+    return 47
+  }
+  run files.put("/loop/HEAD", "ref: refs/heads/a\n")
+  run files.put("/loop/refs/heads/a", "ref: refs/heads/b\n")
+  run files.put("/loop/refs/heads/b", "ref: refs/heads/a\n")
+  let loopDir = run Path.make("/loop")
+  let looped = run Effect.result(LocalRefs.read(&loopDir))
+    |> Effect.provideMut<FileSystem>(&mut files)
+  let sawLoop = match move looped {
+    Result.Failure { error } => match move error {
+      GitRefError failure => match move failure {
+        GitRefError.SymbolicLoop => true
+        _ => false
+      }
+      _ => false
+    }
+    Result.Success { .. } => false
+  }
+  if sawLoop == false {
+    return 48
+  }
+  return 0
+}
+
+pub effect fn main() -> i32
+  ! GitRefError | HttpError | FileError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let first = run version2() |> Effect.provideMut<Allocator>(&mut allocator)
+  if first != 0 {
+    return first
+  }
+  let second = run version0() |> Effect.provideMut<Allocator>(&mut allocator)
+  if second != 0 {
+    return second
+  }
+  let third = run edges() |> Effect.provideMut<Allocator>(&mut allocator)
+  if third != 0 {
+    return third
+  }
+  return run local() |> Effect.provideMut<Allocator>(&mut allocator)
+}
