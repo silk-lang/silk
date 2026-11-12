@@ -398,8 +398,23 @@ The parameter that fixes `M` must itself change and descend, and the descent may
 active application whose other type arguments it repeats, whatever `M` is there. The owned structure of a type is finite, because a
 declaration unfolds beneath itself only at a strictly smaller application, and a descent may not
 return to an active application whose type arguments it repeats, so these re-entries stay finite.
+
 A recursive type such as `Node { next: Option<Box<Node>> }` admits `count<Box<Node>>` below
-`count<Node>`, and refuses the step back to `count<Node>`.
+`count<Node>`.
+
+A call that returns to an application still active on the path reuses it. With mutually recursive
+types, `write<Tree>` reaches `write<Branch>` through the field `children: List<Branch>`, and
+`write<Branch>` reaches `write<Tree>` again through its field `tree: Tree`. That cycle runs the two
+specializations already on the path.
+
+A field descriptor fixes its value type the same way a bound fixes the parameters it names. In
+`fn read<Owner, V>(static field: Intrinsic.Field<Owner, V>)`, the field of `Owner`'s argument
+decides `V`, so `V` may change to any type along the descent of `Owner`. A moved argument also
+descends when it lies within the ancestor's owned structure as a whole, even when its own type
+arguments do not: `Snapshot<Payment>` held in the context of `Snapshot<Shop>` descends, though
+`Payment` is not part of `Shop`. An exact callable representation, such as the Effect value of
+`read<Owner, V>(field)` that `Effect.result` receives, descends when the function application it
+holds descends by these rules.
 
 **Boundary:** Ordinary polymorphic recursion that changes a type argument to a type outside the
 owned structure of the earlier one is outside the stable model, even when the new type is no larger.
