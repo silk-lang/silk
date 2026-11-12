@@ -73,6 +73,34 @@ it.effect('installs the compiler as bin/silkc and the silk tool as bin/silk besi
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 )
 
+it.effect('installs a bundled LLVM at lib/silk/llvm with executable tools', () =>
+  Effect.gen(function* () {
+    const root = yield* directory
+    mkdirSync(join(root, 'stdlib'))
+    writeFileSync(join(root, 'stdlib/manifest.json'), '{}\n')
+    writeFileSync(join(root, 'compiler'), '#!/bin/sh\n')
+    mkdirSync(join(root, 'llvm/bin'), { recursive: true })
+    mkdirSync(join(root, 'llvm/lib/clang/23/include'), { recursive: true })
+    writeFileSync(join(root, 'llvm/bin/llvm'), 'multicall\n')
+    writeFileSync(join(root, 'llvm/lib/clang/23/include/stddef.h'), '#pragma once\n')
+    writeFileSync(join(root, 'llvm/LICENSE.TXT'), 'Apache-2.0 WITH LLVM-exception\n')
+    mkdirSync(join(root, 'out'))
+    const archive = yield* ReleaseArchive.write({
+      compiler: join(root, 'compiler'),
+      standardLibrary: join(root, 'stdlib'),
+      target: 'aarch64-apple-darwin',
+      version: '1.0.0',
+      outputDirectory: join(root, 'out'),
+      llvm: join(root, 'llvm'),
+    })
+    execFileSync('tar', ['-xzf', archive, '-C', root])
+    const llvm = join(root, 'silk-1.0.0-aarch64-apple-darwin/lib/silk/llvm')
+    assert.strictEqual(statSync(join(llvm, 'bin/llvm')).mode & 0o777, 0o755)
+    assert.strictEqual(statSync(join(llvm, 'lib/clang/23/include/stddef.h')).mode & 0o777, 0o644)
+    assert.strictEqual(statSync(join(llvm, 'LICENSE.TXT')).mode & 0o777, 0o644)
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+)
+
 it('names an archive by its exact version including build metadata', () => {
   assert.strictEqual(
     ReleaseArchive.name('0.1.0-dev.8624+5081812', 'aarch64-apple-darwin'),
