@@ -1,0 +1,2259 @@
+//! Line diffs, unified diff text, and reading and applying patches.
+//!
+//! # When to use
+//! Use [`unified`] to show how a file changed, as `diff -u` and `git diff` do, or to make a patch
+//! that a later step applies. Use [`parse`] to read a patch from `diff -u`, `git diff`, or
+//! `git format-patch`, and [`apply`] to apply one of its files to the original text. Use
+//! [`diffLines`] or [`diffSymbols`] for the edits themselves, for example to show a side-by-side
+//! view or to compare words instead of lines.
+//!
+//! # Details
+//! A line ends after each `\n`. A last line without `\n` is a line too, and it differs from the
+//! same line with `\n`. Lines are compared byte for byte, so a `\r` before `\n` is part of the line.
+//!
+//! The [`Algorithm`] chooses how the shared lines are found:
+//!
+//! - [`Algorithm.Histogram`] anchors the comparison on lines that are rare in both texts, as
+//!   `git diff --histogram` does. It is the fastest, and the diffs are easy to read. Use it unless
+//!   there is a reason to use another algorithm.
+//! - [`Algorithm.MyersMinimal`] always finds the fewest deleted and inserted lines, as
+//!   `git diff --minimal` does. The time grows with the line count times the number of changed
+//!   lines.
+//! - [`Algorithm.Myers`] stops a long search after about the square root of the line count, as
+//!   `git diff` does by default, so very different texts do not take quadratic time. The diff can
+//!   then have a few more changed lines than the minimum.
+//!
+//! The edits are a list of [`Edit`] runs. [`unified`] groups the changes into hunks with
+//! `context` unchanged lines around them, and writes `\ No newline at end of file` after a last
+//! line without `\n`, so the text reads back with [`parse`] and applies with [`apply`].
+//!
+//! A [`Patch`] holds one [`FilePatch`] for each file. Its paths, hunks and lines are [`Span`]
+//! ranges of the patch text, so the patch text must stay alive while the patch is in use.
+//! [`apply`] puts each hunk where its old lines are, nearest to the line that the hunk header
+//! gives, so a patch still applies after lines were added or removed before a hunk.
+//!
+//! The `Bytes` forms, such as [`unifiedBytes`], take and return bytes that need not be UTF-8, such
+//! as file contents.
+//!
+//! # Examples
+//! ## Make a patch and apply it
+//! ```silk
+//! import silk.text.diff
+//! import silk.text.diff { Algorithm, ApplyError, FilePatch, PatchError }
+//! import silk.collections.list { List }
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.core.effect { Effect }
+//! import silk.text.string { String }
+//!
+//! effect fn check() -> i32 ! PatchError | ApplyError | OutOfMemoryError ? &mut Allocator {
+//!   let old = "red\ngreen\nblue\n"
+//!   let new = "red\nyellow\nblue\n"
+//!   let text = run diff.unified("a/colors.txt", old, "b/colors.txt", new, 3, Algorithm.Histogram)
+//!   let expected = "--- a/colors.txt\n+++ b/colors.txt\n@@ -1,3 +1,3 @@\n red\n-green\n+yellow\n blue\n"
+//!   if String.view(&text) != expected {
+//!     return 1
+//!   }
+//!   let patch = run diff.parse(String.view(&text))
+//!   let file = &List<FilePatch>.asSlice(&patch.files)[0]
+//!   let patched = run diff.apply(old, String.view(&text), file)
+//!   if String.view(&patched) != new {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//!
+//! effect fn failed(error: PatchError | ApplyError | OutOfMemoryError) -> i32 {
+//!   drop error
+//!   return 2
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   return run Effect.catchAll(check(), failed) |> Effect.provideMut<Allocator>(&mut allocator)
+//! }
+//! ```
+//!
+//! @category Text
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.io.writer { Writer, WriterError }
+import silk.text.format { Debug, Format, Formatter }
+import silk.text.string { String }
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+
+/// The algorithm that finds the lines two texts share.
+///
+/// # When to use
+///
+/// Use [`Algorithm.Histogram`] unless there is a reason to use another algorithm. It is the
+/// fastest, and its diffs are easy to read.
+///
+/// # Details
+///
+/// All three algorithms give correct edits: applied to the old text, they give the new text. They
+/// can differ in which lines they keep when more than one choice has the same cost, and
+/// [`Algorithm.Myers`] and [`Algorithm.Histogram`] can change a few more lines than the minimum.
+pub enum Algorithm {
+  /// Myers' algorithm, as `git diff` uses by default. A search that takes longer than about the
+  /// square root of the line count stops at its best point so far, so the time stays low for very
+  /// different texts. The diff can then have a few more changed lines than the minimum.
+  Myers,
+  /// Myers' algorithm with no limit, as `git diff --minimal`. The diff has the fewest deleted and
+  /// inserted lines. The time grows with the line count times the number of changed lines.
+  MyersMinimal,
+  /// The histogram algorithm, as `git diff --histogram`. It matches the lines that are rare in
+  /// both texts first, then the lines around them. It is the fastest of the three, and it keeps
+  /// rare lines, such as function headers, as anchors.
+  Histogram,
+}
+
+/// What one [`Edit`] does: keep, delete, or insert its lines.
+pub enum EditKind {
+  /// The lines are in both sequences.
+  Equal,
+  /// The lines are only in the old sequence.
+  Delete,
+  /// The lines are only in the new sequence.
+  Insert,
+}
+
+/// One run of lines that are equal, deleted, or inserted.
+///
+/// # Details
+///
+/// The runs of a diff cover both sequences in order, with no gaps: each run starts where the last
+/// one ended. An `Equal` run covers `length` lines of each sequence. A `Delete` run covers
+/// `length` old lines and starts no new lines, and an `Insert` run covers `length` new lines and
+/// starts no old lines. Where lines change, the `Delete` run comes before the `Insert` run. Line
+/// indices start from 0.
+pub struct Edit {
+  /// What the run does.
+  pub kind: EditKind,
+  /// The index of the first line of the run in the old sequence.
+  pub oldStart: usize,
+  /// The index of the first line of the run in the new sequence.
+  pub newStart: usize,
+  /// The number of lines in the run.
+  pub length: usize,
+}
+
+impl Copy for Edit {}
+
+// A rectangle of the edit graph: old lines `aLo` to `aHi` against new lines `bLo` to `bHi`.
+struct Region {
+  aLo: usize,
+  aHi: usize,
+  bLo: usize,
+  bHi: usize,
+}
+
+impl Copy for Region {}
+
+// A point of the edit graph.
+struct Point {
+  x: usize,
+  y: usize,
+}
+
+impl Copy for Point {}
+
+// The histogram algorithm uses only elements that occur at most this many times in the old
+// region; with none, it falls back to Myers' algorithm.
+const MAX_CHAIN: u32 = 64
+
+/// Returns the edits that turn the sequence `old` into `new`, where each number is one symbol.
+///
+/// # When to use
+///
+/// Use this function to compare sequences of things other than lines, such as words or tokens:
+/// give equal things equal numbers, then compare the numbers. For lines of text, use
+/// [`diffLines`].
+///
+/// # Details
+///
+/// The runs cover both sequences in order. Where symbols change, a `Delete` run comes before the
+/// `Insert` run. The memory used grows with the sequence lengths and with the largest symbol, so
+/// number the symbols from 0.
+///
+/// # Errors
+///
+/// - `OutOfMemoryError` if the `Allocator` cannot supply the scratch storage or the result.
+///
+/// # Examples
+///
+/// ## Compare two sequences of word numbers
+///
+/// ```silk
+/// import silk.text.diff
+/// import silk.text.diff { Algorithm, Edit, EditKind }
+/// import silk.collections.list { List }
+/// import silk.mem.allocator { Allocator, OutOfMemoryError }
+/// import silk.core.effect { Effect }
+///
+/// effect fn check() -> i32 ! OutOfMemoryError ? &mut Allocator {
+///   // "the quick fox" against "the slow fox", one number per word.
+///   let old: [u32; 3] = [0, 1, 2]
+///   let new: [u32; 3] = [0, 3, 2]
+///   let edits = run diff.diffSymbols(&old, &new, Algorithm.Histogram)
+///   let runs = List<Edit>.asSlice(&edits)
+///   if runs.length != 4 || runs[1].kind != EditKind.Delete || runs[2].kind != EditKind.Insert {
+///     return 1
+///   }
+///   return 0
+/// }
+///
+/// effect fn exhausted(error: OutOfMemoryError) -> i32 {
+///   drop error
+///   return 2
+/// }
+///
+/// pub fn main() -> i32 {
+///   let mut allocator = Allocator.systemAllocatorProvider()
+///   return run Effect.catchAll(check(), exhausted) |> Effect.provideMut<Allocator>(&mut allocator)
+/// }
+/// ```
+pub effect fn diffSymbols(old: &[u32], new: &[u32], algorithm: Algorithm) -> List<Edit>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut symbols: usize = 0
+  let mut at: usize = 0
+  while at < old.length {
+    if u32.toUsize(old[at]) >= symbols {
+      symbols = u32.toUsize(old[at]) + 1
+    }
+    at = at + 1
+  }
+  at = 0
+  while at < new.length {
+    if u32.toUsize(new[at]) >= symbols {
+      symbols = u32.toUsize(new[at]) + 1
+    }
+    at = at + 1
+  }
+  return run compare(old, new, symbols, algorithm)
+}
+
+/// Returns the edits that turn the lines of `old` into the lines of `new`.
+///
+/// # When to use
+///
+/// Use this function when the edits themselves are needed, for example to show a side-by-side
+/// view or to count changed lines. Use [`unified`] for diff text.
+///
+/// # Details
+///
+/// A line ends after each `\n`. A last line without `\n` is a line too, and it differs from the
+/// same line with `\n`. Lines are compared byte for byte. The runs cover both texts in order, with
+/// line indices from 0. Where lines change, a `Delete` run comes before the `Insert` run.
+///
+/// # Errors
+///
+/// - `OutOfMemoryError` if the `Allocator` cannot supply the scratch storage or the result.
+///
+/// # Examples
+///
+/// ## Count the changed lines
+///
+/// ```silk
+/// import silk.text.diff
+/// import silk.text.diff { Algorithm, Edit, EditKind }
+/// import silk.collections.list { List }
+/// import silk.mem.allocator { Allocator, OutOfMemoryError }
+/// import silk.core.effect { Effect }
+///
+/// effect fn check() -> i32 ! OutOfMemoryError ? &mut Allocator {
+///   let edits = run diff.diffLines("a\nb\nc\n", "a\nc\nd\n", Algorithm.MyersMinimal)
+///   let runs = List<Edit>.asSlice(&edits)
+///   let mut deleted: usize = 0
+///   let mut inserted: usize = 0
+///   let mut at: usize = 0
+///   while at < runs.length {
+///     if runs[at].kind == EditKind.Delete {
+///       deleted = deleted + runs[at].length
+///     } else if runs[at].kind == EditKind.Insert {
+///       inserted = inserted + runs[at].length
+///     }
+///     at = at + 1
+///   }
+///   if deleted != 1 || inserted != 1 {
+///     return 1
+///   }
+///   return 0
+/// }
+///
+/// effect fn exhausted(error: OutOfMemoryError) -> i32 {
+///   drop error
+///   return 2
+/// }
+///
+/// pub fn main() -> i32 {
+///   let mut allocator = Allocator.systemAllocatorProvider()
+///   return run Effect.catchAll(check(), exhausted) |> Effect.provideMut<Allocator>(&mut allocator)
+/// }
+/// ```
+pub effect fn diffLines(old: string, new: string, algorithm: Algorithm) -> List<Edit>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return run diffLinesBytes(String.utf8Bytes(old), String.utf8Bytes(new), algorithm)
+}
+
+/// Returns the edits that turn the lines of the bytes `old` into the lines of `new`.
+///
+/// # When to use
+///
+/// Use this function for file contents and other bytes that need not be UTF-8. For text, use
+/// [`diffLines`].
+///
+/// # Details
+///
+/// A line ends after each `\n` byte. A last line without `\n` is a line too, and it differs from
+/// the same line with `\n`. Lines are compared byte for byte. The runs cover both inputs in
+/// order, with line indices from 0. Where lines change, a `Delete` run comes before the `Insert`
+/// run.
+///
+/// # Errors
+///
+/// - `OutOfMemoryError` if the `Allocator` cannot supply the scratch storage or the result.
+pub effect fn diffLinesBytes(old: &[u8], new: &[u8], algorithm: Algorithm) -> List<Edit>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let oldStarts = run lineStarts(old)
+  let newStarts = run lineStarts(new)
+  let mut oldIds = List<u32>.make()
+  let mut newIds = List<u32>.make()
+  let symbols = run intern(
+    old,
+    List<usize>.asSlice(&oldStarts),
+    new,
+    List<usize>.asSlice(&newStarts),
+    &mut oldIds,
+    &mut newIds,
+  )
+  return run compare(List<u32>.asSlice(&oldIds), List<u32>.asSlice(&newIds), symbols, algorithm)
+}
+
+/// Returns the unified diff from `old` to `new`, with `context` unchanged lines around each change.
+///
+/// # When to use
+///
+/// Use this function to show how a text changed, or to make a patch for [`apply`] or for tools
+/// such as `patch` and `git apply`.
+///
+/// # Details
+///
+/// The diff starts with `--- oldName` and `+++ newName`, then has one `@@ -start,count +start,count
+/// @@` hunk for each group of changes. Changes with at most `2 * context` unchanged lines between
+/// them share a hunk. Each line starts with `' '` for an unchanged line, `'-'` for a deleted line,
+/// or `'+'` for an inserted line. A last line without `\n` is followed by `\n\ No newline at end
+/// of file\n`. The names are written as given, so pass `a/path` and `b/path` for the form that
+/// `git apply` expects. The usual `context` is 3.
+///
+/// Equal texts give an empty diff, with no header.
+///
+/// # Errors
+///
+/// - `OutOfMemoryError` if the `Allocator` cannot supply the scratch storage or the result.
+///
+/// # Gotchas
+///
+/// A name that contains a tab or a newline makes a header that other tools read differently.
+///
+/// # Examples
+///
+/// ## Write a diff with one line of context
+///
+/// ```silk
+/// import silk.text.diff
+/// import silk.text.diff { Algorithm }
+/// import silk.mem.allocator { Allocator, OutOfMemoryError }
+/// import silk.core.effect { Effect }
+/// import silk.text.string { String }
+///
+/// effect fn check() -> i32 ! OutOfMemoryError ? &mut Allocator {
+///   let old = "one\ntwo\nthree\nfour\n"
+///   let new = "one\n2\nthree\nfour"
+///   let text = run diff.unified("a/n.txt", old, "b/n.txt", new, 1, Algorithm.Histogram)
+///   let expected = "--- a/n.txt\n+++ b/n.txt\n@@ -1,4 +1,4 @@\n one\n-two\n+2\n three\n-four\n+four\n\\ No newline at end of file\n"
+///   if String.view(&text) != expected {
+///     return 1
+///   }
+///   return 0
+/// }
+///
+/// effect fn exhausted(error: OutOfMemoryError) -> i32 {
+///   drop error
+///   return 2
+/// }
+///
+/// pub fn main() -> i32 {
+///   let mut allocator = Allocator.systemAllocatorProvider()
+///   return run Effect.catchAll(check(), exhausted) |> Effect.provideMut<Allocator>(&mut allocator)
+/// }
+/// ```
+pub effect fn unified(
+  oldName: string,
+  old: string,
+  newName: string,
+  new: string,
+  context: usize,
+  algorithm: Algorithm,
+) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let output = run unifiedBytes(
+    String.utf8Bytes(oldName),
+    String.utf8Bytes(old),
+    String.utf8Bytes(newName),
+    String.utf8Bytes(new),
+    context,
+    algorithm,
+  )
+  return unsafe String.fromBytesUnchecked(move output)
+}
+
+/// Returns the unified diff from the bytes `old` to `new`, with `context` unchanged lines around
+/// each change.
+///
+/// # When to use
+///
+/// Use this function for file contents and paths that need not be UTF-8. For text, use
+/// [`unified`].
+///
+/// # Details
+///
+/// The diff starts with `--- oldName` and `+++ newName`, then has one `@@ -start,count +start,count
+/// @@` hunk for each group of changes. Changes with at most `2 * context` unchanged lines between
+/// them share a hunk. Each line starts with `' '`, `'-'`, or `'+'`. A last line without `\n` is
+/// followed by `\n\ No newline at end of file\n`. Equal inputs give an empty diff, with no
+/// header.
+///
+/// # Errors
+///
+/// - `OutOfMemoryError` if the `Allocator` cannot supply the scratch storage or the result.
+pub effect fn unifiedBytes(
+  oldName: &[u8],
+  old: &[u8],
+  newName: &[u8],
+  new: &[u8],
+  context: usize,
+  algorithm: Algorithm,
+) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let oldStarts = run lineStarts(old)
+  let newStarts = run lineStarts(new)
+  let mut oldIds = List<u32>.make()
+  let mut newIds = List<u32>.make()
+  let symbols = run intern(
+    old,
+    List<usize>.asSlice(&oldStarts),
+    new,
+    List<usize>.asSlice(&newStarts),
+    &mut oldIds,
+    &mut newIds,
+  )
+  let edits = run compare(
+    List<u32>.asSlice(&oldIds),
+    List<u32>.asSlice(&newIds),
+    symbols,
+    algorithm,
+  )
+  let mut output = Bytes.make()
+  run writeUnified(
+    &mut output,
+    oldName,
+    old,
+    List<usize>.asSlice(&oldStarts),
+    newName,
+    new,
+    List<usize>.asSlice(&newStarts),
+    List<Edit>.asSlice(&edits),
+    context,
+  )
+  return move output
+}
+
+// Lines
+
+// The offset of each line start in `text`, then the length of `text`. A line ends after `\n`; a
+// last line without `\n` is a line too.
+effect fn lineStarts(text: &[u8]) -> List<usize>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut starts = run List<usize>.makeWithCapacity(text.length / 32 + 2)
+  run List<usize>.append(&mut starts, 0)
+
+  // Eight bytes at a time: each `\n` byte of the word sets the top bit of its byte in `found`.
+  let mut at: usize = 0
+  while at + 8 <= text.length {
+    let flipped = u64.bitXor(word(text, at), 723401728380766730)
+    let mut found = u64.wrappingSubtract(flipped, 72340172838076673) & u64.bitNot(flipped)
+      & 9259542123273814144
+    while found != 0 {
+      run List<usize>.append(&mut starts, at + u32.toUsize(u64.trailingZeros(found) / 8) + 1)
+      found = found & u64.wrappingSubtract(found, 1)
+    }
+    at = at + 8
+  }
+  while at < text.length {
+    if text[at] == 10 {
+      run List<usize>.append(&mut starts, at + 1)
+    }
+    at = at + 1
+  }
+  if text.length > 0 && text[text.length - 1] != 10 {
+    run List<usize>.append(&mut starts, text.length)
+  }
+  return move starts
+}
+
+fn line<'text>(text: &'text [u8], starts: &[usize], index: usize) -> &'text [u8] {
+  return Slice.view<u8>(text, starts[index], starts[index + 1] - starts[index])
+}
+
+// Line `index` of the old text, or of the new text after the old lines.
+fn either<'text>(
+  oldText: &'text [u8],
+  oldStarts: &[usize],
+  newText: &'text [u8],
+  newStarts: &[usize],
+  index: usize,
+) -> &'text [u8] {
+  if index < oldStarts.length - 1 {
+    return line(oldText, oldStarts, index)
+  }
+  return line(newText, newStarts, index - (oldStarts.length - 1))
+}
+
+// Reads 8 bytes at `at` as a little-endian word.
+@inlineAlways
+fn word(values: &[u8], at: usize) -> u64 {
+  let bytes = Slice.view<u8>(values, at, 8)
+  return u8.toU64(bytes[0]) | u64.shiftLeft(u8.toU64(bytes[1]), 8)
+    | u64.shiftLeft(u8.toU64(bytes[2]), 16)
+    | u64.shiftLeft(u8.toU64(bytes[3]), 24)
+    | u64.shiftLeft(u8.toU64(bytes[4]), 32)
+    | u64.shiftLeft(u8.toU64(bytes[5]), 40)
+    | u64.shiftLeft(u8.toU64(bytes[6]), 48)
+    | u64.shiftLeft(u8.toU64(bytes[7]), 56)
+}
+
+fn sameBytes(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at: usize = 0
+  while at + 8 <= left.length {
+    if word(left, at) != word(right, at) {
+      return false
+    }
+    at = at + 8
+  }
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + 1
+  }
+  return true
+}
+
+// A hash of `values` that reads 8 bytes at a time.
+fn hashBytes(values: &[u8]) -> u64 {
+  let mut hash = u64.wrappingMultiply(usize.toU64(values.length), 11400714819323198485)
+  let mut at: usize = 0
+  while at + 8 <= values.length {
+    hash = u64.wrappingMultiply(u64.bitXor(hash, word(values, at)), 11400714819323198485)
+    hash = u64.bitXor(hash, u64.shiftRight(hash, 29))
+    at = at + 8
+  }
+  let mut tail: u64 = 0
+  let mut shift: u64 = 0
+  while at < values.length {
+    tail = tail | u64.shiftLeft(u8.toU64(values[at]), shift)
+    shift = shift + 8
+    at = at + 1
+  }
+  hash = u64.wrappingMultiply(u64.bitXor(hash, tail), 13787848793156543929)
+  return u64.bitXor(hash, u64.shiftRight(hash, 32))
+}
+
+// Numbers the lines of both texts so that equal lines get equal numbers, and returns how many
+// numbers there are.
+effect fn intern(
+  oldText: &[u8],
+  oldStarts: &[usize],
+  newText: &[u8],
+  newStarts: &[usize],
+  oldIds: &mut List<u32>,
+  newIds: &mut List<u32>,
+) -> usize
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let oldCount = oldStarts.length - 1
+  let newCount = newStarts.length - 1
+  let mut capacity: usize = 16
+  while capacity < 2 * (oldCount + newCount) {
+    capacity = capacity * 2
+  }
+  let mask = capacity - 1
+
+  // Each slot holds 0 or a symbol plus 1.
+  let mut slots = List<u32>.make()
+  run List<u32>.appendRepeated(&mut slots, 0, capacity)
+
+  // For each symbol: its hash, and its first line, numbered across both texts.
+  let mut hashes = List<u64>.make()
+  let mut firsts = List<usize>.make()
+  run List<u32>.reserveExact(&mut oldIds, oldCount)
+  run List<u32>.reserveExact(&mut newIds, newCount)
+  let mut index: usize = 0
+  while index < oldCount + newCount {
+    let content = either(oldText, oldStarts, newText, newStarts, index)
+    let hash = hashBytes(content)
+    let mut slot = usize.bitAnd(u64.wrappingToUsize(hash), mask)
+    let mut symbol: u32 = 0
+    let mut found = false
+    while !found {
+      let held = List<u32>.get(&slots, slot)
+      if held == 0 {
+        symbol = usize.toU32(List<u64>.length(&hashes))
+        run List<u64>.append(&mut hashes, hash)
+        run List<usize>.append(&mut firsts, index)
+        List<u32>.set(&mut slots, slot, symbol + 1)
+        found = true
+      } else {
+        let candidate = held - 1
+        let at = u32.toUsize(candidate)
+        if List<u64>.get(&hashes, at) == hash {
+          let first = List<usize>.get(&firsts, at)
+          if sameBytes(content, either(oldText, oldStarts, newText, newStarts, first)) {
+            symbol = candidate
+            found = true
+          }
+        }
+        slot = usize.bitAnd(slot + 1, mask)
+      }
+    }
+    if index < oldCount {
+      run List<u32>.append(&mut oldIds, symbol)
+    } else {
+      run List<u32>.append(&mut newIds, symbol)
+    }
+    index = index + 1
+  }
+  return List<u64>.length(&hashes)
+}
+
+// Comparison
+
+effect fn compare(a: &[u32], b: &[u32], symbols: usize, algorithm: Algorithm) -> List<Edit>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut removedList = List<bool>.make()
+  let mut addedList = List<bool>.make()
+  run List<bool>.appendRepeated(&mut removedList, false, a.length)
+  run List<bool>.appendRepeated(&mut addedList, false, b.length)
+  let region = Region { aLo: 0, aHi: a.length, bLo: 0, bHi: b.length }
+  let mut seen = List<u8>.make()
+  run List<u8>.appendRepeated(&mut seen, 0, symbols)
+  if algorithm == Algorithm.Histogram {
+    run histogram(a, b, symbols, region, &mut seen, &mut removedList, &mut addedList)
+  } else {
+    run myers(
+      a,
+      b,
+      region,
+      algorithm == Algorithm.MyersMinimal,
+      &mut seen,
+      &mut removedList,
+      &mut addedList,
+    )
+  }
+  return run collect(List<bool>.asSlice(&removedList), List<bool>.asSlice(&addedList))
+}
+
+// Turns the marks into runs. Within a change, the deleted lines come before the inserted lines.
+effect fn collect(removed: &[bool], added: &[bool]) -> List<Edit>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut edits = List<Edit>.make()
+  let mut i: usize = 0
+  let mut j: usize = 0
+  while i < removed.length || j < added.length {
+    if i < removed.length && removed[i] {
+      let start = i
+      while i < removed.length && removed[i] {
+        i = i + 1
+      }
+      run List<Edit>.append(
+        &mut edits,
+        Edit { kind: EditKind.Delete, oldStart: start, newStart: j, length: i - start },
+      )
+    } else if j < added.length && added[j] {
+      let start = j
+      while j < added.length && added[j] {
+        j = j + 1
+      }
+      run List<Edit>.append(
+        &mut edits,
+        Edit { kind: EditKind.Insert, oldStart: i, newStart: start, length: j - start },
+      )
+    } else {
+      let oldStart = i
+      let newStart = j
+      while i < removed.length && j < added.length && !removed[i] && !added[j] {
+        i = i + 1
+        j = j + 1
+      }
+      run List<Edit>.append(
+        &mut edits,
+        Edit { kind: EditKind.Equal, oldStart: oldStart, newStart: newStart, length: i - oldStart },
+      )
+    }
+  }
+  return move edits
+}
+
+// Skips the lines that the region shares at its start and end.
+fn trim(a: &[u32], b: &[u32], region: Region) -> Region {
+  let mut r = region
+  while r.aLo < r.aHi && r.bLo < r.bHi && a[r.aLo] == b[r.bLo] {
+    r.aLo = r.aLo + 1
+    r.bLo = r.bLo + 1
+  }
+  while r.aLo < r.aHi && r.bLo < r.bHi && a[r.aHi - 1] == b[r.bHi - 1] {
+    r.aHi = r.aHi - 1
+    r.bHi = r.bHi - 1
+  }
+  return r
+}
+
+fn markAll(region: Region, removed: &mut List<bool>, added: &mut List<bool>) -> () {
+  let oldMarks = List<bool>.asMutSlice(&mut removed)
+  let newMarks = List<bool>.asMutSlice(&mut added)
+  let mut i = region.aLo
+  while i < region.aHi {
+    oldMarks[i] = true
+    i = i + 1
+  }
+  let mut j = region.bLo
+  while j < region.bHi {
+    newMarks[j] = true
+    j = j + 1
+  }
+}
+
+// Myers' algorithm on `region`. A line whose symbol is not on the other side of the region is
+// always a change, so it is marked first and left out of the search, as xdiff does; the result
+// stays minimal. `seen` holds a zero for each symbol, and holds zeros again on return.
+effect fn myers(
+  a: &[u32],
+  b: &[u32],
+  region: Region,
+  minimal: bool,
+  seen: &mut List<u8>,
+  removed: &mut List<bool>,
+  added: &mut List<bool>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let r = trim(a, b, region)
+  if r.aLo == r.aHi || r.bLo == r.bHi {
+    markAll(r, &mut removed, &mut added)
+    return
+  }
+  let marks = List<u8>.asMutSlice(&mut seen)
+  let mut i = r.aLo
+  while i < r.aHi {
+    let symbol = u32.toUsize(a[i])
+    marks[symbol] = u8.bitOr(marks[symbol], 1)
+    i = i + 1
+  }
+  let mut j = r.bLo
+  while j < r.bHi {
+    let symbol = u32.toUsize(b[j])
+    marks[symbol] = u8.bitOr(marks[symbol], 2)
+    j = j + 1
+  }
+  let mut oldKept = List<u32>.make()
+  let mut oldPlace = List<usize>.make()
+  let mut newKept = List<u32>.make()
+  let mut newPlace = List<usize>.make()
+  let oldMarks = List<bool>.asMutSlice(&mut removed)
+  let newMarks = List<bool>.asMutSlice(&mut added)
+  i = r.aLo
+  while i < r.aHi {
+    if marks[u32.toUsize(a[i])] == 3 {
+      run List<u32>.append(&mut oldKept, a[i])
+      run List<usize>.append(&mut oldPlace, i)
+    } else {
+      oldMarks[i] = true
+    }
+    i = i + 1
+  }
+  j = r.bLo
+  while j < r.bHi {
+    if marks[u32.toUsize(b[j])] == 3 {
+      run List<u32>.append(&mut newKept, b[j])
+      run List<usize>.append(&mut newPlace, j)
+    } else {
+      newMarks[j] = true
+    }
+    j = j + 1
+  }
+  i = r.aLo
+  while i < r.aHi {
+    marks[u32.toUsize(a[i])] = 0
+    i = i + 1
+  }
+  j = r.bLo
+  while j < r.bHi {
+    marks[u32.toUsize(b[j])] = 0
+    j = j + 1
+  }
+  let oldCount = List<u32>.length(&oldKept)
+  let newCount = List<u32>.length(&newKept)
+  let mut oldChanged = List<bool>.make()
+  let mut newChanged = List<bool>.make()
+  run List<bool>.appendRepeated(&mut oldChanged, false, oldCount)
+  run List<bool>.appendRepeated(&mut newChanged, false, newCount)
+  run myersCore(
+    List<u32>.asSlice(&oldKept),
+    List<u32>.asSlice(&newKept),
+    Region { aLo: 0, aHi: oldCount, bLo: 0, bHi: newCount },
+    minimal,
+    &mut oldChanged,
+    &mut newChanged,
+  )
+  let oldPlaces = List<usize>.asSlice(&oldPlace)
+  let newPlaces = List<usize>.asSlice(&newPlace)
+  let oldFlags = List<bool>.asSlice(&oldChanged)
+  let newFlags = List<bool>.asSlice(&newChanged)
+  let oldOut = List<bool>.asMutSlice(&mut removed)
+  let newOut = List<bool>.asMutSlice(&mut added)
+  i = 0
+  while i < oldCount {
+    if oldFlags[i] {
+      oldOut[oldPlaces[i]] = true
+    }
+    i = i + 1
+  }
+  j = 0
+  while j < newCount {
+    if newFlags[j] {
+      newOut[newPlaces[j]] = true
+    }
+    j = j + 1
+  }
+}
+
+// Myers' algorithm in linear space, after "An O(ND) difference algorithm and its variations"
+// (1986): each step finds the middle snake of a region and splits the region there.
+effect fn myersCore(
+  a: &[u32],
+  b: &[u32],
+  region: Region,
+  minimal: bool,
+  removed: &mut List<bool>,
+  added: &mut List<bool>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let reach = (region.aHi - region.aLo + region.bHi - region.bLo + 1) / 2 + 1
+
+  // Without `minimal`, a search stops after about the square root of the lines, as in xdiff.
+  let mut limit: usize = 0
+  if !minimal {
+    limit = 256
+    while limit * limit < region.aHi - region.aLo + region.bHi - region.bLo + 3 {
+      limit = limit + limit / 2
+    }
+  }
+  let mut forwardList = List<usize>.make()
+  let mut backwardList = List<usize>.make()
+  run List<usize>.appendRepeated(&mut forwardList, 0, 2 * reach + 2)
+  run List<usize>.appendRepeated(&mut backwardList, 0, 2 * reach + 2)
+  let mut work = List<Region>.make()
+  run List<Region>.append(&mut work, region)
+  while let Option<Region>.Some { value } = List<Region>.pop(&mut work) {
+    let r = trim(a, b, value)
+    if r.aLo == r.aHi || r.bLo == r.bHi {
+      markAll(r, &mut removed, &mut added)
+    } else {
+      match middleSnake(a, b, r, limit, &mut forwardList, &mut backwardList) {
+        Option<Point>.Some { value: split } => {
+          run List<Region>.append(
+            &mut work,
+            Region { aLo: r.aLo, aHi: split.x, bLo: r.bLo, bHi: split.y },
+          )
+          run List<Region>.append(
+            &mut work,
+            Region { aLo: split.x, aHi: r.aHi, bLo: split.y, bHi: r.bHi },
+          )
+        }
+        Option<Point>.None => {
+          markAll(r, &mut removed, &mut added)
+        }
+      }
+    }
+  }
+}
+
+// Finds the start of the middle snake of `region`, whose sides are not empty. Diagonal `k` is at
+// index `k + reach` of `forward` and `backward`.
+fn middleSnake(
+  a: &[u32],
+  b: &[u32],
+  region: Region,
+  limit: usize,
+  forwardList: &mut List<usize>,
+  backwardList: &mut List<usize>,
+) -> Option<Point> {
+  let forward = List<usize>.asMutSlice(&mut forwardList)
+  let backward = List<usize>.asMutSlice(&mut backwardList)
+  let n = region.aHi - region.aLo
+  let m = region.bHi - region.bLo
+  let reach = (n + m + 1) / 2 + 1
+
+  // `k - delta` is `(index + m) - (reach + n)`.
+  let odd = usize.bitAnd(n + m, 1) == 1
+  forward[reach + 1] = 0
+  backward[reach + 1] = 0
+  let mut d: usize = 0
+  while d < reach {
+    // Forward paths.
+    let mut index = reach - d
+    while index <= reach + d {
+      let mut x: usize = 0
+      if index == reach - d || (index != reach + d && forward[index - 1] < forward[index + 1]) {
+        x = forward[index + 1]
+      } else {
+        x = forward[index - 1] + 1
+      }
+      let y = x + reach - index
+      let startX = x
+      let startY = y
+      let mut ex = x
+      let mut ey = y
+      while ex < n && ey < m && a[region.aLo + ex] == b[region.bLo + ey] {
+        ex = ex + 1
+        ey = ey + 1
+      }
+      forward[index] = ex
+      if odd && d > 0 && within(index + m, reach + n, d - 1) {
+        let other = 2 * reach + n - index - m
+        if forward[index] + backward[other] >= n {
+          return Option<Point>.Some {
+            value: Point { x: region.aLo + startX, y: region.bLo + startY }
+          }
+        }
+      }
+      index = index + 2
+    }
+
+    // Backward paths.
+    index = reach - d
+    while index <= reach + d {
+      let mut x: usize = 0
+      if index == reach - d || (index != reach + d && backward[index - 1] < backward[index + 1]) {
+        x = backward[index + 1]
+      } else {
+        x = backward[index - 1] + 1
+      }
+      let mut y = x + reach - index
+      while x < n && y < m && a[region.aHi - 1 - x] == b[region.bHi - 1 - y] {
+        x = x + 1
+        y = y + 1
+      }
+      backward[index] = x
+      if !odd && within(index + m, reach + n, d) {
+        let other = 2 * reach + n - index - m
+        if backward[index] + forward[other] >= n {
+          return Option<Point>.Some {
+            value: Point { x: region.aLo + n - x, y: region.bLo + m - y }
+          }
+        }
+      }
+      index = index + 2
+    }
+    if limit != 0 && d >= limit {
+      return farthest(region, move forward, move backward, reach, d)
+    }
+    d = d + 1
+  }
+  return Option<Point>.None
+}
+
+// The point of the forward or backward paths of cost `d` that is farthest from where it started,
+// or none if neither left its corner.
+fn farthest(
+  region: Region,
+  forward: &mut [usize],
+  backward: &mut [usize],
+  reach: usize,
+  d: usize,
+) -> Option<Point> {
+  let n = region.aHi - region.aLo
+  let m = region.bHi - region.bLo
+  let mut best: usize = 0
+  let mut point = Point { x: 0, y: 0 }
+  let mut index = reach - d
+  while index <= reach + d {
+    let x = forward[index]
+    let y = x + reach - index
+    if x <= n && y <= m && x + y > best && x + y < n + m {
+      best = x + y
+      point = Point { x: x, y: y }
+    }
+    let bx = backward[index]
+    let by = bx + reach - index
+    if bx <= n && by <= m && bx + by > best && bx + by < n + m {
+      best = bx + by
+      point = Point { x: n - bx, y: m - by }
+    }
+    index = index + 2
+  }
+  if best == 0 {
+    return Option<Point>.None
+  }
+  return Option<Point>.Some { value: Point { x: region.aLo + point.x, y: region.bLo + point.y } }
+}
+
+// Whether `left` and `right` are at most `limit` apart.
+fn within(left: usize, right: usize, limit: usize) -> bool {
+  if left >= right {
+    return left - right <= limit
+  }
+  return right - left <= limit
+}
+
+// The histogram algorithm, after JGit's HistogramDiff: each step anchors a region on the longest
+// common run around its least frequent shared line, and splits the region there.
+effect fn histogram(
+  a: &[u32],
+  b: &[u32],
+  symbols: usize,
+  region: Region,
+  seen: &mut List<u8>,
+  removed: &mut List<bool>,
+  added: &mut List<bool>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut countList = List<u32>.make()
+  let mut headList = List<usize>.make()
+  let mut nextList = List<usize>.make()
+  run List<u32>.appendRepeated(&mut countList, 0, symbols)
+  run List<usize>.appendRepeated(&mut headList, 0, symbols)
+  run List<usize>.appendRepeated(&mut nextList, 0, a.length)
+  let count = List<u32>.asMutSlice(&mut countList)
+  let head = List<usize>.asMutSlice(&mut headList)
+  let next = List<usize>.asMutSlice(&mut nextList)
+  let mut work = List<Region>.make()
+  run List<Region>.append(&mut work, region)
+  while let Option<Region>.Some { value } = List<Region>.pop(&mut work) {
+    let r = trim(a, b, value)
+    if r.aLo == r.aHi || r.bLo == r.bHi {
+      markAll(r, &mut removed, &mut added)
+    } else {
+      // Each line of the old region, chained from its symbol in ascending order.
+      let mut i = r.aHi
+      while i > r.aLo {
+        i = i - 1
+        let symbol = u32.toUsize(a[i])
+        next[i] = head[symbol]
+        head[symbol] = i + 1
+        count[symbol] = count[symbol] + 1
+      }
+      let mut shared = false
+      let mut bestLength: usize = 0
+      let mut bestCount = MAX_CHAIN
+      let mut bestA: usize = 0
+      let mut bestB: usize = 0
+      let mut j = r.bLo
+      while j < r.bHi {
+        let symbol = u32.toUsize(b[j])
+        let occurrences = count[symbol]
+        let mut after = j + 1
+        if occurrences > 0 {
+          shared = true
+        }
+        if occurrences > 0 && occurrences <= bestCount {
+          let mut chained = head[symbol]
+          while chained != 0 {
+            let at = chained - 1
+            let mut aStart = at
+            let mut bStart = j
+            let mut aEnd = at + 1
+            let mut bEnd = j + 1
+            let mut rarest = occurrences
+            while aStart > r.aLo && bStart > r.bLo && a[aStart - 1] == b[bStart - 1] {
+              aStart = aStart - 1
+              bStart = bStart - 1
+              if count[u32.toUsize(a[aStart])] < rarest {
+                rarest = count[u32.toUsize(a[aStart])]
+              }
+            }
+            while aEnd < r.aHi && bEnd < r.bHi && a[aEnd] == b[bEnd] {
+              if count[u32.toUsize(a[aEnd])] < rarest {
+                rarest = count[u32.toUsize(a[aEnd])]
+              }
+              aEnd = aEnd + 1
+              bEnd = bEnd + 1
+            }
+            if bEnd > after {
+              after = bEnd
+            }
+            if aEnd - aStart > bestLength || rarest < bestCount {
+              bestLength = aEnd - aStart
+              bestCount = rarest
+              bestA = aStart
+              bestB = bStart
+            }
+            chained = next[at]
+          }
+        }
+        j = after
+      }
+      i = r.aLo
+      while i < r.aHi {
+        let symbol = u32.toUsize(a[i])
+        count[symbol] = 0
+        head[symbol] = 0
+        i = i + 1
+      }
+      if bestLength > 0 {
+        run List<Region>.append(
+          &mut work,
+          Region { aLo: r.aLo, aHi: bestA, bLo: r.bLo, bHi: bestB },
+        )
+        run List<Region>.append(
+          &mut work,
+          Region { aLo: bestA + bestLength, aHi: r.aHi, bLo: bestB + bestLength, bHi: r.bHi },
+        )
+      } else if shared {
+        run myers(a, b, r, false, &mut seen, &mut removed, &mut added)
+      } else {
+        markAll(r, &mut removed, &mut added)
+      }
+    }
+  }
+}
+
+// Unified output
+
+fn smaller(left: usize, right: usize) -> usize {
+  if left < right {
+    return left
+  }
+  return right
+}
+
+effect fn appendDecimal(output: &mut Bytes, value: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut digits: [u8; 20] = [0; 20]
+  let mut count: usize = 0
+  let mut rest = value
+  while count == 0 || rest > 0 {
+    digits[19 - count] = usize.wrappingToU8(rest % 10) + 48
+    rest = rest / 10
+    count = count + 1
+  }
+  run Bytes.append(&mut output, Slice.view<u8>(&digits, 20 - count, count))
+}
+
+// Writes `start,length` for a hunk range whose first line has index `start`.
+effect fn appendRange(output: &mut Bytes, start: usize, length: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if length == 0 {
+    run appendDecimal(&mut output, start)
+    run Bytes.append(&mut output, b",0")
+    return
+  }
+  run appendDecimal(&mut output, start + 1)
+  if length != 1 {
+    run Bytes.append(&mut output, b",")
+    run appendDecimal(&mut output, length)
+  }
+}
+
+effect fn appendLines(
+  output: &mut Bytes,
+  prefix: &[u8],
+  text: &[u8],
+  starts: &[usize],
+  from: usize,
+  to: usize,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut index = from
+  while index < to {
+    let content = line(text, starts, index)
+    run Bytes.append(&mut output, prefix)
+    run Bytes.append(&mut output, content)
+    if content.length == 0 || content[content.length - 1] != 10 {
+      run Bytes.append(&mut output, b"\n\\ No newline at end of file\n")
+    }
+    index = index + 1
+  }
+}
+
+effect fn writeUnified(
+  output: &mut Bytes,
+  oldName: &[u8],
+  oldText: &[u8],
+  oldStarts: &[usize],
+  newName: &[u8],
+  newText: &[u8],
+  newStarts: &[usize],
+  edits: &[Edit],
+  context: usize,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut wroteHeader = false
+  let mut first: usize = 0
+  while first < edits.length {
+    if edits[first].kind == EditKind.Equal {
+      first = first + 1
+      continue
+    }
+
+    // The hunk takes the changes from `first` to `last`, with at most `2 * context` equal lines
+    // between two of them.
+    let mut last = first
+    let mut extending = true
+    while extending {
+      if last + 1 < edits.length && edits[last + 1].kind != EditKind.Equal {
+        last = last + 1
+      } else if last + 2 < edits.length && edits[last + 1].length <= 2 * context {
+        last = last + 2
+      } else {
+        extending = false
+      }
+    }
+    let mut before: usize = 0
+    if first > 0 {
+      before = smaller(context, edits[first - 1].length)
+    }
+    let mut after: usize = 0
+    if last + 1 < edits.length {
+      after = smaller(context, edits[last + 1].length)
+    }
+    let oldStart = edits[first].oldStart - before
+    let newStart = edits[first].newStart - before
+    let mut oldEnd = edits[last].oldStart
+    let mut newEnd = edits[last].newStart
+    if edits[last].kind == EditKind.Delete {
+      oldEnd = oldEnd + edits[last].length
+    } else {
+      newEnd = newEnd + edits[last].length
+    }
+    oldEnd = oldEnd + after
+    newEnd = newEnd + after
+    if !wroteHeader {
+      run Bytes.append(&mut output, b"--- ")
+      run Bytes.append(&mut output, oldName)
+      run Bytes.append(&mut output, b"\n+++ ")
+      run Bytes.append(&mut output, newName)
+      run Bytes.append(&mut output, b"\n")
+      wroteHeader = true
+    }
+    run Bytes.append(&mut output, b"@@ -")
+    run appendRange(&mut output, oldStart, oldEnd - oldStart)
+    run Bytes.append(&mut output, b" +")
+    run appendRange(&mut output, newStart, newEnd - newStart)
+    run Bytes.append(&mut output, b" @@\n")
+    run appendLines(&mut output, b" ", oldText, oldStarts, oldStart, edits[first].oldStart)
+    let mut at = first
+    while at <= last {
+      let edit = edits[at]
+      if edit.kind == EditKind.Equal {
+        run appendLines(
+          &mut output,
+          b" ",
+          oldText,
+          oldStarts,
+          edit.oldStart,
+          edit.oldStart + edit.length,
+        )
+      } else if edit.kind == EditKind.Delete {
+        run appendLines(
+          &mut output,
+          b"-",
+          oldText,
+          oldStarts,
+          edit.oldStart,
+          edit.oldStart + edit.length,
+        )
+      } else {
+        run appendLines(
+          &mut output,
+          b"+",
+          newText,
+          newStarts,
+          edit.newStart,
+          edit.newStart + edit.length,
+        )
+      }
+      at = at + 1
+    }
+    run appendLines(&mut output, b" ", oldText, oldStarts, oldEnd - after, oldEnd)
+    first = last + 1
+  }
+}
+
+// Patches
+
+/// A range of bytes in a patch text.
+///
+/// # Details
+///
+/// The parts of a [`Patch`] are spans of the text that [`parse`] read, so they do not copy it. Use
+/// [`Span.text`] or [`Span.bytes`] with that same text to get the part.
+pub struct Span {
+  /// The offset of the first byte from the start of the source.
+  pub offset: usize,
+  /// The number of bytes.
+  pub length: usize,
+}
+
+impl Copy for Span {}
+
+impl Span {
+  /// Returns the part of `source` that the span covers.
+  ///
+  /// # Gotchas
+  ///
+  /// `source` must be the text that the span came from. The function traps if the span ends
+  /// past the end of `source`, or does not start and end on character boundaries.
+  pub fn text<'source>(self: &Self, source: string<'source>) -> string<'source> {
+    return String.slice(source, self.offset, self.length)
+  }
+
+  /// Returns the bytes of `source` that the span covers.
+  ///
+  /// # Gotchas
+  ///
+  /// `source` must be the bytes that the span came from. The function traps if the span ends past
+  /// the end of `source`.
+  pub fn bytes<'source>(self: &Self, source: &'source [u8]) -> &'source [u8] {
+    return Slice.view<u8>(source, self.offset, self.length)
+  }
+}
+
+/// What one line of a hunk does: keep, delete, or insert it.
+pub enum LineKind {
+  /// The line is in the old and the new file.
+  Context,
+  /// The line is only in the old file.
+  Delete,
+  /// The line is only in the new file.
+  Insert,
+}
+
+/// One line of a hunk: what it does, and its content in the patch text.
+pub struct PatchLine {
+  /// What the line does.
+  pub kind: LineKind,
+  /// The content of the line after its `' '`, `'-'`, or `'+'` prefix, with its `\n`. A line that
+  /// a `\ No newline at end of file` line follows has no `\n`. A context line that is empty in
+  /// the patch, because a tool removed its space, is the `\n` alone.
+  pub text: Span,
+}
+
+impl Copy for PatchLine {}
+
+/// One hunk of a file patch: its `@@` header and where its lines are.
+///
+/// # Details
+///
+/// The numbers are as the header gives them. A range with no lines, such as `-0,0`, gives the line
+/// before the change, so its start is one less than for a range with lines. The lines of the hunk
+/// are `lineCount` items of [`FilePatch.lines`] from `firstLine`.
+pub struct Hunk {
+  /// The line number of the first old line, from 1, or of the line before the change for an empty
+  /// range.
+  pub oldStart: usize,
+  /// The number of context and deleted lines.
+  pub oldLength: usize,
+  /// The line number of the first new line, from 1, or of the line before the change for an empty
+  /// range.
+  pub newStart: usize,
+  /// The number of context and inserted lines.
+  pub newLength: usize,
+  /// The text after the closing `@@`, such as a function name. Empty if there is none.
+  pub section: Span,
+  /// The index of the first line of the hunk in [`FilePatch.lines`].
+  pub firstLine: usize,
+  /// The number of lines of the hunk in [`FilePatch.lines`].
+  pub lineCount: usize,
+}
+
+impl Copy for Hunk {}
+
+/// What a file patch does to its file: change, create, delete, rename, or copy it.
+///
+/// # Details
+///
+/// A git patch says so in its extended header lines, such as `new file mode` or `rename from`.
+/// Other patches create a file when the old path is `/dev/null`, and delete one when the new path
+/// is `/dev/null`.
+pub enum FileChange {
+  /// The file changes in place.
+  Modified,
+  /// The file is new.
+  Created,
+  /// The file is removed.
+  Deleted,
+  /// The file moves to a new path, and can also change.
+  Renamed,
+  /// A copy of the file is made at a new path, and the copy can also change.
+  Copied,
+}
+
+/// The changes to one file: its paths, modes, and hunks.
+///
+/// # Details
+///
+/// The paths and lines are [`Span`] ranges of the patch text. In a git patch, the paths lose their
+/// `a/` and `b/` prefixes, so they are relative to the repository. In other patches they are as
+/// written in the `---` and `+++` lines, up to a tab. Use [`apply`] to apply the hunks to the old
+/// text.
+pub struct FilePatch {
+  /// What the patch does to the file.
+  pub change: FileChange,
+  /// The path of the old file, or none for `/dev/null` or a patch that gives no path.
+  pub oldPath: Option<Span>,
+  /// The path of the new file, or none for `/dev/null` or a patch that gives no path.
+  pub newPath: Option<Span>,
+  /// The old file mode of a git patch, such as 33188 for `100644` in octal.
+  pub oldMode: Option<u32>,
+  /// The new file mode of a git patch, such as 33261 for `100755` in octal.
+  pub newMode: Option<u32>,
+  /// `true` if the patch changes binary content that it does not give as hunks.
+  pub binary: bool,
+  /// The hunks, in order.
+  pub hunks: List<Hunk>,
+  /// The lines of all hunks, in order.
+  pub lines: List<PatchLine>,
+}
+
+/// The file patches of one patch text, in order.
+///
+/// # Details
+///
+/// Its parts are [`Span`] ranges of the text that [`parse`] read, so keep that text alive while the
+/// patch is in use.
+pub struct Patch {
+  /// One item for each file, in the order of the patch.
+  pub files: List<FilePatch>,
+}
+
+/// Why [`parse`] cannot read a patch.
+pub enum PatchReason {
+  /// An `@@` line is not a valid hunk header.
+  InvalidHunkHeader,
+  /// A hunk line does not start with `' '`, `'-'`, `'+'` or `'\\'`, or there are more old or new
+  /// lines than the hunk header gives.
+  InvalidHunkLine,
+  /// The patch ends before the hunk has all the lines that its header gives.
+  UnexpectedEnd,
+  /// A hunk comes before any file header.
+  MissingFileHeader,
+  /// A file mode is not an octal number.
+  InvalidMode,
+}
+
+impl Debug for PatchReason {
+  /// Writes the name of the variant, such as `InvalidHunkHeader`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return match &self.* {
+      PatchReason.InvalidHunkHeader => run Format.write(&mut formatter, b"InvalidHunkHeader")
+      PatchReason.InvalidHunkLine => run Format.write(&mut formatter, b"InvalidHunkLine")
+      PatchReason.UnexpectedEnd => run Format.write(&mut formatter, b"UnexpectedEnd")
+      PatchReason.MissingFileHeader => run Format.write(&mut formatter, b"MissingFileHeader")
+      PatchReason.InvalidMode => run Format.write(&mut formatter, b"InvalidMode")
+    }
+  }
+}
+
+/// The error from [`parse`] or [`parseBytes`]: why the patch cannot be read, and on which line.
+pub struct PatchError {
+  /// Why the patch cannot be read.
+  pub reason: PatchReason,
+  /// The line number of the problem, from 1.
+  pub line: usize,
+}
+
+impl Debug for PatchError {
+  /// Writes the fields, as `PatchError { reason: ..., line: ... }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return run Format.debugFields(self, "PatchError", &mut formatter)
+  }
+}
+
+/// The error from [`apply`] or [`applyBytes`]: a hunk whose old lines are not in the original.
+pub struct ApplyError {
+  /// The index of the hunk in [`FilePatch.hunks`].
+  pub hunk: usize,
+}
+
+impl Debug for ApplyError {
+  /// Writes the fields, as `ApplyError { hunk: ... }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return run Format.debugFields(self, "ApplyError", &mut formatter)
+  }
+}
+
+/// Reads the patch `text`, as `diff -u`, `git diff`, and `git format-patch` write it.
+///
+/// # When to use
+///
+/// Use this function to read a patch before [`apply`] applies its files, or to list the files and
+/// changes that a patch makes.
+///
+/// # Details
+///
+/// A file starts at a `diff --git` line, or at a `---` line that a `+++` line follows. Git
+/// extended header lines give the modes, renames, copies, and binary changes. Each hunk reads as
+/// many lines as its `@@` header gives, and a `\ No newline at end of file` line removes the `\n`
+/// of the line before it. Other lines, such as a commit message or `index` lines, are skipped.
+/// The parts of the result are [`Span`] ranges of `text`.
+///
+/// # Errors
+///
+/// - `PatchError` with reason `InvalidHunkHeader` for an `@@` line that is not a hunk header,
+///   `InvalidHunkLine` for a hunk line that does not start with `' '`, `'-'`, `'+'`, or `'\\'` or
+///   that is more than the header gives, `UnexpectedEnd` if the text ends in a hunk,
+///   `MissingFileHeader` for a hunk before any file header, and `InvalidMode` for a mode that is
+///   not octal.
+/// - `OutOfMemoryError` if the `Allocator` cannot supply the result.
+///
+/// # Gotchas
+///
+/// Quoted git paths, which git writes for names with special characters, keep their quotes and
+/// escapes.
+///
+/// # Examples
+///
+/// ## List the files of a git patch
+///
+/// ```silk
+/// import silk.text.diff
+/// import silk.text.diff { FileChange, FilePatch, PatchError, Span }
+/// import silk.collections.list { List }
+/// import silk.core.option { Option }
+/// import silk.mem.allocator { Allocator, OutOfMemoryError }
+/// import silk.core.effect { Effect }
+///
+/// effect fn check() -> i32 ! PatchError | OutOfMemoryError ? &mut Allocator {
+///   let text = "diff --git a/src/app.js b/src/app.js\nindex 1111111..2222222 100644\n--- a/src/app.js\n+++ b/src/app.js\n@@ -1 +1 @@\n-let x = 1\n+let x = 2\ndiff --git a/notes.txt b/notes.txt\nnew file mode 100644\n--- /dev/null\n+++ b/notes.txt\n@@ -0,0 +1 @@\n+hello\n"
+///   let patch = run diff.parse(text)
+///   let files = List<FilePatch>.asSlice(&patch.files)
+///   if files.length != 2 || files[1].change != FileChange.Created {
+///     return 1
+///   }
+///   let path = match files[0].newPath {
+///     Option<Span>.Some {value} => value.text(text)
+///     Option<Span>.None => ""
+///   }
+///   if path != "src/app.js" {
+///     return 1
+///   }
+///   return 0
+/// }
+///
+/// effect fn failed(error: PatchError | OutOfMemoryError) -> i32 {
+///   drop error
+///   return 2
+/// }
+///
+/// pub fn main() -> i32 {
+///   let mut allocator = Allocator.systemAllocatorProvider()
+///   return run Effect.catchAll(check(), failed) |> Effect.provideMut<Allocator>(&mut allocator)
+/// }
+/// ```
+pub effect fn parse(text: string) -> Patch
+  ! PatchError | OutOfMemoryError
+  ? &mut Allocator {
+  return run parseBytes(String.utf8Bytes(text))
+}
+
+// The state of a file patch while it is read.
+struct Reading {
+  open: bool,
+  git: bool,
+  // Whether the `---` and `+++` lines were read.
+  named: bool,
+  created: bool,
+  deleted: bool,
+  renamed: bool,
+  copied: bool,
+}
+
+fn blankFile() -> FilePatch {
+  return FilePatch {
+    change: FileChange.Modified,
+    oldPath: Option<Span>.None,
+    newPath: Option<Span>.None,
+    oldMode: Option<u32>.None,
+    newMode: Option<u32>.None,
+    binary: false,
+    hunks: List<Hunk>.make(),
+    lines: List<PatchLine>.make(),
+  }
+}
+
+fn startsWith(text: &[u8], at: usize, end: usize, prefix: &[u8]) -> bool {
+  if end - at < prefix.length {
+    return false
+  }
+  return sameBytes(Slice.view<u8>(text, at, prefix.length), prefix)
+}
+
+// The end of the line at `at`, before its `\n`, or the end of `text`.
+fn lineEnd(text: &[u8], at: usize) -> usize {
+  let mut end = at
+  while end < text.length && text[end] != 10 {
+    end = end + 1
+  }
+  return end
+}
+
+// A path from a `---` or `+++` line: up to a tab, without a trailing `\r`, absent for
+// `/dev/null`. With `prefix`, the path loses that leading `a/` or `b/`.
+fn headerPath(text: &[u8], at: usize, end: usize, prefix: &[u8], git: bool) -> Option<Span> {
+  let mut stop = at
+  while stop < end && text[stop] != 9 {
+    stop = stop + 1
+  }
+  if stop > at && text[stop - 1] == 13 {
+    stop = stop - 1
+  }
+  let mut start = at
+  if stop - start == 9 && sameBytes(Slice.view<u8>(text, start, 9), b"/dev/null") {
+    return Option<Span>.None
+  }
+  if git && startsWith(text, start, stop, prefix) {
+    start = start + prefix.length
+  }
+  return Option<Span>.Some { value: Span { offset: start, length: stop - start } }
+}
+
+fn trimmedEnd(text: &[u8], at: usize, end: usize) -> usize {
+  if end > at && text[end - 1] == 13 {
+    return end - 1
+  }
+  return end
+}
+
+// The paths of a `diff --git a/old b/new` line, from `at` after `diff --git `.
+fn gitPaths(file: &mut FilePatch, text: &[u8], at: usize, end: usize) -> () {
+  let stop = trimmedEnd(text, at, end)
+  let mut split = stop
+  let mut probe = at
+
+  // Prefer the split whose two paths are equal, then the first ` b/`.
+  while probe + 3 <= stop {
+    if sameBytes(Slice.view<u8>(text, probe, 3), b" b/") {
+      if split == stop {
+        split = probe
+      }
+      let left = probe - at
+      let right = stop - probe - 1
+      if left == right
+        && sameBytes(Slice.view<u8>(text, at, left), Slice.view<u8>(text, probe + 1, right)) {
+        split = probe
+        probe = stop
+      }
+    }
+    probe = probe + 1
+  }
+  if split == stop {
+    return
+  }
+  let mut oldStart = at
+  if startsWith(text, oldStart, split, b"a/") {
+    oldStart = oldStart + 2
+  }
+  file.oldPath = Option<Span>.Some { value: Span { offset: oldStart, length: split - oldStart } }
+  let newStart = split + 3
+  file.newPath = Option<Span>.Some { value: Span { offset: newStart, length: stop - newStart } }
+}
+
+fn absent(path: Option<Span>) -> bool {
+  return match path {
+    Option<Span>.Some { .. } => false
+    Option<Span>.None => true
+  }
+}
+
+fn modeAt(text: &[u8], at: usize, end: usize) -> Option<u32> {
+  let stop = trimmedEnd(text, at, end)
+  if stop == at {
+    return Option<u32>.None
+  }
+  let mut value: u32 = 0
+  let mut probe = at
+  while probe < stop {
+    let digit = text[probe]
+    if digit < 48 || digit > 55 || value > 16777215 {
+      return Option<u32>.None
+    }
+    value = value * 8 + u8.toU32(digit - 48)
+    probe = probe + 1
+  }
+  return Option<u32>.Some { value: value }
+}
+
+effect fn requireMode(text: &[u8], at: usize, end: usize, lineNumber: usize) -> Option<u32>
+  ! PatchError {
+  let mode = modeAt(text, at, end)
+  if absentMode(mode) {
+    fail patchError(PatchReason.InvalidMode, lineNumber)
+  }
+  return mode
+}
+
+fn absentMode(mode: Option<u32>) -> bool {
+  return match mode {
+    Option<u32>.Some { .. } => false
+    Option<u32>.None => true
+  }
+}
+
+effect fn finish(files: &mut List<FilePatch>, file: FilePatch, reading: &mut Reading) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !reading.open {
+    drop file
+    return
+  }
+  let mut done = move file
+  if reading.copied {
+    done.change = FileChange.Copied
+  } else if reading.renamed {
+    done.change = FileChange.Renamed
+  } else if reading.created || (!reading.git && absent(done.oldPath)) {
+    done.change = FileChange.Created
+  } else if reading.deleted || (!reading.git && absent(done.newPath)) {
+    done.change = FileChange.Deleted
+  }
+  run List<FilePatch>.append(&mut files, move done)
+  reading.open = false
+  reading.git = false
+  reading.named = false
+  reading.created = false
+  reading.deleted = false
+  reading.renamed = false
+  reading.copied = false
+}
+
+// Reads a decimal number at `at`, and returns it with the offset after it.
+fn number(text: &[u8], at: usize, end: usize) -> Option<Point> {
+  let mut probe = at
+  let mut value: usize = 0
+  while probe < end && text[probe] >= 48 && text[probe] <= 57 {
+    if value > 100000000000 {
+      return Option<Point>.None
+    }
+    value = value * 10 + u8.toUsize(text[probe] - 48)
+    probe = probe + 1
+  }
+  if probe == at {
+    return Option<Point>.None
+  }
+  return Option<Point>.Some { value: Point { x: value, y: probe } }
+}
+
+// Reads `start[,length]` at `at`. The point holds the start and length; `after` gets the offset
+// after them.
+fn range(text: &[u8], at: usize, end: usize, after: &mut usize) -> Option<Point> {
+  let start = match number(text, at, end) {
+    Option<Point>.Some { value } => value
+    Option<Point>.None => {
+      return Option<Point>.None
+    }
+  }
+  if start.y < end && text[start.y] == 44 {
+    let length = match number(text, start.y + 1, end) {
+      Option<Point>.Some { value } => value
+      Option<Point>.None => {
+        return Option<Point>.None
+      }
+    }
+    after.* = length.y
+    return Option<Point>.Some { value: Point { x: start.x, y: length.x } }
+  }
+  after.* = start.y
+  return Option<Point>.Some { value: Point { x: start.x, y: 1 } }
+}
+
+// Reads the hunk header `@@ -a,b +c,d @@ section` on the line from `at` to `end`.
+fn hunkHeader(text: &[u8], at: usize, end: usize) -> Option<Hunk> {
+  if !startsWith(text, at, end, b"@@ -") {
+    return Option<Hunk>.None
+  }
+  let mut after: usize = 0
+  let old = match range(text, at + 4, end, &mut after) {
+    Option<Point>.Some { value } => value
+    Option<Point>.None => {
+      return Option<Hunk>.None
+    }
+  }
+  if !startsWith(text, after, end, b" +") {
+    return Option<Hunk>.None
+  }
+  let new = match range(text, after + 2, end, &mut after) {
+    Option<Point>.Some { value } => value
+    Option<Point>.None => {
+      return Option<Hunk>.None
+    }
+  }
+  if !startsWith(text, after, end, b" @@") {
+    return Option<Hunk>.None
+  }
+  let mut section = after + 3
+  if section < end && text[section] == 32 {
+    section = section + 1
+  }
+  let stop = trimmedEnd(text, section, end)
+  return Option<Hunk>.Some {
+    value: Hunk {
+      oldStart: old.x,
+      oldLength: old.y,
+      newStart: new.x,
+      newLength: new.y,
+      section: Span { offset: section, length: stop - section },
+      firstLine: 0,
+      lineCount: 0,
+    },
+  }
+}
+
+fn patchError(reason: PatchReason, line: usize) -> PatchError {
+  return PatchError { reason: reason, line: line }
+}
+
+// Drops the newline from the last line read, for a `\ No newline at end of file` line.
+fn dropNewline(text: &[u8], lines: &mut List<PatchLine>) -> () {
+  let count = List<PatchLine>.length(&lines)
+  if count == 0 {
+    return
+  }
+  let last = List<PatchLine>.asMutSlice(&mut lines)
+  let span = last[count - 1].text
+  if span.length > 0 && text[span.offset + span.length - 1] == 10 {
+    last[count - 1].text = Span { offset: span.offset, length: span.length - 1 }
+  }
+}
+
+/// Reads the patch `text`, given as bytes that need not be UTF-8, as `diff -u`, `git diff`, and
+/// `git format-patch` write it.
+///
+/// # When to use
+///
+/// Use this function for a patch read from a file, whose contents need not be UTF-8. For text, use
+/// [`parse`].
+///
+/// # Details
+///
+/// A file starts at a `diff --git` line, or at a `---` line that a `+++` line follows. Git
+/// extended header lines give the modes, renames, copies, and binary changes. Each hunk reads as
+/// many lines as its `@@` header gives, and a `\ No newline at end of file` line removes the `\n`
+/// of the line before it. Other lines are skipped. The parts of the result are [`Span`] ranges of
+/// `text`.
+///
+/// # Errors
+///
+/// - `PatchError` with reason `InvalidHunkHeader`, `InvalidHunkLine`, `UnexpectedEnd`,
+///   `MissingFileHeader`, or `InvalidMode`, and the line number of the problem.
+/// - `OutOfMemoryError` if the `Allocator` cannot supply the result.
+pub effect fn parseBytes(text: &[u8]) -> Patch
+  ! PatchError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut files = List<FilePatch>.make()
+  let mut file = blankFile()
+  let mut reading = Reading {
+    open: false,
+    git: false,
+    named: false,
+    created: false,
+    deleted: false,
+    renamed: false,
+    copied: false,
+  }
+  let mut at: usize = 0
+  let mut lineNumber: usize = 1
+  while at < text.length {
+    let end = lineEnd(text, at)
+    let mut next = end
+    if next < text.length {
+      next = next + 1
+    }
+    let hunked = List<Hunk>.length(&file.hunks) > 0
+    if startsWith(text, at, end, b"diff --git ") {
+      run finish(&mut files, move file, &mut reading)
+      file = blankFile()
+      reading.open = true
+      reading.git = true
+      gitPaths(&mut file, text, at + 11, end)
+    } else if startsWith(text, at, end, b"--- ")
+      && startsWith(text, next, lineEnd(text, next), b"+++ ") {
+      if reading.open && (hunked || reading.named || !reading.git) {
+        run finish(&mut files, move file, &mut reading)
+        file = blankFile()
+      }
+      if !reading.open {
+        reading.open = true
+      }
+      reading.named = true
+      file.oldPath = headerPath(text, at + 4, end, b"a/", reading.git)
+      let newEnd = lineEnd(text, next)
+      file.newPath = headerPath(text, next + 4, newEnd, b"b/", reading.git)
+      next = newEnd
+      if next < text.length {
+        next = next + 1
+      }
+      lineNumber = lineNumber + 1
+    } else if startsWith(text, at, end, b"@@ ") {
+      if !reading.open {
+        fail patchError(PatchReason.MissingFileHeader, lineNumber)
+      }
+      let mut hunk = match hunkHeader(text, at, end) {
+        Option<Hunk>.Some { value } => value
+        Option<Hunk>.None => {
+          fail patchError(PatchReason.InvalidHunkHeader, lineNumber)
+        }
+      }
+      hunk.firstLine = List<PatchLine>.length(&file.lines)
+      let mut oldLeft = hunk.oldLength
+      let mut newLeft = hunk.newLength
+      while oldLeft > 0 || newLeft > 0 {
+        if next >= text.length {
+          fail patchError(PatchReason.UnexpectedEnd, lineNumber + 1)
+        }
+        at = next
+        lineNumber = lineNumber + 1
+        let bodyEnd = lineEnd(text, at)
+        next = bodyEnd
+        if next < text.length {
+          next = next + 1
+        }
+        let lead = text[at]
+        if lead == 92 {
+          dropNewline(text, &mut file.lines)
+        } else {
+          let mut kind = LineKind.Context
+          let mut content = at + 1
+          if lead == 45 {
+            kind = LineKind.Delete
+          } else if lead == 43 {
+            kind = LineKind.Insert
+          } else if lead == 10 || (lead == 13 && bodyEnd == at + 1) {
+            // An empty context line whose space was removed.
+            content = at
+          } else if lead != 32 {
+            fail patchError(PatchReason.InvalidHunkLine, lineNumber)
+          }
+          if kind != LineKind.Insert {
+            if oldLeft == 0 {
+              fail patchError(PatchReason.InvalidHunkLine, lineNumber)
+            }
+            oldLeft = oldLeft - 1
+          }
+          if kind != LineKind.Delete {
+            if newLeft == 0 {
+              fail patchError(PatchReason.InvalidHunkLine, lineNumber)
+            }
+            newLeft = newLeft - 1
+          }
+          run List<PatchLine>.append(
+            &mut file.lines,
+            PatchLine { kind: kind, text: Span { offset: content, length: next - content } },
+          )
+        }
+      }
+      if next < text.length && text[next] == 92 {
+        dropNewline(text, &mut file.lines)
+        lineNumber = lineNumber + 1
+        next = lineEnd(text, next)
+        if next < text.length {
+          next = next + 1
+        }
+      }
+      hunk.lineCount = List<PatchLine>.length(&file.lines) - hunk.firstLine
+      run List<Hunk>.append(&mut file.hunks, hunk)
+    } else if reading.open && reading.git && !hunked && !reading.named {
+      if startsWith(text, at, end, b"new file mode ") {
+        reading.created = true
+        file.newMode = run requireMode(text, at + 14, end, lineNumber)
+      } else if startsWith(text, at, end, b"deleted file mode ") {
+        reading.deleted = true
+        file.oldMode = run requireMode(text, at + 18, end, lineNumber)
+      } else if startsWith(text, at, end, b"old mode ") {
+        file.oldMode = run requireMode(text, at + 9, end, lineNumber)
+      } else if startsWith(text, at, end, b"new mode ") {
+        file.newMode = run requireMode(text, at + 9, end, lineNumber)
+      } else if startsWith(text, at, end, b"rename from ") {
+        reading.renamed = true
+        file.oldPath = Option<Span>.Some {
+          value: Span { offset: at + 12, length: trimmedEnd(text, at + 12, end) - at - 12 }
+        }
+      } else if startsWith(text, at, end, b"rename to ") {
+        reading.renamed = true
+        file.newPath = Option<Span>.Some {
+          value: Span { offset: at + 10, length: trimmedEnd(text, at + 10, end) - at - 10 }
+        }
+      } else if startsWith(text, at, end, b"copy from ") {
+        reading.copied = true
+        file.oldPath = Option<Span>.Some {
+          value: Span { offset: at + 10, length: trimmedEnd(text, at + 10, end) - at - 10 }
+        }
+      } else if startsWith(text, at, end, b"copy to ") {
+        reading.copied = true
+        file.newPath = Option<Span>.Some {
+          value: Span { offset: at + 8, length: trimmedEnd(text, at + 8, end) - at - 8 }
+        }
+      } else if startsWith(text, at, end, b"Binary files ")
+        || startsWith(text, at, end, b"GIT binary patch") {
+        file.binary = true
+      }
+    }
+    at = next
+    lineNumber = lineNumber + 1
+  }
+  run finish(&mut files, move file, &mut reading)
+  return Patch { files: move files }
+}
+
+/// Returns `original` with the hunks of `file` applied, where `file` was read from `patch`.
+///
+/// # When to use
+///
+/// Use this function to apply one file of a patch that [`parse`] read, for example to patch a
+/// dependency before a build.
+///
+/// # Details
+///
+/// The hunks apply in order. Each hunk goes where its context and deleted lines are the lines of
+/// `original`, first at the line that its header gives, adjusted by how far the last hunk moved,
+/// then at the nearest line before or after that place. Lines are compared byte for byte,
+/// including the `\n`. A new file applies to an empty `original`. Only the hunks change the text:
+/// renames, modes, and binary changes are for the caller to make.
+///
+/// # Errors
+///
+/// - `ApplyError` with the index of the first hunk whose old lines are not in `original` after the
+///   last applied hunk.
+/// - `OutOfMemoryError` if the `Allocator` cannot supply the result.
+///
+/// # Gotchas
+///
+/// `patch` must be the text that `file` was read from, because the lines of `file` are ranges of
+/// it.
+///
+/// # Examples
+///
+/// ## Apply a hunk after the file grew
+///
+/// ```silk
+/// import silk.text.diff
+/// import silk.text.diff { ApplyError, FilePatch, PatchError }
+/// import silk.collections.list { List }
+/// import silk.mem.allocator { Allocator, OutOfMemoryError }
+/// import silk.core.effect { Effect }
+/// import silk.text.string { String }
+///
+/// effect fn check() -> i32 ! PatchError | ApplyError | OutOfMemoryError ? &mut Allocator {
+///   let text = "--- a/list.txt\n+++ b/list.txt\n@@ -1,3 +1,3 @@\n apple\n-banana\n+cherry\n melon\n"
+///   let patch = run diff.parse(text)
+///   let file = &List<FilePatch>.asSlice(&patch.files)[0]
+///   let patched = run diff.apply("fig\napple\nbanana\nmelon\n", text, file)
+///   if String.view(&patched) != "fig\napple\ncherry\nmelon\n" {
+///     return 1
+///   }
+///   return 0
+/// }
+///
+/// effect fn failed(error: PatchError | ApplyError | OutOfMemoryError) -> i32 {
+///   drop error
+///   return 2
+/// }
+///
+/// pub fn main() -> i32 {
+///   let mut allocator = Allocator.systemAllocatorProvider()
+///   return run Effect.catchAll(check(), failed) |> Effect.provideMut<Allocator>(&mut allocator)
+/// }
+/// ```
+pub effect fn apply(original: string, patch: string, file: &FilePatch) -> String
+  ! ApplyError | OutOfMemoryError
+  ? &mut Allocator {
+  let output = run applyBytes(String.utf8Bytes(original), String.utf8Bytes(patch), file)
+  return unsafe String.fromBytesUnchecked(move output)
+}
+
+// Whether the old lines of `hunk` are the lines of `text` from line `at`.
+fn hunkMatches(
+  text: &[u8],
+  starts: &[usize],
+  at: usize,
+  patch: &[u8],
+  lines: &[PatchLine],
+  hunk: Hunk,
+) -> bool {
+  let mut index = at
+  let mut k: usize = 0
+  while k < hunk.lineCount {
+    let patchLine = lines[hunk.firstLine + k]
+    if patchLine.kind != LineKind.Insert {
+      if index + 1 >= starts.length
+        || !sameBytes(line(text, starts, index), patchLine.text.bytes(patch)) {
+        return false
+      }
+      index = index + 1
+    }
+    k = k + 1
+  }
+  return true
+}
+
+/// Returns the bytes `original` with the hunks of `file` applied, where `file` was read from the
+/// bytes `patch`.
+///
+/// # When to use
+///
+/// Use this function for file contents that need not be UTF-8. For text, use [`apply`].
+///
+/// # Details
+///
+/// The hunks apply in order. Each hunk goes where its context and deleted lines are the lines of
+/// `original`, first at the line that its header gives, adjusted by how far the last hunk moved,
+/// then at the nearest line before or after that place. Lines are compared byte for byte,
+/// including the `\n`. Only the hunks change the bytes: renames, modes, and binary changes are for
+/// the caller to make.
+///
+/// # Errors
+///
+/// - `ApplyError` with the index of the first hunk whose old lines are not in `original` after the
+///   last applied hunk.
+/// - `OutOfMemoryError` if the `Allocator` cannot supply the result.
+///
+/// # Gotchas
+///
+/// `patch` must be the bytes that `file` was read from, because the lines of `file` are ranges of
+/// them.
+pub effect fn applyBytes(original: &[u8], patch: &[u8], file: &FilePatch) -> Bytes
+  ! ApplyError | OutOfMemoryError
+  ? &mut Allocator {
+  let startList = run lineStarts(original)
+  let starts = List<usize>.asSlice(&startList)
+  let count = starts.length - 1
+  let hunks = List<Hunk>.asSlice(&file.hunks)
+  let lines = List<PatchLine>.asSlice(&file.lines)
+  let mut output = Bytes.make()
+  run Bytes.reserve(&mut output, original.length)
+
+  // The next line of `original` to copy, and how far the last hunk was from its stated place.
+  let mut cursor: usize = 0
+  let mut ahead: usize = 0
+  let mut behind: usize = 0
+  let mut index: usize = 0
+  while index < hunks.length {
+    let hunk = hunks[index]
+    let mut oldCount: usize = 0
+    let mut k: usize = 0
+    while k < hunk.lineCount {
+      if lines[hunk.firstLine + k].kind != LineKind.Insert {
+        oldCount = oldCount + 1
+      }
+      k = k + 1
+    }
+    let mut stated = hunk.oldStart
+    if hunk.oldLength > 0 && stated > 0 {
+      stated = stated - 1
+    }
+    stated = stated + ahead
+    if stated >= behind {
+      stated = stated - behind
+    } else {
+      stated = 0
+    }
+    if stated < cursor {
+      stated = cursor
+    }
+    if oldCount > count - cursor {
+      fail ApplyError { hunk: index }
+    }
+    let last = count - oldCount
+    if stated > last {
+      stated = last
+    }
+
+    // Look at the stated place first, then nearer places before farther ones.
+    let mut found = count + 1
+    let mut distance: usize = 0
+    while found > count && (stated >= cursor + distance || stated + distance <= last) {
+      if stated >= cursor + distance
+        && hunkMatches(original, starts, stated - distance, patch, lines, hunk) {
+        found = stated - distance
+      } else if distance > 0 && stated + distance <= last
+        && hunkMatches(original, starts, stated + distance, patch, lines, hunk) {
+        found = stated + distance
+      }
+      distance = distance + 1
+    }
+    if found > count {
+      fail ApplyError { hunk: index }
+    }
+    let mut expected = hunk.oldStart
+    if hunk.oldLength > 0 && expected > 0 {
+      expected = expected - 1
+    }
+    if found >= expected {
+      ahead = found - expected
+      behind = 0
+    } else {
+      ahead = 0
+      behind = expected - found
+    }
+    run Bytes.append(
+      &mut output,
+      Slice.view<u8>(original, starts[cursor], starts[found] - starts[cursor]),
+    )
+    k = 0
+    while k < hunk.lineCount {
+      let patchLine = lines[hunk.firstLine + k]
+      if patchLine.kind != LineKind.Delete {
+        run Bytes.append(&mut output, patchLine.text.bytes(patch))
+      }
+      k = k + 1
+    }
+    cursor = found + oldCount
+    index = index + 1
+  }
+  run Bytes.append(
+    &mut output,
+    Slice.view<u8>(original, starts[cursor], original.length - starts[cursor]),
+  )
+  return move output
+}
