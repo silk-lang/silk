@@ -1273,7 +1273,7 @@ const program = Effect.gen(function* () {
   assert.equal(unexported.status, 2, unexported.stderr)
   assert.match(
     unexported.stderr,
-    /^Checking unexported \([^\n]*\)\n  load     failed: 1 error +[0-9.ms ]+s\nInvalid Silk project manifest [^\n]*unexported\/silk\.toml:4: [^\n]+\nFailed unexported in /,
+    /^Checking unexported \([^\n]*\)\n  load      failed: 1 error +[0-9.ms ]+s\nInvalid Silk project manifest [^\n]*unexported\/silk\.toml:4: [^\n]+\nFailed unexported in /,
   )
   const json = yield* invoke(
     silk,
@@ -2198,7 +2198,7 @@ const program = Effect.gen(function* () {
   assert.equal(unstartedBuild.status, 2, unstartedBuild.stderr)
   assert.match(unstartedBuild.stderr, /no-such-clang \(from --clang\)/)
   // A link counts nothing, so its failed row has no detail after `failed`.
-  assert.match(unstartedBuild.stderr, /^  link     failed +[0-9.ms ]+s$/m)
+  assert.match(unstartedBuild.stderr, /^  link      failed +[0-9.ms ]+s$/m)
   assert.doesNotMatch(unstartedBuild.stderr, /failed:/)
   assert.match(unstartedBuild.stderr, /^Failed tested in /m)
   // A single-file test without a manifest is refused as a single-file build is.
@@ -2747,7 +2747,7 @@ const program = Effect.gen(function* () {
   // standard output stays empty.
   assert.equal(released.stdout, '')
   assert.match(released.stderr, new RegExp(`^Compiling greeting \\(${hostTarget}, release\\)\n`))
-  assert.match(released.stderr, /^  codegen  [1-9][0-9,]* functions/m)
+  assert.match(released.stderr, /^  codegen   [1-9][0-9,]* functions/m)
   assert.match(
     released.stderr,
     new RegExp(`^Finished greeting/build/llvm/${hostTarget}/release/greeting in [0-9.ms ]+s\n$`, 'm'),
@@ -3839,7 +3839,7 @@ const program = Effect.gen(function* () {
   assert.equal(unlinked.status, 2, unlinked.stderr)
   assert.equal(unlinked.stdout, '')
   assert.match(unlinked.stderr, /^Compiling hello \(/m)
-  assert.match(unlinked.stderr, /^  link     failed +[0-9.ms ]+s$/m)
+  assert.match(unlinked.stderr, /^  link      failed +[0-9.ms ]+s$/m)
   assert.match(unlinked.stderr, /^Failed hello in /m)
   assert.doesNotMatch(unlinked.stderr + unlinked.stdout, /Run summary/)
   const other = yield* invoke(silk, ['init', 'apps/other', '-t', 'minimal'], managed)
@@ -4573,12 +4573,21 @@ const program = Effect.gen(function* () {
   const releaseBuild = Effect.fnUntraced(function* () {
     const built = yield* invoke(silk, ['build', '--release', '--stdlib', standardLibrary], split, splitEnvironment)
     assert.equal(built.status, 0, built.stderr)
+    return built.stderr
   })
-  yield* releaseBuild()
+  const firstRelease = yield* releaseBuild()
+  assert.match(firstRelease, /^  optimize  clang +[0-9.ms ]+s$/m, 'a whole optimized module compiles in its own optimize phase')
   const releaseExecutable = join(split, `build/llvm/${hostTarget}/release/split`)
   const releasedAt = (yield* fs.stat(releaseExecutable)).mtime
   yield* releaseBuild()
   assert.deepEqual((yield* fs.stat(releaseExecutable)).mtime, releasedAt, 'an unchanged release rebuild leaves the executable as it was')
+  // A release link that runs again, as one with a link input read from outside the build does
+  // every time, links the module's cached object instead of optimizing the module again.
+  yield* fs.remove(`${releaseExecutable}.units/link`)
+  const relinked = yield* releaseBuild()
+  assert.doesNotMatch(relinked, /optimize/, relinked)
+  assert.match(relinked, /^  link      clang +[0-9.ms ]+s$/m, relinked)
+  assert.equal((yield* invoke(releaseExecutable, [], split, splitEnvironment)).status, 7)
   // Every build names its content-derived symbols beside its output, so a frame an optimized
   // program's backtrace shows by symbol leads to its declaration.
   const releaseMap = yield* fs.readFileString(`${releaseExecutable}.symbols`)
