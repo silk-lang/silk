@@ -361,6 +361,7 @@ kind, and the reflecting declaration's visibility authority are retained.
 | `makeVariant(static variant, fields)` | `Union`                     | The variant built from a tuple of its fields            |
 | `isVariant(owner, static variant)`    | `bool`                      | Whether the union holds that variant                    |
 | `borrowVariantField(owner, static variant, static field)` | `&Value` | Shared borrow of a field of the variant the owner holds |
+| `borrowVariantFieldMut(owner, static variant, static field)` | `&mut Value` | Mutable borrow of a field of the variant the owner holds |
 
 A nominal union reports `unionKind`. `makeVariant` takes a tuple of the variant's fields in
 declaration order, `()` for a unit variant, and is exactly the written construction
@@ -369,7 +370,8 @@ declaration order, `()` for a unit variant, and is exactly the written construct
 variant. Construction needs every field of the variant to be visible where the variant was
 reflected. `borrowVariantField` tests the active variant like `isVariant`, traps when the owner holds
 another one, and is otherwise exactly the field binding of that variant's `match` arm; the field
-must be one of `variantFields(variant)`.
+must be one of `variantFields(variant)`. `borrowVariantFieldMut` is the same on `&mut Union`, binding
+the field through a mutable view of the owner.
 
 Descriptors remain nominal: equal field shapes from separate structs do not become assignment-
 compatible or share projection authority. Private fields are absent outside their declaring module
