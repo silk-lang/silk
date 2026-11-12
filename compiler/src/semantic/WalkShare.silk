@@ -1,0 +1,317 @@
+//! Copies of the process that walk one program's instances side by side.
+//!
+//! [`WalkShared.start`] makes copies of the process (POSIX `fork`) partway through a walk, so every
+//! copy holds the same pending instances. A copy enters an instance only once it has claimed the
+//! instance's digest in a table all copies share ([`WalkShared.claim`]), so each instance is
+//! lowered by one copy. A copy with nothing left takes over instances another copy has claimed
+//! and not finished ([`WalkShared.inProgress`]). No instance key crosses a process: a copy sends
+//! what it found as bytes ([`WalkShared.send`]), which the process that started the copies reads
+//! ([`WalkShared.collect`]).
+//!
+//! Other hosts start no copy, and the walk is not shared.
+
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.core.option {Option}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+
+static if (Intrinsic.targetOperatingSystem() == "darwin"
+  && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")
+  && Intrinsic.targetAbi() == "apple"
+  && Intrinsic.profileText("libc") == "system")
+  || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu"
+    && Intrinsic.profileText("libc") == "gnu"
+    && (Intrinsic.targetArchitecture() == "aarch64"
+      || Intrinsic.targetArchitecture() == "x86_64")) {
+  import silk.collections.slice {Slice}
+  import silk.concurrency.atomic {Atomic, CompareExchange, MemoryOrder}
+  import silk.mem.pointer {Pointer}
+  import silk.num.isize
+  import silk.num.u64
+  import silk.num.usize
+
+  unsafe extern "C" fn fork() -> i32
+  unsafe extern "C" fn _exit(status: i32) -> ()
+  unsafe extern "C" fn close(fd: i32) -> i32
+  @foreign(noCapture: .("status"))
+  unsafe extern "C" fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32
+  @foreign(noCapture: .("fds"))
+  unsafe extern "C" fn pipe(fds: ?[*]mut i32) -> i32
+  @foreign(noCapture: .("buffer"))
+  unsafe extern "C" fn read(fd: i32, buffer: ?[*]mut u8, count: usize) -> isize
+  @foreign(noCapture: .("buffer"))
+  unsafe extern "C" fn write(fd: i32, buffer: ?[*]const u8, count: usize) -> isize
+  unsafe extern "C" fn mmap(address: ?*mut u8, length: usize, protection: i32, flags: i32, descriptor: i32, offset: i64) -> ?[*]mut u64
+  unsafe extern "C" fn munmap(address: [*]mut u64, length: usize) -> i32
+
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    // MAP_SHARED | MAP_ANON
+    const MAPPING: i32 = 4097
+  } else {
+    // MAP_SHARED | MAP_ANONYMOUS
+    const MAPPING: i32 = 33
+  }
+
+  // How many claims the table holds. A walk claims far fewer instances, so a probe ends early.
+  const SLOTS: usize = 4194304
+
+  /// A walk shared by copies of the process, or one that is not shared ([`WalkShared.none`]).
+  pub struct WalkShared {
+    table: Option<[*]mut u64>,
+    // This copy's index; zero in the process that started the others.
+    worker: usize,
+    // The descriptor each started copy's bytes are read from, in the process that started them.
+    readers: List<i32>,
+    // The descriptor a started copy writes its bytes to.
+    writer: i32,
+  }
+
+  impl WalkShared {
+    /// Whether this host can start copies of the process to share a walk.
+    pub fn supported() -> bool {
+      return true
+    }
+
+    /// A walk that is not shared: every claim succeeds and no copy runs.
+    pub fn none() -> WalkShared {
+      return WalkShared {table: Option<[*]mut u64>.none(), worker: usize.ZERO,
+        readers: List<i32>.make(), writer: -1}
+    }
+
+    /// Starts up to `workers - 1` copies of the process over a fresh claim table. It returns in
+    /// each copy and in the process that started them; [`WalkShared.isCopy`] tells them apart. The
+    /// walk is not shared when the table or no copy could be made.
+    ///
+    /// # Gotchas
+    /// Call it on the only thread: a copy has no other thread.
+    pub effect fn start(workers: usize) -> WalkShared ! OutOfMemoryError ? &mut Allocator {
+      if workers < 2 { return WalkShared.none() }
+      let mapped = unsafe mmap(Pointer.null<u8>(), SLOTS * 8, 3, MAPPING, -1, 0)
+      // A failed mapping is all ones, which no table address is.
+      if Pointer.addressMany<u64>(mapped) == usize.MAX { return WalkShared.none() }
+      let table = match move Pointer.nonNullManyMut<u64>(mapped) {
+        Option<[*]mut u64>.Some {value} => value
+        Option<[*]mut u64>.None => { return WalkShared.none() }
+      }
+      let mut readers = List<i32>.make()
+      run List<i32>.reserveExact(&mut readers, workers)
+      let mut at = usize.ONE
+      while at < workers {
+        at = at + usize.ONE
+        let mut ends: [i32; 2] = [-1, -1]
+        if unsafe pipe(Pointer.fromMutSlice<i32>(&mut ends)) != 0 { break }
+        let child = unsafe fork()
+        if child < 0 {
+          let _read = unsafe close(ends[0])
+          let _written = unsafe close(ends[1])
+          break
+        }
+        if child == 0 {
+          // The copy reads no other copy's bytes.
+          let _own = unsafe close(ends[0])
+          let held = List<i32>.asSlice(&readers)
+          let mut other = usize.ZERO
+          while other < held.length {
+            let _closed = unsafe close(held[other])
+            other = other + usize.ONE
+          }
+          return WalkShared {table: Option<[*]mut u64>.some(table), worker: at - usize.ONE, readers: List<i32>.make(),
+            writer: ends[1]}
+        }
+        let _written = unsafe close(ends[1])
+        run List<i32>.append(&mut readers, ends[0])
+      }
+      if List<i32>.length(&readers) == usize.ZERO {
+        let _unmapped = unsafe munmap(table, SLOTS * 8)
+        return WalkShared.none()
+      }
+      return WalkShared {table: Option<[*]mut u64>.some(table), worker: usize.ZERO, readers: move readers, writer: -1}
+    }
+
+    /// Whether copies share the walk.
+    pub fn active(self: &Self) -> bool {
+      return match &self.table {
+        Option<[*]mut u64>.Some {..} => true
+        Option<[*]mut u64>.None => false
+      }
+    }
+
+    /// Whether this process is a copy [`WalkShared.start`] made, which ends in [`WalkShared.send`].
+    pub fn isCopy(self: &Self) -> bool {
+      return self.worker != usize.ZERO
+    }
+
+    /// Claims the instance `key` names for this copy. Gives the claim's slot, which
+    /// [`WalkShared.done`] takes, or `usize.MAX` when a copy has claimed the instance already. A
+    /// walk that is not shared claims everything.
+    pub fn claim(self: &Self, key: u64) -> usize {
+      let table = match &self.table {
+        Option<[*]mut u64>.Some {value} => value
+        Option<[*]mut u64>.None => { return usize.ZERO }
+      }
+      // The low two bits hold the claim's state, so a slot is never zero once claimed.
+      let wanted = u64.bitOr(key, 3)
+      let mut at = u64.toUsize(key % usize.toU64(SLOTS))
+      let mut probed = usize.ZERO
+      while probed < SLOTS {
+        let slot = unsafe Pointer.atMut<u64>(table, at)
+        match unsafe Atomic.compareExchange<u64>(slot, 0, wanted, MemoryOrder.SequentiallyConsistent, MemoryOrder.SequentiallyConsistent) {
+          CompareExchange<u64>.Exchanged => { return at }
+          CompareExchange<u64>.Observed {value} => {
+            if u64.bitOr(value, 1) == wanted { return usize.MAX }
+          }
+        }
+        at = (at + usize.ONE) % SLOTS
+        probed = probed + usize.ONE
+      }
+      // A full table holds no further claim; the instance is walked here without one.
+      return SLOTS
+    }
+
+    /// Marks the claim of `key` at `slot` finished: this copy has walked everything below the
+    /// instance, so no other copy takes it over.
+    pub fn done(self: &Self, slot: usize, key: u64) -> () {
+      if slot >= SLOTS { return () }
+      if let Option<[*]mut u64>.Some {value: table} = &self.table {
+        let place = unsafe Pointer.atMut<u64>(table, slot)
+        unsafe Atomic.store<u64>(place, u64.bitOr(key, 3) - 1, MemoryOrder.SequentiallyConsistent)
+      }
+    }
+
+    /// Whether a copy claimed the instance `key` names and has not finished it.
+    pub fn inProgress(self: &Self, key: u64) -> bool {
+      let table = match &self.table {
+        Option<[*]mut u64>.Some {value} => value
+        Option<[*]mut u64>.None => { return false }
+      }
+      let wanted = u64.bitOr(key, 3)
+      let mut at = u64.toUsize(key % usize.toU64(SLOTS))
+      let mut probed = usize.ZERO
+      while probed < SLOTS {
+        let place = unsafe Pointer.atMut<u64>(table, at)
+        let value = unsafe Atomic.load<u64>(place, MemoryOrder.SequentiallyConsistent)
+        if value == 0 { return false }
+        if u64.bitOr(value, 1) == wanted { return value == wanted }
+        at = (at + usize.ONE) % SLOTS
+        probed = probed + usize.ONE
+      }
+      return false
+    }
+
+    /// Ends a copy that cannot finish its walk, with a failure status, so the process that started
+    /// it takes nothing from the shared walk.
+    pub fn abandon() -> () {
+      unsafe _exit(1)
+    }
+
+    /// Ends a copy: writes `bytes` for the process that started it and exits without freeing what
+    /// the copy holds. It exits with a failure status when the bytes cannot all be written.
+    pub fn send(self: &Self, bytes: &[u8]) -> () {
+      let mut offset = usize.ZERO
+      let mut status: i32 = 0
+      while offset < bytes.length {
+        let sent = unsafe write(self.writer, Pointer.fromSlice<u8>(Slice.view<u8>(bytes, offset, bytes.length - offset)), bytes.length - offset)
+        if sent <= 0 {
+          status = 1
+          break
+        }
+        offset = offset + isize.toUsize(sent)
+      }
+      unsafe _exit(status)
+    }
+
+    /// Reads what each started copy sent, in the order the copies were started, and waits for
+    /// them to exit. Gives none when a copy did not exit cleanly, since what it claimed may then
+    /// be missing from what the others sent.
+    pub effect fn collect(self: WalkShared) -> Option<List<Bytes>> ! OutOfMemoryError ? &mut Allocator {
+      let mut received = List<Bytes>.make()
+      let readers = List<i32>.asSlice(&self.readers)
+      let mut whole = true
+      let mut at = usize.ZERO
+      while at < readers.length {
+        let mut bytes = Bytes.make()
+        let mut buffer: [u8; 65536] = [0; 65536]
+        while true {
+          let count = unsafe read(readers[at], Pointer.fromMutSlice<u8>(&mut buffer), 65536)
+          if count <= 0 { break }
+          run Bytes.append(&mut bytes, Slice.view<u8>(&buffer, usize.ZERO, isize.toUsize(count)))
+        }
+        let _closed = unsafe close(readers[at])
+        run List<Bytes>.append(&mut received, move bytes)
+        at = at + usize.ONE
+      }
+      at = usize.ZERO
+      while at < readers.length {
+        let mut status: i32 = 0
+        let waited = unsafe waitpid(-1, Pointer.fromMutRef<i32>(&mut status), 0)
+        if waited <= 0 || status != 0 { whole = false }
+        at = at + usize.ONE
+      }
+      if let Option<[*]mut u64>.Some {value: table} = &self.table {
+        let _unmapped = unsafe munmap(table, SLOTS * 8)
+      }
+      if !whole { return Option<List<Bytes>>.none() }
+      return Option<List<Bytes>>.some(move received)
+    }
+  }
+} else {
+  /// A walk that is not shared: this host starts no copy of the process.
+  pub struct WalkShared {}
+
+  impl WalkShared {
+    /// False: this host starts no copy of the process.
+    pub fn supported() -> bool {
+      return false
+    }
+
+    /// A walk that is not shared: every claim succeeds and no copy runs.
+    pub fn none() -> WalkShared {
+      return WalkShared {}
+    }
+
+    /// A walk that is not shared, since this host starts no copy of the process.
+    pub effect fn start(workers: usize) -> WalkShared ! OutOfMemoryError ? &mut Allocator {
+      return WalkShared {}
+    }
+
+    /// False: this host shares no walk.
+    pub fn active(self: &Self) -> bool {
+      return false
+    }
+
+    /// False: this host starts no copy of the process.
+    pub fn isCopy(self: &Self) -> bool {
+      return false
+    }
+
+    /// Zero: a walk that is not shared claims everything.
+    pub fn claim(self: &Self, key: u64) -> usize {
+      return 0
+    }
+
+    /// Does nothing: this host shares no walk.
+    pub fn done(self: &Self, slot: usize, key: u64) -> () {
+      return ()
+    }
+
+    /// False: this host shares no walk.
+    pub fn inProgress(self: &Self, key: u64) -> bool {
+      return false
+    }
+
+    /// Does nothing: this host starts no copy of the process.
+    pub fn abandon() -> () {
+      return ()
+    }
+
+    /// Does nothing: this host starts no copy of the process.
+    pub fn send(self: &Self, bytes: &[u8]) -> () {
+      return ()
+    }
+
+    /// An empty list: this host starts no copy of the process.
+    pub effect fn collect(self: WalkShared) -> Option<List<Bytes>> ! OutOfMemoryError ? &mut Allocator {
+      return Option<List<Bytes>>.some(List<Bytes>.make())
+    }
+  }
+}

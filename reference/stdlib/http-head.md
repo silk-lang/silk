@@ -1098,6 +1098,16 @@ pub fn bytes<'owner>(self: &'owner Self) -> &'owner [u8]
 
 Returns the written bytes, ending with the empty line.
 
+<a id="WrittenRequest.impl.duplicate"></a>
+
+### Method `duplicate`
+
+```silk
+pub effect fn duplicate(self: &Self) -> WrittenRequest ! OutOfMemoryError ? &mut Allocator
+```
+
+Returns a copy of the written request that owns its own memory.
+
 <a id="WrittenRequest.impl.head"></a>
 
 ### Method `head`
