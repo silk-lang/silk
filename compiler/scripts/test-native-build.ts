@@ -4658,16 +4658,17 @@ const program = Effect.gen(function* () {
     ].join('\n'),
   )
   const escapeReports = (output: string) => output.split('\n').filter((line) => /(error|warning)\[/.test(line)).join('\n')
+  // These compare a check from the cache with one without it, so no check server answers them.
   const escapeCheck = Effect.fnUntraced(function* (helper: string, expected: string) {
     yield* fs.writeFileString(join(escapes, 'src/helper.silk'), helper)
-    const warm = yield* invoke(silk, ['check', '--stdlib', standardLibrary], escapes, splitEnvironment)
+    const warm = yield* invoke(silk, ['check', '--no-server', '--stdlib', standardLibrary], escapes, splitEnvironment)
     yield* fs.remove(join(escapes, 'build'), { recursive: true })
-    const cold = yield* invoke(silk, ['check', '--stdlib', standardLibrary], escapes, splitEnvironment)
+    const cold = yield* invoke(silk, ['check', '--no-server', '--stdlib', standardLibrary], escapes, splitEnvironment)
     assert.equal(escapeReports(warm.stdout + warm.stderr), escapeReports(cold.stdout + cold.stderr), 'a warm check reports what a cold check reports')
     assert.equal(warm.status, cold.status, warm.stderr)
     assert.match(escapeReports(cold.stdout + cold.stderr), new RegExp(expected))
     // Leave a cache for the next edit.
-    yield* invoke(silk, ['check', '--stdlib', standardLibrary], escapes, splitEnvironment)
+    yield* invoke(silk, ['check', '--no-server', '--stdlib', standardLibrary], escapes, splitEnvironment)
   })
   const computing = (body: string) => `effect fn tick() -> () {\n  return ()\n}\n\npub fn compute() -> i32 {\n${body}}\n`
   yield* escapeCheck(computing('  return 1\n'), '^$')

@@ -1,0 +1,494 @@
+//! A copy of `silk check` that stays behind and answers the next checks of the same project.
+//!
+//! A check's last step forks a copy of the process ([`detach`]) that keeps the revisable store
+//! it checked with and listens on a Unix socket named after everything the check depends on but
+//! its sources. The next `silk check` with the same key asks the copy ([`ask`]) instead of
+//! loading the program and its cache again: the copy reads the sources that changed, updates its
+//! store, which reruns only the units an edit reaches, and answers the report and the status.
+//!
+//! # Details
+//! Each message is framed with its byte length as an 8-byte little-endian integer. The client
+//! sends its key; the server answers a frame whose first byte is [`ANSWERED`], then the status and
+//! the count of reported sites as 4 little-endian bytes each, and the report, or [`DECLINED`] alone when the client must check by
+//! itself, as after a manifest changed. A server that waits [`IDLE_MILLISECONDS`] for a client,
+//! or finds while it waits that the project's shape changed, removes its socket and exits.
+//!
+//! # Gotchas
+//! [`detach`] must run on the check's only thread: the copy has no other thread, and a lock
+//! another thread held at the fork stays held in the copy. Other hosts never serve, and [`ask`]
+//! answers none there.
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.core.option { Option }
+
+/// The first byte of an answer that carries a status and a report.
+pub const ANSWERED: u8 = 1
+
+/// The first byte of an answer that leaves the check to the client.
+pub const DECLINED: u8 = 2
+
+/// How long a server waits for its next client before it exits.
+pub const IDLE_MILLISECONDS: i32 = 900000
+
+/// How often a waiting server looks whether its project still has the shape it checked, so a
+/// server of a project that was removed or changed does not hold its memory until it idles out.
+pub const WATCH_MILLISECONDS: i32 = 20000
+
+/// What [`next`] answers when no client came within the time it was given.
+pub const TIMED_OUT: i32 = -2
+
+/// What a server answered: the check's status and its report.
+pub struct Answer {
+  pub status: i32,
+  /// How many sites the report names.
+  pub reported: usize,
+  pub report: Bytes,
+}
+
+static if (Intrinsic.targetOperatingSystem() == "darwin"
+  && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")
+  && Intrinsic.targetAbi() == "apple"
+  && Intrinsic.profileText("libc") == "system")
+  || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu"
+    && Intrinsic.profileText("libc") == "gnu"
+    && (Intrinsic.targetArchitecture() == "aarch64"
+      || Intrinsic.targetArchitecture() == "x86_64")) {
+  import silk.collections.slice { Slice }
+  import silk.mem.pointer { Pointer }
+  import silk.num.isize
+  import silk.num.i32
+  import silk.num.u8
+  import silk.num.u32
+  import silk.num.u64
+  import silk.num.usize
+
+  extern "C" struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+  }
+
+  unsafe extern "C" fn socket(domain: i32, kind: i32, protocol: i32) -> i32
+  @foreign(noCapture: .("address"))
+  unsafe extern "C" fn bind(fd: i32, address: ?[*]const u8, length: u32) -> i32
+  @foreign(noCapture: .("address"))
+  unsafe extern "C" fn connect(fd: i32, address: ?[*]const u8, length: u32) -> i32
+  unsafe extern "C" fn listen(fd: i32, backlog: i32) -> i32
+  @foreign(noCapture: ("address", "length"))
+  unsafe extern "C" fn accept(fd: i32, address: ?*mut u8, length: ?*mut u32) -> i32
+  @foreign(noCapture: .("buffer"))
+  unsafe extern "C" fn send(fd: i32, buffer: ?[*]const u8, count: usize, flags: i32) -> isize
+  @foreign(noCapture: .("buffer"))
+  unsafe extern "C" fn recv(fd: i32, buffer: ?[*]mut u8, count: usize, flags: i32) -> isize
+  unsafe extern "C" fn close(fd: i32) -> i32
+  @foreign(noCapture: .("path"))
+  unsafe extern "C" fn unlink(path: ?[*]const u8) -> i32
+  @foreign(noCapture: .("path"))
+  unsafe extern "C" fn mkdir(path: ?[*]const u8, mode: u32) -> i32
+  @foreign(noCapture: .("path"))
+  unsafe extern "C" fn open(path: ?[*]const u8, flags: i32, ...) -> i32
+  unsafe extern "C" fn fork() -> i32
+  unsafe extern "C" fn setsid() -> i32
+  unsafe extern "C" fn dup2(from: i32, to: i32) -> i32
+  unsafe extern "C" fn _exit(status: i32) -> ()
+  unsafe extern "C" fn getuid() -> u32
+  unsafe extern "C" fn signal(number: i32, handler: usize) -> usize
+
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    @foreign(noCapture: .("fds"))
+    unsafe extern "C" fn poll(fds: ?[*]mut PollFd, count: u32, timeout: i32) -> i32
+    @foreign(noCapture: .("value"))
+    unsafe extern "C" fn setsockopt(fd: i32, level: i32, name: i32, value: ?*const i32, length: u32) -> i32
+    unsafe extern "C" fn __error() -> *mut i32
+    fn interrupted() -> bool {
+      unsafe {
+        return Pointer.read<i32>(__error()) == 4
+      }
+    }
+    const STREAM: i32 = 1
+    const SEND_FLAGS: i32 = 0
+    const CLOSE_ON_EXEC: i32 = 16777216
+    const PATH_LIMIT: usize = 103
+
+    // Writes the address of the socket at `path` into `address`; its length.
+    fn fillAddress(address: &mut [u8; 108], path: &[u8]) -> u32 {
+      address[0] = usize.wrappingToU8(path.length + 3)
+      address[1] = 1
+      return copyPath(&mut address.*, path)
+    }
+
+    // A write to a peer that left fails instead of raising SIGPIPE.
+    fn quiet(fd: i32) -> () {
+      let one: i32 = 1
+      let _set = unsafe setsockopt(fd, 65535, 4130, Pointer.fromRef<i32>(&one), 4)
+    }
+
+    fn pollOne(fd: i32, timeout: i32) -> i32 {
+      let mut polled: [PollFd; 1] = [PollFd {fd: fd, events: 1, revents: 0}]
+      return unsafe poll(Pointer.fromMutSlice<PollFd>(&mut polled), 1, timeout)
+    }
+  } else {
+    @foreign(noCapture: .("fds"))
+    unsafe extern "C" fn poll(fds: ?[*]mut PollFd, count: u64, timeout: i32) -> i32
+    unsafe extern "C" fn __errno_location() -> *mut i32
+    fn interrupted() -> bool {
+      unsafe {
+        return Pointer.read<i32>(__errno_location()) == 4
+      }
+    }
+    // SOCK_STREAM | SOCK_CLOEXEC.
+    const STREAM: i32 = 524289
+    const CLOSE_ON_EXEC: i32 = 524288
+    // MSG_NOSIGNAL: a write to a peer that left fails instead of raising SIGPIPE.
+    const SEND_FLAGS: i32 = 16384
+    const PATH_LIMIT: usize = 107
+
+    fn fillAddress(address: &mut [u8; 108], path: &[u8]) -> u32 {
+      address[0] = 1
+      address[1] = 0
+      return copyPath(&mut address.*, path)
+    }
+
+    fn quiet(fd: i32) -> () {
+      return ()
+    }
+
+    fn pollOne(fd: i32, timeout: i32) -> i32 {
+      let mut polled: [PollFd; 1] = [PollFd {fd: fd, events: 1, revents: 0}]
+      return unsafe poll(Pointer.fromMutSlice<PollFd>(&mut polled), 1, timeout)
+    }
+  }
+
+  // Copies `path` and its terminating zero after the family; the address length.
+  fn copyPath(address: &mut [u8; 108], path: &[u8]) -> u32 {
+    let mut at = usize.ZERO
+    while at < path.length {
+      address[at + 2] = path[at]
+      at = at + usize.ONE
+    }
+    address[path.length + 2] = 0
+    return usize.wrappingToU32(path.length + 3)
+  }
+
+  // The NUL-terminated form of `path`.
+  effect fn host(path: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+    let mut text = run Bytes.copy(path)
+    let ending: [u8; 1] = [0]
+    run Bytes.append(&mut text, &ending)
+    return move text
+  }
+
+  /// Whether this host can serve checks.
+  pub fn supported() -> bool {
+    return true
+  }
+
+  @foreign(noCapture: .("buffer"))
+  unsafe extern "C" fn read(fd: i32, buffer: ?[*]mut u8, count: usize) -> isize
+
+  /// The bytes of the file at `path`, read with the host's calls alone; none when it cannot be
+  /// read. A server reads every source before each check this way, which skips the checks a
+  /// first read makes.
+  pub effect fn readFile(path: &[u8]) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+    let hosted = run host(path)
+    // O_RDONLY | O_CLOEXEC.
+    let fd = unsafe open(Pointer.fromSlice<u8>(Bytes.asSlice(&hosted)), CLOSE_ON_EXEC)
+    if fd < 0 { return Option<Bytes>.none() }
+    let mut content = Bytes.make()
+    let mut buffer: [u8; 65536] = [0; 65536]
+    while true {
+      let count = unsafe read(fd, Pointer.fromMutSlice<u8>(&mut buffer), 65536)
+      if count == 0 { break }
+      if count < 0 {
+        if interrupted() { continue }
+        let _closed = unsafe close(fd)
+        return Option<Bytes>.none()
+      }
+      run Bytes.append(&mut content, Slice.view<u8>(&buffer, usize.ZERO, isize.toUsize(count)))
+    }
+    let _closed = unsafe close(fd)
+    return Option<Bytes>.some(move content)
+  }
+
+  /// The directory a server's socket lives in for this user, made when missing: `runtime` when
+  /// the host names one (`XDG_RUNTIME_DIR`), otherwise a directory of this user's own below
+  /// `/tmp`. None when it cannot be made.
+  pub effect fn directory(runtime: &Option<Bytes>) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+    if let Option<Bytes>.Some {value} = &runtime.* {
+      if Bytes.length(&value) > usize.ZERO { return Option<Bytes>.some(run Bytes.copy(Bytes.asSlice(&value))) }
+    }
+    let mut made = run Bytes.copy(b"/tmp/silk-")
+    run appendDecimal(&mut made, u32.toU64(unsafe getuid()))
+    let hosted = run host(Bytes.asSlice(&made))
+    // The directory is the user's alone, so no other user can reach a socket inside it.
+    let _made = unsafe mkdir(Pointer.fromSlice<u8>(Bytes.asSlice(&hosted)), 448)
+    return Option<Bytes>.some(move made)
+  }
+
+  effect fn appendDecimal(text: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+    if value >= 10 { run appendDecimal(&mut text.*, value / 10) }
+    let digit: [u8; 1] = [u64.wrappingToU8(48 + value % 10)]
+    run Bytes.append(&mut text.*, &digit)
+  }
+
+  /// Asks the server listening at `path` to check with `key`; none when no server listens there
+  /// or it declined, so the caller checks by itself.
+  pub effect fn ask(path: &[u8], key: &[u8]) -> Option<Answer> ! OutOfMemoryError ? &mut Allocator {
+    if path.length > PATH_LIMIT { return Option<Answer>.none() }
+    let fd = unsafe socket(1, STREAM, 0)
+    if fd < 0 { return Option<Answer>.none() }
+    quiet(fd)
+    let mut address: [u8; 108] = [0; 108]
+    let length = fillAddress(&mut address, path)
+    if unsafe connect(fd, Pointer.fromSlice<u8>(&address), length) != 0 {
+      let _closed = unsafe close(fd)
+      return Option<Answer>.none()
+    }
+    if !sendFrame(fd, key) {
+      let _closed = unsafe close(fd)
+      return Option<Answer>.none()
+    }
+    let received = run receiveFrame(fd)
+    let _closed = unsafe close(fd)
+    let answer = match move received {
+      Option<Bytes>.Some {value} => move value
+      Option<Bytes>.None => { return Option<Answer>.none() }
+    }
+    let bytes = Bytes.asSlice(&answer)
+    if bytes.length < 9 || bytes[0] != ANSWERED { return Option<Answer>.none() }
+    let status = u32.wrappingToI32(word(bytes, 1))
+    let reported = u32.toUsize(word(bytes, 5))
+    let report = run Bytes.copy(Slice.view<u8>(bytes, 9, bytes.length - 9))
+    return Option<Answer>.some(Answer {status: status, reported: reported, report: move report})
+  }
+
+  // The little-endian 4-byte word at `at`.
+  fn word(bytes: &[u8], at: usize) -> u32 {
+    return u8.toU32(bytes[at]) + u8.toU32(bytes[at + 1]) * 256 + u8.toU32(bytes[at + 2]) * 65536
+      + u8.toU32(bytes[at + 3]) * 16777216
+  }
+
+  /// Listens on a socket at `path`, replacing whatever was there; -1 when it cannot.
+  pub effect fn listenAt(path: &[u8]) -> i32 ! OutOfMemoryError ? &mut Allocator {
+    if path.length > PATH_LIMIT { return -1 }
+    let hosted = run host(path)
+    let _removed = unsafe unlink(Pointer.fromSlice<u8>(Bytes.asSlice(&hosted)))
+    let fd = unsafe socket(1, STREAM, 0)
+    if fd < 0 { return -1 }
+    let mut address: [u8; 108] = [0; 108]
+    let length = fillAddress(&mut address, path)
+    if unsafe bind(fd, Pointer.fromSlice<u8>(&address), length) != 0 || unsafe listen(fd, 4) != 0 {
+      let _closed = unsafe close(fd)
+      return -1
+    }
+    return fd
+  }
+
+  /// The next client of the server listening on `listener`, [`TIMED_OUT`] when none came within
+  /// `milliseconds`, or -1 once the socket failed.
+  pub fn next(listener: i32, milliseconds: i32) -> i32 {
+    while true {
+      let ready = pollOne(listener, milliseconds)
+      if ready == 0 { return TIMED_OUT }
+      if ready < 0 {
+        if interrupted() { continue }
+        return -1
+      }
+      let client = unsafe accept(listener, Pointer.null<u8>(), Pointer.null<u32>())
+      if client >= 0 {
+        quiet(client)
+        return client
+      }
+      if !interrupted() { return -1 }
+    }
+    return -1
+  }
+
+  /// The key a client sent on `client`; none when it sent no whole frame.
+  pub effect fn request(client: i32) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+    return run receiveFrame(client)
+  }
+
+  /// Answers `client` with `status`, the count of sites `reported` and `report`, then closes it.
+  pub effect fn answer(client: i32, status: i32, reported: usize, report: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut framed = Bytes.make()
+    let mut head: [u8; 9] = [ANSWERED, 0, 0, 0, 0, 0, 0, 0, 0]
+    let mut statusWord = i32.wrappingToU32(status)
+    let mut count = usize.wrappingToU32(reported)
+    let mut at = usize.ONE
+    while at < 5 {
+      head[at] = u32.wrappingToU8(statusWord % 256)
+      head[at + 4] = u32.wrappingToU8(count % 256)
+      statusWord = statusWord / 256
+      count = count / 256
+      at = at + usize.ONE
+    }
+    run Bytes.append(&mut framed, &head)
+    run Bytes.append(&mut framed, report)
+    let _sent = sendFrame(client, Bytes.asSlice(&framed))
+    let _closed = unsafe close(client)
+  }
+
+  /// Tells `client` to check by itself, then closes it.
+  pub fn decline(client: i32) -> () {
+    let declined: [u8; 1] = [DECLINED]
+    let _sent = sendFrame(client, &declined)
+    let _closed = unsafe close(client)
+  }
+
+  /// Removes the socket at `path`, so no later check asks a server that left.
+  pub effect fn remove(path: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    let hosted = run host(path)
+    let _removed = unsafe unlink(Pointer.fromSlice<u8>(Bytes.asSlice(&hosted)))
+  }
+
+  /// Forks the copy that serves: true in the copy, which has left the terminal's session and
+  /// reads and writes `/dev/null` in place of its standard streams; false in the check, which
+  /// returns as before, and when no copy could start.
+  pub fn detach() -> bool {
+    let child = unsafe fork()
+    if child != 0 { return false }
+    let _detached = unsafe setsid()
+    // A client that leaves mid-answer fails the write instead of ending the server.
+    let _ignored = unsafe signal(13, usize.ONE)
+    let empty = unsafe open(Pointer.fromSlice<u8>(b"/dev/null\0"), 2)
+    if empty < 0 { exit(0) }
+    let input = unsafe dup2(empty, 0)
+    let output = unsafe dup2(empty, 1)
+    let errors = unsafe dup2(empty, 2)
+    if input < 0 || output < 0 || errors < 0 { exit(0) }
+    if empty > 2 {
+      let _closed = unsafe close(empty)
+    }
+    return true
+  }
+
+  /// Ends the serving copy without freeing what it holds.
+  pub fn exit(status: i32) -> never {
+    unsafe _exit(status)
+    return exit(status)
+  }
+
+  fn sendAll(fd: i32, bytes: &[u8]) -> bool {
+    let mut offset = usize.ZERO
+    while offset < bytes.length {
+      let sent = unsafe send(fd, Pointer.fromSlice<u8>(Slice.view<u8>(bytes, offset, bytes.length - offset)), bytes.length - offset, SEND_FLAGS)
+      if sent < 0 {
+        if interrupted() { continue }
+        return false
+      }
+      offset = offset + isize.toUsize(sent)
+    }
+    return true
+  }
+
+  fn sendFrame(fd: i32, payload: &[u8]) -> bool {
+    let mut head: [u8; 8] = [0; 8]
+    let mut length = usize.toU64(payload.length)
+    let mut at = usize.ZERO
+    while at < 8 {
+      head[at] = u64.wrappingToU8(length % 256)
+      length = length / 256
+      at = at + usize.ONE
+    }
+    return sendAll(fd, &head) && sendAll(fd, payload)
+  }
+
+  // Reads exactly `count` bytes onto `into`; false when the peer closed first or the read failed.
+  effect fn receiveExactly(fd: i32, into: &mut Bytes, count: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
+    let mut buffer: [u8; 65536] = [0; 65536]
+    let mut left = count
+    while left > usize.ZERO {
+      let mut asked = left
+      if asked > 65536 { asked = 65536 }
+      let read = unsafe recv(fd, Pointer.fromMutSlice<u8>(&mut buffer), asked, 0)
+      if read == 0 { return false }
+      if read < 0 {
+        if interrupted() { continue }
+        return false
+      }
+      let got = isize.toUsize(read)
+      run Bytes.append(&mut into.*, Slice.view<u8>(&buffer, usize.ZERO, got))
+      left = left - got
+    }
+    return true
+  }
+
+  effect fn receiveFrame(fd: i32) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+    let mut head = Bytes.make()
+    if !run receiveExactly(fd, &mut head, 8) { return Option<Bytes>.none() }
+    let bytes = Bytes.asSlice(&head)
+    let mut length: u64 = 0
+    let mut at: usize = 8
+    while at > usize.ZERO {
+      at = at - usize.ONE
+      length = length * 256 + u8.toU64(bytes[at])
+    }
+    // A key or a report is far smaller; anything larger is not a frame of this protocol.
+    if length > 1073741824 { return Option<Bytes>.none() }
+    let mut payload = Bytes.make()
+    if !run receiveExactly(fd, &mut payload, u64.toUsize(length)) { return Option<Bytes>.none() }
+    return Option<Bytes>.some(move payload)
+  }
+} else {
+  /// Whether this host can serve checks: it cannot.
+  pub fn supported() -> bool {
+    return false
+  }
+
+  /// None: this host serves no checks.
+  pub effect fn directory(runtime: &Option<Bytes>) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+    return Option<Bytes>.none()
+  }
+
+  /// None: this host serves no checks.
+  pub effect fn readFile(path: &[u8]) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+    return Option<Bytes>.none()
+  }
+
+  /// None: this host serves no checks.
+  pub effect fn ask(path: &[u8], key: &[u8]) -> Option<Answer> ! OutOfMemoryError ? &mut Allocator {
+    return Option<Answer>.none()
+  }
+
+  /// -1: this host serves no checks.
+  pub effect fn listenAt(path: &[u8]) -> i32 ! OutOfMemoryError ? &mut Allocator {
+    return -1
+  }
+
+  /// Never reached on this host.
+  pub fn next(listener: i32, milliseconds: i32) -> i32 {
+    return -1
+  }
+
+  /// Never reached on this host.
+  pub effect fn request(client: i32) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+    return Option<Bytes>.none()
+  }
+
+  /// Never reached on this host.
+  pub effect fn answer(client: i32, status: i32, reported: usize, report: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    return ()
+  }
+
+  /// Never reached on this host.
+  pub fn decline(client: i32) -> () {
+    return ()
+  }
+
+  /// Never reached on this host.
+  pub effect fn remove(path: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    return ()
+  }
+
+  /// False: this host starts no copy.
+  pub fn detach() -> bool {
+    return false
+  }
+
+  /// Never reached on this host.
+  pub fn exit(status: i32) -> never {
+    return exit(status)
+  }
+}
