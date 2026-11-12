@@ -1,0 +1,662 @@
+//! Read and write `Schema` types as YAML.
+//!
+//! # When to use
+//! Call [`SchemaYaml.decode`] to read a value of a `silk.schema.schema.Schema` type from YAML text,
+//! such as a configuration file, [`SchemaYaml.decodeAll`] to report every problem in the text at
+//! once, and [`SchemaYaml.encode`] to write a value as YAML to the ambient `Writer`. Show the
+//! problems with `silk.schema.report.SchemaReport`. Use `silk.yaml.document.YamlDocument` to work
+//! with YAML whose shape is not known in advance.
+//!
+//! # Details
+//! Decoding parses the text into a `YamlDocument` first, then reads the value from it, so members
+//! may come in any order. Members the type does not name are skipped, or reported when its spec is
+//! `Spec.strict`. Every problem carries the span of the bytes it is about. A field that holds text
+//! also accepts a plain scalar that YAML reads as another kind, such as `version: 1.10` or
+//! `zip: 01234`, and gets its text exactly as written. Encoding writes block-style YAML, with struct
+//! fields in declaration order.
+//!
+//! # Examples
+//! ## Read a configuration file
+//! ```silk
+//! import silk.collections.list { List }
+//! import silk.core.effect { Effect }
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.schema.issue { SchemaError }
+//! import silk.schema.schema { Schema }
+//! import silk.schema.yaml { SchemaYaml }
+//! import silk.text.string { String }
+//!
+//! struct Service {
+//!   pub name: String,
+//!   pub version: String,
+//!   pub ports: List<u16>,
+//! }
+//!
+//! impl Schema for Service {}
+//!
+//! effect fn load() -> i32 ! SchemaError | OutOfMemoryError ? &mut Allocator {
+//!   let api = run SchemaYaml.decode<Service>(b"name: api\nversion: 1.10\nports: [80, 443]\n")
+//!   if api.name.view() != "api" || api.version.view() != "1.10" || List<u16>.get(&api.ports, 1) != 443 {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//!
+//! pub effect fn main() -> i32 ! SchemaError | OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   return run load() |> Effect.provideMut<Allocator>(&mut allocator)
+//! }
+//! ```
+//!
+//! @category Data formats
+
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.io.writer { Writer, WriterError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.usize
+import silk.schema.issue { Issue, IssueReason, MAX_PROBLEMS, SchemaError, SchemaErrors, Span, ValueKind }
+import silk.schema.path { SchemaPath }
+import silk.schema.schema { Schema, SchemaReader, SchemaWriter, Schemas }
+import silk.text.string { String }
+import silk.yaml.document { YamlDocument, YamlError, YamlItems, YamlKind, YamlMember, YamlMembers, YamlNode }
+import silk.yaml.output { YamlEmitter }
+
+/// The owner of the YAML entry points. It has no fields and is never constructed.
+pub struct SchemaYaml {}
+
+impl SchemaYaml {
+  /// Reads one value of type `T` from the YAML text `bytes`, stopping at the first problem.
+  ///
+  /// # Details
+  ///
+  /// The text must hold one YAML document. A text field also accepts a plain scalar that YAML reads
+  /// as a number, a boolean, or null, and gets the text as written.
+  ///
+  /// # Errors
+  ///
+  /// - `SchemaError` if the text is not valid YAML, holds more than one document, or does not hold
+  ///   a `T`. Its `path` names the part that failed, and its issue has the span of the bytes it is
+  ///   about. Invalid YAML gives `IssueReason.InvalidSyntax`.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the document or the value.
+  pub effect fn decode<T: Schema>(bytes: &[u8]) -> T ! SchemaError | OutOfMemoryError ? &mut Allocator {
+    let document = match move run Effect.result(YamlDocument.parse(bytes)) {
+      Result<YamlDocument, YamlError | OutOfMemoryError>.Success {value} => move value
+      Result<YamlDocument, YamlError | OutOfMemoryError>.Failure {error} => match move error {
+        YamlError {offset, ..} => { fail SchemaError {path: SchemaPath.make(), issue: syntax(offset), got: Option<String>.none()} }
+        OutOfMemoryError {} => { fail OutOfMemoryError {} }
+      }
+    }
+    let mut reader = YamlSchemaReader.make(&document, YamlDocument.root(&document))
+    let read = run Effect.result(Schemas.read<T, YamlSchemaReader<'_>>(&mut reader))
+    return match move read {
+      Result<T, Issue | OutOfMemoryError>.Success {value} => move value
+      Result<T, Issue | OutOfMemoryError>.Failure {error} => match move error {
+        Issue {reason, expected, found, span} => {
+          fail SchemaError {path: move reader.path, issue: Issue {reason: reason, expected: expected, found: found, span: span},
+            got: Option<String>.none()}
+        }
+        OutOfMemoryError {} => { fail OutOfMemoryError {} }
+      }
+    }
+  }
+
+  /// Reads one value of type `T` from the YAML text `bytes`, reporting every problem.
+  ///
+  /// # Details
+  ///
+  /// A field, element or variant that fails is recorded and skipped, and reading goes on with the
+  /// next one, so one call lists every problem, in input order: a missing key, a wrong type, a
+  /// number out of range and a failed rule alike. Text that is not valid YAML is the one problem
+  /// reported. At most `MAX_PROBLEMS` (64) are listed.
+  ///
+  /// # Errors
+  ///
+  /// - `SchemaErrors` with every problem found.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the document or the value.
+  pub effect fn decodeAll<T: Schema>(bytes: &[u8]) -> T ! SchemaErrors | OutOfMemoryError ? &mut Allocator {
+    let document = match move run Effect.result(YamlDocument.parse(bytes)) {
+      Result<YamlDocument, YamlError | OutOfMemoryError>.Success {value} => move value
+      Result<YamlDocument, YamlError | OutOfMemoryError>.Failure {error} => match move error {
+        YamlError {offset, ..} => {
+          let mut errors = List<SchemaError>.make()
+          run List<SchemaError>.append(&mut errors, SchemaError {path: SchemaPath.make(), issue: syntax(offset), got: Option<String>.none()})
+          fail SchemaErrors {errors: move errors, dropped: usize.ZERO}
+        }
+        OutOfMemoryError {} => { fail OutOfMemoryError {} }
+      }
+    }
+    let mut reader = YamlSchemaReader.collectingAll(&document, YamlDocument.root(&document))
+    let read = run Effect.result(Schemas.read<T, YamlSchemaReader<'_>>(&mut reader))
+    return match move read {
+      Result<T, Issue | OutOfMemoryError>.Success {value} => {
+        if List<SchemaError>.length(&reader.errors) != 0 { fail SchemaErrors {errors: move reader.errors, dropped: reader.dropped} }
+        move value
+      }
+      Result<T, Issue | OutOfMemoryError>.Failure {error} => match move error {
+        Issue {reason, expected, found, span} => {
+          if reason != IssueReason.Reported {
+            run record(&mut reader, Issue {reason: reason, expected: expected, found: found, span: span})
+          }
+          fail SchemaErrors {errors: move reader.errors, dropped: reader.dropped}
+        }
+        OutOfMemoryError {} => { fail OutOfMemoryError {} }
+      }
+    }
+  }
+
+  /// Writes `value` as block-style YAML to the ambient `Writer`.
+  ///
+  /// # Details
+  ///
+  /// Struct fields are written in declaration order, nested collections are indented by two
+  /// spaces, and strings are quoted only when a reader would read them as something else. The text
+  /// goes to the `Writer` in pieces of up to 4 KiB. It does not flush the `Writer`.
+  ///
+  /// # Errors
+  ///
+  /// - `SchemaError` if the value nests more than 128 levels deep. Its path is empty.
+  /// - `WriterError` if the `Writer` fails. Bytes that it accepted before the failure stay written.
+  /// - `OutOfMemoryError` if a codec needs memory that the `Allocator` cannot supply.
+  ///
+  /// # Examples
+  ///
+  /// ```silk
+  /// import silk.collections.slice { Slice }
+  /// import silk.core.effect { Effect }
+  /// import silk.io.writer { Writer, WriterError }
+  /// import silk.mem.allocator { Allocator, OutOfMemoryError }
+  /// import silk.schema.issue { SchemaError }
+  /// import silk.schema.schema { Schema }
+  /// import silk.schema.yaml { SchemaYaml }
+  ///
+  /// struct Limits {
+  ///   pub retries: u8,
+  /// }
+  ///
+  /// impl Schema for Limits {}
+  ///
+  /// struct Server {
+  ///   pub port: u16,
+  ///   pub limits: Limits,
+  /// }
+  ///
+  /// impl Schema for Server {}
+  ///
+  /// struct Capture {
+  ///   bytes: [u8; 64],
+  ///   length: usize,
+  /// }
+  ///
+  /// impl Writer for Capture {
+  ///   effect fn writeAll(self: &mut Self, val: &[u8]) -> () ! WriterError ? &mut Writer {
+  ///     Slice.copyInto<u8>(&mut self.bytes, self.length, val)
+  ///     self.length = self.length + val.length
+  ///     return ()
+  ///   }
+  ///   effect fn flush(self: &mut Self) -> () ! WriterError ? &mut Writer { return () }
+  /// }
+  ///
+  /// pub effect fn main() -> i32 ! SchemaError | WriterError | OutOfMemoryError {
+  ///   let mut allocator = Allocator.systemAllocatorProvider()
+  ///   let mut capture = Capture {bytes: [0; 64], length: 0}
+  ///   let server = Server {port: 8080, limits: Limits {retries: 3}}
+  ///   run SchemaYaml.encode<Server>(&server) |> Effect.provideMut<Writer>(&mut capture)
+  ///     |> Effect.provideMut<Allocator>(&mut allocator)
+  ///   if Slice.view<u8>(&capture.bytes, 0, capture.length) != b"port: 8080\nlimits:\n  retries: 3\n" {
+  ///     return 1
+  ///   }
+  ///   return 0
+  /// }
+  /// ```
+  pub effect fn encode<T: Schema>(value: &T)
+    -> () ! SchemaError | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
+    let mut writer = YamlSchemaWriter.make()
+    run Effect.catch<Issue>(Schemas.write<T, YamlSchemaWriter>(value, &mut writer),
+      effect fn(issue: Issue) -> () ! SchemaError { fail SchemaError {path: SchemaPath.make(), issue: issue, got: Option<String>.none()} })
+    return run Effect.catch<Issue>(writer.finish(),
+      effect fn(issue: Issue) -> () ! SchemaError { fail SchemaError {path: SchemaPath.make(), issue: issue, got: Option<String>.none()} })
+  }
+}
+
+fn syntax(offset: usize) -> Issue {
+  return Issue.at(IssueReason.InvalidSyntax, "valid YAML", ValueKind.Unknown, Span {start: offset, end: offset + usize.ONE})
+}
+
+// A mapping being read: its node, and where the flags of the members found start in
+// `YamlSchemaReader.seen`.
+struct ObjectFrame {
+  node: YamlNode,
+  seen: usize,
+}
+
+impl Copy for ObjectFrame {}
+
+// A sequence being read: its node and the items left.
+struct ListFrame {
+  node: YamlNode,
+  items: YamlItems,
+}
+
+impl Copy for ListFrame {}
+
+// A position a collecting read can return to.
+struct Mark {
+  frames: usize,
+  lists: usize,
+  seen: usize,
+  current: YamlNode,
+}
+
+impl Copy for Mark {}
+
+/// A `SchemaReader` over a node of a parsed `silk.yaml.document.YamlDocument`.
+///
+/// # When to use
+///
+/// [`SchemaYaml.decode`] uses it. Use it directly to read a typed value from one node of a document
+/// that the program parsed itself, such as one document of a stream from
+/// `YamlDocument.parseAll`: call `Schemas.read` with it.
+///
+/// # Details
+///
+/// A text field also accepts a plain scalar that YAML reads as a number, a boolean, or null, and
+/// gets the text as written. Spans in the problems are byte positions in the parsed text.
+pub struct YamlSchemaReader<'document> {
+  document: &'document YamlDocument,
+  current: YamlNode,
+  frames: List<ObjectFrame>,
+  seen: List<bool>,
+  lists: List<ListFrame>,
+  marks: List<Mark>,
+  path: SchemaPath,
+  collecting: bool,
+  errors: List<SchemaError>,
+  dropped: usize,
+  last: Option<Span>,
+  lastKind: ValueKind,
+}
+
+impl<'document> YamlSchemaReader<'document> {
+  /// Returns a reader of the value at `node` of `document`, which stops at the first problem.
+  pub fn make(document: &'document YamlDocument, node: YamlNode) -> YamlSchemaReader<'document> {
+    return YamlSchemaReader<'document> {
+      document: document,
+      current: node,
+      frames: List<ObjectFrame>.make(),
+      seen: List<bool>.make(),
+      lists: List<ListFrame>.make(),
+      marks: List<Mark>.make(),
+      path: SchemaPath.make(),
+      collecting: false,
+      errors: List<SchemaError>.make(),
+      dropped: usize.ZERO,
+      last: Option<Span>.none(),
+      lastKind: ValueKind.Unknown,
+    }
+  }
+
+  /// Returns a reader of the value at `node` of `document` that records every problem instead of
+  /// stopping at the first. Read them with [`YamlSchemaReader.intoErrors`].
+  pub fn collectingAll(document: &'document YamlDocument, node: YamlNode) -> YamlSchemaReader<'document> {
+    let mut reader = YamlSchemaReader<'document>.make(document, node)
+    reader.collecting = true
+    return move reader
+  }
+
+  /// Returns the problems the reader recorded, in the order they were found.
+  pub fn intoErrors(self: Self) -> List<SchemaError> {
+    return move self.errors
+  }
+}
+
+effect fn record(reader: &mut YamlSchemaReader<'_>, issue: Issue) -> () ! OutOfMemoryError ? &mut Allocator {
+  if List<SchemaError>.length(&reader.errors) >= MAX_PROBLEMS {
+    reader.dropped = reader.dropped + usize.ONE
+    return ()
+  }
+  let path = run SchemaPath.copy(&reader.path)
+  // Problems are kept in input order: an unexpected key is found after the fields it precedes.
+  let mut at = List<SchemaError>.length(&reader.errors)
+  if let Option<Span>.Some {value: span} = issue.span {
+    let recorded = List<SchemaError>.asSlice(&reader.errors)
+    while at > usize.ZERO && startsAfter(recorded[at - usize.ONE].issue.span, span.start) { at = at - usize.ONE }
+  }
+  return run List<SchemaError>.insert(&mut reader.errors, at, SchemaError {path: move path, issue: issue, got: Option<String>.none()})
+}
+
+fn startsAfter(span: Option<Span>, start: usize) -> bool {
+  return match span {
+    Option<Span>.Some {value} => value.start > start
+    Option<Span>.None => false
+  }
+}
+
+fn kindOf(kind: YamlKind) -> ValueKind {
+  return match kind {
+    YamlKind.Null => ValueKind.Null
+    YamlKind.Bool => ValueKind.Boolean
+    YamlKind.Integer => ValueKind.Number
+    YamlKind.Float => ValueKind.Number
+    YamlKind.String => ValueKind.Text
+    YamlKind.Sequence => ValueKind.List
+    YamlKind.Mapping => ValueKind.Object
+  }
+}
+
+fn spanOf(document: &YamlDocument, node: YamlNode) -> Span {
+  let span = YamlDocument.span(document, node)
+  return Span {start: span.start, end: span.end}
+}
+
+impl<'document> YamlSchemaReader<'document> {
+  // Takes the current node as the next value read, remembering its span and kind.
+  fn scalar(self: &mut Self) -> YamlKind {
+    let kind = YamlDocument.kind(self.document, self.current)
+    self.last = Option<Span>.some(spanOf(self.document, self.current))
+    self.lastKind = kindOf(kind)
+    return kind
+  }
+
+  // An issue about the current node.
+  fn mismatch(self: &Self, reason: IssueReason, expected: string<'static>) -> Issue {
+    return Issue.at(reason, expected, kindOf(YamlDocument.kind(self.document, self.current)), spanOf(self.document, self.current))
+  }
+}
+
+impl<'document> SchemaReader for YamlSchemaReader<'document> {
+  /// Returns the path of the part being read.
+  fn path(self: &mut Self) -> &mut SchemaPath {
+    return &mut self.path
+  }
+
+  /// Fails with the issue, or records it and returns when the reader collects every problem.
+  effect fn report(self: &mut Self, issue: Issue) -> () ! Issue | OutOfMemoryError ? &mut Allocator {
+    if !self.collecting { fail issue }
+    return run record(&mut self.*, issue)
+  }
+
+  /// Returns whether the reader records every problem.
+  fn collecting(self: &Self) -> bool {
+    return self.collecting
+  }
+
+  /// Returns the span of the last complete value read.
+  fn lastSpan(self: &Self) -> Option<Span> {
+    return self.last
+  }
+
+  /// Returns the kind of the last complete value read.
+  fn lastKind(self: &Self) -> ValueKind {
+    return self.lastKind
+  }
+
+  /// Remembers the open mappings and sequences and the node being read.
+  effect fn mark(self: &mut Self) -> usize ! OutOfMemoryError ? &mut Allocator {
+    let at = List<Mark>.length(&self.marks)
+    run List<Mark>.append(&mut self.marks, Mark {frames: List<ObjectFrame>.length(&self.frames), lists: List<ListFrame>.length(&self.lists),
+      seen: List<bool>.length(&self.seen), current: self.current})
+    return at
+  }
+
+  /// Returns to the mark, closing the mappings and sequences opened since. With `skip`, the value
+  /// at the mark becomes the last one read.
+  effect fn recover(self: &mut Self, mark: usize, skip: bool) -> () ! Issue | OutOfMemoryError ? &mut Allocator {
+    let saved = List<Mark>.get(&self.marks, mark)
+    List<Mark>.truncate(&mut self.marks, mark)
+    List<ObjectFrame>.truncate(&mut self.frames, saved.frames)
+    List<ListFrame>.truncate(&mut self.lists, saved.lists)
+    List<bool>.truncate(&mut self.seen, saved.seen)
+    self.current = saved.current
+    if skip { self.last = Option<Span>.some(spanOf(self.document, saved.current)) }
+    return ()
+  }
+
+  /// Forgets the mark and every later one.
+  fn release(self: &mut Self, mark: usize) -> () {
+    List<Mark>.truncate(&mut self.marks, mark)
+    return ()
+  }
+
+  /// Reads `true` or `false`.
+  effect fn boolean(self: &mut Self) -> bool ! Issue | OutOfMemoryError ? &mut Allocator {
+    if self.scalar() != YamlKind.Bool { fail self.mismatch(IssueReason.InvalidType, "true or false") }
+    return YamlDocument.asBool(self.document, self.current) |> Option<bool>.unwrapOr(false)
+  }
+
+  /// Reads an integer as an `i64`.
+  effect fn signed(self: &mut Self) -> i64 ! Issue | OutOfMemoryError ? &mut Allocator {
+    if self.scalar() != YamlKind.Integer { fail self.mismatch(IssueReason.InvalidType, "an integer") }
+    return match YamlDocument.asI64(self.document, self.current) {
+      Option<i64>.Some {value} => value
+      Option<i64>.None => { fail self.mismatch(IssueReason.InvalidValue, "an integer") }
+    }
+  }
+
+  /// Reads an integer as a `u64`.
+  effect fn unsigned(self: &mut Self) -> u64 ! Issue | OutOfMemoryError ? &mut Allocator {
+    if self.scalar() != YamlKind.Integer { fail self.mismatch(IssueReason.InvalidType, "a non-negative integer") }
+    return match YamlDocument.asU64(self.document, self.current) {
+      Option<u64>.Some {value} => value
+      Option<u64>.None => { fail self.mismatch(IssueReason.InvalidValue, "a non-negative integer") }
+    }
+  }
+
+  /// Reads an integer or a float as an `f64`.
+  effect fn float(self: &mut Self) -> f64 ! Issue | OutOfMemoryError ? &mut Allocator {
+    let kind = self.scalar()
+    if kind != YamlKind.Float && kind != YamlKind.Integer { fail self.mismatch(IssueReason.InvalidType, "a number") }
+    return YamlDocument.asF64(self.document, self.current) |> Option<f64>.unwrapOr(0.0)
+  }
+
+  /// Reads a string, or the text of a plain scalar that YAML reads as a number, a boolean, or null.
+  effect fn text(self: &mut Self) -> String ! Issue | OutOfMemoryError ? &mut Allocator {
+    let kind = self.scalar()
+    if kind == YamlKind.String {
+      return run String.copy(YamlDocument.asString(self.document, self.current) |> Option<string>.unwrapOr(""))
+    }
+    if kind == YamlKind.Sequence || kind == YamlKind.Mapping { fail self.mismatch(IssueReason.InvalidType, "text") }
+    return run String.copy(YamlDocument.scalarText(self.document, self.current) |> Option<string>.unwrapOr(""))
+  }
+
+  /// Reads past a null value and returns `true`, or returns `false` for another value.
+  effect fn null(self: &mut Self) -> bool ! Issue | OutOfMemoryError ? &mut Allocator {
+    if YamlDocument.kind(self.document, self.current) != YamlKind.Null { return false }
+    let kind = self.scalar()
+    drop kind
+    return true
+  }
+
+  /// Starts reading a sequence.
+  effect fn beginList(self: &mut Self) -> () ! Issue | OutOfMemoryError ? &mut Allocator {
+    if YamlDocument.kind(self.document, self.current) != YamlKind.Sequence { fail self.mismatch(IssueReason.InvalidType, "a list") }
+    return run List<ListFrame>.append(&mut self.lists, ListFrame {node: self.current, items: YamlDocument.items(self.document, self.current)})
+  }
+
+  /// Returns `true` at the next item, or ends the sequence and returns `false`.
+  effect fn nextElement(self: &mut Self) -> bool ! Issue | OutOfMemoryError ? &mut Allocator {
+    let lists = List<ListFrame>.asMutSlice(&mut self.lists)
+    let top = lists.length - usize.ONE
+    return match lists[top].items.next(self.document) {
+      Option<YamlNode>.Some {value} => {
+        self.current = value
+        true
+      }
+      Option<YamlNode>.None => {
+        let node = lists[top].node
+        List<ListFrame>.truncate(&mut self.lists, top)
+        self.current = node
+        self.last = Option<Span>.some(spanOf(self.document, node))
+        self.lastKind = ValueKind.List
+        false
+      }
+    }
+  }
+
+  /// Starts reading a mapping.
+  effect fn beginObject(self: &mut Self) -> () ! Issue | OutOfMemoryError ? &mut Allocator {
+    if YamlDocument.kind(self.document, self.current) != YamlKind.Mapping { fail self.mismatch(IssueReason.InvalidType, "an object") }
+    let seen = List<bool>.length(&self.seen)
+    run List<bool>.appendRepeated(&mut self.seen, false, YamlDocument.length(self.document, self.current))
+    return run List<ObjectFrame>.append(&mut self.frames, ObjectFrame {node: self.current, seen: seen})
+  }
+
+  /// Finds the member `key` of the mapping and leaves the reader at its value. A missing key leaves
+  /// the start of the mapping as the last span.
+  effect fn member(self: &mut Self, key: string) -> bool ! Issue | OutOfMemoryError ? &mut Allocator {
+    let frame = List<ObjectFrame>.get(&self.frames, List<ObjectFrame>.length(&self.frames) - usize.ONE)
+    let mut members = YamlDocument.members(self.document, frame.node)
+    let mut index = frame.seen
+    while let Option<YamlMember>.Some {value: member} = members.next(self.document) {
+      // Every key is a string.
+      if (YamlDocument.asString(self.document, member.key) |> Option<string>.unwrapOr("")) == key {
+        List<bool>.set(&mut self.seen, index, true)
+        self.current = member.value
+        return true
+      }
+      index = index + usize.ONE
+    }
+    let start = YamlDocument.span(self.document, frame.node).start
+    self.current = frame.node
+    self.last = Option<Span>.some(Span {start: start, end: start + usize.ONE})
+    self.lastKind = ValueKind.Missing
+    return false
+  }
+
+  /// Reports every member no `member` call found, at its key.
+  effect fn rejectUnread(self: &mut Self, expected: string<'static>) -> () ! Issue | OutOfMemoryError ? &mut Allocator {
+    let frame = List<ObjectFrame>.get(&self.frames, List<ObjectFrame>.length(&self.frames) - usize.ONE)
+    let mut members = YamlDocument.members(self.document, frame.node)
+    let mut index = frame.seen
+    while let Option<YamlMember>.Some {value: member} = members.next(self.document) {
+      if !List<bool>.get(&self.seen, index) {
+        let issue = Issue.at(IssueReason.UnexpectedKey, expected, ValueKind.Text, spanOf(self.document, member.key))
+        run SchemaReader.report(&mut self.*, issue)
+      }
+      index = index + usize.ONE
+    }
+    return ()
+  }
+
+  /// Ends the mapping being read.
+  effect fn endObject(self: &mut Self) -> () ! Issue | OutOfMemoryError ? &mut Allocator {
+    let frame = match List<ObjectFrame>.pop(&mut self.frames) {
+      Option<ObjectFrame>.Some {value} => value
+      Option<ObjectFrame>.None => { fail Issue.make(IssueReason.InvalidSyntax, "an object") }
+    }
+    List<bool>.truncate(&mut self.seen, frame.seen)
+    self.current = frame.node
+    self.last = Option<Span>.some(spanOf(self.document, frame.node))
+    self.lastKind = ValueKind.Object
+    return ()
+  }
+}
+
+/// A `SchemaWriter` that writes block-style YAML to the ambient `Writer`.
+///
+/// # When to use
+///
+/// [`SchemaYaml.encode`] uses it. Use it directly to write several values as the documents of one
+/// stream: call `Schemas.write` for each, `nextDocument` between them, and `finish` at the end.
+///
+/// # Gotchas
+///
+/// The text is kept in a 4 KiB buffer; call `finish` after the last value, or the end of the text
+/// stays in it.
+pub struct YamlSchemaWriter {
+  emitter: YamlEmitter,
+}
+
+effect fn tooDeep(error: YamlError) -> () ! Issue {
+  fail Issue.invalidValue("a value nested at most 128 levels deep")
+}
+
+impl YamlSchemaWriter {
+  /// Returns a writer at the start of the first document.
+  pub fn make() -> YamlSchemaWriter {
+    return YamlSchemaWriter {emitter: YamlEmitter.make()}
+  }
+
+  /// Ends the current document with a `---` line, so that the next value starts a new document.
+  ///
+  /// # Errors
+  ///
+  /// - `WriterError` if the `Writer` fails while the buffer is written out.
+  pub effect fn nextDocument(self: &mut Self) -> () ! Issue | WriterError ? &mut Writer {
+    return run Effect.catch<YamlError>(self.emitter.nextDocument(), tooDeep)
+  }
+
+  /// Writes the rest of the buffer to the `Writer`. It does not flush the `Writer`.
+  ///
+  /// # Errors
+  ///
+  /// - `WriterError` if the `Writer` fails. Bytes that it accepted before the failure stay written.
+  pub effect fn finish(self: &mut Self) -> () ! Issue | WriterError ? &mut Writer {
+    return run Effect.catch<YamlError>(self.emitter.finish(), tooDeep)
+  }
+}
+
+impl SchemaWriter for YamlSchemaWriter {
+  /// Writes `true` or `false`.
+  effect fn boolean(self: &mut Self, value: bool) -> () ! Issue | WriterError ? &mut Writer {
+    return run Effect.catch<YamlError>(self.emitter.boolean(value), tooDeep)
+  }
+
+  /// Writes the integer in decimal.
+  effect fn signed(self: &mut Self, value: i64) -> () ! Issue | WriterError ? &mut Writer {
+    return run Effect.catch<YamlError>(self.emitter.signed(value), tooDeep)
+  }
+
+  /// Writes the integer in decimal.
+  effect fn unsigned(self: &mut Self, value: u64) -> () ! Issue | WriterError ? &mut Writer {
+    return run Effect.catch<YamlError>(self.emitter.unsigned(value), tooDeep)
+  }
+
+  /// Writes the number, with `.nan`, `.inf`, and `-.inf` for the values that are not finite.
+  effect fn float(self: &mut Self, value: f64) -> () ! Issue | WriterError ? &mut Writer {
+    return run Effect.catch<YamlError>(self.emitter.float(value), tooDeep)
+  }
+
+  /// Writes the string, quoted only when a reader would read it as something else.
+  effect fn text(self: &mut Self, value: string) -> () ! Issue | WriterError ? &mut Writer {
+    return run Effect.catch<YamlError>(self.emitter.text(value), tooDeep)
+  }
+
+  /// Writes `null`.
+  effect fn null(self: &mut Self) -> () ! Issue | WriterError ? &mut Writer {
+    return run Effect.catch<YamlError>(self.emitter.null(), tooDeep)
+  }
+
+  /// Starts a sequence.
+  effect fn beginList(self: &mut Self) -> () ! Issue | WriterError ? &mut Writer {
+    return run Effect.catch<YamlError>(self.emitter.beginSequence(), tooDeep)
+  }
+
+  /// Starts the next item, with `- `.
+  effect fn element(self: &mut Self) -> () ! Issue | WriterError ? &mut Writer {
+    return run Effect.catch<YamlError>(self.emitter.element(), tooDeep)
+  }
+
+  /// Ends the sequence; an empty one is written as `[]`.
+  effect fn endList(self: &mut Self) -> () ! Issue | WriterError ? &mut Writer {
+    return run Effect.catch<YamlError>(self.emitter.endSequence(), tooDeep)
+  }
+
+  /// Starts a mapping.
+  effect fn beginObject(self: &mut Self) -> () ! Issue | WriterError ? &mut Writer {
+    return run Effect.catch<YamlError>(self.emitter.beginMapping(), tooDeep)
+  }
+
+  /// Writes the key of the next entry and `:`.
+  effect fn key(self: &mut Self, name: string) -> () ! Issue | WriterError ? &mut Writer {
+    return run Effect.catch<YamlError>(self.emitter.key(name), tooDeep)
+  }
+
+  /// Ends the mapping; an empty one is written as `{}`.
+  effect fn endObject(self: &mut Self) -> () ! Issue | WriterError ? &mut Writer {
+    return run Effect.catch<YamlError>(self.emitter.endMapping(), tooDeep)
+  }
+}

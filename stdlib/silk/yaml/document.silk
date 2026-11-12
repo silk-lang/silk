@@ -1,0 +1,2568 @@
+//! Parse YAML into a compact document, and read values from it.
+//!
+//! # When to use
+//! Use [`YamlDocument.parse`] to read a configuration file, a lockfile, or any other YAML text whose
+//! shape is not fixed. Read values with [`YamlDocument.field`], [`YamlDocument.item`], and the `as...`
+//! functions. Use [`YamlDocument.parseAll`] for a stream of several documents. Use
+//! `silk.schema.yaml.SchemaYaml` to read YAML straight into a typed value, and `silk.yaml.output` to
+//! write YAML.
+//!
+//! # Details
+//! The parser follows YAML 1.2 with the core schema. It reads block mappings and sequences, flow
+//! collections (`[a, b]` and `{a: 1}`), plain, single-quoted, and double-quoted scalars, literal
+//! (`|`) and folded (`>`) block scalars, comments, anchors and aliases, tags, directives, and several
+//! documents in one stream. Mappings keep source order.
+//!
+//! A plain scalar is resolved with the core schema: `null`, `~`, and an empty value are null; `true`
+//! and `false` (also capitalized or upper case) are booleans; `12`, `-3`, `0o17`, and `0xff` are
+//! integers; `1.5`, `6e-3`, `.inf`, and `.nan` are floats; everything else is a string. A quoted
+//! scalar is always a string. The tags `!!str`, `!!int`, `!!float`, `!!bool`, `!!null`, and the
+//! non-specific `!` change the resolution. Other tags are accepted and ignored.
+//!
+//! An alias is replaced with a copy of the node its anchor names. Merge keys (`<<`) have no special
+//! meaning: `<<` is an ordinary key.
+//!
+//! # Errors
+//! - `YamlError` if the text is not valid YAML, repeats a key in one mapping, uses a key that is not
+//!   a scalar, names an alias that is not defined before it, or nests more than `MAX_DEPTH` (128)
+//!   collections. `offset` gives the byte position of the problem.
+//! - `OutOfMemoryError` if the `Allocator` cannot supply the document.
+//!
+//! # Gotchas
+//! A key is always text: the key `1` in `1: one` reads as the string `"1"`, and an empty key as
+//! `""`. A key that is a collection, such as `[a, b]: c` or `? [a, b]`, is refused with
+//! `YamlReason.UnsupportedKey`.
+//!
+//! # Examples
+//! ## Read fields from a document
+//! ```silk
+//! import silk.core.effect { Effect }
+//! import silk.core.option { Option }
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.yaml.document { YamlDocument, YamlError, YamlNode }
+//!
+//! effect fn read() -> i32 ! YamlError | OutOfMemoryError ? &mut Allocator {
+//!   let document = run YamlDocument.parse(b"name: Ada\nports:\n  - 80\n  - 443\n")
+//!   let root = YamlDocument.root(&document)
+//!   let name = YamlDocument.field(&document, root, "name") |> YamlDocument.stringAt(&document)
+//!     |> Option<string>.unwrapOr("")
+//!   let port = match YamlDocument.field(&document, root, "ports") {
+//!     Option<YamlNode>.Some { value } => YamlDocument.item(&document, value, 1) |> YamlDocument.i64At(&document)
+//!       |> Option<i64>.unwrapOr(0)
+//!     Option<YamlNode>.None => 0
+//!   }
+//!   if name != "Ada" || port != 443 {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//!
+//! pub effect fn main() -> i32 ! YamlError | OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   return run read() |> Effect.provideMut<Allocator>(&mut allocator)
+//! }
+//! ```
+//!
+//! ## Report where a key repeats
+//! ```silk
+//! import silk.core.effect { Effect }
+//! import silk.core.result { Result }
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.yaml.document { YamlDocument, YamlError, YamlReason }
+//!
+//! pub effect fn main() -> i32 ! OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let parsed = run Effect.result(YamlDocument.parse(b"name: Ada\nname: Grace\n")) |> Effect.provideMut<Allocator>(&mut allocator)
+//!   return match move parsed {
+//!     Result<YamlDocument, YamlError | OutOfMemoryError>.Success {..} => 1
+//!     Result<YamlDocument, YamlError | OutOfMemoryError>.Failure {error} => match move error {
+//!       // The second `name` starts at byte 10.
+//!       YamlError {reason, offset} => if reason == YamlReason.DuplicateKey && offset == 10 { 0 } else { 2 }
+//!       OutOfMemoryError {} => { fail OutOfMemoryError {} }
+//!     }
+//!   }
+//! }
+//! ```
+//!
+//! @category Data formats
+
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.io.writer { Writer, WriterError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f64
+import silk.num.i64
+import silk.num.u32
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+import silk.text.format { Debug, Format, Formatter, ParseError }
+import silk.text.string { InvalidUtf8, String }
+
+/// The deepest nesting of mappings and sequences that the parser accepts.
+pub const MAX_DEPTH: usize = 128
+
+/// The most nodes that aliases may add to one stream, so that a small text cannot expand to a huge
+/// document through nested aliases.
+pub const MAX_ALIAS_NODES: usize = 1000000
+
+/// The cause of a [`YamlError`].
+pub enum YamlReason {
+  /// The input is not valid UTF-8.
+  InvalidUtf8,
+  /// A character that YAML does not allow at this position, such as a `:` after a value on the same
+  /// line, or text after the end of a node.
+  UnexpectedCharacter,
+  /// The input ends inside a flow collection or a quoted scalar.
+  UnexpectedEnd,
+  /// A line is indented in a way that does not match the collection it belongs to.
+  BadIndentation,
+  /// A tab character is used for indentation. YAML allows only spaces there.
+  TabIndentation,
+  /// A double-quoted scalar has an escape that YAML does not define, or an escape that is not a
+  /// Unicode scalar value.
+  InvalidEscape,
+  /// The same key appears two times in one mapping.
+  DuplicateKey,
+  /// An alias names an anchor that is not defined before it.
+  UnknownAlias,
+  /// Aliases would add more than [`MAX_ALIAS_NODES`] nodes.
+  AliasLimit,
+  /// More than [`MAX_DEPTH`] collections are nested, in the parsed text or in the values that a
+  /// `silk.yaml.output.YamlEmitter` writes.
+  DepthExceeded,
+  /// A mapping key is a collection or an alias of a collection. Keys must be scalars.
+  UnsupportedKey,
+  /// A scalar does not match its tag, such as `!!int abc`.
+  InvalidTag,
+  /// The block scalar header after `|` or `>` is not valid, or its lines are indented less than its
+  /// first line.
+  InvalidBlockScalar,
+  /// [`YamlDocument.parse`] found more than one document.
+  MultipleDocuments,
+  /// The input is 4 GiB or longer.
+  TooLarge,
+}
+
+
+impl Debug for YamlReason {
+  /// Writes the name of the variant, such as `DuplicateKey`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      YamlReason.InvalidUtf8 => run Format.write(&mut formatter, b"InvalidUtf8")
+      YamlReason.UnexpectedCharacter => run Format.write(&mut formatter, b"UnexpectedCharacter")
+      YamlReason.UnexpectedEnd => run Format.write(&mut formatter, b"UnexpectedEnd")
+      YamlReason.BadIndentation => run Format.write(&mut formatter, b"BadIndentation")
+      YamlReason.TabIndentation => run Format.write(&mut formatter, b"TabIndentation")
+      YamlReason.InvalidEscape => run Format.write(&mut formatter, b"InvalidEscape")
+      YamlReason.DuplicateKey => run Format.write(&mut formatter, b"DuplicateKey")
+      YamlReason.UnknownAlias => run Format.write(&mut formatter, b"UnknownAlias")
+      YamlReason.AliasLimit => run Format.write(&mut formatter, b"AliasLimit")
+      YamlReason.DepthExceeded => run Format.write(&mut formatter, b"DepthExceeded")
+      YamlReason.UnsupportedKey => run Format.write(&mut formatter, b"UnsupportedKey")
+      YamlReason.InvalidTag => run Format.write(&mut formatter, b"InvalidTag")
+      YamlReason.InvalidBlockScalar => run Format.write(&mut formatter, b"InvalidBlockScalar")
+      YamlReason.MultipleDocuments => run Format.write(&mut formatter, b"MultipleDocuments")
+      YamlReason.TooLarge => run Format.write(&mut formatter, b"TooLarge")
+    }
+  }
+}
+
+/// A YAML error: the cause and the byte position where it occurred.
+pub struct YamlError {
+  /// The cause of the error.
+  pub reason: YamlReason,
+  /// The byte position of the problem in the input.
+  pub offset: usize,
+}
+
+impl Copy for YamlError {}
+
+impl Debug for YamlError {
+  /// Writes the fields, as `YamlError { reason: ..., offset: ... }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return run Format.debugFields(self, "YamlError", &mut formatter)
+  }
+}
+
+/// The kind of a value in a [`YamlDocument`].
+pub enum YamlKind {
+  /// `null`, `~`, or an empty value.
+  Null,
+  /// `true` or `false`.
+  Bool,
+  /// An integer, such as `42`, `-7`, or `0xff`.
+  Integer,
+  /// A float, such as `1.5`, `6e-3`, `.inf`, or `.nan`.
+  Float,
+  /// A string.
+  String,
+  /// A sequence of values.
+  Sequence,
+  /// A mapping from string keys to values.
+  Mapping,
+}
+
+impl YamlKind {
+  /// Returns the kind that the plain (unquoted) scalar `text` resolves to with the YAML 1.2 core
+  /// schema.
+  ///
+  /// # When to use
+  ///
+  /// Check if a string can be written without quotes: if the result is not `YamlKind.String`, a
+  /// reader would read the unquoted text as another kind of value.
+  ///
+  /// # Details
+  ///
+  /// The empty text, `null`, `Null`, `NULL`, and `~` give `YamlKind.Null`. `true` and `false` in
+  /// the same three spellings give `YamlKind.Bool`. Decimal, `0o` octal, and `0x` hexadecimal
+  /// integers give `YamlKind.Integer`. Decimals with a fraction or an exponent, `.inf`, `-.inf`, and
+  /// `.nan` give `YamlKind.Float`. All other text gives `YamlKind.String`. The text is not checked
+  /// for characters that a plain scalar cannot hold.
+  ///
+  /// # Examples
+  ///
+  /// ```silk
+  /// import silk.yaml.document { YamlKind }
+  ///
+  /// pub fn main() -> i32 {
+  ///   if YamlKind.ofPlain("0x1f") != YamlKind.Integer || YamlKind.ofPlain("yes") != YamlKind.String {
+  ///     return 1
+  ///   }
+  ///   return 0
+  /// }
+  /// ```
+  pub fn ofPlain(text: string) -> YamlKind {
+    let kind = resolve(String.utf8Bytes(text)).kind
+    if kind == KIND_NULL { return YamlKind.Null }
+    if kind <= KIND_TRUE { return YamlKind.Bool }
+    if kind <= KIND_UNSIGNED { return YamlKind.Integer }
+    if kind == KIND_FLOAT { return YamlKind.Float }
+    return YamlKind.String
+  }
+}
+
+
+/// A range of bytes in the parsed text: from `start` up to, but not including, `end`.
+pub struct YamlSpan {
+  /// The position of the first byte.
+  pub start: usize,
+  /// The position after the last byte.
+  pub end: usize,
+}
+
+impl Copy for YamlSpan {}
+
+/// One value in a [`YamlDocument`]: its position in the document.
+///
+/// # Gotchas
+/// A `YamlNode` is only meaningful with the document that returned it. With another document it
+/// names some other value or traps.
+pub struct YamlNode {
+  index: usize,
+}
+
+impl Copy for YamlNode {}
+
+/// One member of a mapping in a [`YamlDocument`]: the node of its key, which is a string, and the
+/// node of its value.
+pub struct YamlMember {
+  /// The key, a string node.
+  pub key: YamlNode,
+  /// The value.
+  pub value: YamlNode,
+}
+
+impl Copy for YamlMember {}
+
+/// The elements of a sequence in a [`YamlDocument`], in source order. [`YamlDocument.items`] makes
+/// it.
+pub struct YamlItems {
+  position: usize,
+  end: usize,
+}
+
+impl Copy for YamlItems {}
+
+/// The members of a mapping in a [`YamlDocument`], in source order. [`YamlDocument.members`] makes
+/// it.
+pub struct YamlMembers {
+  position: usize,
+  end: usize,
+}
+
+impl Copy for YamlMembers {}
+
+impl YamlItems {
+  /// Returns the next element, or an absent option after the last one. `document` must be the one
+  /// that made these items.
+  pub fn next(self: &mut Self, document: &YamlDocument) -> Option<YamlNode> {
+    if self.position >= self.end { return Option<YamlNode>.none() }
+    let node = YamlNode { index: self.position }
+    self.position = slotEnd(&document.slots, self.position)
+    return Option<YamlNode>.some(node)
+  }
+}
+
+impl YamlMembers {
+  /// Returns the next member, or an absent option after the last one. `document` must be the one
+  /// that made these members.
+  pub fn next(self: &mut Self, document: &YamlDocument) -> Option<YamlMember> {
+    if self.position >= self.end { return Option<YamlMember>.none() }
+    let key = self.position
+    self.position = slotEnd(&document.slots, key + usize.ONE)
+    return Option<YamlMember>.some(YamlMember { key: YamlNode { index: key }, value: YamlNode { index: key + usize.ONE } })
+  }
+}
+
+/// A parsed YAML stream: one or more documents, held as a flat list of values.
+///
+/// # When to use
+/// Use [`YamlDocument.parse`] to read one document and [`YamlDocument.parseAll`] to read a stream of
+/// several. Start reading at [`YamlDocument.root`], or at [`YamlDocument.documentAt`] for a stream.
+///
+/// # Details
+/// Strings are decoded when the text is parsed, and numbers are converted. Each value also keeps the
+/// span of its text, which [`YamlDocument.span`] returns. The document owns all of its text, so it
+/// does not borrow the input.
+///
+/// # Gotchas
+/// A `YamlNode` is only meaningful with the document that returned it.
+///
+/// # Examples
+/// ## Walk the members of a mapping
+/// ```silk
+/// import silk.core.effect { Effect }
+/// import silk.core.option { Option }
+/// import silk.mem.allocator { Allocator, OutOfMemoryError }
+/// import silk.yaml.document { YamlDocument, YamlError, YamlMember }
+///
+/// effect fn total() -> i64 ! YamlError | OutOfMemoryError ? &mut Allocator {
+///   let document = run YamlDocument.parse(b"a: 1\nb: 2\nc: 3\n")
+///   let mut members = YamlDocument.members(&document, YamlDocument.root(&document))
+///   let mut sum: i64 = 0
+///   while let Option<YamlMember>.Some { value } = members.next(&document) {
+///     sum = sum + Option<i64>.unwrapOr(YamlDocument.asI64(&document, value.value), 0)
+///   }
+///   return sum
+/// }
+///
+/// pub effect fn main() -> i32 ! YamlError | OutOfMemoryError {
+///   let mut allocator = Allocator.systemAllocatorProvider()
+///   let sum = run total() |> Effect.provideMut<Allocator>(&mut allocator)
+///   return if sum == 6 { 0 } else { 1 }
+/// }
+/// ```
+pub struct YamlDocument {
+  slots: List<Slot>,
+  text: Bytes,
+  roots: List<usize>,
+}
+
+impl YamlDocument {
+  /// Parses `bytes` as one YAML document.
+  ///
+  /// # Details
+  /// The text may start with a `---` marker and end with a `...` marker. Text with no document,
+  /// such as an empty file or one with only comments, gives a document whose root is null.
+  ///
+  /// # Errors
+  /// - `YamlError` if `bytes` is not valid YAML, or with `YamlReason.MultipleDocuments` if it holds
+  ///   more than one document. `offset` is the byte position of the problem.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the document.
+  pub effect fn parse(bytes: &[u8]) -> YamlDocument ! YamlError | OutOfMemoryError ? &mut Allocator {
+    let mut document = run YamlDocument.parseAll(bytes)
+    let count = List<usize>.length(&document.roots)
+    if count > usize.ONE {
+      let second = List<usize>.get(&document.roots, usize.ONE)
+      fail problem(YamlReason.MultipleDocuments, slotStart(List<Slot>.get(&document.slots, second)))
+    }
+    if count == usize.ZERO {
+      run List<usize>.append(&mut document.roots, usize.ZERO)
+      run pushSlot(&mut document, KIND_NULL, usize.ZERO, 0, usize.ZERO, usize.ZERO)
+    }
+    return move document
+  }
+
+  /// Parses `bytes` as a stream of YAML documents, separated by `---` or `...` markers.
+  ///
+  /// # Details
+  /// Read the number of documents with [`YamlDocument.documentCount`] and each one with
+  /// [`YamlDocument.documentAt`]. Text with no document gives a stream with no documents.
+  ///
+  /// # Errors
+  /// - `YamlError` if `bytes` is not valid YAML. `offset` is the byte position of the problem.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the document.
+  pub effect fn parseAll(bytes: &[u8]) -> YamlDocument ! YamlError | OutOfMemoryError ? &mut Allocator {
+    if bytes.length >= 4294967295 { fail problem(YamlReason.TooLarge, usize.ZERO) }
+    match String.fromUtf8(bytes) {
+      Result<string, InvalidUtf8>.Failure { error } => { fail problem(YamlReason.InvalidUtf8, error.offset) }
+      Result<string, InvalidUtf8>.Success {..} => {}
+    }
+    let mut document = YamlDocument { slots: List<Slot>.make(), text: Bytes.make(), roots: List<usize>.make() }
+    // Scalars that need no decoding are read from this copy of the input.
+    run Bytes.reserve(&mut document.text, bytes.length + bytes.length / 4 + 16)
+    run Bytes.append(&mut document.text, bytes)
+    run List<Slot>.reserve(&mut document.slots, bytes.length / 8 + 4)
+    let mut parser = Parser<'_> {
+      input: bytes,
+      at: usize.ZERO,
+      line: usize.ZERO,
+      depth: usize.ZERO,
+      anchors: List<Anchor>.make(),
+      copied: usize.ZERO,
+      keys: List<u64>.make(),
+      table: List<u64>.make(),
+      tableUsed: usize.ZERO,
+      tabbed: false,
+      secondary: false,
+      handles: List<u64>.make(),
+      flowIndent: usize.ZERO,
+    }
+    run parseStream(&mut parser, &mut document)
+    return move document
+  }
+
+  /// Returns the number of documents in the stream. A document from [`YamlDocument.parse`] has
+  /// exactly one.
+  pub fn documentCount(self: &Self) -> usize {
+    return List<usize>.length(&self.roots)
+  }
+
+  /// Returns the root node of the document at `index` in the stream. The first document has index
+  /// 0.
+  ///
+  /// # Gotchas
+  /// `index` must be less than [`YamlDocument.documentCount`], or the call traps.
+  pub fn documentAt(self: &Self, index: usize) -> YamlNode {
+    return YamlNode { index: List<usize>.get(&self.roots, index) }
+  }
+
+  /// Returns the root node of the first document.
+  ///
+  /// # Gotchas
+  /// A stream from [`YamlDocument.parseAll`] with no documents has no root, and the call traps.
+  pub fn root(self: &Self) -> YamlNode {
+    return YamlNode { index: List<usize>.get(&self.roots, usize.ZERO) }
+  }
+
+  /// Returns the kind of `node`.
+  pub fn kind(self: &Self, node: YamlNode) -> YamlKind {
+    let kind = slotKind(&self.slots, node.index)
+    if kind == KIND_NULL { return YamlKind.Null }
+    if kind <= KIND_TRUE { return YamlKind.Bool }
+    if kind <= KIND_UNSIGNED { return YamlKind.Integer }
+    if kind == KIND_FLOAT { return YamlKind.Float }
+    if kind == KIND_STRING { return YamlKind.String }
+    if kind == KIND_SEQUENCE { return YamlKind.Sequence }
+    return YamlKind.Mapping
+  }
+
+  /// Returns the span of the text of `node`. For a value that an alias copied, the span of the
+  /// alias.
+  pub fn span(self: &Self, node: YamlNode) -> YamlSpan {
+    let slot = List<Slot>.get(&self.slots, node.index)
+    return YamlSpan { start: slotStart(slot), end: slotFinish(slot) }
+  }
+
+  /// Returns `true` if `node` is null.
+  pub fn isNull(self: &Self, node: YamlNode) -> bool {
+    return slotKind(&self.slots, node.index) == KIND_NULL
+  }
+
+  /// Returns the value of a boolean, or `None` if `node` is not a boolean.
+  pub fn asBool(self: &Self, node: YamlNode) -> Option<bool> {
+    let kind = slotKind(&self.slots, node.index)
+    if kind == KIND_FALSE { return Option<bool>.some(false) }
+    if kind == KIND_TRUE { return Option<bool>.some(true) }
+    return Option<bool>.none()
+  }
+
+  /// Returns the value of an integer that fits in `i64`, or `None` if `node` is not such an
+  /// integer.
+  pub fn asI64(self: &Self, node: YamlNode) -> Option<i64> {
+    let slot = List<Slot>.get(&self.slots, node.index)
+    let kind = u64.bitAnd(slot.info, KIND_MASK)
+    if kind == KIND_INTEGER { return Option<i64>.some(u64.wrappingToI64(slot.payload)) }
+    return Option<i64>.none()
+  }
+
+  /// Returns the value of an integer that fits in `u64`, or `None` if `node` is not such an
+  /// integer.
+  pub fn asU64(self: &Self, node: YamlNode) -> Option<u64> {
+    let slot = List<Slot>.get(&self.slots, node.index)
+    let kind = u64.bitAnd(slot.info, KIND_MASK)
+    if kind == KIND_UNSIGNED { return Option<u64>.some(slot.payload) }
+    if kind == KIND_INTEGER && u64.wrappingToI64(slot.payload) >= 0 { return Option<u64>.some(slot.payload) }
+    return Option<u64>.none()
+  }
+
+  /// Returns a number as an `f64`: a float, or an integer converted to the nearest `f64`. Returns
+  /// `None` if `node` is not a number.
+  pub fn asF64(self: &Self, node: YamlNode) -> Option<f64> {
+    let slot = List<Slot>.get(&self.slots, node.index)
+    let kind = u64.bitAnd(slot.info, KIND_MASK)
+    if kind == KIND_FLOAT { return Option<f64>.some(f64.fromBits(slot.payload)) }
+    if kind == KIND_INTEGER { return Option<f64>.some(i64.toF64(u64.wrappingToI64(slot.payload))) }
+    if kind == KIND_UNSIGNED { return Option<f64>.some(u64.toF64(slot.payload)) }
+    return Option<f64>.none()
+  }
+
+  /// Returns the decoded text of a string, or `None` if `node` is not a string. The text borrows
+  /// the document.
+  pub fn asString<'a>(self: &'a Self, node: YamlNode) -> Option<string<'a>> {
+    let slot = List<Slot>.get(&self.slots, node.index)
+    if u64.bitAnd(slot.info, KIND_MASK) != KIND_STRING { return Option<string<'a>>.none() }
+    return Option<string<'a>>.some(slotText(&self.*, slot))
+  }
+
+  /// Returns the text of a scalar: the decoded text of a string, or the source spelling of a null,
+  /// a boolean, or a number, such as `0x1F` or `~`. Returns `None` for a sequence or a mapping. The
+  /// text borrows the document.
+  ///
+  /// # When to use
+  /// Use it to read a value as text whatever it resolved to, such as a version `1.10` that the core
+  /// schema reads as a float.
+  pub fn scalarText<'a>(self: &'a Self, node: YamlNode) -> Option<string<'a>> {
+    let slot = List<Slot>.get(&self.slots, node.index)
+    let kind = u64.bitAnd(slot.info, KIND_MASK)
+    if kind == KIND_STRING { return Option<string<'a>>.some(slotText(&self.*, slot)) }
+    if kind == KIND_SEQUENCE || kind == KIND_MAPPING { return Option<string<'a>>.none() }
+    return Option<string<'a>>.some(sourceText(&self.*, slot))
+  }
+
+  /// Returns the number of elements of a sequence or members of a mapping, or 0 for any other
+  /// value.
+  pub fn length(self: &Self, node: YamlNode) -> usize {
+    let slot = List<Slot>.get(&self.slots, node.index)
+    let kind = u64.bitAnd(slot.info, KIND_MASK)
+    if kind != KIND_SEQUENCE && kind != KIND_MAPPING { return usize.ZERO }
+    return u64.toUsize(u64.shiftRight(slot.info, 8))
+  }
+
+  /// Returns the elements of a sequence, or no elements if `node` is not a sequence.
+  pub fn items(self: &Self, node: YamlNode) -> YamlItems {
+    let slot = List<Slot>.get(&self.slots, node.index)
+    if u64.bitAnd(slot.info, KIND_MASK) != KIND_SEQUENCE { return YamlItems { position: usize.ZERO, end: usize.ZERO } }
+    return YamlItems { position: node.index + usize.ONE, end: u64.toUsize(slot.payload) }
+  }
+
+  /// Returns the members of a mapping, or no members if `node` is not a mapping.
+  pub fn members(self: &Self, node: YamlNode) -> YamlMembers {
+    let slot = List<Slot>.get(&self.slots, node.index)
+    if u64.bitAnd(slot.info, KIND_MASK) != KIND_MAPPING { return YamlMembers { position: usize.ZERO, end: usize.ZERO } }
+    return YamlMembers { position: node.index + usize.ONE, end: u64.toUsize(slot.payload) }
+  }
+
+  /// Returns the value of member `key` of a mapping. Returns `None` if `node` is not a mapping or
+  /// has no such key.
+  pub fn field(self: &Self, node: YamlNode, key: string) -> Option<YamlNode> {
+    let mut members = YamlDocument.members(self, node)
+    while true {
+      match YamlMembers.next(&mut members, self) {
+        Option<YamlMember>.Some { value } => {
+          if slotText(self, List<Slot>.get(&self.slots, value.key.index)) == key { return Option<YamlNode>.some(value.value) }
+        }
+        Option<YamlMember>.None => { break }
+      }
+    }
+    return Option<YamlNode>.none()
+  }
+
+  /// Returns the element at `index` of a sequence. The first element has index 0. Returns `None` if
+  /// `node` is not a sequence or `index` is out of range.
+  pub fn item(self: &Self, node: YamlNode, index: usize) -> Option<YamlNode> {
+    let mut items = YamlDocument.items(self, node)
+    let mut at = usize.ZERO
+    while true {
+      match YamlItems.next(&mut items, self) {
+        Option<YamlNode>.Some { value } => {
+          if at == index { return Option<YamlNode>.some(value) }
+        }
+        Option<YamlNode>.None => { break }
+      }
+      at = at + usize.ONE
+    }
+    return Option<YamlNode>.none()
+  }
+
+  /// Returns the member `key` of an optional mapping node. Use it to chain lookups with `|>`.
+  ///
+  /// Returns `None` if `node` is `None`, is not a mapping, or has no such key.
+  pub fn fieldAt(node: Option<YamlNode>, document: &YamlDocument, key: string) -> Option<YamlNode> {
+    return match node {
+      Option<YamlNode>.Some { value } => YamlDocument.field(document, value, key)
+      Option<YamlNode>.None => Option<YamlNode>.none()
+    }
+  }
+
+  /// Returns the text of an optional string node. Use it at the end of a `|>` chain.
+  ///
+  /// Returns `None` if `node` is `None` or is not a string. The text borrows `document`.
+  pub fn stringAt<'a>(node: Option<YamlNode>, document: &'a YamlDocument) -> Option<string<'a>> {
+    return match node {
+      Option<YamlNode>.Some { value } => YamlDocument.asString(document, value)
+      Option<YamlNode>.None => Option<string<'a>>.none()
+    }
+  }
+
+  /// Returns the value of an optional integer node. Use it at the end of a `|>` chain.
+  ///
+  /// Returns `None` if `node` is `None` or is not an integer that fits in `i64`.
+  pub fn i64At(node: Option<YamlNode>, document: &YamlDocument) -> Option<i64> {
+    return match node {
+      Option<YamlNode>.Some { value } => YamlDocument.asI64(document, value)
+      Option<YamlNode>.None => Option<i64>.none()
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Slots
+
+// One value: its kind and count in `info`, its payload, and its span in the source.
+struct Slot {
+  // The kind in the low 8 bits; the byte length of a string or the count of a collection above.
+  info: u64,
+  // A string's offset in `text`, a collection's end slot, or a number's bits.
+  payload: u64,
+  // The start offset in the low 32 bits and the end offset in the high 32 bits.
+  span: u64,
+}
+
+impl Copy for Slot {}
+
+const KIND_NULL: u64 = 0
+const KIND_FALSE: u64 = 1
+const KIND_TRUE: u64 = 2
+const KIND_INTEGER: u64 = 3
+const KIND_UNSIGNED: u64 = 4
+const KIND_FLOAT: u64 = 5
+const KIND_STRING: u64 = 6
+const KIND_SEQUENCE: u64 = 7
+const KIND_MAPPING: u64 = 8
+const KIND_MASK: u64 = 255
+
+fn slotKind(slots: &List<Slot>, index: usize) -> u64 {
+  return u64.bitAnd(List<Slot>.get(slots, index).info, KIND_MASK)
+}
+
+// The index after the value at `index` and everything in it.
+@inlineAlways
+fn slotEnd(slots: &List<Slot>, index: usize) -> usize {
+  let slot = List<Slot>.get(slots, index)
+  let kind = u64.bitAnd(slot.info, KIND_MASK)
+  if kind == KIND_SEQUENCE || kind == KIND_MAPPING { return u64.toUsize(slot.payload) }
+  return index + usize.ONE
+}
+
+fn slotStart(slot: Slot) -> usize {
+  return u64.toUsize(u64.bitAnd(slot.span, 4294967295))
+}
+
+fn slotFinish(slot: Slot) -> usize {
+  return u64.toUsize(u64.shiftRight(slot.span, 32))
+}
+
+fn slotText<'a>(document: &'a YamlDocument, slot: Slot) -> string<'a> {
+  let bytes = Slice.view<u8>(Bytes.asSlice(&document.text), u64.toUsize(slot.payload), u64.toUsize(u64.shiftRight(slot.info, 8)))
+  // The input was checked as UTF-8, and every decoded escape is a Unicode scalar value.
+  return unsafe Intrinsic.stringFromUtf8Unchecked(bytes)
+}
+
+// The source spelling of a scalar, which starts the text buffer.
+fn sourceText<'a>(document: &'a YamlDocument, slot: Slot) -> string<'a> {
+  let start = slotStart(slot)
+  let bytes = Slice.view<u8>(Bytes.asSlice(&document.text), start, slotFinish(slot) - start)
+  return unsafe Intrinsic.stringFromUtf8Unchecked(bytes)
+}
+
+@inlineAlways
+effect fn pushSlot(document: &mut YamlDocument, kind: u64, count: usize, payload: u64, start: usize, end: usize)
+  -> () ! OutOfMemoryError ? &mut Allocator {
+  let info = u64.bitOr(kind, u64.shiftLeft(usize.toU64(count), 8))
+  let span = u64.bitOr(usize.toU64(start), u64.shiftLeft(usize.toU64(end), 32))
+  return run List<Slot>.append(&mut document.slots, Slot { info: info, payload: payload, span: span })
+}
+
+// Fills in the count, end, and span end of the collection at `index`.
+fn closeSlot(document: &mut YamlDocument, index: usize, count: usize, end: usize) -> () {
+  let slots = List<Slot>.asMutSlice(&mut document.slots)
+  let kind = u64.bitAnd(slots[index].info, KIND_MASK)
+  slots[index].info = u64.bitOr(kind, u64.shiftLeft(usize.toU64(count), 8))
+  slots[index].payload = usize.toU64(slots.length)
+  slots[index].span = u64.bitOr(u64.bitAnd(slots[index].span, 4294967295), u64.shiftLeft(usize.toU64(end), 32))
+  return ()
+}
+
+// ---------------------------------------------------------------------------------------------
+// The parser
+
+struct Anchor {
+  start: usize,
+  length: usize,
+  slot: usize,
+}
+
+impl Copy for Anchor {}
+
+struct Parser<'input> {
+  input: &'input [u8],
+  at: usize,
+  // The offset where the current line starts, so `at - line` is the column.
+  line: usize,
+  depth: usize,
+  anchors: List<Anchor>,
+  copied: usize,
+  // The key hashes of every mapping being parsed, for the duplicate check.
+  keys: List<u64>,
+  // An open-addressing index of the keys of large mappings: three words per bucket (mixed hash,
+  // key slot + 1, mapping base). Entries of closed mappings stay behind and never match, because a
+  // later mapping with the same base starts after their slots.
+  table: List<u64>,
+  tableUsed: usize,
+  // `true` when the indentation of the current line holds a tab.
+  tabbed: bool,
+  // `true` when a `%TAG !! ...` directive gave `!!` another meaning.
+  secondary: bool,
+  // The tag handles that `%TAG` directives of the current document define, as offset and length.
+  handles: List<u64>,
+  // The least column of the lines that continue a flow collection or a quoted scalar.
+  flowIndent: usize,
+}
+
+// The properties of a node: an anchor and a tag.
+struct Props {
+  start: usize,
+  anchorStart: usize,
+  anchorLength: usize,
+  tag: u8,
+  present: bool,
+}
+
+impl Copy for Props {}
+
+const TAG_NONE: u8 = 0
+const TAG_STR: u8 = 1
+const TAG_INT: u8 = 2
+const TAG_FLOAT: u8 = 3
+const TAG_BOOL: u8 = 4
+const TAG_NULL: u8 = 5
+const TAG_OTHER: u8 = 6
+
+fn noProps(at: usize) -> Props {
+  return Props { start: at, anchorStart: usize.ZERO, anchorLength: usize.ZERO, tag: TAG_NONE, present: false }
+}
+
+// A scalar found in the text, before it is stored.
+struct Scalar {
+  style: u8,
+  // The content, without quotes.
+  start: usize,
+  end: usize,
+  // The offset after the scalar, closing quote included.
+  close: usize,
+  // `true` if the content is stored as it is in the source: one line, no escapes.
+  simple: bool,
+}
+
+impl Copy for Scalar {}
+
+const STYLE_PLAIN: u8 = 0
+const STYLE_SINGLE: u8 = 1
+const STYLE_DOUBLE: u8 = 2
+
+fn problem(reason: YamlReason, offset: usize) -> YamlError {
+  return YamlError { reason: reason, offset: offset }
+}
+
+@inlineAlways
+fn byteAt(parser: &Parser<'_>, at: usize) -> u8 {
+  if at < parser.input.length { return parser.input[at] }
+  return 0
+}
+
+@inlineAlways
+fn isBlank(byte: u8) -> bool {
+  return byte == 32 || byte == 9
+}
+
+@inlineAlways
+fn isBreakOrEnd(byte: u8) -> bool {
+  return byte == 10 || byte == 13 || byte == 0
+}
+
+@inlineAlways
+fn isSpaceOrEnd(byte: u8) -> bool {
+  return byte == 32 || byte == 9 || byte == 10 || byte == 13 || byte == 0
+}
+
+@inlineAlways
+fn isFlowIndicator(byte: u8) -> bool {
+  return byte == 44 || byte == 91 || byte == 93 || byte == 123 || byte == 125
+}
+
+fn column(parser: &Parser<'_>) -> usize {
+  return parser.at - parser.line
+}
+
+fn atEnd(parser: &Parser<'_>) -> bool {
+  return parser.at >= parser.input.length
+}
+
+// `true` at a `---` or `...` marker at the start of a line.
+fn atMarker(parser: &Parser<'_>) -> bool {
+  if parser.at != parser.line { return false }
+  let first = byteAt(&parser.*, parser.at)
+  if first != 45 && first != 46 { return false }
+  return byteAt(&parser.*, parser.at + usize.ONE) == first && byteAt(&parser.*, parser.at + 2) == first &&
+    isSpaceOrEnd(byteAt(&parser.*, parser.at + 3))
+}
+
+// `true` at `-` followed by a space or the end of the line.
+fn atSequenceEntry(parser: &Parser<'_>) -> bool {
+  return byteAt(&parser.*, parser.at) == 45 && isSpaceOrEnd(byteAt(&parser.*, parser.at + usize.ONE))
+}
+
+// `true` where the rest of the line holds no content: a line break, the end, or a comment.
+fn atLineEnd(parser: &Parser<'_>) -> bool {
+  let byte = byteAt(&parser.*, parser.at)
+  return isBreakOrEnd(byte) || byte == 35
+}
+
+fn consumeBreak(parser: &mut Parser<'_>) -> () {
+  if byteAt(&parser.*, parser.at) == 13 { parser.at = parser.at + usize.ONE }
+  if byteAt(&parser.*, parser.at) == 10 { parser.at = parser.at + usize.ONE }
+  parser.line = parser.at
+  return ()
+}
+
+fn skipInline(parser: &mut Parser<'_>) -> () {
+  while isBlank(byteAt(&parser.*, parser.at)) { parser.at = parser.at + usize.ONE }
+  return ()
+}
+
+fn skipLine(parser: &mut Parser<'_>) -> () {
+  while !isBreakOrEnd(byteAt(&parser.*, parser.at)) { parser.at = parser.at + usize.ONE }
+  return ()
+}
+
+// Moves past spaces, comments, and line breaks to the next content, or to the end.
+effect fn skipToContent(parser: &mut Parser<'_>) -> () ! YamlError {
+  let length = parser.input.length
+  let mut tab = false
+  while parser.at < length {
+    let byte = parser.input[parser.at]
+    if byte == 32 {
+      parser.at = parser.at + usize.ONE
+    } else if byte == 9 {
+      tab = true
+      parser.at = parser.at + usize.ONE
+    } else if byte == 35 {
+      if parser.at > usize.ZERO && !isSpaceOrEnd(parser.input[parser.at - usize.ONE]) {
+        fail problem(YamlReason.UnexpectedCharacter, parser.at)
+      }
+      skipLine(&mut parser.*)
+    } else if byte == 10 || byte == 13 {
+      consumeBreak(&mut parser.*)
+      tab = false
+      parser.tabbed = false
+    } else {
+      parser.tabbed = tab && onlyBlanksBefore(&parser.*)
+      return ()
+    }
+  }
+  return ()
+}
+
+// `true` if a tab is among the blanks from `start` to the cursor.
+fn blanksHoldTab(parser: &Parser<'_>, start: usize) -> bool {
+  let mut at = start
+  while at < parser.at {
+    if parser.input[at] == 9 { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn onlyBlanksBefore(parser: &Parser<'_>) -> bool {
+  let mut at = parser.line
+  while at < parser.at {
+    if !isBlank(parser.input[at]) { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// Moves past spaces, tabs, comments, and line breaks inside a flow collection.
+effect fn skipFlowSpace(parser: &mut Parser<'_>) -> () ! YamlError {
+  let length = parser.input.length
+  while parser.at < length {
+    let byte = parser.input[parser.at]
+    if byte == 32 || byte == 9 {
+      parser.at = parser.at + usize.ONE
+    } else if byte == 35 {
+      if parser.at > usize.ZERO && !isSpaceOrEnd(parser.input[parser.at - usize.ONE]) {
+        fail problem(YamlReason.UnexpectedCharacter, parser.at)
+      }
+      skipLine(&mut parser.*)
+    } else if byte == 10 || byte == 13 {
+      consumeBreak(&mut parser.*)
+      if atMarker(&parser.*) { fail problem(YamlReason.UnexpectedEnd, parser.at) }
+      run checkFlowLine(&parser.*, true)
+    } else {
+      return ()
+    }
+  }
+  return ()
+}
+
+// Fails if the line under the cursor, which continues a flow collection or a quoted scalar, is
+// indented less than `parser.flowIndent` and holds content. A line that starts with a closing
+// bracket may be indented less.
+effect fn checkFlowLine(parser: &Parser<'_>, brackets: bool) -> () ! YamlError {
+  let input = parser.input
+  let mut at = parser.line
+  while at < input.length && input[at] == 32 && at - parser.line < parser.flowIndent { at = at + usize.ONE }
+  if at - parser.line >= parser.flowIndent { return () }
+  while at < input.length && isBlank(input[at]) { at = at + usize.ONE }
+  if at >= input.length { return () }
+  let byte = input[at]
+  if byte == 10 || byte == 13 || byte == 35 || brackets && (byte == 93 || byte == 125) { return () }
+  fail problem(YamlReason.BadIndentation, at)
+}
+
+effect fn parseStream(parser: &mut Parser<'_>, document: &mut YamlDocument) -> () ! YamlError | OutOfMemoryError ? &mut Allocator {
+  if parser.input.length >= 3 && parser.input[0] == 239 && parser.input[1] == 187 && parser.input[2] == 191 {
+    parser.at = 3
+    parser.line = 3
+  }
+  let mut directives = false
+  let mut version = false
+  while true {
+    run skipToContent(&mut parser.*)
+    if atEnd(&parser.*) {
+      if directives { fail problem(YamlReason.UnexpectedEnd, parser.at) }
+      return ()
+    }
+    if column(&parser.*) == usize.ZERO && byteAt(&parser.*, parser.at) == 37 {
+      version = run directive(&mut parser.*, version)
+      directives = true
+      continue
+    }
+    if directives && !(atMarker(&parser.*) && byteAt(&parser.*, parser.at) == 45) {
+      fail problem(YamlReason.UnexpectedCharacter, parser.at)
+    }
+    let mut explicit = false
+    if atMarker(&parser.*) {
+      if byteAt(&parser.*, parser.at) == 46 {
+        parser.at = parser.at + 3
+        continue
+      }
+      parser.at = parser.at + 3
+      explicit = true
+    }
+    run List<usize>.append(&mut document.roots, List<Slot>.length(&document.slots))
+    if explicit {
+      skipInline(&mut parser.*)
+      if atLineEnd(&parser.*) {
+        run skipToContent(&mut parser.*)
+        if atEnd(&parser.*) || atMarker(&parser.*) {
+          run pushSlot(&mut document.*, KIND_NULL, usize.ZERO, 0, parser.at, parser.at)
+        } else {
+          run parseNode(&mut parser.*, &mut document.*, usize.ZERO, true, false)
+        }
+      } else {
+        run parseNode(&mut parser.*, &mut document.*, usize.ZERO, false, false)
+      }
+    } else {
+      run parseNode(&mut parser.*, &mut document.*, usize.ZERO, true, false)
+    }
+    List<u64>.clear(&mut parser.handles)
+    parser.secondary = false
+    directives = false
+    version = false
+    run skipToContent(&mut parser.*)
+    if atEnd(&parser.*) { return () }
+    if atMarker(&parser.*) {
+      if byteAt(&parser.*, parser.at) == 46 {
+        parser.at = parser.at + 3
+        skipInline(&mut parser.*)
+        if !atLineEnd(&parser.*) { fail problem(YamlReason.UnexpectedCharacter, parser.at) }
+      }
+      continue
+    }
+    if column(&parser.*) > usize.ZERO { fail problem(YamlReason.BadIndentation, parser.at) }
+    fail problem(YamlReason.UnexpectedCharacter, parser.at)
+  }
+  return ()
+}
+
+// Reads a `%` directive line. `%YAML` must give a version and appear once per document, and
+// `%TAG` defines a tag handle. Other directives are ignored. Returns whether a `%YAML` was seen.
+effect fn directive(parser: &mut Parser<'_>, version: bool) -> bool ! YamlError | OutOfMemoryError ? &mut Allocator {
+  let start = parser.at
+  let name = nameEnd(&parser.*, start + usize.ONE)
+  let word = Slice.view<u8>(parser.input, start + usize.ONE, name - start - usize.ONE)
+  parser.at = name
+  if sameBytes(word, b"YAML") {
+    if version { fail problem(YamlReason.UnexpectedCharacter, start) }
+    skipInline(&mut parser.*)
+    let number = parser.at
+    while byteAt(&parser.*, parser.at) >= 48 && byteAt(&parser.*, parser.at) <= 57 || byteAt(&parser.*, parser.at) == 46 {
+      parser.at = parser.at + usize.ONE
+    }
+    if parser.at == number || parser.at == name { fail problem(YamlReason.UnexpectedCharacter, parser.at) }
+    skipInline(&mut parser.*)
+    if byteAt(&parser.*, parser.at) == 35 && !isBlank(byteAt(&parser.*, parser.at - usize.ONE)) {
+      fail problem(YamlReason.UnexpectedCharacter, parser.at)
+    }
+    if !atLineEnd(&parser.*) { fail problem(YamlReason.UnexpectedCharacter, parser.at) }
+    skipLine(&mut parser.*)
+    return true
+  }
+  if sameBytes(word, b"TAG") {
+    skipInline(&mut parser.*)
+    let handle = parser.at
+    parser.at = nameEnd(&parser.*, handle)
+    let size = parser.at - handle
+    if size == 2 && byteAt(&parser.*, handle + usize.ONE) == 33 { parser.secondary = true }
+    run List<u64>.append(&mut parser.handles, u64.bitOr(usize.toU64(handle), u64.shiftLeft(usize.toU64(size), 32)))
+  }
+  skipLine(&mut parser.*)
+  return version
+}
+
+// `true` if `%TAG` defined the named handle `tag` starts with, such as `!e!` in `!e!point`.
+fn knownHandle(parser: &Parser<'_>, tag: &[u8]) -> bool {
+  if tag.length > usize.ONE && tag[1] == 60 { return true }
+  let mut size = usize.ONE
+  while size < tag.length && tag[size] != 33 { size = size + usize.ONE }
+  if size >= tag.length || size == usize.ONE { return true }
+  let handle = Slice.view<u8>(tag, usize.ZERO, size + usize.ONE)
+  let handles = List<u64>.asSlice(&parser.handles)
+  let mut at = usize.ZERO
+  while at < handles.length {
+    let offset = u64.toUsize(u64.bitAnd(handles[at], 4294967295))
+    let length = u64.toUsize(u64.shiftRight(handles[at], 32))
+    if sameBytes(Slice.view<u8>(parser.input, offset, length), handle) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// Reads anchors and tags before a node, and the blanks after each.
+effect fn properties(parser: &mut Parser<'_>, props: &mut Props) -> () ! YamlError {
+  while true {
+    let byte = byteAt(&parser.*, parser.at)
+    if byte == 38 {
+      if props.anchorLength != usize.ZERO { fail problem(YamlReason.UnexpectedCharacter, parser.at) }
+      let start = parser.at + usize.ONE
+      let end = nameEnd(&parser.*, start)
+      if end == start { fail problem(YamlReason.UnexpectedCharacter, parser.at) }
+      props.anchorStart = start
+      props.anchorLength = end - start
+      props.present = true
+      parser.at = end
+    } else if byte == 33 {
+      if props.tag != TAG_NONE { fail problem(YamlReason.UnexpectedCharacter, parser.at) }
+      let start = parser.at
+      let mut end = start + usize.ONE
+      if byteAt(&parser.*, end) == 60 {
+        while byteAt(&parser.*, end) != 62 {
+          if isSpaceOrEnd(byteAt(&parser.*, end)) { fail problem(YamlReason.InvalidTag, start) }
+          end = end + usize.ONE
+        }
+        end = end + usize.ONE
+      } else {
+        end = nameEnd(&parser.*, end)
+      }
+      let tag = Slice.view<u8>(parser.input, start, end - start)
+      if !knownHandle(&parser.*, tag) { fail problem(YamlReason.InvalidTag, start) }
+      props.tag = tagCode(tag, parser.secondary)
+      props.present = true
+      parser.at = end
+    } else {
+      return ()
+    }
+    if !isSpaceOrEnd(byteAt(&parser.*, parser.at)) && !isFlowIndicator(byteAt(&parser.*, parser.at)) {
+      fail problem(YamlReason.UnexpectedCharacter, parser.at)
+    }
+    skipInline(&mut parser.*)
+  }
+  return ()
+}
+
+// The end of an anchor, alias, or tag name that starts at `start`.
+fn nameEnd(parser: &Parser<'_>, start: usize) -> usize {
+  let mut end = start
+  while true {
+    let byte = byteAt(&parser.*, end)
+    if isSpaceOrEnd(byte) || isFlowIndicator(byte) { break }
+    end = end + usize.ONE
+  }
+  return end
+}
+
+fn tagCode(tag: &[u8], secondary: bool) -> u8 {
+  if tag.length == usize.ONE { return TAG_STR }
+  let mut name = tag
+  if tag.length > 2 && tag[1] == 33 {
+    if secondary { return TAG_OTHER }
+    name = Slice.view<u8>(tag, 2, tag.length - 2)
+  } else if tag.length > 20 && tag[1] == 60 && sameBytes(Slice.view<u8>(tag, 2, 18), b"tag:yaml.org,2002:") {
+    name = Slice.view<u8>(tag, 20, tag.length - 21)
+  } else {
+    return TAG_OTHER
+  }
+  if sameBytes(name, b"str") { return TAG_STR }
+  if sameBytes(name, b"int") { return TAG_INT }
+  if sameBytes(name, b"float") { return TAG_FLOAT }
+  if sameBytes(name, b"bool") { return TAG_BOOL }
+  if sameBytes(name, b"null") { return TAG_NULL }
+  return TAG_OTHER
+}
+
+fn sameBytes(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// Parses the node at the content under the cursor. Lines that continue it must start at column
+// `parent` or later. `block` allows a block mapping or sequence to start here, and `compact`
+// allows a block sequence at column `parent - 1` when the node starts on the next line.
+effect fn parseNode(parser: &mut Parser<'_>, document: &mut YamlDocument, parent: usize, block: bool, compact: bool)
+  -> () ! YamlError | OutOfMemoryError ? &mut Allocator {
+  let mut props = noProps(parser.at)
+  run properties(&mut parser.*, &mut props)
+  if !props.present || !atLineEnd(&parser.*) {
+    return run parseContent(&mut parser.*, &mut document.*, parent, block, noProps(props.start), props)
+  }
+  // Properties alone on their line belong to the node on the lines below.
+  while true {
+    run skipToContent(&mut parser.*)
+    if atEnd(&parser.*) || atMarker(&parser.*) {
+      return run emitEmpty(&mut parser.*, &mut document.*, props)
+    }
+    let found = column(&parser.*)
+    if found >= parent {
+      let mut inline = noProps(parser.at)
+      run properties(&mut parser.*, &mut inline)
+      if inline.present && atLineEnd(&parser.*) {
+        props = run mergeProps(props, inline)
+        continue
+      }
+      return run parseContent(&mut parser.*, &mut document.*, parent, true, props, inline)
+    }
+    if compact && found + usize.ONE == parent && atSequenceEntry(&parser.*) {
+      return run parseBlockSequence(&mut parser.*, &mut document.*, found, props)
+    }
+    return run emitEmpty(&mut parser.*, &mut document.*, props)
+  }
+  return ()
+}
+
+// The properties of one node written in two places. A node has at most one anchor and one tag.
+effect fn mergeProps(outer: Props, inline: Props) -> Props ! YamlError {
+  if !outer.present { return inline }
+  if !inline.present { return outer }
+  let mut merged = outer
+  if inline.anchorLength != usize.ZERO {
+    if outer.anchorLength != usize.ZERO { fail problem(YamlReason.UnexpectedCharacter, inline.anchorStart - usize.ONE) }
+    merged.anchorStart = inline.anchorStart
+    merged.anchorLength = inline.anchorLength
+  }
+  if inline.tag != TAG_NONE {
+    if outer.tag != TAG_NONE { fail problem(YamlReason.UnexpectedCharacter, inline.start) }
+    merged.tag = inline.tag
+  }
+  return merged
+}
+
+effect fn emitEmpty(parser: &mut Parser<'_>, document: &mut YamlDocument, props: Props) -> () ! YamlError | OutOfMemoryError ? &mut Allocator {
+  let index = List<Slot>.length(&document.slots)
+  if props.tag == TAG_STR {
+    run pushSlot(&mut document.*, KIND_STRING, usize.ZERO, 0, props.start, props.start)
+  } else {
+    run pushSlot(&mut document.*, KIND_NULL, usize.ZERO, 0, props.start, props.start)
+  }
+  return run anchor(&mut parser.*, props, index)
+}
+
+effect fn anchor(parser: &mut Parser<'_>, props: Props, index: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  if props.anchorLength == usize.ZERO { return () }
+  return run List<Anchor>.append(&mut parser.anchors, Anchor { start: props.anchorStart, length: props.anchorLength, slot: index })
+}
+
+effect fn enter(parser: &mut Parser<'_>) -> () ! YamlError {
+  parser.depth = parser.depth + usize.ONE
+  if parser.depth > MAX_DEPTH { fail problem(YamlReason.DepthExceeded, parser.at) }
+  return ()
+}
+
+// Parses a node after its properties: `outer` from the lines above, and `inline` from the line of
+// the content. When the node is a key that starts a mapping, `outer` belongs to the mapping and
+// `inline` to the key; otherwise both belong to the node.
+effect fn parseContent(parser: &mut Parser<'_>, document: &mut YamlDocument, parent: usize, block: bool, outer: Props, inline: Props)
+  -> () ! YamlError | OutOfMemoryError ? &mut Allocator {
+  let start = parser.at
+  let mut at = column(&parser.*)
+  // A mapping whose first key has properties on its line starts where the properties start.
+  if inline.present && inline.start >= parser.line { at = inline.start - parser.line }
+  let byte = byteAt(&parser.*, start)
+  let next = byteAt(&parser.*, start + usize.ONE)
+  let tabbed = block && parser.tabbed && onlyBlanksBefore(&parser.*)
+  let none = Scalar { style: STYLE_PLAIN, start: start, end: start, close: start, simple: true }
+  if byte == 42 {
+    if inline.present { fail problem(YamlReason.UnexpectedCharacter, start) }
+    let key = List<Slot>.length(&document.slots)
+    run alias(&mut parser.*, &mut document.*)
+    if block && atKeyIndicator(&mut parser.*) {
+      if tabbed { fail problem(YamlReason.TabIndentation, start) }
+      return run parseBlockMapping(&mut parser.*, &mut document.*, at, none, noProps(start), outer, ENTRY_STORED, key)
+    }
+    if outer.present { fail problem(YamlReason.UnexpectedCharacter, start) }
+    return ()
+  }
+  if byte == 63 && isSpaceOrEnd(next) {
+    if !block { fail problem(YamlReason.UnexpectedCharacter, start) }
+    if tabbed { fail problem(YamlReason.TabIndentation, start) }
+    if inline.present { fail problem(YamlReason.UnexpectedCharacter, start) }
+    return run parseBlockMapping(&mut parser.*, &mut document.*, at, none, noProps(start), outer, ENTRY_EXPLICIT, usize.ZERO)
+  }
+  if byte == 58 && isSpaceOrEnd(next) {
+    // An empty key, as in `: value`.
+    if !block { fail problem(YamlReason.UnexpectedCharacter, start) }
+    if tabbed { fail problem(YamlReason.TabIndentation, start) }
+    return run startMapping(&mut parser.*, &mut document.*, at, none, outer, inline)
+  }
+  if byte == 64 || byte == 96 || byte == 37 || byte == 44 || byte == 93 || byte == 125 || byte == 0 {
+    fail problem(YamlReason.UnexpectedCharacter, start)
+  }
+  if byte == 91 || byte == 123 || byte == 124 || byte == 62 || byte == 45 && isSpaceOrEnd(next) {
+    let props = run mergeProps(outer, inline)
+    if byte == 124 || byte == 62 {
+      return run parseBlockScalar(&mut parser.*, &mut document.*, parent, props)
+    }
+    if byte == 45 {
+      if !block || inline.present { fail problem(YamlReason.UnexpectedCharacter, start) }
+      if tabbed { fail problem(YamlReason.TabIndentation, start) }
+      return run parseBlockSequence(&mut parser.*, &mut document.*, at, props)
+    }
+    let index = List<Slot>.length(&document.slots)
+    let saved = parser.flowIndent
+    parser.flowIndent = parent
+    run parseFlow(&mut parser.*, &mut document.*, props)
+    parser.flowIndent = saved
+    if block { run refuseKey(&mut parser.*) }
+    return run anchor(&mut parser.*, props, index)
+  }
+  let mut scalar = none
+  if byte == 34 || byte == 39 {
+    let saved = parser.flowIndent
+    parser.flowIndent = parent
+    scalar = run scanQuoted(&mut parser.*)
+    parser.flowIndent = saved
+    if block && parser.line <= start {
+      let after = parser.at
+      skipInline(&mut parser.*)
+      if byteAt(&parser.*, parser.at) == 58 && isSpaceOrEnd(byteAt(&parser.*, parser.at + usize.ONE)) {
+        if tabbed { fail problem(YamlReason.TabIndentation, start) }
+        return run startMapping(&mut parser.*, &mut document.*, at, scalar, outer, inline)
+      }
+      parser.at = after
+    }
+  } else {
+    let key = scanPlainLine(&mut parser.*, false, &mut scalar)
+    if key {
+      if !block { fail problem(YamlReason.UnexpectedCharacter, parser.at) }
+      if tabbed { fail problem(YamlReason.TabIndentation, start) }
+      return run startMapping(&mut parser.*, &mut document.*, at, scalar, outer, inline)
+    }
+    run continuePlain(&mut parser.*, parent, false, &mut scalar)
+  }
+  let props = run mergeProps(outer, inline)
+  return run emitScalar(&mut parser.*, &mut document.*, scalar, props)
+}
+
+// Fails if a `:` follows a flow collection on its line, which would make it a key.
+effect fn refuseKey(parser: &mut Parser<'_>) -> () ! YamlError {
+  if atKeyIndicator(&mut parser.*) { fail problem(YamlReason.UnsupportedKey, parser.at) }
+  return ()
+}
+
+// Returns `true` and leaves the cursor at the `:` if one follows on the line as a key indicator.
+// Otherwise the cursor does not move.
+fn atKeyIndicator(parser: &mut Parser<'_>) -> bool {
+  let after = parser.at
+  skipInline(&mut parser.*)
+  if byteAt(&parser.*, parser.at) == 58 && isSpaceOrEnd(byteAt(&parser.*, parser.at + usize.ONE)) { return true }
+  parser.at = after
+  return false
+}
+
+effect fn startMapping(parser: &mut Parser<'_>, document: &mut YamlDocument, at: usize, first: Scalar, outer: Props, inline: Props)
+  -> () ! YamlError | OutOfMemoryError ? &mut Allocator {
+  let mut keyProps = inline
+  if !inline.present { keyProps = noProps(first.start) }
+  return run parseBlockMapping(&mut parser.*, &mut document.*, at, first, keyProps, outer, ENTRY_SCANNED, usize.ZERO)
+}
+
+// Reads one line of a plain scalar from the cursor into `scalar`, and returns `true` if it ends at
+// a `:` that makes it a key. The cursor stops at the end of the content: at the `:`, at a comment,
+// at the line break, or, in a flow collection, at a flow indicator.
+fn scanPlainLine(parser: &mut Parser<'_>, flow: bool, scalar: &mut Scalar) -> bool {
+  let input = parser.input
+  let length = input.length
+  let start = parser.at
+  let mut at = start
+  let mut end = start
+  let mut key = false
+  while at < length {
+    let byte = input[at]
+    if byte == 58 {
+      let next = byteAt(&parser.*, at + usize.ONE)
+      if isSpaceOrEnd(next) || flow && isFlowIndicator(next) {
+        key = true
+        break
+      }
+    } else if byte == 35 {
+      if isBlank(input[at - usize.ONE]) { break }
+    } else if byte == 10 || byte == 13 {
+      break
+    } else if flow && isFlowIndicator(byte) {
+      break
+    }
+    if byte != 32 && byte != 9 { end = at + usize.ONE }
+    at = at + usize.ONE
+  }
+  scalar.start = start
+  scalar.end = end
+  scalar.close = end
+  scalar.style = STYLE_PLAIN
+  scalar.simple = true
+  if key { parser.at = at } else { parser.at = end }
+  return key
+}
+
+// Extends a plain scalar over the lines that continue it: lines at column `parent` or later in
+// block context, and any line in a flow collection.
+effect fn continuePlain(parser: &mut Parser<'_>, parent: usize, flow: bool, scalar: &mut Scalar) -> () ! YamlError {
+  while true {
+    let resume = parser.at
+    let resumeLine = parser.line
+    skipInline(&mut parser.*)
+    let byte = byteAt(&parser.*, parser.at)
+    if byte != 10 && byte != 13 {
+      parser.at = resume
+      return ()
+    }
+    // Skip blank lines and the indentation of the next one.
+    while true {
+      consumeBreak(&mut parser.*)
+      while byteAt(&parser.*, parser.at) == 32 { parser.at = parser.at + usize.ONE }
+      if column(&parser.*) >= parent || flow {
+        while isBlank(byteAt(&parser.*, parser.at)) { parser.at = parser.at + usize.ONE }
+      }
+      let found = byteAt(&parser.*, parser.at)
+      if found != 10 && found != 13 { break }
+    }
+    let found = byteAt(&parser.*, parser.at)
+    if flow && found != 35 { run checkFlowLine(&parser.*, true) }
+    let stop = atEnd(&parser.*) || atMarker(&parser.*) || found == 35 || !flow && column(&parser.*) < parent ||
+      flow && (isFlowIndicator(found) || found == 58 && (isSpaceOrEnd(byteAt(&parser.*, parser.at + usize.ONE)) ||
+      isFlowIndicator(byteAt(&parser.*, parser.at + usize.ONE))))
+    if stop || isBlank(found) {
+      parser.at = resume
+      parser.line = resumeLine
+      return ()
+    }
+    let mut line = Scalar { style: STYLE_PLAIN, start: parser.at, end: parser.at, close: parser.at, simple: true }
+    let key = scanPlainLine(&mut parser.*, flow, &mut line)
+    if key && !flow { fail problem(YamlReason.UnexpectedCharacter, parser.at) }
+    scalar.end = line.end
+    scalar.close = line.end
+    scalar.simple = false
+    if key { return () }
+    if byteAt(&parser.*, parser.at) == 35 || flow && isFlowIndicator(byteAt(&parser.*, parser.at)) { return () }
+  }
+  return ()
+}
+
+// Reads a quoted scalar from its opening quote. The cursor ends after the closing quote.
+effect fn scanQuoted(parser: &mut Parser<'_>) -> Scalar ! YamlError {
+  let input = parser.input
+  let length = input.length
+  let open = parser.at
+  let quote = input[open]
+  let mut at = open + usize.ONE
+  let mut simple = true
+  while true {
+    if at >= length { fail problem(YamlReason.UnexpectedEnd, open) }
+    let byte = input[at]
+    if byte == quote {
+      if quote == 39 && byteAt(&parser.*, at + usize.ONE) == 39 {
+        simple = false
+        at = at + 2
+        continue
+      }
+      break
+    }
+    if byte == 92 && quote == 34 {
+      simple = false
+      at = at + 2
+      continue
+    }
+    if byte == 10 || byte == 13 {
+      simple = false
+      parser.at = at
+      consumeBreak(&mut parser.*)
+      at = parser.at
+      if atMarker(&parser.*) { fail problem(YamlReason.UnexpectedEnd, at) }
+      run checkFlowLine(&parser.*, false)
+      continue
+    }
+    at = at + usize.ONE
+  }
+  parser.at = at + usize.ONE
+  let mut style = STYLE_SINGLE
+  if quote == 34 { style = STYLE_DOUBLE }
+  return Scalar { style: style, start: open + usize.ONE, end: at, close: at + usize.ONE, simple: simple }
+}
+
+// Stores a scalar value, resolving a plain one with the core schema and applying the tag.
+effect fn emitScalar(parser: &mut Parser<'_>, document: &mut YamlDocument, scalar: Scalar, props: Props)
+  -> () ! YamlError | OutOfMemoryError ? &mut Allocator {
+  let index = List<Slot>.length(&document.slots)
+  let spanStart = props.start
+  let stored = run storeText(parser.input, &mut document.*, scalar)
+  let offset = stored.offset
+  let size = stored.size
+  let tag = props.tag
+  if tag == TAG_STR || tag == TAG_OTHER || scalar.style != STYLE_PLAIN && tag == TAG_NONE {
+    run pushSlot(&mut document.*, KIND_STRING, size, usize.toU64(offset), spanStart, scalar.close)
+    return run anchor(&mut parser.*, props, index)
+  }
+  let text = Slice.view<u8>(Bytes.asSlice(&document.text), offset, size)
+  let resolved = resolve(text)
+  let kind = resolved.kind
+  let mut accepted = true
+  if tag == TAG_INT { accepted = kind == KIND_INTEGER || kind == KIND_UNSIGNED }
+  if tag == TAG_FLOAT { accepted = kind == KIND_INTEGER || kind == KIND_UNSIGNED || kind == KIND_FLOAT }
+  if tag == TAG_BOOL { accepted = kind == KIND_TRUE || kind == KIND_FALSE }
+  if tag == TAG_NULL { accepted = kind == KIND_NULL }
+  if !accepted { fail problem(YamlReason.InvalidTag, scalar.start) }
+  if kind == KIND_STRING {
+    run pushSlot(&mut document.*, KIND_STRING, size, usize.toU64(offset), spanStart, scalar.close)
+  } else if tag == TAG_FLOAT && kind == KIND_INTEGER {
+    let value = i64.toF64(u64.wrappingToI64(resolved.payload))
+    run pushSlot(&mut document.*, KIND_FLOAT, usize.ZERO, f64.toBits(value), spanStart, scalar.close)
+  } else if tag == TAG_FLOAT && kind == KIND_UNSIGNED {
+    run pushSlot(&mut document.*, KIND_FLOAT, usize.ZERO, f64.toBits(u64.toF64(resolved.payload)), spanStart, scalar.close)
+  } else {
+    run pushSlot(&mut document.*, kind, usize.ZERO, resolved.payload, spanStart, scalar.close)
+  }
+  return run anchor(&mut parser.*, props, index)
+}
+
+// Stores a mapping key, which is always a string, and checks that the mapping has no other key
+// with the same text. Keys of the mapping are hashed from `base` on in `parser.keys`.
+effect fn emitKey(parser: &mut Parser<'_>, document: &mut YamlDocument, scalar: Scalar, props: Props, base: usize, first: usize)
+  -> () ! YamlError | OutOfMemoryError ? &mut Allocator {
+  let index = List<Slot>.length(&document.slots)
+  let stored = run storeText(parser.input, &mut document.*, scalar)
+  let offset = stored.offset
+  let size = stored.size
+  run pushSlot(&mut document.*, KIND_STRING, size, usize.toU64(offset), props.start, scalar.close)
+  run checkKey(&mut parser.*, &mut document.*, index, base, first)
+  return run anchor(&mut parser.*, props, index)
+}
+
+// Fails if the string key at `index` repeats a key of its mapping, whose first key is at `first`
+// and whose key hashes start at `base` in `parser.keys`.
+effect fn checkKey(parser: &mut Parser<'_>, document: &mut YamlDocument, index: usize, base: usize, first: usize)
+  -> () ! YamlError | OutOfMemoryError ? &mut Allocator {
+  let slot = List<Slot>.get(&document.slots, index)
+  let text = Slice.view<u8>(Bytes.asSlice(&document.text), u64.toUsize(slot.payload), u64.toUsize(u64.shiftRight(slot.info, 8)))
+  let hash = textHash(text)
+  let hashes = List<u64>.asSlice(&parser.keys)
+  let count = hashes.length - base
+  if count < LINEAR_KEYS {
+    let mut at = base
+    while at < hashes.length {
+      if hashes[at] == hash && repeatedKey(&document.*, first, index) { fail problem(YamlReason.DuplicateKey, slotStart(slot)) }
+      at = at + usize.ONE
+    }
+    if count + usize.ONE == LINEAR_KEYS {
+      // The mapping is large: index every key so far.
+      let mut key = first
+      while true {
+        let keySlot = List<Slot>.get(&document.slots, key)
+        let keyHash = textHash(Slice.view<u8>(Bytes.asSlice(&document.text), u64.toUsize(keySlot.payload), u64.toUsize(u64.shiftRight(keySlot.info, 8))))
+        run tableInsert(&mut parser.*, mixKey(keyHash, base), key, base)
+        if key == index { break }
+        key = slotEnd(&document.slots, key + usize.ONE)
+      }
+    }
+  } else {
+    let mixed = mixKey(hash, base)
+    let words = List<u64>.asSlice(&parser.table)
+    let mask = words.length / 3 - usize.ONE
+    let mut bucket = u64.toUsize(u64.bitAnd(u64.shiftRight(mixed, 16), usize.toU64(mask)))
+    while words[bucket * 3 + usize.ONE] != 0 {
+      let at = bucket * 3
+      if words[at] == mixed && words[at + 2] == usize.toU64(base) {
+        let other = u64.toUsize(words[at + usize.ONE]) - usize.ONE
+        if other >= first && other < index && slotText(&document.*, List<Slot>.get(&document.slots, other)) == slotText(&document.*, slot) {
+          fail problem(YamlReason.DuplicateKey, slotStart(slot))
+        }
+      }
+      bucket = u64.toUsize(u64.bitAnd(usize.toU64(bucket + usize.ONE), usize.toU64(mask)))
+    }
+    run tableInsert(&mut parser.*, mixed, index, base)
+  }
+  return run List<u64>.append(&mut parser.keys, hash)
+}
+
+// Mappings with this many keys or fewer check a new key against each earlier hash; larger ones use
+// `Parser.table`.
+const LINEAR_KEYS: usize = 16
+
+fn mixKey(hash: u64, base: usize) -> u64 {
+  return u64.wrappingMultiply(u64.bitXor(hash, usize.toU64(base)), 11400714819323198485)
+}
+
+// Adds the key at slot `key` of the mapping with key base `base` to `Parser.table`, growing the
+// table to keep it at most half full.
+effect fn tableInsert(parser: &mut Parser<'_>, mixed: u64, key: usize, base: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let buckets = List<u64>.length(&parser.table) / 3
+  if (parser.tableUsed + usize.ONE) * 2 > buckets {
+    let size = if buckets == usize.ZERO { 256 } else { buckets * 2 }
+    let mut grown = List<u64>.make()
+    run List<u64>.appendRepeated(&mut grown, 0, size * 3)
+    let oldWords = List<u64>.asSlice(&parser.table)
+    let mut at = usize.ZERO
+    while at < oldWords.length {
+      if oldWords[at + usize.ONE] != 0 { tablePlace(List<u64>.asMutSlice(&mut grown), oldWords[at], oldWords[at + usize.ONE], oldWords[at + 2]) }
+      at = at + 3
+    }
+    parser.table = move grown
+  }
+  tablePlace(List<u64>.asMutSlice(&mut parser.table), mixed, usize.toU64(key + usize.ONE), usize.toU64(base))
+  parser.tableUsed = parser.tableUsed + usize.ONE
+  return ()
+}
+
+fn tablePlace(words: &mut [u64], mixed: u64, slot: u64, base: u64) -> () {
+  let mask = words.length / 3 - usize.ONE
+  let mut bucket = u64.toUsize(u64.bitAnd(u64.shiftRight(mixed, 16), usize.toU64(mask)))
+  while words[bucket * 3 + usize.ONE] != 0 { bucket = u64.toUsize(u64.bitAnd(usize.toU64(bucket + usize.ONE), usize.toU64(mask))) }
+  words[bucket * 3] = mixed
+  words[bucket * 3 + usize.ONE] = slot
+  words[bucket * 3 + 2] = base
+  return ()
+}
+
+// `true` if a key of the mapping whose first key is at `first` repeats the key at `key`.
+fn repeatedKey(document: &YamlDocument, first: usize, key: usize) -> bool {
+  let text = slotText(document, List<Slot>.get(&document.slots, key))
+  let mut index = first
+  while index < key {
+    if slotText(document, List<Slot>.get(&document.slots, index)) == text { return true }
+    index = slotEnd(&document.slots, index + usize.ONE)
+  }
+  return false
+}
+
+fn textHash(text: &[u8]) -> u64 {
+  let mut hash: u64 = 14695981039346656037
+  let mut at = usize.ZERO
+  while at < text.length {
+    hash = u64.wrappingMultiply(u64.bitXor(hash, u8.toU64(text[at])), 1099511628211)
+    at = at + usize.ONE
+  }
+  return hash
+}
+
+// Returns the offset and length of the decoded text of `scalar` in `document.text`. A simple
+// scalar is read from the copy of the input.
+struct TextRef {
+  offset: usize,
+  size: usize,
+}
+
+impl Copy for TextRef {}
+
+effect fn storeText(input: &[u8], document: &mut YamlDocument, scalar: Scalar) -> TextRef ! YamlError | OutOfMemoryError ? &mut Allocator {
+  if scalar.simple { return TextRef { offset: scalar.start, size: scalar.end - scalar.start } }
+  let offset = Bytes.length(&document.text)
+  if scalar.style == STYLE_DOUBLE {
+    run decodeDouble(input, &mut document.*, scalar.start, scalar.end)
+  } else {
+    run fold(input, &mut document.*, scalar.start, scalar.end, scalar.style == STYLE_SINGLE)
+  }
+  return TextRef { offset: offset, size: Bytes.length(&document.text) - offset }
+}
+
+effect fn appendByte(document: &mut YamlDocument, byte: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  if Bytes.appendWithinCapacity(&mut document.text, byte) { return () }
+  let one = [byte]
+  return run Bytes.append(&mut document.text, &one)
+}
+
+effect fn appendSource(input: &[u8], document: &mut YamlDocument, start: usize, end: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  if end <= start { return () }
+  return run Bytes.append(&mut document.text, Slice.view<u8>(input, start, end - start))
+}
+
+// Appends the folded text of a plain or single-quoted scalar: each line break becomes a space, and
+// each empty line becomes a line break. `quoted` decodes `''` to `'`.
+effect fn fold(input: &[u8], document: &mut YamlDocument, start: usize, end: usize, quoted: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut at = start
+  // The end of the text written so far that is not trailing blanks.
+  let mut pending = start
+  while at < end {
+    let byte = input[at]
+    if byte == 10 || byte == 13 {
+      at = run lineFold(input, &mut document.*, at, end)
+      pending = at
+      continue
+    }
+    if byte == 32 || byte == 9 {
+      at = at + usize.ONE
+      continue
+    }
+    run appendSource(input, &mut document.*, pending, at)
+    if quoted && byte == 39 {
+      run appendByte(&mut document.*, 39)
+      at = at + 2
+    } else {
+      run appendByte(&mut document.*, byte)
+      at = at + usize.ONE
+    }
+    pending = at
+  }
+  // Blanks before the closing quote are content.
+  return run appendSource(input, &mut document.*, pending, end)
+}
+
+// Writes the fold of the line break at `at` and of the empty lines after it, and returns the
+// offset of the next content.
+effect fn lineFold(input: &[u8], document: &mut YamlDocument, start: usize, end: usize) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let mut at = start
+  let mut breaks = usize.ZERO
+  while at < end {
+    let byte = input[at]
+    if byte == 13 {
+      if at + usize.ONE < end && input[at + usize.ONE] == 10 { at = at + usize.ONE }
+      breaks = breaks + usize.ONE
+    } else if byte == 10 {
+      breaks = breaks + usize.ONE
+    } else if byte != 32 && byte != 9 {
+      break
+    }
+    at = at + usize.ONE
+  }
+  if breaks == usize.ONE {
+    run appendByte(&mut document.*, 32)
+  } else {
+    let mut count = usize.ONE
+    while count < breaks {
+      run appendByte(&mut document.*, 10)
+      count = count + usize.ONE
+    }
+  }
+  return at
+}
+
+// Appends the decoded text of a double-quoted scalar.
+effect fn decodeDouble(input: &[u8], document: &mut YamlDocument, start: usize, end: usize) -> () ! YamlError | OutOfMemoryError ? &mut Allocator {
+  let mut at = start
+  let mut pending = start
+  while at < end {
+    let byte = input[at]
+    if byte == 10 || byte == 13 {
+      at = run lineFold(input, &mut document.*, at, end)
+      pending = at
+      continue
+    }
+    if byte == 32 || byte == 9 {
+      at = at + usize.ONE
+      continue
+    }
+    run appendSource(input, &mut document.*, pending, at)
+    if byte != 92 {
+      run appendByte(&mut document.*, byte)
+      at = at + usize.ONE
+      pending = at
+      continue
+    }
+    let escaped = input[at + usize.ONE]
+    at = at + 2
+    if escaped == 10 || escaped == 13 {
+      // An escaped line break joins the lines with nothing between them.
+      if escaped == 13 && at < end && input[at] == 10 { at = at + usize.ONE }
+      while at < end && isBlank(input[at]) { at = at + usize.ONE }
+      pending = at
+      continue
+    }
+    let mut digits = usize.ZERO
+    if escaped == 120 { digits = 2 } else if escaped == 117 { digits = 4 } else if escaped == 85 { digits = 8 }
+    if digits != usize.ZERO {
+      if at + digits > end { fail problem(YamlReason.InvalidEscape, at - 2) }
+      let mut scalar: u32 = 0
+      let mut digit = usize.ZERO
+      while digit < digits {
+        let value = hexValue(input[at + digit])
+        if value > 15 { fail problem(YamlReason.InvalidEscape, at - 2) }
+        scalar = scalar * 16 + value
+        digit = digit + usize.ONE
+      }
+      if scalar > 1114111 || scalar >= 55296 && scalar <= 57343 { fail problem(YamlReason.InvalidEscape, at - 2) }
+      run appendScalar(&mut document.*, scalar)
+      at = at + digits
+      pending = at
+      continue
+    }
+    let decoded = simpleEscape(escaped)
+    if decoded == 1114112 { fail problem(YamlReason.InvalidEscape, at - 2) }
+    run appendScalar(&mut document.*, decoded)
+    pending = at
+  }
+  // Blanks before the closing quote are content.
+  return run appendSource(input, &mut document.*, pending, end)
+}
+
+fn hexValue(byte: u8) -> u32 {
+  if byte >= 48 && byte <= 57 { return u8.toU32(byte - 48) }
+  if byte >= 65 && byte <= 70 { return u8.toU32(byte - 55) }
+  if byte >= 97 && byte <= 102 { return u8.toU32(byte - 87) }
+  return 16
+}
+
+// The scalar value of a one-letter escape, or 1114112 if YAML does not define it.
+fn simpleEscape(escaped: u8) -> u32 {
+  if escaped == 48 { return 0 }
+  if escaped == 97 { return 7 }
+  if escaped == 98 { return 8 }
+  if escaped == 116 || escaped == 9 { return 9 }
+  if escaped == 110 { return 10 }
+  if escaped == 118 { return 11 }
+  if escaped == 102 { return 12 }
+  if escaped == 114 { return 13 }
+  if escaped == 101 { return 27 }
+  if escaped == 32 { return 32 }
+  if escaped == 34 { return 34 }
+  if escaped == 47 { return 47 }
+  if escaped == 92 { return 92 }
+  if escaped == 78 { return 133 }
+  if escaped == 95 { return 160 }
+  if escaped == 76 { return 8232 }
+  if escaped == 80 { return 8233 }
+  return 1114112
+}
+
+effect fn appendScalar(document: &mut YamlDocument, scalar: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+  if scalar < 128 { return run appendByte(&mut document.*, u32.toU8(scalar)) }
+  if scalar < 2048 {
+    run appendByte(&mut document.*, u32.toU8(192 + scalar / 64))
+    return run appendByte(&mut document.*, u32.toU8(128 + scalar % 64))
+  }
+  if scalar < 65536 {
+    run appendByte(&mut document.*, u32.toU8(224 + scalar / 4096))
+    run appendByte(&mut document.*, u32.toU8(128 + scalar / 64 % 64))
+    return run appendByte(&mut document.*, u32.toU8(128 + scalar % 64))
+  }
+  run appendByte(&mut document.*, u32.toU8(240 + scalar / 262144))
+  run appendByte(&mut document.*, u32.toU8(128 + scalar / 4096 % 64))
+  run appendByte(&mut document.*, u32.toU8(128 + scalar / 64 % 64))
+  return run appendByte(&mut document.*, u32.toU8(128 + scalar % 64))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Core schema resolution
+
+struct Resolved {
+  kind: u64,
+  payload: u64,
+}
+
+impl Copy for Resolved {}
+
+fn resolve(text: &[u8]) -> Resolved {
+  let plain = Resolved { kind: KIND_STRING, payload: 0 }
+  let length = text.length
+  if length == usize.ZERO { return Resolved { kind: KIND_NULL, payload: 0 } }
+  let first = text[0]
+  // Only text that starts like a number or a keyword can resolve to something else.
+  if first >= 48 && first <= 57 || first == 45 || first == 43 || first == 46 {
+    return resolveNumber(text)
+  }
+  if length == usize.ONE {
+    if first == 126 { return Resolved { kind: KIND_NULL, payload: 0 } }
+    return plain
+  }
+  if length == 4 {
+    if sameBytes(text, b"null") || sameBytes(text, b"Null") || sameBytes(text, b"NULL") { return Resolved { kind: KIND_NULL, payload: 0 } }
+    if sameBytes(text, b"true") || sameBytes(text, b"True") || sameBytes(text, b"TRUE") { return Resolved { kind: KIND_TRUE, payload: 0 } }
+  }
+  if length == 5 {
+    if sameBytes(text, b"false") || sameBytes(text, b"False") || sameBytes(text, b"FALSE") { return Resolved { kind: KIND_FALSE, payload: 0 } }
+  }
+  return plain
+}
+
+fn resolveNumber(text: &[u8]) -> Resolved {
+  let plain = Resolved { kind: KIND_STRING, payload: 0 }
+  let length = text.length
+  let mut at = usize.ZERO
+  let mut negative = false
+  if text[0] == 45 || text[0] == 43 {
+    negative = text[0] == 45
+    at = usize.ONE
+  }
+  if at == length { return plain }
+  // `.inf` and `.nan`, with an optional sign before `.inf`.
+  if text[at] == 46 && length - at == 4 {
+    let word = Slice.view<u8>(text, at + usize.ONE, 3)
+    if sameBytes(word, b"inf") || sameBytes(word, b"Inf") || sameBytes(word, b"INF") {
+      let mut value = f64.INFINITY
+      if negative { value = -f64.INFINITY }
+      return Resolved { kind: KIND_FLOAT, payload: f64.toBits(value) }
+    }
+    if at == usize.ZERO && (sameBytes(word, b"nan") || sameBytes(word, b"NaN") || sameBytes(word, b"NAN")) {
+      return Resolved { kind: KIND_FLOAT, payload: f64.toBits(f64.NAN) }
+    }
+    return plain
+  }
+  // `0o17` and `0x1F`, without a sign.
+  if at == usize.ZERO && length > 2 && text[0] == 48 && (text[1] == 111 || text[1] == 120) {
+    let mut radix: u64 = 8
+    if text[1] == 120 { radix = 16 }
+    let mut value: u64 = 0
+    let mut index: usize = 2
+    let mut overflow = false
+    while index < length {
+      let digit = u32.toU64(hexValue(text[index]))
+      if digit >= radix { return plain }
+      if value > u64.MAX / radix { overflow = true }
+      value = u64.wrappingAdd(u64.wrappingMultiply(value, radix), digit)
+      index = index + usize.ONE
+    }
+    if overflow { return Resolved { kind: KIND_FLOAT, payload: f64.toBits(f64.INFINITY) } }
+    if value > 9223372036854775807 { return Resolved { kind: KIND_UNSIGNED, payload: value } }
+    return Resolved { kind: KIND_INTEGER, payload: value }
+  }
+  // Decimal digits, then an optional fraction and exponent.
+  let digitsStart = at
+  let mut value: u64 = 0
+  let mut overflow = false
+  while at < length && text[at] >= 48 && text[at] <= 57 {
+    let digit = u8.toU64(text[at] - 48)
+    if value > 1844674407370955161 || value == 1844674407370955161 && digit > 5 { overflow = true }
+    value = u64.wrappingAdd(u64.wrappingMultiply(value, 10), digit)
+    at = at + usize.ONE
+  }
+  let integerDigits = at - digitsStart
+  if at == length {
+    if overflow { return floatOf(text, negative) }
+    if negative {
+      if value <= 9223372036854775808 { return Resolved { kind: KIND_INTEGER, payload: u64.wrappingSubtract(0, value) } }
+      return floatOf(text, negative)
+    }
+    if value > 9223372036854775807 { return Resolved { kind: KIND_UNSIGNED, payload: value } }
+    return Resolved { kind: KIND_INTEGER, payload: value }
+  }
+  let mut fractionDigits = usize.ZERO
+  if text[at] == 46 {
+    at = at + usize.ONE
+    let fractionStart = at
+    while at < length && text[at] >= 48 && text[at] <= 57 { at = at + usize.ONE }
+    fractionDigits = at - fractionStart
+  }
+  if integerDigits == usize.ZERO && fractionDigits == usize.ZERO { return plain }
+  if at < length && (text[at] == 101 || text[at] == 69) {
+    at = at + usize.ONE
+    if at < length && (text[at] == 45 || text[at] == 43) { at = at + usize.ONE }
+    let exponentStart = at
+    while at < length && text[at] >= 48 && text[at] <= 57 { at = at + usize.ONE }
+    if at == exponentStart { return plain }
+  }
+  if at != length { return plain }
+  return floatOf(text, negative)
+}
+
+// Converts text that matches the core schema float pattern.
+fn floatOf(text: &[u8], negative: bool) -> Resolved {
+  // `Format.f64Value` takes `-`, digits, `.`, digits, and an exponent: drop a `+` sign, and write
+  // a `0` around a bare point.
+  let mut buffer: [u8; 128] = [0; 128]
+  let mut size = usize.ZERO
+  let mut at = usize.ZERO
+  if text[0] == 43 || text[0] == 45 { at = usize.ONE }
+  if negative {
+    buffer[0] = 45
+    size = usize.ONE
+  }
+  if text[at] == 46 {
+    buffer[size] = 48
+    size = size + usize.ONE
+  }
+  while at < text.length && size < 120 {
+    let byte = text[at]
+    buffer[size] = byte
+    size = size + usize.ONE
+    if byte == 46 && (at + usize.ONE == text.length || text[at + usize.ONE] == 101 || text[at + usize.ONE] == 69) {
+      buffer[size] = 48
+      size = size + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  if at < text.length { return floatSlow(text, negative) }
+  let digits = unsafe Intrinsic.stringFromUtf8Unchecked(Slice.view<u8>(&buffer, usize.ZERO, size))
+  return match Format.f64Value(digits) {
+    Result<f64, ParseError>.Success { value } => Resolved { kind: KIND_FLOAT, payload: f64.toBits(value) }
+    Result<f64, ParseError>.Failure {..} => Resolved { kind: KIND_STRING, payload: 0 }
+  }
+}
+
+// A float written with more than 120 characters: its digits past the 40th cannot change the
+// nearest `f64` unless the exponent is huge, so the text is cut and the exponent adjusted.
+fn floatSlow(text: &[u8], negative: bool) -> Resolved {
+  let mut at = usize.ZERO
+  if text[0] == 43 || text[0] == 45 { at = usize.ONE }
+  let mut scale: i64 = 0
+  let mut seenPoint = false
+  let mut kept = usize.ZERO
+  let mut digitsValue: u64 = 0
+  while at < text.length && text[at] != 101 && text[at] != 69 {
+    let byte = text[at]
+    if byte == 46 {
+      seenPoint = true
+    } else if kept < 19 {
+      digitsValue = digitsValue * 10 + u8.toU64(byte - 48)
+      kept = kept + usize.ONE
+      if seenPoint { scale = scale - 1 }
+    } else if !seenPoint {
+      scale = scale + 1
+    }
+    at = at + usize.ONE
+  }
+  if at < text.length {
+    at = at + usize.ONE
+    let mut sign: i64 = 1
+    if text[at] == 45 { sign = -1 }
+    if text[at] == 45 || text[at] == 43 { at = at + usize.ONE }
+    let mut exponent: i64 = 0
+    while at < text.length {
+      if exponent < 100000 { exponent = exponent * 10 + u8.toI64(text[at] - 48) }
+      at = at + usize.ONE
+    }
+    scale = scale + sign * exponent
+  }
+  let mut value = Format.f64FromDecimal(digitsValue, scale)
+  if negative { value = -value }
+  return Resolved { kind: KIND_FLOAT, payload: f64.toBits(value) }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Collections
+
+// Parses a block mapping at column `at`. Its first key is `first` and the cursor is at the `:`
+// after it, or, when `explicit` is set, the cursor is at the `?` of an explicit key.
+effect fn parseBlockMapping(parser: &mut Parser<'_>, document: &mut YamlDocument, at: usize, first: Scalar, keyProps: Props, props: Props,
+  entry: u8, stored: usize) -> () ! YamlError | OutOfMemoryError ? &mut Allocator {
+  run enter(&mut parser.*)
+  let mut start = keyProps.start
+  if props.present { start = props.start }
+  let mut index = List<Slot>.length(&document.slots)
+  if entry == ENTRY_STORED {
+    index = stored
+    run insertSlot(&mut parser.*, &mut document.*, index, KIND_MAPPING, start)
+  } else {
+    run pushSlot(&mut document.*, KIND_MAPPING, usize.ZERO, 0, start, start)
+  }
+  let base = List<u64>.length(&parser.keys)
+  let mut count = usize.ZERO
+  let mut key = first
+  let mut currentProps = keyProps
+  let mut kind = entry
+  let mut keyIndex = index + usize.ONE
+  let mut end = parser.at
+  while true {
+    if kind == ENTRY_EXPLICIT {
+      run explicitEntry(&mut parser.*, &mut document.*, at, base, index + usize.ONE)
+    } else {
+      if kind == ENTRY_SCANNED {
+        run emitKey(&mut parser.*, &mut document.*, key, currentProps, base, index + usize.ONE)
+      } else {
+        run makeKey(&mut parser.*, &mut document.*, keyIndex, base, index + usize.ONE)
+      }
+      // The cursor is at the `:` after the key.
+      parser.at = parser.at + usize.ONE
+      run parseValue(&mut parser.*, &mut document.*, at)
+    }
+    count = count + usize.ONE
+    end = parser.at
+    run skipToContent(&mut parser.*)
+    if atEnd(&parser.*) || atMarker(&parser.*) { break }
+    let found = column(&parser.*)
+    if found < at { break }
+    if found > at { fail problem(YamlReason.BadIndentation, parser.at) }
+    if parser.tabbed { fail problem(YamlReason.TabIndentation, parser.at) }
+    let byte = byteAt(&parser.*, parser.at)
+    if byte == 63 && isSpaceOrEnd(byteAt(&parser.*, parser.at + usize.ONE)) {
+      kind = ENTRY_EXPLICIT
+    } else if byte == 42 {
+      kind = ENTRY_STORED
+      keyIndex = List<Slot>.length(&document.slots)
+      run alias(&mut parser.*, &mut document.*)
+      if !atKeyIndicator(&mut parser.*) { fail problem(YamlReason.UnexpectedCharacter, parser.at) }
+    } else {
+      kind = ENTRY_SCANNED
+      currentProps = noProps(parser.at)
+      run properties(&mut parser.*, &mut currentProps)
+      key = run scanKey(&mut parser.*)
+    }
+  }
+  List<u64>.truncate(&mut parser.keys, base)
+  closeSlot(&mut document.*, index, count, end)
+  parser.depth = parser.depth - usize.ONE
+  return run anchor(&mut parser.*, props, index)
+}
+
+const ENTRY_SCANNED: u8 = 0
+const ENTRY_EXPLICIT: u8 = 1
+const ENTRY_STORED: u8 = 2
+
+// Inserts an empty collection slot at `index`, before nodes already parsed, and moves the anchors
+// that name those nodes.
+effect fn insertSlot(parser: &mut Parser<'_>, document: &mut YamlDocument, index: usize, kind: u64, start: usize)
+  -> () ! OutOfMemoryError ? &mut Allocator {
+  let span = u64.bitOr(usize.toU64(start), u64.shiftLeft(usize.toU64(start), 32))
+  run List<Slot>.insert(&mut document.slots, index, Slot { info: kind, payload: 0, span: span })
+  let anchors = List<Anchor>.asMutSlice(&mut parser.anchors)
+  let mut at = usize.ZERO
+  while at < anchors.length {
+    if anchors[at].slot >= index { anchors[at].slot = anchors[at].slot + usize.ONE }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Parses an explicit entry, `? key` and an optional `: value` line, of a block mapping at column
+// `at`. The cursor is at the `?`.
+effect fn explicitEntry(parser: &mut Parser<'_>, document: &mut YamlDocument, at: usize, base: usize, first: usize)
+  -> () ! YamlError | OutOfMemoryError ? &mut Allocator {
+  let key = List<Slot>.length(&document.slots)
+  run entryNode(&mut parser.*, &mut document.*, at)
+  run makeKey(&mut parser.*, &mut document.*, key, base, first)
+  let here = parser.at
+  run skipToContent(&mut parser.*)
+  if !atEnd(&parser.*) && !atMarker(&parser.*) && column(&parser.*) == at && byteAt(&parser.*, parser.at) == 58 &&
+    isSpaceOrEnd(byteAt(&parser.*, parser.at + usize.ONE)) {
+    return run entryNode(&mut parser.*, &mut document.*, at)
+  }
+  parser.at = here
+  return run pushSlot(&mut document.*, KIND_NULL, usize.ZERO, 0, here, here)
+}
+
+// Parses the node after a `?`, `:`, or `-` indicator at column `at`: on the same line, as a compact
+// collection, or on the lines below.
+effect fn entryNode(parser: &mut Parser<'_>, document: &mut YamlDocument, at: usize) -> () ! YamlError | OutOfMemoryError ? &mut Allocator {
+  parser.at = parser.at + usize.ONE
+  skipInline(&mut parser.*)
+  if atLineEnd(&parser.*) {
+    let here = parser.at
+    run skipToContent(&mut parser.*)
+    if !atEnd(&parser.*) && !atMarker(&parser.*) && column(&parser.*) > at {
+      return run parseNode(&mut parser.*, &mut document.*, at + usize.ONE, true, false)
+    }
+    return run pushSlot(&mut document.*, KIND_NULL, usize.ZERO, 0, here, here)
+  }
+  return run parseNode(&mut parser.*, &mut document.*, at + usize.ONE, true, false)
+}
+
+// Turns the scalar node at `index` into a string key and checks it against the other keys of its
+// mapping. A null key becomes the empty string, and another scalar its source text.
+effect fn makeKey(parser: &mut Parser<'_>, document: &mut YamlDocument, index: usize, base: usize, first: usize)
+  -> () ! YamlError | OutOfMemoryError ? &mut Allocator {
+  let slot = List<Slot>.get(&document.slots, index)
+  let kind = u64.bitAnd(slot.info, KIND_MASK)
+  if kind == KIND_SEQUENCE || kind == KIND_MAPPING { fail problem(YamlReason.UnsupportedKey, slotStart(slot)) }
+  if kind != KIND_STRING {
+    let slots = List<Slot>.asMutSlice(&mut document.slots)
+    let start = slotStart(slot)
+    let mut size = slotFinish(slot) - start
+    if kind == KIND_NULL { size = usize.ZERO }
+    slots[index].info = u64.bitOr(KIND_STRING, u64.shiftLeft(usize.toU64(size), 8))
+    slots[index].payload = usize.toU64(start)
+  }
+  return run checkKey(&mut parser.*, &mut document.*, index, base, first)
+}
+
+// Reads the key of a block mapping entry and leaves the cursor at its `:`.
+effect fn scanKey(parser: &mut Parser<'_>) -> Scalar ! YamlError {
+  let start = parser.at
+  let byte = byteAt(&parser.*, start)
+  let next = byteAt(&parser.*, start + usize.ONE)
+  if byte == 58 && isSpaceOrEnd(next) {
+    // An empty key, as in `: value`.
+    return Scalar { style: STYLE_PLAIN, start: start, end: start, close: start, simple: true }
+  }
+  if byte == 42 || byte == 91 || byte == 123 || byte == 63 && isSpaceOrEnd(next) {
+    fail problem(YamlReason.UnsupportedKey, start)
+  }
+  if byte == 45 && isSpaceOrEnd(next) || byte == 124 || byte == 62 || byte == 64 || byte == 96 || byte == 37 ||
+    byte == 44 || byte == 93 || byte == 125 {
+    fail problem(YamlReason.UnexpectedCharacter, start)
+  }
+  if byte == 34 || byte == 39 {
+    let scalar = run scanQuoted(&mut parser.*)
+    if parser.line > start { fail problem(YamlReason.UnexpectedCharacter, start) }
+    skipInline(&mut parser.*)
+    if byteAt(&parser.*, parser.at) == 58 && isSpaceOrEnd(byteAt(&parser.*, parser.at + usize.ONE)) { return scalar }
+    fail problem(YamlReason.UnexpectedCharacter, parser.at)
+  }
+  let mut scalar = Scalar { style: STYLE_PLAIN, start: start, end: start, close: start, simple: true }
+  if scanPlainLine(&mut parser.*, false, &mut scalar) { return scalar }
+  fail problem(YamlReason.UnexpectedCharacter, parser.at)
+}
+
+// Parses the value after the `:` of a key in a block mapping at column `at`.
+effect fn parseValue(parser: &mut Parser<'_>, document: &mut YamlDocument, at: usize) -> () ! YamlError | OutOfMemoryError ? &mut Allocator {
+  skipInline(&mut parser.*)
+  if atLineEnd(&parser.*) {
+    let here = parser.at
+    run skipToContent(&mut parser.*)
+    if atEnd(&parser.*) || atMarker(&parser.*) {
+      return run pushSlot(&mut document.*, KIND_NULL, usize.ZERO, 0, here, here)
+    }
+    let found = column(&parser.*)
+    if found > at { return run parseNode(&mut parser.*, &mut document.*, at + usize.ONE, true, true) }
+    if found == at && atSequenceEntry(&parser.*) {
+      let props = noProps(parser.at)
+      return run parseBlockSequence(&mut parser.*, &mut document.*, at, props)
+    }
+    return run pushSlot(&mut document.*, KIND_NULL, usize.ZERO, 0, here, here)
+  }
+  return run parseNode(&mut parser.*, &mut document.*, at + usize.ONE, false, true)
+}
+
+effect fn parseBlockSequence(parser: &mut Parser<'_>, document: &mut YamlDocument, at: usize, props: Props)
+  -> () ! YamlError | OutOfMemoryError ? &mut Allocator {
+  run enter(&mut parser.*)
+  let index = List<Slot>.length(&document.slots)
+  let mut start = parser.at
+  if props.present { start = props.start }
+  run pushSlot(&mut document.*, KIND_SEQUENCE, usize.ZERO, 0, start, start)
+  let mut count = usize.ZERO
+  let mut end = parser.at
+  while true {
+    // The cursor is at the `-`.
+    parser.at = parser.at + usize.ONE
+    count = count + usize.ONE
+    let gap = parser.at
+    skipInline(&mut parser.*)
+    if blanksHoldTab(&parser.*, gap) && (atSequenceEntry(&parser.*) ||
+      byteAt(&parser.*, parser.at) == 63 && isSpaceOrEnd(byteAt(&parser.*, parser.at + usize.ONE))) {
+      fail problem(YamlReason.TabIndentation, parser.at)
+    }
+    if atLineEnd(&parser.*) {
+      let here = parser.at
+      run skipToContent(&mut parser.*)
+      if !atEnd(&parser.*) && !atMarker(&parser.*) && column(&parser.*) > at {
+        run parseNode(&mut parser.*, &mut document.*, at + usize.ONE, true, false)
+      } else {
+        run pushSlot(&mut document.*, KIND_NULL, usize.ZERO, 0, here, here)
+      }
+    } else {
+      run parseNode(&mut parser.*, &mut document.*, at + usize.ONE, true, false)
+    }
+    end = parser.at
+    run skipToContent(&mut parser.*)
+    if atEnd(&parser.*) || atMarker(&parser.*) { break }
+    let found = column(&parser.*)
+    if found < at { break }
+    if found > at { fail problem(YamlReason.BadIndentation, parser.at) }
+    if !atSequenceEntry(&parser.*) { break }
+    if parser.tabbed { fail problem(YamlReason.TabIndentation, parser.at) }
+  }
+  closeSlot(&mut document.*, index, count, end)
+  parser.depth = parser.depth - usize.ONE
+  return run anchor(&mut parser.*, props, index)
+}
+
+// Parses a flow sequence or mapping from its opening bracket.
+effect fn parseFlow(parser: &mut Parser<'_>, document: &mut YamlDocument, props: Props) -> () ! YamlError | OutOfMemoryError ? &mut Allocator {
+  run enter(&mut parser.*)
+  let index = List<Slot>.length(&document.slots)
+  let open = parser.at
+  let mapping = byteAt(&parser.*, open) == 123
+  let mut start = open
+  if props.present { start = props.start }
+  if mapping {
+    run pushSlot(&mut document.*, KIND_MAPPING, usize.ZERO, 0, start, start)
+  } else {
+    run pushSlot(&mut document.*, KIND_SEQUENCE, usize.ZERO, 0, start, start)
+  }
+  parser.at = open + usize.ONE
+  let base = List<u64>.length(&parser.keys)
+  let mut count = usize.ZERO
+  let mut close: u8 = 93
+  if mapping { close = 125 }
+  while true {
+    run skipFlowSpace(&mut parser.*)
+    let byte = byteAt(&parser.*, parser.at)
+    if byte == close { break }
+    if atEnd(&parser.*) { fail problem(YamlReason.UnexpectedEnd, open) }
+    if mapping {
+      run flowEntry(&mut parser.*, &mut document.*, base, index + usize.ONE)
+    } else {
+      let entry = List<Slot>.length(&document.slots)
+      let explicit = byte == 63 && isSpaceOrEnd(byteAt(&parser.*, parser.at + usize.ONE)) ||
+        byte == 58 && (isSpaceOrEnd(byteAt(&parser.*, parser.at + usize.ONE)) || isFlowIndicator(byteAt(&parser.*, parser.at + usize.ONE)))
+      if explicit && byte == 63 {
+        parser.at = parser.at + usize.ONE
+        run skipFlowSpace(&mut parser.*)
+      }
+      let after = byteAt(&parser.*, parser.at)
+      if explicit && (after == 58 || after == 44 || after == 93) {
+        run pushSlot(&mut document.*, KIND_NULL, usize.ZERO, 0, parser.at, parser.at)
+      } else {
+        run parseFlowNode(&mut parser.*, &mut document.*)
+      }
+      let line = parser.line
+      run skipFlowSpace(&mut parser.*)
+      if byteAt(&parser.*, parser.at) == 58 && !explicit && parser.line != line {
+        // The key of a pair in a flow sequence must be on the line of its `:`.
+        fail problem(YamlReason.UnexpectedCharacter, parser.at)
+      }
+      if byteAt(&parser.*, parser.at) == 58 || explicit { run flowPair(&mut parser.*, &mut document.*, entry) }
+    }
+    count = count + usize.ONE
+    run skipFlowSpace(&mut parser.*)
+    let after = byteAt(&parser.*, parser.at)
+    if after == 44 {
+      parser.at = parser.at + usize.ONE
+      continue
+    }
+    if after == close { break }
+    if atEnd(&parser.*) { fail problem(YamlReason.UnexpectedEnd, open) }
+    fail problem(YamlReason.UnexpectedCharacter, parser.at)
+  }
+  parser.at = parser.at + usize.ONE
+  List<u64>.truncate(&mut parser.keys, base)
+  closeSlot(&mut document.*, index, count, parser.at)
+  parser.depth = parser.depth - usize.ONE
+  return ()
+}
+
+// Turns the scalar at `entry` of a flow sequence into the key of a mapping with one member, and
+// parses its value after the `:` under the cursor, as in `[name: Ada]`.
+effect fn flowPair(parser: &mut Parser<'_>, document: &mut YamlDocument, entry: usize) -> () ! YamlError | OutOfMemoryError ? &mut Allocator {
+  let slot = List<Slot>.get(&document.slots, entry)
+  let kind = u64.bitAnd(slot.info, KIND_MASK)
+  if kind == KIND_SEQUENCE || kind == KIND_MAPPING { fail problem(YamlReason.UnsupportedKey, slotStart(slot)) }
+  run enter(&mut parser.*)
+  run insertSlot(&mut parser.*, &mut document.*, entry, KIND_MAPPING, slotStart(slot))
+  let base = List<u64>.length(&parser.keys)
+  run makeKey(&mut parser.*, &mut document.*, entry + usize.ONE, base, entry + usize.ONE)
+  List<u64>.truncate(&mut parser.keys, base)
+  if byteAt(&parser.*, parser.at) == 58 {
+    parser.at = parser.at + usize.ONE
+    run skipFlowSpace(&mut parser.*)
+  }
+  let value = byteAt(&parser.*, parser.at)
+  if value == 44 || value == 93 {
+    run pushSlot(&mut document.*, KIND_NULL, usize.ZERO, 0, parser.at, parser.at)
+  } else {
+    run parseFlowNode(&mut parser.*, &mut document.*)
+  }
+  closeSlot(&mut document.*, entry, usize.ONE, parser.at)
+  parser.depth = parser.depth - usize.ONE
+  return ()
+}
+
+// Parses one `key: value` entry of a flow mapping. A key without `:` has a null value.
+effect fn flowEntry(parser: &mut Parser<'_>, document: &mut YamlDocument, base: usize, first: usize)
+  -> () ! YamlError | OutOfMemoryError ? &mut Allocator {
+  if byteAt(&parser.*, parser.at) == 63 && isSpaceOrEnd(byteAt(&parser.*, parser.at + usize.ONE)) {
+    parser.at = parser.at + usize.ONE
+    run skipFlowSpace(&mut parser.*)
+  }
+  let mut props = noProps(parser.at)
+  run properties(&mut parser.*, &mut props)
+  let start = parser.at
+  let byte = byteAt(&parser.*, start)
+  let next = byteAt(&parser.*, start + usize.ONE)
+  if byte == 44 || byte == 125 {
+    // `{ ? }` and `{ ?, a }`: an empty key with a null value.
+    let none = Scalar { style: STYLE_PLAIN, start: start, end: start, close: start, simple: true }
+    run emitKey(&mut parser.*, &mut document.*, none, props, base, first)
+    return run pushSlot(&mut document.*, KIND_NULL, usize.ZERO, 0, start, start)
+  }
+  if byte == 42 || byte == 91 || byte == 123 || byte == 63 && isSpaceOrEnd(next) {
+    fail problem(YamlReason.UnsupportedKey, start)
+  }
+  let mut key = Scalar { style: STYLE_PLAIN, start: start, end: start, close: start, simple: true }
+  let mut adjacent = false
+  if byte == 58 && (isSpaceOrEnd(next) || isFlowIndicator(next)) {
+    // An empty key.
+  } else if byte == 34 || byte == 39 {
+    key = run scanQuoted(&mut parser.*)
+    adjacent = true
+  } else {
+    if byte == 44 || byte == 125 || byte == 93 || byte == 0 { fail problem(YamlReason.UnexpectedCharacter, start) }
+    let ended = scanPlainLine(&mut parser.*, true, &mut key)
+    if !ended { run continuePlain(&mut parser.*, usize.ZERO, true, &mut key) }
+  }
+  run emitKey(&mut parser.*, &mut document.*, key, props, base, first)
+  if !adjacent { run skipFlowSpace(&mut parser.*) }
+  let colon = byteAt(&parser.*, parser.at)
+  if colon != 58 {
+    if adjacent { run skipFlowSpace(&mut parser.*) }
+    if byteAt(&parser.*, parser.at) == 58 {
+      parser.at = parser.at + usize.ONE
+    } else {
+      return run pushSlot(&mut document.*, KIND_NULL, usize.ZERO, 0, parser.at, parser.at)
+    }
+  } else {
+    parser.at = parser.at + usize.ONE
+  }
+  run skipFlowSpace(&mut parser.*)
+  let value = byteAt(&parser.*, parser.at)
+  if value == 44 || value == 125 {
+    return run pushSlot(&mut document.*, KIND_NULL, usize.ZERO, 0, parser.at, parser.at)
+  }
+  return run parseFlowNode(&mut parser.*, &mut document.*)
+}
+
+// Parses one node inside a flow collection.
+effect fn parseFlowNode(parser: &mut Parser<'_>, document: &mut YamlDocument) -> () ! YamlError | OutOfMemoryError ? &mut Allocator {
+  let mut props = noProps(parser.at)
+  run properties(&mut parser.*, &mut props)
+  if props.present { run skipFlowSpace(&mut parser.*) }
+  let start = parser.at
+  let byte = byteAt(&parser.*, start)
+  let next = byteAt(&parser.*, start + usize.ONE)
+  if byte == 44 || byte == 93 || byte == 125 {
+    if !props.present { fail problem(YamlReason.UnexpectedCharacter, start) }
+    return run emitEmpty(&mut parser.*, &mut document.*, props)
+  }
+  if byte == 42 {
+    if props.present { fail problem(YamlReason.UnexpectedCharacter, start) }
+    return run alias(&mut parser.*, &mut document.*)
+  }
+  if byte == 91 || byte == 123 {
+    let index = List<Slot>.length(&document.slots)
+    run parseFlow(&mut parser.*, &mut document.*, props)
+    return run anchor(&mut parser.*, props, index)
+  }
+  if byte == 34 || byte == 39 {
+    let scalar = run scanQuoted(&mut parser.*)
+    return run emitScalar(&mut parser.*, &mut document.*, scalar, props)
+  }
+  if byte == 124 || byte == 62 || byte == 64 || byte == 96 || byte == 37 || byte == 35 ||
+    (byte == 45 || byte == 63 || byte == 58) && (isSpaceOrEnd(next) || isFlowIndicator(next)) || byte == 0 {
+    fail problem(YamlReason.UnexpectedCharacter, start)
+  }
+  let mut scalar = Scalar { style: STYLE_PLAIN, start: start, end: start, close: start, simple: true }
+  let ended = scanPlainLine(&mut parser.*, true, &mut scalar)
+  if !ended { run continuePlain(&mut parser.*, usize.ZERO, true, &mut scalar) }
+  return run emitScalar(&mut parser.*, &mut document.*, scalar, props)
+}
+
+// Replaces the alias under the cursor with a copy of the node its anchor names.
+effect fn alias(parser: &mut Parser<'_>, document: &mut YamlDocument) -> () ! YamlError | OutOfMemoryError ? &mut Allocator {
+  let start = parser.at
+  let nameStart = start + usize.ONE
+  let end = nameEnd(&parser.*, nameStart)
+  if end == nameStart { fail problem(YamlReason.UnexpectedCharacter, start) }
+  let name = Slice.view<u8>(parser.input, nameStart, end - nameStart)
+  let anchors = List<Anchor>.asSlice(&parser.anchors)
+  let mut found = anchors.length
+  while found > usize.ZERO {
+    let candidate = anchors[found - usize.ONE]
+    if sameBytes(Slice.view<u8>(parser.input, candidate.start, candidate.length), name) { break }
+    found = found - usize.ONE
+  }
+  if found == usize.ZERO { fail problem(YamlReason.UnknownAlias, start) }
+  let source = anchors[found - usize.ONE].slot
+  let last = slotEnd(&document.slots, source)
+  parser.copied = parser.copied + (last - source)
+  if parser.copied > MAX_ALIAS_NODES { fail problem(YamlReason.AliasLimit, start) }
+  let target = List<Slot>.length(&document.slots)
+  let shift = usize.toU64(target - source)
+  run List<Slot>.reserve(&mut document.slots, last - source)
+  let mut at = source
+  while at < last {
+    let mut slot = List<Slot>.get(&document.slots, at)
+    let kind = u64.bitAnd(slot.info, KIND_MASK)
+    if kind == KIND_SEQUENCE || kind == KIND_MAPPING { slot.payload = slot.payload + shift }
+    run List<Slot>.append(&mut document.slots, slot)
+    at = at + usize.ONE
+  }
+  let slots = List<Slot>.asMutSlice(&mut document.slots)
+  slots[target].span = u64.bitOr(usize.toU64(start), u64.shiftLeft(usize.toU64(end), 32))
+  parser.at = end
+  return ()
+}
+
+// ---------------------------------------------------------------------------------------------
+// Block scalars
+
+effect fn parseBlockScalar(parser: &mut Parser<'_>, document: &mut YamlDocument, parent: usize, props: Props)
+  -> () ! YamlError | OutOfMemoryError ? &mut Allocator {
+  let index = List<Slot>.length(&document.slots)
+  let header = parser.at
+  let literal = byteAt(&parser.*, header) == 124
+  parser.at = header + usize.ONE
+  // 0 strips the final line breaks, 1 keeps one, 2 keeps them all.
+  let mut chomp = usize.ONE
+  let mut explicit = usize.ZERO
+  let mut seen = usize.ZERO
+  while seen < 2 {
+    let byte = byteAt(&parser.*, parser.at)
+    if byte == 45 && chomp == usize.ONE {
+      chomp = usize.ZERO
+    } else if byte == 43 && chomp == usize.ONE {
+      chomp = 2
+    } else if byte >= 49 && byte <= 57 && explicit == usize.ZERO {
+      explicit = u8.toUsize(byte - 48)
+    } else {
+      break
+    }
+    parser.at = parser.at + usize.ONE
+    seen = seen + usize.ONE
+  }
+  if !isSpaceOrEnd(byteAt(&parser.*, parser.at)) { fail problem(YamlReason.InvalidBlockScalar, parser.at) }
+  skipInline(&mut parser.*)
+  if byteAt(&parser.*, parser.at) == 35 { skipLine(&mut parser.*) }
+  if !isBreakOrEnd(byteAt(&parser.*, parser.at)) { fail problem(YamlReason.InvalidBlockScalar, parser.at) }
+  consumeBreak(&mut parser.*)
+  let input = parser.input
+  let length = input.length
+  // Find the content indentation: the explicit one, or that of the first line with content.
+  let mut indent = usize.ZERO
+  if explicit != usize.ZERO {
+    indent = parent + explicit - usize.ONE
+  } else {
+    let mut probe = parser.at
+    let mut widest = usize.ZERO
+    while true {
+      let lineStart = probe
+      while probe < length && input[probe] == 32 { probe = probe + usize.ONE }
+      let spaces = probe - lineStart
+      if probe >= length && spaces > widest { widest = spaces }
+      if probe < length && (input[probe] == 10 || input[probe] == 13) {
+        if spaces > widest { widest = spaces }
+        if input[probe] == 13 && probe + usize.ONE < length && input[probe + usize.ONE] == 10 { probe = probe + usize.ONE }
+        probe = probe + usize.ONE
+        continue
+      }
+      indent = spaces
+      if probe >= length || spaces < parent {
+        // No line has content: the longest empty line sets the indentation.
+        indent = widest
+        if indent < parent { indent = parent }
+      } else if widest > indent {
+        fail problem(YamlReason.InvalidBlockScalar, lineStart)
+      }
+      break
+    }
+  }
+  let offset = Bytes.length(&document.text)
+  // Line breaks seen after the last content line, and whether that line was more indented.
+  let mut breaks = usize.ZERO
+  let mut written = false
+  let mut previousMore = false
+  let mut end = parser.at
+  while parser.at < length {
+    let lineStart = parser.at
+    let mut at = lineStart
+    while at < length && input[at] == 32 && at - lineStart < indent { at = at + usize.ONE }
+    if at < length && (input[at] == 10 || input[at] == 13) || at >= length {
+      // An empty line, or one with only indentation. The end of the input ends a line too.
+      if at >= length {
+        if at > lineStart { breaks = breaks + usize.ONE }
+        parser.at = at
+        break
+      }
+      parser.at = at
+      consumeBreak(&mut parser.*)
+      breaks = breaks + usize.ONE
+      continue
+    }
+    if at - lineStart < indent && input[at] == 9 { fail problem(YamlReason.TabIndentation, at) }
+    if at - lineStart < indent {
+      // A less indented line with content ends the scalar, unless it is all blanks.
+      let mut probe = at
+      while probe < length && isBlank(input[probe]) { probe = probe + usize.ONE }
+      if probe < length && (input[probe] == 10 || input[probe] == 13) {
+        parser.at = probe
+        consumeBreak(&mut parser.*)
+        breaks = breaks + usize.ONE
+        continue
+      }
+      break
+    }
+    if lineStart == parser.line && indent == usize.ZERO && atMarker(&parser.*) { break }
+    let contentStart = at
+    let more = isBlank(input[at])
+    while at < length && input[at] != 10 && input[at] != 13 { at = at + usize.ONE }
+    if written {
+      if !literal && !more && !previousMore && breaks == usize.ONE {
+        run appendByte(&mut document.*, 32)
+      } else {
+        let mut count = usize.ZERO
+        let mut needed = breaks
+        if !literal && !more && !previousMore { needed = breaks - usize.ONE }
+        while count < needed {
+          run appendByte(&mut document.*, 10)
+          count = count + usize.ONE
+        }
+      }
+    } else {
+      let mut count = usize.ZERO
+      while count < breaks {
+        run appendByte(&mut document.*, 10)
+        count = count + usize.ONE
+      }
+    }
+    run appendSource(input, &mut document.*, contentStart, at)
+    written = true
+    previousMore = more
+    end = at
+    parser.at = at
+    breaks = usize.ONE
+    if at < length { consumeBreak(&mut parser.*) }
+  }
+  if chomp == 2 {
+    let mut count = usize.ZERO
+    while count < breaks {
+      run appendByte(&mut document.*, 10)
+      count = count + usize.ONE
+    }
+  } else if chomp == usize.ONE && written && breaks > usize.ZERO {
+    run appendByte(&mut document.*, 10)
+  }
+  // Leave the cursor at the start of the line after the scalar.
+  parser.at = parser.line
+  if parser.at < end { parser.at = end }
+  let size = Bytes.length(&document.text) - offset
+  if props.tag == TAG_NULL || props.tag == TAG_INT || props.tag == TAG_FLOAT || props.tag == TAG_BOOL {
+    fail problem(YamlReason.InvalidTag, header)
+  }
+  run pushSlot(&mut document.*, KIND_STRING, size, usize.toU64(offset), props.start, end)
+  return run anchor(&mut parser.*, props, index)
+}
