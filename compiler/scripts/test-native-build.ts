@@ -1990,7 +1990,7 @@ const program = Effect.gen(function* () {
     { ...process.env, SILK_CLANG: clang },
   )
   assert.equal(unclosed.status, 1, unclosed.stderr)
-  assert.match(unclosed.stderr, /^ {2}check {4}failed: 1 module, 1 error/m)
+  assert.match(unclosed.stderr, /^ {2}check {5}failed: 1 module, 1 error/m)
   assert.match(unclosed.stderr, /^src\/main\.silk:3:1: error\[PAR0001\] Expected `\}`$/m)
   assert.doesNotMatch(unclosed.stderr, /codegen/)
   // A file with a syntax error keeps no import summary, so the next load parses it and reports it again.
@@ -4583,7 +4583,7 @@ const program = Effect.gen(function* () {
   assert.deepEqual((yield* fs.stat(releaseExecutable)).mtime, releasedAt, 'an unchanged release rebuild leaves the executable as it was')
   // A release link that runs again, as one with a link input read from outside the build does
   // every time, links the module's cached object instead of optimizing the module again.
-  yield* fs.remove(`${releaseExecutable}.units/link`)
+  yield* fs.remove(releaseExecutable)
   const relinked = yield* releaseBuild()
   assert.doesNotMatch(relinked, /optimize/, relinked)
   assert.match(relinked, /^  link      clang +[0-9.ms ]+s$/m, relinked)
