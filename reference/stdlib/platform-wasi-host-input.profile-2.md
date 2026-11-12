@@ -85,6 +85,16 @@ effect fn variable(self: &mut Self, name: &[u8]) -> Option<Bytes>
       ? &mut Allocator
 ```
 
+<a id="WasiHostInput.impl.HostInput.variableNames"></a>
+
+### Operation `variableNames`
+
+```silk
+effect fn variableNames(self: &mut Self) -> List<Bytes>
+      ! HostInputError | OutOfMemoryError
+      ? &mut Allocator
+```
+
 <a id="WasiHostInput.impl.HostInput.workingDirectory"></a>
 
 ### Operation `workingDirectory`

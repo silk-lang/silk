@@ -189,6 +189,24 @@ its full length, or `None`.
 The name must match byte for byte. An empty value returns `Some(0)`. A name with NUL or `=`
 never matches. Entries without `=` are ignored.
 
+<a id="NativeHostInput.impl.variableNames"></a>
+
+### Method `variableNames`
+
+```silk
+pub effect fn variableNames(self: &Self) -> List<Bytes> ! OutOfMemoryError ? &mut Allocator
+```
+
+Returns copies of the names of the variables in the snapshot, in order.
+
+#### Details
+A name is the bytes before the first `=` of an entry. Entries without `=` are left out, and a
+name that appears again is left out too, because [`NativeHostInput.variable`](#NativeHostInput.impl.variable) finds only the
+first.
+
+#### Errors
+- `OutOfMemoryError` if the `Allocator` cannot supply the copies.
+
 <a id="NativeHostInput.impl.workingDirectory"></a>
 
 ### Associated function `workingDirectory`
