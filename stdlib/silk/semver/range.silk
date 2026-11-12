@@ -1,0 +1,1129 @@
+//! Version ranges in the npm and Cargo syntaxes: parse a requirement and test versions against it.
+//!
+//! # When to use
+//!
+//! Use [`VersionRange.parseNpm`] for ranges from `package.json`, such as `^1.2.3 || >=2.1.0 <3`,
+//! and [`VersionRange.parseCargo`] for requirements from `Cargo.toml`, such as `>=1.2, <1.5`. Then
+//! call [`VersionRange.matches`] for each version, or [`VersionRange.bestMatch`] to pick the
+//! highest one that matches.
+//!
+//! # Details
+//!
+//! A [`VersionRange`] borrows its text and does not allocate. Parsing checks the whole text, and
+//! each match reads the text again, so a match costs time in proportion to the length of the range.
+//!
+//! The two syntaxes give different meanings to the same text:
+//!
+//! | Text | npm | Cargo |
+//! | --- | --- | --- |
+//! | `1.2.3` | exactly `1.2.3` | `^1.2.3` |
+//! | `^1.2.3` | `>=1.2.3, <2.0.0` | `>=1.2.3, <2.0.0` |
+//! | `~1.2.3` | `>=1.2.3, <1.3.0` | `>=1.2.3, <1.3.0` |
+//! | `1.2.x`, `1.2.*` | `>=1.2.0, <1.3.0` | `>=1.2.0, <1.3.0` |
+//! | `>=1 <2`, `>=1, <2` | space means AND | comma means AND |
+//! | `a || b` | either range | not valid |
+//! | `1.0.0 - 2.0.0` | `>=1.0.0, <=2.0.0` | not valid |
+//!
+//! In both syntaxes, a pre-release version such as `1.3.0-beta` matches only if a comparator of the
+//! range names a pre-release of the same `MAJOR.MINOR.PATCH`. So `^1.2.3` does not match
+//! `1.3.0-beta`, but `>=1.3.0-alpha` matches `1.3.0-beta`. Use
+//! [`VersionRange.matchesIncludingPrerelease`] to drop that rule.
+//!
+//! # Gotchas
+//!
+//! The npm parser follows the strict mode of the `semver` package: loose forms such as `01.2.3` or
+//! `1.2.3beta` are errors. Build metadata in a range is accepted only after a full version, and it
+//! does not change the result.
+//!
+//! # Examples
+//!
+//! ## Pick the newest compatible version
+//!
+//! ```silk
+//! import silk.core.option { Option }
+//! import silk.core.result { Result }
+//! import silk.semver.range { VersionRange }
+//! import silk.semver.version { Version, SemverError }
+//!
+//! pub fn main() -> i32 {
+//!   let range = match VersionRange.parseNpm("^1.2.0") {
+//!     Result<VersionRange, SemverError>.Success { value } => value
+//!     Result<VersionRange, SemverError>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   let versions = [Version.make(1, 1, 9), Version.make(1, 4, 2), Version.make(2, 0, 0)]
+//!   return match range.bestMatch(&versions) {
+//!     Option<usize>.Some { value } => {
+//!       if value != 1 {
+//!         return 1
+//!       }
+//!       return 0
+//!     }
+//!     Option<usize>.None => 1
+//!   }
+//! }
+//! ```
+//!
+//! # See also
+//!
+//! The [npm range grammar](https://github.com/npm/node-semver#ranges) and the
+//! [Cargo requirement syntax](https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html)
+//! define the two syntaxes.
+//!
+//! @category Data formats
+
+import silk.core.option { Option }
+import silk.core.order { Ordering }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.io.writer { Writer, WriterError }
+import silk.semver.version { SemverError, SemverErrorReason, Version }
+import silk.text.format { Debug, Display, Format, Formatter }
+import silk.text.string { String }
+import silk.collections.slice { Slice }
+import silk.num.u8
+import silk.num.u64
+
+/// The syntax of a [`VersionRange`]: the npm range syntax or the Cargo requirement syntax.
+pub enum RangeSyntax {
+  /// The `semver` package syntax of npm, with `||`, spaces for AND, hyphen ranges, and exact bare
+  /// versions.
+  Npm,
+  /// The Cargo syntax, with commas for AND and bare versions that mean `^`.
+  Cargo,
+}
+
+/// A parsed version range that borrows its text.
+///
+/// # Details
+///
+/// Make one with [`VersionRange.parseNpm`] or [`VersionRange.parseCargo`]. The value is `Copy`,
+/// does not allocate, and cannot live longer than its text. Each match reads the text again, so it
+/// costs time in proportion to the length of the range.
+///
+/// A pre-release version matches only if a comparator of the range names a pre-release of the same
+/// `MAJOR.MINOR.PATCH`. [`VersionRange.matchesIncludingPrerelease`] drops that rule.
+pub struct VersionRange<'text> {
+  source: string<'text>,
+  form: RangeSyntax,
+}
+
+impl<'text> Copy for VersionRange<'text> {}
+
+impl<'text> VersionRange<'text> {
+  /// Parses a range in the npm syntax of the `semver` package, such as `^1.2.3 || >=2.1.0 <3`.
+  ///
+  /// # Details
+  ///
+  /// `||` separates alternatives, and spaces separate comparators that must all match. Each
+  /// comparator is one of these forms. `M`, `m`, and `p` are numbers, and any of them can be `x`,
+  /// `X`, or `*`, or be left out, to match any value.
+  ///
+  /// - `1.2.3` or `=1.2.3`: exactly that version. `1.2` means `>=1.2.0 <1.3.0`, and `*` or empty
+  ///   text means any version.
+  /// - `>1.2.3`, `>=1.2.3`, `<1.2.3`, `<=1.2.3`: comparisons. A partial version counts as its range,
+  ///   so `<=1.2` means `<1.3.0` and `>1.2` means `>=1.3.0`.
+  /// - `^1.2.3`: changes that do not modify the leftmost nonzero number, `>=1.2.3 <2.0.0`. `^0.2.3`
+  ///   means `>=0.2.3 <0.3.0`, and `^0.0.3` means `>=0.0.3 <0.0.4`.
+  /// - `~1.2.3` or `~>1.2.3`: patch changes, `>=1.2.3 <1.3.0`. `~1` means `>=1.0.0 <2.0.0`.
+  /// - `1.2.3 - 2.3.4`: inclusive, `>=1.2.3 <=2.3.4`. A partial upper end counts as its range, so
+  ///   `1.2.3 - 2.3` means `>=1.2.3 <2.4.0`.
+  ///
+  /// An operator can have spaces after it, and a version can have a `v` prefix. Upper bounds made
+  /// from partial versions exclude the pre-releases of the bound, so `^1.2.3` does not match
+  /// `2.0.0-rc.1`.
+  ///
+  /// # Errors
+  ///
+  /// - `SemverError` with the reason and byte offset of the first problem, such as
+  ///   `UnexpectedCharacter` for an unknown operator or a single `|`, `LeadingZero` for `01`, and
+  ///   `UnexpectedEnd` for an operator with no version after it.
+  ///
+  /// # Gotchas
+  ///
+  /// A bare `1.2.3` matches only `1.2.3` in npm, but means `^1.2.3` in Cargo. Loose forms that the
+  /// `semver` package accepts only with its `loose` option, such as `01.2.3`, are errors.
+  pub fn parseNpm(text: string<'text>) -> Result<VersionRange<'text>, SemverError> {
+    return check(VersionRange<'text> { source: text, form: RangeSyntax.Npm })
+  }
+
+  /// Parses a requirement in the Cargo syntax, such as `>=1.2, <1.5` or `0.4`.
+  ///
+  /// # Details
+  ///
+  /// Commas separate comparators that must all match. Each comparator is an optional operator and a
+  /// version, where the minor and patch numbers can be left out:
+  ///
+  /// - `1.2.3` or `^1.2.3`: changes that do not modify the leftmost nonzero number, `>=1.2.3,
+  ///   <2.0.0`. `^0.2.3` means `>=0.2.3, <0.3.0`, `^0.0.3` means `=0.0.3`, and `^0` means `<1.0.0`.
+  /// - `~1.2.3`: patch changes, `>=1.2.3, <1.3.0`. `~1` means `>=1.0.0, <2.0.0`.
+  /// - `=1.2.3`, `>1.2.3`, `>=1.2.3`, `<1.2.3`, `<=1.2.3`: comparisons. A partial version counts as
+  ///   its range, so `=1.2` means `>=1.2.0, <1.3.0` and `>1.2` means `>=1.3.0`.
+  /// - `1.*`, `1.2.*`, or `*` alone: wildcards, also spelled with `x` or `X`.
+  ///
+  /// Spaces can come before and after each comparator and after an operator.
+  ///
+  /// # Errors
+  ///
+  /// - `SemverError` with the reason and byte offset of the first problem:
+  ///   - `Empty` for empty text or text of only spaces.
+  ///   - `UnexpectedCharacter` for a byte that is not valid there, such as a missing comma, a `v`
+  ///     prefix, `||`, a hyphen range, or `*` together with other comparators.
+  ///   - `UnexpectedEnd`, `LeadingZero`, `NumberTooLarge`, or `EmptyIdentifier` for a bad version.
+  ///   - `TooManyComparators` for more than 32 comparators, which Cargo also rejects.
+  ///
+  /// # Gotchas
+  ///
+  /// A bare version means `^`, so `1.2.3` matches `1.9.0`. Write `=1.2.3` for exactly one version.
+  pub fn parseCargo(text: string<'text>) -> Result<VersionRange<'text>, SemverError> {
+    return check(VersionRange<'text> { source: text, form: RangeSyntax.Cargo })
+  }
+
+  /// Returns the text of the range, as it was parsed.
+  pub fn text(self: &Self) -> string<'text> {
+    return self.source
+  }
+
+  /// Returns the syntax that the range was parsed with.
+  pub fn syntax(self: &Self) -> RangeSyntax {
+    return self.form
+  }
+
+  /// Returns `true` if `version` is in the range.
+  ///
+  /// # Details
+  ///
+  /// A pre-release version matches only if it is in the range and a comparator in the same
+  /// alternative names a pre-release with the same `MAJOR.MINOR.PATCH`. So `>=1.2.3-alpha` matches
+  /// `1.2.3-beta` but not `1.2.4-beta`, and `^1.2.3` matches no pre-release. Build metadata of
+  /// `version` does not count.
+  pub fn matches(self: &Self, version: &Version<'_>) -> bool {
+    return evaluate(&self, version, false)
+  }
+
+  /// Returns `true` if `version` is in the range, with pre-releases treated as other versions.
+  ///
+  /// # Details
+  ///
+  /// For an npm range, this is the `includePrerelease` option of the `semver` package: the bounds
+  /// of `^`, `~`, `x`, and hyphen ranges include their pre-releases, so `^1.2.3` matches
+  /// `1.4.0-beta` and `1.x` matches `1.0.0-rc.1`. For a Cargo range, only the rule that a
+  /// pre-release needs a comparator with a pre-release of the same `MAJOR.MINOR.PATCH` is dropped.
+  /// Build metadata of `version` does not count.
+  pub fn matchesIncludingPrerelease(self: &Self, version: &Version<'_>) -> bool {
+    return evaluate(&self, version, true)
+  }
+
+  /// Returns the position of the highest version in `versions` that the range matches, or `None`.
+  ///
+  /// # Details
+  ///
+  /// Matching uses [`VersionRange.matches`], so pre-releases match only by that rule. Versions
+  /// compare by precedence and then build metadata, and the first of two equal versions wins.
+  pub fn bestMatch(self: &Self, versions: &[Version<'_>]) -> Option<usize> {
+    let mut best = Option<usize>.none()
+    let mut index: usize = 0
+    while index < versions.length {
+      if self.matches(&versions[index]) {
+        let better = match &best {
+          Option<usize>.Some { value } => &versions[index] > &versions[value]
+          Option<usize>.None => true
+        }
+        if better {
+          best = Option<usize>.some(index)
+        }
+      }
+      index = index + 1
+    }
+    return best
+  }
+}
+
+impl<'text> Display for VersionRange<'text> {
+  /// Writes the text of the range, as it was parsed. Writer failures propagate unchanged.
+  effect fn display(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return run Format.writeText(&mut formatter, self.source)
+  }
+}
+
+impl<'text> Debug for VersionRange<'text> {
+  /// Writes the text of the range, as it was parsed. Writer failures propagate unchanged.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return run Format.writeText(&mut formatter, self.source)
+  }
+}
+
+// Parsing runs the matcher once on any version: every error comes from the shared scan.
+fn check<'text>(range: VersionRange<'text>) -> Result<VersionRange<'text>, SemverError> {
+  let probe = Version.make(0, 0, 0)
+  let result = match range.form {
+    RangeSyntax.Npm => npmRange(range.source, &probe, false)
+    RangeSyntax.Cargo => cargoRange(range.source, &probe, false)
+  }
+  return match move result {
+    Result<bool, SemverError>.Success { value: _ } => Result<
+      VersionRange<'text>,
+      SemverError
+    >.succeed(range)
+    Result<bool, SemverError>.Failure { error } => Result<
+      VersionRange<'text>,
+      SemverError
+    >.failResult(error)
+  }
+}
+
+fn evaluate(range: &VersionRange<'_>, version: &Version<'_>, include: bool) -> bool {
+  let result = match range.form {
+    RangeSyntax.Npm => npmRange(range.source, version, include)
+    RangeSyntax.Cargo => cargoRange(range.source, version, include)
+  }
+  return match move result {
+    Result<bool, SemverError>.Success { value } => value
+    Result<bool, SemverError>.Failure { error: _ } => false
+  }
+}
+
+fn syntaxError(reason: SemverErrorReason, offset: usize) -> SemverError {
+  return SemverError { reason: reason, offset: offset }
+}
+
+fn isDigit(byte: u8) -> bool {
+  return byte >= 48 && byte <= 57
+}
+
+fn isIdentifierByte(byte: u8) -> bool {
+  return isDigit(byte) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 45
+}
+
+fn isWildcard(byte: u8) -> bool {
+  return byte == 120 || byte == 88 || byte == 42
+}
+
+fn isSpace(byte: u8) -> bool {
+  return byte == 32 || (byte >= 9 && byte <= 13)
+}
+
+// A comparison against one full version. `op` is one of the `less`... constants below.
+struct Bound<'text> {
+  op: u8,
+  version: Version<'text>,
+}
+
+impl<'text> Copy for Bound<'text> {}
+
+fn less() -> u8 {
+  return 0
+}
+
+fn lessEqual() -> u8 {
+  return 1
+}
+
+fn greater() -> u8 {
+  return 2
+}
+
+fn greaterEqual() -> u8 {
+  return 3
+}
+
+fn equal() -> u8 {
+  return 4
+}
+
+// The running result of one npm alternative or one Cargo requirement: whether every comparator
+// so far holds, whether one names a pre-release of the version's numbers, and whether one can
+// never hold.
+struct SetState {
+  holds: bool,
+  allowsPrerelease: bool,
+}
+
+fn sameNumbers(left: &Version<'_>, right: &Version<'_>) -> bool {
+  return left.major == right.major && left.minor == right.minor && left.patch == right.patch
+}
+
+fn apply(state: &mut SetState, bound: &Bound<'_>, version: &Version<'_>) -> () {
+  let order = Version.comparePrecedence(version, &bound.version)
+  let holds = if bound.op == less() {
+    order == Ordering.Less
+  } else if bound.op == lessEqual() {
+    order != Ordering.Greater
+  } else if bound.op == greater() {
+    order == Ordering.Greater
+  } else if bound.op == greaterEqual() {
+    order != Ordering.Less
+  } else {
+    order == Ordering.Equal
+  }
+  if !holds {
+    state.holds = false
+  }
+  if bound.version.isPrerelease() && sameNumbers(&bound.version, version) {
+    state.allowsPrerelease = true
+  }
+  return ()
+}
+
+fn finish(state: &SetState, version: &Version<'_>, include: bool) -> bool {
+  if !state.holds {
+    return false
+  }
+  return include || !version.isPrerelease() || state.allowsPrerelease
+}
+
+fn at<'text>(major: u64, minor: u64, patch: u64, prerelease: string<'text>) -> Version<'text> {
+  return Version<'text> {
+    major: major,
+    minor: minor,
+    patch: patch,
+    prerelease: prerelease,
+    build: "",
+  }
+}
+
+// A version as written in a range: `parts` numbers before the first wildcard or the end, and
+// whether a wildcard was written.
+struct Partial<'text> {
+  parts: u8,
+  wild: bool,
+  major: u64,
+  minor: u64,
+  patch: u64,
+  prerelease: string<'text>,
+  end: usize,
+}
+
+impl<'text> Copy for Partial<'text> {}
+
+// Reads one number and returns its value and end, or an error.
+fn number(bytes: &[u8], start: usize) -> Result<Partial<'static>, SemverError> {
+  if start >= bytes.length {
+    return Result<Partial<'static>, SemverError>.failResult(
+      syntaxError(SemverErrorReason.UnexpectedEnd, start),
+    )
+  }
+  if !isDigit(bytes[start]) {
+    return Result<Partial<'static>, SemverError>.failResult(
+      syntaxError(SemverErrorReason.UnexpectedCharacter, start),
+    )
+  }
+  let mut index = start
+  let mut value: u64 = 0
+  while index < bytes.length && isDigit(bytes[index]) {
+    if index > start && bytes[start] == 48 {
+      return Result<Partial<'static>, SemverError>.failResult(
+        syntaxError(SemverErrorReason.LeadingZero, start),
+      )
+    }
+    let digit = u8.toU64(bytes[index] - 48)
+    if value > (u64.MAX - digit) / 10 {
+      return Result<Partial<'static>, SemverError>.failResult(
+        syntaxError(SemverErrorReason.NumberTooLarge, start),
+      )
+    }
+    value = value * 10 + digit
+    index = index + 1
+  }
+  return Result<Partial<'static>, SemverError>.succeed(
+    Partial<'static> {
+      parts: 1,
+      wild: false,
+      major: value,
+      minor: 0,
+      patch: 0,
+      prerelease: "",
+      end: index,
+    },
+  )
+}
+
+// Reads a partial version from `start` up to `stop`, the end of its token. After a wildcard, every
+// later part must be a wildcard. A pre-release is read by `Version.parse` and needs all three
+// numbers. Npm allows a wildcard major and build metadata after any partial version; Cargo allows
+// neither.
+fn partial<'text>(text: string<'text>, start: usize, stop: usize, npm: bool) -> Result<
+  Partial<'text>,
+  SemverError
+> {
+  let bytes = String.utf8Bytes(text)
+  let mut result = Partial<'text> {
+    parts: 0,
+    wild: false,
+    major: 0,
+    minor: 0,
+    patch: 0,
+    prerelease: "",
+    end: start,
+  }
+  let mut index = start
+  let mut wild = false
+  let mut part: u8 = 0
+  while part < 3 {
+    if part > 0 {
+      if index >= stop || bytes[index] != 46 {
+        break
+      }
+      index = index + 1
+    }
+    if index < stop && isWildcard(bytes[index]) && (part > 0 || npm) {
+      wild = true
+      index = index + 1
+    } else if wild {
+      if index >= stop {
+        return Result<Partial<'text>, SemverError>.failResult(
+          syntaxError(SemverErrorReason.UnexpectedEnd, index),
+        )
+      }
+      return Result<Partial<'text>, SemverError>.failResult(
+        syntaxError(SemverErrorReason.UnexpectedCharacter, index),
+      )
+    } else {
+      let read = match number(Slice.view<u8>(bytes, 0, stop), index) {
+        Result<Partial<'static>, SemverError>.Success { value } => value
+        Result<Partial<'static>, SemverError>.Failure { error } => {
+          return Result<Partial<'text>, SemverError>.failResult(error)
+        }
+      }
+      if part == 0 {
+        result.major = read.major
+      } else if part == 1 {
+        result.minor = read.major
+      } else {
+        result.patch = read.major
+      }
+      result.parts = part + 1
+      index = read.end
+    }
+    part = part + 1
+  }
+  if index < stop && (bytes[index] == 45 || bytes[index] == 43) && !wild && result.parts == 3 {
+    let full = match Version.parse(String.slice(text, start, stop - start)) {
+      Result<Version<'text>, SemverError>.Success { value } => value
+      Result<Version<'text>, SemverError>.Failure { error } => {
+        return Result<Partial<'text>, SemverError>.failResult(
+          syntaxError(error.reason, error.offset + start),
+        )
+      }
+    }
+    result.prerelease = full.prerelease
+    index = stop
+  } else if npm && index < stop && bytes[index] == 43 {
+    index = index + 1
+    while true {
+      let first = index
+      while index < stop && isIdentifierByte(bytes[index]) {
+        index = index + 1
+      }
+      if index == first {
+        return Result<Partial<'text>, SemverError>.failResult(
+          syntaxError(SemverErrorReason.EmptyIdentifier, index),
+        )
+      }
+      if index < stop && bytes[index] == 46 {
+        index = index + 1
+      } else {
+        break
+      }
+    }
+  }
+  result.end = index
+  result.wild = wild
+  return Result<Partial<'text>, SemverError>.succeed(result)
+}
+
+// Npm ranges. The desugaring follows the `semver` package: each comparator becomes zero, one, or
+// two bounds, and `<X.Y.Z-0` is the lowest version with the numbers `X.Y.Z`.
+
+fn npmRange(text: string, version: &Version<'_>, include: bool) -> Result<bool, SemverError> {
+  let bytes = String.utf8Bytes(text)
+  let mut start: usize = 0
+  let mut found = false
+  while true {
+    let mut stop = start
+    while stop < bytes.length && bytes[stop] != 124 {
+      stop = stop + 1
+    }
+    match npmAlternative(text, start, stop, version, include) {
+      Result<bool, SemverError>.Success { value } => {
+        if value {
+          found = true
+        }
+      }
+      Result<bool, SemverError>.Failure { error } => {
+        return Result<bool, SemverError>.failResult(error)
+      }
+    }
+    if stop >= bytes.length {
+      break
+    }
+    if stop + 1 >= bytes.length || bytes[stop + 1] != 124 {
+      return Result<bool, SemverError>.failResult(
+        syntaxError(SemverErrorReason.UnexpectedCharacter, stop),
+      )
+    }
+    start = stop + 2
+  }
+  return Result<bool, SemverError>.succeed(found)
+}
+
+fn skipSpaces(bytes: &[u8], start: usize, stop: usize) -> usize {
+  let mut index = start
+  while index < stop && isSpace(bytes[index]) {
+    index = index + 1
+  }
+  return index
+}
+
+fn tokenEnd(bytes: &[u8], start: usize, stop: usize) -> usize {
+  let mut index = start
+  while index < stop && !isSpace(bytes[index]) {
+    index = index + 1
+  }
+  return index
+}
+
+// Returns the length of the operator at `start`: `<`, `<=`, `>`, `>=`, `=`, `~`, `~>`, or `^`.
+fn operatorLength(bytes: &[u8], start: usize, stop: usize) -> usize {
+  if start >= stop {
+    return 0
+  }
+  let first = bytes[start]
+  let second: u8 = if start + 1 < stop {
+    bytes[start + 1]
+  } else {
+    0
+  }
+  if first == 60 || first == 62 {
+    if second == 61 {
+      return 2
+    }
+    return 1
+  }
+  if first == 126 {
+    if second == 62 {
+      return 2
+    }
+    return 1
+  }
+  if first == 61 || first == 94 {
+    return 1
+  }
+  return 0
+}
+
+fn npmAlternative(
+  text: string,
+  start: usize,
+  stop: usize,
+  version: &Version<'_>,
+  include: bool,
+) -> Result<bool, SemverError> {
+  let bytes = String.utf8Bytes(text)
+  let mut state = SetState { holds: true, allowsPrerelease: false }
+
+  // A hyphen range is exactly three tokens with `-` in the middle.
+  let first = skipSpaces(bytes, start, stop)
+  let firstEnd = tokenEnd(bytes, first, stop)
+  let middle = skipSpaces(bytes, firstEnd, stop)
+  let middleEnd = tokenEnd(bytes, middle, stop)
+  let last = skipSpaces(bytes, middleEnd, stop)
+  let lastEnd = tokenEnd(bytes, last, stop)
+  if middleEnd == middle + 1 && bytes[middle] == 45 && last < stop
+    && skipSpaces(bytes, lastEnd, stop) == stop {
+    let from = match npmVersion(text, first, firstEnd) {
+      Result<Partial, SemverError>.Success { value } => value
+      Result<Partial, SemverError>.Failure { error } => {
+        return Result<bool, SemverError>.failResult(error)
+      }
+    }
+    let to = match npmVersion(text, last, lastEnd) {
+      Result<Partial, SemverError>.Success { value } => value
+      Result<Partial, SemverError>.Failure { error } => {
+        return Result<bool, SemverError>.failResult(error)
+      }
+    }
+    hyphen(&mut state, &from, &to, version, include)
+    return Result<bool, SemverError>.succeed(finish(&state, version, include))
+  }
+  let mut index = first
+  while index < stop {
+    let opStart = index
+    let opLength = operatorLength(bytes, index, stop)
+    let mut operandStart = index + opLength
+
+    // An operator alone in its token takes the next token as its version.
+    if opLength > 0 && (operandStart >= stop || isSpace(bytes[operandStart])) {
+      operandStart = skipSpaces(bytes, operandStart, stop)
+      if operandStart >= stop {
+        return Result<bool, SemverError>.failResult(
+          syntaxError(SemverErrorReason.UnexpectedEnd, operandStart),
+        )
+      }
+    }
+    let operandEnd = tokenEnd(bytes, operandStart, stop)
+    let operand = match npmVersion(text, operandStart, operandEnd) {
+      Result<Partial, SemverError>.Success { value } => value
+      Result<Partial, SemverError>.Failure { error } => {
+        return Result<bool, SemverError>.failResult(error)
+      }
+    }
+    npmComparator(&mut state, Slice.view<u8>(bytes, opStart, opLength), &operand, version, include)
+    index = skipSpaces(bytes, operandEnd, stop)
+  }
+  return Result<bool, SemverError>.succeed(finish(&state, version, include))
+}
+
+// Reads an npm version token: an optional `v` and a partial version that fills the whole token.
+fn npmVersion<'text>(text: string<'text>, start: usize, stop: usize) -> Result<
+  Partial<'text>,
+  SemverError
+> {
+  let bytes = String.utf8Bytes(text)
+  let mut index = start
+  if index < stop && bytes[index] == 118 {
+    index = index + 1
+  }
+  let read = partial(text, index, stop, true)
+  match &read {
+    Result<Partial<'text>, SemverError>.Success { value } => {
+      if value.end < stop {
+        return Result<Partial<'text>, SemverError>.failResult(
+          syntaxError(SemverErrorReason.UnexpectedCharacter, value.end),
+        )
+      }
+    }
+    Result<Partial<'text>, SemverError>.Failure { error: _ } => {}
+  }
+  return move read
+}
+
+// The lowest version with the given numbers when pre-releases are included, `X.Y.Z-0`, or `X.Y.Z`.
+fn lowest(major: u64, minor: u64, patch: u64, include: bool) -> Version<'static> {
+  if include {
+    return at(major, minor, patch, "0")
+  }
+  return at(major, minor, patch, "")
+}
+
+fn bound(state: &mut SetState, op: u8, value: Version<'_>, version: &Version<'_>) -> () {
+  let made = Bound { op: op, version: value }
+  apply(&mut state, &made, version)
+  return ()
+}
+
+fn never(state: &mut SetState) -> () {
+  state.holds = false
+  return ()
+}
+
+// The lowest version above every version that starts with the first `parts` numbers: `M+1.0.0`
+// for one part, `M.m+1.0` for two, and `M.m.p+1` for three. A number that cannot grow moves the
+// step to the part before it, and `None` means that no such version exists.
+fn ceiling(major: u64, minor: u64, patch: u64, parts: u8) -> Option<Version<'static>> {
+  if parts >= 3 && patch < u64.MAX {
+    return Option<Version<'static>>.some(at(major, minor, patch + 1, ""))
+  }
+  if parts >= 2 && minor < u64.MAX {
+    return Option<Version<'static>>.some(at(major, minor + 1, 0, ""))
+  }
+  if parts >= 1 && major < u64.MAX {
+    return Option<Version<'static>>.some(at(major + 1, 0, 0, ""))
+  }
+  return Option<Version<'static>>.none()
+}
+
+// Adds `<C-0` for the ceiling `C` of the first `parts` numbers, so the bound also excludes the
+// pre-releases of `C`. Without a ceiling, the range has no upper bound.
+fn upperBound(
+  state: &mut SetState,
+  major: u64,
+  minor: u64,
+  patch: u64,
+  parts: u8,
+  version: &Version<'_>,
+) -> () {
+  match ceiling(major, minor, patch, parts) {
+    Option<Version<'static>>.Some { value } => bound(
+      &mut state,
+      less(),
+      at(value.major, value.minor, value.patch, "0"),
+      version,
+    )
+    Option<Version<'static>>.None => {}
+  }
+  return ()
+}
+
+// Adds `>=C` for the ceiling `C` of the first `parts` numbers, or `-0` of it to include
+// pre-releases. Without a ceiling, nothing is greater, so nothing matches.
+fn lowerAbove(
+  state: &mut SetState,
+  major: u64,
+  minor: u64,
+  parts: u8,
+  version: &Version<'_>,
+  include: bool,
+) -> () {
+  match ceiling(major, minor, 0, parts) {
+    Option<Version<'static>>.Some { value } => bound(
+      &mut state,
+      greaterEqual(),
+      lowest(value.major, value.minor, 0, include),
+      version,
+    )
+    Option<Version<'static>>.None => never(&mut state)
+  }
+  return ()
+}
+
+fn partialCeiling(state: &mut SetState, value: &Partial<'_>, version: &Version<'_>) -> () {
+  if value.parts > 0 {
+    upperBound(&mut state, value.major, value.minor, value.patch, value.parts, version)
+  }
+  return ()
+}
+
+fn exactVersion<'text>(value: &Partial<'text>) -> Version<'text> {
+  return at(value.major, value.minor, value.patch, value.prerelease)
+}
+
+fn npmComparator(
+  state: &mut SetState,
+  op: &[u8],
+  value: &Partial<'_>,
+  version: &Version<'_>,
+  include: bool,
+) -> () {
+  let first: u8 = if op.length > 0 {
+    op[0]
+  } else {
+    0
+  }
+  if first == 94 {
+    caret(&mut state, value, version, include)
+    return ()
+  }
+  if first == 126 {
+    tilde(&mut state, value, version, include)
+    return ()
+  }
+  let mut kind = equal()
+  if first == 60 {
+    kind = if op.length == 2 {
+      lessEqual()
+    } else {
+      less()
+    }
+  } else if first == 62 {
+    kind = if op.length == 2 {
+      greaterEqual()
+    } else {
+      greater()
+    }
+  }
+  if value.parts == 3 {
+    bound(&mut state, kind, exactVersion(value), version)
+    return ()
+  }
+  if value.parts == 0 {
+    if kind == less() || kind == greater() {
+      never(&mut state)
+    }
+    return ()
+  }
+  if kind == equal() {
+    bound(&mut state, greaterEqual(), lowest(value.major, value.minor, 0, include), version)
+    partialCeiling(&mut state, value, version)
+    return ()
+  }
+  if kind == greaterEqual() {
+    bound(&mut state, greaterEqual(), lowest(value.major, value.minor, 0, include), version)
+    return ()
+  }
+  if kind == less() {
+    bound(&mut state, less(), at(value.major, value.minor, 0, "0"), version)
+    return ()
+  }
+  if kind == lessEqual() {
+    partialCeiling(&mut state, value, version)
+    return ()
+  }
+
+  // `>1` is `>=2.0.0` and `>1.2` is `>=1.3.0`.
+  lowerAbove(&mut state, value.major, value.minor, value.parts, version, include)
+  return ()
+}
+
+fn caret(state: &mut SetState, value: &Partial<'_>, version: &Version<'_>, include: bool) -> () {
+  if value.parts == 0 {
+    return ()
+  }
+  if value.parts < 3 {
+    bound(&mut state, greaterEqual(), lowest(value.major, value.minor, 0, include), version)
+    if value.parts == 2 && value.major == 0 {
+      upperBound(&mut state, 0, value.minor, 0, 2, version)
+    } else {
+      upperBound(&mut state, value.major, 0, 0, 1, version)
+    }
+    return ()
+  }
+  bound(&mut state, greaterEqual(), exactVersion(value), version)
+  if value.major == 0 && value.minor == 0 {
+    upperBound(&mut state, 0, 0, value.patch, 3, version)
+  } else if value.major == 0 {
+    upperBound(&mut state, 0, value.minor, 0, 2, version)
+  } else {
+    upperBound(&mut state, value.major, 0, 0, 1, version)
+  }
+  return ()
+}
+
+fn tilde(state: &mut SetState, value: &Partial<'_>, version: &Version<'_>, include: bool) -> () {
+  if value.parts == 0 {
+    return ()
+  }
+  if value.parts < 3 {
+    bound(&mut state, greaterEqual(), lowest(value.major, value.minor, 0, include), version)
+    partialCeiling(&mut state, value, version)
+    return ()
+  }
+  bound(&mut state, greaterEqual(), exactVersion(value), version)
+  upperBound(&mut state, value.major, value.minor, 0, 2, version)
+  return ()
+}
+
+fn hyphen(
+  state: &mut SetState,
+  from: &Partial<'_>,
+  to: &Partial<'_>,
+  version: &Version<'_>,
+  include: bool,
+) -> () {
+  if from.parts == 3 && from.prerelease != "" {
+    bound(&mut state, greaterEqual(), exactVersion(from), version)
+  } else if from.parts > 0 {
+    bound(&mut state, greaterEqual(), lowest(from.major, from.minor, from.patch, include), version)
+  }
+  if to.parts == 3 {
+    if to.prerelease != "" || !include {
+      bound(&mut state, lessEqual(), exactVersion(to), version)
+    } else {
+      upperBound(&mut state, to.major, to.minor, to.patch, 3, version)
+    }
+  } else {
+    partialCeiling(&mut state, to, version)
+  }
+  return ()
+}
+
+// Cargo requirements. The rules follow the `semver` crate that Cargo uses: each comparator keeps
+// its missing minor and patch numbers, and the match functions treat them as wildcards.
+
+fn cargoRange(text: string, version: &Version<'_>, include: bool) -> Result<bool, SemverError> {
+  let bytes = String.utf8Bytes(text)
+  let mut index = cargoSpaces(bytes, 0)
+  if index >= bytes.length {
+    return Result<bool, SemverError>.failResult(syntaxError(SemverErrorReason.Empty, 0))
+  }
+  if isWildcard(bytes[index]) {
+    let rest = cargoSpaces(bytes, index + 1)
+    if rest < bytes.length {
+      return Result<bool, SemverError>.failResult(
+        syntaxError(SemverErrorReason.UnexpectedCharacter, rest),
+      )
+    }
+    return Result<bool, SemverError>.succeed(include || !version.isPrerelease())
+  }
+  let mut holds = true
+  let mut allowsPrerelease = false
+  let mut count: usize = 0
+  while true {
+    let opLength = operatorLength(bytes, index, bytes.length)
+    if opLength == 2 && bytes[index] == 126 {
+      return Result<bool, SemverError>.failResult(
+        syntaxError(SemverErrorReason.UnexpectedCharacter, index + 1),
+      )
+    }
+    let op = Slice.view<u8>(bytes, index, opLength)
+    let start = cargoSpaces(bytes, index + opLength)
+    let mut stop = start
+    while stop < bytes.length && bytes[stop] != 32 && bytes[stop] != 44 {
+      stop = stop + 1
+    }
+    let value = match partial(text, start, stop, false) {
+      Result<Partial, SemverError>.Success { value } => value
+      Result<Partial, SemverError>.Failure { error } => {
+        return Result<bool, SemverError>.failResult(error)
+      }
+    }
+    if !cargoMatches(op, &value, version) {
+      holds = false
+    }
+    if value.parts == 3 && value.prerelease != "" && value.major == version.major
+      && value.minor == version.minor
+      && value.patch == version.patch {
+      allowsPrerelease = true
+    }
+    count = count + 1
+    index = cargoSpaces(bytes, value.end)
+    if index >= bytes.length {
+      break
+    }
+    if bytes[index] != 44 {
+      return Result<bool, SemverError>.failResult(
+        syntaxError(SemverErrorReason.UnexpectedCharacter, index),
+      )
+    }
+    if count == 32 {
+      return Result<bool, SemverError>.failResult(
+        syntaxError(SemverErrorReason.TooManyComparators, index),
+      )
+    }
+    index = cargoSpaces(bytes, index + 1)
+  }
+  return Result<bool, SemverError>.succeed(
+    holds && (include || !version.isPrerelease() || allowsPrerelease),
+  )
+}
+
+fn cargoSpaces(bytes: &[u8], start: usize) -> usize {
+  let mut index = start
+  while index < bytes.length && bytes[index] == 32 {
+    index = index + 1
+  }
+  return index
+}
+
+// Compares only the pre-release identifiers; a release is greater than any pre-release.
+fn comparePrerelease(left: string, right: string) -> Ordering {
+  return Version.comparePrecedence(&at(0, 0, 0, left), &at(0, 0, 0, right))
+}
+
+fn cargoMatches(op: &[u8], value: &Partial<'_>, version: &Version<'_>) -> bool {
+  let first: u8 = if op.length > 0 {
+    op[0]
+  } else {
+    0
+  }
+  if first == 61 {
+    return cargoExact(value, version)
+  }
+  if first == 62 {
+    return (op.length == 2 && cargoExact(value, version)) || cargoGreater(value, version)
+  }
+  if first == 60 {
+    return (op.length == 2 && cargoExact(value, version)) || cargoLess(value, version)
+  }
+  if first == 126 {
+    return cargoTilde(value, version)
+  }
+
+  // A bare version with a wildcard is the wildcard; any other bare version is a caret.
+  if first == 0 && value.wild {
+    return cargoExact(value, version)
+  }
+  return cargoCaret(value, version)
+}
+
+fn cargoExact(value: &Partial<'_>, version: &Version<'_>) -> bool {
+  if version.major != value.major {
+    return false
+  }
+  if value.parts >= 2 && version.minor != value.minor {
+    return false
+  }
+  if value.parts >= 3 && version.patch != value.patch {
+    return false
+  }
+  return version.prerelease == value.prerelease
+}
+
+fn cargoGreater(value: &Partial<'_>, version: &Version<'_>) -> bool {
+  if version.major != value.major {
+    return version.major > value.major
+  }
+  if value.parts < 2 {
+    return false
+  }
+  if version.minor != value.minor {
+    return version.minor > value.minor
+  }
+  if value.parts < 3 {
+    return false
+  }
+  if version.patch != value.patch {
+    return version.patch > value.patch
+  }
+  return comparePrerelease(version.prerelease, value.prerelease) == Ordering.Greater
+}
+
+fn cargoLess(value: &Partial<'_>, version: &Version<'_>) -> bool {
+  if version.major != value.major {
+    return version.major < value.major
+  }
+  if value.parts < 2 {
+    return false
+  }
+  if version.minor != value.minor {
+    return version.minor < value.minor
+  }
+  if value.parts < 3 {
+    return false
+  }
+  if version.patch != value.patch {
+    return version.patch < value.patch
+  }
+  return comparePrerelease(version.prerelease, value.prerelease) == Ordering.Less
+}
+
+fn cargoTilde(value: &Partial<'_>, version: &Version<'_>) -> bool {
+  if version.major != value.major {
+    return false
+  }
+  if value.parts >= 2 && version.minor != value.minor {
+    return false
+  }
+  if value.parts >= 3 && version.patch != value.patch {
+    return version.patch > value.patch
+  }
+  return comparePrerelease(version.prerelease, value.prerelease) != Ordering.Less
+}
+
+fn cargoCaret(value: &Partial<'_>, version: &Version<'_>) -> bool {
+  if version.major != value.major {
+    return false
+  }
+  if value.parts < 2 {
+    return true
+  }
+  if value.parts < 3 {
+    if value.major > 0 {
+      return version.minor >= value.minor
+    }
+    return version.minor == value.minor
+  }
+  if value.major > 0 {
+    if version.minor != value.minor {
+      return version.minor > value.minor
+    }
+    if version.patch != value.patch {
+      return version.patch > value.patch
+    }
+  } else if value.minor > 0 {
+    if version.minor != value.minor {
+      return false
+    }
+    if version.patch != value.patch {
+      return version.patch > value.patch
+    }
+  } else if version.minor != value.minor || version.patch != value.patch {
+    return false
+  }
+  return comparePrerelease(version.prerelease, value.prerelease) != Ordering.Less
+}

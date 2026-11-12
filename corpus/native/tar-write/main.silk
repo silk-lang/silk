@@ -1,14 +1,38 @@
 // Writes a tar archive with TarWriter and reads it back with TarReader: short paths, a path split
-// into the ustar prefix, a path only a pax record holds, an executable file, a directory, and
-// refused paths.
-import silk.mem.allocator {Allocator, OutOfMemoryError}
+// into the ustar prefix, a path only a pax record holds, an executable file, a file sent in
+// pieces, a directory, refused paths, calls out of order, and a gzip stream of the archive.
+import silk.mem.allocator {Allocator, OutOfMemoryError, SystemAllocator}
 import silk.core.effect {Effect}
-import silk.compress.tar {TarError, TarKind, TarMember, TarReader, TarWriter}
+import silk.compress.deflate {EncodeError, EncodeWriter, Options}
+import silk.compress.inflate {DecodeError, Decoder, Format, Limits, MEMORY_BOUND, Progress, Status}
+import silk.compress.tar {TarError, TarKind, TarMember, TarReader, TarStatus, TarWriter}
 import silk.collections.bytes {Bytes}
 import silk.collections.slice {Slice}
-import silk.core.option {Option}
 import silk.core.result {Result}
+import silk.io.writer {Writer, WriterError}
 import silk.num.usize
+
+// A `Writer` that keeps every byte in memory.
+struct Collected {
+  bytes: Bytes,
+  allocator: SystemAllocator,
+}
+
+impl Writer for Collected {
+  effect fn writeAll(self: &mut Self, value: &[u8]) -> () ! WriterError ? &mut Writer {
+    let appended = run Effect.result(Bytes.append(&mut self.bytes, value) |> Effect.provideMut<Allocator>(&mut self.allocator))
+    match move appended {
+      Result<(), OutOfMemoryError>.Success {..} => ()
+      Result<(), OutOfMemoryError>.Failure {..} => { fail Writer.failure() }
+    }
+  }
+
+  effect fn flush(self: &mut Self) -> () ! WriterError ? &mut Writer { return () }
+}
+
+fn collector() -> Collected {
+  return Collected {bytes: Bytes.make(), allocator: Allocator.systemAllocatorProvider()}
+}
 
 fn same(left: &[u8], right: &[u8]) -> bool {
   if left.length != right.length { return false }
@@ -32,14 +56,53 @@ effect fn repeated(part: &[u8], count: usize) -> Bytes ! OutOfMemoryError ? &mut
   return move text
 }
 
-effect fn archive(split: &[u8], long: &[u8]) -> Bytes ! TarError | OutOfMemoryError ? &mut Allocator {
+effect fn members(split: &[u8], long: &[u8]) -> () ! TarError | WriterError ? &mut Writer {
   let mut writer = TarWriter.make()
   run TarWriter.directory(&mut writer, b"pkg-1.0.0")
   run TarWriter.file(&mut writer, b"pkg-1.0.0/silk.toml", b"[package]\nname = \"pkg\"\n", false)
   run TarWriter.file(&mut writer, b"pkg-1.0.0/bin/tool", b"\x7fELF", true)
   run TarWriter.file(&mut writer, split, b"split", false)
   run TarWriter.file(&mut writer, long, b"", false)
+  // 600 bytes in three pieces, so the content crosses a block boundary.
+  run TarWriter.beginFile(&mut writer, b"pkg-1.0.0/pieces", 600, false)
+  let piece: [u8; 200] = [97; 200]
+  run TarWriter.writeContent(&mut writer, &piece)
+  run TarWriter.writeContent(&mut writer, &piece)
+  run TarWriter.writeContent(&mut writer, &piece)
   return run TarWriter.finish(move writer)
+}
+
+effect fn archive(split: &[u8], long: &[u8]) -> Bytes ! TarError | WriterError {
+  let mut output = collector()
+  run members(split, long) |> Effect.provideMut<Writer>(&mut output)
+  return move output.bytes
+}
+
+// The archive as a gzip stream, written through an `EncodeWriter`.
+effect fn compressed(split: &[u8], long: &[u8]) -> Bytes ! TarError | WriterError | EncodeError | OutOfMemoryError ? &mut Allocator {
+  let mut gzip = run EncodeWriter<Collected>.make(collector(), Format.Gzip, Options.make(9))
+  run members(split, long) |> Effect.provideMut<Writer>(&mut gzip)
+  let output = run EncodeWriter<Collected>.finish(move gzip)
+  return move output.bytes
+}
+
+// The gzip stream `data` decoded 100 bytes at a time.
+effect fn decompressed(data: &[u8]) -> Bytes ! DecodeError | OutOfMemoryError ? &mut Allocator {
+  let limits = Limits {maxInputBytes: 1048576, maxOutputBytes: 1048576, maxMembers: 1, maxHeaderBytes: 1024, maxMemoryBytes: MEMORY_BOUND}
+  let mut decoder = run Decoder.make(Format.Gzip, move limits)
+  let mut text = Bytes.make()
+  let mut chunk: [u8; 100] = [0; 100]
+  let mut offset: usize = 0
+  while true {
+    let progress = match Decoder.step(&mut decoder, Slice.view<u8>(data, offset, data.length - offset), &mut chunk, true) {
+      Result<Progress, DecodeError>.Success {value} => move value
+      Result<Progress, DecodeError>.Failure {error} => { fail move error }
+    }
+    offset = offset + progress.consumed
+    run Bytes.append(&mut text, Slice.view<u8>(&chunk, 0, progress.written))
+    if progress.status == Status.Finished { return move text }
+  }
+  return move text
 }
 
 // The member's whole path, `prefix/name` or `name`.
@@ -53,19 +116,43 @@ effect fn path(member: &TarMember<'_>) -> Bytes ! OutOfMemoryError ? &mut Alloca
   return move text
 }
 
-effect fn refused(path: &[u8]) -> bool ! OutOfMemoryError ? &mut Allocator {
+effect fn refused(path: &[u8]) -> bool ! WriterError {
   let mut writer = TarWriter.make()
-  let added = run Effect.result(TarWriter.file(&mut writer, path, b"x", false))
+  let mut output = collector()
+  let added = run Effect.result(TarWriter.file(&mut writer, path, b"x", false) |> Effect.provideMut<Writer>(&mut output))
+  if Bytes.length(&output.bytes) != 0 { return false }
   return match move added {
-    Result<(), TarError | OutOfMemoryError>.Success {..} => false
-    Result<(), TarError | OutOfMemoryError>.Failure {error} => match move error {
+    Result<(), TarError | WriterError>.Success {..} => false
+    Result<(), TarError | WriterError>.Failure {error} => match move error {
       TarError reason => reason == TarError.UnsafePath
-      OutOfMemoryError exhausted => { fail move exhausted }
+      WriterError failure => { fail move failure }
     }
   }
 }
 
-effect fn check() -> i32 ! TarError | OutOfMemoryError ? &mut Allocator {
+// Whether each call out of order fails with `InvalidUse`.
+effect fn outOfOrder() -> bool ! TarError | WriterError {
+  let mut output = collector()
+  let mut writer = TarWriter.make()
+  run TarWriter.beginFile(&mut writer, b"a", 4, false) |> Effect.provideMut<Writer>(&mut output)
+  let early = run Effect.result(TarWriter.directory(&mut writer, b"b") |> Effect.provideMut<Writer>(&mut output))
+  let tooMuch = run Effect.result(TarWriter.writeContent(&mut writer, b"12345") |> Effect.provideMut<Writer>(&mut output))
+  run TarWriter.writeContent(&mut writer, b"12") |> Effect.provideMut<Writer>(&mut output)
+  let unfinished = run Effect.result(TarWriter.finish(move writer) |> Effect.provideMut<Writer>(&mut output))
+  return invalid(move early) && invalid(move tooMuch) && invalid(move unfinished)
+}
+
+fn invalid(result: Result<(), TarError | WriterError>) -> bool {
+  return match move result {
+    Result<(), TarError | WriterError>.Success {..} => false
+    Result<(), TarError | WriterError>.Failure {error} => match move error {
+      TarError reason => reason == TarError.InvalidUse
+      WriterError _failure => false
+    }
+  }
+}
+
+effect fn check() -> i32 ! TarError | WriterError | EncodeError | DecodeError | OutOfMemoryError ? &mut Allocator {
   // 120 bytes: too long for the name field, but it splits at a `/` into prefix and name.
   let split = run repeated(b"segment-0123456789", 6)
   // 300 bytes in segments of 9: no prefix of 155 and name of 100 fit, so a pax record holds it.
@@ -77,27 +164,50 @@ effect fn check() -> i32 ! TarError | OutOfMemoryError ? &mut Allocator {
   if bytes.length % 512 != 0 { return 2 }
   // The first header's modification time is zero.
   if !same(Slice.view<u8>(bytes, 136, 12), b"00000000000\x00") { return 3 }
-  let mut reader = TarReader.open(bytes)
+  let mut reader = TarReader.make()
   let mut seen: usize = 0
+  let mut offset: usize = 0
+  let mut content = Bytes.make()
+  let mut whole = Bytes.make()
+  let mut kind = TarKind.Other
+  let mut executable = false
+  let mut prefixed = false
   while true {
-    let next = match TarReader.next(&mut reader) {
-      Result.Success {value} => move value
+    let input = Slice.view<u8>(bytes, offset, bytes.length - offset)
+    let progress = match TarReader.step(&mut reader, input, true) {
+      Result.Success {value} => value
       Result.Failure {error} => { fail error }
     }
-    let member = match move next {
-      Option<TarMember>.Some {value} => move value
-      Option<TarMember>.None => { break }
+    offset = offset + progress.consumed
+    if progress.status == TarStatus.End { break }
+    if progress.status == TarStatus.Content { run Bytes.append(&mut content, Slice.view<u8>(input, 0, progress.consumed)) }
+    if progress.status == TarStatus.Member {
+      let header = TarReader.member(&reader)
+      whole = run path(&header)
+      kind = header.kind
+      executable = header.executable
+      prefixed = header.prefix.length > 0
+      Bytes.clear(&mut content)
     }
-    let whole = run path(&member)
-    let name = Bytes.asSlice(&whole)
-    if seen == 0 && !(same(name, b"pkg-1.0.0") && member.kind == TarKind.Directory) { return 10 }
-    if seen == 1 && !(same(name, b"pkg-1.0.0/silk.toml") && !member.executable && same(member.content, b"[package]\nname = \"pkg\"\n")) { return 11 }
-    if seen == 2 && !(same(name, b"pkg-1.0.0/bin/tool") && member.executable && same(member.content, b"\x7fELF")) { return 12 }
-    if seen == 3 && !(same(name, Bytes.asSlice(&split)) && member.prefix.length > 0 && same(member.content, b"split")) { return 13 }
-    if seen == 4 && !(same(name, Bytes.asSlice(&long)) && member.prefix.length == 0 && member.content.length == 0) { return 14 }
-    seen = seen + 1
+    if TarReader.remaining(&reader) == 0 && progress.status != TarStatus.NeedInput {
+      let name = Bytes.asSlice(&whole)
+      let data = Bytes.asSlice(&content)
+      if seen == 0 && !(same(name, b"pkg-1.0.0") && kind == TarKind.Directory) { return 10 }
+      if seen == 1 && !(same(name, b"pkg-1.0.0/silk.toml") && !executable && same(data, b"[package]\nname = \"pkg\"\n")) { return 11 }
+      if seen == 2 && !(same(name, b"pkg-1.0.0/bin/tool") && executable && same(data, b"\x7fELF")) { return 12 }
+      if seen == 3 && !(same(name, Bytes.asSlice(&split)) && prefixed && same(data, b"split")) { return 13 }
+      if seen == 4 && !(same(name, Bytes.asSlice(&long)) && !prefixed && data.length == 0) { return 14 }
+      if seen == 5 && !(same(name, b"pkg-1.0.0/pieces") && data.length == 600 && data[599] == 97) { return 15 }
+      seen = seen + 1
+    }
   }
-  if seen != 5 { return 4 }
+  if seen != 6 { return 4 }
+  // The gzip stream decodes to the same archive.
+  let gzip = run compressed(Bytes.asSlice(&split), Bytes.asSlice(&long))
+  let decoded = run decompressed(Bytes.asSlice(&gzip))
+  if !same(Bytes.asSlice(&decoded), bytes) { return 6 }
+  let ordered = run outOfOrder()
+  if !ordered { return 7 }
   let refusedPaths: [&[u8]; 5] = [b"", b"/etc/passwd", b"a/../b", b"dir/", b"a\\b"]
   let mut at: usize = 0
   while at < refusedPaths.length {
@@ -108,7 +218,7 @@ effect fn check() -> i32 ! TarError | OutOfMemoryError ? &mut Allocator {
   return 42
 }
 
-pub effect fn main() -> i32 ! TarError | OutOfMemoryError {
+pub effect fn main() -> i32 ! TarError | WriterError | EncodeError | DecodeError | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   return run check() |> Effect.provideMut<Allocator>(&mut allocator)
 }

@@ -8,7 +8,8 @@ strategies, and flush modes.
 ## When to use
 Use an [`Encoder`](#Encoder) to write `.gz` files, zlib streams, or HTTP bodies with `Content-Encoding:
 gzip` or `deflate`, in steps and with fixed memory. Use [`Encoder.encode`](#Encoder.impl.encode) to compress one
-complete buffer. Choose the container with `silk.compress.inflate.Format`, and decode with
+complete buffer. Use an [`EncodeWriter`](#EncodeWriter) to compress what code writes to the ambient
+`silk.io.writer.Writer`, such as a `silk.compress.tar.TarWriter` archive. Choose the container with `silk.compress.inflate.Format`, and decode with
 `silk.compress.inflate.Decoder`.
 
 ## Details
@@ -45,7 +46,7 @@ pub effect fn main() -> i32
 
 Import as `Encoder` with `import silk.compress.deflate { Encoder }`.
 
-Public declarations: 8.
+Public declarations: 9.
 
 <a id="Strategy"></a>
 
@@ -642,6 +643,104 @@ as enforced by their shared and exclusive borrows.
   stream.
 - `InvalidOptions` if an option is outside its range.
 - `OutOfMemoryError` if the `Allocator` fails.
+
+<a id="EncodeWriter"></a>
+
+## `EncodeWriter`
+
+```silk
+pub struct EncodeWriter<W>
+```
+
+A `Writer` that compresses the bytes it receives and writes the stream to another `Writer`.
+
+### When to use
+Use it to write a `.gz` file, a zlib stream, or a compressed HTTP body from code that writes
+to the ambient `Writer`, such as `silk.compress.tar.TarWriter`, without first collecting the
+uncompressed bytes. Make one with [`EncodeWriter.make`](#EncodeWriter.impl.make) around the destination, provide it with
+`Effect.provideMut<Writer>(&mut writer)`, and end the stream with [`EncodeWriter.finish`](#EncodeWriter.impl.finish).
+
+### Details
+Each write runs the [`Encoder`](#Encoder) with `Flush.None` and sends its output to the destination in
+pieces of at most 16 KiB. `Writer.flush` runs a `Flush.Sync`, so that a decoder can decode all
+bytes written so far, and then flushes the destination. [`EncodeWriter.finish`](#EncodeWriter.impl.finish) writes the end
+of the stream and its checksum trailer, flushes the destination, and returns it.
+
+### Gotchas
+Dropping the writer does not end the stream. Without [`EncodeWriter.finish`](#EncodeWriter.impl.finish), the destination
+holds a stream with no end. Each flush makes the stream a little longer and compression a
+little worse, so flush only when a reader waits for the bytes.
+
+<a id="EncodeWriter.impl"></a>
+
+## Implementation `EncodeWriter<W>`
+
+```silk
+impl<W> EncodeWriter<W>
+```
+
+<a id="EncodeWriter.impl.make"></a>
+
+### Associated function `make`
+
+```silk
+pub effect fn make(destination: W, format: Format, options: Options) -> EncodeWriter<W>
+    ! OutOfMemoryError | EncodeError
+    ? &mut Allocator
+```
+
+Returns a writer that compresses into `destination` in `format` with `options`, with the
+encoder's storage from the ambient `Allocator`.
+
+#### Errors
+- [`EncodeError`](#EncodeError) with `InvalidOptions` if an option is outside its range.
+- `OutOfMemoryError` if the `Allocator` fails.
+
+<a id="EncodeWriter.impl-2"></a>
+
+## Implementation `EncodeWriter<W>`
+
+```silk
+impl<W: Writer> EncodeWriter<W>
+```
+
+<a id="EncodeWriter.impl.finish"></a>
+
+### Method `finish`
+
+```silk
+pub effect fn finish(self: Self) -> W ! WriterError
+```
+
+Ends the stream with its trailer, flushes the destination, and returns it.
+
+#### Errors
+- `WriterError` if the destination fails, or if an earlier write failed. The destination is
+  dropped.
+
+<a id="EncodeWriter.impl.Writer"></a>
+
+## Implementation `Writer for EncodeWriter<W>`
+
+```silk
+impl<W: Writer> Writer for EncodeWriter<W>
+```
+
+<a id="EncodeWriter.impl.Writer.writeAll"></a>
+
+### Operation `writeAll`
+
+```silk
+effect fn writeAll(self: &mut Self, val: &[u8]) -> () ! WriterError ? &mut Writer
+```
+
+<a id="EncodeWriter.impl.Writer.flush"></a>
+
+### Operation `flush`
+
+```silk
+effect fn flush(self: &mut Self) -> () ! WriterError ? &mut Writer
+```
 
 
 Category: Data formats.
