@@ -2,4 +2,4 @@
 bump: minor
 ---
 
-Add `silk.markdown.document` and `silk.markdown.html`, a CommonMark parser and HTML renderer.
+Add Markdown parsing and HTML rendering with opt-in GFM extensions, footnotes, frontmatter, alerts, visible text, heading slugs, and outlines.

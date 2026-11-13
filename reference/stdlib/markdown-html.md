@@ -73,6 +73,17 @@ pub unsafeLinks: bool
 Allows javascript, vbscript, file, and data destinations when true. The default is false.
 Filtering ignores ASCII case, leading control bytes, and tabs or line endings within a scheme.
 
+<a id="HtmlOptions.headingIds"></a>
+
+### Field `headingIds`
+
+```silk
+pub headingIds: bool
+```
+
+Emits unique GitHub-style heading ids when true. The default is false.
+Slug state starts empty for each render operation and follows rendered heading order.
+
 <a id="HtmlOptions.impl.Copy"></a>
 
 ## Implementation `Copy for HtmlOptions`
@@ -236,15 +247,17 @@ Appends subtree `id` as HTML using `options`. Invalid ids append nothing.
 
 ```silk
 pub effect fn renderToWriter(document: &MarkdownDocument<'_>) -> ()
-    ! WriterError
-    ? &mut Writer
+    ! WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator
 ```
 
-Writes HTML with raw HTML escaped and dangerous schemes filtered. Does not allocate or flush.
+Writes HTML with raw HTML escaped and dangerous schemes filtered. Does not flush the writer.
+Heading ids allocate slug state only when enabled.
 
 #### Errors
 
 - `WriterError` if the writer fails. Bytes already accepted remain written.
+- `OutOfMemoryError` if enabled heading-id storage cannot grow. Earlier output remains written.
 
 <a id="MarkdownHtml.impl.renderToWriterWithOptions"></a>
 
@@ -255,15 +268,16 @@ pub effect fn renderToWriterWithOptions(
     document: &MarkdownDocument<'_>,
     options: &HtmlOptions,
   ) -> ()
-    ! WriterError
-    ? &mut Writer
+    ! WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator
 ```
 
-Writes HTML using `options`. Does not allocate or flush the writer.
+Writes HTML using `options`. Does not flush the writer. Heading ids allocate slug state only when enabled.
 
 #### Errors
 
 - `WriterError` if the writer fails. Bytes already accepted remain written.
+- `OutOfMemoryError` if enabled heading-id storage cannot grow. Earlier output remains written.
 
 <a id="MarkdownHtml.impl.escapeTextInto"></a>
 

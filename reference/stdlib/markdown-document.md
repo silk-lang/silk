@@ -6,7 +6,8 @@ A source-spanned Markdown tree with indexed nodes and borrowed source text.
 
 ## When to use
 
-Parse once with `MarkdownDocument.parse`, then walk the tree or render it with `silk.markdown.html`.
+Parse strict CommonMark with `MarkdownDocument.parse`, or select extensions with `MarkdownOptions` and `MarkdownDocument.parseWithOptions`.
+Walk the tree or render it with `silk.markdown.html`.
 
 ## Details
 
@@ -38,7 +39,7 @@ pub effect fn main() -> i32
 
 Import as `MarkdownDocument` with `import silk.markdown.document { MarkdownDocument }`.
 
-Public declarations: 6.
+Public declarations: 10.
 
 <a id="MarkdownSpan"></a>
 
@@ -296,6 +297,286 @@ HtmlInline
 
 A raw inline HTML fragment.
 
+<a id="MarkdownNodeKind.Table"></a>
+
+### `Table`
+
+```silk
+Table
+```
+
+A GFM table with row children.
+
+<a id="MarkdownNodeKind.TableRow"></a>
+
+### `TableRow`
+
+```silk
+TableRow
+```
+
+A table header or body row with cell children.
+
+<a id="MarkdownNodeKind.TableCell"></a>
+
+### `TableCell`
+
+```silk
+TableCell
+```
+
+A table cell with inline children.
+
+<a id="MarkdownNodeKind.Strikethrough"></a>
+
+### `Strikethrough`
+
+```silk
+Strikethrough
+```
+
+Deleted inline content enclosed by one or two tildes.
+
+<a id="MarkdownNodeKind.FootnoteReference"></a>
+
+### `FootnoteReference`
+
+```silk
+FootnoteReference
+```
+
+A reference to a defined footnote.
+
+<a id="MarkdownNodeKind.FootnoteDefinition"></a>
+
+### `FootnoteDefinition`
+
+```silk
+FootnoteDefinition
+```
+
+A footnote container with block children.
+
+<a id="MarkdownNodeKind.Frontmatter"></a>
+
+### `Frontmatter`
+
+```silk
+Frontmatter
+```
+
+A leading YAML or TOML metadata block with an unparsed source body.
+
+<a id="MarkdownNodeKind.Alert"></a>
+
+### `Alert`
+
+```silk
+Alert
+```
+
+A GitHub alert container with block children.
+
+<a id="MarkdownAlignment"></a>
+
+## `MarkdownAlignment`
+
+```silk
+pub enum MarkdownAlignment
+```
+
+A table column's horizontal alignment.
+
+<a id="MarkdownAlignment.None"></a>
+
+### `None`
+
+```silk
+None
+```
+
+No explicit alignment.
+
+<a id="MarkdownAlignment.Left"></a>
+
+### `Left`
+
+```silk
+Left
+```
+
+Left alignment.
+
+<a id="MarkdownAlignment.Center"></a>
+
+### `Center`
+
+```silk
+Center
+```
+
+Center alignment.
+
+<a id="MarkdownAlignment.Right"></a>
+
+### `Right`
+
+```silk
+Right
+```
+
+Right alignment.
+
+<a id="MarkdownTaskState"></a>
+
+## `MarkdownTaskState`
+
+```silk
+pub enum MarkdownTaskState
+```
+
+A list item's task marker state.
+
+<a id="MarkdownTaskState.None"></a>
+
+### `None`
+
+```silk
+None
+```
+
+The item has no task marker, or the node is not a list item.
+
+<a id="MarkdownTaskState.Unchecked"></a>
+
+### `Unchecked`
+
+```silk
+Unchecked
+```
+
+The item starts with an unchecked task marker.
+
+<a id="MarkdownTaskState.Checked"></a>
+
+### `Checked`
+
+```silk
+Checked
+```
+
+The item starts with a checked task marker.
+
+<a id="MarkdownFrontmatterKind"></a>
+
+## `MarkdownFrontmatterKind`
+
+```silk
+pub enum MarkdownFrontmatterKind
+```
+
+The delimiter of an unparsed frontmatter block.
+
+<a id="MarkdownFrontmatterKind.None"></a>
+
+### `None`
+
+```silk
+None
+```
+
+The node is not frontmatter.
+
+<a id="MarkdownFrontmatterKind.Yaml"></a>
+
+### `Yaml`
+
+```silk
+Yaml
+```
+
+Three hyphens delimit YAML metadata.
+
+<a id="MarkdownFrontmatterKind.Toml"></a>
+
+### `Toml`
+
+```silk
+Toml
+```
+
+Three plus signs delimit TOML metadata.
+
+<a id="MarkdownAlertKind"></a>
+
+## `MarkdownAlertKind`
+
+```silk
+pub enum MarkdownAlertKind
+```
+
+The category of a GitHub alert.
+
+<a id="MarkdownAlertKind.None"></a>
+
+### `None`
+
+```silk
+None
+```
+
+The node is not an alert.
+
+<a id="MarkdownAlertKind.Note"></a>
+
+### `Note`
+
+```silk
+Note
+```
+
+Useful information.
+
+<a id="MarkdownAlertKind.Tip"></a>
+
+### `Tip`
+
+```silk
+Tip
+```
+
+Advice for a task.
+
+<a id="MarkdownAlertKind.Important"></a>
+
+### `Important`
+
+```silk
+Important
+```
+
+Information required for a task.
+
+<a id="MarkdownAlertKind.Warning"></a>
+
+### `Warning`
+
+```silk
+Warning
+```
+
+A potential problem.
+
+<a id="MarkdownAlertKind.Caution"></a>
+
+### `Caution`
+
+```silk
+Caution
+```
+
+A risk that requires attention.
+
 <a id="MarkdownOptions"></a>
 
 ## `MarkdownOptions`
@@ -304,7 +585,8 @@ A raw inline HTML fragment.
 pub struct MarkdownOptions
 ```
 
-The resource policy for a Markdown parse. Excess nesting remains literal text or paragraph content.
+Syntax switches and a nesting bound. Every extension is disabled by default.
+Excess nesting remains literal text or paragraph content.
 
 <a id="MarkdownOptions.maxNesting"></a>
 
@@ -315,6 +597,76 @@ pub maxNesting: usize
 ```
 
 The maximum block-container and inline nesting depth. The default is 256; zero disables nesting.
+
+<a id="MarkdownOptions.tables"></a>
+
+### Field `tables`
+
+```silk
+pub tables: bool
+```
+
+Enables GFM tables. The default is false.
+
+<a id="MarkdownOptions.strikethrough"></a>
+
+### Field `strikethrough`
+
+```silk
+pub strikethrough: bool
+```
+
+Enables matching one- or two-tilde strikethrough. The default is false.
+
+<a id="MarkdownOptions.taskLists"></a>
+
+### Field `taskLists`
+
+```silk
+pub taskLists: bool
+```
+
+Enables task markers in list items. The default is false.
+
+<a id="MarkdownOptions.autolinkLiterals"></a>
+
+### Field `autolinkLiterals`
+
+```silk
+pub autolinkLiterals: bool
+```
+
+Enables GFM URL and email literals, including ftp, mailto, and xmpp. The default is false.
+
+<a id="MarkdownOptions.footnotes"></a>
+
+### Field `footnotes`
+
+```silk
+pub footnotes: bool
+```
+
+Enables footnote definitions and references. The default is false.
+
+<a id="MarkdownOptions.frontmatter"></a>
+
+### Field `frontmatter`
+
+```silk
+pub frontmatter: bool
+```
+
+Enables leading YAML or TOML frontmatter capture. The default is false.
+
+<a id="MarkdownOptions.alerts"></a>
+
+### Field `alerts`
+
+```silk
+pub alerts: bool
+```
+
+Enables GitHub alert block quotes. The default is false.
 
 <a id="MarkdownOptions.impl.Copy"></a>
 
@@ -340,7 +692,18 @@ impl MarkdownOptions
 pub fn make() -> MarkdownOptions
 ```
 
-Returns a nesting bound of 256. Markdown syntax errors never cause a parse failure.
+Returns strict CommonMark options with a nesting bound of 256 and every extension disabled.
+
+<a id="MarkdownOptions.impl.gfm"></a>
+
+### Associated function `gfm`
+
+```silk
+pub fn gfm() -> MarkdownOptions
+```
+
+Returns GFM table, strikethrough, task-list, and autolink options with a nesting bound of 256.
+Footnotes, frontmatter, and alerts remain disabled.
 
 <a id="MarkdownNode"></a>
 
@@ -385,6 +748,7 @@ A parsed Markdown tree that borrows the source and owns decoded text and a flat 
 
 Verbatim literals are views into the original source. Decoded literals borrow one owned side buffer.
 Returned text cannot outlive the document. Invalid ids return absent links, empty text, and zero payloads.
+Footnote definitions follow main blocks in first-reference order. Unused definitions follow referenced definitions.
 
 <a id="MarkdownDocument.impl"></a>
 
@@ -404,7 +768,7 @@ pub effect fn parse(source: string<'source>) -> MarkdownDocument<'source>
     ? &mut Allocator
 ```
 
-Parses UTF-8 Markdown with a nesting bound of 256. Every input produces a document.
+Parses strict CommonMark 0.31.2 with a nesting bound of 256 and every extension disabled. Every input produces a document.
 The document borrows `source` and owns its nodes and decoded text.
 
 #### Details
@@ -428,7 +792,8 @@ pub effect fn parseWithOptions(
     ? &mut Allocator
 ```
 
-Parses UTF-8 Markdown within `options.maxNesting`. Excess nesting remains literal text or paragraph content.
+Parses UTF-8 Markdown with the extension switches and nesting bound in `options`.
+Disabled extensions retain CommonMark syntax. Excess nesting remains literal text or paragraph content.
 The document borrows `source` and owns its nodes and decoded text.
 
 #### Details
@@ -624,6 +989,129 @@ pub fn destination<'a>(self: &'a Self, id: MarkdownNodeId) -> string<'a>
 
 Returns the decoded link or image destination, or empty text for other kinds.
 The result borrows the document.
+
+<a id="MarkdownDocument.impl.isTableHeader"></a>
+
+### Method `isTableHeader`
+
+```silk
+pub fn isTableHeader(self: &Self, id: MarkdownNodeId) -> bool
+```
+
+Returns whether a table row is the header row; returns false for other kinds.
+
+<a id="MarkdownDocument.impl.tableColumns"></a>
+
+### Method `tableColumns`
+
+```silk
+pub fn tableColumns(self: &Self, id: MarkdownNodeId) -> usize
+```
+
+Returns the number of columns in a table; returns zero for other kinds or invalid ids.
+
+<a id="MarkdownDocument.impl.columnAlignment"></a>
+
+### Method `columnAlignment`
+
+```silk
+pub fn columnAlignment(self: &Self, id: MarkdownNodeId, column: usize) -> MarkdownAlignment
+```
+
+Returns a table column's alignment in constant time. Columns have zero-based indices.
+Returns `None` for other kinds, invalid ids, or out-of-range columns.
+
+<a id="MarkdownDocument.impl.alignment"></a>
+
+### Method `alignment`
+
+```silk
+pub fn alignment(self: &Self, id: MarkdownNodeId) -> MarkdownAlignment
+```
+
+Returns a cell's column alignment; returns `None` for other kinds or invalid ids.
+
+<a id="MarkdownDocument.impl.taskState"></a>
+
+### Method `taskState`
+
+```silk
+pub fn taskState(self: &Self, id: MarkdownNodeId) -> MarkdownTaskState
+```
+
+Returns a list item's task state; returns `None` for other kinds or items without a marker.
+
+<a id="MarkdownDocument.impl.frontmatterKind"></a>
+
+### Method `frontmatterKind`
+
+```silk
+pub fn frontmatterKind(self: &Self, id: MarkdownNodeId) -> MarkdownFrontmatterKind
+```
+
+Returns the frontmatter delimiter kind; returns `None` for other kinds or invalid ids.
+
+<a id="MarkdownDocument.impl.frontmatterBody"></a>
+
+### Method `frontmatterBody`
+
+```silk
+pub fn frontmatterBody<'a>(self: &'a Self, id: MarkdownNodeId) -> string<'a>
+```
+
+Borrows the unparsed frontmatter body directly from the source, including its final line ending.
+Excludes both delimiter lines. Returns empty text for other kinds or invalid ids.
+
+<a id="MarkdownDocument.impl.alertKind"></a>
+
+### Method `alertKind`
+
+```silk
+pub fn alertKind(self: &Self, id: MarkdownNodeId) -> MarkdownAlertKind
+```
+
+Returns the alert category; returns `None` for other kinds or invalid ids.
+
+<a id="MarkdownDocument.impl.footnoteLabel"></a>
+
+### Method `footnoteLabel`
+
+```silk
+pub fn footnoteLabel<'a>(self: &'a Self, id: MarkdownNodeId) -> string<'a>
+```
+
+Borrows the source label of a footnote reference or definition, without brackets or the caret.
+Returns empty text for other kinds. Resolution collapses label whitespace and folds Unicode case.
+
+<a id="MarkdownDocument.impl.footnoteDefinition"></a>
+
+### Method `footnoteDefinition`
+
+```silk
+pub fn footnoteDefinition(self: &Self, id: MarkdownNodeId) -> Option<MarkdownNodeId>
+```
+
+Returns the definition resolved by a footnote reference; returns `None` for other kinds or invalid ids.
+
+<a id="MarkdownDocument.impl.footnoteNumber"></a>
+
+### Method `footnoteNumber`
+
+```silk
+pub fn footnoteNumber(self: &Self, id: MarkdownNodeId) -> usize
+```
+
+Returns a footnote's one-based first-reference number; returns zero for unused definitions and other kinds.
+
+<a id="MarkdownDocument.impl.footnoteReferences"></a>
+
+### Method `footnoteReferences`
+
+```silk
+pub fn footnoteReferences(self: &Self, id: MarkdownNodeId) -> usize
+```
+
+Returns a reference's one-based occurrence, or a definition's reference count; returns zero for other kinds.
 
 <a id="MarkdownDocument.impl.title"></a>
 
