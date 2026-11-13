@@ -97,6 +97,7 @@ import semantic.Specialization {
   Edge,
   OperandPass,
   OwnedStep,
+  OwnedMove,
   OwnedDescent,
   BoundSlot,
 }
@@ -991,7 +992,9 @@ pub union Value {
   /// Whether dropping a value of a closed nominal type runs no cleanup.
   CleanupFree {pub holds: bool},
   /// Whether a runtime function needs static residualization.
-  StaticRouting {pub holds: bool},
+  /// Whether a body needs selection for its static work, and whether a static call it routes on
+  /// depends on the body's own unbound binders.
+  StaticRouting {pub holds: bool, pub dependent: bool},
   /// The position of a function body's resolved annotations and call targets in this store's
   /// body facts arena.
   BodyFacts {pub index: usize},
@@ -5204,8 +5207,8 @@ fn sameValue(left: &Value, right: &Value) -> bool {
       Value.CleanupFree {holds: other} => holds == other
       _ => false
     }
-    Value.StaticRouting {holds} => match & right.* {
-      Value.StaticRouting {holds: other} => holds == other
+    Value.StaticRouting {holds, dependent} => match & right.* {
+      Value.StaticRouting {holds: other, dependent: otherDependent} => holds == other && dependent == otherDependent
       _ => false
     }
     Value.BodyFacts {..} => false
@@ -8860,7 +8863,10 @@ fn fingerprintValue(writer: &mut AnswerFingerprint.Writer, value: &Value) -> () 
     Value.Condition {holds} => { AnswerFingerprint.flag(&mut writer.*, holds) }
     Value.PhaseOnly {holds} => { AnswerFingerprint.flag(&mut writer.*, holds) }
     Value.CleanupFree {holds} => { AnswerFingerprint.flag(&mut writer.*, holds) }
-    Value.StaticRouting {holds} => { AnswerFingerprint.flag(&mut writer.*, holds) }
+    Value.StaticRouting {holds, dependent} => {
+      AnswerFingerprint.flag(&mut writer.*, holds)
+      AnswerFingerprint.flag(&mut writer.*, dependent)
+    }
     Value.ProfileInput {slot} => { AnswerFingerprint.count(&mut writer.*, slot) }
     Value.LayoutUnsupported => {}
     Value.Initializer {value: published, ..} => { StaticValue.fingerprint(&mut writer.*, &published) }
@@ -84027,9 +84033,39 @@ effect fn needsStaticResidualization(
 
 fn staticRoutingHolds(answer: &Result<Answer, NoRejection>) -> bool {
   if let Result<Answer, NoRejection>.Success {value} = &answer.* {
-    if let Outcome.Success {value: Value.StaticRouting {holds}} = &value.outcome { return holds }
+    if let Outcome.Success {value: Value.StaticRouting {holds, ..}} = &value.outcome { return holds }
   }
   return false
+}
+
+fn staticRoutingDependent(answer: &Result<Answer, NoRejection>) -> bool {
+  if let Result<Answer, NoRejection>.Success {value} = &answer.* {
+    if let Outcome.Success {value: Value.StaticRouting {dependent, ..}} = &value.outcome { return dependent }
+  }
+  return false
+}
+
+// Whether the function at `declaration` routes its body through selection only for static calls,
+// one of which depends on the function's own unbound binders, such as `Reflect.typeName<S>()` as
+// a runtime argument. Such a template is deferred like one whose written static work depends on
+// them (`StaticTemplate.Reason.DependentExpansion`): no selection over its binders checks it.
+effect fn dependentStaticRouting(
+  resolver: &mut Resolver,
+  owner: &mut Query<Answer, NoRejection>,
+  dependencies: &mut List<Dependency>,
+  module: &ModuleId,
+  moduleOrdinal: usize,
+  declaration: usize,
+) -> bool
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator | &mut Types {
+  let routingRequest = Key {
+    family: Family.StaticRouting, module: moduleOrdinal, name: usize.ZERO,
+    declaration: declaration, member: usize.ZERO, external: false,
+  }
+  let routing = run internDeclaration(&mut resolver.*, routingRequest)
+  let answer = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies.*, routing, Span.make(usize.ZERO, usize.ZERO))
+  return Shared<Result<Answer, NoRejection>>.with<bool>(&answer, staticRoutingDependent)
 }
 
 effect fn resolveStaticRouting(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, key: Key) -> Answer
@@ -84037,9 +84073,10 @@ effect fn resolveStaticRouting(resolver: &mut Resolver, owner: &mut Query<Answer
   let mut dependencies = List<Dependency>.make()
   let declaration = declarationPosition(&resolver.*, key)
   let module = resolvedModule(&resolver.*, key.module)
-  let computed = run computeStaticRouting(&mut resolver.*, &mut owner.*, &mut dependencies, &module, key.module, declaration)
+  let mut dependent = false
+  let computed = run computeStaticRouting(&mut resolver.*, &mut owner.*, &mut dependencies, &module, key.module, declaration, &mut dependent)
   return match move computed {
-    Result<bool, Shared<Rejection>>.Success {value} => memberSuccess(Value.StaticRouting {holds: value}, move dependencies)
+    Result<bool, Shared<Rejection>>.Success {value} => memberSuccess(Value.StaticRouting {holds: value, dependent: value && dependent}, move dependencies)
     Result<bool, Shared<Rejection>>.Failure {error} => run memberRejected(move error, move dependencies)
   }
 }
@@ -84158,6 +84195,7 @@ effect fn computeStaticRouting(
   module: &ModuleId,
   moduleOrdinal: usize,
   declaration: usize,
+  dependent: &mut bool,
 ) -> Result<bool, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
 ? &mut Allocator | &mut Types {
@@ -84192,29 +84230,36 @@ effect fn computeStaticRouting(
       }
     }
   }
-  if marked { return Result<bool, Shared<Rejection>>.succeed(true) }
+  // Written static work routes the body by itself; its calls are still read when the body has
+  // binders, since one may depend on them.
+  if marked && !run declarationHasBinders(&resolver.*, &sourceAnswer, module, declaration) { return Result<bool, Shared<Rejection>>.succeed(true) }
   let facts = run takeBodyFacts(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, moduleOrdinal, declaration)
   let taken = match move facts {
     Result<TakenFacts, Shared<Rejection>>.Success {value} => move value
-    Result<TakenFacts, Shared<Rejection>>.Failure {error} => { return Result<bool, Shared<Rejection>>.failResult(move error) }
+    Result<TakenFacts, Shared<Rejection>>.Failure {error} => {
+      if marked { return Result<bool, Shared<Rejection>>.succeed(true) }
+      return Result<bool, Shared<Rejection>>.failResult(move error)
+    }
   }
-  let mut routed = Result<bool, Shared<Rejection>>.succeed(false)
+  let mut routed = Result<bool, Shared<Rejection>>.succeed(marked)
+  let mut foundRouted = marked
   let calls = List<ResolvedCall>.asSlice(&taken.facts.calls)
   let mut at = usize.ZERO
   while at < calls.length {
     let decided = run resolvedCallPhase(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, &calls[at])
     match move decided {
       Result<CallPhase, Shared<Rejection>>.Success {value: phase} => {
-        match move phase {
-          CallPhase.Runtime => {}
-          _ => {
-            routed = Result<bool, Shared<Rejection>>.succeed(true)
-            break
-          }
+        if let CallPhase.Runtime = &phase {} else {
+          routed = Result<bool, Shared<Rejection>>.succeed(true)
+          foundRouted = true
+          dependent.* = run routedCallDependent(&resolver.*, &sourceAnswer, module, declaration, calls[at].id, &phase)
+          // Later routed calls only matter while none found so far depends on the binders.
+          if dependent.* { break }
         }
       }
       Result<CallPhase, Shared<Rejection>>.Failure {error} => {
-        routed = Result<bool, Shared<Rejection>>.failResult(move error)
+        // A routed call already decides the body; only an unrouted one reports the failure.
+        if !foundRouted { routed = Result<bool, Shared<Rejection>>.failResult(move error) }
         break
       }
     }
@@ -84260,6 +84305,48 @@ effect fn computeStaticRouting(
     }
   }
   return move routed
+}
+
+// Whether the function at `declaration` has own or enclosing binders its body may depend on.
+effect fn declarationHasBinders(resolver: &Resolver, sourceAnswer: &Shared<Result<SourceResult, NoRejection>>, module: &ModuleId,
+  declaration: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
+  if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(resolver, sourceAnswer, module) {
+    let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
+    if declaration >= declarations.length { return false }
+    if let Option<StaticTemplate.Binders>.Some {..} = move run StaticTemplate.binders(IndexedSource.authored(indexed), declarations, declaration) { return true }
+  }
+  return false
+}
+
+// Whether the routed call `call` in the body of the function at `declaration` depends on that
+// function's own or enclosing binders where the selection pass evaluates it: the whole call of a
+// `static fn`, or the arguments in a callee's static slots.
+effect fn routedCallDependent(resolver: &Resolver, sourceAnswer: &Shared<Result<SourceResult, NoRejection>>, module: &ModuleId,
+  declaration: usize, call: HirId, phase: &CallPhase) -> bool ! OutOfMemoryError ? &mut Allocator {
+  if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(resolver, sourceAnswer, module) {
+    let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
+    if declaration >= declarations.length { return false }
+    let hir = IndexedSource.authored(indexed)
+    let binders = match move run StaticTemplate.binders(hir, declarations, declaration) {
+      Option<StaticTemplate.Binders>.Some {value} => move value
+      Option<StaticTemplate.Binders>.None => { return false }
+    }
+    if let CallPhase.StaticSlots {slots, ..} = &phase.* {
+      if let Option<CallInput>.Some {value: input} = move CallInput.ofNode(Module.node(hir, call)) {
+        let listed = List<usize>.asSlice(&slots)
+        let mut at = usize.ZERO
+        while at < listed.length {
+          if listed[at] < CallArguments.length(input.arguments) {
+            if run StaticTemplate.dependsOn(hir, CallArguments.child(input.arguments, hir, listed[at]), &binders) { return true }
+          }
+          at = at + usize.ONE
+        }
+        return false
+      }
+    }
+    return run StaticTemplate.dependsOn(hir, call, &binders)
+  }
+  return false
 }
 
 // Whether a checked body reports a method or interface operation call whose static arguments no
@@ -85078,6 +85165,7 @@ effect fn resolveAnonymousBody(resolver: &mut Resolver, owner: &mut Query<Answer
       // static expansions depend on them: that template is deferred and has no such body.
       if !unselected && Shared<Result<Answer, NoRejection>>.with<usize>(&parentSignature, signatureNonLifetimeBinderCount) != usize.ZERO {
         unselected = run deferredStaticTemplate(&mut resolver.*, &module, parent)
+        if !unselected { unselected = run dependentStaticRouting(&mut resolver.*, &mut owner.*, &mut dependencies, &module, key.module, parent) }
       }
       if !unselected {
         let instance = run InstanceKey.named(&handle)
@@ -97159,7 +97247,17 @@ impl Semantic {
         )
         run appendCheckedAnswer(&mut sweep.rejections, &mut sweep.gaps, &mut self.query, &declaration.identity, &signature)
         if declaration.body {
-          if let Option<StaticTemplate.Reason>.Some { value } = &declaration.deferred {
+          let mut deferred = declaration.deferred
+          if deferred.isNone() && declaration.open {
+            // A static call that depends on the template's binders defers it as written dependent
+            // static work does.
+            let mut dependencies = List<Dependency>.make()
+            if run dependentStaticRouting(&mut self.resolver, &mut self.query, &mut dependencies, module, moduleOrdinal,
+              declaration.ordinal) {
+              deferred = Option<StaticTemplate.Reason>.some(StaticTemplate.dependentExpansion())
+            }
+          }
+          if let Option<StaticTemplate.Reason>.Some { value } = &deferred {
             run List<
               DeferredStaticTemplate
             >.append(
@@ -108227,17 +108325,62 @@ effect fn admitOwnedDescent(resolver: &mut Resolver, owner: &mut Query<Answer, N
     let bound = run boundSlots(&mut resolver.*, &mut owner.*, Application.bodyDeclaration(application))
     if let Option<OwnedDescent>.Some {value: descent} = move run Admission.ownedSteps(&listed[usize.ZERO], application, List<BoundSlot>.asSlice(&bound)) {
       admitted = !run Admission.activeUpToStatics(&admission.*, application, List<usize>.asSlice(&descent.fixed))
-      let moved = List<OwnedStep>.asSlice(&descent.steps)
-      let mut at = usize.ZERO
-      while admitted && at < moved.length {
-        admitted = run withinOwned(&mut resolver.*, &mut owner.*, &moved[at].outer, &moved[at].inner)
-        at = at + usize.ONE
-      }
+      if admitted { admitted = run movesDescend(&mut resolver.*, &mut owner.*, List<OwnedMove>.asSlice(&descent.moves), usize.ZERO) }
     }
   }
   if !admitted { return move decision }
   run Admission.enterChain(&mut admission.*, application, Edge.copy(edge))
   return Decision.Entered
+}
+
+// How deeply exact callable representations nest within each other's applications before a
+// descent through them stops being proved.
+const callableDescentDepth: usize = 8
+
+// Whether each moved argument lies within the owned structure of the ancestor's: part by part
+// inside a type constructor both share, or as a whole. An exact callable representation, such as
+// the Effect value of `fieldRead<R, Owner, V>(...)` that `Effect.result` receives, is fixed by the
+// function application it holds, so it descends when that application descends.
+effect fn movesDescend(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, moved: &[OwnedMove], depth: usize) -> bool
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut at = usize.ZERO
+  while at < moved.length {
+    let parts = List<OwnedStep>.asSlice(&moved[at].parts)
+    let mut within = true
+    let mut part = usize.ZERO
+    while within && part < parts.length {
+      within = run withinOwned(&mut resolver.*, &mut owner.*, &parts[part].outer, &parts[part].inner)
+      part = part + usize.ONE
+    }
+    if !within { within = run withinOwned(&mut resolver.*, &mut owner.*, &moved[at].outer, &moved[at].inner) }
+    if !within && depth < callableDescentDepth {
+      within = run callableDescends(&mut resolver.*, &mut owner.*, &moved[at].outer, &moved[at].inner, depth)
+    }
+    if !within { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// Whether `inner`, an exact callable representation, holds an application of the same function
+// as `outer`'s that is an owned descent of it.
+effect fn callableDescends(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, outer: &Interned<Type>, inner: &Interned<Type>,
+  depth: usize) -> bool
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let older = match &outer.get().* {
+    Type.CallableValue {application, ..} => Interned<Application>.clone(&application)
+    _ => { return false }
+  }
+  let newer = match &inner.get().* {
+    Type.CallableValue {application, ..} => Interned<Application>.clone(&application)
+    _ => { return false }
+  }
+  if !DeclarationId.equals(Application.bodyDeclaration(older.get()), Application.bodyDeclaration(newer.get())) { return false }
+  let bound = run boundSlots(&mut resolver.*, &mut owner.*, Application.bodyDeclaration(newer.get()))
+  if let Option<OwnedDescent>.Some {value: descent} = move run Admission.ownedSteps(older.get(), newer.get(), List<BoundSlot>.asSlice(&bound)) {
+    return run movesDescend(&mut resolver.*, &mut owner.*, List<OwnedMove>.asSlice(&descent.moves), depth + usize.ONE)
+  }
+  return false
 }
 
 // The type parameters of `declaration` that a conformance bound on another of its type parameters
@@ -108260,22 +108403,50 @@ effect fn boundSlots(resolver: &mut Resolver, owner: &mut Query<Answer, NoReject
       if by != usize.MAX {
         let mut pending = List<Interned<Type>>.make()
         run Type.structuralChildren(&contract, &mut pending)
-        while List<Interned<Type>>.length(&pending) != usize.ZERO {
-          let part = match move List<Interned<Type>>.pop(&mut pending) {
-            Option<Interned<Type>>.Some {value} => move value
-            Option<Interned<Type>>.None => { break }
-          }
-          let ordinal = Interned<Type>.with<usize>(&part, fn(value: &Type) -> usize { return Type.parameterOrdinalOf(value, declaration) })
-          if ordinal != usize.MAX && ordinal != by {
-            run List<BoundSlot>.append(&mut slots, BoundSlot {ordinal: ordinal, by: by})
-          }
-          run Type.structuralChildren(&part, &mut pending)
+        run fixedSlots(&mut slots, move pending, declaration, by)
+      }
+    }
+    at = at + usize.ONE
+  }
+  // A field descriptor `Intrinsic.Field<Owner, V>` names a field of `Owner`, so the argument for
+  // `Owner` fixes `V` as a bound fixes the parameters its contract names.
+  let parameters = Shared<Result<Answer, NoRejection>>.with<usize>(&signature, signatureParameterCount)
+  at = usize.ZERO
+  while at < parameters {
+    let parameter = Shared<Result<Answer, NoRejection>>.with<Option<Interned<Type>>>(&signature,
+      fn(answer: &Result<Answer, NoRejection>) -> Option<Interned<Type>> { return signatureParameterAt(answer, at) })
+    if let Option<Interned<Type>>.Some {value: ty} = move parameter {
+      if let Option<CheckedIntrinsic.FieldTypes>.Some {value: described} = move Interned<Type>.with<Option<CheckedIntrinsic.FieldTypes>>(&ty, CheckedIntrinsic.fieldTypes) {
+        let by = Interned<Type>.with<usize>(&described.owner, fn(value: &Type) -> usize { return Type.parameterOrdinalOf(value, declaration) })
+        if by != usize.MAX {
+          let mut pending = List<Interned<Type>>.make()
+          run List<Interned<Type>>.append(&mut pending, Interned<Type>.clone(&described.value))
+          run fixedSlots(&mut slots, move pending, declaration, by)
         }
       }
     }
     at = at + usize.ONE
   }
   return move slots
+}
+
+// Appends a slot fixed by the parameter `by` for each parameter of `declaration` that `pending`
+// names, structurally.
+effect fn fixedSlots(slots: &mut List<BoundSlot>, pending: List<Interned<Type>>, declaration: &DeclarationId, by: usize) -> ()
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut pending = move pending
+  while List<Interned<Type>>.length(&pending) != usize.ZERO {
+    let part = match move List<Interned<Type>>.pop(&mut pending) {
+      Option<Interned<Type>>.Some {value} => move value
+      Option<Interned<Type>>.None => { break }
+    }
+    let ordinal = Interned<Type>.with<usize>(&part, fn(value: &Type) -> usize { return Type.parameterOrdinalOf(value, declaration) })
+    if ordinal != usize.MAX && ordinal != by {
+      run List<BoundSlot>.append(&mut slots.*, BoundSlot {ordinal: ordinal, by: by})
+    }
+    run Type.structuralChildren(&part, &mut pending)
+  }
+  return ()
 }
 
 // Whether `inner` lies within the owned structure of `outer`: a part of it, a member type of a

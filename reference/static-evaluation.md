@@ -489,6 +489,12 @@ Loading, indexing, importing, or navigating an uncalled declaration does not exe
 Equal target, generic arguments, evidence, and canonical static arguments reuse one deterministic
 result.
 
+A static call that names a generic function's own unbound type parameters, such as
+`Reflect.typeName<S>()` passed as a runtime argument, has no value until those parameters are
+bound. The function is then checked like one whose written static work depends on them: its
+unapplied body is not evaluated, and each application a call reaches evaluates the static call with
+its own type arguments.
+
 After selection, static parameters, static locals, static-function frames, inactive arms, and
 static-only intrinsics are absent from runtime calling shapes, ownership facts, cleanup plans,
 runtime reachability, MIR, and backend artifacts. Runtime analysis sees only the selected residual
