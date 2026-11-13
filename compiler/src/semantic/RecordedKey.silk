@@ -1,0 +1,547 @@
+//! Stable, reversible shapes of named instance keys persisted by build records and inline summaries.
+//!
+//! # Details
+//!
+//! Declarations are complete `StableKey` identities. Arguments retain their original ordinals,
+//! scopes retain their owners and static slots, and providers retain every requirement field.
+//! Unsupported shapes write nothing; malformed or unknown encodings read as none. Every user
+//! must compare the rebuilt key's digest with the recorded digest before trusting it.
+
+import backend.InstanceKey {InstanceKey, ProviderEntry}
+import hir.Hir {Access, Multiplicity}
+import semantic.DeclarationId {DeclarationId}
+import semantic.Lifetime {CanonicalizationFailure, Lifetime}
+import semantic.RuntimeEncoding as Encoding
+import semantic.Specialization {Application, ScopeBinding, StaticSlot, Target}
+import semantic.StableKey
+import semantic.StaticValue {Value, IntegerType, FloatType, Sign}
+import semantic.Type {Argument, Requirement, Row, RowParameter, RowSubtraction, Type}
+import semantic.Types {Types}
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.core.option {Option}
+import silk.core.result {Result}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.mem.interned {Interned}
+import silk.mem.shared {Shared}
+import silk.num.u8
+import silk.num.u64
+import silk.num.usize
+
+// Resource bounds apply to both directions, independently of the compiler's semantic limits.
+const DEPTH: usize = 64
+
+/// Appends a named key's shape after its declaration, or nothing if any part cannot round-trip.
+/// The caller must retain a digest: declaration-only bytes cannot reconstruct unsupported shapes.
+pub effect fn appendShape(output: &mut Bytes, instance: &InstanceKey) -> () ! OutOfMemoryError ? &mut Allocator {
+  let application = match move InstanceKey.application(instance) {
+    Option<Interned<Application>>.Some {value} => move value
+    Option<Interned<Application>>.None => { return () }
+  }
+  let held = Interned<Application>.get(&application)
+  if let Target.Named {..} = &held.target {} else { return () }
+  let providers = match move InstanceKey.providers(instance) {
+    Option<Shared<List<ProviderEntry>>>.Some {value} => move value
+    Option<Shared<List<ProviderEntry>>>.None => { return () }
+  }
+  let mut written = Bytes.make()
+  if !run writeArguments(&mut written, List<Argument>.asSlice(&held.arguments), List<usize>.asSlice(&held.argumentOrdinals), DEPTH) { return () }
+  let scopes = List<ScopeBinding>.asSlice(&held.scopes)
+  run Encoding.word(&mut written, usize.toU64(scopes.length))
+  let mut at = usize.ZERO
+  while at < scopes.length {
+    run StableKey.declaration(&mut written, Interned<DeclarationId>.get(&scopes[at].owner))
+    if !run writeArguments(&mut written, List<Argument>.asSlice(&scopes[at].arguments), List<usize>.asSlice(&scopes[at].argumentOrdinals), DEPTH) { return () }
+    if !run writeStatics(&mut written, List<StaticSlot>.asSlice(&scopes[at].statics)) { return () }
+    at = at + usize.ONE
+  }
+  if !run writeStatics(&mut written, List<StaticSlot>.asSlice(&held.statics)) { return () }
+  let count = Shared<List<ProviderEntry>>.with<usize>(&providers, fn(entries: &List<ProviderEntry>) -> usize {
+    return List<ProviderEntry>.length(entries)
+  })
+  run Encoding.word(&mut written, usize.toU64(count))
+  at = usize.ZERO
+  while at < count {
+    let entry = Shared<List<ProviderEntry>>.with<ProviderEntry>(&providers, fn(entries: &List<ProviderEntry>) -> ProviderEntry {
+      return ProviderEntry.copy(&List<ProviderEntry>.asSlice(entries)[at])
+    })
+    if !run writeRequirement(&mut written, &entry.key, DEPTH) { return () }
+    if !run writeType(&mut written, &entry.provider, DEPTH) { return () }
+    at = at + usize.ONE
+  }
+  run Bytes.append(&mut output.*, Bytes.asSlice(&written))
+}
+
+/// Rebuilds a key from its stable declaration and optional shape. Unknown or malformed input
+/// returns none. The result is canonical; its digest must still equal the recorded key's digest.
+pub effect fn read(bytes: &[u8]) -> Option<InstanceKey> ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut reader = StableKey.reader()
+  let declaration = match move run StableKey.readDeclaration(bytes, &mut reader) {
+    Option<DeclarationId>.Some {value} => move value
+    Option<DeclarationId>.None => { return Option<InstanceKey>.none() }
+  }
+  if StableKey.finished(bytes, &reader) { return Option<InstanceKey>.some(run InstanceKey.named(&run Types.internDeclaration(move declaration))) }
+  let mut arguments = List<Argument>.make()
+  let mut ordinals = List<usize>.make()
+  if !run readArguments(bytes, &mut reader, &mut arguments, &mut ordinals, DEPTH) { return Option<InstanceKey>.none() }
+  let mut scopes = List<ScopeBinding>.make()
+  let count = readCount(bytes, &mut reader)
+  let mut at = usize.ZERO
+  while at < count && !StableKey.failed(&reader) {
+    let owner = match move run StableKey.readDeclaration(bytes, &mut reader) {
+      Option<DeclarationId>.Some {value} => run Types.internDeclaration(move value)
+      Option<DeclarationId>.None => { return Option<InstanceKey>.none() }
+    }
+    let mut supplied = List<Argument>.make()
+    let mut positions = List<usize>.make()
+    let mut statics = List<StaticSlot>.make()
+    if !run readArguments(bytes, &mut reader, &mut supplied, &mut positions, DEPTH) { return Option<InstanceKey>.none() }
+    if !run readStatics(bytes, &mut reader, &mut statics) { return Option<InstanceKey>.none() }
+    run List<ScopeBinding>.append(&mut scopes, ScopeBinding {owner: move owner, arguments: move supplied,
+      argumentOrdinals: move positions, statics: move statics})
+    at = at + usize.ONE
+  }
+  let mut statics = List<StaticSlot>.make()
+  if !run readStatics(bytes, &mut reader, &mut statics) { return Option<InstanceKey>.none() }
+  let countProviders = readCount(bytes, &mut reader)
+  let mut served = List<ProviderEntry>.make()
+  at = usize.ZERO
+  while at < countProviders && !StableKey.failed(&reader) {
+    let key = match move run readRequirement(bytes, &mut reader, DEPTH) {
+      Option<Requirement>.Some {value} => move value
+      Option<Requirement>.None => { return Option<InstanceKey>.none() }
+    }
+    let provider = match move run readType(bytes, &mut reader, DEPTH) {
+      Option<Interned<Type>>.Some {value} => move value
+      Option<Interned<Type>>.None => { return Option<InstanceKey>.none() }
+    }
+    run List<ProviderEntry>.append(&mut served, ProviderEntry {key: move key, provider: move provider})
+    at = at + usize.ONE
+  }
+  if !StableKey.finished(bytes, &reader) { return Option<InstanceKey>.none() }
+  let application = Application {target: Target.Named {declaration: move declaration}, arguments: move arguments,
+    argumentOrdinals: move ordinals, scopes: move scopes, statics: move statics}
+  return match move run InstanceKey.canonical(move application, move served) {
+    Result<InstanceKey, CanonicalizationFailure>.Success {value} => Option<InstanceKey>.some(move value)
+    Result<InstanceKey, CanonicalizationFailure>.Failure {..} => Option<InstanceKey>.none()
+  }
+}
+
+// A count cannot exceed the remaining words. Force the reader failed on an impossible count.
+fn readCount(bytes: &[u8], reader: &mut StableKey.Reader) -> usize {
+  let count = StableKey.readWord(bytes, &mut reader.*)
+  if count > usize.toU64((bytes.length - StableKey.offset(&reader.*)) / 8) {
+    drop StableKey.readWord(&[], &mut reader.*)
+    return usize.ZERO
+  }
+  return u64.toUsize(count)
+}
+
+effect fn writeLifetime(output: &mut Bytes, value: &Interned<Lifetime>) -> bool ! OutOfMemoryError ? &mut Allocator {
+  match &Interned<Lifetime>.get(value).* {
+    Lifetime.Static => { run Encoding.word(&mut output.*, 0) }
+    Lifetime.Supplied {ordinal} => {
+      run Encoding.word(&mut output.*, 1)
+      run Encoding.word(&mut output.*, usize.toU64(ordinal))
+    }
+    _ => { return false }
+  }
+  return true
+}
+
+effect fn readLifetime(bytes: &[u8], reader: &mut StableKey.Reader) -> Option<Interned<Lifetime>>
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let kind = StableKey.readWord(bytes, &mut reader.*)
+  let lifetime = match kind {
+    0 => Lifetime.Static
+    1 => Lifetime.Supplied {ordinal: u64.toUsize(StableKey.readWord(bytes, &mut reader.*))}
+    _ => { return Option<Interned<Lifetime>>.none() }
+  }
+  if StableKey.failed(&reader.*) { return Option<Interned<Lifetime>>.none() }
+  return Option<Interned<Lifetime>>.some(run Types.internLifetime(move lifetime))
+}
+
+effect fn writeArguments(output: &mut Bytes, arguments: &[Argument], ordinals: &[usize], depth: usize) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  if arguments.length != ordinals.length { return false }
+  run Encoding.word(&mut output.*, usize.toU64(arguments.length))
+  let mut at = usize.ZERO
+  while at < arguments.length {
+    run Encoding.word(&mut output.*, usize.toU64(ordinals[at]))
+    if !run writeArgument(&mut output.*, &arguments[at], depth) { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+effect fn readArguments(bytes: &[u8], reader: &mut StableKey.Reader, arguments: &mut List<Argument>, ordinals: &mut List<usize>, depth: usize)
+  -> bool ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let count = readCount(bytes, &mut reader.*)
+  let mut at = usize.ZERO
+  while at < count && !StableKey.failed(&reader.*) {
+    let ordinal = StableKey.readWord(bytes, &mut reader.*)
+    let value = match move run readArgument(bytes, &mut reader.*, depth) {
+      Option<Argument>.Some {value} => move value
+      Option<Argument>.None => { return false }
+    }
+    run List<Argument>.append(&mut arguments.*, move value)
+    run List<usize>.append(&mut ordinals.*, u64.toUsize(ordinal))
+    at = at + usize.ONE
+  }
+  return !StableKey.failed(&reader.*)
+}
+
+effect fn writeArgument(output: &mut Bytes, value: &Argument, depth: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
+  match &value.* {
+    Argument.Type {value: ty} => { run Encoding.word(&mut output.*, 0) return run writeType(&mut output.*, &ty, depth) }
+    Argument.Lifetime {value: lifetime} => { run Encoding.word(&mut output.*, 1) return run writeLifetime(&mut output.*, &lifetime) }
+    Argument.Row {value: row} => {
+      if depth == usize.ZERO || Bytes.length(&output.*) > 1048576 { return false }
+      let held = Interned<Row>.get(&row)
+      if List<RowParameter>.length(&held.parameters) != usize.ZERO || List<RowSubtraction>.length(&held.subtractions) != usize.ZERO { return false }
+      run Encoding.word(&mut output.*, 2)
+      let entries = List<Requirement>.asSlice(&held.entries)
+      run Encoding.word(&mut output.*, usize.toU64(entries.length))
+      let mut at = usize.ZERO
+      while at < entries.length {
+        if !run writeRequirement(&mut output.*, &entries[at], depth - usize.ONE) { return false }
+        at = at + usize.ONE
+      }
+      return true
+    }
+  }
+}
+
+effect fn readArgument(bytes: &[u8], reader: &mut StableKey.Reader, depth: usize) -> Option<Argument>
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let kind = StableKey.readWord(bytes, &mut reader.*)
+  if kind == 0 {
+    if let Option<Interned<Type>>.Some {value} = move run readType(bytes, &mut reader.*, depth) {
+      return Option<Argument>.some(Argument.Type {value: move value})
+    }
+  } else if kind == 1 {
+    if let Option<Interned<Lifetime>>.Some {value} = move run readLifetime(bytes, &mut reader.*) {
+      return Option<Argument>.some(Argument.Lifetime {value: move value})
+    }
+  } else if kind == 2 && depth > usize.ZERO {
+    let count = readCount(bytes, &mut reader.*)
+    let mut entries = List<Requirement>.make()
+    let mut at = usize.ZERO
+    while at < count && !StableKey.failed(&reader.*) {
+      let entry = match move run readRequirement(bytes, &mut reader.*, depth - usize.ONE) {
+        Option<Requirement>.Some {value} => move value
+        Option<Requirement>.None => { return Option<Argument>.none() }
+      }
+      run List<Requirement>.append(&mut entries, move entry)
+      at = at + usize.ONE
+    }
+    if !StableKey.failed(&reader.*) {
+      return Option<Argument>.some(Argument.Row {value: run Types.internRow(Row {entries: move entries,
+        parameters: List<RowParameter>.make(), subtractions: List<RowSubtraction>.make()})})
+    }
+  }
+  return Option<Argument>.none()
+}
+
+effect fn writeRequirement(output: &mut Bytes, value: &Requirement, depth: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
+  if !run writeType(&mut output.*, &value.capability, depth) { return false }
+  if let Option<Interned<Type>>.Some {value: roleValue} = &value.roleType {
+    run Encoding.word(&mut output.*, 1)
+    if !run writeType(&mut output.*, &roleValue, depth) { return false }
+  } else { run Encoding.word(&mut output.*, 0) }
+  run Encoding.word(&mut output.*, accessWord(value.access))
+  return true
+}
+
+effect fn readRequirement(bytes: &[u8], reader: &mut StableKey.Reader, depth: usize) -> Option<Requirement>
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let capability = match move run readType(bytes, &mut reader.*, depth) {
+    Option<Interned<Type>>.Some {value} => move value
+    Option<Interned<Type>>.None => { return Option<Requirement>.none() }
+  }
+  let roleKind = StableKey.readWord(bytes, &mut reader.*)
+  let mut roleValue = Option<Interned<Type>>.none()
+  if roleKind == 1 {
+    roleValue = run readType(bytes, &mut reader.*, depth)
+    if let Option<Interned<Type>>.None = &roleValue { return Option<Requirement>.none() }
+  } else if roleKind != 0 { return Option<Requirement>.none() }
+  let access = StableKey.readWord(bytes, &mut reader.*)
+  if access > 1 || StableKey.failed(&reader.*) { return Option<Requirement>.none() }
+  return Option<Requirement>.some(Requirement {capability: move capability, roleType: move roleValue, access: readAccess(access)})
+}
+
+fn accessWord(access: Access) -> u64 { return match access { Access.Shared => 0 Access.Mutable => 1 } }
+fn readAccess(word: u64) -> Access { if word == 1 { return Access.Mutable } return Access.Shared }
+
+effect fn writeType(output: &mut Bytes, value: &Interned<Type>, depth: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
+  if depth == usize.ZERO || Bytes.length(&output.*) > 1048576 { return false }
+  let next = depth - usize.ONE
+  match &Interned<Type>.get(value).* {
+    Type.Primitive {name} => { run Encoding.word(&mut output.*, 0) run Encoding.field(&mut output.*, Bytes.asSlice(&name)) }
+    Type.Unit => { run Encoding.word(&mut output.*, 1) }
+    Type.Nominal {declaration, isPublic, arguments} => {
+      run Encoding.word(&mut output.*, 2)
+      run StableKey.declaration(&mut output.*, &declaration)
+      let mut visible: u64 = 0
+      if isPublic { visible = 1 }
+      run Encoding.word(&mut output.*, visible)
+      let listed = List<Argument>.asSlice(&arguments)
+      run Encoding.word(&mut output.*, usize.toU64(listed.length))
+      let mut at = usize.ZERO
+      while at < listed.length {
+        if !run writeArgument(&mut output.*, &listed[at], next) { return false }
+        at = at + usize.ONE
+      }
+    }
+    Type.String {lifetime} => { run Encoding.word(&mut output.*, 3) return run writeLifetime(&mut output.*, &lifetime) }
+    Type.Reference {referent, access, lifetime} => {
+      run Encoding.word(&mut output.*, 4)
+      run Encoding.word(&mut output.*, accessWord(access))
+      if !run writeLifetime(&mut output.*, &lifetime) { return false }
+      return run writeType(&mut output.*, &referent, next)
+    }
+    Type.Slice {element, access, lifetime} => {
+      run Encoding.word(&mut output.*, 5)
+      run Encoding.word(&mut output.*, accessWord(access))
+      if !run writeLifetime(&mut output.*, &lifetime) { return false }
+      return run writeType(&mut output.*, &element, next)
+    }
+    Type.Pointer {pointee, access, nullable, multiplicity, alignment} => {
+      run Encoding.word(&mut output.*, 6)
+      run Encoding.word(&mut output.*, accessWord(access))
+      let mut nullWord: u64 = 0
+      if nullable { nullWord = 1 }
+      run Encoding.word(&mut output.*, nullWord)
+      run Encoding.word(&mut output.*, match multiplicity { Multiplicity.Single => 0 Multiplicity.Many => 1 })
+      if let Option<u64>.Some {value: aligned} = &alignment {
+        run Encoding.word(&mut output.*, 1)
+        run Encoding.word(&mut output.*, aligned)
+      } else { run Encoding.word(&mut output.*, 0) }
+      return run writeType(&mut output.*, &pointee, next)
+    }
+    Type.Array {element, extent} => {
+      run Encoding.word(&mut output.*, 7)
+      run Encoding.field(&mut output.*, Bytes.asSlice(&extent))
+      return run writeType(&mut output.*, &element, next)
+    }
+    Type.Vector {element, lanes} => {
+      run Encoding.word(&mut output.*, 8)
+      run Encoding.field(&mut output.*, Bytes.asSlice(&lanes))
+      return run writeType(&mut output.*, &element, next)
+    }
+    Type.Union {members} => {
+      run Encoding.word(&mut output.*, 9)
+      let listed = List<Interned<Type>>.asSlice(&members)
+      run Encoding.word(&mut output.*, usize.toU64(listed.length))
+      let mut at = usize.ZERO
+      while at < listed.length {
+        if !run writeType(&mut output.*, &listed[at], next) { return false }
+        at = at + usize.ONE
+      }
+    }
+    _ => { return false }
+  }
+  return true
+}
+
+effect fn readType(bytes: &[u8], reader: &mut StableKey.Reader, depth: usize) -> Option<Interned<Type>>
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  if depth == usize.ZERO || StableKey.failed(&reader.*) { return Option<Interned<Type>>.none() }
+  let next = depth - usize.ONE
+  let kind = StableKey.readWord(bytes, &mut reader.*)
+  let mut branch = kind
+  if kind == 5 { branch = 4 }
+  if kind == 8 { branch = 7 }
+  let node = match branch {
+    0 => {
+      let field = StableKey.readField(bytes, &mut reader.*)
+      Type.Primitive {name: run Bytes.copy(StableKey.view(bytes, field))}
+    }
+    1 => Type.Unit
+    2 => {
+      let declaration = match move run StableKey.readDeclaration(bytes, &mut reader.*) {
+        Option<DeclarationId>.Some {value} => move value
+        Option<DeclarationId>.None => { return Option<Interned<Type>>.none() }
+      }
+      let visible = StableKey.readWord(bytes, &mut reader.*)
+      if visible > 1 { return Option<Interned<Type>>.none() }
+      let count = readCount(bytes, &mut reader.*)
+      let mut arguments = List<Argument>.make()
+      let mut at = usize.ZERO
+      while at < count && !StableKey.failed(&reader.*) {
+        let argument = match move run readArgument(bytes, &mut reader.*, next) {
+          Option<Argument>.Some {value} => move value
+          Option<Argument>.None => { return Option<Interned<Type>>.none() }
+        }
+        run List<Argument>.append(&mut arguments, move argument)
+        at = at + usize.ONE
+      }
+      Type.Nominal {declaration: move declaration, isPublic: visible == 1, arguments: move arguments}
+    }
+    3 => {
+      let lifetime = match move run readLifetime(bytes, &mut reader.*) {
+        Option<Interned<Lifetime>>.Some {value} => move value
+        Option<Interned<Lifetime>>.None => { return Option<Interned<Type>>.none() }
+      }
+      Type.String {lifetime: move lifetime}
+    }
+    4 => {
+      let access = StableKey.readWord(bytes, &mut reader.*)
+      if access > 1 { return Option<Interned<Type>>.none() }
+      let lifetime = match move run readLifetime(bytes, &mut reader.*) {
+        Option<Interned<Lifetime>>.Some {value} => move value
+        Option<Interned<Lifetime>>.None => { return Option<Interned<Type>>.none() }
+      }
+      let element = match move run readType(bytes, &mut reader.*, next) {
+        Option<Interned<Type>>.Some {value} => move value
+        Option<Interned<Type>>.None => { return Option<Interned<Type>>.none() }
+      }
+      if kind == 4 { Type.Reference {referent: move element, access: readAccess(access), lifetime: move lifetime} }
+      else { Type.Slice {element: move element, access: readAccess(access), lifetime: move lifetime} }
+    }
+    6 => {
+      let access = StableKey.readWord(bytes, &mut reader.*)
+      let nullable = StableKey.readWord(bytes, &mut reader.*)
+      let many = StableKey.readWord(bytes, &mut reader.*)
+      let aligned = StableKey.readWord(bytes, &mut reader.*)
+      if access > 1 || nullable > 1 || many > 1 || aligned > 1 { return Option<Interned<Type>>.none() }
+      let mut alignment = Option<u64>.none()
+      if aligned == 1 { alignment = Option<u64>.some(StableKey.readWord(bytes, &mut reader.*)) }
+      let pointee = match move run readType(bytes, &mut reader.*, next) {
+        Option<Interned<Type>>.Some {value} => move value
+        Option<Interned<Type>>.None => { return Option<Interned<Type>>.none() }
+      }
+      let mut multiplicity = Multiplicity.Single
+      if many == 1 { multiplicity = Multiplicity.Many }
+      Type.Pointer {pointee: move pointee, access: readAccess(access), nullable: nullable == 1,
+        multiplicity: multiplicity, alignment: move alignment}
+    }
+    7 => {
+      let field = StableKey.readField(bytes, &mut reader.*)
+      let extent = run Bytes.copy(StableKey.view(bytes, field))
+      let element = match move run readType(bytes, &mut reader.*, next) {
+        Option<Interned<Type>>.Some {value} => move value
+        Option<Interned<Type>>.None => { return Option<Interned<Type>>.none() }
+      }
+      if kind == 7 { Type.Array {element: move element, extent: move extent} }
+      else { Type.Vector {element: move element, lanes: move extent} }
+    }
+    9 => {
+      let count = readCount(bytes, &mut reader.*)
+      let mut members = List<Interned<Type>>.make()
+      let mut at = usize.ZERO
+      while at < count && !StableKey.failed(&reader.*) {
+        let member = match move run readType(bytes, &mut reader.*, next) {
+          Option<Interned<Type>>.Some {value} => move value
+          Option<Interned<Type>>.None => { return Option<Interned<Type>>.none() }
+        }
+        run List<Interned<Type>>.append(&mut members, move member)
+        at = at + usize.ONE
+      }
+      Type.Union {members: move members}
+    }
+    _ => { return Option<Interned<Type>>.none() }
+  }
+  if StableKey.failed(&reader.*) { return Option<Interned<Type>>.none() }
+  return Option<Interned<Type>>.some(run Types.intern(move node))
+}
+
+// Static admission evidence and aggregate recipes stay with the evaluator; only complete scalars
+// and byte runs can be reconstructed without minting that evidence.
+effect fn writeStatics(output: &mut Bytes, values: &[StaticSlot]) -> bool ! OutOfMemoryError ? &mut Allocator {
+  run Encoding.word(&mut output.*, usize.toU64(values.length))
+  let mut at = usize.ZERO
+  while at < values.length {
+    run Encoding.word(&mut output.*, usize.toU64(values[at].ordinal))
+    match &Interned<Value>.get(&values[at].value).* {
+      Value.Unit => { run Encoding.word(&mut output.*, 0) }
+      Value.Boolean {value} => {
+        run Encoding.word(&mut output.*, 1)
+        let mut word: u64 = 0
+        if value { word = 1 }
+        run Encoding.word(&mut output.*, word)
+      }
+      Value.Integer {ty, sign, magnitude} => {
+        run Encoding.word(&mut output.*, 2)
+        run Encoding.word(&mut output.*, integerWord(ty))
+        let mut negative: u64 = 0
+        if sign == Sign.Negative { negative = 1 }
+        run Encoding.word(&mut output.*, negative)
+        run Encoding.word(&mut output.*, magnitude)
+      }
+      Value.Float {ty, bits} => {
+        run Encoding.word(&mut output.*, 3)
+        let mut wide: u64 = 0
+        if ty == FloatType.F64 { wide = 1 }
+        run Encoding.word(&mut output.*, wide)
+        run Encoding.word(&mut output.*, bits)
+      }
+      Value.Text {bytes} => { run Encoding.word(&mut output.*, 4) run Encoding.field(&mut output.*, Bytes.asSlice(&bytes)) }
+      Value.Bytes {bytes} => { run Encoding.word(&mut output.*, 5) run Encoding.field(&mut output.*, Bytes.asSlice(&bytes)) }
+      _ => { return false }
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn integerWord(value: IntegerType) -> u64 {
+  return match value {
+    IntegerType.U8 => 0 IntegerType.U16 => 1 IntegerType.U32 => 2 IntegerType.U64 => 3 IntegerType.Usize => 4
+    IntegerType.I8 => 5 IntegerType.I16 => 6 IntegerType.I32 => 7 IntegerType.I64 => 8 IntegerType.Isize => 9
+  }
+}
+
+fn readInteger(value: u64) -> IntegerType {
+  return match value {
+    0 => IntegerType.U8 1 => IntegerType.U16 2 => IntegerType.U32 3 => IntegerType.U64 4 => IntegerType.Usize
+    5 => IntegerType.I8 6 => IntegerType.I16 7 => IntegerType.I32 8 => IntegerType.I64 _ => IntegerType.Isize
+  }
+}
+
+effect fn readStatics(bytes: &[u8], reader: &mut StableKey.Reader, values: &mut List<StaticSlot>) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  let count = readCount(bytes, &mut reader.*)
+  let mut at = usize.ZERO
+  while at < count && !StableKey.failed(&reader.*) {
+    let ordinal = StableKey.readWord(bytes, &mut reader.*)
+    let kind = StableKey.readWord(bytes, &mut reader.*)
+    let mut branch = kind
+    if kind == 5 { branch = 4 }
+    let value = match branch {
+      0 => Value.Unit
+      1 => {
+        let word = StableKey.readWord(bytes, &mut reader.*)
+        if word > 1 { return false }
+        Value.Boolean {value: word == 1}
+      }
+      2 => {
+        let ty = StableKey.readWord(bytes, &mut reader.*)
+        let negative = StableKey.readWord(bytes, &mut reader.*)
+        let magnitude = StableKey.readWord(bytes, &mut reader.*)
+        if ty > 9 || negative > 1 { return false }
+        let mut sign = Sign.Positive
+        if negative == 1 { sign = Sign.Negative }
+        Value.Integer {ty: readInteger(ty), sign: sign, magnitude: magnitude}
+      }
+      3 => {
+        let wide = StableKey.readWord(bytes, &mut reader.*)
+        let bits = StableKey.readWord(bytes, &mut reader.*)
+        if wide > 1 { return false }
+        let mut ty = FloatType.F32
+        if wide == 1 { ty = FloatType.F64 }
+        Value.Float {ty: ty, bits: bits}
+      }
+      4 => {
+        let field = StableKey.readField(bytes, &mut reader.*)
+        let content = run Bytes.copy(StableKey.view(bytes, field))
+        if kind == 4 { Value.Text {bytes: move content} } else { Value.Bytes {bytes: move content} }
+      }
+      _ => { return false }
+    }
+    if StableKey.failed(&reader.*) { return false }
+    run List<StaticSlot>.append(&mut values.*, StaticSlot {ordinal: u64.toUsize(ordinal), value: run Interned<Value>.make(move value)})
+    at = at + usize.ONE
+  }
+  return !StableKey.failed(&reader.*)
+}
