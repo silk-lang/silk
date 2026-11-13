@@ -65,8 +65,10 @@ Each read checks the result of the system.
 ### Gotchas
 - A failed call or a bad result is a trap.
 - A wait blocks the whole thread. It does not let another fiber run.
-- A call fails to compile on targets other than WASI, Windows on x86_64, Darwin on x86_64 or
-  aarch64, and GNU Linux on x86_64 or aarch64.
+- On `wasm32-unknown-unknown`, it reads the host's `silk.clock` import, and a wait reads the
+  clock until the deadline.
+- A call fails to compile on targets other than a JavaScript host, WASI, Windows on x86_64,
+  Darwin on x86_64 or aarch64, and GNU Linux on x86_64 or aarch64.
 
 <a id="NativeClock.impl"></a>
 
@@ -128,7 +130,8 @@ Waits in one `poll` until a handle in `watch` is ready or the monotonic clock re
 `until`, and returns how many handles are ready.
 
 It clears the events of each watch first. An empty `watch` waits until `until`. A signal that
-interrupts the poll does not end the wait. WASI has no handles to poll, so a watch there traps.
+interrupts the poll does not end the wait. WebAssembly has no handles to poll, so a watch there
+traps.
 
 <a id="NativeClock.impl.pollNow"></a>
 
