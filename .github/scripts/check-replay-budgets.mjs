@@ -6,7 +6,9 @@
 // Every step must appear in order with its budgeted kind and module. An edit's units run and units
 // marked outdated must stay within budget, and so must its demands, as a fraction of the initial
 // check's: rechecking walks every root again, so that walk is the fixed cost of an update and
-// grows with the workspace. Its `update-us` must stay within the entry's per-update limit. A
+// grows with the workspace. Its `update-us` must stay within the entry's per-update limit, except
+// in a `--differential` log: there each update follows a one-shot store that the replay dropped and
+// returned to the system, so it times page faults the check server never takes. A
 // budgeted rejection count must match exactly, and a budgeted `unchanged` count is a floor: that
 // many reruns must complete answers that hash equal to the ones they replace. A budgeted `verified`
 // count is a floor too: that many outdated units must be confirmed current without rerunning. A
@@ -89,6 +91,7 @@ for (const line of readFileSync(logPath, 'utf8').split('\n')) {
   }
 }
 
+const differential = differences.size > 0;
 const failures = [];
 const rows = [];
 const budgets = entry.steps;
@@ -147,7 +150,7 @@ for (let at = 0; at < Math.min(steps.length, budgets.length); at += 1) {
     if (fraction > budget.demandsFraction) {
       failures.push(`${label}: demands are ${fraction.toFixed(3)} of the initial check's, over the budget of ${budget.demandsFraction}`);
     }
-    if (Number(step['update-us']) > entry.updateMicroseconds) {
+    if (!differential && Number(step['update-us']) > entry.updateMicroseconds) {
       failures.push(`${label}: update-us=${step['update-us']} exceeds the per-update limit of ${entry.updateMicroseconds}`);
     }
   }
