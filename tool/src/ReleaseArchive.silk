@@ -2,6 +2,7 @@
 
 import silk.collections.bytes {Bytes}
 import silk.collections.slice {Slice}
+import silk.compress.inflate {DecodeError, Decoder, Format as InflateFormat, Limits as InflateLimits, MEMORY_BOUND as INFLATE_MEMORY_BOUND, Progress, Status as InflateStatus}
 import silk.compress.tar {TarError, TarKind, TarProgress, TarReader, TarStatus}
 import silk.compress.zip {ZipError, ZipKind, ZipMember, ZipReader}
 import silk.collections.hash {Hash, HashSeed, HashKey}
@@ -14,9 +15,10 @@ import silk.core.effect {Effect}
 import silk.mem.allocator {Allocator, OutOfMemoryError}
 import silk.text.string {String}
 
-/// A malformed release container: its format's structural reason, a repeated path, a member that
-/// is neither a file nor a directory, or a path with an empty or `.` segment.
-pub union ArchiveError {Tar {pub error: TarError}, Zip {pub error: ZipError}, Duplicate, UnsupportedMember, UnsafePath}
+/// A malformed release container: gzip that does not decode, its format's structural reason, a
+/// repeated path, a member that is neither a file nor a directory, or a path with an empty or `.`
+/// segment.
+pub union ArchiveError {Gzip, Tar {pub error: TarError}, Zip {pub error: ZipError}, Duplicate, UnsupportedMember, UnsafePath}
 
 // Whether `path` is not empty and has no empty or `.` segment. The format readers have already
 // refused absolute paths and `..` segments.
@@ -34,7 +36,27 @@ fn ordinary(path: &[u8]) -> bool {
 }
 
 /// A reader for the target's release container.
-union ContainerReader<'a> {Tar {reader: TarReader, archive: &'a [u8], offset: usize}, Zip {reader: ZipReader<'a>}}
+union ContainerReader<'a> {Tar {stream: TarStream<'a>}, Zip {reader: ZipReader<'a>}}
+
+/// A `.tar.gz` release decoded as it is read: the gzip decoder, the tar reader, the compressed
+/// bytes and how far the decoder has read them, and the decoded piece the tar reader has not
+/// consumed yet.
+struct TarStream<'a> {
+  decoder: Decoder,
+  reader: TarReader,
+  archive: &'a [u8],
+  offset: usize,
+  chunk: Bytes,
+  start: usize,
+  end: usize,
+  finished: bool,
+}
+
+// The decoded bytes a release `.tar.gz` may hold: 1 GiB.
+const TAR_LIMIT: u64 = 1073741824
+
+// The decoded piece the tar reader gets at a time: 64 KiB.
+const CHUNK: usize = 65536
 
 /// A member's relative path and decoded data. Directories have empty content.
 struct MemberPath {bytes: Bytes}
@@ -88,15 +110,38 @@ pub fn windows(target: &[u8]) -> bool {
 // The decoded bytes a release ZIP may hold: 1 GiB.
 const ZIP_LIMIT: u64 = 1073741824
 
-/// Opens ZIP for Windows or an already decompressed tar stream for other targets.
-pub fn reader<'a>(archive: &'a [u8], windows: bool) -> Result<ArchiveReader<'a>, ArchiveError> {
+/// Opens ZIP for Windows, or a gzip-compressed tar stream for other targets, which is decoded as
+/// it is read.
+///
+/// # Errors
+/// - `ArchiveError` when the ZIP directory is corrupt, or the gzip decoder cannot start.
+/// - `OutOfMemoryError` when the decoder's storage cannot be allocated.
+pub effect fn reader<'a>(archive: &'a [u8], windows: bool) -> Result<ArchiveReader<'a>, ArchiveError>
+  ! OutOfMemoryError ? &mut Allocator {
   if windows {
     return match ZipReader.open(archive, ZIP_LIMIT) {
       Result.Success {value} => Result<ArchiveReader<'a>, ArchiveError>.succeed(ArchiveReader {container: ContainerReader.Zip {reader: move value}, seen: HashSet<MemberPath>.make(Hash.seed(0))})
       Result.Failure {error} => Result<ArchiveReader<'a>, ArchiveError>.failResult(ArchiveError.Zip {error: error})
     }
   }
-  return Result<ArchiveReader<'a>, ArchiveError>.succeed(ArchiveReader {container: ContainerReader.Tar {reader: TarReader.make(), archive: archive, offset: 0}, seen: HashSet<MemberPath>.make(Hash.seed(0))})
+  let limits = InflateLimits {
+    maxInputBytes: usize.toU64(archive.length),
+    maxOutputBytes: TAR_LIMIT,
+    maxMembers: 1,
+    maxHeaderBytes: 65536,
+    maxMemoryBytes: INFLATE_MEMORY_BOUND,
+  }
+  let made = run Effect.result(Decoder.make(InflateFormat.Gzip, move limits))
+  let decoder = match move made {
+    Result<Decoder, OutOfMemoryError | DecodeError>.Success {value} => move value
+    Result<Decoder, OutOfMemoryError | DecodeError>.Failure {error} => match move error {
+      OutOfMemoryError exhausted => { fail move exhausted }
+      DecodeError _invalid => { return Result<ArchiveReader<'a>, ArchiveError>.failResult(ArchiveError.Gzip) }
+    }
+  }
+  let stream = TarStream<'a> {decoder: move decoder, reader: TarReader.make(), archive: archive, offset: 0,
+    chunk: run Bytes.zeroed(CHUNK), start: 0, end: 0, finished: false}
+  return Result<ArchiveReader<'a>, ArchiveError>.succeed(ArchiveReader {container: ContainerReader.Tar {stream: move stream}, seen: HashSet<MemberPath>.make(Hash.seed(0))})
 }
 
 impl<'a> ContainerReader<'a> {
@@ -104,7 +149,7 @@ impl<'a> ContainerReader<'a> {
   effect fn next(self: &mut ContainerReader<'_>) -> Option<ArchiveMember>
     ! ArchiveError | OutOfMemoryError ? &mut Allocator {
     match &mut self.* {
-      ContainerReader.Tar {reader, archive, offset} => { return run tarNext(&mut reader, archive, &mut offset) }
+      ContainerReader.Tar {stream} => { return run tarNext(&mut stream) }
       ContainerReader.Zip {reader} => {
         let next = match ZipReader.next(&mut reader) {
           Result.Success {value} => move value
@@ -130,8 +175,9 @@ impl<'a> ContainerReader<'a> {
   }
 }
 
-// Reads the next tar member of `archive` from `offset`, with all its content.
-effect fn tarNext(reader: &mut TarReader, archive: &[u8], offset: &mut usize) -> Option<ArchiveMember>
+// Reads the next tar member of `stream`, with all its content, decoding more gzip as the tar
+// reader needs it.
+effect fn tarNext(stream: &mut TarStream<'_>) -> Option<ArchiveMember>
   ! ArchiveError | OutOfMemoryError ? &mut Allocator {
   let mut name = Bytes.make()
   let mut directory = false
@@ -139,16 +185,28 @@ effect fn tarNext(reader: &mut TarReader, archive: &[u8], offset: &mut usize) ->
   let mut content = Bytes.make()
   let mut started = false
   while true {
-    let rest = Slice.view<u8>(archive, offset.*, archive.length - offset.*)
-    let progress = match TarReader.step(&mut reader.*, rest, true) {
+    if stream.start == stream.end && !stream.finished {
+      let input = Slice.view<u8>(stream.archive, stream.offset, stream.archive.length - stream.offset)
+      let decoded = match Decoder.step(&mut stream.decoder, input, Bytes.asMutSlice(&mut stream.chunk), true) {
+        Result<Progress, DecodeError>.Success {value} => move value
+        Result<Progress, DecodeError>.Failure {..} => { fail ArchiveError.Gzip }
+      }
+      stream.offset = stream.offset + decoded.consumed
+      stream.start = 0
+      stream.end = decoded.written
+      stream.finished = decoded.status == InflateStatus.Finished
+      if !stream.finished && decoded.consumed == 0 && decoded.written == 0 { fail ArchiveError.Gzip }
+    }
+    let rest = Slice.view<u8>(Bytes.asSlice(&stream.chunk), stream.start, stream.end - stream.start)
+    let progress = match TarReader.step(&mut stream.reader, rest, stream.finished) {
       Result<TarProgress, TarError>.Success {value} => value
       Result<TarProgress, TarError>.Failure {error} => { fail ArchiveError.Tar {error: error} }
     }
-    offset.* = offset.* + progress.consumed
+    stream.start = stream.start + progress.consumed
     if progress.status == TarStatus.End { return Option<ArchiveMember>.none() }
     if progress.status == TarStatus.Content { run Bytes.append(&mut content, Slice.view<u8>(rest, 0, progress.consumed)) }
     if progress.status == TarStatus.Member {
-      let member = TarReader.member(&reader.*)
+      let member = TarReader.member(&stream.reader)
       // A release holds only files and directories.
       if member.kind != TarKind.File && member.kind != TarKind.Directory { fail ArchiveError.UnsupportedMember }
       name = run Bytes.copy(member.prefix)
@@ -158,7 +216,7 @@ effect fn tarNext(reader: &mut TarReader, archive: &[u8], offset: &mut usize) ->
       executable = member.executable
       started = true
     }
-    if started && TarReader.remaining(&reader.*) == 0 {
+    if started && progress.status != TarStatus.NeedInput && TarReader.remaining(&stream.reader) == 0 {
       return Option<ArchiveMember>.some(ArchiveMember {name: move name, directory: directory, executable: executable, content: move content})
     }
   }
@@ -186,6 +244,7 @@ impl<'a> ArchiveReader<'a> {
 /// A description of the structural error for an install diagnostic.
 pub fn describe(error: ArchiveError) -> &'static [u8] {
   return match move error {
+    ArchiveError.Gzip => b"the release archive is not valid gzip"
     ArchiveError.Tar {error: invalid} => String.utf8Bytes(TarError.describe(invalid))
     ArchiveError.Zip {error: invalid} => String.utf8Bytes(ZipError.describe(invalid))
     ArchiveError.Duplicate => b"the archive repeats a member path"
