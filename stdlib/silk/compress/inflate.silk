@@ -70,16 +70,21 @@
 
 import silk.mem.allocator {Allocator, OutOfMemoryError}
 import silk.mem.layout {Layout}
+import silk.mem.pointer {Pointer}
 import silk.mem.raw_buffer {RawBuffer}
 import silk.text.format {Debug, Format as TextFormat, Formatter}
 import silk.collections.slice {Slice}
 import silk.compress.checksum {CompressionChecksum}
+import silk.encoding.endian
 import silk.core.result {Result}
+import silk.core.target {Arch, Target}
 import silk.num.u8
 import silk.num.u32
 import silk.num.u64
 import silk.num.usize
 import silk.io.writer {Writer, WriterError}
+import silk.simd.cpu {CpuFeatures}
+import silk.simd.u8x16
 
 /// The number of bytes of storage that a [`Decoder`] needs: 64 KiB.
 ///
@@ -577,33 +582,45 @@ const RING: usize = 32768
 const RING_MASK: usize = 32767
 
 // The table storage: the literal/length table, the distance table, and the code-length table.
-// Each has a root part indexed by its root bits and second-level parts after it. The capacities
-// hold the largest tables that valid codes need: a second-level part of 2^k entries holds codes
-// of at least k + 1 symbols, so 288 symbols fill at most 48 parts of 32 entries after a root of
-// 1024, and 32 distance symbols fill at most 4 parts of 128 entries after a root of 256.
+// Each has a root part indexed by its root bits and second-level parts after it. Complete codes
+// of at most 15 bits need fewer than 1400 entries for 288 symbols and 10 root bits, and fewer
+// than 420 entries for 32 symbols and 8 root bits (the search of zlib's `enough` program gives
+// these bounds). The build rejects a code that needs more than its capacity. The capacities are
+// powers of two, so that an index with its high bits cleared is in its table.
 const LITERAL_ROOT: u32 = 10
 const DISTANCE_ROOT: u32 = 8
 const CODE_ROOT: u32 = 7
 const LITERAL_BASE: usize = 0
-const LITERAL_CAPACITY: usize = 2560
-const DISTANCE_BASE: usize = 2560
-const DISTANCE_CAPACITY: usize = 768
-const CODE_BASE: usize = 3328
+const LITERAL_CAPACITY: usize = 2048
+const DISTANCE_BASE: usize = 2048
+const DISTANCE_CAPACITY: usize = 1024
+const CODE_BASE: usize = 3072
 const CODE_CAPACITY: usize = 128
-const TABLE_WORDS: usize = 3456
+const TABLE_WORDS: usize = 3200
 const LENGTH_COUNT: usize = 320
 
-// A table entry is `value << 16 | kind << 12 | extra << 8 | bits`. `bits` is the length of the
-// code. `value` is a literal byte, a code-length symbol, the base of a length or distance whose
-// `extra` bits follow the code, or for a link the offset of a second-level part whose index is the
-// `extra` bits after the root bits.
-const KIND_LITERAL: u32 = 0
-const KIND_BASE: u32 = 1
-const KIND_END: u32 = 2
-const KIND_LINK: u32 = 3
-const KIND_BAD_CODE: u32 = 4
-const KIND_BAD_LENGTH: u32 = 5
-const KIND_BAD_DISTANCE: u32 = 6
+// A table entry is `value << 16 | flags | skip << 8 | take`, in one word that the decode loops
+// read once per symbol.
+//
+// - `take` (8 bits) is how many bits the entry consumes: the code and the extra bits after it. In
+//   a second-level part, it does not count the root bits, which the link consumed.
+// - `skip` (4 bits) is the length of the code within those bits, so the extra bits of a length
+//   or a distance are the consumed bits from bit `skip`.
+// - `value` is a literal byte, a code-length symbol, or the base of a length or a distance.
+//
+// An entry with `ENTRY_LITERAL` is a literal. An entry with `ENTRY_SPECIAL` is one of three
+// things: with `ENTRY_LINK`, a link whose `take` is the root bits, whose `skip` is the index
+// width of a second-level part and whose `value` is the offset of that part; with `ENTRY_END`,
+// the end of the block; with neither, a code that is not valid, whose `value` is a `BAD_` cause.
+// An entry with no flag is a length, a distance or a code-length symbol.
+const ENTRY_LITERAL: u32 = 0x80000000
+const ENTRY_SPECIAL: u32 = 0x8000
+const ENTRY_LINK: u32 = 0x4000
+const ENTRY_END: u32 = 0x2000
+
+const BAD_CODE: u32 = 0
+const BAD_LENGTH: u32 = 1
+const BAD_DISTANCE: u32 = 2
 
 const ALPHABET_LITERAL: u32 = 0
 const ALPHABET_DISTANCE: u32 = 1
@@ -788,49 +805,33 @@ fn bitsAt(acc: u64, shift: u32, width: u32) -> u32 {
   return u64.wrappingToU32(shifted(acc, shift) & lowMask(width))
 }
 
-// Reads 8 bytes at `at` as a little-endian word, with one bounds check.
+// Returns the extra bits of the length or distance `entry`, whose code is at the bottom of `acc`.
 @inlineAlways
-fn load64(buffer: &[u8], at: usize) -> u64 {
-  let bytes = Slice.view<u8>(buffer, at, 8)
-  return u8.toU64(bytes[0]) | u64.shiftLeft(u8.toU64(bytes[1]), 8)
-    | u64.shiftLeft(u8.toU64(bytes[2]), 16)
-    | u64.shiftLeft(u8.toU64(bytes[3]), 24)
-    | u64.shiftLeft(u8.toU64(bytes[4]), 32)
-    | u64.shiftLeft(u8.toU64(bytes[5]), 40)
-    | u64.shiftLeft(u8.toU64(bytes[6]), 48)
-    | u64.shiftLeft(u8.toU64(bytes[7]), 56)
+fn extraBits(acc: u64, entry: u32) -> u32 {
+  return u64.wrappingToU32(
+    u64.shiftRight(acc & lowMask(entry & 255), u32.toU64(u32.shiftRight(entry, 8) & 15)),
+  )
 }
 
-// Writes `value` as 8 little-endian bytes at `at`, with one bounds check.
-@inlineAlways
-fn store64(buffer: &mut [u8], at: usize, value: u64) -> () {
-  let bytes = Slice.viewMut<u8>(move buffer, at, 8)
-  bytes[0] = u64.wrappingToU8(value)
-  bytes[1] = u64.wrappingToU8(u64.shiftRight(value, 8))
-  bytes[2] = u64.wrappingToU8(u64.shiftRight(value, 16))
-  bytes[3] = u64.wrappingToU8(u64.shiftRight(value, 24))
-  bytes[4] = u64.wrappingToU8(u64.shiftRight(value, 32))
-  bytes[5] = u64.wrappingToU8(u64.shiftRight(value, 40))
-  bytes[6] = u64.wrappingToU8(u64.shiftRight(value, 48))
-  bytes[7] = u64.wrappingToU8(u64.shiftRight(value, 56))
-}
-
-// Fills the bit buffer to at least 57 bits, or with all of the input up to the input limit. The
-// bits above `count` stay zero.
+// Fills the bit buffer to at least 56 bits and at most 63, or with all of the input up to the
+// input limit. The bits above `count` stay zero.
 @inlineAlways
 fn fill(state: &mut Decoder, input: &[u8]) -> () {
-  if state.count > 56 {
+  if state.count >= 56 {
     return ()
   }
   if state.inputEnd - state.inputPosition >= 8 {
     let take = (63 - state.count) / 8
-    let word = u64.shiftLeft(load64(input, state.inputPosition), u32.toU64(state.count & 63))
+    let word = u64.shiftLeft(
+      endian.readU64LittleEndian(input, state.inputPosition),
+      u32.toU64(state.count & 63),
+    )
     state.count = state.count + take * 8
     state.acc = state.acc | (word & lowMask(state.count))
     state.inputPosition = state.inputPosition + u32.toUsize(take)
     return ()
   }
-  while state.count <= 56 && state.inputPosition < state.inputEnd {
+  while state.count < 56 && state.inputPosition < state.inputEnd {
     state.acc = state.acc
       | u64.shiftLeft(u8.toU64(input[state.inputPosition]), u32.toU64(state.count))
     state.count = state.count + 8
@@ -878,27 +879,18 @@ fn headerByte(state: &mut Decoder, input: &[u8], checksum: bool) -> u32 {
 }
 
 // Looks up the code at the bottom of `acc` in the table at `base` with `root` index bits. Returns
-// the entry of the symbol, with the full code length in its low bits. The bits above the buffer
-// count are zero, so a code that fits in the buffer is found correctly.
+// the entry of the symbol, with the root bits of a second-level entry added to its `take` and
+// `skip`, so they count from the start of the code. The bits above the buffer count are zero, so
+// an entry whose `take` fits in the buffer is the entry of the code that is there.
 @inlineAlways
 fn lookup(table: &[u32], base: usize, root: u32, acc: u64) -> u32 {
   let entry = table[base + u64.wrappingToUsize(acc & lowMask(root))]
-  if u32.shiftRight(entry, 12) & 15 != KIND_LINK {
+  if entry & ENTRY_LINK == 0 {
     return entry
   }
   let width = u32.shiftRight(entry, 8) & 15
   let index = u32.toUsize(u32.shiftRight(entry, 16)) + u32.toUsize(bitsAt(acc, root, width))
-  return table[base + index] + root
-}
-
-@inlineAlways
-fn kindOf(entry: u32) -> u32 {
-  return u32.shiftRight(entry, 12) & 15
-}
-
-@inlineAlways
-fn extraOf(entry: u32) -> u32 {
-  return u32.shiftRight(entry, 8) & 15
+  return table[base + index] + (u32.shiftLeft(root, 8) | root)
 }
 
 fn nextGzipField(state: &mut Decoder, phase: u32) -> () {
@@ -1295,68 +1287,69 @@ fn codeLengths(state: &mut Decoder, input: &[u8]) -> u32 {
 // Decodes literal/length symbols. The fast loop runs while the input and output have room for a
 // whole sequence; then one unit at a time.
 fn symbol(state: &mut Decoder, input: &[u8], output: &mut [u8]) -> u32 {
-  if fastBlock(&mut state, input, &mut output) {
+  let fast = fastBlock(&mut state, input, &mut output)
+  if fast == FAST_END {
     endBlock(&mut state, &output)
     return GO
   }
-  fill(&mut state, input)
-  let entry = lookup(words(&state.tables), LITERAL_BASE, LITERAL_ROOT, state.acc)
-  let bits = entry & 255
-  if bits > state.count {
-    return starve(&mut state, input)
-  }
-  let kind = kindOf(entry)
-  if kind == KIND_LITERAL {
-    if state.outputPosition == state.outputEnd {
-      return full(&mut state, &output)
-    }
-    dropBits(&mut state, bits)
-    output[state.outputPosition] = u32.wrappingToU8(u32.shiftRight(entry, 16))
-    state.outputPosition = state.outputPosition + 1
-    return GO
-  }
-  if kind == KIND_BASE {
-    let extra = extraOf(entry)
-    if bits + extra > state.count {
-      return starve(&mut state, input)
-    }
-    state.matchLength = u32.toUsize(u32.shiftRight(entry, 16) + bitsAt(state.acc, bits, extra))
-    dropBits(&mut state, bits + extra)
+  if fast == FAST_DISTANCE {
     state.phase = PHASE_DISTANCE
     return GO
   }
-  if kind == KIND_END {
-    dropBits(&mut state, bits)
-    endBlock(&mut state, &output)
-    return GO
+  fill(&mut state, input)
+  let mut entry = lookup(words(&state.tables), LITERAL_BASE, LITERAL_ROOT, state.acc)
+  let mut take = entry & 255
+  // A run of literals stays here, which is most of what the end of an output buffer holds.
+  while entry & ENTRY_LITERAL != 0 {
+    if take > state.count {
+      return starve(&mut state, input)
+    }
+    if state.outputPosition == state.outputEnd {
+      return full(&mut state, &output)
+    }
+    dropBits(&mut state, take)
+    output[state.outputPosition] = u32.wrappingToU8(u32.shiftRight(entry, 16))
+    state.outputPosition = state.outputPosition + 1
+    fill(&mut state, input)
+    entry = lookup(words(&state.tables), LITERAL_BASE, LITERAL_ROOT, state.acc)
+    take = entry & 255
   }
-  if kind == KIND_BAD_LENGTH {
-    return reject(&mut state, ErrorKind.InvalidBlock)
+  if take > state.count {
+    return starve(&mut state, input)
   }
-  return reject(&mut state, ErrorKind.InvalidHuffman)
+  if entry & ENTRY_SPECIAL != 0 {
+    if entry & ENTRY_END != 0 {
+      dropBits(&mut state, take)
+      endBlock(&mut state, &output)
+      return GO
+    }
+    if u32.shiftRight(entry, 16) == BAD_LENGTH {
+      return reject(&mut state, ErrorKind.InvalidBlock)
+    }
+    return reject(&mut state, ErrorKind.InvalidHuffman)
+  }
+  state.matchLength = u32.toUsize(u32.shiftRight(entry, 16) + extraBits(state.acc, entry))
+  dropBits(&mut state, take)
+  state.phase = PHASE_DISTANCE
+  return GO
 }
 
 // Decodes the distance of a match whose length is read.
 fn distance(state: &mut Decoder, input: &[u8]) -> u32 {
   fill(&mut state, input)
   let entry = lookup(words(&state.tables), DISTANCE_BASE, DISTANCE_ROOT, state.acc)
-  let bits = entry & 255
-  if bits > state.count {
+  let take = entry & 255
+  if take > state.count {
     return starve(&mut state, input)
   }
-  let kind = kindOf(entry)
-  if kind == KIND_BAD_CODE {
+  if entry & ENTRY_SPECIAL != 0 {
+    if u32.shiftRight(entry, 16) == BAD_DISTANCE {
+      return reject(&mut state, ErrorKind.InvalidDistance)
+    }
     return reject(&mut state, ErrorKind.InvalidHuffman)
   }
-  if kind == KIND_BAD_DISTANCE {
-    return reject(&mut state, ErrorKind.InvalidDistance)
-  }
-  let extra = extraOf(entry)
-  if bits + extra > state.count {
-    return starve(&mut state, input)
-  }
-  let found = u32.toUsize(u32.shiftRight(entry, 16) + bitsAt(state.acc, bits, extra))
-  dropBits(&mut state, bits + extra)
+  let found = u32.toUsize(u32.shiftRight(entry, 16) + extraBits(state.acc, entry))
+  dropBits(&mut state, take)
   if found > state.historyCount + (state.outputPosition - state.flushed) || found > state.window {
     return reject(&mut state, ErrorKind.InvalidDistance)
   }
@@ -1446,8 +1439,8 @@ fn copyBack(output: &mut [u8], at: usize, found: usize, length: usize) -> () {
   }
   if back >= 8 {
     while target + 8 <= end {
-      let value = load64(&output, target - back)
-      store64(&mut output, target, value)
+      let value = endian.readU64LittleEndian(&output, target - back)
+      endian.writeU64LittleEndian(&mut output, target, value)
       target = target + 8
     }
   }
@@ -1457,118 +1450,381 @@ fn copyBack(output: &mut [u8], at: usize, found: usize, length: usize) -> () {
   }
 }
 
-// The output room of the fast loop: the longest match, and 8 bytes that its last copy can write
-// past the end of the match.
-const FAST_ROOM: usize = 266
+// What `fastBlock` stopped at.
+const FAST_MORE: u32 = 0
+const FAST_END: u32 = 1
+const FAST_DISTANCE: u32 = 2
 
-// Copies `length` bytes from `found` bytes back to `output[at..]` in 8-byte pieces, where the
-// source is in the output. It can write up to 8 bytes after the match, which the output has room
-// for; later output overwrites them.
+// The input the fast loop needs ahead of one pass, which is more than its refills read.
+const FAST_INPUT: usize = 32
+
+// The output room the fast loop needs for one pass: two literals, the longest match, and the
+// 29 bytes that the copy of a short match can write after it.
+const FAST_ROOM: usize = 320
+
+const LITERAL_ROOT_MASK: usize = 1023
+const DISTANCE_ROOT_MASK: usize = 255
+
+// The fast loop reads and writes through pointers, with no bounds checks. Before each pass, it
+// proves that the pass stays inside both buffers: `FAST_INPUT` bytes of input and `FAST_ROOM`
+// bytes of output are ahead, and a match reads only output that this call wrote.
+
+// Returns the 8 bytes at `base[at..]` as a little-endian word. The caller proves that they are
+// inside the buffer.
 @inlineAlways
-fn fastCopy(output: &mut [u8], at: usize, found: usize, length: usize) -> () {
-  let end = at + length
-  let mut target = at
-  let mut back = found
-  if found < 8 {
-    // A match repeats with period `found`, so after its first 8 bytes it can also read from the
-    // first multiple of `found` that is at least 8 back.
-    while target < at + 8 {
-      output[target] = output[target - found]
-      target = target + 1
-    }
-    back = (8 + found - 1) / found * found
-  }
-  while target < end {
-    let value = load64(&output, target - back)
-    store64(&mut output, target, value)
-    target = target + 8
+unsafe fn peek(base: [*]const u8, at: usize) -> u64 {
+  unsafe {
+    return Pointer.readUnaligned<u64>(
+      Intrinsic.pointerReinterpret<*const u8, *const align(1) u64>(Pointer.at<u8>(base, at)),
+    )
   }
 }
 
-// Decodes whole literals and matches while the input has 8 bytes ahead for each refill and the
-// output has room for the longest match. It stops before anything rare: a code it cannot decode,
-// or a distance past the history, which the unit path then reports. Returns true if it read the
-// end of the block.
-fn fastBlock(state: &mut Decoder, input: &[u8], output: &mut [u8]) -> bool {
-  let table = words(&state.tables)
-  let ring = bytes(&state.ring)
-  let inputEnd = state.inputEnd
-  let outputEnd = state.outputEnd
-  let flushed = state.flushed
-  let next = state.historyNext
-  let reach = state.historyCount
-  let window = state.window
-  let mut acc = state.acc
-  let mut count = state.count
+// Writes `value` as 8 little-endian bytes at `base[at..]`. The caller proves that they are
+// inside the buffer.
+@inlineAlways
+unsafe fn poke(base: [*]mut u8, at: usize, value: u64) -> () {
+  unsafe {
+    Pointer.writeUnaligned<u64>(
+      Intrinsic.pointerReinterpret<*mut u8, *mut align(1) u64>(Pointer.atMut<u8>(base, at)),
+      value,
+    )
+  }
+}
+
+// Writes `value` at `base[at]`. The caller proves that it is inside the buffer.
+@inlineAlways
+unsafe fn pokeByte(base: [*]mut u8, at: usize, value: u8) -> () {
+  unsafe { Pointer.write<u8>(Pointer.atMut<u8>(base, at), value) }
+}
+
+// Returns the 16 bytes at `base[at..]`. The caller proves that they are inside the buffer.
+@inlineAlways
+unsafe fn peekWide(base: [*]const u8, at: usize) -> simd<u8, 16> {
+  unsafe {
+    return u8x16.loadUnchecked(
+      Intrinsic.pointerRequalify<*const u8, [*]const u8>(Pointer.at<u8>(base, at)),
+    )
+  }
+}
+
+// Writes the 16 bytes of `value` at `base[at..]`. The caller proves that they are inside the
+// buffer.
+@inlineAlways
+unsafe fn pokeWide(base: [*]mut u8, at: usize, value: simd<u8, 16>) -> () {
+  unsafe {
+    u8x16.storeUnchecked(
+      Intrinsic.pointerRequalify<*mut u8, [*]mut u8>(Pointer.atMut<u8>(base, at)),
+      value,
+    )
+  }
+}
+
+// Copies `length` bytes from `from[source..]` to `out[at..]` in 16-byte pieces, where the two
+// ranges are at least 16 bytes apart or in different buffers. It can write up to 29 bytes after
+// the range. The caller proves that `length + 29` bytes are inside both buffers.
+@inlineAlways
+unsafe fn wideCopy(out: [*]mut u8, at: usize, from: [*]const u8, source: usize, length: usize) -> () {
+  unsafe {
+    // Most matches are short, so two pieces go without a test.
+    pokeWide(out, at, peekWide(from, source))
+    pokeWide(out, usize.wrappingAdd(at, 16), peekWide(from, usize.wrappingAdd(source, 16)))
+    let mut done: usize = 32
+    while done < length {
+      pokeWide(out, usize.wrappingAdd(at, done), peekWide(from, usize.wrappingAdd(source, done)))
+      done = usize.wrappingAdd(done, 16)
+    }
+  }
+}
+
+// Copies `length` bytes from `found` bytes back to `out[at..]` in pieces of 8 or 16 bytes, where
+// the source is in the output. It can write up to 29 bytes after the match; later output
+// overwrites them. The caller proves that `at - found` is inside the output and that
+// `length + 29` bytes of room follow `at`.
+@inlineAlways
+unsafe fn fastCopy(out: [*]mut u8, at: usize, found: usize, length: usize) -> () {
+  unsafe {
+    let read = Intrinsic.pointerRequalify<[*]mut u8, [*]const u8>(out)
+    let end = usize.wrappingAdd(at, length)
+    let mut target = at
+    let mut source = usize.wrappingSubtract(at, found)
+    if found >= 16 {
+      wideCopy(out, at, read, source, length)
+      return ()
+    }
+    if found >= 8 {
+      // Most matches are short, so three pieces go without a test. A piece can read what the
+      // piece before it wrote, which is what a match of a distance under 16 needs.
+      poke(out, target, peek(read, source))
+      poke(out, usize.wrappingAdd(target, 8), peek(read, usize.wrappingAdd(source, 8)))
+      poke(out, usize.wrappingAdd(target, 16), peek(read, usize.wrappingAdd(source, 16)))
+      target = usize.wrappingAdd(target, 24)
+      source = usize.wrappingAdd(source, 24)
+      while target < end {
+        poke(out, target, peek(read, source))
+        target = usize.wrappingAdd(target, 8)
+        source = usize.wrappingAdd(source, 8)
+      }
+      return ()
+    }
+    if found == 1 {
+      // A run of one byte.
+      let repeated = u64.wrappingMultiply(peek(read, source) & 255, 0x0101010101010101)
+      while target < end {
+        poke(out, target, repeated)
+        target = usize.wrappingAdd(target, 8)
+      }
+      return ()
+    }
+    // Each piece is 8 bytes of which the first `found` are right, and the next piece starts
+    // after those.
+    while target < end {
+      poke(out, target, peek(read, source))
+      target = usize.wrappingAdd(target, found)
+      source = usize.wrappingAdd(source, found)
+    }
+  }
+}
+
+// Copies the match of `length` bytes from `found` bytes back to `output[at..]`, where the first
+// bytes are in the history. The fast loop calls it out of line.
+@inlineNever
+fn historyMatch(state: &Decoder, output: &mut [u8], at: usize, found: usize, length: usize) -> () {
+  copyMatch(bytes(&state.ring), state.historyNext, &mut output, at, state.flushed, found, length)
+}
+
+// Decodes whole literals and matches while the input has `FAST_INPUT` bytes ahead and the output
+// has `FAST_ROOM` bytes of room. Returns `FAST_END` after the end of the block. Returns
+// `FAST_DISTANCE` after a length whose distance it does not decode: a code that is not valid, or
+// a distance past the history, which the unit path reports. Else returns `FAST_MORE` before a
+// literal/length code, which the unit path decodes or reports.
+@inlineNever
+fn fastBlock(state: &mut Decoder, input: &[u8], output: &mut [u8]) -> u32 {
+  static if Target.arch() == Arch.X86_64 {
+    if CpuFeatures.available("bmi2") {
+      return unsafe fastBlockBmi2(&mut state, input, &mut output)
+    }
+  }
+  return fastLoop(&mut state, input, &mut output)
+}
+
+static if Target.arch() == Arch.X86_64 {
+  // `fastLoop` compiled for BMI2, whose shifts and bit extracts take their count in any
+  // register. The caller must know that the CPU has `bmi2`.
+  @features("bmi2")
+  @inlineNever
+  unsafe fn fastBlockBmi2(state: &mut Decoder, input: &[u8], output: &mut [u8]) -> u32 {
+    return fastLoop(&mut state, input, &mut output)
+  }
+}
+
+// The body of `fastBlock`.
+//
+// In the loop, the bits of `acc` above `count` are the next bits of the input, not zeros: a
+// refill reads the 8 bytes at `position`, which start at bit `count` of the buffer, and moves
+// `position` by the whole bytes that fit below bit 64. A refill thus leaves 64 bits of input in
+// `acc`, of which `count`, at least 56, can be consumed before the next refill. A table index
+// reads bits without consuming them, so it can read the bits above `count`: after a refill and
+// `n` consumed bits, `64 - n` bits of input are there.
+@inlineAlways
+fn fastLoop(state: &mut Decoder, input: &[u8], output: &mut [u8]) -> u32 {
+  // The ends are inside the buffers, whatever the state holds.
+  let mut inputEnd = state.inputEnd
+  if inputEnd > input.length {
+    inputEnd = input.length
+  }
+  let mut outputEnd = state.outputEnd
+  if outputEnd > output.length {
+    outputEnd = output.length
+  }
   let mut position = state.inputPosition
   let mut at = state.outputPosition
-  let mut ended = false
-  while inputEnd - position >= 8 && outputEnd - at >= FAST_ROOM {
-    if count < 48 {
-      let take = (63 - count) / 8
-      let word = u64.shiftLeft(load64(input, position), u32.toU64(count & 63))
-      count = count + take * 8
-      acc = acc | (word & lowMask(count))
-      position = position + u32.toUsize(take)
-    }
-    let resolved = lookup(table, LITERAL_BASE, LITERAL_ROOT, acc)
-    let bits = resolved & 255
-    let kind = kindOf(resolved)
-    if kind == KIND_LITERAL {
-      acc = shifted(acc, bits)
-      count = count - bits
-      output[at] = u32.wrappingToU8(u32.shiftRight(resolved, 16))
-      at = at + 1
-      // At least 33 bits remain, so a second literal needs no refill.
-      let second = lookup(table, LITERAL_BASE, LITERAL_ROOT, acc)
-      if kindOf(second) == KIND_LITERAL {
-        let secondBits = second & 255
-        acc = shifted(acc, secondBits)
-        count = count - secondBits
-        output[at] = u32.wrappingToU8(u32.shiftRight(second, 16))
-        at = at + 1
+  let flushed = state.flushed
+  if position > inputEnd || inputEnd - position < FAST_INPUT || at > outputEnd
+    || outputEnd - at < FAST_ROOM
+    || flushed > at
+    || state.count > 63 {
+    return FAST_MORE
+  }
+  let inputLimit = inputEnd - FAST_INPUT
+  let outputLimit = outputEnd - FAST_ROOM
+  let tables = words(&state.tables)
+  let literals = Slice.view<u32>(tables, LITERAL_BASE, LITERAL_CAPACITY)
+  let distances = Slice.view<u32>(tables, DISTANCE_BASE, DISTANCE_CAPACITY)
+  let reach = state.historyCount
+  let window = state.window
+  let next = state.historyNext & RING_MASK
+  let history = bytes(&state.ring)
+  if history.length != RING {
+    return FAST_MORE
+  }
+  // The history holds `RING` bytes, so its pointer is not null.
+  let ring = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice<u8>(history))
+  let mut acc = state.acc
+  let mut count = state.count & 63
+  let mut result = FAST_MORE
+  let mut pending: usize = 0
+  // Both buffers hold bytes, so their pointers are not null.
+  let source = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice<u8>(input))
+  let out = unsafe Intrinsic.pointerRequalify<?[*]mut u8, [*]mut u8>(Pointer.fromMutSlice<u8>(&mut output))
+  // Each pass starts with `position <= inputLimit`. It refills at most two times, the second at
+  // most 7 bytes after the first, so every refill reads 8 bytes that end at most 15 bytes after
+  // `position`, inside the `FAST_INPUT` bytes ahead.
+  acc = acc | u64.shiftLeft(unsafe peek(source, position), u32.toU64(count))
+  position = usize.wrappingAdd(position, u32.toUsize(u32.shiftRight(count ^ 63, 3)))
+  count = count | 56
+  while position <= inputLimit && at <= outputLimit {
+    // A pass consumes at most 48 bits after a refill, so at least 16 bits of input are in the
+    // buffer, more than the 10 of the root index. The refill does not wait for the entry.
+    let mut entry = literals[u64.wrappingToUsize(acc) & LITERAL_ROOT_MASK]
+    acc = acc | u64.shiftLeft(unsafe peek(source, position), u32.toU64(count & 63))
+    position = usize.wrappingAdd(position, u32.toUsize(u32.shiftRight(count ^ 63, 3)))
+    count = count | 56
+    if entry & ENTRY_LITERAL != 0 {
+      // A literal from the root takes at most 10 bits, so three of them consume at most 30.
+      // Each pass writes at most two literals before a match, inside the `FAST_ROOM` bytes
+      // ahead.
+      acc = u64.shiftRight(acc, u32.toU64(entry & 63))
+      count = u32.wrappingSubtract(count, entry & 255)
+      unsafe pokeByte(out, at, u32.wrappingToU8(u32.shiftRight(entry, 16)))
+      at = usize.wrappingAdd(at, 1)
+      entry = literals[u64.wrappingToUsize(acc) & LITERAL_ROOT_MASK]
+      if entry & ENTRY_LITERAL != 0 {
+        acc = u64.shiftRight(acc, u32.toU64(entry & 63))
+        count = u32.wrappingSubtract(count, entry & 255)
+        unsafe pokeByte(out, at, u32.wrappingToU8(u32.shiftRight(entry, 16)))
+        at = usize.wrappingAdd(at, 1)
+        entry = literals[u64.wrappingToUsize(acc) & LITERAL_ROOT_MASK]
+        if entry & ENTRY_LITERAL != 0 {
+          acc = u64.shiftRight(acc, u32.toU64(entry & 63))
+          count = u32.wrappingSubtract(count, entry & 255)
+          unsafe pokeByte(out, at, u32.wrappingToU8(u32.shiftRight(entry, 16)))
+          at = usize.wrappingAdd(at, 1)
+          continue
+        }
       }
+      // A length and its distance can consume 48 bits, more than the 36 that two literals leave.
+      // `entry` stays right, because a refill only adds bits above those it read.
+      acc = acc | u64.shiftLeft(unsafe peek(source, position), u32.toU64(count & 63))
+      position = usize.wrappingAdd(position, u32.toUsize(u32.shiftRight(count ^ 63, 3)))
+      count = count | 56
+    }
+    // `entry` is not a literal, and at least 56 bits can be consumed: at most 20 for a length
+    // and 28 for a distance.
+    if entry & ENTRY_SPECIAL != 0 {
+      if entry & ENTRY_LINK == 0 {
+        if entry & ENTRY_END != 0 {
+          acc = u64.shiftRight(acc, u32.toU64(entry & 63))
+          count = u32.wrappingSubtract(count, entry & 255)
+          result = FAST_END
+        }
+        break
+      }
+      let linkAcc = acc
+      let linkCount = count
+      acc = u64.shiftRight(acc, u32.toU64(entry & 63))
+      count = u32.wrappingSubtract(count, entry & 255)
+      let part = usize.wrappingAdd(
+        u32.toUsize(u32.shiftRight(entry, 16)),
+        u64.wrappingToUsize(acc & lowMask(u32.shiftRight(entry, 8) & 15)),
+      )
+      entry = literals[part & (LITERAL_CAPACITY - 1)]
+      if entry & ENTRY_LITERAL != 0 {
+        acc = u64.shiftRight(acc, u32.toU64(entry & 63))
+        count = u32.wrappingSubtract(count, entry & 255)
+        unsafe pokeByte(out, at, u32.wrappingToU8(u32.shiftRight(entry, 16)))
+        at = usize.wrappingAdd(at, 1)
+        continue
+      }
+      if entry & ENTRY_SPECIAL != 0 {
+        if entry & ENTRY_END != 0 {
+          acc = u64.shiftRight(acc, u32.toU64(entry & 63))
+          count = u32.wrappingSubtract(count, entry & 255)
+          result = FAST_END
+        } else {
+          acc = linkAcc
+          count = linkCount
+        }
+        break
+      }
+    }
+    // A length.
+    let length = u32.toUsize(u32.wrappingAdd(u32.shiftRight(entry, 16), extraBits(acc, entry)))
+    acc = u64.shiftRight(acc, u32.toU64(entry & 63))
+    count = u32.wrappingSubtract(count, entry & 255)
+    let mut far = distances[u64.wrappingToUsize(acc) & DISTANCE_ROOT_MASK]
+    let lengthAcc = acc
+    let lengthCount = count
+    if far & ENTRY_SPECIAL != 0 {
+      if far & ENTRY_LINK == 0 {
+        pending = length
+        result = FAST_DISTANCE
+        break
+      }
+      acc = u64.shiftRight(acc, u32.toU64(far & 63))
+      count = u32.wrappingSubtract(count, far & 255)
+      let part = usize.wrappingAdd(
+        u32.toUsize(u32.shiftRight(far, 16)),
+        u64.wrappingToUsize(acc & lowMask(u32.shiftRight(far, 8) & 15)),
+      )
+      far = distances[part & (DISTANCE_CAPACITY - 1)]
+      if far & ENTRY_SPECIAL != 0 {
+        acc = lengthAcc
+        count = lengthCount
+        pending = length
+        result = FAST_DISTANCE
+        break
+      }
+    }
+    let found = u32.toUsize(u32.wrappingAdd(u32.shiftRight(far, 16), extraBits(acc, far)))
+    // `flushed <= at`, so `fresh` is how many bytes of this call's output a match can read.
+    let fresh = usize.wrappingSubtract(at, flushed)
+    if found <= fresh {
+      if found > window {
+        acc = lengthAcc
+        count = lengthCount
+        pending = length
+        result = FAST_DISTANCE
+        break
+      }
+      acc = u64.shiftRight(acc, u32.toU64(far & 63))
+      count = u32.wrappingSubtract(count, far & 255)
+      // A length is at most 258, so the copy stays inside the `FAST_ROOM` bytes ahead, and
+      // `found` is at least 1 and at most `at`.
+      unsafe fastCopy(out, at, found, length)
+      at = usize.wrappingAdd(at, length)
       continue
     }
-    if kind != KIND_BASE {
-      if kind == KIND_END {
-        acc = shifted(acc, bits)
-        count = count - bits
-        ended = true
-      }
+    if found > window || usize.wrappingSubtract(found, fresh) > reach {
+      acc = lengthAcc
+      count = lengthCount
+      pending = length
+      result = FAST_DISTANCE
       break
     }
-    let extra = extraOf(resolved)
-    let length = u32.toUsize(u32.shiftRight(resolved, 16) + bitsAt(acc, bits, extra))
-    let used = bits + extra
-    let rest = shifted(acc, used)
-    let distanceEntry = lookup(table, DISTANCE_BASE, DISTANCE_ROOT, rest)
-    if kindOf(distanceEntry) != KIND_BASE {
-      break
-    }
-    let distanceBits = distanceEntry & 255
-    let distanceExtra = extraOf(distanceEntry)
-    let found = u32.toUsize(
-      u32.shiftRight(distanceEntry, 16) + bitsAt(rest, distanceBits, distanceExtra),
-    )
-    if found > reach + (at - flushed) || found > window {
-      break
-    }
-    let total = used + distanceBits + distanceExtra
-    acc = shifted(acc, total)
-    count = count - total
-    if found <= at - flushed {
-      fastCopy(&mut output, at, found, length)
+    acc = u64.shiftRight(acc, u32.toU64(far & 63))
+    count = u32.wrappingSubtract(count, far & 255)
+    // The match starts `back` bytes before the end of the history, at `from` in the ring.
+    let back = usize.wrappingSubtract(found, fresh)
+    let from = usize.wrappingSubtract(usize.wrappingAdd(next, RING), back) & RING_MASK
+    if back >= length && from <= RING - FAST_ROOM {
+      // The whole match is in the history and does not reach the end of the ring, with room for
+      // what the copy reads after it.
+      unsafe wideCopy(out, at, ring, from, length)
     } else {
-      copyMatch(ring, next, &mut output, at, flushed, found, length)
+      historyMatch(&state, &mut output, at, found, length)
     }
-    at = at + length
+    at = usize.wrappingAdd(at, length)
   }
-  state.acc = acc
+  if result == FAST_DISTANCE {
+    state.matchLength = pending
+  }
+  // The unit path needs zeros above the count.
+  state.acc = acc & lowMask(count)
   state.count = count
   state.inputPosition = position
   state.outputPosition = at
-  return ended
+  return result
 }
 
 // Ends a block. After the final block, it skips to the next byte boundary and commits the output,
@@ -1592,31 +1848,37 @@ fn endBlock(state: &mut Decoder, output: &[u8]) -> () {
   return ()
 }
 
-// Returns the table entry of `symbol` in `alphabet`, without its code length.
-fn entryOf(alphabet: u32, symbol: u32) -> u32 {
+// Returns the table entry of `symbol` in `alphabet` for a code of `bits` bits, or for the `bits`
+// bits of the code after the root bits.
+fn entryOf(alphabet: u32, symbol: u32, bits: u32) -> u32 {
+  let plain = u32.shiftLeft(bits, 8) | bits
   if alphabet == ALPHABET_CODE {
-    return u32.shiftLeft(symbol, 16)
+    return u32.shiftLeft(symbol, 16) | plain
   }
   if alphabet == ALPHABET_DISTANCE {
     if symbol >= 30 {
-      return u32.shiftLeft(KIND_BAD_DISTANCE, 12)
+      return badEntry(BAD_DISTANCE, bits)
     }
     let at = u32.toUsize(symbol)
-    return u32.shiftLeft(DISTANCE_BASE_VALUES[at], 16) | u32.shiftLeft(KIND_BASE, 12)
-      | u32.shiftLeft(DISTANCE_EXTRA[at], 8)
+    return u32.shiftLeft(DISTANCE_BASE_VALUES[at], 16) | u32.shiftLeft(bits, 8)
+      | (bits + DISTANCE_EXTRA[at])
   }
   if symbol < 256 {
-    return u32.shiftLeft(symbol, 16)
+    return ENTRY_LITERAL | u32.shiftLeft(symbol, 16) | plain
   }
   if symbol == 256 {
-    return u32.shiftLeft(KIND_END, 12)
+    return ENTRY_SPECIAL | ENTRY_END | plain
   }
   if symbol >= 286 {
-    return u32.shiftLeft(KIND_BAD_LENGTH, 12)
+    return badEntry(BAD_LENGTH, bits)
   }
   let at = u32.toUsize(symbol - 257)
-  return u32.shiftLeft(LENGTH_BASE[at], 16) | u32.shiftLeft(KIND_BASE, 12)
-    | u32.shiftLeft(LENGTH_EXTRA[at], 8)
+  return u32.shiftLeft(LENGTH_BASE[at], 16) | u32.shiftLeft(bits, 8) | (bits + LENGTH_EXTRA[at])
+}
+
+// Returns the entry of a `bits`-bit code that is not valid, with a `BAD_` cause.
+fn badEntry(cause: u32, bits: u32) -> u32 {
+  return u32.shiftLeft(cause, 16) | ENTRY_SPECIAL | u32.shiftLeft(bits, 8) | bits
 }
 
 // Returns the bit-reversed `length`-bit code after the bit-reversed code `key`.
@@ -1676,7 +1938,7 @@ fn buildCode(
     if empty == false {
       return false
     }
-    let bad = u32.shiftLeft(KIND_BAD_CODE, 12)
+    let bad = badEntry(BAD_CODE, 0)
     index = 0
     while index < rootSize {
       table[base + index] = bad
@@ -1703,8 +1965,8 @@ fn buildCode(
     while lengths[start + u32.toUsize(symbol)] == 0 {
       symbol = symbol + 1
     }
-    let entry = entryOf(alphabet, symbol) | 1
-    let bad = u32.shiftLeft(KIND_BAD_CODE, 12) | 1
+    let entry = entryOf(alphabet, symbol, 1)
+    let bad = badEntry(BAD_CODE, 1)
     index = 0
     while index < rootSize {
       table[base + index] = entry
@@ -1734,16 +1996,21 @@ fn buildCode(
   let mut key: u32 = 0
   let mut used: usize = 0
   let mut size: u32 = 1
+  // The root grows from 1 entry to `rootSize`. While it has 2^size entries, a code of `size`
+  // bits is one entry, and each doubling repeats the codes that are there. The code is complete,
+  // so every entry gets a code or a link before the end.
+  let mut filled: usize = 1
   while size <= root {
-    let step = usize.shiftLeft(1, u32.toUsize(size))
+    let grown = Slice.viewMut<u32>(&mut table, base, filled * 2)
+    index = 0
+    while index < filled {
+      grown[usize.wrappingAdd(filled, index)] = grown[index]
+      index = index + 1
+    }
+    filled = filled * 2
     while remaining[u32.toUsize(size)] > 0 {
-      let entry = entryOf(alphabet, sorted[used]) | size
+      table[base + u32.toUsize(key)] = entryOf(alphabet, sorted[used], size)
       used = used + 1
-      index = u32.toUsize(key)
-      while index < rootSize {
-        table[base + index] = entry
-        index = index + step
-      }
       key = nextKey(key, size)
       remaining[u32.toUsize(size)] = remaining[u32.toUsize(size)] - 1
     }
@@ -1774,14 +2041,14 @@ fn buildCode(
         if total + span > capacity {
           return false
         }
-        table[base + u32.toUsize(low)] = u32.shiftLeft(usize.toU32(total), 16)
-          | u32.shiftLeft(KIND_LINK, 12)
+        table[base + u32.toUsize(low)] = u32.shiftLeft(usize.toU32(total), 16) | ENTRY_SPECIAL
+          | ENTRY_LINK
           | u32.shiftLeft(bits, 8)
           | root
         part = base + total
         total = total + span
       }
-      let entry = entryOf(alphabet, sorted[used]) | (size - root)
+      let entry = entryOf(alphabet, sorted[used], size - root)
       used = used + 1
       index = u32.toUsize(u32.shiftRight(key, root))
       while index < span {

@@ -10,7 +10,9 @@ and [`CompressionChecksum.crc64`](#CompressionChecksum.impl.crc64) for XZ. Use t
 arrives in parts.
 
 ## Details
-No function allocates. CRC-32 uses a 256-entry table and processes one byte per lookup.
+No function allocates. CRC-32 folds 64 or 128 bytes per step with carry-less multiplication
+when the running CPU has it (`pclmul` on x86-64, `aes` on AArch64), and otherwise reads eight
+table entries per 8 bytes. Both paths return the same value.
 
 Import as `CompressionChecksum` with `import silk.compress.checksum { CompressionChecksum }`.
 

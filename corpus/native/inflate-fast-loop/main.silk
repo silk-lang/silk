@@ -1,0 +1,330 @@
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.compress.checksum { CompressionChecksum }
+import silk.compress.deflate { EncodeError, Encoder, Options, Strategy }
+import silk.compress.inflate { DecodeError, Decoder, ErrorKind, Format, Limits, Progress, Status }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+
+// The decoder's fast loop runs only with 32 bytes of input and 320 bytes of output ahead, and
+// leaves the ends of both buffers to the unit path. These cases decode the same streams through
+// buffers around those sizes and compare every byte.
+
+fn limits() -> Limits {
+  return Limits {
+    maxInputBytes: 1000000,
+    maxOutputBytes: 1000000,
+    maxMembers: 1,
+    maxHeaderBytes: 100,
+    maxMemoryBytes: 65536,
+  }
+}
+
+fn next(seed: &mut u64) -> u64 {
+  seed.* = u64.wrappingAdd(u64.wrappingMultiply(seed.*, 6364136223846793005), 1442695040888963407)
+  return u64.shiftRight(seed.*, 33)
+}
+
+// Text of repeated words, skewed bytes that need long codes, runs and short periods, and a far
+// repeat: the shapes that take the literal, link, short-distance, long-distance and history paths.
+effect fn sample() -> List<u8>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut seed: u64 = 20261112
+  let mut data = List<u8>.make()
+  let mut words: [u8; 640] = [0; 640]
+  let mut index: usize = 0
+  while index < 640 {
+    words[index] = u64.wrappingToU8(97 + u64.remainder(next(&mut seed), 26))
+    index = index + 1
+  }
+  while List<u8>.length(&data) < 24000 {
+    let word = u64.toUsize(u64.remainder(next(&mut seed), 64))
+    let length = 3 + u64.toUsize(u64.remainder(next(&mut seed), 8))
+    run List<u8>.appendSlice(&mut data, Slice.view<u8>(&words, word * 10, length))
+    run List<u8>.append(&mut data, 32)
+  }
+  index = 0
+  while index < 8000 {
+    let one = next(&mut seed) & 255
+    let two = next(&mut seed) & 255
+    let mut low = one
+    if two < low {
+      low = two
+    }
+    run List<u8>.append(&mut data, u64.wrappingToU8(low))
+    index = index + 1
+  }
+  run List<u8>.appendRepeated(&mut data, 120, 3000)
+  index = 0
+  while index < 3000 {
+    run List<u8>.append(&mut data, usize.wrappingToU8(65 + usize.remainder(index, 3)))
+    index = index + 1
+  }
+  index = 0
+  while index < 3000 {
+    run List<u8>.append(&mut data, usize.wrappingToU8(48 + usize.remainder(index, 7)))
+    index = index + 1
+  }
+  let start = List<u8>.length(&data) - 31000
+  index = 0
+  while index < 30000 {
+    let byte = List<u8>.get(&data, start + index)
+    run List<u8>.append(&mut data, byte)
+    index = index + 1
+  }
+  return move data
+}
+
+// Decodes `encoded` with at most `inputWidth` new bytes per step into `room`, and checks every
+// output byte against `expected`.
+fn decodes(
+  decoder: &mut Decoder,
+  format: Format,
+  encoded: &[u8],
+  expected: &[u8],
+  inputWidth: usize,
+  room: &mut [u8],
+) -> bool {
+  if let Result<(), DecodeError>.Failure { .. } = Decoder.reset(&mut decoder, format, limits()) {
+    return false
+  }
+  let mut consumed: usize = 0
+  let mut written: usize = 0
+  let mut given: usize = 0
+  while true {
+    if given < consumed + inputWidth {
+      given = consumed + inputWidth
+    }
+    if given > encoded.length {
+      given = encoded.length
+    }
+    let rest = Slice.view<u8>(encoded, consumed, given - consumed)
+    match Decoder.step(&mut decoder, rest, &mut room, given == encoded.length) {
+      Result<Progress, DecodeError>.Success { value } => {
+        if value.written > expected.length - written {
+          return false
+        }
+        let mut index: usize = 0
+        while index < value.written {
+          if room[index] != expected[written + index] {
+            return false
+          }
+          index = index + 1
+        }
+        consumed = consumed + value.consumed
+        written = written + value.written
+        if value.status == Status.Finished {
+          return written == expected.length && consumed == encoded.length
+        }
+        if value.status == Status.NeedInput {
+          if given == encoded.length {
+            return false
+          }
+          given = given + inputWidth
+        }
+      }
+      Result<Progress, DecodeError>.Failure { .. } => {
+        return false
+      }
+    }
+  }
+  return false
+}
+
+// Returns 0 if `encoded` decodes to `expected` through every pair of buffer widths.
+fn widths(
+  decoder: &mut Decoder,
+  format: Format,
+  encoded: &[u8],
+  expected: &[u8],
+  room: &mut [u8],
+) -> i32 {
+  let inputs: [usize; 5] = [1000000, 4096, 33, 32, 31]
+  let outputs: [usize; 7] = [200000, 65536, 4096, 321, 320, 319, 40]
+  let mut input: usize = 0
+  while input < inputs.length {
+    let mut output: usize = 0
+    while output < outputs.length {
+      // A narrow input with a narrow output only repeats the unit path.
+      if input < 2 || output == 0 || output == 4 {
+        let view = Slice.viewMut<u8>(&mut room, 0, outputs[output])
+        if !decodes(&mut decoder, format, encoded, expected, inputs[input], &mut view) {
+          return usize.toI32(input * 10 + output) + 1
+        }
+      }
+      output = output + 1
+    }
+    input = input + 1
+  }
+  return 0
+}
+
+// Returns true if one step of the stream `encoded`, into room for the fast loop, fails with
+// `kind` after `consumed` input bytes and `written` output bytes.
+fn rejects(
+  decoder: &mut Decoder,
+  format: Format,
+  encoded: &[u8],
+  room: &mut [u8],
+  kind: ErrorKind,
+  consumed: usize,
+  written: usize,
+) -> bool {
+  if let Result<(), DecodeError>.Failure { .. } = Decoder.reset(&mut decoder, format, limits()) {
+    return false
+  }
+  return match Decoder.step(&mut decoder, encoded, &mut room, true) {
+    Result<Progress, DecodeError>.Success { .. } => false
+    Result<Progress, DecodeError>.Failure { error } => error.kind == kind
+      && error.consumed == consumed
+      && error.written == written
+  }
+}
+
+// The CRC-32 of `bytes` one bit at a time.
+fn bitwise(bytes: &[u8]) -> u32 {
+  let mut value: u32 = 0xffffffff
+  let mut index: usize = 0
+  while index < bytes.length {
+    value = value ^ u8.toU32(bytes[index])
+    let mut bit: u32 = 0
+    while bit < 8 {
+      if value & 1 == 1 {
+        value = u32.shiftRight(value, 1) ^ 0xedb88320
+      } else {
+        value = u32.shiftRight(value, 1)
+      }
+      bit = bit + 1
+    }
+    index = index + 1
+  }
+  return value ^ 0xffffffff
+}
+
+// The folding CRC-32 takes 64 bytes and then 16 at a time, and leaves the rest to the tables.
+// Every length up to 300, at each of 16 offsets in turn, crosses each of those edges.
+fn checksums(data: &[u8]) -> bool {
+  let mut length: usize = 0
+  while length <= 300 {
+    let part = Slice.view<u8>(data, usize.remainder(length, 16), length)
+    let expected = bitwise(part)
+    if CompressionChecksum.crc32(part) != expected {
+      return false
+    }
+    let split = length / 3
+    let first = CompressionChecksum.crc32(Slice.view<u8>(part, 0, split))
+    if CompressionChecksum.crc32Update(first, Slice.view<u8>(part, split, length - split))
+      != expected {
+      return false
+    }
+    length = length + 1
+  }
+  // Long data folds 128 bytes at a time after its first 512 bytes.
+  length = 500
+  while length <= 800 {
+    let part = Slice.view<u8>(data, usize.remainder(length, 16), length)
+    if CompressionChecksum.crc32(part) != bitwise(part) {
+      return false
+    }
+    length = length + 7
+  }
+  let long = Slice.view<u8>(data, 5, 20003)
+  return CompressionChecksum.crc32(long) == bitwise(long)
+}
+
+effect fn encoded(data: &[u8], format: Format, options: Options) -> List<u8>
+  ! OutOfMemoryError | EncodeError
+  ? &mut Allocator {
+  let bound = match move Encoder.encodedBound(data.length, format) {
+    Option<usize>.Some { value } => value
+    Option<usize>.None => 0
+  }
+  let mut out = List<u8>.make()
+  run List<u8>.appendRepeated(&mut out, 0, bound)
+  let size = run Encoder.encode(data, List<u8>.asMutSlice(&mut out), format, move options)
+  List<u8>.truncate(&mut out, size)
+  return move out
+}
+
+effect fn program() -> i32
+  ! OutOfMemoryError | EncodeError | DecodeError
+  ? &mut Allocator {
+  let sampled = run sample()
+  let data = List<u8>.asSlice(&sampled)
+  if !checksums(data) {
+    return 1
+  }
+  let mut roomBytes = List<u8>.make()
+  run List<u8>.appendRepeated(&mut roomBytes, 0, 200000)
+  let room = List<u8>.asMutSlice(&mut roomBytes)
+  let mut decoder = run Decoder.make(Format.Gzip, limits())
+
+  // Dynamic codes in a gzip member.
+  let gzip = run encoded(data, Format.Gzip, Options.make(6))
+  let dynamic = widths(&mut decoder, Format.Gzip, List<u8>.asSlice(&gzip), data, &mut room)
+  if dynamic != 0 {
+    return 100 + dynamic
+  }
+
+  // The fixed codes, raw.
+  let fixed = run encoded(
+    data,
+    Format.Raw,
+    Options { level: 6, windowBits: 15, memoryLevel: 8, strategy: Strategy.Fixed },
+  )
+  let fixedResult = widths(&mut decoder, Format.Raw, List<u8>.asSlice(&fixed), data, &mut room)
+  if fixedResult != 0 {
+    return 200 + fixedResult
+  }
+
+  // A 1 KiB window in a zlib stream.
+  let small = run encoded(
+    data,
+    Format.Zlib,
+    Options { level: 9, windowBits: 10, memoryLevel: 8, strategy: Strategy.Default },
+  )
+  let smallResult = widths(&mut decoder, Format.Zlib, List<u8>.asSlice(&small), data, &mut room)
+  if smallResult != 0 {
+    return 300 + smallResult
+  }
+
+  // Fixed-code streams of ten literals, a bad code, and 60 more literals, so that the fast loop
+  // meets the bad code with input and output to spare. A distance of 100 after 10 bytes:
+  let far = b"\x4b\x4c\x4a\x4e\x49\x4d\x4b\xcf\xc8\xcc\x02\xda\xe1\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\xe8\x08\x00"
+  if !rejects(&mut decoder, Format.Raw, far, &mut room, ErrorKind.InvalidDistance, 13, 10) {
+    return 2
+  }
+
+  // The distance symbol 30, which has no distance:
+  let badDistance = b"\x4b\x4c\x4a\x4e\x49\x4d\x4b\xcf\xc8\xcc\x02\x3e\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x47\x00"
+  if !rejects(&mut decoder, Format.Raw, badDistance, &mut room, ErrorKind.InvalidDistance, 12, 10) {
+    return 3
+  }
+
+  // The length symbol 286, which has no length:
+  let badLength = b"\x4b\x4c\x4a\x4e\x49\x4d\x4b\xcf\xc8\xcc\x1a\x73\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x74\x04\x00"
+  if !rejects(&mut decoder, Format.Raw, badLength, &mut room, ErrorKind.InvalidBlock, 11, 10) {
+    return 4
+  }
+
+  // A zlib stream with a 256-byte window, 300 literals, and a match 300 bytes back, which is in
+  // the output and outside the window:
+  let outside = b"\x08\x1d\x4b\x4c\x4a\x4e\x49\x4d\x4b\xcf\xc8\xcc\xca\xce\xc9\xcd\xcb\x2f\x28\x2c\x2a\x2e\x29\x2d\x2b\xaf\xa8\xac\x4a\x4c\x4a\x4e\x49\x4d\x4b\xcf\xc8\xcc\xca\xce\xc9\xcd\xcb\x2f\x28\x2c\x2a\x2e\x29\x2d\x2b\xaf\xa8\xac\x4a\x4c\x4a\x4e\x49\x4d\x4b\xcf\xc8\xcc\xca\xce\xc9\xcd\xcb\x2f\x28\x2c\x2a\x2e\x29\x2d\x2b\xaf\xa8\xac\x4a\x4c\x4a\x4e\x49\x4d\x4b\xcf\xc8\xcc\xca\xce\xc9\xcd\xcb\x2f\x28\x2c\x2a\x2e\x29\x2d\x2b\xaf\xa8\xac\x4a\x4c\x4a\x4e\x49\x4d\x4b\xcf\xc8\xcc\xca\xce\xc9\xcd\xcb\x2f\x28\x2c\x2a\x2e\x29\x2d\x2b\xaf\xa8\xac\x4a\x4c\x4a\x4e\x49\x4d\x4b\xcf\xc8\xcc\xca\xce\xc9\xcd\xcb\x2f\x28\x2c\x2a\x2e\x29\x2d\x2b\xaf\xa8\xac\x4a\x4c\x4a\x4e\x49\x4d\x4b\xcf\xc8\xcc\xca\xce\xc9\xcd\xcb\x2f\x28\x2c\x2a\x2e\x29\x2d\x2b\xaf\xa8\xac\x4a\x4c\x4a\x4e\x49\x4d\x4b\xcf\xc8\xcc\xca\xce\xc9\xcd\xcb\x2f\x28\x2c\x2a\x2e\x29\x2d\x2b\xaf\xa8\xac\x4a\x4c\x4a\x4e\x49\x4d\x4b\xcf\xc8\xcc\xca\xce\xc9\xcd\xcb\x2f\x28\x2c\x2a\x2e\x29\x2d\x2b\xaf\xa8\xac\x4a\x4c\x4a\x4e\x49\x4d\x4b\xcf\xc8\xcc\xca\xce\xc9\xcd\xcb\x2f\x28\x2c\x2a\x2e\x29\x2d\x2b\xaf\xa8\xac\x4a\x4c\x4a\x4e\x49\x4d\x4b\xcf\xc8\xcc\xca\xce\xc9\xcd\xcb\x2f\x28\x2c\x2a\x2e\x29\x2d\x2b\xaf\xa8\xac\x4a\x4c\x4a\x4e\x49\x4d\x4b\xcf\xc8\xcc\xca\xce\xc9\xcd\x03\x86\x95\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\x23\x00"
+  if !rejects(&mut decoder, Format.Zlib, outside, &mut room, ErrorKind.InvalidDistance, 305, 300) {
+    return 5
+  }
+  return 42
+}
+
+pub effect fn main() -> i32
+  ! OutOfMemoryError | EncodeError | DecodeError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run program() |> Effect.provideMut<Allocator>(&mut allocator)
+}
