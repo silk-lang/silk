@@ -15,7 +15,38 @@ The tables are compact range encodings, generated from the Unicode 17.0.0 Charac
 QuickJS, Copyright (c) 2017-2021 Fabrice Bellard and Charlie Gordon, under the MIT license in
 `licenses/quickjs.txt`.
 
-Public declarations: 5.
+Public declarations: 6.
+
+<a id="CaseMapping"></a>
+
+## `CaseMapping`
+
+```silk
+pub struct CaseMapping
+```
+
+The full Unicode case-fold mapping of one scalar, with at most three scalar values.
+Only the first `length` entries of `points` are part of the result.
+
+<a id="CaseMapping.points"></a>
+
+### Field `points`
+
+```silk
+pub points: [u32; 3]
+```
+
+The mapped scalars, followed by zero entries that are not part of the result.
+
+<a id="CaseMapping.length"></a>
+
+### Field `length`
+
+```silk
+pub length: usize
+```
+
+The number of mapped scalars, from one through three.
 
 <a id="UnicodeCase"></a>
 
@@ -34,6 +65,21 @@ ECMAScript case canonicalization and character classes over Unicode scalars.
 ```silk
 impl UnicodeCase
 ```
+
+<a id="UnicodeCase.impl.fold"></a>
+
+### Associated function `fold`
+
+```silk
+pub fn fold(c: u32) -> CaseMapping
+```
+
+Returns the full, locale-independent Unicode 17.0.0 case fold of `c`.
+
+#### Details
+
+The result contains one through three scalars. An unmapped value is returned unchanged.
+Use this mapping for caseless text comparison; it can expand one scalar into several scalars.
 
 <a id="UnicodeCase.impl.canonicalize"></a>
 

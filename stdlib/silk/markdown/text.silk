@@ -1,0 +1,783 @@
+//! Visible text, heading slugs, and document outlines for Markdown trees.
+//!
+//! # When to use
+//! Use `MarkdownText.plainTextOwned` to extract text and `MarkdownText.outline` to collect headings.
+//! Use `MarkdownSlugger` for unique GitHub-style anchors across a sequence of headings.
+//!
+//! # Details
+//! Text extraction omits raw HTML and frontmatter. Image children contribute their alternative text.
+//! Slugs use Unicode lowercase, remove punctuation except hyphens and underscores, and replace spaces with hyphens.
+//!
+//! # Examples
+//!
+//! ## Collect unique heading anchors
+//!
+//! ```silk
+//! import silk.markdown.document { MarkdownDocument }
+//! import silk.markdown.text { MarkdownText, MarkdownHeading }
+//! import silk.collections.list { List }
+//! import silk.text.string { String }
+//! import silk.core.effect { Effect }
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//!
+//! pub effect fn main() -> i32
+//!   ! OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let document = run MarkdownDocument.parse("# Hello\n\n# Hello")
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!   let headings = run MarkdownText.outline(&document) |> Effect.provideMut<Allocator>(&mut allocator)
+//!   let rows = List<MarkdownHeading>.asSlice(&headings)
+//!   if rows.length != 2 || String.view(&rows[1].slug) != "hello-1" {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! @category Data formats
+
+import silk.markdown.document { MarkdownDocument, MarkdownNodeId, MarkdownNodeKind }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.collections.hash { Hash }
+import silk.collections.hash_map { HashMap }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.string { String }
+import silk.text.utf8_scan
+import silk.text.regex_unicode { UnicodeCase }
+import silk.text.unicode_properties { GeneralCategory }
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+
+/// The owner of visible-text, slug, and outline operations over the public Markdown tree.
+pub struct MarkdownText {}
+
+/// One heading in document order, with owned visible text and a unique slug.
+pub struct MarkdownHeading {
+  /// The heading's node id in the source document.
+  pub node: MarkdownNodeId,
+  /// The heading level from one through six.
+  pub level: u8,
+  /// The visible heading text without inline markup or raw HTML.
+  pub text: String,
+  /// The unique GitHub-style anchor for this heading.
+  pub slug: String,
+}
+
+struct SlugEntry {
+  value: String,
+  suffix: usize,
+  next: usize
+}
+
+/// Reusable state for unique GitHub-style slugs. Repeated slugs receive `-1`, `-2`, and later available suffixes.
+/// Explicit suffixed names also reserve their spelling. Create separate state for each document.
+pub struct MarkdownSlugger {
+  entries: List<SlugEntry>,
+  index: HashMap<u64, usize>,
+}
+
+impl MarkdownSlugger {
+  /// Creates empty slug state without allocation.
+  pub fn make() -> MarkdownSlugger {
+    return MarkdownSlugger {
+      entries: List<SlugEntry>.make(),
+      index: HashMap<u64, usize>.make(Hash.seed(0)),
+    }
+  }
+
+  /// Removes all reserved slugs and retains allocated capacity.
+  pub fn clear(self: &mut Self) {
+    List<SlugEntry>.clear(&mut self.entries)
+    HashMap<u64, usize>.clear(&mut self.index)
+  }
+
+  /// Returns a lowercase slug unique within this state, reserving its spelling.
+  /// Removes punctuation except `-` and `_`, replaces ASCII spaces with `-`, and preserves repeated spaces.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if slug storage cannot grow. Earlier reserved slugs remain reserved.
+  pub effect fn slug(self: &mut Self, value: string) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let base = run MarkdownText.slugOwned(value)
+    let mut candidate = run String.copy(String.view(&base))
+    let existing = slugIndex(&self.*, String.view(&base))
+    if existing != usize.MAX {
+      let mut entry = List<SlugEntry>.asMutSlice(&mut self.entries)
+      let mut suffix = entry[existing].suffix
+      drop entry
+      while true {
+        suffix = suffix + 1
+        String.clear(&mut candidate)
+        run String.append(&mut candidate, String.view(&base))
+        run String.append(&mut candidate, "-")
+        let mut digits = Bytes.make()
+        run decimal(&mut digits, suffix)
+        run String.append(&mut candidate, unsafe String.fromUtf8Unchecked(Bytes.asSlice(&digits)))
+        if slugIndex(&self.*, String.view(&candidate)) == usize.MAX {
+          break
+        }
+      }
+      let updated = List<SlugEntry>.asMutSlice(&mut self.entries)
+      updated[existing].suffix = suffix
+    }
+    let hash = slugHash(String.view(&candidate))
+    let next = match HashMap<u64, usize>.get(&self.index, hash) {
+      Option<usize>.Some { value: found } => found
+      _ => usize.MAX
+    }
+    let index = List<SlugEntry>.length(&self.entries)
+    let copy = run String.copy(String.view(&candidate))
+    run List<SlugEntry>.append(
+      &mut self.entries,
+      SlugEntry { value: move copy, suffix: 0, next: next },
+    )
+    drop run HashMap<u64, usize>.insert(&mut self.index, hash, index)
+    return move candidate
+  }
+}
+
+impl MarkdownText {
+  /// Appends visible text from subtree `id` to `out`. Invalid ids append nothing.
+  /// Text, code, and image alternatives contribute text. Breaks and block boundaries contribute newlines; table cells use tabs.
+  /// Raw HTML and frontmatter contribute no text. Footnote references contribute their number; nested definitions are skipped.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if `out` cannot grow. Text already appended remains in `out`.
+  pub effect fn plainTextInto(
+    document: &MarkdownDocument<'_>,
+    id: MarkdownNodeId,
+    out: &mut Bytes,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if id.index >= MarkdownDocument.nodes(document).length {
+      return
+    }
+    let mut current = id.index
+    let mut entering = true
+    while true {
+      let key = MarkdownNodeId { index: current }
+      let kind = MarkdownDocument.kind(document, key)
+      let hidden = kind == MarkdownNodeKind.Frontmatter
+        || kind == MarkdownNodeKind.FootnoteDefinition && current != id.index
+      if entering {
+        if kind == MarkdownNodeKind.Text || kind == MarkdownNodeKind.Code
+          || kind == MarkdownNodeKind.CodeBlock {
+          run Bytes.append(&mut out.*, String.utf8Bytes(MarkdownDocument.literal(document, key)))
+        } else if kind == MarkdownNodeKind.FootnoteReference {
+          let number = MarkdownDocument.footnoteNumber(document, key)
+          if number != 0 {
+            run decimal(&mut out.*, number)
+          }
+        } else if kind == MarkdownNodeKind.SoftBreak || kind == MarkdownNodeKind.HardBreak {
+          run Bytes.append(&mut out.*, b"\n")
+        }
+        if !hidden {
+          if let Option<MarkdownNodeId>.Some { value } = MarkdownDocument.firstChild(
+            document,
+            key,
+          ) {
+            current = value.index
+            continue
+          }
+        }
+      }
+      if !hidden && current != id.index && MarkdownDocument.nextSibling(document, key).isSome() {
+        if kind == MarkdownNodeKind.TableCell {
+          run Bytes.append(&mut out.*, b"\t")
+        } else if kind == MarkdownNodeKind.Paragraph || kind == MarkdownNodeKind.Heading
+          || kind == MarkdownNodeKind.Table
+          || kind == MarkdownNodeKind.TableRow
+          || kind == MarkdownNodeKind.List
+          || kind == MarkdownNodeKind.ListItem
+          || kind == MarkdownNodeKind.BlockQuote
+          || kind == MarkdownNodeKind.Alert
+          || kind == MarkdownNodeKind.CodeBlock {
+          let output = Bytes.asSlice(&out.*)
+          let needsBreak = output.length > 0 && output[output.length - 1] != 10
+          drop output
+          if needsBreak {
+            run Bytes.append(&mut out.*, b"\n")
+          }
+        }
+      }
+      if current == id.index {
+        break
+      }
+      if let Option<MarkdownNodeId>.Some { value } = MarkdownDocument.nextSibling(document, key) {
+        current = value.index
+        entering = true
+      } else {
+        current = match MarkdownDocument.parent(document, key) {
+          Option<MarkdownNodeId>.Some { value } => value.index
+          _ => id.index
+        }
+        entering = false
+      }
+    }
+  }
+
+  /// Returns owned visible text for subtree `id`. Invalid ids return empty text.
+  /// Text, code, and image alternatives contribute text. Breaks and block boundaries contribute newlines; table cells use tabs.
+  /// Raw HTML and frontmatter contribute no text. Footnote references contribute their number; nested definitions are skipped.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the allocator cannot supply the result.
+  pub effect fn plainTextOwned(document: &MarkdownDocument<'_>, id: MarkdownNodeId) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut output = Bytes.make()
+    run MarkdownText.plainTextInto(document, id, &mut output)
+    return unsafe String.fromBytesUnchecked(move output)
+  }
+
+  /// Returns a GitHub-style slug without duplicate tracking.
+  /// Uses Unicode lowercase, removes punctuation except `-` and `_`, and replaces ASCII spaces with `-`.
+  /// Tabs and control characters are removed. Non-ASCII letters, combining marks, and numbers remain.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the allocator cannot supply the result.
+  pub effect fn slugOwned(value: string) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut output = Bytes.make()
+    let data = String.utf8Bytes(value)
+    let mut pos: usize = 0
+    let mut precedingCased = false
+    while pos < data.length {
+      let decoded = utf8_scan.decode(data, pos)
+      let c = decoded.scalar
+      pos = decoded.next
+      let final = c == 0x3a3 && precedingCased && !followingCased(data, pos)
+      if !caseIgnorable(c) {
+        precedingCased = cased(c)
+      }
+      if c == 32 {
+        run Bytes.append(&mut output, b"-")
+        continue
+      }
+      if !slugCharacter(c) {
+        continue
+      }
+      let exception = lowercaseException(c)
+      if final {
+        run scalar(&mut output, 0x3c2)
+      } else if exception != u32.MAX {
+        run scalar(&mut output, exception)
+      } else {
+        let mapped = UnicodeCase.fold(c)
+        let mut i: usize = 0
+        while i < mapped.length {
+          run scalar(&mut output, mapped.points[i])
+          i = i + 1
+        }
+      }
+    }
+    return unsafe String.fromBytesUnchecked(move output)
+  }
+
+  /// Returns headings in document order with owned visible text and unique slugs.
+  /// Duplicate tracking starts empty for each call. The returned ids belong to `document`.
+  /// Headings inside footnote definitions are excluded because definitions are not part of the document outline.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the allocator cannot supply the outline or its strings.
+  pub effect fn outline(document: &MarkdownDocument<'_>) -> List<MarkdownHeading>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut result = List<MarkdownHeading>.make()
+    let mut slugger = MarkdownSlugger.make()
+    let mut i: usize = 0
+    let nodes = MarkdownDocument.nodes(document)
+    while i < nodes.length {
+      let key = MarkdownNodeId { index: i }
+      if nodes[i].kind == MarkdownNodeKind.Heading && !insideFootnote(document, key) {
+        let text = run MarkdownText.plainTextOwned(document, key)
+        let slug = run MarkdownSlugger.slug(&mut slugger, String.view(&text))
+        run List<MarkdownHeading>.append(
+          &mut result,
+          MarkdownHeading {
+            node: key,
+            level: MarkdownDocument.headingLevel(document, key),
+            text: move text,
+            slug: move slug,
+          },
+        )
+      }
+      i = i + 1
+    }
+    return move result
+  }
+}
+
+fn insideFootnote(doc: &MarkdownDocument<'_>, id: MarkdownNodeId) -> bool {
+  let mut parent = MarkdownDocument.parent(doc, id)
+  while let Option<MarkdownNodeId>.Some { value } = parent {
+    if MarkdownDocument.kind(doc, value) == MarkdownNodeKind.FootnoteDefinition {
+      return true
+    }
+    parent = MarkdownDocument.parent(doc, value)
+  }
+  return false
+}
+
+fn slugHash(value: string) -> u64 {
+  let data = String.utf8Bytes(value)
+  let mut hash: u64 = 14695981039346656037
+  let mut i: usize = 0
+  while i < data.length {
+    hash = u64.wrappingMultiply(hash ^ u8.toU64(data[i]), 1099511628211)
+    i = i + 1
+  }
+  return hash
+}
+
+fn slugIndex(state: &MarkdownSlugger, value: string) -> usize {
+  let mut index = match HashMap<u64, usize>.get(&state.index, slugHash(value)) {
+    Option<usize>.Some { value: found } => found
+    _ => usize.MAX
+  }
+  let entries = List<SlugEntry>.asSlice(&state.entries)
+  while index != usize.MAX {
+    if String.view(&entries[index].value) == value {
+      return index
+    }
+    index = entries[index].next
+  }
+  return usize.MAX
+}
+
+fn slugCharacter(c: u32) -> bool {
+  if c == 45 || c == 95 {
+    return true
+  }
+  if c < 128 {
+    return c >= 48 && c <= 57 || c >= 65 && c <= 90 || c >= 97 && c <= 122
+  }
+  return match GeneralCategory.of(c) {
+    GeneralCategory.Cc => false
+    GeneralCategory.Cf => false
+    GeneralCategory.Pc => false
+    GeneralCategory.Pd => false
+    GeneralCategory.Pe => false
+    GeneralCategory.Pf => false
+    GeneralCategory.Pi => false
+    GeneralCategory.Po => false
+    GeneralCategory.Ps => false
+    GeneralCategory.Sc => false
+    GeneralCategory.Sk => false
+    GeneralCategory.Sm => false
+    GeneralCategory.So => false
+    _ => true
+  }
+}
+
+effect fn decimal(out: &mut Bytes, value: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut digits: [u8; 20] = [0; 20]
+  let mut at: usize = 20
+  let mut number = value
+  while true {
+    at = at - 1
+    digits[at] = usize.toU8(number % 10) + 48
+    number = number / 10
+    if number == 0 {
+      break
+    }
+  }
+  run Bytes.append(&mut out.*, Slice.view<u8>(&digits, at, 20 - at))
+}
+
+effect fn scalar(out: &mut Bytes, c: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if c < 128 {
+    run Bytes.append(&mut out.*, &[u32.toU8(c)])
+  } else if c < 2048 {
+    run Bytes.append(&mut out.*, &[u32.toU8(192 + c / 64), u32.toU8(128 + c % 64)])
+  } else if c < 65536 {
+    run Bytes.append(
+      &mut out.*,
+      &[u32.toU8(224 + c / 4096), u32.toU8(128 + c / 64 % 64), u32.toU8(128 + c % 64)],
+    )
+  } else {
+    run Bytes.append(
+      &mut out.*,
+      &[
+        u32.toU8(240 + c / 262144),
+        u32.toU8(128 + c / 4096 % 64),
+        u32.toU8(128 + c / 64 % 64),
+        u32.toU8(128 + c % 64),
+      ],
+    )
+  }
+}
+
+fn cased(c: u32) -> bool {
+  let category = GeneralCategory.of(c)
+  let base = category == GeneralCategory.Lu || category == GeneralCategory.Ll
+    || category == GeneralCategory.Lt
+  return contextProperty(c, base, &CASED_EXCEPTIONS)
+}
+
+fn caseIgnorable(c: u32) -> bool {
+  let category = GeneralCategory.of(c)
+  let base = category == GeneralCategory.Mn || category == GeneralCategory.Me
+    || category == GeneralCategory.Cf
+    || category == GeneralCategory.Lm
+    || category == GeneralCategory.Sk
+  return contextProperty(c, base, &CASE_IGNORABLE_EXCEPTIONS)
+}
+
+fn contextProperty(c: u32, base: bool, exceptions: &[u32]) -> bool {
+  let mut low: usize = 0
+  let mut high = exceptions.length / 3
+  while low < high {
+    let mid = low + (high - low) / 2
+    let at = mid * 3
+    if c < exceptions[at] {
+      high = mid
+    } else if c > exceptions[at + 1] {
+      low = mid + 1
+    } else {
+      return exceptions[at + 2] != 0
+    }
+  }
+  return base
+}
+
+fn followingCased(data: &[u8], start: usize) -> bool {
+  let mut pos = start
+  while pos < data.length {
+    let decoded = utf8_scan.decode(data, pos)
+    if !caseIgnorable(decoded.scalar) {
+      return cased(decoded.scalar)
+    }
+    pos = decoded.next
+  }
+  return false
+}
+
+fn lowercaseException(c: u32) -> u32 {
+  let mut low: usize = 0
+  let mut high = LOWERCASE_EXCEPTIONS.length / 3
+  while low < high {
+    let mid = low + (high - low) / 2
+    let at = mid * 3
+    if c < LOWERCASE_EXCEPTIONS[at] {
+      high = mid
+    } else if c > LOWERCASE_EXCEPTIONS[at + 1] {
+      low = mid + 1
+    } else {
+      return u32.wrappingAdd(c, LOWERCASE_EXCEPTIONS[at + 2])
+    }
+  }
+  return u32.MAX
+}
+
+// BEGIN GENERATED LOWERCASE EXCEPTIONS
+// Unicode 17.0.0; generated by scripts/markdown/generate-slug-lowercase.
+// Pinned UnicodeData, SpecialCasing, and CaseFolding inputs; see the generator for SHA-256 values.
+const LOWERCASE_EXCEPTIONS: [u32; 141] = [
+  181,
+  181,
+  0,
+  223,
+  223,
+  0,
+  329,
+  329,
+  0,
+  383,
+  383,
+  0,
+  496,
+  496,
+  0,
+  837,
+  837,
+  0,
+  912,
+  912,
+  0,
+  944,
+  944,
+  0,
+  962,
+  962,
+  0,
+  976,
+  977,
+  0,
+  981,
+  982,
+  0,
+  1008,
+  1009,
+  0,
+  1013,
+  1013,
+  0,
+  1415,
+  1415,
+  0,
+  5024,
+  5103,
+  38864,
+  5104,
+  5109,
+  8,
+  5112,
+  5117,
+  0,
+  7296,
+  7304,
+  0,
+  7830,
+  7835,
+  0,
+  7838,
+  7838,
+  4294959681,
+  8016,
+  8016,
+  0,
+  8018,
+  8018,
+  0,
+  8020,
+  8020,
+  0,
+  8022,
+  8022,
+  0,
+  8064,
+  8071,
+  0,
+  8072,
+  8079,
+  4294967288,
+  8080,
+  8087,
+  0,
+  8088,
+  8095,
+  4294967288,
+  8096,
+  8103,
+  0,
+  8104,
+  8111,
+  4294967288,
+  8114,
+  8116,
+  0,
+  8118,
+  8119,
+  0,
+  8124,
+  8124,
+  4294967287,
+  8126,
+  8126,
+  0,
+  8130,
+  8132,
+  0,
+  8134,
+  8135,
+  0,
+  8140,
+  8140,
+  4294967287,
+  8146,
+  8147,
+  0,
+  8150,
+  8151,
+  0,
+  8162,
+  8164,
+  0,
+  8166,
+  8167,
+  0,
+  8178,
+  8180,
+  0,
+  8182,
+  8183,
+  0,
+  8188,
+  8188,
+  4294967287,
+  43888,
+  43967,
+  0,
+  64256,
+  64262,
+  0,
+  64275,
+  64279,
+  0,
+]
+
+const CASED_EXCEPTIONS: [u32; 93] = [
+  170,
+  170,
+  1,
+  186,
+  186,
+  1,
+  688,
+  696,
+  1,
+  704,
+  705,
+  1,
+  736,
+  740,
+  1,
+  837,
+  837,
+  1,
+  890,
+  890,
+  1,
+  4348,
+  4348,
+  1,
+  7468,
+  7530,
+  1,
+  7544,
+  7544,
+  1,
+  7579,
+  7615,
+  1,
+  8305,
+  8305,
+  1,
+  8319,
+  8319,
+  1,
+  8336,
+  8348,
+  1,
+  8544,
+  8575,
+  1,
+  9398,
+  9449,
+  1,
+  11388,
+  11389,
+  1,
+  42652,
+  42653,
+  1,
+  42864,
+  42864,
+  1,
+  42993,
+  42996,
+  1,
+  43000,
+  43001,
+  1,
+  43868,
+  43871,
+  1,
+  43881,
+  43881,
+  1,
+  67456,
+  67456,
+  1,
+  67459,
+  67461,
+  1,
+  67463,
+  67504,
+  1,
+  67506,
+  67514,
+  1,
+  122928,
+  122989,
+  1,
+  127280,
+  127305,
+  1,
+  127312,
+  127337,
+  1,
+  127344,
+  127369,
+  1,
+]
+
+const CASE_IGNORABLE_EXCEPTIONS: [u32; 48] = [
+  39,
+  39,
+  1,
+  46,
+  46,
+  1,
+  58,
+  58,
+  1,
+  183,
+  183,
+  1,
+  903,
+  903,
+  1,
+  1375,
+  1375,
+  1,
+  1524,
+  1524,
+  1,
+  8216,
+  8217,
+  1,
+  8228,
+  8228,
+  1,
+  8231,
+  8231,
+  1,
+  65043,
+  65043,
+  1,
+  65106,
+  65106,
+  1,
+  65109,
+  65109,
+  1,
+  65287,
+  65287,
+  1,
+  65294,
+  65294,
+  1,
+  65306,
+  65306,
+  1,
+]
+// END GENERATED LOWERCASE EXCEPTIONS
