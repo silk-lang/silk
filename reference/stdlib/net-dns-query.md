@@ -22,7 +22,8 @@ Make an exchange with [`Exchange.make`](#Exchange.impl.make), then loop:
 4. For `Step.Done`, call [`Exchange.finish`](#Exchange.impl.finish) for the result.
 
 The exchange tries each server in turn, for `attempts` rounds. It waits `timeout` for each server
-in the first round, and doubles the wait in each later round, up to 8 times `timeout`. A reply with
+in the first round, and doubles the wait in each later round, up to 8 times `timeout` and at most
+`maxTimeout` when that is not 0. A reply with
 the TC bit is asked again over TCP from the same server. A server that answers SERVFAIL, NOTIMP or
 REFUSED is skipped at once. A FORMERR answer to a query with EDNS is asked again without EDNS.
 A late UDP answer from a server that was asked before is accepted.
@@ -439,7 +440,7 @@ pub effect fn make(config: &ResolverConfig, question: Question, id: u16, first: 
 Returns an exchange that asks `question` with the identifier `id`.
 
 #### Details
-The exchange uses the servers, `timeout`, `attempts`, `edns` and `useTcp` of `config`, and starts
+The exchange uses the servers, `timeout`, `maxTimeout`, `attempts`, `edns` and `useTcp` of `config`, and starts
 at server `first`, modulo the number of servers. To follow the `rotate` option, give a different
 `first` to each query. Take `id` from a `Random` provider, so that an attacker cannot guess it.
 

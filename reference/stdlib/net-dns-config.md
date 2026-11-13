@@ -91,6 +91,17 @@ pub attempts: usize
 
 How many times to try the whole list of servers. The default is 2.
 
+<a id="ResolverConfig.maxTimeout"></a>
+
+### Field `maxTimeout`
+
+```silk
+pub maxTimeout: u64
+```
+
+The longest wait for one server in any round, in nanoseconds, or 0 for no limit beyond the
+doubling (c-ares' `maxtimeout`). The default is 0.
+
 <a id="ResolverConfig.rotate"></a>
 
 ### Field `rotate`
@@ -178,7 +189,7 @@ pub fn make(servers: List<Endpoint>) -> ResolverConfig
 ```
 
 Returns a configuration with `servers` and the default options: no search domains, `ndots` 1, a
-5 second timeout, 2 attempts, and UDP queries without EDNS.
+5 second timeout, 2 attempts, no limit on the doubled wait, and UDP queries without EDNS.
 
 <a id="ResolverConfig.impl.parse"></a>
 
