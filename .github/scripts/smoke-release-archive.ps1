@@ -22,8 +22,12 @@ $env:SILK_HOME = Join-Path $OutputDirectory 'isolated home'
 Push-Location $project
 try {
   # No --stdlib: test the archive's actual installed library discovery and bundled compiler.
-  # No --clang either: the archive's bundled LLVM, which makes its tool links on first use.
+  # No --clang or SILK_CLANG either: the archive's bundled LLVM, which makes its tool links on
+  # first use.
+  $selectedClang = $env:SILK_CLANG
+  $env:SILK_CLANG = $null
   & $tool build main.silk -o program.exe --optimization none --debug false
+  $env:SILK_CLANG = $selectedClang
   if ($LASTEXITCODE -ne 0) { throw 'The packaged tool could not build a new project' }
   foreach ($link in 'clang.exe', 'lld-link.exe', 'llvm-ar.exe', 'llvm-dlltool.exe') {
     if (-not (Test-Path -LiteralPath (Join-Path $release "lib/silk/llvm/bin/$link"))) { throw "The bundled LLVM has no $link" }
