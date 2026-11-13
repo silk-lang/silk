@@ -1,0 +1,440 @@
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.diff
+import silk.text.diff {
+  Algorithm,
+  ApplyError,
+  Edit,
+  EditKind,
+  FileChange,
+  Patch,
+  PatchError,
+  PatchReason,
+  Span
+}
+import silk.text.string { String }
+import silk.num.u64
+import silk.num.usize
+
+// Random texts against their unified diffs: the edits rebuild the new text, minimal Myers edits
+// are minimal, and every diff read back with `parse` and applied with `apply` gives the new text.
+// Then fixed patches in the formats that git and GNU diff write.
+
+fn step(state: &mut u64) -> usize {
+  state.* = u64.wrappingAdd(u64.wrappingMultiply(state.*, 6364136223846793005), 1442695040888963407)
+  return u64.wrappingToUsize(u64.shiftRight(state.*, 33))
+}
+
+// Appends `count` lines drawn from `alphabet` letters; the last line has no newline if `open`.
+effect fn generate(
+  state: &mut u64,
+  output: &mut Bytes,
+  count: usize,
+  alphabet: usize,
+  open: bool,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let letters = b"abcdefghijklmnopqrstuvwxyz"
+  let mut index: usize = 0
+  while index < count {
+    let letter = step(&mut state) % alphabet
+    run Bytes.append(&mut output, Slice.view<u8>(letters, letter, 1))
+    if index + 1 < count || !open {
+      run Bytes.append(&mut output, b"\n")
+    }
+    index = index + 1
+  }
+}
+
+// Changes some lines of `source`: each line is kept, dropped, replaced, or gets a new line after it.
+effect fn mutate(state: &mut u64, source: &[u8], output: &mut Bytes, alphabet: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut at: usize = 0
+  while at < source.length {
+    let mut end = at
+    while end < source.length && source[end] != 10 {
+      end = end + 1
+    }
+    if end < source.length {
+      end = end + 1
+    }
+    let roll = step(&mut state) % 10
+    let extra = 1 + step(&mut state) % 3
+    if roll == 0 {
+      run generate(&mut state, &mut output, 1, alphabet, false)
+    } else if roll == 1 {
+      run Bytes.append(&mut output, Slice.view<u8>(source, at, end - at))
+      run generate(&mut state, &mut output, extra, alphabet, false)
+    } else if roll != 2 {
+      run Bytes.append(&mut output, Slice.view<u8>(source, at, end - at))
+    }
+    at = end
+  }
+  let tail = step(&mut state) % 4 == 0
+  let count = 1 + step(&mut state) % 3
+  let open = step(&mut state) % 2 == 0
+  if tail {
+    run generate(&mut state, &mut output, count, alphabet, open)
+  }
+}
+
+effect fn lines(text: &[u8]) -> List<usize>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut starts = List<usize>.make()
+  run List<usize>.append(&mut starts, 0)
+  let mut at: usize = 0
+  while at < text.length {
+    if text[at] == 10 || at + 1 == text.length {
+      run List<usize>.append(&mut starts, at + 1)
+    }
+    at = at + 1
+  }
+  return move starts
+}
+
+fn sameBytes(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at: usize = 0
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + 1
+  }
+  return true
+}
+
+fn lineAt<'text>(text: &'text [u8], starts: &[usize], index: usize) -> &'text [u8] {
+  return Slice.view<u8>(text, starts[index], starts[index + 1] - starts[index])
+}
+
+// The length of the longest common subsequence of lines, with the whole table.
+effect fn common(old: &[u8], new: &[u8]) -> usize
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let oldStarts = run lines(old)
+  let newStarts = run lines(new)
+  let n = List<usize>.length(&oldStarts) - 1
+  let m = List<usize>.length(&newStarts) - 1
+  let mut table = List<usize>.make()
+  run List<usize>.appendRepeated(&mut table, 0, (n + 1) * (m + 1))
+  let cells = List<usize>.asMutSlice(&mut table)
+  let mut i: usize = 1
+  while i <= n {
+    let mut j: usize = 1
+    while j <= m {
+      let a = lineAt(old, List<usize>.asSlice(&oldStarts), i - 1)
+      let b = lineAt(new, List<usize>.asSlice(&newStarts), j - 1)
+      if sameBytes(a, b) {
+        cells[i * (m + 1) + j] = cells[(i - 1) * (m + 1) + j - 1] + 1
+      } else if cells[(i - 1) * (m + 1) + j] > cells[i * (m + 1) + j - 1] {
+        cells[i * (m + 1) + j] = cells[(i - 1) * (m + 1) + j]
+      } else {
+        cells[i * (m + 1) + j] = cells[i * (m + 1) + j - 1]
+      }
+      j = j + 1
+    }
+    i = i + 1
+  }
+  return cells[n * (m + 1) + m]
+}
+
+// 0 if the edits cover both texts in order and their equal runs are equal lines; otherwise the
+// number of the failed check. Also counts the equal lines into `kept`.
+effect fn checkEdits(old: &[u8], new: &[u8], edits: &[Edit], kept: &mut usize) -> i32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let oldStarts = run lines(old)
+  let newStarts = run lines(new)
+  let mut i: usize = 0
+  let mut j: usize = 0
+  let mut at: usize = 0
+  while at < edits.length {
+    let edit = edits[at]
+    if edit.oldStart != i || edit.newStart != j || edit.length == 0 {
+      return 1
+    }
+    if edit.kind == EditKind.Equal {
+      let mut k: usize = 0
+      while k < edit.length {
+        let a = lineAt(old, List<usize>.asSlice(&oldStarts), i + k)
+        let b = lineAt(new, List<usize>.asSlice(&newStarts), j + k)
+        if !sameBytes(a, b) {
+          return 2
+        }
+        k = k + 1
+      }
+      i = i + edit.length
+      j = j + edit.length
+      kept.* = kept.* + edit.length
+    } else if edit.kind == EditKind.Delete {
+      i = i + edit.length
+    } else {
+      j = j + edit.length
+    }
+    at = at + 1
+  }
+  if i != List<usize>.length(&oldStarts) - 1 || j != List<usize>.length(&newStarts) - 1 {
+    return 3
+  }
+  return 0
+}
+
+effect fn roundTrip(old: &[u8], new: &[u8], algorithm: Algorithm, context: usize) -> i32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let edits = run diff.diffLinesBytes(old, new, algorithm)
+  let mut kept: usize = 0
+  let checked = run checkEdits(old, new, List<Edit>.asSlice(&edits), &mut kept)
+  if checked != 0 {
+    return checked
+  }
+  if algorithm == Algorithm.MyersMinimal && kept != (run common(old, new)) {
+    return 4
+  }
+  let text = run diff.unifiedBytes(b"a/file", old, b"b/file", new, context, algorithm)
+  if Bytes.length(&text) == 0 {
+    if sameBytes(old, new) {
+      return 0
+    }
+    return 5
+  }
+  let read = run Effect.result(diff.parseBytes(Bytes.asSlice(&text)))
+  let patch = match move read {
+    Result<Patch, PatchError | OutOfMemoryError>.Success { value } => move value
+    Result<Patch, PatchError | OutOfMemoryError>.Failure { error } => {
+      drop error
+      return 6
+    }
+  }
+  if List<diff.FilePatch>.length(&patch.files) != 1 {
+    return 7
+  }
+  let file = &List<diff.FilePatch>.asSlice(&patch.files)[0]
+  let applied = run Effect.result(diff.applyBytes(old, Bytes.asSlice(&text), file))
+  let output = match move applied {
+    Result<Bytes, ApplyError | OutOfMemoryError>.Success { value } => move value
+    Result<Bytes, ApplyError | OutOfMemoryError>.Failure { error } => {
+      drop error
+      return 8
+    }
+  }
+  if !sameBytes(Bytes.asSlice(&output), new) {
+    return 9
+  }
+  return 0
+}
+
+effect fn randomCases() -> i32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut state: u64 = 7
+  let mut round: usize = 0
+  while round < 400 {
+    let mut old = Bytes.make()
+    let mut new = Bytes.make()
+    let alphabet = 2 + round % 7
+    run generate(&mut state, &mut old, round % 40, alphabet, round % 5 == 0)
+    if round % 9 == 0 {
+      let count = step(&mut state) % 30
+      run generate(&mut state, &mut new, count, alphabet, round % 2 == 0)
+    } else {
+      run mutate(&mut state, Bytes.asSlice(&old), &mut new, alphabet)
+    }
+    let context = round % 4
+    let myers = run roundTrip(Bytes.asSlice(&old), Bytes.asSlice(&new), Algorithm.Myers, context)
+    if myers != 0 {
+      return 100 + myers
+    }
+    let minimal = run roundTrip(
+      Bytes.asSlice(&old),
+      Bytes.asSlice(&new),
+      Algorithm.MyersMinimal,
+      context,
+    )
+    if minimal != 0 {
+      return 300 + minimal
+    }
+    let histogram = run roundTrip(
+      Bytes.asSlice(&old),
+      Bytes.asSlice(&new),
+      Algorithm.Histogram,
+      context,
+    )
+    if histogram != 0 {
+      return 200 + histogram
+    }
+    round = round + 1
+  }
+  return 0
+}
+
+fn present(path: Option<Span>) -> bool {
+  return match path {
+    Option<Span>.Some { .. } => true
+    Option<Span>.None => false
+  }
+}
+
+fn mode(written: Option<u32>) -> u32 {
+  return match written {
+    Option<u32>.Some { value } => value
+    Option<u32>.None => 0
+  }
+}
+
+effect fn fixedCases() -> i32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let old = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n"
+  let new = "one\n2\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven"
+  let written = run diff.unified("a/count.txt", old, "b/count.txt", new, 3, Algorithm.Myers)
+  let expected = "--- a/count.txt\n+++ b/count.txt\n@@ -1,5 +1,5 @@\n one\n-two\n+2\n three\n four\n five\n@@ -8,3 +8,4 @@\n eight\n nine\n ten\n+eleven\n\\ No newline at end of file\n"
+  if String.view(&written) != expected {
+    return 1
+  }
+  let empty = run diff.unified("a/x", "", "b/x", "x\n", 3, Algorithm.Histogram)
+  if String.view(&empty) != "--- a/x\n+++ b/x\n@@ -0,0 +1 @@\n+x\n" {
+    return 2
+  }
+
+  // A git patch with a mode change, a rename, a new file, a deleted file and a binary file,
+  // after a commit message.
+  let git = "From 1234 Mon Sep 17 00:00:00 2001\nSubject: [PATCH] Change files\n\n---\n run.sh | 0\n\ndiff --git a/run.sh b/run.sh\nold mode 100644\nnew mode 100755\ndiff --git a/old name.txt b/new name.txt\nsimilarity index 90%\nrename from old name.txt\nrename to new name.txt\nindex 1111111..2222222 100644\n--- a/old name.txt\n+++ b/new name.txt\n@@ -1,2 +1,2 @@ section\n keep\n-drop\n+add\ndiff --git a/fresh.txt b/fresh.txt\nnew file mode 100644\nindex 0000000..3333333\n--- /dev/null\n+++ b/fresh.txt\n@@ -0,0 +1 @@\n+hello\n\\ No newline at end of file\ndiff --git a/gone.txt b/gone.txt\ndeleted file mode 100644\n--- a/gone.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-bye\ndiff --git a/logo.png b/logo.png\nBinary files a/logo.png and b/logo.png differ\n-- \n2.40.0\n"
+  let patch = match move run Effect.result(diff.parse(git)) {
+    Result<Patch, PatchError | OutOfMemoryError>.Success { value } => move value
+    Result<Patch, PatchError | OutOfMemoryError>.Failure { error } => {
+      drop error
+      return 3
+    }
+  }
+  let files = List<diff.FilePatch>.asSlice(&patch.files)
+  if files.length != 5 {
+    return 4
+  }
+  if files[0].change != FileChange.Modified || mode(files[0].oldMode) != 33188
+    || mode(files[0].newMode) != 33261 {
+    return 5
+  }
+  let renamedFrom = match files[1].oldPath {
+    Option<Span>.Some { value } => value.text(git)
+    Option<Span>.None => {
+      return 6
+    }
+  }
+  let renamedTo = match files[1].newPath {
+    Option<Span>.Some { value } => value.text(git)
+    Option<Span>.None => {
+      return 6
+    }
+  }
+  if files[1].change != FileChange.Renamed || renamedFrom != "old name.txt"
+    || renamedTo != "new name.txt" {
+    return 7
+  }
+  let hunk = List<diff.Hunk>.asSlice(&files[1].hunks)[0]
+  if hunk.section.text(git) != "section" || hunk.lineCount != 3 {
+    return 8
+  }
+  let moved = match move run Effect.result(diff.apply("keep\ndrop\n", git, &files[1])) {
+    Result<String, ApplyError | OutOfMemoryError>.Success { value } => move value
+    Result<String, ApplyError | OutOfMemoryError>.Failure { error } => {
+      drop error
+      return 9
+    }
+  }
+  if String.view(&moved) != "keep\nadd\n" {
+    return 10
+  }
+  if files[2].change != FileChange.Created || present(files[2].oldPath) {
+    return 11
+  }
+  let created = match move run Effect.result(diff.apply("", git, &files[2])) {
+    Result<String, ApplyError | OutOfMemoryError>.Success { value } => move value
+    Result<String, ApplyError | OutOfMemoryError>.Failure { error } => {
+      drop error
+      return 12
+    }
+  }
+  if String.view(&created) != "hello" {
+    return 13
+  }
+  if files[3].change != FileChange.Deleted || present(files[3].newPath) {
+    return 14
+  }
+  if !files[4].binary || List<diff.Hunk>.length(&files[4].hunks) != 0 {
+    return 15
+  }
+
+  // A hunk whose lines moved: it applies where its old lines are now.
+  let shifted = "zero\nextra\none\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n"
+  let reread = match move run Effect.result(diff.parse(String.view(&written))) {
+    Result<Patch, PatchError | OutOfMemoryError>.Success { value } => move value
+    Result<Patch, PatchError | OutOfMemoryError>.Failure { error } => {
+      drop error
+      return 16
+    }
+  }
+  let first = &List<diff.FilePatch>.asSlice(&reread.files)[0]
+  let applied = match move run Effect.result(diff.apply(shifted, String.view(&written), first)) {
+    Result<String, ApplyError | OutOfMemoryError>.Success { value } => move value
+    Result<String, ApplyError | OutOfMemoryError>.Failure { error } => {
+      drop error
+      return 17
+    }
+  }
+  if String.view(&applied)
+    != "zero\nextra\none\n2\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven" {
+    return 21
+  }
+
+  // Errors.
+  let short = run Effect.result(diff.parse("--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n a\n"))
+  match move short {
+    Result<Patch, PatchError | OutOfMemoryError>.Failure { error } => match move error {
+      PatchError { reason, line } => {
+        if reason != PatchReason.UnexpectedEnd || line != 5 {
+          return 18
+        }
+      }
+      OutOfMemoryError { .. } => {
+        return 19
+      }
+    }
+    Result<Patch, PatchError | OutOfMemoryError>.Success { value } => {
+      drop value
+      return 20
+    }
+  }
+  return 0
+}
+
+effect fn cases() -> i32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let fixed = run fixedCases()
+  if fixed != 0 {
+    return fixed
+  }
+  return run randomCases()
+}
+
+effect fn exhausted(error: OutOfMemoryError) -> i32 {
+  drop error
+  return 99
+}
+
+pub fn main() -> i32 {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(cases(), exhausted) |> Effect.provideMut<Allocator>(&mut allocator)
+}
