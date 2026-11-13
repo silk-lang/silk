@@ -206,7 +206,7 @@ function Install-Silk([string]$Requested, [string]$Channel, [string]$HomeDirecto
       else { [IO.File]::Move($settingsStage, $settings) }
     } finally { $lock.Dispose() }
     Write-Output "Installed silk v$version to $destination"
-    Write-Output "Add $bin to your user PATH. Silk needs LLVM 22 or newer on PATH, or SILK_CLANG set to clang.exe."
+    Write-Output "Add $bin to your user PATH."
   } finally { Remove-SilkStage $stage $store }
 }
 

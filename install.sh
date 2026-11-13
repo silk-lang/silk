@@ -289,19 +289,6 @@ else
   printf 'It is the default toolchain; %s/bin/silk links to its compiler. This release has no silk tool.\n' "$silk_home"
 fi
 
-# Silk hands Clang LLVM 22 bitcode, which older Clang misreads.
-clang=${SILK_CLANG:-clang}
-if ! command -v "$clang" > /dev/null 2>&1; then
-  printf '\nSilk needs Clang 22 or newer to build programs. Put it on PATH, or set SILK_CLANG to it.\n'
-else
-  clang_version=$("$clang" --version 2> /dev/null | head -n 1)
-  major=$(printf '%s\n' "$clang_version" | sed -n 's/.*clang version \([0-9][0-9]*\).*/\1/p')
-  if [ -z "$major" ] || [ "$major" -lt 22 ]; then
-    printf '\nSilk needs Clang 22 or newer, but %s is: %s\n' "$clang" "$clang_version"
-    printf 'Put LLVM 22 or newer on PATH, or set SILK_CLANG to its clang.\n'
-  fi
-fi
-
 case ":$PATH:" in
   *":$silk_home/bin:"*) ;;
   *)

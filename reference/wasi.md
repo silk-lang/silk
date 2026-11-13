@@ -14,7 +14,8 @@ freestanding.
 
 ## Build and run
 
-Use Clang 22 or newer, with its WebAssembly linker. Preview 2 additionally needs
+A release's bundled LLVM includes the WebAssembly linker; another Clang must be 22 or newer, with
+its WebAssembly linker. Preview 2 additionally needs
 [wasm-tools](https://github.com/bytecodealliance/wasm-tools) and the
 [WASI command adapter](https://github.com/bytecodealliance/wasmtime/releases).
 Commands use `wasi_snapshot_preview1.command.wasm`. A component without command startup uses
@@ -22,7 +23,6 @@ Commands use `wasi_snapshot_preview1.command.wasm`. A component without command 
 need no adapter.
 
 ```sh
-export SILK_CLANG=/path/to/clang
 export SILK_WASM_TOOLS=/path/to/wasm-tools
 export SILK_WASI_ADAPTER=/path/to/wasi_snapshot_preview1.command.wasm
 export SILK_WASMTIME=/path/to/wasmtime

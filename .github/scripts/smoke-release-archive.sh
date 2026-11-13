@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Installs a release archive the way a user would and runs a new project through it: the compiler
 # `bin/silkc` directly, then the silk tool `bin/silk` forwarding to the same compiler as an
-# installed toolchain. An installed compiler finds `lib/silk/stdlib`, the clang on PATH and, on
-# macOS, its SDK through xcrun discovery by itself.
+# installed toolchain. An installed compiler finds `lib/silk/stdlib` and the LLVM bundled at
+# `lib/silk/llvm` by itself, whatever Clang PATH holds, and links a plain program with no SDK.
 # usage: smoke-release-archive.sh <archive> <version> <empty work directory>
 set -euo pipefail
 archive=$1
@@ -18,6 +18,9 @@ grep -Fx "silk-version = \"$version\"" hello/silk.toml
 # `run` reports the build on standard error, so standard output is the program's own.
 output=$(cd hello && env -u SILK_CLANG -u SDKROOT "$top/bin/silkc" run)
 test "$output" = 'Hello, world!'
+# The build ran the bundled Clang, which made its tool links on first use.
+test -L "$top/lib/silk/llvm/bin/clang"
+test "$(readlink "$top/lib/silk/llvm/bin/ld.lld")" = llvm
 
 # The archive's own layout, less the tool, is a toolchain in the store; the tool forwards to it.
 home="$work/home"

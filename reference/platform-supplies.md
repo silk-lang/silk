@@ -14,7 +14,10 @@ Managed supplies are recognized but unsupported. Resolution does not download or
 
 Darwin supplies distinguish SDK metadata, libSystem, frameworks, linker and consumed headers.
 SDKROOT, when supplied, must identify a valid SDK; otherwise discovery queries selected developer
-tools using xcrun and DEVELOPER_DIR, on a macOS host only. One SDK serves both macOS
+tools using xcrun and DEVELOPER_DIR, on a macOS host only. When xcrun is missing or cannot answer
+(without developer tools, `/usr/bin/xcrun` only offers to install them), discovery takes the SDK at
+`/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk`, else at Xcode's default location; when
+neither exists the refusal names `xcode-select --install` and SDKROOT. One SDK serves both macOS
 architectures, so an Apple silicon Mac discovers it for `x86_64-apple-darwin` too. The SDK must
 admit the target's architecture (`arm64` or `x86_64`) in its settings and libSystem stub, and the
 requested deployment. The default deployment is 11.0.0, raised to the SDK's minimum when a newer
@@ -59,8 +62,8 @@ root, linker, deployment and the digests of the SDK files it read, so a replaced
 
 A macOS link needs no SDK. An automatic request without `SDKROOT` uses Silk's own libSystem stub
 on every host, a Mac included, unless the link declares inputs (objects, archives, libraries,
-frameworks or C sources): those need the SDK a Mac discovers through `xcrun`, and only on another
-host, or a Mac with no `xcrun`, do they fall back to the stub. A program therefore links to the
+frameworks or C sources): those need the SDK a Mac discovers, and only on another host do they
+fall back to the stub. A program therefore links to the
 same bytes on every host, as a GNU/Linux program does. The stub is a TAPI text file that names
 `/usr/lib/libSystem.B.dylib` and the symbols Silk programs bind there, for both macOS
 architectures. The compiler writes it into the link's scratch directory and links with

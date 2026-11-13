@@ -78,8 +78,11 @@ to change `~/.silk`) and makes it your default. It also installs [the silk tool]
 you type for Silk, as `~/.silk/bin/silk`; each release's compiler is `silkc`. It verifies the
 compiler's SHA-256 and reported version, and the release signature when `minisign` is installed.
 Earlier versions stay installed beside it.
-Set `SILK_RELEASE=v0.2.0-beta.1` to select a published prerelease explicitly. Building programs
-needs Clang 22 or newer on `PATH`, or `SILK_CLANG` pointing at it.
+Set `SILK_RELEASE=v0.2.0-beta.1` to select a published prerelease explicitly. Each release
+carries its own LLVM (Clang, lld and llvm-ar) at `lib/silk/llvm`, so building programs needs no
+installed compiler. `SILK_CLANG` or `--clang` selects another Clang (22 or newer) instead. On
+macOS, plain programs link without an SDK; a package with C sources or native libraries needs the
+macOS SDK (`xcode-select --install`).
 
 With [Homebrew](https://brew.sh), which also installs Homebrew's LLVM and points `silk` at its Clang:
 
@@ -120,9 +123,8 @@ $env:Path = "$env:USERPROFILE\.silk\bin;$env:Path"
 silk --version
 ```
 
-Building programs requires [LLVM 22 or newer](https://github.com/llvm/llvm-project/releases),
-including Clang, LLD and `llvm-ar`. Add LLVM's `bin` directory to `PATH`, or set `$env:SILK_CLANG`
-to the full path to `clang.exe`. See [Silk on Windows](reference/windows.md) for archive
+The release carries its own LLVM, so building programs needs nothing else installed;
+`$env:SILK_CLANG` selects another `clang.exe` instead. See [Silk on Windows](reference/windows.md) for archive
 verification, Scoop and mise installation, and the supported Windows filesystem scope.
 
 ### Silk versions

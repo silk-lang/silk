@@ -1,6 +1,7 @@
 // One release archive per target: the native compiler as `bin/silkc`, the silk tool as `bin/silk`,
-// and the standard library at `lib/silk/stdlib`, the layout an installed compiler finds its library
-// in without `--stdlib`.
+// the standard library at `lib/silk/stdlib`, the layout an installed compiler finds its library
+// in without `--stdlib`, and the bundled LLVM at `lib/silk/llvm` (scripts/build-llvm.sh), which the
+// compiler runs instead of a Clang on PATH.
 import { createRequire } from 'node:module'
 import { join, resolve, sep } from 'node:path'
 import { parseArgs } from 'node:util'
@@ -42,6 +43,9 @@ export interface ArchiveOptions {
   readonly outputDirectory: string
   /** Immutable native release metadata, embedded verbatim without executing the compiler. */
   readonly snapshot?: string | undefined
+  /** The LLVM installation scripts/build-llvm.sh made for the target, installed as
+   * `lib/silk/llvm`. Its `bin` directory holds only executables. */
+  readonly llvm?: string | undefined
 }
 
 const encoder = new TextEncoder()
@@ -155,7 +159,8 @@ const zip = (entries: ReadonlyArray<Entry>): Uint8Array | undefined => {
 }
 
 // The directory and file members below `root`, as `<base>/<relative path>`, in sorted path order.
-export const tree = Effect.fnUntraced(function* (root: string, base: string) {
+// With `executables`, the files of a `bin` directory are executable.
+export const tree = Effect.fnUntraced(function* (root: string, base: string, executables = false) {
   const fs = yield* FileSystem.FileSystem
   const entries: Array<Entry> = [{ _tag: 'Directory', path: base }]
   const paths = [...(yield* fs.readDirectory(root, { recursive: true }))].sort()
@@ -168,11 +173,11 @@ export const tree = Effect.fnUntraced(function* (root: string, base: string) {
         _tag: 'File',
         path: member,
         bytes: yield* fs.readFile(join(root, path)),
-        executable: false,
+        executable: executables && member.split('/').includes('bin'),
       })
     else
       return yield* new ReleaseArchiveError({
-        message: `Standard-library entry ${path} is neither a file nor a directory`,
+        message: `Archive entry ${path} is neither a file nor a directory`,
       })
   }
   return entries
@@ -213,6 +218,7 @@ export const write = Effect.fn('ReleaseArchive.write')(function* (options: Archi
     { _tag: 'Directory', path: `${top}/lib/silk` },
     ...library,
   ]
+  if (options.llvm !== undefined) entries.push(...(yield* tree(options.llvm, `${top}/lib/silk/llvm`, true)))
   if (options.snapshot !== undefined)
     entries.push({
       _tag: 'File',
@@ -237,7 +243,7 @@ export const write = Effect.fn('ReleaseArchive.write')(function* (options: Archi
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   const usage =
-    'usage: node compiler/scripts/ReleaseArchive.ts --compiler <silkc> [--tool <silk>] --stdlib <directory> --target <triple> --output <directory> --version <version> [--snapshot <TOML-file>]'
+    'usage: node compiler/scripts/ReleaseArchive.ts --compiler <silkc> [--tool <silk>] --stdlib <directory> --target <triple> --output <directory> --version <version> [--snapshot <TOML-file>] [--llvm <directory>]'
   const cli = Effect.gen(function* () {
     const { values } = yield* Effect.try({
       try: () =>
@@ -250,6 +256,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
             output: { type: 'string' },
             version: { type: 'string' },
             snapshot: { type: 'string' },
+            llvm: { type: 'string' },
           },
         }),
       catch: (cause) => new ReleaseArchiveError({ message: usage, cause }),
@@ -264,6 +271,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
       version: values.version,
       outputDirectory: resolve(values.output),
       snapshot: values.snapshot === undefined ? undefined : resolve(values.snapshot),
+      llvm: values.llvm === undefined ? undefined : resolve(values.llvm),
     })
     yield* Effect.sync(() => process.stdout.write(`${path}\n`))
   })

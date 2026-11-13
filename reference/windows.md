@@ -2,8 +2,8 @@
 
 The Windows target is `x86_64-pc-windows-msvc`. The compiler and runtime call Windows system
 DLLs directly and require no C runtime. Native execution and self-hosting are tested on
-Windows Server 2025 x64. Install LLVM 22 or newer, including Clang and LLD, and put its `bin`
-directory on `PATH`, or set `SILK_CLANG` to `clang.exe`.
+Windows Server 2025 x64. A release carries its own LLVM at `lib\silk\llvm`; `SILK_CLANG` names
+another `clang.exe` (LLVM 22 or newer, with LLD) instead.
 
 ## Install a published release
 
