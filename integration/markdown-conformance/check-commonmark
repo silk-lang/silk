@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""Hand-run CommonMark 0.31.2 conformance, pathological inputs, and release throughput."""
+import argparse
+import collections
+import hashlib
+import json
+import os
+from pathlib import Path
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+
+ROOT = Path(__file__).resolve().parents[2]
+CACHE = ROOT / "build/markdown"
+SPEC_SHA256 = "d431b29d97b6f73e69d547109cf5081578fac931e72afe95639ebe766c1b2a20"
+
+
+def fetch(name, digest):
+    path = CACHE / name
+    if path.exists():
+        data = path.read_bytes()
+    else:
+        with urllib.request.urlopen(f"https://spec.commonmark.org/0.31.2/{name}", timeout=60) as response:
+            data = response.read()
+    if hashlib.sha256(data).hexdigest() != digest:
+        raise SystemExit(f"{name} does not match its pinned SHA-256; remove a corrupt cache explicitly")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    return data
+
+
+def build():
+    manifest = ROOT / "integration/markdown-conformance/silk.toml"
+    command = shlex.split(os.environ.get("SILK", "silk"))
+    command += ["build", "--release", "--manifest-path", str(manifest), "--stdlib", os.environ.get("SILK_STDLIB", str(ROOT / "stdlib"))]
+    subprocess.run(command, cwd=ROOT, check=True)
+    name = "markdown-conformance.exe" if os.name == "nt" else "markdown-conformance"
+    return next((manifest.parent / "build/llvm").glob(f"*/release/{name}"))
+
+
+def invoke(runner, path, mode=None, timeout=30):
+    command = [str(runner), str(path)]
+    if mode:
+        command.append(mode)
+    start = time.perf_counter()
+    result = subprocess.run(command, capture_output=True, timeout=timeout)
+    return result, time.perf_counter() - start
+
+
+def conformance(runner, report):
+    cases = json.loads(fetch("spec.json", SPEC_SHA256))
+    assert len(cases) == 652
+    directory = CACHE / "spec-cases"
+    directory.mkdir(parents=True, exist_ok=True)
+    results = []
+    sections = collections.defaultdict(lambda: [0, 0])
+    for case in cases:
+        path = directory / f"{case['example']}.md"
+        path.write_bytes(case["markdown"].encode())
+        try:
+            result, _ = invoke(runner, path)
+            actual = result.stdout.decode(errors="replace")
+            passed = result.returncode == 0 and result.stdout == case["html"].encode()
+            status = result.returncode
+        except subprocess.TimeoutExpired:
+            actual, passed, status = "", False, "timeout"
+        sections[case["section"]][0] += passed
+        sections[case["section"]][1] += 1
+        results.append(dict(case, passed=passed, actual=actual, exitCode=status))
+        if not passed:
+            print(f"FAIL {case['example']} ({case['section']}): exit={status}")
+    for section, (passed, count) in sections.items():
+        print(f"{section}: {passed}/{count}")
+    failures = [case["example"] for case in results if not case["passed"]]
+    print(f"CommonMark: {652 - len(failures)}/652; failing examples: " + (", ".join(map(str, failures)) or "none"))
+    if report:
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text(json.dumps(dict(passed=652-len(failures), total=652, failures=failures, cases=results), indent=2) + "\n")
+    return bool(failures)
+
+
+def pathological(runner):
+    directory = CACHE / "pathological"
+    directory.mkdir(parents=True, exist_ok=True)
+    inputs = {
+        "brackets": "[" * 250000,
+        "emphasis": "**a " * 62500,
+        "backticks": "x".join("`" * n for n in range(1, 708)),
+        "angles": "<" * 250000,
+        "escaped-quotes": '"' * 250000,
+        "valid-links": "[a](b) " * 35000,
+        "quotes": ">" * 250000,
+        "lists": "- " * 125000,
+        "references": "".join(f"[label{i}]: /target/{i}\n" for i in range(12000)) + "\n[label11999]\n",
+        "link-openers": "[a](" * 62500,
+    }
+    failures = []
+    for name, text in inputs.items():
+        path = directory / f"{name}.md"
+        path.write_bytes(text.encode())
+        try:
+            result, elapsed = invoke(runner, path, timeout=20)
+            print(f"Pathological {name}: {len(text.encode())} bytes, {elapsed:.3f}s, exit={result.returncode}")
+            if result.returncode:
+                failures.append(name)
+        except subprocess.TimeoutExpired:
+            print(f"Pathological {name}: FAIL (over 20s)")
+            failures.append(name)
+    print("Pathological: " + ("FAIL " + ", ".join(failures) if failures else f"{len(inputs)}/{len(inputs)} pass (20s bound)"))
+    return bool(failures)
+
+
+def bench(runner):
+    seed = fetch("spec.txt", "bfef4ddc97276b6ab6c2a28ace48478e35b1c50e60cde9f517ab8ab030aa3b82")
+    data = (seed * (10000000 // len(seed) + 1))[:10000000]
+    # Cut at a UTF-8 boundary without modifying the benchmark's valid text contract.
+    data = data.decode(errors="ignore").encode()
+    path = CACHE / "benchmark.md"
+    path.write_bytes(data)
+    for name, mode in [("parse-only", "parse"), ("parse+render", None)]:
+        measurements = []
+        for _ in range(3):
+            result, elapsed = invoke(runner, path, mode, timeout=120)
+            if result.returncode:
+                raise SystemExit(f"Benchmark {name} failed: {result.returncode}: {result.stderr.decode(errors='replace')}")
+            measurements.append(elapsed)
+        elapsed = min(measurements)
+        print(f"Benchmark {name}: {len(data)/1000000:.2f} MB, {elapsed:.3f}s, {len(data)/1000000/elapsed:.2f} MB/s (best of 3, includes input read and process startup)")
+    for tool in ["cmark", "md2html", "pulldown-cmark"]:
+        executable = shutil.which(tool)
+        if executable:
+            start = time.perf_counter()
+            with path.open("rb") as source:
+                result = subprocess.run([executable], stdin=source, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=120)
+            elapsed = time.perf_counter() - start
+            print(f"Comparison {tool}: {elapsed:.3f}s, {len(data)/1000000/elapsed:.2f} MB/s, exit={result.returncode}")
+        else:
+            print(f"Comparison {tool}: not installed")
+    return False
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--report", type=Path)
+    parser.add_argument("--pathological", action="store_true")
+    parser.add_argument("--bench", action="store_true")
+    args = parser.parse_args()
+    runner = build()
+    if args.pathological:
+        return pathological(runner)
+    if args.bench:
+        return bench(runner)
+    return conformance(runner, args.report)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,680 @@
+//! HTML output for Markdown trees, with escaped raw HTML and filtered destinations by default.
+//!
+//! # When to use
+//!
+//! Use `MarkdownHtml.renderOwned` for owned text, `renderInto` for a reusable buffer, or `renderToWriter` for streaming output.
+//!
+//! # Details
+//!
+//! Rendering walks tree links iteratively and allocates no storage per node.
+//! Default options escape raw HTML and empty destinations with javascript, vbscript, file, or data schemes.
+//!
+//! # Examples
+//!
+//! ## Render a link with a filtered destination
+//!
+//! ```silk
+//! import silk.markdown.document { MarkdownDocument }
+//! import silk.markdown.html { MarkdownHtml }
+//! import silk.text.string { String }
+//! import silk.core.effect { Effect }
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//!
+//! pub effect fn main() -> i32
+//!   ! OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let document = run MarkdownDocument.parse("[open](javascript:alert)")
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!   let output = run MarkdownHtml.renderOwned(&document)
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!   if String.view(&output) != "<p><a href=\"\">open</a></p>\n" {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! @category Data formats
+
+import silk.markdown.document { MarkdownDocument, MarkdownNodeId, MarkdownNodeKind }
+import silk.collections.bytes { Bytes }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.io.writer { Writer, WriterError }
+import silk.text.string { String }
+import silk.simd.simd
+import silk.simd.mask16
+import silk.simd.u8x16
+import silk.num.u8
+import silk.num.usize
+
+/// The HTML rendering policy. The defaults escape raw HTML and filter dangerous destination schemes.
+pub struct HtmlOptions {
+  /// Emits raw HTML verbatim when true. The default is false, which escapes raw HTML as text.
+  pub rawHtml: bool,
+  /// Allows javascript, vbscript, file, and data destinations when true. The default is false.
+  /// Filtering ignores ASCII case, leading control bytes, and tabs or line endings within a scheme.
+  pub unsafeLinks: bool,
+}
+
+impl Copy for HtmlOptions {}
+
+impl HtmlOptions {
+  /// Returns options that escape raw HTML and filter dangerous destination schemes.
+  pub fn make() -> HtmlOptions {
+    return HtmlOptions { rawHtml: false, unsafeLinks: false }
+  }
+}
+
+/// The owner of Markdown HTML rendering and escaping operations.
+pub struct MarkdownHtml {}
+
+interface Output<E, ? R> {
+  effect fn write(self: &mut Self, data: &[u8]) -> () ! E ? R
+}
+
+struct ByteOutput<'a> {
+  out: &'a mut Bytes
+}
+
+impl<'a> Output<OutOfMemoryError ? &mut Allocator> for ByteOutput<'a> {
+  effect fn write(self: &mut Self, data: &[u8]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run Bytes.append(&mut self.out.*, data)
+  }
+}
+
+struct StreamOutput {}
+
+impl Output<WriterError ? &mut Writer> for StreamOutput {
+  effect fn write(self: &mut Self, data: &[u8]) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return run Writer.writeAll(data)
+  }
+}
+
+impl MarkdownHtml {
+  /// Returns HTML with raw HTML escaped and dangerous destination schemes filtered.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the allocator cannot supply the output string.
+  pub effect fn renderOwned(document: &MarkdownDocument<'_>) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let options = HtmlOptions.make()
+    return run MarkdownHtml.renderOwnedWithOptions(document, &options)
+  }
+
+  /// Returns HTML using the raw-HTML and destination policy in `options`.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the allocator cannot supply the output string.
+  pub effect fn renderOwnedWithOptions(
+    document: &MarkdownDocument<'_>,
+    options: &HtmlOptions,
+  ) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut output = Bytes.make()
+    run MarkdownHtml.renderIntoWithOptions(document, &mut output, options)
+
+    // Every emitted token and document literal is UTF-8.
+    return unsafe String.fromBytesUnchecked(move output)
+  }
+
+  /// Replaces `out` with HTML that escapes raw HTML and filters dangerous destination schemes.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the output cannot grow. A partial result can remain in `out`.
+  pub effect fn renderInto(document: &MarkdownDocument<'_>, out: &mut Bytes) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let options = HtmlOptions.make()
+    return run MarkdownHtml.renderIntoWithOptions(document, &mut out.*, &options)
+  }
+
+  /// Replaces `out` with HTML using the raw-HTML and destination policy in `options`.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the output cannot grow. A partial result can remain in `out`.
+  pub effect fn renderIntoWithOptions(
+    document: &MarkdownDocument<'_>,
+    out: &mut Bytes,
+    options: &HtmlOptions,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    Bytes.clear(&mut out.*)
+    return run MarkdownHtml.renderNodeIntoWithOptions(
+      document,
+      MarkdownDocument.root(document),
+      &mut out.*,
+      options,
+    )
+  }
+
+  /// Appends the HTML of subtree `id` to `out` with raw HTML escaped and dangerous schemes filtered.
+  /// Invalid ids append nothing. List paragraphs follow their containing list's tightness.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the output cannot grow. Bytes already appended remain in `out`.
+  pub effect fn renderNodeInto(
+    document: &MarkdownDocument<'_>,
+    id: MarkdownNodeId,
+    out: &mut Bytes,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let options = HtmlOptions.make()
+    return run MarkdownHtml.renderNodeIntoWithOptions(document, id, &mut out.*, &options)
+  }
+
+  /// Appends subtree `id` as HTML using `options`. Invalid ids append nothing.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the output cannot grow. Bytes already appended remain in `out`.
+  pub effect fn renderNodeIntoWithOptions(
+    document: &MarkdownDocument<'_>,
+    id: MarkdownNodeId,
+    out: &mut Bytes,
+    options: &HtmlOptions,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut sink = ByteOutput { out: &mut out.* }
+    return run render<ByteOutput, OutOfMemoryError, &mut Allocator>(
+      &mut sink,
+      document,
+      id,
+      options,
+    )
+  }
+
+  /// Writes HTML with raw HTML escaped and dangerous schemes filtered. Does not allocate or flush.
+  ///
+  /// # Errors
+  ///
+  /// - `WriterError` if the writer fails. Bytes already accepted remain written.
+  pub effect fn renderToWriter(document: &MarkdownDocument<'_>) -> ()
+    ! WriterError
+    ? &mut Writer {
+    let options = HtmlOptions.make()
+    return run MarkdownHtml.renderToWriterWithOptions(document, &options)
+  }
+
+  /// Writes HTML using `options`. Does not allocate or flush the writer.
+  ///
+  /// # Errors
+  ///
+  /// - `WriterError` if the writer fails. Bytes already accepted remain written.
+  pub effect fn renderToWriterWithOptions(
+    document: &MarkdownDocument<'_>,
+    options: &HtmlOptions,
+  ) -> ()
+    ! WriterError
+    ? &mut Writer {
+    let mut sink = StreamOutput {}
+    return run render<StreamOutput, WriterError, &mut Writer>(
+      &mut sink,
+      document,
+      MarkdownDocument.root(document),
+      options,
+    )
+  }
+
+  /// Appends text with `&`, `<`, `>`, and double quotes replaced by HTML character references.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the output cannot grow. Bytes already appended remain in `out`.
+  pub effect fn escapeTextInto(out: &mut Bytes, value: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut sink = ByteOutput { out: &mut out.* }
+    return run escaped<ByteOutput, OutOfMemoryError, &mut Allocator>(&mut sink, value)
+  }
+
+  /// Appends text escaped for a double-quoted HTML attribute. Replaces `&`, `<`, `>`, and double quotes.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the output cannot grow. Bytes already appended remain in `out`.
+  pub effect fn escapeAttributeInto(out: &mut Bytes, value: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run MarkdownHtml.escapeTextInto(&mut out.*, value)
+  }
+
+  /// Returns text with `&`, `<`, `>`, and double quotes replaced by HTML character references.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the allocator cannot supply the output string.
+  pub effect fn escapeTextOwned(value: string) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut output = Bytes.make()
+    run MarkdownHtml.escapeTextInto(&mut output, value)
+    return unsafe String.fromBytesUnchecked(move output)
+  }
+
+  /// Returns text escaped for a double-quoted HTML attribute. Replaces `&`, `<`, `>`, and double quotes.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the allocator cannot supply the output string.
+  pub effect fn escapeAttributeOwned(value: string) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run MarkdownHtml.escapeTextOwned(value)
+  }
+}
+
+effect fn emit<S: Output<E ? R>, E, ? R>(sink: &mut S, value: string) -> ()
+  ! E
+  ? R {
+  return run Output<E ? R>.write(&mut sink.*, String.utf8Bytes(value))
+}
+
+effect fn escaped<S: Output<E ? R>, E, ? R>(sink: &mut S, value: string) -> ()
+  ! E
+  ? R {
+  let data = String.utf8Bytes(value)
+  let mut pos: usize = 0
+  while pos < data.length {
+    let quote = nextEscape(data, pos)
+    if quote > pos {
+      run Output<E ? R>.write(&mut sink.*, Slice.view<u8>(data, pos, quote - pos))
+    }
+    if quote == data.length {
+      break
+    }
+    let c = data[quote]
+    if c == 38 {
+      run emit<S, E, R>(&mut sink.*, "&amp;")
+    } else if c == 60 {
+      run emit<S, E, R>(&mut sink.*, "&lt;")
+    } else if c == 62 {
+      run emit<S, E, R>(&mut sink.*, "&gt;")
+    } else {
+      run emit<S, E, R>(&mut sink.*, "&quot;")
+    }
+    pos = quote + 1
+  }
+}
+
+fn lower(c: u8) -> u8 {
+  if c >= 65 && c <= 90 {
+    return c + 32
+  }
+  return c
+}
+
+fn prefix(data: &[u8], pos: usize, word: string) -> bool {
+  let wanted = String.utf8Bytes(word)
+  let mut at = pos
+  let mut i: usize = 0
+  while i < wanted.length {
+    // Browsers remove these characters before interpreting a URL scheme.
+    while at < data.length && (data[at] == 9 || data[at] == 10 || data[at] == 13) {
+      at = at + 1
+    }
+    if at == data.length || lower(data[at]) != wanted[i] {
+      return false
+    }
+    at = at + 1
+    i = i + 1
+  }
+  return true
+}
+
+fn dangerous(value: string) -> bool {
+  let data = String.utf8Bytes(value)
+  let mut pos: usize = 0
+  while pos < data.length && (data[pos] <= 32 || data[pos] == 127) {
+    pos = pos + 1
+  }
+  return prefix(data, pos, "javascript:") || prefix(data, pos, "vbscript:")
+    || prefix(data, pos, "file:")
+    || prefix(data, pos, "data:")
+}
+
+fn uriSafe(c: u8) -> bool {
+  return c >= 65 && c <= 90 || c >= 97 && c <= 122 || c >= 48 && c <= 57 || c == 45 || c == 46
+    || c == 95
+    || c == 126
+    || c == 33
+    || c == 36
+    || c == 38
+    || c == 39
+    || c == 40
+    || c == 41
+    || c == 42
+    || c == 43
+    || c == 44
+    || c == 59
+    || c == 61
+    || c == 58
+    || c == 47
+    || c == 63
+    || c == 35
+    || c == 64
+    || c == 37
+}
+
+fn hex(c: u8) -> u8 {
+  if c < 10 {
+    return c + 48
+  }
+  return c + 55
+}
+
+effect fn destination<S: Output<E ? R>, E, ? R>(
+  sink: &mut S,
+  value: string,
+  options: &HtmlOptions,
+) -> ()
+  ! E
+  ? R {
+  if !options.unsafeLinks && dangerous(value) {
+    return
+  }
+  let data = String.utf8Bytes(value)
+  let mut i: usize = 0
+  while i < data.length {
+    let start = i
+    while i < data.length && uriSafe(data[i]) && data[i] != 38 && data[i] != 39 {
+      i = i + 1
+    }
+    if i > start {
+      run Output<E ? R>.write(&mut sink.*, Slice.view<u8>(data, start, i - start))
+    }
+    if i == data.length {
+      break
+    }
+    let c = data[i]
+    if c == 38 {
+      run emit<S, E, R>(&mut sink.*, "&amp;")
+    } else if c == 39 {
+      run emit<S, E, R>(&mut sink.*, "&#x27;")
+    } else {
+      let encoded: [u8; 3] = [37, hex(c / 16), hex(c % 16)]
+      run Output<E ? R>.write(&mut sink.*, &encoded)
+    }
+    i = i + 1
+  }
+}
+
+fn link(option: Option<MarkdownNodeId>) -> usize {
+  return match option {
+    Option<MarkdownNodeId>.Some { value } => value.index
+    _ => usize.MAX
+  }
+}
+
+fn kind(doc: &MarkdownDocument<'_>, id: usize) -> MarkdownNodeKind {
+  return MarkdownDocument.kind(doc, MarkdownNodeId { index: id })
+}
+
+fn first(doc: &MarkdownDocument<'_>, id: usize) -> usize {
+  return link(MarkdownDocument.firstChild(doc, MarkdownNodeId { index: id }))
+}
+
+fn next(doc: &MarkdownDocument<'_>, id: usize) -> usize {
+  return link(MarkdownDocument.nextSibling(doc, MarkdownNodeId { index: id }))
+}
+
+fn parent(doc: &MarkdownDocument<'_>, id: usize) -> usize {
+  return link(MarkdownDocument.parent(doc, MarkdownNodeId { index: id }))
+}
+
+fn tightParagraph(doc: &MarkdownDocument<'_>, id: usize) -> bool {
+  let item = parent(doc, id)
+  if item == usize.MAX || kind(doc, item) != MarkdownNodeKind.ListItem {
+    return false
+  }
+  let list = parent(doc, item)
+  return list != usize.MAX && MarkdownDocument.tight(doc, MarkdownNodeId { index: list })
+}
+
+effect fn number<S: Output<E ? R>, E, ? R>(sink: &mut S, value: usize) -> ()
+  ! E
+  ? R {
+  let mut digits: [u8; 20] = [0; 20]
+  let mut at: usize = 20
+  let mut n = value
+  while true {
+    at = at - 1
+    digits[at] = usize.toU8(n % 10) + 48
+    n = n / 10
+    if n == 0 {
+      break
+    }
+  }
+  return run Output<E ? R>.write(&mut sink.*, Slice.view<u8>(&digits, at, 20 - at))
+}
+
+effect fn alt<S: Output<E ? R>, E, ? R>(sink: &mut S, doc: &MarkdownDocument<'_>, root: usize) -> ()
+  ! E
+  ? R {
+  let mut id = first(doc, root)
+  while id != usize.MAX {
+    let k = kind(doc, id)
+    if k == MarkdownNodeKind.Text || k == MarkdownNodeKind.Code
+      || k == MarkdownNodeKind.HtmlInline {
+      run escaped<S, E, R>(&mut sink.*, MarkdownDocument.literal(doc, MarkdownNodeId { index: id }))
+    } else if k == MarkdownNodeKind.SoftBreak || k == MarkdownNodeKind.HardBreak {
+      run emit<S, E, R>(&mut sink.*, "\n")
+    }
+    if first(doc, id) != usize.MAX {
+      id = first(doc, id)
+      continue
+    }
+    while id != root && next(doc, id) == usize.MAX {
+      id = parent(doc, id)
+    }
+    if id == root {
+      break
+    }
+    id = next(doc, id)
+  }
+}
+
+effect fn render<S: Output<E ? R>, E, ? R>(
+  sink: &mut S,
+  doc: &MarkdownDocument<'_>,
+  root: MarkdownNodeId,
+  options: &HtmlOptions,
+) -> ()
+  ! E
+  ? R {
+  if root.index >= MarkdownDocument.nodes(doc).length {
+    return
+  }
+  let mut id = root.index
+  let mut entering = true
+  while true {
+    let key = MarkdownNodeId { index: id }
+    let k = kind(doc, id)
+    let mut descend = entering
+    if entering {
+      if k == MarkdownNodeKind.Paragraph {
+        if !tightParagraph(doc, id) {
+          run emit<S, E, R>(&mut sink.*, "<p>")
+        }
+      } else if k == MarkdownNodeKind.Heading {
+        run emit<S, E, R>(&mut sink.*, "<h")
+        run number<S, E, R>(&mut sink.*, u8.toUsize(MarkdownDocument.headingLevel(doc, key)))
+        run emit<S, E, R>(&mut sink.*, ">")
+      } else if k == MarkdownNodeKind.ThematicBreak {
+        run emit<S, E, R>(&mut sink.*, "<hr />\n")
+      } else if k == MarkdownNodeKind.BlockQuote {
+        run emit<S, E, R>(&mut sink.*, "<blockquote>\n")
+      } else if k == MarkdownNodeKind.List {
+        if MarkdownDocument.ordered(doc, key) {
+          run emit<S, E, R>(&mut sink.*, "<ol")
+          if MarkdownDocument.start(doc, key) != 1 {
+            run emit<S, E, R>(&mut sink.*, " start=\"")
+            run number<S, E, R>(&mut sink.*, MarkdownDocument.start(doc, key))
+            run emit<S, E, R>(&mut sink.*, "\"")
+          }
+          run emit<S, E, R>(&mut sink.*, ">\n")
+        } else {
+          run emit<S, E, R>(&mut sink.*, "<ul>\n")
+        }
+      } else if k == MarkdownNodeKind.ListItem {
+        run emit<S, E, R>(&mut sink.*, "<li>")
+        let child = first(doc, id)
+        if child != usize.MAX
+          && (kind(doc, child) != MarkdownNodeKind.Paragraph || !tightParagraph(doc, child)) {
+          run emit<S, E, R>(&mut sink.*, "\n")
+        }
+      } else if k == MarkdownNodeKind.CodeBlock {
+        run emit<S, E, R>(&mut sink.*, "<pre><code")
+        let info = String.utf8Bytes(MarkdownDocument.info(doc, key))
+        let mut length: usize = 0
+        while length < info.length && info[length] != 32 && info[length] != 9 && info[length] != 10
+          && info[length] != 13 {
+          length = length + 1
+        }
+        if length > 0 {
+          run emit<S, E, R>(&mut sink.*, " class=\"language-")
+          run escaped<S, E, R>(
+            &mut sink.*,
+            unsafe String.fromUtf8Unchecked(Slice.view<u8>(info, 0, length)),
+          )
+          run emit<S, E, R>(&mut sink.*, "\"")
+        }
+        run emit<S, E, R>(&mut sink.*, ">")
+        run escaped<S, E, R>(&mut sink.*, MarkdownDocument.literal(doc, key))
+        run emit<S, E, R>(&mut sink.*, "</code></pre>\n")
+      } else if k == MarkdownNodeKind.Text {
+        run escaped<S, E, R>(&mut sink.*, MarkdownDocument.literal(doc, key))
+      } else if k == MarkdownNodeKind.HtmlBlock || k == MarkdownNodeKind.HtmlInline {
+        let literal = MarkdownDocument.literal(doc, key)
+        if options.rawHtml {
+          run emit<S, E, R>(&mut sink.*, literal)
+        } else {
+          run escaped<S, E, R>(&mut sink.*, literal)
+        }
+        let data = String.utf8Bytes(literal)
+        if k == MarkdownNodeKind.HtmlBlock && (data.length == 0 || data[data.length - 1] != 10) {
+          run emit<S, E, R>(&mut sink.*, "\n")
+        }
+      } else if k == MarkdownNodeKind.SoftBreak {
+        run emit<S, E, R>(&mut sink.*, "\n")
+      } else if k == MarkdownNodeKind.HardBreak {
+        run emit<S, E, R>(&mut sink.*, "<br />\n")
+      } else if k == MarkdownNodeKind.Code {
+        run emit<S, E, R>(&mut sink.*, "<code>")
+        run escaped<S, E, R>(&mut sink.*, MarkdownDocument.literal(doc, key))
+        run emit<S, E, R>(&mut sink.*, "</code>")
+      } else if k == MarkdownNodeKind.Emphasis {
+        run emit<S, E, R>(&mut sink.*, "<em>")
+      } else if k == MarkdownNodeKind.Strong {
+        run emit<S, E, R>(&mut sink.*, "<strong>")
+      } else if k == MarkdownNodeKind.Link || k == MarkdownNodeKind.Image {
+        if k == MarkdownNodeKind.Link {
+          run emit<S, E, R>(&mut sink.*, "<a href=\"")
+        } else {
+          run emit<S, E, R>(&mut sink.*, "<img src=\"")
+        }
+        run destination<S, E, R>(&mut sink.*, MarkdownDocument.destination(doc, key), options)
+        run emit<S, E, R>(&mut sink.*, "\"")
+        if k == MarkdownNodeKind.Image {
+          run emit<S, E, R>(&mut sink.*, " alt=\"")
+          run alt<S, E, R>(&mut sink.*, doc, id)
+          run emit<S, E, R>(&mut sink.*, "\"")
+          descend = false
+        }
+        if let Option<string>.Some { value } = MarkdownDocument.title(doc, key) {
+          run emit<S, E, R>(&mut sink.*, " title=\"")
+          run escaped<S, E, R>(&mut sink.*, value)
+          run emit<S, E, R>(&mut sink.*, "\"")
+        }
+        if k == MarkdownNodeKind.Image {
+          run emit<S, E, R>(&mut sink.*, " />")
+        } else {
+          run emit<S, E, R>(&mut sink.*, ">")
+        }
+      }
+      if descend && first(doc, id) != usize.MAX {
+        id = first(doc, id)
+        continue
+      }
+    }
+    if !entering || first(doc, id) == usize.MAX {
+      if k == MarkdownNodeKind.Paragraph {
+        if !tightParagraph(doc, id) {
+          run emit<S, E, R>(&mut sink.*, "</p>\n")
+        } else if next(doc, id) != usize.MAX {
+          run emit<S, E, R>(&mut sink.*, "\n")
+        }
+      } else if k == MarkdownNodeKind.Heading {
+        run emit<S, E, R>(&mut sink.*, "</h")
+        run number<S, E, R>(&mut sink.*, u8.toUsize(MarkdownDocument.headingLevel(doc, key)))
+        run emit<S, E, R>(&mut sink.*, ">\n")
+      } else if k == MarkdownNodeKind.BlockQuote {
+        run emit<S, E, R>(&mut sink.*, "</blockquote>\n")
+      } else if k == MarkdownNodeKind.List {
+        if MarkdownDocument.ordered(doc, key) {
+          run emit<S, E, R>(&mut sink.*, "</ol>\n")
+        } else {
+          run emit<S, E, R>(&mut sink.*, "</ul>\n")
+        }
+      } else if k == MarkdownNodeKind.ListItem {
+        run emit<S, E, R>(&mut sink.*, "</li>\n")
+      } else if k == MarkdownNodeKind.Emphasis {
+        run emit<S, E, R>(&mut sink.*, "</em>")
+      } else if k == MarkdownNodeKind.Strong {
+        run emit<S, E, R>(&mut sink.*, "</strong>")
+      } else if k == MarkdownNodeKind.Link {
+        run emit<S, E, R>(&mut sink.*, "</a>")
+      }
+    }
+    if id == root.index {
+      break
+    }
+    if next(doc, id) != usize.MAX {
+      id = next(doc, id)
+      entering = true
+    } else {
+      id = parent(doc, id)
+      entering = false
+    }
+  }
+}
+
+fn nextEscape(data: &[u8], start: usize) -> usize {
+  let mut pos = start
+  static if simd.hardware() {
+    while pos + 16 <= data.length {
+      let chunk = u8x16.load(data, pos)
+      let hits = u8x16.lanesEqual(chunk, u8x16.splat(38)) | u8x16.lanesEqual(chunk, u8x16.splat(60))
+        | u8x16.lanesEqual(chunk, u8x16.splat(62))
+        | u8x16.lanesEqual(chunk, u8x16.splat(34))
+      if mask16.any(hits) {
+        return pos + mask16.firstSet(hits)
+      }
+      pos = pos + 16
+    }
+  }
+  while pos < data.length {
+    let c = data[pos]
+    if c == 38 || c == 60 || c == 62 || c == 34 {
+      break
+    }
+    pos = pos + 1
+  }
+  return pos
+}

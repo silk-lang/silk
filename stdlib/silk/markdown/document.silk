@@ -1,0 +1,3492 @@
+//! A source-spanned Markdown tree with indexed nodes and borrowed source text.
+//!
+//! # When to use
+//!
+//! Parse once with `MarkdownDocument.parse`, then walk the tree or render it with `silk.markdown.html`.
+//!
+//! # Details
+//!
+//! The document borrows its UTF-8 source. Verbatim text uses source ranges; decoded text uses one owned buffer.
+//! Node ids belong to one document. Every span counts bytes in the original source, including syntax delimiters.
+//!
+//! # Examples
+//!
+//! ## Inspect a heading and its source span
+//!
+//! ```silk
+//! import silk.markdown.document { MarkdownDocument, MarkdownNodeId }
+//! import silk.core.effect { Effect }
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//!
+//! pub effect fn main() -> i32
+//!   ! OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let document = run MarkdownDocument.parse("# Hello")
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!   let heading = MarkdownNodeId { index: 1 }
+//!   if MarkdownDocument.headingLevel(&document, heading) != 1
+//!     || MarkdownDocument.span(&document, heading).end != 7 {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! @category Data formats
+
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.collections.hash { Hash }
+import silk.collections.hash_map { HashMap }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.string { String }
+import silk.text.byte_search
+import silk.text.utf8_scan
+import silk.text.unicode_properties { GeneralCategory }
+import silk.text.regex_unicode { UnicodeCase }
+import silk.markdown.entities
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+
+/// A half-open byte range in the original Markdown source.
+pub struct MarkdownSpan {
+  /// The offset of the first byte, including any opening syntax delimiter.
+  pub start: usize,
+  /// The offset after the last byte, including any closing syntax delimiter.
+  pub end: usize,
+}
+
+impl Copy for MarkdownSpan {}
+
+/// The index of one node in one Markdown document. An id from another document is not transferable.
+pub struct MarkdownNodeId {
+  /// The index in the document's preorder node slice.
+  pub index: usize,
+}
+
+impl Copy for MarkdownNodeId {}
+
+/// The syntactic role of a Markdown node.
+pub enum MarkdownNodeKind {
+  /// The root container of all blocks.
+  Document,
+  /// A paragraph with inline children.
+  Paragraph,
+  /// An ATX or setext heading with inline children.
+  Heading,
+  /// A horizontal thematic break.
+  ThematicBreak,
+  /// A block quote container.
+  BlockQuote,
+  /// An ordered or bullet list.
+  List,
+  /// One item in a list.
+  ListItem,
+  /// A fenced or indented code block.
+  CodeBlock,
+  /// A raw HTML block.
+  HtmlBlock,
+  /// Literal inline text with escapes and entities decoded.
+  Text,
+  /// A line ending within a paragraph.
+  SoftBreak,
+  /// An explicit inline line break.
+  HardBreak,
+  /// An inline code span.
+  Code,
+  /// Emphasized inline content.
+  Emphasis,
+  /// Strongly emphasized inline content.
+  Strong,
+  /// A link with inline label children.
+  Link,
+  /// An image with inline alternative-text children.
+  Image,
+  /// A raw inline HTML fragment.
+  HtmlInline,
+}
+
+/// The resource policy for a Markdown parse. Excess nesting remains literal text or paragraph content.
+pub struct MarkdownOptions {
+  /// The maximum block-container and inline nesting depth. The default is 256; zero disables nesting.
+  pub maxNesting: usize,
+}
+
+impl Copy for MarkdownOptions {}
+
+impl MarkdownOptions {
+  /// Returns a nesting bound of 256. Markdown syntax errors never cause a parse failure.
+  pub fn make() -> MarkdownOptions {
+    return MarkdownOptions { maxNesting: 256 }
+  }
+}
+
+struct TextRange {
+  span: MarkdownSpan,
+  side: bool
+}
+
+impl Copy for TextRange {}
+
+/// One node in a Markdown document. Read payloads and tree links with `MarkdownDocument` operations.
+/// The node slice is in preorder, with each parent before its children.
+pub struct MarkdownNode {
+  /// The syntactic role of this node.
+  pub kind: MarkdownNodeKind,
+  span: MarkdownSpan,
+  parent: usize,
+  first: usize,
+  last: usize,
+  next: usize,
+  previous: usize,
+  value: TextRange,
+  extra: TextRange,
+  target: TextRange,
+  hasTitle: bool,
+  level: u8,
+  ordered: bool,
+  start: usize,
+  tight: bool,
+  marker: u8,
+  fenced: bool,
+  head: usize,
+  tail: usize,
+  indent: usize,
+  fenceLength: usize,
+  htmlType: u8,
+  blank: bool,
+  depth: usize,
+}
+
+impl Copy for MarkdownNode {}
+
+/// A parsed Markdown tree that borrows the source and owns decoded text and a flat node arena.
+///
+/// # Details
+///
+/// Verbatim literals are views into the original source. Decoded literals borrow one owned side buffer.
+/// Returned text cannot outlive the document. Invalid ids return absent links, empty text, and zero payloads.
+pub struct MarkdownDocument<'source> {
+  source: string<'source>,
+  storage: Bytes,
+  arena: List<MarkdownNode>,
+}
+
+impl<'source> MarkdownDocument<'source> {
+  /// Parses UTF-8 Markdown with a nesting bound of 256. Every input produces a document.
+  /// The document borrows `source` and owns its nodes and decoded text.
+  ///
+  /// # Details
+  ///
+  /// Bounded inline lookahead and reference expansion leave excess candidates as literal text.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the allocator cannot supply the tree or decoded text.
+  pub effect fn parse(source: string<'source>) -> MarkdownDocument<'source>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let options = MarkdownOptions.make()
+    return run MarkdownDocument.parseWithOptions(source, &options)
+  }
+
+  /// Parses UTF-8 Markdown within `options.maxNesting`. Excess nesting remains literal text or paragraph content.
+  /// The document borrows `source` and owns its nodes and decoded text.
+  ///
+  /// # Details
+  ///
+  /// Bounded inline lookahead and reference expansion leave excess candidates as literal text.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the allocator cannot supply the tree or decoded text.
+  pub effect fn parseWithOptions(
+    source: string<'source>,
+    options: &MarkdownOptions,
+  ) -> MarkdownDocument<'source>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run parseDocument(source, options)
+  }
+
+  /// Returns the document root, whose index is zero, including for an empty source.
+  pub fn root(self: &Self) -> MarkdownNodeId {
+    return MarkdownNodeId { index: 0 }
+  }
+
+  /// Borrows all nodes in preorder. A node's id is its index in this slice.
+  pub fn nodes(self: &Self) -> &[MarkdownNode] {
+    return List<MarkdownNode>.asSlice(&self.arena)
+  }
+
+  /// Returns the node kind, or `Text` for an invalid id.
+  pub fn kind(self: &Self, id: MarkdownNodeId) -> MarkdownNodeKind {
+    return node(self, id.index).kind
+  }
+
+  /// Returns the source byte range, including delimiters, or `0..0` for an invalid id.
+  /// Container spans include prefixes and line endings; inline spans include only their own syntax.
+  pub fn span(self: &Self, id: MarkdownNodeId) -> MarkdownSpan {
+    return node(self, id.index).span
+  }
+
+  /// Returns the parent, or `None` if the link is absent or the id is invalid.
+  pub fn parent(self: &Self, id: MarkdownNodeId) -> Option<MarkdownNodeId> {
+    return optional(node(self, id.index).parent)
+  }
+
+  /// Returns the first child, or `None` if the link is absent or the id is invalid.
+  pub fn firstChild(self: &Self, id: MarkdownNodeId) -> Option<MarkdownNodeId> {
+    return optional(node(self, id.index).first)
+  }
+
+  /// Returns the last child, or `None` if the link is absent or the id is invalid.
+  pub fn lastChild(self: &Self, id: MarkdownNodeId) -> Option<MarkdownNodeId> {
+    return optional(node(self, id.index).last)
+  }
+
+  /// Returns the next sibling, or `None` if the link is absent or the id is invalid.
+  pub fn nextSibling(self: &Self, id: MarkdownNodeId) -> Option<MarkdownNodeId> {
+    return optional(node(self, id.index).next)
+  }
+
+  /// Returns the previous sibling, or `None` if the link is absent or the id is invalid.
+  pub fn previousSibling(self: &Self, id: MarkdownNodeId) -> Option<MarkdownNodeId> {
+    return optional(node(self, id.index).previous)
+  }
+
+  /// Returns the heading level from one through six, or zero for other kinds.
+  pub fn headingLevel(self: &Self, id: MarkdownNodeId) -> u8 {
+    return node(self, id.index).level
+  }
+
+  /// Returns whether a list is ordered; returns false for other kinds.
+  pub fn ordered(self: &Self, id: MarkdownNodeId) -> bool {
+    return node(self, id.index).ordered
+  }
+
+  /// Returns the initial ordered-list number, or zero for other kinds.
+  pub fn start(self: &Self, id: MarkdownNodeId) -> usize {
+    return node(self, id.index).start
+  }
+
+  /// Returns whether a list suppresses paragraph tags; returns false for other kinds.
+  pub fn tight(self: &Self, id: MarkdownNodeId) -> bool {
+    return node(self, id.index).tight
+  }
+
+  /// Returns the bullet or ordered-list delimiter byte, or zero for other kinds.
+  pub fn marker(self: &Self, id: MarkdownNodeId) -> u8 {
+    let n = node(self, id.index)
+    if n.kind != MarkdownNodeKind.List {
+      return 0
+    }
+    return n.marker
+  }
+
+  /// Returns whether a code block uses a fence; returns false for other kinds.
+  pub fn isFenced(self: &Self, id: MarkdownNodeId) -> bool {
+    return node(self, id.index).fenced
+  }
+
+  /// Returns the literal of Text, Code, CodeBlock, HtmlBlock, or HtmlInline; returns empty text for other kinds.
+  /// The result borrows the document. Text has decoded backslash escapes and character references.
+  /// Code spans replace line endings with spaces and remove one enclosing space when required.
+  /// Block literals normalize line endings to line feeds. All literals replace NUL with U+FFFD.
+  pub fn literal<'a>(self: &'a Self, id: MarkdownNodeId) -> string<'a> {
+    return text(self, node(self, id.index).value)
+  }
+
+  /// Returns the decoded fence info string, or empty text for other kinds.
+  /// The result borrows the document.
+  pub fn info<'a>(self: &'a Self, id: MarkdownNodeId) -> string<'a> {
+    let n = node(self, id.index)
+    if n.kind != MarkdownNodeKind.CodeBlock {
+      return ""
+    }
+    return text(self, n.extra)
+  }
+
+  /// Returns the decoded link or image destination, or empty text for other kinds.
+  /// The result borrows the document.
+  pub fn destination<'a>(self: &'a Self, id: MarkdownNodeId) -> string<'a> {
+    return text(self, node(self, id.index).target)
+  }
+
+  /// Returns the decoded link or image title, or `None` for an absent title or another kind.
+  /// A present empty title differs from an absent title. The text borrows the document.
+  pub fn title<'a>(self: &'a Self, id: MarkdownNodeId) -> Option<string<'a>> {
+    let n = node(self, id.index)
+    if !n.hasTitle {
+      return Option<string<'a>>.None
+    }
+    return Option<string<'a>>.some(text(self, n.extra))
+  }
+}
+
+const NONE: usize = usize.MAX
+
+fn emptySpan() -> MarkdownSpan {
+  return MarkdownSpan { start: 0, end: 0 }
+}
+
+fn emptyText() -> TextRange {
+  return TextRange { span: emptySpan(), side: false }
+}
+
+fn optional(index: usize) -> Option<MarkdownNodeId> {
+  if index == NONE {
+    return Option<MarkdownNodeId>.None
+  }
+  return Option<MarkdownNodeId>.some(MarkdownNodeId { index: index })
+}
+
+fn makeNode(kind: MarkdownNodeKind, start: usize) -> MarkdownNode {
+  return MarkdownNode {
+    kind: kind,
+    span: MarkdownSpan { start: start, end: start },
+    parent: NONE,
+    first: NONE,
+    last: NONE,
+    next: NONE,
+    previous: NONE,
+    value: emptyText(),
+    extra: emptyText(),
+    target: emptyText(),
+    hasTitle: false,
+    level: 0,
+    ordered: false,
+    start: 0,
+    tight: false,
+    marker: 0,
+    fenced: false,
+    head: NONE,
+    tail: NONE,
+    indent: 0,
+    fenceLength: 0,
+    htmlType: 0,
+    blank: false,
+    depth: 0,
+  }
+}
+
+fn node(doc: &MarkdownDocument<'_>, index: usize) -> MarkdownNode {
+  if index >= List<MarkdownNode>.length(&doc.arena) {
+    return makeNode(MarkdownNodeKind.Text, 0)
+  }
+  return List<MarkdownNode>.get(&doc.arena, index)
+}
+
+fn bytes(data: &[u8], start: usize, end: usize) -> &[u8] {
+  return Slice.view<u8>(data, start, end - start)
+}
+
+fn source<'a>(doc: &MarkdownDocument<'a>) -> &'a [u8] {
+  return String.utf8Bytes(doc.source)
+}
+
+fn text<'a>(doc: &'a MarkdownDocument<'_>, value: TextRange) -> string<'a> {
+  let mut data: &'a [u8] = source(doc)
+  if value.side {
+    data = Bytes.asSlice(&doc.storage)
+  }
+
+  // Ranges always select complete UTF-8 scalars from source text or decoded UTF-8.
+  return unsafe String.fromUtf8Unchecked(bytes(data, value.span.start, value.span.end))
+}
+
+fn set(doc: &mut MarkdownDocument<'_>, index: usize, value: MarkdownNode) {
+  List<MarkdownNode>.set(&mut doc.arena, index, value)
+}
+
+effect fn add(
+  doc: &mut MarkdownDocument<'_>,
+  parent: usize,
+  kind: MarkdownNodeKind,
+  start: usize,
+) -> usize
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let id = List<MarkdownNode>.length(&doc.arena)
+  let mut n = makeNode(kind, start)
+  n.parent = parent
+  if parent != NONE {
+    let mut p = node(&doc.*, parent)
+    n.previous = p.last
+    n.depth = p.depth + 1
+    if p.last != NONE {
+      let mut last = node(&doc.*, p.last)
+      last.next = id
+      set(&mut doc.*, p.last, last)
+    } else {
+      p.first = id
+    }
+    p.last = id
+    set(&mut doc.*, parent, p)
+  }
+  run List<MarkdownNode>.append(&mut doc.arena, n)
+  return id
+}
+
+effect fn store(doc: &mut MarkdownDocument<'_>, value: &[u8]) -> TextRange
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let start = Bytes.length(&doc.storage)
+  run Bytes.append(&mut doc.storage, value)
+  return TextRange {
+    span: MarkdownSpan { start: start, end: Bytes.length(&doc.storage) },
+    side: true,
+  }
+}
+
+fn space(c: u8) -> bool {
+  return c == 32 || c == 9 || c == 10 || c == 13 || c == 12
+}
+
+fn punctuation(c: u8) -> bool {
+  return c >= 33 && c <= 126 && !(c >= 48 && c <= 57) && !(c >= 65 && c <= 90)
+    && !(c >= 97 && c <= 122)
+}
+
+fn lower(c: u8) -> u8 {
+  if c >= 65 && c <= 90 {
+    return c + 32
+  }
+  return c
+}
+
+fn at(data: &[u8], pos: usize, value: string) -> bool {
+  let wanted = String.utf8Bytes(value)
+  if pos > data.length || wanted.length > data.length - pos {
+    return false
+  }
+  let mut i: usize = 0
+  while i < wanted.length {
+    if data[pos + i] != wanted[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn foldedAt(data: &[u8], pos: usize, value: string) -> bool {
+  let wanted = String.utf8Bytes(value)
+  if pos > data.length || wanted.length > data.length - pos {
+    return false
+  }
+  let mut i: usize = 0
+  while i < wanted.length {
+    if lower(data[pos + i]) != wanted[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+effect fn scalar(out: &mut Bytes, value: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut c = value
+  if c == 0 || c > 0x10ffff || (c >= 0xd800 && c <= 0xdfff) {
+    c = 0xfffd
+  }
+  if c < 128 {
+    run Bytes.append(&mut out.*, &[u32.toU8(c)])
+  } else if c < 2048 {
+    run Bytes.append(&mut out.*, &[u32.toU8(192 + c / 64), u32.toU8(128 + c % 64)])
+  } else if c < 65536 {
+    run Bytes.append(
+      &mut out.*,
+      &[u32.toU8(224 + c / 4096), u32.toU8(128 + c / 64 % 64), u32.toU8(128 + c % 64)],
+    )
+  } else {
+    run Bytes.append(
+      &mut out.*,
+      &[
+        u32.toU8(240 + c / 262144),
+        u32.toU8(128 + c / 4096 % 64),
+        u32.toU8(128 + c / 64 % 64),
+        u32.toU8(128 + c % 64),
+      ],
+    )
+  }
+}
+
+struct Chunk {
+  start: usize,
+  end: usize,
+  padding: usize,
+  next: usize
+}
+
+impl Copy for Chunk {}
+
+struct Piece {
+  input: usize,
+  start: usize,
+  length: usize
+}
+
+impl Copy for Piece {}
+
+struct Reference {
+  label: TextRange,
+  destination: TextRange,
+  title: TextRange,
+  hasTitle: bool,
+  next: usize
+}
+
+impl Copy for Reference {}
+
+struct Parser<'a> {
+  doc: MarkdownDocument<'a>,
+  chunks: List<Chunk>,
+  open: List<usize>,
+  references: List<Reference>,
+  referenceIndex: HashMap<u64, usize>,
+  options: MarkdownOptions,
+  referenceWork: usize,
+  input: Input,
+  inlineState: Inline,
+  labelBuffer: Bytes,
+}
+
+struct Line {
+  start: usize,
+  end: usize,
+  after: usize
+}
+
+struct Cursor {
+  pos: usize,
+  column: usize,
+  partial: usize
+}
+
+impl Copy for Cursor {}
+
+struct Indent {
+  pos: usize,
+  columns: usize,
+  blank: bool
+}
+
+fn indentation(data: &[u8], cursor: Cursor, end: usize) -> Indent {
+  let mut pos = cursor.pos
+  let mut column = cursor.column
+  let start = column
+  if cursor.partial != 0 {
+    column = column + cursor.partial
+  }
+  while pos < end {
+    if data[pos] == 32 {
+      column = column + 1
+    } else if data[pos] == 9 {
+      column = column + 4 - column % 4
+    } else {
+      break
+    }
+    pos = pos + 1
+  }
+  return Indent { pos: pos, columns: column - start, blank: pos == end }
+}
+
+fn advance(data: &[u8], cursor: &mut Cursor, columns: usize, end: usize) {
+  let mut left = columns
+  while left > 0 && (cursor.pos < end || cursor.partial > 0) {
+    let mut width: usize = 1
+    if cursor.partial != 0 {
+      width = cursor.partial
+    } else if data[cursor.pos] == 9 {
+      width = 4 - cursor.column % 4
+    }
+    if width > left {
+      if cursor.partial == 0 {
+        cursor.pos = cursor.pos + 1
+      }
+      cursor.partial = width - left
+      cursor.column = cursor.column + left
+      return
+    }
+    if cursor.partial == 0 {
+      cursor.pos = cursor.pos + 1
+    }
+    cursor.partial = 0
+    cursor.column = cursor.column + width
+    left = left - width
+  }
+}
+
+effect fn chunk(p: &mut Parser<'_>, id: usize, cursor: Cursor, line: &Line) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut n = node(&p.doc, id)
+  let index = List<Chunk>.length(&p.chunks)
+  if n.tail == NONE {
+    n.head = index
+  } else {
+    let mut last = List<Chunk>.get(&p.chunks, n.tail)
+    last.next = index
+    List<Chunk>.set(&mut p.chunks, n.tail, last)
+  }
+  n.tail = index
+  n.span.end = line.after
+  set(&mut p.doc, id, n)
+  run List<Chunk>.append(
+    &mut p.chunks,
+    Chunk { start: cursor.pos, end: line.after, padding: cursor.partial, next: NONE },
+  )
+}
+
+fn tip(p: &Parser<'_>) -> usize {
+  return List<usize>.get(&p.open, List<usize>.length(&p.open) - 1)
+}
+
+fn closeTo(p: &mut Parser<'_>, length: usize) {
+  while List<usize>.length(&p.open) > length {
+    let id = tip(&p.*)
+    let mut n = node(&p.doc, id)
+    set(&mut p.doc, id, n)
+    if n.blank && n.parent != NONE && n.kind != MarkdownNodeKind.BlockQuote {
+      let mut parent = node(&p.doc, n.parent)
+      parent.blank = true
+      set(&mut p.doc, n.parent, parent)
+    }
+    drop List<usize>.pop(&mut p.open)
+  }
+}
+
+effect fn push(p: &mut Parser<'_>, kind: MarkdownNodeKind, start: usize) -> usize
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let parent = tip(&p.*)
+  beforeBlock(&mut p.*, parent)
+  let id = run add(&mut p.doc, parent, kind, start)
+  run List<usize>.append(&mut p.open, id)
+  return id
+}
+
+fn thematic(data: &[u8], pos: usize, end: usize) -> bool {
+  if pos >= end {
+    return false
+  }
+  let c = data[pos]
+  if c != 42 && c != 45 && c != 95 {
+    return false
+  }
+  let mut count: usize = 0
+  let mut i = pos
+  while i < end {
+    if data[i] == c {
+      count = count + 1
+    } else if data[i] != 32 && data[i] != 9 {
+      return false
+    }
+    i = i + 1
+  }
+  return count >= 3
+}
+
+fn heading(data: &[u8], pos: usize, end: usize) -> usize {
+  let mut i = pos
+  while i < end && data[i] == 35 {
+    i = i + 1
+  }
+  let count = i - pos
+  if count > 6 || count == 0 || (i < end && data[i] != 32 && data[i] != 9) {
+    return 0
+  }
+  return count
+}
+
+fn setext(data: &[u8], pos: usize, end: usize) -> u8 {
+  if pos == end || (data[pos] != 61 && data[pos] != 45) {
+    return 0
+  }
+  let c = data[pos]
+  let mut i = pos
+  while i < end && data[i] == c {
+    i = i + 1
+  }
+  while i < end && (data[i] == 32 || data[i] == 9) {
+    i = i + 1
+  }
+  if i != end {
+    return 0
+  }
+  if c == 61 {
+    return 1
+  }
+  return 2
+}
+
+struct Marker {
+  end: usize,
+  start: usize,
+  ordered: bool,
+  byte: u8
+}
+
+fn listMarker(data: &[u8], pos: usize, end: usize) -> Marker {
+  let mut result = Marker { end: pos, start: 0, ordered: false, byte: 0 }
+  if pos == end {
+    return move result
+  }
+  let mut i = pos
+  let c = data[i]
+  if c == 45 || c == 43 || c == 42 {
+    i = i + 1
+    result.byte = c
+  } else {
+    while i < end && i - pos < 9 && data[i] >= 48 && data[i] <= 57 {
+      result.start = result.start * 10 + u8.toUsize(data[i] - 48)
+      i = i + 1
+    }
+    if i == pos || i == end || (data[i] != 46 && data[i] != 41) {
+      return move result
+    }
+    result.ordered = true
+    result.byte = data[i]
+    i = i + 1
+  }
+  if i < end && data[i] != 32 && data[i] != 9 {
+    return move result
+  }
+  result.end = i
+  return move result
+}
+
+fn alpha(c: u8) -> bool {
+  return (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+}
+
+fn tagName(c: u8) -> bool {
+  return alpha(c) || (c >= 48 && c <= 57) || c == 45
+}
+
+fn attrName(c: u8) -> bool {
+  return alpha(c) || (c >= 48 && c <= 57) || c == 95 || c == 46 || c == 58 || c == 45
+}
+
+// Returns the byte after a complete raw HTML token, or zero. All scans move forward.
+fn htmlEnd(data: &[u8], pos: usize, work: &mut usize) -> usize {
+  if pos + 1 >= data.length || data[pos] != 60 {
+    return 0
+  }
+  let mut i = pos + 1
+  if at(data, i, "!--") {
+    i = i + 3
+    if i < data.length && data[i] == 62 {
+      return i + 1
+    }
+    if at(data, i, "->") {
+      return i + 2
+    }
+    while i < data.length {
+      if work.* == 0 {
+        return 0
+      }
+      work.* = work.* - 1
+      if at(data, i, "-->") {
+        return i + 3
+      }
+      i = i + 1
+    }
+    return 0
+  }
+  if at(data, i, "![CDATA[") {
+    i = i + 8
+    while i < data.length {
+      if work.* == 0 {
+        return 0
+      }
+      work.* = work.* - 1
+      if at(data, i, "]]>") {
+        return i + 3
+      }
+      i = i + 1
+    }
+    return 0
+  }
+  if data[i] == 63 {
+    i = i + 1
+    while i < data.length {
+      if work.* == 0 {
+        return 0
+      }
+      work.* = work.* - 1
+      if at(data, i, "?>") {
+        return i + 2
+      }
+      i = i + 1
+    }
+    return 0
+  }
+  if data[i] == 33 {
+    i = i + 1
+    if i == data.length || !alpha(data[i]) {
+      return 0
+    }
+    while i < data.length {
+      if work.* == 0 {
+        return 0
+      }
+      work.* = work.* - 1
+      if data[i] == 62 {
+        return i + 1
+      }
+      i = i + 1
+    }
+    return 0
+  }
+  let mut closing = false
+  if data[i] == 47 {
+    closing = true
+    i = i + 1
+  }
+  if i == data.length || !alpha(data[i]) {
+    return 0
+  }
+  i = i + 1
+  while i < data.length && tagName(data[i]) {
+    if work.* == 0 {
+      return 0
+    }
+    work.* = work.* - 1
+    i = i + 1
+  }
+  while i < data.length {
+    if work.* == 0 {
+      return 0
+    }
+    work.* = work.* - 1
+    let before = i
+    while i < data.length && space(data[i]) {
+      if work.* == 0 {
+        return 0
+      }
+      work.* = work.* - 1
+      i = i + 1
+    }
+    if i == data.length {
+      return 0
+    }
+    if data[i] == 62 {
+      return i + 1
+    }
+    if !closing && at(data, i, "/>") {
+      return i + 2
+    }
+    if closing || before == i || !(alpha(data[i]) || data[i] == 95 || data[i] == 58) {
+      return 0
+    }
+    i = i + 1
+    while i < data.length && attrName(data[i]) {
+      if work.* == 0 {
+        return 0
+      }
+      work.* = work.* - 1
+      i = i + 1
+    }
+    let attributeEnd = i
+    while i < data.length && space(data[i]) {
+      if work.* == 0 {
+        return 0
+      }
+      work.* = work.* - 1
+      i = i + 1
+    }
+    if i == data.length {
+      return 0
+    }
+    if data[i] != 61 {
+      i = attributeEnd
+      continue
+    }
+    i = i + 1
+    while i < data.length && space(data[i]) {
+      if work.* == 0 {
+        return 0
+      }
+      work.* = work.* - 1
+      i = i + 1
+    }
+    if i == data.length {
+      return 0
+    }
+    let quote = data[i]
+    if quote == 34 || quote == 39 {
+      i = i + 1
+      while i < data.length && data[i] != quote {
+        if work.* == 0 {
+          return 0
+        }
+        work.* = work.* - 1
+        i = i + 1
+      }
+      if i == data.length {
+        return 0
+      }
+      i = i + 1
+    } else {
+      let start = i
+      while i < data.length && !space(data[i]) && data[i] != 62 {
+        if work.* == 0 {
+          return 0
+        }
+        work.* = work.* - 1
+        if data[i] == 34 || data[i] == 39 || data[i] == 61 || data[i] == 60 || data[i] == 96 {
+          return 0
+        }
+        i = i + 1
+      }
+      if i == start {
+        return 0
+      }
+    }
+  }
+  return 0
+}
+
+fn htmlBlock(data: &[u8], pos: usize, end: usize, paragraph: bool) -> u8 {
+  if pos == end || data[pos] != 60 {
+    return 0
+  }
+  if at(data, pos, "<!--") {
+    return 2
+  }
+  if at(data, pos, "<?") {
+    return 3
+  }
+  if at(data, pos, "<![CDATA[") {
+    return 5
+  }
+  if pos + 2 < end && data[pos + 1] == 33 && alpha(data[pos + 2]) {
+    return 4
+  }
+  let mut i = pos + 1
+  if i < end && data[i] == 47 {
+    i = i + 1
+  }
+  let start = i
+  while i < end && tagName(data[i]) {
+    i = i + 1
+  }
+  if i == start {
+    return 0
+  }
+  if i < end && !(space(data[i]) || data[i] == 62 || data[i] == 47) {
+    return 0
+  }
+  let names = "address article aside base basefont blockquote body caption center col colgroup dd details dialog dir div dl dt fieldset figcaption figure footer form frame frameset h1 h2 h3 h4 h5 h6 head header hr html iframe legend li link main menu menuitem nav noframes ol optgroup option p param search section summary table tbody td tfoot th thead title tr track ul"
+  let key = bytes(data, start, i)
+  if data[pos + 1] != 47
+    && (foldedAt(key, 0, "script") && key.length == 6 || foldedAt(key, 0, "pre") && key.length == 3
+      || foldedAt(key, 0, "style") && key.length == 5
+      || foldedAt(key, 0, "textarea") && key.length == 8) {
+    return 1
+  }
+  let words = String.utf8Bytes(names)
+  let mut begin: usize = 0
+  while begin < words.length {
+    let mut stop = begin
+    while stop < words.length && words[stop] != 32 {
+      stop = stop + 1
+    }
+    if stop - begin == key.length
+      && foldedAt(key, 0, unsafe String.fromUtf8Unchecked(bytes(words, begin, stop))) {
+      return 6
+    }
+    begin = stop + 1
+  }
+  if !paragraph {
+    let mut work = end - pos + 1
+    let finish = htmlEnd(bytes(data, 0, end), pos, &mut work)
+    if finish != 0 {
+      i = finish
+      while i < end && (data[i] == 32 || data[i] == 9) {
+        i = i + 1
+      }
+      if i == end {
+        return 7
+      }
+    }
+  }
+  return 0
+}
+
+fn htmlClosed(data: &[u8], pos: usize, end: usize, kind: u8) -> bool {
+  let mut i = pos
+  while i < end {
+    if kind == 1
+      && (foldedAt(data, i, "</script>") || foldedAt(data, i, "</pre>")
+        || foldedAt(data, i, "</style>")
+        || foldedAt(data, i, "</textarea>")) {
+      return true
+    }
+    if kind == 2 && at(data, i, "-->") || kind == 3 && at(data, i, "?>")
+      || kind == 4 && data[i] == 62
+      || kind == 5 && at(data, i, "]]>") {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+fn startsBlock(data: &[u8], cursor: Cursor, end: usize, interrupting: bool) -> bool {
+  let ind = indentation(data, cursor, end)
+  if ind.blank || ind.columns >= 4 {
+    return false
+  }
+  let pos = ind.pos
+  if data[pos] == 62 || heading(data, pos, end) != 0 || thematic(data, pos, end) {
+    return true
+  }
+  if data[pos] == 96 || data[pos] == 126 {
+    let c = data[pos]
+    let mut i = pos
+    while i < end && data[i] == c {
+      i = i + 1
+    }
+    if i - pos >= 3 {
+      if c == 126 {
+        return true
+      }
+      while i < end {
+        if data[i] == 96 {
+          return false
+        }
+        i = i + 1
+      }
+      return true
+    }
+  }
+  if htmlBlock(data, pos, end, true) != 0 {
+    return true
+  }
+  let marker = listMarker(data, pos, end)
+  if marker.end > pos && !interrupting {
+    return true
+  }
+  if marker.end > pos && (!marker.ordered || marker.start == 1) {
+    let rest = indentation(data, Cursor { pos: marker.end, column: 0, partial: 0 }, end)
+    return !rest.blank
+  }
+  return false
+}
+
+effect fn blockLine(p: &mut Parser<'_>, line: &Line) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let data = source(&p.doc)
+  let mut cursor = Cursor { pos: line.start, column: 0, partial: 0 }
+  let oldTip = tip(&p.*)
+  let mut matched: usize = 1
+  let length = List<usize>.length(&p.open)
+  while matched < length {
+    let id = List<usize>.get(&p.open, matched)
+    let n = node(&p.doc, id)
+    let ind = indentation(data, cursor, line.end)
+    if n.kind == MarkdownNodeKind.BlockQuote {
+      if ind.columns > 3 || ind.blank || data[ind.pos] != 62 {
+        break
+      }
+      advance(data, &mut cursor, ind.columns + 1, line.end)
+      if cursor.pos < line.end && (data[cursor.pos] == 32 || data[cursor.pos] == 9) {
+        advance(data, &mut cursor, 1, line.end)
+      }
+    } else if n.kind == MarkdownNodeKind.ListItem {
+      if ind.columns >= n.indent {
+        advance(data, &mut cursor, n.indent, line.end)
+      } else if ind.blank && n.first != NONE {
+        advance(data, &mut cursor, ind.columns, line.end)
+      } else {
+        break
+      }
+    } else if n.kind == MarkdownNodeKind.Paragraph {
+      break
+    } else if n.kind == MarkdownNodeKind.CodeBlock {
+      if n.fenced {
+        if ind.columns <= 3 && !ind.blank && data[ind.pos] == n.marker {
+          let mut i = ind.pos
+          while i < line.end && data[i] == n.marker {
+            i = i + 1
+          }
+          let runLength = i - ind.pos
+          while i < line.end && (data[i] == 32 || data[i] == 9) {
+            i = i + 1
+          }
+          if runLength >= n.fenceLength && i == line.end {
+            let mut closed = n
+            closed.span.end = line.after
+            set(&mut p.doc, id, closed)
+            closeTo(&mut p.*, matched)
+            return
+          }
+        }
+        advance(data, &mut cursor, minimum(ind.columns, n.indent), line.end)
+      } else {
+        if ind.columns >= 4 {
+          advance(data, &mut cursor, 4, line.end)
+        } else if ind.blank {
+          advance(data, &mut cursor, ind.columns, line.end)
+        } else {
+          break
+        }
+      }
+      matched = matched + 1
+      break
+    } else if n.kind == MarkdownNodeKind.HtmlBlock {
+      if ind.blank && n.htmlType >= 6 {
+        break
+      }
+      matched = matched + 1
+      break
+    }
+    matched = matched + 1
+  }
+  let ind = indentation(data, cursor, line.end)
+  let old = node(&p.doc, oldTip)
+  let paragraph = old.kind == MarkdownNodeKind.Paragraph
+
+  let currentMarker = listMarker(data, ind.pos, line.end)
+  let siblingItem = matched < length - 1 && ind.columns <= 3 && currentMarker.end > ind.pos
+    && node(&p.doc, List<usize>.get(&p.open, matched - 1)).kind == MarkdownNodeKind.List
+  if paragraph && matched == length - 1 && !ind.blank && ind.columns <= 3
+    && setext(data, ind.pos, line.end) != 0 {
+    let level = setext(data, ind.pos, line.end)
+    drop data
+    let previous = Intrinsic.replace(p.input, makeInput())
+    let input = run gather(&p.*, oldTip, move previous)
+    let consumed = run referenceDefinitions(&mut p.*, &input)
+    let mut n = old
+    if consumed < Bytes.length(&input.data) {
+      n.kind = MarkdownNodeKind.Heading
+      n.span.start = position(&input, consumed, false)
+      n.level = level
+      n.fenceLength = consumed
+      n.span.end = line.after
+      set(&mut p.doc, oldTip, n)
+      closeTo(&mut p.*, matched)
+    } else {
+      n.head = NONE
+      n.tail = NONE
+      n.span.start = line.start
+      set(&mut p.doc, oldTip, n)
+      run chunk(&mut p.*, oldTip, cursor, line)
+    }
+    p.input = move input
+    return
+  }
+
+  // Missing container prefixes permit lazy paragraph text, but cannot consume a sibling item marker.
+  // Only a paragraph whose containers all matched restricts which list items may interrupt it.
+  if paragraph && !ind.blank && !siblingItem
+    && !startsBlock(data, cursor, line.end, matched == length - 1) {
+    advance(data, &mut cursor, ind.columns, line.end)
+    drop data
+    run chunk(&mut p.*, oldTip, cursor, line)
+    return
+  }
+  drop data
+  closeTo(&mut p.*, matched)
+  let mut current = tip(&p.*)
+  let currentNode = node(&p.doc, current)
+  if currentNode.kind == MarkdownNodeKind.CodeBlock
+    || currentNode.kind == MarkdownNodeKind.HtmlBlock {
+    run chunk(&mut p.*, current, cursor, line)
+    if currentNode.kind == MarkdownNodeKind.HtmlBlock
+      && htmlClosed(source(&p.doc), cursor.pos, line.end, currentNode.htmlType) {
+      closeTo(&mut p.*, matched - 1)
+    }
+    return
+  }
+  let mut inParagraph = paragraph && matched == length - 1
+
+  // New containers are opened before leaf blocks, at most maxNesting levels.
+  while true {
+    let data = source(&p.doc)
+    let ind = indentation(data, cursor, line.end)
+    let pos = ind.pos
+    current = tip(&p.*)
+    let depth = node(&p.doc, current).depth
+    if node(&p.doc, current).kind == MarkdownNodeKind.List && !ind.blank {
+      let nextMarker = listMarker(data, pos, line.end)
+      if ind.columns >= 4 || nextMarker.end == pos || thematic(data, pos, line.end) {
+        drop data
+        closeLast(&mut p.*)
+        inParagraph = false
+        continue
+      }
+    }
+    if ind.blank {
+      let mut n = node(&p.doc, current)
+      n.blank = !(n.kind == MarkdownNodeKind.ListItem && n.first == NONE
+        && n.span.start >= line.start
+        && n.span.start < line.after)
+      set(&mut p.doc, current, n)
+      return
+    }
+    if ind.columns <= 3 && data[pos] == 62 && depth < p.options.maxNesting {
+      advance(data, &mut cursor, ind.columns + 1, line.end)
+      if cursor.pos < line.end && (data[cursor.pos] == 32 || data[cursor.pos] == 9) {
+        advance(data, &mut cursor, 1, line.end)
+      }
+      drop data
+      drop run push(&mut p.*, MarkdownNodeKind.BlockQuote, pos)
+      inParagraph = false
+      continue
+    }
+    let level = heading(data, pos, line.end)
+    if ind.columns <= 3 && level > 0 {
+      let mut start = pos + level
+      while start < line.end && (data[start] == 32 || data[start] == 9) {
+        start = start + 1
+      }
+      let mut end = line.end
+      while end > start && (data[end - 1] == 32 || data[end - 1] == 9) {
+        end = end - 1
+      }
+      let mut hashes = end
+      while hashes > start && data[hashes - 1] == 35 {
+        hashes = hashes - 1
+      }
+      if hashes < end && (hashes == start || data[hashes - 1] == 32 || data[hashes - 1] == 9) {
+        end = hashes
+        while end > start && (data[end - 1] == 32 || data[end - 1] == 9) {
+          end = end - 1
+        }
+      }
+      drop data
+      let id = run push(&mut p.*, MarkdownNodeKind.Heading, pos)
+      let mut n = node(&p.doc, id)
+      n.level = usize.toU8(level)
+      n.span.end = line.after
+      set(&mut p.doc, id, n)
+      run chunk(
+        &mut p.*,
+        id,
+        Cursor { pos: start, column: 0, partial: 0 },
+        &Line { start: start, end: end, after: end },
+      )
+      n = node(&p.doc, id)
+      n.span.end = line.after
+      set(&mut p.doc, id, n)
+      closeLast(&mut p.*)
+      return
+    }
+    if ind.columns <= 3 && (data[pos] == 96 || data[pos] == 126) {
+      let c = data[pos]
+      let mut finish = pos
+      while finish < line.end && data[finish] == c {
+        finish = finish + 1
+      }
+      let count = finish - pos
+      let mut valid = count >= 3
+      let mut i = finish
+      while i < line.end {
+        if c == 96 && data[i] == 96 {
+          valid = false
+        }
+        i = i + 1
+      }
+      if valid {
+        while finish < line.end && (data[finish] == 32 || data[finish] == 9) {
+          finish = finish + 1
+        }
+        let mut end = line.end
+        while end > finish && (data[end - 1] == 32 || data[end - 1] == 9) {
+          end = end - 1
+        }
+        drop data
+        let extra = run decodedSource(&mut p.doc, finish, end)
+        let id = run push(&mut p.*, MarkdownNodeKind.CodeBlock, pos)
+        let mut n = node(&p.doc, id)
+        n.fenced = true
+        n.marker = c
+        n.fenceLength = count
+        n.indent = ind.columns
+        n.extra = extra
+        n.span.end = line.after
+        set(&mut p.doc, id, n)
+        return
+      }
+    }
+    let html = htmlBlock(data, pos, line.end, inParagraph)
+    if ind.columns <= 3 && html != 0 {
+      drop data
+      let id = run push(&mut p.*, MarkdownNodeKind.HtmlBlock, cursor.pos)
+      let mut n = node(&p.doc, id)
+      n.htmlType = html
+      set(&mut p.doc, id, n)
+      run chunk(&mut p.*, id, cursor, line)
+      if htmlClosed(source(&p.doc), cursor.pos, line.end, html) {
+        closeLast(&mut p.*)
+      }
+      return
+    }
+    if ind.columns <= 3 && thematic(data, pos, line.end) {
+      drop data
+      let id = run add(&mut p.doc, current, MarkdownNodeKind.ThematicBreak, pos)
+      let mut n = node(&p.doc, id)
+      n.span.end = line.after
+      set(&mut p.doc, id, n)
+      return
+    }
+    let marker = listMarker(data, pos, line.end)
+    if ind.columns <= 3 && marker.end > pos && depth + 2 <= p.options.maxNesting {
+      let width = marker.end - pos
+      let mut content = cursor
+      advance(data, &mut content, ind.columns + width, line.end)
+      let spaces = indentation(data, content, line.end)
+      let mut padding = spaces.columns
+      if spaces.blank || padding < 1 || padding > 4 {
+        padding = 1
+      }
+      if !inParagraph || (!marker.ordered || marker.start == 1) && !spaces.blank {
+        advance(data, &mut content, padding, line.end)
+        drop data
+        let mut list = current
+        let listBefore = node(&p.doc, list)
+        if listBefore.kind != MarkdownNodeKind.List || listBefore.ordered != marker.ordered
+          || listBefore.marker != marker.byte {
+          if listBefore.kind == MarkdownNodeKind.List {
+            closeLast(&mut p.*)
+          }
+          list = run push(&mut p.*, MarkdownNodeKind.List, pos)
+          let mut n = node(&p.doc, list)
+          n.ordered = marker.ordered
+          n.start = marker.start
+          n.marker = marker.byte
+          n.tight = true
+          set(&mut p.doc, list, n)
+        }
+        let listNode = node(&p.doc, list)
+        if listNode.blank && listNode.first != NONE {
+          let mut loosened = listNode
+          loosened.tight = false
+          loosened.blank = false
+          set(&mut p.doc, list, loosened)
+        }
+        let item = run push(&mut p.*, MarkdownNodeKind.ListItem, pos)
+        let mut n = node(&p.doc, item)
+        n.indent = ind.columns + width + padding
+        n.span.end = line.after
+        set(&mut p.doc, item, n)
+        cursor = content
+        inParagraph = false
+        continue
+      }
+    }
+    if ind.columns >= 4 && !inParagraph {
+      advance(data, &mut cursor, 4, line.end)
+      drop data
+      let id = run push(&mut p.*, MarkdownNodeKind.CodeBlock, cursor.pos)
+      run chunk(&mut p.*, id, cursor, line)
+      return
+    }
+    advance(data, &mut cursor, ind.columns, line.end)
+    drop data
+
+    // A list cannot directly contain a paragraph after its last item stops matching.
+    if node(&p.doc, tip(&p.*)).kind == MarkdownNodeKind.List {
+      closeLast(&mut p.*)
+    }
+    let mut parent = tip(&p.*)
+
+    if node(&p.doc, parent).kind != MarkdownNodeKind.Paragraph {
+      parent = run push(&mut p.*, MarkdownNodeKind.Paragraph, cursor.pos)
+    }
+    run chunk(&mut p.*, parent, cursor, line)
+    return
+  }
+}
+
+struct EntityMatch {
+  end: usize,
+  named: string<'static>,
+  scalar: u32
+}
+
+fn entity(data: &[u8], pos: usize) -> EntityMatch {
+  let mut result = EntityMatch { end: pos, named: "", scalar: 0 }
+  let mut i = pos + 1
+  if i >= data.length {
+    return move result
+  }
+  if data[i] == 35 {
+    i = i + 1
+    let mut base: u32 = 10
+    let mut limit: usize = 7
+    if i < data.length && (data[i] == 120 || data[i] == 88) {
+      base = 16
+      limit = 6
+      i = i + 1
+    }
+    let start = i
+    let mut value: u32 = 0
+    while i < data.length && i - start < limit {
+      let c = lower(data[i])
+      let mut digit: u32 = 100
+      if c >= 48 && c <= 57 {
+        digit = u8.toU32(c - 48)
+      } else if c >= 97 && c <= 102 {
+        digit = u8.toU32(c - 97) + 10
+      }
+      if digit >= base {
+        break
+      }
+      value = value * base + digit
+      i = i + 1
+    }
+    if i > start && i < data.length && data[i] == 59 {
+      result.end = i + 1
+      result.scalar = value
+    }
+    return move result
+  }
+  let start = i
+  while i < data.length && i - start <= 32 && (alpha(data[i]) || data[i] >= 48 && data[i] <= 57) {
+    i = i + 1
+  }
+  if i > start && i < data.length && data[i] == 59 {
+    let name = unsafe String.fromUtf8Unchecked(bytes(data, start, i + 1))
+    let value = entities.lookup(name)
+    if String.byteLength(value) != 0 {
+      result.end = i + 1
+      result.named = value
+    }
+  }
+  return move result
+}
+
+effect fn decodeInto(out: &mut Bytes, data: &[u8], escapes: bool, lineSpaces: bool) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut i: usize = 0
+  while i < data.length {
+    let start = i
+    while i < data.length && data[i] != 0 && data[i] != 13 && (!lineSpaces || data[i] != 10)
+      && (!escapes || data[i] != 92 && data[i] != 38) {
+      i = i + 1
+    }
+    run Bytes.append(&mut out.*, bytes(data, start, i))
+    if i == data.length {
+      break
+    }
+    let c = data[i]
+    if c == 0 {
+      run scalar(&mut out.*, 0xfffd)
+      i = i + 1
+    } else if c == 13 || lineSpaces && c == 10 {
+      if c == 13 && i + 1 < data.length && data[i + 1] == 10 {
+        i = i + 1
+      }
+      let mut replacement: u8 = 10
+      if lineSpaces {
+        replacement = 32
+      }
+      run Bytes.append(&mut out.*, &[replacement])
+      i = i + 1
+    } else if c == 92 && i + 1 < data.length && punctuation(data[i + 1]) {
+      run Bytes.append(&mut out.*, bytes(data, i + 1, i + 2))
+      i = i + 2
+    } else if c == 38 {
+      let found = entity(data, i)
+      if found.end > i {
+        if String.byteLength(found.named) > 0 {
+          run Bytes.append(&mut out.*, String.utf8Bytes(found.named))
+        } else {
+          run scalar(&mut out.*, found.scalar)
+        }
+        i = found.end
+      } else {
+        run Bytes.append(&mut out.*, &[c])
+        i = i + 1
+      }
+    } else {
+      run Bytes.append(&mut out.*, &[c])
+      i = i + 1
+    }
+  }
+}
+
+effect fn decodedSource(doc: &mut MarkdownDocument<'_>, start: usize, end: usize) -> TextRange
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let data = bytes(source(&doc.*), start, end)
+  let begin = Bytes.length(&doc.storage)
+  run decodeInto(&mut doc.storage, data, true, false)
+  let finish = Bytes.length(&doc.storage)
+  if same(data, bytes(Bytes.asSlice(&doc.storage), begin, finish)) {
+    Bytes.truncate(&mut doc.storage, begin)
+    return TextRange { span: MarkdownSpan { start: start, end: end }, side: false }
+  }
+  return TextRange { span: MarkdownSpan { start: begin, end: finish }, side: true }
+}
+
+effect fn decodedInput(
+  doc: &mut MarkdownDocument<'_>,
+  input: &Input,
+  start: usize,
+  end: usize,
+) -> TextRange
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let data = bytes(Bytes.asSlice(&input.data), start, end)
+  let begin = Bytes.length(&doc.storage)
+  run decodeInto(&mut doc.storage, data, true, false)
+  let finish = Bytes.length(&doc.storage)
+  if same(data, bytes(Bytes.asSlice(&doc.storage), begin, finish)) {
+    Bytes.truncate(&mut doc.storage, begin)
+    return run inputText(&mut doc.*, input, start, end)
+  }
+  return TextRange { span: MarkdownSpan { start: begin, end: finish }, side: true }
+}
+
+struct Input {
+  data: Bytes,
+  pieces: List<Piece>
+}
+
+effect fn gather(p: &Parser<'_>, id: usize, previous: Input) -> Input
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut input = move previous
+  Bytes.clear(&mut input.data)
+  List<Piece>.clear(&mut input.pieces)
+  let mut index = node(&p.doc, id).head
+  let data = source(&p.doc)
+  while index != NONE {
+    let part = List<Chunk>.get(&p.chunks, index)
+    if part.padding > 0 {
+      let begin = Bytes.length(&input.data)
+      let mut i: usize = 0
+      while i < part.padding {
+        run Bytes.append(&mut input.data, b" ")
+        i = i + 1
+      }
+      run List<Piece>.append(
+        &mut input.pieces,
+        Piece { input: begin, start: part.start, length: part.padding },
+      )
+    }
+    run List<Piece>.append(
+      &mut input.pieces,
+      Piece { input: Bytes.length(&input.data), start: part.start, length: part.end - part.start },
+    )
+    run Bytes.append(&mut input.data, bytes(data, part.start, part.end))
+    index = part.next
+  }
+  return move input
+}
+
+fn pieceAt(input: &Input, offset: usize) -> Piece {
+  let parts = List<Piece>.asSlice(&input.pieces)
+  let mut low: usize = 0
+  let mut high = parts.length
+  while low < high {
+    let mid = low + (high - low) / 2
+    if parts[mid].input <= offset {
+      low = mid + 1
+    } else {
+      high = mid
+    }
+  }
+  if low == 0 {
+    return Piece { input: 0, start: 0, length: 0 }
+  }
+  return parts[low - 1]
+}
+
+fn position(input: &Input, offset: usize, end: bool) -> usize {
+  let mut at = offset
+  if end && at > 0 {
+    at = at - 1
+  }
+  let part = pieceAt(input, at)
+  return part.start + offset - part.input
+}
+
+fn inputSpan(input: &Input, start: usize, end: usize) -> MarkdownSpan {
+  return MarkdownSpan { start: position(input, start, false), end: position(input, end, true) }
+}
+
+effect fn inputText(
+  doc: &mut MarkdownDocument<'_>,
+  input: &Input,
+  start: usize,
+  end: usize,
+) -> TextRange
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if start == end {
+    return emptyText()
+  }
+  let mapped = inputSpan(input, start, end)
+  if mapped.end - mapped.start == end - start {
+    let span = inputSpan(input, start, end)
+    let actual = bytes(source(&doc.*), span.start, span.end)
+    let wanted = bytes(Bytes.asSlice(&input.data), start, end)
+    if same(actual, wanted) {
+      return TextRange { span: span, side: false }
+    }
+  }
+  return run store(&mut doc.*, bytes(Bytes.asSlice(&input.data), start, end))
+}
+
+fn same(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < a.length {
+    if a[i] != b[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn whiteScalar(c: u32) -> bool {
+  if c < 128 {
+    return c == 9 || c == 10 || c == 12 || c == 13 || c == 32
+  }
+  return GeneralCategory.of(c) == GeneralCategory.Zs
+}
+
+fn punctScalar(c: u32) -> bool {
+  if c < 128 {
+    return punctuation(u32.toU8(c))
+  }
+  return match GeneralCategory.of(c) {
+    GeneralCategory.Pc => true
+    GeneralCategory.Pd => true
+    GeneralCategory.Pe => true
+    GeneralCategory.Pf => true
+    GeneralCategory.Pi => true
+    GeneralCategory.Po => true
+    GeneralCategory.Ps => true
+    GeneralCategory.Sc => true
+    GeneralCategory.Sk => true
+    GeneralCategory.Sm => true
+    GeneralCategory.So => true
+    _ => false
+  }
+}
+
+effect fn normalizeLabel(out: &mut Bytes, data: &[u8]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  Bytes.clear(&mut out.*)
+  let mut i: usize = 0
+  let mut pending = false
+  while i < data.length {
+    let decoded = utf8_scan.decode(data, i)
+    i = decoded.next
+    if decoded.scalar == 32 || decoded.scalar == 9 || decoded.scalar == 10 || decoded.scalar == 13 {
+      pending = Bytes.length(&out.*) != 0
+      continue
+    }
+    if pending {
+      run Bytes.append(&mut out.*, b" ")
+      pending = false
+    }
+    let mapped = UnicodeCase.fold(decoded.scalar)
+    let mut j: usize = 0
+    while j < mapped.length {
+      run scalar(&mut out.*, mapped.points[j])
+      j = j + 1
+    }
+  }
+}
+
+fn labelHash(data: &[u8]) -> u64 {
+  let mut value: u64 = 14695981039346656037
+  let mut i: usize = 0
+  while i < data.length {
+    value = u64.wrappingMultiply(value ^ u8.toU64(data[i]), 1099511628211)
+    i = i + 1
+  }
+  return value
+}
+
+fn findReference(p: &Parser<'_>, label: &[u8]) -> usize {
+  let mut index = match HashMap<u64, usize>.get(&p.referenceIndex, labelHash(label)) {
+    Option<usize>.Some { value } => value
+    _ => NONE
+  }
+  while index != NONE {
+    let entry = List<Reference>.get(&p.references, index)
+    if same(String.utf8Bytes(text(&p.doc, entry.label)), label) {
+      return index
+    }
+    index = entry.next
+  }
+  return NONE
+}
+
+struct LinkParts {
+  end: usize,
+  destinationStart: usize,
+  destinationEnd: usize,
+  titleStart: usize,
+  titleEnd: usize,
+  hasTitle: bool
+}
+
+fn skipSpace(data: &[u8], pos: usize, work: &mut usize) -> usize {
+  let mut i = pos
+  while i < data.length && space(data[i]) {
+    if work.* == 0 {
+      return pos
+    }
+    work.* = work.* - 1
+    i = i + 1
+  }
+  return i
+}
+
+fn destinationEnd(data: &[u8], pos: usize, work: &mut usize) -> usize {
+  let mut i = pos
+  if i < data.length && data[i] == 60 {
+    i = i + 1
+    while i < data.length {
+      if work.* == 0 {
+        return pos
+      }
+      work.* = work.* - 1
+      if data[i] == 62 {
+        return i + 1
+      }
+      if data[i] == 10 || data[i] == 13 || data[i] == 60 {
+        return pos
+      }
+      if data[i] == 92 && i + 1 < data.length && punctuation(data[i + 1]) {
+        i = i + 1
+      }
+      i = i + 1
+    }
+    return pos
+  }
+  let mut depth: usize = 0
+  while i < data.length {
+    if work.* == 0 {
+      return pos
+    }
+    work.* = work.* - 1
+    let c = data[i]
+    if c <= 32 || c == 127 {
+      break
+    }
+    if c == 40 {
+      depth = depth + 1
+      if depth > 32 {
+        return pos
+      }
+    }
+    if c == 41 {
+      if depth == 0 {
+        break
+      }
+      depth = depth - 1
+    }
+    if c == 92 && i + 1 < data.length && punctuation(data[i + 1]) {
+      i = i + 1
+    }
+    i = i + 1
+  }
+  if depth != 0 {
+    return pos
+  }
+  return i
+}
+
+fn titleEnd(data: &[u8], pos: usize, work: &mut usize) -> usize {
+  if pos >= data.length || (data[pos] != 34 && data[pos] != 39 && data[pos] != 40) {
+    return pos
+  }
+  let mut closing = data[pos]
+  if closing == 40 {
+    closing = 41
+  }
+  let mut i = pos + 1
+  while i < data.length {
+    if work.* == 0 {
+      return pos
+    }
+    work.* = work.* - 1
+    if data[i] == closing {
+      return i + 1
+    }
+    if closing == 41 && data[i] == 40 {
+      return pos
+    }
+    if data[i] == 92 && i + 1 < data.length && punctuation(data[i + 1]) {
+      i = i + 1
+    }
+    i = i + 1
+  }
+  return pos
+}
+
+fn linkParts(data: &[u8], pos: usize, definition: bool, work: &mut usize) -> LinkParts {
+  let mut result = LinkParts {
+    end: pos,
+    destinationStart: 0,
+    destinationEnd: 0,
+    titleStart: 0,
+    titleEnd: 0,
+    hasTitle: false,
+  }
+  let start = skipSpace(data, pos, &mut work.*)
+  let finish = destinationEnd(data, start, &mut work.*)
+  if finish == start && definition {
+    return move result
+  }
+  result.destinationStart = start
+  result.destinationEnd = finish
+  if start < data.length && data[start] == 60 && finish > start {
+    result.destinationStart = start + 1
+    result.destinationEnd = finish - 1
+  }
+  let spaceEnd = skipSpace(data, finish, &mut work.*)
+  let mut end = finish
+  if spaceEnd > finish {
+    let title = titleEnd(data, spaceEnd, &mut work.*)
+    if title > spaceEnd {
+      result.hasTitle = true
+      result.titleStart = spaceEnd + 1
+      result.titleEnd = title - 1
+      end = skipSpace(data, title, &mut work.*)
+    } else {
+      end = spaceEnd
+    }
+  }
+  if !definition {
+    if end < data.length && data[end] == 41 {
+      result.end = end + 1
+    }
+  } else {
+    // A reference definition ends at the first line ending after its destination or title.
+    let mut i = finish
+    if result.hasTitle {
+      i = result.titleEnd + 1
+    }
+    while i < data.length && (data[i] == 32 || data[i] == 9) {
+      if work.* == 0 {
+        return move result
+      }
+      work.* = work.* - 1
+      i = i + 1
+    }
+    if i == data.length || data[i] == 10 || data[i] == 13 {
+      if i < data.length && data[i] == 13 {
+        i = i + 1
+      }
+      if i < data.length && data[i] == 10 {
+        i = i + 1
+      }
+      result.end = i
+    } else if result.hasTitle {
+      result.hasTitle = false
+      i = finish
+      while i < data.length && (data[i] == 32 || data[i] == 9) {
+        if work.* == 0 {
+          return move result
+        }
+        work.* = work.* - 1
+        i = i + 1
+      }
+      if i == data.length || data[i] == 10 || data[i] == 13 {
+        if i < data.length && data[i] == 13 {
+          i = i + 1
+        }
+        if i < data.length && data[i] == 10 {
+          i = i + 1
+        }
+        result.end = i
+      }
+    }
+  }
+  return move result
+}
+
+effect fn referenceDefinitions(p: &mut Parser<'_>, input: &Input) -> usize
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let data = Bytes.asSlice(&input.data)
+  let mut pos: usize = 0
+  let mut normalized = Intrinsic.replace(p.labelBuffer, Bytes.make())
+  let mut work = usize.saturatingAdd(usize.saturatingMultiply(data.length, 16), 1024)
+  while pos < data.length && data[pos] == 91 {
+    let i = labelClose(data, pos + 1)
+    if i == NONE || !at(data, i, "]:") {
+      break
+    }
+    run normalizeLabel(&mut normalized, bytes(data, pos + 1, i))
+    if Bytes.length(&normalized) == 0 {
+      break
+    }
+    let parts = linkParts(data, i + 2, true, &mut work)
+    if parts.end == i + 2 {
+      break
+    }
+    if findReference(&p.*, Bytes.asSlice(&normalized)) == NONE {
+      let hash = labelHash(Bytes.asSlice(&normalized))
+      let next = match HashMap<u64, usize>.get(&p.referenceIndex, hash) {
+        Option<usize>.Some { value } => value
+        _ => NONE
+      }
+      let label = run store(&mut p.doc, Bytes.asSlice(&normalized))
+      let target = run decodedInput(&mut p.doc, input, parts.destinationStart, parts.destinationEnd)
+      let mut title = emptyText()
+      if parts.hasTitle {
+        title = run decodedInput(&mut p.doc, input, parts.titleStart, parts.titleEnd)
+      }
+      let index = List<Reference>.length(&p.references)
+      run List<Reference>.append(
+        &mut p.references,
+        Reference {
+          label: label,
+          destination: target,
+          title: title,
+          hasTitle: parts.hasTitle,
+          next: next,
+        },
+      )
+      drop run HashMap<u64, usize>.insert(&mut p.referenceIndex, hash, index)
+    }
+    pos = parts.end
+  }
+  p.labelBuffer = move normalized
+  return pos
+}
+
+struct Delimiter {
+  node: usize,
+  byte: u8,
+  length: usize,
+  original: usize,
+  canOpen: bool,
+  canClose: bool,
+  previous: usize,
+  next: usize,
+  active: bool
+}
+
+impl Copy for Delimiter {}
+
+struct Bracket {
+  node: usize,
+  position: usize,
+  image: bool,
+  delimiter: usize,
+  active: bool,
+  after: bool
+}
+
+impl Copy for Bracket {}
+
+struct Backtick {
+  start: usize,
+  length: usize,
+  next: usize,
+  shorter: usize
+}
+
+impl Copy for Backtick {}
+
+struct Inline {
+  delimiters: List<Delimiter>,
+  last: usize,
+  brackets: List<Bracket>,
+  ticks: List<Backtick>,
+  tickIndex: HashMap<usize, usize>,
+  normalized: Bytes,
+  work: usize,
+}
+
+fn unlink(doc: &mut MarkdownDocument<'_>, id: usize) {
+  let n = node(&doc.*, id)
+  if n.previous != NONE {
+    let mut previous = node(&doc.*, n.previous)
+    previous.next = n.next
+    set(&mut doc.*, n.previous, previous)
+  } else if n.parent != NONE {
+    let mut parent = node(&doc.*, n.parent)
+    parent.first = n.next
+    set(&mut doc.*, n.parent, parent)
+  }
+  if n.next != NONE {
+    let mut next = node(&doc.*, n.next)
+    next.previous = n.previous
+    set(&mut doc.*, n.next, next)
+  } else if n.parent != NONE {
+    let mut parent = node(&doc.*, n.parent)
+    parent.last = n.previous
+    set(&mut doc.*, n.parent, parent)
+  }
+  let mut removed = n
+  removed.parent = NONE
+  removed.next = NONE
+  removed.previous = NONE
+  set(&mut doc.*, id, removed)
+}
+
+fn removeDelimiter(state: &mut Inline, id: usize) {
+  let mut d = List<Delimiter>.get(&state.delimiters, id)
+  if !d.active {
+    return
+  }
+  if d.previous != NONE {
+    let mut previous = List<Delimiter>.get(&state.delimiters, d.previous)
+    previous.next = d.next
+    List<Delimiter>.set(&mut state.delimiters, d.previous, previous)
+  }
+  if d.next != NONE {
+    let mut next = List<Delimiter>.get(&state.delimiters, d.next)
+    next.previous = d.previous
+    List<Delimiter>.set(&mut state.delimiters, d.next, next)
+  } else {
+    state.last = d.previous
+  }
+  d.active = false
+  List<Delimiter>.set(&mut state.delimiters, id, d)
+}
+
+effect fn textNode(
+  doc: &mut MarkdownDocument<'_>,
+  input: &Input,
+  parent: usize,
+  start: usize,
+  end: usize,
+) -> usize
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let value = run inputText(&mut doc.*, input, start, end)
+  let id = run add(&mut doc.*, parent, MarkdownNodeKind.Text, position(input, start, false))
+  let mut n = node(&doc.*, id)
+  n.span = inputSpan(input, start, end)
+  n.value = value
+  n.depth = 0
+  n.marker = 1
+  set(&mut doc.*, id, n)
+  return id
+}
+
+// Move a sibling range into a new inline container. Each reparented node remains in the flat arena.
+effect fn wrap(
+  doc: &mut MarkdownDocument<'_>,
+  first: usize,
+  last: usize,
+  kind: MarkdownNodeKind,
+  span: MarkdownSpan,
+) -> usize
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let firstNode = node(&doc.*, first)
+  let lastNode = node(&doc.*, last)
+  let id = List<MarkdownNode>.length(&doc.arena)
+  let mut n = makeNode(kind, span.start)
+  n.span = span
+  n.parent = firstNode.parent
+  n.first = first
+  n.last = last
+  n.previous = firstNode.previous
+  n.next = lastNode.next
+  let mut child = first
+  while child != NONE {
+    let mut c = node(&doc.*, child)
+    n.depth = maximum(n.depth, c.depth + 1)
+    c.parent = id
+    set(&mut doc.*, child, c)
+    if child == last {
+      break
+    }
+    child = c.next
+  }
+  if n.previous != NONE {
+    let mut previous = node(&doc.*, n.previous)
+    previous.next = id
+    set(&mut doc.*, n.previous, previous)
+  } else {
+    let mut parent = node(&doc.*, n.parent)
+    parent.first = id
+    set(&mut doc.*, n.parent, parent)
+  }
+  if n.next != NONE {
+    let mut next = node(&doc.*, n.next)
+    next.previous = id
+    set(&mut doc.*, n.next, next)
+  } else {
+    let mut parent = node(&doc.*, n.parent)
+    parent.last = id
+    set(&mut doc.*, n.parent, parent)
+  }
+  let mut c = node(&doc.*, first)
+  c.previous = NONE
+  set(&mut doc.*, first, c)
+  c = node(&doc.*, last)
+  c.next = NONE
+  set(&mut doc.*, last, c)
+  run List<MarkdownNode>.append(&mut doc.arena, n)
+  return id
+}
+
+effect fn emphasis(p: &mut Parser<'_>, state: &mut Inline, bottom: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut bottoms: [usize; 12] = [0; 12]
+  let threshold = if bottom == NONE {
+    0
+  } else {
+    bottom + 1
+  }
+  let mut current = state.last
+  while current != NONE && List<Delimiter>.get(&state.delimiters, current).previous != bottom {
+    let d = List<Delimiter>.get(&state.delimiters, current)
+    if current < threshold {
+      break
+    }
+    current = d.previous
+  }
+  while current != NONE && current >= threshold {
+    let candidate = List<Delimiter>.get(&state.delimiters, current)
+    if !candidate.canClose {
+      current = candidate.next
+      continue
+    }
+    let mut category: usize = 0
+    if candidate.byte == 95 {
+      category = 6
+    }
+    if candidate.canOpen {
+      category = category + 3
+    }
+    category = category + candidate.original % 3
+    let stop = maximum(bottoms[category], threshold)
+    let mut openerId = candidate.previous
+    let mut found = false
+    while openerId != NONE && openerId >= stop {
+      let opener = List<Delimiter>.get(&state.delimiters, openerId)
+      if opener.canOpen && opener.byte == candidate.byte
+        && (!(candidate.canOpen || opener.canClose)
+          || (opener.original + candidate.original) % 3 != 0
+          || opener.original % 3 == 0 && candidate.original % 3 == 0) {
+        found = true
+        break
+      }
+      openerId = opener.previous
+    }
+    if !found {
+      bottoms[category] = if candidate.previous == NONE {
+        0
+      } else {
+        candidate.previous + 1
+      }
+      let next = candidate.next
+      if !candidate.canOpen {
+        removeDelimiter(&mut state.*, current)
+      }
+      current = next
+      continue
+    }
+    let mut opener = List<Delimiter>.get(&state.delimiters, openerId)
+    let mut closer = candidate
+    let mut count: usize = 1
+    if opener.length >= 2 && closer.length >= 2 {
+      count = 2
+    }
+    let mut opening = node(&p.doc, opener.node)
+    let mut closing = node(&p.doc, closer.node)
+    let first = opening.next
+    let last = closing.previous
+    let mut maxDepth: usize = 0
+    let mut child = first
+    while child != closer.node && child != NONE {
+      let n = node(&p.doc, child)
+      maxDepth = maximum(maxDepth, n.depth)
+      child = n.next
+    }
+    if first == closer.node || maxDepth >= p.options.maxNesting {
+      removeDelimiter(&mut state.*, openerId)
+      current = closer.next
+      continue
+    }
+    let mut kind = MarkdownNodeKind.Emphasis
+    if count == 2 {
+      kind = MarkdownNodeKind.Strong
+    }
+    let span = MarkdownSpan { start: opening.span.end - count, end: closing.span.start + count }
+    drop run wrap(&mut p.doc, first, last, kind, span)
+    opening = node(&p.doc, opener.node)
+    closing = node(&p.doc, closer.node)
+    opening.span.end = opening.span.end - count
+    opening.value.span.end = opening.value.span.end - count
+    closing.span.start = closing.span.start + count
+    closing.value.span.start = closing.value.span.start + count
+    set(&mut p.doc, opener.node, opening)
+    set(&mut p.doc, closer.node, closing)
+    opener.length = opener.length - count
+    closer.length = closer.length - count
+    List<Delimiter>.set(&mut state.delimiters, openerId, opener)
+    List<Delimiter>.set(&mut state.delimiters, current, closer)
+    let mut between = opener.next
+    while between != current && between != NONE {
+      let d = List<Delimiter>.get(&state.delimiters, between)
+      removeDelimiter(&mut state.*, between)
+      between = d.next
+    }
+    if opener.length == 0 {
+      unlink(&mut p.doc, opener.node)
+      removeDelimiter(&mut state.*, openerId)
+    }
+    if closer.length == 0 {
+      let next = closer.next
+      unlink(&mut p.doc, closer.node)
+      removeDelimiter(&mut state.*, current)
+      current = next
+    }
+  }
+  while state.last != bottom && state.last != NONE {
+    let last = state.last
+    removeDelimiter(&mut state.*, last)
+  }
+}
+
+const SPECIAL: [u8; 256] = [
+  1,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  1,
+  0,
+  0,
+  1,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  1,
+  0,
+  0,
+  0,
+  0,
+  1,
+  0,
+  0,
+  0,
+  1,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  1,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  1,
+  1,
+  1,
+  0,
+  1,
+  1,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+]
+
+@inlineAlways
+fn special(c: u8) -> bool {
+  return SPECIAL[u8.toUsize(c)] != 0
+}
+
+fn previousScalar(data: &[u8], pos: usize) -> u32 {
+  if pos == 0 {
+    return 10
+  }
+  let mut i = pos - 1
+  while i > 0 && data[i] >= 128 && data[i] < 192 {
+    i = i - 1
+  }
+  return utf8_scan.decode(data, i).scalar
+}
+
+effect fn tickCache(state: &mut Inline, data: &[u8]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut i: usize = 0
+  while i < data.length {
+    if data[i] != 96 {
+      i = i + 1
+      continue
+    }
+    let start = i
+    while i < data.length && data[i] == 96 {
+      i = i + 1
+    }
+    run List<Backtick>.append(
+      &mut state.ticks,
+      Backtick { start: start, length: i - start, next: NONE, shorter: NONE },
+    )
+  }
+
+  // Each run links to the nearest later run of its length and of one byte less; the shorter link
+  // closes a run whose first backtick is backslash-escaped.
+  let mut index = List<Backtick>.length(&state.ticks)
+  while index > 0 {
+    index = index - 1
+    let mut tick = List<Backtick>.get(&state.ticks, index)
+    if let Option<usize>.Some { value } = HashMap<usize, usize>.get(&state.tickIndex, tick.length) {
+      tick.next = value
+    }
+    if let Option<usize>.Some { value } = HashMap<usize, usize>.get(
+      &state.tickIndex,
+      tick.length - 1,
+    ) {
+      tick.shorter = value
+    }
+    List<Backtick>.set(&mut state.ticks, index, tick)
+    drop run HashMap<usize, usize>.insert(&mut state.tickIndex, tick.length, index)
+  }
+}
+
+fn tickAt(state: &Inline, pos: usize) -> Backtick {
+  let ticks = List<Backtick>.asSlice(&state.ticks)
+  let mut low: usize = 0
+  let mut high = ticks.length
+  while low < high {
+    let mid = low + (high - low) / 2
+    if ticks[mid].start < pos {
+      low = mid + 1
+    } else {
+      high = mid
+    }
+  }
+  if low < ticks.length && ticks[low].start == pos {
+    return ticks[low]
+  }
+
+  // A backslash escape consumed the first backtick of the preceding run.
+  let whole = ticks[low - 1]
+  let length = whole.start + whole.length - pos
+  return Backtick {
+    start: pos,
+    length: length,
+    next: if pos == whole.start + 1 {
+      whole.shorter
+    } else {
+      NONE
+    },
+    shorter: NONE,
+  }
+}
+
+fn autolinkEnd(data: &[u8], pos: usize) -> usize {
+  let mut i = pos + 1
+  let mut colon = NONE
+  let mut email = false
+  while i < data.length && data[i] != 62 {
+    if data[i] <= 32 || data[i] == 60 {
+      return pos
+    }
+    if data[i] == 58 && colon == NONE {
+      colon = i
+    }
+    if data[i] == 64 {
+      email = true
+    }
+    i = i + 1
+  }
+  if i == data.length {
+    return pos
+  }
+  if colon != NONE && colon - pos >= 3 && colon - pos <= 33 && alpha(data[pos + 1]) {
+    let mut j = pos + 2
+    while j < colon {
+      let c = data[j]
+      if !alpha(c) && !(c >= 48 && c <= 57) && c != 43 && c != 45 && c != 46 {
+        return pos
+      }
+      j = j + 1
+    }
+    return i + 1
+  }
+  if email {
+    let mut j = pos + 1
+    while j < i && data[j] != 64 {
+      let c = data[j]
+      if !alpha(c) && !(c >= 48 && c <= 57) && c != 46 && c != 33 && c != 35 && c != 36 && c != 37
+        && c != 38
+        && c != 39
+        && c != 42
+        && c != 43
+        && c != 47
+        && c != 61
+        && c != 63
+        && c != 94
+        && c != 95
+        && c != 96
+        && c != 123
+        && c != 124
+        && c != 125
+        && c != 126
+        && c != 45 {
+        return pos
+      }
+      j = j + 1
+    }
+    if j == pos + 1 || j == i {
+      return pos
+    }
+    j = j + 1
+    while j < i {
+      let start = j
+      if !alpha(data[j]) && !(data[j] >= 48 && data[j] <= 57) {
+        return pos
+      }
+      while j < i && (alpha(data[j]) || data[j] >= 48 && data[j] <= 57 || data[j] == 45) {
+        j = j + 1
+      }
+      if j - start > 63 || data[j - 1] == 45 {
+        return pos
+      }
+      if j < i {
+        if data[j] != 46 {
+          return pos
+        }
+        j = j + 1
+        if j == i {
+          return pos
+        }
+      }
+    }
+    return i + 1
+  }
+  return pos
+}
+
+effect fn inlines(p: &mut Parser<'_>, parent: usize, input: &Input, begin: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let data = Bytes.asSlice(&input.data)
+  let mut end = data.length
+  while end > begin && space(data[end - 1]) {
+    end = end - 1
+  }
+  let mut pos = begin
+  while pos < end && space(data[pos]) {
+    pos = pos + 1
+  }
+  let mut state = Intrinsic.replace(p.inlineState, makeInline())
+  List<Delimiter>.clear(&mut state.delimiters)
+  List<Bracket>.clear(&mut state.brackets)
+  List<Backtick>.clear(&mut state.ticks)
+  HashMap<usize, usize>.clear(&mut state.tickIndex)
+  Bytes.clear(&mut state.normalized)
+  state.last = NONE
+  state.work = usize.saturatingAdd(usize.saturatingMultiply(data.length, 16), 1024)
+  run tickCache(&mut state, bytes(data, 0, end))
+  while pos < end {
+    let start = pos
+    let c = data[pos]
+    if !special(c) {
+      pos = pos + 1
+      while pos < end && !special(data[pos]) {
+        pos = pos + 1
+      }
+
+      // Trailing spaces belong to a line break, not to its preceding Text node.
+      let mut finish = pos
+      if pos < end && (data[pos] == 10 || data[pos] == 13) {
+        while finish > start && (data[finish - 1] == 32 || data[finish - 1] == 9) {
+          finish = finish - 1
+        }
+      }
+      if finish > start {
+        drop run appendText(&mut p.doc, input, parent, start, finish)
+      }
+      continue
+    }
+    if c == 0 || c == 38 || c == 92 && pos + 1 < end && punctuation(data[pos + 1]) {
+      let mut finish = pos + 1
+      let mut replacement: string = ""
+      let found = entity(data, pos)
+      if c == 38 && found.end > pos {
+        finish = found.end
+        replacement = found.named
+      } else if c == 92 {
+        finish = pos + 2
+      }
+      if c == 38 && found.end == pos {
+        drop run appendText(&mut p.doc, input, parent, pos, finish)
+      } else {
+        let valueStart = Bytes.length(&p.doc.storage)
+        if c == 0 {
+          run scalar(&mut p.doc.storage, 0xfffd)
+        } else if c == 92 {
+          run Bytes.append(&mut p.doc.storage, bytes(data, pos + 1, finish))
+        } else if String.byteLength(replacement) != 0 {
+          run Bytes.append(&mut p.doc.storage, String.utf8Bytes(replacement))
+        } else {
+          run scalar(&mut p.doc.storage, found.scalar)
+        }
+        let value = TextRange {
+          span: MarkdownSpan { start: valueStart, end: Bytes.length(&p.doc.storage) },
+          side: true,
+        }
+        drop run appendRange(&mut p.doc, parent, value, inputSpan(input, pos, finish))
+      }
+      pos = finish
+      continue
+    }
+    if c == 10 || c == 13
+      || c == 92 && pos + 1 < end && (data[pos + 1] == 10 || data[pos + 1] == 13) {
+      let mut kind = MarkdownNodeKind.SoftBreak
+      let mut spanStart = pos
+      if c == 92 {
+        kind = MarkdownNodeKind.HardBreak
+        pos = pos + 1
+      } else {
+        let mut spaces = pos
+        while spaces > begin && data[spaces - 1] == 32 {
+          spaces = spaces - 1
+        }
+        if pos - spaces >= 2 {
+          kind = MarkdownNodeKind.HardBreak
+          spanStart = spaces
+        }
+      }
+      if data[pos] == 13 && pos + 1 < end && data[pos + 1] == 10 {
+        pos = pos + 1
+      }
+      pos = pos + 1
+      let id = run add(&mut p.doc, parent, kind, position(input, spanStart, false))
+      let mut n = node(&p.doc, id)
+      n.span = inputSpan(input, spanStart, pos)
+      n.depth = 0
+      set(&mut p.doc, id, n)
+      while pos < end && (data[pos] == 32 || data[pos] == 9) {
+        pos = pos + 1
+      }
+      continue
+    }
+    if c == 96 {
+      let tick = tickAt(&state, pos)
+      pos = pos + tick.length
+      if tick.next == NONE {
+        drop run appendText(&mut p.doc, input, parent, start, pos)
+        continue
+      }
+      let closing = List<Backtick>.get(&state.ticks, tick.next)
+      let valueStart = Bytes.length(&p.doc.storage)
+      run decodeInto(&mut p.doc.storage, bytes(data, pos, closing.start), false, true)
+      let mut valueEnd = Bytes.length(&p.doc.storage)
+      let mut valueBegin = valueStart
+      let valueBytes = Bytes.asSlice(&p.doc.storage)
+      if valueEnd > valueBegin + 1 && valueBytes[valueBegin] == 32
+        && valueBytes[valueEnd - 1] == 32 {
+        let mut allSpaces = true
+        let mut i = valueBegin
+        while i < valueEnd {
+          if valueBytes[i] != 32 {
+            allSpaces = false
+            break
+          }
+          i = i + 1
+        }
+        if !allSpaces {
+          valueBegin = valueBegin + 1
+          valueEnd = valueEnd - 1
+        }
+      }
+      drop valueBytes
+      let mut value = TextRange {
+        span: MarkdownSpan { start: valueBegin, end: valueEnd },
+        side: true,
+      }
+
+      // Preserve a view when normalization and trimming do not change the code content.
+      let trimStart = pos + valueBegin - valueStart
+      let trimEnd = closing.start - (Bytes.length(&p.doc.storage) - valueEnd)
+      let original = bytes(data, trimStart, trimEnd)
+      if same(original, bytes(Bytes.asSlice(&p.doc.storage), valueBegin, valueEnd)) {
+        Bytes.truncate(&mut p.doc.storage, valueStart)
+        value = run inputText(&mut p.doc, input, trimStart, trimEnd)
+      }
+      pos = closing.start + closing.length
+      let id = run add(&mut p.doc, parent, MarkdownNodeKind.Code, position(input, start, false))
+      let mut n = node(&p.doc, id)
+      n.span = inputSpan(input, start, pos)
+      n.value = value
+      n.depth = 0
+      set(&mut p.doc, id, n)
+      continue
+    }
+    if c == 42 || c == 95 {
+      while pos < end && data[pos] == c {
+        pos = pos + 1
+      }
+      let before = previousScalar(data, start)
+      let after = if pos < end {
+        utf8_scan.decode(data, pos).scalar
+      } else {
+        10
+      }
+      let left = !whiteScalar(after)
+        && (!punctScalar(after) || whiteScalar(before) || punctScalar(before))
+      let right = !whiteScalar(before)
+        && (!punctScalar(before) || whiteScalar(after) || punctScalar(after))
+      let canOpen = left && (c == 42 || !right || punctScalar(before))
+      let canClose = right && (c == 42 || !left || punctScalar(after))
+      let id = run textNode(&mut p.doc, input, parent, start, pos)
+      if canOpen || canClose {
+        let index = List<Delimiter>.length(&state.delimiters)
+        if state.last != NONE {
+          let mut last = List<Delimiter>.get(&state.delimiters, state.last)
+          last.next = index
+          List<Delimiter>.set(&mut state.delimiters, state.last, last)
+        }
+        run List<Delimiter>.append(
+          &mut state.delimiters,
+          Delimiter {
+            node: id,
+            byte: c,
+            length: pos - start,
+            original: pos - start,
+            canOpen: canOpen,
+            canClose: canClose,
+            previous: state.last,
+            next: NONE,
+            active: true,
+          },
+        )
+        state.last = index
+      }
+      continue
+    }
+    if c == 91 || c == 33 && pos + 1 < end && data[pos + 1] == 91 {
+      let image = c == 33
+      pos = pos + 1
+      if image {
+        pos = pos + 1
+      }
+      let id = run textNode(&mut p.doc, input, parent, start, pos)
+      let length = List<Bracket>.length(&state.brackets)
+      if length > 0 {
+        let mut last = List<Bracket>.get(&state.brackets, length - 1)
+        last.after = true
+        List<Bracket>.set(&mut state.brackets, length - 1, last)
+      }
+      run List<Bracket>.append(
+        &mut state.brackets,
+        Bracket {
+          node: id,
+          position: start,
+          image: image,
+          delimiter: state.last,
+          active: true,
+          after: false,
+        },
+      )
+      continue
+    }
+    if c == 93 && List<Bracket>.length(&state.brackets) > 0 {
+      let bracket = match List<Bracket>.pop(&mut state.brackets) {
+        Option<Bracket>.Some { value } => value
+        _ => {
+          pos = pos + 1
+          continue
+        }
+      }
+      let mut parts = LinkParts {
+        end: pos,
+        destinationStart: 0,
+        destinationEnd: 0,
+        titleStart: 0,
+        titleEnd: 0,
+        hasTitle: false,
+      }
+      let mut reference = NONE
+      let labelStart = bracket.position
+        + if bracket.image {
+          usize.toUsize(2)
+        } else {
+          usize.toUsize(1)
+        }
+      let mut labelEnd = pos
+      let mut explicit = false
+      if bracket.active && state.work > 0
+        && List<Bracket>.length(&state.brackets) < p.options.maxNesting {
+        if pos + 1 < end && data[pos + 1] == 40 {
+          parts = linkParts(bytes(data, 0, end), pos + 2, false, &mut state.work)
+        }
+        if parts.end == pos || parts.end == pos + 2 {
+          parts.end = pos
+          let mut begin = labelStart
+          if pos + 1 < end && data[pos + 1] == 91 {
+            let i = labelClose(bytes(data, 0, end), pos + 2)
+            if i != NONE {
+              explicit = true
+              parts.end = i + 1
+              if i != pos + 2 {
+                begin = pos + 2
+                labelEnd = i
+              }
+            }
+          }
+          if (explicit || !bracket.after) && labelFits(bytes(data, begin, labelEnd)) {
+            run normalizeLabel(&mut state.normalized, bytes(data, begin, labelEnd))
+            reference = findReference(&p.*, Bytes.asSlice(&state.normalized))
+            if reference != NONE {
+              let entry = List<Reference>.get(&p.references, reference)
+              let expansion = entry.destination.span.end - entry.destination.span.start
+                + entry.title.span.end
+                - entry.title.span.start
+              if expansion > p.referenceWork {
+                reference = NONE
+              } else {
+                p.referenceWork = p.referenceWork - expansion
+              }
+            }
+            if reference != NONE && !explicit {
+              parts.end = pos + 1
+            }
+          }
+          if reference == NONE {
+            parts.end = pos
+          }
+        }
+      }
+      if parts.end > pos {
+        run emphasis(&mut p.*, &mut state, bracket.delimiter)
+        let opening = node(&p.doc, bracket.node)
+        let first = opening.next
+        let last = node(&p.doc, parent).last
+        let mut child = first
+        let mut depth: usize = 0
+        while child != NONE {
+          let n = node(&p.doc, child)
+          depth = maximum(depth, n.depth)
+          child = n.next
+        }
+        if depth >= p.options.maxNesting {
+          pos = pos + 1
+          drop run appendText(&mut p.doc, input, parent, start, pos)
+          continue
+        }
+        let mut kind = MarkdownNodeKind.Link
+        if bracket.image {
+          kind = MarkdownNodeKind.Image
+        }
+        let span = inputSpan(input, bracket.position, parts.end)
+        let mut id: usize = NONE
+        if first != NONE {
+          id = run wrap(&mut p.doc, first, last, kind, span)
+          unlink(&mut p.doc, bracket.node)
+        } else {
+          id = bracket.node
+          let mut n = opening
+          n.kind = kind
+          n.value = emptyText()
+          n.span = span
+          n.depth = 1
+          set(&mut p.doc, id, n)
+        }
+        let mut target = emptyText()
+        let mut title = emptyText()
+        let mut hasTitle = parts.hasTitle
+        if reference != NONE {
+          let entry = List<Reference>.get(&p.references, reference)
+          target = entry.destination
+          title = entry.title
+          hasTitle = entry.hasTitle
+        } else {
+          target = run decodedInput(&mut p.doc, input, parts.destinationStart, parts.destinationEnd)
+          if parts.hasTitle {
+            title = run decodedInput(&mut p.doc, input, parts.titleStart, parts.titleEnd)
+          }
+        }
+        let mut n = node(&p.doc, id)
+        n.target = target
+        n.extra = title
+        n.hasTitle = hasTitle
+        set(&mut p.doc, id, n)
+        if !bracket.image {
+          let brackets = List<Bracket>.asMutSlice(&mut state.brackets)
+          let mut i = brackets.length
+          while i > 0 {
+            i = i - 1
+            if !brackets[i].active {
+              break
+            }
+            if !brackets[i].image {
+              brackets[i].active = false
+            }
+          }
+        }
+        pos = parts.end
+        continue
+      }
+      pos = pos + 1
+      drop run appendText(&mut p.doc, input, parent, start, pos)
+      continue
+    }
+    if c == 60 && state.work > 0 {
+      let finish = autolinkEnd(bytes(data, 0, end), pos)
+      if finish > pos && p.options.maxNesting > 0 {
+        let targetStart = pos + 1
+        let targetEnd = finish - 1
+        let targetBytes = bytes(data, targetStart, targetEnd)
+        let mut email = true
+        let mut i: usize = 0
+        while i < targetBytes.length {
+          if targetBytes[i] == 58 {
+            email = false
+            break
+          }
+          i = i + 1
+        }
+        let mut target = run inputText(&mut p.doc, input, targetStart, targetEnd)
+        if email {
+          let begin = Bytes.length(&p.doc.storage)
+          run Bytes.append(&mut p.doc.storage, b"mailto:")
+          run Bytes.append(&mut p.doc.storage, targetBytes)
+          target = TextRange {
+            span: MarkdownSpan { start: begin, end: Bytes.length(&p.doc.storage) },
+            side: true,
+          }
+        }
+        let id = run add(&mut p.doc, parent, MarkdownNodeKind.Link, position(input, start, false))
+        let mut n = node(&p.doc, id)
+        n.span = inputSpan(input, start, finish)
+        n.target = target
+        n.depth = 1
+        set(&mut p.doc, id, n)
+        drop run textNode(&mut p.doc, input, id, targetStart, targetEnd)
+        pos = finish
+        continue
+      }
+      if state.work > 0 {
+        let finish = htmlEnd(bytes(data, 0, end), pos, &mut state.work)
+        if finish > pos {
+          let value = run literalInput(&mut p.doc, input, pos, finish)
+          let id = run add(
+            &mut p.doc,
+            parent,
+            MarkdownNodeKind.HtmlInline,
+            position(input, start, false),
+          )
+          let mut n = node(&p.doc, id)
+          n.span = inputSpan(input, start, finish)
+          n.value = value
+          n.depth = 0
+          set(&mut p.doc, id, n)
+          pos = finish
+          continue
+        }
+      }
+    }
+    pos = pos + 1
+    drop run appendText(&mut p.doc, input, parent, start, pos)
+  }
+  run emphasis(&mut p.*, &mut state, NONE)
+  p.inlineState = move state
+}
+
+fn coalesce(doc: &mut MarkdownDocument<'_>) {
+  let mut parent: usize = 0
+  while parent < List<MarkdownNode>.length(&doc.arena) {
+    let mut id = node(&doc.*, parent).first
+    while id != NONE {
+      let mut n = node(&doc.*, id)
+      if n.kind == MarkdownNodeKind.Text {
+        while n.next != NONE {
+          let next = node(&doc.*, n.next)
+          if next.kind != MarkdownNodeKind.Text || n.value.side != next.value.side
+            || n.value.span.end != next.value.span.start {
+            break
+          }
+          let removed = n.next
+          n.value.span.end = next.value.span.end
+          n.span.end = next.span.end
+          unlink(&mut doc.*, removed)
+          n.next = node(&doc.*, id).next
+          set(&mut doc.*, id, n)
+        }
+      }
+      id = n.next
+    }
+    parent = parent + 1
+  }
+}
+
+fn preorderNext(doc: &MarkdownDocument<'_>, id: usize) -> usize {
+  let n = node(doc, id)
+  if n.first != NONE {
+    return n.first
+  }
+  let mut index = id
+  while index != NONE {
+    let n = node(doc, index)
+    if n.next != NONE {
+      return n.next
+    }
+    index = n.parent
+  }
+  return NONE
+}
+
+fn remap(mapping: &[usize], index: usize) -> usize {
+  if index == NONE {
+    return NONE
+  }
+  return mapping[index]
+}
+
+effect fn compact(doc: &mut MarkdownDocument<'_>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  coalesce(&mut doc.*)
+  let count = List<MarkdownNode>.length(&doc.arena)
+  let mut mapping = List<usize>.make()
+  run List<usize>.appendRepeated(&mut mapping, NONE, count)
+  let mut arena = run List<MarkdownNode>.makeWithCapacity(count)
+  let mut id: usize = 0
+  while id != NONE {
+    List<usize>.set(&mut mapping, id, List<MarkdownNode>.length(&arena))
+    run List<MarkdownNode>.append(&mut arena, node(&doc.*, id))
+    id = preorderNext(&doc.*, id)
+  }
+  let map = List<usize>.asSlice(&mapping)
+  let nodes = List<MarkdownNode>.asMutSlice(&mut arena)
+  let mut i: usize = 0
+  while i < nodes.length {
+    nodes[i].parent = remap(map, nodes[i].parent)
+    nodes[i].first = remap(map, nodes[i].first)
+    nodes[i].last = remap(map, nodes[i].last)
+    nodes[i].next = remap(map, nodes[i].next)
+    nodes[i].previous = remap(map, nodes[i].previous)
+    i = i + 1
+  }
+  doc.arena = move arena
+}
+
+effect fn parseDocument<'a>(value: string<'a>, options: &MarkdownOptions) -> MarkdownDocument<'a>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let data = String.utf8Bytes(value)
+  let mut p = Parser<'a> {
+    doc: MarkdownDocument<'a> {
+      source: value,
+      storage: Bytes.make(),
+      arena: run List<MarkdownNode>.makeWithCapacity(data.length / 24 + 1),
+    },
+    chunks: List<Chunk>.make(),
+    open: List<usize>.make(),
+    references: List<Reference>.make(),
+    referenceIndex: HashMap<u64, usize>.make(Hash.seed(0)),
+    options: options.*,
+    referenceWork: usize.saturatingAdd(usize.saturatingMultiply(data.length, 16), 65536),
+    input: makeInput(),
+    inlineState: makeInline(),
+    labelBuffer: Bytes.make(),
+  }
+  drop run add(&mut p.doc, NONE, MarkdownNodeKind.Document, 0)
+  run List<usize>.append(&mut p.open, 0)
+  let mut pos: usize = 0
+  while pos < data.length {
+    let end = match byte_search.find2(bytes(data, pos, data.length), 10, 13) {
+      Option<usize>.Some { value: found } => pos + found
+      _ => data.length
+    }
+    let mut after = end
+    if after < data.length && data[after] == 13 {
+      after = after + 1
+    }
+    if after < data.length && data[after] == 10 {
+      after = after + 1
+    }
+    let line = Line { start: pos, end: end, after: after }
+    run blockLine(&mut p, &line)
+    let open = List<usize>.asSlice(&p.open)
+    let mut i: usize = 0
+    while i < open.length {
+      let mut n = node(&p.doc, open[i])
+      n.span.end = after
+      set(&mut p.doc, open[i], n)
+      i = i + 1
+    }
+    pos = after
+  }
+  closeTo(&mut p, 1)
+  let blocks = List<MarkdownNode>.length(&p.doc.arena)
+  let mut id: usize = 1
+
+  // Extract every definition before any inline leaf resolves reference links.
+  while id < blocks {
+    let n = node(&p.doc, id)
+    if n.kind == MarkdownNodeKind.Paragraph {
+      let previous = Intrinsic.replace(p.input, makeInput())
+      let input = run gather(&p, id, move previous)
+      let consumed = run referenceDefinitions(&mut p, &input)
+      let mut n = node(&p.doc, id)
+      n.fenceLength = consumed
+      if consumed < Bytes.length(&input.data) {
+        n.span.start = position(&input, consumed, false)
+      }
+      set(&mut p.doc, id, n)
+      if consumed == Bytes.length(&input.data) {
+        unlink(&mut p.doc, id)
+      }
+      p.input = move input
+    }
+    id = id + 1
+  }
+  id = 1
+  while id < blocks {
+    let mut n = node(&p.doc, id)
+    if n.kind == MarkdownNodeKind.Paragraph || n.kind == MarkdownNodeKind.Heading {
+      if n.parent != NONE {
+        let previous = Intrinsic.replace(p.input, makeInput())
+        let input = run gather(&p, id, move previous)
+        run inlines(&mut p, id, &input, n.fenceLength)
+        p.input = move input
+      }
+    } else if n.kind == MarkdownNodeKind.CodeBlock || n.kind == MarkdownNodeKind.HtmlBlock {
+      let previous = Intrinsic.replace(p.input, makeInput())
+      let input = run gather(&p, id, move previous)
+      let raw = Bytes.asSlice(&input.data)
+      let mut end = raw.length
+      if n.kind == MarkdownNodeKind.CodeBlock && !n.fenced {
+        // Remove blank lines at the end of an indented block, retaining its final content newline.
+        let mut lastContent: usize = 0
+        let mut i: usize = 0
+        while i < end {
+          let line = i
+          while i < end && raw[i] != 10 && raw[i] != 13 {
+            i = i + 1
+          }
+          let mut content = line
+          while content < i && (raw[content] == 32 || raw[content] == 9) {
+            content = content + 1
+          }
+          let nonblank = content < i
+          if i < end && raw[i] == 13 {
+            i = i + 1
+          }
+          if i < end && raw[i] == 10 {
+            i = i + 1
+          }
+          if nonblank {
+            lastContent = i
+          }
+        }
+        end = lastContent
+      }
+      let begin = Bytes.length(&p.doc.storage)
+      run decodeInto(&mut p.doc.storage, bytes(raw, 0, end), false, false)
+      if n.kind == MarkdownNodeKind.CodeBlock && end > 0 && raw[end - 1] != 10
+        && raw[end - 1] != 13 {
+        run Bytes.append(&mut p.doc.storage, b"\n")
+      }
+      let finish = Bytes.length(&p.doc.storage)
+      n.value = TextRange { span: MarkdownSpan { start: begin, end: finish }, side: true }
+      if same(bytes(raw, 0, end), bytes(Bytes.asSlice(&p.doc.storage), begin, finish)) {
+        Bytes.truncate(&mut p.doc.storage, begin)
+        n.value = run inputText(&mut p.doc, &input, 0, end)
+      }
+      set(&mut p.doc, id, n)
+      p.input = move input
+    }
+    id = id + 1
+  }
+  run compact(&mut p.doc)
+  return move p.doc
+}
+
+fn minimum(a: usize, b: usize) -> usize {
+  if a < b {
+    return a
+  }
+  return b
+}
+
+fn maximum(a: usize, b: usize) -> usize {
+  if a > b {
+    return a
+  }
+  return b
+}
+
+fn closeLast(p: &mut Parser<'_>) {
+  let length = List<usize>.length(&p.open)
+  closeTo(&mut p.*, length - 1)
+}
+
+fn beforeBlock(p: &mut Parser<'_>, parent: usize) {
+  let mut n = node(&p.doc, parent)
+  if n.blank && n.first != NONE {
+    let mut ancestor = parent
+    while ancestor != NONE {
+      let mut container = node(&p.doc, ancestor)
+      if container.kind == MarkdownNodeKind.List {
+        container.tight = false
+        set(&mut p.doc, ancestor, container)
+        break
+      }
+      ancestor = container.parent
+    }
+  }
+  n.blank = false
+  set(&mut p.doc, parent, n)
+}
+
+fn makeInput() -> Input {
+  return Input { data: Bytes.make(), pieces: List<Piece>.make() }
+}
+
+fn makeInline() -> Inline {
+  return Inline {
+    delimiters: List<Delimiter>.make(),
+    last: NONE,
+    brackets: List<Bracket>.make(),
+    ticks: List<Backtick>.make(),
+    tickIndex: HashMap<usize, usize>.make(Hash.seed(0)),
+    normalized: Bytes.make(),
+    work: 0,
+  }
+}
+
+// Link labels are limited in Unicode characters, not UTF-8 bytes. Escapes retain both source characters.
+fn labelClose(data: &[u8], start: usize) -> usize {
+  let mut pos = start
+  let mut count: usize = 0
+  while pos < data.length {
+    let c = data[pos]
+    if c == 93 {
+      return pos
+    }
+    if c == 91 || count >= 999 {
+      return NONE
+    }
+    if c == 92 && pos + 1 < data.length && punctuation(data[pos + 1]) {
+      pos = pos + 2
+      count = count + 2
+      if count > 999 {
+        return NONE
+      }
+    } else {
+      pos = utf8_scan.decode(data, pos).next
+      count = count + 1
+    }
+  }
+  return NONE
+}
+
+fn labelFits(data: &[u8]) -> bool {
+  if data.length <= 999 {
+    return true
+  }
+  let mut pos: usize = 0
+  let mut count: usize = 0
+  while pos < data.length && count < 999 {
+    pos = utf8_scan.decode(data, pos).next
+    count = count + 1
+  }
+  return pos == data.length
+}
+
+effect fn appendText(
+  doc: &mut MarkdownDocument<'_>,
+  input: &Input,
+  parent: usize,
+  start: usize,
+  end: usize,
+) -> usize
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let value = run inputText(&mut doc.*, input, start, end)
+  return run appendRange(&mut doc.*, parent, value, inputSpan(input, start, end))
+}
+
+effect fn appendRange(
+  doc: &mut MarkdownDocument<'_>,
+  parent: usize,
+  value: TextRange,
+  span: MarkdownSpan,
+) -> usize
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let last = node(&doc.*, parent).last
+  if last != NONE {
+    let mut n = node(&doc.*, last)
+    if n.kind == MarkdownNodeKind.Text && n.marker == 0 && n.value.side == value.side
+      && n.value.span.end == value.span.start
+      && n.span.end == span.start {
+      n.value.span.end = value.span.end
+      n.span.end = span.end
+      set(&mut doc.*, last, n)
+      return last
+    }
+  }
+  let id = run add(&mut doc.*, parent, MarkdownNodeKind.Text, span.start)
+  let mut n = node(&doc.*, id)
+  n.value = value
+  n.span = span
+  n.depth = 0
+  set(&mut doc.*, id, n)
+  return id
+}
+
+effect fn literalInput(
+  doc: &mut MarkdownDocument<'_>,
+  input: &Input,
+  start: usize,
+  end: usize,
+) -> TextRange
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let data = bytes(Bytes.asSlice(&input.data), start, end)
+  let mut i: usize = 0
+  while i < data.length && data[i] != 0 && data[i] != 13 {
+    i = i + 1
+  }
+  if i == data.length {
+    return run inputText(&mut doc.*, input, start, end)
+  }
+  let begin = Bytes.length(&doc.storage)
+  run decodeInto(&mut doc.storage, data, false, false)
+  return TextRange {
+    span: MarkdownSpan { start: begin, end: Bytes.length(&doc.storage) },
+    side: true,
+  }
+}
