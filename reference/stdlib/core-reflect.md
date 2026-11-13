@@ -336,8 +336,13 @@ type has a kind, so a generic function can branch on the kind of its type parame
 pub static fn typeName<Owner>() -> string<'static>
 ```
 
-Returns the declared name of `Owner` with its type arguments and without module paths, such as
-`Server` or `Page<String>`.
+Returns the name of `Owner` as a program writes it, with its type arguments and without module
+paths, such as `Server` or `Page<String>`.
+
+#### Details
+
+Lifetimes other than `'static` are elided, as in `&u32`. A function passed as a value is named
+by the contract it satisfies, such as `fn(&u32) -> bool`.
 
 #### When to use
 

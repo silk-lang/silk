@@ -473,11 +473,16 @@ callable parameter, but an unsafe callable cannot satisfy a safe one. Partial ap
 the qualifier until the final invocation; constructing the section itself does not acknowledge the
 eventual call. A struct field whose type is a callable contract, such as `f: fn(i32) -> i32`, names
 no function and cannot store one; the struct takes a type parameter bounded by the contract instead,
-as in `struct Handler<F: fn<'static>(i32) -> i32> { f: F }`.
+as in `struct Handler<F: fn<'static>(i32) -> i32> { f: F }`. A parameter typed by a type argument
+written as a callable contract, as in `keep<fn(i32) -> i32>(increment)`, is refused the same way;
+leaving the type argument out lets the call infer the exact callable. A `let` annotated with a
+callable contract keeps the exact callable and fixes the type parameters a generic function leaves
+open, so `let identity: fn(i32) -> i32 = same` names `same` at `i32`.
 
 **Diagnostics:** Applying a non-callable reports `SEM0075`. An incompatible callable parameter,
 result, or mode reports `SEM0076`. A context that would erase a required concrete callable identity
-reports `SEM0080` or the more specific represented-storage diagnostic.
+reports `SEM0080` or the more specific represented-storage diagnostic. A parameter whose type
+argument is a callable contract reports `SEM0018`.
 
 **Evidence:** callable specification,
 indirect-call tests,
