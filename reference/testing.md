@@ -11,8 +11,6 @@ runner owns filtering, invocation, reporting, and exit policy.
 - The **discovery root** is the project source file whose active import graph defines the candidate
   test modules.
 - A **test descriptor** is a sealed static value issued by the compiler for one discovered test.
-- An **authored fingerprint** identifies the canonical authored header and body of one test. It is
-  content metadata, not a reusable test result.
 - A **runner record** lists every file the build of the bundled runner read, so a later run can
   tell whether the runner it built is still current.
 - The **bundled runner** is ordinary Silk source used as the executable entry for `silk test`.
@@ -103,15 +101,15 @@ assuming a root or returning an empty catalog.
 
 `Intrinsic.tests()` produces a finite heterogeneous static catalog. Each
 `Intrinsic.Test<F>` descriptor represents one discovered declaration and retains that test's exact
-callable type `F`. `Intrinsic.testInfo(descriptor)` produces immutable identity, name, module,
-logical project-relative path, and fingerprint metadata.
+callable type `F`. `Intrinsic.testInfo(descriptor)` produces immutable identity, name, module, and
+logical project-relative path metadata.
 `Intrinsic.testFunction(descriptor)` crosses the static boundary once and produces the exact
 ordinary runtime callable.
 
-Descriptors and their metadata carry no source line or column. Moving a test, or editing text
-around it, therefore leaves the catalog and every runner specialization over it unchanged; only an
-edit to the test's own declaration changes its fingerprint (TEST-005). A tool that shows where a
-test is declared resolves the test's identity against the current source.
+Descriptors and their metadata carry no source line or column and nothing of a test's body. Moving
+a test, or editing text around it or inside it, therefore leaves the catalog and every runner
+specialization over it unchanged (TEST-005). A tool that shows where a test is declared resolves the
+test's identity against the current source.
 
 The descriptor authorizes callable extraction for its marked test, including a private test. It
 does not authorize ordinary access to that declaration or another private declaration. Static
@@ -128,27 +126,25 @@ module selection report static-phase diagnostics and publish no partial executab
 **Evidence:** test catalog and callable requirements,
 [static evaluation](static-evaluation.md).
 
-### TEST-005 — A fingerprint covers only the test's authored declaration
+### TEST-005 — A descriptor names its test by declaration
 
 **Status:** Confirmed
 
-Each descriptor reports a versioned SHA-256 fingerprint over the canonical authored header and
-body of that test. Comments, whitespace, source offsets, physical paths, unrelated pool numbering,
-and moving unchanged source do not affect it. Editing the test's contract or body does.
+A descriptor is determined by its test's declaration alone: its exact callable type `F` names the
+declaration, and `Intrinsic.testInfo` reads nothing else. The catalog is determined by which tests
+the discovered modules declare, in catalog order. Discovery reads each module's imports and the
+headers of its tests, never a body.
 
-The fingerprint excludes called function implementations, resolved external meanings, providers,
-targets, profiles, compiler and runner versions, files, environment, time, and network state. If a
-test calls `parse`, editing only `parse` may change the test result while leaving the test's
-fingerprint unchanged.
+So editing a test's body, or any function it calls, changes no descriptor and no catalog. Adding,
+removing or renaming a test changes the catalog, and so the runner's loops over it, but leaves the
+descriptor of every other test, and the runner specialization for it, unchanged.
 
-**Boundary:** The authored fingerprint is never cache authority. `silk test` reuses a passing run
-only as a whole (TEST-008), and it decides whether a built runner is current from every file the
-build read (TEST-009), not from fingerprints.
+**Boundary:** A descriptor is not a test result. Whether a test runs again is decided from what it
+executed and read (TEST-008), not from its descriptor.
 
-**Diagnostics:** No diagnostic applies to observing a fingerprint. Treating it as cache authority
-has no language support.
+**Diagnostics:** None.
 
-**Evidence:** authored fingerprint requirements.
+**Evidence:** test discovery requirements.
 
 ## Running tests
 
