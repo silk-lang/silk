@@ -4843,6 +4843,96 @@ const program = Effect.gen(function* () {
   const checkedBroken = yield* invoke(silk, ['check', '--workspace', '--stdlib', standardLibrary], shared, inProcesses)
   assert.equal(checkedBroken.status, 1, checkedBroken.stderr)
   assert.match(checkedBroken.stdout + checkedBroken.stderr, /Failed 1 of 2 packages/)
+  // A program checked for the first time starts its walk from the one a sibling program left in
+  // the cache: it lowers what it alone reaches and still reports what only it reaches. A workspace
+  // check lets one program finish before the others start, so they find its walk.
+  const siblings = join(directory, 'siblings')
+  yield* fs.makeDirectory(join(siblings, 'spec/src'), { recursive: true })
+  yield* fs.writeFileString(join(siblings, 'silk.toml'), '[workspace]\nmembers = ["spec", "one", "two"]\n')
+  yield* fs.writeFileString(
+    join(siblings, 'spec/silk.toml'),
+    '[package]\nname = "spec"\nversion = "0.1.0"\nkind = "library"\nexports = ["lib"]\n',
+  )
+  yield* fs.writeFileString(
+    join(siblings, 'spec/src/lib.silk'),
+    [
+      'import silk.collections.list { List }',
+      'import silk.mem.allocator { Allocator, OutOfMemoryError }',
+      '',
+      'pub fn sized(static n: i64) -> i64 {',
+      '  static if n > 3 { compileError("size too big") }',
+      '  return n',
+      '}',
+      '',
+      'pub effect fn kept<T>(value: T) -> usize ! OutOfMemoryError ? &mut Allocator {',
+      '  let mut values = List<T>.make()',
+      '  run List<T>.append(&mut values, move value)',
+      '  return List<T>.length(&values)',
+      '}',
+      '',
+    ].join('\n'),
+  )
+  const siblingMain = (size: number) =>
+    [
+      'import silk.core.effect { Effect }',
+      'import silk.mem.allocator { Allocator, OutOfMemoryError }',
+      'import silk.num.usize',
+      'import spec.lib { sized, kept }',
+      '',
+      'pub effect fn main() -> i32 ! OutOfMemoryError {',
+      '  let mut system = Allocator.systemAllocatorProvider()',
+      `  let count = run kept<i64>(sized(${size})) |> Effect.provideMut<Allocator>(&mut system)`,
+      '  if count != usize.ONE { return 1 }',
+      '  return 0',
+      '}',
+      '',
+    ].join('\n')
+  for (const member of ['one', 'two']) {
+    yield* fs.makeDirectory(join(siblings, member, 'src'), { recursive: true })
+    yield* fs.writeFileString(
+      join(siblings, member, 'silk.toml'),
+      `[package]\nname = "${member}"\nversion = "0.1.0"\n\n[dependencies]\nspec = { path = "../spec" }\n`,
+    )
+    yield* fs.writeFileString(join(siblings, member, 'src/main.silk'), siblingMain(member === 'one' ? 1 : 2))
+  }
+  // How many bodies each member's check ran, by member name, from its `--timings` rows.
+  const bodyRuns = (report: string) => {
+    const runs = new Map<string, number>()
+    for (const section of report.split(/^Checking /m).slice(1)) {
+      const row = /^\s+\S+\s+\S+\s+([\d,]+)\s+Body$/m.exec(section)
+      runs.set(section.slice(0, section.indexOf(' ')), row === null ? 0 : Number(row[1].replaceAll(',', '')))
+    }
+    return runs
+  }
+  const checkSiblings = Effect.fnUntraced(function* (selection: ReadonlyArray<string>, environment: typeof splitEnvironment) {
+    const checked = yield* invoke(silk, ['check', '--no-server', '--stdlib', standardLibrary, '--timings', ...selection], siblings, environment)
+    return { status: checked.status, report: checked.stdout + checked.stderr }
+  })
+  const coldTwo = yield* checkSiblings(['--package', 'two'], splitEnvironment)
+  assert.equal(coldTwo.status, 0, coldTwo.report)
+  const coldRuns = bodyRuns(coldTwo.report).get('two') ?? 0
+  yield* fs.remove(join(siblings, 'build'), { recursive: true })
+  const firstOne = yield* checkSiblings(['--package', 'one'], splitEnvironment)
+  assert.equal(firstOne.status, 0, firstOne.report)
+  yield* fs.writeFileString(join(siblings, 'two/src/main.silk'), siblingMain(5))
+  const refusedTwo = yield* checkSiblings(['--package', 'two'], splitEnvironment)
+  assert.equal(refusedTwo.status, 1, refusedTwo.report)
+  assert.match(refusedTwo.report, /^two\/src\/main\.silk:8:\d+: error\[SEM0177\] size too big$/m)
+  yield* fs.writeFileString(join(siblings, 'two/src/main.silk'), siblingMain(2))
+  yield* fs.remove(join(siblings, 'build/cache/two'), { recursive: true })
+  const afterOne = yield* checkSiblings(['--package', 'two'], splitEnvironment)
+  assert.equal(afterOne.status, 0, afterOne.report)
+  const afterRuns = bodyRuns(afterOne.report).get('two') ?? 0
+  assert.ok(afterRuns * 3 < coldRuns, `after its sibling the program ran ${afterRuns} bodies, and ${coldRuns} alone`)
+  for (const environment of [splitEnvironment, { ...splitEnvironment, SILK_MEMBER_PROCESSES: '1' }]) {
+    yield* fs.remove(join(siblings, 'build'), { recursive: true })
+    const together = yield* checkSiblings(['--workspace'], environment)
+    assert.equal(together.status, 0, together.report)
+    const runs = bodyRuns(together.report)
+    const first = runs.get('one') ?? 0
+    const second = runs.get('two') ?? 0
+    assert.ok(second * 3 < first, `checked together, the second program ran ${second} bodies beside the first one's ${first}`)
+  }
   // Each unit carries line tables made from the lines its location markers name, so a function
   // that moves recompiles its unit alone, and the unit's rows name the lines it moved to.
   const rowLines = Effect.fnUntraced(function* (object: string) {
