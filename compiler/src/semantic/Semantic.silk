@@ -101050,8 +101050,11 @@ impl Semantic {
               let functions = List<MirFunction>.asSlice(&self.resolver.mirValues)
               let forwards = List<usize>.get(&selection.bodies, framed) != usize.MAX
               let selecting = run selectingDigest(&functions[unframed], &instance, forwards, entrySpan)
+              let owner = DeclarationId.copyShared(&InstanceKey.identity(&instance))
+              let ordinary = run SuspensionSummary.make(&functions[unframed], &instance, DeclarationId.moduleId(&owner),
+                &Option<Anchor>.none(), DeclarationId.moduleId(&owner), entrySpan)
               run BuildCapture.framed(&mut capture, entry, frameUnit, List<usize>.get(&selection.components, framed), forwards, selecting,
-                List<MirReference>.asSlice(&functions[unframed].references))
+                List<MirReference>.asSlice(&functions[unframed].references), &ordinary)
             }
           }
         }
@@ -101235,6 +101238,7 @@ impl Semantic {
           if marked[at] { run FrameSelection.include(&mut selection, run definitionDigest(&reached[at].key), component[at]) }
           at = at + usize.ONE
         }
+        if capturing { run parkingDefinitions(reached, &mut selection.parking) }
         // Only this walk's MIR is current. The arena can also hold obsolete revisions and the
         // non-observing pass abandoned before this walk selected diagnostic observation.
         let ordinary = List<MirFunction>.asSlice(&self.resolver.mirValues)
@@ -101274,6 +101278,18 @@ impl Semantic {
         if capture.guarded {
           drop run Graph.finishRun(&mut self.resolver.graph, guardUnit, Option<ContentHash>.none())
           guard = guardUnit
+        }
+        // A rewalk of a frame walk's record reads which instances either walk found able to park.
+        if let Option<FrameSelection>.Some {value: selection} = &frames.* {
+          let mut parking = DigestSet.make()
+          let found = List<ContentHash>.asSlice(&selection.parking.values)
+          let mut each = usize.ZERO
+          while each < found.length {
+            drop run DigestSet.add(&mut parking, found[each])
+            each = each + usize.ONE
+          }
+          run parkingDefinitions(List<SuspensionSummary>.asSlice(&summaries), &mut parking)
+          BuildCapture.parks(&mut capture, &parking)
         }
         self.capturedBuild = run BuildCapture.finish(move capture, guard)
         self.freshBuild = true
@@ -101914,11 +101930,20 @@ impl Semantic {
   //
   // Gives none when the walk cannot be proved to be the cold one, and the build walks.
   //
+  // A frame walk's record is walked again as that walk, from its roots with the storage exports,
+  // while the frames stay as the record has them. A suspendable entry the image no longer holds
+  // must read to the selection, and lower to a variant, as the record says (`replayFrame`,
+  // `replayAgrees`). Any other body lowered here must stay outside the selection and unable to
+  // park (`rewalkKeepsFrames`), so the walk that selects the frames would select the same ones
+  // and both walks' parking checks would find what they found. That walk must also still reach
+  // every suspendable instance this one does (`rewalkSelects`). An edit that changes what a
+  // suspendable function reaches, or that makes a function suspend, is left to a full build.
+  //
   // With `shared`, the record is what copies of the process lowered of this build (`sharedState`)
   // rather than an earlier walk: it decided no edge, so none is trusted, an entry no copy gave a
   // definition for (`BuildRecord.ABSENT`) is lowered here from its key, and the keys admission
   // needs are found again through MIR (`rewalkDecideKeyed`).
-  effect fn rewalkBuild(self: &mut Self, state: ReplayState, module: &ModuleId, roots: &[BuildRoot], entrySpan: Span, shared: bool)
+  effect fn rewalkBuild(self: &mut Self, state: ReplayState, module: &ModuleId, rooted: &[BuildRoot], entrySpan: Span, shared: bool)
     -> Option<BackendBuild>
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
   ? &mut Allocator | &mut Types {
@@ -101927,9 +101952,32 @@ impl Semantic {
     let entries = List<BuildRecord.Entry>.asSlice(&record.entries)
     // A replay that took the image's definitions leaves none to take, and a record resting on
     // growth guard reads cannot be replaced by one that does not.
-    // A frame walk's record is only replayed: a rewalk would have to select the frames again.
-    if !record.patterns || record.frames || guarded || List<Option<InstanceDefinition>>.length(&definitions) != entries.length {
+    if !record.patterns || guarded || List<Option<InstanceDefinition>>.length(&definitions) != entries.length {
       return Option<BackendBuild>.none()
+    }
+    // A frame walk's record is walked again with the frames its walk selected and the storage
+    // exports it rooted (`replayFrames`); what copies of the process lowered selects none.
+    let framing = record.frames
+    if framing && shared { return Option<BackendBuild>.none() }
+    let mut selection = FrameSelection.make()
+    let mut forwards = List<bool>.make()
+    let mut extended = List<BuildRoot>.make()
+    let mut roots = rooted
+    if framing {
+      extended = match move run Semantic.replayFrames(&mut self.*, entries, rooted, &mut selection, &mut forwards) {
+        Option<List<BuildRoot>>.Some {value} => move value
+        Option<List<BuildRoot>>.None => { return Option<BackendBuild>.none() }
+      }
+      roots = List<BuildRoot>.asSlice(&extended)
+    }
+    // The definition of each instance a walk of the record's build found able to park.
+    let mut parking = DigestSet.make()
+    let mut parked = usize.ZERO
+    while framing && parked < entries.length {
+      if u64.bitAnd(entries[parked].facts.flags, BuildRecord.FACT_PARKS) != 0 {
+        drop run DigestSet.add(&mut parking, entries[parked].facts.definition)
+      }
+      parked = parked + usize.ONE
     }
     let observing = record.observing
     let mut heldDefinitions = move definitions
@@ -102112,14 +102160,35 @@ impl Semantic {
             return Option<BackendBuild>.none()
           }
         }
-        let lowered = match move run Semantic.replayMir(&mut self.*, &instance, observing) {
+        let mut lowered = match move run Semantic.replayMir(&mut self.*, &instance, observing) {
           Option<ReplayMir>.Some {value} => value
           Option<ReplayMir>.None => {
             return Option<BackendBuild>.none()
           }
         }
+        // A suspendable instance is followed and emitted through its frame variant while the
+        // selection reads of its MIR outside any frame what it read, and the variant names the
+        // references and summarizes as the record says: the frames then stay as they are.
+        let mut suspension = Option<CoroutineFacts>.none()
+        let mut unchanged = false
+        if framing && run FrameSelection.contains(&selection, &instance) {
+          if entry == usize.MAX || u64.bitAnd(entries[entry].facts.flags, BuildRecord.FACT_FRAMED) == 0 {
+            return Option<BackendBuild>.none()
+          }
+          let framed = match move run Semantic.replayFrame(&mut self.*, &instance, lowered, observing, &entries[entry].facts, true,
+            &mut selection, List<bool>.asSlice(&forwards), entrySpan) {
+            Option<ReplayFrame>.Some {value} => move value
+            Option<ReplayFrame>.None => { return Option<BackendBuild>.none() }
+          }
+          lowered = framed.lowered
+          suspension = Option<CoroutineFacts>.some(move framed.facts)
+          if !run Semantic.replayAgrees(&mut self.*, &instance, lowered.mir, entries, entry, true, entrySpan) {
+            return Option<BackendBuild>.none()
+          }
+          unchanged = true
+        }
         if entry != usize.MAX { List<usize>.set(&mut mirs, entry, lowered.mir) }
-        let text = match move run Semantic.replayText(&mut self.*, &instance, lowered, observing, &Option<CoroutineFacts>.none()) {
+        let text = match move run Semantic.replayText(&mut self.*, &instance, lowered, observing, &suspension) {
           Option<CapturedEntry>.Some {value} => value
           Option<CapturedEntry>.None => {
             return Option<BackendBuild>.none()
@@ -102133,10 +102202,18 @@ impl Semantic {
         let summary = run SuspensionSummary.make(&functions[lowered.mir], &instance, declared, &anchor, declared, entrySpan)
         let observes = functions[lowered.mir].observes
         let digest = run summaryDigest(&summary, observes, true)
-        // What the record says of an entry's summary is replaced by what its MIR says now.
-        facts = run aliasFacts(&facts)
-        run summaryFacts(&mut facts, &summary, observes)
-        if u64.bitAnd(facts.flags, BuildRecord.FACT_SUSPENDS) != 0 || (observes && !observing) {
+        if !unchanged {
+          // What the record says of an entry's summary is replaced by what its MIR says now.
+          facts = run aliasFacts(&facts)
+          run summaryFacts(&mut facts, &summary, observes)
+          if u64.bitAnd(facts.flags, BuildRecord.FACT_SUSPENDS) != 0 {
+            return Option<BackendBuild>.none()
+          }
+          if framing && !run rewalkKeepsFrames(&summary, &selection, &parking) {
+            return Option<BackendBuild>.none()
+          }
+        }
+        if observes && !observing {
           return Option<BackendBuild>.none()
         }
         // A dropped value a NonParking obligation runs must have drop glue to prove.
@@ -102144,6 +102221,8 @@ impl Semantic {
         let mut obligation = usize.ZERO
         while obligation < owed.length {
           let glues = List<Interned<Type>>.asSlice(&owed[obligation].glues)
+          // Whether glue a new obligation runs can park is not read from a frame walk's record.
+          if framing && !unchanged && glues.length > usize.ZERO { return Option<BackendBuild>.none() }
           let mut glue = usize.ZERO
           while glue < glues.length {
             if let Result<Option<InstanceKey>, CanonicalizationFailure>.Failure {..} = move run InstanceKey.dropGlue(&glues[glue], &identity) {
@@ -102236,13 +102315,17 @@ impl Semantic {
       }
     }
     if !run rewalkProved(entries, List<RewalkNode>.asSlice(&nodes), List<ContentHash>.asSlice(&reachedDefinitions), &reachedLookup,
-      observing) {
+      observing, framing) {
+      return Option<BackendBuild>.none()
+    }
+    if framing && !run rewalkSelects(entries, List<RewalkNode>.asSlice(&nodes), &visitedLookup, rooted) {
       return Option<BackendBuild>.none()
     }
     // Every definition in walk order, as the walk collects them, and the record of this walk.
     let listed = List<RewalkNode>.asSlice(&nodes)
     let mut emitted = List<CollectedText>.make()
     let mut rewritten = BuildRecord.make(observing, true)
+    rewritten.frames = framing
     let mut rested = List<CapturedEntry>.make()
     let mut node = usize.ZERO
     while node < listed.length {
@@ -102253,6 +102336,15 @@ impl Semantic {
       let mut entry = BuildRecord.Entry {exact: walked.exact, hash: 0, family: 0, declaration: Bytes.make(),
         parent: walked.parent, position: walked.position, requested: walked.requested, alias: walked.alias, leaf: 0,
         references: List<BuildRecord.Reference>.make(), summary: walked.summary, facts: run BuildRecord.copyFacts(&walked.facts)}
+      // A framed entry names what the selecting walk reached from it by this walk's entries.
+      let reaching = List<usize>.asMutSlice(&mut entry.facts.ordinary)
+      let mut reach = usize.ZERO
+      while reach < reaching.length {
+        let target = rewalkVisited(listed, &visitedLookup, entries[reaching[reach]].exact)
+        if target == usize.MAX { return Option<BackendBuild>.none() }
+        reaching[reach] = target
+        reach = reach + usize.ONE
+      }
       let mut replayed = Option<Replayed>.none()
       if walked.entry != usize.MAX && entries[walked.entry].leaf != BuildRecord.ABSENT {
         let recorded = &entries[walked.entry]
@@ -102376,6 +102468,8 @@ impl Semantic {
       }
       let mut mir = List<usize>.get(&mirs.*, parent)
       if mir == usize.MAX {
+        // A framed entry's references are its frame variant's, which only its own visit lowers.
+        if u64.bitAnd(entries[parent].facts.flags, BuildRecord.FACT_FRAMED) != 0 { return Option<InstanceKey>.none() }
         mir = match move run Semantic.replayMir(&mut self.*, &parentKey, observing) {
           Option<ReplayMir>.Some {value} => value.mir
           Option<ReplayMir>.None => { return Option<InstanceKey>.none() }
@@ -104760,6 +104854,8 @@ struct BuildCapture {
   // instance's MIR outside any frame. A replay finds that walk's instances among this walk's
   // entries, so the record is kept only when each of these is one.
   selected: List<ContentHash>,
+  // The entry each of `selected` was reached from.
+  selectedFrom: List<usize>,
 }
 
 // What a rewalk reads of `instance` from a build record instead of the key (`BuildRecord.Facts`).
@@ -104866,15 +104962,29 @@ effect fn summaryFacts(facts: &mut BuildRecord.Facts, summary: &SuspensionSummar
 // the record's walk, which found nothing: no reached body suspends or parks, a walk that
 // observes diagnostics still reaches one that does, and every NonParking obligation names reached
 // targets and declarations (`nonParkingViolations`). Local-shared escapes are `rewalkEscapeFree`'s.
+//
+// With `framing`, the record is a frame walk's: bodies suspend and park, and the walk lowered none
+// that can (`rewalkKeepsFrames`), so an instance parks only where the record says one can
+// (`BuildRecord.FACT_PARKS`), and no obligation may name such a target or declaration.
 effect fn rewalkProved(entries: &[BuildRecord.Entry], nodes: &[RewalkNode], reachedDefinitions: &[ContentHash],
-  reachedLookup: &InternIndex, observing: bool) -> bool
+  reachedLookup: &InternIndex, observing: bool, framing: bool) -> bool
 ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut parking = DigestSet.make()
   let mut observes = false
   let mut declared = false
   let mut at = usize.ZERO
   while at < nodes.length {
     let flags = nodes[at].facts.flags
-    if u64.bitAnd(flags, BuildRecord.FACT_SUSPENDS) != 0 { return false }
+    if u64.bitAnd(flags, BuildRecord.FACT_SUSPENDS) != 0 && !framing { return false }
+    if u64.bitAnd(flags, BuildRecord.FACT_PARKS) != 0 {
+      drop run DigestSet.add(&mut parking, nodes[at].facts.definition)
+      if u64.bitAnd(flags, BuildRecord.FACT_BARE) != 0 { drop run DigestSet.add(&mut parking, nodes[at].facts.bare) }
+    }
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < nodes.length {
+    let flags = nodes[at].facts.flags
     if u64.bitAnd(flags, BuildRecord.FACT_OBSERVES) != 0 { observes = true }
     let obligations = List<BuildRecord.Obligation>.asSlice(&nodes[at].facts.obligations)
     let mut obligation = usize.ZERO
@@ -104884,6 +104994,7 @@ effect fn rewalkProved(entries: &[BuildRecord.Entry], nodes: &[RewalkNode], reac
       let mut callee = usize.ZERO
       while callee < callees.length {
         if !rewalkReached(reachedDefinitions, reachedLookup, callees[callee].definition) { return false }
+        if DigestSet.find(&parking, callees[callee].definition) != usize.MAX { return false }
         callee = callee + usize.ONE
       }
       if List<Bytes>.length(&obligations[obligation].declarations) > usize.ZERO { declared = true }
@@ -104895,11 +105006,12 @@ effect fn rewalkProved(entries: &[BuildRecord.Entry], nodes: &[RewalkNode], reac
   if observes != observing { return false }
   if !declared { return true }
   // A declaration is reached through its own summary or one that inlined an instance of it,
-  // as `nonParkingViolations` decides. Every such summary is non-suspending and non-parking
-  // here, so none of the declaration's reached instances can park.
+  // as `nonParkingViolations` decides. None of those summaries may be one that can park.
   let mut identities = List<Bytes>.make()
+  let mut parked = List<bool>.make()
   at = usize.ZERO
   while at < nodes.length {
+    let parks = u64.bitAnd(nodes[at].facts.flags, BuildRecord.FACT_PARKS) != 0
     let mut bytes = Bytes.make()
     if u64.bitAnd(nodes[at].facts.flags, BuildRecord.FACT_SUMMARIZED) != 0 {
       if let Option<InstanceKey>.Some {value: known} = &nodes[at].key {
@@ -104913,11 +105025,13 @@ effect fn rewalkProved(entries: &[BuildRecord.Entry], nodes: &[RewalkNode], reac
       }
     }
     run List<Bytes>.append(&mut identities, move bytes)
+    run List<bool>.append(&mut parked, parks)
     if u64.bitAnd(nodes[at].facts.flags, BuildRecord.FACT_SUMMARIZED) != 0 {
       let inlined = List<Bytes>.asSlice(&nodes[at].facts.inlined)
       let mut each = usize.ZERO
       while each < inlined.length {
         run List<Bytes>.append(&mut identities, run Bytes.copy(Bytes.asSlice(&inlined[each])))
+        run List<bool>.append(&mut parked, parks)
         each = each + usize.ONE
       }
     }
@@ -104934,8 +105048,11 @@ effect fn rewalkProved(entries: &[BuildRecord.Entry], nodes: &[RewalkNode], reac
       while declaration < declarations.length {
         let mut found = false
         let mut candidate = usize.ZERO
-        while candidate < named.length && !found {
-          found = Bytes.length(&named[candidate]) > usize.ZERO && same(Bytes.asSlice(&named[candidate]), Bytes.asSlice(&declarations[declaration]))
+        while candidate < named.length {
+          if Bytes.length(&named[candidate]) > usize.ZERO && same(Bytes.asSlice(&named[candidate]), Bytes.asSlice(&declarations[declaration])) {
+            if List<bool>.get(&parked, candidate) { return false }
+            found = true
+          }
           candidate = candidate + usize.ONE
         }
         if !found { return false }
@@ -105021,8 +105138,137 @@ effect fn rewalkEscapeFree(entries: &[BuildRecord.Entry]) -> bool ! OutOfMemoryE
       }
       reference = reference + usize.ONE
     }
+    // A framed entry's references are its frame variant's; its MIR outside any frame, which the
+    // selecting walk checked, reaches these.
+    let ordinary = List<usize>.asSlice(&entries[reached].facts.ordinary)
+    reference = usize.ZERO
+    while reference < ordinary.length {
+      if !List<bool>.get(&queued, ordinary[reference]) {
+        List<bool>.set(&mut queued, ordinary[reference], true)
+        run List<usize>.append(&mut queue, ordinary[reference])
+      }
+      reference = reference + usize.ONE
+    }
   }
   return true
+}
+
+// Whether `summary`, of a body a rewalk of a frame walk's record lowered outside any frame, leaves
+// the frames of `selection` and the instances that can park (`parking`, by definition digest) as
+// the record has them. The body calls no suspendable instance, so it stays outside the selection.
+// It calls and indirectly runs no instance that can park, notifies no Execution and releases no
+// package, so it cannot park (`closeParking`); no package it forms has glue that can park, so no
+// release runs more than it ran; and it forms no callback address.
+effect fn rewalkKeepsFrames(summary: &SuspensionSummary, selection: &FrameSelection, parking: &DigestSet) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  if summary.notifies || summary.releases || List<CallbackBoundary>.length(&summary.callbacks) > usize.ZERO { return false }
+  let callees = List<InstanceKey>.asSlice(&summary.callees)
+  let mut at = usize.ZERO
+  while at < callees.length {
+    if run FrameSelection.contains(selection, &callees[at]) { return false }
+    if DigestSet.find(parking, run definitionDigest(&callees[at])) != usize.MAX { return false }
+    at = at + usize.ONE
+  }
+  let indirect = List<InstanceKey>.asSlice(&summary.indirect)
+  at = usize.ZERO
+  while at < indirect.length {
+    if DigestSet.find(parking, run definitionDigest(&indirect[at])) != usize.MAX { return false }
+    at = at + usize.ONE
+  }
+  let packages = List<InstanceKey>.asSlice(&summary.packages)
+  at = usize.ZERO
+  while at < packages.length {
+    if DigestSet.find(parking, run definitionDigest(&packages[at])) != usize.MAX { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// Whether the walk that selects a build's frames would reach, from `roots`, every framed node of a
+// rewalk of a frame walk's record, and nothing the rewalk did not: it follows each instance's MIR
+// outside any frame, which a framed entry names by `BuildRecord.Facts.ordinary`. A framed instance
+// only the frame walk reaches would be emitted without a frame, and a program that reaches none
+// has no frame walk.
+effect fn rewalkSelects(entries: &[BuildRecord.Entry], nodes: &[RewalkNode], visitedLookup: &InternIndex, roots: &[BuildRoot]) -> bool
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut reached = List<bool>.make()
+  while List<bool>.length(&reached) < nodes.length { run List<bool>.append(&mut reached, false) }
+  let mut queue = List<usize>.make()
+  let mut at = usize.ZERO
+  while at < roots.length {
+    let root = rewalkVisited(nodes, visitedLookup, run instanceDigest(&roots[at].key))
+    if root == usize.MAX { return false }
+    if !List<bool>.get(&reached, root) {
+      List<bool>.set(&mut reached, root, true)
+      run List<usize>.append(&mut queue, root)
+    }
+    at = at + usize.ONE
+  }
+  let mut head = usize.ZERO
+  let mut growing = true
+  while growing {
+    while head < List<usize>.length(&queue) {
+      let node = &nodes[List<usize>.get(&queue, head)]
+      head = head + usize.ONE
+      let mut targets = List<usize>.make()
+      if node.alias != usize.MAX {
+        run List<usize>.append(&mut targets, node.alias)
+      } else if u64.bitAnd(node.facts.flags, BuildRecord.FACT_FRAMED) != 0 {
+        let ordinary = List<usize>.asSlice(&node.facts.ordinary)
+        let mut each = usize.ZERO
+        while each < ordinary.length {
+          run List<usize>.append(&mut targets, rewalkVisited(nodes, visitedLookup, entries[ordinary[each]].exact))
+          each = each + usize.ONE
+        }
+      } else if node.live {
+        let named = List<ContentHash>.asSlice(&node.targets)
+        let mut each = usize.ZERO
+        while each < named.length {
+          run List<usize>.append(&mut targets, rewalkVisited(nodes, visitedLookup, named[each]))
+          each = each + usize.ONE
+        }
+      } else if node.entry != usize.MAX {
+        let references = List<BuildRecord.Reference>.asSlice(&entries[node.entry].references)
+        let mut each = usize.ZERO
+        while each < references.length {
+          run List<usize>.append(&mut targets, rewalkVisited(nodes, visitedLookup, entries[references[each].target].exact))
+          each = each + usize.ONE
+        }
+      }
+      let found = List<usize>.asSlice(&targets)
+      let mut each = usize.ZERO
+      while each < found.length {
+        if found[each] == usize.MAX { return false }
+        if !List<bool>.get(&reached, found[each]) {
+          List<bool>.set(&mut reached, found[each], true)
+          run List<usize>.append(&mut queue, found[each])
+        }
+        each = each + usize.ONE
+      }
+    }
+    // A NonParking target nothing reaches joins the walk from the obligation that names it.
+    growing = false
+    at = usize.ZERO
+    while at < nodes.length {
+      if nodes[at].requested && !List<bool>.get(&reached, at) && nodes[at].parent != usize.MAX
+        && List<bool>.get(&reached, nodes[at].parent) {
+        List<bool>.set(&mut reached, at, true)
+        run List<usize>.append(&mut queue, at)
+        growing = true
+      }
+      at = at + usize.ONE
+    }
+  }
+  let mut framed = false
+  at = usize.ZERO
+  while at < nodes.length {
+    if nodes[at].alias == usize.MAX && u64.bitAnd(nodes[at].facts.flags, BuildRecord.FACT_FRAMED) != 0 {
+      if !List<bool>.get(&reached, at) { return false }
+      framed = true
+    }
+    at = at + usize.ONE
+  }
+  return framed
 }
 
 // One pending visit of a rewalk (`rewalkBuild`), as `BackendVisit` is of a build walk.
@@ -106006,14 +106252,14 @@ impl BuildCapture {
       at = at + usize.ONE
     }
     return BuildCapture {observing: observing, roots: move identities, entries: List<CaptureEntry>.make(), lookup: InternIndex.make(),
-      guarded: false, declared: true, patterns: true, unreplayable: false, frames: false, selected: List<ContentHash>.make()}
+      guarded: false, declared: true, patterns: true, unreplayable: false, frames: false, selected: List<ContentHash>.make(), selectedFrom: List<usize>.make()}
   }
 
   // An escape walk's capture, whose walk appends its roots as it finds them. Each entry names its
   // declaration, so a replay finds a changed plain body without lowering the bodies above it.
   fn walk() -> BuildCapture {
     return BuildCapture {observing: false, roots: List<ContentHash>.make(), entries: List<CaptureEntry>.make(), lookup: InternIndex.make(),
-      guarded: false, declared: true, patterns: false, unreplayable: false, frames: false, selected: List<ContentHash>.make()}
+      guarded: false, declared: true, patterns: false, unreplayable: false, frames: false, selected: List<ContentHash>.make(), selectedFrom: List<usize>.make()}
   }
 
   // Adds the entry of a newly reached instance.
@@ -106092,20 +106338,45 @@ impl BuildCapture {
   // unit is `frameUnit`: its cycle `component`, whether a caller's frame may run its body
   // (`forwards`), and the digest `selecting` of what the frame selection read of its MIR outside
   // any frame, whose references are `references`.
+  //
+  // `ordinary` is the summary of that MIR. What it escapes and the local-shared accesses it holds
+  // join the entry's facts, so a rewalk's escape check reads what the selecting walk checked.
   effect fn framed(self: &mut Self, entry: usize, frameUnit: usize, component: usize, forwards: bool, selecting: ContentHash,
-    references: &[MirReference]) -> () ! OutOfMemoryError ? &mut Allocator {
+    references: &[MirReference], ordinary: &SuspensionSummary) -> () ! OutOfMemoryError ? &mut Allocator {
     let mut at = usize.ZERO
     while at < references.length {
       run List<ContentHash>.append(&mut self.selected, run keyDigest(&references[at].key, self.patterns))
+      run List<usize>.append(&mut self.selectedFrom, entry)
       at = at + usize.ONE
     }
     let entries = List<CaptureEntry>.asMutSlice(&mut self.entries)
     entries[entry].frameUnit = frameUnit
     let mut flags = u64.bitOr(entries[entry].facts.flags, BuildRecord.FACT_FRAMED)
     if forwards { flags = u64.bitOr(flags, BuildRecord.FACT_FORWARDS) }
+    if List<SummaryEscape>.length(&ordinary.escapes) > usize.ZERO { flags = u64.bitOr(flags, BuildRecord.FACT_ESCAPES) }
+    let accesses = List<CallbackBoundary>.asSlice(&ordinary.accesses)
+    if accesses.length > usize.ZERO { flags = u64.bitOr(flags, BuildRecord.FACT_ACCESSES) }
+    at = usize.ZERO
+    while at < accesses.length {
+      run List<ContentHash>.append(&mut entries[entry].facts.callbacks, run InstanceKey.definitionDigest(&accesses[at].key))
+      at = at + usize.ONE
+    }
     entries[entry].facts.flags = flags
     entries[entry].facts.component = component
     entries[entry].facts.selecting = selecting
+  }
+
+  // Marks every entry whose definition digest is one of `parking` as able to park externally
+  // (`BuildRecord.FACT_PARKS`).
+  fn parks(self: &mut Self, parking: &DigestSet) -> () {
+    let entries = List<CaptureEntry>.asMutSlice(&mut self.entries)
+    let mut at = usize.ZERO
+    while at < entries.length {
+      if DigestSet.find(parking, entries[at].facts.definition) != usize.MAX {
+        entries[at].facts.flags = u64.bitOr(entries[at].facts.flags, BuildRecord.FACT_PARKS)
+      }
+      at = at + usize.ONE
+    }
   }
 
   // Adds what `summary`, the summary of `entry`'s MIR, tells a rewalk to the entry's facts.
@@ -106203,6 +106474,14 @@ impl BuildCapture {
         summary: kept.summary, facts: move facts})
       run List<CapturedEntry>.append(&mut rested, CapturedEntry {value: kept.value, mirUnit: kept.mirUnit, emissionUnit: kept.emissionUnit, frameUnit: kept.frameUnit,
         carried: usize.MAX})
+    }
+    let from = List<usize>.asSlice(&captured.selectedFrom)
+    reached = usize.ZERO
+    while reached < from.length {
+      let target = BuildCapture.find(&captured, List<ContentHash>.get(&captured.selected, reached))
+      let framed = List<BuildRecord.Entry>.asMutSlice(&mut record.entries)
+      run List<usize>.append(&mut framed[from[reached]].facts.ordinary, target)
+      reached = reached + usize.ONE
     }
     record.roots = move captured.roots
     return Option<CapturedBuild>.some(CapturedBuild {record: move record, entries: move rested, guard: guard, carriedRecord: usize.MAX})
@@ -107076,6 +107355,18 @@ effect fn closeParking(summaries: &[SuspensionSummary]) -> List<bool> ! OutOfMem
   return move marked
 }
 
+// Adds the definition digest of each of `summaries` that can park externally to `parking`.
+effect fn parkingDefinitions(summaries: &[SuspensionSummary], parking: &mut DigestSet) -> () ! OutOfMemoryError ? &mut Allocator {
+  let parks = run closeParking(summaries)
+  let marked = List<bool>.asSlice(&parks)
+  let mut at = usize.ZERO
+  while at < marked.length {
+    if marked[at] { drop run DigestSet.add(&mut parking.*, run InstanceKey.definitionDigest(&summaries[at].key)) }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
 // The provider-free key of each summary: an obligated value names its target's application,
 // while a reached instance may also carry the providers its requirement row is served by.
 effect fn bareKeys(summaries: &[SuspensionSummary]) -> List<Option<InstanceKey>> ! OutOfMemoryError ? &mut Allocator | &mut Types {
@@ -107631,12 +107922,15 @@ struct FrameSelection {
   // Per member, the MIR outside any frame of a body a suspendable caller may run in its own frame
   // at a suspension point, or `usize.MAX`.
   bodies: List<usize>,
+  // The definition digest of each instance the walk that selected the frames found able to park
+  // externally (`closeParking`).
+  parking: DigestSet,
 }
 
 impl FrameSelection {
   fn make() -> FrameSelection {
     return FrameSelection {suspendable: List<ContentHash>.make(), components: List<usize>.make(), lookup: InternIndex.make(),
-      symbols: List<Bytes>.make(), bodies: List<usize>.make()}
+      symbols: List<Bytes>.make(), bodies: List<usize>.make(), parking: DigestSet.make()}
   }
 
   // Adds the member whose definition digest is `definition`.
