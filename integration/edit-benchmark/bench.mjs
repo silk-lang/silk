@@ -77,13 +77,14 @@ const commands = {
 
 const options = { workspace: '.', packages: 'silk-compiler,silk-tool', commands: Object.keys(commands).join(','), rounds: '3' };
 const argv = process.argv.slice(2);
+const known = ['silk', 'workspace', 'packages', 'commands', 'edits', 'rounds', 'stdlib', 'work'];
 for (let at = 0; at < argv.length; at += 2) options[argv[at].replace(/^--/, '')] = argv[at + 1];
 const usage = 'usage: bench.mjs --silk <silkc> [--workspace <dir>] [--packages <name,...>] [--commands <name,...>] [--edits <name,...>] [--rounds <n>] [--stdlib <dir>] [--work <dir>]';
 function stop(message) {
   console.error(message);
   process.exit(2);
 }
-if (!options.silk || argv.length % 2 !== 0) stop(usage);
+if (!options.silk || argv.length % 2 !== 0 || Object.keys(options).some((name) => !known.includes(name))) stop(usage);
 const chosenPackages = options.packages.split(',');
 for (const name of chosenPackages) if (!Object.hasOwn(packages, name)) stop(`no edits are listed for the package ${name}; the packages are ${Object.keys(packages).join(', ')}`);
 const chosenCommands = options.commands.split(',');
@@ -104,6 +105,8 @@ const snapshot = join(work, 'cold-build');
 const logs = join(work, 'logs');
 const samples = join(work, 'samples.jsonl');
 
+// The work folder is removed first, so it must not hold anything the run reads.
+for (const read of [workspace, library, silk]) if (!relative(work, read).startsWith('..')) stop(`--work ${work} holds ${read}, and is removed first; name another folder`);
 rmSync(work, { recursive: true, force: true });
 mkdirSync(logs, { recursive: true });
 cpSync(workspace, tree, {
@@ -118,7 +121,8 @@ const sockets = mkdtempSync(join(tmpdir(), 'silk-eb-'));
 const environment = { ...process.env, XDG_RUNTIME_DIR: sockets };
 process.on('exit', () => rmSync(sockets, { recursive: true, force: true }));
 
-// Edit texts carry a number no earlier round or run used.
+// Edit texts carry a number no earlier round of this run used, and a run starts from a number
+// taken from the clock.
 let stamp = (Date.now() % 1000000) * 1000;
 const fresh = () => (stamp += 1);
 
@@ -218,8 +222,9 @@ function run(name, command, edit, state, text) {
   // `counts` holds the first number of what each covered: the functions codegen emitted, say.
   const rows = {};
   const counts = {};
-  for (const row of output.matchAll(/^ {2}(\w+) +(.*?) +(\d+(?:\.\d+)?)(m?)s$/gm)) {
-    rows[row[1]] = Number(row[3]) / (row[4] === 'm' ? 1000 : 1);
+  // A time is seconds (`0.28s`), milliseconds (`12ms`) or, from a minute on, `2m 05s`.
+  for (const row of output.matchAll(/^ {2}(\w+) +(.*?) +(?:(\d+)m )?(\d+(?:\.\d+)?)(m?)s$/gm)) {
+    rows[row[1]] = Number(row[3] ?? 0) * 60 + Number(row[4]) / (row[5] === 'm' ? 1000 : 1);
     const count = /\d[\d,]*/.exec(row[2]);
     if (count) counts[row[1]] = Number(count[0].replaceAll(',', ''));
   }
@@ -247,6 +252,7 @@ for (const name of chosenPackages) {
   const sites = Object.entries(packages[name].edits)
     .filter(([edit]) => options.edits === undefined || options.edits.split(',').includes(edit))
     .map(([edit, site]) => ({ ...site, edit, marks: [fresh()] }));
+  for (const edit of options.edits?.split(',') ?? []) if (!Object.values(packages).some((listed) => Object.hasOwn(listed.edits, edit))) stop(`unknown edit ${edit}; ${name}'s edits are ${Object.keys(packages[name].edits).join(', ')}`);
   if (sites.length === 0) stop(`--edits names none of ${name}'s edits; they are ${Object.keys(packages[name].edits).join(', ')}`);
   // Each site starts with its first text in place, so a round changes a line and adds none.
   const reset = () => {

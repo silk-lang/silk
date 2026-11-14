@@ -41,7 +41,7 @@ The script copies the workspace, and a standard library outside it, so the check
 
 So every first edit meets the state a cold run leaves, and the later edits meet the state an edit build leaves. For `check`, each kind of edit starts with a new check server: the script ends the last one, puts `build` back and runs one check with nothing changed, which is listed in the samples as `server start`.
 
-No edit text is used twice, in one run or across runs, so no run finds a state its cache has seen. Before the cold run each place already holds its first text, so every round changes a line where it stands. The exception is `lines`, which adds a line each round.
+No edit text is used twice in a run, and each run starts its texts from the clock, so no run finds a state its cache has seen. Before the cold run each place already holds its first text, so every round changes a line where it stands. The exception is `lines`, which adds a line each round.
 
 | Edit | What changes |
 | --- | --- |
