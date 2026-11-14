@@ -1079,7 +1079,8 @@ matches only itself, and a prerelease compiler builds only dependencies written 
 or `self`. When `package` is present it must equal the dependency's `[package].name`. Dependencies are
 not transitive: a package imports only the packages its own manifest lists. Packages cannot depend
 on each other in a cycle. A dependency is a `path` dependency or a git dependency; `url`, `version`,
-`tag`, `branch`, `hash`, `optional` and `workspace` are reserved and refused as not supported yet.
+`tag`, `branch`, `hash` and `optional` are reserved and refused as not supported yet. An entry
+written `{ workspace = true }` takes its fields from the workspace (PACKAGE-008).
 
 A git dependency names a repository with `git` and pins one commit with `rev`, its full hash (40 or
 64 lowercase hexadecimal digits). `path` selects the package's directory relative to the
@@ -1232,6 +1233,65 @@ invalid-manifest error that points to the member directories.
 **Evidence:** [native project manifests](../../../../compiler/src/driver/Project.silk),
 [project manifest cases](../../../../compiler/src/driver/ProjectCases.silk),
 [native build contract](../../../../compiler/scripts/test-native-build.ts).
+
+### PACKAGE-008 — A workspace writes shared dependencies once
+
+**Status:** Confirmed; implemented in the native compiler.
+
+`[workspace.dependencies]` in a workspace's root manifest holds dependency entries written as
+`[dependencies]` entries are. A member takes one by name with `{ workspace = true }`, so a pin that
+many members share is written, and changed, in one file.
+
+```toml
+# silk.toml, the workspace root
+[workspace]
+members = ["ui", "demo"]
+
+[workspace.dependencies]
+css = { git = "https://github.com/example/css.git", rev = "ef277166234015091490a56f88476f442599fe30" }
+ui = { path = "ui" }
+```
+
+```toml
+# demo/silk.toml
+[package]
+name = "demo"
+
+[dependencies]
+css = { workspace = true }
+ui = { workspace = true }
+```
+
+The member's entry is read as if it wrote the workspace's fields itself, with one difference: a
+`path` in `[workspace.dependencies]` is relative to the workspace root's directory, so every member
+names the same package whatever its own depth. The dependency name is the key in both tables.
+`{ workspace = true }` works in `[dependencies]` and in a profile's `[profiles.<name>.dependencies]`.
+The workspace of a package is the one PACKAGE-007 gives it: the nearest manifest at or above its
+directory with a `[workspace]` table that lists it, or its own manifest when that has the table. A
+package read from a git checkout or an archive finds its workspace inside that checkout or archive
+only.
+
+`silk pack` writes each `{ workspace = true }` entry out in the archive's `silk.toml`, as the
+workspace has it, because the archive holds the package and not the workspace around it.
+
+**Boundary:** `workspace = true` is written alone: a member cannot add or change a field of the
+shared entry, and a member that needs another source writes its own entry instead. An entry of
+`[workspace.dependencies]` that no member takes is not read. The table shares entries only; it
+gives no member a dependency the member does not list.
+
+**Diagnostics:** These are invalid-manifest errors that name the dependency, exit with status 2,
+and give the `silk.toml` line at fault: `workspace = false` or `workspace = true` beside another
+field, a package no workspace lists, a workspace with no entry of that name, and an entry of
+`[workspace.dependencies]` that is itself `{ workspace = true }`. A fault in the shared entry, such
+as a `rev` that is not a full commit hash, names the workspace root's manifest and line.
+`silk pack` refuses a package whose `{ workspace = true }` entry it cannot write out on its own line,
+such as one written as a `[dependencies.<name>]` table.
+
+**Evidence:** [workspace dependencies](../compiler/src/driver/WorkspaceDependencies.silk),
+[package dependency loading](../compiler/src/driver/Packages.silk),
+[pack archives](../compiler/src/driver/PackArchive.silk),
+[manifest schema](../compiler/manifest.schema.toml),
+[native build contract](../compiler/scripts/test-native-build.ts).
 
 ## Implementation evidence
 

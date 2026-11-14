@@ -9,9 +9,15 @@
 //! package rather than being followed. Members are written in byte order of their paths with the
 //! fixed metadata of `TarWriter` and gzip's zero timestamp, so packing the same files gives the
 //! same bytes and the same SHA-256 on every host.
+//!
+//! The archive's `silk.toml` is the package's own, except that each dependency written
+//! `{ workspace = true }` is written out as the workspace's `[workspace.dependencies]` has it:
+//! whoever downloads the archive has the package, not the workspace around it.
 
 import driver.ManifestFields
 import driver.Project as Projects {Project}
+import driver.WorkspaceDependencies as Workspaces {Shared}
+import tomledit.ManifestEdit as ManifestEdits {ManifestEditRefused}
 import silk.compress.deflate {EncodeError, EncodeWriter, Options as DeflateOptions}
 import silk.compress.inflate {Format}
 import silk.compress.tar {TarError, TarWriter}
@@ -90,8 +96,166 @@ fn members<'a>(value: &'a TomlValue) -> Option<&'a [TomlChild]> {
   }
 }
 
-/// Checks that the package described by `document` can be packed: it writes `[package].version`,
-/// and none of its dependencies is a path dependency, which nobody downloading the archive has.
+// `entry`, a dependency whose fields are all strings, as TOML source: `{ git = "...", rev = "..." }`.
+effect fn inlineTable(entry: &TomlValue) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut text = run Bytes.copy(b"{ ")
+  let mut written = usize.ZERO
+  if let Option<&[TomlChild]>.Some {value: fields} = move members(entry) {
+    let mut at = usize.ZERO
+    while at < fields.length {
+      if let TomlChild.Member {entry: field} = &fields[at] {
+        if let Option<string>.Some {value} = move Toml.asString(Option<&TomlValue>.some(&field.value)) {
+          if written > usize.ZERO { run Bytes.append(&mut text, b", ") }
+          run Bytes.append(&mut text, String.ownedUtf8Bytes(&field.key))
+          run Bytes.append(&mut text, b" = ")
+          let quoted = run ManifestEdits.quoted(String.utf8Bytes(value))
+          run Bytes.append(&mut text, Bytes.asSlice(&quoted))
+          written = written + usize.ONE
+        }
+      }
+      at = at + usize.ONE
+    }
+  }
+  run Bytes.append(&mut text, b" }")
+  return move text
+}
+
+// One dependency table of a manifest: its dotted name, such as `profiles.tasks.dependencies`, and
+// the names of its entries that are taken from the workspace.
+struct Inherited {
+  table: Bytes,
+  names: List<Bytes>,
+}
+
+// Adds to `found` the entries of `listed`, the dependency table named `table`, that are taken
+// from the workspace.
+effect fn collectInherited(found: &mut List<Inherited>, table: &[u8], listed: Option<&TomlValue>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let children = match move listed {
+    Option<&TomlValue>.Some {value} => match move members(value) {
+      Option<&[TomlChild]>.Some {value: entries} => entries
+      Option<&[TomlChild]>.None => { return () }
+    }
+    Option<&TomlValue>.None => { return () }
+  }
+  let mut names = List<Bytes>.make()
+  let mut at = usize.ZERO
+  while at < children.length {
+    if let TomlChild.Member {entry} = &children[at] {
+      if Workspaces.inherits(&entry.value) { run List<Bytes>.append(&mut names, run Bytes.copy(String.ownedUtf8Bytes(&entry.key))) }
+    }
+    at = at + usize.ONE
+  }
+  if List<Bytes>.length(&names) > usize.ZERO {
+    run List<Inherited>.append(&mut found.*, Inherited {table: run Bytes.copy(table), names: move names})
+  }
+  return ()
+}
+
+// The dependency tables of `document`, `[dependencies]` and each profile's, that hold an entry
+// taken from the workspace.
+effect fn inheritedTables(document: &TomlValue) -> List<Inherited> ! OutOfMemoryError ? &mut Allocator {
+  let mut found = List<Inherited>.make()
+  run collectInherited(&mut found, b"dependencies", Toml.field(document, "dependencies"))
+  if let Option<&TomlValue>.Some {value: profiles} = move Toml.field(document, "profiles") {
+    if let Option<&[TomlChild]>.Some {value: named} = move members(profiles) {
+      let mut at = usize.ZERO
+      while at < named.length {
+        if let TomlChild.Member {entry} = &named[at] {
+          let mut table = run Bytes.copy(b"profiles.")
+          run Bytes.append(&mut table, String.ownedUtf8Bytes(&entry.key))
+          run Bytes.append(&mut table, b".dependencies")
+          run collectInherited(&mut found, Bytes.asSlice(&table), Toml.field(&entry.value, "dependencies"))
+        }
+        at = at + usize.ONE
+      }
+    }
+  }
+  return move found
+}
+
+/// Whether the manifest `document` writes a dependency `{ workspace = true }`, in
+/// `[dependencies]` or a profile's.
+pub effect fn takesWorkspaceDependencies(document: &TomlValue) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let tables = run inheritedTables(document)
+  return List<Inherited>.length(&tables) > usize.ZERO
+}
+
+/// The `silk.toml` the archive of `project` holds: the package's own, with each dependency
+/// written `{ workspace = true }`, in `[dependencies]` or a profile's, replaced by the entry of
+/// the same name in `[workspace.dependencies]` of the package's workspace. A manifest that takes
+/// nothing from a workspace is returned as it is written.
+///
+/// # Errors
+/// - `PackRefused` when an entry taken from the workspace has other fields, no workspace lists
+///   the package, the workspace has no entry of that name, or the entry is not written on one
+///   line as `name = { workspace = true }`.
+/// - `FileError` when the manifest cannot be read.
+pub effect fn manifestText(project: &Project) -> Bytes
+  ! PackRefused | FileError | TomlError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let mut text = run FileSystem.readFile(Projects.manifest(project))
+  let document = run Toml.parse(Bytes.asSlice(&text))
+  let tables = run inheritedTables(&document)
+  let listed = List<Inherited>.asSlice(&tables)
+  if listed.length == usize.ZERO { return move text }
+  let shared = match move run Workspaces.of(Projects.directory(project), &Option<Path>.none()) {
+    Option<Shared>.Some {value} => move value
+    Option<Shared>.None => { fail run refuse(&[b"a dependency is written { workspace = true }, but no workspace lists this package as a member"]) }
+  }
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let table = Bytes.asSlice(&listed[at].table)
+    let names = List<Bytes>.asSlice(&listed[at].names)
+    let mut one = usize.ZERO
+    while one < names.length {
+      let name = Bytes.asSlice(&names[one])
+      one = one + usize.ONE
+      let written = match move Workspaces.find(&shared, name) {
+        Option<&TomlValue>.Some {value} => value
+        Option<&TomlValue>.None => {
+          fail run refuse(&[b"dependency `", name, b"` is written { workspace = true }, but [workspace.dependencies] of ", Path.rawBytes(Workspaces.manifest(&shared)), b" has no `", name, b"`"])
+        }
+      }
+      if Workspaces.inherits(written) {
+        fail run refuse(&[b"dependency `", name, b"`: an entry of [workspace.dependencies] cannot be workspace = true itself"])
+      }
+      let value = run inlineTable(written)
+      let edited = run Effect.result(ManifestEdits.setValue(Bytes.asSlice(&text), table, name, Bytes.asSlice(&value)))
+      text = match move edited {
+        Result<Bytes, ManifestEditRefused | OutOfMemoryError>.Success {value: next} => move next
+        Result<Bytes, ManifestEditRefused | OutOfMemoryError>.Failure {error} => match move error {
+          ManifestEditRefused _unplaced => {
+            fail run refuse(&[b"dependency `", name, b"` cannot be written out for the archive; write it on one line in [", table, b"], as ", name, b" = { workspace = true }"])
+          }
+          OutOfMemoryError exhausted => { fail move exhausted }
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+  // An entry the edit could not find, such as one in a `[dependencies.<name>]` table, is still
+  // taken from the workspace, or the text no longer parses.
+  let rewritten = match move run Effect.result(Toml.parse(Bytes.asSlice(&text))) {
+    Result<TomlValue, TomlError | OutOfMemoryError>.Success {value} => move value
+    Result<TomlValue, TomlError | OutOfMemoryError>.Failure {error} => match move error {
+      TomlError _malformed => {
+        fail run refuse(&[b"a dependency written { workspace = true } cannot be written out for the archive; write each on one line, as name = { workspace = true }"])
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let left = run inheritedTables(&rewritten)
+  let remaining = List<Inherited>.asSlice(&left)
+  if remaining.length > usize.ZERO {
+    let first = Bytes.asSlice(&List<Bytes>.asSlice(&remaining[usize.ZERO].names)[usize.ZERO])
+    fail run refuse(&[b"dependency `", first, b"` cannot be written out for the archive; write it on one line in [", Bytes.asSlice(&remaining[usize.ZERO].table), b"], as ", first, b" = { workspace = true }"])
+  }
+  return move text
+}
+
+/// Checks that the package described by `document`, its manifest as [`manifestText`] writes it for
+/// the archive, can be packed: it writes `[package].version`, and none of its dependencies is a
+/// path dependency, which nobody downloading the archive has.
 ///
 /// # Errors
 /// - `PackRefused` naming the first problem.
@@ -392,7 +556,9 @@ pub effect fn archive(project: &Project, files: &[Bytes]) -> Packed
   while at < files.length {
     let relative = Bytes.asSlice(&files[at])
     at = at + usize.ONE
-    let content = run FileSystem.readFile(&run Path.joinBytes(Projects.directory(project), relative))
+    let path = run Path.joinBytes(Projects.directory(project), relative)
+    // The manifest is packed with its workspace dependencies written out.
+    let content = if same(Path.rawBytes(&path), Path.rawBytes(Projects.manifest(project))) { run manifestText(project) } else { run FileSystem.readFile(&path) }
     let mut member = run Bytes.copy(Bytes.asSlice(&top))
     run Bytes.append(&mut member, b"/")
     run Bytes.append(&mut member, relative)
