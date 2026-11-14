@@ -1445,6 +1445,10 @@ impl<'a, T: Debug> Debug for &'a [T] {
 }
 ```
 
+No other type can be a provider: an array `[T; N]`, a reference `&T`, a pointer, a function type or
+an anonymous tuple or record reports `SEM0083`, naming the type. Declare a tuple or struct that
+holds the value and implement the interface for it.
+
 Where a reference is expected, such as the receiver `&Self` or a generic `&T` parameter, `&s` for
 a slice `s` borrows the slice itself and gives `& &[T]`. Anywhere else it reborrows the elements
 and gives `&[T]`.
@@ -1639,6 +1643,10 @@ impl Multiply<Vector2, Vector2> for f64 {
   }
 }
 ```
+
+A reference as the first type argument stands for its referent, so the module that declares `Pixel`
+may also declare `impl<'a> From<&'a Pixel> for u32`. A slice, an array or any other type built
+around a nominal type does not count.
 
 Only the first type argument counts, so for one provider and one argument owner at most three
 modules (contract, provider, argument owner) can hold a competing head. The coherence check of an
