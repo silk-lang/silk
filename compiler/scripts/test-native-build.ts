@@ -3571,7 +3571,7 @@ const program = Effect.gen(function* () {
     yield* fs.writeFileString(join(workspace, 'silk.toml'), root(pin))
     yield* fs.writeFileString(
       join(workspace, 'libs/math/silk.toml'),
-      '[package]\nname = "shared-math"\nversion = "0.1.0"\nsource = "."\nkind = "library"\nexports = ["twice"]\n\n[dependencies]\nlengths = { workspace = true }\n',
+      '[package]\nname = "shared-math"\nversion = "0.1.0"\nsource = "."\nkind = "library"\nmain = "twice.silk"\nexports = ["twice"]\n\n[dependencies]\nlengths = { workspace = true }\n',
     )
     yield* fs.writeFileString(
       join(workspace, 'libs/math/twice.silk'),
