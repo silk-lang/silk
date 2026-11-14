@@ -4723,8 +4723,82 @@ const program = Effect.gen(function* () {
   })
   yield* refusedEmbed('shaders/missing.bin', /cannot embed "shaders\/missing\.bin": no such file in package embeds/)
   yield* refusedEmbed('../outside.bin', /cannot embed "\.\.\/outside\.bin": the path must be relative to the package's directory/)
+  // `Source.compressed` and `Source.compressedText` keep a file as one Zstandard frame, and the
+  // program expands it to the bytes the build read: a file that shrinks, an empty one, and one
+  // too short to shrink. Text that is not UTF-8 is refused where it is embedded.
+  const embedLong = 'fn shade(position: vec4<f32>) -> vec4<f32> { return position * 0.5; } // λ\n'.repeat(64)
+  yield* fs.writeFileString(join(embeds, 'shaders/long.wgsl'), embedLong)
+  yield* fs.writeFileString(join(embeds, 'shaders/empty.bin'), '')
+  const compressedMain = (text: string) =>
+    'import silk.build.source { Compressed, CompressedText, Source }\nimport silk.collections.bytes { Bytes }\n'
+    + 'import silk.core.effect { Effect }\nimport silk.mem.allocator { Allocator, OutOfMemoryError }\n'
+    + 'import silk.text.string { String }\n\npub effect fn main() -> i32 ! OutOfMemoryError {\n'
+    + '  let mut allocator = Allocator.systemAllocatorProvider()\n  let plain = Source.read("shaders/long.wgsl")\n'
+    + `  let packed = Source.compressed("shaders/long.wgsl")\n  let text = Source.compressedText("${text}")\n`
+    + '  if Compressed.length(&packed) != plain.length || CompressedText.length(&text) != plain.length { return 1 }\n'
+    + '  if Compressed.compressedLength(&packed) * 4 > plain.length { return 2 }\n'
+    + '  if CompressedText.compressedLength(&text) != Compressed.compressedLength(&packed) { return 3 }\n'
+    + '  let bytes = run Compressed.bytes(&packed) |> Effect.provideMut<Allocator>(&mut allocator)\n'
+    + '  let expanded = Bytes.asSlice(&bytes)\n  if expanded.length != plain.length { return 4 }\n'
+    + '  let mut at: usize = 0\n  while at < plain.length {\n    if expanded[at] != plain[at] { return 5 }\n    at = at + 1\n  }\n'
+    + '  let owned = run CompressedText.text(&text) |> Effect.provideMut<Allocator>(&mut allocator)\n'
+    + '  let spelled = String.ownedUtf8Bytes(&owned)\n  if spelled.length != plain.length || spelled[plain.length - 3] != 206 { return 6 }\n'
+    + '  let empty = Source.compressed("shaders/empty.bin")\n'
+    + '  let nothing = run Compressed.bytes(&empty) |> Effect.provideMut<Allocator>(&mut allocator)\n'
+    + '  if Compressed.length(&empty) != 0 || Bytes.length(&nothing) != 0 { return 7 }\n'
+    + '  let short = Source.compressed("shaders/b.bin")\n'
+    + '  let raw = run Compressed.bytes(&short) |> Effect.provideMut<Allocator>(&mut allocator)\n'
+    + '  if Bytes.length(&raw) != 3 || Bytes.asSlice(&raw)[1] != 255 { return 8 }\n  return 42\n}\n'
+  yield* fs.writeFileString(join(embeds, 'src/main.silk'), compressedMain('shaders/long.wgsl'))
+  yield* embedBuild(42)
+  yield* fs.writeFileString(join(embeds, 'src/main.silk'), compressedMain('shaders/b.bin'))
+  const refusedText = yield* invoke(silk, ['build', '--stdlib', standardLibrary], embeds, splitEnvironment)
+  assert.notEqual(refusedText.status, 0, 'compressed text that is not UTF-8 was embedded')
+  assert.match(refusedText.stdout + refusedText.stderr, /main\.silk:11:14: error\[SEM0176\] .*cannot embed "shaders\/b\.bin" as text/)
+  // A dependency embeds its own files, and the package that depends on it reads them as bytes in
+  // a check and in a build: an embedded file is never parsed, so it need not be Silk. A check
+  // server reads an embedded file again before each check, from the directory of the package
+  // that embeds it.
+  const embedLibrary = join(directory, 'embed-library')
+  const embedApp = join(directory, 'embed-app')
+  yield* fs.makeDirectory(join(embedLibrary, 'src'), { recursive: true })
+  yield* fs.makeDirectory(join(embedLibrary, 'js'), { recursive: true })
+  yield* fs.makeDirectory(join(embedApp, 'src'), { recursive: true })
+  yield* fs.writeFileString(
+    join(embedLibrary, 'silk.toml'),
+    '[package]\nname = "embed-library"\nversion = "0.1.0"\nkind = "library"\nmain = "library.silk"\nexports = ["library"]\n',
+  )
+  yield* fs.writeFileString(join(embedLibrary, 'js/index.js'), 'export const hello = () => `hi ${1 + 1}`;\n')
+  yield* fs.writeFileString(
+    join(embedLibrary, 'src/library.silk'),
+    'import silk.build.source { Source }\n\npub fn script() -> &\'static [u8] {\n  return Source.read("js/index.js")\n}\n',
+  )
+  yield* fs.writeFileString(
+    join(embedApp, 'silk.toml'),
+    '[package]\nname = "embed-app"\nversion = "0.1.0"\n\n[dependencies]\nlibrary = { path = "../embed-library", package = "embed-library" }\n',
+  )
+  yield* fs.writeFileString(
+    join(embedApp, 'src/main.silk'),
+    'import library.library { script }\nimport silk.num.usize\n\npub fn main() -> i32 {\n  return usize.toI32(script().length)\n}\n',
+  )
+  const embedCheck = Effect.fnUntraced(function* (cwd: string, claim: string) {
+    const checked = yield* invoke(silk, ['check', '--stdlib', standardLibrary], cwd, splitEnvironment)
+    assert.equal(checked.status, 0, `${claim}: ${checked.stdout}${checked.stderr}`)
+  })
+  const embedAppRun = Effect.fnUntraced(function* (expected: number) {
+    const ran = yield* invoke(silk, ['run', '--stdlib', standardLibrary], embedApp, splitEnvironment)
+    assert.equal(ran.status, expected, ran.stderr)
+  })
+  yield* embedCheck(embedApp, 'a dependency\'s embedded JavaScript was checked as Silk')
+  yield* embedAppRun(42)
+  yield* embedCheck(embedApp, 'a second check lost a dependency\'s embedded file')
+  yield* fs.writeFileString(join(embedLibrary, 'js/index.js'), 'export const hello = () => `hello ${1 + 1}`;\n')
+  yield* embedCheck(embedApp, 'a check after an edit lost a dependency\'s embedded file')
+  yield* embedAppRun(45)
+  yield* embedCheck(embedLibrary, 'a package\'s own embedded file was not read')
+  yield* embedCheck(embedLibrary, 'a second check lost a package\'s own embedded file')
   yield* Console.log(
-    'Native build CLI: exact LLVM output, Clang bypass, --clang, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, path dependencies, native sources, native archives, exports, workspaces, silk change release/history/recovery, retention, runtime requests, format reports, installed standard library, clang on PATH, version, help, check, project test, cached codegen units, build replay, check replay, embedded files, object and static library artifacts and emission stages passed',
+    'Native build CLI: exact LLVM output, Clang bypass, --clang, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, path dependencies, native sources, native archives, exports, workspaces, silk change release/history/recovery, retention, runtime requests, format reports, installed standard library, clang on PATH, version, help, check, project test, cached codegen units, build replay, check replay, embedded files, compressed embedded files, embedded files of a dependency, object and static library artifacts and emission stages passed',
   )
 })
 const require = createRequire(new URL('../../package.json', import.meta.url))
