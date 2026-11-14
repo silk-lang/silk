@@ -19,6 +19,7 @@ The host passes these options. Each takes one value:
 | `--silk-test-result` | Path of the receipt file. Required. |
 | `--silk-test-progress` | Path of the progress file. Optional. |
 | `--silk-test-timeout` | Each test's time limit in whole seconds. Optional; `0` or absent is none. |
+| `--silk-test-record` | Path of the record of passing tests. Optional. |
 
 The runner checks the complete plan before any test body runs.
 
@@ -31,6 +32,11 @@ before each test body runs, and removes the file when every test has finished. I
 already holds a record when the runner starts, the test it names stopped an earlier runner
 process, for example with a trap. The runner then reports that test as failed, skips the tests
 before it, and continues with the next one, so its summary and receipt count the whole run.
+
+With `--silk-test-record`, on a target whose runner has a table of its functions (ELF and
+Mach-O), the runner skips a selected test that passed in the run that wrote the record, when it
+would execute the same functions on the same inputs (see `silk.testing.selection`). It reports
+the test as `CACHED` and counts it as cached and passed. At the end it writes the record again.
 
 With a time limit on a native target with a C library, the runner sets an alarm before each test
 body runs. A test that outlives it ends the process with `SIGALRM`, which the host reports as a

@@ -2064,8 +2064,8 @@ const program = Effect.gen(function* () {
   )
   const runnerRecord = join(directory, 'tested/build/test/llvm', hostTarget, 'debug/tested.inputs')
   const firstRecord = yield* fs.readFile(runnerRecord)
-  // No passing run is stored yet (the first used --no-cache), so a plain `silk test` runs every
-  // selected test.
+  // No passing test is recorded yet (the first run used --no-cache), so a plain `silk test` runs
+  // every selected test.
   const failedTests = yield* invoke(
     silk,
     ['test', '--stdlib', standardLibrary],
@@ -2087,15 +2087,15 @@ const program = Effect.gen(function* () {
     /util\/check::failsOnPurpose\n {4}assertion failed: integer division truncates\n {6}at [^\n]*failsOnPurpose \([^\n]*:12:3\)\n {4}FAIL/,
   )
   assert.match(failedTests.stdout, /2 passed, 2 failed \(0 cached, 4 executed, 4 selected, 4 discovered\)/)
-  // A passing run is stored, and the same selection on the unchanged runner is not run again.
+  // A test that passed is recorded, and the unchanged runner skips it while its code and inputs
+  // stay the same.
   const passArguments = ['test', '--stdlib', standardLibrary, '--file', 'src/util/check.silk', '--filter', 'EVEN']
   const passedTests = yield* invoke(silk, passArguments, join(directory, 'tested'), { ...process.env, SILK_CLANG: clang })
   assert.equal(passedTests.status, 0, passedTests.stderr)
-  assert.doesNotMatch(passedTests.stdout, /Not run again/)
   const replayedTests = yield* invoke(silk, passArguments, join(directory, 'tested'), { ...process.env, SILK_CLANG: clang })
   assert.equal(replayedTests.status, 0, replayedTests.stderr)
-  assert.match(replayedTests.stdout, /1 passed, 0 failed \(0 cached, 1 executed, 1 selected, 4 discovered\)/)
-  assert.match(replayedTests.stdout, /\nNot run again: nothing changed/)
+  assert.match(replayedTests.stdout, /util\/check::halvesEvenly\n {4}CACHED\n/)
+  assert.match(replayedTests.stdout, /1 passed, 0 failed \(1 cached, 0 executed, 1 selected, 4 discovered\)/)
   // `--no-cache` runs them again.
   const forcedTests = yield* invoke(
     silk,
@@ -2104,9 +2104,9 @@ const program = Effect.gen(function* () {
     { ...process.env, SILK_CLANG: clang },
   )
   assert.equal(forcedTests.status, 0, forcedTests.stderr)
-  assert.doesNotMatch(forcedTests.stdout, /Not run again/)
-  // A selection that matches no test verified nothing, so it fails.
-  // It is not stored either, so running it again fails the same way.
+  assert.match(forcedTests.stdout, /1 passed, 0 failed \(0 cached, 1 executed, 1 selected, 4 discovered\)/)
+  // A selection that matches no test verified nothing, so it fails, and running it again fails the
+  // same way.
   for (let attempt = 0; attempt < 2; attempt++) {
     const unmatchedTests = yield* invoke(
       silk,
@@ -2116,7 +2116,6 @@ const program = Effect.gen(function* () {
     )
     assert.equal(unmatchedTests.status, 1, unmatchedTests.stderr)
     assert.match(unmatchedTests.stderr, /no tests matched/)
-    assert.doesNotMatch(unmatchedTests.stdout, /Not run again/)
   }
   // A test past its --timeout and a test that overflows the stack each fail with a report naming
   // why, and the remaining tests still run.

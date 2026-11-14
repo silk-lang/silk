@@ -1,0 +1,177 @@
+//! What a test reads of the host while the test runner watches it.
+//!
+//! # When to use
+//! The built-in test runner (`silk.testing.runner`) watches each test with this module, so it can
+//! skip a passing test whose code and inputs did not change. The native providers of files,
+//! environment variables, clocks, randomness, sockets and child processes report to it. You do not
+//! call it from normal code.
+//!
+//! # Details
+//! A watch is one buffer that the runner owns, named by one word of the process. While no watch is
+//! active, a report reads that word and returns. While one is active, [`note`] appends a read the
+//! runner can repeat later (a file's contents, whether a path exists, a directory's listing, an
+//! environment variable), and [`mark`] records that the test used something it cannot repeat, such
+//! as the clock. Reports from several threads take turns on a lock.
+//!
+//! A buffer starts with a 32-byte header: its data capacity, the bytes used, the marks (each a
+//! `u64`, little-endian) and the lock word. Each note after it is its kind byte, then the root and
+//! the path, each as a 4-byte little-endian length and its bytes. A note that does not fit sets
+//! [`OVERFLOW`] instead.
+//!
+//! # Gotchas
+//! - Only reads through the native providers are seen. A test that calls C directly, or reads the
+//!   host some other way, reads unseen.
+//!
+//! @category Testing
+
+import silk.concurrency.atomic { Atomic, MemoryOrder }
+import silk.core.option { Option }
+import silk.mem.pointer { Pointer }
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+
+/// A note of a file's contents, read through a provider rooted at the note's root.
+pub const FILE: u8 = 1
+/// A note of whether a path exists, and whether it is a file or a directory, and its size.
+pub const ENTRY: u8 = 2
+/// A note of the names in a directory.
+pub const LISTING: u8 = 3
+/// A note of one environment variable, named by the note's path. Its root is empty.
+pub const VARIABLE: u8 = 4
+
+/// The mark of a clock read.
+pub const CLOCK: u64 = 1
+/// The mark of a random number from the host.
+pub const RANDOM: u64 = 2
+/// The mark of a socket or a name lookup.
+pub const NETWORK: u64 = 4
+/// The mark of a child process.
+pub const PROCESS: u64 = 8
+/// The mark of a note that did not fit in the buffer.
+pub const OVERFLOW: u64 = 16
+/// The mark of a list of environment variable names.
+pub const ENVIRONMENT: u64 = 32
+
+/// The size of a buffer's header, before its notes.
+pub const HEADER: usize = 32
+
+// The word of the process that holds the active buffer's address, or null.
+@inlineNever
+fn activeSlot() -> *mut ?*mut u8 {
+  return unsafe Intrinsic.pointerReinterpret<*mut u64, *mut ?*mut u8>(Intrinsic.processWord())
+}
+
+unsafe fn wordAt(buffer: *mut u8, offset: usize) -> *mut u64 {
+  unsafe {
+    return Intrinsic.pointerReinterpret<*mut u8, *mut u64>(Pointer.atMut<u8>(Pointer.assumeManyMut<u8>(buffer), offset))
+  }
+}
+
+// Takes the buffer's lock, runs nothing else meanwhile, and returns the buffer.
+unsafe fn lock(buffer: *mut u8) -> () {
+  unsafe {
+    let word = Intrinsic.pointerReinterpret<*mut u64, *mut u32>(wordAt(buffer, 24))
+    while true {
+      let previous = Atomic.swap<u32>(word, 1, MemoryOrder.Acquire)
+      if previous == 0 { return () }
+    }
+  }
+}
+
+unsafe fn unlock(buffer: *mut u8) -> () {
+  unsafe {
+    let word = Intrinsic.pointerReinterpret<*mut u64, *mut u32>(wordAt(buffer, 24))
+    Atomic.store<u32>(word, 0, MemoryOrder.Release)
+  }
+}
+
+/// Makes `buffer` the active watch, so the reports that follow go to it.
+///
+/// # Details
+/// `buffer` must hold a header (`HEADER` bytes) whose first word is the capacity of the data after
+/// it, whose other words are zero, and it must stay valid until [`stop`]. `start` does not clear it;
+/// the runner does.
+///
+/// # Gotchas
+/// Only the test runner calls it, between tests.
+pub unsafe fn start(buffer: *mut u8) -> () {
+  unsafe { Atomic.store<?*mut u8>(activeSlot(), buffer, MemoryOrder.Release) }
+}
+
+/// Ends the active watch. The reports that follow do nothing.
+///
+/// # Gotchas
+/// Only the test runner calls it, between tests. A report on another thread that already read the
+/// buffer's address can still write to it, so the runner reads the buffer only after the test's
+/// threads have stopped.
+pub fn stop() -> () {
+  unsafe { Atomic.store<?*mut u8>(activeSlot(), Pointer.null<u8>(), MemoryOrder.Release) }
+}
+
+/// Whether a watch is active.
+pub fn watching() -> bool {
+  let active = unsafe Atomic.load<?*mut u8>(activeSlot(), MemoryOrder.Acquire)
+  return !Pointer.isNull<u8>(active)
+}
+
+/// Records, in the active watch, that the test used what `reason` names, which it cannot repeat.
+///
+/// # Details
+/// `reason` is one of the marks, such as [`CLOCK`]. Without an active watch it does nothing.
+pub fn mark(reason: u64) -> () {
+  let active = unsafe Atomic.load<?*mut u8>(activeSlot(), MemoryOrder.Acquire)
+  if let Option<*mut u8>.Some { value: buffer } = Pointer.nonNullMut<u8>(active) {
+    unsafe { drop Atomic.fetchBitOr<u64>(wordAt(buffer, 16), reason, MemoryOrder.AcquireRelease) }
+  }
+  return ()
+}
+
+/// Records, in the active watch, that the test read `path` of a provider rooted at `root`, as
+/// `kind` says.
+///
+/// # Details
+/// `kind` is one of [`FILE`], [`ENTRY`], [`LISTING`] or [`VARIABLE`]. Without an active watch it
+/// does nothing. When the note does not fit, it marks [`OVERFLOW`].
+pub fn note(kind: u8, root: &[u8], path: &[u8]) -> () {
+  let active = unsafe Atomic.load<?*mut u8>(activeSlot(), MemoryOrder.Acquire)
+  if let Option<*mut u8>.Some { value: buffer } = Pointer.nonNullMut<u8>(active) {
+    unsafe {
+      lock(buffer)
+      let capacity = u64.toUsize(Pointer.read<u64>(wordAt(buffer, 0)))
+      let used = u64.toUsize(Pointer.read<u64>(wordAt(buffer, 8)))
+      let size = 9 + root.length + path.length
+      if size > capacity - used {
+        drop Atomic.fetchBitOr<u64>(wordAt(buffer, 16), OVERFLOW, MemoryOrder.AcquireRelease)
+      } else {
+        let data = Pointer.assumeManyMut<u8>(buffer)
+        let mut at = HEADER + used
+        Pointer.write<u8>(Pointer.atMut<u8>(data, at), kind)
+        at = at + usize.ONE
+        at = putText(data, at, root)
+        at = putText(data, at, path)
+        Pointer.write<u64>(wordAt(buffer, 8), usize.toU64(at - HEADER))
+      }
+      unlock(buffer)
+    }
+  }
+  return ()
+}
+
+unsafe fn putText(data: [*]mut u8, start: usize, text: &[u8]) -> usize {
+  let mut at = start
+  let length = usize.toU32(text.length)
+  let mut shift: u32 = 0
+  while shift < 32 {
+    unsafe { Pointer.write<u8>(Pointer.atMut<u8>(data, at), u32.toU8(u32.bitAnd(u32.shiftRight(length, shift), 255))) }
+    at = at + usize.ONE
+    shift = shift + 8
+  }
+  let mut index = usize.ZERO
+  while index < text.length {
+    unsafe { Pointer.write<u8>(Pointer.atMut<u8>(data, at), text[index]) }
+    at = at + usize.ONE
+    index = index + usize.ONE
+  }
+  return at
+}

@@ -9,19 +9,13 @@ The binary plan and receipt formats that let `silk test` control the test runner
 and the runner writes a receipt file. You do not call it from normal code.
 
 ## Details
-A plan starts with the magic `SLKTPLN1`, a version (`1`), a mode, and a 32-byte nonce. All
-integers are little-endian. There are two modes:
-
-- Per-test mode (`1`). The plan has the count of discovered tests, then one catalog entry per
-  test: ordinal, declaration name, execution identity, and action (`0` run, `1` cached). The
-  receipt has one result per selected test. Its disposition is `0` cached, `1` passed, or `2`
-  failed.
-- Uncached mode (`2`). The plan is exactly 256 bytes. It holds a SHA-256 digest of the catalog
-  (see [`updateCatalogDigest`](#updateCatalogDigest)) and the test count, then zero padding. The receipt is also
-  padded to 256 bytes.
+A plan is exactly 256 bytes: the magic `SLKTPLN1`, a version (`1`), the mode `2`, a 32-byte
+nonce, a SHA-256 digest of the catalog (see [`updateCatalogDigest`](#updateCatalogDigest)) and the test count, then
+zero padding. All integers are little-endian.
 
 A receipt starts with the magic `SLKTRCP1`, the version, the mode, the nonce of the plan, and
-the SHA-256 of the complete plan. It ends with the counts and the status.
+the SHA-256 of the complete plan. Then come the counts and the status, then zero padding to 256
+bytes.
 
 A progress record lets the host continue a run after a test traps. It is exactly 48 bytes: the
 magic `SLKTPRG1`, the ordinal of the test that is starting, then the cached, executed, passed
@@ -35,7 +29,7 @@ an abnormal exit the record names the test that stopped the process.
 
 Import as `TestExchange` with `import silk.testing.exchange as TestExchange`.
 
-Public declarations: 21.
+Public declarations: 11.
 
 <a id="Plan"></a>
 
@@ -50,16 +44,6 @@ A cursor over one borrowed plan file that the `silk test` driver wrote.
 ### Gotchas
 It does not stop at the first error. After a failure it reads as empty, and [`failed`](#failed)
 stays true. Check [`failed`](#failed) or the `bool` results before a test body runs.
-
-<a id="Entry"></a>
-
-## `Entry`
-
-```silk
-pub struct Entry<'a>
-```
-
-One borrowed per-test catalog entry.
 
 <a id="Progress"></a>
 
@@ -148,26 +132,6 @@ Opens a plan and checks its magic, version, mode and nonce framing.
 If a check fails, the returned plan is already rejected: it reads as empty, and [`failed`](#failed)
 returns `true`.
 
-<a id="isPerTest"></a>
-
-## `isPerTest`
-
-```silk
-pub fn isPerTest(plan: &Plan<'_>) -> bool
-```
-
-Returns true for a per-test plan (mode `1`).
-
-<a id="isUncached"></a>
-
-## `isUncached`
-
-```silk
-pub fn isUncached(plan: &Plan<'_>) -> bool
-```
-
-Returns true for an uncached plan of 256 bytes (mode `2`).
-
 <a id="failed"></a>
 
 ## `failed`
@@ -178,89 +142,19 @@ pub fn failed(plan: &Plan<'_>) -> bool
 
 Returns true after a check on the plan fails. It does not become false again.
 
-<a id="beginPerTest"></a>
+<a id="validate"></a>
 
-## `beginPerTest`
-
-```silk
-pub fn beginPerTest(plan: &mut Plan<'_>, expectedDiscovered: u64) -> bool
-```
-
-Reads the test count of a per-test plan, and checks it and the size bound of the file.
-
-The count must equal `expectedDiscovered`. Call it before any test body runs.
-
-<a id="readEntry"></a>
-
-## `readEntry`
+## `validate`
 
 ```silk
-pub fn readEntry<'a>(
-  plan: &mut Plan<'a>,
-  expectedOrdinal: u64,
-  expectedDeclaration: &[u8],
-) -> Entry<'a>
-```
-
-Reads and checks the next catalog entry.
-
-The ordinal and declaration name must match the expected values, and a cached entry must have an
-execution identity. For an uncached plan, it returns [`uncachedEntry`](#uncachedEntry) and reads nothing.
-
-<a id="cached"></a>
-
-## `cached`
-
-```silk
-pub fn cached(entry: &Entry<'_>) -> bool
-```
-
-Returns true for a valid entry that the host marked as a cache hit.
-
-<a id="executionIdentity"></a>
-
-## `executionIdentity`
-
-```silk
-pub fn executionIdentity<'a>(entry: &Entry<'a>) -> &'a [u8]
-```
-
-Borrows the opaque execution identity of an entry.
-
-<a id="uncachedEntry"></a>
-
-## `uncachedEntry`
-
-```silk
-pub fn uncachedEntry<'a>(bytes: &'a [u8]) -> Entry<'a>
-```
-
-Returns the empty entry that is not cached, for uncached mode.
-
-<a id="finishPerTest"></a>
-
-## `finishPerTest`
-
-```silk
-pub fn finishPerTest(plan: &mut Plan<'_>) -> bool
-```
-
-Checks that a per-test plan ends exactly after the catalog.
-
-<a id="validateUncached"></a>
-
-## `validateUncached`
-
-```silk
-pub fn validateUncached(
+pub fn validate(
   plan: &mut Plan<'_>,
   expectedCatalogDigest: &[u8],
   expectedDiscovered: u64,
 ) -> bool
 ```
 
-Checks an uncached plan: exactly 256 bytes, the catalog digest, the test count, and zero
-padding.
+Checks a plan: exactly 256 bytes, the catalog digest, the test count, and zero padding.
 
 <a id="updateCatalogDigest"></a>
 
@@ -270,7 +164,7 @@ padding.
 pub fn updateCatalogDigest(state: &mut Sha256, ordinal: u64, identity: &[u8]) -> ()
 ```
 
-Adds one catalog identity to the digest of an uncached plan.
+Adds one catalog identity to the digest of a plan.
 
 It hashes the ordinal and the identity length as 8-byte little-endian values, then the identity.
 
@@ -279,35 +173,10 @@ It hashes the ordinal and the identity length as 8-byte little-endian values, th
 ## `beginReceipt`
 
 ```silk
-pub effect fn beginReceipt(
-  plan: &[u8],
-  perTest: bool,
-  selected: u64,
-) -> Receipt ! OutOfMemoryError ? &mut Allocator
+pub effect fn beginReceipt(plan: &[u8]) -> Receipt ! OutOfMemoryError ? &mut Allocator
 ```
 
 Starts a receipt for `plan`. It copies the nonce and hashes the complete plan.
-
-`selected` is the number of results that follow in per-test mode.
-
-<a id="appendResult"></a>
-
-## `appendResult`
-
-```silk
-pub effect fn appendResult(
-  receipt: &mut Receipt,
-  ordinal: u64,
-  declaration: &[u8],
-  execution: &[u8],
-  disposition: u8,
-) -> () ! OutOfMemoryError ? &mut Allocator
-```
-
-Appends one per-test result. Append results in ordinal order.
-
-### Gotchas
-It traps if the receipt is not per-test, or if `disposition` is more than `2`.
 
 <a id="finishReceipt"></a>
 
@@ -326,9 +195,11 @@ pub effect fn finishReceipt(
 ) -> Bytes ! OutOfMemoryError ? &mut Allocator
 ```
 
-Appends the counts and the status, and returns the receipt bytes.
+Appends the counts and the status, and returns the receipt bytes, padded to exactly 256 bytes.
 
-In uncached mode the receipt is padded to exactly 256 bytes.
+### Details
+`cachedCount` counts the selected tests the runner did not run because they passed before with
+the same code and inputs; `passed` includes them.
 
 <a id="progressRecord"></a>
 

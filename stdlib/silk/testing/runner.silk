@@ -15,6 +15,7 @@
 //! | `--silk-test-result` | Path of the receipt file. Required. |
 //! | `--silk-test-progress` | Path of the progress file. Optional. |
 //! | `--silk-test-timeout` | Each test's time limit in whole seconds. Optional; `0` or absent is none. |
+//! | `--silk-test-record` | Path of the record of passing tests. Optional. |
 //!
 //! The runner checks the complete plan before any test body runs.
 //!
@@ -27,6 +28,11 @@
 //! already holds a record when the runner starts, the test it names stopped an earlier runner
 //! process, for example with a trap. The runner then reports that test as failed, skips the tests
 //! before it, and continues with the next one, so its summary and receipt count the whole run.
+//!
+//! With `--silk-test-record`, on a target whose runner has a table of its functions (ELF and
+//! Mach-O), the runner skips a selected test that passed in the run that wrote the record, when it
+//! would execute the same functions on the same inputs (see `silk.testing.selection`). It reports
+//! the test as `CACHED` and counts it as cached and passed. At the end it writes the record again.
 //!
 //! With a time limit on a native target with a C library, the runner sets an alarm before each test
 //! body runs. A test that outlives it ends the process with `SIGALRM`, which the host reports as a
@@ -57,6 +63,25 @@ static if Intrinsic.targetOperatingSystem() == "windows" {
   }
 }
 import silk.system.monotonic_clock_native { OsMonotonicClock }
+// The runner's table of executed functions lies in a section whose bounds the linker names. The
+// compiler gives every function of a test runner for an ELF or Mach-O target a record there.
+static if Intrinsic.targetObjectFormat() == "elf" {
+  unsafe extern "C" static seenStart: u8 as "__start_silk_seen"
+  unsafe extern "C" static seenStop: u8 as "__stop_silk_seen"
+  fn runnerTable() -> Table {
+    unsafe { return Table.between(Pointer.fromRef<u8>(&seenStart), Pointer.fromRef<u8>(&seenStop)) }
+  }
+} else {
+  static if Intrinsic.targetObjectFormat() == "macho" {
+    unsafe extern "C" static seenStart: u8 as "\x01section$start$__DATA$__silk_seen"
+    unsafe extern "C" static seenStop: u8 as "\x01section$end$__DATA$__silk_seen"
+    fn runnerTable() -> Table {
+      unsafe { return Table.between(Pointer.fromRef<u8>(&seenStart), Pointer.fromRef<u8>(&seenStop)) }
+    }
+  } else {
+    fn runnerTable() -> Table { return Table.empty() }
+  }
+}
 import silk.core.option { Option }
 import silk.io.writer_native { StdoutWriter }
 import silk.core.result { Result }
@@ -64,12 +89,17 @@ import silk.crypto.sha2 { Sha256 }
 import silk.text.string { InvalidUtf8, String }
 import silk.system.system_clock { Instant, SystemClock }
 import silk.testing.exchange as TestExchange
+import silk.testing.observation as Observation
+import silk.testing.selection as Selection
+import silk.testing.selection { Entry, Previous, Table }
 import silk.testing.testing { AssertionError, Testing }
 import silk.num.u32
 import silk.num.u64
 import silk.num.u8
 import silk.collections.list { List }
+import silk.collections.slice { Slice }
 import silk.io.writer { Writer, WriterError }
+import silk.mem.pointer { Pointer }
 import silk.num.usize
 
 struct TestOutcome<T> {}
@@ -248,27 +278,10 @@ fn catalogDigest(tests: &[CatalogTest]) -> [u8; 32] {
   return state.finish()
 }
 
-fn validatePlan(bytes: &[u8], tests: &[CatalogTest]) -> i32 {
-  let discovered = usize.toU64(tests.length)
+fn validPlan(bytes: &[u8], tests: &[CatalogTest]) -> bool {
   let mut plan = TestExchange.openPlan(bytes)
-  if TestExchange.isPerTest(&plan) {
-    if !TestExchange.beginPerTest(&mut plan, discovered) { return 11 }
-    let mut index = usize.ZERO
-    while index < tests.length {
-      let entry = TestExchange.readEntry(&mut plan, usize.toU64(index), String.utf8Bytes(tests[index].identity))
-      drop entry
-      if TestExchange.failed(&plan) { return 12 }
-      index = index + usize.ONE
-    }
-    if TestExchange.finishPerTest(&mut plan) { return 0 }
-    return 13
-  }
-  if TestExchange.isUncached(&plan) {
-    let digest = catalogDigest(tests)
-    if TestExchange.validateUncached(&mut plan, &digest, discovered) { return 0 }
-    return 21
-  }
-  return 1
+  let digest = catalogDigest(tests)
+  return TestExchange.validate(&mut plan, &digest, usize.toU64(tests.length))
 }
 
 // Which tests the filters select, in catalog order.
@@ -322,18 +335,23 @@ effect fn resumedProgress(path: &Option<Path>) -> Option<TestExchange.Progress> 
 }
 
 // The state of one run as it walks the catalog.
-struct Session<'plan> {
+struct Session {
   tests: List<CatalogTest>,
   selected: List<bool>,
-  plan: TestExchange.Plan<'plan>,
-  // The plan entry of the test at `ordinal`, once `beginTest` has read it.
-  entry: TestExchange.Entry<'plan>,
   receipt: TestExchange.Receipt,
   progressPath: Option<Path>,
   clock: OsMonotonicClock,
   testStarted: Instant,
   limit: u32,
-  perTest: bool,
+  // Whether the runner skips unchanged tests and writes a record: it has a record path and a table.
+  recording: bool,
+  table: Table,
+  // What the last run recorded.
+  previous: Previous,
+  // What this run records: the tests that passed, executed or skipped.
+  entries: List<Entry>,
+  // The watch buffer: its header, then the notes of the test that runs.
+  watch: Bytes,
   // The test that stopped an earlier runner failed; the tests before it already ran there.
   resumed: bool,
   stopped: u64,
@@ -344,15 +362,51 @@ struct Session<'plan> {
   failed: u64,
 }
 
-// Reports the next catalog test and returns whether its body should run now. A cached, filtered,
-// or already finished test is handled here and returns false.
-effect fn beginTest(session: &mut Session<'_>) -> bool
+// Keeps what the last run recorded for the test `identity`, which this run does not execute, when
+// its functions are all still in the runner.
+effect fn carry(session: &mut Session, identity: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  if !session.recording { return () }
+  if let Option<Entry>.Some { value } = move run Previous.find(&mut session.previous, identity) {
+    run List<Entry>.append(&mut session.entries, move value)
+  }
+  return ()
+}
+
+fn watchBuffer(session: &mut Session) -> *mut u8 {
+  return Pointer.fromMutRef<u8>(&mut Bytes.asMutSlice(&mut session.watch)[0])
+}
+
+fn littleWord(bytes: &[u8], at: usize) -> u64 {
+  let mut value: u64 = 0
+  let mut index = usize.ZERO
+  while index < 8 {
+    value = u64.bitOr(value, u64.shiftLeft(u8.toU64(bytes[at + index]), usize.toU64(index * 8)))
+    index = index + usize.ONE
+  }
+  return value
+}
+
+// Empties the watch buffer: its capacity, no notes, no marks, the lock free.
+fn resetWatch(session: &mut Session) -> () {
+  let bytes = Bytes.asMutSlice(&mut session.watch)
+  let capacity = usize.toU64(bytes.length - Observation.HEADER)
+  let mut index = usize.ZERO
+  while index < Observation.HEADER {
+    bytes[index] = 0
+    if index < 8 { bytes[index] = u64.toU8(u64.bitAnd(u64.shiftRight(capacity, usize.toU64(index * 8)), 255)) }
+    index = index + usize.ONE
+  }
+  return ()
+}
+
+// Reports the next catalog test and returns whether its body should run now. A filtered, already
+// finished, or unchanged passing test is handled here and returns false.
+effect fn beginTest(session: &mut Session) -> bool
 ! OutOfMemoryError | FileError | WriterError
-? &mut Allocator | &mut FileSystem | &mut Writer {
+? &mut Allocator | &mut FileSystem | &mut Writer | &mut HostInput {
   let ordinal = session.ordinal
   let index = u64.toUsize(ordinal)
   let declaration = String.utf8Bytes(List<CatalogTest>.asSlice(&session.tests)[index].identity)
-  session.entry = TestExchange.readEntry(&mut session.plan, ordinal, declaration)
   if session.resumed && ordinal <= session.stopped {
     // The earlier runner already wrote this test's name; its trap report followed.
     if ordinal == session.stopped { run Writer.writeString("    FAIL  stopped the test process\n") }
@@ -360,6 +414,7 @@ effect fn beginTest(session: &mut Session<'_>) -> bool
     return false
   }
   if !List<bool>.asSlice(&session.selected)[index] {
+    run carry(&mut session, declaration)
     session.ordinal = ordinal + 1
     return false
   }
@@ -367,19 +422,17 @@ effect fn beginTest(session: &mut Session<'_>) -> bool
   let name = List<CatalogTest>.asSlice(&session.tests)[index].name
   let identity = .{module: module, name: name}
   run Format.format("  {module}::{name}\n", &identity)
-  if session.perTest && TestExchange.cached(&session.entry) {
-    run Writer.writeString("    CACHED\n")
-    run TestExchange.appendResult(
-      &mut session.receipt,
-      ordinal,
-      declaration,
-      TestExchange.executionIdentity(&session.entry),
-      0,
-    )
-    session.cached = session.cached + 1
-    session.passed = session.passed + 1
-    session.ordinal = ordinal + 1
-    return false
+  if session.recording {
+    if let Option<Entry>.Some { value } = move run Previous.find(&mut session.previous, declaration) {
+      if run Selection.unchanged(&value) {
+        run Writer.writeString("    CACHED\n")
+        run List<Entry>.append(&mut session.entries, move value)
+        session.cached = session.cached + 1
+        session.passed = session.passed + 1
+        session.ordinal = ordinal + 1
+        return false
+      }
+    }
   }
   run recordProgress(&session.progressPath, TestExchange.Progress {
     ordinal: ordinal, cachedCount: session.cached, executed: session.executed, passed: session.passed,
@@ -388,13 +441,20 @@ effect fn beginTest(session: &mut Session<'_>) -> bool
   session.testStarted = run MonotonicClock.now()
     |> Effect.provideMut<MonotonicClock>(&mut session.clock)
   setAlarm(session.limit)
+  if session.recording {
+    resetWatch(&mut session)
+    Table.clear(&session.table)
+    // Last, so that the watch sees only the test.
+    unsafe { Observation.start(watchBuffer(&mut session)) }
+  }
   return true
 }
 
 // Records the outcome of the test body that `beginTest` started.
-effect fn endTest(session: &mut Session<'_>, ok: bool) -> ()
+effect fn endTest(session: &mut Session, ok: bool) -> ()
 ! OutOfMemoryError | WriterError
-? &mut Allocator | &mut Writer {
+? &mut Allocator | &mut Writer | &mut HostInput {
+  if session.recording { Observation.stop() }
   setAlarm(0)
   let testFinished = run MonotonicClock.now()
     |> Effect.provideMut<MonotonicClock>(&mut session.clock)
@@ -402,17 +462,21 @@ effect fn endTest(session: &mut Session<'_>, ok: bool) -> ()
   session.executed = session.executed + 1
   if ok { session.passed = session.passed + 1 } else { session.failed = session.failed + 1 }
   let ordinal = session.ordinal
-  if session.perTest {
-    let mut disposition: u8 = 2
-    if ok { disposition = 1 }
-    let declaration = String.utf8Bytes(List<CatalogTest>.asSlice(&session.tests)[u64.toUsize(ordinal)].identity)
-    run TestExchange.appendResult(
-      &mut session.receipt,
-      ordinal,
-      declaration,
-      TestExchange.executionIdentity(&session.entry),
-      disposition,
-    )
+  if session.recording {
+    let mut functions = List<u32>.make()
+    let known = run Table.collect(&session.table, &mut functions)
+    let header = Bytes.asSlice(&session.watch)
+    let used = u64.toUsize(littleWord(header, 8))
+    let marks = littleWord(header, 16)
+    // A test that failed, or used what it cannot repeat, runs again next time.
+    if ok && known && marks == 0 {
+      let notes = Slice.view<u8>(Bytes.asSlice(&session.watch), Observation.HEADER, used)
+      let inputs = run Selection.inputs(notes)
+      let declaration = String.utf8Bytes(List<CatalogTest>.asSlice(&session.tests)[u64.toUsize(ordinal)].identity)
+      run List<Entry>.append(&mut session.entries, Entry {
+        identity: run Bytes.copy(declaration), functions: move functions, inputs: move inputs,
+      })
+    }
   }
   session.ordinal = ordinal + 1
   return ()
@@ -422,22 +486,24 @@ effect fn endTest(session: &mut Session<'_>, ok: bool) -> ()
 // holds no loan per test.
 service TestSession {
   effect fn begin() -> bool ! OutOfMemoryError | FileError | WriterError
-    ? &mut TestSession | &mut Allocator | &mut FileSystem | &mut Writer
-  effect fn end(ok: bool) -> () ! OutOfMemoryError | WriterError ? &mut TestSession | &mut Allocator | &mut Writer
+    ? &mut TestSession | &mut Allocator | &mut FileSystem | &mut Writer | &mut HostInput
+  effect fn end(ok: bool) -> () ! OutOfMemoryError | WriterError
+    ? &mut TestSession | &mut Allocator | &mut Writer | &mut HostInput
 }
 
-impl<'plan> TestSession for Session<'plan> {
+impl TestSession for Session {
   effect fn begin(self: &mut Self) -> bool ! OutOfMemoryError | FileError | WriterError
-    ? &mut Allocator | &mut FileSystem | &mut Writer {
+    ? &mut Allocator | &mut FileSystem | &mut Writer | &mut HostInput {
     return run beginTest(&mut self)
   }
-  effect fn end(self: &mut Self, ok: bool) -> () ! OutOfMemoryError | WriterError ? &mut Allocator | &mut Writer {
+  effect fn end(self: &mut Self, ok: bool) -> () ! OutOfMemoryError | WriterError
+    ? &mut Allocator | &mut Writer | &mut HostInput {
     return run endTest(&mut self, ok)
   }
 }
 
 effect fn runAll() -> () ! OutOfMemoryError | FileError | WriterError
-  ? &mut TestSession | &mut Allocator | &mut FileSystem | &mut Writer {
+  ? &mut TestSession | &mut Allocator | &mut FileSystem | &mut Writer | &mut HostInput {
   static for descriptor in Intrinsic.tests() {
     if run TestSession.begin() { run TestSession.end(invokeTest(descriptor)) }
   }
@@ -450,7 +516,7 @@ static if Intrinsic.targetOperatingSystem() == "wasi" || (Intrinsic.targetOperat
   // Runs the tests under an observer that writes to standard output like the runner, so the report
   // of a failed test, with its call path, appears under the test's name.
   effect fn observedTests() -> () ! OutOfMemoryError | FileError | WriterError
-    ? &mut TestSession | &mut Allocator | &mut FileSystem | &mut Writer {
+    ? &mut TestSession | &mut Allocator | &mut FileSystem | &mut Writer | &mut HostInput {
     let observer = run NativeDiagnostics.make(NativeReport.indented(1, 4096, 32, "    "), 64)
     let finished = run NativeDiagnostics.observe(move observer, Effect.result(runAll()))
     return match move finished {
@@ -460,7 +526,7 @@ static if Intrinsic.targetOperatingSystem() == "wasi" || (Intrinsic.targetOperat
   }
 } else {
   effect fn observedTests() -> () ! OutOfMemoryError | FileError | WriterError
-    ? &mut TestSession | &mut Allocator | &mut FileSystem | &mut Writer {
+    ? &mut TestSession | &mut Allocator | &mut FileSystem | &mut Writer | &mut HostInput {
     return run runAll()
   }
 }
@@ -474,30 +540,40 @@ fn invokeTest<F>(static descriptor: Intrinsic.Test<F>) -> bool {
   return completeTest(move value, move provider)
 }
 
+// What the last run recorded at `path`, for this runner's `table`, run in `working`.
+effect fn previousRecord(path: &Path, table: &Table, working: &[u8]) -> Previous
+! OutOfMemoryError
+? &mut Allocator | &mut FileSystem {
+  let read = run Effect.result(FileSystem.readFile(path))
+  return match move read {
+    Result<Bytes, FileError | OutOfMemoryError>.Success { value } => run Previous.read(Bytes.asSlice(&value), table, working)
+    Result<Bytes, FileError | OutOfMemoryError>.Failure { error } => match move error {
+      FileError missing => { drop missing Previous.none() }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+// The bytes of the watch buffer: its header and room for the notes of one test.
+const WATCH_BYTES: usize = 4194304
+
 effect fn runSelected<'file, 'name>(
   fileFilter: string<'file>,
   nameFilter: string<'name>,
   planBytes: &[u8],
   resultPath: &Path,
   progressPath: Option<Path>,
+  recordPath: Option<Path>,
   limit: u32,
 ) -> i32
 ! OutOfMemoryError | FileError | WriterError
-? &mut Allocator | &mut FileSystem | &mut Writer {
+? &mut Allocator | &mut FileSystem | &mut Writer | &mut HostInput {
   let tests = run catalog()
   let discovered = usize.toU64(tests.length())
-  if validatePlan(planBytes, List<CatalogTest>.asSlice(&tests)) != 0 { return 2 }
-  let opened = TestExchange.openPlan(planBytes)
-  let perTest = TestExchange.isPerTest(&opened)
-  drop opened
+  if !validPlan(planBytes, List<CatalogTest>.asSlice(&tests)) { return 2 }
   let chosen = run selection(List<CatalogTest>.asSlice(&tests), fileFilter, nameFilter)
   let selected = selectedCount(List<bool>.asSlice(&chosen))
-  let receipt = run TestExchange.beginReceipt(planBytes, perTest, selected)
-  let mut plan = TestExchange.openPlan(planBytes)
-  if perTest {
-    let began = TestExchange.beginPerTest(&mut plan, discovered)
-    drop began
-  }
+  let receipt = run TestExchange.beginReceipt(planBytes)
   let mut resumed = false
   let mut stopped: u64 = 0
   let mut cached: u64 = 0
@@ -512,20 +588,46 @@ effect fn runSelected<'file, 'name>(
     passed = value.passed
     failed = value.failedCount + 1
   }
+  // A runner skips unchanged tests when the host names a record and its compiler wrote a table.
+  let table = runnerTable()
+  let mut working = Bytes.make()
+  let mut previous = Previous.none()
+  let mut recording = false
+  let mut watch = Bytes.make()
+  if let Option<Path>.Some { value } = &recordPath {
+    if Table.length(&table) != usize.ZERO {
+      match move run Effect.result(HostInput.workingDirectory()) {
+        Result<Bytes, HostInputError | OutOfMemoryError>.Success { value: directory } => {
+          working = move directory
+          recording = true
+        }
+        Result<Bytes, HostInputError | OutOfMemoryError>.Failure { error } => match move error {
+          HostInputError unknown => { drop unknown }
+          OutOfMemoryError exhausted => { fail move exhausted }
+        }
+      }
+    }
+    if recording {
+      previous = run previousRecord(&value, &table, Bytes.asSlice(&working))
+      watch = run Bytes.zeroed(WATCH_BYTES)
+    }
+  }
   let mut clock = OsMonotonicClock.make()
   let started = run MonotonicClock.now()
     |> Effect.provideMut<MonotonicClock>(&mut clock)
   let mut session = Session {
     tests: move tests,
     selected: move chosen,
-    plan: move plan,
-    entry: TestExchange.uncachedEntry(planBytes),
     receipt: move receipt,
     progressPath: move progressPath,
     clock: move clock,
     testStarted: SystemClock.make(SystemClock.seconds(&started), SystemClock.nanoseconds(&started)),
     limit: limit,
-    perTest: perTest,
+    recording: recording,
+    table: table,
+    previous: move previous,
+    entries: List<Entry>.make(),
+    watch: move watch,
     resumed: resumed,
     stopped: stopped,
     ordinal: 0,
@@ -570,6 +672,14 @@ effect fn runSelected<'file, 'name>(
     session.failed,
     status,
   )
+  if session.recording {
+    if let Option<Path>.Some { value } = &recordPath {
+      let record = run Selection.record(&session.table, Bytes.asSlice(&working), List<Entry>.asSlice(&session.entries))
+      // Without the record the next run runs every test; it never changes this run.
+      let written = run Effect.result(FileSystem.writeFile(&value, Bytes.asSlice(&record)))
+      drop written
+    }
+  }
   run FileSystem.writeFile(resultPath, Bytes.asSlice(&bytes))
   if status == 0 { return 0 }
   return 1
@@ -590,13 +700,15 @@ fn argumentOrEmpty<'arguments>(
 }
 
 effect fn executeArguments<'arguments>(values: &'arguments [Bytes]) -> i32
-! FileError | OutOfMemoryError | WriterError {
+! FileError | OutOfMemoryError | WriterError
+? &mut HostInput {
   let mut fileIndex = usize.ZERO
   let mut nameIndex = usize.ZERO
   let mut planIndex = usize.ZERO
   let mut resultIndex = usize.ZERO
   let mut progressIndex = usize.ZERO
   let mut timeoutIndex = usize.ZERO
+  let mut recordIndex = usize.ZERO
   let mut index = usize.ONE
   while index < values.length {
     let option = match move argumentText(values, index) {
@@ -622,7 +734,11 @@ effect fn executeArguments<'arguments>(values: &'arguments [Bytes]) -> i32
               if Intrinsic.stringEqualsExact(option, "--silk-test-timeout") {
                 timeoutIndex = index + usize.ONE
               } else {
-                return 2
+                if Intrinsic.stringEqualsExact(option, "--silk-test-record") {
+                  recordIndex = index + usize.ONE
+                } else {
+                  return 2
+                }
               }
             }
           }
@@ -675,6 +791,15 @@ effect fn executeArguments<'arguments>(values: &'arguments [Bytes]) -> i32
     progressPath = Option<Path>.some(run Path.make(progressText)
       |> Effect.provideMut<Allocator>(&mut allocator))
   }
+  let mut recordPath = Option<Path>.none()
+  if recordIndex != usize.ZERO {
+    let recordText = match move argumentText(values, recordIndex) {
+      Result<string, InvalidUtf8>.Success { value } => move value
+      Result<string, InvalidUtf8>.Failure { error } => { drop error return 2 }
+    }
+    recordPath = Option<Path>.some(run Path.make(recordText)
+      |> Effect.provideMut<Allocator>(&mut allocator))
+  }
   let metadata = run FileSystem.stat(&planPath)
     |> Effect.provideMut<FileSystem>(&mut fileSystem)
   let planLength = match move metadata {
@@ -687,7 +812,7 @@ effect fn executeArguments<'arguments>(values: &'arguments [Bytes]) -> i32
     |> Effect.provideMut<Allocator>(&mut allocator)
   let planBytes = run reading
   let mut writer = StdoutWriter.make()
-  return run runSelected(fileFilter, nameFilter, Bytes.asSlice(&planBytes), &resultPath, move progressPath, limit)
+  return run runSelected(fileFilter, nameFilter, Bytes.asSlice(&planBytes), &resultPath, move progressPath, move recordPath, limit)
     |> Effect.provideMut<Allocator>(&mut allocator)
     |> Effect.provideMut<FileSystem>(&mut fileSystem)
     |> Effect.provideMut<Writer>(&mut writer)
