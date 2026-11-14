@@ -4,6 +4,8 @@
 //! # When to use
 //! Use [`Source.read`] for a file's bytes and [`Source.text`] for UTF-8 text, from runtime code
 //! or from a `static fn` that parses the file while the package compiles. Use
+//! [`Source.compressed`] and [`Source.compressedText`] for a large file the program does not
+//! need at once: the program holds it compressed and expands it when asked. Use
 //! `silk.system.filesystem` for files the program reads when it runs.
 //!
 //! # Details
@@ -11,7 +13,8 @@
 //! separators and has no `.` or `..` segment, so a package reads only its own files. Write it as
 //! a string literal in the call: the build finds the files a package reads from those literals.
 //! The file's contents become a constant of the program. Editing the file rebuilds only the
-//! functions that read it.
+//! functions that read it. The file is read as bytes and never as Silk source, whatever it holds,
+//! and a package that depends on this one builds with the same contents.
 //!
 //! # Examples
 //! ## Embed a shader
@@ -23,7 +26,32 @@
 //! }
 //! ```
 //!
+//! ## Keep a large script compressed
+//! ```silk,ignore
+//! import silk.build.source { CompressedText, Source }
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.text.string { String }
+//!
+//! pub effect fn library() -> String ! OutOfMemoryError ? &mut Allocator {
+//!   let packed = Source.compressedText("js/index.js")
+//!   return run CompressedText.text(&packed)
+//! }
+//! ```
+//!
 //! @category Core
+
+import silk.collections.bytes { Bytes }
+import silk.compress.zstd { Zstd, ZstdError, ZstdLimits, ZstdProgress, ZstdStatus }
+import silk.core.effect { Effect }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u8
+import silk.num.usize
+import silk.text.string { String }
+
+// The largest window of a frame the build writes: 4 MiB.
+const WINDOW_LIMIT: usize = 4194304
 
 /// The owner type of the package file reads. It has no fields and is never constructed.
 ///
@@ -49,5 +77,161 @@ impl Source {
   /// package or names no file.
   pub static fn text(path: string<'static>) -> string<'static> {
     return Intrinsic.embedText(path)
+  }
+  /// Returns the package file at `path`, kept compressed in the program.
+  ///
+  /// # Details
+  ///
+  /// The build compresses the file as one Zstandard frame, and the program holds only that
+  /// frame. [`Compressed.bytes`] expands it when the program asks. A file that does not shrink
+  /// is stored as it is, a few bytes larger.
+  ///
+  /// # Gotchas
+  ///
+  /// A path that leaves the package, or names no file, is a compile error at the call.
+  pub static fn compressed(path: string<'static>) -> Compressed {
+    return Compressed { frame: Intrinsic.embedCompressed(path) }
+  }
+  /// Returns the text of the package file at `path`, kept compressed in the program.
+  ///
+  /// # Details
+  ///
+  /// The build checks that the file is UTF-8 and compresses it as one Zstandard frame, and the
+  /// program holds only that frame. [`CompressedText.text`] expands it when the program asks.
+  ///
+  /// # Gotchas
+  ///
+  /// A file that is not valid UTF-8 is a compile error at the call, as is a path that leaves the
+  /// package or names no file.
+  pub static fn compressedText(path: string<'static>) -> CompressedText {
+    // Read as text first, so a file that is not UTF-8 stops the build here.
+    let _checked = Intrinsic.embedText(path)
+    return CompressedText { file: Compressed { frame: Intrinsic.embedCompressed(path) } }
+  }
+}
+
+/// A package file the program holds compressed, from [`Source.compressed`].
+///
+/// # Details
+///
+/// The value is a borrow of a constant of the program, so it copies freely and lives as long as
+/// the program does. Nothing is expanded until [`Compressed.bytes`] runs, and each call expands
+/// the file again: keep the result when the program needs it more than once.
+pub struct Compressed {
+  // One Zstandard frame whose header records the file's length.
+  frame: &'static [u8],
+}
+
+impl Copy for Compressed {}
+
+impl Compressed {
+  /// Returns how many bytes the file holds once expanded.
+  pub fn length(self: &Self) -> usize {
+    // The frame header (RFC 8878, section 3.1.1.1): a 4-byte magic number, a descriptor, a window
+    // byte unless the frame is one segment, then the content size in 1, 2, 4 or 8 bytes.
+    let descriptor = u8.toUsize(self.frame[4])
+    let flag = usize.shiftRight(descriptor, 6)
+    let mut at: usize = 6
+    if usize.bitAnd(descriptor, 32) != 0 {
+      at = 5
+    }
+    let mut width: usize = 1
+    if flag != 0 {
+      width = usize.shiftLeft(1, flag)
+    }
+    let mut size: usize = 0
+    let mut index = width
+    while index > 0 {
+      index = index - 1
+      size = usize.shiftLeft(size, 8) + u8.toUsize(self.frame[at + index])
+    }
+    if flag == 1 {
+      size = size + 256
+    }
+    return size
+  }
+  /// Returns how many bytes the program holds for the file.
+  pub fn compressedLength(self: &Self) -> usize {
+    return self.frame.length
+  }
+  /// Expands the file and returns its bytes, exactly as the build read them.
+  ///
+  /// # Details
+  ///
+  /// Besides the result, it allocates a decoder for the length of the call: a window as large
+  /// as the file, up to 4 MiB, and about 400 KiB of buffers and tables.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the result or the decoder.
+  pub effect fn bytes(self: &Self) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+    let size = Compressed.length(self)
+    let mut output = run Bytes.zeroed(size)
+    let mut limits = ZstdLimits.make()
+    limits.inputBytes = usize.toU64(self.frame.length)
+    limits.outputBytes = usize.toU64(size)
+    limits.windowBytes = size
+    if size > WINDOW_LIMIT {
+      limits.windowBytes = WINDOW_LIMIT
+    }
+    if size == 0 {
+      limits.windowBytes = 1
+    }
+    let made = run Effect.result(Zstd.make(move limits))
+    let mut decoder = match move made {
+      Result<Zstd, ZstdError | OutOfMemoryError>.Success { value } => move value
+      Result<Zstd, ZstdError | OutOfMemoryError>.Failure { error } => match move error {
+        OutOfMemoryError exhausted => { fail move exhausted }
+        ZstdError _refused => Intrinsic.trap("Compressed.bytes: the decoder refused its limits")
+      }
+    }
+    let expanded = match Zstd.step(&mut decoder, self.frame, Bytes.asMutSlice(&mut output), true) {
+      Result<ZstdProgress, ZstdError>.Success { value } => value.status == ZstdStatus.Finished && value.written == size
+      Result<ZstdProgress, ZstdError>.Failure {..} => false
+    }
+    if !expanded {
+      return Intrinsic.trap("Compressed.bytes: the build wrote a frame that does not hold the file")
+    }
+    return move output
+  }
+}
+
+/// A UTF-8 package file the program holds compressed, from [`Source.compressedText`].
+///
+/// # Details
+///
+/// The value is a borrow of a constant of the program, so it copies freely and lives as long as
+/// the program does. Nothing is expanded until [`CompressedText.text`] runs, and each call
+/// expands the file again: keep the result when the program needs it more than once.
+pub struct CompressedText {
+  file: Compressed,
+}
+
+impl Copy for CompressedText {}
+
+impl CompressedText {
+  /// Returns how many bytes of UTF-8 the text holds once expanded.
+  pub fn length(self: &Self) -> usize {
+    return Compressed.length(&self.file)
+  }
+  /// Returns how many bytes the program holds for the text.
+  pub fn compressedLength(self: &Self) -> usize {
+    return self.file.frame.length
+  }
+  /// Expands the file and returns its text.
+  ///
+  /// # Details
+  ///
+  /// The build already checked that the file is UTF-8, so the text is not checked again.
+  /// Besides the result, it allocates a decoder for the length of the call: a window as large
+  /// as the file, up to 4 MiB, and about 400 KiB of buffers and tables.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the result or the decoder.
+  pub effect fn text(self: &Self) -> String ! OutOfMemoryError ? &mut Allocator {
+    let expanded = run Compressed.bytes(&self.file)
+    // The build checked the file as UTF-8 before it compressed the same bytes.
+    unsafe { return String.fromBytesUnchecked(move expanded) }
   }
 }

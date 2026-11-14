@@ -604,10 +604,12 @@ sealed target primitive requirements,
 The ordinary standard-library module `silk.build.source` reads a file of the calling package during
 static evaluation:
 
-| Member              | Result            | Value                                   |
-| ------------------- | ----------------- | --------------------------------------- |
-| `Source.read(path)` | `&'static [u8]`   | The file's bytes                        |
-| `Source.text(path)` | `string<'static>` | The file's text, checked to be UTF-8    |
+| Member                        | Result            | Value                                                 |
+| ----------------------------- | ----------------- | ----------------------------------------------------- |
+| `Source.read(path)`           | `&'static [u8]`   | The file's bytes                                      |
+| `Source.text(path)`           | `string<'static>` | The file's text, checked to be UTF-8                  |
+| `Source.compressed(path)`     | `Compressed`      | The file's bytes, held as one Zstandard frame         |
+| `Source.compressedText(path)` | `CompressedText`  | The file's text, checked to be UTF-8, held as a frame |
 
 The path is relative to the directory that holds the package's `silk.toml`, uses `/` separators and
 has no empty, `.` or `..` segment, so a package reads only its own files. Write it as a string
@@ -629,17 +631,42 @@ static fn composedShader() -> string<'static> {
 ```
 
 A read belongs to the package of the innermost calling frame outside the standard library, so a
-library's own `static fn` reads the library's files even when another package calls it. The file
-is an input of the unit that read it: editing it reruns only that unit, and an unchanged file
-leaves every cached result in place. `silk check` reads the file but runs no process.
+library's own `static fn` reads the library's files even when another package calls it. A package
+that depends on the library builds and checks with the same files, read below the library's own
+directory. An embedded file is bytes: it is never lexed, parsed or checked as Silk source, whatever
+its name or contents. The file is an input of the unit that read it: editing it reruns only that
+unit, and an unchanged file leaves every cached result in place. `silk check` reads the file but
+runs no process.
 
-**Boundary:** The members wrap the static-only sealed primitives `Intrinsic.embed(path)` and
-`Intrinsic.embedText(path)`. An embedded file's bytes are the only static `&'static [u8]` value;
-they are not bounded by the retained-value budget, since they are read rather than computed.
+A compressed member keeps a large file small in the program. The build compresses the file once,
+and the program holds only the frame. `Compressed.bytes` and `CompressedText.text` are ordinary
+effect functions that expand it with the ambient `Allocator` when the program asks, so a file the
+program never asks for costs only its compressed size:
+
+```silk,ignore
+import silk.build.source { CompressedText, Source }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.string { String }
+
+pub effect fn library() -> String ! OutOfMemoryError ? &mut Allocator {
+  let packed = Source.compressedText("js/index.js")
+  return run CompressedText.text(&packed)
+}
+```
+
+`Compressed.length` and `Compressed.compressedLength` give the two sizes without expanding
+anything. The frame is the same on every host for the same file, so builds stay reproducible.
+
+**Boundary:** The members wrap the static-only sealed primitives `Intrinsic.embed(path)`,
+`Intrinsic.embedText(path)` and `Intrinsic.embedCompressed(path)`, which returns the file as one
+Zstandard frame that records the file's length. An embedded file's bytes, plain or compressed, are
+the only static `&'static [u8]` values; they are not bounded by the retained-value budget, since
+they are read rather than computed. Expanding a frame is library code: the compiler knows nothing
+of `Compressed`.
 
 **Diagnostics:** A path that leaves the package, a path that names no file (including one built from
-anything but a literal at the call), and `Source.text` of a file that is not UTF-8 each stop static
-evaluation with `SEM0176` at the call.
+anything but a literal at the call), and `Source.text` or `Source.compressedText` of a file that is
+not UTF-8 each stop static evaluation with `SEM0176` at the call.
 
 **Evidence:** [package file source actor](../stdlib/silk/build/source.silk).
 
