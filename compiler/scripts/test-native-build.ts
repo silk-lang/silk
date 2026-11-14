@@ -4561,7 +4561,8 @@ const program = Effect.gen(function* () {
     'import helper\n\npub fn main() -> i32 {\n  return helper.value() + 4\n}\n',
   )
   const splitEnvironment = { ...process.env, SILK_CLANG: clang }
-  const unitObjects = join(split, `build/llvm/${hostTarget}/debug/split.units`)
+  // The objects are in the store the outputs of one directory share.
+  const unitObjects = join(split, `build/llvm/${hostTarget}/debug/units`)
   const objectNames = Effect.fnUntraced(function* () {
     const names = yield* fs.readDirectory(unitObjects)
     return names.filter((name) => name.endsWith('.o')).sort()
@@ -4624,6 +4625,50 @@ const program = Effect.gen(function* () {
   const editedPacks = yield* packNames()
   assert.equal(editedPacks.filter((name) => !coldPacks.includes(name)).length, 1, 'an edit to one module writes one pack')
   assert.equal(editedPacks.length, coldPacks.length, 'a build removes the packs no unit names')
+  // Two programs of a workspace share the objects of the units both hold: the second one built
+  // compiles only its own, and each lists what it links so neither build removes the other's.
+  const shared = join(directory, 'shared-units')
+  for (const member of ['one', 'two']) {
+    yield* fs.makeDirectory(join(shared, member, 'src'), { recursive: true })
+    yield* fs.writeFileString(join(shared, member, 'silk.toml'), `[package]\nname = "${member}"\nversion = "0.1.0"\n`)
+    yield* fs.writeFileString(
+      join(shared, member, 'src/main.silk'),
+      `pub fn main() -> i32 {\n  return ${member === 'one' ? 1 : 2}\n}\n`,
+    )
+  }
+  yield* fs.writeFileString(join(shared, 'silk.toml'), '[workspace]\nmembers = ["one", "two"]\n')
+  const sharedObjects = join(shared, `build/llvm/${hostTarget}/debug/units`)
+  const sharedNames = Effect.fnUntraced(function* (suffix: string) {
+    return (yield* fs.readDirectory(sharedObjects)).filter((name) => name.endsWith(suffix)).sort()
+  })
+  const builtOne = yield* invoke(silk, ['build', '--stdlib', standardLibrary, '--package', 'one'], shared, splitEnvironment)
+  assert.equal(builtOne.status, 0, builtOne.stderr)
+  const oneObjects = yield* sharedNames('.o')
+  const builtTwo = yield* invoke(silk, ['build', '--stdlib', standardLibrary, '--package', 'two'], shared, splitEnvironment)
+  assert.equal(builtTwo.status, 0, builtTwo.stderr)
+  const bothObjects = yield* sharedNames('.o')
+  const addedByTwo = bothObjects.filter((name) => !oneObjects.includes(name))
+  assert.ok(
+    addedByTwo.length < oneObjects.length / 2,
+    `the second program compiled ${addedByTwo.length} units of its own beside the first one's ${oneObjects.length}`,
+  )
+  assert.equal((yield* sharedNames('.uses')).length, 2, 'each program lists the objects it links')
+  for (const [member, expected] of [['one', 1], ['two', 2]] as const) {
+    const ran = yield* invoke(join(shared, `build/llvm/${hostTarget}/debug/${member}`), [], shared, splitEnvironment)
+    assert.equal(ran.status, expected, ran.stderr)
+  }
+  // A host that cannot copy its process runs each member in a compiler process of its own, and
+  // SILK_MEMBER_PROCESSES asks any host to: the reports read as a run of one member at a time.
+  const inProcesses = { ...splitEnvironment, SILK_MEMBER_PROCESSES: '1' }
+  const checkedBoth = yield* invoke(silk, ['check', '--workspace', '--stdlib', standardLibrary], shared, inProcesses)
+  assert.equal(checkedBoth.status, 0, checkedBoth.stderr)
+  const checkedReport = checkedBoth.stdout + checkedBoth.stderr
+  assert.ok(checkedReport.indexOf('Finished one') < checkedReport.indexOf('Finished two'), checkedReport)
+  assert.match(checkedReport, /Finished 2 packages/)
+  yield* fs.writeFileString(join(shared, 'two/src/main.silk'), 'pub fn main() -> i32 {\n  return missing\n}\n')
+  const checkedBroken = yield* invoke(silk, ['check', '--workspace', '--stdlib', standardLibrary], shared, inProcesses)
+  assert.equal(checkedBroken.status, 1, checkedBroken.stderr)
+  assert.match(checkedBroken.stdout + checkedBroken.stderr, /Failed 1 of 2 packages/)
   // Each unit carries line tables made from the lines its location markers name, so a function
   // that moves recompiles its unit alone, and the unit's rows name the lines it moved to.
   const rowLines = Effect.fnUntraced(function* (object: string) {
