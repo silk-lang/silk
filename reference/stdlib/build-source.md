@@ -8,6 +8,8 @@ as part of its code.
 ## When to use
 Use [`Source.read`](#Source.impl.read) for a file's bytes and [`Source.text`](#Source.impl.text) for UTF-8 text, from runtime code
 or from a `static fn` that parses the file while the package compiles. Use
+[`Source.compressed`](#Source.impl.compressed) and [`Source.compressedText`](#Source.impl.compressedText) for a large file the program does not
+need at once: the program holds it compressed and expands it when asked. Use
 `silk.system.filesystem` for files the program reads when it runs.
 
 ## Details
@@ -15,7 +17,8 @@ The path is relative to the directory that holds the package's `silk.toml`, uses
 separators and has no `.` or `..` segment, so a package reads only its own files. Write it as
 a string literal in the call: the build finds the files a package reads from those literals.
 The file's contents become a constant of the program. Editing the file rebuilds only the
-functions that read it.
+functions that read it. The file is read as bytes and never as Silk source, whatever it holds,
+and a package that depends on this one builds with the same contents.
 
 ## Examples
 ### Embed a shader
@@ -27,9 +30,21 @@ pub fn sceneShader() -> &'static [u8] {
 }
 ```
 
+### Keep a large script compressed
+```silk,ignore
+import silk.build.source { CompressedText, Source }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.string { String }
+
+pub effect fn library() -> String ! OutOfMemoryError ? &mut Allocator {
+  let packed = Source.compressedText("js/index.js")
+  return run CompressedText.text(&packed)
+}
+```
+
 Import as `Source` with `import silk.build.source { Source }`.
 
-Public declarations: 1.
+Public declarations: 3.
 
 <a id="Source"></a>
 
@@ -81,6 +96,189 @@ Returns the text of the package file at `path`.
 
 A file that is not valid UTF-8 is a compile error at the call, as is a path that leaves the
 package or names no file.
+
+<a id="Source.impl.compressed"></a>
+
+### Associated function `compressed`
+
+```silk
+pub static fn compressed(path: string<'static>) -> Compressed
+```
+
+Returns the package file at `path`, kept compressed in the program.
+
+#### Details
+
+The build compresses the file as one Zstandard frame, and the program holds only that
+frame. [`Compressed.bytes`](#Compressed.impl.bytes) expands it when the program asks. A file that does not shrink
+is stored as it is, a few bytes larger.
+
+#### Gotchas
+
+A path that leaves the package, or names no file, is a compile error at the call.
+
+<a id="Source.impl.compressedText"></a>
+
+### Associated function `compressedText`
+
+```silk
+pub static fn compressedText(path: string<'static>) -> CompressedText
+```
+
+Returns the text of the package file at `path`, kept compressed in the program.
+
+#### Details
+
+The build checks that the file is UTF-8 and compresses it as one Zstandard frame, and the
+program holds only that frame. [`CompressedText.text`](#CompressedText.impl.text) expands it when the program asks.
+
+#### Gotchas
+
+A file that is not valid UTF-8 is a compile error at the call, as is a path that leaves the
+package or names no file.
+
+<a id="Compressed"></a>
+
+## `Compressed`
+
+```silk
+pub struct Compressed
+```
+
+A package file the program holds compressed, from [`Source.compressed`](#Source.impl.compressed).
+
+### Details
+
+The value is a borrow of a constant of the program, so it copies freely and lives as long as
+the program does. Nothing is expanded until [`Compressed.bytes`](#Compressed.impl.bytes) runs, and each call expands
+the file again: keep the result when the program needs it more than once.
+
+<a id="Compressed.impl.Copy"></a>
+
+## Implementation `Copy for Compressed`
+
+```silk
+impl Copy for Compressed
+```
+
+<a id="Compressed.impl"></a>
+
+## Implementation `Compressed`
+
+```silk
+impl Compressed
+```
+
+<a id="Compressed.impl.length"></a>
+
+### Method `length`
+
+```silk
+pub fn length(self: &Self) -> usize
+```
+
+Returns how many bytes the file holds once expanded.
+
+<a id="Compressed.impl.compressedLength"></a>
+
+### Method `compressedLength`
+
+```silk
+pub fn compressedLength(self: &Self) -> usize
+```
+
+Returns how many bytes the program holds for the file.
+
+<a id="Compressed.impl.bytes"></a>
+
+### Method `bytes`
+
+```silk
+pub effect fn bytes(self: &Self) -> Bytes ! OutOfMemoryError ? &mut Allocator
+```
+
+Expands the file and returns its bytes, exactly as the build read them.
+
+#### Details
+
+Besides the result, it allocates a decoder for the length of the call: a window as large
+as the file, up to 4 MiB, and about 400 KiB of buffers and tables.
+
+#### Errors
+
+- `OutOfMemoryError` if the `Allocator` cannot supply the result or the decoder.
+
+<a id="CompressedText"></a>
+
+## `CompressedText`
+
+```silk
+pub struct CompressedText
+```
+
+A UTF-8 package file the program holds compressed, from [`Source.compressedText`](#Source.impl.compressedText).
+
+### Details
+
+The value is a borrow of a constant of the program, so it copies freely and lives as long as
+the program does. Nothing is expanded until [`CompressedText.text`](#CompressedText.impl.text) runs, and each call
+expands the file again: keep the result when the program needs it more than once.
+
+<a id="CompressedText.impl.Copy"></a>
+
+## Implementation `Copy for CompressedText`
+
+```silk
+impl Copy for CompressedText
+```
+
+<a id="CompressedText.impl"></a>
+
+## Implementation `CompressedText`
+
+```silk
+impl CompressedText
+```
+
+<a id="CompressedText.impl.length"></a>
+
+### Method `length`
+
+```silk
+pub fn length(self: &Self) -> usize
+```
+
+Returns how many bytes of UTF-8 the text holds once expanded.
+
+<a id="CompressedText.impl.compressedLength"></a>
+
+### Method `compressedLength`
+
+```silk
+pub fn compressedLength(self: &Self) -> usize
+```
+
+Returns how many bytes the program holds for the text.
+
+<a id="CompressedText.impl.text"></a>
+
+### Method `text`
+
+```silk
+pub effect fn text(self: &Self) -> String ! OutOfMemoryError ? &mut Allocator
+```
+
+Expands the file and returns its text.
+
+#### Details
+
+The build already checked that the file is UTF-8, so the text is not checked again.
+Besides the result, it allocates a decoder for the length of the call: a window as large
+as the file, up to 4 MiB, and about 400 KiB of buffers and tables.
+
+#### Errors
+
+- `OutOfMemoryError` if the `Allocator` cannot supply the result or the decoder.
 
 
 Category: Core.
