@@ -3,14 +3,17 @@
 //! installation or libgcc: the stub libraries stand in for glibc at link time, and the program
 //! runs against the real glibc 2.28 or later on the target.
 
+import driver.HostRename
 import driver.NativeToolchain
 import driver.PlatformSupply as PlatformSupplies
+import semantic.ContentHash {ContentHash}
 import semantic.Target {Target}
 import silk.io.writer_native {StderrWriter}
 import silk.core.effect {Effect}
 import silk.core.option {Option}
+import silk.core.result {Result}
 import silk.mem.allocator {Allocator, OutOfMemoryError}
-import silk.system.filesystem {FileSystem, FileError, Path}
+import silk.system.filesystem {DirectoryEntry, FileSystem, FileError, Path}
 import silk.system.host_input {HostInput, HostInputError}
 import silk.system.child_process {ChildProcess, ProcessRequest, ProcessError}
 import silk.io.writer {Writer, WriterError}
@@ -937,8 +940,7 @@ pub fn interpreter(target: &Target) -> &'static [u8] {
   return b"/lib64/ld-linux-x86-64.so.2"
 }
 
-// The file `<stem><suffix>` in the link's scratch directory. Every file this module writes is
-// named after the link's staged output, so the link stamp names it by its suffix alone.
+// The file `<stem><suffix>` in the link's scratch directory, where the stubs' sources are written.
 effect fn scratchFile(stem: &[u8], suffix: &[u8]) -> Path ! FileError | OutOfMemoryError ? &mut Allocator {
   let mut name = run Bytes.copy(stem)
   run Bytes.append(&mut name, suffix)
@@ -951,25 +953,75 @@ effect fn librarySuffix(library: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Alloc
   return move suffix
 }
 
+// The startup object's name in a stub directory. `build` publishes it last, so a directory that
+// holds it holds every stub library too.
+fn startName() -> &'static [u8] { return b"start.o" }
+
+// The stubs' directories under the build's codegen cache `cache`.
+effect fn stubsRoot(cache: &Path) -> Path ! FileError | OutOfMemoryError ? &mut Allocator {
+  return run Path.joinBytes(cache, b"glibc-stubs")
+}
+
+/// The directory under the build's codegen cache `cache` that keeps the stub libraries and the
+/// startup object: `<cache>/glibc-stubs/<digest>`. The digest covers everything they are built
+/// from: `identity` (the Clang that builds them, named by its path and its `--version` answer),
+/// `linker` (the options that select the program's linker), the target, and the text of every
+/// stub source, version script and the startup code. An edit build of the same program finds them
+/// there and links them without running Clang again.
+pub effect fn stubDirectory(cache: &Path, identity: &[u8], linker: &[Bytes], target: &Target) -> Path
+! FileError | OutOfMemoryError ? &mut Allocator {
+  let aarch64 = same(Target.architecture(target), b"aarch64")
+  let mut stream = ContentHash.stream()
+  // The commands `build` runs are fixed here; a change to them changes this word.
+  ContentHash.append(&mut stream, b"glibc-stubs 1\x00")
+  ContentHash.append(&mut stream, identity)
+  ContentHash.appendByte(&mut stream, 0)
+  let mut flag = usize.ZERO
+  while flag < linker.length {
+    ContentHash.append(&mut stream, Bytes.asSlice(&linker[flag]))
+    ContentHash.appendByte(&mut stream, 0)
+    flag = flag + usize.ONE
+  }
+  ContentHash.append(&mut stream, Target.llvmTriple(target))
+  ContentHash.appendByte(&mut stream, 0)
+  let names = libraries()
+  let mut at = usize.ZERO
+  while at < names.length {
+    ContentHash.append(&mut stream, names[at])
+    ContentHash.appendByte(&mut stream, 0)
+    let assembly = run stubSource(names[at], aarch64)
+    ContentHash.append(&mut stream, Bytes.asSlice(&assembly))
+    ContentHash.appendByte(&mut stream, 0)
+    let script = run versionScript(names[at], aarch64)
+    ContentHash.append(&mut stream, Bytes.asSlice(&script))
+    ContentHash.appendByte(&mut stream, 0)
+    at = at + usize.ONE
+  }
+  ContentHash.append(&mut stream, String.utf8Bytes(startSource()))
+  let digits = ContentHash.digits(ContentHash.finish(move stream))
+  let root = run stubsRoot(cache)
+  return run Path.joinBytes(&root, &digits)
+}
+
 /// Links without the C compiler's startup files and libraries, with glibc's program interpreter
-/// for `target`, and adds the startup object and the stub libraries that `build` writes under
-/// `stem`. The stub libraries are needed only when the program uses one of their symbols.
-pub effect fn configure(process: &mut ProcessRequest, stem: &[u8], target: &Target) -> ()
+/// for `target`, and adds the startup object and the stub libraries that `build` keeps in
+/// `directory` ([`stubDirectory`]). The stub libraries are needed only when the program uses one of
+/// their symbols.
+pub effect fn configure(process: &mut ProcessRequest, directory: &Path, target: &Target) -> ()
 ! FileError | OutOfMemoryError ? &mut Allocator {
   run ChildProcess.addArgument(&mut process.*, "-nostdlib")
   run ChildProcess.addArgument(&mut process.*, "-Xlinker")
   let mut loader = run Bytes.copy(b"--dynamic-linker=")
   run Bytes.append(&mut loader, interpreter(target))
   run ChildProcess.addArgumentBytes(&mut process.*, Bytes.asSlice(&loader))
-  let start = run scratchFile(stem, b".silk-start.o")
+  let start = run Path.joinBytes(directory, startName())
   run NativeToolchain.addPathArgument(&mut process.*, &start)
   run ChildProcess.addArgument(&mut process.*, "-Xlinker")
   run ChildProcess.addArgument(&mut process.*, "--as-needed")
   let names = libraries()
   let mut at = usize.ZERO
   while at < names.length {
-    let suffix = run librarySuffix(names[at])
-    let library = run scratchFile(stem, Bytes.asSlice(&suffix))
+    let library = run Path.joinBytes(directory, names[at])
     run NativeToolchain.addPathArgument(&mut process.*, &library)
     at = at + usize.ONE
   }
@@ -992,18 +1044,28 @@ effect fn targetArgument(request: &mut ProcessRequest, target: &Target) -> () ! 
   run ChildProcess.addArgumentBytes(&mut request.*, Bytes.asSlice(&selected))
 }
 
-/// Writes and builds the startup object and the stub libraries that `configure` named under
-/// `stem`. Each stub library is linked by `clang` with `linker`, the options that select the
-/// program's own linker. Returns 0, or the exit status of the first tool that failed.
-pub effect fn build(clang: &Path, linker: &[Bytes], stem: &[u8], target: &Target) -> i32
+/// Builds the stub libraries and the startup object into `directory`, the [`stubDirectory`] that
+/// `configure` named, unless it holds them already. Their sources are written under `stem` in the
+/// link's scratch directory. Each stub library is linked by `clang` with `linker`, the options
+/// that select the program's own linker. Each file is built under a temporary name and renamed
+/// into place once its tool succeeds, the startup object last, so a failed or interrupted build
+/// never leaves a directory a later link would trust. Returns 0, or the exit status of the first
+/// tool that failed.
+pub effect fn build(clang: &Path, linker: &[Bytes], directory: &Path, stem: &[u8], target: &Target) -> i32
 ! FileError | HostInputError | ProcessError | OutOfMemoryError | WriterError
 ? &mut FileSystem | &mut HostInput | &mut ChildProcess | &mut Allocator {
+  let startObject = run Path.joinBytes(directory, startName())
+  if run FileSystem.exists(&startObject) { return 0 }
+  // Only one set of stubs is kept: the ones an earlier compiler or Clang built are removed.
+  if let Option<Path>.Some {value: root} = move run Path.parent(directory) { run removeOthers(&root, directory) }
+  run FileSystem.createDirectoriesRecursively(directory)
   let aarch64 = same(Target.architecture(target), b"aarch64")
   let names = libraries()
   let mut at = usize.ZERO
   while at < names.length {
     let suffix = run librarySuffix(names[at])
-    let library = run scratchFile(stem, Bytes.asSlice(&suffix))
+    let library = run Path.joinBytes(directory, names[at])
+    let pending = run pendingFile(&library)
     let mut sourceSuffix = run Bytes.copy(Bytes.asSlice(&suffix))
     run Bytes.append(&mut sourceSuffix, b".s")
     let source = run scratchFile(stem, Bytes.asSlice(&sourceSuffix))
@@ -1039,13 +1101,14 @@ pub effect fn build(clang: &Path, linker: &[Bytes], stem: &[u8], target: &Target
     run ChildProcess.addArgument(&mut request, "assembler")
     run NativeToolchain.addPathArgument(&mut request, &source)
     run ChildProcess.addArgument(&mut request, "-o")
-    run NativeToolchain.addPathArgument(&mut request, &library)
+    run NativeToolchain.addPathArgument(&mut request, &pending)
     let status = run submitted(&request)
     if status != 0 { return status }
+    if !run HostRename.replaceFile(&pending, &library) { return run unwritable(&library) }
     at = at + usize.ONE
   }
   let startSourcePath = run scratchFile(stem, b".silk-start.c")
-  let startObject = run scratchFile(stem, b".silk-start.o")
+  let pendingStart = run pendingFile(&startObject)
   run FileSystem.writeFile(&startSourcePath, String.utf8Bytes(startSource()))
   let mut request = run NativeToolchain.request(clang)
   run targetArgument(&mut request, target)
@@ -1059,6 +1122,50 @@ pub effect fn build(clang: &Path, linker: &[Bytes], stem: &[u8], target: &Target
   run ChildProcess.addArgument(&mut request, "-c")
   run NativeToolchain.addPathArgument(&mut request, &startSourcePath)
   run ChildProcess.addArgument(&mut request, "-o")
-  run NativeToolchain.addPathArgument(&mut request, &startObject)
-  return run submitted(&request)
+  run NativeToolchain.addPathArgument(&mut request, &pendingStart)
+  let status = run submitted(&request)
+  if status != 0 { return status }
+  if !run HostRename.replaceFile(&pendingStart, &startObject) { return run unwritable(&startObject) }
+  return 0
+}
+
+// The temporary name `file` is built under before it is renamed into place.
+effect fn pendingFile(file: &Path) -> Path ! FileError | OutOfMemoryError ? &mut Allocator {
+  let mut named = run Bytes.copy(Path.rawBytes(file))
+  run Bytes.append(&mut named, b".partial")
+  return run Path.fromBytes(Bytes.asSlice(&named))
+}
+
+// Removes every directory under `root` but `kept`. A directory that cannot be listed or removed
+// is left as it is: it only takes space.
+effect fn removeOthers(root: &Path, kept: &Path) -> () ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let entries = match move run Effect.result(FileSystem.listDirectory(root)) {
+    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => {
+        drop failure
+        return ()
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let found = List<DirectoryEntry>.asSlice(&entries)
+  let mut at = usize.ZERO
+  while at < found.length {
+    if !same(Path.rawBytes(&found[at].path), Path.rawBytes(kept)) {
+      let removed = run Effect.result(FileSystem.removeDirectoryRecursively(&found[at].path))
+      drop removed
+    }
+    at = at + usize.ONE
+  }
+}
+
+// Reports that a built stub could not be renamed to `file`, and answers the exit status.
+effect fn unwritable(file: &Path) -> i32 ! OutOfMemoryError | WriterError ? &mut Allocator {
+  let mut stderr = StderrWriter.make()
+  let mut message = run Bytes.copy(b"silk: cannot write ")
+  run Bytes.append(&mut message, Path.rawBytes(file))
+  run Bytes.append(&mut message, b"\n")
+  run Writer.writeAll(Bytes.asSlice(&message)) |> Effect.provideMut<Writer>(&mut stderr)
+  return 2
 }
