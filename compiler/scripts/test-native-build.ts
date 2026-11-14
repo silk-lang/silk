@@ -3733,6 +3733,94 @@ const program = Effect.gen(function* () {
     assert.equal(foreign.stdout, '')
   }
   {
+    // `[pack.binary]` ships binaries without `--bin`: a tar file with the executable in `bin/`
+    // and the included files, or for a target that says so a ZIP file with it at the top.
+    const tool = join(directory, 'binary/tool')
+    const output = join(directory, 'binary/out')
+    const environment = { ...process.env, SILK_CLANG: clang }
+    yield* fs.makeDirectory(join(tool, 'src'), { recursive: true })
+    yield* fs.makeDirectory(join(tool, 'completions'), { recursive: true })
+    const manifest = (more: string) =>
+      `[package]\nname = "packed-tool"\nversion = "1.2.0"\n\n[pack.binary]\ninclude = ["completions", "notes.txt"]\n${more}`
+    yield* fs.writeFileString(join(tool, 'silk.toml'), manifest(''))
+    yield* fs.writeFileString(join(tool, 'src/main.silk'), 'pub fn main() -> i32 {\n  return 0\n}\n')
+    yield* fs.writeFileString(join(tool, 'completions/tool.bash'), 'complete -W "pack" packed-tool\n')
+    yield* fs.writeFileString(join(tool, 'notes.txt'), 'notes\n')
+    yield* fs.writeFileString(join(tool, 'LICENSE'), 'license\n')
+    const packed = yield* invoke(
+      silk,
+      ['pack', '--json', '--output', output, '--stdlib', standardLibrary],
+      tool,
+      environment,
+      120_000,
+    )
+    assert.equal(packed.status, 0, packed.stderr)
+    const binaries = JSON.parse(packed.stdout).archives[0].binaries as ReadonlyArray<{ platform: string; path: string }>
+    assert.equal(binaries.length, 1, packed.stdout)
+    const platform = binaries[0].platform
+    const top = `packed-tool-1.2.0-${platform}`
+    assert.equal(binaries[0].path, join(output, `${top}.tar.gz`))
+    const tarred = spawnSync('tar', ['-tzf', binaries[0].path], { encoding: 'utf8' })
+    assert.equal(tarred.status, 0, tarred.stderr)
+    assert.deepEqual(tarred.stdout.trim().split('\n'), [
+      `${top}/bin/packed-tool`,
+      `${top}/LICENSE`,
+      `${top}/completions/tool.bash`,
+      `${top}/notes.txt`,
+    ])
+    // The target's own table replaces the format, the layout and the included files.
+    yield* fs.writeFileString(
+      join(tool, 'silk.toml'),
+      manifest(`\n[pack.binary.target.${platform}]\nformat = "zip"\nlayout = "flat"\ninclude = ["notes.txt"]\n`),
+    )
+    const zipped = yield* invoke(
+      silk,
+      ['pack', '--json', '--output', output, '--stdlib', standardLibrary],
+      tool,
+      environment,
+      120_000,
+    )
+    assert.equal(zipped.status, 0, zipped.stderr)
+    const archive = JSON.parse(zipped.stdout).archives[0].binaries[0].path as string
+    assert.equal(archive, join(output, `${top}.zip`))
+    const tested = spawnSync('unzip', ['-t', archive], { encoding: 'utf8' })
+    assert.equal(tested.status, 0, tested.stdout + tested.stderr)
+    const names = spawnSync('unzip', ['-Z1', archive], { encoding: 'utf8' })
+    assert.deepEqual(names.stdout.trim().split('\n'), [`${top}/packed-tool`, `${top}/LICENSE`, `${top}/notes.txt`])
+    const modes = spawnSync('unzip', ['-Z', archive], { encoding: 'utf8' })
+    assert.match(modes.stdout, /^-rwxr-xr-x .* packed-tool-1\.2\.0-.*\/packed-tool$/m)
+    assert.match(modes.stdout, /^-rw-r--r-- .*\/LICENSE$/m)
+    // `--list` writes nothing, so it builds nothing.
+    const listed = yield* invoke(silk, ['pack', '--list', '--stdlib', standardLibrary], tool, { ...process.env, SILK_CLANG: '/nonexistent' })
+    assert.equal(listed.status, 0, listed.stderr)
+    // An entry that names nothing is refused with the table it is written in.
+    yield* fs.writeFileString(join(tool, 'silk.toml'), manifest('').replace('"notes.txt"', '"missing.txt"'))
+    const missing = yield* invoke(silk, ['pack', '--output', output, '--stdlib', standardLibrary], tool, environment, 120_000)
+    assert.equal(missing.status, 1, 'an include entry that names nothing was packed')
+    assert.match(missing.stderr, /\[pack\.binary\]\.include entry missing\.txt names no file or directory/)
+    // An included path at, above or below the executable's is refused, naming its table.
+    yield* fs.writeFileString(join(tool, 'bin'), 'a file named as the directory of the executable\n')
+    yield* fs.writeFileString(
+      join(tool, 'silk.toml'),
+      manifest(`\n[pack.binary.target.${platform}]\ninclude = ["bin"]\n`),
+    )
+    const displaced = yield* invoke(silk, ['pack', '--output', output, '--stdlib', standardLibrary], tool, environment, 120_000)
+    assert.equal(displaced.status, 1, 'an included file took the place of the executable directory')
+    assert.ok(
+      displaced.stderr.includes(`[pack.binary.target.${platform}].include holds bin, which takes the place of the executable at bin/packed-tool`),
+      displaced.stderr,
+    )
+    yield* fs.remove(join(tool, 'bin'))
+    // The table is an executable's.
+    yield* fs.writeFileString(
+      join(tool, 'silk.toml'),
+      '[package]\nname = "packed-tool"\nversion = "1.2.0"\nkind = "library"\nmain = "main.silk"\nexports = ["main"]\n\n[pack.binary]\n',
+    )
+    const library = yield* invoke(silk, ['pack', '--output', output, '--stdlib', standardLibrary], tool, environment, 120_000)
+    assert.equal(library.status, 1, 'a library with [pack.binary] was packed')
+    assert.match(library.stderr, /\[pack\.binary\] archives an executable, and \[package\]\.kind is library/)
+  }
+  {
     // `init --template` copies one directory of a GitHub repository, here served from local
     // repositories through git's `insteadOf`, runs its [[post-init]] entries and drops them from the
     // new manifest. A one-segment template is a directory of silk-lang/examples.
