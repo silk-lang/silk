@@ -2035,6 +2035,11 @@ const program = Effect.gen(function* () {
   )
   assert.equal(selectedTests.status, 0, selectedTests.stderr)
   assert.match(selectedTests.stdout, /util\/check::halvesEvenly\n/)
+  // The runner's build reports its phases as a program's does, and keeps a semantic cache of its
+  // own beside the package's so the next runner build checks and emits only what an edit reaches.
+  assert.match(selectedTests.stderr, /^Compiling tested tests \(/m)
+  assert.match(selectedTests.stderr, /^ {2}codegen +[\d,]+ functions? /m)
+  assert.equal(yield* fs.exists(join(directory, 'tested/build/cache/tested@tests')), true)
   assert.match(
     selectedTests.stdout,
     /1 passed, 0 failed \(0 cached, 1 executed, 1 selected, 4 discovered\)/,
