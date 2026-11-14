@@ -302,6 +302,11 @@ The program reaches concrete `identity<bool>` and `identity<i32>` instances. Run
 receive a generic type descriptor, interface dictionary, requirement-row record, or reflective type
 value.
 
+A generic function named as a value with its type arguments, such as `identity<i32>`, and the C
+address of a generic export at an instantiation
+([FFI-012](unsafe-intrinsics-and-targets.md#ffi-012--c-function-pointers-are-exact-exported-addresses))
+are generic applications too: each is closed where the code that writes it is specialized.
+
 This rule is observable through accepted programs, static call behavior, target parity, and code
 size, but names or counts of backend symbols are not source-level API.
 
