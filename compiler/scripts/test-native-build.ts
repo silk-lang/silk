@@ -1964,6 +1964,15 @@ const program = Effect.gen(function* () {
   const shiftCount = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(directory, 'shiftcount'), { ...process.env, SILK_CLANG: clang })
   assert.notEqual(shiftCount.status, 0, shiftCount.stderr)
   assert.match(shiftCount.stderr, /^fatal trap: invalid shift count\n {2}at main\.main \(main:6:17\)$/m)
+  // A function that only moves in its file is not lowered again, and its trap names the line it
+  // moved to.
+  const shiftCountSource = yield* fs.readFileString(join(directory, 'shiftcount/src/main.silk'))
+  yield* fs.writeFileString(join(directory, 'shiftcount/src/main.silk'), shiftCountSource.replace('\npub fn main', '// moved\n\n\npub fn main'))
+  const movedBuild = yield* invoke(silk, ['build', '--stdlib', standardLibrary, '--timings'], join(directory, 'shiftcount'), { ...process.env, SILK_CLANG: clang })
+  assert.equal(movedBuild.status, 0, movedBuild.stderr)
+  assert.match(movedBuild.stdout + movedBuild.stderr, /codegen\s+0 functions\s/)
+  const movedCount = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(directory, 'shiftcount'), { ...process.env, SILK_CLANG: clang })
+  assert.match(movedCount.stderr, /^fatal trap: invalid shift count\n {2}at main\.main \(main:8:17\)$/m)
   // A trap after a fiber resumes names the suspended callers of the resumed frame, which only its
   // frame chain holds: the fiber's driver, not `work`, called `pick`'s step.
   yield* fs.makeDirectory(join(directory, 'resumedtrap/src'), { recursive: true })
@@ -4947,6 +4956,9 @@ const program = Effect.gen(function* () {
   })
   assert.deepEqual(yield* rowLines(compiled[0]), [2])
   yield* fs.writeFileString(join(split, 'src/helper.silk'), `// moved\n\n${helperSource(5)}`)
+  const moved = yield* invoke(silk, ['build', '--stdlib', standardLibrary, '--timings'], split, splitEnvironment)
+  assert.equal(moved.status, 0, moved.stderr)
+  assert.match(moved.stdout + moved.stderr, /codegen\s+0 functions\s/, 'a function that only moved is not lowered again')
   yield* splitRun(9)
   const movedObjects = (yield* objectNames()).filter((name) => !editedObjects.includes(name))
   assert.equal(movedObjects.length, 1, `a moved function compiles one unit, added ${movedObjects.join(', ')}`)
