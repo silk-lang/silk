@@ -3684,6 +3684,20 @@ const program = Effect.gen(function* () {
     assert.equal(extra.status, 1, 'a file SHA256SUMS does not name was accepted')
     assert.match(extra.stderr, /^silk pack: extra\.txt: SHA256SUMS does not name it$/m)
     yield* fs.remove(join(signed, 'extra.txt'))
+    // A signature of nothing the list names, and on Linux a name that only ends like a listed
+    // one, are unlisted files too.
+    yield* fs.writeFileString(join(signed, 'orphan.minisig'), 'not a signature\n')
+    const orphan = yield* verify()
+    assert.equal(orphan.status, 1, 'a signature of no listed file was accepted')
+    assert.match(orphan.stderr, /^silk pack: orphan\.minisig: SHA256SUMS does not name it$/m)
+    assert.equal(orphan.stdout, '', 'a directory with a fault reported a verified file')
+    yield* fs.remove(join(signed, 'orphan.minisig'))
+    if (process.platform === 'linux') {
+      yield* fs.writeFileString(join(signed, 'x\\SHA256SUMS'), 'hidden\n')
+      const hidden = yield* verify()
+      assert.equal(hidden.status, 1, 'a file named with a backslash was taken for the list')
+      yield* fs.remove(join(signed, 'x\\SHA256SUMS'))
+    }
     const archive = join(signed, 'shared-math-0.1.0.tar.gz')
     const original = yield* fs.readFile(archive)
     yield* fs.writeFile(archive, new Uint8Array([...original, 0]))
