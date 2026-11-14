@@ -9,6 +9,12 @@
 //! interrupted compile never leaves an object a later build would reuse. After a link, [`prune`]
 //! removes the objects no unit of that build named, once there are more of them than units.
 //!
+//! The units of an unoptimized build are compiled into a store that every output of one directory
+//! shares ([`sharedFor`]) instead: two programs of a workspace hold mostly the same units, the
+//! standard library's and their common dependencies', and a unit one of them compiled is an object
+//! the other links without compiling it. Each output lists the objects its last build named
+//! ([`claim`]), and [`pruneShared`] removes the objects no output lists.
+//!
 //! The directory also keeps the link stamp ([`recordLink`]), for a split build or a whole module:
 //! the command that linked the output and the output's length. A build whose link command and
 //! output still match it skips the link, so a build that changes nothing writes nothing.
@@ -29,7 +35,9 @@ import silk.core.option {Option}
 import silk.system.child_process_native {OsChildProcess}
 import silk.system.filesystem_machine {MachineFileSystem}
 import silk.core.result {Result}
+import silk.collections.slice {Slice}
 import silk.num.u64
+import silk.num.u8
 import silk.num.usize
 
 /// The objects of one build's units, in unit order, and the units that still need Clang.
@@ -115,17 +123,182 @@ pub effect fn wholeObject(directory: &Path, identity: &[u8], module: ContentHash
   return run Path.joinBytes(directory, Bytes.asSlice(&name))
 }
 
-/// The path a unit's object is compiled to before it is renamed over `object`.
-pub effect fn pending(object: &Path) -> Path ! FileError | OutOfMemoryError ? &mut Allocator {
+/// The path a unit's object is compiled to before it is renamed over `object`. `tag` names the
+/// build among the builds that share the object's directory ([`tagOf`]), so two of them compiling
+/// the same unit at once write different files; it is empty in a directory only one build writes.
+pub effect fn pending(object: &Path, tag: &[u8]) -> Path ! FileError | OutOfMemoryError ? &mut Allocator {
   let mut named = run Bytes.copy(Path.rawBytes(object))
+  if tag.length > usize.ZERO {
+    run Bytes.append(&mut named, b".")
+    run Bytes.append(&mut named, tag)
+  }
   run Bytes.append(&mut named, b".partial")
   return run Path.fromBytes(Bytes.asSlice(&named))
 }
 
-/// Renames a unit's compiled object over its cached name; false when it cannot.
-pub effect fn publish(object: &Path) -> bool ! FileError | OutOfMemoryError ? &mut Allocator {
-  let compiled = run pending(object)
+/// Renames a unit's compiled object, at `pending(object, tag)`, over its cached name; false when
+/// it cannot.
+pub effect fn publish(object: &Path, tag: &[u8]) -> bool ! FileError | OutOfMemoryError ? &mut Allocator {
+  let compiled = run pending(object, tag)
   return run HostRename.replaceFile(&compiled, object)
+}
+
+/// The object store shared by every output written into the directory of `output`:
+/// `<directory>/units`. None for an output without a directory.
+pub effect fn sharedFor(output: &Path) -> Option<Path> ! FileError | OutOfMemoryError ? &mut Allocator {
+  return match move run Path.parent(output) {
+    Option<Path>.Some {value} => Option<Path>.some(run Path.joinBytes(&value, b"units"))
+    Option<Path>.None => Option<Path>.none()
+  }
+}
+
+/// The name of the build that writes `output` in a shared store: the digest of the output's path.
+pub effect fn tagOf(output: &Path) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let digest = ContentHash.of(Path.rawBytes(output))
+  let mut tag = Bytes.make()
+  run appendHex(&mut tag, digest.high)
+  run appendHex(&mut tag, digest.low)
+  return move tag
+}
+
+// The file of the shared `store` that lists the objects the build named `tag` uses.
+effect fn usesPath(store: &Path, tag: &[u8]) -> Path ! FileError | OutOfMemoryError ? &mut Allocator {
+  let mut name = run Bytes.copy(tag)
+  run Bytes.append(&mut name, usesSuffix())
+  return run Path.joinBytes(store, Bytes.asSlice(&name))
+}
+
+fn usesSuffix() -> &'static [u8] { return b".uses" }
+
+// The file name `path` ends in.
+fn fileName(path: &[u8]) -> &[u8] {
+  let mut slash = path.length
+  while slash > usize.ZERO && path[slash - usize.ONE] != 47 && path[slash - usize.ONE] != 92 { slash = slash - usize.ONE }
+  return Slice.view<u8>(path, slash, path.length - slash)
+}
+
+// Whether `text` ends in `suffix`.
+fn endsIn(text: &[u8], suffix: &[u8]) -> bool {
+  if text.length < suffix.length { return false }
+  return same(Slice.view<u8>(text, text.length - suffix.length, suffix.length), suffix)
+}
+
+// The first sixteen hexadecimal digits of an object's file `name` as a number, which stands for
+// the object in a prune; none for a name that does not start with them.
+fn objectKey(name: &[u8]) -> Option<u64> {
+  if name.length < 16 { return Option<u64>.none() }
+  let mut key: u64 = 0
+  let mut at = usize.ZERO
+  while at < 16 {
+    let byte = name[at]
+    let mut digit: u64 = 0
+    if byte >= 48 && byte <= 57 {
+      digit = u8.toU64(byte - 48)
+    } else if byte >= 97 && byte <= 102 {
+      digit = u8.toU64(byte - 87)
+    } else {
+      return Option<u64>.none()
+    }
+    key = u64.bitOr(u64.shiftLeft(key, 4), digit)
+    at = at + usize.ONE
+  }
+  return Option<u64>.some(key)
+}
+
+/// Lists `objects` in the shared `store` as what the build named `tag` uses, in place of what its
+/// last build listed, so that [`pruneShared`] in another build keeps them. Call it before looking
+/// for the objects: one listed first cannot be removed between the look and the link. A list that
+/// cannot be written is left as it was.
+pub effect fn claim(store: &Path, tag: &[u8], objects: &[Path]) -> () ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let mut listed = Bytes.make()
+  let mut at = usize.ZERO
+  while at < objects.length {
+    run Bytes.append(&mut listed, fileName(Path.rawBytes(&objects[at])))
+    run Bytes.append(&mut listed, b"\n")
+    at = at + usize.ONE
+  }
+  let path = run usesPath(store, tag)
+  let written = run Effect.result(FileSystem.writeFileAtomic(&path, Bytes.asSlice(&listed), FileSystem.replaceExisting(), FileSystem.buffered()))
+  drop written
+}
+
+/// Removes from the shared `store` the objects that no build lists ([`claim`]), once they
+/// outnumber the listed ones, and the partial compiles the build named `tag` left behind. Waiting
+/// until then bounds the store at about twice what its builds use while keeping the objects of a
+/// build that an edit will bring back.
+pub effect fn pruneShared(store: &Path, tag: &[u8]) -> () ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let entries = match move run Effect.result(FileSystem.listDirectory(store)) {
+    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => {
+        drop failure
+        return ()
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let found = List<DirectoryEntry>.asSlice(&entries)
+  let mut own = run Bytes.copy(b".")
+  run Bytes.append(&mut own, tag)
+  run Bytes.append(&mut own, b".partial")
+  let mut live = List<u64>.make()
+  let mut at = usize.ZERO
+  while at < found.length {
+    let path = Path.rawBytes(&found[at].path)
+    if endsIn(path, usesSuffix()) {
+      match move run Effect.result(FileSystem.readFile(&found[at].path)) {
+        Result<Bytes, FileError | OutOfMemoryError>.Success {value} => {
+          let text = Bytes.asSlice(&value)
+          let mut start = usize.ZERO
+          while start < text.length {
+            let mut end = start
+            while end < text.length && text[end] != 10 { end = end + usize.ONE }
+            if let Option<u64>.Some {value: key} = objectKey(Slice.view<u8>(text, start, end - start)) {
+              run List<u64>.append(&mut live, key)
+            }
+            start = end + usize.ONE
+          }
+        }
+        Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
+          // A list that cannot be read may name any object: nothing is removed.
+          FileError failure => {
+            drop failure
+            return ()
+          }
+          OutOfMemoryError exhausted => { fail move exhausted }
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+  run List<u64>.sort(&mut live)
+  let mut stale = List<usize>.make()
+  at = usize.ZERO
+  while at < found.length {
+    let path = Path.rawBytes(&found[at].path)
+    if endsIn(path, Bytes.asSlice(&own)) {
+      let removed = run Effect.result(FileSystem.removeFile(&found[at].path))
+      drop removed
+    } else if endsIn(path, b".o") {
+      let mut listed = true
+      if let Option<u64>.Some {value: key} = objectKey(fileName(path)) {
+        listed = match move List<u64>.binarySearch(&live, key) {
+          Option<usize>.Some {..} => true
+          Option<usize>.None => false
+        }
+      }
+      if !listed { run List<usize>.append(&mut stale, at) }
+    }
+    at = at + usize.ONE
+  }
+  if List<usize>.length(&stale) <= List<u64>.length(&live) { return () }
+  let removable = List<usize>.asSlice(&stale)
+  at = usize.ZERO
+  while at < removable.length {
+    let removed = run Effect.result(FileSystem.removeFile(&found[removable[at]].path))
+    drop removed
+    at = at + usize.ONE
+  }
 }
 
 /// One unit's compile: the bitcode file its fragments encode to, with the line tables `debug`

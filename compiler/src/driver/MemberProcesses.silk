@@ -1,0 +1,135 @@
+//! Compiler processes that check or build workspace members side by side, for a host that cannot
+//! copy its process (driver/MemberChecks).
+//!
+//! # Details
+//! Each member is one command: the compiler again, with the member's manifest in place of the
+//! workspace selection. [`runAll`] runs the commands on worker threads, each of which starts a
+//! process, waits for it and keeps what it wrote, so the caller writes each member's report in
+//! order as a run of one member at a time would.
+
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.collections.bytes {Bytes}
+import silk.system.child_process {ChildProcess, ProcessError, ProcessOutcome, ProcessRequest}
+import silk.system.child_process_native {OsChildProcess}
+import silk.core.effect {Effect}
+import silk.collections.list {List}
+import silk.concurrency.thread_native {JoinHandle, NativeThread, SpawnError}
+import silk.concurrency.work_queue {Injector}
+import silk.core.option {Option}
+import silk.core.result {Result}
+import silk.num.usize
+
+/// What one member's process ended with: its exit status, or 2 when it did not start or did not
+/// exit, and what it wrote on standard output and standard error.
+pub struct Finished {
+  pub status: i32,
+  pub output: Bytes,
+  pub errors: Bytes,
+}
+
+// One command in the shared queue, and its place in the caller's list.
+struct Queued {
+  index: usize,
+  request: ProcessRequest,
+}
+
+// What one worker thread ran: the place of each command it took and how each ended, in the order
+// it took them.
+struct Ran {
+  indexes: List<usize>,
+  finished: List<Finished>,
+}
+
+/// Runs each of `requests` on up to `workers` threads and answers how each ended, in order.
+///
+/// # Details
+/// The threads take commands from one queue, in order, so a thread that finishes early takes the
+/// next command instead of waiting for the others.
+pub effect fn runAll(requests: List<ProcessRequest>, workers: usize) -> List<Finished> ! OutOfMemoryError | SpawnError ? &mut Allocator {
+  let count = List<ProcessRequest>.length(&requests)
+  let mut threads = workers
+  if threads > count { threads = count }
+  if threads == usize.ZERO { threads = usize.ONE }
+  let queue = run Injector<Queued>.make()
+  let mut pending = move requests
+  let mut placed = usize.ZERO
+  while placed < count {
+    let request = List<ProcessRequest>.remove(&mut pending, usize.ZERO)
+    run Injector<Queued>.push(&queue, Queued {index: placed, request: move request})
+    placed = placed + usize.ONE
+  }
+  let mut handles = List<JoinHandle<Ran>>.make()
+  let mut started = usize.ZERO
+  while started < threads {
+    let shared = Injector<Queued>.clone(&queue)
+    let handle = run NativeThread.spawn(
+      fn() -> Ran {
+        return run runQueued(move shared)
+      }
+    )
+    run List<JoinHandle<Ran>>.append(&mut handles, move handle)
+    started = started + usize.ONE
+  }
+  let mut answers = List<Option<Finished>>.make()
+  let mut at = usize.ZERO
+  while at < count {
+    run List<Option<Finished>>.append(&mut answers, Option<Finished>.none())
+    at = at + usize.ONE
+  }
+  while List<JoinHandle<Ran>>.length(&handles) > usize.ZERO {
+    let handle = List<JoinHandle<Ran>>.remove(&mut handles, usize.ZERO)
+    let mut ran = handle.join()
+    // A thread that stopped early holds a place without an answer; its command answers 2 below.
+    while List<Finished>.length(&ran.finished) > usize.ZERO {
+      let index = List<usize>.remove(&mut ran.indexes, usize.ZERO)
+      let finished = List<Finished>.remove(&mut ran.finished, usize.ZERO)
+      let slots = List<Option<Finished>>.asMutSlice(&mut answers)
+      slots[index] = Option<Finished>.some(move finished)
+    }
+  }
+  let mut ordered = List<Finished>.make()
+  while List<Option<Finished>>.length(&answers) > usize.ZERO {
+    match move List<Option<Finished>>.remove(&mut answers, usize.ZERO) {
+      Option<Finished>.Some {value} => { run List<Finished>.append(&mut ordered, move value) }
+      Option<Finished>.None => { run List<Finished>.append(&mut ordered, Finished {status: 2, output: Bytes.make(), errors: Bytes.make()}) }
+    }
+  }
+  return move ordered
+}
+
+// A worker thread: takes commands from the shared queue until it is empty, with services of its own.
+effect fn runQueued(queue: Injector<Queued>) -> Ran {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut process = OsChildProcess.make()
+  let mut ran = Ran {indexes: List<usize>.make(), finished: List<Finished>.make()}
+  // A thread that runs out of memory stops; the commands it leaves go to another thread.
+  drop run Effect.result(
+    runTaken(&queue, &mut ran) |> Effect.provideMut<ChildProcess>(&mut process)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+  )
+  return move ran
+}
+
+effect fn runTaken(queue: &Injector<Queued>, ran: &mut Ran) -> () ! OutOfMemoryError ? &mut ChildProcess | &mut Allocator {
+  while true {
+    let taken = match move Injector<Queued>.pop(queue) {
+      Option<Queued>.Some {value} => move value
+      Option<Queued>.None => { break }
+    }
+    run List<usize>.append(&mut ran.indexes, taken.index)
+    let mut finished = Finished {status: 2, output: Bytes.make(), errors: Bytes.make()}
+    match move run Effect.result(ChildProcess.submit(&taken.request)) {
+      Result<ProcessOutcome, ProcessError | OutOfMemoryError>.Success {value: outcome} => {
+        if let Option<i32>.Some {value} = move ChildProcess.exitCode(&outcome) { finished.status = value }
+        finished.output = run Bytes.copy(ChildProcess.outputBytes(&outcome))
+        finished.errors = run Bytes.copy(ChildProcess.errorBytes(&outcome))
+      }
+      Result<ProcessOutcome, ProcessError | OutOfMemoryError>.Failure {error} => match move error {
+        ProcessError failed => { drop failed }
+        OutOfMemoryError exhausted => { fail move exhausted }
+      }
+    }
+    run List<Finished>.append(&mut ran.finished, move finished)
+  }
+  return ()
+}
