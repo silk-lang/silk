@@ -1,9 +1,11 @@
-//! Read the files and directories of a ZIP archive held in memory.
+//! Read the files and directories of a ZIP archive held in memory, and write one.
 //!
 //! # When to use
 //! Use a [`ZipReader`] to unpack a `.zip` download, such as a vendor SDK or a release archive. Open
 //! the archive with [`ZipReader.open`], call [`ZipReader.next`] until it returns none, and decode
-//! each file with [`ZipMember.content`]. This module does not write archives.
+//! each file with [`ZipMember.content`]. Use a [`ZipWriter`] to write an archive, such as a
+//! release for Windows: add each member with [`ZipWriter.file`] and end the archive with
+//! [`ZipWriter.finish`].
 //!
 //! # Details
 //! The reader walks the central directory at the end of the archive, so it accepts archives with a
@@ -23,6 +25,7 @@
 //! - [`ZipError`] from [`ZipReader.open`], [`ZipReader.next`], and [`ZipMember.content`] when the
 //!   archive is malformed, uses a feature this module does not read, or goes over the limit.
 //! - `OutOfMemoryError` from [`ZipMember.content`] if the `Allocator` fails.
+//! - [`ZipError`] with `UnsafePath` or `TooLarge` from the [`ZipWriter`] functions.
 //!
 //! # Examples
 //! ```silk
@@ -59,6 +62,7 @@
 import silk.collections.bytes {Bytes}
 import silk.collections.slice {Slice}
 import silk.compress.checksum {CompressionChecksum}
+import silk.compress.deflate {EncodeError, Encoder, Options}
 import silk.compress.inflate {Decoder, DecodeError, Format, Limits, Progress, Status, MEMORY_BOUND}
 import silk.core.effect {Effect}
 import silk.core.option {Option}
@@ -92,6 +96,9 @@ pub enum ZipError {
   /// The decoded lengths the central directory declares go over the limit given to
   /// [`ZipReader.open`].
   LimitExceeded,
+  /// A member, an offset, or the member count given to a [`ZipWriter`] needs ZIP64 records, which
+  /// the writer does not write: 4 GiB or more of data, or more than 65534 members.
+  TooLarge,
 }
 
 impl ZipError {
@@ -105,6 +112,7 @@ impl ZipError {
       ZipError.InvalidData => "a ZIP member's data is invalid"
       ZipError.BadChecksum => "a ZIP member's CRC-32 does not match"
       ZipError.LimitExceeded => "the ZIP archive goes over the decoded size limit"
+      ZipError.TooLarge => "the ZIP archive needs ZIP64 records, which the writer does not write"
     }
   }
 }
@@ -120,6 +128,7 @@ impl Debug for ZipError {
       ZipError.InvalidData => run TextFormat.write(&mut formatter, b"InvalidData")
       ZipError.BadChecksum => run TextFormat.write(&mut formatter, b"BadChecksum")
       ZipError.LimitExceeded => run TextFormat.write(&mut formatter, b"LimitExceeded")
+      ZipError.TooLarge => run TextFormat.write(&mut formatter, b"TooLarge")
     }
   }
 }
@@ -446,4 +455,187 @@ impl<'a> ZipMember<'a> {
     if CompressionChecksum.crc32(Bytes.asSlice(&output)) != self.checksum { fail ZipError.BadChecksum }
     return move output
   }
+}
+
+/// A ZIP archive being written to the ambient `Writer`, one member at a time.
+///
+/// # When to use
+/// Make one with [`ZipWriter.make`], add members in the order the archive should list them, and
+/// end the archive with [`ZipWriter.finish`], which writes the central directory.
+///
+/// # Details
+/// Each member goes to the `Writer` as it is added: its local header, then its data, compressed
+/// with DEFLATE at the best level, or stored as is when DEFLATE makes it no smaller. The writer
+/// keeps only the central directory in memory. Metadata is fixed: the earliest ZIP time,
+/// 1980-01-01 00:00, a Unix mode of 644 for a file and 755 for an executable file or a directory,
+/// and names marked as UTF-8. The same members in the same order therefore always give the same
+/// bytes, on any host. The writer writes no ZIP64 records, so the archive holds at most 65534
+/// members and less than 4 GiB. [`ZipReader`] reads every archive the writer makes.
+///
+/// # Gotchas
+/// Dropping the writer without [`ZipWriter.finish`] leaves an archive with no central directory,
+/// which no reader opens. After a `WriterError`, discard the writer. The writer does not flush
+/// the `Writer`.
+pub struct ZipWriter {
+  central: Bytes,
+  offset: u64,
+  count: u64,
+}
+
+// Appends `value` in `width` little-endian bytes.
+effect fn field(record: &mut Bytes, value: u64, width: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut bytes: [u8; 4] = [0; 4]
+  let mut rest = value
+  let mut at: usize = 0
+  while at < width {
+    bytes[at] = u64.toU8(rest % 256)
+    rest = rest / 256
+    at = at + 1
+  }
+  return run Bytes.append(&mut record.*, Slice.view<u8>(&bytes, 0, width))
+}
+
+// The fields a local header and a central record share, from the version needed to the lengths
+// of the name and the extra field.
+effect fn shared(record: &mut Bytes, deflated: bool, checksum: u32, stored: u64, length: u64, name: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run field(&mut record.*, 20, 2)
+  // Bit 11: the name is UTF-8.
+  run field(&mut record.*, 2048, 2)
+  run field(&mut record.*, if deflated { 8 } else { 0 }, 2)
+  // Midnight on 1980-01-01.
+  run field(&mut record.*, 0, 2)
+  run field(&mut record.*, 33, 2)
+  run field(&mut record.*, u32.toU64(checksum), 4)
+  run field(&mut record.*, stored, 4)
+  run field(&mut record.*, length, 4)
+  run field(&mut record.*, usize.toU64(name), 2)
+  return run field(&mut record.*, 0, 2)
+}
+
+impl ZipWriter {
+  /// Returns a writer with no members.
+  pub fn make() -> ZipWriter {
+    return ZipWriter {central: Bytes.make(), offset: 0, count: 0}
+  }
+
+  /// Adds the regular file `path` holding `content`, with mode 755 when `executable` and 644
+  /// otherwise.
+  ///
+  /// # Errors
+  /// - [`ZipError`] with `UnsafePath` when `path` is absolute, ends in `/`, is longer than 65535
+  ///   bytes, holds a backslash, a colon, or a NUL, or has an empty, `.`, or `..` segment, and
+  ///   `TooLarge` when the archive would need ZIP64 records. Nothing is written.
+  /// - `WriterError` when the `Writer` fails.
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  pub effect fn file(self: &mut Self, path: &[u8], content: &[u8], executable: bool) -> ()
+    ! ZipError | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator {
+    // 0100755 or 0100644 in the high half of the external attributes.
+    let attributes: u64 = if executable { 2179792896 } else { 2175008768 }
+    return run member(&mut self, path, b"", content, attributes)
+  }
+
+  /// Adds the directory `path`, with mode 755. Write it without a trailing `/`.
+  ///
+  /// # Errors
+  /// - [`ZipError`] with `UnsafePath` or `TooLarge`, as for [`ZipWriter.file`]. Nothing is
+  ///   written.
+  /// - `WriterError` when the `Writer` fails.
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  pub effect fn directory(self: &mut Self, path: &[u8]) -> ()
+    ! ZipError | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator {
+    // 040755 in the high half, and the DOS directory bit.
+    return run member(&mut self, path, b"/", b"", 1106051088)
+  }
+
+  /// Ends the archive with its central directory and end record.
+  ///
+  /// # Errors
+  /// - [`ZipError`] with `TooLarge` when the central directory would start or end at 4 GiB or
+  ///   later. Nothing is written.
+  /// - `WriterError` when the `Writer` fails.
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  pub effect fn finish(self: ZipWriter) -> ()
+    ! ZipError | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator {
+    let ZipWriter {central, offset, count} = move self
+    let size = usize.toU64(Bytes.length(&central))
+    if offset + size >= 4294967295 { fail ZipError.TooLarge }
+    let mut end = run Bytes.copy(b"PK\x05\x06")
+    run field(&mut end, 0, 2)
+    run field(&mut end, 0, 2)
+    run field(&mut end, count, 2)
+    run field(&mut end, count, 2)
+    run field(&mut end, size, 4)
+    run field(&mut end, offset, 4)
+    run field(&mut end, 0, 2)
+    run Writer.writeAll(Bytes.asSlice(&central))
+    return run Writer.writeAll(Bytes.asSlice(&end))
+  }
+}
+
+// Writes one member's local header and data, and adds its record to the central directory.
+// `suffix` is the `/` that ends a directory's name.
+effect fn member(writer: &mut ZipWriter, path: &[u8], suffix: &[u8], content: &[u8], attributes: u64) -> ()
+  ! ZipError | WriterError | OutOfMemoryError
+  ? &mut Writer | &mut Allocator {
+  if !safe(path) || path.length + suffix.length > 65535 { fail ZipError.UnsafePath }
+  let length = usize.toU64(content.length)
+  // A count of 65535 and a size or offset of 0xFFFFFFFF mark ZIP64 records.
+  if writer.count >= 65534 || length >= 4294967295 { fail ZipError.TooLarge }
+  // The data is stored as is unless DEFLATE makes it smaller.
+  let mut packed = Bytes.make()
+  let mut deflated = false
+  if content.length > 0 {
+    if let Option<usize>.Some {value: bound} = Encoder.encodedBound(content.length, Format.Raw) {
+      packed = run Bytes.zeroed(bound)
+      let encoded = run Effect.result(Encoder.encode(content, Bytes.asMutSlice(&mut packed), Format.Raw, Options.make(9)))
+      match move encoded {
+        Result<usize, OutOfMemoryError | EncodeError>.Success {value: written} => {
+          if written < content.length {
+            Bytes.truncate(&mut packed, written)
+            deflated = true
+          }
+        }
+        Result<usize, OutOfMemoryError | EncodeError>.Failure {error} => match move error {
+          OutOfMemoryError exhausted => { fail move exhausted }
+          // Level 9 is a valid option and the buffer holds the bound, so this stores the data.
+          EncodeError _unreachable => {}
+        }
+      }
+    }
+  }
+  let data = if deflated { Bytes.asSlice(&packed) } else { content }
+  let stored = usize.toU64(data.length)
+  let name = path.length + suffix.length
+  let next = writer.offset + 30 + usize.toU64(name) + stored
+  if next >= 4294967295 { fail ZipError.TooLarge }
+  let checksum = CompressionChecksum.crc32(content)
+  let mut local = run Bytes.copy(b"PK\x03\x04")
+  run shared(&mut local, deflated, checksum, stored, length, name)
+  run Bytes.append(&mut local, path)
+  run Bytes.append(&mut local, suffix)
+  // Both records are complete before anything is written, so only the `Writer` can fail from
+  // here on. After a `WriterError` the archive is cut short: discard the writer.
+  let mut record = run Bytes.copy(b"PK\x01\x02")
+  // Made on Unix, by version 2.0 of the format.
+  run field(&mut record, 788, 2)
+  run shared(&mut record, deflated, checksum, stored, length, name)
+  run field(&mut record, 0, 2)
+  run field(&mut record, 0, 2)
+  run field(&mut record, 0, 2)
+  run field(&mut record, attributes, 4)
+  run field(&mut record, writer.offset, 4)
+  run Bytes.append(&mut record, path)
+  run Bytes.append(&mut record, suffix)
+  run Bytes.reserve(&mut writer.central, Bytes.length(&record))
+  run Writer.writeAll(Bytes.asSlice(&local))
+  run Writer.writeAll(data)
+  run Bytes.append(&mut writer.central, Bytes.asSlice(&record))
+  writer.offset = next
+  writer.count = writer.count + 1
+  return ()
 }
