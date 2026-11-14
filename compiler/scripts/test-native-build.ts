@@ -5009,12 +5009,24 @@ const program = Effect.gen(function* () {
       splitEnvironment,
     )
   })
+  // Only the modules the package's check reads count: a module nothing imports, as a test module
+  // is, may embed a fixture the archive leaves out. `--list` still lists.
+  yield* fs.makeDirectory(join(embedLibrary, 'fixtures'), { recursive: true })
+  yield* fs.writeFileString(join(embedLibrary, 'fixtures/case.txt'), 'fixture\n')
+  yield* fs.writeFileString(
+    join(embedLibrary, 'src/tests.silk'),
+    'import silk.build.source { Source }\n\npub fn fixture() -> &\'static [u8] { return Source.read("fixtures/case.txt") }\n',
+  )
+  const embedListed = yield* invoke(silk, ['pack', '--list'], embedLibrary, splitEnvironment)
+  assert.equal(embedListed.status, 0, embedListed.stdout + embedListed.stderr)
+  assert.match(embedListed.stdout, /^src\/library\.silk$/m)
   const unpacked = yield* embedPack()
   assert.notEqual(unpacked.status, 0, 'an archive without an embedded file was packed')
   assert.match(
     unpacked.stderr,
-    /silk pack: embed-library: src\/library\.silk embeds js\/index\.js, which the archive would not hold; add it to \[package\]\.include/,
+    /silk pack: embed-library: module library\.silk embeds js\/index\.js, which the archive would not hold; add it to \[package\]\.include/,
   )
+  assert.doesNotMatch(unpacked.stderr, /fixtures/)
   yield* fs.writeFileString(
     join(embedLibrary, 'silk.toml'),
     '[package]\nname = "embed-library"\nversion = "0.1.0"\nkind = "library"\nmain = "library.silk"\nexports = ["library"]\ninclude = ["js"]\n',
