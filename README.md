@@ -84,7 +84,7 @@ installed compiler. `SILK_CLANG` or `--clang` selects another Clang (22 or newer
 macOS, plain programs link without an SDK; a package with C sources or native libraries needs the
 macOS SDK (`xcode-select --install`).
 
-With [Homebrew](https://brew.sh), which also installs Homebrew's LLVM and points `silk` at its Clang:
+With [Homebrew](https://brew.sh), which installs the release with its bundled LLVM:
 
 ```sh
 brew install silk-lang/tap/silk
