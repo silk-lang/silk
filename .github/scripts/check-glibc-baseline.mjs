@@ -31,6 +31,8 @@ const otherBranches = new Set([
   'closesocket', 'ioctlsocket', '__silk_stderr_lock', '__silk_stderr_once',
   // The Tracy profiler, which a profiling build links as a declared input.
   'silk_tracy_zone_begin', 'silk_tracy_zone_end', 'silk_tracy_zone_text',
+  // The linker's bounds of the section that holds a test runner's table of executed functions.
+  '__start_silk_seen', '__stop_silk_seen',
 ])
 
 const missing = []
