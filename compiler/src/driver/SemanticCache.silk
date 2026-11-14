@@ -26,7 +26,17 @@
 //! named by the hex of its own digest.
 //!
 //! A build's write can outlive the build (see `DetachedWriter`). The copy that writes the file
-//! holds a lock on `semantic-<digest>.lock` until it is done, and a read of the file waits for it.
+//! holds a lock on `semantic-<digest>.lock` until it is done, and a build's read of the file waits
+//! for it. After a cold build that lowered in several processes, the copy first walks the build
+//! again, which takes about as long as the build's code generation did.
+//!
+//! A check does not wait for that. What a build's write adds, its record and definitions, a check
+//! never reads, and the file still holds what the last check left. So a check waits only for a
+//! write that holds `semantic-<digest>.checks.lock` as well, as every write but a build's does,
+//! and reads the file as it stands when a build's write is running and the file already holds a
+//! check's escape walks. A store that read the file that way writes nothing back
+//! ([`CacheFile.unsettled`]): the image it would write carries the build definitions of the file
+//! it read, not those the running write leaves.
 
 import backend.CodegenUnits {CodegenUnit}
 import driver.CacheStamp
@@ -37,7 +47,7 @@ import semantic.BuildRecord
 import semantic.CacheImage
 import semantic.CacheImage {Merge as ImageMerge}
 import semantic.ContentHash {ContentHash}
-import semantic.Semantic {Adopted, Request, Semantic}
+import semantic.Semantic {Adopted, Request, Semantic, recordsEscapeWalks}
 import semantic.Query {Cycle}
 import semantic.Types {Types}
 import silk.mem.allocator {Allocator, OutOfMemoryError}
@@ -62,6 +72,10 @@ pub struct CacheFile {
   packs: Path,
   // The lock file a write of it holds.
   lock: Path,
+  // The lock file a write of it holds too unless a build writes it; a check's read waits on it.
+  checksLock: Path,
+  // Whether the store builds, so its write adds nothing a check reads.
+  building: bool,
   stamp: Bytes,
   /// What the store reused from the file it read; nothing when it read none. The store keeps the
   /// image it read (`Semantic.adoptedImage`), which the next one carries reused checks from.
@@ -69,6 +83,10 @@ pub struct CacheFile {
   /// Whether the store adopted this file's own image, not a dependency's or none. Only then do the
   /// files the store parses tell the next load which files it will parse again.
   pub own: bool,
+  /// Whether the file was read while a build's write of it was running. [`save`] and
+  /// [`saveDetached`] then write nothing, so the build definitions that write leaves are kept;
+  /// the next check reads them and writes its own checks beside them.
+  pub unsettled: bool,
 }
 
 fn hexDigit(value: u64) -> u8 {
@@ -177,6 +195,10 @@ struct Fetched {
   stamp: Bytes,
   graph: CacheImage.Graph,
   packs: List<BuildRecord.PackBody>,
+  // Whether a build's write of the file was running when a check read it. A check does not wait
+  // for one, so whether one runs is asked here, before the read, and again once the read is
+  // joined (`openPrefetched`): a write that ran in between replaced the file.
+  unsettled: bool,
 }
 
 /// Starts reading the cache file in `cache` that the target and profile `profile` (the bytes
@@ -234,7 +256,7 @@ effect fn startReading(path: Bytes, building: bool) -> Option<Reading> ! OutOfMe
   let rootsPath = run Bytes.copy(Bytes.asSlice(&path))
   let roots = match move run Effect.result(NativeThread.spawn(
     fn() -> Option<CacheImage.Roots> {
-      return run fetchRootsDetached(move rootsPath)
+      return run fetchRootsDetached(move rootsPath, building)
     }
   )) {
     Result<JoinHandle<Option<CacheImage.Roots>>, OutOfMemoryError | SpawnError>.Success {value} => move value
@@ -352,10 +374,10 @@ effect fn fetch(path: &Bytes, building: bool) -> Option<Fetched> ! OutOfMemoryEr
       OutOfMemoryError exhausted => { fail move exhausted }
     }
   }
-  let mut lockName = run Bytes.copy(Bytes.asSlice(&path.*))
-  run Bytes.append(&mut lockName, b".lock")
-  if let Result<Path, FileError | OutOfMemoryError>.Success {value: lock} = move run Effect.result(Path.fromBytes(Bytes.asSlice(&lockName))) {
-    run DetachedWriter.waitFor(&lock)
+  run waitForWrite(Bytes.asSlice(&path.*), building)
+  let mut unsettled = false
+  if !building {
+    if let Option<Path>.Some {value: lock} = move run suffixed(Bytes.asSlice(&path.*), b".lock") { unsettled = run DetachedWriter.busy(&lock) }
   }
   let bytes = match move run Effect.result(FileSystem.readFile(&located)) {
     Result<Bytes, FileError | OutOfMemoryError>.Success {value} => move value
@@ -383,7 +405,17 @@ effect fn fetch(path: &Bytes, building: bool) -> Option<Fetched> ! OutOfMemoryEr
       packs = run readPacks(&directory)
     }
   }
-  return Option<Fetched>.some(Fetched {path: run Bytes.copy(Bytes.asSlice(&path.*)), stamp: move stamp, graph: move graph, packs: move packs})
+  return Option<Fetched>.some(Fetched {path: run Bytes.copy(Bytes.asSlice(&path.*)), stamp: move stamp, graph: move graph, packs: move packs,
+    unsettled: unsettled})
+}
+
+// Waits for the writes of the cache file at `path` that a prefetch for a store that builds
+// (`building`) or only checks must not read past: a build waits for every write, a check only
+// for one that is not a build's.
+effect fn waitForWrite(path: &[u8], building: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut suffix = b".checks.lock"
+  if building { suffix = b".lock" }
+  if let Option<Path>.Some {value: lock} = move run suffixed(path, suffix) { run DetachedWriter.waitFor(&lock) }
 }
 
 // The graph file `bytes` under `stamp`. Its leaves past its anchors and its nodes stay in the file
@@ -401,9 +433,9 @@ effect fn graphOf(bytes: Bytes, stamp: &[u8]) -> Option<CacheImage.Graph> ! OutO
 
 
 // `fetchRoots` on a thread of its own, with its own allocator and file system.
-effect fn fetchRootsDetached(path: Bytes) -> Option<CacheImage.Roots> {
+effect fn fetchRootsDetached(path: Bytes, building: bool) -> Option<CacheImage.Roots> {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let fetched = run Effect.result(fetchRootsOpened(&path) |> Effect.provideMut<Allocator>(&mut allocator))
+  let fetched = run Effect.result(fetchRootsOpened(&path, building) |> Effect.provideMut<Allocator>(&mut allocator))
   return match move fetched {
     Result<Option<CacheImage.Roots>, OutOfMemoryError>.Success {value} => move value
     Result<Option<CacheImage.Roots>, OutOfMemoryError>.Failure {error} => {
@@ -413,19 +445,15 @@ effect fn fetchRootsDetached(path: Bytes) -> Option<CacheImage.Roots> {
   }
 }
 
-effect fn fetchRootsOpened(path: &Bytes) -> Option<CacheImage.Roots> ! OutOfMemoryError ? &mut Allocator {
+effect fn fetchRootsOpened(path: &Bytes, building: bool) -> Option<CacheImage.Roots> ! OutOfMemoryError ? &mut Allocator {
   let mut files = run MachineFileSystem.make()
-  return run fetchRoots(path) |> Effect.provideMut<FileSystem>(&mut files)
+  return run fetchRoots(path, building) |> Effect.provideMut<FileSystem>(&mut files)
 }
 
 // Reads and decodes the roots file beside the cache file at `path`, under the stamp it was
 // written with; joining it to the graph file checks they are one image's.
-effect fn fetchRoots(path: &Bytes) -> Option<CacheImage.Roots> ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  let mut lockName = run Bytes.copy(Bytes.asSlice(&path.*))
-  run Bytes.append(&mut lockName, b".lock")
-  if let Result<Path, FileError | OutOfMemoryError>.Success {value: lock} = move run Effect.result(Path.fromBytes(Bytes.asSlice(&lockName))) {
-    run DetachedWriter.waitFor(&lock)
-  }
+effect fn fetchRoots(path: &Bytes, building: bool) -> Option<CacheImage.Roots> ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  run waitForWrite(Bytes.asSlice(&path.*), building)
   return match move run rootsPath(Bytes.asSlice(&path.*)) {
     Option<Path>.Some {value: located} => run readRoots(&located)
     Option<Path>.None => Option<CacheImage.Roots>.none()
@@ -469,6 +497,10 @@ pub effect fn open(store: &mut Semantic, request: &Request, cache: &Path, compil
 /// the escape walks of the package that walked one and loaded most of the packages whose cache
 /// directories `runtime` lists, the ones it loads, too ([`rememberRuntime`]); `runtime` is empty
 /// for a store that walks none.
+///
+/// A store that builds waits for a write of the file that is still running. One that only checks
+/// waits unless the write is a build's and the file as it stands holds a check's escape walks; it
+/// then adopts the file as it stands and marks it `unsettled`.
 pub effect fn openPrefetched(store: &mut Semantic, request: &Request, cache: &Path, compiler: &[u8], linked: bool, building: bool,
   prefetched: Option<Prefetch>, dependencies: &[Path], runtime: &[Path]) -> Option<CacheFile>
   ! Cycle | OutOfMemoryError ? &mut FileSystem | &mut Allocator | &mut Types {
@@ -512,6 +544,18 @@ pub effect fn openPrefetched(store: &mut Semantic, request: &Request, cache: &Pa
       OutOfMemoryError exhausted => { fail move exhausted }
     }
   }
+  let mut checksName = run Bytes.copy(Bytes.asSlice(&imageFile))
+  run Bytes.append(&mut checksName, b".checks.lock")
+  let checksLock = match move run Effect.result(Path.joinBytes(cache, Bytes.asSlice(&checksName))) {
+    Result<Path, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => {
+        drop failure
+        return Option<CacheFile>.none()
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
   let mut adopted = Adopted {roots: usize.ZERO, stale: usize.ZERO, nodes: usize.ZERO, changedLeaves: usize.ZERO}
   let mut fetched = Option<Fetched>.none()
   let mut fetchedRoots = Option<CacheImage.Roots>.none()
@@ -529,13 +573,19 @@ pub effect fn openPrefetched(store: &mut Semantic, request: &Request, cache: &Pa
   }
   if let Option<Fetched>.Some {value: read} = move fetched {
     if same(Bytes.asSlice(&read.path), Path.rawBytes(&path)) && same(Bytes.asSlice(&read.stamp), Bytes.asSlice(&stamp)) {
-      let Fetched {path: _, stamp: _, graph, packs: bodies} = move read
+      let Fetched {path: _, stamp: _, graph, packs: bodies, unsettled: early} = move read
+      // Whether a check read the file while a build's write of it was running.
+      let unsettled = !building && (early || run DetachedWriter.busy(&lock))
       if let Option<CacheImage.Roots>.Some {value: roots} = move fetchedRoots {
         if let Option<CacheImage.Image>.Some {value: image} = move CacheImage.joined(move graph, move roots) {
-          if building { Semantic.offerPacks(&mut store.*, move bodies) }
-          adopted = run Semantic.adoptImage(&mut store.*, request, move image, linked)
-          return Option<CacheFile>.some(CacheFile {path: move path, packs: move packs, lock: move lock, stamp: move stamp,
-            adopted: move adopted, own: true})
+          // A file read beside a build's write serves a check only when it holds a check's walks.
+          // One that holds none, as after a first build, is read again once the write is done.
+          if !unsettled || recordsEscapeWalks(&image) {
+            if building { Semantic.offerPacks(&mut store.*, move bodies) }
+            adopted = run Semantic.adoptImage(&mut store.*, request, move image, linked)
+            return Option<CacheFile>.some(CacheFile {path: move path, packs: move packs, lock: move lock, checksLock: move checksLock,
+              building: building, stamp: move stamp, adopted: move adopted, own: true, unsettled: unsettled})
+          }
         }
       }
     }
@@ -554,8 +604,8 @@ pub effect fn openPrefetched(store: &mut Semantic, request: &Request, cache: &Pa
       adopted = run Semantic.adoptImage(&mut store.*, request, move image, linked)
     }
   }
-  return Option<CacheFile>.some(CacheFile {path: move path, packs: move packs, lock: move lock, stamp: move stamp, adopted: move adopted,
-    own: own})
+  return Option<CacheFile>.some(CacheFile {path: move path, packs: move packs, lock: move lock, checksLock: move checksLock,
+    building: building, stamp: move stamp, adopted: move adopted, own: own, unsettled: false})
 }
 
 /// Records that the cache file `file` holds the escape walk of a runtime, as an executable's
@@ -934,14 +984,24 @@ effect fn rootsPath(path: &[u8]) -> Option<Path> ! OutOfMemoryError ? &mut Alloc
 /// Writes `store`'s image to its cache file, with the checks and build definitions it reused
 /// from the file carried over, unless it ran no module check, every check in the file was
 /// reused and its last build lowered nothing the file lacks, so the file already holds what it
-/// would write.
+/// would write. Writes nothing either when the file was read while a build's write of it was
+/// running (`CacheFile.unsettled`).
 pub effect fn save(store: &mut Semantic, file: &CacheFile) -> ()
   ! Cycle | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  if current(&store.*, file) { return () }
+  if current(&store.*, file) || file.unsettled { return () }
   // A copy of an earlier build may still be writing the file.
   let held = run DetachedWriter.hold(&file.lock)
+  let checks = run holdChecks(file)
   run persist(&mut store.*, file, true)
+  drop checks
   drop held
+}
+
+// The lock a write of `file` holds beside its own unless a build writes it, so a check waits for
+// the write (`waitForWrite`); none for a build's write, or where the lock cannot be taken.
+effect fn holdChecks(file: &CacheFile) -> Option<Held> ! OutOfMemoryError ? &mut Allocator {
+  if file.building { return Option<Held>.none() }
+  return run DetachedWriter.hold(&file.checksLock)
 }
 
 /// As [`save`], but in a copy of the process (`DetachedWriter`), so a build links its units and
@@ -956,7 +1016,7 @@ pub effect fn save(store: &mut Semantic, file: &CacheFile) -> ()
 /// the file names.
 pub effect fn saveDetached(store: &mut Semantic, file: &CacheFile, units: Option<&[CodegenUnit]>) -> ()
   ! Cycle | OutOfMemoryError ? &mut FileSystem | &mut Allocator | &mut Types {
-  if current(&store.*, file) { return () }
+  if current(&store.*, file) || file.unsettled { return () }
   let held = match move run DetachedWriter.hold(&file.lock) {
     Option<Held>.Some {value} => move value
     Option<Held>.None => {
@@ -965,6 +1025,9 @@ pub effect fn saveDetached(store: &mut Semantic, file: &CacheFile, units: Option
       return run pruneBuilt(file, &units)
     }
   }
+  // The copy inherits this lock too and holds it until it exits; the build's own handle closes
+  // when this returns.
+  let _checks = run holdChecks(file)
   match move DetachedWriter.handOff(move held) {
     Handoff.Original => {}
     Handoff.Copy {held: kept} => {
