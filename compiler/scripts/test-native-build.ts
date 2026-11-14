@@ -3528,6 +3528,130 @@ const program = Effect.gen(function* () {
     assert.equal(cached.status, 42, cached.stderr)
   }
   {
+    // A workspace writes shared dependencies once in [workspace.dependencies]; a member takes one
+    // by name with { workspace = true } (PACKAGE-008). The repository is itself a workspace whose
+    // member takes a sibling that way, so a checkout resolves the entry inside itself.
+    const repository = join(directory, 'shared/repository')
+    yield* fs.makeDirectory(join(repository, 'lengths'), { recursive: true })
+    yield* fs.makeDirectory(join(repository, 'units'), { recursive: true })
+    yield* fs.writeFileString(
+      join(repository, 'silk.toml'),
+      '[workspace]\nmembers = ["lengths", "units"]\n\n[workspace.dependencies]\nunits = { path = "units" }\n',
+    )
+    yield* fs.writeFileString(
+      join(repository, 'lengths/silk.toml'),
+      '[package]\nname = "lengths"\nversion = "0.1.0"\nsource = "."\nexports = ["length"]\n\n[dependencies]\nunits = { workspace = true }\n',
+    )
+    yield* fs.writeFileString(
+      join(repository, 'lengths/length.silk'),
+      'import units.unit { unit }\n\npub fn length() -> i32 {\n  return unit() + 6\n}\n',
+    )
+    yield* fs.writeFileString(
+      join(repository, 'units/silk.toml'),
+      '[package]\nname = "units"\nversion = "0.1.0"\nsource = "."\nexports = ["unit"]\n',
+    )
+    yield* fs.writeFileString(join(repository, 'units/unit.silk'), 'pub fn unit() -> i32 {\n  return 1\n}\n')
+    const git = (args: ReadonlyArray<string>) => {
+      const ran = spawnSync('git', ['-C', repository, ...args], { encoding: 'utf8' })
+      assert.equal(ran.status, 0, ran.stderr)
+      return ran.stdout.trim()
+    }
+    git(['init', '--quiet'])
+    git(['add', '.'])
+    git(['-c', 'user.name=Silk', '-c', 'user.email=silk@example.com', '-c', 'commit.gpgsign=false', 'commit', '--quiet', '-m', 'packages'])
+    const commit = git(['rev-parse', 'HEAD'])
+    const pin = `git = "${pathToFileURL(repository).href}", rev = "${commit}", path = "lengths"`
+    const workspace = join(directory, 'shared/workspace')
+    const environment = { ...process.env, SILK_CLANG: clang, SILK_HOME: join(directory, 'shared/home') }
+    const refusing = { ...environment, SILK_CLANG: sentinel }
+    yield* fs.makeDirectory(join(workspace, 'app'), { recursive: true })
+    yield* fs.makeDirectory(join(workspace, 'libs/math'), { recursive: true })
+    const root = (lengths: string) =>
+      `[workspace]\nmembers = ["app", "libs/*"]\n\n[workspace.dependencies]\nlengths = { ${lengths} }\nmath = { path = "libs/math" }\n`
+    yield* fs.writeFileString(join(workspace, 'silk.toml'), root(pin))
+    yield* fs.writeFileString(
+      join(workspace, 'libs/math/silk.toml'),
+      '[package]\nname = "shared-math"\nversion = "0.1.0"\nsource = "."\nkind = "library"\nexports = ["twice"]\n\n[dependencies]\nlengths = { workspace = true }\n',
+    )
+    yield* fs.writeFileString(
+      join(workspace, 'libs/math/twice.silk'),
+      'import lengths.length { length }\n\npub fn twice() -> i32 {\n  return length() * 2\n}\n',
+    )
+    const member = (dependencies: string) =>
+      `[package]\nname = "shared-app"\nversion = "0.1.0"\nsource = "."\n\n[dependencies]\n${dependencies}`
+    const taken = 'math = { workspace = true }\nlengths = { workspace = true }\n'
+    yield* fs.writeFileString(join(workspace, 'app/silk.toml'), member(taken))
+    yield* fs.writeFileString(
+      join(workspace, 'app/main.silk'),
+      'import lengths.length { length }\nimport math.twice { twice }\n\npub fn main() -> i32 {\n  return twice() + length()\n}\n',
+    )
+    // The shared path is relative to the workspace root, and the shared pin is fetched once.
+    const ran = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(workspace, 'app'), environment)
+    assert.equal(ran.status, 21, ran.stderr)
+    // From the root, the members build in dependency order through the shared path entry.
+    const all = yield* invoke(silk, ['check', '--stdlib', standardLibrary], workspace, refusing)
+    assert.equal(all.status, 0, all.stderr)
+    assert.ok(
+      all.stderr.indexOf('shared-math') < all.stderr.indexOf('shared-app'),
+      `the library member is not checked before the member that takes it:\n${all.stderr}`,
+    )
+    // A name the workspace does not write is refused at the member's entry.
+    yield* fs.writeFileString(join(workspace, 'app/silk.toml'), member(`${taken}missing = { workspace = true }\n`))
+    const missing = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(workspace, 'app'), refusing)
+    assert.equal(missing.status, 2, 'a dependency the workspace does not write was accepted')
+    assert.match(missing.stderr, /Invalid Silk project manifest .*shared\/workspace\/app\/silk\.toml:9: /)
+    // The entry is written alone.
+    yield* fs.writeFileString(
+      join(workspace, 'app/silk.toml'),
+      member('math = { workspace = true }\nlengths = { workspace = true, package = "lengths" }\n'),
+    )
+    const extended = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(workspace, 'app'), refusing)
+    assert.equal(extended.status, 2, 'a workspace entry with another field was accepted')
+    assert.match(extended.stderr, /Invalid Silk project manifest .*shared\/workspace\/app\/silk\.toml:8: /)
+    // A fault in the shared entry names the workspace root's manifest.
+    yield* fs.writeFileString(join(workspace, 'app/silk.toml'), member(taken))
+    yield* fs.writeFileString(join(workspace, 'silk.toml'), root(pin.replace(commit, 'main')))
+    const unpinned = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(workspace, 'app'), refusing)
+    assert.equal(unpinned.status, 2, 'a shared git dependency without a commit was accepted')
+    assert.match(unpinned.stderr, /Invalid Silk project manifest .*shared\/workspace\/silk\.toml:5: /)
+    yield* fs.writeFileString(join(workspace, 'silk.toml'), root(pin))
+    // A package no workspace lists has nothing to take the entry from.
+    yield* fs.makeDirectory(join(workspace, 'tool'), { recursive: true })
+    yield* fs.writeFileString(
+      join(workspace, 'tool/silk.toml'),
+      '[package]\nname = "shared-tool"\nversion = "0.1.0"\nsource = "."\n\n[dependencies]\nlengths = { workspace = true }\n',
+    )
+    yield* fs.writeFileString(join(workspace, 'tool/main.silk'), 'pub fn main() -> i32 {\n  return 0\n}\n')
+    const unlisted = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(workspace, 'tool'), refusing)
+    assert.equal(unlisted.status, 2, 'a package outside the workspace took a workspace dependency')
+    assert.match(unlisted.stderr, /Invalid Silk project manifest .*shared\/workspace\/tool\/silk\.toml:7: /)
+    yield* fs.remove(join(workspace, 'tool'), { recursive: true })
+    // `silk pack` writes the shared pin out, so the archive builds without the workspace.
+    const output = join(directory, 'shared/packed')
+    const packed = yield* invoke(
+      silk,
+      ['pack', '-p', 'shared-math', '--output', output, '--stdlib', standardLibrary],
+      workspace,
+      refusing,
+    )
+    assert.equal(packed.status, 0, packed.stderr)
+    const listed = spawnSync('tar', ['-xzOf', join(output, 'shared-math-0.1.0.tar.gz'), 'shared-math-0.1.0/silk.toml'], {
+      encoding: 'utf8',
+    })
+    assert.equal(listed.status, 0, listed.stderr)
+    assert.ok(listed.stdout.includes(`lengths = { ${pin} }\n`), listed.stdout)
+    assert.equal(listed.stdout.includes('workspace'), false, listed.stdout)
+    // A shared path dependency is still one an archive cannot carry.
+    const carried = yield* invoke(
+      silk,
+      ['pack', '-p', 'shared-app', '--output', output, '--stdlib', standardLibrary],
+      workspace,
+      refusing,
+    )
+    assert.equal(carried.status, 1, 'a package with a shared path dependency was packed')
+    assert.match(carried.stderr, /path dependency `math`/)
+  }
+  {
     // `init --template` copies one directory of a GitHub repository, here served from local
     // repositories through git's `insteadOf`, runs its [[post-init]] entries and drops them from the
     // new manifest. A one-segment template is a directory of silk-lang/examples.
