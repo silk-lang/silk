@@ -5135,6 +5135,51 @@ const program = Effect.gen(function* () {
   yield* embedAppRun(45)
   yield* embedCheck(embedLibrary, 'a package\'s own embedded file was not read')
   yield* embedCheck(embedLibrary, 'a second check lost a package\'s own embedded file')
+  // A static fn reads the length of an embedded file while the package compiles.
+  yield* fs.writeFileString(
+    join(embedLibrary, 'src/library.silk'),
+    'import silk.build.source { Source }\n\npub fn script() -> &\'static [u8] {\n  return Source.read("js/index.js")\n}\n\n'
+      + 'static fn measured() -> usize {\n  return Source.read("js/index.js").length\n}\n\npub fn size() -> usize {\n  return measured()\n}\n',
+  )
+  yield* fs.writeFileString(
+    join(embedApp, 'src/main.silk'),
+    'import library.library { script, size }\nimport silk.num.usize\n\npub fn main() -> i32 {\n  if script().length != size() { return 1 }\n  return usize.toI32(size())\n}\n',
+  )
+  yield* embedAppRun(45)
+  // `silk pack` refuses an archive that would lack a file its sources embed, since a package that
+  // depends on the archive reads the file from it; naming the file in `include` packs it.
+  const embedPack = Effect.fnUntraced(function* () {
+    return yield* invoke(
+      silk,
+      ['pack', '--output', join(directory, 'embed-packed'), '--stdlib', standardLibrary],
+      embedLibrary,
+      splitEnvironment,
+    )
+  })
+  // Only the modules the package's check reads count: a module nothing imports, as a test module
+  // is, may embed a fixture the archive leaves out. `--list` still lists.
+  yield* fs.makeDirectory(join(embedLibrary, 'fixtures'), { recursive: true })
+  yield* fs.writeFileString(join(embedLibrary, 'fixtures/case.txt'), 'fixture\n')
+  yield* fs.writeFileString(
+    join(embedLibrary, 'src/tests.silk'),
+    'import silk.build.source { Source }\n\npub fn fixture() -> &\'static [u8] { return Source.read("fixtures/case.txt") }\n',
+  )
+  const embedListed = yield* invoke(silk, ['pack', '--list'], embedLibrary, splitEnvironment)
+  assert.equal(embedListed.status, 0, embedListed.stdout + embedListed.stderr)
+  assert.match(embedListed.stdout, /^src\/library\.silk$/m)
+  const unpacked = yield* embedPack()
+  assert.notEqual(unpacked.status, 0, 'an archive without an embedded file was packed')
+  assert.match(
+    unpacked.stderr,
+    /silk pack: embed-library: module library\.silk embeds js\/index\.js, which the archive would not hold; add it to \[package\]\.include/,
+  )
+  assert.doesNotMatch(unpacked.stderr, /fixtures/)
+  yield* fs.writeFileString(
+    join(embedLibrary, 'silk.toml'),
+    '[package]\nname = "embed-library"\nversion = "0.1.0"\nkind = "library"\nmain = "library.silk"\nexports = ["library"]\ninclude = ["js"]\n',
+  )
+  const packedEmbed = yield* embedPack()
+  assert.equal(packedEmbed.status, 0, packedEmbed.stdout + packedEmbed.stderr)
   yield* Console.log(
     'Native build CLI: exact LLVM output, Clang bypass, --clang, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, path dependencies, native sources, native archives, exports, workspaces, silk change release/history/recovery, retention, runtime requests, format reports, installed standard library, clang on PATH, version, help, check, project test, cached codegen units, build replay, check replay, embedded files, compressed embedded files, embedded files of a dependency, object and static library artifacts and emission stages passed',
   )
