@@ -4533,6 +4533,18 @@ const program = Effect.gen(function* () {
     const ran = yield* invoke(join(shared, `build/llvm/${hostTarget}/debug/${member}`), [], shared, splitEnvironment)
     assert.equal(ran.status, expected, ran.stderr)
   }
+  // A host that cannot copy its process runs each member in a compiler process of its own, and
+  // SILK_MEMBER_PROCESSES asks any host to: the reports read as a run of one member at a time.
+  const inProcesses = { ...splitEnvironment, SILK_MEMBER_PROCESSES: '1' }
+  const checkedBoth = yield* invoke(silk, ['check', '--workspace', '--stdlib', standardLibrary], shared, inProcesses)
+  assert.equal(checkedBoth.status, 0, checkedBoth.stderr)
+  const checkedReport = checkedBoth.stdout + checkedBoth.stderr
+  assert.ok(checkedReport.indexOf('Finished one') < checkedReport.indexOf('Finished two'), checkedReport)
+  assert.match(checkedReport, /Finished 2 packages/)
+  yield* fs.writeFileString(join(shared, 'two/src/main.silk'), 'pub fn main() -> i32 {\n  return missing\n}\n')
+  const checkedBroken = yield* invoke(silk, ['check', '--workspace', '--stdlib', standardLibrary], shared, inProcesses)
+  assert.equal(checkedBroken.status, 1, checkedBroken.stderr)
+  assert.match(checkedBroken.stdout + checkedBroken.stderr, /Failed 1 of 2 packages/)
   // Each unit carries line tables made from the lines its location markers name, so a function
   // that moves recompiles its unit alone, and the unit's rows name the lines it moved to.
   const rowLines = Effect.fnUntraced(function* (object: string) {
