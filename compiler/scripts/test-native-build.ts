@@ -3650,6 +3650,73 @@ const program = Effect.gen(function* () {
     )
     assert.equal(carried.status, 1, 'a package with a shared path dependency was packed')
     assert.match(carried.stderr, /path dependency `math`/)
+    // `silk pack --verify` accepts what a signing `silk pack` wrote, and names every fault in a
+    // directory that was changed afterwards.
+    const keys = join(directory, 'shared/keys')
+    const made = yield* invoke(silk, ['pack', '--new-key', join(keys, 'release.key')], workspace, refusing)
+    assert.equal(made.status, 0, made.stderr)
+    const signed = join(directory, 'shared/signed')
+    const signing = yield* invoke(
+      silk,
+      ['pack', '-p', 'shared-math', '--output', signed, '--sign', join(keys, 'release.key'), '--stdlib', standardLibrary],
+      workspace,
+      refusing,
+    )
+    assert.equal(signing.status, 0, signing.stderr)
+    const verify = (...more: ReadonlyArray<string>) =>
+      invoke(silk, ['pack', '--verify', signed, '--key', join(keys, 'release.pub'), ...more], workspace, refusing)
+    const verified = yield* verify()
+    assert.equal(verified.status, 0, verified.stderr)
+    assert.match(verified.stdout, /^verified shared-math-0\.1\.0\.tar\.gz\n/)
+    // Without `--key` the public key is `minisign.pub` in the working directory.
+    const unkeyed = yield* invoke(silk, ['pack', '--verify', signed], workspace, refusing)
+    assert.equal(unkeyed.status, 2, 'a release was verified without a public key')
+    assert.match(unkeyed.stderr, /cannot read the public key .*minisign\.pub; name the key file with --key/)
+    yield* fs.copyFile(join(keys, 'release.pub'), join(workspace, 'minisign.pub'))
+    const found = yield* invoke(silk, ['pack', '--verify', signed], workspace, refusing)
+    assert.equal(found.status, 0, found.stderr)
+    yield* fs.remove(join(workspace, 'minisign.pub'))
+    const combined = yield* verify('--bin')
+    assert.equal(combined.status, 2, '--verify was accepted beside --bin')
+    // A file the list does not name, a changed file and a missing signature each fail.
+    yield* fs.writeFileString(join(signed, 'extra.txt'), 'not released\n')
+    const extra = yield* verify()
+    assert.equal(extra.status, 1, 'a file SHA256SUMS does not name was accepted')
+    assert.match(extra.stderr, /^silk pack: extra\.txt: SHA256SUMS does not name it$/m)
+    yield* fs.remove(join(signed, 'extra.txt'))
+    // A signature of nothing the list names, and on Linux a name that only ends like a listed
+    // one, are unlisted files too.
+    yield* fs.writeFileString(join(signed, 'orphan.minisig'), 'not a signature\n')
+    const orphan = yield* verify()
+    assert.equal(orphan.status, 1, 'a signature of no listed file was accepted')
+    assert.match(orphan.stderr, /^silk pack: orphan\.minisig: SHA256SUMS does not name it$/m)
+    assert.equal(orphan.stdout, '', 'a directory with a fault reported a verified file')
+    yield* fs.remove(join(signed, 'orphan.minisig'))
+    if (process.platform === 'linux') {
+      yield* fs.writeFileString(join(signed, 'x\\SHA256SUMS'), 'hidden\n')
+      const hidden = yield* verify()
+      assert.equal(hidden.status, 1, 'a file named with a backslash was taken for the list')
+      yield* fs.remove(join(signed, 'x\\SHA256SUMS'))
+    }
+    const archive = join(signed, 'shared-math-0.1.0.tar.gz')
+    const original = yield* fs.readFile(archive)
+    yield* fs.writeFile(archive, new Uint8Array([...original, 0]))
+    const changed = yield* verify()
+    assert.equal(changed.status, 1, 'a changed archive was accepted')
+    assert.match(changed.stderr, /^silk pack: shared-math-0\.1\.0\.tar\.gz: the SHA-256 does not match SHA256SUMS$/m)
+    assert.equal(changed.stdout.includes('shared-math-0.1.0.tar.gz\n'), false, changed.stdout)
+    yield* fs.writeFile(archive, original)
+    yield* fs.remove(`${archive}.minisig`)
+    const unsigned = yield* verify()
+    assert.equal(unsigned.status, 1, 'an archive without a signature was accepted')
+    assert.match(unsigned.stderr, /shared-math-0\.1\.0\.tar\.gz: it has no signature/)
+    // A list signed by another key proves nothing, so no file is reported verified.
+    const other = yield* invoke(silk, ['pack', '--new-key', join(keys, 'other.key')], workspace, refusing)
+    assert.equal(other.status, 0, other.stderr)
+    const foreign = yield* invoke(silk, ['pack', '--verify', signed, '--key', join(keys, 'other.pub')], workspace, refusing)
+    assert.equal(foreign.status, 1, 'a release signed by another key was accepted')
+    assert.match(foreign.stderr, /^silk pack: SHA256SUMS: the signature was made with a different key$/m)
+    assert.equal(foreign.stdout, '')
   }
   {
     // `init --template` copies one directory of a GitHub repository, here served from local

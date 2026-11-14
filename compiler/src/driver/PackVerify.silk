@@ -1,0 +1,261 @@
+//! What `silk pack --verify` checks in a directory of release files.
+//!
+//! # Details
+//! The directory is what `silk pack --output` wrote with a signing key, or the assets of a
+//! release downloaded into one directory. It verifies when `SHA256SUMS` is signed by the public
+//! key, every file it names is there with that SHA-256 and a signature of its own by the same
+//! key, and nothing else sits beside them: every entry is a regular file that is the list, a
+//! file it names, or the signature of one of those. A file `SHA256SUMS` does not name fails the
+//! directory: whoever reads the result takes every file in it as verified.
+//!
+//! A signature proves who signed a file, not which release it belongs to: an older release
+//! signed by the same key verifies too. The version is in the file names and in each
+//! signature's trusted comment.
+
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.collections.slice {Slice}
+import silk.core.effect {Effect}
+import silk.core.option {Option}
+import silk.core.result {Result}
+import silk.crypto.minisign as Minisign {MinisignError, MinisignKey}
+import silk.crypto.sha2 {Sha256}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.u8
+import silk.num.usize
+import silk.system.filesystem {DirectoryEntry, FileError, FileSystem, Path}
+
+/// The outcome of verifying one directory.
+pub struct Verified {
+  /// The files `SHA256SUMS` names, in its order; empty when the directory has a fault.
+  pub files: List<Bytes>,
+
+  /// One sentence per fault, such as "app-1.0.0.tar.gz: the SHA-256 does not match SHA256SUMS".
+  /// Empty when the directory verifies.
+  pub faults: List<Bytes>,
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn endsWith(text: &[u8], suffix: &[u8]) -> bool {
+  if text.length < suffix.length { return false }
+  return same(Slice.view<u8>(text, text.length - suffix.length, suffix.length), suffix)
+}
+
+// The name of the entry `path` of `directory`: what follows the directory and one separator. A
+// backslash is part of a name except on Windows, so the name is cut by length, not searched for.
+fn entryName<'a>(directory: &Path, path: &'a Path) -> &'a [u8] {
+  let whole = Path.rawBytes(path)
+  let mut start = Path.rawBytes(directory).length
+  if start > whole.length { start = whole.length }
+  while start < whole.length && (whole[start] == 47 || whole[start] == 92) { start = start + usize.ONE }
+  return Slice.view<u8>(whole, start, whole.length - start)
+}
+
+fn among(names: &[Bytes], name: &[u8]) -> bool {
+  let mut at = usize.ZERO
+  while at < names.length {
+    if same(Bytes.asSlice(&names[at]), name) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+/// The base64 key of a `minisign.pub` file's text: its last line that is not empty. The text may
+/// also be the key alone.
+pub fn publicKeyLine(text: &[u8]) -> &[u8] {
+  let mut found = Slice.view<u8>(text, usize.ZERO, usize.ZERO)
+  let mut start = usize.ZERO
+  let mut at = usize.ZERO
+  while at <= text.length {
+    if at == text.length || text[at] == 10 {
+      let mut end = at
+      while end > start && (text[end - usize.ONE] == 13 || text[end - usize.ONE] == 32) { end = end - usize.ONE }
+      if end > start { found = Slice.view<u8>(text, start, end - start) }
+      start = at + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return found
+}
+
+fn hexDigit(value: u8) -> u8 {
+  if value < 10 { return value + 48 }
+  return value + 87
+}
+
+// Whether `digest` is the lowercase hexadecimal SHA-256 of `content`.
+fn digestMatches(digest: &[u8], content: &[u8]) -> bool {
+  if digest.length != 64 { return false }
+  let hash = Sha256.hash(content)
+  let mut at = usize.ZERO
+  while at < 32 {
+    if digest[at * 2] != hexDigit(u8.shiftRight(hash[at], 4)) || digest[at * 2 + usize.ONE] != hexDigit(hash[at] & 15) { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// A file name `SHA256SUMS` may list: one name in the directory itself, and not the sums file or
+// a signature.
+fn listable(name: &[u8]) -> bool {
+  if name.length == usize.ZERO || same(name, b".") || same(name, b"..") || same(name, b"SHA256SUMS") { return false }
+  if endsWith(name, b".minisig") { return false }
+  let mut at = usize.ZERO
+  while at < name.length {
+    if name[at] == 47 || name[at] == 92 || name[at] == 0 { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+effect fn fault(faults: &mut List<Bytes>, name: &[u8], reason: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut line = run Bytes.copy(name)
+  run Bytes.append(&mut line, b": ")
+  run Bytes.append(&mut line, reason)
+  return run List<Bytes>.append(&mut faults.*, move line)
+}
+
+// The content of `directory`/`name`, or absent when it cannot be read.
+effect fn content(directory: &Path, name: &[u8]) -> Option<Bytes> ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let path = run Path.joinBytes(directory, name)
+  return match move run Effect.result(FileSystem.readFile(&path)) {
+    Result<Bytes, FileError | OutOfMemoryError>.Success {value} => Option<Bytes>.some(move value)
+    Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError unread => {
+        drop unread
+        Option<Bytes>.none()
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+// Whether `directory`/`name`.minisig is `signer`'s signature of `held`; reports why not.
+effect fn signed(directory: &Path, name: &[u8], held: &[u8], signer: &MinisignKey, faults: &mut List<Bytes>) -> bool
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let mut signatureName = run Bytes.copy(name)
+  run Bytes.append(&mut signatureName, b".minisig")
+  let signature = match move run content(directory, Bytes.asSlice(&signatureName)) {
+    Option<Bytes>.Some {value} => move value
+    Option<Bytes>.None => {
+      run fault(&mut faults.*, name, b"it has no signature; the file .minisig beside it is missing")
+      return false
+    }
+  }
+  return match Minisign.verify(signer, Bytes.asSlice(&signature), held) {
+    Result<&[u8], MinisignError>.Success {..} => true
+    Result<&[u8], MinisignError>.Failure {error} => {
+      run fault(&mut faults.*, name, Minisign.describe(error))
+      false
+    }
+  }
+}
+
+/// Verifies the release files in `directory` against the public key `signer`.
+///
+/// # Errors
+///
+/// - `FileError` when a file name cannot be joined to `directory`. A file that cannot be read is
+///   a fault, not a failure.
+pub effect fn verify(directory: &Path, signer: &MinisignKey) -> Verified
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let mut files = List<Bytes>.make()
+  let mut faults = List<Bytes>.make()
+  // Every name the list holds, verified or not: a fault of such a file is reported once.
+  let mut named = List<Bytes>.make()
+  let sums = match move run content(directory, b"SHA256SUMS") {
+    Option<Bytes>.Some {value} => move value
+    Option<Bytes>.None => {
+      run fault(&mut faults, b"SHA256SUMS", b"the directory has none; it names the files of a release")
+      return Verified {files: move files, faults: move faults}
+    }
+  }
+  let text = Bytes.asSlice(&sums)
+  // An unsigned list proves nothing about the files it names, so nothing more is read.
+  if !(run signed(directory, b"SHA256SUMS", text, signer, &mut faults)) {
+    return Verified {files: move files, faults: move faults}
+  }
+  let mut start = usize.ZERO
+  let mut at = usize.ZERO
+  while at <= text.length {
+    if at == text.length || text[at] == 10 {
+      let mut end = at
+      if end > start && text[end - usize.ONE] == 13 { end = end - usize.ONE }
+      let line = Slice.view<u8>(text, start, end - start)
+      start = at + usize.ONE
+      if line.length > usize.ZERO {
+        // `<64 hexadecimal digits>  <name>`, as `sha256sum` writes; `*` marks binary mode.
+        if line.length < 67 || line[64] != 32 || (line[65] != 32 && line[65] != 42) {
+          run fault(&mut faults, b"SHA256SUMS", b"a line is not a SHA-256, two spaces and a file name")
+        } else {
+          let name = Slice.view<u8>(line, 66, line.length - 66)
+          if !listable(name) {
+            run fault(&mut faults, name, b"SHA256SUMS may name only files in the directory itself")
+          } else {
+            run List<Bytes>.append(&mut named, run Bytes.copy(name))
+            match move run content(directory, name) {
+              Option<Bytes>.None => run fault(&mut faults, name, b"SHA256SUMS names it and it is missing")
+              Option<Bytes>.Some {value: held} => {
+                if !digestMatches(Slice.view<u8>(line, usize.ZERO, 64), Bytes.asSlice(&held)) {
+                  run fault(&mut faults, name, b"the SHA-256 does not match SHA256SUMS")
+                } else {
+                  if run signed(directory, name, Bytes.asSlice(&held), signer, &mut faults) {
+                    run List<Bytes>.append(&mut files, run Bytes.copy(name))
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+  if List<Bytes>.length(&named) == usize.ZERO && List<Bytes>.length(&faults) == usize.ZERO {
+    run fault(&mut faults, b"SHA256SUMS", b"it names no file")
+  }
+  // Every entry must be the list, a regular file it names, or the signature of one of those.
+  let entries = match move run Effect.result(FileSystem.listDirectory(directory)) {
+    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError unread => {
+        drop unread
+        run fault(&mut faults, Path.rawBytes(directory), b"it cannot be listed, so a file SHA256SUMS does not name cannot be ruled out")
+        return Verified {files: move files, faults: move faults}
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let children = List<DirectoryEntry>.asSlice(&entries)
+  let listed = List<Bytes>.asSlice(&named)
+  let mut child = usize.ZERO
+  while child < children.length {
+    let name = entryName(directory, &children[child].path)
+    let regular = children[child].kind.code == 0
+    child = child + usize.ONE
+    let mut expected = same(name, b"SHA256SUMS") || among(listed, name)
+    if !expected && endsWith(name, b".minisig") {
+      let stem = Slice.view<u8>(name, usize.ZERO, name.length - 8)
+      expected = same(stem, b"SHA256SUMS") || among(listed, stem)
+    }
+    if !expected {
+      run fault(&mut faults, name, b"SHA256SUMS does not name it")
+    } else {
+      if !regular { run fault(&mut faults, name, b"it is not a regular file") }
+    }
+  }
+  if List<Bytes>.length(&faults) > usize.ZERO {
+    // A file is reported verified only in a directory that verifies as a whole.
+    files = List<Bytes>.make()
+  }
+  return Verified {files: move files, faults: move faults}
+}
