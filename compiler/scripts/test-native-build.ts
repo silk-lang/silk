@@ -1371,6 +1371,20 @@ const program = Effect.gen(function* () {
       pattern: /error\[SEM0212\] This value must live for `'static`, but it borrows something/,
     },
     {
+      name: 'localborrow',
+      files: {
+        'main.silk': "fn first<'a>(value: u8) -> &'a [u8] {\n  return &[value]\n}\n\npub fn main() -> i32 {\n  let _one = first(1)\n  return 0\n}\n",
+      },
+      pattern: /error\[SEM0212\] This borrows a value that lives only inside this function, but the borrow must stay valid after the function returns/,
+    },
+    {
+      name: 'arrayprovider',
+      files: {
+        'main.silk': 'interface Shown {}\nimpl Shown for [u8; 4] {}\n\npub fn main() -> i32 {\n  return 0\n}\n',
+      },
+      pattern: /error\[SEM0083\] Invalid conformance: `\[u8; 4\]` cannot be the type an impl is for; that type is a declared struct, tuple, enum or union, a scalar, `string`, or a slice such as `&\[T\]`; declare a tuple or struct that holds the array/,
+    },
+    {
       name: 'privatefn',
       files: {
         'geo/shapes.silk': 'fn secret() -> i32 { return 0 }\n',
