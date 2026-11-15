@@ -1133,6 +1133,13 @@ Within one executable closure, two reachable foreign declarations of one symbol 
 their classified C signatures and normalized behavioral contracts are equal and rejected when either differs. The executable declares
 the symbol once.
 
+The root package's own declarations of one symbol must agree whether or not anything calls them,
+so `silk check` reports a conflict between two of them without building. A declaration in a
+`static if` arm the target does not select is not declared, so a symbol whose C types differ
+between systems is declared once per system, each in its own arm. A declaration of a
+dependency or of the standard library enters the comparison where the executable reaches it, which
+only `silk build` knows.
+
 ```silk,ignore
 unsafe extern "C" fn f() -> () as "not a symbol"
 unsafe extern "C" fn g() -> i32 as "__silk_foreign_personality"
@@ -1142,7 +1149,7 @@ unsafe extern "C" fn g() -> i32 as "__silk_foreign_personality"
 a 64-bit target and `i64` classify to the same C type and therefore agree, as do raw pointers that
 differ only in pointee type, nullability or many-ness, such as `*mut u8` and `?[*]mut u64`. A
 declaration's `@foreign(noCapture: ...)` list is that declaration's own assertion and does not enter
-agreement; its `memory`, `locality` and callback directives do. Unreachable source declarations do not enter executable identity. Supplied behavioral interfaces are checked against one another and against the executable inventory, with both origins retained.
+agreement; its `memory`, `locality` and callback directives do. An unreachable declaration outside the root package does not enter executable identity. Supplied behavioral interfaces are checked against one another and against the executable inventory, with both origins retained.
 
 **Diagnostics:** An invalid spelling reports `SEM0190` at the `as` string or, without `as`, at the
 declaration. A reserved symbol reports `SEM0191` at the same position. A conflicting redeclaration
@@ -1152,7 +1159,8 @@ no artifact. A symbol the native backend also declares for its own use, with a d
 is a backend diagnostic naming the symbol.
 
 **Current compiler:** Aligned. Spelling and reservation are checked per module; signature
-agreement is checked when the executable origin collects reachable foreign calls for the target.
+agreement is checked between the root package's declarations by the declaration check, and across
+packages when the executable origin collects reachable foreign calls for the target.
 
 **Evidence:** foreign function specification,
 [symbol spelling and reservation](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/ForeignSymbol.ts),
