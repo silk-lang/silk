@@ -49,7 +49,7 @@ pub fn main() -> i32 {
 
 Import as `f64` with `import silk.num.f64`.
 
-Public declarations: 73.
+Public declarations: 83.
 
 <a id="MAX"></a>
 
@@ -816,6 +816,28 @@ from `u8.MAX` would round outward and wrongly admit an overflowing value.
 NaN and either infinity return `None`. A value in `(-1.0, -0.0]` truncates to negative zero and
 converts to `0`, so its sign is discarded rather than rejected.
 
+<a id="toU8Unchecked"></a>
+
+## `toU8Unchecked`
+
+```silk
+pub unsafe fn toU8Unchecked(value: f64) -> u8
+```
+
+Converts `value` toward zero to `u8` without a range test. The caller proves that `value` is
+finite and that its truncation fits `u8`.
+
+### When to use
+
+Use this function in measured hot code whose values are proven in range, such as a scaled
+probability that a prior clamp bounds. [`toU8`](#toU8) traps on the inputs this function leaves
+undefined and is the default.
+
+### Gotchas
+
+NaN, an infinity, or a value whose truncation is out of range is undefined behavior, and an
+optimized build converts it with one instruction and no test.
+
 <a id="toU16"></a>
 
 ## `toU16`
@@ -854,6 +876,28 @@ from `u16.MAX` would round outward and wrongly admit an overflowing value.
 
 NaN and either infinity return `None`. A value in `(-1.0, -0.0]` truncates to negative zero and
 converts to `0`, so its sign is discarded rather than rejected.
+
+<a id="toU16Unchecked"></a>
+
+## `toU16Unchecked`
+
+```silk
+pub unsafe fn toU16Unchecked(value: f64) -> u16
+```
+
+Converts `value` toward zero to `u16` without a range test. The caller proves that `value` is
+finite and that its truncation fits `u16`.
+
+### When to use
+
+Use this function in measured hot code whose values are proven in range, such as a scaled
+probability that a prior clamp bounds. [`toU16`](#toU16) traps on the inputs this function leaves
+undefined and is the default.
+
+### Gotchas
+
+NaN, an infinity, or a value whose truncation is out of range is undefined behavior, and an
+optimized build converts it with one instruction and no test.
 
 <a id="toU32"></a>
 
@@ -894,6 +938,28 @@ from `u32.MAX` would round outward and wrongly admit an overflowing value.
 NaN and either infinity return `None`. A value in `(-1.0, -0.0]` truncates to negative zero and
 converts to `0`, so its sign is discarded rather than rejected.
 
+<a id="toU32Unchecked"></a>
+
+## `toU32Unchecked`
+
+```silk
+pub unsafe fn toU32Unchecked(value: f64) -> u32
+```
+
+Converts `value` toward zero to `u32` without a range test. The caller proves that `value` is
+finite and that its truncation fits `u32`.
+
+### When to use
+
+Use this function in measured hot code whose values are proven in range, such as a scaled
+probability that a prior clamp bounds. [`toU32`](#toU32) traps on the inputs this function leaves
+undefined and is the default.
+
+### Gotchas
+
+NaN, an infinity, or a value whose truncation is out of range is undefined behavior, and an
+optimized build converts it with one instruction and no test.
+
 <a id="toU64"></a>
 
 ## `toU64`
@@ -932,6 +998,28 @@ from `u64.MAX` would round outward and wrongly admit an overflowing value.
 
 NaN and either infinity return `None`. A value in `(-1.0, -0.0]` truncates to negative zero and
 converts to `0`, so its sign is discarded rather than rejected.
+
+<a id="toU64Unchecked"></a>
+
+## `toU64Unchecked`
+
+```silk
+pub unsafe fn toU64Unchecked(value: f64) -> u64
+```
+
+Converts `value` toward zero to `u64` without a range test. The caller proves that `value` is
+finite and that its truncation fits `u64`.
+
+### When to use
+
+Use this function in measured hot code whose values are proven in range, such as a scaled
+probability that a prior clamp bounds. [`toU64`](#toU64) traps on the inputs this function leaves
+undefined and is the default.
+
+### Gotchas
+
+NaN, an infinity, or a value whose truncation is out of range is undefined behavior, and an
+optimized build converts it with one instruction and no test.
 
 <a id="toUsize"></a>
 
@@ -976,6 +1064,28 @@ would admit values that trap on a 32-bit target.
 NaN and either infinity return `None`. A value in `(-1.0, -0.0]` truncates to negative zero and
 converts to `0`, so its sign is discarded rather than rejected.
 
+<a id="toUsizeUnchecked"></a>
+
+## `toUsizeUnchecked`
+
+```silk
+pub unsafe fn toUsizeUnchecked(value: f64) -> usize
+```
+
+Converts `value` toward zero to `usize` without a range test. The caller proves that `value` is
+finite and that its truncation fits `usize`.
+
+### When to use
+
+Use this function in measured hot code whose values are proven in range, such as a scaled
+probability that a prior clamp bounds. [`toUsize`](#toUsize) traps on the inputs this function leaves
+undefined and is the default.
+
+### Gotchas
+
+NaN, an infinity, or a value whose truncation is out of range is undefined behavior, and an
+optimized build converts it with one instruction and no test.
+
 <a id="toI8"></a>
 
 ## `toI8`
@@ -1014,6 +1124,28 @@ converted from `i8.MAX` would round outward and wrongly admit an overflowing val
 
 NaN and either infinity return `None`. A value in `(-1.0, -0.0]` truncates to negative zero and
 converts to `0`, so its sign is discarded rather than rejected.
+
+<a id="toI8Unchecked"></a>
+
+## `toI8Unchecked`
+
+```silk
+pub unsafe fn toI8Unchecked(value: f64) -> i8
+```
+
+Converts `value` toward zero to `i8` without a range test. The caller proves that `value` is
+finite and that its truncation fits `i8`.
+
+### When to use
+
+Use this function in measured hot code whose values are proven in range, such as a scaled
+probability that a prior clamp bounds. [`toI8`](#toI8) traps on the inputs this function leaves
+undefined and is the default.
+
+### Gotchas
+
+NaN, an infinity, or a value whose truncation is out of range is undefined behavior, and an
+optimized build converts it with one instruction and no test.
 
 <a id="toI16"></a>
 
@@ -1054,6 +1186,28 @@ converted from `i16.MAX` would round outward and wrongly admit an overflowing va
 NaN and either infinity return `None`. A value in `(-1.0, -0.0]` truncates to negative zero and
 converts to `0`, so its sign is discarded rather than rejected.
 
+<a id="toI16Unchecked"></a>
+
+## `toI16Unchecked`
+
+```silk
+pub unsafe fn toI16Unchecked(value: f64) -> i16
+```
+
+Converts `value` toward zero to `i16` without a range test. The caller proves that `value` is
+finite and that its truncation fits `i16`.
+
+### When to use
+
+Use this function in measured hot code whose values are proven in range, such as a scaled
+probability that a prior clamp bounds. [`toI16`](#toI16) traps on the inputs this function leaves
+undefined and is the default.
+
+### Gotchas
+
+NaN, an infinity, or a value whose truncation is out of range is undefined behavior, and an
+optimized build converts it with one instruction and no test.
+
 <a id="toI32"></a>
 
 ## `toI32`
@@ -1093,6 +1247,28 @@ converted from `i32.MAX` would round outward and wrongly admit an overflowing va
 NaN and either infinity return `None`. A value in `(-1.0, -0.0]` truncates to negative zero and
 converts to `0`, so its sign is discarded rather than rejected.
 
+<a id="toI32Unchecked"></a>
+
+## `toI32Unchecked`
+
+```silk
+pub unsafe fn toI32Unchecked(value: f64) -> i32
+```
+
+Converts `value` toward zero to `i32` without a range test. The caller proves that `value` is
+finite and that its truncation fits `i32`.
+
+### When to use
+
+Use this function in measured hot code whose values are proven in range, such as a scaled
+probability that a prior clamp bounds. [`toI32`](#toI32) traps on the inputs this function leaves
+undefined and is the default.
+
+### Gotchas
+
+NaN, an infinity, or a value whose truncation is out of range is undefined behavior, and an
+optimized build converts it with one instruction and no test.
+
 <a id="toI64"></a>
 
 ## `toI64`
@@ -1131,6 +1307,28 @@ converted from `i64.MAX` would round outward and wrongly admit an overflowing va
 
 NaN and either infinity return `None`. A value in `(-1.0, -0.0]` truncates to negative zero and
 converts to `0`, so its sign is discarded rather than rejected.
+
+<a id="toI64Unchecked"></a>
+
+## `toI64Unchecked`
+
+```silk
+pub unsafe fn toI64Unchecked(value: f64) -> i64
+```
+
+Converts `value` toward zero to `i64` without a range test. The caller proves that `value` is
+finite and that its truncation fits `i64`.
+
+### When to use
+
+Use this function in measured hot code whose values are proven in range, such as a scaled
+probability that a prior clamp bounds. [`toI64`](#toI64) traps on the inputs this function leaves
+undefined and is the default.
+
+### Gotchas
+
+NaN, an infinity, or a value whose truncation is out of range is undefined behavior, and an
+optimized build converts it with one instruction and no test.
 
 <a id="toIsize"></a>
 
@@ -1174,6 +1372,28 @@ would admit values that trap on a 32-bit target.
 
 NaN and either infinity return `None`. A value in `(-1.0, -0.0]` truncates to negative zero and
 converts to `0`, so its sign is discarded rather than rejected.
+
+<a id="toIsizeUnchecked"></a>
+
+## `toIsizeUnchecked`
+
+```silk
+pub unsafe fn toIsizeUnchecked(value: f64) -> isize
+```
+
+Converts `value` toward zero to `isize` without a range test. The caller proves that `value` is
+finite and that its truncation fits `isize`.
+
+### When to use
+
+Use this function in measured hot code whose values are proven in range, such as a scaled
+probability that a prior clamp bounds. [`toIsize`](#toIsize) traps on the inputs this function leaves
+undefined and is the default.
+
+### Gotchas
+
+NaN, an infinity, or a value whose truncation is out of range is undefined behavior, and an
+optimized build converts it with one instruction and no test.
 
 
 Category: Numbers.
