@@ -10,7 +10,8 @@
 //! The copy holds an exclusive `flock` on the cache file's lock file until it exits. A writer takes
 //! that lock before it forks, so two writes of one file never overlap, and a reader waits on it
 //! ([`waitFor`]) before it reads the file, so a build never reads an older image than the last
-//! build left. A write that does not fork holds the same lock. Windows writes in the calling
+//! build left. A reader that can use the older image asks whether a write is running instead
+//! ([`busy`]) and does not wait. A write that does not fork holds the same lock. Windows writes in the calling
 //! process under a synchronous `LockFileEx` byte-range lock. A detached relaunch would have to
 //! reconstruct the live semantic store before assembling its image; native measurements found
 //! reconstruction slower than the write it would defer. The opt-in measurement and its limits
@@ -43,6 +44,7 @@ static if Intrinsic.targetOperatingSystem() == "darwin" || Intrinsic.targetOpera
     }
     const CREATE: i32 = 512
     const CLOEXEC: i32 = 16777216
+    const WOULD_BLOCK: i32 = 35
   } else {
     unsafe extern "C" fn __errno_location() -> *mut i32
     unsafe fn currentError() -> i32 {
@@ -52,7 +54,9 @@ static if Intrinsic.targetOperatingSystem() == "darwin" || Intrinsic.targetOpera
     }
     const CREATE: i32 = 64
     const CLOEXEC: i32 = 524288
+    const WOULD_BLOCK: i32 = 11
   }
+  const NON_BLOCKING: i32 = 4
   const READ_ONLY: i32 = 0
   const READ_WRITE: i32 = 2
   const SHARED: i32 = 1
@@ -153,6 +157,23 @@ static if Intrinsic.targetOperatingSystem() == "darwin" || Intrinsic.targetOpera
     let _waited = acquire(fd, SHARED)
     drop held
   }
+
+  /// Whether a write of the cache file whose lock file is `lock` is running now, without waiting
+  /// for it. False when there is no lock file or the host refuses the lock, as [`hold`] then
+  /// writes without one.
+  pub effect fn busy(lock: &Path) -> bool ! OutOfMemoryError ? &mut Allocator {
+    let path = run host(lock)
+    let fd = unsafe open(Pointer.fromSlice<u8>(Bytes.asSlice(&path)), READ_ONLY + CLOEXEC)
+    if fd < 0 { return false }
+    let _held = Held {fd: fd}
+    while true {
+      if unsafe flock(fd, SHARED + NON_BLOCKING) == 0 { return false }
+      let error = unsafe currentError()
+      if error == WOULD_BLOCK { return true }
+      if error != INTERRUPTED { return false }
+    }
+    return false
+  }
 } else {
 static if Intrinsic.targetOperatingSystem() == "windows" {
   import silk.platform.windows.host_path as WindowsHostPath
@@ -185,7 +206,7 @@ static if Intrinsic.targetOperatingSystem() == "windows" {
     Here {pub held: Held},
   }
 
-  effect fn acquire(lock: &Path, write: bool) -> Option<Held> ! OutOfMemoryError ? &mut Allocator {
+  effect fn acquire(lock: &Path, write: bool, waiting: bool) -> Option<Held> ! OutOfMemoryError ? &mut Allocator {
     let name = match move run WindowsHostPath.wide(lock) {
       Option<List<u16>>.Some {value} => move value
       Option<List<u16>>.None => { return Option<Held>.none() }
@@ -198,16 +219,17 @@ static if Intrinsic.targetOperatingSystem() == "windows" {
     if Pointer.isNull(raw) || Pointer.address(raw) == usize.MAX { return Option<Held>.none() }
     let held = Held {handle: raw}
     let mut position = Overlapped { internal: 0, transferred: 0, offset: 0, offsetHigh: 0, event: Pointer.null<u8>() }
-    let flags: u32 = if write { 2 } else { 0 }
+    let mut flags: u32 = if write { 2 } else { 0 }
     // The handle is synchronous. Omitting FAIL_IMMEDIATELY waits for the prior writer; the
     // OVERLAPPED remains borrowed until completion and no event or pending I/O escapes.
+    if !waiting { flags = flags + 1 }
     if unsafe LockFileEx(raw, flags, 0, 1, 0, Pointer.fromMutRef(&mut position)) == 0 { return Option<Held>.none() }
     return Option<Held>.some(move held)
   }
 
   /// Waits for an exclusive cache lock. Returns None when opening or locking the file fails.
   pub effect fn hold(lock: &Path) -> Option<Held> ! OutOfMemoryError ? &mut Allocator {
-    return run acquire(lock, true)
+    return run acquire(lock, true, true)
   }
 
   /// Retains the Windows lock in this process while the cache is written.
@@ -223,8 +245,24 @@ static if Intrinsic.targetOperatingSystem() == "windows" {
   /// Waits for the cache's writer using a shared byte-range lock, then releases the reader handle.
   /// A missing or inaccessible lock file returns immediately.
   pub effect fn waitFor(lock: &Path) -> () ! OutOfMemoryError ? &mut Allocator {
-    let held = run acquire(lock, false)
+    let held = run acquire(lock, false, true)
     drop held
+  }
+
+  /// Whether a write of the cache file whose lock file is `lock` is running now, without waiting
+  /// for it: a lock file that exists and whose shared lock is refused at once.
+  pub effect fn busy(lock: &Path) -> bool ! OutOfMemoryError ? &mut Allocator {
+    let name = match move run WindowsHostPath.wide(lock) {
+      Option<List<u16>>.Some {value} => move value
+      Option<List<u16>>.None => { return false }
+    }
+    let raw = unsafe CreateFileW(Pointer.fromSlice(List<u16>.asSlice(&name)), 2147483648, 3,
+      Pointer.null<u8>(), 3, 128, Pointer.null<u8>())
+    if Pointer.isNull(raw) || Pointer.address(raw) == usize.MAX { return false }
+    let _held = Held {handle: raw}
+    let mut position = Overlapped { internal: 0, transferred: 0, offset: 0, offsetHigh: 0, event: Pointer.null<u8>() }
+    // FAIL_IMMEDIATELY: a writer's exclusive lock refuses the shared one instead of making it wait.
+    return unsafe LockFileEx(raw, 1, 0, 1, 0, Pointer.fromMutRef(&mut position)) == 0
   }
 } else {
   /// The lock on one cache file's lock file; this host takes none.
@@ -258,6 +296,11 @@ static if Intrinsic.targetOperatingSystem() == "windows" {
   /// Returns at once: this host starts no copy to wait for.
   pub effect fn waitFor(lock: &Path) -> () ! OutOfMemoryError ? &mut Allocator {
     return ()
+  }
+
+  /// False: this host takes no lock, so no write is seen running.
+  pub effect fn busy(lock: &Path) -> bool ! OutOfMemoryError ? &mut Allocator {
+    return false
   }
 }
 

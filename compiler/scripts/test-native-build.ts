@@ -2013,7 +2013,8 @@ const program = Effect.gen(function* () {
     { ...process.env, SILK_CLANG: clang },
   )
   assert.equal(unclosed.status, 1, unclosed.stderr)
-  assert.match(unclosed.stderr, /^ {2}check {5}failed: 1 module, 1 error/m)
+  // The cache has its own row, before the check, even when it holds nothing yet.
+  assert.match(unclosed.stderr, /^ {2}load {6}[^\n]*\n {2}cache {5}nothing to reuse {2,}[0-9.ms ]+s\n {2}check {5}failed: 1 module, 1 error/m)
   assert.match(unclosed.stderr, /^src\/main\.silk:3:1: error\[PAR0001\] Expected `\}`$/m)
   assert.doesNotMatch(unclosed.stderr, /codegen/)
   // A file with a syntax error keeps no import summary, so the next load parses it and reports it again.
@@ -2025,6 +2026,40 @@ const program = Effect.gen(function* () {
   )
   assert.equal(reopened.status, 1, reopened.stderr)
   assert.match(reopened.stderr, /^src\/main\.silk:3:1: error\[PAR0001\] Expected `\}`$/m)
+  // A check does not wait for a build's cache write once the file holds a check's escape walks:
+  // it reads the file as it stands. While the file holds only a build, the check waits for the
+  // write, since the file it leaves is the one the check's own write must carry.
+  for (const checkedFirst of [true, false]) {
+    const name = checkedFirst ? 'unwaited' : 'waited'
+    const project = join(directory, name)
+    yield* fs.makeDirectory(join(project, 'src'), { recursive: true })
+    yield* fs.writeFileString(join(project, 'silk.toml'), `[package]\nname = "${name}"\nversion = "0.1.0"\n`)
+    yield* fs.writeFileString(join(project, 'src/main.silk'), 'fn half(value: i32) -> i32 {\n  return value / 2\n}\n\npub fn main() -> i32 {\n  return half(0)\n}\n')
+    const first = checkedFirst ? ['check', '--no-server'] : ['build']
+    const prepared = yield* invoke(silk, [...first, '--stdlib', standardLibrary], project, { ...process.env, SILK_CLANG: clang })
+    assert.equal(prepared.status, 0, prepared.stderr)
+    const cache = join(project, 'build/cache', name)
+    const lock = (yield* fs.readDirectory(cache)).find((entry) => /^semantic-[0-9a-f]{32}\.lock$/.test(entry))
+    assert.ok(lock, `${name}: the cache names no lock file`)
+    // Stands in for a build's writer: it holds the write lock, and not the one a check's write holds too.
+    const holdSeconds = checkedFirst ? 60 : 2
+    const holder = spawn('python3', ['-c', 'import fcntl, sys, time\nheld = open(sys.argv[1])\nfcntl.flock(held, fcntl.LOCK_EX)\nprint("held", flush=True)\ntime.sleep(float(sys.argv[2]))', join(cache, lock), String(holdSeconds)], {
+      stdio: ['ignore', 'pipe', 'inherit'],
+    })
+    yield* Effect.promise(() => new Promise<void>((resolved) => holder.stdout.once('data', () => resolved())))
+    const heldAt = Date.now()
+    const checked = spawnSync(silk, ['check', '--no-server', '--stdlib', standardLibrary, '--progress', 'plain'], { cwd: project, encoding: 'utf8', timeout: 50_000 })
+    const waited = Date.now() - heldAt
+    holder.kill()
+    settleCaches(project)
+    assert.equal(checked.status, 0, checked.stderr)
+    if (checkedFirst) {
+      assert.ok(waited < holdSeconds * 1000, `${name}: the check waited ${waited} ms for the build's write`)
+      assert.match(checked.stderr, /^ {2}cache {5}[1-9][0-9,]* checks? reused {2,}[0-9.ms ]+s$/m)
+    } else {
+      assert.ok(waited >= holdSeconds * 1000, `${name}: the check read a file without a check's walks ${waited} ms into the build's write`)
+    }
+  }
   // `test` builds the project's runner below <output-dir>/test as an executable, whatever the
   // manifest's artifact, and runs the tests that --file and --filter select; a failing test makes
   // the status 1, and a selection outside the source root is refused before anything is built.
