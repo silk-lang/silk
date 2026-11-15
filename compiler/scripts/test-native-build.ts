@@ -4942,6 +4942,65 @@ const program = Effect.gen(function* () {
     const second = runs.get('two') ?? 0
     assert.ok(second * 3 < first, `checked together, the second program ran ${second} bodies beside the first one's ${first}`)
   }
+  // A program built for the first time borrows the build record a sibling program's build left in
+  // the cache: it emits what it alone reaches, its executable is byte for byte the one it builds
+  // alone, and it keeps a record and packs of its own, so an edit rebuilds what changed without the
+  // sibling's cache. A workspace build lets one program finish before the others start, so they
+  // find its record.
+  const buildSiblings = Effect.fnUntraced(function* (selection: ReadonlyArray<string>) {
+    const built = yield* invoke(silk, ['build', '--stdlib', standardLibrary, ...selection], siblings, splitEnvironment)
+    assert.equal(built.status, 0, built.stdout + built.stderr)
+    return built.stdout + built.stderr
+  })
+  // How many functions each member's build emitted, by member name, and where it left its executable.
+  const emitted = (report: string) => {
+    const members = new Map<string, { functions: number; executable: string }>()
+    for (const section of report.split(/^Compiling /m).slice(1)) {
+      const row = /^\s+codegen\s+([\d,]+) functions?/m.exec(section)
+      const finished = /^Finished (\S+) in /m.exec(section)
+      assert.ok(finished !== null, report)
+      members.set(section.slice(0, section.indexOf(' ')), {
+        functions: row === null ? 0 : Number(row[1].replaceAll(',', '')),
+        executable: join(siblings, finished[1]),
+      })
+    }
+    return members
+  }
+  const builtMember = (report: string, member: string) => {
+    const built = emitted(report).get(member)
+    assert.ok(built !== undefined, report)
+    return built
+  }
+  yield* fs.remove(join(siblings, 'build'), { recursive: true })
+  const aloneTwo = builtMember(yield* buildSiblings(['--package', 'two']), 'two')
+  const aloneBytes = yield* fs.readFile(aloneTwo.executable)
+  yield* fs.remove(join(siblings, 'build'), { recursive: true })
+  yield* buildSiblings(['--package', 'one'])
+  const borrowedTwo = builtMember(yield* buildSiblings(['--package', 'two']), 'two')
+  assert.ok(
+    borrowedTwo.functions * 3 < aloneTwo.functions,
+    `after its sibling the program emitted ${borrowedTwo.functions} functions, and ${aloneTwo.functions} alone`,
+  )
+  assert.ok(
+    Buffer.from(yield* fs.readFile(borrowedTwo.executable)).equals(Buffer.from(aloneBytes)),
+    'a program built after its sibling differs from the one built alone',
+  )
+  yield* fs.remove(join(siblings, 'build/cache/one'), { recursive: true })
+  yield* fs.writeFileString(join(siblings, 'two/src/main.silk'), siblingMain(3))
+  const editedTwo = builtMember(yield* buildSiblings(['--package', 'two']), 'two')
+  assert.ok(
+    editedTwo.functions > 0 && editedTwo.functions <= borrowedTwo.functions,
+    `an edit after a borrowed build emitted ${editedTwo.functions} functions, and the borrowed build ${borrowedTwo.functions}`,
+  )
+  yield* fs.writeFileString(join(siblings, 'two/src/main.silk'), siblingMain(2))
+  yield* fs.remove(join(siblings, 'build'), { recursive: true })
+  const builtTogether = emitted(yield* buildSiblings(['--workspace']))
+  const builtFirst = builtTogether.get('one')?.functions ?? 0
+  const builtSecond = builtTogether.get('two')?.functions ?? 0
+  assert.ok(
+    builtSecond * 3 < builtFirst,
+    `built together, the second program emitted ${builtSecond} functions beside the first one's ${builtFirst}`,
+  )
   // Each unit carries line tables made from the lines its location markers name, so a function
   // that moves recompiles its unit alone, and the unit's rows name the lines it moved to.
   const rowLines = Effect.fnUntraced(function* (object: string) {
