@@ -302,6 +302,11 @@ The program reaches concrete `identity<bool>` and `identity<i32>` instances. Run
 receive a generic type descriptor, interface dictionary, requirement-row record, or reflective type
 value.
 
+A generic function named as a value with its type arguments, such as `identity<i32>`, and the C
+address of a generic export at an instantiation
+([FFI-012](unsafe-intrinsics-and-targets.md#ffi-012--c-function-pointers-are-exact-exported-addresses))
+are generic applications too: each is closed where the code that writes it is specialized.
+
 This rule is observable through accepted programs, static call behavior, target parity, and code
 size, but names or counts of backend symbols are not source-level API.
 
@@ -1445,6 +1450,10 @@ impl<'a, T: Debug> Debug for &'a [T] {
 }
 ```
 
+No other type can be a provider: an array `[T; N]`, a reference `&T`, a pointer, a function type or
+an anonymous tuple or record reports `SEM0083`, naming the type. Declare a tuple or struct that
+holds the value and implement the interface for it.
+
 Where a reference is expected, such as the receiver `&Self` or a generic `&T` parameter, `&s` for
 a slice `s` borrows the slice itself and gives `& &[T]`. Anywhere else it reborrows the elements
 and gives `&[T]`.
@@ -1639,6 +1648,10 @@ impl Multiply<Vector2, Vector2> for f64 {
   }
 }
 ```
+
+A reference as the first type argument stands for its referent, so the module that declares `Pixel`
+may also declare `impl<'a> From<&'a Pixel> for u32`. A slice, an array or any other type built
+around a nominal type does not count.
 
 Only the first type argument counts, so for one provider and one argument owner at most three
 modules (contract, provider, argument owner) can hold a competing head. The coherence check of an

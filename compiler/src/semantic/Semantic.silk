@@ -278,7 +278,8 @@ import semantic.SourceUnit {SourceUnit}
 import documentation.Attached
 import documentation.Model {Document}
 import semantic.Anchor {Anchor}
-import semantic.SourceLocations {Location}
+import semantic.SourceLocations {Location, place as sourcePlace}
+import semantic.Origins {ModuleOrigins, Origins}
 import semantic.SourceIndex {
   AuthoredCursor,
   Event as SourceEvent,
@@ -2245,6 +2246,44 @@ effect fn linkageRestriction(span: Span, imported: bool, restriction: &[u8]) -> 
   return Option<HeaderConflict>.some(HeaderConflict {code: RejectionCode.ForeignDeclarationRestriction, span: span, arguments: move arguments})
 }
 
+// Whether a written generic list declares a type parameter. An `export "C"` function that does is
+// a generic export: it publishes no symbol, and each instantiation whose address is taken has its
+// own C thunk (FFI-012).
+fn declaresTypeParameter(hir: &Module, generics: Range) -> bool {
+  let mut at = usize.ZERO
+  while at < generics.length {
+    if let Node.TypeParameter {..} = Module.node(hir, Module.child(hir, generics, at)) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// The first lifetime or row parameter of a written generic list, which no linked function admits.
+fn proofOnlyParameter(hir: &Module, generics: Range) -> Option<HirId> {
+  let mut at = usize.ZERO
+  while at < generics.length {
+    let parameter = Module.child(hir, generics, at)
+    let typed = match Module.node(hir, parameter) { Node.TypeParameter {..} => true _ => false }
+    if !typed { return Option<HirId>.some(parameter) }
+    at = at + usize.ONE
+  }
+  return Option<HirId>.none()
+}
+
+// Whether the function header at `header` is a generic export.
+fn genericExportHeader(hir: &Module, header: HirId) -> bool {
+  if let Node.FunctionHeader {contract, linkage, ..} = Module.node(hir, header) {
+    if !linkage.present { return false }
+    if let Node.Linkage {direction, ..} = Module.node(hir, linkage.id) {
+      if direction != LinkageDirection.Export { return false }
+      if let Option<HirContract>.Some {value: HirContract {generics, ..}} = Module.contractOf(hir, contract) {
+        return declaresTypeParameter(hir, generics)
+      }
+    }
+  }
+  return false
+}
+
 // A variadic header other than a C import's (SEM0188): an `export "C"` definition or a Silk function.
 effect fn variadicRestriction(span: Span, foreign: bool) -> Option<HeaderConflict> ! OutOfMemoryError ? &mut Allocator {
   if foreign {
@@ -2702,6 +2741,9 @@ struct Resolver {
   codegenUnits: bool,
   // Whether LLVM text is shaped for an unoptimized compile (`LlvmCode.Writer.fastPath`).
   fastPathIr: bool,
+  // Whether each emitted function marks its record in the table of executed functions as it
+  // starts, which a test runner reads to learn what each test ran (`selectCoverage`).
+  coverage: bool,
   // Whether lowering inlines callees into their callers (`inlineCalls`, by `inlineRule`): an
   // optimized build without line tables (`selectInlining`).
   inlining: bool,
@@ -2713,6 +2755,9 @@ struct Resolver {
   directSize: bool,
   // Whether lowered functions carry their source lines (`MirFunction.lines`) for line tables.
   lineTables: bool,
+  // Where each declaration of the modules such a build emits starts (`collectedOrigins`), by
+  // module: the tables a cache offered (`Semantic.offerOrigins`) and those made since.
+  declarationOrigins: Origins,
   // Whether an assembled module is split into packs for a cache to store beside its image
   // (`Semantic.offerPacks`), the bodies offered, and the packs of the image an adoption read that
   // claimed one.
@@ -3270,6 +3315,56 @@ impl EscapeImage {
     if found == usize.MAX { return Option<EscapeRecordRoot>.none() }
     return Option<EscapeRecordRoot>.some(List<EscapeRecordRoot>.remove(&mut self.records, found))
   }
+}
+
+// The module a record's stable unit key `key` names when the record is a sibling's of the check
+// whose key is `unit`: the same check of a module whose source this store does not hold, as the walk another
+// program made of its own module. None for any other record, such as a dependency module's.
+effect fn siblingModule(resolver: &Resolver, key: &[u8], unit: &[u8], own: &ModuleId) -> Option<ModuleId> ! OutOfMemoryError ? &mut Allocator {
+  // A unit key is its family and profile words, its module, and the rest (`stableUnit`).
+  let mut reader = StableKey.reader()
+  drop StableKey.readWord(key, &mut reader)
+  drop StableKey.readWord(key, &mut reader)
+  let module = match move run StableKey.readModule(key, &mut reader) {
+    Option<ModuleId>.Some {value} => move value
+    Option<ModuleId>.None => { return Option<ModuleId>.none() }
+  }
+  if StableKey.failed(&reader) || SourceIndex.presents(&resolver.source, &module) { return Option<ModuleId>.none() }
+  let mut named = Bytes.make()
+  run StableKey.module(&mut named, own)
+  let rest = 16 + Bytes.length(&named)
+  if unit.length < rest { return Option<ModuleId>.none() }
+  let mut expected = run Bytes.copy(Slice.view<u8>(unit, usize.ZERO, 16))
+  run StableKey.module(&mut expected, &module)
+  run Bytes.append(&mut expected, Slice.view<u8>(unit, rest, unit.length - rest))
+  if !same(Bytes.asSlice(&expected), key) { return Option<ModuleId>.none() }
+  return Option<ModuleId>.some(move module)
+}
+
+// The image root of the longest record `escapes` holds for a sibling of the check whose stable
+// unit key is `unit` (`siblingModule`), or `usize.MAX` when it holds none. The longest walk
+// reached the most, so a walk started from it lowers the least again.
+effect fn siblingRecord(resolver: &Resolver, escapes: &EscapeImage, image: &Option<CacheImage.Image>, unit: &[u8], own: &ModuleId) -> usize
+! OutOfMemoryError ? &mut Allocator {
+  let mut best = usize.MAX
+  let mut length = usize.ZERO
+  if let Option<CacheImage.Image>.Some {value: adopted} = &image.* {
+    let roots = List<CacheImage.Root>.asSlice(&adopted.roots)
+    let held = List<EscapeRecordRoot>.asSlice(&escapes.records)
+    let mut at = usize.ZERO
+    while at < held.length {
+      let size = Bytes.length(&roots[held[at].root].answer)
+      if size > length {
+        let key = StableKey.view(Bytes.asSlice(&roots[held[at].root].key), held[at].unit)
+        if let Option<ModuleId>.Some {..} = move run siblingModule(resolver, key, unit, own) {
+          length = size
+          best = held[at].root
+        }
+      }
+      at = at + usize.ONE
+    }
+  }
+  return best
 }
 
 // Byte strings by position, found through their hashes.
@@ -6073,8 +6168,11 @@ effect fn memberRejection(
 // build's discovery root (its application is the library's runner), else the request's
 // application, else the standard library's package (a request without an application lowers no
 // observing body of a root package).
-effect fn reportRoot(resolver: &mut Resolver, module: &ModuleId) -> Option<ModuleId> ! OutOfMemoryError ? &mut Allocator {
-  run recordRequestInput(&mut resolver.*, module, run Bytes.copy(b"report-root"))
+//
+// A body lowered against it reads of it only whether each module it names is of another package
+// (`Mir.foreignTo`), and records that for each (`recordReportNames`), so a body of a library
+// reads the same under every program that roots the build.
+effect fn reportRoot(resolver: &Resolver) -> Option<ModuleId> ! OutOfMemoryError ? &mut Allocator {
   if let Option<Discovery>.Some {value: discovery} = &resolver.discovery { return Option<ModuleId>.some(ModuleId.copy(&discovery.root)) }
   if resolver.currentApplication != usize.MAX {
     return Option<ModuleId>.some(resolvedModule(&resolver.*, resolver.currentApplication))
@@ -7091,6 +7189,24 @@ effect fn recordRequestInput(resolver: &mut Resolver, module: &ModuleId, fact: B
   run Graph.record(&mut resolver.graph, unit, Dependee.SourceInput {input: input, module: ordinal})
 }
 
+// The request fact that says whether a report leads the names of `named` with its package's name
+// (`Mir.foreignTo` against `reportRoot`).
+effect fn reportNameFact(named: &ModuleId) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut fact = run Bytes.copy(b"report-foreign:")
+  run StableKey.module(&mut fact, named)
+  return move fact
+}
+
+// Records that the running unit, lowering a body of `module`, spelled report names of the modules
+// `named` lists against the program's own package.
+effect fn recordReportNames(resolver: &mut Resolver, module: &ModuleId, named: &[ModuleId]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < named.length {
+    run recordRequestInput(&mut resolver.*, module, run reportNameFact(&named[at]))
+    at = at + usize.ONE
+  }
+}
+
 // Records that the running unit, checking `module`, read the request's application module.
 effect fn recordApplicationRead(resolver: &mut Resolver, module: &ModuleId) -> () ! OutOfMemoryError ? &mut Allocator {
   return run recordRequestInput(&mut resolver.*, module, run Bytes.copy(b"application"))
@@ -7122,6 +7238,18 @@ effect fn captureRequest(resolver: &Resolver, fact: &[u8]) -> Bytes ! OutOfMemor
       run StableKey.module(&mut output, &discovery.root)
     } else if resolver.currentApplication == usize.MAX { run RuntimeEncoding.field(&mut output, b"none") }
     else { run StableKey.module(&mut output, &resolvedModule(resolver, resolver.currentApplication)) }
+    return move output
+  }
+  // Whether a report leads a module's names with its package's name (`reportNameFact`).
+  let foreign = b"report-foreign:"
+  if startsWithBytes(fact, foreign) {
+    let identity = Slice.view<u8>(fact, foreign.length, fact.length - foreign.length)
+    let mut reader = StableKey.reader()
+    let mut leads = false
+    if let Option<ModuleId>.Some {value: named} = move run StableKey.readModule(identity, &mut reader) {
+      if let Option<ModuleId>.Some {value: root} = move run reportRoot(resolver) { leads = Mir.foreignTo(&named, &root) }
+    }
+    if leads { run RuntimeEncoding.field(&mut output, b"foreign") } else { run RuntimeEncoding.field(&mut output, b"own") }
     return move output
   }
   // A parameter read while the profile assembles reads the assembly's registrations and bindings;
@@ -7990,6 +8118,8 @@ effect fn signatureSyntax(resolver: &mut Resolver, module: &ModuleId, ordinal: u
     let mut foreignAbi = Option<Span>.none()
     let mut abiText = Bytes.make()
     let mut imported = false
+    // The `as` string of a linked function, which a generic export cannot write.
+    let mut writtenSymbol = Option<Span>.none()
     let mut functionName = Bytes.make()
     if let Node.FunctionHeader {name: spelled, contract, linkage, isPublic: visible, ..} = written {
       callable = Option<HirId>.some(contract)
@@ -7998,8 +8128,9 @@ effect fn signatureSyntax(resolver: &mut Resolver, module: &ModuleId, ordinal: u
       if linkage.present { linkageSpan = Module.span(hir, linkage.id) }
       if let Node.Name {text} = Module.node(hir, spelled) { functionName = run Bytes.copy(Module.text(hir, text)) }
       if linkage.present {
-        if let Node.Linkage {direction, abi, ..} = Module.node(hir, linkage.id) {
+        if let Node.Linkage {direction, abi, symbol: linkedSymbol} = Module.node(hir, linkage.id) {
           imported = direction != LinkageDirection.Export
+          if linkedSymbol.present { writtenSymbol = Option<Span>.some(Module.span(hir, linkedSymbol.id)) }
           if let Node.TextLiteral {value: text} = Module.node(hir, abi) {
             if !same(Module.text(hir, text), b"C") {
               foreignAbi = Option<Span>.some(Module.span(hir, abi))
@@ -8083,10 +8214,20 @@ effect fn signatureSyntax(resolver: &mut Resolver, module: &ModuleId, ordinal: u
         } else if let Option<Span>.Some {value: abiSpan} = move foreignAbi {
           // Only the C ABI exists (SEM0185); the linkage names the ABI it asked for.
           headerConflict = run namedHeaderConflict(RejectionCode.UnsupportedForeignAbi, abiSpan, b"abi", Bytes.asSlice(&abiText))
-        } else if foreign && generics.length > usize.ZERO {
-          // A linked function has one C signature, so it has no Silk-only contract (SEM0188).
-          headerConflict = run linkageRestriction(Module.span(hir, Module.child(hir, generics, usize.ZERO)), imported,
+        } else if foreign && imported && generics.length > usize.ZERO {
+          // A C import has one C signature, so it has no Silk-only contract (SEM0188).
+          headerConflict = run linkageRestriction(Module.span(hir, Module.child(hir, generics, usize.ZERO)), true,
             b"generic parameters")
+        } else if foreign && generics.length > usize.ZERO {
+          // An export's type parameters select one C thunk per instantiation (FFI-012). A lifetime
+          // or row parameter has no thunk to select, and one symbol cannot name every
+          // instantiation (SEM0188).
+          if let Option<HirId>.Some {value: proofOnly} = move proofOnlyParameter(hir, generics) {
+            headerConflict = run linkageRestriction(Module.span(hir, proofOnly), false, b"lifetime or row parameters")
+          } else if let Option<Span>.Some {value: symbolSpan} = &writtenSymbol {
+            headerConflict = run linkageRestriction(symbolSpan, false,
+              b"an `as` symbol beside type parameters; each instantiation has its own C thunk and symbol")
+          }
         } else if foreign && isStatic {
           headerConflict = run linkageRestriction(writtenAnchor(writtenAnchors.staticAnchor, declarationSpan), imported, b"static")
         } else if foreign && isEffect {
@@ -19962,6 +20103,33 @@ effect fn conformanceOwnerRejection(module: &ModuleId, span: Span, provider: &In
   return run Shared<Rejection>.make(move diagnostic)
 }
 
+// SEM0083 for an impl whose provider IMPL-001 does not admit, naming the type and the kinds that
+// are admitted: "`[u8; 4]` cannot be the type an impl is for; ...". An array adds how to give it a
+// name.
+effect fn invalidProviderRejection(module: &ModuleId, span: Span, provider: &Interned<Type>) -> Shared<Rejection>
+! OutOfMemoryError ? &mut Allocator {
+  let mut diagnostic = run makeRejection(RejectionCode.InvalidProvider, module, span)
+  let providerText = match move run TypeText.displayElided(provider, module) {
+    Option<Bytes>.Some {value} => move value
+    Option<Bytes>.None => { return run Shared<Rejection>.make(move diagnostic) }
+  }
+  let mut detail = Bytes.make()
+  run appendQuoted(&mut detail, Bytes.asSlice(&providerText))
+  run Bytes.append(&mut detail,
+    b" cannot be the type an impl is for; that type is a declared struct, tuple, enum or union, a scalar, `string`, or a slice such as `&[T]`")
+  let array = Interned<Type>.with<bool>(provider, fn(value: &Type) -> bool {
+    return match & value.* {
+      Type.Array {..} => true
+      _ => false
+    }
+  })
+  if array {
+    run Bytes.append(&mut detail, b"; declare a tuple or struct that holds the array and implement the interface for it")
+  }
+  run List<MessageArgument>.append(&mut diagnostic.arguments, MessageArgument {name: run Bytes.copy(b"detail"), value: move detail})
+  return run Shared<Rejection>.make(move diagnostic)
+}
+
 // The module that declares a nominal type.
 fn nominalModule(value: &Type) -> Option<ModuleId> {
   return match & value.* {
@@ -20554,7 +20722,7 @@ effect fn resolveImplementationShape(
   // IMPL-001: a provider needs one canonical nominal identity, or is a scalar or `string`.
   if !nominal && !foundational {
     return run memberRejected(
-      run reject(&resolver.*, &module, RejectionCode.InvalidProvider, providerSpan),
+      run invalidProviderRejection(&module, providerSpan, &provider),
       move dependencies,
     )
   }
@@ -21423,14 +21591,20 @@ fn rejectionModuleOrdinal(resolver: &Resolver, diagnostic: &Shared<Rejection>) -
 }
 
 // The first type argument of an applied contract, whose nominal owner's module may also own a
-// conformance of that contract (IMPL-004); none for a contract without a type argument.
+// conformance of that contract (IMPL-004); none for a contract without a type argument. A reference
+// stands for its referent, so `From<&Pixel>` belongs with `Pixel` as `From<Pixel>` does.
 fn firstTypeArgument(contract: &Type) -> Option<Interned<Type>> {
   if let Type.Nominal {arguments, ..} = &contract.* {
     let listed = List<Argument>.asSlice(&arguments)
     let mut at = usize.ZERO
     while at < listed.length {
       if let Argument.Type {value} = &listed[at] {
-        return Option<Interned<Type>>.some(Interned<Type>.clone(&value))
+        return Option<Interned<Type>>.some(Interned<Type>.with<Interned<Type>>(&value, fn(argument: &Type) -> Interned<Type> {
+          return match & argument.* {
+            Type.Reference {referent, ..} => Interned<Type>.clone(&referent)
+            _ => Interned<Type>.clone(&value)
+          }
+        }))
       }
       at = at + usize.ONE
     }
@@ -33347,6 +33521,26 @@ effect fn collectCall(hir: &Module, expression: HirId, annotations: &mut List<Hi
       run collectQualifiedValue(hir, expression, &mut calls.*)
       run collectCall(hir, subject, &mut annotations.*, &mut calls.*)
     }
+    // `scaled<Two>` selects its function as a value read does, with the written type arguments.
+    Node.InstantiationExpression {callee, generics} => {
+      let mut reference = CallReference.Unsupported
+      match Module.node(hir, callee) {
+        Node.IdentifierExpression {name, binding} => {
+          if binding.present {
+            reference = CallReference.NonCallable
+          } else if let Node.Name {text} = Module.node(hir, name) {
+            reference = CallReference.Unbound {name: run Bytes.copy(Module.text(hir, text))}
+          }
+        }
+        _ => {
+          if let Option<CallReference>.Some {value} = move run qualifiedCallReference(hir, callee) { reference = move value }
+        }
+      }
+      run List<CallSyntax>.append(&mut calls.*, CallSyntax {
+        exactItem: false, value: true, id: expression, span: Module.span(hir, callee), reference: move reference,
+        generics: HirRef.of(generics), pipeline: false,
+      })
+    }
     Node.IdentifierExpression {name, binding} => {
       if !binding.present {
         if let Node.Name {text} = Module.node(hir, name) {
@@ -44863,11 +45057,14 @@ effect fn embeddedSection(
     first, move arguments, move result, List<usize>.make(), constraints, expected, mismatchCode, false)
 }
 
-// One read of an imported C static, checked at its declared type.
-effect fn foreignFunctionAddress(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>,
+// The C address of a named export, checked against the expected C function-pointer type (FFI-012).
+// A monomorphic export gives the thunk its symbol names. A generic export gives the thunk of the
+// instantiation its written type arguments select: they must fix every type parameter and prove
+// its bounds, and the signature compared is the export's under them.
+effect fn foreignFunctionAddress(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, request: &mut Request,
   dependencies: &mut List<Dependency>, module: &ModuleId, cursor: &AuthoredCursor, nodes: &mut List<BodyNode>,
   requiredBodies: &mut List<DeclarationId>, expression: HirId, span: Span, target: &CallTarget,
-  expected: &Option<Interned<Type>>, mismatchCode: RejectionCode) -> Result<BodyNodeId, Shared<Rejection>>
+  expected: &Option<Interned<Type>>, mismatchCode: RejectionCode, constraints: &[Constraint]) -> Result<BodyNodeId, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
   let refusal = RejectionCode.ForeignFunctionNotFirstClass
   let ty = match &expected.* {
@@ -44885,11 +45082,47 @@ effect fn foreignFunctionAddress(resolver: &mut Resolver, owner: &mut Query<Answ
     Option<Interned<Type>>.Some {value: selected} => move selected
     _ => { return run bodyRejection(&resolver.*, module, refusal, span) }
   }
-  if Shared<Result<Answer, NoRejection>>.with<usize>(&target.signature, signatureBinderCount) != usize.ZERO
-    || Shared<Result<Answer, NoRejection>>.with<bool>(&target.signature, signatureIsEffect)
+  if Shared<Result<Answer, NoRejection>>.with<bool>(&target.signature, signatureIsEffect)
     || Shared<Result<Answer, NoRejection>>.with<bool>(&target.signature, signatureIsStatic) {
     return run bodyRejection(&resolver.*, module, refusal, span)
   }
+  // The written type arguments of a generic export close its application; a monomorphic export
+  // has none to write.
+  let binders = Shared<Result<Answer, NoRejection>>.with<usize>(&target.signature, signatureBinderCount)
+  if target.prefixLifetimes != usize.ZERO || List<Argument>.length(&target.explicit) != binders {
+    return run bodyRejection(&resolver.*, module, refusal, span)
+  }
+  let mut instance = Option<Application>.none()
+  let mut bindings = List<Binding>.make()
+  if binders != usize.ZERO {
+    let selected = run checkedDirectApplication(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*,
+      &target.declaration, &target.signature, run copyArguments(List<Argument>.asSlice(&target.explicit)),
+      &target.scopeArguments, module, span)
+    let application = match move selected {
+      Result<Application, Shared<Rejection>>.Success {value} => move value
+      Result<Application, Shared<Rejection>>.Failure {error} => { return Result<BodyNodeId, Shared<Rejection>>.failResult(move error) }
+    }
+    bindings = run Application.bindings(&application)
+    let boundCount = Shared<Result<Answer, NoRejection>>.with<usize>(&target.signature, signatureConstraintCount)
+    let mut applied = List<Constraint>.make()
+    let mut boundAt = usize.ZERO
+    while boundAt < boundCount {
+      let bound = Shared<Result<Answer, NoRejection>>.with<Option<Constraint>>(&target.signature,
+        fn(answer: &Result<Answer, NoRejection>) -> Option<Constraint> { return signatureConstraint(answer, boundAt) })
+      if let Option<Constraint>.Some {value} = move bound {
+        run List<Constraint>.append(&mut applied, run bindConstraint(&value, List<Binding>.asSlice(&bindings)))
+      }
+      boundAt = boundAt + usize.ONE
+    }
+    let declared = run copyConstraints(constraints)
+    let unproved = run proveAppliedBounds(&mut resolver.*, &mut owner.*, &mut dependencies.*, &declared,
+      List<Constraint>.asSlice(&applied), module, span, RegionProof.Typing)
+    if let Option<Shared<Rejection>>.Some {value} = move unproved {
+      return Result<BodyNodeId, Shared<Rejection>>.failResult(move value)
+    }
+    instance = Option<Application>.some(move application)
+  }
+  let supplied = List<Binding>.asSlice(&bindings)
   let identity = run Types.internDeclaration(DeclarationId.copy(&target.declaration))
   let targetModule = DeclarationId.moduleId(&target.declaration)
   let ordinal = match move run ordinalOfIdentity(&mut resolver.*, targetModule, &identity) {
@@ -44897,7 +45130,7 @@ effect fn foreignFunctionAddress(resolver: &mut Resolver, owner: &mut Query<Answ
     _ => { return run bodyRejection(&resolver.*, module, refusal, span) }
   }
   let written = run foreignHeader(&mut resolver.*, targetModule, ordinal)
-  if !written.exported || written.global {
+  if !written.exported || written.global || written.generic != (binders != usize.ZERO) {
     return run bodyRejection(&resolver.*, module, refusal, span)
   }
   if let Option<HeaderConflict>.Some {..} = &written.refusal {
@@ -44934,21 +45167,27 @@ effect fn foreignFunctionAddress(resolver: &mut Resolver, owner: &mut Query<Answ
   while at < count {
     let actual = Shared<Result<Answer, NoRejection>>.with<Option<Interned<Type>>>(&target.signature,
       fn(answer: &Result<Answer, NoRejection>) -> Option<Interned<Type>> { return signatureParameterAt(answer, at) })
-    if let Option<Interned<Type>>.Some {value: parameter} = move actual {
+    if let Option<Interned<Type>>.Some {value: declared} = move actual {
+      let parameter = run Type.applyBindings(&declared, supplied, true)
       if !run Type.equalsShared(&parameter, &wanted[at]) { return run bodyRejection(&resolver.*, module, mismatchCode, span) }
     } else { return run bodyRejection(&resolver.*, module, refusal, span) }
     at = at + usize.ONE
   }
   let actualResult = Shared<Result<Answer, NoRejection>>.with<Option<Interned<Type>>>(&target.signature, signatureResult)
-  if let Option<Interned<Type>>.Some {value: actual} = move actualResult {
+  if let Option<Interned<Type>>.Some {value: declared} = move actualResult {
+    let actual = run Type.applyBindings(&declared, supplied, true)
     if !run Type.equalsShared(&actual, &result) { return run bodyRejection(&resolver.*, module, mismatchCode, span) }
   } else { return run bodyRejection(&resolver.*, module, refusal, span) }
   run List<DeclarationId>.append(&mut requiredBodies.*, DeclarationId.copy(&target.declaration))
+  let form = match move instance {
+    Option<Application>.Some {value: application} => BodyExpression.ForeignInstanceAddress {
+      application: run Types.internApplication(move application)}
+    Option<Application>.None => BodyExpression.ForeignAddress {
+      declaration: move identity, symbol: run Shared<Bytes>.make(move written.symbol)}
+  }
   let index = List<BodyNode>.length(&nodes.*)
   run List<BodyNode>.append(&mut nodes.*, BodyNode {origin: run originAt(cursor, expression, span),
-    kind: BodyNodeKind.Expression {ty: move ty, form: BodyExpression.ForeignAddress {
-      declaration: move identity, symbol: run Shared<Bytes>.make(move written.symbol),
-    }}})
+    kind: BodyNodeKind.Expression {ty: move ty, form: move form}})
   return Result<BodyNodeId, Shared<Rejection>>.succeed(BodyNodeId {index: index})
 }
 
@@ -45456,19 +45695,15 @@ effect fn checkTestDiscoveryCall<'scope>(
       Option<Interned<StaticData>>.Some {value} => move value
       Option<Interned<StaticData>>.None => { return run bodyRejection(&resolver.*, module, RejectionCode.StaticPhaseViolation, argumentSpan) }
     }
-    let selected = match move run selectedTestEntry(&mut resolver.*, &mut owner.*, &mut dependencies.*, &descriptor, module, argumentSpan) {
-      Result<SelectedTest, Shared<Rejection>>.Success {value} => move value
-      Result<SelectedTest, Shared<Rejection>>.Failure {error} => { return Result<BodyNodeId, Shared<Rejection>>.failResult(move error) }
+    let selected = match move run describedTest(&resolver.*, &descriptor, module, argumentSpan) {
+      Result<DescribedTest, Shared<Rejection>>.Success {value} => move value
+      Result<DescribedTest, Shared<Rejection>>.Failure {error} => { return Result<BodyNodeId, Shared<Rejection>>.failResult(move error) }
     }
     if typeArguments.length == usize.ONE {
       if !run sameBodyType(&resolver.*, &typeArguments[usize.ZERO], &selected.callable) { return run bodyRejection(&resolver.*, module, RejectionCode.TypeMismatch, span) }
     }
-    let declaration = Shared<TestCatalog>.with<Interned<DeclarationId>>(&selected.catalog, fn(held: &TestCatalog) -> Interned<DeclarationId> {
-      let entries = List<TestEntry>.asSlice(&held.entries)
-      return Interned<DeclarationId>.clone(&entries[selected.ordinal].declaration)
-    })
-    run List<DeclarationId>.append(&mut requiredBodies.*, DeclarationId.copyShared(&declaration))
-    run List<SignatureDependency>.append(&mut signatures.*, SignatureDependency {declaration: DeclarationId.copyShared(&declaration)})
+    run List<DeclarationId>.append(&mut requiredBodies.*, DeclarationId.copy(&selected.declaration))
+    run List<SignatureDependency>.append(&mut signatures.*, SignatureDependency {declaration: move selected.declaration})
     return run finishExpression(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, caller, constraints, &mut nodes.*,
       expression, span, Interned<Type>.clone(&selected.callable), BodyExpression.Aggregate {fields: List<BodyAggregateField>.make(), written: List<Interned<Lifetime>>.make(), section: Option<SectionRetention>.none()},
       false, expected, mismatchCode, contractBody, false)
@@ -54989,10 +55224,18 @@ effect fn checkNamedValue<'scope>(
   contractBody: bool, staticBody: bool, unsafeAllowed: bool,
 ) -> Option<Result<BodyNodeId, Shared<Rejection>>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut instantiation = Option<CallInput>.none()
+  let mut instantiated = false
   let namedValue = match run bodyNode(&resolver.source, cursor, expression) {
     Node.IdentifierExpression {binding, ..} => !binding.present
     Node.FieldExpression {..} => true
     Node.MemberExpression {fields, ..} => !fields.present
+    Node.InstantiationExpression {callee, generics} => {
+      instantiation = Option<CallInput>.some(CallInput {callee: callee, generics: HirRef.of(generics),
+        arguments: CallArguments.Written {range: Range.empty()}, pipeline: false})
+      instantiated = true
+      true
+    }
     _ => false
   }
   if !namedValue { return Option<Result<BodyNodeId, Shared<Rejection>>>.none() }
@@ -55012,12 +55255,18 @@ effect fn checkNamedValue<'scope>(
             b"call it from runtime code instead"))
         }
         return Option<Result<BodyNodeId, Shared<Rejection>>>.some(run foreignFunctionAddress(&mut resolver.*, &mut owner.*,
-          &mut dependencies.*, module, cursor, &mut nodes.*, &mut requiredBodies.*, expression, span, &target, expected, mismatchCode))
+          &mut request.*, &mut dependencies.*, module, cursor, &mut nodes.*, &mut requiredBodies.*, expression, span, &target,
+          expected, mismatchCode, constraints))
+      }
+      // An instantiated Silk function is its named value with the written arguments fixed.
+      let input = match move instantiation {
+        Option<CallInput>.Some {value} => value
+        Option<CallInput>.None => CallInput {callee: expression, generics: HirRef.absent(),
+          arguments: CallArguments.Written {range: Range.empty()}, pipeline: false}
       }
       return Option<Result<BodyNodeId, Shared<Rejection>>>.some(run checkInvocation(&mut resolver.*, &mut owner.*, &mut request.*,
         &mut dependencies.*, module, cursor, caller, &mut statementScope.*, calls, &mut nodes.*, &mut signatures.*,
-        &mut requiredBodies.*, expression, CallInput {callee: expression, generics: HirRef.absent(),
-          arguments: CallArguments.Written {range: Range.empty()}, pipeline: false},
+        &mut requiredBodies.*, expression, input,
         expected, mismatchCode, constraints, contractBody, staticBody, unsafeAllowed, false, true, promised))
     }
     Option<Result<ResolvedTarget, Shared<Rejection>>>.Some {
@@ -55041,11 +55290,16 @@ effect fn checkNamedValue<'scope>(
           || value.code == RejectionCode.UnsupportedForeignAbi || value.code == RejectionCode.ForeignFunctionRequiresUnsafe
           || value.code == RejectionCode.PrivateMember || value.code == RejectionCode.UnknownImportedMember
       })
-      if rejectedValue {
+      // An instantiation has no other reading, so its target's refusal is its own.
+      if rejectedValue || instantiated {
         return Option<Result<BodyNodeId, Shared<Rejection>>>.some(Result<BodyNodeId, Shared<Rejection>>.failResult(move error))
       }
     }
     _ => ()
+  }
+  // Only a function takes type arguments as a value.
+  if instantiated {
+    return Option<Result<BodyNodeId, Shared<Rejection>>>.some(run bodyRejection(&resolver.*, module, RejectionCode.NotCallable, span))
   }
   return Option<Result<BodyNodeId, Shared<Rejection>>>.none()
 }
@@ -61174,7 +61428,9 @@ effect fn checkDeclarationCallForm<'scope>(
       }
     }
   }
+  // A generic export has no C symbol to call: Silk calls it as the ordinary generic function it is.
   let foreignCall = target.foreign
+    && Shared<Result<Answer, NoRejection>>.with<usize>(&target.signature, signatureNonLifetimeBinderCount) == usize.ZERO
   let variadic = Shared<Result<Answer, NoRejection>>.with<bool>(&target.signature, signatureIsVariadic)
   // Only a C import is variadic, and its header refused any other (`signatureSyntax`).
   if variadic && !foreignCall { return CompilerBug.panic(b"a variadic signature passed the header check outside a C import") }
@@ -73145,7 +73401,7 @@ effect fn storeMir(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejectio
 // Their queries select that one tail; copying the ordinary body never duplicates the helpers.
 effect fn storeLowered(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, lowered: Lowered, dependencies: List<Dependency>, construction: bool) -> Answer
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
-  let Lowered {function, helpers} = move lowered
+  let Lowered {function, helpers, named: _} = move lowered
   let mut read = move dependencies
   let mut coalesced = move helpers
   let mut changed = List<MirFunction>.asMutSlice(&mut coalesced)
@@ -80615,9 +80871,12 @@ effect fn lowerMir(
   if let Option<HeaderSyntax>.Some {value: syntax} = move selectedHeader {
     if let Node.FunctionHeader {linkage, ..} = syntax.header { linked = linkage.present }
   }
+  // Each instance of a generic export is lowered with its own C thunk (FFI-012).
+  let mut thunked = false
   if linked {
     let declarationAccess186 = declarationPosition(&resolver.*, key)
     let foreign = run foreignHeader(&mut resolver.*, &module, declarationAccess186)
+    thunked = foreign.generic
     // An import's definition is C code, so it has no MIR; only a refused header reaches here.
     if !foreign.exported {
       if let Option<HeaderConflict>.Some {value: conflict} = &foreign.refusal {
@@ -80870,6 +81129,26 @@ effect fn lowerMir(
       }
       run List<MirCallTarget>.append(&mut calls, MirCallTarget {
         node: node, receiverDereferences: usize.ZERO, key: move calleeKey, application: move closed, edge: Edge.Direct, operands: move operands,
+        stored: Option<MirStoredArguments>.none(), providers: List<MirProviderSource>.make(), dispatch: Option<MirProviderSource>.none(),
+        witnessFailure: Option<Interned<Type>>.none(), nonParking: false, vacuous: false, returned: Option<Interned<Type>>.none(),
+      })
+    }
+    // An addressed instantiation of a generic export is closed like a call's: its instance is the
+    // creator of the thunk whose address the node takes.
+    if let Option<Interned<Application>>.Some {value: addressed} = move TypedBody.addressedApplication(&typed, node) {
+      let recorded = run Application.copyShared(&addressed)
+      let closed = run Application.substitute(&recorded, &callerApplication)
+      let addressedKey = match move run InstanceKey.function(run Application.copy(&closed)) {
+        Result<InstanceKey, CanonicalizationFailure>.Success {value: canonicalKey} => move canonicalKey
+        Result<InstanceKey, CanonicalizationFailure>.Failure {error: reason} => {
+          return run preparationAnswer(&resolver.*, &identity, &module,
+            Shared<TypedBody>.with<Span>(&typed, fn(value: &TypedBody) -> Span { return BodyOrigin.span(TypedBody.nodeSlice(value)[node.index].origin, &anchor) }),
+            PreparationFailure.Canonicalization {reason: reason}, move dependencies)
+        }
+      }
+      run List<MirCallTarget>.append(&mut calls, MirCallTarget {
+        node: node, receiverDereferences: usize.ZERO, key: move addressedKey, application: move closed, edge: Edge.Direct,
+        operands: List<MirCallOperand>.make(),
         stored: Option<MirStoredArguments>.none(), providers: List<MirProviderSource>.make(), dispatch: Option<MirProviderSource>.none(),
         witnessFailure: Option<Interned<Type>>.none(), nonParking: false, vacuous: false, returned: Option<Interned<Type>>.none(),
       })
@@ -81247,16 +81526,20 @@ effect fn lowerMir(
   }
   let failureType = run signatureFailure(&signature)
   // Semantic declaration reads guard literals and types. Embedded site labels and debug
-  // locations additionally read this anchor's origin and its declaration's internal trivia.
+  // locations additionally read the declaration's internal trivia. A debug location is counted
+  // from the anchor (`MirFunction.lines`), and so is a site label of a build with line tables
+  // (`Mir.siteLabel`), so a body that only moves in its file reads what it read. Any other site
+  // label names the line its anchor starts on, so its body reads the anchor's origin too.
+  let relativeSites = relativeSites(&resolver.*)
   let mut sourceAnswer = run demandSource(&mut resolver.*, &module)
   if (observing || resolver.lineTables) && recordingUnit(&resolver.*) != usize.MAX {
     let loaded = move sourceAnswer
     sourceAnswer = run observedDeclarationIn(&mut resolver.*, &module, move loaded, declarationAccess183, SourceFacet.Layout)
-    drop run observedSource(&mut resolver.*, &module, SourceSelector.Origin {handle: key.declaration})
+    if observing && !relativeSites { drop run observedSource(&mut resolver.*, &module, SourceSelector.Origin {handle: key.declaration}) }
   }
   // Only an observing body names its sites, so only it reads which application reports are for.
   let mut packageRoot = Option<ModuleId>.none()
-  if observing { packageRoot = run reportRoot(&mut resolver.*, &module) }
+  if observing { packageRoot = run reportRoot(&resolver.*) }
   let lowered = match move sourceOf(&resolver.*, &sourceAnswer, &module) {
     Option<&IndexedSource>.Some {value: indexed} => run Effect.result(
       MirFunction.lower(
@@ -81279,6 +81562,7 @@ effect fn lowerMir(
         &anchor,
         observing,
         resolver.lineTables,
+        relativeSites,
         resolver.fastPathIr,
         move packageRoot,
         move suspending,
@@ -81300,6 +81584,8 @@ effect fn lowerMir(
   let mut completed = match move lowered {
     Result<Lowered, BackendGap | CanonicalizationFailure | OutOfMemoryError>.Success {value} => move value
     Result<Lowered, BackendGap | CanonicalizationFailure | OutOfMemoryError>.Failure {error} => {
+      // A body that did not lower names nothing; what it reports rests on the whole report root.
+      if observing { run recordRequestInput(&mut resolver.*, &module, run Bytes.copy(b"report-root")) }
       return match move error {
         BackendGap {code, owner: gapOwner, source} => memberSuccess(
           Value.Unsupported {
@@ -81317,6 +81603,7 @@ effect fn lowerMir(
       }
     }
   }
+  run recordReportNames(&mut resolver.*, &module, List<ModuleId>.asSlice(&completed.named))
   let mut owed = move entry
   while List<MirNonParkingRun>.length(&owed) > usize.ZERO {
     run List<MirNonParkingRun>.append(&mut completed.function.nonParking, List<MirNonParkingRun>.remove(&mut owed, usize.ZERO))
@@ -81326,6 +81613,9 @@ effect fn lowerMir(
   completed.function.features = run featureAttribute(&mut resolver.*, &module, List<Bytes>.asSlice(&listedFeatures))
   completed.function.inlining = run declarationInlining(&mut resolver.*, &module, declarationAccess182)
   completed.function.optimizeSize = run declarationOptimizeSize(&mut resolver.*, &module, declarationAccess182)
+  if thunked {
+    run List<MirFunction>.append(&mut completed.helpers, run MirFunction.cThunk(&completed.function, observing))
+  }
   return run storeLowered(&mut resolver.*, &mut owner.*, move completed, move dependencies, selfRaw)
 }
 
@@ -81807,7 +82097,7 @@ effect fn copyMirCValues(resolver: &Resolver, index: usize, anchor: &Option<Anch
 ! OutOfMemoryError ? &mut Allocator {
   let function = &List<MirFunction>.asSlice(&resolver.mirValues)[index]
   let mut copied = List<LayoutDemand>.make()
-  if InstanceKey.fixedLinkage(&function.key) {
+  if InstanceKey.cEntry(&function.key) {
     let span = anchoredSpan(anchor, List<MirLocal>.asSlice(&function.locals)[usize.ZERO].origin)
     run List<LayoutDemand>.append(&mut copied, LayoutDemand {ty: Interned<Type>.clone(&function.result), span: span})
     let parameters = List<Interned<Type>>.asSlice(&function.parameters)
@@ -82413,6 +82703,9 @@ struct ForeignHeader {
   exported: bool,
   /// Whether the declaration is a C object (`static`) rather than a function.
   global: bool,
+  /// Whether the declaration is a generic export: it declares type parameters, so it publishes no
+  /// symbol and each instantiation whose address is taken has its own C thunk.
+  generic: bool,
   /// The `@callbacks` directive a function with C function-pointer parameters needs when its
   /// directives do not name each of them once, as `@callbacks("compare")`; empty otherwise.
   callbacks: Bytes,
@@ -82464,7 +82757,7 @@ effect fn foreignHeader(resolver: &mut Resolver, module: &ModuleId, ordinal: usi
           if direction == LinkageDirection.Import && !isUnsafe {
             refusal = run namedHeaderConflict(RejectionCode.ForeignFunctionRequiresUnsafe, span, b"name", Bytes.asSlice(&staticName))
           }
-          return ForeignHeader {importModule: Bytes.make(), importName: Bytes.make(), behavior: ForeignContract.conservative(), symbol: move symbolName, refusal: move refusal, span: span, exported: direction == LinkageDirection.Export, global: true, callbacks: Bytes.make(),
+          return ForeignHeader {importModule: Bytes.make(), importName: Bytes.make(), behavior: ForeignContract.conservative(), symbol: move symbolName, refusal: move refusal, span: span, exported: direction == LinkageDirection.Export, global: true, generic: false, callbacks: Bytes.make(),
             parameterNames: List<Bytes>.make(), callbackModes: List<CallbackMode>.make()}
         }
       }
@@ -82478,6 +82771,7 @@ effect fn foreignHeader(resolver: &mut Resolver, module: &ModuleId, ordinal: usi
               if let Node.TextLiteral {value: text} = Module.node(hir, symbol.id) { symbolName = run Bytes.copy(Module.text(hir, text)) }
             }
             let mut refusal = Option<HeaderConflict>.none()
+            let mut generic = false
             let mut functionName = Bytes.make()
             if let Node.Name {text} = Module.node(hir, name) { functionName = run Bytes.copy(Module.text(hir, text)) }
             let mut behavior = ForeignContract.conservative()
@@ -82547,7 +82841,16 @@ effect fn foreignHeader(resolver: &mut Resolver, module: &ModuleId, ordinal: usi
                 }
               }
               // The signature check refuses these first, at their own spans (`signatureSyntax`).
-              if generics.length > usize.ZERO { refusal = run linkageRestriction(span, !exported, b"generic parameters") }
+              if generics.length > usize.ZERO {
+                generic = exported && declaresTypeParameter(hir, generics)
+                if !exported { refusal = run linkageRestriction(span, true, b"generic parameters") }
+                else if let Option<HirId>.Some {..} = move proofOnlyParameter(hir, generics) {
+                  refusal = run linkageRestriction(span, false, b"lifetime or row parameters")
+                } else if symbol.present {
+                  refusal = run linkageRestriction(span, false,
+                    b"an `as` symbol beside type parameters; each instantiation has its own C thunk and symbol")
+                }
+              }
               if isStatic { refusal = run linkageRestriction(span, !exported, b"static") }
               if isEffect { refusal = run linkageRestriction(span, !exported, b"effect") }
               if !isUnsafe && !exported {
@@ -82608,14 +82911,14 @@ effect fn foreignHeader(resolver: &mut Resolver, module: &ModuleId, ordinal: usi
               run Bytes.append(&mut filled, Bytes.asSlice(&importName))
               symbolName = run wasmImportSymbol(Bytes.asSlice(&filled))
             }
-            return ForeignHeader {importModule: move importModule, importName: move importName, behavior: behavior, symbol: move symbolName, refusal: move refusal, span: span, exported: exported, global: false, callbacks: move callbacks,
+            return ForeignHeader {importModule: move importModule, importName: move importName, behavior: behavior, symbol: move symbolName, refusal: move refusal, span: span, exported: exported, global: false, generic: generic, callbacks: move callbacks,
               parameterNames: move parameterNames, callbackModes: move callbackModes}
           }
         }
       }
     }
   }
-  return ForeignHeader {importModule: Bytes.make(), importName: Bytes.make(), behavior: ForeignContract.conservative(), symbol: Bytes.make(), refusal: conflictAt(RejectionCode.UnsupportedForeignAbi, Span.make(usize.ZERO, usize.ZERO)), span: Span.make(usize.ZERO, usize.ZERO), exported: false, global: false, callbacks: Bytes.make(),
+  return ForeignHeader {importModule: Bytes.make(), importName: Bytes.make(), behavior: ForeignContract.conservative(), symbol: Bytes.make(), refusal: conflictAt(RejectionCode.UnsupportedForeignAbi, Span.make(usize.ZERO, usize.ZERO)), span: Span.make(usize.ZERO, usize.ZERO), exported: false, global: false, generic: false, callbacks: Bytes.make(),
     parameterNames: List<Bytes>.make(), callbackModes: List<CallbackMode>.make()}
 }
 
@@ -83449,6 +83752,12 @@ fn directLevel(resolver: &Resolver) -> SsaLevel {
   return SsaLevel.Speed
 }
 
+// Whether a site label counts its place from its function's declaration: in a build with line
+// tables whose text Clang compiles, which is encoded with where each declaration starts
+// (`Bitcode.Module.placeSites`). The direct backend holds each label's text, so this follows
+// the backend `emitInstance` selects.
+fn relativeSites(resolver: &Resolver) -> bool { return resolver.lineTables && !resolver.direct }
+
 // One instance's text: LLVM text, or for the direct backend a wasm fragment (`WasmLower`).
 effect fn emitInstance(resolver: &Resolver, function: &MirFunction, input: &EmissionInputs, hostExport: bool) -> Bytes
 ! BackendGap | OutOfMemoryError ? &mut Allocator | &mut Types {
@@ -83466,6 +83775,18 @@ effect fn emitInstance(resolver: &Resolver, function: &MirFunction, input: &Emis
       resolver.verifyMir,
     )
   }
+  // Every function of a test runner has a record in its table of executed functions; one whose
+  // content has no digest, as in a one-shot build, has a zero digest, so a test that executes it
+  // is never skipped.
+  let mut seen = Option<ContentHash>.none()
+  if resolver.coverage {
+    seen = Option<ContentHash>.some(ContentHash {high: 0, low: 0})
+    if input.llvm != usize.MAX {
+      if let Option<ContentHash>.Some {value} = &List<LlvmInput>.asSlice(&resolver.llvmInputs)[input.llvm].digest {
+        seen = Option<ContentHash>.some(value)
+      }
+    }
+  }
   return run LlvmCode.emit(
     function,
     &resolver.target,
@@ -83475,6 +83796,7 @@ effect fn emitInstance(resolver: &Resolver, function: &MirFunction, input: &Emis
     &input.suspension,
     resolver.fastPathIr,
     hostExport,
+    &seen,
   )
 }
 
@@ -83885,6 +84207,7 @@ effect fn resolveEmissionInputs(
       Bytes.asSlice(&signatures),
       List<Bytes>.asSlice(&encoded),
       &suspension,
+      resolver.coverage,
     )
     identity = Option<ContentHash>.some(digest)
   }
@@ -86283,6 +86606,11 @@ effect fn finishCheckedBody(resolver: &mut Resolver, owner: &mut Query<Answer, N
           diagnostic.arguments = List<MessageArgument>.make()
           run List<MessageArgument>.append(&mut diagnostic.arguments, MessageArgument {name: run Bytes.copy(b"template"), value: run Bytes.copy(b"1")})
         }
+        // A borrow of storage the body owns that must stay valid after the body returns says so.
+        if listed[at].code == RejectionCode.UnsatisfiedLifetimeBound && listed[at].local {
+          diagnostic.arguments = List<MessageArgument>.make()
+          run List<MessageArgument>.append(&mut diagnostic.arguments, MessageArgument {name: run Bytes.copy(b"template"), value: run Bytes.copy(b"2")})
+        }
         run List<Shared<Rejection>>.append(&mut diagnostics, run Shared<Rejection>.make(move diagnostic))
         at = at + usize.ONE
       }
@@ -86904,9 +87232,12 @@ effect fn solveBound(
     Option<usize>.None => { return false }
   }
   let providerApplication = run internApplication(&mut resolver.*, &provided)
+  // The bound leaves a later argument open, but a first argument it has already fixed still names
+  // a module that may hold the head (IMPL-004).
+  let argumentSlot = argumentOwnerSlot(&resolver.*, &wanted, &provided)
   let bucketKey = run internDeclaration(&mut resolver.*, Key {
     family: Family.ConformanceHeads, module: contractModule, name: providerApplication,
-    declaration: contractOrdinal, member: usize.ZERO, external: false,
+    declaration: contractOrdinal, member: argumentSlot, external: false,
   })
   let bucket = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies.*, bucketKey, span)
   if let Option<Shared<Rejection>>.Some {..} = move Shared<Result<Answer, NoRejection>>.with<Option<Shared<Rejection>>>(
@@ -89806,6 +90137,16 @@ effect fn appendConcreteHeadSupplier(
   if !exactHeadMatched(&matched) {
     return Result<(), Shared<Rejection>>.succeed(())
   }
+  // A head parameter the provider leaves open is fixed by the head's own bounds, as `O` in
+  // `impl<T: Mix<Right, O>, O> Out<O> for Box<T>` once `T` is matched.
+  let binderCount = Shared<ImplementationHead>.with<usize>(&head, headBinderCount)
+  let headOwner = DeclarationId.copyShared(&termsValue.declaration)
+  let lent = List<Interned<Lifetime>>.make()
+  if let Option<List<Argument>>.None = &run matchedArguments(binderCount, &headOwner, List<Binding>.asSlice(&bindings),
+    List<Interned<Lifetime>>.asSlice(&lent)) {
+    run solveHeadBounds(&mut resolver.*, &mut owner.*, &mut dependencies.*, &head,
+      List<Interned<DeclarationId>>.asSlice(&variables), &mut bindings, siteModule, siteSpan, usize.ZERO)
+  }
   let applied = run appliedHeadContract(
     &mut resolver.*,
     &mut owner.*,
@@ -90859,8 +91200,6 @@ pub struct TestEntry {
   pub module: Bytes,
   /// The package-relative logical path of the module's file.
   pub path: Bytes,
-  /// `silk-test-v1:` and the SHA-256 of the authored header and body (TEST-005).
-  pub fingerprint: Bytes,
   pub callable: Interned<Type>,
 }
 
@@ -91038,23 +91377,6 @@ effect fn appendFramed(state: &mut Sha256, bytes: &[u8]) -> () ! OutOfMemoryErro
   return ()
 }
 
-// `silk-test-v1:` and the SHA-256 of the framed domain, header encoding and body encoding of the
-// declaration at `id` (TEST-005).
-effect fn testFingerprint(hir: &Module, id: HirId) -> Bytes ! OutOfMemoryError ? &mut Allocator {
-  let mut state = Sha256.make()
-  run appendFramed(&mut state, b"silk:test-fingerprint:v1")
-  let header = run Fingerprint.header(hir, id)
-  run appendFramed(&mut state, List<u8>.asSlice(&header))
-  let body = run Fingerprint.body(hir, id)
-  run appendFramed(&mut state, List<u8>.asSlice(&body))
-  let digest = state.finish()
-  let mut text = List<u8>.make()
-  run Fingerprint.appendHex(&mut text, &digest)
-  let mut fingerprint = run Bytes.copy(b"silk-test-v1:")
-  run Bytes.append(&mut fingerprint, List<u8>.asSlice(&text))
-  return move fingerprint
-}
-
 fn testBefore(left: &TestEntry, right: &TestEntry) -> bool {
   if !same(Bytes.asSlice(&left.module), Bytes.asSlice(&right.module)) { return bytesBefore(Bytes.asSlice(&left.module), Bytes.asSlice(&right.module)) }
   if !same(Bytes.asSlice(&left.name), Bytes.asSlice(&right.name)) { return bytesBefore(Bytes.asSlice(&left.name), Bytes.asSlice(&right.name)) }
@@ -91124,100 +91446,86 @@ effect fn selectedTests(resolver: &mut Resolver, owner: &mut Query<Answer, NoRej
   return run answeredTests(&resolver.*, &answer, module, span)
 }
 
-effect fn copyCatalogIdentity(catalog: &Shared<TestCatalog>) -> Bytes ! OutOfMemoryError ? &mut Allocator {
-  let length = Shared<TestCatalog>.with<usize>(catalog, fn(held: &TestCatalog) -> usize { return Bytes.length(&held.identity) })
-  let mut copied = run Bytes.zeroed(length)
-  let target = Bytes.asMutSlice(&mut copied)
-  let mut at = usize.ZERO
-  while at < length {
-    target[at] = Shared<TestCatalog>.with<u8>(catalog, fn(held: &TestCatalog) -> u8 { return Bytes.asSlice(&held.identity)[at] })
-    at = at + usize.ONE
-  }
-  return move copied
-}
-
-// One catalog entry a descriptor names.
-struct SelectedTest {
-  catalog: Shared<TestCatalog>,
-  ordinal: usize,
-  callable: Interned<Type>,
-}
-
-// A descriptor is honored only for the current catalog: its identity must be this catalog's and
-// its exact callable type the entry's (TEST-004).
-effect fn selectedTestEntry(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>,
-  dependencies: &mut List<Dependency>, descriptor: &Interned<StaticData>, module: &ModuleId, span: Span)
--> Result<SelectedTest, Shared<Rejection>> ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
-  let parts = match move run StaticValue.testDescriptorParts(descriptor) {
-    Option<StaticValue.TestDescriptorParts>.Some {value} => move value
-    Option<StaticValue.TestDescriptorParts>.None => {
-      return Result<SelectedTest, Shared<Rejection>>.failResult(run reject(&resolver.*, module, RejectionCode.StaticPhaseViolation, span))
-    }
-  }
-  let catalog = match move run selectedTests(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, span) {
-    Result<Shared<TestCatalog>, Shared<Rejection>>.Success {value} => move value
-    Result<Shared<TestCatalog>, Shared<Rejection>>.Failure {error} => { return Result<SelectedTest, Shared<Rejection>>.failResult(move error) }
-  }
-  let current = Shared<TestCatalog>.with<bool>(&catalog, fn(held: &TestCatalog) -> bool {
-    return same(Bytes.asSlice(&held.identity), Bytes.asSlice(&parts.catalog)) && parts.ordinal < List<TestEntry>.length(&held.entries)
-  })
-  if !current {
-    return Result<SelectedTest, Shared<Rejection>>.failResult(run reject(&resolver.*, module, RejectionCode.StaticPhaseViolation, span))
-  }
-  let callable = Shared<TestCatalog>.with<Interned<Type>>(&catalog, fn(held: &TestCatalog) -> Interned<Type> {
-    let entries = List<TestEntry>.asSlice(&held.entries)
-    return Interned<Type>.clone(&entries[parts.ordinal].callable)
-  })
-  if !run Type.equalsShared(&callable, &parts.callable) {
-    return Result<SelectedTest, Shared<Rejection>>.failResult(run reject(&resolver.*, module, RejectionCode.StaticPhaseViolation, span))
-  }
-  return Result<SelectedTest, Shared<Rejection>>.succeed(SelectedTest {catalog: move catalog, ordinal: parts.ordinal, callable: move callable})
-}
-
-// A copy of text field `field` of catalog entry `ordinal`, numbered as in `testInfoText`.
-effect fn entryText(catalog: &Shared<TestCatalog>, ordinal: usize, field: usize) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+// A copy of the identity of catalog entry `ordinal`.
+effect fn entryIdentity(catalog: &Shared<TestCatalog>, ordinal: usize) -> Bytes ! OutOfMemoryError ? &mut Allocator {
   let length = Shared<TestCatalog>.with<usize>(catalog, fn(held: &TestCatalog) -> usize {
-    let entries = List<TestEntry>.asSlice(&held.entries)
-    return Bytes.length(testInfoText(&entries[ordinal], field))
+    return Bytes.length(&List<TestEntry>.asSlice(&held.entries)[ordinal].identity)
   })
   let mut copied = run Bytes.zeroed(length)
   let target = Bytes.asMutSlice(&mut copied)
   let mut at = usize.ZERO
   while at < length {
     target[at] = Shared<TestCatalog>.with<u8>(catalog, fn(held: &TestCatalog) -> u8 {
-      let entries = List<TestEntry>.asSlice(&held.entries)
-      let text = Bytes.asSlice(testInfoText(&entries[ordinal], field))
-      return text[at]
+      return Bytes.asSlice(&List<TestEntry>.asSlice(&held.entries)[ordinal].identity)[at]
     })
     at = at + usize.ONE
   }
   return move copied
 }
 
-// The five text fields of one entry's `TestInfo`, in field order.
-effect fn testInfoTexts(selected: &SelectedTest) -> List<Bytes> ! OutOfMemoryError ? &mut Allocator {
-  let mut texts = List<Bytes>.make()
-  let mut field = usize.ZERO
-  while field < CheckedIntrinsic.testInfoFieldCount() {
-    run List<Bytes>.append(&mut texts, run entryText(&selected.catalog, selected.ordinal, field))
-    field = field + usize.ONE
-  }
-  return move texts
+// The test a genuine descriptor names: the declaration its exact callable type applies, and that
+// type. A descriptor names its test by declaration, not by catalog position, so reading it
+// depends on no catalog: adding, removing or editing another test leaves it alone (TEST-004).
+struct DescribedTest {
+  declaration: DeclarationId,
+  callable: Interned<Type>,
 }
 
-fn testInfoText(entry: &TestEntry, field: usize) -> &Bytes {
-  if field == usize.ZERO { return &entry.identity }
-  if field == usize.ONE { return &entry.name }
-  if field == 2 { return &entry.module }
-  if field == 3 { return &entry.path }
-  return &entry.fingerprint
+fn appliedDeclaration(value: &Type) -> Option<DeclarationId> {
+  return match &value.* {
+    Type.CallableValue {application, ..} => Option<DeclarationId>.some(
+      Interned<Application>.with<DeclarationId>(&application, fn(held: &Application) -> DeclarationId {
+        return DeclarationId.copy(Application.bodyDeclaration(held))
+      }))
+    _ => Option<DeclarationId>.none()
+  }
+}
+
+// Source cannot construct a sealed descriptor, and only the catalog mints one, so a genuine
+// descriptor's callable names a discovered test of the current revision (TEST-004).
+effect fn describedTest(resolver: &Resolver, descriptor: &Interned<StaticData>, module: &ModuleId, span: Span)
+-> Result<DescribedTest, Shared<Rejection>> ! OutOfMemoryError ? &mut Allocator {
+  let callable = match move StaticValue.testDescriptorCallable(descriptor) {
+    Option<Interned<Type>>.Some {value} => move value
+    Option<Interned<Type>>.None => {
+      return Result<DescribedTest, Shared<Rejection>>.failResult(run reject(resolver, module, RejectionCode.StaticPhaseViolation, span))
+    }
+  }
+  let declaration = match move Interned<Type>.with<Option<DeclarationId>>(&callable, appliedDeclaration) {
+    Option<DeclarationId>.Some {value} => move value
+    Option<DeclarationId>.None => {
+      return Result<DescribedTest, Shared<Rejection>>.failResult(run reject(resolver, module, RejectionCode.StaticPhaseViolation, span))
+    }
+  }
+  return Result<DescribedTest, Shared<Rejection>>.succeed(DescribedTest {declaration: move declaration, callable: move callable})
+}
+
+// The four text fields of the `TestInfo` of the test `declaration`, in field order: its identity,
+// name, module and package-relative path. They follow from the declaration and the discovery
+// directory alone.
+effect fn testInfoTexts(resolver: &Resolver, declaration: &DeclarationId) -> List<Bytes> ! OutOfMemoryError ? &mut Allocator {
+  let module = DeclarationId.moduleId(declaration)
+  let moduleText = run moduleName(module)
+  let mut path = Bytes.make()
+  if let Option<Discovery>.Some {value} = &resolver.discovery {
+    if Bytes.length(&value.directory) > usize.ZERO {
+      run Bytes.append(&mut path, Bytes.asSlice(&value.directory))
+      run Bytes.append(&mut path, b"/")
+    }
+  }
+  run ModuleId.appendPath(module, &mut path)
+  let mut texts = List<Bytes>.make()
+  run List<Bytes>.append(&mut texts, run testIdentity(Bytes.asSlice(&moduleText), declaration))
+  run List<Bytes>.append(&mut texts, run DeclarationId.copySpelling(declaration))
+  run List<Bytes>.append(&mut texts, move moduleText)
+  run List<Bytes>.append(&mut texts, move path)
+  return move texts
 }
 
 // One written `test` declaration found while scanning a project module.
 struct WrittenTest {
   ordinal: usize,
   isPublic: bool,
-  fingerprint: Bytes,
 }
 
 // The project modules reached from the root through active imports, each once, contribute every
@@ -91229,10 +91537,6 @@ effect fn resolveTests(
   key: Key,
 ) -> Answer ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
   let root = resolvedModule(&resolver.*, key.module)
-  let mut directory = Bytes.make()
-  if let Option<Discovery>.Some {value} = &resolver.discovery {
-    directory = run Bytes.copy(Bytes.asSlice(&value.directory))
-  }
   let span = Span.make(usize.ZERO, usize.ZERO)
   let mut dependencies = List<Dependency>.make()
   let mut pending = List<ModuleId>.make()
@@ -91261,7 +91565,9 @@ effect fn resolveTests(
     let moduleOrdinal = run internModule(&mut resolver.*, &module)
     let mut imports = List<usize>.make()
     let mut tests = List<WrittenTest>.make()
-    let sourceAnswer = run source(&mut resolver.*, &module)
+    // Discovery reads which imports and tests the module declares, never their bodies, so editing
+    // a test's body or any other declaration leaves the catalog alone.
+    let sourceAnswer = run observedSource(&mut resolver.*, &module, SourceSelector.Tests)
     if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&resolver.*, &sourceAnswer, &module) {
       let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
       let hir = IndexedSource.authored(indexed)
@@ -91271,10 +91577,7 @@ effect fn resolveTests(
           run List<usize>.append(&mut imports, at)
         } else if let Node.FunctionHeader {contract, isPublic, ..} = Module.node(hir, declarations[at].header) {
           if let Option<HirContract>.Some {value: HirContract {isTest, ..}} = Module.contractOf(hir, contract) {
-            if isTest {
-              run List<WrittenTest>.append(&mut tests, WrittenTest {ordinal: at, isPublic: isPublic,
-                fingerprint: run testFingerprint(hir, declarations[at].local)})
-            }
+            if isTest { run List<WrittenTest>.append(&mut tests, WrittenTest {ordinal: at, isPublic: isPublic}) }
           }
         }
         at = at + usize.ONE
@@ -91312,10 +91615,6 @@ effect fn resolveTests(
       importAt = importAt + usize.ONE
     }
     if !toolchainModule(&module) {
-      let moduleText = run moduleName(&module)
-      let mut path = run Bytes.copy(Bytes.asSlice(&directory))
-      if Bytes.length(&directory) > usize.ZERO { run Bytes.append(&mut path, b"/") }
-      run ModuleId.appendPath(&module, &mut path)
       let mut written = move tests
       while List<WrittenTest>.length(&written) > usize.ZERO {
         let test = List<WrittenTest>.remove(&mut written, usize.ZERO)
@@ -91345,12 +91644,14 @@ effect fn resolveTests(
             Result<Interned<Type>, Shared<Rejection>>.Success {value} => move value
             Result<Interned<Type>, Shared<Rejection>>.Failure {error} => { return run memberRejected(move error, move dependencies) }
           }
-          let identity = run testIdentity(Bytes.asSlice(&moduleText), &declaration)
-          let name = run DeclarationId.copySpelling(&declaration)
+          let mut texts = run testInfoTexts(&resolver.*, &declaration)
+          let identity = List<Bytes>.remove(&mut texts, usize.ZERO)
+          let name = List<Bytes>.remove(&mut texts, usize.ZERO)
+          let moduleText = List<Bytes>.remove(&mut texts, usize.ZERO)
+          let path = List<Bytes>.remove(&mut texts, usize.ZERO)
           run List<TestEntry>.append(&mut entries, TestEntry {
             name: move name, declaration: run Types.internDeclaration(move declaration), identity: move identity,
-            module: run Bytes.copy(Bytes.asSlice(&moduleText)), path: run Bytes.copy(Bytes.asSlice(&path)),
-            fingerprint: move test.fingerprint, callable: move callable,
+            module: move moduleText, path: move path, callable: move callable,
           })
         }
       }
@@ -91369,7 +91670,7 @@ effect fn resolveTests(
     run List<TestEntry>.append(&mut ordered, List<TestEntry>.remove(&mut entries, first))
   }
   let mut state = Sha256.make()
-  run appendFramed(&mut state, b"silk:test-catalog:v1")
+  run appendFramed(&mut state, b"silk:test-catalog:v2")
   let rootPath = run ModuleId.copyPath(&root)
   run appendFramed(&mut state, Bytes.asSlice(&rootPath))
   let catalogued = List<TestEntry>.asSlice(&ordered)
@@ -91377,13 +91678,12 @@ effect fn resolveTests(
   while at < catalogued.length {
     run appendFramed(&mut state, Bytes.asSlice(&catalogued[at].identity))
     run appendFramed(&mut state, Bytes.asSlice(&catalogued[at].path))
-    run appendFramed(&mut state, Bytes.asSlice(&catalogued[at].fingerprint))
     at = at + usize.ONE
   }
   let digest = state.finish()
   let mut hex = List<u8>.make()
   run Fingerprint.appendHex(&mut hex, &digest)
-  let mut identity = run Bytes.copy(b"silk-test-catalog-v1:")
+  let mut identity = run Bytes.copy(b"silk-test-catalog-v2:")
   run Bytes.append(&mut identity, List<u8>.asSlice(&hex))
   return memberSuccess(Value.Tests {catalog: run Shared<TestCatalog>.make(TestCatalog {identity: move identity, digest: digest, entries: move ordered})},
     move dependencies)
@@ -93708,8 +94008,7 @@ impl<'source> StaticPort<'source> {
         let entries = List<TestEntry>.asSlice(&held.entries)
         return Interned<Type>.clone(&entries[at].callable)
       })
-      let identity = run copyCatalogIdentity(&catalog)
-      let descriptor = match move run StaticValue.testDescriptor(run CheckedIntrinsic.testType(&callable), move identity, at) {
+      let descriptor = match move StaticValue.testDescriptor(run CheckedIntrinsic.testType(&callable)) {
         Option<StaticData>.Some {value} => move value
         Option<StaticData>.None => { return Result<StaticData, Shared<Rejection>>.failResult(run reject(&self.resolver.*, module, RejectionCode.StaticPhaseViolation, span)) }
       }
@@ -93721,15 +94020,15 @@ impl<'source> StaticPort<'source> {
       Option<StaticData>.None => Result<StaticData, Shared<Rejection>>.failResult(run reject(&self.resolver.*, module, RejectionCode.StaticPhaseViolation, span))
     }
   }
-  /// One descriptor's `Intrinsic.TestInfo`, authenticated against the current catalog (TEST-004).
+  /// One descriptor's `Intrinsic.TestInfo` (TEST-004). It follows from the test's declaration, so
+  /// reading it depends on no other test.
   pub effect fn testInfo(self: &mut Self, descriptor: &Interned<StaticData>, module: &ModuleId, span: Span) -> Result<StaticData, Shared<Rejection>>
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
-    let selected = run selectedTestEntry(&mut self.resolver.*, &mut self.query.*, &mut self.dependencies.*, descriptor, module, span)
-    let entry = match move selected {
-      Result<SelectedTest, Shared<Rejection>>.Success {value} => move value
-      Result<SelectedTest, Shared<Rejection>>.Failure {error} => { return Result<StaticData, Shared<Rejection>>.failResult(move error) }
+    let entry = match move run describedTest(&self.resolver.*, descriptor, module, span) {
+      Result<DescribedTest, Shared<Rejection>>.Success {value} => move value
+      Result<DescribedTest, Shared<Rejection>>.Failure {error} => { return Result<StaticData, Shared<Rejection>>.failResult(move error) }
     }
-    let texts = run testInfoTexts(&entry)
+    let texts = run testInfoTexts(&self.resolver.*, &entry.declaration)
     return match move run StaticValue.testInfo(run CheckedIntrinsic.testInfoType(), move texts) {
       Option<StaticData>.Some {value} => Result<StaticData, Shared<Rejection>>.succeed(move value)
       Option<StaticData>.None => Result<StaticData, Shared<Rejection>>.failResult(run reject(&self.resolver.*, module, RejectionCode.StaticPhaseViolation, span))
@@ -94510,12 +94809,14 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
       llvmValues: List<InstanceDefinition>.make(),
       codegenUnits: false,
       fastPathIr: false,
+      coverage: false,
       inlining: false,
       direct: false,
       threads: false,
       directSize: false,
       lineTables: false,
       packing: false,
+      declarationOrigins: Origins.make(),
       offeredBodies: List<BuildRecord.PackBody>.make(),
       packs: List<HeldPack>.make(),
       modules: List<ModuleId>.make(),
@@ -94748,7 +95049,7 @@ impl Semantic {
     let mut identities = List<Bytes>.make()
     let mut ordinal = usize.ZERO
     while ordinal < count {
-      run List<Bytes>.append(&mut identities, run entryText(catalog, ordinal, usize.ZERO))
+      run List<Bytes>.append(&mut identities, run entryIdentity(catalog, ordinal))
       ordinal = ordinal + usize.ONE
     }
     return move identities
@@ -95656,6 +95957,31 @@ impl Semantic {
   pub effect fn escapeRoots(image: &CacheImage.Image) -> List<usize> ! OutOfMemoryError ? &mut Allocator {
     return run rootsOfKinds(image, false)
   }
+  /// The roots of `image` a build replays from: its build record, the definitions and packs it
+  /// names, and the inline summaries.
+  pub effect fn buildRoots(image: &CacheImage.Image) -> List<usize> ! OutOfMemoryError ? &mut Allocator {
+    let roots = List<CacheImage.Root>.asSlice(&image.roots)
+    let mut kept = List<usize>.make()
+    let mut at = usize.ZERO
+    while at < roots.length {
+      let mut exact = Span.make(usize.ZERO, usize.ZERO)
+      let kind = buildRootKind(Bytes.asSlice(&roots[at].key), &mut exact)
+      if kind == 1 || kind == 2 || kind == 5 || kind == 6 { run List<usize>.append(&mut kept, at) }
+      at = at + usize.ONE
+    }
+    return move kept
+  }
+  /// Whether `image` holds a build record.
+  pub fn holdsBuildRecord(image: &CacheImage.Image) -> bool {
+    let roots = List<CacheImage.Root>.asSlice(&image.roots)
+    let mut at = usize.ZERO
+    while at < roots.length {
+      let mut exact = Span.make(usize.ZERO, usize.ZERO)
+      if buildRootKind(Bytes.asSlice(&roots[at].key), &mut exact) == 1 { return true }
+      at = at + usize.ONE
+    }
+    return false
+  }
   /// The image of this store's module checks for a cache on disk: each current module sweep and
   /// escape check, as a root, with every unit and source read it rests on and the rejections it
   /// reports, which also rest on the files their spans point into. A check that left a gap or an
@@ -95782,13 +96108,20 @@ impl Semantic {
         if mirNode >= unfit() { continue }
         let mut node = usize.MAX
         let mut answer = Bytes.make()
+        let mut edges = List<usize>.make()
+        run List<usize>.append(&mut edges, CacheImage.nodeEdge(mirNode))
+        // A suspendable instance of a frame walk rests on its frame variant's MIR, which it was
+        // emitted from, beside the MIR outside any frame its frame facts were read from.
+        if entry.frameUnit != usize.MAX {
+          let frameNode = run imageUnit(&self.resolver, &mut build, entry.frameUnit)
+          if frameNode >= unfit() { continue }
+          run List<usize>.append(&mut edges, CacheImage.nodeEdge(frameNode))
+        }
         if entry.value == usize.MAX {
-          node = run CacheImage.addNode(&mut build.image, &[CacheImage.nodeEdge(mirNode)])
+          node = run CacheImage.addNode(&mut build.image, List<usize>.asSlice(&edges))
         } else {
           // A definition also rests on every layout its text was emitted against, which its MIR
           // need not read: a generic body indexes or views its element at the element's stride.
-          let mut edges = List<usize>.make()
-          run List<usize>.append(&mut edges, CacheImage.nodeEdge(mirNode))
           if !run emittedLayoutEdges(&self.resolver, &mut build, entry.emissionUnit, &mut edges) { continue }
           node = run CacheImage.addNode(&mut build.image, List<usize>.asSlice(&edges))
           let values = List<InstanceDefinition>.asSlice(&self.resolver.llvmValues)
@@ -96136,6 +96469,12 @@ impl Semantic {
     let records = List<EscapeRecordRoot>.asSlice(&self.escapeImage.records)
     at = usize.ZERO
     while at < records.length {
+      // A sibling program's record of a module this store holds no source of (`siblingModule`) is not
+      // this program's: the walk that started from it wrote its own.
+      if !run Semantic.recordLoaded(&self.*, &records[at]) {
+        at = at + usize.ONE
+        continue
+      }
       run List<usize>.append(&mut carried, records[at].root)
       let recorded = run adoptedAnswer(&self.heldImage, records[at].root)
       if let Option<BuildRecord.Record>.Some {value: record} = move run BuildRecord.decode(Bytes.asSlice(&recorded)) {
@@ -96392,6 +96731,15 @@ impl Semantic {
     self.resolver.fastPathIr = unoptimized
   }
 
+  /// Selects whether each emitted function records that it ran, for a test runner build: its
+  /// entry sets the flag of its own record in the table of executed functions, which holds its
+  /// content digest (`LlvmCode.seenRecord`). A build that records no content digests, such as a
+  /// one-shot build, gives every record a zero digest. The content digest covers the choice, so
+  /// code emitted under one choice is never adopted under the other.
+  pub fn selectCoverage(self: &mut Self, coverage: bool) -> () {
+    self.resolver.coverage = coverage
+  }
+
   /// Selects whether instances lower to wasm fragments for the direct backend (`WasmLower`)
   /// instead of LLVM text, whether that module's memory is shared between threads (`threads`),
   /// and whether a build that is not unoptimized (`selectFastPathIr`) optimizes them for size
@@ -96405,17 +96753,61 @@ impl Semantic {
 
   /// Selects whether lowered functions carry the line and column of each position their location
   /// markers name (`MirFunction.lines`), which a debug build's line tables are made from. Only
-  /// such a build pays for them, and only its functions change content when a line moves.
+  /// such a build pays for them. A function's lines are counted from its declaration's first
+  /// token, so its content changes when a line inside the declaration moves and not when the
+  /// declaration does; the assembled plan says where each declaration starts
+  /// (`EmissionPlan.identityOrigin`).
   pub fn selectLineTables(self: &mut Self, lines: bool) -> () {
     self.resolver.lineTables = lines
+  }
+
+  /// Offers the declaration origins a cache kept from an earlier build (`takeOrigins`), before a
+  /// build with line tables. A module whose bytes read as they did then is asked about without
+  /// being parsed. Bytes that are not origins offer nothing.
+  pub effect fn offerOrigins(self: &mut Self, bytes: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    self.resolver.declarationOrigins = run Origins.decode(bytes)
+    return ()
+  }
+
+  /// The declaration origins for a cache to keep, when a build made or replaced a module's since
+  /// `offerOrigins`; none when what the cache holds still reads the same.
+  pub effect fn takeOrigins(self: &Self) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+    if !Origins.changed(&self.resolver.declarationOrigins) { return Option<Bytes>.none() }
+    return Option<Bytes>.some(run Origins.encode(&self.resolver.declarationOrigins))
   }
 
   /// Offers the pack bodies a cache keeps beside its image, before `adoptCache` reads the image,
   /// and has each assembled module split into packs (`BackendBuild.Module.units`) for the cache to
   /// store. A replay takes the text of a definition the image holds from its pack.
+  /// Says that the build record of the image adopted last is another program's: the build of a
+  /// sibling package that loads many of the packages this one does. A build then walks from that
+  /// record instead of replaying it, taking each definition the record holds that this program
+  /// reaches too and lowering the rest (`rewalkBuild`).
+  pub fn borrowBuildRecord(self: &mut Self) -> () {
+    if let Option<ReplayState>.Some {value: state} = &mut self.replay { state.borrowed = true }
+  }
+
   pub fn offerPacks(self: &mut Self, bodies: List<BuildRecord.PackBody>) -> () {
     self.resolver.offeredBodies = move bodies
     self.resolver.packing = true
+  }
+
+  /// The body of the pack named `digest` among those `offerPacks` gave, as a build that left a unit
+  /// `stored` holds it; none when the store holds no such body.
+  pub fn packBody(self: &Self, digest: ContentHash) -> Option<&[u8]> {
+    let offered = List<BuildRecord.PackBody>.asSlice(&self.resolver.offeredBodies)
+    let mut at = usize.ZERO
+    while at < offered.length {
+      if ContentHash.equals(offered[at].digest, digest) { return Option<&[u8]>.some(Bytes.asSlice(&offered[at].bytes)) }
+      at = at + usize.ONE
+    }
+    let held = List<HeldPack>.asSlice(&self.resolver.packs)
+    at = usize.ZERO
+    while at < held.length {
+      if ContentHash.equals(held[at].pack.digest, digest) { return Option<&[u8]>.some(Bytes.asSlice(&held[at].body)) }
+      at = at + usize.ONE
+    }
+    return Option<&[u8]>.none()
   }
 
   /// Takes back every pack body `offerPacks` gave, including those of the units a build left
@@ -96678,6 +97070,23 @@ impl Semantic {
     return move sweep
   }
 
+  // Whether this store holds the source of the module the adopted record `record` names.
+  effect fn recordLoaded(self: &Self, record: &EscapeRecordRoot) -> bool ! OutOfMemoryError ? &mut Allocator {
+    let adopted = match &self.heldImage {
+      Option<CacheImage.Image>.Some {value} => &value
+      Option<CacheImage.Image>.None => { return true }
+    }
+    let roots = List<CacheImage.Root>.asSlice(&adopted.roots)
+    let key = StableKey.view(Bytes.asSlice(&roots[record.root].key), record.unit)
+    let mut reader = StableKey.reader()
+    drop StableKey.readWord(key, &mut reader)
+    drop StableKey.readWord(key, &mut reader)
+    return match move run StableKey.readModule(key, &mut reader) {
+      Option<ModuleId>.Some {value} => SourceIndex.presents(&self.resolver.source, &value)
+      Option<ModuleId>.None => true
+    }
+  }
+
   // The escapes of `concrete`, the concrete bodies of `module`, kept for its check. They run again
   // when the bodies differ or the unit neither is current nor verifies. The walk leaves the plain
   // bodies of the other modules `checked` lists, and of the application's package, to their own
@@ -96739,14 +97148,30 @@ impl Semantic {
     // The walk an adopted image recorded for this check is replayed when it still describes the
     // check; a walk run here replaces it either way.
     let mut adopted = Option<EscapeRecordRoot>.none()
+    let mut sibling = usize.MAX
     if let Option<Bytes>.Some {value: stable} = move run stableUnit(&self.resolver, unit) {
       adopted = EscapeImage.take(&mut self.escapeImage, &self.heldImage, Bytes.asSlice(&stable))
+      // A check the image holds no record for, as a program's first, starts from the record a
+      // sibling program's walk of its own module left: the entries that walk lowered are green
+      // here too, so only what this one reaches and that one did not is lowered.
+      if found == usize.MAX {
+        if let Option<EscapeRecordRoot>.None = &adopted {
+          let named = resolvedModule(&self.resolver, module)
+          sibling = run siblingRecord(&self.resolver, &self.escapeImage, &self.heldImage, Bytes.asSlice(&stable), &named)
+        }
+      }
+    }
+    if sibling != usize.MAX {
+      let recorded = run adoptedAnswer(&self.heldImage, sibling)
+      let replayed = run Semantic.replayKept(&mut self.*, &mut request.*, module, member, unit, concrete, &boundary,
+        Bytes.asSlice(&recorded), sibling, &[], usize.MAX, false, true)
+      if let Option<DeclarationCheckResult>.Some {value: result} = move replayed { return move result }
     }
     let mut kept = Option<EscapeRecordRoot>.none()
     if let Option<EscapeRecordRoot>.Some {value: held} = move adopted {
       let recorded = run adoptedAnswer(&self.heldImage, held.root)
       let replayed = run Semantic.replayKept(&mut self.*, &mut request.*, module, member, unit, concrete, &boundary,
-        Bytes.asSlice(&recorded), held.root, &[], usize.MAX, false)
+        Bytes.asSlice(&recorded), held.root, &[], usize.MAX, false, false)
       if let Option<DeclarationCheckResult>.Some {value: result} = move replayed { return move result }
       kept = Option<EscapeRecordRoot>.some(move held)
     } else if let Option<CapturedBuild>.Some {value: last} = move previous {
@@ -96756,7 +97181,7 @@ impl Semantic {
       if last.guard == usize.MAX || run Semantic.unitCurrent(&mut self.*, last.guard) {
         let recorded = run BuildRecord.encode(&last.record)
         let replayed = run Semantic.replayKept(&mut self.*, &mut request.*, module, member, unit, concrete, &boundary,
-          Bytes.asSlice(&recorded), last.carriedRecord, List<CapturedEntry>.asSlice(&last.entries), last.guard, true)
+          Bytes.asSlice(&recorded), last.carriedRecord, List<CapturedEntry>.asSlice(&last.entries), last.guard, true, false)
         if let Option<DeclarationCheckResult>.Some {value: result} = move replayed { return move result }
       }
     }
@@ -96808,7 +97233,7 @@ impl Semantic {
   // or walks it again from the record (`rewalkEscapes`) within `boundary`, and keeps what it found
   // as the check's memo; none when neither can tell what the walk finds.
   effect fn replayKept(self: &mut Self, request: &mut Request, module: usize, member: usize, unit: usize, concrete: &[DeclarationId],
-    boundary: &Option<WalkBoundary>, recorded: &[u8], recordRoot: usize, previous: &[CapturedEntry], guard: usize, inProcess: bool)
+    boundary: &Option<WalkBoundary>, recorded: &[u8], recordRoot: usize, previous: &[CapturedEntry], guard: usize, inProcess: bool, rewalkOnly: bool)
     -> Option<DeclarationCheckResult>
     ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
     ? &mut Allocator | &mut Types {
@@ -96821,7 +97246,7 @@ impl Semantic {
     let recorder = self.resolver.rootRecorder
     self.resolver.rootRecorder = reads
     let attempted = run Effect.result(Semantic.keptReplay(&mut self.*, &mut request.*, concrete, boundary, recorded, recordRoot,
-      previous, guard, inProcess))
+      previous, guard, inProcess, rewalkOnly))
     self.resolver.rootRecorder = recorder
     drop run Graph.finishRun(&mut self.resolver.graph, reads, Option<ContentHash>.none())
     let replayed = match move attempted {
@@ -96839,7 +97264,7 @@ impl Semantic {
 
   // `replayEscapes`, or `rewalkEscapes` when the record no longer describes the walk as it is.
   effect fn keptReplay(self: &mut Self, request: &mut Request, concrete: &[DeclarationId], boundary: &Option<WalkBoundary>, recorded: &[u8],
-    recordRoot: usize, previous: &[CapturedEntry], guard: usize, inProcess: bool) -> Option<EscapeReplay>
+    recordRoot: usize, previous: &[CapturedEntry], guard: usize, inProcess: bool, rewalkOnly: bool) -> Option<EscapeReplay>
     ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
     ? &mut Allocator | &mut Types {
     // Both read the record decoded once; a replay that succeeds takes it.
@@ -96847,9 +97272,12 @@ impl Semantic {
       Option<BuildRecord.Record>.Some {value} => move value
       Option<BuildRecord.Record>.None => { return Option<EscapeReplay>.none() }
     }
-    let replayed = run Semantic.replayEscapes(&mut self.*, &mut request.*, concrete, &mut record, recordRoot, previous, guard, inProcess)
-    if let Option<EscapeReplay>.Some {..} = &replayed { return move replayed }
-    drop replayed
+    // Another check's record describes another walk: it is only ever walked again from.
+    if !rewalkOnly {
+      let replayed = run Semantic.replayEscapes(&mut self.*, &mut request.*, concrete, &mut record, recordRoot, previous, guard, inProcess)
+      if let Option<EscapeReplay>.Some {..} = &replayed { return move replayed }
+      drop replayed
+    }
     if let Option<WalkBoundary>.Some {value: walk} = &boundary.* {
       return run Semantic.rewalkEscapes(&mut self.*, &mut request.*, concrete, &walk, &record, previous, inProcess)
     }
@@ -100062,10 +100490,13 @@ impl Semantic {
       if Graph.recording(&self.resolver.graph) {
         let mut replaying = move state
         run Semantic.settleSummaries(&mut self.*, &mut replaying)
-        if let Option<BackendBuild>.Some {value: replayed} = move run Semantic.replayBuild(&mut self.*, &mut replaying, &module,
-          List<BuildRoot>.asSlice(&roots), origin) {
-          drop emitting
-          return run withUnemittedBodies(move replayed, List<UncheckedDeclaration>.asSlice(&checked.unchecked))
+        // Another program's record names other roots, and its walk decided nothing of this one.
+        if !replaying.borrowed {
+          if let Option<BackendBuild>.Some {value: replayed} = move run Semantic.replayBuild(&mut self.*, &mut replaying, &module,
+            List<BuildRoot>.asSlice(&roots), origin) {
+            drop emitting
+            return run withUnemittedBodies(move replayed, List<UncheckedDeclaration>.asSlice(&checked.unchecked))
+          }
         }
         if let Option<BackendBuild>.Some {value: rewalked} = move run Semantic.rewalkBuild(&mut self.*, move replaying, &module,
           List<BuildRoot>.asSlice(&roots), origin, false) {
@@ -100196,6 +100627,13 @@ impl Semantic {
         }
         // Recovered syntax is reported as a syntax error, never as the spelling recovery invented.
         if !selected || claim.damaged { continue }
+        // A generic export names no symbol to spell, reserve or share; only its signature is judged.
+        if claim.generic {
+          if let Option<Shared<Rejection>>.Some {value: refused} = move run Semantic.claimRefusal(&mut self.*, &module, &claim) {
+            run appendDeclarationRejection(&mut rejections.*, move refused)
+          }
+          continue
+        }
         let mut valid = NativeForeign.validSymbol(Bytes.asSlice(&claim.symbol))
         if same(MachineTarget.objectFormat(&self.resolver.target), b"wasm") { valid = NativeForeign.validWasmName(Bytes.asSlice(&claim.symbol)) }
         // Without a selected runtime the application supplies its own C entry, so only then may it
@@ -100561,9 +100999,11 @@ impl Semantic {
     // `origins` runs beside `pending` and names how each pending visit was reached.
     let mut capture = run BuildCapture.make(observing, roots)
     let mut origins = List<VisitOrigin>.make()
-    // A frame walk selects its variants from the walk before it, which a record does not hold.
-    let mut capturing = Graph.recording(&self.resolver.graph)
-    if let Option<FrameSelection>.Some {..} = &frames.* { capturing = false }
+    let capturing = Graph.recording(&self.resolver.graph)
+    // A frame walk selects its variants from the walk before it. Its record keeps what that
+    // selection read of each suspendable instance (`BuildCapture.framed`), so a replay selects the
+    // same variants without that walk.
+    if let Option<FrameSelection>.Some {..} = &frames.* { capture.frames = true }
     // A growth guard that admits a re-entry reads the owned structure of types, which no MIR
     // reference shows: those reads are recorded against the walk's guard unit, which the record
     // then rests on.
@@ -100895,15 +101335,21 @@ impl Semantic {
         )
         let mut mirIndex = Shared<Result<Answer, NoRejection>>.with<Option<usize>>(&mir, answerMirIndex)
         let mut suspension = Option<CoroutineFacts>.none()
+        // The instance's place in the frame selection, and its MIR outside any frame.
+        let mut framed = usize.MAX
+        let mut unframed = usize.MAX
         if let Option<FrameSelection>.Some {value: selection} = &frames.* {
           if let Option<usize>.Some {value: loweredIndex} = &mirIndex {
-            if run FrameSelection.contains(&selection, &instance) {
+            framed = run FrameSelection.position(&selection, &instance)
+            if framed != usize.MAX {
+              unframed = loweredIndex
               let functions = List<MirFunction>.asSlice(&self.resolver.mirValues)
               suspension = Option<CoroutineFacts>.some(run FrameSelection.facts(&selection, &functions[loweredIndex], functions))
             }
           }
         }
         let backendName = run exactBackendVariant(&mut self.resolver, &instance, observing, &suspension, false)
+        let mut frameUnit = usize.MAX
         // A frame variant's cancel exits can drop owners its other paths move away, so its own MIR
         // names the references to visit.
         if let Option<CoroutineFacts>.Some {..} = &suspension {
@@ -100923,6 +101369,10 @@ impl Semantic {
             Span.make(usize.ZERO, usize.ZERO),
           )
           mirIndex = Shared<Result<Answer, NoRejection>>.with<Option<usize>>(&variant, answerMirIndex)
+          if capturing {
+            let variantWord = run internKey(&mut self.resolver, declarationAccess275)
+            frameUnit = u64.toUsize(variantWord.value)
+          }
         }
         let declarationAccess276Request = Key {
           family: Family.EmissionInputs,
@@ -101001,6 +101451,18 @@ impl Semantic {
         if capturing {
           let mirWord = run internKey(&mut self.resolver, declarationAccess274)
           BuildCapture.lowered(&mut capture, entry, u64.toUsize(mirWord.value))
+          if let Option<FrameSelection>.Some {value: selection} = &frames.* {
+            if framed != usize.MAX {
+              let functions = List<MirFunction>.asSlice(&self.resolver.mirValues)
+              let forwards = List<usize>.get(&selection.bodies, framed) != usize.MAX
+              let selecting = run selectingDigest(&functions[unframed], &instance, forwards, entrySpan)
+              let owner = DeclarationId.copyShared(&InstanceKey.identity(&instance))
+              let ordinary = run SuspensionSummary.make(&functions[unframed], &instance, DeclarationId.moduleId(&owner),
+                &Option<Anchor>.none(), DeclarationId.moduleId(&owner), entrySpan)
+              run BuildCapture.framed(&mut capture, entry, frameUnit, List<usize>.get(&selection.components, framed), forwards, selecting,
+                List<MirReference>.asSlice(&functions[unframed].references), &ordinary)
+            }
+          }
         }
         run recordText(&mut owners, lowered, entry)
         if mayShare && capturing { List<bool>.set(&mut lowerings, entry, true) }
@@ -101179,8 +101641,16 @@ impl Semantic {
         let component = List<usize>.asSlice(&components)
         at = usize.ZERO
         while at < marked.length {
-          if marked[at] { run FrameSelection.include(&mut selection, &reached[at].key, component[at]) }
+          if marked[at] { run FrameSelection.include(&mut selection, run definitionDigest(&reached[at].key), component[at]) }
           at = at + usize.ONE
+        }
+        if capturing {
+          run parkingDefinitions(reached, &mut selection.parking)
+          at = usize.ZERO
+          while at < reached.length {
+            drop run DigestSet.add(&mut selection.reached, run definitionDigest(&reached[at].key))
+            at = at + usize.ONE
+          }
         }
         // Only this walk's MIR is current. The arena can also hold obsolete revisions and the
         // non-observing pass abandoned before this walk selected diagnostic observation.
@@ -101189,38 +101659,28 @@ impl Semantic {
         at = usize.ZERO
         while at < current.length {
           let body = current[at]
-          if self.resolver.inlining && !self.resolver.lineTables && MirInline.eligible(&ordinary[body], self.resolver.direct) {
+          if frameForwards(&self.resolver, &ordinary[body]) {
             let position = run FrameSelection.position(&selection, &ordinary[body].key)
             if position != usize.MAX { List<usize>.set(&mut selection.bodies, position, body) }
           }
-          at = at + usize.ONE
-        }
-        let mut extended = run List<BuildRoot>.makeWithCapacity(roots.length)
-        at = usize.ZERO
-        while at < roots.length {
-          run List<BuildRoot>.append(&mut extended, BuildRoot {key: InstanceKey.copy(&roots[at].key), span: roots[at].span, retained: roots[at].retained})
           at = at + usize.ONE
         }
         let exports = run storageExports(&mut self.resolver, &mut self.query, &storage)
         if List<StorageExport>.length(&exports) != 4 {
           return refusedBuild(run reject(&self.resolver, &reached[origin].module, RejectionCode.InvalidConfiguration, boundary))
         }
-        let selected = List<StorageExport>.asSlice(&exports)
-        at = usize.ZERO
-        while at < selected.length {
-          run FrameSelection.bind(&mut selection, run Bytes.copy(Bytes.asSlice(&selected[at].symbol)))
-          run List<BuildRoot>.append(&mut extended, BuildRoot {key: InstanceKey.copy(&selected[at].key), span: selected[at].span, retained: false})
-          at = at + usize.ONE
-        }
+        let extended = run frameRoots(&mut selection, roots, List<StorageExport>.asSlice(&exports))
         let chosen = Option<FrameSelection>.some(move selection)
         return run Semantic.buildFrom(&mut self.*, module, runtimeSelected, List<BuildRoot>.asSlice(&extended), entrySpan,
           closureNodes, observing, &chosen, &mut unshared())
       }
     }
     let mut packed = PackedBuild.make()
+    let starts = run collectedOrigins(&mut self.resolver, List<CollectedText>.asSlice(&emitted))
     let assembled = run assembleEmission(
       &self.resolver,
       List<CollectedText>.asSlice(&emitted),
+      List<u64>.asSlice(&starts),
       roots,
       module,
       entrySpan,
@@ -101233,6 +101693,18 @@ impl Semantic {
         if capture.guarded {
           drop run Graph.finishRun(&mut self.resolver.graph, guardUnit, Option<ContentHash>.none())
           guard = guardUnit
+        }
+        // A rewalk of a frame walk's record reads which instances either walk found able to park.
+        if let Option<FrameSelection>.Some {value: selection} = &frames.* {
+          let mut parking = DigestSet.make()
+          let found = List<ContentHash>.asSlice(&selection.parking.values)
+          let mut each = usize.ZERO
+          while each < found.length {
+            drop run DigestSet.add(&mut parking, found[each])
+            each = each + usize.ONE
+          }
+          run parkingDefinitions(List<SuspensionSummary>.asSlice(&summaries), &mut parking)
+          BuildCapture.parks(&mut capture, &parking, &selection.reached)
         }
         self.capturedBuild = run BuildCapture.finish(move capture, guard)
         self.freshBuild = true
@@ -101274,7 +101746,7 @@ impl Semantic {
   // the walk needed it yet; a direct edge for a root or a requested target. None when the node's
   // key is not found again.
   effect fn rewalkFollowedEdge(self: &mut Self, entries: &[BuildRecord.Entry], nodes: &[RewalkNode], parent: usize, position: usize, asked: bool,
-    keys: &mut List<Option<InstanceKey>>, mirs: &mut List<usize>, roots: &[BuildRoot], observing: bool, entrySpan: Span) -> Option<Edge>
+    recovered: &mut RewalkKeys, roots: &[BuildRoot], observing: bool, entrySpan: Span) -> Option<Edge>
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
   ? &mut Allocator | &mut Types {
     if parent == usize.MAX || asked { return Option<Edge>.some(Edge.Direct) }
@@ -101290,7 +101762,7 @@ impl Semantic {
       if let Option<InstanceKey>.Some {value} = &nodes[outer].key {
         glue = Option<InstanceKey>.some(InstanceKey.copy(&value))
       } else if nodes[outer].entry != usize.MAX {
-        glue = run Semantic.rewalkKey(&mut self.*, entries, &mut keys.*, &mut mirs.*, roots, nodes[outer].entry, observing, entrySpan)
+        glue = run Semantic.rewalkKey(&mut self.*, entries, &mut recovered.*, roots, nodes[outer].entry, observing, entrySpan)
       }
       if let Option<InstanceKey>.Some {value: known} = move glue {
         if let Option<Interned<Type>>.Some {value: owner} = move InstanceKey.glueType(&known) {
@@ -101304,20 +101776,20 @@ impl Semantic {
     if let Option<InstanceKey>.Some {value} = &node.key {
       found = Option<InstanceKey>.some(InstanceKey.copy(&value))
     } else if node.entry != usize.MAX {
-      found = run Semantic.rewalkKey(&mut self.*, entries, &mut keys.*, &mut mirs.*, roots, node.entry, observing, entrySpan)
+      found = run Semantic.rewalkKey(&mut self.*, entries, &mut recovered.*, roots, node.entry, observing, entrySpan)
     }
     let key = match move found {
       Option<InstanceKey>.Some {value} => move value
       Option<InstanceKey>.None => { return Option<Edge>.none() }
     }
     let mut mir = usize.MAX
-    if node.entry != usize.MAX { mir = List<usize>.get(&mirs.*, node.entry) }
+    if node.entry != usize.MAX { mir = List<usize>.get(&recovered.mirs, node.entry) }
     if mir == usize.MAX {
       mir = match move run Semantic.replayMir(&mut self.*, &key, observing) {
         Option<ReplayMir>.Some {value} => value.mir
         Option<ReplayMir>.None => { return Option<Edge>.none() }
       }
-      if node.entry != usize.MAX { List<usize>.set(&mut mirs.*, node.entry, mir) }
+      if node.entry != usize.MAX { List<usize>.set(&mut recovered.mirs, node.entry, mir) }
     }
     let functions = List<MirFunction>.asSlice(&self.resolver.mirValues)
     let references = List<MirReference>.asSlice(&functions[mir].references)
@@ -101331,8 +101803,8 @@ impl Semantic {
   // (`rewalkFollowedEdge`), so admission decides as the walk of one process does, owned descent included.
   // An edge under drop glue, which that walk follows as a cleanup edge, is refused.
   effect fn rewalkDecideKeyed(self: &mut Self, entries: &[BuildRecord.Entry], nodes: &[RewalkNode], frames: &[RewalkFrame],
-    reached: &Option<InstanceKey>, parent: usize, position: usize, asked: bool, keys: &mut List<Option<InstanceKey>>,
-    mirs: &mut List<usize>, roots: &[BuildRoot], observing: bool, entrySpan: Span) -> u64
+    reached: &Option<InstanceKey>, parent: usize, position: usize, asked: bool, recovered: &mut RewalkKeys, roots: &[BuildRoot],
+    observing: bool, entrySpan: Span) -> u64
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
   ? &mut Allocator | &mut Types {
     let key = match &reached.* {
@@ -101354,7 +101826,7 @@ impl Semantic {
       if let Option<InstanceKey>.Some {value} = &node.key {
         found = Option<InstanceKey>.some(InstanceKey.copy(&value))
       } else if node.entry != usize.MAX {
-        found = run Semantic.rewalkKey(&mut self.*, entries, &mut keys.*, &mut mirs.*, roots, node.entry, observing, entrySpan)
+        found = run Semantic.rewalkKey(&mut self.*, entries, &mut recovered.*, roots, node.entry, observing, entrySpan)
       }
       let framed = match move found {
         Option<InstanceKey>.Some {value} => move value
@@ -101363,7 +101835,7 @@ impl Semantic {
         }
       }
       let followed = match move run Semantic.rewalkFollowedEdge(&mut self.*, entries, nodes, node.parent, node.position, node.requested,
-        &mut keys.*, &mut mirs.*, roots, observing, entrySpan) {
+        &mut recovered.*, roots, observing, entrySpan) {
         Option<Edge>.Some {value} => move value
         Option<Edge>.None => {
           return REWALK_REFUSED
@@ -101372,7 +101844,7 @@ impl Semantic {
       run Admission.enterChain(&mut admission, &run InstanceKey.selected(&framed), move followed)
       at = at + usize.ONE
     }
-    let edge = match move run Semantic.rewalkFollowedEdge(&mut self.*, entries, nodes, parent, position, asked, &mut keys.*, &mut mirs.*, roots,
+    let edge = match move run Semantic.rewalkFollowedEdge(&mut self.*, entries, nodes, parent, position, asked, &mut recovered.*, roots,
       observing, entrySpan) {
       Option<Edge>.Some {value} => move value
       Option<Edge>.None => {
@@ -101414,7 +101886,7 @@ impl Semantic {
         let summary = List<usize>.get(&state.waitedOn, each)
         if List<u8>.get(&verdicts, summary) == 0 {
           let mut verdict: u8 = 2
-          if run Semantic.summaryAgrees(&mut self.*, &List<SummaryRoot>.asSlice(&state.summaries)[summary]) { verdict = 1 }
+          if run Semantic.summaryAgrees(&mut self.*, &List<SummaryRoot>.asSlice(&state.summaries)[summary], state.borrowed) { verdict = 1 }
           List<u8>.set(&mut verdicts, summary, verdict)
         }
         agrees = List<u8>.get(&verdicts, summary) == 1
@@ -101427,8 +101899,9 @@ impl Semantic {
 
   // Whether the inline summary `summary` names answers as it did when its root was written: the
   // key its identity names is made again from its declaration (`recordedKey`), and the summary of
-  // that key's un-inlined MIR, outside any frame, fingerprints as the root records.
-  effect fn summaryAgrees(self: &mut Self, summary: &SummaryRoot) -> bool
+  // that key's un-inlined MIR, outside any frame, fingerprints as the root records. A summary of
+  // another program's record (`borrowed`) that names a module this build does not load does not.
+  effect fn summaryAgrees(self: &mut Self, summary: &SummaryRoot, borrowed: bool) -> bool
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
   ? &mut Allocator | &mut Types {
     let identity = Bytes.asSlice(&summary.identity)
@@ -101445,6 +101918,14 @@ impl Semantic {
       Option<InstanceKey>.None => { return false }
     }
     if !ContentHash.equals(run instanceDigest(&instance), ContentHash {high: high, low: low}) { return false }
+    // Another program's image names summaries of its own modules, which this build does not load:
+    // a demand of one would read outside the build's preloaded import graph.
+    if borrowed {
+      if let Option<Interned<Type>>.None = move InstanceKey.glueType(&instance) {
+        let owner = DeclarationId.copyShared(&InstanceKey.identity(&instance))
+        if !SourceIndex.presents(&self.resolver.source, DeclarationId.moduleId(&owner)) { return false }
+      }
+    }
     let location = match move run locationOfInstance(&mut self.resolver, &instance) {
       Option<InstanceLocation>.Some {value} => value
       Option<InstanceLocation>.None => { return false }
@@ -101467,9 +101948,13 @@ impl Semantic {
   // Every other definition is taken from the image. Gives none when anything differs, and the
   // build walks the program instead.
   //
+  // A frame walk's record (`BuildRecord.Record.frames`) replays over the frame selection its
+  // entries name (`replayFrames`): a framed entry is lowered and followed through its frame
+  // variant, once its MIR outside any frame reads to the selection as it did (`replayFrame`).
+  //
   // A replay that gives none before it takes any definition leaves `state` as it was, so the build
   // can still be walked again from it (`rewalkBuild`).
-  effect fn replayBuild(self: &mut Self, state: &mut ReplayState, module: &ModuleId, roots: &[BuildRoot], entrySpan: Span)
+  effect fn replayBuild(self: &mut Self, state: &mut ReplayState, module: &ModuleId, rooted: &[BuildRoot], entrySpan: Span)
     -> Option<BackendBuild>
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
   ? &mut Allocator | &mut Types {
@@ -101481,6 +101966,20 @@ impl Semantic {
     // A build emits one definition per region pattern, so only a record that names patterns apart
     // describes this build; every digest below is an exact one.
     if !record.patterns { return Option<BackendBuild>.none() }
+    // A frame walk's record selects the frames its walk selected and roots the storage exports
+    // that walk rooted (`replayFrames`).
+    let mut selection = FrameSelection.make()
+    let mut forwards = List<bool>.make()
+    let mut framing = List<BuildRoot>.make()
+    let mut roots = rooted
+    if record.frames {
+      framing = match move run Semantic.replayFrames(&mut self.*, List<BuildRecord.Entry>.asSlice(&record.entries), rooted, &mut selection,
+        &mut forwards) {
+        Option<List<BuildRoot>>.Some {value} => move value
+        Option<List<BuildRoot>>.None => { return Option<BackendBuild>.none() }
+      }
+      roots = List<BuildRoot>.asSlice(&framing)
+    }
     let recordedRoots = List<ContentHash>.asSlice(&record.roots)
     if recordedRoots.length != roots.length { return Option<BackendBuild>.none() }
     let mut at = usize.ZERO
@@ -101500,7 +101999,7 @@ impl Semantic {
       run List<bool>.append(&mut needed, false)
       run List<usize>.append(&mut mirs, usize.MAX)
       run List<Option<InstanceKey>>.append(&mut keys, Option<InstanceKey>.none())
-      run List<CapturedEntry>.append(&mut rested, CapturedEntry {value: usize.MAX, mirUnit: usize.MAX, emissionUnit: usize.MAX,
+      run List<CapturedEntry>.append(&mut rested, CapturedEntry {value: usize.MAX, mirUnit: usize.MAX, emissionUnit: usize.MAX, frameUnit: usize.MAX,
         carried: usize.MAX})
       at = at + usize.ONE
     }
@@ -101561,13 +102060,25 @@ impl Semantic {
       }
       let exact = run instanceDigest(&instance)
       if !ContentHash.equals(exact, entry.exact) || entry.alias != usize.MAX { return Option<BackendBuild>.none() }
-      let lowered = match move run Semantic.replayMir(&mut self.*, &instance, record.observing) {
+      let mut lowered = match move run Semantic.replayMir(&mut self.*, &instance, record.observing) {
         Option<ReplayMir>.Some {value} => value
         Option<ReplayMir>.None => { return Option<BackendBuild>.none() }
       }
+      // A suspendable instance is followed and emitted through its frame variant, as the frame
+      // walk did, once the selection read of its MIR outside any frame what it read then.
+      let mut suspension = Option<CoroutineFacts>.none()
+      if u64.bitAnd(entry.facts.flags, BuildRecord.FACT_FRAMED) != 0 {
+        let framed = match move run Semantic.replayFrame(&mut self.*, &instance, lowered, record.observing, &entry.facts,
+          !List<bool>.get(usable, index), &mut selection, List<bool>.asSlice(&forwards), entrySpan) {
+          Option<ReplayFrame>.Some {value} => move value
+          Option<ReplayFrame>.None => { return Option<BackendBuild>.none() }
+        }
+        lowered = framed.lowered
+        suspension = Option<CoroutineFacts>.some(move framed.facts)
+      }
       List<usize>.set(&mut mirs, index, lowered.mir)
       if !List<bool>.get(usable, index) {
-        let text = match move run Semantic.replayText(&mut self.*, &instance, lowered, record.observing) {
+        let text = match move run Semantic.replayText(&mut self.*, &instance, lowered, record.observing, &suspension) {
           Option<CapturedEntry>.Some {value} => value
           Option<CapturedEntry>.None => { return Option<BackendBuild>.none() }
         }
@@ -101601,7 +102112,7 @@ impl Semantic {
           run List<InstanceDefinition>.append(&mut self.resolver.llvmValues, move definition)
           place = placed[index]
         }
-        List<CapturedEntry>.set(&mut rested, index, CapturedEntry {value: value, mirUnit: usize.MAX, emissionUnit: usize.MAX,
+        List<CapturedEntry>.set(&mut rested, index, CapturedEntry {value: value, mirUnit: usize.MAX, emissionUnit: usize.MAX, frameUnit: usize.MAX,
           carried: List<usize>.get(definitionRoots, index)})
       } else {
         value = List<CapturedEntry>.asSlice(&rested)[index].value
@@ -101631,12 +102142,14 @@ impl Semantic {
     at = usize.ZERO
     while at < entries.length {
       if entries[at].alias != usize.MAX {
-        List<CapturedEntry>.set(&mut rested, at, CapturedEntry {value: usize.MAX, mirUnit: usize.MAX, emissionUnit: usize.MAX, carried: usize.MAX})
+        List<CapturedEntry>.set(&mut rested, at, CapturedEntry {value: usize.MAX, mirUnit: usize.MAX, emissionUnit: usize.MAX, frameUnit: usize.MAX, carried: usize.MAX})
       }
       at = at + usize.ONE
     }
     let mut packed = PackedBuild.make()
-    let assembled = run assembleEmission(&self.resolver, List<CollectedText>.asSlice(&emitted), roots, module, entrySpan, &mut packed)
+    let starts = run collectedOrigins(&mut self.resolver, List<CollectedText>.asSlice(&emitted))
+    let assembled = run assembleEmission(&self.resolver, List<CollectedText>.asSlice(&emitted), List<u64>.asSlice(&starts), roots, module, entrySpan,
+      &mut packed)
     self.packedBuild = move packed
     if let BackendBuild.Module {..} = &assembled {
       self.capturedBuild = Option<CapturedBuild>.some(CapturedBuild {record: Intrinsic.replace(state.record, BuildRecord.make(false, false)),
@@ -101645,6 +102158,102 @@ impl Semantic {
       return Option<BackendBuild>.some(move assembled)
     }
     return Option<BackendBuild>.none()
+  }
+
+  // Makes `selection` the frame selection of the walk that wrote a frame walk's record `entries`:
+  // every framed entry's instance, in its recorded cycle, with the symbols of the execution
+  // storage's exports. `forwards` says, per member, whether a caller's frame may run its body.
+  // Gives the walk's roots, `roots` and then those exports; none when the program no longer
+  // selects an execution storage with its four exports.
+  effect fn replayFrames(self: &mut Self, entries: &[BuildRecord.Entry], roots: &[BuildRoot], selection: &mut FrameSelection,
+    forwards: &mut List<bool>) -> Option<List<BuildRoot>>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+    let storage = match &self.resolver.executionStorage {
+      Option<ExecutionStorage>.Some {value} => run ExecutionStorage.copy(&value)
+      Option<ExecutionStorage>.None => { return Option<List<BuildRoot>>.none() }
+    }
+    let exports = run storageExports(&mut self.resolver, &mut self.query, &storage)
+    if List<StorageExport>.length(&exports) != 4 { return Option<List<BuildRoot>>.none() }
+    let mut at = usize.ZERO
+    while at < entries.length {
+      let flags = entries[at].facts.flags
+      if u64.bitAnd(flags, BuildRecord.FACT_FRAMED) != 0 {
+        run FrameSelection.include(&mut selection.*, entries[at].facts.definition, entries[at].facts.component)
+        run List<bool>.append(&mut forwards.*, u64.bitAnd(flags, BuildRecord.FACT_FORWARDS) != 0)
+      }
+      at = at + usize.ONE
+    }
+    return Option<List<BuildRoot>>.some(run frameRoots(&mut selection.*, roots, List<StorageExport>.asSlice(&exports)))
+  }
+
+  // Lowers the frame variant a frame walk emitted suspendable `instance` from, whose MIR outside
+  // any frame is `lowered`: the frame facts `selection` gives that MIR, and the variant's MIR in
+  // place of it. When the image no longer holds the instance (`changed`), that MIR must first read
+  // to the selection as `facts` records it read (`selectingDigest`), so the walk that selects the
+  // frames would reach and select what it did. A body a frame may run in place of a call is
+  // lowered here when the selection does not hold it yet. None when anything differs.
+  effect fn replayFrame(self: &mut Self, instance: &InstanceKey, lowered: ReplayMir, observing: bool, facts: &BuildRecord.Facts,
+    changed: bool, selection: &mut FrameSelection, forwards: &[bool], entrySpan: Span) -> Option<ReplayFrame>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+    if changed {
+      let functions = List<MirFunction>.asSlice(&self.resolver.mirValues)
+      let forwarded = frameForwards(&self.resolver, &functions[lowered.mir])
+      let selecting = run selectingDigest(&functions[lowered.mir], instance, forwarded, entrySpan)
+      if !ContentHash.equals(selecting, facts.selecting) || forwarded != (u64.bitAnd(facts.flags, BuildRecord.FACT_FORWARDS) != 0) {
+        return Option<ReplayFrame>.none()
+      }
+    }
+    // Each body the frame may reach through calls it runs in place, nearest first.
+    let mut reading = List<usize>.make()
+    run List<usize>.append(&mut reading, lowered.mir)
+    let mut next = usize.ZERO
+    while next < List<usize>.length(&reading) {
+      let mut called = List<InstanceKey>.make()
+      let functions = List<MirFunction>.asSlice(&self.resolver.mirValues)
+      let blocks = List<MirBlock>.asSlice(&functions[List<usize>.get(&reading, next)].blocks)
+      next = next + usize.ONE
+      let mut block = usize.ZERO
+      while block < blocks.length {
+        if let MirTerminator.Call {callee: MirCallee.Instance {key}, ..} = &blocks[block].terminator {
+          run List<InstanceKey>.append(&mut called, InstanceKey.copy(&key))
+        }
+        block = block + usize.ONE
+      }
+      let callees = List<InstanceKey>.asSlice(&called)
+      let mut callee = usize.ZERO
+      while callee < callees.length {
+        let member = run FrameSelection.position(&selection.*, &callees[callee])
+        if member != usize.MAX && forwards[member] && List<usize>.get(&selection.bodies, member) == usize.MAX {
+          let body = match move run Semantic.replayMir(&mut self.*, &callees[callee], observing) {
+            Option<ReplayMir>.Some {value} => value
+            Option<ReplayMir>.None => { return Option<ReplayFrame>.none() }
+          }
+          List<usize>.set(&mut selection.bodies, member, body.mir)
+          run List<usize>.append(&mut reading, body.mir)
+        }
+        callee = callee + usize.ONE
+      }
+    }
+    let functions = List<MirFunction>.asSlice(&self.resolver.mirValues)
+    let frame = run FrameSelection.facts(&selection.*, &functions[lowered.mir], functions)
+    let suspension = Option<CoroutineFacts>.some(move frame)
+    let variant = run exactBackendVariant(&mut self.resolver, instance, observing, &suspension, false)
+    let mirKey = run internDeclaration(&mut self.resolver, Key {family: Family.Mir, module: lowered.location.module, name: variant,
+      declaration: lowered.location.declaration, member: lowered.member, external: false})
+    let answer = run demandRaw(&mut self.resolver, &mut self.query, mirKey, Span.make(usize.ZERO, usize.ZERO))
+    let mir = match move Shared<Result<Answer, NoRejection>>.with<Option<usize>>(&answer, answerMirIndex) {
+      Option<usize>.Some {value} => value
+      Option<usize>.None => { return Option<ReplayFrame>.none() }
+    }
+    let word = run internKey(&mut self.resolver, mirKey)
+    let held = match move suspension {
+      Option<CoroutineFacts>.Some {value} => move value
+      Option<CoroutineFacts>.None => { return Option<ReplayFrame>.none() }
+    }
+    return Option<ReplayFrame>.some(ReplayFrame {lowered: ReplayMir {mir: mir, mirUnit: lowered.mirUnit, frameUnit: u64.toUsize(word.value),
+      location: lowered.location, member: lowered.member}, facts: move held})
   }
 
   // Lowers the MIR a build walk lowers for `instance`; none when the walk would refuse it.
@@ -101666,15 +102275,16 @@ impl Semantic {
       Option<usize>.None => { return Option<ReplayMir>.none() }
     }
     let mirWord = run internKey(&mut self.resolver, mirKey)
-    return Option<ReplayMir>.some(ReplayMir {mir: mir, mirUnit: u64.toUsize(mirWord.value), location: location, member: member})
+    return Option<ReplayMir>.some(ReplayMir {mir: mir, mirUnit: u64.toUsize(mirWord.value), frameUnit: usize.MAX, location: location, member: member})
   }
 
   // Emits `instance` as a build walk does once its MIR is lowered; none when the walk would refuse
   // it or report a gap. An instance with no definition gives an entry without a value.
-  effect fn replayText(self: &mut Self, instance: &InstanceKey, lowered: ReplayMir, observing: bool) -> Option<CapturedEntry>
+  effect fn replayText(self: &mut Self, instance: &InstanceKey, lowered: ReplayMir, observing: bool, suspension: &Option<CoroutineFacts>)
+    -> Option<CapturedEntry>
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
   ? &mut Allocator | &mut Types {
-    let backendName = run exactBackendVariant(&mut self.resolver, instance, observing, &Option<CoroutineFacts>.none(), false)
+    let backendName = run exactBackendVariant(&mut self.resolver, instance, observing, suspension, false)
     let key = run internDeclaration(&mut self.resolver, Key {family: Family.EmissionInputs, module: lowered.location.module,
       name: backendName, declaration: lowered.location.declaration, member: lowered.member, external: false})
     let prepared = run demandRaw(&mut self.resolver, &mut self.query, key, Span.make(usize.ZERO, usize.ZERO))
@@ -101689,12 +102299,14 @@ impl Semantic {
     let value = match move index {
       Option<usize>.Some {value: text} => text
       Option<usize>.None => {
-        return Option<CapturedEntry>.some(CapturedEntry {value: usize.MAX, mirUnit: lowered.mirUnit, emissionUnit: usize.MAX, carried: usize.MAX})
+        return Option<CapturedEntry>.some(CapturedEntry {value: usize.MAX, mirUnit: lowered.mirUnit, emissionUnit: usize.MAX,
+          frameUnit: lowered.frameUnit, carried: usize.MAX})
       }
     }
     let emissionUnit = run emissionInputsUnit(&mut self.resolver, key, &prepared)
     if emissionUnit == usize.MAX { return Option<CapturedEntry>.none() }
-    return Option<CapturedEntry>.some(CapturedEntry {value: value, mirUnit: lowered.mirUnit, emissionUnit: emissionUnit, carried: usize.MAX})
+    return Option<CapturedEntry>.some(CapturedEntry {value: value, mirUnit: lowered.mirUnit, emissionUnit: emissionUnit,
+      frameUnit: lowered.frameUnit, carried: usize.MAX})
   }
 
   // Whether the MIR lowered for record entry `entry` names the references the record holds for it,
@@ -101744,21 +102356,62 @@ impl Semantic {
   //
   // Gives none when the walk cannot be proved to be the cold one, and the build walks.
   //
+  // A frame walk's record is walked again as that walk, from its roots with the storage exports,
+  // while the frames stay as the record has them. A suspendable entry the image no longer holds
+  // must read to the selection, and lower to a variant, as the record says (`replayFrame`,
+  // `replayAgrees`). Any other body lowered here must stay outside the selection and unable to
+  // park (`rewalkKeepsFrames`), so the walk that selects the frames would select the same ones
+  // and both walks' parking checks would find what they found. That walk must also still reach
+  // every suspendable instance this one does (`rewalkSelects`). An edit that changes what a
+  // suspendable function reaches, or that makes a function suspend, is left to a full build.
+  //
   // With `shared`, the record is what copies of the process lowered of this build (`sharedState`)
   // rather than an earlier walk: it decided no edge, so none is trusted, an entry no copy gave a
   // definition for (`BuildRecord.ABSENT`) is lowered here from its key, and the keys admission
   // needs are found again through MIR (`rewalkDecideKeyed`).
-  effect fn rewalkBuild(self: &mut Self, state: ReplayState, module: &ModuleId, roots: &[BuildRoot], entrySpan: Span, shared: bool)
+  //
+  // A record another program's build wrote (`ReplayState.borrowed`) is an earlier walk of other
+  // roots: it decided no edge of this walk either, so none is trusted and admission finds its keys
+  // through MIR as it does with `shared`. An entry's key is found through the entry this walk
+  // first reached it from (`RewalkKeys.links`), since the record's own path to it can pass through
+  // the other program's modules. The walk keeps the record it writes, as a walk of its own does.
+  // A frame walk's record is not borrowed: the frames it selected are the other program's.
+  effect fn rewalkBuild(self: &mut Self, state: ReplayState, module: &ModuleId, rooted: &[BuildRoot], entrySpan: Span, shared: bool)
     -> Option<BackendBuild>
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
   ? &mut Allocator | &mut Types {
-    let ReplayState {record, recordRoot: _, roots: definitionRoots, definitions, places, held, packRoots: _, guarded, waiting: _,
+    let ReplayState {record, recordRoot: _, roots: definitionRoots, definitions, places, held, packRoots: _, guarded, borrowed, waiting: _,
       waitedOn: _, summaries: _} = move state
     let entries = List<BuildRecord.Entry>.asSlice(&record.entries)
     // A replay that took the image's definitions leaves none to take, and a record resting on
     // growth guard reads cannot be replaced by one that does not.
     if !record.patterns || guarded || List<Option<InstanceDefinition>>.length(&definitions) != entries.length {
       return Option<BackendBuild>.none()
+    }
+    // A frame walk's record is walked again with the frames its walk selected and the storage
+    // exports it rooted (`replayFrames`); what copies of the process lowered selects none, and
+    // the frames another program's walk selected are not this program's.
+    let framing = record.frames
+    if framing && (shared || borrowed) { return Option<BackendBuild>.none() }
+    let mut selection = FrameSelection.make()
+    let mut forwards = List<bool>.make()
+    let mut extended = List<BuildRoot>.make()
+    let mut roots = rooted
+    if framing {
+      extended = match move run Semantic.replayFrames(&mut self.*, entries, rooted, &mut selection, &mut forwards) {
+        Option<List<BuildRoot>>.Some {value} => move value
+        Option<List<BuildRoot>>.None => { return Option<BackendBuild>.none() }
+      }
+      roots = List<BuildRoot>.asSlice(&extended)
+    }
+    // The definition of each instance a walk of the record's build found able to park.
+    let mut parking = DigestSet.make()
+    let mut parked = usize.ZERO
+    while framing && parked < entries.length {
+      if u64.bitAnd(entries[parked].facts.flags, BuildRecord.FACT_PARKS) != 0 {
+        drop run DigestSet.add(&mut parking, entries[parked].facts.definition)
+      }
+      parked = parked + usize.ONE
     }
     let observing = record.observing
     let mut heldDefinitions = move definitions
@@ -101773,14 +102426,25 @@ impl Semantic {
       at = at + usize.ONE
     }
     // Keys and MIR the walk found for record entries, by entry.
-    let mut keys = List<Option<InstanceKey>>.make()
-    let mut mirs = List<usize>.make()
+    let mut recovered = RewalkKeys {keys: List<Option<InstanceKey>>.make(), mirs: List<usize>.make(), links: List<RewalkLink>.make()}
     at = usize.ZERO
     while at < entries.length {
-      run List<Option<InstanceKey>>.append(&mut keys, Option<InstanceKey>.none())
-      run List<usize>.append(&mut mirs, usize.MAX)
+      run List<Option<InstanceKey>>.append(&mut recovered.keys, Option<InstanceKey>.none())
+      run List<usize>.append(&mut recovered.mirs, usize.MAX)
       at = at + usize.ONE
     }
+    // Each entry of another program's record is found through the entry this walk first reaches
+    // it from (`RewalkKeys.links`).
+    let foreign = !shared && borrowed
+    if foreign {
+      at = usize.ZERO
+      while at < entries.length {
+        run List<RewalkLink>.append(&mut recovered.links, RewalkLink {parent: usize.MAX, position: usize.MAX, requested: false})
+        at = at + usize.ONE
+      }
+    }
+    // Neither a record copies lowered nor another program's decided an edge of this walk.
+    let keyed = shared || foreign
     let mut nodes = List<RewalkNode>.make()
     let mut visitedLookup = InternIndex.make()
     // The owner of each backend instance, by definition digest, and which nodes those are.
@@ -101800,7 +102464,7 @@ impl Semantic {
       let exact = run instanceDigest(&roots[at].key)
       let entry = rewalkEntry(entries, &entryLookup, exact)
       let mut same = false
-      if entry != usize.MAX && !shared { same = entries[entry].parent == usize.MAX && entries[entry].position == at }
+      if entry != usize.MAX && !keyed { same = entries[entry].parent == usize.MAX && entries[entry].position == at }
       run List<RewalkVisit>.append(&mut pending, RewalkVisit {leave: false, entry: entry, key: Option<InstanceKey>.some(InstanceKey.copy(&roots[at].key)),
         exact: exact, parent: usize.MAX, position: at, requested: false, trusted: same, same: same})
     }
@@ -101818,11 +102482,25 @@ impl Semantic {
         }
         let visited = rewalkVisited(List<RewalkNode>.asSlice(&nodes), &visitedLookup, reachedExact)
         let mut reachedKey = move visitKey
+        if foreign && entry != usize.MAX {
+          let mut unknown = false
+          if let Option<InstanceKey>.None = &List<Option<InstanceKey>>.asSlice(&recovered.keys)[entry] { unknown = true }
+          if unknown {
+            if let Option<InstanceKey>.Some {value: known} = &reachedKey {
+              List<Option<InstanceKey>>.set(&mut recovered.keys, entry, Option<InstanceKey>.some(InstanceKey.copy(&known)))
+            } else if parent != usize.MAX && List<RewalkLink>.get(&recovered.links, entry).parent == usize.MAX {
+              let from = List<RewalkNode>.asSlice(&nodes)[parent].entry
+              if from != usize.MAX {
+                List<RewalkLink>.set(&mut recovered.links, entry, RewalkLink {parent: from, position: position, requested: asked})
+              }
+            }
+          }
+        }
         // An entry no copy lowered tells nothing the key does not: the walk finds the key.
         let absent = entry != usize.MAX && entries[entry].leaf == BuildRecord.ABSENT
         if absent {
           if let Option<InstanceKey>.None = &reachedKey {
-            reachedKey = run Semantic.rewalkKey(&mut self.*, entries, &mut keys, &mut mirs, roots, entry, observing, entrySpan)
+            reachedKey = run Semantic.rewalkKey(&mut self.*, entries, &mut recovered, roots, entry, observing, entrySpan)
           }
           if let Option<InstanceKey>.None = &reachedKey {
             return Option<BackendBuild>.none()
@@ -101853,12 +102531,12 @@ impl Semantic {
               if !closed { return Option<BackendBuild>.none() }
             }
             let mut decision = rewalkAdmits(List<RewalkFrame>.asSlice(&frames), facts.body, visited)
-            if decision == REWALK_REFUSED && shared {
+            if decision == REWALK_REFUSED && keyed {
               if let Option<InstanceKey>.None = &reachedKey {
-                reachedKey = run Semantic.rewalkKey(&mut self.*, entries, &mut keys, &mut mirs, roots, entry, observing, entrySpan)
+                reachedKey = run Semantic.rewalkKey(&mut self.*, entries, &mut recovered, roots, entry, observing, entrySpan)
               }
               decision = run Semantic.rewalkDecideKeyed(&mut self.*, entries, List<RewalkNode>.asSlice(&nodes), List<RewalkFrame>.asSlice(&frames),
-                &reachedKey, parent, position, asked, &mut keys, &mut mirs, roots, observing, entrySpan)
+                &reachedKey, parent, position, asked, &mut recovered, roots, observing, entrySpan)
             } else if decision == REWALK_REFUSED {
               decision = run rewalkBuildDecide(entries, List<RewalkNode>.asSlice(&nodes), List<RewalkFrame>.asSlice(&frames), &reachedKey,
                 visited)
@@ -101896,7 +102574,7 @@ impl Semantic {
             position: position, requested: asked, alias: owner, live: false, facts: run aliasFacts(&facts),
             targets: List<ContentHash>.make(), edges: List<ContentHash>.make(), summary: ContentHash {high: 0, low: 0},
             suspension: Option<SuspensionSummary>.none(),
-            captured: CapturedEntry {value: captured.value, mirUnit: usize.MAX, emissionUnit: usize.MAX, carried: usize.MAX}, place: place})
+            captured: CapturedEntry {value: captured.value, mirUnit: usize.MAX, emissionUnit: usize.MAX, frameUnit: usize.MAX, carried: usize.MAX}, place: place})
           continue
         }
         run InternIndex.record(&mut ownerLookup, Hash.combine(facts.definition.high, facts.definition.low))
@@ -101915,7 +102593,7 @@ impl Semantic {
             position: position, requested: asked, alias: usize.MAX, live: false, facts: move facts,
             targets: List<ContentHash>.make(), edges: List<ContentHash>.make(), summary: entries[entry].summary,
             suspension: Option<SuspensionSummary>.none(),
-            captured: CapturedEntry {value: value, mirUnit: usize.MAX, emissionUnit: usize.MAX, carried: List<usize>.get(&definitionRoots, entry)},
+            captured: CapturedEntry {value: value, mirUnit: usize.MAX, emissionUnit: usize.MAX, frameUnit: usize.MAX, carried: List<usize>.get(&definitionRoots, entry)},
             place: placed[entry]})
           let references = List<BuildRecord.Reference>.asSlice(&entries[entry].references)
           let mut reference = usize.ZERO
@@ -101933,7 +102611,7 @@ impl Semantic {
         // Lowered again here: a stale entry, an instance the record never reached, or a pattern
         // that now reaches its application first.
         if let Option<InstanceKey>.None = &key {
-          key = run Semantic.rewalkKey(&mut self.*, entries, &mut keys, &mut mirs, roots, entry, observing, entrySpan)
+          key = run Semantic.rewalkKey(&mut self.*, entries, &mut recovered, roots, entry, observing, entrySpan)
         }
         let instance = match move key {
           Option<InstanceKey>.Some {value} => move value
@@ -101941,14 +102619,35 @@ impl Semantic {
             return Option<BackendBuild>.none()
           }
         }
-        let lowered = match move run Semantic.replayMir(&mut self.*, &instance, observing) {
+        let mut lowered = match move run Semantic.replayMir(&mut self.*, &instance, observing) {
           Option<ReplayMir>.Some {value} => value
           Option<ReplayMir>.None => {
             return Option<BackendBuild>.none()
           }
         }
-        if entry != usize.MAX { List<usize>.set(&mut mirs, entry, lowered.mir) }
-        let text = match move run Semantic.replayText(&mut self.*, &instance, lowered, observing) {
+        // A suspendable instance is followed and emitted through its frame variant while the
+        // selection reads of its MIR outside any frame what it read, and the variant names the
+        // references and summarizes as the record says: the frames then stay as they are.
+        let mut suspension = Option<CoroutineFacts>.none()
+        let mut unchanged = false
+        if framing && run FrameSelection.contains(&selection, &instance) {
+          if entry == usize.MAX || u64.bitAnd(entries[entry].facts.flags, BuildRecord.FACT_FRAMED) == 0 {
+            return Option<BackendBuild>.none()
+          }
+          let framed = match move run Semantic.replayFrame(&mut self.*, &instance, lowered, observing, &entries[entry].facts, true,
+            &mut selection, List<bool>.asSlice(&forwards), entrySpan) {
+            Option<ReplayFrame>.Some {value} => move value
+            Option<ReplayFrame>.None => { return Option<BackendBuild>.none() }
+          }
+          lowered = framed.lowered
+          suspension = Option<CoroutineFacts>.some(move framed.facts)
+          if !run Semantic.replayAgrees(&mut self.*, &instance, lowered.mir, entries, entry, true, entrySpan) {
+            return Option<BackendBuild>.none()
+          }
+          unchanged = true
+        }
+        if entry != usize.MAX { List<usize>.set(&mut recovered.mirs, entry, lowered.mir) }
+        let text = match move run Semantic.replayText(&mut self.*, &instance, lowered, observing, &suspension) {
           Option<CapturedEntry>.Some {value} => value
           Option<CapturedEntry>.None => {
             return Option<BackendBuild>.none()
@@ -101962,10 +102661,18 @@ impl Semantic {
         let summary = run SuspensionSummary.make(&functions[lowered.mir], &instance, declared, &anchor, declared, entrySpan)
         let observes = functions[lowered.mir].observes
         let digest = run summaryDigest(&summary, observes, true)
-        // What the record says of an entry's summary is replaced by what its MIR says now.
-        facts = run aliasFacts(&facts)
-        run summaryFacts(&mut facts, &summary, observes)
-        if u64.bitAnd(facts.flags, BuildRecord.FACT_SUSPENDS) != 0 || (observes && !observing) {
+        if !unchanged {
+          // What the record says of an entry's summary is replaced by what its MIR says now.
+          facts = run aliasFacts(&facts)
+          run summaryFacts(&mut facts, &summary, observes)
+          if u64.bitAnd(facts.flags, BuildRecord.FACT_SUSPENDS) != 0 {
+            return Option<BackendBuild>.none()
+          }
+          if framing && !run rewalkKeepsFrames(&summary, &selection, &parking) {
+            return Option<BackendBuild>.none()
+          }
+        }
+        if observes && !observing {
           return Option<BackendBuild>.none()
         }
         // A dropped value a NonParking obligation runs must have drop glue to prove.
@@ -101973,6 +102680,8 @@ impl Semantic {
         let mut obligation = usize.ZERO
         while obligation < owed.length {
           let glues = List<Interned<Type>>.asSlice(&owed[obligation].glues)
+          // Whether glue a new obligation runs can park is not read from a frame walk's record.
+          if framing && !unchanged && glues.length > usize.ZERO { return Option<BackendBuild>.none() }
           let mut glue = usize.ZERO
           while glue < glues.length {
             if let Result<Option<InstanceKey>, CanonicalizationFailure>.Failure {..} = move run InstanceKey.dropGlue(&glues[glue], &identity) {
@@ -102064,14 +102773,23 @@ impl Semantic {
         node = node + usize.ONE
       }
     }
+    // Which nodes the walk that selects the frames reaches; every node for a build without frames.
+    let mut selected = List<bool>.make()
+    if framing {
+      selected = match move run rewalkSelects(entries, List<RewalkNode>.asSlice(&nodes), &visitedLookup, rooted) {
+        Option<List<bool>>.Some {value} => move value
+        Option<List<bool>>.None => { return Option<BackendBuild>.none() }
+      }
+    }
     if !run rewalkProved(entries, List<RewalkNode>.asSlice(&nodes), List<ContentHash>.asSlice(&reachedDefinitions), &reachedLookup,
-      observing) {
+      observing, framing, List<bool>.asSlice(&selected)) {
       return Option<BackendBuild>.none()
     }
     // Every definition in walk order, as the walk collects them, and the record of this walk.
     let listed = List<RewalkNode>.asSlice(&nodes)
     let mut emitted = List<CollectedText>.make()
     let mut rewritten = BuildRecord.make(observing, true)
+    rewritten.frames = framing
     let mut rested = List<CapturedEntry>.make()
     let mut node = usize.ZERO
     while node < listed.length {
@@ -102082,6 +102800,21 @@ impl Semantic {
       let mut entry = BuildRecord.Entry {exact: walked.exact, hash: 0, family: 0, declaration: Bytes.make(),
         parent: walked.parent, position: walked.position, requested: walked.requested, alias: walked.alias, leaf: 0,
         references: List<BuildRecord.Reference>.make(), summary: walked.summary, facts: run BuildRecord.copyFacts(&walked.facts)}
+      if framing {
+        let was = u64.bitAnd(entry.facts.flags, BuildRecord.FACT_SELECTED) != 0
+        let now = List<bool>.get(&selected, node - usize.ONE)
+        if was && !now { entry.facts.flags = entry.facts.flags - BuildRecord.FACT_SELECTED }
+        if now && !was { entry.facts.flags = entry.facts.flags + BuildRecord.FACT_SELECTED }
+      }
+      // A framed entry names what the selecting walk reached from it by this walk's entries.
+      let reaching = List<usize>.asMutSlice(&mut entry.facts.ordinary)
+      let mut reach = usize.ZERO
+      while reach < reaching.length {
+        let target = rewalkVisited(listed, &visitedLookup, entries[reaching[reach]].exact)
+        if target == usize.MAX { return Option<BackendBuild>.none() }
+        reaching[reach] = target
+        reach = reach + usize.ONE
+      }
       let mut replayed = Option<Replayed>.none()
       if walked.entry != usize.MAX && entries[walked.entry].leaf != BuildRecord.ABSENT {
         let recorded = &entries[walked.entry]
@@ -102133,7 +102866,7 @@ impl Semantic {
         run List<CapturedEntry>.append(&mut rested, walked.captured)
       } else {
         // An alias shares its owner's definition and holds none of its own.
-        run List<CapturedEntry>.append(&mut rested, CapturedEntry {value: usize.MAX, mirUnit: usize.MAX, emissionUnit: usize.MAX, carried: usize.MAX})
+        run List<CapturedEntry>.append(&mut rested, CapturedEntry {value: usize.MAX, mirUnit: usize.MAX, emissionUnit: usize.MAX, frameUnit: usize.MAX, carried: usize.MAX})
       }
       run List<BuildRecord.Entry>.append(&mut rewritten.entries, move entry)
       // The walk collects nothing for an instance that emits no definition.
@@ -102149,7 +102882,9 @@ impl Semantic {
       at = at + usize.ONE
     }
     let mut packed = PackedBuild.make()
-    let assembled = run assembleEmission(&self.resolver, List<CollectedText>.asSlice(&emitted), roots, module, entrySpan, &mut packed)
+    let starts = run collectedOrigins(&mut self.resolver, List<CollectedText>.asSlice(&emitted))
+    let assembled = run assembleEmission(&self.resolver, List<CollectedText>.asSlice(&emitted), List<u64>.asSlice(&starts), roots, module, entrySpan,
+      &mut packed)
     self.packedBuild = move packed
     if let BackendBuild.Module {..} = &assembled {
       // The entries copies lowered rest on units this process never ran, so this walk keeps no
@@ -102169,7 +102904,7 @@ impl Semantic {
   // The key of record entry `entry`, found again as `replayBuild` finds it: by its own declaration
   // when its shape is supported, as its root, or through its parent's MIR, whose key is found
   // the same way. None when an entry on the way no longer has the key the record names.
-  effect fn rewalkKey(self: &mut Self, entries: &[BuildRecord.Entry], keys: &mut List<Option<InstanceKey>>, mirs: &mut List<usize>,
+  effect fn rewalkKey(self: &mut Self, entries: &[BuildRecord.Entry], recovered: &mut RewalkKeys,
     roots: &[BuildRoot], entry: usize, observing: bool, entrySpan: Span) -> Option<InstanceKey>
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
   ? &mut Allocator | &mut Types {
@@ -102178,52 +102913,56 @@ impl Semantic {
     let mut chain = List<usize>.make()
     let mut at = entry
     while true {
-      if let Option<InstanceKey>.Some {..} = &List<Option<InstanceKey>>.asSlice(&keys.*)[at] { break }
+      if let Option<InstanceKey>.Some {..} = &List<Option<InstanceKey>>.asSlice(&recovered.keys)[at] { break }
       if let Option<InstanceKey>.Some {value} = move run plainEntryKey(&entries[at]) {
-        List<Option<InstanceKey>>.set(&mut keys.*, at, Option<InstanceKey>.some(move value))
+        List<Option<InstanceKey>>.set(&mut recovered.keys, at, Option<InstanceKey>.some(move value))
         break
       }
-      if entries[at].parent == usize.MAX {
-        if entries[at].position >= roots.length { return Option<InstanceKey>.none() }
-        let root = &roots[entries[at].position].key
+      let link = rewalkLink(&recovered.*, entries, at)
+      if link.parent == usize.MAX {
+        if link.position >= roots.length { return Option<InstanceKey>.none() }
+        let root = &roots[link.position].key
         if !ContentHash.equals(run instanceDigest(root), entries[at].exact) { return Option<InstanceKey>.none() }
-        List<Option<InstanceKey>>.set(&mut keys.*, at, Option<InstanceKey>.some(InstanceKey.copy(root)))
+        List<Option<InstanceKey>>.set(&mut recovered.keys, at, Option<InstanceKey>.some(InstanceKey.copy(root)))
         break
       }
       run List<usize>.append(&mut chain, at)
-      at = entries[at].parent
+      at = link.parent
     }
     while List<usize>.length(&chain) > usize.ZERO {
       let child = match move List<usize>.pop(&mut chain) {
         Option<usize>.Some {value} => value
         Option<usize>.None => { break }
       }
-      let parent = entries[child].parent
-      let parentKey = match &List<Option<InstanceKey>>.asSlice(&keys.*)[parent] {
+      let linked = rewalkLink(&recovered.*, entries, child)
+      let parent = linked.parent
+      let parentKey = match &List<Option<InstanceKey>>.asSlice(&recovered.keys)[parent] {
         Option<InstanceKey>.Some {value} => InstanceKey.copy(&value)
         Option<InstanceKey>.None => { return Option<InstanceKey>.none() }
       }
-      let mut mir = List<usize>.get(&mirs.*, parent)
+      let mut mir = List<usize>.get(&recovered.mirs, parent)
       if mir == usize.MAX {
+        // A framed entry's references are its frame variant's, which only its own visit lowers.
+        if u64.bitAnd(entries[parent].facts.flags, BuildRecord.FACT_FRAMED) != 0 { return Option<InstanceKey>.none() }
         mir = match move run Semantic.replayMir(&mut self.*, &parentKey, observing) {
           Option<ReplayMir>.Some {value} => value.mir
           Option<ReplayMir>.None => { return Option<InstanceKey>.none() }
         }
-        List<usize>.set(&mut mirs.*, parent, mir)
+        List<usize>.set(&mut recovered.mirs, parent, mir)
       }
       let functions = List<MirFunction>.asSlice(&self.resolver.mirValues)
       let mut found = Option<InstanceKey>.none()
-      if entries[child].requested {
+      if linked.requested {
         let owner = DeclarationId.copyShared(&InstanceKey.identity(&parentKey))
         let summary = run SuspensionSummary.make(&functions[mir], &parentKey, DeclarationId.moduleId(&owner),
           &Option<Anchor>.none(), DeclarationId.moduleId(&owner), entrySpan)
-        if let Option<&InstanceKey>.Some {value: target} = move requestedTarget(&summary, entries[child].position) {
+        if let Option<&InstanceKey>.Some {value: target} = move requestedTarget(&summary, linked.position) {
           found = Option<InstanceKey>.some(InstanceKey.copy(target))
         }
       } else {
         let references = List<MirReference>.asSlice(&functions[mir].references)
-        if entries[child].position < references.length {
-          found = Option<InstanceKey>.some(InstanceKey.copy(&references[entries[child].position].key))
+        if linked.position < references.length {
+          found = Option<InstanceKey>.some(InstanceKey.copy(&references[linked.position].key))
         }
       }
       let instance = match move found {
@@ -102231,9 +102970,9 @@ impl Semantic {
         Option<InstanceKey>.None => { return Option<InstanceKey>.none() }
       }
       if !ContentHash.equals(run instanceDigest(&instance), entries[child].exact) { return Option<InstanceKey>.none() }
-      List<Option<InstanceKey>>.set(&mut keys.*, child, Option<InstanceKey>.some(move instance))
+      List<Option<InstanceKey>>.set(&mut recovered.keys, child, Option<InstanceKey>.some(move instance))
     }
-    return match &List<Option<InstanceKey>>.asSlice(&keys.*)[entry] {
+    return match &List<Option<InstanceKey>>.asSlice(&recovered.keys)[entry] {
       Option<InstanceKey>.Some {value} => Option<InstanceKey>.some(InstanceKey.copy(&value))
       Option<InstanceKey>.None => Option<InstanceKey>.none()
     }
@@ -102335,7 +103074,7 @@ impl Semantic {
       run List<bool>.append(&mut stale, outdated)
       run List<bool>.append(&mut needed, outdated)
       run List<usize>.append(&mut mirs, usize.MAX)
-      run List<CapturedEntry>.append(&mut rested, CapturedEntry {value: usize.MAX, mirUnit: keptUnit, emissionUnit: usize.MAX, carried: held})
+      run List<CapturedEntry>.append(&mut rested, CapturedEntry {value: usize.MAX, mirUnit: keptUnit, emissionUnit: usize.MAX, frameUnit: usize.MAX, carried: held})
       run List<bool>.append(&mut pruned, false)
       run List<Option<EntrySite>>.append(&mut sites, Option<EntrySite>.none())
       run List<Option<InstanceKey>>.append(&mut keys, Option<InstanceKey>.none())
@@ -102511,7 +103250,7 @@ impl Semantic {
         if !run Semantic.replayAgrees(&mut self.*, &instance, lowered.mir, entries, index, false, Span.make(usize.ZERO, usize.ZERO)) {
           return Option<EscapeReplay>.none()
         }
-        List<CapturedEntry>.set(&mut rested, index, CapturedEntry {value: usize.MAX, mirUnit: lowered.mirUnit, emissionUnit: usize.MAX,
+        List<CapturedEntry>.set(&mut rested, index, CapturedEntry {value: usize.MAX, mirUnit: lowered.mirUnit, emissionUnit: usize.MAX, frameUnit: usize.MAX,
           carried: usize.MAX})
       }
     }
@@ -102748,7 +103487,7 @@ impl Semantic {
         run List<EscapeNode>.append(&mut nodes, EscapeNode {entry: any, key: move leafKey, exact: reachedExact,
           parent: parent, position: position, leaf: leaf, live: false, facts: move kept, targets: List<ContentHash>.make(),
           edges: List<ContentHash>.make(), callees: List<ContentHash>.make(), callbacks: List<ContentHash>.make(), summary: ContentHash {high: 0, low: 0},
-          captured: CapturedEntry {value: usize.MAX, mirUnit: usize.MAX, emissionUnit: usize.MAX, carried: usize.MAX}, mir: usize.MAX,
+          captured: CapturedEntry {value: usize.MAX, mirUnit: usize.MAX, emissionUnit: usize.MAX, frameUnit: usize.MAX, carried: usize.MAX}, mir: usize.MAX,
           cleanupNode: cleanupNode})
         if !isForeign {
           run List<EscapeVisit>.append(&mut left, EscapeVisit {leave: false, entry: entry, key: move reachedKey, exact: reachedExact,
@@ -102809,7 +103548,7 @@ impl Semantic {
           callee = callee + usize.ONE
         }
         let callbacks = run escapeCallbacks(&facts)
-        let mut captured = CapturedEntry {value: usize.MAX, mirUnit: usize.MAX, emissionUnit: usize.MAX, carried: List<usize>.get(&carried, entry)}
+        let mut captured = CapturedEntry {value: usize.MAX, mirUnit: usize.MAX, emissionUnit: usize.MAX, frameUnit: usize.MAX, carried: List<usize>.get(&carried, entry)}
         if inProcess { captured.mirUnit = previous[entry].mirUnit }
         run List<EscapeNode>.append(&mut nodes, EscapeNode {entry: entry, key: move reachedKey, exact: reachedExact, parent: parent,
           position: position, leaf: 0, live: false, facts: move facts, targets: List<ContentHash>.make(), edges: List<ContentHash>.make(),
@@ -102899,7 +103638,7 @@ impl Semantic {
       run List<EscapeNode>.append(&mut nodes, EscapeNode {entry: entry, key: Option<InstanceKey>.some(move instance), exact: reachedExact,
         parent: parent, position: position, leaf: 0, live: true, facts: move fresh, targets: move targets, edges: move edges,
         callees: move callees, callbacks: move callbacks, summary: digest,
-        captured: CapturedEntry {value: usize.MAX, mirUnit: lowered.mirUnit, emissionUnit: usize.MAX, carried: usize.MAX}, mir: lowered.mir,
+        captured: CapturedEntry {value: usize.MAX, mirUnit: lowered.mirUnit, emissionUnit: usize.MAX, frameUnit: usize.MAX, carried: usize.MAX}, mir: lowered.mir,
         cleanupNode: cleanupNode})
     }
     if !checked && run escapeFound(List<EscapeNode>.asSlice(&nodes), List<usize>.asSlice(&summarized), &visitedLookup) {
@@ -103242,7 +103981,7 @@ impl Semantic {
       if !run Semantic.replayAgrees(&mut self.*, instance, lowered.mir, entries, index, false, Span.make(usize.ZERO, usize.ZERO)) {
         return false
       }
-      List<CapturedEntry>.set(&mut rested.*, index, CapturedEntry {value: usize.MAX, mirUnit: lowered.mirUnit, emissionUnit: usize.MAX,
+      List<CapturedEntry>.set(&mut rested.*, index, CapturedEntry {value: usize.MAX, mirUnit: lowered.mirUnit, emissionUnit: usize.MAX, frameUnit: usize.MAX,
         carried: usize.MAX})
     }
     List<usize>.set(&mut mirs.*, index, lowered.mir)
@@ -103335,7 +104074,7 @@ impl Semantic {
       Option<usize>.None => { return Option<ReplayMir>.none() }
     }
     let mirWord = run internKey(&mut self.resolver, mirKey)
-    return Option<ReplayMir>.some(ReplayMir {mir: mir, mirUnit: u64.toUsize(mirWord.value), location: location, member: member})
+    return Option<ReplayMir>.some(ReplayMir {mir: mir, mirUnit: u64.toUsize(mirWord.value), frameUnit: usize.MAX, location: location, member: member})
   }
 }
 
@@ -103836,12 +104575,13 @@ effect fn withUnemittedBodies(built: BackendBuild, unchecked: &[UncheckedDeclara
 effect fn assembleEmission(
   resolver: &Resolver,
   reached: &[CollectedText],
+  origins: &[u64],
   roots: &[BuildRoot],
   module: &ModuleId,
   span: Span,
   packed: &mut PackedBuild,
 ) -> BackendBuild ! OutOfMemoryError ? &mut Allocator {
-  let assembled = run Effect.result(assembleEmissionChecked(resolver, reached, roots, module, span, &mut packed.*))
+  let assembled = run Effect.result(assembleEmissionChecked(resolver, reached, origins, roots, module, span, &mut packed.*))
   return match move assembled {
     Result<BackendBuild, BackendGap | OutOfMemoryError>.Success {value} => move value
     Result<BackendBuild, BackendGap | OutOfMemoryError>.Failure {error} => match move error {
@@ -103906,9 +104646,57 @@ effect fn boundDeclarations(resolver: &Resolver, plan: &EmissionPlan, foreign: &
   return Option<List<LlvmCode.Declaration>>.some(move kept)
 }
 
+// The table of `module`'s declaration origins for the bytes it holds now: the one a cache offered
+// or an earlier assembly made when it was made from these bytes, else one made here from the
+// module's parse.
+effect fn moduleOrigins(resolver: &mut Resolver, module: &ModuleId) -> usize ! Cycle | OutOfMemoryError ? &mut Allocator {
+  let digest = run sourceDigest(&mut resolver.*, module)
+  let known = Origins.position(&resolver.declarationOrigins, module)
+  if known != usize.MAX && Origins.confirm(&mut resolver.declarationOrigins, known, digest) { return known }
+  let mut table = ModuleOrigins.make(ModuleId.copy(module), digest)
+  // A module without source declares nothing a marker is counted from.
+  if !ContentHash.equals(digest, ContentHash {high: 0, low: 0}) {
+    let answer = run demandSource(&mut resolver.*, module)
+    if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&resolver.*, &answer, module) {
+      let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
+      let mut at = usize.ZERO
+      while at < declarations.length {
+        if let Option<Anchor>.Some {value: anchor} = move IndexedSource.anchorOf(indexed, at) {
+          run ModuleOrigins.add(&mut table, DeclarationId.hash(&declarations[at].identity), sourcePlace(Anchor.origin(&anchor)))
+        }
+        at = at + usize.ONE
+      }
+    }
+  }
+  return run Origins.place(&mut resolver.declarationOrigins, move table)
+}
+
+// For a build with line tables, where the declaration of each collected definition starts in the
+// source as it reads now (`EmissionPlan.Identity.origin`), in `reached`'s order; empty for any
+// other build. The definitions' markers are counted from there, so this is the one thing a line
+// table reads that moves with the declaration, and it is read here, outside every unit: no
+// lowered body or definition rests on it.
+effect fn collectedOrigins(resolver: &mut Resolver, reached: &[CollectedText]) -> List<u64> ! Cycle | OutOfMemoryError ? &mut Allocator {
+  let mut origins = List<u64>.make()
+  if !resolver.lineTables { return move origins }
+  run List<u64>.reserve(&mut origins, reached.length)
+  Origins.begin(&mut resolver.declarationOrigins)
+  let mut at = usize.ZERO
+  while at < reached.length {
+    let declaration = collectedDeclaration(&reached[at])
+    let module = DeclarationId.moduleId(&declaration)
+    let mut table = Origins.current(&resolver.declarationOrigins, module)
+    if table == usize.MAX { table = run moduleOrigins(&mut resolver.*, module) }
+    run List<u64>.append(&mut origins, Origins.find(&resolver.declarationOrigins, table, DeclarationId.hash(&declaration)))
+    at = at + usize.ONE
+  }
+  return move origins
+}
+
 effect fn assembleEmissionChecked(
   resolver: &Resolver,
   reached: &[CollectedText],
+  origins: &[u64],
   roots: &[BuildRoot],
   module: &ModuleId,
   span: Span,
@@ -103929,6 +104717,7 @@ effect fn assembleEmissionChecked(
   if EmissionPlan.hasSymbolConflict(&plan) {
     return CompilerBug.panic(b"InstanceSymbolConflict")
   }
+  EmissionPlan.placeOrigins(&mut plan, origins)
   let foreign = match move run emissionDeclarations(resolver, reached) {
     Result<List<LlvmCode.Declaration>, ForeignConflict>.Success {value} => move value
     Result<List<LlvmCode.Declaration>, ForeignConflict>.Failure {error} => {
@@ -104069,6 +104858,25 @@ effect fn assembleUnits(resolver: &Resolver, reached: &[CollectedText], plan: &E
     at = at + usize.ONE
   }
   let unitCount = List<usize>.length(&unitModules)
+  // For a build with line tables, a digest per unit of where its definitions' declarations start,
+  // in emission order: the body's markers are counted from there, so a unit whose declarations
+  // moved keeps its body and compiles to another object.
+  let mut originHigh = List<u64>.make()
+  let mut originLow = List<u64>.make()
+  if resolver.lineTables {
+    run List<u64>.appendRepeated(&mut originHigh, 1, unitCount)
+    run List<u64>.appendRepeated(&mut originLow, 2, unitCount)
+    at = usize.ZERO
+    while at < order.length {
+      let held = List<usize>.get(&placed, at)
+      let origin = identities[order[at]].origin
+      let high = Hash.combine(List<u64>.get(&originHigh, held), origin)
+      let low = Hash.combine(Hash.combine(List<u64>.get(&originLow, held), u64.bitNot(origin)), origin)
+      List<u64>.set(&mut originHigh, held, high)
+      List<u64>.set(&mut originLow, held, low)
+      at = at + usize.ONE
+    }
+  }
   let mut units = List<CodegenUnit>.make()
   let mut unit = usize.ZERO
   while unit < unitCount + usize.ONE {
@@ -104110,7 +104918,11 @@ effect fn assembleUnits(resolver: &Resolver, reached: &[CollectedText], plan: &E
       digest = ContentHash.of(Bytes.asSlice(&body))
     }
     let head = run Bytes.copy(header)
-    run List<CodegenUnit>.append(&mut units, CodegenUnit {head: move head, body: move body, digest: digest, stored: stored,
+    let mut origins = ContentHash {high: 0, low: 0}
+    if unit < List<u64>.length(&originHigh) {
+      origins = ContentHash {high: List<u64>.get(&originHigh, unit), low: List<u64>.get(&originLow, unit)}
+    }
+    run List<CodegenUnit>.append(&mut units, CodegenUnit {head: move head, body: move body, digest: digest, origins: origins, stored: stored,
       exports: Option<Bytes>.none()})
     unit = unit + usize.ONE
   }
@@ -104530,7 +105342,7 @@ effect fn sharedState(parts: &[Bytes], roots: &[BuildRoot]) -> Option<ReplayStat
   let mut places = List<TextPlace>.make()
   run List<TextPlace>.appendRepeated(&mut places, TextPlace {pack: usize.MAX, member: usize.MAX}, total)
   return Option<ReplayState>.some(ReplayState {record: move merged, recordRoot: usize.MAX, roots: move definitionRoots,
-    definitions: move definitions, places: move places, held: move held, packRoots: List<usize>.make(), guarded: false,
+    definitions: move definitions, places: move places, held: move held, packRoots: List<usize>.make(), guarded: false, borrowed: false,
     waiting: List<WaitingEntry>.make(), waitedOn: List<usize>.make(), summaries: List<SummaryRoot>.make()})
 }
 
@@ -104556,6 +105368,8 @@ struct CaptureEntry {
   value: usize,
   mirUnit: usize,
   emissionUnit: usize,
+  // `CapturedEntry.frameUnit`.
+  frameUnit: usize,
   // `BuildRecord.Entry.facts`.
   facts: BuildRecord.Facts,
 }
@@ -104581,6 +105395,14 @@ struct BuildCapture {
   // again what a body that lowers to nothing reports, as it lowers every stale entry; anything
   // else a walk reports, as a body that lowers and reports or a refused admission, it does not.
   unreplayable: bool,
+  // Whether the walk is a frame walk (`BuildRecord.Record.frames`).
+  frames: bool,
+  // The digest of each instance the walk that selected the frames reached from a suspendable
+  // instance's MIR outside any frame. A replay finds that walk's instances among this walk's
+  // entries, so the record is kept only when each of these is one.
+  selected: List<ContentHash>,
+  // The entry each of `selected` was reached from.
+  selectedFrom: List<usize>,
 }
 
 // What a rewalk reads of `instance` from a build record instead of the key (`BuildRecord.Facts`).
@@ -104687,15 +105509,31 @@ effect fn summaryFacts(facts: &mut BuildRecord.Facts, summary: &SuspensionSummar
 // the record's walk, which found nothing: no reached body suspends or parks, a walk that
 // observes diagnostics still reaches one that does, and every NonParking obligation names reached
 // targets and declarations (`nonParkingViolations`). Local-shared escapes are `rewalkEscapeFree`'s.
+//
+// With `framing`, the record is a frame walk's: bodies suspend and park, and the walk lowered none
+// that can (`rewalkKeepsFrames`), so an instance parks only where the record says one can
+// (`BuildRecord.FACT_PARKS`), and no obligation may name such a target or declaration. Both walks
+// of the build prove the obligations, so a declaration needs an instance among the nodes the
+// selecting walk reaches (`selected`).
 effect fn rewalkProved(entries: &[BuildRecord.Entry], nodes: &[RewalkNode], reachedDefinitions: &[ContentHash],
-  reachedLookup: &InternIndex, observing: bool) -> bool
+  reachedLookup: &InternIndex, observing: bool, framing: bool, selected: &[bool]) -> bool
 ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut parking = DigestSet.make()
   let mut observes = false
   let mut declared = false
   let mut at = usize.ZERO
   while at < nodes.length {
     let flags = nodes[at].facts.flags
-    if u64.bitAnd(flags, BuildRecord.FACT_SUSPENDS) != 0 { return false }
+    if u64.bitAnd(flags, BuildRecord.FACT_SUSPENDS) != 0 && !framing { return false }
+    if u64.bitAnd(flags, BuildRecord.FACT_PARKS) != 0 {
+      drop run DigestSet.add(&mut parking, nodes[at].facts.definition)
+      if u64.bitAnd(flags, BuildRecord.FACT_BARE) != 0 { drop run DigestSet.add(&mut parking, nodes[at].facts.bare) }
+    }
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < nodes.length {
+    let flags = nodes[at].facts.flags
     if u64.bitAnd(flags, BuildRecord.FACT_OBSERVES) != 0 { observes = true }
     let obligations = List<BuildRecord.Obligation>.asSlice(&nodes[at].facts.obligations)
     let mut obligation = usize.ZERO
@@ -104705,6 +105543,7 @@ effect fn rewalkProved(entries: &[BuildRecord.Entry], nodes: &[RewalkNode], reac
       let mut callee = usize.ZERO
       while callee < callees.length {
         if !rewalkReached(reachedDefinitions, reachedLookup, callees[callee].definition) { return false }
+        if DigestSet.find(&parking, callees[callee].definition) != usize.MAX { return false }
         callee = callee + usize.ONE
       }
       if List<Bytes>.length(&obligations[obligation].declarations) > usize.ZERO { declared = true }
@@ -104716,13 +105555,17 @@ effect fn rewalkProved(entries: &[BuildRecord.Entry], nodes: &[RewalkNode], reac
   if observes != observing { return false }
   if !declared { return true }
   // A declaration is reached through its own summary or one that inlined an instance of it,
-  // as `nonParkingViolations` decides. Every such summary is non-suspending and non-parking
-  // here, so none of the declaration's reached instances can park.
+  // as `nonParkingViolations` decides. None of those summaries may be one that can park.
   let mut identities = List<Bytes>.make()
+  let mut parked = List<bool>.make()
   at = usize.ZERO
   while at < nodes.length {
+    let parks = u64.bitAnd(nodes[at].facts.flags, BuildRecord.FACT_PARKS) != 0
+    // An instance only the frame walk reaches proves nothing for the selecting walk, but one that
+    // can park still refuses the proof.
+    let counted = !framing || selected[at] || parks
     let mut bytes = Bytes.make()
-    if u64.bitAnd(nodes[at].facts.flags, BuildRecord.FACT_SUMMARIZED) != 0 {
+    if counted && u64.bitAnd(nodes[at].facts.flags, BuildRecord.FACT_SUMMARIZED) != 0 {
       if let Option<InstanceKey>.Some {value: known} = &nodes[at].key {
         run StableKey.declaration(&mut bytes, &DeclarationId.copyShared(&InstanceKey.identity(&known)))
       } else if nodes[at].entry != usize.MAX {
@@ -104734,11 +105577,13 @@ effect fn rewalkProved(entries: &[BuildRecord.Entry], nodes: &[RewalkNode], reac
       }
     }
     run List<Bytes>.append(&mut identities, move bytes)
-    if u64.bitAnd(nodes[at].facts.flags, BuildRecord.FACT_SUMMARIZED) != 0 {
+    run List<bool>.append(&mut parked, parks)
+    if counted && u64.bitAnd(nodes[at].facts.flags, BuildRecord.FACT_SUMMARIZED) != 0 {
       let inlined = List<Bytes>.asSlice(&nodes[at].facts.inlined)
       let mut each = usize.ZERO
       while each < inlined.length {
         run List<Bytes>.append(&mut identities, run Bytes.copy(Bytes.asSlice(&inlined[each])))
+        run List<bool>.append(&mut parked, parks)
         each = each + usize.ONE
       }
     }
@@ -104755,8 +105600,11 @@ effect fn rewalkProved(entries: &[BuildRecord.Entry], nodes: &[RewalkNode], reac
       while declaration < declarations.length {
         let mut found = false
         let mut candidate = usize.ZERO
-        while candidate < named.length && !found {
-          found = Bytes.length(&named[candidate]) > usize.ZERO && same(Bytes.asSlice(&named[candidate]), Bytes.asSlice(&declarations[declaration]))
+        while candidate < named.length {
+          if Bytes.length(&named[candidate]) > usize.ZERO && same(Bytes.asSlice(&named[candidate]), Bytes.asSlice(&declarations[declaration])) {
+            if List<bool>.get(&parked, candidate) { return false }
+            found = true
+          }
           candidate = candidate + usize.ONE
         }
         if !found { return false }
@@ -104842,8 +105690,186 @@ effect fn rewalkEscapeFree(entries: &[BuildRecord.Entry]) -> bool ! OutOfMemoryE
       }
       reference = reference + usize.ONE
     }
+    // A framed entry's references are its frame variant's; its MIR outside any frame, which the
+    // selecting walk checked, reaches these.
+    let ordinary = List<usize>.asSlice(&entries[reached].facts.ordinary)
+    reference = usize.ZERO
+    while reference < ordinary.length {
+      if !List<bool>.get(&queued, ordinary[reference]) {
+        List<bool>.set(&mut queued, ordinary[reference], true)
+        run List<usize>.append(&mut queue, ordinary[reference])
+      }
+      reference = reference + usize.ONE
+    }
   }
   return true
+}
+
+// Whether `summary`, of a body a rewalk of a frame walk's record lowered outside any frame, leaves
+// the frames of `selection` and the instances that can park (`parking`, by definition digest) as
+// the record has them. The body calls no suspendable instance, so it stays outside the selection.
+// It calls and indirectly runs no instance that can park, notifies no Execution and releases no
+// package, so it cannot park (`closeParking`); no package it forms has glue that can park, so no
+// release runs more than it ran; and it forms no callback address.
+effect fn rewalkKeepsFrames(summary: &SuspensionSummary, selection: &FrameSelection, parking: &DigestSet) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  if summary.notifies || summary.releases || List<CallbackBoundary>.length(&summary.callbacks) > usize.ZERO { return false }
+  let callees = List<InstanceKey>.asSlice(&summary.callees)
+  let mut at = usize.ZERO
+  while at < callees.length {
+    if run FrameSelection.contains(selection, &callees[at]) { return false }
+    if DigestSet.find(parking, run definitionDigest(&callees[at])) != usize.MAX { return false }
+    at = at + usize.ONE
+  }
+  let indirect = List<InstanceKey>.asSlice(&summary.indirect)
+  at = usize.ZERO
+  while at < indirect.length {
+    if DigestSet.find(parking, run definitionDigest(&indirect[at])) != usize.MAX { return false }
+    at = at + usize.ONE
+  }
+  let packages = List<InstanceKey>.asSlice(&summary.packages)
+  at = usize.ZERO
+  while at < packages.length {
+    if DigestSet.find(parking, run definitionDigest(&packages[at])) != usize.MAX { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// The nodes of a rewalk of a frame walk's record that the walk that selects the build's frames
+// would reach from `roots`: it follows each instance's MIR outside any frame, which a framed entry
+// names by `BuildRecord.Facts.ordinary`, and enters the NonParking targets its obligations name.
+// None when that walk and the rewalk differ in what matters. A framed instance only the frame
+// walk reaches would be emitted without a frame. A program that reaches no framed instance has no
+// frame walk. And a body the record's selecting walk never reached
+// (`BuildRecord.FACT_SELECTED`), such as one only a storage export runs, was never read for the
+// selection or the selecting walk's checks, so reaching it now may select or refuse what the
+// record does not say.
+effect fn rewalkSelects(entries: &[BuildRecord.Entry], nodes: &[RewalkNode], visitedLookup: &InternIndex, roots: &[BuildRoot])
+  -> Option<List<bool>>
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  // Each node under its definition digest and its bare one, as an obligation names its targets.
+  let mut defined = InternIndex.make()
+  let mut definitions = List<ContentHash>.make()
+  let mut definers = List<usize>.make()
+  let mut defining = usize.ZERO
+  while defining < nodes.length {
+    let facts = &nodes[defining].facts
+    run InternIndex.record(&mut defined, digestHash(facts.definition))
+    run List<ContentHash>.append(&mut definitions, facts.definition)
+    run List<usize>.append(&mut definers, defining)
+    if u64.bitAnd(facts.flags, BuildRecord.FACT_BARE) != 0 {
+      run InternIndex.record(&mut defined, digestHash(facts.bare))
+      run List<ContentHash>.append(&mut definitions, facts.bare)
+      run List<usize>.append(&mut definers, defining)
+    }
+    defining = defining + usize.ONE
+  }
+  let mut reached = List<bool>.make()
+  while List<bool>.length(&reached) < nodes.length { run List<bool>.append(&mut reached, false) }
+  let mut queue = List<usize>.make()
+  let mut at = usize.ZERO
+  while at < roots.length {
+    let root = rewalkVisited(nodes, visitedLookup, run instanceDigest(&roots[at].key))
+    if root == usize.MAX { return Option<List<bool>>.none() }
+    if !List<bool>.get(&reached, root) {
+      List<bool>.set(&mut reached, root, true)
+      run List<usize>.append(&mut queue, root)
+    }
+    at = at + usize.ONE
+  }
+  let mut head = usize.ZERO
+  let mut growing = true
+  while growing {
+    while head < List<usize>.length(&queue) {
+      let node = &nodes[List<usize>.get(&queue, head)]
+      head = head + usize.ONE
+      let mut targets = List<usize>.make()
+      if node.alias != usize.MAX {
+        run List<usize>.append(&mut targets, node.alias)
+      } else if u64.bitAnd(node.facts.flags, BuildRecord.FACT_FRAMED) != 0 {
+        let ordinary = List<usize>.asSlice(&node.facts.ordinary)
+        let mut each = usize.ZERO
+        while each < ordinary.length {
+          run List<usize>.append(&mut targets, rewalkVisited(nodes, visitedLookup, entries[ordinary[each]].exact))
+          each = each + usize.ONE
+        }
+      } else if node.live {
+        let named = List<ContentHash>.asSlice(&node.targets)
+        let mut each = usize.ZERO
+        while each < named.length {
+          run List<usize>.append(&mut targets, rewalkVisited(nodes, visitedLookup, named[each]))
+          each = each + usize.ONE
+        }
+      } else if node.entry != usize.MAX {
+        let references = List<BuildRecord.Reference>.asSlice(&entries[node.entry].references)
+        let mut each = usize.ZERO
+        while each < references.length {
+          run List<usize>.append(&mut targets, rewalkVisited(nodes, visitedLookup, entries[references[each].target].exact))
+          each = each + usize.ONE
+        }
+      }
+      // The targets its obligations name are entered where nothing else reaches them.
+      let obligations = List<BuildRecord.Obligation>.asSlice(&node.facts.obligations)
+      let mut obligation = usize.ZERO
+      while obligation < obligations.length {
+        let callees = List<BuildRecord.Callee>.asSlice(&obligations[obligation].callees)
+        let mut callee = usize.ZERO
+        while callee < callees.length {
+          let mut named = InternIndex.first(&defined, digestHash(callees[callee].definition))
+          while named != usize.MAX {
+            if ContentHash.equals(List<ContentHash>.get(&definitions, named), callees[callee].definition) {
+              run List<usize>.append(&mut targets, List<usize>.get(&definers, named))
+            }
+            named = InternIndex.after(&defined, named)
+          }
+          callee = callee + usize.ONE
+        }
+        obligation = obligation + usize.ONE
+      }
+      let found = List<usize>.asSlice(&targets)
+      let mut each = usize.ZERO
+      while each < found.length {
+        if found[each] == usize.MAX { return Option<List<bool>>.none() }
+        if !List<bool>.get(&reached, found[each]) {
+          List<bool>.set(&mut reached, found[each], true)
+          run List<usize>.append(&mut queue, found[each])
+        }
+        each = each + usize.ONE
+      }
+    }
+    // A NonParking target nothing reaches joins the walk from the obligation that names it.
+    growing = false
+    at = usize.ZERO
+    while at < nodes.length {
+      if nodes[at].requested && !List<bool>.get(&reached, at) && nodes[at].parent != usize.MAX
+        && List<bool>.get(&reached, nodes[at].parent) {
+        List<bool>.set(&mut reached, at, true)
+        run List<usize>.append(&mut queue, at)
+        growing = true
+      }
+      at = at + usize.ONE
+    }
+  }
+  let mut framed = false
+  at = usize.ZERO
+  while at < nodes.length {
+    let node = &nodes[at]
+    let known = List<bool>.get(&reached, at)
+    at = at + usize.ONE
+    if node.alias != usize.MAX { continue }
+    if u64.bitAnd(node.facts.flags, BuildRecord.FACT_FRAMED) != 0 {
+      if !known { return Option<List<bool>>.none() }
+      framed = true
+    }
+    // A body the image holds that the selecting walk reaches now and did not reach before.
+    if known && !node.live && node.entry != usize.MAX && entries[node.entry].leaf == 0
+      && u64.bitAnd(node.facts.flags, BuildRecord.FACT_SELECTED) == 0 {
+      return Option<List<bool>>.none()
+    }
+  }
+  if !framed { return Option<List<bool>>.none() }
+  return Option<List<bool>>.some(move reached)
 }
 
 // One pending visit of a rewalk (`rewalkBuild`), as `BackendVisit` is of a build walk.
@@ -104867,6 +105893,36 @@ struct RewalkVisit {
   // Whether this is the edge the record's walk first reached the entry by, on the same path, so
   // the entry's own edges are followed on the path they were then.
   same: bool,
+}
+
+// The record entry whose reference `position` reaches an entry, or whose NonParking target
+// `position` it is when `requested`; a root when `parent` is `usize.MAX`, with `position` its
+// index among the roots, or `usize.MAX` when no path to the entry is known.
+struct RewalkLink {
+  parent: usize,
+  position: usize,
+  requested: bool,
+}
+
+impl Copy for RewalkLink {}
+
+// What a rewalk knows of its record's entries' keys, by entry (`Semantic.rewalkKey`): each key
+// once found, and the MIR lowered for an entry, whose references name its targets' keys.
+struct RewalkKeys {
+  keys: List<Option<InstanceKey>>,
+  mirs: List<usize>,
+  // For a record another program's build wrote (`ReplayState.borrowed`), how this walk first
+  // reached each entry, since the record's own path to it can pass through that program's
+  // modules, which this build does not load; empty for the build's own record, whose entries
+  // are found by the paths the record names.
+  links: List<RewalkLink>,
+}
+
+// How `found`'s walk finds the key of entry `at`: the way it first reached the entry when the
+// record is another program's, else the way the record's walk did.
+fn rewalkLink(found: &RewalkKeys, entries: &[BuildRecord.Entry], at: usize) -> RewalkLink {
+  if List<RewalkLink>.length(&found.links) > usize.ZERO { return List<RewalkLink>.get(&found.links, at) }
+  return RewalkLink {parent: entries[at].parent, position: entries[at].position, requested: entries[at].requested}
 }
 
 // One instance a rewalk reached, in walk order.
@@ -105444,6 +106500,9 @@ struct CapturedEntry {
   value: usize,
   mirUnit: usize,
   emissionUnit: usize,
+  // The unit of the frame variant's MIR a frame walk emitted a suspendable instance from, beside
+  // `mirUnit`, the MIR its frame facts were read from; `usize.MAX` for any other entry.
+  frameUnit: usize,
   // The root of the image this store read that holds the definition, when a replay took it from
   // there instead of lowering it; `usize.MAX` otherwise.
   carried: usize,
@@ -105484,11 +106543,20 @@ struct EscapeReplay {
 struct ReplayMir {
   mir: usize,
   mirUnit: usize,
+  // The unit of `mir` when it is a frame variant's MIR, lowered beside the MIR outside any frame
+  // whose unit is `mirUnit`; `usize.MAX` otherwise.
+  frameUnit: usize,
   location: InstanceLocation,
   member: usize,
 }
 
 impl Copy for ReplayMir {}
+
+// The frame variant a replay lowered for one suspendable entry, and the frame facts that name it.
+struct ReplayFrame {
+  lowered: ReplayMir,
+  facts: CoroutineFacts,
+}
 
 // A build record an adoption read, with what the image holds for each entry.
 struct ReplayState {
@@ -105509,6 +106577,9 @@ struct ReplayState {
   packRoots: List<usize>,
   // Whether the record rests on growth guard reads, which a record a rewalk writes cannot carry.
   guarded: bool,
+  // Whether the record is another program's (`Semantic.borrowBuildRecord`): its roots are not this
+  // build's, so it is never replayed, and a rewalk trusts none of its walk's decisions.
+  borrowed: bool,
   // The entries taken above only while inline summaries answer as they did, each with the
   // `summaries` it waits on, and those summaries; `settleSummaries` keeps or drops each entry
   // before a replay reads the others.
@@ -105564,7 +106635,7 @@ impl ReplayState {
     let mut lookup = InternIndex.make()
     let mut state = ReplayState {record: BuildRecord.make(false, false), recordRoot: recordRoot, roots: List<usize>.make(),
       definitions: List<Option<InstanceDefinition>>.make(), places: List<TextPlace>.make(), held: List<bool>.make(),
-      packRoots: move packRoots, guarded: CacheImage.edgesOf(image, roots[recordRoot].node).length > usize.ZERO,
+      packRoots: move packRoots, guarded: CacheImage.edgesOf(image, roots[recordRoot].node).length > usize.ZERO, borrowed: false,
       waiting: List<WaitingEntry>.make(), waitedOn: List<usize>.make(), summaries: List<SummaryRoot>.make()}
     let mut at = usize.ZERO
     while at < entries.length {
@@ -105815,14 +106886,14 @@ impl BuildCapture {
       at = at + usize.ONE
     }
     return BuildCapture {observing: observing, roots: move identities, entries: List<CaptureEntry>.make(), lookup: InternIndex.make(),
-      guarded: false, declared: true, patterns: true, unreplayable: false}
+      guarded: false, declared: true, patterns: true, unreplayable: false, frames: false, selected: List<ContentHash>.make(), selectedFrom: List<usize>.make()}
   }
 
   // An escape walk's capture, whose walk appends its roots as it finds them. Each entry names its
   // declaration, so a replay finds a changed plain body without lowering the bodies above it.
   fn walk() -> BuildCapture {
     return BuildCapture {observing: false, roots: List<ContentHash>.make(), entries: List<CaptureEntry>.make(), lookup: InternIndex.make(),
-      guarded: false, declared: true, patterns: false, unreplayable: false}
+      guarded: false, declared: true, patterns: false, unreplayable: false, frames: false, selected: List<ContentHash>.make(), selectedFrom: List<usize>.make()}
   }
 
   // Adds the entry of a newly reached instance.
@@ -105838,7 +106909,8 @@ impl BuildCapture {
     run List<CaptureEntry>.append(&mut self.entries, CaptureEntry {digest: digest, hash: InstanceKey.runtimeHash(instance),
       family: EmissionPlan.familyName(instance), declaration: move declaration, parent: origin.parent, position: origin.position,
       requested: origin.requested, alias: usize.MAX, leaf: 0, targets: List<ContentHash>.make(), edges: List<ContentHash>.make(),
-      summary: ContentHash {high: 0, low: 0}, value: usize.MAX, mirUnit: usize.MAX, emissionUnit: usize.MAX, facts: move facts})
+      summary: ContentHash {high: 0, low: 0}, value: usize.MAX, mirUnit: usize.MAX, emissionUnit: usize.MAX, frameUnit: usize.MAX,
+      facts: move facts})
   }
 
   // Adds the entry of an instance an escape walk reached without entering it, as `leaf` says.
@@ -105896,6 +106968,55 @@ impl BuildCapture {
     entries[entry].mirUnit = mirUnit
   }
 
+  // Marks `entry` as a suspendable instance a frame walk emitted from the frame variant whose MIR
+  // unit is `frameUnit`: its cycle `component`, whether a caller's frame may run its body
+  // (`forwards`), and the digest `selecting` of what the frame selection read of its MIR outside
+  // any frame, whose references are `references`.
+  //
+  // `ordinary` is the summary of that MIR. What it escapes and the local-shared accesses it holds
+  // join the entry's facts, so a rewalk's escape check reads what the selecting walk checked.
+  effect fn framed(self: &mut Self, entry: usize, frameUnit: usize, component: usize, forwards: bool, selecting: ContentHash,
+    references: &[MirReference], ordinary: &SuspensionSummary) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut at = usize.ZERO
+    while at < references.length {
+      run List<ContentHash>.append(&mut self.selected, run keyDigest(&references[at].key, self.patterns))
+      run List<usize>.append(&mut self.selectedFrom, entry)
+      at = at + usize.ONE
+    }
+    let entries = List<CaptureEntry>.asMutSlice(&mut self.entries)
+    entries[entry].frameUnit = frameUnit
+    let mut flags = u64.bitOr(entries[entry].facts.flags, BuildRecord.FACT_FRAMED)
+    if forwards { flags = u64.bitOr(flags, BuildRecord.FACT_FORWARDS) }
+    if List<SummaryEscape>.length(&ordinary.escapes) > usize.ZERO { flags = u64.bitOr(flags, BuildRecord.FACT_ESCAPES) }
+    let accesses = List<CallbackBoundary>.asSlice(&ordinary.accesses)
+    if accesses.length > usize.ZERO { flags = u64.bitOr(flags, BuildRecord.FACT_ACCESSES) }
+    at = usize.ZERO
+    while at < accesses.length {
+      run List<ContentHash>.append(&mut entries[entry].facts.callbacks, run InstanceKey.definitionDigest(&accesses[at].key))
+      at = at + usize.ONE
+    }
+    entries[entry].facts.flags = flags
+    entries[entry].facts.component = component
+    entries[entry].facts.selecting = selecting
+  }
+
+  // Marks every entry whose definition digest is one of `parking` as able to park externally
+  // (`BuildRecord.FACT_PARKS`), and every one whose definition digest is one of `selected` as
+  // reached by the walk that selected the frames (`BuildRecord.FACT_SELECTED`).
+  fn parks(self: &mut Self, parking: &DigestSet, selected: &DigestSet) -> () {
+    let entries = List<CaptureEntry>.asMutSlice(&mut self.entries)
+    let mut at = usize.ZERO
+    while at < entries.length {
+      if DigestSet.find(parking, entries[at].facts.definition) != usize.MAX {
+        entries[at].facts.flags = u64.bitOr(entries[at].facts.flags, BuildRecord.FACT_PARKS)
+      }
+      if DigestSet.find(selected, entries[at].facts.definition) != usize.MAX {
+        entries[at].facts.flags = u64.bitOr(entries[at].facts.flags, BuildRecord.FACT_SELECTED)
+      }
+      at = at + usize.ONE
+    }
+  }
+
   // Adds what `summary`, the summary of `entry`'s MIR, tells a rewalk to the entry's facts.
   effect fn summarized(self: &mut Self, entry: usize, summary: &SuspensionSummary, observes: bool) -> ()
   ! OutOfMemoryError ? &mut Allocator {
@@ -105939,8 +107060,15 @@ impl BuildCapture {
   effect fn finish(self: BuildCapture, guard: usize) -> Option<CapturedBuild> ! OutOfMemoryError ? &mut Allocator {
     let mut record = BuildRecord.make(self.observing, self.patterns)
     record.guarded = guard != usize.MAX
+    record.frames = self.frames
     let mut rested = List<CapturedEntry>.make()
     let mut captured = move self
+    let selected = List<ContentHash>.asSlice(&captured.selected)
+    let mut reached = usize.ZERO
+    while reached < selected.length {
+      if BuildCapture.find(&captured, selected[reached]) == usize.MAX { return Option<CapturedBuild>.none() }
+      reached = reached + usize.ONE
+    }
     let count = List<CaptureEntry>.length(&captured.entries)
     run List<BuildRecord.Entry>.reserveExact(&mut record.entries, count)
     run List<CapturedEntry>.reserveExact(&mut rested, count)
@@ -105953,6 +107081,7 @@ impl BuildCapture {
       if entry.alias == usize.MAX && entry.leaf == 0 && (!lowered || (entry.value != usize.MAX && entry.emissionUnit == usize.MAX)) {
         return Option<CapturedBuild>.none()
       }
+      if u64.bitAnd(entry.facts.flags, BuildRecord.FACT_FRAMED) != 0 && entry.frameUnit == usize.MAX { return Option<CapturedBuild>.none() }
       let mut references = List<BuildRecord.Reference>.make()
       let targets = List<ContentHash>.asSlice(&entry.targets)
       run List<BuildRecord.Reference>.reserveExact(&mut references, targets.length)
@@ -105981,8 +107110,16 @@ impl BuildCapture {
         hash: kept.hash, family: kept.family, declaration: move declaration, parent: kept.parent,
         position: kept.position, requested: kept.requested, alias: kept.alias, leaf: kept.leaf, references: move references,
         summary: kept.summary, facts: move facts})
-      run List<CapturedEntry>.append(&mut rested, CapturedEntry {value: kept.value, mirUnit: kept.mirUnit, emissionUnit: kept.emissionUnit,
+      run List<CapturedEntry>.append(&mut rested, CapturedEntry {value: kept.value, mirUnit: kept.mirUnit, emissionUnit: kept.emissionUnit, frameUnit: kept.frameUnit,
         carried: usize.MAX})
+    }
+    let from = List<usize>.asSlice(&captured.selectedFrom)
+    reached = usize.ZERO
+    while reached < from.length {
+      let target = BuildCapture.find(&captured, List<ContentHash>.get(&captured.selected, reached))
+      let framed = List<BuildRecord.Entry>.asMutSlice(&mut record.entries)
+      run List<usize>.append(&mut framed[from[reached]].facts.ordinary, target)
+      reached = reached + usize.ONE
     }
     record.roots = move captured.roots
     return Option<CapturedBuild>.some(CapturedBuild {record: move record, entries: move rested, guard: guard, carriedRecord: usize.MAX})
@@ -106374,7 +107511,7 @@ impl SuspensionSummary {
       let mut statement = usize.ZERO
       while statement < statements.length {
         if let MirStatement.Assign {value: MirRvalue.FunctionAddress {key}, origin, ..} = &statements[statement] {
-          if InstanceKey.fixedLinkage(&key) {
+          if InstanceKey.cEntry(&key) {
             run List<CallbackBoundary>.append(&mut callbacks, CallbackBoundary {key: InstanceKey.copy(&key), span: anchoredSpan(anchor, origin)})
           }
           if !startHelper(&key) { run List<InstanceKey>.append(&mut indirect, InstanceKey.copy(&key)) }
@@ -106621,7 +107758,7 @@ effect fn closeSuspendable(summaries: &[SuspensionSummary]) -> List<bool> ! OutO
   let mut any = false
   let mut at = usize.ZERO
   while at < summaries.length {
-    let shim = InstanceKey.fixedLinkage(&summaries[at].key)
+    let shim = InstanceKey.cEntry(&summaries[at].key)
     let origin = match &summaries[at].boundary {
       Option<Span>.Some {..} => !shim
       Option<Span>.None => false
@@ -106854,6 +107991,18 @@ effect fn closeParking(summaries: &[SuspensionSummary]) -> List<bool> ! OutOfMem
   }
   run closeCallers(&mut marked, List<List<CallEdge>>.asSlice(&callers), &[])
   return move marked
+}
+
+// Adds the definition digest of each of `summaries` that can park externally to `parking`.
+effect fn parkingDefinitions(summaries: &[SuspensionSummary], parking: &mut DigestSet) -> () ! OutOfMemoryError ? &mut Allocator {
+  let parks = run closeParking(summaries)
+  let marked = List<bool>.asSlice(&parks)
+  let mut at = usize.ZERO
+  while at < marked.length {
+    if marked[at] { drop run DigestSet.add(&mut parking.*, run InstanceKey.definitionDigest(&summaries[at].key)) }
+    at = at + usize.ONE
+  }
+  return ()
 }
 
 // The provider-free key of each summary: an obligated value names its target's application,
@@ -107400,26 +108549,36 @@ effect fn localSharedEscapes(resolver: &Resolver, summaries: &[SuspensionSummary
 // The closed suspendable set of one build, the recursive cycle each member belongs to, and the
 // storage export symbols its frames use.
 struct FrameSelection {
-  suspendable: List<InstanceKey>,
+  // Each member's definition digest, which every region pattern of its application shares, so a
+  // replay selects from a build record's entries what the walk selected from keys.
+  suspendable: List<ContentHash>,
   /// Per member, its strongly connected component in the suspendable call graph: two members
   /// share one exactly when each can call the other.
   components: List<usize>,
   lookup: InternIndex,
   symbols: List<Bytes>,
+  // Per member, the MIR outside any frame of a body a suspendable caller may run in its own frame
+  // at a suspension point, or `usize.MAX`.
   bodies: List<usize>,
+  // The definition digest of each instance the walk that selected the frames found able to park
+  // externally (`closeParking`).
+  parking: DigestSet,
+  // The definition digest of each instance that walk summarized.
+  reached: DigestSet,
 }
 
 impl FrameSelection {
   fn make() -> FrameSelection {
-    return FrameSelection {suspendable: List<InstanceKey>.make(), components: List<usize>.make(), lookup: InternIndex.make(),
-      symbols: List<Bytes>.make(), bodies: List<usize>.make()}
+    return FrameSelection {suspendable: List<ContentHash>.make(), components: List<usize>.make(), lookup: InternIndex.make(),
+      symbols: List<Bytes>.make(), bodies: List<usize>.make(), parking: DigestSet.make(), reached: DigestSet.make()}
   }
 
-  effect fn include(self: &mut Self, key: &InstanceKey, component: usize) -> () ! OutOfMemoryError ? &mut Allocator {
-    run List<InstanceKey>.append(&mut self.suspendable, InstanceKey.copy(key))
+  // Adds the member whose definition digest is `definition`.
+  effect fn include(self: &mut Self, definition: ContentHash, component: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    run List<ContentHash>.append(&mut self.suspendable, definition)
     run List<usize>.append(&mut self.components, component)
     run List<usize>.append(&mut self.bodies, usize.MAX)
-    run InternIndex.record(&mut self.lookup, InstanceKey.runtimeHash(key))
+    run InternIndex.record(&mut self.lookup, digestHash(definition))
   }
 
   // Binds the next operation in create, acquire, release, destroy order.
@@ -107434,10 +108593,11 @@ impl FrameSelection {
 
   // The suspendable entry that is `key`'s backend instance, or `usize.MAX`.
   effect fn position(self: &Self, key: &InstanceKey) -> usize ! OutOfMemoryError ? &mut Allocator {
-    let listed = List<InstanceKey>.asSlice(&self.suspendable)
-    let mut at = InternIndex.first(&self.lookup, InstanceKey.runtimeHash(key))
+    let definition = run definitionDigest(key)
+    let listed = List<ContentHash>.asSlice(&self.suspendable)
+    let mut at = InternIndex.first(&self.lookup, digestHash(definition))
     while at != usize.MAX {
-      if run InstanceKey.sameInstance(&listed[at], key) { return at }
+      if ContentHash.equals(listed[at], definition) { return at }
       at = InternIndex.after(&self.lookup, at)
     }
     return usize.MAX
@@ -107529,6 +108689,74 @@ impl FrameSelection {
       destroy: run Bytes.copy(Bytes.asSlice(&symbols[3])),
     }
   }
+}
+
+// Whether a suspendable caller may run `function`, a suspendable instance's MIR outside any
+// frame, in its own frame at a suspension point (`FrameSelection.bodies`).
+fn frameForwards(resolver: &Resolver, function: &MirFunction) -> bool {
+  return resolver.inlining && !resolver.lineTables && MirInline.eligible(function, resolver.direct)
+}
+
+// The roots of a frame walk: `roots`, then the four storage `exports`, whose symbols `selection`
+// binds in their order.
+effect fn frameRoots(selection: &mut FrameSelection, roots: &[BuildRoot], exports: &[StorageExport]) -> List<BuildRoot>
+! OutOfMemoryError ? &mut Allocator {
+  let mut extended = run List<BuildRoot>.makeWithCapacity(roots.length + exports.length)
+  let mut at = usize.ZERO
+  while at < roots.length {
+    run List<BuildRoot>.append(&mut extended, BuildRoot {key: InstanceKey.copy(&roots[at].key), span: roots[at].span, retained: roots[at].retained})
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < exports.length {
+    run FrameSelection.bind(&mut selection.*, run Bytes.copy(Bytes.asSlice(&exports[at].symbol)))
+    run List<BuildRoot>.append(&mut extended, BuildRoot {key: InstanceKey.copy(&exports[at].key), span: exports[at].span, retained: false})
+    at = at + usize.ONE
+  }
+  return move extended
+}
+
+// The digest of what the walk that selects a build's frames reads of `function`, the MIR outside
+// any frame of suspendable `instance`: its references and its summary, which decide what that
+// walk reaches and which instances it selects; whether a caller's frame may run its body
+// (`forwards`); and the calls, size and line table `FrameSelection.facts` reads of it, for its own
+// frame or a caller's. While it reads the same, the selection and every frame it names do.
+effect fn selectingDigest(function: &MirFunction, instance: &InstanceKey, forwards: bool, entrySpan: Span) -> ContentHash
+! OutOfMemoryError ? &mut Allocator {
+  let owner = DeclarationId.copyShared(&InstanceKey.identity(instance))
+  let module = DeclarationId.moduleId(&owner)
+  let summary = run SuspensionSummary.make(function, instance, module, &Option<Anchor>.none(), module, entrySpan)
+  let summarized = run summaryDigest(&summary, function.observes, true)
+  let mut bytes = Bytes.make()
+  run RuntimeEncoding.word(&mut bytes, summarized.high)
+  run RuntimeEncoding.word(&mut bytes, summarized.low)
+  run RuntimeEncoding.word(&mut bytes, presence(forwards))
+  run RuntimeEncoding.word(&mut bytes, presence(List<u64>.length(&function.lines) == usize.ZERO))
+  let references = List<MirReference>.asSlice(&function.references)
+  run RuntimeEncoding.word(&mut bytes, usize.toU64(references.length))
+  let mut at = usize.ZERO
+  while at < references.length {
+    let exact = run instanceDigest(&references[at].key)
+    let edge = recordDigest(Bytes.asSlice(&run Edge.recordBytes(&references[at].edge, &owner)))
+    run RuntimeEncoding.word(&mut bytes, exact.high)
+    run RuntimeEncoding.word(&mut bytes, exact.low)
+    run RuntimeEncoding.word(&mut bytes, edge.high)
+    run RuntimeEncoding.word(&mut bytes, edge.low)
+    at = at + usize.ONE
+  }
+  let blocks = List<MirBlock>.asSlice(&function.blocks)
+  run RuntimeEncoding.word(&mut bytes, usize.toU64(blocks.length))
+  at = usize.ZERO
+  while at < blocks.length {
+    if let MirTerminator.Call {callee: MirCallee.Instance {key}, ..} = &blocks[at].terminator {
+      let called = run definitionDigest(&key)
+      run RuntimeEncoding.word(&mut bytes, usize.toU64(at))
+      run RuntimeEncoding.word(&mut bytes, called.high)
+      run RuntimeEncoding.word(&mut bytes, called.low)
+    }
+    at = at + usize.ONE
+  }
+  return ContentHash.of(Bytes.asSlice(&bytes))
 }
 
 // One selected storage operation's export root and its symbol.
@@ -107626,7 +108854,9 @@ effect fn exportCandidates(resolver: &mut Resolver, module: &ModuleId) -> Option
         if let Node.FunctionHeader {name, linkage, ..} = Module.node(hir, declarations[at].header) {
           if linkage.present {
             if let Node.Linkage {direction, symbol, ..} = Module.node(hir, linkage.id) {
-              if direction == LinkageDirection.Export {
+              // A generic export publishes no symbol and roots nothing: an address taken at an
+              // instantiation reaches that instantiation's thunk.
+              if direction == LinkageDirection.Export && !genericExportHeader(hir, declarations[at].header) {
                 let mut written = Bytes.make()
                 if let Node.Name {text} = Module.node(hir, name) { written = run Bytes.copy(Module.text(hir, text)) }
                 let mut linked = run Bytes.copy(Bytes.asSlice(&written))
@@ -107658,6 +108888,9 @@ struct ForeignClaim {
   header: Span,
   exported: bool,
   global: bool,
+  /// Whether the declaration is a generic export, which claims no symbol: each instantiation's
+  /// thunk has a private symbol derived from it. Its C signature is still classified as written.
+  generic: bool,
   /// Whether the module's syntax is damaged, so recovery may have invented this spelling.
   damaged: bool,
 }
@@ -107694,7 +108927,8 @@ effect fn appendForeignClaim(found: &mut List<ForeignClaim>, hir: &Module, modul
     }
     run List<ForeignClaim>.append(&mut found.*, ForeignClaim {
       module: module, declaration: declaration, symbol: move spelled, span: span, header: header,
-      exported: direction == LinkageDirection.Export, global: global, damaged: damaged,
+      exported: direction == LinkageDirection.Export, global: global, generic: !global && genericExportHeader(hir, owner),
+      damaged: damaged,
     })
   }
   return ()

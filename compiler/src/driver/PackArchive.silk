@@ -13,14 +13,22 @@
 //! The archive's `silk.toml` is the package's own, except that each dependency written
 //! `{ workspace = true }` is written out as the workspace's `[workspace.dependencies]` has it:
 //! whoever downloads the archive has the package, not the workspace around it.
+//!
+//! A binary archive, one per built target of an executable, holds the executable and the files
+//! that document the package. `[pack.binary]` in the manifest says a package ships them and how:
+//! `format` is `tar.gz` or `zip`, `layout` is `bin` (the executable in `bin/`) or `flat` (at the
+//! top), and `include` adds files and directories at their paths in the package.
+//! `[pack.binary.target.<target>]` replaces any of the three for one target.
 
 import driver.ManifestFields
+import driver.ModuleSources {EmbeddedRead}
 import driver.Project as Projects {Project}
 import driver.WorkspaceDependencies as Workspaces {Shared}
 import tomledit.ManifestEdit as ManifestEdits {ManifestEditRefused}
 import silk.compress.deflate {EncodeError, EncodeWriter, Options as DeflateOptions}
 import silk.compress.inflate {Format}
 import silk.compress.tar {TarError, TarWriter}
+import silk.compress.zip {ZipError, ZipWriter}
 import silk.io.writer {Writer, WriterError}
 import silk.mem.allocator {Allocator, OutOfMemoryError, SystemAllocator}
 import silk.mem.box {Box}
@@ -254,8 +262,9 @@ pub effect fn manifestText(project: &Project) -> Bytes
 }
 
 /// Checks that the package described by `document`, its manifest as [`manifestText`] writes it for
-/// the archive, can be packed: it writes `[package].version`, and none of its dependencies is a
-/// path dependency, which nobody downloading the archive has.
+/// the archive, can be packed: it writes `[package].version`, none of its dependencies is a
+/// path dependency, which nobody downloading the archive has, and `[pack.binary]` is written
+/// only by an executable.
 ///
 /// # Errors
 /// - `PackRefused` naming the first problem.
@@ -264,6 +273,14 @@ pub effect fn checkManifest(document: &TomlValue) -> ()
   ? &mut Allocator {
   if let Option<&[u8]>.None = ManifestFields.packageText(document, "version") {
     fail run refuse(&[b"[package] has no version; write one, as version = \"0.1.0\", to name the archive"])
+  }
+  // Binary archives hold an executable, so the table on any other kind would do nothing.
+  if packsBinaries(document) {
+    if let Option<string>.Some {value: kind} = move Toml.asString(ManifestFields.kind(document)) {
+      if kind != "executable" {
+        fail run refuse(&[b"[pack.binary] archives an executable, and [package].kind is ", String.utf8Bytes(kind), b"; remove the table"])
+      }
+    }
   }
   if let Option<&TomlValue>.Some {value: listed} = move Toml.field(document, "dependencies") {
     if let Option<&[TomlChild]>.Some {value: children} = move members(listed) {
@@ -368,7 +385,7 @@ effect fn add(files: &mut List<Bytes>, directory: &Path, path: &Path) -> () ! Ou
 
 // Refuses `relative`, an include entry below `directory`, when any segment of it is a symbolic
 // link. A segment that does not exist is left for the caller to report.
-effect fn refuseLinks(directory: &Path, relative: &[u8]) -> () ! PackRefused | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+effect fn refuseLinks(directory: &Path, relative: &[u8], label: &[u8]) -> () ! PackRefused | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
   let mut parent = run Path.fromBytes(Path.rawBytes(directory))
   let mut start = usize.ZERO
   while start < relative.length {
@@ -389,7 +406,7 @@ effect fn refuseLinks(directory: &Path, relative: &[u8]) -> () ! PackRefused | F
     let mut at = usize.ZERO
     while at < entries.length {
       if same(Path.rawBytes(&entries[at].path), Path.rawBytes(&child)) && entries[at].kind.code == FileSystem.entryKindCode(FileSystem.symbolicLink()) {
-        fail run refuse(&[b"[package].include entry ", relative, b" passes through a symbolic link; an archive holds only files and directories"])
+        fail run refuse(&[label, b" entry ", relative, b" passes through a symbolic link; an archive holds only files and directories"])
       }
       at = at + usize.ONE
     }
@@ -448,6 +465,44 @@ fn contained(relative: &[u8]) -> bool {
   return true
 }
 
+// Adds the files and directories the manifest array `include` names to `files`. `label` names
+// the array in a refusal, such as `[package].include`.
+effect fn included(files: &mut List<Bytes>, project: &Project, include: &TomlValue, label: &[u8]) -> ()
+  ! PackRefused | FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let directory = Projects.directory(project)
+  let skip = Projects.outputDirectory(project)
+  let mut at = usize.ZERO
+  while true {
+    let item = match move Toml.item(include, at) {
+      Option<&TomlValue>.Some {value} => value
+      Option<&TomlValue>.None => { break }
+    }
+    at = at + usize.ONE
+    let relative = match move Toml.asString(Option<&TomlValue>.some(item)) {
+      Option<string>.Some {value} => String.utf8Bytes(value)
+      Option<string>.None => { continue }
+    }
+    if !contained(relative) {
+      fail run refuse(&[label, b" entry ", relative, b" is not a path below the package directory"])
+    }
+    // `stat` follows links, so each segment of the entry is looked up in its parent first.
+    run refuseLinks(directory, relative, label)
+    let path = run Path.joinBytes(directory, relative)
+    match move run Effect.result(FileSystem.stat(&path)) {
+      Result<FileInfo | DirectoryInfo, FileError>.Success {value} => match move value {
+        DirectoryInfo _directory => run walk(&mut files.*, directory, &path, skip)
+        FileInfo _file => run add(&mut files.*, directory, &path)
+      }
+      Result<FileInfo | DirectoryInfo, FileError>.Failure {error} => {
+        drop error
+        fail run refuse(&[label, b" entry ", relative, b" names no file or directory"])
+      }
+    }
+  }
+  return ()
+}
+
 /// The files `silk pack` puts in the archive of `project`, as paths relative to the package
 /// directory, in byte order.
 ///
@@ -478,34 +533,7 @@ pub effect fn files(project: &Project) -> List<Bytes>
   }
   let document = run Projects.document(project)
   if let Option<&TomlValue>.Some {value: include} = move Toml.fieldAt(Toml.field(&document, "package"), "include") {
-    let mut at = usize.ZERO
-    while true {
-      let item = match move Toml.item(include, at) {
-        Option<&TomlValue>.Some {value} => value
-        Option<&TomlValue>.None => { break }
-      }
-      at = at + usize.ONE
-      let relative = match move Toml.asString(Option<&TomlValue>.some(item)) {
-        Option<string>.Some {value} => String.utf8Bytes(value)
-        Option<string>.None => { continue }
-      }
-      if !contained(relative) {
-        fail run refuse(&[b"[package].include entry ", relative, b" is not a path below the package directory"])
-      }
-      // `stat` follows links, so each segment of the entry is looked up in its parent first.
-      run refuseLinks(directory, relative)
-      let path = run Path.joinBytes(directory, relative)
-      match move run Effect.result(FileSystem.stat(&path)) {
-        Result<FileInfo | DirectoryInfo, FileError>.Success {value} => match move value {
-          DirectoryInfo _directory => run walk(&mut files, directory, &path, skip)
-          FileInfo _file => run add(&mut files, directory, &path)
-        }
-        Result<FileInfo | DirectoryInfo, FileError>.Failure {error} => {
-          drop error
-          fail run refuse(&[b"[package].include entry ", relative, b" names no file or directory"])
-        }
-      }
-    }
+    run included(&mut files, project, include, b"[package].include")
   }
   let root = run FileSystem.listDirectory(directory)
   let listed = List<DirectoryEntry>.asSlice(&root)
@@ -517,6 +545,34 @@ pub effect fn files(project: &Project) -> List<Bytes>
     if documentsPackage(lastName(Path.rawBytes(&entry.path))) { run add(&mut files, directory, &entry.path) }
   }
   return run sortPaths(move files)
+}
+
+/// Refuses `files`, the archive of a package as [`files`] lists it, when the package embeds a
+/// file the archive does not hold.
+///
+/// # Details
+/// `reads` are the embedded files the check of the package read and found present. A package that
+/// depends on the archive reads each of them from it, so a file left out would build here and
+/// fail there. A module the check does not reach, as a test module is, asks for nothing.
+///
+/// # Errors
+/// - `PackRefused` naming the module, the embedded file and the `[package].include` key.
+pub effect fn checkEmbedded(files: &[Bytes], reads: &[EmbeddedRead]) -> () ! PackRefused | OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < reads.length {
+    let embedded = Bytes.asSlice(&reads[at].path)
+    let mut held = false
+    let mut seen = usize.ZERO
+    while seen < files.length {
+      if same(Bytes.asSlice(&files[seen]), embedded) { held = true }
+      seen = seen + usize.ONE
+    }
+    if !held {
+      fail run refuse(&[b"module ", Bytes.asSlice(&reads[at].reader), b" embeds ", embedded, b", which the archive would not hold; add it to [package].include"])
+    }
+    at = at + usize.ONE
+  }
+  return ()
 }
 
 // `paths` in byte order, by selection: a package holds few enough files.
@@ -634,16 +690,140 @@ effect fn finished(writer: TarWriter, gzip: EncodeWriter<Collected>) -> Bytes ! 
   }
 }
 
-/// The binary archive of `project` for one built executable at `executable`: the
-/// `<name>-<version>-<platform>.tar.gz` file whose top directory `<name>-<version>-<platform>/`
-/// holds the executable in `bin/` and the `README`, `LICENSE`, `LICENCE`, `COPYING` and
-/// `CHANGELOG` files among `files`, the source archive's list. `platform` is the target name,
-/// followed by `-<profile>` for a named profile.
+/// How one target's binary archive is written: the `[pack.binary]` settings with those of
+/// `[pack.binary.target.<target>]` in their place.
+pub struct BinaryLayout {
+  /// Whether the archive is a ZIP file; otherwise a gzip-compressed tar file.
+  pub zip: bool,
+
+  /// Whether the executable sits at the top of the archive; otherwise in `bin/`.
+  pub flat: bool,
+
+  /// The files `include` adds, as paths relative to the package directory, in byte order.
+  pub include: List<Bytes>,
+
+  /// The manifest array `include` came from, such as `[pack.binary].include`, for a refusal.
+  pub label: Bytes,
+}
+
+/// Whether the manifest `document` has a `[pack.binary]` table, so `silk pack` writes binary
+/// archives without `--bin`.
+pub fn packsBinaries(document: &TomlValue) -> bool {
+  return Option<&TomlValue>.isSome(&Toml.fieldAt(Toml.field(document, "pack"), "binary"))
+}
+
+// `[pack.binary.target.<target>]`, when the manifest writes one.
+fn targetTable<'a>(binary: Option<&'a TomlValue>, target: &[u8]) -> Option<&'a TomlValue> {
+  if let Option<&TomlValue>.Some {value: targets} = move Toml.fieldAt(binary, "target") {
+    if let Option<&[TomlChild]>.Some {value: children} = move members(targets) {
+      let mut at = usize.ZERO
+      while at < children.length {
+        if let TomlChild.Member {entry} = &children[at] {
+          if same(String.ownedUtf8Bytes(&entry.key), target) { return Option<&'a TomlValue>.some(&entry.value) }
+        }
+        at = at + usize.ONE
+      }
+    }
+  }
+  return Option<&'a TomlValue>.none()
+}
+
+/// How `project`'s binary archive for `target` is written. A package without `[pack.binary]`
+/// gets a tar file with the executable in `bin/` and no added file.
 ///
 /// # Errors
-/// - `PackRefused` when a path cannot be stored.
+/// - `PackRefused` when an `include` entry is not a path below the package directory, names
+///   nothing, or would pack a symbolic link.
+/// - `FileError` when a directory cannot be listed.
+pub effect fn binaryLayout(project: &Project, target: &[u8]) -> BinaryLayout
+  ! PackRefused | FileError | TomlError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let document = run Projects.document(project)
+  let binary = Toml.fieldAt(Toml.field(&document, "pack"), "binary")
+  let specific = targetTable(binary, target)
+  let mut format = Toml.asString(Toml.fieldAt(specific, "format"))
+  if Option<string>.isNone(&format) { format = Toml.asString(Toml.fieldAt(binary, "format")) }
+  let mut layout = Toml.asString(Toml.fieldAt(specific, "layout"))
+  if Option<string>.isNone(&layout) { layout = Toml.asString(Toml.fieldAt(binary, "layout")) }
+  let mut zip = false
+  if let Option<string>.Some {value} = move format { zip = value == "zip" }
+  let mut flat = false
+  if let Option<string>.Some {value} = move layout { flat = value == "flat" }
+  let mut include = List<Bytes>.make()
+  let mut label = run Bytes.copy(b"[pack.binary].include")
+  if let Option<&TomlValue>.Some {value: listed} = move Toml.fieldAt(specific, "include") {
+    label = run Bytes.copy(b"[pack.binary.target.")
+    run Bytes.append(&mut label, target)
+    run Bytes.append(&mut label, b"].include")
+    run included(&mut include, project, listed, Bytes.asSlice(&label))
+  } else if let Option<&TomlValue>.Some {value: listed} = move Toml.fieldAt(binary, "include") {
+    run included(&mut include, project, listed, Bytes.asSlice(&label))
+  }
+  return BinaryLayout {zip: zip, flat: flat, include: run sortPaths(move include), label: move label}
+}
+
+// Whether `path` is below the directory `directory`, both relative paths.
+fn under(path: &[u8], directory: &[u8]) -> bool {
+  return path.length > directory.length && startsWith(path, directory) && path[directory.length] == 47
+}
+
+// A binary archive being written, in either format.
+union ArchiveWriter {
+  Tar {writer: TarWriter, gzip: EncodeWriter<Collected>},
+  Zip {writer: ZipWriter, bytes: Collected},
+}
+
+// Adds one file to a binary archive, refusing a path its format cannot store.
+effect fn storeIn(archive: &mut ArchiveWriter, member: &[u8], content: &[u8], executable: bool) -> ()
+  ! PackRefused | OutOfMemoryError
+  ? &mut Allocator {
+  return match &mut archive.* {
+    ArchiveWriter.Tar {writer, gzip} => run store(&mut writer, &mut gzip, member, member, content, executable)
+    ArchiveWriter.Zip {writer, bytes} => {
+      let added = run Effect.result(ZipWriter.file(&mut writer, member, content, executable) |> Effect.provideMut<Writer>(&mut bytes))
+      match move added {
+        Result<(), ZipError | WriterError | OutOfMemoryError>.Success {..} => ()
+        Result<(), ZipError | WriterError | OutOfMemoryError>.Failure {error} => match move error {
+          ZipError reason => { fail run refuse(&[member, b" cannot be stored in a ZIP archive: ", String.utf8Bytes(ZipError.describe(reason))]) }
+          // Only the in-memory archive can fail, when it cannot grow.
+          WriterError _full => { fail OutOfMemoryError {} }
+          OutOfMemoryError exhausted => { fail move exhausted }
+        }
+      }
+    }
+  }
+}
+
+// Ends a binary archive and returns its bytes.
+effect fn finishedIn(archive: ArchiveWriter) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  match move archive {
+    ArchiveWriter.Tar {writer, gzip} => { return run finished(move writer, move gzip) }
+    ArchiveWriter.Zip {writer, bytes} => {
+      let mut collected = move bytes
+      let ended = run Effect.result(ZipWriter.finish(move writer) |> Effect.provideMut<Writer>(&mut collected))
+      match move ended {
+        Result<(), ZipError | WriterError | OutOfMemoryError>.Success {..} => ()
+        // An archive of release files is far below the sizes that need ZIP64.
+        Result<(), ZipError | WriterError | OutOfMemoryError>.Failure {..} => { fail OutOfMemoryError {} }
+      }
+      let Collected {bytes: written, allocator: _} = move collected
+      return move written
+    }
+  }
+}
+
+/// The binary archive of `project` for one built executable at `executable`: the
+/// `<name>-<version>-<platform>.tar.gz` or `.zip` file whose top directory
+/// `<name>-<version>-<platform>/` holds the executable, in `bin/` unless `layout` is flat, the
+/// `README`, `LICENSE`, `LICENCE`, `COPYING` and `CHANGELOG` files among `files`, the source
+/// archive's list, and the files `layout` includes. `platform` is the target name, followed by
+/// `-<profile>` for a named profile.
+///
+/// # Errors
+/// - `PackRefused` when a path cannot be stored, or an included file is at the executable's
+///   path, above it or below it.
 /// - `FileError` when a file cannot be read.
-pub effect fn binaryArchive(project: &Project, platform: &[u8], executable: &Path, files: &[Bytes]) -> Packed
+pub effect fn binaryArchive(project: &Project, platform: &[u8], executable: &Path, files: &[Bytes], layout: &BinaryLayout) -> Packed
   ! PackRefused | FileError | TomlError | OutOfMemoryError
   ? &mut FileSystem | &mut Allocator {
   let document = run Projects.document(project)
@@ -652,29 +832,63 @@ pub effect fn binaryArchive(project: &Project, platform: &[u8], executable: &Pat
   run Bytes.append(&mut top, ManifestFields.version(&document))
   run Bytes.append(&mut top, b"-")
   run Bytes.append(&mut top, platform)
-  let mut writer = TarWriter.make()
-  let mut gzip = run compressor()
+  let mut archive = if layout.zip {
+    ArchiveWriter.Zip {writer: ZipWriter.make(), bytes: Collected {bytes: Bytes.make(), allocator: Allocator.systemAllocatorProvider()}}
+  } else {
+    ArchiveWriter.Tar {writer: TarWriter.make(), gzip: run compressor()}
+  }
   let mut count = usize.ZERO
   let program = run FileSystem.readFile(executable)
+  let mut placed = Bytes.make()
+  if !layout.flat { run Bytes.append(&mut placed, b"bin/") }
+  run Bytes.append(&mut placed, lastName(Path.rawBytes(executable)))
   let mut member = run Bytes.copy(Bytes.asSlice(&top))
-  run Bytes.append(&mut member, b"/bin/")
-  run Bytes.append(&mut member, lastName(Path.rawBytes(executable)))
-  run store(&mut writer, &mut gzip, Bytes.asSlice(&member), Bytes.asSlice(&member), Bytes.asSlice(&program), true)
+  run Bytes.append(&mut member, b"/")
+  run Bytes.append(&mut member, Bytes.asSlice(&placed))
+  run storeIn(&mut archive, Bytes.asSlice(&member), Bytes.asSlice(&program), true)
   count = count + usize.ONE
+  // The documenting files, then the included ones that are not among them.
+  let mut added = List<Bytes>.make()
   let mut at = usize.ZERO
   while at < files.length {
     let relative = Bytes.asSlice(&files[at])
     at = at + usize.ONE
     if lastName(relative).length != relative.length || !documentsPackage(relative) { continue }
+    run List<Bytes>.append(&mut added, run Bytes.copy(relative))
+  }
+  let extra = List<Bytes>.asSlice(&layout.include)
+  let mut one = usize.ZERO
+  while one < extra.length {
+    let relative = Bytes.asSlice(&extra[one])
+    one = one + usize.ONE
+    // The executable's path, a directory on the way to it, or a file below it cannot be both.
+    if same(relative, Bytes.asSlice(&placed)) || under(Bytes.asSlice(&placed), relative) || under(relative, Bytes.asSlice(&placed)) {
+      fail run refuse(&[Bytes.asSlice(&layout.label), b" holds ", relative, b", which takes the place of the executable at ", Bytes.asSlice(&placed), b" in the archive"])
+    }
+    let mut known = false
+    let listed = List<Bytes>.asSlice(&added)
+    let mut other = usize.ZERO
+    while other < listed.length {
+      if same(Bytes.asSlice(&listed[other]), relative) { known = true }
+      other = other + usize.ONE
+    }
+    if !known { run List<Bytes>.append(&mut added, run Bytes.copy(relative)) }
+  }
+  let ordered = run sortPaths(move added)
+  let members = List<Bytes>.asSlice(&ordered)
+  let mut each = usize.ZERO
+  while each < members.length {
+    let relative = Bytes.asSlice(&members[each])
+    each = each + usize.ONE
     let content = run FileSystem.readFile(&run Path.joinBytes(Projects.directory(project), relative))
     let mut named = run Bytes.copy(Bytes.asSlice(&top))
     run Bytes.append(&mut named, b"/")
     run Bytes.append(&mut named, relative)
-    run store(&mut writer, &mut gzip, Bytes.asSlice(&named), Bytes.asSlice(&named), Bytes.asSlice(&content), false)
+    run storeIn(&mut archive, Bytes.asSlice(&named), Bytes.asSlice(&content), false)
     count = count + usize.ONE
   }
-  let bytes = run finished(move writer, move gzip)
+  let bytes = run finishedIn(move archive)
   let mut fileName = run Bytes.copy(Bytes.asSlice(&top))
-  run Bytes.append(&mut fileName, b".tar.gz")
+  run Bytes.append(&mut fileName, if layout.zip { b".zip" } else { b".tar.gz" })
   return Packed {stem: move top, fileName: move fileName, bytes: move bytes, files: count}
 }

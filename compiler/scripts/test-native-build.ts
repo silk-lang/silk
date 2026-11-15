@@ -1371,6 +1371,20 @@ const program = Effect.gen(function* () {
       pattern: /error\[SEM0212\] This value must live for `'static`, but it borrows something/,
     },
     {
+      name: 'localborrow',
+      files: {
+        'main.silk': "fn first<'a>(value: u8) -> &'a [u8] {\n  return &[value]\n}\n\npub fn main() -> i32 {\n  let _one = first(1)\n  return 0\n}\n",
+      },
+      pattern: /error\[SEM0212\] This borrows a value that lives only inside this function, but the borrow must stay valid after the function returns/,
+    },
+    {
+      name: 'arrayprovider',
+      files: {
+        'main.silk': 'interface Shown {}\nimpl Shown for [u8; 4] {}\n\npub fn main() -> i32 {\n  return 0\n}\n',
+      },
+      pattern: /error\[SEM0083\] Invalid conformance: `\[u8; 4\]` cannot be the type an impl is for; that type is a declared struct, tuple, enum or union, a scalar, `string`, or a slice such as `&\[T\]`; declare a tuple or struct that holds the array/,
+    },
+    {
       name: 'privatefn',
       files: {
         'geo/shapes.silk': 'fn secret() -> i32 { return 0 }\n',
@@ -1950,6 +1964,15 @@ const program = Effect.gen(function* () {
   const shiftCount = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(directory, 'shiftcount'), { ...process.env, SILK_CLANG: clang })
   assert.notEqual(shiftCount.status, 0, shiftCount.stderr)
   assert.match(shiftCount.stderr, /^fatal trap: invalid shift count\n {2}at main\.main \(main:6:17\)$/m)
+  // A function that only moves in its file is not lowered again, and its trap names the line it
+  // moved to.
+  const shiftCountSource = yield* fs.readFileString(join(directory, 'shiftcount/src/main.silk'))
+  yield* fs.writeFileString(join(directory, 'shiftcount/src/main.silk'), shiftCountSource.replace('\npub fn main', '// moved\n\n\npub fn main'))
+  const movedBuild = yield* invoke(silk, ['build', '--stdlib', standardLibrary, '--timings'], join(directory, 'shiftcount'), { ...process.env, SILK_CLANG: clang })
+  assert.equal(movedBuild.status, 0, movedBuild.stderr)
+  assert.match(movedBuild.stdout + movedBuild.stderr, /codegen\s+0 functions\s/)
+  const movedCount = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(directory, 'shiftcount'), { ...process.env, SILK_CLANG: clang })
+  assert.match(movedCount.stderr, /^fatal trap: invalid shift count\n {2}at main\.main \(main:8:17\)$/m)
   // A trap after a fiber resumes names the suspended callers of the resumed frame, which only its
   // frame chain holds: the fiber's driver, not `work`, called `pick`'s step.
   yield* fs.makeDirectory(join(directory, 'resumedtrap/src'), { recursive: true })
@@ -2070,6 +2093,11 @@ const program = Effect.gen(function* () {
   )
   assert.equal(selectedTests.status, 0, selectedTests.stderr)
   assert.match(selectedTests.stdout, /util\/check::halvesEvenly\n/)
+  // The runner's build reports its phases as a program's does, and keeps a semantic cache of its
+  // own beside the package's so the next runner build checks and emits only what an edit reaches.
+  assert.match(selectedTests.stderr, /^Compiling tested tests \(/m)
+  assert.match(selectedTests.stderr, /^ {2}codegen +[\d,]+ functions? /m)
+  assert.equal(yield* fs.exists(join(directory, 'tested/build/cache/tested@tests')), true)
   assert.match(
     selectedTests.stdout,
     /1 passed, 0 failed \(0 cached, 1 executed, 1 selected, 4 discovered\)/,
@@ -2080,8 +2108,8 @@ const program = Effect.gen(function* () {
   )
   const runnerRecord = join(directory, 'tested/build/test/llvm', hostTarget, 'debug/tested.inputs')
   const firstRecord = yield* fs.readFile(runnerRecord)
-  // No passing run is stored yet (the first used --no-cache), so a plain `silk test` runs every
-  // selected test.
+  // No passing test is recorded yet (the first run used --no-cache), so a plain `silk test` runs
+  // every selected test.
   const failedTests = yield* invoke(
     silk,
     ['test', '--stdlib', standardLibrary],
@@ -2103,15 +2131,15 @@ const program = Effect.gen(function* () {
     /util\/check::failsOnPurpose\n {4}assertion failed: integer division truncates\n {6}at [^\n]*failsOnPurpose \([^\n]*:12:3\)\n {4}FAIL/,
   )
   assert.match(failedTests.stdout, /2 passed, 2 failed \(0 cached, 4 executed, 4 selected, 4 discovered\)/)
-  // A passing run is stored, and the same selection on the unchanged runner is not run again.
+  // A test that passed is recorded, and the unchanged runner skips it while its code and inputs
+  // stay the same.
   const passArguments = ['test', '--stdlib', standardLibrary, '--file', 'src/util/check.silk', '--filter', 'EVEN']
   const passedTests = yield* invoke(silk, passArguments, join(directory, 'tested'), { ...process.env, SILK_CLANG: clang })
   assert.equal(passedTests.status, 0, passedTests.stderr)
-  assert.doesNotMatch(passedTests.stdout, /Not run again/)
   const replayedTests = yield* invoke(silk, passArguments, join(directory, 'tested'), { ...process.env, SILK_CLANG: clang })
   assert.equal(replayedTests.status, 0, replayedTests.stderr)
-  assert.match(replayedTests.stdout, /1 passed, 0 failed \(0 cached, 1 executed, 1 selected, 4 discovered\)/)
-  assert.match(replayedTests.stdout, /\nNot run again: nothing changed/)
+  assert.match(replayedTests.stdout, /util\/check::halvesEvenly\n {4}CACHED\n/)
+  assert.match(replayedTests.stdout, /1 passed, 0 failed \(1 cached, 0 executed, 1 selected, 4 discovered\)/)
   // `--no-cache` runs them again.
   const forcedTests = yield* invoke(
     silk,
@@ -2120,9 +2148,9 @@ const program = Effect.gen(function* () {
     { ...process.env, SILK_CLANG: clang },
   )
   assert.equal(forcedTests.status, 0, forcedTests.stderr)
-  assert.doesNotMatch(forcedTests.stdout, /Not run again/)
-  // A selection that matches no test verified nothing, so it fails.
-  // It is not stored either, so running it again fails the same way.
+  assert.match(forcedTests.stdout, /1 passed, 0 failed \(0 cached, 1 executed, 1 selected, 4 discovered\)/)
+  // A selection that matches no test verified nothing, so it fails, and running it again fails the
+  // same way.
   for (let attempt = 0; attempt < 2; attempt++) {
     const unmatchedTests = yield* invoke(
       silk,
@@ -2132,7 +2160,6 @@ const program = Effect.gen(function* () {
     )
     assert.equal(unmatchedTests.status, 1, unmatchedTests.stderr)
     assert.match(unmatchedTests.stderr, /no tests matched/)
-    assert.doesNotMatch(unmatchedTests.stdout, /Not run again/)
   }
   // A test past its --timeout and a test that overflows the stack each fail with a report naming
   // why, and the remaining tests still run.
@@ -3754,6 +3781,94 @@ const program = Effect.gen(function* () {
     assert.equal(foreign.stdout, '')
   }
   {
+    // `[pack.binary]` ships binaries without `--bin`: a tar file with the executable in `bin/`
+    // and the included files, or for a target that says so a ZIP file with it at the top.
+    const tool = join(directory, 'binary/tool')
+    const output = join(directory, 'binary/out')
+    const environment = { ...process.env, SILK_CLANG: clang }
+    yield* fs.makeDirectory(join(tool, 'src'), { recursive: true })
+    yield* fs.makeDirectory(join(tool, 'completions'), { recursive: true })
+    const manifest = (more: string) =>
+      `[package]\nname = "packed-tool"\nversion = "1.2.0"\n\n[pack.binary]\ninclude = ["completions", "notes.txt"]\n${more}`
+    yield* fs.writeFileString(join(tool, 'silk.toml'), manifest(''))
+    yield* fs.writeFileString(join(tool, 'src/main.silk'), 'pub fn main() -> i32 {\n  return 0\n}\n')
+    yield* fs.writeFileString(join(tool, 'completions/tool.bash'), 'complete -W "pack" packed-tool\n')
+    yield* fs.writeFileString(join(tool, 'notes.txt'), 'notes\n')
+    yield* fs.writeFileString(join(tool, 'LICENSE'), 'license\n')
+    const packed = yield* invoke(
+      silk,
+      ['pack', '--json', '--output', output, '--stdlib', standardLibrary],
+      tool,
+      environment,
+      120_000,
+    )
+    assert.equal(packed.status, 0, packed.stderr)
+    const binaries = JSON.parse(packed.stdout).archives[0].binaries as ReadonlyArray<{ platform: string; path: string }>
+    assert.equal(binaries.length, 1, packed.stdout)
+    const platform = binaries[0].platform
+    const top = `packed-tool-1.2.0-${platform}`
+    assert.equal(binaries[0].path, join(output, `${top}.tar.gz`))
+    const tarred = spawnSync('tar', ['-tzf', binaries[0].path], { encoding: 'utf8' })
+    assert.equal(tarred.status, 0, tarred.stderr)
+    assert.deepEqual(tarred.stdout.trim().split('\n'), [
+      `${top}/bin/packed-tool`,
+      `${top}/LICENSE`,
+      `${top}/completions/tool.bash`,
+      `${top}/notes.txt`,
+    ])
+    // The target's own table replaces the format, the layout and the included files.
+    yield* fs.writeFileString(
+      join(tool, 'silk.toml'),
+      manifest(`\n[pack.binary.target.${platform}]\nformat = "zip"\nlayout = "flat"\ninclude = ["notes.txt"]\n`),
+    )
+    const zipped = yield* invoke(
+      silk,
+      ['pack', '--json', '--output', output, '--stdlib', standardLibrary],
+      tool,
+      environment,
+      120_000,
+    )
+    assert.equal(zipped.status, 0, zipped.stderr)
+    const archive = JSON.parse(zipped.stdout).archives[0].binaries[0].path as string
+    assert.equal(archive, join(output, `${top}.zip`))
+    const tested = spawnSync('unzip', ['-t', archive], { encoding: 'utf8' })
+    assert.equal(tested.status, 0, tested.stdout + tested.stderr)
+    const names = spawnSync('unzip', ['-Z1', archive], { encoding: 'utf8' })
+    assert.deepEqual(names.stdout.trim().split('\n'), [`${top}/packed-tool`, `${top}/LICENSE`, `${top}/notes.txt`])
+    const modes = spawnSync('unzip', ['-Z', archive], { encoding: 'utf8' })
+    assert.match(modes.stdout, /^-rwxr-xr-x .* packed-tool-1\.2\.0-.*\/packed-tool$/m)
+    assert.match(modes.stdout, /^-rw-r--r-- .*\/LICENSE$/m)
+    // `--list` writes nothing, so it builds nothing.
+    const listed = yield* invoke(silk, ['pack', '--list', '--stdlib', standardLibrary], tool, { ...process.env, SILK_CLANG: '/nonexistent' })
+    assert.equal(listed.status, 0, listed.stderr)
+    // An entry that names nothing is refused with the table it is written in.
+    yield* fs.writeFileString(join(tool, 'silk.toml'), manifest('').replace('"notes.txt"', '"missing.txt"'))
+    const missing = yield* invoke(silk, ['pack', '--output', output, '--stdlib', standardLibrary], tool, environment, 120_000)
+    assert.equal(missing.status, 1, 'an include entry that names nothing was packed')
+    assert.match(missing.stderr, /\[pack\.binary\]\.include entry missing\.txt names no file or directory/)
+    // An included path at, above or below the executable's is refused, naming its table.
+    yield* fs.writeFileString(join(tool, 'bin'), 'a file named as the directory of the executable\n')
+    yield* fs.writeFileString(
+      join(tool, 'silk.toml'),
+      manifest(`\n[pack.binary.target.${platform}]\ninclude = ["bin"]\n`),
+    )
+    const displaced = yield* invoke(silk, ['pack', '--output', output, '--stdlib', standardLibrary], tool, environment, 120_000)
+    assert.equal(displaced.status, 1, 'an included file took the place of the executable directory')
+    assert.ok(
+      displaced.stderr.includes(`[pack.binary.target.${platform}].include holds bin, which takes the place of the executable at bin/packed-tool`),
+      displaced.stderr,
+    )
+    yield* fs.remove(join(tool, 'bin'))
+    // The table is an executable's.
+    yield* fs.writeFileString(
+      join(tool, 'silk.toml'),
+      '[package]\nname = "packed-tool"\nversion = "1.2.0"\nkind = "library"\nmain = "main.silk"\nexports = ["main"]\n\n[pack.binary]\n',
+    )
+    const library = yield* invoke(silk, ['pack', '--output', output, '--stdlib', standardLibrary], tool, environment, 120_000)
+    assert.equal(library.status, 1, 'a library with [pack.binary] was packed')
+    assert.match(library.stderr, /\[pack\.binary\] archives an executable, and \[package\]\.kind is library/)
+  }
+  {
     // `init --template` copies one directory of a GitHub repository, here served from local
     // repositories through git's `insteadOf`, runs its [[post-init]] entries and drops them from the
     // new manifest. A one-segment template is a directory of silk-lang/examples.
@@ -4663,7 +4778,8 @@ const program = Effect.gen(function* () {
     'import helper\n\npub fn main() -> i32 {\n  return helper.value() + 4\n}\n',
   )
   const splitEnvironment = { ...process.env, SILK_CLANG: clang }
-  const unitObjects = join(split, `build/llvm/${hostTarget}/debug/split.units`)
+  // The objects are in the store the outputs of one directory share.
+  const unitObjects = join(split, `build/llvm/${hostTarget}/debug/units`)
   const objectNames = Effect.fnUntraced(function* () {
     const names = yield* fs.readDirectory(unitObjects)
     return names.filter((name) => name.endsWith('.o')).sort()
@@ -4726,6 +4842,199 @@ const program = Effect.gen(function* () {
   const editedPacks = yield* packNames()
   assert.equal(editedPacks.filter((name) => !coldPacks.includes(name)).length, 1, 'an edit to one module writes one pack')
   assert.equal(editedPacks.length, coldPacks.length, 'a build removes the packs no unit names')
+  // Two programs of a workspace share the objects of the units both hold: the second one built
+  // compiles only its own, and each lists what it links so neither build removes the other's.
+  const shared = join(directory, 'shared-units')
+  for (const member of ['one', 'two']) {
+    yield* fs.makeDirectory(join(shared, member, 'src'), { recursive: true })
+    yield* fs.writeFileString(join(shared, member, 'silk.toml'), `[package]\nname = "${member}"\nversion = "0.1.0"\n`)
+    yield* fs.writeFileString(
+      join(shared, member, 'src/main.silk'),
+      `pub fn main() -> i32 {\n  return ${member === 'one' ? 1 : 2}\n}\n`,
+    )
+  }
+  yield* fs.writeFileString(join(shared, 'silk.toml'), '[workspace]\nmembers = ["one", "two"]\n')
+  const sharedObjects = join(shared, `build/llvm/${hostTarget}/debug/units`)
+  const sharedNames = Effect.fnUntraced(function* (suffix: string) {
+    return (yield* fs.readDirectory(sharedObjects)).filter((name) => name.endsWith(suffix)).sort()
+  })
+  const builtOne = yield* invoke(silk, ['build', '--stdlib', standardLibrary, '--package', 'one'], shared, splitEnvironment)
+  assert.equal(builtOne.status, 0, builtOne.stderr)
+  const oneObjects = yield* sharedNames('.o')
+  const builtTwo = yield* invoke(silk, ['build', '--stdlib', standardLibrary, '--package', 'two'], shared, splitEnvironment)
+  assert.equal(builtTwo.status, 0, builtTwo.stderr)
+  const bothObjects = yield* sharedNames('.o')
+  const addedByTwo = bothObjects.filter((name) => !oneObjects.includes(name))
+  assert.ok(
+    addedByTwo.length < oneObjects.length / 2,
+    `the second program compiled ${addedByTwo.length} units of its own beside the first one's ${oneObjects.length}`,
+  )
+  assert.equal((yield* sharedNames('.uses')).length, 2, 'each program lists the objects it links')
+  for (const [member, expected] of [['one', 1], ['two', 2]] as const) {
+    const ran = yield* invoke(join(shared, `build/llvm/${hostTarget}/debug/${member}`), [], shared, splitEnvironment)
+    assert.equal(ran.status, expected, ran.stderr)
+  }
+  // A host that cannot copy its process runs each member in a compiler process of its own, and
+  // SILK_MEMBER_PROCESSES asks any host to: the reports read as a run of one member at a time.
+  const inProcesses = { ...splitEnvironment, SILK_MEMBER_PROCESSES: '1' }
+  const checkedBoth = yield* invoke(silk, ['check', '--workspace', '--stdlib', standardLibrary], shared, inProcesses)
+  assert.equal(checkedBoth.status, 0, checkedBoth.stderr)
+  const checkedReport = checkedBoth.stdout + checkedBoth.stderr
+  assert.ok(checkedReport.indexOf('Finished one') < checkedReport.indexOf('Finished two'), checkedReport)
+  assert.match(checkedReport, /Finished 2 packages/)
+  yield* fs.writeFileString(join(shared, 'two/src/main.silk'), 'pub fn main() -> i32 {\n  return missing\n}\n')
+  const checkedBroken = yield* invoke(silk, ['check', '--workspace', '--stdlib', standardLibrary], shared, inProcesses)
+  assert.equal(checkedBroken.status, 1, checkedBroken.stderr)
+  assert.match(checkedBroken.stdout + checkedBroken.stderr, /Failed 1 of 2 packages/)
+  // A program checked for the first time starts its walk from the one a sibling program left in
+  // the cache: it lowers what it alone reaches and still reports what only it reaches. A workspace
+  // check lets one program finish before the others start, so they find its walk.
+  const siblings = join(directory, 'siblings')
+  yield* fs.makeDirectory(join(siblings, 'spec/src'), { recursive: true })
+  yield* fs.writeFileString(join(siblings, 'silk.toml'), '[workspace]\nmembers = ["spec", "one", "two"]\n')
+  yield* fs.writeFileString(
+    join(siblings, 'spec/silk.toml'),
+    '[package]\nname = "spec"\nversion = "0.1.0"\nkind = "library"\nexports = ["lib"]\n',
+  )
+  yield* fs.writeFileString(
+    join(siblings, 'spec/src/lib.silk'),
+    [
+      'import silk.collections.list { List }',
+      'import silk.mem.allocator { Allocator, OutOfMemoryError }',
+      '',
+      'pub fn sized(static n: i64) -> i64 {',
+      '  static if n > 3 { compileError("size too big") }',
+      '  return n',
+      '}',
+      '',
+      'pub effect fn kept<T>(value: T) -> usize ! OutOfMemoryError ? &mut Allocator {',
+      '  let mut values = List<T>.make()',
+      '  run List<T>.append(&mut values, move value)',
+      '  return List<T>.length(&values)',
+      '}',
+      '',
+    ].join('\n'),
+  )
+  const siblingMain = (size: number) =>
+    [
+      'import silk.core.effect { Effect }',
+      'import silk.mem.allocator { Allocator, OutOfMemoryError }',
+      'import silk.num.usize',
+      'import spec.lib { sized, kept }',
+      '',
+      'pub effect fn main() -> i32 ! OutOfMemoryError {',
+      '  let mut system = Allocator.systemAllocatorProvider()',
+      `  let count = run kept<i64>(sized(${size})) |> Effect.provideMut<Allocator>(&mut system)`,
+      '  if count != usize.ONE { return 1 }',
+      '  return 0',
+      '}',
+      '',
+    ].join('\n')
+  for (const member of ['one', 'two']) {
+    yield* fs.makeDirectory(join(siblings, member, 'src'), { recursive: true })
+    yield* fs.writeFileString(
+      join(siblings, member, 'silk.toml'),
+      `[package]\nname = "${member}"\nversion = "0.1.0"\n\n[dependencies]\nspec = { path = "../spec" }\n`,
+    )
+    yield* fs.writeFileString(join(siblings, member, 'src/main.silk'), siblingMain(member === 'one' ? 1 : 2))
+  }
+  // How many bodies each member's check ran, by member name, from its `--timings` rows.
+  const bodyRuns = (report: string) => {
+    const runs = new Map<string, number>()
+    for (const section of report.split(/^Checking /m).slice(1)) {
+      const row = /^\s+\S+\s+\S+\s+([\d,]+)\s+Body$/m.exec(section)
+      runs.set(section.slice(0, section.indexOf(' ')), row === null ? 0 : Number(row[1].replaceAll(',', '')))
+    }
+    return runs
+  }
+  const checkSiblings = Effect.fnUntraced(function* (selection: ReadonlyArray<string>, environment: typeof splitEnvironment) {
+    const checked = yield* invoke(silk, ['check', '--no-server', '--stdlib', standardLibrary, '--timings', ...selection], siblings, environment)
+    return { status: checked.status, report: checked.stdout + checked.stderr }
+  })
+  const coldTwo = yield* checkSiblings(['--package', 'two'], splitEnvironment)
+  assert.equal(coldTwo.status, 0, coldTwo.report)
+  const coldRuns = bodyRuns(coldTwo.report).get('two') ?? 0
+  yield* fs.remove(join(siblings, 'build'), { recursive: true })
+  const firstOne = yield* checkSiblings(['--package', 'one'], splitEnvironment)
+  assert.equal(firstOne.status, 0, firstOne.report)
+  yield* fs.writeFileString(join(siblings, 'two/src/main.silk'), siblingMain(5))
+  const refusedTwo = yield* checkSiblings(['--package', 'two'], splitEnvironment)
+  assert.equal(refusedTwo.status, 1, refusedTwo.report)
+  assert.match(refusedTwo.report, /^two\/src\/main\.silk:8:\d+: error\[SEM0177\] size too big$/m)
+  yield* fs.writeFileString(join(siblings, 'two/src/main.silk'), siblingMain(2))
+  yield* fs.remove(join(siblings, 'build/cache/two'), { recursive: true })
+  const afterOne = yield* checkSiblings(['--package', 'two'], splitEnvironment)
+  assert.equal(afterOne.status, 0, afterOne.report)
+  const afterRuns = bodyRuns(afterOne.report).get('two') ?? 0
+  assert.ok(afterRuns * 3 < coldRuns, `after its sibling the program ran ${afterRuns} bodies, and ${coldRuns} alone`)
+  for (const environment of [splitEnvironment, { ...splitEnvironment, SILK_MEMBER_PROCESSES: '1' }]) {
+    yield* fs.remove(join(siblings, 'build'), { recursive: true })
+    const together = yield* checkSiblings(['--workspace'], environment)
+    assert.equal(together.status, 0, together.report)
+    const runs = bodyRuns(together.report)
+    const first = runs.get('one') ?? 0
+    const second = runs.get('two') ?? 0
+    assert.ok(second * 3 < first, `checked together, the second program ran ${second} bodies beside the first one's ${first}`)
+  }
+  // A program built for the first time borrows the build record a sibling program's build left in
+  // the cache: it emits what it alone reaches, its executable is byte for byte the one it builds
+  // alone, and it keeps a record and packs of its own, so an edit rebuilds what changed without the
+  // sibling's cache. A workspace build lets one program finish before the others start, so they
+  // find its record.
+  const buildSiblings = Effect.fnUntraced(function* (selection: ReadonlyArray<string>) {
+    const built = yield* invoke(silk, ['build', '--stdlib', standardLibrary, ...selection], siblings, splitEnvironment)
+    assert.equal(built.status, 0, built.stdout + built.stderr)
+    return built.stdout + built.stderr
+  })
+  // How many functions each member's build emitted, by member name, and where it left its executable.
+  const emitted = (report: string) => {
+    const members = new Map<string, { functions: number; executable: string }>()
+    for (const section of report.split(/^Compiling /m).slice(1)) {
+      const row = /^\s+codegen\s+([\d,]+) functions?/m.exec(section)
+      const finished = /^Finished (\S+) in /m.exec(section)
+      assert.ok(finished !== null, report)
+      members.set(section.slice(0, section.indexOf(' ')), {
+        functions: row === null ? 0 : Number(row[1].replaceAll(',', '')),
+        executable: join(siblings, finished[1]),
+      })
+    }
+    return members
+  }
+  const builtMember = (report: string, member: string) => {
+    const built = emitted(report).get(member)
+    assert.ok(built !== undefined, report)
+    return built
+  }
+  yield* fs.remove(join(siblings, 'build'), { recursive: true })
+  const aloneTwo = builtMember(yield* buildSiblings(['--package', 'two']), 'two')
+  const aloneBytes = yield* fs.readFile(aloneTwo.executable)
+  yield* fs.remove(join(siblings, 'build'), { recursive: true })
+  yield* buildSiblings(['--package', 'one'])
+  const borrowedTwo = builtMember(yield* buildSiblings(['--package', 'two']), 'two')
+  assert.ok(
+    borrowedTwo.functions * 3 < aloneTwo.functions,
+    `after its sibling the program emitted ${borrowedTwo.functions} functions, and ${aloneTwo.functions} alone`,
+  )
+  assert.ok(
+    Buffer.from(yield* fs.readFile(borrowedTwo.executable)).equals(Buffer.from(aloneBytes)),
+    'a program built after its sibling differs from the one built alone',
+  )
+  yield* fs.remove(join(siblings, 'build/cache/one'), { recursive: true })
+  yield* fs.writeFileString(join(siblings, 'two/src/main.silk'), siblingMain(3))
+  const editedTwo = builtMember(yield* buildSiblings(['--package', 'two']), 'two')
+  assert.ok(
+    editedTwo.functions > 0 && editedTwo.functions <= borrowedTwo.functions,
+    `an edit after a borrowed build emitted ${editedTwo.functions} functions, and the borrowed build ${borrowedTwo.functions}`,
+  )
+  yield* fs.writeFileString(join(siblings, 'two/src/main.silk'), siblingMain(2))
+  yield* fs.remove(join(siblings, 'build'), { recursive: true })
+  const builtTogether = emitted(yield* buildSiblings(['--workspace']))
+  const builtFirst = builtTogether.get('one')?.functions ?? 0
+  const builtSecond = builtTogether.get('two')?.functions ?? 0
+  assert.ok(
+    builtSecond * 3 < builtFirst,
+    `built together, the second program emitted ${builtSecond} functions beside the first one's ${builtFirst}`,
+  )
   // Each unit carries line tables made from the lines its location markers name, so a function
   // that moves recompiles its unit alone, and the unit's rows name the lines it moved to.
   const rowLines = Effect.fnUntraced(function* (object: string) {
@@ -4740,6 +5049,9 @@ const program = Effect.gen(function* () {
   })
   assert.deepEqual(yield* rowLines(compiled[0]), [2])
   yield* fs.writeFileString(join(split, 'src/helper.silk'), `// moved\n\n${helperSource(5)}`)
+  const moved = yield* invoke(silk, ['build', '--stdlib', standardLibrary, '--timings'], split, splitEnvironment)
+  assert.equal(moved.status, 0, moved.stderr)
+  assert.match(moved.stdout + moved.stderr, /codegen\s+0 functions\s/, 'a function that only moved is not lowered again')
   yield* splitRun(9)
   const movedObjects = (yield* objectNames()).filter((name) => !editedObjects.includes(name))
   assert.equal(movedObjects.length, 1, `a moved function compiles one unit, added ${movedObjects.join(', ')}`)
@@ -5023,6 +5335,51 @@ const program = Effect.gen(function* () {
   yield* embedAppRun(45)
   yield* embedCheck(embedLibrary, 'a package\'s own embedded file was not read')
   yield* embedCheck(embedLibrary, 'a second check lost a package\'s own embedded file')
+  // A static fn reads the length of an embedded file while the package compiles.
+  yield* fs.writeFileString(
+    join(embedLibrary, 'src/library.silk'),
+    'import silk.build.source { Source }\n\npub fn script() -> &\'static [u8] {\n  return Source.read("js/index.js")\n}\n\n'
+      + 'static fn measured() -> usize {\n  return Source.read("js/index.js").length\n}\n\npub fn size() -> usize {\n  return measured()\n}\n',
+  )
+  yield* fs.writeFileString(
+    join(embedApp, 'src/main.silk'),
+    'import library.library { script, size }\nimport silk.num.usize\n\npub fn main() -> i32 {\n  if script().length != size() { return 1 }\n  return usize.toI32(size())\n}\n',
+  )
+  yield* embedAppRun(45)
+  // `silk pack` refuses an archive that would lack a file its sources embed, since a package that
+  // depends on the archive reads the file from it; naming the file in `include` packs it.
+  const embedPack = Effect.fnUntraced(function* () {
+    return yield* invoke(
+      silk,
+      ['pack', '--output', join(directory, 'embed-packed'), '--stdlib', standardLibrary],
+      embedLibrary,
+      splitEnvironment,
+    )
+  })
+  // Only the modules the package's check reads count: a module nothing imports, as a test module
+  // is, may embed a fixture the archive leaves out. `--list` still lists.
+  yield* fs.makeDirectory(join(embedLibrary, 'fixtures'), { recursive: true })
+  yield* fs.writeFileString(join(embedLibrary, 'fixtures/case.txt'), 'fixture\n')
+  yield* fs.writeFileString(
+    join(embedLibrary, 'src/tests.silk'),
+    'import silk.build.source { Source }\n\npub fn fixture() -> &\'static [u8] { return Source.read("fixtures/case.txt") }\n',
+  )
+  const embedListed = yield* invoke(silk, ['pack', '--list'], embedLibrary, splitEnvironment)
+  assert.equal(embedListed.status, 0, embedListed.stdout + embedListed.stderr)
+  assert.match(embedListed.stdout, /^src\/library\.silk$/m)
+  const unpacked = yield* embedPack()
+  assert.notEqual(unpacked.status, 0, 'an archive without an embedded file was packed')
+  assert.match(
+    unpacked.stderr,
+    /silk pack: embed-library: module library\.silk embeds js\/index\.js, which the archive would not hold; add it to \[package\]\.include/,
+  )
+  assert.doesNotMatch(unpacked.stderr, /fixtures/)
+  yield* fs.writeFileString(
+    join(embedLibrary, 'silk.toml'),
+    '[package]\nname = "embed-library"\nversion = "0.1.0"\nkind = "library"\nmain = "library.silk"\nexports = ["library"]\ninclude = ["js"]\n',
+  )
+  const packedEmbed = yield* embedPack()
+  assert.equal(packedEmbed.status, 0, packedEmbed.stdout + packedEmbed.stderr)
   yield* Console.log(
     'Native build CLI: exact LLVM output, Clang bypass, --clang, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, path dependencies, native sources, native archives, exports, workspaces, silk change release/history/recovery, retention, runtime requests, format reports, installed standard library, clang on PATH, version, help, check, project test, cached codegen units, build replay, check replay, embedded files, compressed embedded files, embedded files of a dependency, object and static library artifacts and emission stages passed',
   )

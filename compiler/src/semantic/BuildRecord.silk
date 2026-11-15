@@ -32,6 +32,18 @@
 //! while admission and the program-wide checks are decided from the facts. An entry without
 //! known facts sends the build back to a full walk.
 //!
+//! A program that reaches a suspension boundary is emitted by a second walk, the frame walk, which
+//! emits each suspendable instance as a frame variant selected from what the first walk reached.
+//! Its record says so ([`Record.frames`]): its roots end with the execution storage's exports, and
+//! a suspendable instance's entry is [`FACT_FRAMED`], with the references and summary of the
+//! variant, the recursive cycle the instance belongs to, and a digest of what the selection read
+//! of its MIR outside any frame. A replay lowers a stale framed entry's MIR outside any frame
+//! first; while that digest holds, the first walk would reach and select what it did, so every
+//! other entry keeps its variant. Such a record is walked again only while the frames stay as
+//! they are: no instance the walk lowers may suspend, call a suspendable instance, or run one that
+//! can park ([`FACT_PARKS`]), and the first walk must reach every suspendable instance it reaches
+//! ([`Facts.ordinary`]) and no body it did not reach before ([`FACT_SELECTED`]).
+//!
 //! An escape check's walk is recorded in the same form, without definitions. It reaches some
 //! instances without entering them, a foreign declaration or a body another module's check walks;
 //! such a leaf entry holds no references either, and the walk may enter the same instance later
@@ -64,7 +76,7 @@ import silk.num.u64
 import silk.num.usize
 
 // Changes whenever the layout below changes.
-const FORMAT: u64 = 12
+const FORMAT: u64 = 14
 
 /// An escape walk's leaf for a foreign declaration, which has no body to walk.
 pub const FOREIGN: u64 = 1
@@ -143,6 +155,16 @@ pub const FACT_CALLEES: u64 = 1024
 pub const FACT_GLUE: u64 = 2048
 /// The entry's MIR inlined instances whose declarations are named by [`Facts.inlined`].
 pub const FACT_INLINED: u64 = 4096
+/// A frame walk emitted the instance as a suspendable one: [`Facts.component`] and
+/// [`Facts.selecting`] say what its frame selection read of it.
+pub const FACT_FRAMED: u64 = 8192
+/// A suspendable caller may run the instance's body in its own frame at a suspension point.
+pub const FACT_FORWARDS: u64 = 16384
+/// One of the two walks of a build with frames found that the instance can park externally.
+pub const FACT_PARKS: u64 = 32768
+/// The walk that selected the frames of a build with frames reached the instance; the frame walk
+/// alone reaches the execution storage's exports and what only they or a frame variant run.
+pub const FACT_SELECTED: u64 = 65536
 
 /// What the walk read of one entry's key and summary that a rewalk needs without them
 /// (`Semantic.rewalkBuild`).
@@ -167,6 +189,16 @@ pub struct Facts {
   /// The declarations of instances inlined into this entry's MIR, as `StableKey.declaration`
   /// writes them, under [`FACT_INLINED`]. They run and park as part of this entry.
   pub inlined: List<Bytes>,
+  /// The recursive cycle of suspendable instances the instance belongs to, under [`FACT_FRAMED`]:
+  /// two framed entries share a number exactly when each can call the other.
+  pub component: usize,
+  /// The digest of what the walk that selected the frames read of the instance's MIR outside any
+  /// frame, under [`FACT_FRAMED`]: its references, its summary, and the calls and size a caller's
+  /// frame reads (`Semantic.selectingDigest`).
+  pub selecting: ContentHash,
+  /// The entry of each reference of the instance's MIR outside any frame, under [`FACT_FRAMED`]:
+  /// what the walk that selected the frames reached from it.
+  pub ordinary: List<usize>,
 }
 
 /// One NonParking obligation of a summary, as `Semantic.nonParkingViolations` reads it.
@@ -186,7 +218,8 @@ pub struct Callee {
 /// No facts, as an escape walk's entries carry.
 pub fn unknownFacts() -> Facts {
   return Facts {flags: 0, definition: ContentHash {high: 0, low: 0}, bare: ContentHash {high: 0, low: 0}, body: 0,
-    obligations: List<Obligation>.make(), callbacks: List<ContentHash>.make(), callees: List<usize>.make(), inlined: List<Bytes>.make()}
+    obligations: List<Obligation>.make(), callbacks: List<ContentHash>.make(), callees: List<usize>.make(), inlined: List<Bytes>.make(),
+    component: usize.ZERO, selecting: ContentHash {high: 0, low: 0}, ordinary: List<usize>.make()}
 }
 
 /// A copy of `facts`.
@@ -234,8 +267,16 @@ pub effect fn copyFacts(facts: &Facts) -> Facts ! OutOfMemoryError ? &mut Alloca
     run List<Bytes>.append(&mut inlined, run Bytes.copy(Bytes.asSlice(&spliced[at])))
     at = at + usize.ONE
   }
+  let mut ordinary = List<usize>.make()
+  let reached = List<usize>.asSlice(&facts.ordinary)
+  at = usize.ZERO
+  while at < reached.length {
+    run List<usize>.append(&mut ordinary, reached[at])
+    at = at + usize.ONE
+  }
   return Facts {flags: facts.flags, definition: facts.definition, bare: facts.bare, body: facts.body, obligations: move obligations,
-    callbacks: move callbacks, callees: move callees, inlined: move inlined}
+    callbacks: move callbacks, callees: move callees, inlined: move inlined, component: facts.component, selecting: facts.selecting,
+    ordinary: move ordinary}
 }
 
 effect fn writeFacts(output: &mut Bytes, facts: &Facts) -> () ! OutOfMemoryError ? &mut Allocator {
@@ -299,10 +340,21 @@ effect fn writeFacts(output: &mut Bytes, facts: &Facts) -> () ! OutOfMemoryError
       at = at + usize.ONE
     }
   }
+  if u64.bitAnd(facts.flags, FACT_FRAMED) != 0 {
+    run varint(&mut output.*, usize.toU64(facts.component))
+    run digest(&mut output.*, facts.selecting)
+    let ordinary = List<usize>.asSlice(&facts.ordinary)
+    run varint(&mut output.*, usize.toU64(ordinary.length))
+    at = usize.ZERO
+    while at < ordinary.length {
+      run varint(&mut output.*, usize.toU64(ordinary[at]))
+      at = at + usize.ONE
+    }
+  }
   return ()
 }
 
-effect fn readFacts(bytes: &[u8], cursor: &mut Cursor, referenceCount: usize) -> Facts ! OutOfMemoryError ? &mut Allocator {
+effect fn readFacts(bytes: &[u8], cursor: &mut Cursor, referenceCount: usize, total: usize) -> Facts ! OutOfMemoryError ? &mut Allocator {
   let mut facts = unknownFacts()
   facts.flags = readVarint(bytes, &mut cursor.*)
   if u64.bitAnd(facts.flags, FACT_KNOWN) == 0 || cursor.failed { return move facts }
@@ -361,6 +413,16 @@ effect fn readFacts(bytes: &[u8], cursor: &mut Cursor, referenceCount: usize) ->
       at = at + usize.ONE
     }
   }
+  if u64.bitAnd(facts.flags, FACT_FRAMED) != 0 {
+    facts.component = u64.toUsize(readVarint(bytes, &mut cursor.*))
+    facts.selecting = readDigest(bytes, &mut cursor.*)
+    let ordinaryCount = readCount(bytes, &mut cursor.*)
+    at = usize.ZERO
+    while at < ordinaryCount && !cursor.failed {
+      run List<usize>.append(&mut facts.ordinary, readBelow(bytes, &mut cursor.*, total))
+      at = at + usize.ONE
+    }
+  }
   return move facts
 }
 
@@ -375,6 +437,10 @@ pub struct Record {
   pub patterns: bool,
   /// Whether the walk read growth guards or static closures, which its record rests on.
   pub guarded: bool,
+  /// Whether the walk is a frame walk: the program reaches a suspension boundary, the roots end
+  /// with its execution storage's four exports, and each suspendable instance's entry is
+  /// [`FACT_FRAMED`], with the references and summary of the frame variant the walk emitted.
+  pub frames: bool,
   /// The digest of each root, in root order.
   pub roots: List<ContentHash>,
   pub entries: List<Entry>,
@@ -382,7 +448,7 @@ pub struct Record {
 
 /// An empty record.
 pub fn make(observing: bool, patterns: bool) -> Record {
-  return Record {observing: observing, patterns: patterns, guarded: false, roots: List<ContentHash>.make(), entries: List<Entry>.make()}
+  return Record {observing: observing, patterns: patterns, guarded: false, frames: false, roots: List<ContentHash>.make(), entries: List<Entry>.make()}
 }
 
 /// The bytes of `record`.
@@ -392,6 +458,7 @@ pub effect fn encode(record: &Record) -> Bytes ! OutOfMemoryError ? &mut Allocat
   let mut header: u64 = 0
   if record.observing { header = 1 }
   if record.guarded { header = header + 2 }
+  if record.frames { header = header + 4 }
   run varint(&mut output, header)
   if record.patterns { run varint(&mut output, 1) } else { run varint(&mut output, 0) }
   let roots = List<ContentHash>.asSlice(&record.roots)
@@ -612,6 +679,7 @@ pub effect fn decode(bytes: &[u8]) -> Option<Record> ! OutOfMemoryError ? &mut A
   let patterned = readVarint(bytes, &mut cursor)
   let mut record = make(u64.bitAnd(observed, 1) == 1, patterned == 1)
   record.guarded = u64.bitAnd(observed, 2) != 0
+  record.frames = u64.bitAnd(observed, 4) != 0
   let rootCount = readCount(bytes, &mut cursor)
   // Every count is sized before the reads, so no list is copied while it grows.
   run List<ContentHash>.reserveExact(&mut record.roots, rootCount)
@@ -628,7 +696,7 @@ pub effect fn decode(bytes: &[u8]) -> Option<Record> ! OutOfMemoryError ? &mut A
     at = at + usize.ONE
   }
   let total = readCount(bytes, &mut cursor)
-  if observed > 3 || patterned > 1 || cursor.failed { return Option<Record>.none() }
+  if observed > 7 || patterned > 1 || cursor.failed { return Option<Record>.none() }
   let listed = List<ContentHash>.asSlice(&edges)
   run List<Entry>.reserveExact(&mut record.entries, total)
   let mut entry = usize.ZERO
@@ -657,7 +725,7 @@ pub effect fn decode(bytes: &[u8]) -> Option<Record> ! OutOfMemoryError ? &mut A
     }
     let high = readFixed(bytes, &mut cursor)
     let low = readFixed(bytes, &mut cursor)
-    let facts = run readFacts(bytes, &mut cursor, referenceCount)
+    let facts = run readFacts(bytes, &mut cursor, referenceCount, total)
     if cursor.failed { return Option<Record>.none() }
     run List<Entry>.append(&mut record.entries, Entry {exact: exact, hash: hash, family: family,
       declaration: move declaration, parent: parent, position: position,

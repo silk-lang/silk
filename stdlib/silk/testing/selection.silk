@@ -1,0 +1,608 @@
+//! How the built-in test runner skips a passing test whose code and inputs did not change.
+//!
+//! # When to use
+//! `silk.testing.runner` uses this module. You do not call it from normal code.
+//!
+//! # Details
+//! A test runner that `silk test` builds for an ELF or Mach-O target holds a table of every
+//! function in it: for each one a flag, which the function sets when it starts, and the digest of
+//! everything the compiler read to make it. [`Table`] reads that table. Before a test runs, the
+//! runner clears the flags; after it, the set flags are the functions the test executed.
+//!
+//! The runner also watches the test (`silk.testing.observation`): the files, directory listings and
+//! environment variables it read, and whether it used the clock, randomness, the network or a child
+//! process.
+//!
+//! A record file keeps, for each test that passed, the digests of the functions it executed and a
+//! digest of each input it read, taken after it ran. A later run skips the test when every one of
+//! those functions is in the new runner with the same digest and every input reads the same. A
+//! test that executes the same functions on the same inputs does the same thing, so it passes
+//! again.
+//!
+//! A test is not recorded, so it runs every time, when it failed, when it used the clock,
+//! randomness, the network or a child process, listed the environment, read more than the watch
+//! holds, or executed a function the compiler gave no digest, as in a build without a cache.
+//!
+//! The record starts with the magic `SLKTREC1` and a version, then the runner's table: its count
+//! and each function's 16-byte digest. Then the working directory, and for each recorded test its
+//! identity, the table positions of its functions as increasing LEB128 differences, and its inputs:
+//! kind, root, path and a 32-byte SHA-256. Integers are little-endian `u64`; text is a `u64` length
+//! and its bytes.
+//!
+//! # Gotchas
+//! - Work a process does once, such as filling a cache on first use, is recorded only for the test
+//!   that did it. A later test that relies on it can be skipped after an edit to that work.
+//! - A test that reads the host other than through the native providers reads unseen.
+//!
+//! @category Testing
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.collections.hash { Hash }
+import silk.collections.hash_map { HashMap }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.crypto.sha2 { Sha256 }
+import silk.mem.pointer { Pointer }
+import silk.system.filesystem { DirectoryEntry, DirectoryInfo, FileError, FileInfo, FileSystem, Path }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.testing.observation as Observation
+import silk.num.i32
+import silk.num.u32
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+
+static if Intrinsic.targetOperatingSystem() == "windows" {
+  import silk.system.filesystem_machine { MachineFileSystem }
+  effect fn rootedFileSystem(root: &[u8]) -> MachineFileSystem ! OutOfMemoryError ? &mut Allocator {
+    drop root
+    return run MachineFileSystem.make()
+  }
+} else {
+  import silk.system.filesystem_native { OsFileSystem }
+  effect fn rootedFileSystem(root: &[u8]) -> OsFileSystem ! OutOfMemoryError ? &mut Allocator {
+    return run OsFileSystem.makeBytes(root)
+  }
+}
+
+const RECORD: usize = 17
+const VERSION: u64 = 1
+
+/// The table of the functions in this runner: one record per function, each a flag and a digest.
+pub struct Table {
+  start: ?*mut u8,
+  count: usize,
+}
+
+impl Copy for Table {}
+
+/// One input a test read, with the digest of what it read.
+pub struct Input {
+  /// The note kind, such as `Observation.FILE`.
+  pub kind: u8,
+  /// The root of the provider it was read through; empty for an environment variable.
+  pub root: Bytes,
+  /// The path it read, or the variable's name.
+  pub path: Bytes,
+  /// The SHA-256 of what the input reads now, by [`digestInput`].
+  pub digest: [u8; 32],
+}
+
+/// What one passing test executed and read.
+pub struct Entry {
+  /// The test's identity.
+  pub identity: Bytes,
+  /// The table positions of the functions it executed, increasing.
+  pub functions: List<u32>,
+  /// The inputs it read, each once.
+  pub inputs: List<Input>,
+}
+
+/// The entries a record file holds, with each function of the runner that wrote it mapped to the
+/// position of the same function in this runner's table.
+pub struct Previous {
+  /// For each position of the writer's table, the position of the function with the same digest
+  /// in this runner's table, or `u32.MAX`.
+  moved: List<u32>,
+  entries: List<Entry>,
+  // The entry a lookup found last; the next lookup starts after it, as tests come in order.
+  cursor: usize,
+}
+
+impl Table {
+  /// The table that lies between `start` and `stop`, the bounds of the section that holds the
+  /// records of a test runner's functions. It is empty when either is null or `stop` is not
+  /// after `start`.
+  ///
+  /// # Details
+  /// A test runner that `silk test` builds for an ELF or Mach-O target holds the records in the
+  /// section `silk_seen` (`__DATA,__silk_seen` on Mach-O), whose bounds the linker names
+  /// `__start_silk_seen` and `__stop_silk_seen`. Each record is 17 bytes: a flag the function sets
+  /// when it starts, then its 16-byte content digest.
+  ///
+  /// # Safety
+  /// The bytes between the bounds must be such records, writable, and stay valid while the table
+  /// is used.
+  pub unsafe fn between(start: ?*const u8, stop: ?*const u8) -> Table {
+    let first = Pointer.address<u8>(start)
+    let last = Pointer.address<u8>(stop)
+    if Pointer.isNull<u8>(start) || Pointer.isNull<u8>(stop) || last <= first { return Table.empty() }
+    return Table {start: unsafe Intrinsic.pointerRequalify<?*const u8, ?*mut u8>(start), count: (last - first) / RECORD}
+  }
+
+  /// The table of no functions: every test runs and none is recorded.
+  pub fn empty() -> Table {
+    return Table {start: Pointer.null<u8>(), count: usize.ZERO}
+  }
+
+  /// The number of functions in the table.
+  pub fn length(self: &Self) -> usize { return self.count }
+
+  /// Clears every function's flag, so the flags set next are those of the code that runs next.
+  pub fn clear(self: &Self) -> () {
+    if let Option<*mut u8>.Some { value: start } = Pointer.nonNullMut<u8>(self.start) {
+      let data = unsafe Pointer.assumeManyMut<u8>(start)
+      let mut at = usize.ZERO
+      let end = self.count * RECORD
+      while at < end {
+        unsafe { Pointer.write<u8>(Pointer.atMut<u8>(data, at), 0) }
+        at = at + RECORD
+      }
+    }
+    return ()
+  }
+
+  /// Appends to `into` the position of each function whose flag is set, in order, and clears the
+  /// flags. Returns false when one of them has no digest.
+  pub effect fn collect(self: &Self, into: &mut List<u32>) -> bool ! OutOfMemoryError ? &mut Allocator {
+    let mut known = true
+    if let Option<*mut u8>.Some { value: start } = Pointer.nonNullMut<u8>(self.start) {
+      let data = unsafe Pointer.assumeManyMut<u8>(start)
+      let mut index = usize.ZERO
+      while index < self.count {
+        let flag = unsafe Pointer.atMut<u8>(data, index * RECORD)
+        if unsafe Pointer.read<u8>(flag) != 0 {
+          unsafe { Pointer.write<u8>(flag, 0) }
+          run List<u32>.append(&mut into.*, usize.toU32(index))
+          if self.digestWord(index, 0) == 0 && self.digestWord(index, 1) == 0 { known = false }
+        }
+        index = index + usize.ONE
+      }
+    }
+    return known
+  }
+
+  // Word `half` (0 high, 1 low) of the digest of the function at `index`, big-endian.
+  fn digestWord(self: &Self, index: usize, half: usize) -> u64 {
+    let mut value: u64 = 0
+    if let Option<*mut u8>.Some { value: start } = Pointer.nonNullMut<u8>(self.start) {
+      let data = unsafe Pointer.assumeManyMut<u8>(start)
+      let base = index * RECORD + 1 + half * 8
+      let mut at = usize.ZERO
+      while at < 8 {
+        value = u64.bitOr(u64.shiftLeft(value, 8), u8.toU64(unsafe Pointer.read<u8>(unsafe Pointer.atMut<u8>(data, base + at))))
+        at = at + usize.ONE
+      }
+    }
+    return value
+  }
+}
+
+// A reader over the bytes of a record file. After a short read it reads zeros and `failed` stays
+// true.
+struct Reader<'a> {
+  bytes: &'a [u8],
+  at: usize,
+  failed: bool,
+}
+
+fn readU64(reader: &mut Reader<'_>) -> u64 {
+  if reader.failed || reader.bytes.length - reader.at < 8 { reader.failed = true return 0 }
+  let mut value: u64 = 0
+  let mut index = usize.ZERO
+  while index < 8 {
+    value = u64.bitOr(value, u64.shiftLeft(u8.toU64(reader.bytes[reader.at + index]), usize.toU64(index * 8)))
+    index = index + usize.ONE
+  }
+  reader.at = reader.at + 8
+  return value
+}
+
+fn readU8(reader: &mut Reader<'_>) -> u8 {
+  if reader.failed || reader.at >= reader.bytes.length { reader.failed = true return 0 }
+  let value = reader.bytes[reader.at]
+  reader.at = reader.at + usize.ONE
+  return value
+}
+
+fn readVarint(reader: &mut Reader<'_>) -> u64 {
+  let mut value: u64 = 0
+  let mut shift: u64 = 0
+  while shift < 64 {
+    let byte = readU8(&mut reader)
+    value = u64.bitOr(value, u64.shiftLeft(u8.toU64(u8.bitAnd(byte, 127)), shift))
+    if u8.bitAnd(byte, 128) == 0 { return value }
+    shift = shift + 7
+  }
+  reader.failed = true
+  return 0
+}
+
+fn readSlice<'a>(reader: &mut Reader<'a>, length: u64) -> &'a [u8] {
+  if reader.failed || u64.toUsize(length) > reader.bytes.length - reader.at || length > 16777216 {
+    reader.failed = true
+    return Slice.view<u8>(reader.bytes, usize.ZERO, usize.ZERO)
+  }
+  let start = reader.at
+  reader.at = reader.at + u64.toUsize(length)
+  return Slice.view<u8>(reader.bytes, start, u64.toUsize(length))
+}
+
+fn readText<'a>(reader: &mut Reader<'a>) -> &'a [u8] {
+  let length = readU64(&mut reader)
+  return readSlice(&mut reader, length)
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn bigWord(bytes: &[u8], offset: usize) -> u64 {
+  let mut value: u64 = 0
+  let mut at = usize.ZERO
+  while at < 8 {
+    value = u64.bitOr(u64.shiftLeft(value, 8), u8.toU64(bytes[offset + at]))
+    at = at + usize.ONE
+  }
+  return value
+}
+
+impl Previous {
+  /// No entries: every test runs.
+  pub fn none() -> Previous {
+    return Previous {moved: List<u32>.make(), entries: List<Entry>.make(), cursor: usize.ZERO}
+  }
+
+  /// Reads the record `bytes` for this runner's `table`, run in the working directory `working`.
+  /// A record that is not valid, or that was written in another working directory, holds no
+  /// entries.
+  pub effect fn read(bytes: &[u8], table: &Table, working: &[u8]) -> Previous ! OutOfMemoryError ? &mut Allocator {
+    let mut reader = Reader {bytes: bytes, at: usize.ZERO, failed: false}
+    let magic = readSlice(&mut reader, 8)
+    if reader.failed || !same(magic, b"SLKTREC1") || readU64(&mut reader) != VERSION { return Previous.none() }
+    // This runner's functions by the high word of their digest.
+    let mut positions = run HashMap<u64, u32>.makeWithCapacity(Hash.seed(29), table.count)
+    let mut index = usize.ZERO
+    while index < table.count {
+      drop run HashMap<u64, u32>.insert(&mut positions, table.digestWord(index, 0), usize.toU32(index))
+      index = index + usize.ONE
+    }
+    let count = readU64(&mut reader)
+    let digests = readSlice(&mut reader, u64.wrappingMultiply(count, 16))
+    if reader.failed { return Previous.none() }
+    let mut moved = run List<u32>.makeWithCapacity(u64.toUsize(count))
+    index = usize.ZERO
+    while index < u64.toUsize(count) {
+      let high = bigWord(digests, index * 16)
+      let low = bigWord(digests, index * 16 + 8)
+      let mut position = u32.MAX
+      if high != 0 || low != 0 {
+        if let Option<u32>.Some { value } = HashMap<u64, u32>.get(&positions, high) {
+          if table.digestWord(u32.toUsize(value), 1) == low { position = value }
+        }
+      }
+      run List<u32>.append(&mut moved, position)
+      index = index + usize.ONE
+    }
+    if !same(readText(&mut reader), working) || reader.failed { return Previous.none() }
+    let tests = readU64(&mut reader)
+    let mut entries = List<Entry>.make()
+    let mut test: u64 = 0
+    while test < tests && !reader.failed {
+      let identity = run Bytes.copy(readText(&mut reader))
+      let functionCount = readU64(&mut reader)
+      if functionCount > count { return Previous.none() }
+      let mut functions = run List<u32>.makeWithCapacity(u64.toUsize(functionCount))
+      let mut position: u64 = 0
+      let mut at: u64 = 0
+      while at < functionCount && !reader.failed {
+        position = position + readVarint(&mut reader)
+        if position >= count { return Previous.none() }
+        run List<u32>.append(&mut functions, u64.toU32(position))
+        at = at + 1
+      }
+      let inputCount = readU64(&mut reader)
+      let mut inputs = List<Input>.make()
+      at = 0
+      while at < inputCount && !reader.failed {
+        let kind = readU8(&mut reader)
+        let root = run Bytes.copy(readText(&mut reader))
+        let path = run Bytes.copy(readText(&mut reader))
+        let recorded = readSlice(&mut reader, 32)
+        if reader.failed { return Previous.none() }
+        let mut digest: [u8; 32] = [0; 32]
+        let mut byte = usize.ZERO
+        while byte < 32 {
+          digest[byte] = recorded[byte]
+          byte = byte + usize.ONE
+        }
+        run List<Input>.append(&mut inputs, Input {kind: kind, root: move root, path: move path, digest: digest})
+        at = at + 1
+      }
+      run List<Entry>.append(&mut entries, Entry {identity: move identity, functions: move functions, inputs: move inputs})
+      test = test + 1
+    }
+    if reader.failed || reader.at != bytes.length { return Previous.none() }
+    return Previous {moved: move moved, entries: move entries, cursor: usize.ZERO}
+  }
+
+  /// The entry of the test `identity` with its functions moved to this runner's table, when every
+  /// function it executed is still in the table with the same digest. Its inputs are not checked;
+  /// [`unchanged`] checks them.
+  pub effect fn find(self: &mut Self, identity: &[u8]) -> Option<Entry> ! OutOfMemoryError ? &mut Allocator {
+    let count = List<Entry>.length(&self.entries)
+    let mut step = usize.ZERO
+    while step < count {
+      let at = (self.cursor + step) % count
+      let entries = List<Entry>.asSlice(&self.entries)
+      if same(Bytes.asSlice(&entries[at].identity), identity) {
+        self.cursor = at + usize.ONE
+        let moved = List<u32>.asSlice(&self.moved)
+        let recorded = List<u32>.asSlice(&entries[at].functions)
+        let mut functions = run List<u32>.makeWithCapacity(recorded.length)
+        let mut index = usize.ZERO
+        while index < recorded.length {
+          let position = moved[u32.toUsize(recorded[index])]
+          if position == u32.MAX { return Option<Entry>.none() }
+          run List<u32>.append(&mut functions, position)
+          index = index + usize.ONE
+        }
+        sortPositions(List<u32>.asMutSlice(&mut functions))
+        let mut inputs = List<Input>.make()
+        let listed = List<Input>.asSlice(&entries[at].inputs)
+        index = usize.ZERO
+        while index < listed.length {
+          run List<Input>.append(&mut inputs, Input {kind: listed[index].kind, root: run Bytes.copy(Bytes.asSlice(&listed[index].root)),
+            path: run Bytes.copy(Bytes.asSlice(&listed[index].path)), digest: listed[index].digest})
+          index = index + usize.ONE
+        }
+        return Option<Entry>.some(Entry {identity: run Bytes.copy(identity), functions: move functions, inputs: move inputs})
+      }
+      step = step + usize.ONE
+    }
+    return Option<Entry>.none()
+  }
+}
+
+// Sorts positions in increasing order: an insertion sort over runs that are mostly in order.
+fn sortPositions(values: &mut [u32]) -> () {
+  let mut at = usize.ONE
+  while at < values.length {
+    let value = values[at]
+    let mut place = at
+    while place > usize.ZERO && values[place - usize.ONE] > value {
+      values[place] = values[place - usize.ONE]
+      place = place - usize.ONE
+    }
+    values[place] = value
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+/// Whether every input of `entry` reads now as it did when it was recorded.
+pub effect fn unchanged(entry: &Entry) -> bool ! OutOfMemoryError ? &mut Allocator | &mut HostInput {
+  let inputs = List<Input>.asSlice(&entry.inputs)
+  let mut at = usize.ZERO
+  while at < inputs.length {
+    let now = run digestInput(inputs[at].kind, Bytes.asSlice(&inputs[at].root), Bytes.asSlice(&inputs[at].path))
+    if !same(&now, &inputs[at].digest) { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+/// The SHA-256 of what the input of `kind` at `path`, through a provider rooted at `root`, reads
+/// now: a file's contents, an entry's kind and size, a directory's names, or a variable's value,
+/// each after a word for its kind, or a word for a failure.
+pub effect fn digestInput(kind: u8, root: &[u8], path: &[u8]) -> [u8; 32] ! OutOfMemoryError ? &mut Allocator | &mut HostInput {
+  let mut state = Sha256.make()
+  if kind == Observation.VARIABLE {
+    match move run Effect.result(HostInput.variable(path)) {
+      Result<Option<Bytes>, HostInputError | OutOfMemoryError>.Success { value } => match move value {
+        Option<Bytes>.Some { value: text } => {
+          Sha256.update(&mut state, b"set:")
+          Sha256.update(&mut state, Bytes.asSlice(&text))
+        }
+        Option<Bytes>.None => Sha256.update(&mut state, b"unset")
+      }
+      Result<Option<Bytes>, HostInputError | OutOfMemoryError>.Failure { error } => match move error {
+        HostInputError unread => { drop unread Sha256.update(&mut state, b"failed") }
+        OutOfMemoryError exhausted => { fail move exhausted }
+      }
+    }
+    return state.finish()
+  }
+  let mut fileSystem = run rootedFileSystem(root)
+  let read = run Effect.result(inputDigest(kind, path)) |> Effect.provideMut<FileSystem>(&mut fileSystem)
+  return match move read {
+    Result<[u8; 32], FileError | OutOfMemoryError>.Success { value } => value
+    Result<[u8; 32], FileError | OutOfMemoryError>.Failure { error } => match move error {
+      FileError unread => {
+        drop unread
+        Sha256.update(&mut state, b"failed")
+        state.finish()
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+effect fn inputDigest(kind: u8, path: &[u8]) -> [u8; 32] ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let mut state = Sha256.make()
+  let named = run Path.fromBytes(path)
+  if kind == Observation.FILE {
+    let bytes = run FileSystem.readFile(&named)
+    Sha256.update(&mut state, b"file:")
+    Sha256.update(&mut state, Bytes.asSlice(&bytes))
+  } else if kind == Observation.ENTRY {
+    match move run FileSystem.stat(&named) {
+      FileInfo { byteLength } => {
+        Sha256.update(&mut state, b"file of ")
+        let size = usize.toU64(byteLength)
+        let mut shift: u64 = 0
+        while shift < 64 {
+          Sha256.update(&mut state, &[u64.toU8(u64.bitAnd(u64.shiftRight(size, shift), 255))])
+          shift = shift + 8
+        }
+      }
+      DirectoryInfo {} => Sha256.update(&mut state, b"directory")
+    }
+  } else {
+    let listed = run FileSystem.listDirectory(&named)
+    Sha256.update(&mut state, b"listing:")
+    let entries = List<DirectoryEntry>.asSlice(&listed)
+    let mut at = usize.ZERO
+    while at < entries.length {
+      Sha256.update(&mut state, Path.rawBytes(&entries[at].path))
+      Sha256.update(&mut state, &[0, i32.wrappingToU8(entries[at].kind.code)])
+      at = at + usize.ONE
+    }
+  }
+  return state.finish()
+}
+
+/// The inputs the notes of a watch buffer `notes` name, each once, with their digests now.
+pub effect fn inputs(notes: &[u8]) -> List<Input> ! OutOfMemoryError ? &mut Allocator | &mut HostInput {
+  let mut found = List<Input>.make()
+  let mut seen = HashMap<u64, usize>.make(Hash.seed(31))
+  let mut at = usize.ZERO
+  while at < notes.length {
+    let start = at
+    let kind = notes[at]
+    at = at + usize.ONE
+    let rootLength = littleU32(notes, at)
+    let root = Slice.view<u8>(notes, at + 4, rootLength)
+    at = at + 4 + rootLength
+    let pathLength = littleU32(notes, at)
+    let path = Slice.view<u8>(notes, at + 4, pathLength)
+    at = at + 4 + pathLength
+    let key = noteHash(Slice.view<u8>(notes, start, at - start))
+    let mut known = false
+    if let Option<usize>.Some { value: first } = HashMap<u64, usize>.get(&seen, key) {
+      let listed = List<Input>.asSlice(&found)
+      known = listed[first].kind == kind && same(Bytes.asSlice(&listed[first].root), root) && same(Bytes.asSlice(&listed[first].path), path)
+    }
+    if !known {
+      drop run HashMap<u64, usize>.insert(&mut seen, key, List<Input>.length(&found))
+      let digest = run digestInput(kind, root, path)
+      run List<Input>.append(&mut found, Input {kind: kind, root: run Bytes.copy(root), path: run Bytes.copy(path), digest: digest})
+    }
+  }
+  return move found
+}
+
+fn littleU32(bytes: &[u8], at: usize) -> usize {
+  let mut value: usize = 0
+  let mut index = usize.ZERO
+  while index < 4 {
+    value = value + u8.toUsize(bytes[at + index]) * u64.toUsize(u64.shiftLeft(1, usize.toU64(index * 8)))
+    index = index + usize.ONE
+  }
+  return value
+}
+
+// FNV-1a over `bytes`.
+fn noteHash(bytes: &[u8]) -> u64 {
+  let mut hash: u64 = 14695981039346656037
+  let mut at = usize.ZERO
+  while at < bytes.length {
+    hash = u64.wrappingMultiply(u64.bitXor(hash, u8.toU64(bytes[at])), 1099511628211)
+    at = at + usize.ONE
+  }
+  return hash
+}
+
+effect fn appendU64(out: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut bytes: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0]
+  let mut index = usize.ZERO
+  while index < 8 {
+    bytes[index] = u64.toU8(u64.bitAnd(u64.shiftRight(value, usize.toU64(index * 8)), 255))
+    index = index + usize.ONE
+  }
+  return run Bytes.append(&mut out.*, &bytes)
+}
+
+effect fn appendText(out: &mut Bytes, text: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  run appendU64(&mut out.*, usize.toU64(text.length))
+  return run Bytes.append(&mut out.*, text)
+}
+
+effect fn appendVarint(out: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut rest = value
+  while rest >= 128 {
+    run Bytes.append(&mut out.*, &[u64.toU8(u64.bitOr(u64.bitAnd(rest, 127), 128))])
+    rest = u64.shiftRight(rest, 7)
+  }
+  return run Bytes.append(&mut out.*, &[u64.toU8(rest)])
+}
+
+/// The record file of `entries` for this runner's `table`, run in the working directory `working`.
+pub effect fn record(table: &Table, working: &[u8], entries: &[Entry]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut out = run Bytes.copy(b"SLKTREC1")
+  run appendU64(&mut out, VERSION)
+  run appendU64(&mut out, usize.toU64(table.count))
+  let mut index = usize.ZERO
+  while index < table.count {
+    let mut half = usize.ZERO
+    while half < 2 {
+      let word = table.digestWord(index, half)
+      let mut shift: u64 = 56
+      while true {
+        run Bytes.append(&mut out, &[u64.toU8(u64.bitAnd(u64.shiftRight(word, shift), 255))])
+        if shift == 0 { break }
+        shift = shift - 8
+      }
+      half = half + usize.ONE
+    }
+    index = index + usize.ONE
+  }
+  run appendText(&mut out, working)
+  run appendU64(&mut out, usize.toU64(entries.length))
+  index = usize.ZERO
+  while index < entries.length {
+    run appendText(&mut out, Bytes.asSlice(&entries[index].identity))
+    let functions = List<u32>.asSlice(&entries[index].functions)
+    run appendU64(&mut out, usize.toU64(functions.length))
+    let mut previous: u64 = 0
+    let mut at = usize.ZERO
+    while at < functions.length {
+      run appendVarint(&mut out, u32.toU64(functions[at]) - previous)
+      previous = u32.toU64(functions[at])
+      at = at + usize.ONE
+    }
+    let inputs = List<Input>.asSlice(&entries[index].inputs)
+    run appendU64(&mut out, usize.toU64(inputs.length))
+    at = usize.ZERO
+    while at < inputs.length {
+      run Bytes.append(&mut out, &[inputs[at].kind])
+      run appendText(&mut out, Bytes.asSlice(&inputs[at].root))
+      run appendText(&mut out, Bytes.asSlice(&inputs[at].path))
+      run Bytes.append(&mut out, &inputs[at].digest)
+      at = at + usize.ONE
+    }
+    index = index + usize.ONE
+  }
+  return move out
+}

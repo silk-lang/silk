@@ -1353,6 +1353,10 @@ also call. Like a foreign function it carries three separate identities:
 - the **native symbol**, which is the `as` string when present and the Silk name otherwise; and
 - the **ABI**, named by the string after `export`.
 
+A generic export, one that declares type parameters, publishes no native symbol: each
+instantiation whose address is taken has its own thunk under a private symbol
+([FFI-012](#ffi-012--c-function-pointers-are-exact-exported-addresses)).
+
 Only `"C"` is accepted as the ABI. The exported symbol names a compiler-generated thunk under the
 target's C calling convention whose parameters and result follow the classified C signature. The
 Silk implementation keeps its private compiler-versioned symbol and lane-flattened internal ABI;
@@ -1391,7 +1395,7 @@ Each parameter and the result of an exported function passes the same V1 foreign
 relation as a foreign function under
 [FFI-003](#ffi-003--foreign-signatures-admit-only-the-c-compatible-scalar-subset): `()` as the
 result only, exact-width integers, target-width `isize` and `usize`, `f32` and `f64`, and raw
-pointers, all by value. An exported function cannot declare type parameters, a `where` clause, a failure row, a
+pointers, all by value. An exported function cannot declare a lifetime or row parameter, a failure row, a
 requirement row, the `effect` kind, the `static` phase, or the `unsafe` qualifier, and its body
 cannot suspend.
 
@@ -1399,6 +1403,17 @@ cannot suspend.
 export "C" fn bad() -> string { return "" }
 export "C" effect fn bad() -> () { return () }
 unsafe export "C" fn bad(value: i32) -> i32 { return value }
+```
+
+An exported function may declare type parameters, with bounds. It is then a generic export. Its
+signature passes the admission relation as written, so a type parameter appears only beneath a raw
+pointer, and it cannot write an `as` symbol, because one symbol cannot name every instantiation.
+
+```silk,ignore
+export "C" fn entered<C: Composition>(raw: ?*mut u8) -> ?*mut u8 { return raw }
+export "C" fn read<T: Scale>(value: *const T) -> i32 { return 0 }
+export "C" fn bad<T>(value: T) -> i32 { return 0 }
+export "C" fn bad<T>(value: i32) -> i32 as "bad_c" { return value }
 ```
 
 **Boundary:** The header restrictions are those of
@@ -1409,7 +1424,8 @@ its spelling, so it is judged after lowering: a body that runs an Effect classif
 other than synchronous is rejected even when every header check passes.
 
 **Diagnostics:** A parameter or result outside the subset reports `SEM0187` at the offending
-type. Retained Silk-only syntax, `static`, or `unsafe` reports `SEM0188` at the offending syntax.
+type. Retained Silk-only syntax, `static`, or `unsafe` reports `SEM0188` at the offending syntax,
+as do a lifetime or row parameter and the `as` string of a generic export.
 A suspending body reports `SEM0201` at the declaration, naming the suspending call; planning
 constructs no artifact. A rejected export publishes no thunk.
 
@@ -1426,12 +1442,17 @@ planning gate, the same predicate the native backend uses to decide suspendabili
 
 **Status:** Confirmed
 
-Every `export "C"` declaration in the loaded module closure is an instance-discovery root when the
-selected target is native, in addition to the entry. An export that no Silk code calls is still
-specialized, verified, and emitted, because its consumer is native code the compiler cannot see.
-Roots are collected in canonical module then declaration order; they are monomorphic by
-[FFI-009](#ffi-009--exported-signatures-and-contracts-follow-the-foreign-admission-rules), so
-no specialization arguments are needed.
+Every `export "C"` declaration without type parameters in the loaded module closure is an
+instance-discovery root when the selected target is native, in addition to the entry. An export
+that no Silk code calls is still specialized, verified, and emitted, because its consumer is native
+code the compiler cannot see. Roots are collected in canonical module then declaration order; they
+are monomorphic, so no specialization arguments are needed.
+
+A generic export is not a root. Native code reaches it only through an address Silk code takes at
+an instantiation ([FFI-012](#ffi-012--c-function-pointers-are-exact-exported-addresses)), so an
+instantiation is discovered where that address is specialized, like a generic call
+([GEN-005](generics-interfaces-and-specialization.md)). A generic export whose address is never
+taken emits nothing.
 
 Exports do not replace the entry: a native executable still requires the ordinary `main`, and the
 driver, shim, and termination contract are unchanged.
@@ -1476,7 +1497,8 @@ beside the foreign imports. That inventory is the source of the generated header
 manifests described by [FFI-014](#ffi-014--native-libraries-publish-c-interface-companions).
 
 **Boundary:** Two foreign imports of one symbol agree when their C signatures match; two exports
-never do, because each would define the symbol. An export in a module that is not loaded into
+never do, because each would define the symbol. A generic export claims no symbol, so it conflicts
+with nothing and the artifact's export inventory does not list it. An export in a module that is not loaded into
 the closure contributes nothing and conflicts with nothing.
 
 **Diagnostics:** An invalid spelling reports `SEM0190` and a reserved symbol `SEM0191`, at the `as`
@@ -1501,7 +1523,9 @@ module.
 `extern "C" fn(P...) -> R` is a distinct Copy type represented by one native address. It is not a
 Silk `fn(P...) -> R` value: it has no environment, dynamic dispatch record, or ownership-bearing
 capture. A named `export "C" fn` item contextually converts to the C function-pointer type only
-when its signature and declared behavior match exactly and its body is synchronous with no type or value generics. Per-call lifetime binders are permitted.
+when its signature and declared behavior match exactly and its body is synchronous. A generic
+export converts only when written with type arguments that fix every type parameter. Per-call
+lifetime binders are permitted.
 
 ```silk,ignore
 import silk.mem.pointer { Pointer }
@@ -1525,8 +1549,37 @@ unsafe export "C" fn compare(left: *const i32, right: *const i32) -> i32 {
 ```
 
 The native backend supplies the address of the same C-ABI thunk published for external callers.
-The address passes unchanged through the foreign call. Calling a runtime native pointer requires `unsafe` and uses a distinct guarded C-ABI indirect call. Ordinary functions, generic functions,
+The address passes unchanged through the foreign call. Calling a runtime native pointer requires `unsafe` and uses a distinct guarded C-ABI indirect call. Ordinary functions,
 effect or suspending functions, naked machine functions, and anonymous or capturing callables never acquire a C callback address.
+
+A generic export supplies one thunk for each instantiation. Its name written with type arguments
+and no argument list is the address of the thunk of that instantiation:
+
+```silk,ignore
+// In a library: written once, generic over the embedder's capabilities.
+export "C" fn workerEntry<C: Composition>(raw: ?*mut u8) -> ?*mut u8 {
+  return raw
+}
+
+// Where the instantiating code is itself generic, the instantiation is found when it is specialized.
+fn spawn<C: Composition>(packet: ?*mut u8) -> i32 {
+  let mut thread: usize = 0
+  let entry: extern "C" fn(?*mut u8) -> ?*mut u8 = workerEntry<C>
+  return unsafe pthread_create(Pointer.fromMutRef(&mut thread), Pointer.null<u8>(), entry, packet)
+}
+```
+
+The type arguments must fix every type parameter and prove its bounds, and the signature compared
+with the expected pointer type is the export's under them. Every reachable instantiation becomes
+one thunk, however many places take its address, so two addresses of one instantiation are equal
+and two instantiations have different addresses. A thunk's symbol is private to the artifact and
+derived from the export and its type arguments, as the symbol of any generic instance is; it is
+deterministic and no native code can name it. No lookup or dictionary exists at run time. A thunk
+has the unwind guard of every exported entry
+([FFI-006](#ffi-006--foreign-calls-use-linked-symbols-and-enforced-unwind-boundaries)).
+
+Silk code calls a generic export as the generic function it is: `workerEntry<C>(packet)` is an
+ordinary call of the Silk instance, needs no `unsafe` and goes through no thunk.
 
 A C function-pointer slot that may hold NULL has the type `?extern "C" fn(P...) -> R`, with the
 same representation, signature and behavior. A nonnull address, including an export converted in
@@ -1547,17 +1600,28 @@ fn unset() -> CallbackInfo {
 
 **Boundary:** Callback conversion is contextual; naming `compare` where a Silk callable is expected
 still produces its ordinary Silk callable value. Imported foreign functions remain callable-only.
+An instantiated generic export is a value only where a C function-pointer type is expected, and
+its type arguments are written, never inferred from that type: a userdata pointer does not name
+them. Native code can reach a generic export only through such an address, since it has no symbol
+to link against.
 The LLVM-to-Wasm target rejects any reachable call whose signature contains a C function pointer
 before emission and does not invent host addresses.
 
 **Diagnostics:** A C function-pointer type containing any parameter or result outside the admitted
 C subset reports `SEM0187` at that type wherever it is declared. An ineligible value at a C
 callback conversion reports `SEM0207` at the value. An otherwise valid callback operation on a
-non-native execution surface reports `SEM0193` with the foreign symbol and surface.
+non-native execution surface reports `SEM0193` with the foreign symbol and surface. A generic
+export named without type arguments, or instantiated where no C function-pointer type is expected,
+reports `SEM0189` at the name. Type arguments of the wrong number report `SEM0051`, a bound they do
+not prove reports `SEM0121`, and an instantiated signature that differs from the expected pointer
+type reports the mismatch of its context, such as `SEM0012` for a call argument.
 
 **Current compiler:** Aligned. Semantic analysis records the contextual address conversion, MIR
 retains a dedicated foreign-address operation, and native lowering resolves it to the generated
-export thunk. The native corpus calls libc `qsort` through a Silk comparator and retains callbacks from direct and nested by-value arguments for invocation during a later C call. The [native callback contract](./synchronous-native-callbacks.md) defines synchronous, deferred same-thread and any-thread invocation, field-path coverage, reentrancy and boundary termination.
+export thunk. For a generic export the conversion records the written application; specialization
+closes it with the instantiating code's own type arguments, and each instance of a generic export
+is lowered with its thunk, which the address names. The native corpus instantiates one from
+concrete and from generic code and has C code call both back. The native corpus also calls libc `qsort` through a Silk comparator and retains callbacks from direct and nested by-value arguments for invocation during a later C call. The [native callback contract](./synchronous-native-callbacks.md) defines synchronous, deferred same-thread and any-thread invocation, field-path coverage, reentrancy and boundary termination.
 
 **Evidence:** callback specification,
 [call resolution](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/CallResolution.ts),
