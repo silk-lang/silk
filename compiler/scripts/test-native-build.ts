@@ -5387,8 +5387,9 @@ const program = Effect.gen(function* () {
   yield* embedAppRun(45)
   yield* embedCheck(embedLibrary, 'a package\'s own embedded file was not read')
   yield* embedCheck(embedLibrary, 'a second check lost a package\'s own embedded file')
-  // A check server whose first check reused the cache follows edits of the modules it reused: an
-  // edited module that calls a missing one is refused, as `--no-server` refuses it (#3116).
+  // A check that reused the cache leaves no server behind, so an edit of a module it reused is
+  // refused as `--no-server` refuses it; a server a cold check left sweeps a module an edit newly
+  // imports (#3116).
   const served = join(directory, 'served-edits')
   yield* fs.makeDirectory(join(served, 'src'), { recursive: true })
   yield* fs.writeFileString(join(served, 'silk.toml'), '[package]\nname = "served-edits"\nversion = "0.1.0"\n')
@@ -5403,11 +5404,20 @@ const program = Effect.gen(function* () {
   const missingModule = yield* servedCheck(['--no-server'])
   assert.match(missingModule.stdout + missingModule.stderr, /main\.silk:2:8: error\[MOD0001\]/)
   yield* fs.writeFileString(join(served, 'src/main.silk'), 'import other\npub fn main() -> i32 { return other.helper() - 1 }\n')
-  const leftServer = yield* servedCheck([])
-  assert.equal(leftServer.status, 0, leftServer.stdout + leftServer.stderr)
+  const reused = yield* servedCheck([])
+  assert.equal(reused.status, 0, reused.stdout + reused.stderr)
   yield* fs.writeFileString(join(served, 'src/other.silk'), 'import third\npub fn helper() -> i32 { return third.t() }\n')
   const servedEdit = yield* servedCheck([])
-  assert.match(servedEdit.stdout + servedEdit.stderr, /other\.silk:1:8: error\[MOD0001\]/, 'the check server missed an edit of a module it reused')
+  assert.match(servedEdit.stdout + servedEdit.stderr, /other\.silk:1:8: error\[MOD0001\]/, 'a check missed an edit of a module the cache answered')
+  yield* fs.remove(join(served, 'build'), { recursive: true })
+  yield* fs.writeFileString(join(served, 'src/other.silk'), 'pub fn helper() -> i32 { return 1 }\n')
+  // Nothing imports `extra` yet; a file added later would change the program's shape instead.
+  yield* fs.writeFileString(join(served, 'src/extra.silk'), 'pub fn more() -> i32 { return true }\n')
+  const coldServer = yield* servedCheck([])
+  assert.equal(coldServer.status, 0, coldServer.stdout + coldServer.stderr)
+  yield* fs.writeFileString(join(served, 'src/main.silk'), 'import other\nimport extra\npub fn main() -> i32 { return other.helper() + extra.more() }\n')
+  const newlyImported = yield* servedCheck([])
+  assert.match(newlyImported.stdout + newlyImported.stderr, /extra\.silk:1:\d+: error\[SEM0129\]/, 'the check server did not sweep a newly imported module')
   // A static fn reads the length of an embedded file while the package compiles.
   yield* fs.writeFileString(
     join(embedLibrary, 'src/library.silk'),
