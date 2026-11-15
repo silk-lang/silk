@@ -1319,8 +1319,7 @@ publishes one, is not reported either, because method syntax and `Type.operation
 interface's operations through it without spelling it. Like every warning, `MOD0007` fails
 `silk check`, `silk build` and `silk test` unless `--ignore-warnings` is given.
 
-A warning does not reject the program: the command still succeeds, and its exit status is the
-one it would have without the warning. Only the root package's modules are reported, a module with
-syntax errors reports none, `silk build` reports them only when the build succeeds, and a binding
-inside an error's span, such as an import of a missing module, reports only the error. The language server marks the binding unnecessary, which editors
-show faded. Imports themselves have no runtime behavior.
+Only the root package's modules are reported, a module with syntax errors reports none,
+`silk build` reports them only when the build succeeds, and a binding inside an error's span, such
+as an import of a missing module, reports only the error. The language server marks the binding
+unnecessary, which editors show faded. Imports themselves have no runtime behavior.
