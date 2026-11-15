@@ -77,7 +77,7 @@ effect fn failed<E>(error: E) -> i32 { drop error return 1 }
 pub fn main() -> i32 {
   let mut allocator = Allocator.systemAllocatorProvider()
   let served = Server.make(8080).serve(Hello {})
-  return run Effect.catchAll(Effect.map(move served, fn(done: ()) -> i32 { return 0 }), failed)
+  return run Effect.catchAll(Effect.map(move served, |done: ()| -> i32 { return 0 }), failed)
     |> Effect.provideMut<Allocator>(&mut allocator)
 }
 ```

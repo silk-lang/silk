@@ -585,13 +585,14 @@ use ownership diagnostic `OWN0014` for the same access violation.
 **Evidence:** [callable ownership](ownership-and-borrowing.md#callable-002--invocation-mode-derives-from-access-to-the-callable-environment),
 callable specification.
 
-### ANON-CALLABLE-001 — An anonymous callable has one exact source identity and explicit contract
+### ANON-CALLABLE-001 — An anonymous callable has one exact source identity
 
 **Status:** Confirmed
 
-An anonymous callable defines its parameters, result, and body at an expression site. Parameter and
-result types are mandatory. An effectful anonymous callable also declares any failure and
-requirement channels in the ordinary Effect-contract positions.
+An anonymous callable is a lambda: it defines its parameters, result, and body at an expression
+site. A lambda that writes every parameter type and its result has exactly that contract; an
+effectful one also writes any failure and requirement rows after its result, in the ordinary
+Effect-contract positions.
 
 ```silk
 fn apply(transform: fn(i32) -> i32, value: i32) -> i32 {
@@ -599,7 +600,7 @@ fn apply(transform: fn(i32) -> i32, value: i32) -> i32 {
 }
 
 fn addOffset(offset: i32) -> i32 {
-  return apply(fn(value: i32) -> i32 { return value + offset }, 40)
+  return apply(|value: i32| -> i32 { return value + offset }, 40)
 }
 ```
 
@@ -615,10 +616,8 @@ imports, overload sets, or documentation as named functions. Writing a structura
 does not merge distinct occurrences or erase their targets and environments into a universal
 closure representation or ABI.
 
-**Boundary:** The `fn(...)` form's written contract must be complete. An expected callable type may
-check compatibility and contribute ordinary surrounding generic constraints, but it does not infer a
-missing parameter, result, failure, or requirement annotation and does not rewrite a conflicting
-annotation. The lambda form leaves types to its context instead
+**Boundary:** An expected callable type checks a written type for compatibility and does not rewrite
+a conflicting one; it supplies only the types a lambda omits
 ([ANON-CALLABLE-002](#anon-callable-002--a-lambda-takes-omitted-types-from-where-it-is-used)). Anonymous callables cannot declare independent type parameters, name themselves, refer
 to themselves recursively, carry declaration modifiers, or participate in overloads. An anonymous
 body may be nested inside another anonymous body or an `effect` block, at any depth; it sees every
@@ -627,8 +626,8 @@ is derived from captures under
 [ANON-OWN-001](ownership-and-borrowing.md#anon-own-001--anonymous-captures-determine-environment-ownership-and-invocation-mode);
 source does not spell `mut fn` or `once fn` when constructing the value.
 
-**Diagnostics:** An incomplete written contract receives a syntax or type diagnostic at the missing
-or incompatible contract part. A self-reference, independent type parameter, declaration
+**Diagnostics:** A written type that conflicts with the expected callable type receives a type
+diagnostic at that contract part. A self-reference, independent type parameter, declaration
 modifier, or overload use receives a semantic diagnostic at that unsupported construct.
 
 **Evidence:** anonymous callable value specification,
@@ -667,7 +666,7 @@ fn examples(offset: i32) -> i32 {
 In a generic call, a lambda whose parameter types use binders the call has not inferred yet is
 checked after the call's other arguments, so `applyTwice(|value| value + 1, 40)` types `value` as
 `i32` from `40`. A lambda is otherwise an anonymous callable under
-[ANON-CALLABLE-001](#anon-callable-001--an-anonymous-callable-has-one-exact-source-identity-and-explicit-contract):
+[ANON-CALLABLE-001](#anon-callable-001--an-anonymous-callable-has-one-exact-source-identity):
 it has its own source identity, captures, and invocation mode, and its signature is fixed by the
 check of its enclosing body. Inference adds no work to code that does not use lambdas.
 

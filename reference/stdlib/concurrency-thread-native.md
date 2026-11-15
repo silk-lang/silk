@@ -55,7 +55,7 @@ effect fn program() -> i32
   // The closure owns what it captures, so it can run on the new thread.
   let limit = 100
   let handle = run NativeThread.spawn(
-    fn() -> i32 {
+    || -> i32 {
       return sum(limit)
     }
   )
