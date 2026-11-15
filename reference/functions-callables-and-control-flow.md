@@ -675,6 +675,24 @@ An `effect` lambda, `effect |value| ...`, is an anonymous `effect fn`. When it o
 success, failure, and requirements are those of the Effect the context expects when the context
 fixes them, and otherwise they are derived from its body as for an `effect {}` block
 ([RETURN-002](#return-002--an-effect-block-derives-its-contract-from-every-reachable-terminal)).
+When it writes its result, its failure and requirements are the rows written after it, as in an
+`effect fn` declaration, and none when it writes none.
+
+```silk
+pub enum Problem {
+  TooSmall,
+}
+
+effect fn checked(value: i32) -> i32 ! Problem {
+  if value < 10 { fail Problem.TooSmall }
+  return value
+}
+
+effect fn written() -> i32 ! Problem {
+  let check = effect |value: i32| -> i32 ! Problem { return run checked(value) }
+  return run check(12)
+}
+```
 
 ```silk
 import silk.core.effect { Effect }
