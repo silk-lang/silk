@@ -54,7 +54,7 @@ import semantic.ModuleId {InvalidModulePath, ModuleId}
 import semantic.PackageGraph {PackageGraph}
 import semantic.Query {Cycle}
 import semantic.TypedBody {uncheckedReasonCount, uncheckedReasonName}
-import driver.ModuleSources as ModuleSourceFiles {EmbeddedRead, InvalidBuildComposition, InvalidSourceRoot, MissingManifest, MissingStandardLibrary, ModuleSources, SourceSnapshot}
+import driver.ModuleSources as ModuleSourceFiles {EmbeddedRead, InvalidBuildComposition, InvalidSourceRoot, MissingManifest, MissingStandardLibrary, ModuleSources, Reach, SourceSnapshot}
 import driver.GitCheckouts
 import driver.Packages as PackageSources {InvalidDependency}
 import driver.PackArchive as PackArchives {Packed, PackRefused}
@@ -6287,7 +6287,10 @@ effect fn checkTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Op
       let dependencies = run dependencyCaches(Projects.outputDirectory(project), &sources)
       if let Option<ModuleId>.Some {..} = &runtime { loadedCaches = run packageCaches(Projects.outputDirectory(project), &sources) }
       run Progress.begin(&mut progress, ProgressPhase.Cache, usize.ZERO)
-      cache = run SemanticCache.openPrefetched(&mut store, &request, &directory, Bytes.asSlice(&stamped), false, false, move prefetched,
+      // A store a server keeps is revised by every later check, so what it reuses must rest on the
+      // image's nodes: a reused check that rests on nothing stays current after any edit.
+      let linked = match &serving { Option<Bytes>.Some {..} => true Option<Bytes>.None => false }
+      cache = run SemanticCache.openPrefetched(&mut store, &request, &directory, Bytes.asSlice(&stamped), linked, false, move prefetched,
         List<Path>.asSlice(&dependencies), List<Path>.asSlice(&loadedCaches))
       run endCacheRow(&mut progress, &cache)
     }
@@ -6307,8 +6310,8 @@ effect fn checkTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Op
     // The check has reported; a copy of the process stays behind with its store and answers the
     // next checks of this project, and this process exits as before.
     if CheckServer.detach() {
-      run serveChecks(Bytes.asSlice(&socket), Bytes.asSlice(&serverKey), &mut store, &mut request, &mut sources, &sweptModules,
-        &rootPackage, &identity, &runtime, &format, json, ignoreWarnings, &cache, &cacheHome, &loadedCaches, serverTimings)
+      run serveChecks(Bytes.asSlice(&socket), Bytes.asSlice(&serverKey), &mut store, &mut request, &mut sources, &identity, &runtime,
+        &format, json, ignoreWarnings, &cache, &cacheHome, &loadedCaches, serverTimings)
       CheckServer.exit(0)
     }
   }
@@ -6388,7 +6391,7 @@ fn sameBytes(left: &[u8], right: &[u8]) -> bool {
 // holds (`CheckServer.crowded`). Before each check it reads the changed sources into the store,
 // which reruns only the units they reach.
 effect fn serveChecks(socket: &[u8], key: &[u8], store: &mut Semantic, request: &mut SemanticRequest, sources: &mut ModuleSources,
-  sweptModules: &List<ModuleId>, rootPackage: &List<ModuleId>, identity: &ModuleId, runtime: &Option<ModuleId>, format: &DiagnosticFormat,
+  identity: &ModuleId, runtime: &Option<ModuleId>, format: &DiagnosticFormat,
   json: bool, ignoreWarnings: bool, cache: &Option<CacheFile>, cacheHome: &Option<Path>, loadedCaches: &List<Path>, timings: bool) -> ()
 ! OutOfMemoryError ? &mut FileSystem | &mut Allocator | &mut Types {
   let mut clock = OsMonotonicClock.make()
@@ -6450,12 +6453,16 @@ effect fn serveChecks(socket: &[u8], key: &[u8], store: &mut Semantic, request: 
       CheckServer.decline(client)
       break
     }
+    // What the check sweeps follows the imports of the texts just read: a module an edit newly
+    // imports is swept, and one no import reaches any longer is not, as a fresh check would load.
+    let rootPackage = run ModuleSourceFiles.loadedRootModules(&sources.*)
+    let sweptModules = run ModuleSourceFiles.checkedModules(&sources.*)
     let refreshedAt = run MonotonicClock.now() |> Effect.provideMut<MonotonicClock>(&mut clock)
     run Semantic.update(&mut store.*, run ModuleSourceFiles.revision(&sources.*))
     let updatedAt = run MonotonicClock.now() |> Effect.provideMut<MonotonicClock>(&mut clock)
     let mut out = Bytes.make()
     let mut progress = Progress.off()
-    let passed = run Effect.result(checkPass(&mut store.*, &mut request.*, &sources.*, sweptModules, rootPackage, identity, runtime,
+    let passed = run Effect.result(checkPass(&mut store.*, &mut request.*, &sources.*, &sweptModules, &rootPackage, identity, runtime,
       format, json, false, ignoreWarnings, cache, cacheHome, loadedCaches, false, &mut out, &mut progress))
     match move passed {
       Result<PassResult, ApplicationError | FileError | InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | WriterError>.Success {value} => {
@@ -6612,7 +6619,10 @@ effect fn checkPass(store: &mut Semantic, request: &mut SemanticRequest, sources
     refusal = refusal + usize.ONE
   }
   progress.* = Semantic.takeProgress(&mut store.*)
-  let syntax = run Semantic.syntaxRejections(&store.*)
+  // A store a server keeps still holds modules an edit stopped importing; what they refuse is not
+  // reported, as a fresh check would not read them.
+  let reach = run ModuleSourceFiles.reached(&sources.*)
+  let syntax = run reachedRejections(&reach, run Semantic.syntaxRejections(&store.*))
   let malformed = List<Shared<Rejection>>.asSlice(&syntax)
   let mut at = usize.ZERO
   while at < malformed.length {
@@ -6621,7 +6631,7 @@ effect fn checkPass(store: &mut Semantic, request: &mut SemanticRequest, sources
     }
     at = at + usize.ONE
   }
-  let importRejected = run Semantic.importRejections(&mut store.*, &mut request.*)
+  let importRejected = run reachedRejections(&reach, run Semantic.importRejections(&mut store.*, &mut request.*))
   status = worse(status, run reportedImportRejections(List<Shared<Rejection>>.asSlice(&importRejected), &sources.*, &format.*, &mut out.*, &mut seen))
   // Malformed syntax leaves later phases without a complete tree, so their refusals of the
   // recovered constructs are not reported next to the syntax errors that caused them.
@@ -6686,6 +6696,20 @@ effect fn checkPass(store: &mut Semantic, request: &mut SemanticRequest, sources
   }
   run abandonValue(move checked)
   return PassResult {status: status, reported: List<ReportedSite>.length(&seen)}
+}
+
+// The rejections of `found` in the modules `reach` holds.
+effect fn reachedRejections(reach: &Reach, found: List<Shared<Rejection>>) -> List<Shared<Rejection>>
+! OutOfMemoryError ? &mut Allocator {
+  let mut kept = move found
+  let mut at = usize.ZERO
+  while at < List<Shared<Rejection>>.length(&kept) {
+    let inside = Shared<Rejection>.with<bool>(&List<Shared<Rejection>>.asSlice(&kept)[at], fn(value: &Rejection) -> bool {
+      return ModuleSourceFiles.reaches(reach, &value.module)
+    })
+    if inside { at = at + usize.ONE } else { drop List<Shared<Rejection>>.remove(&mut kept, at) }
+  }
+  return move kept
 }
 
 // Writes the image of `store`'s checks for the next process, in a copy of this one.
