@@ -4842,6 +4842,29 @@ const program = Effect.gen(function* () {
   const editedPacks = yield* packNames()
   assert.equal(editedPacks.filter((name) => !coldPacks.includes(name)).length, 1, 'an edit to one module writes one pack')
   assert.equal(editedPacks.length, coldPacks.length, 'a build removes the packs no unit names')
+  // A wasm32 debug build splits the same way, so an edit compiles one unit and wasm-ld links the
+  // objects: one module of a UI page took Clang 85 s after any edit.
+  const wasmDirectory = join(split, 'build/llvm/wasm32-unknown-unknown/debug')
+  const wasmObjects = Effect.fnUntraced(function* () {
+    const names = yield* fs.readDirectory(join(wasmDirectory, 'units'))
+    return names.filter((name) => name.endsWith('.o')).sort()
+  })
+  const wasmRun = Effect.fnUntraced(function* (expected: number) {
+    const built = yield* invoke(silk, ['build', '--target', 'wasm32-unknown-unknown', '--stdlib', standardLibrary], split, splitEnvironment)
+    assert.equal(built.status, 0, built.stderr)
+    const module = new WebAssembly.Module(yield* fs.readFile(join(wasmDirectory, 'split')))
+    const main = new WebAssembly.Instance(module, {}).exports.main as () => number
+    assert.equal(main(), expected)
+  })
+  yield* wasmRun(9)
+  const coldWasmObjects = yield* wasmObjects()
+  assert.ok(coldWasmObjects.length > 2, `expected a wasm object per module, found ${coldWasmObjects.join(', ')}`)
+  yield* fs.writeFileString(join(split, 'src/helper.silk'), helperSource(6))
+  yield* wasmRun(10)
+  const editedWasmObjects = yield* wasmObjects()
+  const compiledWasm = editedWasmObjects.filter((name) => !coldWasmObjects.includes(name))
+  assert.equal(compiledWasm.length, 1, `an edit to one module compiles one wasm unit, added ${compiledWasm.join(', ')}`)
+  yield* fs.writeFileString(join(split, 'src/helper.silk'), helperSource(5))
   // Two programs of a workspace share the objects of the units both hold: the second one built
   // compiles only its own, and each lists what it links so neither build removes the other's.
   const shared = join(directory, 'shared-units')
