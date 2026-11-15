@@ -595,6 +595,42 @@ enums from different nominal types uses the ordinary cross-enum diagnostic.
 sealed target primitive requirements,
 [intrinsic catalog](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Intrinsic.ts).
 
+### STATIC-023 — Static code reads a type's layout on the selected target
+
+**Status:** Confirmed
+
+`Layout.of<T>()` from `silk.mem.layout` gives the size and alignment of `T` on the selected
+target, and `Layout.offsetOf<T>("field")` the byte offset of a field of the struct `T`, whose name is
+a checked field name (STATIC-018). Both can be called in static code, so an `extern "C"` struct is
+checked against its C header when it is compiled, for each target it is built for.
+
+```silk
+import silk.mem.layout {Layout}
+
+extern "C" struct Event {
+  wd: i32,
+  mask: u32,
+  cookie: u32,
+  len: u32,
+}
+
+fn checked() -> () {
+  static if Layout.of<Event>().bytes != 16 || Layout.offsetOf<Event>("len") != 12 {
+    compileError("Event does not match struct inotify_event")
+  }
+  return ()
+}
+```
+
+**Boundary:** The layout is the one the selected target's code uses, so it differs between targets
+where pointer width or alignment does. Reading it makes the evaluation depend on the type, so an edit
+to the type evaluates it again. `Layout.offsetOf` takes a struct; a union has no field offsets.
+
+**Diagnostics:** A name that is not a field of `T` reports `SEM0022` at the literal. `Layout.offsetOf`
+of a type that is not a struct reports `SEM0176`.
+
+**Evidence:** static layout and field offset semantic tests.
+
 ## Package files
 
 ### STATIC-015 — `silk.build.source` embeds files of the package

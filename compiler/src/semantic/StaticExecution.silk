@@ -1,5 +1,6 @@
 //! Demand-driven execution of static function bodies and evaluator-local control flow.
 
+import CompilerBug
 import diagnostic.Catalog as Catalog {Code}
 import semantic.Types {Types}
 import hir.Hir {Access, CallableContract, Diagnostic as HirDiagnostic, DurationUnit, HirId, HirRef, InfixOperator, Module, Node, OwnerKind, ParameterMode, PrefixOperator, Range, Sign}
@@ -17,7 +18,7 @@ import semantic.ModuleId {InvalidModulePath, ModuleId}
 import semantic.ModuleIndex {Candidate, IndexedDeclaration, ModuleIndex}
 import semantic.Query {Cycle}
 import semantic.Rejection {Rejection}
-import semantic.Semantic {Answer, Outcome, StaticCall, StaticCallable, StaticPort, Value}
+import semantic.Semantic {Answer, Outcome, StaticCall, StaticCallable, StaticLayout, StaticPort, Value}
 import semantic.SourceIndex {AuthoredCursor, IndexedSource, NoRejection, RevisionMismatch}
 import semantic.SourceUnit {SourceUnit}
 import semantic.Specialization {ScopeBinding, Application, Identity, Pool, StaticSlot, Target as ApplicationTarget}
@@ -720,6 +721,29 @@ effect fn reflectionAnswer<'source>(machine: &Machine<'source>,
   return match move result {
     Result<StaticData, Shared<Rejection>>.Success {value} => move value
     Result<StaticData, Shared<Rejection>>.Failure {error} => {
+      let mut failure = run diagnostic(&machine.*, Fault.Unsupported, span)
+      failure.rejection = Option<Shared<Rejection>>.some(move error)
+      fail move failure
+    }
+  }
+}
+
+// The target layout fact a static layout query read; a rejection the query met is the cause of
+// a static fault at the call.
+effect fn layoutAnswer<'source, T>(machine: &Machine<'source>,
+  measured: Result<Result<T, Shared<Rejection>>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>, span: Span)
+-> T ! Diagnostic | OutOfMemoryError ? &mut Allocator {
+  let result = match move measured {
+    Result<Result<T, Shared<Rejection>>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} => move value
+    Result<Result<T, Shared<Rejection>>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} => match move error {
+      OutOfMemoryError {} => {fail OutOfMemoryError {}}
+      Cycle {} => run reject(&machine.*, Fault.Cycle, span)
+      _ => run reject(&machine.*, Fault.Unavailable, span)
+    }
+  }
+  return match move result {
+    Result<T, Shared<Rejection>>.Success {value} => move value
+    Result<T, Shared<Rejection>>.Failure {error} => {
       let mut failure = run diagnostic(&machine.*, Fault.Unsupported, span)
       failure.rejection = Option<Shared<Rejection>>.some(move error)
       fail move failure
@@ -1530,6 +1554,42 @@ effect fn dispatchIntrinsic<'source>(
     let text = Interned<StaticData>.with<bool>(&name, fn(data: &StaticData) -> bool { return match &data.* { StaticData.Text {..} => true _ => false } })
     if !text {return run reject(&machine.*, Fault.InvalidValue, span)}
     return move name
+  }
+  if primitive == IntrinsicPrimitive.FieldOffset {
+    if CallArguments.length(arguments) != usize.ONE {return run reject(&machine.*, Fault.InvalidValue, span)}
+    let syntax = CallArguments.child(arguments, run authored(&machine.*), usize.ZERO)
+    // The argument's checked type is `FieldName<Owner>`, written in the executing body's binders.
+    let written = match move checkedExpressionType(&machine.*, syntax) {
+      Option<Interned<SemanticType>>.Some {value} => move value
+      Option<Interned<SemanticType>>.None => run reject(&machine.*, Fault.Unavailable, span)
+    }
+    let closed = run closeType(&machine.*, &written)
+    let owner = match move Interned<SemanticType>.with<Option<Interned<SemanticType>>>(&closed, CheckedIntrinsic.fieldNameOwner) {
+      Option<Interned<SemanticType>>.Some {value} => move value
+      Option<Interned<SemanticType>>.None => run reject(&machine.*, Fault.InvalidValue, span)
+    }
+    if SemanticType.hasOpenRuntimeParameters(&owner) {return run reject(&machine.*, Fault.Unsupported, span)}
+    // A field name of a union names a variant's field, which has no one offset.
+    let measured = Interned<SemanticType>.with<bool>(&owner, fn(value: &SemanticType) -> bool {
+      return match &value.* {
+        SemanticType.Nominal {declaration, ..} => DeclarationId.kind(&declaration) == OwnerKind.Struct
+        _ => false
+      }
+    })
+    if !measured {
+      let mut failure = run diagnostic(&machine.*, Fault.StaticPhaseViolation, span)
+      failure.message = Option<Bytes>.some(run Bytes.copy(b"`Intrinsic.fieldOffset` measures a field of a struct, and this type is not a struct"))
+      fail move failure
+    }
+    let name = run expression(&mut machine.*, &mut local.*, syntax)
+    let label = match move run StaticValue.textBytes(&name) {
+      Option<Bytes>.Some {value} => move value
+      Option<Bytes>.None => run reject(&machine.*, Fault.InvalidValue, span)
+    }
+    let site = run currentModule(&machine.*)
+    let read = run Effect.result(StaticPort.fieldOffset(&mut machine.port, &owner, Bytes.asSlice(&label), &site, span))
+    let offset = run layoutAnswer<usize>(&machine.*, move read, span)
+    return run retain(&mut machine.*, StaticData.Integer {ty: StaticIntegerType.Usize, sign: StaticSign.Positive, magnitude: usize.toU64(offset)}, span)
   }
   if primitive == IntrinsicPrimitive.ReflectFieldDoc || primitive == IntrinsicPrimitive.ReflectFieldKind || primitive == IntrinsicPrimitive.ReflectFieldLabel || primitive == IntrinsicPrimitive.ReflectFieldOrdinal {
     if CallArguments.length(arguments) != usize.ONE {return run reject(&machine.*, Fault.InvalidValue, span)}
@@ -2454,6 +2514,89 @@ fn checkedStorageCall<'source>(machine: &Machine<'source>, id: HirId) -> Option<
   }
 }
 
+// The type arguments and result type of the checked storage call at `id`, written in the
+// executing body's binders.
+struct CheckedStorage {
+  typeArguments: List<Interned<SemanticType>>,
+  ty: Interned<SemanticType>,
+}
+
+effect fn checkedStorageTypes<'source>(machine: &Machine<'source>, id: HirId) -> Option<CheckedStorage> ! OutOfMemoryError ? &mut Allocator {
+  let window = checkedRange(machine)
+  let index = checkedNodes(machine)
+  let anchor = match move checkedAnchor(machine) {
+    Option<Anchor>.Some {value} => move value
+    Option<Anchor>.None => { return Option<CheckedStorage>.none() }
+  }
+  let body = match move checkedBodyForExpression(machine) {
+    Option<Shared<TypedBody>>.Some {value} => move value
+    Option<Shared<TypedBody>>.None => { return Option<CheckedStorage>.none() }
+  }
+  let found = recorded(index, &anchor, id)
+  let candidates = List<usize>.asSlice(&index.positions)
+  let mut next = found.start
+  while next < found.start + found.length {
+    let at = candidates[next]
+    next = next + usize.ONE
+    if at < window.start || at - window.start >= window.length { continue }
+    let count = Shared<TypedBody>.with<usize>(&body, fn(checked: &TypedBody) -> usize {
+      if let CheckedNodeKind.Expression {form: CheckedExpression.StorageCall {typeArguments, ..}, ..} = &TypedBody.nodeSlice(checked)[at].kind {
+        return List<Interned<SemanticType>>.length(&typeArguments)
+      }
+      return usize.MAX
+    })
+    if count == usize.MAX { continue }
+    let mut arguments = run List<Interned<SemanticType>>.makeWithCapacity(count)
+    let mut position = usize.ZERO
+    while position < count {
+      let argument = Shared<TypedBody>.with<Interned<SemanticType>>(&body, fn(checked: &TypedBody) -> Interned<SemanticType> {
+        if let CheckedNodeKind.Expression {form: CheckedExpression.StorageCall {typeArguments, ..}, ..} = &TypedBody.nodeSlice(checked)[at].kind {
+          return Interned<SemanticType>.clone(&List<Interned<SemanticType>>.asSlice(&typeArguments)[position])
+        }
+        return CompilerBug.panic(b"a checked storage call changed while its type arguments were read")
+      })
+      run List<Interned<SemanticType>>.append(&mut arguments, move argument)
+      position = position + usize.ONE
+    }
+    let ty = Shared<TypedBody>.with<Interned<SemanticType>>(&body, fn(checked: &TypedBody) -> Interned<SemanticType> {
+      if let CheckedNodeKind.Expression {ty, ..} = &TypedBody.nodeSlice(checked)[at].kind {
+        return Interned<SemanticType>.clone(&ty)
+      }
+      return CompilerBug.panic(b"a checked storage call has no expression type")
+    })
+    return Option<CheckedStorage>.some(CheckedStorage {typeArguments: move arguments, ty: move ty})
+  }
+  return Option<CheckedStorage>.none()
+}
+
+// `Intrinsic.layoutOf<T>()` reached by static evaluation: the standard `Layout` record of the
+// closed `T`'s size and alignment on the checked target.
+effect fn staticLayout<'source>(machine: &mut Machine<'source>, id: HirId, span: Span) -> Interned<StaticData>
+! Diagnostic | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let checked = match move run checkedStorageTypes(&machine.*, id) {
+    Option<CheckedStorage>.Some {value} => move value
+    Option<CheckedStorage>.None => run reject(&machine.*, Fault.Unavailable, span)
+  }
+  let written = List<Interned<SemanticType>>.asSlice(&checked.typeArguments)
+  if written.length != usize.ONE { return run reject(&machine.*, Fault.InvalidValue, span) }
+  let measured = run closeType(&machine.*, &written[usize.ZERO])
+  if SemanticType.hasOpenRuntimeParameters(&measured) { return run reject(&machine.*, Fault.Unsupported, span) }
+  let ty = run closeType(&machine.*, &checked.ty)
+  let site = run currentModule(&machine.*)
+  let read = run Effect.result(StaticPort.typeLayout(&mut machine.port, &measured, &site, span))
+  let layout = run layoutAnswer<StaticLayout>(&machine.*, move read, span)
+  // The record's fields are `bytes` and `alignment`, in that order.
+  let mut fields = run List<Interned<StaticData>>.makeWithCapacity(2)
+  run List<Interned<StaticData>>.append(&mut fields, run retain(&mut machine.*,
+    StaticData.Integer {ty: StaticIntegerType.Usize, sign: StaticSign.Positive, magnitude: usize.toU64(layout.bytes)}, span))
+  run List<Interned<StaticData>>.append(&mut fields, run retain(&mut machine.*,
+    StaticData.Integer {ty: StaticIntegerType.Usize, sign: StaticSign.Positive, magnitude: usize.toU64(layout.alignment)}, span))
+  return match move StaticValue.cleanupFreeStruct(move ty, move fields) {
+    Option<StaticData>.Some {value} => run retain(&mut machine.*, move value, span)
+    Option<StaticData>.None => run reject(&machine.*, Fault.Unsupported, span)
+  }
+}
+
 fn checkedIntrinsicMember<'source>(machine: &Machine<'source>, id: HirId) -> Option<IntrinsicMember> {
   let window = checkedRange(machine)
   let index = checkedNodes(machine)
@@ -3349,6 +3492,10 @@ effect fn callExpression<'source>(
       // A storage primitive runs only at run time, however many ordinary calls deep a static
       // frame reached it.
       if let Option<StorageOperation>.Some {value: operation} = move checkedStorageCall(&machine.*, id) {
+        // A layout query reads the checked target's layout of its closed type argument.
+        if operation == StorageOperation.LayoutOf {
+          return run staticLayout(&mut machine.*, id, span)
+        }
         let mut failure = run diagnostic(&machine.*, Fault.StaticPhaseViolation, span)
         let mut detail = run Bytes.copy(b"`Intrinsic.")
         run Bytes.append(&mut detail, StorageOperation.spelling(operation))
