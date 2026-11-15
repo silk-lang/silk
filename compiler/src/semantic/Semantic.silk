@@ -2741,6 +2741,9 @@ struct Resolver {
   codegenUnits: bool,
   // Whether LLVM text is shaped for an unoptimized compile (`LlvmCode.Writer.fastPath`).
   fastPathIr: bool,
+  // Whether each emitted function marks its record in the table of executed functions as it
+  // starts, which a test runner reads to learn what each test ran (`selectCoverage`).
+  coverage: bool,
   // Whether lowering inlines callees into their callers (`inlineCalls`, by `inlineRule`): an
   // optimized build without line tables (`selectInlining`).
   inlining: bool,
@@ -45679,19 +45682,15 @@ effect fn checkTestDiscoveryCall<'scope>(
       Option<Interned<StaticData>>.Some {value} => move value
       Option<Interned<StaticData>>.None => { return run bodyRejection(&resolver.*, module, RejectionCode.StaticPhaseViolation, argumentSpan) }
     }
-    let selected = match move run selectedTestEntry(&mut resolver.*, &mut owner.*, &mut dependencies.*, &descriptor, module, argumentSpan) {
-      Result<SelectedTest, Shared<Rejection>>.Success {value} => move value
-      Result<SelectedTest, Shared<Rejection>>.Failure {error} => { return Result<BodyNodeId, Shared<Rejection>>.failResult(move error) }
+    let selected = match move run describedTest(&resolver.*, &descriptor, module, argumentSpan) {
+      Result<DescribedTest, Shared<Rejection>>.Success {value} => move value
+      Result<DescribedTest, Shared<Rejection>>.Failure {error} => { return Result<BodyNodeId, Shared<Rejection>>.failResult(move error) }
     }
     if typeArguments.length == usize.ONE {
       if !run sameBodyType(&resolver.*, &typeArguments[usize.ZERO], &selected.callable) { return run bodyRejection(&resolver.*, module, RejectionCode.TypeMismatch, span) }
     }
-    let declaration = Shared<TestCatalog>.with<Interned<DeclarationId>>(&selected.catalog, fn(held: &TestCatalog) -> Interned<DeclarationId> {
-      let entries = List<TestEntry>.asSlice(&held.entries)
-      return Interned<DeclarationId>.clone(&entries[selected.ordinal].declaration)
-    })
-    run List<DeclarationId>.append(&mut requiredBodies.*, DeclarationId.copyShared(&declaration))
-    run List<SignatureDependency>.append(&mut signatures.*, SignatureDependency {declaration: DeclarationId.copyShared(&declaration)})
+    run List<DeclarationId>.append(&mut requiredBodies.*, DeclarationId.copy(&selected.declaration))
+    run List<SignatureDependency>.append(&mut signatures.*, SignatureDependency {declaration: move selected.declaration})
     return run finishExpression(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, caller, constraints, &mut nodes.*,
       expression, span, Interned<Type>.clone(&selected.callable), BodyExpression.Aggregate {fields: List<BodyAggregateField>.make(), written: List<Interned<Lifetime>>.make(), section: Option<SectionRetention>.none()},
       false, expected, mismatchCode, contractBody, false)
@@ -83763,6 +83762,18 @@ effect fn emitInstance(resolver: &Resolver, function: &MirFunction, input: &Emis
       resolver.verifyMir,
     )
   }
+  // Every function of a test runner has a record in its table of executed functions; one whose
+  // content has no digest, as in a one-shot build, has a zero digest, so a test that executes it
+  // is never skipped.
+  let mut seen = Option<ContentHash>.none()
+  if resolver.coverage {
+    seen = Option<ContentHash>.some(ContentHash {high: 0, low: 0})
+    if input.llvm != usize.MAX {
+      if let Option<ContentHash>.Some {value} = &List<LlvmInput>.asSlice(&resolver.llvmInputs)[input.llvm].digest {
+        seen = Option<ContentHash>.some(value)
+      }
+    }
+  }
   return run LlvmCode.emit(
     function,
     &resolver.target,
@@ -83772,6 +83783,7 @@ effect fn emitInstance(resolver: &Resolver, function: &MirFunction, input: &Emis
     &input.suspension,
     resolver.fastPathIr,
     hostExport,
+    &seen,
   )
 }
 
@@ -84182,6 +84194,7 @@ effect fn resolveEmissionInputs(
       Bytes.asSlice(&signatures),
       List<Bytes>.asSlice(&encoded),
       &suspension,
+      resolver.coverage,
     )
     identity = Option<ContentHash>.some(digest)
   }
@@ -91174,8 +91187,6 @@ pub struct TestEntry {
   pub module: Bytes,
   /// The package-relative logical path of the module's file.
   pub path: Bytes,
-  /// `silk-test-v1:` and the SHA-256 of the authored header and body (TEST-005).
-  pub fingerprint: Bytes,
   pub callable: Interned<Type>,
 }
 
@@ -91353,23 +91364,6 @@ effect fn appendFramed(state: &mut Sha256, bytes: &[u8]) -> () ! OutOfMemoryErro
   return ()
 }
 
-// `silk-test-v1:` and the SHA-256 of the framed domain, header encoding and body encoding of the
-// declaration at `id` (TEST-005).
-effect fn testFingerprint(hir: &Module, id: HirId) -> Bytes ! OutOfMemoryError ? &mut Allocator {
-  let mut state = Sha256.make()
-  run appendFramed(&mut state, b"silk:test-fingerprint:v1")
-  let header = run Fingerprint.header(hir, id)
-  run appendFramed(&mut state, List<u8>.asSlice(&header))
-  let body = run Fingerprint.body(hir, id)
-  run appendFramed(&mut state, List<u8>.asSlice(&body))
-  let digest = state.finish()
-  let mut text = List<u8>.make()
-  run Fingerprint.appendHex(&mut text, &digest)
-  let mut fingerprint = run Bytes.copy(b"silk-test-v1:")
-  run Bytes.append(&mut fingerprint, List<u8>.asSlice(&text))
-  return move fingerprint
-}
-
 fn testBefore(left: &TestEntry, right: &TestEntry) -> bool {
   if !same(Bytes.asSlice(&left.module), Bytes.asSlice(&right.module)) { return bytesBefore(Bytes.asSlice(&left.module), Bytes.asSlice(&right.module)) }
   if !same(Bytes.asSlice(&left.name), Bytes.asSlice(&right.name)) { return bytesBefore(Bytes.asSlice(&left.name), Bytes.asSlice(&right.name)) }
@@ -91439,100 +91433,86 @@ effect fn selectedTests(resolver: &mut Resolver, owner: &mut Query<Answer, NoRej
   return run answeredTests(&resolver.*, &answer, module, span)
 }
 
-effect fn copyCatalogIdentity(catalog: &Shared<TestCatalog>) -> Bytes ! OutOfMemoryError ? &mut Allocator {
-  let length = Shared<TestCatalog>.with<usize>(catalog, fn(held: &TestCatalog) -> usize { return Bytes.length(&held.identity) })
-  let mut copied = run Bytes.zeroed(length)
-  let target = Bytes.asMutSlice(&mut copied)
-  let mut at = usize.ZERO
-  while at < length {
-    target[at] = Shared<TestCatalog>.with<u8>(catalog, fn(held: &TestCatalog) -> u8 { return Bytes.asSlice(&held.identity)[at] })
-    at = at + usize.ONE
-  }
-  return move copied
-}
-
-// One catalog entry a descriptor names.
-struct SelectedTest {
-  catalog: Shared<TestCatalog>,
-  ordinal: usize,
-  callable: Interned<Type>,
-}
-
-// A descriptor is honored only for the current catalog: its identity must be this catalog's and
-// its exact callable type the entry's (TEST-004).
-effect fn selectedTestEntry(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>,
-  dependencies: &mut List<Dependency>, descriptor: &Interned<StaticData>, module: &ModuleId, span: Span)
--> Result<SelectedTest, Shared<Rejection>> ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
-  let parts = match move run StaticValue.testDescriptorParts(descriptor) {
-    Option<StaticValue.TestDescriptorParts>.Some {value} => move value
-    Option<StaticValue.TestDescriptorParts>.None => {
-      return Result<SelectedTest, Shared<Rejection>>.failResult(run reject(&resolver.*, module, RejectionCode.StaticPhaseViolation, span))
-    }
-  }
-  let catalog = match move run selectedTests(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, span) {
-    Result<Shared<TestCatalog>, Shared<Rejection>>.Success {value} => move value
-    Result<Shared<TestCatalog>, Shared<Rejection>>.Failure {error} => { return Result<SelectedTest, Shared<Rejection>>.failResult(move error) }
-  }
-  let current = Shared<TestCatalog>.with<bool>(&catalog, fn(held: &TestCatalog) -> bool {
-    return same(Bytes.asSlice(&held.identity), Bytes.asSlice(&parts.catalog)) && parts.ordinal < List<TestEntry>.length(&held.entries)
-  })
-  if !current {
-    return Result<SelectedTest, Shared<Rejection>>.failResult(run reject(&resolver.*, module, RejectionCode.StaticPhaseViolation, span))
-  }
-  let callable = Shared<TestCatalog>.with<Interned<Type>>(&catalog, fn(held: &TestCatalog) -> Interned<Type> {
-    let entries = List<TestEntry>.asSlice(&held.entries)
-    return Interned<Type>.clone(&entries[parts.ordinal].callable)
-  })
-  if !run Type.equalsShared(&callable, &parts.callable) {
-    return Result<SelectedTest, Shared<Rejection>>.failResult(run reject(&resolver.*, module, RejectionCode.StaticPhaseViolation, span))
-  }
-  return Result<SelectedTest, Shared<Rejection>>.succeed(SelectedTest {catalog: move catalog, ordinal: parts.ordinal, callable: move callable})
-}
-
-// A copy of text field `field` of catalog entry `ordinal`, numbered as in `testInfoText`.
-effect fn entryText(catalog: &Shared<TestCatalog>, ordinal: usize, field: usize) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+// A copy of the identity of catalog entry `ordinal`.
+effect fn entryIdentity(catalog: &Shared<TestCatalog>, ordinal: usize) -> Bytes ! OutOfMemoryError ? &mut Allocator {
   let length = Shared<TestCatalog>.with<usize>(catalog, fn(held: &TestCatalog) -> usize {
-    let entries = List<TestEntry>.asSlice(&held.entries)
-    return Bytes.length(testInfoText(&entries[ordinal], field))
+    return Bytes.length(&List<TestEntry>.asSlice(&held.entries)[ordinal].identity)
   })
   let mut copied = run Bytes.zeroed(length)
   let target = Bytes.asMutSlice(&mut copied)
   let mut at = usize.ZERO
   while at < length {
     target[at] = Shared<TestCatalog>.with<u8>(catalog, fn(held: &TestCatalog) -> u8 {
-      let entries = List<TestEntry>.asSlice(&held.entries)
-      let text = Bytes.asSlice(testInfoText(&entries[ordinal], field))
-      return text[at]
+      return Bytes.asSlice(&List<TestEntry>.asSlice(&held.entries)[ordinal].identity)[at]
     })
     at = at + usize.ONE
   }
   return move copied
 }
 
-// The five text fields of one entry's `TestInfo`, in field order.
-effect fn testInfoTexts(selected: &SelectedTest) -> List<Bytes> ! OutOfMemoryError ? &mut Allocator {
-  let mut texts = List<Bytes>.make()
-  let mut field = usize.ZERO
-  while field < CheckedIntrinsic.testInfoFieldCount() {
-    run List<Bytes>.append(&mut texts, run entryText(&selected.catalog, selected.ordinal, field))
-    field = field + usize.ONE
-  }
-  return move texts
+// The test a genuine descriptor names: the declaration its exact callable type applies, and that
+// type. A descriptor names its test by declaration, not by catalog position, so reading it
+// depends on no catalog: adding, removing or editing another test leaves it alone (TEST-004).
+struct DescribedTest {
+  declaration: DeclarationId,
+  callable: Interned<Type>,
 }
 
-fn testInfoText(entry: &TestEntry, field: usize) -> &Bytes {
-  if field == usize.ZERO { return &entry.identity }
-  if field == usize.ONE { return &entry.name }
-  if field == 2 { return &entry.module }
-  if field == 3 { return &entry.path }
-  return &entry.fingerprint
+fn appliedDeclaration(value: &Type) -> Option<DeclarationId> {
+  return match &value.* {
+    Type.CallableValue {application, ..} => Option<DeclarationId>.some(
+      Interned<Application>.with<DeclarationId>(&application, fn(held: &Application) -> DeclarationId {
+        return DeclarationId.copy(Application.bodyDeclaration(held))
+      }))
+    _ => Option<DeclarationId>.none()
+  }
+}
+
+// Source cannot construct a sealed descriptor, and only the catalog mints one, so a genuine
+// descriptor's callable names a discovered test of the current revision (TEST-004).
+effect fn describedTest(resolver: &Resolver, descriptor: &Interned<StaticData>, module: &ModuleId, span: Span)
+-> Result<DescribedTest, Shared<Rejection>> ! OutOfMemoryError ? &mut Allocator {
+  let callable = match move StaticValue.testDescriptorCallable(descriptor) {
+    Option<Interned<Type>>.Some {value} => move value
+    Option<Interned<Type>>.None => {
+      return Result<DescribedTest, Shared<Rejection>>.failResult(run reject(resolver, module, RejectionCode.StaticPhaseViolation, span))
+    }
+  }
+  let declaration = match move Interned<Type>.with<Option<DeclarationId>>(&callable, appliedDeclaration) {
+    Option<DeclarationId>.Some {value} => move value
+    Option<DeclarationId>.None => {
+      return Result<DescribedTest, Shared<Rejection>>.failResult(run reject(resolver, module, RejectionCode.StaticPhaseViolation, span))
+    }
+  }
+  return Result<DescribedTest, Shared<Rejection>>.succeed(DescribedTest {declaration: move declaration, callable: move callable})
+}
+
+// The four text fields of the `TestInfo` of the test `declaration`, in field order: its identity,
+// name, module and package-relative path. They follow from the declaration and the discovery
+// directory alone.
+effect fn testInfoTexts(resolver: &Resolver, declaration: &DeclarationId) -> List<Bytes> ! OutOfMemoryError ? &mut Allocator {
+  let module = DeclarationId.moduleId(declaration)
+  let moduleText = run moduleName(module)
+  let mut path = Bytes.make()
+  if let Option<Discovery>.Some {value} = &resolver.discovery {
+    if Bytes.length(&value.directory) > usize.ZERO {
+      run Bytes.append(&mut path, Bytes.asSlice(&value.directory))
+      run Bytes.append(&mut path, b"/")
+    }
+  }
+  run ModuleId.appendPath(module, &mut path)
+  let mut texts = List<Bytes>.make()
+  run List<Bytes>.append(&mut texts, run testIdentity(Bytes.asSlice(&moduleText), declaration))
+  run List<Bytes>.append(&mut texts, run DeclarationId.copySpelling(declaration))
+  run List<Bytes>.append(&mut texts, move moduleText)
+  run List<Bytes>.append(&mut texts, move path)
+  return move texts
 }
 
 // One written `test` declaration found while scanning a project module.
 struct WrittenTest {
   ordinal: usize,
   isPublic: bool,
-  fingerprint: Bytes,
 }
 
 // The project modules reached from the root through active imports, each once, contribute every
@@ -91544,10 +91524,6 @@ effect fn resolveTests(
   key: Key,
 ) -> Answer ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
   let root = resolvedModule(&resolver.*, key.module)
-  let mut directory = Bytes.make()
-  if let Option<Discovery>.Some {value} = &resolver.discovery {
-    directory = run Bytes.copy(Bytes.asSlice(&value.directory))
-  }
   let span = Span.make(usize.ZERO, usize.ZERO)
   let mut dependencies = List<Dependency>.make()
   let mut pending = List<ModuleId>.make()
@@ -91576,7 +91552,9 @@ effect fn resolveTests(
     let moduleOrdinal = run internModule(&mut resolver.*, &module)
     let mut imports = List<usize>.make()
     let mut tests = List<WrittenTest>.make()
-    let sourceAnswer = run source(&mut resolver.*, &module)
+    // Discovery reads which imports and tests the module declares, never their bodies, so editing
+    // a test's body or any other declaration leaves the catalog alone.
+    let sourceAnswer = run observedSource(&mut resolver.*, &module, SourceSelector.Tests)
     if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&resolver.*, &sourceAnswer, &module) {
       let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
       let hir = IndexedSource.authored(indexed)
@@ -91586,10 +91564,7 @@ effect fn resolveTests(
           run List<usize>.append(&mut imports, at)
         } else if let Node.FunctionHeader {contract, isPublic, ..} = Module.node(hir, declarations[at].header) {
           if let Option<HirContract>.Some {value: HirContract {isTest, ..}} = Module.contractOf(hir, contract) {
-            if isTest {
-              run List<WrittenTest>.append(&mut tests, WrittenTest {ordinal: at, isPublic: isPublic,
-                fingerprint: run testFingerprint(hir, declarations[at].local)})
-            }
+            if isTest { run List<WrittenTest>.append(&mut tests, WrittenTest {ordinal: at, isPublic: isPublic}) }
           }
         }
         at = at + usize.ONE
@@ -91627,10 +91602,6 @@ effect fn resolveTests(
       importAt = importAt + usize.ONE
     }
     if !toolchainModule(&module) {
-      let moduleText = run moduleName(&module)
-      let mut path = run Bytes.copy(Bytes.asSlice(&directory))
-      if Bytes.length(&directory) > usize.ZERO { run Bytes.append(&mut path, b"/") }
-      run ModuleId.appendPath(&module, &mut path)
       let mut written = move tests
       while List<WrittenTest>.length(&written) > usize.ZERO {
         let test = List<WrittenTest>.remove(&mut written, usize.ZERO)
@@ -91660,12 +91631,14 @@ effect fn resolveTests(
             Result<Interned<Type>, Shared<Rejection>>.Success {value} => move value
             Result<Interned<Type>, Shared<Rejection>>.Failure {error} => { return run memberRejected(move error, move dependencies) }
           }
-          let identity = run testIdentity(Bytes.asSlice(&moduleText), &declaration)
-          let name = run DeclarationId.copySpelling(&declaration)
+          let mut texts = run testInfoTexts(&resolver.*, &declaration)
+          let identity = List<Bytes>.remove(&mut texts, usize.ZERO)
+          let name = List<Bytes>.remove(&mut texts, usize.ZERO)
+          let moduleText = List<Bytes>.remove(&mut texts, usize.ZERO)
+          let path = List<Bytes>.remove(&mut texts, usize.ZERO)
           run List<TestEntry>.append(&mut entries, TestEntry {
             name: move name, declaration: run Types.internDeclaration(move declaration), identity: move identity,
-            module: run Bytes.copy(Bytes.asSlice(&moduleText)), path: run Bytes.copy(Bytes.asSlice(&path)),
-            fingerprint: move test.fingerprint, callable: move callable,
+            module: move moduleText, path: move path, callable: move callable,
           })
         }
       }
@@ -91684,7 +91657,7 @@ effect fn resolveTests(
     run List<TestEntry>.append(&mut ordered, List<TestEntry>.remove(&mut entries, first))
   }
   let mut state = Sha256.make()
-  run appendFramed(&mut state, b"silk:test-catalog:v1")
+  run appendFramed(&mut state, b"silk:test-catalog:v2")
   let rootPath = run ModuleId.copyPath(&root)
   run appendFramed(&mut state, Bytes.asSlice(&rootPath))
   let catalogued = List<TestEntry>.asSlice(&ordered)
@@ -91692,13 +91665,12 @@ effect fn resolveTests(
   while at < catalogued.length {
     run appendFramed(&mut state, Bytes.asSlice(&catalogued[at].identity))
     run appendFramed(&mut state, Bytes.asSlice(&catalogued[at].path))
-    run appendFramed(&mut state, Bytes.asSlice(&catalogued[at].fingerprint))
     at = at + usize.ONE
   }
   let digest = state.finish()
   let mut hex = List<u8>.make()
   run Fingerprint.appendHex(&mut hex, &digest)
-  let mut identity = run Bytes.copy(b"silk-test-catalog-v1:")
+  let mut identity = run Bytes.copy(b"silk-test-catalog-v2:")
   run Bytes.append(&mut identity, List<u8>.asSlice(&hex))
   return memberSuccess(Value.Tests {catalog: run Shared<TestCatalog>.make(TestCatalog {identity: move identity, digest: digest, entries: move ordered})},
     move dependencies)
@@ -94023,8 +93995,7 @@ impl<'source> StaticPort<'source> {
         let entries = List<TestEntry>.asSlice(&held.entries)
         return Interned<Type>.clone(&entries[at].callable)
       })
-      let identity = run copyCatalogIdentity(&catalog)
-      let descriptor = match move run StaticValue.testDescriptor(run CheckedIntrinsic.testType(&callable), move identity, at) {
+      let descriptor = match move StaticValue.testDescriptor(run CheckedIntrinsic.testType(&callable)) {
         Option<StaticData>.Some {value} => move value
         Option<StaticData>.None => { return Result<StaticData, Shared<Rejection>>.failResult(run reject(&self.resolver.*, module, RejectionCode.StaticPhaseViolation, span)) }
       }
@@ -94036,15 +94007,15 @@ impl<'source> StaticPort<'source> {
       Option<StaticData>.None => Result<StaticData, Shared<Rejection>>.failResult(run reject(&self.resolver.*, module, RejectionCode.StaticPhaseViolation, span))
     }
   }
-  /// One descriptor's `Intrinsic.TestInfo`, authenticated against the current catalog (TEST-004).
+  /// One descriptor's `Intrinsic.TestInfo` (TEST-004). It follows from the test's declaration, so
+  /// reading it depends on no other test.
   pub effect fn testInfo(self: &mut Self, descriptor: &Interned<StaticData>, module: &ModuleId, span: Span) -> Result<StaticData, Shared<Rejection>>
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
-    let selected = run selectedTestEntry(&mut self.resolver.*, &mut self.query.*, &mut self.dependencies.*, descriptor, module, span)
-    let entry = match move selected {
-      Result<SelectedTest, Shared<Rejection>>.Success {value} => move value
-      Result<SelectedTest, Shared<Rejection>>.Failure {error} => { return Result<StaticData, Shared<Rejection>>.failResult(move error) }
+    let entry = match move run describedTest(&self.resolver.*, descriptor, module, span) {
+      Result<DescribedTest, Shared<Rejection>>.Success {value} => move value
+      Result<DescribedTest, Shared<Rejection>>.Failure {error} => { return Result<StaticData, Shared<Rejection>>.failResult(move error) }
     }
-    let texts = run testInfoTexts(&entry)
+    let texts = run testInfoTexts(&self.resolver.*, &entry.declaration)
     return match move run StaticValue.testInfo(run CheckedIntrinsic.testInfoType(), move texts) {
       Option<StaticData>.Some {value} => Result<StaticData, Shared<Rejection>>.succeed(move value)
       Option<StaticData>.None => Result<StaticData, Shared<Rejection>>.failResult(run reject(&self.resolver.*, module, RejectionCode.StaticPhaseViolation, span))
@@ -94825,6 +94796,7 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
       llvmValues: List<InstanceDefinition>.make(),
       codegenUnits: false,
       fastPathIr: false,
+      coverage: false,
       inlining: false,
       direct: false,
       threads: false,
@@ -95064,7 +95036,7 @@ impl Semantic {
     let mut identities = List<Bytes>.make()
     let mut ordinal = usize.ZERO
     while ordinal < count {
-      run List<Bytes>.append(&mut identities, run entryText(catalog, ordinal, usize.ZERO))
+      run List<Bytes>.append(&mut identities, run entryIdentity(catalog, ordinal))
       ordinal = ordinal + usize.ONE
     }
     return move identities
@@ -96744,6 +96716,15 @@ impl Semantic {
   /// adopted under the other.
   pub fn selectFastPathIr(self: &mut Self, unoptimized: bool) -> () {
     self.resolver.fastPathIr = unoptimized
+  }
+
+  /// Selects whether each emitted function records that it ran, for a test runner build: its
+  /// entry sets the flag of its own record in the table of executed functions, which holds its
+  /// content digest (`LlvmCode.seenRecord`). A build that records no content digests, such as a
+  /// one-shot build, gives every record a zero digest. The content digest covers the choice, so
+  /// code emitted under one choice is never adopted under the other.
+  pub fn selectCoverage(self: &mut Self, coverage: bool) -> () {
+    self.resolver.coverage = coverage
   }
 
   /// Selects whether instances lower to wasm fragments for the direct backend (`WasmLower`)

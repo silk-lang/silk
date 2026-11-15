@@ -11,8 +11,6 @@ runner owns filtering, invocation, reporting, and exit policy.
 - The **discovery root** is the project source file whose active import graph defines the candidate
   test modules.
 - A **test descriptor** is a sealed static value issued by the compiler for one discovered test.
-- An **authored fingerprint** identifies the canonical authored header and body of one test. It is
-  content metadata, not a reusable test result.
 - A **runner record** lists every file the build of the bundled runner read, so a later run can
   tell whether the runner it built is still current.
 - The **bundled runner** is ordinary Silk source used as the executable entry for `silk test`.
@@ -103,15 +101,15 @@ assuming a root or returning an empty catalog.
 
 `Intrinsic.tests()` produces a finite heterogeneous static catalog. Each
 `Intrinsic.Test<F>` descriptor represents one discovered declaration and retains that test's exact
-callable type `F`. `Intrinsic.testInfo(descriptor)` produces immutable identity, name, module,
-logical project-relative path, and fingerprint metadata.
+callable type `F`. `Intrinsic.testInfo(descriptor)` produces immutable identity, name, module, and
+logical project-relative path metadata.
 `Intrinsic.testFunction(descriptor)` crosses the static boundary once and produces the exact
 ordinary runtime callable.
 
-Descriptors and their metadata carry no source line or column. Moving a test, or editing text
-around it, therefore leaves the catalog and every runner specialization over it unchanged; only an
-edit to the test's own declaration changes its fingerprint (TEST-005). A tool that shows where a
-test is declared resolves the test's identity against the current source.
+Descriptors and their metadata carry no source line or column and nothing of a test's body. Moving
+a test, or editing text around it or inside it, therefore leaves the catalog and every runner
+specialization over it unchanged (TEST-005). A tool that shows where a test is declared resolves the
+test's identity against the current source.
 
 The descriptor authorizes callable extraction for its marked test, including a private test. It
 does not authorize ordinary access to that declaration or another private declaration. Static
@@ -128,27 +126,25 @@ module selection report static-phase diagnostics and publish no partial executab
 **Evidence:** test catalog and callable requirements,
 [static evaluation](static-evaluation.md).
 
-### TEST-005 — A fingerprint covers only the test's authored declaration
+### TEST-005 — A descriptor names its test by declaration
 
 **Status:** Confirmed
 
-Each descriptor reports a versioned SHA-256 fingerprint over the canonical authored header and
-body of that test. Comments, whitespace, source offsets, physical paths, unrelated pool numbering,
-and moving unchanged source do not affect it. Editing the test's contract or body does.
+A descriptor is determined by its test's declaration alone: its exact callable type `F` names the
+declaration, and `Intrinsic.testInfo` reads nothing else. The catalog is determined by which tests
+the discovered modules declare, in catalog order. Discovery reads each module's imports and the
+headers of its tests, never a body.
 
-The fingerprint excludes called function implementations, resolved external meanings, providers,
-targets, profiles, compiler and runner versions, files, environment, time, and network state. If a
-test calls `parse`, editing only `parse` may change the test result while leaving the test's
-fingerprint unchanged.
+So editing a test's body, or any function it calls, changes no descriptor and no catalog. Adding,
+removing or renaming a test changes the catalog, and so the runner's loops over it, but leaves the
+descriptor of every other test, and the runner specialization for it, unchanged.
 
-**Boundary:** The authored fingerprint is never cache authority. `silk test` reuses a passing run
-only as a whole (TEST-008), and it decides whether a built runner is current from every file the
-build read (TEST-009), not from fingerprints.
+**Boundary:** A descriptor is not a test result. Whether a test runs again is decided from what it
+executed and read (TEST-008), not from its descriptor.
 
-**Diagnostics:** No diagnostic applies to observing a fingerprint. Treating it as cache authority
-has no language support.
+**Diagnostics:** None.
 
-**Evidence:** authored fingerprint requirements.
+**Evidence:** test discovery requirements.
 
 ## Running tests
 
@@ -231,10 +227,9 @@ test fn readsFixedClock() -> () { return run readWithFixedClock() }
 ```
 
 The runner identifies each selected test, prints elapsed time for each executed result, and reports
-discovered, selected, cached, executed, passed, and failed counts plus total run time. The exchange
-lets a host mark a test as an already passed cache hit, which the runner reports as `CACHED`
-without invoking it and counts in `cached` and `passed`, but not `executed`. `silk test` marks no
-test that way: it reuses a passing run as a whole (TEST-008), so its `cached` count is 0. Completed runs return 0 when all selected
+discovered, selected, cached, executed, passed, and failed counts plus total run time. A test the
+runner skips because it passed before with the same code and inputs (TEST-008) is reported as
+`CACHED` and counted in `cached` and `passed`, but not `executed`. Completed runs return 0 when all selected
 tests pass, including zero selected tests; they return 1 when a typed test failure or a trapping
 test occurs. Runner or cache-exchange operational failures return 2. Abnormal termination outside a
 test body remains abnormal.
@@ -249,31 +244,38 @@ boundary are compile-time errors even when runtime filters would exclude that te
 [typed failures](typed-failures.md), [requirements and services](requirements-and-services.md),
 [program termination](program-termination-and-reporting.md).
 
-### TEST-008 — A passing run is not repeated while nothing changed
+### TEST-008 — A test that passed is not repeated while its code and inputs are unchanged
 
 **Status:** Confirmed
 
-`silk test` keeps the output of the last run that passed and selected at least one test, beside
-its runner. A rerun by the same compiler, from the same working directory, whose runner is byte for
-byte the one that passed (TEST-009), with the same `--file`, `--filter` and `--timeout`, does not run
-the tests again: it prints that run's output, says that nothing changed since the tests passed, and
-exits 0, as a build step whose inputs did not change is not repeated. A run that failed or selected
-no test is always repeated, and so is a WASI run, which depends on the wasmtime it finds. Tests run
-with an empty environment, but a test that reads files outside its imports, a dynamic library it
-loads, the clock or the network is not seen to change; `--no-cache` builds the runner again and runs
-every selected test.
+A runner that `silk test` builds for an ELF or Mach-O target keeps a table of its functions: each
+one has a flag its entry sets and the digest of everything the compiler read to make it. Before a
+test runs, the runner clears the flags and watches what the test reads through the native
+providers: files and their entries, directory listings and environment variables, and whether it
+reads the clock, takes random numbers from the host, opens a socket or resolves a name, starts a
+child process or lists the environment. After a test that passed, the runner records, beside
+itself, the digests of the functions the test executed and a digest of each input it read, taken
+after the test.
+
+A later run from the same working directory skips a selected test when every function it
+executed is in the new runner with the same digest and every input it read reads the same. It
+reports the test as `CACHED` and counts it in `cached` and `passed`, but not `executed`. A test is
+always run again when it failed, used the clock, randomness, the network, a child process or the
+list of the environment, read more than the watch holds, or executed a function without a digest,
+as in a build without a cache. The record is kept only while the runner's build key (TEST-009),
+which names the compiler, Clang and the build's options, stays the same. `--no-cache` builds the
+runner again and runs every selected test.
 
 ```sh
-silk test             # reuses an unchanged runner; runs the tests unless they passed unchanged
+silk test             # reuses an unchanged runner; runs only the tests whose code or inputs changed
 silk test --no-cache  # builds the runner again, then runs every selected test
 ```
 
-The plan and receipt the host exchanges with the runner (`silk.testing.exchange`) also have a
-per-test mode that marks cache hits; `silk test` always uses the compact uncached mode.
-
-**Boundary:** Reusing passed results needs a per-test identity that covers each test's transitive
-dependencies, which the compiler does not publish. No result store exists under
-`<build.output-dir>`.
+**Boundary:** A test that reads the host other than through the native providers, such as a C
+call or a dynamic library it loads, reads unseen. Work a process does once, such as filling a cache
+on first use, is recorded only for the test that did it, so a later test that relies on it can be
+skipped after an edit to that work. Windows and WASI runners have no table, so every selected
+test runs.
 
 **Diagnostics:** Every discovered test is compiled, or its build reused, before runtime selection,
 so source diagnostics are never hidden. Invalid or incomplete plan or receipt exchange data is an

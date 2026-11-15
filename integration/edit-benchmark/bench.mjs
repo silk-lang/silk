@@ -40,6 +40,7 @@ const packages = {
       field: { kind: 'field', file: 'compiler/src/driver/Project.silk', at: 'pub struct Project {' },
       comment: { kind: 'comment', file: 'compiler/src/semantic/Semantic.silk', at: 'fn namesInterface(key: &[u8]) -> bool {' },
       lines: { kind: 'lines', file: 'compiler/src/semantic/Semantic.silk', at: 'fn familyName(family: Family) -> string<\'static> {' },
+      test: { kind: 'body', file: 'compiler/src/driver/ManifestSchemaCases.silk', at: 'test effect fn manifestSchemaRangesFollowTomlStructure() -> () ! AssertionError<\'static> | OutOfMemoryError {' },
     },
   },
   'silk-tool': {
@@ -52,6 +53,7 @@ const packages = {
       field: { kind: 'field', file: 'tool/src/Command.silk', at: 'pub struct Context {' },
       comment: { kind: 'comment', file: 'tool/src/Command.silk', at: 'fn same(left: &[u8], right: &[u8]) -> bool {' },
       lines: { kind: 'lines', file: 'tool/src/Command.silk', at: 'pub struct Context {' },
+      test: { kind: 'body', file: 'tool/src/tests/ReleaseArchiveCases.silk', at: 'test effect fn releaseReadsTarMembers() -> () ! AssertionError<\'static> | OutOfMemoryError {' },
     },
   },
   // A program with fibers, in a workspace of its own: `--workspace examples/the-conductor --stdlib stdlib`.
