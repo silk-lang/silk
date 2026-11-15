@@ -59,8 +59,9 @@ operation with a runtime one. Nested static function
 declarations within executable bodies are unavailable. Module declaration groups may select static
 functions. A static function cannot be captured or passed as a runtime callable.
 
-**Diagnostics:** An unsupported modifier combination or declaration position reports a syntax
-diagnostic at the conflicting modifier or declaration. A use requiring a runtime callable reports
+**Diagnostics:** `static` with `unsafe`, `effect`, a failure row or a requirement row reports
+`SEM0176` at the conflicting modifier or row. Another unsupported declaration position reports a
+syntax diagnostic at the declaration. A use requiring a runtime callable reports
 a static-phase violation at that use. A static call that selects a runtime interface operation, or
 a runtime call of a static one, reports `SEM0176` at the call.
 
