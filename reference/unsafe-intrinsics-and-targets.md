@@ -1133,6 +1133,13 @@ Within one executable closure, two reachable foreign declarations of one symbol 
 their classified C signatures and normalized behavioral contracts are equal and rejected when either differs. The executable declares
 the symbol once.
 
+The root package's own declarations of one symbol must agree whether or not anything calls them,
+so `silk check` reports a conflict between two of them without building. A declaration in a
+`static if` arm the target does not select is not declared, so a symbol whose C types differ
+between systems is declared once per system, each in its own arm. A declaration of a
+dependency or of the standard library enters the comparison where the executable reaches it, which
+only `silk build` knows.
+
 ```silk,ignore
 unsafe extern "C" fn f() -> () as "not a symbol"
 unsafe extern "C" fn g() -> i32 as "__silk_foreign_personality"
@@ -1142,7 +1149,7 @@ unsafe extern "C" fn g() -> i32 as "__silk_foreign_personality"
 a 64-bit target and `i64` classify to the same C type and therefore agree, as do raw pointers that
 differ only in pointee type, nullability or many-ness, such as `*mut u8` and `?[*]mut u64`. A
 declaration's `@foreign(noCapture: ...)` list is that declaration's own assertion and does not enter
-agreement; its `memory`, `locality` and callback directives do. Unreachable source declarations do not enter executable identity. Supplied behavioral interfaces are checked against one another and against the executable inventory, with both origins retained.
+agreement; its `memory`, `locality` and callback directives do. An unreachable declaration outside the root package does not enter executable identity. Supplied behavioral interfaces are checked against one another and against the executable inventory, with both origins retained.
 
 **Diagnostics:** An invalid spelling reports `SEM0190` at the `as` string or, without `as`, at the
 declaration. A reserved symbol reports `SEM0191` at the same position. A conflicting redeclaration
@@ -1152,7 +1159,8 @@ no artifact. A symbol the native backend also declares for its own use, with a d
 is a backend diagnostic naming the symbol.
 
 **Current compiler:** Aligned. Spelling and reservation are checked per module; signature
-agreement is checked when the executable origin collects reachable foreign calls for the target.
+agreement is checked between the root package's declarations by the declaration check, and across
+packages when the executable origin collects reachable foreign calls for the target.
 
 **Evidence:** foreign function specification,
 [symbol spelling and reservation](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/ForeignSymbol.ts),
@@ -1448,6 +1456,25 @@ that no Silk code calls is still specialized, verified, and emitted, because its
 code the compiler cannot see. Roots are collected in canonical module then declaration order; they
 are monomorphic, so no specialization arguments are needed.
 
+The loaded module closure is every module the program loads through imports: the modules of the
+root package and the modules of its dependency packages alike. A dependency's export is a root of
+the program that loads its module, whether or not Silk code names it, so native code linked into
+that program can resolve the symbol. A module that no import reaches is not loaded and roots
+nothing.
+
+```silk,ignore
+// Package `core`, module `core.probes`.
+pub export "C" fn core_probe(value: i32) -> i32 { return value }
+pub fn touch() -> i32 { return 1 }
+
+// Package `app`, which depends on `core`. `core_probe` is defined in the executable.
+import core.probes
+pub fn main() -> i32 { return probes.touch() }
+```
+
+The standard library is the exception: its exports reach an artifact only as the selected
+runtime's or a selected component's.
+
 A generic export is not a root. Native code reaches it only through an address Silk code takes at
 an instantiation ([FFI-012](#ffi-012--c-function-pointers-are-exact-exported-addresses)), so an
 instantiation is discovered where that address is specialized, like a generic call
@@ -1467,10 +1494,10 @@ symbol and the target, in the
 [TARGET-003](#target-003--target-unavailability-is-a-compile-time-compatibility-error) shape, and
 constructs no module.
 
-**Current compiler:** Aligned. `Instances.discover` appends the export roots after the entry when
-the target kind is native and records them on the discovery result; lowering copies the inventory
-onto the MIR module, which is the only input the backends receive, and into the driver's cached
-emission header.
+**Current compiler:** Aligned. The build roots the exports of the selected runtime, the application
+module, the other root-package modules and every loaded dependency module, and defines the C
+object of each of their exported statics. The native build test links a C unit against a
+dependency's exported function and static that no Silk code names.
 
 **Evidence:** export specification,
 [instance discovery](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Instances.ts),

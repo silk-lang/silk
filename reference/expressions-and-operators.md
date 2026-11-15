@@ -370,7 +370,8 @@ anonymous formatting specification.
 
 A lambda lists its parameters between `|` bars, each with an optional `: Type`, and is followed by
 its body. An expression body returns its value; a braced block is an ordinary body. `->` writes the
-result type, as in a function, and then requires a block.
+result type, as in a function, and then requires a block. A written result may be followed by a
+failure row `! E` and a requirement row `? R`, as in `effect |value: i32| -> i32 ! Problem ? &Source { ... }`.
 
 ```silk
 fn forms() {

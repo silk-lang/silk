@@ -157,6 +157,7 @@ import backend.MirText
 import backend.Mir
 import semantic.SemanticCaseSupport {
   printedArtifact,
+  entryRuntime,
   copyMirBlock,
   copyMirShape,
   copyMirStatement,
@@ -2068,6 +2069,71 @@ pub fn main() -> i32 {
   })
   run Testing.expect(phased,
     "a runtime ordering is a static-phase violation")
+  return ()
+}
+
+test effect fn prefetchLowersToLlvmPrefetchAndRejectsInadmissibleSelections() -> ()
+! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut typeTable = TypeTable.make()
+  let id = run module("prefetch.silk")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let source = """fn farLocality(cell: *const u32) -> () {
+  return Intrinsic.prefetch<*const u32>(cell, false, 4, false)
+}
+fn runtimeAccess(cell: *const u32, write: bool) -> () {
+  return Intrinsic.prefetch<*const u32>(cell, write, 3, false)
+}
+fn notPointer(value: u32) -> () {
+  return Intrinsic.prefetch<u32>(value, false, 3, false)
+}
+"""
+  let buildText = """fn hint(cell: *mut u32, bytes: ?[*]const u8) -> () {
+  Intrinsic.prefetch<*const u32>(cell, false, 3, false)
+  Intrinsic.prefetch<?[*]const u8>(bytes, true, 0, false)
+  Intrinsic.prefetch<*const u32>(cell, false, 1, true)
+}
+pub fn main() -> i32 {
+  let mut value: u32 = 1
+  hint(Intrinsic.pointerFromMutRef<u32>(&mut value), Intrinsic.pointerFromSlice<u8>(b"abc"))
+  if value != 1 { return 1 }
+  return 0
+}
+"""
+  let mut buildStore = run applicationSemantic(&id, buildText, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut buildRequest = Request.forApplication(ModuleId.copy(&id))
+  let built = run buildApplication(&mut buildStore, &mut buildRequest, staticClosureNodes)
+    |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut lowered = false
+  if let BackendBuild.Module {text, ..} = &built {
+    let ir = Bytes.asSlice(&text)
+    lowered = containsIr(ir, b", i32 0, i32 3, i32 1)\n") && containsIr(ir, b", i32 1, i32 0, i32 1)\n") &&
+      containsIr(ir, b", i32 0, i32 1, i32 0)\n") && containsIr(ir, b"declare void @llvm.prefetch.p0(ptr, i32, i32, i32)\n")
+  }
+  run Testing.expect(lowered, "each prefetch lowers to llvm.prefetch with its access, locality and cache, and the write weakens to a shared pointer")
+  // Static selections are evaluated for selected bodies, so each rejection is demanded as one.
+  let presented = run present(source) |> Effect.provideMut<Allocator>(&mut allocator)
+  let revision = run Revision.publish(&Revision.make(), &id, &presented) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut index = SourceIndex.make(run Revision.copy(&revision) |> Effect.provideMut<Allocator>(&mut allocator))
+  let mut store = makeSemantic(move revision)
+  let mut request = Request.make()
+  let farLocality = run demandAtomicCase(&mut store, &mut request, &mut index, &id, b"farLocality")
+    |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(rejectsSpan(&farLocality, RejectionCode.InvalidConfiguration, source, "4", usize.ZERO),
+    "a locality past 3 is refused at that argument")
+  let runtimeAccess = run demandAtomicCase(&mut store, &mut request, &mut index, &id, b"runtimeAccess")
+    |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+  let phased = Shared<Result<Answer, NoRejection>>.with<bool>(&runtimeAccess, fn(answer: &Result<Answer, NoRejection>) -> bool {
+    return rejectionCode(answer, RejectionCode.StaticPhaseViolation)
+  })
+  run Testing.expect(phased, "a runtime access selection is a static-phase violation")
+  let notPointer = run demandAtomicCase(&mut store, &mut request, &mut index, &id, b"notPointer")
+    |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+  let qualified = Shared<Result<Answer, NoRejection>>.with<bool>(&notPointer, fn(answer: &Result<Answer, NoRejection>) -> bool {
+    return rejectionCode(answer, RejectionCode.InvalidPointerQualifier)
+  })
+  run Testing.expect(qualified, "a prefetch of a value that is not a data pointer is refused")
   return ()
 }
 
@@ -4388,30 +4454,37 @@ fn rejectedBuildAt(built: &BackendBuild, code: RejectionCode, source: string, sp
   return false
 }
 
+// Whether `diagnostic` is SEM0192 for `symbol`, at one of the two declarations and relating the
+// other.
+fn conflictNamesBoth(diagnostic: &Shared<Rejection>, symbol: &[u8], first: &ModuleId, firstStart: usize, second: &ModuleId,
+  secondStart: usize) -> bool {
+  return Shared<Rejection>.with<bool>(diagnostic, fn(found: &Rejection) -> bool {
+    if found.code != RejectionCode.ForeignSymbolConflict { return false }
+    let related = match &found.related {
+      Option<RelatedSite>.Some {value} => RelatedSite {module: ModuleId.copy(&value.module), span: value.span}
+      Option<RelatedSite>.None => { return false }
+    }
+    let mut named = false
+    let arguments = List<MessageArgument>.asSlice(&found.arguments)
+    let mut at = usize.ZERO
+    while at < arguments.length {
+      if sameBytes(Bytes.asSlice(&arguments[at].name), b"symbol") && sameBytes(Bytes.asSlice(&arguments[at].value), symbol) { named = true }
+      at = at + usize.ONE
+    }
+    let forward = ModuleId.equals(&found.module, first) && found.span.start == firstStart
+      && ModuleId.equals(&related.module, second) && related.span.start == secondStart
+    let backward = ModuleId.equals(&found.module, second) && found.span.start == secondStart
+      && ModuleId.equals(&related.module, first) && related.span.start == firstStart
+    return named && (forward || backward)
+  })
+}
+
 // Whether `built` was refused with SEM0192 for `symbol`, at one of the two declarations and relating
 // the other.
 fn foreignConflictNamesBoth(built: &BackendBuild, symbol: &[u8], first: &ModuleId, firstStart: usize, second: &ModuleId,
   secondStart: usize) -> bool {
   if let BackendBuild.Rejected {first: diagnostic, ..} = &built.* {
-    return Shared<Rejection>.with<bool>(&diagnostic, fn(found: &Rejection) -> bool {
-      if found.code != RejectionCode.ForeignSymbolConflict { return false }
-      let related = match &found.related {
-        Option<RelatedSite>.Some {value} => RelatedSite {module: ModuleId.copy(&value.module), span: value.span}
-        Option<RelatedSite>.None => { return false }
-      }
-      let mut named = false
-      let arguments = List<MessageArgument>.asSlice(&found.arguments)
-      let mut at = usize.ZERO
-      while at < arguments.length {
-        if sameBytes(Bytes.asSlice(&arguments[at].name), b"symbol") && sameBytes(Bytes.asSlice(&arguments[at].value), symbol) { named = true }
-        at = at + usize.ONE
-      }
-      let forward = ModuleId.equals(&found.module, first) && found.span.start == firstStart
-        && ModuleId.equals(&related.module, second) && related.span.start == secondStart
-      let backward = ModuleId.equals(&found.module, second) && found.span.start == secondStart
-        && ModuleId.equals(&related.module, first) && related.span.start == firstStart
-      return named && (forward || backward)
-    })
+    return conflictNamesBoth(&diagnostic, symbol, first, firstStart, second, secondStart)
   }
   return false
 }
@@ -4460,6 +4533,54 @@ pub fn measure() -> i32 { return unsafe widen(4) }
   run Testing.expect(foreignConflictNamesBoth(&conflicting, b"foreign_widen", &main, offsetOf(conflictingMain, "unsafe extern", usize.ZERO),
     &library, offsetOf(conflictingLibrary, "unsafe extern", usize.ZERO)),
     "a conflicting C symbol is reported at one declaration, relating the other and naming the symbol")
+  return ()
+}
+
+// The rejections a declaration check of the package `main` and `library` reports for x86_64 Linux.
+effect fn foreignPairCheck(mainText: string, libraryText: string, main: &ModuleId, library: &ModuleId) -> List<Shared<Rejection>>
+! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mainSource = run present(mainText)
+  let librarySource = run present(libraryText)
+  let first = run Revision.publish(&Revision.make(), main, &mainSource)
+  let both = run Revision.publish(&first, library, &librarySource)
+  let mut store = Semantic.traced(run withEntryRuntime(&both), MachineTarget.forId(TargetId.X8664UnknownLinuxGnu), Option<FinalProfile>.none())
+  let mut request = Request.forApplication(ModuleId.copy(main))
+  let roots = [ModuleId.copy(main), ModuleId.copy(library)]
+  let checked = run Semantic.checkDeclarations(&mut store, &mut request, &roots, &Option<ModuleId>.none())
+  return move checked.rejections
+}
+
+// FFI-005: the root package's imports of one C symbol agree whether or not anything calls them, so
+// the declaration check reports the conflict a build would, without lowering a body.
+test effect fn declarationCheckComparesImportsOfOneSymbol() -> ()
+! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut typeTable = TypeTable.make()
+  let main = run module("foreign-check-main.silk") |> Effect.provideMut<Allocator>(&mut allocator)
+  let library = run module("foreign_check_library.silk") |> Effect.provideMut<Allocator>(&mut allocator)
+  let agreeingMain = """import foreign_check_library
+@foreign(noCapture: .("buffer"))
+unsafe extern "C" fn probe(buffer: ?*mut u8, limit: isize) -> i32 as "foreign_probe"
+pub fn main() -> i32 { return 0 }
+"""
+  let agreeingLibrary = """unsafe extern "C" fn probe(buffer: ?*mut u16, limit: i64) -> i32 as "foreign_probe"
+"""
+  let agreeing = run foreignPairCheck(agreeingMain, agreeingLibrary, &main, &library)
+    |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(List<Shared<Rejection>>.length(&agreeing) == usize.ZERO,
+    "imports of one C symbol that classify to the same C types pass the declaration check")
+  let conflictingMain = """import foreign_check_library
+unsafe extern "C" fn widen(value: i64) -> i32 as "foreign_widen"
+pub fn main() -> i32 { return 0 }
+"""
+  let conflictingLibrary = """unsafe extern "C" fn widen(value: i32) -> i32 as "foreign_widen"
+"""
+  let conflicting = run foreignPairCheck(conflictingMain, conflictingLibrary, &main, &library)
+    |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+  let found = List<Shared<Rejection>>.asSlice(&conflicting)
+  run Testing.expect(found.length == usize.ONE && conflictNamesBoth(&found[0], b"foreign_widen", &main,
+    offsetOf(conflictingMain, "unsafe extern", usize.ZERO), &library, offsetOf(conflictingLibrary, "unsafe extern", usize.ZERO)),
+    "the declaration check reports uncalled imports of one C symbol with different C types at one, relating the other")
   return ()
 }
 
@@ -5891,6 +6012,43 @@ pub fn main() -> i32 { return accepted() + through<Two>() + through<Three>() }
   run Testing.expect(thunks == 2,
     "two instantiations define two guarded C thunks, shared by concrete and generic code that names the same one")
   run Testing.expect(!published, "a generic export publishes no symbol of its own and roots nothing")
+  return ()
+}
+
+// FFI-010: the exports of a loaded dependency module are roots, though no Silk code names them.
+test effect fn dependencyExportsAreRoots() -> ()
+! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut typeTable = TypeTable.make()
+  let libraryId = run module("dependency_exports.silk") |> Effect.provideMut<Allocator>(&mut allocator)
+  let librarySource = run present("""pub export "C" fn dependency_probe(value: i32) -> i32 { return value }
+export "C" static dependency_version: u32 = 7
+pub fn touch() -> i32 { return 1 }
+""") |> Effect.provideMut<Allocator>(&mut allocator)
+  let applicationId = run module("dependency-exports-application.silk") |> Effect.provideMut<Allocator>(&mut allocator)
+  let applicationSource = run present("""import dependency_exports { touch }
+pub fn main() -> i32 { return touch() }
+""") |> Effect.provideMut<Allocator>(&mut allocator)
+  let first = run Revision.publish(&Revision.make(), &libraryId, &librarySource) |> Effect.provideMut<Allocator>(&mut allocator)
+  let second = run Revision.publish(&first, &applicationId, &applicationSource) |> Effect.provideMut<Allocator>(&mut allocator)
+  let revision = run withEntryRuntime(&second) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut store = Semantic.traced(move revision, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu), Option<FinalProfile>.none())
+  let runtime = run entryRuntime() |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut request = Request.forApplication(ModuleId.copy(&applicationId))
+  // The library is loaded and checked, but it is not a module of the root package.
+  let rootPackage = [ModuleId.copy(&runtime), ModuleId.copy(&applicationId)]
+  let loaded = [ModuleId.copy(&runtime), ModuleId.copy(&applicationId), ModuleId.copy(&libraryId)]
+  let built = run printedArtifact(&mut store, &mut request, Option<&ModuleId>.some(&runtime), &rootPackage, &loaded, staticClosureNodes)
+    |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut function = false
+  let mut object = false
+  if let BackendBuild.Module {text: output, ..} = &built {
+    let ir = Bytes.asSlice(&output)
+    function = containsIr(ir, b"@dependency_probe(i32 %p0) noinline nounwind personality")
+    object = containsIr(ir, b"@dependency_version = ")
+  }
+  run Testing.expect(function, "a dependency's exported function is emitted under its symbol when nothing calls it")
+  run Testing.expect(object, "a dependency's exported static defines its C object")
   return ()
 }
 
@@ -15838,6 +15996,79 @@ effect fn sealedPublicationClaims() -> ()
     ),
     "the sealed source cannot be selected as a composition runtime root"
   )
+  return ()
+}
+
+// Whether `warning` has `code`, belongs to `module` and has a span that starts at `start`.
+fn warningAt(warning: &Shared<Rejection>, code: RejectionCode, module: &ModuleId, start: usize) -> bool {
+  return Shared<Rejection>.with<bool>(warning, fn(value: &Rejection) -> bool {
+    return value.code == code && ModuleId.equals(&value.module, module) && value.span.start == start
+  })
+}
+
+test effect fn refreshedSourcesReportUnusedBindingsOfTheNewText() -> ()
+  ! FileError
+    | HostInputError
+    | TomlError
+    | InvalidSourceRoot
+    | InvalidDependency
+    | MissingManifest
+    | InvalidBuildComposition
+    | MissingStandardLibrary
+    | InvalidNativeLinkInput
+    | InvalidModulePath
+    | OutOfMemoryError
+    | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut files = run OsFileSystem.make("/") |> Effect.provideMut<Allocator>(&mut allocator)
+  return run refreshedUnusedClaims() |> Effect.provideMut<FileSystem>(&mut files)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn refreshedUnusedClaims() -> ()
+  ! FileError
+    | HostInputError
+    | TomlError
+    | InvalidSourceRoot
+    | InvalidDependency
+    | MissingManifest
+    | InvalidBuildComposition
+    | MissingStandardLibrary
+    | InvalidNativeLinkInput
+    | InvalidModulePath
+    | OutOfMemoryError
+    | AssertionError<'static>
+  ? &mut FileSystem | &mut Allocator {
+  let cwd = run workingDirectory()
+  let checkout = run Path.fromBytes(Bytes.asSlice(&cwd))
+  let library = run Path.join(&checkout, "stdlib")
+  let temp = run FileSystem.temporaryDirectory(&run Path.make("/tmp"), "silk-refreshed-unused-")
+  let source = run Path.join(&temp.path, "main.silk")
+  run writePackageFile(&temp.path, "silk.toml", b"[package]\nname = \"refreshed\"\nversion = \"0.1.0\"\nsource = \".\"\n")
+  run writePackageFile(&temp.path, "main.silk", b"import other\nimport spare { value }\npub fn main() -> i32 { return other.helper() }\n")
+  run writePackageFile(&temp.path, "other.silk", b"pub fn helper() -> i32 {\n  let idle = 1\n  return 1\n}\n")
+  run writePackageFile(&temp.path, "spare.silk", b"pub fn value() -> i32 { return 1 }\n")
+  run writePackageFile(&temp.path, "fresh.silk", b"pub fn more() -> i32 { return 1 }\n")
+  let mut sources = run ModuleSourceFiles.make(&source,
+    Option<Path>.some(run Path.fromBytes(Path.rawBytes(&library))), Option<&Path>.none(), b"x86_64-unknown-linux-gnu", b"gnu", false, ProfileSelection.Default)
+  let modules = [ModuleId.copy(ModuleSourceFiles.entry(&sources)), run ModuleSourceFiles.module(&sources, b"other.silk")]
+  let roots = [ModuleId.copy(&modules[usize.ZERO])]
+  run ModuleSourceFiles.preload(&mut sources, &roots)
+  let loaded = run ModuleSourceFiles.unusedWarnings(&sources, &modules)
+  let first = List<Shared<Rejection>>.asSlice(&loaded)
+  run Testing.expect(first.length == 2, "the load reports the unused import and the unused local")
+  run Testing.expect(warningAt(&first[usize.ZERO], RejectionCode.UnusedImport, &modules[usize.ZERO], 28)
+    && warningAt(&first[usize.ONE], RejectionCode.UnusedLocal, &modules[usize.ONE], 31),
+    "each warning names its binding in the text the load read")
+  // The edit removes the unused import and imports a module no earlier text reached.
+  run writePackageFile(&temp.path, "main.silk", b"import other\nimport fresh\npub fn main() -> i32 { return other.helper() + fresh.more() }\n")
+  let changed = run ModuleSourceFiles.refreshFromDisk(&mut sources)
+  let refreshed = run ModuleSourceFiles.unusedWarnings(&sources, &modules)
+  let second = List<Shared<Rejection>>.asSlice(&refreshed)
+  run Testing.expect(changed == usize.ONE && second.length == usize.ONE, "the removed import's warning goes with the text that wrote it")
+  run Testing.expect(warningAt(&second[usize.ZERO], RejectionCode.UnusedLocal, &modules[usize.ONE], 31),
+    "an unchanged module keeps its warning when the edit reaches a new module")
+  run FileSystem.release(move temp)
   return ()
 }
 
