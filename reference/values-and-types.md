@@ -1377,8 +1377,9 @@ though neither contains a runtime element.
 The written type of a `let` or `const` may end its outermost fixed array with a column hint,
 `[T; N; C]`, where `C` is a decimal integer literal of at least 1. The type is `[T; N]`; the hint
 has no semantic effect and is not part of the type's identity. `silk format` lays the array literal
-that is the declaration's own initializer out `C` elements per line, and no other value or later
-assignment carries the hint.
+that is the declaration's own initializer out `C` elements per line, right-aligning each column to
+its widest element, and no other value or later assignment carries the hint. A literal with a
+comment inside or an element that spans lines keeps one space between elements.
 
 ```silk
 const REVERSE_BITS: [u8; 8; 4] = [
