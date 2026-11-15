@@ -10,8 +10,8 @@ unsafe extern "C" fn receive(tag: i32, ...) -> i32
 
 The declaration must have at least one fixed parameter. Ellipsis is last and creates no named
 parameter. Calls supply all fixed arguments and then zero or more admitted scalar or raw-pointer values, under
-the usual unsafe acknowledgement. Ellipsis is not admitted on ordinary or exported definitions or
-C function-pointer types; Silk does not expose variadic definitions or va_list.
+the usual unsafe acknowledgement. Ellipsis is not admitted on ordinary definitions, generic
+exports or C function-pointer types.
 
 Fixed arguments retain their declared contextual types and the existing scalar/pointer boundary.
 Tail expressions retain ordinary expression typing without a declared parameter type. The admitted
@@ -43,3 +43,32 @@ shapes and promotions.
 The admitted matrix is Darwin ARM64 and GNU/Linux x86-64 and ARM64. Required pinned conformance
 uses independently compiled C receivers and direct platform calls in debug and optimized builds;
 missing supplies or skipped designated cases fail. LTO remains unadmitted.
+
+## Variadic exports
+
+An `export "C"` function may also end its parameters with `, ...`, so that a C caller can pass it
+extra arguments:
+
+```silk
+import silk.mem.va_list { VaList }
+
+pub unsafe export "C" fn configure(target: *mut u8, option: i32, ...) -> i32 as "uv_loop_configure" {
+  if option != 0 {
+    return 0
+  }
+  unsafe {
+    let mut arguments = VaList.of(Intrinsic.variadicArguments())
+    return arguments.next<i32>()
+  }
+}
+```
+
+The export's C entry is a true variadic LLVM function. It runs `va_start` on entry and `va_end`
+before it returns, and hands the `va_list` address to the body. In that body only,
+`Intrinsic.variadicArguments()` answers the address as `*mut u64`; anywhere else it diagnoses
+SEM0188. `silk.mem.va_list` reads the arguments in order under the target's C ABI: System V
+x86-64 and GNU ARM64 read the register save area and then the stack, while Darwin ARM64, Windows
+and WebAssembly read consecutive stack slots. Read a promoted `char` or `short` as `i32` and a
+`float` as `f64`. Nothing checks the caller's arguments against the reads. A Silk call to a
+variadic export is an ordinary variadic C call with the tail rules above. The direct WebAssembly
+backend does not lower variadic exports yet.

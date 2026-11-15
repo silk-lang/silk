@@ -1170,7 +1170,9 @@ packages when the executable origin collects reachable foreign calls for the tar
 
 **Status:** Confirmed
 
-A foreign call retains its ordinary externally linked C symbol and classified signature. The backend emits one internal, non-inlined guard per symbol. The guard invokes the actual external function with a normal-return edge and a cleanup landing pad, and has a target-native Itanium/DWARF personality that traps in either unwind phase. A foreign exception therefore terminates at this boundary, including when an enclosing C++ caller has a catch handler. The original callee receives no inferred `nounwind` promise; the guard's `nounwind` describes its enforced termination path. No runtime symbol lookup occurs.
+A foreign call retains its ordinary externally linked C symbol and classified signature. The backend gives each Silk function that calls one a guard frame. The frame invokes the actual external function with a normal-return edge and a cleanup landing pad, and has a target-native Itanium/DWARF personality that traps in either unwind phase. A foreign exception therefore terminates at this boundary, including when an enclosing C++ caller has a catch handler. The original callee receives no inferred `nounwind` promise; the guard's `nounwind` describes its enforced termination path. No runtime symbol lookup occurs.
+
+A guarded function stays out of line unless its source asks to inline it with `@inline` or `@inlineAlways`. Inlined, its calls keep their unwind edges, and the caller takes the same terminating personality, which every guard shares. An `export "C"` entry always keeps its own frame.
 
 Unannotated calls access externally reachable memory conservatively. Only the explicit sealed [foreign contract](foreign-call-contracts.md) supplies narrower memory, capture, alias or no-return assertions. Raw pointers cross as address lanes; address-taken Silk roots are still reloaded after each call. Ordinary foreign data/error-state reads stay ordinary loads, with no recognized accessor names, global volatility or hardware fences.
 

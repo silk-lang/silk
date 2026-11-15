@@ -2469,10 +2469,10 @@ const program = Effect.gen(function* () {
   const packed = yield* invoke('tar', ['czf', 'vend.tar.gz', 'vend-1'], vendorArchived)
   assert.equal(packed.status, 0, packed.stderr)
   const vendDigest = createHash('sha256').update(yield* fs.readFile(join(vendorArchived, 'vend.tar.gz'))).digest('hex')
-  const sysManifest = (digest: string) =>
+  const sysManifest = (digest: string, url = `file://${join(vendorArchived, 'vend.tar.gz')}`) =>
     '[package]\nname = "sys"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nexports = ["Sys"]\n\n[native]\n'
     + 'sources = [{ c = "native/shim.c", include = ["vend:include"] }]\nlink = [{ static-archive = "vend:lib/libvend.a" }]\n\n'
-    + `[native.archive.vend]\nurl = "file://${join(vendorArchived, 'vend.tar.gz')}"\nsha256 = "${digest}"\nstrip = 1\n`
+    + `[native.archive.vend]\nurl = "${url}"\nsha256 = "${digest}"\nstrip = 1\n`
   yield* fs.writeFileString(join(vendorArchived, 'sys/silk.toml'), sysManifest(vendDigest))
   yield* fs.writeFileString(join(vendorArchived, 'sys/native/shim.c'), '#include "vend.h"\nint shim_value(void) { return vend_base() + 5; }\n')
   yield* fs.writeFileString(join(vendorArchived, 'sys/Sys.silk'), 'unsafe extern "C" fn shim_value() -> i32\n\npub fn value() -> i32 {\n  return unsafe shim_value()\n}\n')
@@ -2502,6 +2502,15 @@ const program = Effect.gen(function* () {
   assert.equal(mismatched.status, 2, mismatched.stderr)
   assert.match(mismatched.stderr, new RegExp(`archive vend from file://.* has SHA-256 ${vendDigest}, but its manifest pins 0{64}; nothing was extracted`))
   assert.ok(!(yield* fs.exists(join(archiveStore, vendDigest))), 'a mismatched archive is never extracted')
+  // SILK_ARCHIVE_MIRROR rewrites the URL's prefix, here to a file:/// directory, and the digest is
+  // still checked; a malformed entry is refused.
+  yield* fs.writeFileString(join(vendorArchived, 'sys/silk.toml'), sysManifest(vendDigest, 'https://archives.invalid/vend.tar.gz'))
+  const malformedMirror = yield* archivedBuild({ ...vendorArchiveEnvironment, SILK_ARCHIVE_MIRROR: 'https://archives.invalid/' })
+  assert.equal(malformedMirror.status, 2, malformedMirror.stderr)
+  assert.match(malformedMirror.stderr, /SILK_ARCHIVE_MIRROR entry https:\/\/archives\.invalid\/ is not <prefix>=<replacement>/)
+  yield* archivedRun(35, { ...vendorArchiveEnvironment, SILK_ARCHIVE_MIRROR: `https://archives.invalid/=file://${vendorArchived}/` })
+  yield* fs.remove(join(archiveStore, vendDigest), { recursive: true })
+  yield* fs.remove(join(archiveStore, `${vendDigest}.fetched`))
   yield* fs.writeFileString(join(vendorArchived, 'sys/silk.toml'), sysManifest(vendDigest))
   yield* archivedRun(35)
   assert.ok(yield* fs.exists(join(archiveStore, vendDigest, 'lib/libvend.a')), 'the archive is extracted below its digest, its top directory stripped')
@@ -2946,6 +2955,18 @@ const program = Effect.gen(function* () {
   assert.match(
     tooOld.stderr,
     /^silk: Silk builds need Clang 22 or newer, but \S+clang-18 \(from SILK_CLANG\) is Clang 18; set SILK_CLANG or pass --clang the path of a newer Clang$/m,
+  )
+  // A --clang wrapper does not see SILK_CLANG, so the refusal says why it reached another Clang.
+  const wrapped = yield* invoke(
+    silk,
+    ['build', '--manifest-path', join('threads', 'silk.toml'), '--profile', 'web', '--stdlib', standardLibrary, '--clang', eighteen],
+    directory,
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.equal(wrapped.status, 2, wrapped.stderr)
+  assert.match(
+    wrapped.stderr,
+    /^silk: Silk builds need Clang 22 or newer, but \S+clang-18 \(from --clang\) is Clang 18; Clang runs with only PATH, HOME, TMPDIR, TMP, TEMP, LANG, LC_ALL and LC_CTYPE from the environment, so a --clang wrapper does not see SILK_CLANG$/m,
   )
   // Clang 22 miscompiles AVX-512 mask code (llvm/llvm-project#198220), so a profile with avx512vl
   // and avx512dq needs Clang 23.
@@ -5387,6 +5408,43 @@ const program = Effect.gen(function* () {
   yield* embedAppRun(45)
   yield* embedCheck(embedLibrary, 'a package\'s own embedded file was not read')
   yield* embedCheck(embedLibrary, 'a second check lost a package\'s own embedded file')
+  // A check that reused the cache leaves no server behind, so an edit of a module it reused is
+  // refused as `--no-server` refuses it; a server a cold check left sweeps a module an edit newly
+  // imports (#3116).
+  const served = join(directory, 'served-edits')
+  yield* fs.makeDirectory(join(served, 'src'), { recursive: true })
+  yield* fs.writeFileString(join(served, 'silk.toml'), '[package]\nname = "served-edits"\nversion = "0.1.0"\n')
+  yield* fs.writeFileString(join(served, 'src/other.silk'), 'pub fn helper() -> i32 { return 1 }\n')
+  yield* fs.writeFileString(
+    join(served, 'src/main.silk'),
+    'import other\nimport third\npub fn main() -> i32 { return other.helper() - third.t() }\n',
+  )
+  const servedCheck = Effect.fnUntraced(function* (options: ReadonlyArray<string>) {
+    return yield* invoke(silk, ['check', ...options, '--stdlib', standardLibrary], served, splitEnvironment)
+  })
+  const missingModule = yield* servedCheck(['--no-server'])
+  assert.match(missingModule.stdout + missingModule.stderr, /main\.silk:2:8: error\[MOD0001\]/)
+  yield* fs.writeFileString(join(served, 'src/main.silk'), 'import other\npub fn main() -> i32 { return other.helper() - 1 }\n')
+  const reused = yield* servedCheck([])
+  assert.equal(reused.status, 0, reused.stdout + reused.stderr)
+  yield* fs.writeFileString(join(served, 'src/other.silk'), 'import third\npub fn helper() -> i32 { return third.t() }\n')
+  const servedEdit = yield* servedCheck([])
+  assert.match(servedEdit.stdout + servedEdit.stderr, /other\.silk:1:8: error\[MOD0001\]/, 'a check missed an edit of a module the cache answered')
+  yield* fs.remove(join(served, 'build'), { recursive: true })
+  yield* fs.writeFileString(join(served, 'src/other.silk'), 'pub fn helper() -> i32 { return 1 }\n')
+  // Nothing imports `extra` yet; a file added later would change the program's shape instead.
+  yield* fs.writeFileString(join(served, 'src/extra.silk'), 'pub fn more() -> i32 { return true }\n')
+  const coldServer = yield* servedCheck([])
+  assert.equal(coldServer.status, 0, coldServer.stdout + coldServer.stderr)
+  yield* fs.writeFileString(join(served, 'src/main.silk'), 'import other\nimport extra\npub fn main() -> i32 { return other.helper() + extra.more() }\n')
+  const newlyImported = yield* servedCheck([])
+  assert.match(newlyImported.stdout + newlyImported.stderr, /extra\.silk:1:\d+: error\[SEM0129\]/, 'the check server did not sweep a newly imported module')
+  // Every check reports a syntax error while it stays, not only the first one after the edit.
+  yield* fs.writeFileString(join(served, 'src/extra.silk'), 'pub fn more() -> i32 { return 1 \n')
+  for (const attempt of ['first', 'second']) {
+    const broken = yield* servedCheck(['--no-server'])
+    assert.match(broken.stdout + broken.stderr, /extra\.silk:2:1: error\[PAR0001\]/, `the ${attempt} check missed a syntax error`)
+  }
   // A static fn reads the length of an embedded file while the package compiles.
   yield* fs.writeFileString(
     join(embedLibrary, 'src/library.silk'),
