@@ -73,7 +73,7 @@ final-link setting outside the profile's identity, and another target refuses it
 unsupported combination.
 
 A profile may set `codegen-units`, a whole number from 1 to 256: how many codegen units an
-optimized native executable splits into (one module when unset or `1`). It changes no
+optimized executable splits into (one module when unset or `1`). It changes no
 source-visible fact, but it is part of the profile's identity, so each count keeps its own cache.
 
 Safety and threading choices are source-visible policy requests; they never change the language's
@@ -285,15 +285,16 @@ object's cache key, so changing either the variable or the profile rebuilds the 
 profile describes one build of the program: regenerate it after changing the source or the
 compiler.
 
-An optimized (`speed`) native executable is one module unless its profile sets `codegen-units`
+An optimized (`speed`) executable is one module unless its profile sets `codegen-units`
 above 1. Then, when it holds more than 4 MB of bitcode, it splits into that many codegen units,
 which Clang optimizes on separate threads; an unoptimized build already splits by module. The units follow the call graph:
 a function that only one group of functions calls joins that group, up to an even share of the
 program, and every unit keeps its own internal copy of each function that asks to be inlined that
-it calls. The units compile for ThinLTO, and lld links them: the link imports what each unit calls
+it calls. The units compile for ThinLTO, and lld links them, or wasm-ld for a wasm target: the link imports what each unit calls
 from the others, inlines it, and generates each unit's code on its own thread, keeping each result
 in a cache beside the units' objects. A split program runs slower than one module, and its code is
-larger: the compiler ran 3% slower in 16 units, and silkjs 10% slower and 30% larger. With
+larger: the compiler ran 3% slower in 16 units, and silkjs 10% slower and 30% larger. A wasm32 UI page
+built in 1m24 in 8 units on 4 cores instead of 3m29, and was 9% larger. With
 no lld beside Clang (`ld.lld`, or `ld64.lld` for macOS), with a platform supply's own linker, on
 Windows, or in a build with debug information, the program stays one module.
 
