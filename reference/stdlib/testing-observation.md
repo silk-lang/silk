@@ -28,7 +28,7 @@ the path, each as a 4-byte little-endian length and its bytes. A note that does 
 
 Import as `TestObservation` with `import silk.testing.observation as TestObservation`.
 
-Public declarations: 16.
+Public declarations: 19.
 
 <a id="FILE"></a>
 
@@ -69,6 +69,26 @@ pub const VARIABLE: u8
 ```
 
 A note of one environment variable, named by the note's path. Its root is empty.
+
+<a id="WRITE"></a>
+
+## `WRITE`
+
+```silk
+pub const WRITE: u8
+```
+
+A note of a change to a path: a write, a new file or directory, or a removal.
+
+<a id="TEMPORARY"></a>
+
+## `TEMPORARY`
+
+```silk
+pub const TEMPORARY: u8
+```
+
+A note of a directory the test created with a unique name. Notes under it are the test's own.
 
 <a id="CLOCK"></a>
 
@@ -129,6 +149,17 @@ pub const ENVIRONMENT: u64
 ```
 
 The mark of a list of environment variable names.
+
+<a id="HOST"></a>
+
+## `HOST`
+
+```silk
+pub const HOST: u64
+```
+
+The mark of a read of the host: its system information, standard input, signals or the
+program's arguments.
 
 <a id="HEADER"></a>
 
@@ -208,7 +239,7 @@ Records, in the active watch, that the test read `path` of a provider rooted at 
 `kind` says.
 
 ### Details
-`kind` is one of [`FILE`](#FILE), [`ENTRY`](#ENTRY), [`LISTING`](#LISTING) or [`VARIABLE`](#VARIABLE). Without an active watch it
+`kind` is one of [`FILE`](#FILE), [`ENTRY`](#ENTRY), [`LISTING`](#LISTING), [`VARIABLE`](#VARIABLE), [`WRITE`](#WRITE) or [`TEMPORARY`](#TEMPORARY). Without an active watch it
 does nothing. When the note does not fit, it marks [`OVERFLOW`](#OVERFLOW).
 
 
