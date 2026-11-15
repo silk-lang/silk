@@ -464,6 +464,28 @@ pub fn main() -> i32 {
 
 The result is `42`. Naming `increment` does not call it and does not require empty parentheses.
 
+A generic function may be named with its type arguments and no argument list. The arguments fix
+its type parameters, as they do in a call:
+
+```silk
+fn same<T>(value: T) -> T { return move value }
+
+fn apply(transform: fn(i32) -> i32, value: i32) -> i32 {
+  return transform(value)
+}
+
+pub fn main() -> i32 {
+  let chosen = same<i32>
+  return apply(same<i32>, 40) + chosen(2)
+}
+```
+
+The result is `42`. The angles belong to the name only when they end the expression: the token
+after the closing `>` starts a new line or cannot begin an operand, as a comma, a closing `)`, `]`
+or `}`, and a statement keyword such as `return` cannot. An argument list after the angles makes a
+call, and an operand on the same line, as in `a < b > c`, leaves both angles comparisons. The
+instantiated name is an identifier or a module-qualified name, such as `shapes.same<i32>`.
+
 **Boundary:** A function item must satisfy the expected parameter, result, and invocation-mode
 contract. Two functions with the same visible callable signature may retain distinct concrete
 identities for specialization; source cannot erase those identities merely by naming the structural
@@ -479,7 +501,9 @@ leaving the type argument out lets the call infer the exact callable. A `let` an
 callable contract keeps the exact callable and fixes the type parameters a generic function leaves
 open, so `let identity: fn(i32) -> i32 = same` names `same` at `i32`.
 
-**Diagnostics:** Applying a non-callable reports `SEM0075`. An incompatible callable parameter,
+**Diagnostics:** Applying a non-callable reports `SEM0075`, as does writing type arguments after a
+name that is not a function. Type arguments of the wrong number report `SEM0051`. An incompatible
+callable parameter,
 result, or mode reports `SEM0076`. A context that would erase a required concrete callable identity
 reports `SEM0080` or the more specific represented-storage diagnostic. A parameter whose type
 argument is a callable contract reports `SEM0018`.

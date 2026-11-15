@@ -124,10 +124,41 @@ callback coverage.
 
 ## Exported addresses and exact behavior
 
-A named synchronous export without type or value generics supplies its real C thunk address.
-Per-call lifetime binders are permitted. An ordinary, capturing, type-generic, effect, suspending
-or naked machine callable cannot supply a native callback address. Imported foreign functions
-remain callable by symbol; this contract does not add imported-symbol address conversion.
+A named synchronous export supplies its real C thunk address. Per-call lifetime binders are
+permitted. An ordinary, capturing, effect, suspending or naked machine callable cannot supply a
+native callback address. Imported foreign functions remain callable by symbol; this contract does
+not add imported-symbol address conversion.
+
+An export that declares type parameters is a generic export. It supplies one C thunk for each
+instantiation, selected by writing its type arguments after its name with no argument list:
+
+```silk,ignore
+// In a library: written once, generic over the embedder's capabilities type.
+export "C" fn workerEntry<C: Composition>(raw: ?*mut u8) -> ?*mut u8 {
+  return raw
+}
+
+// At a use site that knows `C`, which may itself be generic.
+fn spawn<C: Composition>(thread: *mut usize, packet: ?*mut u8) -> i32 {
+  let entry: extern "C" fn(?*mut u8) -> ?*mut u8 = workerEntry<C>
+  return unsafe pthread_create(thread, Pointer.null<u8>(), entry, packet)
+}
+```
+
+The written type arguments fix every type parameter and prove its bounds; they are never inferred
+from the expected pointer type. The instantiating code may be generic: the instantiation is found
+when that code is specialized, like any generic call, so only the program's entry point needs to
+name concrete types. Each distinct instantiation has exactly one thunk, shared by every place that
+takes its address, and two instantiations have two thunks. No lookup or dictionary exists at run
+time.
+
+A generic export publishes no native symbol and cannot write `as`: one symbol cannot name every
+instantiation. A thunk's symbol is private to the artifact and derived from the export and its
+type arguments, as every generic instance's symbol is, so it is deterministic and native code
+cannot link against it. A generic export whose address is never taken emits nothing. Its
+signature is admitted as written, so a type parameter appears only beneath a raw pointer, such as
+`*const T`. Silk code calls a generic export as the ordinary generic function it is, without
+`unsafe` and without a thunk.
 
 An export declaring stronger foreign promises requires `unsafe export "C" fn` and a `@foreign`
 directive. Its author owns the truth of those promises. Address conversion compares that declared
@@ -156,7 +187,8 @@ respect the borrowing contract. Raw pointers carry no inferred context mapping, 
 
 ## Unwind and cleanup
 
-Native indirect calls and exported callback entry enforce the existing forbidden-unwind outcome:
+Native indirect calls and exported callback entry, including the thunk of each instantiation of a
+generic export, enforce the existing forbidden-unwind outcome:
 the supported native exception unwinder triggers fatal termination at the boundary, before an outer
 foreign catch can receive the exception. This is enforced by a retained guard frame and fatal
 personality, not merely a `nounwind` assumption.

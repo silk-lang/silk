@@ -183,7 +183,9 @@ The call and projection complete before addition: `(makeCounter().value) + 1`.
 is name qualification when `Actor` is a namespace-like declaration; `Interface<A>.operation`
 selects a complete compile-time interface application; and `value.field` is projection when
 `value` is a value. The resolved declaration determines which operation the source names. Applied
-qualification is not available for service operations.
+qualification is not available for service operations. Type arguments written after a name with no
+argument list, as in `same<i32>`, instantiate a function as a value and end the postfix chain
+([CALLABLE-001](functions-callables-and-control-flow.md#callable-001--naming-a-function-produces-a-first-class-callable-value)).
 
 **Diagnostics:** Projecting a non-struct reports `SEM0026`; an unknown or inaccessible field reports
 `SEM0027` or `SEM0028`. Indexing a non-indexable value reports `SEM0032`; a non-`usize` index reports
