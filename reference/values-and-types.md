@@ -1374,10 +1374,24 @@ fn pair(values: [i32; 2]) -> [i32; 2] {
 `[i32; 2]` is incompatible with `[i32; 3]`. `[Token; 0]` remains distinct from `[End; 0]` even
 though neither contains a runtime element.
 
+The written type of a `let` or `const` may end its outermost fixed array with a column hint,
+`[T; N; C]`, where `C` is a decimal integer literal of at least 1. The type is `[T; N]`; the hint
+has no semantic effect and is not part of the type's identity. `silk format` lays the array literal
+that is the declaration's own initializer out `C` elements per line, and no other value or later
+assignment carries the hint.
+
+```silk
+const REVERSE_BITS: [u8; 8; 4] = [
+  0x00, 0x80, 0x40, 0xC0,
+  0x20, 0xA0, 0x60, 0xE0,
+]
+```
+
 **Boundary:** `Array<T, N>` is a compiler display encoding found in older artifacts, not valid Silk
 source syntax. Length is not inferred across a declared parameter or result type.
 
-**Diagnostics:** Malformed fixed-array syntax receives a parser diagnostic. A length above
+**Diagnostics:** Malformed fixed-array syntax receives a parser diagnostic, including a column hint
+on any other type, such as a parameter or an element type, and a hint of `0`. A length above
 2147483647 reports `SEM0002`. A contextual array literal with the wrong length reports `SEM0031`.
 
 **Evidence:** fixed-array source syntax,
