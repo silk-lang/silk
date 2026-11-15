@@ -1448,6 +1448,25 @@ that no Silk code calls is still specialized, verified, and emitted, because its
 code the compiler cannot see. Roots are collected in canonical module then declaration order; they
 are monomorphic, so no specialization arguments are needed.
 
+The loaded module closure is every module the program loads through imports: the modules of the
+root package and the modules of its dependency packages alike. A dependency's export is a root of
+the program that loads its module, whether or not Silk code names it, so native code linked into
+that program can resolve the symbol. A module that no import reaches is not loaded and roots
+nothing.
+
+```silk,ignore
+// Package `core`, module `core.probes`.
+pub export "C" fn core_probe(value: i32) -> i32 { return value }
+pub fn touch() -> i32 { return 1 }
+
+// Package `app`, which depends on `core`. `core_probe` is defined in the executable.
+import core.probes
+pub fn main() -> i32 { return probes.touch() }
+```
+
+The standard library is the exception: its exports reach an artifact only as the selected
+runtime's or a selected component's.
+
 A generic export is not a root. Native code reaches it only through an address Silk code takes at
 an instantiation ([FFI-012](#ffi-012--c-function-pointers-are-exact-exported-addresses)), so an
 instantiation is discovered where that address is specialized, like a generic call
@@ -1467,10 +1486,10 @@ symbol and the target, in the
 [TARGET-003](#target-003--target-unavailability-is-a-compile-time-compatibility-error) shape, and
 constructs no module.
 
-**Current compiler:** Aligned. `Instances.discover` appends the export roots after the entry when
-the target kind is native and records them on the discovery result; lowering copies the inventory
-onto the MIR module, which is the only input the backends receive, and into the driver's cached
-emission header.
+**Current compiler:** Aligned. The build roots the exports of the selected runtime, the application
+module, the other root-package modules and every loaded dependency module, and defines the C
+object of each of their exported statics. The native build test links a C unit against a
+dependency's exported function and static that no Silk code names.
 
 **Evidence:** export specification,
 [instance discovery](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Instances.ts),

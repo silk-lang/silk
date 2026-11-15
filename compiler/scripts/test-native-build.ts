@@ -1761,6 +1761,35 @@ const program = Effect.gen(function* () {
   assert.equal(privateDependency.status, 1, privateDependency.stderr)
   assert.match(privateDependency.stderr, /error\[SEM0015\] `hidden` is private to taskcore\.Store; mark it `pub` there to use it here/)
   assert.match(privateDependency.stderr, /error\[SEM0028\] Field `value` of [A-Za-z.]*Box is private to the module that declares it\n/)
+  // FFI-010: a loaded dependency module's C exports are roots. No Silk code names the function or
+  // the static; the application's C unit links against both by symbol.
+  yield* fs.makeDirectory(join(directory, 'depexport/core'), { recursive: true })
+  yield* fs.makeDirectory(join(directory, 'depexport/app/native'), { recursive: true })
+  yield* fs.writeFileString(
+    join(directory, 'depexport/core/silk.toml'),
+    '[package]\nname = "core"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nexports = ["probes"]\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'depexport/core/probes.silk'),
+    'pub export "C" fn silk_test_dependency_probe(value: i32) -> i32 { return value + 1 }\n\nexport "C" static silk_test_dependency_version: i32 = 40\n\npub fn touch() -> i32 {\n  return 0\n}\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'depexport/app/silk.toml'),
+    '[package]\nname = "app"\nversion = "0.1.0"\nsource = "."\n\n[dependencies]\ncore = { path = "../core" }\n\n[native]\nsources = [{ c = "native/caller.c" }]\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'depexport/app/native/caller.c'),
+    '#include <stdint.h>\nextern const int32_t silk_test_dependency_version;\nint32_t silk_test_dependency_probe(int32_t);\nint32_t silk_test_call_dependency(void) { return silk_test_dependency_probe(1) + silk_test_dependency_version; }\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'depexport/app/main.silk'),
+    'import core.probes\n\nunsafe extern "C" fn silk_test_call_dependency() -> i32\n\npub fn main() -> i32 {\n  return probes.touch() + unsafe silk_test_call_dependency()\n}\n',
+  )
+  const dependencyExportApp = join(directory, 'depexport/app')
+  const dependencyExportBuilt = yield* invoke(silk, ['build', '--stdlib', standardLibrary], dependencyExportApp, { ...process.env, SILK_CLANG: clang })
+  assert.equal(dependencyExportBuilt.status, 0, dependencyExportBuilt.stderr)
+  const dependencyExportRan = yield* invoke(join(dependencyExportApp, `build/llvm/${hostTarget}/debug/app`), [], dependencyExportApp)
+  assert.equal(dependencyExportRan.status, 42, dependencyExportRan.stderr)
   // A library's types are named with their package, an impl outside the modules IMPL-004 allows
   // names the rule, and a refusal of the library's own generic body is reported once, at its site.
   yield* fs.makeDirectory(join(directory, 'libmsg/geo/src'), { recursive: true })
