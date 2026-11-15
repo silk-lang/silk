@@ -82,7 +82,7 @@ pub fn main() -> i32 {
 
 Import as `i32` with `import silk.num.i32`.
 
-Public declarations: 73.
+Public declarations: 75.
 
 <a id="MAX"></a>
 
@@ -622,6 +622,41 @@ pub fn shiftRight(left: i32, right: i32) -> i32
 
 Shifts `left` bits right by `right` positions and preserves its sign. Traps if `right` is
 negative or not less than [`BITS`](#BITS).
+
+<a id="shiftLeftUnchecked"></a>
+
+## `shiftLeftUnchecked`
+
+```silk
+pub unsafe fn shiftLeftUnchecked(left: i32, right: i32) -> i32
+```
+
+Shifts `left` bits left by `right` positions without testing the count. The caller proves that
+`right` is at least zero and less than [`BITS`](#BITS).
+
+### When to use
+
+Use this function in measured hot code whose shift counts are proven in range, such as a bit
+reader that masks its count. [`shiftLeft`](#shiftLeft) traps on a count out of range and is the default.
+
+### Gotchas
+
+A count out of range is undefined behavior, and an optimized build shifts with no test.
+
+<a id="shiftRightUnchecked"></a>
+
+## `shiftRightUnchecked`
+
+```silk
+pub unsafe fn shiftRightUnchecked(left: i32, right: i32) -> i32
+```
+
+Shifts `left` bits right by `right` positions and preserves its sign, without testing the count. The
+caller proves that `right` is at least zero and less than [`BITS`](#BITS).
+
+### Gotchas
+
+A count out of range is undefined behavior, and an optimized build shifts with no test.
 
 <a id="rotateLeft"></a>
 
