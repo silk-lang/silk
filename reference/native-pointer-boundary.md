@@ -128,6 +128,21 @@ inlining and codegen units keep one word per program. A static body cannot call 
 Silk has no other process-wide or thread-local storage. A function that keeps a value in its word
 must answer as if it computed it on every call, so that callers cannot tell the difference.
 
+## Prefetch hints
+
+`Intrinsic.prefetch<P>(pointer: P, static write: bool, static locality: u32, static instruction: bool)
+-> ()` is the safe hint that the program will soon read the memory at the data pointer `pointer`,
+or write it with `write`. `P` is any data pointer type, nullable or not. `locality`, from 0 to 3,
+says how long to keep the memory in cache, from no reuse to every cache level; `instruction` selects
+the instruction cache instead of the data cache. The three selections are static; a locality past 3
+reports `SEM0214` at the argument.
+
+The hint reads and writes no memory, never faults, also for null or released memory, and never
+changes what the program computes. It lowers to `llvm.prefetch`: one prefetch instruction on x86_64
+and AArch64, and nothing on a target without one, such as `wasm32`. `Prefetch.hint` and
+`Prefetch.hintMany` in `silk.mem.prefetch` expose it with an options struct. A static body cannot
+call it.
+
 ## Native output storage
 
 Ordinary source owns `Uninitialized<T>` and `Initialized<T>` output states for Copy values. Private
