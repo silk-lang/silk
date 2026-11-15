@@ -116,7 +116,7 @@ pub struct ModuleSources {
   claimFree: List<ModuleId>,
   // The digest of each module the last load read with summaries, for `parsedDigests`.
   digests: List<LoadedDigest>,
-  // The bindings nothing names in each module the last load read that has any, for
+  // The bindings nothing names in the text last read of each module that has any, for
   // `unusedWarnings`.
   unused: List<ModuleUnused>,
   /// The modules packages' `build.silk` plans generate (driver/BuildPlan).
@@ -1529,7 +1529,8 @@ pub effect fn reread(self: &mut ModuleSources, module: &ModuleId, content: &[u8]
 
 /// Reads every module already read from its file again, as a long-lived check does before each
 /// check, and publishes each one whose text changed, appeared or went away into the revision. A
-/// module a changed text imports for the first time is read too. Answers how many changed.
+/// module a changed text imports for the first time is read too, and [`unusedWarnings`] then
+/// answers from each module's new text. Answers how many changed.
 pub effect fn refreshFromDisk(self: &mut ModuleSources) -> usize
 ! FileError | InvalidModulePath | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
   let mut changed = List<ModuleId>.make()
@@ -1572,12 +1573,32 @@ pub effect fn refreshFromDisk(self: &mut ModuleSources) -> usize
       continue
     }
     let observed = run Revision.observe(&self.revision, &edited[at])
+    // The warnings of the text it had are gone with that text, whether or not a new one replaces it.
     if let Option<Bytes>.Some {value: text} = move run Observation.copyContent(&observed) {
-      run preloadImports(&mut self.*, &edited[at], Bytes.asSlice(&text))
+      let unit = run SourceUnit.parse(&edited[at], Revision.revisionNumber(&self.revision), move text)
+      run recordUnused(&mut self.*, &edited[at], run UnusedBindings.find(&unit.authored))
+      run preloadUnitImports(&mut self.*, &unit)
+    } else {
+      run recordUnused(&mut self.*, &edited[at], List<Unused>.make())
     }
     at = at + usize.ONE
   }
   return edited.length
+}
+
+// Records `found`, the bindings nothing names in the text of `module` just read, in place of what
+// an earlier text of it had.
+effect fn recordUnused(self: &mut ModuleSources, module: &ModuleId, found: List<Unused>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < List<ModuleUnused>.length(&self.unused) {
+    if ModuleId.equals(&List<ModuleUnused>.asSlice(&self.unused)[at].module, module) {
+      drop List<ModuleUnused>.remove(&mut self.unused, at)
+      break
+    }
+    at = at + usize.ONE
+  }
+  if List<Unused>.length(&found) == usize.ZERO { return () }
+  return run List<ModuleUnused>.append(&mut self.unused, ModuleUnused {module: ModuleId.copy(module), found: move found})
 }
 
 /// Lets the root package import its own modules by `name` as well, as a documentation example
@@ -2257,7 +2278,6 @@ pub effect fn preload(self: &mut ModuleSources, roots: &[ModuleId]) -> ()
   List<SourceUnit>.clear(&mut self.parsed)
   List<ModuleId>.clear(&mut self.claimFree)
   List<LoadedDigest>.clear(&mut self.digests)
-  self.unused = List<ModuleUnused>.make()
   // A file the last build's store parsed is parsed again ahead, on threads of their own, while
   // this load reads and parses the rest (see `ImportSummaries.wasParsed`).
   let mut ahead = List<ParseJob>.make()
@@ -2325,10 +2345,9 @@ pub effect fn preload(self: &mut ModuleSources, roots: &[ModuleId]) -> ()
         }
       }
       if !summary.claims { run List<ModuleId>.append(&mut self.claimFree, ModuleId.copy(&module)) }
-      if List<Unused>.length(&summary.unused) > usize.ZERO {
-        let found = run Summaries.copyUnused(List<Unused>.asSlice(&summary.unused))
-        run List<ModuleUnused>.append(&mut self.unused, ModuleUnused {module: ModuleId.copy(&module), found: move found})
-      }
+      // A load that follows an edit reads only the modules the edit newly reaches, so each module
+      // replaces its own record and the others keep theirs.
+      run recordUnused(&mut self.*, &module, run Summaries.copyUnused(List<Unused>.asSlice(&summary.unused)))
       if summary.sealed {
         // The path is fixed and compiler-owned; sourceLocation never consults the project tree.
         run List<ModuleId>.append(&mut pending, run PackageGraph.target(&self.graph, &module, SealedOperators.path()))
@@ -2563,9 +2582,10 @@ pub fn takeClaimFree(self: &mut ModuleSources) -> List<ModuleId> {
   return Intrinsic.replace(self.claimFree, List<ModuleId>.make())
 }
 
-/// The unused-binding warnings (MOD0007, SEM0255) of each of `modules` the last load read, module
-/// by module in the order given. A file's come from its summary when its bytes are unchanged, so
-/// a warm load reports them without parsing it.
+/// The unused-binding warnings (MOD0007, SEM0255) of each of `modules`, module by module in the
+/// order given, for the text [`preload`] or [`refreshFromDisk`] last read of it; [`reread`] leaves
+/// them as they were. A file's come from its summary when its bytes are unchanged, so a warm load
+/// reports them without parsing it.
 pub effect fn unusedWarnings(self: &ModuleSources, modules: &[ModuleId]) -> List<Shared<Rejection>> ! OutOfMemoryError ? &mut Allocator {
   let mut warnings = List<Shared<Rejection>>.make()
   let recorded = List<ModuleUnused>.asSlice(&self.unused)
@@ -2595,8 +2615,15 @@ pub fn takeParsed(self: &mut ModuleSources) -> List<SourceUnit> {
 pub effect fn preloadImports(self: &mut ModuleSources, module: &ModuleId, text: &[u8]) -> ()
 ! FileError | InvalidModulePath | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
   let unit = run SourceUnit.parse(module, Revision.revisionNumber(&self.revision), run Bytes.copy(text))
-  let index = run ModuleIndex.build(&unit, false)
-  let mut paths = run ModuleIndex.importPaths(&index, &unit)
+  return run preloadUnitImports(&mut self.*, &unit)
+}
+
+// Publishes, from disk, every module that `unit` imports, and everything those import.
+effect fn preloadUnitImports(self: &mut ModuleSources, unit: &SourceUnit) -> ()
+! FileError | InvalidModulePath | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let module = &unit.id
+  let index = run ModuleIndex.build(unit, false)
+  let mut paths = run ModuleIndex.importPaths(&index, unit)
   run EmbeddedFiles.append(&unit.authored, &mut paths)
   let written = List<Bytes>.asSlice(&paths)
   let mut roots = List<ModuleId>.make()
