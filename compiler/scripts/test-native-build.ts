@@ -5418,6 +5418,12 @@ const program = Effect.gen(function* () {
   yield* fs.writeFileString(join(served, 'src/main.silk'), 'import other\nimport extra\npub fn main() -> i32 { return other.helper() + extra.more() }\n')
   const newlyImported = yield* servedCheck([])
   assert.match(newlyImported.stdout + newlyImported.stderr, /extra\.silk:1:\d+: error\[SEM0129\]/, 'the check server did not sweep a newly imported module')
+  // Every check reports a syntax error while it stays, not only the first one after the edit.
+  yield* fs.writeFileString(join(served, 'src/extra.silk'), 'pub fn more() -> i32 { return 1 \n')
+  for (const attempt of ['first', 'second']) {
+    const broken = yield* servedCheck(['--no-server'])
+    assert.match(broken.stdout + broken.stderr, /extra\.silk:2:1: error\[PAR0001\]/, `the ${attempt} check missed a syntax error`)
+  }
   // A static fn reads the length of an embedded file while the package compiles.
   yield* fs.writeFileString(
     join(embedLibrary, 'src/library.silk'),
