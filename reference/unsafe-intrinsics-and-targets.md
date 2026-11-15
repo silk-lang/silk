@@ -1137,8 +1137,8 @@ The root package's own declarations of one symbol must agree whether or not anyt
 so `silk check` reports a conflict between two of them without building. A declaration in a
 `static if` arm the target does not select is not declared, so a symbol whose C types differ
 between systems is declared once per system, each in its own arm. `silk check` also compares
-them with the standard library's declarations of the same symbols in the modules it loads, for the
-checked target, so a declaration that disagrees with the standard library's `close` or `fchmod`
+them with the standard library's declarations of the same symbols in the modules the package
+imports, directly or through other modules, for the checked target, so a declaration that disagrees with the standard library's `close` or `fchmod`
 is reported without building. Two declarations that are both in the standard library, or a
 dependency's declaration, enter the comparison where the executable reaches them, which only
 `silk build` knows.
