@@ -49,7 +49,7 @@ pub fn main() -> i32 {
 
 Import as `f64` with `import silk.num.f64`.
 
-Public declarations: 72.
+Public declarations: 73.
 
 <a id="MAX"></a>
 
@@ -632,6 +632,30 @@ bits.
 
 Either signed zero returns negative infinity, and one returns positive zero. Positive infinity
 returns itself. NaN and any negative argument return the canonical quiet NaN.
+
+<a id="log2"></a>
+
+## `log2`
+
+```silk
+pub fn log2(value: f64) -> f64
+```
+
+Approximates the base-2 logarithm within 0.55 units in the last place using deterministic
+result bits.
+
+### When to use
+
+Use it instead of `log(value) / ln 2`, which rounds twice and so can differ from the nearest
+result. A power of two returns its exponent exactly.
+
+### Details
+
+Either signed zero returns negative infinity, and one returns positive zero. Positive infinity
+returns itself. NaN and any negative argument return the canonical quiet NaN.
+
+The result bits are those of musl's `log2`, and of glibc's on a processor without fused
+multiply-add. glibc's fused multiply-add path rounds about one result in 20,000 the other way.
 
 <a id="pow"></a>
 
