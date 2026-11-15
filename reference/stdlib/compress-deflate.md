@@ -48,7 +48,7 @@ pub effect fn main() -> i32
 
 Import as `Encoder` with `import silk.compress.deflate { Encoder }`.
 
-Public declarations: 9.
+Public declarations: 10.
 
 <a id="Strategy"></a>
 
@@ -461,6 +461,51 @@ pub strategy: Strategy
 
 How the encoder looks for repeated data.
 
+<a id="Options.hash"></a>
+
+### Field `hash`
+
+```silk
+pub hash: Hash
+```
+
+How the encoder finds earlier occurrences of the next bytes.
+
+<a id="Hash"></a>
+
+## `Hash`
+
+```silk
+pub enum Hash
+```
+
+How an [`Encoder`](#Encoder) finds earlier occurrences of the next bytes. Each choice writes the bytes of
+a zlib that uses it, and each is the same on every target.
+
+<a id="Hash.Rolling"></a>
+
+### `Rolling`
+
+```silk
+Rolling
+```
+
+zlib's rolling hash of 3 bytes, in a table of `1 << (memoryLevel + 7)` entries. The output is
+byte for byte zlib 1.3.1's.
+
+<a id="Hash.Multiplicative"></a>
+
+### `Multiplicative`
+
+```silk
+Multiplicative
+```
+
+The hash of Chromium's zlib, which Node.js and Chrome use: a multiplicative hash of 4 bytes,
+in a table of at least `1 << 15` entries. Its chains have fewer collisions, so it is faster
+at levels 4 to 9 and compresses about as well. The output is byte for byte Chromium zlib's
+(revision 09a1572 of Node 24).
+
 <a id="Options.impl"></a>
 
 ## Implementation `Options`
@@ -477,8 +522,8 @@ impl Options
 pub fn make(level: u32) -> Options
 ```
 
-Returns options with `level`, a 32 KiB window, memory level 8, and the default strategy, the
-defaults of zlib's `deflateInit`.
+Returns options with `level`, a 32 KiB window, memory level 8, the default strategy, and
+zlib's rolling hash, the defaults of zlib's `deflateInit`.
 
 <a id="Encoder"></a>
 
