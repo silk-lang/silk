@@ -251,20 +251,25 @@ boundary are compile-time errors even when runtime filters would exclude that te
 A runner that `silk test` builds for an ELF or Mach-O target keeps a table of its functions: each
 one has a flag its entry sets and the digest of everything the compiler read to make it. Before a
 test runs, the runner clears the flags and watches what the test reads through the native
-providers: files and their entries, directory listings and environment variables, and whether it
-reads the clock, takes random numbers from the host, opens a socket or resolves a name, starts a
-child process or lists the environment. After a test that passed, the runner records, beside
-itself, the digests of the functions the test executed and a digest of each input it read, taken
-after the test.
+providers: files and their entries, directory listings and environment variables, the files and
+directories it writes, makes or removes, and whether it reads the clock, takes random numbers from
+the host, opens a socket or resolves a name, starts a child process, lists the environment, or
+reads the host's system information, standard input, signals or the program's arguments. After a
+test that passed, the runner records, beside itself, the digests of the functions the test
+executed and a digest of each input it read, taken after the test. What a test reads or writes in
+a directory it made with `createTemporaryDirectory` is its own and is not an input.
 
 A later run from the same working directory skips a selected test when every function it
 executed is in the new runner with the same digest and every input it read reads the same. It
 reports the test as `CACHED` and counts it in `cached` and `passed`, but not `executed`. A test is
-always run again when it failed, used the clock, randomness, the network, a child process or the
-list of the environment, read more than the watch holds, or executed a function without a digest,
+always run again when it failed, changed a file or directory outside its own temporary
+directories, used the clock, randomness, the network, a child process, the list of the
+environment or the host, read more than the watch holds, or executed a function without a digest,
 as in a build without a cache. The record is kept only while the runner's build key (TEST-009),
-which names the compiler, Clang and the build's options, stays the same. `--no-cache` builds the
-runner again and runs every selected test.
+which names the compiler, Clang and the build's options, the time limit, and the files besides
+Silk sources that the build read, such as the C sources and archives of `[native]`, the manifest
+and embedded files, stay the same. `--no-cache` builds the runner again and runs every selected
+test.
 
 ```sh
 silk test             # reuses an unchanged runner; runs only the tests whose code or inputs changed
@@ -272,7 +277,8 @@ silk test --no-cache  # builds the runner again, then runs every selected test
 ```
 
 **Boundary:** A test that reads the host other than through the native providers, such as a C
-call or a dynamic library it loads, reads unseen. Work a process does once, such as filling a cache
+call or a dynamic library it loads, reads unseen. A system library the runner links is not part of
+the key. Work a process does once, such as filling a cache
 on first use, is recorded only for the test that did it, so a later test that relies on it can be
 skipped after an edit to that work. Windows and WASI runners have no table, so every selected
 test runs.

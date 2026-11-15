@@ -301,10 +301,17 @@ each after a word for its kind, or a word for a failure.
 ## `inputs`
 
 ```silk
-pub effect fn inputs(notes: &[u8]) -> List<Input> ! OutOfMemoryError ? &mut Allocator | &mut HostInput
+pub effect fn inputs(notes: &[u8]) -> Option<List<Input>> ! OutOfMemoryError ? &mut Allocator | &mut HostInput
 ```
 
-The inputs the notes of a watch buffer `notes` name, each once, with their digests now.
+The inputs the notes of a watch buffer `notes` name, each once, with their digests now, or
+`None` when the test cannot be recorded.
+
+### Details
+Notes under a directory the test created with a unique name ([`Observation.TEMPORARY`](./testing-observation.md#TEMPORARY)) are
+the test's own and name no input. A change to any other path ([`Observation.WRITE`](./testing-observation.md#WRITE)) means a
+later run would start from what the test left, so the result is `None`. So is a buffer whose
+notes do not parse.
 
 <a id="record"></a>
 
