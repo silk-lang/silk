@@ -1134,7 +1134,9 @@ their classified C signatures and normalized behavioral contracts are equal and 
 the symbol once.
 
 The root package's own declarations of one symbol must agree whether or not anything calls them,
-so `silk check` reports a conflict between two of them without building. A declaration of a
+so `silk check` reports a conflict between two of them without building. A declaration in a
+`static if` arm the target does not select is not declared, so a symbol whose C types differ
+between systems is declared once per system, each in its own arm. A declaration of a
 dependency or of the standard library enters the comparison where the executable reaches it, which
 only `silk build` knows.
 
