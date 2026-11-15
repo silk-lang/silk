@@ -39,9 +39,13 @@ arguments before machine execution.
 
 **Status:** Candidate.
 
-**Rule:** A non-unit result has one `={register}` or early-clobber `=&{register}` output. Each input
-has one fixed `{register}` constraint or one `0` tie to the output. Tied lanes have compatible LLVM
-kinds. Fixed input/output overlap must be spelled as a tie. x86-64 admits rax/rdi/rsi/rdx/rcx and
+**Rule:** A non-unit result has one `={register}` or early-clobber `=&{register}` output, or `=r`
+or `=&r` for a register the allocator chooses. Each input has one fixed `{register}` constraint, `r`
+for a register the allocator chooses, `m` for the memory a pointer input addresses, or one `0` tie
+to the output. An `m` operand prints as the target's memory operand, such as `(%rdi)` or `[x0]`, and
+needs a `memory` contract other than `none`. Tied lanes have compatible LLVM kinds. Fixed
+input/output overlap must be spelled as a tie. An allocator-chosen output may share a register with
+an input unless it is early-clobber `=&r`. x86-64 admits rax/rdi/rsi/rdx/rcx and
 r8–r11; Linux and Darwin ARM64 admit x0–x17. A comma-separated clobber string admits those registers
 plus `flags` (lowered to LLVM `cc` on both ARM64 targets). Darwin's reserved x18, callee-saved
 registers, frame pointer, link register and stack pointer are not operand/clobber registers.
@@ -52,7 +56,9 @@ the output. `noReturn = true` requires unit and side effects; control flow termi
 assembly. Templates use AT&T x86-64 or the default ARM64 dialect and contain function-local assembly,
 not module directives. LLVM operand references are `$0`, `$1`, etc.; literal `$` uses `$$`.
 
-**Example:** `"{rdi},{rsi}"` with a unit result binds two independent input words. A memory store
+**Example:** `"{rdi},{rsi}"` with a unit result binds two independent input words.
+`"leaq ($1,$2), $0"` with `"=r,r,r"` adds two words in registers the allocator picks, and
+`"movq $1, $0"` with `"=&r,m"` and `read` loads the word a pointer addresses. A memory store
 must declare write/readwrite and side effects even if its result is unused.
 
 A CPU spin hint is an observable machine effect, not a scheduler yield. On either ARM64 target,
