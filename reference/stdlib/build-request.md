@@ -1488,6 +1488,14 @@ impl Schema for LinkInput
 static fn spec() -> Spec<LinkInput>
 ```
 
+<a id="LinkInput.impl.Schema.check"></a>
+
+### Operation `check`
+
+```silk
+fn check(self: &Self, checks: &mut Checks<Self>) -> ()
+```
+
 <a id="Platform"></a>
 
 ## `Platform`

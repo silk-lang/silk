@@ -313,6 +313,15 @@ effect fn member(self: &mut Self, key: string) -> bool
     ? &mut Allocator
 ```
 
+<a id="TomlSchemaReader.impl.SchemaReader.nextMember"></a>
+
+### Operation `nextMember`
+
+```silk
+effect fn nextMember(self: &mut Self) -> Option<String>
+    ! Issue | OutOfMemoryError ? &mut Allocator
+```
+
 <a id="TomlSchemaReader.impl.SchemaReader.rejectUnread"></a>
 
 ### Operation `rejectUnread`
