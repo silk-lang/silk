@@ -112,6 +112,11 @@ const reader = (bytes: Uint8Array, start: number, end: number) => {
     const lead = byte()
     if (lead === 0x63 || lead === 0x64) skipLeb()
   }
+  /** A block type: empty, a value type (a reference type's byte and heap type included), or a type index. */
+  const blockType = (): void => {
+    const lead = byte()
+    if (lead === 0x63 || lead === 0x64 || (lead & 0x80) !== 0) skipLeb()
+  }
   const limits = (): void => {
     const flags = byte()
     skipLeb()
@@ -135,6 +140,7 @@ const reader = (bytes: Uint8Array, start: number, end: number) => {
     skip,
     name,
     valueType,
+    blockType,
     limits,
     memoryArgument,
   }
@@ -175,6 +181,8 @@ const instruction = (read: Reader, index: number): number => {
     case BLOCK:
     case LOOP:
     case IF:
+      read.blockType()
+      return opcode
     case 0x0c: // br
     case BR_IF:
     case 0x10: // call
