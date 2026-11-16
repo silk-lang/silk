@@ -249,11 +249,14 @@ const serve = Effect.fnUntraced(function* (text: string) {
             try {
               exit = wasi.start(instance) ?? 0
             } catch (cause) {
-              trap = cause instanceof Error ? cause.message : String(cause)
+              // A trap is a RuntimeError, or a RangeError when the wasm stack overflows; anything
+              // else, such as a missing `memory` or `_start` export, means the module cannot run.
+              if (!(cause instanceof WebAssembly.RuntimeError || cause instanceof RangeError)) throw cause
+              trap = cause.message
             }
             return { exit, trap, ms: performance.now() - started, exports: instance.exports }
           },
-          catch: (cause) => external('cannot instantiate the module', cause),
+          catch: (cause) => external('cannot run the module', cause),
         })
       }),
     )
@@ -326,12 +329,15 @@ const runV8 = Effect.fnUntraced(function* (engine: V8Engine, request: Request) {
 
 /**
  * What a `wasmtime run` process did. Wasmtime exits 134 after a trap and describes the trap on
- * stderr after the program's own output; any other status is the program's.
+ * stderr after the program's own output, ending with the trap itself and, when `RUST_BACKTRACE` is
+ * set, followed by Wasmtime's own stack backtrace; any other status is the program's.
  */
 export const wasmtimeOutcome = (status: number | null, signal: string | null, stdout: string, stderr: string): Outcome => {
   const report = stderr.lastIndexOf('Error: failed to run main module')
-  if (status === 134 && report >= 0)
-    return { exit: null, trap: stderr.trim().split('\n').slice(-1)[0]?.trim() ?? 'trap', stdout, stderr: stderr.slice(0, report) }
+  if (status === 134 && report >= 0) {
+    const described = stderr.slice(report).split('\nStack backtrace:')[0] ?? ''
+    return { exit: null, trap: described.trim().split('\n').at(-1)?.trim() ?? 'trap', stdout, stderr: stderr.slice(0, report) }
+  }
   if (status === null) return { exit: null, trap: `wasmtime killed by ${signal}`, stdout, stderr }
   return { exit: status, trap: null, stdout, stderr }
 }
@@ -420,7 +426,9 @@ export const run = Effect.fn('WasmEngine.run')(function* (
   engine: V8Engine | Wasmtime,
   request: Request,
 ): Effect.fn.Return<Execution, WasmEngineError, FileSystem.FileSystem> {
-  return yield* typeof engine === 'string' ? Effect.scoped(runV8(engine, request)) : runWasmtime(engine, request)
+  // Absolute, because a run's process starts in the module's directory.
+  const absolute = { ...request, module: resolve(request.module) }
+  return yield* typeof engine === 'string' ? Effect.scoped(runV8(engine, absolute)) : runWasmtime(engine, absolute)
 })
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
