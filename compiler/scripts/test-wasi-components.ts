@@ -190,7 +190,8 @@ export const verify = Effect.fn('WasiComponents.verify')(function* (
     const request = join(root, 'request.toml')
     yield* fs.writeFileString(definition,
       `manifest=${JSON.stringify(join(root, 'silk.toml'))}\nstdlib=${JSON.stringify(join(repo, 'stdlib'))}\n` +
-      '[settings.profile]\ntarget="wasm32-wasip2"\nruntime="none"\n')
+      '[settings]\nmodules=[]\n[settings.profile]\ntarget="wasm32-wasip2"\nruntime="none"\n' +
+      '[settings.native]\nsources=[]\nlink=[]\n')
     const resolved = yield* invoke(compiler, ['resolve', '--definition', definition, '--output', request], root)
     assert.equal(resolved.status, 0, resolved.stderr.toString())
     const built = yield* invoke(compiler, ['compile', '--request', request], root)

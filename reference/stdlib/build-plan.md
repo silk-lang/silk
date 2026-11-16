@@ -274,6 +274,16 @@ Requirements in reverse insertion order; producers are retained by their deferre
 impl Plan
 ```
 
+<a id="Plan.impl.when"></a>
+
+### Method `when`
+
+```silk
+pub static fn when(self: Self, condition: bool, transform: fn(Self) -> Self) -> Self
+```
+
+Applies `transform` when `condition` is true, returning this plan without calling it otherwise.
+
 <a id="Plan.impl.archivePath"></a>
 
 ### Associated function `archivePath`

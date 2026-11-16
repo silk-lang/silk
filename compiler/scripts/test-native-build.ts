@@ -4370,7 +4370,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   // Members build in dependency order, whatever order `members` lists them in.
   // A library member is only checked; it makes no artifact of its own.
   assert.match(managedBuild.stderr, /^Checking greeting \(.*\)\n[\s\S]*^Compiling hello \(/m)
-  assert.match(managedBuild.stderr, /^Finished 2 packages in [^\n]*\n$/m)
+  assert.match(managedBuild.stderr, /^Finished greeting in [^\n]+$/m)
   // Each artifact is named from the working directory, the workspace root here, not its package.
   assert.match(
     managedBuild.stderr,

@@ -47,10 +47,11 @@ build() {
 import json, sys
 from pathlib import Path
 root, target, stdlib, platform = sys.argv[1:]
-text = f'manifest = {json.dumps(root + "/silk.toml")}\nstdlib = {json.dumps(stdlib)}\n[settings]\n'
+text = f'manifest = {json.dumps(root + "/silk.toml")}\nstdlib = {json.dumps(stdlib)}\n[settings]\nmodules = []\n'
 if platform:
     text += f'platform = {platform}\n'
 text += f'[settings.profile]\ntarget = {json.dumps(target)}\noptimization = "none"\ndebug = false\n'
+text += '[settings.native]\nsources = []\nlink = []\n'
 Path(root, 'definition.toml').write_text(text)
 PYCODE
   if ! { "$compiler" resolve --definition "$package/definition.toml" --output "$package/request.toml" &&
