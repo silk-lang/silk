@@ -1,5 +1,6 @@
+import silk.build.context as BuildContext
+import silk.system.host_input { HostInput, HostInputError }
 //! Captures resolved compiler inputs in the shared compilation-request model.
-
 import driver.ModuleSources as Sources { ModuleSources }
 import driver.NativeLinkInput as NativeInputs
 import driver.RequestText
@@ -10,13 +11,16 @@ import format.Output as Output { Counter }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
 import silk.io.writer { Writer, WriterError }
+import silk.build.encoding as Encoding
 import silk.schema.toml { SchemaToml }
+import silk.schema.json { SchemaJson }
 import silk.schema.issue { SchemaError }
 import semantic.ExecutionStorage { Binding, ExecutionStorage }
 import semantic.InitialProfile { InitialProfile }
 import semantic.ModuleId { ModuleId }
-import silk.build.request {
+import silk.build.request as Requests {
   Request,
+  RequestSet,
   Profile,
   Composition,
   ModuleRef,
@@ -34,7 +38,7 @@ import silk.collections.bytes { Bytes }
 import silk.collections.list { List }
 import silk.core.option { Option }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
-import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.system.filesystem { AtomicWriteError, FileError, FileSystem, Path }
 import silk.text.string { String }
 import silk.num.usize
 
@@ -209,12 +213,7 @@ pub effect fn make(
   if testing {
     artifact = run String.copy("test")
   }
-  let name = match move Path.name(output) {
-    Option<string>.Some { value } => run String.copy(value)
-    Option<string>.None => {
-      fail FileSystem.error(FileSystem.writeFileOperation(), FileSystem.invalidPath())
-    }
-  }
+  let name = run artifactLabel(output, initial, testing, emit)
   return Request {
     version: 1,
     name: move name,
@@ -265,7 +264,7 @@ pub effect fn write(request: &Request, path: &Path) -> ()
   if let Option<Path>.Some { value: parent } = move run Path.parent(path) {
     run FileSystem.createDirectoriesRecursively(&parent)
   }
-  run FileSystem.writeFile(path, bytes.asSlice())
+  run publish(path, bytes.asSlice())
   return ()
 }
 
@@ -317,7 +316,7 @@ pub effect fn wasm(request: &mut Request, world: &World) -> ()
   }
   request.wasm = Option<Wasm>.some(
     Wasm {
-      importMemory: false,
+      importMemory: request.profile.threading.view() == "multi",
       sharedMemory: request.profile.threading.view() == "multi",
       exportTable: false,
       executionModel: run String.copy("command"),
@@ -326,4 +325,246 @@ pub effect fn wasm(request: &mut Request, world: &World) -> ()
     },
   )
   return ()
+}
+
+/// The logical artifact name, without the suffix assigned by the target and emission kind.
+pub effect fn artifactLabel(
+  output: &Path,
+  initial: &InitialProfile,
+  testing: bool,
+  emit: string,
+) -> String
+  ! FileError | OutOfMemoryError
+  ? &mut Allocator {
+  let name = match move Path.name(output) {
+    Option<string>.Some { value } => value
+    Option<string>.None => {
+      fail FileSystem.error(FileSystem.writeFileOperation(), FileSystem.invalidPath())
+    }
+  }
+  let mut artifact = run fact(initial, b"artifact")
+  if testing {
+    artifact = run String.copy("test")
+  }
+  let target = run fact(initial, b"target")
+  let suffix = run Requests.artifactName("", artifact.view(), emit, target.view())
+  if suffix.view() != "" && String.endsWith(name, suffix.view())
+    && String.byteLength(name) > String.byteLength(suffix.view()) {
+    return run String.copy(
+      String.slice(name, 0, String.byteLength(name) - String.byteLength(suffix.view())),
+    )
+  }
+  return run String.copy(name)
+}
+
+/// Publishes the complete editor request set only after every compilation resolved successfully.
+pub effect fn writeSet(directory: &Path, files: List<String>) -> ()
+  ! HostInputError | InvalidSourceRoot | FileError | WriterError | OutOfMemoryError
+  ? &mut HostInput | &mut FileSystem | &mut Allocator {
+  let index = RequestSet { version: 1, files: move files }
+  let bytes = match move run Effect.result(Encoding.json<RequestSet>(&index)) {
+    Result<Bytes, SchemaError | WriterError | OutOfMemoryError>.Success { value } => move value
+    Result<Bytes, SchemaError | WriterError | OutOfMemoryError>.Failure {
+      error
+    } => match move error {
+      SchemaError _invalid => {
+        fail InvalidSourceRoot {}
+      }
+      WriterError failure => {
+        fail move failure
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+  let path = run Path.join(directory, run BuildContext.planIndex())
+  return run publish(&path, bytes.asSlice())
+}
+
+effect fn publish(path: &Path, bytes: &[u8]) -> ()
+  ! FileError
+  ? &mut FileSystem {
+  let written = run Effect.result(
+    FileSystem.writeFileAtomic(path, bytes, FileSystem.replaceExisting(), FileSystem.buffered()),
+  )
+  if let Result<(), AtomicWriteError>.Failure { error } = move written {
+    fail move error.cause
+  }
+  return ()
+}
+
+/// One directory's complete set of requests across selected workspace packages.
+pub struct Set {
+  pub directory: Path,
+  pub files: List<String>,
+}
+
+/// Adds a package's requests, rejecting artifact names shared by different packages.
+pub effect fn extend(sets: &mut List<Set>, directory: &Path, files: List<String>) -> ()
+  ! InvalidSourceRoot | FileError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut incoming = move files
+  let mut at: usize = 0
+  while at < sets.length() {
+    let found = &mut sets.asMutSlice()[at]
+    if samePath(&found.directory, directory) {
+      while incoming.length() > 0 {
+        let name = incoming.remove(0)
+        let listed = found.files.asSlice()
+        let mut previous: usize = 0
+        while previous < listed.length {
+          if listed[previous].view() == name.view() {
+            fail InvalidSourceRoot {}
+          }
+          previous = previous + 1
+        }
+        run found.files.append(move name)
+      }
+      return ()
+    }
+    at = at + 1
+  }
+  run sets.append(
+    Set { directory: run Path.fromBytes(Path.rawBytes(directory)), files: move incoming },
+  )
+  return ()
+}
+
+/// Reads a completed package plan before another package replaces its directory's index.
+pub effect fn collect(sets: &mut List<Set>, directory: &Path) -> ()
+  ! HostInputError | InvalidSourceRoot | FileError | OutOfMemoryError
+  ? &mut HostInput | &mut FileSystem | &mut Allocator {
+  let path = run Path.join(directory, run BuildContext.planIndex())
+  let bytes = run FileSystem.readFile(&path)
+  let index = match move run Effect.result(SchemaJson.decode<RequestSet>(bytes.asSlice())) {
+    Result<RequestSet, SchemaError | OutOfMemoryError>.Success { value } => move value
+    Result<RequestSet, SchemaError | OutOfMemoryError>.Failure { error } => match move error {
+      SchemaError _invalid => {
+        fail InvalidSourceRoot {}
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+  return run extend(&mut sets.*, directory, move index.files)
+}
+
+/// Atomically publishes each complete directory index after every selected package succeeds.
+pub effect fn publishSets(sets: List<Set>) -> ()
+  ! HostInputError | InvalidSourceRoot | FileError | WriterError | OutOfMemoryError
+  ? &mut HostInput | &mut FileSystem | &mut Allocator {
+  let mut remaining = move sets
+  while remaining.length() > 0 {
+    let selected = remaining.remove(0)
+    run writeSet(&selected.directory, move selected.files)
+  }
+  return ()
+}
+
+fn samePath(left: &Path, right: &Path) -> bool {
+  let a = Path.rawBytes(left)
+  let b = Path.rawBytes(right)
+  if a.length != b.length {
+    return false
+  }
+  let mut at: usize = 0
+  while at < a.length {
+    if a[at] != b[at] {
+      return false
+    }
+    at = at + 1
+  }
+  return true
+}
+
+/// A previous publication retained while all selected workspace plans are evaluated.
+struct SavedFile {
+  path: Path,
+  contents: Bytes,
+}
+
+pub struct Snapshot {
+  directory: Path,
+  files: List<SavedFile>,
+}
+
+/// Captures a request directory once, including generated source files referred to by requests.
+pub effect fn snapshot(snapshots: &mut List<Snapshot>, directory: &Path) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let listed = snapshots.asSlice()
+  let mut at: usize = 0
+  while at < listed.length {
+    if samePath(&listed[at].directory, directory) {
+      return ()
+    }
+    at = at + 1
+  }
+  let mut files = List<SavedFile>.make()
+  if run FileSystem.exists(directory) {
+    run saveFiles(directory, &mut files)
+  }
+  run snapshots.append(
+    Snapshot { directory: run Path.fromBytes(Path.rawBytes(directory)), files: move files },
+  )
+}
+
+effect fn saveFiles(directory: &Path, files: &mut List<SavedFile>) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let entries = run FileSystem.listDirectory(directory)
+  let listed = entries.asSlice()
+  let mut at: usize = 0
+  while at < listed.length {
+    let entry = &listed[at]
+    if entry.kind.code == FileSystem.directory().code {
+      run saveFiles(&entry.path, &mut files.*)
+    } else if entry.kind.code == FileSystem.file().code {
+      run files.append(
+        SavedFile {
+          path: run Path.fromBytes(Path.rawBytes(&entry.path)),
+          contents: run FileSystem.readFile(&entry.path),
+        },
+      )
+    }
+    at = at + 1
+  }
+}
+
+/// Restores the last complete request publication after a plan fails.
+pub effect fn restore(snapshots: &[Snapshot]) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let mut at: usize = 0
+  while at < snapshots.length {
+    let snapshot = &snapshots[at]
+    let mut current = List<SavedFile>.make()
+    if run FileSystem.exists(&snapshot.directory) {
+      run saveFiles(&snapshot.directory, &mut current)
+    }
+    let old = snapshot.files.asSlice()
+    let changed = current.asSlice()
+    let mut file: usize = 0
+    while file < changed.length {
+      let mut previous: usize = 0
+      while previous < old.length && !samePath(&old[previous].path, &changed[file].path) {
+        previous = previous + 1
+      }
+      if previous == old.length {
+        run FileSystem.removeFile(&changed[file].path)
+      }
+      file = file + 1
+    }
+    file = 0
+    while file < old.length {
+      if let Option<Path>.Some { value: parent } = move run Path.parent(&old[file].path) {
+        run FileSystem.createDirectoriesRecursively(&parent)
+      }
+      run publish(&old[file].path, old[file].contents.asSlice())
+      file = file + 1
+    }
+    at = at + 1
+  }
 }

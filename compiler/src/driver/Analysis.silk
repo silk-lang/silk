@@ -2,6 +2,7 @@
 //! assembles the final profile. `silk build`, `silk check` and the language server share it; each
 //! reports a refusal its own way.
 
+import silk.system.host_input { HostInput, HostInputError }
 import driver.CompilationDefinition as Definitions
 import silk.build.definition { Definition }
 import silk.text.string { String }
@@ -24,11 +25,12 @@ import driver.ModuleSources as ModuleSourceFiles {
   ModuleSources,
   SourceSnapshot,
 }
-import driver.NativeLinkInput { InvalidNativeLinkInput, PlannedNative }
+import driver.NativeLinkInput { InvalidNativeLinkInput }
 import driver.Packages { InvalidDependency }
 import semantic.ExecutionStorage { ExecutionStorage }
 import semantic.FinalProfile { FinalProfile, Problem as ProfileProblem }
-import semantic.InitialProfile { InitialProfile }
+import semantic.InitialProfile { InitialProfile, Selection as RuntimeRequest }
+import semantic.StaticValue
 import semantic.ModuleId { InvalidModulePath, ModuleId }
 import semantic.ProfileAssembly { AssemblyProblem, assemble as assembleProfile }
 import semantic.ProfileBinding { BindingError, Supplied }
@@ -60,8 +62,9 @@ import silk.core.option { Option }
 import silk.core.result { Result }
 import silk.collections.slice { Slice }
 import silk.mem.shared { Shared }
+import silk.mem.box { Box }
 import silk.toml.scanner { TomlError }
-import silk.toml.value { Toml, Value as TomlValue }
+import silk.toml.value { Toml, Value as TomlValue, TomlChild }
 import silk.system.child_process { ChildProcess }
 import silk.num.usize
 
@@ -116,7 +119,12 @@ pub union Opened {
 // What evaluating one `build.silk` answers.
 union Evaluated {
   Planned { plan: Plan },
-  Refused { sources: ModuleSources, store: Semantic, rejection: Option<Shared<Rejection>>, reason: Bytes },
+  Refused {
+    sources: ModuleSources,
+    store: Semantic,
+    rejection: Option<Shared<Rejection>>,
+    reason: Bytes
+  },
 }
 
 /// Loads the program rooted at `sourcePath` (within `manifest`'s package when given), publishes
@@ -137,10 +145,11 @@ pub effect fn open(
   alias: Option<&[u8]>,
   summaries: Option<ImportSummaries>,
   snapshot: Option<SourceSnapshot>,
-  profileName: Option<&[u8]>,
   definition: Option<&Definition>,
+  unsandboxedTools: bool,
 ) -> Opened
-  ! FileError
+  ! HostInputError
+    | FileError
     | InvalidModulePath
     | InvalidSourceRoot
     | InvalidDependency
@@ -154,7 +163,7 @@ pub effect fn open(
     | Cycle
     | RevisionMismatch
     | OutOfMemoryError
-  ? &mut FileSystem | &mut ChildProcess | &mut Allocator | &mut Types {
+  ? &mut HostInput | &mut FileSystem | &mut ChildProcess | &mut Allocator | &mut Types {
   let target = Target.forId(Target.id(InitialProfile.target(profile)))
   let libc = match move InitialProfile.text(profile, b"libc") {
     Option<&[u8]>.Some { value } => run Bytes.copy(value)
@@ -169,11 +178,13 @@ pub effect fn open(
     }
   }
   let mut selectedRoot = Option<Path>.none()
-  if let Option<&Definition>.Some {value} = definition {
-    if let Option<String>.Some {value: root} = &value.settings.root { selectedRoot = Option<Path>.some(run Path.make(root.view())) }
+  if let Option<&Definition>.Some { value } = definition {
+    if let Option<String>.Some { value: root } = &value.settings.root {
+      selectedRoot = Option<Path>.some(run Path.make(root.view()))
+    }
   }
   let root = match &selectedRoot {
-    Option<Path>.Some {value} => Option<&Path>.some(&value)
+    Option<Path>.Some { value } => Option<&Path>.some(&value)
     Option<Path>.None => Option<&Path>.none()
   }
   let library = run copiedLibrary(&standardLibrary)
@@ -190,125 +201,20 @@ pub effect fn open(
         Bytes.asSlice(&libc),
         executable,
         run InitialProfile.runtimeRequest(profile),
-        profileName,
         root,
-        definition
+        definition,
       )
     }
-    Option<&Path>.None => run ModuleSourceFiles.make(
+    Option<&Path>.None => run ModuleSourceFiles.standalone(
       sourcePath,
       move standardLibrary,
-      store,
       Target.name(&target),
       Bytes.asSlice(&libc),
       executable,
-      run InitialProfile.runtimeRequest(profile)
+      run InitialProfile.runtimeRequest(profile),
     )
   }
-  // Each package's `build.silk` is evaluated first; its plan adds modules and `[native]` entries.
-  if let Option<Path>.Some { value: manifestPath } = &ownedManifest {
-    let mut plans = List<PlannedNative>.make()
-    let mut generated = List<Resolved>.make()
-    let mut owners = List<Bytes>.make()
-    let mut native = false
-    let policy = run toolPolicy(&manifestPath)
-    let rootDirectory = match move run Path.parent(&manifestPath) {
-      Option<Path>.Some { value } => move value
-      Option<Path>.None => { fail InvalidSourceRoot {} }
-    }
-    let mut at = usize.ZERO
-    while at < ModuleSourceFiles.packageCount(&sources) {
-      let directory = ModuleSourceFiles.packageDirectoryAt(&sources, at)
-      let buildFile = run Path.join(directory, "build.silk")
-      if run FileSystem.exists(&buildFile) {
-        let mut planBindings = List<Supplied>.make()
-        let mut suppliedPaths = List<String>.make()
-        if let Option<&Definition>.Some {value} = definition {
-          let owner = ModuleSourceFiles.packageIdentityAt(&sources, at)
-          planBindings = run Definitions.bindings(value, &sources, Option<&[u8]>.some(owner))
-          suppliedPaths = run Definitions.suppliedPaths(value, &sources, owner)
-        }
-        let evaluated = run evaluatePlan(
-          &buildFile,
-          directory,
-          ModuleSourceFiles.packageIdentityAt(&sources, at),
-          run copiedLibrary(&library),
-          profile,
-          &target,
-          Bytes.asSlice(&libc),
-          move planBindings
-        )
-        match move evaluated {
-          Evaluated.Planned { plan: evaluatedPlan } => {
-            let mut allowed = at == usize.ZERO
-            let listed = policy.allowed.asSlice()
-            let mut permission: usize = 0
-            while permission < listed.length {
-              if same(listed[permission].asSlice(), packageName(ModuleSourceFiles.packageIdentityAt(&sources, at))) { allowed = true }
-              permission = permission + 1
-            }
-            let cache = run Path.join(&rootDirectory, "build/steps")
-            let execution = run Effect.result(BuildPlans.execute(&evaluatedPlan, directory, &cache, allowed, move suppliedPaths))
-            let plan = match move execution {
-              Result<Resolved, StepFailure | SpawnError | Cancelled>.Success {value} => move value
-              Result<Resolved, StepFailure | SpawnError | Cancelled>.Failure {error} => {
-                let reason = match move error {
-                  OutOfMemoryError exhausted => { fail move exhausted }
-                  FileError failure => { fail move failure }
-                  StepError {message} => run Bytes.copy(String.ownedUtf8Bytes(&message))
-                  _ => run Bytes.copy(b"the package build graph failed while executing its declared steps")
-                }
-                let empty = Semantic.oneShot(run ModuleSourceFiles.revision(&sources), Target.forId(Target.id(&target)), Option<FinalProfile>.none())
-                return Opened.PlanRefused {sources: move sources, store: move empty, rejection: Option<Shared<Rejection>>.none(), file: run Bytes.copy(Path.rawBytes(&buildFile)), reason: move reason}
-              }
-            }
-            native = true
-            run plans.append(run NativeLinkInputs.planned(directory, &plan.native))
-            run List<Bytes>.append(&mut owners, run Bytes.copy(ModuleSourceFiles.packageIdentityAt(&sources, at)))
-            run generated.append(move plan)
-          }
-          Evaluated.Refused { sources: planSources, store: planStore, rejection, reason } => {
-            return Opened.PlanRefused {
-              sources: move planSources,
-              store: move planStore,
-              rejection: move rejection,
-              file: run Bytes.copy(Path.rawBytes(&buildFile)),
-              reason: move reason,
-            }
-          }
-        }
-      }
-      at = at + usize.ONE
-    }
-    if native {
-      sources = run ModuleSourceFiles.makePlanned(
-        sourcePath,
-        &manifestPath,
-        run copiedLibrary(&library),
-        store,
-        Target.name(&target),
-        Bytes.asSlice(&libc),
-        executable,
-        run InitialProfile.runtimeRequest(profile),
-        move plans,
-        profileName,
-        root,
-        definition
-      )
-    }
-    let planned = generated.asSlice()
-    let mut planAt = usize.ZERO
-    while planAt < planned.length {
-      let modules = planned[planAt].modules.asSlice()
-      let mut moduleAt = usize.ZERO
-      while moduleAt < modules.length {
-        run ModuleSourceFiles.addGeneratedFile(&mut sources, owners.asSlice()[planAt].asSlice(), &modules[moduleAt])
-        moduleAt = moduleAt + usize.ONE
-      }
-      planAt = planAt + usize.ONE
-    }
-  }
-  if let Option<&Definition>.Some {value} = definition {
+  if let Option<&Definition>.Some { value } = definition {
     let owner = run Bytes.copy(ModuleSourceFiles.packageIdentityAt(&sources, usize.ZERO))
     let modules = value.settings.modules.asSlice()
     let mut at = usize.ZERO
@@ -317,12 +223,175 @@ pub effect fn open(
       at = at + usize.ONE
     }
   }
+  if let Option<ImportSummaries>.Some { value } = move summaries {
+    ModuleSourceFiles.useSummaries(&mut sources, move value)
+  }
+  if let Option<SourceSnapshot>.Some { value } = move snapshot {
+    ModuleSourceFiles.useSnapshot(&mut sources, move value)
+  }
+
+  // Evaluate a reached package before following imports from its generated modules.
+  // Each package's `build.silk` is evaluated first; its plan adds modules and `[native]` entries.
+  if let Option<Path>.Some { value: manifestPath } = &ownedManifest {
+    let rootDirectory = match move run Path.parent(&manifestPath) {
+      Option<Path>.Some { value } => move value
+      Option<Path>.None => {
+        fail InvalidSourceRoot {}
+      }
+    }
+    let mut at = usize.ZERO
+    while true {
+      let policy = run toolPolicy(&manifestPath, &sources)
+      while at < ModuleSourceFiles.packageCount(&sources) {
+        let directory = run Path.fromBytes(
+          Path.rawBytes(ModuleSourceFiles.packageDirectoryAt(&sources, at)),
+        )
+        let owner = run Bytes.copy(ModuleSourceFiles.packageIdentityAt(&sources, at))
+        let buildFile = run Path.join(&directory, "build.silk")
+        if run FileSystem.exists(&buildFile) {
+          let mut planBindings = List<Supplied>.make()
+          let mut suppliedPaths = List<String>.make()
+          if let Option<&Definition>.Some { value } = definition {
+            planBindings = run Definitions.bindings(
+              value,
+              &sources,
+              Option<&[u8]>.some(owner.asSlice()),
+            )
+            suppliedPaths = run Definitions.suppliedPaths(value, &sources, owner.asSlice())
+          }
+          let evaluated = run evaluatePlan(
+            &buildFile,
+            &directory,
+            ModuleSourceFiles.packageIdentityAt(&sources, at),
+            run copiedLibrary(&library),
+            profile,
+            &target,
+            Bytes.asSlice(&libc),
+            move planBindings,
+          )
+          match move evaluated {
+            Evaluated.Planned { plan: evaluatedPlan } => {
+              let mut allowed = at == usize.ZERO
+              let listed = policy.allowed.asSlice()
+              let mut permission: usize = 0
+              while permission < listed.length {
+                if same(
+                  listed[permission].asSlice(),
+                  ModuleSourceFiles.packageIdentityAt(&sources, at),
+                ) {
+                  allowed = true
+                }
+                permission = permission + 1
+              }
+              let cache = run Path.join(&rootDirectory, "build/steps")
+              let execution = run Effect.result(
+                BuildPlans.execute(
+                  &evaluatedPlan,
+                  &directory,
+                  &cache,
+                  allowed,
+                  move suppliedPaths,
+                  unsandboxedTools,
+                  ModuleSourceFiles.packageArchivesAt(&sources, at),
+                ),
+              )
+              let plan = match move execution {
+                Result<Resolved, StepFailure | SpawnError | Cancelled>.Success {
+                  value
+                } => move value
+                Result<Resolved, StepFailure | SpawnError | Cancelled>.Failure { error } => {
+                  let reason = match move error {
+                    OutOfMemoryError exhausted => {
+                      fail move exhausted
+                    }
+                    FileError failure => {
+                      fail move failure
+                    }
+                    StepError { message } => run Bytes.copy(String.ownedUtf8Bytes(&message))
+                    _ => run Bytes.copy(
+                      b"the package build graph failed while executing its declared steps",
+                    )
+                  }
+                  let empty = Semantic.oneShot(
+                    run ModuleSourceFiles.revision(&sources),
+                    Target.forId(Target.id(&target)),
+                    Option<FinalProfile>.none(),
+                  )
+                  return Opened.PlanRefused {
+                    sources: move sources,
+                    store: move empty,
+                    rejection: Option<Shared<Rejection>>.none(),
+                    file: run Bytes.copy(Path.rawBytes(&buildFile)),
+                    reason: move reason,
+                  }
+                }
+              }
+              run ModuleSourceFiles.applyNativePlan(
+                &mut sources,
+                at,
+                run NativeLinkInputs.planned(&plan.native),
+                executable,
+              )
+              let modules = plan.modules.asSlice()
+              let mut moduleAt: usize = 0
+              while moduleAt < modules.length {
+                run ModuleSourceFiles.addGeneratedFile(
+                  &mut sources,
+                  owner.asSlice(),
+                  &modules[moduleAt],
+                )
+                moduleAt = moduleAt + 1
+              }
+            }
+            Evaluated.Refused { sources: planSources, store: planStore, rejection, reason } => {
+              return Opened.PlanRefused {
+                sources: move planSources,
+                store: move planStore,
+                rejection: move rejection,
+                file: run Bytes.copy(Path.rawBytes(&buildFile)),
+                reason: move reason,
+              }
+            }
+          }
+        }
+        at = at + usize.ONE
+      }
+      let application = if testing {
+        run ModuleSourceFiles.module(&sources, b"silk/testing/runner.silk")
+      } else {
+        ModuleId.copy(ModuleSourceFiles.entry(&sources))
+      }
+      run ModuleSourceFiles.preloadProgram(&mut sources, &application)
+      if !run ModuleSourceFiles.resolveDependencies(&mut sources) {
+        break
+      }
+    }
+  } else {
+    let application = ModuleId.copy(ModuleSourceFiles.entry(&sources))
+    while true {
+      run ModuleSourceFiles.preloadProgram(&mut sources, &application)
+      if !run ModuleSourceFiles.resolveDependencies(&mut sources) {
+        break
+      }
+    }
+  }
   if let Option<&[u8]>.Some { value } = move alias {
     run ModuleSourceFiles.aliasRoot(&mut sources, value)
   }
   let mut supplied = move bindings
-  if let Option<&Definition>.Some {value} = definition { run supplied.appendList(run Definitions.bindings(value, &sources, Option<&[u8]>.none())) }
-  return run analyze(move sources, profile, move supplied, testing, mode, move summaries, move snapshot, target)
+  if let Option<&Definition>.Some { value } = definition {
+    run supplied.appendList(run Definitions.bindings(value, &sources, Option<&[u8]>.none()))
+  }
+  return run analyze(
+    move sources,
+    profile,
+    move supplied,
+    testing,
+    mode,
+    Option<ImportSummaries>.none(),
+    Option<SourceSnapshot>.none(),
+    target,
+  )
 }
 
 // The dependency tool steps the root package authorizes.
@@ -330,35 +399,47 @@ struct ToolPolicy {
   allowed: List<Bytes>,
 }
 
-effect fn toolPolicy(manifest: &Path) -> ToolPolicy ! FileError | TomlError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+effect fn toolPolicy(manifest: &Path, sources: &ModuleSources) -> ToolPolicy
+  ! FileError | TomlError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
   let text = run FileSystem.readFile(manifest)
-  let document = run Toml.parse(Bytes.asSlice(&text))
+  let document = run Toml.parse(text.asSlice())
   let mut policy = ToolPolicy { allowed: List<Bytes>.make() }
-  if let Option<&TomlValue>.Some { value: listed } = move Toml.fieldAt(Toml.field(&document, "build"), "tools") {
-    let mut item = usize.ZERO
-    while true {
-      let named = match move Toml.item(listed, item) {
-        Option<&TomlValue>.Some { value } => value
-        Option<&TomlValue>.None => { break }
+  if let Option<&TomlValue>.Some { value: dependencies } = move Toml.field(
+    &document,
+    "dependencies",
+  ) {
+    if let TomlValue.Table { entries, .. } = &dependencies.* {
+      let listed = Box<List<TomlChild>>.get(&entries)[0].asSlice()
+      let mut at: usize = 0
+      while at < listed.length {
+        if let TomlChild.Member { entry } = &listed[at] {
+          if let Option<&TomlValue>.Some { value: flag } = move Toml.field(&entry.value, "tools") {
+            if let TomlValue.Boolean { value: allowed } = &flag.* {
+              if allowed {
+                if let Option<Bytes>.Some {
+                  value: identity
+                } = move run ModuleSourceFiles.selectedPackage(
+                  sources,
+                  String.ownedUtf8Bytes(&entry.key),
+                ) {
+                  run policy.allowed.append(move identity)
+                }
+              }
+            }
+          }
+        }
+        at = at + 1
       }
-      if let Option<string>.Some { value: name } = move Toml.asString(Option<&TomlValue>.some(named)) {
-        run List<Bytes>.append(&mut policy.allowed, run Bytes.copy(String.utf8Bytes(name)))
-      }
-      item = item + usize.ONE
     }
   }
   return move policy
 }
 
-// The name of the package `identity` (`name@version`).
-fn packageName(identity: &[u8]) -> &[u8] {
-  let mut at = usize.ZERO
-  while at < identity.length && identity[at] != 64 { at = at + usize.ONE }
-  return Slice.view<u8>(identity, usize.ZERO, at)
-}
-
 // A copy of the standard library directory.
-effect fn copiedLibrary(library: &Option<Path>) -> Option<Path> ! FileError | OutOfMemoryError ? &mut Allocator {
+effect fn copiedLibrary(library: &Option<Path>) -> Option<Path>
+  ! FileError | OutOfMemoryError
+  ? &mut Allocator {
   if let Option<Path>.Some { value } = &library.* {
     return Option<Path>.some(run Path.fromBytes(Path.rawBytes(&value)))
   }
@@ -367,7 +448,16 @@ effect fn copiedLibrary(library: &Option<Path>) -> Option<Path> ! FileError | Ou
 
 // Evaluates the `build.silk` at `buildFile` of the package in `directory` on its own and reads the
 // plan its `PLAN` constant holds.
-effect fn evaluatePlan(buildFile: &Path, directory: &Path, package: &[u8], standardLibrary: Option<Path>, profile: &InitialProfile, target: &Target, libc: &[u8], bindings: List<Supplied>) -> Evaluated
+effect fn evaluatePlan(
+  buildFile: &Path,
+  directory: &Path,
+  package: &[u8],
+  standardLibrary: Option<Path>,
+  profile: &InitialProfile,
+  target: &Target,
+  libc: &[u8],
+  bindings: List<Supplied>,
+) -> Evaluated
   ! FileError
     | InvalidModulePath
     | InvalidSourceRoot
@@ -383,13 +473,37 @@ effect fn evaluatePlan(buildFile: &Path, directory: &Path, package: &[u8], stand
     | RevisionMismatch
     | OutOfMemoryError
   ? &mut FileSystem | &mut Allocator | &mut Types {
-  let scriptSources = run ModuleSourceFiles.makeBuildScript(buildFile, directory, package, move standardLibrary, Target.name(target), libc)
-  let opened = run analyze(move scriptSources, profile, move bindings, false, StoreMode.Transient, Option<ImportSummaries>.none(), Option<SourceSnapshot>.none(), Target.forId(Target.id(target)))
+  let scriptSources = run ModuleSourceFiles.makeBuildScript(
+    buildFile,
+    directory,
+    package,
+    move standardLibrary,
+    Target.name(target),
+    libc,
+  )
+  let opened = run analyze(
+    move scriptSources,
+    profile,
+    move bindings,
+    false,
+    StoreMode.Transient,
+    Option<ImportSummaries>.none(),
+    Option<SourceSnapshot>.none(),
+    Target.forId(Target.id(target)),
+  )
   let declared = run declaresPlan(buildFile)
   let shape = b"it must declare `pub const PLAN: Plan` built with silk.build.plan"
   return match move opened {
     Opened.Ready { analysis } => {
-      let Analysis { sources: planSources, store, request, rootPackage: _, checked: _, identity, runtime: _ } = move analysis
+      let Analysis {
+        sources: planSources,
+        store,
+        request,
+        rootPackage: _,
+        checked: _,
+        identity,
+        runtime: _
+      } = move analysis
       let mut evaluating = move store
       if !declared {
         return Evaluated.Refused {
@@ -400,14 +514,25 @@ effect fn evaluatePlan(buildFile: &Path, directory: &Path, package: &[u8], stand
         }
       }
       let mut asked = move request
-      let answer = run Semantic.demandInitializer(&mut evaluating, &mut asked, &identity, BuildPlans.constantName())
+      let answer = run Semantic.demandInitializer(
+        &mut evaluating,
+        &mut asked,
+        &identity,
+        BuildPlans.constantName(),
+      )
       match move initializerData(&answer) {
         InitializerData.Data { value: data } => {
           let decoded = run Effect.result(BuildPlans.read(&data))
           match move decoded {
-            Result<Plan, InvalidStaticData | OutOfMemoryError>.Success {value} => { return Evaluated.Planned {plan: move value} }
-            Result<Plan, InvalidStaticData | OutOfMemoryError>.Failure {error} => match move error {
-              OutOfMemoryError exhausted => { fail move exhausted }
+            Result<Plan, InvalidStaticData | OutOfMemoryError>.Success { value } => {
+              return Evaluated.Planned { plan: move value }
+            }
+            Result<Plan, InvalidStaticData | OutOfMemoryError>.Failure {
+              error
+            } => match move error {
+              OutOfMemoryError exhausted => {
+                fail move exhausted
+              }
               InvalidStaticData {} => {}
             }
           }
@@ -415,7 +540,9 @@ effect fn evaluatePlan(buildFile: &Path, directory: &Path, package: &[u8], stand
             sources: move planSources,
             store: move evaluating,
             rejection: Option<Shared<Rejection>>.none(),
-            reason: run Bytes.copy(b"`PLAN` is not a plan; build it from `Plan.empty()` with silk.build.plan"),
+            reason: run Bytes.copy(
+              b"`PLAN` is not a plan; build it from `Plan.empty()` with silk.build.plan",
+            ),
           }
         }
         InitializerData.Refused { rejection } => Evaluated.Refused {
@@ -437,21 +564,32 @@ effect fn evaluatePlan(buildFile: &Path, directory: &Path, package: &[u8], stand
     }
     Opened.PlanRefused { sources, store, rejection, file, reason } => {
       drop file
-      return Evaluated.Refused { sources: move sources, store: move store, rejection: move rejection, reason: move reason }
+      return Evaluated.Refused {
+        sources: move sources,
+        store: move store,
+        rejection: move rejection,
+        reason: move reason,
+      }
     }
-    Opened.InvalidProfile => { fail InvalidSourceRoot {} }
+    Opened.InvalidProfile => {
+      fail InvalidSourceRoot {}
+    }
   }
 }
 
 // Whether the `build.silk` at `buildFile` names `PLAN` at all; one that does not is refused
 // without the evaluation's unknown-name rejection.
-effect fn declaresPlan(buildFile: &Path) -> bool ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+effect fn declaresPlan(buildFile: &Path) -> bool
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
   let text = run FileSystem.readFile(buildFile)
   let bytes = Bytes.asSlice(&text)
   let name = BuildPlans.constantName()
   let mut at = usize.ZERO
   while at + name.length <= bytes.length {
-    if same(Slice.view<u8>(bytes, at, name.length), name) { return true }
+    if same(Slice.view<u8>(bytes, at, name.length), name) {
+      return true
+    }
     at = at + usize.ONE
   }
   return false
@@ -459,7 +597,16 @@ effect fn declaresPlan(buildFile: &Path) -> bool ! FileError | OutOfMemoryError 
 
 // Publishes every module of `sources` reachable from its roots into a new store and assembles the
 // final profile.
-effect fn analyze(sources: ModuleSources, profile: &InitialProfile, bindings: List<Supplied>, testing: bool, mode: StoreMode, summaries: Option<ImportSummaries>, snapshot: Option<SourceSnapshot>, target: Target) -> Opened
+effect fn analyze(
+  sources: ModuleSources,
+  profile: &InitialProfile,
+  bindings: List<Supplied>,
+  testing: bool,
+  mode: StoreMode,
+  summaries: Option<ImportSummaries>,
+  snapshot: Option<SourceSnapshot>,
+  target: Target,
+) -> Opened
   ! FileError
     | InvalidModulePath
     | InvalidSourceRoot
@@ -476,11 +623,13 @@ effect fn analyze(sources: ModuleSources, profile: &InitialProfile, bindings: Li
   if let Option<&ModuleId>.Some { value } = move ModuleSourceFiles.runtime(&sources) {
     runtime = Option<ModuleId>.some(ModuleId.copy(value))
   }
+
   // A test build's application is the bundled runner; the source file is its discovery root.
   let mut application = ModuleId.copy(&identity)
   if testing {
     application = run ModuleSourceFiles.module(&sources, b"silk/testing/runner.silk")
   }
+
   // One build sees the whole program: every module reachable through imports from the build's
   // roots is published before semantic analysis starts.
   if let Option<ImportSummaries>.Some { value } = move summaries {
@@ -512,15 +661,25 @@ effect fn analyze(sources: ModuleSources, profile: &InitialProfile, bindings: Li
   let revision = run ModuleSourceFiles.revision(&sources)
   let mut store = Semantic.oneShot(move revision, target, Option<FinalProfile>.none())
   if mode == StoreMode.Revisable {
-    store = Semantic.make(run ModuleSourceFiles.revision(&sources), target, Option<FinalProfile>.none())
+    store = Semantic.make(
+      run ModuleSourceFiles.revision(&sources),
+      target,
+      Option<FinalProfile>.none(),
+    )
   } else if mode == StoreMode.Cached {
-    store = Semantic.cached(run ModuleSourceFiles.revision(&sources), target, Option<FinalProfile>.none())
+    store = Semantic.cached(
+      run ModuleSourceFiles.revision(&sources),
+      target,
+      Option<FinalProfile>.none(),
+    )
   }
   Semantic.offerParsed(&mut store, ModuleSourceFiles.takeParsed(&mut sources))
   let claimFree = ModuleSourceFiles.takeClaimFree(&mut sources)
   run Semantic.offerClaimFree(&mut store, List<ModuleId>.asSlice(&claimFree))
   Semantic.selectPackages(&mut store, run ModuleSourceFiles.packageGraph(&sources))
-  if let Option<&ExecutionStorage>.Some { value: storage } = move ModuleSourceFiles.executionStorage(&sources) {
+  if let Option<&ExecutionStorage>.Some {
+    value: storage
+  } = move ModuleSourceFiles.executionStorage(&sources) {
     Semantic.selectExecutionStorage(&mut store, run ExecutionStorage.copy(storage))
   }
   Semantic.selectRetention(&mut store, run ModuleSourceFiles.retention(&sources))
@@ -535,7 +694,7 @@ effect fn analyze(sources: ModuleSources, profile: &InitialProfile, bindings: Li
     Semantic.selectDiscovery(
       &mut store,
       ModuleId.copy(&identity),
-      run Bytes.copy(ModuleSourceFiles.moduleDirectory(&sources))
+      run Bytes.copy(ModuleSourceFiles.moduleDirectory(&sources)),
     )
     Semantic.selectDiscoveryExports(&mut store, run ModuleSourceFiles.exportedModules(&sources))
   }
@@ -554,11 +713,13 @@ effect fn analyze(sources: ModuleSources, profile: &InitialProfile, bindings: Li
       &mut store,
       &mut request,
       &value,
-      move bindings
+      move bindings,
     )
     Result<Registered, ShapeRefusal>.Failure { error } => {
       let refusal = match move error {
-        ShapeRefusal.Rejected { rejection } => Refusal.ParameterRejected { rejection: move rejection }
+        ShapeRefusal.Rejected { rejection } => Refusal.ParameterRejected {
+          rejection: move rejection,
+        }
         ShapeRefusal.Shape { problem } => Refusal.Shape { problem: problem }
       }
       return Opened.Refused { sources: move sources, store: move store, refusal: move refusal }
@@ -570,7 +731,9 @@ effect fn analyze(sources: ModuleSources, profile: &InitialProfile, bindings: Li
     }
     Result<FinalProfile, AssemblyProblem>.Failure { error } => {
       let refusal = match move error {
-        AssemblyProblem.Default { rejection } => Refusal.DefaultRejected { rejection: move rejection }
+        AssemblyProblem.Default { rejection } => Refusal.DefaultRejected {
+          rejection: move rejection,
+        }
         AssemblyProblem.Profile { error: problem } => Refusal.Profile { problem: problem }
         AssemblyProblem.Binding { error: refused } => Refusal.Binding { error: move refused }
         AssemblyProblem.InputMismatch => Refusal.InputMismatch
@@ -640,4 +803,74 @@ pub effect fn openRequest(
     move snapshot,
     Target.forId(Target.id(InitialProfile.target(profile))),
   )
+}
+
+/// Reads the task command catalog by static evaluation. It never evaluates package build plans,
+/// builds a task executable, or runs the task entry point.
+pub effect fn taskCommands(
+  source: &Path,
+  manifest: &Path,
+  standardLibrary: Option<Path>,
+  store: &Option<Path>,
+  profile: &InitialProfile,
+) -> Option<Bytes>
+  ! FileError
+    | InvalidModulePath
+    | InvalidSourceRoot
+    | InvalidDependency
+    | MissingManifest
+    | InvalidBuildComposition
+    | MissingStandardLibrary
+    | InvalidNativeLinkInput
+    | TomlError
+    | RegistrationClosed
+    | ConflictingPackageSource
+    | Cycle
+    | RevisionMismatch
+    | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator | &mut Types {
+  let target = InitialProfile.target(profile)
+  let libc = match move InitialProfile.text(profile, b"libc") {
+    Option<&[u8]>.Some { value } => value
+    Option<&[u8]>.None => b"none"
+  }
+  let cached = match &store.* {
+    Option<Path>.Some { value } => Option<&Path>.some(&value)
+    Option<Path>.None => Option<&Path>.none()
+  }
+  let sources = run ModuleSourceFiles.makeInPackage(
+    source,
+    manifest,
+    move standardLibrary,
+    cached,
+    Target.name(target),
+    libc,
+    false,
+    RuntimeRequest.None,
+    Option<&Path>.none(),
+    Option<&Definition>.none(),
+  )
+  let opened = run analyze(
+    move sources,
+    profile,
+    List<Supplied>.make(),
+    false,
+    StoreMode.Transient,
+    Option<ImportSummaries>.none(),
+    Option<SourceSnapshot>.none(),
+    Target.forId(Target.id(target)),
+  )
+  if let Opened.Ready { analysis: ready } = move opened {
+    let mut analysis = move ready
+    let answer = run Semantic.demandInitializer(
+      &mut analysis.store,
+      &mut analysis.request,
+      &analysis.identity,
+      b"COMMANDS",
+    )
+    if let InitializerData.Data { value } = move initializerData(&answer) {
+      return run StaticValue.textBytes(&value)
+    }
+  }
+  return Option<Bytes>.none()
 }

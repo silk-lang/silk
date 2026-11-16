@@ -102,6 +102,32 @@ A path supplied by the root command as a package parameter.
 pub path: string<'static>
 ```
 
+<a id="Input.Archive"></a>
+
+### `Archive`
+
+```silk
+Archive
+```
+
+A file in a native archive pinned by the declaring package manifest.
+
+<a id="Input.Archive.name"></a>
+
+#### Field `name`
+
+```silk
+pub name: string<'static>
+```
+
+<a id="Input.Archive.path"></a>
+
+#### Field `path`
+
+```silk
+pub path: string<'static>
+```
+
 <a id="Input.Output"></a>
 
 ### `Output`

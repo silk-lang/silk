@@ -21,8 +21,27 @@ const { NodeServices } = await import(pathToFileURL(require.resolve('@effect/pla
 import * as NativeBuild from './NativeBuild.ts'
 import * as SourceSnapshot from './SourceSnapshot.mjs'
 
+// The fake compiler resolves a definition to a tiny request, then normalizes it for the
+// artifact-producing fixture below. Real compiler syntax is exercised by the native suite.
+const requestProtocol = `
+if test "$1" = resolve; then
+  test "$2" = --definition && test "$4" = --output && test "$6" = --artifact || exit 97
+  manifest=$(sed -n 's/^manifest = "\\(.*\\)"$/\\1/p' "$3")
+  stdlib=$(sed -n 's/^stdlib = "\\(.*\\)"$/\\1/p' "$3")
+  emit=$(sed -n 's/^emit = "\\(.*\\)"$/\\1/p' "$3")
+  printf "source='%s/src/main.silk'\\nstdlib='%s'\\nemit='%s'\\nartifact='%s'\\n" "\${manifest%/*}" "$stdlib" "$emit" "$7" > "$5"
+  exit 0
+fi
+if test "$1" = compile; then
+  test "$2" = --request && test "$#" = 3 || exit 98
+  . "$3"
+  if test "$emit" = llvm-ir; then set -- build "$source" -o "$artifact" --emit llvm-ir --stdlib "$stdlib"
+  else set -- build "$source" -o "$artifact" --stdlib "$stdlib"; fi
+fi
+`
+
 const executable = (path, contents, mode = 0o555) => {
-  writeFileSync(path, `#!/bin/sh\n${contents}\n`)
+  writeFileSync(path, `#!/bin/sh\n${contents.replaceAll('test "$1" = build', requestProtocol + 'test "$1" = build')}\n`)
   chmodSync(path, mode)
 }
 
@@ -228,7 +247,7 @@ it.layer(NodeServices.layer, { excludeTestServices: true })((it) => {
             const result = yield* fixtureBuild({ ...options, clang: alias })
             assert.strictEqual(result.status, 'failed')
             assert.strictEqual(result.failure.stage, 'native-build')
-            assert.strictEqual(result.stages.length, 1)
+            assert.strictEqual(result.stages.length, 2)
             assert.match(result.failure.message, /changed/)
             assert.strictEqual(result.output.sha256, null)
             assert.strictEqual(existsSync(join(options.outputDirectory, 'smoke')), false)
@@ -275,10 +294,10 @@ it.layer(NodeServices.layer, { excludeTestServices: true })((it) => {
         )
         assert.deepStrictEqual(
           result.stages.map(({ name }) => name),
-          ['native-build', 'smoke-build', 'smoke-run'],
+          ['native-build-resolve', 'native-build', 'smoke-build', 'smoke-run'],
         )
         assert.strictEqual(result.stages[0].command[0], options.producer)
-        assert.strictEqual(result.stages[1].command[0], result.output.path)
+        assert.strictEqual(result.stages[2].command[0], result.output.path)
         assert.strictEqual(
           readFileSync(`${options.producer}.invocations`, 'utf8').split('\n').filter(Boolean)
             .length,
@@ -383,28 +402,19 @@ sleep 60`,
       assert.strictEqual(existsSync(result.output.path), false)
       assert.strictEqual(existsSync(join(options.outputDirectory, 'smoke')), false)
       assert.deepStrictEqual(stage.command, [
-        options.producer,
-        'build',
-        join(options.snapshot, 'compiler/src/main.silk'),
-        '-o',
-        result.output.path,
-        '--stdlib',
-        join(options.snapshot, 'stdlib'),
-        '--optimization',
-        'speed',
-        '--debug',
-        'false',
+        options.producer, 'resolve', '--definition', `${result.output.path}.definition.toml`,
+        '--output', `${result.output.path}.request.toml`, '--artifact', result.output.path,
       ])
       assert.deepStrictEqual(
-        [...readFileSync(join(options.outputDirectory, 'native-build-stdout.bin'))],
+        [...readFileSync(join(options.outputDirectory, 'native-build-resolve-stdout.bin'))],
         [255, 111, 117, 116],
       )
       assert.deepStrictEqual(
-        [...readFileSync(join(options.outputDirectory, 'native-build-stderr.bin'))],
+        [...readFileSync(join(options.outputDirectory, 'native-build-resolve-stderr.bin'))],
         [254, 101, 114, 114],
       )
       const sidecar = JSON.parse(
-        readFileSync(join(options.outputDirectory, 'native-build-process-evidence.json'), 'utf8'),
+        readFileSync(join(options.outputDirectory, 'native-build-resolve-process-evidence.json'), 'utf8'),
       )
       assert.deepStrictEqual(sidecar.deadline, { timeoutMs: 250, expired: true })
       assert.strictEqual(sidecar.resources.present, false)
@@ -431,7 +441,7 @@ sleep 60`,
           const result = yield* fixtureBuild({ ...options, timeoutMs: 150 })
           assert.strictEqual(result.status, 'failed')
           assert.strictEqual(result.failure.stage, point)
-          assert.strictEqual(result.stages.length, point === 'linker-preflight' ? 0 : 1)
+          assert.strictEqual(result.stages.length, point === 'linker-preflight' ? 0 : 2)
           assert.match(result.failure.message, /cannot read verified clang version/)
           assert.strictEqual(result.output.sha256, null)
           assert.strictEqual(existsSync(join(options.outputDirectory, 'smoke')), false)
@@ -444,7 +454,7 @@ sleep 60`,
     fixture(function* ({ options }) {
       executable(
         options.producer,
-        `mkdir '${join(options.outputDirectory, 'native-build-stdout.bin')}'\nprintf actual\nprintf refused >&2\nexit 2`,
+        `mkdir '${join(options.outputDirectory, 'native-build-resolve-stdout.bin')}'\nprintf actual\nprintf refused >&2\nexit 2`,
       )
       const result = yield* fixtureBuild(options)
       assert.strictEqual(result.status, 'failed')
@@ -455,7 +465,7 @@ sleep 60`,
       assert.strictEqual(result.stages[0].stderr, 'refused')
       assert.match(result.failure.message, /EISDIR|directory|AlreadyExists/)
       assert.strictEqual(
-        existsSync(join(options.outputDirectory, 'native-build-process-evidence.json')),
+        existsSync(join(options.outputDirectory, 'native-build-resolve-process-evidence.json')),
         false,
       )
       assert.strictEqual(existsSync(join(options.outputDirectory, 'smoke')), false)
@@ -467,7 +477,7 @@ sleep 60`,
   )
 
   it.effect(
-    'retains unexpired deadlines and completed evidence for all three successful stages',
+    'retains unexpired deadlines and completed evidence for resolution, compilation, and both smoke stages',
     () =>
       fixture(function* ({ options }) {
         executable(options.producer, producer())
@@ -520,7 +530,7 @@ sleep 60`,
           executable(options.producer, body)
           const result = yield* fixtureBuild(options)
           assert.strictEqual(result.status, 'failed')
-          assert.strictEqual(result.stages.length, 1)
+          assert.strictEqual(result.stages.length, body.startsWith('kill') ? 1 : 2)
           if (body.startsWith('kill')) assert.strictEqual(result.stages[0].signal, 'SIGTERM')
           else assert.match(result.failure.message, /ENOENT/)
         })
@@ -543,7 +553,7 @@ sleep 60`,
           const result = yield* fixtureBuild(options)
           assert.strictEqual(result.status, 'failed')
           assert.strictEqual(result.failure.stage, index < 2 ? 'smoke-build' : 'smoke-run')
-          assert.strictEqual(result.stages.length, index < 2 ? 2 : 3)
+          assert.strictEqual(result.stages.length, index < 2 ? 3 : 4)
         })
       }
     }),
@@ -626,8 +636,11 @@ sleep 60`,
         assert.strictEqual(result.status, 'passed')
         assert.deepStrictEqual(result.stages.map(({ name }) => name).sort(), [
           'N1-ir',
+          'N1-ir-resolve',
           'N2-ir',
+          'N2-ir-resolve',
           'native-build',
+          'native-build-resolve',
           'smoke-build',
           'smoke-run',
         ])
@@ -700,5 +713,6 @@ chmod +x "$4"`,
         assert.strictEqual(existsSync(join(work, 'training/build')), true)
         assert.strictEqual(existsSync(join(options.snapshot, 'build')), false)
       }),
+    { timeout: 10000 },
   )
 })

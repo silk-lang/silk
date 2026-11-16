@@ -69,7 +69,9 @@ static fn kind() -> KindOf<Self>
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> Self ! Issue | OutOfMemoryError ? &mut Allocator
+effect fn read<R: SchemaReader>(reader: &mut R) -> Self
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 <a id="Optimize.impl.Schema.write"></a>
@@ -77,8 +79,9 @@ effect fn read<R: SchemaReader>(reader: &mut R) -> Self ! Issue | OutOfMemoryErr
 ### Operation `write`
 
 ```silk
-effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
-    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator
+effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+    ! Issue | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator
 ```
 
 <a id="Optimize.impl.Schema.shape"></a>
@@ -86,7 +89,9 @@ effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
 ### Operation `shape`
 
 ```silk
-effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self>
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 <a id="Optimize.impl"></a>
@@ -120,7 +125,9 @@ impl FromArg for Optimize
 ### Operation `fromArg`
 
 ```silk
-effect fn fromArg(arg: Arg<'_>) -> Result<Self, bool> ! OutOfMemoryError ? &mut Allocator
+effect fn fromArg(arg: Arg<'_>) -> Result<Self, bool>
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 <a id="Optimize.impl.ArgValue"></a>
@@ -152,7 +159,9 @@ fn repeats() -> bool
 ### Operation `initial`
 
 ```silk
-effect fn initial() -> Self ! OutOfMemoryError ? &mut Allocator
+effect fn initial() -> Self
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 <a id="Optimize.impl.ArgValue.accept"></a>
@@ -160,7 +169,9 @@ effect fn initial() -> Self ! OutOfMemoryError ? &mut Allocator
 ### Operation `accept`
 
 ```silk
-effect fn accept(self: &mut Self, arg: Arg<'_>) -> bool ! OutOfMemoryError ? &mut Allocator
+effect fn accept(self: &mut Self, arg: Arg<'_>) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 <a id="Options"></a>
@@ -202,6 +213,16 @@ pub debug: Option<bool>
 ```
 
 An explicit debug-information choice; absent uses the compilation's mode default.
+
+<a id="Options.unsandboxedTools"></a>
+
+### Field `unsandboxedTools`
+
+```silk
+pub unsandboxedTools: bool
+```
+
+Authorizes package tools without a sandbox during this command.
 
 <a id="Options.impl"></a>
 

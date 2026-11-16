@@ -6,14 +6,16 @@ Owned schema output used by build keys, cached values, and compilation requests.
 
 Import as `Encoding` with `import silk.build.encoding as Encoding`.
 
-Public declarations: 2.
+Public declarations: 4.
 
 <a id="json"></a>
 
 ## `json`
 
 ```silk
-pub effect fn json<T: Schema>(value: &T) -> Bytes ! SchemaError | WriterError | OutOfMemoryError ? &mut Allocator
+pub effect fn json<T: Schema>(value: &T) -> Bytes
+  ! SchemaError | WriterError | OutOfMemoryError
+  ? &mut Allocator
 ```
 
 Encodes one value as JSON without decoding or retaining a second representation.
@@ -23,10 +25,36 @@ Encodes one value as JSON without decoding or retaining a second representation.
 ## `toml`
 
 ```silk
-pub effect fn toml<T: Schema>(value: &T) -> Bytes ! SchemaError | WriterError | OutOfMemoryError ? &mut Allocator
+pub effect fn toml<T: Schema>(value: &T) -> Bytes
+  ! SchemaError | WriterError | OutOfMemoryError
+  ? &mut Allocator
 ```
 
 Encodes one record as TOML without decoding or retaining a second representation.
+
+<a id="value"></a>
+
+## `value`
+
+```silk
+pub effect fn value<T: Schema>(input: &T) -> Bytes
+  ! SchemaError | WriterError | OutOfMemoryError
+  ? &mut Allocator
+```
+
+Encodes a cached graph value, preserving each layer of nested options.
+
+<a id="read"></a>
+
+## `read`
+
+```silk
+pub effect fn read<T: Schema>(bytes: &[u8]) -> T
+  ! SchemaError | OutOfMemoryError
+  ? &mut Allocator
+```
+
+Restores a cached graph value with its exact optional structure.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`, `wasm64-unknown-unknown`.

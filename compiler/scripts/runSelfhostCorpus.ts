@@ -364,7 +364,7 @@ export const defaultCCompiler = process.platform === 'win32' ? 'clang.exe' : '/u
 
 /**
  * Compiles each corpus C unit to an object beside the package with the C driver the compiler links
- * with, as the bootstrap's `compileCObject` does, and returns the manifest's link input entries.
+ * with, as the bootstrap's `compileCObject` does, and returns typed package-plan operations.
  */
 const nativeLinkInputs = async (
   directory: string,
@@ -386,7 +386,7 @@ const nativeLinkInputs = async (
     )
     if (compiled.error !== undefined || compiled.status !== 0 || compiled.signal !== null)
       throw new Error(`C unit ${unit}: ${processFailure(compiled)}`)
-    objects.push(`{ object = ${JSON.stringify(`${unit}.o`)} }`)
+    objects.push(`  plan = Plan.linkObject(plan, sourcePath(${JSON.stringify(`${unit}.o`)}))`)
   }
   if (process.platform === 'win32') {
     for (const [library, contents] of Object.entries(program.windowsImports)) {
@@ -397,14 +397,14 @@ const nativeLinkInputs = async (
       const compiled = await runProcess(dlltool, ['-m', 'i386:x86-64', '-d', `${library}.def`, '-l', `${library}.lib`], buildTimeoutMs, directory)
       if (compiled.error !== undefined || compiled.status !== 0 || compiled.signal !== null)
         throw new Error(`import library ${library}: ${processFailure(compiled)}`)
-      objects.push(`{ static-archive = ${JSON.stringify(`${library}.lib`)} }`)
+      objects.push(`  plan = Plan.linkArchive(plan, sourcePath(${JSON.stringify(`${library}.lib`)}))`)
     }
   }
   const libraries = (program.outcome.dynamicLibraries ?? []).filter((library) =>
     process.platform !== 'win32' || !(library in program.windowsImports),
   ).map((library) => {
     if (!safeName.test(library)) throw new Error(`unsafe corpus library name: ${library}`)
-    return `{ library = ${JSON.stringify(library)}, mode = "dynamic" }`
+    return `  plan = Plan.linkLibrary(plan, ${JSON.stringify(library)}, "dynamic", false, false)`
   })
   return [...objects, ...libraries]
 }
@@ -514,11 +514,13 @@ const writeProgram = async (
   writeFileSync(source, program.source)
   const linkInputs = await nativeLinkInputs(directory, program, cCompiler)
   const composition = componentComposition(program, stdlib)
-  const native = linkInputs.length === 0 ? '' : `\n[native]\nlink = [${linkInputs.join(', ')}]\n`
+  if (linkInputs.length > 0) writeFileSync(join(directory, 'build.silk'),
+    'import silk.build.plan { Plan }\nimport silk.build.step { sourcePath }\n' +
+    `static fn make() -> Plan {\n  let mut plan = Plan.empty()\n${linkInputs.join('\n')}\n  return plan\n}\npub const PLAN: Plan = make()\n`)
   const unstable = composition === undefined ? '' : `\n[unstable]\ncomposition = ${composition}\n`
   writeFileSync(
     join(directory, 'silk.toml'),
-    `[package]\nname = "corpus"\nversion = "0.1.0"\nsource = "."\n${native}${unstable}`,
+    `[package]\nname = "corpus"\nversion = "0.1.0"\nsource = "."\nmain = "${programModule}"\n${unstable}`,
   )
   for (const [module, contents] of Object.entries(program.imports)) {
     if (module.startsWith('/') || module.split('/').includes('..'))
@@ -554,6 +556,34 @@ const reportedDiagnostics = (
  * any other list is a diagnostic-parity gap: the program stays rejected, so the gap is reported,
  * not failed.
  */
+const buildProgram = Effect.fn('SelfhostCorpus.buildProgram')(function* (
+  silkc: string, directory: string, stdlib: string, optimization: string, debug: boolean,
+) {
+  const definition = join(directory, 'definition.toml')
+  const request = join(directory, 'request.toml')
+  const output = join(directory, process.platform === 'win32' ? 'program.exe' : 'program')
+  yield* Effect.try({
+    try: () => writeFileSync(definition, [
+      `manifest = ${JSON.stringify(join(directory, 'silk.toml'))}`,
+      'artifact = "executable"', `stdlib = ${JSON.stringify(stdlib)}`,
+      '[settings]', 'modules = []', '[settings.native]', 'sources = []', 'link = []',
+      '[settings.profile]', `optimization = ${JSON.stringify(optimization)}`, `debug = ${debug}`, '',
+    ].join('\n')),
+    catch: (cause) => new CorpusFixtureError({ reason: 'ExternalFailure', message: 'Could not write compilation definition', cause }),
+  })
+  for (const args of [
+    ['resolve', '--definition', definition, '--output', request, '--artifact', output],
+    ['compile', '--request', request],
+  ]) {
+    const result = yield* Effect.tryPromise({
+      try: () => runProcess(silkc, args, buildTimeoutMs, directory),
+      catch: (cause) => new CorpusFixtureError({ reason: 'ExternalFailure', message: 'Could not start compiler', cause }),
+    })
+    if (args[0] === 'compile' || result.error !== undefined || result.status !== 0 || result.signal !== null) return result
+  }
+  return yield* new CorpusFixtureError({ reason: 'ExternalFailure', message: 'Missing compilation command' })
+})
+
 const checkRejected = async (
   silkc: string,
   program: Corpus.Program,
@@ -561,12 +591,7 @@ const checkRejected = async (
   directory: string,
   stdlib: string,
 ): Promise<CaseResult> => {
-  const built = await runProcess(
-    silkc,
-    ['build', programModule, '-o', 'program', '--stdlib', stdlib],
-    buildTimeoutMs,
-    directory,
-  )
+  const built = await Effect.runPromise(buildProgram(silkc, directory, stdlib, 'none', true))
   if (built.error === undefined && built.status === 0 && built.signal === null) {
     const bodies = parseUncheckedBodies(built.stderr)
     if (coveredByUncheckedBodies(program.source, expected, bodies))
@@ -667,7 +692,7 @@ export const runCase = async (
   silkc: string,
   program: Corpus.Program,
   stdlib = fileURLToPath(new URL('../../stdlib', import.meta.url)),
-  cCompiler = defaultCCompiler,
+  cCompiler = process.env['SILK_CLANG'] ?? defaultCCompiler,
 ): Promise<CaseResult> => {
   const directory = mkdtempSync(join(tmpdir(), 'silk-selfhost-corpus-'))
   try {
@@ -685,23 +710,7 @@ export const runCase = async (
     // Every profile checks the same bodies, so the first build's gap stands for the program.
     let borrowGap: BorrowGap | undefined
     for (const profile of profiles) {
-      const built = await runProcess(
-        silkc,
-        [
-          'build',
-          programModule,
-          '-o',
-          outputName,
-          '--stdlib',
-          stdlib,
-          '--optimization',
-          profile.optimization,
-          '--debug',
-          String(profile.debug),
-        ],
-        buildTimeoutMs,
-        directory,
-      )
+      const built = await Effect.runPromise(buildProgram(silkc, directory, stdlib, profile.optimization, profile.debug))
       if (built.error !== undefined || built.status !== 0 || built.signal !== null) {
         const stderr = built.stderr
         // A semantic rejection is a failure even when the build also reached gaps beside it.

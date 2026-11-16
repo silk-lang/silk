@@ -74,6 +74,30 @@ pub language: string<'static>
 pub source: Input
 ```
 
+<a id="Operation.Compile.flags"></a>
+
+#### Field `flags`
+
+```silk
+pub flags: &'static [string<'static>]
+```
+
+<a id="Operation.Compile.include"></a>
+
+#### Field `include`
+
+```silk
+pub include: Option<&'static Chain<Input>>
+```
+
+<a id="Operation.Compile.pattern"></a>
+
+#### Field `pattern`
+
+```silk
+pub pattern: Option<string<'static>>
+```
+
 <a id="Operation.Flag"></a>
 
 ### `Flag`
@@ -250,6 +274,17 @@ Requirements in reverse insertion order; producers are retained by their deferre
 impl Plan
 ```
 
+<a id="Plan.impl.archivePath"></a>
+
+### Associated function `archivePath`
+
+```silk
+pub static fn archivePath(name: string<'static>, path: string<'static>) -> Deferred<Path>
+```
+
+Names a file or directory in this package's manifest-pinned native archive.
+The package plan resolves the target variant and root or machine override before running steps.
+
 <a id="Plan.impl.empty"></a>
 
 ### Associated function `empty`
@@ -309,6 +344,41 @@ pub static fn compileObjectiveCpp(self: Self, source: Deferred<Path>) -> Self
 ```
 
 Compiles a deferred Objective-C++ file into the package's native inputs.
+
+<a id="Plan.impl.compileNative"></a>
+
+### Method `compileNative`
+
+```silk
+pub static fn compileNative(
+    self: Self,
+    language: string<'static>,
+    source: Deferred<Path>,
+    flags: &'static [string<'static>],
+    include: &'static [Deferred<Path>],
+  ) -> Self
+```
+
+Compiles one translation unit with flags and include directories applying only to that file.
+`language` is `c`, `cpp`, `objc`, or `objcpp`. Package-wide flags and includes are also applied.
+
+<a id="Plan.impl.compileSources"></a>
+
+### Method `compileSources`
+
+```silk
+pub static fn compileSources(
+    self: Self,
+    language: string<'static>,
+    directory: Deferred<Path>,
+    pattern: string<'static>,
+    flags: &'static [string<'static>],
+    include: &'static [Deferred<Path>],
+  ) -> Self
+```
+
+Compiles matching files from a declared directory with flags and include paths for those files.
+Resolution expands the glob after any producer or pinned archive has supplied the directory.
 
 <a id="Plan.impl.cFlag"></a>
 
@@ -385,7 +455,13 @@ Supplies a deferred native linker script.
 ### Method `linkLibrary`
 
 ```silk
-pub static fn linkLibrary(self: Self, name: string<'static>, mode: string<'static>, weak: bool, needed: bool) -> Self
+pub static fn linkLibrary(
+    self: Self,
+    name: string<'static>,
+    mode: string<'static>,
+    weak: bool,
+    needed: bool,
+  ) -> Self
 ```
 
 Links a named library using static or dynamic search, optionally weak or retained.

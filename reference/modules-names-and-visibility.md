@@ -996,13 +996,11 @@ build checks and makes no artifact for), `static-library`, `shared-library` or `
 defaults to `0.0.0`. A name starts with a lowercase letter and holds lowercase letters, digits,
 `_` and `-`; `self`, `silk` and `silkc` are reserved.
 
-The canonical structural contract is
-[`compiler/manifest.schema.toml`](../compiler/manifest.schema.toml), a JSON Schema Draft 2020-12
-document written in TOML. The compiler embeds this schema and validates the root manifest, each
-workspace manifest and each dependency's manifest before decoding them. A dependency's manifest is
-validated after its `silk-version` is checked, so a dependency written for another Silk is refused
-for that first. Unknown fields are rejected outside `tool`. A field this schema does not list is
-an unknown field, whether a later Silk adds it or an earlier one had it: there are no aliases.
+The manifest's definition is [`silk.build.manifest.Manifest`](../stdlib/silk/build/manifest.silk).
+The compiler decodes root, workspace, and dependency manifests with the shared TOML schema reader.
+Unknown fields are rejected outside `tool`. `silk manifest-schema` derives the published JSON
+Schema from the same type. The published schema describes structure; the typed reader also checks
+relationships between fields, such as requiring a revision with a Git source.
 
 `[package]` also accepts publishing metadata that builds never read: `description`, `license`,
 `repository`, `homepage` and `readme` as strings, `authors` and `keywords` as arrays of strings.
@@ -1010,11 +1008,10 @@ an unknown field, whether a later Silk adds it or an earlier one had it: there a
 `silk change`. Unsupported tables and fields, such as `[dev-dependencies]`, are rejected as
 unknown fields.
 
-Validation maps TOML to the shared JSON value model without rounding numbers. TOML dates and times
-map to strings; mathematically integral floats satisfy JSON Schema's `integer` type. The compiler
-still checks TOML-specific value kinds, normalized path containment, target/profile compatibility,
-dependency resolution and other semantic constraints. The root `tool` value is omitted from schema
-validation, so even tool-owned non-finite numbers remain opaque.
+Validation reads TOML directly. Integer fields require TOML integers. A tool table's values are
+opaque, including dates and non-finite numbers; the table itself is required to be a table.
+Filesystem containment, dependency resolution, and target compatibility are checked when the
+compilation is resolved.
 
 Run `integration/json-schema-conformance/check-json-schema --manifest-schema` to verify the schema
 against the official metaschema, all tracked manifests and valid/invalid boundary fixtures.
@@ -1226,8 +1223,7 @@ directory.
 directory without a package manifest is an invalid-manifest error, as are a member listed twice and
 two members with the same package name, since they would share artifact paths. Every child
 directory of a `dir/*` entry must hold a package manifest. These errors are reported only to the
-workspace's members; a package the workspace does not list ignores it. A member's own `[build].output-dir` is an
-invalid-manifest error. A project command run on a manifest with only a `[workspace]` table is an
+workspace's members; a package the workspace does not list ignores it. Only `[workspace].output-dir` selects a shared output directory. A project command run on a manifest with only a `[workspace]` table is an
 invalid-manifest error that points to the member directories.
 
 **Evidence:** [native project manifests](../../../../compiler/src/driver/Project.silk),
@@ -1265,7 +1261,7 @@ ui = { workspace = true }
 The member's entry is read as if it wrote the workspace's fields itself, with one difference: a
 `path` in `[workspace.dependencies]` is relative to the workspace root's directory, so every member
 names the same package whatever its own depth. The dependency name is the key in both tables.
-`{ workspace = true }` works in `[dependencies]` and in a profile's `[profiles.<name>.dependencies]`.
+`{ workspace = true }` works in `[dependencies]`.
 The workspace of a package is the one PACKAGE-007 gives it: the nearest manifest at or above its
 directory with a `[workspace]` table that lists it, or its own manifest when that has the table. A
 package read from a git checkout or an archive finds its workspace inside that checkout or archive
@@ -1290,7 +1286,7 @@ such as one written as a `[dependencies.<name>]` table.
 **Evidence:** [workspace dependencies](../compiler/src/driver/WorkspaceDependencies.silk),
 [package dependency loading](../compiler/src/driver/Packages.silk),
 [pack archives](../compiler/src/driver/PackArchive.silk),
-[manifest schema](../compiler/manifest.schema.toml),
+[manifest schema](../stdlib/silk/build/manifest.schema.json),
 [native build contract](../compiler/scripts/test-native-build.ts).
 
 ## Implementation evidence

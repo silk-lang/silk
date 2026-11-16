@@ -441,6 +441,18 @@ The owner type of the parser. It has no fields and is never constructed.
 impl Cli
 ```
 
+<a id="Cli.impl.commands"></a>
+
+### Associated function `commands`
+
+```silk
+pub static fn commands<T: CommandLine>() -> string<'static>
+```
+
+Returns the root union's command names, separated by spaces, during static evaluation.
+A task module publishes this value as `COMMANDS` so the driver can select built-ins without
+compiling or executing its entry point.
+
 <a id="Cli.impl.parse"></a>
 
 ### Associated function `parse`

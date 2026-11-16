@@ -1,4 +1,4 @@
-# Compilation profiles and package configuration
+# Compilation settings and package parameters
 
 A compilation profile is the immutable logical input shared by static evaluation, semantic
 analysis, artifact planning and developer tools. The profile is published after package schemas,
@@ -18,7 +18,7 @@ The canonical targets are `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64
 with architecture, operating system, ABI, object format, endianness, primitive widths and
 alignments, address spaces, stack alignment, supported CPU features and toolchain class. Target
 selection is independent of the host. Only an application edge can explicitly supply host facts
-when neither a request nor a selected project profile names a target.
+when neither a request nor a compilation names a target.
 
 The Windows target uses the x86-64 instruction set, the Microsoft ABI, COFF objects and little-endian
 storage. Pointers are 64 bits with 8-byte alignment; C `long` is 32 bits with 4-byte alignment
@@ -58,13 +58,13 @@ The profile separates these domains:
 | Runtime               | default, named package composition, none                              |
 | Package configuration | typed values keyed by package/module/parameter identity               |
 
-A project profile may also set `max-memory`, the most linear memory a wasm32 module may grow to: a
+A compilation may also set `max-memory`, the most linear memory a wasm32 module may grow to: a
 whole number of bytes, `KiB`, `MiB` or `GiB` that is a positive multiple of the 64 KiB page and at
 most 4 GiB, such as `max-memory = "256MiB"`. It is a final-link setting, not an initial fact, so it
 never enters source specialization or its identity. Another target refuses it as an unsupported
 combination. A multi-threaded wasm32 profile defaults it to 1 GiB (THREAD-009).
 
-A project profile may also set `stack-size`, the wasm32 main thread's stack: a whole number of
+A compilation may also set `stack-size`, the wasm32 main thread's stack: a whole number of
 bytes, `KiB`, `MiB` or `GiB` that is a positive multiple of 16, below 4 GiB, and below `max-memory`
 when that is set, such as `stack-size = "8MiB"`. Without it the main stack is 1 MiB, the size the
 runtime gives each new thread (THREAD-009). The stack sits below the module's data, so a program
@@ -72,7 +72,7 @@ that recurses past it traps with an out-of-bounds memory access. Like `max-memor
 final-link setting outside the profile's identity, and another target refuses it as an
 unsupported combination.
 
-A profile may set `codegen-units`, a whole number from 1 to 256: how many codegen units an
+A compilation may set `codegen-units`, a whole number from 1 to 256: how many codegen units an
 optimized executable splits into (one module when unset or `1`). It changes no
 source-visible fact, but it is part of the profile's identity, so each count keeps its own cache.
 
@@ -128,35 +128,29 @@ optional element type, array length/element type, and record fields are checked 
 Callable values, runtime handles, resources, opaque identities and ambient capabilities are not
 configuration values.
 
-A manifest writes values under `[config]` (project tier) and a profile's `config` (override tier).
-A key is the root module's path and the parameter's name, as `main.limit = 42` or
-`net.http.retries = 3` for `net/http.silk`, in the manifest's own package. The value is plain TOML
-with no tags: an integer, a boolean, a string, or an array of them; an inline table inside an array
-is a record. Assembly checks it against the declared type, and a refusal names the manifest line of
-its key. Every manifest value has `literal` provenance.
+A command binds values with `Package.set(module, name, Deferred<T>)` and attaches that package
+configuration through `Compilation.package(alias, package)`. The alias must already be declared
+in `[dependencies]`; `self` selects the root package. A required public parameter without a
+binding fails when the compilation request is resolved, before code generation.
 
-`--profile-input` and other tools use the portable binding transport, which tags each value:
+`T` implements `Schema`, `Parameter`, and `Transferable`. The ordinary library encoder preserves
+nominal enum identity, integer precision, records, sequences and nested optional layers. A deferred
+producer is evaluated before the parameter is encoded. `Package.supplyPath` grants a package plan
+access to a physical path; `Package.path` instead resolves an included dependency asset.
 
-| Kind    | Transport                                                                       |
-| ------- | ------------------------------------------------------------------------------- |
-| Integer | `{ "kind": "integer", "value": "42" }`                                          |
-| Boolean | `{ "kind": "boolean", "value": true }`                                          |
-| String  | `{ "kind": "string", "value": "hello" }`                                        |
-| Enum    | `{ "kind": "enum", "type": "package@version/module/Type", "member": "Choice" }` |
-| None    | `{ "kind": "none" }`                                                            |
-| Some    | `{ "kind": "some", "value": <value> }`                                          |
-| Array   | `{ "kind": "array", "values": [<value>, ...] }`                                 |
-| Record  | `{ "kind": "record", "fields": { "field": <value>, ... } }`                     |
+The request uses the schema of `silk.build.request.ParameterValue`: `Text { value }`,
+`Boolean { value }`, `Integer { decimal }`, `Enum { nominal, member }`, `None`, `Some { value }`,
+`Sequence { values }`, and `Record { fields }`. Each record field has a name and another value.
+The schema readers and writers define the TOML and JSON representation; callers do not maintain
+another binding parser.
 
 Integer decimal strings avoid JSON numeric precision loss. Type checking supplies the declared
 integer width and record identity; external callers cannot forge a resolved static value.
 
-Each binding contains `package`, `module`, `parameter`, `value` and provenance. Its tier is assigned
-by the request that contains it. Project and workspace bindings have one shared tier. Artifact
-and selected-profile overrides have one higher tier. Package defaults have the lowest tier.
-Multiple bindings for one parameter at one tier are conflicts, including equal values. Every
-supplied binding is checked for identity, visibility, type and provenance. The highest valid tier
-wins and retains its origin.
+The resolved request records each parameter's canonical module, name, value and provenance.
+Explicit compilation bindings override package defaults. Multiple bindings for the same parameter
+at the same tier are conflicts, even when their values are equal. Every binding is checked for
+identity, visibility, type and provenance; a failed binding cannot become a source fact.
 
 Provenance is `literal`, `translated-public`, `secret`, `physical-supply` or `runtime`. Public
 translation supplies a concrete deterministic value and logical translator identity. Secret,
@@ -211,26 +205,24 @@ Ordinary Silk wrappers own nominal domain enums and ergonomic operations. Packag
 read by declaration identity, not through arbitrary library-field key lookup. No ordinal target
 `Profile` or `Intrinsic.targetProfile` operation exists.
 
-A manifest selects its default with `build.profile`; `[profiles.<name>]` contains logical profile
-inputs and `config`. `[config]` contains project-tier package parameter values, keyed by the root
-module's path and the parameter's name (`main.limit = 42`) and written as plain TOML that is checked
-against the parameter's declared type. A profile's `config` holds override-tier values. A profile
-that names no `target` builds for the host. Profile fields are kebab-case (`code-model`,
-`max-memory`, `stack-size`); `codeModel` and `maxMemory` are unknown fields, and the message
-suggests `code-model` and `max-memory`. A profile's `backend` (`--backend` on the command line) picks the code generator: `llvm`, the
-default, or `direct`, which writes wasm32 executables itself, without Clang. A `wasm32-wasip2`
-component still needs wasm-tools and the Preview 1 adapter, as with `llvm`. `--profile-input` JSON keeps `codeModel`, `maxMemory`, `stackSize`, `codegenUnits` and tagged `bindings`. Without a table
-of that name, `dev` (unoptimized, with debug information) and `release` (optimized, without it) are
-built-in profiles for the host. `--release` and `--optimization release` build the manifest's
-`[profiles.release]` when it declares one, as `--profile release` does; with `--target`, each
-target replaces the table's own. A complete request override replaces project profile selection. CLI `--profile`
-and LSP profile-name settings select a project profile; `--profile-input` and its LSP equivalent
-provide the complete input object; target-triple shorthand selects a default logical input for
-that target. Conflicting explicit modes are errors. Without an explicit mode, tooling uses the
-project default, then an explicitly supplied host fallback. Compiler and language-server analysis
-consume the same normalized model.
+Commands select settings through `Compilation`; built-in commands expose `--target`,
+`--optimization none|speed|size`, `--release`, and `--debug`. The default is host-target development:
+unoptimized with debug information. Release selects speed with debug information disabled unless
+explicitly requested. Requests carry the complete normalized profile, using kebab-case schema keys.
+`backend` selects LLVM or the direct WebAssembly backend. Preview 2 components also need wasm-tools.
 
-Named entry/runtime selections expose their kind separately from their name. A named value spelled `default` remains distinct from the default request.
+The language server selects a saved compilation request and uses its package graph, parameters,
+native inputs and profile. It may refresh the graph through a sandboxed `plan` task in a trusted
+workspace. Read-only source commands never execute a task. There are no named manifest profiles or
+JSON command-line profile overrides.
+
+Per-package `Package.optimize` and `Package.debug` affect code defined by that package, including
+generic instantiations used elsewhere. They do not change `silk.core.compilation` queries or
+semantic cache identity. Units with distinct settings are optimized separately without cross-unit
+inlining; intermediate outputs preserve those settings too. Program settings remain the defaults
+for packages without an override.
+
+Entry and runtime selections use `default`, `none`, or a named symbol/composition.
 
 ## PROFILE-006 — CPU models and features
 
@@ -262,11 +254,11 @@ AArch64 Mac, also guarantees `aes`, `crc`, `crypto`, `dotprod`, `fullfp16`, `lse
 `avx512vl`). A native build always names its model to Clang, and a ThinLTO link generates code for the same
 model and features.
 
-In a manifest profile, `cpu.model = "native"` asks the machine that runs the compiler, through
-`silk.simd.cpu`, and adds each catalog feature it has to `cpu.features`; the model stays the default.
+At the command-line edge, `--cpu native` asks the machine that runs the compiler, through
+`silk.simd.cpu`, and adds each catalog feature it has to the compilation CPU features; the model stays the default.
 The frozen profile therefore names a concrete feature list, and two machines with the same
 features share caches. Only the compiler's own target can be native; another target with
-`native` is an unsupported combination of `cpu.model`. `InitialProfile.freeze` itself never
+`native` is an unsupported combination of CPU selection. `InitialProfile.freeze` itself never
 reads the host.
 
 ## PROFILE-007 — Profile-guided optimization
@@ -300,34 +292,14 @@ Windows, or in a build with debug information, the program stays one module.
 
 ## PROFILE-008 — Generated source
 
-A package author declares each generator as a `[[generate]]` entry in the package manifest or the
-workspace manifest. `run` is the command line: the program, then its arguments. A program spelled
-with a `/` is a path below the manifest's directory; a bare name is searched on `PATH`. `outputs`
-lists the files it writes, as paths below the manifest's directory; a `*` in the last segment
-matches any run of bytes.
+Generated modules are graph outputs. Use `WriteFiles` for authored text, `Run` for an external
+generator, or an ordinary type implementing `Step` for a custom generator. Pass a producer's
+`Deferred<Path>` to `Compilation.moduleFile` or `Plan.module`. The runner executes reachable
+producers before resolving the compilation and fingerprints their inputs and outputs.
 
-```toml
-[[generate]]
-run = ["scripts/generate-unicode", "--pinned"]
-outputs = ["src/generated_tables.silk", "src/generated_*.silk"]
-```
-
-`silk generate [--check] [--manifest-path <path>]` runs the located manifest's entries in order
-and then, for a workspace, each member's. A command runs in its manifest's directory with the
-caller's environment plus `SILK_GENERATE=1` (Windows passes on the common system, user and Cargo
-variables). While it runs, its declared outputs that already exist are moved aside to
-`.<name>.silk-generate` beside them. An output it then writes with the same bytes gets the
-original file back, so an unchanged rerun keeps every file's identity and modification time and
-invalidates no build cache. The command prints `Created`, `Updated` or `Removed` for each output
-that changed.
-
-`--check` restores every original and removes every new file, so it never changes the tree, and
-exits 1 naming each output that is stale, would be created or would be removed. A command that
-fails or exits nonzero, or does not write an output declared without a `*`, leaves every output
-as it was and makes `silk generate` exit 1. A manifest it cannot use exits 2.
-
-Generated files are committed. `silk build`, `silk check` and dependents never run an entry; they
-only refuse a malformed one, naming its manifest line.
+Maintenance generation belongs in an ordinary task variant. A task that updates committed source
+can expose its own check mode and compare the resulting bytes. Fetching or importing a package
+never runs a maintenance task. Manifests do not describe generators or build hooks.
 
 ## PROFILE-009 — Build plans
 
@@ -365,7 +337,7 @@ object, search-directory, linker-script, and function-order methods also accept 
 A plan contributes its requirements whenever the package is compiled. Invalid plans, missing
 outputs, duplicate modules, and modules that shadow existing package files refuse the build.
 
-Parameters declared by `build.silk` are bound only in its isolated analysis. `Package.path` grants
+Parameters declared by `build.silk` are bound only in its isolated analysis. `Package.supplyPath` grants
 read access to an explicitly supplied host path through a text parameter in that file. Such a
 parameter cannot become a source-code parameter or a source profile identity.
 
@@ -396,12 +368,11 @@ output. Its executable, arguments, declared file and tree contents, sandbox laun
 keys determine its cache identity. Package plans cannot capture ambient environment variables.
 `WriteFiles` runs through the same graph without starting a process and requires no tool permission.
 
-The root package's steps always run. A dependency's steps run only when the root manifest lists
-the dependency by name:
+The root package's steps always run. A dependency's steps run only when the dependency entry grants tool permission:
 
 ```toml
-[build]
-tools = ["tables"]
+[dependencies]
+tables = { path = "../tables", tools = true }
 ```
 
 A step runs in an operating-system sandbox. On Linux 6.7 or newer it runs under Landlock: it reads
@@ -410,7 +381,9 @@ and its declared inputs, writes only its output directory, and can neither bind 
 socket; where the kernel allows an unprivileged user namespace, it also has no network interface
 but loopback. On macOS it runs through `sandbox-exec` with a profile that denies everything but
 running programs, reading the system directories, its program and its inputs, and reading and
-writing its output directory, so it has no network at all. Build tools always require a supported sandbox; any other host refuses them.
+writing its output directory, so it has no network at all. A host without a supported sandbox refuses tools unless the command explicitly selects
+`--unsandboxed-tools`. That choice runs the package tools with the caller's rights and is part of
+the request-resolution cache key. Editor refresh never enables it.
 `SILK_NO_TOOL_SANDBOX` set makes a host behave as one without a sandbox.
 
 ## PROFILE-011 — Project templates
@@ -446,7 +419,7 @@ workspace's members are part of their workspace. Each line gives the name `--tem
 one.
 
 A template adjusts the new project with `[[post-init]]` entries in its `silk.toml`. `run` is the
-command line, spelled as a `[[generate]]` entry's: the program, then its arguments, where a
+command line: the program, then its arguments, where a
 program with a `/` is a path below the template's directory and a bare name is searched on `PATH`.
 `arguments = true` also passes the entry every argument given after `--`.
 

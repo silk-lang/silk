@@ -61,20 +61,43 @@ Selects debug information for code defined in this package.
 ### Method `set`
 
 ```silk
-pub effect fn set(self: Self, module: string, name: string, value: Deferred<ParameterValue>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn set<T: Schema + ParameterInput + Transferable + 'static>(
+    self: Self,
+    module: string,
+    name: string,
+    value: Deferred<T>,
+  ) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Binds a typed value to a public parameter declared in `module`, such as `build.silk`.
 
-<a id="Package.impl.path"></a>
+<a id="Package.impl.supplyPath"></a>
 
-### Method `path`
+### Method `supplyPath`
 
 ```silk
-pub effect fn path(self: Self, module: string, name: string, value: Deferred<Path>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn supplyPath(self: Self, module: string, name: string, value: Deferred<Path>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Grants the package's plan read access to a declared path parameter.
+
+<a id="Package.impl.path"></a>
+
+### Associated function `path`
+
+```silk
+pub effect fn path(name: string, subpath: string) -> Deferred<Path>
+    ! StepFailure
+    ? &mut Allocator | &mut HostInput | &mut FileSystem
+```
+
+Names a file or directory listed in a declared dependency's `package.include`.
+Only a consumer's use resolves and fetches the dependency. No package code is evaluated.
+The consumer keys the referenced file or tree, including changes to a local dependency.
 
 <a id="Package.impl.without"></a>
 
@@ -91,7 +114,9 @@ Excludes this dependency from the compilation's available import graph.
 ## `key`
 
 ```silk
-pub effect fn key(package: &Package, key: &mut Key) -> () ! StepFailure ? &mut Allocator
+pub effect fn key(package: &Package, key: &mut Key) -> ()
+  ! StepFailure
+  ? &mut Allocator
 ```
 
 Declares the deferred values and supplied paths that determine the override.
@@ -101,7 +126,9 @@ Declares the deferred values and supplied paths that determine the override.
 ## `resolve`
 
 ```silk
-pub effect fn resolve(package: &Package, make: &mut Make) -> Definitions.Package ! StepFailure ? &mut Allocator
+pub effect fn resolve(package: &Package, make: &mut Make) -> Definitions.Package
+  ! StepFailure
+  ? &mut Allocator
 ```
 
 Resolves overrides only after every declared producer has completed.

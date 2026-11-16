@@ -23,7 +23,9 @@ Adds a length-delimited byte string to a SHA-256 stream.
 ## `name`
 
 ```silk
-pub effect fn name(digest: &[u8; 32]) -> String ! OutOfMemoryError ? &mut Allocator
+pub effect fn name(digest: &[u8; 32]) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator
 ```
 
 Converts a digest into the lowercase hexadecimal directory name used by the build cache.
@@ -34,11 +36,12 @@ Converts a digest into the lowercase hexadecimal directory name used by the buil
 
 ```silk
 pub effect fn path(hash: &mut Sha256, input: &Path, completion: bool) -> ()
-! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator
 ```
 
 Hashes file contents or a sorted tree, including names and empty directories.
-Symbolic links are refused, so declared trees cannot escape through a link.
+Symbolic links within the declared root are followed; escaping links and cycles are refused.
 `completion` excludes the root cache marker when verifying completed outputs.
 
 <a id="package"></a>
@@ -47,7 +50,8 @@ Symbolic links are refused, so declared trees cannot escape through a link.
 
 ```silk
 pub effect fn package(hash: &mut Sha256, input: &Path, output: &Path) -> ()
-! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator
 ```
 
 Hashes a package's files, excluding build outputs and root version-control metadata.

@@ -6,7 +6,7 @@ Compilations as build steps that write explicit requests before invoking the com
 
 Import as `Compilation` with `import silk.build.compilation { Compilation }`.
 
-Public declarations: 2.
+Public declarations: 1.
 
 <a id="Compilation"></a>
 
@@ -31,8 +31,13 @@ impl Compilation
 ### Method `when`
 
 ```silk
-pub effect fn when<'env, E, ?R>(self: Self, condition: bool,
-    transform: once effect fn<'env>(Self) -> Self ! E ? R) -> Self ! E ? R
+pub effect fn when<'env, E, ? R>(
+    self: Self,
+    condition: bool,
+    transform: once effect fn<'env>(Self) -> Self ! E ? R,
+  ) -> Self
+    ! E
+    ? R
 ```
 
 Applies `transform` when `condition` is true, returning the original value otherwise.
@@ -42,7 +47,9 @@ Applies `transform` when `condition` is true, returning the original value other
 ### Associated function `fromDefinition`
 
 ```silk
-pub effect fn fromDefinition(definition: Definition, compiler: Deferred<Path>) -> Self ! StepFailure ? &mut Allocator | &mut FileSystem
+pub effect fn fromDefinition(definition: Definition, compiler: Deferred<Path>) -> Self
+    ! StepFailure
+    ? &mut Allocator | &mut FileSystem
 ```
 
 Creates a compilation from an explicit package definition and compiler. Resolution runs as a graph prerequisite.
@@ -52,17 +59,23 @@ Creates a compilation from an explicit package definition and compiler. Resoluti
 ### Associated function `fromPackage`
 
 ```silk
-pub effect fn fromPackage() -> Self ! StepFailure ? &mut Allocator | &mut FileSystem | &mut HostInput
+pub effect fn fromPackage(options: &Options) -> Self
+    ! StepFailure
+    ? &mut Allocator | &mut FileSystem | &mut HostInput
 ```
 
-Uses the current package's default root and artifact.
+Uses the current package's default root and artifact with the command's options.
+A compilation selects at most one target. Commands building several targets create one
+compilation per target and add them to a Build.
 
 <a id="Compilation.impl.executable"></a>
 
 ### Associated function `executable`
 
 ```silk
-pub effect fn executable(name: string, root: string) -> Self ! StepFailure ? &mut Allocator | &mut FileSystem | &mut HostInput
+pub effect fn executable(name: string, root: string) -> Self
+    ! StepFailure
+    ? &mut Allocator | &mut FileSystem | &mut HostInput
 ```
 
 Creates a program named `name` with `root` resolved against the package directory.
@@ -72,7 +85,9 @@ Creates a program named `name` with `root` resolved against the package director
 ### Associated function `loadableModule`
 
 ```silk
-pub effect fn loadableModule(name: string, root: string) -> Self ! StepFailure ? &mut Allocator | &mut FileSystem | &mut HostInput
+pub effect fn loadableModule(name: string, root: string) -> Self
+    ! StepFailure
+    ? &mut Allocator | &mut FileSystem | &mut HostInput
 ```
 
 Creates a loadable module named `name` with `root` resolved against the package directory.
@@ -82,7 +97,9 @@ Creates a loadable module named `name` with `root` resolved against the package 
 ### Associated function `staticArchive`
 
 ```silk
-pub effect fn staticArchive(name: string, root: string) -> Self ! StepFailure ? &mut Allocator | &mut FileSystem | &mut HostInput
+pub effect fn staticArchive(name: string, root: string) -> Self
+    ! StepFailure
+    ? &mut Allocator | &mut FileSystem | &mut HostInput
 ```
 
 Creates a static archive named `name` with `root` resolved against the package directory.
@@ -92,7 +109,9 @@ Creates a static archive named `name` with `root` resolved against the package d
 ### Associated function `object`
 
 ```silk
-pub effect fn object(name: string, root: string) -> Self ! StepFailure ? &mut Allocator | &mut FileSystem | &mut HostInput
+pub effect fn object(name: string, root: string) -> Self
+    ! StepFailure
+    ? &mut Allocator | &mut FileSystem | &mut HostInput
 ```
 
 Creates a relocatable object named `name` with `root` resolved against the package directory.
@@ -102,7 +121,9 @@ Creates a relocatable object named `name` with `root` resolved against the packa
 ### Associated function `test`
 
 ```silk
-pub effect fn test(name: string, root: string) -> Self ! StepFailure ? &mut Allocator | &mut FileSystem | &mut HostInput
+pub effect fn test(name: string, root: string) -> Self
+    ! StepFailure
+    ? &mut Allocator | &mut FileSystem | &mut HostInput
 ```
 
 Creates a test runner named `name` with `root` resolved against the package directory.
@@ -112,7 +133,9 @@ Creates a test runner named `name` with `root` resolved against the package dire
 ### Method `package`
 
 ```silk
-pub effect fn package(self: Self, alias: string, settings: Package) -> Self ! StepFailure ? &mut Allocator
+pub effect fn package(self: Self, alias: string, settings: Package) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Configures one declared dependency alias, or `self` for this package.
@@ -122,7 +145,9 @@ Configures one declared dependency alias, or `self` for this package.
 ### Method `without`
 
 ```silk
-pub effect fn without(self: Self, alias: string) -> Self ! StepFailure ? &mut Allocator
+pub effect fn without(self: Self, alias: string) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Removes a declared dependency from this compilation's available imports.
@@ -132,7 +157,9 @@ Removes a declared dependency from this compilation's available imports.
 ### Method `target`
 
 ```silk
-pub effect fn target(self: Self, value: Deferred<String>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn target(self: Self, value: Deferred<String>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Sets `target` from a declared deferred value.
@@ -142,7 +169,9 @@ Sets `target` from a declared deferred value.
 ### Method `cpu`
 
 ```silk
-pub effect fn cpu(self: Self, value: Deferred<String>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn cpu(self: Self, value: Deferred<String>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Sets `cpu` from a declared deferred value.
@@ -152,7 +181,9 @@ Sets `cpu` from a declared deferred value.
 ### Method `deployment`
 
 ```silk
-pub effect fn deployment(self: Self, value: Deferred<String>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn deployment(self: Self, value: Deferred<String>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Sets `deployment` from a declared deferred value.
@@ -162,7 +193,9 @@ Sets `deployment` from a declared deferred value.
 ### Method `libc`
 
 ```silk
-pub effect fn libc(self: Self, value: Deferred<String>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn libc(self: Self, value: Deferred<String>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Sets `libc` from a declared deferred value.
@@ -172,7 +205,9 @@ Sets `libc` from a declared deferred value.
 ### Method `entry`
 
 ```silk
-pub effect fn entry(self: Self, value: Deferred<String>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn entry(self: Self, value: Deferred<String>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Sets `entry` from a declared deferred value.
@@ -182,7 +217,9 @@ Sets `entry` from a declared deferred value.
 ### Method `runtime`
 
 ```silk
-pub effect fn runtime(self: Self, value: Deferred<String>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn runtime(self: Self, value: Deferred<String>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Sets `runtime` from a declared deferred value.
@@ -192,7 +229,9 @@ Sets `runtime` from a declared deferred value.
 ### Method `link`
 
 ```silk
-pub effect fn link(self: Self, value: Deferred<String>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn link(self: Self, value: Deferred<String>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Sets `link` from a declared deferred value.
@@ -202,7 +241,9 @@ Sets `link` from a declared deferred value.
 ### Method `codeModel`
 
 ```silk
-pub effect fn codeModel(self: Self, value: Deferred<String>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn codeModel(self: Self, value: Deferred<String>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Sets `codeModel` from a declared deferred value.
@@ -212,7 +253,9 @@ Sets `codeModel` from a declared deferred value.
 ### Method `relocation`
 
 ```silk
-pub effect fn relocation(self: Self, value: Deferred<String>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn relocation(self: Self, value: Deferred<String>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Sets `relocation` from a declared deferred value.
@@ -222,7 +265,9 @@ Sets `relocation` from a declared deferred value.
 ### Method `safety`
 
 ```silk
-pub effect fn safety(self: Self, value: Deferred<String>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn safety(self: Self, value: Deferred<String>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Sets `safety` from a declared deferred value.
@@ -232,7 +277,9 @@ Sets `safety` from a declared deferred value.
 ### Method `threading`
 
 ```silk
-pub effect fn threading(self: Self, value: Deferred<String>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn threading(self: Self, value: Deferred<String>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Sets `threading` from a declared deferred value.
@@ -242,7 +289,9 @@ Sets `threading` from a declared deferred value.
 ### Method `unwind`
 
 ```silk
-pub effect fn unwind(self: Self, value: Deferred<String>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn unwind(self: Self, value: Deferred<String>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Sets `unwind` from a declared deferred value.
@@ -252,7 +301,9 @@ Sets `unwind` from a declared deferred value.
 ### Method `backend`
 
 ```silk
-pub effect fn backend(self: Self, value: Deferred<String>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn backend(self: Self, value: Deferred<String>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Sets `backend` from a declared deferred value.
@@ -262,7 +313,9 @@ Sets `backend` from a declared deferred value.
 ### Method `codegenUnits`
 
 ```silk
-pub effect fn codegenUnits(self: Self, value: Deferred<u64>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn codegenUnits(self: Self, value: Deferred<u64>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Sets `codegenUnits` from a declared deferred value.
@@ -272,7 +325,9 @@ Sets `codegenUnits` from a declared deferred value.
 ### Method `maxMemory`
 
 ```silk
-pub effect fn maxMemory(self: Self, value: Deferred<u64>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn maxMemory(self: Self, value: Deferred<u64>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Sets `maxMemory` from a declared deferred value.
@@ -282,7 +337,9 @@ Sets `maxMemory` from a declared deferred value.
 ### Method `stackSize`
 
 ```silk
-pub effect fn stackSize(self: Self, value: Deferred<u64>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn stackSize(self: Self, value: Deferred<u64>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Sets `stackSize` from a declared deferred value.
@@ -292,7 +349,9 @@ Sets `stackSize` from a declared deferred value.
 ### Method `cpuFeatures`
 
 ```silk
-pub effect fn cpuFeatures(self: Self, value: Deferred<List<String>>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn cpuFeatures(self: Self, value: Deferred<List<String>>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Sets `cpuFeatures` from a declared deferred value.
@@ -302,7 +361,9 @@ Sets `cpuFeatures` from a declared deferred value.
 ### Method `sanitizers`
 
 ```silk
-pub effect fn sanitizers(self: Self, value: Deferred<List<String>>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn sanitizers(self: Self, value: Deferred<List<String>>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Sets `sanitizers` from a declared deferred value.
@@ -312,7 +373,9 @@ Sets `sanitizers` from a declared deferred value.
 ### Method `optimize`
 
 ```silk
-pub effect fn optimize(self: Self, value: Deferred<Optimize>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn optimize(self: Self, value: Deferred<Optimize>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Sets `optimize` from a declared deferred value.
@@ -322,7 +385,9 @@ Sets `optimize` from a declared deferred value.
 ### Method `debug`
 
 ```silk
-pub effect fn debug(self: Self, value: Deferred<bool>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn debug(self: Self, value: Deferred<bool>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Sets `debug` from a declared deferred value.
@@ -332,7 +397,9 @@ Sets `debug` from a declared deferred value.
 ### Method `runner`
 
 ```silk
-pub effect fn runner(self: Self, value: Deferred<Runner>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn runner(self: Self, value: Deferred<Runner>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Selects the program and arguments used to launch this artifact or its tests.
@@ -343,7 +410,9 @@ WASI artifacts use `wasmtime run` when no runner is supplied.
 ### Method `standardLibrary`
 
 ```silk
-pub effect fn standardLibrary(self: Self, path: Deferred<Path>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn standardLibrary(self: Self, path: Deferred<Path>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Selects a declared standard-library directory before resolution.
@@ -353,7 +422,9 @@ Selects a declared standard-library directory before resolution.
 ### Method `platform`
 
 ```silk
-pub effect fn platform(self: Self, value: Deferred<Platform>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn platform(self: Self, value: Deferred<Platform>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Selects the target sysroot, linker, and support installations.
@@ -363,7 +434,9 @@ Selects the target sysroot, linker, and support installations.
 ### Method `windows`
 
 ```silk
-pub effect fn windows(self: Self, value: Deferred<Windows>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn windows(self: Self, value: Deferred<Windows>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Selects Windows subsystem, resource, and manifest settings.
@@ -373,7 +446,9 @@ Selects Windows subsystem, resource, and manifest settings.
 ### Method `macos`
 
 ```silk
-pub effect fn macos(self: Self, value: Deferred<MacOS>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn macos(self: Self, value: Deferred<MacOS>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Selects macOS installation, framework, and signing settings.
@@ -383,7 +458,9 @@ Selects macOS installation, framework, and signing settings.
 ### Method `wasm`
 
 ```silk
-pub effect fn wasm(self: Self, value: Deferred<Wasm>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn wasm(self: Self, value: Deferred<Wasm>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Selects WebAssembly memory, execution, and component settings.
@@ -393,7 +470,9 @@ Selects WebAssembly memory, execution, and component settings.
 ### Method `header`
 
 ```silk
-pub effect fn header(self: Self, value: Deferred<String>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn header(self: Self, value: Deferred<String>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Requests a C header at an absolute output path.
@@ -403,7 +482,9 @@ Requests a C header at an absolute output path.
 ### Method `importLibrary`
 
 ```silk
-pub effect fn importLibrary(self: Self, value: Deferred<String>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn importLibrary(self: Self, value: Deferred<String>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Requests an import library at an absolute output path.
@@ -413,7 +494,9 @@ Requests an import library at an absolute output path.
 ### Method `emit`
 
 ```silk
-pub effect fn emit(self: Self, value: Deferred<String>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn emit(self: Self, value: Deferred<String>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Sets `emit` from a declared deferred value.
@@ -423,7 +506,9 @@ Sets `emit` from a declared deferred value.
 ### Method `root`
 
 ```silk
-pub effect fn root(self: Self, path: Deferred<Path>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn root(self: Self, path: Deferred<Path>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Selects a deferred source file as the compilation's root module.
@@ -433,7 +518,9 @@ Selects a deferred source file as the compilation's root module.
 ### Method `moduleFile`
 
 ```silk
-pub effect fn moduleFile(self: Self, name: string, path: Deferred<Path>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn moduleFile(self: Self, name: string, path: Deferred<Path>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Adds a generated module file to the root package.
@@ -443,17 +530,39 @@ Adds a generated module file to the root package.
 ### Method `module`
 
 ```silk
-pub effect fn module(self: Self, name: string, text: Deferred<String>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn module(self: Self, name: string, text: Deferred<String>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Writes deferred source text as a generated module before compiling its consumer.
+
+<a id="Compilation.impl.embed"></a>
+
+### Method `embed`
+
+```silk
+pub effect fn embed(self: Self, name: string, path: Deferred<Path>) -> Self
+    ! StepFailure
+    ? &mut Allocator
+```
+
+Embeds a file or another compilation's artifact in a generated module named `name`.
+Import that module's `data` constant to read its bytes; the producer runs before compilation.
 
 <a id="Compilation.impl.compileC"></a>
 
 ### Method `compileC`
 
 ```silk
-pub effect fn compileC(self: Self, path: Deferred<Path>, flags: Deferred<List<String>>, include: List<Deferred<Path>>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn compileC(
+    self: Self,
+    path: Deferred<Path>,
+    flags: Deferred<List<String>>,
+    include: List<Deferred<Path>>,
+  ) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Compiles a deferred `c` source with declared flags and include directory trees.
@@ -463,7 +572,14 @@ Compiles a deferred `c` source with declared flags and include directory trees.
 ### Method `compileCpp`
 
 ```silk
-pub effect fn compileCpp(self: Self, path: Deferred<Path>, flags: Deferred<List<String>>, include: List<Deferred<Path>>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn compileCpp(
+    self: Self,
+    path: Deferred<Path>,
+    flags: Deferred<List<String>>,
+    include: List<Deferred<Path>>,
+  ) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Compiles a deferred `cpp` source with declared flags and include directory trees.
@@ -473,7 +589,14 @@ Compiles a deferred `cpp` source with declared flags and include directory trees
 ### Method `compileObjectiveC`
 
 ```silk
-pub effect fn compileObjectiveC(self: Self, path: Deferred<Path>, flags: Deferred<List<String>>, include: List<Deferred<Path>>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn compileObjectiveC(
+    self: Self,
+    path: Deferred<Path>,
+    flags: Deferred<List<String>>,
+    include: List<Deferred<Path>>,
+  ) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Compiles a deferred `objc` source with declared flags and include directory trees.
@@ -483,7 +606,14 @@ Compiles a deferred `objc` source with declared flags and include directory tree
 ### Method `compileObjectiveCpp`
 
 ```silk
-pub effect fn compileObjectiveCpp(self: Self, path: Deferred<Path>, flags: Deferred<List<String>>, include: List<Deferred<Path>>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn compileObjectiveCpp(
+    self: Self,
+    path: Deferred<Path>,
+    flags: Deferred<List<String>>,
+    include: List<Deferred<Path>>,
+  ) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Compiles a deferred `objcpp` source with declared flags and include directory trees.
@@ -493,7 +623,9 @@ Compiles a deferred `objcpp` source with declared flags and include directory tr
 ### Method `linkArchive`
 
 ```silk
-pub effect fn linkArchive(self: Self, path: Deferred<Path>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn linkArchive(self: Self, path: Deferred<Path>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Adds a deferred `archive` input, including its contents in the key.
@@ -503,7 +635,9 @@ Adds a deferred `archive` input, including its contents in the key.
 ### Method `linkObject`
 
 ```silk
-pub effect fn linkObject(self: Self, path: Deferred<Path>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn linkObject(self: Self, path: Deferred<Path>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Adds a deferred `object` input, including its contents in the key.
@@ -513,7 +647,9 @@ Adds a deferred `object` input, including its contents in the key.
 ### Method `searchPath`
 
 ```silk
-pub effect fn searchPath(self: Self, path: Deferred<Path>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn searchPath(self: Self, path: Deferred<Path>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Adds a deferred `search-path` input, including its contents in the key.
@@ -523,7 +659,9 @@ Adds a deferred `search-path` input, including its contents in the key.
 ### Method `frameworkSearchPath`
 
 ```silk
-pub effect fn frameworkSearchPath(self: Self, path: Deferred<Path>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn frameworkSearchPath(self: Self, path: Deferred<Path>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Adds a deferred `framework-search-path` input, including its contents in the key.
@@ -533,7 +671,9 @@ Adds a deferred `framework-search-path` input, including its contents in the key
 ### Method `linkerScript`
 
 ```silk
-pub effect fn linkerScript(self: Self, path: Deferred<Path>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn linkerScript(self: Self, path: Deferred<Path>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Adds a deferred `linker-script` input, including its contents in the key.
@@ -543,7 +683,9 @@ Adds a deferred `linker-script` input, including its contents in the key.
 ### Method `functionOrder`
 
 ```silk
-pub effect fn functionOrder(self: Self, path: Deferred<Path>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn functionOrder(self: Self, path: Deferred<Path>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Selects a deferred function-order file, including its contents in the key.
@@ -553,7 +695,15 @@ Selects a deferred function-order file, including its contents in the key.
 ### Method `linkLibrary`
 
 ```silk
-pub effect fn linkLibrary(self: Self, name: Deferred<String>, mode: string, weak: bool, needed: bool) -> Self ! StepFailure ? &mut Allocator
+pub effect fn linkLibrary(
+    self: Self,
+    name: Deferred<String>,
+    mode: string,
+    weak: bool,
+    needed: bool,
+  ) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Links a deferred library name, with an explicit static or dynamic mode and retention policy.
@@ -563,7 +713,9 @@ Links a deferred library name, with an explicit static or dynamic mode and reten
 ### Method `linkFramework`
 
 ```silk
-pub effect fn linkFramework(self: Self, name: Deferred<String>, weak: bool, needed: bool) -> Self ! StepFailure ? &mut Allocator
+pub effect fn linkFramework(self: Self, name: Deferred<String>, weak: bool, needed: bool) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Links a deferred macOS framework name with an explicit retention policy.
@@ -573,7 +725,9 @@ Links a deferred macOS framework name with an explicit retention policy.
 ### Method `rpath`
 
 ```silk
-pub effect fn rpath(self: Self, value: Deferred<String>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn rpath(self: Self, value: Deferred<String>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Adds a deferred runtime library search path, preserving loader-relative tokens.
@@ -583,7 +737,9 @@ Adds a deferred runtime library search path, preserving loader-relative tokens.
 ### Method `linkArtifact`
 
 ```silk
-pub effect fn linkArtifact(self: Self, artifact: Deferred<Path>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn linkArtifact(self: Self, artifact: Deferred<Path>) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Links another compilation's deferred artifact and schedules its producer first.
@@ -593,7 +749,9 @@ Links another compilation's deferred artifact and schedules its producer first.
 ### Method `build`
 
 ```silk
-pub effect fn build(self: Self) -> Built ! BuildError ? &mut Allocator | &mut FileSystem | &mut HostInput
+pub effect fn build(self: Self) -> Built
+    ! BuildError
+    ? &mut Allocator | &mut FileSystem | &mut HostInput
 ```
 
 Executes this compilation through the build runner, publishing its request and artifact.
@@ -603,17 +761,34 @@ Executes this compilation through the build runner, publishing its request and a
 ### Method `memoryBudget`
 
 ```silk
-pub effect fn memoryBudget(self: Self, bytes: u64) -> Self ! StepFailure ? &mut Allocator
+pub effect fn memoryBudget(self: Self, bytes: u64) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Sets the runner's peak-memory estimate for this compiler process; the default is 3 GiB.
+
+<a id="Compilation.impl.unsandboxedTools"></a>
+
+### Method `unsandboxedTools`
+
+```silk
+pub effect fn unsandboxedTools(self: Self, allowed: bool) -> Self
+    ! StepFailure
+    ? &mut Allocator
+```
+
+Authorizes package tools to run without a sandbox for this graph execution.
+This setting is not serialized into compilation definitions or requests.
 
 <a id="Compilation.impl.step"></a>
 
 ### Method `step`
 
 ```silk
-pub effect fn step(self: &Self) -> StepHandle ! StepFailure ? &mut Allocator
+pub effect fn step(self: &Self) -> StepHandle
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Registers the compilation once, freezing its settings and retaining its typed work.
@@ -623,20 +798,38 @@ Registers the compilation once, freezing its settings and retaining its typed wo
 ### Method `artifact`
 
 ```silk
-pub effect fn artifact(self: &Self) -> Deferred<Path> ! StepFailure ? &mut Allocator
+pub effect fn artifact(self: &Self) -> Deferred<Path>
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Returns the artifact's deferred path; consuming it adds this compilation as a dependency.
 
-<a id="artifactFile"></a>
+<a id="Compilation.impl.emittedHeader"></a>
 
-## `artifactFile`
+### Method `emittedHeader`
 
 ```silk
-pub effect fn artifactFile(request: &Request) -> String ! StepFailure ? &mut Allocator
+pub effect fn emittedHeader(self: &Self) -> Deferred<Path>
+    ! StepFailure
+    ? &mut Allocator
 ```
 
-Returns the artifact filename selected by the resolved request.
+Returns the generated C header as a deferred input. Configure `header` before using it.
+Consuming the path runs this compilation and rejects a missing header output.
+
+<a id="Compilation.impl.emittedImportLibrary"></a>
+
+### Method `emittedImportLibrary`
+
+```silk
+pub effect fn emittedImportLibrary(self: &Self) -> Deferred<Path>
+    ! StepFailure
+    ? &mut Allocator
+```
+
+Returns the Windows import library as a deferred input. Configure `importLibrary` first.
+Consuming the path runs this compilation and rejects a missing import-library output.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`, `wasm64-unknown-unknown`.

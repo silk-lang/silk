@@ -16,7 +16,7 @@ Every record rejects unknown fields. The `version` field identifies this wire fo
 
 Import as `Request` with `import silk.build.request { Request }`.
 
-Public declarations: 23.
+Public declarations: 25.
 
 <a id="Request"></a>
 
@@ -1858,6 +1858,105 @@ impl Schema for Runner
 
 ```silk
 static fn spec() -> Spec<Runner>
+```
+
+<a id="Request.impl"></a>
+
+## Implementation `Request`
+
+```silk
+impl Request
+```
+
+<a id="Request.impl.fileName"></a>
+
+### Method `fileName`
+
+```silk
+pub effect fn fileName(self: &Self) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Returns the stable publication filename for this artifact, target, and optimization mode.
+
+<a id="Request.impl.requestFileName"></a>
+
+### Associated function `requestFileName`
+
+```silk
+pub effect fn requestFileName(name: string, target: string, optimization: string) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Names a published request using its compilation name, canonical target, and optimization.
+
+<a id="artifactName"></a>
+
+## `artifactName`
+
+```silk
+pub effect fn artifactName(name: string, artifact: string, emit: string, target: string) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator
+```
+
+Returns the artifact filename selected by the resolved request.
+
+<a id="RequestSet"></a>
+
+## `RequestSet`
+
+```silk
+pub struct RequestSet
+```
+
+The complete request set most recently published by `Build.write` or the built-in plan command.
+Readers select only these files when this index exists; other commands may publish additional requests.
+
+<a id="RequestSet.version"></a>
+
+### Field `version`
+
+```silk
+pub version: u32
+```
+
+The request-set format version, currently 1.
+
+<a id="RequestSet.files"></a>
+
+### Field `files`
+
+```silk
+pub files: List<String>
+```
+
+Request filenames relative to the directory holding `plan.json`.
+
+<a id="RequestSet.impl.Schema"></a>
+
+## Implementation `Schema for RequestSet`
+
+```silk
+impl Schema for RequestSet
+```
+
+<a id="RequestSet.impl.Schema.spec"></a>
+
+### Operation `spec`
+
+```silk
+static fn spec() -> Spec<RequestSet>
+```
+
+<a id="RequestSet.impl.Schema.check"></a>
+
+### Operation `check`
+
+```silk
+fn check(self: &Self, checks: &mut Checks<Self>) -> ()
 ```
 
 

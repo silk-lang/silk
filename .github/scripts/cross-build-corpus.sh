@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Cross-build the self-contained native corpus programs for another target with an existing N1,
-# as packages whose manifest names the target's platform supply, or none when it is empty. Writes
+# through explicit definitions and requests, with an optional platform supply. Writes
 # one directory per program under <output>: the executable `program`, `exit-code` and any
 # `expected.stdout`.
 #
-# usage: cross-build-corpus.sh <compiler> <target> <output> <platform-supply TOML or ''> [programs...]
+# usage: cross-build-corpus.sh <compiler> <target> <output> <request platform TOML or ''> [programs...]
 # Without programs, every corpus program that needs no C units, splices, profiles, runs,
 # libraries or components and completes normally is built. Corpus programs test code generation,
 # not lint, so warnings are allowed here as in the receipt-counted corpus harness.
@@ -43,9 +43,19 @@ build() {
   mkdir -p "$package" "$output/$name"
   cp "corpus/native/$name/main.silk" "$package/main.silk"
   printf '[package]\nname = "corpus"\nversion = "0.0.0"\nsource = "."\n' > "$package/silk.toml"
-  if [ -n "$supply" ]; then printf '\n[native]\nplatform-supply = %s\n' "$supply" >> "$package/silk.toml"; fi
-  if ! "$compiler" build "$package/main.silk" -o "$output/$name/program" --target "$target" --stdlib "$PWD/stdlib" \
-    --optimization none --debug false --ignore-warnings > "$package/build.log" 2>&1; then
+  python3 - "$package" "$target" "$PWD/stdlib" "$supply" <<'PYCODE'
+import json, sys
+from pathlib import Path
+root, target, stdlib, platform = sys.argv[1:]
+text = f'manifest = {json.dumps(root + "/silk.toml")}\nstdlib = {json.dumps(stdlib)}\n[settings]\n'
+if platform:
+    text += f'platform = {platform}\n'
+text += f'[settings.profile]\ntarget = {json.dumps(target)}\noptimization = "none"\ndebug = false\n'
+Path(root, 'definition.toml').write_text(text)
+PYCODE
+  if ! { "$compiler" resolve --definition "$package/definition.toml" --output "$package/request.toml" &&
+    "$compiler" compile --request "$package/request.toml" --ignore-warnings &&
+    cp "$package/artifact" "$output/$name/program"; } > "$package/build.log" 2>&1; then
     echo "FAIL $name"
     sed 's/^/  /' "$package/build.log"
     rm -rf -- "$output/$name"

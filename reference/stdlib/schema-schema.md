@@ -104,6 +104,16 @@ A reader that knows where values are in its input reports it through `lastSpan` 
 reader that collects every problem, as `SchemaJson.decodeAll` does, returns `true` from
 `collecting`, records what `report` gives it, and moves past a failed part with `recover`.
 
+<a id="SchemaReader.taggedOptions"></a>
+
+### Operation `taggedOptions`
+
+```silk
+fn taggedOptions(self: &Self) -> bool
+```
+
+Whether options use a tagged array (`[false]` or `[true, value]`) to preserve nested options.
+
 <a id="SchemaReader.path"></a>
 
 ### Operation `path`
@@ -253,7 +263,9 @@ returns `false` if the object has no such member.
 ### Operation `nextMember`
 
 ```silk
-effect fn nextMember(self: &mut Self) -> Option<String> ! Issue | OutOfMemoryError ? &mut Allocator
+effect fn nextMember(self: &mut Self) -> Option<String>
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Returns the next unread member's owned key and leaves the reader at its value.
@@ -264,7 +276,9 @@ Returns `None` after every member has been visited; `endObject` still closes the
 ### Operation `rejectUnread`
 
 ```silk
-effect fn rejectUnread(self: &mut Self, expected: string<'static>) -> () ! Issue | OutOfMemoryError ? &mut Allocator
+effect fn rejectUnread(self: &mut Self, expected: string<'static>) -> ()
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Reports every member of the object being read that no `member` call found, as
@@ -311,7 +325,9 @@ Returns the kind of the last complete value read. The default knows none.
 ### Operation `report`
 
 ```silk
-effect fn report(self: &mut Self, issue: Issue) -> () ! Issue | OutOfMemoryError ? &mut Allocator
+effect fn report(self: &mut Self, issue: Issue) -> ()
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Reports a problem with the part at the current path. The default fails with it; a reader
@@ -338,7 +354,9 @@ is `false`.
 ### Operation `mark`
 
 ```silk
-effect fn mark(self: &mut Self) -> usize ! OutOfMemoryError ? &mut Allocator
+effect fn mark(self: &mut Self) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Remembers the reader's position, before a part that may fail, and returns a mark for
@@ -353,7 +371,9 @@ Remembers the reader's position, before a part that may fail, and returns a mark
 ### Operation `recover`
 
 ```silk
-effect fn recover(self: &mut Self, mark: usize, skip: bool) -> () ! Issue | OutOfMemoryError ? &mut Allocator
+effect fn recover(self: &mut Self, mark: usize, skip: bool) -> ()
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Returns to the position `mark` names after the part read from it failed, and when `skip` is
@@ -394,6 +414,16 @@ point, such as `silk.schema.json.SchemaJson.encode`.
 
 The schema writes a list as `beginList`, then `element` before each element, then `endList`. It
 writes an object as `beginObject`, then `key` before each member's value, then `endObject`.
+
+<a id="SchemaWriter.taggedOptions"></a>
+
+### Operation `taggedOptions`
+
+```silk
+fn taggedOptions(self: &Self) -> bool
+```
+
+Whether options use a tagged array (`[false]` or `[true, value]`) to preserve nested options.
 
 <a id="SchemaWriter.boolean"></a>
 
@@ -703,7 +733,11 @@ Returns the spec in which the list in `field` has `min` to `max` elements.
 ### Method `pattern`
 
 ```silk
-pub static fn pattern(self: Self, field: Intrinsic.FieldName<T>, source: string<'static>) -> Self
+pub static fn pattern(
+    self: Self,
+    field: Intrinsic.FieldName<T>,
+    source: string<'static>,
+  ) -> Self
 ```
 
 Returns the spec in which the text in `field` matches the regular expression `source`,
@@ -765,7 +799,9 @@ Returns the name of the field `label` in the data format.
 ### Method `rulesOf`
 
 ```silk
-pub static fn rulesOf(self: &Self, label: string<'static>) -> Intrinsic.StaticSequence<Constraint>
+pub static fn rulesOf(self: &Self, label: string<'static>) -> Intrinsic.StaticSequence<
+    Constraint
+  >
 ```
 
 Returns the rules of the field `label`, in the order they were added.
@@ -898,7 +934,9 @@ Override it next to `read` for a type read from one kind of value, usually as
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> Self ! Issue | OutOfMemoryError ? &mut Allocator
+effect fn read<R: SchemaReader>(reader: &mut R) -> Self
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Reads a value. The default reads a struct from an object, a union of unit variants from its
@@ -914,8 +952,9 @@ variant name, and any other union from an object tagged with its variant name.
 ### Operation `write`
 
 ```silk
-effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
-    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator
+effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+    ! Issue | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator
 ```
 
 Writes the value. The default writes a struct as an object, a union of unit variants as its
@@ -932,7 +971,9 @@ variant name, and any other union as an object tagged with its variant name.
 ### Operation `shape`
 
 ```silk
-effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self>
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Adds the type's wire form to `shapes` and returns its node. The default describes a struct
@@ -952,7 +993,8 @@ through a codec, so its shape describes what `read` accepts.
 ### Operation `missing`
 
 ```silk
-effect fn missing() -> Self ! Issue
+effect fn missing() -> Self
+    ! Issue
 ```
 
 Returns the value of a field whose key is absent. The default fails, because the key is
@@ -978,7 +1020,9 @@ Returns whether a field holding the value is left out when written. The default 
 ### Operation `satisfies`
 
 ```silk
-effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator
+effect fn satisfies(self: &Self, constraint: Constraint) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Returns whether the value follows `constraint`, a rule its field's spec declares. The default
@@ -1108,7 +1152,9 @@ impl Schemas
 ### Associated function `read`
 
 ```silk
-pub effect fn read<T: Schema, R: SchemaReader>(reader: &mut R) -> T ! Issue | OutOfMemoryError ? &mut Allocator
+pub effect fn read<T: Schema, R: SchemaReader>(reader: &mut R) -> T
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Reads a `T` with its `Schema` implementation and runs its `Schema.check`.
@@ -1123,7 +1169,9 @@ Reads a `T` with its `Schema` implementation and runs its `Schema.check`.
 ### Associated function `readVariant`
 
 ```silk
-pub effect fn readVariant<U: Schema, R: SchemaReader>(reader: &mut R, name: string) -> U ! Issue | OutOfMemoryError ? &mut Allocator
+pub effect fn readVariant<U: Schema, R: SchemaReader>(reader: &mut R, name: string) -> U
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Reads the variant of the union `U` whose wire name is `name` from an object of its fields,
@@ -1140,8 +1188,9 @@ such as a tool call whose name and arguments arrive apart.
 ### Associated function `write`
 
 ```silk
-pub effect fn write<T: Schema, W: SchemaWriter>(value: &T, writer: &mut W)
-    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator
+pub effect fn write<T: Schema, W: SchemaWriter>(value: &T, writer: &mut W) -> ()
+    ! Issue | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator
 ```
 
 Writes `value` with its `Schema` implementation.
@@ -1156,7 +1205,9 @@ Writes `value` with its `Schema` implementation.
 ### Associated function `shape`
 
 ```silk
-pub effect fn shape<T: Schema>() -> Shapes ! OutOfMemoryError ? &mut Allocator
+pub effect fn shape<T: Schema>() -> Shapes
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Returns the shape of `T`: its wire form, and that of every type it uses.
@@ -1170,7 +1221,9 @@ Returns the shape of `T`: its wire form, and that of every type it uses.
 ### Associated function `shapeOf`
 
 ```silk
-pub effect fn shapeOf<T: Schema>(shapes: &mut Shapes) -> ShapeRef ! OutOfMemoryError ? &mut Allocator
+pub effect fn shapeOf<T: Schema>(shapes: &mut Shapes) -> ShapeRef
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Adds the shape of `T` to `shapes` and returns its node, as a type's own `shape` does for the
@@ -1216,8 +1269,12 @@ through a codec with [`Schemas.readVia`](#Schemas.impl.readVia).
 ### Associated function `readVia`
 
 ```silk
-pub effect fn readVia<A, I: Schema, C: Codec<A, I>, R: SchemaReader>(codec: &C, reader: &mut R)
-    -> A ! Issue | OutOfMemoryError ? &mut Allocator
+pub effect fn readVia<A, I: Schema, C: Codec<A, I>, R: SchemaReader>(
+    codec: &C,
+    reader: &mut R,
+  ) -> A
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Reads the wire form `I` and decodes it into an `A` with `codec`.
@@ -1238,8 +1295,13 @@ text. Its `shape` is then [`Schemas.shapeVia`](#Schemas.impl.shapeVia) with the 
 ### Associated function `writeVia`
 
 ```silk
-pub effect fn writeVia<A, I: Schema, C: Codec<A, I>, W: SchemaWriter>(codec: &C, value: &A, writer: &mut W)
-    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator
+pub effect fn writeVia<A, I: Schema, C: Codec<A, I>, W: SchemaWriter>(
+    codec: &C,
+    value: &A,
+    writer: &mut W,
+  ) -> ()
+    ! Issue | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator
 ```
 
 Encodes `value` into the wire form `I` with `codec` and writes it.
@@ -1255,7 +1317,9 @@ Encodes `value` into the wire form `I` with `codec` and writes it.
 ### Associated function `shapeVia`
 
 ```silk
-pub effect fn shapeVia<A, I: Schema, C: Codec<A, I>>(codec: &C, shapes: &mut Shapes) -> ShapeOf<A> ! OutOfMemoryError ? &mut Allocator
+pub effect fn shapeVia<A, I: Schema, C: Codec<A, I>>(codec: &C, shapes: &mut Shapes) -> ShapeOf<A>
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Adds the shape of a type read through `codec` from the wire form `I` to `shapes`: the shape of
@@ -1299,7 +1363,9 @@ Returns `ValueKind.Boolean`.
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> bool ! Issue | OutOfMemoryError ? &mut Allocator
+effect fn read<R: SchemaReader>(reader: &mut R) -> bool
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Reads `true` or `false`.
@@ -1309,8 +1375,9 @@ Reads `true` or `false`.
 ### Operation `write`
 
 ```silk
-effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
-    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator
+effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+    ! Issue | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator
 ```
 
 Writes `true` or `false`.
@@ -1320,7 +1387,9 @@ Writes `true` or `false`.
 ### Operation `shape`
 
 ```silk
-effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self>
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Adds `Shape.Boolean`.
@@ -1348,7 +1417,9 @@ Returns `ValueKind.Number`.
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> u64 ! Issue | OutOfMemoryError ? &mut Allocator
+effect fn read<R: SchemaReader>(reader: &mut R) -> u64
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Reads a number.
@@ -1358,8 +1429,9 @@ Reads a number.
 ### Operation `write`
 
 ```silk
-effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
-    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator
+effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+    ! Issue | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator
 ```
 
 Writes the number.
@@ -1369,7 +1441,9 @@ Writes the number.
 ### Operation `shape`
 
 ```silk
-effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self>
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Adds an integer from 0 to `u64.MAX`.
@@ -1379,7 +1453,9 @@ Adds an integer from 0 to `u64.MAX`.
 ### Operation `satisfies`
 
 ```silk
-effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator
+effect fn satisfies(self: &Self, constraint: Constraint) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Tests a range.
@@ -1407,7 +1483,9 @@ Returns `ValueKind.Number`.
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> i64 ! Issue | OutOfMemoryError ? &mut Allocator
+effect fn read<R: SchemaReader>(reader: &mut R) -> i64
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Reads a number.
@@ -1417,8 +1495,9 @@ Reads a number.
 ### Operation `write`
 
 ```silk
-effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
-    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator
+effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+    ! Issue | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator
 ```
 
 Writes the number.
@@ -1428,7 +1507,9 @@ Writes the number.
 ### Operation `shape`
 
 ```silk
-effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self>
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Adds an integer from `i64.MIN` to `i64.MAX`.
@@ -1438,7 +1519,9 @@ Adds an integer from `i64.MIN` to `i64.MAX`.
 ### Operation `satisfies`
 
 ```silk
-effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator
+effect fn satisfies(self: &Self, constraint: Constraint) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Tests a range.
@@ -1466,7 +1549,9 @@ Returns `ValueKind.Number`.
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> f64 ! Issue | OutOfMemoryError ? &mut Allocator
+effect fn read<R: SchemaReader>(reader: &mut R) -> f64
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Reads a number.
@@ -1476,8 +1561,9 @@ Reads a number.
 ### Operation `write`
 
 ```silk
-effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
-    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator
+effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+    ! Issue | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator
 ```
 
 Writes the number. A format that cannot hold a NaN or an infinity fails with an `Issue`.
@@ -1487,7 +1573,9 @@ Writes the number. A format that cannot hold a NaN or an infinity fails with an 
 ### Operation `shape`
 
 ```silk
-effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self>
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Adds `Shape.Float`.
@@ -1497,7 +1585,9 @@ Adds `Shape.Float`.
 ### Operation `satisfies`
 
 ```silk
-effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator
+effect fn satisfies(self: &Self, constraint: Constraint) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Tests a range.
@@ -1525,7 +1615,9 @@ Returns `ValueKind.Text`.
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> String ! Issue | OutOfMemoryError ? &mut Allocator
+effect fn read<R: SchemaReader>(reader: &mut R) -> String
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Reads text.
@@ -1535,8 +1627,9 @@ Reads text.
 ### Operation `write`
 
 ```silk
-effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
-    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator
+effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+    ! Issue | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator
 ```
 
 Writes the text.
@@ -1546,7 +1639,9 @@ Writes the text.
 ### Operation `shape`
 
 ```silk
-effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self>
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Adds `Shape.Text`.
@@ -1556,7 +1651,9 @@ Adds `Shape.Text`.
 ### Operation `satisfies`
 
 ```silk
-effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator
+effect fn satisfies(self: &Self, constraint: Constraint) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Tests a length in characters, or a pattern.
@@ -1584,7 +1681,9 @@ Returns the contained schema's value kind and expected description.
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> Box<T> ! Issue | OutOfMemoryError ? &mut Allocator
+effect fn read<R: SchemaReader>(reader: &mut R) -> Box<T>
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Reads and allocates the contained value, with the schema and errors of `T`.
@@ -1594,8 +1693,9 @@ Reads and allocates the contained value, with the schema and errors of `T`.
 ### Operation `write`
 
 ```silk
-effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
-    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator
+effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+    ! Issue | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator
 ```
 
 Writes the contained value without an extra object or field.
@@ -1605,7 +1705,9 @@ Writes the contained value without an extra object or field.
 ### Operation `shape`
 
 ```silk
-effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self>
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Returns the shape of the contained value, without an extra object or field.
@@ -1615,7 +1717,9 @@ Returns the shape of the contained value, without an extra object or field.
 ### Operation `satisfies`
 
 ```silk
-effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator
+effect fn satisfies(self: &Self, constraint: Constraint) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Tests a constraint against the contained value.
@@ -1643,7 +1747,9 @@ Returns the kind of `T`.
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> Option<T> ! Issue | OutOfMemoryError ? &mut Allocator
+effect fn read<R: SchemaReader>(reader: &mut R) -> Option<T>
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Reads `None` from a null value, and `Some` from any other value.
@@ -1653,8 +1759,9 @@ Reads `None` from a null value, and `Some` from any other value.
 ### Operation `write`
 
 ```silk
-effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
-    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator
+effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+    ! Issue | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator
 ```
 
 Writes the value of `Some`, or a null value for `None`. A `None` field is left out instead.
@@ -1664,7 +1771,9 @@ Writes the value of `Some`, or a null value for `None`. A `None` field is left o
 ### Operation `shape`
 
 ```silk
-effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self>
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Adds `Shape.Optional` around the shape of `T`.
@@ -1674,7 +1783,8 @@ Adds `Shape.Optional` around the shape of `T`.
 ### Operation `missing`
 
 ```silk
-effect fn missing() -> Option<T> ! Issue
+effect fn missing() -> Option<T>
+    ! Issue
 ```
 
 Returns `None`, so an `Option` field may be absent.
@@ -1694,7 +1804,9 @@ Returns `true` for `None`, so a `None` field is left out.
 ### Operation `satisfies`
 
 ```silk
-effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator
+effect fn satisfies(self: &Self, constraint: Constraint) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Tests the value of `Some`; `None` follows every rule.
@@ -1722,7 +1834,9 @@ Returns `ValueKind.List`.
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> List<T> ! Issue | OutOfMemoryError ? &mut Allocator
+effect fn read<R: SchemaReader>(reader: &mut R) -> List<T>
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Reads a list, element by element. A collecting reader records a failed element and goes on
@@ -1733,8 +1847,9 @@ with the next.
 ### Operation `write`
 
 ```silk
-effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
-    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator
+effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+    ! Issue | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator
 ```
 
 Writes the list, element by element.
@@ -1744,7 +1859,9 @@ Writes the list, element by element.
 ### Operation `shape`
 
 ```silk
-effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self>
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Adds `Shape.List` of the shape of `T`.
@@ -1754,7 +1871,9 @@ Adds `Shape.List` of the shape of `T`.
 ### Operation `satisfies`
 
 ```silk
-effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator
+effect fn satisfies(self: &Self, constraint: Constraint) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Tests a number of elements.
@@ -1782,7 +1901,9 @@ Returns `ValueKind.Number`.
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> u8 ! Issue | OutOfMemoryError ? &mut Allocator
+effect fn read<R: SchemaReader>(reader: &mut R) -> u8
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Reads a number and fails with `IssueReason.InvalidValue` if it does not fit.
@@ -1792,8 +1913,9 @@ Reads a number and fails with `IssueReason.InvalidValue` if it does not fit.
 ### Operation `write`
 
 ```silk
-effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
-    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator
+effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+    ! Issue | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator
 ```
 
 Writes the number.
@@ -1803,7 +1925,9 @@ Writes the number.
 ### Operation `shape`
 
 ```silk
-effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self>
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Adds an integer from 0 to 255.
@@ -1813,7 +1937,9 @@ Adds an integer from 0 to 255.
 ### Operation `satisfies`
 
 ```silk
-effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator
+effect fn satisfies(self: &Self, constraint: Constraint) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Tests a range.
@@ -1841,7 +1967,9 @@ Returns `ValueKind.Number`.
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> u16 ! Issue | OutOfMemoryError ? &mut Allocator
+effect fn read<R: SchemaReader>(reader: &mut R) -> u16
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Reads a number and fails with `IssueReason.InvalidValue` if it does not fit.
@@ -1851,8 +1979,9 @@ Reads a number and fails with `IssueReason.InvalidValue` if it does not fit.
 ### Operation `write`
 
 ```silk
-effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
-    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator
+effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+    ! Issue | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator
 ```
 
 Writes the number.
@@ -1862,7 +1991,9 @@ Writes the number.
 ### Operation `shape`
 
 ```silk
-effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self>
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Adds an integer from 0 to 65535.
@@ -1872,7 +2003,9 @@ Adds an integer from 0 to 65535.
 ### Operation `satisfies`
 
 ```silk
-effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator
+effect fn satisfies(self: &Self, constraint: Constraint) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Tests a range.
@@ -1900,7 +2033,9 @@ Returns `ValueKind.Number`.
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> u32 ! Issue | OutOfMemoryError ? &mut Allocator
+effect fn read<R: SchemaReader>(reader: &mut R) -> u32
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Reads a number and fails with `IssueReason.InvalidValue` if it does not fit.
@@ -1910,8 +2045,9 @@ Reads a number and fails with `IssueReason.InvalidValue` if it does not fit.
 ### Operation `write`
 
 ```silk
-effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
-    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator
+effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+    ! Issue | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator
 ```
 
 Writes the number.
@@ -1921,7 +2057,9 @@ Writes the number.
 ### Operation `shape`
 
 ```silk
-effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self>
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Adds an integer from 0 to 4294967295.
@@ -1931,7 +2069,9 @@ Adds an integer from 0 to 4294967295.
 ### Operation `satisfies`
 
 ```silk
-effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator
+effect fn satisfies(self: &Self, constraint: Constraint) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Tests a range.
@@ -1959,7 +2099,9 @@ Returns `ValueKind.Number`.
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> usize ! Issue | OutOfMemoryError ? &mut Allocator
+effect fn read<R: SchemaReader>(reader: &mut R) -> usize
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Reads a number and fails with `IssueReason.InvalidValue` if it does not fit.
@@ -1969,8 +2111,9 @@ Reads a number and fails with `IssueReason.InvalidValue` if it does not fit.
 ### Operation `write`
 
 ```silk
-effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
-    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator
+effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+    ! Issue | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator
 ```
 
 Writes the number.
@@ -1980,7 +2123,9 @@ Writes the number.
 ### Operation `shape`
 
 ```silk
-effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self>
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Adds an integer from 0 to `usize.MAX`.
@@ -1990,7 +2135,9 @@ Adds an integer from 0 to `usize.MAX`.
 ### Operation `satisfies`
 
 ```silk
-effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator
+effect fn satisfies(self: &Self, constraint: Constraint) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Tests a range.
@@ -2018,7 +2165,9 @@ Returns `ValueKind.Number`.
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> i8 ! Issue | OutOfMemoryError ? &mut Allocator
+effect fn read<R: SchemaReader>(reader: &mut R) -> i8
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Reads a number and fails with `IssueReason.InvalidValue` if it does not fit.
@@ -2028,8 +2177,9 @@ Reads a number and fails with `IssueReason.InvalidValue` if it does not fit.
 ### Operation `write`
 
 ```silk
-effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
-    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator
+effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+    ! Issue | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator
 ```
 
 Writes the number.
@@ -2039,7 +2189,9 @@ Writes the number.
 ### Operation `shape`
 
 ```silk
-effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self>
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Adds an integer from -128 to 127.
@@ -2049,7 +2201,9 @@ Adds an integer from -128 to 127.
 ### Operation `satisfies`
 
 ```silk
-effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator
+effect fn satisfies(self: &Self, constraint: Constraint) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Tests a range.
@@ -2077,7 +2231,9 @@ Returns `ValueKind.Number`.
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> i16 ! Issue | OutOfMemoryError ? &mut Allocator
+effect fn read<R: SchemaReader>(reader: &mut R) -> i16
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Reads a number and fails with `IssueReason.InvalidValue` if it does not fit.
@@ -2087,8 +2243,9 @@ Reads a number and fails with `IssueReason.InvalidValue` if it does not fit.
 ### Operation `write`
 
 ```silk
-effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
-    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator
+effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+    ! Issue | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator
 ```
 
 Writes the number.
@@ -2098,7 +2255,9 @@ Writes the number.
 ### Operation `shape`
 
 ```silk
-effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self>
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Adds an integer from -32768 to 32767.
@@ -2108,7 +2267,9 @@ Adds an integer from -32768 to 32767.
 ### Operation `satisfies`
 
 ```silk
-effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator
+effect fn satisfies(self: &Self, constraint: Constraint) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Tests a range.
@@ -2136,7 +2297,9 @@ Returns `ValueKind.Number`.
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> i32 ! Issue | OutOfMemoryError ? &mut Allocator
+effect fn read<R: SchemaReader>(reader: &mut R) -> i32
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Reads a number and fails with `IssueReason.InvalidValue` if it does not fit.
@@ -2146,8 +2309,9 @@ Reads a number and fails with `IssueReason.InvalidValue` if it does not fit.
 ### Operation `write`
 
 ```silk
-effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
-    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator
+effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+    ! Issue | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator
 ```
 
 Writes the number.
@@ -2157,7 +2321,9 @@ Writes the number.
 ### Operation `shape`
 
 ```silk
-effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self>
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Adds an integer from -2147483648 to 2147483647.
@@ -2167,7 +2333,9 @@ Adds an integer from -2147483648 to 2147483647.
 ### Operation `satisfies`
 
 ```silk
-effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator
+effect fn satisfies(self: &Self, constraint: Constraint) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Tests a range.
@@ -2255,7 +2423,9 @@ Finds a member by its exact key, preserving its ownership in the dictionary.
 ### Method `insert`
 
 ```silk
-pub effect fn insert(self: &mut Self, key: String, value: T) -> () ! Issue | OutOfMemoryError ? &mut Allocator
+pub effect fn insert(self: &mut Self, key: String, value: T) -> ()
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Appends a new member, refusing duplicate keys.
@@ -2281,7 +2451,9 @@ static fn kind() -> KindOf<Self>
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> Self ! Issue | OutOfMemoryError ? &mut Allocator
+effect fn read<R: SchemaReader>(reader: &mut R) -> Self
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 <a id="Dictionary.impl.Schema.write"></a>
@@ -2290,7 +2462,8 @@ effect fn read<R: SchemaReader>(reader: &mut R) -> Self ! Issue | OutOfMemoryErr
 
 ```silk
 effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
-  ! Issue | WriterError | OutOfMemoryError ? &mut Allocator | &mut Writer
+    ! Issue | WriterError | OutOfMemoryError
+    ? &mut Allocator | &mut Writer
 ```
 
 <a id="Dictionary.impl.Schema.shape"></a>
@@ -2298,7 +2471,9 @@ effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
 ### Operation `shape`
 
 ```silk
-effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self>
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 <a id="Dictionary.impl.Schema.missing"></a>
@@ -2306,7 +2481,8 @@ effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut 
 ### Operation `missing`
 
 ```silk
-effect fn missing() -> Self ! Issue
+effect fn missing() -> Self
+    ! Issue
 ```
 
 An absent dictionary field has no members.

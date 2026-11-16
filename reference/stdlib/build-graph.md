@@ -221,8 +221,13 @@ impl Build
 ### Method `when`
 
 ```silk
-pub effect fn when<'env, E, ?R>(self: Self, condition: bool,
-    transform: once effect fn<'env>(Self) -> Self ! E ? R) -> Self ! E ? R
+pub effect fn when<'env, E, ? R>(
+    self: Self,
+    condition: bool,
+    transform: once effect fn<'env>(Self) -> Self ! E ? R,
+  ) -> Self
+    ! E
+    ? R
 ```
 
 Applies `transform` when `condition` is true, returning the original value otherwise.
@@ -232,7 +237,9 @@ Applies `transform` when `condition` is true, returning the original value other
 ### Associated function `make`
 
 ```silk
-pub effect fn make() -> Self ! BuildError ? &mut Allocator | &mut HostInput | &mut FileSystem
+pub effect fn make() -> Self
+    ! BuildError
+    ? &mut Allocator | &mut HostInput | &mut FileSystem
 ```
 
 Starts a graph in the current package, keying the executable that constructs it.
@@ -242,7 +249,9 @@ Starts a graph in the current package, keying the executable that constructs it.
 ### Associated function `at`
 
 ```silk
-pub effect fn at(root: Path, identity: &[u8]) -> Self ! BuildError ? &mut Allocator
+pub effect fn at(root: Path, identity: &[u8]) -> Self
+    ! BuildError
+    ? &mut Allocator
 ```
 
 Starts a graph at an explicit root with the content identity of its constructing program.
@@ -252,20 +261,39 @@ Starts a graph at an explicit root with the content identity of its constructing
 ### Method `add`
 
 ```silk
-pub effect fn add(self: Self, compilation: Compilation) -> Self ! BuildError ? &mut Allocator
+pub effect fn add(self: Self, compilation: Compilation) -> Self
+    ! BuildError
+    ? &mut Allocator
 ```
 
-Adds a requested compilation, freezing its settings. Dependencies follow its deferred inputs.
+Adds a requested compilation. Settings freeze when execution starts or an artifact is used.
+Dependencies follow its deferred inputs.
 
 <a id="Build.impl.addStep"></a>
 
 ### Method `addStep`
 
 ```silk
-pub effect fn addStep(self: Self, step: StepHandle, output: string) -> Self ! BuildError ? &mut Allocator
+pub effect fn addStep(self: Self, step: StepHandle, output: string) -> Self
+    ! BuildError
+    ? &mut Allocator
 ```
 
 Adds custom work as a requested root. The named output becomes one returned artifact.
+
+<a id="Build.impl.embed"></a>
+
+### Method `embed`
+
+```silk
+pub effect fn embed(self: Self, name: string, input: Deferred<Path>) -> Self
+    ! BuildError
+    ? &mut Allocator
+```
+
+Embeds a file as a generated module in every root compilation.
+The file stays deferred and its producer becomes a dependency of each compilation.
+A compilation already used as another step's input has frozen settings and cannot be changed.
 
 <a id="Build.impl.memoryBudget"></a>
 
@@ -292,7 +320,9 @@ Sets the maximum number of worker fibers. Zero requests one worker.
 ### Method `compile`
 
 ```silk
-pub effect fn compile(self: Self) -> Built ! BuildError ? &mut Allocator | &mut FileSystem | &mut HostInput
+pub effect fn compile(self: Self) -> Built
+    ! BuildError
+    ? &mut Allocator | &mut FileSystem | &mut HostInput
 ```
 
 Runs the requested graph, publishes complete requests, and returns the resulting artifacts.
@@ -302,7 +332,9 @@ Runs the requested graph, publishes complete requests, and returns the resulting
 ### Method `write`
 
 ```silk
-pub effect fn write(self: Self) -> Planned ! BuildError ? &mut Allocator | &mut FileSystem | &mut HostInput
+pub effect fn write(self: Self) -> Planned
+    ! BuildError
+    ? &mut Allocator | &mut FileSystem | &mut HostInput
 ```
 
 Resolves dependencies and publishes requests, stopping before requested compilations run.
@@ -321,7 +353,8 @@ impl Built
 ### Method `launch`
 
 ```silk
-pub effect fn launch(self: &Self, arguments: &[string]) -> () ! BuildError | TaskError
+pub effect fn launch(self: &Self, arguments: &[string]) -> ()
+    ! BuildError | TaskError
     ? &mut Allocator | &mut FileSystem | &mut HostInput
 ```
 
@@ -334,7 +367,8 @@ Use `launchAt` to choose an artifact from a build with several roots.
 ### Method `launchAt`
 
 ```silk
-pub effect fn launchAt(self: &Self, index: usize, arguments: &[string]) -> () ! BuildError | TaskError
+pub effect fn launchAt(self: &Self, index: usize, arguments: &[string]) -> ()
+    ! BuildError | TaskError
     ? &mut Allocator | &mut FileSystem | &mut HostInput
 ```
 
@@ -346,10 +380,12 @@ A nonzero process status is preserved in `TaskError.status`.
 ### Method `write`
 
 ```silk
-pub effect fn write(self: Self, directory: string) -> Self ! BuildError ? &mut Allocator | &mut FileSystem | &mut HostInput
+pub effect fn write(self: Self, directory: string) -> Self
+    ! BuildError
+    ? &mut Allocator | &mut FileSystem | &mut HostInput
 ```
 
-Copies completed artifacts to `directory`, preserving executable permissions.
+Copies completed artifacts, generated headers, and import libraries to `directory`, preserving executable permissions.
 The returned paths name the copies; their request files remain at their build locations.
 
 

@@ -6,34 +6,52 @@ Package context and local input closure for resolving compilation definitions.
 
 Import as `Context` with `import silk.build.context as Context`.
 
-Public declarations: 6.
+Public declarations: 9.
 
 <a id="manifest"></a>
 
 ## `manifest`
 
 ```silk
-pub effect fn manifest() -> Path ! StepFailure ? &mut Allocator | &mut FileSystem | &mut HostInput
+pub effect fn manifest() -> Path
+  ! StepFailure
+  ? &mut Allocator | &mut FileSystem | &mut HostInput
 ```
 
 Finds the nearest package manifest above the task's package or current directory.
+
+<a id="compilerPath"></a>
+
+## `compilerPath`
+
+```silk
+pub effect fn compilerPath() -> Path
+  ! StepFailure
+  ? &mut Allocator | &mut HostInput | &mut FileSystem
+```
+
+Returns the compiler that launched the task, or the installed `silkc` executable.
 
 <a id="compiler"></a>
 
 ## `compiler`
 
 ```silk
-pub effect fn compiler() -> Deferred<Path> ! StepFailure ? &mut Allocator | &mut HostInput | &mut FileSystem
+pub effect fn compiler() -> Deferred<Path>
+  ! StepFailure
+  ? &mut Allocator | &mut HostInput | &mut FileSystem
 ```
 
-Returns the compiler that launched the task, or the installed `silkc` executable.
+Names the task's compiler as a deferred executable input.
 
 <a id="text"></a>
 
 ## `text`
 
 ```silk
-pub effect fn text(path: &Path) -> String ! StepFailure ? &mut Allocator
+pub effect fn text(path: &Path) -> String
+  ! StepFailure
+  ? &mut Allocator
 ```
 
 Copies a path as validated UTF-8 text.
@@ -43,7 +61,9 @@ Copies a path as validated UTF-8 text.
 ## `path`
 
 ```silk
-pub effect fn path(base: &Path, value: string) -> Path ! StepFailure ? &mut Allocator
+pub effect fn path(base: &Path, value: string) -> Path
+  ! StepFailure
+  ? &mut Allocator
 ```
 
 Resolves a user path against the package directory, accepting absolute paths explicitly.
@@ -83,10 +103,38 @@ Enclosing workspace manifests.
 ## `inputs`
 
 ```silk
-pub effect fn inputs(manifest: &Path) -> Inputs ! StepFailure ? &mut Allocator | &mut FileSystem
+pub effect fn inputs(manifest: &Path) -> Inputs
+  ! StepFailure
+  ? &mut Allocator | &mut FileSystem
 ```
 
 Collects local inputs without fetching remote pins. Unused malformed manifests remain data.
+
+<a id="standardLibrary"></a>
+
+## `standardLibrary`
+
+```silk
+pub effect fn standardLibrary() -> Option<String>
+  ! StepFailure
+  ? &mut HostInput | &mut Allocator
+```
+
+Returns the standard library selected by the compiler that launched this task.
+An absent value leaves selection to the installed compiler.
+
+<a id="planIndex"></a>
+
+## `planIndex`
+
+```silk
+pub effect fn planIndex() -> string<'static>
+  ! HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator
+```
+
+The request-set index selected by the CLI while it collects workspace package plans.
+Package plans stage their index until the CLI can publish the complete workspace set.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`, `wasm64-unknown-unknown`.

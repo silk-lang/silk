@@ -1,0 +1,767 @@
+//! Saved compilation requests and confined editor refreshes.
+
+import driver.CacheStamp
+import driver.ToolSandbox
+import driver.NativeToolchain
+import driver.OptimizationFlags
+import semantic.Target { Target }
+import driver.Project as Projects { Project, ProjectError }
+import driver.RequestText
+import silk.build.request { Request, RequestSet, Platform }
+import silk.build.encoding as Encoding
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.json.value { Json, Value }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.schema.schema { Schema, Spec }
+import silk.schema.json { SchemaJson }
+import silk.schema.toml { SchemaToml }
+import silk.schema.issue { SchemaError }
+import silk.system.child_process { ChildProcess, ProcessError, ProcessOutcome, Exited, Signaled }
+import silk.system.child_process_native { OsChildProcess }
+import silk.system.filesystem { AtomicWriteError, FileError, FileSystem, Path }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.system.sandbox as Sandbox
+import silk.text.string { String }
+import silk.io.writer { WriterError }
+import silk.num.usize
+
+/// Explicit editor choices. Trust starts disabled and never grants unsandboxed execution.
+pub struct Settings {
+  pub trusted: bool,
+  pub refresh: bool,
+  pub target: Option<String>,
+  pub mode: String,
+  pub compilation: Option<String>,
+}
+
+pub fn defaults() -> Settings {
+  return Settings {
+    trusted: false,
+    refresh: true,
+    target: Option<String>.none(),
+    mode: String.make(),
+    compilation: Option<String>.none(),
+  }
+}
+
+/// Reads the `silk` settings object, or the object itself in initialization options.
+pub effect fn settings(document: &Value) -> Settings
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let root = match move Json.field(document, "silk") {
+    Option<&Value>.Some { value: configured } => configured
+    Option<&Value>.None => document
+  }
+  let mut selected = defaults()
+  if let Option<&Value>.Some { value } = move Json.field(root, "workspaceTrusted") {
+    if let Value.Bool { value: flag } = &value.* {
+      selected.trusted = flag
+    }
+  }
+  if let Option<&Value>.Some { value } = move Json.field(root, "refreshPlan") {
+    if let Value.Bool { value: flag } = &value.* {
+      selected.refresh = flag
+    }
+  }
+  if let Option<string>.Some { value } = move Json.asString(Json.field(root, "target")) {
+    selected.target = Option<String>.some(run String.copy(value))
+  }
+  if let Option<string>.Some { value } = move Json.asString(Json.field(root, "mode")) {
+    selected.mode = run String.copy(value)
+  }
+  if let Option<string>.Some { value } = move Json.asString(Json.field(root, "compilation")) {
+    selected.compilation = Option<String>.some(run String.copy(value))
+  }
+  return move selected
+}
+
+pub struct Variable {
+  pub name: Bytes,
+  pub value: Bytes
+}
+
+/// A package manifest and its most recently resolved request output directory.
+pub struct Location {
+  manifest: Path,
+  output: Path,
+}
+
+/// A captured environment and request locations held by the editor session.
+pub struct Host {
+  pub variables: List<Variable>,
+  /// Request locations retained across manifest edits for this editor session.
+  pub locations: List<Location>,
+}
+
+pub effect fn captureHost() -> Host
+  ! HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator {
+  let names = run HostInput.variableNames()
+  let mut variables = List<Variable>.make()
+  let listed = names.asSlice()
+  let mut at: usize = 0
+  while at < listed.length {
+    if let Option<Bytes>.Some { value } = move run HostInput.variable(listed[at].asSlice()) {
+      run variables.append(
+        Variable { name: run Bytes.copy(listed[at].asSlice()), value: move value },
+      )
+    }
+    at = at + 1
+  }
+  return Host { variables: move variables, locations: List<Location>.make() }
+}
+
+impl HostInput for Host {
+  effect fn argumentCount(self: &mut Self) -> usize
+    ! HostInputError {
+    return 0
+  }
+
+  effect fn argument(self: &mut Self, index: usize) -> Option<Bytes>
+    ! HostInputError | OutOfMemoryError
+    ? &mut Allocator {
+    return Option<Bytes>.none()
+  }
+
+  effect fn variable(self: &mut Self, name: &[u8]) -> Option<Bytes>
+    ! HostInputError | OutOfMemoryError
+    ? &mut Allocator {
+    if same(name, b"SILK_OFFLINE") {
+      return Option<Bytes>.some(run Bytes.copy(b"1"))
+    }
+    let variables = self.variables.asSlice()
+    let mut at: usize = 0
+    while at < variables.length {
+      if same(variables[at].name.asSlice(), name) {
+        return Option<Bytes>.some(run Bytes.copy(variables[at].value.asSlice()))
+      }
+      at = at + 1
+    }
+    return Option<Bytes>.none()
+  }
+
+  effect fn variableNames(self: &mut Self) -> List<Bytes>
+    ! HostInputError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut names = List<Bytes>.make()
+    let variables = self.variables.asSlice()
+    let mut at: usize = 0
+    while at < variables.length {
+      run names.append(run Bytes.copy(variables[at].name.asSlice()))
+      at = at + 1
+    }
+    return move names
+  }
+
+  effect fn workingDirectory(self: &mut Self) -> Bytes
+    ! HostInputError | OutOfMemoryError
+    ? &mut Allocator {
+    return run Bytes.copy(b"/")
+  }
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at: usize = 0
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + 1
+  }
+  return true
+}
+
+fn within(directory: string, path: &[u8]) -> bool {
+  let root = String.utf8Bytes(directory)
+  return path.length > root.length && same(Slice.view<u8>(path, 0, root.length), root)
+    && (root[root.length - 1] == 47 || path[root.length] == 47)
+}
+
+fn holds(request: &Request, path: &[u8]) -> bool {
+  let packages = request.packages.asSlice()
+  let mut at: usize = 0
+  while at < packages.length {
+    if within(packages[at].source.view(), path) {
+      return true
+    }
+    let modules = packages[at].modules.asSlice()
+    let mut module: usize = 0
+    while module < modules.length {
+      if same(String.ownedUtf8Bytes(&modules[module].source), path) {
+        return true
+      }
+      module = module + 1
+    }
+    at = at + 1
+  }
+  return within(request.stdlib.view(), path)
+}
+
+fn matches(request: &Request, selected: &Settings) -> bool {
+  if let Option<String>.Some { value } = &selected.compilation {
+    if request.name.view() != value.view() {
+      return false
+    }
+  }
+  if let Option<String>.Some { value } = &selected.target {
+    if request.profile.target.view() != value.view() {
+      return false
+    }
+  }
+  let mode = selected.mode.view()
+  return mode == "" || (mode == "dev" && request.profile.optimization.view() == "none")
+    || (mode == "release" && request.profile.optimization.view() == "speed")
+    || (mode == "size" && request.profile.optimization.view() == "size")
+}
+
+pub struct Selection {
+  pub request: Option<Request>,
+  pub hint: bool
+}
+
+/// Refreshes only with explicit trust, then selects the first saved compilation that owns a file.
+/// All request files contribute their C translation units to `compile_commands.json`.
+pub effect fn select(
+  project: &Project,
+  path: &[u8],
+  library: &Option<Path>,
+  store: &Option<Path>,
+  selected: &Settings,
+  host: &mut Host,
+) -> Selection
+  ! FileError | HostInputError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let mut hint = false
+  if selected.trusted && selected.refresh {
+    hint = !(run refreshPlan(project, library, store, selected)
+      |> Effect.provideMut<HostInput>(&mut host.*))
+  }
+  let saved = run readSaved(Projects.outputDirectory(project), path, selected, &mut host.*)
+  return Selection { request: move saved.request, hint: hint || saved.hint }
+}
+
+effect fn readSaved(output: &Path, path: &[u8], selected: &Settings, host: &mut Host) -> Selection
+  ! FileError | HostInputError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let mut hint = false
+  let directory = run Path.join(output, "requests")
+  let mut found = Option<Request>.none()
+  let mut commands = List<CompileCommand>.make()
+  if run FileSystem.exists(&directory) {
+    let index = run Path.join(&directory, "plan.json")
+    let mut planned = Option<RequestSet>.none()
+    if run FileSystem.exists(&index) {
+      let bytes = run FileSystem.readFile(&index)
+      match move run Effect.result(SchemaJson.decode<RequestSet>(bytes.asSlice())) {
+        Result<RequestSet, SchemaError | OutOfMemoryError>.Success { value } => {
+          planned = Option<RequestSet>.some(move value)
+        }
+        Result<RequestSet, SchemaError | OutOfMemoryError>.Failure { error } => match move error {
+          OutOfMemoryError exhausted => {
+            fail move exhausted
+          }
+          SchemaError _invalid => {
+            hint = true
+            planned = Option<RequestSet>.some(RequestSet { version: 1, files: List<String>.make() })
+          }
+        }
+      }
+    }
+    let entries = run FileSystem.listDirectory(&directory)
+    let listed = entries.asSlice()
+    let mut at: usize = 0
+    while at < listed.length {
+      let raw = Path.rawBytes(&listed[at].path)
+      let mut admitted = planned.isNone()
+      if let Option<RequestSet>.Some { value } = &planned {
+        let files = value.files.asSlice()
+        let mut file: usize = 0
+        while file < files.length {
+          let candidate = run Path.join(&directory, files[file].view())
+          admitted = admitted || same(Path.rawBytes(&candidate), raw)
+          file = file + 1
+        }
+      }
+      if admitted && listed[at].kind.code == FileSystem.file().code && raw.length >= 5
+        && same(Slice.view<u8>(raw, raw.length - 5, 5), b".toml") {
+        let bytes = run FileSystem.readFile(&listed[at].path)
+        match move run Effect.result(SchemaToml.decode<Request>(bytes.asSlice())) {
+          Result<Request, SchemaError | OutOfMemoryError>.Success { value } => {
+            run nativeCommands(&value, &mut commands) |> Effect.provideMut<HostInput>(&mut host.*)
+            if found.isNone() && matches(&value, selected) && holds(&value, path) {
+              found = Option<Request>.some(move value)
+            }
+          }
+          Result<Request, SchemaError | OutOfMemoryError>.Failure { error } => match move error {
+            OutOfMemoryError exhausted => {
+              fail move exhausted
+            }
+            SchemaError _invalid => {
+              hint = true
+            }
+          }
+        }
+      }
+      at = at + 1
+    }
+    let encoded = run Effect.result(Encoding.json<List<CompileCommand>>(&commands))
+    match move encoded {
+      Result<Bytes, SchemaError | WriterError | OutOfMemoryError>.Success { value } => {
+        let destination = run Path.join(output, "compile_commands.json")
+        let written = run Effect.result(
+          FileSystem.writeFileAtomic(
+            &destination,
+            value.asSlice(),
+            FileSystem.replaceExisting(),
+            FileSystem.buffered(),
+          ),
+        )
+
+        // A read-only checkout can still use its saved request for Silk analysis.
+        if let Result<(), AtomicWriteError>.Failure { error: _unwritable } = move written {
+          hint = true
+        }
+      }
+      Result<Bytes, SchemaError | WriterError | OutOfMemoryError>.Failure {
+        error
+      } => match move error {
+        OutOfMemoryError exhausted => {
+          fail move exhausted
+        }
+        SchemaError _invalid => {
+          hint = true
+        }
+        WriterError _unwritable => {
+          hint = true
+        }
+      }
+    }
+  }
+  return Selection { request: move found, hint: hint }
+}
+
+/// Saved requests remain usable while a manifest is incomplete or invalid during an edit.
+pub struct Selected {
+  pub selection: Selection,
+  pub output: Path,
+  pub name: Bytes,
+}
+
+/// Locates a manifest, retaining a session's package identity during deletion or atomic edits.
+pub effect fn locate(directory: &Path, host: &Host) -> Path
+  ! ProjectError | FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let locations = host.locations.asSlice()
+  let mut nearest = Option<&Path>.none()
+  let mut length: usize = 0
+  let mut at: usize = 0
+  while at < locations.length {
+    if let Option<Path>.Some { value: parent } = move run Path.parent(&locations[at].manifest) {
+      let bytes = Path.rawBytes(&parent)
+      let target = Path.rawBytes(directory)
+      if target.length >= bytes.length && same(Slice.view<u8>(target, 0, bytes.length), bytes)
+        && (target.length == bytes.length || target[bytes.length] == 47)
+        && bytes.length > length {
+        length = bytes.length
+        nearest = Option<&Path>.some(&locations[at].manifest)
+      }
+    }
+    at = at + 1
+  }
+  if let Option<&Path>.Some { value } = nearest {
+    if !run FileSystem.exists(value) {
+      return run Path.fromBytes(Path.rawBytes(value))
+    }
+  }
+  return run Projects.discover(directory)
+}
+
+pub effect fn open(
+  manifest: &Path,
+  path: &[u8],
+  library: &Option<Path>,
+  store: &Option<Path>,
+  selected: &Settings,
+  host: &mut Host,
+) -> Selected
+  ! ProjectError | FileError | HostInputError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let loaded = run Effect.result(Projects.load(manifest))
+  return match move loaded {
+    Result<Project, ProjectError | FileError | OutOfMemoryError>.Success { value: project } => {
+      let output = run Path.fromBytes(Path.rawBytes(Projects.outputDirectory(&project)))
+      let mut at: usize = 0
+      while at < host.locations.length()
+        && !same(Path.rawBytes(&host.locations.asSlice()[at].manifest), Path.rawBytes(manifest)) {
+        at = at + 1
+      }
+      if at < host.locations.length() {
+        let locations = host.locations.asMutSlice()
+        locations[at].output = run Path.fromBytes(Path.rawBytes(&output))
+      } else {
+        run host.locations.append(
+          Location {
+            manifest: run Path.fromBytes(Path.rawBytes(manifest)),
+            output: run Path.fromBytes(Path.rawBytes(&output)),
+          },
+        )
+      }
+      let selection = run select(&project, path, library, store, selected, &mut host.*)
+      Selected {
+        selection: move selection,
+        output: move output,
+        name: run Bytes.copy(Projects.name(&project)),
+      }
+    }
+    Result<Project, ProjectError | FileError | OutOfMemoryError>.Failure { error } => {
+      if let Option<Selected>.Some { value } = move run retained(
+        manifest,
+        path,
+        selected,
+        &mut host.*,
+      ) {
+        return move value
+      }
+      match move error {
+        OutOfMemoryError exhausted => {
+          fail move exhausted
+        }
+        FileError failed => {
+          fail move failed
+        }
+        ProjectError invalid => {
+          fail move invalid
+        }
+      }
+    }
+  }
+}
+
+effect fn retained(manifest: &Path, path: &[u8], selected: &Settings, host: &mut Host) -> Option<
+  Selected
+>
+  ! FileError | HostInputError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let mut outputs = List<Path>.make()
+  let locations = host.locations.asSlice()
+  let mut at: usize = 0
+  while at < locations.length {
+    if same(Path.rawBytes(&locations[at].manifest), Path.rawBytes(manifest)) {
+      run outputs.append(run Path.fromBytes(Path.rawBytes(&locations[at].output)))
+    }
+    at = at + 1
+  }
+  let mut directory = run Path.parent(manifest)
+  while true {
+    let current = match move directory {
+      Option<Path>.Some { value } => move value
+      Option<Path>.None => {
+        break
+      }
+    }
+    run outputs.append(run Path.join(&current, "build"))
+    directory = run Path.parent(&current)
+  }
+  while outputs.length() > 0 {
+    let output = outputs.remove(0)
+    let saved = run readSaved(&output, path, selected, &mut host.*)
+    if let Option<Request>.Some { value } = move saved.request {
+      let name = run Bytes.copy(String.ownedUtf8Bytes(&value.packages.asSlice()[0].name))
+      return Option<Selected>.some(
+        Selected {
+          selection: Selection { request: Option<Request>.some(move value), hint: true },
+          output: move output,
+          name: move name,
+        },
+      )
+    }
+  }
+  return Option<Selected>.none()
+}
+
+struct CompileCommand {
+  pub directory: String,
+  pub file: String,
+  pub arguments: List<String>
+}
+
+impl Schema for CompileCommand {
+  static fn spec() -> Spec<CompileCommand> {
+    return Spec<CompileCommand>.of()
+  }
+}
+
+effect fn nativeCommands(request: &Request, commands: &mut List<CompileCommand>) -> ()
+  ! FileError | HostInputError | OutOfMemoryError
+  ? &mut FileSystem | &mut HostInput | &mut Allocator {
+  let compiler = match move run NativeToolchain.compiler(Option<&[u8]>.none()) {
+    Option<Path>.Some { value } => run RequestText.copy(Path.rawBytes(&value))
+    Option<Path>.None => run String.copy("clang")
+  }
+  let target = match move Target.resolve(String.ownedUtf8Bytes(&request.profile.target)) {
+    Option<Target>.Some { value } => value
+    Option<Target>.None => {
+      return ()
+    }
+  }
+  let mut common = List<Bytes>.make()
+  let mut backend = List<Bytes>.make()
+  let wasm = Target.objectFormat(&target) == b"wasm"
+  run OptimizationFlags.append(
+    &mut common,
+    &mut backend,
+    String.ownedUtf8Bytes(&request.profile.optimization),
+    wasm,
+    Target.architecture(&target) == b"x86_64",
+  )
+  if request.profile.debug {
+    run common.append(run Bytes.copy(b"-g"))
+  }
+  if !wasm {
+    let cpu = match &request.profile.cpu {
+      Option<String>.Some { value } => String.ownedUtf8Bytes(&value)
+      Option<String>.None => Target.defaultCpu(&target)
+    }
+    let mut flag = run Bytes.copy(
+      if Target.architecture(&target) == b"aarch64" {
+        b"-mcpu="
+      } else {
+        b"-march="
+      },
+    )
+    run flag.append(cpu)
+    run common.append(move flag)
+    if request.profile.codeModel.view() == "large" {
+      run common.append(run Bytes.copy(b"-mcmodel=large"))
+    }
+    if Target.operatingSystem(&target) != b"windows" {
+      run common.append(
+        run Bytes.copy(
+          if request.artifact.view() == "loadable-module"
+            || request.profile.relocation.view() == "pic" {
+            b"-fPIC"
+          } else {
+            b"-fno-pic"
+          },
+        ),
+      )
+    }
+  } else {
+    run common.append(run Bytes.copy(b"-mbulk-memory"))
+    if request.profile.threading.view() == "multi" {
+      run common.append(run Bytes.copy(b"-matomics"))
+    }
+  }
+  let features = request.profile.cpuFeatures.asSlice()
+  let mut feature: usize = 0
+  while feature < features.length {
+    run common.append(run Bytes.copy(b"-Xclang"))
+    run common.append(run Bytes.copy(b"-target-feature"))
+    run common.append(run Bytes.copy(b"-Xclang"))
+    let mut enabled = run Bytes.copy(b"+")
+    run enabled.append(String.ownedUtf8Bytes(&features[feature]))
+    run common.append(move enabled)
+    feature = feature + 1
+  }
+  if let Option<String>.Some { value } = &request.profile.deployment {
+    if Target.operatingSystem(&target) == b"darwin" {
+      let mut minimum = run Bytes.copy(b"-mmacosx-version-min=")
+      run minimum.append(String.ownedUtf8Bytes(&value))
+      run common.append(move minimum)
+    }
+  }
+  if let Option<Platform>.Some { value } = &request.platform {
+    run common.append(
+      run Bytes.copy(
+        if Target.operatingSystem(&target) == b"darwin" {
+          b"-isysroot"
+        } else {
+          b"--sysroot"
+        },
+      ),
+    )
+    run common.append(run NativeToolchain.pathBytes(&run Path.make(value.sysroot.view())))
+    let installations = value.support.asSlice()
+    let mut support: usize = 0
+    while support < installations.length {
+      if installations[support].target.view() == request.profile.target.view() {
+        let mut installation = run Bytes.copy(b"--gcc-install-dir=")
+        let path = run NativeToolchain.pathBytes(&run Path.make(installations[support].root.view()))
+        run installation.append(path.asSlice())
+        run common.append(move installation)
+      }
+      support = support + 1
+    }
+  }
+  let sources = request.native.sources.asSlice()
+  let mut at: usize = 0
+  while at < sources.length {
+    let source = &sources[at]
+    let mut arguments = List<String>.make()
+    run arguments.append(run String.copy(compiler.view()))
+    run arguments.append(run String.copy("-c"))
+    run arguments.append(run String.copy(source.path.view()))
+    run arguments.append(run String.copy("--target"))
+    run arguments.append(run RequestText.copy(Target.llvmTriple(&target)))
+    let shared = common.asSlice()
+    let mut argument: usize = 0
+    while argument < shared.length {
+      run arguments.append(run RequestText.copy(shared[argument].asSlice()))
+      argument = argument + 1
+    }
+    run arguments.append(run String.copy("-x"))
+    let language = source.language.view()
+    run arguments.append(
+      run String.copy(
+        if language == "cpp" {
+          "c++"
+        } else if language == "objc" {
+          "objective-c"
+        } else if language == "objcpp" {
+          "objective-c++"
+        } else {
+          "c"
+        },
+      ),
+    )
+    let flags = source.flags.asSlice()
+    let mut flag: usize = 0
+    while flag < flags.length {
+      run arguments.append(run String.copy(flags[flag].view()))
+      flag = flag + 1
+    }
+    let includes = source.include.asSlice()
+    let mut include: usize = 0
+    while include < includes.length {
+      run arguments.append(run String.copy("-I"))
+      run arguments.append(run String.copy(includes[include].view()))
+      include = include + 1
+    }
+    run commands.append(
+      CompileCommand {
+        directory: run String.copy(request.packages.asSlice()[0].source.view()),
+        file: run String.copy(source.path.view()),
+        arguments: move arguments,
+      },
+    )
+    at = at + 1
+  }
+}
+
+effect fn refreshPlan(
+  project: &Project,
+  library: &Option<Path>,
+  store: &Option<Path>,
+  selected: &Settings,
+) -> bool
+  ! FileError | HostInputError | OutOfMemoryError
+  ? &mut FileSystem | &mut HostInput | &mut Allocator {
+  if !ToolSandbox.supported() {
+    return false
+  }
+  let program = match move run CacheStamp.executablePath() {
+    Option<Bytes>.Some { value } => run Path.fromBytes(value.asSlice())
+    Option<Bytes>.None => {
+      return false
+    }
+  }
+  let launcher = match move run ToolSandbox.launcher() {
+    Option<Path>.Some { value } => move value
+    Option<Path>.None => {
+      return false
+    }
+  }
+  let steps = run Path.join(Projects.outputDirectory(project), "steps")
+  let requests = run Path.join(Projects.outputDirectory(project), "requests")
+  run FileSystem.createDirectoriesRecursively(&steps)
+  run FileSystem.createDirectoriesRecursively(&requests)
+  let mut readable = List<Path>.make()
+  run readable.append(run Path.fromBytes(Path.rawBytes(Projects.directory(project))))
+  if let Option<Path>.Some { value } = &library.* {
+    run readable.append(run Path.fromBytes(Path.rawBytes(&value)))
+  }
+  if let Option<Path>.Some { value } = &store.* {
+    run readable.append(run Path.fromBytes(Path.rawBytes(&value)))
+  }
+  if let Option<Path>.Some { value } = move run Path.parent(&program) {
+    run readable.append(move value)
+  }
+  if let Option<Path>.Some { value } = move run NativeToolchain.compiler(Option<&[u8]>.none()) {
+    if let Option<Path>.Some { value: parent } = move run Path.parent(&value) {
+      if let Option<Path>.Some { value: installation } = move run Path.parent(&parent) {
+        let resources = run Path.join(&installation, "lib")
+        if run FileSystem.exists(&resources) {
+          run readable.append(move resources)
+        }
+      }
+      run readable.append(move parent)
+    }
+  }
+  let writable = [&steps, &requests]
+  let mut process = run Sandbox.request(&launcher, &program, readable.asSlice(), &writable)
+  run ChildProcess.addArgument(&mut process, "plan")
+  run ChildProcess.addArgument(&mut process, "--manifest-path")
+  run ChildProcess.addArgumentBytes(&mut process, Path.rawBytes(Projects.manifest(project)))
+  if let Option<Path>.Some { value } = &library.* {
+    run ChildProcess.addArgument(&mut process, "--stdlib")
+    run ChildProcess.addArgumentBytes(&mut process, Path.rawBytes(&value))
+  }
+  if let Option<String>.Some { value } = &selected.target {
+    run ChildProcess.addArgument(&mut process, "--target")
+    run ChildProcess.addArgument(&mut process, value.view())
+  }
+  if selected.mode.view() == "release" {
+    run ChildProcess.addArgument(&mut process, "--release")
+  }
+  if selected.mode.view() == "size" {
+    run ChildProcess.addArgument(&mut process, "--optimization")
+    run ChildProcess.addArgument(&mut process, "size")
+  }
+  let names = [
+    "PATH",
+    "HOME",
+    "SILK_HOME",
+    "SILK_CLANG",
+    "SILK_LLVM_AR",
+    "SDKROOT",
+    "DEVELOPER_DIR",
+    "SystemRoot",
+    "USERPROFILE",
+    "LOCALAPPDATA",
+  ]
+  let mut at: usize = 0
+  while at < names.length {
+    if let Option<Bytes>.Some { value } = move run HostInput.variableNamed(names[at]) {
+      run ChildProcess.setVariableBytes(&mut process, String.utf8Bytes(names[at]), value.asSlice())
+    }
+    at = at + 1
+  }
+  run ChildProcess.setVariable(&mut process, "SILK_OFFLINE", "1")
+  run ChildProcess.setVariableBytes(&mut process, b"TMPDIR", Path.rawBytes(&steps))
+  let mut provider = OsChildProcess.make()
+  let result = run Effect.result(
+    ChildProcess.submit(&process) |> Effect.provideMut<ChildProcess>(&mut provider),
+  )
+  return match move result {
+    Result<ProcessOutcome, ProcessError | OutOfMemoryError>.Success {
+      value
+    } => match move value.value {
+      Exited finished => finished.code == 0
+      Signaled _signal => false
+    }
+    Result<ProcessOutcome, ProcessError | OutOfMemoryError>.Failure { error } => match move error {
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+      ProcessError _refused => false
+    }
+  }
+}

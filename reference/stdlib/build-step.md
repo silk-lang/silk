@@ -6,7 +6,7 @@ Build steps, their declared inputs, and values resolved only by the graph runner
 
 Import as `Step` with `import silk.build.step { Step }`.
 
-Public declarations: 11.
+Public declarations: 13.
 
 <a id="StepError"></a>
 
@@ -41,7 +41,9 @@ impl Debug for StepError
 ### Operation `debug`
 
 ```silk
-effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer
 ```
 
 <a id="StepFailure"></a>
@@ -49,7 +51,14 @@ effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &m
 ## `StepFailure`
 
 ```silk
-pub type StepFailure = StepError | AtomicWriteError | FileError | ProcessError | HostInputError | SchemaError | WriterError | OutOfMemoryError
+pub type StepFailure = StepError
+  | AtomicWriteError
+  | FileError
+  | ProcessError
+  | HostInputError
+  | SchemaError
+  | WriterError
+  | OutOfMemoryError
 ```
 
 Failures preserved by the build runner and its file, process, and serialization operations.
@@ -135,7 +144,9 @@ impl<T> Deferred<T>
 ### Method `copy`
 
 ```silk
-pub effect fn copy(self: &Self) -> Self ! OutOfMemoryError ? &mut Allocator
+pub effect fn copy(self: &Self) -> Self
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Retains a deferred reference without evaluating it or starting its producer.
@@ -153,7 +164,9 @@ impl<T> Deferred<T>
 ### Associated function `source`
 
 ```silk
-pub effect fn source(path: string) -> Deferred<Path> ! OutOfMemoryError ? &mut Allocator
+pub effect fn source(path: string) -> Deferred<Path>
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Names a path relative to the package root. The runner refuses paths that leave that root.
@@ -163,7 +176,9 @@ Names a path relative to the package root. The runner refuses paths that leave t
 ### Associated function `external`
 
 ```silk
-pub effect fn external(path: string) -> Deferred<Path> ! OutOfMemoryError ? &mut Allocator
+pub effect fn external(path: string) -> Deferred<Path>
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Names an explicitly supplied absolute host path.
@@ -181,7 +196,9 @@ impl<T: Schema> Deferred<T>
 ### Associated function `value`
 
 ```silk
-pub effect fn value(value: T) -> Self ! StepFailure ? &mut Allocator
+pub effect fn value(value: T) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Captures a known value without exposing a way to read deferred results while constructing the graph.
@@ -191,9 +208,12 @@ Captures a known value without exposing a way to read deferred results while con
 ### Method `map`
 
 ```silk
-pub effect fn map<U: Schema + Transferable + 'static, F: fn<'static>(T) -> U + Transferable + 'static>(
-    self: Self, transform: F
-  ) -> Deferred<U> ! StepFailure ? &mut Allocator
+pub effect fn map<
+    U: Schema + Transferable + 'static,
+    F: fn<'static>(T) -> U + Transferable + 'static
+  >(self: Self, transform: F) -> Deferred<U>
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Applies a noncapturing pure function when the graph resolves this value.
@@ -222,7 +242,9 @@ impl Key
 ### Method `bytes`
 
 ```silk
-pub effect fn bytes(self: &mut Self, value: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator
+pub effect fn bytes(self: &mut Self, value: &[u8]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Adds bytes with a length prefix so adjacent values cannot collide.
@@ -232,7 +254,9 @@ Adds bytes with a length prefix so adjacent values cannot collide.
 ### Method `text`
 
 ```silk
-pub effect fn text(self: &mut Self, value: string) -> () ! OutOfMemoryError ? &mut Allocator
+pub effect fn text(self: &mut Self, value: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Adds text to the step's identity.
@@ -242,17 +266,34 @@ Adds text to the step's identity.
 ### Method `file`
 
 ```silk
-pub effect fn file(self: &mut Self, value: &Deferred<Path>) -> () ! OutOfMemoryError ? &mut Allocator
+pub effect fn file(self: &mut Self, value: &Deferred<Path>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Declares one readable file; its bytes or producer key participate in this step's key.
+
+<a id="Key.impl.toolchain"></a>
+
+### Method `toolchain`
+
+```silk
+pub effect fn toolchain(self: &mut Self, compiler: &Deferred<Path>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Hashes the compiler and the LLVM tools selected from its installation and environment.
+Tool contents are inspected before every cache lookup, including replacements at the same path.
 
 <a id="Key.impl.tree"></a>
 
 ### Method `tree`
 
 ```silk
-pub effect fn tree(self: &mut Self, value: &Deferred<Path>) -> () ! OutOfMemoryError ? &mut Allocator
+pub effect fn tree(self: &mut Self, value: &Deferred<Path>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Declares a readable directory tree, including its names and file contents.
@@ -262,7 +303,9 @@ Declares a readable directory tree, including its names and file contents.
 ### Method `packageTree`
 
 ```silk
-pub effect fn packageTree(self: &mut Self, value: &Deferred<Path>) -> () ! OutOfMemoryError ? &mut Allocator
+pub effect fn packageTree(self: &mut Self, value: &Deferred<Path>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Declares package contents, excluding the root `build` directory and `.git` metadata.
@@ -273,7 +316,9 @@ Generated inputs below `build` must be declared separately through their produce
 ### Method `value`
 
 ```silk
-pub effect fn value<T>(self: &mut Self, value: &Deferred<T>) -> () ! OutOfMemoryError ? &mut Allocator
+pub effect fn value<T>(self: &mut Self, value: &Deferred<T>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Declares a typed value; a produced value contributes its producer key before it exists.
@@ -283,7 +328,9 @@ Declares a typed value; a produced value contributes its producer key before it 
 ### Method `files`
 
 ```silk
-pub effect fn files(self: &mut Self, paths: &Deferred<List<String>>) -> () ! OutOfMemoryError ? &mut Allocator
+pub effect fn files(self: &mut Self, paths: &Deferred<List<String>>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Declares a deferred list of absolute file paths. The runner obtains the list first, then
@@ -294,7 +341,9 @@ includes each file's path and contents in this step's key before deciding whethe
 ### Method `trees`
 
 ```silk
-pub effect fn trees(self: &mut Self, paths: &Deferred<List<String>>) -> () ! OutOfMemoryError ? &mut Allocator
+pub effect fn trees(self: &mut Self, paths: &Deferred<List<String>>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Declares deferred absolute directory paths, hashing each complete tree before cache lookup.
@@ -304,7 +353,9 @@ Declares deferred absolute directory paths, hashing each complete tree before ca
 ### Method `packageTrees`
 
 ```silk
-pub effect fn packageTrees(self: &mut Self, paths: &Deferred<List<String>>) -> () ! OutOfMemoryError ? &mut Allocator
+pub effect fn packageTrees(self: &mut Self, paths: &Deferred<List<String>>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Declares deferred package directories, excluding each root's build and version-control data.
@@ -314,7 +365,9 @@ Declares deferred package directories, excluding each root's build and version-c
 ### Method `environment`
 
 ```silk
-pub effect fn environment(self: &mut Self, name: string) -> () ! OutOfMemoryError ? &mut Allocator
+pub effect fn environment(self: &mut Self, name: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Declares an environment variable. Its presence and value enter the key and the child environment.
@@ -344,7 +397,9 @@ Work a root task explicitly adds to its build graph. Package plans cannot introd
 ### Operation `prepare`
 
 ```silk
-effect fn prepare(self: Self) -> Self ! StepFailure ? &mut Allocator
+effect fn prepare(self: Self) -> Self
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Materializes a static description before its inputs are recorded. This phase allocates only.
@@ -422,17 +477,32 @@ Retains the step without copying or running its work.
 ### Method `output`
 
 ```silk
-pub effect fn output(self: &Self, name: string) -> Deferred<Path> ! StepError | OutOfMemoryError ? &mut Allocator
+pub effect fn output(self: &Self, name: string) -> Deferred<Path>
+    ! StepError | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Names one file that this step will produce. The path must stay below its output directory.
+
+<a id="StepHandle.impl.resolvedPath"></a>
+
+### Method `resolvedPath`
+
+```silk
+pub fn resolvedPath(self: &Self) -> Deferred<Path>
+```
+
+Uses the absolute path text published by `Make.value` as a deferred file or tree.
+The producer runs when a consumer needs this path; the consumer keys the referenced contents.
 
 <a id="StepHandle.impl.valueFile"></a>
 
 ### Method `valueFile`
 
 ```silk
-pub effect fn valueFile<T: Schema>(self: &Self, name: string) -> Deferred<T> ! StepError | OutOfMemoryError ? &mut Allocator
+pub effect fn valueFile<T: Schema>(self: &Self, name: string) -> Deferred<T>
+    ! StepError | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Names a typed JSON output published by `Make.valueFile` during this step.
@@ -442,7 +512,9 @@ Names a typed JSON output published by `Make.valueFile` during this step.
 ### Method `value`
 
 ```silk
-pub effect fn value<T: Schema>(self: &Self) -> Deferred<T> ! OutOfMemoryError ? &mut Allocator
+pub effect fn value<T: Schema>(self: &Self) -> Deferred<T>
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Names the typed value published by `Make.value` during this step.
@@ -460,7 +532,9 @@ impl Step
 ### Associated function `register`
 
 ```silk
-pub effect fn register<T: Step + Transferable + 'static>(input: T) -> StepHandle ! StepFailure ? &mut Allocator
+pub effect fn register<T: Step + Transferable + 'static>(input: T) -> StepHandle
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Takes ownership of custom work and records its key without running it. Outputs retain this handle.
@@ -470,7 +544,9 @@ Takes ownership of custom work and records its key without running it. Outputs r
 ### Associated function `output`
 
 ```silk
-pub effect fn output(step: &StepHandle, name: string) -> Deferred<Path> ! StepError | OutOfMemoryError ? &mut Allocator
+pub effect fn output(step: &StepHandle, name: string) -> Deferred<Path>
+    ! StepError | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Names an output of registered work, creating its dependency edge without running it.
@@ -498,17 +574,34 @@ impl Make
 ### Method `readWithin`
 
 ```silk
-pub effect fn readWithin(self: &mut Self, tree: &Deferred<Path>, name: string) -> Bytes ! StepFailure ? &mut Allocator
+pub effect fn readWithin(self: &mut Self, tree: &Deferred<Path>, name: string) -> Bytes
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Reads one relative child of a directory declared with `Key.tree`.
+
+<a id="Make.impl.glob"></a>
+
+### Method `glob`
+
+```silk
+pub effect fn glob(self: &mut Self, tree: &Deferred<Path>, pattern: string) -> List<Path>
+    ! StepFailure
+    ? &mut Allocator
+```
+
+Lists files matching a package-relative glob within a declared tree.
+The directory must have been declared with `Key.tree` or `Key.packageTree`.
 
 <a id="Make.impl.requireOutput"></a>
 
 ### Method `requireOutput`
 
 ```silk
-pub effect fn requireOutput(self: &mut Self, name: string) -> () ! StepFailure ? &mut Allocator
+pub effect fn requireOutput(self: &mut Self, name: string) -> ()
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Verifies that a process wrote a declared output before the runner publishes its cache entry.
@@ -518,7 +611,9 @@ Verifies that a process wrote a declared output before the runner publishes its 
 ### Method `path`
 
 ```silk
-pub effect fn path(self: &Self, value: &Deferred<Path>) -> Path ! StepFailure ? &mut Allocator
+pub effect fn path(self: &Self, value: &Deferred<Path>) -> Path
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Resolves a file previously declared with `Key.file` or `Key.tree`.
@@ -528,7 +623,9 @@ Resolves a file previously declared with `Key.file` or `Key.tree`.
 ### Method `producer`
 
 ```silk
-pub effect fn producer<T>(self: &Self, value: &Deferred<T>) -> Option<String> ! StepFailure ? &mut Allocator
+pub effect fn producer<T>(self: &Self, value: &Deferred<T>) -> Option<String>
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Returns a declared input's producer key, absent for source files and known values.
@@ -538,7 +635,9 @@ Returns a declared input's producer key, absent for source files and known value
 ### Method `read`
 
 ```silk
-pub effect fn read(self: &mut Self, value: &Deferred<Path>) -> Bytes ! StepFailure ? &mut Allocator
+pub effect fn read(self: &mut Self, value: &Deferred<Path>) -> Bytes
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Reads a file previously declared in the key; undeclared access fails before opening a file.
@@ -548,7 +647,9 @@ Reads a file previously declared in the key; undeclared access fails before open
 ### Method `get`
 
 ```silk
-pub effect fn get<T: Schema>(self: &mut Self, value: &Deferred<T>) -> T ! StepFailure ? &mut Allocator
+pub effect fn get<T: Schema>(self: &mut Self, value: &Deferred<T>) -> T
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Resolves a typed value previously declared with `Key.value`.
@@ -558,7 +659,9 @@ Resolves a typed value previously declared with `Key.value`.
 ### Method `output`
 
 ```silk
-pub effect fn output(self: &Self, name: string) -> Path ! StepFailure ? &mut Allocator
+pub effect fn output(self: &Self, name: string) -> Path
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Returns a path below this step's output directory, refusing traversal and absolute names.
@@ -568,7 +671,9 @@ Returns a path below this step's output directory, refusing traversal and absolu
 ### Method `readOutput`
 
 ```silk
-pub effect fn readOutput(self: &mut Self, name: string) -> Bytes ! StepFailure ? &mut Allocator
+pub effect fn readOutput(self: &mut Self, name: string) -> Bytes
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Reads a file produced inside this step's output directory, refusing paths outside it.
@@ -578,7 +683,9 @@ Reads a file produced inside this step's output directory, refusing paths outsid
 ### Method `write`
 
 ```silk
-pub effect fn write(self: &mut Self, name: string, bytes: &[u8]) -> () ! StepFailure ? &mut Allocator
+pub effect fn write(self: &mut Self, name: string, bytes: &[u8]) -> ()
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Writes a file below this step's output directory, creating its parent directories.
@@ -588,7 +695,9 @@ Writes a file below this step's output directory, creating its parent directorie
 ### Method `valueFile`
 
 ```silk
-pub effect fn valueFile<T: Schema>(self: &mut Self, name: string, value: &T) -> () ! StepFailure ? &mut Allocator
+pub effect fn valueFile<T: Schema>(self: &mut Self, name: string, value: &T) -> ()
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Publishes one named typed result as JSON for deferred consumers.
@@ -598,17 +707,38 @@ Publishes one named typed result as JSON for deferred consumers.
 ### Method `value`
 
 ```silk
-pub effect fn value<T: Schema>(self: &mut Self, value: &T) -> () ! StepFailure ? &mut Allocator
+pub effect fn value<T: Schema>(self: &mut Self, value: &T) -> ()
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Publishes this step's typed result for deferred consumers.
+
+<a id="Make.impl.resolvedPath"></a>
+
+### Method `resolvedPath`
+
+```silk
+pub effect fn resolvedPath(self: &mut Self, path: &String) -> ()
+    ! StepFailure
+    ? &mut Allocator
+```
+
+Publishes an external path obtained by this step. A cache hit is valid only while it exists.
+Consumers hash the selected file or tree, so changing its contents also invalidates them.
 
 <a id="Make.impl.exec"></a>
 
 ### Method `exec`
 
 ```silk
-pub effect fn exec(self: &mut Self, program: &Deferred<Path>, arguments: &[string]) -> ProcessOutcome ! StepFailure ? &mut Allocator
+pub effect fn exec(
+    self: &mut Self,
+    program: &Deferred<Path>,
+    arguments: &[string],
+  ) -> ProcessOutcome
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Executes a declared program in the output directory with only the keyed environment.
@@ -618,7 +748,14 @@ Executes a declared program in the output directory with only the keyed environm
 ### Method `execConfined`
 
 ```silk
-pub effect fn execConfined(self: &mut Self, launcher: &Deferred<Path>, program: &Deferred<Path>, arguments: &[string]) -> ProcessOutcome ! StepFailure ? &mut Allocator
+pub effect fn execConfined(
+    self: &mut Self,
+    launcher: &Deferred<Path>,
+    program: &Deferred<Path>,
+    arguments: &[string],
+  ) -> ProcessOutcome
+    ! StepFailure
+    ? &mut Allocator
 ```
 
 Executes a declared program through a declared sandbox launcher with only keyed reads.
@@ -643,6 +780,66 @@ pub struct Runner
 
 Executes an immutable graph with content-verified caching and bounded worker memory.
 
+<a id="CompilationOutput"></a>
+
+## `CompilationOutput`
+
+```silk
+pub struct CompilationOutput
+```
+
+One compilation reached through the requested graph.
+
+<a id="CompilationOutput.directory"></a>
+
+### Field `directory`
+
+```silk
+pub directory: Path
+```
+
+Its cache directory, containing the complete request and emitted files.
+
+<a id="CompilationOutput.compiled"></a>
+
+### Field `compiled`
+
+```silk
+pub compiled: bool
+```
+
+Whether the artifact was built, including prerequisites of a planning invocation.
+
+<a id="Execution"></a>
+
+## `Execution`
+
+```silk
+pub struct Execution
+```
+
+Completed root outputs and every reachable compilation.
+
+<a id="Execution.outputs"></a>
+
+### Field `outputs`
+
+```silk
+pub outputs: List<Path>
+```
+
+Cache directories in the order roots were requested.
+
+<a id="Execution.compilations"></a>
+
+### Field `compilations`
+
+```silk
+pub compilations: List<CompilationOutput>
+```
+
+Reachable compilations, including tools needed by other steps.
+
 <a id="Runner.impl"></a>
 
 ## Implementation `Runner`
@@ -657,7 +854,8 @@ impl Runner
 
 ```silk
 pub effect fn make(root: Path, cache: Path, identity: &[u8]) -> Self
-  ! OutOfMemoryError ? &mut Allocator
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Sets the package root, cache directory, and identity of the task program and compiler.
@@ -688,8 +886,9 @@ Limits the number of worker fibers; zero selects one worker.
 ### Method `execute`
 
 ```silk
-pub effect fn execute(self: &Self, targets: &[StepHandle], compile: bool) -> List<Path>
-  ! StepFailure | SpawnError | Cancelled ? &mut Allocator | &mut FileSystem | &mut HostInput
+pub effect fn execute(self: &Self, targets: &[StepHandle], compile: bool) -> Execution
+    ! StepFailure | SpawnError | Cancelled
+    ? &mut Allocator | &mut FileSystem | &mut HostInput
 ```
 
 Resolves each key before running its step, executing prerequisites needed to discover file sets.
