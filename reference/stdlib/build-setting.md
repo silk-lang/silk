@@ -6,7 +6,7 @@ Deferred compilation settings resolved by the graph runner.
 
 Import as `Setting` with `import silk.build.setting { Setting }`.
 
-Public declarations: 7.
+Public declarations: 9.
 
 <a id="TextField"></a>
 
@@ -626,12 +626,34 @@ pub alias: String
 pub settings: Package
 ```
 
+<a id="replaces"></a>
+
+## `replaces`
+
+```silk
+pub fn replaces(later: &Setting, earlier: &Setting) -> bool
+```
+
+Reports whether a later setting replaces an earlier setting's value and inputs.
+
+<a id="clearReplaced"></a>
+
+## `clearReplaced`
+
+```silk
+pub fn clearReplaced(definition: &mut Definition, setting: &Setting) -> ()
+```
+
+Removes physical inputs replaced by deferred settings before the definition is keyed.
+
 <a id="key"></a>
 
 ## `key`
 
 ```silk
-pub effect fn key(setting: &Setting, key: &mut Key) -> () ! StepFailure ? &mut Allocator
+pub effect fn key(setting: &Setting, key: &mut Key) -> ()
+  ! StepFailure
+  ? &mut Allocator
 ```
 
 Adds a setting's identity and all deferred inputs to the compilation key.
@@ -641,7 +663,9 @@ Adds a setting's identity and all deferred inputs to the compilation key.
 ## `apply`
 
 ```silk
-pub effect fn apply(setting: &Setting, make: &mut Make, definition: &mut Definition) -> () ! StepFailure ? &mut Allocator
+pub effect fn apply(setting: &Setting, make: &mut Make, definition: &mut Definition) -> ()
+  ! StepFailure
+  ? &mut Allocator
 ```
 
 Resolves a setting only after its declared prerequisites have completed.
@@ -651,7 +675,9 @@ Resolves a setting only after its declared prerequisites have completed.
 ## `keyValues`
 
 ```silk
-pub effect fn keyValues(values: &Values, key: &mut Key) -> () ! StepFailure ? &mut Allocator
+pub effect fn keyValues(values: &Values, key: &mut Key) -> ()
+  ! StepFailure
+  ? &mut Allocator
 ```
 
 Declares every physical input already present in a compilation definition.
