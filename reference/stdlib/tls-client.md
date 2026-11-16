@@ -2272,6 +2272,64 @@ pub fn closeNotified(self: &Self) -> bool
 Returns whether the server sent `close_notify`. Plaintext that came before it can still be
 read.
 
+<a id="Client.impl.deferVerification"></a>
+
+### Method `deferVerification`
+
+```silk
+pub fn deferVerification(self: &mut Self) -> ()
+```
+
+Makes the handshake go on when the server's certificate chain does not validate against the
+trust snapshot, or its names do not match the reference identity, and records the failure
+instead, for [`Client.verificationFailure`](#Client.impl.verificationFailure). Call it before the server's Certificate
+message arrives.
+
+#### When to use
+Use it when the caller decides itself whether an unverified server is acceptable, as Node.js
+does with `rejectUnauthorized` and `checkServerIdentity`.
+
+#### Details
+Only the chain and the name are deferred. The client still checks that the server holds the
+leaf's key (CertificateVerify, or the TLS 1.2 ServerKeyExchange signature) and the Finished
+messages, and fails when they do not verify.
+
+#### Gotchas
+A deferred client can talk to anyone. Check [`Client.verificationFailure`](#Client.impl.verificationFailure) after
+`Authenticated`, before you trust the connection.
+
+<a id="Client.impl.verificationFailure"></a>
+
+### Method `verificationFailure`
+
+```silk
+pub fn verificationFailure<'a>(self: &'a Self) -> Option<&'a TlsError>
+```
+
+Returns why the server's chain or name did not verify, for a client that deferred its
+verification ([`Client.deferVerification`](#Client.impl.deferVerification)), or `None` when both verified (or before the
+server's Certificate message). The chain's failure comes first when both failed.
+
+<a id="Client.impl.peerCertificateCount"></a>
+
+### Method `peerCertificateCount`
+
+```silk
+pub fn peerCertificateCount(self: &Self) -> usize
+```
+
+Returns the number of certificates the server sent, leaf first.
+
+<a id="Client.impl.peerCertificateDer"></a>
+
+### Method `peerCertificateDer`
+
+```silk
+pub fn peerCertificateDer<'a>(self: &'a Self, index: usize) -> Option<&'a [u8]>
+```
+
+Returns the DER of the server's certificate at `index` (0 is the leaf), as it was sent.
+
 <a id="Client.impl.authentication"></a>
 
 ### Method `authentication`
