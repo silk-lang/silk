@@ -10,7 +10,7 @@ The type's schema controls field names, defaults, validation, and unknown fields
 
 ## Details
 TOML tables become schema objects, and arrays become lists. Strings remain text without scalar coercion.
-Encoding writes root assignments and nested inline tables in declaration order. Absent optional fields are omitted.
+Encoding writes root assignments and nested inline tables in declaration order, with bare keys where TOML allows them. Absent optional fields are omitted.
 TOML has no null value; a null inside an array cannot be encoded.
 
 Import as `SchemaToml` with `import silk.schema.toml { SchemaToml }`.
@@ -512,7 +512,7 @@ effect fn key(self: &mut Self, name: string) -> ()
     ? &mut Writer
 ```
 
-Separates assignments and writes a quoted key followed by ` = `.
+Separates assignments and writes the key followed by ` = `. A key of ASCII letters, digits, `-` and `_` is written bare, any other key quoted.
 
 <a id="TomlSchemaWriter.impl.SchemaWriter.endObject"></a>
 

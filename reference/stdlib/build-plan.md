@@ -10,7 +10,7 @@ processes require dependency authorization and a supported operating-system sand
 
 Import as `Plan` with `import silk.build.plan { Plan }`.
 
-Public declarations: 2.
+Public declarations: 4.
 
 <a id="Operation"></a>
 
@@ -246,6 +246,172 @@ The package's native symbol order file.
 pub path: Input
 ```
 
+<a id="Library"></a>
+
+## `Library`
+
+```silk
+pub struct Library
+```
+
+How a named library is linked: by static or dynamic search, and whether it is weak or retained.
+
+### When to use
+
+Pass it to `Plan.linkLibrary` or `Compilation.linkLibrary`. Start from [`Library.dynamicSearch`](#Library.impl.dynamicSearch) or
+[`Library.staticSearch`](#Library.impl.staticSearch) and add [`Library.weak`](#Library.impl.weak) or [`Library.needed`](#Library.impl.needed) only where the link needs them.
+
+<a id="Library.mode"></a>
+
+### Field `mode`
+
+```silk
+pub mode: string<'static>
+```
+
+`"dynamic"` or `"static"`.
+
+<a id="Library.isWeak"></a>
+
+### Field `isWeak`
+
+```silk
+pub isWeak: bool
+```
+
+Whether the program may start when the library is absent.
+
+<a id="Library.isNeeded"></a>
+
+### Field `isNeeded`
+
+```silk
+pub isNeeded: bool
+```
+
+Whether the library stays linked when no symbol refers to it.
+
+<a id="Library.impl"></a>
+
+## Implementation `Library`
+
+```silk
+impl Library
+```
+
+<a id="Library.impl.dynamicSearch"></a>
+
+### Associated function `dynamicSearch`
+
+```silk
+pub fn dynamicSearch() -> Library
+```
+
+A library found by dynamic search, strong and dropped when unused.
+
+<a id="Library.impl.staticSearch"></a>
+
+### Associated function `staticSearch`
+
+```silk
+pub fn staticSearch() -> Library
+```
+
+A library found by static search, strong and dropped when unused.
+
+<a id="Library.impl.weak"></a>
+
+### Method `weak`
+
+```silk
+pub fn weak(self: Self) -> Library
+```
+
+Returns this library linked weakly, so the program may start when it is absent.
+
+<a id="Library.impl.needed"></a>
+
+### Method `needed`
+
+```silk
+pub fn needed(self: Self) -> Library
+```
+
+Returns this library retained even when no symbol refers to it.
+
+<a id="Framework"></a>
+
+## `Framework`
+
+```silk
+pub struct Framework
+```
+
+How a named macOS framework is linked: whether it is weak or retained.
+
+### When to use
+
+Pass it to `Plan.linkFramework` or `Compilation.linkFramework`. Start from [`Framework.make`](#Framework.impl.make)
+and add [`Framework.weak`](#Framework.impl.weak) or [`Framework.needed`](#Framework.impl.needed) only where the link needs them.
+
+<a id="Framework.isWeak"></a>
+
+### Field `isWeak`
+
+```silk
+pub isWeak: bool
+```
+
+Whether the program may start when the framework is absent.
+
+<a id="Framework.isNeeded"></a>
+
+### Field `isNeeded`
+
+```silk
+pub isNeeded: bool
+```
+
+Whether the framework stays linked when no symbol refers to it.
+
+<a id="Framework.impl"></a>
+
+## Implementation `Framework`
+
+```silk
+impl Framework
+```
+
+<a id="Framework.impl.make"></a>
+
+### Associated function `make`
+
+```silk
+pub fn make() -> Framework
+```
+
+A framework linked strongly and dropped when unused.
+
+<a id="Framework.impl.weak"></a>
+
+### Method `weak`
+
+```silk
+pub fn weak(self: Self) -> Framework
+```
+
+Returns this framework linked weakly, so the program may start when it is absent.
+
+<a id="Framework.impl.needed"></a>
+
+### Method `needed`
+
+```silk
+pub fn needed(self: Self) -> Framework
+```
+
+Returns this framework retained even when no symbol refers to it.
+
 <a id="Plan"></a>
 
 ## `Plan`
@@ -465,26 +631,20 @@ Supplies a deferred native linker script.
 ### Method `linkLibrary`
 
 ```silk
-pub static fn linkLibrary(
-    self: Self,
-    name: string<'static>,
-    mode: string<'static>,
-    weak: bool,
-    needed: bool,
-  ) -> Self
+pub static fn linkLibrary(self: Self, name: string<'static>, library: Library) -> Self
 ```
 
-Links a named library using static or dynamic search, optionally weak or retained.
+Links a named library as `library` describes, for example `Library.dynamicSearch()`.
 
 <a id="Plan.impl.linkFramework"></a>
 
 ### Method `linkFramework`
 
 ```silk
-pub static fn linkFramework(self: Self, name: string<'static>, weak: bool, needed: bool) -> Self
+pub static fn linkFramework(self: Self, name: string<'static>, framework: Framework) -> Self
 ```
 
-Links a named macOS framework, optionally weak or retained.
+Links a named macOS framework as `framework` describes, for example `Framework.make()`.
 
 <a id="Plan.impl.rpath"></a>
 

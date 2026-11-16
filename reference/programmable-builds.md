@@ -84,7 +84,7 @@ A package may declare `pub param` values in source or `build.silk`. The consumer
 `build.silk` exports `pub const PLAN: Plan`. The compiler evaluates it statically, with standard-library imports and the package's parameters. The plan contributes generated modules, native sources and link inputs. Target conditions are ordinary static code.
 
 ```silk
-import silk.build.plan { Plan }
+import silk.build.plan { Library, Plan }
 import silk.build.step { sourcePath }
 
 static fn plan() -> Plan {
@@ -92,7 +92,7 @@ static fn plan() -> Plan {
   result = result |> Plan.compileC(sourcePath("native/codec.c"))
   result = result |> Plan.includePath(sourcePath("include"))
   if Intrinsic.targetOperatingSystem() == "linux" {
-    result = result |> Plan.linkLibrary("m", "dynamic", false, false)
+    result = result |> Plan.linkLibrary("m", Library.dynamicSearch())
   }
   return result
 }

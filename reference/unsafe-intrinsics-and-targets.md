@@ -1186,7 +1186,7 @@ the package unless a consumer grants a supplied path. A target condition in ordi
 selects platform-specific requirements.
 
 ```silk,ignore
-import silk.build.plan { Plan }
+import silk.build.plan { Framework, Plan }
 import silk.build.step { sourcePath }
 import silk.core.target { Target, OperatingSystem }
 
@@ -1195,7 +1195,7 @@ static fn plan() -> Plan {
   native = Plan.compileC(native, sourcePath("native/support.c"))
   native = Plan.compileNative(native, "c", sourcePath("native/special.c"), &["-DSPECIAL=1"], &[])
   if Target.operatingSystem() == OperatingSystem.Darwin {
-    native = Plan.linkFramework(native, "Metal", false, false)
+    native = Plan.linkFramework(native, "Metal", Framework.make())
   }
   return native
 }

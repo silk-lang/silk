@@ -695,30 +695,24 @@ Selects a deferred function-order file, including its contents in the key.
 ### Method `linkLibrary`
 
 ```silk
-pub effect fn linkLibrary(
-    self: Self,
-    name: Deferred<String>,
-    mode: string,
-    weak: bool,
-    needed: bool,
-  ) -> Self
+pub effect fn linkLibrary(self: Self, name: Deferred<String>, library: Library) -> Self
     ! StepFailure
     ? &mut Allocator
 ```
 
-Links a deferred library name, with an explicit static or dynamic mode and retention policy.
+Links a deferred library name as `library` describes, for example `Library.dynamicSearch()`.
 
 <a id="Compilation.impl.linkFramework"></a>
 
 ### Method `linkFramework`
 
 ```silk
-pub effect fn linkFramework(self: Self, name: Deferred<String>, weak: bool, needed: bool) -> Self
+pub effect fn linkFramework(self: Self, name: Deferred<String>, framework: Framework) -> Self
     ! StepFailure
     ? &mut Allocator
 ```
 
-Links a deferred macOS framework name with an explicit retention policy.
+Links a deferred macOS framework name as `framework` describes, for example `Framework.make()`.
 
 <a id="Compilation.impl.rpath"></a>
 
