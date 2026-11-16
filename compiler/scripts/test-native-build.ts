@@ -1254,6 +1254,27 @@ const program = Effect.gen(function* () {
     if (ignored) assert.doesNotMatch(unused.stderr, /--ignore-warnings/)
     else assert.match(unused.stderr, /^silk: warnings fail this command; fix them, or pass --ignore-warnings to allow them$/m)
   }
+  // A path dependency is the author's own code, so its warnings are reported and fail the
+  // dependent's check and build too (#3149).
+  yield* fs.makeDirectory(join(directory, 'unuseddep/src'), { recursive: true })
+  yield* fs.makeDirectory(join(directory, 'unusedapp/src'), { recursive: true })
+  yield* fs.writeFileString(
+    join(directory, 'unuseddep/silk.toml'),
+    '[package]\nname = "unuseddep"\nversion = "0.1.0"\nkind = "library"\nexports = ["lib"]\n',
+  )
+  yield* fs.writeFileString(join(directory, 'unuseddep/src/lib.silk'), 'import silk.num.u64\n\npub fn value() -> i32 {\n  return 0\n}\n')
+  yield* fs.writeFileString(
+    join(directory, 'unusedapp/silk.toml'),
+    '[package]\nname = "unusedapp"\nversion = "0.1.0"\n\n[dependencies]\nunuseddep = { path = "../unuseddep" }\n',
+  )
+  yield* fs.writeFileString(join(directory, 'unusedapp/src/main.silk'), 'import unuseddep.lib\n\npub fn main() -> i32 {\n  return lib.value()\n}\n')
+  for (const command of ['check', 'build']) {
+    const dependent = yield* invoke(silk, [
+      command, '--stdlib', standardLibrary, ...(command === 'build' ? ['--clang', clang] : []),
+    ], join(directory, 'unusedapp'))
+    assert.equal(dependent.status, 1, dependent.stderr)
+    assert.match(dependent.stderr, /unuseddep\/src\/lib\.silk:1:17: warning\[MOD0007\] Import `u64` is never used/m)
+  }
   // A package that cannot be loaded ends its load row as failed and still names itself on its
   // final line.
   yield* fs.makeDirectory(join(directory, 'unexported/src'), { recursive: true })
