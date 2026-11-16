@@ -320,8 +320,9 @@ is, and `TransferableWake` always is; both assert it with an `impl` (THREAD-003)
 
 `TransferableExecution.local` returns the intrinsic handle for `Execution.drive`, and
 `TransferableExecution.adopt` wraps one again, such as the dormant handle `onSuspend` receives.
-Values the body creates itself carry no bound: Silk has no thread-local or mutable global storage,
-so only the body reaches them while it moves between threads.
+Values the body creates itself carry no bound: Silk has no safe thread-local or mutable global
+storage, so only the body reaches them while it moves between threads. The unsafe process and
+thread slots (see the native pointer boundary) are the exception the unsafe code answers for.
 
 ```silk,ignore
 fn register(wake: TransferableWake) -> Guard {

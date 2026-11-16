@@ -70,7 +70,7 @@ pub fn main() -> i32 {
 
 Import as `u32` with `import silk.num.u32`.
 
-Public declarations: 72.
+Public declarations: 77.
 
 <a id="MAX"></a>
 
@@ -632,6 +632,65 @@ pub fn rotateRight(left: u32, right: u32) -> u32
 
 Rotates the bits of `left` right by `right` positions. The count is reduced modulo [`BITS`](#BITS), so
 each count is valid.
+
+<a id="byteSwap"></a>
+
+## `byteSwap`
+
+```silk
+pub fn byteSwap(value: u32) -> u32
+```
+
+Returns `value` with the order of its bytes reversed. An optimized build makes it one byte swap
+instruction where the target has one.
+
+<a id="fromLittleEndian"></a>
+
+## `fromLittleEndian`
+
+```silk
+pub fn fromLittleEndian(value: u32) -> u32
+```
+
+Returns the `u32` whose little-endian bytes are the bytes of `value` in memory, such as a word
+read with `Pointer.readUnaligned` from a little-endian format. It does nothing on a
+little-endian target and swaps the bytes on a big-endian one.
+
+<a id="toLittleEndian"></a>
+
+## `toLittleEndian`
+
+```silk
+pub fn toLittleEndian(value: u32) -> u32
+```
+
+Returns `value` arranged so that its bytes in memory are little-endian, for writing it to a
+little-endian format. It does nothing on a little-endian target and swaps the bytes on a
+big-endian one.
+
+<a id="fromBigEndian"></a>
+
+## `fromBigEndian`
+
+```silk
+pub fn fromBigEndian(value: u32) -> u32
+```
+
+Returns the `u32` whose big-endian bytes are the bytes of `value` in memory, such as a word read
+with `Pointer.readUnaligned` from a network header. It swaps the bytes on a little-endian target
+and does nothing on a big-endian one.
+
+<a id="toBigEndian"></a>
+
+## `toBigEndian`
+
+```silk
+pub fn toBigEndian(value: u32) -> u32
+```
+
+Returns `value` arranged so that its bytes in memory are big-endian, for writing it to a
+network header or another big-endian format. It swaps the bytes on a little-endian target and
+does nothing on a big-endian one.
 
 <a id="countOnes"></a>
 
