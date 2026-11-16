@@ -378,7 +378,8 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   const mixedSteps = yield* fs.readDirectory(join(aliased, 'build/steps'))
   const mixedSizes: Array<string> = []
   for (const name of mixedSteps) {
-    if (yield* fs.exists(join(aliased, 'build/steps', name, 'size.txt'))) mixedSizes.push(name)
+    // A step directory is named by its key; lock files and records sit beside them.
+    if (/^[0-9a-f]{64}$/.test(name) && (yield* fs.exists(join(aliased, 'build/steps', name, 'size.txt')))) mixedSizes.push(name)
   }
   assert.equal(mixedSizes.length, 1, 'the custom step that reads the artifact ran once')
   const argumentsFor = (output: string) => [
