@@ -6,7 +6,7 @@ Build steps, their declared inputs, and values resolved only by the graph runner
 
 Import as `Step` with `import silk.build.step { Step }`.
 
-Public declarations: 13.
+Public declarations: 14.
 
 <a id="StepError"></a>
 
@@ -894,6 +894,18 @@ pub effect fn execute(self: &Self, targets: &[StepHandle], compile: bool) -> Exe
 Resolves each key before running its step, executing prerequisites needed to discover file sets.
 Only requested steps and their declared inputs run.
 When `compile` is false, requested compilations write requests while prerequisite tools build.
+
+<a id="recordDirectory"></a>
+
+## `recordDirectory`
+
+```silk
+pub effect fn recordDirectory(cache: &Path) -> Path
+  ! FileError | OutOfMemoryError
+  ? &mut Allocator
+```
+
+Where the digests of unchanged inputs are recorded, beside the step outputs they key.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`, `wasm64-unknown-unknown`.
