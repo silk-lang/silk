@@ -5,8 +5,9 @@
 Commands implemented by a project's tasks.silk program.
 
 Put project automation in src/tasks.silk. A command is a union variant described with
-silk.cli. The build, run, test, and plan commands select matching variants; missing variants
-use the compiler's built-in commands. Dependencies' tasks never run.
+silk.cli. `silk build`, `silk run`, `silk test` and `silk plan` run the variants named Build,
+Run, Test and Plan; for one the union does not have, Task.main hands the command back and the
+toolchain runs its built-in. Dependencies' tasks never run.
 
 Task.main parses typed options and invokes TaskSet.perform. Task.exec and Task.silk share
 the developer's terminal and environment. SILK_PROJECT_ROOT is the package directory,
@@ -51,8 +52,6 @@ impl TaskSet for Tasks {
     }
   }
 }
-
-pub const COMMANDS: string = Task.commands<Tasks>()
 
 pub effect fn main() -> i32 ? &mut HostInput {
   return run Task.main<Tasks>()
@@ -151,18 +150,6 @@ The functions of a tasks program.
 impl Task
 ```
 
-<a id="Task.impl.commands"></a>
-
-### Associated function `commands`
-
-```silk
-pub static fn commands<T: CommandLine>() -> string<'static>
-```
-
-Computes the command catalog without running the task program.
-Declare `pub const COMMANDS: string = Task.commands<Tasks>()` in `tasks.silk`.
-The driver reads this constant to decide which reserved commands have project implementations.
-
 <a id="Task.impl.main"></a>
 
 ### Associated function `main`
@@ -176,6 +163,10 @@ Reads the command line as `T`, runs the task it names, and answers the exit stat
 the task succeeded, 0 after `--help`, 2 after a command line error, and a failed task's
 [`TaskError.status`](#TaskError.status) after writing `error: <message>` to standard error. An unexpected failure,
 such as a file that cannot be read, is reported the same way with status 1.
+
+`build`, `run`, `test` and `plan` are the toolchain's own commands. When `silk` starts the
+tasks program for one of them and `T` has no variant of that name, nothing runs here: the
+status is 0 and `silk` runs its built-in command.
 
 <a id="Task.impl.abort"></a>
 

@@ -6,7 +6,7 @@ A manifest identifies a package and declares its dependencies. A command constru
 
 `build`, `run`, `test` and `plan` are reserved task names. Each has a built-in implementation. A variant in the root package's `tasks.silk` replaces that built-in. Other variants are project commands, invoked with `silk task <name>`.
 
-A tasks module implements `CommandLine` and `TaskSet` for its command union, exposes `pub const COMMANDS: string = Task.commands<Tasks>()`, and calls `Task.main<Tasks>()` from its entry. The metadata describes available commands without running the task entry. Only the root package's tasks run. Dependencies contribute static `build.silk` plans and ordinary modules the root may import.
+A tasks module implements `CommandLine` and `TaskSet` for its command union and calls `Task.main<Tasks>()` from its entry. It declares nothing else. A package without a `tasks.silk` uses the built-ins directly. A package with one sends all four reserved commands to its tasks program, so that program is built first. For a reserved command the union has no variant for, `Task.main` runs nothing and the toolchain runs its built-in. Only the root package's tasks run. Dependencies contribute static `build.silk` plans and ordinary modules the root may import.
 
 Commands embed `silk.build.options.Options` and flatten it in their `CommandLine` description. It owns `--target`, `--release`, `--optimization`, `--debug` and `--unsandboxed-tools`. Commands may add flags but cannot redefine these. A command building several targets creates a compilation for each target.
 
@@ -87,7 +87,7 @@ A dependency's tool steps require `tools = true` on its dependency entry. Tools 
 
 Requests contain absolute source and native paths, all package parameters, generated modules, compiler settings and platform inputs. Replaying a request uses these captured values even when an ambient manifest changes.
 
-The language server reads saved requests and `compile_commands.json`. With workspace trust and refresh enabled, it may run the root's `plan` under confinement. A project without a `Plan` variant uses the built-in compilation without running its task entry. An unavailable or refused refresh retains the last usable requests and reports that the developer should run `silk build` or `silk plan`. `check`, `format`, `doc`, `hash` and `pack` do not run project tasks.
+The language server reads saved requests and `compile_commands.json`. With workspace trust and refresh enabled, it may run the root's `plan` under confinement. A project with a `tasks.silk` builds and starts its tasks program under the same confinement; without a `Plan` variant that program runs nothing and the built-in plan is used. An unavailable or refused refresh retains the last usable requests and reports that the developer should run `silk build` or `silk plan`. `check`, `format`, `doc`, `hash` and `pack` do not run project tasks.
 
 ## Package code generation and platforms
 
