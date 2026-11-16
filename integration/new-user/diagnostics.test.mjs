@@ -41,6 +41,7 @@ const cases = [
   ['left a placeholder open', `${logging}  run Effect.log("hi {name", &.{ name: 1 }) |> Effect.provideMut(&mut logger)\n}\n`, /error\[SEM0177\] template placeholder is not closed: \{name$/],
   ['logged a struct with no Display', `struct P { x: i32 }\n${logging}  let p = P { x: 1 }\n  run Effect.log("{p}", &.{ p: move p }) |> Effect.provideMut(&mut logger)\n}\n`, /error\[SEM0121\] `main\.P: silk[./]text[./]format\.Display` cannot be proved/],
   ['wrote a typed literal', 'pub fn main() -> i32 {\n  let x = 5u64\n  return 0\n}\n', /error\[LEX0014\] Numeric literals take no type suffix/],
+  ['left the unit off a duration', 'pub fn main() -> i32 {\n  let nap = 1h30\n  return 0\n}\n', /error\[LEX0015\] Duration amount `30` has no unit; add one, as in `1h30m`$/],
 ]
 
 for (const [what, source, first] of cases) {
