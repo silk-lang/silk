@@ -76,7 +76,7 @@ flags=(
   -DLLVM_TOOL_LLVM_NM_BUILD=OFF
   -DLLVM_TOOL_LLVM_OBJCOPY_BUILD=OFF
   -DLLVM_TOOL_LLVM_OBJDUMP_BUILD=OFF
-  -DLLVM_TOOL_LLVM_RC_BUILD=OFF
+  -DLLVM_TOOL_LLVM_RC_BUILD=ON
   -DLLVM_TOOL_LLVM_READOBJ_BUILD=OFF
   -DLLVM_TOOL_LLVM_READTAPI_BUILD=OFF
   -DLLVM_TOOL_LLVM_SIZE_BUILD=OFF
@@ -113,3 +113,4 @@ mkdir -p "$output/lib/clang/$major"
 cp -R "$build/lib/clang/$major/include" "$output/lib/clang/$major/include"
 cp "$source/llvm/LICENSE.TXT" "$output/LICENSE.TXT"
 "$output/bin/llvm$suffix" clang --version
+"$output/bin/llvm$suffix" llvm-rc /? > /dev/null
