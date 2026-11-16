@@ -106,6 +106,22 @@ pub status: i32
 
 The exit status, such as the status of a program that [`Task.exec`](#Task.impl.exec) ran. Never 0.
 
+<a id="TaskError.impl.Debug"></a>
+
+## Implementation `Debug for TaskError`
+
+```silk
+impl Debug for TaskError
+```
+
+<a id="TaskError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
 <a id="TaskSet"></a>
 
 ## `TaskSet`
@@ -122,7 +138,7 @@ A command line whose variants are tasks.
 
 ```silk
 effect fn perform(self: Self) -> ()
-    ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+    ! TaskError | StepFailure | SpawnError | Cancelled
     ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem
 ```
 

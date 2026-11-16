@@ -1,0 +1,164 @@
+//! Package context and local input closure for resolving compilation definitions.
+
+import silk.build.manifest { Manifest, Workspace, Dependency, Package }
+import silk.build.step { StepError, StepFailure, Deferred }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.schema.issue { SchemaError }
+import silk.schema.schema { Dictionary }
+import silk.schema.toml { SchemaToml }
+import silk.platform.windows.path { WindowsPath }
+import silk.system.executable as Executable
+import silk.system.filesystem { FileSystem, Path }
+import silk.system.host_input { HostInput }
+import silk.text.string { String }
+import silk.num.usize
+
+/// Finds the nearest package manifest above the task's package or current directory.
+pub effect fn manifest() -> Path ! StepFailure ? &mut Allocator | &mut FileSystem | &mut HostInput {
+  let start = match move run HostInput.variableNamed("SILK_PROJECT_ROOT") {
+    Option<Bytes>.Some {value} => move value
+    Option<Bytes>.None => run HostInput.workingDirectory()
+  }
+  let mut directory = run fromHost(start.asSlice())
+  while true {
+    let file = run Path.join(&directory, "silk.toml")
+    if run FileSystem.exists(&file) {
+      let bytes = run FileSystem.readFile(&file)
+      let metadata = run SchemaToml.decode<Manifest>(bytes.asSlice())
+      if metadata.package.isSome() { return move file }
+    }
+    directory = match move run Path.parent(&directory) {
+      Option<Path>.Some {value} => move value
+      Option<Path>.None => { fail StepError {message: run String.copy("the compilation has no package manifest")} }
+    }
+  }
+}
+
+/// Returns the compiler that launched the task, or the installed `silkc` executable.
+pub effect fn compiler() -> Deferred<Path> ! StepFailure ? &mut Allocator | &mut HostInput | &mut FileSystem {
+  if let Option<Bytes>.Some {value} = move run HostInput.variableNamed("SILK_COMPILER") {
+    return run Deferred<Path>.external((run text(&run fromHost(value.asSlice()))).view())
+  }
+  if let Option<Path>.Some {value} = move run Executable.find("silkc") {
+    return run Deferred<Path>.external((run text(&value)).view())
+  }
+  fail StepError {message: run String.copy("cannot locate the compiler; run the command with silk task or set SILK_COMPILER")}
+}
+
+/// Copies a path as validated UTF-8 text.
+pub effect fn text(path: &Path) -> String ! StepFailure ? &mut Allocator {
+  return match move Path.view(path) {
+    Option<string>.Some {value} => run String.copy(value)
+    Option<string>.None => { fail StepError {message: run String.copy("compilation paths must be UTF-8")} }
+  }
+}
+
+/// Resolves a user path against the package directory, accepting absolute paths explicitly.
+pub effect fn path(base: &Path, value: string) -> Path ! StepFailure ? &mut Allocator {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    return run WindowsPath.resolve(base, value)
+  } else {
+    let bytes = String.utf8Bytes(value)
+    if bytes.length > usize.ZERO && bytes[0] == 47 { return run Path.make(value) }
+    return run Path.resolve(base, value)
+  }
+}
+
+/// Local package trees and ancestor catalogs that can affect resolution.
+pub struct Inputs {
+  /// Existing declared package and source trees.
+  pub packages: List<String>,
+  /// Enclosing workspace manifests.
+  pub files: List<String>,
+}
+
+/// Collects local inputs without fetching remote pins. Unused malformed manifests remain data.
+pub effect fn inputs(manifest: &Path) -> Inputs ! StepFailure ? &mut Allocator | &mut FileSystem {
+  let mut found = Inputs {packages: List<String>.make(), files: List<String>.make()}
+  let directory = match move run Path.parent(manifest) {
+    Option<Path>.Some {value} => move value
+    Option<Path>.None => { fail StepError {message: run String.copy("a package manifest needs a parent directory")} }
+  }
+  let mut visited = List<String>.make()
+  run visit(&mut found, &mut visited, &directory)
+  return move found
+}
+
+fn contains(list: &List<String>, value: string) -> bool {
+  let listed = list.asSlice()
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if listed[at].view() == value { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+effect fn metadata(file: &Path) -> Option<Manifest> ! StepFailure ? &mut Allocator | &mut FileSystem {
+  if !run FileSystem.exists(file) { return Option<Manifest>.none() }
+  let bytes = run FileSystem.readFile(file)
+  return match move run Effect.result(SchemaToml.decode<Manifest>(bytes.asSlice())) {
+    Result<Manifest, SchemaError | OutOfMemoryError>.Success {value} => Option<Manifest>.some(move value)
+    Result<Manifest, SchemaError | OutOfMemoryError>.Failure {error} => match move error {
+      SchemaError _invalid => Option<Manifest>.none()
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+effect fn visit(found: &mut Inputs, visited: &mut List<String>, directory: &Path) -> () ! StepFailure ? &mut Allocator | &mut FileSystem {
+  let spelling = run text(directory)
+  if contains(&visited.*, spelling.view()) || !run FileSystem.exists(directory) { return () }
+  run visited.append(run String.copy(spelling.view()))
+  if !contains(&found.packages, spelling.view()) { run found.packages.append(move spelling) }
+  let file = run Path.join(directory, "silk.toml")
+  let document = match move run metadata(&file) {
+    Option<Manifest>.Some {value} => move value
+    Option<Manifest>.None => { return () }
+  }
+  if let Option<Package>.Some {value} = &document.package {
+    let source = run path(directory, value.source.view())
+    let name = run text(&source)
+    if !contains(&found.packages, name.view()) && run FileSystem.exists(&source) { run found.packages.append(move name) }
+  }
+  run dependencies(&mut found, &mut visited, directory, &document.dependencies)
+  if let Option<Workspace>.Some {value} = &document.workspace { run dependencies(&mut found, &mut visited, directory, &value.dependencies) }
+  let mut parent = run Path.parent(directory)
+  while let Option<Path>.Some {value} = move parent {
+    let candidate = run Path.join(&value, "silk.toml")
+    if run FileSystem.exists(&candidate) {
+      let name = run text(&candidate)
+      if !contains(&found.files, name.view()) { run found.files.append(move name) }
+    }
+    if let Option<Manifest>.Some {value: ancestor} = move run metadata(&candidate) {
+      if let Option<Workspace>.Some {value: workspace} = &ancestor.workspace {
+        run dependencies(&mut found, &mut visited, &value, &workspace.dependencies)
+        return ()
+      }
+    }
+    parent = run Path.parent(&value)
+  }
+}
+
+effect fn dependencies(found: &mut Inputs, visited: &mut List<String>, directory: &Path, dependencies: &Dictionary<Dependency>) -> ()
+  ! StepFailure ? &mut Allocator | &mut FileSystem {
+  let entries = dependencies.entries()
+  let mut at = usize.ZERO
+  while at < entries.length {
+    let entry = &entries[at].value
+    if !entry.git.isSome() && !entry.url.isSome() {
+      if let Option<String>.Some {value} = &entry.path { run visit(&mut found, &mut visited, &run path(directory, value.view())) }
+    }
+    at = at + usize.ONE
+  }
+}
+
+effect fn fromHost(bytes: &[u8]) -> Path ! StepFailure ? &mut Allocator {
+  static if Intrinsic.targetOperatingSystem() == "windows" { return run WindowsPath.fromNativeBytes(bytes) }
+  else { return run Path.fromBytes(bytes) }
+}

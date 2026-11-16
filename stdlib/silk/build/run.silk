@@ -1,0 +1,423 @@
+//! Process steps with declared arguments, files, environment, and captured values.
+
+import silk.build.encoding as Encoding
+import silk.build.descriptor { Invocation, Chain, Argument as StaticArgument, Input, Action }
+import silk.build.step { describedPath, Deferred, Key, Make, Step, StepError, StepFailure, StepHandle }
+import silk.collections.list { List }
+import silk.collections.bytes { Bytes }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator }
+import silk.system.child_process { ChildProcess }
+import silk.system.executable as Executable
+import silk.system.filesystem { FileSystem, Path }
+import silk.system.host_input { HostInput }
+import silk.text.string { String, InvalidUtf8 }
+import silk.num.usize
+
+union Argument {Text {value: Deferred<String>}, Input {path: Deferred<Path>}, Output {name: String}}
+enum Capture {None, Text, Lines}
+
+/// A cached process invocation. Only declared environment variables reach the process.
+struct Process {
+  executable: Deferred<Path>,
+  arguments: List<Argument>,
+  files: List<Deferred<Path>>,
+  trees: List<Deferred<Path>>,
+  environment: List<String>,
+  volatile: bool,
+  capture: Capture,
+  sandbox: Option<Deferred<Path>>,
+}
+
+impl Process {
+  /// Resolves a program now without running it; the resolved executable's contents enter its key.
+  effect fn program(name: string) -> Self ! StepFailure ? &mut Allocator | &mut FileSystem | &mut HostInput {
+    let program = match move run Executable.findBytes(String.utf8Bytes(name)) {
+      Option<Path>.Some {value} => move value
+      Option<Path>.None => { fail StepError {message: run String.copy("cannot find the build step's program")} }
+    }
+    let written = run pathText(&program)
+    return Process.artifact(run Deferred<Path>.external(written.view()))
+  }
+
+  /// Runs a deferred executable, adding its producer as a dependency when this step is registered.
+  fn artifact(program: Deferred<Path>) -> Self {
+    return Process {executable: move program, arguments: List<Argument>.make(), files: List<Deferred<Path>>.make(),
+      trees: List<Deferred<Path>>.make(), environment: List<String>.make(), volatile: false, capture: Capture.None, sandbox: Option<Deferred<Path>>.none()}
+  }
+
+  /// Runs this process with operating-system confinement: declared reads, its output directory,
+  /// and no TCP access. Missing sandbox support fails instead of running unrestricted.
+  effect fn confined(self: Self) -> Self ! StepFailure ? &mut Allocator | &mut FileSystem | &mut HostInput {
+    let mut process = move self
+    static if Intrinsic.targetOperatingSystem() == "darwin" {
+      process.sandbox = Option<Deferred<Path>>.some(run Deferred<Path>.external("/usr/bin/sandbox-exec"))
+    } else { static if Intrinsic.targetOperatingSystem() == "linux" {
+      let selected = run HostInput.variableNamed("SILK_COMPILER")
+      let launcher = match move selected {
+        Option<Bytes>.Some {value} => run Executable.findBytes(value.asSlice())
+        Option<Bytes>.None => run Executable.find("silkc")
+      }
+      let path = match move launcher {
+        Option<Path>.Some {value} => move value
+        Option<Path>.None => { fail StepError {message: run String.copy("a confined step needs SILK_COMPILER or silkc on PATH")} }
+      }
+      let written = run pathText(&path)
+      process.sandbox = Option<Deferred<Path>>.some(run Deferred<Path>.external(written.view()))
+    } else {
+      fail StepError {message: run String.copy("this host has no build-tool sandbox")}
+    } }
+    return move process
+  }
+
+  /// Appends a deferred text argument, including its producer and value in the key.
+  effect fn argument(self: Self, value: Deferred<String>) -> Self ! StepFailure ? &mut Allocator {
+    let mut step = move self
+    run step.arguments.append(Argument.Text {value: move value})
+    return move step
+  }
+
+  /// Appends a declared file's resolved path as an argument.
+  effect fn inputFile(self: Self, path: Deferred<Path>) -> Self ! StepFailure ? &mut Allocator {
+    let mut step = move self
+    run step.arguments.append(Argument.Input {path: move path})
+    return move step
+  }
+
+  /// Appends a path below the output directory and requires the process to produce it.
+  effect fn outputFile(self: Self, name: string) -> Self ! StepFailure ? &mut Allocator {
+    let mut step = move self
+    run step.arguments.append(Argument.Output {name: run String.copy(name)})
+    return move step
+  }
+
+  /// Declares a file dependency without adding a command-line argument.
+  effect fn keyFile(self: Self, path: Deferred<Path>) -> Self ! StepFailure ? &mut Allocator {
+    let mut step = move self
+    run step.files.append(move path)
+    return move step
+  }
+
+  /// Declares a directory dependency without adding a command-line argument.
+  effect fn keyTree(self: Self, path: Deferred<Path>) -> Self ! StepFailure ? &mut Allocator {
+    let mut step = move self
+    run step.trees.append(move path)
+    return move step
+  }
+
+  /// Keys a variable's presence and value and passes it to the child process.
+  effect fn keyEnvironment(self: Self, name: string) -> Self ! StepFailure ? &mut Allocator {
+    let mut step = move self
+    run step.environment.append(run String.copy(name))
+    return move step
+  }
+
+  /// Runs the process and its consumers every invocation, for work with external side effects.
+  fn always(self: Self) -> Self {
+    let mut step = move self
+    step.volatile = true
+    return move step
+  }
+
+  /// Registers this invocation; output paths can then be taken from the returned handle.
+  effect fn register(self: Self) -> StepHandle ! StepFailure ? &mut Allocator { return run Step.register(move self) }
+
+  /// Registers the process and returns its complete UTF-8 standard output as a deferred value.
+  effect fn captureText(self: Self) -> Deferred<String> ! StepFailure ? &mut Allocator {
+    let mut step = move self
+    step.capture = Capture.Text
+    let registered = run step.register()
+    return run registered.value<String>()
+  }
+
+  /// Registers the process and returns UTF-8 lines, removing line endings and a final empty line.
+  effect fn captureLines(self: Self) -> Deferred<List<String>> ! StepFailure ? &mut Allocator {
+    let mut step = move self
+    step.capture = Capture.Lines
+    let registered = run step.register()
+    return run registered.value<List<String>>()
+  }
+}
+
+effect fn pathText(path: &Path) -> String ! StepFailure ? &mut Allocator {
+  return match move Path.view(path) {
+    Option<string>.Some {value} => run String.copy(value)
+    Option<string>.None => { fail StepError {message: run String.copy("the build path is not UTF-8")} }
+  }
+}
+
+effect fn text(bytes: &[u8]) -> String ! StepFailure ? &mut Allocator {
+  return match move run String.copyUtf8(bytes) {
+    Result<String, InvalidUtf8>.Success {value} => move value
+    Result<String, InvalidUtf8>.Failure {..} => { fail StepError {message: run String.copy("captured process output is not UTF-8")} }
+  }
+}
+
+impl Step for Process {
+  effect fn key(self: &Self, key: &mut Key) -> () ! StepFailure ? &mut Allocator {
+    run key.file(&self.executable)
+    if let Option<Deferred<Path>>.Some {value} = &self.sandbox {
+      run key.text("confined")
+      run key.file(&value)
+    } else { run key.text("unconfined") }
+    if self.volatile { key.always() }
+    run key.text(match self.capture { Capture.None => "none" Capture.Text => "text" Capture.Lines => "lines" })
+    let arguments = self.arguments.asSlice()
+    let mut at = usize.ZERO
+    while at < arguments.length {
+      match &arguments[at] {
+        Argument.Text {value} => { run key.text("text")
+      run key.value(&value) }
+        Argument.Input {path} => { run key.text("input")
+      run key.file(&path) }
+        Argument.Output {name} => { run key.text("output")
+      run key.text(name.view()) }
+      }
+      at = at + usize.ONE
+    }
+    let files = self.files.asSlice()
+    at = usize.ZERO
+    while at < files.length { run key.file(&files[at])
+      at = at + usize.ONE }
+    let trees = self.trees.asSlice()
+    at = usize.ZERO
+    while at < trees.length { run key.tree(&trees[at])
+      at = at + usize.ONE }
+    let environment = self.environment.asSlice()
+    at = usize.ZERO
+    while at < environment.length { run key.environment(environment[at].view())
+      at = at + usize.ONE }
+  }
+
+  effect fn make(self: &Self, make: &mut Make) -> () ! StepFailure ? &mut Allocator {
+    let arguments = self.arguments.asSlice()
+    let mut words = List<String>.make()
+    let mut at = usize.ZERO
+    while at < arguments.length {
+      let word = match &arguments[at] {
+        Argument.Text {value} => run make.get(&value)
+        Argument.Input {path} => run pathText(&run make.path(&path))
+        Argument.Output {name} => run pathText(&run make.output(name.view()))
+      }
+      run words.append(move word)
+      at = at + usize.ONE
+    }
+    let mut views = List<string>.make()
+    let owned = words.asSlice()
+    at = usize.ZERO
+    while at < owned.length { run views.append(owned[at].view())
+      at = at + usize.ONE }
+    let outcome = match &self.sandbox {
+      Option<Deferred<Path>>.Some {value} => run make.execConfined(&value, &self.executable, views.asSlice())
+      Option<Deferred<Path>>.None => run make.exec(&self.executable, views.asSlice())
+    }
+    let succeeded = match move ChildProcess.exitCode(&outcome) {
+      Option<i32>.Some {value} => value == 0
+      Option<i32>.None => false
+    }
+    if !succeeded {
+      let mut message = run String.copy("build process failed")
+      if let Option<i32>.Some {value} = move ChildProcess.exitCode(&outcome) {
+        let encoded = run Encoding.json<i32>(&value)
+        let status = run text(encoded.asSlice())
+        run message.append(" with status ")
+        run message.append(status.view())
+      }
+      run message.append(": ")
+      let errors = run text(ChildProcess.errorBytes(&outcome))
+      run message.append(errors.view())
+      fail StepError {message: move message}
+    }
+    at = usize.ZERO
+    while at < arguments.length {
+      if let Argument.Output {name} = &arguments[at] { run make.requireOutput(name.view()) }
+      at = at + usize.ONE
+    }
+    let output = ChildProcess.outputBytes(&outcome)
+    match self.capture {
+      Capture.None => ()
+      Capture.Text => { let value = run text(output)
+      run make.value<String>(&value) }
+      Capture.Lines => {
+        let mut lines = List<String>.make()
+        let mut start = usize.ZERO
+        at = usize.ZERO
+        while at <= output.length {
+          if at == output.length || output[at] == 10 {
+            let end = if at > start && output[at - usize.ONE] == 13 { at - usize.ONE } else { at }
+            if start < output.length { run lines.append(run text(Slice.view<u8>(output, start, end - start))) }
+            start = at + usize.ONE
+          }
+          at = at + usize.ONE
+        }
+        run make.value<List<String>>(&lines)
+      }
+    }
+  }
+}
+
+
+/// A process step, described statically or constructed from runtime deferred values.
+pub union Run {
+  Static {description: Invocation},
+  Dynamic {process: Process},
+}
+
+impl Run {
+  /// Wraps a standard invocation description for registration in a runtime graph.
+  pub fn fromDescription(description: Invocation) -> Self { return Run.Static {description: description} }
+
+  /// Describes a package-relative executable without reading the filesystem or running it.
+  pub static fn command(path: string<'static>) -> Self {
+    return Run.Static {description: Invocation {program: Input.Source {path: path}, arguments: Option<&'static Chain<StaticArgument>>.None}}
+  }
+
+  /// Describes an executable supplied by another standard step or a path parameter.
+  pub static fn executable(path: Deferred<Path>) -> Self {
+    return Run.Static {description: Invocation {program: Deferred<Path>.description(&path), arguments: Option<&'static Chain<StaticArgument>>.None}}
+  }
+
+  /// Appends a literal argument to a static invocation.
+  pub static fn arg(self: Self, value: string<'static>) -> Self { return self.append(StaticArgument.Text {value: value}) }
+  /// Appends a deferred input path to a static invocation's arguments.
+  pub static fn input(self: Self, value: Deferred<Path>) -> Self { return self.append(StaticArgument.Input {path: Deferred<Path>.description(&value)}) }
+  /// Appends a required output path to a static invocation's arguments.
+  pub static fn output(self: Self, name: string<'static>) -> Self { return self.append(StaticArgument.Output {name: name}) }
+  /// Declares a static invocation's file dependency without adding an argument.
+  pub static fn reads(self: Self, value: Deferred<Path>) -> Self { return self.append(StaticArgument.File {path: Deferred<Path>.description(&value)}) }
+  /// Declares a static invocation's directory dependency without adding an argument.
+  pub static fn readsTree(self: Self, value: Deferred<Path>) -> Self { return self.append(StaticArgument.Tree {path: Deferred<Path>.description(&value)}) }
+
+  static fn append(self: Self, argument: StaticArgument) -> Self {
+    let mut description = Run.description(&self)
+    description.arguments = Chain<StaticArgument>.append(description.arguments, argument)
+    return Run.Static {description: description}
+  }
+
+  /// Returns this invocation's immutable description; runtime inputs cannot enter a static plan.
+  pub static fn description(self: &Self) -> Invocation {
+    return match &self.* {
+      Run.Static {description} => description
+      Run.Dynamic {..} => compileError("a package plan requires a static process description")
+    }
+  }
+
+  /// Names a declared output without registering or executing the producing process.
+  pub static fn result(self: &Self, name: string<'static>) -> Deferred<Path> {
+    let action = Action.Run {invocation: Run.description(self)}
+    return describedPath(Input.Output {step: &action, name: name})
+  }
+
+  /// Applies a graph transformation only when the condition is true.
+  pub effect fn when<'env, E, ?R>(self: Self, condition: bool,
+    transform: once effect fn<'env>(Self) -> Self ! E ? R) -> Self ! E ? R {
+    if condition { return run transform(move self) }
+    return move self
+  }
+
+  /// Resolves an installed program now, including the executable's contents in the step key.
+  pub effect fn program(name: string) -> Self ! StepFailure ? &mut Allocator | &mut FileSystem | &mut HostInput {
+    return Run.Dynamic {process: run Process.program(name)}
+  }
+  /// Runs a deferred executable, depending on its producer.
+  pub fn artifact(program: Deferred<Path>) -> Self { return Run.Dynamic {process: Process.artifact(move program)} }
+
+  /// Registers the invocation and returns a handle to its declared outputs.
+  pub effect fn register(self: Self) -> StepHandle ! StepFailure ? &mut Allocator { return run Step.register(move self) }
+  /// Confines the process to declared inputs, its output directory, and no network.
+  pub effect fn confined(self: Self) -> Self ! StepFailure ? &mut Allocator | &mut FileSystem | &mut HostInput {
+    let process = run materialize(move self)
+    return Run.Dynamic {process: run process.confined()}
+  }
+  /// Uses an explicitly selected sandbox launcher and includes its contents in the step key.
+  pub effect fn confinedBy(self: Self, launcher: Deferred<Path>) -> Self ! StepFailure ? &mut Allocator {
+    let mut process = run materialize(move self)
+    process.sandbox = Option<Deferred<Path>>.some(move launcher)
+    return Run.Dynamic {process: move process}
+  }
+
+  /// Appends a deferred text argument.
+  pub effect fn argument(self: Self, value: Deferred<String>) -> Self ! StepFailure ? &mut Allocator {
+    let process = run materialize(move self)
+    return Run.Dynamic {process: run process.argument(move value)}
+  }
+  /// Appends and keys a deferred file argument.
+  pub effect fn inputFile(self: Self, path: Deferred<Path>) -> Self ! StepFailure ? &mut Allocator {
+    let process = run materialize(move self)
+    return Run.Dynamic {process: run process.inputFile(move path)}
+  }
+  /// Appends and requires a file below the output directory.
+  pub effect fn outputFile(self: Self, name: string) -> Self ! StepFailure ? &mut Allocator {
+    let process = run materialize(move self)
+    return Run.Dynamic {process: run process.outputFile(name)}
+  }
+  /// Keys an additional file without adding an argument.
+  pub effect fn keyFile(self: Self, path: Deferred<Path>) -> Self ! StepFailure ? &mut Allocator {
+    let process = run materialize(move self)
+    return Run.Dynamic {process: run process.keyFile(move path)}
+  }
+  /// Keys an additional directory without adding an argument.
+  pub effect fn keyTree(self: Self, path: Deferred<Path>) -> Self ! StepFailure ? &mut Allocator {
+    let process = run materialize(move self)
+    return Run.Dynamic {process: run process.keyTree(move path)}
+  }
+  /// Keys and forwards one named environment variable.
+  pub effect fn keyEnvironment(self: Self, name: string) -> Self ! StepFailure ? &mut Allocator {
+    let process = run materialize(move self)
+    return Run.Dynamic {process: run process.keyEnvironment(name)}
+  }
+  /// Makes the process and its consumers run on every invocation.
+  pub effect fn always(self: Self) -> Self ! StepFailure ? &mut Allocator {
+    let process = run materialize(move self)
+    return Run.Dynamic {process: process.always()}
+  }
+  /// Captures UTF-8 standard output as a deferred value.
+  pub effect fn captureText(self: Self) -> Deferred<String> ! StepFailure ? &mut Allocator {
+    let process = run materialize(move self)
+    return run process.captureText()
+  }
+  /// Captures UTF-8 standard output split into lines.
+  pub effect fn captureLines(self: Self) -> Deferred<List<String>> ! StepFailure ? &mut Allocator {
+    let process = run materialize(move self)
+    return run process.captureLines()
+  }
+}
+
+effect fn materialize(step: Run) -> Process ! StepFailure ? &mut Allocator {
+  return match move step {
+    Run.Dynamic {process} => move process
+    Run.Static {description} => {
+      let process = Process.artifact(Deferred<Path>.fromDescription(description.program))
+      run applyArguments(move process, description.arguments)
+    }
+  }
+}
+
+effect fn applyArguments(process: Process, arguments: Option<&'static Chain<StaticArgument>>) -> Process
+! StepFailure ? &mut Allocator {
+  if let Option<&'static Chain<StaticArgument>>.Some {value} = arguments {
+    let previous = run applyArguments(move process, value.previous)
+    return match value.value {
+      StaticArgument.Text {value: text} => run previous.argument(run Deferred<String>.value(run String.copy(text)))
+      StaticArgument.Input {path} => run previous.inputFile(Deferred<Path>.fromDescription(path))
+      StaticArgument.Output {name} => run previous.outputFile(name)
+      StaticArgument.File {path} => run previous.keyFile(Deferred<Path>.fromDescription(path))
+      StaticArgument.Tree {path} => run previous.keyTree(Deferred<Path>.fromDescription(path))
+    }
+  }
+  return move process
+}
+
+impl Step for Run {
+  effect fn prepare(self: Self) -> Self ! StepFailure ? &mut Allocator { return Run.Dynamic {process: run materialize(move self)} }
+  effect fn key(self: &Self, key: &mut Key) -> () ! StepFailure ? &mut Allocator {
+    if let Run.Dynamic {process} = &self.* { return run Step.key(&process, &mut key.*) }
+    fail StepError {message: run String.copy("a process description must be prepared before keying")}
+  }
+  effect fn make(self: &Self, make: &mut Make) -> () ! StepFailure ? &mut Allocator {
+    if let Run.Dynamic {process} = &self.* { return run Step.make(&process, &mut make.*) }
+    fail StepError {message: run String.copy("a process description must be prepared before execution")}
+  }
+}

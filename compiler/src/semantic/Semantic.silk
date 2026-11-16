@@ -55,6 +55,7 @@ import backend.DropGlue {
 }
 import backend.InstanceKey {HelperRole, InstanceKey, ProviderEntry}
 import backend.UnionDispatch {Arm as DispatchArm, Borrowed as DispatchBorrow, UnionDispatch}
+import backend.PackageSettings { PackageSettings, Mode as PackageMode }
 import backend.CodegenUnits {CodegenUnit}
 import backend.Bitcode
 import backend.Mir
@@ -2752,6 +2753,8 @@ struct Resolver {
   llvmValues: List<InstanceDefinition>,
   // Whether an assembled module is also split into codegen units.
   codegenUnits: bool,
+  packageCodegen: List<PackageSettings>,
+  programDebug: bool,
   // Whether LLVM text is shaped for an unoptimized compile (`LlvmCode.Writer.fastPath`).
   fastPathIr: bool,
   // Whether each emitted function marks its record in the table of executed functions as it
@@ -46394,11 +46397,15 @@ effect fn checkReflectionCall<'scope>(
   // `reflectTypeName`, `reflectTypeDoc` and `reflectPrivateField` take the type's own descriptor,
   // as `reflectTypeKind` does.
   let typeText = CheckedIntrinsic.isPrimitive(member, IntrinsicPrimitive.ReflectTypeName) ||
+    CheckedIntrinsic.isPrimitive(member, IntrinsicPrimitive.ReflectDeclarationName) ||
     CheckedIntrinsic.isPrimitive(member, IntrinsicPrimitive.ReflectTypeDoc) ||
     CheckedIntrinsic.isPrimitive(member, IntrinsicPrimitive.ReflectPrivateField)
   let variantFields = CheckedIntrinsic.isPrimitive(member, IntrinsicPrimitive.ReflectVariantFields)
   if variantLabel || variantFields {descriptor = run CheckedIntrinsic.variantType(&typeArguments[usize.ZERO])}
   if CheckedIntrinsic.isPrimitive(member, IntrinsicPrimitive.ReflectVariants) {descriptor = run CheckedIntrinsic.variantsType(&typeArguments[usize.ZERO])}
+  let enumLabel = CheckedIntrinsic.isPrimitive(member, IntrinsicPrimitive.ReflectEnumLabel)
+  if enumLabel { descriptor = Interned<Type>.clone(&typeArguments[usize.ZERO]) }
+  if CheckedIntrinsic.isPrimitive(member, IntrinsicPrimitive.ReflectEnumMembers) { descriptor = run CheckedIntrinsic.staticSequenceType(&typeArguments[usize.ZERO]) }
   // `functionRef<F>` erases the contract `F` of a function value; `functionAs<F>` restores it.
   let erases = CheckedIntrinsic.isPrimitive(member, IntrinsicPrimitive.FunctionRef)
   let restores = CheckedIntrinsic.isPrimitive(member, IntrinsicPrimitive.FunctionAs)
@@ -46444,7 +46451,7 @@ effect fn checkReflectionCall<'scope>(
     run List<BodyNodeId>.append(&mut checkedArguments, argumentNode)
     ty = run primitiveType(b"u8")
     if CheckedIntrinsic.isPrimitive(member, IntrinsicPrimitive.ReflectFieldOrdinal) || nameOffset {ty = run primitiveType(b"usize")}
-    if CheckedIntrinsic.isPrimitive(member, IntrinsicPrimitive.ReflectFieldLabel) || variantLabel || nameLabel || variantNameLabel || fieldDoc || typeText {
+    if CheckedIntrinsic.isPrimitive(member, IntrinsicPrimitive.ReflectFieldLabel) || variantLabel || nameLabel || variantNameLabel || fieldDoc || typeText || enumLabel {
       ty = run Types.intern(Type.String {lifetime: run Types.internLifetime(Lifetime.Static)})
     }
     if variantFields {ty = run CheckedIntrinsic.fieldsType(&typeArguments[usize.ZERO])}
@@ -57862,9 +57869,6 @@ effect fn checkSourceReferentExpression<'scope>(
   let mut ty = move initialType
   let mut form = move initialForm
   let mut diverges = initialDiverges
-  if staticBody {
-    return run bodyRejection(&resolver.*, module, RejectionCode.StaticPhaseViolation, span)
-  }
   let checked = run checkExpression(
     &mut resolver.*,
     &mut owner.*,
@@ -57899,6 +57903,14 @@ effect fn checkSourceReferentExpression<'scope>(
     Option<Interned<Type>>.None => {
       return run bodyRejection(&resolver.*, module, RejectionCode.Undetermined, span)
     }
+  }
+  // Static evaluation already owns immutable referents. Projecting one reads its value;
+  // raw pointers and exclusive references still require unavailable runtime storage.
+  if staticBody {
+    let shared = Interned<Type>.with<bool>(&subjectType, |value: &Type| -> bool {
+      return match &value.* { Type.Reference {access: Access.Shared, ..} => true _ => false }
+    })
+    if !shared { return run bodyRejection(&resolver.*, module, RejectionCode.StaticPhaseViolation, span) }
   }
   let rawPointer = Interned<Type>.with<bool>(
     &subjectType,
@@ -58345,9 +58357,14 @@ effect fn checkSourceInfixExpression<'scope>(
     leftType = move metLeft
     rightType = move metRight
   }
-  let leftFamily = run operatorFamily(&mut resolver.*, &leftType)
-  let rightFamily = run operatorFamily(&mut resolver.*, &rightType)
-  let sameType = run Type.equalsShared(&leftType, &rightType)
+  // Static iteration can pair an embedded concrete value with an authored type binder.
+  // Inspect both operands under the selected body application, retaining their authored
+  // types in the body so specialization and interface selection keep their provenance.
+  let closedLeft = run closedBodyType(&resolver.*, &leftType)
+  let closedRight = run closedBodyType(&resolver.*, &rightType)
+  let leftFamily = run operatorFamily(&mut resolver.*, &closedLeft)
+  let rightFamily = run operatorFamily(&mut resolver.*, &closedRight)
+  let sameType = run Type.equalsShared(&closedLeft, &closedRight)
   let mut concrete = Operator.infix(operator, leftFamily, rightFamily, sameType)
   if (operator == InfixOperator.And || operator == InfixOperator.Or) && sameType && leftFamily == OperatorFamily.Boolean && rightFamily == OperatorFamily.Boolean {
     concrete = Option<OperatorResultType>.some(OperatorResultType.Boolean)
@@ -71084,23 +71101,20 @@ fn initializerValue(answer: &Result<Answer, NoRejection>) -> Option<Interned<Sta
   }
 }
 
-/// What a demanded text constant holds: its bytes, or the rejection that refused it, absent when
-/// the answer carries none.
-pub union InitializerText {
-  Text {pub bytes: Bytes},
+/// The ordinary static value of a demanded constant, or its semantic rejection.
+pub union InitializerData {
+  Data {pub value: Interned<StaticData>},
   Refused {pub rejection: Option<Shared<Rejection>>},
 }
 
-/// Reads a `demandInitializer` answer for a `string` constant, such as a package's build plan.
-pub effect fn initializerText(answer: &Shared<Result<Answer, NoRejection>>) -> InitializerText ! OutOfMemoryError ? &mut Allocator {
+/// Reads a demanded initializer without assigning meaning to its library-defined representation.
+pub fn initializerData(answer: &Shared<Result<Answer, NoRejection>>) -> InitializerData {
   let found = Shared<Result<Answer, NoRejection>>.with<Option<Interned<StaticData>>>(answer, initializerValue)
   if let Option<Interned<StaticData>>.Some {value} = move found {
-    if let Option<Bytes>.Some {value: bytes} = move run StaticValue.textBytes(&value) {
-      return InitializerText.Text {bytes: move bytes}
-    }
+    return InitializerData.Data {value: move value}
   }
   let cause = Shared<Result<Answer, NoRejection>>.with<Option<Shared<Rejection>>>(answer, answerCause)
-  return InitializerText.Refused {rejection: move cause}
+  return InitializerData.Refused {rejection: move cause}
 }
 
 // A package parameter declaration that cannot join the parameter schema (SEM0214), with `reason`.
@@ -73565,7 +73579,7 @@ effect fn resolveHelperMir(resolver: &mut Resolver, owner: &mut Query<Answer, No
     Option<InstanceLocation>.None => { return memberSuccess(move gap, move dependencies) }
   }
   // Helpers are already coalesced and never have a source inlining tail of their own.
-  let raw = inlinesMir(&resolver.*, &Option<CoroutineFacts>.none())
+  let raw = inlinesMir(&resolver.*, &Option<CoroutineFacts>.none(), creator)
   let name = run internBackendVariant(&mut resolver.*, creator, observing, &Option<CoroutineFacts>.none(), raw)
   let declarationAccess156Request = Key {
     family: Family.Mir, module: location.module, name: name, declaration: location.declaration, member: instanceMember(creator),
@@ -78553,9 +78567,15 @@ effect fn callableValueCall(resolver: &mut Resolver, owner: &mut Query<Answer, N
   if !ownValue {
     placed = Option<MirStoredArguments>.some(MirStoredArguments {environment: move environment, lanes: move lanes, consumes: mode == CallableMode.Once})
   }
+  // A stored interface Effect keeps the operation's promised channels, but runs the selected
+  // witness. Catch its declared failure before widening into the operation's failure sink.
+  let mut failure = Option<Interned<Type>>.none()
+  if facts.isEffect {
+    failure = Option<Interned<Type>>.some(run RuntimeType.applyBindings(&facts.failure, assigned, projections))
+  }
   return Result<MirCallTarget, PreparationFailure>.succeed(MirCallTarget {node: node, receiverDereferences: usize.ZERO, key: move key,
     application: move application, edge: Edge.Direct, operands: move operands, stored: move placed,
-    providers: List<MirProviderSource>.make(), dispatch: Option<MirProviderSource>.none(), witnessFailure: Option<Interned<Type>>.none(), nonParking: false, vacuous: false, returned: move returned})
+    providers: List<MirProviderSource>.make(), dispatch: Option<MirProviderSource>.none(), witnessFailure: move failure, nonParking: false, vacuous: false, returned: move returned})
 }
 
 // The access at which `parameter` borrows a stored `field` it does not store itself: a reference
@@ -80685,8 +80705,8 @@ fn inlineRule(direct: bool, framed: bool, selected: bool, suspending: bool) -> I
 
 // Whether this MIR variant runs inlining. LLVM selects callees only in suspendable frames;
 // direct builds may also inline synchronous calls. Line tables keep every authored boundary.
-fn inlinesMir(resolver: &Resolver, facts: &Option<CoroutineFacts>) -> bool {
-  if !resolver.inlining || resolver.lineTables { return false }
+fn inlinesMir(resolver: &Resolver, facts: &Option<CoroutineFacts>, key: &InstanceKey) -> bool {
+  if !instanceInlining(resolver, key) || instanceLines(resolver, key) { return false }
   if resolver.direct { return true }
   if let Option<CoroutineFacts>.Some {value} = &facts.* { return List<InstanceKey>.length(&value.inline) != usize.ZERO }
   return false
@@ -80708,7 +80728,7 @@ fn inlinesMir(resolver: &Resolver, facts: &Option<CoroutineFacts>) -> bool {
 effect fn inlineCalls(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>,
   dependencies: &mut List<Dependency>, function: &mut MirFunction, facts: &Option<CoroutineFacts>, observing: bool) -> ()
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
-  if !inlinesMir(&resolver.*, facts) { return () }
+  if !inlinesMir(&resolver.*, facts, &function.key) { return () }
   let mut candidates = List<InstanceKey>.make()
   let mut rawFacts = Option<CoroutineFacts>.none()
   let mut framed = false
@@ -80741,6 +80761,15 @@ effect fn inlineCalls(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejec
     let selected = match move target {
       Option<InstanceKey>.Some {value} => move value
       Option<InstanceKey>.None => { continue }
+    }
+    // Package backend settings survive lowering: a cross-package call keeps its own body.
+    if resolver.packageCodegen.length() != usize.ZERO {
+      let caller = DeclarationId.copyShared(&InstanceKey.identity(&function.key))
+      let callee = DeclarationId.copyShared(&InstanceKey.identity(&selected))
+      let samePackage = ModuleId.withPackage<bool>(DeclarationId.moduleId(&caller), |name: &[u8]| -> bool {
+        return ModuleId.withPackage<bool>(DeclarationId.moduleId(&callee), |other: &[u8]| -> bool { return name == other })
+      })
+      if !samePackage || !instanceInlining(&resolver.*, &selected) || instanceLines(&resolver.*, &selected) { continue }
     }
     let mut suspending = false
     let cancels = List<MirCancel>.asSlice(&function.cancels)
@@ -80867,7 +80896,7 @@ effect fn lowerMir(
   }
   let selfRaw = instances[key.name].raw
   let selfFacts = run copySuspension(&instances[key.name].suspension)
-  if !selfRaw && inlinesMir(&resolver.*, &selfFacts) {
+  if !selfRaw && inlinesMir(&resolver.*, &selfFacts, &instance) {
     let mut dependencies = List<Dependency>.make()
     let answer = match move run rawMirAnswer(&mut resolver.*, &mut owner.*, &mut dependencies, &instance, observing, &selfFacts) {
       Option<Shared<Result<Answer, NoRejection>>>.Some {value} => move value
@@ -81659,9 +81688,10 @@ effect fn lowerMir(
   // from the anchor (`MirFunction.lines`), and so is a site label of a build with line tables
   // (`Mir.siteLabel`), so a body that only moves in its file reads what it read. Any other site
   // label names the line its anchor starts on, so its body reads the anchor's origin too.
-  let relativeSites = relativeSites(&resolver.*)
+  let bodyLines = moduleLines(&resolver.*, &module)
+  let relativeSites = bodyLines && !resolver.direct
   let mut sourceAnswer = run demandSource(&mut resolver.*, &module)
-  if (observing || resolver.lineTables) && recordingUnit(&resolver.*) != usize.MAX {
+  if (observing || bodyLines) && recordingUnit(&resolver.*) != usize.MAX {
     let loaded = move sourceAnswer
     sourceAnswer = run observedDeclarationIn(&mut resolver.*, &module, move loaded, declarationAccess183, SourceFacet.Layout)
     if observing && !relativeSites { drop run observedSource(&mut resolver.*, &module, SourceSelector.Origin {handle: key.declaration}) }
@@ -81690,9 +81720,9 @@ effect fn lowerMir(
         SourceUnit.bytes(IndexedSource.sourceUnit(indexed)),
         &anchor,
         observing,
-        resolver.lineTables,
+        bodyLines,
         relativeSites,
-        resolver.fastPathIr,
+        moduleFastPath(&resolver.*, &module),
         move packageRoot,
         move suspending,
         move constants,
@@ -83907,7 +83937,15 @@ effect fn observeLlvmGap(resolver: &mut Resolver, subject: usize) -> ()
 
 // How hard the direct backend optimizes: not at all in an unoptimized build, else for size or
 // speed as the build asked.
-fn directLevel(resolver: &Resolver) -> SsaLevel {
+fn directLevel(resolver: &Resolver, key: &InstanceKey) -> SsaLevel {
+  let identity = InstanceKey.identity(key)
+  let declaration = DeclarationId.copyShared(&identity)
+  match moduleMode(resolver, DeclarationId.moduleId(&declaration)) {
+    PackageMode.None => { return SsaLevel.None }
+    PackageMode.Size => { return SsaLevel.Size }
+    PackageMode.Speed => { return SsaLevel.Speed }
+    PackageMode.Default => ()
+  }
   if resolver.fastPathIr { return SsaLevel.None }
   if resolver.directSize { return SsaLevel.Size }
   return SsaLevel.Speed
@@ -83917,7 +83955,66 @@ fn directLevel(resolver: &Resolver) -> SsaLevel {
 // tables whose text Clang compiles, which is encoded with where each declaration starts
 // (`Bitcode.Module.placeSites`). The direct backend holds each label's text, so this follows
 // the backend `emitInstance` selects.
-fn relativeSites(resolver: &Resolver) -> bool { return resolver.lineTables && !resolver.direct }
+fn moduleMode(resolver: &Resolver, module: &ModuleId) -> PackageMode {
+  let packages = resolver.packageCodegen.asSlice()
+  let mut at = usize.ZERO
+  while at < packages.length {
+    if ModuleId.withPackage<bool>(module, |name: &[u8]| -> bool { return name == packages[at].identity.asSlice() }) {
+      if let Option<Bytes>.Some {value} = &packages[at].optimization {
+        if value.asSlice() == b"none" { return PackageMode.None }
+        if value.asSlice() == b"size" { return PackageMode.Size }
+        return PackageMode.Speed
+      }
+    }
+    at = at + usize.ONE
+  }
+  return PackageMode.Default
+}
+
+fn moduleFastPath(resolver: &Resolver, module: &ModuleId) -> bool {
+  return match moduleMode(resolver, module) {
+    PackageMode.Default => resolver.fastPathIr
+    PackageMode.None => true
+    PackageMode.Speed => false
+    PackageMode.Size => false
+  }
+}
+
+fn moduleLines(resolver: &Resolver, module: &ModuleId) -> bool {
+  let packages = resolver.packageCodegen.asSlice()
+  if packages.length == usize.ZERO { return resolver.lineTables }
+  let mut at = usize.ZERO
+  while at < packages.length {
+    if ModuleId.withPackage<bool>(module, |name: &[u8]| -> bool { return name == packages[at].identity.asSlice() }) {
+      if let Option<bool>.Some {value} = &packages[at].debug { return value }
+    }
+    at = at + usize.ONE
+  }
+  return resolver.programDebug
+}
+
+fn instanceFastPath(resolver: &Resolver, key: &InstanceKey) -> bool {
+  let identity = InstanceKey.identity(key)
+  let declaration = DeclarationId.copyShared(&identity)
+  return moduleFastPath(resolver, DeclarationId.moduleId(&declaration))
+}
+
+fn instanceInlining(resolver: &Resolver, key: &InstanceKey) -> bool {
+  let identity = InstanceKey.identity(key)
+  let declaration = DeclarationId.copyShared(&identity)
+  return match moduleMode(resolver, DeclarationId.moduleId(&declaration)) {
+    PackageMode.Default => resolver.inlining
+    PackageMode.None => false
+    PackageMode.Speed => true
+    PackageMode.Size => true
+  }
+}
+
+fn instanceLines(resolver: &Resolver, key: &InstanceKey) -> bool {
+  let identity = InstanceKey.identity(key)
+  let declaration = DeclarationId.copyShared(&identity)
+  return moduleLines(resolver, DeclarationId.moduleId(&declaration))
+}
 
 // One instance's text: LLVM text, or for the direct backend a wasm fragment (`WasmLower`).
 effect fn emitInstance(resolver: &Resolver, function: &MirFunction, input: &EmissionInputs, hostExport: bool) -> Bytes
@@ -83932,7 +84029,7 @@ effect fn emitInstance(resolver: &Resolver, function: &MirFunction, input: &Emis
       &input.suspension,
       resolver.threads,
       hostExport,
-      directLevel(resolver),
+      directLevel(resolver, &function.key),
       resolver.verifyMir,
     )
   }
@@ -83955,7 +84052,7 @@ effect fn emitInstance(resolver: &Resolver, function: &MirFunction, input: &Emis
     List<CAbi.Signature>.asSlice(&input.foreign),
     List<InstanceIdentity>.asSlice(&input.identities),
     &input.suspension,
-    resolver.fastPathIr,
+    instanceFastPath(resolver, &function.key),
     hostExport,
     &seen,
   )
@@ -94335,6 +94432,91 @@ impl<'source> StaticPort<'source> {
     return run documentationOf(&mut self.resolver.*, ty, DocumentedPart.Variant, label, usize.ZERO)
   }
 
+  /// The visible scalar enum values, obtained from the same checked discriminants as source member access.
+  pub effect fn reflectedEnumMembers(self: &mut Self, ty: &Interned<Type>, site: &ModuleId, span: Span) -> Result<StaticData, Shared<Rejection>>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+    let members = match move run subjectScalarEnum(&mut self.resolver.*, &mut self.query.*, &mut self.dependencies.*, ty, span) {
+      Option<Result<Shared<Result<Answer, NoRejection>>, Shared<Rejection>>>.Some {value} => match move value {
+        Result<Shared<Result<Answer, NoRejection>>, Shared<Rejection>>.Success {value: listed} => move listed
+        Result<Shared<Result<Answer, NoRejection>>, Shared<Rejection>>.Failure {error} => { return Result<StaticData, Shared<Rejection>>.failResult(move error) }
+      }
+      Option<Result<Shared<Result<Answer, NoRejection>>, Shared<Rejection>>>.None => { return Result<StaticData, Shared<Rejection>>.failResult(run reject(&self.resolver.*, site, RejectionCode.TypeMismatch, span)) }
+    }
+    let declaration = match move run Type.copy(ty) {
+      Type.Nominal {declaration, ..} => run Types.internDeclaration(move declaration)
+      _ => { return Result<StaticData, Shared<Rejection>>.failResult(run reject(&self.resolver.*, site, RejectionCode.TypeMismatch, span)) }
+    }
+    let local = ModuleId.equals(site, DeclarationId.moduleId(Interned<DeclarationId>.get(&declaration)))
+    let empty = match move StaticValue.sequenceEmpty(run CheckedIntrinsic.staticSequenceType(ty)) {
+      Option<StaticData>.Some {value} => move value
+      Option<StaticData>.None => { return CompilerBug.panic(b"invalid reflected enum sequence type") }
+    }
+    let mut sequence = move empty
+    let count = Shared<Result<Answer, NoRejection>>.with<usize>(&members, scalarEnumCount)
+    let mut at: usize = 0
+    while at < count {
+      let label = run reflectedMemberLabel(&members, at)
+      let selected = Shared<Result<Answer, NoRejection>>.with<Option<ScalarEnumMember>>(&members,
+        |answer: &Result<Answer, NoRejection>| -> Option<ScalarEnumMember> { return scalarEnumMember(answer, label.asSlice()) })
+      if let Option<ScalarEnumMember>.Some {value} = move selected {
+        if local || value.isPublic {
+          let sign = if value.value.negative { StaticSign.Negative } else { StaticSign.Positive }
+          let member = match move StaticValue.enumeration(Interned<DeclarationId>.clone(&declaration), value.value.ordinal, value.value.representation, sign, value.value.magnitude) {
+            Option<StaticData>.Some {value: member} => run Interned<StaticData>.make(move member)
+            Option<StaticData>.None => { return CompilerBug.panic(b"checked enum discriminant was invalid") }
+          }
+          let previous = run Interned<StaticData>.make(move sequence)
+          let appended = match move run StaticValue.sequenceAppend(&previous, &member) {
+            Option<StaticData>.Some {value: appended} => move appended
+            Option<StaticData>.None => { return CompilerBug.panic(b"reflected enum value did not meet its sequence type") }
+          }
+          sequence = move appended
+        }
+      }
+      at = at + 1
+    }
+    return Result<StaticData, Shared<Rejection>>.succeed(move sequence)
+  }
+
+  /// The label of a scalar enum's checked declaration ordinal.
+  pub effect fn reflectedEnumLabel(self: &mut Self, ty: &Interned<Type>, ordinal: usize, site: &ModuleId, span: Span) -> Result<StaticData, Shared<Rejection>>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+    let members = match move run subjectScalarEnum(&mut self.resolver.*, &mut self.query.*, &mut self.dependencies.*, ty, span) {
+      Option<Result<Shared<Result<Answer, NoRejection>>, Shared<Rejection>>>.Some {value} => match move value {
+        Result<Shared<Result<Answer, NoRejection>>, Shared<Rejection>>.Success {value: listed} => move listed
+        Result<Shared<Result<Answer, NoRejection>>, Shared<Rejection>>.Failure {error} => { return Result<StaticData, Shared<Rejection>>.failResult(move error) }
+      }
+      Option<Result<Shared<Result<Answer, NoRejection>>, Shared<Rejection>>>.None => { return Result<StaticData, Shared<Rejection>>.failResult(run reject(&self.resolver.*, site, RejectionCode.TypeMismatch, span)) }
+    }
+    let label = run reflectedMemberLabel(&members, ordinal)
+    return match move StaticValue.text(move label) {
+      Option<StaticData>.Some {value} => Result<StaticData, Shared<Rejection>>.succeed(move value)
+      Option<StaticData>.None => Result<StaticData, Shared<Rejection>>.failResult(run reject(&self.resolver.*, site, RejectionCode.TypeMismatch, span))
+    }
+  }
+
+  /// Names the defining declaration, independent of the module viewing it.
+  pub effect fn declarationName(ty: &Interned<Type>) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+    let declaration = Interned<Type>.with<Option<DeclarationId>>(ty, |value: &Type| -> Option<DeclarationId> {
+      return match &value.* { Type.Nominal {declaration, ..} => Option<DeclarationId>.some(DeclarationId.copy(&declaration)) _ => Option<DeclarationId>.none() }
+    })
+    let mut name = Bytes.make()
+    if let Option<DeclarationId>.Some {value} = move declaration {
+      let module = DeclarationId.moduleId(&value)
+      run ModuleId.appendPackage(module, &mut name)
+      run name.append(b"/")
+      run ModuleId.appendPath(module, &mut name)
+      let mut at: usize = 0
+      while at < DeclarationId.ownerCount(&value) {
+        run name.append(b"/")
+        let owner = run DeclarationId.copyOwnerName(&value, at)
+        run name.append(owner.asSlice())
+        at = at + 1
+      }
+    }
+    return move name
+  }
+
   /// The name of `ty` as a program writes it, without module paths and with lifetimes other than
   /// `'static` elided, such as `Page<String>` for `app.main.Page<silk.text.string.String>`, `&u32`,
   /// or `fn(&u32) -> bool` for a named function's value; none when the type has no spelling.
@@ -95154,6 +95336,8 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
       llvmInputs: List<LlvmInput>.make(),
       llvmValues: List<InstanceDefinition>.make(),
       codegenUnits: false,
+      packageCodegen: List<PackageSettings>.make(),
+      programDebug: false,
       fastPathIr: false,
       coverage: false,
       inlining: false,
@@ -97073,6 +97257,11 @@ impl Semantic {
 
   /// Selects whether `buildArtifact` also splits its module into codegen units
   /// (`BackendBuild.Module.units`), so the driver can compile and cache each unit's object apart.
+  pub fn selectPackageCodegen(self: &mut Self, packages: List<PackageSettings>, debug: bool) -> () {
+    self.resolver.packageCodegen = move packages
+    self.resolver.programDebug = debug
+  }
+
   pub fn selectCodegenUnits(self: &mut Self, split: bool) -> () {
     self.resolver.codegenUnits = split
   }
@@ -105546,7 +105735,9 @@ effect fn assembleUnits(resolver: &Resolver, reached: &[CollectedText], plan: &E
     if unit < List<u64>.length(&originHigh) {
       origins = ContentHash {high: List<u64>.get(&originHigh, unit), low: List<u64>.get(&originLow, unit)}
     }
-    run List<CodegenUnit>.append(&mut units, CodegenUnit {head: move head, body: move body, digest: digest, origins: origins, stored: stored,
+    let mut owner = Bytes.make()
+    if unit < unitCount { owner = run ModuleId.copyPackage(&modules.asSlice()[unitModules.asSlice()[unit]]) }
+    run List<CodegenUnit>.append(&mut units, CodegenUnit {owner: move owner, optimization: Option<Bytes>.none(), debug: Option<bool>.none(), head: move head, body: move body, digest: digest, origins: origins, stored: stored,
       exports: Option<Bytes>.none()})
     unit = unit + usize.ONE
   }
@@ -109318,7 +109509,7 @@ impl FrameSelection {
 // Whether a suspendable caller may run `function`, a suspendable instance's MIR outside any
 // frame, in its own frame at a suspension point (`FrameSelection.bodies`).
 fn frameForwards(resolver: &Resolver, function: &MirFunction) -> bool {
-  return resolver.inlining && !resolver.lineTables && MirInline.eligible(function, resolver.direct)
+  return instanceInlining(resolver, &function.key) && !instanceLines(resolver, &function.key) && MirInline.eligible(function, resolver.direct)
 }
 
 // The roots of a frame walk: `roots`, then the four storage `exports`, whose symbols `selection`

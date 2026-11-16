@@ -75,7 +75,7 @@ pub effect fn main() -> i32 ! OutOfMemoryError {
 
 Import as `Schema` with `import silk.schema.schema { Schema }`.
 
-Public declarations: 9.
+Public declarations: 11.
 
 <a id="SchemaReader"></a>
 
@@ -247,6 +247,17 @@ effect fn member(self: &mut Self, key: string) -> bool ! Issue | OutOfMemoryErro
 
 Finds the member `key` of the object being read and leaves the reader at its value, or
 returns `false` if the object has no such member.
+
+<a id="SchemaReader.nextMember"></a>
+
+### Operation `nextMember`
+
+```silk
+effect fn nextMember(self: &mut Self) -> Option<String> ! Issue | OutOfMemoryError ? &mut Allocator
+```
+
+Returns the next unread member's owned key and leaves the reader at its value.
+Returns `None` after every member has been visited; `endObject` still closes the object.
 
 <a id="SchemaReader.rejectUnread"></a>
 
@@ -1550,6 +1561,65 @@ effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryEr
 
 Tests a length in characters, or a pattern.
 
+<a id="Box.impl.Schema"></a>
+
+## Implementation `Schema for Box<T>`
+
+```silk
+impl<T: Schema> Schema for Box<T>
+```
+
+<a id="Box.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns the contained schema's value kind and expected description.
+
+<a id="Box.impl.Schema.read"></a>
+
+### Operation `read`
+
+```silk
+effect fn read<R: SchemaReader>(reader: &mut R) -> Box<T> ! Issue | OutOfMemoryError ? &mut Allocator
+```
+
+Reads and allocates the contained value, with the schema and errors of `T`.
+
+<a id="Box.impl.Schema.write"></a>
+
+### Operation `write`
+
+```silk
+effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
+    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator
+```
+
+Writes the contained value without an extra object or field.
+
+<a id="Box.impl.Schema.shape"></a>
+
+### Operation `shape`
+
+```silk
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator
+```
+
+Returns the shape of the contained value, without an extra object or field.
+
+<a id="Box.impl.Schema.satisfies"></a>
+
+### Operation `satisfies`
+
+```silk
+effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator
+```
+
+Tests a constraint against the contained value.
+
 <a id="Option.impl.Schema"></a>
 
 ## Implementation `Schema for Option<T>`
@@ -2101,6 +2171,145 @@ effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryEr
 ```
 
 Tests a range.
+
+<a id="DictionaryEntry"></a>
+
+## `DictionaryEntry`
+
+```silk
+pub struct DictionaryEntry<T>
+```
+
+One owned key and typed value in a schema dictionary.
+
+<a id="DictionaryEntry.key"></a>
+
+### Field `key`
+
+```silk
+pub key: String
+```
+
+The member name as it appears in the document.
+
+<a id="DictionaryEntry.value"></a>
+
+### Field `value`
+
+```silk
+pub value: T
+```
+
+The member's decoded value.
+
+<a id="Dictionary"></a>
+
+## `Dictionary`
+
+```silk
+pub struct Dictionary<T>
+```
+
+An ordered object with arbitrary text keys and one schema for all values.
+
+<a id="Dictionary.impl"></a>
+
+## Implementation `Dictionary<T>`
+
+```silk
+impl<T> Dictionary<T>
+```
+
+<a id="Dictionary.impl.make"></a>
+
+### Associated function `make`
+
+```silk
+pub fn make() -> Self
+```
+
+Creates an empty dictionary.
+
+<a id="Dictionary.impl.entries"></a>
+
+### Method `entries`
+
+```silk
+pub fn entries(self: &Self) -> &[DictionaryEntry<T>]
+```
+
+Borrows the members in document order.
+
+<a id="Dictionary.impl.find"></a>
+
+### Method `find`
+
+```silk
+pub fn find(self: &Self, key: string) -> Option<&T>
+```
+
+Finds a member by its exact key, preserving its ownership in the dictionary.
+
+<a id="Dictionary.impl.insert"></a>
+
+### Method `insert`
+
+```silk
+pub effect fn insert(self: &mut Self, key: String, value: T) -> () ! Issue | OutOfMemoryError ? &mut Allocator
+```
+
+Appends a new member, refusing duplicate keys.
+
+<a id="Dictionary.impl.Schema"></a>
+
+## Implementation `Schema for Dictionary<T>`
+
+```silk
+impl<T: Schema> Schema for Dictionary<T>
+```
+
+<a id="Dictionary.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+<a id="Dictionary.impl.Schema.read"></a>
+
+### Operation `read`
+
+```silk
+effect fn read<R: SchemaReader>(reader: &mut R) -> Self ! Issue | OutOfMemoryError ? &mut Allocator
+```
+
+<a id="Dictionary.impl.Schema.write"></a>
+
+### Operation `write`
+
+```silk
+effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+  ! Issue | WriterError | OutOfMemoryError ? &mut Allocator | &mut Writer
+```
+
+<a id="Dictionary.impl.Schema.shape"></a>
+
+### Operation `shape`
+
+```silk
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator
+```
+
+<a id="Dictionary.impl.Schema.missing"></a>
+
+### Operation `missing`
+
+```silk
+effect fn missing() -> Self ! Issue
+```
+
+An absent dictionary field has no members.
 
 
 Category: Data formats.

@@ -91,6 +91,7 @@ import silk.num.u16
 import silk.num.u32
 import silk.num.u64
 import silk.num.u8
+import silk.mem.box { Box }
 import silk.num.usize
 import silk.schema.codec { Codec }
 import silk.schema.issue { Issue, IssueReason, Span, ValueKind }
@@ -185,6 +186,10 @@ pub interface SchemaReader {
   /// Finds the member `key` of the object being read and leaves the reader at its value, or
   /// returns `false` if the object has no such member.
   effect fn member(self: &mut Self, key: string) -> bool ! Issue | OutOfMemoryError ? &mut Allocator
+
+  /// Returns the next unread member's owned key and leaves the reader at its value.
+  /// Returns `None` after every member has been visited; `endObject` still closes the object.
+  effect fn nextMember(self: &mut Self) -> Option<String> ! Issue | OutOfMemoryError ? &mut Allocator
 
   /// Reports every member of the object being read that no `member` call found, as
   /// `IssueReason.UnexpectedKey` with `expected` naming the keys the type accepts. The default
@@ -1297,6 +1302,10 @@ impl SchemaReader for LiteralReader {
     return false
   }
 
+  effect fn nextMember(self: &mut Self) -> Option<String> ! Issue | OutOfMemoryError ? &mut Allocator {
+    fail Issue.make(IssueReason.InvalidType, "an object")
+  }
+
   effect fn endObject(self: &mut Self) -> () ! Issue | OutOfMemoryError ? &mut Allocator {
     return ()
   }
@@ -1718,6 +1727,35 @@ impl Schema for String {
   }
 }
 
+impl<T: Schema> Schema for Box<T> {
+  /// Returns the contained schema's value kind and expected description.
+  static fn kind() -> KindOf<Self> {
+    let value = Schemas.kind<T>()
+    return KindOf<Self>.of(value.value, value.expected)
+  }
+
+  /// Reads and allocates the contained value, with the schema and errors of `T`.
+  effect fn read<R: SchemaReader>(reader: &mut R) -> Box<T> ! Issue | OutOfMemoryError ? &mut Allocator {
+    return run Box<T>.make(run Schemas.read<T, R>(&mut reader.*))
+  }
+
+  /// Writes the contained value without an extra object or field.
+  effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
+    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
+    return run Schemas.write<T, W>(&Box<T>.get(self)[0], &mut writer.*)
+  }
+
+  /// Returns the shape of the contained value, without an extra object or field.
+  effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator {
+    return ShapeOf<Self>.make(run Schemas.shapeOf<T>(&mut shapes.*))
+  }
+
+  /// Tests a constraint against the contained value.
+  effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator {
+    return run Schema.satisfies(&Box<T>.get(self)[0], constraint)
+  }
+}
+
 impl<T: Schema> Schema for Option<T> {
   /// Returns the kind of `T`.
   static fn kind() -> KindOf<Self> {
@@ -2064,4 +2102,103 @@ impl Schema for i32 {
   effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator {
     return withinSigned(i32.toI64(self.*), constraint)
   }
+}
+
+/// One owned key and typed value in a schema dictionary.
+pub struct DictionaryEntry<T> {
+  /// The member name as it appears in the document.
+  pub key: String,
+  /// The member's decoded value.
+  pub value: T,
+}
+
+/// An ordered object with arbitrary text keys and one schema for all values.
+pub struct Dictionary<T> {storage: List<DictionaryEntry<T>>}
+
+impl<T> Dictionary<T> {
+  /// Creates an empty dictionary.
+  pub fn make() -> Self { return Dictionary<T> {storage: List<DictionaryEntry<T>>.make()} }
+
+  /// Borrows the members in document order.
+  pub fn entries(self: &Self) -> &[DictionaryEntry<T>] { return self.storage.asSlice() }
+
+  /// Finds a member by its exact key, preserving its ownership in the dictionary.
+  pub fn find(self: &Self, key: string) -> Option<&T> {
+    let entries = self.storage.asSlice()
+    let mut at = usize.ZERO
+    while at < entries.length {
+      if entries[at].key.view() == key { return Option<&T>.some(&entries[at].value) }
+      at = at + usize.ONE
+    }
+    return Option<&T>.none()
+  }
+
+  /// Appends a new member, refusing duplicate keys.
+  pub effect fn insert(self: &mut Self, key: String, value: T) -> () ! Issue | OutOfMemoryError ? &mut Allocator {
+    if self.find(key.view()).isSome() { fail Issue.make(IssueReason.InvalidValue, "unique object keys") }
+    return run self.storage.append(DictionaryEntry<T> {key: move key, value: move value})
+  }
+}
+
+impl<T: Schema> Schema for Dictionary<T> {
+  static fn kind() -> KindOf<Self> { return KindOf<Self>.of(ValueKind.Object, "an object") }
+
+  effect fn read<R: SchemaReader>(reader: &mut R) -> Self ! Issue | OutOfMemoryError ? &mut Allocator {
+    run SchemaReader.beginObject(&mut reader)
+    let mut result = Dictionary<T>.make()
+    let collecting = SchemaReader.collecting(&reader.*)
+    let mut failed = false
+    while let Option<String>.Some {value: key} = move run SchemaReader.nextMember(&mut reader) {
+      run SchemaPath.push(SchemaReader.path(&mut reader), PathSegment.Key {name: run String.copy(key.view())})
+      if collecting {
+        let depth = pathDepth(&mut reader)
+        let start = run SchemaReader.mark(&mut reader)
+        match move run Effect.result(readDictionaryMember<T, R>(&mut reader, &mut result, move key)) {
+          Result<(), Issue | OutOfMemoryError>.Success {..} => SchemaReader.release(&mut reader, start)
+          Result<(), Issue | OutOfMemoryError>.Failure {error} => match move error {
+            Issue issue => {
+              run noteFailure(&mut reader, move issue)
+              SchemaPath.truncate(SchemaReader.path(&mut reader), depth)
+              run SchemaReader.recover(&mut reader, start, true)
+              failed = true
+            }
+            OutOfMemoryError {} => { fail OutOfMemoryError {} }
+          }
+        }
+      } else {
+        run readDictionaryMember<T, R>(&mut reader, &mut result, move key)
+      }
+      SchemaPath.pop(SchemaReader.path(&mut reader))
+    }
+    run SchemaReader.endObject(&mut reader)
+    if failed { fail Issue.make(IssueReason.Reported, "") }
+    return move result
+  }
+
+  effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+  ! Issue | WriterError | OutOfMemoryError ? &mut Allocator | &mut Writer {
+    run SchemaWriter.beginObject(&mut writer)
+    let entries = self.storage.asSlice()
+    let mut at = usize.ZERO
+    while at < entries.length {
+      run SchemaWriter.key(&mut writer, entries[at].key.view())
+      run Schemas.write<T, W>(&entries[at].value, &mut writer)
+      at = at + usize.ONE
+    }
+    return run SchemaWriter.endObject(&mut writer)
+  }
+
+  effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator {
+    let value = run Schemas.shapeOf<T>(&mut shapes)
+    return ShapeOf<Self>.make(run shapes.add(Shape.Dictionary {value: value}))
+  }
+
+  /// An absent dictionary field has no members.
+  effect fn missing() -> Self ! Issue { return Dictionary<T>.make() }
+}
+
+effect fn readDictionaryMember<T: Schema, R: SchemaReader>(reader: &mut R, result: &mut Dictionary<T>, key: String)
+-> () ! Issue | OutOfMemoryError ? &mut Allocator {
+  let value = run Schemas.read<T, R>(&mut reader)
+  return run result.insert(move key, move value)
 }

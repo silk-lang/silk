@@ -411,6 +411,14 @@ effect fn member(self: &mut Self, key: string) -> bool ! Issue | OutOfMemoryErro
 Finds the member `key` in the object's index and leaves the reader at its value. A missing key
 leaves the object's opening brace as the last span.
 
+<a id="JsonSchemaReader.impl.SchemaReader.nextMember"></a>
+
+### Operation `nextMember`
+
+```silk
+effect fn nextMember(self: &mut Self) -> Option<String> ! Issue | OutOfMemoryError ? &mut Allocator
+```
+
 <a id="JsonSchemaReader.impl.SchemaReader.rejectUnread"></a>
 
 ### Operation `rejectUnread`

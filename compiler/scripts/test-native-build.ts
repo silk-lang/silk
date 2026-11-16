@@ -4,7 +4,6 @@ import { createHash } from 'node:crypto'
 import { spawn, spawnSync, type SpawnSyncReturns } from 'node:child_process'
 import { existsSync, readdirSync, statSync } from 'node:fs'
 import { createRequire } from 'node:module'
-import { release } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import * as Config from 'effect/Config'
@@ -54,10 +53,11 @@ const invoke = Effect.fnUntraced(function* (
   cwd: string,
   env: NodeJS.ProcessEnv = process.env,
   timeout = 30_000,
+  input?: string,
 ): Effect.fn.Return<SpawnSyncReturns<string>, VerificationError> {
   return yield* Effect.try({
     try: () => {
-      const ran = spawnSync(command, args, { cwd, env, encoding: 'utf8', timeout })
+      const ran = spawnSync(command, args, { cwd, env, encoding: 'utf8', timeout, input })
       settleCaches(cwd)
       return ran
     },
@@ -90,6 +90,152 @@ const program = Effect.gen(function* () {
   yield* fs.chmod(sentinel, 0o755)
   // The standard library supplies the catalog runtime that roots the build.
   const standardLibrary = join(repository, 'stdlib')
+  // Explicit requests must ignore even malformed manifests and build scripts, while resolving
+  // package aliases, supplied parameters, generated modules, and native translation units.
+  const requestRoot = join(directory, 'request-fixture')
+  yield* fs.makeDirectory(requestRoot, { recursive: true })
+  yield* fs.copy(join(repository, 'compiler/fixtures/compilation-request'), requestRoot, { overwrite: true })
+  yield* fs.rename(join(requestRoot, 'silk.toml.invalid'), join(requestRoot, 'silk.toml'))
+  yield* fs.rename(join(requestRoot, 'build.silk.invalid'), join(requestRoot, 'build.silk'))
+  const requestText = (yield* fs.readFileString(join(requestRoot, 'request.toml')))
+    .replaceAll('/REQUEST_ROOT', requestRoot).replaceAll('/STDLIB_ROOT', standardLibrary)
+  const requestFile = join(requestRoot, 'request.toml')
+  yield* fs.writeFileString(requestFile, requestText)
+  const requestEnv = { ...process.env, SILK_CLANG: clang }
+  const requested = yield* invoke(silk, ['compile', '--request', requestFile], requestRoot, requestEnv, 120_000)
+  assert.equal(requested.status, 0, requested.stderr)
+  const requestOutput = join(requestRoot, 'program')
+  const requestBytes = yield* fs.readFile(requestOutput)
+  const requestRan = yield* invoke(requestOutput, [], requestRoot)
+  assert.equal(requestRan.status, 0, requestRan.stderr)
+  const pipedRequest = yield* invoke(silk, ['compile', '--request', '-'], requestRoot, requestEnv, 120_000, requestText)
+  assert.equal(pipedRequest.status, 0, pipedRequest.stderr)
+  assert.deepEqual(yield* fs.readFile(requestOutput), requestBytes, 'request file and stdin must emit identical artifacts')
+  const wrongVersion = yield* invoke(silk, ['compile', '--request', '-'], requestRoot, requestEnv, 30_000, requestText.replace('version = 1', 'version = 2'))
+  assert.equal(wrongVersion.status, 2, wrongVersion.stderr)
+  // A generic instantiated by the root belongs to its defining package's backend unit.
+  const mixedLog = join(directory, 'mixed-clang.jsonl')
+  const mixedClang = join(directory, 'mixed-clang')
+  yield* fs.writeFileString(mixedClang, `#!/usr/bin/env python3
+import json, os, sys
+with open(${encodeJson(mixedLog)}, 'a') as log:
+    log.write(json.dumps(sys.argv[1:]) + '\\n')
+os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
+`)
+  yield* fs.chmod(mixedClang, 0o755)
+  const mixedText = requestText.replace('name = "request-dependency"', 'optimization = "speed"\ndebug = true\nname = "request-dependency"')
+  const mixed = yield* invoke(silk, ['compile', '--request', '-'], requestRoot,
+    { ...requestEnv, SILK_CLANG: mixedClang }, 120_000, mixedText)
+  assert.equal(mixed.status, 0, mixed.stderr)
+  assert.equal((yield* invoke(requestOutput, [], requestRoot)).status, 0)
+  const generic = (yield* fs.readFileString(`${requestOutput}.symbols`)).split('\n')
+    .find((line) => line.endsWith('request-dependency@0.1.0:value.silk::identity'))?.split('\t')[0]
+  assert.ok(generic, 'the root must instantiate the dependency generic')
+  const calls = yield* Schema.decodeUnknownEffect(Schema.Array(Schema.Array(Schema.String)))(
+    yield* decodeJson(`[${(yield* fs.readFileString(mixedLog)).trim().split('\n').join(',')}]`))
+  let genericUnits = 0
+  for (const call of calls) {
+    if (!call.includes('-c') || !call.includes('ir')) continue
+    const partial = call[call.indexOf('-o') + 1]
+    const object = partial.slice(0, partial.indexOf('.o.') + 2)
+    const symbols = yield* invoke(join(dirname(clang), 'llvm-nm'), ['--defined-only', object], requestRoot)
+    assert.equal(symbols.status, 0, symbols.stderr)
+    if (!symbols.stdout.split('\n').some((line) => line.endsWith(` ${generic}`))) continue
+    genericUnits++
+    assert.ok(call.includes('-O2') && call.includes('-g'), 'dependency generics use the defining package optimization and debug settings')
+    assert.ok(!call.includes('-O0'), 'program defaults must not override package flags')
+    const dwarf = yield* invoke(join(dirname(clang), 'llvm-dwarfdump'), ['--debug-info', object], requestRoot)
+    assert.equal(dwarf.status, 0, dwarf.stderr)
+    assert.match(dwarf.stdout, /DW_TAG_compile_unit/, 'the dependency object must contain usable debug information')
+  }
+  assert.equal(genericUnits, 1)
+  const graphRoot = join(directory, 'graph-fixture')
+  yield* fs.makeDirectory(graphRoot, { recursive: true })
+  const graphProgram = join(directory, 'graph-test')
+  const graphBuilt = yield* invoke(silk, ['build', join(repository, 'compiler/fixtures/build-graph/main.silk'),
+    '-o', graphProgram, '--stdlib', standardLibrary, '--clang', clang], directory, process.env, 120_000)
+  assert.equal(graphBuilt.status, 0, graphBuilt.stderr)
+  const graphRan = yield* invoke(graphProgram, [], graphRoot)
+  assert.equal(graphRan.status, 0, graphRan.stderr)
+  const staticGraphProgram = join(directory, 'static-graph-test')
+  const staticGraphBuilt = yield* invoke(silk, ['build', join(repository, 'compiler/fixtures/build-graph/static.silk'),
+    '-o', staticGraphProgram, '--stdlib', standardLibrary, '--clang', clang], directory, process.env, 120_000)
+  assert.equal(staticGraphBuilt.status, 0, staticGraphBuilt.stderr)
+  const staticGraphRan = yield* invoke(staticGraphProgram, [], graphRoot)
+  assert.equal(staticGraphRan.status, 0, staticGraphRan.stderr)
+  const optionsProgram = join(directory, 'build-options-test')
+  const optionsBuilt = yield* invoke(silk, ['build', join(repository, 'compiler/fixtures/build-graph/options.silk'),
+    '-o', optionsProgram, '--stdlib', standardLibrary, '--clang', clang], directory, process.env, 120_000)
+  assert.equal(optionsBuilt.status, 0, optionsBuilt.stderr)
+  const optionsRan = yield* invoke(optionsProgram, [], graphRoot)
+  assert.equal(optionsRan.status, 0, optionsRan.stderr)
+  const graphTask = join(directory, 'graph-task-test')
+  const graphTaskBuilt = yield* invoke(silk, ['build', join(repository, 'compiler/fixtures/build-graph/task.silk'),
+    '-o', graphTask, '--stdlib', standardLibrary, '--clang', clang], directory, process.env, 120_000)
+  assert.equal(graphTaskBuilt.status, 0, graphTaskBuilt.stderr)
+  const graphTaskRan = yield* invoke(graphTask, ['fail'], graphRoot)
+  assert.equal(graphTaskRan.status, 1, graphTaskRan.stderr)
+  assert.equal(graphTaskRan.stderr, 'error: declared build input is missing\n')
+  // Resolution reads the package definition; only compile --request bypasses manifests and plans.
+  yield* fs.remove(join(requestRoot, 'build.silk'))
+  yield* fs.writeFileString(join(requestRoot, 'silk.toml'),
+    '[package]\nname = "request-fixture"\nversion = "0.1.0"\nsource = "."\n[dependencies]\ndep = { path = "dependency" }\n')
+  yield* fs.writeFileString(join(requestRoot, 'dependency/silk.toml'),
+    '[package]\nname = "request-dependency"\nversion = "0.1.0"\nsource = "."\nkind = "library"\nexports = ["value"]\n')
+  const definitionText = (yield* fs.readFileString(join(requestRoot, 'definition.toml')))
+    .replaceAll('/REQUEST_ROOT', requestRoot).replaceAll('/STDLIB_ROOT', standardLibrary)
+  yield* fs.writeFileString(join(requestRoot, 'definition.toml'), definitionText)
+  const generatedRoot = join(directory, 'generated-entry.silk')
+  yield* fs.copyFile(join(requestRoot, 'main.silk'), generatedRoot)
+  const definitionFile = join(requestRoot, 'definition.toml')
+  const resolvedFile = join(requestRoot, 'resolved.toml')
+  const manifestBeforeExclusion = yield* fs.readFileString(join(requestRoot, 'silk.toml'))
+  yield* fs.writeFileString(join(requestRoot, 'silk.toml'),
+    manifestBeforeExclusion + 'unused = { path = "missing-dependency" }\n')
+  const excludedDefinition = definitionText.replace('[settings]\n', `[settings]\nroot = ${JSON.stringify(generatedRoot)}\n`)
+    + '\n[packages.unused]\nexcluded = true\nparameters = []\n'
+  yield* fs.writeFileString(definitionFile, excludedDefinition)
+  const resolved = yield* invoke(silk, ['resolve', '--definition', definitionFile, '--output', resolvedFile], requestRoot, requestEnv, 120_000)
+  assert.equal(resolved.status, 0, resolved.stderr)
+  const resolvedText = yield* fs.readFileString(resolvedFile)
+  assert.ok(resolvedText.includes(generatedRoot), 'the request must retain the physical generated root')
+  assert.match(resolvedText, /"root-module" = "main\.silk"/)
+  assert.ok(!resolvedText.includes('missing-dependency'), 'excluded packages must not enter the request')
+  const generatedCompiled = yield* invoke(silk, ['compile', '--request', resolvedFile], requestRoot, requestEnv, 120_000)
+  assert.equal(generatedCompiled.status, 0, generatedCompiled.stderr)
+  const generatedRan = yield* invoke(join(requestRoot, 'artifact'), [], requestRoot)
+  assert.equal(generatedRan.status, 0, generatedRan.stderr)
+  yield* fs.writeFileString(definitionFile, definitionText)
+  yield* fs.writeFileString(join(requestRoot, 'silk.toml'), manifestBeforeExclusion)
+  const graphCompiler = join(directory, 'graph-compilation-test')
+  const graphCompilerBuilt = yield* invoke(silk, ['build', join(repository, 'compiler/fixtures/build-graph/compile.silk'),
+    '-o', graphCompiler, '--stdlib', standardLibrary, '--clang', clang], directory, process.env, 300_000)
+  assert.equal(graphCompilerBuilt.status, 0, graphCompilerBuilt.stderr || String(graphCompilerBuilt.error))
+  yield* fs.writeFileString(join(directory, 'silk.toml'),
+    '[package]\nname = "native-build"\nversion = "0.1.0"\nsource = "."\n[workspace]\nmembers = ["request-fixture"]\noutput-dir = "request-fixture/custom-output"\n')
+  const graphCompiled = yield* invoke(graphCompiler, [], requestRoot, { ...requestEnv, SILK_TEST_COMPILER: silk }, 120_000)
+  assert.equal(graphCompiled.status, 0, graphCompiled.stderr)
+  assert.ok(yield* fs.exists(join(requestRoot, 'custom-output/x86_64-unknown-linux-gnu/dev/request-fixture')))
+  yield* fs.writeFileString(join(directory, 'silk.toml'),
+    '[package]\nname = "native-build"\nversion = "0.1.0"\nsource = "."\n')
+  const runnerDirectory = join(directory, 'artifact-runners')
+  yield* fs.makeDirectory(runnerDirectory)
+  const explicitRunner = join(runnerDirectory, 'explicit')
+  const wasiRunner = join(runnerDirectory, 'wasmtime')
+  const launchArguments = `test "$2" = ${quote(requestOutput)} && test "$3" = 'argument with spaces' && test "$#" = 3`
+  yield* fs.writeFileString(explicitRunner, `#!/bin/sh\ntest "$1" = 'runner option' && ${launchArguments}\n`)
+  yield* fs.writeFileString(wasiRunner, `#!/bin/sh\ntest "$1" = run && ${launchArguments}\n`)
+  yield* fs.chmod(explicitRunner, 0o755)
+  yield* fs.chmod(wasiRunner, 0o755)
+  const launchRequest = join(requestRoot, 'launch.toml')
+  yield* fs.writeFileString(launchRequest, `${requestText}\n[runner]\nprogram = ${JSON.stringify(explicitRunner)}\narguments = ["runner option"]\n`)
+  const explicitLaunch = yield* invoke(graphCompiler, [], requestRoot,
+    { ...requestEnv, SILK_TEST_LAUNCH_REQUEST: launchRequest }, 30_000)
+  assert.equal(explicitLaunch.status, 0, explicitLaunch.stderr)
+  yield* fs.writeFileString(launchRequest, requestText.replace('target = "x86_64-unknown-linux-gnu"', 'target = "wasm32-wasip1"'))
+  const wasiLaunch = yield* invoke(graphCompiler, [], requestRoot,
+    { ...requestEnv, SILK_TEST_LAUNCH_REQUEST: launchRequest, PATH: `${runnerDirectory}:${process.env.PATH}` }, 30_000)
+  assert.equal(wasiLaunch.status, 0, wasiLaunch.stderr)
   const argumentsFor = (output: string) => [
     'build',
     'main.silk',
@@ -2622,13 +2768,13 @@ const program = Effect.gen(function* () {
     '[package]\nname = "plib"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nexports = ["Plib"]\n',
   )
   const planScript = (body: string) =>
-    'import silk.build.plan { Plan }\nimport silk.build.source { Source }\nimport silk.core.static_text { StaticText }\n\n'
-      + `static fn plan() -> string<'static> {\n${body}}\n\npub const PLAN: string = plan()\n`
+    'import silk.build.plan { Plan }\nimport silk.build.source { Source }\nimport silk.core.static_text { StaticText }\nimport silk.build.write_files { WriteFiles }\nimport silk.build.run { Run }\nimport silk.build.step { sourcePath }\n\n'
+      + `static fn plan() -> Plan {\n${body}}\n\npub const PLAN: Plan = plan()\n`
   const workingPlan = planScript(
     '  let mut plan = Plan.empty()\n'
-      + '  plan = Plan.module(plan, "generated_base", StaticText.concat("pub const BASE: i32 = ", Source.text("base.txt")))\n'
-      + '  plan = Plan.compileC(plan, "native/twice.c")\n'
-      + '  plan = Plan.linkLibrary(plan, "m")\n'
+      + '  let files = WriteFiles.empty() |> WriteFiles.literal("base.silk", StaticText.concat("pub const BASE: i32 = ", Source.text("base.txt")))\n  plan = Plan.module(plan, "generated_base", WriteFiles.result(&files, "base.silk"))\n'
+      + '  plan = Plan.compileC(plan, sourcePath("native/twice.c"))\n'
+      + '  plan = Plan.linkLibrary(plan, "m", "dynamic", false, false)\n'
       + '  return plan\n',
   )
   yield* fs.writeFileString(join(planned, 'plib/build.silk'), workingPlan)
@@ -2651,25 +2797,83 @@ const program = Effect.gen(function* () {
   yield* fs.writeFileString(join(planned, 'plib/base.txt'), '30\n')
   yield* planRun(61)
   for (const [script, rule] of [
-    ['pub const OTHER: i32 = 1\n', /plib\/build\.silk: build\.silk computes no plan: it must declare `pub const PLAN: string`/],
+    ['pub const OTHER: i32 = 1\n', /plib\/build\.silk: build\.silk computes no plan: it must declare `pub const PLAN: Plan`/],
     ['pub const PLAN: string = "silk-plan 2\\n"\n', /plib\/build\.silk: build\.silk computes no plan: `PLAN` is not a plan/],
-    [planScript('  return Plan.module(Plan.empty(), "a.b", "")\n'), /error\[SEM0177\] a generated module name is one path segment/],
-    [planScript('  return Plan.module(Plan.empty(), "missing", Source.text("absent.txt"))\n'), /error\[SEM0176\] .*cannot embed "absent\.txt"/],
-    [planScript('  return Plan.module(Plan.empty(), "Plib", "")\n'), /its module `Plib` would shadow the package's file .*plib\/Plib\.silk/],
+    [planScript('  return Plan.module(Plan.empty(), "../escape", sourcePath("base.txt"))\n'), /build\.silk computes no plan/],
+    [planScript('  return Plan.module(Plan.empty(), "missing", WriteFiles.result(&WriteFiles.literal(WriteFiles.empty(), "source.silk", Source.text("absent.txt")), "source.silk"))\n'), /error\[SEM0176\] .*cannot embed "absent\.txt"/],
+    [planScript('  return Plan.module(Plan.empty(), "Plib", sourcePath("base.txt"))\n'), /source root/],
   ] as const) {
     yield* fs.writeFileString(join(planned, 'plib/build.silk'), script)
     const refusedPlan = yield* invoke(silk, ['build', '--stdlib', standardLibrary], plannedApp, sourcesEnvironment)
     assert.equal(refusedPlan.status, 1, refusedPlan.stderr)
     assert.match(refusedPlan.stderr, rule)
   }
+  const suppliedPlan = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-supplied-plan-' })
+  for (const name of ['silk.toml', 'main.silk', 'build.silk']) {
+    yield* fs.copyFile(join(repository, 'compiler/fixtures/build-plan', name), join(suppliedPlan, name))
+  }
+  const suppliedSource = join(directory, 'supplied-answer.silk')
+  yield* fs.writeFileString(suppliedSource, 'pub const VALUE: i32 = 42\n')
+  const suppliedDefinition = (module: string, permitted: boolean, path = suppliedSource) =>
+    `manifest = ${JSON.stringify(join(suppliedPlan, 'silk.toml'))}\nstdlib = ${JSON.stringify(standardLibrary)}\n`
+      + '[settings]\nmodules = []\n[settings.profile]\noptimization = "none"\ndebug = false\n'
+      + '[settings.native]\nsources = []\nlink = []\n[packages.self]\nexcluded = false\n'
+      + `parameters = [{name = "input", module = ${JSON.stringify(module)}, supplied-path = ${permitted}, value = {type = "Text", value = ${JSON.stringify(path)}}}]\n`
+  const suppliedDefinitionFile = join(suppliedPlan, 'definition.toml')
+  const suppliedRequest = join(suppliedPlan, 'request.toml')
+  const resolveSupplied = () => invoke(silk, ['resolve', '--definition', suppliedDefinitionFile, '--output', suppliedRequest], suppliedPlan, sourcesEnvironment)
+  yield* fs.writeFileString(suppliedDefinitionFile, suppliedDefinition('build.silk', true))
+  const grantedPlan = yield* resolveSupplied()
+  assert.equal(grantedPlan.status, 0, grantedPlan.stderr)
+  const grantedRequest = yield* fs.readFileString(suppliedRequest)
+  assert.match(grantedRequest, /"parameters" = \[\]/, 'plan bindings must not leak into source profiles')
+  const grantedCompilation = yield* invoke(silk, ['compile', '--request', suppliedRequest], suppliedPlan, sourcesEnvironment)
+  assert.equal(grantedCompilation.status, 0, grantedCompilation.stderr)
+  const grantedRun = yield* invoke(join(suppliedPlan, 'artifact'), [], suppliedPlan)
+  assert.equal(grantedRun.status, 42, grantedRun.stderr)
+  yield* fs.writeFileString(suppliedDefinitionFile, suppliedDefinition('build.silk', false))
+  const ungrantedPlan = yield* resolveSupplied()
+  assert.equal(ungrantedPlan.status, 1, ungrantedPlan.stderr)
+  assert.match(ungrantedPlan.stderr, /only read host paths explicitly supplied/)
+  yield* fs.writeFileString(suppliedDefinitionFile, suppliedDefinition('main.silk', true))
+  const sourceGrant = yield* resolveSupplied()
+  assert.equal(sourceGrant.status, 2, sourceGrant.stderr)
+  assert.match(sourceGrant.stderr, /supplied host path bound only to a text parameter of build\.silk/)
+  const suppliedDirectory = join(suppliedPlan, 'sdk')
+  yield* fs.makeDirectory(suppliedDirectory)
+  const suppliedMember = join(suppliedDirectory, 'answer.silk')
+  yield* fs.copyFile(suppliedSource, suppliedMember)
+  const pathPlan = (yield* fs.readFileString(join(suppliedPlan, 'build.silk')))
+    .replace('pub param input:', 'import silk.core.static_text { StaticText }\npub param input:')
+    .replace('suppliedPath(input)', 'suppliedPath(StaticText.concat(input, "/answer.silk"))')
+  yield* fs.writeFileString(join(suppliedPlan, 'build.silk'), pathPlan)
+  yield* fs.writeFileString(suppliedDefinitionFile, suppliedDefinition('build.silk', true, suppliedDirectory))
+  const directoryGrant = yield* resolveSupplied()
+  assert.equal(directoryGrant.status, 0, directoryGrant.stderr)
+  yield* fs.remove(suppliedMember)
+  yield* fs.symlink(suppliedSource, suppliedMember)
+  const escapedGrant = yield* resolveSupplied()
+  assert.equal(escapedGrant.status, 1, escapedGrant.stderr)
+  assert.match(escapedGrant.stderr, /only read host paths explicitly supplied/)
   // A plan's tool step runs a program of the package that writes declared outputs, and a module can
   // be served from one. A dependency's steps run only when the root lists it in [build].tools. On
   // Linux 6.7 or newer the step runs under Landlock, which refuses writes outside its output
   // directory, reads outside its inputs and the system, and TCP. An unchanged rerun does not run
-  // it; a host without a sandbox refuses it unless the root sets [build].unsandboxed-tools, and
-  // then warns on every build.
-  const [kernelMajor, kernelMinor] = release().split('.').map(Number)
-  const landlockNet = process.platform === 'linux' && (kernelMajor > 6 || (kernelMajor === 6 && kernelMinor >= 7))
+  // it; a host without a sandbox always refuses it.
+  const sandboxProbe = yield* invoke(silk, ['sandbox-exec', '--read', '/usr', '--read', '/bin',
+    '--read', '/lib', '--read', '/lib64', '--', '/bin/true'], directory)
+  const landlockNet = sandboxProbe.status === 0
+  const sandboxRoot = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-graph-sandbox-' })
+  const sandboxProgram = join(directory, 'graph-sandbox-test')
+  const sandboxBuilt = yield* invoke(silk, ['build', join(repository, 'compiler/fixtures/build-graph/sandbox.silk'),
+    '-o', sandboxProgram, '--stdlib', standardLibrary, '--clang', clang], directory, process.env, 120_000)
+  assert.equal(sandboxBuilt.status, 0, sandboxBuilt.stderr)
+  const sandboxRan = yield* invoke(sandboxProgram, [], sandboxRoot, { ...process.env, SILK_COMPILER: silk })
+  if (landlockNet) assert.equal(sandboxRan.status, 0, sandboxRan.stderr)
+  else {
+    assert.notEqual(sandboxRan.status, 0, 'confinement must fail closed on a host without a sandbox')
+    assert.equal(yield* fs.exists(join(sandboxRoot, 'forbidden')), false)
+  }
   const tooled = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-build-tool-' })
   for (const member of ['tlib/tools', 'app']) yield* fs.makeDirectory(join(tooled, member), { recursive: true })
   yield* fs.writeFileString(
@@ -2679,17 +2883,14 @@ const program = Effect.gen(function* () {
   yield* fs.writeFileString(
     join(tooled, 'tlib/build.silk'),
     planScript(
-      '  let mut plan = Plan.empty()\n'
-        + '  plan = Plan.tool(plan, "gen", "tools/gen.sh")\n'
-        + '  plan = Plan.toolArgument(plan, "base.txt")\n'
-        + '  plan = Plan.toolInput(plan, "base.txt")\n'
-        + '  plan = Plan.toolOutput(plan, "generated.silk")\n'
-        + '  plan = Plan.toolModule(plan, "generated_base", "gen", "generated.silk")\n'
-        + '  return plan\n',
+      '  let generator = Run.command("tools/gen.sh")\n'
+        + '    |> Run.input(sourcePath("base.txt"))\n'
+        + '    |> Run.output("generated.silk")\n'
+        + '  return Plan.module(Plan.empty(), "generated_base", Run.result(&generator, "generated.silk"))\n',
     ),
   )
   const toolScript = (extra: string) =>
-    `#!/bin/sh\n[ "$SILK_TOOL" = 1 ] || exit 9\n${extra}printf 'pub const BASE: i32 = %s\\n' "$(cat "$SILK_PACKAGE_DIR/$1")" > generated.silk\n`
+    `#!/bin/sh\n${extra}printf 'pub const BASE: i32 = %s\\n' "$(cat "$1")" > "$2"\n`
   const writeTool = (extra: string) =>
     fs.writeFileString(join(tooled, 'tlib/tools/gen.sh'), toolScript(extra)).pipe(Effect.andThen(fs.chmod(join(tooled, 'tlib/tools/gen.sh'), 0o755)))
   yield* writeTool('')
@@ -2704,13 +2905,18 @@ const program = Effect.gen(function* () {
     invoke(silk, ['build', '--stdlib', standardLibrary], toolApp, { ...sourcesEnvironment, ...environment })
   const unlisted = yield* stepBuild()
   assert.equal(unlisted.status, 1, unlisted.stderr)
-  assert.match(unlisted.stderr, /tlib\/build\.silk: build\.silk computes no plan: its tool steps run only when the root manifest lists "tlib" in \[build\]\.tools/)
+  assert.match(unlisted.stderr, /tlib\/build\.silk: build\.silk computes no plan: this dependency is not authorized to run package tools/)
   yield* fs.writeFileString(join(toolApp, 'silk.toml'), toolManifest('\n[build]\ntools = ["tlib"]\n'))
-  const generatedFile = join(toolApp, 'build/tools/tlib/gen/generated.silk')
-  const generatedStamp = () => {
-    const info = statSync(generatedFile, { bigint: true })
-    return `${info.ino}:${info.mtimeNs}`
-  }
+  const generatedStamp = Effect.fnUntraced(function* () {
+    const cache = join(toolApp, 'build/steps')
+    const entries = (yield* fs.readDirectory(cache)).filter((name) => /^[0-9a-f]{64}$/.test(name)).sort()
+    const outputs: string[] = []
+    for (const entry of entries) {
+      const file = join(cache, entry, 'generated.silk')
+      if (yield* fs.exists(file)) outputs.push(`${entry}:${yield* fs.readFileString(file)}`)
+    }
+    return outputs
+  })
   const toolRun = Effect.fnUntraced(function* (expected: number, environment: Record<string, string> = {}) {
     const built = yield* stepBuild(environment)
     assert.equal(built.status, 0, built.stderr)
@@ -2720,16 +2926,16 @@ const program = Effect.gen(function* () {
   })
   if (landlockNet) {
     yield* toolRun(21)
-    const firstGenerated = generatedStamp()
+    const firstGenerated = yield* generatedStamp()
     yield* toolRun(21)
-    assert.equal(generatedStamp(), firstGenerated, 'an unchanged rerun ran the tool again')
+    assert.deepEqual(yield* generatedStamp(), firstGenerated, 'an unchanged rerun ran the tool again')
     yield* fs.writeFileString(join(tooled, 'tlib/base.txt'), '30')
     yield* toolRun(31)
-    assert.notEqual(generatedStamp(), firstGenerated, 'an edited input did not run the tool again')
+    assert.notDeepEqual(yield* generatedStamp(), firstGenerated, 'an edited input did not run the tool again')
     for (const [extra, rule] of [
-      ['echo pwned > "$SILK_PACKAGE_DIR/pwned" || exit 3\n', /its tool step `gen` failed with status 3:\n.*pwned: Permission denied/],
-      ['cat "$SILK_PACKAGE_DIR/silk.toml" > /dev/null || exit 4\n', /its tool step `gen` failed with status 4/],
-      ['python3 -I -c "import socket; socket.create_connection((\'127.0.0.1\', 9), timeout=3)" 2>&1 | grep -q PermissionError && exit 5\n', /its tool step `gen` failed with status 5/],
+      ['echo pwned > "$(dirname "$1")/pwned" || exit 3\n', /build process failed with status 3:.*pwned: Permission denied/],
+      ['cat "$(dirname "$1")/silk.toml" > /dev/null || exit 4\n', /build process failed with status 4/],
+      ['python3 -I -c "import socket; socket.create_connection((\'127.0.0.1\', 9), timeout=3)" 2>&1 | grep -q PermissionError && exit 5\n', /build process failed with status 5/],
     ] as const) {
       yield* writeTool(extra)
       const escapedTool = yield* stepBuild()
@@ -2740,17 +2946,15 @@ const program = Effect.gen(function* () {
     yield* writeTool('exit 0\n')
     const silent = yield* stepBuild()
     assert.equal(silent.status, 1, silent.stderr)
-    assert.match(silent.stderr, /did not write its declared output generated\.silk/)
+    assert.match(silent.stderr, /did not write a declared output/)
     yield* writeTool('')
   }
   const unsandboxedHost = yield* stepBuild({ SILK_NO_TOOL_SANDBOX: '1' })
   assert.equal(unsandboxedHost.status, 1, unsandboxedHost.stderr)
-  assert.match(unsandboxedHost.stderr, /this host has no sandbox for build tools .*set \[build\]\.unsandboxed-tools = true/)
+  assert.match(unsandboxedHost.stderr, /package tools require a supported operating-system sandbox/)
   yield* fs.writeFileString(join(toolApp, 'silk.toml'), toolManifest('\n[build]\ntools = ["tlib"]\nunsandboxed-tools = true\n'))
-  for (let round = 0; round < 2; round += 1) {
-    const stderr = yield* toolRun(landlockNet ? 31 : 21, { SILK_NO_TOOL_SANDBOX: '1' })
-    assert.match(stderr, /silk: warning: running build tool `gen` of tlib without a sandbox \(\[build\]\.unsandboxed-tools\)/)
-  }
+  const deniedEscape = yield* stepBuild({ SILK_NO_TOOL_SANDBOX: '1' })
+  assert.notEqual(deniedEscape.status, 0, 'a manifest must never disable build-tool confinement')
   // `[native].function-order` places the functions it lists first in the executable's code, in its
   // order, and a change to the file alone links again. A path outside the package is refused.
   const ordered = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-ordered-' })
@@ -3363,6 +3567,11 @@ const program = Effect.gen(function* () {
     },
   )
   assert.equal(bound.status, 7, bound.stderr)
+  const boundRequest = join(directory, 'bound/build/llvm/x86_64-unknown-linux-gnu/debug/requests/bound.toml')
+  const replayedBound = yield* invoke(silk, ['compile', '--request', boundRequest], directory, { ...process.env, SILK_CLANG: clang })
+  assert.equal(replayedBound.status, 0, replayedBound.stderr)
+  const replayedProgram = yield* invoke(join(dirname(boundRequest), '../bound'), [], directory)
+  assert.equal(replayedProgram.status, 7, replayedProgram.stderr)
   const boundProfile = yield* invoke(
     silk,
     ['run', '--profile', 'small', '--stdlib', standardLibrary],
@@ -4520,7 +4729,7 @@ const program = Effect.gen(function* () {
     { ...process.env, SILK_CLANG: clang },
   )
   assert.equal(looped.status, 1, looped.stderr)
-  assert.match(looped.stderr, /^silk: cannot create temporary directory: /m)
+  assert.match(looped.stderr, /^silk: cannot inspect: invalid path\n$/)
   // Cleaning removes a link in the build directory itself, never what it points to.
   yield* fs.symlink('../../real', join(throughLinks, 'app/build/escape'))
   const cleanedLinks = yield* invoke(silk, ['clean'], join(throughLinks, 'app'))
