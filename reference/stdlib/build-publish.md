@@ -18,7 +18,7 @@ pub effect fn copy(source: &Path, destination: &Path) -> () ! AtomicWriteError |
 ```
 
 Copies a completed file or directory tree. Files replace their destination atomically and
-retain executable permissions on Unix; directories merge their completed files.
+retain executable permissions on Unix. Directory copies remove stale destination entries after copying their current files.
 
 <a id="artifact"></a>
 

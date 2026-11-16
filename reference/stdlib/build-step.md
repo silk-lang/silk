@@ -455,6 +455,16 @@ pub effect fn path(self: &Self, value: &Deferred<Path>) -> Path ! StepFailure ? 
 
 Resolves a file previously declared with `Key.file` or `Key.tree`.
 
+<a id="Make.impl.producer"></a>
+
+### Method `producer`
+
+```silk
+pub effect fn producer<T>(self: &Self, value: &Deferred<T>) -> Option<String> ! StepFailure ? &mut Allocator
+```
+
+Returns a declared input's producer key, absent for source files and known values.
+
 <a id="Make.impl.read"></a>
 
 ### Method `read`
@@ -484,6 +494,16 @@ pub effect fn output(self: &Self, name: string) -> Path ! StepFailure ? &mut All
 ```
 
 Returns a path below this step's output directory, refusing traversal and absolute names.
+
+<a id="Make.impl.readOutput"></a>
+
+### Method `readOutput`
+
+```silk
+pub effect fn readOutput(self: &mut Self, name: string) -> Bytes ! StepFailure ? &mut Allocator
+```
+
+Reads a file produced inside this step's output directory, refusing paths outside it.
 
 <a id="Make.impl.write"></a>
 

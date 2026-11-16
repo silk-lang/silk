@@ -6,7 +6,7 @@ Deferred compilation settings resolved by the graph runner.
 
 Import as `Setting` with `import silk.build.setting { Setting }`.
 
-Public declarations: 6.
+Public declarations: 7.
 
 <a id="TextField"></a>
 
@@ -306,6 +306,118 @@ Runner
 pub value: Deferred<Runner>
 ```
 
+<a id="Setting.StandardLibrary"></a>
+
+### `StandardLibrary`
+
+```silk
+StandardLibrary
+```
+
+<a id="Setting.StandardLibrary.path"></a>
+
+#### Field `path`
+
+```silk
+pub path: Deferred<Path>
+```
+
+<a id="Setting.Platform"></a>
+
+### `Platform`
+
+```silk
+Platform
+```
+
+<a id="Setting.Platform.value"></a>
+
+#### Field `value`
+
+```silk
+pub value: Deferred<Platform>
+```
+
+<a id="Setting.Windows"></a>
+
+### `Windows`
+
+```silk
+Windows
+```
+
+<a id="Setting.Windows.value"></a>
+
+#### Field `value`
+
+```silk
+pub value: Deferred<Windows>
+```
+
+<a id="Setting.MacOS"></a>
+
+### `MacOS`
+
+```silk
+MacOS
+```
+
+<a id="Setting.MacOS.value"></a>
+
+#### Field `value`
+
+```silk
+pub value: Deferred<MacOS>
+```
+
+<a id="Setting.Wasm"></a>
+
+### `Wasm`
+
+```silk
+Wasm
+```
+
+<a id="Setting.Wasm.value"></a>
+
+#### Field `value`
+
+```silk
+pub value: Deferred<Wasm>
+```
+
+<a id="Setting.Header"></a>
+
+### `Header`
+
+```silk
+Header
+```
+
+<a id="Setting.Header.value"></a>
+
+#### Field `value`
+
+```silk
+pub value: Deferred<String>
+```
+
+<a id="Setting.ImportLibrary"></a>
+
+### `ImportLibrary`
+
+```silk
+ImportLibrary
+```
+
+<a id="Setting.ImportLibrary.value"></a>
+
+#### Field `value`
+
+```silk
+pub value: Deferred<String>
+```
+
 <a id="Setting.Emit"></a>
 
 ### `Emit`
@@ -490,6 +602,30 @@ FunctionOrder
 pub path: Deferred<Path>
 ```
 
+<a id="Setting.Package"></a>
+
+### `Package`
+
+```silk
+Package
+```
+
+<a id="Setting.Package.alias"></a>
+
+#### Field `alias`
+
+```silk
+pub alias: String
+```
+
+<a id="Setting.Package.settings"></a>
+
+#### Field `settings`
+
+```silk
+pub settings: Package
+```
+
 <a id="key"></a>
 
 ## `key`
@@ -505,10 +641,20 @@ Adds a setting's identity and all deferred inputs to the compilation key.
 ## `apply`
 
 ```silk
-pub effect fn apply(setting: &Setting, make: &mut Make, request: &mut Request) -> () ! StepFailure ? &mut Allocator
+pub effect fn apply(setting: &Setting, make: &mut Make, definition: &mut Definition) -> () ! StepFailure ? &mut Allocator
 ```
 
 Resolves a setting only after its declared prerequisites have completed.
+
+<a id="keyValues"></a>
+
+## `keyValues`
+
+```silk
+pub effect fn keyValues(values: &Values, key: &mut Key) -> () ! StepFailure ? &mut Allocator
+```
+
+Declares every physical input already present in a compilation definition.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`, `wasm64-unknown-unknown`.

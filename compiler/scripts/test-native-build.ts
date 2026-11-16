@@ -113,6 +113,42 @@ const program = Effect.gen(function* () {
   assert.deepEqual(yield* fs.readFile(requestOutput), requestBytes, 'request file and stdin must emit identical artifacts')
   const wrongVersion = yield* invoke(silk, ['compile', '--request', '-'], requestRoot, requestEnv, 30_000, requestText.replace('version = 1', 'version = 2'))
   assert.equal(wrongVersion.status, 2, wrongVersion.stderr)
+  // A generic instantiated by the root belongs to its defining package's backend unit.
+  const mixedLog = join(directory, 'mixed-clang.jsonl')
+  const mixedClang = join(directory, 'mixed-clang')
+  yield* fs.writeFileString(mixedClang, `#!/usr/bin/env python3
+import json, os, sys
+with open(${encodeJson(mixedLog)}, 'a') as log:
+    log.write(json.dumps(sys.argv[1:]) + '\\n')
+os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
+`)
+  yield* fs.chmod(mixedClang, 0o755)
+  const mixedText = requestText.replace('name = "request-dependency"', 'optimization = "speed"\ndebug = true\nname = "request-dependency"')
+  const mixed = yield* invoke(silk, ['compile', '--request', '-'], requestRoot,
+    { ...requestEnv, SILK_CLANG: mixedClang }, 120_000, mixedText)
+  assert.equal(mixed.status, 0, mixed.stderr)
+  assert.equal((yield* invoke(requestOutput, [], requestRoot)).status, 0)
+  const generic = (yield* fs.readFileString(`${requestOutput}.symbols`)).split('\n')
+    .find((line) => line.endsWith('request-dependency@0.1.0:value.silk::identity'))?.split('\t')[0]
+  assert.ok(generic, 'the root must instantiate the dependency generic')
+  const calls = yield* Schema.decodeUnknownEffect(Schema.Array(Schema.Array(Schema.String)))(
+    yield* decodeJson(`[${(yield* fs.readFileString(mixedLog)).trim().split('\n').join(',')}]`))
+  let genericUnits = 0
+  for (const call of calls) {
+    if (!call.includes('-c') || !call.includes('ir')) continue
+    const partial = call[call.indexOf('-o') + 1]
+    const object = partial.slice(0, partial.indexOf('.o.') + 2)
+    const symbols = yield* invoke(join(dirname(clang), 'llvm-nm'), ['--defined-only', object], requestRoot)
+    assert.equal(symbols.status, 0, symbols.stderr)
+    if (!symbols.stdout.split('\n').some((line) => line.endsWith(` ${generic}`))) continue
+    genericUnits++
+    assert.ok(call.includes('-O2') && call.includes('-g'), 'dependency generics use the defining package optimization and debug settings')
+    assert.ok(!call.includes('-O0'), 'program defaults must not override package flags')
+    const dwarf = yield* invoke(join(dirname(clang), 'llvm-dwarfdump'), ['--debug-info', object], requestRoot)
+    assert.equal(dwarf.status, 0, dwarf.stderr)
+    assert.match(dwarf.stdout, /DW_TAG_compile_unit/, 'the dependency object must contain usable debug information')
+  }
+  assert.equal(genericUnits, 1)
   const graphRoot = join(directory, 'graph-fixture')
   yield* fs.makeDirectory(graphRoot, { recursive: true })
   const graphProgram = join(directory, 'graph-test')
@@ -134,10 +170,41 @@ const program = Effect.gen(function* () {
   const graphTaskRan = yield* invoke(graphTask, ['fail'], graphRoot)
   assert.equal(graphTaskRan.status, 1, graphTaskRan.stderr)
   assert.equal(graphTaskRan.stderr, 'error: declared build input is missing\n')
+  // Resolution reads the package definition; only compile --request bypasses manifests and plans.
+  yield* fs.remove(join(requestRoot, 'build.silk'))
+  yield* fs.writeFileString(join(requestRoot, 'silk.toml'),
+    '[package]\nname = "request-fixture"\nversion = "0.1.0"\nsource = "."\n[dependencies]\ndep = { path = "dependency" }\n')
+  yield* fs.writeFileString(join(requestRoot, 'dependency/silk.toml'),
+    '[package]\nname = "request-dependency"\nversion = "0.1.0"\nsource = "."\nkind = "library"\nexports = ["value"]\n')
+  const definitionText = (yield* fs.readFileString(join(requestRoot, 'definition.toml')))
+    .replaceAll('/REQUEST_ROOT', requestRoot).replaceAll('/STDLIB_ROOT', standardLibrary)
+  yield* fs.writeFileString(join(requestRoot, 'definition.toml'), definitionText)
+  const generatedRoot = join(directory, 'generated-entry.silk')
+  yield* fs.copyFile(join(requestRoot, 'main.silk'), generatedRoot)
+  const definitionFile = join(requestRoot, 'definition.toml')
+  const resolvedFile = join(requestRoot, 'resolved.toml')
+  const manifestBeforeExclusion = yield* fs.readFileString(join(requestRoot, 'silk.toml'))
+  yield* fs.writeFileString(join(requestRoot, 'silk.toml'),
+    manifestBeforeExclusion + 'unused = { path = "missing-dependency" }\n')
+  const excludedDefinition = definitionText.replace('[settings]\n', `[settings]\nroot = ${JSON.stringify(generatedRoot)}\n`)
+    + '\n[packages.unused]\nexcluded = true\nparameters = []\n'
+  yield* fs.writeFileString(definitionFile, excludedDefinition)
+  const resolved = yield* invoke(silk, ['resolve', '--definition', definitionFile, '--output', resolvedFile], requestRoot, requestEnv, 120_000)
+  assert.equal(resolved.status, 0, resolved.stderr)
+  const resolvedText = yield* fs.readFileString(resolvedFile)
+  assert.ok(resolvedText.includes(generatedRoot), 'the request must retain the physical generated root')
+  assert.match(resolvedText, /"root-module" = "main\.silk"/)
+  assert.ok(!resolvedText.includes('missing-dependency'), 'excluded packages must not enter the request')
+  const generatedCompiled = yield* invoke(silk, ['compile', '--request', resolvedFile], requestRoot, requestEnv, 120_000)
+  assert.equal(generatedCompiled.status, 0, generatedCompiled.stderr)
+  const generatedRan = yield* invoke(join(requestRoot, 'artifact'), [], requestRoot)
+  assert.equal(generatedRan.status, 0, generatedRan.stderr)
+  yield* fs.writeFileString(definitionFile, definitionText)
+  yield* fs.writeFileString(join(requestRoot, 'silk.toml'), manifestBeforeExclusion)
   const graphCompiler = join(directory, 'graph-compilation-test')
   const graphCompilerBuilt = yield* invoke(silk, ['build', join(repository, 'compiler/fixtures/build-graph/compile.silk'),
-    '-o', graphCompiler, '--stdlib', standardLibrary, '--clang', clang], directory, process.env, 120_000)
-  assert.equal(graphCompilerBuilt.status, 0, graphCompilerBuilt.stderr)
+    '-o', graphCompiler, '--stdlib', standardLibrary, '--clang', clang], directory, process.env, 300_000)
+  assert.equal(graphCompilerBuilt.status, 0, graphCompilerBuilt.stderr || String(graphCompilerBuilt.error))
   yield* fs.writeFileString(join(directory, 'silk.toml'),
     '[package]\nname = "native-build"\nversion = "0.1.0"\nsource = "."\n[workspace]\nmembers = ["request-fixture"]\noutput-dir = "request-fixture/custom-output"\n')
   const graphCompiled = yield* invoke(graphCompiler, [], requestRoot, { ...requestEnv, SILK_TEST_COMPILER: silk }, 120_000)
@@ -2739,8 +2806,7 @@ const program = Effect.gen(function* () {
   // be served from one. A dependency's steps run only when the root lists it in [build].tools. On
   // Linux 6.7 or newer the step runs under Landlock, which refuses writes outside its output
   // directory, reads outside its inputs and the system, and TCP. An unchanged rerun does not run
-  // it; a host without a sandbox refuses it unless the root sets [build].unsandboxed-tools, and
-  // then warns on every build.
+  // it; a host without a sandbox always refuses it.
   const sandboxProbe = yield* invoke(silk, ['sandbox-exec', '--read', '/usr', '--read', '/bin',
     '--read', '/lib', '--read', '/lib64', '--', '/bin/true'], directory)
   const landlockNet = sandboxProbe.status === 0
@@ -2830,12 +2896,10 @@ const program = Effect.gen(function* () {
   }
   const unsandboxedHost = yield* stepBuild({ SILK_NO_TOOL_SANDBOX: '1' })
   assert.equal(unsandboxedHost.status, 1, unsandboxedHost.stderr)
-  assert.match(unsandboxedHost.stderr, /this host has no sandbox for build tools .*set \[build\]\.unsandboxed-tools = true/)
+  assert.match(unsandboxedHost.stderr, /this host has no sandbox for build tools/)
   yield* fs.writeFileString(join(toolApp, 'silk.toml'), toolManifest('\n[build]\ntools = ["tlib"]\nunsandboxed-tools = true\n'))
-  for (let round = 0; round < 2; round += 1) {
-    const stderr = yield* toolRun(landlockNet ? 31 : 21, { SILK_NO_TOOL_SANDBOX: '1' })
-    assert.match(stderr, /silk: warning: running build tool `gen` of tlib without a sandbox \(\[build\]\.unsandboxed-tools\)/)
-  }
+  const deniedEscape = yield* stepBuild({ SILK_NO_TOOL_SANDBOX: '1' })
+  assert.notEqual(deniedEscape.status, 0, 'a manifest must never disable build-tool confinement')
   // `[native].function-order` places the functions it lists first in the executable's code, in its
   // order, and a change to the file alone links again. A path outside the package is refused.
   const ordered = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-ordered-' })

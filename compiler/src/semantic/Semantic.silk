@@ -55,6 +55,7 @@ import backend.DropGlue {
 }
 import backend.InstanceKey {HelperRole, InstanceKey, ProviderEntry}
 import backend.UnionDispatch {Arm as DispatchArm, Borrowed as DispatchBorrow, UnionDispatch}
+import backend.PackageSettings { PackageSettings, Mode as PackageMode }
 import backend.CodegenUnits {CodegenUnit}
 import backend.Bitcode
 import backend.Mir
@@ -2752,6 +2753,8 @@ struct Resolver {
   llvmValues: List<InstanceDefinition>,
   // Whether an assembled module is also split into codegen units.
   codegenUnits: bool,
+  packageCodegen: List<PackageSettings>,
+  programDebug: bool,
   // Whether LLVM text is shaped for an unoptimized compile (`LlvmCode.Writer.fastPath`).
   fastPathIr: bool,
   // Whether each emitted function marks its record in the table of executed functions as it
@@ -73565,7 +73568,7 @@ effect fn resolveHelperMir(resolver: &mut Resolver, owner: &mut Query<Answer, No
     Option<InstanceLocation>.None => { return memberSuccess(move gap, move dependencies) }
   }
   // Helpers are already coalesced and never have a source inlining tail of their own.
-  let raw = inlinesMir(&resolver.*, &Option<CoroutineFacts>.none())
+  let raw = inlinesMir(&resolver.*, &Option<CoroutineFacts>.none(), creator)
   let name = run internBackendVariant(&mut resolver.*, creator, observing, &Option<CoroutineFacts>.none(), raw)
   let declarationAccess156Request = Key {
     family: Family.Mir, module: location.module, name: name, declaration: location.declaration, member: instanceMember(creator),
@@ -80691,8 +80694,8 @@ fn inlineRule(direct: bool, framed: bool, selected: bool, suspending: bool) -> I
 
 // Whether this MIR variant runs inlining. LLVM selects callees only in suspendable frames;
 // direct builds may also inline synchronous calls. Line tables keep every authored boundary.
-fn inlinesMir(resolver: &Resolver, facts: &Option<CoroutineFacts>) -> bool {
-  if !resolver.inlining || resolver.lineTables { return false }
+fn inlinesMir(resolver: &Resolver, facts: &Option<CoroutineFacts>, key: &InstanceKey) -> bool {
+  if !instanceInlining(resolver, key) || instanceLines(resolver, key) { return false }
   if resolver.direct { return true }
   if let Option<CoroutineFacts>.Some {value} = &facts.* { return List<InstanceKey>.length(&value.inline) != usize.ZERO }
   return false
@@ -80714,7 +80717,7 @@ fn inlinesMir(resolver: &Resolver, facts: &Option<CoroutineFacts>) -> bool {
 effect fn inlineCalls(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>,
   dependencies: &mut List<Dependency>, function: &mut MirFunction, facts: &Option<CoroutineFacts>, observing: bool) -> ()
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
-  if !inlinesMir(&resolver.*, facts) { return () }
+  if !inlinesMir(&resolver.*, facts, &function.key) { return () }
   let mut candidates = List<InstanceKey>.make()
   let mut rawFacts = Option<CoroutineFacts>.none()
   let mut framed = false
@@ -80747,6 +80750,15 @@ effect fn inlineCalls(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejec
     let selected = match move target {
       Option<InstanceKey>.Some {value} => move value
       Option<InstanceKey>.None => { continue }
+    }
+    // Package backend settings survive lowering: a cross-package call keeps its own body.
+    if resolver.packageCodegen.length() != usize.ZERO {
+      let caller = DeclarationId.copyShared(&InstanceKey.identity(&function.key))
+      let callee = DeclarationId.copyShared(&InstanceKey.identity(&selected))
+      let samePackage = ModuleId.withPackage<bool>(DeclarationId.moduleId(&caller), |name: &[u8]| -> bool {
+        return ModuleId.withPackage<bool>(DeclarationId.moduleId(&callee), |other: &[u8]| -> bool { return name == other })
+      })
+      if !samePackage || !instanceInlining(&resolver.*, &selected) || instanceLines(&resolver.*, &selected) { continue }
     }
     let mut suspending = false
     let cancels = List<MirCancel>.asSlice(&function.cancels)
@@ -80873,7 +80885,7 @@ effect fn lowerMir(
   }
   let selfRaw = instances[key.name].raw
   let selfFacts = run copySuspension(&instances[key.name].suspension)
-  if !selfRaw && inlinesMir(&resolver.*, &selfFacts) {
+  if !selfRaw && inlinesMir(&resolver.*, &selfFacts, &instance) {
     let mut dependencies = List<Dependency>.make()
     let answer = match move run rawMirAnswer(&mut resolver.*, &mut owner.*, &mut dependencies, &instance, observing, &selfFacts) {
       Option<Shared<Result<Answer, NoRejection>>>.Some {value} => move value
@@ -81665,9 +81677,10 @@ effect fn lowerMir(
   // from the anchor (`MirFunction.lines`), and so is a site label of a build with line tables
   // (`Mir.siteLabel`), so a body that only moves in its file reads what it read. Any other site
   // label names the line its anchor starts on, so its body reads the anchor's origin too.
-  let relativeSites = relativeSites(&resolver.*)
+  let bodyLines = moduleLines(&resolver.*, &module)
+  let relativeSites = bodyLines && !resolver.direct
   let mut sourceAnswer = run demandSource(&mut resolver.*, &module)
-  if (observing || resolver.lineTables) && recordingUnit(&resolver.*) != usize.MAX {
+  if (observing || bodyLines) && recordingUnit(&resolver.*) != usize.MAX {
     let loaded = move sourceAnswer
     sourceAnswer = run observedDeclarationIn(&mut resolver.*, &module, move loaded, declarationAccess183, SourceFacet.Layout)
     if observing && !relativeSites { drop run observedSource(&mut resolver.*, &module, SourceSelector.Origin {handle: key.declaration}) }
@@ -81696,9 +81709,9 @@ effect fn lowerMir(
         SourceUnit.bytes(IndexedSource.sourceUnit(indexed)),
         &anchor,
         observing,
-        resolver.lineTables,
+        bodyLines,
         relativeSites,
-        resolver.fastPathIr,
+        moduleFastPath(&resolver.*, &module),
         move packageRoot,
         move suspending,
         move constants,
@@ -83913,7 +83926,15 @@ effect fn observeLlvmGap(resolver: &mut Resolver, subject: usize) -> ()
 
 // How hard the direct backend optimizes: not at all in an unoptimized build, else for size or
 // speed as the build asked.
-fn directLevel(resolver: &Resolver) -> SsaLevel {
+fn directLevel(resolver: &Resolver, key: &InstanceKey) -> SsaLevel {
+  let identity = InstanceKey.identity(key)
+  let declaration = DeclarationId.copyShared(&identity)
+  match moduleMode(resolver, DeclarationId.moduleId(&declaration)) {
+    PackageMode.None => { return SsaLevel.None }
+    PackageMode.Size => { return SsaLevel.Size }
+    PackageMode.Speed => { return SsaLevel.Speed }
+    PackageMode.Default => ()
+  }
   if resolver.fastPathIr { return SsaLevel.None }
   if resolver.directSize { return SsaLevel.Size }
   return SsaLevel.Speed
@@ -83923,7 +83944,66 @@ fn directLevel(resolver: &Resolver) -> SsaLevel {
 // tables whose text Clang compiles, which is encoded with where each declaration starts
 // (`Bitcode.Module.placeSites`). The direct backend holds each label's text, so this follows
 // the backend `emitInstance` selects.
-fn relativeSites(resolver: &Resolver) -> bool { return resolver.lineTables && !resolver.direct }
+fn moduleMode(resolver: &Resolver, module: &ModuleId) -> PackageMode {
+  let packages = resolver.packageCodegen.asSlice()
+  let mut at = usize.ZERO
+  while at < packages.length {
+    if ModuleId.withPackage<bool>(module, |name: &[u8]| -> bool { return name == packages[at].identity.asSlice() }) {
+      if let Option<Bytes>.Some {value} = &packages[at].optimization {
+        if value.asSlice() == b"none" { return PackageMode.None }
+        if value.asSlice() == b"size" { return PackageMode.Size }
+        return PackageMode.Speed
+      }
+    }
+    at = at + usize.ONE
+  }
+  return PackageMode.Default
+}
+
+fn moduleFastPath(resolver: &Resolver, module: &ModuleId) -> bool {
+  return match moduleMode(resolver, module) {
+    PackageMode.Default => resolver.fastPathIr
+    PackageMode.None => true
+    PackageMode.Speed => false
+    PackageMode.Size => false
+  }
+}
+
+fn moduleLines(resolver: &Resolver, module: &ModuleId) -> bool {
+  let packages = resolver.packageCodegen.asSlice()
+  if packages.length == usize.ZERO { return resolver.lineTables }
+  let mut at = usize.ZERO
+  while at < packages.length {
+    if ModuleId.withPackage<bool>(module, |name: &[u8]| -> bool { return name == packages[at].identity.asSlice() }) {
+      if let Option<bool>.Some {value} = &packages[at].debug { return value }
+    }
+    at = at + usize.ONE
+  }
+  return resolver.programDebug
+}
+
+fn instanceFastPath(resolver: &Resolver, key: &InstanceKey) -> bool {
+  let identity = InstanceKey.identity(key)
+  let declaration = DeclarationId.copyShared(&identity)
+  return moduleFastPath(resolver, DeclarationId.moduleId(&declaration))
+}
+
+fn instanceInlining(resolver: &Resolver, key: &InstanceKey) -> bool {
+  let identity = InstanceKey.identity(key)
+  let declaration = DeclarationId.copyShared(&identity)
+  return match moduleMode(resolver, DeclarationId.moduleId(&declaration)) {
+    PackageMode.Default => resolver.inlining
+    PackageMode.None => false
+    PackageMode.Speed => true
+    PackageMode.Size => true
+  }
+}
+
+fn instanceLines(resolver: &Resolver, key: &InstanceKey) -> bool {
+  let identity = InstanceKey.identity(key)
+  let declaration = DeclarationId.copyShared(&identity)
+  return moduleLines(resolver, DeclarationId.moduleId(&declaration))
+}
 
 // One instance's text: LLVM text, or for the direct backend a wasm fragment (`WasmLower`).
 effect fn emitInstance(resolver: &Resolver, function: &MirFunction, input: &EmissionInputs, hostExport: bool) -> Bytes
@@ -83938,7 +84018,7 @@ effect fn emitInstance(resolver: &Resolver, function: &MirFunction, input: &Emis
       &input.suspension,
       resolver.threads,
       hostExport,
-      directLevel(resolver),
+      directLevel(resolver, &function.key),
       resolver.verifyMir,
     )
   }
@@ -83961,7 +84041,7 @@ effect fn emitInstance(resolver: &Resolver, function: &MirFunction, input: &Emis
     List<CAbi.Signature>.asSlice(&input.foreign),
     List<InstanceIdentity>.asSlice(&input.identities),
     &input.suspension,
-    resolver.fastPathIr,
+    instanceFastPath(resolver, &function.key),
     hostExport,
     &seen,
   )
@@ -95160,6 +95240,8 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
       llvmInputs: List<LlvmInput>.make(),
       llvmValues: List<InstanceDefinition>.make(),
       codegenUnits: false,
+      packageCodegen: List<PackageSettings>.make(),
+      programDebug: false,
       fastPathIr: false,
       coverage: false,
       inlining: false,
@@ -97079,6 +97161,11 @@ impl Semantic {
 
   /// Selects whether `buildArtifact` also splits its module into codegen units
   /// (`BackendBuild.Module.units`), so the driver can compile and cache each unit's object apart.
+  pub fn selectPackageCodegen(self: &mut Self, packages: List<PackageSettings>, debug: bool) -> () {
+    self.resolver.packageCodegen = move packages
+    self.resolver.programDebug = debug
+  }
+
   pub fn selectCodegenUnits(self: &mut Self, split: bool) -> () {
     self.resolver.codegenUnits = split
   }
@@ -105552,7 +105639,9 @@ effect fn assembleUnits(resolver: &Resolver, reached: &[CollectedText], plan: &E
     if unit < List<u64>.length(&originHigh) {
       origins = ContentHash {high: List<u64>.get(&originHigh, unit), low: List<u64>.get(&originLow, unit)}
     }
-    run List<CodegenUnit>.append(&mut units, CodegenUnit {head: move head, body: move body, digest: digest, origins: origins, stored: stored,
+    let mut owner = Bytes.make()
+    if unit < unitCount { owner = run ModuleId.copyPackage(&modules.asSlice()[unitModules.asSlice()[unit]]) }
+    run List<CodegenUnit>.append(&mut units, CodegenUnit {owner: move owner, optimization: Option<Bytes>.none(), debug: Option<bool>.none(), head: move head, body: move body, digest: digest, origins: origins, stored: stored,
       exports: Option<Bytes>.none()})
     unit = unit + usize.ONE
   }
@@ -109324,7 +109413,7 @@ impl FrameSelection {
 // Whether a suspendable caller may run `function`, a suspendable instance's MIR outside any
 // frame, in its own frame at a suspension point (`FrameSelection.bodies`).
 fn frameForwards(resolver: &Resolver, function: &MirFunction) -> bool {
-  return resolver.inlining && !resolver.lineTables && MirInline.eligible(function, resolver.direct)
+  return instanceInlining(resolver, &function.key) && !instanceLines(resolver, &function.key) && MirInline.eligible(function, resolver.direct)
 }
 
 // The roots of a frame walk: `roots`, then the four storage `exports`, whose symbols `selection`

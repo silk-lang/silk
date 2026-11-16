@@ -407,9 +407,7 @@ and its declared inputs, writes only its output directory, and can neither bind 
 socket; where the kernel allows an unprivileged user namespace, it also has no network interface
 but loopback. On macOS it runs through `sandbox-exec` with a profile that denies everything but
 running programs, reading the system directories, its program and its inputs, and reading and
-writing its output directory, so it has no network at all. Any other host has no sandbox, and
-refuses tool steps unless the root manifest sets
-`[build].unsandboxed-tools = true`; each build that then runs a step prints a warning naming it.
+writing its output directory, so it has no network at all. Build tools always require a supported sandbox; any other host refuses them.
 `SILK_NO_TOOL_SANDBOX` set makes a host behave as one without a sandbox.
 
 ## PROFILE-011 — Project templates

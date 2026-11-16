@@ -1,4 +1,9 @@
 import silk.system.host_path as HostPath
+import driver.OptimizationFlags
+import driver.PackageCodegen
+import driver.RequestText
+import silk.build.definition { Definition as CompilationDefinition }
+import driver.CompilationDefinition as CompilationDefinitions
 import silk.mem.interned {Interned}
 import ReleaseVersion
 import CompilerBug
@@ -231,6 +236,7 @@ effect fn invalidCommand(command: &[u8], invalid: InvalidProjectCommand) -> neve
 /// request builds the bundled runner for its discovery root and runs the selected tests.
 union Request {
   Compile { file: Bytes },
+  Resolve { command: ProjectCommands.Resolve },
   RequestSchema,
   /// `silk dump tokens|syntax|hir <source>`: one front-end stage of one source file.
   Dump {stage: Dumped, source: Bytes},
@@ -632,6 +638,16 @@ effect fn request() -> Request
   }
   if count >= usize.add(0, 2) {
     let command = run argumentAt(usize.ONE, count)
+    if same(Bytes.asSlice(&command), b"resolve") {
+      let arguments = run commandArguments(count)
+      return match move run Effect.result(ProjectCommands.parseResolve(arguments.asSlice())) {
+        Result<ProjectCommands.Resolve, InvalidProjectCommand | OutOfMemoryError>.Success {value} => Request.Resolve {command: move value}
+        Result<ProjectCommands.Resolve, InvalidProjectCommand | OutOfMemoryError>.Failure {error} => match move error {
+          InvalidProjectCommand invalid => run invalidCommand(b"resolve", move invalid)
+          OutOfMemoryError exhausted => { fail move exhausted }
+        }
+      }
+    }
     if same(Bytes.asSlice(&command), b"compile") {
       let arguments = run commandArguments(count)
       return match move run Effect.result(ProjectCommands.parseCompile(arguments.asSlice())) {
@@ -1457,7 +1473,8 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
     run writeError(b"\", root = \"<sysroot>\", linker = \"<ld.lld>\" }\n")
     return 2
   }
-  let merged = final && form == Form.Object && linkInputs.length > usize.ZERO
+  let merged = final && ((form == Form.Object && (linkInputs.length > usize.ZERO || requestedUnits.length > usize.ZERO))
+    || (form == Form.StaticLibrary && requestedUnits.length > usize.ZERO))
   let archive = final && form == Form.StaticLibrary
   // A wasm32 executable links freestanding: no libc and no entry. The stdlib's wasm support
   // modules define what a C runtime would.
@@ -1547,62 +1564,15 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
   // Split codegen units are compiled by separate Clang requests before the final link.
   // The IR names no triple, so every link and its units state the target to Clang; a
   // cross link would otherwise build for Clang's default triple.
-  if linked {
+  if linked || requestedUnits.length > usize.ZERO {
     let mut selected = run Bytes.copy(b"--target=")
     run Bytes.append(&mut selected, Target.llvmTriple(target))
     run List<Bytes>.append(&mut common, move selected)
   }
   // An ELF linker orders whole sections, so each function gets its own; Mach-O orders symbols.
   if ordered && !darwin { run List<Bytes>.append(&mut common, run Bytes.copy(b"-ffunction-sections")) }
-  if same(optimization, b"speed") {
-    run List<Bytes>.append(&mut common, run Bytes.copy(b"-O2"))
-    // Tail merging folds the identical tails of match arms into one shared block, so the
-    // arms of an interpreter loop jump through common code and lose the branch history
-    // that predicts their next dispatch. Keeping the tails apart cost silkjs 14% more code
-    // and gave 12% fewer branch mispredicts and 1-2% fewer instructions.
-    run List<Bytes>.append(&mut common, run Bytes.copy(b"-mllvm"))
-    run List<Bytes>.append(&mut common, run Bytes.copy(b"-enable-tail-merge=false"))
-    run List<Bytes>.append(&mut backendOptions, run Bytes.copy(b"-enable-tail-merge=false"))
-    // Runtime unrolling turns every loop with an unknown trip count into a four-way body
-    // plus a remainder loop. Loops that run a handful of times, such as filling a call
-    // frame's few locals, then pay the remainder's setup on every entry: silkjs ran 2-2.5%
-    // more instructions on its call-heavy benchmarks with it, and its numeric ones gained
-    // nothing.
-    run List<Bytes>.append(&mut common, run Bytes.copy(b"-mllvm"))
-    run List<Bytes>.append(&mut common, run Bytes.copy(b"-unroll-runtime=false"))
-    run List<Bytes>.append(&mut backendOptions, run Bytes.copy(b"-unroll-runtime=false"))
-    // Silk code calls many small helpers (list and buffer accessors, refcount releases, table
-    // lookups) whose checks make them look too big to LLVM's default threshold of 225. At 500,
-    // silkjs ran 2.4% fewer instructions loading jQuery and 2.6% fewer across its macro
-    // benchmarks, for 8% more code and 14% more Clang time. 1000 gave 5% at 27% more code.
-    run List<Bytes>.append(&mut common, run Bytes.copy(b"-mllvm"))
-    run List<Bytes>.append(&mut common, run Bytes.copy(b"-inline-threshold=500"))
-    run List<Bytes>.append(&mut backendOptions, run Bytes.copy(b"-inline-threshold=500"))
-    // The x86 cmov converter turns a loop's conditional moves back into branches when it guesses
-    // they sit on the critical path. A `min` over unpredictable values then mispredicts about
-    // half the time: short Damerau-Levenshtein ran 15-20% slower and sorting random u64 26%
-    // slower with it. JSON parsing, the HTTP server and the compiler's own build time were
-    // unchanged without it.
-    if same(Target.architecture(target), b"x86_64") {
-      run List<Bytes>.append(&mut common, run Bytes.copy(b"-mllvm"))
-      run List<Bytes>.append(&mut common, run Bytes.copy(b"-x86-cmov-converter=false"))
-      run List<Bytes>.append(&mut backendOptions, run Bytes.copy(b"-x86-cmov-converter=false"))
-    }
-  } else if same(optimization, b"size") {
-    // `size` optimizes as hard as Clang can for small code, such as a wasm module to download.
-    run List<Bytes>.append(&mut common, run Bytes.copy(b"-Oz"))
-  } else if same(Target.objectFormat(target), b"wasm") {
-    // At -O0 LLVM's WebAssembly backend skips register stackifying and local coloring, so every
-    // value goes through a local of its own: the lib-ui docs site had 2.97 MB of code. Generating
-    // code at -O1 from the same unoptimized IR keeps every variable in the debug information and
-    // writes 1.45 MB. No IR pass runs, not even the always-inliner, which at -O0 copied the
-    // `alwaysinline` bodies unoptimized into their callers for no gain.
-    run List<Bytes>.append(&mut common, run Bytes.copy(b"-O1"))
-    run List<Bytes>.append(&mut common, run Bytes.copy(b"-Xclang"))
-    run List<Bytes>.append(&mut common, run Bytes.copy(b"-disable-llvm-passes"))
-  } else {
-    run List<Bytes>.append(&mut common, run Bytes.copy(b"-O0"))
-  }
+  run OptimizationFlags.append(&mut common, &mut backendOptions, optimization,
+    same(Target.objectFormat(target), b"wasm"), same(Target.architecture(target), b"x86_64"))
   if debug {
     run List<Bytes>.append(&mut common, run Bytes.copy(b"-g"))
   }
@@ -1707,7 +1677,7 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
   // one then links with the `ld64.lld` installed beside Clang too. Without lld the whole module
   // compiles as one instead, since units without the link's cross-unit inlining run much slower.
   let thinWanted = requestedUnits.length > usize.ZERO && same(optimization, b"speed") && linked && !windows
-    && !supplied
+    && !supplied && !PackageCodegen.configured(requestedUnits)
   let lld = linked && !freestanding && !supplied && (same(Target.operatingSystem(target), b"linux") || crossDarwin || darwin && thinWanted)
   let mut lldName: &[u8] = b"/ld.lld"
   if darwin { lldName = b"/ld64.lld" }
@@ -1812,7 +1782,7 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
   let mut objects = List<Path>.make()
   if let Option<Bytes>.Some {value: answer} = &probed {
     if units.length > usize.ZERO {
-      objects = match move run compileUnits(scratch, &clang, origin, Bytes.asSlice(&answer), List<Bytes>.asSlice(&unitFlags), units, packs, unitLines, sources, output, &mut progress.*) {
+      objects = match move run compileUnits(scratch, &clang, origin, Bytes.asSlice(&answer), List<Bytes>.asSlice(&unitFlags), units, packs, unitLines, sources, target, output, &mut progress.*) {
         UnitBuild.Objects {paths} => move paths
         UnitBuild.Failed {status} => { return status }
       }
@@ -2451,12 +2421,17 @@ effect fn unstartedClang(clang: &Path, origin: &[u8], progress: &mut Progress) -
 
 // The line tables of the unit made of `fragments` (`debugInfoOf`), or nothing without a `plan`
 // to name its functions.
-effect fn unitDebugInfo(plan: Option<&EmissionPlan>, sources: &ModuleSources, fragments: &[u8]) -> Bytes
+effect fn unitDebugInfo(plan: Option<&EmissionPlan>, sources: &ModuleSources, fragments: &[u8], unit: &CodegenUnit) -> Bytes
 ! FileError | OutOfMemoryError ? &mut Allocator {
+  if !unit.debug.unwrapOr(true) { return Bytes.make() }
   if let Option<&EmissionPlan>.Some {value} = plan {
     let mut module = BitcodeModule.make()
     run BitcodeModule.mergeAll(&mut module, fragments)
-    return run debugInfoOf(value, sources, &module, false)
+    let optimized = match &unit.optimization {
+      Option<Bytes>.Some {value: mode} => mode.asSlice() != b"none"
+      Option<Bytes>.None => false
+    }
+    return run debugInfoOf(value, sources, &module, optimized)
   }
   return Bytes.make()
 }
@@ -2516,7 +2491,7 @@ effect fn optimizeModule(clang: &Path, origin: &[u8], ir: &Bytes, input: &Path, 
 // the error when it cannot start.
 effect fn compileUnits(scratch: &Path, clang: &Path, origin: &[u8], probed: &[u8], common: &[Bytes], units: &[CodegenUnit],
   packs: &[BuildRecord.PackBody],
-  unitLines: Option<&EmissionPlan>, sources: &ModuleSources,
+  unitLines: Option<&EmissionPlan>, sources: &ModuleSources, target: &Target,
   output: &Path,
   progress: &mut Progress) -> UnitBuild
 ! FileError | ProcessError | HostInputError | OutOfMemoryError | WriterError
@@ -2572,15 +2547,17 @@ effect fn compileUnits(scratch: &Path, clang: &Path, origin: &[u8], probed: &[u8
     let ir = run Path.joinBytes(scratch, Bytes.asSlice(&name))
     let mut fragments = run Bytes.copy(Bytes.asSlice(&units[missing[at]].head))
     run Bytes.append(&mut fragments, unitBody(&units[missing[at]], packs))
-    let debug = run unitDebugInfo(unitLines, sources, Bytes.asSlice(&fragments))
+    let debug = run unitDebugInfo(unitLines, sources, Bytes.asSlice(&fragments), &units[missing[at]])
     run List<usize>.append(&mut sizes, Bytes.length(&fragments))
     let mut command = List<Bytes>.make()
     run List<Bytes>.append(&mut command, run Bytes.copy(Path.rawBytes(clang)))
     run List<Bytes>.append(&mut command, run Bytes.copy(b"-c"))
     run List<Bytes>.append(&mut command, run Bytes.copy(b"-Wno-unused-command-line-argument"))
+    let selectedFlags = run PackageCodegen.flags(common, &units[missing[at]], same(Target.objectFormat(target), b"wasm"), same(Target.architecture(target), b"x86_64"))
+    let selected = selectedFlags.asSlice()
     let mut flag = usize.ZERO
-    while flag < common.length {
-      run List<Bytes>.append(&mut command, run Bytes.copy(Bytes.asSlice(&common[flag])))
+    while flag < selected.length {
+      run List<Bytes>.append(&mut command, run Bytes.copy(selected[flag].asSlice()))
       flag = flag + usize.ONE
     }
     run List<Bytes>.append(&mut command, run Bytes.copy(b"-x"))
@@ -2627,7 +2604,7 @@ effect fn compileUnits(scratch: &Path, clang: &Path, origin: &[u8], probed: &[u8
       // A worker that failed early may not have written the input.
       let mut fragments = run Bytes.copy(Bytes.asSlice(&units[missing[at]].head))
       run Bytes.append(&mut fragments, unitBody(&units[missing[at]], packs))
-      let debug = run unitDebugInfo(unitLines, sources, Bytes.asSlice(&fragments))
+      let debug = run unitDebugInfo(unitLines, sources, Bytes.asSlice(&fragments), &units[missing[at]])
       let mut bitcode = Bytes.make()
       if Bytes.length(&debug) == usize.ZERO {
         bitcode = run Bitcode.compile(Bytes.asSlice(&fragments))
@@ -2767,7 +2744,7 @@ fn borrowedPath(path: &Option<Path>) -> Option<&Path> {
 // Fetches into `store` the git dependencies that the package of `sourcePath` reaches: the package
 // `manifest` declares, or else the one of the nearest silk.toml above `sourcePath`. A manifest
 // that cannot be read or parsed fetches nothing; loading reports it.
-effect fn fetchDependencies(sourcePath: &Path, manifest: Option<&Path>, store: &Path, profile: Option<&[u8]>) -> ()
+effect fn fetchDependencies(sourcePath: &Path, manifest: Option<&Path>, store: &Path, profile: Option<&[u8]>, definition: Option<&CompilationDefinition>) -> ()
 ! InvalidDependency | HostInputError | FileError | OutOfMemoryError
 ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
   let mut located = Option<Path>.none()
@@ -2819,6 +2796,7 @@ effect fn fetchDependencies(sourcePath: &Path, manifest: Option<&Path>, store: &
     Option<Path>.Some {value} => move value
     Option<Path>.None => { return () }
   }
+  if let Option<&CompilationDefinition>.Some {value} = definition { run CompilationDefinitions.exclude(&mut document, value) }
   run PackageSources.fetch(&directory, &document, store)
 }
 
@@ -2829,6 +2807,7 @@ effect fn fetchDependencies(sourcePath: &Path, manifest: Option<&Path>, store: &
 // files the load reads are left there for the next load of the run.
 effect fn prepare(sourcePath: &Path, manifest: Option<&Path>, standardLibrary: Option<Path>, profile: &InitialProfile, bindings: List<Supplied>, testing: bool, mode: StoreMode, alias: Option<&[u8]>, imports: Option<&Path>, compiler: &Option<Bytes>, snapshot: &mut SourceSnapshot, format: &DiagnosticFormat, out: &mut Bytes, progress: &mut Progress, profileName: Option<&[u8]>,
   explicit: Option<&CompilationRequest>,
+  definition: Option<&CompilationDefinition>,
 ) -> Prepared
 ! ApplicationError | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | InvalidDependency | MissingManifest | InvalidBuildComposition | MissingStandardLibrary | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
 ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types {
@@ -2836,9 +2815,24 @@ effect fn prepare(sourcePath: &Path, manifest: Option<&Path>, standardLibrary: O
   let mut manifestFile = Bytes.make()
   if let Option<&Path>.Some {value} = &manifest { manifestFile = run Bytes.copy(Path.rawBytes(value)) }
   // The bindings are moved into assembly; a refused one is named from these copies.
-  let boundParameters = run boundNames(&bindings, true)
-  let boundModules = run boundNames(&bindings, false)
-  let boundTiers = run tiersOf(&bindings)
+  let mut boundParameters = run boundNames(&bindings, true)
+  let mut boundModules = run boundNames(&bindings, false)
+  let mut boundTiers = run tiersOf(&bindings)
+  if let Option<&CompilationDefinition>.Some {value} = definition {
+    let packages = value.packages.entries()
+    let mut package = usize.ZERO
+    while package < packages.length {
+      let parameters = packages[package].value.parameters.asSlice()
+      let mut at = usize.ZERO
+      while at < parameters.length {
+        run boundParameters.append(run Bytes.copy(String.ownedUtf8Bytes(&parameters[at].name)))
+        run boundModules.append(run Bytes.copy(String.ownedUtf8Bytes(&parameters[at].module)))
+        run boundTiers.append(Tier.Override)
+        at = at + usize.ONE
+      }
+      package = package + usize.ONE
+    }
+  }
   run Progress.begin(&mut progress.*, ProgressPhase.Load, usize.ZERO)
   // A package that cannot be loaded, such as one whose exports name no module, ends its load
   // row as failed and is reported here, so its unit still ends with its own `Failed` line.
@@ -2865,14 +2859,14 @@ effect fn prepare(sourcePath: &Path, manifest: Option<&Path>, standardLibrary: O
   } else {
     let checkoutStore = run GitCheckouts.store()
   if let Option<Path>.Some {value: checkouts} = &checkoutStore {
-    let fetched = run Effect.result(fetchDependencies(sourcePath, manifest, &checkouts, profileName))
+    let fetched = run Effect.result(fetchDependencies(sourcePath, manifest, &checkouts, profileName, definition))
     if let Result<(), InvalidDependency | HostInputError | FileError | OutOfMemoryError>.Failure {error} = move fetched {
       run Progress.refuse(&mut progress.*, usize.ONE)
       return Prepared.Finished {status: run report(move error)}
     }
   }
     run Effect.result(Analyses.open(sourcePath, move manifest, move standardLibrary, borrowedPath(&checkoutStore), profile, move bindings, testing, mode, move alias, move summaries,
-    Option<SourceSnapshot>.some(Intrinsic.replace(snapshot.*, ModuleSourceFiles.snapshot())), profileName))
+    Option<SourceSnapshot>.some(Intrinsic.replace(snapshot.*, ModuleSourceFiles.snapshot())), profileName, definition))
   }
   let opened = match move attempted {
     Result<Opened, FileError | InvalidModulePath | InvalidSourceRoot | InvalidDependency | MissingManifest | InvalidBuildComposition | MissingStandardLibrary | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError>.Success {value} => move value
@@ -3705,6 +3699,7 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, cacheDirectory: Opti
   let mut snapshot = ModuleSourceFiles.snapshot()
   let prepared = run prepare(sourcePath, move manifest, move standardLibrary, &profile, move bindings, testing, mode, move alias, move imports, &compiler, &mut snapshot, &machine, &mut refused, &mut progress.*, profileName,
     explicit,
+    Option<&CompilationDefinition>.none(),
   )
   run writeHeaded(heading, &mut headed, Bytes.asSlice(&refused), &mut progress.*)
   let mut analysis = match move prepared {
@@ -3787,7 +3782,9 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, cacheDirectory: Opti
   // changes (see `compileUnits`); an optimized one stays one module for cross-module inlining.
   // A wasm executable splits the same way: Clang generated the whole 172 MB module of a UI page
   // on one thread in 85 s after any edit. The direct backend writes its own module.
-  let split = form == Form.Executable && stage == Stage.Final && same(Bytes.asSlice(&optimization), b"none") && !direct
+  let packageCodegen = PackageCodegen.separate(explicit)
+  let lineTables = PackageCodegen.lines(explicit, debug)
+  let split = stage == Stage.Final && !direct && (packageCodegen || (form == Form.Executable && same(Bytes.asSlice(&optimization), b"none")))
   Semantic.selectCodegenUnits(&mut store, split)
   // Clang compiles anything but `speed` at -O0 (see `compileIrIn`).
   Semantic.selectFastPathIr(&mut store, same(Bytes.asSlice(&optimization), b"none"))
@@ -3799,7 +3796,10 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, cacheDirectory: Opti
   Semantic.selectDirect(&mut store, direct, directThreads, same(Bytes.asSlice(&optimization), b"size"))
   // A debug build's line tables come from the lines its location markers carry, counted from
   // where each declaration starts, which the cache keeps per module.
-  Semantic.selectLineTables(&mut store, debug)
+  Semantic.selectLineTables(&mut store, lineTables)
+  if let Option<&CompilationRequest>.Some {value} = explicit {
+    Semantic.selectPackageCodegen(&mut store, run PackageCodegen.lowering(value), debug)
+  }
   if debug {
     if let Option<&Path>.Some {value: directory} = &cacheDirectory {
       if let Option<Bytes>.Some {value: stamped} = &compiler { run SemanticCache.openOrigins(&mut store, directory, Bytes.asSlice(&stamped)) }
@@ -3890,6 +3890,9 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, cacheDirectory: Opti
         return Compiled.Finished {status: 0}
       }
       let mut units = move assembled
+      if packageCodegen {
+        if let Option<&CompilationRequest>.Some {value} = explicit { run PackageCodegen.configure(&mut units, value) }
+      }
       // The root package's unused bindings are warnings, shown when the build otherwise succeeds;
       // the corpus harness's records leave them out. A warning fails the build unless
       // `--ignore-warnings` allows it, before any artifact is written.
@@ -4020,9 +4023,9 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, cacheDirectory: Opti
       // A link input the target cannot link fails this package's link, like a linker error.
       // A split debug build makes each compiled unit's line tables from its own text.
       let mut unitLines = Option<&EmissionPlan>.none()
-      if debug && split { unitLines = Option<&EmissionPlan>.some(&plan) }
+      if lineTables && split { unitLines = Option<&EmissionPlan>.some(&plan) }
       let linked = run Effect.result(compileIr(
-        &text, Bytes.asSlice(&debugInfo), unitLines, &sources, &functionNames, List<CodegenUnit>.asSlice(&units), List<BuildRecord.PackBody>.asSlice(&packs), output, form, stage, Bytes.asSlice(&optimization), debug, Bytes.asSlice(&relocation),
+        &text, Bytes.asSlice(&debugInfo), unitLines, &sources, &functionNames, List<CodegenUnit>.asSlice(&units), List<BuildRecord.PackBody>.asSlice(&packs), output, form, stage, Bytes.asSlice(&optimization), lineTables, Bytes.asSlice(&relocation),
         Bytes.asSlice(&libc), List<Bytes>.asSlice(&profileFlags), &target,
         &supply, ModuleSourceFiles.nativeLinkInputs(&sources), ModuleSourceFiles.functionOrder(&sources), clang, &world, started, printed,
         &mut progress.*,
@@ -6419,6 +6422,7 @@ effect fn checkTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Op
   }
   let prepared = run prepare(&entry, Option<&Path>.some(Projects.manifest(project)), move library, &profile, move bindings, false, mode, Option<&[u8]>.none(), borrowedPath(&cacheHome), compiler, &mut snapshot.*, &format, &mut out, &mut progress, profileOf(&profileNamed),
     Option<&CompilationRequest>.none(),
+    Option<&CompilationDefinition>.none(),
   )
   let analysis = match move prepared {
     Prepared.Ready {analysis} => move analysis
@@ -7211,7 +7215,9 @@ effect fn replayTarget(project: &Project, plan: ProjectPlan, standardLibrary: &O
   // A replay reports its own lines, so it shows no progress.
   let mut progress = run startProgress(&silentProgress(), b"Replaying", project, &target, b"")
   let prepared = run prepare(&entry, Option<&Path>.some(Projects.manifest(project)), move library, &profile, move bindings, false, StoreMode.Revisable, Option<&[u8]>.none(), Option<&Path>.none(), &Option<Bytes>.none(), &mut ModuleSourceFiles.snapshot(), &format, &mut out, &mut progress, profileOf(&profileNamed),
-    Option<&CompilationRequest>.none())
+    Option<&CompilationRequest>.none(),
+    Option<&CompilationDefinition>.none(),
+  )
   let analysis = match move prepared {
     Prepared.Ready {analysis} => move analysis
     Prepared.Finished {status} => {
@@ -8841,7 +8847,7 @@ effect fn projectInputs(project: &Project, options: &ProjectOptions, root: &Opti
     // Git dependencies are fetched before recording: making the checkout store looks at its parent
     // directories, and a fresh machine would otherwise hash other text than a warm one.
     if let Option<Path>.Some {value: checkouts} = &run GitCheckouts.store() {
-      let fetched = run Effect.result(fetchDependencies(&entry, Option<&Path>.some(Projects.manifest(project)), &checkouts, profileOf(&profileNamed)))
+      let fetched = run Effect.result(fetchDependencies(&entry, Option<&Path>.some(Projects.manifest(project)), &checkouts, profileOf(&profileNamed), Option<&CompilationDefinition>.none()))
       if let Result<(), InvalidDependency | HostInputError | FileError | OutOfMemoryError>.Failure {error} = move fetched {
         drop run report(move error)
         return Option<HashedProject>.none()
@@ -8851,7 +8857,8 @@ effect fn projectInputs(project: &Project, options: &ProjectOptions, root: &Opti
     let prepared = run prepare(&entry, Option<&Path>.some(Projects.manifest(project)), move library, &profile, move bindings, testing, StoreMode.Transient, Option<&[u8]>.none(),
       Option<&Path>.none(), compiler, &mut snapshot, &format, &mut out, &mut progress, profileOf(&profileNamed),
       Option<&CompilationRequest>.none(),
-    )
+    Option<&CompilationDefinition>.none(),
+  )
       |> Effect.provideMut<FileSystem>(&mut recorder)
     // A load that fails is reported and hashes nothing, so a cache never keys a broken load, such as
     // one whose git fetch failed.
@@ -10383,6 +10390,12 @@ effect fn program() -> i32
         }
       }
     }
+    Request.Resolve {command: resolveCommand} => {
+      let mut process = OsChildProcess.make()
+      return run resolveDefinition(&working, move resolveCommand)
+        |> Effect.provideMut<FileSystem>(&mut files)
+        |> Effect.provideMut<ChildProcess>(&mut process)
+    }
     Request.Compile { file } => {
       let mut process = OsChildProcess.make()
       return run compileRequest(&working, &file)
@@ -10841,4 +10854,100 @@ effect fn compileRequest(working: &Path, file: &Bytes) -> i32
     Compiled.Finished { status } => status
     Compiled.Tests { .. } => 0
   }
+}
+
+effect fn resolveDefinition(working: &Path, command: ProjectCommands.Resolve) -> i32
+  ! ApplicationError
+    | InitialProfileProblem
+    | FileError
+    | ProcessError
+    | HostInputError
+    | InvalidModulePath
+    | InvalidSourceRoot
+    | InvalidDependency
+    | MissingManifest
+    | InvalidBuildComposition
+    | MissingStandardLibrary
+    | InvalidNativeLinkInput
+    | TomlError
+    | RegistrationClosed
+    | ConflictingPackageSource
+    | Cycle
+    | RevisionMismatch
+    | OutOfMemoryError
+    | WriterError
+  ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types {
+  let definitionFile = run pathArgument(working, command.definition.asSlice())
+  let bytes = run FileSystem.readFile(&definitionFile)
+  let definition = match move run Effect.result(SchemaToml.decode<CompilationDefinition>(bytes.asSlice())) {
+    Result<CompilationDefinition, SchemaError | OutOfMemoryError>.Success {value} => move value
+    Result<CompilationDefinition, SchemaError | OutOfMemoryError>.Failure {error} => match move error {
+      SchemaError problem => {
+        let mut stderr = StderrWriter.make()
+        run SchemaReport.writeOne(&problem, bytes.asSlice(), "compilation definition", ReportOptions.line())
+          |> Effect.provideMut<Writer>(&mut stderr)
+        return 2
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let manifest = Option<Bytes>.some(run Bytes.copy(String.ownedUtf8Bytes(&definition.manifest)))
+  let project = match move run locateProject(working, &manifest) {
+    Option<Project>.Some {value} => move value
+    Option<Project>.None => { return 2 }
+  }
+  let profile = run CompilationDefinitions.profile(&definition, Target.name(&hostTarget()), Projects.profileArtifact(Projects.form(&project)))
+  let mut configuredLibrary = Option<Bytes>.none()
+  if let Option<String>.Some {value} = &definition.stdlib { configuredLibrary = Option<Bytes>.some(run Bytes.copy(String.ownedUtf8Bytes(&value))) }
+  let library = run standardLibraryFor(working, &configuredLibrary)
+  let testing = match &definition.artifact {
+    Option<String>.Some {value} => value.view() == "test"
+    Option<String>.None => false
+  }
+  let mut progress = Progress.off()
+  let mut diagnostic = Bytes.make()
+  let format = DiagnosticFormat.Human {root: run diagnosticRoot(Projects.manifest(&project))}
+  let prepared = run prepare(Projects.entry(&project), Option<&Path>.some(Projects.manifest(&project)), move library,
+    &profile, List<Supplied>.make(), testing, StoreMode.Transient, Option<&[u8]>.none(), Option<&Path>.none(),
+    &Option<Bytes>.none(), &mut ModuleSourceFiles.snapshot(), &format, &mut diagnostic, &mut progress,
+    Option<&[u8]>.none(), Option<&CompilationRequest>.none(), Option<&CompilationDefinition>.some(&definition))
+  run writeError(diagnostic.asSlice())
+  let mut analysis = match move prepared {
+    Prepared.Ready {analysis} => move analysis
+    Prepared.Finished {status} => { return status }
+  }
+  let output = run pathArgument(working, command.output.asSlice())
+  let directory = match move run Path.parent(&output) {
+    Option<Path>.Some {value} => move value
+    Option<Path>.None => { fail InvalidSourceRoot {} }
+  }
+  let generated = run Path.join(&directory, "sources")
+  let artifact = run Path.join(&directory, "artifact")
+  let source = match &definition.settings.root {
+    Option<String>.Some {value} => run Path.make(value.view())
+    Option<String>.None => run Path.fromBytes(Path.rawBytes(Projects.entry(&project)))
+  }
+  let emit = match &definition.settings.emit {
+    Option<String>.Some {value} => value.view()
+    Option<String>.None => "final"
+  }
+  let mut request = run RequestCapture.make(&analysis.sources, &source, &artifact, &generated, &profile,
+    definition.settings.profile.maxMemory, definition.settings.profile.stackSize, testing, emit)
+  if !definition.name.isSome() { request.name = run RequestText.copy(Projects.name(&project)) }
+  if let Option<Bytes>.Some {value: failure} = move run NativeArchives.ensure(ModuleSourceFiles.archives(&analysis.sources), ModuleSourceFiles.nativeLinkInputs(&analysis.sources)) {
+    run writeError(b"silk resolve: ")
+    run writeError(failure.asSlice())
+    run writeError(b"\n")
+    return 2
+  }
+  if Target.id(InitialProfile.target(&profile)) == TargetId.Wasm32Wasip2 {
+    let mut library = Option<Path>.none()
+    if let Option<&Path>.Some {value} = move ModuleSourceFiles.standardLibrary(&analysis.sources) { library = Option<Path>.some(run Path.fromBytes(Path.rawBytes(value))) }
+    let world = if testing { run WasiTools.commandWorld(&library) } else { run WasiTools.world(&project, &library) }
+    run RequestCapture.wasm(&mut request, &world)
+  }
+  run RequestParameters.capture(&mut request, &analysis.sources, &mut analysis.store, &mut analysis.request)
+  run CompilationDefinitions.finish(&mut request, move definition)
+  run RequestCapture.write(&request, &output)
+  return 0
 }

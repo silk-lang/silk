@@ -16,7 +16,7 @@ Every record rejects unknown fields. The `version` field identifies this wire fo
 
 Import as `Request` with `import silk.build.request { Request }`.
 
-Public declarations: 22.
+Public declarations: 23.
 
 <a id="Request"></a>
 
@@ -67,6 +67,16 @@ pub root: String
 ```
 
 The absolute path of the root Silk module.
+
+<a id="Request.rootModule"></a>
+
+### Field `rootModule`
+
+```silk
+pub rootModule: String
+```
+
+The root module identity within the root package, independent of its physical file.
 
 <a id="Request.output"></a>
 
@@ -459,6 +469,16 @@ impl Schema for Profile
 ```silk
 static fn spec() -> Spec<Profile>
 ```
+
+<a id="profileSpec"></a>
+
+## `profileSpec`
+
+```silk
+pub static fn profileSpec<T>() -> Spec<T>
+```
+
+Describes the shared profile field names and domains for resolved and optional settings.
 
 <a id="Package"></a>
 
@@ -1008,6 +1028,14 @@ impl Schema for Module
 
 ```silk
 static fn spec() -> Spec<Module>
+```
+
+<a id="Module.impl.Schema.check"></a>
+
+### Operation `check`
+
+```silk
+fn check(self: &Self, checks: &mut Checks<Self>) -> ()
 ```
 
 <a id="Selector"></a>

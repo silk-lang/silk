@@ -6,7 +6,7 @@ Build graphs that publish complete compilation requests and return their artifac
 
 Import as `Build` with `import silk.build.graph { Build }`.
 
-Public declarations: 14.
+Public declarations: 15.
 
 <a id="Options"></a>
 
@@ -38,12 +38,22 @@ pub type Compilation = Compilations.Compilation
 
 One compilation; its settings freeze when an artifact or step handle is first requested.
 
+<a id="Package"></a>
+
+## `Package`
+
+```silk
+pub type Package = Packages.Package
+```
+
+Backend settings and parameters for a declared package.
+
 <a id="Deferred"></a>
 
 ## `Deferred`
 
 ```silk
-pub type Deferred<T> = Steps.Deferred<T>
+pub type Deferred = Steps.Deferred
 ```
 
 A typed value that only the running step can resolve.

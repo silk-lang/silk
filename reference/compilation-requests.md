@@ -27,3 +27,12 @@ The compiler-workspace replay check builds the compiler's LLVM IR through the or
 replays the resulting request, and compares the output bytes. The native CLI fixture separately
 checks dependency aliases, parameter bindings, generated modules, C sources, and file/stdin
 artifact parity with invalid manifest and build-script files beside its source.
+
+The `root` field names the physical entry file. `root-module` names its module within the root package, such as `main.silk`. Generated entries retain that logical identity even when the file is in a step output directory.
+
+`silkc resolve --definition <file> --output <request>` resolves a `Definition` from
+`silk.build.definition`. Definitions select a package manifest, optional source settings,
+generated files, native inputs, and overrides keyed by declared dependency alias. Unspecified
+source settings use the compiler's target defaults before runtime composition is selected.
+Resolution writes a complete request; the compilation entry point consumes only that request.
+Excluded dependencies are removed before fetching or loading packages.

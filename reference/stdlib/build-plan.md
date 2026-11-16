@@ -177,8 +177,7 @@ the dependency in `[build].tools`.
 #### Gotchas
 
 `name` is one module path segment, such as `tables`; any other name is a compile error. A
-host without a sandbox refuses the step unless the root manifest sets
-`[build].unsandboxed-tools = true`.
+host without a supported sandbox refuses the step.
 
 <a id="Plan.impl.toolArgument"></a>
 

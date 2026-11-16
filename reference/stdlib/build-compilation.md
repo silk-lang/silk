@@ -37,15 +37,95 @@ pub effect fn when<'env, E, ?R>(self: Self, condition: bool,
 
 Applies `transform` when `condition` is true, returning the original value otherwise.
 
-<a id="Compilation.impl.fromRequest"></a>
+<a id="Compilation.impl.fromDefinition"></a>
 
-### Associated function `fromRequest`
+### Associated function `fromDefinition`
 
 ```silk
-pub effect fn fromRequest(request: Request, compiler: Deferred<Path>) -> Self ! StepFailure ? &mut Allocator
+pub effect fn fromDefinition(definition: Definition, compiler: Deferred<Path>) -> Self ! StepFailure ? &mut Allocator | &mut FileSystem
 ```
 
-Creates a compilation from fully resolved inputs. The graph assigns its output directory.
+Creates a compilation from an explicit package definition and compiler. Resolution runs as a graph prerequisite.
+
+<a id="Compilation.impl.fromPackage"></a>
+
+### Associated function `fromPackage`
+
+```silk
+pub effect fn fromPackage() -> Self ! StepFailure ? &mut Allocator | &mut FileSystem | &mut HostInput
+```
+
+Uses the current package's default root and artifact.
+
+<a id="Compilation.impl.executable"></a>
+
+### Associated function `executable`
+
+```silk
+pub effect fn executable(name: string, root: string) -> Self ! StepFailure ? &mut Allocator | &mut FileSystem | &mut HostInput
+```
+
+Creates a program named `name` with `root` resolved against the package directory.
+
+<a id="Compilation.impl.loadableModule"></a>
+
+### Associated function `loadableModule`
+
+```silk
+pub effect fn loadableModule(name: string, root: string) -> Self ! StepFailure ? &mut Allocator | &mut FileSystem | &mut HostInput
+```
+
+Creates a loadable module named `name` with `root` resolved against the package directory.
+
+<a id="Compilation.impl.staticArchive"></a>
+
+### Associated function `staticArchive`
+
+```silk
+pub effect fn staticArchive(name: string, root: string) -> Self ! StepFailure ? &mut Allocator | &mut FileSystem | &mut HostInput
+```
+
+Creates a static archive named `name` with `root` resolved against the package directory.
+
+<a id="Compilation.impl.object"></a>
+
+### Associated function `object`
+
+```silk
+pub effect fn object(name: string, root: string) -> Self ! StepFailure ? &mut Allocator | &mut FileSystem | &mut HostInput
+```
+
+Creates a relocatable object named `name` with `root` resolved against the package directory.
+
+<a id="Compilation.impl.test"></a>
+
+### Associated function `test`
+
+```silk
+pub effect fn test(name: string, root: string) -> Self ! StepFailure ? &mut Allocator | &mut FileSystem | &mut HostInput
+```
+
+Creates a test runner named `name` with `root` resolved against the package directory.
+
+<a id="Compilation.impl.package"></a>
+
+### Method `package`
+
+```silk
+pub effect fn package(self: Self, alias: string, settings: Package) -> Self ! StepFailure ? &mut Allocator
+```
+
+Configures one declared dependency alias, or `self` for this package.
+
+<a id="Compilation.impl.without"></a>
+
+### Method `without`
+
+```silk
+pub effect fn without(self: Self, alias: string) -> Self ! StepFailure ? &mut Allocator
+```
+
+Removes a declared dependency from this compilation's available imports.
 
 <a id="Compilation.impl.target"></a>
 
@@ -257,6 +337,76 @@ pub effect fn runner(self: Self, value: Deferred<Runner>) -> Self ! StepFailure 
 
 Selects the program and arguments used to launch this artifact or its tests.
 WASI artifacts use `wasmtime run` when no runner is supplied.
+
+<a id="Compilation.impl.standardLibrary"></a>
+
+### Method `standardLibrary`
+
+```silk
+pub effect fn standardLibrary(self: Self, path: Deferred<Path>) -> Self ! StepFailure ? &mut Allocator
+```
+
+Selects a declared standard-library directory before resolution.
+
+<a id="Compilation.impl.platform"></a>
+
+### Method `platform`
+
+```silk
+pub effect fn platform(self: Self, value: Deferred<Platform>) -> Self ! StepFailure ? &mut Allocator
+```
+
+Selects the target sysroot, linker, and support installations.
+
+<a id="Compilation.impl.windows"></a>
+
+### Method `windows`
+
+```silk
+pub effect fn windows(self: Self, value: Deferred<Windows>) -> Self ! StepFailure ? &mut Allocator
+```
+
+Selects Windows subsystem, resource, and manifest settings.
+
+<a id="Compilation.impl.macos"></a>
+
+### Method `macos`
+
+```silk
+pub effect fn macos(self: Self, value: Deferred<MacOS>) -> Self ! StepFailure ? &mut Allocator
+```
+
+Selects macOS installation, framework, and signing settings.
+
+<a id="Compilation.impl.wasm"></a>
+
+### Method `wasm`
+
+```silk
+pub effect fn wasm(self: Self, value: Deferred<Wasm>) -> Self ! StepFailure ? &mut Allocator
+```
+
+Selects WebAssembly memory, execution, and component settings.
+
+<a id="Compilation.impl.header"></a>
+
+### Method `header`
+
+```silk
+pub effect fn header(self: Self, value: Deferred<String>) -> Self ! StepFailure ? &mut Allocator
+```
+
+Requests a C header at an absolute output path.
+
+<a id="Compilation.impl.importLibrary"></a>
+
+### Method `importLibrary`
+
+```silk
+pub effect fn importLibrary(self: Self, value: Deferred<String>) -> Self ! StepFailure ? &mut Allocator
+```
+
+Requests an import library at an absolute output path.
 
 <a id="Compilation.impl.emit"></a>
 
