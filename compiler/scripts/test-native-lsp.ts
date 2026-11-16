@@ -763,7 +763,9 @@ const program = Effect.gen(function* () {
   // The only automatic project command is confined. It can write the request directory, while
   // an attempted write beside the project fails and leaves the saved request set usable.
   const outside = join(directory, 'editor-escaped')
-  const entered = join(requestsRoot, 'plan-entered')
+  const unpublished = join(requestsRoot, 'unpublished')
+  // A failed plan restores requests, so keep its execution witness outside that transaction.
+  const entered = join(plannedRoot, 'editor-output/steps/plan-entered')
   unlinkSync(join(plannedRoot, 'build.silk'))
   writeFileSync(join(plannedRoot, 'tasks.silk'), `
 import silk.cli.command { Command, CommandLine }
@@ -776,6 +778,7 @@ impl CommandLine for Tasks { static fn command() -> Command<Self> { return Comma
 impl TaskSet for Tasks {
   effect fn perform(self: Self) -> () ! FileError | OutOfMemoryError ? &mut Allocator | &mut FileSystem {
     drop self
+    run FileSystem.writeFile(&run Path.make(${JSON.stringify(unpublished)}), b"unpublished")
     run FileSystem.writeFile(&run Path.make(${JSON.stringify(entered)}), b"entered")
     run FileSystem.writeFile(&run Path.make(${JSON.stringify(outside)}), b"escaped")
   }
@@ -796,6 +799,7 @@ pub effect fn main() -> i32 ? &mut HostInput { return run Task.main<Tasks>() }
     catch: (cause) => new SessionError({ reason: 'Spawn', message: String(cause) }),
   })
   if (sandboxAvailable) assert.ok(existsSync(entered), 'the confined Plan command reached its permitted write')
+  assert.equal(existsSync(unpublished), false, 'the failed Plan command rolls back unpublished requests')
   const stillChecked = yield* diagnosticsFor(planned, savedUri, 1, confined.notifications)
   assert.deepEqual(stillChecked.diagnostics, [], JSON.stringify(stillChecked))
   // Turning refresh off prevents even the allowed write on the next settings change.
