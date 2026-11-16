@@ -98,6 +98,7 @@ const program = Effect.gen(function* () {
     settings: string,
     env: NodeJS.ProcessEnv = { ...process.env, SILK_CLANG: clang },
     artifact = 'executable',
+    artifactOutput?: string,
   ) {
     if (!/^\[settings\]$/m.test(settings)) settings = `[settings]\nmodules = []\n${settings}`
     else if (!/^modules\s*=/m.test(settings)) settings = settings.replace('[settings]', '[settings]\nmodules = []')
@@ -113,7 +114,8 @@ const program = Effect.gen(function* () {
     const request = join(output, 'request.toml')
     yield* fs.writeFileString(definition,
       `manifest = ${encodeJson(join(root, 'silk.toml'))}\nname = ${encodeJson(name)}\nartifact = ${encodeJson(artifact)}\nstdlib = ${encodeJson(standardLibrary)}\n${settings}\n`)
-    const resolved = yield* invoke(silk, ['resolve', '--definition', definition, '--output', request], root, env, 120_000)
+    const resolved = yield* invoke(silk, ['resolve', '--definition', definition, '--output', request,
+      ...(artifactOutput === undefined ? [] : ['--artifact', artifactOutput])], root, env, 120_000)
     if (resolved.status !== 0) return resolved
     return yield* invoke(silk, ['compile', '--request', request], root, env, 120_000)
   })
@@ -4462,20 +4464,24 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     unknownMember.stderr,
     /has no package named `nope`\nsilk: its members are: greeting, hello, other\n/,
   )
-  // A member that cannot load its dependencies fails on its own; the others still run and the
-  // workspace's final line is still written.
+  // An imported dependency cycle fails its members; the others still run and the workspace's
+  // final line is still written. An unused manifest pin does not enter the compilation graph.
   const greetingManifest = join(managed, 'libs/greeting/silk.toml')
   const acyclic = yield* fs.readFileString(greetingManifest)
+  const greetingLibrary = join(managed, 'libs/greeting/src/lib.silk')
+  const greetingSource = yield* fs.readFileString(greetingLibrary)
   yield* fs.writeFileString(
     greetingManifest,
     `${acyclic}\n[dependencies]\nhello = { path = "../../apps/hello" }\n`,
   )
+  yield* fs.writeFileString(greetingLibrary, `import hello.main\n${greetingSource}`)
   const cyclic = yield* invoke(silk, ['check', '--stdlib', standardLibrary], managed)
   assert.notEqual(cyclic.status, 0, 'a dependency cycle was checked')
   assert.match(cyclic.stderr, /form a cycle/)
   assert.match(cyclic.stderr, /^Checking other \(/m)
   assert.match(cyclic.stderr, /^Failed 2 of 3 packages in [^\n]*\n$/m)
   yield* fs.writeFileString(greetingManifest, acyclic)
+  yield* fs.writeFileString(greetingLibrary, greetingSource)
   // `format` and `doc` at the root cover every member.
   const managedFormat = yield* invoke(silk, ['format'], managed)
   assert.equal(managedFormat.status, 0, managedFormat.stderr + managedFormat.stdout)
@@ -4491,8 +4497,6 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   assert.equal(managedFormatDot.status, 0, managedFormatDot.stderr + managedFormatDot.stdout)
   assert.match(managedFormatDot.stdout, /apps\/hello\/src\/main\.silk: unchanged/)
   assert.match(managedFormatDot.stdout, /libs\/greeting\/src\//)
-  const greetingLibrary = join(managed, 'libs/greeting/src/lib.silk')
-  const greetingSource = yield* fs.readFileString(greetingLibrary)
   yield* fs.writeFileString(
     greetingLibrary,
     greetingSource +
@@ -4556,13 +4560,9 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     join(directory, 'retained/silk.toml'),
     '[package]\nname = "retained"\nversion = "0.1.0"\nsource = "."\n\n[unstable]\ncomposition = { runtimes = [{ name = "start", module = "support/start" }], defaults = ["start"], retention = [{ module = "support/keep", declaration = "capability" }] }\n',
   )
-  const retainedIr = yield* invoke(
-    silk,
-    ['build', 'main.silk', '-o', 'retained.ll', '--emit', 'llvm-ir', '--stdlib', standardLibrary],
-    join(directory, 'retained'),
-  )
+  const retainedIr = yield* compileSettings(join(directory, 'retained'), 'retained', '[settings]\nemit = "llvm-ir"\n')
   assert.equal(retainedIr.status, 0, retainedIr.stderr)
-  const retainedText = yield* fs.readFileString(join(directory, 'retained/retained.ll'))
+  const retainedText = yield* fs.readFileString(compilationPath(join(directory, 'retained'), 'retained'))
   assert.match(retainedText, /i32 7177/)
   assert.match(
     retainedText,
@@ -4647,32 +4647,17 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   yield* fs.symlink(join(throughLinks, 'real'), join(throughLinks, 'absolute'))
   yield* fs.symlink('via', join(throughLinks, 'chain'))
   for (const output of ['via/linked', 'absolute/absolute', 'chain/chained']) {
-    const built = yield* invoke(
-      silk,
-      ['build', 'src/main.silk', '-o', join(throughLinks, output), '--stdlib', standardLibrary],
-      join(throughLinks, 'app'),
-      { ...process.env, SILK_CLANG: clang },
-    )
+    const built = yield* compileSettings(join(throughLinks, 'app'), basename(output), '',
+      { ...process.env, SILK_CLANG: clang }, 'executable', join(throughLinks, output))
     assert.equal(built.status, 0, built.stderr)
     const ran = yield* invoke(join(throughLinks, 'real', basename(output)), [], throughLinks)
     assert.equal(ran.status, 7, ran.stderr)
   }
   yield* fs.symlink('loop', join(throughLinks, 'loop'))
-  const looped = yield* invoke(
-    silk,
-    [
-      'build',
-      'src/main.silk',
-      '-o',
-      join(throughLinks, 'loop/program'),
-      '--stdlib',
-      standardLibrary,
-    ],
-    join(throughLinks, 'app'),
-    { ...process.env, SILK_CLANG: clang },
-  )
+  const looped = yield* compileSettings(join(throughLinks, 'app'), 'looped', '',
+    { ...process.env, SILK_CLANG: clang }, 'executable', join(throughLinks, 'loop/program'))
   assert.equal(looped.status, 1, looped.stderr)
-  assert.match(looped.stderr, /^silk: cannot inspect: invalid path\n$/)
+  assert.match(looped.stderr, /^silk: cannot create temporary directory: invalid path\n$/)
   // Cleaning removes a link in the build directory itself, never what it points to.
   yield* fs.symlink('../../real', join(throughLinks, 'app/build/escape'))
   const cleanedLinks = yield* invoke(silk, ['clean'], join(throughLinks, 'app'))
@@ -4753,7 +4738,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     symbols.some((line) => / T _?(\S+)$/.exec(line)?.[1] === name)
   const compiledHelper = yield* invoke(clang, ['-c', '-fPIC', 'offset.c', '-o', 'offset.o'], library)
   assert.equal(compiledHelper.status, 0, compiledHelper.stderr)
-  const linkedObject = `[settings.native]\nlink = [{ kind = "object", value = ${encodeJson(join(library, 'offset.o'))} }]\n`
+  const linkedObject = `[settings.native]\nlink = [{ kind = "object", value = ${encodeJson(join(library, 'offset.o'))}, weak = false, needed = false }]\n`
   const libraryBuild = Effect.fnUntraced(function* (
     name: string, artifact: string, settings = '[settings.profile]\n',
     env: NodeJS.ProcessEnv = { ...process.env, SILK_CLANG: clang },
@@ -4780,7 +4765,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   assert.equal(mergedConsumer.status, 0, mergedConsumer.stderr)
   assert.equal((yield* invoke(join(library, 'merged-consumer'), [], library)).status, 0)
   const unmergeable = yield* libraryBuild('unmergeable.o', 'object',
-    '[settings.native]\nlink = [{ kind = "library", value = "m", mode = "dynamic" }]\n',
+    '[settings.native]\nlink = [{ kind = "library", value = "m", mode = "dynamic", weak = false, needed = false }]\n',
     { ...process.env, SILK_CLANG: sentinel })
   assert.notEqual(unmergeable.status, 0, 'a library input was merged into an object')
   assert.equal(yield* fs.exists(marker), false)
@@ -4832,7 +4817,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   assert.equal(archiveConsumer.status, 0, archiveConsumer.stderr)
   assert.equal((yield* invoke(join(library, 'archive-consumer'), [], library)).status, 0)
   const nested = yield* libraryBuild('nested.a', 'static-archive',
-    `[settings.native]\nlink = [{ kind = "archive", value = ${encodeJson(join(library, 'libsilk.a'))} }]\n`,
+    `[settings.native]\nlink = [{ kind = "archive", value = ${encodeJson(join(library, 'libsilk.a'))}, weak = false, needed = false }]\n`,
     { ...process.env, SILK_CLANG: sentinel })
   assert.notEqual(nested.status, 0, 'an archive input was nested in a static archive')
   assert.equal(yield* fs.exists(marker), false)
@@ -4845,14 +4830,24 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   // request replay and reach the final binary, including resources and the import library.
   const platformLibrary = join(directory, 'platform-library')
   yield* fs.makeDirectory(platformLibrary)
+  const nativeDependency = join(platformLibrary, 'native-dependency')
+  yield* fs.makeDirectory(nativeDependency)
+  yield* fs.writeFileString(join(nativeDependency, 'silk.toml'),
+    '[package]\nname = "native-dependency"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nexports = ["Value"]\n')
+  yield* fs.writeFileString(join(nativeDependency, 'Value.silk'),
+    'unsafe extern "C" fn native_answer() -> i32\npub fn answer() -> i32 { return unsafe native_answer() }\n')
+  yield* fs.writeFileString(join(nativeDependency, 'answer.c'), 'int native_answer(void) { return 42; }\n')
+  yield* writePlan(nativeDependency, '  plan = Plan.compileC(plan, sourcePath("answer.c"))')
   yield* fs.writeFileString(join(platformLibrary, 'silk.toml'),
-    '[package]\nname = "platform-library"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nmain = "main.silk"\n')
+    '[package]\nname = "platform-library"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nmain = "main.silk"\n'
+      + '[dependencies]\nnative = { path = "native-dependency" }\n')
   yield* fs.writeFileString(join(platformLibrary, 'main.silk'), [
+    'import native.Value',
     'extern "C" struct Pair { a: i32, b: i32 }',
     'export "C" fn pair(value: Pair) -> Pair as "silk_pair" { return Pair { a: value.a + 1, b: value.b + 2 } }',
     '@callbacks("call")',
     'unsafe export "C" fn callback(call: extern "C" fn(i32) -> i32, value: i32) -> i32 as "silk_callback" { return unsafe call(value) }',
-    'export "C" fn answer() -> i32 as "silk_answer" { return 42 }',
+    'export "C" fn answer() -> i32 as "silk_answer" { return Value.answer() }',
     '',
   ].join('\n'))
   yield* fs.writeFileString(join(platformLibrary, 'test.rc'), '42 RCDATA { 1, 2, 3, 4 }\n')
