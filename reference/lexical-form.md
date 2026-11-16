@@ -166,7 +166,8 @@ recognition. Malformed candidates such as `1.5s`, `0x10s`, `3sec`, `1H`, `1h60m`
 standalone exponent spelling such as `1e5` remains a floating literal because no unit follows it.
 
 **Diagnostics:** A malformed candidate produces exactly one focused lexical diagnostic. Invalid
-amounts report `LEX0008`, unknown units `LEX0009`, repeated units `LEX0010`, out-of-order units
+amounts report `LEX0008`, a last amount with no unit after an earlier component (`1h30`)
+`LEX0015` with the next smaller unit as a suggestion (`1h30m`), unknown units `LEX0009`, repeated units `LEX0010`, out-of-order units
 `LEX0011`, and subordinate fields outside their range `LEX0012`. Invalid digit separators retain
 `LEX0005`.
 
