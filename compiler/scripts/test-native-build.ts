@@ -1532,6 +1532,27 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     if (ignored) assert.doesNotMatch(unused.stderr, /--ignore-warnings/)
     else assert.match(unused.stderr, /^silk: warnings fail this command; fix them, or pass --ignore-warnings to allow them$/m)
   }
+  // A path dependency is the author's own code, so its warnings are reported and fail the
+  // dependent's check and build too (#3149).
+  yield* fs.makeDirectory(join(directory, 'unuseddep/src'), { recursive: true })
+  yield* fs.makeDirectory(join(directory, 'unusedapp/src'), { recursive: true })
+  yield* fs.writeFileString(
+    join(directory, 'unuseddep/silk.toml'),
+    '[package]\nname = "unuseddep"\nversion = "0.1.0"\nkind = "library"\nexports = ["lib"]\n',
+  )
+  yield* fs.writeFileString(join(directory, 'unuseddep/src/lib.silk'), 'import silk.num.u64\n\npub fn value() -> i32 {\n  return 0\n}\n')
+  yield* fs.writeFileString(
+    join(directory, 'unusedapp/silk.toml'),
+    '[package]\nname = "unusedapp"\nversion = "0.1.0"\n\n[dependencies]\nunuseddep = { path = "../unuseddep" }\n',
+  )
+  yield* fs.writeFileString(join(directory, 'unusedapp/src/main.silk'), 'import unuseddep.lib\n\npub fn main() -> i32 {\n  return lib.value()\n}\n')
+  for (const command of ['check', 'build']) {
+    const dependent = yield* invoke(silk, [
+      command, '--stdlib', standardLibrary, ...(command === 'build' ? ['--clang', clang] : []),
+    ], join(directory, 'unusedapp'))
+    assert.equal(dependent.status, 1, dependent.stderr)
+    assert.match(dependent.stderr, /unuseddep\/src\/lib\.silk:1:17: warning\[MOD0007\] Import `u64` is never used/m)
+  }
   // A package that cannot be loaded ends its load row as failed and still names itself on its
   // final line.
   yield* fs.makeDirectory(join(directory, 'unexported/src'), { recursive: true })
@@ -2684,6 +2705,17 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   yield* sourcesRun(48)
   const editedNativeObjects = (yield* nativeObjects()).filter((name) => !firstObjects.includes(name))
   assert.equal(editedNativeObjects.length, 1, `an edit to one file compiles one object, added ${editedNativeObjects.join(', ')}`)
+  // A file Clang reads through `#embed` and a `..` path is in the object's record, so an edit to it
+  // alone compiles the object again (#3152).
+  yield* fs.makeDirectory(join(sourcesRoot, 'clib/data'), { recursive: true })
+  yield* fs.writeFile(join(sourcesRoot, 'clib/data/blob.bin'), new Uint8Array([3]))
+  yield* fs.writeFileString(
+    join(sourcesRoot, 'clib/native/two.c'),
+    'static const unsigned char blob[] = {\n#embed "../data/blob.bin"\n};\nint clib_two(void) { return blob[0]; }\n',
+  )
+  yield* sourcesRun(48)
+  yield* fs.writeFile(join(sourcesRoot, 'clib/data/blob.bin'), new Uint8Array([4]))
+  yield* sourcesRun(49)
   for (const operation of [
     'Plan.cFlag(plan, "-fplugin=evil.so")',
     'Plan.cFlag(plan, "-Wl,-rpath,/tmp")',
@@ -3108,6 +3140,26 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     placedFirst(yield* orderedBuild(), last, beforeLast)
     yield* fs.writeFileString(join(ordered, 'order.txt'), `${beforeLast}\n${last}\n`)
     placedFirst(yield* orderedBuild(), beforeLast, last)
+    // A declaration, as the `.symbols` map's third column spells it, orders every symbol of that
+    // declaration; an entry that names nothing this build emits is reported as a note.
+    const symbolMap = (yield* fs.readFileString(`${executable}.symbols`)).split('\n').map((line) => line.split('\t'))
+    // The latest-placed function that belongs to a Silk declaration; runtime entries such as
+    // `silk_gnu_initialize` have none.
+    const declarationOf = (symbol: string) => symbolMap.find((row) => row[0] === symbol)?.[2] ?? ''
+    const latest = [...unordered].reverse().find(([symbol]) => declarationOf(symbol).includes('::'))
+    assert.ok(latest !== undefined, `${profile}: no linked function has a declaration in the symbol map`)
+    const declaration = declarationOf(latest[0])
+    const declared = new Set(symbolMap.filter((row) => row[2] === declaration).map((row) => row[0]))
+    yield* fs.writeFileString(join(ordered, 'order.txt'), `${declaration}\nsilk_00000000000000000000000000000000\n`)
+    const byDeclaration = yield* invoke(silk, ['build', '--stdlib', standardLibrary, ...profile], ordered, { ...process.env, SILK_CLANG: clang })
+    assert.equal(byDeclaration.status, 0, byDeclaration.stderr)
+    assert.match(byDeclaration.stderr, /silk: note: 1 of 2 entries in .*order\.txt name no function of this build/)
+    const declaredAddresses = yield* functionAddresses(executable)
+    let latestDeclared = 0n
+    for (const [name, address] of declaredAddresses) if (declared.has(name) && address > latestDeclared) latestDeclared = address
+    for (const [name, address] of declaredAddresses) {
+      if (!declared.has(name)) assert.ok(latestDeclared < address, `${profile}: ${name} is placed before ${declaration}`)
+    }
   }
   // Each profile keeps its own cache file, and a file per profile names it, so the next build in
   // either profile prefetches its own file rather than none.
@@ -3218,15 +3270,21 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     tooOld.stderr,
     /^silk: Silk builds need Clang 22 or newer, but \S+clang-18 \(from SILK_CLANG\) is Clang 18; set SILK_CLANG or pass --clang the path of a newer Clang$/m,
   )
-  // A --clang wrapper does not see SILK_CLANG, so the refusal says why it reached another Clang.
-  const wrapped = yield* invoke(silk,
-    ['build', '--manifest-path', manifest, '--stdlib', standardLibrary, '--clang', eighteen],
-    directory, { ...process.env, SILK_CLANG: clang })
-
+  // A --clang wrapper that runs $SILK_CLANG sees it, so its version probe answers with that Clang
+  // (#3150).
+  const wrapper = join(directory, 'clang-wrapper')
+  yield* fs.writeFileString(wrapper, '#!/bin/sh\nexec "$SILK_CLANG" "$@"\n')
+  yield* fs.chmod(wrapper, 0o755)
+  const wrapped = yield* invoke(
+    silk,
+    ['build', '--manifest-path', manifest, '--stdlib', standardLibrary, '--clang', wrapper],
+    directory,
+    { ...process.env, SILK_CLANG: eighteen },
+  )
   assert.equal(wrapped.status, 2, wrapped.stderr)
   assert.match(
     wrapped.stderr,
-    /^silk: Silk builds need Clang 22 or newer, but \S+clang-18 \(from --clang\) is Clang 18; Clang runs with only PATH, HOME, TMPDIR, TMP, TEMP, LANG, LC_ALL and LC_CTYPE from the environment, so a --clang wrapper does not see SILK_CLANG$/m,
+    /^silk: Silk builds need Clang 22 or newer, but \S+clang-wrapper \(from --clang\) is Clang 18; set SILK_CLANG or pass --clang the path of a newer Clang$/m,
   )
   // Clang 22 miscompiles AVX-512 mask code (llvm/llvm-project#198220), so a request with avx512vl
   // and avx512dq needs Clang 23.

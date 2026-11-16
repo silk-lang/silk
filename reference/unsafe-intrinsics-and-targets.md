@@ -1247,13 +1247,18 @@ sha256 = "d4f419dcbe81de4b86e6fbf172b647f41c67820a925efca55dae3bd43248d8e2"
 strip = 1
 ```
 
-`Plan.functionOrder` or `Compilation.functionOrder` names a text file below the manifest's directory that lists function
-symbols, one per line, such as `silk_1f3a9c...`; blank lines and lines starting with `#` are
-ignored. Write each symbol as the program's LLVM IR and a Linux `nm` spell it, without the leading
-underscore Mach-O adds. Every build writes these names beside its output in `<output>.symbols`, one
-line per symbol: the symbol, its kind and the declaration it belongs to.
-A Silk function's symbol derives from its declaration, not its body, so editing a body keeps it
-while renaming the function or changing its signature does not. A Linux or macOS executable link
+`Plan.functionOrder` or `Compilation.functionOrder` names a text file below the manifest's directory that lists functions,
+one per line; blank lines and lines starting with `#` are ignored. Every build writes its names
+beside its output in `<output>.symbols`, one line per symbol: the symbol, its kind and the
+declaration it belongs to, such as `app@0.1.0:src/main.silk::Parser.next`. A line may name a
+declaration that way, with or without the package's version (`app:src/main.silk::Parser.next`),
+and orders every symbol of that declaration, its generic instances and drop glue included, in the
+map's order. Prefer declarations: they stay the same across compiler versions and dependency
+bumps. A line may also name a symbol, such as `silk_1f3a9c...`, as the program's LLVM IR and a Linux
+`nm` spell it, without the leading underscore Mach-O adds. A Silk function's symbol derives from
+its declaration, not its body, so editing a body keeps it while renaming the function or changing
+its signature does not. When some entries name no function of the build, the build prints a note
+that counts them, so a stale file shows. A Linux or macOS executable link
 places the listed functions first, in the listed order, so code that runs together, such as a
 program's startup path, shares pages. On Linux the build compiles each function into its own
 section and links with `--symbol-ordering-file`, using lld: the one installed beside Clang, else

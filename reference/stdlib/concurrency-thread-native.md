@@ -248,6 +248,35 @@ Starts `work` on a new native thread and returns the handle that joins it.
 The thread's start storage and result storage come from the selected `Allocator`. Creation
 failure reports [`SpawnError`](#SpawnError) and drops `work` without running it.
 
+<a id="NativeThread.impl.spawnDetached"></a>
+
+### Associated function `spawnDetached`
+
+```silk
+pub effect<'static> fn spawnDetached<
+    F: 'static + once fn() -> () + Intrinsic.Detached + Transferable
+  >(work: F) -> ()
+  ! OutOfMemoryError | SpawnError
+  ? &mut Allocator
+```
+
+Starts `work` on a new native thread that nobody joins.
+
+#### When to use
+Use it for a thread that runs on its own and outlives the code that started it, such as a
+worker that a protocol shuts down. Use [`NativeThread.spawn`](#NativeThread.impl.spawn) when someone waits for the
+result.
+
+#### Details
+The thread's start storage comes from the selected `Allocator`, and the thread itself frees it
+once `work` returns. Thus that allocator must outlive the thread and must accept a free from
+any thread, as the system allocator does. Creation failure reports [`SpawnError`](#SpawnError) and drops
+`work` without running it.
+
+#### Gotchas
+- When the main function returns, the process ends, and a detached thread ends with it.
+- wasm32 has no detached threads: the joiner frees a wasm32 thread's stack.
+
 <a id="NativeThread.impl.runStarted"></a>
 
 ### Associated function `runStarted`

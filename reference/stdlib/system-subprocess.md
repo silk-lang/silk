@@ -106,7 +106,7 @@ pub effect fn main() -> i32 {
 
 Import as `Subprocess` with `import silk.system.subprocess { Subprocess }`.
 
-Public declarations: 7.
+Public declarations: 8.
 
 <a id="SubprocessOperation"></a>
 
@@ -204,15 +204,8 @@ pub struct Stdio
 What a child gets in one descriptor slot.
 
 ### Details
-Make one with [`Stdio.ignore`](#Stdio.impl.ignore), [`Stdio.inherit`](#Stdio.impl.inherit), or [`Stdio.pipe`](#Stdio.impl.pipe).
-
-<a id="Stdio.impl.Copy"></a>
-
-## Implementation `Copy for Stdio`
-
-```silk
-impl Copy for Stdio
-```
+Make one with [`Stdio.ignore`](#Stdio.impl.ignore), [`Stdio.inherit`](#Stdio.impl.inherit), [`Stdio.pipe`](#Stdio.impl.pipe), [`Stdio.toFile`](#Stdio.impl.toFile), or
+[`Stdio.fromFile`](#Stdio.impl.fromFile).
 
 <a id="Stdio.impl"></a>
 
@@ -265,6 +258,49 @@ Returns a slot connected to a new pipe between the parent and the child.
 The pipe is a UNIX stream socket pair, so both sides can read and write, and it can carry
 descriptors with `SCM_RIGHTS`. The parent end is nonblocking and close-on-exec. Take it with
 [`Subprocess.takePipe`](#Subprocess.impl.takePipe). The child end is blocking, as programs expect.
+
+<a id="Stdio.impl.toFile"></a>
+
+### Associated function `toFile`
+
+```silk
+pub effect fn toFile(path: &Path, append: bool) -> Stdio ! OutOfMemoryError ? &mut Allocator
+```
+
+Returns a slot that the child writes to the file at `path`, as a shell's `> path` or, with
+`append`, `>> path` gives it.
+
+#### Details
+[`Subprocess.spawn`](#Subprocess.impl.spawn) opens the file for writing, creating it with mode `0666` less the umask
+if it does not exist. Without `append` it empties the file first; with `append` each write
+goes to its end. The parent does not keep the descriptor.
+
+#### Errors
+`OutOfMemoryError` if the `Allocator` cannot supply the copy of `path`.
+
+#### Gotchas
+The file is opened by [`Subprocess.spawn`](#Subprocess.impl.spawn), which fails with operation `Spawn` and the code of
+`open`, such as 2 (`ENOENT`) for a missing directory or 13 (`EACCES`), if it cannot be opened.
+
+<a id="Stdio.impl.fromFile"></a>
+
+### Associated function `fromFile`
+
+```silk
+pub effect fn fromFile(path: &Path) -> Stdio ! OutOfMemoryError ? &mut Allocator
+```
+
+Returns a slot that the child reads from the file at `path`, as a shell's `< path` gives it.
+
+#### Details
+[`Subprocess.spawn`](#Subprocess.impl.spawn) opens the file for reading. The parent does not keep the descriptor.
+
+#### Errors
+`OutOfMemoryError` if the `Allocator` cannot supply the copy of `path`.
+
+#### Gotchas
+The file is opened by [`Subprocess.spawn`](#Subprocess.impl.spawn), which fails with operation `Spawn` and the code of
+`open`, such as 2 (`ENOENT`), if it cannot be opened.
 
 <a id="SpawnOptions"></a>
 
@@ -418,6 +454,50 @@ The signal number, when `signaled` is true.
 
 ```silk
 impl Copy for ExitStatus
+```
+
+<a id="ExitUsage"></a>
+
+## `ExitUsage`
+
+```silk
+pub struct ExitUsage
+```
+
+How a child ended, and the resources it used, from [`ExitWatch.collectWithUsage`](#ExitWatch.impl.collectWithUsage).
+
+<a id="ExitUsage.status"></a>
+
+### Field `status`
+
+```silk
+pub status: ExitStatus
+```
+
+How the child ended.
+
+<a id="ExitUsage.usage"></a>
+
+### Field `usage`
+
+```silk
+pub usage: ResourceUsage
+```
+
+The resources the child used over its whole life, as `wait4` reports them.
+
+#### Details
+Times are in microseconds and `maxResidentBytes` is in bytes on every system. The counters
+that a system does not keep are 0: Linux keeps no `sharedMemory`, `unsharedData`,
+`unsharedStack`, `swaps`, `messagesSent`, `messagesReceived`, or `signals`. The usage covers
+the child and the descendants it waited for, not the ones it left running.
+
+<a id="ExitUsage.impl.Copy"></a>
+
+## Implementation `Copy for ExitUsage`
+
+```silk
+impl Copy for ExitUsage
 ```
 
 <a id="Subprocess"></a>
@@ -673,6 +753,32 @@ The child has ended when the descriptor is readable. On Linux the status is read
 the call returns at once. On Darwin the kernel reports the exit a moment before the status is
 ready, and the call waits for the kernel to finish the exit. After it returns, the process ID
 is free, as after [`Subprocess.tryWait`](#Subprocess.impl.tryWait).
+
+#### Errors
+[`SubprocessError`](#SubprocessError) with operation `Wait`, for example with code 10 (`ECHILD`) if the status
+was collected before.
+
+#### Gotchas
+- Before the descriptor is readable, the call blocks until the child ends.
+
+<a id="ExitWatch.impl.collectWithUsage"></a>
+
+### Method `collectWithUsage`
+
+```silk
+pub effect fn collectWithUsage(self: &Self) -> ExitUsage ! SubprocessError
+```
+
+Collects the exit status of the watched child after [`ExitWatch.descriptor`](#ExitWatch.impl.descriptor) is readable, with
+the resources the child used: its CPU times, its peak resident memory, its page faults and the
+rest of `struct rusage`.
+
+#### When to use
+Use it to measure a child, as a benchmark harness or `time` does. It collects the status in
+place of [`ExitWatch.collect`](#ExitWatch.impl.collect); call one of them, once.
+
+#### Details
+It waits as [`ExitWatch.collect`](#ExitWatch.impl.collect) does, with `wait4`. After it returns, the process ID is free.
 
 #### Errors
 [`SubprocessError`](#SubprocessError) with operation `Wait`, for example with code 10 (`ECHILD`) if the status

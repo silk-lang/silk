@@ -64,7 +64,7 @@ unsafe extern "C" fn pthread_create(
 ) -> i32
 ```
 
-The export itself needs nothing more: it has no captured environment, and Silk has no thread-local
+The export itself needs nothing more: it has no captured environment, and Silk has no safe thread-local
 or mutable global storage, so its body runs the same on a new thread. Whatever reaches it through
 its raw-pointer arguments is the unsafe caller's obligation, typically an owned value moved with
 `Pointer.take` (see the native pointer boundary) whose type is `Transferable` (THREAD-001).

@@ -365,7 +365,14 @@ Returns `command` with the field `field` read as a named option, described by `o
 #### Details
 
 `field` is checked against the fields of `T` where it is written, so a misspelled name is a
-compile error at the name. For a union, `field` names a field of any of its variants.
+compile error at the name. For a union, `field` names a field of any of its variants, and one
+description covers that field in every variant that has it.
+
+#### Gotchas
+
+Describing one field twice is a compile error, also in a union whose variants share the field.
+To give variants different help or defaults, give each its own field label and the same
+`Opt.long` name: a union's variants may share option names.
 
 <a id="Command.impl.arg"></a>
 
@@ -411,7 +418,10 @@ commands.
 #### Details
 
 A group holds named options only: its own positional arguments or subcommands are a compile
-error. Help lists the group's options among the command's own.
+error. Help lists the group's options among the command's own. The group's own `command`
+describes its options, so their help and defaults are the same in every command that flattens
+it. For a union, one `flatten` covers the field in every variant that has it; flattening the
+same field again is a compile error.
 
 <a id="Command.impl.variant"></a>
 
