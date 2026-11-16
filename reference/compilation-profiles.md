@@ -308,7 +308,7 @@ The file exposes a typed `pub const PLAN: Plan`. Its values use the same deferre
 standard `Run` and `WriteFiles` steps as root task graphs:
 
 ```silk,ignore
-import silk.build.plan { Plan }
+import silk.build.plan { Library, Plan }
 import silk.build.source { Source }
 import silk.build.step { sourcePath }
 import silk.build.write_files { WriteFiles }
@@ -320,7 +320,7 @@ static fn plan() -> Plan {
   return Plan.empty()
     |> Plan.module("generated_limit", WriteFiles.result(&files, "limit.silk"))
     |> Plan.compileC(sourcePath("native/shim.c"))
-    |> Plan.linkLibrary("m", "dynamic", false, false)
+    |> Plan.linkLibrary("m", Library.dynamicSearch())
 }
 
 pub const PLAN: Plan = plan()
