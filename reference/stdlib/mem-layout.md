@@ -92,6 +92,51 @@ pub fn of<T>() -> Layout
 
 Returns the byte size and alignment of one value of type `T`.
 
+#### Details
+
+The values are for the target being checked or built. A static body, such as a `static if`
+condition, can call it too, so a layout check against a C header fails at compile time.
+
+<a id="Layout.impl.offsetOf"></a>
+
+### Associated function `offsetOf`
+
+```silk
+pub static fn offsetOf<T>(name: Intrinsic.FieldName<T>) -> usize
+```
+
+Returns the byte offset of the field `name` from the start of one value of the struct `T`.
+
+#### When to use
+
+Use it with [`Layout.of`](#Layout.impl.of) in a `static if` to check, at compile time, that an `extern "C"`
+struct matches the C header it mirrors. The answer is for the target being checked or built,
+so a mismatch on one target fails only that target's check.
+
+#### Details
+
+`name` must be a string literal that names a field of `T`, so a misspelled name is an error
+at the literal. The function is static: it runs during static evaluation, such as in a
+`static if` condition or a constant, and never at run time. The fields of an `extern "C"`
+struct are at their C offsets; the fields of other structs are at offsets the compiler picks.
+
+#### Examples
+```silk
+import silk.mem.layout { Layout }
+
+extern "C" struct Pair {
+  first: i64,
+  second: i32,
+}
+
+pub fn main() -> i32 {
+  static if Layout.of<Pair>().bytes != 16 || Layout.offsetOf<Pair>("second") != 8 {
+    compileError("Pair does not match its C header")
+  }
+  return 0
+}
+```
+
 <a id="Layout.impl.make"></a>
 
 ### Associated function `make`
