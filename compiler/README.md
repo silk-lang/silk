@@ -46,16 +46,20 @@ invalidates. It checks the package as `silk check` does, but in a store opened w
 `Semantic.update` and checks again. It prints no diagnostics; each step writes one line:
 
 ```text
-silk-replay step=1 kind=trivia module=silk/collections/bytes.silk demands=211352 hits=211338 units-run=14 marked-outdated=14 graph-units=64550 graph-bytes=46662656 answers=68759 mir-functions=5927 rejections=5 update-us=238 check-us=904871
+silk-replay step=1 kind=trivia module=silk/collections/bytes.silk demands=211352 hits=211338 units-run=14 units-new=0 marked-outdated=14 graph-units=64550 graph-bytes=46662656 answers=68759 mir-functions=5927 rejections=5 update-us=238 check-us=904871
 ```
 
 `demands`, `hits`, `units-run` and `marked-outdated` are what that step added to the store's
-`Statistics`; `graph-units` and `graph-bytes` are the dependency graph's size after it, and
+`Statistics`. `units-new` counts the units among `units-run` that held no answer before: a step
+after a rejected one computes for the first time what the rejected body kept the check from
+reaching, which is not a rerun. `graph-units` and `graph-bytes` are the dependency graph's size after it, and
 `answers` and `mir-functions` the completed answers and lowered MIR functions the store holds.
 After each check the replay drops what the language server drops after each of its steps: the
 request's roots (`Request.forgetRoots`) and the lowered functions no answer names any more
 (`Semantic.releaseStaleMir`), which a unit that reruns has replaced.
-`rejections` counts the root package's rejections and every parsed module's syntax errors, and
+`rejections` counts the root package's rejections, what the selected runtime refuses of the
+application's `main` (which `silk check` reports as SEM0225), and every parsed module's syntax
+errors, and
 `update-us` and `check-us` are the wall time of `Semantic.update` and of the check. Step 0 is the
 first check. The `replayUpdate` and `replayCheck` Tracy zones cover the same spans.
 

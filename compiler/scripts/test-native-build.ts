@@ -5326,6 +5326,22 @@ const program = Effect.gen(function* () {
   assert.equal(replay.status, 0, replay.stdout + replay.stderr)
   const unitsRun = [...(replay.stdout + replay.stderr).matchAll(/silk-replay step=[1-9]\d* .*?units-run=(\d+)/g)].map((match) => Number(match[1]))
   assert.ok(unitsRun.length > 0 && unitsRun.every((units) => units < 10), `an embedded edit reran ${unitsRun.join(', ')} units`)
+  // An edit replay counts what the runtime refuses of `main`, as `check` reports it (SEM0225), and
+  // both stores of a differential replay reach it.
+  const entry = join(directory, 'replayentry')
+  yield* fs.makeDirectory(join(entry, 'src'), { recursive: true })
+  yield* fs.writeFileString(join(entry, 'silk.toml'), '[package]\nname = "replayentry"\nversion = "0.1.0"\n')
+  yield* fs.writeFileString(join(entry, 'src/main.silk'), 'pub fn main() -> i32 {\n  return 0\n}\n')
+  yield* fs.writeFileString(
+    join(entry, 'replay.toml'),
+    '[[edit]]\nkind = "header-same-type"\nmodule = "main.silk"\nfind = "pub fn main"\nreplace = "fn main"\n\n'
+      + '[[edit]]\nkind = "header-same-type"\nmodule = "main.silk"\nfind = "fn main"\nreplace = "pub fn main"\n',
+  )
+  const entryReplay = yield* invoke(silk, ['check', '--stdlib', standardLibrary, '--replay', 'replay.toml', '--differential'], entry,
+    splitEnvironment)
+  assert.equal(entryReplay.status, 0, entryReplay.stdout + entryReplay.stderr)
+  const entryRejections = [...entryReplay.stdout.matchAll(/^silk-replay step=\d+ .*? rejections=(\d+)/gm)].map((match) => Number(match[1]))
+  assert.deepEqual(entryRejections, [0, 1, 0], entryReplay.stdout)
   const refusedEmbed = Effect.fnUntraced(function* (path: string, message: RegExp) {
     yield* fs.writeFileString(join(embeds, 'src/main.silk'), embedMain(path))
     const built = yield* invoke(silk, ['build', '--stdlib', standardLibrary], embeds, splitEnvironment)
