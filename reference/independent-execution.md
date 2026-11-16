@@ -225,7 +225,7 @@ The compiler recognizes only these sealed target-neutral Execution primitives:
 - `Intrinsic.ExecutionRef` is counted authority over one package allocation. It is obtained with
   `Intrinsic.executionCurrent` or `Intrinsic.executionRefOf`.
 - `Intrinsic.executionLoad`, `Intrinsic.executionStore` and `Intrinsic.executionCompareExchange`
-  access the two source control words atomically (EXEC-009).
+  access the three source control words atomically (EXEC-009); any other index is a fatal trap.
 - `Intrinsic.executionNotify` invokes the fixed readiness endpoint.
 - `Intrinsic.executionLive` reports whether the Execution handle still exists.
 
