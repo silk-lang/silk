@@ -449,9 +449,8 @@ impl Cli
 pub static fn commands<T: CommandLine>() -> string<'static>
 ```
 
-Returns the root union's command names, separated by spaces, during static evaluation.
-A task module publishes this value as `COMMANDS` so the driver can select built-ins without
-compiling or executing its entry point.
+Returns the command names of the root union `T`, in kebab case and each followed by a space,
+such as `"codegen release "`. Returns `""` when `T` is not a union.
 
 <a id="Cli.impl.parse"></a>
 

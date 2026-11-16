@@ -783,7 +783,6 @@ impl TaskSet for Tasks {
     run FileSystem.writeFile(&run Path.make(${JSON.stringify(outside)}), b"escaped")
   }
 }
-pub const COMMANDS: string = Task.commands<Tasks>()
 pub effect fn main() -> i32 ? &mut HostInput { return run Task.main<Tasks>() }
 `)
   yield* planned.send({ jsonrpc: '2.0', method: 'workspace/didChangeConfiguration',

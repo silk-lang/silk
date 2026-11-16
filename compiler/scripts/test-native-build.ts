@@ -339,7 +339,6 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     '    }',
     '  }',
     '}',
-    'pub const COMMANDS: string = Task.commands<Tasks>()',
     'pub effect fn main() -> i32 ? &mut HostInput { return run Task.main<Tasks>() }',
     '',
   ].join('\n')
@@ -348,7 +347,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   for (const command of reservedCommands.map((name) => name.toLowerCase())) {
     const dispatched = yield* invoke(silk, [command, '--stdlib', standardLibrary, '--code', '17'], aliased, requestEnv, 120_000)
     assert.equal(dispatched.status, 17, dispatched.stderr)
-    assert.equal(dispatched.stderr.split('task selected').length - 1, 1, 'the discovery query must not perform the task')
+    assert.equal(dispatched.stderr.split('task selected').length - 1, 1, 'a reserved command performs its task once')
   }
   const explicitTask = yield* invoke(silk, ['task', '--stdlib', standardLibrary, 'build', '--code', '23'], aliased, requestEnv, 120_000)
   assert.equal(explicitTask.status, 23, explicitTask.stderr)
