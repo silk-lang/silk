@@ -2428,6 +2428,17 @@ const program = Effect.gen(function* () {
   yield* sourcesRun(48)
   const editedNativeObjects = (yield* nativeObjects()).filter((name) => !firstObjects.includes(name))
   assert.equal(editedNativeObjects.length, 1, `an edit to one file compiles one object, added ${editedNativeObjects.join(', ')}`)
+  // A file Clang reads through `#embed` and a `..` path is in the object's record, so an edit to it
+  // alone compiles the object again (#3152).
+  yield* fs.makeDirectory(join(sourcesRoot, 'clib/data'), { recursive: true })
+  yield* fs.writeFile(join(sourcesRoot, 'clib/data/blob.bin'), new Uint8Array([3]))
+  yield* fs.writeFileString(
+    join(sourcesRoot, 'clib/native/two.c'),
+    'static const unsigned char blob[] = {\n#embed "../data/blob.bin"\n};\nint clib_two(void) { return blob[0]; }\n',
+  )
+  yield* sourcesRun(48)
+  yield* fs.writeFile(join(sourcesRoot, 'clib/data/blob.bin'), new Uint8Array([4]))
+  yield* sourcesRun(49)
   for (const sources of [
     '{ c = "native/*.c", flags = ["-fplugin=evil.so"] }',
     '{ c = "native/*.c", flags = ["-Wl,-rpath,/tmp"] }',
@@ -2956,17 +2967,21 @@ const program = Effect.gen(function* () {
     tooOld.stderr,
     /^silk: Silk builds need Clang 22 or newer, but \S+clang-18 \(from SILK_CLANG\) is Clang 18; set SILK_CLANG or pass --clang the path of a newer Clang$/m,
   )
-  // A --clang wrapper does not see SILK_CLANG, so the refusal says why it reached another Clang.
+  // A --clang wrapper that runs $SILK_CLANG sees it, so its version probe answers with that Clang
+  // (#3150).
+  const wrapper = join(directory, 'clang-wrapper')
+  yield* fs.writeFileString(wrapper, '#!/bin/sh\nexec "$SILK_CLANG" "$@"\n')
+  yield* fs.chmod(wrapper, 0o755)
   const wrapped = yield* invoke(
     silk,
-    ['build', '--manifest-path', join('threads', 'silk.toml'), '--profile', 'web', '--stdlib', standardLibrary, '--clang', eighteen],
+    ['build', '--manifest-path', join('threads', 'silk.toml'), '--profile', 'web', '--stdlib', standardLibrary, '--clang', wrapper],
     directory,
-    { ...process.env, SILK_CLANG: clang },
+    { ...process.env, SILK_CLANG: eighteen },
   )
   assert.equal(wrapped.status, 2, wrapped.stderr)
   assert.match(
     wrapped.stderr,
-    /^silk: Silk builds need Clang 22 or newer, but \S+clang-18 \(from --clang\) is Clang 18; Clang runs with only PATH, HOME, TMPDIR, TMP, TEMP, LANG, LC_ALL and LC_CTYPE from the environment, so a --clang wrapper does not see SILK_CLANG$/m,
+    /^silk: Silk builds need Clang 22 or newer, but \S+clang-wrapper \(from --clang\) is Clang 18; set SILK_CLANG or pass --clang the path of a newer Clang$/m,
   )
   // Clang 22 miscompiles AVX-512 mask code (llvm/llvm-project#198220), so a profile with avx512vl
   // and avx512dq needs Clang 23.

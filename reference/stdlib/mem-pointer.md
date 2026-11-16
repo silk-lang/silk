@@ -722,6 +722,79 @@ is known to be aligned.
 
 The caller must prove that the bytes there are a valid `U` before reading it.
 
+<a id="Pointer.impl.castUnalignedMut"></a>
+
+### Associated function `castUnalignedMut`
+
+```silk
+pub unsafe fn castUnalignedMut<T, U>(pointer: *mut T) -> *mut align(1) U
+```
+
+Returns `pointer` as a writable pointer to a `U` at the same address that need not be aligned
+for `U`.
+
+#### Details
+
+Write through the result with [`Pointer.writeUnaligned`](#Pointer.impl.writeUnaligned) and read it with
+[`Pointer.readUnaligned`](#Pointer.impl.readUnaligned). Use [`Pointer.castMut`](#Pointer.impl.castMut) when the address is known to be aligned.
+
+#### Gotchas
+
+The caller must prove that the storage there is writable, and that its bytes are a valid `U`
+before reading it.
+
+<a id="Pointer.impl.wrappingOffset"></a>
+
+### Associated function `wrappingOffset`
+
+```silk
+pub fn wrappingOffset<T>(pointer: [*]const T, delta: isize) -> [*]const T
+```
+
+Returns `pointer` moved by `delta` elements of `T`, as plain address arithmetic.
+
+#### When to use
+
+Use it for a base that may lie outside its allocation, such as a C window addressed as
+`base + index` where `base` is the start of the data minus an index that only ever counts up
+from there. Use [`Pointer.at`](#Pointer.impl.at) for an element inside the allocation.
+
+#### Details
+
+The address wraps modulo the pointer width. The result keeps the allocation of `pointer`, so
+it can be read through once it is back inside that allocation, however far outside the
+steps in between went. No in-bounds assumption is made. Making the pointer is safe; reading
+or writing through it is not.
+
+#### Gotchas
+
+The result must be inside the original allocation before any access through it.
+
+<a id="Pointer.impl.wrappingOffsetMut"></a>
+
+### Associated function `wrappingOffsetMut`
+
+```silk
+pub fn wrappingOffsetMut<T>(pointer: [*]mut T, delta: isize) -> [*]mut T
+```
+
+Returns the writable `pointer` moved by `delta` elements of `T`, as plain address arithmetic.
+
+#### When to use
+
+Use it for a base that may lie outside its allocation, such as a C window addressed as
+`base + index`. Use [`Pointer.atMut`](#Pointer.impl.atMut) for an element inside the allocation.
+
+#### Details
+
+The address wraps modulo the pointer width. The result keeps the allocation of `pointer`, so
+it can be read and written through once it is back inside that allocation. No in-bounds
+assumption is made. Making the pointer is safe; reading or writing through it is not.
+
+#### Gotchas
+
+The result must be inside the original allocation before any access through it.
+
 <a id="Pointer.impl.zeroed"></a>
 
 ### Associated function `zeroed`
