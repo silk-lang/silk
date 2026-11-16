@@ -335,7 +335,7 @@ again without entering the body. Only `run` enters the body.
 struct Failure {}
 
 fn recover(answer: i32) -> Effect<i32> {
-  let handler = effect fn(error: Failure) -> i32 {
+  let handler = effect |error: Failure| -> i32 {
     return answer
   }
   return handler(Failure {})
@@ -349,7 +349,7 @@ pub fn main() -> i32 {
 Evaluating `handler` captures `answer`. Calling `handler(Failure {})` constructs the returned
 `Effect<i32>`. The body reads `answer` only when `main` runs that Effect.
 
-**Boundary:** `effect fn(...) -> ... { ... }` is an anonymous callable whose invocation returns an
+**Boundary:** `effect |...| -> ... { ... }` is an anonymous callable whose invocation returns an
 Effect. `effect { ... }` directly constructs an Effect and has no intervening callable-invocation
 boundary. An effectful anonymous callable that moves an affine capture derives `once fn`; its one
 invocation transfers the environment into the returned Effect, and constructing a second Effect

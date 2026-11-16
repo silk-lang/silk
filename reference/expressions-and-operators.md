@@ -321,49 +321,6 @@ produces one diagnostic; a later independent over-budget expression may produce 
 diagnostic catalog,
 bootstrap syntax specification.
 
-### ANON-SYNTAX-001 — Anonymous callable expressions write a complete callable contract
-
-**Status:** Confirmed
-
-An ordinary anonymous callable expression has this form:
-
-```silk
-fn(value: i32) -> i32 { return value + 1 }
-```
-
-An effectful anonymous callable prefixes the same form with `effect` and may declare failure and
-requirement channels after its success type:
-
-```silk
-effect fn(error: Failure) -> i32 ! RecoveryError ? &Logger { return 42 }
-```
-
-The parameter list, `->`, result or success type, and braced body are mandatory. The failure and
-requirement rows are optional and have the same spelling and fixed empty meanings as a named effect
-function. Whitespace, comments, punctuation, and source spans remain part of the lossless syntax.
-
-**Boundary:** `effect fn(` begins an effectful anonymous callable, while `effect {` begins a direct
-Effect block. Anonymous construction has no name, type-parameter list, declaration modifier,
-capture list, or explicit `mut` or `once` modifier. The syntax parser retains a nested anonymous
-body for recovery and formatting, but semantic analysis rejects that nesting in this language
-slice.
-
-```silk,ignore
-fn invalidForms() {
-  let missingParameterType = fn(value) -> i32 { return value }
-  let missingResult = fn(value: i32) { return value }
-  let explicitMode = mut fn(value: i32) -> i32 { return value }
-  let namedExpression = fn named(value: i32) -> i32 { return value }
-}
-```
-
-**Diagnostics:** A missing parameter type, result arrow or type, delimiter, or body receives a
-local parser diagnostic. Recovery remains bounded to the anonymous expression so later arguments,
-statements, and declarations remain independently parseable.
-
-**Evidence:** anonymous callable syntax specification,
-anonymous formatting specification.
-
 ### LAMBDA-SYNTAX-001 — Lambdas write parameters between bars
 
 **Status:** Confirmed
@@ -389,13 +346,26 @@ fn forms() {
 single-type forms; parenthesize a union. Types the lambda omits come from its context under
 [ANON-CALLABLE-002](functions-callables-and-control-flow.md#anon-callable-002--a-lambda-takes-omitted-types-from-where-it-is-used).
 
-**Boundary:** The `fn(...)` anonymous form of
-[ANON-SYNTAX-001](#anon-syntax-001--anonymous-callable-expressions-write-a-complete-callable-contract)
-is unchanged. `effect` before the bars, `effect |value| ...`, writes an `effect` lambda.
+A lambda is the only anonymous callable expression. `effect` before the bars,
+`effect |value| ...`, writes an `effect` lambda; `effect {` without bars begins a direct Effect
+block.
 
-**Diagnostics:** A missing closing bar or body receives a local parser diagnostic.
+**Boundary:** A lambda has no name, type-parameter list, declaration modifier, capture list, or
+explicit `mut` or `once` modifier; its invocation mode comes from its captures.
 
-**Evidence:** anonymous callable syntax specification.
+```silk,ignore
+fn invalidForms() {
+  let oldForm = fn(value: i32) -> i32 { return value }
+  let explicitMode = mut |value: i32| -> i32 { return value }
+}
+```
+
+**Diagnostics:** A missing closing bar or body receives a local parser diagnostic. The anonymous
+`fn(value: i32) -> i32 { ... }` form receives `PAR0010` at its `fn`, naming the lambda spelling
+`|value: i32| -> i32 { ... }`; it is parsed whole, so later code reports nothing more.
+
+**Evidence:** anonymous callable syntax specification,
+anonymous formatting specification.
 
 ## Operator precedence and dispatch
 
