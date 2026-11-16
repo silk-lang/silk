@@ -33,6 +33,51 @@ traps, because this effect has no error type.
 ```silk
 import silk.core.effect { Effect }
 import silk.core.option { Option }
+import silk.system.monotonic_clock { MonotonicClock, ReadyWatch }
+import silk.system.system_clock { Instant, SystemClock }
+
+struct VirtualClock {
+  mark: Instant,
+}
+
+impl MonotonicClock for VirtualClock {
+  effect fn now(self: &mut Self) -> Instant {
+    return SystemClock.make(SystemClock.seconds(&self.mark), SystemClock.nanoseconds(&self.mark))
+  }
+
+  effect fn getResolution(self: &mut Self) -> u64 {
+    return 1
+  }
+
+  effect fn waitUntil(self: &mut Self, when: Instant) -> () {
+    self.mark = move when
+    return ()
+  }
+
+  effect fn waitFor(self: &mut Self, howLong: u64) -> () {
+    self.mark = MonotonicClock.deadlineAfter(&self.mark, howLong)
+    return ()
+  }
+
+  // No handle is ever ready on this clock, so a wait moves to `until`.
+  effect fn waitReady(self: &mut Self, watch: &mut [ReadyWatch], until: Option<Instant>) -> usize {
+    match move until {
+      Option<Instant>.Some {value} => { self.mark = move value }
+      Option<Instant>.None => Intrinsic.trap("VirtualClock: no handle will be ready")
+    }
+    return 0
+  }
+}
+
+pub fn main() -> i32 {
+  let mut clock = VirtualClock { mark: SystemClock.make(0, 900000000) }
+  run MonotonicClock.waitFor(300ms) |> Effect.provideMut<MonotonicClock>(&mut clock)
+  if SystemClock.seconds(&clock.mark) != 1 || SystemClock.nanoseconds(&clock.mark) != 200000000 {
+    return 1
+  }
+  return 0
+}
+```
 
 Import as `MonotonicClock` with `import silk.system.monotonic_clock { MonotonicClock }`.
 
@@ -355,5 +400,7 @@ pub fn takeEvents(self: &mut Self, source: &ReadyWatch) -> ()
 Copies the events of `source` into this watch. A scheduler uses it to hand back the result of
 a wait that it forwarded.
 
+
+Category: System.
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`, `wasm64-unknown-unknown`.
