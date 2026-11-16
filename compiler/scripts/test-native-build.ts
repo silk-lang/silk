@@ -2832,6 +2832,22 @@ const program = Effect.gen(function* () {
     placedFirst(yield* orderedBuild(), last, beforeLast)
     yield* fs.writeFileString(join(ordered, 'order.txt'), `${beforeLast}\n${last}\n`)
     placedFirst(yield* orderedBuild(), beforeLast, last)
+    // A declaration, as the `.symbols` map's third column spells it, orders every symbol of that
+    // declaration; an entry that names nothing this build emits is reported as a note.
+    const symbolMap = (yield* fs.readFileString(`${executable}.symbols`)).split('\n').map((line) => line.split('\t'))
+    const declaration = symbolMap.find((row) => row[0] === last)?.[2] ?? ''
+    assert.ok(declaration.includes('::'), `${profile}: ${last} has no declaration in the symbol map`)
+    const declared = new Set(symbolMap.filter((row) => row[2] === declaration).map((row) => row[0]))
+    yield* fs.writeFileString(join(ordered, 'order.txt'), `${declaration}\nsilk_00000000000000000000000000000000\n`)
+    const byDeclaration = yield* invoke(silk, ['build', '--stdlib', standardLibrary, ...profile], ordered, { ...process.env, SILK_CLANG: clang })
+    assert.equal(byDeclaration.status, 0, byDeclaration.stderr)
+    assert.match(byDeclaration.stderr, /silk: note: 1 of 2 entries in .*order\.txt name no function of this build/)
+    const declaredAddresses = yield* functionAddresses(executable)
+    let latestDeclared = 0n
+    for (const [name, address] of declaredAddresses) if (declared.has(name) && address > latestDeclared) latestDeclared = address
+    for (const [name, address] of declaredAddresses) {
+      if (!declared.has(name)) assert.ok(latestDeclared < address, `${profile}: ${name} is placed before ${declaration}`)
+    }
   }
   // Each profile keeps its own cache file, and a file per profile names it, so the next build in
   // either profile prefetches its own file rather than none.
