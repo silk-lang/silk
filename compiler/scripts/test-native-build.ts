@@ -312,9 +312,13 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   // Reserved command aliases dispatch to the typed task without interpreting its arguments.
   const aliased = join(directory, 'aliased')
   yield* fs.makeDirectory(join(aliased, 'src'), { recursive: true })
-  yield* fs.writeFileString(join(aliased, 'silk.toml'), '[package]\nname="aliased"\n')
+  yield* fs.writeFileString(join(aliased, 'silk.toml'), '[package]\nname="aliased"\n[dependencies]\ncatalog = {path="catalog"}\n')
+  yield* fs.makeDirectory(join(aliased, 'catalog'), { recursive: true })
+  yield* fs.writeFileString(join(aliased, 'catalog/silk.toml'), '[package]\nname="task-catalog"\nsource="."\nexports=["description"]\n')
+  yield* fs.writeFileString(join(aliased, 'catalog/description.silk'), 'pub const DESCRIPTION: string = "Alias fixture"\n')
   yield* fs.writeFileString(join(aliased, 'src/main.silk'), 'pub fn main() -> i32 { return 42 }\ntest fn smoke() -> () {}\n')
   const aliasSource = (names: ReadonlyArray<string>) => [
+    'import catalog.description { DESCRIPTION }',
     'import silk.cli.command { Command, CommandLine, Opt }',
     'import silk.cli.task { Task, TaskSet, TaskError }',
     'import silk.mem.allocator { Allocator, OutOfMemoryError }',
@@ -323,7 +327,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     `union Tasks { ${names.map((name) => `${name} { pub code: i32 }`).join(', ')} }`,
     'impl CommandLine for Tasks {',
     '  static fn command() -> Command<Tasks> {',
-    '    return Command<Tasks>.make("tasks", "Alias fixture") |> Command.option("code", Opt.about("Exit code") |> Opt.required())',
+    '    return Command<Tasks>.make("tasks", DESCRIPTION) |> Command.option("code", Opt.about("Exit code") |> Opt.required())',
     '  }',
     '}',
     'impl TaskSet for Tasks {',
@@ -2712,7 +2716,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   yield* packVendor('vend-1', 30)
   yield* packVendor('alt', 50)
   const packed = yield* invoke('tar', ['czf', 'vend.tar.gz', 'vend-1'], vendorArchived)
-  assert.equal(packed.status, 0, packed.stderr)
+  assert.equal(packed.status, 0, packed.stdout + packed.stderr)
   const vendDigest = createHash('sha256').update(yield* fs.readFile(join(vendorArchived, 'vend.tar.gz'))).digest('hex')
   const sysManifest = (digest: string, url = `file://${join(vendorArchived, 'vend.tar.gz')}`) =>
     '[package]\nname = "sys"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nexports = ["Sys"]\n'
@@ -3906,7 +3910,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
       workspace,
       refusing,
     )
-    assert.equal(packed.status, 0, packed.stderr)
+    assert.equal(packed.status, 0, packed.stdout + packed.stderr)
     const listed = spawnSync('tar', ['-xzOf', join(output, 'shared-math-0.1.0.tar.gz'), 'shared-math-0.1.0/silk.toml'], {
       encoding: 'utf8',
     })
@@ -4012,7 +4016,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
       environment,
       120_000,
     )
-    assert.equal(packed.status, 0, packed.stderr)
+    assert.equal(packed.status, 0, packed.stdout + packed.stderr)
     const binaries = JSON.parse(packed.stdout).archives[0].binaries as ReadonlyArray<{ platform: string; path: string }>
     assert.equal(binaries.length, 1, packed.stdout)
     const platform = binaries[0].platform
