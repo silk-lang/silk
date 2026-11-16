@@ -1,0 +1,236 @@
+//! Build graphs that publish complete compilation requests and return their artifacts.
+
+import silk.build.compilation as Compilations
+import silk.build.encoding as Encoding
+import silk.build.options as Standard
+import silk.build.publish as Publish
+import silk.build.request { Request }
+import silk.build.step as Steps { StepHandle, Runner, StepError, StepFailure }
+import silk.build.run as Runs
+import silk.build.write_files as Files
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.concurrency.fiber { Cancelled }
+import silk.concurrency.thread_native { SpawnError }
+import silk.core.option { Option }
+import silk.crypto.sha2 { Sha256 }
+import silk.mem.allocator { Allocator }
+import silk.platform.windows.path { WindowsPath }
+import silk.schema.toml { SchemaToml }
+import silk.system.executable as Executable
+import silk.system.filesystem { FileSystem, Path }
+import silk.system.host_input { HostInput }
+import silk.text.string { String }
+import silk.num.usize
+
+/// The shared target, optimization, and debug command-line options.
+pub type Options = Standard.Options
+/// A compilation or defining package's optimization mode.
+pub type Optimize = Standard.Optimize
+/// One compilation; its settings freeze when an artifact or step handle is first requested.
+pub type Compilation = Compilations.Compilation
+/// A typed value that only the running step can resolve.
+pub type Deferred<T> = Steps.Deferred<T>
+/// Custom work with a declared key and a constrained make context.
+pub type Step = Steps.Step
+/// The inputs that determine a step's cached outputs.
+pub type Key = Steps.Key
+/// The declared inputs and output directory available while a step executes.
+pub type Make = Steps.Make
+/// A process invocation with declared inputs, environment, outputs, and captured values.
+pub type Run = Runs.Run
+/// Text files generated from known or deferred values.
+pub type WriteFiles = Files.WriteFiles
+/// A failure to prepare, schedule, run, or publish a build graph.
+pub type BuildError = StepFailure | SpawnError | Cancelled
+
+struct Destination {request: String, directory: String}
+struct Root {step: StepHandle, name: String, destination: Option<Destination>}
+
+/// Requested root steps and compilations, executed only by `compile` or `write`.
+pub struct Build {
+  root: Path,
+  identity: Bytes,
+  roots: List<Root>,
+  memory: u64,
+  workers: usize,
+}
+
+/// The paths of a completed compilation, including its stable request file.
+pub struct Artifact {
+  /// The artifact name chosen by its compilation.
+  pub name: String,
+  /// The compilation's fixed output path, or a custom step's cache output path.
+  pub path: Path,
+  /// The stable request file, when this root is a compilation.
+  pub request: Option<Path>,
+}
+
+/// Completed root artifacts in the order they were added to a build.
+pub struct Built {
+  /// The resolved artifacts. Request-only builds retain paths for artifacts not yet compiled.
+  pub artifacts: List<Artifact>,
+}
+
+impl Build {
+  /// Applies `transform` when `condition` is true, returning the original value otherwise.
+  pub effect fn when<'env, E, ?R>(self: Self, condition: bool,
+    transform: once effect fn<'env>(Self) -> Self ! E ? R) -> Self ! E ? R {
+    if condition { return run transform(move self) }
+    return move self
+  }
+
+  /// Starts a graph in the current package, keying the executable that constructs it.
+  pub effect fn make() -> Self ! BuildError ? &mut Allocator | &mut HostInput | &mut FileSystem {
+    let cwd = run HostInput.workingDirectory()
+    let root = run fromHost(cwd.asSlice())
+    let program = match move run HostInput.argument(usize.ZERO) {
+      Option<Bytes>.Some {value} => move value
+      Option<Bytes>.None => { fail StepError {message: run String.copy("the build program has no executable identity")} }
+    }
+    let path = match move run Executable.findBytes(program.asSlice()) {
+      Option<Path>.Some {value} => move value
+      Option<Path>.None => { fail StepError {message: run String.copy("cannot locate the executable constructing this build")} }
+    }
+    let contents = run FileSystem.readFile(&path)
+    let identity = Sha256.hash(contents.asSlice())
+    return run Build.at(move root, &identity)
+  }
+
+  /// Starts a graph at an explicit root with the content identity of its constructing program.
+  pub effect fn at(root: Path, identity: &[u8]) -> Self ! BuildError ? &mut Allocator {
+    return Build {root: move root, identity: run Bytes.copy(identity), roots: List<Root>.make(), memory: 4294967296, workers: 4}
+  }
+
+  /// Adds a requested compilation, freezing its settings. Dependencies follow its deferred inputs.
+  pub effect fn add(self: Self, compilation: Compilation) -> Self ! BuildError ? &mut Allocator {
+    let mut build = move self
+    let roots = build.roots.asSlice()
+    let mut at = usize.ZERO
+    while at < roots.length {
+      if let Option<Destination>.Some {value} = &roots[at].destination {
+        if value.request.view() == compilation.requestFile() {
+          fail StepError {message: run String.copy("two compilations select the same artifact, target, and mode")}
+        }
+      }
+      at = at + usize.ONE
+    }
+    run build.roots.append(Root {step: run compilation.step(), name: run String.copy(compilation.artifactName()),
+      destination: Option<Destination>.some(Destination {request: run String.copy(compilation.requestFile()),
+        directory: run String.copy(compilation.outputDirectory())})})
+    return move build
+  }
+
+  /// Adds custom work as a requested root. The named output becomes one returned artifact.
+  pub effect fn addStep(self: Self, step: StepHandle, output: string) -> Self ! BuildError ? &mut Allocator {
+    let mut build = move self
+    let _validated = run step.output(output)
+    run build.roots.append(Root {step: move step, name: run String.copy(output), destination: Option<Destination>.none()})
+    return move build
+  }
+
+  /// Bounds the sum of estimates for running steps; a larger single step runs alone.
+  pub fn memoryBudget(self: Self, bytes: u64) -> Self {
+    let mut build = move self
+    build.memory = bytes
+    return move build
+  }
+
+  /// Sets the maximum number of worker fibers. Zero requests one worker.
+  pub fn parallelism(self: Self, workers: usize) -> Self {
+    let mut build = move self
+    build.workers = workers
+    return move build
+  }
+
+  /// Runs the requested graph, publishes complete requests, and returns the resulting artifacts.
+  pub effect fn compile(self: Self) -> Built ! BuildError ? &mut Allocator | &mut FileSystem | &mut HostInput {
+    return run execute(move self, true)
+  }
+
+  /// Resolves dependencies and publishes requests, stopping before requested compilations run.
+  /// Prerequisite tool compilations still build. Failures leave previously published requests intact.
+  pub effect fn write(self: Self) -> Built ! BuildError ? &mut Allocator | &mut FileSystem | &mut HostInput {
+    return run execute(move self, false)
+  }
+}
+
+effect fn fromHost(bytes: &[u8]) -> Path ! StepFailure ? &mut Allocator {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    return run WindowsPath.fromNativeBytes(bytes)
+  } else { return run Path.fromBytes(bytes) }
+}
+
+effect fn resolveHost(root: &Path, text: string) -> Path ! StepFailure ? &mut Allocator {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    return run WindowsPath.resolve(root, text)
+  } else {
+    let bytes = String.utf8Bytes(text)
+    if bytes.length > usize.ZERO && bytes[usize.ZERO] == 47 { return run Path.fromBytes(bytes) }
+    return run Path.resolve(root, text)
+  }
+}
+
+effect fn execute(build: Build, compile: bool) -> Built ! BuildError ? &mut Allocator | &mut FileSystem | &mut HostInput {
+  let output = run Path.join(&build.root, "build")
+  let cache = run Path.join(&output, "steps")
+  let configured = run Runner.make(run Path.fromBytes(Path.rawBytes(&build.root)), move cache, build.identity.asSlice())
+  let runner = move configured |> Runner.memory(build.memory) |> Runner.parallelism(build.workers)
+  let mut targets = List<StepHandle>.make()
+  let roots = build.roots.asSlice()
+  let mut at = usize.ZERO
+  while at < roots.length { run targets.append(roots[at].step.copy())
+    at = at + usize.ONE }
+  let outputs = run runner.execute(targets.asSlice(), compile)
+  let mut artifacts = List<Artifact>.make()
+  let requests = run Path.join(&output, "requests")
+  run FileSystem.createDirectoriesRecursively(&requests)
+  at = usize.ZERO
+  while at < roots.length {
+    let root = &roots[at]
+    let mut published = Option<Path>.none()
+    let cached = run Path.join(&outputs.asSlice()[at], root.name.view())
+    let mut artifact = run Path.fromBytes(Path.rawBytes(&cached))
+    if let Option<Destination>.Some {value: selected} = &root.destination {
+      let directory = run Path.join(&output, selected.directory.view())
+      artifact = run Path.join(&directory, root.name.view())
+      if compile { run Publish.artifact(&cached, &artifact) }
+      let input = run Path.join(&outputs.asSlice()[at], "request.toml")
+      let bytes = run FileSystem.readFile(&input)
+      let mut request = run SchemaToml.decode<Request>(bytes.asSlice())
+      request.output = match move Path.view(&artifact) {
+        Option<string>.Some {value} => run String.copy(value)
+        Option<string>.None => { fail StepError {message: run String.copy("the artifact output path must be UTF-8")} }
+      }
+      let encoded = run Encoding.toml<Request>(&request)
+      let destination = run Path.join(&requests, selected.request.view())
+      run FileSystem.writeFileAtomic(&destination, encoded.asSlice(), FileSystem.replaceExisting(), FileSystem.buffered())
+      published = Option<Path>.some(move destination)
+    }
+    run artifacts.append(Artifact {name: run String.copy(root.name.view()),
+      path: move artifact, request: move published})
+    at = at + usize.ONE
+  }
+  return Built {artifacts: move artifacts}
+}
+
+impl Built {
+  /// Copies completed artifacts to `directory`, preserving executable permissions.
+  /// The returned paths name the copies; their request files remain at their build locations.
+  pub effect fn write(self: Self, directory: string) -> Self ! BuildError ? &mut Allocator | &mut FileSystem | &mut HostInput {
+    let cwd = run HostInput.workingDirectory()
+    let root = run fromHost(cwd.asSlice())
+    let destination = run resolveHost(&root, directory)
+    let mut built = move self
+    let artifacts = built.artifacts.asMutSlice()
+    let mut at = usize.ZERO
+    while at < artifacts.length {
+      let artifact = &mut artifacts[at]
+      let output = run Path.join(&destination, artifact.name.view())
+      run Publish.artifact(&artifact.path, &output)
+      artifact.path = move output
+      at = at + usize.ONE
+    }
+    return move built
+  }
+}

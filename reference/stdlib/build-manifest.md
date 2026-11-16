@@ -6,7 +6,7 @@ Package identities, fetch pins, and publication settings read from `silk.toml`.
 
 Import as `Manifest` with `import silk.build.manifest { Manifest }`.
 
-Public declarations: 14.
+Public declarations: 21.
 
 <a id="Manifest"></a>
 
@@ -57,6 +57,26 @@ pub native: Option<Native>
 ```
 
 Downloaded native archives and local replacements.
+
+<a id="Manifest.component"></a>
+
+### Field `component`
+
+```silk
+pub component: Option<Component>
+```
+
+The package's WebAssembly component interface and world.
+
+<a id="Manifest.unstable"></a>
+
+### Field `unstable`
+
+```silk
+pub unstable: Option<Unstable>
+```
+
+Runtime composition declarations that travel with the package.
 
 <a id="Manifest.pack"></a>
 
@@ -139,6 +159,374 @@ Decoding discards its contents; a manifest editor must preserve the source docum
 
 ```silk
 impl Schema for Tool
+```
+
+<a id="Component"></a>
+
+## `Component`
+
+```silk
+pub struct Component
+```
+
+The interface definition and exported world of a WebAssembly component package.
+
+<a id="Component.wit"></a>
+
+### Field `wit`
+
+```silk
+pub wit: String
+```
+
+A WIT file or directory relative to this package.
+
+<a id="Component.world"></a>
+
+### Field `world`
+
+```silk
+pub world: String
+```
+
+The WIT world to compile.
+
+<a id="Component.impl.Schema"></a>
+
+## Implementation `Schema for Component`
+
+```silk
+impl Schema for Component
+```
+
+<a id="Component.impl.Schema.spec"></a>
+
+### Operation `spec`
+
+```silk
+static fn spec() -> Spec<Component>
+```
+
+<a id="Unstable"></a>
+
+## `Unstable`
+
+```silk
+pub struct Unstable
+```
+
+Experimental package declarations whose selected bindings become explicit request inputs.
+
+<a id="Unstable.composition"></a>
+
+### Field `composition`
+
+```silk
+pub composition: Option<Composition>
+```
+
+Runtime implementations, defaults, and execution-storage bindings.
+
+<a id="Unstable.impl.Schema"></a>
+
+## Implementation `Schema for Unstable`
+
+```silk
+impl Schema for Unstable
+```
+
+<a id="Unstable.impl.Schema.spec"></a>
+
+### Operation `spec`
+
+```silk
+static fn spec() -> Spec<Unstable>
+```
+
+<a id="Composition"></a>
+
+## `Composition`
+
+```silk
+pub struct Composition
+```
+
+Runtime and provider declarations available to compilations of this package.
+
+<a id="Composition.runtimes"></a>
+
+### Field `runtimes`
+
+```silk
+pub runtimes: Option<List<Runtime>>
+```
+
+Named runtime modules declared by the package.
+
+<a id="Composition.defaults"></a>
+
+### Field `defaults`
+
+```silk
+pub defaults: Option<List<String>>
+```
+
+The runtime names selected by default.
+
+<a id="Composition.components"></a>
+
+### Field `components`
+
+```silk
+pub components: Option<List<Capability>>
+```
+
+Execution-storage implementations.
+
+<a id="Composition.retention"></a>
+
+### Field `retention`
+
+```silk
+pub retention: Option<List<Retention>>
+```
+
+Declarations retained regardless of import reachability.
+
+<a id="Composition.requirements"></a>
+
+### Field `requirements`
+
+```silk
+pub requirements: Option<List<String>>
+```
+
+Reserved requirements; the current compiler accepts only an empty list.
+
+<a id="Composition.impl.Schema"></a>
+
+## Implementation `Schema for Composition`
+
+```silk
+impl Schema for Composition
+```
+
+<a id="Composition.impl.Schema.spec"></a>
+
+### Operation `spec`
+
+```silk
+static fn spec() -> Spec<Composition>
+```
+
+<a id="Composition.impl.Schema.check"></a>
+
+### Operation `check`
+
+```silk
+fn check(self: &Self, checks: &mut Checks<Self>) -> ()
+```
+
+<a id="Runtime"></a>
+
+## `Runtime`
+
+```silk
+pub struct Runtime
+```
+
+A named package runtime module.
+
+<a id="Runtime.name"></a>
+
+### Field `name`
+
+```silk
+pub name: String
+```
+
+The name a compilation selects.
+
+<a id="Runtime.module"></a>
+
+### Field `module`
+
+```silk
+pub module: String
+```
+
+The module implementing the runtime.
+
+<a id="Runtime.impl.Schema"></a>
+
+## Implementation `Schema for Runtime`
+
+```silk
+impl Schema for Runtime
+```
+
+<a id="Runtime.impl.Schema.spec"></a>
+
+### Operation `spec`
+
+```silk
+static fn spec() -> Spec<Runtime>
+```
+
+<a id="Capability"></a>
+
+## `Capability`
+
+```silk
+pub struct Capability
+```
+
+A runtime capability supplied by a complete set of declaration bindings.
+
+<a id="Capability.capability"></a>
+
+### Field `capability`
+
+```silk
+pub capability: String
+```
+
+The supported capability, `execution-storage`.
+
+<a id="Capability.bindings"></a>
+
+### Field `bindings`
+
+```silk
+pub bindings: List<StorageBinding>
+```
+
+One binding for each execution-storage operation.
+
+<a id="Capability.impl.Schema"></a>
+
+## Implementation `Schema for Capability`
+
+```silk
+impl Schema for Capability
+```
+
+<a id="Capability.impl.Schema.spec"></a>
+
+### Operation `spec`
+
+```silk
+static fn spec() -> Spec<Capability>
+```
+
+<a id="Capability.impl.Schema.check"></a>
+
+### Operation `check`
+
+```silk
+fn check(self: &Self, checks: &mut Checks<Self>) -> ()
+```
+
+<a id="StorageBinding"></a>
+
+## `StorageBinding`
+
+```silk
+pub struct StorageBinding
+```
+
+One operation supplied by an execution-storage implementation.
+
+<a id="StorageBinding.operation"></a>
+
+### Field `operation`
+
+```silk
+pub operation: String
+```
+
+The operation: create, acquire, release, or destroy.
+
+<a id="StorageBinding.module"></a>
+
+### Field `module`
+
+```silk
+pub module: String
+```
+
+The module declaring the implementation.
+
+<a id="StorageBinding.declaration"></a>
+
+### Field `declaration`
+
+```silk
+pub declaration: String
+```
+
+The implementation's declaration name.
+
+<a id="StorageBinding.impl.Schema"></a>
+
+## Implementation `Schema for StorageBinding`
+
+```silk
+impl Schema for StorageBinding
+```
+
+<a id="StorageBinding.impl.Schema.spec"></a>
+
+### Operation `spec`
+
+```silk
+static fn spec() -> Spec<StorageBinding>
+```
+
+<a id="Retention"></a>
+
+## `Retention`
+
+```silk
+pub struct Retention
+```
+
+A declaration kept even when no ordinary source import reaches it.
+
+<a id="Retention.module"></a>
+
+### Field `module`
+
+```silk
+pub module: String
+```
+
+The module declaring the retained value or function.
+
+<a id="Retention.declaration"></a>
+
+### Field `declaration`
+
+```silk
+pub declaration: String
+```
+
+The declaration name.
+
+<a id="Retention.impl.Schema"></a>
+
+## Implementation `Schema for Retention`
+
+```silk
+impl Schema for Retention
+```
+
+<a id="Retention.impl.Schema.spec"></a>
+
+### Operation `spec`
+
+```silk
+static fn spec() -> Spec<Retention>
 ```
 
 <a id="Package"></a>

@@ -1,0 +1,718 @@
+//! Build steps, their declared inputs, and values resolved only by the graph runner.
+
+import silk.build.encoding as Encoding
+import silk.build.fingerprint as Fingerprint
+import silk.build.execution { Pending, Work }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.concurrency.sync { Arc, Mutex }
+import silk.concurrency.thread { Transferable }
+import silk.concurrency.fiber { Cancelled }
+import silk.concurrency.thread_native { SpawnError }
+import silk.concurrency.thread_pool { PoolFiber, ThreadPool }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.crypto.sha2 { Sha256 }
+import silk.io.writer { Writer, WriterError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.layout { Layout }
+import silk.mem.pointer { Pointer }
+import silk.core.reflect { Reflect }
+import silk.schema.issue { SchemaError }
+import silk.schema.json { SchemaJson }
+import silk.schema.schema { Schema }
+import silk.system.child_process { ChildProcess, ProcessError, ProcessOutcome }
+import silk.system.child_process_native { OsChildProcess }
+import silk.system.file_lock { FileLock }
+import silk.system.filesystem { AtomicWriteError, FileError, FileSystem, Path }
+import silk.system.filesystem_machine { MachineFileSystem }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.text.format { Debug, Format, Formatter }
+import silk.text.string { String }
+import silk.num.usize
+import silk.num.u64
+
+/// A build graph or step violated its declared input or output contract.
+pub struct StepError {
+  /// The diagnostic describing the refused operation.
+  pub message: String,
+}
+
+impl Debug for StepError {
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return run Format.writeText(&mut formatter, self.message.view())
+  }
+}
+
+/// Failures preserved by the build runner and its file, process, and serialization operations.
+pub type StepFailure = StepError | AtomicWriteError | FileError | ProcessError | HostInputError | SchemaError | WriterError | OutOfMemoryError
+
+effect fn refused(message: string) -> never ! StepError | OutOfMemoryError ? &mut Allocator {
+  fail StepError {message: run String.copy(message)}
+}
+
+union Reference {
+  Source {path: String, external: bool},
+  Value {bytes: Bytes},
+  Output {step: StepHandle, name: String},
+}
+
+/// A typed reference to a source, a known value, or a step result. Only `Make` resolves it.
+pub struct Deferred<T> {
+  reference: Reference,
+  owner: [T; 0],
+}
+
+impl<T> Deferred<T> {
+  /// Retains a deferred reference without evaluating it or starting its producer.
+  pub effect fn copy(self: &Self) -> Self ! OutOfMemoryError ? &mut Allocator {
+    return Deferred<T> {reference: run copyReference(&self.reference), owner: []}
+  }
+}
+
+impl<T> Deferred<T> {
+  /// Names a path relative to the package root. The runner refuses paths that leave that root.
+  pub effect fn source(path: string) -> Deferred<Path> ! OutOfMemoryError ? &mut Allocator {
+    return Deferred<Path> {reference: Reference.Source {path: run String.copy(path), external: false}, owner: []}
+  }
+
+  /// Names an explicitly supplied absolute host path.
+  pub effect fn external(path: string) -> Deferred<Path> ! OutOfMemoryError ? &mut Allocator {
+    return Deferred<Path> {reference: Reference.Source {path: run String.copy(path), external: true}, owner: []}
+  }
+}
+
+impl<T: Schema> Deferred<T> {
+  /// Captures a known value without exposing a way to read deferred results while constructing the graph.
+  pub effect fn value(value: T) -> Self ! StepFailure ? &mut Allocator {
+    return Deferred<T> {reference: Reference.Value {bytes: run Encoding.json<T>(&value)}, owner: []}
+  }
+
+  /// Applies a noncapturing pure function when the graph resolves this value.
+  /// The function's type and the task executable identify its code in the key.
+  pub effect fn map<U: Schema + Transferable + 'static, F: fn<'static>(T) -> U + Transferable + 'static>(
+    self: Self, transform: F
+  ) -> Deferred<U> ! StepFailure ? &mut Allocator {
+    static if Layout.of<F>().bytes != 0 {
+      compileError("Deferred.map requires a noncapturing function; declare captured data as a deferred input")
+    }
+    let step = run Step.register(Mapped<T, U, F> {input: move self, transform: move transform, result: []})
+    return run step.value<U>()
+  }
+}
+
+struct Mapped<T, U, F> {input: Deferred<T>, transform: F, result: [U; 0]}
+
+impl<T: Schema, U: Schema, F: fn<'static>(T) -> U> Step for Mapped<T, U, F> {
+  effect fn key(self: &Self, key: &mut Key) -> () ! StepFailure ? &mut Allocator {
+    return run key.value(&self.input)
+  }
+  effect fn make(self: &Self, make: &mut Make) -> () ! StepFailure ? &mut Allocator {
+    let value = run make.get<T>(&self.input)
+    let mapped = (self.transform)(move value)
+    return run make.value<U>(&mapped)
+  }
+}
+
+effect fn copyReference(reference: &Reference) -> Reference ! OutOfMemoryError ? &mut Allocator {
+  return match &reference.* {
+    Reference.Source {path, external} => Reference.Source {path: run String.copy(path.view()), external: external}
+    Reference.Value {bytes} => Reference.Value {bytes: run Bytes.copy(bytes.asSlice())}
+    Reference.Output {step, name} => Reference.Output {step: step.copy(), name: run String.copy(name.view())}
+  }
+}
+
+fn sameBytes(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn sameReference(left: &Reference, right: &Reference) -> bool {
+  return match &left.* {
+    Reference.Source {path, external} => match &right.* {
+      Reference.Source {path: other, external: host} => path.view() == other.view() && external == host
+      _ => false
+    }
+    Reference.Value {bytes} => match &right.* {
+      Reference.Value {bytes: other} => sameBytes(bytes.asSlice(), other.asSlice())
+      _ => false
+    }
+    Reference.Output {step, name} => match &right.* {
+      Reference.Output {step: other, name: path} => step.identity() == other.identity() && name.view() == path.view()
+      _ => false
+    }
+  }
+}
+
+enum InputKind { File, Tree, Package, Value }
+struct Input {reference: Reference, kind: InputKind}
+
+/// The complete inputs of a step. Its methods record inputs without reading files or running work.
+pub struct Key {
+  material: Bytes,
+  inputs: List<Input>,
+  variables: List<String>,
+  volatile: bool,
+}
+
+impl Key {
+  fn make() -> Self {
+    return Key {material: Bytes.make(), inputs: List<Input>.make(), variables: List<String>.make(), volatile: false}
+  }
+
+  /// Adds bytes with a length prefix so adjacent values cannot collide.
+  pub effect fn bytes(self: &mut Self, value: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut length = usize.toU64(value.length)
+    let mut at = usize.ZERO
+    while at < 8 {
+      run self.material.append(&[u64.toU8(length % 256)])
+      length = length / 256
+      at = at + usize.ONE
+    }
+    return run self.material.append(value)
+  }
+
+  /// Adds text to the step's identity.
+  pub effect fn text(self: &mut Self, value: string) -> () ! OutOfMemoryError ? &mut Allocator {
+    return run self.bytes(String.utf8Bytes(value))
+  }
+
+  /// Declares one readable file; its bytes or producer key participate in this step's key.
+  pub effect fn file(self: &mut Self, value: &Deferred<Path>) -> () ! OutOfMemoryError ? &mut Allocator {
+    return run self.inputs.append(Input {reference: run copyReference(&value.reference), kind: InputKind.File})
+  }
+
+  /// Declares a readable directory tree, including its names and file contents.
+  pub effect fn tree(self: &mut Self, value: &Deferred<Path>) -> () ! OutOfMemoryError ? &mut Allocator {
+    return run self.inputs.append(Input {reference: run copyReference(&value.reference), kind: InputKind.Tree})
+  }
+
+  /// Declares package contents, excluding the root `build` directory and `.git` metadata.
+  /// Generated inputs below `build` must be declared separately through their producer.
+  pub effect fn packageTree(self: &mut Self, value: &Deferred<Path>) -> () ! OutOfMemoryError ? &mut Allocator {
+    return run self.inputs.append(Input {reference: run copyReference(&value.reference), kind: InputKind.Package})
+  }
+
+  /// Declares a typed value; a produced value contributes its producer key before it exists.
+  pub effect fn value<T>(self: &mut Self, value: &Deferred<T>) -> () ! OutOfMemoryError ? &mut Allocator {
+    return run self.inputs.append(Input {reference: run copyReference(&value.reference), kind: InputKind.Value})
+  }
+
+  /// Declares an environment variable. Its presence and value enter the key and the child environment.
+  pub effect fn environment(self: &mut Self, name: string) -> () ! OutOfMemoryError ? &mut Allocator {
+    return run self.variables.append(run String.copy(name))
+  }
+
+  /// Runs this step and every consumer on every invocation, even when their keys are unchanged.
+  pub fn always(self: &mut Self) -> () { self.volatile = true }
+}
+
+/// Work a root task explicitly adds to its build graph. Package plans cannot introduce custom implementations.
+pub interface Step {
+  /// Records everything the work reads. It must perform no filesystem or process operations.
+  effect fn key(self: &Self, key: &mut Key) -> () ! StepFailure ? &mut Allocator
+  /// Produces the outputs through `Make`, which rejects undeclared file and value inputs.
+  effect fn make(self: &Self, make: &mut Make) -> () ! StepFailure ? &mut Allocator
+  /// The estimated peak memory, used to bound concurrently running steps. Defaults to 256 MiB.
+  fn memory(self: &Self) -> u64 { return 268435456 }
+  /// Whether this step writes a compilation request and can stop before invoking the compiler.
+  fn compilation(self: &Self) -> bool { return false }
+}
+
+struct Node {
+  key: Key,
+  memory: u64,
+  compilation: bool,
+  work: Mutex<Option<Pending<Resolved, (), StepFailure>>>,
+}
+
+/// An owned step registered in a graph. Several deferred outputs may retain the same step.
+pub struct StepHandle {node: Arc<Node>}
+
+impl StepHandle {
+  /// Retains the step without copying or running its work.
+  pub fn copy(self: &Self) -> Self { return StepHandle {node: self.node.clone()} }
+
+  fn identity(self: &Self) -> usize { return Pointer.address<Node>(Pointer.fromRef<Node>(self.node.get())) }
+
+  /// Names one file that this step will produce. The path must stay below its output directory.
+  pub effect fn output(self: &Self, name: string) -> Deferred<Path> ! StepError | OutOfMemoryError ? &mut Allocator {
+    if !contained(name) || name == ".complete" { run refused("a step output must be a relative path without . or .. segments") }
+    return Deferred<Path> {reference: Reference.Output {step: self.copy(), name: run String.copy(name)}, owner: []}
+  }
+
+  /// Names the typed value published by `Make.value` during this step.
+  pub effect fn value<T: Schema>(self: &Self) -> Deferred<T> ! OutOfMemoryError ? &mut Allocator {
+    return Deferred<T> {reference: Reference.Output {step: self.copy(), name: run String.copy(".value.json")}, owner: []}
+  }
+}
+
+impl Step {
+  /// Takes ownership of custom work and records its key without running it. Outputs retain this handle.
+  pub effect fn register<T: Step + Transferable + 'static>(step: T) -> StepHandle ! StepFailure ? &mut Allocator {
+    let mut key = Key.make()
+    run key.text(Reflect.typeName<T>())
+    run Step.key(&step, &mut key)
+    let memory = Step.memory(&step)
+    let compilation = Step.compilation(&step)
+    let work = run Pending<Resolved, (), StepFailure>.make(Body<T> {step: move step})
+    return StepHandle {node: run Arc<Node>.make(Node {key: move key, memory: memory, compilation: compilation,
+      work: run Mutex<Option<Pending<Resolved, (), StepFailure>>>.make(Option<Pending<Resolved, (), StepFailure>>.some(move work))})}
+  }
+
+  /// Names an output of registered work, creating its dependency edge without running it.
+  pub effect fn output(step: &StepHandle, name: string) -> Deferred<Path> ! StepError | OutOfMemoryError ? &mut Allocator {
+    return run step.output(name)
+  }
+}
+
+struct Variable {name: String, value: Option<Bytes>}
+struct ResolvedInput {reference: Reference, kind: InputKind, path: Option<Path>, bytes: Option<Bytes>}
+struct Resolved {root: Path, output: Path, inputs: List<ResolvedInput>, environment: List<Variable>, compile: bool}
+struct Body<T> {step: T}
+
+impl<T: Step> Work<Resolved, (), StepFailure> for Body<T> {
+  effect fn perform(self: Self, context: Resolved) -> () ! StepFailure {
+    let mut allocator = Allocator.systemAllocatorProvider()
+    return run perform<T>(move self.step, move context) |> Effect.provideMut<Allocator>(&mut allocator)
+  }
+}
+
+effect fn perform<T: Step>(step: T, context: Resolved) -> () ! StepFailure ? &mut Allocator {
+  let mut make = Make {resolved: move context, files: run MachineFileSystem.make(), process: OsChildProcess.make()}
+  return run Step.make(&step, &mut make)
+}
+
+/// The resolved inputs and output directory visible only while a step runs.
+pub struct Make {
+  resolved: Resolved,
+  files: MachineFileSystem,
+  process: OsChildProcess,
+}
+
+fn contained(path: string) -> bool {
+  let bytes = String.utf8Bytes(path)
+  if bytes.length == usize.ZERO { return false }
+  let mut start = usize.ZERO
+  let mut at = usize.ZERO
+  while at <= bytes.length {
+    if at == bytes.length || bytes[at] == 47 {
+      let length = at - start
+      if length == usize.ZERO || (length == 1 && bytes[start] == 46)
+        || (length == 2 && bytes[start] == 46 && bytes[start + 1] == 46) { return false }
+      start = at + usize.ONE
+    } else if bytes[at] == 0 || bytes[at] == 92 { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+impl Make {
+  /// Reads one relative child of a directory declared with `Key.tree`.
+  pub effect fn readWithin(self: &mut Self, tree: &Deferred<Path>, name: string) -> Bytes ! StepFailure ? &mut Allocator {
+    if !contained(name) { run refused("a tree input must stay inside its declared directory") }
+    let inputs = self.resolved.inputs.asSlice()
+    let mut at = usize.ZERO
+    while at < inputs.length {
+      if (inputs[at].kind == InputKind.Tree || inputs[at].kind == InputKind.Package) && sameReference(&inputs[at].reference, &tree.reference) {
+        if inputs[at].kind == InputKind.Package && (name == "build" || name == ".git"
+          || String.startsWith(name, "build/") || String.startsWith(name, ".git/")) {
+          run refused("generated files and version-control metadata are not package source inputs")
+        }
+        if let Option<Path>.Some {value: base} = &inputs[at].path {
+          let path = run Path.join(&base, name)
+          return run FileSystem.readFile(&path) |> Effect.provideMut<FileSystem>(&mut self.files)
+        }
+      }
+      at = at + usize.ONE
+    }
+    run refused("the step did not declare this directory tree in its key")
+  }
+
+  /// Verifies that a process wrote a declared output before the runner publishes its cache entry.
+  pub effect fn requireOutput(self: &mut Self, name: string) -> () ! StepFailure ? &mut Allocator {
+    let path = run self.output(name)
+    if !run FileSystem.exists(&path) |> Effect.provideMut<FileSystem>(&mut self.files) {
+      run refused("the process did not write a declared output")
+    }
+  }
+
+  /// Resolves a file previously declared with `Key.file` or `Key.tree`.
+  pub effect fn path(self: &Self, value: &Deferred<Path>) -> Path ! StepFailure ? &mut Allocator {
+    let inputs = self.resolved.inputs.asSlice()
+    let mut at = usize.ZERO
+    while at < inputs.length {
+      if inputs[at].kind != InputKind.Value && sameReference(&inputs[at].reference, &value.reference) {
+        if let Option<Path>.Some {value: path} = &inputs[at].path { return run Path.fromBytes(Path.rawBytes(&path)) }
+      }
+      at = at + usize.ONE
+    }
+    run refused("the step did not declare this file in its key")
+  }
+
+  /// Reads a file previously declared in the key; undeclared access fails before opening a file.
+  pub effect fn read(self: &mut Self, value: &Deferred<Path>) -> Bytes ! StepFailure ? &mut Allocator {
+    let path = run self.path(value)
+    return run FileSystem.readFile(&path) |> Effect.provideMut<FileSystem>(&mut self.files)
+  }
+
+  /// Resolves a typed value previously declared with `Key.value`.
+  pub effect fn get<T: Schema>(self: &mut Self, value: &Deferred<T>) -> T ! StepFailure ? &mut Allocator {
+    let inputs = self.resolved.inputs.asSlice()
+    let mut at = usize.ZERO
+    while at < inputs.length {
+      if inputs[at].kind == InputKind.Value && sameReference(&inputs[at].reference, &value.reference) {
+        if let Option<Bytes>.Some {value: bytes} = &inputs[at].bytes { return run SchemaJson.decode<T>(bytes.asSlice()) }
+        if let Option<Path>.Some {value: path} = &inputs[at].path {
+          let bytes = run FileSystem.readFile(&path) |> Effect.provideMut<FileSystem>(&mut self.files)
+          return run SchemaJson.decode<T>(bytes.asSlice())
+        }
+      }
+      at = at + usize.ONE
+    }
+    run refused("the step did not declare this value in its key")
+  }
+
+  /// Returns a path below this step's output directory, refusing traversal and absolute names.
+  pub effect fn output(self: &Self, name: string) -> Path ! StepFailure ? &mut Allocator {
+    if !contained(name) || name == ".complete" { run refused("a step output must stay inside its output directory") }
+    return run Path.join(&self.resolved.output, name)
+  }
+
+  /// Writes a file below this step's output directory, creating its parent directories.
+  pub effect fn write(self: &mut Self, name: string, bytes: &[u8]) -> () ! StepFailure ? &mut Allocator {
+    let path = run self.output(name)
+    if let Option<Path>.Some {value: parent} = move run Path.parent(&path) {
+      run FileSystem.createDirectoriesRecursively(&parent) |> Effect.provideMut<FileSystem>(&mut self.files)
+    }
+    return run FileSystem.writeFile(&path, bytes) |> Effect.provideMut<FileSystem>(&mut self.files)
+  }
+
+  /// Publishes this step's typed result for deferred consumers.
+  pub effect fn value<T: Schema>(self: &mut Self, value: &T) -> () ! StepFailure ? &mut Allocator {
+    let encoded = run Encoding.json<T>(value)
+    return run self.write(".value.json", encoded.asSlice())
+  }
+
+  /// Executes a declared program in the output directory with only the keyed environment.
+  pub effect fn exec(self: &mut Self, program: &Deferred<Path>, arguments: &[string]) -> ProcessOutcome ! StepFailure ? &mut Allocator {
+    let executable = run self.path(program)
+    let mut request = run ChildProcess.requestWithin(&executable, &self.resolved.output)
+    let mut at = usize.ZERO
+    while at < arguments.length {
+      run ChildProcess.addArgument(&mut request, arguments[at])
+      at = at + usize.ONE
+    }
+    let environment = self.resolved.environment.asSlice()
+    at = usize.ZERO
+    while at < environment.length {
+      if let Option<Bytes>.Some {value} = &environment[at].value {
+        run ChildProcess.setVariableBytes(&mut request, String.ownedUtf8Bytes(&environment[at].name), value.asSlice())
+      }
+      at = at + usize.ONE
+    }
+    return run ChildProcess.submit(&request) |> Effect.provideMut<ChildProcess>(&mut self.process)
+  }
+
+  /// Whether this compilation should invoke the compiler after writing its request.
+  pub fn shouldCompile(self: &Self) -> bool { return self.resolved.compile }
+}
+
+struct Prepared {
+  step: StepHandle,
+  digest: [u8; 32],
+  output: Path,
+  dependencies: List<usize>,
+  context: Option<Resolved>,
+  volatile: bool,
+  complete: bool,
+}
+
+/// Executes an immutable graph with content-verified caching and bounded worker memory.
+pub struct Runner {
+  root: Path,
+  cache: Path,
+  identity: Bytes,
+  budget: u64,
+  workers: usize,
+}
+
+impl Runner {
+  /// Sets the package root, cache directory, and identity of the task program and compiler.
+  /// The caller must include both executables' content digests in `identity`.
+  pub effect fn make(root: Path, cache: Path, identity: &[u8]) -> Self
+  ! OutOfMemoryError ? &mut Allocator {
+    return Runner {root: move root, cache: move cache, identity: run Bytes.copy(identity), budget: 4294967296, workers: 4}
+  }
+
+  /// Limits the sum of running steps' memory estimates. A step larger than the budget runs alone.
+  pub fn memory(self: Self, bytes: u64) -> Self {
+    let mut runner = move self
+    runner.budget = bytes
+    return move runner
+  }
+
+  /// Limits the number of worker fibers; zero selects one worker.
+  pub fn parallelism(self: Self, workers: usize) -> Self {
+    let mut runner = move self
+    runner.workers = if workers == usize.ZERO { usize.ONE } else { workers }
+    return move runner
+  }
+
+  /// Computes every key before starting work, then runs only the requested steps and their inputs.
+  /// When `compile` is false, requested compilations write requests while prerequisite tools build.
+  pub effect fn execute(self: &Self, targets: &[StepHandle], compile: bool) -> List<Path>
+  ! StepFailure | SpawnError | Cancelled ? &mut Allocator | &mut FileSystem | &mut HostInput {
+    let mut prepared = List<Prepared>.make()
+    let mut roots = List<usize>.make()
+    let mut at = usize.ZERO
+    while at < targets.length {
+      run roots.append(run prepareStep(self, &targets[at], &mut prepared))
+      at = at + usize.ONE
+    }
+    if !compile {
+      let selected = roots.asSlice()
+      at = usize.ZERO
+      while at < selected.length {
+        let prerequisite = isDependency(&prepared, selected[at])
+        let item = &mut prepared.asMutSlice()[selected[at]]
+        if item.step.node.get().compilation && !prerequisite {
+          if let Option<Resolved>.Some {value} = &mut item.context { value.compile = false }
+        }
+        at = at + usize.ONE
+      }
+    }
+    let threads = run ThreadPool.make(self.workers)
+    let pool = threads.pool()
+    let mut remaining = prepared.length()
+    while remaining > usize.ZERO {
+      let mut selected = List<usize>.make()
+      let mut cost: u64 = 0
+      at = usize.ZERO
+      while at < prepared.length() && selected.length() < self.workers {
+        let item = &prepared.asSlice()[at]
+        if !item.complete && dependenciesComplete(&prepared, item.dependencies.asSlice()) {
+          let needed = item.step.node.get().memory
+          if selected.length() == usize.ZERO || (needed <= self.budget && cost <= self.budget - needed) {
+            run selected.append(at)
+            cost = if needed > self.budget { self.budget } else { cost + needed }
+          }
+        }
+        at = at + usize.ONE
+      }
+      if selected.length() == usize.ZERO { run refused("the build graph contains a dependency cycle") }
+      let mut running = List<PoolFiber<(), StepFailure>>.make()
+      let batch = selected.asSlice()
+      at = usize.ZERO
+      while at < batch.length {
+        let item = &mut prepared.asMutSlice()[batch[at]]
+        let context = Intrinsic.replace(item.context, Option<Resolved>.none())
+        let resolved = match move context {
+          Option<Resolved>.Some {value} => move value
+          Option<Resolved>.None => { run refused("a build step has already been consumed") }
+        }
+        run running.append(run pool.fork(executeStep(item.step.copy(), move resolved, item.volatile)))
+        at = at + usize.ONE
+      }
+      run pool.block(joinSteps(move running))
+      at = usize.ZERO
+      while at < batch.length {
+        let item = &mut prepared.asMutSlice()[batch[at]]
+        item.complete = true
+        remaining = remaining - usize.ONE
+        at = at + usize.ONE
+      }
+    }
+    let mut outputs = List<Path>.make()
+    let selected = roots.asSlice()
+    at = usize.ZERO
+    while at < selected.length {
+      run outputs.append(run Path.fromBytes(Path.rawBytes(&prepared.asSlice()[selected[at]].output)))
+      at = at + usize.ONE
+    }
+    return move outputs
+  }
+}
+
+fn isDependency(prepared: &List<Prepared>, index: usize) -> bool {
+  let items = prepared.asSlice()
+  let mut at = usize.ZERO
+  while at < items.length {
+    let dependencies = items[at].dependencies.asSlice()
+    let mut edge = usize.ZERO
+    while edge < dependencies.length {
+      if dependencies[edge] == index { return true }
+      edge = edge + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn dependenciesComplete(prepared: &List<Prepared>, dependencies: &[usize]) -> bool {
+  let mut at = usize.ZERO
+  while at < dependencies.length {
+    if !prepared.asSlice()[dependencies[at]].complete { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+effect fn prepareStep(runner: &Runner, step: &StepHandle, prepared: &mut List<Prepared>) -> usize
+! StepFailure ? &mut Allocator | &mut FileSystem | &mut HostInput {
+  let mut at = usize.ZERO
+  while at < prepared.length() {
+    if prepared.asSlice()[at].step.identity() == step.identity() { return at }
+    at = at + usize.ONE
+  }
+  let node = step.node.get()
+  let mut hash = Sha256.make()
+  Fingerprint.field(&mut hash, b"silk-build-step-v1")
+  Fingerprint.field(&mut hash, runner.identity.asSlice())
+  Fingerprint.field(&mut hash, Path.rawBytes(&runner.root))
+  Fingerprint.field(&mut hash, node.key.material.asSlice())
+  let mut dependencies = List<usize>.make()
+  let mut inputs = List<ResolvedInput>.make()
+  let mut volatile = node.key.volatile
+  let declared = node.key.inputs.asSlice()
+  at = usize.ZERO
+  while at < declared.length {
+    let input = &declared[at]
+    Fingerprint.field(&mut hash, match input.kind {
+      InputKind.File => b"file"
+      InputKind.Tree => b"tree"
+      InputKind.Package => b"package"
+      InputKind.Value => b"value"
+    })
+    let mut path = Option<Path>.none()
+    let mut bytes = Option<Bytes>.none()
+    match &input.reference {
+      Reference.Source {path: source, external} => {
+        if input.kind == InputKind.Value { run refused("a source path cannot be a typed value") }
+        let resolved = if external { run Path.make(source.view()) } else {
+          if source.view() != "." && !contained(source.view()) { run refused("a source path must stay below the package root") }
+          run Path.resolve(&runner.root, source.view())
+        }
+        Fingerprint.field(&mut hash, Path.rawBytes(&resolved))
+        if input.kind == InputKind.File {
+          let contents = run FileSystem.readFile(&resolved)
+          Fingerprint.field(&mut hash, contents.asSlice())
+        } else if input.kind == InputKind.Package {
+          run Fingerprint.package(&mut hash, &resolved)
+        } else {
+          run Fingerprint.path(&mut hash, &resolved, false)
+        }
+        path = Option<Path>.some(move resolved)
+      }
+      Reference.Value {bytes: known} => {
+        if input.kind != InputKind.Value { run refused("a known value cannot be used as a file") }
+        Fingerprint.field(&mut hash, known.asSlice())
+        bytes = Option<Bytes>.some(run Bytes.copy(known.asSlice()))
+      }
+      Reference.Output {step: producer, name} => {
+        let index = run prepareStep(runner, &producer, &mut prepared)
+        let dependency = &prepared.asSlice()[index]
+        Fingerprint.field(&mut hash, &dependency.digest)
+        Fingerprint.field(&mut hash, String.ownedUtf8Bytes(&name))
+        path = Option<Path>.some(run Path.join(&dependency.output, name.view()))
+        volatile = volatile || dependency.volatile
+        run dependencies.append(index)
+      }
+    }
+    run inputs.append(ResolvedInput {reference: run copyReference(&input.reference), kind: input.kind,
+      path: move path, bytes: move bytes})
+    at = at + usize.ONE
+  }
+  let mut environment = List<Variable>.make()
+  let names = node.key.variables.asSlice()
+  at = usize.ZERO
+  while at < names.length {
+    let value = run HostInput.variableNamed(names[at].view())
+    Fingerprint.field(&mut hash, String.ownedUtf8Bytes(&names[at]))
+    match &value {
+      Option<Bytes>.Some {value: present} => {
+        Fingerprint.field(&mut hash, b"present")
+        Fingerprint.field(&mut hash, present.asSlice())
+      }
+      Option<Bytes>.None => Fingerprint.field(&mut hash, b"absent")
+    }
+    run environment.append(Variable {name: run String.copy(names[at].view()), value: move value})
+    at = at + usize.ONE
+  }
+  let digest = hash.finish()
+  at = usize.ZERO
+  while at < prepared.length() {
+    if sameBytes(&prepared.asSlice()[at].digest, &digest) { return at }
+    at = at + usize.ONE
+  }
+  let name = run Fingerprint.name(&digest)
+  let output = run Path.join(&runner.cache, name.view())
+  let context = Resolved {root: run Path.fromBytes(Path.rawBytes(&runner.root)),
+    output: run Path.fromBytes(Path.rawBytes(&output)), inputs: move inputs, environment: move environment, compile: true}
+  let index = prepared.length()
+  run prepared.append(Prepared {step: step.copy(), digest: digest, output: move output,
+    dependencies: move dependencies, context: Option<Resolved>.some(move context), volatile: volatile, complete: false})
+  return index
+}
+
+effect fn joinSteps(fibers: List<PoolFiber<(), StepFailure>>) -> () ! StepFailure | Cancelled {
+  let mut remaining = move fibers
+  while remaining.length() > usize.ZERO {
+    let fiber = remaining.remove(usize.ZERO)
+    run fiber.join()
+  }
+}
+
+effect fn executeStep(step: StepHandle, context: Resolved, volatile: bool) -> () ! StepFailure {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut files = run MachineFileSystem.make() |> Effect.provideMut<Allocator>(&mut allocator)
+  return run executeStepWithFiles(move step, move context, volatile)
+    |> Effect.provideMut<FileSystem>(&mut files) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn executeStepWithFiles(step: StepHandle, context: Resolved, volatile: bool) -> ()
+! StepFailure ? &mut Allocator | &mut FileSystem {
+  let output = run Path.fromBytes(Path.rawBytes(&context.output))
+  let parent = match move run Path.parent(&output) {
+    Option<Path>.Some {value} => move value
+    Option<Path>.None => { run refused("the build cache must have a parent directory") }
+  }
+  run FileSystem.createDirectoriesRecursively(&parent)
+  let mut lockName = run String.copy(match move Path.name(&output) {
+    Option<string>.Some {value} => value
+    Option<string>.None => { run refused("the build cache directory name must be UTF-8") }
+  })
+  run lockName.append(".lock")
+  let lockPath = run Path.join(&parent, lockName.view())
+  let _held = run FileLock.exclusive(&lockPath)
+  let marker = run Path.join(&output, ".complete")
+  let exists = run FileSystem.exists(&marker)
+  if exists && !volatile {
+    let previous = run FileSystem.readFile(&marker)
+    let mut hash = Sha256.make()
+    run Fingerprint.path(&mut hash, &output, true)
+    let digest = hash.finish()
+    if sameBytes(previous.asSlice(), &digest) { return () }
+  }
+  if run FileSystem.exists(&output) { run FileSystem.removeDirectoryRecursively(&output) }
+  run FileSystem.createDirectoriesRecursively(&output)
+  let publish = context.compile || !step.node.get().compilation
+  let mut held = step.node.get().work.lock()
+  let work = Intrinsic.replace(held.getMut().*, Option<Pending<Resolved, (), StepFailure>>.none())
+  drop held
+  match move work {
+    Option<Pending<Resolved, (), StepFailure>>.Some {value} => { run value.execute(move context) }
+    Option<Pending<Resolved, (), StepFailure>>.None => { run refused("a build step can only execute once; construct a new graph for another build") }
+  }
+  if publish {
+    let mut hash = Sha256.make()
+    run Fingerprint.path(&mut hash, &output, true)
+    let digest = hash.finish()
+    run FileSystem.writeFile(&marker, &digest)
+  }
+}

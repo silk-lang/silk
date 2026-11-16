@@ -1,0 +1,211 @@
+//! Compilations as build steps that write explicit requests before invoking the compiler.
+
+import silk.build.encoding as Encoding
+import silk.build.request { Request }
+import silk.build.step { Deferred, Key, Make, Step, StepError, StepFailure, StepHandle }
+import silk.concurrency.sync { Mutex }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.text.string { InvalidUtf8 }
+import silk.mem.allocator { Allocator }
+import silk.system.child_process { ChildProcess }
+import silk.system.filesystem { Path }
+import silk.text.string { String }
+import silk.num.usize
+
+struct State {
+  request: Option<Request>,
+  compiler: Option<Deferred<Path>>,
+  registered: Option<StepHandle>,
+}
+
+/// A compilation whose settings freeze when its artifact is first used by the graph.
+pub struct Compilation {
+  state: Mutex<State>,
+  name: String,
+  requestName: String,
+  directory: String,
+}
+
+impl Compilation {
+  /// Applies `transform` when `condition` is true, returning the original value otherwise.
+  pub effect fn when<'env, E, ?R>(self: Self, condition: bool,
+    transform: once effect fn<'env>(Self) -> Self ! E ? R) -> Self ! E ? R {
+    if condition { return run transform(move self) }
+    return move self
+  }
+
+  /// Creates a compilation from fully resolved inputs. The graph assigns its output directory.
+  pub effect fn fromRequest(request: Request, compiler: Deferred<Path>) -> Self ! StepFailure ? &mut Allocator {
+    let name = run artifactFile(&request)
+    let mode = if request.profile.optimization.view() == "none" { "dev" }
+      else if request.profile.optimization.view() == "size" { "size" } else { "release" }
+    let mut directory = run String.copy(request.profile.target.view())
+    run directory.append("/")
+    run directory.append(mode)
+    let mut requestName = run String.copy(request.name.view())
+    run requestName.append(".")
+    run requestName.append(request.profile.target.view())
+    run requestName.append(".")
+    run requestName.append(mode)
+    run requestName.append(".toml")
+    return Compilation {name: move name, requestName: move requestName, directory: move directory, state: run Mutex<State>.make(State {
+      request: Option<Request>.some(move request), compiler: Option<Deferred<Path>>.some(move compiler),
+      registered: Option<StepHandle>.none()})}
+  }
+
+  /// Registers the compilation once, freezing its settings and retaining its typed work.
+  pub effect fn step(self: &Self) -> StepHandle ! StepFailure ? &mut Allocator {
+    let mut held = self.state.lock()
+    let state = held.getMut()
+    if let Option<StepHandle>.Some {value} = &state.registered { return value.copy() }
+    let request = match move Intrinsic.replace(state.request, Option<Request>.none()) {
+      Option<Request>.Some {value} => move value
+      Option<Request>.None => { fail StepError {message: run String.copy("the compilation has already been consumed")} }
+    }
+    let compiler = match move Intrinsic.replace(state.compiler, Option<Deferred<Path>>.none()) {
+      Option<Deferred<Path>>.Some {value} => move value
+      Option<Deferred<Path>>.None => { fail StepError {message: run String.copy("the compilation has no compiler")} }
+    }
+    let encoded = run Encoding.json<Request>(&request)
+    let work = CompilerStep {request: run Mutex<Option<Request>>.make(Option<Request>.some(move request)),
+      compiler: move compiler, encoded: move encoded, outputName: run String.copy(self.name.view())}
+    let step = run Step.register(move work)
+    state.registered = Option<StepHandle>.some(step.copy())
+    return move step
+  }
+
+  /// Returns the artifact's deferred path; consuming it adds this compilation as a dependency.
+  pub effect fn artifact(self: &Self) -> Deferred<Path> ! StepFailure ? &mut Allocator {
+    let step = run self.step()
+    return run step.output(self.name.view())
+  }
+
+  /// Returns the stable request filename for this artifact, target, and optimization mode.
+  pub fn requestFile(self: &Self) -> string { return self.requestName.view() }
+
+  /// Returns the compilation's artifact name, without resolving or running it.
+  pub fn artifactName(self: &Self) -> string { return self.name.view() }
+
+  /// Returns the target and mode directory below the workspace's build output.
+  pub fn outputDirectory(self: &Self) -> string { return self.directory.view() }
+}
+
+import silk.collections.bytes { Bytes }
+struct CompilerStep {request: Mutex<Option<Request>>, compiler: Deferred<Path>, encoded: Bytes, outputName: String}
+
+impl Step for CompilerStep {
+  effect fn key(self: &Self, key: &mut Key) -> () ! StepFailure ? &mut Allocator {
+    run key.bytes(self.encoded.asSlice())
+    run key.file(&self.compiler)
+    let held = self.request.lock()
+    if let Option<Request>.Some {value: request} = &held.get().* {
+      run key.file(&run Deferred<Path>.external(request.root.view()))
+      run key.tree(&run Deferred<Path>.external(request.stdlib.view()))
+      let packages = request.packages.asSlice()
+      let mut at = usize.ZERO
+      while at < packages.length {
+        run key.packageTree(&run Deferred<Path>.external(packages[at].directory.view()))
+        let modules = packages[at].modules.asSlice()
+        let mut module = usize.ZERO
+        while module < modules.length {
+          run key.file(&run Deferred<Path>.external(modules[module].source.view()))
+          module = module + usize.ONE
+        }
+        at = at + usize.ONE
+      }
+      let sources = request.native.sources.asSlice()
+      at = usize.ZERO
+      while at < sources.length {
+        run key.file(&run Deferred<Path>.external(sources[at].path.view()))
+        let include = sources[at].include.asSlice()
+        let mut directory = usize.ZERO
+        while directory < include.length {
+          run key.tree(&run Deferred<Path>.external(include[directory].view()))
+          directory = directory + usize.ONE
+        }
+        at = at + usize.ONE
+      }
+      let links = request.native.link.asSlice()
+      at = usize.ZERO
+      while at < links.length {
+        let kind = links[at].kind.view()
+        if kind == "object" || kind == "archive" || kind == "linker-script" {
+          run key.file(&run Deferred<Path>.external(links[at].value.view()))
+        }
+        at = at + usize.ONE
+      }
+      if let Option<String>.Some {value} = &request.native.functionOrder {
+        run key.file(&run Deferred<Path>.external(value.view()))
+      }
+    }
+    run key.environment("PATH")
+    run key.environment("SILK_CLANG")
+    run key.environment("SILK_LLVM_AR")
+    run key.environment("SILK_HOME")
+    run key.environment("HOME")
+  }
+
+  effect fn make(self: &Self, make: &mut Make) -> () ! StepFailure ? &mut Allocator {
+    let mut held = self.request.lock()
+    let selected = Intrinsic.replace(held.getMut().*, Option<Request>.none())
+    drop held
+    let mut request = match move selected {
+      Option<Request>.Some {value} => move value
+      Option<Request>.None => { fail StepError {message: run String.copy("a compilation can only execute once")} }
+    }
+    let output = run make.output(self.outputName.view())
+    request.output = run pathText(&output)
+    let encoded = run Encoding.toml<Request>(&request)
+    run make.write("request.toml", encoded.asSlice())
+    if !make.shouldCompile() { return () }
+    let requestPath = run make.output("request.toml")
+    let written = run pathText(&requestPath)
+    let outcome = run make.exec(&self.compiler, &["compile", "--request", written.view()])
+    let succeeded = match move ChildProcess.exitCode(&outcome) {
+      Option<i32>.Some {value} => value == 0
+      Option<i32>.None => false
+    }
+    if !succeeded {
+      let mut message = run String.copy("the compiler rejected the compilation request")
+      match move String.fromUtf8(ChildProcess.errorBytes(&outcome)) {
+        Result<string, InvalidUtf8>.Success {value} => {
+          run message.append(": ")
+          run message.append(value)
+        }
+        Result<string, InvalidUtf8>.Failure {..} => ()
+      }
+      fail StepError {message: move message}
+    }
+    return run make.requireOutput(self.outputName.view())
+  }
+
+  fn memory(self: &Self) -> u64 { return 2147483648 }
+  fn compilation(self: &Self) -> bool { return true }
+}
+
+effect fn artifactFile(request: &Request) -> String ! StepFailure ? &mut Allocator {
+  let windows = request.profile.target.view() == "x86_64-pc-windows-msvc"
+  let darwin = request.profile.target.view() == "aarch64-apple-darwin" || request.profile.target.view() == "x86_64-apple-darwin"
+  let wasm = request.profile.target.view() == "wasm32-unknown-unknown" || request.profile.target.view() == "wasm64-unknown-unknown"
+    || request.profile.target.view() == "wasm32-wasip1" || request.profile.target.view() == "wasm32-wasip2"
+  let emit = request.emit.view()
+  let kind = request.artifact.view()
+  let suffix = if emit == "llvm-ir" { ".ll" } else if emit == "llvm-bitcode" { ".bc" }
+    else if emit == "assembly" { ".s" } else if emit == "wasm-text" { ".wat" }
+    else if emit == "object" || kind == "object" { if windows { ".obj" } else { ".o" } }
+    else if kind == "static-archive" { if windows { ".lib" } else { ".a" } }
+    else if wasm { ".wasm" }
+    else if kind == "loadable-module" { if windows { ".dll" } else if darwin { ".dylib" } else { ".so" } }
+    else if windows { ".exe" } else { "" }
+  let mut name = run String.copy(request.name.view())
+  run name.append(suffix)
+  return move name
+}
+
+effect fn pathText(path: &Path) -> String ! StepFailure ? &mut Allocator {
+  return match move Path.view(path) {
+    Option<string>.Some {value} => run String.copy(value)
+    Option<string>.None => { fail StepError {message: run String.copy("a compilation path must be UTF-8")} }
+  }
+}

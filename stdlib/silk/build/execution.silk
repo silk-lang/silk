@@ -1,0 +1,115 @@
+//! Deferred storage for a build step's work, using the ordinary fiber execution boundary.
+//!
+//! Construction packages the work without running it. The graph runner supplies its resolved
+//! context when the dependencies are complete, then drives the work on a worker fiber.
+
+import silk.concurrency.execution { Execution, TransferableExecution, TransferableWake }
+import silk.concurrency.sync { Arc, Mutex }
+import silk.concurrency.thread { Transferable }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+
+/// Owned work whose resolved context is supplied only when the graph runs it.
+pub interface Work<C, A, E> {
+  /// Runs once after all declared inputs have been resolved.
+  effect fn perform(self: Self, context: C) -> A ! E
+}
+
+/// A dormant step with one execution and no resolved inputs yet.
+pub struct Pending<C, A, E> {
+  context: Arc<Mutex<Option<C>>>,
+  execution: TransferableExecution<Result<A, E>>,
+  signal: Arc<Mutex<Signal>>,
+}
+
+struct Driven<A, E> {
+  execution: Option<TransferableExecution<Result<A, E>>>,
+  result: Option<Result<A, E>>,
+}
+
+struct Signal {
+  ready: bool,
+  waiter: Option<TransferableWake>,
+}
+
+fn ready(signal: &Arc<Mutex<Signal>>) -> () {
+  let mut held = signal.get().lock()
+  let state = held.getMut()
+  state.ready = true
+  let waiter = Intrinsic.replace(state.waiter, Option<TransferableWake>.none())
+  drop held
+  if let Option<TransferableWake>.Some {value} = move waiter { Execution.wakeTransferable(move value) }
+}
+
+fn awaitSignal(signal: &Arc<Mutex<Signal>>, wake: TransferableWake) -> () {
+  let mut held = signal.get().lock()
+  let state = held.getMut()
+  if state.ready {
+    state.ready = false
+    drop held
+    Execution.wakeTransferable(move wake)
+  } else {
+    state.waiter = Option<TransferableWake>.some(move wake)
+  }
+}
+
+effect fn body<C: Transferable + 'static, A: Transferable + 'static, E: Transferable + 'static,
+  T: Work<C, A, E> + Transferable + 'static>(work: T, context: Arc<Mutex<Option<C>>>) -> Result<A, E> {
+  let mut held = context.get().lock()
+  let selected = Intrinsic.replace(held.getMut().*, Option<C>.none())
+  drop held
+  let resolved = match move selected {
+    Option<C>.Some {value} => move value
+    // Pending.execute publishes the context before the first drive. No other operation drives it.
+    Option<C>.None => { return Intrinsic.trap("Build step driven before its context was published") }
+  }
+  return run Effect.result(Work.perform(move work, move resolved))
+}
+
+fn completed<A, E>(state: &mut Driven<A, E>, result: Result<A, E>) -> () {
+  state.result = Option<Result<A, E>>.some(move result)
+}
+
+fn suspended<A: Transferable, E: Transferable>(state: &mut Driven<A, E>, execution: Intrinsic.Execution<Result<A, E>>) -> () {
+  state.execution = Option<TransferableExecution<Result<A, E>>>.some(
+    TransferableExecution<Result<A, E>>.adopt(move execution))
+}
+
+impl<C: Transferable + 'static, A: Transferable + 'static, E: Transferable + 'static> Pending<C, A, E> {
+  /// Packages owned work without calling it. Allocation failure runs no work.
+  pub effect fn make<T: Work<C, A, E> + Transferable + 'static>(work: T) -> Self
+  ! OutOfMemoryError ? &mut Allocator {
+    let context = run Arc<Mutex<Option<C>>>.make(run Mutex<Option<C>>.make(Option<C>.none()))
+    let signal = run Arc<Mutex<Signal>>.make(run Mutex<Signal>.make(Signal {ready: false, waiter: Option<TransferableWake>.none()}))
+    let execution = run Execution.makeTransferable(body<C, A, E, T>(move work, context.clone()), signal.clone(), ready)
+    return Pending<C, A, E> {context: move context, execution: move execution, signal: move signal}
+  }
+
+  /// Supplies the resolved inputs and drives the work to completion, preserving typed failures.
+  /// A parked step resumes only after its execution's readiness notification.
+  pub effect fn execute(self: Self, context: C) -> A ! E {
+    let mut held = self.context.get().lock()
+    let target = held.getMut()
+    target.* = Option<C>.some(move context)
+    drop held
+    let mut state = Driven<A, E> {execution: Option<TransferableExecution<Result<A, E>>>.some(move self.execution),
+      result: Option<Result<A, E>>.none()}
+    while true {
+      let execution = Intrinsic.replace(state.execution, Option<TransferableExecution<Result<A, E>>>.none())
+      if let Option<TransferableExecution<Result<A, E>>>.Some {value} = move execution {
+        run Execution.drive(value.local(), &mut state, completed<A, E>, suspended<A, E>)
+      }
+      let result = Intrinsic.replace(state.result, Option<Result<A, E>>.none())
+      if let Option<Result<A, E>>.Some {value} = move result {
+        return match move value {
+          Result<A, E>.Success {value: answer} => move answer
+          Result<A, E>.Failure {error} => { fail move error }
+        }
+      }
+      let notification = self.signal.clone()
+      run Execution.parkTransferable(|wake: TransferableWake| -> () { awaitSignal(&notification, move wake) })
+    }
+  }
+}

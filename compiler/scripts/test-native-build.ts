@@ -114,6 +114,26 @@ const program = Effect.gen(function* () {
   assert.deepEqual(yield* fs.readFile(requestOutput), requestBytes, 'request file and stdin must emit identical artifacts')
   const wrongVersion = yield* invoke(silk, ['compile', '--request', '-'], requestRoot, requestEnv, 30_000, requestText.replace('version = 1', 'version = 2'))
   assert.equal(wrongVersion.status, 2, wrongVersion.stderr)
+  const graphRoot = join(directory, 'graph-fixture')
+  yield* fs.makeDirectory(graphRoot, { recursive: true })
+  const graphProgram = join(directory, 'graph-test')
+  const graphBuilt = yield* invoke(silk, ['build', join(repository, 'compiler/fixtures/build-graph/main.silk'),
+    '-o', graphProgram, '--stdlib', standardLibrary, '--clang', clang], directory, process.env, 120_000)
+  assert.equal(graphBuilt.status, 0, graphBuilt.stderr)
+  const graphRan = yield* invoke(graphProgram, [], graphRoot)
+  assert.equal(graphRan.status, 0, graphRan.stderr)
+  const optionsProgram = join(directory, 'build-options-test')
+  const optionsBuilt = yield* invoke(silk, ['build', join(repository, 'compiler/fixtures/build-graph/options.silk'),
+    '-o', optionsProgram, '--stdlib', standardLibrary, '--clang', clang], directory, process.env, 120_000)
+  assert.equal(optionsBuilt.status, 0, optionsBuilt.stderr)
+  const optionsRan = yield* invoke(optionsProgram, [], graphRoot)
+  assert.equal(optionsRan.status, 0, optionsRan.stderr)
+  const graphCompiler = join(directory, 'graph-compilation-test')
+  const graphCompilerBuilt = yield* invoke(silk, ['build', join(repository, 'compiler/fixtures/build-graph/compile.silk'),
+    '-o', graphCompiler, '--stdlib', standardLibrary, '--clang', clang], directory, process.env, 120_000)
+  assert.equal(graphCompilerBuilt.status, 0, graphCompilerBuilt.stderr)
+  const graphCompiled = yield* invoke(graphCompiler, [], requestRoot, { ...requestEnv, SILK_TEST_COMPILER: silk }, 120_000)
+  assert.equal(graphCompiled.status, 0, graphCompiled.stderr)
   const argumentsFor = (output: string) => [
     'build',
     'main.silk',
