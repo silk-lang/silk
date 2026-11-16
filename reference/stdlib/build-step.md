@@ -474,6 +474,16 @@ pub effect fn exec(self: &mut Self, program: &Deferred<Path>, arguments: &[strin
 
 Executes a declared program in the output directory with only the keyed environment.
 
+<a id="Make.impl.execConfined"></a>
+
+### Method `execConfined`
+
+```silk
+pub effect fn execConfined(self: &mut Self, launcher: &Deferred<Path>, program: &Deferred<Path>, arguments: &[string]) -> ProcessOutcome ! StepFailure ? &mut Allocator
+```
+
+Executes a declared program through a declared sandbox launcher with only keyed reads.
+
 <a id="Make.impl.shouldCompile"></a>
 
 ### Method `shouldCompile`

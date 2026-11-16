@@ -57,15 +57,26 @@ pub fn artifact(program: Deferred<Path>) -> Self
 
 Runs a deferred executable, adding its producer as a dependency when this step is registered.
 
+<a id="Run.impl.confined"></a>
+
+### Method `confined`
+
+```silk
+pub effect fn confined(self: Self) -> Self ! StepFailure ? &mut Allocator | &mut FileSystem | &mut HostInput
+```
+
+Runs this process with operating-system confinement: declared reads, its output directory,
+and no TCP access. Missing sandbox support fails instead of running unrestricted.
+
 <a id="Run.impl.argument"></a>
 
 ### Method `argument`
 
 ```silk
-pub effect fn argument(self: Self, value: string) -> Self ! StepFailure ? &mut Allocator
+pub effect fn argument(self: Self, value: Deferred<String>) -> Self ! StepFailure ? &mut Allocator
 ```
 
-Appends a literal argument, including it in the key.
+Appends a deferred text argument, including its producer and value in the key.
 
 <a id="Run.impl.inputFile"></a>
 

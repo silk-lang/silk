@@ -48,6 +48,47 @@ Size
 
 Optimize code size.
 
+<a id="Optimize.impl.Schema"></a>
+
+## Implementation `Schema for Optimize`
+
+```silk
+impl Schema for Optimize
+```
+
+<a id="Optimize.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+<a id="Optimize.impl.Schema.read"></a>
+
+### Operation `read`
+
+```silk
+effect fn read<R: SchemaReader>(reader: &mut R) -> Self ! Issue | OutOfMemoryError ? &mut Allocator
+```
+
+<a id="Optimize.impl.Schema.write"></a>
+
+### Operation `write`
+
+```silk
+effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
+    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator
+```
+
+<a id="Optimize.impl.Schema.shape"></a>
+
+### Operation `shape`
+
+```silk
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator
+```
+
 <a id="Optimize.impl"></a>
 
 ## Implementation `Optimize`

@@ -4,7 +4,6 @@ import { createHash } from 'node:crypto'
 import { spawn, spawnSync, type SpawnSyncReturns } from 'node:child_process'
 import { existsSync, readdirSync, statSync } from 'node:fs'
 import { createRequire } from 'node:module'
-import { release } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import * as Config from 'effect/Config'
@@ -2712,8 +2711,20 @@ const program = Effect.gen(function* () {
   // directory, reads outside its inputs and the system, and TCP. An unchanged rerun does not run
   // it; a host without a sandbox refuses it unless the root sets [build].unsandboxed-tools, and
   // then warns on every build.
-  const [kernelMajor, kernelMinor] = release().split('.').map(Number)
-  const landlockNet = process.platform === 'linux' && (kernelMajor > 6 || (kernelMajor === 6 && kernelMinor >= 7))
+  const sandboxProbe = yield* invoke(silk, ['sandbox-exec', '--read', '/usr', '--read', '/bin',
+    '--read', '/lib', '--read', '/lib64', '--', '/bin/true'], directory)
+  const landlockNet = sandboxProbe.status === 0
+  const sandboxRoot = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-graph-sandbox-' })
+  const sandboxProgram = join(directory, 'graph-sandbox-test')
+  const sandboxBuilt = yield* invoke(silk, ['build', join(repository, 'compiler/fixtures/build-graph/sandbox.silk'),
+    '-o', sandboxProgram, '--stdlib', standardLibrary, '--clang', clang], directory, process.env, 120_000)
+  assert.equal(sandboxBuilt.status, 0, sandboxBuilt.stderr)
+  const sandboxRan = yield* invoke(sandboxProgram, [], sandboxRoot, { ...process.env, SILK_COMPILER: silk })
+  if (landlockNet) assert.equal(sandboxRan.status, 0, sandboxRan.stderr)
+  else {
+    assert.notEqual(sandboxRan.status, 0, 'confinement must fail closed on a host without a sandbox')
+    assert.equal(yield* fs.exists(join(sandboxRoot, 'forbidden')), false)
+  }
   const tooled = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-build-tool-' })
   for (const member of ['tlib/tools', 'app']) yield* fs.makeDirectory(join(tooled, member), { recursive: true })
   yield* fs.writeFileString(
