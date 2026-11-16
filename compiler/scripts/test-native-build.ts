@@ -1254,6 +1254,27 @@ const program = Effect.gen(function* () {
     if (ignored) assert.doesNotMatch(unused.stderr, /--ignore-warnings/)
     else assert.match(unused.stderr, /^silk: warnings fail this command; fix them, or pass --ignore-warnings to allow them$/m)
   }
+  // A path dependency is the author's own code, so its warnings are reported and fail the
+  // dependent's check and build too (#3149).
+  yield* fs.makeDirectory(join(directory, 'unuseddep/src'), { recursive: true })
+  yield* fs.makeDirectory(join(directory, 'unusedapp/src'), { recursive: true })
+  yield* fs.writeFileString(
+    join(directory, 'unuseddep/silk.toml'),
+    '[package]\nname = "unuseddep"\nversion = "0.1.0"\nkind = "library"\nexports = ["lib"]\n',
+  )
+  yield* fs.writeFileString(join(directory, 'unuseddep/src/lib.silk'), 'import silk.num.u64\n\npub fn value() -> i32 {\n  return 0\n}\n')
+  yield* fs.writeFileString(
+    join(directory, 'unusedapp/silk.toml'),
+    '[package]\nname = "unusedapp"\nversion = "0.1.0"\n\n[dependencies]\nunuseddep = { path = "../unuseddep" }\n',
+  )
+  yield* fs.writeFileString(join(directory, 'unusedapp/src/main.silk'), 'import unuseddep.lib\n\npub fn main() -> i32 {\n  return lib.value()\n}\n')
+  for (const command of ['check', 'build']) {
+    const dependent = yield* invoke(silk, [
+      command, '--stdlib', standardLibrary, ...(command === 'build' ? ['--clang', clang] : []),
+    ], join(directory, 'unusedapp'))
+    assert.equal(dependent.status, 1, dependent.stderr)
+    assert.match(dependent.stderr, /unuseddep\/src\/lib\.silk:1:17: warning\[MOD0007\] Import `u64` is never used/m)
+  }
   // A package that cannot be loaded ends its load row as failed and still names itself on its
   // final line.
   yield* fs.makeDirectory(join(directory, 'unexported/src'), { recursive: true })
@@ -1761,6 +1782,35 @@ const program = Effect.gen(function* () {
   assert.equal(privateDependency.status, 1, privateDependency.stderr)
   assert.match(privateDependency.stderr, /error\[SEM0015\] `hidden` is private to taskcore\.Store; mark it `pub` there to use it here/)
   assert.match(privateDependency.stderr, /error\[SEM0028\] Field `value` of [A-Za-z.]*Box is private to the module that declares it\n/)
+  // FFI-010: a loaded dependency module's C exports are roots. No Silk code names the function or
+  // the static; the application's C unit links against both by symbol.
+  yield* fs.makeDirectory(join(directory, 'depexport/core'), { recursive: true })
+  yield* fs.makeDirectory(join(directory, 'depexport/app/native'), { recursive: true })
+  yield* fs.writeFileString(
+    join(directory, 'depexport/core/silk.toml'),
+    '[package]\nname = "core"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nexports = ["probes"]\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'depexport/core/probes.silk'),
+    'pub export "C" fn silk_test_dependency_probe(value: i32) -> i32 { return value + 1 }\n\nexport "C" static silk_test_dependency_version: i32 = 40\n\npub fn touch() -> i32 {\n  return 0\n}\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'depexport/app/silk.toml'),
+    '[package]\nname = "app"\nversion = "0.1.0"\nsource = "."\n\n[dependencies]\ncore = { path = "../core" }\n\n[native]\nsources = [{ c = "native/caller.c" }]\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'depexport/app/native/caller.c'),
+    '#include <stdint.h>\nextern const int32_t silk_test_dependency_version;\nint32_t silk_test_dependency_probe(int32_t);\nint32_t silk_test_call_dependency(void) { return silk_test_dependency_probe(1) + silk_test_dependency_version; }\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'depexport/app/main.silk'),
+    'import core.probes\n\nunsafe extern "C" fn silk_test_call_dependency() -> i32\n\npub fn main() -> i32 {\n  return probes.touch() + unsafe silk_test_call_dependency()\n}\n',
+  )
+  const dependencyExportApp = join(directory, 'depexport/app')
+  const dependencyExportBuilt = yield* invoke(silk, ['build', '--stdlib', standardLibrary], dependencyExportApp, { ...process.env, SILK_CLANG: clang })
+  assert.equal(dependencyExportBuilt.status, 0, dependencyExportBuilt.stderr)
+  const dependencyExportRan = yield* invoke(join(dependencyExportApp, `build/llvm/${hostTarget}/debug/app`), [], dependencyExportApp)
+  assert.equal(dependencyExportRan.status, 42, dependencyExportRan.stderr)
   // A library's types are named with their package, an impl outside the modules IMPL-004 allows
   // names the rule, and a refusal of the library's own generic body is reported once, at its site.
   yield* fs.makeDirectory(join(directory, 'libmsg/geo/src'), { recursive: true })
@@ -1856,9 +1906,9 @@ const program = Effect.gen(function* () {
     ["unrun", "effect fn tick() -> i32 {\n  return 1\n}\n\npub fn main() -> i32 {\n  tick()\n  return 0\n}\n", /error\[SEM0087\] Expression statement produces an Effect of `i32` that is never run \(write `run` before it to run it, or `drop` it to discard it\), but only \(\) or never may be ignored\n/],
   ]
   const lendCases: Array<[string, string, RegExp]> = [
-    ["lendtwice", "fn both(mut f: mut fn(i32) -> i32, mut g: mut fn(i32) -> i32) -> i32 {\n  return f(1) + g(2)\n}\n\npub fn main() -> i32 {\n  let mut total = 0\n  let mut acc = fn(x: i32) -> i32 {\n    total = total + x\n    return total\n  }\n  return both(acc, acc)\n}\n", /src\/main\.silk:11:20: error\[OWN0010\] A mutable borrow of `acc` conflicts with an earlier mutable borrow of it that is still in use/],
-    ["closureescape", "struct Base { value: i32, }\n\nimpl Base {\n  fn peek(self: &Self) -> i32 { return self.value }\n}\n\nfn make() -> fn<'static>(i32) -> i32 {\n  let base = Base { value: 2 }\n  return fn(x: i32) -> i32 { return x + base.peek() }\n}\n\npub fn main() -> i32 {\n  return make()(1)\n}\n", /error\[OWN0018\] The returned callable borrows `base`, a local of this function; move it into the callable instead, which makes the result a `once fn<'static>`\n/],
-    ["callableresult", "fn adder(n: i32) -> fn(i32) -> i32 {\n  return fn(x: i32) -> i32 { return x + n }\n}\n\npub fn main() -> i32 {\n  return adder(1)(2)\n}\n", /error\[SEM0210\] The result is a callable whose captures could borrow, but the function has no borrowed input they could come from; for a callable that captures only owned data, write `fn<'static>\(\.\.\.\)`, as in `fn<'static>\(i32\) -> i32`\n/],
+    ["lendtwice", "fn both(mut f: mut fn(i32) -> i32, mut g: mut fn(i32) -> i32) -> i32 {\n  return f(1) + g(2)\n}\n\npub fn main() -> i32 {\n  let mut total = 0\n  let mut acc = |x: i32| -> i32 {\n    total = total + x\n    return total\n  }\n  return both(acc, acc)\n}\n", /src\/main\.silk:11:20: error\[OWN0010\] A mutable borrow of `acc` conflicts with an earlier mutable borrow of it that is still in use/],
+    ["closureescape", "struct Base { value: i32, }\n\nimpl Base {\n  fn peek(self: &Self) -> i32 { return self.value }\n}\n\nfn make() -> fn<'static>(i32) -> i32 {\n  let base = Base { value: 2 }\n  return |x: i32| -> i32 { return x + base.peek() }\n}\n\npub fn main() -> i32 {\n  return make()(1)\n}\n", /error\[OWN0018\] The returned callable borrows `base`, a local of this function; move it into the callable instead, which makes the result a `once fn<'static>`\n/],
+    ["callableresult", "fn adder(n: i32) -> fn(i32) -> i32 {\n  return |x: i32| -> i32 { return x + n }\n}\n\npub fn main() -> i32 {\n  return adder(1)(2)\n}\n", /error\[SEM0210\] The result is a callable whose captures could borrow, but the function has no borrowed input they could come from; for a callable that captures only owned data, write `fn<'static>\(\.\.\.\)`, as in `fn<'static>\(i32\) -> i32`\n/],
     ["boundmove", "struct Counter { count: i32, }\n\nimpl Counter {\n  fn peek(self: &Self) -> i32 { return self.count }\n  fn finish(self: Self) -> i32 { return self.count }\n}\n\npub fn main() -> i32 {\n  let counter = Counter { count: 1 }\n  let finish = counter.finish\n  return counter.peek()\n}\n", /error\[OWN0001\] counter was moved and cannot be used again\n/],
     ["callableassign", "struct Counter { count: i32, }\n\nimpl Counter {\n  fn peek(self: &Self) -> i32 { return self.count }\n  fn total(self: &Self) -> i32 { return self.count }\n}\n\npub fn main() -> i32 {\n  let counter = Counter { count: 1 }\n  let mut get = counter.total\n  get = counter.peek\n  return get()\n}\n", /error\[SEM0037\] Every function and closure has its own type, so a binding that holds one cannot be assigned a different one\n/],
     ["plainmismatch", "pub fn main() -> i32 {\n  let count: i32 = \"three\"\n  return count\n}\n", /error\[SEM0037\] Assignment expected i32 but received string<'static>\n/],
@@ -1996,7 +2046,7 @@ const program = Effect.gen(function* () {
   assert.equal(negative.status, 8, negative.stderr)
   yield* fs.makeDirectory(join(directory, 'lendok/src'), { recursive: true })
   yield* fs.writeFileString(join(directory, 'lendok/silk.toml'), '[package]\nname = "lendok"\nversion = "0.1.0"\n')
-  yield* fs.writeFileString(join(directory, 'lendok/src/main.silk'), "fn callMut(mut f: mut fn(i32) -> i32) -> i32 {\n  return f(1)\n}\n\npub fn main() -> i32 {\n  let mut total = 0\n  let mut acc = fn(x: i32) -> i32 {\n    total = total + x\n    return total\n  }\n  let a = callMut(acc)\n  let b = callMut(acc)\n  let c = acc(100)\n  return a + b + c\n}\n")
+  yield* fs.writeFileString(join(directory, 'lendok/src/main.silk'), "fn callMut(mut f: mut fn(i32) -> i32) -> i32 {\n  return f(1)\n}\n\npub fn main() -> i32 {\n  let mut total = 0\n  let mut acc = |x: i32| -> i32 {\n    total = total + x\n    return total\n  }\n  let a = callMut(acc)\n  let b = callMut(acc)\n  let c = acc(100)\n  return a + b + c\n}\n")
   const lent = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(directory, 'lendok'), { ...process.env, SILK_CLANG: clang })
   assert.equal(lent.status, 105, lent.stderr)
   // A syntax error the parser recovered from fails the check phase of a build, before codegen.
@@ -2399,6 +2449,17 @@ const program = Effect.gen(function* () {
   yield* sourcesRun(48)
   const editedNativeObjects = (yield* nativeObjects()).filter((name) => !firstObjects.includes(name))
   assert.equal(editedNativeObjects.length, 1, `an edit to one file compiles one object, added ${editedNativeObjects.join(', ')}`)
+  // A file Clang reads through `#embed` and a `..` path is in the object's record, so an edit to it
+  // alone compiles the object again (#3152).
+  yield* fs.makeDirectory(join(sourcesRoot, 'clib/data'), { recursive: true })
+  yield* fs.writeFile(join(sourcesRoot, 'clib/data/blob.bin'), new Uint8Array([3]))
+  yield* fs.writeFileString(
+    join(sourcesRoot, 'clib/native/two.c'),
+    'static const unsigned char blob[] = {\n#embed "../data/blob.bin"\n};\nint clib_two(void) { return blob[0]; }\n',
+  )
+  yield* sourcesRun(48)
+  yield* fs.writeFile(join(sourcesRoot, 'clib/data/blob.bin'), new Uint8Array([4]))
+  yield* sourcesRun(49)
   for (const sources of [
     '{ c = "native/*.c", flags = ["-fplugin=evil.so"] }',
     '{ c = "native/*.c", flags = ["-Wl,-rpath,/tmp"] }',
@@ -2440,10 +2501,10 @@ const program = Effect.gen(function* () {
   const packed = yield* invoke('tar', ['czf', 'vend.tar.gz', 'vend-1'], vendorArchived)
   assert.equal(packed.status, 0, packed.stderr)
   const vendDigest = createHash('sha256').update(yield* fs.readFile(join(vendorArchived, 'vend.tar.gz'))).digest('hex')
-  const sysManifest = (digest: string) =>
+  const sysManifest = (digest: string, url = `file://${join(vendorArchived, 'vend.tar.gz')}`) =>
     '[package]\nname = "sys"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nexports = ["Sys"]\n\n[native]\n'
     + 'sources = [{ c = "native/shim.c", include = ["vend:include"] }]\nlink = [{ static-archive = "vend:lib/libvend.a" }]\n\n'
-    + `[native.archive.vend]\nurl = "file://${join(vendorArchived, 'vend.tar.gz')}"\nsha256 = "${digest}"\nstrip = 1\n`
+    + `[native.archive.vend]\nurl = "${url}"\nsha256 = "${digest}"\nstrip = 1\n`
   yield* fs.writeFileString(join(vendorArchived, 'sys/silk.toml'), sysManifest(vendDigest))
   yield* fs.writeFileString(join(vendorArchived, 'sys/native/shim.c'), '#include "vend.h"\nint shim_value(void) { return vend_base() + 5; }\n')
   yield* fs.writeFileString(join(vendorArchived, 'sys/Sys.silk'), 'unsafe extern "C" fn shim_value() -> i32\n\npub fn value() -> i32 {\n  return unsafe shim_value()\n}\n')
@@ -2473,6 +2534,15 @@ const program = Effect.gen(function* () {
   assert.equal(mismatched.status, 2, mismatched.stderr)
   assert.match(mismatched.stderr, new RegExp(`archive vend from file://.* has SHA-256 ${vendDigest}, but its manifest pins 0{64}; nothing was extracted`))
   assert.ok(!(yield* fs.exists(join(archiveStore, vendDigest))), 'a mismatched archive is never extracted')
+  // SILK_ARCHIVE_MIRROR rewrites the URL's prefix, here to a file:/// directory, and the digest is
+  // still checked; a malformed entry is refused.
+  yield* fs.writeFileString(join(vendorArchived, 'sys/silk.toml'), sysManifest(vendDigest, 'https://archives.invalid/vend.tar.gz'))
+  const malformedMirror = yield* archivedBuild({ ...vendorArchiveEnvironment, SILK_ARCHIVE_MIRROR: 'https://archives.invalid/' })
+  assert.equal(malformedMirror.status, 2, malformedMirror.stderr)
+  assert.match(malformedMirror.stderr, /SILK_ARCHIVE_MIRROR entry https:\/\/archives\.invalid\/ is not <prefix>=<replacement>/)
+  yield* archivedRun(35, { ...vendorArchiveEnvironment, SILK_ARCHIVE_MIRROR: `https://archives.invalid/=file://${vendorArchived}/` })
+  yield* fs.remove(join(archiveStore, vendDigest), { recursive: true })
+  yield* fs.remove(join(archiveStore, `${vendDigest}.fetched`))
   yield* fs.writeFileString(join(vendorArchived, 'sys/silk.toml'), sysManifest(vendDigest))
   yield* archivedRun(35)
   assert.ok(yield* fs.exists(join(archiveStore, vendDigest, 'lib/libvend.a')), 'the archive is extracted below its digest, its top directory stripped')
@@ -2762,6 +2832,26 @@ const program = Effect.gen(function* () {
     placedFirst(yield* orderedBuild(), last, beforeLast)
     yield* fs.writeFileString(join(ordered, 'order.txt'), `${beforeLast}\n${last}\n`)
     placedFirst(yield* orderedBuild(), beforeLast, last)
+    // A declaration, as the `.symbols` map's third column spells it, orders every symbol of that
+    // declaration; an entry that names nothing this build emits is reported as a note.
+    const symbolMap = (yield* fs.readFileString(`${executable}.symbols`)).split('\n').map((line) => line.split('\t'))
+    // The latest-placed function that belongs to a Silk declaration; runtime entries such as
+    // `silk_gnu_initialize` have none.
+    const declarationOf = (symbol: string) => symbolMap.find((row) => row[0] === symbol)?.[2] ?? ''
+    const latest = [...unordered].reverse().find(([symbol]) => declarationOf(symbol).includes('::'))
+    assert.ok(latest !== undefined, `${profile}: no linked function has a declaration in the symbol map`)
+    const declaration = declarationOf(latest[0])
+    const declared = new Set(symbolMap.filter((row) => row[2] === declaration).map((row) => row[0]))
+    yield* fs.writeFileString(join(ordered, 'order.txt'), `${declaration}\nsilk_00000000000000000000000000000000\n`)
+    const byDeclaration = yield* invoke(silk, ['build', '--stdlib', standardLibrary, ...profile], ordered, { ...process.env, SILK_CLANG: clang })
+    assert.equal(byDeclaration.status, 0, byDeclaration.stderr)
+    assert.match(byDeclaration.stderr, /silk: note: 1 of 2 entries in .*order\.txt name no function of this build/)
+    const declaredAddresses = yield* functionAddresses(executable)
+    let latestDeclared = 0n
+    for (const [name, address] of declaredAddresses) if (declared.has(name) && address > latestDeclared) latestDeclared = address
+    for (const [name, address] of declaredAddresses) {
+      if (!declared.has(name)) assert.ok(latestDeclared < address, `${profile}: ${name} is placed before ${declaration}`)
+    }
   }
   // Each profile keeps its own cache file, and a file per profile names it, so the next build in
   // either profile prefetches its own file rather than none.
@@ -2874,9 +2964,9 @@ const program = Effect.gen(function* () {
       'effect fn program() -> i32 ! OutOfMemoryError | SpawnError {',
       '  let mut allocator = Allocator.systemAllocatorProvider()',
       '  let owned = run Box<i32>.make(20) |> Effect.provideMut<Allocator>(&mut allocator)',
-      '  let first = run NativeThread.spawn(fn() -> i32 { return (move owned).into() + 1 })',
+      '  let first = run NativeThread.spawn(|| -> i32 { return (move owned).into() + 1 })',
       '    |> Effect.provideMut<Allocator>(&mut allocator)',
-      '  let second = run NativeThread.spawn(fn() -> i32 { return 21 })',
+      '  let second = run NativeThread.spawn(|| -> i32 { return 21 })',
       '    |> Effect.provideMut<Allocator>(&mut allocator)',
       '  return first.join() + second.join()',
       '}',
@@ -2917,6 +3007,22 @@ const program = Effect.gen(function* () {
   assert.match(
     tooOld.stderr,
     /^silk: Silk builds need Clang 22 or newer, but \S+clang-18 \(from SILK_CLANG\) is Clang 18; set SILK_CLANG or pass --clang the path of a newer Clang$/m,
+  )
+  // A --clang wrapper that runs $SILK_CLANG sees it, so its version probe answers with that Clang
+  // (#3150).
+  const wrapper = join(directory, 'clang-wrapper')
+  yield* fs.writeFileString(wrapper, '#!/bin/sh\nexec "$SILK_CLANG" "$@"\n')
+  yield* fs.chmod(wrapper, 0o755)
+  const wrapped = yield* invoke(
+    silk,
+    ['build', '--manifest-path', join('threads', 'silk.toml'), '--profile', 'web', '--stdlib', standardLibrary, '--clang', wrapper],
+    directory,
+    { ...process.env, SILK_CLANG: eighteen },
+  )
+  assert.equal(wrapped.status, 2, wrapped.stderr)
+  assert.match(
+    wrapped.stderr,
+    /^silk: Silk builds need Clang 22 or newer, but \S+clang-wrapper \(from --clang\) is Clang 18; set SILK_CLANG or pass --clang the path of a newer Clang$/m,
   )
   // Clang 22 miscompiles AVX-512 mask code (llvm/llvm-project#198220), so a profile with avx512vl
   // and avx512dq needs Clang 23.
@@ -3031,7 +3137,7 @@ const program = Effect.gen(function* () {
       '  while round < 100 {',
       '    let filled = run fill(10000) |> Effect.provideMut<Allocator>(&mut allocator)',
       '    if filled != 10000 { return 1 }',
-      '    let worker = run NativeThread.spawn(fn() -> i32 { return work() })',
+      '    let worker = run NativeThread.spawn(|| -> i32 { return work() })',
       '      |> Effect.provideMut<Allocator>(&mut allocator)',
       '    if worker.join() != 1000 { return 2 }',
       '    round = round + 1',
@@ -5358,6 +5464,43 @@ const program = Effect.gen(function* () {
   yield* embedAppRun(45)
   yield* embedCheck(embedLibrary, 'a package\'s own embedded file was not read')
   yield* embedCheck(embedLibrary, 'a second check lost a package\'s own embedded file')
+  // A check that reused the cache leaves no server behind, so an edit of a module it reused is
+  // refused as `--no-server` refuses it; a server a cold check left sweeps a module an edit newly
+  // imports (#3116).
+  const served = join(directory, 'served-edits')
+  yield* fs.makeDirectory(join(served, 'src'), { recursive: true })
+  yield* fs.writeFileString(join(served, 'silk.toml'), '[package]\nname = "served-edits"\nversion = "0.1.0"\n')
+  yield* fs.writeFileString(join(served, 'src/other.silk'), 'pub fn helper() -> i32 { return 1 }\n')
+  yield* fs.writeFileString(
+    join(served, 'src/main.silk'),
+    'import other\nimport third\npub fn main() -> i32 { return other.helper() - third.t() }\n',
+  )
+  const servedCheck = Effect.fnUntraced(function* (options: ReadonlyArray<string>) {
+    return yield* invoke(silk, ['check', ...options, '--stdlib', standardLibrary], served, splitEnvironment)
+  })
+  const missingModule = yield* servedCheck(['--no-server'])
+  assert.match(missingModule.stdout + missingModule.stderr, /main\.silk:2:8: error\[MOD0001\]/)
+  yield* fs.writeFileString(join(served, 'src/main.silk'), 'import other\npub fn main() -> i32 { return other.helper() - 1 }\n')
+  const reused = yield* servedCheck([])
+  assert.equal(reused.status, 0, reused.stdout + reused.stderr)
+  yield* fs.writeFileString(join(served, 'src/other.silk'), 'import third\npub fn helper() -> i32 { return third.t() }\n')
+  const servedEdit = yield* servedCheck([])
+  assert.match(servedEdit.stdout + servedEdit.stderr, /other\.silk:1:8: error\[MOD0001\]/, 'a check missed an edit of a module the cache answered')
+  yield* fs.remove(join(served, 'build'), { recursive: true })
+  yield* fs.writeFileString(join(served, 'src/other.silk'), 'pub fn helper() -> i32 { return 1 }\n')
+  // Nothing imports `extra` yet; a file added later would change the program's shape instead.
+  yield* fs.writeFileString(join(served, 'src/extra.silk'), 'pub fn more() -> i32 { return true }\n')
+  const coldServer = yield* servedCheck([])
+  assert.equal(coldServer.status, 0, coldServer.stdout + coldServer.stderr)
+  yield* fs.writeFileString(join(served, 'src/main.silk'), 'import other\nimport extra\npub fn main() -> i32 { return other.helper() + extra.more() }\n')
+  const newlyImported = yield* servedCheck([])
+  assert.match(newlyImported.stdout + newlyImported.stderr, /extra\.silk:1:\d+: error\[SEM0129\]/, 'the check server did not sweep a newly imported module')
+  // Every check reports a syntax error while it stays, not only the first one after the edit.
+  yield* fs.writeFileString(join(served, 'src/extra.silk'), 'pub fn more() -> i32 { return 1 \n')
+  for (const attempt of ['first', 'second']) {
+    const broken = yield* servedCheck(['--no-server'])
+    assert.match(broken.stdout + broken.stderr, /extra\.silk:2:1: error\[PAR0001\]/, `the ${attempt} check missed a syntax error`)
+  }
   // A static fn reads the length of an embedded file while the package compiles.
   yield* fs.writeFileString(
     join(embedLibrary, 'src/library.silk'),

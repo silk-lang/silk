@@ -66,7 +66,7 @@ effect fn program() -> i32
   run worker.push(2) |> Effect.provideMut<Allocator>(&mut allocator)
   let stealer = worker.stealer()
   let thief = run NativeThread.spawn(
-    fn() -> i32 {
+    || -> i32 {
       return stealOne(move stealer)
     }
   )

@@ -175,7 +175,7 @@ closure owns everything it captures and nothing it holds is shared with the spaw
 `JoinHandle.join` waits for the thread and returns the value.
 
 ```silk,ignore
-let handle = run NativeThread.spawn(fn() -> i32 { return compute(move input) })
+let handle = run NativeThread.spawn(|| -> i32 { return compute(move input) })
   |> Effect.provideMut<Allocator>(&mut allocator)
 let value = handle.join()
 ```
@@ -216,7 +216,7 @@ any thread, so an unpark before the park is not lost.
 ```silk,ignore
 let total = run Arc<Mutex<i32>>.make(move mutex) |> Effect.provideMut<Allocator>(&mut allocator)
 let mine = total.clone()
-let worker = run NativeThread.spawn(fn() -> i32 { return addOne(move mine) })
+let worker = run NativeThread.spawn(|| -> i32 { return addOne(move mine) })
   |> Effect.provideMut<Allocator>(&mut allocator)
 ```
 
@@ -248,7 +248,7 @@ returns the one `MailboxReceiver<T>` of a multi-producer, single-consumer queue;
 let mut worker = run WorkDeque.make<i32>() |> Effect.provideMut<Allocator>(&mut allocator)
 run worker.push(42) |> Effect.provideMut<Allocator>(&mut allocator)
 let stealer = worker.stealer()
-let thief = run NativeThread.spawn(fn() -> Steal<i32> { return stealer.steal() })
+let thief = run NativeThread.spawn(|| -> Steal<i32> { return stealer.steal() })
   |> Effect.provideMut<Allocator>(&mut allocator)
 ```
 

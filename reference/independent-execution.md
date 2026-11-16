@@ -225,7 +225,7 @@ The compiler recognizes only these sealed target-neutral Execution primitives:
 - `Intrinsic.ExecutionRef` is counted authority over one package allocation. It is obtained with
   `Intrinsic.executionCurrent` or `Intrinsic.executionRefOf`.
 - `Intrinsic.executionLoad`, `Intrinsic.executionStore` and `Intrinsic.executionCompareExchange`
-  access the two source control words atomically (EXEC-009).
+  access the three source control words atomically (EXEC-009); any other index is a fatal trap.
 - `Intrinsic.executionNotify` invokes the fixed readiness endpoint.
 - `Intrinsic.executionLive` reports whether the Execution handle still exists.
 
@@ -320,8 +320,9 @@ is, and `TransferableWake` always is; both assert it with an `impl` (THREAD-003)
 
 `TransferableExecution.local` returns the intrinsic handle for `Execution.drive`, and
 `TransferableExecution.adopt` wraps one again, such as the dormant handle `onSuspend` receives.
-Values the body creates itself carry no bound: Silk has no thread-local or mutable global storage,
-so only the body reaches them while it moves between threads.
+Values the body creates itself carry no bound: Silk has no safe thread-local or mutable global
+storage, so only the body reaches them while it moves between threads. The unsafe process and
+thread slots (see the native pointer boundary) are the exception the unsafe code answers for.
 
 ```silk,ignore
 fn register(wake: TransferableWake) -> Guard {

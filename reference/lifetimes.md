@@ -437,7 +437,10 @@ Static evaluation has no loans (STATIC-005), so a `static fn` body and an expres
 static evaluation are not region-checked.
 
 **Diagnostics:** A borrow of local or temporary storage whose loan must outlive a lifetime chosen by
-the caller, such as a lifetime parameter or `'static`, reports `SEM0212` at the borrow. A relation
+the caller, such as a lifetime parameter or `'static`, reports `SEM0212` at the borrow. When the
+borrow is assigned to a binding declared outside its block, whose type took that lifetime from
+where it was declared, the report is at the assignment instead, names the binding and the lifetime,
+and relates the borrow. A relation
 between two caller-chosen lifetimes that no declared or implied bound gives reports `SEM0212` at
 the flow that requires it. A use of a view after its referent's storage has ended reports `OWN0019`
 at that use. Storage that ends with a block ends at the block's closing brace, which is the reported

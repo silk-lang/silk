@@ -57,7 +57,7 @@ effect fn program() -> i32
   // Each thread gets its own handle to the same mutex.
   let mine = total.clone()
   let worker = run NativeThread.spawn(
-    fn() -> i32 {
+    || -> i32 {
       return addOne(move mine)
     }
   )
@@ -100,7 +100,7 @@ effect fn program() -> i32
   let parker = run Parker.make() |> Effect.provideMut<Allocator>(&mut allocator)
   let unparker = parker.unparker()
   let worker = run NativeThread.spawn(
-    fn() -> i32 {
+    || -> i32 {
       return wake(move unparker)
     }
   )

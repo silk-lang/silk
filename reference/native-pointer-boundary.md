@@ -125,8 +125,43 @@ and writes it with `silk.concurrency.atomic`, whose operations are unsafe and mu
 since every thread shares the word. A word is a hidden global defined next to its instance, so
 inlining and codegen units keep one word per program. A static body cannot call it.
 
-Silk has no other process-wide or thread-local storage. A function that keeps a value in its word
-must answer as if it computed it on every call, so that callers cannot tell the difference.
+A function that keeps a value in its word must answer as if it computed it on every call, so that
+callers cannot tell the difference.
+
+## Process and thread slots
+
+`Intrinsic.processSlot<T>() -> *mut T` is the safe address of one zero-initialized `T` that belongs
+to the call site in the calling function instance and lives as long as the process. Each run of
+that call answers the same address; another call site, even in the same function, has a slot of its
+own. Use it for process-wide state wider than a word, such as a timebase read once, or a table that
+a lazy initializer publishes. All threads share the slot, so the same rules as for the process word
+apply: reads and writes are unsafe, and those that can race must be atomic.
+
+`Intrinsic.threadSlot<T>() -> *mut T` is the same per thread: each thread sees its own `T`, zeroed
+when the thread starts and gone when it ends. The address belongs to the thread that asked for it.
+A body that can move between threads, such as a transferable execution package, asks again after
+each suspension rather than keeping the address. Thread slots are LLVM `thread_local` globals; the
+direct wasm32 backend accepts them only in a module without shared memory, where one thread runs and
+a thread slot is a process slot.
+
+Both are hidden globals named after the instance and the call site, so inlining and codegen units
+keep one slot per call site per program. A static body cannot call them. Silk has no other
+process-wide or thread-local storage, and no safe way to reach either.
+
+## Prefetch hints
+
+`Intrinsic.prefetch<P>(pointer: P, static write: bool, static locality: u32, static instruction: bool)
+-> ()` is the safe hint that the program will soon read the memory at the data pointer `pointer`,
+or write it with `write`. `P` is any data pointer type, nullable or not. `locality`, from 0 to 3,
+says how long to keep the memory in cache, from no reuse to every cache level; `instruction` selects
+the instruction cache instead of the data cache. The three selections are static; a locality past 3
+reports `SEM0214` at the argument.
+
+The hint reads and writes no memory, never faults, also for null or released memory, and never
+changes what the program computes. It lowers to `llvm.prefetch`: one prefetch instruction on x86_64
+and AArch64, and nothing on a target without one, such as `wasm32`. `Prefetch.hint` and
+`Prefetch.hintMany` in `silk.mem.prefetch` expose it with an options struct. A static body cannot
+call it.
 
 ## Native output storage
 

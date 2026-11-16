@@ -17,9 +17,11 @@ The encoder follows the design of zlib: a sliding window of up to 32 KiB with ha
 greedy matching for levels 1 to 3, lazy matching for levels 4 to 9, and blocks that use stored,
 fixed Huffman, or dynamic Huffman codes, whichever is smallest. Level 0 writes stored blocks.
 [`Encoder.make`](#Encoder.impl.make) allocates all storage one time. Later calls do not allocate and do not keep a
-borrow of your buffers. The output is deterministic: gzip uses timestamp zero, no optional
-fields, and OS byte 255. The bytes are a valid stream but are not the same bytes that zlib
-writes.
+borrow of your buffers. The output is deterministic, and with the same options, input and
+flushes it is byte for byte what zlib 1.3.1 writes, in steps that consume and write what zlib's
+`deflate` does with the same input and output lengths. Gzip uses timestamp zero, no optional
+fields, and operating system byte 255, which zlib sets to the system it was built for;
+[`Encoder.setGzipSystem`](#Encoder.impl.setGzipSystem) changes it.
 
 ## Examples
 ### Compress a buffer with zlib framing
@@ -46,7 +48,7 @@ pub effect fn main() -> i32
 
 Import as `Encoder` with `import silk.compress.deflate { Encoder }`.
 
-Public declarations: 9.
+Public declarations: 10.
 
 <a id="Strategy"></a>
 
@@ -459,6 +461,51 @@ pub strategy: Strategy
 
 How the encoder looks for repeated data.
 
+<a id="Options.hash"></a>
+
+### Field `hash`
+
+```silk
+pub hash: Hash
+```
+
+How the encoder finds earlier occurrences of the next bytes.
+
+<a id="Hash"></a>
+
+## `Hash`
+
+```silk
+pub enum Hash
+```
+
+How an [`Encoder`](#Encoder) finds earlier occurrences of the next bytes. Each choice writes the bytes of
+a zlib that uses it, and each is the same on every target.
+
+<a id="Hash.Rolling"></a>
+
+### `Rolling`
+
+```silk
+Rolling
+```
+
+zlib's rolling hash of 3 bytes, in a table of `1 << (memoryLevel + 7)` entries. The output is
+byte for byte zlib 1.3.1's.
+
+<a id="Hash.Multiplicative"></a>
+
+### `Multiplicative`
+
+```silk
+Multiplicative
+```
+
+The hash of Chromium's zlib, which Node.js and Chrome use: a multiplicative hash of 4 bytes,
+in a table of at least `1 << 15` entries. Its chains have fewer collisions, so it is faster
+at levels 4 to 9 and compresses about as well. The output is byte for byte Chromium zlib's
+(revision 09a1572 of Node 24).
+
 <a id="Options.impl"></a>
 
 ## Implementation `Options`
@@ -475,8 +522,8 @@ impl Options
 pub fn make(level: u32) -> Options
 ```
 
-Returns options with `level`, a 32 KiB window, memory level 8, and the default strategy, the
-defaults of zlib's `deflateInit`.
+Returns options with `level`, a 32 KiB window, memory level 8, the default strategy, and
+zlib's rolling hash, the defaults of zlib's `deflateInit`.
 
 <a id="Encoder"></a>
 
@@ -543,6 +590,20 @@ does.
 It does not allocate. It drops the input and output that the encoder holds, any dictionary,
 and a failure. Parameters set with [`Encoder.setParameters`](#Encoder.impl.setParameters) stay.
 
+<a id="Encoder.impl.setGzipSystem"></a>
+
+### Method `setGzipSystem`
+
+```silk
+pub fn setGzipSystem(self: &mut Self, system: u8) -> ()
+```
+
+Sets the operating system byte of the gzip header, which is 255 (unknown) by default.
+
+#### Details
+zlib writes the system it was built for: 3 on Unix, 19 on macOS, 10 on Windows. Set it before
+the first step of a stream. It stays across [`Encoder.reset`](#Encoder.impl.reset). Other formats ignore it.
+
 <a id="Encoder.impl.setDictionary"></a>
 
 ### Method `setDictionary`
@@ -551,16 +612,19 @@ and a failure. Parameters set with [`Encoder.setParameters`](#Encoder.impl.setPa
 pub fn setDictionary(self: &mut Self, dictionary: &[u8]) -> Result<(), EncodeError>
 ```
 
-Loads `dictionary` as data that the stream can refer to, before the first step, as zlib's
-`deflateSetDictionary` does.
+Loads `dictionary` as data that the stream can refer to, as zlib's `deflateSetDictionary`
+does.
 
 #### Details
-Only the last bytes that fit in the window are used. With zlib framing the header names the
-dictionary by its Adler-32, and the decoder must load the same dictionary. With raw framing
-the decoder must load the same dictionary without being told.
+Only the last bytes that fit in the window are used. With zlib framing, load it before the
+first step: the header names the dictionary by its Adler-32, and the decoder must load the
+same dictionary. With raw framing, load it before the first step or after a step that
+consumed all of its input with a flush, and the decoder must load the same dictionary at
+the same place without being told.
 
 #### Errors
-`InvalidUse` with gzip framing, after the first step, or after a failure.
+`InvalidUse` with gzip framing, with zlib framing after the first step, while the encoder
+holds input that is not compressed yet, or after a failure.
 
 <a id="Encoder.impl.setParameters"></a>
 
@@ -573,9 +637,10 @@ pub fn setParameters(self: &mut Self, level: u32, strategy: Strategy) -> Result<
 Changes the level and strategy for the data after this call, as zlib's `deflateParams` does.
 
 #### Details
-If the encoder holds input of the current block, the next [`Encoder.step`](#Encoder.impl.step) ends that block
-with the old settings before it compresses more, as `Flush.Block` does. Only then do the new
-settings apply.
+If the change needs another way of compressing (a new strategy, or a level on the other
+side of 0, 1 to 3, and 4 to 9) and a step ran before, the next [`Encoder.step`](#Encoder.impl.step) first ends
+the block of the input it holds with the old settings, as `Flush.Block` does, and only then
+applies the new settings. Otherwise the new settings apply at once.
 
 #### Errors
 `InvalidOptions` if `level` is more than 9. `InvalidUse` after a failure or after the stream
@@ -599,6 +664,13 @@ On the next call, give only the input after the consumed prefix. You can give a 
 buffer of any length. Call with `Flush.None` while more input follows. A flush finishes only
 when the step returns `Flushed`, or `Finished` for `Flush.Finish`. Until then, call again with
 the same flush. A second flush of the same kind with no new input writes nothing.
+
+The steps follow zlib's `deflate`: with the same options, the same input and output lengths,
+and the same flushes, each step consumes and writes what zlib 1.3.1 does.
+
+#### Gotchas
+As in zlib, if a `Sync` or `Full` flush fills the output, the step after it can write the
+marker of the flush again. Give more than 6 bytes of output when a flush starts to avoid it.
 
 #### Errors
 `InvalidUse` with input after the stream finished, or after an earlier failure.

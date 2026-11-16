@@ -1141,9 +1141,12 @@ the symbol once.
 The root package's own declarations of one symbol must agree whether or not anything calls them,
 so `silk check` reports a conflict between two of them without building. A declaration in a
 `static if` arm the target does not select is not declared, so a symbol whose C types differ
-between systems is declared once per system, each in its own arm. A declaration of a
-dependency or of the standard library enters the comparison where the executable reaches it, which
-only `silk build` knows.
+between systems is declared once per system, each in its own arm. `silk check` also compares
+them with the standard library's declarations of the same symbols in the modules the package
+imports, directly or through other modules, for the checked target, so a declaration that disagrees with the standard library's `close` or `fchmod`
+is reported without building. Two declarations that are both in the standard library, or a
+dependency's declaration, enter the comparison where the executable reaches them, which only
+`silk build` knows.
 
 ```silk,ignore
 unsafe extern "C" fn f() -> () as "not a symbol"
@@ -1175,7 +1178,9 @@ packages when the executable origin collects reachable foreign calls for the tar
 
 **Status:** Confirmed
 
-A foreign call retains its ordinary externally linked C symbol and classified signature. The backend emits one internal, non-inlined guard per symbol. The guard invokes the actual external function with a normal-return edge and a cleanup landing pad, and has a target-native Itanium/DWARF personality that traps in either unwind phase. A foreign exception therefore terminates at this boundary, including when an enclosing C++ caller has a catch handler. The original callee receives no inferred `nounwind` promise; the guard's `nounwind` describes its enforced termination path. No runtime symbol lookup occurs.
+A foreign call retains its ordinary externally linked C symbol and classified signature. The backend gives each Silk function that calls one a guard frame. The frame invokes the actual external function with a normal-return edge and a cleanup landing pad, and has a target-native Itanium/DWARF personality that traps in either unwind phase. A foreign exception therefore terminates at this boundary, including when an enclosing C++ caller has a catch handler. The original callee receives no inferred `nounwind` promise; the guard's `nounwind` describes its enforced termination path. No runtime symbol lookup occurs.
+
+A guarded function stays out of line unless its source asks to inline it with `@inline` or `@inlineAlways`. Inlined, its calls keep their unwind edges, and the caller takes the same terminating personality, which every guard shares. An `export "C"` entry always keeps its own frame.
 
 Unannotated calls access externally reachable memory conservatively. Only the explicit sealed [foreign contract](foreign-call-contracts.md) supplies narrower memory, capture, alias or no-return assertions. Raw pointers cross as address lanes; address-taken Silk roots are still reloaded after each call. Ordinary foreign data/error-state reads stay ordinary loads, with no recognized accessor names, global volatility or hardware fences.
 
@@ -1274,13 +1279,18 @@ sha256 = "d4f419dcbe81de4b86e6fbf172b647f41c67820a925efca55dae3bd43248d8e2"
 strip = 1
 ```
 
-`[native].function-order` names a text file below the manifest's directory that lists function
-symbols, one per line, such as `silk_1f3a9c...`; blank lines and lines starting with `#` are
-ignored. Write each symbol as the program's LLVM IR and a Linux `nm` spell it, without the leading
-underscore Mach-O adds. Every build writes these names beside its output in `<output>.symbols`, one
-line per symbol: the symbol, its kind and the declaration it belongs to.
-A Silk function's symbol derives from its declaration, not its body, so editing a body keeps it
-while renaming the function or changing its signature does not. A Linux or macOS executable link
+`[native].function-order` names a text file below the manifest's directory that lists functions,
+one per line; blank lines and lines starting with `#` are ignored. Every build writes its names
+beside its output in `<output>.symbols`, one line per symbol: the symbol, its kind and the
+declaration it belongs to, such as `app@0.1.0:src/main.silk::Parser.next`. A line may name a
+declaration that way, with or without the package's version (`app:src/main.silk::Parser.next`),
+and orders every symbol of that declaration, its generic instances and drop glue included, in the
+map's order. Prefer declarations: they stay the same across compiler versions and dependency
+bumps. A line may also name a symbol, such as `silk_1f3a9c...`, as the program's LLVM IR and a Linux
+`nm` spell it, without the leading underscore Mach-O adds. A Silk function's symbol derives from
+its declaration, not its body, so editing a body keeps it while renaming the function or changing
+its signature does not. When some entries name no function of the build, the build prints a note
+that counts them, so a stale file shows. A Linux or macOS executable link
 places the listed functions first, in the listed order, so code that runs together, such as a
 program's startup path, shares pages. On Linux the build compiles each function into its own
 section and links with `--symbol-ordering-file`, using lld: the one installed beside Clang, else
@@ -1461,6 +1471,25 @@ that no Silk code calls is still specialized, verified, and emitted, because its
 code the compiler cannot see. Roots are collected in canonical module then declaration order; they
 are monomorphic, so no specialization arguments are needed.
 
+The loaded module closure is every module the program loads through imports: the modules of the
+root package and the modules of its dependency packages alike. A dependency's export is a root of
+the program that loads its module, whether or not Silk code names it, so native code linked into
+that program can resolve the symbol. A module that no import reaches is not loaded and roots
+nothing.
+
+```silk,ignore
+// Package `core`, module `core.probes`.
+pub export "C" fn core_probe(value: i32) -> i32 { return value }
+pub fn touch() -> i32 { return 1 }
+
+// Package `app`, which depends on `core`. `core_probe` is defined in the executable.
+import core.probes
+pub fn main() -> i32 { return probes.touch() }
+```
+
+The standard library is the exception: its exports reach an artifact only as the selected
+runtime's or a selected component's.
+
 A generic export is not a root. Native code reaches it only through an address Silk code takes at
 an instantiation ([FFI-012](#ffi-012--c-function-pointers-are-exact-exported-addresses)), so an
 instantiation is discovered where that address is specialized, like a generic call
@@ -1480,10 +1509,10 @@ symbol and the target, in the
 [TARGET-003](#target-003--target-unavailability-is-a-compile-time-compatibility-error) shape, and
 constructs no module.
 
-**Current compiler:** Aligned. `Instances.discover` appends the export roots after the entry when
-the target kind is native and records them on the discovery result; lowering copies the inventory
-onto the MIR module, which is the only input the backends receive, and into the driver's cached
-emission header.
+**Current compiler:** Aligned. The build roots the exports of the selected runtime, the application
+module, the other root-package modules and every loaded dependency module, and defines the C
+object of each of their exported statics. The native build test links a C unit against a
+dependency's exported function and static that no Silk code names.
 
 **Evidence:** export specification,
 [instance discovery](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Instances.ts),

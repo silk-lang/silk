@@ -82,7 +82,7 @@ pub fn main() -> i32 {
 
 Import as `usize` with `import silk.num.usize`.
 
-Public declarations: 72.
+Public declarations: 79.
 
 <a id="MAX"></a>
 
@@ -615,6 +615,41 @@ pub fn shiftRight(left: usize, right: usize) -> usize
 Shifts `left` bits right by `right` positions and inserts zero bits. Traps if `right` is
 not less than [`BITS`](#BITS).
 
+<a id="shiftLeftUnchecked"></a>
+
+## `shiftLeftUnchecked`
+
+```silk
+pub unsafe fn shiftLeftUnchecked(left: usize, right: usize) -> usize
+```
+
+Shifts `left` bits left by `right` positions without testing the count. The caller proves that
+`right` is less than [`BITS`](#BITS).
+
+### When to use
+
+Use this function in measured hot code whose shift counts are proven in range, such as a bit
+reader that masks its count. [`shiftLeft`](#shiftLeft) traps on a count out of range and is the default.
+
+### Gotchas
+
+A count out of range is undefined behavior, and an optimized build shifts with no test.
+
+<a id="shiftRightUnchecked"></a>
+
+## `shiftRightUnchecked`
+
+```silk
+pub unsafe fn shiftRightUnchecked(left: usize, right: usize) -> usize
+```
+
+Shifts `left` bits right by `right` positions and inserts zero bits, without testing the count. The
+caller proves that `right` is less than [`BITS`](#BITS).
+
+### Gotchas
+
+A count out of range is undefined behavior, and an optimized build shifts with no test.
+
 <a id="rotateLeft"></a>
 
 ## `rotateLeft`
@@ -636,6 +671,65 @@ pub fn rotateRight(left: usize, right: usize) -> usize
 
 Rotates the bits of `left` right by `right` positions. The count is reduced modulo [`BITS`](#BITS), so
 each count is valid.
+
+<a id="byteSwap"></a>
+
+## `byteSwap`
+
+```silk
+pub fn byteSwap(value: usize) -> usize
+```
+
+Returns `value` with the order of its bytes reversed. An optimized build makes it one byte swap
+instruction where the target has one.
+
+<a id="fromLittleEndian"></a>
+
+## `fromLittleEndian`
+
+```silk
+pub fn fromLittleEndian(value: usize) -> usize
+```
+
+Returns the `usize` whose little-endian bytes are the bytes of `value` in memory, such as a word
+read with `Pointer.readUnaligned` from a little-endian format. It does nothing on a
+little-endian target and swaps the bytes on a big-endian one.
+
+<a id="toLittleEndian"></a>
+
+## `toLittleEndian`
+
+```silk
+pub fn toLittleEndian(value: usize) -> usize
+```
+
+Returns `value` arranged so that its bytes in memory are little-endian, for writing it to a
+little-endian format. It does nothing on a little-endian target and swaps the bytes on a
+big-endian one.
+
+<a id="fromBigEndian"></a>
+
+## `fromBigEndian`
+
+```silk
+pub fn fromBigEndian(value: usize) -> usize
+```
+
+Returns the `usize` whose big-endian bytes are the bytes of `value` in memory, such as a word read
+with `Pointer.readUnaligned` from a network header. It swaps the bytes on a little-endian target
+and does nothing on a big-endian one.
+
+<a id="toBigEndian"></a>
+
+## `toBigEndian`
+
+```silk
+pub fn toBigEndian(value: usize) -> usize
+```
+
+Returns `value` arranged so that its bytes in memory are big-endian, for writing it to a
+network header or another big-endian format. It swaps the bytes on a little-endian target and
+does nothing on a big-endian one.
 
 <a id="countOnes"></a>
 

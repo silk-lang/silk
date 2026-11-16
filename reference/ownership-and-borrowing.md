@@ -1249,7 +1249,7 @@ The body operation determines both capture access and the callable's strongest i
 struct Token { value: i32 }
 
 fn prepare(token: Token) -> once fn() -> Token {
-  return fn() -> Token { return move token }
+  return || -> Token { return move token }
 }
 ```
 
@@ -1276,7 +1276,7 @@ struct Slot<'a> { view: &'a i32 }
 
 fn invalid(slot: &mut Slot) -> () {
   let count = 41
-  let mut store = fn() -> () { slot.view = &count }
+  let mut store = || -> () { slot.view = &count }
   store()
 }
 ```
@@ -1476,7 +1476,7 @@ run or drop. A `once fn` value moves into the Effect.
 ```silk,ignore
 effect fn twice() -> i32 {
   let mut count = 0
-  let mut counting = effect fn(extra: i32) -> i32 {
+  let mut counting = effect |extra: i32| -> i32 {
     count = count + extra
     return count
   }

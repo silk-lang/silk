@@ -637,6 +637,203 @@ Returns `pointer` as a many-element pointer. The address does not change.
 The result has no length. Before each indexed access, the caller must prove that the element
 is inside the allocation.
 
+<a id="Pointer.impl.cast"></a>
+
+### Associated function `cast`
+
+```silk
+pub unsafe fn cast<T, U>(pointer: *const T) -> *const U
+```
+
+Returns `pointer` as a pointer to a `U` at the same address.
+
+#### When to use
+
+Use `cast` to read a C record out of a byte buffer, such as the variable-length records
+`read` returns for an inotify descriptor, when the caller knows the record's address is
+aligned for `U`. For an address that may not be aligned, use [`Pointer.castUnaligned`](#Pointer.impl.castUnaligned).
+
+#### Gotchas
+
+The caller must prove that the address is a multiple of the alignment of `U`, and that the
+bytes there are a valid `U` before reading it. It does not check either.
+
+#### Examples
+```silk
+import silk.core.ownership { Copy }
+import silk.mem.layout { Layout }
+import silk.mem.pointer { Pointer }
+import silk.num.u32
+
+extern "C" struct Header {
+  kind: u32,
+  length: u32,
+}
+
+impl Copy for Header {}
+
+pub fn main() -> i32 {
+  // Two records of a header and `length` bytes, in word-aligned storage.
+  let storage: [u32; 6] = [1, 4, 0x64636261, 2, 0, 0]
+  let bytes = unsafe Pointer.cast<u32, u8>(Pointer.fromRef<u32>(&storage[0]))
+  let first = unsafe Pointer.read<Header>(unsafe Pointer.cast<u8, Header>(bytes))
+  let next = Layout.of<Header>().bytes + u32.toUsize(first.length)
+  let second = unsafe Pointer.read<Header>(unsafe Pointer.cast<u8, Header>(
+    unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(bytes), next)
+  ))
+  if first.kind != 1 || second.kind != 2 {
+    return 1
+  }
+  return 0
+}
+```
+
+<a id="Pointer.impl.castMut"></a>
+
+### Associated function `castMut`
+
+```silk
+pub unsafe fn castMut<T, U>(pointer: *mut T) -> *mut U
+```
+
+Returns `pointer` as a mutable pointer to a `U` at the same address.
+
+#### Gotchas
+
+The caller must prove that the address is a multiple of the alignment of `U`, and that the
+bytes there are a valid `U` before reading it. It does not check either.
+
+<a id="Pointer.impl.castUnaligned"></a>
+
+### Associated function `castUnaligned`
+
+```silk
+pub unsafe fn castUnaligned<T, U>(pointer: *const T) -> *const align(1) U
+```
+
+Returns `pointer` as a pointer to a `U` at the same address that need not be aligned for `U`.
+
+#### Details
+
+Read through the result with [`Pointer.readUnaligned`](#Pointer.impl.readUnaligned). Use [`Pointer.cast`](#Pointer.impl.cast) when the address
+is known to be aligned.
+
+#### Gotchas
+
+The caller must prove that the bytes there are a valid `U` before reading it.
+
+<a id="Pointer.impl.castUnalignedMut"></a>
+
+### Associated function `castUnalignedMut`
+
+```silk
+pub unsafe fn castUnalignedMut<T, U>(pointer: *mut T) -> *mut align(1) U
+```
+
+Returns `pointer` as a writable pointer to a `U` at the same address that need not be aligned
+for `U`.
+
+#### Details
+
+Write through the result with [`Pointer.writeUnaligned`](#Pointer.impl.writeUnaligned) and read it with
+[`Pointer.readUnaligned`](#Pointer.impl.readUnaligned). Use [`Pointer.castMut`](#Pointer.impl.castMut) when the address is known to be aligned.
+
+#### Gotchas
+
+The caller must prove that the storage there is writable, and that its bytes are a valid `U`
+before reading it.
+
+<a id="Pointer.impl.wrappingOffset"></a>
+
+### Associated function `wrappingOffset`
+
+```silk
+pub fn wrappingOffset<T>(pointer: [*]const T, delta: isize) -> [*]const T
+```
+
+Returns `pointer` moved by `delta` elements of `T`, as plain address arithmetic.
+
+#### When to use
+
+Use it for a base that may lie outside its allocation, such as a C window addressed as
+`base + index` where `base` is the start of the data minus an index that only ever counts up
+from there. Use [`Pointer.at`](#Pointer.impl.at) for an element inside the allocation.
+
+#### Details
+
+The address wraps modulo the pointer width. The result keeps the allocation of `pointer`, so
+it can be read through once it is back inside that allocation, however far outside the
+steps in between went. No in-bounds assumption is made. Making the pointer is safe; reading
+or writing through it is not.
+
+#### Gotchas
+
+The result must be inside the original allocation before any access through it.
+
+<a id="Pointer.impl.wrappingOffsetMut"></a>
+
+### Associated function `wrappingOffsetMut`
+
+```silk
+pub fn wrappingOffsetMut<T>(pointer: [*]mut T, delta: isize) -> [*]mut T
+```
+
+Returns the writable `pointer` moved by `delta` elements of `T`, as plain address arithmetic.
+
+#### When to use
+
+Use it for a base that may lie outside its allocation, such as a C window addressed as
+`base + index`. Use [`Pointer.atMut`](#Pointer.impl.atMut) for an element inside the allocation.
+
+#### Details
+
+The address wraps modulo the pointer width. The result keeps the allocation of `pointer`, so
+it can be read and written through once it is back inside that allocation. No in-bounds
+assumption is made. Making the pointer is safe; reading or writing through it is not.
+
+#### Gotchas
+
+The result must be inside the original allocation before any access through it.
+
+<a id="Pointer.impl.zeroed"></a>
+
+### Associated function `zeroed`
+
+```silk
+pub unsafe fn zeroed<T>() -> T
+```
+
+Returns a `T` whose bytes are all zero.
+
+#### When to use
+
+Use `zeroed` for an `extern "C"` struct that a C function fills in, such as `rusage` or
+`statx`, instead of writing every field out.
+
+#### Gotchas
+
+The caller must prove that all-zero bytes are a valid `T`. They are for integers, floats,
+nullable pointers and `extern "C"` structs and arrays of those. They are not for a non-null
+pointer, a reference, a `bool` or enum without a zero member, or a value that owns memory.
+
+#### Examples
+```silk
+import silk.mem.pointer { Pointer }
+
+extern "C" struct Usage {
+  seconds: i64,
+  faults: i64,
+}
+
+pub fn main() -> i32 {
+  let usage = unsafe Pointer.zeroed<Usage>()
+  if usage.seconds != 0 || usage.faults != 0 {
+    return 1
+  }
+  return 0
+}
+```
+
 
 Category: Memory.
 

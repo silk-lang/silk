@@ -361,8 +361,8 @@ the body can resume on any thread that drives it. The endpoint and its state mus
 thread that signals it. The body parks with [`parkTransferable`](#Execution.impl.parkTransferable).
 
 #### Gotchas
-Values that the body makes itself need no bound. Silk has no thread-local or global storage,
-so nothing outside the body can reach them while it moves between threads.
+Values that the body makes itself need no bound. Silk has no safe thread-local or global
+storage, so nothing outside the body can reach them while it moves between threads.
 
 <a id="Execution.impl.drive"></a>
 

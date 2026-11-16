@@ -166,9 +166,11 @@ recognition. Malformed candidates such as `1.5s`, `0x10s`, `3sec`, `1H`, `1h60m`
 standalone exponent spelling such as `1e5` remains a floating literal because no unit follows it.
 
 **Diagnostics:** A malformed candidate produces exactly one focused lexical diagnostic. Invalid
-amounts report `LEX0008`, unknown units `LEX0009`, repeated units `LEX0010`, out-of-order units
-`LEX0011`, and subordinate fields outside their range `LEX0012`. Invalid digit separators retain
-`LEX0005`.
+amounts report `LEX0008`. A last amount with no unit after an earlier component, as in `1h30`,
+reports `LEX0015`, which suggests the next smaller unit (`1h30m`) when that unit exists and can
+hold the amount; `1h90` and `1ns5` get no suggestion. Unknown units report `LEX0009`, repeated
+units `LEX0010`, out-of-order units `LEX0011`, and subordinate fields outside their range
+`LEX0012`. Invalid digit separators retain `LEX0005`.
 
 **Evidence:** duration literal specification,
 [duration actor](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/internal/DurationLiteral.ts),
