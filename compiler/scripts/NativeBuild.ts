@@ -379,6 +379,7 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
       })
     const stdlib = join(snapshot, 'stdlib')
     const compilerManifest = join(snapshot, 'compiler/silk.toml')
+    const compilerRoot = join(snapshot, 'compiler/src/main.silk')
 
     const buildFlags = [
       '--stdlib',
@@ -400,7 +401,15 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
       ...(emit === 'llvm-ir' ? ['--emit', 'llvm-ir'] : []),
       ...buildFlags,
     ]
+    // A seed is a released compiler, so it is driven through the CLI every release has. The
+    // compiler it builds resolves and compiles an explicit request.
     const compile = Effect.fnUntraced(function* (name: string, compiler: string, output: string, emit: string) {
+      if (compiler === producer && producerGeneration === 'seed')
+        return yield* invoke(
+          name,
+          [compiler, ...argumentsFor(compilerRoot, output, emit === 'llvm-ir' ? 'llvm-ir' : 'executable')],
+          join(snapshot, 'compiler'),
+        )
       const commands = yield* CompilationBuild.prepare({ compiler, manifest: compilerManifest, output,
         stdlib, optimization, debug, emit })
       const resolved = yield* invoke(`${name}-resolve`, [compiler, ...commands[0]], join(snapshot, 'compiler'))
