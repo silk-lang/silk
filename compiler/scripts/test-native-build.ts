@@ -2909,7 +2909,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   yield* fs.writeFileString(join(toolApp, 'silk.toml'), toolManifest('\n[build]\ntools = ["tlib"]\n'))
   const generatedStamp = Effect.fnUntraced(function* () {
     const cache = join(toolApp, 'build/steps')
-    const entries = (yield* fs.readDirectory(cache)).sort()
+    const entries = (yield* fs.readDirectory(cache)).filter((name) => /^[0-9a-f]{64}$/.test(name)).sort()
     const outputs: string[] = []
     for (const entry of entries) {
       const file = join(cache, entry, 'generated.silk')
