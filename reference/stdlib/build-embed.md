@@ -6,7 +6,7 @@ Generated modules that expose a declared file's bytes as a static value.
 
 Import as `Embed` with `import silk.build.embed as Embed`.
 
-Public declarations: 1.
+Public declarations: 2.
 
 <a id="module"></a>
 
@@ -20,6 +20,18 @@ pub effect fn module(input: Deferred<Path>) -> Deferred<Path>
 
 Produces a module with `pub const data: &'static [u8]` containing exactly the input file's bytes.
 The file's producer runs first, and its content determines the generated module's cache key.
+
+<a id="restore"></a>
+
+## `restore`
+
+```silk
+pub effect fn restore(step: &[u8]) -> StepHandle
+  ! StepFailure
+  ? &mut Allocator
+```
+
+Restores a described embedding as a step this process can run.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`, `wasm64-unknown-unknown`.

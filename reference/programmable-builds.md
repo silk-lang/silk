@@ -52,6 +52,10 @@ Artifacts live under `build/<target>/<mode>/<name>`, relative to the enclosing w
 
 A custom `Step` implements `key` and `make`. Its key declares every file, directory, environment variable and value it reads. `Make` grants access to those inputs and the step's output directory. The runner hashes inputs and toolchain contents, reuses complete cached outputs, executes independent misses on fibers and observes its memory budget. `Key.always` opts a step out of reuse.
 
+A task program runs only its custom steps. It describes every compilation and every standard step (`Run`, `WriteFiles`, an embedded file, a dependency path) to the compiler, which runs them through `silkc graph` with the same keys and the same cache, and answers where each step left its outputs. A graph that mixes the two alternates: the task program runs a custom step, then hands the compiler the standard steps that read it. A task program with no custom step therefore contains no runner, and builds in a few seconds. A program that drives a `Runner` itself needs the compiler for its standard steps: `SILK_COMPILER`, or `silkc` on `PATH`. `Run.registerHere` and `WriteFiles.registerHere` register the same work as steps the program runs itself.
+
+The compiler reports each compilation as it does for `silk build`: the `Compiling` line and one line per stage once the compilation ends, then `Finished` with the published artifact.
+
 `Run` describes an external command with declared inputs and outputs. `WriteFiles` creates files from deferred values. `Package.path(alias, subpath)` resolves a dependency's included file; the package must publish that file or its parent directory in `include`.
 
 ## Package parameters and plans

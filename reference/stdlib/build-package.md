@@ -6,7 +6,7 @@ Per-package backend settings and typed parameter bindings in a compilation graph
 
 Import as `Package` with `import silk.build.package { Package }`.
 
-Public declarations: 3.
+Public declarations: 4.
 
 <a id="Package"></a>
 
@@ -17,6 +17,46 @@ pub struct Package
 ```
 
 Overrides that affect only the selected declared package.
+
+<a id="Package.optimization"></a>
+
+### Field `optimization`
+
+```silk
+pub optimization: Option<Deferred<Optimize>>
+```
+
+<a id="Package.debugging"></a>
+
+### Field `debugging`
+
+```silk
+pub debugging: Option<Deferred<bool>>
+```
+
+<a id="Package.bindings"></a>
+
+### Field `bindings`
+
+```silk
+pub bindings: List<Binding>
+```
+
+<a id="Package.excluded"></a>
+
+### Field `excluded`
+
+```silk
+pub excluded: bool
+```
+
+<a id="Package.impl.Schema"></a>
+
+## Implementation `Schema for Package`
+
+```silk
+impl Schema for Package
+```
 
 <a id="Package.impl"></a>
 
@@ -132,6 +172,18 @@ pub effect fn resolve(package: &Package, make: &mut Make) -> Definitions.Package
 ```
 
 Resolves overrides only after every declared producer has completed.
+
+<a id="restorePath"></a>
+
+## `restorePath`
+
+```silk
+pub effect fn restorePath(step: &[u8]) -> StepHandle
+  ! StepFailure
+  ? &mut Allocator | &mut FileSystem
+```
+
+Restores a described dependency path lookup as a step this process can run.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`, `wasm64-unknown-unknown`.

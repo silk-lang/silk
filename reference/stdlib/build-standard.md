@@ -6,7 +6,7 @@ Materializes immutable standard action descriptions through the ordinary step in
 
 Import as `Standard` with `import silk.build.standard as Standard`.
 
-Public declarations: 1.
+Public declarations: 3.
 
 <a id="register"></a>
 
@@ -17,6 +17,30 @@ pub effect fn register(action: &Action) -> StepHandle ! StepFailure ? &mut Alloc
 ```
 
 Registers a standard action without executing it or reading its inputs.
+
+<a id="restore"></a>
+
+## `restore`
+
+```silk
+pub effect fn restore(kind: string, step: &[u8]) -> StepHandle
+  ! StepFailure
+  ? &mut Allocator | &mut FileSystem
+```
+
+Restores a described standard step by its kind as a step this process can run.
+
+<a id="restoreLinks"></a>
+
+## `restoreLinks`
+
+```silk
+pub effect fn restoreLinks(links: &[Link]) -> ()
+  ! StepFailure
+  ? &mut Allocator | &mut FileSystem
+```
+
+Restores every step of a description in this process, so a runner here can run them.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`, `wasm64-unknown-unknown`.

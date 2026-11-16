@@ -6,7 +6,7 @@ Compilations as build steps that write explicit requests before invoking the com
 
 Import as `Compilation` with `import silk.build.compilation { Compilation }`.
 
-Public declarations: 1.
+Public declarations: 2.
 
 <a id="Compilation"></a>
 
@@ -791,7 +791,8 @@ pub effect fn step(self: &Self) -> StepHandle
     ? &mut Allocator
 ```
 
-Registers the compilation once, freezing its settings and retaining its typed work.
+Registers the compilation once, freezing its settings. The step holds the compilation's
+description, which the compiler restores and runs.
 
 <a id="Compilation.impl.artifact"></a>
 
@@ -830,6 +831,19 @@ pub effect fn emittedImportLibrary(self: &Self) -> Deferred<Path>
 
 Returns the Windows import library as a deferred input. Configure `importLibrary` first.
 Consuming the path runs this compilation and rejects a missing import-library output.
+
+<a id="restore"></a>
+
+## `restore`
+
+```silk
+pub effect fn restore(step: &[u8]) -> StepHandle
+  ! StepFailure
+  ? &mut Allocator | &mut FileSystem
+```
+
+Restores a described compilation as the steps this process can run: one resolves its
+request and one compiles it. Answers the compiling step.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`, `wasm64-unknown-unknown`.

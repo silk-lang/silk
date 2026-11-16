@@ -2,6 +2,9 @@
 
 import silk.build.descriptor as Descriptions { Input as Description }
 import silk.build.standard as Standard
+import silk.build.graph as Graphs
+import silk.build.delegate as Delegate
+import silk.build.context as Context
 import silk.build.encoding as Encoding
 import silk.build.fingerprint as Fingerprint
 import silk.build.toolchain as Toolchain
@@ -25,7 +28,8 @@ import silk.mem.layout { Layout }
 import silk.mem.pointer { Pointer }
 import silk.core.reflect { Reflect }
 import silk.schema.issue { SchemaError }
-import silk.schema.schema { Schema }
+import silk.schema.schema { Schema, Schemas, SchemaReader, SchemaWriter, Spec }
+import silk.schema.issue { Issue }
 import silk.system.sandbox as Sandbox
 import silk.system.child_process { ChildProcess, ProcessError, ProcessOutcome }
 import silk.system.child_process_native { OsChildProcess }
@@ -82,6 +86,8 @@ union Reference {
   Value { bytes: Bytes },
   Output { step: StepHandle, name: String },
   ResolvedPath { step: StepHandle },
+  // A step output restored from a description, before the runner links `node` to its step.
+  Linked { node: u64, name: String, resolved: bool },
 }
 
 /// A typed reference to a source, a known value, or a step result. Only `Make` resolves it.
@@ -151,6 +157,126 @@ impl<T> Deferred<T> {
   }
 }
 
+// How a deferred reference travels in a step description. `node` identifies the producing step
+// within one description.
+struct Wire {
+  pub kind: String,
+  pub text: String,
+  pub node: Option<u64>,
+}
+
+impl Schema for Wire {
+  static fn spec() -> Spec<Wire> {
+    return Spec<Wire>.of() |> Spec<Wire>.strict()
+  }
+}
+
+effect fn wired(reference: &Reference) -> Wire
+  ! Issue | OutOfMemoryError
+  ? &mut Allocator {
+  return match &reference.* {
+    Reference.Declared { input } => match input {
+      Description.Source { path } => Wire {
+        kind: run String.copy("source"),
+        text: run String.copy(path),
+        node: Option<u64>.none(),
+      }
+      Description.Supplied { path } => Wire {
+        kind: run String.copy("external"),
+        text: run String.copy(path),
+        node: Option<u64>.none(),
+      }
+      _ => {
+        fail Issue.invalidValue("a deferred value that names a path, a value or a step output")
+      }
+    }
+    Reference.Source { path, external } => Wire {
+      kind: run String.copy(
+        if external {
+          "external"
+        } else {
+          "source"
+        },
+      ),
+      text: run String.copy(path.view()),
+      node: Option<u64>.none(),
+    }
+    Reference.Value { bytes } => match move run String.copyUtf8(bytes.asSlice()) {
+      Result<String, InvalidUtf8>.Success { value } => Wire {
+        kind: run String.copy("value"),
+        text: move value,
+        node: Option<u64>.none(),
+      }
+      Result<String, InvalidUtf8>.Failure { .. } => {
+        fail Issue.invalidValue("a deferred value encoded as UTF-8")
+      }
+    }
+    Reference.Output { step, name } => Wire {
+      kind: run String.copy("output"),
+      text: run String.copy(name.view()),
+      node: Option<u64>.some(usize.toU64(step.identity())),
+    }
+    Reference.ResolvedPath { step } => Wire {
+      kind: run String.copy("resolved-path"),
+      text: String.make(),
+      node: Option<u64>.some(usize.toU64(step.identity())),
+    }
+    Reference.Linked { node, name, resolved } => Wire {
+      kind: run String.copy(
+        if resolved {
+          "resolved-path"
+        } else {
+          "output"
+        },
+      ),
+      text: run String.copy(name.view()),
+      node: Option<u64>.some(node),
+    }
+  }
+}
+
+effect fn unwired(wire: Wire) -> Reference
+  ! Issue | OutOfMemoryError
+  ? &mut Allocator {
+  let kind = wire.kind.view()
+  if kind == "value" {
+    return Reference.Value { bytes: run Bytes.copy(String.ownedUtf8Bytes(&wire.text)) }
+  }
+  if kind == "source" || kind == "external" {
+    return Reference.Source { external: kind == "external", path: move wire.text }
+  }
+  if kind == "output" || kind == "resolved-path" {
+    return match wire.node {
+      Option<u64>.Some { value } => Reference.Linked {
+        node: value,
+        resolved: kind == "resolved-path",
+        name: move wire.text,
+      }
+      Option<u64>.None => {
+        fail Issue.invalidValue("a step output that names its step")
+      }
+    }
+  }
+  fail Issue.invalidValue("value, source, external, output or resolved-path")
+}
+
+/// A deferred value travels in a step description as its reference, never as its result.
+impl<T> Schema for Deferred<T> {
+  effect fn read<R: SchemaReader>(reader: &mut R) -> Self
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator {
+    let wire = run Schemas.read<Wire, R>(&mut reader.*)
+    return Deferred<T> { reference: run unwired(move wire), owner: [] }
+  }
+
+  effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+    ! Issue | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator {
+    let wire = run wired(&self.reference)
+    return run Schemas.write<Wire, W>(&wire, &mut writer.*)
+  }
+}
+
 impl<T: Schema> Deferred<T> {
   /// Captures a known value without exposing a way to read deferred results while constructing the graph.
   pub effect fn value(value: T) -> Self
@@ -217,6 +343,11 @@ effect fn copyReference(reference: &Reference) -> Reference
       name: run String.copy(name.view()),
     }
     Reference.ResolvedPath { step } => Reference.ResolvedPath { step: step.copy() }
+    Reference.Linked { node, name, resolved } => Reference.Linked {
+      node: node,
+      name: run String.copy(name.view()),
+      resolved: resolved,
+    }
   }
 }
 
@@ -256,6 +387,12 @@ fn sameReference(left: &Reference, right: &Reference) -> bool {
     Reference.Output { step, name } => match &right.* {
       Reference.Output { step: other, name: path } => step.identity() == other.identity()
         && name.view() == path.view()
+      _ => false
+    }
+    Reference.Linked { node, name, resolved } => match &right.* {
+      Reference.Linked { node: other, name: path, resolved: same } => node == other
+        && name.view() == path.view()
+        && resolved == same
       _ => false
     }
   }
@@ -312,6 +449,29 @@ pub struct Key {
 }
 
 impl Key {
+  /// Starts an empty key, for collecting what a described step declares.
+  pub fn collecting() -> Self {
+    return Key.make()
+  }
+
+  /// Retains every step whose output this key declares as an input.
+  pub effect fn producers(self: &Self) -> List<StepHandle>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut found = List<StepHandle>.make()
+    let inputs = self.inputs.asSlice()
+    let mut at = usize.ZERO
+    while at < inputs.length {
+      match &inputs[at].reference {
+        Reference.Output { step, .. } => run found.append(step.copy())
+        Reference.ResolvedPath { step } => run found.append(step.copy())
+        _ => ()
+      }
+      at = at + usize.ONE
+    }
+    return move found
+  }
+
   fn make() -> Self {
     return Key {
       material: Bytes.make(),
@@ -463,19 +623,230 @@ struct Node {
   work: Mutex<Option<Pending<Resolved, (), StepFailure>>>,
 }
 
+// A standard step as the compiler can restore it: its kind and its encoded description.
+struct Described {
+  kind: String,
+  step: Bytes,
+}
+
+// One step of a graph. A standard step is held as its description, which the compiler restores
+// and runs; the compiler's answer becomes the step's provision. A custom step is registered with
+// its node and runs in this process.
+struct Slot {
+  described: Option<Described>,
+  producers: List<StepHandle>,
+  node: Mutex<Option<Arc<Node>>>,
+  executor: Option<Graphs.Executor>,
+  provision: Mutex<Option<Provision>>,
+}
+
+/// Where a step that another process ran left its outputs.
+pub struct Provision {
+  /// The step's cache directory, named by its key.
+  pub directory: String,
+  /// Whether the step runs every time, so its consumers do too.
+  pub volatile: bool,
+  /// Whether the step is a compilation.
+  pub compilation: bool,
+  /// Whether a compilation built its artifact, or only wrote its request.
+  pub compiled: bool,
+}
+
+impl Schema for Provision {
+  static fn spec() -> Spec<Provision> {
+    return Spec<Provision>.of() |> Spec<Provision>.strict()
+  }
+}
+
 /// An owned step registered in a graph. Several deferred outputs may retain the same step.
 pub struct StepHandle {
-  node: Arc<Node>
+  slot: Arc<Slot>
+}
+
+/// One step of a described graph: what the task program hands to the compiler.
+pub struct StepDescription {
+  /// The step's identity within its description.
+  pub node: u64,
+  /// The kind of standard step.
+  pub kind: String,
+  /// The step's own JSON description.
+  pub step: String,
+}
+
+impl Schema for StepDescription {
+  static fn spec() -> Spec<StepDescription> {
+    return Spec<StepDescription>.of() |> Spec<StepDescription>.strict()
+  }
+}
+
+/// A described step's identity and the step restored for it.
+pub struct Link {
+  node: u64,
+  step: StepHandle,
 }
 
 impl StepHandle {
   /// Retains the step without copying or running its work.
   pub fn copy(self: &Self) -> Self {
-    return StepHandle { node: self.node.clone() }
+    return StepHandle { slot: self.slot.clone() }
   }
 
-  fn identity(self: &Self) -> usize {
-    return Pointer.address<Node>(Pointer.fromRef<Node>(self.node.get()))
+  /// The step's identity among the live steps of this process.
+  pub fn identity(self: &Self) -> usize {
+    return Pointer.address<Slot>(Pointer.fromRef<Slot>(self.slot.get()))
+  }
+
+  /// Holds a standard step as its description. `producers` are the steps whose outputs it reads.
+  /// The compiler restores the step by its kind and runs it.
+  pub effect fn described(kind: string, step: Bytes, producers: List<StepHandle>) -> Self
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return StepHandle {
+      slot: run Arc<Slot>.make(
+        Slot {
+          described: Option<Described>.some(
+            Described { kind: run String.copy(kind), step: move step },
+          ),
+          producers: move producers,
+          node: run Mutex<Option<Arc<Node>>>.make(Option<Arc<Node>>.none()),
+          executor: Option<Graphs.Executor>.none(),
+          provision: run Mutex<Option<Provision>>.make(Option<Provision>.none()),
+        },
+      ),
+    }
+  }
+
+  /// Holds a step that already ran, as the directory its outputs are in.
+  pub effect fn provided(provision: Provision) -> Self
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return StepHandle {
+      slot: run Arc<Slot>.make(
+        Slot {
+          described: Option<Described>.none(),
+          producers: List<StepHandle>.make(),
+          node: run Mutex<Option<Arc<Node>>>.make(Option<Arc<Node>>.none()),
+          executor: Option<Graphs.Executor>.none(),
+          provision: run Mutex<Option<Provision>>.make(Option<Provision>.some(move provision)),
+        },
+      ),
+    }
+  }
+
+  /// The step's description, when it is a standard step that has not been restored.
+  pub effect fn description(self: &Self) -> Option<StepDescription>
+    ! StepFailure
+    ? &mut Allocator {
+    let slot = self.slot.get()
+    if readyNode(self).isSome() {
+      return Option<StepDescription>.none()
+    }
+    if let Option<Described>.Some { value } = &slot.described {
+      let text = match move run String.copyUtf8(value.step.asSlice()) {
+        Result<String, InvalidUtf8>.Success { value: copied } => move copied
+        Result<String, InvalidUtf8>.Failure { .. } => {
+          run refused("a step description must be UTF-8")
+        }
+      }
+      return Option<StepDescription>.some(
+        StepDescription {
+          node: usize.toU64(self.identity()),
+          kind: run String.copy(value.kind.view()),
+          step: move text,
+        },
+      )
+    }
+    return Option<StepDescription>.none()
+  }
+
+  /// Gives this step the work, or the provision, of the step restored from its description.
+  pub effect fn install(self: &Self, restored: &StepHandle) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if let Option<Arc<Node>>.Some { value } = move readyNode(restored) {
+      let mut held = self.slot.get().node.lock()
+      let target = held.getMut()
+      target.* = Option<Arc<Node>>.some(move value)
+      drop held
+    }
+    if let Option<Provision>.Some { value } = move run provisionOf(restored) {
+      provide(self, move value)
+    }
+  }
+
+  /// The steps restored for a description, in its order.
+  pub effect fn linkedSteps(links: &[Link]) -> List<StepHandle>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut steps = List<StepHandle>.make()
+    let mut at = usize.ZERO
+    while at < links.length {
+      run steps.append(links[at].step.copy())
+      at = at + usize.ONE
+    }
+    return move steps
+  }
+
+  /// Describes these steps and everything they read, producers first. Answers nothing when the
+  /// graph holds a custom step, which only this program can run.
+  pub effect fn describeAll(targets: &[StepHandle]) -> Option<List<StepDescription>>
+    ! StepFailure
+    ? &mut Allocator {
+    let mut seen = List<usize>.make()
+    let mut steps = List<StepDescription>.make()
+    let mut at = usize.ZERO
+    while at < targets.length {
+      if !run describeInto(&targets[at], &mut seen, &mut steps) {
+        return Option<List<StepDescription>>.none()
+      }
+      at = at + usize.ONE
+    }
+    return Option<List<StepDescription>>.some(move steps)
+  }
+
+  /// Finds the executor of a custom step among these steps and everything they read.
+  pub effect fn executorOf(targets: &[StepHandle]) -> Option<Graphs.Executor>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut seen = List<usize>.make()
+    let mut at = usize.ZERO
+    while at < targets.length {
+      if let Option<Graphs.Executor>.Some { value } = move run executorIn(&targets[at], &mut seen) {
+        return Option<Graphs.Executor>.some(move value)
+      }
+      at = at + usize.ONE
+    }
+    return Option<Graphs.Executor>.none()
+  }
+
+  /// Restores described steps without running them, and answers the link of each.
+  pub effect fn restoreAll(steps: &[StepDescription]) -> List<Link>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut links = List<Link>.make()
+    let mut at = usize.ZERO
+    while at < steps.length {
+      let restored = run StepHandle.described(
+        steps[at].kind.view(),
+        run Bytes.copy(String.ownedUtf8Bytes(&steps[at].step)),
+        List<StepHandle>.make(),
+      )
+      run links.append(Link { node: steps[at].node, step: move restored })
+      at = at + usize.ONE
+    }
+    return move links
+  }
+
+  /// Finds the step restored for `node` of a description.
+  pub fn linked(links: &[Link], node: u64) -> Option<StepHandle> {
+    let mut at = usize.ZERO
+    while at < links.length {
+      if links[at].node == node {
+        return Option<StepHandle>.some(links[at].step.copy())
+      }
+      at = at + usize.ONE
+    }
+    return Option<StepHandle>.none()
   }
 
   /// Names one file that this step will produce. The path must stay below its output directory.
@@ -534,18 +905,42 @@ impl Step {
     let memory = Step.memory(&step)
     let compilation = Step.compilation(&step)
     let work = run Pending<Resolved, (), StepFailure>.make(Body<T> { step: move step })
+    let producers = run key.producers()
+    let node = run Arc<Node>.make(
+      Node {
+        key: move key,
+        memory: memory,
+        compilation: compilation,
+        work: run Mutex<Option<Pending<Resolved, (), StepFailure>>>.make(
+          Option<Pending<Resolved, (), StepFailure>>.some(move work),
+        ),
+      },
+    )
     return StepHandle {
-      node: run Arc<Node>.make(
-        Node {
-          key: move key,
-          memory: memory,
-          compilation: compilation,
-          work: run Mutex<Option<Pending<Resolved, (), StepFailure>>>.make(
-            Option<Pending<Resolved, (), StepFailure>>.some(move work),
-          ),
+      slot: run Arc<Slot>.make(
+        Slot {
+          described: Option<Described>.none(),
+          producers: move producers,
+          node: run Mutex<Option<Arc<Node>>>.make(Option<Arc<Node>>.some(move node)),
+          executor: Option<Graphs.Executor>.some(run Graphs.executor()),
+          provision: run Mutex<Option<Provision>>.make(Option<Provision>.none()),
         },
       ),
     }
+  }
+
+  /// Holds a standard step as its description, without its work. `kind` names how the compiler
+  /// restores it.
+  pub effect fn describe<T: Step + Schema>(kind: string, input: T) -> StepHandle
+    ! StepFailure
+    ? &mut Allocator {
+    let prepared = run Step.prepare(move input)
+    let step = move prepared
+    let mut key = Key.make()
+    run Step.key(&step, &mut key)
+    let producers = run key.producers()
+    let encoded = run Encoding.json<T>(&step)
+    return run StepHandle.described(kind, move encoded, move producers)
   }
 
   /// Names an output of registered work, creating its dependency edge without running it.
@@ -553,6 +948,138 @@ impl Step {
     ! StepError | OutOfMemoryError
     ? &mut Allocator {
     return run step.output(name)
+  }
+}
+
+effect fn describeInto(
+  step: &StepHandle,
+  seen: &mut List<usize>,
+  steps: &mut List<StepDescription>,
+) -> bool
+  ! StepFailure
+  ? &mut Allocator {
+  let identity = step.identity()
+  let known = seen.asSlice()
+  let mut at = usize.ZERO
+  while at < known.length {
+    if known[at] == identity {
+      return true
+    }
+    at = at + usize.ONE
+  }
+  run seen.append(identity)
+  let slot = step.slot.get()
+  if slot.described.isNone() {
+    return false
+  }
+  let producers = slot.producers.asSlice()
+  at = usize.ZERO
+  while at < producers.length {
+    if !run describeInto(&producers[at], &mut seen.*, &mut steps.*) {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  if let Option<Described>.Some { value } = &slot.described {
+    let text = match move run String.copyUtf8(value.step.asSlice()) {
+      Result<String, InvalidUtf8>.Success { value: copied } => move copied
+      Result<String, InvalidUtf8>.Failure { .. } => {
+        run refused("a step description must be UTF-8")
+      }
+    }
+    run steps.append(
+      StepDescription {
+        node: usize.toU64(identity),
+        kind: run String.copy(value.kind.view()),
+        step: move text,
+      },
+    )
+  }
+  return true
+}
+
+effect fn executorIn(step: &StepHandle, seen: &mut List<usize>) -> Option<Graphs.Executor>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let identity = step.identity()
+  let known = seen.asSlice()
+  let mut at = usize.ZERO
+  while at < known.length {
+    if known[at] == identity {
+      return Option<Graphs.Executor>.none()
+    }
+    at = at + usize.ONE
+  }
+  run seen.append(identity)
+  let slot = step.slot.get()
+  if let Option<Graphs.Executor>.Some { value } = &slot.executor {
+    return Option<Graphs.Executor>.some(value.clone())
+  }
+  let producers = slot.producers.asSlice()
+  at = usize.ZERO
+  while at < producers.length {
+    if let Option<Graphs.Executor>.Some { value } = move run executorIn(
+      &producers[at],
+      &mut seen.*,
+    ) {
+      return Option<Graphs.Executor>.some(move value)
+    }
+    at = at + usize.ONE
+  }
+  return Option<Graphs.Executor>.none()
+}
+
+effect fn provisionOf(step: &StepHandle) -> Option<Provision>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let held = step.slot.get().provision.lock()
+  return match &held.get().* {
+    Option<Provision>.Some { value } => Option<Provision>.some(
+      Provision {
+        directory: run String.copy(value.directory.view()),
+        volatile: value.volatile,
+        compilation: value.compilation,
+        compiled: value.compiled,
+      },
+    )
+    Option<Provision>.None => Option<Provision>.none()
+  }
+}
+
+fn provide(step: &StepHandle, provision: Provision) -> () {
+  let mut held = step.slot.get().provision.lock()
+  let target = held.getMut()
+  target.* = Option<Provision>.some(move provision)
+}
+
+// Replaces a described step output by the step the runner linked to it.
+effect fn linkedReference(runner: &Runner, reference: Reference) -> Reference
+  ! StepFailure
+  ? &mut Allocator {
+  if let Reference.Linked { node, name, resolved } = &reference {
+    let held = runner.links.lock()
+    let found = StepHandle.linked(held.get().asSlice(), node)
+    drop held
+    let step = match move found {
+      Option<StepHandle>.Some { value } => move value
+      Option<StepHandle>.None => {
+        run refused("a described step names a producer outside its graph")
+      }
+    }
+    if resolved {
+      return Reference.ResolvedPath { step: move step }
+    }
+    return Reference.Output { step: move step, name: run String.copy(name.view()) }
+  }
+  return move reference
+}
+
+// The node of a step the runner already prepared.
+fn readyNode(step: &StepHandle) -> Option<Arc<Node>> {
+  let held = step.slot.get().node.lock()
+  return match &held.get().* {
+    Option<Arc<Node>>.Some { value } => Option<Arc<Node>>.some(value.clone())
+    Option<Arc<Node>>.None => Option<Arc<Node>>.none()
   }
 }
 
@@ -901,6 +1428,7 @@ impl Make {
 
 struct Prepared {
   step: StepHandle,
+  compilation: bool,
   memory: u64,
   digest: [u8; 32],
   output: Path,
@@ -908,6 +1436,10 @@ struct Prepared {
   context: Option<Resolved>,
   volatile: bool,
   complete: bool,
+  // Whether another process ran the step, so only its provision is known here.
+  provided: bool,
+  // Other handles whose steps have this same key.
+  aliases: List<usize>,
 }
 
 /// Executes an immutable graph with content-verified caching and bounded worker memory.
@@ -917,6 +1449,9 @@ pub struct Runner {
   identity: Bytes,
   budget: u64,
   workers: usize,
+  links: Mutex<List<Link>>,
+  // Compilations the compiler reached while running described steps for this runner.
+  delegated: Mutex<List<CompilationOutput>>,
 }
 
 /// One compilation reached through the requested graph.
@@ -927,12 +1462,28 @@ pub struct CompilationOutput {
   pub compiled: bool,
 }
 
+/// One step the runner prepared.
+pub struct StepOutput {
+  /// The identity of the step's handle.
+  pub identity: usize,
+  /// The step's cache directory.
+  pub directory: Path,
+  /// Whether the step runs every time.
+  pub volatile: bool,
+  /// Whether the step is a compilation.
+  pub compilation: bool,
+  /// Whether a compilation built its artifact, or only wrote its request.
+  pub compiled: bool,
+}
+
 /// Completed root outputs and every reachable compilation.
 pub struct Execution {
   /// Cache directories in the order roots were requested.
   pub outputs: List<Path>,
   /// Reachable compilations, including tools needed by other steps.
   pub compilations: List<CompilationOutput>,
+  /// Every step the runner prepared, producers first.
+  pub steps: List<StepOutput>,
 }
 
 impl Runner {
@@ -947,7 +1498,18 @@ impl Runner {
       identity: run Bytes.copy(identity),
       budget: 4294967296,
       workers: 4,
+      links: run Mutex<List<Link>>.make(List<Link>.make()),
+      delegated: run Mutex<List<CompilationOutput>>.make(List<CompilationOutput>.make()),
     }
+  }
+
+  /// Supplies the steps restored from a description, which their consumers name by identity.
+  pub fn linking(self: Self, links: List<Link>) -> Self {
+    let mut held = self.links.lock()
+    let target = held.getMut()
+    target.* = move links
+    drop held
+    return move self
   }
 
   /// Limits the sum of running steps' memory estimates. A step larger than the budget runs alone.
@@ -980,8 +1542,21 @@ impl Runner {
     let mut prepared = List<Prepared>.make()
     let mut roots = List<usize>.make()
     let mut at = usize.ZERO
+
+    // The compiler runs the requested standard steps in one invocation.
+    let mut described = List<StepHandle>.make()
     while at < targets.length {
-      run roots.append(run prepareStep(self, &targets[at], &mut prepared, &pool))
+      if awaitsCompiler(&targets[at]) {
+        run described.append(targets[at].copy())
+      }
+      at = at + usize.ONE
+    }
+    if described.length() > usize.ZERO {
+      run delegate(self, described.asSlice(), compile, &mut prepared, &pool)
+    }
+    at = usize.ZERO
+    while at < targets.length {
+      run roots.append(run prepareStep(self, &targets[at], &mut prepared, &pool, false))
       at = at + usize.ONE
     }
     if !compile {
@@ -990,7 +1565,7 @@ impl Runner {
       while at < selected.length {
         let prerequisite = isDependency(&prepared, selected[at])
         let item = &mut prepared.asMutSlice()[selected[at]]
-        if item.step.node.get().compilation && !prerequisite {
+        if item.compilation && !prerequisite {
           if let Option<Resolved>.Some { value } = &mut item.context {
             value.compile = false
           }
@@ -1015,20 +1590,75 @@ impl Runner {
       at = at + usize.ONE
     }
     let mut compilations = List<CompilationOutput>.make()
+    let mut steps = List<StepOutput>.make()
     at = 0
     while at < prepared.length() {
       let item = &prepared.asSlice()[at]
-      if item.step.node.get().compilation {
+      let mut compiled = !item.compilation || compile || isDependency(&prepared, at)
+      if item.provided {
+        if let Option<Provision>.Some { value } = move run provisionOf(&item.step) {
+          compiled = !item.compilation || value.compiled || isDependency(&prepared, at)
+        }
+      }
+      if item.compilation {
         run compilations.append(
           CompilationOutput {
             directory: run Path.fromBytes(Path.rawBytes(&item.output)),
-            compiled: compile || isDependency(&prepared, at),
+            compiled: compiled,
           },
         )
       }
+      run steps.append(
+        StepOutput {
+          identity: item.step.identity(),
+          directory: run Path.fromBytes(Path.rawBytes(&item.output)),
+          volatile: item.volatile,
+          compilation: item.compilation,
+          compiled: compiled,
+        },
+      )
+      let aliases = item.aliases.asSlice()
+      let mut alias = usize.ZERO
+      while alias < aliases.length {
+        run steps.append(
+          StepOutput {
+            identity: aliases[alias],
+            directory: run Path.fromBytes(Path.rawBytes(&item.output)),
+            volatile: item.volatile,
+            compilation: item.compilation,
+            compiled: compiled,
+          },
+        )
+        alias = alias + usize.ONE
+      }
       at = at + 1
     }
-    return Execution { outputs: move outputs, compilations: move compilations }
+    let held = self.delegated.lock()
+    let reached = held.get().asSlice()
+    at = usize.ZERO
+    while at < reached.length {
+      let mut known = false
+      let mut earlier = usize.ZERO
+      while earlier < compilations.length() {
+        let existing = &mut compilations.asMutSlice()[earlier]
+        if Path.rawBytes(&existing.directory) == Path.rawBytes(&reached[at].directory) {
+          existing.compiled = existing.compiled || reached[at].compiled
+          known = true
+        }
+        earlier = earlier + usize.ONE
+      }
+      if !known {
+        run compilations.append(
+          CompilationOutput {
+            directory: run Path.fromBytes(Path.rawBytes(&reached[at].directory)),
+            compiled: reached[at].compiled,
+          },
+        )
+      }
+      at = at + usize.ONE
+    }
+    drop held
+    return Execution { outputs: move outputs, compilations: move compilations, steps: move steps }
   }
 }
 
@@ -1149,9 +1779,14 @@ effect fn prepareStep(
   step: &StepHandle,
   prepared: &mut List<Prepared>,
   pool: &Pool,
+  dependency: bool,
 ) -> usize
   ! StepFailure | Cancelled
   ? &mut Allocator | &mut FileSystem | &mut HostInput {
+  let ready = readyNode(step)
+  if ready.isNone() {
+    return run prepareProvided(runner, step, &mut prepared.*, pool, dependency)
+  }
   let mut at = usize.ZERO
   while at < prepared.length() {
     if prepared.asSlice()[at].step.identity() == step.identity() {
@@ -1159,7 +1794,13 @@ effect fn prepareStep(
     }
     at = at + usize.ONE
   }
-  let node = step.node.get()
+  let shared = match move ready {
+    Option<Arc<Node>>.Some { value } => move value
+    Option<Arc<Node>>.None => {
+      run refused("a build step has no work")
+    }
+  }
+  let node = shared.get()
   let mut hash = Sha256.make()
   Fingerprint.field(&mut hash, b"silk-build-step-v2")
   Fingerprint.field(&mut hash, runner.identity.asSlice())
@@ -1217,10 +1858,13 @@ effect fn prepareStep(
     let mut path = Option<Path>.none()
     let mut bytes = Option<Bytes>.none()
     let mut producerKey = Option<String>.none()
-    let normalized = run materializeReference(&input.reference)
+    let normalized = run linkedReference(runner, run materializeReference(&input.reference))
     match &normalized {
       Reference.Declared { .. } => {
         run refused("an input description was not materialized")
+      }
+      Reference.Linked { .. } => {
+        run refused("a described step output was not linked")
       }
       Reference.Source { path: source, external } => {
         if isValue(input.kind) {
@@ -1253,7 +1897,7 @@ effect fn prepareStep(
         if isValue(input.kind) {
           run refused("a resolved path must be declared as a file or tree")
         }
-        let index = run prepareStep(runner, &producer, &mut prepared, pool)
+        let index = run prepareStep(runner, &producer, &mut prepared, pool, true)
         let mut wanted = List<bool>.make()
         let mut existing = usize.ZERO
         while existing < prepared.length() {
@@ -1283,7 +1927,7 @@ effect fn prepareStep(
         run dependencies.append(index)
       }
       Reference.Output { step: producer, name } => {
-        let index = run prepareStep(runner, &producer, &mut prepared, pool)
+        let index = run prepareStep(runner, &producer, &mut prepared, pool, true)
         if input.kind == InputKind.Files || input.kind == InputKind.Trees
           || input.kind == InputKind.Packages {
           let mut wanted = List<bool>.make()
@@ -1371,6 +2015,7 @@ effect fn prepareStep(
       if node.memory > existing.memory {
         existing.memory = node.memory
       }
+      run existing.aliases.append(step.identity())
       return at
     }
     at = at + usize.ONE
@@ -1388,6 +2033,7 @@ effect fn prepareStep(
   run prepared.append(
     Prepared {
       step: step.copy(),
+      compilation: node.compilation,
       memory: node.memory,
       digest: digest,
       output: move output,
@@ -1395,9 +2041,289 @@ effect fn prepareStep(
       context: Option<Resolved>.some(move context),
       volatile: volatile,
       complete: false,
+      provided: false,
+      aliases: List<usize>.make(),
     },
   )
   return index
+}
+
+// Whether the compiler has yet to run this standard step.
+fn awaitsCompiler(step: &StepHandle) -> bool {
+  if readyNode(step).isSome() {
+    return false
+  }
+  let held = step.slot.get().provision.lock()
+  return held.get().isNone()
+}
+
+fn hexDigit(byte: u8) -> u8 {
+  if byte >= 97 {
+    return byte - 87
+  }
+  return byte - 48
+}
+
+// Enters a step that another process ran: its directory names its key.
+effect fn prepareProvided(
+  runner: &Runner,
+  step: &StepHandle,
+  prepared: &mut List<Prepared>,
+  pool: &Pool,
+  dependency: bool,
+) -> usize
+  ! StepFailure | Cancelled
+  ? &mut Allocator | &mut FileSystem | &mut HostInput {
+  let mut provision = run provisionOf(step)
+  let stale = match &provision {
+    // A compilation that only wrote its request must build before another step reads it.
+    Option<Provision>.Some { value } => dependency && value.compilation && !value.compiled
+    Option<Provision>.None => true
+  }
+  if stale {
+    if step.slot.get().described.isNone() {
+      run refused("a build step has no work")
+    }
+    let targets = [step.copy()]
+    run delegate(runner, &targets, true, &mut prepared.*, pool)
+    provision = run provisionOf(step)
+  }
+  let known = match move provision {
+    Option<Provision>.Some { value } => move value
+    Option<Provision>.None => {
+      run refused("the compiler did not answer for a described step")
+    }
+  }
+  let mut at = usize.ZERO
+  while at < prepared.length() {
+    if prepared.asSlice()[at].step.identity() == step.identity() {
+      return at
+    }
+    at = at + usize.ONE
+  }
+  let output = run Path.make(known.directory.view())
+  let mut digest: [u8; 32] = [0; 32]
+  let name = match move Path.name(&output) {
+    Option<string>.Some { value } => String.utf8Bytes(value)
+    Option<string>.None => {
+      run refused("a provided step needs a cache directory named by its key")
+    }
+  }
+  if name.length != 64 {
+    run refused("a provided step needs a cache directory named by its key")
+  }
+  at = usize.ZERO
+  while at < 32 {
+    digest[at] = hexDigit(name[at * 2]) * 16 + hexDigit(name[at * 2 + usize.ONE])
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < prepared.length() {
+    if sameBytes(&prepared.asSlice()[at].digest, &digest) {
+      run prepared.asMutSlice()[at].aliases.append(step.identity())
+      return at
+    }
+    at = at + usize.ONE
+  }
+  let index = prepared.length()
+  run prepared.append(
+    Prepared {
+      step: step.copy(),
+      compilation: known.compilation,
+      memory: 0,
+      digest: digest,
+      output: move output,
+      dependencies: List<usize>.make(),
+      context: Option<Resolved>.none(),
+      volatile: known.volatile,
+      complete: true,
+      provided: true,
+      aliases: List<usize>.make(),
+    },
+  )
+  return index
+}
+
+// Adds `step` and the standard steps it reads to a description. A custom step runs here first
+// and enters the description as its provision, and so does a standard step the compiler
+// already ran.
+effect fn gather(
+  runner: &Runner,
+  step: &StepHandle,
+  requested: bool,
+  seen: &mut List<usize>,
+  steps: &mut List<StepDescription>,
+  described: &mut List<StepHandle>,
+  prepared: &mut List<Prepared>,
+  pool: &Pool,
+) -> ()
+  ! StepFailure | Cancelled
+  ? &mut Allocator | &mut FileSystem | &mut HostInput {
+  let identity = step.identity()
+  let known = seen.asSlice()
+  let mut at = usize.ZERO
+  while at < known.length {
+    if known[at] == identity {
+      return ()
+    }
+    at = at + usize.ONE
+  }
+  run seen.append(identity)
+  if readyNode(step).isSome() {
+    let index = run prepareStep(runner, step, &mut prepared.*, pool, true)
+    let mut wanted = List<bool>.make()
+    let mut existing = usize.ZERO
+    while existing < prepared.length() {
+      run wanted.append(false)
+      existing = existing + usize.ONE
+    }
+    requireInputs(&prepared, index, wanted.asMutSlice())
+    run executePrepared(runner, &mut prepared.*, pool, wanted.asSlice())
+    let item = &prepared.asSlice()[index]
+    let provision = Provision {
+      directory: run Context.text(&item.output),
+      volatile: item.volatile,
+      compilation: item.compilation,
+      compiled: true,
+    }
+    let encoded = run Encoding.json<Provision>(&provision)
+    run steps.append(
+      StepDescription {
+        node: usize.toU64(identity),
+        kind: run String.copy("provided"),
+        step: unsafe String.fromBytesUnchecked(move encoded),
+      },
+    )
+    return ()
+  }
+  if !requested {
+    let finished = match move run provisionOf(step) {
+      Option<Provision>.Some { value } => {
+        if value.compilation && !value.compiled {
+          Option<Provision>.none()
+        } else {
+          Option<Provision>.some(move value)
+        }
+      }
+      Option<Provision>.None => Option<Provision>.none()
+    }
+    if let Option<Provision>.Some { value } = move finished {
+      let encoded = run Encoding.json<Provision>(&value)
+      run steps.append(
+        StepDescription {
+          node: usize.toU64(identity),
+          kind: run String.copy("provided"),
+          step: unsafe String.fromBytesUnchecked(move encoded),
+        },
+      )
+      return ()
+    }
+  }
+  let producers = step.slot.get().producers.asSlice()
+  at = usize.ZERO
+  while at < producers.length {
+    run gather(
+      runner,
+      &producers[at],
+      false,
+      &mut seen.*,
+      &mut steps.*,
+      &mut described.*,
+      &mut prepared.*,
+      pool,
+    )
+    at = at + usize.ONE
+  }
+  match move run step.description() {
+    Option<StepDescription>.Some { value } => run steps.append(move value)
+    Option<StepDescription>.None => {
+      run refused("a build step has no work")
+    }
+  }
+  run described.append(step.copy())
+}
+
+// Has the compiler run `targets` and the standard steps they read, and records where each left
+// its outputs.
+effect fn delegate(
+  runner: &Runner,
+  targets: &[StepHandle],
+  compile: bool,
+  prepared: &mut List<Prepared>,
+  pool: &Pool,
+) -> ()
+  ! StepFailure | Cancelled
+  ? &mut Allocator | &mut FileSystem | &mut HostInput {
+  let mut seen = List<usize>.make()
+  let mut steps = List<StepDescription>.make()
+  let mut described = List<StepHandle>.make()
+  let mut roots = List<Delegate.RootDescription>.make()
+  let mut at = usize.ZERO
+  while at < targets.length {
+    run gather(
+      runner,
+      &targets[at],
+      true,
+      &mut seen,
+      &mut steps,
+      &mut described,
+      &mut prepared.*,
+      pool,
+    )
+    run roots.append(
+      Delegate.RootDescription {
+        node: usize.toU64(targets[at].identity()),
+        name: String.make(),
+        compilation: false,
+      },
+    )
+    at = at + usize.ONE
+  }
+  let description = Delegate.GraphDescription {
+    version: 1,
+    root: run Context.text(&runner.root),
+    program: Option<String>.none(),
+    identity: Option<String>.some(run Delegate.hexadecimal(runner.identity.asSlice())),
+    cache: Option<String>.some(run Context.text(&runner.cache)),
+    compile: compile,
+    publish: false,
+    memory: runner.budget,
+    workers: usize.toU64(runner.workers),
+    steps: move steps,
+    roots: move roots,
+  }
+  let directory = run Path.join(&runner.cache, ".graphs")
+  let mut outcome = run Delegate.submit(&description, &directory)
+  let waiting = described.asSlice()
+  while outcome.outputs.length() > usize.ZERO {
+    let output = outcome.outputs.remove(0)
+    at = usize.ZERO
+    while at < waiting.length {
+      if usize.toU64(waiting[at].identity()) == output.node {
+        provide(
+          &waiting[at],
+          Provision {
+            directory: run String.copy(output.directory.view()),
+            volatile: output.volatile,
+            compilation: output.compilation,
+            compiled: output.compiled,
+          },
+        )
+      }
+      at = at + usize.ONE
+    }
+  }
+  let mut held = runner.delegated.lock()
+  let reached = held.getMut()
+  while outcome.compilations.length() > usize.ZERO {
+    let compilation = outcome.compilations.remove(0)
+    run reached.append(
+      CompilationOutput {
+        directory: run Path.make(compilation.directory.view()),
+        compiled: compilation.compiled,
+      },
+    )
+  }
 }
 
 effect fn joinSteps(fibers: List<PoolFiber<(), StepFailure>>) -> ()
@@ -1463,8 +2389,15 @@ effect fn executeStepWithFiles(step: StepHandle, context: Resolved, volatile: bo
     run FileSystem.removeDirectoryRecursively(&output)
   }
   run FileSystem.createDirectoriesRecursively(&output)
-  let publish = context.compile || !step.node.get().compilation
-  let mut held = step.node.get().work.lock()
+  let shared = match move readyNode(&step) {
+    Option<Arc<Node>>.Some { value } => move value
+    Option<Arc<Node>>.None => {
+      run refused("a build step ran before it was prepared")
+    }
+  }
+  let node = shared.get()
+  let publish = context.compile || !node.compilation
+  let mut held = node.work.lock()
   let work = Intrinsic.replace(held.getMut().*, Option<Pending<Resolved, (), StepFailure>>.none())
   drop held
   match move work {

@@ -211,7 +211,8 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   const graphBuilt = yield* invoke(silk, ['build', join(graphSources, 'main.silk'),
     '-o', graphProgram, '--stdlib', standardLibrary, '--clang', clang], directory, process.env, 120_000)
   assert.equal(graphBuilt.status, 0, graphBuilt.stderr)
-  const graphRan = yield* invoke(graphProgram, [], graphRoot)
+  // The runner hands its standard steps to the compiler, as a task program's does.
+  const graphRan = yield* invoke(graphProgram, [], graphRoot, { ...process.env, SILK_COMPILER: silk })
   assert.equal(graphRan.status, 0, graphRan.stderr)
   const staticGraphProgram = join(directory, 'static-graph-test')
   const staticGraphBuilt = yield* invoke(silk, ['build', join(repository, 'compiler/fixtures/build-graph/static.silk'),
@@ -365,6 +366,21 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   const customSet = JSON.parse(yield* fs.readFileString(join(aliased, 'build/requests/plan.json')))
   assert.ok(customSet.files.length > 0, 'a child task publishes its pending requests through the parent')
   assert.equal(yield* fs.exists(join(aliased, 'build/requests/.pending-plan.json')), false)
+  // A graph of a custom step, a compilation that embeds its output and a custom step that reads
+  // the artifact: the task program runs the custom steps and the compiler runs the compilation.
+  yield* fs.copyFile(join(graphSources, 'mixed_task.silk'), join(aliased, 'src/tasks.silk'))
+  for (const round of ['first', 'unchanged']) {
+    const mixed = yield* invoke(silk, ['build', '--stdlib', standardLibrary], aliased, requestEnv, 300_000)
+    assert.equal(mixed.status, 0, `${round}: ${mixed.stderr}`)
+    assert.match(mixed.stderr, /^Finished build\/[^/\n]+\/dev\/aliased(\.exe)? in /m, `${round}: the build reports its artifact`)
+    if (round === 'first') assert.match(mixed.stderr, /^Compiling aliased \(/m, 'the compilation reports its progress')
+  }
+  const mixedSteps = yield* fs.readDirectory(join(aliased, 'build/steps'))
+  const mixedSizes: Array<string> = []
+  for (const name of mixedSteps) {
+    if (yield* fs.exists(join(aliased, 'build/steps', name, 'size.txt'))) mixedSizes.push(name)
+  }
+  assert.equal(mixedSizes.length, 1, 'the custom step that reads the artifact ran once')
   const argumentsFor = (output: string) => [
     'build',
     'main.silk',

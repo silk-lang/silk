@@ -6,7 +6,7 @@ Build graphs that publish complete compilation requests and return their artifac
 
 Import as `Build` with `import silk.build.graph { Build }`.
 
-Public declarations: 15.
+Public declarations: 18.
 
 <a id="Options"></a>
 
@@ -340,7 +340,98 @@ pub effect fn write(self: Self) -> Planned
 Resolves dependencies and publishes requests, stopping before requested compilations run.
 Prerequisite tool compilations still build. Failures leave previously published requests intact.
 
+<a id="Build.impl.perform"></a>
+
+### Method `perform`
+
+```silk
+pub effect fn perform(self: Self, compile: bool) -> Built
+    ! BuildError
+    ? &mut Allocator | &mut FileSystem | &mut HostInput
+```
+
+Runs the graph in this process. The compiler calls this for a described graph.
+
+<a id="Build.impl.describe"></a>
+
+### Method `describe`
+
+```silk
+pub effect fn describe(self: &Self, compile: bool) -> Option<GraphDescription>
+    ! BuildError
+    ? &mut Allocator
+```
+
+Describes the graph for the compiler to run. Answers nothing when the graph holds a custom
+step, which only this program can run.
+
+<a id="Build.impl.restore"></a>
+
+### Associated function `restore`
+
+```silk
+pub effect fn restore(description: &GraphDescription) -> Self
+    ! BuildError
+    ? &mut Allocator | &mut FileSystem
+```
+
+Restores a described graph without running any of its steps.
+
 <a id="Built.impl"></a>
+
+## Implementation `Built`
+
+```silk
+impl Built
+```
+
+<a id="Built.impl.outcome"></a>
+
+### Method `outcome`
+
+```silk
+pub effect fn outcome(self: &Self) -> Outcome
+    ! BuildError
+    ? &mut Allocator
+```
+
+Describes the completed artifacts for the task program that requested them.
+
+<a id="Job"></a>
+
+## `Job`
+
+```silk
+pub struct Job
+```
+
+What a custom step's executor runs: one whole graph, with the program's inputs as they were
+when the build was requested.
+
+<a id="Executor"></a>
+
+## `Executor`
+
+```silk
+pub type Executor = Arc<Mutex<Option<Pending<Job, Built, BuildError>>>>
+```
+
+Runs graphs in this process. Only a registered custom step creates one, so a program whose
+graphs the compiler can run carries no runner.
+
+<a id="executor"></a>
+
+## `executor`
+
+```silk
+pub effect fn executor() -> Executor
+  ! OutOfMemoryError
+  ? &mut Allocator
+```
+
+Makes an executor for a custom step. The step registration calls this.
+
+<a id="Built.impl-2"></a>
 
 ## Implementation `Built`
 
