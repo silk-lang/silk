@@ -2835,8 +2835,12 @@ const program = Effect.gen(function* () {
     // A declaration, as the `.symbols` map's third column spells it, orders every symbol of that
     // declaration; an entry that names nothing this build emits is reported as a note.
     const symbolMap = (yield* fs.readFileString(`${executable}.symbols`)).split('\n').map((line) => line.split('\t'))
-    const declaration = symbolMap.find((row) => row[0] === last)?.[2] ?? ''
-    assert.ok(declaration.includes('::'), `${profile}: ${last} has no declaration in the symbol map`)
+    // The latest-placed function that belongs to a Silk declaration; runtime entries such as
+    // `silk_gnu_initialize` have none.
+    const declarationOf = (symbol: string) => symbolMap.find((row) => row[0] === symbol)?.[2] ?? ''
+    const latest = [...unordered].reverse().find(([symbol]) => declarationOf(symbol).includes('::'))
+    assert.ok(latest !== undefined, `${profile}: no linked function has a declaration in the symbol map`)
+    const declaration = declarationOf(latest[0])
     const declared = new Set(symbolMap.filter((row) => row[2] === declaration).map((row) => row[0]))
     yield* fs.writeFileString(join(ordered, 'order.txt'), `${declaration}\nsilk_00000000000000000000000000000000\n`)
     const byDeclaration = yield* invoke(silk, ['build', '--stdlib', standardLibrary, ...profile], ordered, { ...process.env, SILK_CLANG: clang })
