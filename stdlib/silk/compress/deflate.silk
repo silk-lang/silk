@@ -13,9 +13,11 @@
 //! greedy matching for levels 1 to 3, lazy matching for levels 4 to 9, and blocks that use stored,
 //! fixed Huffman, or dynamic Huffman codes, whichever is smallest. Level 0 writes stored blocks.
 //! [`Encoder.make`] allocates all storage one time. Later calls do not allocate and do not keep a
-//! borrow of your buffers. The output is deterministic: gzip uses timestamp zero, no optional
-//! fields, and OS byte 255. The bytes are a valid stream but are not the same bytes that zlib
-//! writes.
+//! borrow of your buffers. The output is deterministic, and with the same options, input and
+//! flushes it is byte for byte what zlib 1.3.1 writes, in steps that consume and write what zlib's
+//! `deflate` does with the same input and output lengths. Gzip uses timestamp zero, no optional
+//! fields, and operating system byte 255, which zlib sets to the system it was built for;
+//! [`Encoder.setGzipSystem`] changes it.
 //!
 //! # Examples
 //! ## Compress a buffer with zlib framing
@@ -50,6 +52,8 @@ import silk.collections.slice { Slice }
 import silk.compress.checksum { CompressionChecksum }
 import silk.core.option { Option }
 import silk.core.result { Result }
+import silk.core.target { Endianness, Target }
+import silk.mem.pointer { Pointer }
 import silk.num.u8
 import silk.num.u16
 import silk.num.u32
@@ -184,13 +188,28 @@ pub struct Options {
   pub memoryLevel: u32,
   /// How the encoder looks for repeated data.
   pub strategy: Strategy,
+  /// How the encoder finds earlier occurrences of the next bytes.
+  pub hash: Hash,
+}
+
+/// How an [`Encoder`] finds earlier occurrences of the next bytes. Each choice writes the bytes of
+/// a zlib that uses it, and each is the same on every target.
+pub enum Hash {
+  /// zlib's rolling hash of 3 bytes, in a table of `1 << (memoryLevel + 7)` entries. The output is
+  /// byte for byte zlib 1.3.1's.
+  Rolling,
+  /// The hash of Chromium's zlib, which Node.js and Chrome use: a multiplicative hash of 4 bytes,
+  /// in a table of at least `1 << 15` entries. Its chains have fewer collisions, so it is faster
+  /// at levels 4 to 9 and compresses about as well. The output is byte for byte Chromium zlib's
+  /// (revision 09a1572 of Node 24).
+  Multiplicative,
 }
 
 impl Options {
-  /// Returns options with `level`, a 32 KiB window, memory level 8, and the default strategy, the
-  /// defaults of zlib's `deflateInit`.
+  /// Returns options with `level`, a 32 KiB window, memory level 8, the default strategy, and
+  /// zlib's rolling hash, the defaults of zlib's `deflateInit`.
   pub fn make(level: u32) -> Options {
-    return Options { level: level, windowBits: 15, memoryLevel: 8, strategy: Strategy.Default }
+    return Options { level: level, windowBits: 15, memoryLevel: 8, strategy: Strategy.Default, hash: Hash.Rolling }
   }
 }
 
@@ -245,6 +264,7 @@ pub struct Encoder {
   window: List<u8>,
   hashMask: u32,
   hashShift: u32,
+  multiplicative: bool,
   head: List<u16>,
   prev: List<u16>,
   insertHash: u32,
@@ -276,7 +296,8 @@ pub struct Encoder {
   checksum: u32,
   totalIn: u32,
   dictionaryId: u32,
-  hasDictionary: bool,
+  gzipSystem: u8,
+  pendingLimit: usize,
   inputPosition: usize,
   outputPosition: usize,
 }
@@ -287,21 +308,36 @@ const MAX_MATCH: usize = 258
 
 const MIN_LOOKAHEAD: usize = 262
 
+const WINDOW_PADDING: usize = 16
+
 const TOO_FAR: usize = 4096
 
 const PHASE_START: u32 = 0
 
 const PHASE_RUNNING: u32 = 1
 
-const PHASE_FINISHED: u32 = 2
+// The last block is written and the trailer is not, as zlib's FINISH_STATE.
+const PHASE_FINISHING: u32 = 2
 
-const PHASE_FAILED: u32 = 3
+const PHASE_FINISHED: u32 = 3
+
+const PHASE_FAILED: u32 = 4
 
 const NEED_MORE: u32 = 0
 
 const BLOCK_DONE: u32 = 1
 
-const FINISH_DONE: u32 = 2
+// The last block is in the pending output, and the caller's output is full.
+const FINISH_STARTED: u32 = 2
+
+const FINISH_DONE: u32 = 3
+
+// The values of `lastFlush` that are not a flush: no step yet, and a step that filled the output.
+const FLUSH_NEVER: i64 = -2
+
+const FLUSH_OUTPUT_FULL: i64 = -1
+
+const MAX_STORED: usize = 65535
 
 impl Encoder {
   /// Returns an encoder for one stream in `format` with `options`, with storage from the ambient
@@ -326,7 +362,11 @@ impl Encoder {
       windowBits = 9
     }
     let windowSize = usize.shiftLeft(1, u32.toUsize(windowBits))
-    let hashBits = options.memoryLevel + 7
+    let multiplicative = options.hash == Hash.Multiplicative
+    let mut hashBits = options.memoryLevel + 7
+    if multiplicative && hashBits < 15 {
+      hashBits = 15
+    }
     let hashSize = usize.shiftLeft(1, u32.toUsize(hashBits))
     let literalBufferSize = usize.shiftLeft(1, u32.toUsize(options.memoryLevel + 6))
     let mut pendingSize = literalBufferSize * 4
@@ -334,8 +374,10 @@ impl Encoder {
       pendingSize = windowSize
     }
     pendingSize = pendingSize + 1024
+    // The window has 16 bytes after its end: the multiplicative hash reads 4 bytes at a position,
+    // and they stay zero until data reaches them, as in Chromium's zlib.
     let mut window = List<u8>.make()
-    run List<u8>.appendRepeated(&mut window, 0, windowSize * 2)
+    run List<u8>.appendRepeated(&mut window, 0, windowSize * 2 + WINDOW_PADDING)
     let mut head = List<u16>.make()
     run List<u16>.appendRepeated(&mut head, 0, hashSize)
     let mut prev = List<u16>.make()
@@ -361,6 +403,7 @@ impl Encoder {
       window: move window,
       hashMask: usize.toU32(hashSize - 1),
       hashShift: (hashBits + 2) / 3,
+      multiplicative: multiplicative,
       head: move head,
       prev: move prev,
       insertHash: 0,
@@ -399,8 +442,9 @@ impl Encoder {
       lastFlush: 0,
       checksum: 0,
       totalIn: 0,
-      dictionaryId: 0,
-      hasDictionary: false,
+      dictionaryId: 1,
+      gzipSystem: 255,
+      pendingLimit: literalBufferSize * 4,
       inputPosition: 0,
       outputPosition: 0,
     }
@@ -415,8 +459,7 @@ impl Encoder {
   /// and a failure. Parameters set with [`Encoder.setParameters`] stay.
   pub fn reset(self: &mut Self) -> () {
     if self.parametersPending {
-      self.level = self.nextLevel
-      self.strategy = self.nextStrategy
+      applyParameters(&mut self)
       self.parametersPending = false
     }
     configure(&mut self)
@@ -429,8 +472,6 @@ impl Encoder {
     self.insert = 0
     self.matchLength = MIN_MATCH - 1
     self.prevLength = MIN_MATCH - 1
-    self.matchStart = 0
-    self.prevMatch = 0
     self.matchAvailable = false
     initBlock(&mut self)
     self.pendingLength = 0
@@ -438,10 +479,9 @@ impl Encoder {
     self.bitBuffer = 0
     self.bitCount = 0
     self.phase = PHASE_START
-    self.lastFlush = 0
+    self.lastFlush = FLUSH_NEVER
     self.totalIn = 0
-    self.dictionaryId = 0
-    self.hasDictionary = false
+    self.dictionaryId = 1
     if self.format == Format.Gzip {
       self.checksum = 0
     } else {
@@ -449,59 +489,84 @@ impl Encoder {
     }
   }
 
-  /// Loads `dictionary` as data that the stream can refer to, before the first step, as zlib's
-  /// `deflateSetDictionary` does.
+  /// Sets the operating system byte of the gzip header, which is 255 (unknown) by default.
   ///
   /// # Details
-  /// Only the last bytes that fit in the window are used. With zlib framing the header names the
-  /// dictionary by its Adler-32, and the decoder must load the same dictionary. With raw framing
-  /// the decoder must load the same dictionary without being told.
+  /// zlib writes the system it was built for: 3 on Unix, 19 on macOS, 10 on Windows. Set it before
+  /// the first step of a stream. It stays across [`Encoder.reset`]. Other formats ignore it.
+  pub fn setGzipSystem(self: &mut Self, system: u8) -> () {
+    self.gzipSystem = system
+  }
+
+  /// Loads `dictionary` as data that the stream can refer to, as zlib's `deflateSetDictionary`
+  /// does.
+  ///
+  /// # Details
+  /// Only the last bytes that fit in the window are used. With zlib framing, load it before the
+  /// first step: the header names the dictionary by its Adler-32, and the decoder must load the
+  /// same dictionary. With raw framing, load it before the first step or after a step that
+  /// consumed all of its input with a flush, and the decoder must load the same dictionary at
+  /// the same place without being told.
   ///
   /// # Errors
-  /// `InvalidUse` with gzip framing, after the first step, or after a failure.
+  /// `InvalidUse` with gzip framing, with zlib framing after the first step, while the encoder
+  /// holds input that is not compressed yet, or after a failure.
   pub fn setDictionary(self: &mut Self, dictionary: &[u8]) -> Result<(), EncodeError> {
-    if self.format == Format.Gzip || self.phase != PHASE_START || self.lookahead != 0
-      || self.strStart != 0
-      || self.hasDictionary {
+    if self.format == Format.Gzip || (self.format == Format.Zlib && self.phase != PHASE_START)
+      || self.lookahead != 0
+      || self.phase == PHASE_FAILED {
       return Result<(), EncodeError>.failResult(
         EncodeError { kind: EncodeErrorKind.InvalidUse, consumed: 0, written: 0 },
       )
     }
     if self.format == Format.Zlib {
-      self.dictionaryId = CompressionChecksum.adler32(dictionary)
+      self.dictionaryId = CompressionChecksum.adler32Update(self.dictionaryId, dictionary)
     }
-    self.hasDictionary = true
     let mut used = dictionary
-    if used.length > self.windowSize {
+    if used.length >= self.windowSize {
+      // The dictionary fills the window, so it replaces the history.
+      if self.format == Format.Raw {
+        clearHash(&mut self)
+        self.strStart = 0
+        self.blockStart = 0
+        self.blockValid = true
+        self.insert = 0
+      }
       used = Slice.view<u8>(dictionary, dictionary.length - self.windowSize, self.windowSize)
     }
-    Slice.copyInto<u8>(List<u8>.asMutSlice(&mut self.window), 0, used)
-    let count = used.length
-    if count >= MIN_MATCH {
-      self.insertHash = u8.toU32(windowByte(&self, 0))
-      self.insertHash = updateHash(&self, self.insertHash, windowByte(&self, 1))
-      let mut position: usize = 0
-      while position + MIN_MATCH <= count {
+    self.inputPosition = 0
+    fillWindow(&mut self, used, false)
+    while self.lookahead >= MIN_MATCH {
+      let mut position = self.strStart
+      let mut count = self.lookahead - (MIN_MATCH - 1)
+      while count != 0 {
         let _head = insertString(&mut self, position)
         position = position + 1
+        count = count - 1
       }
+      self.strStart = position
+      self.lookahead = MIN_MATCH - 1
+      fillWindow(&mut self, used, false)
     }
-    self.strStart = count
-    self.blockStart = count
-    if count < MIN_MATCH - 1 {
-      self.insert = count
-    } else {
-      self.insert = MIN_MATCH - 1
-    }
+    self.strStart = self.strStart + self.lookahead
+    self.blockStart = self.strStart
+    self.blockValid = true
+    self.insert = self.lookahead
+    self.lookahead = 0
+    self.matchLength = MIN_MATCH - 1
+    self.prevLength = MIN_MATCH - 1
+    self.matchAvailable = false
+    self.inputPosition = 0
     return Result<(), EncodeError>.succeed(())
   }
 
   /// Changes the level and strategy for the data after this call, as zlib's `deflateParams` does.
   ///
   /// # Details
-  /// If the encoder holds input of the current block, the next [`Encoder.step`] ends that block
-  /// with the old settings before it compresses more, as `Flush.Block` does. Only then do the new
-  /// settings apply.
+  /// If the change needs another way of compressing (a new strategy, or a level on the other
+  /// side of 0, 1 to 3, and 4 to 9) and a step ran before, the next [`Encoder.step`] first ends
+  /// the block of the input it holds with the old settings, as `Flush.Block` does, and only then
+  /// applies the new settings. Otherwise the new settings apply at once.
   ///
   /// # Errors
   /// `InvalidOptions` if `level` is more than 9. `InvalidUse` after a failure or after the stream
@@ -512,17 +577,20 @@ impl Encoder {
         EncodeError { kind: EncodeErrorKind.InvalidOptions, consumed: 0, written: 0 },
       )
     }
-    if self.phase == PHASE_FAILED || self.phase == PHASE_FINISHED {
+    if self.phase == PHASE_FAILED || self.phase == PHASE_FINISHING
+      || self.phase == PHASE_FINISHED {
       return Result<(), EncodeError>.failResult(
         EncodeError { kind: EncodeErrorKind.InvalidUse, consumed: 0, written: 0 },
       )
     }
     self.nextLevel = level
     self.nextStrategy = strategy
-    if self.lookahead == 0 && self.symbolNext == 0 && self.strStart == self.blockStart {
-      applyParameters(&mut self)
-    } else {
+    if (strategy != self.strategy || levelKind(level) != levelKind(self.level))
+      && self.lastFlush != FLUSH_NEVER {
       self.parametersPending = true
+    } else {
+      applyParameters(&mut self)
+      self.parametersPending = false
     }
     return Result<(), EncodeError>.succeed(())
   }
@@ -535,6 +603,13 @@ impl Encoder {
   /// when the step returns `Flushed`, or `Finished` for `Flush.Finish`. Until then, call again with
   /// the same flush. A second flush of the same kind with no new input writes nothing.
   ///
+  /// The steps follow zlib's `deflate`: with the same options, the same input and output lengths,
+  /// and the same flushes, each step consumes and writes what zlib 1.3.1 does.
+  ///
+  /// # Gotchas
+  /// As in zlib, if a `Sync` or `Full` flush fills the output, the step after it can write the
+  /// marker of the flush again. Give more than 6 bytes of output when a flush starts to avoid it.
+  ///
   /// # Errors
   /// `InvalidUse` with input after the stream finished, or after an earlier failure.
   pub fn step(self: &mut Self, input: &[u8], output: &mut [u8], flush: Flush) -> Result<
@@ -546,79 +621,33 @@ impl Encoder {
     if self.phase == PHASE_FAILED {
       return failure(&mut self, EncodeErrorKind.InvalidUse)
     }
-    if self.phase == PHASE_FINISHED {
-      if !drain(&mut self, &mut output) {
-        return success(&mut self, EncodeStatus.NeedOutput)
-      }
+    if self.phase == PHASE_FINISHED && self.pendingOffset == self.pendingLength {
       if input.length != 0 {
         return failure(&mut self, EncodeErrorKind.InvalidUse)
       }
       return success(&mut self, EncodeStatus.Finished)
     }
-    if self.phase == PHASE_START {
-      writeHeader(&mut self)
-      self.phase = PHASE_RUNNING
-    }
-
-    // A flush that is complete but not drained keeps its rank, so that the same flush with no new
-    // input does not write its marker again.
-    if !drain(&mut self, &mut output) {
+    if output.length == 0 {
       return success(&mut self, EncodeStatus.NeedOutput)
     }
     if self.parametersPending {
-      let code = compress(&mut self, Slice.view<u8>(input, 0, 0), &mut output, Flush.Block)
-      if code != NEED_MORE {
-        flushBits(&mut self)
-        applyParameters(&mut self)
-        self.parametersPending = false
+      // zlib's deflateParams ends the block of the held input before it changes the settings,
+      // and changes nothing while input is still held.
+      let _status = deflate(&mut self, Slice.view<u8>(input, 0, 0), &mut output, Flush.Block)
+      if self.phase == PHASE_FAILED {
+        return failure(&mut self, EncodeErrorKind.InvalidUse)
       }
-      if !drain(&mut self, &mut output) {
-        self.lastFlush = -1
+      if self.strStart - self.blockStart + self.lookahead != 0 {
         return success(&mut self, EncodeStatus.NeedOutput)
       }
+      applyParameters(&mut self)
+      self.parametersPending = false
     }
-    let rank = flushRank(flush)
-    if input.length == 0 && flush != Flush.Finish && rank <= self.lastFlush {
-      if flush == Flush.None {
-        return success(&mut self, EncodeStatus.NeedInput)
-      }
-      return success(&mut self, EncodeStatus.Flushed)
+    let status = deflate(&mut self, input, &mut output, flush)
+    if self.phase == PHASE_FAILED {
+      return failure(&mut self, EncodeErrorKind.InvalidUse)
     }
-    self.lastFlush = rank
-    let code = compress(&mut self, input, &mut output, flush)
-    if code == NEED_MORE {
-      if self.pendingOffset != self.pendingLength {
-        self.lastFlush = -1
-        return success(&mut self, EncodeStatus.NeedOutput)
-      }
-      return success(&mut self, EncodeStatus.NeedInput)
-    }
-    if code == FINISH_DONE {
-      writeTrailer(&mut self)
-      self.phase = PHASE_FINISHED
-      if !drain(&mut self, &mut output) {
-        return success(&mut self, EncodeStatus.NeedOutput)
-      }
-      return success(&mut self, EncodeStatus.Finished)
-    }
-    if flush == Flush.Partial {
-      alignBlock(&mut self)
-    } else if flush != Flush.Block {
-      storedBlock(&mut self, 0, 0, false)
-      if flush == Flush.Full {
-        clearHash(&mut self)
-        if self.lookahead == 0 {
-          self.strStart = 0
-          self.blockStart = 0
-          self.insert = 0
-        }
-      }
-    }
-    flushBits(&mut self)
-    if !drain(&mut self, &mut output) {
-      return success(&mut self, EncodeStatus.NeedOutput)
-    }
-    return success(&mut self, EncodeStatus.Flushed)
+    return success(&mut self, status)
   }
 
   /// Returns the most bytes that [`Encoder.encode`] can write for `length` input bytes in
@@ -775,10 +804,32 @@ fn configure(state: &mut Encoder) -> () {
   state.maxChain = chain[level]
 }
 
+// Which of zlib's compress functions a level uses: stored, fast, or slow.
+fn levelKind(level: u32) -> u32 {
+  if level == 0 {
+    return 0
+  }
+  if level <= 3 {
+    return 1
+  }
+  return 2
+}
+
 fn applyParameters(state: &mut Encoder) -> () {
-  state.level = state.nextLevel
+  if state.level != state.nextLevel {
+    if state.level == 0 && state.matches != 0 {
+      // Level 0 does not keep the hash chains. It counts the slides it owes in `matches`.
+      if state.matches == 1 {
+        slideHash(&mut state)
+      } else {
+        clearHash(&mut state)
+      }
+      state.matches = 0
+    }
+    state.level = state.nextLevel
+    configure(&mut state)
+  }
   state.strategy = state.nextStrategy
-  configure(&mut state)
 }
 
 fn clearHash(state: &mut Encoder) -> () {
@@ -813,15 +864,113 @@ fn initBlock(state: &mut Encoder) -> () {
   state.matches = 0
 }
 
-fn flushRank(flush: Flush) -> i64 {
+// zlib's numbers of the flush modes.
+fn flushCode(flush: Flush) -> i64 {
   return match flush {
     Flush.None => 0
-    Flush.Block => 1
-    Flush.Partial => 2
-    Flush.Sync => 4
-    Flush.Full => 6
-    Flush.Finish => 8
+    Flush.Partial => 1
+    Flush.Sync => 2
+    Flush.Full => 3
+    Flush.Finish => 4
+    Flush.Block => 5
   }
+}
+
+// zlib's RANK: the order of the flush codes, and of the two values that are not a flush.
+fn flushRank(code: i64) -> i64 {
+  if code > 4 {
+    return code * 2 - 9
+  }
+  return code * 2
+}
+
+// One call of zlib's `deflate`. Returns what the encoder needs next; `phase` is `PHASE_FAILED`
+// after input that follows the end of the stream.
+fn deflate(state: &mut Encoder, input: &[u8], output: &mut [u8], asked: Flush) -> EncodeStatus {
+  let mut flush = asked
+  if state.phase == PHASE_FINISHING || state.phase == PHASE_FINISHED {
+    // The stream is ending, and each step continues that.
+    flush = Flush.Finish
+  }
+  let mut idle = EncodeStatus.Flushed
+  if flush == Flush.None {
+    idle = EncodeStatus.NeedInput
+  }
+  let old = state.lastFlush
+  state.lastFlush = flushCode(flush)
+  if state.pendingOffset != state.pendingLength {
+    flushPending(&mut state, &mut output)
+    if state.outputPosition == output.length {
+      state.lastFlush = FLUSH_OUTPUT_FULL
+      return EncodeStatus.NeedOutput
+    }
+  } else if input.length == 0 && flush != Flush.Finish
+    && flushRank(state.lastFlush) <= flushRank(old) {
+    // There is nothing to do, and the same flush is not written twice.
+    return idle
+  }
+  if (state.phase == PHASE_FINISHING || state.phase == PHASE_FINISHED) && input.length != 0 {
+    state.phase = PHASE_FAILED
+    return EncodeStatus.NeedInput
+  }
+  if state.phase == PHASE_START {
+    writeHeader(&mut state)
+    state.phase = PHASE_RUNNING
+    if state.format != Format.Raw {
+      flushPending(&mut state, &mut output)
+      if state.pendingOffset != state.pendingLength {
+        state.lastFlush = FLUSH_OUTPUT_FULL
+        return EncodeStatus.NeedOutput
+      }
+    }
+  }
+  if input.length != 0 || state.lookahead != 0
+    || (flush != Flush.None && state.phase == PHASE_RUNNING) {
+    let code = compress(&mut state, input, &mut output, flush)
+    if code == FINISH_STARTED || code == FINISH_DONE {
+      state.phase = PHASE_FINISHING
+    }
+    if code == NEED_MORE || code == FINISH_STARTED {
+      if state.outputPosition == output.length {
+        state.lastFlush = FLUSH_OUTPUT_FULL
+        return EncodeStatus.NeedOutput
+      }
+      return EncodeStatus.NeedInput
+    }
+    if code == BLOCK_DONE {
+      if flush == Flush.Partial {
+        alignBlock(&mut state)
+      } else if flush != Flush.Block {
+        storedBlock(&mut state, 0, 0, false)
+        if flush == Flush.Full {
+          clearHash(&mut state)
+          if state.lookahead == 0 {
+            state.strStart = 0
+            state.blockStart = 0
+            state.blockValid = true
+            state.insert = 0
+          }
+        }
+      }
+      flushPending(&mut state, &mut output)
+      if state.outputPosition == output.length {
+        state.lastFlush = FLUSH_OUTPUT_FULL
+        return EncodeStatus.NeedOutput
+      }
+    }
+  }
+  if flush != Flush.Finish {
+    return idle
+  }
+  if state.phase != PHASE_FINISHED {
+    writeTrailer(&mut state)
+    state.phase = PHASE_FINISHED
+  }
+  flushPending(&mut state, &mut output)
+  if state.pendingOffset != state.pendingLength {
+    return EncodeStatus.NeedOutput
+  }
+  return EncodeStatus.Finished
 }
 
 fn success(state: &mut Encoder, status: EncodeStatus) -> Result<EncodeProgress, EncodeError> {
@@ -905,6 +1054,13 @@ fn flushBits(state: &mut Encoder) -> () {
   }
 }
 
+// Moves the complete bytes of the bit buffer to the pending output, then as much of the pending
+// output as fits to the caller's output, as zlib's flush_pending does.
+fn flushPending(state: &mut Encoder, output: &mut [u8]) -> () {
+  flushBits(&mut state)
+  let _empty = drain(&mut state, &mut output)
+}
+
 // Moves all bits to the pending output, padding the last byte with zeros.
 fn windup(state: &mut Encoder) -> () {
   flushBits(&mut state)
@@ -930,7 +1086,8 @@ fn writeHeader(state: &mut Encoder) -> () {
     putByte(&mut state, 0)
     putLittle(&mut state, 0)
     putByte(&mut state, extra)
-    putByte(&mut state, 255)
+    let system = state.gzipSystem
+    putByte(&mut state, system)
   } else if state.format == Format.Zlib {
     let mut header = u32.shiftLeft(8 + u32.shiftLeft(state.windowBits - 8, 4), 8)
     let mut levelFlags: u32 = 3
@@ -942,12 +1099,14 @@ fn writeHeader(state: &mut Encoder) -> () {
       levelFlags = 2
     }
     header = header | u32.shiftLeft(levelFlags, 6)
-    if state.hasDictionary {
+    // A dictionary is loaded when the window holds bytes before the first input.
+    let preset = state.strStart != 0
+    if preset {
       header = header | 32
     }
     header = header + 31 - u32.remainder(header, 31)
     putShortMsb(&mut state, header)
-    if state.hasDictionary {
+    if preset {
       let high = u32.shiftRight(state.dictionaryId, 16)
       putShortMsb(&mut state, high)
       let low = state.dictionaryId & 0xffff
@@ -990,13 +1149,45 @@ fn updateHash(state: &Encoder, hash: u32, byte: u8) -> u32 {
 }
 
 // Hashes the 3 bytes at `position`, links it into its chain, and returns the previous head.
+// It runs for every byte of the input, so it reads each table through one slice, and masks the
+// shift count, which is below 32, so that the shift needs no range check.
+@inlineAlways
 fn insertString(state: &mut Encoder, position: usize) -> usize {
-  let hash = updateHash(&state, state.insertHash, windowByte(&state, position + 2))
-  state.insertHash = hash
+  let mut hash: u32 = 0
+  if state.multiplicative {
+    // Chromium zlib's insert_string: the 4 bytes as a little-endian word, times and plus 66521,
+    // bits 16 and up.
+    let window = List<u8>.asSlice(&state.window)
+    let mut value: u32 = 0
+    let mut loaded = false
+    static if Target.endianness() == Endianness.Little {
+      if position + 4 <= window.length {
+        // One load: the window's padding keeps the 4 bytes after any position inside it.
+        unsafe {
+          let bytes = Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice<u8>(window))
+          value = Pointer.readUnaligned<u32>(Intrinsic.pointerReinterpret<*const u8, *const align(1) u32>(Pointer.at<u8>(bytes, position)))
+        }
+        loaded = true
+      }
+    }
+    if !loaded {
+      value = u8.toU32(window[position]) | u32.shiftLeft(u8.toU32(window[position + 1]), 8)
+        | u32.shiftLeft(u8.toU32(window[position + 2]), 16)
+        | u32.shiftLeft(u8.toU32(window[position + 3]), 24)
+    }
+    hash = u32.shiftRight(u32.wrappingAdd(u32.wrappingMultiply(value, 66521), 66521), 16) & state.hashMask
+  } else {
+    let byte = List<u8>.asSlice(&state.window)[position + 2]
+    hash = (u32.shiftLeft(state.insertHash, state.hashShift & 31) ^ u8.toU32(byte)) & state.hashMask
+    state.insertHash = hash
+  }
   let slot = u32.toUsize(hash)
-  let previous = List<u16>.get(&state.head, slot)
-  List<u16>.set(&mut state.prev, position & state.windowMask, previous)
-  List<u16>.set(&mut state.head, slot, usize.toU16(position))
+  let link = position & state.windowMask
+  let head = List<u16>.asMutSlice(&mut state.head)
+  let previous = head[slot]
+  head[slot] = usize.wrappingToU16(position)
+  let chains = List<u16>.asMutSlice(&mut state.prev)
+  chains[link] = previous
   return u16.toUsize(previous)
 }
 
@@ -1026,20 +1217,27 @@ fn slideHash(state: &mut Encoder) -> () {
   }
 }
 
+// Copies `count` bytes of `window` from `from` down to its start, where `count` is at most `from`.
+fn moveDown(window: &mut [u8], from: usize, count: usize) -> () {
+  let mut index: usize = 0
+  while index < count {
+    window[index] = window[from + index]
+    index = index + 1
+  }
+}
+
 // Copies input into the window, after sliding it when the match position nears its end, and
 // updates the checksum. Follows zlib's fill_window.
-fn fillWindow(state: &mut Encoder, input: &[u8]) -> () {
+fn fillWindow(state: &mut Encoder, input: &[u8], checked: bool) -> () {
   let size = state.windowSize
   let maxDistance = size - MIN_LOOKAHEAD
   while true {
     let mut more = 2 * size - state.lookahead - state.strStart
     if state.strStart >= size + maxDistance {
+      // Only the bytes up to the end of the data move. The bytes after them stay as they are,
+      // and the longest match can read them, so what stays must be what zlib leaves.
       let window = List<u8>.asMutSlice(&mut state.window)
-      let mut index: usize = 0
-      while index < size {
-        window[index] = window[index + size]
-        index = index + 1
-      }
+      moveDown(&mut window, size, size - more)
       if state.matchStart >= size {
         state.matchStart = state.matchStart - size
       } else {
@@ -1072,15 +1270,25 @@ fn fillWindow(state: &mut Encoder, input: &[u8]) -> () {
       state.strStart + state.lookahead,
       source,
     )
-    if state.format == Format.Zlib {
-      state.checksum = CompressionChecksum.adler32Update(state.checksum, source)
-    } else if state.format == Format.Gzip {
-      state.checksum = CompressionChecksum.crc32Update(state.checksum, source)
-      state.totalIn = u32.wrappingAdd(state.totalIn, usize.toU32(count & 0xffffffff))
+    if checked {
+      addChecksum(&mut state, source)
     }
     state.inputPosition = state.inputPosition + count
     state.lookahead = state.lookahead + count
-    if state.lookahead + state.insert >= MIN_MATCH {
+    if state.multiplicative {
+      // The hash reads 4 bytes, so a position is hashed once 4 bytes are there.
+      if state.lookahead + state.insert > MIN_MATCH {
+        let mut position = state.strStart - state.insert
+        while state.insert != 0 {
+          let _head = insertString(&mut state, position)
+          position = position + 1
+          state.insert = state.insert - 1
+          if state.lookahead + state.insert <= MIN_MATCH {
+            break
+          }
+        }
+      }
+    } else if state.lookahead + state.insert >= MIN_MATCH {
       let mut position = state.strStart - state.insert
       state.insertHash = u8.toU32(windowByte(&state, position))
       state.insertHash = updateHash(&state, state.insertHash, windowByte(&state, position + 1))
@@ -1099,16 +1307,149 @@ fn fillWindow(state: &mut Encoder, input: &[u8]) -> () {
   }
 }
 
-// Follows zlib's longest_match: walks the hash chain from `current` and returns the longest match
+// Adds input bytes to the checksum and the size that the trailer holds.
+fn addChecksum(state: &mut Encoder, source: &[u8]) -> () {
+  if state.format == Format.Zlib {
+    state.checksum = CompressionChecksum.adler32Update(state.checksum, source)
+  } else if state.format == Format.Gzip {
+    state.checksum = CompressionChecksum.crc32Update(state.checksum, source)
+    state.totalIn = u32.wrappingAdd(state.totalIn, usize.toU32(source.length & 0xffffffff))
+  }
+}
+
+// Follows zlib's longest_match: walks the hash chain from `start` and returns the longest match
 // length, with its start in `matchStart`.
+//
+// The loop reads through pointers. Before it, the function proves what the reads need: the 258
+// bytes after the match position are in the window, every candidate is before that position, and
+// the chain table covers the window mask.
+@inlineAlways
 fn longestMatch(state: &mut Encoder, start: usize) -> usize {
+  let scan = state.strStart
+  let window = List<u8>.asSlice(&state.window)
+  let chains = List<u16>.asSlice(&state.prev)
+  if scan + MAX_MATCH >= window.length || chains.length <= state.windowMask || start >= scan
+    || start == 0
+    || state.prevLength > MAX_MATCH
+    || state.prevLength == 0 {
+    return longestMatchChecked(&mut state, start)
+  }
+  let mut current = start
+  let mut chain = state.maxChain
+  let mut best = state.prevLength
+  let mut nice = state.niceMatch
+  let maxDistance = state.windowSize - MIN_LOOKAHEAD
+  let mut limit: usize = 0
+  if scan > maxDistance {
+    limit = scan - maxDistance
+  }
+  if state.prevLength >= state.goodMatch {
+    chain = u32.shiftRight(chain, 2)
+  }
+  if nice > state.lookahead {
+    nice = state.lookahead
+  }
+  let mask = state.windowMask
+  let mut matchStart = state.matchStart
+  unsafe {
+    // Both tables hold elements, so their pointers are not null.
+    let bytes = Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice<u8>(window))
+    let links = Intrinsic.pointerRequalify<?[*]const u16, [*]const u16>(Pointer.fromSlice<u16>(chains))
+    // The first two bytes and the two at the end of the best match so far, each pair in one
+    // load: a candidate must match them all to be longer.
+    let opening = pair(bytes, scan)
+    // `best` is at most 258 and a candidate is at least 1 and before `scan`, so the reads at
+    // `best - 1` and `best` from a candidate or from `scan` are in the window.
+    let mut end = pair(bytes, scan + best - 1)
+    let mut endAt = best - 1
+    // A link goes on when it is after `limit` and before `scan`: one unsigned compare. The test
+    // of `scan` keeps a damaged table from reading past the window.
+    let span = scan - limit - 1
+    let lowest = limit + 1
+    // The arithmetic below cannot wrap: positions are below `scan`, lengths at most 258, and
+    // `scan + 258` is inside the window.
+    while true {
+      let candidate = current
+      if pair(bytes, usize.wrappingAdd(candidate, endAt)) == end && pair(bytes, candidate) == opening {
+        // Eight bytes at a time while eight more stay inside the 258, then one at a time.
+        let mut length: usize = 2
+        let mut differs = false
+        while length <= MAX_MATCH - 8 {
+          let left = Pointer.readUnaligned<u64>(
+            Intrinsic.pointerReinterpret<*const u8, *const align(1) u64>(Pointer.at<u8>(bytes, usize.wrappingAdd(candidate, length))),
+          )
+          let right = Pointer.readUnaligned<u64>(
+            Intrinsic.pointerReinterpret<*const u8, *const align(1) u64>(Pointer.at<u8>(bytes, usize.wrappingAdd(scan, length))),
+          )
+          let changed = left ^ right
+          if changed != 0 {
+            length = usize.wrappingAdd(length, u32.toUsize(sameBytes(changed)))
+            differs = true
+            break
+          }
+          length = usize.wrappingAdd(length, 8)
+        }
+        if differs == false {
+          while length < MAX_MATCH
+            && Pointer.read<u8>(Pointer.at<u8>(bytes, usize.wrappingAdd(candidate, length)))
+              == Pointer.read<u8>(Pointer.at<u8>(bytes, usize.wrappingAdd(scan, length))) {
+            length = usize.wrappingAdd(length, 1)
+          }
+        }
+        if length > best {
+          matchStart = candidate
+          best = length
+          if length >= nice {
+            break
+          }
+          endAt = usize.wrappingSubtract(best, 1)
+          end = pair(bytes, usize.wrappingAdd(scan, endAt))
+        }
+      }
+      current = u16.toUsize(Pointer.read<u16>(Pointer.at<u16>(links, current & mask)))
+      if usize.wrappingSubtract(current, lowest) >= span {
+        break
+      }
+      chain = u32.wrappingSubtract(chain, 1)
+      if chain == 0 {
+        break
+      }
+    }
+  }
+  state.matchStart = matchStart
+  if best <= state.lookahead {
+    return best
+  }
+  return state.lookahead
+}
+
+// The two bytes at `bytes[at..]` as one word. The caller proves that they are in the buffer.
+@inlineAlways
+unsafe fn pair(bytes: [*]const u8, at: usize) -> u16 {
+  unsafe {
+    return Pointer.readUnaligned<u16>(Intrinsic.pointerReinterpret<*const u8, *const align(1) u16>(Pointer.at<u8>(bytes, at)))
+  }
+}
+
+// The number of equal low bytes of two words whose XOR is `changed`, which is not 0. The words
+// are read as the target stores them, so the first bytes are the low ones on a little-endian
+// target and the high ones on a big-endian one.
+@inlineAlways
+fn sameBytes(changed: u64) -> u32 {
+  static if Target.endianness() == Endianness.Little {
+    return u64.trailingZeros(changed) / 8
+  }
+  return u64.leadingZeros(changed) / 8
+}
+
+// `longestMatch` with every read checked, for a state that does not hold what the fast one needs.
+fn longestMatchChecked(state: &mut Encoder, start: usize) -> usize {
   let mut current = start
   let mut chain = state.maxChain
   let scan = state.strStart
+  // After a change from lazy to greedy matching, the previous length can be 0. zlib starts from
+  // it as it is, and so the byte before a candidate must then match too.
   let mut best = state.prevLength
-  if best < MIN_MATCH - 1 {
-    best = MIN_MATCH - 1
-  }
   let mut nice = state.niceMatch
   let maxDistance = state.windowSize - MIN_LOOKAHEAD
   let mut limit: usize = 0
@@ -1165,12 +1506,23 @@ fn longestMatch(state: &mut Encoder, start: usize) -> usize {
 fn tallyLiteral(state: &mut Encoder, byte: u8) -> bool {
   let next = state.symbolNext
   let symbols = List<u8>.asMutSlice(&mut state.symbols)
-  symbols[next] = 0
-  symbols[next + 1] = 0
-  symbols[next + 2] = byte
-  state.symbolNext = next + 3
+  if next < symbols.length && symbols.length - next >= 3 {
+    // One check for the three bytes of the symbol.
+    unsafe {
+      let bytes = Intrinsic.pointerRequalify<?[*]mut u8, [*]mut u8>(Pointer.fromMutSlice<u8>(move symbols))
+      Pointer.write<u8>(Pointer.atMut<u8>(bytes, next), 0)
+      Pointer.write<u8>(Pointer.atMut<u8>(bytes, usize.wrappingAdd(next, 1)), 0)
+      Pointer.write<u8>(Pointer.atMut<u8>(bytes, usize.wrappingAdd(next, 2)), byte)
+    }
+  } else {
+    symbols[next] = 0
+    symbols[next + 1] = 0
+    symbols[next + 2] = byte
+  }
+  state.symbolNext = usize.wrappingAdd(next, 3)
   let slot = u8.toUsize(byte)
-  state.literalTree.freq[slot] = state.literalTree.freq[slot] + 1
+  // A count is at most the number of symbols in a block, far below 2^32.
+  state.literalTree.freq[slot] = u32.wrappingAdd(state.literalTree.freq[slot], 1)
   return state.symbolNext == state.symbolEnd
 }
 
@@ -1198,7 +1550,8 @@ fn tallyMatch(state: &mut Encoder, distance: usize, length: usize) -> bool {
   return state.symbolNext == state.symbolEnd
 }
 
-// Ends the current block and starts the next at the match position.
+// Ends the current block and starts the next at the match position. Returns whether the output
+// has room left, as zlib's FLUSH_BLOCK tests.
 fn flushBlock(state: &mut Encoder, output: &mut [u8], last: bool) -> bool {
   let storedLength = state.strStart - state.blockStart
   let valid = state.blockValid
@@ -1206,8 +1559,8 @@ fn flushBlock(state: &mut Encoder, output: &mut [u8], last: bool) -> bool {
   writeBlock(&mut state, valid, start, storedLength, last)
   state.blockStart = state.strStart
   state.blockValid = true
-  flushBits(&mut state)
-  return drain(&mut state, &mut output)
+  flushPending(&mut state, &mut output)
+  return state.outputPosition != output.length
 }
 
 fn finishInsert(state: &mut Encoder) -> () {
@@ -1236,7 +1589,9 @@ fn compress(state: &mut Encoder, input: &[u8], output: &mut [u8], flush: Flush) 
 
 fn endCompress(state: &mut Encoder, output: &mut [u8], flush: Flush) -> u32 {
   if flush == Flush.Finish {
-    let _drained = flushBlock(&mut state, &mut output, true)
+    if !flushBlock(&mut state, &mut output, true) {
+      return FINISH_STARTED
+    }
     return FINISH_DONE
   }
   if state.symbolNext != 0 {
@@ -1247,52 +1602,171 @@ fn endCompress(state: &mut Encoder, output: &mut [u8], flush: Flush) -> u32 {
   return BLOCK_DONE
 }
 
-// Level 0: copies the input into stored blocks of at most 32 KiB.
+// Level 0, as zlib's deflate_stored: copies the input into stored blocks, straight to the output
+// when a block of a worthy size fits there, and through the window and the pending output when it
+// does not. The lengths of the blocks depend on the room in the output.
 fn compressStored(state: &mut Encoder, input: &[u8], output: &mut [u8], flush: Flush) -> u32 {
-  let mut most: usize = 65535
-  if most > state.windowSize {
-    most = state.windowSize
+  let size = state.windowSize
+  let mut minBlock = state.pendingLimit - 5
+  if minBlock > size {
+    minBlock = size
   }
-  let maxDistance = state.windowSize - MIN_LOOKAHEAD
+  let mut last = false
+  let start = state.inputPosition
   while true {
-    if state.lookahead == 0 {
-      if state.strStart >= state.windowSize + maxDistance && state.strStart > state.blockStart {
-        if !flushBlock(&mut state, &mut output, false) {
-          return NEED_MORE
+    let mut length = MAX_STORED
+    // The bytes of a stored block header after the bits that wait.
+    let header = u32.toUsize((state.bitCount + 42) / 8)
+    let room = output.length - state.outputPosition
+    if room < header {
+      break
+    }
+    let have = room - header
+    let mut left = state.strStart - state.blockStart
+    let available = input.length - state.inputPosition
+    if length > left + available {
+      length = left + available
+    }
+    if length > have {
+      length = have
+    }
+    if length < minBlock
+      && ((length == 0 && flush != Flush.Finish) || flush == Flush.None
+        || length != left + available) {
+      break
+    }
+    last = flush == Flush.Finish && length == left + available
+    storedBlock(&mut state, 0, 0, last)
+    let end = state.pendingLength
+    let pending = List<u8>.asMutSlice(&mut state.pending)
+    pending[end - 4] = usize.toU8(length & 255)
+    pending[end - 3] = usize.toU8(usize.shiftRight(length, 8))
+    pending[end - 2] = usize.toU8(~length & 255)
+    pending[end - 1] = usize.toU8(usize.shiftRight(~length, 8) & 255)
+    flushPending(&mut state, &mut output)
+    if left != 0 {
+      if left > length {
+        left = length
+      }
+      let source = Slice.view<u8>(List<u8>.asSlice(&state.window), state.blockStart, left)
+      Slice.copyInto<u8>(&mut output, state.outputPosition, source)
+      state.outputPosition = state.outputPosition + left
+      state.blockStart = state.blockStart + left
+      length = length - left
+    }
+    if length != 0 {
+      let source = Slice.view<u8>(input, state.inputPosition, length)
+      Slice.copyInto<u8>(&mut output, state.outputPosition, source)
+      addChecksum(&mut state, source)
+      state.inputPosition = state.inputPosition + length
+      state.outputPosition = state.outputPosition + length
+    }
+    if last {
+      break
+    }
+  }
+
+  // The window takes the last bytes of what went straight to the output, and `insert` counts
+  // the bytes to hash if a later level looks for matches.
+  let used = state.inputPosition - start
+  if used != 0 {
+    if used >= size {
+      state.matches = 2
+      let source = Slice.view<u8>(input, state.inputPosition - size, size)
+      Slice.copyInto<u8>(List<u8>.asMutSlice(&mut state.window), 0, source)
+      state.strStart = size
+      state.insert = size
+    } else {
+      if 2 * size - state.strStart <= used {
+        state.strStart = state.strStart - size
+        let kept = state.strStart
+        moveDown(List<u8>.asMutSlice(&mut state.window), size, kept)
+        if state.matches < 2 {
+          state.matches = state.matches + 1
+        }
+        if state.insert > state.strStart {
+          state.insert = state.strStart
         }
       }
-      fillWindow(&mut state, input)
-      if state.lookahead == 0 {
-        break
+      let source = Slice.view<u8>(input, state.inputPosition - used, used)
+      Slice.copyInto<u8>(List<u8>.asMutSlice(&mut state.window), state.strStart, source)
+      state.strStart = state.strStart + used
+      let mut added = size - state.insert
+      if added > used {
+        added = used
       }
+      state.insert = state.insert + added
     }
-    let mut take = state.lookahead
-    let room = most - (state.strStart - state.blockStart)
-    if take > room {
-      take = room
-    }
-    state.strStart = state.strStart + take
-    state.lookahead = state.lookahead - take
-    if state.strStart - state.blockStart >= most {
-      if !flushBlock(&mut state, &mut output, false) {
-        return NEED_MORE
-      }
-    }
+    state.blockStart = state.strStart
+    state.blockValid = true
   }
-  finishInsert(&mut state)
-  if flush == Flush.None {
-    return NEED_MORE
-  }
-  if flush == Flush.Finish {
-    let _drained = flushBlock(&mut state, &mut output, true)
+  if last {
     return FINISH_DONE
   }
-  if state.strStart > state.blockStart {
-    if !flushBlock(&mut state, &mut output, false) {
-      return NEED_MORE
+  if flush != Flush.None && flush != Flush.Finish && state.inputPosition == input.length
+    && state.strStart == state.blockStart {
+    return BLOCK_DONE
+  }
+
+  // The rest of the input goes to the window.
+  let mut space = 2 * size - state.strStart
+  if input.length - state.inputPosition > space && state.blockStart >= size {
+    state.blockStart = state.blockStart - size
+    state.strStart = state.strStart - size
+    let kept = state.strStart
+    moveDown(List<u8>.asMutSlice(&mut state.window), size, kept)
+    if state.matches < 2 {
+      state.matches = state.matches + 1
+    }
+    space = space + size
+    if state.insert > state.strStart {
+      state.insert = state.strStart
     }
   }
-  return BLOCK_DONE
+  if space > input.length - state.inputPosition {
+    space = input.length - state.inputPosition
+  }
+  if space != 0 {
+    let source = Slice.view<u8>(input, state.inputPosition, space)
+    Slice.copyInto<u8>(List<u8>.asMutSlice(&mut state.window), state.strStart, source)
+    addChecksum(&mut state, source)
+    state.inputPosition = state.inputPosition + space
+    state.strStart = state.strStart + space
+    let mut added = size - state.insert
+    if added > space {
+      added = space
+    }
+    state.insert = state.insert + added
+  }
+
+  // A block that does not fit in the output goes to the pending output, when it has a worthy
+  // size or a flush asks for all of the input.
+  let mut fits = state.pendingLimit - u32.toUsize((state.bitCount + 42) / 8)
+  if fits > MAX_STORED {
+    fits = MAX_STORED
+  }
+  minBlock = fits
+  if minBlock > size {
+    minBlock = size
+  }
+  let left = state.strStart - state.blockStart
+  let drained = state.inputPosition == input.length
+  if left >= minBlock
+    || ((left != 0 || flush == Flush.Finish) && flush != Flush.None && drained && left <= fits) {
+    let mut length = left
+    if length > fits {
+      length = fits
+    }
+    last = flush == Flush.Finish && drained && length == left
+    let offset = state.blockStart
+    storedBlock(&mut state, offset, length, last)
+    state.blockStart = state.blockStart + length
+    flushPending(&mut state, &mut output)
+  }
+  if last {
+    return FINISH_STARTED
+  }
+  return NEED_MORE
 }
 
 // Levels 1 to 3: greedy matching, as zlib's deflate_fast.
@@ -1300,7 +1774,7 @@ fn compressFast(state: &mut Encoder, input: &[u8], output: &mut [u8], flush: Flu
   let maxDistance = state.windowSize - MIN_LOOKAHEAD
   while true {
     if state.lookahead < MIN_LOOKAHEAD {
-      fillWindow(&mut state, input)
+      fillWindow(&mut state, input, true)
       if state.lookahead < MIN_LOOKAHEAD && flush == Flush.None {
         return NEED_MORE
       }
@@ -1365,7 +1839,7 @@ fn compressSlow(state: &mut Encoder, input: &[u8], output: &mut [u8], flush: Flu
   let maxDistance = state.windowSize - MIN_LOOKAHEAD
   while true {
     if state.lookahead < MIN_LOOKAHEAD {
-      fillWindow(&mut state, input)
+      fillWindow(&mut state, input, true)
       if state.lookahead < MIN_LOOKAHEAD && flush == Flush.None {
         return NEED_MORE
       }
@@ -1419,13 +1893,12 @@ fn compressSlow(state: &mut Encoder, input: &[u8], output: &mut [u8], flush: Flu
     } else if state.matchAvailable {
       let byte = windowByte(&state, state.strStart - 1)
       let full = tallyLiteral(&mut state, byte)
-      let mut drained = true
       if full {
-        drained = flushBlock(&mut state, &mut output, false)
+        let _room = flushBlock(&mut state, &mut output, false)
       }
       state.strStart = state.strStart + 1
       state.lookahead = state.lookahead - 1
-      if !drained {
+      if state.outputPosition == output.length {
         return NEED_MORE
       }
     } else {
@@ -1447,7 +1920,7 @@ fn compressSlow(state: &mut Encoder, input: &[u8], output: &mut [u8], flush: Flu
 fn compressHuffman(state: &mut Encoder, input: &[u8], output: &mut [u8], flush: Flush) -> u32 {
   while true {
     if state.lookahead == 0 {
-      fillWindow(&mut state, input)
+      fillWindow(&mut state, input, true)
       if state.lookahead == 0 {
         if flush == Flush.None {
           return NEED_MORE
@@ -1474,7 +1947,7 @@ fn compressHuffman(state: &mut Encoder, input: &[u8], output: &mut [u8], flush: 
 fn compressRle(state: &mut Encoder, input: &[u8], output: &mut [u8], flush: Flush) -> u32 {
   while true {
     if state.lookahead <= MAX_MATCH {
-      fillWindow(&mut state, input)
+      fillWindow(&mut state, input, true)
       if state.lookahead <= MAX_MATCH && flush == Flush.None {
         return NEED_MORE
       }
@@ -1483,6 +1956,8 @@ fn compressRle(state: &mut Encoder, input: &[u8], output: &mut [u8], flush: Flus
       }
     }
     let mut length: usize = 0
+    // zlib leaves no match length behind, and a later change of strategy starts from it.
+    state.matchLength = 0
     if state.lookahead >= MIN_MATCH && state.strStart > 0 {
       let window = List<u8>.asSlice(&state.window)
       let previous = window[state.strStart - 1]

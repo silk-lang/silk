@@ -230,6 +230,63 @@ impl Debug for DecodeError {
   }
 }
 
+/// The rule of the format that the data broke, in more detail than [`ErrorKind`].
+///
+/// The variants are the causes that zlib's `inflate` reports, and the comments give its message
+/// for each. Read it with [`Decoder.failureDetail`] after a step fails.
+pub enum ErrorDetail {
+  /// No step failed, or the failure is not one of the data: a limit, or a call that is not
+  /// allowed.
+  None,
+  /// The two bytes of a zlib header are not a multiple of 31, or a gzip header does not start with
+  /// `1f 8b`: "incorrect header check".
+  HeaderCheck,
+  /// The header names a method that is not DEFLATE: "unknown compression method".
+  Method,
+  /// The zlib header names a window that is larger than 32 KiB or than the window bits of
+  /// [`Decoder.setWindowBits`]: "invalid window size".
+  WindowSize,
+  /// A reserved flag of the gzip header is set: "unknown header flags set".
+  HeaderFlags,
+  /// The CRC of the gzip header is not correct: "header crc mismatch".
+  HeaderCrc,
+  /// The zlib header names a preset dictionary and none is loaded.
+  DictionaryNeeded,
+  /// The zlib header names another preset dictionary than the loaded one.
+  DictionaryId,
+  /// A block has type 3: "invalid block type".
+  BlockType,
+  /// The length of a stored block and its complement do not agree: "invalid stored block
+  /// lengths".
+  StoredLengths,
+  /// A dynamic block has more than 286 literal/length codes or more than 30 distance codes: "too
+  /// many length or distance symbols".
+  SymbolCounts,
+  /// The code lengths of the code-length code are not a complete code: "invalid code lengths
+  /// set".
+  CodeLengthsSet,
+  /// A repeat of a code length has no length before it, or goes past the last code: "invalid bit
+  /// length repeat".
+  LengthRepeat,
+  /// The end-of-block symbol has no code: "invalid code -- missing end-of-block".
+  MissingEndOfBlock,
+  /// The literal/length code lengths are not a usable code: "invalid literal/lengths set".
+  LiteralLengthsSet,
+  /// The distance code lengths are not a usable code: "invalid distances set".
+  DistancesSet,
+  /// The data holds a literal/length code that is not in the code: "invalid literal/length code".
+  LiteralLengthCode,
+  /// The data holds a distance code that is not in the code: "invalid distance code".
+  DistanceCode,
+  /// A back-reference points before the bytes that the decoder holds: "invalid distance too far
+  /// back".
+  DistanceTooFar,
+  /// The Adler-32 or CRC-32 of the data is not correct: "incorrect data check".
+  DataCheck,
+  /// The size in the gzip trailer is not the size of the data: "incorrect length check".
+  LengthCheck,
+}
+
 /// A DEFLATE, zlib, or gzip decoder that owns its history and tables.
 ///
 /// # When to use
@@ -263,6 +320,21 @@ pub struct Decoder {
   fixedLoaded: bool,
   phase: u32,
   error: ErrorKind,
+  detail: ErrorDetail,
+  // The most bytes of history that a match can reach: 32 KiB, or the window of `setWindowBits`.
+  reach: usize,
+  // The window bits that the caller set, 0 for those of the zlib header, or `WINDOW_STRICT`.
+  windowBits: u32,
+  memberStop: bool,
+  blockStop: bool,
+  // Whether the decoder just reached the start of a block, where a block stop returns.
+  boundary: bool,
+  literal: u8,
+  // What the bytes read so far of a header unit already prove wrong. The unit is checked when
+  // it is complete; if the final input ends inside it, this is the failure.
+  early: bool,
+  earlyKind: ErrorKind,
+  earlyDetail: ErrorDetail,
   totalInput: u64,
   totalOutput: u64,
   totalHeaders: u64,
@@ -330,6 +402,16 @@ impl Decoder {
       fixedLoaded: false,
       phase: startPhase(format),
       error: ErrorKind.InvalidUse,
+      detail: ErrorDetail.None,
+      reach: RING,
+      windowBits: WINDOW_STRICT,
+      memberStop: false,
+      blockStop: false,
+      boundary: false,
+      literal: 0,
+      early: false,
+      earlyKind: ErrorKind.InvalidUse,
+      earlyDetail: ErrorDetail.None,
       totalInput: 0,
       totalOutput: 0,
       totalHeaders: 0,
@@ -395,6 +477,11 @@ impl Decoder {
     self.window = RING
     self.phase = startPhase(format)
     self.error = ErrorKind.InvalidUse
+    self.detail = ErrorDetail.None
+    self.reach = reachOf(self.windowBits)
+    self.boundary = false
+    self.literal = 0
+    self.early = false
     self.totalInput = 0
     self.totalOutput = 0
     self.totalHeaders = 0
@@ -446,8 +533,8 @@ impl Decoder {
       )
     }
     let mut used = dictionary
-    if used.length > RING {
-      used = Slice.view<u8>(dictionary, dictionary.length - RING, RING)
+    if used.length > self.reach {
+      used = Slice.view<u8>(dictionary, dictionary.length - self.reach, self.reach)
     }
     Slice.copyInto<u8>(bytesMut(&mut self.ring), 0, used)
     self.historyNext = used.length & RING_MASK
@@ -455,6 +542,53 @@ impl Decoder {
     self.dictionaryId = CompressionChecksum.adler32(dictionary)
     self.dictionaryLength = dictionary.length
     return Result<(), DecodeError>.succeed(())
+  }
+  /// Sets the window as zlib's `inflateInit2` does, before the first step.
+  ///
+  /// # Details
+  /// `bits` is from 8 to 15, or 0 to take the window of the zlib header. A match can then reach
+  /// `1 << bits` bytes of the output of earlier steps, and all the output of its own step, as in
+  /// zlib. A zlib header that names a larger window fails with `InvalidHeader`. Without this
+  /// call, the window is the one that the zlib header names, 32 KiB for the other formats, and a
+  /// match that reaches past it is not valid. The setting stays across [`Decoder.reset`].
+  ///
+  /// # Errors
+  /// `InvalidUse` if `bits` is outside its range, or after the first step.
+  pub fn setWindowBits(self: &mut Self, bits: u32) -> Result<(), DecodeError> {
+    if (bits != 0 && bits < 8) || bits > 15 || self.totalInput != 0 || self.finalSeen
+      || self.phase == PHASE_FAILED
+      || self.phase == PHASE_DONE {
+      return Result<(), DecodeError>.failResult(
+        DecodeError {kind: ErrorKind.InvalidUse, consumed: 0, written: 0},
+      )
+    }
+    self.windowBits = bits
+    self.reach = reachOf(bits)
+    if self.historyCount > self.reach {
+      self.historyCount = self.reach
+    }
+    return Result<(), DecodeError>.succeed(())
+  }
+  /// Sets whether a gzip decoder finishes at the end of the first member, as the other formats
+  /// finish at the end of their stream, and leaves the bytes after it unconsumed.
+  ///
+  /// Without it, a gzip decoder goes on to the next member and finishes at the final input. The
+  /// setting stays across [`Decoder.reset`].
+  pub fn setMemberStop(self: &mut Self, stop: bool) -> () {
+    self.memberStop = stop
+  }
+  /// Sets whether a step returns when it reaches the start of a block, as zlib's `inflate` does
+  /// with `Z_BLOCK`.
+  ///
+  /// The step then returns `NeedInput` with input left, after the header and after each block. A
+  /// step that starts at the start of a block decodes that block. The setting stays across
+  /// [`Decoder.reset`].
+  pub fn setBlockStop(self: &mut Self, stop: bool) -> () {
+    self.blockStop = stop
+  }
+  /// Returns which rule of the format the data broke, after a step failed.
+  pub fn failureDetail(self: &Self) -> ErrorDetail {
+    return self.detail
   }
   /// Decodes from `input` into `output` and returns how much it consumed and wrote.
   ///
@@ -513,6 +647,15 @@ impl Decoder {
       self.outputEnd = u64.toUsize(outputRoom)
     }
     while true {
+      if self.boundary {
+        // The mark is taken here, so the step after a block stop decodes the block.
+        self.boundary = false
+        if self.blockStop {
+          commit(&mut self, &output)
+          giveBack(&mut self)
+          return success(&mut self, Status.NeedInput)
+        }
+      }
       let action = advance(&mut self, input, &mut output)
       if action == GO {
         continue
@@ -529,6 +672,11 @@ impl Decoder {
       commit(&mut self, &output)
       if action == NEED_INPUT {
         if self.finalSeen {
+          if self.early {
+            let kind = self.earlyKind
+            self.detail = self.earlyDetail
+            return failure(&mut self, kind)
+          }
           return failure(&mut self, ErrorKind.TruncatedInput)
         }
         return success(&mut self, Status.NeedInput)
@@ -569,6 +717,7 @@ const PHASE_COUNTS: u32 = 14
 const PHASE_CODE_LENGTHS: u32 = 15
 const PHASE_LENGTHS: u32 = 16
 const PHASE_SYMBOL: u32 = 20
+const PHASE_LITERAL: u32 = 21
 const PHASE_DISTANCE: u32 = 23
 const PHASE_COPY: u32 = 25
 const PHASE_ADLER: u32 = 30
@@ -580,6 +729,18 @@ const PHASE_FAILED: u32 = 60
 
 const RING: usize = 32768
 const RING_MASK: usize = 32767
+
+// The value of `windowBits` when the caller did not set them: the zlib header sets the window,
+// and a match that reaches past it is not valid.
+const WINDOW_STRICT: u32 = 255
+
+// The most history that a match can reach with the caller's window bits.
+fn reachOf(bits: u32) -> usize {
+  if bits >= 8 && bits <= 15 {
+    return usize.shiftLeft(1, u32.toUsize(bits))
+  }
+  return RING
+}
 
 // The table storage: the literal/length table, the distance table, and the code-length table.
 // Each has a root part indexed by its root bits and second-level parts after it. Complete codes
@@ -706,8 +867,17 @@ fn failure(state: &mut Decoder, kind: ErrorKind) -> Result<Progress, DecodeError
   )
 }
 
-fn reject(state: &mut Decoder, kind: ErrorKind) -> u32 {
+// Notes a failure that the first bytes of a header unit prove, for a final input that ends
+// inside the unit.
+fn foresee(state: &mut Decoder, kind: ErrorKind, detail: ErrorDetail) -> () {
+  state.early = true
+  state.earlyKind = kind
+  state.earlyDetail = detail
+}
+
+fn reject(state: &mut Decoder, kind: ErrorKind, detail: ErrorDetail) -> u32 {
   state.error = kind
+  state.detail = detail
   state.phase = PHASE_FAILED
   return FAILED
 }
@@ -716,7 +886,7 @@ fn reject(state: &mut Decoder, kind: ErrorKind) -> u32 {
 // failure when input is left but the input limit stops the decoder from taking it.
 fn starve(state: &mut Decoder, input: &[u8]) -> u32 {
   if state.inputPosition < input.length {
-    return reject(&mut state, ErrorKind.InputLimit)
+    return reject(&mut state, ErrorKind.InputLimit, ErrorDetail.None)
   }
   return NEED_INPUT
 }
@@ -727,7 +897,7 @@ fn full(state: &mut Decoder, output: &[u8]) -> u32 {
   if state.outputEnd == output.length {
     return NEED_OUTPUT
   }
-  return reject(&mut state, ErrorKind.OutputLimit)
+  return reject(&mut state, ErrorKind.OutputLimit, ErrorDetail.None)
 }
 
 // Returns the whole bytes of the bit buffer to the caller, who gives them again on the next call.
@@ -777,8 +947,8 @@ fn commit(state: &mut Decoder, output: &[u8]) -> () {
     state.historyNext = (next + fresh.length) & RING_MASK
   }
   state.historyCount = state.historyCount + fresh.length
-  if state.historyCount > RING {
-    state.historyCount = RING
+  if state.historyCount > state.reach {
+    state.historyCount = state.reach
   }
   state.totalOutput = state.totalOutput + usize.toU64(fresh.length)
   state.flushed = end
@@ -865,7 +1035,7 @@ fn headerByte(state: &mut Decoder, input: &[u8], checksum: bool) -> u32 {
     }
   }
   if state.totalHeaders == state.limits.maxHeaderBytes {
-    return reject(&mut state, ErrorKind.HeaderLimit)
+    return reject(&mut state, ErrorKind.HeaderLimit, ErrorDetail.None)
   }
   if readBits(&mut state, input, 8) == false {
     return starve(&mut state, input)
@@ -909,6 +1079,7 @@ fn nextGzipField(state: &mut Decoder, phase: u32) -> () {
   if phase < PHASE_GZIP_EXTRA_LENGTH && u32.bitAnd(state.flags, 4) != 0 {
     state.phase = PHASE_GZIP_EXTRA_LENGTH
   }
+  state.boundary = state.phase == PHASE_BLOCK
   return ()
 }
 
@@ -919,6 +1090,15 @@ fn advance(state: &mut Decoder, input: &[u8], output: &mut [u8]) -> u32 {
   }
   if phase == PHASE_COPY {
     return copy(&mut state, &mut output)
+  }
+  if phase == PHASE_LITERAL {
+    if state.outputPosition == state.outputEnd {
+      return full(&mut state, &output)
+    }
+    output[state.outputPosition] = state.literal
+    state.outputPosition = state.outputPosition + 1
+    state.phase = PHASE_SYMBOL
+    return GO
   }
   if phase == PHASE_DISTANCE {
     return distance(&mut state, input)
@@ -933,7 +1113,7 @@ fn advance(state: &mut Decoder, input: &[u8], output: &mut [u8]) -> u32 {
     state.finalBlock = u32.bitAnd(state.value, 1) != 0
     let kind = u32.shiftRight(state.value, 1)
     if kind == 3 {
-      return reject(&mut state, ErrorKind.InvalidBlock)
+      return reject(&mut state, ErrorKind.InvalidBlock, ErrorDetail.BlockType)
     }
     if kind == 0 {
       // A stored block starts at the next byte boundary.
@@ -959,7 +1139,7 @@ fn advance(state: &mut Decoder, input: &[u8], output: &mut [u8]) -> u32 {
     }
     let length = state.value & 65535
     if u32.shiftRight(state.value, 16) != u32.bitXor(length, 65535) {
-      return reject(&mut state, ErrorKind.InvalidBlock)
+      return reject(&mut state, ErrorKind.InvalidBlock, ErrorDetail.StoredLengths)
     }
     state.remaining = u32.toUsize(length)
     state.phase = PHASE_STORED
@@ -975,8 +1155,8 @@ fn advance(state: &mut Decoder, input: &[u8], output: &mut [u8]) -> u32 {
     state.literalCount = u32.toUsize(u32.bitAnd(state.value, 31)) + 257
     state.distanceCount = u32.toUsize(u32.bitAnd(u32.shiftRight(state.value, 5), 31)) + 1
     state.codeCount = u32.toUsize(u32.shiftRight(state.value, 10)) + 4
-    if state.literalCount > 286 {
-      return reject(&mut state, ErrorKind.InvalidHuffman)
+    if state.literalCount > 286 || state.distanceCount > 30 {
+      return reject(&mut state, ErrorKind.InvalidHuffman, ErrorDetail.SymbolCounts)
     }
     RawBuffer.fill(&mut state.lengths, 0, LENGTH_COUNT, 0)
     state.index = 0
@@ -994,8 +1174,9 @@ fn advance(state: &mut Decoder, input: &[u8], output: &mut [u8]) -> u32 {
       lengths[at] = value
       state.index = state.index + 1
     }
-    if buildCode(&mut state, 0, 19, ALPHABET_CODE, false, false) == false {
-      return reject(&mut state, ErrorKind.InvalidHuffman)
+    if emptyCode(&mut state) == false
+      && buildCode(&mut state, 0, 19, ALPHABET_CODE, false, false) == false {
+      return reject(&mut state, ErrorKind.InvalidHuffman, ErrorDetail.CodeLengthsSet)
     }
     state.index = 0
     state.phase = PHASE_LENGTHS
@@ -1014,7 +1195,7 @@ fn advance(state: &mut Decoder, input: &[u8], output: &mut [u8]) -> u32 {
       | u32.shiftLeft(u32.shiftRight(value, 16) & 255, 8)
       | u32.shiftRight(value, 24)
     if expected != state.adler {
-      return reject(&mut state, ErrorKind.ChecksumMismatch)
+      return reject(&mut state, ErrorKind.ChecksumMismatch, ErrorDetail.DataCheck)
     }
     return DONE
   }
@@ -1023,7 +1204,7 @@ fn advance(state: &mut Decoder, input: &[u8], output: &mut [u8]) -> u32 {
       return starve(&mut state, input)
     }
     if state.value != state.crc {
-      return reject(&mut state, ErrorKind.ChecksumMismatch)
+      return reject(&mut state, ErrorKind.ChecksumMismatch, ErrorDetail.DataCheck)
     }
     state.phase = PHASE_GZIP_SIZE
     return GO
@@ -1033,7 +1214,7 @@ fn advance(state: &mut Decoder, input: &[u8], output: &mut [u8]) -> u32 {
       return starve(&mut state, input)
     }
     if state.value != state.memberSize {
-      return reject(&mut state, ErrorKind.SizeMismatch)
+      return reject(&mut state, ErrorKind.SizeMismatch, ErrorDetail.LengthCheck)
     }
     state.phase = PHASE_MEMBER
     return GO
@@ -1041,6 +1222,9 @@ fn advance(state: &mut Decoder, input: &[u8], output: &mut [u8]) -> u32 {
   if phase == PHASE_MEMBER {
     // The trailer ends on a byte boundary, so the buffer holds only whole bytes of this call.
     giveBack(&mut state)
+    if state.memberStop {
+      return DONE
+    }
     if state.inputPosition == input.length {
       if state.finalSeen {
         return DONE
@@ -1048,7 +1232,7 @@ fn advance(state: &mut Decoder, input: &[u8], output: &mut [u8]) -> u32 {
       return NEED_INPUT
     }
     if state.members == state.limits.maxMembers {
-      return reject(&mut state, ErrorKind.MemberLimit)
+      return reject(&mut state, ErrorKind.MemberLimit, ErrorDetail.None)
     }
     state.members = state.members + 1
     state.historyNext = 0
@@ -1064,7 +1248,7 @@ fn advance(state: &mut Decoder, input: &[u8], output: &mut [u8]) -> u32 {
   if phase == PHASE_DONE {
     return DONE
   }
-  return reject(&mut state, ErrorKind.InvalidUse)
+  return reject(&mut state, ErrorKind.InvalidUse, ErrorDetail.None)
 }
 
 // Reads one byte of a gzip or zlib header.
@@ -1076,18 +1260,29 @@ fn header(state: &mut Decoder, input: &[u8]) -> u32 {
     return read
   }
   if phase == PHASE_GZIP {
-    if state.index == 0 && state.value != 31 {
-      return reject(&mut state, ErrorKind.InvalidHeader)
+    // The header is checked in units of two bytes, as zlib does: the magic, then the method with
+    // the flags.
+    if state.index == 0 || state.index == 2 {
+      state.first = state.value
+      state.early = false
+      if state.index == 0 && state.value != 31 {
+        foresee(&mut state, ErrorKind.InvalidHeader, ErrorDetail.HeaderCheck)
+      }
+      if state.index == 2 && state.value != 8 {
+        foresee(&mut state, ErrorKind.UnsupportedMethod, ErrorDetail.Method)
+      }
+    } else {
+      state.early = false
     }
-    if state.index == 1 && state.value != 139 {
-      return reject(&mut state, ErrorKind.InvalidHeader)
-    }
-    if state.index == 2 && state.value != 8 {
-      return reject(&mut state, ErrorKind.UnsupportedMethod)
+    if state.index == 1 && (state.first != 31 || state.value != 139) {
+      return reject(&mut state, ErrorKind.InvalidHeader, ErrorDetail.HeaderCheck)
     }
     if state.index == 3 {
+      if state.first != 8 {
+        return reject(&mut state, ErrorKind.UnsupportedMethod, ErrorDetail.Method)
+      }
       if state.value >= 32 {
-        return reject(&mut state, ErrorKind.InvalidHeader)
+        return reject(&mut state, ErrorKind.InvalidHeader, ErrorDetail.HeaderFlags)
       }
       state.flags = state.value
     }
@@ -1133,31 +1328,54 @@ fn header(state: &mut Decoder, input: &[u8]) -> u32 {
     state.index = state.index + 1
     if state.index == 2 {
       if state.trailer != u32.bitAnd(state.headerCrc, 65535) {
-        return reject(&mut state, ErrorKind.ChecksumMismatch)
+        return reject(&mut state, ErrorKind.ChecksumMismatch, ErrorDetail.HeaderCrc)
       }
       state.phase = PHASE_BLOCK
+      state.boundary = true
     }
     return GO
   }
   if phase == PHASE_ZLIB_METHOD {
     state.first = state.value
     if u32.bitAnd(state.first, 15) != 8 {
-      return reject(&mut state, ErrorKind.UnsupportedMethod)
+      foresee(&mut state, ErrorKind.UnsupportedMethod, ErrorDetail.Method)
+    } else if state.first >= 128 {
+      foresee(&mut state, ErrorKind.InvalidHeader, ErrorDetail.WindowSize)
     }
-    if state.first >= 128 {
-      return reject(&mut state, ErrorKind.InvalidHeader)
-    }
-    state.window = u32.toUsize(u32.shiftLeft(1, 8 + u32.shiftRight(state.first, 4)))
     state.phase = PHASE_ZLIB_FLAGS
     return GO
   }
   if phase == PHASE_ZLIB_FLAGS {
+    state.early = false
+    // The two bytes are checked together and in zlib's order.
     if u32.remainder(state.first * 256 + state.value, 31) != 0 {
-      return reject(&mut state, ErrorKind.InvalidHeader)
+      // zlib names the check first. The kind stays the more specific one when the method is
+      // wrong too.
+      if u32.bitAnd(state.first, 15) != 8 {
+        return reject(&mut state, ErrorKind.UnsupportedMethod, ErrorDetail.HeaderCheck)
+      }
+      return reject(&mut state, ErrorKind.InvalidHeader, ErrorDetail.HeaderCheck)
+    }
+    if u32.bitAnd(state.first, 15) != 8 {
+      return reject(&mut state, ErrorKind.UnsupportedMethod, ErrorDetail.Method)
+    }
+    let bits = 8 + u32.shiftRight(state.first, 4)
+    if bits > 15 {
+      return reject(&mut state, ErrorKind.InvalidHeader, ErrorDetail.WindowSize)
+    }
+    if state.windowBits == WINDOW_STRICT {
+      state.window = u32.toUsize(u32.shiftLeft(1, bits))
+    } else if state.windowBits == 0 {
+      state.reach = u32.toUsize(u32.shiftLeft(1, bits))
+      if state.historyCount > state.reach {
+        state.historyCount = state.reach
+      }
+    } else if bits > state.windowBits {
+      return reject(&mut state, ErrorKind.InvalidHeader, ErrorDetail.WindowSize)
     }
     if u32.bitAnd(state.value, 32) != 0 {
       if state.dictionaryLength == 0 {
-        return reject(&mut state, ErrorKind.MissingDictionary)
+        foresee(&mut state, ErrorKind.MissingDictionary, ErrorDetail.DictionaryNeeded)
       }
       state.index = 0
       state.trailer = 0
@@ -1168,18 +1386,24 @@ fn header(state: &mut Decoder, input: &[u8]) -> u32 {
     state.historyNext = 0
     state.historyCount = 0
     state.phase = PHASE_BLOCK
+    state.boundary = true
     return GO
   }
   // PHASE_ZLIB_DICTIONARY
   state.trailer = u32.shiftLeft(state.trailer, 8) | state.value
   state.index = state.index + 1
   if state.index == 4 {
+    state.early = false
+    if state.dictionaryLength == 0 {
+      return reject(&mut state, ErrorKind.MissingDictionary, ErrorDetail.DictionaryNeeded)
+    }
     if state.trailer != state.dictionaryId {
-      return reject(&mut state, ErrorKind.DictionaryMismatch)
+      return reject(&mut state, ErrorKind.DictionaryMismatch, ErrorDetail.DictionaryId)
     }
     state.index = 0
     state.trailer = 0
     state.phase = PHASE_BLOCK
+    state.boundary = true
   }
   return GO
 }
@@ -1217,6 +1441,27 @@ fn stored(state: &mut Decoder, input: &[u8], output: &mut [u8]) -> u32 {
   return GO
 }
 
+// With no code length at all, zlib reads each code-length symbol as the length 0 in one bit.
+// Returns whether the code lengths are all 0, with the table for that loaded.
+fn emptyCode(state: &mut Decoder) -> bool {
+  let lengths = bytes(&state.lengths)
+  let mut index: usize = 0
+  while index < 19 {
+    if lengths[index] != 0 {
+      return false
+    }
+    index = index + 1
+  }
+  let entry = entryOf(ALPHABET_CODE, 0, 1)
+  let table = wordsMut(&mut state.tables)
+  index = 0
+  while index < CODE_CAPACITY {
+    table[CODE_BASE + index] = entry
+    index = index + 1
+  }
+  return true
+}
+
 // Reads the code lengths of the literal/length and distance codes, then builds their tables.
 fn codeLengths(state: &mut Decoder, input: &[u8]) -> u32 {
   let total = state.literalCount + state.distanceCount
@@ -1236,9 +1481,6 @@ fn codeLengths(state: &mut Decoder, input: &[u8]) -> u32 {
       state.index = state.index + 1
       continue
     }
-    if symbol == 16 && state.index == 0 {
-      return reject(&mut state, ErrorKind.InvalidHuffman)
-    }
     let mut extra: u32 = 2
     let mut base: usize = 3
     if symbol == 17 {
@@ -1251,10 +1493,13 @@ fn codeLengths(state: &mut Decoder, input: &[u8]) -> u32 {
     if bits + extra > state.count {
       return starve(&mut state, input)
     }
+    if symbol == 16 && state.index == 0 {
+      return reject(&mut state, ErrorKind.InvalidHuffman, ErrorDetail.LengthRepeat)
+    }
     let repeat = base + u32.toUsize(bitsAt(state.acc, bits, extra))
     dropBits(&mut state, bits + extra)
     if repeat > total - state.index {
-      return reject(&mut state, ErrorKind.InvalidHuffman)
+      return reject(&mut state, ErrorKind.InvalidHuffman, ErrorDetail.LengthRepeat)
     }
     let mut value: u8 = 0
     let at = state.index
@@ -1272,13 +1517,13 @@ fn codeLengths(state: &mut Decoder, input: &[u8]) -> u32 {
   let literalCount = state.literalCount
   let distanceCount = state.distanceCount
   if bytes(&state.lengths)[256] == 0 {
-    return reject(&mut state, ErrorKind.InvalidHuffman)
+    return reject(&mut state, ErrorKind.InvalidHuffman, ErrorDetail.MissingEndOfBlock)
   }
   if buildCode(&mut state, 0, literalCount, ALPHABET_LITERAL, true, false) == false {
-    return reject(&mut state, ErrorKind.InvalidHuffman)
+    return reject(&mut state, ErrorKind.InvalidHuffman, ErrorDetail.LiteralLengthsSet)
   }
   if buildCode(&mut state, literalCount, distanceCount, ALPHABET_DISTANCE, true, true) == false {
-    return reject(&mut state, ErrorKind.InvalidHuffman)
+    return reject(&mut state, ErrorKind.InvalidHuffman, ErrorDetail.DistancesSet)
   }
   state.phase = PHASE_SYMBOL
   return GO
@@ -1305,6 +1550,11 @@ fn symbol(state: &mut Decoder, input: &[u8], output: &mut [u8]) -> u32 {
       return starve(&mut state, input)
     }
     if state.outputPosition == state.outputEnd {
+      // The literal is read and waits for room, as in zlib, so the input that a full output
+      // leaves is the same.
+      dropBits(&mut state, take)
+      state.literal = u32.wrappingToU8(u32.shiftRight(entry, 16))
+      state.phase = PHASE_LITERAL
       return full(&mut state, &output)
     }
     dropBits(&mut state, take)
@@ -1324,9 +1574,9 @@ fn symbol(state: &mut Decoder, input: &[u8], output: &mut [u8]) -> u32 {
       return GO
     }
     if u32.shiftRight(entry, 16) == BAD_LENGTH {
-      return reject(&mut state, ErrorKind.InvalidBlock)
+      return reject(&mut state, ErrorKind.InvalidBlock, ErrorDetail.LiteralLengthCode)
     }
-    return reject(&mut state, ErrorKind.InvalidHuffman)
+    return reject(&mut state, ErrorKind.InvalidHuffman, ErrorDetail.LiteralLengthCode)
   }
   state.matchLength = u32.toUsize(u32.shiftRight(entry, 16) + extraBits(state.acc, entry))
   dropBits(&mut state, take)
@@ -1344,15 +1594,12 @@ fn distance(state: &mut Decoder, input: &[u8]) -> u32 {
   }
   if entry & ENTRY_SPECIAL != 0 {
     if u32.shiftRight(entry, 16) == BAD_DISTANCE {
-      return reject(&mut state, ErrorKind.InvalidDistance)
+      return reject(&mut state, ErrorKind.InvalidDistance, ErrorDetail.DistanceCode)
     }
-    return reject(&mut state, ErrorKind.InvalidHuffman)
+    return reject(&mut state, ErrorKind.InvalidHuffman, ErrorDetail.DistanceCode)
   }
   let found = u32.toUsize(u32.shiftRight(entry, 16) + extraBits(state.acc, entry))
   dropBits(&mut state, take)
-  if found > state.historyCount + (state.outputPosition - state.flushed) || found > state.window {
-    return reject(&mut state, ErrorKind.InvalidDistance)
-  }
   state.remaining = found
   state.phase = PHASE_COPY
   return GO
@@ -1367,6 +1614,12 @@ fn copy(state: &mut Decoder, output: &mut [u8]) -> u32 {
   }
   if state.outputPosition == state.outputEnd {
     return full(&mut state, &output)
+  }
+  // The distance is checked when the copy has room, and again when a later step continues the
+  // copy, as zlib checks it.
+  if state.remaining > state.historyCount + (state.outputPosition - state.flushed)
+    || state.remaining > state.window {
+    return reject(&mut state, ErrorKind.InvalidDistance, ErrorDetail.DistanceTooFar)
   }
   let mut length = state.matchLength
   if length > state.outputEnd - state.outputPosition {
@@ -1831,6 +2084,7 @@ fn fastLoop(state: &mut Decoder, input: &[u8], output: &mut [u8]) -> u32 {
 // so that the trailer can check the checksum.
 fn endBlock(state: &mut Decoder, output: &[u8]) -> () {
   state.phase = PHASE_BLOCK
+  state.boundary = true
   if state.finalBlock {
     let partial = state.count % 8
     dropBits(&mut state, partial)

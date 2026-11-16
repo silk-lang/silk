@@ -72,7 +72,7 @@ pub effect fn main() -> i32
 
 Import as `Decoder` with `import silk.compress.inflate { Decoder }`.
 
-Public declarations: 8.
+Public declarations: 9.
 
 <a id="MEMORY_BOUND"></a>
 
@@ -530,6 +530,237 @@ effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &m
 
 Writes the fields, as `DecodeError { kind: ..., consumed: ..., ... }`.
 
+<a id="ErrorDetail"></a>
+
+## `ErrorDetail`
+
+```silk
+pub enum ErrorDetail
+```
+
+The rule of the format that the data broke, in more detail than [`ErrorKind`](#ErrorKind).
+
+The variants are the causes that zlib's `inflate` reports, and the comments give its message
+for each. Read it with [`Decoder.failureDetail`](#Decoder.impl.failureDetail) after a step fails.
+
+<a id="ErrorDetail.None"></a>
+
+### `None`
+
+```silk
+None
+```
+
+No step failed, or the failure is not one of the data: a limit, or a call that is not
+allowed.
+
+<a id="ErrorDetail.HeaderCheck"></a>
+
+### `HeaderCheck`
+
+```silk
+HeaderCheck
+```
+
+The two bytes of a zlib header are not a multiple of 31, or a gzip header does not start with
+`1f 8b`: "incorrect header check".
+
+<a id="ErrorDetail.Method"></a>
+
+### `Method`
+
+```silk
+Method
+```
+
+The header names a method that is not DEFLATE: "unknown compression method".
+
+<a id="ErrorDetail.WindowSize"></a>
+
+### `WindowSize`
+
+```silk
+WindowSize
+```
+
+The zlib header names a window that is larger than 32 KiB or than the window bits of
+[`Decoder.setWindowBits`](#Decoder.impl.setWindowBits): "invalid window size".
+
+<a id="ErrorDetail.HeaderFlags"></a>
+
+### `HeaderFlags`
+
+```silk
+HeaderFlags
+```
+
+A reserved flag of the gzip header is set: "unknown header flags set".
+
+<a id="ErrorDetail.HeaderCrc"></a>
+
+### `HeaderCrc`
+
+```silk
+HeaderCrc
+```
+
+The CRC of the gzip header is not correct: "header crc mismatch".
+
+<a id="ErrorDetail.DictionaryNeeded"></a>
+
+### `DictionaryNeeded`
+
+```silk
+DictionaryNeeded
+```
+
+The zlib header names a preset dictionary and none is loaded.
+
+<a id="ErrorDetail.DictionaryId"></a>
+
+### `DictionaryId`
+
+```silk
+DictionaryId
+```
+
+The zlib header names another preset dictionary than the loaded one.
+
+<a id="ErrorDetail.BlockType"></a>
+
+### `BlockType`
+
+```silk
+BlockType
+```
+
+A block has type 3: "invalid block type".
+
+<a id="ErrorDetail.StoredLengths"></a>
+
+### `StoredLengths`
+
+```silk
+StoredLengths
+```
+
+The length of a stored block and its complement do not agree: "invalid stored block
+lengths".
+
+<a id="ErrorDetail.SymbolCounts"></a>
+
+### `SymbolCounts`
+
+```silk
+SymbolCounts
+```
+
+A dynamic block has more than 286 literal/length codes or more than 30 distance codes: "too
+many length or distance symbols".
+
+<a id="ErrorDetail.CodeLengthsSet"></a>
+
+### `CodeLengthsSet`
+
+```silk
+CodeLengthsSet
+```
+
+The code lengths of the code-length code are not a complete code: "invalid code lengths
+set".
+
+<a id="ErrorDetail.LengthRepeat"></a>
+
+### `LengthRepeat`
+
+```silk
+LengthRepeat
+```
+
+A repeat of a code length has no length before it, or goes past the last code: "invalid bit
+length repeat".
+
+<a id="ErrorDetail.MissingEndOfBlock"></a>
+
+### `MissingEndOfBlock`
+
+```silk
+MissingEndOfBlock
+```
+
+The end-of-block symbol has no code: "invalid code -- missing end-of-block".
+
+<a id="ErrorDetail.LiteralLengthsSet"></a>
+
+### `LiteralLengthsSet`
+
+```silk
+LiteralLengthsSet
+```
+
+The literal/length code lengths are not a usable code: "invalid literal/lengths set".
+
+<a id="ErrorDetail.DistancesSet"></a>
+
+### `DistancesSet`
+
+```silk
+DistancesSet
+```
+
+The distance code lengths are not a usable code: "invalid distances set".
+
+<a id="ErrorDetail.LiteralLengthCode"></a>
+
+### `LiteralLengthCode`
+
+```silk
+LiteralLengthCode
+```
+
+The data holds a literal/length code that is not in the code: "invalid literal/length code".
+
+<a id="ErrorDetail.DistanceCode"></a>
+
+### `DistanceCode`
+
+```silk
+DistanceCode
+```
+
+The data holds a distance code that is not in the code: "invalid distance code".
+
+<a id="ErrorDetail.DistanceTooFar"></a>
+
+### `DistanceTooFar`
+
+```silk
+DistanceTooFar
+```
+
+A back-reference points before the bytes that the decoder holds: "invalid distance too far
+back".
+
+<a id="ErrorDetail.DataCheck"></a>
+
+### `DataCheck`
+
+```silk
+DataCheck
+```
+
+The Adler-32 or CRC-32 of the data is not correct: "incorrect data check".
+
+<a id="ErrorDetail.LengthCheck"></a>
+
+### `LengthCheck`
+
+```silk
+LengthCheck
+```
+
+The size in the gzip trailer is not the size of the data: "incorrect length check".
+
 <a id="Decoder"></a>
 
 ## `Decoder`
@@ -626,6 +857,65 @@ without a dictionary id decodes as if none was loaded. It does not allocate.
 #### Errors
 `InvalidUse` with gzip, after the first step, or after a dictionary was loaded for this
 stream. The decoder does not change.
+
+<a id="Decoder.impl.setWindowBits"></a>
+
+### Method `setWindowBits`
+
+```silk
+pub fn setWindowBits(self: &mut Self, bits: u32) -> Result<(), DecodeError>
+```
+
+Sets the window as zlib's `inflateInit2` does, before the first step.
+
+#### Details
+`bits` is from 8 to 15, or 0 to take the window of the zlib header. A match can then reach
+`1 << bits` bytes of the output of earlier steps, and all the output of its own step, as in
+zlib. A zlib header that names a larger window fails with `InvalidHeader`. Without this
+call, the window is the one that the zlib header names, 32 KiB for the other formats, and a
+match that reaches past it is not valid. The setting stays across [`Decoder.reset`](#Decoder.impl.reset).
+
+#### Errors
+`InvalidUse` if `bits` is outside its range, or after the first step.
+
+<a id="Decoder.impl.setMemberStop"></a>
+
+### Method `setMemberStop`
+
+```silk
+pub fn setMemberStop(self: &mut Self, stop: bool) -> ()
+```
+
+Sets whether a gzip decoder finishes at the end of the first member, as the other formats
+finish at the end of their stream, and leaves the bytes after it unconsumed.
+
+Without it, a gzip decoder goes on to the next member and finishes at the final input. The
+setting stays across [`Decoder.reset`](#Decoder.impl.reset).
+
+<a id="Decoder.impl.setBlockStop"></a>
+
+### Method `setBlockStop`
+
+```silk
+pub fn setBlockStop(self: &mut Self, stop: bool) -> ()
+```
+
+Sets whether a step returns when it reaches the start of a block, as zlib's `inflate` does
+with `Z_BLOCK`.
+
+The step then returns `NeedInput` with input left, after the header and after each block. A
+step that starts at the start of a block decodes that block. The setting stays across
+[`Decoder.reset`](#Decoder.impl.reset).
+
+<a id="Decoder.impl.failureDetail"></a>
+
+### Method `failureDetail`
+
+```silk
+pub fn failureDetail(self: &Self) -> ErrorDetail
+```
+
+Returns which rule of the format the data broke, after a step failed.
 
 <a id="Decoder.impl.step"></a>
 
