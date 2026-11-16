@@ -353,6 +353,12 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   assert.equal(builtinPlan.status, 0, builtinPlan.stderr)
   const aliasRequests = yield* fs.readDirectory(join(aliased, 'build/requests'))
   assert.ok(aliasRequests.some((name) => name.startsWith('aliased.') && name.endsWith('.dev.toml')))
+  yield* fs.copyFile(join(graphSources, 'plan_task.silk'), join(aliased, 'src/tasks.silk'))
+  const customPlan = yield* invoke(silk, ['plan', '--stdlib', standardLibrary], aliased, requestEnv, 300_000)
+  assert.equal(customPlan.status, 0, customPlan.stderr)
+  const customSet = JSON.parse(yield* fs.readFileString(join(aliased, 'build/requests/plan.json')))
+  assert.ok(customSet.files.length > 0, 'a child task publishes its pending requests through the parent')
+  assert.equal(yield* fs.exists(join(aliased, 'build/requests/.pending-plan.json')), false)
   const argumentsFor = (output: string) => [
     'build',
     'main.silk',
@@ -3517,7 +3523,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     'pub param limit: i32 = 1\n\npub fn main() -> i32 { return limit }\n')
   yield* fs.writeFileString(join(boundRoot, 'silk.toml'), '[package]\nname = "bound"\nversion = "0.1.0"\n')
   const parameter = (name: string, value: string) =>
-    `[settings.profile]\n[packages.self]\nparameters = [{ module = "main.silk", name = "${name}", supplied-path = false, value = ${value} }]\n`
+    `[settings.profile]\n[packages.self]\nexcluded = false\nparameters = [{ module = "main.silk", name = "${name}", supplied-path = false, value = ${value} }]\n`
   for (const value of [7, 3]) {
     const bound = yield* compileSettings(boundRoot, `bound-${value}`, parameter('limit', `{ type = "Integer", decimal = "${value}" }`))
     assert.equal(bound.status, 0, bound.stderr)
@@ -3666,6 +3672,8 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     join(directory, 'packaged/app/silk.toml'),
     packagedManifest('util = { path = "../numbers" }'),
   )
+  yield* fs.writeFileString(join(directory, 'packaged/app/main.silk'),
+    'import util.scale { scale }\npub fn main() -> i32 { return scale(21) }\n')
   const shadowed = yield* invoke(
     silk,
     ['run', '--stdlib', standardLibrary],
@@ -3682,6 +3690,8 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   yield* fs.makeDirectory(join(directory, 'packaged/broken'), { recursive: true })
   yield* fs.writeFileString(join(directory, 'packaged/broken/silk.toml'), '[package]\nname = "broken"\nversion = 1.0\n[x\n')
   yield* fs.writeFileString(join(directory, 'packaged/app/silk.toml'), packagedManifest('broken = { path = "../broken" }'))
+  yield* fs.writeFileString(join(directory, 'packaged/app/main.silk'),
+    'import broken.value { value }\npub fn main() -> i32 { return value() }\n')
   const notToml = yield* invoke(
     silk,
     ['run', '--stdlib', standardLibrary],

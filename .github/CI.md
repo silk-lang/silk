@@ -80,3 +80,15 @@ candidate come from its verification.
 cross-built from it. Changing the pin is a separate, explicit decision. A release's own
 `native-seed.json` names every target's compiler; a pin bump keeps only its x86-64 Linux entry.
 The installers do not read it: they trust the archive's minisign signature.
+
+## Publishing a prepared preview
+
+Prepare a prerelease with `silk change --dir compiler version --tag <channel>` and update the tool's
+version source to match. Commit it on a same-repository pull request. A maintainer can then add
+`publish-preview` to run all native gates on that exact head and publish its immutable signed
+archives after they pass. The channel must be a prerelease. This does not merge the pull request,
+advance the dev counter, or replace the latest stable release. The label event is the publication
+request; later pushes only verify until the label is removed and added again.
+
+Preview publication shares archive, receipt, fixpoint, source-digest and signature verification
+with stable and dev publication. The playground is built and checked on every candidate run.

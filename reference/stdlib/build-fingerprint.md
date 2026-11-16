@@ -54,7 +54,7 @@ pub effect fn package(hash: &mut Sha256, input: &Path, output: &Path) -> ()
   ? &mut FileSystem | &mut Allocator
 ```
 
-Hashes a package's files, excluding build outputs and root version-control metadata.
+Hashes package files, excluding build outputs and version-control metadata at package roots.
 `output` is the current workspace output directory, excluded at any depth.
 
 

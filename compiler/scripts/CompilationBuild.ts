@@ -18,6 +18,7 @@ export interface Options {
   readonly manifest: string
   readonly output: string
   readonly stdlib: string
+  readonly root?: string
   readonly target?: string
   readonly optimization: string
   readonly debug: boolean
@@ -36,6 +37,7 @@ export const prepare = Effect.fn('CompilationBuild.prepare')(function* (options:
     `stdlib = ${quote(options.stdlib)}`,
     '[settings]',
     'modules = []',
+    ...(options.root === undefined ? [] : [`root = ${quote(options.root)}`]),
     `emit = ${quote(options.emit)}`,
     '[settings.profile]',
     `optimization = ${quote(options.optimization)}`,
@@ -70,7 +72,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     const { values } = yield* Effect.try({
       try: () => parseArgs({ options: {
         compiler: { type: 'string' }, manifest: { type: 'string' }, output: { type: 'string' },
-        stdlib: { type: 'string' }, target: { type: 'string' }, optimization: { type: 'string', default: 'none' },
+        stdlib: { type: 'string' }, root: { type: 'string' }, target: { type: 'string' }, optimization: { type: 'string', default: 'none' },
         debug: { type: 'string', default: 'true' }, emit: { type: 'string', default: 'final' },
       } }),
       catch: (cause) => new CompilationBuildError({ message: 'invalid compilation build arguments', cause }),
@@ -78,7 +80,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     if (!values.compiler || !values.manifest || !values.output || !values.stdlib || !['true', 'false'].includes(values.debug))
       return yield* new CompilationBuildError({ message: '--compiler, --manifest, --output and --stdlib are required; --debug accepts true or false' })
     yield* build({ compiler: resolve(values.compiler), manifest: resolve(values.manifest),
-      output: resolve(values.output), stdlib: resolve(values.stdlib), target: values.target,
+      output: resolve(values.output), stdlib: resolve(values.stdlib), root: values.root && resolve(values.root), target: values.target,
       optimization: values.optimization, debug: values.debug === 'true', emit: values.emit })
   })
   const require = createRequire(new URL('../../package.json', import.meta.url))
