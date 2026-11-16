@@ -4428,6 +4428,22 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   assert.equal(filteredWorkspace.status, 0, filteredWorkspace.stderr + filteredWorkspace.stdout)
   assert.match(filteredWorkspace.stdout, /addsTwoNumbers/)
   assert.doesNotMatch(filteredWorkspace.stderr, /no tests matched/)
+  const unmatchedWorkspace = yield* invoke(
+    silk,
+    ['test', '--workspace', '--filter', 'no-such-workspace-test', '--stdlib', standardLibrary],
+    managed,
+    withClang,
+  )
+  assert.equal(unmatchedWorkspace.status, 1, unmatchedWorkspace.stderr + unmatchedWorkspace.stdout)
+  assert.equal((unmatchedWorkspace.stderr.match(/no tests matched/g) ?? []).length, 1)
+  const narrowedWorkspace = yield* invoke(
+    silk,
+    ['test', '--workspace', '--root', 'src/lib.silk', '--stdlib', standardLibrary],
+    managed,
+    withClang,
+  )
+  assert.equal(narrowedWorkspace.status, 2, narrowedWorkspace.stderr + narrowedWorkspace.stdout)
+  assert.match(narrowedWorkspace.stderr, /pass --package <name>/)
   // From a member directory, `--workspace` selects every member.
   const managedCheck = yield* invoke(
     silk,
