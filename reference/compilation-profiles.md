@@ -331,67 +331,70 @@ only refuse a malformed one, naming its manifest line.
 
 ## PROFILE-009 — Build plans
 
-A package that needs more than its manifest's `[native]` keys can say puts a `build.silk` beside its
-`silk.toml`. The file declares `pub const PLAN: string`, built with `silk.build.plan` from
-`Plan.empty()`:
+A package declares its portable build requirements in a `build.silk` beside `silk.toml`.
+The file exposes a typed `pub const PLAN: Plan`. Its values use the same deferred paths and
+standard `Run` and `WriteFiles` steps as root task graphs:
 
 ```silk,ignore
 import silk.build.plan { Plan }
 import silk.build.source { Source }
+import silk.build.step { sourcePath }
+import silk.build.write_files { WriteFiles }
 import silk.core.static_text { StaticText }
 
-static fn plan() -> string<'static> {
-  let mut plan = Plan.empty()
-  plan = Plan.module(plan, "generated_limit", StaticText.concat("pub const LIMIT: i32 = ", Source.text("limit.txt")))
-  plan = Plan.compileC(plan, "native/shim.c")
-  plan = Plan.linkLibrary(plan, "m")
-  return plan
+static fn plan() -> Plan {
+  let files = WriteFiles.empty()
+    |> WriteFiles.literal("limit.silk", StaticText.concat("pub const LIMIT: i32 = ", Source.text("limit.txt")))
+  return Plan.empty()
+    |> Plan.module("generated_limit", WriteFiles.result(&files, "limit.silk"))
+    |> Plan.compileC(sourcePath("native/shim.c"))
+    |> Plan.linkLibrary("m", "dynamic", false, false)
 }
 
-pub const PLAN: string = plan()
+pub const PLAN: Plan = plan()
 ```
 
-Every build and check of the package, or of a package that depends on it, first evaluates each
-package's `build.silk` on its own: a store whose only package is that file, in the package's
-directory, importing only the standard library. The constant is computed by static evaluation, so a
-plan runs no process, reaches no network and reads only the package's own files through
-`silk.build.source`. Its steps then join the package as if written there:
+The compiler evaluates the constant in an isolated analysis that imports only the standard library.
+Static construction runs no processes and reads package files only through `silk.build.source`.
+The resulting ordinary values describe dependencies; the build runner executes their producers
+before resolving generated modules and native inputs. The compiler decodes typed native records
+directly. There is no serialized plan language or generated manifest.
 
-| Step                                                      | Effect                                                       |
-| --------------------------------------------------------- | ------------------------------------------------------------ |
-| `Plan.module(plan, name, source)`                         | Module `name` of the package, at its source root             |
-| `Plan.compileC`, `compileObjectiveC`, `compileCpp`        | A `[native].sources` entry `{ c = path }` (or `objc`, `cpp`) |
-| `Plan.linkLibrary`, `linkFramework`, `linkArchive`, `linkObject` | A `[native].link` entry                               |
+`Plan.module` accepts a canonical module path and a deferred file. Native source, include, archive,
+object, search-directory, linker-script, and function-order methods also accept deferred paths.
+A plan contributes its requirements whenever the package is compiled. Invalid plans, missing
+outputs, duplicate modules, and modules that shadow existing package files refuse the build.
 
-A dependency's plan entries reach its dependents as its manifest entries do. A plan that cannot be
-evaluated, a `PLAN` that is missing or not text `silk.build.plan` writes, and a generated module
-that a file of the package also defines each refuse the build, naming `build.silk`, after the
-diagnostics of its evaluation.
+Parameters declared by `build.silk` are bound only in its isolated analysis. `Package.path` grants
+read access to an explicitly supplied host path through a text parameter in that file. Such a
+parameter cannot become a source-code parameter or a source profile identity.
 
 ## PROFILE-010 — Build tools
 
-A plan can run a program of the package as a tool step, for a job that needs a real program, such
-as a code generator:
+A plan describes a process with the standard `Run` step. Passing a deferred input records its
+producer dependency; output arguments name files below the step's private output directory:
 
 ```silk,ignore
-static fn plan() -> string<'static> {
-  let mut plan = Plan.empty()
-  plan = Plan.tool(plan, "gen", "tools/gen.sh")
-  plan = Plan.toolArgument(plan, "tables.txt")
-  plan = Plan.toolInput(plan, "tables.txt")
-  plan = Plan.toolOutput(plan, "tables.silk")
-  plan = Plan.toolModule(plan, "generated_tables", "gen", "tables.silk")
-  return plan
+import silk.build.plan { Plan }
+import silk.build.run { Run }
+import silk.build.step { sourcePath }
+
+static fn plan() -> Plan {
+  let generator = Run.command("tools/gen.sh")
+    |> Run.input(sourcePath("tables.txt"))
+    |> Run.output("tables.silk")
+  return Plan.empty()
+    |> Plan.module("generated_tables", Run.result(&generator, "tables.silk"))
 }
+
+pub const PLAN: Plan = plan()
 ```
 
-The step runs before the package is analyzed, with its output directory
-`<root>/build/tools/<package>/<step>` as its working directory, `HOME` and `TMPDIR` inside it,
-`SILK_TOOL=1`, `SILK_PACKAGE_DIR` naming the package directory and `PATH` naming the system's
-program directories. It starts from an empty output directory, must exit 0 and must write every
-declared output; otherwise the build is refused, naming `build.silk`, with what the step printed.
-Its key digests its program, arguments, inputs and outputs, so a build that changes none of them
-does not run it again. `Plan.toolModule` serves one of its outputs as a module of the package.
+The process runs in its private content-addressed graph directory. Arguments contain the resolved
+absolute paths of its declared inputs and outputs. It must exit successfully and write every
+output. Its executable, arguments, declared file and tree contents, sandbox launcher, and producer
+keys determine its cache identity. Package plans cannot capture ambient environment variables.
+`WriteFiles` runs through the same graph without starting a process and requires no tool permission.
 
 The root package's steps always run. A dependency's steps run only when the root manifest lists
 the dependency by name:

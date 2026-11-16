@@ -6,7 +6,7 @@ Build steps, their declared inputs, and values resolved only by the graph runner
 
 Import as `Step` with `import silk.build.step { Step }`.
 
-Public declarations: 8.
+Public declarations: 11.
 
 <a id="StepError"></a>
 
@@ -64,7 +64,65 @@ pub struct Deferred<T>
 
 A typed reference to a source, a known value, or a step result. Only `Make` resolves it.
 
+<a id="describedPath"></a>
+
+## `describedPath`
+
+```silk
+pub static fn describedPath(input: Description) -> Deferred<Path>
+```
+
+Describes an input during static plan construction without allocating a graph node.
+
+<a id="sourcePath"></a>
+
+## `sourcePath`
+
+```silk
+pub static fn sourcePath(path: string<'static>) -> Deferred<Path>
+```
+
+Names a package-relative file during static plan construction.
+
+<a id="suppliedPath"></a>
+
+## `suppliedPath`
+
+```silk
+pub static fn suppliedPath(path: string<'static>) -> Deferred<Path>
+```
+
+Names a host path explicitly supplied to a package plan by its root command.
+
 <a id="Deferred.impl"></a>
+
+## Implementation `Deferred<T>`
+
+```silk
+impl<T> Deferred<T>
+```
+
+<a id="Deferred.impl.fromDescription"></a>
+
+### Associated function `fromDescription`
+
+```silk
+pub fn fromDescription(input: Description) -> Deferred<Path>
+```
+
+Retains a standard-action description already read by runtime graph construction.
+
+<a id="Deferred.impl.description"></a>
+
+### Method `description`
+
+```silk
+pub static fn description(self: &Self) -> Description
+```
+
+Reads the static description; runtime deferred values cannot enter a package plan.
+
+<a id="Deferred.impl-2"></a>
 
 ## Implementation `Deferred<T>`
 
@@ -82,7 +140,7 @@ pub effect fn copy(self: &Self) -> Self ! OutOfMemoryError ? &mut Allocator
 
 Retains a deferred reference without evaluating it or starting its producer.
 
-<a id="Deferred.impl-2"></a>
+<a id="Deferred.impl-3"></a>
 
 ## Implementation `Deferred<T>`
 
@@ -110,7 +168,7 @@ pub effect fn external(path: string) -> Deferred<Path> ! OutOfMemoryError ? &mut
 
 Names an explicitly supplied absolute host path.
 
-<a id="Deferred.impl-3"></a>
+<a id="Deferred.impl-4"></a>
 
 ## Implementation `Deferred<T>`
 
@@ -281,6 +339,16 @@ pub interface Step
 
 Work a root task explicitly adds to its build graph. Package plans cannot introduce custom implementations.
 
+<a id="Step.prepare"></a>
+
+### Operation `prepare`
+
+```silk
+effect fn prepare(self: Self) -> Self ! StepFailure ? &mut Allocator
+```
+
+Materializes a static description before its inputs are recorded. This phase allocates only.
+
 <a id="Step.key"></a>
 
 ### Operation `key`
@@ -392,7 +460,7 @@ impl Step
 ### Associated function `register`
 
 ```silk
-pub effect fn register<T: Step + Transferable + 'static>(step: T) -> StepHandle ! StepFailure ? &mut Allocator
+pub effect fn register<T: Step + Transferable + 'static>(input: T) -> StepHandle ! StepFailure ? &mut Allocator
 ```
 
 Takes ownership of custom work and records its key without running it. Outputs retain this handle.

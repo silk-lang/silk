@@ -13,10 +13,26 @@ Public declarations: 1.
 ## `Run`
 
 ```silk
-pub struct Run
+pub union Run
 ```
 
-A cached process invocation. Only declared environment variables reach the process.
+A process step, described statically or constructed from runtime deferred values.
+
+<a id="Run.Static"></a>
+
+### `Static`
+
+```silk
+Static
+```
+
+<a id="Run.Dynamic"></a>
+
+### `Dynamic`
+
+```silk
+Dynamic
+```
 
 <a id="Run.impl"></a>
 
@@ -25,6 +41,106 @@ A cached process invocation. Only declared environment variables reach the proce
 ```silk
 impl Run
 ```
+
+<a id="Run.impl.fromDescription"></a>
+
+### Associated function `fromDescription`
+
+```silk
+pub fn fromDescription(description: Invocation) -> Self
+```
+
+Wraps a standard invocation description for registration in a runtime graph.
+
+<a id="Run.impl.command"></a>
+
+### Associated function `command`
+
+```silk
+pub static fn command(path: string<'static>) -> Self
+```
+
+Describes a package-relative executable without reading the filesystem or running it.
+
+<a id="Run.impl.executable"></a>
+
+### Associated function `executable`
+
+```silk
+pub static fn executable(path: Deferred<Path>) -> Self
+```
+
+Describes an executable supplied by another standard step or a path parameter.
+
+<a id="Run.impl.arg"></a>
+
+### Method `arg`
+
+```silk
+pub static fn arg(self: Self, value: string<'static>) -> Self
+```
+
+Appends a literal argument to a static invocation.
+
+<a id="Run.impl.input"></a>
+
+### Method `input`
+
+```silk
+pub static fn input(self: Self, value: Deferred<Path>) -> Self
+```
+
+Appends a deferred input path to a static invocation's arguments.
+
+<a id="Run.impl.output"></a>
+
+### Method `output`
+
+```silk
+pub static fn output(self: Self, name: string<'static>) -> Self
+```
+
+Appends a required output path to a static invocation's arguments.
+
+<a id="Run.impl.reads"></a>
+
+### Method `reads`
+
+```silk
+pub static fn reads(self: Self, value: Deferred<Path>) -> Self
+```
+
+Declares a static invocation's file dependency without adding an argument.
+
+<a id="Run.impl.readsTree"></a>
+
+### Method `readsTree`
+
+```silk
+pub static fn readsTree(self: Self, value: Deferred<Path>) -> Self
+```
+
+Declares a static invocation's directory dependency without adding an argument.
+
+<a id="Run.impl.description"></a>
+
+### Method `description`
+
+```silk
+pub static fn description(self: &Self) -> Invocation
+```
+
+Returns this invocation's immutable description; runtime inputs cannot enter a static plan.
+
+<a id="Run.impl.result"></a>
+
+### Method `result`
+
+```silk
+pub static fn result(self: &Self, name: string<'static>) -> Deferred<Path>
+```
+
+Names a declared output without registering or executing the producing process.
 
 <a id="Run.impl.when"></a>
 
@@ -35,7 +151,7 @@ pub effect fn when<'env, E, ?R>(self: Self, condition: bool,
     transform: once effect fn<'env>(Self) -> Self ! E ? R) -> Self ! E ? R
 ```
 
-Applies `transform` when `condition` is true, returning the original value otherwise.
+Applies a graph transformation only when the condition is true.
 
 <a id="Run.impl.program"></a>
 
@@ -45,7 +161,7 @@ Applies `transform` when `condition` is true, returning the original value other
 pub effect fn program(name: string) -> Self ! StepFailure ? &mut Allocator | &mut FileSystem | &mut HostInput
 ```
 
-Resolves a program now without running it; the resolved executable's contents enter its key.
+Resolves an installed program now, including the executable's contents in the step key.
 
 <a id="Run.impl.artifact"></a>
 
@@ -55,88 +171,7 @@ Resolves a program now without running it; the resolved executable's contents en
 pub fn artifact(program: Deferred<Path>) -> Self
 ```
 
-Runs a deferred executable, adding its producer as a dependency when this step is registered.
-
-<a id="Run.impl.confined"></a>
-
-### Method `confined`
-
-```silk
-pub effect fn confined(self: Self) -> Self ! StepFailure ? &mut Allocator | &mut FileSystem | &mut HostInput
-```
-
-Runs this process with operating-system confinement: declared reads, its output directory,
-and no TCP access. Missing sandbox support fails instead of running unrestricted.
-
-<a id="Run.impl.argument"></a>
-
-### Method `argument`
-
-```silk
-pub effect fn argument(self: Self, value: Deferred<String>) -> Self ! StepFailure ? &mut Allocator
-```
-
-Appends a deferred text argument, including its producer and value in the key.
-
-<a id="Run.impl.inputFile"></a>
-
-### Method `inputFile`
-
-```silk
-pub effect fn inputFile(self: Self, path: Deferred<Path>) -> Self ! StepFailure ? &mut Allocator
-```
-
-Appends a declared file's resolved path as an argument.
-
-<a id="Run.impl.outputFile"></a>
-
-### Method `outputFile`
-
-```silk
-pub effect fn outputFile(self: Self, name: string) -> Self ! StepFailure ? &mut Allocator
-```
-
-Appends a path below the output directory and requires the process to produce it.
-
-<a id="Run.impl.keyFile"></a>
-
-### Method `keyFile`
-
-```silk
-pub effect fn keyFile(self: Self, path: Deferred<Path>) -> Self ! StepFailure ? &mut Allocator
-```
-
-Declares a file dependency without adding a command-line argument.
-
-<a id="Run.impl.keyTree"></a>
-
-### Method `keyTree`
-
-```silk
-pub effect fn keyTree(self: Self, path: Deferred<Path>) -> Self ! StepFailure ? &mut Allocator
-```
-
-Declares a directory dependency without adding a command-line argument.
-
-<a id="Run.impl.keyEnvironment"></a>
-
-### Method `keyEnvironment`
-
-```silk
-pub effect fn keyEnvironment(self: Self, name: string) -> Self ! StepFailure ? &mut Allocator
-```
-
-Keys a variable's presence and value and passes it to the child process.
-
-<a id="Run.impl.always"></a>
-
-### Method `always`
-
-```silk
-pub fn always(self: Self) -> Self
-```
-
-Runs the process and its consumers every invocation, for work with external side effects.
+Runs a deferred executable, depending on its producer.
 
 <a id="Run.impl.register"></a>
 
@@ -146,7 +181,97 @@ Runs the process and its consumers every invocation, for work with external side
 pub effect fn register(self: Self) -> StepHandle ! StepFailure ? &mut Allocator
 ```
 
-Registers this invocation; output paths can then be taken from the returned handle.
+Registers the invocation and returns a handle to its declared outputs.
+
+<a id="Run.impl.confined"></a>
+
+### Method `confined`
+
+```silk
+pub effect fn confined(self: Self) -> Self ! StepFailure ? &mut Allocator | &mut FileSystem | &mut HostInput
+```
+
+Confines the process to declared inputs, its output directory, and no network.
+
+<a id="Run.impl.confinedBy"></a>
+
+### Method `confinedBy`
+
+```silk
+pub effect fn confinedBy(self: Self, launcher: Deferred<Path>) -> Self ! StepFailure ? &mut Allocator
+```
+
+Uses an explicitly selected sandbox launcher and includes its contents in the step key.
+
+<a id="Run.impl.argument"></a>
+
+### Method `argument`
+
+```silk
+pub effect fn argument(self: Self, value: Deferred<String>) -> Self ! StepFailure ? &mut Allocator
+```
+
+Appends a deferred text argument.
+
+<a id="Run.impl.inputFile"></a>
+
+### Method `inputFile`
+
+```silk
+pub effect fn inputFile(self: Self, path: Deferred<Path>) -> Self ! StepFailure ? &mut Allocator
+```
+
+Appends and keys a deferred file argument.
+
+<a id="Run.impl.outputFile"></a>
+
+### Method `outputFile`
+
+```silk
+pub effect fn outputFile(self: Self, name: string) -> Self ! StepFailure ? &mut Allocator
+```
+
+Appends and requires a file below the output directory.
+
+<a id="Run.impl.keyFile"></a>
+
+### Method `keyFile`
+
+```silk
+pub effect fn keyFile(self: Self, path: Deferred<Path>) -> Self ! StepFailure ? &mut Allocator
+```
+
+Keys an additional file without adding an argument.
+
+<a id="Run.impl.keyTree"></a>
+
+### Method `keyTree`
+
+```silk
+pub effect fn keyTree(self: Self, path: Deferred<Path>) -> Self ! StepFailure ? &mut Allocator
+```
+
+Keys an additional directory without adding an argument.
+
+<a id="Run.impl.keyEnvironment"></a>
+
+### Method `keyEnvironment`
+
+```silk
+pub effect fn keyEnvironment(self: Self, name: string) -> Self ! StepFailure ? &mut Allocator
+```
+
+Keys and forwards one named environment variable.
+
+<a id="Run.impl.always"></a>
+
+### Method `always`
+
+```silk
+pub effect fn always(self: Self) -> Self ! StepFailure ? &mut Allocator
+```
+
+Makes the process and its consumers run on every invocation.
 
 <a id="Run.impl.captureText"></a>
 
@@ -156,7 +281,7 @@ Registers this invocation; output paths can then be taken from the returned hand
 pub effect fn captureText(self: Self) -> Deferred<String> ! StepFailure ? &mut Allocator
 ```
 
-Registers the process and returns its complete UTF-8 standard output as a deferred value.
+Captures UTF-8 standard output as a deferred value.
 
 <a id="Run.impl.captureLines"></a>
 
@@ -166,7 +291,7 @@ Registers the process and returns its complete UTF-8 standard output as a deferr
 pub effect fn captureLines(self: Self) -> Deferred<List<String>> ! StepFailure ? &mut Allocator
 ```
 
-Registers the process and returns UTF-8 lines, removing line endings and a final empty line.
+Captures UTF-8 standard output split into lines.
 
 <a id="Run.impl.Step"></a>
 
@@ -174,6 +299,14 @@ Registers the process and returns UTF-8 lines, removing line endings and a final
 
 ```silk
 impl Step for Run
+```
+
+<a id="Run.impl.Step.prepare"></a>
+
+### Operation `prepare`
+
+```silk
+effect fn prepare(self: Self) -> Self ! StepFailure ? &mut Allocator
 ```
 
 <a id="Run.impl.Step.key"></a>

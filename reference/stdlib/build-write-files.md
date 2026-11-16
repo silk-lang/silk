@@ -13,10 +13,26 @@ Public declarations: 1.
 ## `WriteFiles`
 
 ```silk
-pub struct WriteFiles
+pub union WriteFiles
 ```
 
-A step that writes declared text files without starting a process.
+A generated-file step shared by static package plans and runtime task graphs.
+
+<a id="WriteFiles.Static"></a>
+
+### `Static`
+
+```silk
+Static
+```
+
+<a id="WriteFiles.Dynamic"></a>
+
+### `Dynamic`
+
+```silk
+Dynamic
+```
 
 <a id="WriteFiles.impl"></a>
 
@@ -26,6 +42,46 @@ A step that writes declared text files without starting a process.
 impl WriteFiles
 ```
 
+<a id="WriteFiles.impl.empty"></a>
+
+### Associated function `empty`
+
+```silk
+pub static fn empty() -> Self
+```
+
+Begins a pure description of generated text files.
+
+<a id="WriteFiles.impl.literal"></a>
+
+### Method `literal`
+
+```silk
+pub static fn literal(self: Self, name: string<'static>, content: string<'static>) -> Self
+```
+
+Adds a known text file to a static description.
+
+<a id="WriteFiles.impl.description"></a>
+
+### Method `description`
+
+```silk
+pub static fn description(self: &Self) -> Option<&'static Chain<StaticFile>>
+```
+
+Reads a pure file description; runtime values cannot enter a package plan.
+
+<a id="WriteFiles.impl.result"></a>
+
+### Method `result`
+
+```silk
+pub static fn result(self: &Self, name: string<'static>) -> Deferred<Path>
+```
+
+Names a file without registering or executing its producer.
+
 <a id="WriteFiles.impl.make"></a>
 
 ### Associated function `make`
@@ -34,7 +90,7 @@ impl WriteFiles
 pub fn make() -> Self
 ```
 
-Creates an empty set of generated files.
+Starts a generated-file step that accepts runtime values.
 
 <a id="WriteFiles.impl.text"></a>
 
@@ -44,7 +100,7 @@ Creates an empty set of generated files.
 pub effect fn text(self: Self, name: string, content: string) -> Self ! StepFailure ? &mut Allocator
 ```
 
-Adds UTF-8 text to write below this step's output directory.
+Adds known UTF-8 text to the generated files.
 
 <a id="WriteFiles.impl.value"></a>
 
@@ -54,7 +110,7 @@ Adds UTF-8 text to write below this step's output directory.
 pub effect fn value(self: Self, name: string, content: Deferred<String>) -> Self ! StepFailure ? &mut Allocator
 ```
 
-Adds text produced by another step; its producer becomes an implicit dependency.
+Adds a deferred text value, retaining its producer dependency.
 
 <a id="WriteFiles.impl.register"></a>
 
@@ -64,7 +120,7 @@ Adds text produced by another step; its producer becomes an implicit dependency.
 pub effect fn register(self: Self) -> StepHandle ! StepFailure ? &mut Allocator
 ```
 
-Registers the files once; use the returned handle to name their deferred output paths.
+Registers the files and returns a handle to their deferred output paths.
 
 <a id="WriteFiles.impl.Step"></a>
 
@@ -72,6 +128,14 @@ Registers the files once; use the returned handle to name their deferred output 
 
 ```silk
 impl Step for WriteFiles
+```
+
+<a id="WriteFiles.impl.Step.prepare"></a>
+
+### Operation `prepare`
+
+```silk
+effect fn prepare(self: Self) -> Self ! StepFailure ? &mut Allocator
 ```
 
 <a id="WriteFiles.impl.Step.key"></a>
