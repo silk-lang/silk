@@ -200,6 +200,10 @@ a `&'static T` and a `&'static [T]`. Admission excludes values carrying a runtim
 exclusive borrow, opaque identity, callable execution, Effect, service, unsafe pointer, or
 observable cleanup behavior.
 
+A shared static view supports `view.*` to read its referent. A `match &` binding is a place of
+its field's type, as at runtime: reading it retains the field value, while `&binding` creates a
+shared view. A field that already holds a reference keeps that reference's type and referent.
+
 Reusing a static value does not grant its declared runtime type the `Copy` property and does not
 change runtime interface selection. When an admitted value is runtime-representable and
 cleanup-free, residualization may embed it directly without retaining compiler storage.
