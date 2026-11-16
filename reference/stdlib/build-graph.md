@@ -6,7 +6,7 @@ Build graphs that publish complete compilation requests and return their artifac
 
 Import as `Build` with `import silk.build.graph { Build }`.
 
-Public declarations: 13.
+Public declarations: 14.
 
 <a id="Options"></a>
 
@@ -176,7 +176,27 @@ Completed root artifacts in the order they were added to a build.
 pub artifacts: List<Artifact>
 ```
 
-The resolved artifacts. Request-only builds retain paths for artifacts not yet compiled.
+The completed artifacts, with their published request files.
+
+<a id="Planned"></a>
+
+## `Planned`
+
+```silk
+pub struct Planned
+```
+
+Published requests and intended output paths, without compiling the requested artifacts.
+
+<a id="Planned.artifacts"></a>
+
+### Field `artifacts`
+
+```silk
+pub artifacts: List<Artifact>
+```
+
+The planned output paths. These artifacts are not available to launch or copy.
 
 <a id="Build.impl"></a>
 
@@ -272,7 +292,7 @@ Runs the requested graph, publishes complete requests, and returns the resulting
 ### Method `write`
 
 ```silk
-pub effect fn write(self: Self) -> Built ! BuildError ? &mut Allocator | &mut FileSystem | &mut HostInput
+pub effect fn write(self: Self) -> Planned ! BuildError ? &mut Allocator | &mut FileSystem | &mut HostInput
 ```
 
 Resolves dependencies and publishes requests, stopping before requested compilations run.
@@ -285,6 +305,31 @@ Prerequisite tool compilations still build. Failures leave previously published 
 ```silk
 impl Built
 ```
+
+<a id="Built.impl.launch"></a>
+
+### Method `launch`
+
+```silk
+pub effect fn launch(self: &Self, arguments: &[string]) -> () ! BuildError | TaskError
+    ? &mut Allocator | &mut FileSystem | &mut HostInput
+```
+
+Launches the single completed artifact with inherited terminal streams and environment.
+A request's explicit runner takes precedence; WASI defaults to `wasmtime run`.
+Use `launchAt` to choose an artifact from a build with several roots.
+
+<a id="Built.impl.launchAt"></a>
+
+### Method `launchAt`
+
+```silk
+pub effect fn launchAt(self: &Self, index: usize, arguments: &[string]) -> () ! BuildError | TaskError
+    ? &mut Allocator | &mut FileSystem | &mut HostInput
+```
+
+Launches artifact `index`, passing runner arguments, the artifact path, then `arguments`.
+A nonzero process status is preserved in `TaskError.status`.
 
 <a id="Built.impl.write"></a>
 

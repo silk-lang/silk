@@ -2,9 +2,12 @@
 
 import silk.build.compilation as Compilations
 import silk.build.encoding as Encoding
+import silk.build.manifest { Manifest, Workspace }
+import silk.text.glob as Glob
 import silk.build.options as Standard
 import silk.build.publish as Publish
-import silk.build.request { Request }
+import silk.build.request { Request, Runner as ArtifactRunner }
+import silk.cli.task { Task, TaskError }
 import silk.build.step as Steps { StepHandle, Runner, StepError, StepFailure }
 import silk.build.run as Runs
 import silk.build.write_files as Files
@@ -67,7 +70,13 @@ pub struct Artifact {
 
 /// Completed root artifacts in the order they were added to a build.
 pub struct Built {
-  /// The resolved artifacts. Request-only builds retain paths for artifacts not yet compiled.
+  /// The completed artifacts, with their published request files.
+  pub artifacts: List<Artifact>,
+}
+
+/// Published requests and intended output paths, without compiling the requested artifacts.
+pub struct Planned {
+  /// The planned output paths. These artifacts are not available to launch or copy.
   pub artifacts: List<Artifact>,
 }
 
@@ -137,8 +146,9 @@ impl Build {
 
   /// Resolves dependencies and publishes requests, stopping before requested compilations run.
   /// Prerequisite tool compilations still build. Failures leave previously published requests intact.
-  pub effect fn write(self: Self) -> Built ! BuildError ? &mut Allocator | &mut FileSystem | &mut HostInput {
-    return run execute(move self, false)
+  pub effect fn write(self: Self) -> Planned ! BuildError ? &mut Allocator | &mut FileSystem | &mut HostInput {
+    let planned = run execute(move self, false)
+    return Planned {artifacts: move planned.artifacts}
   }
 }
 
@@ -158,8 +168,44 @@ effect fn resolveHost(root: &Path, text: string) -> Path ! StepFailure ? &mut Al
   }
 }
 
+effect fn outputDirectory(root: &Path) -> Path ! StepFailure ? &mut Allocator | &mut FileSystem {
+  let mut directory = run Path.fromBytes(Path.rawBytes(root))
+  let mut relative = String.make()
+  while true {
+    let manifest = run Path.join(&directory, "silk.toml")
+    if run FileSystem.exists(&manifest) {
+      let bytes = run FileSystem.readFile(&manifest)
+      let document = run SchemaToml.decode<Manifest>(bytes.asSlice())
+      if let Option<Workspace>.Some {value: workspace} = &document.workspace {
+        let mut member = relative.view() == "" && document.package.isSome()
+        let members = workspace.members.asSlice()
+        let mut index = usize.ZERO
+        while !member && index < members.length {
+          member = (run Glob.matches(members[index].view(), relative.view())).matches
+          index = index + usize.ONE
+        }
+        if member { return run Path.join(&directory, workspace.outputDir.view()) }
+      }
+    }
+    let parent = match move run Path.parent(&directory) {
+      Option<Path>.Some {value} => move value
+      Option<Path>.None => { break }
+    }
+    let name = match move Path.name(&directory) {
+      Option<string>.Some {value} => value
+      Option<string>.None => { break }
+    }
+    let mut next = run String.copy(name)
+    if relative.view() != "" { run next.append("/")
+      run next.append(relative.view()) }
+    relative = move next
+    directory = move parent
+  }
+  return run Path.join(root, "build")
+}
+
 effect fn execute(build: Build, compile: bool) -> Built ! BuildError ? &mut Allocator | &mut FileSystem | &mut HostInput {
-  let output = run Path.join(&build.root, "build")
+  let output = run outputDirectory(&build.root)
   let cache = run Path.join(&output, "steps")
   let configured = run Runner.make(run Path.fromBytes(Path.rawBytes(&build.root)), move cache, build.identity.asSlice())
   let runner = move configured |> Runner.memory(build.memory) |> Runner.parallelism(build.workers)
@@ -233,6 +279,56 @@ effect fn execute(build: Build, compile: bool) -> Built ! BuildError ? &mut Allo
 }
 
 impl Built {
+  /// Launches the single completed artifact with inherited terminal streams and environment.
+  /// A request's explicit runner takes precedence; WASI defaults to `wasmtime run`.
+  /// Use `launchAt` to choose an artifact from a build with several roots.
+  pub effect fn launch(self: &Self, arguments: &[string]) -> () ! BuildError | TaskError
+    ? &mut Allocator | &mut FileSystem | &mut HostInput {
+    if self.artifacts.length() != usize.ONE {
+      fail StepError {message: run String.copy("launch requires exactly one artifact; use launchAt to select one")}
+    }
+    return run self.launchAt(usize.ZERO, arguments)
+  }
+
+  /// Launches artifact `index`, passing runner arguments, the artifact path, then `arguments`.
+  /// A nonzero process status is preserved in `TaskError.status`.
+  pub effect fn launchAt(self: &Self, index: usize, arguments: &[string]) -> () ! BuildError | TaskError
+    ? &mut Allocator | &mut FileSystem | &mut HostInput {
+    if index >= self.artifacts.length() {
+      fail StepError {message: run String.copy("the selected build artifact does not exist")}
+    }
+    let artifact = &self.artifacts.asSlice()[index]
+    let mut program = run Bytes.copy(Path.rawBytes(&artifact.path))
+    let mut words = List<Bytes>.make()
+    if let Option<Path>.Some {value: path} = &artifact.request {
+      let encoded = run FileSystem.readFile(&path)
+      let request = run SchemaToml.decode<Request>(encoded.asSlice())
+      if request.emit.view() != "final" || (request.artifact.view() != "executable" && request.artifact.view() != "test") {
+        fail StepError {message: run String.copy("only a completed executable or test artifact can be launched")}
+      }
+      if let Option<ArtifactRunner>.Some {value: runner} = &request.runner {
+        program = run Bytes.copy(String.ownedUtf8Bytes(&runner.program))
+        let before = runner.arguments.asSlice()
+        let mut at = usize.ZERO
+        while at < before.length {
+          run words.append(run Bytes.copy(String.ownedUtf8Bytes(&before[at])))
+          at = at + usize.ONE
+        }
+        run words.append(run Bytes.copy(Path.rawBytes(&artifact.path)))
+      } else if request.profile.target.view() == "wasm32-wasip1" || request.profile.target.view() == "wasm32-wasip2" {
+        program = run Bytes.copy(b"wasmtime")
+        run words.append(run Bytes.copy(b"run"))
+        run words.append(run Bytes.copy(Path.rawBytes(&artifact.path)))
+      }
+    }
+    let mut at = usize.ZERO
+    while at < arguments.length {
+      run words.append(run Bytes.copy(String.utf8Bytes(arguments[at])))
+      at = at + usize.ONE
+    }
+    return run Task.execBytes(program.asSlice(), words.asSlice())
+  }
+
   /// Copies completed artifacts to `directory`, preserving executable permissions.
   /// The returned paths name the copies; their request files remain at their build locations.
   pub effect fn write(self: Self, directory: string) -> Self ! BuildError ? &mut Allocator | &mut FileSystem | &mut HostInput {

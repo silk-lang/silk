@@ -247,6 +247,17 @@ pub effect fn debug(self: Self, value: Deferred<bool>) -> Self ! StepFailure ? &
 
 Sets `debug` from a declared deferred value.
 
+<a id="Compilation.impl.runner"></a>
+
+### Method `runner`
+
+```silk
+pub effect fn runner(self: Self, value: Deferred<Runner>) -> Self ! StepFailure ? &mut Allocator
+```
+
+Selects the program and arguments used to launch this artifact or its tests.
+WASI artifacts use `wasmtime run` when no runner is supplied.
+
 <a id="Compilation.impl.emit"></a>
 
 ### Method `emit`

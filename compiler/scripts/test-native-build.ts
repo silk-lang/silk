@@ -127,12 +127,42 @@ const program = Effect.gen(function* () {
   assert.equal(optionsBuilt.status, 0, optionsBuilt.stderr)
   const optionsRan = yield* invoke(optionsProgram, [], graphRoot)
   assert.equal(optionsRan.status, 0, optionsRan.stderr)
+  const graphTask = join(directory, 'graph-task-test')
+  const graphTaskBuilt = yield* invoke(silk, ['build', join(repository, 'compiler/fixtures/build-graph/task.silk'),
+    '-o', graphTask, '--stdlib', standardLibrary, '--clang', clang], directory, process.env, 120_000)
+  assert.equal(graphTaskBuilt.status, 0, graphTaskBuilt.stderr)
+  const graphTaskRan = yield* invoke(graphTask, ['fail'], graphRoot)
+  assert.equal(graphTaskRan.status, 1, graphTaskRan.stderr)
+  assert.equal(graphTaskRan.stderr, 'error: declared build input is missing\n')
   const graphCompiler = join(directory, 'graph-compilation-test')
   const graphCompilerBuilt = yield* invoke(silk, ['build', join(repository, 'compiler/fixtures/build-graph/compile.silk'),
     '-o', graphCompiler, '--stdlib', standardLibrary, '--clang', clang], directory, process.env, 120_000)
   assert.equal(graphCompilerBuilt.status, 0, graphCompilerBuilt.stderr)
+  yield* fs.writeFileString(join(directory, 'silk.toml'),
+    '[package]\nname = "native-build"\nversion = "0.1.0"\nsource = "."\n[workspace]\nmembers = ["request-fixture"]\noutput-dir = "request-fixture/custom-output"\n')
   const graphCompiled = yield* invoke(graphCompiler, [], requestRoot, { ...requestEnv, SILK_TEST_COMPILER: silk }, 120_000)
   assert.equal(graphCompiled.status, 0, graphCompiled.stderr)
+  assert.ok(yield* fs.exists(join(requestRoot, 'custom-output/x86_64-unknown-linux-gnu/dev/request-fixture')))
+  yield* fs.writeFileString(join(directory, 'silk.toml'),
+    '[package]\nname = "native-build"\nversion = "0.1.0"\nsource = "."\n')
+  const runnerDirectory = join(directory, 'artifact-runners')
+  yield* fs.makeDirectory(runnerDirectory)
+  const explicitRunner = join(runnerDirectory, 'explicit')
+  const wasiRunner = join(runnerDirectory, 'wasmtime')
+  const launchArguments = `test "$2" = ${quote(requestOutput)} && test "$3" = 'argument with spaces' && test "$#" = 3`
+  yield* fs.writeFileString(explicitRunner, `#!/bin/sh\ntest "$1" = 'runner option' && ${launchArguments}\n`)
+  yield* fs.writeFileString(wasiRunner, `#!/bin/sh\ntest "$1" = run && ${launchArguments}\n`)
+  yield* fs.chmod(explicitRunner, 0o755)
+  yield* fs.chmod(wasiRunner, 0o755)
+  const launchRequest = join(requestRoot, 'launch.toml')
+  yield* fs.writeFileString(launchRequest, `${requestText}\n[runner]\nprogram = ${JSON.stringify(explicitRunner)}\narguments = ["runner option"]\n`)
+  const explicitLaunch = yield* invoke(graphCompiler, [], requestRoot,
+    { ...requestEnv, SILK_TEST_LAUNCH_REQUEST: launchRequest }, 30_000)
+  assert.equal(explicitLaunch.status, 0, explicitLaunch.stderr)
+  yield* fs.writeFileString(launchRequest, requestText.replace('target = "x86_64-unknown-linux-gnu"', 'target = "wasm32-wasip1"'))
+  const wasiLaunch = yield* invoke(graphCompiler, [], requestRoot,
+    { ...requestEnv, SILK_TEST_LAUNCH_REQUEST: launchRequest, PATH: `${runnerDirectory}:${process.env.PATH}` }, 30_000)
+  assert.equal(wasiLaunch.status, 0, wasiLaunch.stderr)
   const argumentsFor = (output: string) => [
     'build',
     'main.silk',
@@ -4580,7 +4610,7 @@ const program = Effect.gen(function* () {
     { ...process.env, SILK_CLANG: clang },
   )
   assert.equal(looped.status, 1, looped.stderr)
-  assert.match(looped.stderr, /^silk: cannot create temporary directory: /m)
+  assert.match(looped.stderr, /^silk: cannot inspect: invalid path\n$/)
   // Cleaning removes a link in the build directory itself, never what it points to.
   yield* fs.symlink('../../real', join(throughLinks, 'app/build/escape'))
   const cleanedLinks = yield* invoke(silk, ['clean'], join(throughLinks, 'app'))

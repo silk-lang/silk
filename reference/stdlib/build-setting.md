@@ -290,6 +290,22 @@ Debug
 pub value: Deferred<bool>
 ```
 
+<a id="Setting.Runner"></a>
+
+### `Runner`
+
+```silk
+Runner
+```
+
+<a id="Setting.Runner.value"></a>
+
+#### Field `value`
+
+```silk
+pub value: Deferred<Runner>
+```
+
 <a id="Setting.Emit"></a>
 
 ### `Emit`

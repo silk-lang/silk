@@ -220,6 +220,37 @@ pub effect fn value<T>(self: &mut Self, value: &Deferred<T>) -> () ! OutOfMemory
 
 Declares a typed value; a produced value contributes its producer key before it exists.
 
+<a id="Key.impl.files"></a>
+
+### Method `files`
+
+```silk
+pub effect fn files(self: &mut Self, paths: &Deferred<List<String>>) -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Declares a deferred list of absolute file paths. The runner obtains the list first, then
+includes each file's path and contents in this step's key before deciding whether to run it.
+
+<a id="Key.impl.trees"></a>
+
+### Method `trees`
+
+```silk
+pub effect fn trees(self: &mut Self, paths: &Deferred<List<String>>) -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Declares deferred absolute directory paths, hashing each complete tree before cache lookup.
+
+<a id="Key.impl.packageTrees"></a>
+
+### Method `packageTrees`
+
+```silk
+pub effect fn packageTrees(self: &mut Self, paths: &Deferred<List<String>>) -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Declares deferred package directories, excluding each root's build and version-control data.
+
 <a id="Key.impl.environment"></a>
 
 ### Method `environment`
@@ -327,6 +358,16 @@ pub effect fn output(self: &Self, name: string) -> Deferred<Path> ! StepError | 
 ```
 
 Names one file that this step will produce. The path must stay below its output directory.
+
+<a id="StepHandle.impl.valueFile"></a>
+
+### Method `valueFile`
+
+```silk
+pub effect fn valueFile<T: Schema>(self: &Self, name: string) -> Deferred<T> ! StepError | OutOfMemoryError ? &mut Allocator
+```
+
+Names a typed JSON output published by `Make.valueFile` during this step.
 
 <a id="StepHandle.impl.value"></a>
 
@@ -454,6 +495,16 @@ pub effect fn write(self: &mut Self, name: string, bytes: &[u8]) -> () ! StepFai
 
 Writes a file below this step's output directory, creating its parent directories.
 
+<a id="Make.impl.valueFile"></a>
+
+### Method `valueFile`
+
+```silk
+pub effect fn valueFile<T: Schema>(self: &mut Self, name: string, value: &T) -> () ! StepFailure ? &mut Allocator
+```
+
+Publishes one named typed result as JSON for deferred consumers.
+
 <a id="Make.impl.value"></a>
 
 ### Method `value`
@@ -553,7 +604,8 @@ pub effect fn execute(self: &Self, targets: &[StepHandle], compile: bool) -> Lis
   ! StepFailure | SpawnError | Cancelled ? &mut Allocator | &mut FileSystem | &mut HostInput
 ```
 
-Computes every key before starting work, then runs only the requested steps and their inputs.
+Resolves each key before running its step, executing prerequisites needed to discover file sets.
+Only requested steps and their declared inputs run.
 When `compile` is false, requested compilations write requests while prerequisite tools build.
 
 
