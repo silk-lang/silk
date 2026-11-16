@@ -2925,6 +2925,11 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   assert.equal(importsBuilt.status, 0, importsBuilt.stderr)
   const importsRan = yield* invoke(join(importsRoot, `app/build/${hostTarget}/dev/imports-app`), [], importsRoot)
   assert.equal(importsRan.status, 42, importsRan.stderr)
+  const importsDocumented = yield* invoke(silk,
+    ['doc', '--stdlib-root', standardLibrary, '--output', join(importsRoot, 'app.docs.json')],
+    join(importsRoot, 'app'), importsEnvironment)
+  assert.equal(importsDocumented.status, 0, importsDocumented.stdout + importsDocumented.stderr)
+  assert.ok(yield* fs.exists(join(importsRoot, 'app.docs.json')), 'documentation uses plans and transitive generated imports')
   const importsRequests = join(importsRoot, 'app/build/requests')
   const importsRequestName = (yield* fs.readDirectory(importsRequests)).find((name) => name.endsWith('.toml'))
   assert.ok(importsRequestName)
