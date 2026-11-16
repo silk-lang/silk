@@ -3862,9 +3862,14 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
       all.stderr.indexOf('shared-math') < all.stderr.indexOf('shared-app'),
       `the library member is not checked before the member that takes it:\n${all.stderr}`,
     )
-    // A name the workspace does not write is refused at the member's entry.
+    // An unused workspace dependency is not resolved; importing it reports the bad entry.
     yield* fs.writeFileString(join(workspace, 'app/silk.toml'), member(`${taken}missing = { workspace = true }\n`))
+    const unusedMissing = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(workspace, 'app'), refusing)
+    assert.equal(unusedMissing.status, 0, unusedMissing.stderr)
+    const appSource = yield* fs.readFileString(join(workspace, 'app/main.silk'))
+    yield* fs.writeFileString(join(workspace, 'app/main.silk'), `import missing.lib\n${appSource}`)
     const missing = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(workspace, 'app'), refusing)
+    yield* fs.writeFileString(join(workspace, 'app/main.silk'), appSource)
     assert.equal(missing.status, 2, 'a dependency the workspace does not write was accepted')
     assert.match(missing.stderr, /Invalid Silk project manifest .*shared\/workspace\/app\/silk\.toml:9: /)
     // The entry is written alone.
@@ -3888,7 +3893,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
       join(workspace, 'tool/silk.toml'),
       '[package]\nname = "shared-tool"\nversion = "0.1.0"\nsource = "."\n\n[dependencies]\nlengths = { workspace = true }\n',
     )
-    yield* fs.writeFileString(join(workspace, 'tool/main.silk'), 'pub fn main() -> i32 {\n  return 0\n}\n')
+    yield* fs.writeFileString(join(workspace, 'tool/main.silk'), 'import lengths.length { length }\npub fn main() -> i32 {\n  return length()\n}\n')
     const unlisted = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(workspace, 'tool'), refusing)
     assert.equal(unlisted.status, 2, 'a package outside the workspace took a workspace dependency')
     assert.match(unlisted.stderr, /Invalid Silk project manifest .*shared\/workspace\/tool\/silk\.toml:7: /)
