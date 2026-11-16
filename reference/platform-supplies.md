@@ -85,6 +85,18 @@ target's libraries: natively the host toolchain supplies them, and a cross link 
 explicit supply stops and says how to declare one. The link stamp covers the digest of the stub
 table and startup source.
 
+The standard library's `f64` and `f32` math never calls libm, and its result bits are the same on
+every host. A program that declares a libm function itself, such as
+`unsafe extern "C" fn log2(value: f64) -> f64`, binds glibc's `GLIBC_2.2.5` versions of `exp`,
+`exp2`, `log`, `log2` and `pow`: they check their argument for `errno` and then run the same code
+as the newer versions, so they return the same bits. Those bits can still differ between machines:
+on x86-64, glibc picks a fused multiply-add implementation when the processor has FMA, which
+rounds a few results the other way. In glibc 2.39 that covers `asin`, `acos`, `atan`, `atan2`,
+`exp`, `expm1`, `log`, `log1p`, `log2`, `pow`, `sin`, `cos`, `sincos`, `tan`, `expf`, `exp2f`,
+`logf`, `log2f`, `powf`, `sinf`, `cosf` and `sincosf`. Output that must not depend on the host,
+such as compressed bytes chosen by a cost model, needs the standard library's functions or a test
+on both kinds of processor.
+
 A project can pin a physical installation independently of its logical target profile:
 
 ```toml
