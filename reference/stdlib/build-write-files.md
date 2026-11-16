@@ -6,7 +6,7 @@ Generated files whose contents are known values or other steps' deferred values.
 
 Import as `WriteFiles` with `import silk.build.write_files { WriteFiles }`.
 
-Public declarations: 1.
+Public declarations: 2.
 
 <a id="WriteFiles"></a>
 
@@ -121,6 +121,26 @@ pub effect fn register(self: Self) -> StepHandle ! StepFailure ? &mut Allocator
 ```
 
 Registers the files and returns a handle to their deferred output paths.
+
+<a id="WriteFiles.impl.registerHere"></a>
+
+### Method `registerHere`
+
+```silk
+pub effect fn registerHere(self: Self) -> StepHandle ! StepFailure ? &mut Allocator
+```
+
+Registers the files as work this process runs itself, without describing it to the compiler.
+
+<a id="restore"></a>
+
+## `restore`
+
+```silk
+pub effect fn restore(step: &[u8]) -> StepHandle ! StepFailure ? &mut Allocator
+```
+
+Restores described files as a step this process can run.
 
 <a id="WriteFiles.impl.Step"></a>
 

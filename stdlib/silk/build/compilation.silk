@@ -7,7 +7,7 @@ import silk.build.graph { Build, Built, BuildError }
 import silk.build.encoding as Encoding
 import silk.build.definition { Definition, Settings as Values, Package as PackageSettings }
 import silk.build.context as Context
-import silk.schema.schema { Dictionary }
+import silk.schema.schema { Dictionary, Schema }
 import silk.schema.json { SchemaJson }
 import silk.schema.toml { SchemaToml }
 import silk.build.setting as Settings { Setting, TextField, NumberField, ListField }
@@ -19,6 +19,9 @@ import silk.build.step { Deferred, Key, Make, Step, StepError, StepFailure, Step
 import silk.concurrency.sync { Mutex }
 import silk.core.option { Option }
 import silk.core.result { Result }
+import silk.core.effect { Effect }
+import silk.io.writer { Writer, WriterError }
+import silk.io.writer_native { StderrWriter }
 import silk.text.string { InvalidUtf8 }
 import silk.mem.allocator { Allocator }
 import silk.system.child_process { ChildProcess }
@@ -27,9 +30,19 @@ import silk.system.host_input { HostInput }
 import silk.text.string { String }
 import silk.num.usize
 
+// A compilation as the compiler restores it: the definition and the settings still to apply.
+struct Description {
+  pub definition: Definition,
+  pub compiler: Deferred<Path>,
+  pub settings: List<Setting>,
+  pub memory: u64,
+  pub unsandboxedTools: bool,
+}
+
+impl Schema for Description {}
+
 struct State {
   definition: Option<Definition>,
-  inputs: Option<Context.Inputs>,
   compiler: Option<Deferred<Path>>,
   registered: Option<StepHandle>,
   settings: List<Setting>,
@@ -61,12 +74,10 @@ impl Compilation {
   pub effect fn fromDefinition(definition: Definition, compiler: Deferred<Path>) -> Self
     ! StepFailure
     ? &mut Allocator | &mut FileSystem {
-    let inputs = run Context.inputs(&run Path.make(definition.manifest.view()))
     return Compilation {
       state: run Mutex<State>.make(
         State {
           definition: Option<Definition>.some(move definition),
-          inputs: Option<Context.Inputs>.some(move inputs),
           compiler: Option<Deferred<Path>>.some(move compiler),
           registered: Option<StepHandle>.none(),
           settings: List<Setting>.make(),
@@ -683,7 +694,8 @@ impl Compilation {
     return move self
   }
 
-  /// Registers the compilation once, freezing its settings and retaining its typed work.
+  /// Registers the compilation once, freezing its settings. The step holds the compilation's
+  /// description, which the compiler restores and runs.
   pub effect fn step(self: &Self) -> StepHandle
     ! StepFailure
     ? &mut Allocator {
@@ -692,16 +704,10 @@ impl Compilation {
     if let Option<StepHandle>.Some { value } = &state.registered {
       return value.copy()
     }
-    let mut definition = match move Intrinsic.replace(state.definition, Option<Definition>.none()) {
+    let definition = match move Intrinsic.replace(state.definition, Option<Definition>.none()) {
       Option<Definition>.Some { value } => move value
       Option<Definition>.None => {
         fail StepError { message: run String.copy("the compilation has already been consumed") }
-      }
-    }
-    let inputs = match move Intrinsic.replace(state.inputs, Option<Context.Inputs>.none()) {
-      Option<Context.Inputs>.Some { value } => move value
-      Option<Context.Inputs>.None => {
-        fail StepError { message: run String.copy("the compilation has no package inputs") }
       }
     }
     let compiler = match move Intrinsic.replace(state.compiler, Option<Deferred<Path>>.none()) {
@@ -710,32 +716,25 @@ impl Compilation {
         fail StepError { message: run String.copy("the compilation has no compiler") }
       }
     }
-    let settings = state.settings.asSlice()
+    let description = Description {
+      definition: move definition,
+      compiler: move compiler,
+      settings: Intrinsic.replace(state.settings, List<Setting>.make()),
+      memory: state.memory,
+      unsandboxedTools: state.unsandboxedTools,
+    }
+    let mut key = Key.collecting()
+    run key.toolchain(&description.compiler)
+    let settings = description.settings.asSlice()
     let mut at: usize = 0
     while at < settings.length {
-      Settings.clearReplaced(&mut definition, &settings[at])
+      run Settings.key(&settings[at], &mut key)
       at = at + 1
     }
-    let encoded = run Encoding.json<Definition>(&definition)
-    let resolved = run Step.register(
-      RequestStep {
-        definition: move encoded,
-        compiler: run compiler.copy(),
-        packages: run Deferred<List<String>>.value(move inputs.packages),
-        files: run Deferred<List<String>>.value(move inputs.files),
-        settings: Intrinsic.replace(state.settings, List<Setting>.make()),
-        unsandboxedTools: state.unsandboxedTools,
-      },
-    )
-    let step = run Step.register(
-      CompilerStep {
-        request: run resolved.valueFile<Request>("request.json"),
-        files: run resolved.valueFile<List<String>>("files.json"),
-        trees: run resolved.valueFile<List<String>>("trees.json"),
-        packages: run resolved.valueFile<List<String>>("packages.json"),
-        compiler: move compiler,
-        memory: state.memory,
-      },
+    let step = run StepHandle.described(
+      "compilation",
+      run Encoding.json<Description>(&description),
+      run key.producers(),
     )
     state.registered = Option<StepHandle>.some(step.copy())
     return move step
@@ -767,6 +766,51 @@ impl Compilation {
 }
 
 import silk.collections.bytes { Bytes }
+
+/// Restores a described compilation as the steps this process can run: one resolves its
+/// request and one compiles it. Answers the compiling step.
+pub effect fn restore(step: &[u8]) -> StepHandle
+  ! StepFailure
+  ? &mut Allocator | &mut FileSystem {
+  let description = run SchemaJson.decode<Description>(step)
+  let Description {
+    definition: described,
+    compiler,
+    settings: listed,
+    memory,
+    unsandboxedTools
+  } = move description
+  let mut definition = move described
+  let mut settings = move listed
+  let inputs = run Context.inputs(&run Path.make(definition.manifest.view()))
+  let applied = settings.asSlice()
+  let mut at: usize = 0
+  while at < applied.length {
+    Settings.clearReplaced(&mut definition, &applied[at])
+    at = at + 1
+  }
+  let encoded = run Encoding.json<Definition>(&definition)
+  let resolved = run Step.register(
+    RequestStep {
+      definition: move encoded,
+      compiler: run compiler.copy(),
+      packages: run Deferred<List<String>>.value(move inputs.packages),
+      files: run Deferred<List<String>>.value(move inputs.files),
+      settings: move settings,
+      unsandboxedTools: unsandboxedTools,
+    },
+  )
+  return run Step.register(
+    CompilerStep {
+      request: run resolved.valueFile<Request>("request.json"),
+      files: run resolved.valueFile<List<String>>("files.json"),
+      trees: run resolved.valueFile<List<String>>("trees.json"),
+      packages: run resolved.valueFile<List<String>>("packages.json"),
+      compiler: move compiler,
+      memory: memory,
+    },
+  )
+}
 
 struct RequestStep {
   unsandboxedTools: bool,
@@ -902,21 +946,28 @@ impl Step for CompilerStep {
     }
     let requestPath = run make.output("request.toml")
     let written = run pathText(&requestPath)
-    let outcome = run make.exec(&self.compiler, &["compile", "--request", written.view()])
+    let outcome = run make.exec(
+      &self.compiler,
+      &["compile", "--request", written.view(), "--progress"],
+    )
+
+    // The compiler's progress and diagnostics, as a build of this compilation alone shows them.
+    let mut shown = StderrWriter.make()
+    let forwarded = run Effect.result(
+      Writer.writeAll(ChildProcess.errorBytes(&outcome)) |> Effect.provideMut<Writer>(&mut shown),
+    )
+    match move forwarded {
+      Result<(), WriterError>.Success { .. } => ()
+      Result<(), WriterError>.Failure { error } => {
+        drop error
+      }
+    }
     let succeeded = match move ChildProcess.exitCode(&outcome) {
       Option<i32>.Some { value } => value == 0
       Option<i32>.None => false
     }
     if !succeeded {
-      let mut message = run String.copy("the compiler rejected the compilation request")
-      match move String.fromUtf8(ChildProcess.errorBytes(&outcome)) {
-        Result<string, InvalidUtf8>.Success { value } => {
-          run message.append(": ")
-          run message.append(value)
-        }
-        Result<string, InvalidUtf8>.Failure { .. } => ()
-      }
-      fail StepError { message: move message }
+      fail StepError { message: run String.copy("the compiler rejected the compilation request") }
     }
     if request.header.isSome() {
       run make.requireOutput("header.h")

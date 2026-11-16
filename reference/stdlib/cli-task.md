@@ -60,7 +60,7 @@ pub effect fn main() -> i32 ? &mut HostInput {
 
 Import as `Task` with `import silk.cli.task { Task }`.
 
-Public declarations: 3.
+Public declarations: 5.
 
 <a id="TaskError"></a>
 
@@ -273,6 +273,26 @@ paths relative to it.
 
 #### Errors
 [`TaskError`](#TaskError) when the variable is not set, as outside `silk task`.
+
+<a id="fileAction"></a>
+
+## `fileAction`
+
+```silk
+pub fn fileAction(code: i32) -> &'static [u8]
+```
+
+What a `FileOperation` code was doing, for a report such as `could not read a file: ...`.
+
+<a id="fileReason"></a>
+
+## `fileReason`
+
+```silk
+pub fn fileReason(code: i32) -> &'static [u8]
+```
+
+Why a file operation failed, from a `FileReason` code.
 
 
 Category: Command line.
