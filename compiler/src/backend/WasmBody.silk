@@ -120,6 +120,10 @@ fn formConstant() -> u8 { return 1 }
 fn formSymbol() -> u8 { return 2 }
 fn formFrame() -> u8 { return 3 }
 fn formLocalSymbol() -> u8 { return 4 }
+// A deferred value's code is kept aside until its one use pushes it.
+fn formDeferred() -> u8 { return 5 }
+// A deferred value whose code a push has put in the straight code, leaving it on the stack.
+fn formPushed() -> u8 { return 6 }
 
 /// One value: its kind and where its lanes are.
 struct Slot {
@@ -127,8 +131,8 @@ struct Slot {
   form: u8,
   /// The first wasm local of a local value, or the frame base local of a frame slot.
   local: usize,
-  /// A constant's bits, an `i128`'s low lane, the addend of an address, or a frame address's
-  /// offset in the frame.
+  /// A constant's bits, an `i128`'s low lane, the addend of an address, a frame address's
+  /// offset in the frame, or the index of a deferred value's code in the body's.
   low: u64,
   /// An `i128` constant's high lane.
   high: u64,
@@ -145,6 +149,26 @@ struct Emission {
   /// Pairs of an offset in `code` and a source place, by offset.
   locations: List<u64>,
 }
+
+/// The code of one deferred value: `[start, end)` of the body's deferred code, with its
+/// relocations.
+struct Deferred {
+  start: usize,
+  end: usize,
+  relocationStart: usize,
+  relocationEnd: usize,
+}
+
+impl Copy for Deferred {}
+
+/// Where a push put a deferred value's code: the straight code's length right after it, where a
+/// `local.tee` goes if the value is pushed again.
+struct Pushed {
+  value: usize,
+  at: usize,
+}
+
+impl Copy for Pushed {}
 
 fn emission() -> Emission {
   return Emission {code: Bytes.make(), relocations: List<Relocation>.make(), locations: List<u64>.make()}
@@ -179,6 +203,8 @@ struct Piece {
   cases: List<u64>,
   /// The source place of the exit.
   place: u64,
+  /// The block's code leaves the branch's condition or the return's value on the stack.
+  stacked: bool,
 }
 
 /// A body under construction.
@@ -213,6 +239,23 @@ pub struct Body {
   setStart: usize,
   setEnd: usize,
   setLocal: usize,
+  /// The code of every deferred value, one after another, and each one's range in it.
+  deferred: Emission,
+  deferrals: List<Deferred>,
+  /// The deferred values pushed in the current block.
+  pushed: List<Pushed>,
+  /// Where the operation being deferred starts in the straight code and its relocations and
+  /// locations, or `usize.MAX` outside one.
+  deferStart: usize,
+  deferRelocations: usize,
+  deferLocations: usize,
+  /// The last `local.set` as it was when the operation being deferred started: `setStart`,
+  /// `setEnd` and `setLocal` again once its code is taken out.
+  heldStart: usize,
+  heldEnd: usize,
+  heldLocal: usize,
+  /// The local value `soleUse` named, which is read once, or `none()`.
+  sole: u64,
 }
 
 impl Body {
@@ -222,7 +265,10 @@ impl Body {
     return Body {symbol: run Bytes.copy(symbol), wide: wide, threaded: threaded, parameters: List<u8>.make(), results: List<u8>.make(),
       locals: List<u8>.make(), slots: List<Slot>.make(), pieces: List<Piece>.make(), current: usize.MAX, entry: usize.MAX,
       straight: emission(), symbols: List<Bytes>.make(), signatures: List<Bytes>.make(), frameSize: 0, frame: usize.MAX,
-      saved: usize.MAX, place: 0, setStart: usize.MAX, setEnd: usize.MAX, setLocal: usize.MAX}
+      saved: usize.MAX, place: 0, setStart: usize.MAX, setEnd: usize.MAX, setLocal: usize.MAX, deferred: emission(),
+      deferrals: List<Deferred>.make(), pushed: List<Pushed>.make(), deferStart: usize.MAX, deferRelocations: usize.ZERO,
+      deferLocations: usize.ZERO, heldStart: usize.MAX, heldEnd: usize.MAX, heldLocal: usize.MAX,
+      sole: none()}
   }
 
   /// The symbol the body defines.
@@ -511,9 +557,275 @@ effect fn pushSlot(out: &mut Emission, slot: Slot, lane: usize, wide: bool) -> (
 // Pushes lane `lane` of `value`.
 effect fn pushLane(body: &mut Body, value: u64, lane: usize) -> () ! OutOfMemoryError ? &mut Allocator {
   let slot = List<Slot>.get(&body.slots, u64.toUsize(value))
-  if slot.form == formLocal() { return run localGet(&mut body.*, slot.local + lane) }
+  if slot.form == formLocal() {
+    if run takeLastSet(&mut body.*, value) {
+      // The set is gone, so the value is on the stack as a pushed deferred value's is.
+      let length = Bytes.length(&body.straight.code)
+      run List<Pushed>.append(&mut body.*.pushed, Pushed {value: u64.toUsize(value), at: length})
+      let mut moved = slot
+      moved.form = formPushed()
+      List<Slot>.set(&mut body.*.slots, u64.toUsize(value), moved)
+      return ()
+    }
+    return run localGet(&mut body.*, slot.local + lane)
+  }
+  if slot.form == formDeferred() { return run pushDeferred(&mut body.*, value) }
+  if slot.form == formPushed() {
+    run keepPushed(&mut body.*, value)
+    let kept = List<Slot>.get(&body.slots, u64.toUsize(value)).local
+    return run localGet(&mut body.*, kept)
+  }
   let wide = body.wide
   return run pushSlot(&mut body.*.straight, slot, lane, wide)
+}
+
+/// Says that local value `value` is read exactly once, or with `none()` that the value named
+/// before no longer is the last one made. When that one read comes right after the code that
+/// sets the value, the value stays on the stack and is never set.
+pub fn soleUse(body: &mut Body, value: u64) -> () {
+  body.sole = value
+  return ()
+}
+
+// Removes the `local.set` of `value` when it ends the straight code and `value` is the one-lane
+// local value `soleUse` named, which leaves the value on the stack; answers whether it did.
+effect fn takeLastSet(body: &mut Body, value: u64) -> bool ! OutOfMemoryError ? &mut Allocator {
+  if value == none() || value != body.sole { return false }
+  let slot = List<Slot>.get(&body.slots, u64.toUsize(value))
+  let length = Bytes.length(&body.straight.code)
+  if slot.form != formLocal() || slot.kind.lanes() != usize.ONE || body.setEnd != length || body.setLocal != slot.local { return false }
+  let start = body.setStart
+  Bytes.truncate(&mut body.*.straight.code, start)
+  // A place that started after the set starts where the set did.
+  let locations = List<u64>.asMutSlice(&mut body.*.straight.locations)
+  let mut at = locations.length
+  while at >= 2 && u64.toUsize(locations[at - 2]) > start {
+    at = at - 2
+    locations[at] = usize.toU64(start)
+  }
+  body.setEnd = usize.MAX
+  body.sole = none()
+  return true
+}
+
+// Deferred values. An operation between `beginDeferred` and `endDeferred` has its code taken out
+// of the straight code and kept until the value's first push puts it there, so the value goes
+// from the operation to its use on the stack. A second push in the same block turns the first
+// into a `local.tee` of the value's local.
+
+/// Starts an operation whose result `endDeferred` may defer.
+pub fn beginDeferred(body: &mut Body) -> () {
+  body.deferStart = Bytes.length(&body.straight.code)
+  body.deferRelocations = List<Relocation>.length(&body.straight.relocations)
+  body.deferLocations = List<u64>.length(&body.straight.locations)
+  // The operation's own code must not turn a set before it into a tee: it runs elsewhere.
+  body.heldStart = body.setStart
+  body.heldEnd = body.setEnd
+  body.heldLocal = body.setLocal
+  body.setEnd = usize.MAX
+  return ()
+}
+
+/// Ends the operation `beginDeferred` started, whose result is `value`. Answers whether the value
+/// is deferred: it is when the operation's code is the computation of a one-lane local value and
+/// ends by setting it, or when the operation answered a deferred value itself. A deferred value
+/// must be pushed, or settled, in the block and before any code its computation cannot follow.
+pub effect fn endDeferred(body: &mut Body, value: u64) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let start = body.deferStart
+  body.deferStart = usize.MAX
+  if value == none() || start == usize.MAX { return false }
+  let slot = List<Slot>.get(&body.slots, u64.toUsize(value))
+  if slot.form == formDeferred() { return true }
+  let length = Bytes.length(&body.straight.code)
+  if slot.form != formLocal() || slot.kind.lanes() != usize.ONE || body.setEnd != length || body.setLocal != slot.local
+    || body.setStart < start {
+    return false
+  }
+  let codeStart = Bytes.length(&body.deferred.code)
+  let relocationStart = List<Relocation>.length(&body.deferred.relocations)
+  let end = body.setStart
+  let mut at = start
+  while at < end {
+    let byte = Bytes.asSlice(&body.straight.code)[at]
+    run WasmModule.byte(&mut body.*.deferred.code, byte)
+    at = at + usize.ONE
+  }
+  let relocations = List<Relocation>.length(&body.straight.relocations)
+  at = body.deferRelocations
+  while at < relocations {
+    let relocation = List<Relocation>.get(&body.straight.relocations, at)
+    run List<Relocation>.append(&mut body.*.deferred.relocations, Relocation {offset: relocation.offset - start + codeStart,
+      kind: relocation.kind, target: relocation.target, addend: relocation.addend})
+    at = at + usize.ONE
+  }
+  Bytes.truncate(&mut body.*.straight.code, start)
+  List<Relocation>.truncate(&mut body.*.straight.relocations, body.deferRelocations)
+  List<u64>.truncate(&mut body.*.straight.locations, body.deferLocations)
+  // A push the operation made lies in the code taken out, and can no longer become a tee.
+  let mut kept = List<Pushed>.length(&body.pushed)
+  while kept > usize.ZERO && List<Pushed>.get(&body.pushed, kept - usize.ONE).at > start { kept = kept - usize.ONE }
+  List<Pushed>.truncate(&mut body.*.pushed, kept)
+  let index = List<Deferred>.length(&body.deferrals)
+  run List<Deferred>.append(&mut body.*.deferrals, Deferred {start: codeStart, end: Bytes.length(&body.deferred.code),
+    relocationStart: relocationStart, relocationEnd: List<Relocation>.length(&body.deferred.relocations)})
+  let mut moved = slot
+  moved.form = formDeferred()
+  moved.low = usize.toU64(index)
+  // The value's local is given back when it is the last one made; `localOfDeferred` makes one
+  // again if the value turns out to need it.
+  let declared = List<u8>.length(&body.locals)
+  if declared > usize.ZERO && slot.local == List<u8>.length(&body.parameters) + declared - usize.ONE {
+    List<u8>.truncate(&mut body.*.locals, declared - usize.ONE)
+    moved.local = usize.MAX
+  }
+  List<Slot>.set(&mut body.*.slots, u64.toUsize(value), moved)
+  body.setStart = body.heldStart
+  body.setEnd = body.heldEnd
+  body.setLocal = body.heldLocal
+  return true
+}
+
+// The local of deferred or pushed `value`, made now if `endDeferred` gave it back.
+effect fn localOfDeferred(body: &mut Body, value: u64) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let slot = List<Slot>.get(&body.slots, u64.toUsize(value))
+  if slot.local != usize.MAX { return slot.local }
+  let mut moved = slot
+  moved.local = run addLocal(&mut body.*, slot.kind.lane)
+  List<Slot>.set(&mut body.*.slots, u64.toUsize(value), moved)
+  return moved.local
+}
+
+/// Makes `value` a local value where the code is now, when it is deferred: its computation runs
+/// here. Any other value is left as it is.
+pub effect fn settle(body: &mut Body, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  if value == none() { return () }
+  let slot = List<Slot>.get(&body.slots, u64.toUsize(value))
+  if slot.form == formPushed() { return run keepPushed(&mut body.*, value) }
+  if slot.form != formDeferred() { return () }
+  run pushDeferred(&mut body.*, value)
+  let local = run localOfDeferred(&mut body.*, value)
+  run localSet(&mut body.*, local)
+  let mut moved = List<Slot>.get(&body.slots, u64.toUsize(value))
+  moved.form = formLocal()
+  moved.low = 0
+  List<Slot>.set(&mut body.*.slots, u64.toUsize(value), moved)
+  return ()
+}
+
+// Puts deferred `value`'s code in the straight code, which leaves the value on the stack.
+effect fn pushDeferred(body: &mut Body, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let slot = List<Slot>.get(&body.slots, u64.toUsize(value))
+  let range = List<Deferred>.get(&body.deferrals, u64.toUsize(slot.low))
+  let base = Bytes.length(&body.straight.code)
+  // Code that starts by reading the local the straight code has just set leaves that read out:
+  // the set becomes a `local.tee`, as in `localGet`.
+  let mut first = range.start
+  if body.setEnd == base {
+    let mut read = Bytes.make()
+    run WasmModule.localGet(&mut read, body.setLocal)
+    let length = Bytes.length(&read)
+    let mut matches = range.end - range.start >= length
+    let mut at = usize.ZERO
+    while matches && at < length {
+      if Bytes.asSlice(&body.deferred.code)[range.start + at] != Bytes.asSlice(&read)[at] { matches = false }
+      at = at + usize.ONE
+    }
+    if matches {
+      let code = Bytes.asMutSlice(&mut body.*.straight.code)
+      code[body.setStart] = 0x22
+      first = range.start + length
+    }
+  }
+  let mut at = first
+  while at < range.end {
+    let byte = Bytes.asSlice(&body.deferred.code)[at]
+    run WasmModule.byte(&mut body.*.straight.code, byte)
+    at = at + usize.ONE
+  }
+  at = range.relocationStart
+  while at < range.relocationEnd {
+    let relocation = List<Relocation>.get(&body.deferred.relocations, at)
+    run List<Relocation>.append(&mut body.*.straight.relocations, Relocation {offset: relocation.offset - first + base,
+      kind: relocation.kind, target: relocation.target, addend: relocation.addend})
+    at = at + usize.ONE
+  }
+  body.setEnd = usize.MAX
+  let length = Bytes.length(&body.straight.code)
+  run List<Pushed>.append(&mut body.*.pushed, Pushed {value: u64.toUsize(value), at: length})
+  let mut moved = slot
+  moved.form = formPushed()
+  List<Slot>.set(&mut body.*.slots, u64.toUsize(value), moved)
+  return ()
+}
+
+// Makes pushed `value` a local value: a `local.tee` of its local goes in right after the code its
+// first push put in the straight code.
+effect fn keepPushed(body: &mut Body, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut found = List<Pushed>.length(&body.pushed)
+  let mut spot = usize.MAX
+  while found > usize.ZERO {
+    found = found - usize.ONE
+    let entry = List<Pushed>.get(&body.pushed, found)
+    if entry.value == u64.toUsize(value) {
+      spot = entry.at
+      found = usize.ZERO
+    }
+  }
+  if spot == usize.MAX { return CompilerBug.panic(b"WasmBody: a deferred value pushed again where its first push cannot keep it") }
+  let local = run localOfDeferred(&mut body.*, value)
+  let mut tee = Bytes.make()
+  run WasmModule.localTee(&mut tee, local)
+  let added = Bytes.length(&tee)
+  let before = Bytes.length(&body.straight.code)
+  let mut at = usize.ZERO
+  while at < added {
+    run WasmModule.byte(&mut body.*.straight.code, 0)
+    at = at + usize.ONE
+  }
+  let code = Bytes.asMutSlice(&mut body.*.straight.code)
+  at = before
+  while at > spot {
+    at = at - usize.ONE
+    code[at + added] = code[at]
+  }
+  at = usize.ZERO
+  while at < added {
+    code[spot + at] = Bytes.asSlice(&tee)[at]
+    at = at + usize.ONE
+  }
+  let relocations = List<Relocation>.asMutSlice(&mut body.*.straight.relocations)
+  at = relocations.length
+  while at > usize.ZERO && relocations[at - usize.ONE].offset >= spot {
+    at = at - usize.ONE
+    relocations[at].offset = relocations[at].offset + added
+  }
+  let locations = List<u64>.asMutSlice(&mut body.*.straight.locations)
+  at = locations.length
+  while at >= 2 && u64.toUsize(locations[at - 2]) >= spot {
+    at = at - 2
+    locations[at] = locations[at] + usize.toU64(added)
+  }
+  let pushes = List<Pushed>.asMutSlice(&mut body.*.pushed)
+  at = usize.ZERO
+  while at < pushes.length {
+    if pushes[at].at > spot { pushes[at].at = pushes[at].at + added }
+    at = at + usize.ONE
+  }
+  // A tee right where a deferred operation starts stays before it, with the push it follows.
+  if body.deferStart != usize.MAX && body.deferStart >= spot { body.deferStart = body.deferStart + added }
+  if body.setEnd != usize.MAX && body.setStart >= spot {
+    body.setStart = body.setStart + added
+    body.setEnd = body.setEnd + added
+  }
+  if body.deferStart != usize.MAX && body.heldEnd != usize.MAX && body.heldStart >= spot {
+    body.heldStart = body.heldStart + added
+    body.heldEnd = body.heldEnd + added
+  }
+  let mut moved = List<Slot>.get(&body.slots, u64.toUsize(value))
+  moved.form = formLocal()
+  moved.low = 0
+  List<Slot>.set(&mut body.*.slots, u64.toUsize(value), moved)
+  return ()
 }
 
 // Pushes the base of a load or store at `address`, and answers the offset left to the access: a
@@ -1634,6 +1946,76 @@ pub effect fn overflowing(body: &mut Body, operation: Binary, signed: bool, left
   let flagged = run fresh(&mut body.*, Kind.flag())
   let first = localOf(&body.*, result, usize.ZERO, usize.ZERO)
   let flag = localOf(&body.*, flagged, usize.ZERO, usize.ZERO)
+  if bits <= 32 && operation != Binary.Mul {
+    let mut code: u8 = 0x6A
+    if operation == Binary.Sub { code = 0x6B }
+    if bits == 32 {
+      // In `i32` itself. Signed add: the result's sign differs from both operands'; signed
+      // subtract: the operands' signs differ and the result's differs from the left one's.
+      // Unsigned add: the result is below an operand; unsigned subtract: the left is below the
+      // right.
+      run push(&mut body.*, left)
+      run push(&mut body.*, right)
+      run emit(&mut body.*, code)
+      run localSet(&mut body.*, first)
+      if signed {
+        run push(&mut body.*, left)
+        if operation == Binary.Add { run localGet(&mut body.*, first) } else { run push(&mut body.*, right) }
+        run emit(&mut body.*, 0x73)
+        if operation == Binary.Add { run push(&mut body.*, right) } else { run push(&mut body.*, left) }
+        run localGet(&mut body.*, first)
+        run emit(&mut body.*, 0x73)
+        run emit(&mut body.*, 0x71)
+        run i32Const(&mut body.*, 0)
+        run emit(&mut body.*, 0x48)
+      } else if operation == Binary.Add {
+        run localGet(&mut body.*, first)
+        run push(&mut body.*, left)
+        run emit(&mut body.*, 0x49)
+      } else {
+        run push(&mut body.*, left)
+        run push(&mut body.*, right)
+        run emit(&mut body.*, 0x49)
+      }
+    } else if signed {
+      // The exact result fits an `i32`; it overflowed when it is not its own low bits
+      // sign-extended.
+      let exact = run addLocal(&mut body.*, WasmModule.i32Type())
+      run pushSigned(&mut body.*, left, usize.ZERO)
+      run pushSigned(&mut body.*, right, usize.ZERO)
+      run emit(&mut body.*, code)
+      run localTee(&mut body.*, exact)
+      run normalize(&mut body.*, bits)
+      run localSet(&mut body.*, first)
+      run localGet(&mut body.*, exact)
+      run signExtend(&mut body.*, bits)
+      run localGet(&mut body.*, exact)
+      run emit(&mut body.*, 0x47)
+    } else if operation == Binary.Add {
+      // The exact sum fits an `i32`; the bit above the width is the carry.
+      let exact = run addLocal(&mut body.*, WasmModule.i32Type())
+      run push(&mut body.*, left)
+      run push(&mut body.*, right)
+      run emit(&mut body.*, code)
+      run localTee(&mut body.*, exact)
+      run normalize(&mut body.*, bits)
+      run localSet(&mut body.*, first)
+      run localGet(&mut body.*, exact)
+      run i32Const(&mut body.*, usize.toU64(bits))
+      run emit(&mut body.*, 0x76)
+    } else {
+      run push(&mut body.*, left)
+      run push(&mut body.*, right)
+      run emit(&mut body.*, code)
+      run normalize(&mut body.*, bits)
+      run localSet(&mut body.*, first)
+      run push(&mut body.*, left)
+      run push(&mut body.*, right)
+      run emit(&mut body.*, 0x49)
+    }
+    run localSet(&mut body.*, flag)
+    return Checked {value: result, overflow: flagged}
+  }
   if bits < 64 {
     let exact = run addLocal(&mut body.*, WasmModule.i64Type())
     run pushExtended(&mut body.*, left, usize.ZERO, signed)
@@ -2400,7 +2782,7 @@ pub effect fn newBlock(body: &mut Body) -> usize ! OutOfMemoryError ? &mut Alloc
   let index = List<Piece>.length(&body.pieces)
   run List<Piece>.append(&mut body.*.pieces, Piece {started: false, start: usize.ZERO, end: usize.ZERO, relocationStart: usize.ZERO,
     relocationEnd: usize.ZERO, locationStart: usize.ZERO, locationEnd: usize.ZERO, exit: exitNone(), value: none(), first: usize.ZERO,
-    second: usize.ZERO, cases: List<u64>.make(), place: 0})
+    second: usize.ZERO, cases: List<u64>.make(), place: 0, stacked: false})
   return index
 }
 
@@ -2409,6 +2791,7 @@ pub effect fn newBlock(body: &mut Body) -> usize ! OutOfMemoryError ? &mut Alloc
 pub effect fn startBlock(body: &mut Body, block: usize) -> () ! OutOfMemoryError ? &mut Allocator {
   run closeCurrent(&mut body.*)
   body.setEnd = usize.MAX
+  List<Pushed>.clear(&mut body.*.pushed)
   let start = Bytes.length(&body.straight.code)
   let relocations = List<Relocation>.length(&body.straight.relocations)
   let locations = List<u64>.length(&body.straight.locations)
@@ -2441,6 +2824,24 @@ effect fn closeCurrent(body: &mut Body) -> () ! OutOfMemoryError ? &mut Allocato
   return ()
 }
 
+// Ends the current block's code with deferred `value` on the stack, for the exit to use there.
+// A value pushed before is made a local one, which the exit reads.
+effect fn stackExit(body: &mut Body, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  if value == none() { return () }
+  let current = body.current
+  if current == usize.MAX { return CompilerBug.panic(b"WasmBody: an exit outside a block") }
+  let slot = List<Slot>.get(&body.slots, u64.toUsize(value))
+  if slot.form == formPushed() { return run keepPushed(&mut body.*, value) }
+  if slot.form == formDeferred() {
+    run pushDeferred(&mut body.*, value)
+  } else if !run takeLastSet(&mut body.*, value) {
+    return ()
+  }
+  let pieces = List<Piece>.asMutSlice(&mut body.*.pieces)
+  pieces[current].stacked = true
+  return ()
+}
+
 effect fn setExit(body: &mut Body, exit: u8, value: u64, first: usize, second: usize) -> () ! OutOfMemoryError ? &mut Allocator {
   let current = body.current
   if current == usize.MAX { return CompilerBug.panic(b"WasmBody: an exit outside a block") }
@@ -2463,6 +2864,7 @@ pub effect fn jump(body: &mut Body, target: usize) -> () ! OutOfMemoryError ? &m
 /// Ends the current block with a branch to `onTrue` when `condition` holds, else to `onFalse`.
 pub effect fn branchIf(body: &mut Body, condition: u64, onTrue: usize, onFalse: usize) -> () ! OutOfMemoryError ? &mut Allocator {
   if onTrue == onFalse { return run jump(&mut body.*, onTrue) }
+  run stackExit(&mut body.*, condition)
   return run setExit(&mut body.*, exitBranch(), condition, onTrue, onFalse)
 }
 
@@ -2471,6 +2873,7 @@ pub effect fn branchIf(body: &mut Body, condition: u64, onTrue: usize, onFalse: 
 pub effect fn switch(body: &mut Body, value: u64, cases: &[u64], otherwise: usize) -> () ! OutOfMemoryError ? &mut Allocator {
   let current = body.current
   if current == usize.MAX { return CompilerBug.panic(b"WasmBody: an exit outside a block") }
+  run settle(&mut body.*, value)
   let pieces = List<Piece>.asMutSlice(&mut body.*.pieces)
   run List<u64>.appendSlice(&mut pieces[current].cases, cases)
   return run setExit(&mut body.*, exitSwitch(), value, otherwise, usize.ZERO)
@@ -2478,6 +2881,7 @@ pub effect fn switch(body: &mut Body, value: u64, cases: &[u64], otherwise: usiz
 
 /// Ends the current block by returning `value`, or nothing for `none()`.
 pub effect fn ret(body: &mut Body, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  run stackExit(&mut body.*, value)
   return run setExit(&mut body.*, exitReturn(), value, usize.ZERO, usize.ZERO)
 }
 
@@ -2953,6 +3357,7 @@ effect fn copyPiece(body: &Body, out: &mut Emission, node: usize) -> () ! OutOfM
 // Pushes lane `lane` of `value` into `out`.
 effect fn pushInto(body: &Body, out: &mut Emission, value: u64, lane: usize) -> () ! OutOfMemoryError ? &mut Allocator {
   let slot = List<Slot>.get(&body.slots, u64.toUsize(value))
+  if slot.form == formDeferred() || slot.form == formPushed() { return CompilerBug.panic(b"WasmBody: an exit reads a deferred value") }
   return run pushSlot(&mut out.*, slot, lane, body.wide)
 }
 
@@ -3065,7 +3470,7 @@ effect fn terminate(body: &Body, out: &mut Emission, piece: &Piece, node: usize,
     return run List<Action>.append(&mut actions.*, Action {kind: actionBranch(), first: node, second: blockOfNode(entry, piece.first)})
   }
   if exit == exitBranch() {
-    run pushInto(body, &mut out.*, piece.value, usize.ZERO)
+    if !piece.stacked { run pushInto(body, &mut out.*, piece.value, usize.ZERO) }
     run WasmModule.structured(&mut out.*.code, WasmModule.opIf())
     // The `if` is a label until `actionEndIf` closes it, so branches inside it count it.
     run List<Label>.append(&mut labels.*, Label {kind: labelIf(), block: usize.MAX})
@@ -3093,7 +3498,7 @@ effect fn terminate(body: &Body, out: &mut Emission, piece: &Piece, node: usize,
       run WasmModule.localGet(&mut out.*.code, body.saved)
       run WasmModule.globalSet(&mut out.*.code, usize.ZERO)
     }
-    if piece.value != none() {
+    if piece.value != none() && !piece.stacked {
       let lanes = body.kindOf(piece.value).lanes()
       let mut lane = usize.ZERO
       while lane < lanes {
