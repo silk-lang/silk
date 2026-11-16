@@ -36,6 +36,29 @@ effect fn graph(options: &Options) -> Build
 
 The dependency alias must exist in the manifest. A graph cannot introduce an undeclared package. `Compilation.without(alias)` excludes a declared dependency from that compilation. Dependencies are fetched as selected imports reach them; `silk fetch` downloads all declared pins without evaluating package code.
 
+`when(condition, transform)` on `Compilation`, `Build` and `Run` applies `transform` only when `condition` is true, so a pipeline can branch without rebinding. `transform` is a `once effect fn`, so it may move captured values and fail with the pipeline's errors. A plain lambda that returns the step's Effect fits it, as `|c| c.without("devtools")` does. Write an `effect` lambda when the body runs steps itself or branches. `run` is only allowed inside an `effect` lambda. A named `effect fn` works too. `Plan.when` takes a plain `fn`, because plans are static.
+
+```silk
+import silk.build.graph { Build, Compilation, Options, BuildError }
+import silk.build.step { Deferred }
+import silk.mem.allocator { Allocator }
+import silk.system.filesystem { FileSystem }
+import silk.system.host_input { HostInput }
+
+effect fn graph(options: &Options, devtools: bool, release: bool) -> Build
+  ! BuildError
+  ? &mut Allocator | &mut FileSystem | &mut HostInput {
+  let base = run Compilation.fromPackage(options)
+  let app = run base.when(!devtools, |c| c.without("devtools"))
+  let shipped = run app.when(release, effect |c| {
+    let stripped = run c.debug(run Deferred<bool>.value(false))
+    return run stripped.without("profiler")
+  })
+  let build = run Build.make()
+  return run build.add(move shipped)
+}
+```
+
 ## Completing a graph
 
 - `Compilation.build()` builds one compilation and returns its `Built` result.

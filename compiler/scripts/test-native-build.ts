@@ -364,6 +364,10 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   assert.equal(customPlan.status, 0, customPlan.stderr)
   const customSet = JSON.parse(yield* fs.readFileString(join(aliased, 'build/requests/plan.json')))
   assert.ok(customSet.files.length > 0, 'a child task publishes its pending requests through the parent')
+  // The fixture's `when` lambdas set speed and turn debug information off.
+  const customRequest = yield* fs.readFileString(join(aliased, 'build/requests', customSet.files[0]))
+  assert.match(customRequest, /"optimization" = "speed"/)
+  assert.match(customRequest, /"debug" = false/)
   assert.equal(yield* fs.exists(join(aliased, 'build/requests/.pending-plan.json')), false)
   const argumentsFor = (output: string) => [
     'build',
