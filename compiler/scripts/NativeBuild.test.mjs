@@ -247,7 +247,7 @@ it.layer(NodeServices.layer, { excludeTestServices: true })((it) => {
             const result = yield* fixtureBuild({ ...options, clang: alias })
             assert.strictEqual(result.status, 'failed')
             assert.strictEqual(result.failure.stage, 'native-build')
-            assert.strictEqual(result.stages.length, 2)
+            assert.strictEqual(result.stages.length, 1)
             assert.match(result.failure.message, /changed/)
             assert.strictEqual(result.output.sha256, null)
             assert.strictEqual(existsSync(join(options.outputDirectory, 'smoke')), false)
@@ -294,10 +294,10 @@ it.layer(NodeServices.layer, { excludeTestServices: true })((it) => {
         )
         assert.deepStrictEqual(
           result.stages.map(({ name }) => name),
-          ['native-build-resolve', 'native-build', 'smoke-build', 'smoke-run'],
+          ['native-build', 'smoke-build', 'smoke-run'],
         )
         assert.strictEqual(result.stages[0].command[0], options.producer)
-        assert.strictEqual(result.stages[2].command[0], result.output.path)
+        assert.strictEqual(result.stages[1].command[0], result.output.path)
         assert.strictEqual(
           readFileSync(`${options.producer}.invocations`, 'utf8').split('\n').filter(Boolean)
             .length,
@@ -401,20 +401,19 @@ sleep 60`,
       assert.strictEqual(result.output.sha256, null)
       assert.strictEqual(existsSync(result.output.path), false)
       assert.strictEqual(existsSync(join(options.outputDirectory, 'smoke')), false)
-      assert.deepStrictEqual(stage.command, [
-        options.producer, 'resolve', '--definition', `${result.output.path}.definition.toml`,
-        '--output', `${result.output.path}.request.toml`, '--artifact', result.output.path,
+      assert.deepStrictEqual(stage.command.slice(0, 5), [
+        options.producer, 'build', join(options.snapshot, 'compiler/src/main.silk'), '-o', result.output.path,
       ])
       assert.deepStrictEqual(
-        [...readFileSync(join(options.outputDirectory, 'native-build-resolve-stdout.bin'))],
+        [...readFileSync(join(options.outputDirectory, 'native-build-stdout.bin'))],
         [255, 111, 117, 116],
       )
       assert.deepStrictEqual(
-        [...readFileSync(join(options.outputDirectory, 'native-build-resolve-stderr.bin'))],
+        [...readFileSync(join(options.outputDirectory, 'native-build-stderr.bin'))],
         [254, 101, 114, 114],
       )
       const sidecar = JSON.parse(
-        readFileSync(join(options.outputDirectory, 'native-build-resolve-process-evidence.json'), 'utf8'),
+        readFileSync(join(options.outputDirectory, 'native-build-process-evidence.json'), 'utf8'),
       )
       assert.deepStrictEqual(sidecar.deadline, { timeoutMs: 250, expired: true })
       assert.strictEqual(sidecar.resources.present, false)
@@ -441,7 +440,7 @@ sleep 60`,
           const result = yield* fixtureBuild({ ...options, timeoutMs: 150 })
           assert.strictEqual(result.status, 'failed')
           assert.strictEqual(result.failure.stage, point)
-          assert.strictEqual(result.stages.length, point === 'linker-preflight' ? 0 : 2)
+          assert.strictEqual(result.stages.length, point === 'linker-preflight' ? 0 : 1)
           assert.match(result.failure.message, /cannot read verified clang version/)
           assert.strictEqual(result.output.sha256, null)
           assert.strictEqual(existsSync(join(options.outputDirectory, 'smoke')), false)
@@ -454,7 +453,7 @@ sleep 60`,
     fixture(function* ({ options }) {
       executable(
         options.producer,
-        `mkdir '${join(options.outputDirectory, 'native-build-resolve-stdout.bin')}'\nprintf actual\nprintf refused >&2\nexit 2`,
+        `mkdir '${join(options.outputDirectory, 'native-build-stdout.bin')}'\nprintf actual\nprintf refused >&2\nexit 2`,
       )
       const result = yield* fixtureBuild(options)
       assert.strictEqual(result.status, 'failed')
@@ -465,7 +464,7 @@ sleep 60`,
       assert.strictEqual(result.stages[0].stderr, 'refused')
       assert.match(result.failure.message, /EISDIR|directory|AlreadyExists/)
       assert.strictEqual(
-        existsSync(join(options.outputDirectory, 'native-build-resolve-process-evidence.json')),
+        existsSync(join(options.outputDirectory, 'native-build-process-evidence.json')),
         false,
       )
       assert.strictEqual(existsSync(join(options.outputDirectory, 'smoke')), false)
@@ -530,7 +529,7 @@ sleep 60`,
           executable(options.producer, body)
           const result = yield* fixtureBuild(options)
           assert.strictEqual(result.status, 'failed')
-          assert.strictEqual(result.stages.length, body.startsWith('kill') ? 1 : 2)
+          assert.strictEqual(result.stages.length, 1)
           if (body.startsWith('kill')) assert.strictEqual(result.stages[0].signal, 'SIGTERM')
           else assert.match(result.failure.message, /ENOENT/)
         })
@@ -553,7 +552,7 @@ sleep 60`,
           const result = yield* fixtureBuild(options)
           assert.strictEqual(result.status, 'failed')
           assert.strictEqual(result.failure.stage, index < 2 ? 'smoke-build' : 'smoke-run')
-          assert.strictEqual(result.stages.length, index < 2 ? 3 : 4)
+          assert.strictEqual(result.stages.length, index < 2 ? 2 : 3)
         })
       }
     }),
