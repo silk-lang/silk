@@ -6,7 +6,7 @@ Deterministic content fingerprints for build inputs and completed output trees.
 
 Import as `Fingerprint` with `import silk.build.fingerprint as Fingerprint`.
 
-Public declarations: 4.
+Public declarations: 6.
 
 <a id="field"></a>
 
@@ -43,6 +43,35 @@ pub effect fn path(hash: &mut Sha256, input: &Path, completion: bool) -> ()
 Hashes file contents or a sorted tree, including names and empty directories.
 Symbolic links within the declared root are followed; escaping links and cycles are refused.
 `completion` excludes the root cache marker when verifying completed outputs.
+
+<a id="recorded"></a>
+
+## `recorded`
+
+```silk
+pub effect fn recorded(hash: &mut Sha256, input: &Path, completion: bool, records: &Path) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator
+```
+
+Adds the digest [`path`](#path) computes for `input`, reading file contents only when a file's status
+changed since the digest was recorded under `records`.
+
+The record is named by the status of every file in the tree: device, inode, size, modification
+time and status-change time. A changed, replaced or touched file therefore selects a different
+record and is read again. A host without file status reads the contents every time.
+
+<a id="recordedPackage"></a>
+
+## `recordedPackage`
+
+```silk
+pub effect fn recordedPackage(hash: &mut Sha256, input: &Path, output: &Path, records: &Path) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator
+```
+
+Adds the digest [`package`](#package) computes for `input`, recorded as [`recorded`](#recorded) describes.
 
 <a id="package"></a>
 
