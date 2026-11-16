@@ -87,6 +87,8 @@ export type Phase = 'first' | 'steady'
  * runs is a new process of the same precompiled code.
  */
 export const phases = (engine: string): ReadonlyArray<Phase> => (engine === 'wasmtime' ? ['steady'] : ['steady', 'first'])
+/** The optimizations a benchmark builds, each with both backends. */
+const optimizations = ['speed', 'size'] as const
 
 const reject = (message: string) => new WasmCorpusError({ message, reason: 'RejectedInput' })
 const external = (message: string, cause: unknown) =>
@@ -100,7 +102,7 @@ const buildTimeoutMs = 600_000
 /** Programs whose LLVM time is at or below this are too short for their ratio to mean anything. */
 export const ratioFloorMs = 2
 /** A benchmark runs each build until two runs after the first have taken 200 ms together. */
-export const benchmarkRepeat: WasmEngine.Repeat = { steadyRuns: 2, steadyMs: 200 }
+const benchmarkRepeat: WasmEngine.Repeat = { steadyRuns: 2, steadyMs: 200 }
 /** A profile samples for longer, since a function needs many samples for its share to settle. */
 const profileRepeat: WasmEngine.Repeat = { steadyRuns: 2, steadyMs: 1000 }
 const programModule = 'memory/driver.silk'
@@ -152,11 +154,11 @@ type Measured = Extract<BenchmarkProgram, { builds: unknown }>
 const measured = (program: BenchmarkProgram): program is Measured => 'builds' in program
 
 /** One number of a build, such as a time; undefined where the build has none. */
-export type Pick = (measure: Measure) => number | undefined
+export type Figure = (measure: Measure) => number | undefined
 
 /** A build's time in an engine in one pass, or its least over the passes when no pass is given. */
 export const time =
-  (engine: string, phase: Phase, pass?: number): Pick =>
+  (engine: string, phase: Phase, pass?: number): Figure =>
   (measure) => {
     const timings = measure.timings[engine] ?? []
     const values = (pass === undefined ? timings : timings.slice(pass, pass + 1)).map((timing) =>
@@ -164,53 +166,72 @@ export const time =
     )
     return values.length === 0 ? undefined : Math.min(...values)
   }
-const executedInstructions: Pick = (measure) => measure.executed.instructions
+const executedInstructions: Figure = (measure) => measure.executed.instructions
 
-/** A direct build's number over its LLVM build's, and the LLVM number itself. */
-export interface Ratio {
-  readonly ratio: number
-  readonly llvm: number
-}
-/** The direct build's number over the LLVM build's for one optimization; null where either is missing. */
-export const ratio = (program: BenchmarkProgram, optimization: Optimization, pick: Pick): Ratio | null => {
+/**
+ * The direct build's number over the LLVM build's for one optimization; null where the program
+ * was not measured, either build is missing, or either number is missing or not positive.
+ */
+export const ratio = (program: BenchmarkProgram, optimization: Optimization, figure: Figure): number | null => {
   if (!measured(program)) return null
   const llvmBuild = program.builds[buildKey({ backend: 'llvm', optimization })]
   const directBuild = program.builds[buildKey({ backend: 'direct', optimization })]
-  const llvm = llvmBuild === undefined ? undefined : pick(llvmBuild)
-  const direct = directBuild === undefined ? undefined : pick(directBuild)
+  const llvm = llvmBuild === undefined ? undefined : figure(llvmBuild)
+  const direct = directBuild === undefined ? undefined : figure(directBuild)
   if (llvm === undefined || direct === undefined || llvm <= 0 || direct <= 0) return null
-  return { ratio: direct / llvm, llvm }
-}
-
-/** The direct/LLVM time ratio of each pass, in order, leaving out a pass that lacks either time. */
-const passRatios = (program: BenchmarkProgram, optimization: Optimization, engine: string, phase: Phase): ReadonlyArray<Ratio> => {
-  if (!measured(program)) return []
-  const passes = Math.max(0, ...Object.values(program.builds).map((measure) => measure.timings[engine]?.length ?? 0))
-  return Array.from({ length: passes }, (_, pass) => ratio(program, optimization, time(engine, phase, pass))).filter(
-    (entry) => entry !== null,
-  )
+  return direct / llvm
 }
 
 /**
- * The direct/LLVM time ratio of one program in one engine: the geometric mean of each pass's
- * ratio. A pass times the two builds one right after the other, so what the machine's other work
- * does to both cancels in the pass's ratio, which the ratio of two best times would not ensure.
+ * A program's direct/LLVM time ratio in an engine in each of `passes` passes, in order. Null
+ * unless every pass timed both builds and the LLVM build took longer than `ratioFloorMs`: a
+ * program counts in a pass only if it counts in all of them, so that a mean over programs and the
+ * mean of each pass are taken over the same programs.
  */
-export const timeRatio = (program: BenchmarkProgram, optimization: Optimization, engine: string, phase: Phase): Ratio | null => {
-  const each = passRatios(program, optimization, engine, phase)
-  const mean = geometricMean(each.map((entry) => entry.ratio))
-  return mean === undefined ? null : { ratio: mean, llvm: Math.min(...each.map((entry) => entry.llvm)) }
+export const passRatios = (
+  program: BenchmarkProgram,
+  optimization: Optimization,
+  engine: string,
+  phase: Phase,
+  passes: number,
+): ReadonlyArray<number> | null => {
+  if (!measured(program) || passes < 1) return null
+  const llvm = program.builds[buildKey({ backend: 'llvm', optimization })]
+  const each: Array<number> = []
+  for (let pass = 0; pass < passes; pass++) {
+    const llvmMs = llvm === undefined ? undefined : time(engine, phase, pass)(llvm)
+    const entry = ratio(program, optimization, time(engine, phase, pass))
+    if (llvmMs === undefined || llvmMs <= ratioFloorMs || entry === null) return null
+    each.push(entry)
+  }
+  return each
 }
 
-/** Geometric mean of the programs' direct/LLVM ratios, over those whose LLVM number exceeds `floor`. */
+/**
+ * The direct/LLVM time ratio of one program in one engine: the geometric mean of the ratios
+ * `passRatios` gives, and null where it gives none. A pass times the two builds one right after
+ * the other, so what the machine's other work does to both cancels in the pass's ratio, which the
+ * ratio of two best times would not ensure.
+ */
+export const timeRatio = (
+  program: BenchmarkProgram,
+  optimization: Optimization,
+  engine: string,
+  phase: Phase,
+  passes: number,
+): number | null => {
+  const each = passRatios(program, optimization, engine, phase, passes)
+  return each === null ? null : (geometricMean(each) ?? null)
+}
+
+/** The geometric mean of the programs' ratios that `of` gives, and how many programs have one. */
 export const meanRatio = (
   programs: ReadonlyArray<BenchmarkProgram>,
-  of: (program: BenchmarkProgram) => Ratio | null,
-  floor: number,
+  of: (program: BenchmarkProgram) => number | null,
 ): { readonly mean: number | undefined; readonly count: number } => {
   const ratios = programs.flatMap((program) => {
     const entry = of(program)
-    return entry !== null && entry.llvm > floor ? [entry.ratio] : []
+    return entry === null ? [] : [entry]
   })
   return { mean: geometricMean(ratios), count: ratios.length }
 }
@@ -236,37 +257,40 @@ const between = (things: ReadonlyArray<{ readonly where: string; readonly values
 }
 
 /**
- * How far an engine's times of the same build differ from pass to pass, over builds slower than
- * `ratioFloorMs`. Undefined with fewer than two passes. It measures the machine: a time from
- * another benchmark run differs by this much with no change to the compiler.
+ * How far an engine's times of the same build differ from pass to pass, over builds timed in
+ * every pass and slower than `ratioFloorMs` in each. Undefined with fewer than two passes. It
+ * measures the machine: a time from another benchmark run differs by this much with no change to
+ * the compiler.
  */
-export const timeNoise = (programs: ReadonlyArray<BenchmarkProgram>, engine: string, phase: Phase): Noise | undefined =>
+export const timeNoise = (report: BenchmarkReport, engine: string, phase: Phase): Noise | undefined =>
   between(
-    programs.filter(measured).flatMap((program) =>
+    report.programs.filter(measured).flatMap((program) =>
       Object.entries(program.builds).flatMap(([key, measure]) => {
         const values = (measure.timings[engine] ?? []).map((timing) => (phase === 'first' ? timing.firstMs : timing.steadyMs))
-        return Math.min(...values) > ratioFloorMs ? [{ where: `${program.name} ${key}`, values }] : []
+        return values.length === report.passes && values.every((value) => value > ratioFloorMs)
+          ? [{ where: `${program.name} ${key}`, values }]
+          : []
       }),
     ),
   )
 
 /**
- * How far an engine's direct/LLVM ratio of the same program differs from pass to pass, over
- * programs whose LLVM build is slower than `ratioFloorMs`. Undefined with fewer than two passes.
- * A change in a ratio that is smaller than this is not a result.
+ * How far an engine's direct/LLVM ratio of the same program differs from pass to pass, over the
+ * programs and optimizations that have a ratio in every pass, as `passRatios` decides. Undefined
+ * with fewer than two passes. A change in a ratio that is smaller than this is not a result.
  */
-export const ratioNoise = (programs: ReadonlyArray<BenchmarkProgram>, engine: string, phase: Phase): Noise | undefined =>
+export const ratioNoise = (report: BenchmarkReport, engine: string, phase: Phase): Noise | undefined =>
   between(
-    programs.flatMap((program) =>
-      (['speed', 'size'] as const).flatMap((optimization) => {
-        const each = passRatios(program, optimization, engine, phase)
-        return each.every((entry) => entry.llvm > ratioFloorMs) ? [{ where: `${program.name} ${optimization}`, values: each.map((entry) => entry.ratio) }] : []
+    report.programs.flatMap((program) =>
+      optimizations.flatMap((optimization) => {
+        const each = passRatios(program, optimization, engine, phase, report.passes)
+        return each === null ? [] : [{ where: `${program.name} ${optimization}`, values: each }]
       }),
     ),
   )
 
 const milliseconds = (ms: number): string => (ms < 100 ? ms.toFixed(2) : ms.toFixed(1))
-const times = (value: number | undefined): string => (value === undefined ? '-' : `${value.toFixed(2)}x`)
+const times = (value: number | null | undefined): string => (value === null || value === undefined ? '-' : `${value.toFixed(2)}x`)
 const share = (value: number): string => `${(value * 100).toFixed(1)}%`
 const percent = (before: number, after: number): string => {
   const change = (after / before - 1) * 100
@@ -276,16 +300,17 @@ const row = (cells: ReadonlyArray<string>): string => `| ${cells.join(' | ')} |`
 const rule = (count: number): string => row(Array.from({ length: count }, () => '---'))
 const table = (header: ReadonlyArray<string>, rows: ReadonlyArray<ReadonlyArray<string>>): string =>
   [row(header), rule(header.length), ...rows.map(row)].join('\n')
+/** The label of a mean of time ratios, which counts a program only if `passRatios` gives it ratios. */
+const timeMeanLabel = `geometric mean, LLVM > ${ratioFloorMs} ms in every pass`
 
-const optimizations = ['speed', 'size'] as const
 /** One row per program: a number of each of the four builds, with the direct/LLVM ratio after each pair. */
 const comparisonTable = (
   programs: ReadonlyArray<Measured>,
   unit: string,
-  pick: Pick,
+  figure: Figure,
   show: (value: number) => string,
-  of: (optimization: Optimization) => (program: BenchmarkProgram) => Ratio | null,
-  floor: number,
+  of: (optimization: Optimization) => (program: BenchmarkProgram) => number | null,
+  meanLabel: string,
 ): string =>
   table(
     ['program', ...optimizations.flatMap((optimization) => [`LLVM ${optimization} ${unit}`, `direct ${optimization} ${unit}`, 'ratio'])],
@@ -295,16 +320,16 @@ const comparisonTable = (
         ...optimizations.flatMap((optimization) => [
           ...(['llvm', 'direct'] as const).map((backend) => {
             const measure = program.builds[buildKey({ backend, optimization })]
-            const value = measure === undefined ? undefined : pick(measure)
+            const value = measure === undefined ? undefined : figure(measure)
             return value === undefined ? '-' : show(value)
           }),
-          times(of(optimization)(program)?.ratio),
+          times(of(optimization)(program)),
         ]),
       ]),
       [
-        floor > 0 ? `geometric mean, LLVM > ${floor} ${unit}` : 'geometric mean',
+        meanLabel,
         ...optimizations.flatMap((optimization) => {
-          const mean = meanRatio(programs, of(optimization), floor)
+          const mean = meanRatio(programs, of(optimization))
           return ['', `${mean.count} programs`, times(mean.mean)]
         }),
       ],
@@ -318,20 +343,24 @@ const noiseCell = (noise: Noise | undefined): string =>
  * The headline of a benchmark as markdown. For each engine, for steady state and for the first
  * run: the geometric mean of the programs' direct/LLVM time ratios, with the least and greatest
  * mean of a single pass when there are several, and how far ratios and times lie apart between
- * passes. Then the same mean for executed instructions, which no pass changes.
+ * passes. Every mean of one cell is over the same programs, those `passRatios` gives ratios for,
+ * so the headline lies within the range of the passes. Then the same mean for executed
+ * instructions, which no pass changes.
  */
 export const summaryTable = (report: BenchmarkReport): string => {
   const programs = report.programs.filter(measured)
   const mean = (optimization: Optimization, engine: string, phase: Phase): string => {
-    const all = meanRatio(programs, (program) => timeRatio(program, optimization, engine, phase), ratioFloorMs)
-    const each = Array.from({ length: report.passes }, (_, pass) =>
-      meanRatio(programs, (program) => ratio(program, optimization, time(engine, phase, pass)), ratioFloorMs).mean,
+    const all = meanRatio(programs, (program) => timeRatio(program, optimization, engine, phase, report.passes))
+    const each = Array.from(
+      { length: report.passes },
+      (_, pass) =>
+        meanRatio(programs, (program) => passRatios(program, optimization, engine, phase, report.passes)?.[pass] ?? null).mean,
     ).filter((value) => value !== undefined)
     const range = each.length < 2 ? '' : ` (${times(Math.min(...each))} to ${times(Math.max(...each))})`
     return `${times(all.mean)}${range}, ${all.count} programs`
   }
   const instructions = (optimization: Optimization): string => {
-    const all = meanRatio(programs, (program) => ratio(program, optimization, executedInstructions), 0)
+    const all = meanRatio(programs, (program) => ratio(program, optimization, executedInstructions))
     return `${times(all.mean)}, ${all.count} programs`
   }
   return table(
@@ -343,8 +372,8 @@ export const summaryTable = (report: BenchmarkReport): string => {
           phase === 'first' ? 'first run' : 'steady state',
           mean('speed', engine, phase),
           mean('size', engine, phase),
-          noiseCell(ratioNoise(programs, engine, phase)),
-          noiseCell(timeNoise(programs, engine, phase)),
+          noiseCell(ratioNoise(report, engine, phase)),
+          noiseCell(timeNoise(report, engine, phase)),
         ]),
       ),
       ['executed instructions', '', instructions('speed'), instructions('size'), 'none', 'none'],
@@ -354,7 +383,8 @@ export const summaryTable = (report: BenchmarkReport): string => {
 
 /**
  * The benchmark as markdown: the summary, then per engine each program's least steady-state time
- * with direct/LLVM ratios, then executed instructions, module sizes and function counts.
+ * over the passes with its direct/LLVM time ratio, then executed instructions, module sizes and
+ * function counts, then the programs that were not measured and why.
  */
 export const benchmarkTable = (report: BenchmarkReport): string => {
   const programs = report.programs.filter(measured)
@@ -366,8 +396,8 @@ export const benchmarkTable = (report: BenchmarkReport): string => {
         'ms',
         time(engine, 'steady'),
         milliseconds,
-        (optimization) => (program) => timeRatio(program, optimization, engine, 'steady'),
-        ratioFloorMs,
+        (optimization) => (program) => timeRatio(program, optimization, engine, 'steady', report.passes),
+        timeMeanLabel,
       )}`,
     )
   sections.push(
@@ -377,7 +407,7 @@ export const benchmarkTable = (report: BenchmarkReport): string => {
       executedInstructions,
       String,
       (optimization) => (program) => ratio(program, optimization, executedInstructions),
-      0,
+      'geometric mean',
     )}`,
   )
   sections.push(
@@ -392,19 +422,20 @@ export const benchmarkTable = (report: BenchmarkReport): string => {
       ]),
     ),
   )
-  const failed = report.programs.filter((program) => !measured(program))
-  if (failed.length > 0)
-    sections.push(['Not measured:', ...failed.map((program) => `- ${program.name}: ${'error' in program ? program.error : ''}`)].join('\n'))
+  const failed = report.programs.flatMap((program) => ('error' in program ? [program] : []))
+  if (failed.length > 0) sections.push(['Not measured:', ...failed.map((program) => `- ${program.name}: ${program.error}`)].join('\n'))
   return `${sections.join('\n\n')}\n`
 }
 
 /**
- * What changed since an earlier benchmark, as markdown. Times of two benchmark runs cannot be
- * compared, since the machine's other work moves them, so per engine both reports timed this
- * shows each program's steady-state direct/LLVM ratio before and after; a change is marked `~`
- * when a pass of one report had a ratio within the other's passes, which makes it noise as far as
- * the two reports can tell. Then, exactly, each build's executed instructions and each direct
- * build's module size.
+ * What changed since an earlier benchmark, as markdown, over the programs both reports measured.
+ * Times of two benchmark runs cannot be compared, since the machine's other work moves them, so
+ * per engine both reports timed this shows each program's steady-state direct/LLVM ratio before
+ * and after; a change is marked `~` when a pass of one report had a ratio within the other's
+ * passes, which makes it noise as far as the two reports can tell. A program without a ratio in
+ * every pass of both reports, as `passRatios` decides, shows `-`. Then, exactly, each build's
+ * executed instructions and each direct build's module size, and the programs and engines the
+ * earlier benchmark did not measure.
  */
 export const changeTable = (before: BenchmarkReport, after: BenchmarkReport): string => {
   const earlier = new Map(before.programs.filter(measured).map((program) => [program.name, program]))
@@ -422,16 +453,13 @@ export const changeTable = (before: BenchmarkReport, after: BenchmarkReport): st
   for (const engine of after.engines.filter((name) => before.engines.includes(name))) {
     const cells = optimizations.map((optimization) =>
       pairs.map(({ old, now }) => {
-        const was = timeRatio(old, optimization, engine, 'steady')
-        const is = timeRatio(now, optimization, engine, 'steady')
-        if (was === null || is === null) return { text: '-', change: undefined }
-        const from = passRatios(old, optimization, engine, 'steady').map((entry) => entry.ratio)
-        const to = passRatios(now, optimization, engine, 'steady').map((entry) => entry.ratio)
+        const from = passRatios(old, optimization, engine, 'steady', before.passes)
+        const to = passRatios(now, optimization, engine, 'steady', after.passes)
+        const was = from === null ? undefined : geometricMean(from)
+        const is = to === null ? undefined : geometricMean(to)
+        if (from === null || to === null || was === undefined || is === undefined) return { text: '-', change: undefined }
         const overlap = Math.min(...from) <= Math.max(...to) && Math.min(...to) <= Math.max(...from)
-        return {
-          text: change(was.ratio, is.ratio, times, overlap ? '~' : ''),
-          change: Math.min(was.llvm, is.llvm) > ratioFloorMs ? is.ratio / was.ratio : undefined,
-        }
+        return { text: change(was, is, times, overlap ? '~' : ''), change: is / was }
       }),
     )
     sections.push(
@@ -439,21 +467,21 @@ export const changeTable = (before: BenchmarkReport, after: BenchmarkReport): st
         ['program', ...optimizations.map((optimization) => `${optimization} builds`)],
         [
           ...pairs.map(({ name }, position) => [name, ...cells.map((column) => column[position]?.text ?? '-')]),
-          [`geometric mean, LLVM > ${ratioFloorMs} ms`, ...cells.map((column) => meanChange(column.map((cell) => cell.change)))],
+          [timeMeanLabel, ...cells.map((column) => meanChange(column.map((cell) => cell.change)))],
         ],
       )}`,
     )
   }
   const directs = benchmarkBuilds.filter((build) => build.backend === 'direct')
-  const bytes: Pick = (measure) => measure.bytes
+  const bytes: Figure = (measure) => measure.bytes
   const columns = [
-    ...benchmarkBuilds.map((build) => ({ build, pick: executedInstructions, name: 'instructions' })),
-    ...directs.map((build) => ({ build, pick: bytes, name: 'bytes' })),
+    ...benchmarkBuilds.map((build) => ({ build, figure: executedInstructions, name: 'instructions' })),
+    ...directs.map((build) => ({ build, figure: bytes, name: 'bytes' })),
   ]
   const numbers = (column: (typeof columns)[number], pair: (typeof pairs)[number]) => {
     const was = pair.old.builds[buildKey(column.build)]
     const is = pair.now.builds[buildKey(column.build)]
-    return { was: was && column.pick(was), is: is && column.pick(is) }
+    return { was: was && column.figure(was), is: is && column.figure(is) }
   }
   sections.push(
     table(
@@ -480,8 +508,10 @@ export const changeTable = (before: BenchmarkReport, after: BenchmarkReport): st
       ],
     ),
   )
-  const absent = after.programs.filter((program) => !earlier.has(program.name)).map((program) => program.name)
-  if (absent.length > 0) sections.push(`Not in the earlier benchmark: ${absent.join(', ')}`)
+  const unmeasured = after.programs.filter((program) => measured(program) && !earlier.has(program.name)).map((program) => program.name)
+  if (unmeasured.length > 0) sections.push(`Not measured in the earlier benchmark: ${unmeasured.join(', ')}`)
+  const untimed = after.engines.filter((name) => !before.engines.includes(name))
+  if (untimed.length > 0) sections.push(`Not timed in the earlier benchmark: ${untimed.join(', ')}`)
   return `${sections.join('\n\n')}\n`
 }
 
@@ -694,7 +724,7 @@ interface Built {
 }
 
 const v8 = (engine: WasmEngine.V8Engine | WasmEngine.Wasmtime): engine is WasmEngine.V8Engine => typeof engine === 'string'
-export const engineName = (engine: WasmEngine.V8Engine | WasmEngine.Wasmtime): string => (v8(engine) ? engine : 'wasmtime')
+const engineName = (engine: WasmEngine.V8Engine | WasmEngine.Wasmtime): string => (v8(engine) ? engine : 'wasmtime')
 
 /** Builds and runs each run of one program; never fails, since every outcome is a result. */
 export const checkProgram = Effect.fn('WasmCorpus.checkProgram')(function* (
@@ -1056,11 +1086,12 @@ const writeJson = Effect.fnUntraced(function* (path: string, value: unknown) {
 
 const usage = `usage:
   node compiler/scripts/WasmCorpus.ts corpus --compiler <silkc> [--backend direct|llvm] [--optimization none|speed|size]
-       [--only a,b] [--jobs N] [--json <file>] [--baseline <earlier corpus json>]
+       [--only a,b] [--jobs N] [--stdlib <dir>] [--json <file>] [--baseline <earlier corpus json>]
   node compiler/scripts/WasmCorpus.ts bench --compiler <silkc> [--engines ${WasmEngine.engines.join(',')}]
-       [--wasmtime <wasmtime>] [--passes N] [--only a,b] [--jobs N] [--json <file>] [--baseline <earlier bench json>]
+       [--wasmtime <wasmtime>] [--passes N] [--only a,b] [--jobs N] [--stdlib <dir>] [--json <file>]
+       [--baseline <earlier bench json>]
   node compiler/scripts/WasmCorpus.ts profile --compiler <silkc> [--only a,b] [--optimization speed|size]
-       [--engine ${WasmEngine.v8Engines.join('|')}] [--top N] [--jobs N] [--json <file>]`
+       [--engine ${WasmEngine.v8Engines.join('|')}] [--top N] [--jobs N] [--stdlib <dir>] [--json <file>]`
 
 const positive = (text: string, option: string) => {
   const value = Number(text)
@@ -1070,41 +1101,61 @@ const among = <A extends string>(text: string, choices: ReadonlyArray<A>, option
   const found = choices.find((choice) => choice === text)
   return found === undefined ? Effect.fail(reject(`--${option} must be one of ${choices.join(', ')}`)) : Effect.succeed(found)
 }
+/** A comma-separated list of distinct, nonempty names. */
+const names = (text: string, option: string) => {
+  const list = text.split(',')
+  const repeated = list.filter((name, at) => list.indexOf(name) !== at)
+  if (list.some((name) => name === '')) return Effect.fail(reject(`--${option} has an empty name`))
+  if (repeated.length > 0) return Effect.fail(reject(`--${option} repeats ${repeated.join(', ')}`))
+  return Effect.succeed(list)
+}
+
+const options = {
+  compiler: { type: 'string' },
+  stdlib: { type: 'string' },
+  jobs: { type: 'string' },
+  json: { type: 'string' },
+  only: { type: 'string' },
+  baseline: { type: 'string' },
+  backend: { type: 'string' },
+  optimization: { type: 'string' },
+  engines: { type: 'string' },
+  wasmtime: { type: 'string' },
+  passes: { type: 'string' },
+  engine: { type: 'string' },
+  top: { type: 'string' },
+} as const
+/** The options each mode reads; any other is a mistake, such as `--engine` for `--engines`. */
+const modeOptions: Readonly<Record<'corpus' | 'bench' | 'profile', ReadonlyArray<keyof typeof options>>> = {
+  corpus: ['compiler', 'stdlib', 'jobs', 'json', 'only', 'baseline', 'backend', 'optimization'],
+  bench: ['compiler', 'stdlib', 'jobs', 'json', 'only', 'baseline', 'engines', 'wasmtime', 'passes'],
+  profile: ['compiler', 'stdlib', 'jobs', 'json', 'only', 'optimization', 'engine', 'top'],
+}
 
 const cli = Effect.gen(function* () {
   const { values, positionals } = yield* Effect.try({
-    try: () =>
-      parseArgs({
-        allowPositionals: true,
-        options: {
-          compiler: { type: 'string' },
-          stdlib: { type: 'string', default: join(Corpus.repositoryRoot, 'stdlib') },
-          backend: { type: 'string', default: 'direct' },
-          optimization: { type: 'string', default: 'speed' },
-          only: { type: 'string' },
-          jobs: { type: 'string', default: '2' },
-          engines: { type: 'string' },
-          wasmtime: { type: 'string' },
-          passes: { type: 'string', default: '2' },
-          engine: { type: 'string', default: 'v8-baseline' },
-          top: { type: 'string', default: '12' },
-          json: { type: 'string' },
-          baseline: { type: 'string' },
-        },
-      }),
+    try: () => parseArgs({ allowPositionals: true, options }),
     catch: (cause) => reject(`${cause instanceof Error ? cause.message : String(cause)}\n${usage}`),
   })
   const [mode, ...rest] = positionals
   if ((mode !== 'corpus' && mode !== 'bench' && mode !== 'profile') || rest.length > 0 || values.compiler === undefined)
     return yield* reject(usage)
-  const toolchain = { compiler: resolve(values.compiler), stdlib: resolve(values.stdlib) }
-  const jobs = yield* positive(values.jobs, 'jobs')
-  const all = Corpus.programNames('native')
-  const only = values.only?.split(',').filter(Boolean)
+  const stray = Object.keys(values).filter((name) => !modeOptions[mode].some((option) => option === name))
+  if (stray.length > 0) return yield* reject(`the ${mode} mode does not take ${stray.map((name) => `--${name}`).join(', ')}\n${usage}`)
+  const toolchain = {
+    compiler: resolve(values.compiler),
+    stdlib: resolve(values.stdlib ?? join(Corpus.repositoryRoot, 'stdlib')),
+  }
+  const jobs = yield* positive(values.jobs ?? '2', 'jobs')
+  const all = yield* Effect.try({
+    try: () => Corpus.programNames('native'),
+    catch: (cause) => external('cannot list the corpus programs', cause),
+  })
+  const only = values.only === undefined ? undefined : yield* names(values.only, 'only')
   const fs = yield* FileSystem.FileSystem
   if (mode === 'corpus') {
-    const backend = yield* among(values.backend, ['direct', 'llvm'], 'backend')
-    const optimization = yield* among(values.optimization, ['none', 'speed', 'size'], 'optimization')
+    const backend = yield* among(values.backend ?? 'direct', ['direct', 'llvm'], 'backend')
+    const optimization = yield* among(values.optimization ?? 'speed', ['none', 'speed', 'size'], 'optimization')
     const unknown = (only ?? []).filter((name) => !all.includes(name))
     if (unknown.length > 0) return yield* reject(`not corpus programs: ${unknown.join(', ')}`)
     const before = values.baseline === undefined ? undefined : yield* readJson(values.baseline, CorpusFile)
@@ -1127,34 +1178,34 @@ const cli = Effect.gen(function* () {
   const track = yield* validateTrack(text, all)
   const unknown = (only ?? []).filter((name) => !track.includes(name))
   if (unknown.length > 0) return yield* reject(`not in the benchmark track: ${unknown.join(', ')}`)
+  const programs = only ?? track
   if (mode === 'profile') {
-    const optimization = yield* among(values.optimization, ['speed', 'size'], 'optimization')
-    const engine = yield* among(values.engine, WasmEngine.v8Engines, 'engine')
-    const top = yield* positive(values.top, 'top')
-    const report = yield* Effect.scoped(profile(toolchain, only ?? track, optimization, engine, jobs))
+    const optimization = yield* among(values.optimization ?? 'speed', ['speed', 'size'], 'optimization')
+    const engine = yield* among(values.engine ?? 'v8-baseline', WasmEngine.v8Engines, 'engine')
+    const top = yield* positive(values.top ?? '12', 'top')
+    const report = yield* Effect.scoped(profile(toolchain, programs, optimization, engine, jobs))
     yield* Console.log(`\n${profileTable(report, top)}`)
     if (values.json !== undefined) yield* writeJson(values.json, report)
     if (report.programs.some((program) => 'error' in program)) yield* Effect.sync(() => { process.exitCode = 1 })
     return
   }
-  const passes = yield* positive(values.passes, 'passes')
+  const passes = yield* positive(values.passes ?? '2', 'passes')
   // Every V8 configuration by default, and Wasmtime when the command says where it is.
-  const named = values.engines?.split(',').filter(Boolean) ?? [
-    ...WasmEngine.v8Engines,
-    ...(values.wasmtime === undefined ? [] : ['wasmtime']),
-  ]
-  if (named.length === 0) return yield* reject('--engines names no engine')
-  if (named.includes('wasmtime') && values.wasmtime === undefined) return yield* reject('the wasmtime engine needs --wasmtime <wasmtime>')
+  const named =
+    values.engines === undefined
+      ? [...WasmEngine.v8Engines, ...(values.wasmtime === undefined ? [] : (['wasmtime'] as const))]
+      : yield* Effect.forEach(yield* names(values.engines, 'engines'), (name) => among(name, WasmEngine.engines, 'engines'))
+  const wasmtimePath = values.wasmtime === undefined ? undefined : resolve(values.wasmtime)
+  if (named.includes('wasmtime') && wasmtimePath === undefined) return yield* reject('the wasmtime engine needs --wasmtime <wasmtime>')
+  if (!named.includes('wasmtime') && wasmtimePath !== undefined) return yield* reject('--wasmtime is for the wasmtime engine, which --engines leaves out')
   const before = values.baseline === undefined ? undefined : yield* readJson(values.baseline, BenchmarkFile)
+  if (before !== undefined && !before.programs.some((program) => measured(program) && programs.includes(program.name)))
+    return yield* reject(`${values.baseline} measured none of the programs to benchmark`)
   const report = yield* Effect.scoped(
     Effect.gen(function* () {
-      const wasmtime = named.includes('wasmtime') && values.wasmtime !== undefined ? yield* WasmEngine.wasmtime(resolve(values.wasmtime)) : undefined
-      const engines = yield* Effect.forEach(named, (name) =>
-        among(name, WasmEngine.engines, 'engines').pipe(
-          Effect.flatMap((engine) => (engine !== 'wasmtime' ? Effect.succeed(engine) : wasmtime === undefined ? Effect.fail(reject(usage)) : Effect.succeed(wasmtime))),
-        ),
-      )
-      return yield* benchmark(toolchain, only ?? track, engines, passes, jobs)
+      const wasmtime = wasmtimePath === undefined ? undefined : yield* WasmEngine.wasmtime(wasmtimePath)
+      const engines = named.flatMap((name) => (name !== 'wasmtime' ? [name] : wasmtime === undefined ? [] : [wasmtime]))
+      return yield* benchmark(toolchain, programs, engines, passes, jobs)
     }),
   )
   yield* Console.log(`\n${benchmarkTable(report)}`)
