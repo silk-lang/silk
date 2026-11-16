@@ -1550,6 +1550,65 @@ effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryEr
 
 Tests a length in characters, or a pattern.
 
+<a id="Box.impl.Schema"></a>
+
+## Implementation `Schema for Box<T>`
+
+```silk
+impl<T: Schema> Schema for Box<T>
+```
+
+<a id="Box.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns the contained schema's value kind and expected description.
+
+<a id="Box.impl.Schema.read"></a>
+
+### Operation `read`
+
+```silk
+effect fn read<R: SchemaReader>(reader: &mut R) -> Box<T> ! Issue | OutOfMemoryError ? &mut Allocator
+```
+
+Reads and allocates the contained value, with the schema and errors of `T`.
+
+<a id="Box.impl.Schema.write"></a>
+
+### Operation `write`
+
+```silk
+effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W)
+    -> () ! Issue | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator
+```
+
+Writes the contained value without an extra object or field.
+
+<a id="Box.impl.Schema.shape"></a>
+
+### Operation `shape`
+
+```silk
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self> ! OutOfMemoryError ? &mut Allocator
+```
+
+Returns the shape of the contained value, without an extra object or field.
+
+<a id="Box.impl.Schema.satisfies"></a>
+
+### Operation `satisfies`
+
+```silk
+effect fn satisfies(self: &Self, constraint: Constraint) -> bool ! OutOfMemoryError ? &mut Allocator
+```
+
+Tests a constraint against the contained value.
+
 <a id="Option.impl.Schema"></a>
 
 ## Implementation `Schema for Option<T>`

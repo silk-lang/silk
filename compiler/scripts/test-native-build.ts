@@ -54,10 +54,11 @@ const invoke = Effect.fnUntraced(function* (
   cwd: string,
   env: NodeJS.ProcessEnv = process.env,
   timeout = 30_000,
+  input?: string,
 ): Effect.fn.Return<SpawnSyncReturns<string>, VerificationError> {
   return yield* Effect.try({
     try: () => {
-      const ran = spawnSync(command, args, { cwd, env, encoding: 'utf8', timeout })
+      const ran = spawnSync(command, args, { cwd, env, encoding: 'utf8', timeout, input })
       settleCaches(cwd)
       return ran
     },
@@ -90,6 +91,29 @@ const program = Effect.gen(function* () {
   yield* fs.chmod(sentinel, 0o755)
   // The standard library supplies the catalog runtime that roots the build.
   const standardLibrary = join(repository, 'stdlib')
+  // Explicit requests must ignore even malformed manifests and build scripts, while resolving
+  // package aliases, supplied parameters, generated modules, and native translation units.
+  const requestRoot = join(directory, 'request-fixture')
+  yield* fs.makeDirectory(requestRoot, { recursive: true })
+  yield* fs.copy(join(repository, 'compiler/fixtures/compilation-request'), requestRoot, { overwrite: true })
+  yield* fs.rename(join(requestRoot, 'silk.toml.invalid'), join(requestRoot, 'silk.toml'))
+  yield* fs.rename(join(requestRoot, 'build.silk.invalid'), join(requestRoot, 'build.silk'))
+  const requestText = (yield* fs.readFileString(join(requestRoot, 'request.toml')))
+    .replaceAll('/REQUEST_ROOT', requestRoot).replaceAll('/STDLIB_ROOT', standardLibrary)
+  const requestFile = join(requestRoot, 'request.toml')
+  yield* fs.writeFileString(requestFile, requestText)
+  const requestEnv = { ...process.env, SILK_CLANG: clang }
+  const requested = yield* invoke(silk, ['compile', '--request', requestFile], requestRoot, requestEnv, 120_000)
+  assert.equal(requested.status, 0, requested.stderr)
+  const requestOutput = join(requestRoot, 'program')
+  const requestBytes = yield* fs.readFile(requestOutput)
+  const requestRan = yield* invoke(requestOutput, [], requestRoot)
+  assert.equal(requestRan.status, 0, requestRan.stderr)
+  const pipedRequest = yield* invoke(silk, ['compile', '--request', '-'], requestRoot, requestEnv, 120_000, requestText)
+  assert.equal(pipedRequest.status, 0, pipedRequest.stderr)
+  assert.deepEqual(yield* fs.readFile(requestOutput), requestBytes, 'request file and stdin must emit identical artifacts')
+  const wrongVersion = yield* invoke(silk, ['compile', '--request', '-'], requestRoot, requestEnv, 30_000, requestText.replace('version = 1', 'version = 2'))
+  assert.equal(wrongVersion.status, 2, wrongVersion.stderr)
   const argumentsFor = (output: string) => [
     'build',
     'main.silk',
@@ -3363,6 +3387,11 @@ const program = Effect.gen(function* () {
     },
   )
   assert.equal(bound.status, 7, bound.stderr)
+  const boundRequest = join(directory, 'bound/build/llvm/x86_64-unknown-linux-gnu/debug/requests/bound.toml')
+  const replayedBound = yield* invoke(silk, ['compile', '--request', boundRequest], directory, { ...process.env, SILK_CLANG: clang })
+  assert.equal(replayedBound.status, 0, replayedBound.stderr)
+  const replayedProgram = yield* invoke(join(dirname(boundRequest), '../bound'), [], directory)
+  assert.equal(replayedProgram.status, 7, replayedProgram.stderr)
   const boundProfile = yield* invoke(
     silk,
     ['run', '--profile', 'small', '--stdlib', standardLibrary],
