@@ -101,16 +101,19 @@ case "$(uname -s)" in
     ;;
 esac
 cmake -S "$source/llvm" -B "$build" "${flags[@]}"
-ninja -C "$build" -j "$jobs" llvm-driver clang-resource-headers
+ninja -C "$build" -j "$jobs" llvm-driver llvm-link clang-resource-headers
 
 mkdir -p "$output/bin"
 output=$(cd "$output" && native_pwd)
 cp "$build/bin/llvm$suffix" "$output/bin/llvm$suffix"
+cp "$build/bin/llvm-link$suffix" "$output/bin/llvm-link$suffix"
 # An MSVC executable keeps its symbols in a separate PDB already.
 if [ -z "$suffix" ]; then strip "$output/bin/llvm" 2> /dev/null || strip -x "$output/bin/llvm"; fi
+if [ -z "$suffix" ]; then strip "$output/bin/llvm-link" 2> /dev/null || strip -x "$output/bin/llvm-link"; fi
 major=$(sed -n 's/^ *set(LLVM_VERSION_MAJOR \([0-9]*\)).*/\1/p' "$source/cmake/Modules/LLVMVersion.cmake")
 mkdir -p "$output/lib/clang/$major"
 cp -R "$build/lib/clang/$major/include" "$output/lib/clang/$major/include"
 cp "$source/llvm/LICENSE.TXT" "$output/LICENSE.TXT"
 "$output/bin/llvm$suffix" clang --version
 "$output/bin/llvm$suffix" llvm-rc /? > /dev/null
+"$output/bin/llvm-link$suffix" --version
