@@ -1,0 +1,575 @@
+//! Read MessagePack data as a sequence of tokens, without building a tree and without allocating.
+//!
+//! # When to use
+//! Use [`MsgpackScanner`] to read MessagePack bytes that are in one slice, token by token, when you
+//! do not need a tree. To get a tree, use `silk.msgpack.value.Msgpack.parse`. To read your own
+//! types, use `silk.schema.msgpack.SchemaMsgpack.decode`.
+//!
+//! # Details
+//! Each call of [`MsgpackScanner.next`] reads one value header. A scalar is complete in its token.
+//! An [`MsgpackToken.Array`] token is followed by the tokens of `count` values, and an
+//! [`MsgpackToken.Map`] token by the tokens of `count` keys, each followed by its value. The scanner
+//! does not track that nesting; the caller counts.
+//!
+//! Integers of every width become [`MsgpackToken.Integer`], or [`MsgpackToken.Unsigned`] above the
+//! largest `i64`. A 32-bit float is widened to `f64`. A string or binary token gives a
+//! [`MsgpackSpan`] of its payload in the input; the UTF-8 of a string is checked. All offsets are
+//! byte offsets from the start of the input.
+//!
+//! # Errors
+//! - [`MsgpackError`] with a [`MsgpackReason`] and the offset of the problem. After an error, the
+//!   scanner cannot continue. Make a new one.
+//!
+//! # Gotchas
+//! The scanner does not limit nesting and does not check for duplicate map keys. An extension
+//! value, such as a timestamp (type -1), is returned as its type and payload, not interpreted.
+//!
+//! # Examples
+//! ## Sum the integers of an array
+//! ```silk
+//! import silk.core.result { Result }
+//! import silk.msgpack.scanner { MsgpackError, MsgpackScanner, MsgpackToken }
+//!
+//! fn sum(input: &[u8]) -> i64 {
+//!   let mut scanner = MsgpackScanner.make(input)
+//!   let mut total: i64 = 0
+//!   while true {
+//!     match move MsgpackScanner.next(&mut scanner) {
+//!       Result<MsgpackToken, MsgpackError>.Failure {..} => {
+//!         return -1
+//!       }
+//!       Result<MsgpackToken, MsgpackError>.Success { value } => match move value {
+//!         MsgpackToken.Integer { value: number } => {
+//!           total = total + number
+//!         }
+//!         MsgpackToken.EndOfInput => {
+//!           return total
+//!         }
+//!         _ => {}
+//!       }
+//!     }
+//!   }
+//!   return total
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   // An array of 3 elements: 1, 200 (as a `uint 8`) and 5.
+//!   if sum(b"\x93\x01\xcc\xc8\x05") != 206 {
+//!     return 1
+//!   }
+//!   // The array says 3 elements but the input ends after one.
+//!   if sum(b"\x93\x01") != -1 {
+//!     return 2
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! @category Data formats
+
+import silk.collections.slice { Slice }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.io.writer { Writer, WriterError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.i64
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+import silk.text.format { Debug, Format, Formatter }
+import silk.text.string { InvalidUtf8, String }
+
+/// The largest number of arrays and maps that `silk.msgpack.value.Msgpack.parse` and
+/// `silk.schema.msgpack.SchemaMsgpack` accept nested in one another: 64.
+pub const MAX_DEPTH: usize = 64
+
+/// A range of bytes in the input: the payload of a string, binary or extension value.
+pub struct MsgpackSpan {
+  /// The offset of the first byte.
+  pub offset: usize,
+  /// The number of bytes.
+  pub length: usize,
+}
+
+impl Copy for MsgpackSpan {}
+
+/// The cause of a [`MsgpackError`].
+pub enum MsgpackReason {
+  /// The input ends inside a value, or an array or map says it has more elements than the input
+  /// has bytes left.
+  UnexpectedEnd,
+  /// A value starts with the byte `0xc1`, which MessagePack never uses.
+  ReservedByte,
+  /// A string is not valid UTF-8.
+  InvalidUtf8,
+  /// More bytes follow the one value that the input must hold.
+  TrailingBytes,
+  /// More than [`MAX_DEPTH`] (64) arrays and maps are nested.
+  DepthExceeded,
+  /// A string, binary value, extension payload, array or map is longer than MessagePack can
+  /// write: more than 4294967295 bytes or elements.
+  TooLong,
+}
+
+impl Debug for MsgpackReason {
+  /// Writes the name of the variant, such as `UnexpectedEnd`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return match &self.* {
+      MsgpackReason.UnexpectedEnd => run Format.write(&mut formatter, b"UnexpectedEnd")
+      MsgpackReason.ReservedByte => run Format.write(&mut formatter, b"ReservedByte")
+      MsgpackReason.InvalidUtf8 => run Format.write(&mut formatter, b"InvalidUtf8")
+      MsgpackReason.TrailingBytes => run Format.write(&mut formatter, b"TrailingBytes")
+      MsgpackReason.DepthExceeded => run Format.write(&mut formatter, b"DepthExceeded")
+      MsgpackReason.TooLong => run Format.write(&mut formatter, b"TooLong")
+    }
+  }
+}
+
+/// A MessagePack error: the cause and the byte position where it occurred.
+pub struct MsgpackError {
+  /// The cause of the error.
+  pub reason: MsgpackReason,
+  /// The byte position of the problem in the input. An error from writing, which has no input,
+  /// uses 0.
+  pub offset: usize,
+}
+
+impl Copy for MsgpackError {}
+
+impl Debug for MsgpackError {
+  /// Writes the fields, as `MsgpackError { reason: ..., offset: ... }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return run Format.debugFields(self, "MsgpackError", &mut formatter)
+  }
+}
+
+/// One MessagePack token: a complete scalar, or the header of an array or a map.
+pub union MsgpackToken {
+  /// `nil`.
+  Nil,
+  /// `true` or `false`.
+  Boolean {
+    /// The value.
+    pub value: bool,
+  },
+  /// An integer that fits in `i64`, whatever width it was written in.
+  Integer {
+    /// The value.
+    pub value: i64,
+  },
+  /// An integer above the largest `i64`, written as a `uint 64`.
+  Unsigned {
+    /// The value.
+    pub value: u64,
+  },
+  /// A `float 64`, or a `float 32` widened to `f64`.
+  Float {
+    /// The value.
+    pub value: f64,
+  },
+  /// A string. Its UTF-8 is checked.
+  String {
+    /// The range of the text in the input, without the header.
+    pub span: MsgpackSpan,
+  },
+  /// Binary data.
+  Binary {
+    /// The range of the data in the input, without the header.
+    pub span: MsgpackSpan,
+  },
+  /// The start of an array. The tokens of `count` values follow.
+  Array {
+    /// The number of elements.
+    pub count: usize,
+  },
+  /// The start of a map. The tokens of `count` keys follow, each followed by its value.
+  Map {
+    /// The number of key and value pairs.
+    pub count: usize,
+  },
+  /// An extension value, such as a timestamp (type -1). It is not interpreted.
+  Extension {
+    /// The extension type. MessagePack reserves the negative types.
+    pub kind: i8,
+    /// The range of the payload in the input, without the header and the type.
+    pub span: MsgpackSpan,
+  },
+  /// The input has no more bytes. Later reads also return it.
+  EndOfInput,
+}
+
+impl Copy for MsgpackToken {}
+
+/// A reader of the MessagePack tokens of one slice.
+///
+/// # When to use
+///
+/// Use it to read MessagePack without a tree: call [`MsgpackScanner.next`] until it returns
+/// `MsgpackToken.EndOfInput`.
+///
+/// # Details
+///
+/// The scanner borrows the input and holds only its position, so [`MsgpackScanner.fork`] is cheap.
+/// It reads values one after another and does not require the input to be one value; the caller
+/// decides what follows a complete value.
+///
+/// # Gotchas
+///
+/// After an error, the scanner cannot continue. Make a new one.
+pub struct MsgpackScanner<'input> {
+  input: &'input [u8],
+  cursor: usize,
+  tokenOffset: usize,
+  pending: MsgpackToken,
+  hasPending: bool,
+}
+
+fn failure(reason: MsgpackReason, offset: usize) -> Result<MsgpackToken, MsgpackError> {
+  return Result<MsgpackToken, MsgpackError>.failResult(
+    MsgpackError { reason: reason, offset: offset },
+  )
+}
+
+fn success(token: MsgpackToken) -> Result<MsgpackToken, MsgpackError> {
+  return Result<MsgpackToken, MsgpackError>.succeed(token)
+}
+
+// The big-endian unsigned integer in the `width` bytes of `input` at `at`. The caller checked
+// that they exist.
+fn unsignedAt(input: &[u8], at: usize, width: usize) -> u64 {
+  let mut value: u64 = 0
+  let mut index = usize.ZERO
+  while index < width {
+    value = value * 256 + u8.toU64(input[at + index])
+    index = index + usize.ONE
+  }
+  return value
+}
+
+// The two's complement integer in the low `width` bytes of `raw`.
+fn signedOf(raw: u64, width: usize) -> i64 {
+  if width == 8 {
+    return u64.wrappingToI64(raw)
+  }
+  let half: u64 = if width == 1 {
+    128
+  } else if width == 2 {
+    32768
+  } else {
+    2147483648
+  }
+  if raw < half {
+    return u64.toI64(raw)
+  }
+  return u64.toI64(raw) - u64.toI64(half) - u64.toI64(half)
+}
+
+impl<'input> MsgpackScanner<'input> {
+  /// Returns a scanner at the start of `input`.
+  pub fn make(input: &'input [u8]) -> MsgpackScanner<'input> {
+    return MsgpackScanner<'input> {
+      input: input,
+      cursor: usize.ZERO,
+      tokenOffset: usize.ZERO,
+      pending: MsgpackToken.EndOfInput,
+      hasPending: false,
+    }
+  }
+
+  /// Returns the next token, or `EndOfInput` when no bytes are left.
+  ///
+  /// # Details
+  ///
+  /// A string, binary or extension token is returned only when its whole payload is in the input.
+  /// An array or map token is returned only when the input has at least one byte left for each
+  /// element it counts, so `count` is never larger than the input.
+  ///
+  /// # Errors
+  ///
+  /// - `MsgpackError` with `UnexpectedEnd` if the input ends inside the value, `ReservedByte` for
+  ///   the byte `0xc1`, or `InvalidUtf8` for a string that is not UTF-8. The scanner cannot
+  ///   continue.
+  pub fn next(self: &mut MsgpackScanner<'input>) -> Result<MsgpackToken, MsgpackError> {
+    if self.hasPending {
+      self.hasPending = false
+      return success(self.pending)
+    }
+    let input = self.input
+    let at = self.cursor
+    self.tokenOffset = at
+    if at >= input.length {
+      return success(MsgpackToken.EndOfInput)
+    }
+    let lead = input[at]
+    let body = at + usize.ONE
+    if lead <= 127 {
+      self.cursor = body
+      return success(MsgpackToken.Integer { value: u8.toI64(lead) })
+    }
+    if lead >= 224 {
+      self.cursor = body
+      return success(MsgpackToken.Integer { value: u8.toI64(lead) - 256 })
+    }
+    if lead <= 143 {
+      return self.container(body, u8.toUsize(lead - 128), true)
+    }
+    if lead <= 159 {
+      return self.container(body, u8.toUsize(lead - 144), false)
+    }
+    if lead <= 191 {
+      return self.payload(body, u8.toUsize(lead - 160), Payload.Text, 0)
+    }
+    if lead == 192 {
+      self.cursor = body
+      return success(MsgpackToken.Nil)
+    }
+    if lead == 193 {
+      return failure(MsgpackReason.ReservedByte, at)
+    }
+    if lead == 194 || lead == 195 {
+      self.cursor = body
+      return success(MsgpackToken.Boolean { value: lead == 195 })
+    }
+
+    // bin 8, bin 16, bin 32
+    if lead <= 198 {
+      return self.sized(body, widthOf(lead - 196), Payload.Binary)
+    }
+
+    // ext 8, ext 16, ext 32
+    if lead <= 201 {
+      return self.sized(body, widthOf(lead - 199), Payload.Extension)
+    }
+    if lead == 202 {
+      if input.length - body < 4 {
+        return failure(MsgpackReason.UnexpectedEnd, input.length)
+      }
+      self.cursor = body + 4
+      let single = f32.fromBits(u64.toU32(unsignedAt(input, body, 4)))
+      return success(MsgpackToken.Float { value: f32.toF64(single) })
+    }
+    if lead == 203 {
+      if input.length - body < 8 {
+        return failure(MsgpackReason.UnexpectedEnd, input.length)
+      }
+      self.cursor = body + 8
+      return success(MsgpackToken.Float { value: f64.fromBits(unsignedAt(input, body, 8)) })
+    }
+
+    // uint 8 to uint 64, then int 8 to int 64
+    if lead <= 211 {
+      let signed = lead >= 208
+      let width = if signed {
+        widthOf(lead - 208)
+      } else {
+        widthOf(lead - 204)
+      }
+      if input.length - body < width {
+        return failure(MsgpackReason.UnexpectedEnd, input.length)
+      }
+      self.cursor = body + width
+      let raw = unsignedAt(input, body, width)
+      if signed {
+        return success(MsgpackToken.Integer { value: signedOf(raw, width) })
+      }
+      if raw > 9223372036854775807 {
+        return success(MsgpackToken.Unsigned { value: raw })
+      }
+      return success(MsgpackToken.Integer { value: u64.toI64(raw) })
+    }
+
+    // fixext 1, 2, 4, 8 and 16: the type, then the payload
+    if lead <= 216 {
+      if input.length - body < usize.ONE {
+        return failure(MsgpackReason.UnexpectedEnd, input.length)
+      }
+      return self.payload(body + usize.ONE, widthOf(lead - 212), Payload.Extension, input[body])
+    }
+
+    // str 8, str 16, str 32
+    if lead <= 219 {
+      return self.sized(body, widthOf(lead - 217), Payload.Text)
+    }
+
+    // array 16, array 32, map 16, map 32
+    let map = lead >= 222
+    let width: usize = if lead == 220 || lead == 222 {
+      2
+    } else {
+      4
+    }
+    if input.length - body < width {
+      return failure(MsgpackReason.UnexpectedEnd, input.length)
+    }
+    let count = unsignedAt(input, body, width)
+    if count > usize.toU64(input.length) {
+      return failure(MsgpackReason.UnexpectedEnd, input.length)
+    }
+    return self.container(body + width, u64.toUsize(count), map)
+  }
+
+  /// Returns the next token without consuming it. The next call of `next` returns the same token.
+  ///
+  /// # Errors
+  ///
+  /// - `MsgpackError` with `UnexpectedEnd` if the input ends inside the value, `ReservedByte` for
+  ///   the byte `0xc1`, or `InvalidUtf8` for a string that is not UTF-8. The scanner cannot
+  ///   continue.
+  pub fn peek(self: &mut MsgpackScanner<'input>) -> Result<MsgpackToken, MsgpackError> {
+    if self.hasPending {
+      return success(self.pending)
+    }
+    let result = MsgpackScanner.next(&mut self.*)
+    match move result {
+      Result<MsgpackToken, MsgpackError>.Failure { error } => {
+        return Result<MsgpackToken, MsgpackError>.failResult(error)
+      }
+      Result<MsgpackToken, MsgpackError>.Success { value } => {
+        self.pending = value
+        self.hasPending = true
+        return success(value)
+      }
+    }
+  }
+
+  /// Returns a scanner at the same position as `self`, which reads the same tokens next without
+  /// moving `self`.
+  ///
+  /// # When to use
+  ///
+  /// Use it to look ahead more than one token, such as to find a key of a map before reading the
+  /// entries before it.
+  pub fn fork(self: &MsgpackScanner<'input>) -> MsgpackScanner<'input> {
+    return MsgpackScanner<'input> {
+      input: self.input,
+      cursor: self.cursor,
+      tokenOffset: self.tokenOffset,
+      pending: self.pending,
+      hasPending: self.hasPending,
+    }
+  }
+
+  /// Returns the byte offset of the last token that `next` or `peek` returned: the offset of its
+  /// first header byte. Use it for errors.
+  pub fn offset(self: &MsgpackScanner<'input>) -> usize {
+    return self.tokenOffset
+  }
+
+  /// Returns the byte offset after the last token that `next` or `peek` returned: after the
+  /// payload of a scalar, or after the header of an array or a map.
+  pub fn end(self: &MsgpackScanner<'input>) -> usize {
+    return self.cursor
+  }
+
+  /// Returns the length of the input in bytes.
+  pub fn length(self: &MsgpackScanner<'input>) -> usize {
+    return self.input.length
+  }
+
+  /// Returns the input bytes of `span`, such as the UTF-8 of a string token or the data of a
+  /// binary token.
+  ///
+  /// # Gotchas
+  ///
+  /// Traps if `span` is not inside the input. A span from a token of this scanner always is.
+  pub fn slice(self: &MsgpackScanner<'input>, span: MsgpackSpan) -> &'input [u8] {
+    return Slice.view<u8>(self.input, span.offset, span.length)
+  }
+
+  // A value whose header holds its payload length in `width` bytes at `at`.
+  fn sized(self: &mut MsgpackScanner<'input>, at: usize, width: usize, shape: Payload) -> Result<
+    MsgpackToken,
+    MsgpackError
+  > {
+    let input = self.input
+
+    // An extension has one more header byte: its type.
+    let header = match shape {
+      Payload.Extension => width + usize.ONE
+      _ => width
+    }
+    if input.length - at < header {
+      return failure(MsgpackReason.UnexpectedEnd, input.length)
+    }
+    let length = unsignedAt(input, at, width)
+    if length > usize.toU64(input.length) {
+      return failure(MsgpackReason.UnexpectedEnd, input.length)
+    }
+    let kind = match shape {
+      Payload.Extension => input[at + width]
+      _ => 0
+    }
+    return self.payload(at + header, u64.toUsize(length), shape, kind)
+  }
+
+  // A string, binary or extension token whose `length` payload bytes start at `start`.
+  fn payload(
+    self: &mut MsgpackScanner<'input>,
+    start: usize,
+    length: usize,
+    shape: Payload,
+    kind: u8,
+  ) -> Result<MsgpackToken, MsgpackError> {
+    if self.input.length - start < length {
+      return failure(MsgpackReason.UnexpectedEnd, self.input.length)
+    }
+    let span = MsgpackSpan { offset: start, length: length }
+    self.cursor = start + length
+    return match shape {
+      Payload.Binary => success(MsgpackToken.Binary { span: span })
+      Payload.Extension => success(
+        MsgpackToken.Extension { kind: u8.wrappingToI8(kind), span: span },
+      )
+      Payload.Text => match String.fromUtf8(Slice.view<u8>(self.input, start, length)) {
+        Result<string, InvalidUtf8>.Success { .. } => success(MsgpackToken.String { span: span })
+        Result<string, InvalidUtf8>.Failure { .. } => failure(MsgpackReason.InvalidUtf8, start)
+      }
+    }
+  }
+
+  // An array or map header that ends at `after` and counts `count` elements or pairs. Each
+  // element takes at least one byte, so a larger count cannot be complete.
+  fn container(self: &mut MsgpackScanner<'input>, after: usize, count: usize, map: bool) -> Result<
+    MsgpackToken,
+    MsgpackError
+  > {
+    let left = self.input.length - after
+    if (map && count > left / 2) || (!map && count > left) {
+      return failure(MsgpackReason.UnexpectedEnd, self.input.length)
+    }
+    self.cursor = after
+    if map {
+      return success(MsgpackToken.Map { count: count })
+    }
+    return success(MsgpackToken.Array { count: count })
+  }
+}
+
+// What the payload of a sized value is.
+enum Payload {
+  Text,
+  Binary,
+  Extension,
+}
+
+// 1, 2, 4, 8 or 16 for `index` 0 to 4: the widths of a family of formats, in format order.
+fn widthOf(index: u8) -> usize {
+  if index == 0 {
+    return 1
+  }
+  if index == 1 {
+    return 2
+  }
+  if index == 2 {
+    return 4
+  }
+  if index == 3 {
+    return 8
+  }
+  return 16
+}
