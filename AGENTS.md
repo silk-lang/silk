@@ -55,7 +55,8 @@ behavior, data format, build artifact, or internal representation is a compatibi
   public API in ordinary Silk source. Keep validation, policy, generic selection, provider types,
   and reusable wrappers in the standard library.
 - Use `service` for runtime-provided Effect contracts and lexical provider replacement. Use
-  `interface` for compile-time conformance and specialization only.
+  `interface` for compile-time conformance and specialization only. Explicit `&any I` references
+  keep interfaces compile-time by dispatching among the concrete witnesses selected by the build.
 
 ## Text and bytes
 

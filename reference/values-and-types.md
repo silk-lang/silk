@@ -1844,6 +1844,9 @@ parameter, its result or its failure. A service operation that requires its own 
 receives its provider that way, so a union provides a service whose members all do. A call on the
 union runs the active member's operation with the remaining arguments unchanged.
 
+A written `&any I` lets the build collect the member types from explicit borrow conversions.
+See [ANY-001](generics-interfaces-and-specialization.md#any-001-borrowing-a-reference-only-interface).
+
 ```silk
 import silk.mem.allocator { OutOfMemoryError }
 import silk.text.format { Format }
