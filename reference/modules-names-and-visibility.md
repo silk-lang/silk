@@ -1289,6 +1289,49 @@ such as one written as a `[dependencies.<name>]` table.
 [manifest schema](../stdlib/silk/build/manifest.schema.json),
 [native build contract](../compiler/scripts/test-native-build.ts).
 
+### PACKAGE-009 — `silk.local.toml` swaps packages for local checkouts
+
+**Status:** Confirmed; implemented in the native compiler.
+
+A `silk.local.toml` names local checkouts that a build reads in place of the packages its
+manifests pin. It sits beside the root package's `silk.toml`, or else beside the root manifest of
+the root package's workspace (PACKAGE-007), and holds one table, `[overrides]`, keyed by package
+name. Each entry is `{ path = "..." }`, the directory of the checkout's `silk.toml`, relative to the
+file.
+
+```toml
+# silk.local.toml, next to the workspace's silk.toml; keep it out of version control
+[overrides]
+css = { path = "../css" }
+```
+
+Every dependency on an overridden package, anywhere in the graph and whatever its source (`git`,
+`url` or `path`), reads the checkout instead. A dependency asks for the package its entry, or the
+workspace entry it takes, names with `package`, and otherwise for its own name. Nothing is fetched
+for an overridden package, so it builds offline before its commit exists anywhere. Because every
+dependent reads the one checkout, the build holds one copy of the package (PACKAGE-004). The
+checkout's own dependencies are read from its manifest, and overrides apply to them too. Its
+warnings are reported with the root package's, as a path dependency's are.
+
+`silk build`, `check`, `test`, `run` and `task` print `silk: note: <file> overrides <package> with
+<path>` for each override the file writes, before their work. `silk init` ignores `/silk.local.toml` in the `.gitignore` it
+writes, and `silk pack` leaves the file out of a package archive.
+
+**Boundary:** Only the root's file counts: a `silk.local.toml` of a dependency is never read. An
+override that no dependency asks for is not used. A checkout of another version is accepted; the
+override is the root's choice. The file changes nothing in any manifest, so removing it restores
+the pinned graph.
+
+**Diagnostics:** These are invalid-manifest errors that exit with status 2 and give the line of
+`silk.local.toml` at fault: a file that is not valid TOML, a table other than `[overrides]`, an
+entry other than `{ path = "..." }`, a path with no `silk.toml`, and a checkout whose
+`[package].name` is not the overridden package.
+
+**Evidence:** [package dependency loading](../compiler/src/driver/Packages.silk),
+[pack archives](../compiler/src/driver/PackArchive.silk),
+[project initialization](../compiler/src/driver/ProjectInitializer.silk),
+[native build contract](../compiler/scripts/test-native-build.ts).
+
 ## Implementation evidence
 
 The compiler closes modules only through parsed imports, keeps catalog declarations out of source
