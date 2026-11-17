@@ -1027,8 +1027,9 @@ pub union Value {
   /// instance without MIR, of which nothing is known), and the instances it calls with their
   /// encodings in order. Nothing else of the body is in it, so an edit that keeps all three does
   /// not lower the callers that read it again.
-  /// `looped` says the body is inlined only at a call inside a loop (`MirInline.onlyInLoops`).
-  InlineSummary {pub inlinable: bool, pub looped: bool, pub suspends: bool, pub callees: List<InstanceKey>, pub encodings: Bytes},
+  /// `directive` is the body's inlining directive (`MirInline.directive`) and `size` its own
+  /// size (`MirInline.size`), from which a caller works out what a call of it would bring in.
+  InlineSummary {pub inlinable: bool, pub directive: usize, pub size: usize, pub suspends: bool, pub callees: List<InstanceKey>, pub encodings: Bytes},
   /// The position of a target layout answer in this store's immutable answer arena.
   Layout {pub index: usize},
   /// This target-neutral type has no layout in the current backend subset.
@@ -2744,6 +2745,11 @@ struct Resolver {
   // Which lowered functions `releaseStaleMir` emptied, by index, and how many.
   mirReleased: List<bool>,
   mirReleasedCount: usize,
+  // The coalesced copy of each un-inlined function a caller read for inlining (`coalescedMir`):
+  // its position in `coalescedValues` by `mirValues` index, or `usize.MAX`. Every caller that
+  // inlines a function reads the same copy, so it is made once.
+  coalescedIndex: List<usize>,
+  coalescedValues: List<MirFunction>,
   layoutValues: List<Shared<BackendLayout>>,
   // The instance-text content of each layout value, encoded on first supply; empty until then.
   layoutContents: List<Bytes>,
@@ -9097,9 +9103,10 @@ fn fingerprintValue(writer: &mut AnswerFingerprint.Writer, value: &Value) -> () 
     Value.ProfileInput {slot} => { AnswerFingerprint.count(&mut writer.*, slot) }
     Value.LayoutUnsupported => {}
     Value.Initializer {value: published, ..} => { StaticValue.fingerprint(&mut writer.*, &published) }
-    Value.InlineSummary {inlinable, looped, suspends, callees, encodings} => {
+    Value.InlineSummary {inlinable, directive, size, suspends, callees, encodings} => {
       AnswerFingerprint.flag(&mut writer.*, inlinable)
-      AnswerFingerprint.flag(&mut writer.*, looped)
+      AnswerFingerprint.count(&mut writer.*, directive)
+      AnswerFingerprint.count(&mut writer.*, size)
       AnswerFingerprint.flag(&mut writer.*, suspends)
       AnswerFingerprint.count(&mut writer.*, List<InstanceKey>.length(&callees))
       AnswerFingerprint.text(&mut writer.*, Bytes.asSlice(&encodings))
@@ -80484,31 +80491,127 @@ struct InlineExpansion {
 // a cancel exit and its body is no longer inlinable, while the ordinary function would have
 // spliced it. Nothing a quiet body reaches suspends, so its MIR is the same under any facts and
 // both make the same decision. The calls a quiet body makes stay calls in the caller.
-struct InlineVerdict {
-  key: InstanceKey,
-  // `InstanceKey.runtimeHash` of `key`, compared before the keys are.
-  hash: u64,
-  quiet: bool,
-  // The body is inlined only at a call inside a loop of its caller (`MirInline.onlyInLoops`).
-  looped: bool,
+struct InlineVerdicts {
+  instances: InstanceTable,
+  quiet: List<bool>,
+  // Each body's inlining directive (`MirInline.directive`).
+  directives: List<usize>,
 }
 
-// Whether the quiet callee `selected`, whose verdict `verdicts` holds, is inlined only at a call
-// inside a loop.
-effect fn onlyInLoops(verdicts: &List<InlineVerdict>, selected: &InstanceKey) -> bool ! OutOfMemoryError ? &mut Allocator {
-  let known = List<InlineVerdict>.asSlice(verdicts)
-  let hash = InstanceKey.runtimeHash(selected)
-  let mut at = usize.ZERO
-  while at < known.length {
-    if known[at].hash == hash && run InstanceKey.sameInstance(&known[at].key, selected) { return known[at].looped }
-    at = at + usize.ONE
+// Instances, each found by its `InstanceKey.runtimeHash` at the position it was added, so a
+// function with thousands of calls looks one up without walking the rest.
+struct InstanceTable {
+  lookup: InternIndex,
+  keys: List<InstanceKey>,
+}
+
+impl InstanceTable {
+  fn make() -> InstanceTable { return InstanceTable {lookup: InternIndex.make(), keys: List<InstanceKey>.make()} }
+
+  // The position of `key`, whose hash is `hash`, or `usize.MAX`.
+  effect fn find(self: &Self, hash: u64, key: &InstanceKey) -> usize ! OutOfMemoryError ? &mut Allocator {
+    let mut at = InternIndex.first(&self.lookup, hash)
+    while at != usize.MAX {
+      if run InstanceKey.sameInstance(&List<InstanceKey>.asSlice(&self.keys)[at], key) { return at }
+      at = InternIndex.after(&self.lookup, at)
+    }
+    return usize.MAX
   }
-  return false
+
+  // Adds `key`, whose hash is `hash` and which must not be there yet; answers its position.
+  effect fn add(self: &mut Self, hash: u64, key: &InstanceKey) -> usize ! OutOfMemoryError ? &mut Allocator {
+    let position = List<InstanceKey>.length(&self.keys)
+    run List<InstanceKey>.append(&mut self.keys, InstanceKey.copy(key))
+    run InternIndex.record(&mut self.lookup, hash)
+    return position
+  }
+
+  // Adds `key` unless it is there.
+  effect fn note(self: &mut Self, key: &InstanceKey) -> () ! OutOfMemoryError ? &mut Allocator {
+    let hash = InstanceKey.runtimeHash(key)
+    if (run self.find(hash, key)) == usize.MAX { drop run self.add(hash, key) }
+    return ()
+  }
 }
 
 // The most instances a quiet body's calls may reach before it counts as not quiet: each one is
 // a summary the caller reads and depends on.
 fn quietReach() -> usize { return 256 }
+
+// The directive of the quiet callee `selected`, whose verdict `verdicts` holds.
+effect fn verdictDirective(verdicts: &InlineVerdicts, selected: &InstanceKey) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let at = run verdicts.instances.find(InstanceKey.runtimeHash(selected), selected)
+  if at == usize.MAX { return usize.ZERO }
+  return List<usize>.get(&verdicts.directives, at)
+}
+
+// The expanded sizes worked out so far in one function's inlining, by instance, with each
+// instance's directive.
+struct Expansions {
+  instances: InstanceTable,
+  sizes: List<usize>,
+  directives: List<usize>,
+}
+
+// An instance's expanded size and directive; the size is `usize.MAX` for one that is not
+// inlinable.
+struct Expansion {
+  size: usize,
+  directive: usize,
+}
+
+impl Copy for Expansion {}
+
+// The expanded size of `selected`: its own body's size and, for each call the body makes of an
+// inlinable instance whose expanded size its directive allows at an ordinary call, that size in
+// turn less the call it replaces (`MirInline.callSized`), as inlining the body would bring those
+// in after it. A call back into `chain`, the
+// instances being expanded, stays a call. The sum stops at `MirInline.expansionCap`.
+effect fn expandedSize(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut List<Dependency>,
+  selected: &InstanceKey, observing: bool, facts: &Option<CoroutineFacts>, chain: &mut List<u64>, known: &mut Expansions) -> Expansion
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let hash = InstanceKey.runtimeHash(selected)
+  let found = run known.instances.find(hash, selected)
+  if found != usize.MAX { return Expansion {size: List<usize>.get(&known.sizes, found), directive: List<usize>.get(&known.directives, found)} }
+  let mut size = usize.MAX
+  let mut directive = usize.ZERO
+  if let Option<InlineFacts>.Some {value: summary} = move run inlineFacts(&mut resolver.*, &mut owner.*, &mut dependencies.*, selected,
+    observing, facts) {
+    directive = summary.directive
+    if summary.inlinable {
+      size = summary.size
+      run List<u64>.append(&mut chain.*, hash)
+      let callees = move summary.callees
+      let listed = List<InstanceKey>.asSlice(&callees)
+      let mut each = usize.ZERO
+      while each < listed.length && size <= MirInline.expansionCap {
+        let calledHash = InstanceKey.runtimeHash(&listed[each])
+        let mut recursive = false
+        let mut link = usize.ZERO
+        while link < List<u64>.length(&chain.*) {
+          if List<u64>.get(&chain.*, link) == calledHash { recursive = true }
+          link = link + usize.ONE
+        }
+        if !recursive {
+          let called = run expandedSize(&mut resolver.*, &mut owner.*, &mut dependencies.*, &listed[each], observing, facts, &mut chain.*,
+            &mut known.*)
+          if called.size != usize.MAX && called.size <= MirInline.expandedLimit(called.directive, false, resolver.directSize)
+            && called.size <= MirInline.expansionCap {
+            // The body takes the place of its call.
+            if called.size > MirInline.callSized { size = size + called.size - MirInline.callSized }
+          }
+        }
+        each = each + usize.ONE
+      }
+      drop List<u64>.pop(&mut chain.*)
+      if size > MirInline.expansionCap { size = MirInline.expansionCap + usize.ONE }
+    }
+  }
+  drop run known.instances.add(hash, selected)
+  run List<usize>.append(&mut known.*.sizes, size)
+  run List<usize>.append(&mut known.*.directives, directive)
+  return Expansion {size: size, directive: directive}
+}
 
 // Summarizes the un-inlined MIR of the instance `key` names (`Family.InlineSummary`).
 effect fn resolveInlineSummary(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, key: Key) -> Answer
@@ -80517,13 +80620,15 @@ effect fn resolveInlineSummary(resolver: &mut Resolver, owner: &mut Query<Answer
   let lowered = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies, Key {family: Family.Mir, module: key.module,
     declaration: key.declaration, member: key.member, name: key.name, external: false}, Span.make(usize.ZERO, usize.ZERO))
   let mut inlinable = false
-  let mut looped = false
+  let mut directive = usize.ZERO
+  let mut size = usize.ZERO
   let mut suspends = true
   let mut callees = List<InstanceKey>.make()
   let mut encodings = Bytes.make()
-  if let Option<MirFunction>.Some {value: function} = move run coalescedMir(&resolver.*, &lowered) {
+  if let Option<MirFunction>.Some {value: function} = move run coalescedMir(&mut resolver.*, &lowered) {
     inlinable = MirInline.inlinable(&function)
-    looped = MirInline.onlyInLoops(&function)
+    directive = MirInline.directive(&function)
+    size = MirInline.size(&function)
     suspends = false
     if let Option.Some {..} = &function.suspension { suspends = true }
     if let Option.Some {..} = &function.parks { suspends = true }
@@ -80538,7 +80643,8 @@ effect fn resolveInlineSummary(resolver: &mut Resolver, owner: &mut Query<Answer
       at = at + usize.ONE
     }
   }
-  return memberSuccess(Value.InlineSummary {inlinable: inlinable, looped: looped, suspends: suspends, callees: move callees, encodings: move encodings},
+  return memberSuccess(Value.InlineSummary {inlinable: inlinable, directive: directive, size: size, suspends: suspends, callees: move callees,
+    encodings: move encodings},
     move dependencies)
 }
 
@@ -80547,7 +80653,8 @@ effect fn resolveInlineSummary(resolver: &mut Resolver, owner: &mut Query<Answer
 // has no place in the source.
 struct InlineFacts {
   inlinable: bool,
-  looped: bool,
+  directive: usize,
+  size: usize,
   suspends: bool,
   callees: List<InstanceKey>,
 }
@@ -80570,14 +80677,16 @@ effect fn inlineFacts(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejec
     return usize.ZERO
   })
   let mut inlinable = false
-  let mut looped = false
+  let mut directive = usize.ZERO
+  let mut size = usize.ZERO
   let mut suspends = true
   let mut present = false
   Shared<Result<Answer, NoRejection>>.with<()>(&answer, |held: &Result<Answer, NoRejection>| -> () {
     if let Result<Answer, NoRejection>.Success {value} = &held.* {
-      if let Outcome.Success {value: Value.InlineSummary {inlinable: candidate, looped: inLoops, suspends: suspending, ..}} = &value.outcome {
+      if let Outcome.Success {value: Value.InlineSummary {inlinable: candidate, directive: asked, size: own, suspends: suspending, ..}} = &value.outcome {
         inlinable = candidate
-        looped = inLoops
+        directive = asked
+        size = own
         suspends = suspending
         present = true
       }
@@ -80599,7 +80708,7 @@ effect fn inlineFacts(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejec
     if let Option<InstanceKey>.Some {value} = move key { run List<InstanceKey>.append(&mut callees, move value) }
     at = at + usize.ONE
   }
-  return Option<InlineFacts>.some(InlineFacts {inlinable: inlinable, looped: looped, suspends: suspends, callees: move callees})
+  return Option<InlineFacts>.some(InlineFacts {inlinable: inlinable, directive: directive, size: size, suspends: suspends, callees: move callees})
 }
 
 // Whether an answer holds the source construction that its own ordinary unit needs.
@@ -80612,17 +80721,26 @@ fn answerMirConstruction(answer: &Result<Answer, NoRejection>) -> bool {
 
 // An inline decision and a splice read the same coalesced body as storage used to retain.
 // Only this temporary view is coalesced; the raw query keeps one construction for its own caller.
-effect fn coalescedMir(resolver: &Resolver, answer: &Shared<Result<Answer, NoRejection>>) -> Option<MirFunction>
+effect fn coalescedMir(resolver: &mut Resolver, answer: &Shared<Result<Answer, NoRejection>>) -> Option<MirFunction>
 ! OutOfMemoryError ? &mut Allocator | &mut Types {
   let index = match move Shared<Result<Answer, NoRejection>>.with<Option<usize>>(answer, answerMirIndex) {
     Option<usize>.Some {value} => value
     Option<usize>.None => { return Option<MirFunction>.none() }
   }
-  let mut function = run MirInline.copy(&List<MirFunction>.asSlice(&resolver.mirValues)[index])
-  if Shared<Result<Answer, NoRejection>>.with<bool>(answer, answerMirConstruction) {
-    run MirCoalesce.coalesce(&mut function)
+  if !Shared<Result<Answer, NoRejection>>.with<bool>(answer, answerMirConstruction) {
+    return Option<MirFunction>.some(run MirInline.copy(&List<MirFunction>.asSlice(&resolver.mirValues)[index]))
   }
-  return Option<MirFunction>.some(move function)
+  // A stored function never changes, so its coalesced copy is made once and copied from then on.
+  while List<usize>.length(&resolver.coalescedIndex) <= index { run List<usize>.append(&mut resolver.coalescedIndex, usize.MAX) }
+  let mut held = List<usize>.get(&resolver.coalescedIndex, index)
+  if held == usize.MAX {
+    let mut function = run MirInline.copy(&List<MirFunction>.asSlice(&resolver.mirValues)[index])
+    run MirCoalesce.coalesce(&mut function)
+    held = List<MirFunction>.length(&resolver.coalescedValues)
+    run List<MirFunction>.append(&mut resolver.coalescedValues, move function)
+    List<usize>.set(&mut resolver.coalescedIndex, index, held)
+  }
+  return Option<MirFunction>.some(run MirInline.copy(&List<MirFunction>.asSlice(&resolver.coalescedValues)[held]))
 }
 
 // The coalesced, un-inlined MIR of `selected`, with its raw query recorded as a dependency;
@@ -80634,7 +80752,7 @@ effect fn rawMir(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>
     Option<Shared<Result<Answer, NoRejection>>>.Some {value} => move value
     Option<Shared<Result<Answer, NoRejection>>>.None => { return Option<MirFunction>.none() }
   }
-  return run coalescedMir(&resolver.*, &answer)
+  return run coalescedMir(&mut resolver.*, &answer)
 }
 
 effect fn rawMirAnswer(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut List<Dependency>,
@@ -80651,48 +80769,27 @@ effect fn rawMirAnswer(resolver: &mut Resolver, owner: &mut Query<Answer, NoReje
   return Option<Shared<Result<Answer, NoRejection>>>.some(move answer)
 }
 
-// The instances a finished walk of `quietBody` reached, none of which reaches a suspending one,
-// each with its `InstanceKey.runtimeHash`.
-struct Settled {
-  hashes: List<u64>,
-  keys: List<InstanceKey>,
-}
-
-// Whether `key` is one of `keys`.
-effect fn amongInstances(keys: &List<InstanceKey>, key: &InstanceKey) -> bool ! OutOfMemoryError ? &mut Allocator {
-  let listed = List<InstanceKey>.asSlice(keys)
-  let mut at = usize.ZERO
-  while at < listed.length {
-    if run InstanceKey.sameInstance(&listed[at], key) { return true }
-    at = at + usize.ONE
-  }
-  return false
-}
 
 // Whether `selected` may be inlined at a call that is not a suspension point: it is inlinable and
-// quiet (`InlineVerdict`). The walk follows the callees each summary lists and stops at an
+// quiet (`InlineVerdicts`). The walk follows the callees each summary lists and stops at an
 // instance that suspends, one without a summary, or more than `quietReach` instances. Every
 // verdict is a property of `selected` alone; `verdicts` keeps each one, and `settled` every
 // instance a finished walk reached, none of which reaches a suspending one.
 effect fn quietBody(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut List<Dependency>,
-  selected: &InstanceKey, observing: bool, facts: &Option<CoroutineFacts>, settled: &mut Settled,
-  verdicts: &mut List<InlineVerdict>) -> bool
+  selected: &InstanceKey, observing: bool, facts: &Option<CoroutineFacts>, settled: &mut InstanceTable,
+  verdicts: &mut InlineVerdicts) -> bool
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
-  let known = List<InlineVerdict>.asSlice(&verdicts.*)
   let selectedHash = InstanceKey.runtimeHash(selected)
-  let mut at = usize.ZERO
-  while at < known.length {
-    if known[at].hash == selectedHash && run InstanceKey.sameInstance(&known[at].key, selected) { return known[at].quiet }
-    at = at + usize.ONE
-  }
+  let known = run verdicts.instances.find(selectedHash, selected)
+  if known != usize.MAX { return List<bool>.get(&verdicts.quiet, known) }
   let mut quiet = false
-  let mut looped = false
+  let mut directive = usize.ZERO
   let mut reached = List<InstanceKey>.make()
   let mut reachedHashes = List<u64>.make()
   if let Option<InlineFacts>.Some {value: summary} = move run inlineFacts(&mut resolver.*, &mut owner.*, &mut dependencies.*, selected,
     observing, facts) {
     quiet = summary.inlinable && !summary.suspends
-    looped = summary.looped
+    directive = summary.directive
     run List<InstanceKey>.append(&mut reached, InstanceKey.copy(selected))
     run List<u64>.append(&mut reachedHashes, selectedHash)
     let mut pending = move summary.callees
@@ -80700,7 +80797,7 @@ effect fn quietBody(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejecti
       let last = List<InstanceKey>.length(&pending) - usize.ONE
       let next = List<InstanceKey>.remove(&mut pending, last)
       let nextHash = InstanceKey.runtimeHash(&next)
-      let mut seen = run hashedAmong(&settled.hashes, &settled.keys, nextHash, &next)
+      let mut seen = (run settled.find(nextHash, &next)) != usize.MAX
       if !seen { seen = run hashedAmong(&reachedHashes, &reached, nextHash, &next) }
       if seen { continue }
       if List<InstanceKey>.length(&reached) >= quietReach() {
@@ -80727,14 +80824,17 @@ effect fn quietBody(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejecti
     }
   }
   if quiet {
-    while List<InstanceKey>.length(&reached) != usize.ZERO {
-      let tail = List<InstanceKey>.length(&reached) - usize.ONE
-      let moved = List<InstanceKey>.remove(&mut reached, tail)
-      run List<u64>.append(&mut settled.*.hashes, List<u64>.get(&reachedHashes, tail))
-      run List<InstanceKey>.append(&mut settled.*.keys, move moved)
+    // Each reached instance is new to `settled`: the walk skipped the ones it held.
+    let found = List<InstanceKey>.asSlice(&reached)
+    let mut each = usize.ZERO
+    while each < found.length {
+      drop run settled.add(List<u64>.get(&reachedHashes, each), &found[each])
+      each = each + usize.ONE
     }
   }
-  run List<InlineVerdict>.append(&mut verdicts.*, InlineVerdict {key: InstanceKey.copy(selected), hash: selectedHash, quiet: quiet, looped: looped})
+  drop run verdicts.instances.add(selectedHash, selected)
+  run List<bool>.append(&mut verdicts.*.quiet, quiet)
+  run List<usize>.append(&mut verdicts.*.directives, directive)
   return quiet
 }
 
@@ -80749,17 +80849,9 @@ effect fn hashedAmong(hashes: &List<u64>, keys: &List<InstanceKey>, hash: u64, k
   return false
 }
 
-// Adds `key` to `keys`, with its hash in `hashes`, unless it is there.
-effect fn noteUsed(hashes: &mut List<u64>, keys: &mut List<InstanceKey>, key: &InstanceKey) -> () ! OutOfMemoryError ? &mut Allocator {
-  let hash = InstanceKey.runtimeHash(key)
-  if run hashedAmong(&hashes.*, &keys.*, hash, key) { return () }
-  run List<u64>.append(&mut hashes.*, hash)
-  return run List<InstanceKey>.append(&mut keys.*, InstanceKey.copy(key))
-}
-
 // Collects every instance `function` still calls, drops through, takes the address of, or owes a
 // proof for.
-effect fn stillUsed(function: &MirFunction, hashes: &mut List<u64>, keys: &mut List<InstanceKey>) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn stillUsed(function: &MirFunction, used: &mut InstanceTable) -> () ! OutOfMemoryError ? &mut Allocator {
   let blocks = List<MirBlock>.asSlice(&function.blocks)
   let mut block = usize.ZERO
   while block < blocks.length {
@@ -80767,14 +80859,14 @@ effect fn stillUsed(function: &MirFunction, hashes: &mut List<u64>, keys: &mut L
     let mut at = usize.ZERO
     while at < statements.length {
       match &statements[at] {
-        MirStatement.Drop {glue, ..} => { run noteUsed(&mut hashes.*, &mut keys.*, &glue) }
-        MirStatement.Assign {value: MirRvalue.FunctionAddress {key: addressed}, ..} => { run noteUsed(&mut hashes.*, &mut keys.*, &addressed) }
+        MirStatement.Drop {glue, ..} => { run used.note(&glue) }
+        MirStatement.Assign {value: MirRvalue.FunctionAddress {key: addressed}, ..} => { run used.note(&addressed) }
         _ => {}
       }
       at = at + usize.ONE
     }
     if let MirTerminator.Call {callee: MirCallee.Instance {key: called}, ..} = &blocks[block].terminator {
-      run noteUsed(&mut hashes.*, &mut keys.*, &called)
+      run used.note(&called)
     }
     block = block + usize.ONE
   }
@@ -80784,7 +80876,7 @@ effect fn stillUsed(function: &MirFunction, hashes: &mut List<u64>, keys: &mut L
     let callees = List<InstanceKey>.asSlice(&runs[owed].callees)
     let mut at = usize.ZERO
     while at < callees.length {
-      run noteUsed(&mut hashes.*, &mut keys.*, &callees[at])
+      run used.note(&callees[at])
       at = at + usize.ONE
     }
     owed = owed + usize.ONE
@@ -80792,7 +80884,7 @@ effect fn stillUsed(function: &MirFunction, hashes: &mut List<u64>, keys: &mut L
   let accesses = List<MirSharedAccess>.asSlice(&function.accesses)
   let mut at = usize.ZERO
   while at < accesses.length {
-    run noteUsed(&mut hashes.*, &mut keys.*, &accesses[at].callback)
+    run used.note(&accesses[at].callback)
     at = at + usize.ONE
   }
   return ()
@@ -80845,8 +80937,8 @@ fn inlinesMir(resolver: &Resolver, facts: &Option<CoroutineFacts>) -> bool {
 // own points have cancel exits, which chain into the point's. Every decision reads the callee
 // alone. The caller reads only un-inlined MIR, a recorded dependency, which inlines nothing, so
 // inlining demands no other function's inlined MIR. A spliced body's own calls are candidates in
-// turn, recursion is cut by ancestry, and bodies larger than a call (`MirInline.callSized`) grow
-// the caller by at most a bound that depends only on its own size. Afterwards an inlined
+// turn, recursion is cut by ancestry, and bodies larger than a call (`MirInline.callSized`) that
+// carry no `@inlineAlways` grow the caller by at most a bound that depends only on its own size. Afterwards an inlined
 // instance the body no longer uses, and whose own body made no call, is no longer referenced, so
 // the build does not emit it for this caller.
 effect fn inlineCalls(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>,
@@ -80868,18 +80960,27 @@ effect fn inlineCalls(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejec
     raw.inline = List<InstanceKey>.make()
     rawFacts = Option<CoroutineFacts>.some(move raw)
   }
-  // The function's size (`MirInline.size`), kept up as each splice adds blocks and statements.
+  // The function's size (`MirInline.size`), kept up as each splice adds blocks and statements,
+  // and the size no chosen splice takes it past: a guard against a runaway, far above what the
+  // per-call limits (`MirInline.expandedLimit`) let a function reach.
   let mut grown = MirInline.size(&function.*)
-  let limit = grown + inlineGrowth(grown, resolver.directSize)
-  let mut verdicts = List<InlineVerdict>.make()
-  let mut settled = Settled {hashes: List<u64>.make(), keys: List<InstanceKey>.make()}
-  let mut inlined = List<InstanceKey>.make()
+  let limit = grown + inlineGrowth(grown)
+  // The first origin node no statement of the function uses yet, which each splice moves on.
+  let mut nodes = MirInline.freshNode(&function.*)
+  let mut expandedSizes = Expansions {instances: InstanceTable.make(), sizes: List<usize>.make(), directives: List<usize>.make()}
+  let mut verdicts = InlineVerdicts {instances: InstanceTable.make(), quiet: List<bool>.make(), directives: List<usize>.make()}
+  // The instances a finished walk of `quietBody` reached, none of which reaches a suspending one.
+  let mut settled = InstanceTable.make()
+  // The instances spliced, each once.
+  let mut inlined = InstanceTable.make()
   // The spliced instances whose bodies left calls in this function.
-  let mut calling = List<InstanceKey>.make()
-  // The callee bodies read so far, by instance.
+  let mut calling = InstanceTable.make()
+  // The callee bodies read so far, each with its size (`MirInline.size`) and whether it calls an
+  // instance, at its instance's position in `held`.
+  let mut held = InstanceTable.make()
   let mut bodies = List<MirFunction>.make()
-  let mut bodyHashes = List<u64>.make()
-  let mut bodyKeys = List<InstanceKey>.make()
+  let mut bodySizes = List<usize>.make()
+  let mut bodyCalls = List<bool>.make()
   let mut ancestry = List<usize>.make()
   run List<usize>.appendRepeated(&mut ancestry, usize.MAX, List<MirBlock>.length(&function.blocks))
   let mut expansions = List<InlineExpansion>.make()
@@ -80939,43 +81040,60 @@ effect fn inlineCalls(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejec
     if rule == InlineRule.Quiet {
       if !run quietBody(&mut resolver.*, &mut owner.*, &mut dependencies.*, &selected, observing, &rawFacts, &mut settled,
         &mut verdicts) { continue }
-      let looped = run onlyInLoops(&verdicts, &selected)
-      if looped && (resolver.directSize || !List<bool>.get(&cyclic, point)) { continue }
+      // A quiet callee is spliced when what it would bring in is within what its directive
+      // allows at this call.
+      let directive = run verdictDirective(&verdicts, &selected)
+      if directive != 2 {
+        let mut chain = List<u64>.make()
+        let expansion = run expandedSize(&mut resolver.*, &mut owner.*, &mut dependencies.*, &selected, observing, &rawFacts, &mut chain,
+          &mut expandedSizes)
+        if expansion.size > MirInline.expandedLimit(directive, List<bool>.get(&cyclic, point), resolver.directSize) { continue }
+      }
     }
     // A callee's body is read and coalesced once for all its calls in this function.
     let wanted = InstanceKey.runtimeHash(&selected)
-    let mut held = usize.MAX
-    let mut seen = usize.ZERO
-    while seen < List<u64>.length(&bodyHashes) && held == usize.MAX {
-      if List<u64>.get(&bodyHashes, seen) == wanted && run InstanceKey.sameInstance(&List<InstanceKey>.asSlice(&bodyKeys)[seen], &selected) { held = seen }
-      seen = seen + usize.ONE
-    }
-    if held == usize.MAX {
+    let mut body = run held.find(wanted, &selected)
+    if body == usize.MAX {
       let read = match move run rawMir(&mut resolver.*, &mut owner.*, &mut dependencies.*, &selected, observing, &rawFacts) {
         Option<MirFunction>.Some {value} => move value
         Option<MirFunction>.None => { continue }
       }
-      held = List<MirFunction>.length(&bodies)
+      let mut calls = false
+      let readBlocks = List<MirBlock>.asSlice(&read.blocks)
+      let mut block = usize.ZERO
+      while block < readBlocks.length && !calls {
+        if let MirTerminator.Call {callee: MirCallee.Instance {..}, ..} = &readBlocks[block].terminator { calls = true }
+        block = block + usize.ONE
+      }
+      run List<usize>.append(&mut bodySizes, MirInline.size(&read))
+      run List<bool>.append(&mut bodyCalls, calls)
       run List<MirFunction>.append(&mut bodies, move read)
-      run List<u64>.append(&mut bodyHashes, wanted)
-      run List<InstanceKey>.append(&mut bodyKeys, InstanceKey.copy(&selected))
+      body = run held.add(wanted, &selected)
     }
-    let callee = &List<MirFunction>.asSlice(&bodies)[held]
+    let callee = &List<MirFunction>.asSlice(&bodies)[body]
     // A body no larger than the call it replaces costs the caller nothing, whatever it has grown to.
-    let calleeSize = MirInline.size(callee)
-    if calleeSize > MirInline.callSized && grown + calleeSize > limit { continue }
+    let calleeSize = List<usize>.get(&bodySizes, body)
+    // `@inlineAlways`, and the forwarding bodies that count as it, are spliced whatever the
+    // caller has grown to, as LLVM does for `alwaysinline`: the budget is for the bodies the
+    // compiler chooses itself.
+    if calleeSize > MirInline.callSized && callee.inlining != MirInlining.Always && grown + calleeSize > limit { continue }
     let mut allowed = rule == InlineRule.Quiet
     if rule == InlineRule.Frame { allowed = MirInline.eligible(callee, resolver.direct) }
     if rule == InlineRule.Forwarder || rule == InlineRule.ForwarderOrQuiet { allowed = MirInline.valueForwarder(callee, resolver.direct) }
     if !allowed && rule == InlineRule.ForwarderOrQuiet {
       allowed = run quietBody(&mut resolver.*, &mut owner.*, &mut dependencies.*, &selected, observing, &rawFacts, &mut settled,
         &mut verdicts)
-      let looped = run onlyInLoops(&verdicts, &selected)
-      if looped && (resolver.directSize || !List<bool>.get(&cyclic, point)) { allowed = false }
+      let directive = run verdictDirective(&verdicts, &selected)
+      if allowed && directive != 2 {
+        let mut chain = List<u64>.make()
+        let expansion = run expandedSize(&mut resolver.*, &mut owner.*, &mut dependencies.*, &selected, observing, &rawFacts, &mut chain,
+          &mut expandedSizes)
+        if expansion.size > MirInline.expandedLimit(directive, List<bool>.get(&cyclic, point), resolver.directSize) { allowed = false }
+      }
     }
     if !allowed { continue }
     let callStatements = List<MirStatement>.length(&List<MirBlock>.asSlice(&function.blocks)[point].statements)
-    if run MirInline.call(&mut function.*, point, callee, resolver.direct) {
+    if run MirInline.call(&mut function.*, point, callee, resolver.direct, &mut nodes) {
       // What the splice added: the statements it put in the call's block, and its new blocks.
       let now = List<MirBlock>.asSlice(&function.blocks)
       grown = grown + List<MirStatement>.length(&now[point].statements) - callStatements
@@ -80997,31 +81115,26 @@ effect fn inlineCalls(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejec
         fresh = fresh - usize.ONE
         run List<usize>.append(&mut pending, fresh)
       }
-      let mut calls = false
-      let spliced = List<MirBlock>.asSlice(&callee.blocks)
-      let mut block = usize.ZERO
-      while block < spliced.length && !calls {
-        if let MirTerminator.Call {callee: MirCallee.Instance {..}, ..} = &spliced[block].terminator { calls = true }
-        block = block + usize.ONE
-      }
-      if calls { run List<InstanceKey>.append(&mut calling, InstanceKey.copy(&selected)) }
-      run List<InstanceKey>.append(&mut inlined, move selected)
+      if List<bool>.get(&bodyCalls, body) && (run calling.find(wanted, &selected)) == usize.MAX { drop run calling.add(wanted, &selected) }
+      if (run inlined.find(wanted, &selected)) == usize.MAX { drop run inlined.add(wanted, &selected) }
     }
   }
-  if List<InstanceKey>.length(&inlined) == usize.ZERO { return () }
-  let listed = List<InstanceKey>.asSlice(&inlined)
-  let mut knownHashes = List<u64>.make()
+  if List<InstanceKey>.length(&inlined.keys) == usize.ZERO { return () }
+  // The function's inlined instances, each once: those it listed already, then the new ones in
+  // the order of their first splice.
+  let mut known = InstanceTable.make()
   let mut prior = usize.ZERO
   while prior < List<InstanceKey>.length(&function.inlined) {
-    run List<u64>.append(&mut knownHashes, InstanceKey.runtimeHash(&List<InstanceKey>.asSlice(&function.inlined)[prior]))
+    run known.note(&List<InstanceKey>.asSlice(&function.inlined)[prior])
     prior = prior + usize.ONE
   }
+  let listed = List<InstanceKey>.asSlice(&inlined.keys)
   let mut each = usize.ZERO
   while each < listed.length {
     let hash = InstanceKey.runtimeHash(&listed[each])
-    if !run hashedAmong(&knownHashes, &function.inlined, hash, &listed[each]) {
+    if (run known.find(hash, &listed[each])) == usize.MAX {
       run List<InstanceKey>.append(&mut function.inlined, InstanceKey.copy(&listed[each]))
-      run List<u64>.append(&mut knownHashes, hash)
+      drop run known.add(hash, &listed[each])
     }
     each = each + usize.ONE
   }
@@ -81032,43 +81145,37 @@ effect fn inlineCalls(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejec
   // has a summary of its own: whether it can park is then decided from its own calls, not from
   // everything the functions that spliced it do (`nonParkingViolations`). The others go when the
   // function no longer uses them, found from one walk of what it still uses.
-  let mut usedHashes = List<u64>.make()
-  let mut usedKeys = List<InstanceKey>.make()
-  run stillUsed(&function.*, &mut usedHashes, &mut usedKeys)
-  let mut goneHashes = List<u64>.make()
-  let mut goneKeys = List<InstanceKey>.make()
+  let mut used = InstanceTable.make()
+  run stillUsed(&function.*, &mut used)
+  let mut gone = InstanceTable.make()
   let spliced = List<InstanceKey>.asSlice(&function.inlined)
   let mut key = usize.ZERO
   while key < spliced.length {
     let hash = InstanceKey.runtimeHash(&spliced[key])
-    let mut unused = !run hashedAmong(&usedHashes, &usedKeys, hash, &spliced[key])
-    if unused { unused = !run amongInstances(&calling, &spliced[key]) }
-    if unused {
-      run List<u64>.append(&mut goneHashes, hash)
-      run List<InstanceKey>.append(&mut goneKeys, InstanceKey.copy(&spliced[key]))
+    if (run used.find(hash, &spliced[key])) == usize.MAX && (run calling.find(hash, &spliced[key])) == usize.MAX
+      && (run gone.find(hash, &spliced[key])) == usize.MAX {
+      drop run gone.add(hash, &spliced[key])
     }
     key = key + usize.ONE
   }
-  if List<u64>.length(&goneHashes) != usize.ZERO {
+  if List<InstanceKey>.length(&gone.keys) != usize.ZERO {
     // The references are sorted afterwards, so they are taken from the end, in any order.
     let mut kept = List<MirReference>.make()
     while List<MirReference>.length(&function.references) != usize.ZERO {
       let last = List<MirReference>.length(&function.references) - usize.ONE
       let reference = List<MirReference>.remove(&mut function.references, last)
       let hash = InstanceKey.runtimeHash(&reference.key)
-      if !run hashedAmong(&goneHashes, &goneKeys, hash, &reference.key) { run List<MirReference>.append(&mut kept, move reference) }
+      if (run gone.find(hash, &reference.key)) == usize.MAX { run List<MirReference>.append(&mut kept, move reference) }
     }
     function.references = move kept
   }
   return run MirFunction.sortReferences(&mut function.references)
 }
 
-// How much an inlining caller of `size` statements and blocks may grow: enough for a small
-// function to absorb its helpers and theirs, and in proportion for a large one. A build for
-// size (`compact`) grows a caller by no more than its own size and a few helpers.
-fn inlineGrowth(size: usize, compact: bool) -> usize {
-  if compact { return 256 + size }
-  return 4096 + 4 * size
+// How much an inlining caller of `size` statements and blocks may grow before the splices its
+// calls' own limits allow stop: far more than those limits let an ordinary function reach.
+fn inlineGrowth(size: usize) -> usize {
+  return 65536 + 8 * size
 }
 
 effect fn lowerMir(
@@ -95381,6 +95488,8 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
       emittedMir: List<usize>.make(),
       mirReleased: List<bool>.make(),
       mirReleasedCount: usize.ZERO,
+      coalescedIndex: List<usize>.make(),
+      coalescedValues: List<MirFunction>.make(),
       layoutValues: List<Shared<BackendLayout>>.make(),
       layoutContents: List<Bytes>.make(),
       exportedObjects: List<ExportedObject>.make(),
@@ -95845,6 +95954,14 @@ impl Semantic {
         emptyMir(&mut functions[at])
         freed[at] = true
         released = released + usize.ONE
+        // Its coalesced copy goes with it.
+        if at < List<usize>.length(&self.resolver.coalescedIndex) {
+          let held = List<usize>.get(&self.resolver.coalescedIndex, at)
+          if held != usize.MAX {
+            emptyMir(&mut List<MirFunction>.asMutSlice(&mut self.resolver.coalescedValues)[held])
+            List<usize>.set(&mut self.resolver.coalescedIndex, at, usize.MAX)
+          }
+        }
       }
       at = at + usize.ONE
     }
