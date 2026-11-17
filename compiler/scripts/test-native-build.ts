@@ -2658,6 +2658,36 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   )
   assert.equal(forcedTests.status, 0, forcedTests.stderr)
   assert.match(forcedTests.stdout, /1 passed, 0 failed \(0 cached, 1 executed, 1 selected, 4 discovered\)/)
+  // An edit in a separate test admits a second member. A test that calls the dispatcher
+  // must run again even though it still passes the same concrete value.
+  const dispatchTests = join(directory, 'dispatch-tests')
+  yield* fs.makeDirectory(join(dispatchTests, 'src'), { recursive: true })
+  yield* fs.writeFileString(join(dispatchTests, 'silk.toml'), '[package]\nname = "dispatch-tests"\nversion = "0.1.0"\nmain = "main.silk"\nkind = "library"\n')
+  yield* fs.writeFileString(join(dispatchTests, 'src/main.silk'), `import members
+test fn readsFirst() -> () { drop members.first() }
+test fn independent() -> () {}
+test fn changesMemberSet() -> () { drop members.second() }
+`)
+  const members = `interface Read { fn read(self: &Self) -> i32 }
+struct First {}
+struct Second {}
+impl Read for First { fn read(self: &Self) -> i32 { return 1 } }
+impl Read for Second { fn read(self: &Self) -> i32 { return 2 } }
+@inlineNever
+fn read(value: &any Read) -> i32 { return value.read() }
+pub fn first() -> i32 { let member = First {} return read(&member) }
+`
+  for (const second of ['return 2', 'let member = Second {} return read(&member)']) {
+    yield* fs.writeFileString(join(dispatchTests, 'src/members.silk'), members + `pub fn second() -> i32 { ${second} }\n`)
+    const tests = yield* invoke(silk, ['test', '--stdlib', standardLibrary], dispatchTests, { ...process.env, SILK_CLANG: clang })
+    assert.equal(tests.status, 0, tests.stderr)
+    assert.match(tests.stdout, /main::readsFirst\n {4}PASS/)
+    if (second === 'return 2') assert.match(tests.stdout, /0 cached, 3 executed/)
+    else {
+      assert.match(tests.stdout, /main::independent\n {4}CACHED/)
+      assert.match(tests.stdout, /1 cached, 2 executed/)
+    }
+  }
   // A selection that matches no test verified nothing, so it fails, and running it again fails the
   // same way.
   for (let attempt = 0; attempt < 2; attempt++) {

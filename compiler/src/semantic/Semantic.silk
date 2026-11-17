@@ -2710,6 +2710,7 @@ struct Resolver {
   erasureDispatchers: List<DiscoveryDispatch>,
   effectDispatchers: List<ErasedRecursion.Operation>,
   erasureRound: ErasureRound,
+  membershipInputs: List<usize>,
   writtenErasure: bool,
   closedErasures: bool,
   // The lambdas whose enclosing body is checking them, with the signatures that check resolved,
@@ -7239,9 +7240,56 @@ effect fn settleSourceInputs(resolver: &mut Resolver) -> () ! Cycle | OutOfMemor
 // syntax `answer`.
 effect fn captureInput(resolver: &Resolver, module: &ModuleId, selector: &SourceSelector,
   answer: &Shared<Result<SourceResult, NoRejection>>, position: usize) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  if let SourceSelector.ErasureMembers {contract} = &selector.* { return run Bytes.copy(membershipSnapshot(resolver, Bytes.asSlice(&contract))) }
   if let SourceSelector.Resolution {path} = &selector.* { return run captureResolution(resolver, module, Bytes.asSlice(&path)) }
   if let SourceSelector.Request {fact} = &selector.* { return run captureRequest(resolver, Bytes.asSlice(&fact)) }
   return run Inputs.capture(selector, sourceOf(resolver, answer, module), position)
+}
+
+// A membership read before closure observes an unavailable set. Closing the build invalidates
+// that read even when the final set is empty, so a check's provisional gap cannot enter codegen.
+fn membershipSnapshot<'a>(resolver: &'a Resolver, contract: &[u8]) -> &'a [u8] {
+  if !resolver.closedErasures { return b"?" }
+  return ErasureIndex.snapshot(&resolver.erasures, contract)
+}
+
+effect fn recordMembership(resolver: &mut Resolver, instance: &InstanceKey) -> () ! OutOfMemoryError ? &mut Allocator {
+  let unit = recordingUnit(&resolver.*)
+  if unit == usize.MAX { return () }
+  let application = run InstanceKey.selected(instance)
+  if let SpecializationTarget.Operation {provider, operation, ..} = &application.target {
+    let contract = run Type.runtimeEncoding(&provider, &operation)
+    let module = run internModule(&mut resolver.*, DeclarationId.moduleId(&operation))
+    let digest = ContentHash.of(membershipSnapshot(&resolver.*, Bytes.asSlice(&contract)))
+    let selector = SourceSelector.ErasureMembers {contract: move contract}
+    let mut input = Inputs.find(&resolver.sourceInputs, module, &selector)
+    if input == usize.MAX {
+      run List<usize>.reserve(&mut resolver.membershipInputs, usize.ONE)
+      input = run Inputs.add(&mut resolver.sourceInputs, module, move selector, digest, ContentHash {high: 0, low: 0})
+      run List<usize>.append(&mut resolver.membershipInputs, input)
+    }
+    run Graph.record(&mut resolver.graph, unit, Dependee.SourceInput {input: input, module: module})
+  }
+}
+
+// A second artifact can be built in the same source revision with different roots. Give
+// changed membership observations a fresh revision before invalidating their consumers.
+effect fn reconcileMembership(resolver: &mut Resolver) -> () ! OutOfMemoryError ? &mut Allocator {
+  let observed = List<usize>.asSlice(&resolver.membershipInputs)
+  let mut advanced = false
+  let mut at = usize.ZERO
+  while at < observed.length {
+    let input = &mut List<Inputs.Input>.asMutSlice(&mut resolver.sourceInputs.inputs)[observed[at]]
+    if let SourceSelector.ErasureMembers {contract} = &input.selector {
+      let digest = ContentHash.of(ErasureIndex.snapshot(&resolver.erasures, Bytes.asSlice(&contract)))
+      if !Inputs.unchanged(&input.*, digest) {
+        if !advanced { Graph.beginRevision(&mut resolver.graph) advanced = true }
+        run Graph.inputChanged(&mut resolver.graph, observed[at], input.module)
+        input.digest = digest
+      }
+    }
+    at = at + usize.ONE
+  }
 }
 
 // Records that the running unit read the request fact `fact` (`SourceSelector.Request`) for its
@@ -9796,6 +9844,12 @@ effect fn summaryConditions(image: &CacheImage.Image, units: &[usize], placed: &
     at = at + usize.ONE
   }
   let mut conditions = SummaryConditions.make()
+  let leaves = CacheImage.leaves(image)
+  at = usize.ZERO
+  while !found && at < leaves.length {
+    if leaves[at].input && leaves[at].selector == 16 { found = true }
+    at = at + usize.ONE
+  }
   if !found { return move conditions }
   run List<bool>.reserveExact(&mut conditions.stale, nodes)
   run List<usize>.reserveExact(&mut conditions.ends, nodes)
@@ -9810,7 +9864,9 @@ effect fn summaryConditions(image: &CacheImage.Image, units: &[usize], placed: &
         let named = CacheImage.target(edges[edge])
         edge = edge + usize.ONE
         if !CacheImage.namesNode(edges[edge - usize.ONE]) {
-          stale = placed[named] == usize.MAX
+          if placed[named] == usize.MAX && leaves[named].input && leaves[named].selector == 16 {
+            stale = !run waitOn(&mut conditions.roots, start, roots.length + named)
+          } else { stale = placed[named] == usize.MAX }
           continue
         }
         if units[named] != usize.MAX { continue }
@@ -10240,6 +10296,9 @@ effect fn placeLeaf(resolver: &mut Resolver, leaf: &CacheImage.Leaf, key: &[u8],
     Option<PlacedInput>.Some {value} => move value
     Option<PlacedInput>.None => { return usize.MAX }
   }
+  // A cache can be opened before the build roots are known. Membership-dependent definitions
+  // wait on this leaf until the walk has closed the member sets.
+  if let SourceSelector.ErasureMembers {..} = &placed.selector { return usize.MAX }
   let known = Inputs.find(&resolver.sourceInputs, placed.module, &placed.selector)
   // A read of a file whose bytes are those the image recorded reads what it read then. A resolution
   // reads the manifests instead, which the image does not record.
@@ -81507,6 +81566,7 @@ effect fn lowerMir(
     }
   }
   let dispatch = operationDispatch(&instance)
+  if dispatch == OperationDispatch.Erased { run recordMembership(&mut resolver.*, &instance) }
   if dispatch == OperationDispatch.Erased && !resolver.closedErasures {
     return memberSuccess(run dispatchGap(GapCode.WitnessOperand, &identity), List<Dependency>.make())
   }
@@ -96012,7 +96072,7 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
   }
   return Semantic {
     resolver: Resolver {
-      erasures: ErasureIndex.make(), erasureRound: ErasureRound.make(), erasureDispatchers: List<DiscoveryDispatch>.make(), effectDispatchers: List<ErasedRecursion.Operation>.make(), writtenErasure: false, closedErasures: false,
+      erasures: ErasureIndex.make(), erasureRound: ErasureRound.make(), membershipInputs: List<usize>.make(), erasureDispatchers: List<DiscoveryDispatch>.make(), effectDispatchers: List<ErasedRecursion.Operation>.make(), writtenErasure: false, closedErasures: false,
       staticDemandDepth: usize.ZERO,
       staticDemandLimit: usize.MAX,
       discoveredStaticCall: Option<StaticCallHint>.none(),
@@ -101939,7 +101999,12 @@ impl Semantic {
       self.resolver.erasureRound = ErasureRound.make()
       self.resolver.erasureDispatchers = List<DiscoveryDispatch>.make()
       self.resolver.effectDispatchers = List<ErasedRecursion.Operation>.make()
+      run ErasureIndex.freeze(&mut self.resolver.erasures)
       self.resolver.closedErasures = true
+      run reconcileMembership(&mut self.resolver)
+    } else if self.resolver.closedErasures {
+      self.resolver.erasures = ErasureIndex.make()
+      run reconcileMembership(&mut self.resolver)
     }
     // A revisable store that read a build record replays it; anything it cannot replay walks.
     // A record whose walk an edit changed is walked again from its entries (`rewalkBuild`).
@@ -103171,11 +103236,16 @@ impl Semantic {
             BuildCapture.emitted(&mut capture, entry, value, emissionUnit)
           }
         }
-        // The instance is charged to the authored call in the root package that led to it.
-        if self.resolver.costs.enabled {
+        // A dispatcher is shared by every caller of this interface operation. Charge its
+        // generated body to the operation declaration, independent of which caller ran first.
+        if self.resolver.costs.enabled && !discovering {
           let fresh = self.resolver.costs.processSteps - costSteps
           let steps = run CostTable.lowered(&mut self.resolver.costs, &instance, fresh)
-          let site = requestSite(&entered.requester, &entered.module, entered.span)
+          let site = if operationDispatch(&instance) == OperationDispatch.Erased {
+            let declared = resolvedModule(&self.resolver, location.module)
+            let span = run declarationSpan(&mut self.resolver, &declared, location.declaration)
+            RelatedSite {module: move declared, span: span}
+          } else { requestSite(&entered.requester, &entered.module, entered.span) }
           let charged = site.span.end != usize.ZERO && !toolchainModule(&site.module) && CostTable.inRoot(&self.resolver.costs, &site.module)
           let costTo = run Progress.stamp()
           let elapsed = costTo - costFrom
@@ -103644,6 +103714,9 @@ impl Semantic {
   effect fn summaryAgrees(self: &mut Self, summary: &SummaryRoot, borrowed: bool) -> bool
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
   ? &mut Allocator | &mut Types {
+    if summary.membership {
+      return ContentHash.equals(ContentHash.of(ErasureIndex.snapshot(&self.resolver.erasures, Bytes.asSlice(&summary.identity))), summary.fingerprint)
+    }
     let identity = Bytes.asSlice(&summary.identity)
     let mut reader = StableKey.reader()
     let observed = StableKey.readWord(identity, &mut reader)
@@ -108343,6 +108416,7 @@ impl Copy for WaitingEntry {}
 // An image's summary root (`imageSummaries`): the identity `buildSummaryKey` writes and the
 // fingerprint of the answer it recorded.
 struct SummaryRoot {
+  membership: bool,
   identity: Bytes,
   fingerprint: ContentHash,
 }
@@ -108405,11 +108479,26 @@ impl ReplayState {
         while known < List<usize>.length(&named) && List<usize>.get(&named, known) != listed[each] { known = known + usize.ONE }
         if known == List<usize>.length(&named) {
           run List<usize>.append(&mut named, listed[each])
-          let summary = &roots[listed[each]]
           let mut identity = Bytes.make()
-          if let Option<&[u8]>.Some {value} = rootIdentity(Bytes.asSlice(&summary.key), 6) { identity = run Bytes.copy(value) }
-          run List<SummaryRoot>.append(&mut state.summaries, SummaryRoot {identity: move identity,
-            fingerprint: digestOfBytes(Bytes.asSlice(&summary.answer))})
+          let mut fingerprint = ContentHash {high: 0, low: 0}
+          let membership = listed[each] >= roots.length
+          if membership {
+            let leaf = listed[each] - roots.length
+            let mut cursor = CacheImage.keyCursor()
+            let key = run CacheImage.keyAt(image, &mut cursor, leaf)
+            let mut reader = StableKey.reader()
+            StableKey.skipModule(key, &mut reader)
+            if StableKey.readWord(key, &mut reader) != 16 { return Option<ReplayState>.none() }
+            let contract = StableKey.readField(key, &mut reader)
+            if !StableKey.finished(key, &reader) { return Option<ReplayState>.none() }
+            identity = run Bytes.copy(StableKey.view(key, contract))
+            fingerprint = CacheImage.leaves(image)[leaf].digest
+          } else {
+            let summary = &roots[listed[each]]
+            if let Option<&[u8]>.Some {value} = rootIdentity(Bytes.asSlice(&summary.key), 6) { identity = run Bytes.copy(value) }
+            fingerprint = digestOfBytes(Bytes.asSlice(&summary.answer))
+          }
+          run List<SummaryRoot>.append(&mut state.summaries, SummaryRoot {identity: move identity, membership: membership, fingerprint: fingerprint})
         }
         run List<usize>.append(&mut state.waitedOn, known)
         each = each + usize.ONE
