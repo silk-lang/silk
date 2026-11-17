@@ -863,7 +863,14 @@ pub effect fn main() -> i32 ? &mut HostInput { return run Task.main<Tasks>() }
   assert.ok(existsSync(worktreeEntered), 'the worktree runs its Plan command without a new question')
   assert.equal(readdirSync(plans).length, 1)
 
-  // Without a Plan variant nothing is asked and the tasks program is not even built.
+  // Turning refresh off prevents any run on the next settings change.
+  unlinkSync(entered)
+  yield* allowing.send({ jsonrpc: '2.0', method: 'workspace/didChangeConfiguration',
+    params: { settings: { workspaceTrusted: true, refreshPlan: false } } })
+  assert.deepEqual((yield* diagnosticsFor(allowing, savedUri, 1, [])).diagnostics, [])
+  assert.equal(existsSync(entered), false)
+  // Without a Plan variant nothing is asked and the tasks program is not even built. The built-in
+  // plan replaces the requests above, so this runs last.
   const tasksBuild = join(plannedRoot, 'editor-output/steps/tasks')
   rmSync(join(plannedRoot, 'editor-output/steps'), { recursive: true, force: true })
   writeFileSync(join(plannedRoot, 'tasks.silk'), tasksSource(entered).replace('union Tasks { Plan }', 'union Tasks { Lint }'))
@@ -875,12 +882,6 @@ pub effect fn main() -> i32 ? &mut HostInput { return run Task.main<Tasks>() }
   assert.equal(existsSync(tasksBuild), false, 'the built-in plan never builds the tasks program')
   assert.equal(existsSync(entered), false)
 
-  // Turning refresh off prevents any run on the next settings change.
-  writeFileSync(join(plannedRoot, 'tasks.silk'), tasksSource(entered))
-  yield* allowing.send({ jsonrpc: '2.0', method: 'workspace/didChangeConfiguration',
-    params: { settings: { workspaceTrusted: true, refreshPlan: false } } })
-  assert.deepEqual((yield* diagnosticsFor(allowing, savedUri, 1, [])).diagnostics, [])
-  assert.equal(existsSync(entered), false)
   yield* allowing.send({ jsonrpc: '2.0', id: 6, method: 'shutdown' })
   yield* notificationsUntil(allowing, 6)
   yield* allowing.send({ jsonrpc: '2.0', method: 'exit' })
