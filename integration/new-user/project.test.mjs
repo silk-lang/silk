@@ -49,7 +49,7 @@ test('silk init makes a package that runs and prints Hello, world!', () => {
   const name = fresh('hello')
   const created = silk(h, ['init', name])
   assert.equal(created.status, 0, show(created))
-  assert.match(created.stdout, new RegExp(`^Initialized Silk project ${name} at `))
+  assert.match(created.stdout, new RegExp(`^  Created ${name} from the default template \\([0-9a-f]{7}\\)\\n`))
   const dir = join(h.work, name)
   assert.deepEqual(readdirSync(dir).sort(), ['.gitignore', 'silk.toml', 'src'])
   assert.equal(read(join(dir, '.gitignore')), '/build/\n')
