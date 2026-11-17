@@ -10,7 +10,7 @@ Use [`preferredBytes`](#preferredBytes) with `static if` to pick a vector width 
 per-shape modules such as `silk.simd.u8x16` for the vector operations themselves.
 
 ## Details
-The answers come from the CPU model and features of the compilation profile, the same facts
+The answers come from the CPU model and features of the compilation, the same facts
 that `Target.hasCpuFeature` reads. They do not depend on the host machine and have no runtime
 cost.
 

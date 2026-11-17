@@ -445,7 +445,7 @@ Returns `true` if the build enables the CPU feature `value`.
 
 #### Details
 
-`value` is a canonical feature name of the target, as written in the compilation profile.
+`value` is a canonical feature name of the target, as written in `Compilation.cpuFeatures`.
 
 
 Category: Core.

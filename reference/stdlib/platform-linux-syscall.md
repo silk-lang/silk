@@ -9,7 +9,7 @@ Use `RawLinux` only in a raw Linux runtime, such as `silk.platform.linux.start`.
 program uses the libc providers (the `*_native` modules and `silk.platform.native`) instead.
 
 ## Details
-The module exists only on Linux on x86_64 or aarch64, with the `libc` profile set to `none`. The
+The module exists only on Linux on x86_64 or aarch64, with `libc` set to `none`. The
 syscall numbers (`READ`, `WRITE`, `MMAP`, `MUNMAP` and `EXIT_GROUP`) are different on
 each architecture. Use the constants, not literal numbers.
 
