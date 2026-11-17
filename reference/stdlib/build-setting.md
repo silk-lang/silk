@@ -128,6 +128,26 @@ Backend
 impl Schema for TextField
 ```
 
+<a id="TextField.impl.Schema.read"></a>
+
+### Operation `read`
+
+```silk
+effect fn read<R: SchemaReader>(reader: &mut R) -> Self
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
+```
+
+<a id="TextField.impl.Schema.write"></a>
+
+### Operation `write`
+
+```silk
+effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+    ! Issue | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator
+```
+
 <a id="NumberField"></a>
 
 ## `NumberField`
@@ -168,6 +188,26 @@ StackSize
 impl Schema for NumberField
 ```
 
+<a id="NumberField.impl.Schema.read"></a>
+
+### Operation `read`
+
+```silk
+effect fn read<R: SchemaReader>(reader: &mut R) -> Self
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
+```
+
+<a id="NumberField.impl.Schema.write"></a>
+
+### Operation `write`
+
+```silk
+effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+    ! Issue | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator
+```
+
 <a id="ListField"></a>
 
 ## `ListField`
@@ -198,6 +238,26 @@ Sanitizers
 
 ```silk
 impl Schema for ListField
+```
+
+<a id="ListField.impl.Schema.read"></a>
+
+### Operation `read`
+
+```silk
+effect fn read<R: SchemaReader>(reader: &mut R) -> Self
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
+```
+
+<a id="ListField.impl.Schema.write"></a>
+
+### Operation `write`
+
+```silk
+effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+    ! Issue | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator
 ```
 
 <a id="Setting"></a>
