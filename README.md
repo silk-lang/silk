@@ -27,8 +27,9 @@ Working with agents is all about clear contracts. Silk exists to give you that. 
 function states what it returns, how it can fail and what it touches, down to the allocator. Every
 value has an owner and every borrow has a lifetime, so nothing is left to luck.
 
-Silk is a systems language. It compiles to native code and WebAssembly, has no garbage collector,
-and its compiler is written in Silk.
+Silk is a systems language with no garbage collector, and its compiler is written in Silk. It
+runs on macOS, Linux and Windows, and each of them builds for all three and for WebAssembly with
+nothing extra to install.
 
 ```silk
 import silk.core.effect { Effect }
@@ -290,6 +291,52 @@ your code, and a dependency's tasks never run on your machine. See
 [Projects](https://silklang.org/docs/projects/overview) for build graphs, generated code, C
 sources and packaging.
 
+## One machine builds for every target
+
+Silk runs on macOS, Linux and Windows, and each of them builds for all three and for WebAssembly.
+A Silk program needs no SDK or sysroot for the other system and nothing to configure. Name the
+targets:
+
+```sh
+silk build --release \
+  --target aarch64-apple-darwin \
+  --target x86_64-pc-windows-msvc \
+  --target aarch64-unknown-linux-gnu \
+  --target wasm32-wasip1
+```
+
+```console
+Finished build/aarch64-apple-darwin/release/hello in 6.95s
+Finished build/x86_64-pc-windows-msvc/release/hello.exe in 1.92s
+Finished build/aarch64-unknown-linux-gnu/release/hello in 1.42s
+Finished build/wasm32-wasip1/release/hello.wasm in 1.40s
+```
+
+That ran on one x86-64 Linux machine. Silk's own releases for every platform are built the same
+way.
+
+| Target      | Triples                                                                       |
+| ----------- | ----------------------------------------------------------------------------- |
+| macOS       | `aarch64-apple-darwin`, `x86_64-apple-darwin`                                 |
+| Linux       | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, with or without libc |
+| Windows     | `x86_64-pc-windows-msvc`                                                      |
+| WebAssembly | `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`                    |
+
+Hosts are Apple Silicon macOS, x86-64 and ARM64 Linux, and x86-64 Windows, with Intel macOS as a
+tier 2 host. A package that links C sources or native libraries needs the target's SDK. See
+[platform supplies](reference/platform-supplies.md) for how cross links work, the
+[WASI guide](reference/wasi.md), and [Silk on Windows](reference/windows.md).
+
+### Two backends
+
+- **LLVM** is the default. It produces the optimized code you ship, for every target. Each release
+  bundles its own Clang and LLD, so there is no compiler to install.
+- **Direct WebAssembly** writes the module itself, with no LLVM at all:
+  `silk build --target wasm32-wasip1 --backend direct`. It translates each function once and
+  reuses it across builds, which makes it the fast edit loop for wasm, and it runs where LLVM
+  cannot, such as in a browser. The [playground](https://silklang.org/playground) is the compiler
+  running in your browser with this backend.
+
 ## Batteries included
 
 The [standard library](https://silklang.org/docs/std/overview) is written in Silk, under the same
@@ -311,17 +358,6 @@ toolchain.
 
 Files, processes, clocks, randomness and sockets are services, so every one of them has a
 stand-in for tests.
-
-## Platforms
-
-Silk runs on macOS (Apple Silicon, with Intel as a tier 2 host), Linux (x86-64 and ARM64) and
-Windows (x86-64). It compiles to macOS, Linux with or without libc, Windows and WebAssembly, and
-any host can build for all of them.
-
-Executables for another system link with no SDK or sysroot (see
-[platform supplies](reference/platform-supplies.md)). WebAssembly output is freestanding
-`wasm32-unknown-unknown`, or WASI Preview 1 and Preview 2 (see the [WASI guide](reference/wasi.md)).
-[Silk on Windows](reference/windows.md) covers the Windows details.
 
 ## Where Silk comes from
 
