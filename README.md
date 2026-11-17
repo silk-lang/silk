@@ -357,7 +357,11 @@ Try it, pin your toolchain, and help shape what Silk becomes.
 
 ## Contributing
 
-Issues and pull requests are welcome. The compiler builds itself from the published seed pinned in
+Issues and pull requests are welcome. So are reports of gaps or errors in the documentation: if a
+page is missing, unclear or wrong, open an issue here or in
+[silk-lang/docs](https://github.com/silk-lang/docs), where the site's source lives.
+
+The compiler builds itself from the published seed pinned in
 [`compiler/native-seed.json`](compiler/native-seed.json); [`compiler/README.md`](compiler/README.md)
 describes its layout and [`.github/CI.md`](.github/CI.md) the checks a pull request runs. The root
 `silk.toml` is a workspace of `compiler`, `changes`, `tomledit` and `tool`, so select a member from
