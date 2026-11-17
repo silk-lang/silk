@@ -1,0 +1,468 @@
+//! Unrolling of the loops of one SSA function that run a small, known number of times.
+//!
+//! # When to use
+//! Run [`unroll`] in a build optimized for speed after the scalar passes, which make a loop's
+//! bounds constants, then run them again: each copy of the body then has a constant for the
+//! counter, so its bounds checks and index arithmetic fold. A build optimized for size skips it.
+//!
+//! # Details
+//! A loop is unrolled when all of this holds:
+//!
+//! - It is a natural loop with one block outside it that enters its header and one block inside
+//!   it, not the header, that goes back to the header.
+//! - The header ends in a branch on an integer comparison of one of its parameters, the counter,
+//!   with a constant; one edge of the branch stays in the loop and the other leaves it.
+//! - The entry passes a constant for the counter, and the back edge passes the counter plus or
+//!   minus a constant.
+//! - Counting from the entry's constant, the comparison lets the body run between one and
+//!   [`trips`] times, and the body's instructions times that count are at most [`growth`].
+//! - No value the loop defines is used outside it other than as an argument of an edge that
+//!   leaves it, or, for a value the header defines, in blocks only the header's leaving edge
+//!   leads to, where the last copy of the header stands for it.
+//!
+//! The loop's blocks are copied once per iteration. A copy of the header takes no parameters:
+//! the first reads what the entry passed, each later one what the copy before passed along its
+//! back edge, and each jumps straight to its body, since the comparison is known to hold. After
+//! the last copy a copy of the header alone runs and jumps along the leaving edge, since the
+//! comparison is known to fail. Every other edge that leaves the loop is copied with its
+//! arguments. The original blocks are then unreachable, and `SsaFunction.compact` removes them.
+//!
+//! The header's instructions run once more than the body's, as they did, and every instruction of
+//! every iteration runs in the order it did. Blocks are only added after the others, in the
+//! loop's own order, so the result depends only on the function.
+
+import backend.SsaFunction {Binary, Block, Edge, Exit, Operation, Predicate, SsaFunction, masked, none}
+import backend.SsaGraph {SsaGraph}
+import silk.collections.list {List}
+import silk.core.option {Option}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.u64
+import silk.num.usize
+
+/// The most iterations an unrolled loop runs.
+pub fn trips() -> u64 { return 8 }
+
+/// The most instructions the copies of one unrolled loop's body hold together.
+pub fn growth() -> usize { return 384 }
+
+/// The most loops one [`unroll`] unrolls.
+pub fn loops() -> usize { return 16 }
+
+/// Unrolls the loops of `function` that run a small, known number of times; answers whether it
+/// unrolled any.
+pub effect fn unroll(function: &mut SsaFunction) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut changed = false
+  let mut done = usize.ZERO
+  while done < loops() {
+    // A copy changes the blocks, so the loops are found again after each.
+    let graph = run SsaGraph.of(&function.*)
+    let sequence = graph.reversePostorder()
+    let mut unrolled = false
+    let mut step = sequence.length
+    while step > usize.ZERO && !unrolled {
+      step = step - usize.ONE
+      unrolled = run unrollLoop(&mut function.*, &graph, sequence[step])
+    }
+    if !unrolled { break }
+    drop run function.compact()
+    changed = true
+    done = done + usize.ONE
+  }
+  return changed
+}
+
+// The value `value` stands for in a copy: its entry in `map`, or itself when it has none.
+fn mapped(map: &List<u64>, value: u64) -> u64 {
+  if value == none() { return value }
+  let at = u64.toUsize(value)
+  if at < List<u64>.length(map) && List<u64>.get(map, at) != none() { return List<u64>.get(map, at) }
+  return value
+}
+
+// `bits`-wide `value` as a signed number in 64 bits.
+fn signed(value: u64, bits: usize) -> u64 {
+  if bits >= 64 { return value }
+  let shift = usize.toU64(64 - bits)
+  let low = masked(value, bits)
+  if (u64.shiftLeft(low, shift) & 9223372036854775808) != 0 { return low | u64.shiftLeft(u64.MAX, usize.toU64(bits)) }
+  return low
+}
+
+// Whether the signed 64-bit `left` is below `right`.
+fn below(left: u64, right: u64) -> bool {
+  let flipped: u64 = 9223372036854775808
+  return u64.bitXor(left, flipped) < u64.bitXor(right, flipped)
+}
+
+// Whether `left predicate right` holds for `bits`-wide integers; `usize.MAX` for a predicate
+// that is not an integer one, 1 when it holds, else 0.
+fn holds(predicate: Predicate, left: u64, right: u64, bits: usize) -> usize {
+  let a = masked(left, bits)
+  let b = masked(right, bits)
+  let x = signed(left, bits)
+  let y = signed(right, bits)
+  let truth = match predicate {
+    Predicate.Eq => a == b
+    Predicate.Ne => a != b
+    Predicate.Ult => a < b
+    Predicate.Ule => a <= b
+    Predicate.Ugt => a > b
+    Predicate.Uge => a >= b
+    Predicate.Slt => below(x, y)
+    Predicate.Sle => !below(y, x)
+    Predicate.Sgt => below(y, x)
+    Predicate.Sge => !below(x, y)
+    _ => { return usize.MAX }
+  }
+  if truth { return usize.ONE }
+  return usize.ZERO
+}
+
+// Unrolls the loop whose header is `header`, when it is one and fits the module's conditions;
+// answers whether it did.
+effect fn unrollLoop(function: &mut SsaFunction, graph: &SsaGraph, header: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
+  // The entry and the back edge's source.
+  let incoming = graph.predecessorsOf(header)
+  let mut entry = usize.MAX
+  let mut latch = usize.MAX
+  let mut at = usize.ZERO
+  while at < incoming.length {
+    if graph.dominates(header, incoming[at]) {
+      if latch != usize.MAX { return false }
+      latch = incoming[at]
+    } else {
+      if entry != usize.MAX { return false }
+      entry = incoming[at]
+    }
+    at = at + usize.ONE
+  }
+  // A loop of one block has no body apart from its header.
+  if latch == usize.MAX || entry == usize.MAX || latch == header { return false }
+  // The loop's blocks, by a walk back from the back edge's source.
+  let count = function.blockCount()
+  let mut inLoop = run List<bool>.makeWithCapacity(count)
+  run List<bool>.appendRepeated(&mut inLoop, false, count)
+  List<bool>.set(&mut inLoop, header, true)
+  let mut stack = List<usize>.make()
+  List<bool>.set(&mut inLoop, latch, true)
+  run List<usize>.append(&mut stack, latch)
+  while let Option<usize>.Some {value: block} = List<usize>.pop(&mut stack) {
+    let before = graph.predecessorsOf(block)
+    let mut edge = usize.ZERO
+    while edge < before.length {
+      if !List<bool>.get(&inLoop, before[edge]) && graph.reaches(before[edge]) {
+        List<bool>.set(&mut inLoop, before[edge], true)
+        run List<usize>.append(&mut stack, before[edge])
+      }
+      edge = edge + usize.ONE
+    }
+  }
+  let mut body = List<usize>.make()
+  let sequence = graph.reversePostorder()
+  let mut size = usize.ZERO
+  at = usize.ZERO
+  while at < sequence.length {
+    if List<bool>.get(&inLoop, sequence[at]) {
+      run List<usize>.append(&mut body, sequence[at])
+      size = size + List<usize>.length(&function.block(sequence[at]).instructions)
+    }
+    at = at + usize.ONE
+  }
+  let blocks = List<usize>.asSlice(&body)
+  if blocks.length > 32 { return false }
+  // The header's branch: a comparison of the counter with a constant, one edge staying.
+  let head = function.block(header)
+  if head.exit != Exit.Branch { return false }
+  let headEdges = List<Edge>.asSlice(&head.edges)
+  let firstStays = List<bool>.get(&inLoop, headEdges[usize.ZERO].block)
+  let secondStays = List<bool>.get(&inLoop, headEdges[usize.ONE].block)
+  if firstStays == secondStays { return false }
+  let mut staying = usize.ONE
+  if firstStays { staying = usize.ZERO }
+  let leaving = usize.ONE - staying
+  let producer = function.producerOf(head.value)
+  if producer == usize.MAX { return false }
+  let predicate = match function.instruction(producer).operation {
+    Operation.Compare {predicate: found} => found
+    _ => { return false }
+  }
+  let compared = function.operandsOf(producer)
+  let parameters = List<u64>.asSlice(&head.parameters)
+  let mut counter = usize.MAX
+  let mut counterLeft = true
+  at = usize.ZERO
+  while at < parameters.length {
+    if parameters[at] == compared[usize.ZERO] && function.isBits(compared[usize.ONE]) { counter = at }
+    if parameters[at] == compared[usize.ONE] && function.isBits(compared[usize.ZERO]) {
+      counter = at
+      counterLeft = false
+    }
+    at = at + usize.ONE
+  }
+  if counter == usize.MAX { return false }
+  let kind = function.kindOf(parameters[counter])
+  if !kind.isInteger() || kind.isVector() || kind.bits > 64 { return false }
+  let mut bound = compared[usize.ONE]
+  if !counterLeft { bound = compared[usize.ZERO] }
+  let limit = function.constantOf(bound).low
+  // The entry's constant and the back edge's step.
+  let entryEdge = edgeTo(function.block(entry), header)
+  let latchEdge = edgeTo(function.block(latch), header)
+  if entryEdge == usize.MAX || latchEdge == usize.MAX { return false }
+  let started = List<u64>.get(&List<Edge>.asSlice(&function.block(entry).edges)[entryEdge].arguments, counter)
+  if !function.isBits(started) { return false }
+  let stepped = List<u64>.get(&List<Edge>.asSlice(&function.block(latch).edges)[latchEdge].arguments, counter)
+  let stepper = function.producerOf(stepped)
+  if stepper == usize.MAX { return false }
+  let mut adds = true
+  match function.instruction(stepper).operation {
+    Operation.Binary {operation: Binary.Add} => {}
+    Operation.Binary {operation: Binary.Sub} => { adds = false }
+    _ => { return false }
+  }
+  let terms = function.operandsOf(stepper)
+  let mut amount: u64 = 0
+  if terms[usize.ZERO] == parameters[counter] && function.isBits(terms[usize.ONE]) {
+    amount = function.constantOf(terms[usize.ONE]).low
+  } else if adds && terms[usize.ONE] == parameters[counter] && function.isBits(terms[usize.ZERO]) {
+    amount = function.constantOf(terms[usize.ZERO]).low
+  } else {
+    return false
+  }
+  // How often the body runs.
+  let mut value = function.constantOf(started).low
+  let mut runs: u64 = 0
+  while true {
+    let mut truth = holds(predicate, value, limit, kind.bits)
+    if !counterLeft { truth = holds(predicate, limit, value, kind.bits) }
+    if truth == usize.MAX { return false }
+    if (truth == usize.ONE) != (staying == usize.ZERO) { break }
+    runs = runs + 1
+    if runs > trips() { return false }
+    if adds { value = masked(u64.wrappingAdd(value, amount), kind.bits) } else { value = masked(u64.wrappingSubtract(value, amount), kind.bits) }
+  }
+  if runs == 0 || size * u64.toUsize(runs) > growth() { return false }
+  // Nothing outside the loop reads a value the loop defines, but through an edge that leaves it,
+  // or a value of the header where only the header's leaving edge leads: the last copy of the
+  // header then stands for it there.
+  let values = function.valueCount()
+  let mut defined = run List<bool>.makeWithCapacity(values)
+  run List<bool>.appendRepeated(&mut defined, false, values)
+  let mut inHeader = run List<bool>.makeWithCapacity(values)
+  run List<bool>.appendRepeated(&mut inHeader, false, values)
+  let after = headEdges[leaving].block
+  let onlyFromHeader = graph.predecessorsOf(after).length == usize.ONE
+  let mut substituted = false
+  at = usize.ZERO
+  while at < blocks.length {
+    let found = function.block(blocks[at])
+    let taken = List<u64>.asSlice(&found.parameters)
+    let mut each = usize.ZERO
+    while each < taken.length {
+      List<bool>.set(&mut defined, u64.toUsize(taken[each]), true)
+      if blocks[at] == header { List<bool>.set(&mut inHeader, u64.toUsize(taken[each]), true) }
+      each = each + usize.ONE
+    }
+    let listed = List<usize>.asSlice(&found.instructions)
+    each = usize.ZERO
+    while each < listed.length {
+      let made = function.instruction(listed[each])
+      if made.result != none() {
+        List<bool>.set(&mut defined, u64.toUsize(made.result), true)
+        if blocks[at] == header { List<bool>.set(&mut inHeader, u64.toUsize(made.result), true) }
+        if made.operation.resultCount(made.kind) == 2 {
+          List<bool>.set(&mut defined, u64.toUsize(made.result) + usize.ONE, true)
+          if blocks[at] == header { List<bool>.set(&mut inHeader, u64.toUsize(made.result) + usize.ONE, true) }
+        }
+      }
+      each = each + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < count {
+    if !List<bool>.get(&inLoop, at) && graph.reaches(at) {
+      let found = function.block(at)
+      // Where the last copy of the header can stand for the header's values.
+      let behind = onlyFromHeader && graph.dominates(after, at)
+      if found.value != none() && List<bool>.get(&defined, u64.toUsize(found.value)) {
+        if !behind || !List<bool>.get(&inHeader, u64.toUsize(found.value)) { return false }
+        substituted = true
+      }
+      let listed = List<usize>.asSlice(&found.instructions)
+      let mut each = usize.ZERO
+      while each < listed.length {
+        let used = function.operandsOf(listed[each])
+        let mut operand = usize.ZERO
+        while operand < used.length {
+          if used[operand] != none() && List<bool>.get(&defined, u64.toUsize(used[operand])) {
+            if !behind || !List<bool>.get(&inHeader, u64.toUsize(used[operand])) { return false }
+            substituted = true
+          }
+          operand = operand + usize.ONE
+        }
+        each = each + usize.ONE
+      }
+      let edges = List<Edge>.asSlice(&found.edges)
+      each = usize.ZERO
+      while each < edges.length {
+        let passed = List<u64>.asSlice(&edges[each].arguments)
+        let mut argument = usize.ZERO
+        while argument < passed.length {
+          if passed[argument] != none() && List<bool>.get(&defined, u64.toUsize(passed[argument])) {
+            if !behind || !List<bool>.get(&inHeader, u64.toUsize(passed[argument])) { return false }
+            substituted = true
+          }
+          argument = argument + usize.ONE
+        }
+        each = each + usize.ONE
+      }
+    }
+    at = at + usize.ONE
+  }
+  // The copies. `carried` holds what the header's parameters are in the copy being made.
+  let mut carried = List<u64>.make()
+  run List<u64>.appendSlice(&mut carried, List<u64>.asSlice(&List<Edge>.asSlice(&function.block(entry).edges)[entryEdge].arguments))
+  let mut previous = usize.MAX
+  let mut copy: u64 = 0
+  while copy <= runs {
+    let last = copy == runs
+    let mut map = run List<u64>.makeWithCapacity(values)
+    run List<u64>.appendRepeated(&mut map, none(), values)
+    let mut clones = run List<usize>.makeWithCapacity(count)
+    run List<usize>.appendRepeated(&mut clones, usize.MAX, count)
+    // The blocks and their parameters; the header's are what was carried here.
+    at = usize.ZERO
+    while at < blocks.length {
+      if !last || blocks[at] == header {
+        let place = function.block(blocks[at]).startPlace
+        let made = run function.addJumpBlock(header, &[], place)
+        List<usize>.set(&mut clones, blocks[at], made)
+        let taken = List<u64>.length(&function.block(blocks[at]).parameters)
+        let mut each = usize.ZERO
+        while each < taken {
+          let parameter = List<u64>.get(&function.block(blocks[at]).parameters, each)
+          if blocks[at] == header {
+            List<u64>.set(&mut map, u64.toUsize(parameter), List<u64>.get(&carried, each))
+          } else {
+            let parameterKind = function.kindOf(parameter)
+            let fresh = run function.addParameter(made, parameterKind)
+            List<u64>.set(&mut map, u64.toUsize(parameter), fresh)
+          }
+          each = each + usize.ONE
+        }
+      }
+      at = at + usize.ONE
+    }
+    // The instructions, in an order in which every definition comes before its uses.
+    at = usize.ZERO
+    while at < blocks.length {
+      let made = List<usize>.get(&clones, blocks[at])
+      if made != usize.MAX {
+        let listed = List<usize>.length(&function.block(blocks[at]).instructions)
+        let mut each = usize.ZERO
+        while each < listed {
+          let number = List<usize>.get(&function.block(blocks[at]).instructions, each)
+          let original = function.instruction(number)
+          let mut operands = List<u64>.make()
+          let used = function.operandsOf(number).length
+          let mut operand = usize.ZERO
+          while operand < used {
+            run List<u64>.append(&mut operands, mapped(&map, function.operandsOf(number)[operand]))
+            operand = operand + usize.ONE
+          }
+          let result = run function.insertInstruction(made, each, original.operation, original.kind, List<u64>.asSlice(&operands), original.place)
+          if original.result != none() {
+            List<u64>.set(&mut map, u64.toUsize(original.result), result)
+            if original.operation.resultCount(original.kind) == 2 { List<u64>.set(&mut map, u64.toUsize(original.result) + usize.ONE, result + 1) }
+          }
+          each = each + usize.ONE
+        }
+      }
+      at = at + usize.ONE
+    }
+    // The exits. The header's copy jumps to its body, or along the leaving edge after the last
+    // iteration; the back edge is taken up by the next copy's header.
+    let mut next = List<u64>.make()
+    at = usize.ZERO
+    while at < blocks.length {
+      let made = List<usize>.get(&clones, blocks[at])
+      if made != usize.MAX {
+        if blocks[at] == header {
+          let mut taken = staying
+          if last { taken = leaving }
+          let onward = &List<Edge>.asSlice(&function.block(header).edges)[taken]
+          let mut target = onward.block
+          if !last { target = List<usize>.get(&clones, target) }
+          let mut arguments = List<u64>.make()
+          let passed = List<u64>.length(&onward.arguments)
+          let mut each = usize.ZERO
+          while each < passed {
+            let argument = List<u64>.get(&List<Edge>.asSlice(&function.block(header).edges)[taken].arguments, each)
+            run List<u64>.append(&mut arguments, mapped(&map, argument))
+            each = each + usize.ONE
+          }
+          run function.setJump(made, target, List<u64>.asSlice(&arguments))
+        } else {
+          run function.copyExit(blocks[at], made)
+          let exitValue = mapped(&map, function.block(blocks[at]).value)
+          function.setExitValue(made, exitValue)
+          let edges = List<Edge>.length(&function.block(blocks[at]).edges)
+          let mut edge = usize.ZERO
+          while edge < edges {
+            let target = List<Edge>.asSlice(&function.block(blocks[at]).edges)[edge].block
+            let mut arguments = List<u64>.make()
+            let passed = List<u64>.length(&List<Edge>.asSlice(&function.block(blocks[at]).edges)[edge].arguments)
+            let mut each = usize.ZERO
+            while each < passed {
+              let argument = List<u64>.get(&List<Edge>.asSlice(&function.block(blocks[at]).edges)[edge].arguments, each)
+              run List<u64>.append(&mut arguments, mapped(&map, argument))
+              each = each + usize.ONE
+            }
+            if target == header {
+              // The next copy's header takes these as its parameters; the edge is pointed at it
+              // once it exists.
+              List<u64>.clear(&mut next)
+              run List<u64>.appendSlice(&mut next, List<u64>.asSlice(&arguments))
+              run function.setEdge(made, edge, header, &[])
+            } else if List<bool>.get(&inLoop, target) {
+              run function.setEdge(made, edge, List<usize>.get(&clones, target), List<u64>.asSlice(&arguments))
+            } else {
+              run function.setEdge(made, edge, target, List<u64>.asSlice(&arguments))
+            }
+            edge = edge + usize.ONE
+          }
+        }
+      }
+      at = at + usize.ONE
+    }
+    // What led to the header now leads to this copy's: the entry, or the copy before's back edge.
+    let headerCopy = List<usize>.get(&clones, header)
+    if previous == usize.MAX {
+      run function.setEdge(entry, entryEdge, headerCopy, &[])
+    } else {
+      let back = edgeTo(function.block(previous), header)
+      run function.setEdge(previous, back, headerCopy, &[])
+    }
+    // What reads the header's values after the loop reads the last copy's.
+    if last && substituted { function.substitute(&mut map) }
+    if !last {
+      previous = List<usize>.get(&clones, latch)
+      List<u64>.clear(&mut carried)
+      run List<u64>.appendSlice(&mut carried, List<u64>.asSlice(&next))
+    }
+    copy = copy + 1
+  }
+  return true
+}
+
+// The position of the first edge of `block` that leads to `target`, or `usize.MAX`.
+fn edgeTo(block: &Block, target: usize) -> usize {
+  let edges = List<Edge>.asSlice(&block.edges)
+  let mut at = usize.ZERO
+  while at < edges.length {
+    if edges[at].block == target { return at }
+    at = at + usize.ONE
+  }
+  return usize.MAX
+}
