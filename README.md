@@ -338,9 +338,9 @@ Executables for another system link with no SDK or sysroot (see
 Silk is in alpha. The compiler already builds itself, and every change has to build it twice in a
 row with identical output and pass a shared corpus of programs with exactly the expected results.
 
-The language, the standard library and the tools are moving fast, and APIs may change before 1.0.
-Every [release](https://silklang.org/releases) lists what changed and how to migrate. Try it, pin
-your toolchain, and help shape what Silk becomes.
+The language, the standard library and the tools are moving fast, and APIs will change rapidly
+before 1.0. Every [release](https://silklang.org/releases) lists what changed and how to migrate.
+Try it, pin your toolchain, and help shape what Silk becomes.
 
 ## Repository
 
