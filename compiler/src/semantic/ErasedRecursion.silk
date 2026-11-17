@@ -1,0 +1,143 @@
+//! Detects a recursive call to a closed Effect dispatcher before an explicit suspension boundary.
+
+import backend.InstanceKey {InstanceKey}
+import backend.Mir {Block, Callee, ErasureFact, FailureEdge, MirFunction, SwitchCase, Terminator}
+import semantic.InternIndex {InternIndex}
+import semantic.TypedBody {Origin}
+import silk.collections.list {List}
+import silk.core.ownership {Copy}
+import silk.core.option {Option}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.usize
+
+/// One exact implementation selected by a dynamic Effect call and the conversion that admits it.
+pub struct Witness {
+  pub key: InstanceKey,
+  pub site: ErasureFact,
+}
+
+/// The witnesses of a reached operation, including its selected static arguments and provider row.
+pub struct Operation {
+  pub key: InstanceKey,
+  pub witnesses: List<Witness>,
+}
+
+/// Where a witness calls back into its dispatcher on a path without suspension.
+pub struct Reentry {
+  pub caller: usize,
+  pub origin: Origin,
+}
+
+struct Point { function: usize, block: usize }
+impl Copy for Point {}
+
+// A caller's continuation is reachable only if its callee can leave without suspending, and
+// only by the corresponding normal or failure exit.
+struct Returns {
+  visited: List<bool>,
+  normal: bool,
+  failed: bool,
+  onReturn: List<Point>,
+  onFailure: List<Point>,
+}
+
+fn empty() -> Returns {
+  return Returns {visited: List<bool>.make(), normal: false, failed: false,
+    onReturn: List<Point>.make(), onFailure: List<Point>.make()}
+}
+
+/// Indexes just the instances reached by the last walk of this artifact.
+pub effect fn index(functions: &[MirFunction], reached: &[usize]) -> InternIndex ! OutOfMemoryError ? &mut Allocator {
+  let mut result = InternIndex.make()
+  let mut at = usize.ZERO
+  while at < reached.length {
+    run InternIndex.record(&mut result, InstanceKey.runtimeHash(&functions[reached[at]].key))
+    at = at + usize.ONE
+  }
+  return move result
+}
+
+effect fn position(lookup: &InternIndex, functions: &[MirFunction], reached: &[usize], key: &InstanceKey) -> usize
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut found = InternIndex.first(lookup, InstanceKey.runtimeHash(key))
+  while found != usize.MAX {
+    if run InstanceKey.sameInstance(&functions[reached[found]].key, key) { return found }
+    found = InternIndex.after(lookup, found)
+  }
+  return usize.MAX
+}
+
+/// Finds a path from the witness entry to another invocation of its exact operation. Calls and
+/// returns are matched even when two callers share a helper. A suspension on a different arm
+/// leaves the recursive arm uncovered. Work ends when no new block or return is reachable.
+pub effect fn find(functions: &[MirFunction], reached: &[usize], lookup: &InternIndex, operation: &InstanceKey, witness: &InstanceKey)
+  -> Option<Reentry> ! OutOfMemoryError ? &mut Allocator {
+  let start = run position(lookup, functions, reached, witness)
+  let goal = run position(lookup, functions, reached, operation)
+  if start == usize.MAX || goal == usize.MAX { return Option<Reentry>.none() }
+  let mut states = run List<Returns>.makeWithCapacity(reached.length)
+  while List<Returns>.length(&states) < reached.length { run List<Returns>.append(&mut states, empty()) }
+  let mut work = List<Point>.make()
+  run List<Point>.append(&mut work, Point {function: start, block: usize.ZERO})
+  while let Option<Point>.Some {value: point} = move List<Point>.pop(&mut work) {
+    let blocks = List<Block>.asSlice(&functions[reached[point.function]].blocks)
+    let state = &mut List<Returns>.asMutSlice(&mut states)[point.function]
+    if List<bool>.length(&state.visited) == usize.ZERO { run List<bool>.appendRepeated(&mut state.visited, false, blocks.length) }
+    if List<bool>.get(&state.visited, point.block) { continue }
+    List<bool>.set(&mut state.visited, point.block, true)
+    let block = &blocks[point.block]
+    if block.suspends { continue }
+    match &block.terminator {
+      Terminator.Goto {target, ..} => run List<Point>.append(&mut work, Point {function: point.function, block: target})
+      Terminator.Branch {thenBlock, elseBlock, ..} => {
+        run List<Point>.append(&mut work, Point {function: point.function, block: elseBlock})
+        run List<Point>.append(&mut work, Point {function: point.function, block: thenBlock})
+      }
+      Terminator.Switch {cases, otherwise, ..} => {
+        run List<Point>.append(&mut work, Point {function: point.function, block: otherwise})
+        let choices = List<SwitchCase>.asSlice(&cases)
+        let mut i = usize.ZERO
+        while i < choices.length {
+          run List<Point>.append(&mut work, Point {function: point.function, block: choices[i].target})
+          i = i + usize.ONE
+        }
+      }
+      Terminator.Return {..} => {
+        if !state.normal {
+          state.normal = true
+          run List<Point>.appendSlice(&mut work, List<Point>.asSlice(&state.onReturn))
+        }
+      }
+      Terminator.Fail {..} => {
+        if !state.failed {
+          state.failed = true
+          run List<Point>.appendSlice(&mut work, List<Point>.asSlice(&state.onFailure))
+        }
+      }
+      Terminator.Call {callee, normal, failure, origin, ..} => {
+        let child = match &callee {
+          Callee.Instance {key} => run position(lookup, functions, reached, &key)
+          _ => usize.MAX
+        }
+        if child == goal { return Option<Reentry>.some(Reentry {caller: reached[point.function], origin: origin}) }
+        let continuation = Point {function: point.function, block: normal}
+        if child == usize.MAX {
+          run List<Point>.append(&mut work, continuation)
+          if let Option<FailureEdge>.Some {value} = &failure { run List<Point>.append(&mut work, Point {function: point.function, block: value.target}) }
+        } else {
+          let target = &mut List<Returns>.asMutSlice(&mut states)[child]
+          if target.normal { run List<Point>.append(&mut work, continuation) }
+          else { run List<Point>.append(&mut target.onReturn, continuation) }
+          if let Option<FailureEdge>.Some {value} = &failure {
+            let escape = Point {function: point.function, block: value.target}
+            if target.failed { run List<Point>.append(&mut work, escape) }
+            else { run List<Point>.append(&mut target.onFailure, escape) }
+          }
+          run List<Point>.append(&mut work, Point {function: child, block: usize.ZERO})
+        }
+      }
+      _ => ()
+    }
+  }
+  return Option<Reentry>.none()
+}

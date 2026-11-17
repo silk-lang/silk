@@ -192,8 +192,11 @@ The mutual cycle crosses the boundary in `odd`; every individual call edge need 
 **Boundary:** A suspension on an unrelated branch does not cover a recursive cycle that can avoid
 that branch.
 
-**Diagnostics:** The compiler does not reject an uncovered cycle. The language service may explain
-which cycle lacks a boundary under SUSP-019.
+**Diagnostics:** For an erased Effect operation the build checks each reached witness for a path
+back to that same dispatcher before an explicit suspension. SEM0263 identifies the conversion
+and the call that closes such a cycle. This gives a caller of the interface a bounded-stack
+guarantee across that dynamic edge. For a statically selected cycle the language service may
+explain which cycle lacks a boundary under SUSP-019.
 
 **Evidence:** suspendability analysis.
 
@@ -506,7 +509,7 @@ suspension MIR tests.
 
 **Status:** Confirmed
 
-A recursive Effect cycle without `Effect.suspend` is valid Silk. The compiler does not reject it
+A statically selected recursive Effect cycle without `Effect.suspend` is valid Silk. The compiler does not reject it
 merely because sufficiently deep execution may exhaust the target machine stack.
 
 ```silk,ignore
@@ -520,7 +523,7 @@ effect fn count(value: i32) -> i32 {
 explicit suspension boundary. That assistance cannot silently edit source or claim every execution
 will overflow.
 
-**Diagnostics:** No mandatory compiler diagnostic applies. Any LSP warning is non-blocking and must
+**Diagnostics:** A statically selected cycle can receive a non-blocking LSP warning. It must
 identify the uncovered cycle and the explicit nature of the suggested change.
 
 **Evidence:** suspendability analysis.
