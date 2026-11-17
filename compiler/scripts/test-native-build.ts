@@ -4127,7 +4127,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     yield* fs.writeFileString(join(workspace, 'silk.toml'), root(pin.replace(commit, 'main')))
     const unpinned = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(workspace, 'app'), refusing)
     assert.equal(unpinned.status, 2, 'a shared git dependency without a commit was accepted')
-    assert.match(unpinned.stderr, /Invalid Silk project manifest .*shared\/workspace\/silk\.toml:5: /)
+    assert.match(unpinned.stderr, /Invalid Silk project manifest .*shared\/workspace\/silk\.toml:6: /)
     yield* fs.writeFileString(join(workspace, 'silk.toml'), root(pin))
     // A package no workspace lists has nothing to take the entry from.
     yield* fs.makeDirectory(join(workspace, 'tool'), { recursive: true })
