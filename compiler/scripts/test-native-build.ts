@@ -468,6 +468,47 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   assert.equal(heldLinkedRun.status, 0, heldLinkedRun.stderr)
   const stillHeld = yield* invoke(silk, ['task', '--stdlib', standardLibrary, 'code'], held, requestEnv, 120_000)
   assert.equal(stillHeld.status, 29, stillHeld.stderr)
+  // Each package's tasks program has a directory of its own, so one package's task can run
+  // another's in the same workspace even where a running executable cannot be replaced.
+  assert.ok(existsSync(join(held, 'build/steps/tasks/held-native')), 'the tasks program is under its package name')
+  // The tasks program never evaluates the plan it does not reach, so an archive the package uses
+  // but its tasks manifest lacks, or one only a task prepares, does not stop the task.
+  yield* fs.writeFileString(join(held, 'build.silk'), [
+    'import silk.build.plan { Plan }',
+    'static fn plan() -> Plan {',
+    '  return Plan.empty() |> Plan.compileNative("c", Plan.archivePath("undeclared", "x.c"), &[], &[])',
+    '}',
+    'pub const PLAN: Plan = plan()',
+    '',
+  ].join('\n'))
+  const unevaluated = yield* invoke(silk, ['task', '--stdlib', standardLibrary, 'code'], held, requestEnv, 120_000)
+  assert.equal(unevaluated.status, 29, unevaluated.stderr)
+  // A check compiles no native code, so it never fetches an archive that native code reads; a
+  // build still does, and says which archive it could not fetch.
+  yield* fs.writeFileString(join(held, 'silk.toml'), [
+    '[package]',
+    'name="held-native"',
+    '[dependencies]',
+    'held_c = {path="held-c"}',
+    '[native.archive.prepared]',
+    'url = "file:///nonexistent-prepared-by-a-task"',
+    'sha256 = "0000000000000000000000000000000000000000000000000000000000000000"',
+    '',
+  ].join('\n'))
+  yield* fs.writeFileString(join(held, 'build.silk'), [
+    'import silk.build.plan { Plan }',
+    'static fn plan() -> Plan {',
+    '  return Plan.empty() |> Plan.compileNative("c", Plan.archivePath("prepared", "x.c"), &[], &[])',
+    '}',
+    'pub const PLAN: Plan = plan()',
+    '',
+  ].join('\n'))
+  const checkedUnfetched = yield* invoke(silk, ['check', '--stdlib', standardLibrary], held, requestEnv, 120_000)
+  assert.equal(checkedUnfetched.status, 0, checkedUnfetched.stderr)
+  const builtUnfetched = yield* invoke(silk, ['build', '--stdlib', standardLibrary], held, requestEnv, 120_000)
+  assert.notEqual(builtUnfetched.status, 0)
+  assert.match(builtUnfetched.stderr, /cannot fetch archive prepared/)
+  yield* fs.writeFileString(join(held, 'silk.toml'), '[package]\nname="held-native"\n[dependencies]\nheld_c = {path="held-c"}\n')
   yield* fs.writeFileString(join(held, 'build.silk'), heldPlan('absent'))
   const undeclared = yield* invoke(silk, ['run', '--stdlib', standardLibrary], held, requestEnv, 120_000)
   assert.notEqual(undeclared.status, 0)
@@ -2885,19 +2926,21 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     const vendorRan = yield* invoke(join(archivedApp, `build/${hostTarget}/dev/app`), [], archivedApp, environment)
     assert.equal(vendorRan.status, expected, vendorRan.stderr)
   })
+  // Native code reads the archive, so it is fetched when that code compiles: a build failure (2),
+  // not a plan the package cannot compute (1).
   const offline = yield* archivedBuild({ ...vendorArchiveEnvironment, SILK_OFFLINE: '1' })
-  assert.equal(offline.status, 1, offline.stderr)
+  assert.equal(offline.status, 2, offline.stderr)
   assert.match(offline.stderr, /archive vend is not in the archive store and SILK_OFFLINE is set/)
   yield* fs.writeFileString(join(vendorArchived, 'sys/silk.toml'), sysManifest('0'.repeat(64)))
   const mismatched = yield* archivedBuild(vendorArchiveEnvironment)
-  assert.equal(mismatched.status, 1, mismatched.stderr)
+  assert.equal(mismatched.status, 2, mismatched.stderr)
   assert.match(mismatched.stderr, new RegExp(`archive vend from file://.* has SHA-256 ${vendDigest}, but its manifest pins 0{64}; nothing was extracted`))
   assert.ok(!(yield* fs.exists(join(archiveStore, vendDigest))), 'a mismatched archive is never extracted')
   // SILK_ARCHIVE_MIRROR rewrites the URL's prefix, here to a file:/// directory, and the digest is
   // still checked; a malformed entry is refused.
   yield* fs.writeFileString(join(vendorArchived, 'sys/silk.toml'), sysManifest(vendDigest, 'https://archives.invalid/vend.tar.gz'))
   const malformedMirror = yield* archivedBuild({ ...vendorArchiveEnvironment, SILK_ARCHIVE_MIRROR: 'https://archives.invalid/' })
-  assert.equal(malformedMirror.status, 1, malformedMirror.stderr)
+  assert.equal(malformedMirror.status, 2, malformedMirror.stderr)
   assert.match(malformedMirror.stderr, /SILK_ARCHIVE_MIRROR entry https:\/\/archives\.invalid\/ is not <prefix>=<replacement>/)
   yield* archivedRun(35, { ...vendorArchiveEnvironment, SILK_ARCHIVE_MIRROR: `https://archives.invalid/=file://${vendorArchived}/` })
   yield* fs.remove(join(archiveStore, vendDigest), { recursive: true })
