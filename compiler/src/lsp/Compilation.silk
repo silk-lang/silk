@@ -1,12 +1,12 @@
-//! Saved compilation requests and confined editor refreshes.
+//! Saved compilation requests and the editor's plan refreshes.
 
 import driver.CacheStamp
-import driver.ToolSandbox
 import driver.NativeToolchain
 import driver.OptimizationFlags
 import semantic.Target { Target }
 import driver.Project as Projects { Project, ProjectError }
 import driver.RequestText
+import lsp.PlanAuthorization
 import silk.build.request { Request, RequestSet, Platform }
 import silk.build.encoding as Encoding
 import silk.collections.bytes { Bytes }
@@ -25,12 +25,12 @@ import silk.system.child_process { ChildProcess, ProcessError, ProcessOutcome, E
 import silk.system.child_process_native { OsChildProcess }
 import silk.system.filesystem { AtomicWriteError, FileError, FileSystem, Path }
 import silk.system.host_input { HostInput, HostInputError }
-import silk.system.sandbox as Sandbox
 import silk.text.string { String }
 import silk.io.writer { WriterError }
 import silk.num.usize
 
-/// Explicit editor choices. Trust starts disabled and never grants unsandboxed execution.
+/// Explicit editor choices. Trust starts disabled; with it the editor runs the built-in plan, and a
+/// project's own `Plan` task once the developer allows it.
 pub struct Settings {
   pub trusted: bool,
   pub refresh: bool,
@@ -91,11 +91,24 @@ pub struct Location {
   output: Path,
 }
 
+/// A question to the developer: may the editor run the custom plans of `key`?
+pub struct Ask {
+  /// What an answer covers, as [`PlanAuthorization.key`] spells it.
+  pub key: Bytes,
+  /// Whether the question was sent. A sent question is not asked again this session, so Not now
+  /// keeps the saved requests until the editor restarts.
+  pub asked: bool,
+}
+
 /// A captured environment and request locations held by the editor session.
 pub struct Host {
   pub variables: List<Variable>,
   /// Request locations retained across manifest edits for this editor session.
   pub locations: List<Location>,
+  /// The custom plans this session asked or will ask to run.
+  pub asks: List<Ask>,
+  /// Whether a package's `tasks.silk` changed after its saved requests and no plan ran.
+  pub outdated: bool,
 }
 
 pub effect fn captureHost() -> Host
@@ -113,7 +126,29 @@ pub effect fn captureHost() -> Host
     }
     at = at + 1
   }
-  return Host { variables: move variables, locations: List<Location>.make() }
+  return Host {
+    variables: move variables,
+    locations: List<Location>.make(),
+    asks: List<Ask>.make(),
+    outdated: false,
+  }
+}
+
+impl Host {
+  /// Queues the question for `key`, unless the session already has it.
+  pub effect fn ask(self: &mut Self, key: Bytes) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let asks = self.asks.asSlice()
+    let mut at: usize = 0
+    while at < asks.length {
+      if same(asks[at].key.asSlice(), key.asSlice()) {
+        return ()
+      }
+      at = at + 1
+    }
+    return run self.asks.append(Ask { key: move key, asked: false })
+  }
 }
 
 impl HostInput for Host {
@@ -228,21 +263,39 @@ pub struct Selection {
 }
 
 /// Refreshes only with explicit trust, then selects the first saved compilation that owns a file.
+/// A project's own `Plan` task runs only once the developer allowed it; until then the package
+/// uses the requests the last build or plan saved, and the session asks.
 /// All request files contribute their C translation units to `compile_commands.json`.
 pub effect fn select(
   project: &Project,
   path: &[u8],
   library: &Option<Path>,
-  store: &Option<Path>,
   selected: &Settings,
   host: &mut Host,
 ) -> Selection
   ! FileError | HostInputError | OutOfMemoryError
   ? &mut FileSystem | &mut Allocator {
   let mut hint = false
+  let mut planned = false
   if selected.trusted && selected.refresh {
-    hint = !(run refreshPlan(project, library, store, selected)
-      |> Effect.provideMut<HostInput>(&mut host.*))
+    let mut permitted = true
+    let custom = run PlanAuthorization.custom(project)
+    if custom {
+      let key = run PlanAuthorization.key(project)
+      permitted = run PlanAuthorization.allowed(key.asSlice())
+        |> Effect.provideMut<HostInput>(&mut host.*)
+      if !permitted {
+        run host.ask(move key)
+      }
+    }
+    if permitted {
+      planned = true
+      hint = !(run refreshPlan(project, library, selected, !custom)
+        |> Effect.provideMut<HostInput>(&mut host.*))
+    }
+  }
+  if !planned && run PlanAuthorization.outdated(project) {
+    host.outdated = true
   }
   let saved = run readSaved(Projects.outputDirectory(project), path, selected, &mut host.*)
   return Selection { request: move saved.request, hint: hint || saved.hint }
@@ -388,7 +441,6 @@ pub effect fn open(
   manifest: &Path,
   path: &[u8],
   library: &Option<Path>,
-  store: &Option<Path>,
   selected: &Settings,
   host: &mut Host,
 ) -> Selected
@@ -414,7 +466,7 @@ pub effect fn open(
           },
         )
       }
-      let selection = run select(&project, path, library, store, selected, &mut host.*)
+      let selection = run select(&project, path, library, selected, &mut host.*)
       Selected {
         selection: move selection,
         output: move output,
@@ -656,57 +708,24 @@ effect fn nativeCommands(request: &Request, commands: &mut List<CompileCommand>)
   }
 }
 
+// Runs `silk plan` for the package as the developer would, with the editor's environment, so the
+// requests match what `silk build` writes. With `builtIn`, the package's tasks have no `Plan`
+// variant, and the driver is told to use the built-in plan without starting the tasks program.
 effect fn refreshPlan(
   project: &Project,
   library: &Option<Path>,
-  store: &Option<Path>,
   selected: &Settings,
+  builtIn: bool,
 ) -> bool
   ! FileError | HostInputError | OutOfMemoryError
   ? &mut FileSystem | &mut HostInput | &mut Allocator {
-  if !ToolSandbox.supported() {
-    return false
-  }
   let program = match move run CacheStamp.executablePath() {
     Option<Bytes>.Some { value } => run Path.fromBytes(value.asSlice())
     Option<Bytes>.None => {
       return false
     }
   }
-  let launcher = match move run ToolSandbox.launcher() {
-    Option<Path>.Some { value } => move value
-    Option<Path>.None => {
-      return false
-    }
-  }
-  let steps = run Path.join(Projects.outputDirectory(project), "steps")
-  let requests = run Path.join(Projects.outputDirectory(project), "requests")
-  run FileSystem.createDirectoriesRecursively(&steps)
-  run FileSystem.createDirectoriesRecursively(&requests)
-  let mut readable = List<Path>.make()
-  run readable.append(run Path.fromBytes(Path.rawBytes(Projects.directory(project))))
-  if let Option<Path>.Some { value } = &library.* {
-    run readable.append(run Path.fromBytes(Path.rawBytes(&value)))
-  }
-  if let Option<Path>.Some { value } = &store.* {
-    run readable.append(run Path.fromBytes(Path.rawBytes(&value)))
-  }
-  if let Option<Path>.Some { value } = move run Path.parent(&program) {
-    run readable.append(move value)
-  }
-  if let Option<Path>.Some { value } = move run NativeToolchain.compiler(Option<&[u8]>.none()) {
-    if let Option<Path>.Some { value: parent } = move run Path.parent(&value) {
-      if let Option<Path>.Some { value: installation } = move run Path.parent(&parent) {
-        let resources = run Path.join(&installation, "lib")
-        if run FileSystem.exists(&resources) {
-          run readable.append(move resources)
-        }
-      }
-      run readable.append(move parent)
-    }
-  }
-  let writable = [&steps, &requests]
-  let mut process = run Sandbox.request(&launcher, &program, readable.asSlice(), &writable)
+  let mut process = run ChildProcess.requestWithin(&program, Projects.directory(project))
   run ChildProcess.addArgument(&mut process, "plan")
   run ChildProcess.addArgument(&mut process, "--manifest-path")
   run ChildProcess.addArgumentBytes(&mut process, Path.rawBytes(Projects.manifest(project)))
@@ -725,27 +744,26 @@ effect fn refreshPlan(
     run ChildProcess.addArgument(&mut process, "--optimization")
     run ChildProcess.addArgument(&mut process, "size")
   }
-  let names = [
-    "PATH",
-    "HOME",
-    "SILK_HOME",
-    "SILK_CLANG",
-    "SILK_LLVM_AR",
-    "SDKROOT",
-    "DEVELOPER_DIR",
-    "SystemRoot",
-    "USERPROFILE",
-    "LOCALAPPDATA",
-  ]
+  let names = run HostInput.variableNames()
+  let listed = names.asSlice()
   let mut at: usize = 0
-  while at < names.length {
-    if let Option<Bytes>.Some { value } = move run HostInput.variableNamed(names[at]) {
-      run ChildProcess.setVariableBytes(&mut process, String.utf8Bytes(names[at]), value.asSlice())
+  while at < listed.length {
+    let name = listed[at].asSlice()
+    if !same(name, b"SILK_PLAN_BUILTIN") {
+      if let Option<Bytes>.Some { value } = move run HostInput.variable(name) {
+        run ChildProcess.setVariableBytes(&mut process, name, value.asSlice())
+      }
     }
     at = at + 1
   }
+
+  // The editor never fetches; a plan that needs a fetch fails and keeps the saved requests.
   run ChildProcess.setVariable(&mut process, "SILK_OFFLINE", "1")
-  run ChildProcess.setVariableBytes(&mut process, b"TMPDIR", Path.rawBytes(&steps))
+
+  // Without a `Plan` variant the driver plans without building or starting the tasks program.
+  if builtIn {
+    run ChildProcess.setVariable(&mut process, "SILK_PLAN_BUILTIN", "1")
+  }
   let mut provider = OsChildProcess.make()
   let result = run Effect.result(
     ChildProcess.submit(&process) |> Effect.provideMut<ChildProcess>(&mut provider),

@@ -114,7 +114,11 @@ A dependency's tool steps require `tools = true` on its dependency entry. Tools 
 
 Requests contain absolute source and native paths, all package parameters, generated modules, compiler settings and platform inputs. Replaying a request uses these captured values even when an ambient manifest changes.
 
-The language server reads saved requests and `compile_commands.json`. With workspace trust and refresh enabled, it may run the root's `plan` under confinement. A project with a `tasks.silk` builds and starts its tasks program under the same confinement; without a `Plan` variant that program runs nothing and the built-in plan is used. An unavailable or refused refresh retains the last usable requests and reports that the developer should run `silk build` or `silk plan`. `check`, `format`, `doc`, `hash` and `pack` do not run project tasks.
+The language server reads saved requests and `compile_commands.json`. With workspace trust and refresh enabled, it runs `silk plan` for the root with the developer's own permissions and environment, so its requests match what `silk build` writes. A project without a `Plan` variant uses the built-in compilation without building or starting its tasks program (the server sets `SILK_PLAN_BUILTIN=1` for `silk plan`), and the server asks nothing more.
+
+A project whose tasks have their own `Plan` variant runs project code, so the server asks once, with Allow and Not now, before it runs it. The server reads `tasks.silk` to tell; it does not run it. Allow is recorded in `$SILK_HOME/editor-plans` (`~/.silk/editor-plans` without `SILK_HOME`), never in the output directory. The record covers the repository's common Git directory, so every worktree of a repository shares it; a project outside Git is covered by the canonical path of its workspace root. Deleting the record's file revokes it. Not now lasts for the editor session.
+
+When the server does not run a plan, it reads the requests the last build or plan saved in `build/requests/`, and says once per session when `tasks.silk` is newer than they are. A failed refresh retains the last usable requests and reports that the developer should run `silk build` or `silk plan`. `check`, `format`, `doc`, `hash` and `pack` do not run project tasks.
 
 ## Package code generation and platforms
 
