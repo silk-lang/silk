@@ -36,7 +36,9 @@
 //! [`forward`] walks the dominator tree, carrying what memory holds from a block into each block
 //! whose only predecessor it is, and starting from nothing at every merge. A load of the place,
 //! size and kind a store wrote, or an earlier load read, with no aliasing write or clobbering
-//! operation between, becomes that value; an integer load of bytes inside a wider integer
+//! operation between, becomes that value; a load through an address of unknown place becomes the
+//! value an earlier load through the same address value read, with no write, copy, fill or
+//! clobbering operation at all between; an integer load of bytes inside a wider integer
 //! constant a store wrote becomes the constant those bytes hold; a store of the value a place
 //! already holds goes. Both
 //! removed accesses touch exactly the bytes of an earlier access that did not trap, so neither
@@ -502,7 +504,22 @@ impl Copy for Held {}
 // How many of the newest held entries an access is checked against.
 fn window() -> usize { return 128 }
 
+// What an earlier load read through an address whose place is not known: the address value,
+// the load's offset and kind, and the value it read.
+struct Read {
+  address: u64,
+  offset: u64,
+  kind: Kind,
+  value: u64,
+}
+
+impl Copy for Read {}
+
 struct Forwarding {
+  // The loads through addresses of unknown place since the last write of any kind, in the
+  // blocks the walk is in; entries below `readFloor` are not visible.
+  reads: List<Read>,
+  readFloor: usize,
   held: List<Held>,
   // Entries below `floor` are not visible: a merge started from nothing.
   floor: usize,
@@ -519,7 +536,7 @@ struct Forwarding {
 pub effect fn forward(function: &mut SsaFunction) -> bool ! OutOfMemoryError ? &mut Allocator {
   let graph = run SsaGraph.of(&function.*)
   let escaped = run escapedSlots(&function.*)
-  let mut state = Forwarding {held: List<Held>.make(), floor: usize.ZERO, killed: List<usize>.make(), substitution: List<u64>.make(), escaped: move escaped,
+  let mut state = Forwarding {reads: List<Read>.make(), readFloor: usize.ZERO, held: List<Held>.make(), floor: usize.ZERO, killed: List<usize>.make(), substitution: List<u64>.make(), escaped: move escaped,
     bits: function.addressBits, changed: false}
   run List<u64>.appendRepeated(&mut state.substitution, none(), function.valueCount())
   // Entries: a block to enter, or `usize.MAX - mark` to leave the mark at that position.
@@ -533,6 +550,9 @@ pub effect fn forward(function: &mut SsaFunction) -> bool ! OutOfMemoryError ? &
       let held = List<usize>.get(&marks, mark)
       let killed = List<usize>.get(&marks, mark + usize.ONE)
       state.floor = List<usize>.get(&marks, mark + 2)
+      // A write below this block hid the reads above it only there.
+      List<Read>.truncate(&mut state.reads, List<usize>.get(&marks, mark + 3))
+      state.readFloor = List<usize>.get(&marks, mark + 4)
       List<Held>.truncate(&mut state.held, held)
       while List<usize>.length(&state.killed) > killed {
         let last = List<usize>.length(&state.killed) - usize.ONE
@@ -551,8 +571,13 @@ pub effect fn forward(function: &mut SsaFunction) -> bool ! OutOfMemoryError ? &
     run List<usize>.append(&mut marks, List<Held>.length(&state.held))
     run List<usize>.append(&mut marks, List<usize>.length(&state.killed))
     run List<usize>.append(&mut marks, state.floor)
+    run List<usize>.append(&mut marks, List<Read>.length(&state.reads))
+    run List<usize>.append(&mut marks, state.readFloor)
     run List<usize>.append(&mut walk, usize.MAX - mark)
-    if graph.predecessorsOf(block).length != usize.ONE { state.floor = List<Held>.length(&state.held) }
+    if graph.predecessorsOf(block).length != usize.ONE {
+      state.floor = List<Held>.length(&state.held)
+      state.readFloor = List<Read>.length(&state.reads)
+    }
     run forwardBlock(&mut state, &mut function.*, block)
     let children = graph.childrenOf(block)
     let mut child = children.length
@@ -693,6 +718,26 @@ effect fn forwardBlock(state: &mut Forwarding, function: &mut SsaFunction, block
           state.changed = true
         } else if place.known {
           run List<Held>.append(&mut state.held, Held {place: place, size: size, kind: found.kind, value: found.result, alive: true})
+        } else {
+          // The same address value read again with no write of any kind between reads the same
+          // bytes, wherever they are.
+          let address = resolved(&state.*, function.operandsOf(instruction)[usize.ZERO])
+          let reads = List<Read>.asSlice(&state.reads)
+          let mut earlier = none()
+          let mut read = reads.length
+          let mut seen = usize.ZERO
+          while read > state.readFloor && seen < window() && earlier == none() {
+            read = read - usize.ONE
+            seen = seen + usize.ONE
+            if reads[read].address == address && reads[read].offset == offset && reads[read].kind.equals(found.kind) { earlier = reads[read].value }
+          }
+          if earlier != none() {
+            List<u64>.set(&mut state.substitution, u64.toUsize(found.result), earlier)
+            function.remove(instruction)
+            state.changed = true
+          } else {
+            run List<Read>.append(&mut state.reads, Read {address: address, offset: offset, kind: found.kind, value: found.result})
+          }
         }
       }
       Operation.Store {offset, ..} => {
@@ -706,19 +751,27 @@ effect fn forwardBlock(state: &mut Forwarding, function: &mut SsaFunction, block
           function.remove(instruction)
           state.changed = true
         } else {
+          state.readFloor = List<Read>.length(&state.reads)
           run kill(&mut state.*, place, size)
           if place.known { run List<Held>.append(&mut state.held, Held {place: place, size: size, kind: kind, value: value, alive: true}) }
         }
       }
       Operation.CopyBytes {size} => {
         let place = placeOf(&function.*, resolved(&state.*, function.operandsOf(instruction)[usize.ZERO]), 0)
+        state.readFloor = List<Read>.length(&state.reads)
         run kill(&mut state.*, place, size)
       }
       Operation.Fill {size, ..} => {
         let place = placeOf(&function.*, resolved(&state.*, function.operandsOf(instruction)[usize.ZERO]), 0)
+        state.readFloor = List<Read>.length(&state.reads)
         run kill(&mut state.*, place, size)
       }
-      _ => { if clobbers(found.operation) { run clobber(&mut state.*) } }
+      _ => {
+        if clobbers(found.operation) {
+          state.readFloor = List<Read>.length(&state.reads)
+          run clobber(&mut state.*)
+        }
+      }
     }
     at = at + usize.ONE
   }
