@@ -27,8 +27,10 @@ and whether unknown keys are rejected. The rules are data, so the same declarati
 read, words its errors, and fills the type's `silk.schema.shape.Shapes`, which JSON Schema
 and command line help are rendered from.
 
-A format implements [`SchemaReader`](#SchemaReader) and [`SchemaWriter`](#SchemaWriter), so the same types read JSON today and
-other formats later without changes.
+A format implements [`SchemaReader`](#SchemaReader) and [`SchemaWriter`](#SchemaWriter), so the same types read and write
+JSON, TOML, YAML and MessagePack without changes. Binary data is a `silk.collections.bytes.Bytes`
+field: a format with a binary type, such as MessagePack, holds the bytes as they are, and a text
+format holds them as Base64 text.
 
 ## Gotchas
 Every field of a derived struct or variant must be public, because reflection sees only public
@@ -85,8 +87,8 @@ Public declarations: 11.
 pub interface SchemaReader
 ```
 
-The reading side of a data format, in terms every format shares: scalars, text, lists and
-objects.
+The reading side of a data format, in terms every format shares: scalars, text, bytes, lists
+and objects.
 
 ### When to use
 
@@ -196,6 +198,25 @@ Reads text.
 
 - `Issue` with `IssueReason.InvalidType` for another kind of value.
 - `OutOfMemoryError` if the `Allocator` cannot supply the text.
+
+<a id="SchemaReader.bytes"></a>
+
+### Operation `bytes`
+
+```silk
+effect fn bytes(self: &mut Self) -> Bytes
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
+```
+
+Reads binary data. The default reads text and decodes it as standard Base64 with padding
+(RFC 4648), which is how a text format holds bytes; a format with a binary type overrides it.
+
+#### Errors
+
+- `Issue` with `IssueReason.InvalidType` for another kind of value, or `InvalidValue` for text
+  that is not Base64.
+- `OutOfMemoryError` if the `Allocator` cannot supply the bytes.
 
 <a id="SchemaReader.null"></a>
 
@@ -402,8 +423,8 @@ Forgets `mark` and every later one, after the part read from it succeeded.
 pub interface SchemaWriter
 ```
 
-The writing side of a data format, in terms every format shares: scalars, text, lists and
-objects.
+The writing side of a data format, in terms every format shares: scalars, text, bytes, lists
+and objects.
 
 ### When to use
 
@@ -414,6 +435,8 @@ point, such as `silk.schema.json.SchemaJson.encode`.
 
 The schema writes a list as `beginList`, then `element` before each element, then `endList`. It
 writes an object as `beginObject`, then `key` before each member's value, then `endObject`.
+`beginList` and `beginObject` are told how many elements or members follow, because a format
+such as MessagePack writes that count first; a format that does not need it ignores it.
 
 <a id="SchemaWriter.taggedOptions"></a>
 
@@ -480,6 +503,25 @@ effect fn text(self: &mut Self, value: string) -> () ! Issue | WriterError ? &mu
 
 Writes text.
 
+<a id="SchemaWriter.bytes"></a>
+
+### Operation `bytes`
+
+```silk
+effect fn bytes(self: &mut Self, value: &[u8]) -> ()
+    ! Issue | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator
+```
+
+Writes binary data. The default writes it as text in standard Base64 with padding (RFC 4648),
+which is how a text format holds bytes; a format with a binary type overrides it.
+
+#### Errors
+
+- `Issue` if the format cannot hold the value.
+- `WriterError` if the `Writer` fails.
+- `OutOfMemoryError` if the `Allocator` cannot supply the Base64 text.
+
 <a id="SchemaWriter.null"></a>
 
 ### Operation `null`
@@ -495,10 +537,11 @@ Writes a null value.
 ### Operation `beginList`
 
 ```silk
-effect fn beginList(self: &mut Self) -> () ! Issue | WriterError ? &mut Writer
+effect fn beginList(self: &mut Self, count: usize) -> () ! Issue | WriterError ? &mut Writer
 ```
 
-Starts a list.
+Starts a list of `count` elements. Exactly `count` calls of `element` follow, each before
+its element, and then `endList`.
 
 <a id="SchemaWriter.element"></a>
 
@@ -525,10 +568,11 @@ Ends the list being written.
 ### Operation `beginObject`
 
 ```silk
-effect fn beginObject(self: &mut Self) -> () ! Issue | WriterError ? &mut Writer
+effect fn beginObject(self: &mut Self, count: usize) -> () ! Issue | WriterError ? &mut Writer
 ```
 
-Starts an object.
+Starts an object of `count` members. Exactly `count` calls of `key` follow, each before its
+member's value, and then `endObject`.
 
 <a id="SchemaWriter.key"></a>
 
@@ -899,8 +943,8 @@ and `shape` for a type whose wire form is not its fields, usually with [`Schemas
 
 ### Details
 
-The standard library implements it for `bool`, the integer types, `f64`, `String`, `Option<T>`
-and `List<T>`.
+The standard library implements it for `bool`, the integer types, `f64`, `String`, `Bytes`,
+`Box<T>`, `Option<T>`, `List<T>` and `Dictionary<T>`.
 
 <a id="Schema.spec"></a>
 
@@ -1657,6 +1701,60 @@ effect fn satisfies(self: &Self, constraint: Constraint) -> bool
 ```
 
 Tests a length in characters, or a pattern.
+
+<a id="Bytes.impl.Schema"></a>
+
+## Implementation `Schema for Bytes`
+
+```silk
+impl Schema for Bytes
+```
+
+<a id="Bytes.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns `ValueKind.Bytes`.
+
+<a id="Bytes.impl.Schema.read"></a>
+
+### Operation `read`
+
+```silk
+effect fn read<R: SchemaReader>(reader: &mut R) -> Bytes
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
+```
+
+Reads binary data: the format's binary type, or Base64 text in a text format.
+
+<a id="Bytes.impl.Schema.write"></a>
+
+### Operation `write`
+
+```silk
+effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+    ! Issue | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator
+```
+
+Writes the bytes: as the format's binary type, or as Base64 text in a text format.
+
+<a id="Bytes.impl.Schema.shape"></a>
+
+### Operation `shape`
+
+```silk
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self>
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Adds `Shape.Bytes`.
 
 <a id="Box.impl.Schema"></a>
 
