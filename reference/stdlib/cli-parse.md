@@ -26,7 +26,9 @@ grouped one-letter flags such as `-abc`, positional arguments, and `--`, after w
 argument is positional. An option that takes one value, or a flag, may be given once; a
 `List` field takes each occurrence. An unknown option names the closest option, when one is
 close. `--help` and `-h` give
-[`Parsed.Help`](#Parsed.Help), and `--version` gives [`Parsed.Version`](#Parsed.Version) when the command has a version.
+[`Parsed.Help`](#Parsed.Help), `--help=json` gives it with `json` set, and `--version` gives
+[`Parsed.Version`](#Parsed.Version) when the command has a version. [`Cli.writeHelpJson`](#Cli.impl.writeHelpJson) writes the help as one
+JSON object, for editors and agents.
 
 Import as `Cli` with `import silk.cli.parse { Cli }`.
 
@@ -342,7 +344,8 @@ The parsed struct.
 Help
 ```
 
-The command line asked for the help text.
+The command line asked for the help text, with `--help` or `-h`, or for the help as JSON,
+with `--help=json`.
 
 <a id="Parsed.Help.command"></a>
 
@@ -353,7 +356,18 @@ pub command: string<'static>
 ```
 
 The subcommand path whose help was asked for, such as `remote.add`, in the names the
-command line uses. Empty for the root command. Give it to [`Cli.writeHelp`](#Cli.impl.writeHelp).
+command line uses. Empty for the root command. Give it to [`Cli.writeHelp`](#Cli.impl.writeHelp), or to
+[`Cli.writeHelpJson`](#Cli.impl.writeHelpJson) when `json` is set.
+
+<a id="Parsed.Help.json"></a>
+
+#### Field `json`
+
+```silk
+pub json: bool
+```
+
+Whether the command line gave `--help=json`.
 
 <a id="Parsed.Version"></a>
 
@@ -569,6 +583,85 @@ pub effect fn writeHelp<T: CommandLine>(path: string) -> ()
 
 Writes the help text of the command or subcommand at `path` (from [`Parsed.Help`](#Parsed.Help); empty
 for the root command) of `T`.
+
+#### Errors
+
+- `WriterError` if the `Writer` fails.
+
+<a id="Cli.impl.writeHelpAs"></a>
+
+### Associated function `writeHelpAs`
+
+```silk
+pub effect fn writeHelpAs<T: CommandLine>(static name: string<'static>, path: string) -> ()
+    ! WriterError
+    ? &mut Writer
+```
+
+[`Cli.writeHelp`](#Cli.impl.writeHelp), with `name` in place of the name of `T`'s command, as for a program that
+another runs, such as `silk task`.
+
+#### Errors
+
+- `WriterError` if the `Writer` fails.
+
+<a id="Cli.impl.writeEachHelp"></a>
+
+### Associated function `writeEachHelp`
+
+```silk
+pub effect fn writeEachHelp<T: CommandLine>(
+    static name: string<'static>,
+    static heading: string<'static>,
+  ) -> ()
+    ! WriterError
+    ? &mut Writer
+```
+
+Writes the subcommands of `T`, a union, under `heading`, and then the help of each one, as
+`<name> <subcommand> --help` writes it. `name` stands for the name of `T`'s command. For a
+`T` that is not a union, writes [`Cli.writeHelpAs`](#Cli.impl.writeHelpAs).
+
+#### Errors
+
+- `WriterError` if the `Writer` fails.
+
+<a id="Cli.impl.writeHelpJson"></a>
+
+### Associated function `writeHelpJson`
+
+```silk
+pub effect fn writeHelpJson<T: CommandLine>(path: string) -> ()
+    ! WriterError
+    ? &mut Writer
+```
+
+Writes the help of the command or subcommand at `path` of `T` (from [`Parsed.Help`](#Parsed.Help); empty
+for the root command) as one JSON object and a line break. The object has `name`, such as
+`git remote add`, `description`, `version` (empty below the root and when there is none),
+`options`, `arguments`, and `commands`, the subcommands' objects with everything below them.
+Each option has `name` (`--long`), `short` (`-s` or empty), `value` (whether it takes one),
+`repeatable`, `required`, `description`, `choices`, `env`, `default` (empty when it has
+none), and `aliases`, the fixed-value flags, each with `name` and `value`. Each argument has
+`name`, `description`, `required`, `repeatable`, `choices` and `default`. `--help` and
+`--version` are not listed.
+
+#### Errors
+
+- `WriterError` if the `Writer` fails.
+
+<a id="Cli.impl.writeHelpJsonAs"></a>
+
+### Associated function `writeHelpJsonAs`
+
+```silk
+pub effect fn writeHelpJsonAs<T: CommandLine>(static name: string<'static>, path: string) -> ()
+    ! WriterError
+    ? &mut Writer
+```
+
+[`Cli.writeHelpJson`](#Cli.impl.writeHelpJson), with `name` in place of the name of `T`'s command, as for a program
+that another runs, such as `silk task`.
 
 #### Errors
 
