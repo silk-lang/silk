@@ -4536,7 +4536,10 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   const managedRoot = yield* invoke(silk, ['init', '--workspace', 'managed'], directory)
   assert.equal(managedRoot.status, 0, managedRoot.stderr)
   // A new workspace has one starter executable member, so it builds and runs at once.
-  assert.equal(yield* fs.readFileString(join(managed, 'silk.toml')), '[workspace]\nmembers = ["app"]\n')
+  assert.equal(
+    yield* fs.readFileString(join(managed, 'silk.toml')),
+    '[workspace]\nmembers = ["app"]\nsilk-version = "0.0.0"\n',
+  )
   assert.match(managedRoot.stdout, /^Initialized Silk project app at .*\/managed\/app$/m)
   assert.equal(yield* fs.exists(join(managed, 'app/src/main.silk')), true)
   assert.equal(yield* fs.exists(join(managed, 'app/.gitignore')), false)
@@ -4547,7 +4550,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   assert.equal(namedRoot.status, 0, namedRoot.stderr)
   assert.equal(
     yield* fs.readFileString(join(directory, 'named/silk.toml')),
-    '[workspace]\nmembers = ["store"]\n',
+    '[workspace]\nmembers = ["store"]\nsilk-version = "0.0.0"\n',
   )
   assert.match(yield* fs.readFileString(join(directory, 'named/store/silk.toml')), /^name = "store"$/m)
   // The rest of this test assembles its members by hand.
