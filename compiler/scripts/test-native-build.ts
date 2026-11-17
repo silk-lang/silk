@@ -433,6 +433,45 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   const reached = yield* invoke(silk, ['task', '--stdlib', standardLibrary, 'code'], held, requestEnv, 120_000)
   assert.notEqual(reached.status, 0, 'a tasks program that reaches the package links its C')
   assert.match(reached.stderr, /held_missing_symbol/)
+  // A C-only dependency that nothing imports links only when the dependent's plan names it with
+  // Plan.linkDependency; declaring it is not enough, and naming an undeclared one refuses the plan.
+  const heldC = join(held, 'held-c')
+  yield* fs.makeDirectory(join(heldC, 'src'), { recursive: true })
+  yield* fs.writeFileString(join(heldC, 'silk.toml'), '[package]\nname="held-c"\nkind="library"\nexports=["lib"]\n')
+  yield* fs.writeFileString(join(heldC, 'src/lib.silk'), '//! Only C.\n')
+  yield* fs.writeFileString(join(heldC, 'build.silk'), [
+    'import silk.build.plan { Plan }',
+    'import silk.build.step { sourcePath }',
+    'static fn plan() -> Plan {',
+    '  return Plan.empty() |> Plan.compileNative("c", sourcePath("defines.c"), &[], &[])',
+    '}',
+    'pub const PLAN: Plan = plan()',
+    '',
+  ].join('\n'))
+  yield* fs.writeFileString(join(heldC, 'defines.c'), 'int held_missing_symbol(void) { return 7; }\n')
+  yield* fs.writeFileString(join(held, 'silk.toml'), '[package]\nname="held-native"\n[dependencies]\nheld_c = {path="held-c"}\n')
+  yield* fs.writeFileString(join(held, 'src/tasks.silk'), heldTasks(false))
+  const heldPlan = (linked: string | undefined) => [
+    'import silk.build.plan { Plan }',
+    'import silk.build.step { sourcePath }',
+    'static fn plan() -> Plan {',
+    `  return Plan.empty() |> Plan.compileNative("c", sourcePath("native/needs.c"), &[], &[])${linked === undefined ? '' : ` |> Plan.linkDependency("${linked}")`}`,
+    '}',
+    'pub const PLAN: Plan = plan()',
+    '',
+  ].join('\n')
+  const declaredOnly = yield* invoke(silk, ['run', '--stdlib', standardLibrary], held, requestEnv, 120_000)
+  assert.notEqual(declaredOnly.status, 0, 'a declared dependency nothing imports does not link')
+  assert.match(declaredOnly.stderr, /held_missing_symbol/)
+  yield* fs.writeFileString(join(held, 'build.silk'), heldPlan('held_c'))
+  const linkedRun = yield* invoke(silk, ['run', '--stdlib', standardLibrary], held, requestEnv, 120_000)
+  assert.equal(linkedRun.status, 0, linkedRun.stderr)
+  const stillHeld = yield* invoke(silk, ['task', '--stdlib', standardLibrary, 'code'], held, requestEnv, 120_000)
+  assert.equal(stillHeld.status, 29, stillHeld.stderr)
+  yield* fs.writeFileString(join(held, 'build.silk'), heldPlan('absent'))
+  const undeclared = yield* invoke(silk, ['run', '--stdlib', standardLibrary], held, requestEnv, 120_000)
+  assert.notEqual(undeclared.status, 0)
+  assert.match(undeclared.stderr, /Plan\.linkDependency names `absent`, which the package's manifest does not declare/)
   const argumentsFor = (output: string) => [
     'build',
     'main.silk',
