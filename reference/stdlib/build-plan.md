@@ -246,6 +246,24 @@ The package's native symbol order file.
 pub path: Input
 ```
 
+<a id="Operation.LinkDependency"></a>
+
+### `LinkDependency`
+
+```silk
+LinkDependency
+```
+
+A declared dependency whose native plan links into this package's artifacts.
+
+<a id="Operation.LinkDependency.name"></a>
+
+#### Field `name`
+
+```silk
+pub name: string<'static>
+```
+
 <a id="Library"></a>
 
 ## `Library`
@@ -635,6 +653,18 @@ pub static fn linkLibrary(self: Self, name: string<'static>, library: Library) -
 ```
 
 Links a named library as `library` describes, for example `Library.dynamicSearch()`.
+
+<a id="Plan.impl.linkDependency"></a>
+
+### Method `linkDependency`
+
+```silk
+pub static fn linkDependency(self: Self, name: string<'static>) -> Self
+```
+
+Links the native plan of `name`, a dependency this package declares, into every artifact that
+links this package, even when nothing imports it: for a package of only C, whose functions
+this package declares itself. A name the manifest does not declare refuses the plan.
 
 <a id="Plan.impl.linkFramework"></a>
 
