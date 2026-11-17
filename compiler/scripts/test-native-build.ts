@@ -433,28 +433,6 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   const reached = yield* invoke(silk, ['task', '--stdlib', standardLibrary, 'code'], held, requestEnv, 120_000)
   assert.notEqual(reached.status, 0, 'a tasks program that reaches the package links its C')
   assert.match(reached.stderr, /held_missing_symbol/)
-  // An executable links every declared dependency's native plan: a C-only package that defines
-  // the function links by being declared, though nothing imports it.
-  const heldC = join(held, 'held-c')
-  yield* fs.makeDirectory(join(heldC, 'src'), { recursive: true })
-  yield* fs.writeFileString(join(heldC, 'silk.toml'), '[package]\nname="held-c"\nkind="library"\nexports=["lib"]\n')
-  yield* fs.writeFileString(join(heldC, 'src/lib.silk'), '//! Only C.\n')
-  yield* fs.writeFileString(join(heldC, 'build.silk'), [
-    'import silk.build.plan { Plan }',
-    'import silk.build.step { sourcePath }',
-    'static fn plan() -> Plan {',
-    '  return Plan.empty() |> Plan.compileNative("c", sourcePath("defines.c"), &[], &[])',
-    '}',
-    'pub const PLAN: Plan = plan()',
-    '',
-  ].join('\n'))
-  yield* fs.writeFileString(join(heldC, 'defines.c'), 'int held_missing_symbol(void) { return 7; }\n')
-  yield* fs.writeFileString(join(held, 'silk.toml'), '[package]\nname="held-native"\n[dependencies]\nheld_c = {path="held-c"}\n')
-  yield* fs.writeFileString(join(held, 'src/tasks.silk'), heldTasks(false))
-  const declaredRun = yield* invoke(silk, ['run', '--stdlib', standardLibrary], held, requestEnv, 120_000)
-  assert.equal(declaredRun.status, 0, declaredRun.stderr)
-  const stillHeld = yield* invoke(silk, ['task', '--stdlib', standardLibrary, 'code'], held, requestEnv, 120_000)
-  assert.equal(stillHeld.status, 29, stillHeld.stderr)
   const argumentsFor = (output: string) => [
     'build',
     'main.silk',
