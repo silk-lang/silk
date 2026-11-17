@@ -743,8 +743,14 @@ The sealed scalar intrinsics such pure functions wrap evaluate with the semantic
 operators: arithmetic and conversions stop evaluation on overflow, and checked forms return through
 their `present` and `absent` function values.
 
+A body that holds static work, such as a `static for`, a `static if` or a `let static`, is checked
+for each static call as a `static fn` body with that call's argument values, so
+`Reflect.enumLabelOf(member)` names a member in static code as well as at runtime.
+
 **Boundary:** A pure function body is still checked as runtime code, so reaching a runtime-only
-operation inside it, such as a raw pointer read, stops static evaluation at that operation. A
+operation inside it, such as a raw pointer read, stops static evaluation at that operation. A body
+with static work is checked for static evaluation under the rules of a `static fn` body, so an
+exclusive borrow in it stops static evaluation with `SEM0176`. A
 scalar intrinsic without a source operator, such as a wrapping or saturating form, is not yet
 evaluated.
 
@@ -753,7 +759,8 @@ pure body that static evaluation cannot perform reports `SEM0176` at that work, 
 trace.
 
 **Evidence:** static function requirements,
-[pure call corpus program](../corpus/native/static-pure-functions/main.silk).
+[pure call corpus program](../corpus/native/static-pure-functions/main.silk),
+[static work corpus program](../corpus/native/static-calls-mixed-function/main.silk).
 
 ## Constructing types field by field
 

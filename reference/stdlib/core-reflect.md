@@ -406,23 +406,8 @@ Returns the members of the scalar enum `Enum`, in declaration order.
 #### Details
 
 Use the result as the sequence of a `static for`. Each element is a value of `Enum`; read
-its name with [`Reflect.enumLabel`](#Reflect.impl.enumLabel) and its discriminant with [`Reflect.enumValue`](#Reflect.impl.enumValue). The
+its name with [`Reflect.enumLabelOf`](#Reflect.impl.enumLabelOf) and its discriminant with [`Reflect.enumValue`](#Reflect.impl.enumValue). The
 sequence has no runtime representation.
-
-<a id="Reflect.impl.enumLabel"></a>
-
-### Associated function `enumLabel`
-
-```silk
-pub static fn enumLabel<Enum>(value: Enum) -> string<'static>
-```
-
-Returns the name of the scalar enum member `value`, as written in the enum declaration.
-
-#### Gotchas
-
-It runs only during static evaluation, so `value` must be known then, such as a member from
-[`Reflect.enumMembers`](#Reflect.impl.enumMembers). Use [`Reflect.enumLabelOf`](#Reflect.impl.enumLabelOf) for a value known only at runtime.
 
 <a id="Reflect.impl.enumValue"></a>
 
@@ -459,7 +444,7 @@ enum declaration.
 #### Details
 
 At runtime it compares `value` with each member in turn, like a `match` with one arm for each
-member.
+member. Static code can call it too, such as on a member from [`Reflect.enumMembers`](#Reflect.impl.enumMembers).
 
 <a id="Reflect.impl.enumFromLabel"></a>
 
