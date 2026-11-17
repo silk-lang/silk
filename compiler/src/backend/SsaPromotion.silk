@@ -8,16 +8,19 @@
 //! # Details
 //! A slot is promotable when every use of its address, directly or through `Offset`, is the
 //! address operand of a `Load` or `Store`, and its accesses fall on fields that do not overlap
-//! and each have one kind; a `FrameAddress` anywhere can reach every slot but a variable's, so
-//! none of those is promotable then. Each field becomes a variable. A variable that some block
-//! reads before storing it gets block parameters on the iterated dominance frontier of its stores
-//! (Cytron et al.); one that every block stores before reading needs none (Briggs et al.'s
-//! semi-pruned form), and a walk of the dominator tree
+//! and each have one kind, or are integers that start at one offset: the widest is the field,
+//! and a narrower access reads or writes its low part; a `FrameAddress` anywhere can reach every
+//! slot but a variable's, so none of those is promotable then. Each field becomes a variable. A
+//! variable that some block reads before storing it gets block parameters on the iterated
+//! dominance frontier of its stores (Cytron et al.); one that every block stores before reading
+//! needs none (Briggs et al.'s semi-pruned form), and a walk of the dominator tree
 //! replaces each load with the value last stored on its path, or a zero of the field's kind before
 //! any store, and passes the current values along each edge. Parameters that end up passing one
 //! value, or feeding nothing, are removed (`pruneParameters`).
 
 import backend.SsaFunction {
+  Binary,
+  Cast,
   Definition,
   Edge,
   Kind,
@@ -41,30 +44,103 @@ struct Field {
 
 impl Copy for Field {}
 
+// The largest slot, in bytes, whose integer accesses of different widths share fields: an
+// `Option` or `Result` of a word or two. A large aggregate that only mismatched widths kept in
+// memory would become a block parameter for each field at every join of a long loop, which costs
+// more there than its loads and stores did.
+fn sharedSlot() -> u64 { return 32 }
+
+// Whether accesses of `kind` can share a field with other integers there: a scalar integer of
+// one, two, four or eight bytes.
+fn sliced(kind: Kind) -> bool {
+  let size = kind.storeSize()
+  return kind.isInteger() && !kind.isVector() && (size == 1 || size == 2 || size == 4 || size == 8)
+}
+
 // Adds access `access` to a slot's distinct `fields`; answers false when it overlaps a field it
-// does not match, so the slot stays in memory.
-effect fn addField(fields: &mut List<Field>, access: Field) -> bool ! OutOfMemoryError ? &mut Allocator {
-  let listed = List<Field>.asSlice(&fields.*)
-  let size = usize.toU64(access.kind.storeSize())
+// cannot share, so the slot stays in memory. With `shares`, integer accesses that start at one
+// offset share one field: an integer as wide as the widest, whose low part the narrower ones read
+// and write (`readPart`, `writePart`). A copy expanded word by word
+// stores a tag byte and its padding as one word that the code then reads as a byte.
+effect fn addField(fields: &mut List<Field>, access: Field, shares: bool) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut wanted = access
   let mut at = usize.ZERO
-  while at < listed.length {
-    let other = listed[at]
-    if other.offset == access.offset && other.kind.equals(access.kind) { return true }
+  while at < List<Field>.length(&fields.*) {
+    let other = List<Field>.get(&fields.*, at)
+    if other.offset == wanted.offset && other.kind.equals(wanted.kind) { return true }
+    let size = usize.toU64(wanted.kind.storeSize())
     let otherSize = usize.toU64(other.kind.storeSize())
-    if access.offset < other.offset + otherSize && other.offset < access.offset + size { return false }
+    if wanted.offset < other.offset + otherSize && other.offset < wanted.offset + size {
+      // Only accesses that start together share a field: a part further in costs a shift and a
+      // mask at every access, more than the memory access it replaces in a loop over bytes.
+      if !shares || !sliced(wanted.kind) || !sliced(other.kind) || other.offset != wanted.offset { return false }
+      let mut widest = size
+      if otherSize > widest { widest = otherSize }
+      wanted = Field {offset: wanted.offset, kind: Kind.integer(u64.toUsize(widest) * 8)}
+      // The field takes the other's place, and is checked against the rest from the start.
+      drop List<Field>.remove(&mut fields.*, at)
+      at = usize.ZERO
+      continue
+    }
     at = at + usize.ONE
   }
-  run List<Field>.append(&mut fields.*, access)
+  run List<Field>.append(&mut fields.*, wanted)
   return true
 }
 
+// The field of `fields` that holds the byte at `offset`.
 fn fieldAt(fields: &[Field], offset: u64) -> usize {
   let mut at = usize.ZERO
   while at < fields.length {
-    if fields[at].offset == offset { return at }
+    if fields[at].offset <= offset && offset < fields[at].offset + usize.toU64(fields[at].kind.storeSize()) { return at }
     at = at + usize.ONE
   }
   return usize.MAX
+}
+
+// The part of the integer `whole` that an access of `kind`, `shift` bytes into it, reads:
+// instructions inserted at `position` of `block`, whose count `added` grows by.
+effect fn readPart(function: &mut SsaFunction, block: usize, position: usize, added: &mut usize, whole: u64, kind: Kind, shift: u64, place: u64) -> u64
+! OutOfMemoryError ? &mut Allocator {
+  let wide = function.kindOf(whole)
+  let mut value = whole
+  if shift != 0 {
+    let amount = run function.constant(wide, shift * 8)
+    value = run function.insertInstruction(block, position + added.*, Operation.Binary {operation: Binary.LShr}, wide, &[value, amount], place)
+    added.* = added.* + usize.ONE
+  }
+  if kind.equals(wide) { return value }
+  value = run function.insertInstruction(block, position + added.*, Operation.Cast {operation: Cast.Trunc}, kind, &[value], place)
+  added.* = added.* + usize.ONE
+  return value
+}
+
+// The integer `whole` with the part an access of `value`'s kind writes, `shift` bytes into it,
+// replaced by `value`: instructions inserted at `position` of `block`, whose count `added` grows
+// by. A flag is written as its byte.
+effect fn writePart(function: &mut SsaFunction, block: usize, position: usize, added: &mut usize, whole: u64, value: u64, shift: u64, place: u64) -> u64
+! OutOfMemoryError ? &mut Allocator {
+  let wide = function.kindOf(whole)
+  let kind = function.kindOf(value)
+  let bits = usize.toU64(kind.storeSize()) * 8
+  let mut part = value
+  if !kind.equals(wide) {
+    part = run function.insertInstruction(block, position + added.*, Operation.Cast {operation: Cast.ZExt}, wide, &[part], place)
+    added.* = added.* + usize.ONE
+  }
+  if bits == usize.toU64(wide.bits) { return part }
+  if shift != 0 {
+    let amount = run function.constant(wide, shift * 8)
+    part = run function.insertInstruction(block, position + added.*, Operation.Binary {operation: Binary.Shl}, wide, &[part, amount], place)
+    added.* = added.* + usize.ONE
+  }
+  let field = u64.shiftLeft(u64.shiftLeft(1, bits) - 1, shift * 8)
+  let kept = run function.constant(wide, u64.bitXor(field, u64.MAX))
+  let rest = run function.insertInstruction(block, position + added.*, Operation.Binary {operation: Binary.And}, wide, &[whole, kept], place)
+  added.* = added.* + usize.ONE
+  let joined = run function.insertInstruction(block, position + added.*, Operation.Binary {operation: Binary.Or}, wide, &[rest, part], place)
+  added.* = added.* + usize.ONE
+  return joined
 }
 
 /// Promotes the builder's variable slots of `function`, and with `all` every other slot whose
@@ -142,7 +218,7 @@ pub effect fn promote(function: &mut SsaFunction, all: bool) -> () ! OutOfMemory
           let mut keeps = false
           if let Operation.Offset {..} = found.operation { keeps = true }
           if let Option<Field>.Some {value: field} = access {
-            keeps = run addField(&mut List<List<Field>>.asMutSlice(&mut fields)[from], field)
+            keeps = run addField(&mut List<List<Field>>.asMutSlice(&mut fields)[from], field, function.slot(from).size <= sharedSlot())
           }
           if !keeps { List<bool>.set(&mut escaped, from, true) }
         }
@@ -172,6 +248,8 @@ pub effect fn promote(function: &mut SsaFunction, all: bool) -> () ! OutOfMemory
   // One variable per field of a promoted slot.
   let mut firstVariable = run List<usize>.makeWithCapacity(slots)
   let mut kinds = List<Kind>.make()
+  // Where each variable's field starts in its slot.
+  let mut starts = List<u64>.make()
   slot = usize.ZERO
   while slot < slots {
     run List<usize>.append(&mut firstVariable, List<Kind>.length(&kinds))
@@ -180,6 +258,7 @@ pub effect fn promote(function: &mut SsaFunction, all: bool) -> () ! OutOfMemory
       let mut at = usize.ZERO
       while at < listed.length {
         run List<Kind>.append(&mut kinds, listed[at].kind)
+        run List<u64>.append(&mut starts, listed[at].offset)
         at = at + usize.ONE
       }
     }
@@ -236,6 +315,10 @@ pub effect fn promote(function: &mut SsaFunction, all: bool) -> () ! OutOfMemory
             let field = fieldAt(List<Field>.asSlice(&List<List<Field>>.asSlice(&fields)[from]), u64.wrappingAdd(offsets[u64.toUsize(operands[usize.ONE])], offset))
             let target = List<usize>.get(&firstVariable, from) + field
             List<usize>.set(&mut reached, instruction, target)
+            // A store of a part reads the rest of the field first.
+            if !function.kindOf(operands[usize.ZERO]).equals(List<Kind>.get(&kinds, target)) && List<usize>.get(&storedIn, target) != block + usize.ONE {
+              List<bool>.set(&mut crossing, target, true)
+            }
             List<usize>.set(&mut storedIn, target, block + usize.ONE)
             let blocksOf = &mut List<List<usize>>.asMutSlice(&mut stored)[target]
             let length = List<usize>.length(&blocksOf.*)
@@ -331,27 +414,43 @@ pub effect fn promote(function: &mut SsaFunction, all: bool) -> () ! OutOfMemory
       List<u64>.set(&mut current, placedHere[at], parametersHere[at])
       at = at + usize.ONE
     }
-    let count = List<usize>.length(&function.block(entered).instructions)
+    let mut count = List<usize>.length(&function.block(entered).instructions)
     at = usize.ZERO
     while at < count {
       let instruction = List<usize>.get(&function.block(entered).instructions, at)
       let target = List<usize>.get(&reached, instruction)
+      // The instructions an access of a part of its field needs, put before it.
+      let mut added = usize.ZERO
       if target != usize.MAX {
         let found = function.instruction(instruction)
-        if let Operation.Store {..} = found.operation {
-          let value = resolve(List<u64>.asSlice(&substitution), function.operandsOf(instruction)[usize.ZERO])
+        let wide = List<Kind>.get(&kinds, target)
+        if let Operation.Store {offset, ..} = found.operation {
+          let mut value = resolve(List<u64>.asSlice(&substitution), function.operandsOf(instruction)[usize.ZERO])
+          if !function.kindOf(value).equals(wide) {
+            let shift = u64.wrappingAdd(offsets[u64.toUsize(function.operandsOf(instruction)[usize.ONE])], offset) - List<u64>.get(&starts, target)
+            let whole = run currentValue(&mut function.*, &mut current, &mut zeros, List<Kind>.asSlice(&kinds), target)
+            value = run writePart(&mut function.*, entered, at, &mut added, whole, value, shift, found.place)
+          }
           run List<usize>.append(&mut undoVariable, target)
           run List<u64>.append(&mut undoValue, List<u64>.get(&current, target))
           List<u64>.set(&mut current, target, value)
         } else {
-          let value = run currentValue(&mut function.*, &mut current, &mut zeros, List<Kind>.asSlice(&kinds), target)
+          let mut value = run currentValue(&mut function.*, &mut current, &mut zeros, List<Kind>.asSlice(&kinds), target)
+          if !found.kind.equals(wide) {
+            let mut shift: u64 = 0
+            if let Operation.Load {offset, ..} = found.operation {
+              shift = u64.wrappingAdd(offsets[u64.toUsize(function.operandsOf(instruction)[usize.ZERO])], offset) - List<u64>.get(&starts, target)
+            }
+            value = run readPart(&mut function.*, entered, at, &mut added, value, found.kind, shift, found.place)
+          }
           List<u64>.set(&mut substitution, u64.toUsize(found.result), value)
         }
         function.remove(instruction)
       } else if List<bool>.get(&removable, instruction) {
         function.remove(instruction)
       }
-      at = at + usize.ONE
+      at = at + added + usize.ONE
+      count = count + added
     }
     // Each edge passes the current values to its target's placed parameters.
     let edgeCount = List<Edge>.length(&function.block(entered).edges)
