@@ -3301,7 +3301,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   const repeated = yield* invoke(silk, ['init', 'greeting', '-t', 'minimal'], directory)
   assert.equal(repeated.status, 2, 'init must refuse an existing manifest')
   // A project `build` names its manifest instead of discovering one, and `--release` selects the
-  // release profile directory; `run` refuses a foreign target before building anything.
+  // release output directory; `run` refuses a foreign target before building anything.
   const manifest = join('greeting', 'silk.toml')
   const released = yield* invoke(
     silk,
@@ -3469,7 +3469,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   assert.equal(directHost.status, 1, directHost.stderr)
   assert.match(
     directHost.stderr,
-    /^silk: invalid build profile: UnsupportedCombination: backend = "direct" builds WebAssembly targets only; choose a wasm target, such as wasm32-wasip1, or backend = "llvm"$/m,
+    /^silk: invalid compilation settings: UnsupportedCombination: backend = "direct" builds WebAssembly targets only; choose a wasm target, such as wasm32-wasip1, or backend = "llvm"$/m,
   )
   // Freed memory is reused: 100 threads with 1 MiB stacks and repeated list growth fit in 64 MiB.
   const churn = join(directory, 'churn')
