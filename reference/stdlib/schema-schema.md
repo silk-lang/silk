@@ -996,7 +996,7 @@ variant name, and any other union from an object tagged with its variant name.
 ### Operation `write`
 
 ```silk
-effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+effect fn write(self: &Self, writer: &mut any SchemaWriter) -> ()
     ! Issue | WriterError | OutOfMemoryError
     ? &mut Writer | &mut Allocator
 ```
@@ -1232,7 +1232,7 @@ such as a tool call whose name and arguments arrive apart.
 ### Associated function `write`
 
 ```silk
-pub effect fn write<T: Schema, W: SchemaWriter>(value: &T, writer: &mut W) -> ()
+pub effect fn write<T: Schema>(value: &T, writer: &mut any SchemaWriter) -> ()
     ! Issue | WriterError | OutOfMemoryError
     ? &mut Writer | &mut Allocator
 ```
@@ -1339,10 +1339,10 @@ text. Its `shape` is then [`Schemas.shapeVia`](#Schemas.impl.shapeVia) with the 
 ### Associated function `writeVia`
 
 ```silk
-pub effect fn writeVia<A, I: Schema, C: Codec<A, I>, W: SchemaWriter>(
+pub effect fn writeVia<A, I: Schema, C: Codec<A, I>>(
     codec: &C,
     value: &A,
-    writer: &mut W,
+    writer: &mut any SchemaWriter,
   ) -> ()
     ! Issue | WriterError | OutOfMemoryError
     ? &mut Writer | &mut Allocator
@@ -1419,7 +1419,7 @@ Reads `true` or `false`.
 ### Operation `write`
 
 ```silk
-effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+effect fn write(self: &Self, writer: &mut any SchemaWriter) -> ()
     ! Issue | WriterError | OutOfMemoryError
     ? &mut Writer | &mut Allocator
 ```
@@ -1473,7 +1473,7 @@ Reads a number.
 ### Operation `write`
 
 ```silk
-effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+effect fn write(self: &Self, writer: &mut any SchemaWriter) -> ()
     ! Issue | WriterError | OutOfMemoryError
     ? &mut Writer | &mut Allocator
 ```
@@ -1539,7 +1539,7 @@ Reads a number.
 ### Operation `write`
 
 ```silk
-effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+effect fn write(self: &Self, writer: &mut any SchemaWriter) -> ()
     ! Issue | WriterError | OutOfMemoryError
     ? &mut Writer | &mut Allocator
 ```
@@ -1605,7 +1605,7 @@ Reads a number.
 ### Operation `write`
 
 ```silk
-effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+effect fn write(self: &Self, writer: &mut any SchemaWriter) -> ()
     ! Issue | WriterError | OutOfMemoryError
     ? &mut Writer | &mut Allocator
 ```
@@ -1671,7 +1671,7 @@ Reads text.
 ### Operation `write`
 
 ```silk
-effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+effect fn write(self: &Self, writer: &mut any SchemaWriter) -> ()
     ! Issue | WriterError | OutOfMemoryError
     ? &mut Writer | &mut Allocator
 ```
@@ -1737,7 +1737,7 @@ Reads binary data: the format's binary type, or Base64 text in a text format.
 ### Operation `write`
 
 ```silk
-effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+effect fn write(self: &Self, writer: &mut any SchemaWriter) -> ()
     ! Issue | WriterError | OutOfMemoryError
     ? &mut Writer | &mut Allocator
 ```
@@ -1791,7 +1791,7 @@ Reads and allocates the contained value, with the schema and errors of `T`.
 ### Operation `write`
 
 ```silk
-effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+effect fn write(self: &Self, writer: &mut any SchemaWriter) -> ()
     ! Issue | WriterError | OutOfMemoryError
     ? &mut Writer | &mut Allocator
 ```
@@ -1857,7 +1857,7 @@ Reads `None` from a null value, and `Some` from any other value.
 ### Operation `write`
 
 ```silk
-effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+effect fn write(self: &Self, writer: &mut any SchemaWriter) -> ()
     ! Issue | WriterError | OutOfMemoryError
     ? &mut Writer | &mut Allocator
 ```
@@ -1945,7 +1945,7 @@ with the next.
 ### Operation `write`
 
 ```silk
-effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+effect fn write(self: &Self, writer: &mut any SchemaWriter) -> ()
     ! Issue | WriterError | OutOfMemoryError
     ? &mut Writer | &mut Allocator
 ```
@@ -2011,7 +2011,7 @@ Reads a number and fails with `IssueReason.InvalidValue` if it does not fit.
 ### Operation `write`
 
 ```silk
-effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+effect fn write(self: &Self, writer: &mut any SchemaWriter) -> ()
     ! Issue | WriterError | OutOfMemoryError
     ? &mut Writer | &mut Allocator
 ```
@@ -2077,7 +2077,7 @@ Reads a number and fails with `IssueReason.InvalidValue` if it does not fit.
 ### Operation `write`
 
 ```silk
-effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+effect fn write(self: &Self, writer: &mut any SchemaWriter) -> ()
     ! Issue | WriterError | OutOfMemoryError
     ? &mut Writer | &mut Allocator
 ```
@@ -2143,7 +2143,7 @@ Reads a number and fails with `IssueReason.InvalidValue` if it does not fit.
 ### Operation `write`
 
 ```silk
-effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+effect fn write(self: &Self, writer: &mut any SchemaWriter) -> ()
     ! Issue | WriterError | OutOfMemoryError
     ? &mut Writer | &mut Allocator
 ```
@@ -2209,7 +2209,7 @@ Reads a number and fails with `IssueReason.InvalidValue` if it does not fit.
 ### Operation `write`
 
 ```silk
-effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+effect fn write(self: &Self, writer: &mut any SchemaWriter) -> ()
     ! Issue | WriterError | OutOfMemoryError
     ? &mut Writer | &mut Allocator
 ```
@@ -2275,7 +2275,7 @@ Reads a number and fails with `IssueReason.InvalidValue` if it does not fit.
 ### Operation `write`
 
 ```silk
-effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+effect fn write(self: &Self, writer: &mut any SchemaWriter) -> ()
     ! Issue | WriterError | OutOfMemoryError
     ? &mut Writer | &mut Allocator
 ```
@@ -2341,7 +2341,7 @@ Reads a number and fails with `IssueReason.InvalidValue` if it does not fit.
 ### Operation `write`
 
 ```silk
-effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+effect fn write(self: &Self, writer: &mut any SchemaWriter) -> ()
     ! Issue | WriterError | OutOfMemoryError
     ? &mut Writer | &mut Allocator
 ```
@@ -2407,7 +2407,7 @@ Reads a number and fails with `IssueReason.InvalidValue` if it does not fit.
 ### Operation `write`
 
 ```silk
-effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+effect fn write(self: &Self, writer: &mut any SchemaWriter) -> ()
     ! Issue | WriterError | OutOfMemoryError
     ? &mut Writer | &mut Allocator
 ```
@@ -2559,7 +2559,7 @@ effect fn read<R: SchemaReader>(reader: &mut R) -> Self
 ### Operation `write`
 
 ```silk
-effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+effect fn write(self: &Self, writer: &mut any SchemaWriter) -> ()
     ! Issue | WriterError | OutOfMemoryError
     ? &mut Allocator | &mut Writer
 ```
