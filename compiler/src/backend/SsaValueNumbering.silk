@@ -28,7 +28,9 @@
 //!   the ranges of its operands decide it: a range comes from the operation (a mask, a narrower
 //!   source, a shift, a remainder, a constant added or subtracted without wrapping) and from the
 //!   known comparisons of the value with constants, so `i < 256` decides a later `i < 258`, and
-//!   the range check of a conversion of `x & 255` to a byte never fails. So a check dominated by an
+//!   the range check of a conversion of `x & 255` to a byte never fails. A signed comparison
+//!   folds the same way from signed ranges, so below `v < 0` the overflow checks of `-(v + 1)`
+//!   are decided. So a check dominated by an
 //!   identical check that passed is decided, and its trap path becomes unreachable once the
 //!   control flow pass folds the branch.
 //!
@@ -53,6 +55,7 @@ import silk.collections.list {List}
 import silk.core.option {Option}
 import silk.core.ownership {Copy}
 import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.i64
 import silk.num.u64
 import silk.num.usize
 
@@ -568,12 +571,142 @@ fn rangeOf(state: &Numbering, function: &SsaFunction, value: u64, depth: usize) 
   return range
 }
 
+// The signed values a value can have where the walk stands, from `low` to `high`.
+struct SignedRange {
+  low: i64,
+  high: i64,
+}
+
+impl Copy for SignedRange {}
+
+// `bits`, an integer `width` bits wide, read as signed.
+fn signedOf(bits: u64, width: usize) -> i64 { return u64.wrappingToI64(SsaFolding.signExtended(masked(bits, width), width)) }
+
+// The range `low` to `high` when both are there and lie within `full`, else `full`: a sum or
+// difference that could leave the kind's range bounds nothing.
+fn withinOr(low: Option<i64>, high: Option<i64>, full: SignedRange) -> SignedRange {
+  if let Option<i64>.Some {value: least} = low {
+    if let Option<i64>.Some {value: most} = high {
+      if least >= full.low && most <= full.high && least <= most { return SignedRange {low: least, high: most} }
+    }
+  }
+  return full
+}
+
+// The signed range of `value`, an integer of 2 to 64 bits, where the walk stands: what its
+// operation bounds it to (a constant added or subtracted without leaving the kind's range, a
+// difference from a constant, a mask, an extension), then what the known signed comparisons of it
+// with constants leave of that. `depth` is how many operands deep it may still look.
+fn signedRangeOf(state: &Numbering, function: &SsaFunction, value: u64, depth: usize) -> SignedRange {
+  let kind = function.kindOf(value)
+  let mut full = SignedRange {low: i64.MIN, high: i64.MAX}
+  if kind.bits < 64 {
+    let most = u64.wrappingToI64(u64.shiftLeft(1, usize.toU64(kind.bits - usize.ONE))) - 1
+    full = SignedRange {low: 0 - most - 1, high: most}
+  }
+  if function.isBits(value) {
+    let exact = signedOf(function.constantOf(value).low, kind.bits)
+    return SignedRange {low: exact, high: exact}
+  }
+  let mut range = full
+  let producer = function.producerOf(value)
+  if producer != usize.MAX && depth > usize.ZERO {
+    let operands = function.operandsOf(producer)
+    match function.instruction(producer).operation {
+      Operation.Binary {operation} => {
+        let first = signedRangeOf(state, function, operands[usize.ZERO], depth - usize.ONE)
+        let second = signedRangeOf(state, function, operands[usize.ONE], depth - usize.ONE)
+        if operation == Binary.Add {
+          range = withinOr(i64.checkedAdd(first.low, second.low), i64.checkedAdd(first.high, second.high), full)
+        }
+        if operation == Binary.Sub {
+          range = withinOr(i64.checkedSubtract(first.low, second.high), i64.checkedSubtract(first.high, second.low), full)
+        }
+        if operation == Binary.And {
+          // A mask that is not negative leaves a value from zero to the mask.
+          if second.low == second.high && second.low >= 0 { range = SignedRange {low: 0, high: second.low} }
+          if first.low == first.high && first.low >= 0 { range = SignedRange {low: 0, high: first.low} }
+        }
+        // Every bit flipped is `-1 - x`, which never leaves the kind's range.
+        if operation == Binary.Xor && second.low == second.high && second.low == -1 {
+          range = SignedRange {low: -1 - first.high, high: -1 - first.low}
+        }
+        if operation == Binary.Xor && first.low == first.high && first.low == -1 {
+          range = SignedRange {low: -1 - second.high, high: -1 - second.low}
+        }
+      }
+      Operation.Cast {operation} => {
+        let from = function.kindOf(operands[usize.ZERO])
+        if from.isInteger() && !from.isVector() && from.bits >= 2 && from.bits <= 64 {
+          if operation == Cast.SExt { range = signedRangeOf(state, function, operands[usize.ZERO], depth - usize.ONE) }
+          if operation == Cast.Trunc {
+            let source = signedRangeOf(state, function, operands[usize.ZERO], depth - usize.ONE)
+            if source.low >= full.low && source.high <= full.high { range = source }
+          }
+          if operation == Cast.ZExt && from.bits < kind.bits {
+            let source = rangeOf(state, function, operands[usize.ZERO], depth - usize.ONE)
+            range = SignedRange {low: u64.wrappingToI64(source.low), high: u64.wrappingToI64(source.high)}
+          }
+        }
+      }
+      _ => {}
+    }
+  }
+  let facts = List<Fact>.asSlice(&state.facts)
+  let mut at = facts.length
+  let mut seen = usize.ZERO
+  while at > usize.ZERO && seen < factWindow() {
+    at = at - usize.ONE
+    seen = seen + usize.ONE
+    let fact = facts[at]
+    let mut holding = fact.predicate
+    if !fact.truth { holding = inverse(fact.predicate) }
+    let mut bound = none()
+    if resolve(state, fact.left) == value && function.isBits(fact.right) { bound = fact.right }
+    else if resolve(state, fact.right) == value && function.isBits(fact.left) {
+      bound = fact.left
+      holding = swapped(holding)
+    }
+    if bound == none() || function.kindOf(bound).bits > 64 || function.kindOf(bound).bits < 2 { continue }
+    let limit = signedOf(function.constantOf(bound).low, function.kindOf(bound).bits)
+    if holding == Predicate.Slt && limit > full.low && limit - 1 < range.high { range.high = limit - 1 }
+    if holding == Predicate.Sle && limit < range.high { range.high = limit }
+    if holding == Predicate.Sgt && limit < full.high && limit + 1 > range.low { range.low = limit + 1 }
+    if holding == Predicate.Sge && limit > range.low { range.low = limit }
+    if holding == Predicate.Eq { range = SignedRange {low: limit, high: limit} }
+  }
+  return range
+}
+
 // 1 when the unsigned ranges of `left` and `right` prove `left asked right`, 0 when they prove it
 // does not hold, else `usize.MAX`: a bounds check against a constant that an earlier, tighter
 // check or a mask already answers, and the range check of a conversion whose source fits.
 fn decidedByRanges(state: &Numbering, function: &SsaFunction, asked: Predicate, left: u64, right: u64) -> usize {
   let kind = function.kindOf(left)
   if kind.isVector() || kind.bits > 64 || !(kind.isInteger() || kind.isAddress()) { return usize.MAX }
+  if asked == Predicate.Slt || asked == Predicate.Sle || asked == Predicate.Sgt || asked == Predicate.Sge {
+    if !kind.isInteger() || kind.bits < 2 { return usize.MAX }
+    let lower = signedRangeOf(state, function, left, rangeDepth())
+    let upper = signedRangeOf(state, function, right, rangeDepth())
+    if lower.low > lower.high || upper.low > upper.high { return usize.MAX }
+    if asked == Predicate.Slt {
+      if lower.high < upper.low { return usize.ONE }
+      if lower.low >= upper.high { return usize.ZERO }
+    }
+    if asked == Predicate.Sle {
+      if lower.high <= upper.low { return usize.ONE }
+      if lower.low > upper.high { return usize.ZERO }
+    }
+    if asked == Predicate.Sgt {
+      if lower.low > upper.high { return usize.ONE }
+      if lower.high <= upper.low { return usize.ZERO }
+    }
+    if asked == Predicate.Sge {
+      if lower.low >= upper.high { return usize.ONE }
+      if lower.high < upper.low { return usize.ZERO }
+    }
+    return usize.MAX
+  }
   if asked != Predicate.Ult && asked != Predicate.Ule && asked != Predicate.Ugt && asked != Predicate.Uge && asked != Predicate.Eq
     && asked != Predicate.Ne { return usize.MAX }
   let first = rangeOf(state, function, left, rangeDepth())
