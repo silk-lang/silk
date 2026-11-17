@@ -6,7 +6,7 @@ Package identities, fetch pins, and publication settings read from `silk.toml`.
 
 Import as `Manifest` with `import silk.build.manifest { Manifest }`.
 
-Public declarations: 21.
+Public declarations: 22.
 
 <a id="Manifest"></a>
 
@@ -107,6 +107,16 @@ pub postInit: Option<List<PostInit>>
 ```
 
 Commands run only when a developer initializes a project from this template.
+
+<a id="Manifest.template"></a>
+
+### Field `template`
+
+```silk
+pub template: Option<Template>
+```
+
+What `silk init` shows after creating a project from this template.
 
 <a id="Manifest.tool"></a>
 
@@ -1335,6 +1345,44 @@ impl Schema for Release
 
 ```silk
 static fn spec() -> Spec<Release>
+```
+
+<a id="Template"></a>
+
+## `Template`
+
+```silk
+pub struct Template
+```
+
+Settings read only when `silk init` creates a project from this manifest's directory; the new
+project's manifest does not keep them.
+
+<a id="Template.nextSteps"></a>
+
+### Field `nextSteps`
+
+```silk
+pub nextSteps: Option<List<String>>
+```
+
+The commands `silk init` suggests running in the new project, in order, after `cd` into it;
+empty to suggest nothing.
+
+<a id="Template.impl.Schema"></a>
+
+## Implementation `Schema for Template`
+
+```silk
+impl Schema for Template
+```
+
+<a id="Template.impl.Schema.spec"></a>
+
+### Operation `spec`
+
+```silk
+static fn spec() -> Spec<Template>
 ```
 
 <a id="PostInit"></a>
