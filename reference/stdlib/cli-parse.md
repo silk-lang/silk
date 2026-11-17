@@ -385,6 +385,18 @@ pub error: CliError
 
 Why.
 
+<a id="Parsed.Failed.command"></a>
+
+#### Field `command`
+
+```silk
+pub command: string<'static>
+```
+
+The subcommand path whose arguments were not accepted, such as `remote.add`, in the names
+the command line uses. Empty for the root command. Give it to [`Cli.writeHelp`](#Cli.impl.writeHelp) to show
+the options that command takes.
+
 <a id="Variable"></a>
 
 ## `Variable`
@@ -534,7 +546,8 @@ pub effect fn read<T: CommandLine>() -> Result<T, i32>
 ```
 
 Reads the command line like [`Cli.fromHost`](#Cli.impl.fromHost), and handles everything but a value: it writes
-the help text or the version to standard output, or the error to standard error. Returns the
+the help text or the version to standard output, or with [`Cli.writeFailure`](#Cli.impl.writeFailure) the error and
+the help text of the command it concerns to standard error. Returns the
 value, or in `Result.Failure` the exit code for `main` to return: 0 after help or the
 version, 2 after an error.
 
@@ -572,6 +585,24 @@ pub effect fn writeVersion<T: CommandLine>() -> ()
 ```
 
 Writes the version of `T`'s command and a line break.
+
+#### Errors
+
+- `WriterError` if the `Writer` fails.
+
+<a id="Cli.impl.writeFailure"></a>
+
+### Associated function `writeFailure`
+
+```silk
+pub effect fn writeFailure<T: CommandLine>(error: &CliError, command: string) -> ()
+    ! WriterError
+    ? &mut Writer
+```
+
+Writes the message for `error`, as [`Cli.writeError`](#Cli.impl.writeError) does, then an empty line and the help
+text of the command or subcommand at `command` (from [`Parsed.Failed`](#Parsed.Failed); empty for the root
+command) of `T`, so the reader sees the usage and the options that command takes.
 
 #### Errors
 
