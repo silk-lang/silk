@@ -379,7 +379,6 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
       })
     const stdlib = join(snapshot, 'stdlib')
     const compilerManifest = join(snapshot, 'compiler/silk.toml')
-    const compilerRoot = join(snapshot, 'compiler/src/main.silk')
 
     const buildFlags = [
       '--stdlib',
@@ -389,27 +388,9 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
       '--debug',
       String(debug),
     ]
-    const argumentsFor = (
-      source: string,
-      output: string,
-      emit: 'executable' | 'llvm-ir',
-    ): ReadonlyArray<string> => [
-      'build',
-      source,
-      '-o',
-      output,
-      ...(emit === 'llvm-ir' ? ['--emit', 'llvm-ir'] : []),
-      ...buildFlags,
-    ]
-    // A seed is a released compiler, so it is driven through the CLI every release has. The
-    // compiler it builds resolves and compiles an explicit request.
+    // Every generation, the seed included, resolves and compiles an explicit request: a source
+    // file build has no package context, so it cannot see the compiler's path dependencies.
     const compile = Effect.fnUntraced(function* (name: string, compiler: string, output: string, emit: string) {
-      if (compiler === producer && producerGeneration === 'seed')
-        return yield* invoke(
-          name,
-          [compiler, ...argumentsFor(compilerRoot, output, emit === 'llvm-ir' ? 'llvm-ir' : 'executable')],
-          join(snapshot, 'compiler'),
-        )
       const commands = yield* CompilationBuild.prepare({ compiler, manifest: compilerManifest, output,
         stdlib, optimization, debug, emit })
       const resolved = yield* invoke(`${name}-resolve`, [compiler, ...commands[0]], join(snapshot, 'compiler'))
@@ -460,7 +441,7 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
       )
       const smokeBuilt = yield* invoke(
         'smoke-build',
-        [output, ...argumentsFor(smokeSource, smokeBinary, 'executable')],
+        [output, 'build', smokeSource, '-o', smokeBinary, ...buildFlags],
         smokeDirectory,
       )
       if (!NativeProcess.succeeded(smokeBuilt))

@@ -33,8 +33,10 @@ behavior, data format, build artifact, or internal representation is a compatibi
   (a newer push cancels the older run); a stack head or a branch without such a PR is dispatched
   as `.github/CI.md` describes. If a check fails, fix the cause and push the new head; report the
   exact failure and whether it predates the change.
-- Open a draft PR as soon as there is a coherent commit, and reuse the task's PR. Run the cheapest
-  relevant checks locally; do not rerun the CI-covered suite as handoff ceremony.
+- Open a draft PR as soon as there is a coherent commit, and reuse the task's PR. Keep it a draft
+  while it is not ready for review or merge; once the work is finished, always mark it ready for
+  review (`gh pr ready`) to signal that it can be reviewed and merged. Run the cheapest relevant
+  checks locally; do not rerun the CI-covered suite as handoff ceremony.
 - Changesets (`.changes/<random>.md`, written by `silk change`) become the release notes, one
   list item each. Write the summary as one line saying what changed for users, such as "Add
   `List.reserveExact`." Details belong in the reference and guides, not the changeset. Internal
