@@ -292,6 +292,17 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   const graphCompiled = yield* invoke(graphCompiler, [], requestRoot, { ...requestEnv, SILK_TEST_COMPILER: silk, SILK_COMPILER: silk }, 120_000)
   assert.equal(graphCompiled.status, 0, graphCompiled.stderr)
   assert.ok(yield* fs.exists(join(requestRoot, 'custom-output/x86_64-unknown-linux-gnu/dev/request-fixture')))
+  // The compilation builds outside its step with the package cache, so the next one after an edit
+  // reuses the checks of what it did not change.
+  assert.ok(yield* fs.exists(join(requestRoot, 'custom-output/steps/compilations/x86_64-unknown-linux-gnu/dev/request-fixture')))
+  const graphCache = join(requestRoot, 'custom-output/cache/request-fixture')
+  assert.ok((yield* fs.readDirectory(graphCache)).some((name) => name.startsWith('semantic-')), 'the graph compilation keeps a semantic cache')
+  const embedded = yield* fs.readFileString(join(requestRoot, 'main.silk'))
+  yield* fs.writeFileString(join(requestRoot, 'main.silk'), embedded + '\nfn edited() -> i32 { return 1 }\n')
+  const graphRecompiled = yield* invoke(graphCompiler, [], requestRoot, { ...requestEnv, SILK_TEST_COMPILER: silk, SILK_COMPILER: silk }, 120_000)
+  assert.equal(graphRecompiled.status, 0, graphRecompiled.stderr)
+  assert.match(graphRecompiled.stderr, /checks? reused/, 'an edited graph compilation reuses its cache')
+  yield* fs.writeFileString(join(requestRoot, 'main.silk'), embedded)
   yield* fs.writeFileString(join(directory, 'silk.toml'),
     '[package]\nname = "native-build"\nversion = "0.1.0"\nsource = "."\n')
   const runnerDirectory = join(directory, 'artifact-runners')
