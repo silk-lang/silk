@@ -6,7 +6,7 @@ A manifest identifies a package and declares its dependencies. A command constru
 
 `build`, `run`, `test` and `plan` are reserved task names. Each has a built-in implementation. A variant in the root package's `tasks.silk` replaces that built-in. Other variants are project commands, invoked with `silk task <name>`.
 
-A tasks module implements `CommandLine` and `TaskSet` for its command union, exposes `pub const COMMANDS: string = Task.commands<Tasks>()`, and calls `Task.main<Tasks>()` from its entry. The metadata describes available commands without running the task entry. Only the root package's tasks run. Dependencies contribute static `build.silk` plans and ordinary modules the root may import.
+A tasks module implements `CommandLine` and `TaskSet` for its command union and calls `Task.main<Tasks>()` from its entry. It declares nothing else. A package without a `tasks.silk` uses the built-ins directly. A package with one sends all four reserved commands to its tasks program, so that program is built first. For a reserved command the union has no variant for, `Task.main` runs nothing and the toolchain runs its built-in. Only the root package's tasks run. Dependencies contribute static `build.silk` plans and ordinary modules the root may import.
 
 Commands embed `silk.build.options.Options` and flatten it in their `CommandLine` description. It owns `--target`, `--release`, `--optimization`, `--debug` and `--unsandboxed-tools`. Commands may add flags but cannot redefine these. A command building several targets creates a compilation for each target.
 
@@ -36,6 +36,29 @@ effect fn graph(options: &Options) -> Build
 
 The dependency alias must exist in the manifest. A graph cannot introduce an undeclared package. `Compilation.without(alias)` excludes a declared dependency from that compilation. Dependencies are fetched as selected imports reach them; `silk fetch` downloads all declared pins without evaluating package code.
 
+`when(condition, transform)` on `Compilation`, `Build` and `Run` applies `transform` only when `condition` is true, so a pipeline can branch without rebinding. `transform` is a `once effect fn`, so it may move captured values and fail with the pipeline's errors. A plain lambda that returns the step's Effect fits it, as `|c| c.without("devtools")` does. Write an `effect` lambda when the body runs steps itself or branches. `run` is only allowed inside an `effect` lambda. A named `effect fn` works too. `Plan.when` takes a plain `fn`, because plans are static.
+
+```silk
+import silk.build.graph { Build, Compilation, Options, BuildError }
+import silk.build.step { Deferred }
+import silk.mem.allocator { Allocator }
+import silk.system.filesystem { FileSystem }
+import silk.system.host_input { HostInput }
+
+effect fn graph(options: &Options, devtools: bool, release: bool) -> Build
+  ! BuildError
+  ? &mut Allocator | &mut FileSystem | &mut HostInput {
+  let base = run Compilation.fromPackage(options)
+  let app = run base.when(!devtools, |c| c.without("devtools"))
+  let shipped = run app.when(release, effect |c| {
+    let stripped = run c.debug(run Deferred<bool>.value(false))
+    return run stripped.without("profiler")
+  })
+  let build = run Build.make()
+  return run build.add(move shipped)
+}
+```
+
 ## Completing a graph
 
 - `Compilation.build()` builds one compilation and returns its `Built` result.
@@ -52,6 +75,10 @@ Artifacts live under `build/<target>/<mode>/<name>`, relative to the enclosing w
 
 A custom `Step` implements `key` and `make`. Its key declares every file, directory, environment variable and value it reads. `Make` grants access to those inputs and the step's output directory. The runner hashes inputs and toolchain contents, reuses complete cached outputs, executes independent misses on fibers and observes its memory budget. `Key.always` opts a step out of reuse.
 
+A task program runs only its custom steps. It describes every compilation and every standard step (`Run`, `WriteFiles`, an embedded file, a dependency path) to the compiler, which runs them through `silkc graph` with the same keys and the same cache, and answers where each step left its outputs. A graph that mixes the two alternates: the task program runs a custom step, then hands the compiler the standard steps that read it. A task program with no custom step therefore contains no runner, and builds in a few seconds. A program that drives a `Runner` itself needs the compiler for its standard steps: `SILK_COMPILER`, or `silkc` on `PATH`. `Run.registerHere` and `WriteFiles.registerHere` register the same work as steps the program runs itself.
+
+The compiler reports each compilation as it does for `silk build`: the `Compiling` line and one line per stage once the compilation ends, then `Finished` with the published artifact.
+
 `Run` describes an external command with declared inputs and outputs. `WriteFiles` creates files from deferred values. `Package.path(alias, subpath)` resolves a dependency's included file; the package must publish that file or its parent directory in `include`.
 
 ## Package parameters and plans
@@ -61,7 +88,7 @@ A package may declare `pub param` values in source or `build.silk`. The consumer
 `build.silk` exports `pub const PLAN: Plan`. The compiler evaluates it statically, with standard-library imports and the package's parameters. The plan contributes generated modules, native sources and link inputs. Target conditions are ordinary static code.
 
 ```silk
-import silk.build.plan { Plan }
+import silk.build.plan { Library, Plan }
 import silk.build.step { sourcePath }
 
 static fn plan() -> Plan {
@@ -69,7 +96,7 @@ static fn plan() -> Plan {
   result = result |> Plan.compileC(sourcePath("native/codec.c"))
   result = result |> Plan.includePath(sourcePath("include"))
   if Intrinsic.targetOperatingSystem() == "linux" {
-    result = result |> Plan.linkLibrary("m", "dynamic", false, false)
+    result = result |> Plan.linkLibrary("m", Library.dynamicSearch())
   }
   return result
 }
@@ -87,7 +114,7 @@ A dependency's tool steps require `tools = true` on its dependency entry. Tools 
 
 Requests contain absolute source and native paths, all package parameters, generated modules, compiler settings and platform inputs. Replaying a request uses these captured values even when an ambient manifest changes.
 
-The language server reads saved requests and `compile_commands.json`. With workspace trust and refresh enabled, it runs `silk plan` for the root with the developer's own permissions and environment, so its requests match what `silk build` writes. A project without a `Plan` variant uses the built-in compilation without running its task entry, and the server asks nothing more.
+The language server reads saved requests and `compile_commands.json`. With workspace trust and refresh enabled, it runs `silk plan` for the root with the developer's own permissions and environment, so its requests match what `silk build` writes. A project without a `Plan` variant uses the built-in compilation without building or starting its tasks program (the server sets `SILK_PLAN_BUILTIN=1` for `silk plan`), and the server asks nothing more.
 
 A project whose tasks have their own `Plan` variant runs project code, so the server asks once, with Allow and Not now, before it runs it. The server reads `tasks.silk` to tell; it does not run it. Allow is recorded in `$SILK_HOME/editor-plans` (`~/.silk/editor-plans` without `SILK_HOME`), never in the output directory. The record covers the repository's common Git directory, so every worktree of a repository shares it; a project outside Git is covered by the canonical path of its workspace root. Deleting the record's file revokes it. Not now lasts for the editor session.
 
