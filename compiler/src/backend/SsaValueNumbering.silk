@@ -282,7 +282,8 @@ effect fn visitBlock(state: &mut Numbering, function: &mut SsaFunction, block: u
   while at < count {
     let instruction = List<usize>.get(&function.block(block).instructions, at)
     // Instructions a truncation is rewritten into go before it and are numbered next time.
-    let added = run narrowThrough(&mut state.*, &mut function.*, block, at, instruction)
+    let mut added = run narrowThrough(&mut state.*, &mut function.*, block, at, instruction)
+    added = added + run uncheck(&mut state.*, &mut function.*, block, at + added, instruction)
     at = at + added
     count = count + added
     run visitInstruction(&mut state.*, &mut function.*, instruction)
@@ -373,6 +374,86 @@ effect fn narrowThrough(state: &mut Numbering, function: &mut SsaFunction, block
   run replace(&mut state.*, found.result, result)
   function.remove(instruction)
   return 2
+}
+
+// Replaces an overflow-checked sum, difference or product whose operands' ranges show it cannot
+// overflow by the wrapping operation and a clear flag, so its trap path folds away: an exponent
+// of a few thousand times a constant needs no check. Answers how many instructions it put before
+// `instruction`, at `position` of `block`, which it then removed.
+effect fn uncheck(state: &mut Numbering, function: &mut SsaFunction, block: usize, position: usize, instruction: usize) -> usize
+! OutOfMemoryError ? &mut Allocator {
+  let found = function.instruction(instruction)
+  if found.removed { return usize.ZERO }
+  let kind = found.kind
+  if !kind.isInteger() || kind.isVector() || kind.bits > 64 || kind.bits < 2 { return usize.ZERO }
+  if let Operation.Overflow {operation, signed} = found.operation {
+    if operation != Binary.Add && operation != Binary.Sub && operation != Binary.Mul { return usize.ZERO }
+    let left = resolve(&state.*, function.operandsOf(instruction)[usize.ZERO])
+    let right = resolve(&state.*, function.operandsOf(instruction)[usize.ONE])
+    let mut fits = false
+    if signed {
+      let first = signedRangeOf(&state.*, &function.*, left, rangeDepth())
+      let second = signedRangeOf(&state.*, &function.*, right, rangeDepth())
+      let mut full = SignedRange {low: i64.MIN, high: i64.MAX}
+      if kind.bits < 64 {
+        let most = u64.wrappingToI64(u64.shiftLeft(1, usize.toU64(kind.bits - usize.ONE))) - 1
+        full = SignedRange {low: 0 - most - 1, high: most}
+      }
+      // A range that is the whole kind's says nothing; a narrower result does not overflow.
+      let mut result = full
+      let mut bounded = false
+      if operation == Binary.Add {
+        if let Option<i64>.Some {value: least} = i64.checkedAdd(first.low, second.low) {
+          if let Option<i64>.Some {value: most} = i64.checkedAdd(first.high, second.high) {
+            result = SignedRange {low: least, high: most}
+            bounded = true
+          }
+        }
+      }
+      if operation == Binary.Sub {
+        if let Option<i64>.Some {value: least} = i64.checkedSubtract(first.low, second.high) {
+          if let Option<i64>.Some {value: most} = i64.checkedSubtract(first.high, second.low) {
+            result = SignedRange {low: least, high: most}
+            bounded = true
+          }
+        }
+      }
+      if operation == Binary.Mul {
+        let corners = [i64.checkedMultiply(first.low, second.low), i64.checkedMultiply(first.low, second.high),
+          i64.checkedMultiply(first.high, second.low), i64.checkedMultiply(first.high, second.high)]
+        bounded = true
+        let mut least = i64.MAX
+        let mut most = i64.MIN
+        let mut at = usize.ZERO
+        while at < 4 {
+          if let Option<i64>.Some {value: corner} = corners[at] {
+            if corner < least { least = corner }
+            if corner > most { most = corner }
+          } else { bounded = false }
+          at = at + usize.ONE
+        }
+        result = SignedRange {low: least, high: most}
+      }
+      fits = bounded && first.low <= first.high && second.low <= second.high && result.low >= full.low && result.high <= full.high
+    } else {
+      let first = rangeOf(&state.*, &function.*, left, rangeDepth())
+      let second = rangeOf(&state.*, &function.*, right, rangeDepth())
+      let most = masked(u64.MAX, kind.bits)
+      if first.low <= first.high && second.low <= second.high {
+        if operation == Binary.Add { fits = first.high <= most - second.high }
+        if operation == Binary.Sub { fits = first.low >= second.high }
+        if operation == Binary.Mul { fits = first.high == 0 || second.high <= most / first.high }
+      }
+    }
+    if !fits { return usize.ZERO }
+    let plain = run function.insertInstruction(block, position, Operation.Binary {operation: operation}, kind, &[left, right], found.place)
+    let clear = run flagOf(&mut state.*, &mut function.*, false)
+    run replace(&mut state.*, found.result, plain)
+    run replace(&mut state.*, found.result + 1, clear)
+    function.remove(instruction)
+    return usize.ONE
+  }
+  return usize.ZERO
 }
 
 effect fn visitInstruction(state: &mut Numbering, function: &mut SsaFunction, instruction: usize) -> () ! OutOfMemoryError ? &mut Allocator {
@@ -555,8 +636,17 @@ struct Range {
 
 impl Copy for Range {}
 
-// How many operands deep `rangeOf` looks.
-fn rangeDepth() -> usize { return 3 }
+// How far `rangeOf` and `signedRangeOf` look through a value's operands: each cast or operation
+// with a constant operand takes one of this budget, and an operation on two other values takes
+// three, since it looks through both.
+fn rangeDepth() -> usize { return 9 }
+
+// What looking through instruction `producer` takes of the depth budget.
+fn rangeCost(function: &SsaFunction, producer: usize) -> usize {
+  let operands = function.operandsOf(producer)
+  if operands.length < 2 || function.isBits(operands[usize.ZERO]) || function.isBits(operands[usize.ONE]) { return usize.ONE }
+  return 3
+}
 
 // The unsigned range of `value`, an integer or address of at most 64 bits, where the walk
 // stands: what its operation bounds it to, such as a mask, a narrower source or a shift, then
@@ -571,15 +661,29 @@ fn rangeOf(state: &Numbering, function: &SsaFunction, value: u64, depth: usize) 
     return Range {low: bits, high: bits}
   }
   let producer = function.producerOf(value)
-  if producer != usize.MAX && depth > usize.ZERO {
+  let mut cost = usize.MAX
+  if producer != usize.MAX { cost = rangeCost(function, producer) }
+  if producer != usize.MAX && depth >= cost {
     let operands = function.operandsOf(producer)
-    match function.instruction(producer).operation {
+    // An overflow-checked operation's value is the wrapping one's.
+    let mut made = function.instruction(producer).operation
+    if let Operation.Overflow {operation: checked, ..} = made {
+      if function.value(value).index == usize.ZERO { made = Operation.Binary {operation: checked} }
+    }
+    match made {
       Operation.Binary {operation} => {
-        let first = rangeOf(state, function, operands[usize.ZERO], depth - usize.ONE)
-        let second = rangeOf(state, function, operands[usize.ONE], depth - usize.ONE)
+        let first = rangeOf(state, function, operands[usize.ZERO], depth - cost)
+        let second = rangeOf(state, function, operands[usize.ONE], depth - cost)
         if operation == Binary.And {
           range.high = first.high
           if second.high < range.high { range.high = second.high }
+        }
+        // A product or a left shift that cannot pass the kind's greatest value.
+        if operation == Binary.Mul && (first.high == 0 || second.high <= most / first.high) {
+          range = Range {low: first.low * second.low, high: first.high * second.high}
+        }
+        if operation == Binary.Shl && second.low == second.high && second.low < 64 && first.high <= u64.shiftRight(most, second.low) {
+          range = Range {low: u64.shiftLeft(first.low, second.low), high: u64.shiftLeft(first.high, second.low)}
         }
         if operation == Binary.LShr && second.low == second.high && second.low < 64 {
           range = Range {low: u64.shiftRight(first.low, second.low), high: u64.shiftRight(first.high, second.low)}
@@ -600,7 +704,7 @@ fn rangeOf(state: &Numbering, function: &SsaFunction, value: u64, depth: usize) 
       Operation.Cast {operation} => {
         let from = function.kindOf(operands[usize.ZERO])
         if (from.isInteger() || from.isAddress()) && !from.isVector() && from.bits <= 64 {
-          let source = rangeOf(state, function, operands[usize.ZERO], depth - usize.ONE)
+          let source = rangeOf(state, function, operands[usize.ZERO], depth - cost)
           if operation == Cast.ZExt || operation == Cast.PtrToInt || operation == Cast.IntToPtr || operation == Cast.Trunc {
             // A truncation keeps a value that already fits.
             if source.high <= most { range = source }
@@ -660,6 +764,32 @@ fn withinOr(low: Option<i64>, high: Option<i64>, full: SignedRange) -> SignedRan
   return full
 }
 
+// `value` shifted right by `by` bits, under 64, with its sign kept.
+fn signedShift(value: i64, by: u64) -> i64 {
+  if value >= 0 { return u64.wrappingToI64(u64.shiftRight(i64.wrappingToU64(value), by)) }
+  // Below zero, shifting the flipped bits and flipping back rounds toward the least value.
+  return -1 - u64.wrappingToI64(u64.shiftRight(i64.wrappingToU64(-1 - value), by))
+}
+
+// The range of a product of values in `first` and `second`: its corners' least and greatest,
+// or `full` when one of them leaves it.
+fn productRange(first: SignedRange, second: SignedRange, full: SignedRange) -> SignedRange {
+  let corners = [i64.checkedMultiply(first.low, second.low), i64.checkedMultiply(first.low, second.high),
+    i64.checkedMultiply(first.high, second.low), i64.checkedMultiply(first.high, second.high)]
+  let mut least = i64.MAX
+  let mut most = i64.MIN
+  let mut at = usize.ZERO
+  while at < 4 {
+    if let Option<i64>.Some {value: corner} = corners[at] {
+      if corner < full.low || corner > full.high { return full }
+      if corner < least { least = corner }
+      if corner > most { most = corner }
+    } else { return full }
+    at = at + usize.ONE
+  }
+  return SignedRange {low: least, high: most}
+}
+
 // The signed range of `value`, an integer of 2 to 64 bits, where the walk stands: what its
 // operation bounds it to (a constant added or subtracted without leaving the kind's range, a
 // difference from a constant, a mask, an extension), then what the known signed comparisons of it
@@ -677,12 +807,25 @@ fn signedRangeOf(state: &Numbering, function: &SsaFunction, value: u64, depth: u
   }
   let mut range = full
   let producer = function.producerOf(value)
-  if producer != usize.MAX && depth > usize.ZERO {
+  let mut cost = usize.MAX
+  if producer != usize.MAX { cost = rangeCost(function, producer) }
+  if producer != usize.MAX && depth >= cost {
     let operands = function.operandsOf(producer)
-    match function.instruction(producer).operation {
+    // An overflow-checked operation's value is the wrapping one's.
+    let mut made = function.instruction(producer).operation
+    if let Operation.Overflow {operation: checked, ..} = made {
+      if function.value(value).index == usize.ZERO { made = Operation.Binary {operation: checked} }
+    }
+    match made {
       Operation.Binary {operation} => {
-        let first = signedRangeOf(state, function, operands[usize.ZERO], depth - usize.ONE)
-        let second = signedRangeOf(state, function, operands[usize.ONE], depth - usize.ONE)
+        let first = signedRangeOf(state, function, operands[usize.ZERO], depth - cost)
+        let second = signedRangeOf(state, function, operands[usize.ONE], depth - cost)
+        if operation == Binary.Mul { range = productRange(first, second, full) }
+        // A shift right that keeps the sign moves both ends.
+        if operation == Binary.AShr && second.low == second.high && second.low >= 0 && second.low < 64 {
+          let by = i64.wrappingToU64(second.low)
+          range = SignedRange {low: signedShift(first.low, by), high: signedShift(first.high, by)}
+        }
         if operation == Binary.Add {
           range = withinOr(i64.checkedAdd(first.low, second.low), i64.checkedAdd(first.high, second.high), full)
         }
@@ -705,13 +848,13 @@ fn signedRangeOf(state: &Numbering, function: &SsaFunction, value: u64, depth: u
       Operation.Cast {operation} => {
         let from = function.kindOf(operands[usize.ZERO])
         if from.isInteger() && !from.isVector() && from.bits >= 2 && from.bits <= 64 {
-          if operation == Cast.SExt { range = signedRangeOf(state, function, operands[usize.ZERO], depth - usize.ONE) }
+          if operation == Cast.SExt { range = signedRangeOf(state, function, operands[usize.ZERO], depth - cost) }
           if operation == Cast.Trunc {
-            let source = signedRangeOf(state, function, operands[usize.ZERO], depth - usize.ONE)
+            let source = signedRangeOf(state, function, operands[usize.ZERO], depth - cost)
             if source.low >= full.low && source.high <= full.high { range = source }
           }
           if operation == Cast.ZExt && from.bits < kind.bits {
-            let source = rangeOf(state, function, operands[usize.ZERO], depth - usize.ONE)
+            let source = rangeOf(state, function, operands[usize.ZERO], depth - cost)
             range = SignedRange {low: u64.wrappingToI64(source.low), high: u64.wrappingToI64(source.high)}
           }
         }
