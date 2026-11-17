@@ -165,7 +165,8 @@ the task succeeded, 0 after `--help`, 2 after a command line error, and a failed
 such as a file that cannot be read, is reported the same way with status 1.
 
 Help names the command `silk task`, as it is typed. `--help` without a task's name lists the
-tasks, then writes the help of each one with its options and arguments.
+tasks, then writes the help of each one with its options and arguments. `--help=json` writes
+that help as one JSON object, with every task under `commands`.
 
 `build`, `run`, `test` and `plan` are the toolchain's own commands. When `silk` starts the
 tasks program for one of them and `T` has no variant of that name, nothing runs here: the
