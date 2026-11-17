@@ -208,7 +208,7 @@ effect fn read<R: SchemaReader>(reader: &mut R) -> Self
 ### Operation `write`
 
 ```silk
-effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+effect fn write(self: &Self, writer: &mut any SchemaWriter) -> ()
     ! Issue | WriterError | OutOfMemoryError
     ? &mut Writer | &mut Allocator
 ```
