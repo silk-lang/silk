@@ -72,6 +72,7 @@ import semantic.Types {Types}
 import silk.mem.allocator {Allocator, OutOfMemoryError}
 import silk.mem.interned {Interned}
 import silk.collections.list {List}
+import silk.collections.slice {Slice}
 import silk.core.option {Option}
 import silk.core.ownership {Copy}
 import silk.num.usize
@@ -273,43 +274,58 @@ fn blockNames(function: &MirFunction, block: &Block, local: usize) -> usize {
 // clears that local with `forget`; it names no other local differently.
 struct UseTable {
   named: List<usize>,
+  // For each local, how many of its names only read it: a `copy` operand, a place whose length,
+  // data address or tag is read, or a runtime index. Every other name writes it whole or in part,
+  // moves it out, borrows it, drops it or passes its context.
+  copied: List<usize>,
   borrowed: List<bool>,
   dropped: List<bool>,
   flags: List<bool>,
 }
 
-fn countPlace(place: &Place, named: &mut List<usize>) -> () {
+// Counts the names of `place` in `named`, and in `copied` those that only read: each runtime
+// index, and the place's own local when `reads`.
+fn countPlace(place: &Place, reads: bool, named: &mut List<usize>, copied: &mut List<usize>) -> () {
   let mut slots = List<usize>.asMutSlice(&mut named.*)
+  let mut read = List<usize>.asMutSlice(&mut copied.*)
   slots[place.local] = slots[place.local] + usize.ONE
+  if reads { read[place.local] = read[place.local] + usize.ONE }
   let steps = List<Projection>.asSlice(&place.projections)
   let mut at = usize.ZERO
   while at < steps.length {
-    if let Projection.Index {local: index} = &steps[at] { slots[index] = slots[index] + usize.ONE }
+    if let Projection.Index {local: index} = &steps[at] {
+      slots[index] = slots[index] + usize.ONE
+      read[index] = read[index] + usize.ONE
+    }
     at = at + usize.ONE
   }
   return ()
 }
 
-fn countSlot<'a>(slot: Slot<'a>, named: &mut List<usize>) -> () {
-  if let Option<&Place>.Some {value: place} = MirWalk.slotPlace(move slot) { countPlace(place, &mut named.*) }
+fn countSlot<'a>(slot: Slot<'a>, named: &mut List<usize>, copied: &mut List<usize>) -> () {
+  let reads = match MirWalk.slotAccess(&slot) {
+    Access.Copy => true
+    _ => false
+  }
+  if let Option<&Place>.Some {value: place} = MirWalk.slotPlace(move slot) { countPlace(place, reads, &mut named.*, &mut copied.*) }
   return ()
 }
 
-fn countStatement(statement: &Statement, named: &mut List<usize>) -> () {
+fn countStatement(statement: &Statement, named: &mut List<usize>, copied: &mut List<usize>) -> () {
   let count = MirWalk.statementSlots(statement)
   let mut at = usize.ZERO
   while at < count {
-    countSlot(MirWalk.statementSlot(statement, at), &mut named.*)
+    countSlot(MirWalk.statementSlot(statement, at), &mut named.*, &mut copied.*)
     at = at + usize.ONE
   }
   return ()
 }
 
-fn countTerminator(terminator: &Terminator, named: &mut List<usize>) -> () {
+fn countTerminator(terminator: &Terminator, named: &mut List<usize>, copied: &mut List<usize>) -> () {
   let count = MirWalk.terminatorSlots(terminator)
   let mut at = usize.ZERO
   while at < count {
-    countSlot(MirWalk.terminatorSlot(terminator, at), &mut named.*)
+    countSlot(MirWalk.terminatorSlot(terminator, at), &mut named.*, &mut copied.*)
     at = at + usize.ONE
   }
   return ()
@@ -326,11 +342,13 @@ impl UseTable {
     let locals = List<Local>.asSlice(&function.locals)
     let mut table = UseTable {
       named: run List<usize>.makeWithCapacity(locals.length),
+      copied: run List<usize>.makeWithCapacity(locals.length),
       borrowed: run List<bool>.makeWithCapacity(locals.length),
       dropped: run List<bool>.makeWithCapacity(locals.length),
       flags: run List<bool>.makeWithCapacity(locals.length),
     }
     run List<usize>.appendRepeated(&mut table.named, usize.ZERO, locals.length)
+    run List<usize>.appendRepeated(&mut table.copied, usize.ZERO, locals.length)
     run List<bool>.appendRepeated(&mut table.borrowed, false, locals.length)
     run List<bool>.appendRepeated(&mut table.dropped, false, locals.length)
     run List<bool>.appendRepeated(&mut table.flags, false, locals.length)
@@ -353,11 +371,11 @@ impl UseTable {
     let blocks = List<Block>.asSlice(&function.blocks)
     let mut at = usize.ZERO
     while at < blocks.length {
-      countTerminator(&blocks[at].terminator, &mut table.named)
+      countTerminator(&blocks[at].terminator, &mut table.named, &mut table.copied)
       let statements = List<Statement>.asSlice(&blocks[at].statements)
       let mut index = usize.ZERO
       while index < statements.length {
-        countStatement(&statements[index], &mut table.named)
+        countStatement(&statements[index], &mut table.named, &mut table.copied)
         match &statements[index] {
           Statement.Assign {value, ..} => {
             match &value {
@@ -385,6 +403,12 @@ impl UseTable {
     }
   }
 
+  // How many names of `local` do more than read it. A rewrite that changes `named` and leaves the
+  // local's reads alone keeps this count right.
+  fn changes(self: &Self, local: usize) -> usize {
+    return List<usize>.asSlice(&self.named)[local] - List<usize>.asSlice(&self.copied)[local]
+  }
+
   fn flagged(self: &Self, local: usize) -> bool {
     return List<bool>.asSlice(&self.flags)[local]
   }
@@ -393,6 +417,7 @@ impl UseTable {
   fn forget(self: &mut Self, local: usize) -> () {
     let mut named = List<usize>.asMutSlice(&mut self.named)
     named[local] = usize.ZERO
+    List<usize>.set(&mut self.copied, local, usize.ZERO)
     return ()
   }
 }
@@ -732,6 +757,69 @@ impl JoinSites {
   }
 }
 
+// The blocks that continue to each block of a function, built at the first request: `from` holds
+// the blocks continuing to block `b` at `starts[b]` up to `starts[b + 1]`.
+struct Incoming {
+  starts: List<usize>,
+  from: List<usize>,
+}
+
+impl Incoming {
+  fn unbuilt() -> Incoming {
+    return Incoming {starts: List<usize>.make(), from: List<usize>.make()}
+  }
+
+  effect fn build(self: &mut Self, function: &MirFunction) -> () ! OutOfMemoryError ? &mut Allocator {
+    let count = List<Block>.length(&function.blocks)
+    if List<usize>.length(&self.starts) == count + usize.ONE { return () }
+    // The edges as pairs of a block and one it continues to, then a counting sort by the second.
+    let mut edges = List<usize>.make()
+    let mut following = List<usize>.make()
+    run List<usize>.appendRepeated(&mut self.starts, usize.ZERO, count + usize.ONE)
+    let mut block = usize.ZERO
+    while block < count {
+      List<usize>.clear(&mut following)
+      run MirWalk.appendSuccessors(function, block, &mut following)
+      let next = List<usize>.asSlice(&following)
+      let mut at = usize.ZERO
+      while at < next.length {
+        run List<usize>.append(&mut edges, block)
+        run List<usize>.append(&mut edges, next[at])
+        let reaching = List<usize>.get(&self.starts, next[at] + usize.ONE)
+        List<usize>.set(&mut self.starts, next[at] + usize.ONE, reaching + usize.ONE)
+        at = at + usize.ONE
+      }
+      block = block + usize.ONE
+    }
+    block = usize.ZERO
+    while block < count {
+      let before = List<usize>.get(&self.starts, block)
+      let reaching = List<usize>.get(&self.starts, block + usize.ONE)
+      List<usize>.set(&mut self.starts, block + usize.ONE, before + reaching)
+      block = block + usize.ONE
+    }
+    let pairs = List<usize>.asSlice(&edges)
+    run List<usize>.appendRepeated(&mut self.from, usize.ZERO, pairs.length / 2)
+    let mut filled = List<usize>.make()
+    run List<usize>.appendRepeated(&mut filled, usize.ZERO, count)
+    let mut pair = usize.ZERO
+    while pair < pairs.length {
+      let into = pairs[pair + usize.ONE]
+      let used = List<usize>.get(&filled, into)
+      let first = List<usize>.get(&self.starts, into)
+      List<usize>.set(&mut self.from, first + used, pairs[pair])
+      List<usize>.set(&mut filled, into, used + usize.ONE)
+      pair = pair + 2
+    }
+    return ()
+  }
+
+  fn of(self: &Self, block: usize) -> &[usize] {
+    let first = List<usize>.get(&self.starts, block)
+    return Slice.view<usize>(List<usize>.asSlice(&self.from), first, List<usize>.get(&self.starts, block + usize.ONE) - first)
+  }
+}
+
 // The most blocks `joinable` walks for one copy before it gives up on it.
 fn joinWalkLimit() -> usize { return 256 }
 
@@ -741,7 +829,9 @@ fn joinWalkLimit() -> usize { return 256 }
 // whole expression, so a nested `match` copies a large result once for each level. After the merge
 // each arm writes the outer temporary directly. No block that a write of the inner temporary
 // reaches before the copy may name the outer one, so its earlier value is dead wherever the inner
-// one was live.
+// one was live. A copy that can run again with no write of the inner temporary in between reads
+// the value that temporary still holds, so the two merge only when nothing but the copy changes
+// the outer one: a loop that counts down a copy of a value set before it keeps both.
 //
 // With `bindings`, the target is instead a `let` binding that the copy alone writes, after every
 // temporary has merged, so a call that writes the join still writes a temporary and the backend's
@@ -749,9 +839,10 @@ fn joinWalkLimit() -> usize { return 256 }
 effect fn mergeJoins(function: &mut MirFunction, bindings: bool) -> () ! OutOfMemoryError ? &mut Allocator | &mut Types {
   let mut table = run UseTable.of(&function.*)
   let mut sites = run JoinSites.of(&function.*)
+  let mut incoming = Incoming.unbuilt()
   let mut removed = List<JoinSite>.make()
-  // The blocks each candidate's walk has visited, marked with the candidate's number, so a
-  // function with thousands of candidates clears nothing between them.
+  // The blocks each candidate's two walks have visited, marked with the candidate's two numbers,
+  // so a function with thousands of candidates clears nothing between them.
   let mut visited = List<usize>.make()
   run List<usize>.appendRepeated(&mut visited, usize.ZERO, List<Block>.length(&function.blocks))
   let mut candidate = usize.ZERO
@@ -765,14 +856,16 @@ effect fn mergeJoins(function: &mut MirFunction, bindings: bool) -> () ! OutOfMe
         source = wholeLocal(&used)
         target = wholePlace(&destination)
       }
-      candidate = candidate + usize.ONE
+      candidate = candidate + 2
       if source != usize.MAX && target != usize.MAX && isTemp(&function.*, target) != bindings
-        && run joinable(&function.*, &table, &sites, block, at, source, target, &mut visited, candidate) {
+        && run joinable(&function.*, &table, &sites, &mut incoming, block, at, source, target, &mut visited, candidate) {
         renameSites(&mut function.*, &sites, source, target)
         moveVariables(&mut function.*, source, target)
         let mut named = List<usize>.asMutSlice(&mut table.named)
         named[target] = named[target] + named[source] - 2
         named[source] = usize.ZERO
+        // The copy was the source's only read.
+        List<usize>.set(&mut table.copied, source, usize.ZERO)
         sites.merge(source, target, block, at)
         run List<JoinSite>.append(&mut removed, JoinSite {block: block, index: at, next: usize.MAX})
       }
@@ -792,12 +885,13 @@ effect fn mergeJoins(function: &mut MirFunction, bindings: bool) -> () ! OutOfMe
 }
 
 // Whether `source` can be merged into `target` at the copy `target = source`, statement `at` of
-// `block`. The walk marks each block it visits in `visited` with `mark`, which no earlier walk
-// used.
+// `block`. The walks mark each block they visit in `visited` with `mark` and `mark + 1`, which no
+// earlier walk used.
 effect fn joinable(
   function: &MirFunction,
   table: &UseTable,
   sites: &JoinSites,
+  incoming: &mut Incoming,
   block: usize,
   at: usize,
   source: usize,
@@ -876,7 +970,49 @@ effect fn joinable(
     let following = run MirWalk.successors(function, next)
     run List<usize>.appendSlice(&mut pending, List<usize>.asSlice(&following))
   }
-  return true
+  // The copy is one of the names of the target that change it. With another, the copy must not
+  // run again on the source's old value, which that other name may have changed in the target.
+  if UseTable.changes(table, target) == usize.ONE { return true }
+  return !(run repeats(function, sites, &mut incoming.*, block, at, source, &mut visited.*, mark + usize.ONE))
+}
+
+// Whether the copy at statement `at` of `block` can run twice with no write of `source` in
+// between, or the walk back from it takes more than `joinWalkLimit` blocks to tell. The walk marks
+// each block it visits in `visited` with `mark`, which no earlier walk used.
+effect fn repeats(
+  function: &MirFunction,
+  sites: &JoinSites,
+  incoming: &mut Incoming,
+  block: usize,
+  at: usize,
+  source: usize,
+  visited: &mut List<usize>,
+  mark: usize,
+) -> bool ! OutOfMemoryError ? &mut Allocator {
+  // No path passes a block that writes the source without meeting the write, so the walk back
+  // stops at each. The copy's own block stops it when the write follows the copy, and a write
+  // before the copy there precedes every run of it.
+  let all = List<JoinSite>.asSlice(&sites.sites)
+  let mut site = List<usize>.get(&sites.first, source)
+  while site != usize.MAX {
+    let write = all[site]
+    site = write.next
+    if write.block == block && write.index < at { return false }
+    List<usize>.set(&mut visited.*, write.block, mark)
+  }
+  run incoming.build(function)
+  let mut pending = List<usize>.make()
+  run List<usize>.appendSlice(&mut pending, incoming.of(block))
+  let mut walked = usize.ZERO
+  while let Option<usize>.Some {value: next} = List<usize>.pop(&mut pending) {
+    if List<usize>.get(&visited.*, next) == mark { continue }
+    if next == block { return true }
+    List<usize>.set(&mut visited.*, next, mark)
+    walked = walked + usize.ONE
+    if walked > joinWalkLimit() { return true }
+    run List<usize>.appendSlice(&mut pending, incoming.of(next))
+  }
+  return false
 }
 
 // Turns a local that one move or copy out of a part of a temporary alone writes into that part, when
