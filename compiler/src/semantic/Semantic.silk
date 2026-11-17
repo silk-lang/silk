@@ -166,6 +166,7 @@ import semantic.RecordedKey
 import semantic.StableKey
 import semantic.CacheImage
 import semantic.BuildRecord
+import semantic.CostLedger as CostLedger {Ledger as CostTable, Site as CostSite}
 import semantic.WalkShare {WalkShared}
 import semantic.FinalProfile {Entry as ProfileEntry, FinalProfile}
 import semantic.InitialProfile {InitialProfile}
@@ -2738,6 +2739,9 @@ struct Resolver {
   mirValues: List<MirFunction>,
   // The `mirValues` index of each function the last whole-program walk emitted, in walk order.
   emittedMir: List<usize>,
+  // What each call in the root package asked the build walk to generate (`selectCosts`), and the
+  // static evaluation steps the process ran.
+  costs: CostTable,
   // Which lowered functions `releaseStaleMir` emptied, by index, and how many.
   mirReleased: List<bool>,
   mirReleasedCount: usize,
@@ -94089,6 +94093,10 @@ pub union DocumentationBinding {
 }
 
 impl<'source> StaticPort<'source> {
+  /// Counts one step of a static evaluation running through this port (`CostLedger.step`).
+  pub fn countStep(self: &mut Self) -> () {
+    CostTable.step(&mut self.resolver.costs)
+  }
   /// Borrows one exact parsed source from this query port.
   pub fn sourceAtCursor(self: &Self, cursor: &AuthoredCursor) -> Option<&IndexedSource> {
     return SourceIndex.sourceAtCursor(&self.resolver.source, cursor)
@@ -95378,6 +95386,7 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
       profileSlot: profileSlot,
       mirValues: List<MirFunction>.make(),
       emittedMir: List<usize>.make(),
+      costs: CostTable.off(),
       mirReleased: List<bool>.make(),
       mirReleasedCount: usize.ZERO,
       layoutValues: List<Shared<BackendLayout>>.make(),
@@ -97361,6 +97370,115 @@ impl Semantic {
   /// (`EmissionPlan.identityOrigin`).
   pub fn selectLineTables(self: &mut Self, lines: bool) -> () {
     self.resolver.lineTables = lines
+  }
+
+  /// Selects whether each build walk charges every function instance it lowers to the call in the
+  /// root package that led to it, for [`costReport`]. Select it before the build, without sharing
+  /// the walk between copies of the process (`shareWalks`) and without a cache, whose answers and
+  /// record would leave instances unlowered.
+  pub fn selectCosts(self: &mut Self, costs: bool) -> () {
+    self.resolver.costs.enabled = costs
+  }
+
+  /// The calls the last build walk charged (`selectCosts`), in the order it first charged them.
+  pub fn costSites(self: &Self) -> &[CostSite] {
+    return CostTable.charged(&self.resolver.costs)
+  }
+
+  /// The `--costs` report of the last build walk: the `limit` calls in the root package whose
+  /// generated functions cost the most, by LLVM text, then functions, then static evaluation steps,
+  /// one row each, and a line of totals. Each row names its call's module as `prefix` and the
+  /// module's path, as `src/` and `main.silk`. Empty unless [`selectCosts`] chose it and the walk
+  /// lowered a function.
+  pub effect fn costReport(self: &mut Self, limit: usize, prefix: &[u8]) -> Bytes ! Cycle | OutOfMemoryError ? &mut Allocator {
+    let mut text = Bytes.make()
+    if !self.resolver.costs.enabled || self.resolver.costs.functions == usize.ZERO { return move text }
+    let order = run CostTable.costliest(&self.resolver.costs, limit)
+    let picked = List<usize>.asSlice(&order)
+    run Bytes.append(&mut text, b"  Costliest calls: functions generated, their LLVM text, static evaluation steps, time\n")
+    let mut charged = usize.ZERO
+    let mut chargedBytes = usize.ZERO
+    let all = CostTable.charged(&self.resolver.costs)
+    let mut at = usize.ZERO
+    while at < all.length {
+      charged = charged + all[at].functions
+      chargedBytes = chargedBytes + all[at].bytes
+      at = at + usize.ONE
+    }
+    at = usize.ZERO
+    while at < picked.length {
+      let held = &CostTable.charged(&self.resolver.costs)[picked[at]]
+      let site = CostSite {module: ModuleId.copy(&held.module), span: held.span, functions: held.functions, bytes: held.bytes,
+        steps: held.steps, nanos: held.nanos}
+      let mut cell = Bytes.make()
+      run Progress.appendCount(&mut cell, site.functions)
+      run CostLedger.appendPadded(&mut text, Bytes.asSlice(&cell), 10)
+      cell = Bytes.make()
+      run CostLedger.appendSize(&mut cell, site.bytes)
+      run CostLedger.appendPadded(&mut text, Bytes.asSlice(&cell), 10)
+      cell = Bytes.make()
+      run Progress.appendCount(&mut cell, site.steps)
+      run CostLedger.appendPadded(&mut text, Bytes.asSlice(&cell), 10)
+      cell = Bytes.make()
+      run Progress.appendFineDuration(&mut cell, site.nanos)
+      run CostLedger.appendPadded(&mut text, Bytes.asSlice(&cell), 9)
+      run Bytes.append(&mut text, b"  ")
+      run Bytes.append(&mut text, prefix)
+      run Semantic.appendSite(&mut self.*, &mut text, &site.module, site.span)
+      run Bytes.append(&mut text, b"\n")
+      at = at + usize.ONE
+    }
+    run Bytes.append(&mut text, b"  Calls in this package asked for ")
+    run Progress.appendCount(&mut text, charged)
+    run Bytes.append(&mut text, b" of the build's ")
+    run Progress.appendCount(&mut text, self.resolver.costs.functions)
+    run Bytes.append(&mut text, b" functions (")
+    run CostLedger.appendSize(&mut text, chargedBytes)
+    run Bytes.append(&mut text, b" of ")
+    run CostLedger.appendSize(&mut text, self.resolver.costs.bytes)
+    run Bytes.append(&mut text, b"); static evaluation ran ")
+    run Progress.appendCount(&mut text, self.resolver.costs.processSteps)
+    run Bytes.append(&mut text, b" steps in all. Time varies from run to run; the other columns do not.\n")
+    return move text
+  }
+
+  // Appends `path:line:column` of `span` in `module` and the call's source text on one line,
+  // cut after 72 bytes.
+  effect fn appendSite(self: &mut Self, out: &mut Bytes, module: &ModuleId, span: Span) -> () ! Cycle | OutOfMemoryError ? &mut Allocator {
+    run ModuleId.appendPath(module, &mut out.*)
+    let answer = run source(&mut self.resolver, module)
+    if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&self.resolver, &answer, module) {
+      let bytes = SourceUnit.bytes(IndexedSource.sourceUnit(indexed))
+      let mut line = usize.ONE
+      let mut column = usize.ONE
+      let mut at = usize.ZERO
+      while at < span.start && at < bytes.length {
+        if bytes[at] == 10 {
+          line = line + usize.ONE
+          column = usize.ONE
+        } else {
+          column = column + usize.ONE
+        }
+        at = at + usize.ONE
+      }
+      run Bytes.append(&mut out.*, b":")
+      run CostLedger.appendDecimal(&mut out.*, line)
+      run Bytes.append(&mut out.*, b":")
+      run CostLedger.appendDecimal(&mut out.*, column)
+      run Bytes.append(&mut out.*, b"  ")
+      let mut folded = Bytes.make()
+      run Progress.appendFolded(&mut folded, bytes, span.start, span.end)
+      let shown = Bytes.asSlice(&folded)
+      if shown.length > 72 {
+        // Cut on a character boundary.
+        let mut cut: usize = 72
+        while cut > usize.ZERO && shown[cut] >= 128 && shown[cut] < 192 { cut = cut - usize.ONE }
+        run Bytes.append(&mut out.*, Slice.view<u8>(shown, usize.ZERO, cut))
+        run Bytes.append(&mut out.*, b"\xE2\x80\xA6")
+      } else {
+        run Bytes.append(&mut out.*, shown)
+      }
+    }
   }
 
   /// Offers the declaration origins a cache kept from an earlier build (`takeOrigins`), before a
@@ -100924,6 +101042,14 @@ impl Semantic {
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
   ? &mut Allocator | &mut Types {
     run selectRequest(&mut self.resolver, &request.*)
+    if self.resolver.costs.enabled {
+      self.resolver.costs.root = List<ModuleId>.make()
+      let mut rootAt = usize.ZERO
+      while rootAt < rootPackage.length {
+        run List<ModuleId>.append(&mut self.resolver.costs.root, ModuleId.copy(&rootPackage[rootAt]))
+        rootAt = rootAt + usize.ONE
+      }
+    }
     self.resolver.exportedObjects = List<ExportedObject>.make()
     self.resolver.exportedFunctions = List<LlvmCode.Declaration>.make()
     // The loaded modules of the root package and of its dependencies: each one's exports are roots.
@@ -101856,6 +101982,7 @@ impl Semantic {
     let mut lowerings = List<bool>.make()
     let mut pending = List<BackendVisit>.make()
     self.resolver.emittedMir = List<usize>.make()
+    CostTable.restart(&mut self.resolver.costs)
     // A revisable store's whole-program walk is captured as a build record (see `BuildRecord`):
     // `origins` runs beside `pending` and names how each pending visit was reached.
     let mut capture = run BuildCapture.make(observing, roots)
@@ -102179,6 +102306,12 @@ impl Semantic {
           }
           continue
         }
+        // What lowering this instance costs, for `--costs`: the static evaluation steps it runs and
+        // the time it takes.
+        let costSteps = self.resolver.costs.processSteps
+        let mut costFrom: u64 = 0
+        if self.resolver.costs.enabled { costFrom = run Progress.stamp() }
+        let mut costBytes = usize.ZERO
         let declarationAccess274Request = Key {
             family: Family.Mir,
             module: location.module,
@@ -102304,10 +102437,21 @@ impl Semantic {
               pack: usize.MAX, member: usize.MAX},
           )
           run recordText(&mut texts, lowered, value)
+          costBytes = Bytes.length(&List<InstanceDefinition>.asSlice(&self.resolver.llvmValues)[value].text)
           if capturing {
             let emissionUnit = run emissionInputsUnit(&mut self.resolver, key, &prepared)
             BuildCapture.emitted(&mut capture, entry, value, emissionUnit)
           }
+        }
+        // The instance is charged to the authored call in the root package that led to it.
+        if self.resolver.costs.enabled {
+          let fresh = self.resolver.costs.processSteps - costSteps
+          let steps = run CostTable.lowered(&mut self.resolver.costs, &instance, fresh)
+          let site = requestSite(&entered.requester, &entered.module, entered.span)
+          let charged = site.span.end != usize.ZERO && !toolchainModule(&site.module) && CostTable.inRoot(&self.resolver.costs, &site.module)
+          let costTo = run Progress.stamp()
+          let elapsed = costTo - costFrom
+          run CostTable.charge(&mut self.resolver.costs, charged, &site.module, site.span, costBytes, steps, elapsed)
         }
         if capturing {
           let mirWord = run internKey(&mut self.resolver, declarationAccess274)
