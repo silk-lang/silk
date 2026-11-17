@@ -23,9 +23,10 @@ silk change minor "Reads now return a future."   # record a change for the next 
 `since`, `recover`; see `silk change --help` and the repository README). It reads the `[release]`
 table of `silk.toml`.
 
-`silk help` lists the project commands and the tool's own; `silk help <command>` of a project
-command is the compiler's. `silk --version` is forwarded too, so it reports the Silk version the
-directory selects.
+`silk help` prints the overview of the compiler the directory selects, which lists the commands that
+compiler runs, then the tool's own; with no installed compiler to ask, it lists the tool's commands
+and says how to install one. `silk help <command>` of a project command is the compiler's.
+`silk --version` is forwarded too, so it reports the Silk version the directory selects.
 
 `list`, `which`, `use` and `set` take `--json`. The commands never prompt and report progress on
 standard error: a download from GitHub draws a live bar with its bytes, rate and time left on a
@@ -57,7 +58,8 @@ first, then the package; `0.0.0` means unpinned), and `default` in `settings.tom
 replaces itself with that version's `bin/silkc`, passing the arguments unchanged (without
 `+<version>`) and setting `SILK_TOOLCHAIN` to the full version and `SILK_HOME`. It never parses a
 forwarded command's flags. A first word one edit away from `use`, `set`, `update` or `change`,
-and from no compiler command, is answered with a suggestion instead of being forwarded.
+and from no command the selected compiler lists, is answered with a suggestion instead of being
+forwarded.
 
 A workspace's pin covers its members. When a member's own `silk-version` names another version,
 the tool prints a note naming both manifests and runs the workspace's version.
