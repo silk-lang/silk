@@ -211,7 +211,8 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   const graphBuilt = yield* invoke(silk, ['build', join(graphSources, 'main.silk'),
     '-o', graphProgram, '--stdlib', standardLibrary, '--clang', clang], directory, process.env, 120_000)
   assert.equal(graphBuilt.status, 0, graphBuilt.stderr)
-  const graphRan = yield* invoke(graphProgram, [], graphRoot)
+  // The runner hands its standard steps to the compiler, as a task program's does.
+  const graphRan = yield* invoke(graphProgram, [], graphRoot, { ...process.env, SILK_COMPILER: silk })
   assert.equal(graphRan.status, 0, graphRan.stderr)
   const staticGraphProgram = join(directory, 'static-graph-test')
   const staticGraphBuilt = yield* invoke(silk, ['build', join(repository, 'compiler/fixtures/build-graph/static.silk'),
@@ -339,7 +340,6 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     '    }',
     '  }',
     '}',
-    'pub const COMMANDS: string = Task.commands<Tasks>()',
     'pub effect fn main() -> i32 ? &mut HostInput { return run Task.main<Tasks>() }',
     '',
   ].join('\n')
@@ -348,7 +348,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   for (const command of reservedCommands.map((name) => name.toLowerCase())) {
     const dispatched = yield* invoke(silk, [command, '--stdlib', standardLibrary, '--code', '17'], aliased, requestEnv, 120_000)
     assert.equal(dispatched.status, 17, dispatched.stderr)
-    assert.equal(dispatched.stderr.split('task selected').length - 1, 1, 'the discovery query must not perform the task')
+    assert.equal(dispatched.stderr.split('task selected').length - 1, 1, 'a reserved command performs its task once')
   }
   const explicitTask = yield* invoke(silk, ['task', '--stdlib', standardLibrary, 'build', '--code', '23'], aliased, requestEnv, 120_000)
   assert.equal(explicitTask.status, 23, explicitTask.stderr)
@@ -364,7 +364,27 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   assert.equal(customPlan.status, 0, customPlan.stderr)
   const customSet = JSON.parse(yield* fs.readFileString(join(aliased, 'build/requests/plan.json')))
   assert.ok(customSet.files.length > 0, 'a child task publishes its pending requests through the parent')
+  // The fixture's `when` lambdas set speed and turn debug information off.
+  const customRequest = yield* fs.readFileString(join(aliased, 'build/requests', customSet.files[0]))
+  assert.match(customRequest, /"optimization" = "speed"/)
+  assert.match(customRequest, /"debug" = false/)
   assert.equal(yield* fs.exists(join(aliased, 'build/requests/.pending-plan.json')), false)
+  // A graph of a custom step, a compilation that embeds its output and a custom step that reads
+  // the artifact: the task program runs the custom steps and the compiler runs the compilation.
+  yield* fs.copyFile(join(graphSources, 'mixed_task.silk'), join(aliased, 'src/tasks.silk'))
+  for (const round of ['first', 'unchanged']) {
+    const mixed = yield* invoke(silk, ['build', '--stdlib', standardLibrary], aliased, requestEnv, 300_000)
+    assert.equal(mixed.status, 0, `${round}: ${mixed.stderr}`)
+    assert.match(mixed.stderr, /^Finished build\/[^/\n]+\/dev\/aliased(\.exe)? in /m, `${round}: the build reports its artifact`)
+    if (round === 'first') assert.match(mixed.stderr, /^Compiling aliased \(/m, 'the compilation reports its progress')
+  }
+  const mixedSteps = yield* fs.readDirectory(join(aliased, 'build/steps'))
+  const mixedSizes: Array<string> = []
+  for (const name of mixedSteps) {
+    // A step directory is named by its key; lock files and records sit beside them.
+    if (/^[0-9a-f]{64}$/.test(name) && (yield* fs.exists(join(aliased, 'build/steps', name, 'size.txt')))) mixedSizes.push(name)
+  }
+  assert.equal(mixedSizes.length, 1, 'the custom step that reads the artifact ran once')
   const argumentsFor = (output: string) => [
     'build',
     'main.silk',

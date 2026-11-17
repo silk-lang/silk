@@ -6,7 +6,7 @@ Build steps, their declared inputs, and values resolved only by the graph runner
 
 Import as `Step` with `import silk.build.step { Step }`.
 
-Public declarations: 13.
+Public declarations: 18.
 
 <a id="StepError"></a>
 
@@ -183,6 +183,36 @@ pub effect fn external(path: string) -> Deferred<Path>
 
 Names an explicitly supplied absolute host path.
 
+<a id="Deferred.impl.Schema"></a>
+
+## Implementation `Schema for Deferred<T>`
+
+```silk
+impl<T> Schema for Deferred<T>
+```
+
+A deferred value travels in a step description as its reference, never as its result.
+
+<a id="Deferred.impl.Schema.read"></a>
+
+### Operation `read`
+
+```silk
+effect fn read<R: SchemaReader>(reader: &mut R) -> Self
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
+```
+
+<a id="Deferred.impl.Schema.write"></a>
+
+### Operation `write`
+
+```silk
+effect fn write<W: SchemaWriter>(self: &Self, writer: &mut W) -> ()
+    ! Issue | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator
+```
+
 <a id="Deferred.impl-4"></a>
 
 ## Implementation `Deferred<T>`
@@ -236,6 +266,28 @@ The complete inputs of a step. Its methods record inputs without reading files o
 ```silk
 impl Key
 ```
+
+<a id="Key.impl.collecting"></a>
+
+### Associated function `collecting`
+
+```silk
+pub fn collecting() -> Self
+```
+
+Starts an empty key, for collecting what a described step declares.
+
+<a id="Key.impl.producers"></a>
+
+### Method `producers`
+
+```silk
+pub effect fn producers(self: &Self) -> List<StepHandle>
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Retains every step whose output this key declares as an input.
 
 <a id="Key.impl.bytes"></a>
 
@@ -444,6 +496,72 @@ fn compilation(self: &Self) -> bool
 
 Whether this step writes a compilation request and can stop before invoking the compiler.
 
+<a id="Provision"></a>
+
+## `Provision`
+
+```silk
+pub struct Provision
+```
+
+Where a step that another process ran left its outputs.
+
+<a id="Provision.directory"></a>
+
+### Field `directory`
+
+```silk
+pub directory: String
+```
+
+The step's cache directory, named by its key.
+
+<a id="Provision.volatile"></a>
+
+### Field `volatile`
+
+```silk
+pub volatile: bool
+```
+
+Whether the step runs every time, so its consumers do too.
+
+<a id="Provision.compilation"></a>
+
+### Field `compilation`
+
+```silk
+pub compilation: bool
+```
+
+Whether the step is a compilation.
+
+<a id="Provision.compiled"></a>
+
+### Field `compiled`
+
+```silk
+pub compiled: bool
+```
+
+Whether a compilation built its artifact, or only wrote its request.
+
+<a id="Provision.impl.Schema"></a>
+
+## Implementation `Schema for Provision`
+
+```silk
+impl Schema for Provision
+```
+
+<a id="Provision.impl.Schema.spec"></a>
+
+### Operation `spec`
+
+```silk
+static fn spec() -> Spec<Provision>
+```
+
 <a id="StepHandle"></a>
 
 ## `StepHandle`
@@ -453,6 +571,72 @@ pub struct StepHandle
 ```
 
 An owned step registered in a graph. Several deferred outputs may retain the same step.
+
+<a id="StepDescription"></a>
+
+## `StepDescription`
+
+```silk
+pub struct StepDescription
+```
+
+One step of a described graph: what the task program hands to the compiler.
+
+<a id="StepDescription.node"></a>
+
+### Field `node`
+
+```silk
+pub node: u64
+```
+
+The step's identity within its description.
+
+<a id="StepDescription.kind"></a>
+
+### Field `kind`
+
+```silk
+pub kind: String
+```
+
+The kind of standard step.
+
+<a id="StepDescription.step"></a>
+
+### Field `step`
+
+```silk
+pub step: String
+```
+
+The step's own JSON description.
+
+<a id="StepDescription.impl.Schema"></a>
+
+## Implementation `Schema for StepDescription`
+
+```silk
+impl Schema for StepDescription
+```
+
+<a id="StepDescription.impl.Schema.spec"></a>
+
+### Operation `spec`
+
+```silk
+static fn spec() -> Spec<StepDescription>
+```
+
+<a id="Link"></a>
+
+## `Link`
+
+```silk
+pub struct Link
+```
+
+A described step's identity and the step restored for it.
 
 <a id="StepHandle.impl"></a>
 
@@ -471,6 +655,124 @@ pub fn copy(self: &Self) -> Self
 ```
 
 Retains the step without copying or running its work.
+
+<a id="StepHandle.impl.identity"></a>
+
+### Method `identity`
+
+```silk
+pub fn identity(self: &Self) -> usize
+```
+
+The step's identity among the live steps of this process.
+
+<a id="StepHandle.impl.described"></a>
+
+### Associated function `described`
+
+```silk
+pub effect fn described(kind: string, step: Bytes, producers: List<StepHandle>) -> Self
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Holds a standard step as its description. `producers` are the steps whose outputs it reads.
+The compiler restores the step by its kind and runs it.
+
+<a id="StepHandle.impl.provided"></a>
+
+### Associated function `provided`
+
+```silk
+pub effect fn provided(provision: Provision) -> Self
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Holds a step that already ran, as the directory its outputs are in.
+
+<a id="StepHandle.impl.description"></a>
+
+### Method `description`
+
+```silk
+pub effect fn description(self: &Self) -> Option<StepDescription>
+    ! StepFailure
+    ? &mut Allocator
+```
+
+The step's description, when it is a standard step that has not been restored.
+
+<a id="StepHandle.impl.install"></a>
+
+### Method `install`
+
+```silk
+pub effect fn install(self: &Self, restored: &StepHandle) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Gives this step the work, or the provision, of the step restored from its description.
+
+<a id="StepHandle.impl.linkedSteps"></a>
+
+### Associated function `linkedSteps`
+
+```silk
+pub effect fn linkedSteps(links: &[Link]) -> List<StepHandle>
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+The steps restored for a description, in its order.
+
+<a id="StepHandle.impl.describeAll"></a>
+
+### Associated function `describeAll`
+
+```silk
+pub effect fn describeAll(targets: &[StepHandle]) -> Option<List<StepDescription>>
+    ! StepFailure
+    ? &mut Allocator
+```
+
+Describes these steps and everything they read, producers first. Answers nothing when the
+graph holds a custom step, which only this program can run.
+
+<a id="StepHandle.impl.executorOf"></a>
+
+### Associated function `executorOf`
+
+```silk
+pub effect fn executorOf(targets: &[StepHandle]) -> Option<Graphs.Executor>
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Finds the executor of a custom step among these steps and everything they read.
+
+<a id="StepHandle.impl.restoreAll"></a>
+
+### Associated function `restoreAll`
+
+```silk
+pub effect fn restoreAll(steps: &[StepDescription]) -> List<Link>
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Restores described steps without running them, and answers the link of each.
+
+<a id="StepHandle.impl.linked"></a>
+
+### Associated function `linked`
+
+```silk
+pub fn linked(links: &[Link], node: u64) -> Option<StepHandle>
+```
+
+Finds the step restored for `node` of a description.
 
 <a id="StepHandle.impl.output"></a>
 
@@ -538,6 +840,19 @@ pub effect fn register<T: Step + Transferable + 'static>(input: T) -> StepHandle
 ```
 
 Takes ownership of custom work and records its key without running it. Outputs retain this handle.
+
+<a id="Step.impl.describe"></a>
+
+### Associated function `describe`
+
+```silk
+pub effect fn describe<T: Step + Schema>(kind: string, input: T) -> StepHandle
+    ! StepFailure
+    ? &mut Allocator
+```
+
+Holds a standard step as its description, without its work. `kind` names how the compiler
+restores it.
 
 <a id="Step.impl.output"></a>
 
@@ -810,6 +1125,66 @@ pub compiled: bool
 
 Whether the artifact was built, including prerequisites of a planning invocation.
 
+<a id="StepOutput"></a>
+
+## `StepOutput`
+
+```silk
+pub struct StepOutput
+```
+
+One step the runner prepared.
+
+<a id="StepOutput.identity"></a>
+
+### Field `identity`
+
+```silk
+pub identity: usize
+```
+
+The identity of the step's handle.
+
+<a id="StepOutput.directory"></a>
+
+### Field `directory`
+
+```silk
+pub directory: Path
+```
+
+The step's cache directory.
+
+<a id="StepOutput.volatile"></a>
+
+### Field `volatile`
+
+```silk
+pub volatile: bool
+```
+
+Whether the step runs every time.
+
+<a id="StepOutput.compilation"></a>
+
+### Field `compilation`
+
+```silk
+pub compilation: bool
+```
+
+Whether the step is a compilation.
+
+<a id="StepOutput.compiled"></a>
+
+### Field `compiled`
+
+```silk
+pub compiled: bool
+```
+
+Whether a compilation built its artifact, or only wrote its request.
+
 <a id="Execution"></a>
 
 ## `Execution`
@@ -840,6 +1215,16 @@ pub compilations: List<CompilationOutput>
 
 Reachable compilations, including tools needed by other steps.
 
+<a id="Execution.steps"></a>
+
+### Field `steps`
+
+```silk
+pub steps: List<StepOutput>
+```
+
+Every step the runner prepared, producers first.
+
 <a id="Runner.impl"></a>
 
 ## Implementation `Runner`
@@ -860,6 +1245,16 @@ pub effect fn make(root: Path, cache: Path, identity: &[u8]) -> Self
 
 Sets the package root, cache directory, and identity of the task program and compiler.
 The caller must include both executables' content digests in `identity`.
+
+<a id="Runner.impl.linking"></a>
+
+### Method `linking`
+
+```silk
+pub fn linking(self: Self, links: List<Link>) -> Self
+```
+
+Supplies the steps restored from a description, which their consumers name by identity.
 
 <a id="Runner.impl.memory"></a>
 
@@ -894,6 +1289,18 @@ pub effect fn execute(self: &Self, targets: &[StepHandle], compile: bool) -> Exe
 Resolves each key before running its step, executing prerequisites needed to discover file sets.
 Only requested steps and their declared inputs run.
 When `compile` is false, requested compilations write requests while prerequisite tools build.
+
+<a id="recordDirectory"></a>
+
+## `recordDirectory`
+
+```silk
+pub effect fn recordDirectory(cache: &Path) -> Path
+  ! FileError | OutOfMemoryError
+  ? &mut Allocator
+```
+
+Where the digests of unchanged inputs are recorded, beside the step outputs they key.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`, `wasm64-unknown-unknown`.

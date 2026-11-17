@@ -781,7 +781,6 @@ impl TaskSet for Tasks {
     run FileSystem.writeFileWithParents(&run Path.make(${JSON.stringify(witness)}), b"entered")
   }
 }
-pub const COMMANDS: string = Task.commands<Tasks>()
 pub effect fn main() -> i32 ? &mut HostInput { return run Task.main<Tasks>() }
 `
   // The plan's witness sits outside the request directory, which a failed plan restores.

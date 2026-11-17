@@ -71,5 +71,16 @@ pub effect fn execute(self: Self, context: C) -> A ! E
 Supplies the resolved inputs and drives the work to completion, preserving typed failures.
 A parked step resumes only after its execution's readiness notification.
 
+<a id="Pending.impl.finish"></a>
+
+### Method `finish`
+
+```silk
+pub effect fn finish(self: Self, context: C) -> A ! E
+```
+
+Supplies the resolved inputs and drives work that blocks instead of parking to completion
+on the calling thread, so a caller without a scheduler can run it.
+
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`, `wasm64-unknown-unknown`.

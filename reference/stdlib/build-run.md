@@ -6,7 +6,7 @@ Process steps with declared arguments, files, environment, and captured values.
 
 Import as `Run` with `import silk.build.run { Run }`.
 
-Public declarations: 1.
+Public declarations: 2.
 
 <a id="Run"></a>
 
@@ -183,6 +183,17 @@ pub effect fn register(self: Self) -> StepHandle ! StepFailure ? &mut Allocator
 
 Registers the invocation and returns a handle to its declared outputs.
 
+<a id="Run.impl.registerHere"></a>
+
+### Method `registerHere`
+
+```silk
+pub effect fn registerHere(self: Self) -> StepHandle ! StepFailure ? &mut Allocator
+```
+
+Registers the invocation as work this process runs itself, without describing it to the
+compiler.
+
 <a id="Run.impl.confined"></a>
 
 ### Method `confined`
@@ -292,6 +303,16 @@ pub effect fn captureLines(self: Self) -> Deferred<List<String>> ! StepFailure ?
 ```
 
 Captures UTF-8 standard output split into lines.
+
+<a id="restore"></a>
+
+## `restore`
+
+```silk
+pub effect fn restore(step: &[u8]) -> StepHandle ! StepFailure ? &mut Allocator
+```
+
+Restores a described process as a step this process can run.
 
 <a id="Run.impl.Step"></a>
 
