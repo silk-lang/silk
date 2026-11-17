@@ -44,15 +44,17 @@ const withStub = async (body: string, run: (path: string) => Promise<void>): Pro
   }
 }
 
-const compiled = `if [ "$5" != --stdlib ] || [ ! -f "$6/silk/num/i32.silk" ] || ! grep -qxF 'version = "0.1.0"' silk.toml; then exit 4; fi
-case "$6" in */) exit 5;; esac
-if [ "$1" != build ] || [ "$2" != memory/driver.silk ] || [ ! -f memory/driver.silk ] || [ "$3" != -o ] || [ "$4" != program ]; then exit 3; fi
-while [ "$1" != "-o" ]; do shift; done
-output="$2"
-printf '#!/bin/sh\\nexit 42\\n' > "$output"
-chmod +x "$output"`
+const compiled = `if [ "$1" = resolve ]; then
+  test "$2" = --definition && test -s "$3" && test "$4" = --output && test "$6" = --artifact || exit 3
+  grep -qxF 'main = "memory/driver.silk"' silk.toml || exit 4
+  test -f memory/driver.silk || exit 5
+  exit 0
+fi
+if [ "$1" != compile ] || [ "$2" != --request ]; then exit 6; fi
+printf '#!/bin/sh\\nexit 42\\n' > program
+chmod +x program`
 
-void it('runs a pinned native corpus program through the build command', async () => {
+void it('runs a pinned native corpus program through resolve and compile', async () => {
   await withStub(compiled, async (silkc) => {
     assert.deepStrictEqual(await runCase(silkc, literal), { name: 'literal', status: 'pass' })
     const profiled = withOutcome({
@@ -62,8 +64,11 @@ void it('runs a pinned native corpus program through the build command', async (
       ],
     })
     await withStub(
-      `if [ "$7" != --optimization ] || [ "$9" != --debug ]; then exit 6; fi
-printf '%s:%s\\n' "$8" "\${10}" >> "$0.profiles"
+      `if [ "$1" = resolve ]; then
+  optimization=$(sed -n 's/^optimization = "\\(.*\\)"$/\\1/p' "$3")
+  debug=$(sed -n 's/^debug = //p' "$3")
+  printf '%s:%s\\n' "$optimization" "$debug" >> "$0.profiles"
+fi
 ${compiled}`,
       async (profileSilkc) => {
         assert.deepStrictEqual(await runCase(profileSilkc, profiled), {
@@ -79,20 +84,21 @@ ${compiled}`,
   })
 })
 
-void it('declares compiled corpus C units and libraries as manifest link inputs', async () => {
+void it('declares compiled corpus C units and libraries through a typed plan', async () => {
   const linked: Corpus.Program = {
     ...withOutcome({ dynamicLibraries: ['custom'] }),
     cSources: { fixture: 'int silk_fixture(void) { return 42; }\n' },
   }
   await withStub(
     `[ -s fixture.o ] || exit 7
-grep -qxF 'link = [{ object = "fixture.o" }, { library = "custom", mode = "dynamic" }]' silk.toml || exit 8
+grep -qF 'Plan.linkObject(plan, sourcePath("fixture.o"))' build.silk || exit 8
+grep -qF 'Plan.linkLibrary(plan, "custom", Library.dynamicSearch())' build.silk || exit 8
 ${compiled}`,
     async (silkc) => {
       assert.deepStrictEqual(await runCase(silkc, linked), { name: 'literal', status: 'pass' })
     },
   )
-  await withStub(`grep -q '^link = ' silk.toml && exit 9\n${compiled}`, async (silkc) => {
+  await withStub(`test -f build.silk && exit 9\n${compiled}`, async (silkc) => {
     assert.deepStrictEqual(await runCase(silkc, literal), { name: 'literal', status: 'pass' })
   })
 })
@@ -270,8 +276,8 @@ void it('fails the gate only for cases on the ordered selfhost track', () => {
 })
 
 void it('passes native run arguments and closes stderr when requested', async () => {
-  const argumentAndStderrStub = `while [ "$1" != "-o" ]; do shift; done
-output="$2"
+  const argumentAndStderrStub = `if [ "$1" = resolve ]; then exit 0; fi
+output="program"
 cat > "$output" <<'SCRIPT'
 #!/bin/sh
 if [ "$#" -ne 2 ] || [ "$1" != one ] || [ "$2" != two ]; then exit 1; fi
@@ -386,7 +392,8 @@ void it('checks a rejected program against its exact diagnostics', async () => {
     },
   }
   const reporting = (records: string) =>
-    `if [ "$1" != build ] || [ "$2" != memory/driver.silk ] || [ "$5" != --stdlib ]; then exit 3; fi
+    `if [ "$1" = resolve ]; then exit 0; fi
+if [ "$1" != compile ] || [ "$2" != --request ]; then exit 3; fi
 printf '${records}' >&2
 exit 1`
   const error = (code: string, start: number, end: number) =>

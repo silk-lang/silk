@@ -17,6 +17,20 @@
 //! A file named exactly `silk.toml` is instead a manifest document: its unsaved text receives
 //! shared TOML/schema diagnostics, without entering a source package or Silk syntax features.
 
+import silk.text.string { String }
+import silk.build.request { Request as SavedRequest }
+import lsp.Compilation as Compilations {
+  Settings as CompilationSettings,
+  Host as CompilationHost,
+  Ask as PlanAsk,
+  Location as CompilationLocation,
+  Variable as EnvironmentVariable
+}
+import lsp.PlanAuthorization
+import driver.CompilationRequest as CompilationRequests
+import silk.json.value { Value as JsonValue }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.build.definition { Definition as CompilationDefinition }
 import diagnostic.Report as Reports { RenderedDiagnostic }
 import driver.Analysis as Analyses { Analysis, Opened }
 import driver.CacheStamp
@@ -53,7 +67,7 @@ import semantic.InitialProfile { InitialProfile, Problem as InitialProfileProble
 import semantic.ModuleId { InvalidModulePath, ModuleId }
 import semantic.Query { Cycle }
 import semantic.Rejection as Rejections { Rejection, RejectionCode }
-import hir.Unused as UnusedBindings {Unused as UnusedBinding}
+import hir.Unused as UnusedBindings { Unused as UnusedBinding }
 import semantic.Semantic as Semantics {
   ConflictingPackageSource,
   RegistrationClosed,
@@ -191,6 +205,11 @@ pub struct Workspace {
   // The git checkout store git dependencies read (driver/GitCheckouts); the server never fetches.
   store: Option<Path>,
   target: Target,
+  settings: CompilationSettings,
+  host: CompilationHost,
+  planHint: bool,
+  hintShown: bool,
+  outdatedShown: bool,
   documents: List<Document>,
   packages: List<Package>,
 
@@ -205,6 +224,16 @@ pub fn make(standardLibrary: Option<Path>, store: Option<Path>, target: Target) 
     standardLibrary: move standardLibrary,
     store: move store,
     target: target,
+    settings: Compilations.defaults(),
+    host: CompilationHost {
+      variables: List<EnvironmentVariable>.make(),
+      locations: List<CompilationLocation>.make(),
+      asks: List<PlanAsk>.make(),
+      outdated: false,
+    },
+    planHint: false,
+    hintShown: false,
+    outdatedShown: false,
     documents: List<Document>.make(),
     packages: List<Package>.make(),
     closed: List<Bytes>.make(),
@@ -212,8 +241,115 @@ pub fn make(standardLibrary: Option<Path>, store: Option<Path>, target: Target) 
 }
 
 impl Workspace {
+  /// Installs the environment captured before the language-server threads started.
+  pub fn hostEnvironment(self: &mut Self, host: CompilationHost) -> () {
+    self.host = move host
+  }
+
+  /// Applies explicit editor settings and reopens documents under their selected compilation.
+  pub effect fn configure(self: &mut Self, value: &JsonValue) -> ()
+    ! OutOfMemoryError
+    ? &mut FileSystem | &mut Allocator | &mut Types {
+    self.settings = run Compilations.settings(value)
+    return run self.reload(true)
+  }
+
+  /// Reopens documents after request files, task sources, or editor settings change.
+  pub effect fn reload(self: &mut Self, refreshPlan: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut FileSystem | &mut Allocator | &mut Types {
+    let refresh = self.settings.refresh
+    self.settings.refresh = refresh && refreshPlan
+    self.packages = List<Package>.make()
+    let mut at: usize = 0
+    while at < self.documents.length() {
+      let document = &mut self.documents.asMutSlice()[at]
+      document.package = usize.MAX
+      document.module = Option<ModuleId>.none()
+      document.stale = true
+      document.owed = true
+      if !document.manifest {
+        document.refusal = Option<Bytes>.some(Bytes.make())
+      }
+      at = at + 1
+    }
+    run self.reopen()
+    self.settings.refresh = refresh
+    return ()
+  }
+
+  /// Reports one stale-plan hint per session while continuing with saved requests.
+  pub fn takePlanHint(self: &mut Self) -> bool {
+    if self.planHint && !self.hintShown {
+      self.hintShown = true
+      return true
+    }
+    return false
+  }
+
+  /// Reports once per session that a package's `tasks.silk` is newer than its saved requests.
+  pub fn takeOutdatedNote(self: &mut Self) -> bool {
+    if self.host.outdated && !self.outdatedShown {
+      self.outdatedShown = true
+      return true
+    }
+    return false
+  }
+
+  /// The next question about running a project's own plan that the session has not sent: its
+  /// number, for [`answer`], and what it covers. It is marked sent.
+  pub effect fn takeAsk(self: &mut Self) -> Option<Asked>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let asks = self.host.asks.asMutSlice()
+    let mut at: usize = 0
+    while at < asks.length {
+      if !asks[at].asked {
+        asks[at].asked = true
+        return Option<Asked>.some(Asked { number: at, key: run Bytes.copy(asks[at].key.asSlice()) })
+      }
+      at = at + 1
+    }
+    return Option<Asked>.none()
+  }
+
+  /// Records the developer's answer to question `number`. Allowing it saves the authorization
+  /// and refreshes the workspace's plans; any other answer keeps the saved requests.
+  pub effect fn answer(self: &mut Self, number: usize, allowed: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut FileSystem | &mut Allocator | &mut Types {
+    if number >= self.host.asks.length() {
+      return ()
+    }
+    if !allowed {
+      return ()
+    }
+    let key = run Bytes.copy(self.host.asks.asSlice()[number].key.asSlice())
+    let saved = run Effect.result(
+      PlanAuthorization.allow(key.asSlice()) |> Effect.provideMut<HostInput>(&mut self.host),
+    )
+    match move saved {
+      Result<bool, HostInputError | OutOfMemoryError>.Success { value } => {
+        if !value {
+          self.planHint = true
+        }
+      }
+      Result<bool, HostInputError | OutOfMemoryError>.Failure { error } => match move error {
+        OutOfMemoryError exhausted => {
+          fail move exhausted
+        }
+        HostInputError _unread => {
+          self.planHint = true
+        }
+      }
+    }
+    return run self.reload(true)
+  }
+
   /// The `file:` URI of the standard library the workspace's packages read, if it has one.
-  pub effect fn libraryUri(self: &Self) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+  pub effect fn libraryUri(self: &Self) -> Option<Bytes>
+    ! OutOfMemoryError
+    ? &mut Allocator {
     return match &self.standardLibrary {
       Option<Path>.Some { value } => Option<Bytes>.some(run fileUri(Path.rawBytes(&value)))
       Option<Path>.None => Option<Bytes>.none()
@@ -261,7 +397,7 @@ impl Workspace {
         owed: true,
         unit: Option<SourceUnit>.none(),
         refusal: move refusal,
-      }
+      },
     )
   }
 
@@ -306,8 +442,15 @@ impl Workspace {
     let packages = List<Package>.asMutSlice(&mut self.packages)
     let mut package = usize.ZERO
     while package < packages.length {
-      if let Option<ModuleId>.Some { value: module } = move run readerModule(&packages[package], Bytes.asSlice(&path)) {
-        run Sources.reread(&mut packages[package].sources, &module, Bytes.asSlice(&documents[at].text))
+      if let Option<ModuleId>.Some { value: module } = move run readerModule(
+        &packages[package],
+        Bytes.asSlice(&path),
+      ) {
+        run Sources.reread(
+          &mut packages[package].sources,
+          &module,
+          Bytes.asSlice(&documents[at].text),
+        )
         packages[package].exports.forget(&module)
         packages[package].stale = true
       }
@@ -318,7 +461,13 @@ impl Workspace {
 
   /// Applies the changes of one `didChange` notification to the open document at `uri`, each to
   /// the text the ones before it left, with positions counted in `encoding`.
-  pub effect fn edit(self: &mut Self, uri: &[u8], version: usize, changes: &[Change], encoding: PositionEncoding) -> ()
+  pub effect fn edit(
+    self: &mut Self,
+    uri: &[u8],
+    version: usize,
+    changes: &[Change],
+    encoding: PositionEncoding,
+  ) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
     let at = documentAt(&self.*, uri)
@@ -413,8 +562,10 @@ impl Workspace {
     while at < List<Document>.length(&self.documents) {
       let mut retried = Option<Bytes>.none()
       let document = &List<Document>.asSlice(&self.documents)[at]
-      if let Option<Bytes>.Some {..} = &document.refusal {
-        if document.stale { retried = run filePath(Bytes.asSlice(&document.uri)) }
+      if let Option<Bytes>.Some { .. } = &document.refusal {
+        if document.stale {
+          retried = run filePath(Bytes.asSlice(&document.uri))
+        }
       }
       if let Option<Bytes>.Some { value: path } = move retried {
         let mut refusal = Option<Bytes>.none()
@@ -462,9 +613,11 @@ impl Workspace {
     while at < packages.length {
       if preparingOne(&packages[at]) || List<ModuleId>.length(&packages[at].queue) > usize.ZERO {
         run step(&mut packages[at])
+
         // The package's first full check is written to its cache once it finishes, so the next
         // session starts warm; later edits are written when the server shuts down.
-        if packages[at].saved == usize.ZERO && !preparingOne(&packages[at]) && List<ModuleId>.length(&packages[at].queue) == usize.ZERO {
+        if packages[at].saved == usize.ZERO && !preparingOne(&packages[at])
+          && List<ModuleId>.length(&packages[at].queue) == usize.ZERO {
           run persist(&mut packages[at])
         }
         return true
@@ -500,7 +653,7 @@ impl Workspace {
       let uri = List<Bytes>.remove(&mut self.closed, usize.ZERO)
       run List<Published>.append(
         &mut published,
-        Published { uri: move uri, version: Option<usize>.none(), problems: List<Problem>.make() }
+        Published { uri: move uri, version: Option<usize>.none(), problems: List<Problem>.make() },
       )
     }
 
@@ -516,7 +669,8 @@ impl Workspace {
     }
     let mut package = usize.ZERO
     while package < List<Package>.length(&self.packages) {
-      while List<ModuleId>.length(&List<Package>.asSlice(&self.packages)[package].dirty) > usize.ZERO {
+      while List<ModuleId>.length(&List<Package>.asSlice(&self.packages)[package].dirty)
+        > usize.ZERO {
         let packages = List<Package>.asMutSlice(&mut self.packages)
         let module = List<ModuleId>.remove(&mut packages[package].dirty, usize.ZERO)
         let opened = documentOf(&self.*, package, &module)
@@ -527,7 +681,12 @@ impl Workspace {
             documents[opened].owed = true
           }
         } else {
-          run publishClosed(&mut List<Package>.asMutSlice(&mut self.packages)[package], &module, encoding, &mut published)
+          run publishClosed(
+            &mut List<Package>.asMutSlice(&mut self.packages)[package],
+            &module,
+            encoding,
+            &mut published,
+          )
         }
       }
       package = package + usize.ONE
@@ -535,7 +694,11 @@ impl Workspace {
 
     at = usize.ZERO
     while at < List<Document>.length(&self.documents) {
-      if let Option<Published>.Some { value } = move run documentDiagnostics(&self.*, at, encoding) {
+      if let Option<Published>.Some { value } = move run documentDiagnostics(
+        &self.*,
+        at,
+        encoding,
+      ) {
         run List<Published>.append(&mut published, move value)
         let documents = List<Document>.asMutSlice(&mut self.documents)
         documents[at].owed = false
@@ -569,13 +732,18 @@ impl Workspace {
       return Option<Statistics>.none()
     }
     return Option<Statistics>.some(
-      Semantic.statistics(&List<Package>.asSlice(&self.packages)[package].store)
+      Semantic.statistics(&List<Package>.asSlice(&self.packages)[package].store),
     )
   }
 
   /// What the cursor at `position` of the open document at `uri` names, as Markdown, or the type
   /// of the expression under it.
-  pub effect fn hover(self: &mut Self, uri: &[u8], position: Position, encoding: PositionEncoding) -> Option<Shown>
+  pub effect fn hover(
+    self: &mut Self,
+    uri: &[u8],
+    position: Position,
+    encoding: PositionEncoding,
+  ) -> Option<Shown>
     ! OutOfMemoryError
     ? &mut FileSystem | &mut Allocator | &mut Types {
     let at = run subject(&mut self.*, uri)
@@ -589,8 +757,18 @@ impl Workspace {
     let package = &mut List<Package>.asMutSlice(&mut self.packages)[document.package]
     let attempted = run Effect.result(Navigation.hover(&mut package.store, &module, text, offset))
     let shown = match move attempted {
-      Result<Option<Hover>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success { value } => move value
-      Result<Option<Hover>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure { error } => match move error {
+      Result<
+        Option<Hover>,
+        Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+      >.Success {
+        value
+      } => move value
+      Result<
+        Option<Hover>,
+        Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+      >.Failure {
+        error
+      } => match move error {
         OutOfMemoryError exhausted => {
           fail move exhausted
         }
@@ -607,7 +785,10 @@ impl Workspace {
       while index < links.length {
         run Bytes.append(&mut linked, Slice.view<u8>(written, cursor, links[index].at - cursor))
         cursor = links[index].at
-        if let Option<Bytes>.Some { value: target } = move run uriOf(&package.sources, &links[index].module) {
+        if let Option<Bytes>.Some { value: target } = move run uriOf(
+          &package.sources,
+          &links[index].module,
+        ) {
           run Bytes.append(&mut linked, b"(")
           run Bytes.append(&mut linked, Bytes.asSlice(&target))
           run Bytes.append(&mut linked, b"#L")
@@ -617,17 +798,24 @@ impl Workspace {
         index = index + usize.ONE
       }
       run Bytes.append(&mut linked, Slice.view<u8>(written, cursor, written.length - cursor))
-      return Option<Shown>.some(Shown {
-        start: locate(text, value.span.start, encoding),
-        end: locate(text, value.span.end, encoding),
-        text: move linked,
-      })
+      return Option<Shown>.some(
+        Shown {
+          start: locate(text, value.span.start, encoding),
+          end: locate(text, value.span.end, encoding),
+          text: move linked,
+        },
+      )
     }
     return Option<Shown>.none()
   }
 
   /// Where the name at `position` of the open document at `uri` is defined.
-  pub effect fn definition(self: &mut Self, uri: &[u8], position: Position, encoding: PositionEncoding) -> Option<Location>
+  pub effect fn definition(
+    self: &mut Self,
+    uri: &[u8],
+    position: Position,
+    encoding: PositionEncoding,
+  ) -> Option<Location>
     ! OutOfMemoryError
     ? &mut FileSystem | &mut Allocator | &mut Types {
     let at = run subject(&mut self.*, uri)
@@ -639,10 +827,22 @@ impl Workspace {
     let text = Bytes.asSlice(&document.text)
     let offset = offsetOf(text, position, encoding)
     let package = &mut List<Package>.asMutSlice(&mut self.packages)[document.package]
-    let attempted = run Effect.result(Navigation.definition(&mut package.store, &module, text, offset))
+    let attempted = run Effect.result(
+      Navigation.definition(&mut package.store, &module, text, offset),
+    )
     let found = match move attempted {
-      Result<Option<Destination>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success { value } => move value
-      Result<Option<Destination>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure { error } => match move error {
+      Result<
+        Option<Destination>,
+        Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+      >.Success {
+        value
+      } => move value
+      Result<
+        Option<Destination>,
+        Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+      >.Failure {
+        error
+      } => match move error {
         OutOfMemoryError exhausted => {
           fail move exhausted
         }
@@ -662,11 +862,13 @@ impl Workspace {
         }
       }
       let targetText = Bytes.asSlice(&target.text)
-      return Option<Location>.some(Location {
-        uri: move targetUri,
-        start: locate(targetText, target.span.start, encoding),
-        end: locate(targetText, target.span.end, encoding),
-      })
+      return Option<Location>.some(
+        Location {
+          uri: move targetUri,
+          start: locate(targetText, target.span.start, encoding),
+          end: locate(targetText, target.span.end, encoding),
+        },
+      )
     }
     return Option<Location>.none()
   }
@@ -686,8 +888,12 @@ impl Workspace {
     let package = &mut List<Package>.asMutSlice(&mut self.packages)[document.package]
     let attempted = run Effect.result(Navigation.hints(&mut package.store, &module))
     let found = match move attempted {
-      Result<List<Hint>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success { value } => move value
-      Result<List<Hint>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure { error } => match move error {
+      Result<List<Hint>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {
+        value
+      } => move value
+      Result<List<Hint>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {
+        error
+      } => match move error {
         OutOfMemoryError exhausted => {
           fail move exhausted
         }
@@ -697,17 +903,25 @@ impl Workspace {
     let listed = List<Hint>.asSlice(&found)
     let mut index = usize.ZERO
     while index < listed.length {
-      run List<Hinted>.append(&mut hinted, Hinted {
-        position: locate(text, listed[index].offset, encoding),
-        label: run Bytes.copy(Bytes.asSlice(&listed[index].label)),
-      })
+      run List<Hinted>.append(
+        &mut hinted,
+        Hinted {
+          position: locate(text, listed[index].offset, encoding),
+          label: run Bytes.copy(Bytes.asSlice(&listed[index].label)),
+        },
+      )
       index = index + usize.ONE
     }
     return move hinted
   }
 
   /// The signature of the call whose arguments hold `position` in the open document at `uri`.
-  pub effect fn signature(self: &mut Self, uri: &[u8], position: Position, encoding: PositionEncoding) -> Option<Help>
+  pub effect fn signature(
+    self: &mut Self,
+    uri: &[u8],
+    position: Position,
+    encoding: PositionEncoding,
+  ) -> Option<Help>
     ! OutOfMemoryError
     ? &mut FileSystem | &mut Allocator | &mut Types {
     let at = run subject(&mut self.*, uri)
@@ -720,8 +934,18 @@ impl Workspace {
     let package = &mut List<Package>.asMutSlice(&mut self.packages)[document.package]
     let attempted = run Effect.result(Navigation.help(&mut package.store, &module, offset))
     return match move attempted {
-      Result<Option<Help>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success { value } => move value
-      Result<Option<Help>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure { error } => match move error {
+      Result<
+        Option<Help>,
+        Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+      >.Success {
+        value
+      } => move value
+      Result<
+        Option<Help>,
+        Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+      >.Failure {
+        error
+      } => match move error {
         OutOfMemoryError exhausted => {
           fail move exhausted
         }
@@ -733,7 +957,12 @@ impl Workspace {
   /// The completions at `position` of the open document at `uri` that start with the identifier
   /// being typed: the next segment of an import header's path, the members of the receiver before
   /// a `.`, or else the names in scope.
-  pub effect fn completion(self: &mut Self, uri: &[u8], position: Position, encoding: PositionEncoding) -> List<Item>
+  pub effect fn completion(
+    self: &mut Self,
+    uri: &[u8],
+    position: Position,
+    encoding: PositionEncoding,
+  ) -> List<Item>
     ! OutOfMemoryError
     ? &mut FileSystem | &mut Allocator | &mut Types {
     let at = run subject(&mut self.*, uri)
@@ -751,17 +980,33 @@ impl Workspace {
     let prefix = Slice.view<u8>(text, start, offset - start)
     let package = &mut List<Package>.asMutSlice(&mut self.packages)[document.package]
     if let Option<Bytes>.Some { value: written } = move run Completions.importPathAt(text, start) {
-      return run Completions.importSegments(&package.sources, &module, Bytes.asSlice(&written), prefix)
+      return run Completions.importSegments(
+        &package.sources,
+        &module,
+        Bytes.asSlice(&written),
+        prefix,
+      )
     }
-    let mut attempted = Result<List<Item>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success { value: List<Item>.make() }
+    let mut attempted = Result<
+      List<Item>,
+      Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+    >.Success {
+      value: List<Item>.make()
+    }
     if start > usize.ZERO && text[start - usize.ONE] == '.' {
-      attempted = run Effect.result(Completions.members(&mut package.store, &module, text, start - usize.ONE, prefix))
+      attempted = run Effect.result(
+        Completions.members(&mut package.store, &module, text, start - usize.ONE, prefix),
+      )
     } else {
       attempted = run Effect.result(Completions.scope(&mut package.store, &module, start, prefix))
     }
     return match move attempted {
-      Result<List<Item>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success { value } => move value
-      Result<List<Item>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure { error } => match move error {
+      Result<List<Item>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {
+        value
+      } => move value
+      Result<List<Item>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {
+        error
+      } => match move error {
         OutOfMemoryError exhausted => {
           fail move exhausted
         }
@@ -773,7 +1018,12 @@ impl Workspace {
   /// The imports that would bring the name at `position` of the open document at `uri` into
   /// scope, when its module's check found nothing of that name: one fix for each module the
   /// document's imports can name that declares it public.
-  pub effect fn importFixes(self: &mut Self, uri: &[u8], position: Position, encoding: PositionEncoding) -> List<Fix>
+  pub effect fn importFixes(
+    self: &mut Self,
+    uri: &[u8],
+    position: Position,
+    encoding: PositionEncoding,
+  ) -> List<Fix>
     ! OutOfMemoryError
     ? &mut FileSystem | &mut Allocator {
     let mut fixes = List<Fix>.make()
@@ -807,12 +1057,23 @@ impl Workspace {
     while other < documents.length {
       if documents[other].package == document.package {
         if let Option<ModuleId>.Some { value: opened } = &documents[other].module {
-          run List<OpenText>.append(&mut open, OpenText { module: ModuleId.copy(&opened), text: run Bytes.copy(Bytes.asSlice(&documents[other].text)) })
+          run List<OpenText>.append(
+            &mut open,
+            OpenText {
+              module: ModuleId.copy(&opened),
+              text: run Bytes.copy(Bytes.asSlice(&documents[other].text)),
+            },
+          )
         }
       }
       other = other + usize.ONE
     }
-    let offers = run package.exports.offers(&package.sources, &module, name, List<OpenText>.asSlice(&open))
+    let offers = run package.exports.offers(
+      &package.sources,
+      &module,
+      name,
+      List<OpenText>.asSlice(&open),
+    )
     let listed = List<Offer>.asSlice(&offers)
     if listed.length == usize.ZERO {
       return move fixes
@@ -822,7 +1083,11 @@ impl Workspace {
     let mut index = usize.ZERO
     while index < listed.length {
       let path = Bytes.asSlice(&listed[index].path)
-      if let Option<Insertion>.Some { value: insertion } = move run AutoImports.insertion(&unit, path, name) {
+      if let Option<Insertion>.Some { value: insertion } = move run AutoImports.insertion(
+        &unit,
+        path,
+        name,
+      ) {
         let mut title = run Bytes.copy(b"Import `")
         run Bytes.append(&mut title, name)
         run Bytes.append(&mut title, b"` from `")
@@ -830,8 +1095,17 @@ impl Workspace {
         run Bytes.append(&mut title, b"`")
         let place = lines.position(text, insertion.offset, encoding)
         let mut edits = List<Edit>.make()
-        run List<Edit>.append(&mut edits, Edit { start: place, end: place, text: move insertion.text })
-        run List<Fix>.append(&mut fixes, Fix { title: move title, change: Changed { uri: run Bytes.copy(uri), edits: move edits } })
+        run List<Edit>.append(
+          &mut edits,
+          Edit { start: place, end: place, text: move insertion.text },
+        )
+        run List<Fix>.append(
+          &mut fixes,
+          Fix {
+            title: move title,
+            change: Changed { uri: run Bytes.copy(uri), edits: move edits },
+          },
+        )
       }
       index = index + usize.ONE
     }
@@ -840,7 +1114,13 @@ impl Workspace {
 
   /// Every place the package of the open document at `uri` names what the name at `position`
   /// refers to, its declaration too when `declaration` is set; empty when it names nothing.
-  pub effect fn references(self: &mut Self, uri: &[u8], position: Position, encoding: PositionEncoding, declaration: bool) -> List<Location>
+  pub effect fn references(
+    self: &mut Self,
+    uri: &[u8],
+    position: Position,
+    encoding: PositionEncoding,
+    declaration: bool,
+  ) -> List<Location>
     ! OutOfMemoryError
     ? &mut FileSystem | &mut Allocator | &mut Types {
     let mut locations = List<Location>.make()
@@ -852,21 +1132,33 @@ impl Workspace {
     let module = moduleOf(document)
     let offset = offsetOf(Bytes.asSlice(&document.text), position, encoding)
     let package = &mut List<Package>.asMutSlice(&mut self.packages)[document.package]
-    if let Option<Searched>.Some { value: searched } = move run search(&mut package.*, &module, offset, declaration, true) {
+    if let Option<Searched>.Some { value: searched } = move run search(
+      &mut package.*,
+      &module,
+      offset,
+      declaration,
+      true,
+    ) {
       let found = List<Found>.asSlice(&searched.found)
       let mut index = usize.ZERO
       while index < found.length {
-        if let Option<Bytes>.Some { value: located } = move run uriOf(&package.sources, &found[index].module) {
+        if let Option<Bytes>.Some { value: located } = move run uriOf(
+          &package.sources,
+          &found[index].module,
+        ) {
           let text = Bytes.asSlice(&found[index].text)
           let lines = run Lines.make(text)
           let spans = List<Span>.asSlice(&found[index].spans)
           let mut place = usize.ZERO
           while place < spans.length {
-            run List<Location>.append(&mut locations, Location {
-              uri: run Bytes.copy(Bytes.asSlice(&located)),
-              start: lines.position(text, spans[place].start, encoding),
-              end: lines.position(text, spans[place].end, encoding),
-            })
+            run List<Location>.append(
+              &mut locations,
+              Location {
+                uri: run Bytes.copy(Bytes.asSlice(&located)),
+                start: lines.position(text, spans[place].start, encoding),
+                end: lines.position(text, spans[place].end, encoding),
+              },
+            )
             place = place + usize.ONE
           }
         }
@@ -879,7 +1171,13 @@ impl Workspace {
   /// The edits that rename what the name at `position` of the open document at `uri` refers to
   /// as `name`, in every module of its package; absent when `name` is not an identifier, the name
   /// names nothing, or what it names is declared outside the package.
-  pub effect fn rename(self: &mut Self, uri: &[u8], position: Position, encoding: PositionEncoding, name: &[u8]) -> Option<List<Changed>>
+  pub effect fn rename(
+    self: &mut Self,
+    uri: &[u8],
+    position: Position,
+    encoding: PositionEncoding,
+    name: &[u8],
+  ) -> Option<List<Changed>>
     ! OutOfMemoryError
     ? &mut FileSystem | &mut Allocator | &mut Types {
     if !run identifier(name) {
@@ -904,6 +1202,7 @@ impl Workspace {
         return Option<List<Changed>>.none()
       }
     }
+
     // Struct literal keys and pattern fields don't resolve to their field yet, so a field rename
     // would miss them.
     if let Sought.Field { .. } = &searched.target.sought {
@@ -929,15 +1228,20 @@ impl Workspace {
         // A field shorthand `{x}` keeps naming field `x`: it becomes `{x: renamed}`.
         let mut written = run Bytes.copy(name)
         if spanAmong(shorthands, spans[place]) {
-          written = run Bytes.copy(Slice.view<u8>(text, spans[place].start, spans[place].end - spans[place].start))
+          written = run Bytes.copy(
+            Slice.view<u8>(text, spans[place].start, spans[place].end - spans[place].start),
+          )
           run Bytes.append(&mut written, b": ")
           run Bytes.append(&mut written, name)
         }
-        run List<Edit>.append(&mut edits, Edit {
-          start: lines.position(text, spans[place].start, encoding),
-          end: lines.position(text, spans[place].end, encoding),
-          text: move written,
-        })
+        run List<Edit>.append(
+          &mut edits,
+          Edit {
+            start: lines.position(text, spans[place].start, encoding),
+            end: lines.position(text, spans[place].end, encoding),
+            text: move written,
+          },
+        )
         place = place + usize.ONE
       }
       run List<Changed>.append(&mut changes, Changed { uri: move located, edits: move edits })
@@ -948,7 +1252,12 @@ impl Workspace {
 
   /// The declarations of every open package's own modules whose names hold `query`, ignoring
   /// ASCII case; at most `limit` of them.
-  pub effect fn symbols(self: &mut Self, query: &[u8], encoding: PositionEncoding, limit: usize) -> List<Placed>
+  pub effect fn symbols(
+    self: &mut Self,
+    query: &[u8],
+    encoding: PositionEncoding,
+    limit: usize,
+  ) -> List<Placed>
     ! OutOfMemoryError
     ? &mut FileSystem | &mut Allocator | &mut Types {
     run self.refresh()
@@ -961,10 +1270,22 @@ impl Workspace {
         let modules = List<ModuleId>.asSlice(&package.rootPackage)
         let mut at = usize.ZERO
         while at < modules.length && List<Placed>.length(&placed) < limit {
-          let attempted = run Effect.result(References.declarations(&mut package.store, &modules[at], query))
+          let attempted = run Effect.result(
+            References.declarations(&mut package.store, &modules[at], query),
+          )
           let listed = match move attempted {
-            Result<Option<Listed>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success { value } => move value
-            Result<Option<Listed>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure { error } => match move error {
+            Result<
+              Option<Listed>,
+              Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+            >.Success {
+              value
+            } => move value
+            Result<
+              Option<Listed>,
+              Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+            >.Failure {
+              error
+            } => match move error {
               OutOfMemoryError exhausted => {
                 fail move exhausted
               }
@@ -973,21 +1294,27 @@ impl Workspace {
           }
           if let Option<Listed>.Some { value } = move listed {
             if List<Declared>.length(&value.declared) > usize.ZERO {
-              if let Option<Bytes>.Some { value: located } = move run uriOf(&package.sources, &modules[at]) {
+              if let Option<Bytes>.Some { value: located } = move run uriOf(
+                &package.sources,
+                &modules[at],
+              ) {
                 let text = Bytes.asSlice(&value.text)
                 let lines = run Lines.make(text)
                 let declared = List<Declared>.asSlice(&value.declared)
                 let mut place = usize.ZERO
                 while place < declared.length && List<Placed>.length(&placed) < limit {
-                  run List<Placed>.append(&mut placed, Placed {
-                    name: run Bytes.copy(Bytes.asSlice(&declared[place].name)),
-                    kind: declared[place].kind,
-                    location: Location {
-                      uri: run Bytes.copy(Bytes.asSlice(&located)),
-                      start: lines.position(text, declared[place].span.start, encoding),
-                      end: lines.position(text, declared[place].span.end, encoding),
+                  run List<Placed>.append(
+                    &mut placed,
+                    Placed {
+                      name: run Bytes.copy(Bytes.asSlice(&declared[place].name)),
+                      kind: declared[place].kind,
+                      location: Location {
+                        uri: run Bytes.copy(Bytes.asSlice(&located)),
+                        start: lines.position(text, declared[place].span.start, encoding),
+                        end: lines.position(text, declared[place].span.end, encoding),
+                      },
                     },
-                  })
+                  )
                   place = place + usize.ONE
                 }
               }
@@ -1036,6 +1363,12 @@ pub struct Placed {
   pub location: Location,
 }
 
+/// A question to send: may the editor run the custom plans that `key` covers?
+pub struct Asked {
+  pub number: usize,
+  pub key: Bytes,
+}
+
 /// An inlay hint, located for the client.
 pub struct Hinted {
   pub position: Position,
@@ -1053,7 +1386,8 @@ effect fn subject(self: &mut Workspace, uri: &[u8]) -> usize
     return usize.MAX
   }
   let document = &List<Document>.asSlice(&self.documents)[at]
-  if document.package == usize.MAX || !List<Package>.asSlice(&self.packages)[document.package].semantic {
+  if document.package == usize.MAX
+    || !List<Package>.asSlice(&self.packages)[document.package].semantic {
     return usize.MAX
   }
   if let Option<ModuleId>.None = &document.module {
@@ -1068,13 +1402,38 @@ struct Searched {
   found: List<Found>,
 }
 
-effect fn search(package: &mut Package, module: &ModuleId, offset: usize, declaration: bool, linked: bool) -> Option<Searched>
+effect fn search(
+  package: &mut Package,
+  module: &ModuleId,
+  offset: usize,
+  declaration: bool,
+  linked: bool,
+) -> Option<Searched>
   ! OutOfMemoryError
   ? &mut Allocator | &mut Types {
-  let attempted = run Effect.result(searchStore(&mut package.store, List<ModuleId>.asSlice(&package.rootPackage), module, offset, declaration, linked))
+  let attempted = run Effect.result(
+    searchStore(
+      &mut package.store,
+      List<ModuleId>.asSlice(&package.rootPackage),
+      module,
+      offset,
+      declaration,
+      linked,
+    ),
+  )
   return match move attempted {
-    Result<Option<Searched>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success { value } => move value
-    Result<Option<Searched>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure { error } => match move error {
+    Result<
+      Option<Searched>,
+      Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+    >.Success {
+      value
+    } => move value
+    Result<
+      Option<Searched>,
+      Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+    >.Failure {
+      error
+    } => match move error {
       OutOfMemoryError exhausted => {
         fail move exhausted
       }
@@ -1083,7 +1442,14 @@ effect fn search(package: &mut Package, module: &ModuleId, offset: usize, declar
   }
 }
 
-effect fn searchStore(store: &mut Semantic, modules: &[ModuleId], module: &ModuleId, offset: usize, declaration: bool, linked: bool) -> Option<Searched>
+effect fn searchStore(
+  store: &mut Semantic,
+  modules: &[ModuleId],
+  module: &ModuleId,
+  offset: usize,
+  declaration: bool,
+  linked: bool,
+) -> Option<Searched>
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
   ? &mut Allocator | &mut Types {
   let target = match move run References.target(&mut store.*, module, offset) {
@@ -1122,7 +1488,8 @@ fn spanAmong(spans: &[Span], span: Span) -> bool {
 effect fn identifier(name: &[u8]) -> bool {
   let mut lexer = Lexer.make(name)
   return match move run Stream.take(&mut lexer) {
-    Option<Token>.Some { value } => Tokens.kind(value) == TokenKind.Identifier && Tokens.span(value).start == usize.ZERO
+    Option<Token>.Some { value } => Tokens.kind(value) == TokenKind.Identifier
+      && Tokens.span(value).start == usize.ZERO
       && Tokens.span(value).end == name.length
     Option<Token>.None => false
   }
@@ -1176,8 +1543,10 @@ pub fn offsetOf(text: &[u8], position: Position, encoding: PositionEncoding) -> 
       units = units + usize.ONE
     }
     at = at + usize.ONE
+
     // A character's continuation bytes belong to it.
-    while encoding == PositionEncoding.Utf16 && at < text.length && text[at] >= 128 && text[at] < 192 {
+    while encoding == PositionEncoding.Utf16 && at < text.length && text[at] >= 128
+      && text[at] < 192 {
       at = at + usize.ONE
     }
   }
@@ -1198,7 +1567,9 @@ fn documentAt(self: &Workspace, uri: &[u8]) -> usize {
 
 // The diagnostics owed for the open document at `at`, unless they wait for its module's check:
 // its syntax errors, or else the checked rejections located in its module.
-effect fn documentDiagnostics(self: &Workspace, at: usize, encoding: PositionEncoding) -> Option<Published>
+effect fn documentDiagnostics(self: &Workspace, at: usize, encoding: PositionEncoding) -> Option<
+  Published
+>
   ! OutOfMemoryError
   ? &mut Allocator {
   let document = &List<Document>.asSlice(&self.documents)[at]
@@ -1209,15 +1580,20 @@ effect fn documentDiagnostics(self: &Workspace, at: usize, encoding: PositionEnc
   if document.manifest {
     let text = Bytes.asSlice(&document.text)
     let mut diagnostics = run ManifestSchemas.diagnose(text)
-    while let Option<ManifestDiagnostic>.Some { value: diagnostic } = move List<ManifestDiagnostic>.pop(&mut diagnostics) {
-      run List<Problem>.append(&mut problems, Problem {
-        start: locate(text, diagnostic.span.start, encoding),
-        end: locate(text, diagnostic.span.end, encoding),
-        code: move diagnostic.code,
-        message: move diagnostic.message,
-        warning: false,
-        unnecessary: false,
-      })
+    while let Option<ManifestDiagnostic>.Some { value: diagnostic } = move List<
+      ManifestDiagnostic
+    >.pop(&mut diagnostics) {
+      run List<Problem>.append(
+        &mut problems,
+        Problem {
+          start: locate(text, diagnostic.span.start, encoding),
+          end: locate(text, diagnostic.span.end, encoding),
+          code: move diagnostic.code,
+          message: move diagnostic.message,
+          warning: false,
+          unnecessary: false,
+        },
+      )
     }
   }
   if let Option<SourceUnit>.Some { value: unit } = &document.unit {
@@ -1225,9 +1601,17 @@ effect fn documentDiagnostics(self: &Workspace, at: usize, encoding: PositionEnc
     if let Option<Bytes>.Some { value: refusal } = &document.refusal {
       if List<Problem>.length(&problems) == usize.ZERO {
         let first = Position { line: usize.ZERO, character: usize.ZERO }
-        run List<Problem>.append(&mut problems,
-          Problem { start: first, end: first, code: Bytes.make(), message: run Bytes.copy(Bytes.asSlice(&refusal)), warning: false,
-            unnecessary: false })
+        run List<Problem>.append(
+          &mut problems,
+          Problem {
+            start: first,
+            end: first,
+            code: Bytes.make(),
+            message: run Bytes.copy(Bytes.asSlice(&refusal)),
+            warning: false,
+            unnecessary: false,
+          },
+        )
       }
     }
     let mut located = List<Shared<Rejection>>.make()
@@ -1235,9 +1619,14 @@ effect fn documentDiagnostics(self: &Workspace, at: usize, encoding: PositionEnc
       if let Option<ModuleId>.Some { value: module } = &document.module {
         let packages = List<Package>.asSlice(&self.packages)
         located = run locatedIn(&packages[document.package], &module)
-        problems = run problemsOf(List<Shared<Rejection>>.asSlice(&located), SourceUnit.bytes(&unit), encoding)
+        problems = run problemsOf(
+          List<Shared<Rejection>>.asSlice(&located),
+          SourceUnit.bytes(&unit),
+          encoding,
+        )
       }
     }
+
     // Unused bindings come from the document's own text, so they follow each edit before a check.
     // One inside an error's span, such as an import of a missing member, reports only the error.
     if SourceUnit.diagnosticCount(&unit) == usize.ZERO {
@@ -1251,7 +1640,11 @@ effect fn documentDiagnostics(self: &Workspace, at: usize, encoding: PositionEnc
           run List<Shared<Rejection>>.append(&mut warnings, move warning)
         }
       }
-      let mut unused = run problemsOf(List<Shared<Rejection>>.asSlice(&warnings), SourceUnit.bytes(&unit), encoding)
+      let mut unused = run problemsOf(
+        List<Shared<Rejection>>.asSlice(&warnings),
+        SourceUnit.bytes(&unit),
+        encoding,
+      )
       while List<Problem>.length(&unused) > usize.ZERO {
         run List<Problem>.append(&mut problems, List<Problem>.remove(&mut unused, usize.ZERO))
       }
@@ -1262,7 +1655,7 @@ effect fn documentDiagnostics(self: &Workspace, at: usize, encoding: PositionEnc
       uri: run Bytes.copy(Bytes.asSlice(&document.uri)),
       version: Option<usize>.some(document.version),
       problems: move problems,
-    }
+    },
   )
 }
 
@@ -1347,10 +1740,15 @@ effect fn refreshPackage(self: &mut Workspace, package: usize) -> ()
         revision = run Revision.publish(&revision, &module, &content)
         run enqueue(&mut queue, &module)
       }
-    } else if let Option<Bytes>.Some { value: path } = move run filePath(Bytes.asSlice(&documents[at].uri)) {
+    } else if let Option<Bytes>.Some { value: path } = move run filePath(
+      Bytes.asSlice(&documents[at].uri),
+    ) {
       // An open document of a package this one depends on is read as its buffer, as its own
       // package reads it.
-      if let Option<ModuleId>.Some { value: module } = move run Sources.dependencyModule(&target.sources, Bytes.asSlice(&path)) {
+      if let Option<ModuleId>.Some { value: module } = move run Sources.dependencyModule(
+        &target.sources,
+        Bytes.asSlice(&path),
+      ) {
         let content = Option<Bytes>.some(run Bytes.copy(Bytes.asSlice(&documents[at].text)))
         revision = run Revision.publish(&revision, &module, &content)
       }
@@ -1382,7 +1780,9 @@ effect fn refreshPackage(self: &mut Workspace, package: usize) -> ()
 
 // The module of `package` that the file at `path` holds: one of its own, of its standard library,
 // or of a package it depends on.
-effect fn readerModule(package: &Package, path: &[u8]) -> Option<ModuleId> ! OutOfMemoryError ? &mut Allocator {
+effect fn readerModule(package: &Package, path: &[u8]) -> Option<ModuleId>
+  ! OutOfMemoryError
+  ? &mut Allocator {
   if let Option<ModuleId>.Some { value } = move run moduleIn(&package.sources, path) {
     return Option<ModuleId>.some(move value)
   }
@@ -1391,7 +1791,9 @@ effect fn readerModule(package: &Package, path: &[u8]) -> Option<ModuleId> ! Out
 
 // Marks stale every package that reads the file of the document at `uri`, so its next refresh
 // sees the document's current text or, once it closes, its file.
-effect fn markReaders(self: &mut Workspace, uri: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn markReaders(self: &mut Workspace, uri: &[u8]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
   let path = match move run filePath(uri) {
     Option<Bytes>.Some { value } => move value
     Option<Bytes>.None => {
@@ -1401,7 +1803,10 @@ effect fn markReaders(self: &mut Workspace, uri: &[u8]) -> () ! OutOfMemoryError
   let packages = List<Package>.asMutSlice(&mut self.packages)
   let mut at = usize.ZERO
   while at < packages.length {
-    if let Option<ModuleId>.Some { .. } = move run readerModule(&packages[at], Bytes.asSlice(&path)) {
+    if let Option<ModuleId>.Some { .. } = move run readerModule(
+      &packages[at],
+      Bytes.asSlice(&path),
+    ) {
       packages[at].stale = true
     }
     at = at + usize.ONE
@@ -1417,7 +1822,9 @@ effect fn preloadImports(sources: &mut ModuleSources, module: &ModuleId, text: &
   let loaded = run Effect.result(Sources.preloadImports(&mut sources.*, module, text))
   return match move loaded {
     Result<(), FileError | InvalidModulePath | OutOfMemoryError>.Success { .. } => ()
-    Result<(), FileError | InvalidModulePath | OutOfMemoryError>.Failure { error } => match move error {
+    Result<(), FileError | InvalidModulePath | OutOfMemoryError>.Failure {
+      error
+    } => match move error {
       OutOfMemoryError exhausted => {
         fail move exhausted
       }
@@ -1426,7 +1833,9 @@ effect fn preloadImports(sources: &mut ModuleSources, module: &ModuleId, text: &
   }
 }
 
-effect fn enqueue(queue: &mut List<ModuleId>, module: &ModuleId) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn enqueue(queue: &mut List<ModuleId>, module: &ModuleId) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
   if !listed(List<ModuleId>.asSlice(&queue.*), module) {
     run List<ModuleId>.append(&mut queue.*, ModuleId.copy(module))
   }
@@ -1454,12 +1863,14 @@ effect fn step(package: &mut Package) -> ()
   if preparingOne(&package.*) {
     if List<DeclarationId>.length(&package.unprepared) > usize.ZERO {
       let declaration = List<DeclarationId>.remove(&mut package.unprepared, usize.ZERO)
-      let prepared = run Effect.result(Semantic.prepareDeclaration(&mut package.store, &mut package.request, &declaration))
+      let prepared = run Effect.result(
+        Semantic.prepareDeclaration(&mut package.store, &mut package.request, &declaration),
+      )
       run tolerated(move prepared)
       return run release(&mut package.*)
     }
     let module = match Intrinsic.replace(package.preparing, Option<ModuleId>.none()) {
-      Option<ModuleId>.Some {value} => move value
+      Option<ModuleId>.Some { value } => move value
       Option<ModuleId>.None => CompilerBug.panic(b"a prepared module is named")
     }
     run checkModule(&mut package.*, move module)
@@ -1469,10 +1880,14 @@ effect fn step(package: &mut Package) -> ()
   let current = run Effect.result(Semantic.moduleSweepCurrent(&mut package.store, &module))
   let mut kept = false
   match move current {
-    Result<bool, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} => {
+    Result<bool, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {
+      value
+    } => {
       kept = value
     }
-    Result<bool, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} => match move error {
+    Result<bool, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {
+      error
+    } => match move error {
       OutOfMemoryError exhausted => {
         fail move exhausted
       }
@@ -1485,10 +1900,20 @@ effect fn step(package: &mut Package) -> ()
   }
   let listed = run Effect.result(Semantic.moduleDeclarations(&mut package.store, &module))
   match move listed {
-    Result<List<DeclarationId>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} => {
+    Result<
+      List<DeclarationId>,
+      Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+    >.Success {
+      value
+    } => {
       package.unprepared = move value
     }
-    Result<List<DeclarationId>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} => match move error {
+    Result<
+      List<DeclarationId>,
+      Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+    >.Failure {
+      error
+    } => match move error {
       OutOfMemoryError exhausted => {
         fail move exhausted
       }
@@ -1503,9 +1928,13 @@ effect fn step(package: &mut Package) -> ()
 
 // Writes the package's semantic cache when the store ran a module check since it was last written.
 // A store that fails to give its image keeps the file as it was.
-effect fn persist(package: &mut Package) -> () ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+effect fn persist(package: &mut Package) -> ()
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
   let ran = Semantic.moduleCheckRuns(&package.store)
-  if ran == package.saved { return () }
+  if ran == package.saved {
+    return ()
+  }
   package.saved = ran
   if let Option<CacheFile>.Some { value: file } = &package.cache {
     let attempted = run Effect.result(SemanticCache.save(&mut package.store, &file))
@@ -1530,11 +1959,15 @@ fn preparingOne(package: &Package) -> bool {
 }
 
 // Passes on only running out of memory; the module's check reports any other failure.
-effect fn tolerated(attempted: Result<(), Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>) -> ()
+effect fn tolerated(
+  attempted: Result<(), Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>,
+) -> ()
   ! OutOfMemoryError {
   return match move attempted {
     Result<(), Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success { .. } => ()
-    Result<(), Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} => match move error {
+    Result<(), Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {
+      error
+    } => match move error {
       OutOfMemoryError exhausted => {
         fail move exhausted
       }
@@ -1545,7 +1978,9 @@ effect fn tolerated(attempted: Result<(), Cycle | InvalidModulePath | RevisionMi
 
 // Drops what the package's store no longer needs once a step is done: the roots its request
 // demanded and the lowered MIR that reruns replaced, so a long session does not grow.
-effect fn release(package: &mut Package) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn release(package: &mut Package) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
   SemanticRequest.forgetRoots(&mut package.request)
   drop run Semantic.releaseStaleMir(&mut package.store, &package.request)
   return ()
@@ -1560,10 +1995,18 @@ effect fn checkModule(package: &mut Package, module: ModuleId) -> ()
   let attempted = run Effect.result(moduleRejections(&mut package.*, &module))
   let mut rejections = List<Shared<Rejection>>.make()
   match move attempted {
-    Result<List<Shared<Rejection>>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success { value } => {
+    Result<
+      List<Shared<Rejection>>,
+      Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+    >.Success {
+      value
+    } => {
       rejections = move value
     }
-    Result<List<Shared<Rejection>>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {
+    Result<
+      List<Shared<Rejection>>,
+      Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+    >.Failure {
       error
     } => match move error {
       OutOfMemoryError exhausted => {
@@ -1592,7 +2035,7 @@ effect fn checkModule(package: &mut Package, module: ModuleId) -> ()
   run markLocations(&mut package.dirty, List<Shared<Rejection>>.asSlice(&rejections))
   return run List<Checked>.append(
     &mut package.checked,
-    Checked { module: move module, rejections: move rejections, current: true }
+    Checked { module: move module, rejections: move rejections, current: true },
   )
 }
 
@@ -1601,16 +2044,30 @@ effect fn checkModule(package: &mut Package, module: ModuleId) -> ()
 effect fn moduleRejections(package: &mut Package, module: &ModuleId) -> List<Shared<Rejection>>
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
   ? &mut Allocator | &mut Types {
-  let checked = run Semantic.checkModule(&mut package.store, &mut package.request, module, &package.runtime)
+  let checked = run Semantic.checkModule(
+    &mut package.store,
+    &mut package.request,
+    module,
+    &package.runtime,
+  )
   let mut rejections = move checked.rejections
-  let mut imported = run Semantic.moduleImportRejections(&mut package.store, &mut package.request, module)
+  let mut imported = run Semantic.moduleImportRejections(
+    &mut package.store,
+    &mut package.request,
+    module,
+  )
   while List<Shared<Rejection>>.length(&imported) > usize.ZERO {
-    run List<Shared<Rejection>>.append(&mut rejections, List<Shared<Rejection>>.remove(&mut imported, usize.ZERO))
+    run List<Shared<Rejection>>.append(
+      &mut rejections,
+      List<Shared<Rejection>>.remove(&mut imported, usize.ZERO),
+    )
   }
   return move rejections
 }
 
-effect fn markDirty(dirty: &mut List<ModuleId>, module: &ModuleId) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn markDirty(dirty: &mut List<ModuleId>, module: &ModuleId) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
   return run enqueue(&mut dirty.*, module)
 }
 
@@ -1619,9 +2076,12 @@ effect fn markLocations(dirty: &mut List<ModuleId>, rejections: &[Shared<Rejecti
   ? &mut Allocator {
   let mut at = usize.ZERO
   while at < rejections.length {
-    let module = Shared<Rejection>.with<ModuleId>(&rejections[at], |held: &Rejection| -> ModuleId {
-      return ModuleId.copy(&held.module)
-    })
+    let module = Shared<Rejection>.with<ModuleId>(
+      &rejections[at],
+      |held: &Rejection| -> ModuleId {
+        return ModuleId.copy(&held.module)
+      },
+    )
     run markDirty(&mut dirty.*, &module)
     at = at + usize.ONE
   }
@@ -1638,8 +2098,10 @@ effect fn unresolved(package: &Package, module: &ModuleId, name: Span) -> bool
   let mut at = usize.ZERO
   while at < listed.length {
     let site = siteOf(&listed[at])
-    let unknown = site.code == RejectionCode.UnknownName || site.code == RejectionCode.UnknownFunction
-      || site.code == RejectionCode.UnknownType || site.code == RejectionCode.UnknownActor
+    let unknown = site.code == RejectionCode.UnknownName
+      || site.code == RejectionCode.UnknownFunction
+      || site.code == RejectionCode.UnknownType
+      || site.code == RejectionCode.UnknownActor
     if unknown && site.span.start <= name.start && name.end <= site.span.end {
       return true
     }
@@ -1661,8 +2123,12 @@ effect fn locatedIn(package: &Package, module: &ModuleId) -> List<Shared<Rejecti
       let mut rejectionAt = usize.ZERO
       while rejectionAt < rejections.length {
         let site = siteOf(&rejections[rejectionAt])
-        if ModuleId.equals(&site.module, module) && !repeated(List<Shared<Rejection>>.asSlice(&located), &site) {
-          run List<Shared<Rejection>>.append(&mut located, Shared<Rejection>.clone(&rejections[rejectionAt]))
+        if ModuleId.equals(&site.module, module)
+          && !repeated(List<Shared<Rejection>>.asSlice(&located), &site) {
+          run List<Shared<Rejection>>.append(
+            &mut located,
+            Shared<Rejection>.clone(&rejections[rejectionAt]),
+          )
         }
         rejectionAt = rejectionAt + usize.ONE
       }
@@ -1682,7 +2148,8 @@ fn sameSites(left: &[Shared<Rejection>], right: &[Shared<Rejection>]) -> bool {
     let one = siteOf(&left[at])
     let other = siteOf(&right[at])
     if !ModuleId.equals(&one.module, &other.module) || one.code != other.code
-      || one.span.start != other.span.start || one.span.end != other.span.end {
+      || one.span.start != other.span.start
+      || one.span.end != other.span.end {
       return false
     }
     at = at + usize.ONE
@@ -1697,9 +2164,12 @@ struct Site {
 }
 
 fn siteOf(rejection: &Shared<Rejection>) -> Site {
-  return Shared<Rejection>.with<Site>(rejection, |held: &Rejection| -> Site {
-    return Site { module: ModuleId.copy(&held.module), code: held.code, span: held.span }
-  })
+  return Shared<Rejection>.with<Site>(
+    rejection,
+    |held: &Rejection| -> Site {
+      return Site { module: ModuleId.copy(&held.module), code: held.code, span: held.span }
+    },
+  )
 }
 
 // Whether a rejection in `listed` has the code and span of `site`, so the client sees it once.
@@ -1707,7 +2177,8 @@ fn repeated(listed: &[Shared<Rejection>], site: &Site) -> bool {
   let mut at = usize.ZERO
   while at < listed.length {
     let known = siteOf(&listed[at])
-    if known.code == site.code && known.span.start == site.span.start && known.span.end == site.span.end {
+    if known.code == site.code && known.span.start == site.span.start
+      && known.span.end == site.span.end {
       return true
     }
     at = at + usize.ONE
@@ -1717,18 +2188,27 @@ fn repeated(listed: &[Shared<Rejection>], site: &Site) -> bool {
 
 // Publishes the checked diagnostics of a module no document has open, read from its file on
 // disk; an empty list only when the client was last shown some.
-effect fn publishClosed(package: &mut Package, module: &ModuleId, encoding: PositionEncoding, published: &mut List<Published>) -> ()
+effect fn publishClosed(
+  package: &mut Package,
+  module: &ModuleId,
+  encoding: PositionEncoding,
+  published: &mut List<Published>,
+) -> ()
   ! OutOfMemoryError
   ? &mut FileSystem | &mut Allocator {
   let location = run Effect.result(Sources.sourceLocation(&package.sources, module))
   let path = match move location {
-    Result<Sources.SourceLocation, FileError | OutOfMemoryError>.Success { value } => match move value.path {
+    Result<Sources.SourceLocation, FileError | OutOfMemoryError>.Success {
+      value
+    } => match move value.path {
       Option<Path>.Some { value: found } => move found
       Option<Path>.None => {
         return ()
       }
     }
-    Result<Sources.SourceLocation, FileError | OutOfMemoryError>.Failure { error } => match move error {
+    Result<Sources.SourceLocation, FileError | OutOfMemoryError>.Failure {
+      error
+    } => match move error {
       OutOfMemoryError exhausted => {
         fail move exhausted
       }
@@ -1752,16 +2232,26 @@ effect fn publishClosed(package: &mut Package, module: &ModuleId, encoding: Posi
       _ => Bytes.make()
     }
   }
-  let problems = run problemsOf(List<Shared<Rejection>>.asSlice(&located), Bytes.asSlice(&text), encoding)
+  let problems = run problemsOf(
+    List<Shared<Rejection>>.asSlice(&located),
+    Bytes.asSlice(&text),
+    encoding,
+  )
   let shown = List<Problem>.length(&problems) > usize.ZERO
   run setShown(&mut package.shown, module, shown)
   return run List<Published>.append(
     &mut published.*,
-    Published { uri: run fileUri(Path.rawBytes(&path)), version: Option<usize>.none(), problems: move problems }
+    Published {
+      uri: run fileUri(Path.rawBytes(&path)),
+      version: Option<usize>.none(),
+      problems: move problems,
+    },
   )
 }
 
-effect fn setShown(shown: &mut List<ModuleId>, module: &ModuleId, value: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn setShown(shown: &mut List<ModuleId>, module: &ModuleId, value: bool) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
   let mut at = usize.ZERO
   while at < List<ModuleId>.length(&shown.*) {
     if ModuleId.equals(&List<ModuleId>.asSlice(&shown.*)[at], module) {
@@ -1780,18 +2270,28 @@ effect fn setShown(shown: &mut List<ModuleId>, module: &ModuleId, value: bool) -
 
 /// The `file:` URI of an absolute path, percent-encoding every byte outside the unreserved set
 /// and `/`.
-pub effect fn fileUri(path: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+pub effect fn fileUri(path: &[u8]) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
   let digits = b"0123456789ABCDEF"
   let mut uri = run Bytes.copy(b"file://")
   let mut at = usize.ZERO
   while at < path.length {
     let byte = path[at]
-    let plain = (byte >= 97 && byte <= 122) || (byte >= 65 && byte <= 90) || (byte >= 48 && byte <= 57)
-      || byte == 45 || byte == 46 || byte == 95 || byte == 126 || byte == 47
+    let plain = (byte >= 97 && byte <= 122) || (byte >= 65 && byte <= 90)
+      || (byte >= 48 && byte <= 57)
+      || byte == 45
+      || byte == 46
+      || byte == 95
+      || byte == 126
+      || byte == 47
     if plain {
       run Bytes.append(&mut uri, &[byte])
     } else {
-      run Bytes.append(&mut uri, &[37, digits[u8.toUsize(byte / 16)], digits[u8.toUsize(byte % 16)]])
+      run Bytes.append(
+        &mut uri,
+        &[37, digits[u8.toUsize(byte / 16)], digits[u8.toUsize(byte % 16)]],
+      )
     }
     at = at + usize.ONE
   }
@@ -1807,11 +2307,12 @@ effect fn packageFor(self: &mut Workspace, path: &[u8], refusal: &mut Option<Byt
   let packages = List<Package>.asSlice(&self.packages)
   let mut at = usize.ZERO
   while at < packages.length {
-    if within(Path.rawBytes(Sources.moduleRoot(&packages[at].sources)), path) {
+    if let Option<ModuleId>.Some { .. } = move run moduleIn(&packages[at].sources, path) {
       return at
     }
     at = at + usize.ONE
   }
+
   // A standard-library file belongs to the first package that reads it, as go to definition
   // reaches it from that package's documents.
   at = usize.ZERO
@@ -1821,7 +2322,17 @@ effect fn packageFor(self: &mut Workspace, path: &[u8], refusal: &mut Option<Byt
     }
     at = at + usize.ONE
   }
-  let found = run Effect.result(openPackage(path, &self.standardLibrary, &self.store, self.target))
+  let found = run Effect.result(
+    openPackage(
+      path,
+      &self.standardLibrary,
+      &self.store,
+      self.target,
+      &self.settings,
+      &mut self.host,
+      &mut self.planHint,
+    ),
+  )
   let opened = match move found {
     Result<
       Option<Package>,
@@ -1829,6 +2340,7 @@ effect fn packageFor(self: &mut Workspace, path: &[u8], refusal: &mut Option<Byt
         | PlanError
         | InvalidProjectCommand
         | InitialProfileProblem
+        | HostInputError
         | FileError
         | InvalidModulePath
         | InvalidSourceRoot
@@ -1852,6 +2364,7 @@ effect fn packageFor(self: &mut Workspace, path: &[u8], refusal: &mut Option<Byt
         | PlanError
         | InvalidProjectCommand
         | InitialProfileProblem
+        | HostInputError
         | FileError
         | InvalidModulePath
         | InvalidSourceRoot
@@ -1876,6 +2389,14 @@ effect fn packageFor(self: &mut Workspace, path: &[u8], refusal: &mut Option<Byt
         refusal.* = Option<Bytes>.some(move invalid.detail)
         Option<Package>.none()
       }
+      FileError _missing => {
+        refusal.* = Option<Bytes>.some(
+          run Bytes.copy(
+            b"Compilation inputs are unavailable; run `silk build` to produce generated files.",
+          ),
+        )
+        Option<Package>.none()
+      }
       _ => Option<Package>.none()
     }
   }
@@ -1891,11 +2412,20 @@ effect fn packageFor(self: &mut Workspace, path: &[u8], refusal: &mut Option<Byt
 // Opens the package of the nearest manifest above `path` as `silk check` does, for the first
 // target its manifest plans, on a revisable store; none when its profile names no artifact form.
 // A package whose profile is refused gets syntax diagnostics only.
-effect fn openPackage(path: &[u8], standardLibrary: &Option<Path>, checkouts: &Option<Path>, host: Target) -> Option<Package>
+effect fn openPackage(
+  path: &[u8],
+  standardLibrary: &Option<Path>,
+  checkouts: &Option<Path>,
+  host: Target,
+  settings: &CompilationSettings,
+  environment: &mut CompilationHost,
+  hint: &mut bool,
+) -> Option<Package>
   ! ProjectError
     | PlanError
     | InvalidProjectCommand
     | InitialProfileProblem
+    | HostInputError
     | FileError
     | InvalidModulePath
     | InvalidSourceRoot
@@ -1918,57 +2448,115 @@ effect fn openPackage(path: &[u8], standardLibrary: &Option<Path>, checkouts: &O
       return Option<Package>.none()
     }
   }
-  let manifest = run Projects.discover(&directory)
-  let project = run Projects.load(&manifest)
-  let defaults = run ProjectCommands.parseCheck(&[])
-  let mut plans = run ProjectPlans.make(&project, &defaults.options, Projects.targets(&project), host)
-  if List<ProjectPlan>.length(&plans) == usize.ZERO {
-    return Option<Package>.none()
+  let manifest = run Compilations.locate(&directory, &environment.*)
+  let found = run Compilations.open(&manifest, path, standardLibrary, settings, &mut environment.*)
+  let selected = move found.selection
+  hint.* = hint.* || selected.hint
+  let opened = if let Option<SavedRequest>.Some { value } = move selected.request {
+    let profile = run CompilationRequests.profile(&value)
+    let bindings = run CompilationRequests.bindings(&value)
+    run Analyses.openRequest(
+      &value,
+      &profile,
+      move bindings,
+      StoreMode.Revisable,
+      Option<ImportSummaries>.none(),
+      Option<SourceSnapshot>.none(),
+    )
+  } else {
+    let project = run Projects.load(&manifest)
+    let defaults = run ProjectCommands.parseCheck(&[])
+    let mut plans = run ProjectPlans.make(&defaults.options, host)
+    if List<ProjectPlan>.length(&plans) == usize.ZERO {
+      return Option<Package>.none()
+    }
+    let ProjectPlan {
+      input: planned,
+      bindings,
+      task: _,
+      maxMemory: unlimited,
+      stackSize: _,
+      entry: _,
+      unsandboxedTools: _
+    } = List<ProjectPlan>.remove(&mut plans, usize.ZERO)
+    drop unlimited
+    let mut input = move planned
+    if let Option<Bytes>.None = &input.artifact {
+      input.artifact = Option<Bytes>.some(
+        run Bytes.copy(Projects.profileArtifact(Projects.form(&project))),
+      )
+    }
+    if let Option<String>.Some { value } = &settings.target {
+      input.target = Option<Bytes>.some(run Bytes.copy(String.ownedUtf8Bytes(&value)))
+    }
+    if settings.mode.view() == "release" {
+      input.optimization = Option<Bytes>.some(run Bytes.copy(b"speed"))
+    }
+    if settings.mode.view() == "size" {
+      input.optimization = Option<Bytes>.some(run Bytes.copy(b"size"))
+    }
+    let profile = run InitialProfile.freeze(&input)
+    let mut library = Option<Path>.none()
+    if let Option<Path>.Some { value } = &standardLibrary.* {
+      library = Option<Path>.some(run Path.fromBytes(Path.rawBytes(&value)))
+    }
+    let mut process = OsChildProcess.make()
+    let mut hostInputs = EditorHost { directory: run Bytes.copy(Path.rawBytes(&directory)) }
+    run Analyses.open(
+      Projects.entry(&project),
+      Option<&Path>.some(Projects.manifest(&project)),
+      move library,
+      match &checkouts.* {
+        Option<Path>.Some { value } => Option<&Path>.some(&value)
+        Option<Path>.None => Option<&Path>.none()
+      },
+      &profile,
+      move bindings,
+      false,
+      StoreMode.Revisable,
+      Option<&[u8]>.none(),
+      Option<ImportSummaries>.none(),
+      Option<SourceSnapshot>.none(),
+      Option<&CompilationDefinition>.none(),
+      false,
+    )
+      |> Effect.provideMut<ChildProcess>(&mut process)
+      |> Effect.provideMut<HostInput>(&mut hostInputs)
   }
-  let ProjectPlan { input: planned, bindings, name: _, maxMemory: unlimited, stackSize: _, entry: _ } = List<ProjectPlan>.remove(&mut plans, usize.ZERO)
-  drop unlimited
-  let mut input = move planned
-  if let Option<Bytes>.None = &input.artifact {
-    input.artifact = Option<Bytes>.some(run Bytes.copy(Projects.profileArtifact(Projects.form(&project))))
-  }
-  let profile = run InitialProfile.freeze(&input)
-  let mut library = Option<Path>.none()
-  if let Option<Path>.Some { value } = &standardLibrary.* {
-    library = Option<Path>.some(run Path.fromBytes(Path.rawBytes(&value)))
-  }
-  // A build.silk tool step runs for the editor as it does for a build.
-  let mut process = OsChildProcess.make()
-  let opened = run Analyses.open(
-    Projects.entry(&project),
-    Option<&Path>.some(Projects.manifest(&project)),
-    move library,
-    match &checkouts.* {
-      Option<Path>.Some { value } => Option<&Path>.some(&value)
-      Option<Path>.None => Option<&Path>.none()
-    },
-    &profile,
-    move bindings,
-    false,
-    StoreMode.Revisable,
-    Option<&[u8]>.none(),
-    Option<ImportSummaries>.none(),
-    Option<SourceSnapshot>.none(),
-    Option<&[u8]>.none()
-  ) |> Effect.provideMut<ChildProcess>(&mut process)
   return match move opened {
     Opened.Ready { analysis } => {
-      let Analysis { sources, store, request, rootPackage, checked, identity, runtime } = move analysis
+      let Analysis {
+        sources,
+        store,
+        request,
+        rootPackage,
+        checked,
+        identity,
+        runtime
+      } = move analysis
       drop checked
       drop identity
+
       // Checked bodies keep the names they resolve, for hover and go to definition.
       let mut store = move store
       Semantic.selectEditorTables(&mut store, true)
+
       // The cache `silk check` keeps for this target and profile: module checks whose sources
       // still read the same start out current instead of waiting their turn in the queue.
       let mut cache = Option<CacheFile>.none()
       if let Option<Bytes>.Some { value: compiler } = move run CacheStamp.compiler() {
-        if let Option<Path>.Some { value: cacheDirectory } = move run SemanticCache.directory(Projects.outputDirectory(&project), Projects.name(&project)) {
-          cache = run SemanticCache.open(&mut store, &request, &cacheDirectory, Bytes.asSlice(&compiler), true, false)
+        if let Option<Path>.Some { value: cacheDirectory } = move run SemanticCache.directory(
+          &found.output,
+          found.name.asSlice(),
+        ) {
+          cache = run SemanticCache.open(
+            &mut store,
+            &request,
+            &cacheDirectory,
+            Bytes.asSlice(&compiler),
+            true,
+            false,
+          )
         }
       }
       return Option<Package>.some(
@@ -1989,7 +2577,7 @@ effect fn openPackage(path: &[u8], standardLibrary: &Option<Path>, checkouts: &O
           cache: move cache,
           saved: usize.ZERO,
           exports: AutoImports.make(),
-        }
+        },
       )
     }
     Opened.Refused { sources, store, refusal } => {
@@ -2013,7 +2601,7 @@ effect fn openPackage(path: &[u8], standardLibrary: &Option<Path>, checkouts: &O
           cache: Option<CacheFile>.none(),
           saved: usize.ZERO,
           exports: AutoImports.make(),
-        }
+        },
       )
     }
     Opened.InvalidProfile => Option<Package>.none()
@@ -2033,8 +2621,13 @@ fn libraryPath(sources: &ModuleSources, path: &[u8]) -> bool {
   if let Option<&Path>.Some { value: library } = Sources.standardLibrary(sources) {
     let root = Path.rawBytes(library)
     if within(root, path) {
-      let logical = Slice.view<u8>(path, root.length + usize.ONE, path.length - root.length - usize.ONE)
-      return logical.length > b"silk/".length && same(Slice.view<u8>(logical, usize.ZERO, b"silk/".length), b"silk/")
+      let logical = Slice.view<u8>(
+        path,
+        root.length + usize.ONE,
+        path.length - root.length - usize.ONE,
+      )
+      return logical.length > b"silk/".length
+        && same(Slice.view<u8>(logical, usize.ZERO, b"silk/".length), b"silk/")
     }
   }
   return false
@@ -2109,7 +2702,9 @@ pub effect fn filePath(uri: &[u8]) -> Option<Bytes>
   return Option<Bytes>.some(move path)
 }
 
-effect fn appendDecimal(output: &mut Bytes, value: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn appendDecimal(output: &mut Bytes, value: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
   if value >= 10 {
     run appendDecimal(&mut output.*, value / 10)
   }
@@ -2140,7 +2735,7 @@ effect fn parse(document: &Document) -> Option<SourceUnit>
   let module = match &document.module {
     Option<ModuleId>.Some { value } => ModuleId.copy(&value)
     Option<ModuleId>.None => match move run Effect.result(
-      ModuleId.make(b"file", b"document", b"document.silk")
+      ModuleId.make(b"file", b"document", b"document.silk"),
     ) {
       Result<ModuleId, InvalidModulePath | OutOfMemoryError>.Success { value } => move value
       Result<ModuleId, InvalidModulePath | OutOfMemoryError>.Failure { error } => match move error {
@@ -2156,11 +2751,10 @@ effect fn parse(document: &Document) -> Option<SourceUnit>
   let unit = run SourceUnit.parse(
     &module,
     usize.ZERO,
-    run Bytes.copy(Bytes.asSlice(&document.text))
+    run Bytes.copy(Bytes.asSlice(&document.text)),
   )
   return Option<SourceUnit>.some(move unit)
 }
-
 
 // Whether `warning` lies inside the span of one of `errors`.
 fn insideError(warning: &Shared<Rejection>, errors: &[Shared<Rejection>]) -> bool {
@@ -2168,7 +2762,9 @@ fn insideError(warning: &Shared<Rejection>, errors: &[Shared<Rejection>]) -> boo
   let mut at = usize.ZERO
   while at < errors.length {
     let known = siteOf(&errors[at])
-    if known.span.start <= site.span.start && site.span.end <= known.span.end { return true }
+    if known.span.start <= site.span.start && site.span.end <= known.span.end {
+      return true
+    }
     at = at + usize.ONE
   }
   return false
@@ -2188,16 +2784,24 @@ effect fn syntaxProblems(unit: &SourceUnit, encoding: PositionEncoding) -> List<
       diagnostic.code,
       diagnostic.span,
       diagnostic.detail,
-      List<Bytes>.asSlice(&holes)
+      List<Bytes>.asSlice(&holes),
     )
     run List<Shared<Rejection>>.append(&mut rejections, move rejection)
     at = at + usize.ONE
   }
-  return run problemsOf(List<Shared<Rejection>>.asSlice(&rejections), SourceUnit.bytes(unit), encoding)
+  return run problemsOf(
+    List<Shared<Rejection>>.asSlice(&rejections),
+    SourceUnit.bytes(unit),
+    encoding,
+  )
 }
 
 // Locates each of `rejections` in `text`, the text of the module they are located in.
-effect fn problemsOf(rejections: &[Shared<Rejection>], text: &[u8], encoding: PositionEncoding) -> List<Problem>
+effect fn problemsOf(
+  rejections: &[Shared<Rejection>],
+  text: &[u8],
+  encoding: PositionEncoding,
+) -> List<Problem>
   ! OutOfMemoryError
   ? &mut Allocator {
   let mut problems = List<Problem>.make()
@@ -2206,13 +2810,18 @@ effect fn problemsOf(rejections: &[Shared<Rejection>], text: &[u8], encoding: Po
     if let Option<RenderedDiagnostic>.Some { value: rendered } = move run Reports.fields(
       &rejections[at],
       text,
-      b""
+      b"",
     ) {
       let mut message = run Bytes.copy(Bytes.asSlice(&rendered.code))
       if let Option<Bytes>.Some { value: filled } = &rendered.message {
         message = run Bytes.copy(Bytes.asSlice(&filled))
       }
-      let code = Shared<Rejection>.with<RejectionCode>(&rejections[at], |value: &Rejection| -> RejectionCode { return value.code })
+      let code = Shared<Rejection>.with<RejectionCode>(
+        &rejections[at],
+        |value: &Rejection| -> RejectionCode {
+          return value.code
+        },
+      )
       run List<Problem>.append(
         &mut problems,
         Problem {
@@ -2222,7 +2831,7 @@ effect fn problemsOf(rejections: &[Shared<Rejection>], text: &[u8], encoding: Po
           message: move message,
           warning: same(Bytes.asSlice(&rendered.severity), b"warning"),
           unnecessary: code == RejectionCode.UnusedImport || code == RejectionCode.UnusedLocal,
-        }
+        },
       )
     } else {
       // A compiler-internal state has no catalog entry, but `silk check` refuses the build over it,
@@ -2242,7 +2851,7 @@ effect fn problemsOf(rejections: &[Shared<Rejection>], text: &[u8], encoding: Po
             message: move message,
             warning: false,
             unnecessary: false,
-          }
+          },
         )
       }
     }
@@ -2304,4 +2913,43 @@ fn same(left: &[u8], right: &[u8]) -> bool {
     at = at + usize.ONE
   }
   return true
+}
+
+// Editor analysis reads cached pins; fetching belongs to an explicit build or sandboxed plan.
+struct EditorHost {
+  directory: Bytes
+}
+
+impl HostInput for EditorHost {
+  effect fn argumentCount(self: &mut Self) -> usize
+    ! HostInputError {
+    return 0
+  }
+
+  effect fn argument(self: &mut Self, index: usize) -> Option<Bytes>
+    ! HostInputError | OutOfMemoryError
+    ? &mut Allocator {
+    return Option<Bytes>.none()
+  }
+
+  effect fn variable(self: &mut Self, name: &[u8]) -> Option<Bytes>
+    ! HostInputError | OutOfMemoryError
+    ? &mut Allocator {
+    if same(name, b"SILK_OFFLINE") {
+      return Option<Bytes>.some(run Bytes.copy(b"1"))
+    }
+    return Option<Bytes>.none()
+  }
+
+  effect fn variableNames(self: &mut Self) -> List<Bytes>
+    ! HostInputError | OutOfMemoryError
+    ? &mut Allocator {
+    return List<Bytes>.make()
+  }
+
+  effect fn workingDirectory(self: &mut Self) -> Bytes
+    ! HostInputError | OutOfMemoryError
+    ? &mut Allocator {
+    return run Bytes.copy(self.directory.asSlice())
+  }
 }

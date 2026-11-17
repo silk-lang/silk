@@ -1,0 +1,395 @@
+//! The developer's permission for the editor to run a project's own `Plan` task.
+//!
+//! # When to use
+//! The language server calls [`custom`] before it refreshes a package's requests. A package whose
+//! tasks have no `Plan` variant uses the built-in plan, which the workspace trust setting alone
+//! covers. A custom `Plan` runs project code with the developer's own permissions, so the server
+//! asks once and records the answer with [`allow`]; [`allowed`] reads it back.
+//!
+//! # Details
+//! An authorization is a file under `$SILK_HOME/editor-plans` (`$HOME/.silk/editor-plans`, or
+//! `USERPROFILE` on Windows), never under the project's output directory, which `silk clean`
+//! removes. It is named by the SHA-256 of its [`key`] and holds the key's text, so a developer can
+//! see what each file allows and delete it to revoke it. The key of a package in a Git checkout is
+//! the repository's common Git directory, which every worktree of the repository shares. Outside
+//! Git it is the canonical path of the workspace root: the directory of the enclosing workspace
+//! manifest, or of the package's own manifest.
+//!
+//! # Gotchas
+//! [`custom`] reads `tasks.silk` without analyzing or running it, and answers `true` whenever it
+//! cannot tell: when the type `Task.main` runs is not a union declared in that file.
+
+import driver.Project as Projects { Project }
+import lexer.Lexer { Lexer }
+import lexer.Token as Tokens { Token, TokenKind }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.crypto.sha2 { Sha256 }
+import silk.git.local { LocalRefs }
+import silk.git.refs { GitRefError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.system.host_path as HostPath
+import silk.num.u8
+import silk.num.usize
+import Stream { Stream }
+
+/// Whether the package's `tasks.silk` declares its own `Plan` command.
+pub effect fn custom(project: &Project) -> bool
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let source = run Path.join(Projects.sourceRoot(project), "tasks.silk")
+  if !run FileSystem.exists(&source) {
+    return false
+  }
+  let text = run FileSystem.readFile(&source)
+  return run declaresPlan(text.asSlice())
+}
+
+/// Whether the tasks source `source` declares a `Plan` variant on the union that `Task.main`
+/// runs, or might: a source that names no such union declared in it answers `true`.
+pub effect fn declaresPlan(source: &[u8]) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let tokens = run significant(source)
+  let listed = tokens.asSlice()
+  let name = match tasksUnion(source, listed) {
+    Option<Token>.Some { value } => value
+    Option<Token>.None => {
+      return true
+    }
+  }
+  let named = text(source, name)
+  let mut at: usize = 0
+  while at + 2 < listed.length {
+    if Tokens.kind(listed[at]) == TokenKind.UnionKeyword
+      && same(text(source, listed[at + 1]), named) {
+      // The variants are the names at the first brace depth of the union's body.
+      let mut open = at + 2
+      while open < listed.length && Tokens.kind(listed[open]) != TokenKind.LeftBrace {
+        open = open + 1
+      }
+      let mut depth: usize = 0
+      let mut inner = open
+      while inner < listed.length {
+        let kind = Tokens.kind(listed[inner])
+        if kind == TokenKind.LeftBrace || kind == TokenKind.LeftParenthesis
+          || kind == TokenKind.LeftBracket {
+          depth = depth + 1
+        } else if kind == TokenKind.RightBrace || kind == TokenKind.RightParenthesis
+          || kind == TokenKind.RightBracket {
+          depth = depth - 1
+          if depth == 0 {
+            return false
+          }
+        } else if depth == 1 && kind == TokenKind.Identifier
+          && same(text(source, listed[inner]), b"Plan") {
+          return true
+        }
+        inner = inner + 1
+      }
+      return true
+    }
+    at = at + 1
+  }
+  return true
+}
+
+// The type argument of `Task.main<T>`, when it is one plain name.
+fn tasksUnion(source: &[u8], tokens: &[Token]) -> Option<Token> {
+  let mut at: usize = 0
+  while at + 5 < tokens.length {
+    if same(text(source, tokens[at]), b"Task") && Tokens.kind(tokens[at + 1]) == TokenKind.Dot
+      && same(text(source, tokens[at + 2]), b"main")
+      && Tokens.kind(tokens[at + 3]) == TokenKind.Less
+      && Tokens.kind(tokens[at + 4]) == TokenKind.Identifier
+      && Tokens.kind(tokens[at + 5]) == TokenKind.Greater {
+      return Option<Token>.some(tokens[at + 4])
+    }
+    at = at + 1
+  }
+  return Option<Token>.none()
+}
+
+effect fn significant(source: &[u8]) -> List<Token>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut lexer = Lexer.make(source)
+  let mut tokens = List<Token>.make()
+  while true {
+    let taken = run Stream.take(&mut lexer)
+    if let Option<Token>.Some { value } = move taken {
+      let kind = Tokens.kind(value)
+      if kind != TokenKind.Whitespace && kind != TokenKind.LineComment
+        && kind != TokenKind.DocComment
+        && kind != TokenKind.ModuleDocComment {
+        run tokens.append(value)
+      }
+    } else {
+      break
+    }
+  }
+  return move tokens
+}
+
+fn text(source: &[u8], token: Token) -> &[u8] {
+  let span = Tokens.span(token)
+  return Slice.view<u8>(source, span.start, span.end - span.start)
+}
+
+/// What one authorization covers: `git:` and the repository's common Git directory, or `path:`
+/// and the canonical workspace root.
+pub effect fn key(project: &Project) -> Bytes
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let directory = Projects.directory(project)
+
+  // A `.git` that cannot be read as a working tree leaves the project keyed by its path.
+  let found = match move run Effect.result(commonDirectory(directory)) {
+    Result<Option<Path>, FileError | OutOfMemoryError>.Success { value } => move value
+    Result<Option<Path>, FileError | OutOfMemoryError>.Failure { error } => match move error {
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+      FileError _unreadable => Option<Path>.none()
+    }
+  }
+  if let Option<Path>.Some { value: common } = move found {
+    let mut written = run Bytes.copy(b"git:")
+    let resolved = run canonical(Path.rawBytes(&common))
+    run written.append(resolved.asSlice())
+    return move written
+  }
+  let mut root = run Path.fromBytes(Path.rawBytes(directory))
+  if let Option<Path>.Some { value: manifest } = move run Projects.enclosingWorkspace(directory) {
+    if let Option<Path>.Some { value: parent } = move run Path.parent(&manifest) {
+      root = move parent
+    }
+  }
+  let mut written = run Bytes.copy(b"path:")
+  let resolved = run canonical(Path.rawBytes(&root))
+  run written.append(resolved.asSlice())
+  return move written
+}
+
+// The common Git directory of the nearest working tree at or above `directory`.
+effect fn commonDirectory(directory: &Path) -> Option<Path>
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let mut current = run Path.fromBytes(Path.rawBytes(directory))
+  while true {
+    let marker = run Path.join(&current, ".git")
+    if run FileSystem.exists(&marker) {
+      let found = run Effect.result(LocalRefs.gitDirectory(&current))
+      return match move found {
+        Result<Path, GitRefError | FileError | OutOfMemoryError>.Success { value } => {
+          let shared = run Path.join(&value, "commondir")
+          if !run FileSystem.exists(&shared) {
+            return Option<Path>.some(move value)
+          }
+          let named = run FileSystem.readFile(&shared)
+          let line = trimmed(named.asSlice())
+          if line.length == 0 {
+            return Option<Path>.some(move value)
+          }
+          if line[0] == 47 {
+            let root = run Path.root()
+            return Option<Path>.some(
+              run Path.resolveBytes(&root, Slice.view<u8>(line, 1, line.length - 1)),
+            )
+          }
+          Option<Path>.some(run Path.resolveBytes(&value, line))
+        }
+        Result<Path, GitRefError | FileError | OutOfMemoryError>.Failure {
+          error
+        } => match move error {
+          OutOfMemoryError exhausted => {
+            fail move exhausted
+          }
+          _ => Option<Path>.none()
+        }
+      }
+    }
+    match move run Path.parent(&current) {
+      Option<Path>.Some { value } => {
+        current = move value
+      }
+      Option<Path>.None => {
+        break
+      }
+    }
+  }
+  return Option<Path>.none()
+}
+
+fn trimmed(line: &[u8]) -> &[u8] {
+  let mut end = line.length
+  while end > 0 && (line[end - 1] == 10 || line[end - 1] == 13 || line[end - 1] == 32) {
+    end = end - 1
+  }
+  return Slice.view<u8>(line, 0, end)
+}
+
+effect fn canonical(path: &[u8]) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match move run HostPath.canonicalBytes(path) {
+    Option<Bytes>.Some { value } => move value
+    Option<Bytes>.None => run Bytes.copy(path)
+  }
+}
+
+/// The file that records an authorization of `key`, or none when neither `SILK_HOME` nor the home
+/// directory is set.
+pub effect fn record(key: &[u8]) -> Option<Path>
+  ! HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator {
+  let mut home = Bytes.make()
+  if let Option<Bytes>.Some { value } = move run HostInput.variableNamed("SILK_HOME") {
+    home = move value
+  } else {
+    let mut homeName = "HOME"
+    static if Intrinsic.targetOperatingSystem() == "windows" {
+      homeName = "USERPROFILE"
+    }
+    if let Option<Bytes>.Some { value } = move run HostInput.variableNamed(homeName) {
+      home = move value
+      run home.append(b"/.silk")
+    }
+  }
+  if home.length() == 0 {
+    return Option<Path>.none()
+  }
+  let mut hash = Sha256.make()
+  hash.update(key)
+  let digest = hash.finish()
+  let digits = b"0123456789abcdef"
+  let mut name = run Bytes.copy(home.asSlice())
+  run name.append(b"/editor-plans/")
+  let mut at: usize = 0
+  while at < digest.length {
+    let pair: [u8; 2] = [digits[u8.toUsize(digest[at] / 16)], digits[u8.toUsize(digest[at] % 16)]]
+    run name.append(&pair)
+    at = at + 1
+  }
+  let made = run Effect.result(Path.fromBytes(name.asSlice()))
+  return match move made {
+    Result<Path, FileError | OutOfMemoryError>.Success { value } => Option<Path>.some(move value)
+    Result<Path, FileError | OutOfMemoryError>.Failure { error } => match move error {
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+      FileError _invalid => Option<Path>.none()
+    }
+  }
+}
+
+/// Whether the developer allowed the editor to run custom plans of `key`.
+pub effect fn allowed(key: &[u8]) -> bool
+  ! HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut FileSystem | &mut Allocator {
+  let path = match move run record(key) {
+    Option<Path>.Some { value } => move value
+    Option<Path>.None => {
+      return false
+    }
+  }
+  let read = run Effect.result(FileSystem.readFile(&path))
+  return match move read {
+    Result<Bytes, FileError | OutOfMemoryError>.Success { value } => same(
+      trimmed(value.asSlice()),
+      key,
+    )
+    Result<Bytes, FileError | OutOfMemoryError>.Failure { error } => match move error {
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+      FileError _absent => false
+    }
+  }
+}
+
+/// Records that the developer allowed custom plans of `key`; `false` when it cannot be written.
+pub effect fn allow(key: &[u8]) -> bool
+  ! HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut FileSystem | &mut Allocator {
+  let path = match move run record(key) {
+    Option<Path>.Some { value } => move value
+    Option<Path>.None => {
+      return false
+    }
+  }
+  let mut contents = run Bytes.copy(key)
+  run contents.append(b"\n")
+  let written = run Effect.result(FileSystem.writeFileWithParents(&path, contents.asSlice()))
+  return match move written {
+    Result<(), FileError | OutOfMemoryError>.Success { .. } => true
+    Result<(), FileError | OutOfMemoryError>.Failure { error } => match move error {
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+      FileError _refused => false
+    }
+  }
+}
+
+/// Whether `tasks.silk` changed after the package's saved requests were written, or there are none.
+pub effect fn outdated(project: &Project) -> bool
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let source = run Path.join(Projects.sourceRoot(project), "tasks.silk")
+  if !run FileSystem.exists(&source) {
+    return false
+  }
+  let requests = run Path.join(Projects.outputDirectory(project), "requests")
+  let index = run Path.join(&requests, "plan.json")
+  if !run FileSystem.exists(&index) {
+    return true
+  }
+  return run newer(Path.rawBytes(&source), Path.rawBytes(&index))
+}
+
+static if Intrinsic.targetOperatingSystem() == "linux"
+  || Intrinsic.targetOperatingSystem() == "darwin" {
+  import silk.platform.native.file { FileStatus, NativeFile, NativeFileError, Timestamp }
+
+  // Whether `left` was modified after `right`; `false` when either has no status.
+  effect fn newer(left: &[u8], right: &[u8]) -> bool {
+    let first = run Effect.result(NativeFile.status(left, true))
+    let second = run Effect.result(NativeFile.status(right, true))
+    if let Result<FileStatus, NativeFileError>.Success { value: changed } = move first {
+      if let Result<FileStatus, NativeFileError>.Success { value: written } = move second {
+        return later(changed.modified, written.modified)
+      }
+    }
+    return false
+  }
+
+  fn later(left: Timestamp, right: Timestamp) -> bool {
+    return left.seconds > right.seconds
+      || (left.seconds == right.seconds && left.nanoseconds > right.nanoseconds)
+  }
+} else {
+  effect fn newer(left: &[u8], right: &[u8]) -> bool {
+    return false
+  }
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at: usize = 0
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + 1
+  }
+  return true
+}

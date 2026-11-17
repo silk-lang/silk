@@ -144,7 +144,7 @@ const program = Effect.gen(function* () {
         env: { ...env, SILK_CLANG: '/nonexistent' },
       })
       assert.equal(rebuilt.status, 0, rebuilt.stderr.toString())
-      const built = join(directory, 'build/direct/wasm32-wasip1/debug/wasi-test')
+      const built = join(directory, 'build/wasm32-wasip1/dev/wasi-test.wasm')
       const exited = yield* invoke(wasmtime, ['run', built])
       assert.equal(exited.status, status, exited.stderr.toString())
     })
@@ -343,7 +343,7 @@ const program = Effect.gen(function* () {
     yield* fs.makeDirectory(nested, { recursive: true })
     yield* fs.writeFileString(
       join(examples, 'silk.toml'),
-      `[package]\nname = "wasi-examples"\nsource = "."\n[build]\nprofile = "wasi"\n[profiles.wasi]\ntarget = "${target}"\n`,
+      `[package]\nname = "wasi-examples"\nsource = "."\n`,
     )
     yield* fs.writeFileString(join(examples, 'marker'), 'package directory')
     const example = [
@@ -370,7 +370,7 @@ const program = Effect.gen(function* () {
         '',
       ].join('\n'),
     )
-    const documented = yield* invoke(compiler, ['doctest', '--stdlib-root', join(repo, 'stdlib')], {
+    const documented = yield* invoke(compiler, ['doctest', '--target', target, '--stdlib-root', join(repo, 'stdlib')], {
       cwd: nested,
     })
     assert.equal(documented.status, 0, documented.stderr.toString() + documented.stdout.toString())

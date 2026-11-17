@@ -48,7 +48,7 @@ pub fn main() -> i32 {
 
 Import as `Reflect` with `import silk.core.reflect { Reflect }`.
 
-Public declarations: 11.
+Public declarations: 12.
 
 <a id="namedKind"></a>
 
@@ -109,7 +109,7 @@ pub const otherKind: u8
 ```
 
 The [`Reflect.typeKind`](#Reflect.impl.typeKind) result for every other type, such as `i32`, `string`, a slice, an
-enum, or a structural union `A | B`. It has no fields.
+or a structural union `A | B`. It has no fields.
 
 <a id="unionKind"></a>
 
@@ -121,6 +121,16 @@ pub const unionKind: u8
 
 The [`Reflect.typeKind`](#Reflect.impl.typeKind) result for a nominal union, such as `union Shape { ... }`. It has no
 fields of its own; list its variants with [`Reflect.variants`](#Reflect.impl.variants).
+
+<a id="enumKind"></a>
+
+## `enumKind`
+
+```silk
+pub const enumKind: u8
+```
+
+The [`Reflect.typeKind`](#Reflect.impl.typeKind) result for a scalar enum, whose values [`Reflect.enumMembers`](#Reflect.impl.enumMembers) lists.
 
 <a id="labeledFieldKind"></a>
 
@@ -299,7 +309,10 @@ pub fn main() -> i32 {
 ### Associated function `fieldNamed`
 
 ```silk
-pub static fn fieldNamed<Owner, Value>(name: Intrinsic.FieldName<Owner>) -> Intrinsic.Field<Owner, Value>
+pub static fn fieldNamed<Owner, Value>(name: Intrinsic.FieldName<Owner>) -> Intrinsic.Field<
+    Owner,
+    Value
+  >
 ```
 
 Returns the descriptor of the field that `name` names, whose type must be `Value`.
@@ -347,6 +360,38 @@ by the contract it satisfies, such as `fn(&u32) -> bool`.
 #### When to use
 
 Name a type where a library describes it to someone else, such as a JSON Schema definition.
+
+<a id="Reflect.impl.declarationName"></a>
+
+### Associated function `declarationName`
+
+```silk
+pub static fn declarationName<Owner>() -> string<'static>
+```
+
+Returns the nominal declaration's package, module and owner names separated by `/`.
+The name does not depend on imports or type arguments. A non-nominal type returns empty text.
+
+<a id="Reflect.impl.enumMembers"></a>
+
+### Associated function `enumMembers`
+
+```silk
+pub static fn enumMembers<Enum>() -> Intrinsic.StaticSequence<Enum>
+```
+
+Returns the visible scalar enum values in declaration order, preserving their discriminants.
+Use the static sequence in a `static for`; it has no runtime representation.
+
+<a id="Reflect.impl.enumLabel"></a>
+
+### Associated function `enumLabel`
+
+```silk
+pub static fn enumLabel<Enum>(value: Enum) -> string<'static>
+```
+
+Returns the declared member name of a scalar enum value during static evaluation.
 
 <a id="Reflect.impl.typeDoc"></a>
 
@@ -463,7 +508,10 @@ Use this function only for a field where [`Reflect.fieldKind`](#Reflect.impl.fie
 ### Associated function `borrowField`
 
 ```silk
-pub fn borrowField<'o, Owner, Value>(owner: &'o Owner, static field: Intrinsic.Field<Owner, Value>) -> &'o Value
+pub fn borrowField<'o, Owner, Value>(
+    owner: &'o Owner,
+    static field: Intrinsic.Field<Owner, Value>,
+  ) -> &'o Value
 ```
 
 Returns a shared borrow of the field of `owner` that `field` describes.
@@ -484,7 +532,10 @@ a field out of an owned value.
 ### Associated function `borrowFieldMut`
 
 ```silk
-pub fn borrowFieldMut<Owner, Value>(owner: &mut Owner, static field: Intrinsic.Field<Owner, Value>) -> &mut Value
+pub fn borrowFieldMut<Owner, Value>(
+    owner: &mut Owner,
+    static field: Intrinsic.Field<Owner, Value>,
+  ) -> &mut Value
 ```
 
 Returns a mutable borrow of the field of `owner` that `field` describes.
@@ -628,7 +679,10 @@ read it with [`Reflect.borrowVariantField`](#Reflect.impl.borrowVariantField).
 ### Associated function `makeVariant`
 
 ```silk
-pub fn makeVariant<Union, Fields>(static variant: Intrinsic.Variant<Union>, fields: Fields) -> Union
+pub fn makeVariant<Union, Fields>(
+    static variant: Intrinsic.Variant<Union>,
+    fields: Fields,
+  ) -> Union
 ```
 
 Returns the variant that `variant` describes, built from `fields`: a tuple of the variant's
@@ -695,8 +749,11 @@ variant must be `pub`, since the variant is built from `silk/core/reflect`.
 ### Associated function `borrowVariantField`
 
 ```silk
-pub fn borrowVariantField<'o, Union, Value>(owner: &'o Union, static variant: Intrinsic.Variant<Union>,
-    static field: Intrinsic.Field<Union, Value>) -> &'o Value
+pub fn borrowVariantField<'o, Union, Value>(
+    owner: &'o Union,
+    static variant: Intrinsic.Variant<Union>,
+    static field: Intrinsic.Field<Union, Value>,
+  ) -> &'o Value
 ```
 
 Returns a borrow of the field that `field` describes, of the variant that `variant` describes.
@@ -750,8 +807,11 @@ It traps when `owner` holds another variant, so test with [`Reflect.isVariant`](
 ### Associated function `borrowVariantFieldMut`
 
 ```silk
-pub fn borrowVariantFieldMut<Union, Value>(owner: &mut Union, static variant: Intrinsic.Variant<Union>,
-    static field: Intrinsic.Field<Union, Value>) -> &mut Value
+pub fn borrowVariantFieldMut<Union, Value>(
+    owner: &mut Union,
+    static variant: Intrinsic.Variant<Union>,
+    static field: Intrinsic.Field<Union, Value>,
+  ) -> &mut Value
 ```
 
 Returns a mutable borrow of the field that `field` describes, of the variant that `variant`

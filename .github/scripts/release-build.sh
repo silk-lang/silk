@@ -22,7 +22,8 @@ if [ "$target" = x86_64-pc-windows-msvc ]; then suffix=.exe; fi
 mkdir "$output"
 output=$(cd "$output" && pwd)
 snapshot=$(cd "$snapshot" && pwd)
-args=(--target "$target" --stdlib ../stdlib --optimization speed --debug false)
+builder=$(cd "$(dirname "$0")/../.." && pwd)/compiler/scripts/CompilationBuild.ts
+args=(--target "$target" --stdlib "$snapshot/stdlib" --optimization speed --debug false)
 
 compilerClang=$clang
 if [ "$profile" != - ]; then
@@ -38,8 +39,10 @@ EOF
   compilerClang=$output/.clang/clang-use
 fi
 
-(cd "$snapshot/compiler" && env -u SDKROOT SILK_CLANG="$compilerClang" "$compiler" build src/main.silk \
-  -o "$output/silkc$suffix" "${args[@]}")
-(cd "$snapshot/compiler" && env -u SDKROOT "$compiler" build src/main.silk -o "$output/compiler.ll" --emit llvm-ir "${args[@]}")
-(cd "$snapshot/tool" && env -u SDKROOT SILK_CLANG="$clang" "$compiler" build src/main.silk -o "$output/silk$suffix" "${args[@]}")
+env -u SDKROOT SILK_CLANG="$compilerClang" node "$builder" --compiler "$compiler" --manifest "$snapshot/compiler/silk.toml" \
+  --output "$output/silkc$suffix" "${args[@]}"
+env -u SDKROOT node "$builder" --compiler "$compiler" --manifest "$snapshot/compiler/silk.toml" \
+  --output "$output/compiler.ll" --emit llvm-ir "${args[@]}"
+env -u SDKROOT SILK_CLANG="$clang" node "$builder" --compiler "$compiler" --manifest "$snapshot/tool/silk.toml" \
+  --output "$output/silk$suffix" "${args[@]}"
 rm -rf "$output/.clang" "$output"/*.units "$output"/*.symbols
