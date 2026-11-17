@@ -352,6 +352,10 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   }
   const explicitTask = yield* invoke(silk, ['task', '--stdlib', standardLibrary, 'build', '--code', '23'], aliased, requestEnv, 120_000)
   assert.equal(explicitTask.status, 23, explicitTask.stderr)
+  // The compiler's own options stay with the compiler; the task sees only its own.
+  const compilerOptions = ['-q', '--timings', '--ignore-warnings', '--progress', 'plain', '--backend', 'llvm']
+  const compilerOptioned = yield* invoke(silk, ['build', ...compilerOptions, '--stdlib', standardLibrary, '--code', '19'], aliased, requestEnv, 120_000)
+  assert.equal(compilerOptioned.status, 19, compilerOptioned.stderr)
   yield* fs.writeFileString(join(aliased, 'src/tasks.silk'), aliasSource(['Build']))
   const builtinRun = yield* invoke(silk, ['run', '--stdlib', standardLibrary], aliased, requestEnv, 120_000)
   assert.equal(builtinRun.status, 42, builtinRun.stderr)
@@ -385,6 +389,11 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     if (/^[0-9a-f]{64}$/.test(name) && (yield* fs.exists(join(aliased, 'build/steps', name, 'size.txt')))) mixedSizes.push(name)
   }
   assert.equal(mixedSizes.length, 1, 'the custom step that reads the artifact ran once')
+  // `silk check` checks the tasks program too.
+  yield* fs.writeFileString(join(aliased, 'src/tasks.silk'), 'pub fn main() -> i32 {\n  return "seven"\n}\n')
+  const checkedTasks = yield* invoke(silk, ['check', '--stdlib', standardLibrary], aliased, requestEnv, 120_000)
+  assert.equal(checkedTasks.status, 1, checkedTasks.stderr)
+  assert.match(checkedTasks.stderr, /src\/tasks\.silk:2:/)
   const argumentsFor = (output: string) => [
     'build',
     'main.silk',
@@ -3629,6 +3638,20 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     assert.equal(refused.status, 1, refused.stderr)
     assert.match(refused.stderr, /error\[SEM0214\]/)
   }
+  // A dependency's parameters take their defaults when nothing binds them.
+  const defaultedRoot = join(directory, 'defaulted')
+  yield* fs.makeDirectory(join(defaultedRoot, 'app/src'), { recursive: true })
+  yield* fs.makeDirectory(join(defaultedRoot, 'greeter/src'), { recursive: true })
+  yield* fs.writeFileString(join(defaultedRoot, 'greeter/silk.toml'),
+    '[package]\nname = "greeter"\nversion = "0.1.0"\nkind = "library"\nexports = ["lib"]\n')
+  yield* fs.writeFileString(join(defaultedRoot, 'greeter/src/lib.silk'),
+    'pub param times: i32 = 5\n\npub fn count() -> i32 {\n  return times\n}\n')
+  yield* fs.writeFileString(join(defaultedRoot, 'app/silk.toml'),
+    '[package]\nname = "app"\nversion = "0.1.0"\n\n[dependencies]\ngreeter = { path = "../greeter" }\n')
+  yield* fs.writeFileString(join(defaultedRoot, 'app/src/main.silk'),
+    'import greeter.lib { count }\n\npub fn main() -> i32 {\n  return count()\n}\n')
+  const defaultedRun = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(defaultedRoot, 'app'), { ...process.env, SILK_CLANG: clang })
+  assert.equal(defaultedRun.status, 5, defaultedRun.stderr)
   // `[package].source` roots module resolution above the root module's own directory.
   yield* fs.makeDirectory(join(directory, 'rooted/src/app'), { recursive: true })
   yield* fs.makeDirectory(join(directory, 'rooted/src/lib'), { recursive: true })
@@ -4898,7 +4921,14 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     `[settings.native]\nlink = [{ kind = "archive", value = ${encodeJson(join(library, 'libsilk.a'))}, weak = false, needed = false }]\n`,
     { ...process.env, SILK_CLANG: sentinel })
   assert.notEqual(nested.status, 0, 'an archive input was nested in a static archive')
+  assert.match(nested.stderr, /a static archive cannot contain the archive/)
   assert.equal(yield* fs.exists(marker), false)
+  // A named library is for the final link of the program that uses the archive: it adds no member.
+  const mathArchive = yield* libraryBuild('libmath.a', 'static-archive',
+    '[settings.native]\nlink = [{ kind = "library", value = "m", mode = "dynamic", weak = false, needed = false }]\n',
+    archiveEnvironment)
+  assert.equal(mathArchive.status, 0, mathArchive.stderr)
+  assert.deepEqual(yield* members('libmath.a'), ['artifact.silk.o'])
   const unarchived = yield* libraryBuild('unarchived.a', 'static-archive', '[settings.profile]\n',
     { ...process.env, SILK_CLANG: clang, SILK_LLVM_AR: sentinel })
   assert.notEqual(unarchived.status, 0, 'a failed archiver reported success')
