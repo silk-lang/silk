@@ -4076,7 +4076,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     yield* fs.makeDirectory(join(workspace, 'app'), { recursive: true })
     yield* fs.makeDirectory(join(workspace, 'libs/math'), { recursive: true })
     const root = (lengths: string) =>
-      `[workspace]\nmembers = ["app", "libs/*"]\n\n[workspace.dependencies]\nlengths = { ${lengths} }\nmath = { path = "libs/math" }\n`
+      `[workspace]\nmembers = ["app", "libs/*"]\nsilk-version = "0.1.0"\n\n[workspace.dependencies]\nlengths = { ${lengths} }\nmath = { path = "libs/math" }\n`
     yield* fs.writeFileString(join(workspace, 'silk.toml'), root(pin))
     yield* fs.writeFileString(
       join(workspace, 'libs/math/silk.toml'),
@@ -4241,7 +4241,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     yield* fs.makeDirectory(join(tool, 'src'), { recursive: true })
     yield* fs.makeDirectory(join(tool, 'completions'), { recursive: true })
     const manifest = (more: string) =>
-      `[package]\nname = "packed-tool"\nversion = "1.2.0"\n\n[pack.binary]\ninclude = ["completions", "notes.txt"]\n${more}`
+      `[package]\nname = "packed-tool"\nversion = "1.2.0"\nsilk-version = "0.1.0"\n\n[pack.binary]\ninclude = ["completions", "notes.txt"]\n${more}`
     yield* fs.writeFileString(join(tool, 'silk.toml'), manifest(''))
     yield* fs.writeFileString(join(tool, 'src/main.silk'), 'pub fn main() -> i32 {\n  return 0\n}\n')
     yield* fs.writeFileString(join(tool, 'completions/tool.bash'), 'complete -W "pack" packed-tool\n')
@@ -4314,7 +4314,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     // The table is an executable's.
     yield* fs.writeFileString(
       join(tool, 'silk.toml'),
-      '[package]\nname = "packed-tool"\nversion = "1.2.0"\nkind = "library"\nmain = "main.silk"\nexports = ["main"]\n\n[pack.binary]\n',
+      '[package]\nname = "packed-tool"\nversion = "1.2.0"\nsilk-version = "0.1.0"\nkind = "library"\nmain = "main.silk"\nexports = ["main"]\n\n[pack.binary]\n',
     )
     const library = yield* invoke(silk, ['pack', '--output', output, '--stdlib', standardLibrary], tool, environment, 120_000)
     assert.equal(library.status, 1, 'a library with [pack.binary] was packed')
@@ -5709,7 +5709,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   yield* fs.makeDirectory(join(embedApp, 'src'), { recursive: true })
   yield* fs.writeFileString(
     join(embedLibrary, 'silk.toml'),
-    '[package]\nname = "embed-library"\nversion = "0.1.0"\nkind = "library"\nmain = "library.silk"\nexports = ["library"]\n',
+    '[package]\nname = "embed-library"\nversion = "0.1.0"\nsilk-version = "0.1.0"\nkind = "library"\nmain = "library.silk"\nexports = ["library"]\n',
   )
   yield* fs.writeFileString(join(embedLibrary, 'js/index.js'), 'export const hello = () => `hi ${1 + 1}`;\n')
   yield* fs.writeFileString(
@@ -5818,7 +5818,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   assert.doesNotMatch(unpacked.stderr, /fixtures/)
   yield* fs.writeFileString(
     join(embedLibrary, 'silk.toml'),
-    '[package]\nname = "embed-library"\nversion = "0.1.0"\nkind = "library"\nmain = "library.silk"\nexports = ["library"]\ninclude = ["js"]\n',
+    '[package]\nname = "embed-library"\nversion = "0.1.0"\nsilk-version = "0.1.0"\nkind = "library"\nmain = "library.silk"\nexports = ["library"]\ninclude = ["js"]\n',
   )
   const packedEmbed = yield* embedPack()
   assert.equal(packedEmbed.status, 0, packedEmbed.stdout + packedEmbed.stderr)
