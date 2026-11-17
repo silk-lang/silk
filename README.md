@@ -5,153 +5,113 @@
   </picture>
 </p>
 
-<p align="center">
-  <strong>A systems language where every failure, requirement and resource is part of the type.</strong>
-</p>
+<h3 align="center">Built for the way software is written today.</h3>
 
 <p align="center">
   <a href="https://github.com/silk-lang/silk/actions/workflows/selfhost.yml"><img src="https://github.com/silk-lang/silk/actions/workflows/selfhost.yml/badge.svg?branch=main" alt="Selfhost"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-c6a678" alt="MIT license"></a>
-  <img src="https://img.shields.io/badge/status-pre--alpha-8b5cf6" alt="Pre-alpha">
+  <img src="https://img.shields.io/badge/status-alpha-8b5cf6" alt="Alpha">
 </p>
 
 <p align="center">
+  <a href="https://silklang.org">Website</a> ·
+  <a href="https://silklang.org/docs/get-started/a-tour-of-silk">Tour</a> ·
+  <a href="https://silklang.org/docs">Documentation</a> ·
   <a href="#install">Install</a> ·
-  <a href="#a-short-tour">Tour</a> ·
-  <a href="reference/index.md">Language reference</a> ·
-  <a href="reference/stdlib/index.md">Standard library</a> ·
-  <a href="#contributing">Contributing</a>
+  <a href="https://silklang.org/releases">Releases</a>
 </p>
 
 ---
 
-Silk compiles to native code and WebAssembly through LLVM, with no garbage collector, no hidden
-allocation and no ambient I/O. A function's signature tells you everything it can do: what it
-returns, how it can fail, and which services it needs. The compiler checks all of it, and cleanup
-runs at a point you can see in the source.
+Working with agents is all about clear contracts. Silk exists to give you that. Every effect
+function states what it returns, how it can fail and what it touches, down to the allocator. Every
+value has an owner and every borrow has a lifetime, so nothing is left to luck.
+
+Silk is a systems language. It compiles to native code and WebAssembly, has no garbage collector,
+and its compiler is written in Silk.
 
 ```silk
-effect fn remaining(deadline: u64) -> u64 ! Expired | LogError ? &Clock | &mut Logger {
-  let now = run Clock.now()
-  if now > deadline { fail Expired {} }
-  run Effect.log("{left} ticks left\n", &.{ left: deadline - now })
-  return deadline - now
+import silk.core.effect { Effect }
+import silk.io.logger { Logger, LogError }
+import silk.io.logger_native { StdoutLogger }
+
+pub service Random {
+  effect fn next(self: &mut Self) -> u32
+}
+
+struct NoSides {}
+
+effect fn roll(sides: u32) -> u32
+  ! NoSides | LogError
+  ? &mut Random | &mut Logger {
+  if sides == 0 {
+    fail NoSides {}
+  }
+  let face = (run Random.next()) % sides + 1
+  run Effect.log("rolled {face}\n", &.{ face })
+  return face
 }
 ```
 
-Read it as "returns a `u64`, may fail with `Expired` or `LogError`, and needs a `Clock` to read and
-a `Logger` to write to". The function doesn't know which clock or logger it gets. The caller
-decides, and a test can hand it fakes.
+Read the signature of `roll` as a contract: it returns a `u32`, it can fail with `NoSides` or
+`LogError`, and it needs a `Random` source and a `Logger`. Nothing else can happen in there
+without the signature changing.
 
-The compiler is written in Silk and builds itself.
+- **`service` names a need** without saying how it is met.
+- **`!` lists the failures** and **`?` lists the needs.** Leave a need unprovided, or a failure
+  unhandled, and the program does not compile.
+- **`run` marks every effect.** An effect is a value until `run` executes it, so you can see where
+  things happen.
 
 ## Why Silk
 
-- **Typed failures.** `! E` lists every error a computation can raise. `fail` raises one,
-  `Effect.catch` handles it, and the handled error leaves the type.
-- **Requirements instead of globals.** Clocks, loggers, allocators, file systems, sockets and
-  random sources are `service`s that a computation asks for with `? &Service`. Providers are
-  ordinary values, so a test or a browser host swaps one in without mocking anything global.
-- **Ownership without a runtime.** Values are affine: `move` transfers them, `&` and `&mut` borrow
-  them, and `Drop` runs exactly once at a deterministic point. Using a value after it moved is a
-  compile error.
-- **Explicit allocation.** Allocation is never hidden. Anything that allocates asks for
-  `? &mut Allocator`, and you choose which allocator it gets.
-- **Compile-time evaluation.** `static` parameters, `let static` and `static if` run at compile time
-  against the selected target, and only the chosen branch reaches the program.
-- **Little compiler magic.** Compiler operations that source can call live in the sealed
-  `Intrinsic` namespace. `Effect`, `Result`, `List`, logging and the file system are ordinary Silk
-  in [`stdlib/`](stdlib), and you can read them like your own code.
+Code is now written by people and agents together, and reviewed by whoever did not write it. Silk
+is designed for that loop.
+
+- **The signature is the contract.** Failures (`! E`) and requirements (`? &Service`) are part of
+  every effect function's type. Clocks, loggers, files, sockets, randomness and allocators are
+  services that code asks for, and the caller decides what it gets.
+- **Guardrails, not trust.** Values have one owner, `&` and `&mut` borrow them, and cleanup runs
+  at a point you can see in the source. You do not have to trust that the author, human or not,
+  remembered to free something or kept a reference alive.
+- **No hidden heap.** Code that allocates asks for an `Allocator`. Pass the system allocator, an
+  arena, or one that always refuses in a test. Running out of memory is a typed failure,
+  `! OutOfMemoryError`, not a crash.
+- **Few ways to write a thing.** Being explicit costs little when agents do the typing, so Silk
+  spends it on clarity. There is usually one way to express something, which makes code easy to
+  review and easy for an agent to match.
+- **A fast loop.** Compile speed is a core value. Every feature is weighed by what it costs the
+  rebuild. `silk check` reports errors without building, builds are incremental, and `silk test`
+  runs only the tests a change can affect.
+- **Library, not magic.** `Effect`, `Option`, `List`, fibers, schedulers and allocators are
+  ordinary Silk in [`stdlib/`](stdlib). You can read them like your own code.
 
 ## Install
 
-### macOS and Linux
-
-On macOS (Apple Silicon) or Linux (x86-64 or ARM64):
+macOS (Apple Silicon) and Linux (x86-64 or ARM64):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/silk-lang/silk/main/install.sh | sh
 ```
 
-The script installs the latest stable release in `~/.silk/toolchains/<version>` (set `SILK_HOME`
-to change `~/.silk`) and makes it your default. It also installs [the silk tool](tool), the command
-you type for Silk, as `~/.silk/bin/silk`; each release's compiler is `silkc`. It verifies the
-compiler's SHA-256 and reported version, and the release signature when `minisign` is installed.
-Earlier versions stay installed beside it.
-Set `SILK_RELEASE=v0.2.0-beta.1` to select a published prerelease explicitly. Each release
-carries its own LLVM (Clang, lld and llvm-ar) at `lib/silk/llvm`, so building programs needs no
-installed compiler. `SILK_CLANG` or `--clang` selects another Clang (22 or newer) instead. On
-macOS, plain programs link without an SDK; a package with C sources or native libraries needs the
-macOS SDK (`xcode-select --install`).
+Windows (x86-64), in PowerShell:
 
-With [Homebrew](https://brew.sh), which installs the release with its bundled LLVM:
+```powershell
+irm https://raw.githubusercontent.com/silk-lang/silk/main/install.ps1 | iex
+```
+
+Homebrew:
 
 ```sh
 brew install silk-lang/tap/silk
 ```
 
-With [mise](https://mise.jdx.dev), from the release archives:
-
-```sh
-mise use -g 'github:silk-lang/silk[version_prefix=v]'
-```
-
-Homebrew follows the same channel as the script. mise picks stable releases only; until the first
-one exists, use `github:silk-lang/silk[version_prefix=v,prerelease=true]` to get dev releases.
-
-### Windows
-
-On Windows x86-64, run this in PowerShell:
-
-```powershell
-Invoke-RestMethod https://raw.githubusercontent.com/silk-lang/silk/main/install.ps1 | Invoke-Expression
-```
-
-The installer needs no administrator privileges. It installs `silk.exe` in
-`$env:USERPROFILE\.silk\bin` and keeps each compiler and its standard library in
-`$env:USERPROFILE\.silk\toolchains\<version>`. Set `$env:SILK_HOME` before installing to use
-another directory. It selects the latest stable release, or the latest development release
-until a stable release exists. To select a specific published release, set `$env:SILK_RELEASE`
-to its full tag before running the command.
-
-Add `%USERPROFILE%\.silk\bin` (or your custom `SILK_HOME`'s `bin` directory) to your **user Path**
-in Windows' Environment Variables settings, then open a new terminal. For the default location,
-you can also enable it in the current PowerShell session:
-
-```powershell
-$env:Path = "$env:USERPROFILE\.silk\bin;$env:Path"
-silk --version
-```
-
-The release carries its own LLVM, so building programs needs nothing else installed;
-`$env:SILK_CLANG` selects another `clang.exe` instead. See [Silk on Windows](reference/windows.md) for archive
-verification, Scoop and mise installation, and the supported Windows filesystem scope.
-
-### Silk versions
-
-A project pins its Silk version with `silk-version` in `silk.toml`, under `[package]` or
-`[workspace]`. `silk` reads the pin and runs that version from `~/.silk/toolchains`, so projects on
-different versions work side by side. Outside a pinned project it runs your default version. In a
-workspace the `[workspace]` pin wins over the members' own, and `silk set` sets it and moves any
-member pins along with it.
-
-```sh
-silk use                    # install the version this project pins
-silk use 0.1.0-dev.11       # install a version and make it your default
-silk set latest             # pin this project to the newest stable release and install it
-                            # (--dev: include dev releases, --no-install: only pin)
-silk use list               # installed versions, and which one is selected here
-silk use which              # the version selected here, and why
-silk +0.1.0-dev.11 build    # run one command with an installed version
-silk update self            # update the silk tool itself
-```
-
-Every other command, such as `silk build` or `silk test`, runs unchanged in the selected
-version's compiler. When the pinned version is missing, the command exits with status 3 and names
-the `silk use` command that fixes it. Set `SILK_AUTO_INSTALL=1`, or `auto-install = true` in
-`~/.silk/settings.toml`, to install it automatically instead. `SILK_TOOLCHAIN=<version>`
-overrides the selection for a shell. See [tool/README.md](tool) for the rest. Homebrew and mise
-install `silk` beside its release's `silkc`, which it runs when nothing selects another version.
+Each release carries its own LLVM, so there is nothing else to install. The installer puts the
+`silk` command in `~/.silk/bin` and keeps every Silk version side by side in `~/.silk/toolchains`.
+A project pins its version with `silk-version` in `silk.toml`, and `silk` runs that version for
+you. The [install guide](https://silklang.org/docs/get-started/install) covers mise, Scoop,
+signature verification and choosing a version, and
+[editor setup](https://silklang.org/docs/get-started/editor-setup) covers the language server.
 
 ## Quick start
 
@@ -165,8 +125,7 @@ silk run
 Hello, world!
 ```
 
-`silk init` writes a `silk.toml` and a `src/main.silk` from the official `default` template
-(`silk init -l` lists the others; `-t minimal` works offline). Even "hello world" names what it needs:
+Even "hello world" says what it needs and how it can fail:
 
 ```silk
 import silk.core.effect { Effect }
@@ -177,265 +136,239 @@ pub effect fn main() -> ()
   ! LogError {
   let mut logger = StdoutLogger.make()
 
-  run Effect.log("Hello, world!", &()) |> Effect.provideMut(&mut logger)
+  run Effect.log("Hello, world!\n", &()) |> Effect.provideMut(&mut logger)
 }
 ```
-
-## Changes and releases
-
-`silk change` records release notes and cuts releases. It is implemented in the [`changes/`](changes)
-Silk package and reads the `[release]` table of `silk.toml`. From a package directory:
-
-```sh
-silk change minor "Reads now return a future." --migration "Await read()."
-silk change status
-silk change version --tag beta
-silk change version
-silk change release --json
-silk change since 0.1.0 --json
-```
-
-Each contribution gets its own `.changes/<random>.md`, avoiding shared changelog edits in PRs.
-Write the summary as one line. Migration guidance is only for changes that consumers must act on;
-no guidance means no action is needed. Releases
-consume pending changes, update the package version, and write authoritative
-`.changes/releases/<version>.toml` records. `CHANGELOG.md` is regenerated from those records
-with a warning that manual edits will be overwritten. An optional `[release].version-file`
-generates a Silk module exposing the package's version in the same recovery transaction.
-Commit the records, changelog, manifest, generated module, and consumed-file deletions together.
-`release` checks the prepared release and exports its notes and metadata for a publisher.
-These commands do not commit, tag, publish, or access Git.
-
-`silk change since` selects compiler upgrades from the project's `package.silk-version`.
-`since <dependency>` starts at that dependency's installed manifest version; `--to VERSION`
-selects an exact target. Published queries compare immutable `changes-snapshot.toml` release
-assets, including pending notes that actually shipped in a dev release—not today's open changes.
-Unchanged notes are deduplicated across dev-to-stable promotion; edited migration guidance is
-shown again as updated. `--source PATH` supports offline checkouts and snapshot files.
-`silk change --help` lists the discovery and trust settings.
-
-The compiler uses this flow itself. A maintained draft release PR collects pending changes;
-merging it publishes stable after the native gates pass. Daily or manually triggered dev releases
-use `0.1.0-dev.N+<commit>` versions without consuming pending notes or changing the committed
-changelog. `0.1.0` remains reserved for the first announcement. See the
-[compiler release procedure](compiler/README.md#release-versions).
 
 ## A short tour
 
-### Services and providers
+### Provide at the edge
 
-A `service` declares operations. Any value can provide it through an `impl`, and `Effect.provide`
-hands that value to a computation.
+`roll` above does not know which random source or logger it gets. Any value can provide a service
+through an `impl`, and `main` picks the providers:
 
 ```silk
-service Clock {
-  effect fn now() -> u64 ? &Clock
+struct Fixed {
+  value: u32,
 }
 
-struct FixedClock { at: u64 }
-
-impl Clock for FixedClock {
-  effect fn now(self: &Self) -> u64 { return self.at }
+impl Random for Fixed {
+  effect fn next(self: &mut Self) -> u32 {
+    return self.value
+  }
 }
 
-struct Expired {}
+effect fn noSides(error: NoSides) -> u32 {
+  return 0
+}
 
-effect fn expired(error: Expired) -> u64 { return 0 }
-
-pub effect fn main() -> () ! LogError {
-  let clock = FixedClock { at: 58 }
+pub effect fn main() -> ()
+  ! LogError {
+  let mut random = Fixed { value: 41 }
   let mut logger = StdoutLogger.make()
-  let left = run Effect.catch<Expired>(remaining(100), expired)
-    |> Effect.provide(&clock)
+
+  drop run roll(6)
+    |> Effect.catch<NoSides>(noSides)
+    |> Effect.provideMut(&mut random)
     |> Effect.provideMut(&mut logger)
 }
 ```
 
 ```console
-42 ticks left
+rolled 6
 ```
 
-`Effect.catch<Expired>` takes `Expired` out of the error type. `main` still declares `LogError`,
+`Effect.catch<NoSides>` takes `NoSides` out of the failure type. `main` still declares `LogError`,
 because nothing handled it.
 
 ### Tests swap the providers
 
-`silk test` finds `test` declarations through the import graph. This one runs `remaining` against
-the fixed clock and the standard library's in-memory logger:
+The same `roll`, with a fixed source and the standard library's in-memory logger. Nothing is
+mocked and nothing global is patched. `Testing` and `AssertionError` come from
+`silk.testing.testing`:
 
 ```silk
-test effect fn reportsTheTimeLeft() -> () ! AssertionError<'static> | Expired | LogError {
-  let clock = FixedClock { at: 58 }
+test effect fn rollsTheFaceTheSourceGives() -> ()
+  ! AssertionError<'static> | NoSides | LogError {
+  let mut random = Fixed { value: 41 }
   let mut logger = Logger.inMemoryProvider()
-  let left = run remaining(100)
-    |> Effect.provide(&clock)
+
+  let face = run roll(6)
+    |> Effect.provideMut(&mut random)
     |> Effect.provideMut(&mut logger)
-  run Testing.expect(left == 42 && Logger.length(&logger) == 1, "one log line, 42 ticks left")
+
+  run Testing.expect(face == 6, "41 % 6 + 1 is 6")
+  run Testing.expect(Logger.length(&logger) == 1, "one line was logged")
 }
 ```
 
 ```console
 $ silk test
-  main::reportsTheTimeLeft
-    PASS  19 us
+  main::rollsTheFaceTheSourceGives
+    PASS  44 us
 
 Tests  1 passed, 0 failed (0 cached, 1 executed, 1 selected, 1 discovered)
 ```
 
-### Ownership and cleanup
+Run it again without changing anything `roll` reaches and the result comes from the cache.
+
+### The compiler says which line to move
+
+Every borrow lives until its last use. A shared read cannot start while a mutable borrow of the
+same value is still in use:
 
 ```silk
-import silk.core.ownership { Drop }
-
-struct Connection { id: i32 }
-
-impl Drop for Connection {
-  fn drop(self: &mut Connection) -> () { return () }
-}
-
-fn peek(connection: &Connection) -> i32 { return connection.id }
-
-fn close(connection: Connection) -> i32 { return connection.id }
-
 pub fn main() -> i32 {
-  let connection = Connection { id: 7 }
-  let seen = peek(&connection)
-  let closed = close(move connection)
-  return seen + closed
+  let mut x = 1
+  let r = &mut x
+  let s = &x
+  r.* = 2
+  return s.*
 }
 ```
-
-`peek` borrows the connection. `close` takes ownership, so `drop` runs when `close` returns. Change
-the last line to `return seen + closed + connection.id` and the compiler stops you:
 
 ```console
-src/main.silk:17:26: error[OWN0001] connection was moved and cannot be used again
+src/main.silk:4:11: error[OWN0010] A shared borrow of `x` conflicts with an earlier mutable borrow of it that is still in use; use that borrow for the last time before this one
+  note: src/main.silk:3:11: the earlier borrow starts here
 ```
 
-### Unions and matching
+Move `let s = &x` below `r.* = 2` and it compiles. Every error code is
+[documented](https://silklang.org/docs/appendix/diagnostic-codes).
 
-Unions are structural, and a `match` has to cover every case.
+The [tour](https://silklang.org/docs/get-started/a-tour-of-silk) continues with fibers, retries on
+a schedule, arenas, unions and compile-time evaluation, and
+[the book](https://silklang.org/docs/book/overview) teaches the language from the start.
 
-```silk
-struct Circle { radius: f64 }
-struct Rect { width: f64, height: f64 }
+## Builds are Silk code
 
-fn area(shape: Circle | Rect) -> f64 {
-  return match move shape {
-    Circle c => 3.14159 * c.radius * c.radius
-    Rect r => r.width * r.height
-  }
-}
-```
+`silk.toml` says what a package is and what it depends on. Most packages need nothing more:
 
-### Compile-time selection
-
-```silk
-import silk.core.target { Target, Arch }
-
-fn wordBits() -> u32 {
-  static if Target.arch() == Arch.Wasm32 {
-    return 32
-  } else {
-    return 64
-  }
-}
-```
-
-The condition is evaluated for the target being built. Only the chosen branch reaches the program,
-so nothing is checked at run time.
-
-## What's in the box
-
-| Command                     | What it does                                                         |
-| --------------------------- | -------------------------------------------------------------------- |
-| `silk init`                 | Create a package with `silk.toml` and `src/main.silk`, or from `-t <template>` |
-| `silk build` / `silk run`   | Compile for one or more targets, in debug or `--release`             |
-| `silk check`                | Check types, ownership and effects without building                  |
-| `silk test`                 | Discover and run `test` declarations                                 |
+| Command                     | What it does                                                    |
+| --------------------------- | --------------------------------------------------------------- |
+| `silk init`                 | Create a package or a workspace, optionally from a template     |
+| `silk build` / `silk run`   | Compile for one or more `--target`s, in dev mode or `--release` |
+| `silk check`                | Report type, ownership and effect errors without building       |
+| `silk test`                 | Run the tests a change can affect                               |
 | `silk format`               | Format Silk and TOML, with `--check` for CI                     |
-| `silk doc` / `silk doctest` | Extract documentation from `///` comments and compile their examples |
-| `silk clean`                | Remove build output                                                  |
+| `silk add` / `silk fetch`   | Manage dependencies                                             |
+| `silk doc` / `silk doctest` | Extract `///` documentation and run its examples                |
+| `silk pack`                 | Check a package and write its release archives                  |
+| `silk lsp`                  | Start the language server                                       |
 
-The [standard library](reference/stdlib/index.md) is written in Silk and documented with `silk doc`.
-It includes:
+When a build needs more than flags can say, it is described in Silk, not in configuration. A
+package's `src/tasks.silk` holds the commands of the project. Each command builds a graph of
+compilations as plain values and hands it to the compiler:
 
-- **Core:** `Effect`, `Result`, `Option`, `List`, `HashMap`, `Box`, `Shared`, strings, Unicode,
-  formatting, and checked arithmetic for every scalar type.
-- **Systems:** files, child processes, sockets, clocks, randomness, single-threaded fibers and
-  schedulers, and WebAssembly start-up.
-- **Data:** JSON and TOML (including comment-preserving TOML formatting), Base64, URIs, LZMA/LZMA2, XZ, and Zstandard decoding, and DEFLATE/zlib/gzip encoding and decoding.
-- **Network:** HTTP/1.x and HTTP/2 clients and servers, HPACK, a WebSocket server, connection pooling, and TLS with X.509
-  certificate path validation.
-- **Crypto:** SHA-1, SHA-2 and SHA-3, HMAC, HKDF, AES-GCM, ChaCha20-Poly1305, X25519, and ECDSA
-  P-256 and RSA signature verification.
+```silk
+union Tasks {
+  Build { pub options: Options },
+  Small { pub options: Options },
+}
+
+impl TaskSet for Tasks {
+  effect fn perform(self: Tasks) -> ()
+    ! BuildError
+    ? &mut Allocator | &mut FileSystem | &mut HostInput {
+    match move self {
+      Tasks.Build { options } => {
+        let program = run Compilation.fromPackage(&options)
+        drop run program.build()
+      }
+      Tasks.Small { options } => {
+        let program = run Compilation.fromPackage(&options)
+        let small = run program.optimize(run Deferred<Optimize>.value(Optimize.Size))
+        drop run small.build()
+      }
+    }
+  }
+}
+```
+
+`Build` replaces what `silk build` does, and `silk task small` runs the other one. The imports and
+the command-line description are left out here. A command is typed and checked like the rest of
+your code, and a dependency's tasks never run on your machine. See
+[Projects](https://silklang.org/docs/projects/overview) for build graphs, generated code, C
+sources and packaging.
+
+## Batteries included
+
+The [standard library](https://silklang.org/docs/std/overview) is written in Silk, under the same
+allocator, failure and service rules as your code. An HTTPS client needs one dependency: the
+toolchain.
+
+- **Core:** `Effect`, `Option`, `Result`, `List`, `HashMap`, `Box`, `Shared`, strings, Unicode,
+  formatting, regular expressions and checked arithmetic.
+- **Concurrency:** fibers, schedulers, retries and repeats on a `Schedule`, and virtual time for
+  tests.
+- **Systems:** files, child processes, sockets, clocks, randomness, typed SIMD vectors, and Linux
+  executables that link no C library.
+- **Network:** HTTP/1.1 and HTTP/2 clients and servers, WebSocket, connection pooling, and TLS 1.3
+  with X.509 path validation.
+- **Crypto:** SHA-2, SHA-3, BLAKE2, HMAC, HKDF, AES-GCM, ChaCha20-Poly1305, X25519 and Ed25519.
+- **Data:** JSON, TOML, YAML, schemas with derived codecs, Base64, URIs, and DEFLATE, gzip,
+  Zstandard, XZ and LZMA2 decoding in fixed memory.
+- **Programs:** typed command lines with `silk.cli`, and the build graph API behind `tasks.silk`.
+
+Files, processes, clocks, randomness and sockets are services, so every one of them has a
+stand-in for tests.
 
 ## Platforms
 
-Native hosts are Apple Silicon macOS (`aarch64-apple-darwin`), x86-64 Linux
-(`x86_64-unknown-linux-gnu`), ARM64 Linux (`aarch64-unknown-linux-gnu`) and x86-64 Windows
-(`x86_64-pc-windows-msvc`); Intel macOS (`x86_64-apple-darwin`) is a tier 2 host. Each release
-has an archive for every one of them, all built on one Linux machine. Any host links Linux,
-macOS and Windows executables for another of these targets with no SDK or sysroot (see
-[platform supplies](reference/platform-supplies.md)). WebAssembly
-(`wasm32-unknown-unknown`) is a freestanding output target. WASI commands target
-`wasm32-wasip1` (core modules) or `wasm32-wasip2` (components). Preview 2 also supports
-TCP, UDP, DNS, HTTP clients and servers, and custom WIT worlds. See the
-[WASI guide](reference/wasi.md) for build tools, runtime commands, and host services.
+Silk runs on macOS (Apple Silicon, with Intel as a tier 2 host), Linux (x86-64 and ARM64) and
+Windows (x86-64). It compiles to macOS, Linux with or without libc, Windows and WebAssembly, and
+any host can build for all of them.
+
+Executables for another system link with no SDK or sysroot (see
+[platform supplies](reference/platform-supplies.md)). WebAssembly output is freestanding
+`wasm32-unknown-unknown`, or WASI Preview 1 and Preview 2 (see the [WASI guide](reference/wasi.md)).
+[Silk on Windows](reference/windows.md) covers the Windows details.
+
+## Where Silk comes from
+
+- **[Effect](https://effect.website)** showed how far typed errors, services and effects can carry
+  a codebase as it grows. Silk exists because that kind of scalability should not be limited to
+  high-level languages.
+- **[Rust](https://www.rust-lang.org)** designed the memory model today's software needs: every
+  value has an owner and every borrow has a lifetime.
+- **[Zig](https://ziglang.org)** showed the value of being explicit about system resources, and
+  that a fast, incremental compiler is essential to any loop.
 
 ## Status
 
-Silk is pre-alpha. The language is still being designed, and any API may change without notice.
-The [language reference](reference/index.md) is prescriptive, and each rule says whether it is
-confirmed, a candidate or still open.
+Silk is in alpha. The compiler already builds itself, and every change has to build it twice in a
+row with identical output and pass a shared corpus of programs with exactly the expected results.
 
-Every change has to build the compiler with itself twice in a row and get identical LLVM IR both
-times. It also has to run a shared corpus of 443 programs with exactly the expected results.
+The language, the standard library and the tools are moving fast, and APIs may change before 1.0.
+Every [release](https://silklang.org/releases) lists what changed and how to migrate. Try it, pin
+your toolchain, and help shape what Silk becomes.
 
 ## Repository
 
-| Path                      | Contents                                                   |
-| ------------------------- | ---------------------------------------------------------- |
-| [`compiler/`](compiler)   | The compiler, written in Silk                              |
-| [`changes/`](changes)     | Changes, release versions, migration notes, and changelogs |
-| [`tool/`](tool)           | The silk tool, the front door: Silk versions and forwarding |
-| [`tomledit/`](tomledit)   | Comment-preserving `silk.toml` edits, shared by both       |
-| [`stdlib/`](stdlib)       | The standard library                                       |
-| [`reference/`](reference) | The language reference and the generated stdlib reference  |
-| [`corpus/`](corpus)       | The shared acceptance corpus                               |
-| [`examples/`](examples)   | Larger example programs                                    |
-
-`silk format` includes package and workspace manifests alongside source files. Exact `.toml`
-paths can be formatted without a project; `--check` reports drift without writing. Formatting
-preserves comments, string contents, value spellings, and declaration order, normalizes spacing
-and line endings, and indents nested values by two spaces. Existing line breaks inside arrays
-and inline tables remain. Invalid TOML is reported and left untouched.
-
-Silk formats TOML before saving project initialization, dependency and workspace edits, toolchain
-pins and settings, and release manifests, records, and snapshots. Recovery restores the original
-bytes; copying an immutable snapshot also preserves its bytes. Library callers can use
-[`TomlFormat`](reference/stdlib/toml-format.md).
-
-The root `silk.toml` defines a native workspace containing `compiler`, `changes`, `tomledit` and
-`tool`. Members
-share the root `build/` directory; the root is not itself a package. Select a member explicitly
-from the root, for example `silk build --manifest-path compiler/silk.toml --stdlib stdlib` or
-`silk change --dir compiler status`. Release operations affect one package at a time.
+| Path                      | Contents                                                     |
+| ------------------------- | ------------------------------------------------------------ |
+| [`compiler/`](compiler)   | The compiler, written in Silk                                |
+| [`stdlib/`](stdlib)       | The standard library                                         |
+| [`tool/`](tool)           | The `silk` command: Silk versions and forwarding to `silkc`  |
+| [`changes/`](changes)     | `silk change`: release notes, versions and changelogs        |
+| [`tomledit/`](tomledit)   | Comment-preserving `silk.toml` edits                         |
+| [`reference/`](reference) | The language reference and the generated stdlib reference    |
+| [`corpus/`](corpus)       | The shared acceptance corpus                                 |
+| [`examples/`](examples)   | Larger example programs                                      |
 
 ## Contributing
 
-The compiler builds itself from the published seed pinned in
-[`compiler/native-seed.json`](compiler/native-seed.json). [`compiler/README.md`](compiler/README.md)
-walks through building it and running its source-written test suites. Repository tooling runs on
-Node and pnpm:
+Issues and pull requests are welcome. The compiler builds itself from the published seed pinned in
+[`compiler/native-seed.json`](compiler/native-seed.json); [`compiler/README.md`](compiler/README.md)
+describes its layout and [`.github/CI.md`](.github/CI.md) the checks a pull request runs. The root
+`silk.toml` is a workspace of `compiler`, `changes`, `tomledit` and `tool`, so select a member from
+the root, for example `silk build --manifest-path compiler/silk.toml --stdlib stdlib`.
+
+Repository tooling runs on Node and pnpm:
 
 ```sh
 pnpm install
 pnpm test:scripts
 ```
-
-On Debian or Ubuntu, `bash scripts/setup-linux-llvm.sh` installs the verified LLVM 22 toolchain
-under `.scratch/llvm-22.1.8`. Put its `bin` directory on `PATH`.
 
 ## License
 
