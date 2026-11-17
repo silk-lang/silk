@@ -460,3 +460,18 @@ entry stops the rest, and `silk init` then removes every file and directory it c
 suggests `-t minimal` for an offline project; a malformed
 template or a file in the way exits 2. Builds never run an entry; they only refuse a malformed
 one, naming its manifest line.
+
+After a project is created, `silk init` prints what to run next: `Next steps:`, then
+`cd <directory>` with the project directory relative to the working directory (quoted for a POSIX
+shell when it needs it, and left out when the project is the working directory), then one line per
+step. The steps are the template's `[template].next-steps`, an array of strings, each one
+nonempty line without control characters; `next-steps = []` prints no next steps at all. Without
+it, the step is `silk test` for a package whose `kind` is `library` and `silk run` otherwise, which
+is also what `--lib`, `--workspace` and `-t minimal` print. The `[template]` table, like the
+`[[post-init]]` entries, is removed from the new manifest. Nothing is printed when `silk init`
+fails, including when it cannot add the package to its workspace.
+
+```toml
+[template]
+next-steps = ["silk task dev"]
+```
