@@ -9243,7 +9243,7 @@ effect fn checkTarget(
   let ProjectPlan {
     input: planned,
     bindings,
-    task: _,
+    task: tasksCheck,
     maxMemory: unlimited,
     stackSize: _,
     entry: _,
@@ -9321,9 +9321,15 @@ effect fn checkTarget(
   if let Option<Bytes>.Some { .. } = &serving {
     mode = StoreMode.Revisable
   }
+  // The tasks program keeps a cache of its own, so it and the package's check do not evict each
+  // other's checks.
+  let mut cacheName = run Bytes.copy(Projects.name(project))
+  if tasksCheck {
+    run Bytes.append(&mut cacheName, b".tasks")
+  }
   let cacheHome = run SemanticCache.directory(
     Projects.outputDirectory(project),
-    Projects.name(project),
+    Bytes.asSlice(&cacheName),
   )
 
   // The cache file is read and decoded while the sources load.
@@ -11831,8 +11837,49 @@ effect fn checkOne(
     }
     return replayed
   }
-  let settings = unitSettings(packages, List<ProjectPlan>.length(&plans))
+  // The package's tasks program, checked for this machine as `silk task` builds it. It goes first
+  // so the package's own last check can still answer from a check server.
+  let tasks = run Path.join(Projects.sourceRoot(project), "tasks.silk")
+  let mut tasksPlan = Option<ProjectPlan>.none()
+  if run FileSystem.exists(&tasks) {
+    let mut host = ProjectCommands.options()
+    host.standardLibrary = run copyOption(&options.standardLibrary)
+    host.clang = run copyOption(&options.clang)
+    if let Option<List<ProjectPlan>>.Some { value: hostPlans } = move run projectPlans(&host) {
+      let mut found = move hostPlans
+      if found.length() > usize.ZERO {
+        let mut plan = found.remove(usize.ZERO)
+        plan.input.artifact = Option<Bytes>.some(run Bytes.copy(b"executable"))
+        plan.entry = Option<Path>.some(move tasks)
+        plan.task = true
+        tasksPlan = Option<ProjectPlan>.some(move plan)
+      }
+    }
+  }
+  let mut checks = List<ProjectPlan>.length(&plans)
+  if tasksPlan.isSome() {
+    checks = checks + usize.ONE
+  }
+  let settings = unitSettings(packages, checks)
   let mut attempts = List<ProjectArtifact>.make()
+  if let Option<ProjectPlan>.Some { value: plan } = move tasksPlan {
+    run List<ProjectArtifact>.append(
+      &mut attempts,
+      run checkTarget(
+        project,
+        move plan,
+        standardLibrary,
+        json,
+        roots,
+        false,
+        false,
+        &settings,
+        compiler,
+        options.ignoreWarnings,
+        &mut snapshot.*,
+      ),
+    )
+  }
   while List<ProjectPlan>.length(&plans) > usize.ZERO {
     let plan = List<ProjectPlan>.remove(&mut plans, usize.ZERO)
     let abandon = last && List<ProjectPlan>.length(&plans) == usize.ZERO
@@ -13242,10 +13289,23 @@ effect fn taskAlias(working: &Path, name: &[u8], arguments: &[Bytes]) -> Option<
     if same(word, b"--") {
       literal = true
     }
+    // The compiler's own options stay with the compiler, so a tasks program reads only its own;
+    // the compilations its graph runs honor them through the environment `tasksEnvironment` sets.
     let selection = same(word, b"--manifest-path") || same(word, b"--stdlib")
       || same(word, b"--clang")
       || same(word, b"--package")
       || same(word, b"-p")
+      || same(word, b"--backend")
+      || same(word, b"--progress")
+    let switch = same(word, b"--workspace") || same(word, b"--quiet") || same(word, b"-q")
+      || same(word, b"--timings")
+      || same(word, b"--ignore-warnings")
+      || selects(word, b"--manifest-path=")
+      || selects(word, b"--stdlib=")
+      || selects(word, b"--clang=")
+      || selects(word, b"--package=")
+      || selects(word, b"--backend=")
+      || selects(word, b"--progress=")
     if !literal && selection {
       if at + 1 >= arguments.length {
         return Option<i32>.none()
@@ -13253,7 +13313,7 @@ effect fn taskAlias(working: &Path, name: &[u8], arguments: &[Bytes]) -> Option<
       run own.append(run Bytes.copy(word))
       run own.append(run Bytes.copy(arguments[at + 1].asSlice()))
       at = at + 2
-    } else if !literal && same(word, b"--workspace") {
+    } else if !literal && switch {
       run own.append(run Bytes.copy(word))
       at = at + 1
     } else {
@@ -13618,6 +13678,23 @@ effect fn tasksEnvironment(working: &Path, project: &Project, options: &ProjectO
   }
   if let Option<Bytes>.Some { value } = move run clangFor(working, &options.clang) {
     prepared = prepared && run ProcessImage.setVariable(b"SILK_CLANG", value.asSlice())
+  }
+
+  // The compiler's own options, for the compilations the tasks program's graph runs.
+  if let Option<Bytes>.Some { value } = &options.backend {
+    prepared = prepared && run ProcessImage.setVariable(b"SILK_BACKEND", value.asSlice())
+  }
+  if let Option<Bytes>.Some { value } = &options.progress {
+    prepared = prepared && run ProcessImage.setVariable(b"SILK_PROGRESS", value.asSlice())
+  }
+  if options.quiet {
+    prepared = prepared && run ProcessImage.setVariable(b"SILK_QUIET", b"1")
+  }
+  if options.timings {
+    prepared = prepared && run ProcessImage.setVariable(b"SILK_TIMINGS", b"1")
+  }
+  if options.ignoreWarnings {
+    prepared = prepared && run ProcessImage.setVariable(b"SILK_IGNORE_WARNINGS", b"1")
   }
   if !prepared {
     run writeError(b"silk: cannot set the tasks program's environment\n")
@@ -16068,18 +16145,26 @@ effect fn compileRequest(working: &Path, file: &Bytes, ignoreWarnings: bool, rep
     Stage.Final
   }
   let supply = run requestSupply(&request)
+
+  // A tasks program's graph runs this for `silk build`, which passes its own options through the
+  // environment (`tasksEnvironment`).
+  let warningsIgnored = ignoreWarnings || run environmentSwitch(b"SILK_IGNORE_WARNINGS")
+  let mut shown = reported
+  if let Option<Bytes>.Some { value } = move run HostInput.variableNamed("SILK_PROGRESS") {
+    if same(value.asSlice(), b"never") { shown = false }
+  }
   let mut progress = Progress.off()
-  if reported {
+  if shown {
     // A build graph shows these lines once the compilation ends, so they are never redrawn.
     let settings = ProgressSettings {
       display: ProgressDisplay.Plain,
       color: false,
       width: 80,
-      quiet: false,
+      quiet: run environmentSwitch(b"SILK_QUIET"),
       compact: false,
       position: 0,
       units: usize.ONE,
-      timings: false,
+      timings: run environmentSwitch(b"SILK_TIMINGS"),
       costs: false,
     }
     let mut detail = run Bytes.copy(String.ownedUtf8Bytes(&request.profile.target))
@@ -16126,7 +16211,7 @@ effect fn compileRequest(working: &Path, file: &Bytes, ignoreWarnings: bool, rep
     &mut progress,
     &mut warned,
     MirListing.Off,
-    ignoreWarnings,
+    warningsIgnored,
     true,
     Option<&CompilationRequest>.some(&request),
     false,
@@ -16141,6 +16226,16 @@ effect fn compileRequest(working: &Path, file: &Bytes, ignoreWarnings: bool, rep
     run Progress.finish(&mut progress, String.ownedUtf8Bytes(&request.name), false)
   }
   return status
+}
+
+// Whether the environment variable `name` is `1`.
+effect fn environmentSwitch(name: &[u8]) -> bool
+  ! HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator {
+  return match move run HostInput.variable(name) {
+    Option<Bytes>.Some { value } => same(value.asSlice(), b"1")
+    Option<Bytes>.None => false
+  }
 }
 
 // A definition spells its paths as its author's host does, such as `D:\\work\\main.silk`. The request
@@ -16236,6 +16331,15 @@ effect fn resolveDefinition(working: &Path, command: ProjectCommands.Resolve) ->
   }
   let mut converted = move definition
   run definitionPaths(working, &mut converted)
+
+  // `silk build --backend` reaches a tasks program's compilations here, unless the graph chose one.
+  if converted.settings.profile.backend.isNone() {
+    if let Option<Bytes>.Some { value } = move run HostInput.variableNamed("SILK_BACKEND") {
+      if value.length() > usize.ZERO {
+        converted.settings.profile.backend = Option<String>.some(run RequestText.copy(value.asSlice()))
+      }
+    }
+  }
   let output = run pathArgument(working, command.output.asSlice())
   let artifact = match move command.artifact {
     Option<Bytes>.Some { value } => Option<Path>.some(run pathArgument(working, value.asSlice()))

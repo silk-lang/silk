@@ -424,6 +424,19 @@ pub effect fn environment(self: &mut Self, name: string) -> ()
 
 Declares an environment variable. Its presence and value enter the key and the child environment.
 
+<a id="Key.impl.passEnvironment"></a>
+
+### Method `passEnvironment`
+
+```silk
+pub effect fn passEnvironment(self: &mut Self, name: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Passes an environment variable to the child process without adding it to the key, for a
+setting that changes only what the process reports, such as its progress display.
+
 <a id="Key.impl.always"></a>
 
 ### Method `always`
