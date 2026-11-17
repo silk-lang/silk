@@ -7,6 +7,7 @@ import * as Console from 'effect/Console'
 import * as Effect from 'effect/Effect'
 import * as FileSystem from 'effect/FileSystem'
 import * as NativeProcess from './NativeProcess.ts'
+import * as CompilationBuild from './CompilationBuild.ts'
 
 const program = Effect.gen(function* () {
   const [compilerArg, clangArg] = process.argv.slice(2)
@@ -21,9 +22,10 @@ const program = Effect.gen(function* () {
   yield* fs.copyFile(join(fixture, 'c/struct_values.c'), join(directory, 'struct_values.c'))
   yield* fs.writeFileString(
     join(directory, 'silk.toml'),
-    '[package]\nname = "c-aggregate-conformance"\nversion = "0.1.0"\nsource = "."\n' +
-      '[native]\nlink = [{ object = "struct_values.o" }]\n',
+    '[package]\nname = "c-aggregate-conformance"\nversion = "0.1.0"\nsource = "."\n',
   )
+  yield* fs.writeFileString(join(directory, 'build.silk'),
+    'import silk.build.plan { Plan }\nimport silk.build.step { sourcePath }\npub const PLAN: Plan = Plan.linkObject(Plan.empty(), sourcePath("struct_values.o"))\n')
   const invoke = Effect.fnUntraced(function* (command: string, args: ReadonlyArray<string>) {
     const result = yield* NativeProcess.execute(command, args, {
       cwd: directory,
@@ -45,21 +47,12 @@ const program = Effect.gen(function* () {
       '-o',
       'struct_values.o',
     ])
-    yield* invoke(compiler, [
-      'build',
-      'main.silk',
-      '-o',
-      'program.wasm',
-      '--target',
-      'wasm32-unknown-unknown',
-      '--stdlib',
-      join(repo, 'stdlib'),
-      '--optimization',
-      profile.optimization,
-      '--debug',
-      profile.debug,
-    ])
-    const bytes = yield* fs.readFile(join(directory, 'program.wasm'))
+    const output = join(directory, `program-${profile.name}.wasm`)
+    const commands = yield* CompilationBuild.prepare({ compiler, manifest: join(directory, 'silk.toml'),
+      output, stdlib: join(repo, 'stdlib'), target: 'wasm32-unknown-unknown',
+      optimization: profile.optimization, debug: profile.debug === 'true', emit: 'final' })
+    for (const args of commands) yield* invoke(compiler, args)
+    const bytes = yield* fs.readFile(output)
     yield* Effect.try(() => {
       const module = new WebAssembly.Module(bytes)
       assert.deepEqual(WebAssembly.Module.imports(module), [])
@@ -77,9 +70,14 @@ const program = Effect.gen(function* () {
   const variadic = join(repo, 'corpus/native/foreign-variadic-scalars')
   yield* fs.copyFile(join(variadic, 'main.silk'), join(directory, 'variadic.silk'))
   yield* fs.copyFile(join(variadic, 'c/silk_test_variadic_scalars.c'), join(directory, 'variadic.c'))
-  // The manifest links `struct_values.o`, so the variadic C object takes that name.
+  // The typed package plan links `struct_values.o`, so the variadic C object takes that name.
   yield* invoke(clang, ['--target=wasm32-unknown-unknown', '-ffreestanding', '-O2', '-c', 'variadic.c', '-o', 'struct_values.o'])
-  yield* invoke(compiler, ['build', 'variadic.silk', '-o', 'variadic.wasm', '--target', 'wasm32-unknown-unknown', '--stdlib', join(repo, 'stdlib')])
+  yield* fs.writeFileString(join(directory, 'silk.toml'),
+    '[package]\nname = "c-variadic-conformance"\nversion = "0.1.0"\nsource = "."\nmain = "variadic.silk"\n')
+  const variadicCommands = yield* CompilationBuild.prepare({ compiler, manifest: join(directory, 'silk.toml'),
+    output: join(directory, 'variadic.wasm'), stdlib: join(repo, 'stdlib'), target: 'wasm32-unknown-unknown',
+    optimization: 'none', debug: true, emit: 'final' })
+  for (const args of variadicCommands) yield* invoke(compiler, args)
   const variadicBytes = yield* fs.readFile(join(directory, 'variadic.wasm'))
   yield* Effect.try(() => {
     const instance = new WebAssembly.Instance(new WebAssembly.Module(variadicBytes), {})

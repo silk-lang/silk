@@ -5,6 +5,7 @@ compiler=$1
 out=$2
 repo=$PWD
 clang=${SILK_TEST_CLANG:-clang}
+export SILK_CLANG="$clang"
 mkdir -p "$out/package/src"
 out=$(cd "$out" && pwd)
 cp "$repo/compiler/fixtures/windows-filesystem/provider.silk" "$out/package/src/main.silk"
@@ -21,15 +22,17 @@ cat > "$out/package/silk.toml" <<'MANIFEST'
 name = "windows-filesystem-contract"
 version = "0.0.0"
 silk-version = "0.0.0"
-
-[native]
-link = [
-  { object = "contract.obj" },
-  { static-archive = "fixture-kernel32.lib" },
-]
 MANIFEST
-"$compiler" build "$out/package/src/main.silk" -o "$out/provider.exe" --target x86_64-pc-windows-msvc \
-  --stdlib "$repo/stdlib" --clang "$clang" --optimization none --debug false \
+cat > "$out/package/build.silk" <<'PLAN'
+import silk.build.plan { Plan }
+import silk.build.step { sourcePath }
+pub const PLAN: Plan = Plan.empty()
+  |> Plan.linkObject(sourcePath("contract.obj"))
+  |> Plan.linkArchive(sourcePath("fixture-kernel32.lib"))
+PLAN
+node compiler/scripts/CompilationBuild.ts --compiler "$compiler" --manifest "$out/package/silk.toml" \
+  --output "$out/provider.exe" --target x86_64-pc-windows-msvc \
+  --stdlib "$repo/stdlib" --optimization none --debug false \
   > "$out/provider-build.log" 2>&1 || { cat "$out/provider-build.log"; exit 1; }
 llvm-readobj --file-headers --coff-imports "$out/provider.exe" > "$out/provider-pe.txt"
 grep -q 'IMAGE_FILE_MACHINE_AMD64' "$out/provider-pe.txt"
@@ -40,8 +43,9 @@ if grep -i 'Name: .*\.dll' "$out/provider-pe.txt" | grep -viE 'Name: (kernel32|n
   exit 1
 fi
 cp "$repo/compiler/fixtures/windows-filesystem/unc-provider.silk" "$out/package/src/main.silk"
-"$compiler" build "$out/package/src/main.silk" -o "$out/unc-provider.exe" --target x86_64-pc-windows-msvc \
-  --stdlib "$repo/stdlib" --clang "$clang" --optimization none --debug false \
+node compiler/scripts/CompilationBuild.ts --compiler "$compiler" --manifest "$out/package/silk.toml" \
+  --output "$out/unc-provider.exe" --target x86_64-pc-windows-msvc \
+  --stdlib "$repo/stdlib" --optimization none --debug false \
   > "$out/unc-provider-build.log" 2>&1 || { cat "$out/unc-provider-build.log"; exit 1; }
 llvm-readobj --file-headers --coff-imports "$out/unc-provider.exe" > "$out/unc-provider-pe.txt"
 if grep -i 'Name: .*\.dll' "$out/unc-provider-pe.txt" | grep -viE 'Name: (kernel32|ntdll)\.dll'; then

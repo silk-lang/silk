@@ -286,6 +286,18 @@ space for four elements, and each later growth doubles the capacity.
 - `OutOfMemoryError` if the `Allocator` cannot supply the new storage. The list does not
   change.
 
+<a id="List.impl.appendList"></a>
+
+### Method `appendList`
+
+```silk
+pub effect fn appendList(self: &mut Self, other: Self) -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Moves every element of `other` to the end of this list, preserving order.
+Elements need not implement `Copy`. The consumed list releases its empty storage.
+If reserving space fails, this list is unchanged and `other` drops its elements.
+
 <a id="List.impl.appendWithinCapacity"></a>
 
 ### Method `appendWithinCapacity`

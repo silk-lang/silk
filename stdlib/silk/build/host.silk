@@ -1,0 +1,274 @@
+//! The compiler's side of a described build graph: restore it, run it and answer what it made.
+
+import silk.build.context as Context
+import silk.build.delegate as Delegate {
+  ArtifactDescription,
+  CompiledDescription,
+  GraphDescription,
+  OutputDescription,
+  Outcome
+}
+import silk.build.encoding as Encoding
+import silk.build.graph { Build, BuildError }
+import silk.build.standard as Standard
+import silk.build.step { Runner, StepError, StepHandle }
+import silk.cli.task as Tasks
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.concurrency.fiber { Cancelled }
+import silk.concurrency.thread_native { SpawnError }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.io.writer { Writer, WriterError }
+import silk.mem.allocator { Allocator, OutOfMemoryError, SystemAllocator }
+import silk.schema.issue { SchemaError }
+import silk.schema.json { SchemaJson }
+import silk.system.child_process { ProcessError }
+import silk.system.filesystem { AtomicWriteError, FileError, FileSystem, Path }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.text.format { Debug, Format }
+import silk.text.string { String, InvalidUtf8 }
+import silk.num.usize
+import silk.num.u64
+
+// Runs the described steps and answers where each left its outputs.
+effect fn ran(description: &GraphDescription) -> Outcome
+  ! BuildError
+  ? &mut Allocator | &mut FileSystem | &mut HostInput {
+  let identity = match &description.identity {
+    Option<String>.Some { value } => run Delegate.binary(value.view())
+    Option<String>.None => {
+      fail StepError { message: run String.copy("a described graph needs an identity") }
+    }
+  }
+  let cache = match &description.cache {
+    Option<String>.Some { value } => run Path.make(value.view())
+    Option<String>.None => {
+      fail StepError { message: run String.copy("a described graph needs a step cache") }
+    }
+  }
+  let links = run StepHandle.restoreAll(description.steps.asSlice())
+  run Standard.restoreLinks(links.asSlice())
+  let described = description.steps.asSlice()
+  let mut identities = List<usize>.make()
+  let mut at = usize.ZERO
+  while at < described.length {
+    match move StepHandle.linked(links.asSlice(), described[at].node) {
+      Option<StepHandle>.Some { value } => run identities.append(value.identity())
+      Option<StepHandle>.None => run identities.append(usize.ZERO)
+    }
+    at = at + usize.ONE
+  }
+  let mut targets = List<StepHandle>.make()
+  let roots = description.roots.asSlice()
+  at = usize.ZERO
+  while at < roots.length {
+    match move StepHandle.linked(links.asSlice(), roots[at].node) {
+      Option<StepHandle>.Some { value } => run targets.append(move value)
+      Option<StepHandle>.None => {
+        fail StepError { message: run String.copy("a described root names no step") }
+      }
+    }
+    at = at + usize.ONE
+  }
+  let made = run Runner.make(run Path.make(description.root.view()), move cache, identity.asSlice())
+  let runner = move made
+    |> Runner.memory(description.memory)
+    |> Runner.parallelism(u64.toUsize(description.workers))
+    |> Runner.linking(move links)
+  let execution = run runner.execute(targets.asSlice(), description.compile)
+  let mut outputs = List<OutputDescription>.make()
+  let steps = execution.steps.asSlice()
+  let known = identities.asSlice()
+  at = usize.ZERO
+  while at < steps.length {
+    let mut node = usize.ZERO
+    while node < known.length {
+      if known[node] == steps[at].identity {
+        run outputs.append(
+          OutputDescription {
+            node: described[node].node,
+            directory: run Context.text(&steps[at].directory),
+            volatile: steps[at].volatile,
+            compilation: steps[at].compilation,
+            compiled: steps[at].compiled,
+          },
+        )
+      }
+      node = node + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  let mut compilations = List<CompiledDescription>.make()
+  let reached = execution.compilations.asSlice()
+  at = usize.ZERO
+  while at < reached.length {
+    run compilations.append(
+      CompiledDescription {
+        directory: run Context.text(&reached[at].directory),
+        compiled: reached[at].compiled,
+      },
+    )
+    at = at + usize.ONE
+  }
+  return Outcome {
+    error: Option<String>.none(),
+    artifacts: List<ArtifactDescription>.make(),
+    outputs: move outputs,
+    compilations: move compilations,
+  }
+}
+
+effect fn performed(description: GraphDescription) -> Outcome
+  ! BuildError
+  ? &mut Allocator | &mut FileSystem | &mut HostInput {
+  if !description.publish {
+    return run ran(&description)
+  }
+  let compile = description.compile
+  let build = run Build.restore(&description)
+  let built = run build.perform(compile)
+  return run built.outcome()
+}
+
+struct Line {
+  bytes: Bytes,
+  allocator: SystemAllocator,
+}
+
+impl Writer for Line {
+  effect fn writeAll(self: &mut Self, bytes: &[u8]) -> ()
+    ! WriterError
+    ? &mut Writer {
+    let appended = run Effect.result(
+      Bytes.append(&mut self.bytes, bytes) |> Effect.provideMut<Allocator>(&mut self.allocator),
+    )
+    match move appended {
+      Result<(), OutOfMemoryError>.Success { .. } => ()
+      Result<(), OutOfMemoryError>.Failure { .. } => {
+        fail Writer.failure()
+      }
+    }
+  }
+
+  effect fn flush(self: &mut Self) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return ()
+  }
+}
+
+effect fn shown<T: Debug>(failure: &T) -> Bytes {
+  let mut line = Line { bytes: Bytes.make(), allocator: Allocator.systemAllocatorProvider() }
+  let written = run Effect.result(Format.debug(failure) |> Effect.provideMut<Writer>(&mut line))
+  match move written {
+    Result<(), WriterError>.Success { .. } => ()
+    Result<(), WriterError>.Failure { error } => {
+      drop error
+    }
+  }
+  return move line.bytes
+}
+
+// The line a task program reports for a failure, as `silk.cli.task.Task.main` writes it.
+effect fn reported(error: BuildError) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match move error {
+    StepError failure => run Bytes.copy(String.ownedUtf8Bytes(&failure.message))
+    AtomicWriteError failure => run shown(&failure)
+    SchemaError failure => run shown(&failure)
+    SpawnError failure => run shown(&failure)
+    Cancelled failure => run shown(&failure)
+    ProcessError failure => {
+      drop failure
+      run Bytes.copy(b"a program could not be run")
+    }
+    FileError failure => {
+      let mut line = run Bytes.copy(b"could not ")
+      run Bytes.append(&mut line, Tasks.fileAction(failure.operation.code))
+      run Bytes.append(&mut line, b": ")
+      run Bytes.append(&mut line, Tasks.fileReason(failure.reason.code))
+      move line
+    }
+    HostInputError failure => {
+      drop failure
+      run Bytes.copy(b"the command line or the environment could not be read")
+    }
+    WriterError failure => {
+      drop failure
+      run Bytes.copy(b"the build graph could not write its output")
+    }
+    OutOfMemoryError exhausted => {
+      fail move exhausted
+    }
+  }
+}
+
+effect fn served(description: &Path, outcome: &Path) -> List<String>
+  ! BuildError
+  ? &mut Allocator | &mut FileSystem | &mut HostInput {
+  let bytes = run FileSystem.readFile(description)
+  let graph = run SchemaJson.decode<GraphDescription>(bytes.asSlice())
+  let compiles = graph.compile && graph.publish
+  let answer = match move run Effect.result(performed(move graph)) {
+    Result<Outcome, BuildError>.Success { value } => move value
+    Result<Outcome, BuildError>.Failure { error } => {
+      let line = run reported(move error)
+      let text = match move run String.copyUtf8(line.asSlice()) {
+        Result<String, InvalidUtf8>.Success { value } => move value
+        Result<String, InvalidUtf8>.Failure { .. } => run String.copy("the build graph failed")
+      }
+      Outcome {
+        error: Option<String>.some(move text),
+        artifacts: List<ArtifactDescription>.make(),
+        outputs: List<OutputDescription>.make(),
+        compilations: List<CompiledDescription>.make(),
+      }
+    }
+  }
+  let encoded = run Encoding.json<Outcome>(&answer)
+  run FileSystem.writeFileAtomic(
+    outcome,
+    encoded.asSlice(),
+    FileSystem.replaceExisting(),
+    FileSystem.buffered(),
+  )
+  let mut made = List<String>.make()
+  let artifacts = answer.artifacts.asSlice()
+  let mut at = usize.ZERO
+  while compiles && at < artifacts.length {
+    if artifacts[at].request.isSome() {
+      run made.append(run String.copy(artifacts[at].path.view()))
+    }
+    at = at + usize.ONE
+  }
+  return move made
+}
+
+/// What serving a described graph answers to the compiler's command line.
+pub struct Served {
+  /// The process status: 0 once an outcome is written, even one that reports a failure.
+  pub status: i32,
+  /// The artifacts the graph compiled and published.
+  pub artifacts: List<String>,
+}
+
+/// Runs the graph described in the file `description` and writes its outcome to `outcome`.
+pub effect fn serve(description: &Path, outcome: &Path) -> Served
+  ! OutOfMemoryError
+  ? &mut Allocator | &mut FileSystem | &mut HostInput {
+  return match move run Effect.result(served(description, outcome)) {
+    Result<List<String>, BuildError>.Success { value } => Served {
+      status: 0,
+      artifacts: move value,
+    }
+    Result<List<String>, BuildError>.Failure { error } => match move error {
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+      _ => Served { status: 1, artifacts: List<String>.make() }
+    }
+  }
+}

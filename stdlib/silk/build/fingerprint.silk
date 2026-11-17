@@ -1,0 +1,357 @@
+//! Deterministic content fingerprints for build inputs and completed output trees.
+
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.system.host_path as HostPath
+import silk.crypto.sha2 { Sha256 }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.filesystem { DirectoryInfo, FileError, FileInfo, FileSystem, Path }
+import silk.text.string { String }
+import silk.num.u8
+import silk.num.u64
+import silk.num.usize
+import silk.num.i64
+import silk.num.u32
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+
+static if Intrinsic.targetOperatingSystem() == "linux"
+  || Intrinsic.targetOperatingSystem() == "darwin" {
+  import silk.platform.native.file { FileStatus, NativeFile, NativeFileError }
+
+  // A file's status as the system reports it. Any write, replacement or metadata change moves
+  // at least one of these fields.
+  effect fn status(path: &Path) -> FileStatus
+    ! FileError {
+    return match move run Effect.result(NativeFile.status(Path.rawBytes(path), true)) {
+      Result<FileStatus, NativeFileError>.Success { value } => value
+      Result<FileStatus, NativeFileError>.Failure { error } => {
+        fail FileSystem.errorWithCode(FileSystem.statOperation(), FileSystem.other(), error.code)
+      }
+    }
+  }
+
+  fn number(hash: &mut Sha256, value: u64) -> () {
+    let mut rest = value
+    let mut at = usize.ZERO
+    let mut bytes: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0]
+    while at < 8 {
+      bytes[at] = u64.toU8(rest % 256)
+      rest = rest / 256
+      at = at + usize.ONE
+    }
+    hash.update(&bytes)
+  }
+
+  // Adds a file's status in place of its contents and raises `newest` to its latest change.
+  effect fn stamp(hash: &mut Sha256, path: &Path, newest: &mut i64) -> ()
+    ! FileError {
+    let found = run status(path)
+    number(&mut hash, found.device)
+    number(&mut hash, found.inode)
+    number(&mut hash, found.size)
+    number(&mut hash, i64.wrappingToU64(found.modified.seconds))
+    number(&mut hash, u32.toU64(found.modified.nanoseconds))
+    number(&mut hash, i64.wrappingToU64(found.changed.seconds))
+    number(&mut hash, u32.toU64(found.changed.nanoseconds))
+    if found.modified.seconds > newest.* {
+      newest.* = found.modified.seconds
+    }
+    if found.changed.seconds > newest.* {
+      newest.* = found.changed.seconds
+    }
+  }
+
+  // The digest recorded for this exact tree status, when the record is safely newer than every
+  // file it covers. A record written within the same clock tick as a change cannot tell a later
+  // write in that tick apart, so it is not trusted.
+  effect fn recalled(record: &Path, newest: i64) -> Option<Bytes>
+    ! FileError | OutOfMemoryError
+    ? &mut FileSystem | &mut Allocator {
+    if !run FileSystem.exists(record) {
+      return Option<Bytes>.none()
+    }
+    let written = run status(record)
+    if written.modified.seconds <= newest + 1 {
+      return Option<Bytes>.none()
+    }
+    let bytes = run FileSystem.readFile(record)
+    if bytes.length() != 32 {
+      return Option<Bytes>.none()
+    }
+    return Option<Bytes>.some(move bytes)
+  }
+}
+
+/// Adds a length-delimited byte string to a SHA-256 stream.
+pub fn field(hash: &mut Sha256, bytes: &[u8]) -> () {
+  let mut length = usize.toU64(bytes.length)
+  let mut at = usize.ZERO
+  let mut prefix: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0]
+  while at < 8 {
+    prefix[at] = u64.toU8(length % 256)
+    length = length / 256
+    at = at + usize.ONE
+  }
+  hash.update(&prefix)
+  hash.update(bytes)
+}
+
+/// Converts a digest into the lowercase hexadecimal directory name used by the build cache.
+pub effect fn name(digest: &[u8; 32]) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let digits = "0123456789abcdef"
+  let bytes = String.utf8Bytes(digits)
+  let mut output = Bytes.make()
+  let mut at = usize.ZERO
+  while at < 32 {
+    let value = u8.toUsize(digest[at])
+    run output.append(&[bytes[value / 16], bytes[value % 16]])
+    at = at + usize.ONE
+  }
+  return unsafe String.fromBytesUnchecked(move output)
+}
+
+/// Hashes file contents or a sorted tree, including names and empty directories.
+/// Symbolic links within the declared root are followed; escaping links and cycles are refused.
+/// `completion` excludes the root cache marker when verifying completed outputs.
+pub effect fn path(hash: &mut Sha256, input: &Path, completion: bool) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let root = run canonical(input)
+  let mut ancestors = List<Bytes>.make()
+  let mut newest: i64 = 0
+  return run visit(
+    &mut hash,
+    input,
+    completion,
+    false,
+    Option<&Path>.none(),
+    &root,
+    &mut ancestors,
+    false,
+    &mut newest,
+  )
+}
+
+/// Adds the digest [`path`] computes for `input`, reading file contents only when a file's status
+/// changed since the digest was recorded under `records`.
+///
+/// The record is named by the status of every file in the tree: device, inode, size, modification
+/// time and status-change time. A changed, replaced or touched file therefore selects a different
+/// record and is read again. A host without file status reads the contents every time.
+pub effect fn recorded(hash: &mut Sha256, input: &Path, completion: bool, records: &Path) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  return run remembered(&mut hash, input, completion, false, Option<&Path>.none(), records)
+}
+
+/// Adds the digest [`package`] computes for `input`, recorded as [`recorded`] describes.
+pub effect fn recordedPackage(hash: &mut Sha256, input: &Path, output: &Path, records: &Path) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  return run remembered(&mut hash, input, false, true, Option<&Path>.some(output), records)
+}
+
+effect fn remembered(
+  hash: &mut Sha256,
+  input: &Path,
+  completion: bool,
+  package: bool,
+  output: Option<&Path>,
+  records: &Path,
+) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let root = run canonical(input)
+  field(&mut hash, b"recorded")
+  static if Intrinsic.targetOperatingSystem() == "linux"
+    || Intrinsic.targetOperatingSystem() == "darwin" {
+    let mut status = Sha256.make()
+    field(&mut status, b"silk-build-status-v1")
+    let mut newest: i64 = 0
+    let mut walked = List<Bytes>.make()
+    run visit(
+      &mut status,
+      input,
+      completion,
+      package,
+      output,
+      &root,
+      &mut walked,
+      true,
+      &mut newest,
+    )
+    let key = status.finish()
+    let record = run Path.join(records, (run name(&key)).view())
+    if let Option<Bytes>.Some { value } = move run recalled(&record, newest) {
+      field(&mut hash, value.asSlice())
+      return ()
+    }
+    let mut contents = Sha256.make()
+    let mut ancestors = List<Bytes>.make()
+    run visit(
+      &mut contents,
+      input,
+      completion,
+      package,
+      output,
+      &root,
+      &mut ancestors,
+      false,
+      &mut newest,
+    )
+    let digest = contents.finish()
+    run FileSystem.createDirectoriesRecursively(records)
+    run FileSystem.writeFile(&record, &digest)
+    field(&mut hash, &digest)
+  } else {
+    let mut contents = Sha256.make()
+    let mut ancestors = List<Bytes>.make()
+    let mut newest: i64 = 0
+    run visit(
+      &mut contents,
+      input,
+      completion,
+      package,
+      output,
+      &root,
+      &mut ancestors,
+      false,
+      &mut newest,
+    )
+    let digest = contents.finish()
+    field(&mut hash, &digest)
+  }
+}
+
+/// Hashes package files, excluding build outputs and version-control metadata at package roots.
+/// `output` is the current workspace output directory, excluded at any depth.
+pub effect fn package(hash: &mut Sha256, input: &Path, output: &Path) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let root = run canonical(input)
+  let mut ancestors = List<Bytes>.make()
+  let mut newest: i64 = 0
+  return run visit(
+    &mut hash,
+    input,
+    false,
+    true,
+    Option<&Path>.some(output),
+    &root,
+    &mut ancestors,
+    false,
+    &mut newest,
+  )
+}
+
+effect fn visit(
+  hash: &mut Sha256,
+  input: &Path,
+  completion: bool,
+  package: bool,
+  output: Option<&Path>,
+  root: &Bytes,
+  ancestors: &mut List<Bytes>,
+  status: bool,
+  newest: &mut i64,
+) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let real = run canonical(input)
+  let base = root.asSlice()
+  let current = real.asSlice()
+  let mut prefix: usize = 0
+  while prefix < base.length && prefix < current.length && base[prefix] == current[prefix] {
+    prefix = prefix + 1
+  }
+  if prefix != base.length
+    || (current.length > base.length && base.length > 1 && current[base.length] != 47) {
+    fail FileSystem.error(FileSystem.pathOperation(), FileSystem.invalidPath())
+  }
+  let active = ancestors.asSlice()
+  let mut parent: usize = 0
+  while parent < active.length {
+    if active[parent].asSlice() == current {
+      fail FileSystem.error(FileSystem.pathOperation(), FileSystem.invalidPath())
+    }
+    parent = parent + 1
+  }
+  run ancestors.append(move real)
+  match move run FileSystem.stat(input) {
+    FileInfo _file => {
+      field(&mut hash, b"file")
+      if status {
+        static if Intrinsic.targetOperatingSystem() == "linux"
+          || Intrinsic.targetOperatingSystem() == "darwin" {
+          run stamp(&mut hash, input, &mut newest.*)
+        }
+      } else {
+        let contents = run FileSystem.readFile(input)
+        field(&mut hash, contents.asSlice())
+      }
+    }
+    DirectoryInfo _directory => {
+      field(&mut hash, b"directory")
+      let packageRoot = package
+        && (ancestors.length() == 1 || run FileSystem.exists(&run Path.join(input, "silk.toml")))
+      let entries = run FileSystem.listDirectory(input)
+      let children = entries.asSlice()
+      let mut names = List<string>.make()
+      let mut at = usize.ZERO
+      while at < children.length {
+        let child = match move Path.name(&children[at].path) {
+          Option<string>.Some { value } => value
+          Option<string>.None => {
+            fail FileSystem.error(FileSystem.pathOperation(), FileSystem.invalidPath())
+          }
+        }
+        let excluded = match output {
+          Option<&Path>.Some { value } => Path.rawBytes(value) == Path.rawBytes(&children[at].path)
+          Option<&Path>.None => false
+        }
+        if !excluded && (!completion || child != ".complete")
+          && (!packageRoot || (child != "build" && child != ".git")) {
+          run names.append(child)
+        }
+        at = at + usize.ONE
+      }
+      run names.sort()
+      let ordered = names.asSlice()
+      at = usize.ZERO
+      while at < ordered.length {
+        field(&mut hash, String.utf8Bytes(ordered[at]))
+        let child = run Path.join(input, ordered[at])
+        run visit(
+          &mut hash,
+          &child,
+          false,
+          package,
+          output,
+          root,
+          &mut ancestors.*,
+          status,
+          &mut newest.*,
+        )
+        at = at + usize.ONE
+      }
+      field(&mut hash, b"end")
+    }
+  }
+  let last = ancestors.length() - 1
+  drop ancestors.remove(last)
+}
+
+effect fn canonical(path: &Path) -> Bytes
+  ! FileError | OutOfMemoryError
+  ? &mut Allocator {
+  return match move run HostPath.canonicalBytes(Path.rawBytes(path)) {
+    Option<Bytes>.Some { value } => move value
+    Option<Bytes>.None => {
+      fail FileSystem.error(FileSystem.pathOperation(), FileSystem.invalidPath())
+    }
+  }
+}

@@ -342,11 +342,13 @@ each thread a 1 MiB stack from the allocator before the thread runs, and `JoinHa
 `Atomic.wait` block with `memory.atomic.wait32`. `NativeThread.processorCount` asks the host
 through `silk.concurrency.thread-parallelism`.
 
+The resolved compilation request carries these fields:
+
 ```toml
-[profiles.web]
+[profile]
 target = "wasm32-unknown-unknown"
 threading = "multi"
-max-memory = "256MiB"
+max-memory = 268435456
 ```
 
 The standard library ships a host for Node and browsers in `stdlib/host/wasm-runner.mjs`.

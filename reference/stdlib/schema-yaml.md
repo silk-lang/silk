@@ -450,6 +450,14 @@ effect fn member(self: &mut Self, key: string) -> bool ! Issue | OutOfMemoryErro
 Finds the member `key` of the mapping and leaves the reader at its value. A missing key leaves
 the start of the mapping as the last span.
 
+<a id="YamlSchemaReader.impl.SchemaReader.nextMember"></a>
+
+### Operation `nextMember`
+
+```silk
+effect fn nextMember(self: &mut Self) -> Option<String> ! Issue | OutOfMemoryError ? &mut Allocator
+```
+
 <a id="YamlSchemaReader.impl.SchemaReader.rejectUnread"></a>
 
 ### Operation `rejectUnread`

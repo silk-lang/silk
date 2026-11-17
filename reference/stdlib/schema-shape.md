@@ -710,6 +710,26 @@ pub element: ShapeRef
 
 Each element.
 
+<a id="Shape.Dictionary"></a>
+
+### `Dictionary`
+
+```silk
+Dictionary
+```
+
+An object whose arbitrary text keys all have the same value schema.
+
+<a id="Shape.Dictionary.value"></a>
+
+#### Field `value`
+
+```silk
+pub value: ShapeRef
+```
+
+The schema of each member's value.
+
 <a id="Shape.Object"></a>
 
 ### `Object`

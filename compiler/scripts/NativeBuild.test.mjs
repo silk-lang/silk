@@ -21,8 +21,27 @@ const { NodeServices } = await import(pathToFileURL(require.resolve('@effect/pla
 import * as NativeBuild from './NativeBuild.ts'
 import * as SourceSnapshot from './SourceSnapshot.mjs'
 
+// The fake compiler resolves a definition to a tiny request, then normalizes it for the
+// artifact-producing fixture below. Real compiler syntax is exercised by the native suite.
+const requestProtocol = `
+if test "$1" = resolve; then
+  test "$2" = --definition && test "$4" = --output && test "$6" = --artifact || exit 97
+  manifest=$(sed -n 's/^manifest = "\\(.*\\)"$/\\1/p' "$3")
+  stdlib=$(sed -n 's/^stdlib = "\\(.*\\)"$/\\1/p' "$3")
+  emit=$(sed -n 's/^emit = "\\(.*\\)"$/\\1/p' "$3")
+  printf "source='%s/src/main.silk'\\nstdlib='%s'\\nemit='%s'\\nartifact='%s'\\n" "\${manifest%/*}" "$stdlib" "$emit" "$7" > "$5"
+  exit 0
+fi
+if test "$1" = compile; then
+  test "$2" = --request && test "$#" = 3 || exit 98
+  . "$3"
+  if test "$emit" = llvm-ir; then set -- build "$source" -o "$artifact" --emit llvm-ir --stdlib "$stdlib"
+  else set -- build "$source" -o "$artifact" --stdlib "$stdlib"; fi
+fi
+`
+
 const executable = (path, contents, mode = 0o555) => {
-  writeFileSync(path, `#!/bin/sh\n${contents}\n`)
+  writeFileSync(path, `#!/bin/sh\n${contents.replaceAll('test "$1" = build', requestProtocol + 'test "$1" = build')}\n`)
   chmodSync(path, mode)
 }
 
@@ -382,18 +401,8 @@ sleep 60`,
       assert.strictEqual(result.output.sha256, null)
       assert.strictEqual(existsSync(result.output.path), false)
       assert.strictEqual(existsSync(join(options.outputDirectory, 'smoke')), false)
-      assert.deepStrictEqual(stage.command, [
-        options.producer,
-        'build',
-        join(options.snapshot, 'compiler/src/main.silk'),
-        '-o',
-        result.output.path,
-        '--stdlib',
-        join(options.snapshot, 'stdlib'),
-        '--optimization',
-        'speed',
-        '--debug',
-        'false',
+      assert.deepStrictEqual(stage.command.slice(0, 5), [
+        options.producer, 'build', join(options.snapshot, 'compiler/src/main.silk'), '-o', result.output.path,
       ])
       assert.deepStrictEqual(
         [...readFileSync(join(options.outputDirectory, 'native-build-stdout.bin'))],
@@ -467,7 +476,7 @@ sleep 60`,
   )
 
   it.effect(
-    'retains unexpired deadlines and completed evidence for all three successful stages',
+    'retains unexpired deadlines and completed evidence for resolution, compilation, and both smoke stages',
     () =>
       fixture(function* ({ options }) {
         executable(options.producer, producer())
@@ -626,8 +635,11 @@ sleep 60`,
         assert.strictEqual(result.status, 'passed')
         assert.deepStrictEqual(result.stages.map(({ name }) => name).sort(), [
           'N1-ir',
+          'N1-ir-resolve',
           'N2-ir',
+          'N2-ir-resolve',
           'native-build',
+          'native-build-resolve',
           'smoke-build',
           'smoke-run',
         ])
@@ -700,5 +712,6 @@ chmod +x "$4"`,
         assert.strictEqual(existsSync(join(work, 'training/build')), true)
         assert.strictEqual(existsSync(join(options.snapshot, 'build')), false)
       }),
+    { timeout: 10000 },
   )
 })

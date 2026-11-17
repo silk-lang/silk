@@ -30,13 +30,13 @@ function compilerOverview(main) {
 function toolTable(command) {
   const table = /^pub fn compilerCommands\(\) -> \[CompilerCommand; (\d+)\] \{\n  return \[\n([\s\S]*?)\n  \]/m.exec(command)
   assert.ok(table, 'tool/src/Command.silk has no compilerCommands table')
-  const entries = [...table[2].matchAll(/CompilerCommand \{ name: b"([^"]*)", summary: b"((?:[^"\\]|\\.)*)" \}/g)]
+  const entries = [...table[2].matchAll(/CompilerCommand\s*\{\s*name: b"([^"]*)",\s*summary: b"((?:[^"\\]|\\.)*)",?\s*\}/g)]
   assert.equal(entries.length, Number(table[1]))
   return entries.map(([, name, summary]) => ({ name, summary: summary.replaceAll("\\'", "'") }))
 }
 
 test('silk --help lists every compiler command with the compiler summary', () => {
   const compiler = compilerOverview(source('compiler/src/main.silk'))
-  assert.ok(compiler.some(({ name }) => name === 'debug') && compiler.some(({ name }) => name === 'generate'))
+  assert.ok(compiler.some(({ name }) => name === 'debug') && compiler.some(({ name }) => name === 'plan'))
   assert.deepEqual(toolTable(source('tool/src/Command.silk')), compiler)
 })

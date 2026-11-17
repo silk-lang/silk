@@ -441,6 +441,17 @@ The owner type of the parser. It has no fields and is never constructed.
 impl Cli
 ```
 
+<a id="Cli.impl.commands"></a>
+
+### Associated function `commands`
+
+```silk
+pub static fn commands<T: CommandLine>() -> string<'static>
+```
+
+Returns the command names of the root union `T`, in kebab case and each followed by a space,
+such as `"codegen release "`. Returns `""` when `T` is not a union.
+
 <a id="Cli.impl.parse"></a>
 
 ### Associated function `parse`
