@@ -90,6 +90,25 @@ const program = Effect.gen(function* () {
   yield* fs.chmod(sentinel, 0o755)
   // The standard library supplies the catalog runtime that roots the build.
   const standardLibrary = join(repository, 'stdlib')
+  // An unused erased contract can trigger discovery, but cannot change an ordinary union's
+  // object. Supplying the pre-feature compiler also checks the same source against main.
+  const ordinaryUnion = join(directory, 'ordinary-union')
+  yield* fs.makeDirectory(ordinaryUnion)
+  const unionSource = yield* fs.readFileString(join(repository, 'corpus/native/union-interface-dispatch/main.silk'))
+  yield* fs.writeFileString(join(ordinaryUnion, 'main.silk'), unionSource)
+  const unionObject = Effect.fnUntraced(function* (producer: string, output: string) {
+    const built = yield* invoke(producer, ['build', 'main.silk', '--stdlib', standardLibrary, '--clang', clang,
+      '--emit', 'object', '--debug', 'false', '-o', output], ordinaryUnion, process.env, 120_000)
+    assert.equal(built.status, 0, built.stderr)
+    return yield* fs.readFile(join(ordinaryUnion, output))
+  })
+  const ordinaryBytes = yield* unionObject(silk, 'ordinary.o')
+  if (process.env.SILK_TEST_BASELINE) {
+    assert.deepEqual(ordinaryBytes, yield* unionObject(resolve(process.env.SILK_TEST_BASELINE), 'baseline.o'))
+  }
+  yield* fs.writeFileString(join(ordinaryUnion, 'main.silk'), unionSource +
+    '\ninterface Unused { fn read(self: &Self) -> i32 }\nfn unused(p: &any Unused) -> i32 { return p.read() }\n')
+  assert.deepEqual(yield* unionObject(silk, 'unused.o'), ordinaryBytes)
   // Exercise the public definition -> request -> compiler boundary for non-default settings.
   const compilationPath = (root: string, name: string) => join(root, 'build/definitions', name, 'artifact')
   const compileSettings = Effect.fnUntraced(function* (
