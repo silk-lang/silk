@@ -28,7 +28,9 @@ command is the compiler's. `silk --version` is forwarded too, so it reports the 
 directory selects.
 
 `list`, `which`, `use` and `set` take `--json`. The commands never prompt and report progress on
-standard error. Exit statuses: 0 success, 1 failure, 2 usage or configuration error, 3 version
+standard error: a download from GitHub draws a live bar with its bytes, rate and time left on a
+terminal and leaves one row when it finishes, and writes only that row elsewhere. `SILK_PROGRESS`
+(`auto`, `live`, `plain` or `never`) picks the display, as it does for `silk build`. Exit statuses: 0 success, 1 failure, 2 usage or configuration error, 3 version
 not installed, 4 download failed, 5 verification failed.
 
 ## Store
