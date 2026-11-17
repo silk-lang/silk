@@ -327,7 +327,7 @@ Executables for another system link with no SDK or sysroot (see
 
 - **[Effect](https://effect.website)** showed how far typed errors, services and effects can carry
   a codebase as it grows. Silk exists because that kind of scalability should not be limited to
-  high-level languages.
+  JavaScript.
 - **[Rust](https://www.rust-lang.org)** designed the memory model today's software needs: every
   value has an owner and every borrow has a lifetime.
 - **[Zig](https://ziglang.org)** showed the value of being explicit about system resources, and
