@@ -1338,8 +1338,10 @@ fn code(status: Status) -> i8 {
 }
 ```
 
-`Status.value(Status.Unknown)` returns `-1`. There is no built-in inverse operation because only
-declared discriminants are valid enum inhabitants.
+`Status.value(Status.Unknown)` returns `-1`. There is no integer-to-enum conversion because only
+declared discriminants are valid enum inhabitants. `Reflect.enumFromValue<Status, i8>(code)` from
+`silk.core.reflect` searches the declared members instead and returns none when no member has
+`code`; generic code reads a member's discriminant with `Reflect.enumValue`.
 
 **Boundary:** An enum does not become an integer in arithmetic, ordering, assignment, arguments, or
 returns. An integer does not become an enum even when its value equals a member discriminant.
