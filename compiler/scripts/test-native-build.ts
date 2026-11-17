@@ -3059,7 +3059,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     invoke(silk, ['build', '--stdlib', standardLibrary], toolApp, { ...sourcesEnvironment, ...environment })
   const unlisted = yield* stepBuild()
   assert.equal(unlisted.status, 1, unlisted.stderr)
-  assert.match(unlisted.stderr, /tlib\/build\.silk: build\.silk computes no plan: this dependency is not authorized to run package tools/)
+  assert.match(unlisted.stderr, /tlib\/build\.silk: build\.silk computes no plan: this dependency runs a package tool without permission; add `tools = true`/)
   yield* fs.writeFileString(join(toolApp, 'silk.toml'), toolManifest(true))
   const generatedStamp = Effect.fnUntraced(function* () {
     const cache = join(toolApp, 'build/steps')
@@ -3100,7 +3100,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     yield* writeTool('exit 0\n')
     const silent = yield* stepBuild()
     assert.equal(silent.status, 1, silent.stderr)
-    assert.match(silent.stderr, /did not write a declared output/)
+    assert.match(silent.stderr, /did not write its declared output generated\.silk/)
     yield* writeTool('')
   }
   const unsandboxedHost = yield* stepBuild({ SILK_NO_TOOL_SANDBOX: '1' })
@@ -3119,7 +3119,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   const unauthorizedEscape = yield* invoke(silk, ['build', '--stdlib', standardLibrary, '--unsandboxed-tools'], toolApp,
     { ...sourcesEnvironment, SILK_NO_TOOL_SANDBOX: '1' })
   assert.equal(unauthorizedEscape.status, 1, unauthorizedEscape.stderr)
-  assert.match(unauthorizedEscape.stderr, /this dependency is not authorized to run package tools/)
+  assert.match(unauthorizedEscape.stderr, /this dependency runs a package tool without permission; add `tools = true`/)
   // A plan's function-order input places the functions it lists first in the executable's code, in its
   // order, and a change to the file alone links again. A path outside the package is refused.
   const ordered = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-ordered-' })
