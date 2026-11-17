@@ -221,7 +221,10 @@ suggests `code-model` and `max-memory`. A profile's `backend` (`--backend` on th
 default, or `direct`, which writes wasm32 executables itself, without Clang. A `wasm32-wasip2`
 component still needs wasm-tools and the Preview 1 adapter, as with `llvm`. `--profile-input` JSON keeps `codeModel`, `maxMemory`, `stackSize`, `codegenUnits` and tagged `bindings`. Without a table
 of that name, `dev` (unoptimized, with debug information) and `release` (optimized, without it) are
-built-in profiles for the host. `--release` and `--optimization release` build the manifest's
+built-in profiles for the host. A table named `dev` or `release` changes that built-in profile:
+an `optimization` or `debug` it leaves unset keeps the built-in profile's value, so
+`[profiles.release]` with only `codegen-units = 16` is still optimized and has no debug
+information. A table of any other name starts from the defaults above. `--release` and `--optimization release` build the manifest's
 `[profiles.release]` when it declares one, as `--profile release` does; with `--target`, each
 target replaces the table's own. A complete request override replaces project profile selection. CLI `--profile`
 and LSP profile-name settings select a project profile; `--profile-input` and its LSP equivalent
@@ -290,7 +293,16 @@ above 1. Then, when it holds more than 4 MB of bitcode, it splits into that many
 which Clang optimizes on separate threads; an unoptimized build already splits by module. The units follow the call graph:
 a function that only one group of functions calls joins that group, up to an even share of the
 program, and every unit keeps its own internal copy of each function that asks to be inlined that
-it calls. The units compile for ThinLTO, and lld links them, or wasm-ld for a wasm target: the link imports what each unit calls
+it calls. The split keeps a rebuild after an edit small. The edited part of a program is the
+functions the root package and its `path` dependencies declare, and every function that reaches
+one of them; the rest, such as the standard library and fetched dependencies, is split as if the
+edited part were absent, so its units hold the same bytes after an edit and their objects and the
+link's results for them are reused. The edited part takes a share of the units by its size, at
+least one, and each of its functions goes to the unit its declaring module picks, so an edit to
+one module recompiles one unit. The link also generates again the code of each unit that inlines
+a function of that unit. A window program of 22,000 functions rebuilt in 7 s after an edit to its
+application module, in 16 units on 4 cores, and in 1m58 from nothing; as one module each took over
+5 minutes. The units compile for ThinLTO, and lld links them, or wasm-ld for a wasm target: the link imports what each unit calls
 from the others, inlines it, and generates each unit's code on its own thread, keeping each result
 in a cache beside the units' objects. A split program runs slower than one module, and its code is
 larger: the compiler ran 3% slower in 16 units, and silkjs 10% slower and 30% larger. A wasm32 UI page
