@@ -34,7 +34,7 @@ effect fn graph(options: &Options) -> Build
 }
 ```
 
-The dependency alias must exist in the manifest. A graph cannot introduce an undeclared package. `Compilation.without(alias)` excludes a declared dependency from that compilation. Dependencies are fetched as selected imports reach them; `silk fetch` downloads all declared pins without evaluating package code.
+The dependency alias must exist in the manifest. A graph cannot introduce an undeclared package. `Compilation.without(alias)` excludes a declared dependency from that compilation. A check, a library and a tasks program fetch dependencies as selected imports reach them, and an executable or loadable module fetches every declared one; `silk fetch` downloads all declared pins without evaluating package code.
 
 `when(condition, transform)` on `Compilation`, `Build` and `Run` applies `transform` only when `condition` is true, so a pipeline can branch without rebinding. `transform` is a `once effect fn`, so it may move captured values and fail with the pipeline's errors. A plain lambda that returns the step's Effect fits it, as `|c| c.without("devtools")` does. Write an `effect` lambda when the body runs steps itself or branches. `run` is only allowed inside an `effect` lambda. A named `effect fn` works too. `Plan.when` takes a plain `fn`, because plans are static.
 
@@ -86,6 +86,8 @@ The compiler reports each compilation as it does for `silk build`: the `Compilin
 A package may declare `pub param` values in source or `build.silk`. The consumer binds them with `Package.set`. Values retain their declared type, including enums and nested options. A parameter without a default is required when resolving the compilation. `Package.supplyPath` authorizes an external path; ordinary plan paths remain inside the declaring package.
 
 `build.silk` exports `pub const PLAN: Plan`. The compiler evaluates it statically, with standard-library imports and the package's parameters. The plan contributes generated modules, native sources and link inputs. Target conditions are ordinary static code.
+
+An executable or loadable module links the native plan of every dependency its packages declare, imported or not, so a package of only C links by being declared; a tasks program links only what it imports, its own package's native plan included.
 
 ```silk
 import silk.build.plan { Library, Plan }
