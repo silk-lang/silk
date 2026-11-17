@@ -352,6 +352,11 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   }
   const explicitTask = yield* invoke(silk, ['task', '--stdlib', standardLibrary, 'build', '--code', '23'], aliased, requestEnv, 120_000)
   assert.equal(explicitTask.status, 23, explicitTask.stderr)
+  // A task's unknown option is followed by that task's usage and options.
+  const unknownTaskOption = yield* invoke(silk, ['task', '--stdlib', standardLibrary, 'build', '--release'], aliased, requestEnv, 120_000)
+  assert.equal(unknownTaskOption.status, 2, unknownTaskOption.stderr)
+  assert.match(unknownTaskOption.stderr, /^error: unknown option --release\n\nUsage: tasks build \[options\]\n/m)
+  assert.match(unknownTaskOption.stderr, /^ +--code <value> +Exit code/m)
   // The compiler's own options stay with the compiler; the task sees only its own.
   const compilerOptions = ['-q', '--timings', '--ignore-warnings', '--progress', 'plain', '--backend', 'llvm']
   const compilerOptioned = yield* invoke(silk, ['build', ...compilerOptions, '--stdlib', standardLibrary, '--code', '19'], aliased, requestEnv, 120_000)
@@ -359,6 +364,13 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   yield* fs.writeFileString(join(aliased, 'src/tasks.silk'), aliasSource(['Build']))
   const builtinRun = yield* invoke(silk, ['run', '--stdlib', standardLibrary], aliased, requestEnv, 120_000)
   assert.equal(builtinRun.status, 42, builtinRun.stderr)
+  // Without its root module, the built-in names the missing file and points to the tasks.
+  yield* fs.rename(join(aliased, 'src/main.silk'), join(aliased, 'main.silk.away'))
+  const rootless = yield* invoke(silk, ['run', '--stdlib', standardLibrary], aliased, requestEnv, 120_000)
+  yield* fs.rename(join(aliased, 'main.silk.away'), join(aliased, 'src/main.silk'))
+  assert.equal(rootless.status, 1, rootless.stderr)
+  assert.match(rootless.stderr, /^silk: package `aliased` has no root module: src\/main\.silk does not exist$/m)
+  assert.match(rootless.stderr, /`silk task` lists its tasks/)
   const builtinPlan = yield* invoke(silk, ['task', '--stdlib', standardLibrary, 'plan'], aliased, requestEnv, 120_000)
   assert.equal(builtinPlan.status, 0, builtinPlan.stderr)
   const aliasRequests = yield* fs.readDirectory(join(aliased, 'build/requests'))
