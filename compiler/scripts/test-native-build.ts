@@ -1523,8 +1523,9 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   // `init -t minimal` writes, offline, a project whose generated entry `run` builds and runs.
   const initialized = yield* invoke(silk, ['init', 'greeting', '-t', 'minimal'], directory)
   assert.equal(initialized.status, 0, initialized.stderr)
-  // It ends with what to run next: `cd` into the project, then `silk run`.
-  assert.match(initialized.stdout, /^Initialized Silk project greeting at \S+greeting\n\nNext steps:\n  cd greeting\n  silk run\n$/)
+  // It names the project relative to the working directory, then what to run next: `cd` into the
+  // project, then `silk run` with what it does. Output that is not a terminal has no escape codes.
+  assert.equal(initialized.stdout, '  Created greeting from the minimal template\n\n  Next steps:\n    cd greeting\n    silk run   build and run it\n')
   const greeted = yield* invoke(
     silk,
     ['run', '--stdlib', standardLibrary],
@@ -4357,7 +4358,8 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
       '[package]\nname = "ui"\nversion = "0.1.0"\nsilk-version = "0.0.1"\ndescription = "A window"\n\n' +
         "[[post-init]]\nrun = ['sh', '-c', 'echo \"plain $# $SILK_VERSION $PATH\"']\n\n" +
         '[[post-init]]\nrun = ["scripts/post-init.sh", "ready"]\narguments = true\n\n' +
-        '[template]\n# Shown after the project is created.\nnext-steps = ["silk task dev", "silk task build --release"]\n',
+        '[[template.next-steps]]\nrun = "silk task dev"\ndescription = "start the dev server"\n\n' +
+        '[[template.next-steps]]\nrun = "silk task build --release"\n',
     )
     // A library template without [template] suggests `silk test`; `next-steps = []` suggests nothing.
     yield* fs.makeDirectory(join(examples, 'library/src'), { recursive: true })
@@ -4370,7 +4372,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     yield* fs.writeFileString(join(examples, 'quiet/silk.toml'), '[package]\nname = "quiet"\n\n[template]\nnext-steps = []\n')
     yield* fs.writeFileString(join(examples, 'quiet/src/main.silk'), 'pub fn main() -> i32 {\n  return 0\n}\n')
     yield* fs.makeDirectory(join(examples, 'garbled'), { recursive: true })
-    yield* fs.writeFileString(join(examples, 'garbled/silk.toml'), '[package]\nname = "garbled"\n\n[template]\nnext-steps = ["silk run", 3]\n')
+    yield* fs.writeFileString(join(examples, 'garbled/silk.toml'), '[package]\nname = "garbled"\n\n[template]\nnext-steps = [{ run = "silk run" }, "silk test"]\n')
     yield* fs.writeFileString(join(examples, 'ui/src/main.silk'), 'pub fn main() -> i32 {\n  return 7\n}\n')
     yield* fs.writeFileString(
       join(examples, 'ui/scripts/post-init.sh'),
@@ -4409,8 +4411,10 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     // Every entry sees the compiler's release in SILK_VERSION and gets only its own arguments; one
     // that sets `arguments = true` also gets the ones after `--`. A sandboxed entry sees a fixed PATH.
     assert.match(official.stdout, landlockNet ? /^plain 0 \d+\.\d+\.\d+\S* \/usr\/local\/bin:\/usr\/bin:\/bin\n/ : /^plain 0 \d+\.\d+\.\d+\S* /)
-    assert.match(official.stdout, /\npost-init ready --dark two words\nInitialized Silk project app at \S+app from template silk-lang\/examples\/ui \(([0-9a-f]{40})\)\n\nNext steps:\n  cd app\n  silk task dev\n  silk task build --release\n$/)
-    assert.equal(official.stdout.includes(commit), true, official.stdout)
+    // The official example is named by its directory, with its commit shortened; a step's
+    // description is lined up beside its command, and a step without one is printed alone.
+    assert.match(official.stdout, /\npost-init ready --dark two words\n  Created app from the ui template \([0-9a-f]{7}\)\n\n  Next steps:\n    cd app\n    silk task dev   start the dev server\n    silk task build --release\n$/)
+    assert.equal(official.stdout.includes(`(${commit.slice(0, 7)})`), true, official.stdout)
     const manifest = yield* fs.readFileString(join(work, 'app/silk.toml'))
     assert.match(manifest, /^\[package\]\nname = "app"\nversion = "0\.1\.0"\nsilk-version = "[^"]+"\n$/)
     assert.equal(manifest.includes('0.0.1'), false, manifest)
@@ -4423,18 +4427,18 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     // is left out for a project created in the working directory.
     const library = yield* templated(['odd place/lib', '-t', 'library', '--name', 'lib'])
     assert.equal(library.status, 0, library.stderr)
-    assert.match(library.stdout, /\)\n\nNext steps:\n  cd 'odd place\/lib'\n  silk test\n$/)
+    assert.match(library.stdout, /^  Created odd place\/lib from the library template \([0-9a-f]{7}\)\n\n  Next steps:\n    cd 'odd place\/lib'\n    silk test   run its tests\n$/)
     yield* fs.makeDirectory(join(work, 'here'), { recursive: true })
     const here = yield* templated(['.', '-t', 'library'], join(work, 'here'))
     assert.equal(here.status, 0, here.stderr)
-    assert.match(here.stdout, /\)\n\nNext steps:\n  silk test\n$/)
+    assert.match(here.stdout, /^  Created here from the library template \([0-9a-f]{7}\)\n\n  Next steps:\n    silk test   run its tests\n$/)
     const quiet = yield* templated(['quiet', '-t', 'quiet'])
     assert.equal(quiet.status, 0, quiet.stderr)
-    assert.match(quiet.stdout, /^Initialized Silk project quiet at \S+ from template silk-lang\/examples\/quiet \([0-9a-f]{40}\)\n$/)
+    assert.match(quiet.stdout, /^  Created quiet from the quiet template \([0-9a-f]{7}\)\n$/)
     assert.equal(yield* fs.readFileString(join(work, 'quiet/silk.toml')), `[package]\nname = "quiet"\nsilk-version = "${(yield* fs.readFileString(join(work, 'app/silk.toml'))).match(/silk-version = "([^"]+)"/)![1]}"\n`)
     const garbled = yield* templated(['garbled', '-t', 'garbled'])
     assert.equal(garbled.status, 1, garbled.stderr)
-    assert.match(garbled.stderr, /^The template's silk\.toml is invalid: \[template\]\.next-steps must be an array of strings, one command per step\n$/)
+    assert.match(garbled.stderr, /^The template's silk\.toml is invalid: \[template\]\.next-steps\[1\]: /)
     assert.equal(yield* fs.exists(join(work, 'garbled')), false)
     // The full spelling with a tag, and a name; the template's own manifest never names the project.
     const tagged = yield* templated(['named', '-t', 'silk-lang/examples/ui@v1', '--name', 'other'])
@@ -4581,7 +4585,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   assert.equal(managedRoot.status, 0, managedRoot.stderr)
   // A new workspace has one starter executable member, so it builds and runs at once.
   assert.equal(yield* fs.readFileString(join(managed, 'silk.toml')), '[workspace]\nmembers = ["app"]\n')
-  assert.match(managedRoot.stdout, /^Initialized Silk project app at .*\/managed\/app\n\nNext steps:\n  cd managed\n  silk run\n$/m)
+  assert.equal(managedRoot.stdout, '  Created workspace managed with package app\n\n  Next steps:\n    cd managed\n    silk run   build and run it\n')
   assert.equal(yield* fs.exists(join(managed, 'app/src/main.silk')), true)
   assert.equal(yield* fs.exists(join(managed, 'app/.gitignore')), false)
   const starterRun = yield* invoke(silk, ['run', '--stdlib', standardLibrary], managed, withClang)
@@ -4600,10 +4604,10 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   yield* fs.writeFileString(join(managed, 'silk.toml'), '[workspace]\nmembers = []\n')
   const hello = yield* invoke(silk, ['init', 'apps/hello', '-t', 'minimal'], managed)
   assert.equal(hello.status, 0, hello.stderr)
-  assert.match(hello.stdout, /Added apps\/hello to the workspace members in /)
+  assert.match(hello.stdout, /^  Created apps\/hello from the minimal template\n  Added apps\/hello to the managed workspace\n\n/)
   const greeting = yield* invoke(silk, ['init', '--lib', 'libs/greeting'], managed)
   assert.equal(greeting.status, 0, greeting.stderr)
-  assert.match(greeting.stdout, /\n\nNext steps:\n  cd libs\/greeting\n  silk test\n$/)
+  assert.equal(greeting.stdout, '  Created library libs/greeting\n  Added libs/greeting to the managed workspace\n\n  Next steps:\n    cd libs/greeting\n    silk test   run its tests\n')
   assert.equal(
     yield* fs.readFileString(join(managed, 'silk.toml')),
     '[workspace]\nmembers = ["apps/hello", "libs/greeting"]\n',

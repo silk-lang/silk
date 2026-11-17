@@ -6,7 +6,7 @@ Package identities, fetch pins, and publication settings read from `silk.toml`.
 
 Import as `Manifest` with `import silk.build.manifest { Manifest }`.
 
-Public declarations: 22.
+Public declarations: 23.
 
 <a id="Manifest"></a>
 
@@ -1363,10 +1363,10 @@ project's manifest does not keep them.
 ### Field `nextSteps`
 
 ```silk
-pub nextSteps: Option<List<String>>
+pub nextSteps: Option<List<NextStep>>
 ```
 
-The commands `silk init` suggests running in the new project, in order, after `cd` into it;
+The steps `silk init` suggests running in the new project, in order, after `cd` into it;
 empty to suggest nothing.
 
 <a id="Template.impl.Schema"></a>
@@ -1383,6 +1383,58 @@ impl Schema for Template
 
 ```silk
 static fn spec() -> Spec<Template>
+```
+
+<a id="NextStep"></a>
+
+## `NextStep`
+
+```silk
+pub struct NextStep
+```
+
+One step `silk init` suggests running in a project created from a template.
+
+### Details
+
+A template writes each step as a table in `[template].next-steps`, such as
+`{ run = "silk task dev", description = "start the dev server" }`. `silk init` prints the
+command, then the description dimmed in a column beside it.
+
+<a id="NextStep.command"></a>
+
+### Field `command`
+
+```silk
+pub command: String
+```
+
+The command, one line as the developer types it.
+
+<a id="NextStep.description"></a>
+
+### Field `description`
+
+```silk
+pub description: Option<String>
+```
+
+What the command does, one line printed beside it; absent to print the command alone.
+
+<a id="NextStep.impl.Schema"></a>
+
+## Implementation `Schema for NextStep`
+
+```silk
+impl Schema for NextStep
+```
+
+<a id="NextStep.impl.Schema.spec"></a>
+
+### Operation `spec`
+
+```silk
+static fn spec() -> Spec<NextStep>
 ```
 
 <a id="PostInit"></a>
