@@ -404,7 +404,7 @@ const nativeLinkInputs = async (
     process.platform !== 'win32' || !(library in program.windowsImports),
   ).map((library) => {
     if (!safeName.test(library)) throw new Error(`unsafe corpus library name: ${library}`)
-    return `  plan = Plan.linkLibrary(plan, ${JSON.stringify(library)}, "dynamic", false, false)`
+    return `  plan = Plan.linkLibrary(plan, ${JSON.stringify(library)}, Library.dynamicSearch())`
   })
   return [...objects, ...libraries]
 }
@@ -515,7 +515,7 @@ const writeProgram = async (
   const linkInputs = await nativeLinkInputs(directory, program, cCompiler)
   const composition = componentComposition(program, stdlib)
   if (linkInputs.length > 0) writeFileSync(join(directory, 'build.silk'),
-    'import silk.build.plan { Plan }\nimport silk.build.step { sourcePath }\n' +
+    'import silk.build.plan { Library, Plan }\nimport silk.build.step { sourcePath }\n' +
     `static fn make() -> Plan {\n  let mut plan = Plan.empty()\n${linkInputs.join('\n')}\n  return plan\n}\npub const PLAN: Plan = make()\n`)
   const unstable = composition === undefined ? '' : `\n[unstable]\ncomposition = ${composition}\n`
   writeFileSync(

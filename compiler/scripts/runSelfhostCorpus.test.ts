@@ -92,7 +92,7 @@ void it('declares compiled corpus C units and libraries through a typed plan', a
   await withStub(
     `[ -s fixture.o ] || exit 7
 grep -qF 'Plan.linkObject(plan, sourcePath("fixture.o"))' build.silk || exit 8
-grep -qF 'Plan.linkLibrary(plan, "custom", "dynamic", false, false)' build.silk || exit 8
+grep -qF 'Plan.linkLibrary(plan, "custom", Library.dynamicSearch())' build.silk || exit 8
 ${compiled}`,
     async (silkc) => {
       assert.deepStrictEqual(await runCase(silkc, linked), { name: 'literal', status: 'pass' })

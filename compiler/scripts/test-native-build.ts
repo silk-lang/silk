@@ -120,7 +120,7 @@ const program = Effect.gen(function* () {
     return yield* invoke(silk, ['compile', '--request', request], root, env, 120_000)
   })
   const writePlan = (root: string, body: string) => fs.writeFileString(join(root, 'build.silk'),
-    'import silk.build.plan { Plan }\nimport silk.build.step { sourcePath }\nimport silk.core.target { Target, OperatingSystem }\n' +
+    'import silk.build.plan { Framework, Library, Plan }\nimport silk.build.step { sourcePath }\nimport silk.core.target { Target, OperatingSystem }\n' +
     `static fn make() -> Plan {\n  let mut plan = Plan.empty()\n${body}\n  return plan\n}\npub const PLAN: Plan = make()\n`)
   // Explicit requests must ignore even malformed manifests and build scripts, while resolving
   // package aliases, supplied parameters, generated modules, and native translation units.
@@ -2630,8 +2630,8 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     '[package]\nname = "linked"\nversion = "0.1.0"\nsource = "."\n')
   yield* fs.writeFileString(join(unpackaged, 'main.silk'), 'pub fn main() -> i32 { return 0 }\n')
   yield* writePlan(unpackaged, `  if Target.operatingSystem() == OperatingSystem.${otherSystem} {
-    plan = Plan.linkFramework(plan, "Security", false, false)
-    plan = Plan.linkLibrary(plan, "nosuchlibrary", "dynamic", false, false)
+    plan = Plan.linkFramework(plan, "Security", Framework.make())
+    plan = Plan.linkLibrary(plan, "nosuchlibrary", Library.dynamicSearch())
   }`)
   const skippedInput = yield* invoke(silk, ['build', '--stdlib', standardLibrary], unpackaged, { ...process.env, SILK_CLANG: clang })
   assert.equal(skippedInput.status, 0, skippedInput.stderr)
@@ -2848,13 +2848,13 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     '[package]\nname = "plib"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nexports = ["Plib"]\n',
   )
   const planScript = (body: string) =>
-    'import silk.build.plan { Plan }\nimport silk.build.source { Source }\nimport silk.core.static_text { StaticText }\nimport silk.build.write_files { WriteFiles }\nimport silk.build.run { Run }\nimport silk.build.step { sourcePath }\n\n'
+    'import silk.build.plan { Library, Plan }\nimport silk.build.source { Source }\nimport silk.core.static_text { StaticText }\nimport silk.build.write_files { WriteFiles }\nimport silk.build.run { Run }\nimport silk.build.step { sourcePath }\n\n'
       + `static fn plan() -> Plan {\n${body}}\n\npub const PLAN: Plan = plan()\n`
   const workingPlan = planScript(
     '  let mut plan = Plan.empty()\n'
       + '  let files = WriteFiles.empty() |> WriteFiles.literal("base.silk", StaticText.concat("pub const BASE: i32 = ", Source.text("base.txt")))\n  plan = Plan.module(plan, "generated_base", WriteFiles.result(&files, "base.silk"))\n'
       + '  plan = Plan.compileC(plan, sourcePath("native/twice.c"))\n'
-      + '  plan = Plan.linkLibrary(plan, "m", "dynamic", false, false)\n'
+      + '  plan = Plan.linkLibrary(plan, "m", Library.dynamicSearch())\n'
       + '  return plan\n',
   )
   yield* fs.writeFileString(join(planned, 'plib/build.silk'), workingPlan)
