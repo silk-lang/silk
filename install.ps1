@@ -152,8 +152,12 @@ function Install-Silk([string]$Requested, [string]$Channel, [string]$HomeDirecto
   try {
     $archive = Join-Path $stage "$top.zip"
     $signature = "$archive.minisig"
+    # PowerShell draws the download's own progress bar; these lines say what it is and how long it took.
+    Write-Output ("Downloading {0} ({1:N1} MiB)" -f "$top.zip", ([double]$asset.size / 1MB))
+    $clock = [Diagnostics.Stopwatch]::StartNew()
     Save-SilkAsset $asset $archive
     Save-SilkAsset $signatureAsset $signature
+    Write-Output ("  Downloaded {0} in {1:N1}s" -f "$top.zip", $clock.Elapsed.TotalSeconds)
     $minisign = Get-Command minisign -ErrorAction SilentlyContinue
     if ($asset.digest -match '^sha256:([a-f0-9]{64})$') {
       $expectedArchive = $Matches[1]
@@ -163,7 +167,9 @@ function Install-Silk([string]$Requested, [string]$Channel, [string]$HomeDirecto
       $comment = & $minisign.Source -V -P $SilkMinisignPublicKey -m $archive -x $signature -Q
       if ($LASTEXITCODE -ne 0 -or $comment -cne "silk $($release.tag_name) $top.zip") { throw 'Release archive signature or trusted comment is invalid' }
     }
+    $clock.Restart()
     Expand-SilkZip $archive $stage $top
+    Write-Output ("  Unpacked {0} in {1:N1}s" -f "$top.zip", $clock.Elapsed.TotalSeconds)
     $tree = Join-Path $stage $top
     $compiler = Join-Path $tree 'bin/silkc.exe'
     $tool = Join-Path $tree 'bin/silk.exe'
