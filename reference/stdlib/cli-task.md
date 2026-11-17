@@ -164,6 +164,9 @@ the task succeeded, 0 after `--help`, 2 after a command line error, and a failed
 [`TaskError.status`](#TaskError.status) after writing `error: <message>` to standard error. An unexpected failure,
 such as a file that cannot be read, is reported the same way with status 1.
 
+Help names the command `silk task`, as it is typed. `--help` without a task's name lists the
+tasks, then writes the help of each one with its options and arguments.
+
 `build`, `run`, `test` and `plan` are the toolchain's own commands. When `silk` starts the
 tasks program for one of them and `T` has no variant of that name, nothing runs here: the
 status is 0 and `silk` runs its built-in command.

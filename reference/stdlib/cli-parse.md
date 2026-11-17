@@ -561,6 +561,44 @@ for the root command) of `T`.
 
 - `WriterError` if the `Writer` fails.
 
+<a id="Cli.impl.writeHelpAs"></a>
+
+### Associated function `writeHelpAs`
+
+```silk
+pub effect fn writeHelpAs<T: CommandLine>(static name: string<'static>, path: string) -> ()
+    ! WriterError
+    ? &mut Writer
+```
+
+[`Cli.writeHelp`](#Cli.impl.writeHelp), with `name` in place of the name of `T`'s command, as for a program that
+another runs, such as `silk task`.
+
+#### Errors
+
+- `WriterError` if the `Writer` fails.
+
+<a id="Cli.impl.writeEachHelp"></a>
+
+### Associated function `writeEachHelp`
+
+```silk
+pub effect fn writeEachHelp<T: CommandLine>(
+    static name: string<'static>,
+    static heading: string<'static>,
+  ) -> ()
+    ! WriterError
+    ? &mut Writer
+```
+
+Writes the subcommands of `T`, a union, under `heading`, and then the help of each one, as
+`<name> <subcommand> --help` writes it. `name` stands for the name of `T`'s command. For a
+`T` that is not a union, writes [`Cli.writeHelpAs`](#Cli.impl.writeHelpAs).
+
+#### Errors
+
+- `WriterError` if the `Writer` fails.
+
 <a id="Cli.impl.writeVersion"></a>
 
 ### Associated function `writeVersion`
