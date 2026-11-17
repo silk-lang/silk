@@ -104,8 +104,8 @@ test('silk check, build, build --release and clean', () => {
 
   const built = silk(h, ['build'], { cwd: dir })
   assert.equal(built.status, 0, show(built))
-  const target = /\((\S+), debug\)/.exec(built.stderr)[1]
-  const exe = join(dir, 'build/llvm', target, 'debug', name)
+  const target = /\((\S+), dev\)/.exec(built.stderr)[1]
+  const exe = join(dir, 'build', target, 'dev', name)
   assert.ok(existsSync(exe), 'the executable is where the Finished line says')
   assert.ok(existsSync(`${exe}.symbols`))
   const own = sh(h, `'${exe}'`)
@@ -113,7 +113,7 @@ test('silk check, build, build --release and clean', () => {
 
   const release = silk(h, ['build', '--release'], { cwd: dir })
   assert.equal(release.status, 0, show(release))
-  assert.ok(existsSync(join(dir, 'build/llvm', target, 'release', name)))
+  assert.ok(existsSync(join(dir, 'build', target, 'release', name)))
 
   const cleaned = silk(h, ['clean'], { cwd: dir })
   assert.equal(cleaned.status, 0)

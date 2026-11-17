@@ -16,17 +16,20 @@ import lsp.Transport { Reader }
 import lsp.Features
 import lsp.Message as Messages { Change, ErrorCode, PositionEncoding, Reply }
 import lsp.Navigation { Help }
-import lsp.Workspace { Changed, Location, Position, Published, Shown, Workspace }
+import lsp.Workspace { Asked, Changed, Location, Position, Published, Shown, Workspace }
 import semantic.Semantic { Statistics }
 import semantic.SourceUnit { SourceUnit }
 import semantic.Types { Types }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.system.filesystem { FileSystem }
 import silk.json.scanner { JsonError }
-import silk.json.value { Value }
+import silk.json.value { Json, Value }
+import silk.collections.bytes { Bytes }
 import silk.collections.list { List }
+import silk.collections.slice { Slice }
 import silk.core.option { Option }
 import silk.text.string { String }
+import silk.num.u8
 import silk.num.usize
 import silk.io.standard_input { StandardInput }
 import silk.io.writer { Writer, WriterError }
@@ -44,6 +47,7 @@ pub enum Phase {
 /// The lifecycle state the compiler thread owns.
 pub struct Server {
   pub phase: Phase,
+  watchFiles: bool,
 
   /// The position encoding `initialize` selected.
   pub encoding: PositionEncoding,
@@ -63,8 +67,9 @@ pub union Step {
 pub fn make(workspace: Workspace) -> Server {
   return Server {
     phase: Phase.Waiting,
+    watchFiles: false,
     encoding: PositionEncoding.Utf16,
-    workspace: move workspace
+    workspace: move workspace,
   }
 }
 
@@ -141,6 +146,18 @@ pub effect fn pump(server: &mut Server) -> ()
   }
   run server.workspace.reopen()
   run server.workspace.refresh()
+  if server.workspace.takePlanHint() {
+    run Messages.showHint(b"The compilation plan could not be refreshed; run `silk plan`.")
+  }
+  if server.workspace.takeOutdatedNote() {
+    run Messages.showHint(
+      b"tasks.silk changed after the saved compilation requests were written; run `silk plan` to update them.",
+    )
+  }
+  while let Option<Asked>.Some { value: asked } = move run server.workspace.takeAsk() {
+    let text = run askText(asked.key.asSlice())
+    run Messages.askToRunPlan(asked.number, text.asSlice())
+  }
   let published = run server.workspace.diagnostics(server.encoding)
   let listed = List<Published>.asSlice(&published)
   let mut at = usize.ZERO
@@ -160,7 +177,7 @@ pub effect fn handle(server: &mut Server, incoming: Incoming) -> Step
     Incoming.Unparsable => {
       run Messages.respond(
         &Value.Null,
-        &Reply.Failure { code: ErrorCode.ParseError, message: "the message is not valid JSON" }
+        &Reply.Failure { code: ErrorCode.ParseError, message: "the message is not valid JSON" },
       )
       return Step.Continue
     }
@@ -176,8 +193,9 @@ effect fn message(server: &mut Server, value: &Value) -> Step
     return Step.Exit { status: exitStatus(&server.*) }
   }
 
-  // A message with no method is a response; the server sends no requests yet.
+  // A message with no method is a response to a request the server sent.
   if let Option<string>.None = &method {
+    run answered(&mut server.*, value)
     return Step.Continue
   }
   let id = match Messages.id(value) {
@@ -196,18 +214,39 @@ effect fn message(server: &mut Server, value: &Value) -> Step
   run pump(&mut server.*)
   let mut reply = Reply.Failure {
     code: ErrorCode.MethodNotFound,
-    message: "the server does not handle this method"
+    message: "the server does not handle this method",
   }
   match server.phase {
     Phase.Waiting => {
       if Messages.names(&method, "initialize") {
+        if let Option<&Value>.Some { value: settings } = move Json.fieldAt(
+          Json.field(value, "params"),
+          "initializationOptions",
+        ) {
+          run server.workspace.configure(settings)
+        }
+        let watching = Json.fieldAt(
+          Json.fieldAt(
+            Json.fieldAt(Json.fieldAt(Json.field(value, "params"), "capabilities"), "workspace"),
+            "didChangeWatchedFiles",
+          ),
+          "dynamicRegistration",
+        )
+        if let Option<&Value>.Some { value: supported } = move watching {
+          if let Value.Bool { value: enabled } = &supported.* {
+            server.watchFiles = enabled
+          }
+        }
         server.encoding = Messages.negotiate(value)
         server.phase = Phase.Running
-        reply = Reply.Initialized { encoding: server.encoding, library: run server.workspace.libraryUri() }
+        reply = Reply.Initialized {
+          encoding: server.encoding,
+          library: run server.workspace.libraryUri(),
+        }
       } else {
         reply = Reply.Failure {
           code: ErrorCode.ServerNotInitialized,
-          message: "the server is not initialized"
+          message: "the server is not initialized",
         }
       }
     }
@@ -215,19 +254,23 @@ effect fn message(server: &mut Server, value: &Value) -> Step
       if Messages.names(&method, "initialize") {
         reply = Reply.Failure {
           code: ErrorCode.InvalidRequest,
-          message: "the server is already initialized"
+          message: "the server is already initialized",
         }
       } else if Messages.names(&method, "shutdown") {
         // What the session checked since the cache was last written is kept for the next one.
         run server.workspace.persistCaches()
         server.phase = Phase.ShutDown
         reply = Reply.Null
-      } else if let Option<Reply>.Some { value: answered } = move run navigation(&mut server.*, &method, value) {
+      } else if let Option<Reply>.Some { value: answered } = move run navigation(
+        &mut server.*,
+        &method,
+        value,
+      ) {
         reply = move answered
       } else if let Option<Reply>.Some { value: answered } = move run feature(
         &server.*,
         &method,
-        value
+        value,
       ) {
         reply = move answered
       }
@@ -248,12 +291,17 @@ effect fn feature(server: &Server, method: &Option<string>, value: &Value) -> Op
   let symbols = Messages.names(method, "textDocument/documentSymbol")
   let folding = Messages.names(method, "textDocument/foldingRange")
   let formatting = Messages.names(method, "textDocument/formatting")
+
   // `silk/statistics` reports the demand counters of the store that owns a document, so session
   // tests can hold invalidation to a budget.
   if Messages.names(method, "silk/statistics") {
     if let Option<string>.Some { value: uri } = move Messages.document(value, "uri") {
-      if let Option<Statistics>.Some { value: counted } = move server.workspace.statistics(String.utf8Bytes(uri)) {
-        return Option<Reply>.some(Reply.Counters { demands: counted.demands, hits: counted.hits, runs: counted.runs })
+      if let Option<Statistics>.Some { value: counted } = move server.workspace.statistics(
+        String.utf8Bytes(uri),
+      ) {
+        return Option<Reply>.some(
+          Reply.Counters { demands: counted.demands, hits: counted.hits, runs: counted.runs },
+        )
       }
     }
     return Option<Reply>.some(Reply.Null)
@@ -274,7 +322,7 @@ effect fn feature(server: &Server, method: &Option<string>, value: &Value) -> Op
   }
   if symbols {
     return Option<Reply>.some(
-      Reply.Symbols { symbols: run Features.symbols(unit, server.encoding) }
+      Reply.Symbols { symbols: run Features.symbols(unit, server.encoding) },
     )
   }
   if folding {
@@ -302,12 +350,17 @@ effect fn navigation(server: &mut Server, method: &Option<string>, value: &Value
   let actions = Messages.names(method, "textDocument/codeAction")
   if Messages.names(method, "workspace/symbol") {
     let symbols = match move Messages.parameter(value, "query") {
-      Option<string>.Some { value: query } => run server.workspace.symbols(String.utf8Bytes(query), server.encoding, SYMBOL_LIMIT)
+      Option<string>.Some { value: query } => run server.workspace.symbols(
+        String.utf8Bytes(query),
+        server.encoding,
+        SYMBOL_LIMIT,
+      )
       Option<string>.None => run server.workspace.symbols(b"", server.encoding, SYMBOL_LIMIT)
     }
     return Option<Reply>.some(Reply.Placements { symbols: move symbols })
   }
-  if !hover && !definition && !hints && !signature && !references && !rename && !completion && !actions {
+  if !hover && !definition && !hints && !signature && !references && !rename && !completion
+    && !actions {
     return Option<Reply>.none()
   }
   let uri = match move Messages.document(value, "uri") {
@@ -317,11 +370,15 @@ effect fn navigation(server: &mut Server, method: &Option<string>, value: &Value
     }
   }
   if hints {
-    return Option<Reply>.some(Reply.Hints { hints: run server.workspace.hints(uri, server.encoding) })
+    return Option<Reply>.some(
+      Reply.Hints { hints: run server.workspace.hints(uri, server.encoding) },
+    )
   }
   if actions {
     return match move Messages.rangeStart(value) {
-      Option<Position>.Some { value: start } => Option<Reply>.some(Reply.Fixes { fixes: run server.workspace.importFixes(uri, start, server.encoding) })
+      Option<Position>.Some { value: start } => Option<Reply>.some(
+        Reply.Fixes { fixes: run server.workspace.importFixes(uri, start, server.encoding) },
+      )
       Option<Position>.None => Option<Reply>.some(Reply.Null)
     }
   }
@@ -332,12 +389,21 @@ effect fn navigation(server: &mut Server, method: &Option<string>, value: &Value
     }
   }
   if completion {
-    return Option<Reply>.some(Reply.Completions { items: run server.workspace.completion(uri, position, server.encoding) })
+    return Option<Reply>.some(
+      Reply.Completions { items: run server.workspace.completion(uri, position, server.encoding) },
+    )
   }
   if references {
-    return Option<Reply>.some(Reply.Locations {
-      locations: run server.workspace.references(uri, position, server.encoding, Messages.includesDeclaration(value)),
-    })
+    return Option<Reply>.some(
+      Reply.Locations {
+        locations: run server.workspace.references(
+          uri,
+          position,
+          server.encoding,
+          Messages.includesDeclaration(value),
+        ),
+      },
+    )
   }
   if rename {
     let name = match move Messages.parameter(value, "newName") {
@@ -347,22 +413,38 @@ effect fn navigation(server: &mut Server, method: &Option<string>, value: &Value
       }
     }
     return match move run server.workspace.rename(uri, position, server.encoding, name) {
-      Option<List<Changed>>.Some { value: changes } => Option<Reply>.some(Reply.Renamed { changes: move changes })
-      Option<List<Changed>>.None => Option<Reply>.some(Reply.Failure {
-        code: ErrorCode.RequestFailed,
-        message: "the name cannot be renamed: it names nothing this package declares, or the new name is not an identifier"
-      })
+      Option<List<Changed>>.Some { value: changes } => Option<Reply>.some(
+        Reply.Renamed { changes: move changes },
+      )
+      Option<List<Changed>>.None => Option<Reply>.some(
+        Reply.Failure {
+          code: ErrorCode.RequestFailed,
+          message: "the name cannot be renamed: it names nothing this package declares, or the new name is not an identifier",
+        },
+      )
     }
   }
   if hover {
-    if let Option<Shown>.Some { value: shown } = move run server.workspace.hover(uri, position, server.encoding) {
+    if let Option<Shown>.Some { value: shown } = move run server.workspace.hover(
+      uri,
+      position,
+      server.encoding,
+    ) {
       return Option<Reply>.some(Reply.Hovered { shown: move shown })
     }
   } else if definition {
-    if let Option<Location>.Some { value: location } = move run server.workspace.definition(uri, position, server.encoding) {
+    if let Option<Location>.Some { value: location } = move run server.workspace.definition(
+      uri,
+      position,
+      server.encoding,
+    ) {
       return Option<Reply>.some(Reply.Located { location: move location })
     }
-  } else if let Option<Help>.Some { value: help } = move run server.workspace.signature(uri, position, server.encoding) {
+  } else if let Option<Help>.Some { value: help } = move run server.workspace.signature(
+    uri,
+    position,
+    server.encoding,
+  ) {
     return Option<Reply>.some(Reply.Signature { help: move help })
   }
   return Option<Reply>.some(Reply.Null)
@@ -370,8 +452,39 @@ effect fn navigation(server: &mut Server, method: &Option<string>, value: &Value
 
 // Applies one document notification to the workspace; other notifications are ignored.
 effect fn notification(server: &mut Server, method: &Option<string>, value: &Value) -> ()
-  ! OutOfMemoryError
-  ? &mut FileSystem | &mut Allocator | &mut Types {
+  ! JsonError | WriterError | OutOfMemoryError
+  ? &mut Writer | &mut FileSystem | &mut Allocator | &mut Types {
+  if Messages.names(method, "initialized") {
+    if server.watchFiles {
+      run Messages.watchBuildFiles()
+    }
+    return ()
+  }
+  if Messages.names(method, "workspace/didChangeConfiguration") {
+    if let Option<&Value>.Some { value: settings } = move Json.fieldAt(
+      Json.field(value, "params"),
+      "settings",
+    ) {
+      run server.workspace.configure(settings)
+    }
+    return ()
+  }
+  if Messages.names(method, "workspace/didChangeWatchedFiles") {
+    let mut refresh = false
+    if let Option<&Value>.Some { value: changes } = move Json.fieldAt(
+      Json.field(value, "params"),
+      "changes",
+    ) {
+      let mut at: usize = 0
+      while let Option<&Value>.Some { value: change } = move Json.item(changes, at) {
+        if let Option<string>.Some { value: uri } = move Json.asString(Json.field(change, "uri")) {
+          refresh = refresh || buildConfiguration(String.utf8Bytes(uri))
+        }
+        at = at + 1
+      }
+    }
+    return run server.workspace.reload(refresh)
+  }
   let uri = match move Messages.document(value, "uri") {
     Option<string>.Some { value: present } => String.utf8Bytes(present)
     Option<string>.None => {
@@ -384,13 +497,93 @@ effect fn notification(server: &mut Server, method: &Option<string>, value: &Val
     }
   } else if Messages.names(method, "textDocument/didChange") {
     let changes = run Messages.changes(value)
-    run server.workspace.edit(uri, Messages.version(value), List<Change>.asSlice(&changes), server.encoding)
+    run server.workspace.edit(
+      uri,
+      Messages.version(value),
+      List<Change>.asSlice(&changes),
+      server.encoding,
+    )
   } else if Messages.names(method, "textDocument/didSave") {
     run server.workspace.save(uri)
+    if buildConfiguration(uri) {
+      run server.workspace.reload(true)
+    }
   } else if Messages.names(method, "textDocument/didClose") {
     run server.workspace.close(uri)
   }
   return ()
+}
+
+// The question that asks to run the custom plans `key` covers, a `git:` or `path:` key.
+effect fn askText(key: &[u8]) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let git = key.length > 4 && same(Slice.view<u8>(key, 0, 4), b"git:")
+  let mut text = run Bytes.copy(
+    b"This project's tasks.silk defines its own Plan command. Allow the editor to run it with your permissions, so its compilation requests match `silk build`, ",
+  )
+  if git {
+    run text.append(b"in every worktree of the repository at ")
+    run text.append(Slice.view<u8>(key, 4, key.length - 4))
+  } else {
+    let mut start: usize = 0
+    while start < key.length && key[start] != 58 {
+      start = start + 1
+    }
+    if start < key.length {
+      start = start + 1
+    }
+    run text.append(b"in ")
+    run text.append(Slice.view<u8>(key, start, key.length - start))
+  }
+  run text.append(b"?")
+  return move text
+}
+
+// Applies the developer's answer to a `silk-plan-<number>` question; other responses are ignored.
+effect fn answered(server: &mut Server, value: &Value) -> ()
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator | &mut Types {
+  let id = match move Json.asString(Json.field(value, "id")) {
+    Option<string>.Some { value: text } => String.utf8Bytes(text)
+    Option<string>.None => {
+      return ()
+    }
+  }
+  let prefix = b"silk-plan-"
+  if id.length <= prefix.length || !same(Slice.view<u8>(id, 0, prefix.length), prefix) {
+    return ()
+  }
+  let mut number: usize = 0
+  let mut at = prefix.length
+  while at < id.length {
+    if id[at] < 48 || id[at] > 57 {
+      return ()
+    }
+    number = number * 10 + u8.toUsize(id[at] - 48)
+    at = at + 1
+  }
+  let mut allowed = false
+  if let Option<string>.Some { value: title } = move Json.asString(
+    Json.fieldAt(Json.field(value, "result"), "title"),
+  ) {
+    allowed = title == Messages.ALLOW
+  }
+  return run server.workspace.answer(number, allowed)
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at: usize = 0
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + 1
+  }
+  return true
 }
 
 fn exitStatus(server: &Server) -> i32 {
@@ -398,4 +591,24 @@ fn exitStatus(server: &Server) -> i32 {
     Phase.ShutDown => 0
     _ => 1
   }
+}
+
+fn buildConfiguration(path: &[u8]) -> bool {
+  let names = [b"tasks.silk", b"silk.toml"]
+  let mut at: usize = 0
+  while at < names.length {
+    if path.length >= names[at].length {
+      let mut index: usize = 0
+      let mut equal = true
+      while index < names[at].length {
+        equal = equal && path[path.length - names[at].length + index] == names[at][index]
+        index = index + 1
+      }
+      if equal {
+        return true
+      }
+    }
+    at = at + 1
+  }
+  return false
 }

@@ -151,7 +151,7 @@ fixture in `compiler/fixtures/wasi-http-server/main.silk` is a complete echo han
 
 The bundled `http` world includes `wasi:http/proxy@0.2.12`. Copy `stdlib/wit` into the server
 package as `wit`, select `world = "http"` in `[component]`, and select `runtime = {kind = "none"}`
-in the build profile. Build it, then run `wasmtime serve --addr 127.0.0.1:8080 <component>`.
+with `Compilation.runtime`, target `wasm32-wasip2`, and a reactor execution model. Build it, then run `wasmtime serve --addr 127.0.0.1:8080 <component>`.
 Pure HTTP components do not need command startup, a Preview 1 adapter, or CLI filesystem grants.
 
 ## Custom WIT worlds, imports, and exports
@@ -163,18 +163,12 @@ A package can describe any synchronous component interface with its own WIT pack
 name = "calculator"
 source = "."
 
-[build]
-profile = "component"
-
-[profiles.component]
-target = "wasm32-wasip2"
-runtime = {kind = "none"}
-
 [component]
 wit = "wit"
 world = "calculator"
 ```
 
+The command selects `wasm32-wasip2` and `runtime = "none"` through its `Compilation`.
 `component.wit` is a file or directory inside the package; its dependency packages belong in
 its WIT `deps` directory. `component.world` selects a world in that package. Both fields are
 required. Test runners select the bundled command world so a library's exported application

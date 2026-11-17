@@ -44,8 +44,8 @@ fi
 
 rm -rf "$stage"
 mkdir -p "$stage"
-# The compiler's path dependency `../changes` comes along so the copy resolves like the checkout.
-cp -R "$repository/compiler" "$repository/changes" "$stage/"
+# The compiler's path dependency comes along so the copy resolves like the checkout.
+cp -R "$repository/compiler" "$repository/tomledit" "$stage/"
 
 profiler="$stage/compiler/src/Profiler.silk"
 if [ "$(grep -c '^pub const enabled: bool = false$' "$profiler")" != 1 ]; then
@@ -63,24 +63,20 @@ mkdir "$stage/compiler/tracy"
 "${AR:-$(dirname "$clang")/llvm-ar}" rcs "$stage/compiler/tracy/libsilk_tracy.a" \
   "$stage/compiler/tracy/silk_tracy.o" "$stage/compiler/tracy/TracyClient.o"
 
-# The compiler's manifest links nothing natively, so an appended `[native]` table adds Tracy.
-manifest="$stage/compiler/silk.toml"
-if grep -q '^\[native\]' "$manifest"; then
-  echo "Expected compiler/silk.toml to have no [native] table" >&2
-  exit 1
-fi
-{
-  echo
-  echo '[native]'
-  echo 'link = ['
-  echo '  { static-archive = "tracy/libsilk_tracy.a" },'
-  for library in "${system[@]}"; do
-    echo "  { library = \"$library\", mode = \"dynamic\" },"
-  done
-  echo ']'
-} >> "$manifest"
-
+# Instrumentation is an explicit compilation input; the package manifest stays unchanged.
+python3 - "$stage" "$repository/stdlib" "${system[@]}" <<'PYCODE'
+from pathlib import Path
+import json, sys
+stage = Path(sys.argv[1])
+links = ['{kind="archive", value=' + json.dumps(str(stage / 'compiler/tracy/libsilk_tracy.a')) + ', weak=false, needed=false}']
+links += ['{kind="library", value=' + json.dumps(name) + ', mode="dynamic", weak=false, needed=false}' for name in sys.argv[3:]]
+text = f'manifest={json.dumps(str(stage / "compiler/silk.toml"))}\nstdlib={json.dumps(sys.argv[2])}\n'
+text += '[settings]\nmodules=[]\n[settings.profile]\noptimization="speed"\ndebug=false\n'
+text += '[settings.native]\nsources=[]\nlink=[' + ','.join(links) + ']\n'
+(stage / 'definition.toml').write_text(text)
+PYCODE
 mkdir -p "$(dirname "$output")"
-(cd "$stage/compiler" && "$silk" build src/main.silk -o "$output" --stdlib "$repository/stdlib" \
-  --clang "$clang" --optimization speed --debug false)
+export SILK_CLANG="$clang"
+"$silk" resolve --definition "$stage/definition.toml" --output "$stage/request.toml" --artifact "$output"
+"$silk" compile --request "$stage/request.toml"
 echo "Built $output; run it with TRACY_NO_EXIT=1 while the Tracy profiler or tracy-capture listens."

@@ -9,6 +9,7 @@ import * as FileSystem from 'effect/FileSystem'
 import type { PlatformError } from 'effect/PlatformError'
 import * as Schema from 'effect/Schema'
 import * as NativeProcess from './NativeProcess.ts'
+import * as CompilationBuild from './CompilationBuild.ts'
 import * as SourceSnapshot from './SourceSnapshot.mjs'
 
 export class NativeBuildError extends Data.TaggedError('NativeBuildError')<{
@@ -377,8 +378,9 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
         return result
       })
     const stdlib = join(snapshot, 'stdlib')
+    const compilerManifest = join(snapshot, 'compiler/silk.toml')
     const compilerRoot = join(snapshot, 'compiler/src/main.silk')
-    // The compiler's manifest selects a final executable, so only IR emission names a stage.
+
     const buildFlags = [
       '--stdlib',
       stdlib,
@@ -399,31 +401,34 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
       ...(emit === 'llvm-ir' ? ['--emit', 'llvm-ir'] : []),
       ...buildFlags,
     ]
+    // A seed is a released compiler, so it is driven through the CLI every release has. The
+    // compiler it builds resolves and compiles an explicit request.
+    const compile = Effect.fnUntraced(function* (name: string, compiler: string, output: string, emit: string) {
+      if (compiler === producer && producerGeneration === 'seed')
+        return yield* invoke(
+          name,
+          [compiler, ...argumentsFor(compilerRoot, output, emit === 'llvm-ir' ? 'llvm-ir' : 'executable')],
+          join(snapshot, 'compiler'),
+        )
+      const commands = yield* CompilationBuild.prepare({ compiler, manifest: compilerManifest, output,
+        stdlib, optimization, debug, emit })
+      const resolved = yield* invoke(`${name}-resolve`, [compiler, ...commands[0]], join(snapshot, 'compiler'))
+      if (!NativeProcess.succeeded(resolved)) return yield* reject(`${name} definition resolution failed`)
+      return yield* invoke(name, [compiler, ...commands[1]], join(snapshot, 'compiler'))
+    })
     const emitIr = (name: string, compiler: string) =>
       Effect.gen(function* () {
         const ir = join(outputDirectory, `${name}.ll`)
-        const emitted = yield* invoke(
-          name,
-          [compiler, ...argumentsFor(compilerRoot, ir, 'llvm-ir')],
-          join(snapshot, 'compiler'),
-        )
+        const emitted = yield* compile(name, compiler, ir, 'llvm-ir')
         if (!NativeProcess.succeeded(emitted)) return yield* reject(`${name} emission failed`)
         return yield* fileHash(ir)
       }).pipe(staged(name))
     const build = Effect.gen(function* () {
       // The script trains in a copy of the snapshot and builds the output with the same flags.
-      const command = profileGuided
-        ? [
-            profileGuidedBuild,
-            join(outputDirectory, 'profile-guided'),
-            producer,
-            snapshot,
-            compilerRoot,
-            receipt.output.path,
-            ...buildFlags,
-          ]
-        : [producer, ...argumentsFor(compilerRoot, receipt.output.path, 'executable')]
-      const built = yield* invoke('native-build', command, join(snapshot, 'compiler'))
+      const built = profileGuided
+        ? yield* invoke('native-build', [profileGuidedBuild, join(outputDirectory, 'profile-guided'),
+            producer, snapshot, compilerManifest, receipt.output.path, ...buildFlags], join(snapshot, 'compiler'))
+        : yield* compile('native-build', producer, receipt.output.path, 'final')
       if (!NativeProcess.succeeded(built))
         return yield* reject(`${producerGeneration} native build failed`)
       receipt.output.sha256 = yield* executableHash(receipt.output.path, false)

@@ -119,14 +119,12 @@ export function collect(docs, filter = '') {
           while (fileLabel(blocks[last + 1]) !== undefined && fileLabel(blocks[last + 1]) !== 'src/main.silk') files[fileLabel(blocks[++last])] = blocks[last].text
         }
         const { expected, diagnostics, build } = shownResult(blocks, last)
-        // A manifest fragment right before or after the program configures its package.
-        const manifest = [blocks[index - 1], blocks[index + 1]].find((near) => near?.lang === 'toml' && /^\[build/m.test(near.text) && !/^\[package\]/m.test(near.text))?.text
         // Prose right before the block that names a code ("OWN0010, conflicting loans:") says the
         // block is rejected with that code.
         const paragraph = block.before.split(/\n\s*\n/).at(-1) ?? ''
         const named = diagnostics === undefined && /:\s*$/.test(paragraph) && paragraph.length < 120 && !/\b(fix|instead)\b/i.test(paragraph) ? /^([A-Z]{3}\d{4})\b/.exec(paragraph)?.[1] : undefined
         const id = `${relative(join(docs, 'content'), path)}:${block.line}`
-        if (filter === '' || id.includes(filter)) samples.push({ id, source: block.text, excerpt, expected, diagnostics, build, named, imports, manifest, files })
+        if (filter === '' || id.includes(filter)) samples.push({ id, source: block.text, excerpt, expected, diagnostics, build, named, imports, files })
       })
     }
   }
@@ -188,7 +186,7 @@ async function check(h, sample, index) {
 async function checkSample(h, sample, index) {
   const name = 'demo'
   const folder = join(h.work, `sample${index}`, name)
-  write(join(folder, 'silk.toml'), `[package]\nname = "${name}"\nversion = "0.1.0"\n${sample.manifest === undefined ? '' : `\n${sample.manifest}\n`}`)
+  write(join(folder, 'silk.toml'), `[package]\nname = "${name}"\nversion = "0.1.0"\n`)
   write(join(folder, 'src/main.silk'), `${sample.source}\n`)
   for (const [label, text] of Object.entries(sample.files)) {
     // `/home/you/<package>/...` is a package beside the sample's own `demo` folder.

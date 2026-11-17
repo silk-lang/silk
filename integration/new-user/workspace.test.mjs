@@ -44,7 +44,7 @@ test('check -p picks one member', () => {
 test('a member built from inside it prints its full output path', () => {
   const result = silk(h, ['build'], { cwd: join(shop, 'store') })
   assert.equal(result.status, 0, show(result))
-  assert.match(result.stderr, new RegExp(`Finished ${shop.replaceAll('.', '\\.')}/build/llvm/\\S+/debug/store in `))
+  assert.match(result.stderr, new RegExp(`Finished ${shop.replaceAll('.', '\\.')}/build/\\S+/dev/store in `))
 })
 
 test('test at the root runs each member and summarizes', () => {

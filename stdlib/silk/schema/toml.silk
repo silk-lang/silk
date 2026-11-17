@@ -1,0 +1,800 @@
+//! Read and write schema types as TOML.
+//!
+//! # When to use
+//! Use `SchemaToml.decode` for typed configuration files and `SchemaToml.encode` to write them.
+//! The type's schema controls field names, defaults, validation, and unknown fields.
+//!
+//! # Details
+//! TOML tables become schema objects, and arrays become lists. Strings remain text without scalar coercion.
+//! Encoding writes root assignments and nested inline tables in declaration order, with bare keys where TOML allows them. Absent optional fields are omitted.
+//! TOML has no null value; a null inside an array cannot be encoded.
+//!
+//! @category Data formats
+
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.io.writer { Writer, WriterError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.box { Box }
+import silk.num.i64
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+import silk.schema.issue {
+  Issue,
+  IssueReason,
+  MAX_PROBLEMS,
+  SchemaError,
+  SchemaErrors,
+  Span,
+  ValueKind
+}
+import silk.schema.path { SchemaPath, PathSegment }
+import silk.schema.schema { Schema, SchemaReader, SchemaWriter, Schemas }
+import silk.text.format { Format }
+import silk.text.string { String }
+import silk.toml.codec { TomlCodec }
+import silk.toml.output { TomlOutput }
+import silk.toml.scanner { TomlError }
+import silk.toml.value { Toml, Value, TomlChild }
+
+/// The entry points for reading and writing schema types as TOML.
+pub struct SchemaToml {}
+
+impl SchemaToml {
+  /// Reads a typed TOML document, stopping at the first problem.
+  ///
+  /// # Errors
+  /// - `SchemaError` if TOML syntax or schema validation fails. The path identifies the failing field.
+  /// - `OutOfMemoryError` if the allocator cannot supply the document or value.
+  pub effect fn decode<T: Schema>(bytes: &[u8]) -> T
+    ! SchemaError | OutOfMemoryError
+    ? &mut Allocator {
+    let document = match move run Effect.result(Toml.parse(bytes)) {
+      Result<Value, TomlError | OutOfMemoryError>.Success { value } => move value
+      Result<Value, TomlError | OutOfMemoryError>.Failure { error } => match move error {
+        TomlError { offset, .. } => {
+          fail SchemaError {
+            path: SchemaPath.make(),
+            issue: syntax(offset),
+            got: Option<String>.none(),
+          }
+        }
+        OutOfMemoryError {} => {
+          fail OutOfMemoryError {}
+        }
+      }
+    }
+    let mut reader = TomlSchemaReader.make(&document)
+    let read = run Effect.result(Schemas.read<T, TomlSchemaReader<'_>>(&mut reader))
+    return match move read {
+      Result<T, Issue | OutOfMemoryError>.Success { value } => move value
+      Result<T, Issue | OutOfMemoryError>.Failure { error } => match move error {
+        Issue { reason, expected, found, span } => {
+          fail SchemaError {
+            path: move reader.path,
+            issue: Issue { reason: reason, expected: expected, found: found, span: span },
+            got: Option<String>.none(),
+          }
+        }
+        OutOfMemoryError {} => {
+          fail OutOfMemoryError {}
+        }
+      }
+    }
+  }
+
+  /// Reads a typed TOML document and reports all schema problems, up to 64.
+  ///
+  /// # Details
+  ///
+  /// A field, element or variant that fails is recorded and skipped, and reading goes on with the
+  /// next one, so one call lists every problem, in schema order: a missing key, a wrong type, a
+  /// number out of range and a failed rule alike. Text that is not valid TOML is the one problem
+  /// reported. At most `MAX_PROBLEMS` (64) are listed.
+  ///
+  /// # Errors
+  ///
+  /// - `SchemaErrors` with every problem found.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the document or the value.
+  pub effect fn decodeAll<T: Schema>(bytes: &[u8]) -> T
+    ! SchemaErrors | OutOfMemoryError
+    ? &mut Allocator {
+    let document = match move run Effect.result(Toml.parse(bytes)) {
+      Result<Value, TomlError | OutOfMemoryError>.Success { value } => move value
+      Result<Value, TomlError | OutOfMemoryError>.Failure { error } => match move error {
+        TomlError { offset, .. } => {
+          let mut errors = List<SchemaError>.make()
+          run List<SchemaError>.append(
+            &mut errors,
+            SchemaError {
+              path: SchemaPath.make(),
+              issue: syntax(offset),
+              got: Option<String>.none(),
+            },
+          )
+          fail SchemaErrors { errors: move errors, dropped: usize.ZERO }
+        }
+        OutOfMemoryError {} => {
+          fail OutOfMemoryError {}
+        }
+      }
+    }
+    let mut reader = TomlSchemaReader.collectingAll(&document)
+    let read = run Effect.result(Schemas.read<T, TomlSchemaReader<'_>>(&mut reader))
+    return match move read {
+      Result<T, Issue | OutOfMemoryError>.Success { value } => {
+        if List<SchemaError>.length(&reader.errors) != 0 {
+          fail SchemaErrors { errors: move reader.errors, dropped: reader.dropped }
+        }
+        move value
+      }
+      Result<T, Issue | OutOfMemoryError>.Failure { error } => match move error {
+        Issue { reason, expected, found, span } => {
+          if reason != IssueReason.Reported {
+            run record(
+              &mut reader,
+              Issue { reason: reason, expected: expected, found: found, span: span },
+            )
+          }
+          fail SchemaErrors { errors: move reader.errors, dropped: reader.dropped }
+        }
+        OutOfMemoryError {} => {
+          fail OutOfMemoryError {}
+        }
+      }
+    }
+  }
+
+  /// Writes a typed value as a TOML document, without flushing the writer.
+  ///
+  /// # Details
+  /// The root must be an object. Nested objects use inline tables. Absent optional fields are omitted.
+  ///
+  /// # Errors
+  /// - `SchemaError` if the root is not an object, a list contains null, or nesting exceeds 64 levels.
+  /// - `WriterError` if output fails; already accepted bytes remain written.
+  /// - `OutOfMemoryError` if a custom codec cannot allocate.
+  pub effect fn encode<T: Schema>(value: &T) -> ()
+    ! SchemaError | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator {
+    let mut writer = TomlSchemaWriter.make()
+    return run Effect.catch<Issue>(
+      Schemas.write<T, TomlSchemaWriter>(value, &mut writer),
+      effect |issue: Issue| -> ()
+        ! SchemaError {
+        fail SchemaError { path: SchemaPath.make(), issue: issue, got: Option<String>.none() }
+      },
+    )
+  }
+}
+
+fn syntax(offset: usize) -> Issue {
+  return Issue.at(
+    IssueReason.InvalidSyntax,
+    "valid TOML",
+    ValueKind.Unknown,
+    Span { start: offset, end: offset + usize.ONE },
+  )
+}
+
+struct ObjectFrame<'document> {
+  node: &'document Value,
+  seen: usize
+}
+
+impl<'document> Copy for ObjectFrame<'document> {}
+
+struct ListFrame<'document> {
+  node: &'document Value,
+  next: usize
+}
+
+impl<'document> Copy for ListFrame<'document> {}
+
+struct Mark<'document> {
+  frames: usize,
+  lists: usize,
+  seen: usize,
+  current: &'document Value
+}
+
+impl<'document> Copy for Mark<'document> {}
+
+/// A schema reader over a parsed TOML value. Semantic errors have field paths; syntax errors also have byte spans.
+pub struct TomlSchemaReader<'document> {
+  current: &'document Value,
+  frames: List<ObjectFrame<'document>>,
+  seen: List<bool>,
+  lists: List<ListFrame<'document>>,
+  marks: List<Mark<'document>>,
+  path: SchemaPath,
+  collecting: bool,
+  errors: List<SchemaError>,
+  dropped: usize,
+  lastKind: ValueKind,
+}
+
+impl<'document> TomlSchemaReader<'document> {
+  /// Returns a reader that stops at the first schema problem.
+  pub fn make(value: &'document Value) -> Self {
+    return Self {
+      current: value,
+      frames: List<ObjectFrame<'document>>.make(),
+      seen: List<bool>.make(),
+      lists: List<ListFrame<'document>>.make(),
+      marks: List<Mark<'document>>.make(),
+      path: SchemaPath.make(),
+      collecting: false,
+      errors: List<SchemaError>.make(),
+      dropped: usize.ZERO,
+      lastKind: ValueKind.Unknown,
+    }
+  }
+
+  /// Returns a reader that collects up to 64 schema problems.
+  pub fn collectingAll(value: &'document Value) -> Self {
+    let mut reader = TomlSchemaReader<'document>.make(value)
+    reader.collecting = true
+    return move reader
+  }
+
+  /// Returns the recorded schema problems in traversal order.
+  pub fn intoErrors(self: Self) -> List<SchemaError> {
+    return move self.errors
+  }
+
+  fn mismatch(self: &Self, reason: IssueReason, expected: string<'static>) -> Issue {
+    return Issue {
+      reason: reason,
+      expected: expected,
+      found: kindOf(self.current),
+      span: Option<Span>.none(),
+    }
+  }
+
+  fn scalar(self: &mut Self) -> ValueKind {
+    self.lastKind = kindOf(self.current)
+    return self.lastKind
+  }
+}
+
+fn kindOf(value: &Value) -> ValueKind {
+  return match &value.* {
+    Value.Boolean { .. } => ValueKind.Boolean
+    Value.Integer { .. } => ValueKind.Number
+    Value.Float { .. } => ValueKind.Number
+    Value.String { .. } => ValueKind.Text
+    Value.Array { .. } => ValueKind.List
+    Value.Table { .. } => ValueKind.Object
+    _ => ValueKind.Unknown
+  }
+}
+
+const EMPTY_CHILDREN: [TomlChild; 0] = []
+
+fn children<'a>(value: &'a Value) -> &'a [TomlChild] {
+  return match &value.* {
+    Value.Table { entries, .. } => List<TomlChild>.asSlice(&Box<List<TomlChild>>.get(&entries)[0])
+    Value.Array { values, .. } => List<TomlChild>.asSlice(&Box<List<TomlChild>>.get(&values)[0])
+    _ => &EMPTY_CHILDREN
+  }
+}
+
+effect fn record(reader: &mut TomlSchemaReader<'_>, issue: Issue) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if List<SchemaError>.length(&reader.errors) >= MAX_PROBLEMS {
+    reader.dropped = reader.dropped + usize.ONE
+    return ()
+  }
+  let path = run SchemaPath.copy(&reader.path)
+  return run List<SchemaError>.append(
+    &mut reader.errors,
+    SchemaError { path: move path, issue: issue, got: Option<String>.none() },
+  )
+}
+
+impl<'document> SchemaReader for TomlSchemaReader<'document> {
+  fn path(self: &mut Self) -> &mut SchemaPath {
+    return &mut self.path
+  }
+
+  fn collecting(self: &Self) -> bool {
+    return self.collecting
+  }
+
+  fn lastKind(self: &Self) -> ValueKind {
+    return self.lastKind
+  }
+
+  effect fn report(self: &mut Self, issue: Issue) -> ()
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator {
+    if !self.collecting {
+      fail issue
+    }
+    return run record(&mut self.*, issue)
+  }
+
+  effect fn mark(self: &mut Self) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let at = List<Mark<'document>>.length(&self.marks)
+    run List<Mark<'document>>.append(
+      &mut self.marks,
+      Mark<'document> {
+        frames: List<ObjectFrame<'document>>.length(&self.frames),
+        lists: List<ListFrame<'document>>.length(&self.lists),
+        seen: List<bool>.length(&self.seen),
+        current: self.current,
+      },
+    )
+    return at
+  }
+
+  effect fn recover(self: &mut Self, mark: usize, skip: bool) -> ()
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator {
+    let saved = List<Mark<'document>>.get(&self.marks, mark)
+    List<Mark<'document>>.truncate(&mut self.marks, mark)
+    List<ObjectFrame<'document>>.truncate(&mut self.frames, saved.frames)
+    List<ListFrame<'document>>.truncate(&mut self.lists, saved.lists)
+    List<bool>.truncate(&mut self.seen, saved.seen)
+    self.current = saved.current
+    if skip {
+      self.lastKind = kindOf(self.current)
+    }
+    return ()
+  }
+
+  fn release(self: &mut Self, mark: usize) -> () {
+    List<Mark<'document>>.truncate(&mut self.marks, mark)
+  }
+
+  effect fn boolean(self: &mut Self) -> bool
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator {
+    let kind = self.scalar()
+    return match &self.current.* {
+      Value.Boolean { value } => value
+      _ => {
+        fail self.mismatch(IssueReason.InvalidType, "true or false")
+      }
+    }
+  }
+
+  effect fn signed(self: &mut Self) -> i64
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator {
+    let kind = self.scalar()
+    if let Value.Integer { .. } = &self.current.* {} else {
+      fail self.mismatch(IssueReason.InvalidType, "an integer")
+    }
+    return match move TomlCodec.decodeOne<i64>(self.current) {
+      Result<i64, TomlError>.Success { value } => value
+      Result<i64, TomlError>.Failure { .. } => {
+        fail self.mismatch(
+          if kind == ValueKind.Number {
+            IssueReason.InvalidValue
+          } else {
+            IssueReason.InvalidType
+          },
+          "an integer that fits in i64",
+        )
+      }
+    }
+  }
+
+  effect fn unsigned(self: &mut Self) -> u64
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator {
+    let kind = self.scalar()
+    let text = match &self.current.* {
+      Value.Integer { text } => String.view(&text)
+      _ => {
+        fail self.mismatch(IssueReason.InvalidType, "a non-negative integer")
+      }
+    }
+    return run unsignedValue(text)
+  }
+
+  effect fn float(self: &mut Self) -> f64
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator {
+    let kind = self.scalar()
+    if let Value.Integer { .. } = &self.current.* {
+      return i64.toF64(run SchemaReader.signed(&mut self.*))
+    }
+    if let Value.Float { .. } = &self.current.* {
+      return run Effect.catch<TomlError>(
+        TomlCodec.deserializeOne<f64>(self.current),
+        effect |error: TomlError| -> f64
+          ! Issue {
+          fail Issue.invalidValue("a number that fits in f64")
+        },
+      )
+    }
+    fail self.mismatch(IssueReason.InvalidType, "a number")
+  }
+
+  effect fn text(self: &mut Self) -> String
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator {
+    let kind = self.scalar()
+    return match &self.current.* {
+      Value.String { text } => run String.copy(String.view(&text))
+      _ => {
+        fail self.mismatch(IssueReason.InvalidType, "text")
+      }
+    }
+  }
+
+  effect fn null(self: &mut Self) -> bool
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator {
+    return false
+  }
+
+  effect fn beginList(self: &mut Self) -> ()
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator {
+    if kindOf(self.current) != ValueKind.List {
+      fail self.mismatch(IssueReason.InvalidType, "a list")
+    }
+    return run List<ListFrame<'document>>.append(
+      &mut self.lists,
+      ListFrame<'document> { node: self.current, next: usize.ZERO },
+    )
+  }
+
+  effect fn nextElement(self: &mut Self) -> bool
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator {
+    let top = List<ListFrame<'document>>.length(&self.lists) - usize.ONE
+    let frame = List<ListFrame<'document>>.get(&self.lists, top)
+    return match Toml.item(frame.node, frame.next) {
+      Option<&Value>.Some { value } => {
+        self.current = value
+        List<ListFrame<'document>>.set(
+          &mut self.lists,
+          top,
+          ListFrame<'document> { node: frame.node, next: frame.next + usize.ONE },
+        )
+        true
+      }
+      Option<&Value>.None => {
+        List<ListFrame<'document>>.truncate(&mut self.lists, top)
+        self.current = frame.node
+        self.lastKind = ValueKind.List
+        false
+      }
+    }
+  }
+
+  effect fn beginObject(self: &mut Self) -> ()
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator {
+    if kindOf(self.current) != ValueKind.Object {
+      fail self.mismatch(IssueReason.InvalidType, "an object")
+    }
+    let seen = List<bool>.length(&self.seen)
+    run List<bool>.appendRepeated(&mut self.seen, false, children(self.current).length)
+    return run List<ObjectFrame<'document>>.append(
+      &mut self.frames,
+      ObjectFrame<'document> { node: self.current, seen: seen },
+    )
+  }
+
+  effect fn member(self: &mut Self, key: string) -> bool
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator {
+    let frame = List<ObjectFrame<'document>>.get(
+      &self.frames,
+      List<ObjectFrame<'document>>.length(&self.frames) - usize.ONE,
+    )
+    let entries = children(frame.node)
+    let mut index = usize.ZERO
+    while index < entries.length {
+      if let TomlChild.Member { entry } = &entries[index] {
+        if String.view(&entry.key) == key {
+          List<bool>.set(&mut self.seen, frame.seen + index, true)
+          self.current = &entry.value
+          return true
+        }
+      }
+      index = index + usize.ONE
+    }
+    self.current = frame.node
+    self.lastKind = ValueKind.Missing
+    return false
+  }
+
+  effect fn nextMember(self: &mut Self) -> Option<String>
+    ! Issue | OutOfMemoryError ? &mut Allocator {
+    let frame = List<ObjectFrame<'document>>.get(&self.frames, self.frames.length() - usize.ONE)
+    let entries = children(frame.node)
+    let mut at = usize.ZERO
+    while at < entries.length {
+      if !self.seen.get(frame.seen + at) {
+        if let TomlChild.Member {entry} = &entries[at] {
+          self.seen.set(frame.seen + at, true)
+          self.current = &entry.value
+          return Option<String>.some(run String.copy(entry.key.view()))
+        }
+      }
+      at = at + usize.ONE
+    }
+    return Option<String>.none()
+  }
+
+  effect fn rejectUnread(self: &mut Self, expected: string<'static>) -> ()
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator {
+    let frame = List<ObjectFrame<'document>>.get(
+      &self.frames,
+      List<ObjectFrame<'document>>.length(&self.frames) - usize.ONE,
+    )
+    let entries = children(frame.node)
+    let mut index = usize.ZERO
+    while index < entries.length {
+      if !List<bool>.get(&self.seen, frame.seen + index) {
+        if let TomlChild.Member {entry} = &entries[index] {
+          run self.path.push(PathSegment.Key {name: run String.copy(entry.key.view())})
+          run SchemaReader.report(&mut self.*, Issue.make(IssueReason.UnexpectedKey, expected))
+          self.path.pop()
+        }
+      }
+      index = index + usize.ONE
+    }
+    return ()
+  }
+
+  effect fn endObject(self: &mut Self) -> ()
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator {
+    let frame = match List<ObjectFrame<'document>>.pop(&mut self.frames) {
+      Option<ObjectFrame<'document>>.Some { value } => value
+      Option<ObjectFrame<'document>>.None => {
+        fail Issue.make(IssueReason.InvalidSyntax, "an object")
+      }
+    }
+    List<bool>.truncate(&mut self.seen, frame.seen)
+    self.current = frame.node
+    self.lastKind = ValueKind.Object
+    return ()
+  }
+}
+
+effect fn unsignedValue(text: string) -> u64
+  ! Issue {
+  let bytes = String.utf8Bytes(text)
+  let mut at = usize.ZERO
+  if bytes.length > usize.ZERO && bytes[0] == 43 {
+    at = usize.ONE
+  }
+  let mut radix: u64 = 10
+  if at + usize.ONE < bytes.length && bytes[at] == 48 {
+    if bytes[at + usize.ONE] == 120 {
+      radix = 16
+      at = at + 2
+    } else if bytes[at + usize.ONE] == 111 {
+      radix = 8
+      at = at + 2
+    } else if bytes[at + usize.ONE] == 98 {
+      radix = 2
+      at = at + 2
+    }
+  }
+  let mut value: u64 = 0
+  let mut digits = usize.ZERO
+  while at < bytes.length {
+    let byte = bytes[at]
+    if byte != 95 {
+      let digit = if byte >= 48 && byte <= 57 {
+        u8.toU64(byte - 48)
+      } else if byte >= 65 && byte <= 70 {
+        u8.toU64(byte - 65) + 10
+      } else if byte >= 97 && byte <= 102 {
+        u8.toU64(byte - 97) + 10
+      } else {
+        u64.MAX
+      }
+      if digit >= radix || value > (u64.MAX - digit) / radix {
+        fail Issue.invalidValue("an integer that fits in u64")
+      }
+      value = value * radix + digit
+      digits = digits + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  if digits == usize.ZERO {
+    fail Issue.invalidValue("a non-negative integer")
+  }
+  return value
+}
+
+const MAX_DEPTH: usize = 64
+
+/// A `SchemaWriter` that writes TOML assignments and inline tables to the ambient `Writer`.
+///
+/// # When to use
+///
+/// [`SchemaToml.encode`] uses it. The root must be an object. Optional fields with no value are omitted by the schema.
+pub struct TomlSchemaWriter {
+  first: [bool; 64],
+  depth: usize,
+}
+
+impl TomlSchemaWriter {
+  /// Returns a writer for one top-level value.
+  pub fn make() -> TomlSchemaWriter {
+    return TomlSchemaWriter { first: [false; 64], depth: usize.ZERO }
+  }
+}
+
+effect fn opened(self: &mut TomlSchemaWriter, bracket: &[u8]) -> ()
+  ! Issue | WriterError
+  ? &mut Writer {
+  if self.depth == usize.ZERO && bracket != b"" {
+    fail Issue.invalidValue("a TOML root object")
+  }
+  if self.depth + usize.ONE >= MAX_DEPTH {
+    fail Issue.invalidValue("a value nested at most 64 levels deep")
+  }
+  self.depth = self.depth + usize.ONE
+  self.first[self.depth] = true
+  return run Writer.writeAll(bracket)
+}
+
+effect fn closed(self: &mut TomlSchemaWriter, bracket: &[u8]) -> ()
+  ! Issue | WriterError
+  ? &mut Writer {
+  self.depth = self.depth - usize.ONE
+  return run Writer.writeAll(bracket)
+}
+
+effect fn separated(self: &mut TomlSchemaWriter) -> ()
+  ! Issue | WriterError
+  ? &mut Writer {
+  if self.first[self.depth] {
+    self.first[self.depth] = false
+    return ()
+  }
+  return run Writer.writeAll(
+    if self.depth == usize.ONE {
+      b"\n"
+    } else {
+      b", "
+    },
+  )
+}
+
+effect fn tomlFailure(error: TomlError) -> ()
+  ! Issue {
+  fail Issue.invalidValue("a TOML number")
+}
+
+impl SchemaWriter for TomlSchemaWriter {
+  /// Writes `true` or `false`.
+  effect fn boolean(self: &mut Self, value: bool) -> ()
+    ! Issue | WriterError
+    ? &mut Writer {
+    if self.depth == usize.ZERO {
+      fail Issue.invalidValue("a TOML root object")
+    }
+    if value {
+      return run Writer.writeAll(b"true")
+    }
+    return run Writer.writeAll(b"false")
+  }
+
+  /// Writes the integer in decimal.
+  effect fn signed(self: &mut Self, value: i64) -> ()
+    ! Issue | WriterError
+    ? &mut Writer {
+    if self.depth == usize.ZERO {
+      fail Issue.invalidValue("a TOML root object")
+    }
+    let mut digits: [u8; 24] = [0; 24]
+    let end = Format.writeI64Display(value, &mut digits, usize.ZERO)
+    return run Writer.writeAll(Slice.view<u8>(&digits, usize.ZERO, end))
+  }
+
+  /// Writes the integer in decimal.
+  effect fn unsigned(self: &mut Self, value: u64) -> ()
+    ! Issue | WriterError
+    ? &mut Writer {
+    if self.depth == usize.ZERO {
+      fail Issue.invalidValue("a TOML root object")
+    }
+    let mut digits: [u8; 24] = [0; 24]
+    let end = Format.writeU64Display(value, &mut digits, usize.ZERO)
+    return run Writer.writeAll(Slice.view<u8>(&digits, usize.ZERO, end))
+  }
+
+  /// Writes a TOML float, including infinities and NaN.
+  effect fn float(self: &mut Self, value: f64) -> ()
+    ! Issue | WriterError
+    ? &mut Writer {
+    if self.depth == usize.ZERO {
+      fail Issue.invalidValue("a TOML root object")
+    }
+    return run Effect.catch<TomlError>(TomlCodec.writeOne<f64>(&value), tomlFailure)
+  }
+
+  /// Writes a quoted TOML string.
+  effect fn text(self: &mut Self, value: string) -> ()
+    ! Issue | WriterError
+    ? &mut Writer {
+    if self.depth == usize.ZERO {
+      fail Issue.invalidValue("a TOML root object")
+    }
+    return run TomlOutput.writeString(value)
+  }
+
+  /// Rejects null, which TOML cannot represent.
+  effect fn null(self: &mut Self) -> ()
+    ! Issue | WriterError
+    ? &mut Writer {
+    fail Issue.invalidValue("a TOML value other than null")
+  }
+
+  /// Writes `[`.
+  effect fn beginList(self: &mut Self) -> ()
+    ! Issue | WriterError
+    ? &mut Writer {
+    return run opened(&mut self.*, b"[")
+  }
+
+  /// Writes `,` before every element but the first.
+  effect fn element(self: &mut Self) -> ()
+    ! Issue | WriterError
+    ? &mut Writer {
+    return run separated(&mut self.*)
+  }
+
+  /// Writes `]`.
+  effect fn endList(self: &mut Self) -> ()
+    ! Issue | WriterError
+    ? &mut Writer {
+    return run closed(&mut self.*, b"]")
+  }
+
+  /// Starts the root document or a nested inline table.
+  effect fn beginObject(self: &mut Self) -> ()
+    ! Issue | WriterError
+    ? &mut Writer {
+    let bracket = if self.depth == usize.ZERO {
+      b""
+    } else {
+      b"{"
+    }
+    return run opened(&mut self.*, bracket)
+  }
+
+  /// Separates assignments and writes the key followed by ` = `. A key of ASCII letters, digits, `-` and `_` is written bare, any other key quoted.
+  effect fn key(self: &mut Self, name: string) -> ()
+    ! Issue | WriterError
+    ? &mut Writer {
+    run separated(&mut self.*)
+    run TomlOutput.writeKey(name)
+    return run Writer.writeAll(b" = ")
+  }
+
+  /// Ends the root document or a nested inline table.
+  effect fn endObject(self: &mut Self) -> ()
+    ! Issue | WriterError
+    ? &mut Writer {
+    let bracket = if self.depth == usize.ONE {
+      b"\n"
+    } else {
+      b"}"
+    }
+    return run closed(&mut self.*, bracket)
+  }
+}

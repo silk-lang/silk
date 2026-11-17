@@ -46,6 +46,23 @@ function Invoke-Checked([string]$Name, [string]$Program, [string[]]$Arguments, [
   } finally { $child.Dispose() }
 }
 
+function Build-Definition([string]$Name, [string]$Manifest, [string]$Source, [string]$ArtifactPath, [string]$Artifact, [string[]]$Links) {
+  $definition = "$ArtifactPath.definition.toml"
+  $request = "$ArtifactPath.request.toml"
+  $text = @(
+    ('manifest = ' + (ConvertTo-Json -InputObject $Manifest -Compress)),
+    ('stdlib = ' + (ConvertTo-Json -InputObject $library -Compress)),
+    ('artifact = ' + (ConvertTo-Json -InputObject $Artifact -Compress)),
+    '[settings]', 'modules = []',
+    ('root = ' + (ConvertTo-Json -InputObject $Source -Compress)),
+    '[settings.profile]', 'target = "x86_64-pc-windows-msvc"', 'optimization = "speed"', 'debug = false',
+    '[settings.native]', 'sources = []', ('link = [' + ($Links -join ',') + ']')
+  ) -join "`n"
+  [IO.File]::WriteAllText($definition, $text)
+  $null = Invoke-Checked "$Name-resolve" $compilerPath @('resolve', '--definition', $definition, '--output', $request, '--artifact', $ArtifactPath)
+  $null = Invoke-Checked $Name $compilerPath @('compile', '--request', $request)
+}
+
 try {
   $version = Invoke-Checked 'version' $compilerPath @('--version')
   if ([string]::IsNullOrWhiteSpace($version)) { throw 'Compiler version was empty' }
@@ -56,6 +73,7 @@ try {
   $source = Join-Path $package 'src/main.silk'
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'hello.silk') -Destination $source
   $clang = Join-Path $LlvmBin 'clang.exe'
+  $env:SILK_CLANG = $clang
   # Spaces test the compiler's own path conversion and Clang process quoting at the real boundary.
   $program = Join-Path $output 'hello from windows.exe'
   $null = Invoke-Checked 'build' $compilerPath @('build', $source, '-o', $program,
@@ -77,24 +95,22 @@ try {
     $name = ('empty object {0:D3} ' -f $index) + ('x' * 32) + '.obj'
     $destination = Join-Path $responsePackage $name
     Copy-Item -LiteralPath $emptyObject -Destination $destination
-    $links.Add('{ object = "' + $name + '" }')
+    $links.Add('{ kind = "object", value = ' + (ConvertTo-Json -InputObject $destination -Compress) + ', weak = false, needed = false }')
     $objectArgumentLength += $destination.Length + 3
   }
   if ($objectArgumentLength -le 32767) { throw 'Long-link control does not exceed the Windows command-line limit' }
-  $manifest = [IO.File]::ReadAllText((Join-Path $package 'silk.toml')) + "`n[native]`nlink = [" + ($links -join ',') + "]`n"
+  $manifest = [IO.File]::ReadAllText((Join-Path $package 'silk.toml'))
   [IO.File]::WriteAllText((Join-Path $responsePackage 'silk.toml'), $manifest)
   $responseExecutable = Join-Path $responsePackage 'response file program.exe'
-  $null = Invoke-Checked 'response-build' $compilerPath @('build', (Join-Path $responsePackage 'src/main.silk'),
-    '-o', $responseExecutable, '--stdlib', $library, '--clang', $clang, '--optimization', 'speed', '--debug', 'false')
+  Build-Definition 'response-build' (Join-Path $responsePackage 'silk.toml') (Join-Path $responsePackage 'src/main.silk') $responseExecutable 'executable' ($links.ToArray())
   if ((Invoke-Checked 'response-execute' $responseExecutable @()) -cne $hello) { throw 'Response-file executable output differs' }
   $results.Add(@{ name = 'response-command-limit'; objectArgumentLength = $objectArgumentLength })
   $archiveSource = Join-Path $responsePackage 'src/library.silk'
   [IO.File]::WriteAllText($archiveSource, 'export "C" fn silk_response_answer(value: i32) -> i32 { return value + 1 }')
-  $archiveManifest = "[package]`nname = `"response-library`"`nversion = `"0.0.0`"`nsilk-version = `"0.0.0`"`nmain = `"library.silk`"`nkind = `"static-library`"`n[native]`nlink = [" + ($links -join ',') + "]`n"
+  $archiveManifest = "[package]`nname = `"response-library`"`nversion = `"0.0.0`"`nsilk-version = `"0.0.0`"`nmain = `"library.silk`"`nkind = `"library`"`n"
   [IO.File]::WriteAllText((Join-Path $responsePackage 'silk.toml'), $archiveManifest)
   $archive = Join-Path $responsePackage 'response library.lib'
-  $null = Invoke-Checked 'response-archive' $compilerPath @('build', $archiveSource, '-o', $archive,
-    '--stdlib', $library, '--clang', $clang, '--optimization', 'speed', '--debug', 'false')
+  Build-Definition 'response-archive' (Join-Path $responsePackage 'silk.toml') $archiveSource $archive 'static-archive' ($links.ToArray())
   $members = Invoke-Checked 'response-archive-members' (Join-Path $LlvmBin 'llvm-ar.exe') @('t', $archive)
   $listed = @($members -split "`r?`n" | Where-Object { $_.Length -gt 0 })
   if ($listed.Count -ne 401) { throw 'Response-file archive did not retain every declared object and the Silk object' }

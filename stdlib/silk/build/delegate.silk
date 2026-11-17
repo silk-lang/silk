@@ -1,0 +1,247 @@
+//! A build graph as a task program hands it to the compiler, and the compiler's answer.
+//!
+//! A task program describes its standard steps instead of running them. The compiler restores
+//! the description, runs the steps and answers where each left its outputs.
+
+import silk.build.context as Context
+import silk.build.encoding as Encoding
+import silk.build.step { StepDescription, StepError, StepFailure }
+import silk.cli.task { Task, TaskError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.crypto.sha2 { Sha256 }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.schema.json { SchemaJson }
+import silk.schema.schema { Schema, Spec }
+import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.text.string { String }
+import silk.num.usize
+import silk.num.u8
+
+/// One requested root of a described graph.
+pub struct RootDescription {
+  /// The step's identity within the description.
+  pub node: u64,
+  /// The output that becomes the root's artifact.
+  pub name: String,
+  /// Whether the root is a compilation, which publishes its request.
+  pub compilation: bool,
+}
+
+impl Schema for RootDescription {
+  static fn spec() -> Spec<RootDescription> {
+    return Spec<RootDescription>.of() |> Spec<RootDescription>.strict()
+  }
+}
+
+/// A build graph as the task program hands it to the compiler.
+pub struct GraphDescription {
+  /// The description format.
+  pub version: u64,
+  /// The package directory.
+  pub root: String,
+  /// The executable that constructed the graph, whose contents enter every step key.
+  pub program: Option<String>,
+  /// An explicit hexadecimal identity in place of the program's contents.
+  pub identity: Option<String>,
+  /// The step cache directory, when the caller chose one.
+  pub cache: Option<String>,
+  /// Whether requested compilations run, or only publish their requests.
+  pub compile: bool,
+  /// Whether the roots publish their requests and artifacts, or only run.
+  pub publish: bool,
+  /// The bound on the sum of running steps' memory estimates, in bytes.
+  pub memory: u64,
+  /// The maximum number of workers.
+  pub workers: u64,
+  /// Every step of the graph, each after the steps it reads.
+  pub steps: List<StepDescription>,
+  /// The requested roots, in the order they were added.
+  pub roots: List<RootDescription>,
+}
+
+impl Schema for GraphDescription {
+  static fn spec() -> Spec<GraphDescription> {
+    return Spec<GraphDescription>.of() |> Spec<GraphDescription>.strict()
+  }
+}
+
+/// One completed artifact of a described graph.
+pub struct ArtifactDescription {
+  /// The artifact's name.
+  pub name: String,
+  /// The artifact's path.
+  pub path: String,
+  /// The published request file of a compilation.
+  pub request: Option<String>,
+}
+
+impl Schema for ArtifactDescription {
+  static fn spec() -> Spec<ArtifactDescription> {
+    return Spec<ArtifactDescription>.of() |> Spec<ArtifactDescription>.strict()
+  }
+}
+
+/// Where one described step left its outputs.
+pub struct OutputDescription {
+  /// The step's identity within the description.
+  pub node: u64,
+  /// The step's cache directory.
+  pub directory: String,
+  /// Whether the step runs every time.
+  pub volatile: bool,
+  /// Whether the step is a compilation.
+  pub compilation: bool,
+  /// Whether a compilation built its artifact, or only wrote its request.
+  pub compiled: bool,
+}
+
+impl Schema for OutputDescription {
+  static fn spec() -> Spec<OutputDescription> {
+    return Spec<OutputDescription>.of() |> Spec<OutputDescription>.strict()
+  }
+}
+
+/// One compilation the compiler reached while running a described graph.
+pub struct CompiledDescription {
+  /// The compilation's cache directory.
+  pub directory: String,
+  /// Whether it built its artifact, or only wrote its request.
+  pub compiled: bool,
+}
+
+impl Schema for CompiledDescription {
+  static fn spec() -> Spec<CompiledDescription> {
+    return Spec<CompiledDescription>.of() |> Spec<CompiledDescription>.strict()
+  }
+}
+
+/// What the compiler answers after running a described graph.
+pub struct Outcome {
+  /// The failure to report, when the graph did not complete.
+  pub error: Option<String>,
+  /// The completed artifacts of a published graph, in the order their roots were added.
+  pub artifacts: List<ArtifactDescription>,
+  /// The steps of a graph that was only run.
+  pub outputs: List<OutputDescription>,
+  /// The compilations reached by a graph that was only run.
+  pub compilations: List<CompiledDescription>,
+}
+
+impl Schema for Outcome {
+  static fn spec() -> Spec<Outcome> {
+    return Spec<Outcome>.of() |> Spec<Outcome>.strict()
+  }
+}
+
+/// Writes bytes as lowercase hexadecimal text.
+pub effect fn hexadecimal(bytes: &[u8]) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let digits = b"0123456789abcdef"
+  let mut output = Bytes.make()
+  let mut at = usize.ZERO
+  while at < bytes.length {
+    let value = u8.toUsize(bytes[at])
+    run output.append(&[digits[value / 16], digits[value % 16]])
+    at = at + usize.ONE
+  }
+  return unsafe String.fromBytesUnchecked(move output)
+}
+
+fn digit(byte: u8) -> u8 {
+  if byte >= 97 {
+    return byte - 87
+  }
+  return byte - 48
+}
+
+/// Reads the bytes that [`hexadecimal`] wrote.
+pub effect fn binary(text: string) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let digits = String.utf8Bytes(text)
+  let mut output = Bytes.make()
+  let mut at = usize.ZERO
+  while at + usize.ONE < digits.length {
+    run output.append(&[digit(digits[at]) * 16 + digit(digits[at + usize.ONE])])
+    at = at + 2
+  }
+  return move output
+}
+
+effect fn discard(path: &Path) -> ()
+  ? &mut FileSystem {
+  let removed = run Effect.result(FileSystem.removeFile(path))
+  match move removed {
+    Result<(), FileError>.Success { .. } => ()
+    Result<(), FileError>.Failure { error } => {
+      drop error
+    }
+  }
+}
+
+/// Hands a described graph to the compiler and reads its answer. The description and the answer
+/// are files in `directory`, named by the description's contents, and removed afterwards.
+///
+/// # Errors
+/// `StepError` with the compiler's report when the graph fails, or when the compiler cannot run.
+pub effect fn submit(description: &GraphDescription, directory: &Path) -> Outcome
+  ! StepFailure
+  ? &mut Allocator | &mut FileSystem | &mut HostInput {
+  let compiler = run Context.compilerPath()
+  run FileSystem.createDirectoriesRecursively(directory)
+  let encoded = run Encoding.json<GraphDescription>(description)
+  let mut hash = Sha256.make()
+  hash.update(encoded.asSlice())
+  let digest = hash.finish()
+  let mut name = run hexadecimal(&digest)
+  let mut answer = run String.copy(name.view())
+  run name.append(".json")
+  run answer.append(".outcome.json")
+  let input = run Path.join(directory, name.view())
+  let output = run Path.join(directory, answer.view())
+  run FileSystem.writeFileAtomic(
+    &input,
+    encoded.asSlice(),
+    FileSystem.replaceExisting(),
+    FileSystem.buffered(),
+  )
+  let mut words = List<Bytes>.make()
+  run words.append(run Bytes.copy(b"graph"))
+  run words.append(run Bytes.copy(b"--description"))
+  run words.append(run Bytes.copy(Path.rawBytes(&input)))
+  run words.append(run Bytes.copy(b"--outcome"))
+  run words.append(run Bytes.copy(Path.rawBytes(&output)))
+  let ran = run Effect.result(Task.execBytes(Path.rawBytes(&compiler), words.asSlice()))
+  run discard(&input)
+  match move ran {
+    Result<(), TaskError | HostInputError | OutOfMemoryError>.Success { .. } => ()
+    Result<(), TaskError | HostInputError | OutOfMemoryError>.Failure {
+      error
+    } => match move error {
+      TaskError failed => {
+        drop failed
+        run discard(&output)
+        fail StepError { message: run String.copy("the compiler could not run the build graph") }
+      }
+      HostInputError unread => {
+        fail move unread
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+  let bytes = run FileSystem.readFile(&output)
+  run discard(&output)
+  let outcome = run SchemaJson.decode<Outcome>(bytes.asSlice())
+  if let Option<String>.Some { value } = &outcome.error {
+    fail StepError { message: run String.copy(value.view()) }
+  }
+  return move outcome
+}

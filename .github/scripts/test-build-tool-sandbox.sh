@@ -15,22 +15,21 @@ printf '20' > base.txt
 printf 'secret' > "$root/secret.txt"
 cat > build.silk <<'SILK'
 import silk.build.plan { Plan }
+import silk.build.run { Run }
+import silk.build.step { sourcePath }
 
-static fn plan() -> string<'static> {
-  let mut plan = Plan.empty()
-  plan = Plan.tool(plan, "gen", "tools/gen.sh")
-  plan = Plan.toolArgument(plan, "base.txt")
-  plan = Plan.toolInput(plan, "base.txt")
-  plan = Plan.toolOutput(plan, "generated.silk")
-  plan = Plan.toolModule(plan, "generated_base", "gen", "generated.silk")
-  return plan
+static fn plan() -> Plan {
+  let generate = Run.command("tools/gen.sh")
+    |> Run.input(sourcePath("base.txt"))
+    |> Run.output("generated.silk")
+  return Plan.empty() |> Plan.module("generated_base", Run.result(&generate, "generated.silk"))
 }
 
-pub const PLAN: string = plan()
+pub const PLAN: Plan = plan()
 SILK
 printf 'import generated_base\n\npub fn main() -> i32 {\n  return generated_base.BASE + 1\n}\n' > main.silk
 tool() {
-  printf '#!/bin/sh\n%s\nprintf "pub const BASE: i32 = %%s\\n" "$(cat "$SILK_PACKAGE_DIR/$1")" > generated.silk\n' "$1" > tools/gen.sh
+  printf '#!/bin/sh\n%s\nprintf "pub const BASE: i32 = %%s\\n" "$(cat "$1")" > "$2"\n' "$1" > tools/gen.sh
   chmod +x tools/gen.sh
 }
 build() { "$compiler" build --stdlib "$stdlib" > "$root/build.log" 2>&1; }
@@ -46,9 +45,9 @@ expect_refused() {
     cat "$root/build.log"
     exit 1
   fi
-  grep -q "its tool step \`gen\` failed with status 7" "$root/build.log" || { cat "$root/build.log"; exit 1; }
+  grep -q "build process failed with status 7" "$root/build.log" || { cat "$root/build.log"; exit 1; }
 }
-expect_refused "echo pwned > \"\$SILK_PACKAGE_DIR/pwned\" || exit 7" "write to the package directory"
+expect_refused "echo pwned > \"$root/app/pwned\" || exit 7" "write to the package directory"
 test ! -e pwned
 expect_refused "cat \"$root/secret.txt\" > /dev/null || exit 7" "read an undeclared file"
 expect_refused "curl -s --max-time 5 -o /dev/null https://example.com || exit 7" "open a network connection"
