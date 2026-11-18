@@ -6,6 +6,7 @@ import backend.SsaControlFlow
 import backend.SsaDeadCode
 import backend.SsaFunction {Binary, Cast, Edge, Exit, Kind, Operation, Predicate, SsaFunction, none}
 import backend.SsaGraph {SsaGraph}
+import backend.SsaIdioms
 import backend.SsaLoops
 import backend.SsaMemory
 import backend.SsaPipeline
@@ -25,7 +26,7 @@ import silk.num.u64
 import silk.num.usize
 
 // The instructions a test counts.
-enum Sort { Add, Divide, Load, Store, Copy, Call, Compare, Select, Cast, Overflow, Any }
+enum Sort { Add, Divide, Load, Store, Copy, CountedCopy, CountedFill, Call, Compare, Select, Cast, Overflow, Any }
 
 fn sorted(operation: Operation, sort: Sort) -> bool {
   return match operation {
@@ -34,6 +35,8 @@ fn sorted(operation: Operation, sort: Sort) -> bool {
     Operation.Load {..} => sort == Sort.Any || sort == Sort.Load
     Operation.Store {..} => sort == Sort.Any || sort == Sort.Store
     Operation.CopyBytes {..} => sort == Sort.Any || sort == Sort.Copy
+    Operation.CopyCounted => sort == Sort.Any || sort == Sort.CountedCopy
+    Operation.FillCounted => sort == Sort.Any || sort == Sort.CountedFill
     Operation.Call {..} => sort == Sort.Any || sort == Sort.Call
     Operation.Compare {..} => sort == Sort.Any || sort == Sort.Compare
     Operation.Select => sort == Sort.Any || sort == Sort.Select
@@ -1282,4 +1285,129 @@ effect fn loopClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut
   run copied.finish()
   run SsaPipeline.prepare(&mut copied, Level.Speed, true)
   run Testing.expect(count(&copied, Sort.Any, usize.MAX) == usize.ZERO, "the pipeline reduces a stored and reloaded constant to a return")
+}
+
+// A loop over bytes: `while at < bound { ...; at = at + 1 }` from zero, or from the argument
+// `first` with `offset`, or with `down`, `while at > 0 { at = at - 1; ... }` from `bound`. Each
+// time round it stores at index `at` of `to` the byte at that index of `from` with `copies`, the
+// low byte of the counter with `varying`, and else the argument `byte`.
+effect fn byteLoop(copies: bool, down: bool, offset: bool, varying: bool) -> SsaFunction ! OutOfMemoryError ? &mut Allocator {
+  let mut function = run SsaFunction.make(b"bytes", 32)
+  let word = Kind.integer(32)
+  let to = run function.argument(Kind.address(32))
+  let from = run function.argument(Kind.address(32))
+  let bound = run function.argument(word)
+  let first = run function.argument(word)
+  let byte = run function.argument(Kind.integer(8))
+  function.setResult(word)
+  let entry = run function.newBlock()
+  let head = run function.newBlock()
+  let body = run function.newBlock()
+  let out = run function.newBlock()
+  let at = run function.addParameter(head, word)
+  function.startBlock(entry)
+  let zero = run function.integer(32, 0)
+  let one = run function.integer(32, 1)
+  let mut start = zero
+  if offset { start = first }
+  if down { start = bound }
+  run function.jumpWith(head, &[start])
+  function.startBlock(head)
+  let mut more = none()
+  if down { more = run function.compare(Predicate.Ult, zero, at) } else { more = run function.compare(Predicate.Ugt, bound, at) }
+  run function.branchIf(more, body, out)
+  function.startBlock(body)
+  let mut reached = at
+  let mut next = none()
+  if down {
+    next = run function.binary(Binary.Sub, at, one)
+    reached = next
+  }
+  let target = run function.indexed(to, reached)
+  let mut stored = byte
+  if copies {
+    let origin = run function.indexed(from, reached)
+    stored = run function.load(Kind.integer(8), origin, 0, 1)
+  }
+  if varying { stored = run function.cast(Cast.Trunc, at, Kind.integer(8)) }
+  run function.store(stored, target, 0, 1)
+  if !down { next = run function.binary(Binary.Add, at, one) }
+  run function.jumpWith(head, &[next])
+  function.startBlock(out)
+  run function.ret(zero)
+  run function.finish()
+  return move function
+}
+
+test effect fn byteLoopsBecomeFillsAndCopies() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run idiomClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// The operands of the one subtraction of two addresses' bits in `function`: the arguments those
+// addresses are, by position, or `usize.MAX` twice without one.
+fn distanceOf(function: &SsaFunction) -> [usize; 2] {
+  let mut found: [usize; 2] = [usize.MAX, usize.MAX]
+  let mut block = usize.ZERO
+  while block < function.blockCount() {
+    let listed = List<usize>.asSlice(&function.block(block).instructions)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      if let Operation.Binary {operation: Binary.Sub} = function.instruction(listed[at]).operation {
+        let operands = function.operandsOf(listed[at])
+        let high = function.producerOf(operands[usize.ZERO])
+        let low = function.producerOf(operands[usize.ONE])
+        if high != usize.MAX && low != usize.MAX {
+          if let Operation.Cast {operation: Cast.PtrToInt} = function.instruction(high).operation {
+            found = [function.value(function.operandsOf(high)[usize.ZERO]).owner, function.value(function.operandsOf(low)[usize.ZERO]).owner]
+          }
+        }
+      }
+      at = at + usize.ONE
+    }
+    block = block + usize.ONE
+  }
+  return found
+}
+
+effect fn idiomClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  // A fill from zero: the loop goes, and one fill of the bound's bytes stays.
+  let mut filling = run byteLoop(false, false, false, false)
+  run Testing.expect(run SsaIdioms.recognize(&mut filling), "a loop that stores one byte each time round is a fill")
+  run Testing.expect(run wellFormed(&filling), "the fill passes the verifier")
+  run Testing.expect(count(&filling, Sort.CountedFill, usize.MAX) == usize.ONE && count(&filling, Sort.Store, usize.MAX) == usize.ZERO
+    && count(&filling, Sort.Compare, usize.MAX) == usize.ZERO, "the fill replaces the loop")
+  // A fill from another index covers what lies between it and the bound, when anything does.
+  let mut later = run byteLoop(false, false, true, false)
+  run Testing.expect((run SsaIdioms.recognize(&mut later)) && (run wellFormed(&later)), "a fill may start past zero")
+  let mut bounded = false
+  let mut block = usize.ZERO
+  while block < later.blockCount() {
+    let listed = List<usize>.asSlice(&later.block(block).instructions)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      if let Operation.Extreme {..} = later.instruction(listed[at]).operation { bounded = true }
+      at = at + usize.ONE
+    }
+    block = block + usize.ONE
+  }
+  run Testing.expect(bounded, "its count is the bound less the first index, and nothing when the index is past the bound")
+  // A copy that counts up keeps its loop for a destination inside the source's range, and
+  // checks the destination's distance past the source.
+  let mut rising = run byteLoop(true, false, false, false)
+  run Testing.expect((run SsaIdioms.recognize(&mut rising)) && (run wellFormed(&rising)), "a loop that moves one byte each time round gets a copy")
+  run Testing.expect(count(&rising, Sort.CountedCopy, usize.MAX) == usize.ONE && count(&rising, Sort.Store, usize.MAX) == usize.ONE
+    && count(&rising, Sort.Compare, usize.MAX) == 2, "the copy runs where a check allows it, and the loop stays for the rest")
+  let up = distanceOf(&rising)
+  run Testing.expect(up[usize.ZERO] == usize.ZERO && up[usize.ONE] == usize.ONE, "counting up, the destination's distance past the source is checked")
+  // One that counts down checks the source's distance past the destination.
+  let mut falling = run byteLoop(true, true, false, false)
+  run Testing.expect((run SsaIdioms.recognize(&mut falling)) && (run wellFormed(&falling)), "a loop that moves bytes from the last down gets a copy")
+  let reversed = distanceOf(&falling)
+  run Testing.expect(count(&falling, Sort.CountedCopy, usize.MAX) == usize.ONE && reversed[usize.ZERO] == usize.ONE && reversed[usize.ONE] == usize.ZERO,
+    "counting down, the source's distance past the destination is checked")
+  // A byte the loop computes is no fill.
+  let mut counting = run byteLoop(false, false, false, true)
+  run Testing.expect(!(run SsaIdioms.recognize(&mut counting)) && count(&counting, Sort.CountedFill, usize.MAX) == usize.ZERO,
+    "a loop that stores a byte it computes stays")
 }
