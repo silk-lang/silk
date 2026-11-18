@@ -24,7 +24,9 @@
 
 import CompilerBug
 import backend.SsaFunction {
+  Binary,
   Block,
+  Cast,
   ConstantForm,
   Edge,
   Exit,
@@ -160,6 +162,73 @@ effect fn countUses(emitter: &mut Emitter, function: &SsaFunction) -> () ! OutOf
 // Whether `kind` is one scalar lane, which a deferred value is.
 fn oneLane(kind: SsaKind) -> bool { return !kind.isUnit() && !kind.isVector() && kind.bits <= 64 }
 
+// The only instruction using this value, or usize.MAX when an exit, edge or other use
+// needs its declared lane layout.
+fn onlyUser(emitter: &Emitter, function: &SsaFunction, value: u64) -> usize {
+  let at = u64.toUsize(value)
+  if List<usize>.get(&emitter.uses, at) != usize.ONE { return usize.MAX }
+  let block = List<usize>.get(&emitter.userBlock, at)
+  if block == usize.MAX { return usize.MAX }
+  let instructions = List<usize>.asSlice(&function.block(block).instructions)
+  let position = List<usize>.get(&emitter.userPosition, at)
+  if position >= instructions.length { return usize.MAX }
+  return instructions[position]
+}
+
+// A mask of the available lane widths: 32 for i32 and 64 for i64. A load can read
+// either width when it divides the vector. A bitcast can supply its existing source words
+// until the next block, where edge assignments can overwrite a block parameter's local.
+fn availableWordBits(emitter: &Emitter, function: &SsaFunction, value: u64) -> usize {
+  let number = function.producerOf(value)
+  if number == usize.MAX || List<usize>.get(&emitter.uses, u64.toUsize(value)) != usize.ONE { return usize.ZERO }
+  let operation = function.instruction(number).operation
+  if let Operation.Load {..} = operation {
+    let size = function.kindOf(value).storeSize()
+    if size % 8 == usize.ZERO { return 32 | 64 }
+    if size % 4 == usize.ZERO { return 32 }
+  }
+  if let Operation.Cast {operation: Cast.Bitcast} = operation {
+    if List<usize>.get(&emitter.userBlock, u64.toUsize(value)) != function.instruction(number).block { return usize.ZERO }
+    let source = function.kindOf(function.operandsOf(number)[0])
+    if source.isInteger() && source.isVector() && (source.bits == 32 || source.bits == 64) { return source.bits }
+  }
+  return usize.ZERO
+}
+
+// When only the bytes reach memory, a bitwise operation can run on the source words.
+// Choose a common layout for both operands before either is emitted, keeping loads at
+// their original positions even when the destination overlaps a source.
+fn memoryWordBits(emitter: &Emitter, function: &SsaFunction, instruction: Instruction) -> usize {
+  let kind = instruction.kind
+  if !emitter.trees || !kind.isVector() || !kind.isInteger() || (kind.bits != 8 && kind.bits != 16) { return usize.ZERO }
+  let user = onlyUser(emitter, function, instruction.result)
+  if user == usize.MAX { return usize.ZERO }
+  let usedBy = function.instruction(user)
+  if let Operation.Cast {operation: Cast.Bitcast} = usedBy.operation {
+    if let Operation.Load {..} = instruction.operation {
+      let target = usedBy.kind
+      if target.isVector() && target.isInteger() && (target.bits == 32 || target.bits == 64) { return target.bits }
+    }
+  }
+  if let Operation.Store {..} = usedBy.operation {
+    if let Operation.Cast {operation: Cast.Bitcast} = instruction.operation {
+      return availableWordBits(emitter, function, instruction.result)
+    }
+  }
+  if let Operation.Binary {operation} = usedBy.operation {
+    if operation != Binary.And && operation != Binary.Or && operation != Binary.Xor { return usize.ZERO }
+    let sink = onlyUser(emitter, function, usedBy.result)
+    if sink == usize.MAX { return usize.ZERO }
+    if let Operation.Store {..} = function.instruction(sink).operation {
+      let operands = function.operandsOf(user)
+      let common = availableWordBits(emitter, function, operands[0]) & availableWordBits(emitter, function, operands[1])
+      if (common & 64) != usize.ZERO { return 64 }
+      if (common & 32) != usize.ZERO { return 32 }
+    }
+  }
+  return usize.ZERO
+}
+
 // Whether the body operation of `instruction` pushes each scalar operand in straight-line code,
 // so a deferred operand's code can go where it is pushed. The operands of any other instruction
 // are settled before it.
@@ -167,6 +236,7 @@ fn takesDeferred(function: &SsaFunction, number: usize, instruction: Instruction
   let used = function.operandsOf(number)
   return match instruction.operation {
     Operation.Binary {..} => oneLane(instruction.kind)
+    Operation.Rotate {..} => oneLane(instruction.kind) && (instruction.kind.bits == 32 || instruction.kind.bits == 64)
     Operation.Negate => oneLane(instruction.kind)
     Operation.Compare {..} => oneLane(function.kindOf(used[0]))
     Operation.Select => oneLane(instruction.kind) && oneLane(function.kindOf(used[0]))
@@ -358,8 +428,22 @@ effect fn emitInstruction(body: &mut Body, function: &SsaFunction, emitter: &mut
     Operation.Negate => { result = run WasmBody.negate(&mut body.*, of[0]) }
     Operation.Compare {predicate} => { result = run WasmBody.compare(&mut body.*, predicate, of[0], of[1]) }
     Operation.Select => { result = run WasmBody.select(&mut body.*, of[0], of[1], of[2]) }
-    Operation.Cast {operation} => { result = run WasmBody.cast(&mut body.*, operation, of[0], kind) }
-    Operation.Load {offset, ..} => { result = run WasmBody.load(&mut body.*, kind, of[0], offset) }
+    Operation.Cast {operation} => {
+      let source = body.kindOf(of[0])
+      let loadedAsTarget = instruction.kind.isVector() && source.elements == kind.elements && source.bits == kind.bits && source.lane == kind.lane
+        && function.kindOf(function.operandsOf(number)[0]).bits != kind.bits
+      if operation == Cast.Bitcast && (loadedAsTarget || memoryWordBits(&emitter.*, function, instruction) != usize.ZERO) {
+        result = of[0]
+      } else {
+        result = run WasmBody.cast(&mut body.*, operation, of[0], kind)
+      }
+    }
+    Operation.Load {offset, ..} => {
+      let mut layout = kind
+      let bits = memoryWordBits(&emitter.*, function, instruction)
+      if bits != usize.ZERO { layout = Kind.vector(Kind.integer(bits), instruction.kind.storeSize() / (bits / 8)) }
+      result = run WasmBody.load(&mut body.*, layout, of[0], offset)
+    }
     Operation.Store {offset, ..} => { run WasmBody.store(&mut body.*, of[0], of[1], offset) }
     Operation.Offset {offset} => { result = run WasmBody.offset(&mut body.*, of[0], offset) }
     Operation.Index => { result = run WasmBody.indexed(&mut body.*, of[0], of[1]) }
