@@ -1,4 +1,7 @@
 //! Runs a root command with the developer’s terminal and environment.
+//!
+//! On Unix the command waits for the program and passes SIGTERM, SIGINT and SIGHUP on to it, so
+//! stopping `silk task` stops the program instead of leaving it running without its parent.
 
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.collections.bytes { Bytes }
@@ -13,6 +16,7 @@ import silk.num.u32
 static if Intrinsic.targetOperatingSystem() == "windows" {
   import silk.platform.windows.process_image as WindowsProcessImage
 } else static if Intrinsic.targetOperatingSystem() != "wasi" {
+  import silk.system.signal_watch { SignalError, SignalWatch }
   import silk.system.subprocess {
     ExitStatus,
     ExitWatch,
@@ -20,6 +24,20 @@ static if Intrinsic.targetOperatingSystem() == "windows" {
     Stdio,
     Subprocess,
     SubprocessError
+  }
+  import silk.mem.pointer { Pointer }
+
+  extern "C" struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+  }
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    @foreign(noCapture: .("fds"))
+    unsafe extern "C" fn poll(fds: [*]mut PollFd, count: u32, timeout: i32) -> i32
+  } else {
+    @foreign(noCapture: .("fds"))
+    unsafe extern "C" fn poll(fds: [*]mut PollFd, count: usize, timeout: i32) -> i32
   }
 }
 
@@ -48,6 +66,9 @@ pub effect fn wait(program: &Path, arguments: &[Bytes], directory: &Path) -> Opt
         at = at + 1
       }
       run Subprocess.inheritEnvironment(&mut request)
+
+      // Held before the program starts, so that none of them ends this process in between.
+      let mut forwarded = run forwardedSignals()
       let mut options = SpawnOptions.make()
       run SpawnOptions.setStdio(&mut options, 0, Stdio.inherit(0))
       run SpawnOptions.setStdio(&mut options, 1, Stdio.inherit(1))
@@ -66,7 +87,7 @@ pub effect fn wait(program: &Path, arguments: &[Bytes], directory: &Path) -> Opt
           }
         }
       }
-      let ended = run Effect.result(collected(Subprocess.pid(&child)))
+      let ended = run Effect.result(collected(Subprocess.pid(&child), &mut forwarded))
       drop child
       return match move ended {
         Result<ExitStatus, SubprocessError>.Success { value } => {
@@ -87,10 +108,68 @@ pub effect fn wait(program: &Path, arguments: &[Bytes], directory: &Path) -> Opt
 
 static if Intrinsic.targetOperatingSystem() != "windows"
   && Intrinsic.targetOperatingSystem() != "wasi" {
-  // Waits for the child `pid` to end and collects its status.
-  effect fn collected(pid: i32) -> ExitStatus
+  // SIGTERM, SIGINT and SIGHUP in a watch, or none when the system refuses one.
+  effect fn forwardedSignals() -> Option<SignalWatch> {
+    return match move run Effect.result(watchedSignals()) {
+      Result<SignalWatch, SignalError>.Success { value } => Option<SignalWatch>.some(move value)
+      Result<SignalWatch, SignalError>.Failure { error } => {
+        drop error
+        Option<SignalWatch>.none()
+      }
+    }
+  }
+
+  effect fn watchedSignals() -> SignalWatch
+    ! SignalError {
+    let mut watch = run SignalWatch.open()
+    run SignalWatch.add(&mut watch, SignalWatch.terminate())
+    run SignalWatch.add(&mut watch, SignalWatch.interrupt())
+    run SignalWatch.add(&mut watch, SignalWatch.hangup())
+    return move watch
+  }
+
+  // Waits for the child `pid` to end and collects its status, sending it each signal of
+  // `forwarded` that arrives meanwhile.
+  effect fn collected(pid: i32, forwarded: &mut Option<SignalWatch>) -> ExitStatus
     ! SubprocessError {
     let watch = run ExitWatch.open(pid)
+    if let Option<SignalWatch>.Some { value: signals } = &mut forwarded.* {
+      let mut fds: [PollFd; 2] = [
+        PollFd { fd: ExitWatch.descriptor(&watch), events: 1, revents: 0 },
+        PollFd { fd: SignalWatch.descriptor(&signals), events: 1, revents: 0 },
+      ]
+      while true {
+        fds[0].revents = 0
+        fds[1].revents = 0
+
+        // An interrupted wait (-1) is tried again.
+        let mut ready = 0
+        unsafe {
+          let pointer = Intrinsic.pointerRequalify<?[*]mut PollFd, [*]mut PollFd>(
+            Pointer.fromMutSlice<PollFd>(&mut fds),
+          )
+          ready = poll(pointer, 2, -1)
+        }
+        if ready > 0 && fds[0].revents != 0 {
+          break
+        }
+        if ready > 0 && fds[1].revents != 0 {
+          let mut received: [i32; 4] = [0; 4]
+          let count = match move run Effect.result(SignalWatch.read(&mut signals, &mut received)) {
+            Result<usize, SignalError>.Success { value } => value
+            Result<usize, SignalError>.Failure { error } => {
+              drop error
+              0
+            }
+          }
+          let mut at: usize = 0
+          while at < count {
+            drop run Effect.result(Subprocess.kill(pid, received[at]))
+            at = at + 1
+          }
+        }
+      }
+    }
     return run ExitWatch.collect(&watch)
   }
 }
