@@ -198,7 +198,7 @@ A deferred value travels in a step description as its reference, never as its re
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> Self
+effect fn read(reader: &mut any SchemaReader) -> Self
     ! Issue | OutOfMemoryError
     ? &mut Allocator
 ```

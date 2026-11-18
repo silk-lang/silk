@@ -133,7 +133,7 @@ impl Schema for TextField
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> Self
+effect fn read(reader: &mut any SchemaReader) -> Self
     ! Issue | OutOfMemoryError
     ? &mut Allocator
 ```
@@ -193,7 +193,7 @@ impl Schema for NumberField
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> Self
+effect fn read(reader: &mut any SchemaReader) -> Self
     ! Issue | OutOfMemoryError
     ? &mut Allocator
 ```
@@ -245,7 +245,7 @@ impl Schema for ListField
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> Self
+effect fn read(reader: &mut any SchemaReader) -> Self
     ! Issue | OutOfMemoryError
     ? &mut Allocator
 ```
