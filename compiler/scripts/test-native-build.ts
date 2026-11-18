@@ -4333,6 +4333,86 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     assert.equal(foreign.stdout, '')
   }
   {
+    // A silk.local.toml beside the workspace root swaps every dependency on a package, git ones
+    // included, for a local checkout (PACKAGE-009), without fetching it, and the build names it.
+    const repository = join(directory, 'override/repository')
+    yield* fs.makeDirectory(join(repository, 'units'), { recursive: true })
+    yield* fs.writeFileString(
+      join(repository, 'units/silk.toml'),
+      '[package]\nname = "units"\nversion = "0.1.0"\nsource = "."\nexports = ["unit"]\n',
+    )
+    yield* fs.writeFileString(join(repository, 'units/unit.silk'), 'pub fn unit() -> i32 {\n  return 1\n}\n')
+    const git = (args: ReadonlyArray<string>) => {
+      const ran = spawnSync('git', ['-C', repository, ...args], { encoding: 'utf8' })
+      assert.equal(ran.status, 0, ran.stderr)
+      return ran.stdout.trim()
+    }
+    git(['init', '--quiet'])
+    git(['add', '.'])
+    git(['-c', 'user.name=Silk', '-c', 'user.email=silk@example.com', '-c', 'commit.gpgsign=false', 'commit', '--quiet', '-m', 'units'])
+    const commit = git(['rev-parse', 'HEAD'])
+    const pin = `units = { git = "${pathToFileURL(repository).href}", rev = "${commit}", path = "units" }\n`
+    const local = join(directory, 'override/units-local')
+    yield* fs.makeDirectory(local, { recursive: true })
+    yield* fs.writeFileString(
+      join(local, 'silk.toml'),
+      '[package]\nname = "units"\nversion = "0.2.0"\nsource = "."\nexports = ["unit"]\n',
+    )
+    yield* fs.writeFileString(join(local, 'unit.silk'), 'pub fn unit() -> i32 {\n  return 5\n}\n')
+    const workspace = join(directory, 'override/workspace')
+    yield* fs.makeDirectory(join(workspace, 'app'), { recursive: true })
+    yield* fs.makeDirectory(join(workspace, 'math'), { recursive: true })
+    yield* fs.writeFileString(join(workspace, 'silk.toml'), '[workspace]\nmembers = ["app", "math"]\n')
+    // Both members pin the git package, so the override settles the diamond on one copy.
+    yield* fs.writeFileString(
+      join(workspace, 'math/silk.toml'),
+      `[package]\nname = "override-math"\nversion = "0.1.0"\nsource = "."\nexports = ["twice"]\n\n[dependencies]\n${pin}`,
+    )
+    yield* fs.writeFileString(
+      join(workspace, 'math/twice.silk'),
+      'import units.unit { unit }\n\npub fn twice() -> i32 {\n  return unit() * 2\n}\n',
+    )
+    yield* fs.writeFileString(
+      join(workspace, 'app/silk.toml'),
+      `[package]\nname = "override-app"\nversion = "0.1.0"\nsource = "."\n\n[dependencies]\nmath = { path = "../math", package = "override-math" }\n${pin}`,
+    )
+    yield* fs.writeFileString(
+      join(workspace, 'app/main.silk'),
+      'import math.twice { twice }\nimport units.unit { unit }\n\npub fn main() -> i32 {\n  return unit() + twice()\n}\n',
+    )
+    const home = join(directory, 'override/home')
+    const environment = { ...process.env, SILK_CLANG: clang, SILK_HOME: home }
+    const overrides = join(workspace, 'silk.local.toml')
+    const using = '[overrides]\nunits = { path = "../units-local" }\n'
+    yield* fs.writeFileString(overrides, using)
+    const overridden = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(workspace, 'app'), environment)
+    assert.equal(overridden.status, 15, overridden.stderr)
+    assert.match(overridden.stderr, /^silk: note: .*silk\.local\.toml overrides units with \.\.\/units-local$/m)
+    assert.equal(yield* fs.exists(join(home, `git/${commit}.fetched`)), false, 'an overridden package was fetched')
+    // Removing the file, and writing it again, each change what the next build reads.
+    yield* fs.remove(overrides)
+    const pinned = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(workspace, 'app'), environment)
+    assert.equal(pinned.status, 3, pinned.stderr)
+    assert.equal(pinned.stderr.includes('silk.local.toml'), false, pinned.stderr)
+    yield* fs.writeFileString(overrides, using)
+    const again = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(workspace, 'app'), environment)
+    assert.equal(again.status, 15, again.stderr)
+    // The checkout must be the package it overrides.
+    yield* fs.writeFileString(overrides, '[overrides]\nunits = { path = "math" }\n')
+    const mismatched = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(workspace, 'app'), environment)
+    assert.equal(mismatched.status, 2, 'an override naming another package was accepted')
+    assert.match(mismatched.stderr, /silk\.local\.toml:2: .*names the package `override-math`/)
+    // The file holds only [overrides], and each entry only a path to a package.
+    yield* fs.writeFileString(overrides, '[dependencies]\nunits = { path = "../units-local" }\n')
+    const unknown = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(workspace, 'app'), environment)
+    assert.equal(unknown.status, 2, 'a silk.local.toml table other than [overrides] was accepted')
+    assert.match(unknown.stderr, /silk\.local\.toml:1: /)
+    yield* fs.writeFileString(overrides, '[overrides]\nunits = { path = "../missing" }\n')
+    const missing = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(workspace, 'app'), environment)
+    assert.equal(missing.status, 2, 'an override of a directory without silk.toml was accepted')
+    assert.match(missing.stderr, /silk\.local\.toml:2: .*has no silk\.toml/)
+  }
+  {
     // `[pack.binary]` ships binaries without `--bin`: a tar file with the executable in `bin/`
     // and the included files, or for a target that says so a ZIP file with it at the top.
     const tool = join(directory, 'binary/tool')
@@ -4503,7 +4583,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     const manifest = yield* fs.readFileString(join(work, 'app/silk.toml'))
     assert.match(manifest, /^\[package\]\nname = "app"\nversion = "0\.1\.0"\nsilk-version = "[^"]+"\n$/)
     assert.equal(manifest.includes('0.0.1'), false, manifest)
-    assert.equal(yield* fs.readFileString(join(work, 'app/.gitignore')), '/build/\n')
+    assert.equal(yield* fs.readFileString(join(work, 'app/.gitignore')), '/build/\n/silk.local.toml\n')
     assert.equal(yield* fs.exists(join(work, 'app/scripts/post-init.sh')), false)
     assert.deepEqual(readdirSync(join(silkHome, 'git')), [], 'a template scratch directory was left behind')
     const ran = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(work, 'app'), { ...process.env, SILK_CLANG: clang })
