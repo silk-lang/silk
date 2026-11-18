@@ -58,6 +58,7 @@
 
 import backend.SsaDeadCode
 import backend.SsaFunction {
+  Binary,
   ConstantForm,
   Definition,
   Edge,
@@ -143,6 +144,84 @@ pub fn placeOf(function: &SsaFunction, address: u64, offset: u64) -> Place {
     steps = steps + usize.ONE
   }
   return Place {form: BaseForm.Value, base: at, offset: moved, known: false}
+}
+
+// An indexed address base + variable * scale + displacement, modulo the address width.
+struct Indexed {
+  address: u64,
+  base: u64,
+  variable: u64,
+  scale: u64,
+  displacement: u64,
+}
+
+impl Copy for Indexed {}
+
+fn indexed(function: &SsaFunction, instruction: usize) -> Indexed {
+  let inputs = function.operandsOf(instruction)
+  let mut result = Indexed {address: function.instruction(instruction).result, base: inputs[usize.ZERO], variable: inputs[usize.ONE], scale: 1, displacement: 0}
+  let mut steps = usize.ZERO
+  while steps < 8 {
+    let producer = function.producerOf(result.variable)
+    if producer == usize.MAX { break }
+    let operation = match function.instruction(producer).operation {
+      Operation.Binary {operation: found} => found
+      _ => { break }
+    }
+    let args = function.operandsOf(producer)
+    let mut variable = args[usize.ZERO]
+    let mut fixed = args[usize.ONE]
+    if !function.isBits(fixed) && operation != Binary.Sub && operation != Binary.Shl { fixed = args[usize.ZERO] variable = args[usize.ONE] }
+    if !function.isBits(fixed) { break }
+    let literal = function.constantOf(fixed).low
+    if operation == Binary.Mul { result.scale = u64.wrappingMultiply(result.scale, literal) }
+    else if operation == Binary.Shl && literal < usize.toU64(function.addressBits) { result.scale = u64.shiftLeft(result.scale, literal) }
+    else if operation == Binary.Add { result.displacement = u64.wrappingAdd(result.displacement, u64.wrappingMultiply(result.scale, literal)) }
+    else if operation == Binary.Sub { result.displacement = u64.wrappingSubtract(result.displacement, u64.wrappingMultiply(result.scale, literal)) }
+    else { break }
+    result.variable = variable
+    steps = steps + usize.ONE
+  }
+  result.scale = masked(result.scale, function.addressBits)
+  return result
+}
+
+/// Reuses an indexed address in its block for later accesses a fixed number of bytes away.
+/// The offset is an explicit wrapping address addition, preserving Wasm memory traps.
+pub effect fn shareIndices(function: &mut SsaFunction) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut seen = List<Indexed>.make()
+  let mut changed = false
+  let mut block = usize.ZERO
+  while block < function.blockCount() {
+    List<Indexed>.truncate(&mut seen, usize.ZERO)
+    let count = List<usize>.length(&function.block(block).instructions)
+    let mut at = usize.ZERO
+    while at < count {
+      let instruction = List<usize>.get(&function.block(block).instructions, at)
+      at = at + usize.ONE
+      if let Operation.Index = function.instruction(instruction).operation {} else { continue }
+      let kind = function.kindOf(function.operandsOf(instruction)[usize.ONE])
+      if kind.bits != function.addressBits || !kind.isInteger() || kind.isVector() { continue }
+      let current = indexed(&function.*, instruction)
+      let prior = List<Indexed>.asSlice(&seen)
+      let mut pos = prior.length
+      let mut found = false
+      while pos > usize.ZERO && prior.length - pos < 32 {
+        pos = pos - usize.ONE
+        let other = prior[pos]
+        if other.variable == current.variable && other.base == current.base && other.scale == current.scale {
+          let delta = masked(u64.wrappingSubtract(current.displacement, other.displacement), function.addressBits)
+          function.replaceWithUnary(instruction, Operation.Offset {offset: delta}, other.address)
+          changed = true
+          found = true
+          break
+        }
+      }
+      if !found { run List<Indexed>.append(&mut seen, current) }
+    }
+    block = block + usize.ONE
+  }
+  return changed
 }
 
 // Whether `size` bytes at `first` and `otherSize` bytes at `second`, offsets from one base, share
@@ -580,8 +659,9 @@ struct Forwarding {
 pub effect fn forward(function: &mut SsaFunction) -> bool ! OutOfMemoryError ? &mut Allocator {
   let graph = run SsaGraph.of(&function.*)
   let escaped = run escapedSlots(&function.*)
+  let bypassed = run bypassTemporaryCopies(&mut function.*, List<bool>.asSlice(&escaped))
   let mut state = Forwarding {reads: List<Read>.make(), killedReads: List<usize>.make(), readFloor: usize.ZERO, held: List<Held>.make(), floor: usize.ZERO, killed: List<usize>.make(), substitution: List<u64>.make(), escaped: move escaped,
-    bits: function.addressBits, changed: false}
+    bits: function.addressBits, changed: bypassed}
   run List<u64>.appendRepeated(&mut state.substitution, none(), function.valueCount())
   // Entries: a block to enter, or `usize.MAX - mark` to leave the mark at that position.
   let mut marks = List<usize>.make()
@@ -770,6 +850,73 @@ effect fn clobber(state: &mut Forwarding) -> () ! OutOfMemoryError ? &mut Alloca
 // when the whole access fits in the promised object and adding the old offset did not wrap.
 fn foldableOffset(function: &SsaFunction, place: Place, address: u64, offset: u64, size: u64) -> bool {
   return address != place.base && place.offset >= offset && withinReach(function, place, size)
+}
+
+// A private temporary read by just one copy is unnecessary when a preceding copy
+// in the same block supplied those bytes. Read the original source just once, even
+// when it is external or can trap. Only pure, nontrapping work may separate the two.
+effect fn bypassTemporaryCopies(function: &mut SsaFunction, escaped: &[bool]) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut reads = List<usize>.make()
+  run List<usize>.appendRepeated(&mut reads, usize.ZERO, function.slotCount())
+  let mut block = usize.ZERO
+  while block < function.blockCount() {
+    let listed = List<usize>.asSlice(&function.block(block).instructions)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      let id = listed[at]
+      at = at + usize.ONE
+      let operand = match function.instruction(id).operation {
+        Operation.CopyBytes {..} => usize.ONE
+        Operation.Load {..} => usize.ZERO
+        _ => { continue }
+      }
+      let place = placeOf(&function.*, function.operandsOf(id)[operand], 0)
+      if place.form == BaseForm.Slot {
+        let slot = u64.toUsize(place.base)
+        let count = List<usize>.get(&reads, slot)
+        List<usize>.set(&mut reads, slot, count + usize.ONE)
+      }
+    }
+    block = block + usize.ONE
+  }
+  let mut changed = false
+  block = usize.ZERO
+  while block < function.blockCount() {
+    let count = List<usize>.length(&function.block(block).instructions)
+    let mut prior = usize.MAX
+    let mut at = usize.ZERO
+    while at < count {
+      let id = List<usize>.get(&function.block(block).instructions, at)
+      at = at + usize.ONE
+      let op = function.instruction(id).operation
+      let size = match op {
+        Operation.CopyBytes {size: bytes} => bytes
+        _ => {
+          if !op.isPure() || function.mayTrap(id) { prior = usize.MAX }
+          continue
+        }
+      }
+      let from = placeOf(&function.*, function.operandsOf(id)[usize.ONE], 0)
+      let to = placeOf(&function.*, function.operandsOf(id)[usize.ZERO], 0)
+      if prior != usize.MAX && privateSlotContains(&function.*, escaped, from, size) && List<usize>.get(&reads, u64.toUsize(from.base)) == usize.ONE {
+        let via = placeOf(&function.*, function.operandsOf(prior)[usize.ZERO], 0)
+        let original = function.operandsOf(prior)[usize.ONE]
+        let source = placeOf(&function.*, original, 0)
+        if let Operation.CopyBytes {size: wrote} = function.instruction(prior).operation {
+          if size == wrote && via.form == BaseForm.Slot && via.known && via.base == from.base && via.offset == from.offset
+            && !mayAlias(from, size, source, size, escaped, function.addressBits) && !mayAlias(from, size, to, size, escaped, function.addressBits) {
+            function.setOperand(id, usize.ONE, original)
+            function.remove(prior)
+            changed = true
+          }
+        }
+      }
+      prior = id
+    }
+    block = block + usize.ONE
+  }
+  if changed { function.sweep() }
+  return changed
 }
 
 // Whether all the bytes belong to a single stack slot whose address stays private.

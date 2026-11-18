@@ -1,0 +1,155 @@
+//! Counted induction variables whose initial value, upper bound and unit increment are known.
+import backend.SsaFunction {Binary, Edge, Exit, Operation, Predicate, SsaFunction, masked, none}
+import backend.SsaGraph {SsaGraph}
+import silk.collections.list {List}
+import silk.core.option {Option}
+import silk.core.ownership {Copy}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.u64
+import silk.num.usize
+
+/// A header parameter that takes every value from its initial constant up to its limit.
+pub struct Counter {
+  pub value: u64,
+  pub initial: u64,
+  pub limit: u64,
+  pub entry: usize,
+  pub next: u64,
+}
+
+impl Copy for Counter {}
+
+/// Finds a constant entry and a unit increment reached only from the arm where the
+/// counter is below its limit. The upper bound includes the final visit to the header.
+pub fn find(function: &SsaFunction, graph: &SsaGraph, block: usize) -> Option<Counter> {
+  let head = function.block(block)
+  if head.exit != Exit.Branch || List<u64>.length(&head.parameters) == usize.ZERO { return Option<Counter>.None }
+  let before = graph.predecessorsOf(block)
+  if block == usize.ZERO || before.length != 2 || before[usize.ZERO] == before[usize.ONE] { return Option<Counter>.None }
+  let test = function.producerOf(head.value)
+  if test == usize.MAX { return Option<Counter>.None }
+  let predicate = match function.instruction(test).operation {
+    Operation.Compare {predicate: found} => found
+    _ => { return Option<Counter>.None }
+  }
+  let args = function.operandsOf(test)
+  let mut counter = args[usize.ZERO]
+  let mut limit = args[usize.ONE]
+  let mut reversed = false
+  if function.isBits(counter) { counter = args[usize.ONE] limit = args[usize.ZERO] reversed = true }
+  if !function.isBits(limit) { return Option<Counter>.None }
+  let kind = function.kindOf(counter)
+  if !kind.isInteger() || kind.isVector() || kind.bits > 64 { return Option<Counter>.None }
+  let mut arm = usize.ZERO
+  if reversed {
+    if predicate == Predicate.Ule { arm = usize.ONE } else if predicate != Predicate.Ugt { return Option<Counter>.None }
+  } else if predicate == Predicate.Uge { arm = usize.ONE } else if predicate != Predicate.Ult { return Option<Counter>.None }
+  if !graph.reaches(before[usize.ZERO]) || !graph.reaches(before[usize.ONE]) { return Option<Counter>.None }
+  let body = List<Edge>.asSlice(&head.edges)[arm].block
+  if body == usize.ZERO || body == block || graph.predecessorsOf(body).length != usize.ONE { return Option<Counter>.None }
+  let mut latch = before[usize.ZERO]
+  let mut entry = before[usize.ONE]
+  if !graph.dominates(body, latch) { latch = before[usize.ONE] entry = before[usize.ZERO] }
+  if !graph.dominates(body, latch) || graph.dominates(block, entry) { return Option<Counter>.None }
+  let parameters = List<u64>.asSlice(&head.parameters)
+  let mut index = usize.ZERO
+  while index < parameters.length && parameters[index] != counter { index = index + usize.ONE }
+  if index == parameters.length { return Option<Counter>.None }
+  let startEdge = function.block(entry).edgeTo(block)
+  let stepEdge = function.block(latch).edgeTo(block)
+  let initial = List<u64>.get(&List<Edge>.asSlice(&function.block(entry).edges)[startEdge].arguments, index)
+  if !function.isBits(initial) || function.constantOf(initial).low > function.constantOf(limit).low { return Option<Counter>.None }
+  let next = List<u64>.get(&List<Edge>.asSlice(&function.block(latch).edges)[stepEdge].arguments, index)
+  if incrementOf(function, next) != counter { return Option<Counter>.None }
+  return Option<Counter>.Some {value: Counter {value: counter, initial: initial, limit: limit, entry: entry, next: next}}
+}
+
+/// The value `value` is one more than, when `value` is the sum of a value and the constant one;
+/// else `none()`, which no operand is.
+pub fn incrementOf(function: &SsaFunction, value: u64) -> u64 {
+  let producer = function.producerOf(value)
+  if producer == usize.MAX { return none() }
+  if let Operation.Binary {operation: Binary.Add} = function.instruction(producer).operation {
+    let operands = function.operandsOf(producer)
+    if function.isBits(operands[usize.ONE]) && function.constantOf(operands[usize.ONE]).low == 1 && !function.isConstant(operands[usize.ZERO]) {
+      return operands[usize.ZERO]
+    }
+    if function.isBits(operands[usize.ZERO]) && function.constantOf(operands[usize.ZERO]).low == 1 && !function.isConstant(operands[usize.ONE]) {
+      return operands[usize.ONE]
+    }
+  }
+  return none()
+}
+
+/// Counts in bytes when multiplying by the same scale is the only use of the
+/// counter apart from its test and increment. Both scaled endpoints must fit.
+pub effect fn scaleCounters(function: &mut SsaFunction) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let graph = run SsaGraph.of(&function.*)
+  let uses = run function.useCounts()
+  let mut replacements = List<u64>.make()
+  run List<u64>.appendRepeated(&mut replacements, none(), function.valueCount())
+  let mut products = List<usize>.make()
+  let mut changed = false
+  let order = graph.reversePostorder()
+  let mut at = usize.ZERO
+  while at < order.length {
+    let header = order[at]
+    at = at + usize.ONE
+    let counter = match find(&function.*, &graph, header) {
+      Option<Counter>.Some {value} => value
+      Option<Counter>.None => { continue }
+    }
+    if List<usize>.get(&uses, u64.toUsize(counter.next)) != usize.ONE { continue }
+    let needed = List<usize>.get(&uses, u64.toUsize(counter.value))
+    if needed <= 2 { continue }
+    let mut scale = none()
+    List<usize>.truncate(&mut products, usize.ZERO)
+    let mut id = usize.ZERO
+    while id < function.instructionCount() {
+      let found = function.instruction(id)
+      id = id + usize.ONE
+      if found.removed { continue }
+      if let Operation.Binary {operation: Binary.Mul} = found.operation {
+        let args = function.operandsOf(id - usize.ONE)
+        let mut fixed = args[usize.ONE]
+        if args[usize.ZERO] != counter.value {
+          if args[usize.ONE] != counter.value { continue }
+          fixed = args[usize.ZERO]
+        }
+        if !function.isBits(fixed) || (scale != none() && scale != fixed) { break }
+        scale = fixed
+        run List<usize>.append(&mut products, id - usize.ONE)
+      }
+    }
+    if scale == none() || List<usize>.length(&products) + 2 != needed { continue }
+    let width = function.constantOf(scale).low
+    let kind = function.kindOf(counter.value)
+    let limit = function.constantOf(counter.limit).low
+    if width < 2 || limit > masked(u64.MAX, kind.bits) / width { continue }
+    let initial = function.constantOf(counter.initial).low
+    let start = run function.integer(kind.bits, initial * width)
+    let end = run function.integer(kind.bits, limit * width)
+    let edge = function.block(counter.entry).edgeTo(header)
+    let parameter = function.value(counter.value).index
+    function.setArgument(counter.entry, edge, parameter, start)
+    let test = function.producerOf(function.block(header).value)
+    let step = function.producerOf(counter.next)
+    let mut operand = usize.ZERO
+    if function.operandsOf(test)[usize.ZERO] == counter.value { operand = usize.ONE }
+    function.setOperand(test, operand, end)
+    operand = usize.ZERO
+    if function.operandsOf(step)[usize.ZERO] == counter.value { operand = usize.ONE }
+    function.setOperand(step, operand, scale)
+    let mut i = usize.ZERO
+    while i < List<usize>.length(&products) {
+      let product = List<usize>.get(&products, i)
+      let value = function.instruction(product).result
+      List<u64>.set(&mut replacements, u64.toUsize(value), counter.value)
+      function.remove(product)
+      i = i + usize.ONE
+    }
+    changed = true
+  }
+  if changed { function.substitute(&mut replacements) function.sweep() }
+  return changed
+}
