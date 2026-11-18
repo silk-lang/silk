@@ -2687,7 +2687,7 @@ test fn readsFirst() -> () { drop members.first() }
 test fn independent() -> () {}
 test fn changesMemberSet() -> () { drop members.second() }
 `)
-  const members = `interface Read { fn read(self: &Self) -> i32 }
+  const dispatchMembersSource = `interface Read { fn read(self: &Self) -> i32 }
 struct First {}
 struct Second {}
 impl Read for First { fn read(self: &Self) -> i32 { return 1 } }
@@ -2697,7 +2697,7 @@ fn read(value: &any Read) -> i32 { return value.read() }
 pub fn first() -> i32 { let member = First {} return read(&member) }
 `
   for (const second of ['return 2', 'let member = Second {} return read(&member)']) {
-    yield* fs.writeFileString(join(dispatchTests, 'src/members.silk'), members + `pub fn second() -> i32 { ${second} }\n`)
+    yield* fs.writeFileString(join(dispatchTests, 'src/members.silk'), dispatchMembersSource + `pub fn second() -> i32 { ${second} }\n`)
     const tests = yield* invoke(silk, ['test', '--stdlib', standardLibrary], dispatchTests, { ...process.env, SILK_CLANG: clang })
     assert.equal(tests.status, 0, tests.stderr)
     assert.match(tests.stdout, /main::readsFirst\n {4}PASS/)
