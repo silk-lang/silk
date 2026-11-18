@@ -23,21 +23,25 @@
 //! 4. A branch whose two edges enter one block becomes a jump there that passes, for each
 //!    parameter the edges differ on, a value the condition chooses ([`joinBranches`]), as LLVM's
 //!    SimplifyCFG turns a two-entry phi into a select.
-//! 5. A block whose only predecessor jumps to it is appended to that predecessor, its parameters
+//! 5. Two branches that together ask whether a value lies between two constants, the second
+//!    reached only from the first and both leaving to one block otherwise, become one branch on
+//!    one unsigned comparison of the value less the lower constant ([`fuseRanges`]).
+//! 6. A block whose only predecessor jumps to it is appended to that predecessor, its parameters
 //!    replaced by the arguments of that jump.
-//! 6. The blocks no path from the entry reaches are removed (`SsaFunction.compact`), and block
+//! 7. The blocks no path from the entry reaches are removed (`SsaFunction.compact`), and block
 //!    parameters every edge passes one value for, or that feed nothing, are removed
 //!    (`SsaPromotion.pruneParameters`).
 //!
 //! Rounds repeat until one changes nothing, at most [`rounds`] times. Nothing here changes what
 //! an instruction computes or the order of the instructions on any path, and the instructions
-//! step 4 adds cannot trap, so traps and side effects happen as before; a trap block that becomes unreachable is one no execution could
+//! steps 4 and 5 add cannot trap, so traps and side effects happen as before; a trap block that becomes unreachable is one no execution could
 //! reach. Blocks keep their relative order, so numbering depends only on the function.
 
-import backend.SsaFunction {Binary, Cast, Edge, Exit, Kind, Operation, SsaFunction, none}
+import backend.SsaFunction {Binary, Cast, Edge, Exit, Kind, Operation, Predicate, SsaFunction, masked, none}
 import backend.SsaGraph {SsaGraph}
 import backend.SsaPromotion
 import silk.collections.list {List}
+import silk.core.ownership {Copy}
 import silk.mem.allocator {Allocator, OutOfMemoryError}
 import silk.num.u64
 import silk.num.usize
@@ -54,6 +58,7 @@ pub effect fn simplify(function: &mut SsaFunction) -> bool ! OutOfMemoryError ? 
     let mut now = run foldExits(&mut function.*)
     if run threadJumps(&mut function.*) { now = true }
     if run threadBranches(&mut function.*) { now = true }
+    if run fuseRanges(&mut function.*) { now = true }
     if run joinBranches(&mut function.*) { now = true }
     if run function.compact() { now = true }
     if run mergeBlocks(&mut function.*) { now = true }
@@ -194,6 +199,181 @@ effect fn appended(function: &mut SsaFunction, block: usize, place: u64, operati
 ! OutOfMemoryError ? &mut Allocator {
   let position = List<usize>.length(&function.block(block).instructions)
   return run function.insertInstruction(block, position, operation, kind, operands, place)
+}
+
+// One end of a range a comparison with a constant leaves a value in: the value, whether the
+// comparison reads it as signed, and the least or the greatest it can be, as the kind's bits.
+struct Bound {
+  value: u64,
+  signed: bool,
+  lower: bool,
+  limit: u64,
+}
+
+impl Copy for Bound {}
+
+// `bits`, `width` bits wide, as a signed number's position on a line from the least to the
+// greatest: its sign bit flipped.
+fn ordered(bits: u64, width: usize, signed: bool) -> u64 {
+  if !signed { return bits }
+  return u64.bitXor(bits, u64.shiftLeft(1, usize.toU64(width - usize.ONE)))
+}
+
+// The bound that `condition` being `held` puts on a scalar integer of at most 64 bits it compares
+// with a constant; a `value` of `none()` when it puts none this pass knows.
+fn boundOf(function: &SsaFunction, condition: u64, held: bool) -> Bound {
+  let nothing = Bound {value: none(), signed: false, lower: false, limit: 0}
+  let producer = function.producerOf(condition)
+  if producer == usize.MAX { return nothing }
+  let mut predicate = match function.instruction(producer).operation {
+    Operation.Compare {predicate: asked} => asked
+    _ => { return nothing }
+  }
+  let mut value = function.operandsOf(producer)[usize.ZERO]
+  let mut constant = function.operandsOf(producer)[usize.ONE]
+  if function.isBits(value) {
+    // `c < x` is `x > c`.
+    let swapped = value
+    value = constant
+    constant = swapped
+    if predicate == Predicate.Ult { predicate = Predicate.Ugt } else if predicate == Predicate.Ugt { predicate = Predicate.Ult }
+    else if predicate == Predicate.Ule { predicate = Predicate.Uge } else if predicate == Predicate.Uge { predicate = Predicate.Ule }
+    else if predicate == Predicate.Slt { predicate = Predicate.Sgt } else if predicate == Predicate.Sgt { predicate = Predicate.Slt }
+    else if predicate == Predicate.Sle { predicate = Predicate.Sge } else if predicate == Predicate.Sge { predicate = Predicate.Sle }
+  }
+  let kind = function.kindOf(value)
+  if !function.isBits(constant) || function.isBits(value) || !kind.isInteger() || kind.isVector() || kind.bits > 64 || kind.bits < 2 { return nothing }
+  if !held {
+    // What holds when the comparison does not.
+    if predicate == Predicate.Ult { predicate = Predicate.Uge } else if predicate == Predicate.Uge { predicate = Predicate.Ult }
+    else if predicate == Predicate.Ule { predicate = Predicate.Ugt } else if predicate == Predicate.Ugt { predicate = Predicate.Ule }
+    else if predicate == Predicate.Slt { predicate = Predicate.Sge } else if predicate == Predicate.Sge { predicate = Predicate.Slt }
+    else if predicate == Predicate.Sle { predicate = Predicate.Sgt } else if predicate == Predicate.Sgt { predicate = Predicate.Sle }
+    else { return nothing }
+  }
+  let signed = predicate == Predicate.Slt || predicate == Predicate.Sle || predicate == Predicate.Sgt || predicate == Predicate.Sge
+  let most = masked(u64.MAX, kind.bits)
+  let position = ordered(masked(function.constantOf(constant).low, kind.bits), kind.bits, signed)
+  // A strict comparison bounds the value one further in, when there is room.
+  if predicate == Predicate.Uge || predicate == Predicate.Sge { return Bound {value: value, signed: signed, lower: true, limit: position} }
+  if predicate == Predicate.Ule || predicate == Predicate.Sle { return Bound {value: value, signed: signed, lower: false, limit: position} }
+  if (predicate == Predicate.Ugt || predicate == Predicate.Sgt) && position < most { return Bound {value: value, signed: signed, lower: true, limit: position + 1} }
+  if (predicate == Predicate.Ult || predicate == Predicate.Slt) && position > 0 { return Bound {value: value, signed: signed, lower: false, limit: position - 1} }
+  return nothing
+}
+
+/// Turns two branches that together keep a value between two constants into one; answers
+/// whether it changed any.
+///
+/// # Details
+///
+/// The first branch leads on one side to a block that holds only the second's comparison, read by
+/// its branch alone, and that nothing else enters; both leave to one block, with the same arguments, when their
+/// comparison goes the other way. The value lies between `low` and `high` exactly when it less
+/// `low`, wrapping, is at most `high - low` unsigned, so the first block computes that and
+/// branches on it once: `'A' <= c && c <= 'Z'` is `c - 'A' <= 25`. The second comparison is no
+/// longer reached.
+pub effect fn fuseRanges(function: &mut SsaFunction) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let count = function.blockCount()
+  let mut entered = run List<usize>.makeWithCapacity(count)
+  run List<usize>.appendRepeated(&mut entered, usize.ZERO, count)
+  let mut block = usize.ZERO
+  while block < count {
+    let edges = List<Edge>.asSlice(&function.block(block).edges)
+    let mut edge = usize.ZERO
+    while edge < edges.length {
+      let before = List<usize>.get(&entered, edges[edge].block)
+      List<usize>.set(&mut entered, edges[edge].block, before + usize.ONE)
+      edge = edge + usize.ONE
+    }
+    block = block + usize.ONE
+  }
+  let uses = run function.useCounts()
+  let mut changed = false
+  block = usize.ZERO
+  while block < count {
+    if run fusedRange(&mut function.*, List<usize>.asSlice(&entered), List<usize>.asSlice(&uses), block) { changed = true }
+    block = block + usize.ONE
+  }
+  return changed
+}
+
+// Two branches that may bound one value: the block of the second, or `usize.MAX`, and what each
+// says of the value where both let it through.
+struct Pair {
+  inner: usize,
+  lower: Bound,
+  upper: Bound,
+}
+
+impl Copy for Pair {}
+
+// The pair that the branch of `block` makes with the block on its side `side`, when that block
+// holds only its own comparison, read by its branch alone, nothing else enters it, and its side
+// `out` leaves where the other side of `block` does, with the same arguments.
+fn pairOf(function: &SsaFunction, entered: &[usize], uses: &[usize], block: usize, side: usize, out: usize) -> Pair {
+  let nothing = Bound {value: none(), signed: false, lower: false, limit: 0}
+  let first = function.block(block)
+  let reached = List<Edge>.asSlice(&first.edges)[side].block
+  let second = function.block(reached)
+  if reached == block || entered[reached] != usize.ONE || second.exit != Exit.Branch || List<u64>.length(&second.parameters) != usize.ZERO
+    || List<usize>.length(&second.instructions) != usize.ONE
+    || function.instruction(List<usize>.get(&second.instructions, usize.ZERO)).result != second.value
+    || u64.toUsize(second.value) >= uses.length || uses[u64.toUsize(second.value)] != usize.ONE {
+    return Pair {inner: usize.MAX, lower: nothing, upper: nothing}
+  }
+  let away = &List<Edge>.asSlice(&first.edges)[usize.ONE - side]
+  if !sameArguments(away, &List<Edge>.asSlice(&second.edges)[out]) || List<Edge>.asSlice(&second.edges)[usize.ONE - out].block == reached {
+    return Pair {inner: usize.MAX, lower: nothing, upper: nothing}
+  }
+  return Pair {inner: reached, lower: boundOf(function, first.value, side == usize.ZERO), upper: boundOf(function, second.value, out == usize.ONE)}
+}
+
+effect fn fusedRange(function: &mut SsaFunction, entered: &[usize], uses: &[usize], block: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
+  if function.block(block).exit != Exit.Branch { return false }
+  let mut side = usize.ZERO
+  while side < 2 {
+    let mut out = usize.ZERO
+    while out < 2 {
+      let pair = pairOf(&function.*, entered, uses, block, side, out)
+      if pair.inner != usize.MAX && run fuse(&mut function.*, block, pair.inner, usize.ONE - out, usize.ONE - side, pair.lower, pair.upper) { return true }
+      out = out + usize.ONE
+    }
+    side = side + usize.ONE
+  }
+  return false
+}
+
+// Replaces the branch of `block` by one on whether the value `one` and `other` bound lies within
+// them: to where edge `inside` of block `inner` leads when it does, else along `block`'s edge
+// `outside`. Answers false, changing nothing, when the two are not the two ends of one range.
+effect fn fuse(function: &mut SsaFunction, block: usize, inner: usize, inside: usize, outside: usize, one: Bound, other: Bound) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  if one.value == none() || one.value != other.value || one.signed != other.signed || one.lower == other.lower { return false }
+  let mut low = one.limit
+  let mut high = other.limit
+  if !one.lower {
+    low = other.limit
+    high = one.limit
+  }
+  if low > high { return false }
+  let kind = function.kindOf(one.value)
+  let place = function.block(block).place
+  let within = run edgeCopy(&function.*, inner, inside)
+  let without = run edgeCopy(&function.*, block, outside)
+  // The value less the lower end, in the kind's own bits.
+  let mut moved = one.value
+  let mut position = List<usize>.length(&function.block(block).instructions)
+  let least = ordered(low, kind.bits, one.signed)
+  if least != 0 {
+    let start = run function.constant(kind, least)
+    moved = run function.insertInstruction(block, position, Operation.Binary {operation: Binary.Sub}, kind, &[moved, start], place)
+    position = position + usize.ONE
+  }
+  let span = run function.constant(kind, high - low)
+  let held = run function.insertInstruction(block, position, Operation.Compare {predicate: Predicate.Ule}, Kind.flag(), &[moved, span], place)
+  run function.setBranch(block, held, within.block, List<u64>.asSlice(&within.arguments), without.block, List<u64>.asSlice(&without.arguments))
+  return true
 }
 
 // The edge a branch or switch of `block` always takes, or `usize.MAX`.
