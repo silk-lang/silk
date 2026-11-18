@@ -747,6 +747,9 @@ return the computed integer. SEM0139 points to the conversion of a member that c
 identifies the dynamic call whose specialization breaks the promise. SEM0263 identifies a
 conversion whose Effect implementation can call back into the same dispatcher before suspension
 and points to the call on that recursive path (SUSP-003).
+SEM0264 points to the conversion when specializing a member witness exceeds the type-complexity
+budget. For example, a witness for `Wrapper<T>` can reach a conversion of `Wrapper<Wrapper<T>>`
+and expand the closed set again. Use a fixed member type or bound the expansion in static code.
 
 ### REP-003 — Representation-dependent values join only at exact type equality
 
