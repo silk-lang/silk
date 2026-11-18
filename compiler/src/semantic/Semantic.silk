@@ -735,6 +735,8 @@ pub union ConformanceEvidence {
   /// A structural union provider whose every member conforms; each member's own steps precede
   /// this one, and a call dispatches on the receiver's tag to the member's witness.
   Union,
+  /// The receiver explicitly carries the requested contract.
+  Erased,
 }
 
 /// One goal and the evidence that discharged it.
@@ -2700,6 +2702,8 @@ struct BodySourceSnapshot {
 }
 
 struct Resolver {
+  // Erased types first enter this store when a written contract is resolved.
+  writtenErasure: bool,
   // The lambdas whose enclosing body is checking them, with the signatures that check resolved,
   // innermost last (ANON-CALLABLE-002).
   lambdas: List<ActiveLambda>,
@@ -3775,6 +3779,7 @@ fn reusableTypeKind(value: &Type) -> usize {
     Type.Union {..} => 10
     Type.Callable {..} => 11
     Type.Effect {..} => 12
+    Type.Erased {..} => 29
     Type.TypeDescriptor {..} => 15
     Type.Anonymous {..} => 16
     Type.CallableValue {..} => 17
@@ -4040,6 +4045,11 @@ fn sameReusableTypeWith(value: &Type, right: &Interned<Type>) -> bool {
         Type.CallableView {representation, contract} => match &other.* {
           Type.CallableView {representation: selected, contract: exposed} =>
             sameReusableType(&representation, &selected) && sameReusableType(&contract, &exposed)
+          _ => false
+        }
+        Type.Erased {contracts, transferable, concurrent} => match &other.* {
+          Type.Erased {contracts: parts, transferable: otherMove, concurrent: otherShare} =>
+            transferable == otherMove && concurrent == otherShare && sameReusableType(&contracts, &parts)
           _ => false
         }
         Type.OpaqueRepresentation {application, contract, detached, nonParking} => match &other.* {
@@ -13233,7 +13243,7 @@ effect fn qualifiedType(
 
 fn borrowedOrBare(value: &Type) -> bool {
   return match & value.* {
-    Type.Reference {..} => true
+    Type.Reference {referent, ..} => !Interned<Type>.with<bool>(&referent, erasedType)
     Type.Slice {..} => true
     Type.Callable {..} => true
     Type.Effect {..} => true
@@ -16012,8 +16022,96 @@ effect fn resolveType(
 ) -> Result<Interned<Type>, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
 ? &mut Allocator | &mut Types {
-  return run resolveTypeAt(&mut resolver.*, &mut owner.*, &mut dependencies.*, moduleOrdinal, id, binders, &mut elision.*, false)
+  return run resolveTypeAt(&mut resolver.*, &mut owner.*, &mut dependencies.*, moduleOrdinal, id, binders, &mut elision.*, TypePosition.Ordinary)
 }
+
+effect fn resolveErased(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut List<Dependency>,
+  moduleOrdinal: usize, module: &ModuleId, parts: Range, span: Span, binders: &[Binder], elision: &mut LifetimeElision)
+  -> Result<Interned<Type>, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  resolver.writtenErasure = true
+  let mut interfaces = List<Interned<Type>>.make()
+  let mut transferable = false
+  let mut concurrent = false
+  let mut at = usize.ZERO
+  while at < parts.length {
+    let part = match move run typeChild(&mut resolver.*, module, parts, at) {
+      Option<HirId>.Some {value} => value
+      Option<HirId>.None => { fail RevisionMismatch {} }
+    }
+    at = at + usize.ONE
+    if let Option<SealedProperty>.Some {value} = move run sealedProperty(&mut resolver.*, &mut owner.*, &mut dependencies.*,
+      moduleOrdinal, module, part, binders) {
+      if value == SealedProperty.Transferable && !transferable { transferable = true continue }
+      if value == SealedProperty.Concurrent && !concurrent { concurrent = true continue }
+      return Result<Interned<Type>, Shared<Rejection>>.failResult(run reject(&resolver.*, module, RejectionCode.ErasedContract, span))
+    }
+    let resolved = run resolveType(&mut resolver.*, &mut owner.*, &mut dependencies.*, moduleOrdinal, part, binders, &mut elision.*)
+    let contract = match move resolved {
+      Result<Interned<Type>, Shared<Rejection>>.Success {value} => move value
+      Result<Interned<Type>, Shared<Rejection>>.Failure {error} => { return Result<Interned<Type>, Shared<Rejection>>.failResult(move error) }
+    }
+    if Interned<Type>.with<OwnerKind>(&contract, nominalKind) != OwnerKind.Interface {
+      return Result<Interned<Type>, Shared<Rejection>>.failResult(run reject(&resolver.*, module, RejectionCode.ErasedContract, span))
+    }
+    let before = List<Interned<Type>>.length(&interfaces)
+    run Type.joinMember(&mut interfaces, &contract)
+    if before == List<Interned<Type>>.length(&interfaces) {
+      return Result<Interned<Type>, Shared<Rejection>>.failResult(run reject(&resolver.*, module, RejectionCode.ErasedContract, span))
+    }
+  }
+  if List<Interned<Type>>.length(&interfaces) == usize.ZERO {
+    return Result<Interned<Type>, Shared<Rejection>>.failResult(run reject(&resolver.*, module, RejectionCode.ErasedContract, span))
+  }
+  // Normalize the written join before interning; later users can print it or enumerate its
+  // operations without depending on which module first resolved this contract.
+  if List<Interned<Type>>.length(&interfaces) > usize.ONE {
+    let mut keys = List<Bytes>.make()
+    let parts = List<Interned<Type>>.asSlice(&interfaces)
+    at = usize.ZERO
+    while at < parts.length {
+      let declaration = match move Interned<Type>.with<Option<DeclarationId>>(&parts[at], |ty: &Type| -> Option<DeclarationId> {
+        if let Type.Nominal {declaration, ..} = &ty.* { return Option<DeclarationId>.some(DeclarationId.copy(&declaration)) }
+        return Option<DeclarationId>.none()
+      }) {
+        Option<DeclarationId>.Some {value} => move value
+        _ => { fail RevisionMismatch {} }
+      }
+      let mut coordinates = RuntimeEncoding.coordinates()
+      run List<Bytes>.append(&mut keys, run Type.encoding(&parts[at], &declaration, true, &mut coordinates))
+      at = at + usize.ONE
+    }
+    let order = run RuntimeEncoding.order(&keys)
+    let ordered = List<usize>.asSlice(&order)
+    let mut sorted = List<Interned<Type>>.make()
+    at = usize.ZERO
+    while at < ordered.length {
+      run List<Interned<Type>>.append(&mut sorted, Interned<Type>.clone(&parts[ordered[at]]))
+      at = at + usize.ONE
+    }
+    interfaces = move sorted
+  }
+  let contracts = if List<Interned<Type>>.length(&interfaces) == usize.ONE {
+    List<Interned<Type>>.remove(&mut interfaces, usize.ZERO)
+  } else { run Types.intern(Type.Union {members: move interfaces}) }
+  let erased = run Types.intern(Type.Erased {contracts: Interned<Type>.clone(&contracts), transferable: transferable, concurrent: concurrent})
+  let members = run Type.failureMembers(&contracts)
+  let listed = List<Interned<Type>>.asSlice(&members)
+  let representative = run Types.intern(Type.Unit)
+  let mut request = Request.make()
+  at = usize.ZERO
+  while at < listed.length {
+    let goal = ConformanceGoal {provider: Interned<Type>.clone(&erased), contract: Interned<Type>.clone(&listed[at])}
+    if let Option<Shared<Rejection>>.Some {value} = move run referenceOnlyContract(&mut resolver.*, &mut owner.*, &mut request,
+      &mut dependencies.*, true, &goal, &representative, module, span) {
+      return Result<Interned<Type>, Shared<Rejection>>.failResult(move value)
+    }
+    at = at + usize.ONE
+  }
+  return Result<Interned<Type>, Shared<Rejection>>.succeed(move erased)
+}
+
+enum TypePosition { Ordinary, AppliedOwner, Referent }
 
 // Resolves a written type. A call's applied owner, as in `Pair<i32>.make(…)`, reports a wrong
 // argument count at its whole application (`callOwner`); every other type reports it at its name
@@ -16026,10 +16124,11 @@ effect fn resolveTypeAt(
   id: HirId,
   binders: &[Binder],
   elision: &mut LifetimeElision,
-  callOwner: bool,
+  position: TypePosition,
 ) -> Result<Interned<Type>, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
 ? &mut Allocator | &mut Types {
+  let callOwner = position == TypePosition.AppliedOwner
   let module = resolvedModule(&resolver.*, moduleOrdinal)
   let syntax = run typeNode(&mut resolver.*, &module, id)
   if let Option<HeaderSyntax>.Some {value} = move syntax {
@@ -16288,6 +16387,12 @@ effect fn resolveTypeAt(
         )
       }
     }
+    if let Node.ErasedType {parts} = selected {
+      if position != TypePosition.Referent {
+        return Result<Interned<Type>, Shared<Rejection>>.failResult(run reject(&resolver.*, &module, RejectionCode.ErasedPosition, value.span))
+      }
+      return run resolveErased(&mut resolver.*, &mut owner.*, &mut dependencies.*, moduleOrdinal, &module, parts, value.span, binders, &mut elision.*)
+    }
     if let Node.ReferenceType {referent, access, lifetime, roleName} = selected {
       if roleName.present {
         return Result<Interned<Type>, Shared<Rejection>>.failResult(
@@ -16308,14 +16413,14 @@ effect fn resolveTypeAt(
           return Result<Interned<Type>, Shared<Rejection>>.failResult(move error)
         }
       }
-      let resolved = run resolveType(
+      let resolved = run resolveTypeAt(
         &mut resolver.*,
         &mut owner.*,
         &mut dependencies.*,
         moduleOrdinal,
         referent,
         binders,
-        &mut elision.*,
+        &mut elision.*, TypePosition.Referent,
       )
       match move resolved {
         Result<Interned<Type>, Shared<Rejection>>.Success {value: ty} => {
@@ -29061,6 +29166,10 @@ effect fn resolveSignatureUnder(
         return run memberRejected(move error, move dependencies)
       }
     }
+    if resolver.writtenErasure && (value.foreign || value.isStatic || isStaticIndex(List<usize>.asSlice(&value.staticSlots), at)) && Type.containsErased(&ty) {
+      let laneSpan = run parameterSpanOr(&mut resolver.*, &module, entries[at], value.span)
+      return run memberRejected(run reject(&resolver.*, &module, RejectionCode.ErasedBoundary, laneSpan), move dependencies)
+    }
     let existential = run existentialRejection(&mut resolver.*, &module, entries[at], &ty)
     if let Option<Shared<Rejection>>.Some {value: diagnostic} = move existential {
       return run memberRejected(move diagnostic, move dependencies)
@@ -29265,6 +29374,10 @@ effect fn resolveSignatureUnder(
         }
         return run memberRejected(move error, move dependencies)
       }
+    }
+    if resolver.writtenErasure && (value.foreign || value.isStatic) && Type.containsErased(&ty) {
+      let laneSpan = run parameterSpanOr(&mut resolver.*, &module, id, value.span)
+      return run memberRejected(run reject(&resolver.*, &module, RejectionCode.ErasedBoundary, laneSpan), move dependencies)
     }
     let existential = run existentialRejection(&mut resolver.*, &module, id, &ty)
     if let Option<Shared<Rejection>>.Some {value: diagnostic} = move existential {
@@ -35338,7 +35451,7 @@ effect fn qualifierApplication(
     required: 0, paths: false,
   }
   let resolved = run resolveTypeAt(&mut resolver.*, &mut owner.*, &mut dependencies.*,
-    moduleOrdinal, application.id, scope, &mut elision, true)
+    moduleOrdinal, application.id, scope, &mut elision, TypePosition.AppliedOwner)
   omitted.* = elision.nextOrdinal
   return match move resolved {
     Result<Interned<Type>, Shared<Rejection>>.Success {value} => Result<
@@ -37138,6 +37251,30 @@ effect fn inferredInterfaceApplication(
 ) -> Result<Interned<Type>, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
 ? &mut Allocator | &mut Types {
+  if let Type.Erased {contracts: joined, ..} = &Interned<Type>.get(provider).* {
+    let contracts = run Type.failureMembers(&joined)
+    let parts = List<Interned<Type>>.asSlice(&contracts)
+    let definition = resolvedModule(&resolver.*, contractModule)
+    let mut selected = Option<Interned<Type>>.none()
+    let mut at = usize.ZERO
+    while at < parts.length {
+      if declaringModuleOrdinal(&resolver.*, &parts[at]) == contractModule {
+        if let Option<usize>.Some {value: position} = move run ordinalOfProvider(&mut resolver.*, &definition, &parts[at]) {
+          if position == contractOrdinal {
+            if let Option<Interned<Type>>.Some {..} = &selected {
+              return Result<Interned<Type>, Shared<Rejection>>.failResult(run reject(&resolver.*, module, RejectionCode.AmbiguousSuppliedOperation, span))
+            }
+            selected = Option<Interned<Type>>.some(Interned<Type>.clone(&parts[at]))
+          }
+        }
+      }
+      at = at + usize.ONE
+    }
+    if let Option<Interned<Type>>.Some {value} = move selected {
+      return Result<Interned<Type>, Shared<Rejection>>.succeed(move value)
+    }
+    return Result<Interned<Type>, Shared<Rejection>>.failResult(run reject(&resolver.*, module, RejectionCode.MissingConformance, span))
+  }
   let providerApplication = run internApplication(&mut resolver.*, provider)
   let declarationAccess113Request = Key {
       family: Family.ConformanceHeads,
@@ -38803,6 +38940,78 @@ effect fn selfReceiverOf(resolver: &mut Resolver, owner: &mut Query<Answer, NoRe
     Option<Interned<Type>>.None => move receiver
   }
   return run Type.equalsShared(&referent, &owned)
+}
+
+fn erasedType(value: &Type) -> bool { return match &value.* { Type.Erased {..} => true _ => false } }
+
+fn erasedReference(value: &Type) -> bool {
+  return match &value.* {
+    Type.Reference {referent, ..} => Interned<Type>.with<bool>(&referent, erasedType)
+    _ => false
+  }
+}
+
+effect fn erasedUse(module: &ModuleId, span: Span, template: &[u8]) -> Shared<Rejection> ! OutOfMemoryError ? &mut Allocator {
+  let mut diagnostic = run makeRejection(RejectionCode.ErasedPosition, module, span)
+  run List<MessageArgument>.append(&mut diagnostic.arguments, MessageArgument {name: run Bytes.copy(b"template"), value: run Bytes.copy(template)})
+  return run Shared<Rejection>.make(move diagnostic)
+}
+
+// Preserve the source loan when the new reference hides the pointee's type. Contextual lifetime
+// checking then relates that loan to the receiving parameter, binding, field or result.
+effect fn eraseReference(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut List<Dependency>,
+  module: &ModuleId, constraints: &[Constraint], nodes: &mut List<BodyNode>, node: BodyNodeId, target: &Interned<Type>, span: Span)
+  -> Result<BodyNodeId, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let actual = match move bodyExpressionType(List<BodyNode>.asSlice(&nodes.*), &node) {
+    Option<Interned<Type>>.Some {value} => move value
+    Option<Interned<Type>>.None => { fail RevisionMismatch {} }
+  }
+  let source = run Type.copy(&actual)
+  let wanted = run Type.copy(target)
+  if let Type.Reference {referent: member, access, lifetime} = move source {
+    if let Type.Reference {referent: erased, access: requested, ..} = move wanted {
+      if access == requested && !sameReusableType(&member, &erased) {
+        let contract = run Type.copy(&erased)
+        if let Type.Erased {contracts, transferable, concurrent} = move contract {
+          let interfaces = run Type.failureMembers(&contracts)
+          let listed = List<Interned<Type>>.asSlice(&interfaces)
+          let mut at = usize.ZERO
+          let mut request = Request.make()
+          let mut chain = List<ConformanceGoal>.make()
+          let mut steps = List<ConformanceStep>.make()
+          let avoid = Option<Interned<DeclarationId>>.none()
+          while at < listed.length {
+            let goal = ConformanceGoal {provider: Interned<Type>.clone(&member), contract: Interned<Type>.clone(&listed[at])}
+            if let Option<Shared<Rejection>>.Some {value} = move run proveGoal(&mut resolver.*, &mut owner.*, &mut request,
+              &mut dependencies.*, true, &avoid, &goal, constraints, module, span, &mut chain, &mut steps) {
+              return Result<BodyNodeId, Shared<Rejection>>.failResult(move value)
+            }
+            at = at + usize.ONE
+          }
+          if transferable {
+            if let Option<Shared<Rejection>>.Some {value} = move run proveThreadSafe(&mut resolver.*, &mut owner.*, &mut dependencies.*,
+              &member, SealedProperty.Transferable, constraints, module, span) {
+              return Result<BodyNodeId, Shared<Rejection>>.failResult(move value)
+            }
+          }
+          if concurrent {
+            if let Option<Shared<Rejection>>.Some {value} = move run proveThreadSafe(&mut resolver.*, &mut owner.*, &mut dependencies.*,
+              &member, SealedProperty.Concurrent, constraints, module, span) {
+              return Result<BodyNodeId, Shared<Rejection>>.failResult(move value)
+            }
+          }
+          let result = BodyNodeId {index: List<BodyNode>.length(&nodes.*)}
+          let origin = List<BodyNode>.asSlice(&nodes.*)[node.index].origin
+          let ty = run Types.intern(Type.Reference {referent: move erased, access: access, lifetime: move lifetime})
+          run List<BodyNode>.append(&mut nodes.*, BodyNode {origin: origin, kind: BodyNodeKind.Expression {
+            ty: move ty, form: BodyExpression.EraseReference {value: node}}})
+          return Result<BodyNodeId, Shared<Rejection>>.succeed(result)
+        }
+      }
+    }
+  }
+  return Result<BodyNodeId, Shared<Rejection>>.succeed(node)
 }
 
 fn referenceReferent(value: &Type) -> Option<Interned<Type>> {
@@ -41319,13 +41528,16 @@ effect fn checkBorrowOperand<'scope>(
   }
   if !sliceContext {
     if let Option<Interned<Type>>.Some {value: context} = &expected.* {
-      let expectedRegion = Interned<Type>.with<Option<Interned<Lifetime>>>(&context,
+      let mut expectedRegion = Interned<Type>.with<Option<Interned<Lifetime>>>(&context,
         |value: &Type| -> Option<Interned<Lifetime>> {
           return match &value.* {
             Type.Reference {lifetime: validity, ..} => Option<Interned<Lifetime>>.some(Interned<Lifetime>.clone(&validity))
             _ => Option<Interned<Lifetime>>.none()
           }
         })
+      if resolver.writtenErasure && Interned<Type>.with<bool>(&context, erasedReference) && run typeMentionsOwner(&context, &run elidedLifetimeOwner(caller)) {
+        expectedRegion = Option<Interned<Lifetime>>.none()
+      }
       if let Option<Interned<Lifetime>>.Some {value: requested} = move expectedRegion {
         // The loan takes the context's region. The region check proves the borrowed place valid
         // for it: storage owned here cannot escape its validity (BORROW-006, BORROW-008), and a
@@ -42552,6 +42764,13 @@ effect fn checkInferredCallArgument<'scope>(
       }
     }
   }
+  if resolver.writtenErasure && Interned<Type>.with<bool>(parameter, erasedReference) {
+    let site = run originSpan(cursor, List<BodyNode>.asSlice(&nodes.*)[node.index].origin)
+    match move run eraseReference(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, constraints, &mut nodes.*, node, parameter, site) {
+      Result<BodyNodeId, Shared<Rejection>>.Success {value} => { node = value }
+      Result<BodyNodeId, Shared<Rejection>>.Failure {error} => { return Result<BodyNodeId, Shared<Rejection>>.failResult(move error) }
+    }
+  }
   node = run sliceArgument(&mut nodes.*, node, parameter)
   node = run unionArgument(&mut nodes.*, node, parameter)
   node = run pointerArgument(&mut nodes.*, node, parameter, variables, List<Binding>.asSlice(&inferred.*),
@@ -42580,6 +42799,18 @@ effect fn checkInferredCallArgument<'scope>(
       )
     }
     return Result<BodyNodeId, Shared<Rejection>>.failResult(move value)
+  }
+  if resolver.writtenErasure && Interned<Type>.with<bool>(&actual, erasedReference) {
+    let bindings = List<Binding>.asSlice(&inferred.*)
+    let mut at = usize.ZERO
+    while at < bindings.length {
+      if let Argument.Type {value} = &bindings[at].value {
+        if Interned<Type>.with<bool>(&value, erasedType) {
+          return Result<BodyNodeId, Shared<Rejection>>.failResult(run erasedUse(module, span, b"3"))
+        }
+      }
+      at = at + usize.ONE
+    }
   }
   // Infer representation signature evidence before later operands. Implicit representations
   // that cannot satisfy their promise fail specialization at the whole call. A representation
@@ -46427,6 +46658,13 @@ effect fn checkReflectionCall<'scope>(
   if typeArguments.length != CheckedIntrinsic.typeArity(member) {
     return Result<BodyNodeId, Shared<Rejection>>.failResult(run rejectArity(&resolver.*, module, span, CheckedIntrinsic.typeArity(member), typeArguments.length))
   }
+  let mut position = usize.ZERO
+  while position < typeArguments.length {
+    if resolver.writtenErasure && Type.containsErased(&typeArguments[position]) {
+      return run bodyRejection(&resolver.*, module, RejectionCode.ErasedBoundary, span)
+    }
+    position = position + usize.ONE
+  }
   let mut descriptor = run Types.intern(Type.TypeDescriptor {owner: Interned<Type>.clone(&typeArguments[usize.ZERO])})
   let fieldDoc = CheckedIntrinsic.isPrimitive(member, IntrinsicPrimitive.ReflectFieldDoc)
   let field = CheckedIntrinsic.isPrimitive(member, IntrinsicPrimitive.ReflectFieldKind) || fieldDoc ||
@@ -49287,6 +49525,9 @@ effect fn checkRecordMatch<'scope>(
   }
   if reference && writtenArms {
     let subjectSpan = run originSpan(cursor, List<BodyNode>.asSlice(&nodes.*)[subjectNode.index].origin)
+    if resolver.writtenErasure && Interned<Type>.with<bool>(subjectType, erasedReference) {
+      return Result<BodyNodeId, Shared<Rejection>>.failResult(run erasedUse(module, subjectSpan, b"2"))
+    }
     return run bodyRejection(&resolver.*, module, RejectionCode.ReferenceMatchSubject, subjectSpan)
   }
   // A bare match reads one copy, so it is valid only for a Copy scrutinee (MATCH-001). A match,
@@ -49888,6 +50129,14 @@ effect fn checkAggregateInitializer<'scope>(
       if let Node.BorrowExpression {..} = run bodyNode(&resolver.source, cursor, initializerValue) {
         run setBorrowRegion(&mut nodes.*, operand, caller, loanOrdinal, loanBinder)
       }
+    }
+  }
+  if resolver.writtenErasure && Interned<Type>.with<bool>(&appliedMember, erasedReference) {
+    let fieldSpan = run bodySpan(&resolver.source, cursor, initializerValue)
+    operand = match move run eraseReference(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, constraints, &mut nodes.*,
+      operand, &appliedMember, fieldSpan) {
+      Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
+      Result<BodyNodeId, Shared<Rejection>>.Failure {error} => { return Result<BodyNodeId, Shared<Rejection>>.failResult(move error) }
     }
   }
   if let Option<InferredAggregateTarget>.Some {value: target} = &inference.* {
@@ -56512,10 +56761,14 @@ effect fn checkSourceArrayExpression<'scope>(
   let mut diverges = initialDiverges
   let mut elementType = Option<Interned<Type>>.none()
   let mut inferElement = true
+  let mut erasing = Option<Interned<Type>>.none()
   if let Option<ArrayShape>.Some {value: array} = move contextualArrayShape(expected) {
     if array.length != elements.length { return run bodyRejection(&resolver.*, module, RejectionCode.ArrayLengthMismatch, span) }
+    if resolver.writtenErasure && Type.containsErased(&array.element) && run typeMentionsOwner(&array.element, &run elidedLifetimeOwner(caller)) {
+      erasing = Option<Interned<Type>>.some(Interned<Type>.clone(&array.element))
+    }
     elementType = Option<Interned<Type>>.some(move array.element)
-    inferElement = false
+    inferElement = match &erasing { Option<Interned<Type>>.Some {..} => true _ => false }
   }
   if elements.length == usize.ZERO && inferElement {
     return run bodyRejection(&resolver.*, module, RejectionCode.UninferredArrayElement, span)
@@ -56534,6 +56787,7 @@ effect fn checkSourceArrayExpression<'scope>(
       Option<Interned<Type>>.None => Option<Interned<Type>>.none()
     }
     if joining { context = Option<Interned<Type>>.none() }
+    if let Option<Interned<Type>>.Some {value: written} = &erasing { context = Option<Interned<Type>>.some(Interned<Type>.clone(&written)) }
     let checked = run checkArrayElement(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*,
       module, cursor, caller, &mut statementScope.*, calls, &mut nodes.*, &mut signatures.*, &mut requiredBodies.*,
       child, &context, constraints, contractBody, staticBody, unsafeAllowed)
@@ -60359,6 +60613,7 @@ effect fn byValueOperands(nodes: &[BodyNode], at: usize, operands: &mut List<Bod
         BodyExpression.VariantConstruct {fields, ..} => {
           run appendByValueFields(List<BodyAggregateField>.asSlice(&fields), &mut operands.*)
         }
+        BodyExpression.EraseReference {value} => { run List<BodyNodeId>.append(&mut operands.*, value) }
         BodyExpression.UnionInject {value, ..} => { run List<BodyNodeId>.append(&mut operands.*, value) }
         // An expression match yields its selected arm's value.
         BodyExpression.Match {arms, ..} => {
@@ -62237,6 +62492,16 @@ Option<Interned<StaticData>>,
     }
   }
   if originalBinderCount > usize.ZERO {
+    if resolver.writtenErasure && Shared<Result<Answer, NoRejection>>.with<bool>(&target.signature, signatureIsStatic) {
+      let types = List<Argument>.asSlice(&specialized)
+      let mut at = usize.ZERO
+      while at < types.length {
+        if let Argument.Type {value} = &types[at] {
+          if Type.containsErased(&value) { return run bodyRejection(&resolver.*, module, RejectionCode.ErasedBoundary, span) }
+        }
+        at = at + usize.ONE
+      }
+    }
     let selected = run checkedDirectApplication(
       &mut resolver.*,
       &mut owner.*,
@@ -62810,6 +63075,12 @@ effect fn finishExpression(
   contractBody: bool, staticBody: bool,
 ) -> Result<BodyNodeId, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  if resolver.writtenErasure && Interned<Type>.with<bool>(&ty, erasedType) {
+    return Result<BodyNodeId, Shared<Rejection>>.failResult(run erasedUse(module, span, b"1"))
+  }
+  if resolver.writtenErasure && staticBody && Type.containsErased(&ty) {
+    return run bodyRejection(&resolver.*, module, RejectionCode.ErasedBoundary, span)
+  }
   if !diverges {
     if let Option<Interned<Type>>.Some {value} = &expected.* {
       if !run Type.equalsShared(&ty, &value) {
@@ -63225,6 +63496,24 @@ effect fn admitExpectedValue(
     if run sameBodyType(&resolver.*, &wanted, &offered) {
       return Result<BodyNodeId, Shared<Rejection>>.succeed(node)
     }
+    // A local annotation with a written erasure supplies the contract while its initializer
+    // supplies each elided lifetime (LIFE-003). Keep those actual regions on the typed node.
+    if resolver.writtenErasure && Type.containsErased(&value) {
+      if let Option<Interned<Type>>.Some {..} = move run inferredAnnotation(&value, &actual, &run elidedLifetimeOwner(caller)) {
+        return Result<BodyNodeId, Shared<Rejection>>.succeed(node)
+      }
+    }
+    if resolver.writtenErasure && Interned<Type>.with<bool>(&value, erasedReference) {
+      let converted = match move run eraseReference(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, constraints,
+        &mut nodes.*, node, &value, span) {
+        Result<BodyNodeId, Shared<Rejection>>.Success {value: changed} => changed
+        Result<BodyNodeId, Shared<Rejection>>.Failure {error} => { return Result<BodyNodeId, Shared<Rejection>>.failResult(move error) }
+      }
+      if converted.index != node.index {
+        return run admitExpectedValue(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, caller, constraints,
+          &mut nodes.*, converted, expected, mismatchCode, span, relateUnowned, tentative)
+      }
+    }
     let injected = run unionArgument(&mut nodes.*, node, &value)
     if injected.index != node.index { return Result<BodyNodeId, Shared<Rejection>>.succeed(injected) }
     // A value that differs from exactly one union member only in covariant regions meets that
@@ -63238,6 +63527,32 @@ effect fn admitExpectedValue(
         run retypeNode(&mut nodes.*, node, move admitted.member)
         let retyped = run unionArgument(&mut nodes.*, node, &value)
         if retyped.index != node.index { return Result<BodyNodeId, Shared<Rejection>>.succeed(retyped) }
+      }
+    }
+    if resolver.writtenErasure && Interned<Type>.with<bool>(&actual, referenceValue) {
+      // Conversion into a union must select exactly one member. A failed conformance proof for
+      // one alternative does not exclude another alternative that admits the reference.
+      let listed = List<Interned<Type>>.asSlice(&candidates)
+      let mut at = usize.ZERO
+      let mut erased = Option<BodyNodeId>.none()
+      while at < listed.length {
+        if Interned<Type>.with<bool>(&listed[at], erasedReference) {
+          let option = Option<Interned<Type>>.some(Interned<Type>.clone(&listed[at]))
+          let saved = List<BodyNode>.length(&nodes.*)
+          let attempt = run admitExpectedValue(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, caller, constraints,
+            &mut nodes.*, node, &option, mismatchCode, span, relateUnowned, tentative)
+          if let Result<BodyNodeId, Shared<Rejection>>.Success {value: converted} = move attempt {
+            if let Option<BodyNodeId>.Some {..} = &erased {
+              return run bodyRejection(&resolver.*, module, RejectionCode.IncompatibleUnionConversion, span)
+            }
+            erased = Option<BodyNodeId>.some(converted)
+          } else { List<BodyNode>.truncate(&mut nodes.*, saved) }
+        }
+        at = at + usize.ONE
+      }
+      if let Option<BodyNodeId>.Some {value: converted} = move erased {
+        let tagged = run unionArgument(&mut nodes.*, converted, &value)
+        if tagged.index != converted.index { return Result<BodyNodeId, Shared<Rejection>>.succeed(tagged) }
       }
     }
     let sliced = run sliceArgument(&mut nodes.*, node, &value)
@@ -65561,6 +65876,9 @@ effect fn threadSafeWithin(
       run List<Interned<Type>>.append(&mut parts, Interned<Type>.clone(&element))
     }
     Type.Array {element, ..} => { run List<Interned<Type>>.append(&mut parts, Interned<Type>.clone(&element)) }
+    Type.Erased {transferable, concurrent, ..} => {
+      return Result<bool, Shared<Rejection>>.succeed(match property { SealedProperty.Transferable => transferable SealedProperty.Concurrent => concurrent _ => false })
+    }
     Type.Union {members} => { parts = run copyTypes(List<Interned<Type>>.asSlice(&members)) }
     Type.Anonymous {members, ..} => { parts = run copyTypes(List<Interned<Type>>.asSlice(&members)) }
     Type.CallableValue {captures, ..} => { parts = run copyTypes(List<Interned<Type>>.asSlice(&captures)) }
@@ -69199,6 +69517,10 @@ effect fn bindingAnnotationType(
   }
   match & annotations[selected].result {
     Result<Interned<Type>, Shared<Rejection>>.Success {value} => {
+      if resolver.writtenErasure && staticBody && Type.containsErased(&value) {
+        return Result<Interned<Type>, Shared<Rejection>>.failResult(run reject(resolver, module, RejectionCode.ErasedBoundary,
+          run bodySpan(&resolver.source, cursor, annotation)))
+      }
       // A declared Effect contract stores the exact Effect its initializer admits (EFF-013).
       if !contractBody && !staticBody && !Interned<Type>.with<bool>(&value, runtimeType) && !Interned<Type>.with<bool>(&value, bareEffect) {
         return Result<Interned<Type>, Shared<Rejection>>.failResult(
@@ -70481,6 +70803,9 @@ effect fn checkWrittenBinding(
                 if run emptyArrayLiteral(&resolver.source, cursor, initializer) {
                   expected = Option<Interned<Type>>.some(run staticElided(&value, &elided))
                 } else {
+                  if resolver.writtenErasure && Type.containsErased(&value) {
+                    expected = Option<Interned<Type>>.some(Interned<Type>.clone(&value))
+                  }
                   described = Option<Interned<Type>>.some(move value)
                 }
               } else {
@@ -80326,14 +80651,26 @@ effect fn exportShim(
 
 // Whether `instance` runs an interface operation itself under a structural union `Self`: the
 // witness a union provider selects (UNION-003).
-effect fn unionDispatched(instance: &InstanceKey) -> bool ! OutOfMemoryError ? &mut Allocator {
-  if let InstanceKey.Function {..} = &instance.* {
-    let application = run InstanceKey.selected(instance)
-    if let SpecializationTarget.Operation {provider, operation, implementation, ..} = &application.target {
-      return DeclarationId.equals(&operation, &implementation) && Interned<Type>.with<bool>(&provider, unionType)
-    }
+enum OperationDispatch { Direct, Union, Erased }
+
+fn operationDispatch(instance: &InstanceKey) -> OperationDispatch {
+  if let InstanceKey.Function {application, ..} = &instance.* {
+    return Interned<Application>.with<OperationDispatch>(&application, |value: &Application| -> OperationDispatch {
+      if let SpecializationTarget.Operation {provider, operation, implementation, ..} = &value.target {
+        if DeclarationId.equals(&operation, &implementation) {
+          return Interned<Type>.with<OperationDispatch>(&provider, |ty: &Type| -> OperationDispatch {
+            return match &ty.* {
+              Type.Union {..} => OperationDispatch.Union
+              Type.Erased {..} => OperationDispatch.Erased
+              _ => OperationDispatch.Direct
+            }
+          })
+        }
+      }
+      return OperationDispatch.Direct
+    })
   }
-  return false
+  return OperationDispatch.Direct
 }
 
 // The dispatch body of a union operation instance: one arm per member calls that member's witness.
@@ -81036,7 +81373,11 @@ effect fn lowerMir(
       )
     }
   }
-  if run unionDispatched(&instance) {
+  let dispatch = operationDispatch(&instance)
+  if dispatch == OperationDispatch.Erased {
+    return memberSuccess(run dispatchGap(GapCode.WitnessOperand, &identity), List<Dependency>.make())
+  }
+  if dispatch == OperationDispatch.Union {
     return run resolveUnionDispatchMir(&mut resolver.*, &mut owner.*, key, move instance, &identity, observing)
   }
   // Typed origins count from the declaration's anchor; MIR keeps them relative and reads them
@@ -88458,6 +88799,14 @@ effect fn proveGoal(
     List<ConformanceGoal>.truncate(&mut chain.*, mark)
     return Option<Shared<Rejection>>.none()
   }
+  if let Type.Erased {contracts: contracts, ..} = &Interned<Type>.get(&goal.provider).* {
+    List<ConformanceGoal>.truncate(&mut chain.*, mark)
+    if !run Type.coversFailure(&contracts, &goal.contract) {
+      return Option<Shared<Rejection>>.some(run missingConformance(siteModule, siteSpan, goal, false))
+    }
+    run List<ConformanceStep>.append(&mut steps.*, ConformanceStep {goal: copyGoal(goal), evidence: ConformanceEvidence.Erased})
+    return Option<Shared<Rejection>>.none()
+  }
   if Interned<Type>.with<bool>(&goal.provider, unionType) {
     let failed = run proveUnionGoal(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*, nested, avoid,
       goal, declared, siteModule, siteSpan, &mut chain.*, &mut steps.*)
@@ -88880,6 +89229,29 @@ effect fn proveUnionGoal(
   // reaches an operation. `()` stands in for a member to find where an operation names `Self`.
   let mut representative = run Types.intern(Type.Unit)
   if listed.length > usize.ZERO { representative = Interned<Type>.clone(&listed[usize.ZERO]) }
+  if let Option<Shared<Rejection>>.Some {value} = move run referenceOnlyContract(&mut resolver.*, &mut owner.*, &mut request.*,
+    &mut dependencies.*, nested, goal, &representative, siteModule, siteSpan) {
+    return Option<Shared<Rejection>>.some(move value)
+  }
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let memberGoal = ConformanceGoal {contract: Interned<Type>.clone(&goal.contract), provider: Interned<Type>.clone(&listed[at])}
+    let failed = run proveGoal(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*, nested, avoid,
+      &memberGoal, declared, siteModule, siteSpan, &mut chain.*, &mut steps.*)
+    if let Option<Shared<Rejection>>.Some {value} = move failed {
+      return Option<Shared<Rejection>>.some(move value)
+    }
+    at = at + usize.ONE
+  }
+  run List<ConformanceStep>.append(&mut steps.*, ConformanceStep {goal: copyGoal(goal), evidence: ConformanceEvidence.Union})
+  return Option<Shared<Rejection>>.none()
+}
+
+// Compare two substitutions for Self so nested references to it in the operation are visible.
+effect fn referenceOnlyContract(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, request: &mut Request,
+  dependencies: &mut List<Dependency>, nested: bool, goal: &ConformanceGoal, representative: &Interned<Type>,
+  siteModule: &ModuleId, siteSpan: Span) -> Option<Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
   let contractModuleOrdinal = declaringModuleOrdinal(&resolver.*, &goal.contract)
   if contractModuleOrdinal == usize.MAX {
     return Option<Shared<Rejection>>.some(run missingConformance(siteModule, siteSpan, goal, false))
@@ -88901,7 +89273,7 @@ effect fn proveUnionGoal(
   // that differs between the two names `Self`.
   let contractKey = run internApplication(&mut resolver.*, &goal.contract)
   let unionKey = run internApplication(&mut resolver.*, &goal.provider)
-  let memberKey = run internApplication(&mut resolver.*, &representative)
+  let memberKey = run internApplication(&mut resolver.*, representative)
   let count = Shared<Result<Answer, NoRejection>>.with<usize>(&operations, listedOperationCount)
   let mut at = usize.ZERO
   while at < count {
@@ -88928,17 +89300,6 @@ effect fn proveUnionGoal(
     }
     at = at + usize.ONE
   }
-  at = usize.ZERO
-  while at < listed.length {
-    let memberGoal = ConformanceGoal {contract: Interned<Type>.clone(&goal.contract), provider: Interned<Type>.clone(&listed[at])}
-    let failed = run proveGoal(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*, nested, avoid,
-      &memberGoal, declared, siteModule, siteSpan, &mut chain.*, &mut steps.*)
-    if let Option<Shared<Rejection>>.Some {value} = move failed {
-      return Option<Shared<Rejection>>.some(move value)
-    }
-    at = at + usize.ONE
-  }
-  run List<ConformanceStep>.append(&mut steps.*, ConformanceStep {goal: copyGoal(goal), evidence: ConformanceEvidence.Union})
   return Option<Shared<Rejection>>.none()
 }
 
@@ -88953,21 +89314,42 @@ effect fn undispatchableUnion(module: &ModuleId, span: Span, goal: &ConformanceG
     run Bytes.append(&mut text, b": ")
     run Bytes.append(&mut text, Bytes.asSlice(&contract))
     run Bytes.append(&mut text, b"`")
+    let erased = Interned<Type>.with<bool>(&goal.provider, erasedType)
+    if erased {
+      run List<MessageArgument>.append(&mut diagnostic.arguments, MessageArgument {name: run Bytes.copy(b"template"), value: run Bytes.copy(b"4")})
+    }
     let name = Interned<DeclarationId>.with<DeclarationId>(operation, DeclarationId.copy)
     let spelling = run DeclarationId.copySpelling(&name)
     let mut detail = Bytes.make()
     if shape == DispatchShape.CallableResult || shape == DispatchShape.EffectResult {
       run Bytes.append(&mut detail, b"`")
+      if erased {
+        run Bytes.append(&mut detail, Bytes.asSlice(&contract))
+        run Bytes.append(&mut detail, b".")
+      }
       run Bytes.append(&mut detail, Bytes.asSlice(&spelling))
       if shape == DispatchShape.CallableResult {
-        run Bytes.append(&mut detail, b"` returns a function whose exact type the implementation chooses. Union members can return different functions with different captures. Give the operation one concrete result type, or pass the arguments into the operation and call the function there")
+        if erased {
+          run Bytes.append(&mut detail, b"` returns a function. Each implementation can return a different closure type, even when the functions take the same arguments and return the same result. Give the operation one concrete result type, or move the function call into the operation and return its result")
+        } else {
+          run Bytes.append(&mut detail, b"` returns a function whose exact type the implementation chooses. Union members can return different functions with different captures. Give the operation one concrete result type, or pass the arguments into the operation and call the function there")
+        }
       } else {
         run Bytes.append(&mut detail, b"` returns an Effect whose exact type the implementation chooses. Give the operation one concrete result type, or declare an `effect fn` that runs the Effect and returns its result")
       }
     } else {
-      run Bytes.append(&mut detail, b"a union takes an interface only when each operation receives `self` by reference and names `Self` nowhere else, and `")
+      if erased {
+        run Bytes.append(&mut detail, b"each operation must receive `self` by reference and name `Self` nowhere else, and `")
+      } else {
+        run Bytes.append(&mut detail, b"a union takes an interface only when each operation receives `self` by reference and names `Self` nowhere else, and `")
+      }
       run Bytes.append(&mut detail, Bytes.asSlice(&spelling))
       run Bytes.append(&mut detail, b"` does not")
+    }
+    if erased {
+      text = run Bytes.copy(b"`&")
+      run Bytes.append(&mut text, Bytes.asSlice(&provider))
+      run Bytes.append(&mut text, b"`")
     }
     run List<MessageArgument>.append(&mut diagnostic.arguments, MessageArgument {name: run Bytes.copy(b"goal"), value: move text})
     run List<MessageArgument>.append(&mut diagnostic.arguments, MessageArgument {name: run Bytes.copy(b"detail"), value: move detail})
@@ -89326,7 +89708,7 @@ effect fn completedWitnessApplication(resolver: &mut Resolver, owner: &mut Query
   let operation = DeclarationId.copyShared(&recipe.operation)
   // A union provider's witness is the operation itself under `Self := U`; its instance dispatches
   // on the receiver's tag (UNION-003), so every operand passes as written.
-  if Interned<Type>.with<bool>(&recipe.provider, unionType) {
+  if Interned<Type>.with<bool>(&recipe.provider, unionType) || Interned<Type>.with<bool>(&recipe.provider, erasedType) {
     let application = run unionOperationApplication(recipe, &operation)
     let mut operands = List<OperandPass>.make()
     let mut at = usize.ZERO
@@ -90810,6 +91192,24 @@ effect fn appendConcreteOperationSuppliers(
     Option<usize>.None => {
       return Result<(), Shared<Rejection>>.succeed(())
     }
+  }
+  if let Type.Erased {contracts: contracts, ..} = &Interned<Type>.get(provider).* {
+    let parts = run Type.failureMembers(&contracts)
+    let listed = List<Interned<Type>>.asSlice(&parts)
+    let mut part = usize.ZERO
+    while part < listed.length {
+      if declaringModuleOrdinal(&resolver.*, &listed[part]) == visibleInterface.module {
+        if let Option<usize>.Some {value: ordinal} = move run ordinalOfProvider(&mut resolver.*, module, &listed[part]) {
+          if ordinal == visibleInterface.ordinal {
+            let added = run appendContractSupplier(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*, nested,
+              provider, providerKey, Interned<Type>.clone(&listed[part]), visibleInterface, operationOrdinal, siteSpan, &mut candidates.*, &mut selection.*)
+            if let Result<(), Shared<Rejection>>.Failure {error} = move added { return Result<(), Shared<Rejection>>.failResult(move error) }
+          }
+        }
+      }
+      part = part + usize.ONE
+    }
+    return Result<(), Shared<Rejection>>.succeed(())
   }
   if Interned<Type>.with<bool>(provider, unionType) {
     return run appendUnionOperationSuppliers(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*, nested,
@@ -95475,6 +95875,7 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
   }
   return Semantic {
     resolver: Resolver {
+      writtenErasure: false,
       staticDemandDepth: usize.ZERO,
       staticDemandLimit: usize.MAX,
       discoveredStaticCall: Option<StaticCallHint>.none(),
@@ -112965,6 +113366,7 @@ effect fn appendOperands(nodes: &[BodyNode], id: BodyNodeId, pending: &mut List<
         BodyExpression.ArrayRepeat {value, ..} => { run List<BodyNodeId>.append(&mut pending.*, value) }
         BodyExpression.EnumValue {value} => { run List<BodyNodeId>.append(&mut pending.*, value) }
         BodyExpression.UnionInject {value, ..} => { run List<BodyNodeId>.append(&mut pending.*, value) }
+        BodyExpression.EraseReference {value} => { run List<BodyNodeId>.append(&mut pending.*, value) }
         BodyExpression.UnionWiden {value} => { run List<BodyNodeId>.append(&mut pending.*, value) }
         BodyExpression.Move {value, ..} => { run List<BodyNodeId>.append(&mut pending.*, value) }
         BodyExpression.Run {value, ..} => { run List<BodyNodeId>.append(&mut pending.*, value) }

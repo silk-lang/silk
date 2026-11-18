@@ -366,7 +366,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   // A task's unknown option is followed by that task's usage and options.
   const unknownTaskOption = yield* invoke(silk, ['task', '--stdlib', standardLibrary, 'build', '--release'], aliased, requestEnv, 120_000)
   assert.equal(unknownTaskOption.status, 2, unknownTaskOption.stderr)
-  assert.match(unknownTaskOption.stderr, /^error: unknown option --release\n\nUsage: tasks build \[options\]\n/m)
+  assert.match(unknownTaskOption.stderr, /^error: unknown option --release\n\nUsage: silk task build \[options\]\n/m)
   assert.match(unknownTaskOption.stderr, /^ +--code <value> +Exit code/m)
   // The compiler's own options stay with the compiler; the task sees only its own.
   const compilerOptions = ['-q', '--timings', '--ignore-warnings', '--progress', 'plain', '--backend', 'llvm']
