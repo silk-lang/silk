@@ -16,7 +16,8 @@ Decoding streams over the text with `silk.json.scanner.JsonScanner` and builds t
 directly, with no tree of JSON values in between. Each object is scanned once into an index of
 its members, so members may come in any order, and members the type does not name are skipped,
 or reported when its spec is `Spec.strict`. Every problem carries the span of the bytes it is
-about. Encoding writes compact JSON, with struct fields in declaration order.
+about. Encoding writes compact JSON, with struct fields in declaration order. A
+`silk.collections.bytes.Bytes` field is a string in standard Base64 with padding.
 
 ## Examples
 ### Report where a value failed
@@ -638,12 +639,12 @@ Writes `null`.
 ### Operation `beginList`
 
 ```silk
-effect fn beginList(self: &mut Self) -> ()
+effect fn beginList(self: &mut Self, count: usize) -> ()
     ! Issue | WriterError
     ? &mut Writer
 ```
 
-Writes `[`.
+Writes `[`. JSON does not write `count`.
 
 <a id="JsonSchemaWriter.impl.SchemaWriter.element"></a>
 
@@ -674,12 +675,12 @@ Writes `]`.
 ### Operation `beginObject`
 
 ```silk
-effect fn beginObject(self: &mut Self) -> ()
+effect fn beginObject(self: &mut Self, count: usize) -> ()
     ! Issue | WriterError
     ? &mut Writer
 ```
 
-Writes `{`.
+Writes `{`. JSON does not write `count`.
 
 <a id="JsonSchemaWriter.impl.SchemaWriter.key"></a>
 

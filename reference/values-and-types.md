@@ -1844,6 +1844,9 @@ parameter, its result or its failure. A service operation that requires its own 
 receives its provider that way, so a union provides a service whose members all do. A call on the
 union runs the active member's operation with the remaining arguments unchanged.
 
+A written `&any I` lets the build collect the member types from explicit borrow conversions.
+See [ANY-001](generics-interfaces-and-specialization.md#any-001-borrowing-a-reference-only-interface).
+
 ```silk
 import silk.mem.allocator { OutOfMemoryError }
 import silk.text.format { Format }
@@ -1872,6 +1875,12 @@ on its failure, which the default runtime places on `main`'s errors.
 **Boundary:** The union never owns an implementation and no `impl` may name it (IMPL-001). An
 operation that takes `self` by value, returns `Self`, or takes a second `Self` operand cannot pick
 one member, so an interface with such an operation never applies to a union.
+
+An operation called through a union must also declare one exact result type independent of the
+member. For example, `fn make(self: &Self) -> fn(i32) -> i32` lets each implementation return a
+different function with different captures. A factory can instead declare
+`fn apply(self: &Self, value: i32) -> i32` and invoke its function before returning. An
+`effect fn` with an ordinary result can still construct a stored Effect and dispatch when it runs.
 
 **Diagnostics:** A member without the interface reports `SEM0121` naming that member. An interface
 with an operation that cannot dispatch on the tag reports `SEM0121` naming the operation.

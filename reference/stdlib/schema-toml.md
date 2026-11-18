@@ -12,6 +12,7 @@ The type's schema controls field names, defaults, validation, and unknown fields
 TOML tables become schema objects, and arrays become lists. Strings remain text without scalar coercion.
 Encoding writes root assignments and nested inline tables in declaration order, with bare keys where TOML allows them. Absent optional fields are omitted.
 TOML has no null value; a null inside an array cannot be encoded.
+A `silk.collections.bytes.Bytes` field is a string in standard Base64 with padding.
 
 Import as `SchemaToml` with `import silk.schema.toml { SchemaToml }`.
 
@@ -459,12 +460,12 @@ Rejects null, which TOML cannot represent.
 ### Operation `beginList`
 
 ```silk
-effect fn beginList(self: &mut Self) -> ()
+effect fn beginList(self: &mut Self, count: usize) -> ()
     ! Issue | WriterError
     ? &mut Writer
 ```
 
-Writes `[`.
+Writes `[`. TOML does not write `count`.
 
 <a id="TomlSchemaWriter.impl.SchemaWriter.element"></a>
 
@@ -495,12 +496,12 @@ Writes `]`.
 ### Operation `beginObject`
 
 ```silk
-effect fn beginObject(self: &mut Self) -> ()
+effect fn beginObject(self: &mut Self, count: usize) -> ()
     ! Issue | WriterError
     ? &mut Writer
 ```
 
-Starts the root document or a nested inline table.
+Starts the root document or a nested inline table. TOML does not write `count`.
 
 <a id="TomlSchemaWriter.impl.SchemaWriter.key"></a>
 

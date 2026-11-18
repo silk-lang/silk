@@ -1,5 +1,6 @@
 //! Loop-invariant code motion for one SSA function: instructions a loop computes the same way on
-//! every iteration move to a block that runs once before it.
+//! every iteration move to a block that runs once before it, and a field the loop reads and
+//! writes through an argument stays in a value for the loop's length.
 //!
 //! # When to use
 //! Run [`hoist`] in a build optimized for speed after the scalar passes, then run them again on
@@ -24,18 +25,32 @@
 //!   no store, copy or fill in the loop may alias it (`SsaMemory.mayAlias`). A load that can trap
 //!   moves only from the header, and only when nothing before it in the header has side effects
 //!   or can trap: the header runs whenever the preheader leaves, so the load ran there first, in
-//!   the same memory, before anything observable.
+//!   the same memory, before anything observable. A load of bytes an argument is known to reach
+//!   (`SsaFunction.setReach`) cannot trap, and moves from any block of the loop.
 //!
-//! A trapping division, a call or a store never moves. Blocks are only added after the others,
-//! and instructions keep their numbers, so the result depends only on the function.
+//! A trapping division, a call or a store never moves.
+//!
+//! A field is the bytes at a known offset from an argument, within what the argument is known to
+//! reach, that the loop stores. When the loop loads and stores those bytes as one kind and holds
+//! nothing else that may reach them (no call, copy, fill or other operation with side effects,
+//! and no load or store that may alias them), the preheader loads the field once, the loop works
+//! on that value, and a new block on each edge out of the loop stores it back, edges to blocks
+//! that trap included. `self.position` advanced each time round then costs no load and no
+//! store there. The pass moves each such field's accesses to a variable slot and has
+//! `SsaPromotion.promote` turn the slots into values; at most [`fields`] fields of one loop.
+//!
+//! Blocks are only added after the others, and instructions keep their numbers, so the result
+//! depends only on the function.
 
 import backend.SsaDeadCode
-import backend.SsaFunction {Definition, Edge, Exit, Operation, SsaFunction, none}
+import backend.SsaFunction {Definition, Edge, Exit, Kind, Operation, SsaFunction, none}
 import backend.SsaGraph {SsaGraph}
 import backend.SsaMemory
 import backend.SsaMemory {BaseForm, Place}
+import backend.SsaPromotion
 import silk.collections.list {List}
 import silk.core.option {Option}
+import silk.core.ownership {Copy}
 import silk.mem.allocator {Allocator, OutOfMemoryError}
 import silk.num.u64
 import silk.num.usize
@@ -58,7 +73,198 @@ pub effect fn hoist(function: &mut SsaFunction) -> bool ! OutOfMemoryError ? &mu
     at = at - usize.ONE
     if run hoistLoop(&mut function.*, List<usize>.get(&headers, at)) { changed = true }
   }
+  // The fields a loop reads and writes through an argument, kept in values for the loop's length.
+  let mut promoted = false
+  at = List<usize>.length(&headers)
+  while at > usize.ZERO {
+    at = at - usize.ONE
+    if run promoteFields(&mut function.*, List<usize>.get(&headers, at)) { promoted = true }
+  }
+  if promoted {
+    run SsaPromotion.promote(&mut function.*, false)
+    changed = true
+  }
   return changed
+}
+
+/// The most fields of one loop [`hoist`] keeps in values.
+pub fn fields() -> usize { return 8 }
+
+// One load or store of a loop: the instruction, where it reaches, how many bytes, of which kind,
+// and whether it writes.
+struct Access {
+  instruction: usize,
+  place: Place,
+  size: u64,
+  kind: Kind,
+  writes: bool,
+}
+
+impl Copy for Access {}
+
+// Whether two places are the same bytes' start.
+fn samePlace(first: Place, second: Place) -> bool {
+  return first.known && second.known && first.form == second.form && first.base == second.base && first.offset == second.offset
+}
+
+// Moves each field that the loop at `header` loads and stores through an argument into a variable
+// slot for the loop's length: the block before the loop loads the field into the slot, the loop's
+// accesses read and write the slot, and a new block on each edge out of the loop stores the slot
+// back. The caller promotes the slots, which leaves the field in a value that goes round the
+// loop. Answers whether it moved any.
+//
+// A field is the bytes at a known offset from an argument that the argument is known to reach
+// (`SsaFunction.setReach`), so the load before the loop cannot trap. The loop must store it, load
+// and store it as one kind, and hold nothing else that may reach those bytes: no call, copy, fill
+// or other operation with side effects, and no load or store that may alias them. An edge to a
+// block that traps stores the field back too, so memory is as the loop left it wherever it
+// leaves.
+effect fn promoteFields(function: &mut SsaFunction, header: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let graph = run SsaGraph.of(&function.*)
+  if header >= function.blockCount() || !graph.reaches(header) { return false }
+  // The loop's blocks, by a walk back from the back edges' sources.
+  let count = function.blockCount()
+  let mut inLoop = run List<bool>.makeWithCapacity(count)
+  run List<bool>.appendRepeated(&mut inLoop, false, count)
+  List<bool>.set(&mut inLoop, header, true)
+  let mut stack = List<usize>.make()
+  let incoming = graph.predecessorsOf(header)
+  let mut at = usize.ZERO
+  while at < incoming.length {
+    if graph.dominates(header, incoming[at]) && !List<bool>.get(&inLoop, incoming[at]) {
+      List<bool>.set(&mut inLoop, incoming[at], true)
+      run List<usize>.append(&mut stack, incoming[at])
+    }
+    at = at + usize.ONE
+  }
+  if List<usize>.length(&stack) == usize.ZERO && !selfLoop(&function.*, header) { return false }
+  while let Option<usize>.Some {value: block} = List<usize>.pop(&mut stack) {
+    let before = graph.predecessorsOf(block)
+    let mut edge = usize.ZERO
+    while edge < before.length {
+      if !List<bool>.get(&inLoop, before[edge]) && graph.reaches(before[edge]) {
+        List<bool>.set(&mut inLoop, before[edge], true)
+        run List<usize>.append(&mut stack, before[edge])
+      }
+      edge = edge + usize.ONE
+    }
+  }
+  // Every load and store of the loop; anything else with side effects keeps every field.
+  let escaped = run SsaMemory.escapedSlots(&function.*)
+  let mut accesses = List<Access>.make()
+  let mut block = usize.ZERO
+  while block < count {
+    if List<bool>.get(&inLoop, block) {
+      let listed = List<usize>.asSlice(&function.block(block).instructions)
+      at = usize.ZERO
+      while at < listed.length {
+        let found = function.instruction(listed[at])
+        let operands = function.operandsOf(listed[at])
+        match found.operation {
+          Operation.Load {offset, ..} => {
+            run List<Access>.append(&mut accesses, Access {instruction: listed[at], place: SsaMemory.placeOf(&function.*, operands[usize.ZERO], offset),
+              size: usize.toU64(found.kind.storeSize()), kind: found.kind, writes: false})
+          }
+          Operation.Store {offset, ..} => {
+            let kind = function.kindOf(operands[usize.ZERO])
+            run List<Access>.append(&mut accesses, Access {instruction: listed[at], place: SsaMemory.placeOf(&function.*, operands[usize.ONE], offset),
+              size: usize.toU64(kind.storeSize()), kind: kind, writes: true})
+          }
+          _ => { if found.operation.hasSideEffects() || found.operation.readsState() { return false } }
+        }
+        at = at + usize.ONE
+      }
+    }
+    block = block + usize.ONE
+  }
+  // The fields: stored in the loop, within an argument's reach, and alone on their bytes.
+  let all = List<Access>.asSlice(&accesses)
+  let mut chosen = List<Access>.make()
+  at = usize.ZERO
+  while at < all.length && List<Access>.length(&chosen) < fields() {
+    let field = all[at]
+    let mut fits = field.writes && !field.kind.isVector() && field.kind.bits <= 64 && SsaMemory.withinReach(&function.*, field.place, field.size)
+    let mut earlier = usize.ZERO
+    while fits && earlier < List<Access>.length(&chosen) {
+      if samePlace(List<Access>.get(&chosen, earlier).place, field.place) { fits = false }
+      earlier = earlier + usize.ONE
+    }
+    let mut other = usize.ZERO
+    while fits && other < all.length {
+      if samePlace(all[other].place, field.place) {
+        if !all[other].kind.equals(field.kind) { fits = false }
+      } else if SsaMemory.mayAlias(all[other].place, all[other].size, field.place, field.size, List<bool>.asSlice(&escaped), function.addressBits) {
+        fits = false
+      }
+      other = other + usize.ONE
+    }
+    if fits { run List<Access>.append(&mut chosen, field) }
+    at = at + usize.ONE
+  }
+  if List<Access>.length(&chosen) == usize.ZERO { return false }
+  // The edges out of the loop, each through a new block that will store the fields back.
+  let preheader = run preheaderOf(&mut function.*, &graph, List<bool>.asSlice(&inLoop), header)
+  let place = function.block(header).place
+  let mut leaving = List<usize>.make()
+  block = usize.ZERO
+  while block < count {
+    if List<bool>.get(&inLoop, block) {
+      let edges = List<Edge>.length(&function.block(block).edges)
+      let mut edge = usize.ZERO
+      while edge < edges {
+        let target = List<Edge>.asSlice(&function.block(block).edges)[edge].block
+        if target >= count || !List<bool>.get(&inLoop, target) {
+          let mut arguments = List<u64>.make()
+          run List<u64>.appendSlice(&mut arguments, List<u64>.asSlice(&List<Edge>.asSlice(&function.block(block).edges)[edge].arguments))
+          let out = run function.addJumpBlock(target, List<u64>.asSlice(&arguments), place)
+          run function.setEdge(block, edge, out, &[])
+          run List<usize>.append(&mut leaving, out)
+        }
+        edge = edge + usize.ONE
+      }
+    }
+    block = block + usize.ONE
+  }
+  let pointer = function.addressKind()
+  let mut each = usize.ZERO
+  while each < List<Access>.length(&chosen) {
+    let field = List<Access>.get(&chosen, each)
+    let slot = run function.addVariableSlot(field.kind)
+    let held = run function.insertInstruction(usize.ZERO, usize.ZERO, Operation.SlotAddress {slot: slot}, pointer, &[], 0)
+    // The field's own address and its value on the way in.
+    let mut end = List<usize>.length(&function.block(preheader).instructions)
+    let mut address = field.place.base
+    if field.place.offset != 0 {
+      address = run function.insertInstruction(preheader, end, Operation.Offset {offset: field.place.offset}, pointer, &[field.place.base], place)
+      end = end + usize.ONE
+    }
+    let first = run function.insertInstruction(preheader, end, Operation.Load {offset: 0, alignment: usize.ONE}, field.kind, &[address], place)
+    drop run function.insertInstruction(preheader, end + usize.ONE, Operation.Store {offset: 0, alignment: usize.ONE}, Kind.unit(), &[first, held], place)
+    // The loop reads and writes the slot.
+    at = usize.ZERO
+    while at < all.length {
+      if samePlace(all[at].place, field.place) {
+        if all[at].writes {
+          function.setOperation(all[at].instruction, Operation.Store {offset: 0, alignment: usize.ONE})
+          function.setOperand(all[at].instruction, usize.ONE, held)
+        } else {
+          function.setOperation(all[at].instruction, Operation.Load {offset: 0, alignment: usize.ONE})
+          function.setOperand(all[at].instruction, usize.ZERO, held)
+        }
+      }
+      at = at + usize.ONE
+    }
+    // Each way out stores it back.
+    at = usize.ZERO
+    while at < List<usize>.length(&leaving) {
+      let out = List<usize>.get(&leaving, at)
+      let last = run function.insertInstruction(out, usize.ZERO, Operation.Load {offset: 0, alignment: usize.ONE}, field.kind, &[held], place)
+      drop run function.insertInstruction(out, usize.ONE, Operation.Store {offset: 0, alignment: usize.ONE}, Kind.unit(), &[last, address], place)
+      at = at + usize.ONE
+    }
+    each = each + usize.ONE
+  }
+  return true
 }
 
 // Whether an edge into `block` comes from a block it dominates.
@@ -216,8 +422,9 @@ fn movable(function: &SsaFunction, instruction: usize, quiet: bool, clobbered: b
   let place = SsaMemory.placeOf(function, address, offset)
   let private = place.form == BaseForm.Slot && !escaped[u64.toUsize(place.base)]
   if clobbered && !private { return false }
-  if !SsaDeadCode.inFrame(function, address) && !quiet { return false }
   let size = usize.toU64(found.kind.storeSize())
+  // A load that could trap runs before the loop only when it ran first in the loop anyway.
+  if !SsaDeadCode.inFrame(function, address) && !quiet && !SsaMemory.withinReach(function, place, size) { return false }
   let mut at = usize.ZERO
   while at < writes.length {
     if SsaMemory.mayAlias(writes[at], sizes[at], place, size, escaped, function.addressBits) { return false }

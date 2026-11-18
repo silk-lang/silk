@@ -97,6 +97,13 @@ const program = Effect.gen(function* () {
     assert.equal(ran.stdout.toString(), 'gather:ab\nwasi services passed\n')
     assert.equal(ran.stderr.toString(), 'wasi stderr\n')
   }
+  // Inlining a finalizer must keep the provider that discharges its NonParking obligation.
+  yield* fs.copyFile(join(repo, 'corpus/native/erased-dispatch-nonparking-provider/main.silk'), join(directory, 'main.silk'))
+  const finalizer = join(directory, 'inlined-finalizer.wasm')
+  const finalized = yield* build('wasm32-wasip1', finalizer, ['--backend', 'direct', '--optimization', 'speed'])
+  assert.equal(finalized.status, 0, finalized.stderr.toString())
+  const cleanup = yield* invoke(wasmtime, ['run', finalizer])
+  assert.equal(cleanup.status, 42, cleanup.stderr.toString())
   // `--emit wasm-text` prints the module each backend links, debug names and all, as text that
   // wasm-tools reads back to the same module once custom sections are stripped from both.
   yield* fs.writeFileString(join(directory, 'main.silk'), source)

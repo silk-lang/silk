@@ -90,6 +90,25 @@ const program = Effect.gen(function* () {
   yield* fs.chmod(sentinel, 0o755)
   // The standard library supplies the catalog runtime that roots the build.
   const standardLibrary = join(repository, 'stdlib')
+  // An unused erased contract can trigger discovery, but cannot change an ordinary union's
+  // object. Supplying the pre-feature compiler also checks the same source against main.
+  const ordinaryUnion = join(directory, 'ordinary-union')
+  yield* fs.makeDirectory(ordinaryUnion)
+  const unionSource = yield* fs.readFileString(join(repository, 'corpus/native/union-interface-dispatch/main.silk'))
+  yield* fs.writeFileString(join(ordinaryUnion, 'main.silk'), unionSource)
+  const unionObject = Effect.fnUntraced(function* (producer: string, output: string) {
+    const built = yield* invoke(producer, ['build', 'main.silk', '--stdlib', standardLibrary, '--clang', clang,
+      '--emit', 'object', '--debug', 'false', '-o', output], ordinaryUnion, process.env, 120_000)
+    assert.equal(built.status, 0, built.stderr)
+    return yield* fs.readFile(join(ordinaryUnion, output))
+  })
+  const ordinaryBytes = yield* unionObject(silk, 'ordinary.o')
+  if (process.env.SILK_TEST_BASELINE) {
+    assert.deepEqual(ordinaryBytes, yield* unionObject(resolve(process.env.SILK_TEST_BASELINE), 'baseline.o'))
+  }
+  yield* fs.writeFileString(join(ordinaryUnion, 'main.silk'), unionSource +
+    '\ninterface Unused { fn read(self: &Self) -> i32 }\nfn unused(p: &any Unused) -> i32 { return p.read() }\n')
+  assert.deepEqual(yield* unionObject(silk, 'unused.o'), ordinaryBytes)
   // Exercise the public definition -> request -> compiler boundary for non-default settings.
   const compilationPath = (root: string, name: string) => join(root, 'build/definitions', name, 'artifact')
   const compileSettings = Effect.fnUntraced(function* (
@@ -292,6 +311,19 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   const graphCompiled = yield* invoke(graphCompiler, [], requestRoot, { ...requestEnv, SILK_TEST_COMPILER: silk, SILK_COMPILER: silk }, 120_000)
   assert.equal(graphCompiled.status, 0, graphCompiled.stderr)
   assert.ok(yield* fs.exists(join(requestRoot, 'custom-output/x86_64-unknown-linux-gnu/dev/request-fixture')))
+  // The compilation builds outside its step with the package cache, so the next one after an edit
+  // reuses the checks of what it did not change.
+  assert.ok(yield* fs.exists(join(requestRoot, 'custom-output/steps/compilations/x86_64-unknown-linux-gnu/dev/request-fixture')))
+  const graphCache = join(requestRoot, 'custom-output/cache/request-fixture')
+  assert.ok((yield* fs.readDirectory(graphCache)).some((name) => name.startsWith('semantic-')), 'the graph compilation keeps a semantic cache')
+  const embedded = yield* fs.readFileString(join(requestRoot, 'main.silk'))
+  yield* fs.writeFileString(join(requestRoot, 'main.silk'), embedded.replace('{ return 8 }', '{ return 9 }'))
+  // The fixture checks that planning leaves no published program, so the first one goes first.
+  yield* fs.remove(join(requestRoot, 'custom-output/x86_64-unknown-linux-gnu/dev/request-fixture'))
+  const graphRecompiled = yield* invoke(graphCompiler, [], requestRoot, { ...requestEnv, SILK_TEST_COMPILER: silk, SILK_COMPILER: silk }, 120_000)
+  assert.equal(graphRecompiled.status, 0, graphRecompiled.stderr)
+  assert.match(graphRecompiled.stderr, /checks? reused/, 'an edited graph compilation reuses its cache')
+  yield* fs.writeFileString(join(requestRoot, 'main.silk'), embedded)
   yield* fs.writeFileString(join(directory, 'silk.toml'),
     '[package]\nname = "native-build"\nversion = "0.1.0"\nsource = "."\n')
   const runnerDirectory = join(directory, 'artifact-runners')
@@ -352,6 +384,11 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   }
   const explicitTask = yield* invoke(silk, ['task', '--stdlib', standardLibrary, 'build', '--code', '23'], aliased, requestEnv, 120_000)
   assert.equal(explicitTask.status, 23, explicitTask.stderr)
+  // A task's unknown option is followed by that task's usage and options.
+  const unknownTaskOption = yield* invoke(silk, ['task', '--stdlib', standardLibrary, 'build', '--release'], aliased, requestEnv, 120_000)
+  assert.equal(unknownTaskOption.status, 2, unknownTaskOption.stderr)
+  assert.match(unknownTaskOption.stderr, /^error: unknown option --release\n\nUsage: silk task build \[options\]\n/m)
+  assert.match(unknownTaskOption.stderr, /^ +--code <value> +Exit code/m)
   // The compiler's own options stay with the compiler; the task sees only its own.
   const compilerOptions = ['-q', '--timings', '--ignore-warnings', '--progress', 'plain', '--backend', 'llvm']
   const compilerOptioned = yield* invoke(silk, ['build', ...compilerOptions, '--stdlib', standardLibrary, '--code', '19'], aliased, requestEnv, 120_000)
@@ -359,6 +396,13 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   yield* fs.writeFileString(join(aliased, 'src/tasks.silk'), aliasSource(['Build']))
   const builtinRun = yield* invoke(silk, ['run', '--stdlib', standardLibrary], aliased, requestEnv, 120_000)
   assert.equal(builtinRun.status, 42, builtinRun.stderr)
+  // Without its root module, the built-in names the missing file and points to the tasks.
+  yield* fs.rename(join(aliased, 'src/main.silk'), join(aliased, 'main.silk.away'))
+  const rootless = yield* invoke(silk, ['run', '--stdlib', standardLibrary], aliased, requestEnv, 120_000)
+  yield* fs.rename(join(aliased, 'main.silk.away'), join(aliased, 'src/main.silk'))
+  assert.equal(rootless.status, 1, rootless.stderr)
+  assert.match(rootless.stderr, /^silk: package `aliased` has no root module: src\/main\.silk does not exist$/m)
+  assert.match(rootless.stderr, /`silk task` lists its tasks/)
   const builtinPlan = yield* invoke(silk, ['task', '--stdlib', standardLibrary, 'plan'], aliased, requestEnv, 120_000)
   assert.equal(builtinPlan.status, 0, builtinPlan.stderr)
   const aliasRequests = yield* fs.readDirectory(join(aliased, 'build/requests'))
@@ -621,6 +665,14 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   assert.match(mir.stdout, /\n {2}let _0: i32 {2}\/\/ return\n/)
   assert.match(mir.stdout, /\nbb0:\n(?: {2}.*\n)* {2}_\d+ = 5_i32 \* 8_i32\n/)
   assert.match(mir.stdout, /\n {2}return\n\n$/)
+  const single = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-erased-mir-' })
+  yield* fs.copyFile(join(repository, 'corpus/native/erased-dispatch-single/main.silk'), join(single, 'main.silk'))
+  const dispatched = yield* invoke(silk, ['dump', 'mir', 'main.silk', '--stdlib', standardLibrary], single, dumpEnv)
+  assert.equal(dispatched.status, 0, dispatched.stderr)
+  const dispatcher = dispatched.stdout.split(/^fn /m).find((body) => body.startsWith('main.Read.read<any '))
+  assert.ok(dispatcher, dispatched.stdout)
+  assert.match(dispatcher, /call main\.Read for Letter\.read\(move _1\.1\)/)
+  assert.doesNotMatch(dispatcher, /switch|discriminant/)
   const everything = yield* invoke(silk, ['dump', 'mir', 'main.silk', '--all', '--stdlib', standardLibrary, '--target', 'wasm32-wasip1'], directory, dumpEnv)
   assert.equal(everything.status, 0, everything.stderr)
   assert.match(everything.stdout, /^fn silk\/platform\/wasi\//m)
@@ -1511,6 +1563,9 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   // `init -t minimal` writes, offline, a project whose generated entry `run` builds and runs.
   const initialized = yield* invoke(silk, ['init', 'greeting', '-t', 'minimal'], directory)
   assert.equal(initialized.status, 0, initialized.stderr)
+  // It names the project relative to the working directory, then what to run next: `cd` into the
+  // project, then `silk run` with what it does. Output that is not a terminal has no escape codes.
+  assert.equal(initialized.stdout, '  Created greeting from the minimal template\n\n  Next steps:\n    cd greeting\n    silk run   build and run it\n')
   const greeted = yield* invoke(
     silk,
     ['run', '--stdlib', standardLibrary],
@@ -2635,6 +2690,51 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   )
   assert.equal(forcedTests.status, 0, forcedTests.stderr)
   assert.match(forcedTests.stdout, /1 passed, 0 failed \(0 cached, 1 executed, 1 selected, 4 discovered\)/)
+  // An edit in a separate test admits a second member. A test that calls the dispatcher
+  // must run again even though it still passes the same concrete value.
+  const dispatchTests = join(directory, 'dispatch-tests')
+  yield* fs.makeDirectory(join(dispatchTests, 'src'), { recursive: true })
+  yield* fs.writeFileString(join(dispatchTests, 'silk.toml'), '[package]\nname = "dispatch-tests"\nversion = "0.1.0"\nmain = "main.silk"\nkind = "library"\n')
+  yield* fs.writeFileString(join(dispatchTests, 'src/main.silk'), `import members
+test fn readsFirst() -> () { drop members.first() }
+test fn independent() -> () {}
+test fn changesMemberSet() -> () { drop members.second() }
+`)
+  const dispatchMembersSource = `interface Read { fn read(self: &Self) -> i32 }
+struct First {}
+struct Second {}
+impl Read for First { fn read(self: &Self) -> i32 { return 1 } }
+impl Read for Second { fn read(self: &Self) -> i32 { return 2 } }
+@inlineNever
+fn read(value: &any Read) -> i32 { return value.read() }
+pub fn first() -> i32 { let member = First {} return read(&member) }
+`
+  for (const second of ['return 2', 'let member = Second {} return read(&member)']) {
+    yield* fs.writeFileString(join(dispatchTests, 'src/members.silk'), dispatchMembersSource + `pub fn second() -> i32 { ${second} }\n`)
+    const tests = yield* invoke(silk, ['test', '--stdlib', standardLibrary], dispatchTests, { ...process.env, SILK_CLANG: clang })
+    assert.equal(tests.status, 0, tests.stderr)
+    assert.match(tests.stdout, /main::readsFirst\n {4}PASS/)
+    if (second === 'return 2') assert.match(tests.stdout, /0 cached, 3 executed/)
+    else {
+      assert.match(tests.stdout, /main::independent\n {4}CACHED/)
+      assert.match(tests.stdout, /1 cached, 2 executed/)
+    }
+  }
+  // Replay the same edits through a long-lived checker and a new store at each step. Both a
+  // missing witness and an operation with a by-value receiver disappear again after repair.
+  const dispatchEdits = [
+    ['body', 'let member = Second {}', 'let member: i32 = 2'],
+    ['body', 'let member: i32 = 2', 'let member = Second {}'],
+    ['header-new-type', 'interface Read { fn read(self: &Self)', 'interface Read { fn read(self: Self)'],
+    ['header-new-type', 'interface Read { fn read(self: Self)', 'interface Read { fn read(self: &Self)'],
+  ].map(([kind, before, after]) =>
+    `[[edit]]\nkind = "${kind}"\nmodule = "members.silk"\nfind = "${before}"\nreplace = "${after}"\n`)
+  yield* fs.writeFileString(join(dispatchTests, 'edits.toml'), dispatchEdits.join('\n'))
+  const checkedMembership = yield* invoke(silk, ['check', '--stdlib', standardLibrary, '--replay', 'edits.toml', '--differential'], dispatchTests)
+  assert.equal(checkedMembership.status, 0, checkedMembership.stderr)
+  const verdicts = [...(checkedMembership.stdout + checkedMembership.stderr).matchAll(/silk-replay-differential step=\d+ rejections=(\d+) differences=(\d+)/g)]
+  assert.deepEqual(verdicts.map(([, rejected, differences]) => [Number(rejected), Number(differences)]),
+    [[0, 0], [1, 0], [0, 0], [1, 0], [0, 0]])
   // A selection that matches no test verified nothing, so it fails, and running it again fails the
   // same way.
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -4233,6 +4333,86 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     assert.equal(foreign.stdout, '')
   }
   {
+    // A silk.local.toml beside the workspace root swaps every dependency on a package, git ones
+    // included, for a local checkout (PACKAGE-009), without fetching it, and the build names it.
+    const repository = join(directory, 'override/repository')
+    yield* fs.makeDirectory(join(repository, 'units'), { recursive: true })
+    yield* fs.writeFileString(
+      join(repository, 'units/silk.toml'),
+      '[package]\nname = "units"\nversion = "0.1.0"\nsource = "."\nexports = ["unit"]\n',
+    )
+    yield* fs.writeFileString(join(repository, 'units/unit.silk'), 'pub fn unit() -> i32 {\n  return 1\n}\n')
+    const git = (args: ReadonlyArray<string>) => {
+      const ran = spawnSync('git', ['-C', repository, ...args], { encoding: 'utf8' })
+      assert.equal(ran.status, 0, ran.stderr)
+      return ran.stdout.trim()
+    }
+    git(['init', '--quiet'])
+    git(['add', '.'])
+    git(['-c', 'user.name=Silk', '-c', 'user.email=silk@example.com', '-c', 'commit.gpgsign=false', 'commit', '--quiet', '-m', 'units'])
+    const commit = git(['rev-parse', 'HEAD'])
+    const pin = `units = { git = "${pathToFileURL(repository).href}", rev = "${commit}", path = "units" }\n`
+    const local = join(directory, 'override/units-local')
+    yield* fs.makeDirectory(local, { recursive: true })
+    yield* fs.writeFileString(
+      join(local, 'silk.toml'),
+      '[package]\nname = "units"\nversion = "0.2.0"\nsource = "."\nexports = ["unit"]\n',
+    )
+    yield* fs.writeFileString(join(local, 'unit.silk'), 'pub fn unit() -> i32 {\n  return 5\n}\n')
+    const workspace = join(directory, 'override/workspace')
+    yield* fs.makeDirectory(join(workspace, 'app'), { recursive: true })
+    yield* fs.makeDirectory(join(workspace, 'math'), { recursive: true })
+    yield* fs.writeFileString(join(workspace, 'silk.toml'), '[workspace]\nmembers = ["app", "math"]\n')
+    // Both members pin the git package, so the override settles the diamond on one copy.
+    yield* fs.writeFileString(
+      join(workspace, 'math/silk.toml'),
+      `[package]\nname = "override-math"\nversion = "0.1.0"\nsource = "."\nexports = ["twice"]\n\n[dependencies]\n${pin}`,
+    )
+    yield* fs.writeFileString(
+      join(workspace, 'math/twice.silk'),
+      'import units.unit { unit }\n\npub fn twice() -> i32 {\n  return unit() * 2\n}\n',
+    )
+    yield* fs.writeFileString(
+      join(workspace, 'app/silk.toml'),
+      `[package]\nname = "override-app"\nversion = "0.1.0"\nsource = "."\n\n[dependencies]\nmath = { path = "../math", package = "override-math" }\n${pin}`,
+    )
+    yield* fs.writeFileString(
+      join(workspace, 'app/main.silk'),
+      'import math.twice { twice }\nimport units.unit { unit }\n\npub fn main() -> i32 {\n  return unit() + twice()\n}\n',
+    )
+    const home = join(directory, 'override/home')
+    const environment = { ...process.env, SILK_CLANG: clang, SILK_HOME: home }
+    const overrides = join(workspace, 'silk.local.toml')
+    const using = '[overrides]\nunits = { path = "../units-local" }\n'
+    yield* fs.writeFileString(overrides, using)
+    const overridden = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(workspace, 'app'), environment)
+    assert.equal(overridden.status, 15, overridden.stderr)
+    assert.match(overridden.stderr, /^silk: note: .*silk\.local\.toml overrides units with \.\.\/units-local$/m)
+    assert.equal(yield* fs.exists(join(home, `git/${commit}.fetched`)), false, 'an overridden package was fetched')
+    // Removing the file, and writing it again, each change what the next build reads.
+    yield* fs.remove(overrides)
+    const pinned = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(workspace, 'app'), environment)
+    assert.equal(pinned.status, 3, pinned.stderr)
+    assert.equal(pinned.stderr.includes('silk.local.toml'), false, pinned.stderr)
+    yield* fs.writeFileString(overrides, using)
+    const again = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(workspace, 'app'), environment)
+    assert.equal(again.status, 15, again.stderr)
+    // The checkout must be the package it overrides.
+    yield* fs.writeFileString(overrides, '[overrides]\nunits = { path = "math" }\n')
+    const mismatched = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(workspace, 'app'), environment)
+    assert.equal(mismatched.status, 2, 'an override naming another package was accepted')
+    assert.match(mismatched.stderr, /silk\.local\.toml:2: .*names the package `override-math`/)
+    // The file holds only [overrides], and each entry only a path to a package.
+    yield* fs.writeFileString(overrides, '[dependencies]\nunits = { path = "../units-local" }\n')
+    const unknown = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(workspace, 'app'), environment)
+    assert.equal(unknown.status, 2, 'a silk.local.toml table other than [overrides] was accepted')
+    assert.match(unknown.stderr, /silk\.local\.toml:1: /)
+    yield* fs.writeFileString(overrides, '[overrides]\nunits = { path = "../missing" }\n')
+    const missing = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(workspace, 'app'), environment)
+    assert.equal(missing.status, 2, 'an override of a directory without silk.toml was accepted')
+    assert.match(missing.stderr, /silk\.local\.toml:2: .*has no silk\.toml/)
+  }
+  {
     // `[pack.binary]` ships binaries without `--bin`: a tar file with the executable in `bin/`
     // and the included files, or for a target that says so a ZIP file with it at the top.
     const tool = join(directory, 'binary/tool')
@@ -4342,8 +4522,22 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
       join(examples, 'ui/silk.toml'),
       '[package]\nname = "ui"\nversion = "0.1.0"\nsilk-version = "0.0.1"\ndescription = "A window"\n\n' +
         "[[post-init]]\nrun = ['sh', '-c', 'echo \"plain $# $SILK_VERSION $PATH\"']\n\n" +
-        '[[post-init]]\nrun = ["scripts/post-init.sh", "ready"]\narguments = true\n',
+        '[[post-init]]\nrun = ["scripts/post-init.sh", "ready"]\narguments = true\n\n' +
+        '[[template.next-steps]]\nrun = "silk task dev"\ndescription = "start the dev server"\n\n' +
+        '[[template.next-steps]]\nrun = "silk task build --release"\n',
     )
+    // A library template without [template] suggests `silk test`; `next-steps = []` suggests nothing.
+    yield* fs.makeDirectory(join(examples, 'library/src'), { recursive: true })
+    yield* fs.writeFileString(
+      join(examples, 'library/silk.toml'),
+      '[package]\nname = "library"\nversion = "0.1.0"\nkind = "library"\nexports = ["lib"]\n',
+    )
+    yield* fs.writeFileString(join(examples, 'library/src/lib.silk'), 'pub fn seven() -> i32 {\n  return 7\n}\n')
+    yield* fs.makeDirectory(join(examples, 'quiet/src'), { recursive: true })
+    yield* fs.writeFileString(join(examples, 'quiet/silk.toml'), '[package]\nname = "quiet"\n\n[template]\nnext-steps = []\n')
+    yield* fs.writeFileString(join(examples, 'quiet/src/main.silk'), 'pub fn main() -> i32 {\n  return 0\n}\n')
+    yield* fs.makeDirectory(join(examples, 'garbled'), { recursive: true })
+    yield* fs.writeFileString(join(examples, 'garbled/silk.toml'), '[package]\nname = "garbled"\n\n[template]\nnext-steps = [{ run = "silk run" }, "silk test"]\n')
     yield* fs.writeFileString(join(examples, 'ui/src/main.silk'), 'pub fn main() -> i32 {\n  return 7\n}\n')
     yield* fs.writeFileString(
       join(examples, 'ui/scripts/post-init.sh'),
@@ -4382,16 +4576,35 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     // Every entry sees the compiler's release in SILK_VERSION and gets only its own arguments; one
     // that sets `arguments = true` also gets the ones after `--`. A sandboxed entry sees a fixed PATH.
     assert.match(official.stdout, landlockNet ? /^plain 0 \d+\.\d+\.\d+\S* \/usr\/local\/bin:\/usr\/bin:\/bin\n/ : /^plain 0 \d+\.\d+\.\d+\S* /)
-    assert.match(official.stdout, /\npost-init ready --dark two words\nInitialized Silk project app at \S+app from template silk-lang\/examples\/ui \(([0-9a-f]{40})\)\n$/)
-    assert.equal(official.stdout.includes(commit), true, official.stdout)
+    // The official example is named by its directory, with its commit shortened; a step's
+    // description is lined up beside its command, and a step without one is printed alone.
+    assert.match(official.stdout, /\npost-init ready --dark two words\n  Created app from the ui template \([0-9a-f]{7}\)\n\n  Next steps:\n    cd app\n    silk task dev   start the dev server\n    silk task build --release\n$/)
+    assert.equal(official.stdout.includes(`(${commit.slice(0, 7)})`), true, official.stdout)
     const manifest = yield* fs.readFileString(join(work, 'app/silk.toml'))
     assert.match(manifest, /^\[package\]\nname = "app"\nversion = "0\.1\.0"\nsilk-version = "[^"]+"\n$/)
     assert.equal(manifest.includes('0.0.1'), false, manifest)
-    assert.equal(yield* fs.readFileString(join(work, 'app/.gitignore')), '/build/\n')
+    assert.equal(yield* fs.readFileString(join(work, 'app/.gitignore')), '/build/\n/silk.local.toml\n')
     assert.equal(yield* fs.exists(join(work, 'app/scripts/post-init.sh')), false)
     assert.deepEqual(readdirSync(join(silkHome, 'git')), [], 'a template scratch directory was left behind')
     const ran = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(work, 'app'), { ...process.env, SILK_CLANG: clang })
     assert.equal(ran.status, 7, ran.stderr)
+    // `cd` names the project relative to the working directory, quoted when the shell needs it, and
+    // is left out for a project created in the working directory.
+    const library = yield* templated(['odd place/lib', '-t', 'library', '--name', 'lib'])
+    assert.equal(library.status, 0, library.stderr)
+    assert.match(library.stdout, /^  Created odd place\/lib from the library template \([0-9a-f]{7}\)\n\n  Next steps:\n    cd 'odd place\/lib'\n    silk test   run its tests\n$/)
+    yield* fs.makeDirectory(join(work, 'here'), { recursive: true })
+    const here = yield* templated(['.', '-t', 'library'], join(work, 'here'))
+    assert.equal(here.status, 0, here.stderr)
+    assert.match(here.stdout, /^  Created here from the library template \([0-9a-f]{7}\)\n\n  Next steps:\n    silk test   run its tests\n$/)
+    const quiet = yield* templated(['quiet', '-t', 'quiet'])
+    assert.equal(quiet.status, 0, quiet.stderr)
+    assert.match(quiet.stdout, /^  Created quiet from the quiet template \([0-9a-f]{7}\)\n$/)
+    assert.equal(yield* fs.readFileString(join(work, 'quiet/silk.toml')), `[package]\nname = "quiet"\nsilk-version = "${(yield* fs.readFileString(join(work, 'app/silk.toml'))).match(/silk-version = "([^"]+)"/)![1]}"\n`)
+    const garbled = yield* templated(['garbled', '-t', 'garbled'])
+    assert.equal(garbled.status, 1, garbled.stderr)
+    assert.match(garbled.stderr, /^The template's silk\.toml is invalid: \[template\]\.next-steps\[1\]: /)
+    assert.equal(yield* fs.exists(join(work, 'garbled')), false)
     // The full spelling with a tag, and a name; the template's own manifest never names the project.
     const tagged = yield* templated(['named', '-t', 'silk-lang/examples/ui@v1', '--name', 'other'])
     assert.equal(tagged.status, 0, tagged.stderr)
@@ -4437,7 +4650,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     // `--list` names each directory with a silk.toml by what `--template` takes, with its description.
     const listed = yield* templated(['-l'])
     assert.equal(listed.status, 0, listed.stderr)
-    assert.match(listed.stdout, /^Templates in silk-lang\/examples \([0-9a-f]{40}\):\n  broken\n  escape\n  ui      A window\nCreate a project from one with `silk init <path> --template <name>`\n$/)
+    assert.match(listed.stdout, /^Templates in silk-lang\/examples \([0-9a-f]{40}\):\n  broken\n  escape\n  garbled\n  library\n  quiet\n  ui       A window\nCreate a project from one with `silk init <path> --template <name>`\n$/)
     const listedFull = yield* templated(['--list', 'silk-lang/examples/ui@v1'])
     assert.equal(listedFull.status, 0, listedFull.stderr)
     assert.match(listedFull.stdout, /\n  ui@v1  A window\n/)
@@ -4540,7 +4753,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     yield* fs.readFileString(join(managed, 'silk.toml')),
     '[workspace]\nmembers = ["app"]\nsilk-version = "0.0.0"\n',
   )
-  assert.match(managedRoot.stdout, /^Initialized Silk project app at .*\/managed\/app$/m)
+  assert.equal(managedRoot.stdout, '  Created workspace managed with package app\n\n  Next steps:\n    cd managed\n    silk run   build and run it\n')
   assert.equal(yield* fs.exists(join(managed, 'app/src/main.silk')), true)
   assert.equal(yield* fs.exists(join(managed, 'app/.gitignore')), false)
   const starterRun = yield* invoke(silk, ['run', '--stdlib', standardLibrary], managed, withClang)
@@ -4559,9 +4772,10 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   yield* fs.writeFileString(join(managed, 'silk.toml'), '[workspace]\nmembers = []\n')
   const hello = yield* invoke(silk, ['init', 'apps/hello', '-t', 'minimal'], managed)
   assert.equal(hello.status, 0, hello.stderr)
-  assert.match(hello.stdout, /Added apps\/hello to the workspace members in /)
+  assert.match(hello.stdout, /^  Created apps\/hello from the minimal template\n  Added apps\/hello to the managed workspace\n\n/)
   const greeting = yield* invoke(silk, ['init', '--lib', 'libs/greeting'], managed)
   assert.equal(greeting.status, 0, greeting.stderr)
+  assert.equal(greeting.stdout, '  Created library libs/greeting\n  Added libs/greeting to the managed workspace\n\n  Next steps:\n    cd libs/greeting\n    silk test   run its tests\n')
   assert.equal(
     yield* fs.readFileString(join(managed, 'silk.toml')),
     '[workspace]\nmembers = ["apps/hello", "libs/greeting"]\n',

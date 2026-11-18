@@ -19,10 +19,18 @@
 //! - Commutative integer operations and integer comparisons put their operands in value order
 //!   first, a comparison swapping its predicate, so `a < b` and `b > a` are one value.
 //! - A block whose only predecessor ends in a branch knows the branch's condition: true along the
-//!   first edge, false along the second, everywhere the block dominates. A switch case's block
+//!   first edge, false along the second, everywhere the block dominates; a condition that is
+//!   another flag negated makes that flag known too. A switch case's block
 //!   knows the switch value equals the case. The known value replaces each use there, and when
 //!   the condition is an integer comparison, another comparison of the same operands that it
-//!   implies or refutes folds too (`i < n` decides a later `i >= n`). So a check dominated by an
+//!   implies or refutes folds too (`i < n` decides a later `i >= n`), and so does the test that
+//!   an unsigned `i + 1` wrapped, which `i < n` refutes. An unsigned comparison also folds when
+//!   the ranges of its operands decide it: a range comes from the operation (a mask, a narrower
+//!   source, a shift, a remainder, a constant added or subtracted without wrapping) and from the
+//!   known comparisons of the value with constants, so `i < 256` decides a later `i < 258`, and
+//!   the range check of a conversion of `x & 255` to a byte never fails. A signed comparison
+//!   folds the same way from signed ranges, so below `v < 0` the overflow checks of `-(v + 1)`
+//!   are decided. So a check dominated by an
 //!   identical check that passed is decided, and its trap path becomes unreachable once the
 //!   control flow pass folds the branch.
 //!
@@ -33,11 +41,13 @@ import backend.SsaFolding
 import backend.SsaFolding {isIntegerPredicate}
 import backend.SsaFunction {
   Binary,
+  Cast,
   Edge,
   Exit,
   Operation,
   Predicate,
   SsaFunction,
+  masked,
   none,
 }
 import backend.SsaGraph {SsaGraph}
@@ -45,6 +55,7 @@ import silk.collections.list {List}
 import silk.core.option {Option}
 import silk.core.ownership {Copy}
 import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.i64
 import silk.num.u64
 import silk.num.usize
 
@@ -124,6 +135,7 @@ pub effect fn number(function: &mut SsaFunction) -> bool ! OutOfMemoryError ? &m
     run List<usize>.append(&mut walk, usize.MAX - mark)
     run learnFromPredecessor(&mut state, &mut function.*, &graph, block)
     run visitBlock(&mut state, &mut function.*, block)
+    run hoistShared(&mut state, &mut function.*, &graph, block)
     let children = graph.childrenOf(block)
     let mut child = children.length
     while child > usize.ZERO {
@@ -133,6 +145,99 @@ pub effect fn number(function: &mut SsaFunction) -> bool ! OutOfMemoryError ? &m
   }
   function.sweep()
   return state.changed
+}
+
+// Moves to the end of `block`, which the walk has just numbered, the instructions of the two
+// blocks its branch leads to, when `block` is the only way into either, they hold the same pure
+// instructions in the same order, and both jump on to one block with the same values: one of
+// each pair moves and is numbered here, and the other becomes it. Whichever way the branch went
+// ran them first, so each runs as often as before, and a trap one raises is raised before
+// anything that follows. The arms are left empty and alike, so the branch between them goes. A
+// conversion written as a branch on the sign, each side of which turns out to keep the same
+// bits, becomes that one computation. Arms that share less keep their instructions, since each
+// moved one would need a local to cross the branch.
+effect fn hoistShared(state: &mut Numbering, function: &mut SsaFunction, graph: &SsaGraph, block: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  if function.block(block).exit != Exit.Branch { return () }
+  let first = List<Edge>.asSlice(&function.block(block).edges)[usize.ZERO].block
+  let second = List<Edge>.asSlice(&function.block(block).edges)[usize.ONE].block
+  if first == second || first == block || second == block { return () }
+  if graph.predecessorsOf(first).length != usize.ONE || graph.predecessorsOf(second).length != usize.ONE { return () }
+  if List<u64>.length(&function.block(first).parameters) != usize.ZERO || List<u64>.length(&function.block(second).parameters) != usize.ZERO { return () }
+  let ours = List<usize>.length(&function.block(first).instructions)
+  let theirs = List<usize>.length(&function.block(second).instructions)
+  let shared = ours
+  if shared == usize.ZERO || theirs != shared { return () }
+  // Each pair's results, the second arm's then the first's: a later pair may read them.
+  let mut pairs = List<u64>.make()
+  let mut at = usize.ZERO
+  while at < shared {
+    let moved = List<usize>.get(&function.block(first).instructions, at)
+    let other = List<usize>.get(&function.block(second).instructions, at)
+    let found = function.instruction(moved)
+    let twin = function.instruction(other)
+    if found.removed || twin.removed || found.result == none() || !found.operation.isPure() || found.operation.hasSideEffects() { return () }
+    if !found.kind.equals(twin.kind) || !sameOperation(found.operation, twin.operation) { return () }
+    let operands = function.operandsOf(moved).length
+    if function.operandsOf(other).length != operands { return () }
+    let mut operand = usize.ZERO
+    while operand < operands {
+      let mut theirOperand = resolve(&state.*, function.operandsOf(other)[operand])
+      let known = List<u64>.asSlice(&pairs)
+      let mut pair = usize.ZERO
+      while pair < known.length {
+        if known[pair] == theirOperand { theirOperand = known[pair + usize.ONE] }
+        pair = pair + 2
+      }
+      if resolve(&state.*, function.operandsOf(moved)[operand]) != theirOperand { return () }
+      operand = operand + usize.ONE
+    }
+    let results = found.operation.resultCount(found.kind)
+    let mut result = usize.ZERO
+    while result < results {
+      run List<u64>.append(&mut pairs, twin.result + usize.toU64(result))
+      run List<u64>.append(&mut pairs, found.result + usize.toU64(result))
+      result = result + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  // Both arms jump on to one block with the same values.
+  if function.block(first).exit != Exit.Jump || function.block(second).exit != Exit.Jump { return () }
+  let onward = &List<Edge>.asSlice(&function.block(first).edges)[usize.ZERO]
+  let twinOnward = &List<Edge>.asSlice(&function.block(second).edges)[usize.ZERO]
+  if onward.block != twinOnward.block || List<u64>.length(&onward.arguments) != List<u64>.length(&twinOnward.arguments) { return () }
+  let mut argument = usize.ZERO
+  while argument < List<u64>.length(&onward.arguments) {
+    let mut theirArgument = resolve(&state.*, List<u64>.get(&twinOnward.arguments, argument))
+    let known = List<u64>.asSlice(&pairs)
+    let mut pair = usize.ZERO
+    while pair < known.length {
+      if known[pair] == theirArgument { theirArgument = known[pair + usize.ONE] }
+      pair = pair + 2
+    }
+    if resolve(&state.*, List<u64>.get(&onward.arguments, argument)) != theirArgument { return () }
+    argument = argument + usize.ONE
+  }
+  // The first arm's instructions leave it one by one; the second's stay listed until the sweep.
+  at = usize.ZERO
+  while at < shared {
+    let moved = List<usize>.get(&function.block(first).instructions, usize.ZERO)
+    let other = List<usize>.get(&function.block(second).instructions, at)
+    let found = function.instruction(moved)
+    let twin = function.instruction(other)
+    let end = List<usize>.length(&function.block(block).instructions)
+    run function.moveInstruction(moved, block, end)
+    run visitInstruction(&mut state.*, &mut function.*, moved)
+    let standing = resolve(&state.*, found.result)
+    run replace(&mut state.*, twin.result, standing)
+    if found.operation.resultCount(found.kind) == 2 {
+      let next = resolve(&state.*, found.result + 1)
+      run replace(&mut state.*, twin.result + 1, next)
+    }
+    function.remove(other)
+    at = at + usize.ONE
+  }
+  state.changed = true
+  return ()
 }
 
 // Undoes what the walk learned since mark `mark`: the entries, the known values and the facts.
@@ -171,10 +276,29 @@ effect fn learnFromPredecessor(state: &mut Numbering, function: &mut SsaFunction
   let condition = resolve(&state.*, from.value)
   if from.exit == Exit.Branch {
     if function.isConstant(condition) { return () }
-    let truth = taken == usize.ZERO
+    let mut truth = taken == usize.ZERO
     let flag = run flagOf(&mut state.*, &mut function.*, truth)
     run learn(&mut state.*, condition, flag)
-    let producer = function.producerOf(condition)
+    let mut producer = function.producerOf(condition)
+    // A flag exclusive-ored with one is the negation of the other operand, which is then known
+    // too, with the opposite truth.
+    let mut steps = usize.ZERO
+    while producer != usize.MAX && steps < 4 {
+      let mut inner = none()
+      if let Operation.Binary {operation: Binary.Xor} = function.instruction(producer).operation {
+        let operands = function.operandsOf(producer)
+        if function.kindOf(operands[usize.ZERO]).bits == usize.ONE && !function.kindOf(operands[usize.ZERO]).isVector() {
+          if function.isBits(operands[usize.ONE]) && function.constantOf(operands[usize.ONE]).low == 1 { inner = operands[usize.ZERO] }
+          if function.isBits(operands[usize.ZERO]) && function.constantOf(operands[usize.ZERO]).low == 1 { inner = operands[usize.ONE] }
+        }
+      }
+      if inner == none() || function.isConstant(inner) { break }
+      truth = !truth
+      let known = run flagOf(&mut state.*, &mut function.*, truth)
+      run learn(&mut state.*, inner, known)
+      producer = function.producerOf(inner)
+      steps = steps + usize.ONE
+    }
     if producer != usize.MAX {
       if let Operation.Compare {predicate} = function.instruction(producer).operation {
         let operands = function.operandsOf(producer)
@@ -247,10 +371,15 @@ effect fn replace(state: &mut Numbering, value: u64, by: u64) -> () ! OutOfMemor
 }
 
 effect fn visitBlock(state: &mut Numbering, function: &mut SsaFunction, block: usize) -> () ! OutOfMemoryError ? &mut Allocator {
-  let count = List<usize>.length(&function.block(block).instructions)
+  let mut count = List<usize>.length(&function.block(block).instructions)
   let mut at = usize.ZERO
   while at < count {
     let instruction = List<usize>.get(&function.block(block).instructions, at)
+    // Instructions a truncation is rewritten into go before it and are numbered next time.
+    let mut added = run narrowThrough(&mut state.*, &mut function.*, block, at, instruction)
+    added = added + run uncheck(&mut state.*, &mut function.*, block, at + added, instruction)
+    at = at + added
+    count = count + added
     run visitInstruction(&mut state.*, &mut function.*, instruction)
     at = at + usize.ONE
   }
@@ -282,6 +411,145 @@ effect fn visitBlock(state: &mut Numbering, function: &mut SsaFunction, block: u
   return ()
 }
 
+// Truncates before a difference from a constant instead of after it: `trunc(c - y)` is
+// `trunc(c) - trunc(y)`, since its low bits depend only on the operands' low bits, and the narrow
+// difference is where the folds of that width apply, such as `-1 - x`. A mask that keeps every
+// bit the truncation does just goes. Answers how many instructions it put before `instruction`, at `position` of `block`,
+// which it then removed.
+effect fn narrowThrough(state: &mut Numbering, function: &mut SsaFunction, block: usize, position: usize, instruction: usize) -> usize
+! OutOfMemoryError ? &mut Allocator {
+  let found = function.instruction(instruction)
+  let truncating = match found.operation {
+    Operation.Cast {operation} => operation == Cast.Trunc
+    _ => false
+  }
+  let kind = found.kind
+  if !truncating || !kind.isInteger() || kind.isVector() || found.removed { return usize.ZERO }
+  let source = resolve(&state.*, function.operandsOf(instruction)[usize.ZERO])
+  let wide = function.kindOf(source)
+  let producer = function.producerOf(source)
+  if producer == usize.MAX || !wide.isInteger() || wide.isVector() || wide.bits > 64 || wide.bits <= kind.bits { return usize.ZERO }
+  let operation = match function.instruction(producer).operation {
+    Operation.Binary {operation: wrapped} => wrapped
+    _ => { return usize.ZERO }
+  }
+  if operation != Binary.Add && operation != Binary.Sub && operation != Binary.Mul && operation != Binary.And && operation != Binary.Or
+    && operation != Binary.Xor { return usize.ZERO }
+  let left = resolve(&state.*, function.operandsOf(producer)[usize.ZERO])
+  let right = resolve(&state.*, function.operandsOf(producer)[usize.ONE])
+  let leftConstant = function.isBits(left)
+  let rightConstant = function.isBits(right)
+  if leftConstant == rightConstant { return usize.ZERO }
+  let mut constant = right
+  let mut other = left
+  if leftConstant {
+    constant = left
+    other = right
+  }
+  let low = masked(function.constantOf(constant).low, kind.bits)
+  if operation == Binary.And && low == masked(u64.MAX, kind.bits) {
+    function.setOperand(instruction, usize.ZERO, other)
+    state.changed = true
+    return usize.ZERO
+  }
+  // Only a constant less a value moves: the narrow difference is where `-1 - x` folds. Moving
+  // a sum or a product would leave the wide one in place for its other uses and add to them.
+  if operation != Binary.Sub || !leftConstant { return usize.ZERO }
+  let narrow = run function.insertInstruction(block, position, Operation.Cast {operation: Cast.Trunc}, kind, &[other], found.place)
+  let folded = run function.constant(kind, low)
+  let mut first = narrow
+  let mut second = folded
+  if leftConstant {
+    first = folded
+    second = narrow
+  }
+  let result = run function.insertInstruction(block, position + usize.ONE, Operation.Binary {operation: operation}, kind, &[first, second],
+    found.place)
+  run replace(&mut state.*, found.result, result)
+  function.remove(instruction)
+  return 2
+}
+
+// Replaces an overflow-checked sum, difference or product whose operands' ranges show it cannot
+// overflow by the wrapping operation and a clear flag, so its trap path folds away: an exponent
+// of a few thousand times a constant needs no check. Answers how many instructions it put before
+// `instruction`, at `position` of `block`, which it then removed.
+effect fn uncheck(state: &mut Numbering, function: &mut SsaFunction, block: usize, position: usize, instruction: usize) -> usize
+! OutOfMemoryError ? &mut Allocator {
+  let found = function.instruction(instruction)
+  if found.removed { return usize.ZERO }
+  let kind = found.kind
+  if !kind.isInteger() || kind.isVector() || kind.bits > 64 || kind.bits < 2 { return usize.ZERO }
+  if let Operation.Overflow {operation, signed} = found.operation {
+    if operation != Binary.Add && operation != Binary.Sub && operation != Binary.Mul { return usize.ZERO }
+    let left = resolve(&state.*, function.operandsOf(instruction)[usize.ZERO])
+    let right = resolve(&state.*, function.operandsOf(instruction)[usize.ONE])
+    let mut fits = false
+    if signed {
+      let first = signedRangeOf(&state.*, &function.*, left, rangeDepth())
+      let second = signedRangeOf(&state.*, &function.*, right, rangeDepth())
+      let mut full = SignedRange {low: i64.MIN, high: i64.MAX}
+      if kind.bits < 64 {
+        let most = u64.wrappingToI64(u64.shiftLeft(1, usize.toU64(kind.bits - usize.ONE))) - 1
+        full = SignedRange {low: 0 - most - 1, high: most}
+      }
+      // A range that is the whole kind's says nothing; a narrower result does not overflow.
+      let mut result = full
+      let mut bounded = false
+      if operation == Binary.Add {
+        if let Option<i64>.Some {value: least} = i64.checkedAdd(first.low, second.low) {
+          if let Option<i64>.Some {value: most} = i64.checkedAdd(first.high, second.high) {
+            result = SignedRange {low: least, high: most}
+            bounded = true
+          }
+        }
+      }
+      if operation == Binary.Sub {
+        if let Option<i64>.Some {value: least} = i64.checkedSubtract(first.low, second.high) {
+          if let Option<i64>.Some {value: most} = i64.checkedSubtract(first.high, second.low) {
+            result = SignedRange {low: least, high: most}
+            bounded = true
+          }
+        }
+      }
+      if operation == Binary.Mul {
+        let corners = [i64.checkedMultiply(first.low, second.low), i64.checkedMultiply(first.low, second.high),
+          i64.checkedMultiply(first.high, second.low), i64.checkedMultiply(first.high, second.high)]
+        bounded = true
+        let mut least = i64.MAX
+        let mut most = i64.MIN
+        let mut at = usize.ZERO
+        while at < 4 {
+          if let Option<i64>.Some {value: corner} = corners[at] {
+            if corner < least { least = corner }
+            if corner > most { most = corner }
+          } else { bounded = false }
+          at = at + usize.ONE
+        }
+        result = SignedRange {low: least, high: most}
+      }
+      fits = bounded && first.low <= first.high && second.low <= second.high && result.low >= full.low && result.high <= full.high
+    } else {
+      let first = rangeOf(&state.*, &function.*, left, rangeDepth())
+      let second = rangeOf(&state.*, &function.*, right, rangeDepth())
+      let most = masked(u64.MAX, kind.bits)
+      if first.low <= first.high && second.low <= second.high {
+        if operation == Binary.Add { fits = first.high <= most - second.high }
+        if operation == Binary.Sub { fits = first.low >= second.high }
+        if operation == Binary.Mul { fits = first.high == 0 || second.high <= most / first.high }
+      }
+    }
+    if !fits { return usize.ZERO }
+    let plain = run function.insertInstruction(block, position, Operation.Binary {operation: operation}, kind, &[left, right], found.place)
+    let clear = run flagOf(&mut state.*, &mut function.*, false)
+    run replace(&mut state.*, found.result, plain)
+    run replace(&mut state.*, found.result + 1, clear)
+    function.remove(instruction)
+    return usize.ONE
+  }
+  return usize.ZERO
+}
+
 effect fn visitInstruction(state: &mut Numbering, function: &mut SsaFunction, instruction: usize) -> () ! OutOfMemoryError ? &mut Allocator {
   let operandCount = function.operandsOf(instruction).length
   let mut at = usize.ZERO
@@ -295,7 +563,7 @@ effect fn visitInstruction(state: &mut Numbering, function: &mut SsaFunction, in
     at = at + usize.ONE
   }
   let found = function.instruction(instruction)
-  if !found.operation.isPure() || found.result == none() { return () }
+  if !found.operation.isPure() || found.result == none() || found.removed { return () }
   let two = found.operation.resultCount(found.kind) == 2
   let folded = run SsaFolding.simplify(&mut function.*, instruction)
   if folded.value != none() && (!two || folded.second != none()) {
@@ -418,6 +686,22 @@ fn decidedByFacts(state: &Numbering, function: &SsaFunction, instruction: usize)
   let facts = List<Fact>.asSlice(&state.facts)
   let mut at = facts.length
   let mut seen = usize.ZERO
+  // `a + 1 < a`, the test that an unsigned increment wrapped, is false wherever `a` is known to
+  // be below some value, since `a` is then not the greatest one.
+  let mut bumped = none()
+  if asked == Predicate.Ult && incrementOf(function, left) == right { bumped = right }
+  if asked == Predicate.Ugt && incrementOf(function, right) == left { bumped = left }
+  while bumped != none() && at > usize.ZERO && seen < factWindow() {
+    at = at - usize.ONE
+    seen = seen + usize.ONE
+    let fact = facts[at]
+    let mut holding = fact.predicate
+    if !fact.truth { holding = inverse(fact.predicate) }
+    if resolve(&state.*, fact.left) == bumped && holding == Predicate.Ult { return usize.ZERO }
+    if resolve(&state.*, fact.right) == bumped && holding == Predicate.Ugt { return usize.ZERO }
+  }
+  at = facts.length
+  seen = usize.ZERO
   while at > usize.ZERO && seen < factWindow() {
     at = at - usize.ONE
     seen = seen + usize.ONE
@@ -435,7 +719,389 @@ fn decidedByFacts(state: &Numbering, function: &SsaFunction, instruction: usize)
       if implies(holding, inverse(asked)) { return usize.ZERO }
     }
   }
+  return decidedByRanges(state, function, asked, left, right)
+}
+
+// The unsigned values a value can have where the walk stands, from `low` to `high`.
+struct Range {
+  low: u64,
+  high: u64,
+}
+
+impl Copy for Range {}
+
+// How far `rangeOf` and `signedRangeOf` look through a value's operands: each cast or operation
+// with a constant operand takes one of this budget, and an operation on two other values takes
+// three, since it looks through both.
+fn rangeDepth() -> usize { return 9 }
+
+// What looking through instruction `producer` takes of the depth budget.
+fn rangeCost(function: &SsaFunction, producer: usize) -> usize {
+  let operands = function.operandsOf(producer)
+  if operands.length < 2 || function.isBits(operands[usize.ZERO]) || function.isBits(operands[usize.ONE]) { return usize.ONE }
+  return 3
+}
+
+// The unsigned range of `value`, an integer or address of at most 64 bits, where the walk
+// stands: what its operation bounds it to, such as a mask, a narrower source or a shift, then
+// what the known facts that compare it with a constant leave of that. `depth` is how many
+// operands deep it may still look.
+fn rangeOf(state: &Numbering, function: &SsaFunction, value: u64, depth: usize) -> Range {
+  let kind = function.kindOf(value)
+  let most = masked(u64.MAX, kind.bits)
+  let mut range = Range {low: 0, high: most}
+  if function.isBits(value) {
+    let bits = masked(function.constantOf(value).low, kind.bits)
+    return Range {low: bits, high: bits}
+  }
+  let producer = function.producerOf(value)
+  let mut cost = usize.MAX
+  if producer != usize.MAX { cost = rangeCost(function, producer) }
+  if producer != usize.MAX && depth >= cost {
+    let operands = function.operandsOf(producer)
+    // An overflow-checked operation's value is the wrapping one's.
+    let mut made = function.instruction(producer).operation
+    if let Operation.Overflow {operation: checked, ..} = made {
+      if function.value(value).index == usize.ZERO { made = Operation.Binary {operation: checked} }
+    }
+    match made {
+      Operation.Binary {operation} => {
+        let first = rangeOf(state, function, operands[usize.ZERO], depth - cost)
+        let second = rangeOf(state, function, operands[usize.ONE], depth - cost)
+        if operation == Binary.And {
+          range.high = first.high
+          if second.high < range.high { range.high = second.high }
+        }
+        // A product or a left shift that cannot pass the kind's greatest value.
+        if operation == Binary.Mul && (first.high == 0 || second.high <= most / first.high) {
+          range = Range {low: first.low * second.low, high: first.high * second.high}
+        }
+        if operation == Binary.Shl && second.low == second.high && second.low < 64 && first.high <= u64.shiftRight(most, second.low) {
+          range = Range {low: u64.shiftLeft(first.low, second.low), high: u64.shiftLeft(first.high, second.low)}
+        }
+        if operation == Binary.LShr && second.low == second.high && second.low < 64 {
+          range = Range {low: u64.shiftRight(first.low, second.low), high: u64.shiftRight(first.high, second.low)}
+        }
+        if operation == Binary.URem && second.low > 0 { range.high = second.high - 1 }
+        // A sum or difference with a constant that cannot wrap moves the range.
+        if operation == Binary.Add && second.low == second.high && first.high <= most - second.low {
+          range = Range {low: first.low + second.low, high: first.high + second.low}
+        }
+        if operation == Binary.Sub && second.low == second.high && first.low >= second.low {
+          range = Range {low: first.low - second.low, high: first.high - second.low}
+        }
+        // A constant less a value that cannot pass it.
+        if operation == Binary.Sub && first.low == first.high && second.high <= first.low && second.low != second.high {
+          range = Range {low: first.low - second.high, high: first.low - second.low}
+        }
+      }
+      Operation.Cast {operation} => {
+        let from = function.kindOf(operands[usize.ZERO])
+        if (from.isInteger() || from.isAddress()) && !from.isVector() && from.bits <= 64 {
+          let source = rangeOf(state, function, operands[usize.ZERO], depth - cost)
+          if operation == Cast.ZExt || operation == Cast.PtrToInt || operation == Cast.IntToPtr || operation == Cast.Trunc {
+            // A truncation keeps a value that already fits.
+            if source.high <= most { range = source }
+          }
+        }
+      }
+      Operation.Compare {..} => { range.high = 1 }
+      _ => {}
+    }
+  }
+  // The facts that compare the value with a constant, or that compare with one the wider value
+  // it is the truncation of, masked to the truncation's bits: the two have the same value.
+  let wider = truncated(function, value)
+  let facts = List<Fact>.asSlice(&state.facts)
+  let mut at = facts.length
+  let mut seen = usize.ZERO
+  while at > usize.ZERO && seen < factWindow() {
+    at = at - usize.ONE
+    seen = seen + usize.ONE
+    let fact = facts[at]
+    let mut holding = fact.predicate
+    if !fact.truth { holding = inverse(fact.predicate) }
+    let mut bound = none()
+    let left = resolve(state, fact.left)
+    let right = resolve(state, fact.right)
+    if function.isBits(fact.right) && (left == value || (wider != none() && maskOf(state, function, left, most) == wider)) { bound = fact.right }
+    else if function.isBits(fact.left) && (right == value || (wider != none() && maskOf(state, function, right, most) == wider)) {
+      bound = fact.left
+      holding = swapped(holding)
+    }
+    if bound == none() || function.kindOf(bound).bits > 64 { continue }
+    let limit = masked(function.constantOf(bound).low, function.kindOf(bound).bits)
+    if holding == Predicate.Ult && limit > 0 && limit - 1 < range.high { range.high = limit - 1 }
+    if holding == Predicate.Ule && limit < range.high { range.high = limit }
+    if holding == Predicate.Ugt && limit < most && limit + 1 > range.low { range.low = limit + 1 }
+    if holding == Predicate.Uge && limit <= most && limit > range.low { range.low = limit }
+    if holding == Predicate.Eq && limit <= most { range = Range {low: limit, high: limit} }
+  }
+  return range
+}
+
+// The wider scalar integer `value` is the truncation of, or `none()`.
+fn truncated(function: &SsaFunction, value: u64) -> u64 {
+  let producer = function.producerOf(value)
+  if producer == usize.MAX { return none() }
+  if let Operation.Cast {operation: Cast.Trunc} = function.instruction(producer).operation {
+    let source = function.operandsOf(producer)[usize.ZERO]
+    let from = function.kindOf(source)
+    if from.isInteger() && !from.isVector() && from.bits <= 64 { return source }
+  }
+  return none()
+}
+
+// The value `value` is the low bits `mask` of, when it is that value and the constant `mask`
+// combined by `And`; else `none()`.
+fn maskOf(state: &Numbering, function: &SsaFunction, value: u64, mask: u64) -> u64 {
+  let producer = function.producerOf(value)
+  if producer == usize.MAX { return none() }
+  if let Operation.Binary {operation: Binary.And} = function.instruction(producer).operation {
+    let operands = function.operandsOf(producer)
+    let first = operands[usize.ZERO]
+    let second = operands[usize.ONE]
+    if function.kindOf(value).isVector() || function.kindOf(value).bits > 64 { return none() }
+    if function.isBits(second) && function.constantOf(second).low == mask { return resolve(state, first) }
+    if function.isBits(first) && function.constantOf(first).low == mask { return resolve(state, second) }
+  }
+  return none()
+}
+
+// The signed values a value can have where the walk stands, from `low` to `high`.
+struct SignedRange {
+  low: i64,
+  high: i64,
+}
+
+impl Copy for SignedRange {}
+
+// `bits`, an integer `width` bits wide, read as signed.
+fn signedOf(bits: u64, width: usize) -> i64 { return u64.wrappingToI64(SsaFolding.signExtended(masked(bits, width), width)) }
+
+// The range `low` to `high` when both are there and lie within `full`, else `full`: a sum or
+// difference that could leave the kind's range bounds nothing.
+fn withinOr(low: Option<i64>, high: Option<i64>, full: SignedRange) -> SignedRange {
+  if let Option<i64>.Some {value: least} = low {
+    if let Option<i64>.Some {value: most} = high {
+      if least >= full.low && most <= full.high && least <= most { return SignedRange {low: least, high: most} }
+    }
+  }
+  return full
+}
+
+// `value` shifted right by `by` bits, under 64, with its sign kept.
+fn signedShift(value: i64, by: u64) -> i64 {
+  if value >= 0 { return u64.wrappingToI64(u64.shiftRight(i64.wrappingToU64(value), by)) }
+  // Below zero, shifting the flipped bits and flipping back rounds toward the least value.
+  return -1 - u64.wrappingToI64(u64.shiftRight(i64.wrappingToU64(-1 - value), by))
+}
+
+// The range of a product of values in `first` and `second`: its corners' least and greatest,
+// or `full` when one of them leaves it.
+fn productRange(first: SignedRange, second: SignedRange, full: SignedRange) -> SignedRange {
+  let corners = [i64.checkedMultiply(first.low, second.low), i64.checkedMultiply(first.low, second.high),
+    i64.checkedMultiply(first.high, second.low), i64.checkedMultiply(first.high, second.high)]
+  let mut least = i64.MAX
+  let mut most = i64.MIN
+  let mut at = usize.ZERO
+  while at < 4 {
+    if let Option<i64>.Some {value: corner} = corners[at] {
+      if corner < full.low || corner > full.high { return full }
+      if corner < least { least = corner }
+      if corner > most { most = corner }
+    } else { return full }
+    at = at + usize.ONE
+  }
+  return SignedRange {low: least, high: most}
+}
+
+// The signed range of `value`, an integer of 2 to 64 bits, where the walk stands: what its
+// operation bounds it to (a constant added or subtracted without leaving the kind's range, a
+// difference from a constant, a mask, an extension), then what the known signed comparisons of it
+// with constants leave of that. `depth` is how many operands deep it may still look.
+fn signedRangeOf(state: &Numbering, function: &SsaFunction, value: u64, depth: usize) -> SignedRange {
+  let kind = function.kindOf(value)
+  let mut full = SignedRange {low: i64.MIN, high: i64.MAX}
+  if kind.bits < 64 {
+    let most = u64.wrappingToI64(u64.shiftLeft(1, usize.toU64(kind.bits - usize.ONE))) - 1
+    full = SignedRange {low: 0 - most - 1, high: most}
+  }
+  if function.isBits(value) {
+    let exact = signedOf(function.constantOf(value).low, kind.bits)
+    return SignedRange {low: exact, high: exact}
+  }
+  let mut range = full
+  let producer = function.producerOf(value)
+  let mut cost = usize.MAX
+  if producer != usize.MAX { cost = rangeCost(function, producer) }
+  if producer != usize.MAX && depth >= cost {
+    let operands = function.operandsOf(producer)
+    // An overflow-checked operation's value is the wrapping one's.
+    let mut made = function.instruction(producer).operation
+    if let Operation.Overflow {operation: checked, ..} = made {
+      if function.value(value).index == usize.ZERO { made = Operation.Binary {operation: checked} }
+    }
+    match made {
+      Operation.Binary {operation} => {
+        let first = signedRangeOf(state, function, operands[usize.ZERO], depth - cost)
+        let second = signedRangeOf(state, function, operands[usize.ONE], depth - cost)
+        if operation == Binary.Mul { range = productRange(first, second, full) }
+        // A shift right that keeps the sign moves both ends.
+        if operation == Binary.AShr && second.low == second.high && second.low >= 0 && second.low < 64 {
+          let by = i64.wrappingToU64(second.low)
+          range = SignedRange {low: signedShift(first.low, by), high: signedShift(first.high, by)}
+        }
+        if operation == Binary.Add {
+          range = withinOr(i64.checkedAdd(first.low, second.low), i64.checkedAdd(first.high, second.high), full)
+        }
+        if operation == Binary.Sub {
+          range = withinOr(i64.checkedSubtract(first.low, second.high), i64.checkedSubtract(first.high, second.low), full)
+        }
+        if operation == Binary.And {
+          // A mask that is not negative leaves a value from zero to the mask.
+          if second.low == second.high && second.low >= 0 { range = SignedRange {low: 0, high: second.low} }
+          if first.low == first.high && first.low >= 0 { range = SignedRange {low: 0, high: first.low} }
+        }
+        // Every bit flipped is `-1 - x`, which never leaves the kind's range.
+        if operation == Binary.Xor && second.low == second.high && second.low == -1 {
+          range = SignedRange {low: -1 - first.high, high: -1 - first.low}
+        }
+        if operation == Binary.Xor && first.low == first.high && first.low == -1 {
+          range = SignedRange {low: -1 - second.high, high: -1 - second.low}
+        }
+      }
+      Operation.Cast {operation} => {
+        let from = function.kindOf(operands[usize.ZERO])
+        if from.isInteger() && !from.isVector() && from.bits >= 2 && from.bits <= 64 {
+          if operation == Cast.SExt { range = signedRangeOf(state, function, operands[usize.ZERO], depth - cost) }
+          if operation == Cast.Trunc {
+            let source = signedRangeOf(state, function, operands[usize.ZERO], depth - cost)
+            if source.low >= full.low && source.high <= full.high { range = source }
+          }
+          if operation == Cast.ZExt && from.bits < kind.bits {
+            let source = rangeOf(state, function, operands[usize.ZERO], depth - cost)
+            range = SignedRange {low: u64.wrappingToI64(source.low), high: u64.wrappingToI64(source.high)}
+          }
+        }
+      }
+      _ => {}
+    }
+  }
+  let facts = List<Fact>.asSlice(&state.facts)
+  let mut at = facts.length
+  let mut seen = usize.ZERO
+  while at > usize.ZERO && seen < factWindow() {
+    at = at - usize.ONE
+    seen = seen + usize.ONE
+    let fact = facts[at]
+    let mut holding = fact.predicate
+    if !fact.truth { holding = inverse(fact.predicate) }
+    let mut bound = none()
+    if resolve(state, fact.left) == value && function.isBits(fact.right) { bound = fact.right }
+    else if resolve(state, fact.right) == value && function.isBits(fact.left) {
+      bound = fact.left
+      holding = swapped(holding)
+    }
+    if bound == none() || function.kindOf(bound).bits > 64 || function.kindOf(bound).bits < 2 { continue }
+    let limit = signedOf(function.constantOf(bound).low, function.kindOf(bound).bits)
+    if holding == Predicate.Slt && limit > full.low && limit - 1 < range.high { range.high = limit - 1 }
+    if holding == Predicate.Sle && limit < range.high { range.high = limit }
+    if holding == Predicate.Sgt && limit < full.high && limit + 1 > range.low { range.low = limit + 1 }
+    if holding == Predicate.Sge && limit > range.low { range.low = limit }
+    if holding == Predicate.Eq { range = SignedRange {low: limit, high: limit} }
+  }
+  // A value whose unsigned range stays below the sign bit is not negative, and its signed range
+  // is no wider than that. One whose unsigned range starts at the sign bit or above is negative:
+  // each end is 2 to the kind's bits less.
+  let unsigned = rangeOf(state, function, value, depth)
+  if unsigned.low <= unsigned.high && unsigned.high <= i64.wrappingToU64(full.high) {
+    let least = u64.wrappingToI64(unsigned.low)
+    let most = u64.wrappingToI64(unsigned.high)
+    if least > range.low { range.low = least }
+    if most < range.high { range.high = most }
+  }
+  if unsigned.low <= unsigned.high && unsigned.low > i64.wrappingToU64(full.high) {
+    let least = signedOf(unsigned.low, kind.bits)
+    let most = signedOf(unsigned.high, kind.bits)
+    if least > range.low { range.low = least }
+    if most < range.high { range.high = most }
+  }
+  return range
+}
+
+// 1 when the unsigned ranges of `left` and `right` prove `left asked right`, 0 when they prove it
+// does not hold, else `usize.MAX`: a bounds check against a constant that an earlier, tighter
+// check or a mask already answers, and the range check of a conversion whose source fits.
+fn decidedByRanges(state: &Numbering, function: &SsaFunction, asked: Predicate, left: u64, right: u64) -> usize {
+  let kind = function.kindOf(left)
+  if kind.isVector() || kind.bits > 64 || !(kind.isInteger() || kind.isAddress()) { return usize.MAX }
+  if asked == Predicate.Slt || asked == Predicate.Sle || asked == Predicate.Sgt || asked == Predicate.Sge {
+    if !kind.isInteger() || kind.bits < 2 { return usize.MAX }
+    let lower = signedRangeOf(state, function, left, rangeDepth())
+    let upper = signedRangeOf(state, function, right, rangeDepth())
+    if lower.low > lower.high || upper.low > upper.high { return usize.MAX }
+    if asked == Predicate.Slt {
+      if lower.high < upper.low { return usize.ONE }
+      if lower.low >= upper.high { return usize.ZERO }
+    }
+    if asked == Predicate.Sle {
+      if lower.high <= upper.low { return usize.ONE }
+      if lower.low > upper.high { return usize.ZERO }
+    }
+    if asked == Predicate.Sgt {
+      if lower.low > upper.high { return usize.ONE }
+      if lower.high <= upper.low { return usize.ZERO }
+    }
+    if asked == Predicate.Sge {
+      if lower.low >= upper.high { return usize.ONE }
+      if lower.high < upper.low { return usize.ZERO }
+    }
+    return usize.MAX
+  }
+  if asked != Predicate.Ult && asked != Predicate.Ule && asked != Predicate.Ugt && asked != Predicate.Uge && asked != Predicate.Eq
+    && asked != Predicate.Ne { return usize.MAX }
+  let first = rangeOf(state, function, left, rangeDepth())
+  let second = rangeOf(state, function, right, rangeDepth())
+  // An empty range comes of facts that contradict: the code is unreachable, and nothing is decided.
+  if first.low > first.high || second.low > second.high { return usize.MAX }
+  if asked == Predicate.Ult {
+    if first.high < second.low { return usize.ONE }
+    if first.low >= second.high { return usize.ZERO }
+  }
+  if asked == Predicate.Ule {
+    if first.high <= second.low { return usize.ONE }
+    if first.low > second.high { return usize.ZERO }
+  }
+  if asked == Predicate.Ugt {
+    if first.low > second.high { return usize.ONE }
+    if first.high <= second.low { return usize.ZERO }
+  }
+  if asked == Predicate.Uge {
+    if first.low >= second.high { return usize.ONE }
+    if first.high < second.low { return usize.ZERO }
+  }
+  let apart = first.high < second.low || second.high < first.low
+  if asked == Predicate.Eq && apart { return usize.ZERO }
+  if asked == Predicate.Ne && apart { return usize.ONE }
   return usize.MAX
+}
+
+// The value `value` is one more than, when `value` is the sum of a value and the constant one;
+// else `none()`, which no operand is.
+fn incrementOf(function: &SsaFunction, value: u64) -> u64 {
+  let producer = function.producerOf(value)
+  if producer == usize.MAX { return none() }
+  if let Operation.Binary {operation: Binary.Add} = function.instruction(producer).operation {
+    let operands = function.operandsOf(producer)
+    if function.isBits(operands[usize.ONE]) && function.constantOf(operands[usize.ONE]).low == 1 && !function.isConstant(operands[usize.ZERO]) {
+      return operands[usize.ZERO]
+    }
+    if function.isBits(operands[usize.ZERO]) && function.constantOf(operands[usize.ZERO]).low == 1 && !function.isConstant(operands[usize.ONE]) {
+      return operands[usize.ONE]
+    }
+  }
+  return none()
 }
 
 // A tag per operation variant and its immediates, for the hash.

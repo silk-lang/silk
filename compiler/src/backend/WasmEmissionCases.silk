@@ -1,0 +1,438 @@
+//! The wasm code of hand-built SSA functions: which values pass on the wasm stack when the
+//! emission keeps single-use values there, and which keep a local because an operation between
+//! their definition and their use could change what they read.
+
+import backend.SsaFunction {Binary, Cast, Kind, Predicate, SsaFunction}
+import backend.WasmEmission
+import backend.WasmObject {Unsupported}
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.core.effect {Effect}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.testing.testing {AssertionError, Testing}
+import silk.num.usize
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn startsWith(code: &[u8], prefix: &[u8]) -> bool {
+  if code.length < prefix.length { return false }
+  let mut at = usize.ZERO
+  while at < prefix.length {
+    if code[at] != prefix[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// The code entry of `function`: its local declarations, then its code.
+effect fn entryOf(function: &SsaFunction, trees: bool) -> Bytes ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let translated = run WasmEmission.emit(function, false, trees)
+  return run Bytes.copy(Bytes.asSlice(&translated.entry))
+}
+
+// `(a + b) * c`, or `(a + b) * (a + b)` when `twice`.
+effect fn product(twice: bool) -> SsaFunction ! OutOfMemoryError ? &mut Allocator {
+  let mut function = run SsaFunction.make(b"product", 32)
+  let int = Kind.integer(32)
+  let a = run function.argument(int)
+  let b = run function.argument(int)
+  let c = run function.argument(int)
+  function.setResult(int)
+  let entry = run function.newBlock()
+  function.startBlock(entry)
+  let sum = run function.binary(Binary.Add, a, b)
+  let mut other = c
+  if twice { other = sum }
+  let scaled = run function.binary(Binary.Mul, sum, other)
+  run function.ret(scaled)
+  run function.finish()
+  return move function
+}
+
+test effect fn singleUseValuesStayOnTheStack() -> () ! Unsupported | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run stackClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn stackClaims() -> () ! Unsupported | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let single = run product(false)
+  let stacked = run entryOf(&single, true)
+  // No locals; local.get 0, local.get 1, i32.add, local.get 2, i32.mul, return, unreachable, end.
+  run Testing.expect(same(Bytes.asSlice(&stacked), &[0, 0x20, 0, 0x20, 1, 0x6A, 0x20, 2, 0x6C, 0x0F, 0x00, 0x0B]),
+    "a sum used once and the returned product pass on the stack")
+  let plain = run entryOf(&single, false)
+  // One run of two `i32` locals.
+  run Testing.expect(startsWith(Bytes.asSlice(&plain), &[1, 2, 0x7F]), "without trees each result has a local")
+  let twice = run product(true)
+  let kept = run entryOf(&twice, true)
+  // One `i32` local; local.get 0, local.get 1, i32.add, local.tee 3, local.get 3, i32.mul, return, unreachable, end.
+  run Testing.expect(same(Bytes.asSlice(&kept), &[1, 1, 0x7F, 0x20, 0, 0x20, 1, 0x6A, 0x22, 3, 0x20, 3, 0x6C, 0x0F, 0x00, 0x0B]),
+    "a sum used twice keeps its local")
+}
+
+test effect fn readsStayBeforeSideEffects() -> () ! Unsupported | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run orderClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// A load of `p`, returned after one is added to it; with `between`, a store through `q` lies
+// between the load and the sum.
+effect fn loaded(between: bool) -> SsaFunction ! OutOfMemoryError ? &mut Allocator {
+  let mut function = run SsaFunction.make(b"loaded", 32)
+  let int = Kind.integer(32)
+  let p = run function.argument(Kind.address(32))
+  let q = run function.argument(Kind.address(32))
+  function.setResult(int)
+  let entry = run function.newBlock()
+  function.startBlock(entry)
+  let read = run function.load(int, p, 0, 4)
+  let seven = run function.integer(32, 7)
+  let one = run function.integer(32, 1)
+  if between { run function.store(seven, q, 0, 4) }
+  let sum = run function.binary(Binary.Add, read, one)
+  run function.ret(sum)
+  run function.finish()
+  return move function
+}
+
+effect fn orderClaims() -> () ! Unsupported | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let free = run loaded(false)
+  let moved = run entryOf(&free, true)
+  // No locals; local.get 0, i32.load, i32.const 1, i32.add, return, unreachable, end.
+  run Testing.expect(same(Bytes.asSlice(&moved), &[0, 0x20, 0, 0x28, 0, 0, 0x41, 1, 0x6A, 0x0F, 0x00, 0x0B]),
+    "a load with nothing between it and its use passes on the stack")
+  let stored = run loaded(true)
+  let held = run entryOf(&stored, true)
+  // One `i32` local; the load is set before the store: local.get 0, i32.load, local.set 2,
+  // local.get 1, i32.const 7, i32.store, local.get 2, i32.const 1, i32.add, return, unreachable, end.
+  run Testing.expect(same(Bytes.asSlice(&held), &[1, 1, 0x7F, 0x20, 0, 0x28, 0, 0, 0x21, 2, 0x20, 1, 0x41, 7, 0x36, 0, 0, 0x20, 2, 0x41, 1,
+    0x6A, 0x0F, 0x00, 0x0B]), "a load a store follows runs before the store")
+}
+
+test effect fn exitsAndRepeatedPushesTakeDeferredValues() -> () ! Unsupported | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run exitClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn exitClaims() -> () ! Unsupported | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let int = Kind.integer(32)
+  let mut branching = run SsaFunction.make(b"branching", 32)
+  let a = run branching.argument(int)
+  let b = run branching.argument(int)
+  branching.setResult(int)
+  let entry = run branching.newBlock()
+  let low = run branching.newBlock()
+  let high = run branching.newBlock()
+  branching.startBlock(entry)
+  let below = run branching.compare(Predicate.Ult, a, b)
+  run branching.branchIf(below, low, high)
+  branching.startBlock(low)
+  run branching.ret(a)
+  branching.startBlock(high)
+  run branching.ret(b)
+  run branching.finish()
+  let branched = run entryOf(&branching, true)
+  // No locals; local.get 0, local.get 1, i32.lt_u, if.
+  run Testing.expect(startsWith(Bytes.asSlice(&branched), &[0, 0x20, 0, 0x20, 1, 0x49, 0x04]), "a branch takes its condition from the stack")
+
+  // An ordered comparison pushes each operand twice, so the deferred sum is kept in a local
+  // where its first push put it.
+  let float = Kind.float(32)
+  let mut ordered = run SsaFunction.make(b"ordered", 32)
+  let x = run ordered.argument(float)
+  let y = run ordered.argument(float)
+  let z = run ordered.argument(float)
+  ordered.setResult(Kind.flag())
+  let only = run ordered.newBlock()
+  ordered.startBlock(only)
+  let sum = run ordered.binary(Binary.Add, x, y)
+  let both = run ordered.compare(Predicate.Ord, sum, z)
+  run ordered.ret(both)
+  run ordered.finish()
+  let compared = run entryOf(&ordered, true)
+  // An `i32` and an `f32` local; local.get 0, local.get 1, f32.add, local.tee 4, local.get 4,
+  // f32.eq, local.get 2, local.get 2, f32.eq, i32.and, return, unreachable, end.
+  run Testing.expect(same(Bytes.asSlice(&compared), &[2, 1, 0x7F, 1, 0x7D, 0x20, 0, 0x20, 1, 0x92, 0x22, 4, 0x20, 4, 0x5B, 0x20, 2, 0x20, 2,
+    0x5B, 0x71, 0x0F, 0x00, 0x0B]), "a deferred value pushed twice is computed once")
+}
+
+test effect fn checkedSumsStayInTheirWidth() -> () ! Unsupported | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run checkedClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// `a + b` or `a - b` of `bits`-wide integers, trapping on overflow.
+effect fn checked(operation: Binary, signed: bool, bits: usize) -> SsaFunction ! OutOfMemoryError ? &mut Allocator {
+  let mut function = run SsaFunction.make(b"checked", 32)
+  let int = Kind.integer(bits)
+  let a = run function.argument(int)
+  let b = run function.argument(int)
+  function.setResult(int)
+  let entry = run function.newBlock()
+  let failed = run function.newBlock()
+  let passed = run function.newBlock()
+  function.startBlock(entry)
+  let sum = run function.overflowing(operation, signed, a, b)
+  run function.branchIf(sum.overflow, failed, passed)
+  function.startBlock(failed)
+  run function.trap()
+  function.startBlock(passed)
+  run function.ret(sum.value)
+  run function.finish()
+  return move function
+}
+
+effect fn checkedClaims() -> () ! Unsupported | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  // Each has two `i32` locals, the sum and its flag, and none of them widens to `i64`. The flag
+  // is read once, by the branch right after it, so it is never set.
+  let unsignedSum = run checked(Binary.Add, false, 32)
+  let added = run entryOf(&unsignedSum, true)
+  // local.get 0, local.get 1, i32.add, local.tee 2, local.get 0, i32.lt_u, if.
+  run Testing.expect(startsWith(Bytes.asSlice(&added), &[1, 2, 0x7F, 0x20, 0, 0x20, 1, 0x6A, 0x22, 2, 0x20, 0, 0x49, 0x04]),
+    "an unsigned 32-bit sum overflowed when it is below an operand")
+  let unsignedDifference = run checked(Binary.Sub, false, 32)
+  let subtracted = run entryOf(&unsignedDifference, true)
+  // local.get 0, local.get 1, i32.sub, local.set 2, local.get 0, local.get 1, i32.lt_u, if.
+  run Testing.expect(startsWith(Bytes.asSlice(&subtracted), &[1, 2, 0x7F, 0x20, 0, 0x20, 1, 0x6B, 0x21, 2, 0x20, 0, 0x20, 1, 0x49, 0x04]),
+    "an unsigned 32-bit difference overflowed when the left is below the right")
+  let signedSum = run checked(Binary.Add, true, 32)
+  let signedAdded = run entryOf(&signedSum, true)
+  // local.get 0, local.get 1, i32.add, local.set 2, local.get 0, local.get 2, i32.xor,
+  // local.get 1, local.get 2, i32.xor, i32.and, i32.const 0, i32.lt_s, if.
+  run Testing.expect(startsWith(Bytes.asSlice(&signedAdded), &[1, 2, 0x7F, 0x20, 0, 0x20, 1, 0x6A, 0x21, 2, 0x20, 0, 0x20, 2, 0x73, 0x20, 1,
+    0x20, 2, 0x73, 0x71, 0x41, 0, 0x48, 0x04]), "a signed 32-bit sum overflowed when its sign differs from both operands'")
+  let narrowSum = run checked(Binary.Add, false, 8)
+  let narrow = run entryOf(&narrowSum, true)
+  // Three `i32` locals, the exact sum the third: local.get 0, local.get 1, i32.add, local.tee 4,
+  // i32.const 255, i32.and, local.set 2, local.get 4, i32.const 8, i32.shr_u, if.
+  run Testing.expect(startsWith(Bytes.asSlice(&narrow), &[1, 3, 0x7F, 0x20, 0, 0x20, 1, 0x6A, 0x22, 4, 0x41, 0xFF, 0x01, 0x71, 0x21, 2, 0x20, 4,
+    0x41, 8, 0x76, 0x04]), "an unsigned 8-bit sum overflowed when it carries into bit 8")
+}
+
+test effect fn deferredOperationsKeepTheLocalsTheyUse() -> () ! Unsupported | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run scratchClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// An element of a vector at a run-time index is chosen through the result's own local, so the
+// deferred result keeps that local declared.
+effect fn scratchClaims() -> () ! Unsupported | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let int = Kind.integer(32)
+  let mut function = run SsaFunction.make(b"element", 32)
+  let vector = run function.argument(Kind.vector(int, 2))
+  let index = run function.argument(int)
+  function.setResult(int)
+  let entry = run function.newBlock()
+  function.startBlock(entry)
+  let element = run function.extractElement(vector, index)
+  run function.ret(element)
+  run function.finish()
+  let code = run entryOf(&function, true)
+  // One `i32` local, local 3 after the vector's two lanes and the index; local.get 0,
+  // local.set 3, local.get 1, local.get 3, local.get 2, i32.const 1, i32.eq, select, return.
+  run Testing.expect(same(Bytes.asSlice(&code), &[1, 1, 0x7F, 0x20, 0, 0x21, 3, 0x20, 1, 0x20, 3, 0x20, 2, 0x41, 1, 0x46, 0x1B, 0x0F, 0x00, 0x0B]),
+    "the chosen element's local is declared and the last choice is returned from the stack")
+}
+
+test effect fn denseSwitchesAreTables() -> () ! Unsupported | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run switchClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// A switch on the argument with four cases `step` apart from `first`, each returning its own
+// constant, and a default.
+effect fn switching(first: u64, step: u64) -> SsaFunction ! OutOfMemoryError ? &mut Allocator {
+  let mut function = run SsaFunction.make(b"switching", 32)
+  let int = Kind.integer(32)
+  let value = run function.argument(int)
+  function.setResult(int)
+  let entry = run function.newBlock()
+  let fallback = run function.newBlock()
+  let mut pairs = List<u64>.make()
+  let mut targets = List<usize>.make()
+  let mut at: u64 = 0
+  while at < 4 {
+    let target = run function.newBlock()
+    run List<usize>.append(&mut targets, target)
+    run List<u64>.append(&mut pairs, first + at * step)
+    run List<u64>.append(&mut pairs, usize.toU64(target))
+    at = at + 1
+  }
+  function.startBlock(entry)
+  run function.switch(value, List<u64>.asSlice(&pairs), fallback)
+  function.startBlock(fallback)
+  let missed = run function.integer(32, 99)
+  run function.ret(missed)
+  let mut each = usize.ZERO
+  while each < 4 {
+    function.startBlock(List<usize>.get(&targets, each))
+    let answer = run function.integer(32, usize.toU64(each))
+    run function.ret(answer)
+    each = each + usize.ONE
+  }
+  run function.finish()
+  return move function
+}
+
+effect fn switchClaims() -> () ! Unsupported | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let dense = run switching(10, 1)
+  let table = run entryOf(&dense, true)
+  // No locals; five blocks, one per target and the default's outermost; local.get 0,
+  // i32.const 10, i32.sub, br_table with four entries to blocks 0 to 3 and default 4, end.
+  run Testing.expect(startsWith(Bytes.asSlice(&table), &[0, 0x02, 0x40, 0x02, 0x40, 0x02, 0x40, 0x02, 0x40, 0x02, 0x40, 0x20, 0, 0x41, 10, 0x6B,
+    0x0E, 4, 0, 1, 2, 3, 4, 0x0B]), "four adjacent cases are one table over the value less the least case")
+  let sparse = run switching(0, 100)
+  let chain = run entryOf(&sparse, true)
+  // No locals; local.get 0, i32.const 0, i32.eq, if.
+  run Testing.expect(startsWith(Bytes.asSlice(&chain), &[0, 0x20, 0, 0x41, 0, 0x46, 0x04, 0x40]), "cases far apart are tested one by one")
+}
+
+test effect fn framesOnlyEndingBlocksReadAreMadeThere() -> () ! Unsupported | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run frameClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// A function that stores its argument in a slot and reports the slot before it traps when
+// `failed` holds, and otherwise returns the argument. With `reads` 1 the returning block reads
+// the argument back from the slot; with 2 the entry block stores it there first as well.
+effect fn reporting(reads: usize) -> SsaFunction ! OutOfMemoryError ? &mut Allocator {
+  let mut function = run SsaFunction.make(b"reporting", 32)
+  let int = Kind.integer(32)
+  let failed = run function.argument(Kind.flag())
+  let value = run function.argument(int)
+  function.setResult(int)
+  let entry = run function.newBlock()
+  let trapping = run function.newBlock()
+  let returning = run function.newBlock()
+  function.startBlock(entry)
+  let cell = run function.slotOf(4, 4)
+  if reads == 2 { run function.store(value, cell, 0, 4) }
+  run function.branchIf(failed, trapping, returning)
+  function.startBlock(trapping)
+  run function.store(value, cell, 0, 4)
+  drop run function.call(b"report", &[cell], Kind.unit())
+  run function.trap()
+  function.startBlock(returning)
+  let mut answer = value
+  if reads != usize.ZERO { answer = run function.load(int, cell, 0, 4) }
+  run function.ret(answer)
+  run function.finish()
+  return move function
+}
+
+effect fn frameClaims() -> () ! Unsupported | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let cold = run reporting(usize.ZERO)
+  let lazy = run entryOf(&cold, true)
+  // Two `i32` locals, the stack pointer at entry and the frame; local.get 0, if, and only then
+  // global.get 0, local.tee 2, i32.const 16, i32.sub, local.tee 3, global.set 0.
+  run Testing.expect(startsWith(Bytes.asSlice(&lazy), &[1, 2, 0x7F, 0x20, 0, 0x04, 0x40, 0x23, 0, 0x22, 2, 0x41, 16, 0x6B, 0x22, 3, 0x24, 0]),
+    "a frame only a trapping block reads is made in that block")
+  run Testing.expect(!contains(Bytes.asSlice(&lazy), &[0x20, 2, 0x24, 0]), "a return that made no frame restores nothing")
+  let ending = run reporting(usize.ONE)
+  let ended = run entryOf(&ending, true)
+  // The returning block makes the frame too, and its return gives it back: local.get 2,
+  // global.set 0.
+  run Testing.expect(startsWith(Bytes.asSlice(&ended), &[1, 2, 0x7F, 0x20, 0, 0x04, 0x40, 0x23, 0, 0x22, 2])
+    && contains(Bytes.asSlice(&ended), &[0x20, 2, 0x24, 0]), "a frame the blocks that end the function read is made in each, and given back by the one that returns")
+  let warm = run reporting(2)
+  let eager = run entryOf(&warm, true)
+  // global.get 0, local.tee 2, i32.const 16, i32.sub, local.tee 3, global.set 0 come first.
+  run Testing.expect(startsWith(Bytes.asSlice(&eager), &[1, 2, 0x7F, 0x23, 0, 0x22, 2, 0x41, 16, 0x6B, 0x22, 3, 0x24, 0]),
+    "a frame a block that goes on reads is made at entry")
+}
+
+fn contains(code: &[u8], part: &[u8]) -> bool {
+  if part.length > code.length { return false }
+  let mut start = usize.ZERO
+  while start + part.length <= code.length {
+    let mut at = usize.ZERO
+    while at < part.length && code[start + at] == part[at] { at = at + usize.ONE }
+    if at == part.length { return true }
+    start = start + usize.ONE
+  }
+  return false
+}
+
+test effect fn edgeArgumentsPassOnTheStack() -> () ! Unsupported | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run edgeClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// A loop over `(a, b, k)` that swaps `a` and `b` and counts `k` up to `n`. The back edge passes
+// `b`, `a` and `k + 1`: all three are pushed before any of the loop's variables is set, so the
+// swap needs no copy and the sum no local of its own.
+effect fn edgeClaims() -> () ! Unsupported | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let int = Kind.integer(32)
+  let mut function = run SsaFunction.make(b"swapping", 32)
+  let x = run function.argument(int)
+  let y = run function.argument(int)
+  let n = run function.argument(int)
+  function.setResult(int)
+  let entry = run function.newBlock()
+  let head = run function.newBlock()
+  let step = run function.newBlock()
+  let done = run function.newBlock()
+  let a = run function.addParameter(head, int)
+  let b = run function.addParameter(head, int)
+  let k = run function.addParameter(head, int)
+  function.startBlock(entry)
+  let zero = run function.integer(32, 0)
+  run function.jumpWith(head, &[x, y, zero])
+  function.startBlock(head)
+  let more = run function.compare(Predicate.Ult, k, n)
+  run function.branchIf(more, step, done)
+  function.startBlock(step)
+  let one = run function.integer(32, 1)
+  let next = run function.binary(Binary.Add, k, one)
+  run function.jumpWith(head, &[b, a, next])
+  function.startBlock(done)
+  run function.ret(a)
+  run function.finish()
+  let code = run entryOf(&function, true)
+  // Three `i32` locals, the loop's variables 3, 4 and 5, and none for the comparison or the sum.
+  run Testing.expect(startsWith(Bytes.asSlice(&code), &[1, 3, 0x7F]), "only the loop's variables are locals")
+  // local.get 4, local.get 3, local.get 5, i32.const 1, i32.add, local.set 5, local.set 4, local.set 3.
+  run Testing.expect(contains(Bytes.asSlice(&code), &[0x20, 4, 0x20, 3, 0x20, 5, 0x41, 1, 0x6A, 0x21, 5, 0x21, 4, 0x21, 3]),
+    "the back edge pushes its three arguments, then sets the three variables")
+}
+
+test effect fn aCastThatAnswersItsOperandLeavesTheOperandsLocal() -> () ! Unsupported | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run aliasClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// A pointer loaded through `p` and its bits as an integer, returned from the next block after a
+// store through the pointer. The cast to an integer of the pointer's width has no code and
+// answers the pointer's own value: though the cast's result is read once, the store reads the
+// pointer too, so the pointer keeps its local for the block that returns.
+effect fn aliasClaims() -> () ! Unsupported | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let int = Kind.integer(32)
+  let address = Kind.address(32)
+  let mut function = run SsaFunction.make(b"aliased", 32)
+  let p = run function.argument(address)
+  function.setResult(int)
+  let entry = run function.newBlock()
+  let after = run function.newBlock()
+  function.startBlock(entry)
+  let pointer = run function.load(address, p, 0, 4)
+  let word = run function.cast(Cast.PtrToInt, pointer, int)
+  let seven = run function.integer(32, 7)
+  run function.store(seven, pointer, 4, 4)
+  run function.jump(after)
+  function.startBlock(after)
+  run function.ret(word)
+  run function.finish()
+  let code = run entryOf(&function, true)
+  // One `i32` local; local.get 0, i32.load, local.tee 1, i32.const 7, i32.store offset=4,
+  // local.get 1, return, unreachable, end.
+  run Testing.expect(same(Bytes.asSlice(&code), &[1, 1, 0x7F, 0x20, 0, 0x28, 0, 0, 0x22, 1, 0x41, 7, 0x36, 0, 4, 0x20, 1, 0x0F, 0x00, 0x0B]),
+    "the store reads the pointer where it is set, and the next block reads its local")
+}

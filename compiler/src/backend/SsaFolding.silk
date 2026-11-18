@@ -80,12 +80,17 @@ pub effect fn simplify(function: &mut SsaFunction, instruction: usize) -> Folded
   let b = operandAt(&function.*, instruction, usize.ONE)
   let c = operandAt(&function.*, instruction, 2)
   return match found.operation {
-    Operation.Binary {operation} => run binary(&mut function.*, found.kind, operation, a, b)
+    Operation.Binary {operation} => run binary(&mut function.*, instruction, found.kind, operation, a, b)
     Operation.Negate => run negation(&mut function.*, a)
-    Operation.Compare {predicate} => run comparison(&mut function.*, found.kind, predicate, a, b)
+    Operation.Compare {predicate} => run comparison(&mut function.*, instruction, found.kind, predicate, a, b)
     Operation.Select => selection(&function.*, a, b, c)
     Operation.Cast {operation} => run conversion(&mut function.*, instruction, found.kind, operation, a)
     Operation.Offset {offset} => run offsetOf(&mut function.*, instruction, offset, a)
+    Operation.Index => {
+      // No bytes past an address is the address.
+      if isZero(&function.*, b) { return to(a) }
+      return kept()
+    }
     Operation.Overflow {operation, signed} => run overflowing(&mut function.*, found.kind, operation, signed, a, b)
     Operation.Rotate {left} => run rotation(&mut function.*, found.kind, left, a, b)
     Operation.Count {which} => run counting(&mut function.*, found.kind, which, a)
@@ -178,7 +183,60 @@ fn evaluate(operation: Binary, left: u64, right: u64, bits: usize) -> Evaluated 
   return valid(u64.shiftRight(extended, right))
 }
 
-effect fn binary(function: &mut SsaFunction, kind: Kind, operation: Binary, left: u64, right: u64) -> Folded ! OutOfMemoryError ? &mut Allocator {
+// The power of two the scalar integer constant `value` is, or `usize.MAX` when it is none or not
+// a constant.
+fn powerOfTwo(function: &SsaFunction, value: u64) -> usize {
+  if !small(function, value) { return usize.MAX }
+  let bits = bitsOf(function, value)
+  if bits == 0 || u64.bitAnd(bits, bits - 1) != 0 { return usize.MAX }
+  let mut power = usize.ZERO
+  while u64.shiftRight(bits, usize.toU64(power)) != 1 { power = power + usize.ONE }
+  return power
+}
+
+// How many of the lowest bits of the scalar integer `value` are known to be zero: those of a
+// constant, or the amount of a shift left by a constant.
+fn lowZeros(function: &SsaFunction, value: u64) -> usize {
+  let kind = function.kindOf(value)
+  if kind.isVector() || !kind.isInteger() || kind.bits > 64 { return usize.ZERO }
+  if small(function, value) {
+    let bits = bitsOf(function, value)
+    if bits == 0 { return kind.bits }
+    let mut count = usize.ZERO
+    while u64.bitAnd(u64.shiftRight(bits, usize.toU64(count)), 1) == 0 { count = count + usize.ONE }
+    return count
+  }
+  let producer = function.producerOf(value)
+  if producer == usize.MAX { return usize.ZERO }
+  if let Operation.Binary {operation: Binary.Shl} = function.instruction(producer).operation {
+    let amount = operandAt(function, producer, usize.ONE)
+    if small(function, amount) && bitsOf(function, amount) < usize.toU64(kind.bits) { return u64.toUsize(bitsOf(function, amount)) }
+  }
+  return usize.ZERO
+}
+
+// How many of the lowest bits of the scalar integer `value` can be set: every bit above them is
+// known to be zero, as above a constant's highest set bit or the source of a zero extension.
+fn activeBits(function: &SsaFunction, value: u64) -> usize {
+  let kind = function.kindOf(value)
+  if kind.isVector() || !kind.isInteger() || kind.bits > 64 { return kind.bits }
+  if small(function, value) {
+    let bits = bitsOf(function, value)
+    let mut count = usize.ZERO
+    while count < 64 && u64.shiftRight(bits, usize.toU64(count)) != 0 { count = count + usize.ONE }
+    return count
+  }
+  let producer = function.producerOf(value)
+  if producer == usize.MAX { return kind.bits }
+  if let Operation.Cast {operation: Cast.ZExt} = function.instruction(producer).operation {
+    let source = function.kindOf(operandAt(function, producer, usize.ZERO))
+    if !source.isVector() && source.bits < kind.bits { return source.bits }
+  }
+  return kind.bits
+}
+
+effect fn binary(function: &mut SsaFunction, instruction: usize, kind: Kind, operation: Binary, left: u64, right: u64) -> Folded
+! OutOfMemoryError ? &mut Allocator {
   if !kind.isInteger() { return kept() }
   if !kind.isVector() && kind.bits <= 64 && small(&function.*, left) && small(&function.*, right) {
     let folded = evaluate(operation, bitsOf(&function.*, left), bitsOf(&function.*, right), kind.bits)
@@ -191,6 +249,95 @@ effect fn binary(function: &mut SsaFunction, kind: Kind, operation: Binary, left
   } else if operation == Binary.Sub {
     if isZero(&function.*, right) { return to(left) }
     if left == right { return to(run function.constant(kind, 0)) }
+    if !kind.isVector() && kind.bits <= 64 && small(&function.*, left) {
+      // `c - (x + d)` is `(c - d) - x`.
+      let producer = function.producerOf(right)
+      if producer != usize.MAX {
+        if let Operation.Binary {operation: Binary.Add} = function.instruction(producer).operation {
+          let inner = operandAt(&function.*, producer, usize.ZERO)
+          let added = operandAt(&function.*, producer, usize.ONE)
+          let mut term = none()
+          let mut constant = none()
+          if small(&function.*, added) {
+            term = inner
+            constant = added
+          } else if small(&function.*, inner) {
+            term = added
+            constant = inner
+          }
+          if term != none() {
+            let moved = masked(u64.wrappingSubtract(bitsOf(&function.*, left), bitsOf(&function.*, constant)), kind.bits)
+            let folded = run function.constant(kind, moved)
+            if moved == masked(u64.MAX, kind.bits) {
+              // `-1 - x` is every bit of `x` flipped.
+              function.setOperation(instruction, Operation.Binary {operation: Binary.Xor})
+              function.setOperand(instruction, usize.ZERO, term)
+              function.setOperand(instruction, usize.ONE, folded)
+              return kept()
+            }
+            function.setOperand(instruction, usize.ZERO, folded)
+            function.setOperand(instruction, usize.ONE, term)
+            return kept()
+          }
+        }
+      }
+      // `c - ~x` is `x + (c + 1)`.
+      if producer != usize.MAX {
+        if let Operation.Binary {operation: Binary.Xor} = function.instruction(producer).operation {
+          let first = operandAt(&function.*, producer, usize.ZERO)
+          let second = operandAt(&function.*, producer, usize.ONE)
+          let mut flipped = none()
+          if isAllOnes(&function.*, second) && small(&function.*, second) { flipped = first }
+          else if isAllOnes(&function.*, first) && small(&function.*, first) { flipped = second }
+          if flipped != none() {
+            let bumped = masked(u64.wrappingAdd(bitsOf(&function.*, left), 1), kind.bits)
+            let sum = run function.constant(kind, bumped)
+            function.setOperation(instruction, Operation.Binary {operation: Binary.Add})
+            function.setOperand(instruction, usize.ZERO, flipped)
+            function.setOperand(instruction, usize.ONE, sum)
+            return kept()
+          }
+        }
+      }
+      // `-1 - x` is every bit of `x` flipped.
+      if isAllOnes(&function.*, left) {
+        function.setOperation(instruction, Operation.Binary {operation: Binary.Xor})
+        function.setOperand(instruction, usize.ZERO, right)
+        function.setOperand(instruction, usize.ONE, left)
+        return kept()
+      }
+    }
+    if !kind.isVector() && kind.bits <= 64 && small(&function.*, right) {
+      // `(x + c) - d` is `x + (c - d)`, and `(c - x) - d` is `(c - d) - x`.
+      let producer = function.producerOf(left)
+      if producer != usize.MAX {
+        let first = operandAt(&function.*, producer, usize.ZERO)
+        let second = operandAt(&function.*, producer, usize.ONE)
+        if let Operation.Binary {operation: inner} = function.instruction(producer).operation {
+          if inner == Binary.Add && (small(&function.*, first) || small(&function.*, second)) {
+            let mut term = first
+            let mut constant = second
+            if small(&function.*, first) {
+              term = second
+              constant = first
+            }
+            let leftOver = masked(u64.wrappingSubtract(bitsOf(&function.*, constant), bitsOf(&function.*, right)), kind.bits)
+            let sum = run function.constant(kind, leftOver)
+            function.setOperation(instruction, Operation.Binary {operation: Binary.Add})
+            function.setOperand(instruction, usize.ZERO, term)
+            function.setOperand(instruction, usize.ONE, sum)
+            return kept()
+          }
+          if inner == Binary.Sub && small(&function.*, first) {
+            let lessened = masked(u64.wrappingSubtract(bitsOf(&function.*, first), bitsOf(&function.*, right)), kind.bits)
+            let difference = run function.constant(kind, lessened)
+            function.setOperand(instruction, usize.ZERO, difference)
+            function.setOperand(instruction, usize.ONE, second)
+            return kept()
+          }
+        }
+      }
+    }
   } else if operation == Binary.Mul {
     if isOne(&function.*, right) { return to(left) }
     if isOne(&function.*, left) { return to(right) }
@@ -198,10 +345,49 @@ effect fn binary(function: &mut SsaFunction, kind: Kind, operation: Binary, left
     if isZero(&function.*, left) { return to(left) }
   } else if operation == Binary.UDiv || operation == Binary.SDiv {
     if isOne(&function.*, right) { return to(left) }
+    // An unsigned division by a power of two is a shift.
+    let power = powerOfTwo(&function.*, right)
+    if operation == Binary.UDiv && power != usize.MAX {
+      let amount = run function.constant(kind, usize.toU64(power))
+      function.setOperation(instruction, Operation.Binary {operation: Binary.LShr})
+      function.setOperand(instruction, usize.ONE, amount)
+    }
   } else if operation == Binary.URem || operation == Binary.SRem {
     if isOne(&function.*, right) { return to(run function.constant(kind, 0)) }
+    // An unsigned remainder by a power of two keeps the bits below it.
+    if operation == Binary.URem && powerOfTwo(&function.*, right) != usize.MAX {
+      let divisor = bitsOf(&function.*, right)
+      let below = run function.constant(kind, divisor - 1)
+      function.setOperation(instruction, Operation.Binary {operation: Binary.And})
+      function.setOperand(instruction, usize.ONE, below)
+    }
   } else if operation == Binary.Shl || operation == Binary.LShr || operation == Binary.AShr {
     if isZero(&function.*, right) || isZero(&function.*, left) { return to(left) }
+    if operation == Binary.LShr && !kind.isVector() && kind.bits <= 64 && small(&function.*, right) && bitsOf(&function.*, right) < usize.toU64(kind.bits) {
+      let amount = u64.toUsize(bitsOf(&function.*, right))
+      let producer = function.producerOf(left)
+      if producer != usize.MAX {
+        let first = operandAt(&function.*, producer, usize.ZERO)
+        let second = operandAt(&function.*, producer, usize.ONE)
+        match function.instruction(producer).operation {
+          // Fields packed into one integer: the shift drops the low one, so only the other
+          // operand is left to shift.
+          Operation.Binary {operation: Binary.Or} => {
+            let mut rest = none()
+            if activeBits(&function.*, first) <= amount { rest = second } else if activeBits(&function.*, second) <= amount { rest = first }
+            if rest != none() {
+              function.setOperand(instruction, usize.ZERO, rest)
+              return run binary(&mut function.*, instruction, kind, operation, rest, right)
+            }
+          }
+          // A shift left and back right by the same amount keeps a value that fits below it.
+          Operation.Binary {operation: Binary.Shl} => {
+            if second == right && activeBits(&function.*, first) + amount <= kind.bits { return to(first) }
+          }
+          _ => {}
+        }
+      }
+    }
   } else if operation == Binary.And {
     if isZero(&function.*, right) || isAllOnes(&function.*, left) { return to(right) }
     if isZero(&function.*, left) || isAllOnes(&function.*, right) || left == right { return to(left) }
@@ -212,6 +398,20 @@ effect fn binary(function: &mut SsaFunction, kind: Kind, operation: Binary, left
     if isZero(&function.*, right) { return to(left) }
     if isZero(&function.*, left) { return to(right) }
     if left == right { return to(run function.constant(kind, 0)) }
+    // Flipping every bit twice gives the value back.
+    if isAllOnes(&function.*, right) || isAllOnes(&function.*, left) {
+      let mut flipped = left
+      if isAllOnes(&function.*, left) { flipped = right }
+      let producer = function.producerOf(flipped)
+      if producer != usize.MAX {
+        if let Operation.Binary {operation: Binary.Xor} = function.instruction(producer).operation {
+          let first = operandAt(&function.*, producer, usize.ZERO)
+          let second = operandAt(&function.*, producer, usize.ONE)
+          if isAllOnes(&function.*, second) { return to(first) }
+          if isAllOnes(&function.*, first) { return to(second) }
+        }
+      }
+    }
   }
   return kept()
 }
@@ -261,7 +461,23 @@ pub fn isIntegerPredicate(predicate: Predicate) -> bool {
   }
 }
 
-effect fn comparison(function: &mut SsaFunction, kind: Kind, predicate: Predicate, left: u64, right: u64) -> Folded ! OutOfMemoryError ? &mut Allocator {
+// The flag `value` is, or widens with zeros; `none()` for any other value.
+fn flagBehind(function: &SsaFunction, value: u64) -> u64 {
+  let kind = function.kindOf(value)
+  if kind.isVector() || !kind.isInteger() { return none() }
+  if kind.bits == usize.ONE { return value }
+  let producer = function.producerOf(value)
+  if producer == usize.MAX { return none() }
+  if let Operation.Cast {operation} = function.instruction(producer).operation {
+    let original = operandAt(function, producer, usize.ZERO)
+    let from = function.kindOf(original)
+    if operation == Cast.ZExt && from.isInteger() && !from.isVector() && from.bits == usize.ONE { return original }
+  }
+  return none()
+}
+
+effect fn comparison(function: &mut SsaFunction, instruction: usize, kind: Kind, predicate: Predicate, left: u64, right: u64) -> Folded
+! OutOfMemoryError ? &mut Allocator {
   if !isIntegerPredicate(predicate) || function.kindOf(left).isFloat() { return kept() }
   if small(&function.*, left) && small(&function.*, right) {
     let bits = function.kindOf(left).bits
@@ -274,6 +490,27 @@ effect fn comparison(function: &mut SsaFunction, kind: Kind, predicate: Predicat
       return to(run function.constant(kind, 1))
     }
     return to(run function.constant(kind, 0))
+  }
+  // A flag, or one widened with zeros, that equals one or differs from zero is the flag itself;
+  // one that equals zero or differs from one is its negation.
+  if (predicate == Predicate.Eq || predicate == Predicate.Ne) && !kind.isVector() {
+    let mut flag = none()
+    let mut constant = none()
+    if small(&function.*, right) {
+      flag = flagBehind(&function.*, left)
+      constant = right
+    } else if small(&function.*, left) {
+      flag = flagBehind(&function.*, right)
+      constant = left
+    }
+    if flag != none() && bitsOf(&function.*, constant) <= 1 {
+      if (bitsOf(&function.*, constant) == 1) == (predicate == Predicate.Eq) { return to(flag) }
+      let set = run function.flag(true)
+      function.setOperation(instruction, Operation.Binary {operation: Binary.Xor})
+      function.setOperand(instruction, usize.ZERO, flag)
+      function.setOperand(instruction, usize.ONE, set)
+      return kept()
+    }
   }
   // Nothing is unsigned below zero.
   if function.kindOf(left).isInteger() {
@@ -318,6 +555,20 @@ effect fn conversion(function: &mut SsaFunction, instruction: usize, kind: Kind,
   }
   let producer = function.producerOf(value)
   if producer == usize.MAX { return kept() }
+  if operation == Cast.Trunc && kind.isInteger() && !kind.isVector() && !source.isVector() {
+    // Fields packed into one integer: the truncation keeps the low one, so an operand whose bits
+    // are all above it adds nothing.
+    if let Operation.Binary {operation: Binary.Or} = function.instruction(producer).operation {
+      let first = operandAt(&function.*, producer, usize.ZERO)
+      let second = operandAt(&function.*, producer, usize.ONE)
+      let mut low = none()
+      if lowZeros(&function.*, second) >= kind.bits { low = first } else if lowZeros(&function.*, first) >= kind.bits { low = second }
+      if low != none() {
+        function.setOperand(instruction, usize.ZERO, low)
+        return run conversion(&mut function.*, instruction, kind, operation, low)
+      }
+    }
+  }
   let inner = match function.instruction(producer).operation {
     Operation.Cast {operation: first} => first
     _ => { return kept() }
@@ -330,6 +581,14 @@ effect fn conversion(function: &mut SsaFunction, instruction: usize, kind: Kind,
     if operation == Cast.Bitcast && inner == Cast.Bitcast { return to(original) }
     if operation == Cast.PtrToInt && inner == Cast.IntToPtr && originalKind.bits == function.addressBits { return to(original) }
     if operation == Cast.IntToPtr && inner == Cast.PtrToInt && function.kindOf(value).bits == function.addressBits { return to(original) }
+  }
+  // A truncation of an extension is the extension to the narrower kind, or a truncation of the
+  // original when it is the wider.
+  if operation == Cast.Trunc && (inner == Cast.ZExt || inner == Cast.SExt) && originalKind.isInteger() && !originalKind.isVector()
+    && kind.isInteger() && !kind.isVector() {
+    function.setOperand(instruction, usize.ZERO, original)
+    if originalKind.bits < kind.bits { function.setOperation(instruction, Operation.Cast {operation: inner}) }
+    return kept()
   }
   // Extensions and truncations that compose into one.
   let both = (operation == Cast.ZExt && inner == Cast.ZExt) || (operation == Cast.SExt && inner == Cast.SExt) || (operation == Cast.Trunc && inner == Cast.Trunc)
