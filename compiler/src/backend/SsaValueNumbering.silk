@@ -44,6 +44,7 @@ import backend.SsaFunction {
   Cast,
   Edge,
   Exit,
+  Kind,
   Operation,
   Predicate,
   SsaFunction,
@@ -52,6 +53,7 @@ import backend.SsaFunction {
 }
 import backend.SsaGraph {SsaGraph}
 import backend.SsaInduction
+import backend.SsaMemory
 import backend.SsaInduction {Counter, incrementOf}
 import silk.collections.list {List}
 import silk.core.option {Option}
@@ -98,6 +100,9 @@ struct Numbering {
   // The value each value equals in the blocks the walk is in, by value, or `none()`.
   known: List<u64>,
   knownLog: List<Known>,
+  escaped: List<bool>,
+  // Indexed bases with neighbors at a negative displacement.
+  biased: List<bool>,
   facts: List<Fact>,
   buckets: List<usize>,
   entries: List<Entry>,
@@ -112,11 +117,28 @@ pub effect fn number(function: &mut SsaFunction) -> bool ! OutOfMemoryError ? &m
   let graph = run SsaGraph.of(&function.*)
   let mut size: usize = 16
   while size < function.instructionCount() * 2 { size = size * 2 }
-  let mut state = Numbering {substitution: List<u64>.make(), known: List<u64>.make(), knownLog: List<Known>.make(), facts: List<Fact>.make(),
+  let mut state = Numbering {substitution: List<u64>.make(), known: List<u64>.make(), knownLog: List<Known>.make(), escaped: List<bool>.make(), biased: List<bool>.make(), facts: List<Fact>.make(),
     buckets: List<usize>.make(), entries: List<Entry>.make(), trueFlag: none(), falseFlag: none(), changed: false}
   run List<usize>.appendRepeated(&mut state.buckets, usize.MAX, size)
   run List<u64>.appendRepeated(&mut state.substitution, none(), function.valueCount())
   run List<u64>.appendRepeated(&mut state.known, none(), function.valueCount())
+  let mut id = usize.ZERO
+  while id < function.instructionCount() {
+    if function.instruction(id).removed { id = id + usize.ONE continue }
+    if let Operation.Offset {offset} = function.instruction(id).operation {
+      if masked(offset, function.addressBits) > u64.shiftRight(masked(u64.MAX, function.addressBits), 1) {
+        let base = function.operandsOf(id)[usize.ZERO]
+        let producer = function.producerOf(base)
+        if producer != usize.MAX {
+          if let Operation.Index = function.instruction(producer).operation {
+            if List<bool>.length(&state.biased) == usize.ZERO { run List<bool>.appendRepeated(&mut state.biased, false, function.valueCount()) }
+            List<bool>.set(&mut state.biased, u64.toUsize(base), true)
+          }
+        }
+      }
+    }
+    id = id + usize.ONE
+  }
   // Entries: a block to enter, or `usize.MAX - n` to leave the n-th mark.
   let mut marks = List<usize>.make()
   let mut walk = List<usize>.make()
@@ -141,6 +163,7 @@ pub effect fn number(function: &mut SsaFunction) -> bool ! OutOfMemoryError ? &m
     }
     run learnFromPredecessor(&mut state, &mut function.*, &graph, block)
     run visitBlock(&mut state, &mut function.*, block)
+    run selectPrivateStore(&mut state, &mut function.*, &graph, block)
     run hoistShared(&mut state, &mut function.*, &graph, block)
     let children = graph.childrenOf(block)
     let mut child = children.length
@@ -151,6 +174,76 @@ pub effect fn number(function: &mut SsaFunction) -> bool ! OutOfMemoryError ? &m
   }
   function.sweep()
   return state.changed
+}
+
+// Replace a guarded update of a private array element with a select and store.
+// The immediately preceding load supplies the value to store when the update is
+// skipped. Check the entire byte range and exclude escaped slots: a newly
+// executed store must not be observable through an alias on another thread.
+effect fn selectPrivateStore(state: &mut Numbering, function: &mut SsaFunction, graph: &SsaGraph, block: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let head = function.block(block)
+  if head.exit != Exit.Branch || function.isConstant(head.value) { return () }
+  let listed = List<usize>.asSlice(&head.instructions)
+  if listed.length < 2 { return () }
+  let test = listed[listed.length - usize.ONE]
+  let load = listed[listed.length - 2]
+  let cond = head.value
+  if function.producerOf(cond) != test { return () }
+  if let Operation.Compare {..} = function.instruction(test).operation {} else { return () }
+  let aligned = match function.instruction(load).operation {
+    Operation.Load {offset, alignment} => { if offset != 0 { return () } alignment }
+    _ => { return () }
+  }
+  let original = function.instruction(load).result
+  let kind = function.kindOf(original)
+  if !kind.isInteger() || kind.isVector() || kind.bits != kind.storeSize() * 8 { return () }
+  let target = function.operandsOf(load)[usize.ZERO]
+  let producer = function.producerOf(target)
+  if producer == usize.MAX { return () }
+  if let Operation.Index = function.instruction(producer).operation {} else { return () }
+  let indexed = function.operandsOf(producer)
+  if function.kindOf(indexed[usize.ONE]).bits != function.addressBits { return () }
+  let base = function.producerOf(indexed[usize.ZERO])
+  if base == usize.MAX { return () }
+  let slot = match function.instruction(base).operation { Operation.SlotAddress {slot: which} => which _ => { return () } }
+  let edges = List<Edge>.asSlice(&head.edges)
+  let mut arm = usize.ZERO
+  while arm < 2 {
+    let side = arm
+    arm = arm + usize.ONE
+    let writes = edges[side].block
+    let next = edges[usize.ONE - side].block
+    let path = function.block(writes)
+    if writes == next || writes == block || graph.predecessorsOf(writes).length != usize.ONE || path.exit != Exit.Jump
+      || List<u64>.length(&path.parameters) != usize.ZERO || List<usize>.length(&path.instructions) != usize.ONE { continue }
+    let out = List<Edge>.asSlice(&path.edges)
+    if out[usize.ZERO].block != next || List<u64>.length(&function.block(next).parameters) != usize.ZERO { continue }
+    let store = List<usize>.get(&path.instructions, usize.ZERO)
+    if let Operation.Store {offset, ..} = function.instruction(store).operation { if offset != 0 { continue } } else { continue }
+    let args = function.operandsOf(store)
+    let value = args[usize.ZERO]
+    if args[usize.ONE] != target || !function.kindOf(value).equals(kind) { continue }
+    let compare = function.operandsOf(test)
+    if !(compare[usize.ZERO] == value && compare[usize.ONE] == original) && !(compare[usize.ONE] == value && compare[usize.ZERO] == original) { continue }
+    let bytes = function.slot(slot).size
+    let width = usize.toU64(kind.storeSize())
+    let bounds = rangeOf(&state.*, &function.*, indexed[usize.ONE], rangeDepth())
+    if width > bytes || bounds.high > bytes - width { return () }
+    if List<bool>.length(&state.escaped) == usize.ZERO { state.escaped = run SsaMemory.escapedSlots(&function.*) }
+    if List<bool>.get(&state.escaped, slot) { return () }
+    let at = listed.length
+    let place = function.instruction(store).place
+    let mut yes = value
+    let mut no = original
+    if side == usize.ONE { yes = original no = value }
+    let result = run function.insertInstruction(block, at, Operation.Select, kind, &[cond, yes, no], place)
+    drop run function.insertInstruction(block, at + usize.ONE, Operation.Store {offset: 0, alignment: aligned}, Kind.unit(), &[result, target], place)
+    let skip = run flagOf(&mut state.*, &mut function.*, side == usize.ONE)
+    function.setExitValue(block, skip)
+    state.changed = true
+    return ()
+  }
+  return ()
 }
 
 // Moves to the end of `block`, which the walk has just numbered, the instructions of the two
@@ -440,8 +533,14 @@ effect fn foldIndexedAccess(state: &mut Numbering, function: &mut SsaFunction, b
   let pointer = function.operandsOf(instruction)[operand]
   let moved = function.producerOf(pointer)
   if moved == usize.MAX { return usize.ZERO }
-  let delta = match function.instruction(moved).operation { Operation.Offset {offset} => offset _ => { return usize.ZERO } }
-  let base = function.operandsOf(moved)[usize.ZERO]
+  let mut delta: u64 = 0
+  let mut base = pointer
+  if let Operation.Offset {offset} = function.instruction(moved).operation {
+    delta = offset
+    base = function.operandsOf(moved)[usize.ZERO]
+  }
+  let biased = u64.toUsize(base) < List<bool>.length(&state.biased) && List<bool>.get(&state.biased, u64.toUsize(base))
+  if delta == 0 && !biased { return usize.ZERO }
   let index = function.producerOf(base)
   if index == usize.MAX { return usize.ZERO }
   if let Operation.Index = function.instruction(index).operation {} else { return usize.ZERO }
@@ -459,7 +558,7 @@ effect fn foldIndexedAccess(state: &mut Numbering, function: &mut SsaFunction, b
   let mut added = usize.ZERO
   let mut address = base
   let mut immediate = delta
-  if delta > low {
+  if delta > low || (biased && bounds.low != 0) {
     if low == 0 { return usize.ZERO }
     let back = masked(u64.wrappingSubtract(0, bounds.low), function.addressBits)
     let pointerKind = function.kindOf(base)
@@ -467,6 +566,7 @@ effect fn foldIndexedAccess(state: &mut Numbering, function: &mut SsaFunction, b
     added = usize.ONE
     immediate = low
   }
+  if address == pointer && immediate == 0 { return usize.ZERO }
   function.setOperand(instruction, operand, address)
   if operand == usize.ZERO { function.setOperation(instruction, Operation.Load {offset: immediate, alignment: alignment}) }
   else { function.setOperation(instruction, Operation.Store {offset: immediate, alignment: alignment}) }
