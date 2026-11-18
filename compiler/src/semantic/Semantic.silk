@@ -2722,6 +2722,8 @@ struct BodySourceSnapshot {
 struct Resolver {
   erasures: ErasureIndex,
   erasureDispatchers: List<DiscoveryDispatch>,
+  checkingMembers: bool,
+  checkMemberSets: List<List<ErasureFact>>,
   effectDispatchers: List<ErasedRecursion.Operation>,
   erasureRound: ErasureRound,
   membershipInputs: List<usize>,
@@ -5779,6 +5781,8 @@ effect fn internErasedStructure(resolver: &mut Resolver, ty: &Interned<Type>) ->
 // which code runs (IMPL-007), so no lowering depends on a pattern's regions.
 struct BackendInstance {
   key: InstanceKey,
+  // A declaration check's immutable member set, or the artifact's current closure.
+  checkSet: usize,
   observing: bool,
   suspension: Option<CoroutineFacts>,
   // Whether this is the instance's un-inlined MIR, which an inlining caller reads. It inlines
@@ -5817,6 +5821,7 @@ effect fn internBackendVariant(resolver: &mut Resolver, instance: &InstanceKey, 
 ? &mut Allocator {
   // Only suspension structure affects pre-inlining MIR. The inline candidates belong to
   // the ordinary variant, so self reads and callers share one raw variant for that structure.
+  let checkSet = run checkedSetFor(&resolver.*, instance)
   let mut canonical = run copySuspension(suspension)
   if raw {
     if let Option<CoroutineFacts>.Some {value} = &mut canonical { value.inline = List<InstanceKey>.make() }
@@ -5826,14 +5831,14 @@ effect fn internBackendVariant(resolver: &mut Resolver, instance: &InstanceKey, 
   let mut at = InternIndex.first(&resolver.backendInstanceLookup, hashed)
   while at != usize.MAX {
     let sameVariant = run sameSuspension(&known[at].suspension, &canonical)
-    if sameVariant && known[at].observing == observing && known[at].raw == raw && run InstanceKey.sameInstance(&known[at].key, instance) {
+    if sameVariant && known[at].checkSet == checkSet && known[at].observing == observing && known[at].raw == raw && run InstanceKey.sameInstance(&known[at].key, instance) {
       return at
     }
     at = InternIndex.after(&resolver.backendInstanceLookup, at)
   }
   let interned = known.length
   run List<BackendInstance>.append(&mut resolver.*.backendInstances,
-    BackendInstance {key: InstanceKey.copy(instance), observing: observing, suspension: move canonical, raw: raw})
+    BackendInstance {key: InstanceKey.copy(instance), checkSet: checkSet, observing: observing, suspension: move canonical, raw: raw})
   run InternIndex.record(&mut resolver.backendInstanceLookup, hashed)
   return interned
 }
@@ -5850,6 +5855,7 @@ effect fn exactBackendVariant(resolver: &mut Resolver, instance: &InstanceKey, o
 ? &mut Allocator {
   // Only suspension structure affects pre-inlining MIR. The inline candidates belong to
   // the ordinary variant, so self reads and callers share one raw variant for that structure.
+  let checkSet = run checkedSetFor(&resolver.*, instance)
   let mut canonical = run copySuspension(suspension)
   if raw {
     if let Option<CoroutineFacts>.Some {value} = &mut canonical { value.inline = List<InstanceKey>.make() }
@@ -5859,14 +5865,14 @@ effect fn exactBackendVariant(resolver: &mut Resolver, instance: &InstanceKey, o
   let mut at = InternIndex.first(&resolver.backendInstanceLookup, hashed)
   while at != usize.MAX {
     let sameVariant = run sameSuspension(&known[at].suspension, &canonical)
-    if sameVariant && known[at].observing == observing && known[at].raw == raw && run InstanceKey.sameApplication(&known[at].key, instance) {
+    if sameVariant && known[at].checkSet == checkSet && known[at].observing == observing && known[at].raw == raw && run InstanceKey.sameApplication(&known[at].key, instance) {
       return at
     }
     at = InternIndex.after(&resolver.backendInstanceLookup, at)
   }
   let interned = known.length
   run List<BackendInstance>.append(&mut resolver.*.backendInstances,
-    BackendInstance {key: InstanceKey.copy(instance), observing: observing, suspension: move canonical, raw: raw})
+    BackendInstance {key: InstanceKey.copy(instance), checkSet: checkSet, observing: observing, suspension: move canonical, raw: raw})
   run InternIndex.record(&mut resolver.backendInstanceLookup, hashed)
   return interned
 }
@@ -7301,20 +7307,14 @@ effect fn recordMembership(resolver: &mut Resolver, instance: &InstanceKey) -> (
 
 // A second artifact can be built in the same source revision with different roots. Give
 // changed membership observations a fresh revision before invalidating their consumers.
-effect fn reconcileMembership(resolver: &mut Resolver, declarationCheck: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn reconcileMembership(resolver: &mut Resolver) -> () ! OutOfMemoryError ? &mut Allocator {
   let observed = List<usize>.asSlice(&resolver.membershipInputs)
   let mut advanced = false
   let mut at = usize.ZERO
   while at < observed.length {
     let input = &mut List<Inputs.Input>.asMutSlice(&mut resolver.sourceInputs.inputs)[observed[at]]
     if let SourceSelector.ErasureMembers {contract} = &input.selector {
-      let snapshot = if declarationCheck { ErasureIndex.reachedSnapshot(&resolver.erasures, Bytes.asSlice(&contract)) }
-        else { ErasureIndex.snapshot(&resolver.erasures, Bytes.asSlice(&contract)) }
-      // A declaration's closure covers what its roots reach. Another declaration may still have
-      // a current proof for a contract this one never uses. A reached zero-member contract has
-      // a nonempty frozen encoding and must invalidate an earlier nonempty membership.
-      if declarationCheck && snapshot.length == usize.ZERO { at = at + usize.ONE continue }
-      let digest = ContentHash.of(snapshot)
+      let digest = ContentHash.of(ErasureIndex.snapshot(&resolver.erasures, Bytes.asSlice(&contract)))
       if !Inputs.unchanged(&input.*, digest) {
         if !advanced { Graph.beginRevision(&mut resolver.graph) advanced = true }
         run Graph.inputChanged(&mut resolver.graph, observed[at], input.module)
@@ -80820,10 +80820,61 @@ struct DispatchTarget {
 // providers and member set share this answer. Only final dispatcher MIR enters ordinary queries.
 struct DiscoveryDispatch {
   instance: InstanceKey,
+  checkSet: usize,
   call: RelatedSite,
   contract: usize,
   count: usize,
   mir: Shared<Result<Answer, NoRejection>>,
+}
+
+// Declaration roots can legitimately close one contract over different concrete members.
+// Retain one MIR variant per exact set, including the provenance of its admissions. Switching
+// declarations then preserves the results and dependency edges of the other roots.
+fn sameCheckMembers(left: &[ErasureFact], right: &[ErasureFact]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    let a = &left[at]
+    let b = &right[at]
+    if !Interned<Type>.same(&a.source, &b.source) || !Interned<Type>.same(&a.target, &b.target)
+      || !Interned<DeclarationId>.same(&a.owner, &b.owner) || a.origin.node != b.origin.node
+      || a.origin.location.start != b.origin.location.start || a.origin.location.end != b.origin.location.end { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+effect fn internCheckMembers(sets: &mut List<List<ErasureFact>>, facts: &[ErasureFact]) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let listed = List<List<ErasureFact>>.asSlice(&sets.*)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if sameCheckMembers(List<ErasureFact>.asSlice(&listed[at]), facts) { return at }
+    at = at + usize.ONE
+  }
+  let mut kept = List<ErasureFact>.make()
+  run ErasureFact.appendTo(facts, &mut kept)
+  run List<List<ErasureFact>>.append(&mut sets.*, move kept)
+  return at
+}
+
+effect fn checkedSetFor(resolver: &Resolver, instance: &InstanceKey) -> usize ! OutOfMemoryError ? &mut Allocator {
+  if !resolver.checkingMembers || operationDispatch(instance) != OperationDispatch.Erased { return usize.MAX }
+  let sites = List<DiscoveryDispatch>.asSlice(&resolver.erasureDispatchers)
+  let mut at = usize.ZERO
+  while at < sites.length {
+    if run InstanceKey.sameInstance(instance, &sites[at].instance) { return sites[at].checkSet }
+    at = at + usize.ONE
+  }
+  return usize.MAX
+}
+
+effect fn dispatchMembers(resolver: &Resolver, key: Key, provider: &Interned<Type>) -> List<ErasureFact>
+  ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let set = List<BackendInstance>.asSlice(&resolver.backendInstances)[key.name].checkSet
+  if set == usize.MAX { return run ErasureIndex.members(&resolver.erasures, provider) }
+  let mut facts = List<ErasureFact>.make()
+  run ErasureFact.appendTo(List<ErasureFact>.asSlice(&List<List<ErasureFact>>.asSlice(&resolver.checkMemberSets)[set]), &mut facts)
+  return move facts
 }
 
 effect fn discoveryDispatcher(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, key: Key, instance: &InstanceKey, caller: &ModuleId, span: Span, positionOut: &mut usize)
@@ -80849,7 +80900,7 @@ effect fn discoveryDispatcher(resolver: &mut Resolver, owner: &mut Query<Answer,
   let identity = InstanceKey.identity(instance)
   let answer = run resolveUnionDispatchMir(&mut resolver.*, &mut owner.*, key, InstanceKey.copy(instance), &identity, false)
   let mir = run Shared<Result<Answer, NoRejection>>.make(Result<Answer, NoRejection>.succeed(move answer))
-  let result = DiscoveryDispatch {instance: InstanceKey.copy(instance), call: RelatedSite {module: ModuleId.copy(caller), span: span}, contract: position, count: count,
+  let result = DiscoveryDispatch {instance: InstanceKey.copy(instance), checkSet: usize.MAX, call: RelatedSite {module: ModuleId.copy(caller), span: span}, contract: position, count: count,
     mir: Shared<Result<Answer, NoRejection>>.clone(&mir)}
   if at == List<DiscoveryDispatch>.length(&resolver.erasureDispatchers) { run List<DiscoveryDispatch>.append(&mut resolver.erasureDispatchers, move result) }
   else { List<DiscoveryDispatch>.set(&mut resolver.erasureDispatchers, at, move result) }
@@ -80963,10 +81014,10 @@ effect fn resolveUnionDispatchMir(resolver: &mut Resolver, owner: &mut Query<Ans
   // Tags number the canonical physical members.
   let promised = run operationNonParking(&mut resolver.*, &operation)
   let erased = Interned<Type>.with<bool>(&provider, Type.isErased)
-  let checkCycles = erased && !resolver.closedErasures && Shared<Result<Answer, NoRejection>>.with<bool>(&signature, signatureIsEffect)
+  let checkCycles = erased && !resolver.closedErasures && List<BackendInstance>.asSlice(&resolver.backendInstances)[key.name].checkSet == usize.MAX && Shared<Result<Answer, NoRejection>>.with<bool>(&signature, signatureIsEffect)
   let mut conversions = List<ErasureFact>.make()
   let members = if erased {
-    let facts = run ErasureIndex.members(&resolver.erasures, &provider)
+    let facts = run dispatchMembers(&resolver.*, key, &provider)
     let mut types = List<Interned<Type>>.make()
     let mut encodings = List<Bytes>.make()
     let sites = List<ErasureFact>.asSlice(&facts)
@@ -81081,7 +81132,7 @@ effect fn resolveUnionDispatchMir(resolver: &mut Resolver, owner: &mut Query<Ans
         if erased && reason == CanonicalizationFailure.Resource {
           // A witness can convert a larger instantiation of its own receiver in each round.
           // Identify the conversion that exhausted the existing specialization budget.
-          let facts = run ErasureIndex.members(&resolver.erasures, &provider)
+          let facts = run dispatchMembers(&resolver.*, key, &provider)
           let sites = List<ErasureFact>.asSlice(&facts)
           let mut site = usize.ZERO
           while site < sites.length {
@@ -82024,8 +82075,9 @@ effect fn lowerMir(
     }
   }
   let dispatch = operationDispatch(&instance)
-  if dispatch == OperationDispatch.Erased { run recordMembership(&mut resolver.*, &instance) }
-  if dispatch == OperationDispatch.Erased && !resolver.closedErasures {
+  let mutableMembers = dispatch == OperationDispatch.Erased && List<BackendInstance>.asSlice(&resolver.backendInstances)[key.name].checkSet == usize.MAX
+  if mutableMembers { run recordMembership(&mut resolver.*, &instance) }
+  if mutableMembers && !resolver.closedErasures {
     return memberSuccess(run dispatchGap(GapCode.WitnessOperand, &identity), List<Dependency>.make())
   }
   if dispatch == OperationDispatch.Union || dispatch == OperationDispatch.Erased {
@@ -96676,7 +96728,7 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
   }
   return Semantic {
     resolver: Resolver {
-      erasures: ErasureIndex.make(), erasureRound: ErasureRound.make(), membershipInputs: List<usize>.make(), erasureDispatchers: List<DiscoveryDispatch>.make(), effectDispatchers: List<ErasedRecursion.Operation>.make(), writtenErasure: false, typeErasure: ErasedTypeMemo.make(), closedErasures: false,
+      erasures: ErasureIndex.make(), erasureRound: ErasureRound.make(), membershipInputs: List<usize>.make(), erasureDispatchers: List<DiscoveryDispatch>.make(), checkingMembers: false, checkMemberSets: List<List<ErasureFact>>.make(), effectDispatchers: List<ErasedRecursion.Operation>.make(), writtenErasure: false, typeErasure: ErasedTypeMemo.make(), closedErasures: false,
       staticDemandDepth: usize.ZERO,
       staticDemandLimit: usize.MAX,
       staticResultsInFlight: List<usize>.make(),
@@ -97749,10 +97801,13 @@ impl Semantic {
       // An escape record and its entries hold no position either: an entry keeps its summary's
       // digest and the exact keys it reaches, and a replay finds every site from the anchors of
       // the source it reads now.
-      if kind == 3 || kind == 4 {
+      if kind == 3 || kind == 4 || kind == 7 {
+        // A cached check can precede the first parse of the dependency that writes the erased
+        // type. Its immutable MIR variants still require discovery in this store.
+        if kind == 7 { self.resolver.writtenErasure = true }
         if (node != usize.MAX || List<bool>.get(&settled, root.node)) && !linked {
           let named = StableKey.view(Bytes.asSlice(&root.key), exact)
-          if kind == 3 {
+          if kind == 3 || kind == 7 {
             run List<EscapeRecordRoot>.append(&mut self.escapeImage.records, EscapeRecordRoot {unit: exact, root: at - usize.ONE})
           } else if run DigestSet.add(&mut self.escapeImage.entries, digestOfBytes(named)) {
             run List<usize>.append(&mut self.escapeImage.roots, at - usize.ONE)
@@ -100221,6 +100276,7 @@ impl Semantic {
   effect fn closeErasures(self: &mut Self, module: &ModuleId, runtimeSelected: bool, roots: &[BuildRoot], origin: Span,
     closureNodes: usize, declarationCheck: bool) -> Option<BackendBuild> ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
     ? &mut Allocator | &mut Types {
+    self.resolver.checkingMembers = false
     self.resolver.erasures = ErasureIndex.make()
     self.resolver.closedErasures = false
     self.resolver.erasureDispatchers = List<DiscoveryDispatch>.make()
@@ -100268,11 +100324,21 @@ impl Semantic {
       }
     }
     self.resolver.erasureRound = ErasureRound.make()
-    self.resolver.erasureDispatchers = List<DiscoveryDispatch>.make()
     self.resolver.effectDispatchers = List<ErasedRecursion.Operation>.make()
     run ErasureIndex.freeze(&mut self.resolver.erasures)
     self.resolver.closedErasures = true
-    run reconcileMembership(&mut self.resolver, declarationCheck)
+    if declarationCheck {
+      let sites = List<DiscoveryDispatch>.asMutSlice(&mut self.resolver.erasureDispatchers)
+      let mut at = usize.ZERO
+      while at < sites.length {
+        sites[at].checkSet = run internCheckMembers(&mut self.resolver.checkMemberSets, ErasureIndex.factsAt(&self.resolver.erasures, sites[at].contract))
+        at = at + usize.ONE
+      }
+      self.resolver.checkingMembers = sites.length != usize.ZERO
+    } else {
+      self.resolver.erasureDispatchers = List<DiscoveryDispatch>.make()
+      run reconcileMembership(&mut self.resolver)
+    }
     return Option<BackendBuild>.none()
   }
 
@@ -102514,6 +102580,7 @@ impl Semantic {
     rootPackage: &[ModuleId], checked: &[ModuleId], closureNodes: usize) -> BackendBuild
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
   ? &mut Allocator | &mut Types {
+    self.resolver.checkingMembers = false
     run selectRequest(&mut self.resolver, &request.*)
     if self.resolver.costs.enabled {
       self.resolver.costs.root = List<ModuleId>.make()
@@ -102725,7 +102792,7 @@ impl Semantic {
         List<BuildRoot>.asSlice(&roots), origin, closureNodes, false) { return move refused }
     } else if self.resolver.closedErasures {
       self.resolver.erasures = ErasureIndex.make()
-      run reconcileMembership(&mut self.resolver, false)
+      run reconcileMembership(&mut self.resolver)
     }
     // A revisable store that read a build record replays it; anything it cannot replay walks.
     // A record whose walk an edit changed is walked again from its entries (`rewalkBuild`).
@@ -109480,15 +109547,16 @@ effect fn imageEscapeRecord(resolver: &Resolver, build: &mut ImageBuild, capture
     if guardNode < unfit() { node = run CacheImage.addNode(&mut build.image, &[CacheImage.nodeEdge(guardNode)]) }
   }
   if node != usize.MAX {
-    run List<CacheImage.Root>.append(&mut build.image.roots, CacheImage.Root {key: run escapeRecordKey(unit), node: node,
+    run List<CacheImage.Root>.append(&mut build.image.roots, CacheImage.Root {key: run escapeRecordKey(unit, List<List<ErasureFact>>.length(&resolver.checkMemberSets) != usize.ZERO), node: node,
       answer: run BuildRecord.encode(&captured.record)})
   }
 }
 
 // The stable key of the escape walk record of the check whose stable unit key is `unit`.
-effect fn escapeRecordKey(unit: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+effect fn escapeRecordKey(unit: &[u8], checkedMembers: bool) -> Bytes ! OutOfMemoryError ? &mut Allocator {
   let mut key = Bytes.make()
-  run RuntimeEncoding.field(&mut key, b"silk.escape.record")
+  if checkedMembers { run RuntimeEncoding.field(&mut key, b"silk.escape.dispatch-record") }
+  else { run RuntimeEncoding.field(&mut key, b"silk.escape.record") }
   run RuntimeEncoding.field(&mut key, unit)
   return move key
 }
@@ -109510,7 +109578,7 @@ effect fn rootsOfKinds(image: &CacheImage.Image, checks: bool) -> List<usize> ! 
   while at < roots.length {
     let mut exact = Span.make(usize.ZERO, usize.ZERO)
     let kind = buildRootKind(Bytes.asSlice(&roots[at].key), &mut exact)
-    if (checks && kind == 0) || kind == 3 || kind == 4 { run List<usize>.append(&mut kept, at) }
+    if (checks && kind == 0) || kind == 3 || kind == 4 || kind == 7 { run List<usize>.append(&mut kept, at) }
     at = at + usize.ONE
   }
   return move kept
@@ -109518,13 +109586,14 @@ effect fn rootsOfKinds(image: &CacheImage.Image, checks: bool) -> List<usize> ! 
 
 // What a cache image root's key names: a module check (0), the build record (1), a build entry's
 // definition (2), an escape walk record (3), an escape entry (4), a pack (5) or an inline
-// summary's fingerprint (6). For a build or escape entry, `exact` then spans its exact identity,
+// summary's fingerprint (6), or an escape record requiring dispatch discovery (7). For a build or escape entry, `exact` then spans its exact identity,
 // for an escape record its check's stable unit key, for a pack its digest, and for a summary the
 // identity `buildSummaryKey` writes.
 // The identity `buildRootKind` finds in a root key of kind `kind`; none for a key of another kind.
 fn rootIdentity<'a>(key: &'a [u8], kind: u64) -> Option<&'a [u8]> {
   let mut span = Span.make(usize.ZERO, usize.ZERO)
-  if buildRootKind(key, &mut span) != kind { return Option<&[u8]>.none() }
+  let found = buildRootKind(key, &mut span)
+  if found != kind && !(found == 7 && kind == 3) { return Option<&[u8]>.none() }
   return Option<&[u8]>.some(StableKey.view(key, span))
 }
 
@@ -109537,6 +109606,7 @@ fn buildRootKind(key: &[u8], exact: &mut Span) -> u64 {
   let mut kind: u64 = 0
   if same(name, b"silk.build.entry") { kind = 2 }
   if same(name, b"silk.escape.record") { kind = 3 }
+  if same(name, b"silk.escape.dispatch-record") { kind = 7 }
   if same(name, b"silk.escape.entry") { kind = 4 }
   if same(name, b"silk.build.pack") { kind = 5 }
   if same(name, b"silk.build.summary") { kind = 6 }
