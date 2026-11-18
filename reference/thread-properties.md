@@ -329,24 +329,26 @@ the pool can wait on.
 
 **Current compiler:** Aligned.
 
-## THREAD-009 — A multi-threaded wasm32 profile runs native threads through wasi-threads
+## THREAD-009 — A multi-threaded wasm32 compilation runs native threads through wasi-threads
 
 **Status:** Confirmed
 
-A project profile with `target = "wasm32-unknown-unknown"` and `threading = "multi"` compiles with
+A compilation with target `wasm32-unknown-unknown` and `Compilation.threading` set to `multi` compiles with
 atomics and bulk memory and links one shared memory that the module imports as `env.memory`, with
-`max-memory` as its maximum (1 GiB by default, PROFILE-001). `NativeThread.spawn` asks the host for a
+`Compilation.maxMemory` (`max-memory` in the request) as its maximum (1 GiB by default, PROFILE-001). `NativeThread.spawn` asks the host for a
 thread through the wasi-threads import `wasi.thread-spawn`; the host instantiates the same module
 on the same memory and calls its exported `wasi_thread_start`. The compiler's linked runtime gives
 each thread a 1 MiB stack from the allocator before the thread runs, and `JoinHandle.join` and
 `Atomic.wait` block with `memory.atomic.wait32`. `NativeThread.processorCount` asks the host
 through `silk.concurrency.thread-parallelism`.
 
+The resolved compilation request carries these fields:
+
 ```toml
-[profiles.web]
+[profile]
 target = "wasm32-unknown-unknown"
 threading = "multi"
-max-memory = "256MiB"
+max-memory = 268435456
 ```
 
 The standard library ships a host for Node and browsers in `stdlib/host/wasm-runner.mjs`.

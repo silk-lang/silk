@@ -1,0 +1,1145 @@
+//! Compilations as build steps that write explicit requests before invoking the compiler.
+
+import silk.build.embed as Embed
+import silk.build.package { Package }
+import silk.build.plan { Framework, Library }
+import silk.build.graph { Build, Built, BuildError }
+import silk.build.encoding as Encoding
+import silk.build.definition { Definition, Settings as Values, Package as PackageSettings }
+import silk.build.context as Context
+import silk.schema.schema { Dictionary, Schema }
+import silk.schema.json { SchemaJson }
+import silk.schema.toml { SchemaToml }
+import silk.build.setting as Settings { Setting, TextField, NumberField, ListField }
+import silk.build.options { Optimize, Options }
+import silk.build.write_files { WriteFiles }
+import silk.collections.list { List }
+import silk.build.request { Request, Platform, Windows, MacOS, Wasm, Runner }
+import silk.build.step { Deferred, Key, Make, Step, StepError, StepFailure, StepHandle }
+import silk.concurrency.sync { Mutex }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.core.effect { Effect }
+import silk.io.writer { Writer, WriterError }
+import silk.io.writer_native { StderrWriter }
+import silk.text.string { InvalidUtf8 }
+import silk.mem.allocator { Allocator }
+import silk.system.child_process { ChildProcess }
+import silk.system.filesystem { FileSystem, Path }
+import silk.system.host_input { HostInput }
+import silk.text.string { String }
+import silk.num.usize
+
+// A compilation as the compiler restores it: the definition and the settings still to apply.
+struct Description {
+  pub definition: Definition,
+  pub compiler: Deferred<Path>,
+  pub settings: List<Setting>,
+  pub memory: u64,
+  pub unsandboxedTools: bool,
+}
+
+impl Schema for Description {}
+
+struct State {
+  definition: Option<Definition>,
+  compiler: Option<Deferred<Path>>,
+  registered: Option<StepHandle>,
+  settings: List<Setting>,
+  memory: u64,
+  unsandboxedTools: bool,
+}
+
+/// A compilation whose settings freeze when its artifact is first used by the graph.
+pub struct Compilation {
+  state: Mutex<State>,
+}
+
+impl Compilation {
+  /// Applies `transform` when `condition` is true, returning the original value otherwise.
+  pub effect fn when<'env, E, ? R>(
+    self: Self,
+    condition: bool,
+    transform: once effect fn<'env>(Self) -> Self ! E ? R,
+  ) -> Self
+    ! E
+    ? R {
+    if condition {
+      return run transform(move self)
+    }
+    return move self
+  }
+
+  /// Creates a compilation from an explicit package definition and compiler. Resolution runs as a graph prerequisite.
+  pub effect fn fromDefinition(definition: Definition, compiler: Deferred<Path>) -> Self
+    ! StepFailure
+    ? &mut Allocator | &mut FileSystem {
+    return Compilation {
+      state: run Mutex<State>.make(
+        State {
+          definition: Option<Definition>.some(move definition),
+          compiler: Option<Deferred<Path>>.some(move compiler),
+          registered: Option<StepHandle>.none(),
+          settings: List<Setting>.make(),
+          memory: 3221225472,
+          unsandboxedTools: false,
+        },
+      ),
+    }
+  }
+
+  effect fn create(name: Option<String>, artifact: Option<String>, root: Option<String>) -> Self
+    ! StepFailure
+    ? &mut Allocator | &mut FileSystem | &mut HostInput {
+    let manifest = run Context.manifest()
+    let mut settings = Values.make()
+    if let Option<String>.Some { value } = move root {
+      let parent = match move run Path.parent(&manifest) {
+        Option<Path>.Some { value: directory } => move directory
+        Option<Path>.None => {
+          fail StepError { message: run String.copy("the package manifest has no directory") }
+        }
+      }
+      settings.root = Option<String>.some(
+        run Context.text(&run Context.path(&parent, value.view())),
+      )
+    }
+    let definition = Definition {
+      manifest: run Context.text(&manifest),
+      name: move name,
+      artifact: move artifact,
+      stdlib: run Context.standardLibrary(),
+      settings: move settings,
+      packages: Dictionary<PackageSettings>.make(),
+    }
+    return run Compilation.fromDefinition(move definition, run Context.compiler())
+  }
+
+  /// Uses the current package's default root and artifact with the command's options.
+  /// A compilation selects at most one target. Commands building several targets create one
+  /// compilation per target and add them to a Build.
+  pub effect fn fromPackage(options: &Options) -> Self
+    ! StepFailure
+    ? &mut Allocator | &mut FileSystem | &mut HostInput {
+    if options.target.length() > 1 {
+      fail StepError {
+        message: run String.copy(
+          "one compilation selects at most one target; add one compilation per target to Build",
+        ),
+      }
+    }
+    let mut compilation = run Compilation.create(
+      Option<String>.none(),
+      Option<String>.none(),
+      Option<String>.none(),
+    )
+    if options.target.length() == 1 {
+      let previous = move compilation
+      compilation = run previous.target(
+        run Deferred<String>.value(run String.copy(options.target.asSlice()[0].view())),
+      )
+    }
+    let selected = move compilation
+    let optimized = run selected.optimize(run Deferred<Optimize>.value(options.optimize))
+    let debugged = run optimized.debug(run Deferred<bool>.value(options.debugInfo()))
+    return run debugged.unsandboxedTools(options.unsandboxedTools)
+  }
+
+  /// Creates a program named `name` with `root` resolved against the package directory.
+  pub effect fn executable(name: string, root: string) -> Self
+    ! StepFailure
+    ? &mut Allocator | &mut FileSystem | &mut HostInput {
+    return run Compilation.create(
+      Option<String>.some(run String.copy(name)),
+      Option<String>.some(run String.copy("executable")),
+      Option<String>.some(run String.copy(root)),
+    )
+  }
+
+  /// Creates a loadable module named `name` with `root` resolved against the package directory.
+  pub effect fn loadableModule(name: string, root: string) -> Self
+    ! StepFailure
+    ? &mut Allocator | &mut FileSystem | &mut HostInput {
+    return run Compilation.create(
+      Option<String>.some(run String.copy(name)),
+      Option<String>.some(run String.copy("loadable-module")),
+      Option<String>.some(run String.copy(root)),
+    )
+  }
+
+  /// Creates a static archive named `name` with `root` resolved against the package directory.
+  pub effect fn staticArchive(name: string, root: string) -> Self
+    ! StepFailure
+    ? &mut Allocator | &mut FileSystem | &mut HostInput {
+    return run Compilation.create(
+      Option<String>.some(run String.copy(name)),
+      Option<String>.some(run String.copy("static-archive")),
+      Option<String>.some(run String.copy(root)),
+    )
+  }
+
+  /// Creates a relocatable object named `name` with `root` resolved against the package directory.
+  pub effect fn object(name: string, root: string) -> Self
+    ! StepFailure
+    ? &mut Allocator | &mut FileSystem | &mut HostInput {
+    return run Compilation.create(
+      Option<String>.some(run String.copy(name)),
+      Option<String>.some(run String.copy("object")),
+      Option<String>.some(run String.copy(root)),
+    )
+  }
+
+  /// Creates a test runner named `name` with `root` resolved against the package directory.
+  pub effect fn test(name: string, root: string) -> Self
+    ! StepFailure
+    ? &mut Allocator | &mut FileSystem | &mut HostInput {
+    return run Compilation.create(
+      Option<String>.some(run String.copy(name)),
+      Option<String>.some(run String.copy("test")),
+      Option<String>.some(run String.copy(root)),
+    )
+  }
+
+  effect fn setting(self: Self, setting: Setting) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    let mut held = self.state.lock()
+    if held.get().registered.isSome() {
+      fail StepError {
+        message: run String.copy("compilation settings are frozen after its artifact is used"),
+      }
+    }
+    let state = held.getMut()
+    let mut at: usize = 0
+    while at < state.settings.length() {
+      if Settings.replaces(&setting, &state.settings.asSlice()[at]) {
+        drop state.settings.remove(at)
+      } else {
+        at = at + 1
+      }
+    }
+    run state.settings.append(move setting)
+    drop held
+    return move self
+  }
+
+  /// Configures one declared dependency alias, or `self` for this package.
+  pub effect fn package(self: Self, alias: string, settings: Package) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(
+      Setting.Package { alias: run String.copy(alias), settings: move settings },
+    )
+  }
+
+  /// Removes a declared dependency from this compilation's available imports.
+  pub effect fn without(self: Self, alias: string) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.package(alias, Package.make().without())
+  }
+
+  /// Sets `target` from a declared deferred value.
+  pub effect fn target(self: Self, value: Deferred<String>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(Setting.Text { field: TextField.Target, value: move value })
+  }
+
+  /// Sets `cpu` from a declared deferred value.
+  pub effect fn cpu(self: Self, value: Deferred<String>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(Setting.Text { field: TextField.Cpu, value: move value })
+  }
+
+  /// Sets `deployment` from a declared deferred value.
+  pub effect fn deployment(self: Self, value: Deferred<String>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(Setting.Text { field: TextField.Deployment, value: move value })
+  }
+
+  /// Sets `libc` from a declared deferred value.
+  pub effect fn libc(self: Self, value: Deferred<String>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(Setting.Text { field: TextField.Libc, value: move value })
+  }
+
+  /// Sets `entry` from a declared deferred value.
+  pub effect fn entry(self: Self, value: Deferred<String>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(Setting.Text { field: TextField.Entry, value: move value })
+  }
+
+  /// Sets `runtime` from a declared deferred value.
+  pub effect fn runtime(self: Self, value: Deferred<String>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(Setting.Text { field: TextField.Runtime, value: move value })
+  }
+
+  /// Sets `link` from a declared deferred value.
+  pub effect fn link(self: Self, value: Deferred<String>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(Setting.Text { field: TextField.Link, value: move value })
+  }
+
+  /// Sets `codeModel` from a declared deferred value.
+  pub effect fn codeModel(self: Self, value: Deferred<String>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(Setting.Text { field: TextField.CodeModel, value: move value })
+  }
+
+  /// Sets `relocation` from a declared deferred value.
+  pub effect fn relocation(self: Self, value: Deferred<String>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(Setting.Text { field: TextField.Relocation, value: move value })
+  }
+
+  /// Sets `safety` from a declared deferred value.
+  pub effect fn safety(self: Self, value: Deferred<String>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(Setting.Text { field: TextField.Safety, value: move value })
+  }
+
+  /// Sets `threading` from a declared deferred value.
+  pub effect fn threading(self: Self, value: Deferred<String>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(Setting.Text { field: TextField.Threading, value: move value })
+  }
+
+  /// Sets `unwind` from a declared deferred value.
+  pub effect fn unwind(self: Self, value: Deferred<String>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(Setting.Text { field: TextField.Unwind, value: move value })
+  }
+
+  /// Sets `backend` from a declared deferred value.
+  pub effect fn backend(self: Self, value: Deferred<String>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(Setting.Text { field: TextField.Backend, value: move value })
+  }
+
+  /// Sets `codegenUnits` from a declared deferred value.
+  pub effect fn codegenUnits(self: Self, value: Deferred<u64>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(Setting.Number { field: NumberField.CodegenUnits, value: move value })
+  }
+
+  /// Sets `maxMemory` from a declared deferred value.
+  pub effect fn maxMemory(self: Self, value: Deferred<u64>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(Setting.Number { field: NumberField.MaxMemory, value: move value })
+  }
+
+  /// Sets `stackSize` from a declared deferred value.
+  pub effect fn stackSize(self: Self, value: Deferred<u64>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(Setting.Number { field: NumberField.StackSize, value: move value })
+  }
+
+  /// Sets `cpuFeatures` from a declared deferred value.
+  pub effect fn cpuFeatures(self: Self, value: Deferred<List<String>>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(Setting.Texts { field: ListField.CpuFeatures, value: move value })
+  }
+
+  /// Sets `sanitizers` from a declared deferred value.
+  pub effect fn sanitizers(self: Self, value: Deferred<List<String>>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(Setting.Texts { field: ListField.Sanitizers, value: move value })
+  }
+
+  /// Sets `optimize` from a declared deferred value.
+  pub effect fn optimize(self: Self, value: Deferred<Optimize>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(Setting.Optimization { value: move value })
+  }
+
+  /// Sets `debug` from a declared deferred value.
+  pub effect fn debug(self: Self, value: Deferred<bool>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(Setting.Debug { value: move value })
+  }
+
+  /// Selects the program and arguments used to launch this artifact or its tests.
+  /// WASI artifacts use `wasmtime run` when no runner is supplied.
+  pub effect fn runner(self: Self, value: Deferred<Runner>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(Setting.Runner { value: move value })
+  }
+
+  /// Selects a declared standard-library directory before resolution.
+  pub effect fn standardLibrary(self: Self, path: Deferred<Path>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(Setting.StandardLibrary { path: move path })
+  }
+
+  /// Selects the target sysroot, linker, and support installations.
+  pub effect fn platform(self: Self, value: Deferred<Platform>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(Setting.Platform { value: move value })
+  }
+
+  /// Selects Windows subsystem, resource, and manifest settings.
+  pub effect fn windows(self: Self, value: Deferred<Windows>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(Setting.Windows { value: move value })
+  }
+
+  /// Selects macOS installation, framework, and signing settings.
+  pub effect fn macos(self: Self, value: Deferred<MacOS>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(Setting.MacOS { value: move value })
+  }
+
+  /// Selects WebAssembly memory, execution, and component settings.
+  pub effect fn wasm(self: Self, value: Deferred<Wasm>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(Setting.Wasm { value: move value })
+  }
+
+  /// Requests a C header at an absolute output path.
+  pub effect fn header(self: Self, value: Deferred<String>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(Setting.Header { value: move value })
+  }
+
+  /// Requests an import library at an absolute output path.
+  pub effect fn importLibrary(self: Self, value: Deferred<String>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(Setting.ImportLibrary { value: move value })
+  }
+
+  /// Sets `emit` from a declared deferred value.
+  pub effect fn emit(self: Self, value: Deferred<String>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(Setting.Emit { value: move value })
+  }
+
+  /// Selects a deferred source file as the compilation's root module.
+  pub effect fn root(self: Self, path: Deferred<Path>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(Setting.Root { path: move path })
+  }
+
+  /// Adds a generated module file to the root package.
+  pub effect fn moduleFile(self: Self, name: string, path: Deferred<Path>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(Setting.ModuleFile { name: run String.copy(name), path: move path })
+  }
+
+  /// Writes deferred source text as a generated module before compiling its consumer.
+  pub effect fn module(self: Self, name: string, text: Deferred<String>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    let files = run WriteFiles.make().value("module.silk", move text)
+    let step = run files.register()
+    return run self.moduleFile(name, run step.output("module.silk"))
+  }
+
+  /// Embeds a file or another compilation's artifact in a generated module named `name`.
+  /// Import that module's `data` constant to read its bytes; the producer runs before compilation.
+  pub effect fn embed(self: Self, name: string, path: Deferred<Path>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.moduleFile(name, run Embed.module(move path))
+  }
+
+  /// Compiles a deferred `c` source with declared flags and include directory trees.
+  pub effect fn compileC(
+    self: Self,
+    path: Deferred<Path>,
+    flags: Deferred<List<String>>,
+    include: List<Deferred<Path>>,
+  ) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(
+      Setting.Native {
+        language: run String.copy("c"),
+        path: move path,
+        flags: move flags,
+        include: move include,
+      },
+    )
+  }
+
+  /// Compiles a deferred `cpp` source with declared flags and include directory trees.
+  pub effect fn compileCpp(
+    self: Self,
+    path: Deferred<Path>,
+    flags: Deferred<List<String>>,
+    include: List<Deferred<Path>>,
+  ) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(
+      Setting.Native {
+        language: run String.copy("cpp"),
+        path: move path,
+        flags: move flags,
+        include: move include,
+      },
+    )
+  }
+
+  /// Compiles a deferred `objc` source with declared flags and include directory trees.
+  pub effect fn compileObjectiveC(
+    self: Self,
+    path: Deferred<Path>,
+    flags: Deferred<List<String>>,
+    include: List<Deferred<Path>>,
+  ) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(
+      Setting.Native {
+        language: run String.copy("objc"),
+        path: move path,
+        flags: move flags,
+        include: move include,
+      },
+    )
+  }
+
+  /// Compiles a deferred `objcpp` source with declared flags and include directory trees.
+  pub effect fn compileObjectiveCpp(
+    self: Self,
+    path: Deferred<Path>,
+    flags: Deferred<List<String>>,
+    include: List<Deferred<Path>>,
+  ) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(
+      Setting.Native {
+        language: run String.copy("objcpp"),
+        path: move path,
+        flags: move flags,
+        include: move include,
+      },
+    )
+  }
+
+  /// Adds a deferred `archive` input, including its contents in the key.
+  pub effect fn linkArchive(self: Self, path: Deferred<Path>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(Setting.LinkFile { kind: run String.copy("archive"), path: move path })
+  }
+
+  /// Adds a deferred `object` input, including its contents in the key.
+  pub effect fn linkObject(self: Self, path: Deferred<Path>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(Setting.LinkFile { kind: run String.copy("object"), path: move path })
+  }
+
+  /// Adds a deferred `search-path` input, including its contents in the key.
+  pub effect fn searchPath(self: Self, path: Deferred<Path>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(
+      Setting.LinkFile { kind: run String.copy("search-path"), path: move path },
+    )
+  }
+
+  /// Adds a deferred `framework-search-path` input, including its contents in the key.
+  pub effect fn frameworkSearchPath(self: Self, path: Deferred<Path>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(
+      Setting.LinkFile { kind: run String.copy("framework-search-path"), path: move path },
+    )
+  }
+
+  /// Adds a deferred `linker-script` input, including its contents in the key.
+  pub effect fn linkerScript(self: Self, path: Deferred<Path>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(
+      Setting.LinkFile { kind: run String.copy("linker-script"), path: move path },
+    )
+  }
+
+  /// Selects a deferred function-order file, including its contents in the key.
+  pub effect fn functionOrder(self: Self, path: Deferred<Path>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(Setting.FunctionOrder { path: move path })
+  }
+
+  /// Links a deferred library name as `library` describes, for example `Library.dynamicSearch()`.
+  pub effect fn linkLibrary(self: Self, name: Deferred<String>, library: Library) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(
+      Setting.LinkName {
+        kind: run String.copy("library"),
+        name: move name,
+        mode: Option<String>.some(run String.copy(library.mode)),
+        weak: library.isWeak,
+        needed: library.isNeeded,
+      },
+    )
+  }
+
+  /// Links a deferred macOS framework name as `framework` describes, for example `Framework.make()`.
+  pub effect fn linkFramework(self: Self, name: Deferred<String>, framework: Framework) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(
+      Setting.LinkName {
+        kind: run String.copy("framework"),
+        name: move name,
+        mode: Option<String>.none(),
+        weak: framework.isWeak,
+        needed: framework.isNeeded,
+      },
+    )
+  }
+
+  /// Adds a deferred runtime library search path, preserving loader-relative tokens.
+  pub effect fn rpath(self: Self, value: Deferred<String>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(
+      Setting.LinkName {
+        kind: run String.copy("rpath"),
+        name: move value,
+        mode: Option<String>.none(),
+        weak: false,
+        needed: false,
+      },
+    )
+  }
+
+  /// Links another compilation's deferred artifact and schedules its producer first.
+  pub effect fn linkArtifact(self: Self, artifact: Deferred<Path>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    return run self.setting(
+      Setting.LinkFile { kind: run String.copy("object"), path: move artifact },
+    )
+  }
+
+  /// Executes this compilation through the build runner, publishing its request and artifact.
+  pub effect fn build(self: Self) -> Built
+    ! BuildError
+    ? &mut Allocator | &mut FileSystem | &mut HostInput {
+    let build = run Build.make()
+    let graph = run build.add(move self)
+    return run graph.compile()
+  }
+
+  /// Sets the runner's peak-memory estimate for this compiler process; the default is 3 GiB.
+  pub effect fn memoryBudget(self: Self, bytes: u64) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    let mut held = self.state.lock()
+    if held.get().registered.isSome() {
+      fail StepError {
+        message: run String.copy("compilation settings are frozen after its artifact is used"),
+      }
+    }
+    let state = held.getMut()
+    state.memory = bytes
+    drop held
+    return move self
+  }
+
+  /// Authorizes package tools to run without a sandbox for this graph execution.
+  /// This setting is not serialized into compilation definitions or requests.
+  pub effect fn unsandboxedTools(self: Self, allowed: bool) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    let mut held = self.state.lock()
+    if held.get().registered.isSome() {
+      fail StepError {
+        message: run String.copy("compilation settings are frozen after its artifact is used"),
+      }
+    }
+    let state = held.getMut()
+    state.unsandboxedTools = allowed
+    drop held
+    return move self
+  }
+
+  /// Registers the compilation once, freezing its settings. The step holds the compilation's
+  /// description, which the compiler restores and runs.
+  pub effect fn step(self: &Self) -> StepHandle
+    ! StepFailure
+    ? &mut Allocator {
+    let mut held = self.state.lock()
+    let state = held.getMut()
+    if let Option<StepHandle>.Some { value } = &state.registered {
+      return value.copy()
+    }
+    let definition = match move Intrinsic.replace(state.definition, Option<Definition>.none()) {
+      Option<Definition>.Some { value } => move value
+      Option<Definition>.None => {
+        fail StepError { message: run String.copy("the compilation has already been consumed") }
+      }
+    }
+    let compiler = match move Intrinsic.replace(state.compiler, Option<Deferred<Path>>.none()) {
+      Option<Deferred<Path>>.Some { value } => move value
+      Option<Deferred<Path>>.None => {
+        fail StepError { message: run String.copy("the compilation has no compiler") }
+      }
+    }
+    let description = Description {
+      definition: move definition,
+      compiler: move compiler,
+      settings: Intrinsic.replace(state.settings, List<Setting>.make()),
+      memory: state.memory,
+      unsandboxedTools: state.unsandboxedTools,
+    }
+    let mut key = Key.collecting()
+    run key.toolchain(&description.compiler)
+    let settings = description.settings.asSlice()
+    let mut at: usize = 0
+    while at < settings.length {
+      run Settings.key(&settings[at], &mut key)
+      at = at + 1
+    }
+    let step = run StepHandle.described(
+      "compilation",
+      run Encoding.json<Description>(&description),
+      run key.producers(),
+    )
+    state.registered = Option<StepHandle>.some(step.copy())
+    return move step
+  }
+
+  /// Returns the artifact's deferred path; consuming it adds this compilation as a dependency.
+  pub effect fn artifact(self: &Self) -> Deferred<Path>
+    ! StepFailure
+    ? &mut Allocator {
+    let step = run self.step()
+    return run step.output("artifact")
+  }
+
+  /// Returns the generated C header as a deferred input. Configure `header` before using it.
+  /// Consuming the path runs this compilation and rejects a missing header output.
+  pub effect fn emittedHeader(self: &Self) -> Deferred<Path>
+    ! StepFailure
+    ? &mut Allocator {
+    return run (run self.step()).output("header.h")
+  }
+
+  /// Returns the Windows import library as a deferred input. Configure `importLibrary` first.
+  /// Consuming the path runs this compilation and rejects a missing import-library output.
+  pub effect fn emittedImportLibrary(self: &Self) -> Deferred<Path>
+    ! StepFailure
+    ? &mut Allocator {
+    return run (run self.step()).output("import-library.lib")
+  }
+}
+
+import silk.collections.bytes { Bytes }
+
+/// Restores a described compilation as the steps this process can run: one resolves its
+/// request and one compiles it. Answers the compiling step.
+pub effect fn restore(step: &[u8]) -> StepHandle
+  ! StepFailure
+  ? &mut Allocator | &mut FileSystem {
+  let description = run SchemaJson.decode<Description>(step)
+  let Description {
+    definition: described,
+    compiler,
+    settings: listed,
+    memory,
+    unsandboxedTools
+  } = move description
+  let mut definition = move described
+  let mut settings = move listed
+  let inputs = run Context.inputs(&run Path.make(definition.manifest.view()))
+  let applied = settings.asSlice()
+  let mut at: usize = 0
+  while at < applied.length {
+    Settings.clearReplaced(&mut definition, &applied[at])
+    at = at + 1
+  }
+  let encoded = run Encoding.json<Definition>(&definition)
+  let resolved = run Step.register(
+    RequestStep {
+      definition: move encoded,
+      compiler: run compiler.copy(),
+      packages: run Deferred<List<String>>.value(move inputs.packages),
+      files: run Deferred<List<String>>.value(move inputs.files),
+      settings: move settings,
+      unsandboxedTools: unsandboxedTools,
+    },
+  )
+  return run Step.register(
+    CompilerStep {
+      request: run resolved.valueFile<Request>("request.json"),
+      files: run resolved.valueFile<List<String>>("files.json"),
+      trees: run resolved.valueFile<List<String>>("trees.json"),
+      packages: run resolved.valueFile<List<String>>("packages.json"),
+      compiler: move compiler,
+      memory: memory,
+    },
+  )
+}
+
+struct RequestStep {
+  unsandboxedTools: bool,
+  settings: List<Setting>,
+  definition: Bytes,
+  compiler: Deferred<Path>,
+  packages: Deferred<List<String>>,
+  files: Deferred<List<String>>,
+}
+
+impl Step for RequestStep {
+  effect fn key(self: &Self, key: &mut Key) -> ()
+    ! StepFailure
+    ? &mut Allocator {
+    run key.bytes(self.definition.asSlice())
+    run key.bytes(
+      if self.unsandboxedTools {
+        b"unsandboxed"
+      } else {
+        b"sandboxed"
+      },
+    )
+    run key.toolchain(&self.compiler)
+    run key.packageTrees(&self.packages)
+    run key.files(&self.files)
+    run compilerEnvironment(&mut key)
+    let definition = run SchemaJson.decode<Definition>(self.definition.asSlice())
+    if let Option<String>.Some { value } = &definition.stdlib {
+      run key.tree(&run Deferred<Path>.external(value.view()))
+    }
+    run Settings.keyValues(&definition.settings, &mut key)
+    let settings = self.settings.asSlice()
+    let mut setting = usize.ZERO
+    while setting < settings.length {
+      run Settings.key(&settings[setting], &mut key)
+      setting = setting + usize.ONE
+    }
+  }
+
+  effect fn make(self: &Self, make: &mut Make) -> ()
+    ! StepFailure
+    ? &mut Allocator {
+    let mut definition = run SchemaJson.decode<Definition>(self.definition.asSlice())
+    let settings = self.settings.asSlice()
+    let mut setting = usize.ZERO
+    while setting < settings.length {
+      run Settings.apply(&settings[setting], &mut make, &mut definition)
+      setting = setting + usize.ONE
+    }
+    let encoded = run Encoding.toml<Definition>(&definition)
+    run make.write("definition.toml", encoded.asSlice())
+    let input = run Context.text(&run make.output("definition.toml"))
+    let output = run Context.text(&run make.output("resolved.toml"))
+    let outcome = if self.unsandboxedTools {
+      run make.exec(
+        &self.compiler,
+        &[
+          "resolve",
+          "--definition",
+          input.view(),
+          "--output",
+          output.view(),
+          "--unsandboxed-tools",
+        ],
+      )
+    } else {
+      run make.exec(
+        &self.compiler,
+        &["resolve", "--definition", input.view(), "--output", output.view()],
+      )
+    }
+    let succeeded = match move ChildProcess.exitCode(&outcome) {
+      Option<i32>.Some { value } => value == 0
+      Option<i32>.None => false
+    }
+    if !succeeded {
+      let mut message = run String.copy("cannot resolve the compilation definition")
+      if let Result<string, InvalidUtf8>.Success { value } = move String.fromUtf8(
+        ChildProcess.errorBytes(&outcome),
+      ) {
+        run message.append(": ")
+        run message.append(value)
+      }
+      fail StepError { message: move message }
+    }
+    let contents = run make.readOutput("resolved.toml")
+    let request = run SchemaToml.decode<Request>(contents.asSlice())
+    return run resolvedInputs(&mut make, &request)
+  }
+}
+
+struct CompilerStep {
+  request: Deferred<Request>,
+  files: Deferred<List<String>>,
+  trees: Deferred<List<String>>,
+  packages: Deferred<List<String>>,
+  compiler: Deferred<Path>,
+  memory: u64,
+}
+
+impl Step for CompilerStep {
+  effect fn key(self: &Self, key: &mut Key) -> ()
+    ! StepFailure
+    ? &mut Allocator {
+    run key.value(&self.request)
+    run key.files(&self.files)
+    run key.trees(&self.trees)
+    run key.packageTrees(&self.packages)
+    run key.toolchain(&self.compiler)
+    run compilerEnvironment(&mut key)
+
+    // `silk build -q`, `--timings` and `--progress` change only what the compiler reports.
+    run key.passEnvironment("SILK_QUIET")
+    run key.passEnvironment("SILK_TIMINGS")
+    run key.passEnvironment("SILK_PROGRESS")
+  }
+
+  effect fn make(self: &Self, make: &mut Make) -> ()
+    ! StepFailure
+    ? &mut Allocator {
+    let mut request = run make.get(&self.request)
+    let publication = run Encoding.toml<Request>(&request)
+    run make.write("publication.toml", publication.asSlice())
+    if request.header.isSome() {
+      request.header = Option<String>.some(run pathText(&run make.output("header.h")))
+    }
+    if request.importLibrary.isSome() {
+      request.importLibrary = Option<String>.some(
+        run pathText(&run make.output("import-library.lib")),
+      )
+    }
+    let output = run make.output("artifact")
+    request.output = run pathText(&output)
+    let encoded = run Encoding.toml<Request>(&request)
+    run make.write("request.toml", encoded.asSlice())
+    if !make.shouldCompile() {
+      return ()
+    }
+    let requestPath = run make.output("request.toml")
+    let written = run pathText(&requestPath)
+    let outcome = run make.exec(
+      &self.compiler,
+      &["compile", "--request", written.view(), "--progress"],
+    )
+
+    // The compiler's progress and diagnostics, as a build of this compilation alone shows them.
+    let mut shown = StderrWriter.make()
+    let forwarded = run Effect.result(
+      Writer.writeAll(ChildProcess.errorBytes(&outcome)) |> Effect.provideMut<Writer>(&mut shown),
+    )
+    match move forwarded {
+      Result<(), WriterError>.Success { .. } => ()
+      Result<(), WriterError>.Failure { error } => {
+        drop error
+      }
+    }
+    let succeeded = match move ChildProcess.exitCode(&outcome) {
+      Option<i32>.Some { value } => value == 0
+      Option<i32>.None => false
+    }
+    if !succeeded {
+      fail StepError { message: run String.copy("the compiler rejected the compilation request") }
+    }
+    if request.header.isSome() {
+      run make.requireOutput("header.h")
+    }
+    if request.importLibrary.isSome() {
+      run make.requireOutput("import-library.lib")
+    }
+    return run make.requireOutput("artifact")
+  }
+
+  fn memory(self: &Self) -> u64 {
+    return self.memory
+  }
+
+  fn compilation(self: &Self) -> bool {
+    return true
+  }
+}
+
+effect fn optionalPath(paths: &mut List<String>, path: &Option<String>) -> ()
+  ! StepFailure
+  ? &mut Allocator {
+  if let Option<String>.Some { value } = &path.* {
+    run paths.append(run String.copy(value.view()))
+  }
+}
+
+effect fn resolvedInputs(make: &mut Make, request: &Request) -> ()
+  ! StepFailure
+  ? &mut Allocator {
+  let mut files = List<String>.make()
+  let mut trees = List<String>.make()
+  let mut packages = List<String>.make()
+  run files.append(run String.copy(request.root.view()))
+  run trees.append(run String.copy(request.stdlib.view()))
+  let listed = request.packages.asSlice()
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let package = &listed[at]
+    run packages.append(run String.copy(package.directory.view()))
+    if package.source.view() != package.directory.view() {
+      run trees.append(run String.copy(package.source.view()))
+    }
+    let modules = package.modules.asSlice()
+    let mut module = usize.ZERO
+    while module < modules.length {
+      run files.append(run String.copy(modules[module].source.view()))
+      module = module + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  let sources = request.native.sources.asSlice()
+  at = usize.ZERO
+  while at < sources.length {
+    run files.append(run String.copy(sources[at].path.view()))
+    let include = sources[at].include.asSlice()
+    let mut directory = usize.ZERO
+    while directory < include.length {
+      run trees.append(run String.copy(include[directory].view()))
+      directory = directory + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  let links = request.native.link.asSlice()
+  at = usize.ZERO
+  while at < links.length {
+    let link = &links[at]
+    let kind = link.kind.view()
+    if kind == "object" || kind == "archive" || kind == "linker-script" {
+      run files.append(run String.copy(link.value.view()))
+    } else if kind == "search-path" || kind == "framework-search-path" {
+      run trees.append(run String.copy(link.value.view()))
+    }
+    at = at + usize.ONE
+  }
+  run optionalPath(&mut files, &request.native.functionOrder)
+
+  // A sysroot and its support installations are system trees, such as `/usr`, with links that
+  // leave them or name nothing. The request keys their paths, as a host toolchain is keyed.
+  if let Option<Platform>.Some { value } = &request.platform {
+    run files.append(run String.copy(value.linker.view()))
+  }
+  if let Option<Windows>.Some { value } = &request.windows {
+    run optionalPath(&mut files, &value.manifest)
+    let resources = value.resources.asSlice()
+    at = usize.ZERO
+    while at < resources.length {
+      run files.append(run String.copy(resources[at].view()))
+      at = at + usize.ONE
+    }
+  }
+  if let Option<MacOS>.Some { value } = &request.macos {
+    run optionalPath(&mut files, &value.entitlements)
+  }
+  if let Option<Wasm>.Some { value } = &request.wasm {
+    run optionalPath(&mut trees, &value.wit)
+  }
+  run make.valueFile<Request>("request.json", request)
+  run make.valueFile<List<String>>("files.json", &files)
+  run make.valueFile<List<String>>("trees.json", &trees)
+  return run make.valueFile<List<String>>("packages.json", &packages)
+}
+
+effect fn pathText(path: &Path) -> String
+  ! StepFailure
+  ? &mut Allocator {
+  return match move Path.view(path) {
+    Option<string>.Some { value } => run String.copy(value)
+    Option<string>.None => {
+      fail StepError { message: run String.copy("a compilation path must be UTF-8") }
+    }
+  }
+}
+
+// Resolution may fetch pinned sources, and compilation invokes the selected native tools.
+// Child processes inherit only inputs declared here.
+effect fn compilerEnvironment(key: &mut Key) -> ()
+  ! StepFailure
+  ? &mut Allocator {
+  let names = [
+    "PATH",
+    "SDKROOT",
+    "DEVELOPER_DIR",
+    "SILK_CLANG",
+    "SILK_LLVM_AR",
+    "SILK_HOME",
+    "SILK_OFFLINE",
+    "SILK_ARCHIVE_MIRROR",
+    "SILK_BACKEND",
+    "SILK_IGNORE_WARNINGS",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LOCALAPPDATA",
+    "USERPROFILE",
+    "SystemRoot",
+    "COMSPEC",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "SILK_VERIFY_MIR",
+    "SILK_RECEIPTS",
+    "SILK_PROFILE_USE",
+    "SILK_PROFILE_GENERATE",
+    "SILK_WASM_TOOLS",
+    "SILK_WASI_ADAPTER",
+    "SILK_WASI_REACTOR_ADAPTER",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "CURL_CA_BUNDLE",
+    "GIT_SSL_CAINFO",
+    "GIT_SSL_CAPATH",
+    "SSH_AUTH_SOCK",
+    "GIT_SSH_COMMAND",
+  ]
+  let mut at: usize = 0
+  while at < names.length {
+    run key.environment(names[at])
+    at = at + 1
+  }
+}

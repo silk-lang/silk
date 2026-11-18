@@ -31,7 +31,7 @@ const program = Effect.gen(function* () {
   yield* fs.makeDirectory(output, { recursive: true })
   yield* fs.writeFileString(
     path.join(output, 'silk.toml'),
-    '[package]\nname = "native-publication-conformance"\nversion = "0.1.0"\nsource = "."\nmain = "publication-fixture.silk"\nkind = "object"\n',
+    '[package]\nname = "native-publication-conformance"\nversion = "0.1.0"\nsource = "."\nmain = "publication-fixture.silk"\nkind = "library"\n',
   )
   yield* fs.copyFile(
     path.join(directory, 'publication-fixture.silk'),
@@ -84,18 +84,36 @@ const program = Effect.gen(function* () {
   for (const optimization of ['none', 'speed']) {
     const prefix = path.join(output, optimization)
     const flag = optimization === 'none' ? '-O0' : '-O2'
-    const compile = yield* run(compiler, [
-      'build',
-      path.join(output, 'publication-fixture.silk'),
-      '-o',
+    // The fixture has no `main`, so an explicit request names the object artifact.
+    const definition = `${prefix}.definition.toml`
+    const request = `${prefix}.request.toml`
+    yield* fs.writeFileString(
+      definition,
+      [
+        `manifest = ${JSON.stringify(path.join(output, 'silk.toml'))}`,
+        'artifact = "object"',
+        `stdlib = ${JSON.stringify(standardLibrary)}`,
+        '[settings]',
+        'modules = []',
+        'emit = "llvm-ir"',
+        '[settings.profile]',
+        `optimization = "${optimization}"`,
+        '[settings.native]',
+        'sources = []',
+        'link = []',
+        '',
+      ].join('\n'),
+    )
+    const resolve = yield* run(compiler, [
+      'resolve',
+      '--definition',
+      definition,
+      '--output',
+      request,
+      '--artifact',
       `${prefix}.ll`,
-      '--emit',
-      'llvm-ir',
-      '--stdlib',
-      standardLibrary,
-      '--optimization',
-      optimization,
     ])
+    const compile = yield* run(compiler, ['compile', '--request', request])
     const silkObject = yield* run(clang, [
       ...platformArguments,
       '-Wno-override-module',
@@ -126,7 +144,7 @@ const program = Effect.gen(function* () {
       prefix,
     ])
     const execute = yield* run(prefix, [])
-    lanes.push({ optimization, compile, silkObject, cObject, link, execute })
+    lanes.push({ optimization, resolve, compile, silkObject, cObject, link, execute })
     yield* Console.log(
       `native filesystem publication ${process.platform}/${process.arch} ${optimization}: passed`,
     )

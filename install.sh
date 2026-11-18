@@ -36,7 +36,7 @@ fail() {
   exit 1
 }
 
-for tool in curl tar uname mktemp cmp ln; do
+for tool in curl tar uname mktemp cmp ln awk; do
   command -v "$tool" > /dev/null 2>&1 || fail "this installer needs $tool"
 done
 
@@ -46,6 +46,36 @@ case "$channel" in
 esac
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT INT TERM
+
+# Progress looks like the silk tool's: a live bar on a terminal, then one row per finished step.
+# Rows use color only on a terminal, and never when NO_COLOR is set and not empty.
+live=
+if [ -t 2 ] && [ "${TERM:-}" != dumb ]; then live=1; fi
+color=
+if [ -t 1 ] && [ "${TERM:-}" != dumb ] && [ -z "${NO_COLOR:-}" ]; then color=1; fi
+
+# row SUMMARY DETAIL writes the row of a finished step.
+row() {
+  if [ -n "$color" ]; then
+    printf '  \033[32m\342\234\223\033[0m %s\033[2m  %s\033[0m\n' "$1" "$2"
+  else
+    printf '  \342\234\223 %s  %s\n' "$1" "$2"
+  fi
+}
+
+# size BYTES writes BYTES in binary units, such as 67.6 MiB.
+size() {
+  awk -v b="$1" 'BEGIN {
+    split("B KiB MiB GiB", unit, " "); i = 1
+    while (b >= 1024 && i < 4) { b /= 1024; i++ }
+    if (i == 1) printf "%d %s", b, unit[i]; else printf "%.1f %s", b, unit[i]
+  }'
+}
+
+# seconds START writes the time since START, a `date +%s` value, such as 3s.
+seconds() {
+  printf '%ss' "$(($(date +%s) - $1))"
+}
 
 # api PATH OUTPUT writes the response body to OUTPUT. A 404 returns 4 so callers can tell a
 # missing release apart from every other failure, which must never switch channels.
@@ -199,8 +229,17 @@ encoded_archive=$(printf '%s' "$archive" | sed 's/+/%2B/g')
 top=${archive%.tar.gz}
 url="https://github.com/$repo/releases/download/$release_path/$encoded_archive"
 
-printf 'Downloading %s from %s\n' "$archive" "$release"
-curl -fSL --progress-bar -o "$tmp/$archive" "$url" || fail "cannot download $url"
+printf 'Installing Silk %s for %s\n' "$version" "$target"
+# On a terminal curl draws its bar, which the row replaces; elsewhere only the row is written.
+if [ -n "$live" ]; then
+  downloaded=$(curl -fSL --progress-bar -w '%{size_download} %{time_total}' -o "$tmp/$archive" "$url") ||
+    fail "cannot download $url"
+  printf '\033[1A\033[2K' >&2
+else
+  downloaded=$(curl -fsSL -w '%{size_download} %{time_total}' -o "$tmp/$archive" "$url") ||
+    fail "cannot download $url"
+fi
+row "Downloaded $archive" "$(size "${downloaded%% *}")  $(awk -v t="${downloaded#* }" 'BEGIN { printf "%.1fs", t }')"
 if command -v minisign > /dev/null 2>&1; then
   # A missing signature fails too: deleting it must not downgrade verification.
   curl -fsSL -o "$tmp/$archive.minisig" "$url.minisig" ||
@@ -209,12 +248,16 @@ if command -v minisign > /dev/null 2>&1; then
     fail "$archive is not signed by the Silk release key"
   [ "$comment" = "silk $release $archive" ] ||
     fail "the signature of $archive belongs to a different release or file: $comment"
-  printf 'Verified the minisign signature of %s\n' "$archive"
+  row "Verified the minisign signature" ""
 else
-  printf 'minisign is not installed; skipping the signature check of %s\n' "$archive"
+  printf '  minisign is not installed; skipping the signature check of %s\n' "$archive"
 fi
 mkdir "$tmp/unpacked"
+[ -z "$live" ] || printf '  Unpacking %s' "$archive" >&2
+unpacking=$(date +%s)
 tar -xzf "$tmp/$archive" -C "$tmp/unpacked" || fail "cannot unpack $archive"
+[ -z "$live" ] || printf '\r\033[2K' >&2
+row "Unpacked $archive" "$(seconds "$unpacking")"
 # The compiler is `bin/silkc`, beside the silk tool `bin/silk`; earlier releases hold only the
 # compiler, as `bin/silk`.
 compiler=bin/silkc

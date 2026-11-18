@@ -670,6 +670,16 @@ Text
 
 Text.
 
+<a id="Shape.Bytes"></a>
+
+### `Bytes`
+
+```silk
+Bytes
+```
+
+Binary data: the format's binary type, or Base64 text in a text format.
+
 <a id="Shape.Optional"></a>
 
 ### `Optional`
@@ -709,6 +719,26 @@ pub element: ShapeRef
 ```
 
 Each element.
+
+<a id="Shape.Dictionary"></a>
+
+### `Dictionary`
+
+```silk
+Dictionary
+```
+
+An object whose arbitrary text keys all have the same value schema.
+
+<a id="Shape.Dictionary.value"></a>
+
+#### Field `value`
+
+```silk
+pub value: ShapeRef
+```
+
+The schema of each member's value.
 
 <a id="Shape.Object"></a>
 

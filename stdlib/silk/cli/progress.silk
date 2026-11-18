@@ -1,0 +1,709 @@
+//! Progress of long work on standard error: a live line redrawn in place on a terminal, and one
+//! plain line for each finished step elsewhere.
+//!
+//! # When to use
+//! Use [`Progress`] in a command line program for work that takes more than a moment, such as a
+//! download, a signature check, or unpacking an archive, so that the program never looks stuck.
+//! `NativeHttp.reportProgress` from `silk.http.client_native` feeds a download into one.
+//!
+//! # Details
+//! Pick a [`ProgressStyle`] once, usually with [`ProgressStyle.standardError`], and make one
+//! [`Progress`] with it. Each step opens with [`Progress.begin`], counts its work with
+//! [`Progress.advance`], and closes with [`Progress.finish`] or [`Progress.abandon`].
+//!
+//! - `Live`: one line, redrawn in place at most every 80 ms: a spinner, the label, a bar when the
+//!   total is known, the amount done, and for bytes the rate and the time left. A finished step
+//!   leaves a row with a check mark, its summary, its size and its time.
+//! - `Plain`: no escape codes. Only the row of a finished step is written.
+//! - `Off`: nothing is written and no clock is read.
+//!
+//! Output never fails the work: a failed write to standard error is dropped.
+//!
+//! # Gotchas
+//! The live line assumes that nothing else writes to standard error while a step is open. Finish
+//! or abandon the step before you print.
+//!
+//! # Examples
+//! ## Count the bytes of a step
+//! ```silk
+//! import silk.cli.progress { Progress, ProgressStyle, ProgressUnit }
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.core.effect { Effect }
+//!
+//! effect fn copy(progress: &mut Progress) -> () ! OutOfMemoryError ? &mut Allocator {
+//!   run progress.begin("Downloading data.bin", ProgressUnit.Bytes, 4096)
+//!   run progress.advance(1024)
+//!   run progress.advance(3072)
+//!   run progress.finish("Downloaded data.bin")
+//! }
+//!
+//! pub effect fn main() -> i32 ! OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   // An `Off` style writes nothing, as standard error of a test should stay quiet.
+//!   let mut progress = Progress.make(ProgressStyle.off())
+//!   run copy(&mut progress) |> Effect.provideMut<Allocator>(&mut allocator)
+//!   if progress.done() != 4096 || progress.isOpen() {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! @category Command line
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.collections.slice { Slice }
+import silk.text.string { String }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.system.system_clock { SystemClock }
+import silk.platform.native.clock { NativeClock }
+import silk.num.i64
+import silk.num.u8
+import silk.num.u16
+import silk.num.u64
+import silk.num.usize
+static if Intrinsic.targetOperatingSystem() == "windows" {
+  import silk.platform.windows.console { WindowsConsole }
+} else static if Intrinsic.targetOperatingSystem() == "wasi" {
+  import silk.platform.wasi.descriptor { WasiDescriptor as NativeDescriptor }
+} else static if Intrinsic.targetObjectFormat() != "wasm" {
+  import silk.platform.native.descriptor { NativeDescriptor }
+}
+static if (Intrinsic.targetOperatingSystem() == "darwin" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64") && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")) {
+  import silk.system.terminal { Terminal, TerminalError, WindowSize }
+}
+
+/// How a [`Progress`] reaches standard error.
+pub enum ProgressDisplay {
+  /// Nothing is written.
+  Off,
+  /// One line for each finished step, without escape codes.
+  Plain,
+  /// A status line redrawn in place, and one row for each finished step.
+  Live,
+}
+
+/// What a step counts: bytes, shown as `KiB`, `MiB` or `GiB` with a rate, or plain items.
+pub enum ProgressUnit {
+  /// Items, shown as a count such as `12/40`.
+  Count,
+  /// Bytes, shown with binary units, a rate per second, and the time left when the total is known.
+  Bytes,
+}
+
+/// How progress is shown: the display, whether rows use color, and the terminal width the live
+/// line must fit in.
+///
+/// # Details
+/// [`ProgressStyle.standardError`] picks a style for standard error. [`ProgressStyle.off`] writes
+/// nothing.
+pub struct ProgressStyle {
+  /// Where and how lines are written.
+  pub display: ProgressDisplay,
+  /// Whether the live line and rows use color.
+  pub color: bool,
+  /// The width in columns that the live line is cut to, at least 20.
+  pub width: usize,
+}
+
+impl Copy for ProgressStyle {}
+
+impl ProgressStyle {
+  /// A style that writes nothing.
+  pub fn off() -> ProgressStyle {
+    return ProgressStyle { display: ProgressDisplay.Off, color: false, width: 80 }
+  }
+
+  /// The style for standard error: `Live` on a terminal, `Plain` otherwise.
+  ///
+  /// # Details
+  /// A terminal whose `TERM` is `dumb` gets `Plain`. Only `Live` uses color, unless `NO_COLOR` is
+  /// set and not empty.
+  /// The width is the terminal's own where the target can ask for it, else `COLUMNS`, else 80.
+  ///
+  /// # Errors
+  /// - `HostInputError` or `OutOfMemoryError` if the environment cannot be read.
+  pub effect fn standardError() -> ProgressStyle
+    ! HostInputError | OutOfMemoryError
+    ? &mut HostInput | &mut Allocator {
+    let mut display = ProgressDisplay.Plain
+    if run terminal() {
+      display = ProgressDisplay.Live
+      if let Option<Bytes>.Some { value } = move run HostInput.variableNamed("TERM") {
+        if same(Bytes.asSlice(&value), b"dumb") {
+          display = ProgressDisplay.Plain
+        }
+      }
+    }
+    // Rows in a log or a pipe stay free of escape codes.
+    let mut color = display == ProgressDisplay.Live
+    if let Option<Bytes>.Some { value } = move run HostInput.variableNamed("NO_COLOR") {
+      if Bytes.length(&value) > usize.ZERO {
+        color = false
+      }
+    }
+    let mut width = run terminalWidth()
+    if width == usize.ZERO {
+      width = 80
+      if let Option<Bytes>.Some { value } = move run HostInput.variableNamed("COLUMNS") {
+        let parsed = decimal(Bytes.asSlice(&value))
+        if parsed >= 20 {
+          width = parsed
+        }
+      }
+    }
+    return ProgressStyle { display: display, color: color, width: width }
+  }
+}
+
+/// The progress of one step at a time, written to standard error in a [`ProgressStyle`].
+///
+/// # Details
+/// A step opens with [`Progress.begin`] and closes with [`Progress.finish`], which leaves a row,
+/// or [`Progress.abandon`], which leaves nothing. Counting a closed step does nothing, so code that
+/// feeds a `Progress`, such as a download, can run with or without an open step.
+pub struct Progress {
+  style: ProgressStyle,
+  unit: ProgressUnit,
+  label: Bytes,
+  total: u64,
+  count: u64,
+  started: u64,
+  drawnAt: u64,
+  frame: usize,
+  open: bool,
+  shown: bool,
+}
+
+// Redraws closer together than this are skipped.
+const REDRAW_NANOS: u64 = 80000000
+
+impl Progress {
+  /// A progress that writes in `style`, with no step open.
+  pub fn make(style: ProgressStyle) -> Progress {
+    return Progress {
+      style: style,
+      unit: ProgressUnit.Count,
+      label: Bytes.make(),
+      total: 0,
+      count: 0,
+      started: 0,
+      drawnAt: 0,
+      frame: usize.ZERO,
+      open: false,
+      shown: false,
+    }
+  }
+
+  /// A progress that writes nothing.
+  pub fn off() -> Progress {
+    return Progress.make(ProgressStyle.off())
+  }
+
+  /// Whether a step is open.
+  pub fn isOpen(self: &Self) -> bool {
+    return self.open
+  }
+
+  /// The amount the open or last step counted.
+  pub fn done(self: &Self) -> u64 {
+    return self.count
+  }
+
+  /// Opens a step named `label`, such as `Downloading silk.tar.gz`, that counts `unit` up to
+  /// `total`, or zero when the total is not known yet.
+  ///
+  /// # Details
+  /// A step that is still open is abandoned first. The live line is drawn at once.
+  ///
+  /// # Errors
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  pub effect fn begin(self: &mut Self, label: string, unit: ProgressUnit, total: u64) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.abandon()
+    if self.style.display == ProgressDisplay.Off {
+      self.count = 0
+      self.total = total
+      self.open = true
+      return ()
+    }
+    Bytes.truncate(&mut self.label, usize.ZERO)
+    run Bytes.append(&mut self.label, String.utf8Bytes(label))
+    self.unit = unit
+    self.total = total
+    self.count = 0
+    self.open = true
+    self.started = run now()
+    self.drawnAt = 0
+    run self.draw()
+  }
+
+  /// Sets the total of the open step, or zero when it is not known.
+  ///
+  /// # Errors
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  pub effect fn expect(self: &mut Self, total: u64) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.open {
+      return ()
+    }
+    self.total = total
+    run self.redraw()
+  }
+
+  /// Counts `amount` more of the open step, and redraws the live line when it is due.
+  ///
+  /// # Errors
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  pub effect fn advance(self: &mut Self, amount: u64) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.open {
+      return ()
+    }
+    self.count = self.count + amount
+    run self.redraw()
+  }
+
+  /// Sets how much of the open step is done to `done`, and redraws the live line when it is due.
+  ///
+  /// # Errors
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  pub effect fn reach(self: &mut Self, done: u64) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.open {
+      return ()
+    }
+    self.count = done
+    run self.redraw()
+  }
+
+  /// Closes the open step and leaves its row: a check mark, `summary`, the size of a bytes step
+  /// and the time the step took.
+  ///
+  /// # Errors
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  pub effect fn finish(self: &mut Self, summary: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.open {
+      return ()
+    }
+    self.open = false
+    if self.style.display == ProgressDisplay.Off {
+      return ()
+    }
+    let finishedAt = run now()
+    let elapsed = finishedAt - self.started
+    let mut line = Bytes.make()
+    if self.shown {
+      run Bytes.append(&mut line, b"\r\x1b[2K")
+      self.shown = false
+    }
+    run Bytes.append(&mut line, b"  ")
+    run self.paint(&mut line, b"\x1b[32m", b"\xE2\x9C\x93")
+    run Bytes.append(&mut line, b" ")
+    run Bytes.append(&mut line, String.utf8Bytes(summary))
+    let mut detail = Bytes.make()
+    if self.unit == ProgressUnit.Bytes && self.count > 0 {
+      run Bytes.append(&mut detail, b"  ")
+      run appendSize(&mut detail, self.count)
+    }
+    run Bytes.append(&mut detail, b"  ")
+    run appendDuration(&mut detail, elapsed)
+    run self.paint(&mut line, b"\x1b[2m", Bytes.asSlice(&detail))
+    run Bytes.append(&mut line, b"\n")
+    run write(Bytes.asSlice(&line))
+  }
+
+  /// Closes the open step without a row, and clears the live line, as before an error message.
+  pub effect fn abandon(self: &mut Self) -> () {
+    self.open = false
+    if self.shown {
+      run write(b"\r\x1b[2K")
+      self.shown = false
+    }
+  }
+
+  // Redraws the live line when the last draw is older than `REDRAW_NANOS`.
+  effect fn redraw(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.style.display != ProgressDisplay.Live {
+      return ()
+    }
+    let at = run now()
+    if at - self.drawnAt < REDRAW_NANOS {
+      return ()
+    }
+    run self.draw()
+  }
+
+  // Draws the live line: spinner, label, bar when the total is known, amount, and for bytes the
+  // rate and the time left, cut to the width.
+  effect fn draw(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.style.display != ProgressDisplay.Live || !self.open {
+      return ()
+    }
+    let at = run now()
+    self.drawnAt = at
+    self.frame = self.frame + usize.ONE
+    let elapsed = at - self.started
+    let spinner = [
+      b"\xE2\xA0\x8B",
+      b"\xE2\xA0\x99",
+      b"\xE2\xA0\xB9",
+      b"\xE2\xA0\xB8",
+      b"\xE2\xA0\xBC",
+      b"\xE2\xA0\xB4",
+      b"\xE2\xA0\xA6",
+      b"\xE2\xA0\xA7",
+      b"\xE2\xA0\x87",
+      b"\xE2\xA0\x8F"
+    ]
+
+    // The parts after the label, all ASCII, so their length is their width.
+    let mut amount = Bytes.make()
+    let mut rest = Bytes.make()
+    if self.unit == ProgressUnit.Bytes {
+      if self.total > 0 {
+        run appendSizePair(&mut amount, self.count, self.total)
+      } else if self.count > 0 {
+        run appendSize(&mut amount, self.count)
+      }
+      // A rate over less than half a second jumps around, so it waits.
+      if elapsed >= 500000000 && self.count > 0 {
+        let rate = rateOf(self.count, elapsed)
+        run Bytes.append(&mut rest, b"  ")
+        run appendSize(&mut rest, rate)
+        run Bytes.append(&mut rest, b"/s")
+        if self.total > self.count && rate > 0 {
+          run Bytes.append(&mut rest, b"  ")
+          run appendSeconds(&mut rest, (self.total - self.count + rate - 1) / rate)
+          run Bytes.append(&mut rest, b" left")
+        }
+      }
+    } else {
+      run appendNumber(&mut amount, self.count)
+      if self.total > 0 {
+        run Bytes.append(&mut amount, b"/")
+        run appendNumber(&mut amount, self.total)
+      }
+    }
+
+    // Columns: two spaces, the spinner, a space, the label, two spaces, the bar and two spaces,
+    // the amount and the rest.
+    let width = self.style.width
+    let mut bar = usize.ZERO
+    if self.total > 0 {
+      if width >= 70 {
+        bar = 20
+      } else if width >= 50 {
+        bar = 10
+      }
+    }
+    let mut fixed = 4 + 2 + Bytes.length(&amount) + Bytes.length(&rest)
+    if bar > usize.ZERO {
+      fixed = fixed + bar + 2
+    }
+    // A line too narrow for its parts drops the rate and time left before the label goes.
+    if fixed + 8 > width && Bytes.length(&rest) > usize.ZERO {
+      fixed = fixed - Bytes.length(&rest)
+      Bytes.truncate(&mut rest, usize.ZERO)
+    }
+    let mut room = usize.ZERO
+    if width > fixed + usize.ONE {
+      room = width - fixed - usize.ONE
+    }
+
+    let mut line = run Bytes.copy(b"\r\x1b[2K  ")
+    run self.paint(&mut line, b"\x1b[36m", spinner[usize.remainder(self.frame, 10)])
+    run Bytes.append(&mut line, b" ")
+    run appendCut(&mut line, Bytes.asSlice(&self.label), room)
+    if bar > usize.ZERO {
+      run Bytes.append(&mut line, b"  ")
+      let mut bounded = self.count
+      if bounded > self.total {
+        bounded = self.total
+      }
+      let filled = u64.toUsize(bounded * usize.toU64(bar) / self.total)
+      let mut drawn = Bytes.make()
+      let mut cell = usize.ZERO
+      while cell < filled {
+        run Bytes.append(&mut drawn, b"\xE2\x94\x81")
+        cell = cell + usize.ONE
+      }
+      run self.paint(&mut line, b"\x1b[32m", Bytes.asSlice(&drawn))
+      let mut empty = Bytes.make()
+      while cell < bar {
+        if self.style.color {
+          run Bytes.append(&mut empty, b"\xE2\x94\x81")
+        } else {
+          run Bytes.append(&mut empty, b"\xE2\x94\x80")
+        }
+        cell = cell + usize.ONE
+      }
+      run self.paint(&mut line, b"\x1b[2m", Bytes.asSlice(&empty))
+    }
+    run Bytes.append(&mut line, b"  ")
+    run self.paint(&mut line, b"\x1b[1m", Bytes.asSlice(&amount))
+    run self.paint(&mut line, b"\x1b[2m", Bytes.asSlice(&rest))
+    run write(Bytes.asSlice(&line))
+    self.shown = true
+  }
+
+  // Appends `text` in the color `code` opens, when color is on.
+  effect fn paint(self: &Self, line: &mut Bytes, code: &[u8], text: &[u8]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if text.length == usize.ZERO {
+      return ()
+    }
+    if self.style.color {
+      run Bytes.append(&mut line.*, code)
+    }
+    run Bytes.append(&mut line.*, text)
+    if self.style.color {
+      run Bytes.append(&mut line.*, b"\x1b[0m")
+    }
+  }
+}
+
+// Bytes per second after `count` bytes in `nanos` nanoseconds.
+fn rateOf(count: u64, nanos: u64) -> u64 {
+  let millis = nanos / 1000000
+  if millis == 0 {
+    return 0
+  }
+  return count / millis * 1000 + count % millis * 1000 / millis
+}
+
+// Appends `text`, cut to `room` columns with an ellipsis. A UTF-8 sequence is never split, and
+// every character counts as one column.
+effect fn appendCut(line: &mut Bytes, text: &[u8], room: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut columns = usize.ZERO
+  let mut at = usize.ZERO
+  while at < text.length {
+    if (text[at] & 192) != 128 {
+      columns = columns + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  if columns <= room {
+    run Bytes.append(&mut line.*, text)
+    return ()
+  }
+  if room == usize.ZERO {
+    return ()
+  }
+  let mut kept = usize.ZERO
+  let mut end = usize.ZERO
+  while end < text.length {
+    if (text[end] & 192) != 128 {
+      if kept + usize.ONE == room {
+        break
+      }
+      kept = kept + usize.ONE
+    }
+    end = end + usize.ONE
+  }
+  run Bytes.append(&mut line.*, Slice.view<u8>(text, usize.ZERO, end))
+  run Bytes.append(&mut line.*, b"\xE2\x80\xA6")
+}
+
+// Appends `value` in decimal.
+effect fn appendNumber(text: &mut Bytes, value: u64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if value >= 10 {
+    run appendNumber(&mut text.*, value / 10)
+  }
+  let digit: [u8; 1] = [u64.toU8(value % 10) + 48]
+  run Bytes.append(&mut text.*, &digit)
+}
+
+// The binary unit `value` bytes are shown in, as its size in bytes and its name.
+fn unitFor(value: u64) -> u64 {
+  if value >= 1073741824 {
+    return 1073741824
+  }
+  if value >= 1048576 {
+    return 1048576
+  }
+  if value >= 1024 {
+    return 1024
+  }
+  return 1
+}
+
+fn unitName(unit: u64) -> &'static [u8] {
+  if unit == 1073741824 {
+    return b" GiB"
+  }
+  if unit == 1048576 {
+    return b" MiB"
+  }
+  if unit == 1024 {
+    return b" KiB"
+  }
+  return b" B"
+}
+
+// Appends `value` bytes in `unit`, with one decimal for a unit above bytes.
+effect fn appendIn(text: &mut Bytes, value: u64, unit: u64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if unit == 1 {
+    run appendNumber(&mut text.*, value)
+    return ()
+  }
+  let tenths = value / (unit / 1024) * 10 / 1024
+  run appendNumber(&mut text.*, tenths / 10)
+  run Bytes.append(&mut text.*, b".")
+  run appendNumber(&mut text.*, tenths % 10)
+}
+
+// Appends `value` bytes, such as `45.2 MiB`.
+effect fn appendSize(text: &mut Bytes, value: u64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let unit = unitFor(value)
+  run appendIn(&mut text.*, value, unit)
+  run Bytes.append(&mut text.*, unitName(unit))
+}
+
+// Appends `done` of `total` bytes in the unit of the total, such as `45.2/67.6 MiB`.
+effect fn appendSizePair(text: &mut Bytes, done: u64, total: u64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let unit = unitFor(total)
+  run appendIn(&mut text.*, done, unit)
+  run Bytes.append(&mut text.*, b"/")
+  run appendIn(&mut text.*, total, unit)
+  run Bytes.append(&mut text.*, unitName(unit))
+}
+
+// Appends `nanos` as `0.4s`, `12s` or `3m 05s`.
+effect fn appendDuration(text: &mut Bytes, nanos: u64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let tenths = nanos / 100000000
+  if tenths < 100 {
+    run appendNumber(&mut text.*, tenths / 10)
+    run Bytes.append(&mut text.*, b".")
+    run appendNumber(&mut text.*, tenths % 10)
+    run Bytes.append(&mut text.*, b"s")
+    return ()
+  }
+  run appendSeconds(&mut text.*, tenths / 10)
+}
+
+// Appends whole `seconds` as `12s` or `3m 05s`.
+effect fn appendSeconds(text: &mut Bytes, seconds: u64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if seconds < 60 {
+    run appendNumber(&mut text.*, seconds)
+    run Bytes.append(&mut text.*, b"s")
+    return ()
+  }
+  run appendNumber(&mut text.*, seconds / 60)
+  run Bytes.append(&mut text.*, b"m ")
+  if seconds % 60 < 10 {
+    run Bytes.append(&mut text.*, b"0")
+  }
+  run appendNumber(&mut text.*, seconds % 60)
+  run Bytes.append(&mut text.*, b"s")
+}
+
+// Monotonic nanoseconds.
+effect fn now() -> u64 {
+  let instant = run NativeClock.now(true)
+  return i64.toU64(SystemClock.seconds(&instant)) * 1000000000 + i64.toU64(SystemClock.nanoseconds(&instant))
+}
+
+// Writes to standard error, dropping a failure: progress never fails the work. A WebAssembly
+// program outside WASI has no standard error, so nothing is written there.
+effect fn write(bytes: &[u8]) -> () {
+  let mut error = 0
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    let _written = run WindowsConsole.writeAll(2, bytes, &mut error)
+  } else {
+    static if Intrinsic.targetOperatingSystem() == "wasi" || Intrinsic.targetObjectFormat() != "wasm" {
+      let _written = run NativeDescriptor.writeAll(2, bytes, &mut error)
+    }
+  }
+  return ()
+}
+
+// Whether standard error is a terminal that takes escape codes.
+effect fn terminal() -> bool {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    return run WindowsConsole.enableAnsi(2)
+  } else {
+    static if Intrinsic.targetOperatingSystem() == "wasi" || Intrinsic.targetObjectFormat() != "wasm" {
+      return run NativeDescriptor.isTerminal(2)
+    } else {
+      return false
+    }
+  }
+}
+
+// The column count of the terminal on standard error, or zero when the target cannot ask.
+static if (Intrinsic.targetOperatingSystem() == "darwin" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64") && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")) {
+  effect fn terminalWidth() -> usize {
+    return match run Effect.result(Terminal.windowSize(2)) {
+      Result<WindowSize, TerminalError>.Success { value } => {
+        if value.columns >= 20 { u16.toUsize(value.columns) } else { usize.ZERO }
+      }
+      Result<WindowSize, TerminalError>.Failure {..} => usize.ZERO
+    }
+  }
+} else {
+  effect fn terminalWidth() -> usize {
+    return usize.ZERO
+  }
+}
+
+// `digits` as a decimal number, or zero when it is not one or has more than five digits.
+fn decimal(digits: &[u8]) -> usize {
+  if digits.length == usize.ZERO || digits.length > 5 {
+    return usize.ZERO
+  }
+  let mut parsed = usize.ZERO
+  let mut at = usize.ZERO
+  while at < digits.length {
+    if digits[at] < 48 || digits[at] > 57 {
+      return usize.ZERO
+    }
+    parsed = parsed * 10 + u8.toUsize(digits[at] - 48)
+    at = at + usize.ONE
+  }
+  return parsed
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}

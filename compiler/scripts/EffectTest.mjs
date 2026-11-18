@@ -7,8 +7,8 @@ import * as Effect from 'effect/Effect'
 const timeout = 3000
 const effectIt = (provide) => {
   const it = (name, body) => test(name, { timeout }, body)
-  it.effect = (name, body) =>
-    test(name, { timeout }, (t) =>
+  it.effect = (name, body, options = {}) =>
+    test(name, { timeout, ...options }, (t) =>
       Effect.runPromise(provide(Effect.scoped(Effect.suspend(body))), { signal: t.signal }),
     )
   it.layer = (layer) => (register) => register(effectIt((effect) => Effect.provide(effect, layer)))

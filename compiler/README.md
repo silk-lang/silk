@@ -18,9 +18,10 @@ The build and test steps CI runs are in `.github/workflows/selfhost.yml`.
 
 ## Manifest validation
 
-[`manifest.schema.toml`](manifest.schema.toml) is the canonical JSON Schema Draft 2020-12
-contract for `silk.toml`. The compiler embeds it and uses the existing JSON Schema and TOML
-modules to validate structure before applying build-specific semantic rules.
+[`silk.build.manifest.Manifest`](../stdlib/silk/build/manifest.silk) is the manifest definition.
+The compiler reads it with the shared TOML schema reader. `silk manifest-schema` derives the
+published [JSON Schema](../stdlib/silk/build/manifest.schema.json) from that type. The JSON
+Schema describes structure; code-backed checks enforce relationships such as dependency sources.
 
 `silk lsp` validates unsaved files whose decoded basename is exactly `silk.toml`. It publishes
 `TOML` syntax errors and `MANIFEST_SCHEMA` constraint errors with UTF-8 or UTF-16 source ranges,

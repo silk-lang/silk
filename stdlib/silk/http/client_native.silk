@@ -83,6 +83,7 @@ import silk.system.filesystem {FileError, Path}
 import silk.system.host_input {HostInput, HostInputError}
 import silk.http.message {Header, Method, OwnedResponseHead, Status, Version}
 import silk.http.client {Field, Http, HttpCause, HttpError, HttpErrorKind, Request, Response}
+import silk.cli.progress {Progress as BodyProgress}
 import silk.http.exchange as Exchange
 import silk.http.exchange {
   Connection,
@@ -310,6 +311,8 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     // instead of parsing the URL and writing the head again. It holds only while one `sendAll`
     // runs, when the settings of the client cannot change.
     lastPrepared: Option<LastPrepared>,
+    // Where the body of each final response that `send` reads is counted.
+    progressValue: BodyProgress,
     // The trust sources that the worker tasks of `sendAll` made, kept for the next round so that a
     // task does not open the PEM bundle path again.
   }
@@ -406,7 +409,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   // Sends `exchange` as one stream on the HTTP/2 connection at `index`, and reads the whole response.
   // It returns none when the connection closed before the response began, so that an idempotent
   // request can go again on a new connection.
-  effect fn exchangeHttp2(idle: &mut List<Box<IdleConnection>>, index: usize, exchange: Direct<'_>) -> Option<Received>
+  effect fn exchangeHttp2(idle: &mut List<Box<IdleConnection>>, index: usize, exchange: Direct<'_>, progress: &mut BodyProgress) -> Option<Received>
   ! HttpError | OutOfMemoryError
   ? &mut Allocator | &mut MonotonicClock | &mut Random {
     let kept = List<Box<IdleConnection>>.asMutSlice(&mut idle.*)
@@ -416,7 +419,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
       Link.Http2 {link} => &mut Box<Http2Link>.getMut(&mut link)[usize.ZERO]
       Link.Http1 {..} => { fail HttpError.make(HttpErrorKind.Protocol, "The connection does not speak HTTP/2.") }
     }
-    let result = run Effect.result(streamHttp2(&mut open.driver, exchange, secure)
+    let result = run Effect.result(streamHttp2(&mut open.driver, exchange, secure, &mut progress.*)
       |> Effect.provideMut<HttpTransport>(&mut open.transport))
     return match move result {
       Result.Success {value} => {
@@ -640,7 +643,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     return Http2Field<'a> {name: name, value: value, sensitive: false}
   }
 
-  effect fn streamHttp2(driver: &mut Driver, exchange: Direct<'_>, secure: bool) -> Streamed
+  effect fn streamHttp2(driver: &mut Driver, exchange: Direct<'_>, secure: bool, progress: &mut BodyProgress) -> Streamed
   ! HttpError | ProtocolError | TransportError | OutOfMemoryError
   ? &mut HttpTransport | &mut Allocator | &mut MonotonicClock | &mut Random {
     let rewritten = run rewriteRequest(exchange.request.bytes(), secure)
@@ -654,6 +657,8 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     let mut head = Option<OwnedResponseHead>.none()
     let mut body = Bytes.make()
     let mut reusable = true
+    // Whether the body of this response is counted: only a successful final response's.
+    let mut counted = false
     while true {
       while sent < payload.length {
         let wrote = run Http2Connection.sendData(Driver.connection(&mut driver.*), id, Slice.view<u8>(payload, sent, payload.length - sent), true)
@@ -679,7 +684,10 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
               // An informational response comes before the final one.
               if code >= 200 {
                 status = code
-                head = Option<OwnedResponseHead>.some(run headOf(code, &received))
+                let made = run headOf(code, &received)
+                counted = progress.isOpen() && code < 300
+                if counted { run progress.expect(declaredLength(&made)) }
+                head = Option<OwnedResponseHead>.some(move made)
               }
             }
             if endStream && status != 0 { break }
@@ -701,6 +709,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
             } else {
               run Bytes.append(&mut body, Bytes.asSlice(&bytes))
             }
+            if counted { run progress.advance(usize.toU64(count)) }
           }
           if count > usize.ZERO {
             run Http2Connection.release(Driver.connection(&mut driver.*), stream, usize.toU32(count))
@@ -840,6 +849,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
         idle: List<Box<IdleConnection>>.make(),
         concurrencyValue: DEFAULT_CONCURRENCY,
         lastPrepared: Option<LastPrepared>.none(),
+        progressValue: BodyProgress.off(),
       }
     }
 
@@ -967,6 +977,27 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
       next.concurrencyValue = limit
       if limit == usize.ZERO { next.concurrencyValue = usize.ONE }
       return move next
+    }
+
+    /// Counts the body of each successful final response that `send` reads in `progress`.
+    ///
+    /// # Details
+    ///
+    /// The client never opens or closes a step: open one with `Progress.begin` before `send`, such
+    /// as `Downloading silk.tar.gz`, and finish it after. While a step is open, the client sets its
+    /// total from the response's `Content-Length` and counts each body chunk as it arrives, so the
+    /// live line shows the bytes, the rate and the time left. Redirects, responses with a status
+    /// outside 200 to 299, and the requests of `sendAll` that run at the same time are not counted.
+    /// Reach the progress with [`NativeHttp.progress`].
+    pub fn reportProgress(self: Self, progress: BodyProgress) -> NativeHttp<'config> {
+      let mut next = move self
+      next.progressValue = move progress
+      return move next
+    }
+
+    /// The progress that [`NativeHttp.reportProgress`] gave the client, or one that writes nothing.
+    pub fn progress<'a>(self: &'a mut Self) -> &'a mut BodyProgress {
+      return &mut self.progressValue
     }
 
     /// Makes each final response with a status outside 200 to 299 fail with a `Status` error.
@@ -1377,6 +1408,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     body: &'b [u8],
     deadline: Instant,
     maxBody: usize,
+    progress: &'b mut BodyProgress,
   }
 
   impl<'b> RouteBody<'b> {
@@ -1388,12 +1420,12 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     ! HttpError | ExchangeError | OutOfMemoryError
     ? &mut Allocator | &mut MonotonicClock | &mut Random {
       drop route
-      let RouteBody<'b> {request, body, deadline, maxBody} = move handler
+      let RouteBody<'b> {request, body, deadline, maxBody, progress} = move handler
       let options = RequestOptions {deadline: Option<Instant>.some(move deadline), continuePolicy: ContinuePolicy.Disabled}
       let callback = effect |exchange: &mut Live<RouteTransport<'transport, 'provider, 'tunnel, NativeRouteProvider>>| -> Received
       ! HttpError | ExchangeError | OutOfMemoryError
       ? &mut Allocator | &mut MonotonicClock | &mut Random {
-        return run exchangeBody(&mut exchange.*, body, maxBody)
+        return run exchangeBody(&mut exchange.*, body, maxBody, &mut progress.*)
       }
       return run Exchange.withExchange(&mut connection.*, &request, move options, move callback)
     }
@@ -1409,7 +1441,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     handle: RouteBody.handle
   }
 
-  effect fn exchangeBody<P>(exchange: &mut Live<'_, P>, payload: &[u8], maxBody: usize) -> Received
+  effect fn exchangeBody<P>(exchange: &mut Live<'_, P>, payload: &[u8], maxBody: usize, progress: &mut BodyProgress) -> Received
   ! HttpError | ExchangeError | OutOfMemoryError
   ? &mut Allocator | &mut MonotonicClock | &mut Random
   where
@@ -1442,6 +1474,13 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     // no body reads nothing. Bigger bodies use the loop below, which grows the storage as bytes
     // arrive.
     let framing = exchange.responseFraming()
+    // Only the body of a successful final response is counted.
+    let counted = progress.isOpen() && status >= 200 && status < 300
+    if counted {
+      if let Option.Some {value: Framing.Fixed {length}} = framing {
+        run progress.expect(length)
+      }
+    }
     if let Option.Some {value: Framing.Empty} = framing {
       run Exchange.finishResponse(&mut exchange.*)
       return Received {
@@ -1458,6 +1497,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
           let count = run Exchange.readSome(&mut exchange.*, Slice.viewMut<u8>(move space, filled, declared - filled))
           if count == usize.ZERO { break }
           filled = filled + count
+          if counted { run progress.advance(usize.toU64(count)) }
         }
         Bytes.truncate(&mut sized, filled)
         run Exchange.finishResponse(&mut exchange.*)
@@ -1480,11 +1520,42 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
         }
       }
       run Bytes.append(&mut body, Slice.view<u8>(Bytes.asSlice(&scratch), usize.ZERO, count))
+      if counted { run progress.advance(usize.toU64(count)) }
     }
     run Exchange.finishResponse(&mut exchange.*)
     return Received {
       parts: run Box<ReceivedParts>.make(ReceivedParts {status: status, head: move head, body: move body, location: move location}),
     }
+  }
+
+  // The one `Content-Length` of `head` as a number, or zero when it has none, several, or one that
+  // is not a decimal number. It only sizes a progress bar.
+  fn declaredLength(head: &OwnedResponseHead) -> u64 {
+    let view = head.view()
+    let mut fields = view.headers().iter()
+    let mut length: u64 = 0
+    let mut seen = false
+    while true {
+      let next = fields.next()
+      match move next {
+        Option.None => { break }
+        Option.Some {value} => {
+          if sameName(Header.name(&value), "content-length") {
+            if seen { return 0 }
+            seen = true
+            let digits = Header.value(&value)
+            if digits.length == usize.ZERO || digits.length > 18 { return 0 }
+            let mut at = usize.ZERO
+            while at < digits.length {
+              if digits[at] < 48 || digits[at] > 57 { return 0 }
+              length = length * 10 + u8.toU64(digits[at] - 48)
+              at = at + usize.ONE
+            }
+          }
+        }
+      }
+    }
+    return length
   }
 
   // A redirect without a `Location` field has nowhere to go, so it is returned as the response
@@ -1677,7 +1748,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     }
     let mut wall = OsSystemClock.make()
     if let Option.Some {value: through} = move route {
-      let routed = RouteBody {request: move prepared, body: payload, deadline: move deadline, maxBody: settings.maxBody}
+      let routed = RouteBody {request: move prepared, body: payload, deadline: move deadline, maxBody: settings.maxBody, progress: &mut client.progressValue}
       let result = run Effect.result(viaProxy(through, move options, limits, &mut trust, move routed)
         |> Effect.provideMut<SystemClock>(&mut wall)
         |> Effect.provideMut<MonotonicClock>(&mut client.clock)
@@ -1733,7 +1804,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     }
     let exchange = Direct {request: &prepared, body: payload, deadline: &deadline, maxBody: settings.maxBody, idempotent: method.idempotent()}
     let mut job = JobTrust.Own {source: move trust}
-    let outcome = run Effect.result(exchangeKept(&mut client.idle, slot, &origin, &options, &limits, exchange, &mut job)
+    let outcome = run Effect.result(exchangeKept(&mut client.idle, slot, &origin, &options, &limits, exchange, &mut job, &mut client.progressValue)
       |> Effect.provideMut<SystemClock>(&mut wall)
       |> Effect.provideMut<MonotonicClock>(&mut client.clock)
       |> Effect.provideMut<Random>(&mut client.random))
@@ -1815,12 +1886,13 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     limits: &Limits,
     exchange: Direct<'_>,
     trust: &mut JobTrust,
+    progress: &mut BodyProgress,
   ) -> Received
   ! HttpError | ExchangeError | NativeExchangeError | ResolverError | NativeSocketError | ConnectionError | IdentityError | TrustSourceError | OutOfMemoryError
   ? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random {
     if let Option.Some {value: index} = slot {
       if isHttp2(&idle.*, index) {
-        let tried = run Effect.result(exchangeHttp2(&mut idle.*, index, exchange))
+        let tried = run Effect.result(exchangeHttp2(&mut idle.*, index, exchange, &mut progress.*))
         match move tried {
           Result.Success {value} => match move value {
             Option.Some {value: received} => {
@@ -1842,7 +1914,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
         let callback = effect |live: &mut Live<NativeTransport>| -> Received
         ! HttpError | ExchangeError | OutOfMemoryError
         ? &mut Allocator | &mut MonotonicClock | &mut Random {
-          return run exchangeBody(&mut live.*, exchange.body, exchange.maxBody)
+          return run exchangeBody(&mut live.*, exchange.body, exchange.maxBody, &mut progress.*)
         }
         let attempt = run Effect.result(Exchange.withExchange(connectionAt(&mut idle.*, index), exchange.request, exchangeOptions(exchange.deadline), move callback))
         match move attempt {
@@ -1868,7 +1940,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     let unresolved = List<Endpoint>.make()
     let index = run connectIdle(&mut idle.*, origin, &unresolved, options, limits) |> Effect.provideMut<TrustSource>(&mut trust.*)
     if isHttp2(&idle.*, index) {
-      let fresh = run Effect.result(exchangeHttp2(&mut idle.*, index, exchange))
+      let fresh = run Effect.result(exchangeHttp2(&mut idle.*, index, exchange, &mut progress.*))
       match move fresh {
         Result.Success {value} => match move value {
           Option.Some {value: received} => {
@@ -1890,7 +1962,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     let callback = effect |live: &mut Live<NativeTransport>| -> Received
     ! HttpError | ExchangeError | OutOfMemoryError
     ? &mut Allocator | &mut MonotonicClock | &mut Random {
-      return run exchangeBody(&mut live.*, exchange.body, exchange.maxBody)
+      return run exchangeBody(&mut live.*, exchange.body, exchange.maxBody, &mut progress.*)
     }
     let result = run Effect.result(Exchange.withExchange(connectionAt(&mut idle.*, index), exchange.request, exchangeOptions(exchange.deadline), move callback))
     return match move result {
@@ -3484,11 +3556,13 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     let now = run MonotonicClock.now()
     let deadline = MonotonicClock.deadlineAfter(&now, job.timeoutNanoseconds)
     let exchange = Direct {request: &job.request, body: Bytes.asSlice(&job.body), deadline: &deadline, maxBody: job.maxBody, idempotent: job.idempotent}
+    // Requests that run at the same time share no progress line.
+    let mut quiet = BodyProgress.off()
     // This is `exchangeKept` written out for a job, which returns its failure: the exchange runs
     // in this frame, without a result and the frame of `exchangeKept` around it.
     if let Option.Some {value: index} = slot {
       if isHttp2(&idle.*, index) {
-        let tried = run Effect.result(exchangeHttp2(&mut idle.*, index, exchange))
+        let tried = run Effect.result(exchangeHttp2(&mut idle.*, index, exchange, &mut quiet))
         match move tried {
           Result.Success {value} => match move value {
             Option.Some {value: received} => {
@@ -3509,7 +3583,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
         let callback = effect |live: &mut Live<NativeTransport>| -> Received
         ! HttpError | ExchangeError | OutOfMemoryError
         ? &mut Allocator | &mut MonotonicClock | &mut Random {
-          return run exchangeBody(&mut live.*, exchange.body, exchange.maxBody)
+          return run exchangeBody(&mut live.*, exchange.body, exchange.maxBody, &mut quiet)
         }
         let attempt = run Effect.result(Exchange.withExchange(connectionAt(&mut idle.*, index), exchange.request, exchangeOptions(exchange.deadline), move callback))
         match move attempt {
@@ -3555,7 +3629,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
       }
     }
     if isHttp2(&idle.*, index) {
-      let fresh = run Effect.result(exchangeHttp2(&mut idle.*, index, exchange))
+      let fresh = run Effect.result(exchangeHttp2(&mut idle.*, index, exchange, &mut quiet))
       return match move fresh {
         Result.Success {value} => match move value {
           Option.Some {value: received} => {
@@ -3576,7 +3650,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     let callback = effect |live: &mut Live<NativeTransport>| -> Received
     ! HttpError | ExchangeError | OutOfMemoryError
     ? &mut Allocator | &mut MonotonicClock | &mut Random {
-      return run exchangeBody(&mut live.*, exchange.body, exchange.maxBody)
+      return run exchangeBody(&mut live.*, exchange.body, exchange.maxBody, &mut quiet)
     }
     let result = run Effect.result(Exchange.withExchange(connectionAt(&mut idle.*, index), exchange.request, exchangeOptions(exchange.deadline), move callback))
     return match move result {

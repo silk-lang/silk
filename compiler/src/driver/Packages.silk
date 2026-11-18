@@ -1,50 +1,57 @@
-//! The packages one build reads: the root package and every package its `[dependencies]` reach.
+//! Packages reached by a compilation's module imports, and metadata-only pin operations.
 //!
-//! # Details
-//! Each manifest's `[dependencies]` table maps a dependency name to `{ path, package? }`, or to a
-//! git dependency `{ git, rev, path?, package? }` (PACKAGE-002). Loading follows those tables depth
-//! first from the root package and checks the rules a build relies on: identifier names other than
-//! `silk` and `Intrinsic`, a readable manifest at each path, a matching `package` name, no name that
-//! is also one of the owner's own top-level modules (PACKAGE-003), no package cycle, and one version
-//! and one directory per package name (PACKAGE-004). An entry takes no field but `path`, `git`,
-//! `rev` and `package`. A dependency's `[package].exports` must list modules that exist in it
-//! (PACKAGE-006).
+//! Each manifest declares the available path, git, and archive pins. `load` retains the root's
+//! declarations; `require` fetches and validates one alias when import discovery reaches it.
+//! Validation enforces package identity, source boundaries, exports, and acyclic imports.
+//! Unused dependencies contribute neither source nor build plans to a compilation.
 //!
-//! A git dependency reads the package at `path` (the repository root by default) in the checkout
-//! of commit `rev` (driver/GitCheckouts). Loading only reads checkouts; [`fetch`] writes the
-//! missing ones first. A package read from a checkout reaches other packages by `path` only inside
-//! the same checkout, so a commit pins its whole dependency graph.
-//!
-//! Each dependency's `[native].link` is read with it (driver/NativeLinkInput), so an executable
-//! links what its libraries declare: [`linkOrder`] lists the packages with every dependent before
-//! its dependencies, the order a static link resolves symbols in.
+//! Explicit `fetch` visits the declared pins for offline work. `requireAll` checks the complete
+//! local metadata graph for dependency editing. Neither evaluates package code.
 
+import silk.system.host_path as HostPath
 import driver.CommandPath
-import driver.GitCheckouts as Checkouts {FetchFailed}
+import driver.RequestText
+import silk.build.manifest { Dependency }
+import silk.schema.schema { Schemas }
+import silk.schema.toml { TomlSchemaReader }
+import silk.schema.issue { Issue }
+import silk.build.request { Parameter as RequestParameter, Module as RequestModule }
+import silk.build.request {
+  Request as CompilationRequest,
+  Package as RequestPackage,
+  Dependency as RequestDependency
+}
+import driver.GitCheckouts as Checkouts { FetchFailed }
 import driver.ManifestFields
 import driver.ManifestSchema as ManifestSchemas
 import driver.NativeArchive as NativeArchives
 import driver.ManifestText
-import driver.WorkspaceDependencies as Workspaces {Shared}
-import driver.NativeLinkInput as NativeLinkInputs {Archive, ArchiveContext, Declarations, Declared, InvalidNativeLinkInput}
+import driver.WorkspaceDependencies as Workspaces { Shared }
+import driver.NativeLinkInput as NativeLinkInputs {
+  Archive,
+  ArchiveContext,
+  NativeLinkInput,
+  InvalidNativeLinkInput
+}
 import ReleaseVersion
-import semantic.ModuleId {InvalidModulePath, ModuleId}
-import semantic.PackageGraph {PackageGraph}
-import silk.mem.allocator {Allocator, OutOfMemoryError}
-import silk.mem.box {Box}
-import silk.collections.bytes {Bytes}
-import silk.core.effect {Effect}
-import silk.system.child_process {ChildProcess}
-import silk.system.filesystem {DirectoryEntry, FileError, FileSystem, Path}
-import silk.system.host_input {HostInput, HostInputError}
-import silk.core.option {Option}
-import silk.core.result {Result}
-import silk.collections.slice {Slice}
-import silk.text.string {String}
-import silk.toml.scanner {TomlError}
-import silk.toml.value {Toml, TomlChild, Value as TomlValue}
+import semantic.ModuleId { InvalidModulePath, ModuleId }
+import semantic.PackageGraph { PackageGraph }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.box { Box }
+import silk.collections.bytes { Bytes }
+import silk.core.effect { Effect }
+import silk.system.child_process { ChildProcess }
+import silk.system.filesystem { DirectoryEntry, FileError, FileSystem, Path }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.core.option { Option }
+import silk.mem.interned { Interned as SharedDocument }
+import silk.core.result { Result }
+import silk.collections.slice { Slice }
+import silk.text.string { String }
+import silk.toml.scanner { TomlError }
+import silk.toml.value { Toml, TomlChild, Value as TomlValue }
 import silk.num.usize
-import silk.collections.list {List}
+import silk.collections.list { List }
 
 /// A dependency the build cannot use. `detail` names the dependency and what is wrong with it.
 /// `manifest` is the silk.toml that writes the fault and `line` its 1-based line there; `manifest`
@@ -60,6 +67,7 @@ struct Package {
   // `name@version`, the identity its module identities carry.
   identity: Bytes,
   name: Bytes,
+  document: Option<SharedDocument<TomlValue>>,
   // The directory holding its manifest.
   manifest: Path,
   // The directory its module paths resolve below.
@@ -68,9 +76,8 @@ struct Package {
   exports: List<Bytes>,
   // The root of the git checkout it was read from, or `None` for a package outside the store.
   checkout: Option<Path>,
-  // Its `[native].link`, resolved against its manifest's directory; empty for the root package,
-  // whose inputs its build reads itself.
-  linkInputs: List<Declared>,
+  // Native inputs attached after evaluating this reached package's typed plan.
+  linkInputs: List<NativeLinkInput>,
   // Its `[native.archive.*]`, selected for the build's target.
   archives: List<Archive>,
 }
@@ -96,10 +103,14 @@ pub struct Packages {
 }
 
 fn same(left: &[u8], right: &[u8]) -> bool {
-  if left.length != right.length { return false }
+  if left.length != right.length {
+    return false
+  }
   let mut at = usize.ZERO
   while at < left.length {
-    if left[at] != right[at] { return false }
+    if left[at] != right[at] {
+      return false
+    }
     at = at + usize.ONE
   }
   return true
@@ -107,33 +118,48 @@ fn same(left: &[u8], right: &[u8]) -> bool {
 
 // Whether `text` is an identifier: an ASCII letter or `_`, then letters, digits or `_`.
 fn identifier(text: &[u8]) -> bool {
-  if text.length == usize.ZERO { return false }
+  if text.length == usize.ZERO {
+    return false
+  }
   let mut at = usize.ZERO
   while at < text.length {
     let byte = text[at]
     let letter = (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95
     let digit = byte >= 48 && byte <= 57
-    if !letter && !(digit && at > usize.ZERO) { return false }
+    if !letter && !(digit && at > usize.ZERO) {
+      return false
+    }
     at = at + usize.ONE
   }
   return true
 }
 
-effect fn copyPath(path: &Path) -> Path ! FileError | OutOfMemoryError ? &mut Allocator {
+effect fn copyPath(path: &Path) -> Path
+  ! FileError | OutOfMemoryError
+  ? &mut Allocator {
   return run Path.fromBytes(Path.rawBytes(path))
 }
 
 // Fails with `dependency <name> of <owner>: <reason>`, at the line of the silk.toml in `directory`
 // that writes `dependencies.<name>`, or its `field` unless that is empty.
 effect fn invalid(owner: &[u8], name: &[u8], reason: &[u8], directory: &Path, field: &[u8]) -> never
-! InvalidDependency | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  ! InvalidDependency | FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
   run invalidIn(owner, name, reason, directory, b"dependencies", field)
 }
 
 // Fails as [`invalid`] does, at the line that writes `<table>.<name>`: `table` is `dependencies`
 // for a package's own entry and `workspace.dependencies` for one its workspace shares.
-effect fn invalidIn(owner: &[u8], name: &[u8], reason: &[u8], directory: &Path, table: &[u8], field: &[u8]) -> never
-! InvalidDependency | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+effect fn invalidIn(
+  owner: &[u8],
+  name: &[u8],
+  reason: &[u8],
+  directory: &Path,
+  table: &[u8],
+  field: &[u8],
+) -> never
+  ! InvalidDependency | FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
   let manifest = run Path.join(directory, "silk.toml")
   let key = run dependencyKey(table, name, field)
   let line = run lineIn(&manifest, Bytes.asSlice(&key))
@@ -142,33 +168,47 @@ effect fn invalidIn(owner: &[u8], name: &[u8], reason: &[u8], directory: &Path, 
 
 // Fails as [`invalid`] does, at `line` of the silk.toml `manifest`.
 effect fn invalidAt(owner: &[u8], name: &[u8], reason: &[u8], manifest: &Path, line: usize) -> never
-! InvalidDependency | OutOfMemoryError ? &mut Allocator {
+  ! InvalidDependency | OutOfMemoryError
+  ? &mut Allocator {
   let mut detail = run Bytes.copy(b"dependency `")
   run Bytes.append(&mut detail, name)
   run Bytes.append(&mut detail, b"` of ")
   run Bytes.append(&mut detail, owner)
   run Bytes.append(&mut detail, b": ")
   run Bytes.append(&mut detail, reason)
-  fail InvalidDependency {detail: move detail, manifest: run Bytes.copy(Path.rawBytes(manifest)), line: line}
+  fail InvalidDependency {
+    detail: move detail,
+    manifest: run Bytes.copy(Path.rawBytes(manifest)),
+    line: line,
+  }
 }
 
 // The line of the silk.toml `manifest` that writes the dotted key `key`, or zero when it cannot be
 // read. Only refusals call it, so reading the file again costs a successful build nothing.
-effect fn lineIn(manifest: &Path, key: &[u8]) -> usize ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+effect fn lineIn(manifest: &Path, key: &[u8]) -> usize
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
   return match move run Effect.result(FileSystem.readFile(manifest)) {
-    Result<Bytes, FileError | OutOfMemoryError>.Success {value} => ManifestText.keyLine(Bytes.asSlice(&value), key)
-    Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
+    Result<Bytes, FileError | OutOfMemoryError>.Success { value } => ManifestText.keyLine(
+      Bytes.asSlice(&value),
+      key,
+    )
+    Result<Bytes, FileError | OutOfMemoryError>.Failure { error } => match move error {
       FileError unread => {
         drop unread
         return usize.ZERO
       }
-      OutOfMemoryError exhausted => { fail move exhausted }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
     }
   }
 }
 
 // `<table>.<name>`, then `.<field>` unless `field` is empty: the key a dependency refusal names.
-effect fn dependencyKey(table: &[u8], name: &[u8], field: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+effect fn dependencyKey(table: &[u8], name: &[u8], field: &[u8]) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
   let mut key = run Bytes.copy(table)
   run Bytes.append(&mut key, b".")
   run Bytes.append(&mut key, name)
@@ -180,13 +220,19 @@ effect fn dependencyKey(table: &[u8], name: &[u8], field: &[u8]) -> Bytes ! OutO
 }
 
 // The manifest's `name@version`, or `None` without a name. The version defaults to `0.0.0`.
-effect fn identityOf(document: &TomlValue) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+effect fn identityOf(document: &TomlValue) -> Option<Bytes>
+  ! OutOfMemoryError
+  ? &mut Allocator {
   let name = match move Toml.asString(Toml.fieldAt(Toml.field(document, "package"), "name")) {
-    Option<string>.Some {value} => String.utf8Bytes(value)
-    Option<string>.None => { return Option<Bytes>.none() }
+    Option<string>.Some { value } => String.utf8Bytes(value)
+    Option<string>.None => {
+      return Option<Bytes>.none()
+    }
   }
   let version = ManifestFields.version(document)
-  if name.length == usize.ZERO || version.length == usize.ZERO { return Option<Bytes>.none() }
+  if name.length == usize.ZERO || version.length == usize.ZERO {
+    return Option<Bytes>.none()
+  }
   let mut identity = run Bytes.copy(name)
   run Bytes.append(&mut identity, b"@")
   run Bytes.append(&mut identity, version)
@@ -195,10 +241,14 @@ effect fn identityOf(document: &TomlValue) -> Option<Bytes> ! OutOfMemoryError ?
 
 // Whether `sourceRoot` holds a module `name.silk` or a directory `name`, which a dependency of the
 // same name would hide (PACKAGE-003).
-effect fn shadows(sourceRoot: &Path, name: &[u8]) -> bool ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+effect fn shadows(sourceRoot: &Path, name: &[u8]) -> bool
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
   let directory = run Path.joinBytes(sourceRoot, name)
   let found = run FileSystem.exists(&directory)
-  if found { return true }
+  if found {
+    return true
+  }
   let mut file = run Bytes.copy(name)
   run Bytes.append(&mut file, b".silk")
   let module = run Path.joinBytes(sourceRoot, Bytes.asSlice(&file))
@@ -208,7 +258,8 @@ effect fn shadows(sourceRoot: &Path, name: &[u8]) -> bool ! FileError | OutOfMem
 // Fails with `exports of <package>: <entry> <reason>`, at the `package.exports` line of the
 // silk.toml in `directory`.
 effect fn invalidExport(package: &[u8], entry: &[u8], reason: &[u8], directory: &Path) -> never
-! InvalidDependency | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  ! InvalidDependency | FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
   let manifest = run Path.join(directory, "silk.toml")
   let line = run lineIn(&manifest, b"package.exports")
   let mut detail = run Bytes.copy(b"exports of ")
@@ -217,33 +268,54 @@ effect fn invalidExport(package: &[u8], entry: &[u8], reason: &[u8], directory: 
   run Bytes.append(&mut detail, entry)
   run Bytes.append(&mut detail, b" ")
   run Bytes.append(&mut detail, reason)
-  fail InvalidDependency {detail: move detail, manifest: run Bytes.copy(Path.rawBytes(&manifest)), line: line}
+  fail InvalidDependency {
+    detail: move detail,
+    manifest: run Bytes.copy(Path.rawBytes(&manifest)),
+    line: line,
+  }
 }
 
 // The canonical module paths `[package].exports` lists in import spelling (`codec.Json` becomes
 // `codec/Json.silk`, or `codec/Json/mod.silk` when that barrel file is the one present), each
 // checked to name a module below `sourceRoot` (PACKAGE-006). `directory` holds the manifest.
-effect fn exportsOf(package: &[u8], document: &TomlValue, directory: &Path, sourceRoot: &Path) -> List<Bytes>
-! InvalidDependency | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+effect fn exportsOf(
+  package: &[u8],
+  document: &TomlValue,
+  directory: &Path,
+  sourceRoot: &Path,
+) -> List<Bytes>
+  ! InvalidDependency | FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
   let mut exports = List<Bytes>.make()
   let listed = match move Toml.fieldAt(Toml.field(document, "package"), "exports") {
-    Option<&TomlValue>.Some {value} => value
-    Option<&TomlValue>.None => { return move exports }
+    Option<&TomlValue>.Some { value } => value
+    Option<&TomlValue>.None => {
+      return move exports
+    }
   }
   let array = match &listed.* {
-    TomlValue.Array {..} => true
+    TomlValue.Array { .. } => true
     _ => false
   }
-  if !array { run invalidExport(package, b"[package].exports", b"must be an array of module names", directory) }
+  if !array {
+    run invalidExport(package, b"[package].exports", b"must be an array of module names", directory)
+  }
   let mut at = usize.ZERO
   while true {
     let item = match move Toml.item(listed, at) {
-      Option<&TomlValue>.Some {value} => value
-      Option<&TomlValue>.None => { return move exports }
+      Option<&TomlValue>.Some { value } => value
+      Option<&TomlValue>.None => {
+        return move exports
+      }
     }
     let spelling = match move Toml.asString(Option<&TomlValue>.some(item)) {
-      Option<string>.Some {value} => String.utf8Bytes(value)
-      Option<string>.None => run invalidExport(package, b"[package].exports", b"must list module names as strings", directory)
+      Option<string>.Some { value } => String.utf8Bytes(value)
+      Option<string>.None => run invalidExport(
+        package,
+        b"[package].exports",
+        b"must list module names as strings",
+        directory,
+      )
     }
     let mut path = Bytes.make()
     let mut start = usize.ZERO
@@ -251,17 +323,32 @@ effect fn exportsOf(package: &[u8], document: &TomlValue, directory: &Path, sour
     while cursor <= spelling.length {
       if cursor == spelling.length || spelling[cursor] == 46 {
         let segment = Slice.view<u8>(spelling, start, cursor - start)
-        if !identifier(segment) { run invalidExport(package, spelling, b"is not a module name such as `codec.Json`", directory) }
-        if start > usize.ZERO { run Bytes.append(&mut path, b"/") }
+        if !identifier(segment) {
+          run invalidExport(
+            package,
+            spelling,
+            b"is not a module name such as `codec.Json`",
+            directory,
+          )
+        }
+        if start > usize.ZERO {
+          run Bytes.append(&mut path, b"/")
+        }
         run Bytes.append(&mut path, segment)
         start = cursor + usize.ONE
       }
       cursor = cursor + usize.ONE
     }
     run Bytes.append(&mut path, b".silk")
+
     // MODULE-007: the entry names the module file or its directory's barrel `mod.silk`.
     if PackageGraph.isBarrel(Bytes.asSlice(&path)) {
-      run invalidExport(package, spelling, b"names a `mod.silk` file; list its directory's path without `.mod`", directory)
+      run invalidExport(
+        package,
+        spelling,
+        b"names a `mod.silk` file; list its directory's path without `.mod`",
+        directory,
+      )
     }
     let barrel = run PackageGraph.barrelPath(Bytes.asSlice(&path))
     let file = run Path.joinBytes(sourceRoot, Bytes.asSlice(&path))
@@ -269,9 +356,16 @@ effect fn exportsOf(package: &[u8], document: &TomlValue, directory: &Path, sour
     let barrelFile = run Path.joinBytes(sourceRoot, Bytes.asSlice(&barrel))
     let barrelFound = run FileSystem.exists(&barrelFile)
     if fileFound && barrelFound {
-      run invalidExport(package, spelling, b"names both a module file and its directory's `mod.silk`; remove or rename one of them", directory)
+      run invalidExport(
+        package,
+        spelling,
+        b"names both a module file and its directory's `mod.silk`; remove or rename one of them",
+        directory,
+      )
     }
-    if !fileFound && !barrelFound { run invalidExport(package, spelling, b"is not a module of the package", directory) }
+    if !fileFound && !barrelFound {
+      run invalidExport(package, spelling, b"is not a module of the package", directory)
+    }
     if barrelFound {
       run List<Bytes>.append(&mut exports, move barrel)
     } else {
@@ -285,7 +379,7 @@ effect fn exportsOf(package: &[u8], document: &TomlValue, directory: &Path, sour
 // The members of a table, or `None` for another kind of value.
 fn members<'a>(value: &'a TomlValue) -> Option<&'a [TomlChild]> {
   return match &value.* {
-    TomlValue.Table {entries, kind: _} => {
+    TomlValue.Table { entries, kind: _ } => {
       let boxed = Box<List<TomlChild>>.get(&entries)
       return Option<&'a [TomlChild]>.some(List<TomlChild>.asSlice(&boxed[0]))
     }
@@ -296,7 +390,9 @@ fn members<'a>(value: &'a TomlValue) -> Option<&'a [TomlChild]> {
 fn indexOf(packages: &[Package], name: &[u8]) -> usize {
   let mut at = usize.ZERO
   while at < packages.length {
-    if same(Bytes.asSlice(&packages[at].name), name) { return at }
+    if same(Bytes.asSlice(&packages[at].name), name) {
+      return at
+    }
     at = at + usize.ONE
   }
   return usize.MAX
@@ -305,7 +401,9 @@ fn indexOf(packages: &[Package], name: &[u8]) -> usize {
 fn onStack(stack: &[Bytes], identity: &[u8]) -> bool {
   let mut at = usize.ZERO
   while at < stack.length {
-    if same(Bytes.asSlice(&stack[at]), identity) { return true }
+    if same(Bytes.asSlice(&stack[at]), identity) {
+      return true
+    }
     at = at + usize.ONE
   }
   return false
@@ -313,19 +411,26 @@ fn onStack(stack: &[Bytes], identity: &[u8]) -> bool {
 
 // Whether `path` is `root` or a path below it.
 fn within(root: &[u8], path: &[u8]) -> bool {
-  if path.length < root.length || !same(Slice.view<u8>(path, usize.ZERO, root.length), root) { return false }
+  if path.length < root.length || !same(Slice.view<u8>(path, usize.ZERO, root.length), root) {
+    return false
+  }
   return path.length == root.length || path[root.length] == 47
 }
 
 // Whether `written` is a relative path with no `..` segment, so it stays below the directory it
 // is joined to.
 fn contained(written: &[u8]) -> bool {
-  if written.length == usize.ZERO || written[usize.ZERO] == 47 { return false }
+  if written.length == usize.ZERO || written[usize.ZERO] == 47 {
+    return false
+  }
   let mut start = usize.ZERO
   let mut cursor = usize.ZERO
   while cursor <= written.length {
     if cursor == written.length || written[cursor] == 47 {
-      if cursor - start == usize.add(0, 2) && written[start] == 46 && written[start + usize.ONE] == 46 { return false }
+      if cursor - start == usize.add(0, 2) && written[start] == 46
+        && written[start + usize.ONE] == 46 {
+        return false
+      }
       start = cursor + usize.ONE
     }
     cursor = cursor + usize.ONE
@@ -335,9 +440,11 @@ fn contained(written: &[u8]) -> bool {
 
 // `path`'s real directory, or `path` itself when it cannot be resolved, so that paths reaching one
 // directory through different symbolic links compare equal.
-effect fn real(path: Path) -> Path ! FileError | OutOfMemoryError ? &mut Allocator {
-  return match move run CommandPath.canonical(Path.rawBytes(&path)) {
-    Option<Bytes>.Some {value} => run Path.fromBytes(Bytes.asSlice(&value))
+effect fn real(path: Path) -> Path
+  ! FileError | OutOfMemoryError
+  ? &mut Allocator {
+  return match move run HostPath.canonicalBytes(Path.rawBytes(&path)) {
+    Option<Bytes>.Some { value } => run Path.fromBytes(Bytes.asSlice(&value))
     Option<Bytes>.None => move path
   }
 }
@@ -345,20 +452,26 @@ effect fn real(path: Path) -> Path ! FileError | OutOfMemoryError ? &mut Allocat
 /// Whether `url` is an archive URL a url dependency may name: HTTPS, or a `file://` URL of an
 /// absolute path, as a local mirror serves.
 pub fn isArchiveUrl(url: &[u8]) -> bool {
-  return (startsWith(url, b"https://") && url.length > 8) || (startsWith(url, b"file:///") && url.length > 8)
+  return (startsWith(url, b"https://") && url.length > 8)
+    || (startsWith(url, b"file:///") && url.length > 8)
 }
 
 fn startsWith(text: &[u8], prefix: &[u8]) -> bool {
-  return text.length >= prefix.length && same(Slice.view<u8>(text, usize.ZERO, prefix.length), prefix)
+  return text.length >= prefix.length
+    && same(Slice.view<u8>(text, usize.ZERO, prefix.length), prefix)
 }
 
 // Whether `digest` is a SHA-256 in lowercase hexadecimal.
 fn isDigest(digest: &[u8]) -> bool {
-  if digest.length != 64 { return false }
+  if digest.length != 64 {
+    return false
+  }
   let mut at = usize.ZERO
   while at < digest.length {
     let byte = digest[at]
-    if !((byte >= 48 && byte <= 57) || (byte >= 97 && byte <= 102)) { return false }
+    if !((byte >= 48 && byte <= 57) || (byte >= 97 && byte <= 102)) {
+      return false
+    }
     at = at + usize.ONE
   }
   return true
@@ -366,24 +479,37 @@ fn isDigest(digest: &[u8]) -> bool {
 
 /// The directory of the archive with SHA-256 `digest` in the archive store beside the checkout
 /// store `store` (`$SILK_HOME/archives/<digest>`), or none.
-pub effect fn archiveDirectory(store: &Path, digest: &[u8]) -> Option<Path> ! FileError | OutOfMemoryError ? &mut Allocator {
+pub effect fn archiveDirectory(store: &Path, digest: &[u8]) -> Option<Path>
+  ! FileError | OutOfMemoryError
+  ? &mut Allocator {
   return match move run Path.parent(store) {
-    Option<Path>.Some {value: home} => Option<Path>.some(run Path.joinBytes(&run Path.join(&home, "archives"), digest))
+    Option<Path>.Some { value: home } => Option<Path>.some(
+      run Path.joinBytes(&run Path.join(&home, "archives"), digest),
+    )
     Option<Path>.None => Option<Path>.none()
   }
 }
 
 /// The package root of an extracted archive: `directory` when it holds `silk.toml`, else its one
 /// entry when that is a directory, as an archive with a top directory such as `name-1.0.0/` holds.
-pub effect fn archiveRoot(directory: Path) -> Path ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+pub effect fn archiveRoot(directory: Path) -> Path
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
   let manifest = run Path.join(&directory, "silk.toml")
-  if let Result<bool, FileError>.Success {value: found} = move run Effect.result(FileSystem.exists(&manifest)) {
-    if found { return move directory }
+  if let Result<bool, FileError>.Success { value: found } = move run Effect.result(
+    FileSystem.exists(&manifest),
+  ) {
+    if found {
+      return move directory
+    }
   }
   let listed = run Effect.result(FileSystem.listDirectory(&directory))
-  if let Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Success {value: entries} = move listed {
+  if let Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Success {
+    value: entries
+  } = move listed {
     let children = List<DirectoryEntry>.asSlice(&entries)
-    if children.length == usize.ONE && children[usize.ZERO].kind.code == FileSystem.entryKindCode(FileSystem.directory()) {
+    if children.length == usize.ONE
+      && children[usize.ZERO].kind.code == FileSystem.entryKindCode(FileSystem.directory()) {
       return run copyPath(&children[usize.ZERO].path)
     }
   }
@@ -399,39 +525,37 @@ struct Located {
 }
 
 // The package name the dependency entry `entry` writes as `package`, when it does.
-effect fn expectedPackage(entry: &TomlValue) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+effect fn expectedPackage(entry: &TomlValue) -> Option<Bytes>
+  ! OutOfMemoryError
+  ? &mut Allocator {
   return match move Toml.asString(Toml.field(entry, "package")) {
-    Option<string>.Some {value} => Option<Bytes>.some(run Bytes.copy(String.utf8Bytes(value)))
+    Option<string>.Some { value } => Option<Bytes>.some(run Bytes.copy(String.utf8Bytes(value)))
     Option<string>.None => Option<Bytes>.none()
   }
 }
 
-// Refuses a field of the entry `entry` of dependency `name` of `owner` that a dependency does not
-// take. `directory` holds the silk.toml that writes the entry in its table `table`.
-effect fn checkFields(owner: &[u8], name: &[u8], entry: &TomlValue, directory: &Path, table: &[u8]) -> ()
-! InvalidDependency | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  if let Option<&[TomlChild]>.Some {value: fields} = move members(entry) {
-    let mut field = usize.ZERO
-    while field < fields.length {
-      if let TomlChild.Member {entry: written} = &fields[field] {
-        let key = String.ownedUtf8Bytes(&written.key)
-        if !same(key, b"path") && !same(key, b"package") && !same(key, b"git") && !same(key, b"rev") && !same(key, b"url") && !same(key, b"sha256") && !same(key, b"workspace") {
-          // Other sources and their modifiers are reserved for a later release.
-          let reserved = same(key, b"version") || same(key, b"tag")
-            || same(key, b"branch") || same(key, b"hash") || same(key, b"optional")
-          let mut reason = run Bytes.copy(key)
-          if reserved {
-            run Bytes.append(&mut reason, b" is not supported yet; a dependency takes only path, git, rev, url, sha256 and package, or workspace = true alone")
-            if same(key, b"tag") || same(key, b"branch") {
-              run Bytes.append(&mut reason, b"; pin a git dependency to a full commit hash with rev")
-            }
-          } else {
-            run Bytes.append(&mut reason, b" is not a supported field; a dependency takes only path, git, rev, url, sha256 and package, or workspace = true alone")
-          }
-          run invalidIn(owner, name, Bytes.asSlice(&reason), directory, table, key)
-        }
+// Validates dependency entries with the public manifest schema, including workspace pins.
+effect fn checkFields(
+  owner: &[u8],
+  name: &[u8],
+  entry: &TomlValue,
+  directory: &Path,
+  table: &[u8],
+) -> ()
+  ! InvalidDependency | FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let mut reader = TomlSchemaReader.make(entry)
+  match move run Effect.result(Schemas.read<Dependency, TomlSchemaReader<'_>>(&mut reader)) {
+    Result<Dependency, Issue | OutOfMemoryError>.Success { value } => {
+      drop value
+    }
+    Result<Dependency, Issue | OutOfMemoryError>.Failure { error } => match move error {
+      OutOfMemoryError exhausted => {
+        fail move exhausted
       }
-      field = field + usize.ONE
+      Issue problem => {
+        run invalidIn(owner, name, String.utf8Bytes(problem.expected), directory, table, b"")
+      }
     }
   }
   return ()
@@ -441,23 +565,37 @@ effect fn checkFields(owner: &[u8], name: &[u8], entry: &TomlValue, directory: &
 // `ownerDirectory`. An entry that is `{ workspace = true }` is read from the entry of the same
 // name in `[workspace.dependencies]` of `shared`, the owner's workspace, whose `path` resolves
 // against the workspace root's directory (PACKAGE-008).
-effect fn place(packages: &Packages, owner: &[u8], name: &[u8], entry: &TomlValue, ownerDirectory: &Path, ownerCheckout: &Option<Path>, shared: &Option<Shared>) -> Located
-! InvalidDependency | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+effect fn place(
+  packages: &Packages,
+  owner: &[u8],
+  name: &[u8],
+  entry: &TomlValue,
+  ownerDirectory: &Path,
+  ownerCheckout: &Option<Path>,
+  shared: &Option<Shared>,
+) -> Located
+  ! InvalidDependency | FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
   if !Workspaces.inherits(entry) {
     return run locate(packages, owner, name, entry, ownerDirectory, ownerCheckout, b"dependencies")
   }
-  if !Workspaces.inheritsOnly(entry) {
-    run invalid(owner, name, b"an entry taken from the workspace is written { workspace = true }, with no other field", ownerDirectory, b"workspace")
-  }
   let workspace = match &shared.* {
-    Option<Shared>.Some {value} => &value
-    Option<Shared>.None => run invalid(owner, name, b"workspace = true takes the entry from [workspace.dependencies], but no workspace lists this package as a member", ownerDirectory, b"workspace")
+    Option<Shared>.Some { value } => &value
+    Option<Shared>.None => run invalid(
+      owner,
+      name,
+      b"workspace = true takes the entry from [workspace.dependencies], but no workspace lists this package as a member",
+      ownerDirectory,
+      b"workspace",
+    )
   }
   let root = Workspaces.directory(workspace)
   let written = match move Workspaces.find(workspace, name) {
-    Option<&TomlValue>.Some {value} => value
+    Option<&TomlValue>.Some { value } => value
     Option<&TomlValue>.None => {
-      let mut reason = run Bytes.copy(b"workspace = true takes the entry from [workspace.dependencies] of ")
+      let mut reason = run Bytes.copy(
+        b"workspace = true takes the entry from [workspace.dependencies] of ",
+      )
       run Bytes.append(&mut reason, Path.rawBytes(Workspaces.manifest(workspace)))
       run Bytes.append(&mut reason, b", which has no `")
       run Bytes.append(&mut reason, name)
@@ -466,14 +604,28 @@ effect fn place(packages: &Packages, owner: &[u8], name: &[u8], entry: &TomlValu
     }
   }
   let table = match &written.* {
-    TomlValue.Table {..} => true
+    TomlValue.Table { .. } => true
     _ => false
   }
   if !table {
-    run invalidIn(owner, name, b"a dependency must be a table such as { path = \"../library\" }", root, b"workspace.dependencies", b"")
+    run invalidIn(
+      owner,
+      name,
+      b"a dependency must be a table such as { path = \"../library\" }",
+      root,
+      b"workspace.dependencies",
+      b"",
+    )
   }
   if Workspaces.inherits(written) {
-    run invalidIn(owner, name, b"an entry of [workspace.dependencies] is the one members take, so it cannot be workspace = true itself", root, b"workspace.dependencies", b"workspace")
+    run invalidIn(
+      owner,
+      name,
+      b"an entry of [workspace.dependencies] is the one members take, so it cannot be workspace = true itself",
+      root,
+      b"workspace.dependencies",
+      b"workspace",
+    )
   }
   run checkFields(owner, name, written, root, b"workspace.dependencies")
   return run locate(packages, owner, name, written, root, ownerCheckout, b"workspace.dependencies")
@@ -484,85 +636,197 @@ effect fn place(packages: &Packages, owner: &[u8], name: &[u8], entry: &TomlValu
 // dependency's is `path` from `ownerDirectory`, and must stay inside `ownerCheckout` when the owner
 // was read from one. `ownerDirectory` holds the silk.toml that writes `entry` in its table `table`:
 // the owner's `dependencies`, or its workspace's `workspace.dependencies`.
-effect fn locate(packages: &Packages, owner: &[u8], name: &[u8], entry: &TomlValue, ownerDirectory: &Path, ownerCheckout: &Option<Path>, table: &[u8]) -> Located
-! InvalidDependency | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  if let Option<&TomlValue>.Some {..} = move Toml.field(entry, "url") {
+effect fn locate(
+  packages: &Packages,
+  owner: &[u8],
+  name: &[u8],
+  entry: &TomlValue,
+  ownerDirectory: &Path,
+  ownerCheckout: &Option<Path>,
+  table: &[u8],
+) -> Located
+  ! InvalidDependency | FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  if let Option<&TomlValue>.Some { .. } = move Toml.field(entry, "url") {
     let url = match move Toml.asString(Toml.field(entry, "url")) {
-      Option<string>.Some {value} => String.utf8Bytes(value)
+      Option<string>.Some { value } => String.utf8Bytes(value)
       Option<string>.None => b""
     }
     if !isArchiveUrl(url) {
-      run invalidIn(owner, name, b"url must be an https:// URL of the package's archive, or a file:/// URL, as url = \"https://example.com/library-1.0.0.tar.gz\"", ownerDirectory, table, b"url")
+      run invalidIn(
+        owner,
+        name,
+        b"url must be an https:// URL of the package's archive, or a file:/// URL, as url = \"https://example.com/library-1.0.0.tar.gz\"",
+        ownerDirectory,
+        table,
+        b"url",
+      )
     }
-    if let Option<&TomlValue>.Some {..} = move Toml.field(entry, "git") {
-      run invalidIn(owner, name, b"a dependency takes git or url, not both", ownerDirectory, table, b"url")
+    if let Option<&TomlValue>.Some { .. } = move Toml.field(entry, "git") {
+      run invalidIn(
+        owner,
+        name,
+        b"a dependency takes git or url, not both",
+        ownerDirectory,
+        table,
+        b"url",
+      )
     }
     let digest = match move Toml.asString(Toml.field(entry, "sha256")) {
-      Option<string>.Some {value} => String.utf8Bytes(value)
-      Option<string>.None => run invalidIn(owner, name, b"a url dependency needs sha256, the SHA-256 of the archive; silk add <url> writes it", ownerDirectory, table, b"url")
+      Option<string>.Some { value } => String.utf8Bytes(value)
+      Option<string>.None => run invalidIn(
+        owner,
+        name,
+        b"a url dependency needs sha256, the SHA-256 of the archive; silk add <url> writes it",
+        ownerDirectory,
+        table,
+        b"url",
+      )
     }
     if !isDigest(digest) {
-      run invalidIn(owner, name, b"sha256 must be 64 lowercase hexadecimal digits", ownerDirectory, table, b"sha256")
+      run invalidIn(
+        owner,
+        name,
+        b"sha256 must be 64 lowercase hexadecimal digits",
+        ownerDirectory,
+        table,
+        b"sha256",
+      )
     }
     let store = match &packages.store {
-      Option<Path>.Some {value} => &value
-      Option<Path>.None => run invalidIn(owner, name, b"this command cannot read url dependencies: neither SILK_HOME nor HOME (USERPROFILE on Windows) names an absolute directory", ownerDirectory, table, b"url")
+      Option<Path>.Some { value } => &value
+      Option<Path>.None => run invalidIn(
+        owner,
+        name,
+        b"this command cannot read url dependencies: neither SILK_HOME nor HOME (USERPROFILE on Windows) names an absolute directory",
+        ownerDirectory,
+        table,
+        b"url",
+      )
     }
     let extracted = match move run archiveDirectory(store, digest) {
-      Option<Path>.Some {value} => move value
-      Option<Path>.None => run invalidIn(owner, name, b"there is no archive store to read it from: set SILK_HOME or HOME", ownerDirectory, table, b"url")
+      Option<Path>.Some { value } => move value
+      Option<Path>.None => run invalidIn(
+        owner,
+        name,
+        b"there is no archive store to read it from: set SILK_HOME or HOME",
+        ownerDirectory,
+        table,
+        b"url",
+      )
     }
     let mut fetchedMarker = run Bytes.copy(Path.rawBytes(&extracted))
     run Bytes.append(&mut fetchedMarker, b".fetched")
-    let present = match move run Effect.result(FileSystem.exists(&run Path.fromBytes(Bytes.asSlice(&fetchedMarker)))) {
-      Result<bool, FileError>.Success {value} => value
-      Result<bool, FileError>.Failure {error} => { drop error false }
+    let present = match move run Effect.result(
+      FileSystem.exists(&run Path.fromBytes(Bytes.asSlice(&fetchedMarker))),
+    ) {
+      Result<bool, FileError>.Success { value } => value
+      Result<bool, FileError>.Failure { error } => {
+        drop error
+        false
+      }
     }
     if !present {
       let mut reason = run Bytes.copy(b"the archive at ")
       run Bytes.append(&mut reason, url)
-      run Bytes.append(&mut reason, b" is not fetched yet; silk build, check, test and run fetch it")
+      run Bytes.append(
+        &mut reason,
+        b" is not fetched yet; silk build, check, test and run fetch it",
+      )
       run invalidIn(owner, name, Bytes.asSlice(&reason), ownerDirectory, table, b"url")
     }
     let root = run real(run archiveRoot(move extracted))
     let mut directory = run copyPath(&root)
-    if let Option<&TomlValue>.Some {..} = move Toml.field(entry, "path") {
+    if let Option<&TomlValue>.Some { .. } = move Toml.field(entry, "path") {
       let inner = match move Toml.asString(Toml.field(entry, "path")) {
-        Option<string>.Some {value} => String.utf8Bytes(value)
+        Option<string>.Some { value } => String.utf8Bytes(value)
         Option<string>.None => b"/"
       }
       if !contained(inner) {
-        run invalidIn(owner, name, b"path of a url dependency must name a directory inside the archive, relative to its root", ownerDirectory, table, b"path")
+        run invalidIn(
+          owner,
+          name,
+          b"path of a url dependency must name a directory inside the archive, relative to its root",
+          ownerDirectory,
+          table,
+          b"path",
+        )
       }
       directory = run real(run Path.joinBytes(&root, inner))
       if !within(Path.rawBytes(&root), Path.rawBytes(&directory)) {
-        run invalidIn(owner, name, b"path of a url dependency must name a directory inside the archive, relative to its root", ownerDirectory, table, b"path")
+        run invalidIn(
+          owner,
+          name,
+          b"path of a url dependency must name a directory inside the archive, relative to its root",
+          ownerDirectory,
+          table,
+          b"path",
+        )
       }
     }
-    return Located {directory: move directory, checkout: Option<Path>.some(move root), package: run expectedPackage(entry)}
+    return Located {
+      directory: move directory,
+      checkout: Option<Path>.some(move root),
+      package: run expectedPackage(entry),
+    }
   }
-  if let Option<&TomlValue>.Some {..} = move Toml.field(entry, "sha256") {
-    run invalidIn(owner, name, b"sha256 pins a url dependency; add url, where the archive is", ownerDirectory, table, b"sha256")
+  if let Option<&TomlValue>.Some { .. } = move Toml.field(entry, "sha256") {
+    run invalidIn(
+      owner,
+      name,
+      b"sha256 pins a url dependency; add url, where the archive is",
+      ownerDirectory,
+      table,
+      b"sha256",
+    )
   }
   let rev = Toml.field(entry, "rev")
-  if let Option<&TomlValue>.Some {..} = move Toml.field(entry, "git") {
+  if let Option<&TomlValue>.Some { .. } = move Toml.field(entry, "git") {
     let url = match move Toml.asString(Toml.field(entry, "git")) {
-      Option<string>.Some {value} => String.utf8Bytes(value)
+      Option<string>.Some { value } => String.utf8Bytes(value)
       Option<string>.None => b""
     }
     if !Checkouts.isRepository(url) {
-      run invalidIn(owner, name, b"git must be the repository URL or absolute path, as git = \"https://example.com/library.git\"", ownerDirectory, table, b"git")
+      run invalidIn(
+        owner,
+        name,
+        b"git must be the repository URL or absolute path, as git = \"https://example.com/library.git\"",
+        ownerDirectory,
+        table,
+        b"git",
+      )
     }
     let commit = match move Toml.asString(rev) {
-      Option<string>.Some {value} => String.utf8Bytes(value)
-      Option<string>.None => run invalidIn(owner, name, b"a git dependency needs rev, the full hash of the commit to build", ownerDirectory, table, b"git")
+      Option<string>.Some { value } => String.utf8Bytes(value)
+      Option<string>.None => run invalidIn(
+        owner,
+        name,
+        b"a git dependency needs rev, the full hash of the commit to build",
+        ownerDirectory,
+        table,
+        b"git",
+      )
     }
     if !Checkouts.isCommit(commit) {
-      run invalidIn(owner, name, b"rev must be a full commit hash: 40 or 64 lowercase hexadecimal digits", ownerDirectory, table, b"rev")
+      run invalidIn(
+        owner,
+        name,
+        b"rev must be a full commit hash: 40 or 64 lowercase hexadecimal digits",
+        ownerDirectory,
+        table,
+        b"rev",
+      )
     }
     let store = match &packages.store {
-      Option<Path>.Some {value} => &value
-      Option<Path>.None => run invalidIn(owner, name, b"this command cannot read git dependencies: neither SILK_HOME nor HOME (USERPROFILE on Windows) names an absolute checkout directory", ownerDirectory, table, b"git")
+      Option<Path>.Some { value } => &value
+      Option<Path>.None => run invalidIn(
+        owner,
+        name,
+        b"this command cannot read git dependencies: neither SILK_HOME nor HOME (USERPROFILE on Windows) names an absolute checkout directory",
+        ownerDirectory,
+        table,
+        b"git",
+      )
     }
     let present = run Checkouts.fetched(store, commit)
     if !present {
@@ -570,44 +834,95 @@ effect fn locate(packages: &Packages, owner: &[u8], name: &[u8], entry: &TomlVal
       run Bytes.append(&mut reason, commit)
       run Bytes.append(&mut reason, b" of ")
       run Bytes.append(&mut reason, url)
-      run Bytes.append(&mut reason, b" is not fetched yet; silk build, check, test and run fetch it")
+      run Bytes.append(
+        &mut reason,
+        b" is not fetched yet; silk build, check, test and run fetch it",
+      )
       run invalidIn(owner, name, Bytes.asSlice(&reason), ownerDirectory, table, b"rev")
     }
     let root = run real(run Checkouts.checkout(store, commit))
     let mut directory = run copyPath(&root)
-    if let Option<&TomlValue>.Some {..} = move Toml.field(entry, "path") {
+    if let Option<&TomlValue>.Some { .. } = move Toml.field(entry, "path") {
       let inner = match move Toml.asString(Toml.field(entry, "path")) {
-        Option<string>.Some {value} => String.utf8Bytes(value)
+        Option<string>.Some { value } => String.utf8Bytes(value)
         Option<string>.None => b"/"
       }
       if !contained(inner) {
-        run invalidIn(owner, name, b"path of a git dependency must name a directory inside the repository, relative to its root", ownerDirectory, table, b"path")
+        run invalidIn(
+          owner,
+          name,
+          b"path of a git dependency must name a directory inside the repository, relative to its root",
+          ownerDirectory,
+          table,
+          b"path",
+        )
       }
       directory = run real(run Path.joinBytes(&root, inner))
       if !within(Path.rawBytes(&root), Path.rawBytes(&directory)) {
-        run invalidIn(owner, name, b"path of a git dependency must name a directory inside the repository, relative to its root", ownerDirectory, table, b"path")
+        run invalidIn(
+          owner,
+          name,
+          b"path of a git dependency must name a directory inside the repository, relative to its root",
+          ownerDirectory,
+          table,
+          b"path",
+        )
       }
     }
-    return Located {directory: move directory, checkout: Option<Path>.some(move root), package: run expectedPackage(entry)}
+    return Located {
+      directory: move directory,
+      checkout: Option<Path>.some(move root),
+      package: run expectedPackage(entry),
+    }
   }
-  if let Option<&TomlValue>.Some {..} = move rev {
-    run invalidIn(owner, name, b"rev pins a git dependency; add git, the repository URL", ownerDirectory, table, b"rev")
+  if let Option<&TomlValue>.Some { .. } = move rev {
+    run invalidIn(
+      owner,
+      name,
+      b"rev pins a git dependency; add git, the repository URL",
+      ownerDirectory,
+      table,
+      b"rev",
+    )
   }
   let written = match move Toml.asString(Toml.field(entry, "path")) {
-    Option<string>.Some {value} => String.utf8Bytes(value)
-    Option<string>.None => run invalidIn(owner, name, b"path must name the directory of the dependency's silk.toml", ownerDirectory, table, b"path")
+    Option<string>.Some { value } => String.utf8Bytes(value)
+    Option<string>.None => run invalidIn(
+      owner,
+      name,
+      b"path must name the directory of the dependency's silk.toml",
+      ownerDirectory,
+      table,
+      b"path",
+    )
   }
+
   // A dependency is read at its real directory, so paths that reach one package through
   // different symbolic links name one directory.
   let directory = run real(run CommandPath.resolve(ownerDirectory, written))
   return match &ownerCheckout.* {
-    Option<Path>.Some {value: root} => {
+    Option<Path>.Some { value: root } => {
       if !within(Path.rawBytes(&root), Path.rawBytes(&directory)) {
-        run invalidIn(owner, name, b"a package from a git dependency reaches packages by path only inside its own repository", ownerDirectory, table, b"path")
+        run invalidIn(
+          owner,
+          name,
+          b"a package from a git dependency reaches packages by path only inside its own repository",
+          ownerDirectory,
+          table,
+          b"path",
+        )
       }
-      return Located {directory: move directory, checkout: Option<Path>.some(run copyPath(&root)), package: run expectedPackage(entry)}
+      return Located {
+        directory: move directory,
+        checkout: Option<Path>.some(run copyPath(&root)),
+        package: run expectedPackage(entry),
+      }
     }
-    Option<Path>.None => Located {directory: move directory, checkout: Option<Path>.none(), package: run expectedPackage(entry)}
+    Option<Path>.None => Located {
+      directory: move directory,
+      checkout: Option<Path>.none(),
+      package: run expectedPackage(entry),
+    }
   }
 }
 
@@ -616,72 +931,114 @@ effect fn locate(packages: &Packages, owner: &[u8], name: &[u8], entry: &TomlVal
 /// packages, and that the store lacks. It follows only entries it can read and leaves every other
 /// check to [`load`]. A fetch that fails is an invalid dependency naming its `git` line.
 pub effect fn fetch(directory: &Path, document: &TomlValue, store: &Path) -> ()
-! InvalidDependency | HostInputError | FileError | OutOfMemoryError
-? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
+  ! InvalidDependency | HostInputError | FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
   let mut seen = List<Bytes>.make()
-  run fetchVisit(directory, document, store, &Option<Path>.none(), &mut seen)
+  run fetchVisit(directory, document, store, &Option<Path>.none(), &mut seen, Option<&[u8]>.none())
 }
 
 // `checkout` is the root of the checkout the package in `directory` was fetched into, or `None`
 // for a package outside the store.
-effect fn fetchVisit(directory: &Path, document: &TomlValue, store: &Path, checkout: &Option<Path>, seen: &mut List<Bytes>) -> ()
-! InvalidDependency | HostInputError | FileError | OutOfMemoryError
-? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
+effect fn fetchVisit(
+  directory: &Path,
+  document: &TomlValue,
+  store: &Path,
+  checkout: &Option<Path>,
+  seen: &mut List<Bytes>,
+  selected: Option<&[u8]>,
+) -> ()
+  ! InvalidDependency | HostInputError | FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
   let children = match move Toml.field(document, "dependencies") {
-    Option<&TomlValue>.Some {value} => match move members(value) {
-      Option<&[TomlChild]>.Some {value: listed} => listed
-      Option<&[TomlChild]>.None => { return () }
+    Option<&TomlValue>.Some { value } => match move members(value) {
+      Option<&[TomlChild]>.Some { value: listed } => listed
+      Option<&[TomlChild]>.None => {
+        return ()
+      }
     }
-    Option<&TomlValue>.None => { return () }
+    Option<&TomlValue>.None => {
+      return ()
+    }
   }
   let mut shared = Option<Shared>.none()
-  if inheriting(children) { shared = run Workspaces.of(directory, checkout) }
+  if inheriting(children) {
+    shared = run Workspaces.of(directory, checkout)
+  }
   let mut at = usize.ZERO
   while at < children.length {
-    if let TomlChild.Member {entry} = &children[at] {
+    if let TomlChild.Member { entry } = &children[at] {
       let name = String.ownedUtf8Bytes(&entry.key)
+      if let Option<&[u8]>.Some { value } = selected {
+        if !same(value, name) {
+          at = at + 1
+          continue
+        }
+      }
+
       // An entry taken from the workspace is fetched as the workspace writes it; one that names
       // no workspace entry is left for the load to refuse.
       let source = match move Workspaces.source(&shared, name, &entry.value) {
-        Option<&TomlValue>.Some {value} => value
+        Option<&TomlValue>.Some { value } => value
         Option<&TomlValue>.None => {
           at = at + usize.ONE
           continue
         }
       }
+
       // A failed fetch names the manifest that writes the pin: this package's, or its workspace's.
       let site = Workspaces.base(&shared, &entry.value, directory)
-      let table: &[u8] = if Workspaces.inherits(&entry.value) { b"workspace.dependencies" } else { b"dependencies" }
+      let table: &[u8] = if Workspaces.inherits(&entry.value) {
+        b"workspace.dependencies"
+      } else {
+        b"dependencies"
+      }
       let mut target = Option<Path>.none()
+
       // The checkout the target was fetched into: its own, or else its owner's.
       let mut inside = Option<Path>.none()
-      if let Option<Path>.Some {value: owners} = &checkout.* { inside = Option<Path>.some(run copyPath(&owners)) }
+      if let Option<Path>.Some { value: owners } = &checkout.* {
+        inside = Option<Path>.some(run copyPath(&owners))
+      }
       let url = Toml.asString(Toml.field(source, "git"))
       let rev = Toml.asString(Toml.field(source, "rev"))
       let path = Toml.asString(Toml.field(source, "path"))
       let archive = Toml.asString(Toml.field(source, "url"))
       let digest = Toml.asString(Toml.field(source, "sha256"))
-      if let Option<string>.Some {value: located} = move archive {
+      if let Option<string>.Some { value: located } = move archive {
         let address = String.utf8Bytes(located)
-        if let Option<string>.Some {value: pinned} = move digest {
+        if let Option<string>.Some { value: pinned } = move digest {
           let sha = String.utf8Bytes(pinned)
+
           // An entry that also names git is refused when it is located, before anything is fetched.
           let alsoGit = match &url {
-            Option<string>.Some {..} => true
+            Option<string>.Some { .. } => true
             Option<string>.None => false
           }
           if isArchiveUrl(address) && isDigest(sha) && !alsoGit {
-            if let Option<Path>.Some {value: extracted} = move run archiveDirectory(store, sha) {
-              if let Option<Bytes>.Some {value: failure} = move run NativeArchives.ensureOne(name, address, sha, &extracted, usize.ZERO) {
+            if let Option<Path>.Some { value: extracted } = move run archiveDirectory(store, sha) {
+              if let Option<Bytes>.Some { value: failure } = move run NativeArchives.ensureOne(
+                name,
+                address,
+                sha,
+                &extracted,
+                usize.ZERO,
+              ) {
                 let owner = match move run identityOf(document) {
-                  Option<Bytes>.Some {value} => move value
+                  Option<Bytes>.Some { value } => move value
                   Option<Bytes>.None => run Bytes.copy(Path.rawBytes(directory))
                 }
-                run invalidIn(Bytes.asSlice(&owner), name, Bytes.asSlice(&failure), site, table, b"url")
+                run invalidIn(
+                  Bytes.asSlice(&owner),
+                  name,
+                  Bytes.asSlice(&failure),
+                  site,
+                  table,
+                  b"url",
+                )
               }
               let root = run archiveRoot(move extracted)
               inside = Option<Path>.some(run real(run copyPath(&root)))
-              if let Option<string>.Some {value: inner} = move path {
+              if let Option<string>.Some { value: inner } = move path {
                 if contained(String.utf8Bytes(inner)) {
                   target = Option<Path>.some(run Path.joinBytes(&root, String.utf8Bytes(inner)))
                 }
@@ -691,14 +1048,20 @@ effect fn fetchVisit(directory: &Path, document: &TomlValue, store: &Path, check
             }
           }
         }
-      } else if let Option<string>.Some {value: written} = move url {
-        if let Option<string>.Some {value: pinned} = move rev {
+      } else if let Option<string>.Some { value: written } = move url {
+        if let Option<string>.Some { value: pinned } = move rev {
           let commit = String.utf8Bytes(pinned)
           if Checkouts.isCommit(commit) && Checkouts.isRepository(String.utf8Bytes(written)) {
-            let fetched = run Effect.result(Checkouts.fetch(store, String.utf8Bytes(written), commit))
+            let fetched = run Effect.result(
+              Checkouts.fetch(store, String.utf8Bytes(written), commit),
+            )
             match move fetched {
-              Result<(), FetchFailed | HostInputError | FileError | OutOfMemoryError>.Success {..} => {}
-              Result<(), FetchFailed | HostInputError | FileError | OutOfMemoryError>.Failure {error} => match move error {
+              Result<(), FetchFailed | HostInputError | FileError | OutOfMemoryError>.Success {
+                ..
+              } => {}
+              Result<(), FetchFailed | HostInputError | FileError | OutOfMemoryError>.Failure {
+                error
+              } => match move error {
                 FetchFailed failure => {
                   let mut reason = run Bytes.copy(b"fetching commit ")
                   run Bytes.append(&mut reason, commit)
@@ -707,28 +1070,46 @@ effect fn fetchVisit(directory: &Path, document: &TomlValue, store: &Path, check
                   run Bytes.append(&mut reason, b" failed: ")
                   run Bytes.append(&mut reason, Bytes.asSlice(&failure.detail))
                   let owner = match move run identityOf(document) {
-                    Option<Bytes>.Some {value} => move value
+                    Option<Bytes>.Some { value } => move value
                     Option<Bytes>.None => run Bytes.copy(Path.rawBytes(directory))
                   }
-                  run invalidIn(Bytes.asSlice(&owner), name, Bytes.asSlice(&reason), site, table, b"git")
+                  run invalidIn(
+                    Bytes.asSlice(&owner),
+                    name,
+                    Bytes.asSlice(&reason),
+                    site,
+                    table,
+                    b"git",
+                  )
                 }
-                HostInputError unread => { fail move unread }
+                HostInputError unread => {
+                  fail move unread
+                }
                 FileError unwritten => {
                   let mut reason = run Bytes.copy(b"its checkout cannot be written below ")
                   run Bytes.append(&mut reason, Path.rawBytes(store))
                   drop unwritten
                   let owner = match move run identityOf(document) {
-                    Option<Bytes>.Some {value} => move value
+                    Option<Bytes>.Some { value } => move value
                     Option<Bytes>.None => run Bytes.copy(Path.rawBytes(directory))
                   }
-                  run invalidIn(Bytes.asSlice(&owner), name, Bytes.asSlice(&reason), site, table, b"git")
+                  run invalidIn(
+                    Bytes.asSlice(&owner),
+                    name,
+                    Bytes.asSlice(&reason),
+                    site,
+                    table,
+                    b"git",
+                  )
                 }
-                OutOfMemoryError exhausted => { fail move exhausted }
+                OutOfMemoryError exhausted => {
+                  fail move exhausted
+                }
               }
             }
             let root = run Checkouts.checkout(store, commit)
             inside = Option<Path>.some(run real(run copyPath(&root)))
-            if let Option<string>.Some {value: inner} = move path {
+            if let Option<string>.Some { value: inner } = move path {
               if contained(String.utf8Bytes(inner)) {
                 target = Option<Path>.some(run Path.joinBytes(&root, String.utf8Bytes(inner)))
               }
@@ -737,17 +1118,35 @@ effect fn fetchVisit(directory: &Path, document: &TomlValue, store: &Path, check
             }
           }
         }
-      } else if let Option<string>.Some {value: written} = move path {
-        target = Option<Path>.some(run CommandPath.resolve(Workspaces.base(&shared, &entry.value, directory), String.utf8Bytes(written)))
+      } else if let Option<string>.Some { value: written } = move path {
+        target = Option<Path>.some(
+          run CommandPath.resolve(
+            Workspaces.base(&shared, &entry.value, directory),
+            String.utf8Bytes(written),
+          ),
+        )
       }
-      if let Option<Path>.Some {value: found} = move target {
-        let resolved = run real(move found)
-        if !onStack(List<Bytes>.asSlice(&seen.*), Path.rawBytes(&resolved)) {
-          run List<Bytes>.append(&mut seen.*, run Bytes.copy(Path.rawBytes(&resolved)))
-          let manifest = run Path.join(&resolved, "silk.toml")
-          if let Result<Bytes, FileError | OutOfMemoryError>.Success {value: contents} = move run Effect.result(FileSystem.readFile(&manifest)) {
-            if let Result<TomlValue, TomlError | OutOfMemoryError>.Success {value: dependency} = move run Effect.result(Toml.parse(Bytes.asSlice(&contents))) {
-              run fetchVisit(&resolved, &dependency, store, &inside, &mut seen.*)
+      if selected.isNone() {
+        if let Option<Path>.Some { value: found } = move target {
+          let resolved = run real(move found)
+          if !onStack(List<Bytes>.asSlice(&seen.*), Path.rawBytes(&resolved)) {
+            run List<Bytes>.append(&mut seen.*, run Bytes.copy(Path.rawBytes(&resolved)))
+            let manifest = run Path.join(&resolved, "silk.toml")
+            if let Result<Bytes, FileError | OutOfMemoryError>.Success {
+              value: contents
+            } = move run Effect.result(FileSystem.readFile(&manifest)) {
+              if let Result<TomlValue, TomlError | OutOfMemoryError>.Success {
+                value: dependency
+              } = move run Effect.result(Toml.parse(Bytes.asSlice(&contents))) {
+                run fetchVisit(
+                  &resolved,
+                  &dependency,
+                  store,
+                  &inside,
+                  &mut seen.*,
+                  Option<&[u8]>.none(),
+                )
+              }
             }
           }
         }
@@ -762,36 +1161,52 @@ effect fn fetchVisit(directory: &Path, document: &TomlValue, store: &Path, check
 /// `document`, reaches by path, directly or through other packages, each once. A workspace check
 /// orders its members by them. Best effort: a git dependency, and a path or manifest that does not
 /// read, are passed over.
-pub effect fn pathDependencies(directory: &Path, document: &TomlValue) -> List<Bytes> ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+pub effect fn pathDependencies(directory: &Path, document: &TomlValue) -> List<Bytes>
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
   let mut reached = List<Bytes>.make()
   run reachPaths(directory, document, &mut reached)
   return move reached
 }
 
 // The real directory that `written` names from `directory`.
-effect fn realPath(directory: &Path, written: &[u8]) -> Path ! FileError | OutOfMemoryError ? &mut Allocator {
+effect fn realPath(directory: &Path, written: &[u8]) -> Path
+  ! FileError | OutOfMemoryError
+  ? &mut Allocator {
   return run real(run CommandPath.resolve(directory, written))
 }
 
-effect fn reachPaths(directory: &Path, document: &TomlValue, reached: &mut List<Bytes>) -> () ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+effect fn reachPaths(directory: &Path, document: &TomlValue, reached: &mut List<Bytes>) -> ()
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
   let children = match move Toml.field(document, "dependencies") {
-    Option<&TomlValue>.Some {value} => match move members(value) {
-      Option<&[TomlChild]>.Some {value: listed} => listed
-      Option<&[TomlChild]>.None => { return () }
+    Option<&TomlValue>.Some { value } => match move members(value) {
+      Option<&[TomlChild]>.Some { value: listed } => listed
+      Option<&[TomlChild]>.None => {
+        return ()
+      }
     }
-    Option<&TomlValue>.None => { return () }
+    Option<&TomlValue>.None => {
+      return ()
+    }
   }
   let mut shared = Option<Shared>.none()
   if inheriting(children) {
-    if let Result<Option<Shared>, FileError | OutOfMemoryError>.Success {value} = move run Effect.result(Workspaces.of(directory, &Option<Path>.none())) {
+    if let Result<Option<Shared>, FileError | OutOfMemoryError>.Success {
+      value
+    } = move run Effect.result(Workspaces.of(directory, &Option<Path>.none())) {
       shared = move value
     }
   }
   let mut at = usize.ZERO
   while at < children.length {
-    if let TomlChild.Member {entry} = &children[at] {
-      let source = match move Workspaces.source(&shared, String.ownedUtf8Bytes(&entry.key), &entry.value) {
-        Option<&TomlValue>.Some {value} => value
+    if let TomlChild.Member { entry } = &children[at] {
+      let source = match move Workspaces.source(
+        &shared,
+        String.ownedUtf8Bytes(&entry.key),
+        &entry.value,
+      ) {
+        Option<&TomlValue>.Some { value } => value
         Option<&TomlValue>.None => {
           at = at + usize.ONE
           continue
@@ -799,25 +1214,37 @@ effect fn reachPaths(directory: &Path, document: &TomlValue, reached: &mut List<
       }
       let git = Toml.asString(Toml.field(source, "git"))
       let path = Toml.asString(Toml.field(source, "path"))
-      if let Option<string>.Some {value: written} = move path {
+      if let Option<string>.Some { value: written } = move path {
         if Option<string>.isNone(&git) {
-          let located = run Effect.result(realPath(Workspaces.base(&shared, &entry.value, directory), String.utf8Bytes(written)))
+          let located = run Effect.result(
+            realPath(Workspaces.base(&shared, &entry.value, directory), String.utf8Bytes(written)),
+          )
           match move located {
-            Result<Path, FileError | OutOfMemoryError>.Success {value: resolved} => {
+            Result<Path, FileError | OutOfMemoryError>.Success { value: resolved } => {
               if !onStack(List<Bytes>.asSlice(&reached.*), Path.rawBytes(&resolved)) {
                 run List<Bytes>.append(&mut reached.*, run Bytes.copy(Path.rawBytes(&resolved)))
-                if let Result<Path, FileError | OutOfMemoryError>.Success {value: manifest} = move run Effect.result(Path.join(&resolved, "silk.toml")) {
-                  if let Result<Bytes, FileError | OutOfMemoryError>.Success {value: contents} = move run Effect.result(FileSystem.readFile(&manifest)) {
-                    if let Result<TomlValue, TomlError | OutOfMemoryError>.Success {value: dependency} = move run Effect.result(Toml.parse(Bytes.asSlice(&contents))) {
+                if let Result<Path, FileError | OutOfMemoryError>.Success {
+                  value: manifest
+                } = move run Effect.result(Path.join(&resolved, "silk.toml")) {
+                  if let Result<Bytes, FileError | OutOfMemoryError>.Success {
+                    value: contents
+                  } = move run Effect.result(FileSystem.readFile(&manifest)) {
+                    if let Result<TomlValue, TomlError | OutOfMemoryError>.Success {
+                      value: dependency
+                    } = move run Effect.result(Toml.parse(Bytes.asSlice(&contents))) {
                       run reachPaths(&resolved, &dependency, &mut reached.*)
                     }
                   }
                 }
               }
             }
-            Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
-              FileError failure => { drop failure }
-              OutOfMemoryError exhausted => { fail move exhausted }
+            Result<Path, FileError | OutOfMemoryError>.Failure { error } => match move error {
+              FileError failure => {
+                drop failure
+              }
+              OutOfMemoryError exhausted => {
+                fail move exhausted
+              }
             }
           }
         }
@@ -832,8 +1259,10 @@ effect fn reachPaths(directory: &Path, document: &TomlValue, reached: &mut List<
 fn inheriting(children: &[TomlChild]) -> bool {
   let mut at = usize.ZERO
   while at < children.length {
-    if let TomlChild.Member {entry} = &children[at] {
-      if Workspaces.inherits(&entry.value) { return true }
+    if let TomlChild.Member { entry } = &children[at] {
+      if Workspaces.inherits(&entry.value) {
+        return true
+      }
     }
     at = at + usize.ONE
   }
@@ -841,35 +1270,45 @@ fn inheriting(children: &[TomlChild]) -> bool {
 }
 
 // Loads every dependency the package at `owner` declares in `document`, then theirs.
-effect fn visit(packages: &mut Packages, owner: usize, document: &TomlValue, stack: &mut List<Bytes>) -> ()
-! InvalidDependency | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+effect fn visit(packages: &mut Packages, owner: usize, document: &TomlValue, selected: &[u8]) -> ()
+  ! InvalidDependency | FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
   let listed = match move Toml.field(document, "dependencies") {
-    Option<&TomlValue>.Some {value} => value
-    Option<&TomlValue>.None => { return () }
+    Option<&TomlValue>.Some { value } => value
+    Option<&TomlValue>.None => {
+      return ()
+    }
   }
   let listedOwner = List<Package>.asSlice(&packages.packages)
   let ownerIdentity = run Bytes.copy(Bytes.asSlice(&listedOwner[owner].identity))
   let ownerManifest = run copyPath(&listedOwner[owner].manifest)
   let ownerSourceRoot = run copyPath(&listedOwner[owner].sourceRoot)
   let mut ownerCheckout = Option<Path>.none()
-  if let Option<Path>.Some {value} = &listedOwner[owner].checkout { ownerCheckout = Option<Path>.some(run copyPath(&value)) }
+  if let Option<Path>.Some { value } = &listedOwner[owner].checkout {
+    ownerCheckout = Option<Path>.some(run copyPath(&value))
+  }
   let owned = Bytes.asSlice(&ownerIdentity)
   let children = match move members(listed) {
-    Option<&[TomlChild]>.Some {value} => value
+    Option<&[TomlChild]>.Some { value } => value
     Option<&[TomlChild]>.None => {
       let mut detail = run Bytes.copy(b"[dependencies] of ")
       run Bytes.append(&mut detail, owned)
       run Bytes.append(&mut detail, b" must be a table")
       let manifest = run Path.join(&ownerManifest, "silk.toml")
       let line = run lineIn(&manifest, b"dependencies")
-      fail InvalidDependency {detail: move detail, manifest: run Bytes.copy(Path.rawBytes(&manifest)), line: line}
+      fail InvalidDependency {
+        detail: move detail,
+        manifest: run Bytes.copy(Path.rawBytes(&manifest)),
+        line: line,
+      }
     }
   }
+
   // The owner's workspace is read once, and only when an entry takes its fields from it.
   let mut shared = Option<Shared>.none()
   if inheriting(children) {
     shared = run Workspaces.of(&ownerManifest, &ownerCheckout)
-    if let Option<Shared>.Some {value: workspace} = &shared {
+    if let Option<Shared>.Some { value: workspace } = &shared {
       let read = Path.rawBytes(Workspaces.manifest(&workspace))
       if !onStack(List<Bytes>.asSlice(&packages.workspaces), read) {
         run List<Bytes>.append(&mut packages.workspaces, run Bytes.copy(read))
@@ -878,60 +1317,107 @@ effect fn visit(packages: &mut Packages, owner: usize, document: &TomlValue, sta
   }
   let mut at = usize.ZERO
   while at < children.length {
-    if let TomlChild.Member {entry} = &children[at] {
+    if let TomlChild.Member { entry } = &children[at] {
       let name = String.ownedUtf8Bytes(&entry.key)
-      if !identifier(name) { run invalid(owned, name, b"a dependency name must be an identifier", &ownerManifest, b"") }
-      if same(name, b"silk") || same(name, b"Intrinsic") || same(name, b"self") || same(name, b"silkc") {
+      if !same(name, selected) {
+        at = at + 1
+        continue
+      }
+      if !identifier(name) {
+        run invalid(owned, name, b"a dependency name must be an identifier", &ownerManifest, b"")
+      }
+      if same(name, b"silk") || same(name, b"Intrinsic") || same(name, b"self")
+        || same(name, b"silkc") {
         run invalid(owned, name, b"the name is reserved for the toolchain", &ownerManifest, b"")
       }
       let table = match &entry.value {
-        TomlValue.Table {..} => true
+        TomlValue.Table { .. } => true
         _ => false
       }
-      if !table { run invalid(owned, name, b"a dependency must be a table such as { path = \"../library\" }", &ownerManifest, b"") }
+      if !table {
+        run invalid(
+          owned,
+          name,
+          b"a dependency must be a table such as { path = \"../library\" }",
+          &ownerManifest,
+          b"",
+        )
+      }
       run checkFields(owned, name, &entry.value, &ownerManifest, b"dependencies")
       let hidden = run shadows(&ownerSourceRoot, name)
       if hidden {
-        run invalid(owned, name, b"the name is also a top-level module or directory of this package's source root", &ownerManifest, b"")
+        run invalid(
+          owned,
+          name,
+          b"the name is also a top-level module or directory of this package's source root",
+          &ownerManifest,
+          b"",
+        )
       }
-      let located = run place(&packages.*, owned, name, &entry.value, &ownerManifest, &ownerCheckout, &shared)
-      let Located {directory, checkout, package: expected} = move located
+      let located = run place(
+        &packages.*,
+        owned,
+        name,
+        &entry.value,
+        &ownerManifest,
+        &ownerCheckout,
+        &shared,
+      )
+      let Located { directory, checkout, package: expected } = move located
       let manifest = run Path.join(&directory, "silk.toml")
       let read = run Effect.result(FileSystem.readFile(&manifest))
       let contents = match move read {
-        Result<Bytes, FileError | OutOfMemoryError>.Success {value} => move value
-        Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
+        Result<Bytes, FileError | OutOfMemoryError>.Success { value } => move value
+        Result<Bytes, FileError | OutOfMemoryError>.Failure { error } => match move error {
           FileError missing => {
             drop missing
             let mut reason = run Bytes.copy(b"no readable silk.toml at ")
             run Bytes.append(&mut reason, Path.rawBytes(&directory))
             run invalid(owned, name, Bytes.asSlice(&reason), &ownerManifest, b"path")
           }
-          OutOfMemoryError exhausted => { fail move exhausted }
+          OutOfMemoryError exhausted => {
+            fail move exhausted
+          }
         }
       }
       let parsed = run Effect.result(Toml.parse(Bytes.asSlice(&contents)))
       let dependency = match move parsed {
-        Result<TomlValue, TomlError | OutOfMemoryError>.Success {value} => move value
-        Result<TomlValue, TomlError | OutOfMemoryError>.Failure {error} => match move error {
+        Result<TomlValue, TomlError | OutOfMemoryError>.Success { value } => move value
+        Result<TomlValue, TomlError | OutOfMemoryError>.Failure { error } => match move error {
           TomlError malformed => {
             let mut reason = run Bytes.copy(b"its silk.toml is not valid TOML: ")
             run ManifestText.appendTomlReason(&mut reason, Bytes.asSlice(&contents), &malformed)
-            run invalidAt(owned, name, Bytes.asSlice(&reason), &manifest, ManifestText.lineAt(Bytes.asSlice(&contents), malformed.offset))
+            run invalidAt(
+              owned,
+              name,
+              Bytes.asSlice(&reason),
+              &manifest,
+              ManifestText.lineAt(Bytes.asSlice(&contents), malformed.offset),
+            )
           }
-          OutOfMemoryError exhausted => { fail move exhausted }
+          OutOfMemoryError exhausted => {
+            fail move exhausted
+          }
         }
       }
+
       // A dependency's `silk-version` names the release line it was written for (D1).
-      if let Option<&[u8]>.Some {value: pinned} = move ManifestFields.packageText(&dependency, "silk-version") {
+      if let Option<&[u8]>.Some { value: pinned } = move ManifestFields.packageText(
+        &dependency,
+        "silk-version",
+      ) {
         if !ManifestFields.compatible(ReleaseVersion.value(), pinned) {
           let mut reason = run Bytes.copy(b"it was written for Silk ")
           run Bytes.append(&mut reason, pinned)
           run Bytes.append(&mut reason, b" (its silk-version), which this Silk ")
           run Bytes.append(&mut reason, ReleaseVersion.value())
           run Bytes.append(&mut reason, b" cannot build")
-          if ManifestFields.isPrerelease(ReleaseVersion.value()) || ManifestFields.isPrerelease(pinned) {
-            run Bytes.append(&mut reason, b"; a dev release builds only packages written for that same dev release")
+          if ManifestFields.isPrerelease(ReleaseVersion.value())
+            || ManifestFields.isPrerelease(pinned) {
+            run Bytes.append(
+              &mut reason,
+              b"; a dev release builds only packages written for that same dev release",
+            )
           }
           run Bytes.append(&mut reason, b". Build with Silk ")
           run Bytes.append(&mut reason, pinned)
@@ -945,27 +1431,48 @@ effect fn visit(packages: &mut Packages, owner: usize, document: &TomlValue, sta
         }
       }
       let identity = match move run identityOf(&dependency) {
-        Option<Bytes>.Some {value} => move value
-        Option<Bytes>.None => run invalidAt(owned, name, b"its silk.toml has no [package] name", &manifest,
-          ManifestText.keyLine(Bytes.asSlice(&contents), b"package.name"))
+        Option<Bytes>.Some { value } => move value
+        Option<Bytes>.None => run invalidAt(
+          owned,
+          name,
+          b"its silk.toml has no [package] name",
+          &manifest,
+          ManifestText.keyLine(Bytes.asSlice(&contents), b"package.name"),
+        )
       }
-      let packageName = match move Toml.asString(Toml.fieldAt(Toml.field(&dependency, "package"), "name")) {
-        Option<string>.Some {value} => String.utf8Bytes(value)
-        Option<string>.None => run invalidAt(owned, name, b"its silk.toml has no [package] name", &manifest,
-          ManifestText.keyLine(Bytes.asSlice(&contents), b"package.name"))
+      let packageName = match move Toml.asString(
+        Toml.fieldAt(Toml.field(&dependency, "package"), "name"),
+      ) {
+        Option<string>.Some { value } => String.utf8Bytes(value)
+        Option<string>.None => run invalidAt(
+          owned,
+          name,
+          b"its silk.toml has no [package] name",
+          &manifest,
+          ManifestText.keyLine(Bytes.asSlice(&contents), b"package.name"),
+        )
       }
-      if let Option<Bytes>.Some {value: wanted} = &expected {
+      if let Option<Bytes>.Some { value: wanted } = &expected {
         if !same(Bytes.asSlice(&wanted), packageName) {
-          run invalid(owned, name, b"package does not match the name in the dependency's silk.toml", &ownerManifest, b"package")
+          run invalid(
+            owned,
+            name,
+            b"package does not match the name in the dependency's silk.toml",
+            &ownerManifest,
+            b"package",
+          )
         }
       }
-      if onStack(List<Bytes>.asSlice(&stack.*), Bytes.asSlice(&identity)) {
+      if run reaches(&packages.*, Bytes.asSlice(&identity), owned) {
         let mut reason = run Bytes.copy(owned)
         run Bytes.append(&mut reason, b" depends on ")
         run Bytes.append(&mut reason, Bytes.asSlice(&identity))
         run Bytes.append(&mut reason, b", which depends on ")
         run Bytes.append(&mut reason, owned)
-        run Bytes.append(&mut reason, b" in turn, directly or through other packages, so they form a cycle")
+        run Bytes.append(
+          &mut reason,
+          b" in turn, directly or through other packages, so they form a cycle",
+        )
         run invalid(owned, name, Bytes.asSlice(&reason), &ownerManifest, b"")
       }
       let known = indexOf(List<Package>.asSlice(&packages.packages), packageName)
@@ -974,7 +1481,13 @@ effect fn visit(packages: &mut Packages, owner: usize, document: &TomlValue, sta
         let sameVersion = same(Bytes.asSlice(&listed[known].identity), Bytes.asSlice(&identity))
         let sameDirectory = same(Path.rawBytes(&listed[known].manifest), Path.rawBytes(&directory))
         if !sameVersion || !sameDirectory {
-          run invalid(owned, name, b"the build already has a different version or copy of this package", &ownerManifest, b"")
+          run invalid(
+            owned,
+            name,
+            b"the build already has a different version or copy of this package",
+            &ownerManifest,
+            b"",
+          )
         }
       } else {
         // Checked as the root manifest is, but after its silk-version, so that a dependency
@@ -984,78 +1497,138 @@ effect fn visit(packages: &mut Packages, owner: usize, document: &TomlValue, sta
         if found.length > usize.ZERO {
           let mut reason = run Bytes.copy(b"its silk.toml is invalid: ")
           run Bytes.append(&mut reason, Bytes.asSlice(&found[usize.ZERO].message))
-          run invalidAt(owned, name, Bytes.asSlice(&reason), &manifest, ManifestText.lineAt(Bytes.asSlice(&contents), found[usize.ZERO].span.start))
+          run invalidAt(
+            owned,
+            name,
+            Bytes.asSlice(&reason),
+            &manifest,
+            ManifestText.lineAt(Bytes.asSlice(&contents), found[usize.ZERO].span.start),
+          )
         }
         let sourceRoot = run ManifestFields.sourceRoot(&directory, &dependency)
         let exports = run exportsOf(Bytes.asSlice(&identity), &dependency, &directory, &sourceRoot)
-        let declarations = match move run Effect.result(NativeLinkInputs.read(&dependency, &manifest, Bytes.asSlice(&contents), &directory, &packages.archiveContext)) {
-          Result<Declarations, InvalidNativeLinkInput | OutOfMemoryError>.Success {value} => move value
-          Result<Declarations, InvalidNativeLinkInput | OutOfMemoryError>.Failure {error} => match move error {
+        let archives = match move run Effect.result(
+          NativeLinkInputs.archivesOf(
+            &dependency,
+            &manifest,
+            Bytes.asSlice(&contents),
+            &packages.archiveContext,
+          ),
+        ) {
+          Result<List<Archive>, InvalidNativeLinkInput | OutOfMemoryError>.Success {
+            value
+          } => move value
+          Result<List<Archive>, InvalidNativeLinkInput | OutOfMemoryError>.Failure {
+            error
+          } => match move error {
             InvalidNativeLinkInput refused => {
               let mut reason = run Bytes.copy(b"invalid native link input: ")
               run Bytes.append(&mut reason, Bytes.asSlice(&refused.detail))
-              run invalidAt(owned, name, Bytes.asSlice(&reason), &manifest, ManifestText.keyLine(Bytes.asSlice(&contents), b"native.link"))
+              run invalidAt(
+                owned,
+                name,
+                Bytes.asSlice(&reason),
+                &manifest,
+                ManifestText.keyLine(Bytes.asSlice(&contents), b"native.archive"),
+              )
             }
-            OutOfMemoryError exhausted => { fail move exhausted }
+            OutOfMemoryError exhausted => {
+              fail move exhausted
+            }
           }
         }
-        run List<Package>.append(&mut packages.packages, Package {
-          identity: run Bytes.copy(Bytes.asSlice(&identity)), name: run Bytes.copy(packageName),
-          manifest: move directory, sourceRoot: move sourceRoot, exports: move exports, checkout: move checkout,
-          linkInputs: move declarations.inputs, archives: move declarations.archives,
-        })
-        run List<Bytes>.append(&mut stack.*, run Bytes.copy(Bytes.asSlice(&identity)))
-        let added = List<Package>.length(&packages.packages) - usize.ONE
-        run visit(&mut packages.*, added, &dependency, &mut stack.*)
-        let top = List<Bytes>.length(&stack.*) - usize.ONE
-        let finished = List<Bytes>.remove(&mut stack.*, top)
-        drop finished
+        run List<Package>.append(
+          &mut packages.packages,
+          Package {
+            identity: run Bytes.copy(Bytes.asSlice(&identity)),
+            name: run Bytes.copy(packageName),
+            document: Option<SharedDocument<TomlValue>>.some(
+              run SharedDocument<TomlValue>.make(move dependency),
+            ),
+            manifest: move directory,
+            sourceRoot: move sourceRoot,
+            exports: move exports,
+            checkout: move checkout,
+            linkInputs: List<NativeLinkInput>.make(),
+            archives: move archives,
+          },
+        )
       }
-      run List<Edge>.append(&mut packages.edges, Edge {
-        owner: run Bytes.copy(owned), name: run Bytes.copy(name), package: move identity,
-      })
+      run List<Edge>.append(
+        &mut packages.edges,
+        Edge { owner: run Bytes.copy(owned), name: run Bytes.copy(name), package: move identity },
+      )
     }
     at = at + usize.ONE
   }
   return ()
 }
 
-/// Loads the root package, whose manifest `document` sits in `manifest` with module identity
-/// `identity` and modules below `sourceRoot`, and every package its dependencies reach. Git
-/// dependencies read their checkouts in `store` (driver/GitCheckouts) and are refused when it is
-/// `None` or lacks the commit; [`fetch`] writes missing checkouts first.
-pub effect fn load(manifest: &Path, document: &TomlValue, identity: &[u8], sourceRoot: &Path, store: Option<&Path>, archiveContext: ArchiveContext) -> Packages
-! InvalidDependency | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  let name = match move Toml.asString(Toml.fieldAt(Toml.field(document, "package"), "name")) {
-    Option<string>.Some {value} => String.utf8Bytes(value)
+/// Retains the root package and its declared pins without loading any dependencies.
+/// `require` resolves aliases as module imports reach them; `requireAll` resolves a metadata graph.
+pub effect fn load(
+  manifest: &Path,
+  document: TomlValue,
+  identity: &[u8],
+  sourceRoot: &Path,
+  store: Option<&Path>,
+  archiveContext: ArchiveContext,
+) -> Packages
+  ! InvalidDependency | FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let name = match move Toml.asString(Toml.fieldAt(Toml.field(&document, "package"), "name")) {
+    Option<string>.Some { value } => String.utf8Bytes(value)
     Option<string>.None => b""
   }
   let mut kept = Option<Path>.none()
-  if let Option<&Path>.Some {value} = move store { kept = Option<Path>.some(run copyPath(value)) }
-  let mut packages = Packages {packages: List<Package>.make(), edges: List<Edge>.make(), store: move kept, archiveContext: move archiveContext, workspaces: List<Bytes>.make()}
+  if let Option<&Path>.Some { value } = move store {
+    kept = Option<Path>.some(run copyPath(value))
+  }
+  let mut packages = Packages {
+    packages: List<Package>.make(),
+    edges: List<Edge>.make(),
+    store: move kept,
+    archiveContext: move archiveContext,
+    workspaces: List<Bytes>.make(),
+  }
+
   // The root's own exports are part of its public surface, so the build checks them even when its
   // root module imports none of them.
-  let exports = run exportsOf(identity, document, manifest, sourceRoot)
-  run List<Package>.append(&mut packages.packages, Package {
-    identity: run Bytes.copy(identity), name: run Bytes.copy(name), manifest: run copyPath(manifest),
-    sourceRoot: run copyPath(sourceRoot), exports: move exports, checkout: Option<Path>.none(),
-    linkInputs: List<Declared>.make(), archives: List<Archive>.make(),
-  })
-  let mut stack = List<Bytes>.make()
-  run List<Bytes>.append(&mut stack, run Bytes.copy(identity))
-  run visit(&mut packages, usize.ZERO, document, &mut stack)
+  let exports = run exportsOf(identity, &document, manifest, sourceRoot)
+  run List<Package>.append(
+    &mut packages.packages,
+    Package {
+      identity: run Bytes.copy(identity),
+      name: run Bytes.copy(name),
+      manifest: run copyPath(manifest),
+      sourceRoot: run copyPath(sourceRoot),
+      exports: move exports,
+      document: Option<SharedDocument<TomlValue>>.some(
+        run SharedDocument<TomlValue>.make(move document),
+      ),
+      checkout: Option<Path>.none(),
+      linkInputs: List<NativeLinkInput>.make(),
+      archives: List<Archive>.make(),
+    },
+  )
   return move packages
 }
 
 /// The package graph of these packages, whose standard-library paths belong to `owner`'s package,
 /// the standard library's own.
-pub effect fn graph(self: &Packages, owner: &ModuleId) -> PackageGraph ! OutOfMemoryError ? &mut Allocator {
+pub effect fn graph(self: &Packages, owner: &ModuleId) -> PackageGraph
+  ! OutOfMemoryError
+  ? &mut Allocator {
   let mut graph = PackageGraph.make(owner)
   let edges = List<Edge>.asSlice(&self.edges)
   let mut at = usize.ZERO
   while at < edges.length {
-    run PackageGraph.depend(&mut graph, Bytes.asSlice(&edges[at].owner), Bytes.asSlice(&edges[at].name),
-      Bytes.asSlice(&edges[at].package))
+    run PackageGraph.depend(
+      &mut graph,
+      Bytes.asSlice(&edges[at].owner),
+      Bytes.asSlice(&edges[at].name),
+      Bytes.asSlice(&edges[at].package),
+    )
     at = at + usize.ONE
   }
   let packages = List<Package>.asSlice(&self.packages)
@@ -1064,7 +1637,11 @@ pub effect fn graph(self: &Packages, owner: &ModuleId) -> PackageGraph ! OutOfMe
     let exports = List<Bytes>.asSlice(&packages[packageAt].exports)
     let mut exportAt = usize.ZERO
     while exportAt < exports.length {
-      run PackageGraph.publish(&mut graph, Bytes.asSlice(&packages[packageAt].identity), Bytes.asSlice(&exports[exportAt]))
+      run PackageGraph.publish(
+        &mut graph,
+        Bytes.asSlice(&packages[packageAt].identity),
+        Bytes.asSlice(&exports[exportAt]),
+      )
       exportAt = exportAt + usize.ONE
     }
     packageAt = packageAt + usize.ONE
@@ -1079,19 +1656,34 @@ pub fn rootExports(self: &Packages) -> &[Bytes] {
 
 /// The module of a dependency whose source root holds the file at `path`, or `None` when no
 /// dependency's does or `path` is not a module path below it.
-pub effect fn dependencyModule(self: &Packages, path: &[u8]) -> Option<ModuleId> ! OutOfMemoryError ? &mut Allocator {
+pub effect fn dependencyModule(self: &Packages, path: &[u8]) -> Option<ModuleId>
+  ! OutOfMemoryError
+  ? &mut Allocator {
   let listed = List<Package>.asSlice(&self.packages)
   let mut at = usize.ONE
   while at < listed.length {
     let root = Path.rawBytes(&listed[at].sourceRoot)
-    if path.length > root.length + usize.ONE && path[root.length] == 47 && same(Slice.view<u8>(path, usize.ZERO, root.length), root) {
-      let logical = Slice.view<u8>(path, root.length + usize.ONE, path.length - root.length - usize.ONE)
-      let identified = run Effect.result(ModuleId.make(b"file", Bytes.asSlice(&listed[at].identity), logical))
+    if path.length > root.length + usize.ONE && path[root.length] == 47
+      && same(Slice.view<u8>(path, usize.ZERO, root.length), root) {
+      let logical = Slice.view<u8>(
+        path,
+        root.length + usize.ONE,
+        path.length - root.length - usize.ONE,
+      )
+      let identified = run Effect.result(
+        ModuleId.make(b"file", Bytes.asSlice(&listed[at].identity), logical),
+      )
       return match move identified {
-        Result<ModuleId, InvalidModulePath | OutOfMemoryError>.Success {value} => Option<ModuleId>.some(move value)
-        Result<ModuleId, InvalidModulePath | OutOfMemoryError>.Failure {error} => match move error {
+        Result<ModuleId, InvalidModulePath | OutOfMemoryError>.Success { value } => Option<
+          ModuleId
+        >.some(move value)
+        Result<ModuleId, InvalidModulePath | OutOfMemoryError>.Failure {
+          error
+        } => match move error {
           InvalidModulePath _invalid => Option<ModuleId>.none()
-          OutOfMemoryError exhausted => { fail move exhausted }
+          OutOfMemoryError exhausted => {
+            fail move exhausted
+          }
         }
       }
     }
@@ -1106,7 +1698,9 @@ pub fn dependencyRoot(self: &Packages, package: &[u8]) -> Option<&Path> {
   let listed = List<Package>.asSlice(&self.packages)
   let mut at = usize.ONE
   while at < listed.length {
-    if same(Bytes.asSlice(&listed[at].identity), package) { return Option<&Path>.some(&listed[at].sourceRoot) }
+    if same(Bytes.asSlice(&listed[at].identity), package) {
+      return Option<&Path>.some(&listed[at].sourceRoot)
+    }
     at = at + usize.ONE
   }
   return Option<&Path>.none()
@@ -1133,7 +1727,9 @@ pub fn localDependency(self: &Packages, package: &[u8]) -> bool {
 /// The positions of the packages, the root first, with every package before each package it
 /// depends on: the order a static link lists their native inputs in, so an archive follows each
 /// archive or object that uses it. Packages no dependency path orders keep their load order.
-pub effect fn linkOrder(self: &Packages) -> List<usize> ! OutOfMemoryError ? &mut Allocator {
+pub effect fn linkOrder(self: &Packages) -> List<usize>
+  ! OutOfMemoryError
+  ? &mut Allocator {
   // Depth first from the root in declaration order; each package is listed after all it reaches,
   // and the reversed list puts dependents first.
   let listed = List<Package>.asSlice(&self.packages)
@@ -1156,8 +1752,14 @@ pub effect fn linkOrder(self: &Packages) -> List<usize> ! OutOfMemoryError ? &mu
 }
 
 // Lists every package `package` reaches that `done` does not mark yet, then `package` itself.
-effect fn finish(self: &Packages, package: usize, done: &mut List<bool>, finished: &mut List<usize>) -> ()
-! OutOfMemoryError ? &mut Allocator {
+effect fn finish(
+  self: &Packages,
+  package: usize,
+  done: &mut List<bool>,
+  finished: &mut List<usize>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
   let marks = List<bool>.asMutSlice(&mut done.*)
   marks[package] = true
   let listed = List<Package>.asSlice(&self.packages)
@@ -1168,7 +1770,9 @@ effect fn finish(self: &Packages, package: usize, done: &mut List<bool>, finishe
     if same(Bytes.asSlice(&edges[at].owner), owner) {
       let mut target = usize.ZERO
       while target < listed.length {
-        if same(Bytes.asSlice(&listed[target].identity), Bytes.asSlice(&edges[at].package)) { break }
+        if same(Bytes.asSlice(&listed[target].identity), Bytes.asSlice(&edges[at].package)) {
+          break
+        }
         target = target + usize.ONE
       }
       if target < listed.length && !List<bool>.asSlice(&done.*)[target] {
@@ -1181,8 +1785,6 @@ effect fn finish(self: &Packages, package: usize, done: &mut List<bool>, finishe
   return ()
 }
 
-/// The `[native].link` of the package at position `package`, as [`linkOrder`] lists positions;
-/// empty for the root package.
 /// The archives package `package` declares, selected for the build's target.
 pub fn archives(self: &Packages, package: usize) -> &[Archive] {
   return List<Archive>.asSlice(&List<Package>.asSlice(&self.packages)[package].archives)
@@ -1214,8 +1816,8 @@ pub fn count(self: &Packages) -> usize {
   return List<Package>.length(&self.packages)
 }
 
-pub fn linkInputs(self: &Packages, package: usize) -> &[Declared] {
-  return List<Declared>.asSlice(&List<Package>.asSlice(&self.packages)[package].linkInputs)
+pub fn linkInputs(self: &Packages, package: usize) -> &[NativeLinkInput] {
+  return List<NativeLinkInput>.asSlice(&List<Package>.asSlice(&self.packages)[package].linkInputs)
 }
 
 /// The directory holding the manifest of the package whose identity is `package`, the root's
@@ -1224,8 +1826,431 @@ pub fn manifestDirectory(self: &Packages, package: &[u8]) -> Option<&Path> {
   let listed = List<Package>.asSlice(&self.packages)
   let mut at = usize.ZERO
   while at < listed.length {
-    if same(Bytes.asSlice(&listed[at].identity), package) { return Option<&Path>.some(&listed[at].manifest) }
+    if same(Bytes.asSlice(&listed[at].identity), package) {
+      return Option<&Path>.some(&listed[at].manifest)
+    }
     at = at + usize.ONE
   }
   return Option<&Path>.none()
+}
+
+/// Loads the explicit package graph of a compilation request without reading a manifest or fetching a package.
+pub effect fn fromRequest(request: &CompilationRequest) -> Packages
+  ! FileError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut packages = Packages {
+    packages: List<Package>.make(),
+    edges: List<Edge>.make(),
+    store: Option<Path>.none(),
+    archiveContext: ArchiveContext {
+      target: run Bytes.copy(String.ownedUtf8Bytes(&request.profile.target)),
+      store: Option<Path>.none(),
+      overrides: List<NativeLinkInputs.Override>.make(),
+    },
+    workspaces: List<Bytes>.make(),
+  }
+  let listed = List<RequestPackage>.asSlice(&request.packages)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let package = &listed[at]
+    let mut identity = run Bytes.copy(String.ownedUtf8Bytes(&package.name))
+    run Bytes.append(&mut identity, b"@")
+    run Bytes.append(&mut identity, String.ownedUtf8Bytes(&package.version))
+    let edges = List<RequestDependency>.asSlice(&package.dependencies)
+    let mut edge = usize.ZERO
+    while edge < edges.length {
+      run List<Edge>.append(
+        &mut packages.edges,
+        Edge {
+          owner: run Bytes.copy(Bytes.asSlice(&identity)),
+          name: run Bytes.copy(String.ownedUtf8Bytes(&edges[edge].name)),
+          package: run Bytes.copy(String.ownedUtf8Bytes(&edges[edge].package)),
+        },
+      )
+      edge = edge + usize.ONE
+    }
+    let mut exports = List<Bytes>.make()
+    let names = List<String>.asSlice(&package.exports)
+    let mut exported = usize.ZERO
+    while exported < names.length {
+      run List<Bytes>.append(&mut exports, run Bytes.copy(String.ownedUtf8Bytes(&names[exported])))
+      exported = exported + usize.ONE
+    }
+    run List<Package>.append(
+      &mut packages.packages,
+      Package {
+        identity: move identity,
+        document: Option<SharedDocument<TomlValue>>.none(),
+        name: run Bytes.copy(String.ownedUtf8Bytes(&package.name)),
+        manifest: run Path.make(package.directory.view()),
+        sourceRoot: run Path.make(package.source.view()),
+        exports: move exports,
+        checkout: Option<Path>.none(),
+        linkInputs: List<NativeLinkInput>.make(),
+        archives: List<Archive>.make(),
+      },
+    )
+    at = at + usize.ONE
+  }
+  return move packages
+}
+
+/// Copies the resolved package graph into the compilation wire model.
+pub effect fn requestPackages(self: &Packages) -> List<RequestPackage>
+  ! FileError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut result = List<RequestPackage>.make()
+  let packages = List<Package>.asSlice(&self.packages)
+  let edges = List<Edge>.asSlice(&self.edges)
+  let mut at = usize.ZERO
+  while at < packages.length {
+    let package = &packages[at]
+    let identity = Bytes.asSlice(&package.identity)
+    let name = Bytes.asSlice(&package.name)
+    let mut dependencies = List<RequestDependency>.make()
+    let mut edge = usize.ZERO
+    while edge < edges.length {
+      if same(Bytes.asSlice(&edges[edge].owner), identity) {
+        run dependencies.append(
+          RequestDependency {
+            name: run RequestText.copy(Bytes.asSlice(&edges[edge].name)),
+            package: run RequestText.copy(Bytes.asSlice(&edges[edge].package)),
+          },
+        )
+      }
+      edge = edge + usize.ONE
+    }
+    let mut exports = List<String>.make()
+    let names = List<Bytes>.asSlice(&package.exports)
+    let mut exported = usize.ZERO
+    while exported < names.length {
+      run exports.append(run RequestText.copy(Bytes.asSlice(&names[exported])))
+      exported = exported + usize.ONE
+    }
+    run result.append(
+      RequestPackage {
+        name: run RequestText.copy(name),
+        version: run RequestText.copy(
+          Slice.view<u8>(
+            identity,
+            name.length + usize.ONE,
+            identity.length - name.length - usize.ONE,
+          ),
+        ),
+        directory: run RequestText.copy(Path.rawBytes(&package.manifest)),
+        source: run RequestText.copy(Path.rawBytes(&package.sourceRoot)),
+        dependencies: move dependencies,
+        exports: move exports,
+        parameters: List<RequestParameter>.make(),
+        modules: List<RequestModule>.make(),
+        optimization: Option<String>.none(),
+        debug: Option<bool>.none(),
+      },
+    )
+    at = at + usize.ONE
+  }
+  return move result
+}
+
+/// Records the root pins already resolved by the manifest loader, for its package plan.
+pub effect fn setRootArchives(self: &mut Packages, archives: &[Archive]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let root = &mut self.packages.asMutSlice()[0]
+  let mut at: usize = 0
+  while at < archives.length {
+    run root.archives.append(run NativeLinkInputs.copyArchive(&archives[at]))
+    at = at + 1
+  }
+}
+
+// Whether an existing dependency path would close a cycle at `target`.
+effect fn reaches(self: &Packages, source: &[u8], target: &[u8]) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut pending = List<Bytes>.make()
+  run pending.append(run Bytes.copy(source))
+  let edges = self.edges.asSlice()
+  let mut at: usize = 0
+  while at < pending.length() {
+    let owned = run Bytes.copy(pending.asSlice()[at].asSlice())
+    let owner = owned.asSlice()
+    if same(owner, target) {
+      return true
+    }
+    let mut edge: usize = 0
+    while edge < edges.length {
+      if same(edges[edge].owner.asSlice(), owner)
+        && !onStack(pending.asSlice(), edges[edge].package.asSlice()) {
+        run pending.append(run Bytes.copy(edges[edge].package.asSlice()))
+      }
+      edge = edge + 1
+    }
+    at = at + 1
+  }
+  return false
+}
+
+fn ownerIndex(self: &Packages, owner: &[u8]) -> usize {
+  let packages = self.packages.asSlice()
+  let mut at: usize = 0
+  while at < packages.length {
+    if same(packages[at].identity.asSlice(), owner) {
+      return at
+    }
+    at = at + 1
+  }
+  return usize.MAX
+}
+
+/// Whether `owner` declares an import alias that has not yet been resolved.
+pub fn pending(self: &Packages, owner: &[u8], name: &[u8]) -> bool {
+  let edges = self.edges.asSlice()
+  let mut at: usize = 0
+  while at < edges.length {
+    if same(edges[at].owner.asSlice(), owner) && same(edges[at].name.asSlice(), name) {
+      return false
+    }
+    at = at + 1
+  }
+  let index = ownerIndex(self, owner)
+  if index == usize.MAX {
+    return false
+  }
+  if let Option<SharedDocument<TomlValue>>.Some {
+    value
+  } = &self.packages.asSlice()[index].document {
+    if let Option<&TomlValue>.Some { value: dependencies } = move Toml.field(
+      SharedDocument<TomlValue>.get(&value),
+      "dependencies",
+    ) {
+      if let Option<&[TomlChild]>.Some { value: children } = move members(dependencies) {
+        let mut child: usize = 0
+        while child < children.length {
+          if let TomlChild.Member { entry } = &children[child] {
+            if same(String.ownedUtf8Bytes(&entry.key), name) {
+              return true
+            }
+          }
+          child = child + 1
+        }
+      }
+    }
+  }
+  return false
+}
+
+/// Resolves one imported alias, fetching only its own pin. It evaluates no package code.
+pub effect fn require(self: &mut Packages, owner: &[u8], name: &[u8]) -> bool
+  ! InvalidDependency | HostInputError | FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
+  if !pending(&self.*, owner, name) {
+    return false
+  }
+  let index = ownerIndex(&self.*, owner)
+  let package = &self.packages.asSlice()[index]
+  let document = match &package.document {
+    Option<SharedDocument<TomlValue>>.Some { value } => SharedDocument<TomlValue>.clone(&value)
+    Option<SharedDocument<TomlValue>>.None => {
+      return false
+    }
+  }
+  if let Option<Path>.Some { value: store } = &self.store {
+    let mut seen = List<Bytes>.make()
+    run fetchVisit(
+      &package.manifest,
+      SharedDocument<TomlValue>.get(&document),
+      &store,
+      &package.checkout,
+      &mut seen,
+      Option<&[u8]>.some(name),
+    )
+  }
+  run visit(&mut self.*, index, SharedDocument<TomlValue>.get(&document), name)
+  return true
+}
+
+/// Resolves every declared pin for metadata operations such as dependency editing.
+/// Compilation uses `require` only for aliases reached by its module imports.
+pub effect fn requireAll(self: &mut Packages) -> ()
+  ! InvalidDependency | FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let mut at: usize = 0
+  while at < self.packages.length() {
+    let package = &self.packages.asSlice()[at]
+    let owner = run Bytes.copy(package.identity.asSlice())
+    let mut names = List<Bytes>.make()
+    if let Option<SharedDocument<TomlValue>>.Some { value } = &package.document {
+      if let Option<&TomlValue>.Some { value: dependencies } = move Toml.field(
+        SharedDocument<TomlValue>.get(&value),
+        "dependencies",
+      ) {
+        if let Option<&[TomlChild]>.Some { value: children } = move members(dependencies) {
+          let mut child: usize = 0
+          while child < children.length {
+            if let TomlChild.Member { entry } = &children[child] {
+              run names.append(run Bytes.copy(String.ownedUtf8Bytes(&entry.key)))
+            }
+            child = child + 1
+          }
+        }
+      }
+    }
+    let listed = names.asSlice()
+    let mut name: usize = 0
+    while name < listed.length {
+      if pending(&self.*, owner.asSlice(), listed[name].asSlice()) {
+        let document = match &self.packages.asSlice()[at].document {
+          Option<SharedDocument<TomlValue>>.Some { value } => SharedDocument<TomlValue>.clone(
+            &value,
+          )
+          Option<SharedDocument<TomlValue>>.None => {
+            break
+          }
+        }
+        run visit(&mut self.*, at, SharedDocument<TomlValue>.get(&document), listed[name].asSlice())
+      }
+      name = name + 1
+    }
+    at = at + 1
+  }
+}
+
+/// Whether the package `owner` declares `name` in its `[dependencies]`.
+pub fn declares(self: &Packages, owner: &[u8], name: &[u8]) -> bool {
+  let edges = self.edges.asSlice()
+  let mut at: usize = 0
+  while at < edges.length {
+    if same(edges[at].owner.asSlice(), owner) && same(edges[at].name.asSlice(), name) {
+      return true
+    }
+    at = at + 1
+  }
+  return pending(self, owner, name)
+}
+
+/// Installs the evaluated native inputs of one reached package.
+pub fn setNative(self: &mut Packages, owner: usize, inputs: List<NativeLinkInput>) -> () {
+  let package = &mut self.packages.asMutSlice()[owner]
+  package.linkInputs = move inputs
+}
+
+/// A source-file compilation's single package, with no manifest, dependencies, or native pins.
+pub effect fn standalone(directory: &Path, target: &[u8]) -> Packages
+  ! FileError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut packages = List<Package>.make()
+  run packages.append(
+    Package {
+      identity: run Bytes.copy(b"source@0.0.0"),
+      name: run Bytes.copy(b"source"),
+      document: Option<SharedDocument<TomlValue>>.none(),
+      manifest: run copyPath(directory),
+      sourceRoot: run copyPath(directory),
+      exports: List<Bytes>.make(),
+      checkout: Option<Path>.none(),
+      linkInputs: List<NativeLinkInput>.make(),
+      archives: List<Archive>.make(),
+    },
+  )
+  return Packages {
+    packages: move packages,
+    edges: List<Edge>.make(),
+    store: Option<Path>.none(),
+    archiveContext: ArchiveContext {
+      target: run Bytes.copy(target),
+      store: Option<Path>.none(),
+      overrides: List<NativeLinkInputs.Override>.make(),
+    },
+    workspaces: List<Bytes>.make(),
+  }
+}
+
+/// Resolves one root dependency's explicitly included file or directory. The declaration is checked
+/// before its canonical path is exposed, and links cannot grant access outside the package.
+pub effect fn includedPath(self: &mut Packages, name: &[u8], relative: &[u8]) -> Path
+  ! InvalidDependency | HostInputError | FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
+  let root = &self.packages.asSlice()[0]
+  let owner = run Bytes.copy(root.identity.asSlice())
+  let directory = run copyPath(&root.manifest)
+  if !contained(relative) {
+    run invalid(
+      owner.asSlice(),
+      name,
+      b"a package path must stay below the declared dependency",
+      &directory,
+      b"path",
+    )
+  }
+  let _loaded = run require(&mut self.*, owner.asSlice(), name)
+  let edges = self.edges.asSlice()
+  let mut package: usize = usize.MAX
+  let mut edge: usize = 0
+  while edge < edges.length {
+    if same(edges[edge].owner.asSlice(), owner.asSlice())
+      && same(edges[edge].name.asSlice(), name) {
+      package = ownerIndex(&self.*, edges[edge].package.asSlice())
+      break
+    }
+    edge = edge + 1
+  }
+  if package == usize.MAX {
+    run invalid(
+      owner.asSlice(),
+      name,
+      b"the root does not declare this dependency alias",
+      &directory,
+      b"",
+    )
+  }
+  let selected = &self.packages.asSlice()[package]
+  let rootPath = run real(run copyPath(&selected.manifest))
+  let requested = run real(run Path.joinBytes(&rootPath, relative))
+  if !within(Path.rawBytes(&rootPath), Path.rawBytes(&requested)) {
+    run invalid(
+      owner.asSlice(),
+      name,
+      b"the requested path leaves the dependency through a symbolic link",
+      &directory,
+      b"path",
+    )
+  }
+  let document = match &selected.document {
+    Option<SharedDocument<TomlValue>>.Some { value } => SharedDocument<TomlValue>.get(&value)
+    Option<SharedDocument<TomlValue>>.None => {
+      run invalid(owner.asSlice(), name, b"the dependency has no manifest", &directory, b"")
+    }
+  }
+  if let Option<&TomlValue>.Some { value: include } = move Toml.fieldAt(
+    Toml.field(document, "package"),
+    "include",
+  ) {
+    let mut at: usize = 0
+    while let Option<&TomlValue>.Some { value } = move Toml.item(include, at) {
+      if let Option<string>.Some { value: text } = move Toml.asString(
+        Option<&TomlValue>.some(value),
+      ) {
+        let entry = String.utf8Bytes(text)
+        if contained(entry) && (same(relative, entry) || within(entry, relative)) {
+          let included = run real(run Path.joinBytes(&rootPath, entry))
+          if within(Path.rawBytes(&rootPath), Path.rawBytes(&included))
+            && (same(Path.rawBytes(&included), Path.rawBytes(&requested))
+              || within(Path.rawBytes(&included), Path.rawBytes(&requested))) {
+            if run FileSystem.exists(&requested) {
+              return move requested
+            }
+          }
+        }
+      }
+      at = at + 1
+    }
+  }
+  run invalid(
+    owner.asSlice(),
+    name,
+    b"the requested path is not an existing file or directory listed in package.include",
+    &directory,
+    b"path",
+  )
 }

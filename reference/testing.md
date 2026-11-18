@@ -267,7 +267,7 @@ directories, used the clock, randomness, the network, a child process, the list 
 environment or the host, read more than the watch holds, or executed a function without a digest,
 as in a build without a cache. The record is kept only while the runner's build key (TEST-009),
 which names the compiler, Clang and the build's options, the time limit, and the files besides
-Silk sources that the build read, such as the C sources and archives of `[native]`, the manifest
+Silk sources that the build read, such as the C sources and archives declared by package plans, the manifest
 and embedded files, stay the same. `--no-cache` builds the runner again and runs every selected
 test.
 

@@ -24,7 +24,37 @@ its fields are that subcommand's options and arguments. A struct or variant fiel
 
 Import as `Command` with `import silk.cli.command { Command }`.
 
-Public declarations: 6.
+Public declarations: 7.
+
+<a id="FlagValue"></a>
+
+## `FlagValue`
+
+```silk
+pub struct FlagValue
+```
+
+A flag that supplies a fixed value to its option's field.
+
+<a id="FlagValue.name"></a>
+
+### Field `name`
+
+```silk
+pub name: string<'static>
+```
+
+The long name without dashes.
+
+<a id="FlagValue.value"></a>
+
+### Field `value`
+
+```silk
+pub value: string<'static>
+```
+
+The value read when the flag occurs.
 
 <a id="OptionSpec"></a>
 
@@ -65,6 +95,16 @@ pub short: string<'static>
 ```
 
 The one-letter alias without the dash. Empty means no alias.
+
+<a id="OptionSpec.flags"></a>
+
+### Field `flags`
+
+```silk
+pub flags: Intrinsic.StaticSequence<FlagValue>
+```
+
+Flags that supply a fixed value without taking an argument.
 
 <a id="OptionSpec.description"></a>
 
@@ -569,6 +609,17 @@ pub static fn long(option: OptionSpec, long: string<'static>) -> OptionSpec
 ```
 
 Returns `option` with the long name `long`, written without the dashes.
+
+<a id="Opt.impl.flagValue"></a>
+
+### Associated function `flagValue`
+
+```silk
+pub static fn flagValue(option: OptionSpec, name: string<'static>, value: string<'static>) -> OptionSpec
+```
+
+Adds a long flag that supplies `value` to this option without taking an argument.
+The flag and the valued option share repetition checks and value validation.
 
 <a id="Opt.impl.describe"></a>
 

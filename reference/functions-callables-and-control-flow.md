@@ -504,7 +504,9 @@ open, so `let identity: fn(i32) -> i32 = same` names `same` at `i32`.
 **Diagnostics:** Applying a non-callable reports `SEM0075`, as does writing type arguments after a
 name that is not a function. Type arguments of the wrong number report `SEM0051`. An incompatible
 callable parameter,
-result, or mode reports `SEM0076`. A context that would erase a required concrete callable identity
+result, or mode reports `SEM0076`. A plain `fn` or lambda passed where an `effect fn` is expected
+reports it too and names the fix, `effect fn` or `effect |value| { ... }`; a plain `fn` that returns
+the Effect without running it is accepted. A context that would erase a required concrete callable identity
 reports `SEM0080` or the more specific represented-storage diagnostic. A parameter whose type
 argument is a callable contract reports `SEM0018`.
 

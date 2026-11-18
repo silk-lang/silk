@@ -26,13 +26,13 @@ try {
   # first use.
   $selectedClang = $env:SILK_CLANG
   $env:SILK_CLANG = $null
-  & $tool build main.silk -o program.exe --optimization none --debug false
+  & $tool build --optimization none --debug false
   $env:SILK_CLANG = $selectedClang
   if ($LASTEXITCODE -ne 0) { throw 'The packaged tool could not build a new project' }
   foreach ($link in 'clang.exe', 'lld-link.exe', 'llvm-ar.exe', 'llvm-dlltool.exe') {
     if (-not (Test-Path -LiteralPath (Join-Path $release "lib/silk/llvm/bin/$link"))) { throw "The bundled LLVM has no $link" }
   }
-  & (Join-Path $project 'program.exe')
+  & (Join-Path $project 'build/x86_64-pc-windows-msvc/dev/release-smoke.exe')
   if ($LASTEXITCODE -ne 42) { throw 'The packaged compiler produced the wrong program result' }
 
   # A cold git dependency checkout through the tool and through the bundled compiler: the tool
@@ -53,9 +53,9 @@ try {
   [IO.File]::WriteAllText((Join-Path $consumer 'silk.toml'), "[package]`nname = `"git-smoke`"`nversion = `"0.1.0`"`nsilk-version = `"$version`"`nsource = `".`"`n`n[dependencies]`nanswer = { git = `"$url`", rev = `"$commit`", path = `"answer`" }`n")
   [IO.File]::WriteAllText((Join-Path $consumer 'main.silk'), "import answer.value { value }`n`npub fn main() -> i32 { return value() }`n")
   Set-Location $consumer
-  & $tool build main.silk -o program.exe --clang $env:SILK_TEST_CLANG --optimization none --debug false
+  & $tool build --clang $env:SILK_TEST_CLANG --optimization none --debug false
   if ($LASTEXITCODE -ne 0) { throw 'The packaged tool could not fetch a git dependency' }
-  & (Join-Path $consumer 'program.exe')
+  & (Join-Path $consumer 'build/x86_64-pc-windows-msvc/dev/git-smoke.exe')
   if ($LASTEXITCODE -ne 42) { throw 'The git dependency program produced the wrong result' }
   if (-not (Test-Path -LiteralPath (Join-Path $env:SILK_HOME "git/$commit.fetched"))) { throw 'The git checkout is not in the store SILK_HOME names' }
   $env:SILK_HOME = Join-Path $OutputDirectory 'compiler home'

@@ -28,12 +28,12 @@ const clang = await Effect.runPromise(Config.String('SILK_CLANG').pipe(Config.wi
 const root = resolve(import.meta.dirname, '../..')
 const directory = mkdtempSync(join(realpathSync(tmpdir()), 'silk-native-https-'))
 const openssl = (...args) => execFileSync('openssl', args, { cwd: directory, stdio: 'pipe' })
-const run = (command, args, env = process.env) =>
+const run = (command, args, env = process.env, timeout = 60_000) =>
   new Promise((resolveRun, reject) => {
     const child = spawn(command, args, {
       cwd: root,
       env,
-      timeout: 60_000,
+      timeout,
       stdio: ['ignore', 'pipe', 'pipe'],
     })
     let stdout = ''
@@ -60,20 +60,15 @@ try {
     `[package]\nname = "native-https-test"\nversion = "0.0.0"\nsource = "."\n[dependencies]\nchangeset = { path = ${JSON.stringify(join(root, 'changes'))} }\n`,
   )
   const executable = join(directory, 'https-test')
-  const build = await run(compiler, [
-    'build',
-    join(directory, 'main.silk'),
-    '-o',
-    executable,
-    '--stdlib',
-    join(root, 'stdlib'),
-    '--clang',
-    clang,
-    '--optimization',
-    'speed',
-    '--debug',
-    'false',
-  ])
+  const build = await run(process.execPath, [
+    join(root, 'compiler/scripts/CompilationBuild.ts'),
+    '--compiler', compiler,
+    '--manifest', join(directory, 'silk.toml'),
+    '--output', executable,
+    '--stdlib', join(root, 'stdlib'),
+    '--optimization', 'speed',
+    '--debug', 'false',
+  ], { ...process.env, SILK_CLANG: clang }, 300_000)
   assert.equal(build.status, 0, JSON.stringify(build))
 
   // Match the compatibility gap: P-256 leaf and intermediate, P-384 authority, SHA-384 CA signature.
