@@ -46,6 +46,27 @@ pub fn main() -> i32 {
 }
 ```
 
+### Keep an enum by its member name
+```silk
+import silk.core.option { Option }
+import silk.core.reflect { Reflect }
+
+enum Tab { Home, Search, Settings }
+
+pub fn main() -> i32 {
+  let saved = Reflect.enumLabelOf(Tab.Search)
+  return match Reflect.enumFromLabel<Tab>(saved) {
+    Option<Tab>.Some {value} => {
+      if value != Tab.Search {
+        return 1
+      }
+      return 0
+    }
+    Option<Tab>.None => 2
+  }
+}
+```
+
 Import as `Reflect` with `import silk.core.reflect { Reflect }`.
 
 Public declarations: 12.
@@ -338,8 +359,8 @@ pub static fn typeKind<Owner>(descriptor: Intrinsic.Type<Owner>) -> u8
 ```
 
 Returns the kind of type that `descriptor` describes: [`namedKind`](#namedKind), [`positionalKind`](#positionalKind),
-[`anonymousNamedKind`](#anonymousNamedKind), [`anonymousPositionalKind`](#anonymousPositionalKind), [`arrayKind`](#arrayKind), or [`otherKind`](#otherKind). Every
-type has a kind, so a generic function can branch on the kind of its type parameter.
+[`anonymousNamedKind`](#anonymousNamedKind), [`anonymousPositionalKind`](#anonymousPositionalKind), [`arrayKind`](#arrayKind), [`unionKind`](#unionKind),
+[`enumKind`](#enumKind), or [`otherKind`](#otherKind). Every type has a kind, so a generic function can branch on the kind of its type parameter.
 
 <a id="Reflect.impl.typeName"></a>
 
@@ -380,18 +401,106 @@ The name does not depend on imports or type arguments. A non-nominal type return
 pub static fn enumMembers<Enum>() -> Intrinsic.StaticSequence<Enum>
 ```
 
-Returns the visible scalar enum values in declaration order, preserving their discriminants.
-Use the static sequence in a `static for`; it has no runtime representation.
+Returns the members of the scalar enum `Enum`, in declaration order.
 
-<a id="Reflect.impl.enumLabel"></a>
+#### Details
 
-### Associated function `enumLabel`
+Use the result as the sequence of a `static for`. Each element is a value of `Enum`; read
+its name with [`Reflect.enumLabelOf`](#Reflect.impl.enumLabelOf) and its discriminant with [`Reflect.enumValue`](#Reflect.impl.enumValue). The
+sequence has no runtime representation.
+
+<a id="Reflect.impl.enumValue"></a>
+
+### Associated function `enumValue`
 
 ```silk
-pub static fn enumLabel<Enum>(value: Enum) -> string<'static>
+pub static fn enumValue<Enum, Repr>(value: Enum) -> Repr
 ```
 
-Returns the declared member name of a scalar enum value during static evaluation.
+Returns the discriminant of the scalar enum member `value`, as its representation `Repr`.
+
+#### When to use
+
+Read the discriminant of a member in generic code, where `Enum.value` cannot be named. For
+`enum(i16) Code { Ok, Failed = 130 }`, `enumValue<Code, i16>(Code.Failed)` is `130`.
+
+#### Gotchas
+
+It runs only during static evaluation, so `value` must be known then, such as a member from
+[`Reflect.enumMembers`](#Reflect.impl.enumMembers). Static evaluation stops at the call when `Repr` is not the enum's
+representation: `u8` for an enum declared without one.
+
+<a id="Reflect.impl.enumLabelOf"></a>
+
+### Associated function `enumLabelOf`
+
+```silk
+pub fn enumLabelOf<Enum>(value: Enum) -> string<'static>
+```
+
+Returns the name of the member that the scalar enum value `value` holds, as written in the
+enum declaration.
+
+#### Details
+
+At runtime it compares `value` with each member in turn, like a `match` with one arm for each
+member. Static code can call it too, such as on a member from [`Reflect.enumMembers`](#Reflect.impl.enumMembers).
+
+<a id="Reflect.impl.enumFromLabel"></a>
+
+### Associated function `enumFromLabel`
+
+```silk
+pub fn enumFromLabel<Enum>(label: string) -> Option<Enum>
+```
+
+Returns the member of the scalar enum `Enum` named `label`, or none when no member has that
+name.
+
+#### When to use
+
+Read back a value written with [`Reflect.enumLabelOf`](#Reflect.impl.enumLabelOf), such as a saved setting. The name
+must match exactly, including case.
+
+<a id="Reflect.impl.enumFromValue"></a>
+
+### Associated function `enumFromValue`
+
+```silk
+pub fn enumFromValue<Enum, Repr>(value: Repr) -> Option<Enum>
+```
+
+Returns the member of the scalar enum `Enum` whose discriminant is `value`, or none when no
+member has it.
+
+#### Details
+
+It is the inverse of `Enum.value` for generic code. `Repr` must be the enum's
+representation, `u8` for an enum declared without one.
+
+#### Examples
+
+```silk
+import silk.core.option { Option }
+import silk.core.reflect { Reflect }
+
+enum(i16) Code { Ok, Failed = 130 }
+
+pub fn main() -> i32 {
+  if Reflect.enumFromValue<Code, i16>(1).isSome() {
+    return 1
+  }
+  return match Reflect.enumFromValue<Code, i16>(130) {
+    Option<Code>.Some {value} => {
+      if value != Code.Failed {
+        return 2
+      }
+      return 0
+    }
+    Option<Code>.None => 3
+  }
+}
+```
 
 <a id="Reflect.impl.typeDoc"></a>
 

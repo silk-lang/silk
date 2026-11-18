@@ -33,6 +33,7 @@ import documentation.Doctest
 import documentation.Doctest { Outcome, Summary, Verdict }
 import driver.ExampleSource as ExampleSources
 import format.Command as FormatCommand { FileOutcome }
+import format.Output
 import lsp.Command as LspCommand
 import hir.Fingerprint
 import hir.Hir
@@ -46,7 +47,7 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.collections.bytes { Bytes }
 import silk.system.child_process { ChildProcess, ProcessError, ProcessOutcome, ProcessRequest }
 import silk.core.effect { Effect }
-import silk.system.filesystem { DirectoryEntry, FileError, FileSystem, Path }
+import silk.system.filesystem { AtomicWriteError, DirectoryEntry, FileError, FileSystem, Path }
 import silk.system.host_input { HostInput, HostInputError }
 import silk.core.option { Option }
 import silk.system.filesystem_machine { MachineFileSystem }
@@ -173,7 +174,8 @@ import silk.io.standard_input_native { OsStandardInput }
 import driver.CompilationRequest as CompilationRequests
 import driver.RequestCapture
 import driver.RequestParameters
-import silk.build.request {
+import silk.build.publish as Publish
+import silk.build.request as Requests {
   Request as CompilationRequest,
   Platform as RequestPlatform,
   Wasm as RequestWasm,
@@ -211,6 +213,7 @@ import driver.ProjectInitializer as ProjectInitializers {
   Initialized,
   Kind as InitKind
 }
+import driver.TemplateCommands { NextStep }
 import driver.Template as Templates {
   Created as TemplateCreated,
   Listed as TemplateListed,
@@ -287,6 +290,9 @@ pub union ApplicationError {
   /// A project command line that does not parse, with the message that names why and the
   /// command's usage.
   InvalidCommand { pub message: Bytes },
+  /// A package whose root module does not exist: its name, the module's path as the package
+  /// spells it, such as `src/main.silk`, and whether the package has a tasks program instead.
+  MissingRootModule { pub package: Bytes, pub path: Bytes, pub tasks: bool },
 }
 
 effect fn invalidArgumentCount(actual: usize) -> never
@@ -307,6 +313,34 @@ effect fn invalidCommand(command: &[u8], invalid: InvalidProjectCommand) -> neve
   run Bytes.append(&mut message, command)
   run Bytes.append(&mut message, b"` for its options.\n")
   fail ApplicationError.InvalidCommand { message: move message }
+}
+
+// Refuses to build `project` from the root module `entry` when that file does not exist, rather
+// than failing on its read, and says whether the package's tasks are what it holds instead.
+effect fn requireRootModule(project: &Project, entry: &Path) -> ()
+  ! ApplicationError | FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  if run FileSystem.exists(entry) {
+    return ()
+  }
+  let tasks = run Path.join(Projects.sourceRoot(project), "tasks.silk")
+  let spelled = Path.rawBytes(entry)
+  let directory = Path.rawBytes(Projects.directory(project))
+  let mut shown = spelled
+  if spelled.length > directory.length + usize.ONE
+    && same(Slice.view<u8>(spelled, usize.ZERO, directory.length), directory)
+    && (spelled[directory.length] == 47 || spelled[directory.length] == 92) {
+    shown = Slice.view<u8>(
+      spelled,
+      directory.length + usize.ONE,
+      spelled.length - directory.length - usize.ONE,
+    )
+  }
+  fail ApplicationError.MissingRootModule {
+    package: run Bytes.copy(Projects.name(project)),
+    path: run Bytes.copy(shown),
+    tasks: run FileSystem.exists(&tasks),
+  }
 }
 
 /// One parsed command line: the source file to read and the requested artifact or dump. A test
@@ -753,10 +787,14 @@ effect fn commandUsage(command: &[u8]) -> Bytes
 }
 
 // Writes the help of `command`: a project command's options, then the synopsis lines of its other
-// forms. Returns `false`, and writes nothing, for a command with no help.
-effect fn writeCommandHelp(command: &[u8]) -> bool
+// forms; with `json`, the project command's help as one JSON object. Returns `false`, and writes
+// nothing, for a command with no such help.
+effect fn writeCommandHelp(command: &[u8], json: bool) -> bool
   ! OutOfMemoryError | WriterError
   ? &mut Allocator | &mut Writer {
+  if json {
+    return run ProjectCommands.writeHelp(command, true)
+  }
   let lines = run commandUsage(command)
   if same(command, b"format") {
     run FormatCommand.writeHelp()
@@ -766,7 +804,7 @@ effect fn writeCommandHelp(command: &[u8]) -> bool
     run DocumentationCommand.writeHelp(command)
     return true
   }
-  let described = run ProjectCommands.writeHelp(command)
+  let described = run ProjectCommands.writeHelp(command, false)
   if described && Bytes.length(&lines) > usize.ZERO {
     run Writer.writeAll(b"\n")
   }
@@ -803,15 +841,43 @@ effect fn request() -> Request
     if same(flag, b"--version") || same(flag, b"-v") {
       return Request.Version
     }
-    if same(flag, b"request-schema") {
-      return Request.Schema { kind: SchemaKind.Request }
-    }
-    if same(flag, b"manifest-schema") {
-      return Request.Schema { kind: SchemaKind.Manifest }
-    }
   }
   if count >= usize.add(0, 2) {
     let command = run argumentAt(usize.ONE, count)
+    if same(Bytes.asSlice(&command), b"request-schema") {
+      let arguments = run commandArguments(count)
+      return match move run Effect.result(ProjectCommands.parseRequestSchema(arguments.asSlice())) {
+        Result<ProjectCommands.RequestSchema, InvalidProjectCommand | OutOfMemoryError>.Success {
+          ..
+        } => Request.Schema { kind: SchemaKind.Request }
+        Result<ProjectCommands.RequestSchema, InvalidProjectCommand | OutOfMemoryError>.Failure {
+          error
+        } => match move error {
+          InvalidProjectCommand invalid => run invalidCommand(b"request-schema", move invalid)
+          OutOfMemoryError exhausted => {
+            fail move exhausted
+          }
+        }
+      }
+    }
+    if same(Bytes.asSlice(&command), b"manifest-schema") {
+      let arguments = run commandArguments(count)
+      return match move run Effect.result(
+        ProjectCommands.parseManifestSchema(arguments.asSlice()),
+      ) {
+        Result<ProjectCommands.ManifestSchema, InvalidProjectCommand | OutOfMemoryError>.Success {
+          ..
+        } => Request.Schema { kind: SchemaKind.Manifest }
+        Result<ProjectCommands.ManifestSchema, InvalidProjectCommand | OutOfMemoryError>.Failure {
+          error
+        } => match move error {
+          InvalidProjectCommand invalid => run invalidCommand(b"manifest-schema", move invalid)
+          OutOfMemoryError exhausted => {
+            fail move exhausted
+          }
+        }
+      }
+    }
     if same(Bytes.asSlice(&command), b"plan") {
       let arguments = run commandArguments(count)
       return match move run Effect.result(ProjectCommands.parsePlan(arguments.asSlice())) {
@@ -2642,6 +2708,17 @@ effect fn compileIrIn(
   let mut units = requestedUnits
   if thinWanted && !thinLinked {
     units = List<CodegenUnit>.asSlice(&noUnits)
+    // One module optimizes on one thread: a large program's build goes from a minute or two to
+    // several, so say why rather than leave `codegen-units` looking ignored.
+    run Progress.clear(&mut progress.*)
+    let mut note = run Bytes.copy(b"silk: note: this build is one module, not its profile's codegen units, because there is no ")
+    run Bytes.append(&mut note, Slice.view<u8>(lldName, usize.ONE, lldName.length - usize.ONE))
+    run Bytes.append(&mut note, b" beside the Clang ")
+    run Bytes.append(&mut note, origin)
+    run Bytes.append(&mut note, b" (")
+    run Bytes.append(&mut note, Path.rawBytes(&clang))
+    run Bytes.append(&mut note, b"), so it optimizes on one thread; use a Clang with lld in its directory, or unset SILK_CLANG for the LLVM bundled with Silk\n")
+    run writeError(Bytes.asSlice(&note))
   }
 
   // A ThinLTO link optimizes and generates each unit's code again, on as many threads as the host
@@ -3046,6 +3123,7 @@ effect fn compileIrIn(
           ir,
           &resource.*,
           &object,
+          &unitDirectory,
           List<Bytes>.asSlice(&common),
           &mut progress.*,
         )
@@ -3565,20 +3643,30 @@ effect fn unitDebugInfo(
 
 // Compiles the whole module `ir`, encoded as bitcode to `input`, to the cached `object` with the
 // shared code `flags`, and answers Clang's status. Clang optimizes the whole program here, so the
-// step shows as its own `optimize` phase before the link resumes.
+// step shows as its own `optimize` phase before the link resumes, measured against the time it
+// took last that the output's cache `directory` records.
 effect fn optimizeModule(
   clang: &Path,
   origin: &[u8],
   ir: &Bytes,
   input: &Path,
   object: &Path,
+  directory: &Path,
   flags: &[Bytes],
   progress: &mut Progress,
 ) -> i32
   ! FileError | ProcessError | HostInputError | OutOfMemoryError | WriterError
   ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
   run Progress.retitle(&mut progress.*, ProgressPhase.Optimize)
-  run Progress.show(&mut progress.*, b"clang")
+  let mut subject = run Bytes.copy(b"clang")
+  if let Option<u64>.Some { value: last } = run CodegenCache.lastOptimize(directory) {
+    Progress.expect(&mut progress.*, last)
+    run Bytes.append(&mut subject, b" (last ")
+    run Progress.appendDuration(&mut subject, last)
+    run Bytes.append(&mut subject, b")")
+  }
+  run Progress.show(&mut progress.*, Bytes.asSlice(&subject))
+  let began = run Progress.stamp()
   let bitcode = run Bitcode.compileProgram(Bytes.asSlice(ir))
   run FileSystem.writeFile(input, Bytes.asSlice(&bitcode))
   drop bitcode
@@ -3616,6 +3704,8 @@ effect fn optimizeModule(
   if compiled != 0 {
     return compiled
   }
+  let ended = run Progress.stamp()
+  run CodegenCache.recordOptimize(directory, ended - began)
   if !run CodegenCache.publish(object, b"") {
     run Progress.clear(&mut progress.*)
     run writeError(b"silk: cannot write ")
@@ -3769,11 +3859,15 @@ effect fn compileUnits(
     at = at + usize.ONE
   }
 
-  // Without threads, each unit compiles below, one at a time.
+  // Without threads, each unit compiles below, one at a time. The workers' Clang runs report
+  // nothing, so a ticker keeps the live line moving until they all end.
   let mut statuses = List<i32>.make()
-  match move run Effect.result(
+  let ticker = run Progress.tick(&mut progress.*)
+  let ran = run Effect.result(
     CodegenCache.runAll(move jobs, List<usize>.asSlice(&sizes), NativeThread.processorCount()),
-  ) {
+  )
+  drop ticker
+  match move ran {
     Result<List<i32>, OutOfMemoryError | SpawnError>.Success { value } => {
       statuses = move value
     }
@@ -3912,7 +4006,10 @@ fn clangMajor(output: &[u8]) -> Option<usize> {
 effect fn submitted(process: &ProcessRequest, progress: &mut Progress) -> i32
   ! ProcessError | OutOfMemoryError | WriterError
   ? &mut ChildProcess | &mut Allocator {
+  // The child reports nothing while it runs, so a ticker keeps the live line moving until it ends.
+  let ticker = run Progress.tick(&mut progress.*)
   let outcome = run ChildProcess.submit(process)
+  drop ticker
   if let Option<i32>.Some { value } = move ChildProcess.exitCode(&outcome) {
     if value == 0 {
       return 0
@@ -3979,6 +4076,7 @@ effect fn prepare(
   explicit: Option<&CompilationRequest>,
   definition: Option<&CompilationDefinition>,
   unsandboxedTools: bool,
+  task: bool,
 ) -> Prepared
   ! ApplicationError
     | FileError
@@ -4100,6 +4198,7 @@ effect fn prepare(
         Option<SourceSnapshot>.some(Intrinsic.replace(snapshot.*, ModuleSourceFiles.snapshot())),
         definition,
         unsandboxedTools,
+        task,
       ),
     )
   }
@@ -4151,6 +4250,7 @@ effect fn prepare(
   return match move opened {
     Opened.Ready { analysis: ready } => {
       let mut analysis = move ready
+
       if let Option<SourceSnapshot>.Some { value: held } = move ModuleSourceFiles.takeSnapshot(
         &mut analysis.sources,
       ) {
@@ -4246,7 +4346,7 @@ effect fn refusedProfile(
       }
     }
     Refusal.Profile { problem } => {
-      run writeError(b"silk: error[SEM0214] invalid package parameter profile: ")
+      run writeError(b"silk: error[SEM0214] invalid package parameters: ")
       run writeError(profileProblemText(problem))
       run writeError(b"\n")
     }
@@ -4255,7 +4355,7 @@ effect fn refusedProfile(
       run writeError(Bytes.asSlice(&line))
     }
     Refusal.InputMismatch => {
-      run writeError(b"silk: invalid package parameter profile\n")
+      run writeError(b"silk: invalid package parameters\n")
     }
   }
   return Prepared.Finished {
@@ -4992,6 +5092,7 @@ effect fn build(
   incoming: Option<&CompilationRequest>,
   unsandboxedTools: bool,
   publication: Option<Path>,
+  task: bool,
 ) -> Compiled
   ! ApplicationError
     | FileError
@@ -5224,6 +5325,7 @@ effect fn build(
     incoming,
     Option<&CompilationDefinition>.none(),
     unsandboxedTools,
+    task,
   )
   run writeHeaded(heading, &mut headed, Bytes.asSlice(&refused), &mut progress.*)
   let mut analysis = match move prepared {
@@ -5366,6 +5468,7 @@ effect fn build(
     Option<ModuleId>.None => Option<&ModuleId>.none()
   }
   let analyzing = Profiler.zone(b"buildArtifact")
+  let costing = Progress.costing(&progress.*)
   Semantic.selectProgress(&mut store, Intrinsic.replace(progress.*, Progress.off()))
 
   // A debug executable compiles each codegen unit apart, so an edit recompiles only the units it
@@ -5409,8 +5512,10 @@ effect fn build(
     }
   }
 
-  // Members built side by side already fill the processors, so each lowers in its one process.
-  if shareWalk {
+  // `--costs` charges each instance as one walk lowers it. Members built side by side already
+  // fill the processors, so each lowers in its one process.
+  Semantic.selectCosts(&mut store, costing)
+  if shareWalk && !costing {
     Semantic.shareWalks(&mut store, run walkWorkers(), 2000)
   }
   let compiled = run Semantic.buildArtifact(
@@ -5422,6 +5527,16 @@ effect fn build(
     staticClosureNodes,
   )
   progress.* = Semantic.takeProgress(&mut store)
+  if costing {
+    // Module paths are read from the entry's directory; the report names them as diagnostics do.
+    let mut prefix = Bytes.make()
+    if let Option<Path>.Some { value: entryDirectory } = move run Path.parent(sourcePath) {
+      prefix = run shownPath(display, &entryDirectory)
+      run Bytes.append(&mut prefix, b"/")
+    }
+    let costs = run Semantic.costReport(&mut store, 15, Bytes.asSlice(&prefix))
+    run Progress.keepReport(&mut progress.*, Bytes.asSlice(&costs))
+  }
   drop analyzing
 
   // A reached module's selected imports are checked whole as well, used or not (IMPORT-003). They
@@ -6825,7 +6940,7 @@ effect fn reportRejection(
             let relatedPath = run displayPath(sources, &site.module, humanRoot(format))
             let mut label = Option<Bytes>.none()
             if let Option<Code>.Some { value: catalogued } = Rejections.catalogCode(code) {
-              label = run Reports.relatedLabel(catalogued)
+              label = run Reports.relatedLabel(catalogued, diagnostic)
             }
             run List<RelatedLocation>.append(
               &mut rendered.related,
@@ -7494,6 +7609,7 @@ effect fn test(
       Option<&CompilationRequest>.none(),
       unsandboxedTools,
       move publication,
+      false,
     )
       |> Effect.provideMut<FileSystem>(&mut recorder)
     let catalog = match move built {
@@ -7832,6 +7948,7 @@ effect fn buildSource(
     Option<&CompilationRequest>.none(),
     false,
     Option<Path>.none(),
+    false,
   )
   return match move built {
     Compiled.Finished { status } => status
@@ -7994,6 +8111,43 @@ effect fn selected(working: &Path, options: &ProjectOptions) -> Option<Selection
     at = at + usize.ONE
   }
   return Option<Selection>.some(Selection { projects: move projects, members: true })
+}
+
+// Names each override that a selected package's silk.local.toml writes, once, because the file
+// changes what the command reads without any manifest saying so. A command a tasks program runs,
+// which finds `SILK_PROJECT_ROOT` set, leaves that to the command that started the program.
+effect fn noteOverrides(projects: &[Project]) -> ()
+  ! HostInputError | WriterError | OutOfMemoryError
+  ? &mut FileSystem | &mut HostInput | &mut Allocator {
+  if let Option<Bytes>.Some { .. } = move run HostInput.variableNamed("SILK_PROJECT_ROOT") {
+    return ()
+  }
+  let mut written = List<Bytes>.make()
+  let mut at = usize.ZERO
+  while at < projects.length {
+    let notes = run PackageSources.overrideNotes(Projects.directory(&projects[at]))
+    let listed = notes.asSlice()
+    let mut note = usize.ZERO
+    while note < listed.length {
+      let mut known = false
+      let seen = written.asSlice()
+      let mut earlier = usize.ZERO
+      while earlier < seen.length {
+        if same(seen[earlier].asSlice(), listed[note].asSlice()) {
+          known = true
+        }
+        earlier = earlier + usize.ONE
+      }
+      if !known {
+        run writeError(b"silk: note: ")
+        run writeError(listed[note].asSlice())
+        run writeError(b"\n")
+        run written.append(run Bytes.copy(listed[note].asSlice()))
+      }
+      note = note + usize.ONE
+    }
+    at = at + usize.ONE
+  }
 }
 
 // `selected`, reporting a manifest that cannot be used.
@@ -8272,6 +8426,7 @@ fn silentProgress() -> ProgressSettings {
     position: 0,
     units: 0,
     timings: false,
+    costs: false,
   }
 }
 
@@ -8353,6 +8508,7 @@ effect fn progressSettingsFor(
     position: 0,
     units: units,
     timings: timings,
+    costs: false,
   }
 }
 
@@ -8411,6 +8567,7 @@ effect fn unitsProgress(settings: &ProgressSettings) -> Progress
     position: 0,
     units: 0,
     timings: false,
+    costs: false,
   }
   return run Progress.start(&whole, b"", b"", b"")
 }
@@ -8467,6 +8624,7 @@ effect fn buildProjectTarget(
     )
   }
   let entry = run Path.fromBytes(Path.rawBytes(ProjectPlans.entry(&plan, project)))
+  run requireRootModule(project, &entry)
   let ProjectPlan {
     input: planned,
     bindings,
@@ -8491,8 +8649,11 @@ effect fn buildProjectTarget(
   let profileName = Projects.mode(optimization)
 
   let path = if task {
+    // Each package's tasks program has its own directory: one task may run another package's
+    // tasks in the same workspace, and Windows cannot replace an executable while it runs.
     let tasks = run Path.join(Projects.outputDirectory(project), "steps/tasks")
-    let targetDirectory = run Path.joinBytes(&tasks, Target.name(&target))
+    let packageDirectory = run Path.joinBytes(&tasks, Projects.name(project))
+    let targetDirectory = run Path.joinBytes(&packageDirectory, Target.name(&target))
     run Path.join(
       &targetDirectory,
       if same(Target.operatingSystem(&target), b"windows") {
@@ -8578,6 +8739,13 @@ effect fn buildProjectTarget(
   }
   let mut reused = false
   let mut built = Compiled.Finished { status: 0 }
+
+  // `--costs` charges what a walk lowers, so its build lowers everything: it reuses no artifact
+  // and reads no semantic cache.
+  let costing = Progress.costing(&progress)
+  if costing {
+    key = Option<Bytes>.none()
+  }
   if let Option<Bytes>.Some { .. } = &key {
     // A reused build prints the warnings the build that made it printed, which an
     // `--ignore-warnings` build recorded, and fails for them as that build would have without it.
@@ -8629,10 +8797,14 @@ effect fn buildProjectTarget(
     run BuildInputs.exclude(&mut recorder, &run symbolMapFor(&path))
     run BuildInputs.exclude(&mut recorder, &run debugBundleFor(&path))
     run BuildInputs.exclude(&mut recorder, &record)
+    let mut semanticCache = borrowedPath(&cacheHome)
+    if costing {
+      semanticCache = Option<&Path>.none()
+    }
     built = run build(
       &entry,
       Option<&Path>.some(Projects.manifest(project)),
-      borrowedPath(&cacheHome),
+      semanticCache,
       &path,
       Projects.directory(project),
       form,
@@ -8662,6 +8834,7 @@ effect fn buildProjectTarget(
       } else {
         Option<Path>.some(run Path.join(Projects.outputDirectory(project), "requests"))
       },
+      task,
     )
       |> Effect.provideMut<FileSystem>(&mut recorder)
     let succeeded = match &built {
@@ -8778,8 +8951,10 @@ effect fn standardLibraryFor(working: &Path, configured: &Option<Bytes>) -> Opti
 // error. The status is 2 when any compilation failed operationally,
 // else 1 when any build was refused, else 0.
 // Builds the selected package through its command graph.
+// `noting` names the overrides of silk.local.toml first; `silk task` already has when it
+// falls back to this command.
 
-effect fn buildProject(working: &Path, command: BuildCommand) -> i32
+effect fn buildProject(working: &Path, command: BuildCommand, noting: bool) -> i32
   ! ApplicationError
     | InitialProfileProblem
     | FileError
@@ -8800,17 +8975,21 @@ effect fn buildProject(working: &Path, command: BuildCommand) -> i32
     | OutOfMemoryError
     | WriterError
   ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types | &mut Writer {
-  let BuildCommand { options } = move command
+  let BuildCommand { options, costs } = move command
   let selection = match move run selectProjects(working, &options) {
     Option<Selection>.Some { value } => move value
     Option<Selection>.None => {
       return 2
     }
   }
+  if noting {
+    run noteOverrides(List<Project>.asSlice(&selection.projects))
+  }
   let standardLibrary = run standardLibraryFor(working, &options.standardLibrary)
   let clang = run clangFor(working, &options.clang)
   let projects = List<Project>.asSlice(&selection.projects)
   let mut settings = run progressSettings(&options, projects.length)
+  settings.costs = costs
   let whole = run unitsProgress(&settings)
 
   // The compiler's identity hashes the whole executable, so a workspace reads it once for every member.
@@ -8819,9 +8998,10 @@ effect fn buildProject(working: &Path, command: BuildCommand) -> i32
   let mut succeeded = usize.ZERO
   let mut at = usize.ZERO
 
-  // Members build side by side in copies of the process, each after the members it depends on.
+  // Members build side by side in copies of the process, each after the members it depends on;
+  // with `--costs` each reports in turn.
   let mut jobs = usize.ONE
-  if projects.length > usize.ONE {
+  if projects.length > usize.ONE && !costs {
     jobs = run MemberChecks.jobs(MemberChecks.BUILD_BYTES)
   }
   if jobs > usize.ONE {
@@ -8984,6 +9164,7 @@ fn unitSettings(packages: &ProgressSettings, targets: usize) -> ProgressSettings
     position: packages.position,
     units: packages.units,
     timings: packages.timings,
+    costs: packages.costs,
   }
 }
 
@@ -9203,10 +9384,11 @@ effect fn checkTarget(
     | WriterError
   ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types {
   let entry = run Path.fromBytes(Path.rawBytes(ProjectPlans.entry(&plan, project)))
+  run requireRootModule(project, &entry)
   let ProjectPlan {
     input: planned,
     bindings,
-    task: _,
+    task: tasksCheck,
     maxMemory: unlimited,
     stackSize: _,
     entry: _,
@@ -9284,9 +9466,15 @@ effect fn checkTarget(
   if let Option<Bytes>.Some { .. } = &serving {
     mode = StoreMode.Revisable
   }
+  // The tasks program keeps a cache of its own, so it and the package's check do not evict each
+  // other's checks.
+  let mut cacheName = run Bytes.copy(Projects.name(project))
+  if tasksCheck {
+    run Bytes.append(&mut cacheName, b".tasks")
+  }
   let cacheHome = run SemanticCache.directory(
     Projects.outputDirectory(project),
-    Projects.name(project),
+    Bytes.asSlice(&cacheName),
   )
 
   // The cache file is read and decoded while the sources load.
@@ -9316,6 +9504,7 @@ effect fn checkTarget(
     Option<&CompilationRequest>.none(),
     Option<&CompilationDefinition>.none(),
     unsandboxedTools,
+    false,
   )
   let analysis = match move prepared {
     Prepared.Ready { analysis } => move analysis
@@ -9741,8 +9930,8 @@ effect fn programShape(sources: &ModuleSources) -> ContentHash
     at = at + usize.ONE
   }
 
-  // A workspace's shared dependencies decide what its members load.
-  let workspaces = ModuleSourceFiles.workspaceManifests(sources)
+  // A workspace's shared dependencies and a silk.local.toml decide what the packages load.
+  let workspaces = ModuleSourceFiles.graphFiles(sources)
   let mut workspace = usize.ZERO
   while workspace < workspaces.length {
     if let Result<Bytes, FileError | OutOfMemoryError>.Success { value } = move run Effect.result(
@@ -10527,6 +10716,7 @@ effect fn replayTarget(
     Option<&CompilationRequest>.none(),
     Option<&CompilationDefinition>.none(),
     unsandboxedTools,
+    false,
   )
   let analysis = match move prepared {
     Prepared.Ready { analysis } => move analysis
@@ -10818,6 +11008,7 @@ effect fn checkProject(working: &Path, command: CheckCommand) -> i32
       return 2
     }
   }
+  run noteOverrides(List<Project>.asSlice(&selection.projects))
   let standardLibrary = run standardLibraryFor(working, &options.standardLibrary)
   let mut edits = Option<List<Edit>>.none()
   if let Option<Bytes>.Some { value } = &script {
@@ -11223,6 +11414,7 @@ effect fn runSideBySide(
     position: settings.position,
     units: settings.units,
     timings: settings.timings,
+    costs: settings.costs,
   }
 
   // Per member, by its place in `order`: 0 waiting, 1 running, 2 finished.
@@ -11791,8 +11983,49 @@ effect fn checkOne(
     }
     return replayed
   }
-  let settings = unitSettings(packages, List<ProjectPlan>.length(&plans))
+  // The package's tasks program, checked for this machine as `silk task` builds it. It goes first
+  // so the package's own last check can still answer from a check server.
+  let tasks = run Path.join(Projects.sourceRoot(project), "tasks.silk")
+  let mut tasksPlan = Option<ProjectPlan>.none()
+  if run FileSystem.exists(&tasks) {
+    let mut host = ProjectCommands.options()
+    host.standardLibrary = run copyOption(&options.standardLibrary)
+    host.clang = run copyOption(&options.clang)
+    if let Option<List<ProjectPlan>>.Some { value: hostPlans } = move run projectPlans(&host) {
+      let mut found = move hostPlans
+      if found.length() > usize.ZERO {
+        let mut plan = found.remove(usize.ZERO)
+        plan.input.artifact = Option<Bytes>.some(run Bytes.copy(b"executable"))
+        plan.entry = Option<Path>.some(move tasks)
+        plan.task = true
+        tasksPlan = Option<ProjectPlan>.some(move plan)
+      }
+    }
+  }
+  let mut checks = List<ProjectPlan>.length(&plans)
+  if tasksPlan.isSome() {
+    checks = checks + usize.ONE
+  }
+  let settings = unitSettings(packages, checks)
   let mut attempts = List<ProjectArtifact>.make()
+  if let Option<ProjectPlan>.Some { value: plan } = move tasksPlan {
+    run List<ProjectArtifact>.append(
+      &mut attempts,
+      run checkTarget(
+        project,
+        move plan,
+        standardLibrary,
+        json,
+        roots,
+        false,
+        false,
+        &settings,
+        compiler,
+        options.ignoreWarnings,
+        &mut snapshot.*,
+      ),
+    )
+  }
   while List<ProjectPlan>.length(&plans) > usize.ZERO {
     let plan = List<ProjectPlan>.remove(&mut plans, usize.ZERO)
     let abandon = last && List<ProjectPlan>.length(&plans) == usize.ZERO
@@ -12335,7 +12568,7 @@ effect fn packProject(working: &Path, command: PackCommand) -> i32
       binaries = move archives
     }
 
-    // The object is also what an `after-pack` hook reads, so it is made without `--json` too.
+    // The object is written without `--json` too, for scripts that read the pack summary.
     if packedCount > usize.ZERO {
       run Bytes.append(&mut document, b",")
     }
@@ -12700,8 +12933,7 @@ effect fn newSigningKey(path: &Path) -> i32
 }
 
 // `silk pack --bin` for one executable package: builds each planned target as `silk build` does
-// and writes its binary archive (see `PackArchive.binaryArchive`) to `directory`. A named profile
-// joins the target in the archive's name.
+// and writes its binary archive (see `PackArchive.binaryArchive`) to `directory`, named by target.
 effect fn packBinaries(
   project: &Project,
   options: &ProjectOptions,
@@ -13047,6 +13279,7 @@ effect fn projectInputs(
       Option<&CompilationRequest>.none(),
       Option<&CompilationDefinition>.none(),
       unsandboxedTools,
+      false,
     )
       |> Effect.provideMut<FileSystem>(&mut recorder)
 
@@ -13201,10 +13434,23 @@ effect fn taskAlias(working: &Path, name: &[u8], arguments: &[Bytes]) -> Option<
     if same(word, b"--") {
       literal = true
     }
+    // The compiler's own options stay with the compiler, so a tasks program reads only its own;
+    // the compilations its graph runs honor them through the environment `tasksEnvironment` sets.
     let selection = same(word, b"--manifest-path") || same(word, b"--stdlib")
       || same(word, b"--clang")
       || same(word, b"--package")
       || same(word, b"-p")
+      || same(word, b"--backend")
+      || same(word, b"--progress")
+    let switch = same(word, b"--workspace") || same(word, b"--quiet") || same(word, b"-q")
+      || same(word, b"--timings")
+      || same(word, b"--ignore-warnings")
+      || selects(word, b"--manifest-path=")
+      || selects(word, b"--stdlib=")
+      || selects(word, b"--clang=")
+      || selects(word, b"--package=")
+      || selects(word, b"--backend=")
+      || selects(word, b"--progress=")
     if !literal && selection {
       if at + 1 >= arguments.length {
         return Option<i32>.none()
@@ -13212,7 +13458,7 @@ effect fn taskAlias(working: &Path, name: &[u8], arguments: &[Bytes]) -> Option<
       run own.append(run Bytes.copy(word))
       run own.append(run Bytes.copy(arguments[at + 1].asSlice()))
       at = at + 2
-    } else if !literal && same(word, b"--workspace") {
+    } else if !literal && switch {
       run own.append(run Bytes.copy(word))
       at = at + 1
     } else {
@@ -13262,7 +13508,13 @@ effect fn taskProject(working: &Path, command: TaskCommand) -> i32
     | OutOfMemoryError
     | WriterError
   ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types | &mut Writer {
-  let TaskCommand { options, arguments: named } = move command
+  let TaskCommand { options, arguments: named, help, json } = move command
+  if help && json {
+    return run taskHelpJson(working, &options)
+  }
+  if help {
+    return run taskHelp(working, &options)
+  }
   let mut arguments = move named
   if arguments.length() == 0 {
     run arguments.append(run Bytes.copy(b"--help"))
@@ -13276,6 +13528,7 @@ effect fn taskProject(working: &Path, command: TaskCommand) -> i32
       return 2
     }
   }
+  run noteOverrides(List<Project>.asSlice(&selection.projects))
   if !builtin && (selection.members || selection.projects.length() != 1) {
     run writeError(
       b"silk: a custom task needs one package; pass --manifest-path <package>/silk.toml\n",
@@ -13321,17 +13574,7 @@ effect fn taskProject(working: &Path, command: TaskCommand) -> i32
   let mut status = 0
   while selection.projects.length() > 0 {
     let project = selection.projects.remove(0)
-    let mut selected = ProjectCommands.options()
-    selected.manifestPath = Option<Bytes>.some(
-      run Bytes.copy(Path.rawBytes(Projects.manifest(&project))),
-    )
-    selected.standardLibrary = run copyOption(&options.standardLibrary)
-    selected.clang = run copyOption(&options.clang)
-    selected.backend = run copyOption(&options.backend)
-    selected.progress = run copyOption(&options.progress)
-    selected.quiet = options.quiet
-    selected.timings = options.timings
-    selected.ignoreWarnings = options.ignoreWarnings
+    let selected = run taskOptions(&project, &options)
     let result = match move run Effect.result(
       taskForProject(working, &project, &selected, arguments.asSlice(), builtin, &mut tests),
     ) {
@@ -13375,6 +13618,209 @@ effect fn taskProject(working: &Path, command: TaskCommand) -> i32
     run RequestCapture.restore(previous.asSlice())
   }
   return run finishTestSelection(status, &tests)
+}
+
+// The options of one package's task run: `options`, for the manifest of `project`.
+effect fn taskOptions(project: &Project, options: &ProjectOptions) -> ProjectOptions
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut selected = ProjectCommands.options()
+  selected.manifestPath = Option<Bytes>.some(
+    run Bytes.copy(Path.rawBytes(Projects.manifest(project))),
+  )
+  selected.standardLibrary = run copyOption(&options.standardLibrary)
+  selected.clang = run copyOption(&options.clang)
+  selected.backend = run copyOption(&options.backend)
+  selected.progress = run copyOption(&options.progress)
+  selected.quiet = options.quiet
+  selected.timings = options.timings
+  selected.ignoreWarnings = options.ignoreWarnings
+  return move selected
+}
+
+// The package `options` select when it has a tasks program, for the help of `silk task`: none
+// outside a package, for a workspace selection, or without src/tasks.silk.
+effect fn tasksPackage(working: &Path, options: &ProjectOptions) -> Option<Project>
+  ! ApplicationError | FileError | OutOfMemoryError | WriterError
+  ? &mut FileSystem | &mut Allocator {
+  let found = match move run Effect.result(selected(working, options)) {
+    Result<
+      Option<Selection>,
+      ApplicationError | ProjectError | FileError | OutOfMemoryError | WriterError
+    >.Success {
+      value
+    } => move value
+    Result<
+      Option<Selection>,
+      ApplicationError | ProjectError | FileError | OutOfMemoryError | WriterError
+    >.Failure {
+      error
+    } => match move error {
+      ProjectError problem => {
+        drop problem
+        return Option<Project>.none()
+      }
+      ApplicationError application => {
+        fail move application
+      }
+      FileError file => {
+        fail move file
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+      WriterError written => {
+        fail move written
+      }
+    }
+  }
+  let mut selection = match move found {
+    Option<Selection>.Some { value } => move value
+    Option<Selection>.None => {
+      return Option<Project>.none()
+    }
+  }
+  if selection.members || selection.projects.length() != 1 {
+    return Option<Project>.none()
+  }
+  let project = selection.projects.remove(0)
+  let source = run Path.join(Projects.sourceRoot(&project), "tasks.silk")
+  if !run FileSystem.exists(&source) {
+    return Option<Project>.none()
+  }
+  return Option<Project>.some(move project)
+}
+
+// Writes the help of `silk task`, then the package's tasks with their options, which its tasks
+// program writes for `--help`. Outside a package, or in one with no tasks program, only the
+// command's own help is written.
+effect fn taskHelp(working: &Path, options: &ProjectOptions) -> i32
+  ! ApplicationError
+    | InitialProfileProblem
+    | FileError
+    | ProcessError
+    | HostInputError
+    | InvalidModulePath
+    | InvalidSourceRoot
+    | InvalidDependency
+    | MissingManifest
+    | InvalidBuildComposition
+    | MissingStandardLibrary
+    | InvalidNativeLinkInput
+    | TomlError
+    | RegistrationClosed
+    | ConflictingPackageSource
+    | Cycle
+    | RevisionMismatch
+    | OutOfMemoryError
+    | WriterError
+  ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types | &mut Writer {
+  let mut stdout = StdoutWriter.make()
+  drop run writeCommandHelp(b"task", false) |> Effect.provideMut<Writer>(&mut stdout)
+  let project = match move run tasksPackage(working, options) {
+    Option<Project>.Some { value } => move value
+    Option<Project>.None => {
+      return 0
+    }
+  }
+  run Writer.writeAll(b"\n") |> Effect.provideMut<Writer>(&mut stdout)
+  let chosen = run taskOptions(&project, options)
+  let mut tests = TestSelection { multiplePackages: false, filtered: false, matched: false }
+  let mut arguments = List<Bytes>.make()
+  run arguments.append(run Bytes.copy(b"--help"))
+  return run taskForProject(working, &project, &chosen, arguments.asSlice(), false, &mut tests)
+}
+
+// Writes the help of `silk task` as one JSON object whose `commands` are the package's tasks, from
+// its tasks program's `--help=json`; empty outside a package or without a tasks program.
+effect fn taskHelpJson(working: &Path, options: &ProjectOptions) -> i32
+  ! ApplicationError
+    | InitialProfileProblem
+    | FileError
+    | ProcessError
+    | HostInputError
+    | InvalidModulePath
+    | InvalidSourceRoot
+    | InvalidDependency
+    | MissingManifest
+    | InvalidBuildComposition
+    | MissingStandardLibrary
+    | InvalidNativeLinkInput
+    | TomlError
+    | RegistrationClosed
+    | ConflictingPackageSource
+    | Cycle
+    | RevisionMismatch
+    | OutOfMemoryError
+    | WriterError
+  ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types | &mut Writer {
+  let mut counter = Output.Counter { length: usize.ZERO }
+  drop run ProjectCommands.writeHelp(b"task", true) |> Effect.provideMut<Writer>(&mut counter)
+  let mut own = run Output.make(counter.length)
+  drop run ProjectCommands.writeHelp(b"task", true) |> Effect.provideMut<Writer>(&mut own)
+
+  // The command's own object ends `"commands":[]}` and a line break; the tasks go in that list.
+  let text = Bytes.asSlice(&own.bytes)
+  let mut stdout = StdoutWriter.make()
+  run Writer.writeAll(Slice.view<u8>(text, usize.ZERO, own.length - usize.add(0, 3)))
+    |> Effect.provideMut<Writer>(&mut stdout)
+  if let Option<Project>.Some { value: project } = move run tasksPackage(working, options) {
+    let chosen = run taskOptions(&project, options)
+    let program = match move run tasksProgram(working, &project, &chosen) {
+      Option<Path>.Some { value } => move value
+      Option<Path>.None => {
+        return 2
+      }
+    }
+    let mut request = run ChildProcess.requestWithin(&program, Projects.directory(&project))
+    run ChildProcess.addArgument(&mut request, "--help=json")
+    let outcome = run ChildProcess.submit(&request)
+    run writeError(ChildProcess.errorBytes(&outcome))
+    let mut answered = false
+    if let Option<i32>.Some { value } = move ChildProcess.exitCode(&outcome) {
+      answered = value == 0
+    }
+    if !answered {
+      run writeError(b"silk: the tasks program could not write its help\n")
+      return 2
+    }
+    match tasksList(ChildProcess.outputBytes(&outcome)) {
+      Option<&[u8]>.Some { value } => {
+        run Writer.writeAll(value) |> Effect.provideMut<Writer>(&mut stdout)
+      }
+      Option<&[u8]>.None => {
+        run writeError(b"silk: the tasks program wrote help that is not a command object\n")
+        return 2
+      }
+    }
+  }
+  run Writer.writeAll(b"]}\n") |> Effect.provideMut<Writer>(&mut stdout)
+  return 0
+}
+
+// The items of the `commands` list of `help`, a tasks program's `--help=json` object, without the
+// brackets: the text between the first `"commands":[` and the `]}` that ends the object.
+fn tasksList(help: &[u8]) -> Option<&[u8]> {
+  let key = b"\"commands\":["
+  let mut end = help.length
+  while end > usize.ZERO && (help[end - usize.ONE] == 10 || help[end - usize.ONE] == 13) {
+    end = end - usize.ONE
+  }
+  if end < usize.add(0, 2) || help[end - usize.ONE] != 125 || help[end - usize.add(0, 2)] != 93 {
+    return Option<&[u8]>.none()
+  }
+  let mut at = usize.ZERO
+  while at + key.length <= end {
+    if same(Slice.view<u8>(help, at, key.length), key) {
+      let from = at + key.length
+      if from > end - usize.add(0, 2) {
+        return Option<&[u8]>.none()
+      }
+      return Option<&[u8]>.some(Slice.view<u8>(help, from, end - usize.add(0, 2) - from))
+    }
+    at = at + usize.ONE
+  }
+  return Option<&[u8]>.none()
 }
 
 effect fn taskForProject(
@@ -13578,6 +14024,23 @@ effect fn tasksEnvironment(working: &Path, project: &Project, options: &ProjectO
   if let Option<Bytes>.Some { value } = move run clangFor(working, &options.clang) {
     prepared = prepared && run ProcessImage.setVariable(b"SILK_CLANG", value.asSlice())
   }
+
+  // The compiler's own options, for the compilations the tasks program's graph runs.
+  if let Option<Bytes>.Some { value } = &options.backend {
+    prepared = prepared && run ProcessImage.setVariable(b"SILK_BACKEND", value.asSlice())
+  }
+  if let Option<Bytes>.Some { value } = &options.progress {
+    prepared = prepared && run ProcessImage.setVariable(b"SILK_PROGRESS", value.asSlice())
+  }
+  if options.quiet {
+    prepared = prepared && run ProcessImage.setVariable(b"SILK_QUIET", b"1")
+  }
+  if options.timings {
+    prepared = prepared && run ProcessImage.setVariable(b"SILK_TIMINGS", b"1")
+  }
+  if options.ignoreWarnings {
+    prepared = prepared && run ProcessImage.setVariable(b"SILK_IGNORE_WARNINGS", b"1")
+  }
   if !prepared {
     run writeError(b"silk: cannot set the tasks program's environment\n")
   }
@@ -13585,7 +14048,9 @@ effect fn tasksEnvironment(working: &Path, project: &Project, options: &ProjectO
 }
 
 // Builds and launches the selected executable, preserving its exit status.
-effect fn runProject(working: &Path, command: RunCommand) -> i32
+// `noting` names the overrides of silk.local.toml first; `silk task` already has when it
+// falls back to this command.
+effect fn runProject(working: &Path, command: RunCommand, noting: bool) -> i32
   ! ApplicationError
     | InitialProfileProblem
     | FileError
@@ -13612,6 +14077,9 @@ effect fn runProject(working: &Path, command: RunCommand) -> i32
     Option<Selection>.None => {
       return 2
     }
+  }
+  if noting {
+    run noteOverrides(List<Project>.asSlice(&selection.projects))
   }
 
   // Without `--package`, a workspace's libraries are passed over: it has one program to run when
@@ -13809,7 +14277,14 @@ struct TestSelection {
 
 // Builds and runs the selected packages' test runners. File selections require one package;
 // a name filter may match tests in any member of the encompassing task selection.
-effect fn testProject(working: &Path, command: TestCommand, tests: &mut TestSelection) -> i32
+// `noting` names the overrides of silk.local.toml first; `silk task` already has when it
+// falls back to this command.
+effect fn testProject(
+  working: &Path,
+  command: TestCommand,
+  tests: &mut TestSelection,
+  noting: bool,
+) -> i32
   ! ApplicationError
     | InitialProfileProblem
     | FileError
@@ -13836,6 +14311,9 @@ effect fn testProject(working: &Path, command: TestCommand, tests: &mut TestSele
     Option<Selection>.None => {
       return 2
     }
+  }
+  if noting {
+    run noteOverrides(List<Project>.asSlice(&selection.projects))
   }
   let projects = List<Project>.asSlice(&selection.projects)
   let narrowed = hasFilter(&root) || hasFilter(&file)
@@ -14090,8 +14568,9 @@ effect fn reportInitialization(problem: &InitializationError) -> ()
 }
 
 // Lists the package in `directory` as a member of the nearest workspace above it, unless that
-// workspace already lists it, and checks the edited workspace before keeping the edit.
-effect fn joinWorkspace(directory: &Path) -> ()
+// workspace already lists it, and checks the edited workspace before keeping the edit. Prints
+// `Added <member> to the <name> workspace`, colored when `color`.
+effect fn joinWorkspace(directory: &Path, color: bool) -> ()
   ! ProjectError | ManifestEditRefused | FileError | OutOfMemoryError | WriterError
   ? &mut FileSystem | &mut Allocator | &mut Writer {
   let parent = match move run Path.parent(directory) {
@@ -14126,19 +14605,26 @@ effect fn joinWorkspace(directory: &Path) -> ()
     run FileSystem.writeFile(&manifest, Bytes.asSlice(&previous))
     fail move error
   }
-  run Writer.writeAll(b"Added ")
-  run Writer.writeAll(Bytes.asSlice(&entry))
-  run Writer.writeAll(b" to the workspace members in ")
-  run Writer.writeAll(Path.rawBytes(&manifest))
-  run Writer.writeAll(b"\n")
+  let mut line = run Bytes.copy(b"  ")
+  run painted(&mut line, color, b"\x1b[1;32m", b"Added")
+  run Bytes.append(&mut line, b" ")
+  run painted(&mut line, color, b"\x1b[1m", Bytes.asSlice(&entry))
+  run Bytes.append(&mut line, b" to the ")
+  if let Option<string>.Some { value } = Path.name(&workspaceDirectory) {
+    run Bytes.append(&mut line, String.utf8Bytes(value))
+    run Bytes.append(&mut line, b" ")
+  }
+  run Bytes.append(&mut line, b"workspace\n")
+  run Writer.writeAll(Bytes.asSlice(&line))
 }
 
 // Lists the package created in `directory` as a member of the nearest workspace above it and
-// reports what happened: status 0, or 2 when the workspace was left unchanged.
-effect fn joinedWorkspace(directory: &Path) -> i32
+// reports what happened, colored when `color`: status 0, or 2 when the workspace was left
+// unchanged.
+effect fn joinedWorkspace(directory: &Path, color: bool) -> i32
   ! FileError | OutOfMemoryError | WriterError
   ? &mut FileSystem | &mut Allocator | &mut Writer {
-  let joined = run Effect.result(joinWorkspace(directory))
+  let joined = run Effect.result(joinWorkspace(directory, color))
   return match move joined {
     Result<
       (),
@@ -14205,6 +14691,7 @@ effect fn initProject(working: &Path, command: InitCommand) -> i32
   if let Option<Bytes>.Some { value: written } = move chosen {
     if !same(Bytes.asSlice(&written), Templates.minimalTemplate()) {
       return run initTemplate(
+        working,
         &directory,
         move name,
         Bytes.asSlice(&written),
@@ -14218,22 +14705,41 @@ effect fn initProject(working: &Path, command: InitCommand) -> i32
   )
   return match move initialized {
     Result<Initialized, InitializationError | OutOfMemoryError>.Success { value } => {
+      let color = run initColor()
+      let mut line = run Bytes.copy(b"  ")
+      run painted(&mut line, color, b"\x1b[1;32m", b"Created")
       if kind == InitKind.Workspace {
-        run Writer.writeAll(b"Initialized Silk workspace at ")
-        run Writer.writeAll(Path.rawBytes(&value.directory))
-        run Writer.writeAll(b"\nInitialized Silk project ")
-        run Writer.writeAll(Bytes.asSlice(&value.name))
-        run Writer.writeAll(b" at ")
-        run Writer.writeAll(Path.rawBytes(&value.package))
-        run Writer.writeAll(b"\nRun it with `silk run` from the workspace root\n")
+        // `value.name` is the starter member's, so the workspace is named by its directory.
+        let place = run createdPlace(working, &value.directory, b"")
+        run Bytes.append(&mut line, b" workspace ")
+        run painted(&mut line, color, b"\x1b[1m", Bytes.asSlice(&place))
+        run Bytes.append(&mut line, b" with package ")
+        run painted(&mut line, color, b"\x1b[1m", Bytes.asSlice(&value.name))
+        run Bytes.append(&mut line, b"\n")
+        run Writer.writeAll(Bytes.asSlice(&line))
+        let steps = run Templates.defaultNextSteps(false)
+        run writeNextSteps(working, &value.directory, List<NextStep>.asSlice(&steps), color)
         return 0
       }
-      run Writer.writeAll(b"Initialized Silk project ")
-      run Writer.writeAll(Bytes.asSlice(&value.name))
-      run Writer.writeAll(b" at ")
-      run Writer.writeAll(Path.rawBytes(&value.directory))
-      run Writer.writeAll(b"\n")
-      return run joinedWorkspace(&value.directory)
+      let place = run createdPlace(working, &value.directory, Bytes.asSlice(&value.name))
+      if kind == InitKind.Library {
+        run Bytes.append(&mut line, b" library ")
+        run painted(&mut line, color, b"\x1b[1m", Bytes.asSlice(&place))
+      } else {
+        run Bytes.append(&mut line, b" ")
+        run painted(&mut line, color, b"\x1b[1m", Bytes.asSlice(&place))
+        run Bytes.append(&mut line, b" from the ")
+        run Bytes.append(&mut line, Templates.minimalTemplate())
+        run Bytes.append(&mut line, b" template")
+      }
+      run Bytes.append(&mut line, b"\n")
+      run Writer.writeAll(Bytes.asSlice(&line))
+      let status = run joinedWorkspace(&value.directory, color)
+      if status == 0 {
+        let steps = run Templates.defaultNextSteps(kind == InitKind.Library)
+        run writeNextSteps(working, &value.directory, List<NextStep>.asSlice(&steps), color)
+      }
+      return status
     }
     Result<Initialized, InitializationError | OutOfMemoryError>.Failure {
       error
@@ -14349,6 +14855,7 @@ effect fn listTemplates(written: &Option<Bytes>) -> i32
 // `[[post-init]]` entries printed: status 0, 2 when the template or the directory is refused, or 1
 // when fetching it or one of its entries failed.
 effect fn initTemplate(
+  working: &Path,
   directory: &Path,
   name: Option<Bytes>,
   written: &[u8],
@@ -14422,27 +14929,198 @@ effect fn initTemplate(
   }
   run Writer.writeAll(Bytes.asSlice(&created.output))
   run writeError(Bytes.asSlice(&created.errors))
-  let shown = run Templates.spelled(&spec)
-  match &created.name {
+  let color = run initColor()
+  let mut line = run Bytes.copy(b"  ")
+  run painted(&mut line, color, b"\x1b[1;32m", b"Created")
+  let place = match &created.name {
     Option<Bytes>.Some { value } => {
-      run Writer.writeAll(b"Initialized Silk project ")
-      run Writer.writeAll(Bytes.asSlice(&value))
+      run Bytes.append(&mut line, b" ")
+      run createdPlace(working, &created.directory, Bytes.asSlice(&value))
     }
     Option<Bytes>.None => {
-      run Writer.writeAll(b"Initialized Silk workspace")
+      run Bytes.append(&mut line, b" workspace ")
+      run createdPlace(working, &created.directory, b"")
     }
   }
-  run Writer.writeAll(b" at ")
-  run Writer.writeAll(Path.rawBytes(&created.directory))
-  run Writer.writeAll(b" from template ")
-  run Writer.writeAll(Bytes.asSlice(&shown))
-  run Writer.writeAll(b" (")
-  run Writer.writeAll(Bytes.asSlice(&created.commit))
-  run Writer.writeAll(b")\n")
-  if let Option<Bytes>.None = &created.name {
-    return 0
+  run painted(&mut line, color, b"\x1b[1m", Bytes.asSlice(&place))
+  run Bytes.append(&mut line, b" from the ")
+  let label = run Templates.label(&spec)
+  run Bytes.append(&mut line, Bytes.asSlice(&label))
+  run Bytes.append(&mut line, b" template ")
+  // A short commit identifies the template's revision; the full hash is not needed to read it.
+  let mut revision = run Bytes.copy(b"(")
+  let commit = Bytes.asSlice(&created.commit)
+  let mut shown: usize = 7
+  if commit.length < shown {
+    shown = commit.length
   }
-  return run joinedWorkspace(&created.directory)
+  run Bytes.append(&mut revision, Slice.view<u8>(commit, usize.ZERO, shown))
+  run Bytes.append(&mut revision, b")")
+  run painted(&mut line, color, b"\x1b[2m", Bytes.asSlice(&revision))
+  run Bytes.append(&mut line, b"\n")
+  run Writer.writeAll(Bytes.asSlice(&line))
+  let mut status = 0
+  if let Option<Bytes>.Some { .. } = &created.name {
+    status = run joinedWorkspace(&created.directory, color)
+  }
+  if status == 0 {
+    run writeNextSteps(
+      working,
+      &created.directory,
+      List<NextStep>.asSlice(&created.nextSteps),
+      color,
+    )
+  }
+  return status
+}
+
+// Whether `silk init` colors what it prints: standard output is a terminal that understands escape
+// codes, TERM is not `dumb` and NO_COLOR is unset or empty.
+effect fn initColor() -> bool
+  ! HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    if !run WindowsConsole.enableAnsi(1) {
+      return false
+    }
+  } else {
+    if !run NativeDescriptor.isTerminal(1) {
+      return false
+    }
+  }
+  if let Option<Bytes>.Some { value } = move run HostInput.variableNamed("TERM") {
+    if same(Bytes.asSlice(&value), b"dumb") {
+      return false
+    }
+  }
+  if let Option<Bytes>.Some { value } = move run HostInput.variableNamed("NO_COLOR") {
+    return Bytes.length(&value) == usize.ZERO
+  }
+  return true
+}
+
+// Appends `text` to `line`, in the color the escape `code` opens when `color`.
+effect fn painted(line: &mut Bytes, color: bool, code: &[u8], text: &[u8]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if color {
+    run Bytes.append(&mut line.*, code)
+  }
+  run Bytes.append(&mut line.*, text)
+  if color {
+    run Bytes.append(&mut line.*, b"\x1b[0m")
+  }
+  return ()
+}
+
+// How `silk init` names the project it created in `directory`: its path relative to the working
+// directory, or `name`, or else the directory's own name, when it is the working directory.
+effect fn createdPlace(working: &Path, directory: &Path, name: &[u8]) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let place = run CommandPath.relative(working, directory)
+  if Bytes.length(&place) > usize.ZERO {
+    return move place
+  }
+  if name.length > usize.ZERO {
+    return run Bytes.copy(name)
+  }
+  return match move Path.name(directory) {
+    Option<string>.Some { value } => run Bytes.copy(String.utf8Bytes(value))
+    Option<string>.None => run Bytes.copy(Path.rawBytes(directory))
+  }
+}
+
+// Whether `byte` needs no quoting in a POSIX shell word.
+fn shellPlain(byte: u8) -> bool {
+  return (byte >= 97 && byte <= 122) || (byte >= 65 && byte <= 90) || (byte >= 48 && byte <= 57)
+    || byte == 45 || byte == 46 || byte == 47 || byte == 95 || byte == 43 || byte == 64
+    || byte == 58 || byte == 44
+}
+
+// The number of characters in the UTF-8 `text`, for lining up columns.
+fn columns(text: &[u8]) -> usize {
+  let mut count = usize.ZERO
+  let mut at = usize.ZERO
+  while at < text.length {
+    if text[at] < 128 || text[at] >= 192 {
+      count = count + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return count
+}
+
+// Prints what to run next in the project created at `directory`, under `Next steps:`: `cd` into it,
+// unless it is the working directory, then each of `steps`, its description dimmed in a column
+// beside it. Colored when `color`; prints nothing when `steps` is empty.
+effect fn writeNextSteps(working: &Path, directory: &Path, steps: &[NextStep], color: bool) -> ()
+  ! WriterError | OutOfMemoryError
+  ? &mut Allocator | &mut Writer {
+  if steps.length == usize.ZERO {
+    return ()
+  }
+  let mut text = run Bytes.copy(b"\n  ")
+  run painted(&mut text, color, b"\x1b[1m", b"Next steps:")
+  run Bytes.append(&mut text, b"\n")
+  let place = run CommandPath.relative(working, directory)
+  let spelled = Bytes.asSlice(&place)
+  if spelled.length > usize.ZERO {
+    run Bytes.append(&mut text, b"    cd ")
+    let mut plain = true
+    let mut at = usize.ZERO
+    while at < spelled.length {
+      if !shellPlain(spelled[at]) {
+        plain = false
+      }
+      at = at + usize.ONE
+    }
+    if plain {
+      run Bytes.append(&mut text, spelled)
+    } else {
+      // Single quotes keep every byte; a quote itself closes, escapes and reopens them.
+      run Bytes.append(&mut text, b"'")
+      at = usize.ZERO
+      while at < spelled.length {
+        if spelled[at] == 39 {
+          run Bytes.append(&mut text, b"'\\''")
+        } else {
+          run Bytes.append(&mut text, Slice.view<u8>(spelled, at, usize.ONE))
+        }
+        at = at + usize.ONE
+      }
+      run Bytes.append(&mut text, b"'")
+    }
+    run Bytes.append(&mut text, b"\n")
+  }
+  let mut width = usize.ZERO
+  let mut step = usize.ZERO
+  while step < steps.length {
+    if let Option<Bytes>.Some { .. } = &steps[step].description {
+      let length = columns(Bytes.asSlice(&steps[step].command))
+      if length > width {
+        width = length
+      }
+    }
+    step = step + usize.ONE
+  }
+  step = usize.ZERO
+  while step < steps.length {
+    run Bytes.append(&mut text, b"    ")
+    run Bytes.append(&mut text, Bytes.asSlice(&steps[step].command))
+    if let Option<Bytes>.Some { value } = &steps[step].description {
+      let mut pad = columns(Bytes.asSlice(&steps[step].command))
+      while pad < width + usize.add(0, 3) {
+        run Bytes.append(&mut text, b" ")
+        pad = pad + usize.ONE
+      }
+      run painted(&mut text, color, b"\x1b[2m", Bytes.asSlice(&value))
+    }
+    run Bytes.append(&mut text, b"\n")
+    step = step + usize.ONE
+  }
+  run Writer.writeAll(Bytes.asSlice(&text))
+  return ()
 }
 
 // The `[package]` table of `document`, or a failure naming `manifest` when it has none.
@@ -15084,7 +15762,7 @@ effect fn runExample(
   let mut plans = match move run projectPlans(options) {
     Option<List<ProjectPlan>>.Some { value } => move value
     Option<List<ProjectPlan>>.None => {
-      return run exampleFailure(b"the package has no build profile for this host")
+      return run exampleFailure(b"the package has no compilation for this host")
     }
   }
   let plan = List<ProjectPlan>.remove(&mut plans, usize.ZERO)
@@ -15141,6 +15819,7 @@ effect fn runExample(
     Option<&CompilationRequest>.none(),
     unsandboxedTools,
     Option<Path>.none(),
+    false,
   )
     |> Effect.provideMut<FileSystem>(&mut files)
   let status = match move built {
@@ -15259,7 +15938,7 @@ effect fn program() -> i32
         return 0
       }
       let named = run argumentAt(usize.add(0, 2), count)
-      if run writeCommandHelp(Bytes.asSlice(&named)) |> Effect.provideMut<Writer>(&mut stdout) {
+      if run writeCommandHelp(Bytes.asSlice(&named), false) |> Effect.provideMut<Writer>(&mut stdout) {
         return 0
       }
       run writeError(b"silk: unknown command `")
@@ -15268,11 +15947,13 @@ effect fn program() -> i32
       run writeError(usage())
       return 2
     }
-    if !documentation && count == usize.add(0, 3) {
+    // `silk task --help` also lists the package's tasks, so the task command answers it.
+    if !documentation && !same(selected, b"task") && count == usize.add(0, 3) {
       let flag = run argumentAt(usize.add(0, 2), usize.add(0, 3))
-      if same(Bytes.asSlice(&flag), b"--help") || same(Bytes.asSlice(&flag), b"-h") {
+      let json = same(Bytes.asSlice(&flag), b"--help=json")
+      if same(Bytes.asSlice(&flag), b"--help") || same(Bytes.asSlice(&flag), b"-h") || json {
         let mut stdout = StdoutWriter.make()
-        if run writeCommandHelp(selected) |> Effect.provideMut<Writer>(&mut stdout) {
+        if run writeCommandHelp(selected, json) |> Effect.provideMut<Writer>(&mut stdout) {
           return 0
         }
       }
@@ -15283,8 +15964,9 @@ effect fn program() -> i32
       && (ProjectCommands.writesHelp(selected) || same(selected, b"format")) {
       let arguments = run commandArguments(count)
       if ProjectCommands.asksHelp(List<Bytes>.asSlice(&arguments)) {
+        let json = ProjectCommands.asksHelpJson(List<Bytes>.asSlice(&arguments))
         let mut stdout = StdoutWriter.make()
-        if run writeCommandHelp(selected) |> Effect.provideMut<Writer>(&mut stdout) {
+        if run writeCommandHelp(selected, json) |> Effect.provideMut<Writer>(&mut stdout) {
           return 0
         }
       }
@@ -15532,7 +16214,7 @@ effect fn program() -> i32
     }
     Request.Run { command: invocation } => {
       let mut process = OsChildProcess.make()
-      return run runProject(&working, move invocation)
+      return run runProject(&working, move invocation, true)
         |> Effect.provideMut<FileSystem>(&mut files)
         |> Effect.provideMut<ChildProcess>(&mut process)
     }
@@ -15583,14 +16265,14 @@ effect fn program() -> i32
     }
     Request.ProjectBuild { command: invocation } => {
       let mut process = OsChildProcess.make()
-      return run buildProject(&working, move invocation)
+      return run buildProject(&working, move invocation, true)
         |> Effect.provideMut<FileSystem>(&mut files)
         |> Effect.provideMut<ChildProcess>(&mut process)
     }
     Request.ProjectTest { command: invocation } => {
       let mut process = OsChildProcess.make()
       let mut tests = TestSelection { multiplePackages: false, filtered: false, matched: false }
-      let status = run testProject(&working, move invocation, &mut tests)
+      let status = run testProject(&working, move invocation, &mut tests, true)
         |> Effect.provideMut<FileSystem>(&mut files)
         |> Effect.provideMut<ChildProcess>(&mut process)
       return run finishTestSelection(status, &tests)
@@ -15741,11 +16423,27 @@ effect fn report(
         run writeError(Bytes.asSlice(&message))
         return 2
       }
-      ApplicationError.InvalidBuildProfile => run writeError(b"silk: invalid build profile\n")
+      ApplicationError.InvalidBuildProfile => run writeError(b"silk: invalid compilation settings\n")
       ApplicationError.InvalidPath { argument } => {
         run writeError(b"silk: invalid path argument: ")
         run writeError(Bytes.asSlice(&argument))
         run writeError(b"\n")
+      }
+      ApplicationError.MissingRootModule { package, path, tasks } => {
+        run writeError(b"silk: package `")
+        run writeError(Bytes.asSlice(&package))
+        run writeError(b"` has no root module: ")
+        run writeError(Bytes.asSlice(&path))
+        run writeError(b" does not exist\n")
+        if tasks {
+          run writeError(
+            b"The package has a tasks program instead: `silk task` lists its tasks, and `silk task <name>` runs one.\n",
+          )
+        } else {
+          run writeError(
+            b"Write that file, or set `main` under [package] in silk.toml to the module to build.\n",
+          )
+        }
       }
       ApplicationError.NotStandardLibrary { directory, missing } => {
         run writeError(b"silk: --stdlib ")
@@ -15758,7 +16456,7 @@ effect fn report(
       }
     }
     InitialProfileProblem problem => {
-      run writeError(b"silk: invalid build profile: ")
+      run writeError(b"silk: invalid compilation settings: ")
       run writeError(
         match problem.kind {
           ProblemKind.InvalidInput => b"InvalidInput: "
@@ -16026,18 +16724,27 @@ effect fn compileRequest(working: &Path, file: &Bytes, ignoreWarnings: bool, rep
     Stage.Final
   }
   let supply = run requestSupply(&request)
+
+  // A tasks program's graph runs this for `silk build`, which passes its own options through the
+  // environment (`tasksEnvironment`).
+  let warningsIgnored = ignoreWarnings || run environmentSwitch(b"SILK_IGNORE_WARNINGS")
+  let mut shown = reported
+  if let Option<Bytes>.Some { value } = move run HostInput.variableNamed("SILK_PROGRESS") {
+    if same(value.asSlice(), b"never") { shown = false }
+  }
   let mut progress = Progress.off()
-  if reported {
+  if shown {
     // A build graph shows these lines once the compilation ends, so they are never redrawn.
     let settings = ProgressSettings {
       display: ProgressDisplay.Plain,
       color: false,
       width: 80,
-      quiet: false,
+      quiet: run environmentSwitch(b"SILK_QUIET"),
       compact: false,
       position: 0,
       units: usize.ONE,
-      timings: false,
+      timings: run environmentSwitch(b"SILK_TIMINGS"),
+      costs: false,
     }
     let mut detail = run Bytes.copy(String.ownedUtf8Bytes(&request.profile.target))
     run Bytes.append(&mut detail, b", ")
@@ -16059,11 +16766,26 @@ effect fn compileRequest(working: &Path, file: &Bytes, ignoreWarnings: bool, rep
     )
   }
   let mut warned = Bytes.make()
+
+  // A build graph compiles into its step's directory, which changes with every edit. The program
+  // builds where the steps keep it across edits instead, with the cache `silk build` keeps, so an
+  // edit recompiles and relinks only what it changed; the step gets a copy.
+  let mut kept = Option<Path>.none()
+  if request.artifact.view() != "test" { kept = run graphOutput(&output) }
+  let mut cacheHome = Option<Path>.none()
+  let mut built = run Path.fromBytes(Path.rawBytes(&output))
+  if let Option<Path>.Some { value: root } = &kept {
+    cacheHome = run SemanticCache.directory(&root, String.ownedUtf8Bytes(&request.name))
+    built = run keptArtifact(&root, &request)
+    if let Option<Path>.Some { value: directory } = move run Path.parent(&built) {
+      run FileSystem.createDirectoriesRecursively(&directory)
+    }
+  }
   let compiled = run build(
     &source,
     Option<&Path>.none(),
-    Option<&Path>.none(),
-    &output,
+    borrowedPath(&cacheHome),
+    &built,
     working,
     form,
     stage,
@@ -16083,11 +16805,12 @@ effect fn compileRequest(working: &Path, file: &Bytes, ignoreWarnings: bool, rep
     &mut progress,
     &mut warned,
     MirListing.Off,
-    ignoreWarnings,
+    warningsIgnored,
     true,
     Option<&CompilationRequest>.some(&request),
     false,
     Option<Path>.none(),
+    false,
   )
   let status = match move compiled {
     Compiled.Finished { status: answered } => answered
@@ -16095,8 +16818,72 @@ effect fn compileRequest(working: &Path, file: &Bytes, ignoreWarnings: bool, rep
   }
   if status != 0 {
     run Progress.finish(&mut progress, String.ownedUtf8Bytes(&request.name), false)
+  } else if kept.isSome() && run FileSystem.exists(&built) {
+    match move run Effect.result(Publish.artifact(&built, &output)) {
+      Result<(), AtomicWriteError | FileError | OutOfMemoryError>.Success { .. } => ()
+      Result<(), AtomicWriteError | FileError | OutOfMemoryError>.Failure { error } => match move error {
+        AtomicWriteError failure => {
+          drop failure
+          run writeError(b"silk: cannot copy the compiled program into its build step\n")
+          return 1
+        }
+        FileError failure => { fail move failure }
+        OutOfMemoryError exhausted => { fail move exhausted }
+      }
+    }
   }
   return status
+}
+
+// The output directory of the build graph whose step writes `output`: the parent of the `steps`
+// directory above it. None for a path no graph step holds.
+effect fn graphOutput(output: &Path) -> Option<Path> ! FileError | OutOfMemoryError ? &mut Allocator {
+  let mut at = run Path.fromBytes(Path.rawBytes(output))
+  while true {
+    let parent = match move run Path.parent(&at) {
+      Option<Path>.Some { value } => move value
+      Option<Path>.None => { return Option<Path>.none() }
+    }
+    if Path.rawBytes(&parent) == Path.rawBytes(&at) { return Option<Path>.none() }
+    if let Option<string>.Some { value } = Path.name(&parent) {
+      if value == "steps" { return run Path.parent(&parent) }
+    }
+    at = move parent
+  }
+  return Option<Path>.none()
+}
+
+// Where a graph's compilation keeps its program between steps:
+// `<output>/steps/compilations/<target>/<dev|size|release>/<artifact>`.
+effect fn keptArtifact(root: &Path, request: &CompilationRequest) -> Path
+  ! FileError | OutOfMemoryError
+  ? &mut Allocator {
+  let mode = if request.profile.optimization.view() == "none" {
+    "dev"
+  } else if request.profile.optimization.view() == "size" {
+    "size"
+  } else {
+    "release"
+  }
+  let name = run Requests.artifactName(
+    request.name.view(),
+    request.artifact.view(),
+    request.emit.view(),
+    request.profile.target.view(),
+  )
+  let kept = run Path.join(&run Path.join(root, "steps"), "compilations")
+  let target = run Path.join(&kept, request.profile.target.view())
+  return run Path.join(&run Path.join(&target, mode), name.view())
+}
+
+// Whether the environment variable `name` is `1`.
+effect fn environmentSwitch(name: &[u8]) -> bool
+  ! HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator {
+  return match move run HostInput.variable(name) {
+    Option<Bytes>.Some { value } => same(value.asSlice(), b"1")
+    Option<Bytes>.None => false
+  }
 }
 
 // A definition spells its paths as its author's host does, such as `D:\\work\\main.silk`. The request
@@ -16192,6 +16979,15 @@ effect fn resolveDefinition(working: &Path, command: ProjectCommands.Resolve) ->
   }
   let mut converted = move definition
   run definitionPaths(working, &mut converted)
+
+  // `silk build --backend` reaches a tasks program's compilations here, unless the graph chose one.
+  if converted.settings.profile.backend.isNone() {
+    if let Option<Bytes>.Some { value } = move run HostInput.variableNamed("SILK_BACKEND") {
+      if value.length() > usize.ZERO {
+        converted.settings.profile.backend = Option<String>.some(run RequestText.copy(value.asSlice()))
+      }
+    }
+  }
   let output = run pathArgument(working, command.output.asSlice())
   let artifact = match move command.artifact {
     Option<Bytes>.Some { value } => Option<Path>.some(run pathArgument(working, value.asSlice()))
@@ -16346,6 +17142,18 @@ effect fn resolveCompilation(
       format = DiagnosticFormat.Machine
     }
   }
+  // A graph resolves its compilation again after each edit. The load reads unchanged files'
+  // imports from the cache its compilation keeps (`compileRequest`) instead of parsing them.
+  let mut imports = Option<Path>.none()
+  let mut stamp = Option<Bytes>.none()
+  if let Option<Path>.Some { value: root } = move run graphOutput(output) {
+    let name = match &definition.name {
+      Option<String>.Some { value } => String.ownedUtf8Bytes(&value)
+      Option<String>.None => Projects.name(&project)
+    }
+    imports = run SemanticCache.directory(&root, name)
+    if imports.isSome() { stamp = run CacheStamp.compiler() }
+  }
   let prepared = run prepare(
     Projects.entry(&project),
     Option<&Path>.some(Projects.manifest(&project)),
@@ -16355,8 +17163,8 @@ effect fn resolveCompilation(
     testing,
     StoreMode.Transient,
     Option<&[u8]>.none(),
-    Option<&Path>.none(),
-    &Option<Bytes>.none(),
+    borrowedPath(&imports),
+    &stamp,
     &mut ModuleSourceFiles.snapshot(),
     &format,
     &mut diagnostic,
@@ -16364,6 +17172,7 @@ effect fn resolveCompilation(
     Option<&CompilationRequest>.none(),
     Option<&CompilationDefinition>.some(&definition),
     unsandboxedTools,
+    false,
   )
   run writeError(diagnostic.asSlice())
   let mut analysis = match move prepared {
@@ -16571,7 +17380,8 @@ effect fn taskFallback(
     | WriterError
   ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types | &mut Writer {
   if ProjectCommands.asksHelp(Slice.view(arguments, 1, arguments.length - 1)) {
-    drop run writeCommandHelp(arguments[0].asSlice())
+    let json = ProjectCommands.asksHelpJson(Slice.view(arguments, 1, arguments.length - 1))
+    drop run writeCommandHelp(arguments[0].asSlice(), json)
     return 0
   }
   let mut forwarded = List<Bytes>.make()
@@ -16633,7 +17443,7 @@ effect fn taskFallback(
         }
       }
     }
-    return run buildProject(working, move parsed)
+    return run buildProject(working, move parsed, false)
   }
   if same(name, b"run") {
     let parsed = match move run Effect.result(ProjectCommands.parseRun(forwarded.asSlice())) {
@@ -16651,7 +17461,7 @@ effect fn taskFallback(
         }
       }
     }
-    return run runProject(working, move parsed)
+    return run runProject(working, move parsed, false)
   }
   if same(name, b"test") {
     let parsed = match move run Effect.result(ProjectCommands.parseTest(forwarded.asSlice())) {
@@ -16669,7 +17479,7 @@ effect fn taskFallback(
         }
       }
     }
-    return run testProject(working, move parsed, &mut tests.*)
+    return run testProject(working, move parsed, &mut tests.*, false)
   }
   if same(name, b"plan") {
     let parsed = match move run Effect.result(ProjectCommands.parsePlan(forwarded.asSlice())) {

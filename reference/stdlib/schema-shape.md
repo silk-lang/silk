@@ -670,6 +670,16 @@ Text
 
 Text.
 
+<a id="Shape.Bytes"></a>
+
+### `Bytes`
+
+```silk
+Bytes
+```
+
+Binary data: the format's binary type, or Base64 text in a text format.
+
 <a id="Shape.Optional"></a>
 
 ### `Optional`

@@ -32,7 +32,8 @@ import semantic.FinalProfile { FinalProfile, Problem as ProfileProblem }
 import semantic.InitialProfile { InitialProfile }
 import semantic.ModuleId { InvalidModulePath, ModuleId }
 import semantic.ProfileAssembly { AssemblyProblem, assemble as assembleProfile }
-import semantic.ProfileBinding { BindingError, Supplied }
+import semantic.ParameterSchema { ParameterSchema }
+import semantic.ProfileBinding { BindingError, RegisteredShape, Supplied }
 import semantic.ProfileShape {
   Problem as ShapeProblem,
   Refusal as ShapeRefusal,
@@ -45,6 +46,7 @@ import semantic.Semantic {
   ConflictingPackageSource,
   InitializerData,
   initializerData,
+  RegisteredParameter,
   RegistrationClosed,
   Request as SemanticRequest,
   Semantic,
@@ -146,6 +148,7 @@ pub effect fn open(
   snapshot: Option<SourceSnapshot>,
   definition: Option<&Definition>,
   unsandboxedTools: bool,
+  task: bool,
 ) -> Opened
   ! HostInputError
     | FileError
@@ -241,14 +244,31 @@ pub effect fn open(
         fail InvalidSourceRoot {}
       }
     }
-    let mut at = usize.ZERO
+    // A tasks program leaves its own package's plan unevaluated until it reaches one of the
+    // package's modules besides the entry, the way a dependency's plan waits until it is reached:
+    // its native code, archives and steps are the package's, not the tasks program's.
+    let mut at = if task {
+      usize.ONE
+    } else {
+      usize.ZERO
+    }
+    let mut rootPending = task
+    let mut rootDue = false
+    if task {
+      ModuleSourceFiles.loadEntryOnly(&mut sources)
+    }
     while true {
       let policy = run toolPolicy(&manifestPath, &sources)
-      while at < ModuleSourceFiles.packageCount(&sources) {
+      while rootDue || at < ModuleSourceFiles.packageCount(&sources) {
+        let current = if rootDue {
+          usize.ZERO
+        } else {
+          at
+        }
         let directory = run Path.fromBytes(
-          Path.rawBytes(ModuleSourceFiles.packageDirectoryAt(&sources, at)),
+          Path.rawBytes(ModuleSourceFiles.packageDirectoryAt(&sources, current)),
         )
-        let owner = run Bytes.copy(ModuleSourceFiles.packageIdentityAt(&sources, at))
+        let owner = run Bytes.copy(ModuleSourceFiles.packageIdentityAt(&sources, current))
         let buildFile = run Path.join(&directory, "build.silk")
         if run FileSystem.exists(&buildFile) {
           let mut planBindings = List<Supplied>.make()
@@ -264,7 +284,7 @@ pub effect fn open(
           let evaluated = run evaluatePlan(
             &buildFile,
             &directory,
-            ModuleSourceFiles.packageIdentityAt(&sources, at),
+            ModuleSourceFiles.packageIdentityAt(&sources, current),
             run copiedLibrary(&library),
             profile,
             &target,
@@ -273,13 +293,13 @@ pub effect fn open(
           )
           match move evaluated {
             Evaluated.Planned { plan: evaluatedPlan } => {
-              let mut allowed = at == usize.ZERO
+              let mut allowed = current == usize.ZERO
               let listed = policy.allowed.asSlice()
               let mut permission: usize = 0
               while permission < listed.length {
                 if same(
                   listed[permission].asSlice(),
-                  ModuleSourceFiles.packageIdentityAt(&sources, at),
+                  ModuleSourceFiles.packageIdentityAt(&sources, current),
                 ) {
                   allowed = true
                 }
@@ -294,7 +314,7 @@ pub effect fn open(
                   allowed,
                   move suppliedPaths,
                   unsandboxedTools,
-                  ModuleSourceFiles.packageArchivesAt(&sources, at),
+                  ModuleSourceFiles.packageArchivesAt(&sources, current),
                 ),
               )
               let plan = match move execution {
@@ -330,10 +350,31 @@ pub effect fn open(
               }
               run ModuleSourceFiles.applyNativePlan(
                 &mut sources,
-                at,
+                current,
                 run NativeLinkInputs.planned(&plan.native),
                 linked,
               )
+              if let Option<Bytes>.Some { value: name } = move run demandLinked(
+                &mut sources,
+                current,
+                plan.dependencies.asSlice(),
+              ) {
+                let empty = Semantic.oneShot(
+                  run ModuleSourceFiles.revision(&sources),
+                  Target.forId(Target.id(&target)),
+                  Option<FinalProfile>.none(),
+                )
+                let mut reason = run Bytes.copy(b"Plan.linkDependency names `")
+                run reason.append(name.asSlice())
+                run reason.append(b"`, which the package's manifest does not declare")
+                return Opened.PlanRefused {
+                  sources: move sources,
+                  store: move empty,
+                  rejection: Option<Shared<Rejection>>.none(),
+                  file: run Bytes.copy(Path.rawBytes(&buildFile)),
+                  reason: move reason,
+                }
+              }
               let modules = plan.modules.asSlice()
               let mut moduleAt: usize = 0
               while moduleAt < modules.length {
@@ -356,7 +397,11 @@ pub effect fn open(
             }
           }
         }
-        at = at + usize.ONE
+        if rootDue {
+          rootDue = false
+        } else {
+          at = at + usize.ONE
+        }
       }
       let application = if testing {
         run ModuleSourceFiles.module(&sources, b"silk/testing/runner.silk")
@@ -364,6 +409,11 @@ pub effect fn open(
         ModuleId.copy(ModuleSourceFiles.entry(&sources))
       }
       run ModuleSourceFiles.preloadProgram(&mut sources, &application)
+      if rootPending && run reachesPackageModule(&sources) {
+        rootPending = false
+        rootDue = true
+        continue
+      }
       if !run ModuleSourceFiles.resolveDependencies(&mut sources) {
         break
       }
@@ -394,6 +444,38 @@ pub effect fn open(
     Option<SourceSnapshot>.none(),
     target,
   )
+}
+
+// Demands each dependency `names` lists for the package at `owner`, and answers the first one the
+// package does not declare, or none.
+effect fn demandLinked(sources: &mut ModuleSources, owner: usize, names: &[String]) -> Option<Bytes>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < names.length {
+    if !run ModuleSourceFiles.demandLinked(&mut sources.*, owner, String.utf8Bytes(names[at].view())) {
+      return Option<Bytes>.some(run Bytes.copy(String.utf8Bytes(names[at].view())))
+    }
+    at = at + usize.ONE
+  }
+  return Option<Bytes>.none()
+}
+
+// Whether the program reaches a module of the root package other than its entry.
+effect fn reachesPackageModule(sources: &ModuleSources) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let loaded = run ModuleSourceFiles.loadedRootModules(sources)
+  let modules = List<ModuleId>.asSlice(&loaded)
+  let entry = ModuleSourceFiles.entry(sources)
+  let mut at = usize.ZERO
+  while at < modules.length {
+    if !ModuleId.equals(&modules[at], entry) {
+      return true
+    }
+    at = at + usize.ONE
+  }
+  return false
 }
 
 // The dependency tool steps the root package authorizes.
@@ -702,6 +784,14 @@ effect fn analyze(
   }
   let mut request = SemanticRequest.forApplication(ModuleId.copy(&application))
   run SemanticRequest.registerSchemaModule(&mut request, &identity)
+  // Any module of the root package or a dependency may declare `param`, so a parameter no binding
+  // names still joins the profile with its default.
+  let declaring = List<ModuleId>.asSlice(&checked)
+  let mut declaringAt = usize.ZERO
+  while declaringAt < declaring.length {
+    run SemanticRequest.registerSchemaModule(&mut request, &declaring[declaringAt])
+    declaringAt = declaringAt + usize.ONE
+  }
   let registered = List<ModuleId>.asSlice(&parameterModules)
   let mut registeredAt = usize.ZERO
   while registeredAt < registered.length {
@@ -710,11 +800,11 @@ effect fn analyze(
   }
   let shapes = run registeredShapes(&mut store, &mut request, &target)
   let assembled = match move shapes {
-    Result<Registered, ShapeRefusal>.Success { value } => run assembleProfile(
+    Result<Registered, ShapeRefusal>.Success { value: found } => run assembleProfile(
       run InitialProfile.copy(profile),
       &mut store,
       &mut request,
-      &value,
+      &run implicitRequired(move found, &identity, List<ModuleId>.asSlice(&parameterModules)),
       move bindings,
     )
     Result<Registered, ShapeRefusal>.Failure { error } => {
@@ -754,6 +844,37 @@ effect fn analyze(
       runtime: move runtime,
     },
   }
+}
+
+// Leaves out the required parameters of modules registered only because they could declare
+// one: a parameter without a default joins the profile when the root module declares it or a
+// binding names its module. A read of one left out is refused where it is read (SEM0214).
+effect fn implicitRequired(registered: Registered, root: &ModuleId, bound: &[ModuleId]) -> Registered
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let Registered { schemas, parameters: listed } = move registered
+  let mut shapes = move schemas
+  let mut declared = move listed
+  let mut keptShapes = List<RegisteredShape>.make()
+  let mut parameters = List<RegisteredParameter>.make()
+  while List<RegisteredParameter>.length(&declared) > usize.ZERO {
+    let parameter = List<RegisteredParameter>.remove(&mut declared, usize.ZERO)
+    let shape = List<RegisteredShape>.remove(&mut shapes, usize.ZERO)
+    let mut kept = ModuleId.equals(&parameter.module, root)
+      || Shared<ParameterSchema>.with<bool>(&shape.schema, |header: &ParameterSchema| -> bool {
+        return header.hasDefault
+      })
+    let mut at = usize.ZERO
+    while !kept && at < bound.length {
+      kept = ModuleId.equals(&parameter.module, &bound[at])
+      at = at + usize.ONE
+    }
+    if kept {
+      run List<RegisteredShape>.append(&mut keptShapes, move shape)
+      run List<RegisteredParameter>.append(&mut parameters, move parameter)
+    }
+  }
+  return Registered { schemas: move keptShapes, parameters: move parameters }
 }
 
 fn same(left: &[u8], right: &[u8]) -> bool {

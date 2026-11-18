@@ -87,6 +87,8 @@ A package may declare `pub param` values in source or `build.silk`. The consumer
 
 `build.silk` exports `pub const PLAN: Plan`. The compiler evaluates it statically, with standard-library imports and the package's parameters. The plan contributes generated modules, native sources and link inputs. Target conditions are ordinary static code.
 
+A dependency's native plan links into an artifact when the artifact imports one of the dependency's modules, or when the dependent's plan names it with `Plan.linkDependency("alias")`, which a package of only C needs; declaring a dependency alone links nothing, and a tasks program evaluates its own package's plan only when it imports one of the package's modules. An archive that native code reads is fetched when that code is compiled or linked, so `silk check` never needs it.
+
 ```silk
 import silk.build.plan { Library, Plan }
 import silk.build.step { sourcePath }

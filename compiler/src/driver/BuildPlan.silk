@@ -34,6 +34,8 @@ import silk.num.usize
 pub struct Resolved {
   pub modules: List<Module>,
   pub native: Native,
+  /// The declared dependencies the plan links though nothing imports them (`Plan.linkDependency`).
+  pub dependencies: List<String>,
 }
 
 impl Schema for Resolved {}
@@ -67,7 +69,10 @@ impl Schema for Requirement {}
 struct Collector {
   requirements: List<Requirement>,
   paths: List<Deferred<Path>>,
-  trees: List<bool>
+  trees: List<bool>,
+  // A pinned archive's path, keyed by its digest instead of its bytes: the archive is fetched when
+  // native code is compiled or linked, so a plan that only checks never needs it present.
+  pinned: List<Option<String>>
 }
 
 struct Authority {
@@ -207,8 +212,20 @@ effect fn ensureIncludes(chain: &Option<Box<Chain<Input>>>, authority: &Authorit
   if let Option<Box<Chain<Input>>>.Some { value } = &chain.* {
     let node = &Box<Chain<Input>>.get(&value)[0]
     run ensureIncludes(&node.previous, authority)
-    run ensureInput(&node.value, authority)
+    run ensureNativeInput(&node.value, authority)
   }
+}
+
+// An archive that native code reads directly is fetched when that code is compiled or linked
+// (`NativeArchives.ensure`), so a check, which compiles none, never needs it. A step's output is
+// different: the plan runs the step now, so the archives the step reads are fetched now.
+effect fn ensureNativeInput(value: &Input, authority: &Authority) -> ()
+  ! StepFailure
+  ? &mut Allocator | &mut FileSystem | &mut HostInput {
+  if let Input.Archive { .. } = &value.* {
+    return
+  }
+  run ensureInput(value, authority)
 }
 
 effect fn ensureArchives(chain: &Option<Box<Chain<Operation>>>, authority: &Authority) -> ()
@@ -219,13 +236,18 @@ effect fn ensureArchives(chain: &Option<Box<Chain<Operation>>>, authority: &Auth
     run ensureArchives(&node.previous, authority)
     match &node.value {
       Operation.Module { source, .. } => run ensureInput(&source, authority)
-      Operation.Compile { source, include, .. } => {
-        run ensureInput(&source, authority)
+      Operation.Compile { source, include, pattern, .. } => {
+        // A pattern lists the archive's files now, so that archive must be present now.
+        if let Option<String>.Some { .. } = &pattern {
+          run ensureInput(&source, authority)
+        } else {
+          run ensureNativeInput(&source, authority)
+        }
         run ensureIncludes(&include, authority)
       }
-      Operation.Include { path } => run ensureInput(&path, authority)
-      Operation.LinkFile { path, .. } => run ensureInput(&path, authority)
-      Operation.FunctionOrder { path } => run ensureInput(&path, authority)
+      Operation.Include { path } => run ensureNativeInput(&path, authority)
+      Operation.LinkFile { path, .. } => run ensureNativeInput(&path, authority)
+      Operation.FunctionOrder { path } => run ensureNativeInput(&path, authority)
       _ => {}
     }
   }
@@ -323,7 +345,7 @@ effect fn action(value: &Action, authority: &Authority) -> StepHandle
     Action.Run { invocation } => {
       if !authority.tools {
         fail StepError {
-          message: run String.copy("this dependency is not authorized to run package tools"),
+          message: run String.copy("this dependency runs a package tool without permission; add `tools = true` to its entry under [dependencies] in the root package's silk.toml"),
         }
       }
       let command = Run.artifact(run input(&invocation.program, authority))
@@ -358,7 +380,43 @@ effect fn addPath(
   let index = collector.paths.length()
   run collector.paths.append(run input(value, authority))
   run collector.trees.append(tree)
+  run collector.pinned.append(run pinnedPath(value, authority))
   return Option<usize>.some(index)
+}
+
+// The path of `value` when it names a file of a fetched archive, which its SHA-256 pins, or none.
+effect fn pinnedPath(value: &Input, authority: &Authority) -> Option<String>
+  ! StepFailure
+  ? &mut Allocator {
+  if let Input.Archive { name, path } = &value.* {
+    let listed = authority.archives.asSlice()
+    let mut at: usize = 0
+    while at < listed.length {
+      let archive = &listed[at]
+      if name.view() == (run RequestText.copy(archive.name.asSlice())).view()
+        && archive.url.length() > 0
+        && archive.refusal.length() == 0 {
+        let selected = if path.view() == "" {
+          run Path.fromBytes(Path.rawBytes(&archive.directory))
+        } else {
+          run Path.join(&archive.directory, path.view())
+        }
+        return Option<String>.some(run RequestText.copy(Path.rawBytes(&selected)))
+      }
+      at = at + 1
+    }
+  }
+  return Option<String>.none()
+}
+
+// Where collected path `index` is when the step runs.
+effect fn collectedPath(collector: &Collector, make: &Make, index: usize) -> Path
+  ! StepFailure
+  ? &mut Allocator {
+  if let Option<String>.Some { value } = &collector.pinned.asSlice()[index] {
+    return run Path.make(value.view())
+  }
+  return run make.path(&collector.paths.asSlice()[index])
 }
 
 effect fn collectIncludes(
@@ -419,6 +477,11 @@ effect fn collect(
         requirement.kind = run String.copy("compile")
         requirement.value = run String.copy(language.view())
         requirement.path = run addPath(&mut collector.*, &source, pattern.isSome(), authority)
+        if pattern.isSome() {
+          // A pattern lists the tree's files, so the step reads the archive itself.
+          let last = collector.pinned.length() - 1
+          collector.pinned.set(last, Option<String>.none())
+        }
       }
       Operation.Flag { value: flag } => {
         requirement.kind = run String.copy("flag")
@@ -452,6 +515,10 @@ effect fn collect(
         requirement.kind = run String.copy("function-order")
         requirement.path = run addPath(&mut collector.*, &path, false, authority)
       }
+      Operation.LinkDependency { name } => {
+        requirement.kind = run String.copy("dependency")
+        requirement.value = run String.copy(name.view())
+      }
     }
     run collector.requirements.append(move requirement)
   }
@@ -480,8 +547,12 @@ impl Step for Collector {
     let paths = self.paths.asSlice()
     let trees = self.trees.asSlice()
     let mut at: usize = 0
+    let pinned = self.pinned.asSlice()
     while at < paths.length {
-      if trees[at] {
+      if let Option<String>.Some { value } = &pinned[at] {
+        // The store directory is named by the archive's SHA-256, so the path pins its bytes.
+        run key.text(value.view())
+      } else if trees[at] {
         run key.packageTree(&paths[at])
       } else {
         run key.file(&paths[at])
@@ -505,7 +576,7 @@ impl Step for Collector {
       }
       if item.kind.view() == "include" {
         if let Option<usize>.Some { value } = &item.path {
-          let resolved = run make.path(&paths[value])
+          let resolved = run collectedPath(self, &make.*, value)
           run includes.append(run RequestText.copy(Path.rawBytes(&resolved)))
         }
       }
@@ -518,6 +589,7 @@ impl Step for Collector {
         link: List<LinkInput>.make(),
         functionOrder: Option<String>.none(),
       },
+      dependencies: List<String>.make(),
     }
     at = 0
     while at < requirements.length {
@@ -525,9 +597,12 @@ impl Step for Collector {
       let mut resolved = run String.copy(item.value.view())
       let mut producer = Option<String>.none()
       if let Option<usize>.Some { value } = &item.path {
-        let path = run make.path(&paths[value])
+        let index = value
+        let path = run collectedPath(self, &make.*, index)
         resolved = run RequestText.copy(Path.rawBytes(&path))
-        producer = run make.producer(&paths[value])
+        if let Option<String>.None = &self.pinned.asSlice()[index] {
+          producer = run make.producer(&paths[value])
+        }
       }
       let kind = item.kind.view()
       if kind == "module" {
@@ -551,7 +626,9 @@ impl Step for Collector {
         let mut directory: usize = 0
         while directory < directories.length {
           run selectedIncludes.append(
-            run RequestText.copy(Path.rawBytes(&run make.path(&paths[directories[directory]]))),
+            run RequestText.copy(
+              Path.rawBytes(&run collectedPath(self, &make.*, directories[directory])),
+            ),
           )
           directory = directory + 1
         }
@@ -594,6 +671,8 @@ impl Step for Collector {
           }
         }
         result.native.functionOrder = Option<String>.some(move resolved)
+      } else if kind == "dependency" {
+        run result.dependencies.append(move resolved)
       } else if kind != "flag" && kind != "include" {
         let mode = if item.mode.view() == "" {
           Option<String>.none()
@@ -728,6 +807,7 @@ pub effect fn execute(
     requirements: List<Requirement>.make(),
     paths: List<Deferred<Path>>.make(),
     trees: List<bool>.make(),
+    pinned: List<Option<String>>.make(),
   }
   run collect(&plan.steps, &mut collector, &authority)
 

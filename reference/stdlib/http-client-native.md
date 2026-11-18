@@ -297,6 +297,35 @@ pub fn withConcurrency(self: Self, limit: usize) -> NativeHttp<'config>
 
 Sets how many requests [`Http.sendAll`](./http-client.md#Http.sendAll) runs at the same time. A value of 0 counts as 1.
 
+<a id="NativeHttp.impl.reportProgress"></a>
+
+### Method `reportProgress`
+
+```silk
+pub fn reportProgress(self: Self, progress: BodyProgress) -> NativeHttp<'config>
+```
+
+Counts the body of each successful final response that `send` reads in `progress`.
+
+#### Details
+
+The client never opens or closes a step: open one with `Progress.begin` before `send`, such
+as `Downloading silk.tar.gz`, and finish it after. While a step is open, the client sets its
+total from the response's `Content-Length` and counts each body chunk as it arrives, so the
+live line shows the bytes, the rate and the time left. Redirects, responses with a status
+outside 200 to 299, and the requests of `sendAll` that run at the same time are not counted.
+Reach the progress with [`NativeHttp.progress`](#NativeHttp.impl.progress).
+
+<a id="NativeHttp.impl.progress"></a>
+
+### Method `progress`
+
+```silk
+pub fn progress<'a>(self: &'a mut Self) -> &'a mut BodyProgress
+```
+
+The progress that [`NativeHttp.reportProgress`](#NativeHttp.impl.reportProgress) gave the client, or one that writes nothing.
+
 <a id="NativeHttp.impl.failOnStatus"></a>
 
 ### Method `failOnStatus`

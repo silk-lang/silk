@@ -284,7 +284,7 @@ function compiled for the feature (SIMD-009). AES rounds and carry-less multipli
 SIMD-011, and the SHA-256 instructions SIMD-012. There is no open escape hatch that names an arbitrary LLVM intrinsic.
 
 **Diagnostics:** A first operand outside the catalog reports `SEM0239`. A call whose target or
-CPU feature the profile does not select reports `SEM0241`.
+CPU feature the compilation does not select reports `SEM0241`.
 
 **Current compiler:** Aligned. Each call lowers to one call of its LLVM target intrinsic.
 
@@ -304,7 +304,7 @@ if CpuFeatures.has(&machine, "avx2") { ... }
 ```
 
 `silk.simd.cpu` names a set of CPU features of the target architecture, spelled as in PROFILE-006.
-`CpuFeatures.selected()` is the set the profile selects. `CpuFeatures.machine()` is the set the
+`CpuFeatures.selected()` is the set the compilation selects. `CpuFeatures.machine()` is the set the
 running machine has and always contains the selected set: x86-64 Linux and Darwin read `cpuid`
 through ASSEMBLY-001 and count AVX and AVX-512 features only when `xgetbv` shows the operating
 system saves their registers; AArch64 Linux with GNU libc reads `getauxval(AT_HWCAP)` and
@@ -387,7 +387,7 @@ way the target's C compilers pass the vector type of the same lanes, such as `__
 caller copies passed by pointer, and results use vector registers. Other supported targets use
 one vector register in both directions. LLVM vector-typed lanes implement both conventions.
 
-| Target | Widths | CPU feature the profile selects |
+| Target | Widths | CPU feature the compilation selects |
 | --- | --- | --- |
 | x86-64 | 128 bits | `sse2` (always) |
 | x86-64 | 256 bits | `avx` |
@@ -400,7 +400,7 @@ profile decides the register, not the function: a function compiled with `@featu
 vectors to C like the rest of the program. A C static may hold a vector.
 
 **Diagnostics:** A vector in an imported C signature whose width the target's C ABI does not admit,
-or that needs a CPU feature the profile does not select, reports `SEM0244`
+or that needs a CPU feature the compilation does not select, reports `SEM0244`
 at the call, and at the declaration of an exported signature.
 
 **Current compiler:** Aligned.

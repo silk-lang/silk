@@ -27,7 +27,12 @@ import silk.system.system_clock { SystemClock }
 import silk.num.u64
 import silk.num.usize
 import silk.text.string {String}
-import silk.core.ownership {Copy}
+import silk.core.ownership {Copy, Drop}
+import silk.core.effect {Effect}
+import silk.core.option {Option}
+import silk.core.result {Result}
+import silk.concurrency.sync {Parker, Unparker}
+import silk.concurrency.thread_native {JoinHandle, NativeThread, SpawnError}
 
 /// How progress reaches standard error.
 pub enum Display {
@@ -67,6 +72,9 @@ pub struct Settings {
   pub units: usize,
   /// Whether each unit lists semantic work and its slowest modules, bodies and functions.
   pub timings: bool,
+  /// Whether a build lists the calls in its package whose generated functions cost the most
+  /// (`--costs`).
+  pub costs: bool,
 }
 
 /// One item of a slowest list: what took `nanos`.
@@ -110,6 +118,8 @@ pub struct Progress {
   count: usize,
   total: usize,
   subject: Bytes,
+  /// How long the open phase is expected to take, from `expect`, or zero when nothing says.
+  expected: u64,
   started: u64,
   phaseStarted: u64,
   drawnAt: u64,
@@ -130,6 +140,10 @@ pub struct Progress {
 
   /// Whether the slowest lists are kept, with the item of the open phase being timed.
   timings: bool,
+  /// Whether the unit's build charges what it generates to the calls that asked for it.
+  costs: bool,
+  // What `keepReport` kept for `finish` to write.
+  report: Bytes,
   timed: Bytes,
   timedFrom: u64,
   // Whether a `clock` reading waits for its `bill`, so nested work is billed once.
@@ -149,6 +163,31 @@ pub struct Progress {
 // Redraws closer together than this are skipped.
 const redrawNanos: u64 = 50000000
 
+/// A thread that redraws the live line while the thread that owns the [`Progress`] waits on work
+/// that reports nothing, such as Clang optimizing a whole module. [`Progress.tick`] starts one.
+///
+/// # Gotchas
+/// Dropping the ticker stops its thread and waits for it. Drop it before anything else writes to
+/// standard error or changes the progress it shows.
+pub struct Ticker {
+  running: Option<Running>,
+}
+
+// The redrawing thread and the token that stops it.
+struct Running {
+  thread: JoinHandle<()>,
+  wake: Unparker,
+}
+
+impl Drop for Running {
+  // Wakes the thread before its handle joins it, so a ticker dropped on any path never waits on a
+  // thread that is still redrawing.
+  fn drop(self: &mut Running) -> () {
+    self.wake.unpark()
+    return ()
+  }
+}
+
 impl Progress {
   /// A reporter that writes nothing.
   pub fn off() -> Progress {
@@ -162,6 +201,7 @@ impl Progress {
       count: 0,
       total: 0,
       subject: Bytes.make(),
+      expected: 0,
       started: 0,
       phaseStarted: 0,
       drawnAt: 0,
@@ -173,6 +213,8 @@ impl Progress {
       headingWidth: 0,
       problems: 0,
       timings: false,
+      costs: false,
+      report: Bytes.make(),
       timed: Bytes.make(),
       timedFrom: 0,
       billing: false,
@@ -204,8 +246,9 @@ impl Progress {
     progress.color = settings.color && display == Display.Live
     progress.width = settings.width
     progress.quiet = settings.quiet
-    progress.compact = settings.compact && display == Display.Live && !settings.timings
+    progress.compact = settings.compact && display == Display.Live && !settings.timings && !settings.costs
     progress.timings = settings.timings && !settings.quiet
+    progress.costs = settings.costs && !settings.quiet
     progress.started = run now()
     if settings.quiet {
       return move progress
@@ -268,6 +311,7 @@ impl Progress {
     self.count = 0
     self.total = total
     Bytes.clear(&mut self.subject)
+    self.expected = 0
     self.phaseStarted = run now()
     run Progress.draw(&mut self.*)
   }
@@ -286,8 +330,16 @@ impl Progress {
     self.phase = phase
     self.count = 0
     self.total = 0
+    self.expected = 0
     self.phaseStarted = run now()
     run Progress.draw(&mut self.*)
+  }
+
+  /// Says the open phase should take about `nanos`, such as the time it took last time, so the live
+  /// line shows a bar of its time against that. The bar stays full once the phase runs longer.
+  pub fn expect(self: &mut Progress, nanos: u64) -> () {
+    self.expected = nanos
+    return ()
   }
 
   /// Counts one finished item of the open phase.
@@ -324,6 +376,62 @@ impl Progress {
     if run Progress.due(&self.*) {
       run Progress.draw(&mut self.*)
     }
+  }
+
+  /// Keeps the live line moving on a thread of its own until the returned [`Ticker`] is dropped,
+  /// for work this thread blocks on without reporting, such as a child process. The thread redraws
+  /// what the line shows now, with a turning spinner and a growing time.
+  ///
+  /// # Details
+  /// Without a live line, or when no thread starts, the ticker does nothing and the line stays as
+  /// it is until the next redraw.
+  pub effect fn tick(self: &mut Progress) -> Ticker
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.display != Display.Live || !self.open || self.quiet {
+      return Ticker { running: Option<Running>.none() }
+    }
+    let parker = run Parker.make()
+    let wake = parker.unparker()
+    let shown = run Progress.snapshot(&self.*)
+    let started = run Effect.result(NativeThread.spawn(|| -> () {
+      return run ticking(move shown, move parker)
+    }))
+    return match move started {
+      Result<JoinHandle<()>, OutOfMemoryError | SpawnError>.Success { value } => Ticker {
+        running: Option<Running>.some(Running { thread: move value, wake: move wake }),
+      }
+      Result<JoinHandle<()>, OutOfMemoryError | SpawnError>.Failure { error } => match move error {
+        SpawnError unstarted => {
+          drop unstarted
+          Ticker { running: Option<Running>.none() }
+        }
+        OutOfMemoryError exhausted => {
+          fail move exhausted
+        }
+      }
+    }
+  }
+
+  // A copy of what `draw` reads, for a ticker's thread to redraw on its own.
+  effect fn snapshot(self: &Progress) -> Progress
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut copy = Progress.off()
+    copy.display = self.display
+    copy.color = self.color
+    copy.width = self.width
+    copy.phase = self.phase
+    copy.open = self.open
+    copy.count = self.count
+    copy.total = self.total
+    copy.subject = run Bytes.copy(Bytes.asSlice(&self.subject))
+    copy.expected = self.expected
+    copy.started = self.started
+    copy.phaseStarted = self.phaseStarted
+    copy.frame = self.frame
+    copy.label = run Bytes.copy(Bytes.asSlice(&self.label))
+    return move copy
   }
 
   /// Ends the open phase with a `✓` row described by `detail`, or by its count, such as
@@ -380,6 +488,23 @@ impl Progress {
     let current = run now()
     self.borrowLast = current - self.borrowFrom
     self.borrowNanos = self.borrowNanos + self.borrowLast
+  }
+
+  /// Whether the unit's build charges what it generates to the calls that asked for it, as
+  /// `--costs` asks; never for a reporter that writes nothing or only its final line.
+  pub fn costing(self: &Progress) -> bool {
+    return self.costs
+  }
+
+  /// A reading of the monotonic clock, in nanoseconds.
+  pub effect fn stamp() -> u64 {
+    return run now()
+  }
+
+  /// Keeps `text`, such as the `--costs` report, to be written when the unit finishes, before its
+  /// final line.
+  pub effect fn keepReport(self: &mut Progress, text: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    run Bytes.append(&mut self.report, text)
   }
 
   /// Whether the slowest lists are kept, so callers name each item only when they are.
@@ -529,6 +654,7 @@ impl Progress {
       run Progress.writeSlowest(&self.*, b"Slowest bodies to borrow-check", &self.slowestBodies)
       run Progress.writeSlowest(&self.*, b"Slowest functions to emit", &self.slowestFunctions)
     }
+    if Bytes.length(&self.report) > usize.ZERO { run write(Bytes.asSlice(&self.report)) }
     let mut line = Bytes.make()
     let live = self.display == Display.Live
     if succeeded {
@@ -950,13 +1076,23 @@ impl Progress {
     if label.length > usize.ZERO {
       columns = columns + label.length + usize.ONE
     }
-    if self.total > usize.ZERO {
+    if self.total > usize.ZERO || self.expected > 0 {
       run Bytes.append(&mut line, b"  ")
-      let mut bounded = self.count
-      if bounded > self.total {
-        bounded = self.total
+      let mut filled = usize.ZERO
+      if self.total > usize.ZERO {
+        let mut bounded = self.count
+        if bounded > self.total {
+          bounded = self.total
+        }
+        filled = usize.divide(bounded * 22, self.total)
+      } else {
+        // The phase's time against the time it is expected to take.
+        let mut spent = at - self.phaseStarted
+        if spent > self.expected {
+          spent = self.expected
+        }
+        filled = u64.toUsize(u64.divide(spent * 22, self.expected))
       }
-      let filled = usize.divide(bounded * 22, self.total)
       let mut cell = usize.ZERO
       let mut bar = Bytes.make()
       while cell < filled {
@@ -1039,6 +1175,17 @@ fn unitName(phase: Phase, plural: bool) -> &'static [u8] {
     return b"modules"
   }
   return b"module"
+}
+
+// Redraws `shown` on a ticker's thread until `parker` gets the token that stops it. A redraw that
+// runs out of memory is skipped, as a failed write is.
+effect fn ticking(shown: Progress, parker: Parker) -> () {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut progress = move shown
+  while !parker.parkTimeout(redrawNanos) {
+    drop run Effect.result(Progress.draw(&mut progress) |> Effect.provideMut<Allocator>(&mut allocator))
+  }
+  return ()
 }
 
 // Monotonic nanoseconds.

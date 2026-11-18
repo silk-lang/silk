@@ -18,7 +18,7 @@ data is ICU's Thai, Lao, Khmer and Burmese word lists, packed as minimal tries i
 allocates only to grow the caller's list.
 
 ## Gotchas
-The dictionaries add about 2.9 MB to a program that uses this module. Only import it when the
+The dictionaries add about 1.5 MB to a program that uses this module. Only import it when the
 text can contain these scripts.
 
 ## Examples
@@ -82,7 +82,7 @@ language, marks kept with the word before them, and the Thai suffix rules.
 
 ### Gotchas
 
-A program that uses `IcuDictionary` links about 2.9 MB of dictionary data. There is no
+A program that uses `IcuDictionary` links about 1.5 MB of dictionary data. There is no
 dictionary for Chinese or Japanese.
 
 <a id="IcuDictionary.impl"></a>

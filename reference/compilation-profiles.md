@@ -460,3 +460,47 @@ entry stops the rest, and `silk init` then removes every file and directory it c
 suggests `-t minimal` for an offline project; a malformed
 template or a file in the way exits 2. Builds never run an entry; they only refuse a malformed
 one, naming its manifest line.
+
+After a project is created, `silk init` prints one line naming it: `Created`, the project, and
+where it came from. The project is its directory relative to the working directory, or the package
+name (a workspace's directory name) when it was created in the working directory. A template is
+named by its directory for the official examples, such as `the ui template`, and by its full
+spelling otherwise, followed by the first seven characters of its commit:
+
+```text
+  Created myapp from the default template (c344420)
+
+  Next steps:
+    cd myapp
+    silk run   build and run it
+```
+
+`--lib` prints `Created library <project>`, `--workspace` prints
+`Created workspace <project> with package <name>`, and `-t minimal` prints
+`Created <project> from the minimal template`. A package created inside a workspace adds
+`Added <member> to the <workspace> workspace`, naming the member as the workspace lists it.
+
+Then come the next steps: `Next steps:`, then `cd <directory>` with the project directory relative
+to the working directory (quoted for a POSIX shell when it needs it, and left out when the project
+is the working directory), then one line per step, with its description dimmed in a column beside
+the command. The steps are the template's `[template].next-steps`, an array of tables: `run` is the
+command and `description`, which is optional, says what it does; each is one nonempty line without
+control characters. `next-steps = []` prints no next steps at all. Without it, the step is
+`silk test` (`run its tests`) for a package whose `kind` is `library` and `silk run`
+(`build and run it`) otherwise, which is also what `--lib`, `--workspace` and `-t minimal` print.
+The `[template]` table, like the `[[post-init]]` entries, is removed from the new manifest. No
+next steps are printed when `silk init` fails, including when it cannot add the package to its
+workspace.
+
+Every line is indented by two spaces, and the next steps by four. When standard output is a
+terminal, `TERM` is not `dumb` and `NO_COLOR` is unset or empty, `Created` and `Added` are bold
+green, the project and `Next steps:` bold, and the commit and the descriptions dim; otherwise the
+text is the same without escape codes.
+
+```toml
+[template]
+next-steps = [
+  { run = "silk task dev", description = "start the dev server" },
+  { run = "silk test" },
+]
+```

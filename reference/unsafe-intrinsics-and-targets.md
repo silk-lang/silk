@@ -1120,8 +1120,13 @@ first-class check runs at the use site.
 **Status:** Confirmed
 
 A native symbol is a non-empty ASCII identifier: a letter or underscore followed by letters,
-digits, or underscores. Any other spelling, including an embedded NUL, is rejected at the
+digits, underscores, or `$`. Any other spelling, including an embedded NUL, is rejected at the
 declaration.
+
+On a Mach-O target, a symbol that starts with `section$start$`, `section$end$`, `segment$start$`
+or `segment$end$` names a bound the linker defines, such as
+`section$start$__DATA$__silk_seen`. The object file holds it as written, without the leading
+underscore every C symbol takes there.
 
 Platform entry names such as `main` are ordinary foreign export names: a selected source
 runtime may define them. The remaining private compiler symbols are reserved:
