@@ -17,7 +17,8 @@ pub effect fn findBytes(written: &[u8]) -> Option<Path> ! HostInputError | OutOf
 ```
 
 Resolves a program spelled as host bytes. A path names the program directly; a name searches
-`PATH`, with an additional `.exe` candidate on Windows. Missing programs return `None`.
+`PATH`, with an additional `.exe` candidate on Windows. Only files count, so a directory of the
+same name is skipped. Missing programs return `None`.
 
 <a id="find"></a>
 
