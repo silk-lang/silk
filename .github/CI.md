@@ -76,7 +76,7 @@ runs the Windows runtime fixtures and the installers. Publication signs and publ
 cross-built archives only after every verification passes; each target's receipt and seed
 candidate come from its verification.
 
-`compiler/native-seed.json` pins only the x86-64 Linux seed: every other target's compiler is
-cross-built from it. Changing the pin is a separate, explicit decision. A release's own
-`native-seed.json` names every target's compiler; a pin bump keeps only its x86-64 Linux entry.
+CI uses the x86-64 Linux seed to cross-build every target. Developers building from source use
+the seed for their host. A seed update copies the verified release's `native-seed.json`, which
+records the compiler and checksum for each supported host.
 The installers do not read it: they trust the archive's minisign signature.
