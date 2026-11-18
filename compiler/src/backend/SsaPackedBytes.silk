@@ -1,0 +1,247 @@
+//! Word-at-a-time lowering of a sixteen-byte vector load used only to classify bytes.
+//! Each comparison produces two i64 words with a flag in the high bit of each byte.
+
+import backend.SsaFunction {Binary, Cast, Kind, Operation, Predicate, Reduction, SsaFunction, none}
+import backend.SsaGraph {SsaGraph}
+import backend.SsaValueNumbering {swapped}
+import silk.collections.list {List}
+import silk.core.ownership {Copy}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.u64
+import silk.num.usize
+
+struct Words { low: u64, high: u64 }
+impl Copy for Words {}
+struct Test { input: u64, byte: u64, predicate: Predicate }
+impl Copy for Test {}
+struct Cursor { block: usize, at: usize, place: u64 }
+
+fn highBits() -> u64 { return 0x8080808080808080 }
+fn repeatByte(value: u64) -> u64 { return value * 0x0101010101010101 }
+
+fn loadable(function: &SsaFunction, value: u64) -> bool {
+  let kind = function.kindOf(value)
+  if !kind.isInteger() || kind.elements != 16 || kind.bits != 8 { return false }
+  let id = function.producerOf(value)
+  if id == usize.MAX { return false }
+  if let Operation.Load {offset, ..} = function.instruction(id).operation { return offset <= 4294967280 }
+  return false
+}
+
+// Compare a loaded byte vector with a broadcast byte, normalizing the operand order.
+fn testOf(function: &SsaFunction, id: usize, pred: Predicate) -> Test {
+  let args = function.operandsOf(id)
+  let mut input = args[usize.ZERO]
+  let mut splat = args[usize.ONE]
+  let mut predicate = pred
+  if !loadable(function, input) { input = args[usize.ONE] splat = args[usize.ZERO] predicate = swapped(pred) }
+  let mut test = Test {input: none(), byte: 0, predicate: predicate}
+  if !loadable(function, input) { return test }
+  if predicate != Predicate.Eq && predicate != Predicate.Ne && predicate != Predicate.Ult && predicate != Predicate.Ule && predicate != Predicate.Ugt && predicate != Predicate.Uge { return test }
+  let maker = function.producerOf(splat)
+  if maker == usize.MAX { return test }
+  if let Operation.Splat {count} = function.instruction(maker).operation {
+    let scalar = function.operandsOf(maker)[usize.ZERO]
+    if count == 16 && function.isBits(scalar) { test.input = input test.byte = function.constantOf(scalar).low }
+  }
+  return test
+}
+
+fn note(counts: &mut List<usize>, value: u64) -> () {
+  let v = u64.toUsize(value)
+  let previous = List<usize>.get(&counts.*, v)
+  List<usize>.set(&mut counts.*, v, previous + usize.ONE)
+}
+
+effect fn emit(f: &mut SsaFunction, w: &mut Cursor, op: Operation, kind: Kind, args: &[u64]) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  let out = run f.insertInstruction(w.block, w.at, op, kind, args, w.place)
+  w.at = w.at + usize.ONE
+  return out
+}
+
+effect fn binary(f: &mut SsaFunction, w: &mut Cursor, op: Binary, x: u64, y: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  return run emit(&mut f.*, &mut w.*, Operation.Binary {operation: op}, Kind.integer(64), &[x, y])
+}
+
+effect fn classify(f: &mut SsaFunction, w: &mut Cursor, word: u64, byte: u64, pred: Predicate) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  let high = run f.integer(64, highBits())
+  let low = run f.integer(64, u64.bitNot(highBits()))
+  let mut bits = word
+  let mut invert = false
+  if pred == Predicate.Eq || pred == Predicate.Ne {
+    let pattern = run f.integer(64, repeatByte(byte))
+    let diff = run binary(&mut f.*, &mut w.*, Binary.Xor, word, pattern)
+    let small = run binary(&mut f.*, &mut w.*, Binary.And, diff, low)
+    // Adding 127 to the low seven bits never carries into the neighboring byte.
+    let biased = run binary(&mut f.*, &mut w.*, Binary.Add, small, low)
+    bits = run binary(&mut f.*, &mut w.*, Binary.Or, diff, biased)
+    invert = pred == Predicate.Eq
+  } else {
+    let mut limit = byte
+    if pred == Predicate.Ule || pred == Predicate.Ugt { limit = limit + 1 }
+    invert = pred == Predicate.Ult || pred == Predicate.Ule
+    if limit == 256 {
+      if invert { return high }
+      return run f.integer(64, 0)
+    }
+    let small = run binary(&mut f.*, &mut w.*, Binary.And, word, low)
+    let bias = run f.integer(64, repeatByte(128 - u64.bitAnd(limit, 127)))
+    let matched = run binary(&mut f.*, &mut w.*, Binary.Add, small, bias)
+    let mut combine = Binary.Or
+    if limit >= 128 { combine = Binary.And }
+    bits = run binary(&mut f.*, &mut w.*, combine, word, matched)
+  }
+  bits = run binary(&mut f.*, &mut w.*, Binary.And, bits, high)
+  if invert { bits = run binary(&mut f.*, &mut w.*, Binary.Xor, bits, high) }
+  return bits
+}
+
+// Gather the eight high-bit flags into the low byte in memory order.
+effect fn gather(f: &mut SsaFunction, w: &mut Cursor, flags: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  let seven = run f.integer(64, 7)
+  let diagonals = run f.integer(64, 0x0102040810204080)
+  let shift = run f.integer(64, 56)
+  let ones = run binary(&mut f.*, &mut w.*, Binary.LShr, flags, seven)
+  let product = run binary(&mut f.*, &mut w.*, Binary.Mul, ones, diagonals)
+  return run binary(&mut f.*, &mut w.*, Binary.LShr, product, shift)
+}
+
+/// Replaces closed byte-classification expressions with pairs of scalar words.
+/// A load stays at its original source position and reads exactly the same sixteen bytes.
+pub effect fn lower(function: &mut SsaFunction) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let original = function.valueCount()
+  let mut possible = false
+  let mut i = usize.ZERO
+  while i < function.instructionCount() && !possible {
+    let inst = function.instruction(i)
+    if !inst.removed && inst.result != none() { possible = loadable(&function.*, inst.result) }
+    i = i + usize.ONE
+  }
+  if !possible { return false }
+  let graph = run SsaGraph.of(&function.*)
+  let order = graph.reversePostorder()
+  let uses = run function.useCounts()
+  let mut covered = List<usize>.make()
+  let mut masks = List<bool>.make()
+  let mut selected = List<bool>.make()
+  run List<usize>.appendRepeated(&mut covered, usize.ZERO, original)
+  run List<bool>.appendRepeated(&mut masks, false, original)
+  run List<bool>.appendRepeated(&mut selected, false, function.instructionCount())
+  let mut terminals = usize.ZERO
+  let mut b = usize.ZERO
+  while b < order.length {
+    let listed = List<usize>.asSlice(&function.block(order[b]).instructions)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      let id = listed[at]
+      at = at + usize.ONE
+      let inst = function.instruction(id)
+      let args = function.operandsOf(id)
+      match inst.operation {
+        Operation.Compare {predicate} => {
+          let test = testOf(&function.*, id, predicate)
+          if test.input == none() { continue }
+          note(&mut covered, test.input)
+          List<bool>.set(&mut selected, function.producerOf(test.input), true)
+          List<bool>.set(&mut masks, u64.toUsize(inst.result), true)
+        }
+        Operation.Binary {operation} => {
+          if operation != Binary.And && operation != Binary.Or && operation != Binary.Xor { continue }
+          if !List<bool>.get(&masks, u64.toUsize(args[usize.ZERO])) || !List<bool>.get(&masks, u64.toUsize(args[usize.ONE])) { continue }
+          note(&mut covered, args[usize.ZERO])
+          note(&mut covered, args[usize.ONE])
+          List<bool>.set(&mut masks, u64.toUsize(inst.result), true)
+        }
+        Operation.Reduce {which} => {
+          if args.length != usize.ONE || (which != Reduction.Or && which != Reduction.And) { continue }
+          if !List<bool>.get(&masks, u64.toUsize(args[usize.ZERO])) { continue }
+          note(&mut covered, args[usize.ZERO])
+          terminals = terminals + usize.ONE
+        }
+        Operation.Cast {operation} => {
+          if operation != Cast.Bitcast || !inst.kind.equals(Kind.integer(16)) || !List<bool>.get(&masks, u64.toUsize(args[usize.ZERO])) { continue }
+          note(&mut covered, args[usize.ZERO])
+          terminals = terminals + usize.ONE
+        }
+        _ => { continue }
+      }
+      List<bool>.set(&mut selected, id, true)
+    }
+    b = b + usize.ONE
+  }
+  if terminals == usize.ZERO { return false }
+  i = usize.ZERO
+  while i < original {
+    let n = List<usize>.get(&covered, i)
+    if n != usize.ZERO && n != List<usize>.get(&uses, i) { return false }
+    if List<bool>.get(&masks, i) && n != List<usize>.get(&uses, i) { return false }
+    i = i + usize.ONE
+  }
+  let mut words = List<Words>.make()
+  let mut replacements = List<u64>.make()
+  run List<Words>.appendRepeated(&mut words, Words {low: none(), high: none()}, original)
+  run List<u64>.appendRepeated(&mut replacements, none(), original)
+  b = usize.ZERO
+  while b < order.length {
+    let block = order[b]
+    let mut at = usize.ZERO
+    while at < List<usize>.length(&function.block(block).instructions) {
+      let id = List<usize>.get(&function.block(block).instructions, at)
+      if !List<bool>.get(&selected, id) { at = at + usize.ONE continue }
+      let inst = function.instruction(id)
+      let mut w = Cursor {block: block, at: at, place: inst.place}
+      let input = function.operandsOf(id)[usize.ZERO]
+      let first = List<Words>.get(&words, u64.toUsize(input))
+      let mut pair = Words {low: none(), high: none()}
+      let mut value = none()
+      match inst.operation {
+        Operation.Load {offset, ..} => {
+          pair.low = run emit(&mut function.*, &mut w, Operation.Load {offset: offset, alignment: usize.ONE}, Kind.integer(64), &[input])
+          pair.high = run emit(&mut function.*, &mut w, Operation.Load {offset: offset + 8, alignment: usize.ONE}, Kind.integer(64), &[input])
+        }
+        Operation.Compare {predicate} => {
+          let test = testOf(&function.*, id, predicate)
+          let data = List<Words>.get(&words, u64.toUsize(test.input))
+          pair.low = run classify(&mut function.*, &mut w, data.low, test.byte, test.predicate)
+          pair.high = run classify(&mut function.*, &mut w, data.high, test.byte, test.predicate)
+        }
+        Operation.Binary {operation} => {
+          let second = List<Words>.get(&words, u64.toUsize(function.operandsOf(id)[usize.ONE]))
+          pair.low = run binary(&mut function.*, &mut w, operation, first.low, second.low)
+          pair.high = run binary(&mut function.*, &mut w, operation, first.high, second.high)
+        }
+        Operation.Reduce {which} => {
+          let mut reducer = Binary.Or
+          let mut pred = Predicate.Ne
+          let mut mask: u64 = 0
+          if which == Reduction.And { reducer = Binary.And pred = Predicate.Eq mask = highBits() }
+          let reduced = run binary(&mut function.*, &mut w, reducer, first.low, first.high)
+          let expected = run function.integer(64, mask)
+          value = run emit(&mut function.*, &mut w, Operation.Compare {predicate: pred}, Kind.flag(), &[reduced, expected])
+        }
+        Operation.Cast {..} => {
+          let lo = run gather(&mut function.*, &mut w, first.low)
+          let hi = run gather(&mut function.*, &mut w, first.high)
+          let eight = run function.integer(64, 8)
+          let top = run binary(&mut function.*, &mut w, Binary.Shl, hi, eight)
+          let packed = run binary(&mut function.*, &mut w, Binary.Or, lo, top)
+          value = run emit(&mut function.*, &mut w, Operation.Cast {operation: Cast.Trunc}, Kind.integer(16), &[packed])
+        }
+        _ => {}
+      }
+      List<Words>.set(&mut words, u64.toUsize(inst.result), pair)
+      List<u64>.set(&mut replacements, u64.toUsize(inst.result), value)
+      // Leave load definitions available to classify the comparisons in this walk.
+      at = w.at + usize.ONE
+    }
+    b = b + usize.ONE
+  }
+  function.substitute(&mut replacements)
+  i = usize.ZERO
+  while i < List<bool>.length(&selected) {
+    if List<bool>.get(&selected, i) { function.remove(i) }
+    i = i + usize.ONE
+  }
+  function.sweep()
+  return true
+}
