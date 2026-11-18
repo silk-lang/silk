@@ -6,7 +6,8 @@ To compare two standard libraries, use the same compiler, Clang, target, profile
 
 ```sh
 cp -R "$REPO/integration/schema-compile-cost/src" "$REPO/integration/schema-compile-cost/silk.toml" .
-XDG_CACHE_HOME="$PWD/cache" "$SILK" build --stdlib "$STDLIB" --progress plain
+XDG_CACHE_HOME="$PWD/cache" SILK_HOME="$PWD/silk-home" SILK_NATIVE_CACHE_DIR="$PWD/native-cache" \
+  "$SILK" build --stdlib "$STDLIB" --progress plain
 exe=build/x86_64-unknown-linux-gnu/dev/schema-compile-cost
 "$exe"
 awk -F '\t' '$2 == "function" {n++} END {print n}' "$exe.symbols"
