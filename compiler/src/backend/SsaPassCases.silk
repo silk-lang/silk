@@ -4,13 +4,18 @@
 
 import backend.SsaControlFlow
 import backend.SsaDeadCode
-import backend.SsaFunction {Binary, Cast, Exit, Kind, Operation, Predicate, SsaFunction, none}
+import backend.SsaFunction {Binary, Cast, Edge, Exit, Kind, Operation, Predicate, SsaFunction, none}
+import backend.SsaGraph {SsaGraph}
+import backend.SsaIdioms
 import backend.SsaLoops
 import backend.SsaMemory
 import backend.SsaPipeline
 import backend.SsaPipeline {Level}
 import backend.SsaPromotion
+import backend.SsaThreading
+import backend.SsaUnroll
 import backend.SsaValueNumbering
+import backend.SsaWebs
 import backend.SsaVerification
 import backend.SsaVerification {Violation}
 import silk.collections.list {List}
@@ -18,10 +23,11 @@ import silk.core.effect {Effect}
 import silk.core.option {Option}
 import silk.mem.allocator {Allocator, OutOfMemoryError}
 import silk.testing.testing {AssertionError, Testing}
+import silk.num.u64
 import silk.num.usize
 
 // The instructions a test counts.
-enum Sort { Add, Divide, Load, Store, Copy, Call, Compare, Any }
+enum Sort { Add, Divide, Load, Store, Copy, CountedCopy, CountedFill, Call, Compare, Select, Cast, Overflow, Any }
 
 fn sorted(operation: Operation, sort: Sort) -> bool {
   return match operation {
@@ -30,8 +36,13 @@ fn sorted(operation: Operation, sort: Sort) -> bool {
     Operation.Load {..} => sort == Sort.Any || sort == Sort.Load
     Operation.Store {..} => sort == Sort.Any || sort == Sort.Store
     Operation.CopyBytes {..} => sort == Sort.Any || sort == Sort.Copy
+    Operation.CopyCounted => sort == Sort.Any || sort == Sort.CountedCopy
+    Operation.FillCounted => sort == Sort.Any || sort == Sort.CountedFill
     Operation.Call {..} => sort == Sort.Any || sort == Sort.Call
     Operation.Compare {..} => sort == Sort.Any || sort == Sort.Compare
+    Operation.Select => sort == Sort.Any || sort == Sort.Select
+    Operation.Cast {..} => sort == Sort.Any || sort == Sort.Cast
+    Operation.Overflow {..} => sort == Sort.Any || sort == Sort.Overflow
     _ => sort == Sort.Any
   }
 }
@@ -221,6 +232,861 @@ effect fn controlClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &
   run Testing.expect(List<u64>.length(&function.block(returning(&function)).parameters) == usize.ZERO, "a join of one value takes no parameter")
 }
 
+test effect fn threadsBranchesOnJoinedConstants() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run threadClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// `a < b || b < c` as lowered: one path passes a true flag to the block that branches on the
+// joined flag, the other a comparison. The path that knows the flag goes straight to the taken
+// target, so the entry's first edge leads to the returning block and no block is left that only
+// branches on a parameter.
+effect fn threadClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut function = run SsaFunction.make(b"either", 32)
+  let int = Kind.integer(32)
+  let a = run function.argument(int)
+  let b = run function.argument(int)
+  let c = run function.argument(int)
+  function.setResult(int)
+  let entry = run function.newBlock()
+  let second = run function.newBlock()
+  let joined = run function.newBlock()
+  let holds = run function.newBlock()
+  let fails = run function.newBlock()
+  let either = run function.addParameter(joined, Kind.flag())
+  function.startBlock(entry)
+  let first = run function.compare(Predicate.Ult, a, b)
+  let yes = run function.flag(true)
+  run function.branchWith(first, joined, &[yes], second, &[])
+  function.startBlock(second)
+  let other = run function.compare(Predicate.Ult, b, c)
+  run function.jumpWith(joined, &[other])
+  function.startBlock(joined)
+  run function.branchIf(either, holds, fails)
+  function.startBlock(holds)
+  run function.ret(a)
+  function.startBlock(fails)
+  drop run function.call(b"act", &[], Kind.unit())
+  run function.ret(b)
+  run function.finish()
+  drop run SsaControlFlow.simplify(&mut function)
+  run Testing.expect(run wellFormed(&function), "the threaded function passes the verifier")
+  let taken = List<Edge>.asSlice(&function.block(usize.ZERO).edges)[usize.ZERO].block
+  run Testing.expect(function.block(taken).exit == Exit.Return && count(&function, Sort.Call, taken) == usize.ZERO,
+    "the path that passes a true flag goes straight to the block the flag chooses")
+  let mut parameters = usize.ZERO
+  let mut at = usize.ZERO
+  while at < function.blockCount() {
+    parameters = parameters + List<u64>.length(&function.block(at).parameters)
+    at = at + usize.ONE
+  }
+  run Testing.expect(parameters == usize.ZERO, "no block takes the joined flag any more")
+}
+
+test effect fn joinsBranchesIntoChosenValues() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run joinClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// A branch whose two edges enter `joined` with `differing` pairs of different arguments, the
+// first pair the constants 1 and 0, the second 0 and 1, the rest two arguments of the function.
+effect fn joinedBranch(differing: usize) -> SsaFunction ! OutOfMemoryError ? &mut Allocator {
+  let mut function = run SsaFunction.make(b"carry", 32)
+  let int = Kind.integer(64)
+  let a = run function.argument(int)
+  let b = run function.argument(int)
+  function.setResult(int)
+  let entry = run function.newBlock()
+  let joined = run function.newBlock()
+  let mut parameters = List<u64>.make()
+  let mut at = usize.ZERO
+  while at < differing {
+    run List<u64>.append(&mut parameters, run function.addParameter(joined, int))
+    at = at + usize.ONE
+  }
+  function.startBlock(entry)
+  let sum = run function.binary(Binary.Add, a, b)
+  let carried = run function.compare(Predicate.Ult, sum, a)
+  let one = run function.integer(64, 1)
+  let zero = run function.integer(64, 0)
+  let mut taken = List<u64>.make()
+  let mut other = List<u64>.make()
+  at = usize.ZERO
+  while at < differing {
+    if at == usize.ZERO {
+      run List<u64>.append(&mut taken, one)
+      run List<u64>.append(&mut other, zero)
+    } else if at == usize.ONE {
+      run List<u64>.append(&mut taken, zero)
+      run List<u64>.append(&mut other, one)
+    } else {
+      run List<u64>.append(&mut taken, a)
+      run List<u64>.append(&mut other, b)
+    }
+    at = at + usize.ONE
+  }
+  run function.branchWith(carried, joined, List<u64>.asSlice(&taken), joined, List<u64>.asSlice(&other))
+  function.startBlock(joined)
+  let mut total = sum
+  at = usize.ZERO
+  while at < differing {
+    total = run function.binary(Binary.Add, total, List<u64>.get(&parameters, at))
+    at = at + usize.ONE
+  }
+  run function.ret(total)
+  run function.finish()
+  return move function
+}
+
+fn branches(function: &SsaFunction) -> usize {
+  let mut total = usize.ZERO
+  let mut at = usize.ZERO
+  while at < function.blockCount() {
+    if function.block(at).exit == Exit.Branch { total = total + usize.ONE }
+    at = at + usize.ONE
+  }
+  return total
+}
+
+// `if sum < a { 1 } else { 0 }` and its like: the two edges of the branch enter one block, so the
+// block takes the flag widened, its negation widened, and a select of the two arguments, and no
+// branch is left. Past `SsaControlFlow.joined()` differing parameters the branch stays. A flag
+// widened and compared with one is the flag, and compared with zero its negation.
+effect fn joinClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut function = run joinedBranch(3)
+  drop run SsaControlFlow.simplify(&mut function)
+  run Testing.expect(run wellFormed(&function), "the joined function passes the verifier")
+  run Testing.expect(function.blockCount() == usize.ONE && branches(&function) == usize.ZERO, "the branch became a jump its target joined")
+  run Testing.expect(count(&function, Sort.Cast, usize.MAX) == 2, "the constants 1 and 0, either way round, are the widened flag")
+  run Testing.expect(count(&function, Sort.Select, usize.MAX) == usize.ONE, "two other values are a select")
+  let mut wide = run joinedBranch(SsaControlFlow.joined() + usize.ONE)
+  drop run SsaControlFlow.simplify(&mut wide)
+  run Testing.expect(branches(&wide) == usize.ONE && count(&wide, Sort.Select, usize.MAX) == usize.ZERO, "a branch that differs on more stays")
+
+  let mut compared = run SsaFunction.make(b"flags", 32)
+  let int = Kind.integer(32)
+  let a = run compared.argument(int)
+  let b = run compared.argument(int)
+  compared.setResult(Kind.flag())
+  drop run compared.newBlock()
+  let below = run compared.compare(Predicate.Ult, a, b)
+  let byte = run compared.cast(Cast.ZExt, below, Kind.integer(8))
+  let set = run compared.integer(8, 1)
+  let clear = run compared.integer(8, 0)
+  let same = run compared.compare(Predicate.Eq, byte, set)
+  let negated = run compared.compare(Predicate.Eq, byte, clear)
+  let both = run compared.binary(Binary.And, same, negated)
+  run compared.ret(both)
+  run compared.finish()
+  drop run SsaValueNumbering.number(&mut compared)
+  drop run SsaDeadCode.eliminate(&mut compared)
+  run Testing.expect(run wellFormed(&compared), "the folded function passes the verifier")
+  run Testing.expect(count(&compared, Sort.Compare, usize.MAX) == usize.ONE && count(&compared, Sort.Cast, usize.MAX) == usize.ZERO,
+    "comparing the widened flag with one or zero needs neither the widening nor a second comparison")
+}
+
+test effect fn decidesChecksByRanges() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run rangeClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Inside `index < 256`, a check of `index < 258` holds; a value masked to 32 bits is never above
+// them; and once `index >= 1` is known too, `index - 1 < 258` holds without wrapping. Only the two
+// comparisons that guard the blocks stay. A check the ranges leave open, `index < 100`, stays too.
+effect fn rangeClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut function = run SsaFunction.make(b"ranges", 32)
+  let int = Kind.integer(32)
+  let wide = Kind.integer(64)
+  let index = run function.argument(int)
+  let value = run function.argument(wide)
+  function.setResult(Kind.flag())
+  let entry = run function.newBlock()
+  let inside = run function.newBlock()
+  let deeper = run function.newBlock()
+  let out = run function.newBlock()
+  function.startBlock(entry)
+  let limit = run function.integer(32, 256)
+  let within = run function.compare(Predicate.Ult, index, limit)
+  run function.branchIf(within, inside, out)
+  function.startBlock(inside)
+  let looser = run function.integer(32, 258)
+  let implied = run function.compare(Predicate.Ult, index, looser)
+  let mask = run function.integer(64, 4294967295)
+  let low = run function.binary(Binary.And, value, mask)
+  let above = run function.compare(Predicate.Ugt, low, mask)
+  let one = run function.integer(32, 1)
+  let positive = run function.compare(Predicate.Uge, index, one)
+  let first = run function.binary(Binary.Or, implied, above)
+  drop run function.call(b"note", &[first], Kind.unit())
+  run function.branchIf(positive, deeper, out)
+  function.startBlock(deeper)
+  let before = run function.binary(Binary.Sub, index, one)
+  let shifted = run function.compare(Predicate.Ult, before, looser)
+  let hundred = run function.integer(32, 100)
+  let open = run function.compare(Predicate.Ult, index, hundred)
+  let both = run function.binary(Binary.And, shifted, open)
+  run function.ret(both)
+  function.startBlock(out)
+  let never = run function.flag(false)
+  run function.ret(never)
+  run function.finish()
+  drop run SsaValueNumbering.number(&mut function)
+  run Testing.expect(run wellFormed(&function), "the numbered function passes the verifier")
+  run Testing.expect(count(&function, Sort.Compare, usize.MAX) == 3, "the guards and the open check stay; the checks the ranges answer are gone")
+}
+
+test effect fn decidesSignedChecksByRanges() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run signedRangeClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Below `value < 0`, `value + 1` cannot pass the greatest integer, and `0 - (value + 1)` is not
+// negative, so both checks fold; and that difference with every bit flipped is `value` again,
+// which the block returns. Only the guard's comparison stays.
+effect fn signedRangeClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut function = run SsaFunction.make(b"signed", 32)
+  let wide = Kind.integer(64)
+  let value = run function.argument(wide)
+  function.setResult(wide)
+  let entry = run function.newBlock()
+  let below = run function.newBlock()
+  let out = run function.newBlock()
+  function.startBlock(entry)
+  let zero = run function.integer(64, 0)
+  let negative = run function.compare(Predicate.Slt, value, zero)
+  run function.branchIf(negative, below, out)
+  function.startBlock(below)
+  let one = run function.integer(64, 1)
+  let nearlyMost = run function.integer(64, 9223372036854775806)
+  let overflows = run function.compare(Predicate.Sgt, value, nearlyMost)
+  let next = run function.binary(Binary.Add, value, one)
+  let negated = run function.binary(Binary.Sub, zero, next)
+  let underflows = run function.compare(Predicate.Slt, negated, zero)
+  let either = run function.binary(Binary.Or, overflows, underflows)
+  drop run function.call(b"note", &[either], Kind.unit())
+  let ones = run function.integer(64, 18446744073709551615)
+  let flipped = run function.binary(Binary.Xor, negated, ones)
+  run function.ret(flipped)
+  function.startBlock(out)
+  run function.ret(zero)
+  run function.finish()
+  drop run SsaValueNumbering.number(&mut function)
+  run Testing.expect(run wellFormed(&function), "the numbered function passes the verifier")
+  run Testing.expect(count(&function, Sort.Compare, usize.MAX) == usize.ONE, "only the guard's comparison stays")
+  let returning = List<Edge>.asSlice(&function.block(usize.ZERO).edges)[usize.ZERO].block
+  run Testing.expect(function.block(returning).value == value, "the flipped negation of the successor is the value itself")
+}
+
+test effect fn foldsAWrappingConversionToATruncation() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run wrappingClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// The upper half of a `u64` to `i32` conversion that keeps the low 32 bits, as the standard
+// library writes it: above the greatest `i32`, `-(4294967295 - low) - 1` with a range check of
+// the difference. The difference cannot pass the greatest `i32` there, so the check folds, and
+// the arithmetic is the truncation of the value itself.
+effect fn wrappingClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut function = run SsaFunction.make(b"wrapping", 32)
+  let wide = Kind.integer(64)
+  let narrow = Kind.integer(32)
+  let value = run function.argument(wide)
+  function.setResult(narrow)
+  let entry = run function.newBlock()
+  let upper = run function.newBlock()
+  let out = run function.newBlock()
+  function.startBlock(entry)
+  let mask = run function.integer(64, 4294967295)
+  let greatest = run function.integer(64, 2147483647)
+  let low = run function.binary(Binary.And, value, mask)
+  let above = run function.compare(Predicate.Ugt, low, greatest)
+  run function.branchIf(above, upper, out)
+  function.startBlock(upper)
+  let rest = run function.binary(Binary.Sub, mask, low)
+  let unfit = run function.compare(Predicate.Ugt, rest, greatest)
+  drop run function.call(b"note", &[unfit], Kind.unit())
+  let small = run function.cast(Cast.Trunc, rest, narrow)
+  let zero = run function.integer(32, 0)
+  let one = run function.integer(32, 1)
+  let negated = run function.binary(Binary.Sub, zero, small)
+  let result = run function.binary(Binary.Sub, negated, one)
+  run function.ret(result)
+  function.startBlock(out)
+  run function.ret(zero)
+  run function.finish()
+  let mut round = usize.ZERO
+  while round < 4 {
+    drop run SsaValueNumbering.number(&mut function)
+    drop run SsaDeadCode.eliminate(&mut function)
+    round = round + usize.ONE
+  }
+  run Testing.expect(run wellFormed(&function), "the folded function passes the verifier")
+  run Testing.expect(count(&function, Sort.Compare, usize.MAX) == usize.ONE, "the difference's range check is decided")
+  let returning = List<Edge>.asSlice(&function.block(usize.ZERO).edges)[usize.ZERO].block
+  let returned = function.block(returning).value
+  let producer = function.producerOf(returned)
+  let mut truncates = false
+  if producer != usize.MAX {
+    if let Operation.Cast {operation: Cast.Trunc} = function.instruction(producer).operation {
+      truncates = function.operandsOf(producer)[usize.ZERO] == value
+    }
+  }
+  run Testing.expect(truncates, "the upper half returns the value truncated")
+}
+
+test effect fn parametersThatHandAValueOnShareAWeb() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run webClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// `held` enters `fork`, which passes it on to `join` along one edge and a sum along the other.
+// When `join` reads only its own parameter, `held` is dead there and the two share a web; when
+// `join` also reads `held` (`both`), both are live at once and each keeps its own location.
+effect fn webbed(both: bool) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut function = run SsaFunction.make(b"webs", 32)
+  let int = Kind.integer(32)
+  let start = run function.argument(int)
+  function.setResult(int)
+  let entry = run function.newBlock()
+  let fork = run function.newBlock()
+  let plain = run function.newBlock()
+  let bumped = run function.newBlock()
+  let join = run function.newBlock()
+  let held = run function.addParameter(fork, int)
+  let passed = run function.addParameter(join, int)
+  function.startBlock(entry)
+  let doubled = run function.binary(Binary.Add, start, start)
+  run function.jumpWith(fork, &[doubled])
+  function.startBlock(fork)
+  let zero = run function.integer(32, 0)
+  let empty = run function.compare(Predicate.Eq, held, zero)
+  run function.branchIf(empty, plain, bumped)
+  function.startBlock(plain)
+  run function.jumpWith(join, &[held])
+  function.startBlock(bumped)
+  let one = run function.integer(32, 1)
+  let more = run function.binary(Binary.Add, held, one)
+  run function.jumpWith(join, &[more])
+  function.startBlock(join)
+  let mut result = passed
+  if both { result = run function.binary(Binary.Add, passed, held) }
+  run function.ret(result)
+  run function.finish()
+  let graph = run SsaGraph.of(&function)
+  let webs = run SsaWebs.of(&function, &graph)
+  return List<u64>.get(&webs, u64.toUsize(passed)) == held && List<u64>.get(&webs, u64.toUsize(held)) == held
+}
+
+effect fn webClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  run Testing.expect(run webbed(false), "a parameter passed on where it is dead shares its successor's web")
+  run Testing.expect(!(run webbed(true)), "two parameters live at once keep their own locations")
+}
+
+test effect fn promotesAFieldReadNarrowerThanItIsStored() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run sharedFieldClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// A tag stored as a word on two paths and read as a byte after they join, as a copy expanded
+// word by word leaves an `Option`: the slot is promoted, so no load or store is left, and the
+// byte is the low part of the word the paths pass on.
+effect fn sharedFieldClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut function = run SsaFunction.make(b"tagged", 32)
+  let chosen = run function.argument(Kind.flag())
+  function.setResult(Kind.integer(8))
+  let entry = run function.newBlock()
+  let some = run function.newBlock()
+  let nothing = run function.newBlock()
+  let after = run function.newBlock()
+  function.startBlock(entry)
+  let slot = run function.slotOf(16, 8)
+  run function.branchIf(chosen, some, nothing)
+  function.startBlock(some)
+  let set = run function.integer(64, 1)
+  run function.store(set, slot, 0, 8)
+  run function.jump(after)
+  function.startBlock(nothing)
+  let clear = run function.integer(64, 0)
+  run function.store(clear, slot, 0, 8)
+  run function.jump(after)
+  function.startBlock(after)
+  let tag = run function.load(Kind.integer(8), slot, 0, 1)
+  run function.ret(tag)
+  run function.finish()
+  run SsaPromotion.promote(&mut function, true)
+  run Testing.expect(run wellFormed(&function), "the promoted function passes the verifier")
+  run Testing.expect(count(&function, Sort.Load, usize.MAX) == usize.ZERO && count(&function, Sort.Store, usize.MAX) == usize.ZERO,
+    "the word stores and the byte load are gone")
+  run Testing.expect(count(&function, Sort.Cast, usize.MAX) == usize.ONE, "the byte is the word truncated")
+
+  // A flag read from the field a word was stored to is the word truncated to a flag.
+  let mut flagged = run SsaFunction.make(b"flagged", 32)
+  let word = run flagged.argument(Kind.integer(64))
+  flagged.setResult(Kind.flag())
+  let only = run flagged.newBlock()
+  flagged.startBlock(only)
+  let held = run flagged.slotOf(8, 8)
+  run flagged.store(word, held, 0, 8)
+  let flag = run flagged.load(Kind.flag(), held, 0, 1)
+  run flagged.ret(flag)
+  run flagged.finish()
+  run SsaPromotion.promote(&mut flagged, true)
+  run Testing.expect(run wellFormed(&flagged), "a flag read from a word's field passes the verifier")
+  run Testing.expect(count(&flagged, Sort.Load, usize.MAX) == usize.ZERO && count(&flagged, Sort.Store, usize.MAX) == usize.ZERO,
+    "the word store and the flag load are gone")
+
+  // A word stored over a flag and an integer beside it is split into them, the flag as a flag.
+  let mut split = run SsaFunction.make(b"split", 32)
+  let both = run split.argument(Kind.integer(64))
+  split.setResult(Kind.integer(32))
+  let body = run split.newBlock()
+  split.startBlock(body)
+  let pair = run split.slotOf(8, 4)
+  run split.store(both, pair, 0, 4)
+  let low = run split.load(Kind.flag(), pair, 0, 1)
+  let high = run split.load(Kind.integer(32), pair, 4, 4)
+  let lowWord = run split.cast(Cast.ZExt, low, Kind.integer(32))
+  let sum = run split.binary(Binary.Add, lowWord, high)
+  run split.ret(sum)
+  run split.finish()
+  run SsaPromotion.promote(&mut split, true)
+  run Testing.expect(run wellFormed(&split), "a word split into a flag and an integer passes the verifier")
+  run Testing.expect(count(&split, Sort.Load, usize.MAX) == usize.ZERO && count(&split, Sort.Store, usize.MAX) == usize.ZERO,
+    "the split word's store and loads are gone")
+}
+
+test effect fn aSignBranchWithEqualSidesGoes() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run signBranchClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// A `u64` to `i32` conversion that keeps the low 32 bits, once its upper side's arithmetic has
+// folded: at most the greatest `i32`, the low bits truncated; above it, the value truncated, after
+// a check that its bits flipped do not pass the least `i32`. Above the greatest `i32` the low
+// bits have their top bit set, so the truncation is negative and the check is decided. Both
+// sides then truncate the same value and pass it on, so they join and the branch goes.
+effect fn signBranchClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut function = run SsaFunction.make(b"converted", 32)
+  let wide = Kind.integer(64)
+  let narrow = Kind.integer(32)
+  let value = run function.argument(wide)
+  function.setResult(narrow)
+  let entry = run function.newBlock()
+  let lower = run function.newBlock()
+  let upper = run function.newBlock()
+  let bad = run function.newBlock()
+  let good = run function.newBlock()
+  let out = run function.newBlock()
+  let result = run function.addParameter(out, narrow)
+  function.startBlock(entry)
+  let mask = run function.integer(64, 4294967295)
+  let greatest = run function.integer(64, 2147483647)
+  let low = run function.binary(Binary.And, value, mask)
+  let small = run function.compare(Predicate.Ule, low, greatest)
+  run function.branchIf(small, lower, upper)
+  function.startBlock(lower)
+  let kept = run function.cast(Cast.Trunc, low, narrow)
+  run function.jumpWith(out, &[kept])
+  function.startBlock(upper)
+  let wrapped = run function.cast(Cast.Trunc, value, narrow)
+  let ones = run function.integer(32, 4294967295)
+  let flipped = run function.binary(Binary.Xor, wrapped, ones)
+  let nearlyLeast = run function.integer(32, 2147483649)
+  let passes = run function.compare(Predicate.Sgt, nearlyLeast, flipped)
+  run function.branchIf(passes, bad, good)
+  function.startBlock(bad)
+  run function.trap()
+  function.startBlock(good)
+  run function.jumpWith(out, &[wrapped])
+  function.startBlock(out)
+  run function.ret(result)
+  run function.finish()
+  drop run SsaValueNumbering.number(&mut function)
+  run Testing.expect(run wellFormed(&function), "the numbered function passes the verifier")
+  run Testing.expect(count(&function, Sort.Compare, usize.MAX) == usize.ONE, "the upper side's check is decided by what the branch says of the low bits")
+  let mut round = usize.ZERO
+  while round < 3 {
+    drop run SsaControlFlow.simplify(&mut function)
+    drop run SsaValueNumbering.number(&mut function)
+    drop run SsaDeadCode.eliminate(&mut function)
+    round = round + usize.ONE
+  }
+  run Testing.expect(run wellFormed(&function), "the simplified function passes the verifier")
+  run Testing.expect(function.blockCount() == usize.ONE && count(&function, Sort.Compare, usize.MAX) == usize.ZERO,
+    "sides that truncate the same value join, and the branch between them goes")
+  let returned = function.block(usize.ZERO).value
+  let producer = function.producerOf(returned)
+  let mut truncates = false
+  if producer != usize.MAX {
+    if let Operation.Cast {operation: Cast.Trunc} = function.instruction(producer).operation {
+      truncates = function.operandsOf(producer)[usize.ZERO] == value
+    }
+  }
+  run Testing.expect(truncates, "the conversion returns the value truncated")
+}
+
+test effect fn promotesAPairCopiedAsOneWord() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run packedPairClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// A pointer and a length stored as two words, copied to a second slot, and read back as two
+// words, as a slice passed by value is. With `wide`, the copy moves both as one integer; without,
+// it moves the pointer as an integer of its own width. Either way both slots are promoted, and
+// after numbering the loaded byte is read through the argument itself.
+effect fn packedPair(wide: bool) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut function = run SsaFunction.make(b"paired", 32)
+  let pointer = run function.argument(Kind.address(32))
+  let length = run function.argument(Kind.integer(32))
+  function.setResult(Kind.integer(32))
+  let entry = run function.newBlock()
+  function.startBlock(entry)
+  let first = run function.slotOf(8, 4)
+  let second = run function.slotOf(8, 4)
+  run function.store(pointer, first, 0, 4)
+  run function.store(length, first, 4, 4)
+  if wide {
+    let both = run function.load(Kind.integer(64), first, 0, 4)
+    run function.store(both, second, 0, 4)
+  } else {
+    let low = run function.load(Kind.integer(32), first, 0, 4)
+    run function.store(low, second, 0, 4)
+    let high = run function.load(Kind.integer(32), first, 4, 4)
+    run function.store(high, second, 4, 4)
+  }
+  let data = run function.load(Kind.address(32), second, 0, 4)
+  let byte = run function.load(Kind.integer(8), data, 0, 1)
+  let widened = run function.cast(Cast.ZExt, byte, Kind.integer(32))
+  let held = run function.load(Kind.integer(32), second, 4, 4)
+  let sum = run function.binary(Binary.Add, widened, held)
+  run function.ret(sum)
+  run function.finish()
+  run SsaPromotion.promote(&mut function, true)
+  if !(run wellFormed(&function)) { return false }
+  drop run SsaValueNumbering.number(&mut function)
+  drop run SsaDeadCode.eliminate(&mut function)
+  if !(run wellFormed(&function)) { return false }
+  // Only the byte's load is left, and it reads through the pointer argument.
+  if count(&function, Sort.Store, usize.MAX) != usize.ZERO || count(&function, Sort.Load, usize.MAX) != usize.ONE { return false }
+  let listed = List<usize>.asSlice(&function.block(entry).instructions)
+  let mut direct = false
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if let Operation.Load {..} = function.instruction(listed[at]).operation { direct = function.operandsOf(listed[at])[usize.ZERO] == pointer }
+    at = at + usize.ONE
+  }
+  return direct && count(&function, Sort.Add, usize.MAX) == usize.ONE
+}
+
+effect fn packedPairClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  run Testing.expect(run packedPair(true), "a pair copied as one integer is promoted field by field")
+  run Testing.expect(run packedPair(false), "a pointer copied as an integer shares the pointer's field")
+}
+
+test effect fn dropsOverflowChecksRangesRuleOut() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run uncheckedClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// An exponent of eleven bits less 1075 times a constant of a few million cannot leave 64 bits, so
+// the checked product is the plain one and the branch on its overflow flag folds. The product of
+// two values nothing bounds keeps its check.
+effect fn unchecked(bounded: bool) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut function = run SsaFunction.make(b"scaled", 32)
+  let wide = Kind.integer(64)
+  let bits = run function.argument(wide)
+  let other = run function.argument(wide)
+  function.setResult(wide)
+  let entry = run function.newBlock()
+  let fine = run function.newBlock()
+  let failed = run function.newBlock()
+  function.startBlock(entry)
+  let mask = run function.integer(64, 2047)
+  let bias = run function.integer(64, 1075)
+  let field = run function.binary(Binary.And, bits, mask)
+  let exponent = run function.binary(Binary.Sub, field, bias)
+  let mut factor = run function.integer(64, 1262611)
+  if !bounded { factor = other }
+  let scaled = run function.overflowing(Binary.Mul, true, exponent, factor)
+  run function.branchIf(scaled.overflow, failed, fine)
+  function.startBlock(fine)
+  run function.ret(scaled.value)
+  function.startBlock(failed)
+  run function.trap()
+  run function.finish()
+  drop run SsaValueNumbering.number(&mut function)
+  drop run SsaControlFlow.simplify(&mut function)
+  drop run SsaDeadCode.eliminate(&mut function)
+  return (run wellFormed(&function)) && count(&function, Sort.Overflow, usize.MAX) == usize.ZERO && branches(&function) == usize.ZERO
+}
+
+effect fn uncheckedClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  run Testing.expect(run unchecked(true), "a product whose operands' ranges fit needs no check")
+  run Testing.expect(!(run unchecked(false)), "a product of unbounded values keeps its check")
+}
+
+test effect fn packsWhatPassesLeftBehind() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run packClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// A function most of whose instructions dead code elimination removed: packing leaves only the
+// numbers the blocks still hold, the function still verifies, and a constant asked for again is
+// the value the kept code already uses.
+effect fn packClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut function = run SsaFunction.make(b"sparse", 32)
+  let int = Kind.integer(32)
+  let a = run function.argument(int)
+  function.setResult(int)
+  let entry = run function.newBlock()
+  let exit = run function.newBlock()
+  let joined = run function.addParameter(exit, int)
+  function.startBlock(entry)
+  let seven = run function.integer(32, 7)
+  let mut unused = a
+  let mut at = usize.ZERO
+  while at < 40 {
+    let mask = run function.integer(32, usize.toU64(at) + 100)
+    unused = run function.binary(Binary.Xor, unused, mask)
+    at = at + usize.ONE
+  }
+  let kept = run function.binary(Binary.Add, a, seven)
+  run function.jumpWith(exit, &[kept])
+  function.startBlock(exit)
+  let doubled = run function.binary(Binary.Add, joined, joined)
+  run function.ret(doubled)
+  run function.finish()
+  drop run SsaDeadCode.eliminate(&mut function)
+  let before = function.valueCount()
+  run Testing.expect(function.instructionCount() > function.heldCount(), "removed instructions keep their numbers until the function is packed")
+  run function.pack()
+  run Testing.expect(run wellFormed(&function), "the packed function passes the verifier")
+  run Testing.expect(function.instructionCount() == function.heldCount() && function.heldCount() == 2, "only the held instructions are numbered")
+  run Testing.expect(function.valueCount() < before, "the values nothing uses are forgotten")
+  let again = run function.integer(32, 7)
+  let add = List<usize>.get(&function.block(usize.ZERO).instructions, usize.ZERO)
+  run Testing.expect(function.operandsOf(add)[usize.ONE] == again, "a constant asked for again is the one the kept code uses")
+}
+
+test effect fn decidesChecksABoundImplies() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run boundClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// How many blocks of `function` end in a trap.
+fn traps(function: &SsaFunction) -> usize {
+  let mut total = usize.ZERO
+  let mut at = usize.ZERO
+  while at < function.blockCount() {
+    if function.block(at).exit == Exit.Trap { total = total + usize.ONE }
+    at = at + usize.ONE
+  }
+  return total
+}
+
+// Where `i < n` holds, `i + 1` cannot wrap, so its check goes; where only `n` is known nothing
+// says so and the check stays. A branch on a negated flag decides the flag itself on each side.
+effect fn boundClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let int = Kind.integer(32)
+  let mut bounded = run SsaFunction.make(b"bounded", 32)
+  let i = run bounded.argument(int)
+  let n = run bounded.argument(int)
+  bounded.setResult(int)
+  let entry = run bounded.newBlock()
+  let inside = run bounded.newBlock()
+  let outside = run bounded.newBlock()
+  let wrapped = run bounded.newBlock()
+  let fine = run bounded.newBlock()
+  let wrappedOutside = run bounded.newBlock()
+  let fineOutside = run bounded.newBlock()
+  bounded.startBlock(entry)
+  let below = run bounded.compare(Predicate.Ult, i, n)
+  run bounded.branchIf(below, inside, outside)
+  bounded.startBlock(inside)
+  let one = run bounded.integer(32, 1)
+  let next = run bounded.binary(Binary.Add, i, one)
+  let over = run bounded.compare(Predicate.Ult, next, i)
+  run bounded.branchIf(over, wrapped, fine)
+  bounded.startBlock(wrapped)
+  run bounded.trap()
+  bounded.startBlock(fine)
+  run bounded.ret(next)
+  bounded.startBlock(outside)
+  let after = run bounded.binary(Binary.Add, n, one)
+  let overOutside = run bounded.compare(Predicate.Ult, after, n)
+  run bounded.branchIf(overOutside, wrappedOutside, fineOutside)
+  bounded.startBlock(wrappedOutside)
+  run bounded.trap()
+  bounded.startBlock(fineOutside)
+  run bounded.ret(after)
+  run bounded.finish()
+  drop run SsaValueNumbering.number(&mut bounded)
+  drop run SsaControlFlow.simplify(&mut bounded)
+  run Testing.expect(run wellFormed(&bounded), "the bounded function passes the verifier")
+  run Testing.expect(traps(&bounded) == usize.ONE, "the increment of a value below a bound is not checked, and the bound's own increment is")
+
+  let mut negated = run SsaFunction.make(b"negated", 32)
+  let x = run negated.argument(int)
+  let y = run negated.argument(int)
+  negated.setResult(int)
+  let first = run negated.newBlock()
+  let not = run negated.newBlock()
+  let so = run negated.newBlock()
+  let never = run negated.newBlock()
+  let always = run negated.newBlock()
+  negated.startBlock(first)
+  let less = run negated.compare(Predicate.Ult, x, y)
+  let set = run negated.flag(true)
+  let flipped = run negated.binary(Binary.Xor, less, set)
+  run negated.branchIf(flipped, not, so)
+  negated.startBlock(not)
+  run negated.branchIf(less, never, always)
+  negated.startBlock(never)
+  run negated.trap()
+  negated.startBlock(always)
+  run negated.ret(x)
+  negated.startBlock(so)
+  run negated.ret(y)
+  run negated.finish()
+  drop run SsaValueNumbering.number(&mut negated)
+  drop run SsaControlFlow.simplify(&mut negated)
+  run Testing.expect(traps(&negated) == usize.ZERO, "a branch on a negated flag decides the flag where it leads")
+}
+
+test effect fn equalConstantsAreOneValue() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run constantClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// A constant asked for twice is one value, so two sums of an argument and that constant are one
+// sum once numbered; a constant of another width or content is another value. Enough constants
+// to grow the table several times are all still found.
+effect fn constantClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut function = run SsaFunction.make(b"constants", 32)
+  let int = Kind.integer(32)
+  let x = run function.argument(int)
+  function.setResult(int)
+  let entry = run function.newBlock()
+  function.startBlock(entry)
+  let seven = run function.integer(32, 7)
+  let again = run function.integer(32, 7)
+  let wide = run function.integer(64, 7)
+  let eight = run function.integer(32, 8)
+  run Testing.expect(seven == again, "the same constant asked for twice is one value")
+  run Testing.expect(seven != wide && seven != eight, "another width or content is another value")
+  let mut held = true
+  let mut each: u64 = 100
+  while each < 400 {
+    drop run function.integer(32, each)
+    each = each + 1
+  }
+  each = 100
+  while each < 400 {
+    let first = run function.integer(32, each)
+    let second = run function.integer(32, each)
+    if first != second { held = false }
+    each = each + 1
+  }
+  let found = run function.integer(32, 7)
+  run Testing.expect(held && found == seven, "every constant is found again after the table grew")
+  let first = run function.binary(Binary.Add, x, seven)
+  let second = run function.binary(Binary.Add, x, again)
+  let both = run function.binary(Binary.Mul, first, second)
+  run function.ret(both)
+  run function.finish()
+  drop run SsaValueNumbering.number(&mut function)
+  run Testing.expect(count(&function, Sort.Add, usize.MAX) == usize.ONE, "two sums with the same constant are one sum")
+}
+
+test effect fn unrollsLoopsOfKnownLength() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run unrollClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// The sum of `i` for `i` from 0 while `i < bound`, each step calling `act` when `calls`.
+effect fn summing(bound: u64, calls: bool) -> SsaFunction ! OutOfMemoryError ? &mut Allocator {
+  let mut function = run SsaFunction.make(b"summing", 32)
+  let int = Kind.integer(32)
+  function.setResult(int)
+  let entry = run function.newBlock()
+  let head = run function.newBlock()
+  let step = run function.newBlock()
+  let done = run function.newBlock()
+  let i = run function.addParameter(head, int)
+  let sum = run function.addParameter(head, int)
+  let total = run function.addParameter(done, int)
+  function.startBlock(entry)
+  let zero = run function.integer(32, 0)
+  run function.jumpWith(head, &[zero, zero])
+  function.startBlock(head)
+  let limit = run function.integer(32, bound)
+  let more = run function.compare(Predicate.Ult, i, limit)
+  run function.branchWith(more, step, &[], done, &[sum])
+  function.startBlock(step)
+  if calls { drop run function.call(b"act", &[], Kind.unit()) }
+  let added = run function.binary(Binary.Add, sum, i)
+  let one = run function.integer(32, 1)
+  let next = run function.binary(Binary.Add, i, one)
+  run function.jumpWith(head, &[next, added])
+  function.startBlock(done)
+  run function.ret(total)
+  run function.finish()
+  return move function
+}
+
+// A loop that runs four times becomes four copies of its body, each with its counter known, so
+// the sum folds to a constant and the calls stay, one per iteration. A loop that runs more
+// often than the limit is left alone.
+effect fn unrollClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut short = run summing(4, true)
+  let unrolled = run SsaUnroll.unroll(&mut short)
+  let formed = run wellFormed(&short)
+  run Testing.expect(unrolled && formed, "the unrolled function passes the verifier")
+  drop run SsaControlFlow.simplify(&mut short)
+  drop run SsaValueNumbering.number(&mut short)
+  drop run SsaControlFlow.simplify(&mut short)
+  run Testing.expect(short.blockCount() == usize.ONE && count(&short, Sort.Call, usize.MAX) == 4, "four iterations are four calls in one block")
+  let returned = short.block(usize.ZERO).value
+  run Testing.expect(short.isBits(returned) && short.constantOf(returned).low == 6, "the sum of the four counters is the constant six")
+  // The same sum returned straight from the header's parameter, with no parameter after the loop.
+  let mut direct = run SsaFunction.make(b"direct", 32)
+  let int = Kind.integer(32)
+  direct.setResult(int)
+  let entry = run direct.newBlock()
+  let head = run direct.newBlock()
+  let step = run direct.newBlock()
+  let done = run direct.newBlock()
+  let i = run direct.addParameter(head, int)
+  let sum = run direct.addParameter(head, int)
+  direct.startBlock(entry)
+  let zero = run direct.integer(32, 0)
+  run direct.jumpWith(head, &[zero, zero])
+  direct.startBlock(head)
+  let limit = run direct.integer(32, 4)
+  let more = run direct.compare(Predicate.Ugt, limit, i)
+  run direct.branchIf(more, step, done)
+  direct.startBlock(step)
+  let added = run direct.binary(Binary.Add, sum, i)
+  let one = run direct.integer(32, 1)
+  let next = run direct.binary(Binary.Add, i, one)
+  run direct.jumpWith(head, &[next, added])
+  direct.startBlock(done)
+  run direct.ret(sum)
+  run direct.finish()
+  let opened = run SsaUnroll.unroll(&mut direct)
+  let sound = run wellFormed(&direct)
+  run Testing.expect(opened && sound, "a loop whose header value is read after it unrolls")
+  drop run SsaControlFlow.simplify(&mut direct)
+  drop run SsaValueNumbering.number(&mut direct)
+  drop run SsaControlFlow.simplify(&mut direct)
+  let answer = direct.block(usize.ZERO).value
+  run Testing.expect(direct.blockCount() == usize.ONE && direct.isBits(answer) && direct.constantOf(answer).low == 6,
+    "what read the header's sum after the loop reads the last copy's")
+  let mut long = run summing(100, false)
+  let lengthened = run SsaUnroll.unroll(&mut long)
+  run Testing.expect(!lengthened, "a loop of a hundred iterations stays a loop")
+}
+
 test effect fn eliminatesDeadCode() -> () ! OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   return run deadClaims() |> Effect.provideMut<Allocator>(&mut allocator)
@@ -305,6 +1171,58 @@ effect fn memoryClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &m
   drop run SsaMemory.forward(&mut escaping)
   run Testing.expect(count(&escaping, Sort.Load, usize.MAX) == usize.ONE, "a load of an escaped slot is not forwarded across a call")
   run Testing.expect(count(&escaping, Sort.Store, usize.MAX) == usize.ONE, "a store the callee can read stays")
+
+  // A second load through the same address value reads what the first read, wherever the
+  // address points, unless something was written between.
+  let mut repeated = run SsaFunction.make(b"repeated", 32)
+  let base = run repeated.argument(Kind.address(32))
+  let offset = run repeated.argument(int)
+  let other = run repeated.argument(Kind.address(32))
+  repeated.setResult(int)
+  let reading = run repeated.newBlock()
+  repeated.startBlock(reading)
+  let place = run repeated.indexed(base, offset)
+  let initial = run repeated.load(int, place, 0, 4)
+  let again = run repeated.load(int, place, 0, 4)
+  run repeated.store(initial, other, 0, 4)
+  let later = run repeated.load(int, place, 0, 4)
+  let pair = run repeated.binary(Binary.Add, initial, again)
+  let all = run repeated.binary(Binary.Add, pair, later)
+  run repeated.ret(all)
+  run repeated.finish()
+  drop run SsaMemory.forward(&mut repeated)
+  run Testing.expect(run wellFormed(&repeated), "the repeated function passes the verifier")
+  run Testing.expect(count(&repeated, Sort.Load, usize.MAX) == 2, "a repeated load is one load until a store may have changed it")
+
+  // A byte inside a wider constant a store wrote is that byte of the constant, low byte first;
+  // a byte of a stored argument is still loaded. The escaping call keeps both stores.
+  let byte = Kind.integer(8)
+  let mut narrow = run SsaFunction.make(b"narrow", 32)
+  let given = run narrow.argument(int)
+  narrow.setResult(byte)
+  let body = run narrow.newBlock()
+  narrow.startBlock(body)
+  let wide = run narrow.slotOf(8, 4)
+  let pattern = run narrow.integer(32, 0x01020304)
+  run narrow.store(pattern, wide, 0, 4)
+  run narrow.store(given, wide, 4, 4)
+  let second = run narrow.load(byte, wide, 1, 1)
+  let passed = run narrow.load(byte, wide, 5, 1)
+  let joined = run narrow.binary(Binary.Add, second, passed)
+  drop run narrow.call(b"use", &[wide], Kind.unit())
+  run narrow.ret(joined)
+  run narrow.finish()
+  drop run SsaMemory.forward(&mut narrow)
+  run Testing.expect(run wellFormed(&narrow), "the narrowed function passes the verifier")
+  run Testing.expect(count(&narrow, Sort.Load, usize.MAX) == usize.ONE, "only the byte of the stored argument is still loaded")
+  let listed = List<usize>.asSlice(&narrow.block(body).instructions)
+  let mut folded = none()
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if sorted(narrow.instruction(listed[at]).operation, Sort.Add) { folded = narrow.operandsOf(listed[at])[usize.ZERO] }
+    at = at + usize.ONE
+  }
+  run Testing.expect(narrow.isBits(folded) && narrow.constantOf(folded).low == 3, "the second byte of 0x01020304 reads as 3")
 }
 
 test effect fn expandsSmallCopies() -> () ! OutOfMemoryError | AssertionError<'static> {
@@ -403,4 +1321,533 @@ effect fn loopClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut
   run copied.finish()
   run SsaPipeline.prepare(&mut copied, Level.Speed, true)
   run Testing.expect(count(&copied, Sort.Any, usize.MAX) == usize.ZERO, "the pipeline reduces a stored and reloaded constant to a return")
+}
+
+// A loop over bytes: `while at < bound { ...; at = at + 1 }` from zero, or from the argument
+// `first` with `offset`, or with `down`, `while at > 0 { at = at - 1; ... }` from `bound`. Each
+// time round it stores at index `at` of `to` the byte at that index of `from` with `copies`, the
+// low byte of the counter with `varying`, and else the argument `byte`.
+effect fn byteLoop(copies: bool, down: bool, offset: bool, varying: bool) -> SsaFunction ! OutOfMemoryError ? &mut Allocator {
+  let mut function = run SsaFunction.make(b"bytes", 32)
+  let word = Kind.integer(32)
+  let to = run function.argument(Kind.address(32))
+  let from = run function.argument(Kind.address(32))
+  let bound = run function.argument(word)
+  let first = run function.argument(word)
+  let byte = run function.argument(Kind.integer(8))
+  function.setResult(word)
+  let entry = run function.newBlock()
+  let head = run function.newBlock()
+  let body = run function.newBlock()
+  let out = run function.newBlock()
+  let at = run function.addParameter(head, word)
+  function.startBlock(entry)
+  let zero = run function.integer(32, 0)
+  let one = run function.integer(32, 1)
+  let mut start = zero
+  if offset { start = first }
+  if down { start = bound }
+  run function.jumpWith(head, &[start])
+  function.startBlock(head)
+  let mut more = none()
+  if down { more = run function.compare(Predicate.Ult, zero, at) } else { more = run function.compare(Predicate.Ugt, bound, at) }
+  run function.branchIf(more, body, out)
+  function.startBlock(body)
+  let mut reached = at
+  let mut next = none()
+  if down {
+    next = run function.binary(Binary.Sub, at, one)
+    reached = next
+  }
+  let target = run function.indexed(to, reached)
+  let mut stored = byte
+  if copies {
+    let origin = run function.indexed(from, reached)
+    stored = run function.load(Kind.integer(8), origin, 0, 1)
+  }
+  if varying { stored = run function.cast(Cast.Trunc, at, Kind.integer(8)) }
+  run function.store(stored, target, 0, 1)
+  if !down { next = run function.binary(Binary.Add, at, one) }
+  run function.jumpWith(head, &[next])
+  function.startBlock(out)
+  run function.ret(zero)
+  run function.finish()
+  return move function
+}
+
+test effect fn byteLoopsBecomeFillsAndCopies() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run idiomClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// The operands of the one subtraction of two addresses' bits in `function`: the arguments those
+// addresses are, by position, or `usize.MAX` twice without one.
+fn distanceOf(function: &SsaFunction) -> [usize; 2] {
+  let mut found: [usize; 2] = [usize.MAX, usize.MAX]
+  let mut block = usize.ZERO
+  while block < function.blockCount() {
+    let listed = List<usize>.asSlice(&function.block(block).instructions)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      if let Operation.Binary {operation: Binary.Sub} = function.instruction(listed[at]).operation {
+        let operands = function.operandsOf(listed[at])
+        let high = function.producerOf(operands[usize.ZERO])
+        let low = function.producerOf(operands[usize.ONE])
+        if high != usize.MAX && low != usize.MAX {
+          if let Operation.Cast {operation: Cast.PtrToInt} = function.instruction(high).operation {
+            found = [function.value(function.operandsOf(high)[usize.ZERO]).owner, function.value(function.operandsOf(low)[usize.ZERO]).owner]
+          }
+        }
+      }
+      at = at + usize.ONE
+    }
+    block = block + usize.ONE
+  }
+  return found
+}
+
+effect fn idiomClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  // A fill from zero: the loop goes, and one fill of the bound's bytes stays.
+  let mut filling = run byteLoop(false, false, false, false)
+  run Testing.expect(run SsaIdioms.recognize(&mut filling), "a loop that stores one byte each time round is a fill")
+  run Testing.expect(run wellFormed(&filling), "the fill passes the verifier")
+  run Testing.expect(count(&filling, Sort.CountedFill, usize.MAX) == usize.ONE && count(&filling, Sort.Store, usize.MAX) == usize.ZERO
+    && count(&filling, Sort.Compare, usize.MAX) == usize.ZERO, "the fill replaces the loop")
+  // A fill from another index covers what lies between it and the bound, when anything does.
+  let mut later = run byteLoop(false, false, true, false)
+  run Testing.expect((run SsaIdioms.recognize(&mut later)) && (run wellFormed(&later)), "a fill may start past zero")
+  let mut bounded = false
+  let mut block = usize.ZERO
+  while block < later.blockCount() {
+    let listed = List<usize>.asSlice(&later.block(block).instructions)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      if let Operation.Extreme {..} = later.instruction(listed[at]).operation { bounded = true }
+      at = at + usize.ONE
+    }
+    block = block + usize.ONE
+  }
+  run Testing.expect(bounded, "its count is the bound less the first index, and nothing when the index is past the bound")
+  // A copy that counts up keeps its loop for a destination inside the source's range, and
+  // checks the destination's distance past the source.
+  let mut rising = run byteLoop(true, false, false, false)
+  run Testing.expect((run SsaIdioms.recognize(&mut rising)) && (run wellFormed(&rising)), "a loop that moves one byte each time round gets a copy")
+  run Testing.expect(count(&rising, Sort.CountedCopy, usize.MAX) == usize.ONE && count(&rising, Sort.Store, usize.MAX) == usize.ONE
+    && count(&rising, Sort.Compare, usize.MAX) == 2, "the copy runs where a check allows it, and the loop stays for the rest")
+  let up = distanceOf(&rising)
+  run Testing.expect(up[usize.ZERO] == usize.ZERO && up[usize.ONE] == usize.ONE, "counting up, the destination's distance past the source is checked")
+  // One that counts down checks the source's distance past the destination.
+  let mut falling = run byteLoop(true, true, false, false)
+  run Testing.expect((run SsaIdioms.recognize(&mut falling)) && (run wellFormed(&falling)), "a loop that moves bytes from the last down gets a copy")
+  let reversed = distanceOf(&falling)
+  run Testing.expect(count(&falling, Sort.CountedCopy, usize.MAX) == usize.ONE && reversed[usize.ZERO] == usize.ONE && reversed[usize.ONE] == usize.ZERO,
+    "counting down, the source's distance past the destination is checked")
+  // A byte the loop computes is no fill.
+  let mut counting = run byteLoop(false, false, false, true)
+  run Testing.expect(!(run SsaIdioms.recognize(&mut counting)) && count(&counting, Sort.CountedFill, usize.MAX) == usize.ZERO,
+    "a loop that stores a byte it computes stays")
+}
+
+// `low <= value && value <= high` as two branches that both leave to one block, on the first
+// argument; with `apart`, the second branch tests the second argument instead.
+effect fn ranged(apart: bool) -> SsaFunction ! OutOfMemoryError ? &mut Allocator {
+  let mut function = run SsaFunction.make(b"ranged", 32)
+  let octet = Kind.integer(8)
+  let value = run function.argument(octet)
+  let other = run function.argument(octet)
+  function.setResult(Kind.integer(32))
+  let entry = run function.newBlock()
+  let inner = run function.newBlock()
+  let inside = run function.newBlock()
+  let outside = run function.newBlock()
+  function.startBlock(entry)
+  let low = run function.integer(8, 65)
+  let high = run function.integer(8, 90)
+  let above = run function.compare(Predicate.Uge, value, low)
+  run function.branchIf(above, inner, outside)
+  function.startBlock(inner)
+  let mut tested = value
+  if apart { tested = other }
+  let below = run function.compare(Predicate.Ule, tested, high)
+  run function.branchIf(below, inside, outside)
+  function.startBlock(inside)
+  let one = run function.integer(32, 1)
+  run function.ret(one)
+  function.startBlock(outside)
+  let zero = run function.integer(32, 0)
+  run function.ret(zero)
+  run function.finish()
+  return move function
+}
+
+test effect fn twoBranchesOnARangeBecomeOne() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run rangeFusionClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn rangeFusionClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut function = run ranged(false)
+  let value: u64 = 0
+  run Testing.expect(run SsaControlFlow.fuseRanges(&mut function), "two branches that keep a value between two constants fuse")
+  // The second branch's block is no longer reached.
+  drop run function.compact()
+  run Testing.expect(run wellFormed(&function), "the fused function passes the verifier")
+  // The entry branches on `value - 65 <= 25`, to the block inside the range first.
+  let entry = function.block(usize.ZERO)
+  let test = function.producerOf(entry.value)
+  let mut spans = false
+  if test != usize.MAX {
+    if let Operation.Compare {predicate: Predicate.Ule} = function.instruction(test).operation {
+      let moved = function.producerOf(function.operandsOf(test)[usize.ZERO])
+      let span = function.operandsOf(test)[usize.ONE]
+      if moved != usize.MAX && function.isBits(span) && function.constantOf(span).low == 25 {
+        if let Operation.Binary {operation: Binary.Sub} = function.instruction(moved).operation {
+          let start = function.operandsOf(moved)[usize.ONE]
+          spans = function.operandsOf(moved)[usize.ZERO] == value && function.isBits(start) && function.constantOf(start).low == 65
+        }
+      }
+    }
+  }
+  run Testing.expect(spans, "the one comparison is of the value less the lower constant with the range's width")
+  let returns = function.block(List<Edge>.asSlice(&entry.edges)[usize.ZERO].block)
+  run Testing.expect(returns.exit == Exit.Return && function.isBits(returns.value) && function.constantOf(returns.value).low == 1,
+    "inside the range the branch goes where the second one did")
+  let mut separate = run ranged(true)
+  run Testing.expect(!(run SsaControlFlow.fuseRanges(&mut separate)), "branches on two values stay")
+}
+
+test effect fn edgesThatKnowATestSkipIt() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run threadingClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Two paths that each pass a constant tag and a value to a block that widens the tag, compares
+// it with zero and branches; both sides of the branch read the value. Each path goes straight to
+// its side, so the comparison goes, and the side a zero tag chooses returns the first path's
+// value, the argument itself.
+effect fn threadingClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut function = run SsaFunction.make(b"tagged", 32)
+  let word = Kind.integer(32)
+  let octet = Kind.integer(8)
+  let chosen = run function.argument(Kind.flag())
+  let value = run function.argument(word)
+  function.setResult(word)
+  let entry = run function.newBlock()
+  let first = run function.newBlock()
+  let second = run function.newBlock()
+  let join = run function.newBlock()
+  let fine = run function.newBlock()
+  let failed = run function.newBlock()
+  let tag = run function.addParameter(join, octet)
+  let carried = run function.addParameter(join, word)
+  function.startBlock(entry)
+  run function.branchIf(chosen, first, second)
+  function.startBlock(first)
+  let success = run function.integer(8, 0)
+  run function.jumpWith(join, &[success, value])
+  function.startBlock(second)
+  let failure = run function.integer(8, 1)
+  let one = run function.integer(32, 1)
+  let other = run function.binary(Binary.Add, value, one)
+  run function.jumpWith(join, &[failure, other])
+  function.startBlock(join)
+  let wide = run function.cast(Cast.ZExt, tag, word)
+  let zero = run function.integer(32, 0)
+  let succeeded = run function.compare(Predicate.Eq, wide, zero)
+  run function.branchIf(succeeded, fine, failed)
+  function.startBlock(fine)
+  run function.ret(carried)
+  function.startBlock(failed)
+  let doubled = run function.binary(Binary.Add, carried, carried)
+  run function.ret(doubled)
+  run function.finish()
+  run Testing.expect(run SsaThreading.thread(&mut function), "an edge that passes a constant for the tested parameter is threaded")
+  run Testing.expect(run wellFormed(&function), "the threaded function passes the verifier")
+  drop run SsaControlFlow.simplify(&mut function)
+  drop run SsaDeadCode.eliminate(&mut function)
+  run Testing.expect(run wellFormed(&function), "the simplified function passes the verifier")
+  run Testing.expect(count(&function, Sort.Compare, usize.MAX) == usize.ZERO && count(&function, Sort.Cast, usize.MAX) == usize.ZERO,
+    "no path widens or tests its tag")
+  let taken = function.block(List<Edge>.asSlice(&function.block(usize.ZERO).edges)[usize.ZERO].block)
+  run Testing.expect(taken.exit == Exit.Return && taken.value == value, "the success path returns the value it passed")
+
+  // A loop's header keeps the edge that enters the loop, though it passes a constant.
+  let mut looping = run SsaFunction.make(b"looping", 32)
+  looping.setResult(word)
+  let start = run looping.newBlock()
+  let head = run looping.newBlock()
+  let body = run looping.newBlock()
+  let out = run looping.newBlock()
+  let round = run looping.addParameter(head, word)
+  looping.startBlock(start)
+  let none = run looping.integer(32, 0)
+  run looping.jumpWith(head, &[none])
+  looping.startBlock(head)
+  let again = run looping.compare(Predicate.Eq, round, none)
+  run looping.branchIf(again, body, out)
+  looping.startBlock(body)
+  let next = run looping.integer(32, 1)
+  run looping.jumpWith(head, &[next])
+  looping.startBlock(out)
+  run looping.ret(round)
+  run looping.finish()
+  run Testing.expect(!(run SsaThreading.thread(&mut looping)), "an edge into a loop's header is not threaded past it")
+
+  // Every edge into the testing block passes a constant and nothing outside it reads a value it
+  // defines, so no value moves to a slot; the block is still removed once nothing reaches it.
+  let mut unread = run SsaFunction.make(b"unread", 32)
+  let pick = run unread.argument(Kind.flag())
+  unread.setResult(word)
+  let top = run unread.newBlock()
+  let left = run unread.newBlock()
+  let right = run unread.newBlock()
+  let meet = run unread.newBlock()
+  let yes = run unread.newBlock()
+  let no = run unread.newBlock()
+  let mark = run unread.addParameter(meet, octet)
+  unread.startBlock(top)
+  run unread.branchIf(pick, left, right)
+  unread.startBlock(left)
+  let clear = run unread.integer(8, 0)
+  run unread.jumpWith(meet, &[clear])
+  unread.startBlock(right)
+  let set = run unread.integer(8, 1)
+  run unread.jumpWith(meet, &[set])
+  unread.startBlock(meet)
+  let widened = run unread.cast(Cast.ZExt, mark, word)
+  let nothing = run unread.integer(32, 0)
+  let isClear = run unread.compare(Predicate.Eq, widened, nothing)
+  let seven = run unread.integer(32, 7)
+  let nine = run unread.integer(32, 9)
+  run unread.branchIf(isClear, yes, no)
+  unread.startBlock(yes)
+  run unread.ret(seven)
+  unread.startBlock(no)
+  run unread.ret(nine)
+  run unread.finish()
+  run Testing.expect(run SsaThreading.thread(&mut unread), "edges are threaded through a block whose values nothing else reads")
+  run Testing.expect(run wellFormed(&unread), "the block every edge skips is removed")
+}
+
+test effect fn promotesAnArrayIndexedByConstants() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run constantIndexClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// An element stored through an index that is a constant, as an unrolled loop leaves it, and
+// loaded through the offset that names the same bytes: the slot is promoted, and the constant
+// index back from the second element reaches the first.
+effect fn constantIndexClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut function = run SsaFunction.make(b"indexed", 32)
+  let word = Kind.integer(32)
+  let value = run function.argument(word)
+  function.setResult(word)
+  let entry = run function.newBlock()
+  function.startBlock(entry)
+  let slot = run function.slotOf(16, 4)
+  let four = run function.integer(32, 4)
+  let second = run function.indexed(slot, four)
+  run function.store(value, second, 0, 4)
+  let back = run function.integer(32, 4294967292)
+  let first = run function.indexed(second, back)
+  let one = run function.integer(32, 1)
+  run function.store(one, first, 0, 4)
+  let stored = run function.load(word, slot, 4, 4)
+  let low = run function.load(word, slot, 0, 4)
+  let sum = run function.binary(Binary.Add, stored, low)
+  run function.ret(sum)
+  run function.finish()
+  run SsaPromotion.promote(&mut function, true)
+  run Testing.expect(run wellFormed(&function), "the promoted function passes the verifier")
+  run Testing.expect(count(&function, Sort.Load, usize.MAX) == usize.ZERO && count(&function, Sort.Store, usize.MAX) == usize.ZERO,
+    "a slot indexed only by constants is promoted")
+  let added = function.producerOf(function.block(entry).value)
+  run Testing.expect(added != usize.MAX && function.operandsOf(added)[usize.ZERO] == value && function.operandsOf(added)[usize.ONE] == one,
+    "each load reads what the index that reaches its bytes stored")
+}
+
+// Two loads through one indexed address of the argument `from`, with a store between them at the
+// same index of a stack slot whose address a call was given, or with `through` of the second
+// argument.
+effect fn reread(through: bool) -> SsaFunction ! OutOfMemoryError ? &mut Allocator {
+  let mut function = run SsaFunction.make(b"reread", 32)
+  let word = Kind.integer(32)
+  let from = run function.argument(Kind.address(32))
+  let other = run function.argument(Kind.address(32))
+  let index = run function.argument(word)
+  function.setResult(word)
+  let entry = run function.newBlock()
+  function.startBlock(entry)
+  let slot = run function.slotOf(64, 4)
+  drop run function.call(b"keep", &[slot], Kind.unit())
+  let source = run function.indexed(from, index)
+  let first = run function.load(word, source, 0, 4)
+  let mut written = slot
+  if through { written = other }
+  let target = run function.indexed(written, index)
+  run function.store(first, target, 0, 4)
+  let again = run function.load(word, source, 0, 4)
+  let sum = run function.binary(Binary.Add, first, again)
+  run function.ret(sum)
+  run function.finish()
+  return move function
+}
+
+test effect fn aStoreToASlotKeepsWhatAnArgumentReaches() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run rereadClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn rereadClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  // The slot did not exist when the caller made the argument, though its address has escaped.
+  let mut local = run reread(false)
+  drop run SsaMemory.forward(&mut local)
+  run Testing.expect(run wellFormed(&local), "the forwarded function passes the verifier")
+  run Testing.expect(count(&local, Sort.Load, usize.MAX) == usize.ONE, "a store to a stack slot leaves what an argument reaches as it was read")
+  // Two arguments may reach the same bytes.
+  let mut apart = run reread(true)
+  drop run SsaMemory.forward(&mut apart)
+  run Testing.expect(count(&apart, Sort.Load, usize.MAX) == 2, "a store through another argument may change it")
+}
+
+test effect fn aSlotReachedThroughAHeldAddressIsPromoted() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run heldAddressClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// A record in one slot whose address a second slot holds, as the `self` of a spliced method
+// does: a loop loads the address each time round and adds one to a field of the record through
+// it. The first promotion sees the record's address stored and leaves the record in memory,
+// where forwarding cannot carry the field round the loop; once the held address is a value, the
+// second promotes the record too, and nothing is left in memory.
+effect fn heldAddressClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut function = run SsaFunction.make(b"held", 32)
+  let word = Kind.integer(32)
+  let pointer = Kind.address(32)
+  let rounds = run function.argument(word)
+  function.setResult(word)
+  let entry = run function.newBlock()
+  let head = run function.newBlock()
+  let body = run function.newBlock()
+  let out = run function.newBlock()
+  let round = run function.addParameter(head, word)
+  function.startBlock(entry)
+  let record = run function.slotOf(8, 4)
+  let reference = run function.slotOf(4, 4)
+  let zero = run function.integer(32, 0)
+  let one = run function.integer(32, 1)
+  run function.store(record, reference, 0, 4)
+  run function.store(zero, record, 4, 4)
+  run function.jumpWith(head, &[zero])
+  function.startBlock(head)
+  let more = run function.compare(Predicate.Ult, round, rounds)
+  run function.branchIf(more, body, out)
+  function.startBlock(body)
+  let through = run function.load(pointer, reference, 0, 4)
+  let before = run function.load(word, through, 4, 4)
+  let after = run function.binary(Binary.Add, before, one)
+  run function.store(after, through, 4, 4)
+  let next = run function.binary(Binary.Add, round, one)
+  run function.jumpWith(head, &[next])
+  function.startBlock(out)
+  let last = run function.load(pointer, reference, 0, 4)
+  let total = run function.load(word, last, 4, 4)
+  run function.ret(total)
+  run function.finish()
+  run SsaPipeline.prepare(&mut function, Level.Size, true)
+  run Testing.expect(count(&function, Sort.Load, usize.MAX) == usize.ZERO && count(&function, Sort.Store, usize.MAX) == usize.ZERO,
+    "the record leaves memory once its held address has")
+}
+
+// A loop over `count` rounds that reads the word four bytes into the first argument each time
+// round. With `writes` it also stores a byte through the second argument at that word's index and
+// stores the word plus one back. `reach` says the first argument reaches eight bytes, and
+// `exclusive` that both arguments are exclusive. Answers the function and its body block.
+effect fn fieldLoop(writes: bool, reach: bool, exclusive: bool) -> SsaFunction ! OutOfMemoryError ? &mut Allocator {
+  let mut function = run SsaFunction.make(b"fields", 32)
+  let word = Kind.integer(32)
+  let pointer = Kind.address(32)
+  let record = run function.argument(pointer)
+  let buffer = run function.argument(pointer)
+  let count = run function.argument(word)
+  function.setResult(word)
+  if reach { run function.setReach(record, 8) }
+  if exclusive {
+    run function.setExclusive(record)
+    run function.setExclusive(buffer)
+  }
+  let entry = run function.newBlock()
+  let head = run function.newBlock()
+  let body = run function.newBlock()
+  let out = run function.newBlock()
+  let round = run function.addParameter(head, word)
+  let total = run function.addParameter(head, word)
+  function.startBlock(entry)
+  let zero = run function.integer(32, 0)
+  let one = run function.integer(32, 1)
+  run function.jumpWith(head, &[zero, zero])
+  function.startBlock(head)
+  let more = run function.compare(Predicate.Ult, round, count)
+  run function.branchIf(more, body, out)
+  function.startBlock(body)
+  let field = run function.load(word, record, 4, 4)
+  if writes {
+    let target = run function.indexed(buffer, field)
+    let seven = run function.integer(8, 7)
+    run function.store(seven, target, 0, 1)
+    let advanced = run function.binary(Binary.Add, field, one)
+    run function.store(advanced, record, 4, 4)
+  }
+  let sum = run function.binary(Binary.Add, total, field)
+  let next = run function.binary(Binary.Add, round, one)
+  run function.jumpWith(head, &[next, sum])
+  function.startBlock(out)
+  run function.ret(total)
+  run function.finish()
+  return move function
+}
+
+// The loads and the stores the loop of `function` holds, counted in the blocks from which an
+// edge leads back to block 1, its header, and in the header.
+fn inLoopAccesses(function: &SsaFunction) -> [usize; 2] {
+  let mut found: [usize; 2] = [count(function, Sort.Load, usize.ONE), count(function, Sort.Store, usize.ONE)]
+  let mut block: usize = 2
+  while block < function.blockCount() {
+    let edges = List<Edge>.asSlice(&function.block(block).edges)
+    if edges.length == usize.ONE && edges[usize.ZERO].block == usize.ONE {
+      found[usize.ZERO] = found[usize.ZERO] + count(function, Sort.Load, block)
+      found[usize.ONE] = found[usize.ONE] + count(function, Sort.Store, block)
+    }
+    block = block + usize.ONE
+  }
+  return found
+}
+
+test effect fn loopsKeepAnArgumentsFieldsInValues() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run fieldLoopClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn fieldLoopClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  // A load the loop only repeats moves before it when the argument is known to reach its bytes,
+  // though it is not in the header: before the loop it cannot trap either.
+  let mut read = run fieldLoop(false, true, false)
+  run Testing.expect(run SsaLoops.hoist(&mut read), "a load within an argument's reach is hoisted from the body")
+  run Testing.expect((run wellFormed(&read)) && inLoopAccesses(&read)[usize.ZERO] == usize.ZERO, "the loop no longer loads the field")
+  let mut unknown = run fieldLoop(false, false, false)
+  drop run SsaLoops.hoist(&mut unknown)
+  run Testing.expect(inLoopAccesses(&unknown)[usize.ZERO] == usize.ONE, "a load that might trap stays where the loop reaches it")
+  // A field the loop also stores lives in a value for the loop's length when nothing else in
+  // the loop can reach it: one load before, the byte store alone inside, one store after.
+  let mut kept = run fieldLoop(true, true, true)
+  run Testing.expect(run SsaLoops.hoist(&mut kept), "a field read and written through an exclusive argument is promoted")
+  run Testing.expect(run wellFormed(&kept), "the promoted loop passes the verifier")
+  let inside = inLoopAccesses(&kept)
+  run Testing.expect(inside[usize.ZERO] == usize.ZERO && inside[usize.ONE] == usize.ONE, "the loop holds only the byte store")
+  run Testing.expect(count(&kept, Sort.Load, usize.MAX) == usize.ONE && count(&kept, Sort.Store, usize.MAX) == 2,
+    "the field is loaded once before the loop and stored once on the way out")
+  // Two plain arguments may reach the same bytes, so the byte store may change the field.
+  let mut shared = run fieldLoop(true, true, false)
+  drop run SsaLoops.hoist(&mut shared)
+  run Testing.expect(inLoopAccesses(&shared)[usize.ZERO] == usize.ONE, "a field another argument may reach stays in memory")
 }

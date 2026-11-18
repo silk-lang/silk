@@ -9,7 +9,7 @@ Use [`Mapping.allocate`](#Mapping.impl.allocate) in a raw Linux program, after s
 `AT_PAGESZ` auxiliary vector entry. Other programs get memory from the `Allocator` effect.
 
 ## Details
-This module exists only on Linux on x86_64 and aarch64, with the `libc` profile set to `none`.
+This module exists only on Linux on x86_64 and aarch64, with `libc` set to `none`.
 Each [`Mapping`](#Mapping) owns its whole mapping. Dropping the mapping releases it with `munmap`. Errors
 are Linux error numbers, such as 22 for `EINVAL`.
 
@@ -30,7 +30,7 @@ pub struct Mapping
 ```
 
 One anonymous mapping from the Linux kernel that starts as zeros, and an aligned range inside
-it. It exists only on Linux on x86_64 and aarch64, with the `libc` profile set to `none`.
+it. It exists only on Linux on x86_64 and aarch64, with `libc` set to `none`.
 
 ### Details
 

@@ -17,7 +17,8 @@ may come in any order. Members the type does not name are skipped, or reported w
 `Spec.strict`. Every problem carries the span of the bytes it is about. A field that holds text
 also accepts a plain scalar that YAML reads as another kind, such as `version: 1.10` or
 `zip: 01234`, and gets its text exactly as written. Encoding writes block-style YAML, with struct
-fields in declaration order.
+fields in declaration order. A `silk.collections.bytes.Bytes` field is text in standard Base64
+with padding.
 
 ## Examples
 ### Read a configuration file
@@ -450,6 +451,14 @@ effect fn member(self: &mut Self, key: string) -> bool ! Issue | OutOfMemoryErro
 Finds the member `key` of the mapping and leaves the reader at its value. A missing key leaves
 the start of the mapping as the last span.
 
+<a id="YamlSchemaReader.impl.SchemaReader.nextMember"></a>
+
+### Operation `nextMember`
+
+```silk
+effect fn nextMember(self: &mut Self) -> Option<String> ! Issue | OutOfMemoryError ? &mut Allocator
+```
+
 <a id="YamlSchemaReader.impl.SchemaReader.rejectUnread"></a>
 
 ### Operation `rejectUnread`
@@ -609,10 +618,10 @@ Writes `null`.
 ### Operation `beginList`
 
 ```silk
-effect fn beginList(self: &mut Self) -> () ! Issue | WriterError ? &mut Writer
+effect fn beginList(self: &mut Self, count: usize) -> () ! Issue | WriterError ? &mut Writer
 ```
 
-Starts a sequence.
+Starts a sequence. YAML does not write `count`.
 
 <a id="YamlSchemaWriter.impl.SchemaWriter.element"></a>
 
@@ -639,10 +648,10 @@ Ends the sequence; an empty one is written as `[]`.
 ### Operation `beginObject`
 
 ```silk
-effect fn beginObject(self: &mut Self) -> () ! Issue | WriterError ? &mut Writer
+effect fn beginObject(self: &mut Self, count: usize) -> () ! Issue | WriterError ? &mut Writer
 ```
 
-Starts a mapping.
+Starts a mapping. YAML does not write `count`.
 
 <a id="YamlSchemaWriter.impl.SchemaWriter.key"></a>
 

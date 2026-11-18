@@ -6,11 +6,10 @@ Platform supplies are physical toolchain inputs. They do not participate in sour
 logical compilation profile. A native build resolves its supply before publishing a final link
 identity, and subsequent stages consume that immutable selection.
 
-A direct supply request takes precedence over an artifact pin, then a project pin. Automatic
-selection uses the winning pin, or native discovery only for a declared compatible host target.
-Explicit requests name the target, SDK/sysroot and linker, with named compatible compiler-support
-roots where needed. An invalid explicit supply fails; it never falls back to host discovery.
-Managed supplies are recognized but unsupported. Resolution does not download or install tools.
+`Compilation.platform` supplies an explicit SDK/sysroot and linker, with compatible compiler-support
+roots where needed. Resolution captures automatic discovery in the request before compilation.
+An invalid explicit supply fails. Compilation reads the selected installation and does not fetch
+packages, run tasks or discover a different SDK.
 
 Darwin supplies distinguish SDK metadata, libSystem, frameworks, linker and consumed headers.
 SDKROOT, when supplied, must identify a valid SDK; otherwise discovery queries selected developer
@@ -69,7 +68,7 @@ same bytes on every host, as a GNU/Linux program does. The stub is a TAPI text f
 architectures. The compiler writes it into the link's scratch directory and links with
 `ld64.lld`, `-nostdlib` and `-lSystem` against it alone. The default deployment is then 12.0; a
 written deployment must be 11.0.0 or later. The stub's digest is part of the link stamp. It has no
-frameworks or other libraries, so a `[native].link` framework entry needs a real SDK through
+frameworks or other libraries, so a `Plan.linkFramework` or `Compilation.linkFramework` input needs a real SDK through
 `SDKROOT`, a `native` request or an explicit supply. A `native` request always discovers the SDK
 and never falls back to the stub.
 
@@ -97,16 +96,17 @@ rounds a few results the other way. In glibc 2.39 that covers `asin`, `acos`, `a
 such as compressed bytes chosen by a cost model, needs the standard library's functions or a test
 on both kinds of processor.
 
-A project can pin a physical installation independently of its logical target profile:
+A command can pin a physical installation through `Compilation.platform(Deferred<Platform>)`.
+`Platform` contains absolute `sysroot` and `linker` paths and a `support` list whose entries contain
+`root` and `target`. These fields are serialized in the compilation request. For example:
 
 ```toml
-[native]
-platform-supply = { kind = "explicit", target = "aarch64-apple-darwin", root = "/opt/SDKs/MacOSX15.5.sdk", linker = "/opt/llvm/bin/ld64.lld", origin = "pinned macOS SDK" }
+[platform]
+sysroot = "/opt/SDKs/MacOSX15.5.sdk"
+linker = "/opt/llvm/bin/ld64.lld"
+support = []
 ```
 
-The `build-exe` command also accepts `--platform-supply` with the same record encoded as JSON.
-Manifest paths resolve relative to the manifest directory. GNU compiler-support installations use
-`support = [{ root = "...", target = "x86_64-unknown-linux-gnu", origin = "pinned GCC support" }]`.
-A successful final native build writes an inspectable `<artifact>.link.json` companion containing
-the frozen supply, concrete command, input origins and digests, consumed C translations, and entry
-policy. This companion describes the physical build; it is not a portable supply installation.
+Request paths are absolute. A successful native link writes an inspectable `<artifact>.link.json`
+companion containing its concrete command, selected inputs, digests and entry policy. This records
+the physical build; it is not a portable SDK installation.

@@ -1,217 +1,848 @@
-//! The plan a package's `build.silk` computes (`silk.build.plan`): modules it generates and
-//! `[native]` entries it adds.
-//!
-//! `build.silk` declares `pub const PLAN: string`. The driver evaluates it statically, in a store
-//! of its own rooted at `build.silk`, and reads the text here. The text starts with `silk-plan 1`;
-//! each step is one line, `module <name> <length>` followed by that many source bytes and a line
-//! break, or `link { ... }` and `sources { ... }`, an inline table of a `[native].link` or
-//! `[native].sources` entry. A tool step is a `tool <name> <program>` line followed by its
-//! `argument <text>`, `input <path>` and `output <path>` lines; `tool-module <name> <step> <path>`
-//! serves a step's output as a module.
+//! Decodes pure package requirements and executes their standard steps through the build runner.
 
-import silk.mem.allocator {Allocator, OutOfMemoryError}
-import silk.collections.bytes {Bytes}
-import silk.collections.list {List}
-import silk.core.option {Option}
-import silk.collections.slice {Slice}
-import silk.num.u8
+import driver.PlanData { Plan, Chain, Operation, Input, Action, Argument, File }
+import driver.StaticDecode as StaticDecodes { StaticDecode, InvalidStaticData }
+import driver.RequestText
+import driver.ToolSandbox as Sandbox
+import driver.NativeLinkInput as NativeLinkInputs { Archive }
+import driver.NativeArchive as NativeArchives
+import driver.CacheStamp
+import silk.system.host_path as HostPath
+import semantic.StaticValue { Value }
+import silk.build.run { Run }
+import silk.build.write_files { WriteFiles }
+import silk.build.step { Deferred, Step, StepHandle, StepFailure, StepError, Key, Make, Runner }
+import silk.build.request { Module, Native, NativeSource, LinkInput }
+import silk.build.fingerprint as Fingerprint
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.crypto.sha2 { Sha256 }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.box { Box }
+import silk.mem.interned { Interned }
+import silk.schema.schema { Schema }
+import silk.build.encoding as Encoding
+import silk.system.filesystem { FileSystem, FileError, Path }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.concurrency.thread_native { SpawnError }
+import silk.concurrency.fiber { Cancelled }
+import silk.text.string { String }
 import silk.num.usize
 
-/// One module a plan generates: its one-segment name and its source.
-pub struct Generated {
-  pub name: Bytes,
-  pub source: Bytes,
+pub struct Resolved {
+  pub modules: List<Module>,
+  pub native: Native,
+  /// The declared dependencies the plan links though nothing imports them (`Plan.linkDependency`).
+  pub dependencies: List<String>,
 }
 
-/// One tool step: a program of the package run in the build tool sandbox (driver/ToolStep).
-pub struct Tool {
-  pub name: Bytes,
-  pub program: Bytes,
-  pub arguments: List<Bytes>,
-  pub inputs: List<Bytes>,
-  pub outputs: List<Bytes>,
-}
+impl Schema for Resolved {}
 
-/// A module served from a tool step's output: its name, the step and the output's path.
-pub struct ToolModule {
-  pub name: Bytes,
-  pub step: Bytes,
-  pub output: Bytes,
-}
-
-/// A read plan: its modules, its `[native]` entries as the text of a TOML document, and its tool
-/// steps with the modules they produce.
-pub struct Plan {
-  pub modules: List<Generated>,
-  pub native: Bytes,
-  pub entries: usize,
-  pub tools: List<Tool>,
-  pub toolModules: List<ToolModule>,
-}
-
-/// The name of the constant a `build.silk` declares.
 pub fn constantName() -> &'static [u8] {
   return b"PLAN"
 }
 
-fn same(left: &[u8], right: &[u8]) -> bool {
-  if left.length != right.length { return false }
-  let mut at = usize.ZERO
-  while at < left.length {
-    if left[at] != right[at] { return false }
-    at = at + usize.ONE
+pub effect fn read(data: &Interned<Value>) -> Plan
+  ! InvalidStaticData | OutOfMemoryError
+  ? &mut Allocator {
+  return run StaticDecodes.read<Plan>(data)
+}
+
+// Metadata is separate from deferred paths so the collector's key includes both exact values
+// and the content of every resolved input. Path indices preserve declaration order.
+struct Requirement {
+  pub kind: String,
+  pub value: String,
+  pub mode: String,
+  pub weak: bool,
+  pub needed: bool,
+  pub path: Option<usize>,
+  pub flags: List<String>,
+  pub include: List<usize>,
+  pub pattern: Option<String>,
+}
+
+impl Schema for Requirement {}
+
+struct Collector {
+  requirements: List<Requirement>,
+  paths: List<Deferred<Path>>,
+  trees: List<bool>,
+  // A pinned archive's path, keyed by its digest instead of its bytes: the archive is fetched when
+  // native code is compiled or linked, so a plan that only checks never needs it present.
+  pinned: List<Option<String>>
+}
+
+struct Authority {
+  archives: List<Archive>,
+  unsandboxed: bool,
+  tools: bool,
+  launcher: Option<Path>,
+  supplied: List<String>
+}
+
+effect fn input(value: &Input, authority: &Authority) -> Deferred<Path>
+  ! StepFailure
+  ? &mut Allocator {
+  return match &value.* {
+    Input.Source { path } => run Deferred<Path>.source(path.view())
+    Input.Supplied { path } => {
+      let canonical = run hostPath(path.view())
+      let mut allowed = false
+      let supplied = authority.supplied.asSlice()
+      let mut at: usize = 0
+      while at < supplied.length {
+        if contained(String.ownedUtf8Bytes(&supplied[at]), String.ownedUtf8Bytes(&canonical)) {
+          allowed = true
+        }
+        at = at + 1
+      }
+      if !allowed {
+        fail StepError {
+          message: run String.copy(
+            "a plan may only read host paths explicitly supplied by its root command",
+          ),
+        }
+      }
+      run Deferred<Path>.external(canonical.view())
+    }
+    Input.Archive { name, path } => {
+      let listed = authority.archives.asSlice()
+      let mut at: usize = 0
+      while at < listed.length {
+        let archive = &listed[at]
+        if name.view() == (run RequestText.copy(archive.name.asSlice())).view() {
+          if archive.refusal.length() > 0 {
+            fail StepError { message: run RequestText.copy(archive.refusal.asSlice()) }
+          }
+          if path.view() != "" && !archiveRelative(path.view()) {
+            fail StepError {
+              message: run String.copy("an archive input must stay below its pinned archive root"),
+            }
+          }
+          let selected = if path.view() == "" {
+            run Path.fromBytes(Path.rawBytes(&archive.directory))
+          } else {
+            run Path.join(&archive.directory, path.view())
+          }
+          return run Deferred<Path>.external(
+            (run RequestText.copy(Path.rawBytes(&selected))).view(),
+          )
+        }
+        at = at + 1
+      }
+      fail StepError {
+        message: run String.copy("the package declares no native archive with this name"),
+      }
+    }
+    Input.Output { step, name } => {
+      let producer = run action(&Box<Action>.get(&step)[0], authority)
+      run producer.output(name.view())
+    }
+  }
+}
+
+effect fn ensureInput(value: &Input, authority: &Authority) -> ()
+  ! StepFailure
+  ? &mut Allocator | &mut FileSystem | &mut HostInput {
+  match &value.* {
+    Input.Archive { name, path } => {
+      let listed = authority.archives.asSlice()
+      let mut at: usize = 0
+      while at < listed.length {
+        let pin = &listed[at]
+        if name.view() == (run RequestText.copy(pin.name.asSlice())).view() {
+          if pin.url.length() > 0 {
+            if let Option<Bytes>.Some { value: failure } = move run NativeArchives.ensureOne(
+              pin.name.asSlice(),
+              pin.url.asSlice(),
+              pin.sha256.asSlice(),
+              &pin.directory,
+              pin.strip,
+            ) {
+              fail StepError { message: run RequestText.copy(failure.asSlice()) }
+            }
+          }
+          let root = run hostPath((run RequestText.copy(Path.rawBytes(&pin.directory))).view())
+          let selected = if path.view() == "" {
+            run Path.fromBytes(Path.rawBytes(&pin.directory))
+          } else {
+            run Path.join(&pin.directory, path.view())
+          }
+          let canonical = run hostPath((run RequestText.copy(Path.rawBytes(&selected))).view())
+          if !contained(String.ownedUtf8Bytes(&root), String.ownedUtf8Bytes(&canonical)) {
+            fail StepError {
+              message: run String.copy("an archive input resolves outside its pinned archive root"),
+            }
+          }
+        }
+        at = at + 1
+      }
+    }
+    Input.Output { step, .. } => {
+      if let Action.Run { invocation } = &Box<Action>.get(&step)[0] {
+        run ensureInput(&invocation.program, authority)
+        run ensureArguments(&invocation.arguments, authority)
+      }
+    }
+    _ => {}
+  }
+}
+
+effect fn ensureArguments(chain: &Option<Box<Chain<Argument>>>, authority: &Authority) -> ()
+  ! StepFailure
+  ? &mut Allocator | &mut FileSystem | &mut HostInput {
+  if let Option<Box<Chain<Argument>>>.Some { value } = &chain.* {
+    let node = &Box<Chain<Argument>>.get(&value)[0]
+    run ensureArguments(&node.previous, authority)
+    match &node.value {
+      Argument.Input { path } => run ensureInput(&path, authority)
+      Argument.File { path } => run ensureInput(&path, authority)
+      Argument.Tree { path } => run ensureInput(&path, authority)
+      _ => {}
+    }
+  }
+}
+
+effect fn ensureIncludes(chain: &Option<Box<Chain<Input>>>, authority: &Authority) -> ()
+  ! StepFailure
+  ? &mut Allocator | &mut FileSystem | &mut HostInput {
+  if let Option<Box<Chain<Input>>>.Some { value } = &chain.* {
+    let node = &Box<Chain<Input>>.get(&value)[0]
+    run ensureIncludes(&node.previous, authority)
+    run ensureNativeInput(&node.value, authority)
+  }
+}
+
+// An archive that native code reads directly is fetched when that code is compiled or linked
+// (`NativeArchives.ensure`), so a check, which compiles none, never needs it. A step's output is
+// different: the plan runs the step now, so the archives the step reads are fetched now.
+effect fn ensureNativeInput(value: &Input, authority: &Authority) -> ()
+  ! StepFailure
+  ? &mut Allocator | &mut FileSystem | &mut HostInput {
+  if let Input.Archive { .. } = &value.* {
+    return
+  }
+  run ensureInput(value, authority)
+}
+
+effect fn ensureArchives(chain: &Option<Box<Chain<Operation>>>, authority: &Authority) -> ()
+  ! StepFailure
+  ? &mut Allocator | &mut FileSystem | &mut HostInput {
+  if let Option<Box<Chain<Operation>>>.Some { value } = &chain.* {
+    let node = &Box<Chain<Operation>>.get(&value)[0]
+    run ensureArchives(&node.previous, authority)
+    match &node.value {
+      Operation.Module { source, .. } => run ensureInput(&source, authority)
+      Operation.Compile { source, include, pattern, .. } => {
+        // A pattern lists the archive's files now, so that archive must be present now.
+        if let Option<String>.Some { .. } = &pattern {
+          run ensureInput(&source, authority)
+        } else {
+          run ensureNativeInput(&source, authority)
+        }
+        run ensureIncludes(&include, authority)
+      }
+      Operation.Include { path } => run ensureNativeInput(&path, authority)
+      Operation.LinkFile { path, .. } => run ensureNativeInput(&path, authority)
+      Operation.FunctionOrder { path } => run ensureNativeInput(&path, authority)
+      _ => {}
+    }
+  }
+}
+
+fn archiveRelative(path: string) -> bool {
+  let bytes = String.utf8Bytes(path)
+  let mut start: usize = 0
+  let mut at: usize = 0
+  while at <= bytes.length {
+    if at == bytes.length || bytes[at] == 47 {
+      let length = at - start
+      if length == 0 || (length == 1 && bytes[start] == 46)
+        || (length == 2 && bytes[start] == 46 && bytes[start + 1] == 46) {
+        return false
+      }
+      start = at + 1
+    } else if bytes[at] == 0 || bytes[at] == 92 || bytes[at] == 58 {
+      return false
+    }
+    at = at + 1
   }
   return true
 }
 
-fn startsWith(text: &[u8], prefix: &[u8]) -> bool {
-  return text.length >= prefix.length && same(Slice.view<u8>(text, usize.ZERO, prefix.length), prefix)
-}
-
-// The position of the first space in `text`, or its length.
-fn spaceIn(text: &[u8]) -> usize {
-  let mut at = usize.ZERO
-  while at < text.length && text[at] != 32 { at = at + usize.ONE }
-  return at
-}
-
-// The end of the line that starts at `at`: the position of its line break, or the text's end.
-fn lineEnd(text: &[u8], at: usize) -> usize {
-  let mut end = at
-  while end < text.length && text[end] != 10 { end = end + usize.ONE }
-  return end
-}
-
-/// Whether `name` is one module path segment: a letter or `_`, then letters, digits and `_`.
-pub fn moduleName(name: &[u8]) -> bool {
-  if name.length == usize.ZERO { return false }
-  let mut at = usize.ZERO
-  while at < name.length {
-    let byte = name[at]
-    let letter = (byte >= 97 && byte <= 122) || (byte >= 65 && byte <= 90) || byte == 95
-    let digit = byte >= 48 && byte <= 57
-    if !letter && !(digit && at > usize.ZERO) { return false }
-    at = at + usize.ONE
+fn contained(root: &[u8], path: &[u8]) -> bool {
+  if path.length < root.length {
+    return false
   }
-  return true
+  let mut at: usize = 0
+  while at < root.length {
+    if root[at] != path[at] {
+      return false
+    }
+    at = at + 1
+  }
+  return path.length == root.length || root.length == 1 || path[root.length] == 47
 }
 
-/// Reads plan `text`; none when it is not text that `silk.build.plan` writes.
-pub effect fn read(text: &[u8]) -> Option<Plan> ! OutOfMemoryError ? &mut Allocator {
-  let header = b"silk-plan 1\n"
-  if !startsWith(text, header) { return Option<Plan>.none() }
-  let mut modules = List<Generated>.make()
-  let mut links = Bytes.make()
-  let mut sources = Bytes.make()
-  let mut entries = usize.ZERO
-  let mut tools = List<Tool>.make()
-  let mut toolModules = List<ToolModule>.make()
-  let mut at = header.length
-  while at < text.length {
-    let end = lineEnd(text, at)
-    let line = Slice.view<u8>(text, at, end - at)
-    if startsWith(line, b"module ") {
-      let rest = Slice.view<u8>(line, usize.add(0, 7), line.length - usize.add(0, 7))
-      let mut space = usize.ZERO
-      while space < rest.length && rest[space] != 32 { space = space + usize.ONE }
-      if space == rest.length { return Option<Plan>.none() }
-      let name = Slice.view<u8>(rest, usize.ZERO, space)
-      let digits = Slice.view<u8>(rest, space + usize.ONE, rest.length - space - usize.ONE)
-      if digits.length == usize.ZERO || !moduleName(name) { return Option<Plan>.none() }
-      let mut length = usize.ZERO
-      let mut digit = usize.ZERO
-      while digit < digits.length {
-        if digits[digit] < 48 || digits[digit] > 57 { return Option<Plan>.none() }
-        length = length * usize.add(0, 10) + u8.toUsize(digits[digit] - 48)
-        digit = digit + usize.ONE
-      }
-      let start = end + usize.ONE
-      if start > text.length || length > text.length - start || start + length >= text.length || text[start + length] != 10 {
-        return Option<Plan>.none()
-      }
-      run List<Generated>.append(&mut modules, Generated {
-        name: run Bytes.copy(name),
-        source: run Bytes.copy(Slice.view<u8>(text, start, length)),
-      })
-      at = start + length + usize.ONE
-      continue
+effect fn hostPath(value: string) -> String
+  ! StepFailure
+  ? &mut Allocator {
+  let absolute = run Path.make(value)
+  let canonical = run HostPath.canonicalBytes(Path.rawBytes(&absolute))
+  return match move canonical {
+    Option<Bytes>.Some { value: bytes } => run RequestText.copy(bytes.asSlice())
+    Option<Bytes>.None => {
+      fail StepError { message: run String.copy("a supplied package path does not exist") }
     }
-    if startsWith(line, b"tool ") {
-      let rest = Slice.view<u8>(line, usize.add(0, 5), line.length - usize.add(0, 5))
-      let space = spaceIn(rest)
-      if space == rest.length || !moduleName(Slice.view<u8>(rest, usize.ZERO, space)) { return Option<Plan>.none() }
-      run List<Tool>.append(&mut tools, Tool {
-        name: run Bytes.copy(Slice.view<u8>(rest, usize.ZERO, space)),
-        program: run Bytes.copy(Slice.view<u8>(rest, space + usize.ONE, rest.length - space - usize.ONE)),
-        arguments: List<Bytes>.make(),
-        inputs: List<Bytes>.make(),
-        outputs: List<Bytes>.make(),
-      })
-      at = end + usize.ONE
-      continue
+  }
+}
+
+effect fn files(previous: &Option<Box<Chain<File>>>, current: WriteFiles) -> WriteFiles
+  ! StepFailure
+  ? &mut Allocator {
+  if let Option<Box<Chain<File>>>.Some { value } = &previous.* {
+    let node = &Box<Chain<File>>.get(&value)[0]
+    let earlier = run files(&node.previous, move current)
+    return run earlier.text(node.value.name.view(), node.value.content.view())
+  }
+  return move current
+}
+
+effect fn arguments(
+  previous: &Option<Box<Chain<Argument>>>,
+  current: Run,
+  authority: &Authority,
+) -> Run
+  ! StepFailure
+  ? &mut Allocator {
+  if let Option<Box<Chain<Argument>>>.Some { value } = &previous.* {
+    let node = &Box<Chain<Argument>>.get(&value)[0]
+    let earlier = run arguments(&node.previous, move current, authority)
+    return match &node.value {
+      Argument.Text { value: literal } => run earlier.argument(
+        run Deferred<String>.value(run String.copy(literal.view())),
+      )
+      Argument.Input { path } => run earlier.inputFile(run input(&path, authority))
+      Argument.Output { name } => run earlier.outputFile(name.view())
+      Argument.File { path } => run earlier.keyFile(run input(&path, authority))
+      Argument.Tree { path } => run earlier.keyTree(run input(&path, authority))
     }
-    if startsWith(line, b"argument ") || startsWith(line, b"input ") || startsWith(line, b"output ") {
-      let count = List<Tool>.length(&tools)
-      if count == usize.ZERO { return Option<Plan>.none() }
-      let space = spaceIn(line)
-      let value = run Bytes.copy(Slice.view<u8>(line, space + usize.ONE, line.length - space - usize.ONE))
-      let step = &mut List<Tool>.asMutSlice(&mut tools)[count - usize.ONE]
-      if startsWith(line, b"argument ") {
-        run List<Bytes>.append(&mut step.arguments, move value)
-      } else if startsWith(line, b"input ") {
-        run List<Bytes>.append(&mut step.inputs, move value)
+  }
+  return move current
+}
+
+effect fn action(value: &Action, authority: &Authority) -> StepHandle
+  ! StepFailure
+  ? &mut Allocator {
+  return match &value.* {
+    Action.WriteFiles { files: declared } => {
+      let step = run files(&declared, WriteFiles.make())
+      run step.registerHere()
+    }
+    Action.Run { invocation } => {
+      if !authority.tools {
+        fail StepError {
+          message: run String.copy("this dependency runs a package tool without permission; add `tools = true` to its entry under [dependencies] in the root package's silk.toml"),
+        }
+      }
+      let command = Run.artifact(run input(&invocation.program, authority))
+      let described = run arguments(&invocation.arguments, move command, authority)
+      if authority.unsandboxed {
+        return run described.registerHere()
+      }
+      let launcher = match &authority.launcher {
+        Option<Path>.Some { value: selected } => run RequestText.copy(Path.rawBytes(&selected))
+        Option<Path>.None => {
+          fail StepError {
+            message: run String.copy(
+              "package tools require a supported operating-system sandbox; run silk build --unsandboxed-tools to authorize this invocation",
+            ),
+          }
+        }
+      }
+      let confined = run described.confinedBy(run Deferred<Path>.external(launcher.view()))
+      run confined.registerHere()
+    }
+  }
+}
+
+effect fn addPath(
+  collector: &mut Collector,
+  value: &Input,
+  tree: bool,
+  authority: &Authority,
+) -> Option<usize>
+  ! StepFailure
+  ? &mut Allocator {
+  let index = collector.paths.length()
+  run collector.paths.append(run input(value, authority))
+  run collector.trees.append(tree)
+  run collector.pinned.append(run pinnedPath(value, authority))
+  return Option<usize>.some(index)
+}
+
+// The path of `value` when it names a file of a fetched archive, which its SHA-256 pins, or none.
+effect fn pinnedPath(value: &Input, authority: &Authority) -> Option<String>
+  ! StepFailure
+  ? &mut Allocator {
+  if let Input.Archive { name, path } = &value.* {
+    let listed = authority.archives.asSlice()
+    let mut at: usize = 0
+    while at < listed.length {
+      let archive = &listed[at]
+      if name.view() == (run RequestText.copy(archive.name.asSlice())).view()
+        && archive.url.length() > 0
+        && archive.refusal.length() == 0 {
+        let selected = if path.view() == "" {
+          run Path.fromBytes(Path.rawBytes(&archive.directory))
+        } else {
+          run Path.join(&archive.directory, path.view())
+        }
+        return Option<String>.some(run RequestText.copy(Path.rawBytes(&selected)))
+      }
+      at = at + 1
+    }
+  }
+  return Option<String>.none()
+}
+
+// Where collected path `index` is when the step runs.
+effect fn collectedPath(collector: &Collector, make: &Make, index: usize) -> Path
+  ! StepFailure
+  ? &mut Allocator {
+  if let Option<String>.Some { value } = &collector.pinned.asSlice()[index] {
+    return run Path.make(value.view())
+  }
+  return run make.path(&collector.paths.asSlice()[index])
+}
+
+effect fn collectIncludes(
+  chain: &Option<Box<Chain<Input>>>,
+  collector: &mut Collector,
+  authority: &Authority,
+  indices: &mut List<usize>,
+) -> ()
+  ! StepFailure
+  ? &mut Allocator {
+  if let Option<Box<Chain<Input>>>.Some { value } = &chain.* {
+    let node = &Box<Chain<Input>>.get(&value)[0]
+    run collectIncludes(&node.previous, &mut collector.*, authority, &mut indices.*)
+    if let Option<usize>.Some { value: index } = move run addPath(
+      &mut collector.*,
+      &node.value,
+      true,
+      authority,
+    ) {
+      run indices.append(index)
+    }
+  }
+}
+
+effect fn collect(
+  previous: &Option<Box<Chain<Operation>>>,
+  collector: &mut Collector,
+  authority: &Authority,
+) -> ()
+  ! StepFailure
+  ? &mut Allocator {
+  if let Option<Box<Chain<Operation>>>.Some { value } = &previous.* {
+    let node = &Box<Chain<Operation>>.get(&value)[0]
+    run collect(&node.previous, &mut collector.*, authority)
+    let mut requirement = Requirement {
+      kind: String.make(),
+      value: String.make(),
+      mode: String.make(),
+      weak: false,
+      needed: false,
+      path: Option<usize>.none(),
+      flags: List<String>.make(),
+      include: List<usize>.make(),
+      pattern: Option<String>.none(),
+    }
+    match &node.value {
+      Operation.Module { name, source } => {
+        requirement.kind = run String.copy("module")
+        requirement.value = run String.copy(name.view())
+        requirement.path = run addPath(&mut collector.*, &source, false, authority)
+      }
+      Operation.Compile { language, source, flags, include, pattern } => {
+        if let Option<String>.Some { value: glob } = &pattern {
+          requirement.pattern = Option<String>.some(run String.copy(glob.view()))
+        }
+        requirement.flags = run copyTexts(flags.asSlice())
+        run collectIncludes(&include, &mut collector.*, authority, &mut requirement.include)
+        requirement.kind = run String.copy("compile")
+        requirement.value = run String.copy(language.view())
+        requirement.path = run addPath(&mut collector.*, &source, pattern.isSome(), authority)
+        if pattern.isSome() {
+          // A pattern lists the tree's files, so the step reads the archive itself.
+          let last = collector.pinned.length() - 1
+          collector.pinned.set(last, Option<String>.none())
+        }
+      }
+      Operation.Flag { value: flag } => {
+        requirement.kind = run String.copy("flag")
+        requirement.value = run String.copy(flag.view())
+      }
+      Operation.Include { path } => {
+        requirement.kind = run String.copy("include")
+        requirement.path = run addPath(&mut collector.*, &path, true, authority)
+      }
+      Operation.LinkFile { kind, path } => {
+        requirement.kind = run String.copy(kind.view())
+        requirement.path = run addPath(
+          &mut collector.*,
+          &path,
+          kind.view() == "search-path" || kind.view() == "framework-search-path",
+          authority,
+        )
+      }
+      Operation.Link { kind, name, mode, weak, needed } => {
+        requirement.kind = run String.copy(kind.view())
+        requirement.value = run String.copy(name.view())
+        requirement.mode = run String.copy(mode.view())
+        requirement.weak = weak
+        requirement.needed = needed
+      }
+      Operation.RPath { value: search } => {
+        requirement.kind = run String.copy("rpath")
+        requirement.value = run String.copy(search.view())
+      }
+      Operation.FunctionOrder { path } => {
+        requirement.kind = run String.copy("function-order")
+        requirement.path = run addPath(&mut collector.*, &path, false, authority)
+      }
+      Operation.LinkDependency { name } => {
+        requirement.kind = run String.copy("dependency")
+        requirement.value = run String.copy(name.view())
+      }
+    }
+    run collector.requirements.append(move requirement)
+  }
+}
+
+effect fn copyTexts(values: &[String]) -> List<String>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut result = List<String>.make()
+  let mut at: usize = 0
+  while at < values.length {
+    run result.append(run String.copy(values[at].view()))
+    at = at + 1
+  }
+  return move result
+}
+
+impl Step for Collector {
+  effect fn key(self: &Self, key: &mut Key) -> ()
+    ! StepFailure
+    ? &mut Allocator {
+    let metadata = run Deferred<List<Requirement>>.value(
+      run copyRequirements(self.requirements.asSlice()),
+    )
+    run key.value(&metadata)
+    let paths = self.paths.asSlice()
+    let trees = self.trees.asSlice()
+    let mut at: usize = 0
+    let pinned = self.pinned.asSlice()
+    while at < paths.length {
+      if let Option<String>.Some { value } = &pinned[at] {
+        // The store directory is named by the archive's SHA-256, so the path pins its bytes.
+        run key.text(value.view())
+      } else if trees[at] {
+        run key.packageTree(&paths[at])
       } else {
-        run List<Bytes>.append(&mut step.outputs, move value)
+        run key.file(&paths[at])
       }
-      at = end + usize.ONE
-      continue
+      at = at + 1
     }
-    if startsWith(line, b"tool-module ") {
-      let rest = Slice.view<u8>(line, usize.add(0, 12), line.length - usize.add(0, 12))
-      let first = spaceIn(rest)
-      if first == rest.length { return Option<Plan>.none() }
-      let after = Slice.view<u8>(rest, first + usize.ONE, rest.length - first - usize.ONE)
-      let second = spaceIn(after)
-      if second == after.length { return Option<Plan>.none() }
-      run List<ToolModule>.append(&mut toolModules, ToolModule {
-        name: run Bytes.copy(Slice.view<u8>(rest, usize.ZERO, first)),
-        step: run Bytes.copy(Slice.view<u8>(after, usize.ZERO, second)),
-        output: run Bytes.copy(Slice.view<u8>(after, second + usize.ONE, after.length - second - usize.ONE)),
-      })
-      at = end + usize.ONE
-      continue
+  }
+
+  effect fn make(self: &Self, make: &mut Make) -> ()
+    ! StepFailure
+    ? &mut Allocator {
+    let requirements = self.requirements.asSlice()
+    let paths = self.paths.asSlice()
+    let mut flags = List<String>.make()
+    let mut includes = List<String>.make()
+    let mut at: usize = 0
+    while at < requirements.length {
+      let item = &requirements[at]
+      if item.kind.view() == "flag" {
+        run flags.append(run String.copy(item.value.view()))
+      }
+      if item.kind.view() == "include" {
+        if let Option<usize>.Some { value } = &item.path {
+          let resolved = run collectedPath(self, &make.*, value)
+          run includes.append(run RequestText.copy(Path.rawBytes(&resolved)))
+        }
+      }
+      at = at + 1
     }
-    if startsWith(line, b"link { ") {
-      run Bytes.append(&mut links, b"  ")
-      run Bytes.append(&mut links, Slice.view<u8>(line, usize.add(0, 5), line.length - usize.add(0, 5)))
-      run Bytes.append(&mut links, b",\n")
-      entries = entries + usize.ONE
-    } else if startsWith(line, b"sources { ") {
-      run Bytes.append(&mut sources, b"  ")
-      run Bytes.append(&mut sources, Slice.view<u8>(line, usize.add(0, 8), line.length - usize.add(0, 8)))
-      run Bytes.append(&mut sources, b",\n")
-      entries = entries + usize.ONE
-    } else {
-      return Option<Plan>.none()
+    let mut result = Resolved {
+      modules: List<Module>.make(),
+      native: Native {
+        sources: List<NativeSource>.make(),
+        link: List<LinkInput>.make(),
+        functionOrder: Option<String>.none(),
+      },
+      dependencies: List<String>.make(),
     }
-    at = end + usize.ONE
+    at = 0
+    while at < requirements.length {
+      let item = &requirements[at]
+      let mut resolved = run String.copy(item.value.view())
+      let mut producer = Option<String>.none()
+      if let Option<usize>.Some { value } = &item.path {
+        let index = value
+        let path = run collectedPath(self, &make.*, index)
+        resolved = run RequestText.copy(Path.rawBytes(&path))
+        if let Option<String>.None = &self.pinned.asSlice()[index] {
+          producer = run make.producer(&paths[value])
+        }
+      }
+      let kind = item.kind.view()
+      if kind == "module" {
+        run result.modules.append(
+          Module {
+            name: run String.copy(item.value.view()),
+            source: move resolved,
+            producer: move producer,
+          },
+        )
+      } else if kind == "compile" {
+        let mut selectedFlags = run copyTexts(flags.asSlice())
+        let local = item.flags.asSlice()
+        let mut flag: usize = 0
+        while flag < local.length {
+          run selectedFlags.append(run String.copy(local[flag].view()))
+          flag = flag + 1
+        }
+        let mut selectedIncludes = run copyTexts(includes.asSlice())
+        let directories = item.include.asSlice()
+        let mut directory: usize = 0
+        while directory < directories.length {
+          run selectedIncludes.append(
+            run RequestText.copy(
+              Path.rawBytes(&run collectedPath(self, &make.*, directories[directory])),
+            ),
+          )
+          directory = directory + 1
+        }
+        if let Option<String>.Some { value: glob } = &item.pattern {
+          if let Option<usize>.Some { value: index } = &item.path {
+            let files = run make.glob(&paths[index], glob.view())
+            let listed = files.asSlice()
+            if listed.length == 0 {
+              fail StepError {
+                message: run String.copy("a native source pattern matched no files"),
+              }
+            }
+            let mut file: usize = 0
+            while file < listed.length {
+              run result.native.sources.append(
+                NativeSource {
+                  path: run RequestText.copy(Path.rawBytes(&listed[file])),
+                  language: run String.copy(item.value.view()),
+                  flags: run copyTexts(selectedFlags.asSlice()),
+                  include: run copyTexts(selectedIncludes.asSlice()),
+                },
+              )
+              file = file + 1
+            }
+          }
+        } else {
+          run result.native.sources.append(
+            NativeSource {
+              path: move resolved,
+              language: run String.copy(item.value.view()),
+              flags: move selectedFlags,
+              include: move selectedIncludes,
+            },
+          )
+        }
+      } else if kind == "function-order" {
+        if result.native.functionOrder.isSome() {
+          fail StepError {
+            message: run String.copy("a package plan declares more than one function-order file"),
+          }
+        }
+        result.native.functionOrder = Option<String>.some(move resolved)
+      } else if kind == "dependency" {
+        run result.dependencies.append(move resolved)
+      } else if kind != "flag" && kind != "include" {
+        let mode = if item.mode.view() == "" {
+          Option<String>.none()
+        } else {
+          Option<String>.some(run String.copy(item.mode.view()))
+        }
+        run result.native.link.append(
+          LinkInput {
+            kind: run String.copy(kind),
+            value: move resolved,
+            mode: move mode,
+            weak: item.weak,
+            needed: item.needed,
+          },
+        )
+      }
+      at = at + 1
+    }
+    return run make.value<Resolved>(&result)
   }
-  let mut native = run Bytes.copy(b"[native]\n")
-  if Bytes.length(&links) > usize.ZERO {
-    run Bytes.append(&mut native, b"link = [\n")
-    run Bytes.append(&mut native, Bytes.asSlice(&links))
-    run Bytes.append(&mut native, b"]\n")
+}
+
+effect fn copyRequirements(values: &[Requirement]) -> List<Requirement>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut result = List<Requirement>.make()
+  let mut at: usize = 0
+  while at < values.length {
+    let item = &values[at]
+    let mut includes = List<usize>.make()
+    let paths = item.include.asSlice()
+    let mut path: usize = 0
+    while path < paths.length {
+      run includes.append(paths[path])
+      path = path + 1
+    }
+    let mut pattern = Option<String>.none()
+    if let Option<String>.Some { value } = &item.pattern {
+      pattern = Option<String>.some(run String.copy(value.view()))
+    }
+    run result.append(
+      Requirement {
+        kind: run String.copy(item.kind.view()),
+        value: run String.copy(item.value.view()),
+        mode: run String.copy(item.mode.view()),
+        weak: item.weak,
+        needed: item.needed,
+        path: item.path,
+        flags: run copyTexts(item.flags.asSlice()),
+        include: move includes,
+        pattern: move pattern,
+      },
+    )
+    at = at + 1
   }
-  if Bytes.length(&sources) > usize.ZERO {
-    run Bytes.append(&mut native, b"sources = [\n")
-    run Bytes.append(&mut native, Bytes.asSlice(&sources))
-    run Bytes.append(&mut native, b"]\n")
+  return move result
+}
+
+// Static plans have no ambient argument/environment access. The graph only receives declared data.
+struct PlanHost {
+  directory: Bytes
+}
+
+impl HostInput for PlanHost {
+  effect fn argumentCount(self: &mut Self) -> usize
+    ! HostInputError {
+    return 0
   }
-  return Option<Plan>.some(Plan {
-    modules: move modules,
-    native: move native,
-    entries: entries,
-    tools: move tools,
-    toolModules: move toolModules,
-  })
+
+  effect fn argument(self: &mut Self, index: usize) -> Option<Bytes>
+    ! HostInputError | OutOfMemoryError
+    ? &mut Allocator {
+    return Option<Bytes>.none()
+  }
+
+  effect fn variable(self: &mut Self, name: &[u8]) -> Option<Bytes>
+    ! HostInputError | OutOfMemoryError
+    ? &mut Allocator {
+    return Option<Bytes>.none()
+  }
+
+  effect fn variableNames(self: &mut Self) -> List<Bytes>
+    ! HostInputError | OutOfMemoryError
+    ? &mut Allocator {
+    return List<Bytes>.make()
+  }
+
+  effect fn workingDirectory(self: &mut Self) -> Bytes
+    ! HostInputError | OutOfMemoryError
+    ? &mut Allocator {
+    return run Bytes.copy(self.directory.asSlice())
+  }
+}
+
+pub effect fn execute(
+  plan: &Plan,
+  directory: &Path,
+  cache: &Path,
+  tools: bool,
+  supplied: List<String>,
+  unsandboxed: bool,
+  archives: &[Archive],
+) -> Resolved
+  ! StepFailure | SpawnError | Cancelled
+  ? &mut Allocator | &mut FileSystem | &mut HostInput {
+  let launcher = if Sandbox.supported() {
+    run Sandbox.launcher()
+  } else {
+    Option<Path>.none()
+  }
+  let mut grants = List<String>.make()
+  let suppliedPaths = supplied.asSlice()
+  let mut grant: usize = 0
+  while grant < suppliedPaths.length {
+    run grants.append(run hostPath(suppliedPaths[grant].view()))
+    grant = grant + 1
+  }
+  let mut pins = List<Archive>.make()
+  let mut pin: usize = 0
+  while pin < archives.length {
+    run pins.append(run NativeLinkInputs.copyArchive(&archives[pin]))
+    pin = pin + 1
+  }
+  let authority = Authority {
+    archives: move pins,
+    unsandboxed: unsandboxed,
+    tools: tools,
+    launcher: move launcher,
+    supplied: move grants,
+  }
+  let mut collector = Collector {
+    requirements: List<Requirement>.make(),
+    paths: List<Deferred<Path>>.make(),
+    trees: List<bool>.make(),
+    pinned: List<Option<String>>.make(),
+  }
+  run collect(&plan.steps, &mut collector, &authority)
+
+  // Archive paths can also occur in producer inputs, so inspect the immutable description.
+  run ensureArchives(&plan.steps, &authority)
+  let handle = run Step.register(move collector)
+  let executable = match move run silkExecutable() {
+    Option<Path>.Some { value } => move value
+    Option<Path>.None => {
+      fail StepError {
+        message: run String.copy("cannot identify the compiler executing the package plan"),
+      }
+    }
+  }
+  let mut hash = Sha256.make()
+  run Fingerprint.path(&mut hash, &executable, false)
+  let identity = hash.finish()
+  let runner = run Runner.make(
+    run Path.fromBytes(Path.rawBytes(directory)),
+    run Path.fromBytes(Path.rawBytes(cache)),
+    &identity,
+  )
+  let mut host = PlanHost { directory: run Bytes.copy(Path.rawBytes(directory)) }
+  let targets = [move handle]
+  let outputs = run runner.execute(&targets, true) |> Effect.provideMut<HostInput>(&mut host)
+  let file = run Path.join(&outputs.outputs.asSlice()[0], ".value.json")
+  let bytes = run FileSystem.readFile(&file)
+  return run Encoding.read<Resolved>(bytes.asSlice())
+}
+
+effect fn silkExecutable() -> Option<Path>
+  ! FileError | OutOfMemoryError
+  ? &mut Allocator | &mut FileSystem {
+  return match move run CacheStamp.executablePath() {
+    Option<Bytes>.Some { value } => Option<Path>.some(run Path.fromBytes(value.asSlice()))
+    Option<Bytes>.None => Option<Path>.none()
+  }
 }

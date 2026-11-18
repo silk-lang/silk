@@ -20,11 +20,12 @@ output=$(cd "$7" && pwd)
 root=$(cd "$(dirname "$0")/../.." && pwd)
 suffix=
 if [ "$target" = x86_64-pc-windows-msvc ]; then suffix=.exe; fi
-args=(--target "$target" --stdlib ../stdlib --optimization speed --debug false)
+builder=$root/compiler/scripts/CompilationBuild.ts
+args=(--target "$target" --stdlib "$snapshot/stdlib" --optimization speed --debug false)
 sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
 
-(cd "$snapshot/compiler" && env -u SDKROOT "$top/bin/silkc$suffix" build src/main.silk -o "$output/compiler.ll" \
-  --emit llvm-ir "${args[@]}")
+env -u SDKROOT node "$builder" --compiler "$top/bin/silkc$suffix" --manifest "$snapshot/compiler/silk.toml" \
+  --output "$output/compiler.ll" --emit llvm-ir "${args[@]}"
 status=0
 producerIr=$(cat "$cross/$target/compiler.ll.sha256")
 outputIr=$(sha "$output/compiler.ll")
@@ -33,8 +34,8 @@ if [ "$producerIr" != "$outputIr" ]; then
   status=1
 fi
 if [ "${8:-}" = tool ]; then
-  (cd "$snapshot/tool" && env -u SDKROOT SILK_CLANG="${SILK_CLANG:?the tool rebuild needs SILK_CLANG}" \
-    "$top/bin/silkc$suffix" build src/main.silk -o "$output/silk$suffix" "${args[@]}")
+  env -u SDKROOT SILK_CLANG="${SILK_CLANG:?the tool rebuild needs SILK_CLANG}" node "$builder" \
+    --compiler "$top/bin/silkc$suffix" --manifest "$snapshot/tool/silk.toml" --output "$output/silk$suffix" "${args[@]}"
   rm -rf "$output"/*.units "$output"/*.symbols
   if ! cmp "$output/silk$suffix" "$top/bin/silk$suffix"; then
     echo "::error title=Tool rebuild differs::$target did not rebuild the archive's silk tool byte for byte"

@@ -1,0 +1,296 @@
+//! Loop idioms of one SSA function: a loop that sets or copies one byte each time round becomes
+//! one fill or copy of all its bytes, as LLVM's loop idiom recognition turns such a loop into
+//! `memset` or `memmove`.
+//!
+//! # When to use
+//! Run [`recognize`] in an optimized build once the scalar passes have folded the loop's checks,
+//! and before loops are unrolled, then run the scalar passes again on what it changed. A fill or
+//! a copy of a count known only when it runs is one wasm instruction that the engine runs over
+//! whole words, where the loop ran a dozen instructions for each byte.
+//!
+//! # Details
+//! The loop is a header and one body block. The header takes one parameter, a counter as wide as
+//! an address, holds one comparison of it with a bound, and branches to the body or out. The body
+//! steps the counter by one, writes one byte at an address the counter indexes, and jumps back.
+//! Nothing the loop computes is read after it. Two shapes are known:
+//!
+//! - counting up: `while at < bound { ...[at]...; at = at + 1 }`, over the bytes from the
+//!   counter's first value up to the bound;
+//! - counting down: `while at > 0 { at = at - 1; ...[at]... }`, over the bytes below the
+//!   counter's first value.
+//!
+//! A body that stores one byte computed outside the loop is a fill. The edge into the loop goes
+//! to a new block that fills the whole range (`Operation.FillCounted`) and jumps where the loop
+//! left to, so the loop is no longer reached.
+//!
+//! A body that stores the byte it loads at the same index of a second address is a copy. A loop
+//! that counts up reads each byte before it writes any later one, which is what one copy does
+//! unless the destination starts inside the source's range above its start; one that counts down
+//! is the same with the two swapped. The new block checks that when it runs, by one unsigned
+//! comparison of the distance between the two addresses with the count: where the ranges allow it
+//! one copy (`Operation.CopyCounted`) runs, and the loop is kept for the rest.
+//!
+//! A fill or copy checks its whole range before it writes, where the loop wrote up to the first
+//! byte out of bounds and then trapped; either way the program traps.
+
+import backend.SsaFunction {
+  Binary,
+  Cast,
+  Definition,
+  Edge,
+  Exit,
+  Extreme,
+  Kind,
+  Operation,
+  Predicate,
+  SsaFunction,
+  none,
+}
+import backend.SsaGraph {SsaGraph}
+import silk.collections.list {List}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.u64
+import silk.num.usize
+
+/// Turns each byte fill loop of `function` into one fill, and puts one copy before each byte copy
+/// loop for the ranges it can copy at once; answers whether it changed anything.
+pub effect fn recognize(function: &mut SsaFunction) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut graph = run SsaGraph.of(&function.*)
+  // The blocks a rewrite adds hold no loop.
+  let blocks = function.blockCount()
+  let mut changed = false
+  let mut header = usize.ZERO
+  while header < blocks {
+    if graph.reaches(header) && run rewrite(&mut function.*, &graph, header) {
+      changed = true
+      graph = run SsaGraph.of(&function.*)
+    }
+    header = header + usize.ONE
+  }
+  if changed { drop run function.compact() }
+  return changed
+}
+
+// Whether `value` is defined in block `header` or `body`.
+fn within(function: &SsaFunction, value: u64, header: usize, body: usize) -> bool {
+  if value == none() { return false }
+  let found = function.value(value)
+  if found.definition == Definition.Parameter { return found.owner == header || found.owner == body }
+  if found.definition == Definition.Result {
+    let block = function.instruction(found.owner).block
+    return block == header || block == body
+  }
+  return false
+}
+
+// Whether `value` is the integer constant `bits`.
+fn isConstant(function: &SsaFunction, value: u64, bits: u64) -> bool {
+  if value == none() || !function.isBits(value) || !function.kindOf(value).isInteger() { return false }
+  let constant = function.constantOf(value)
+  return constant.low == bits && constant.high == 0
+}
+
+// Whether a block other than `header` and `body` reads a value one of the two defines.
+fn readAfter(function: &SsaFunction, header: usize, body: usize) -> bool {
+  let blocks = function.blockCount()
+  let mut block = usize.ZERO
+  while block < blocks {
+    if block != header && block != body {
+      let found = function.block(block)
+      let listed = List<usize>.asSlice(&found.instructions)
+      let mut at = usize.ZERO
+      while at < listed.length {
+        let operands = function.operandsOf(listed[at])
+        let mut operand = usize.ZERO
+        while operand < operands.length {
+          if within(function, operands[operand], header, body) { return true }
+          operand = operand + usize.ONE
+        }
+        at = at + usize.ONE
+      }
+      if within(function, found.value, header, body) { return true }
+      let edges = List<Edge>.asSlice(&found.edges)
+      let mut edge = usize.ZERO
+      while edge < edges.length {
+        let arguments = List<u64>.asSlice(&edges[edge].arguments)
+        let mut argument = usize.ZERO
+        while argument < arguments.length {
+          if within(function, arguments[argument], header, body) { return true }
+          argument = argument + usize.ONE
+        }
+        edge = edge + usize.ONE
+      }
+    }
+    block = block + usize.ONE
+  }
+  return false
+}
+
+// Rewrites the loop at `header` when it is a byte fill or a byte copy; answers whether it did.
+effect fn rewrite(function: &mut SsaFunction, graph: &SsaGraph, header: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let word = Kind.integer(function.addressBits)
+  let byte = Kind.integer(8)
+  // The header: one counter, one comparison, a branch into the body or out.
+  let head = function.block(header)
+  if head.exit != Exit.Branch || List<u64>.length(&head.parameters) != usize.ONE || List<usize>.length(&head.instructions) != usize.ONE { return false }
+  let counter = List<u64>.get(&head.parameters, usize.ZERO)
+  if !function.kindOf(counter).equals(word) { return false }
+  let body = List<Edge>.asSlice(&head.edges)[usize.ZERO].block
+  let after = List<Edge>.asSlice(&head.edges)[usize.ONE].block
+  if body == header || after == header || body == after { return false }
+  if List<u64>.length(&List<Edge>.asSlice(&head.edges)[usize.ZERO].arguments) != usize.ZERO { return false }
+  let mut leaving = List<u64>.make()
+  run List<u64>.appendSlice(&mut leaving, List<u64>.asSlice(&List<Edge>.asSlice(&head.edges)[usize.ONE].arguments))
+  let mut at = usize.ZERO
+  while at < List<u64>.length(&leaving) {
+    if within(&function.*, List<u64>.get(&leaving, at), header, body) { return false }
+    at = at + usize.ONE
+  }
+  let test = List<usize>.get(&head.instructions, usize.ZERO)
+  let tested = function.instruction(test)
+  if tested.result != head.value { return false }
+  let predicate = match tested.operation {
+    Operation.Compare {predicate: asked} => asked
+    _ => { return false }
+  }
+  let left = function.operandsOf(test)[usize.ZERO]
+  let right = function.operandsOf(test)[usize.ONE]
+  // Counting up to a bound, or down to zero.
+  let mut bound = none()
+  let mut down = false
+  if predicate == Predicate.Ugt && right == counter { bound = left }
+  if predicate == Predicate.Ult && left == counter { bound = right }
+  if bound == none() {
+    down = (predicate == Predicate.Ult && right == counter && isConstant(&function.*, left, 0))
+      || (predicate == Predicate.Ugt && left == counter && isConstant(&function.*, right, 0))
+      || (predicate == Predicate.Ne && ((left == counter && isConstant(&function.*, right, 0)) || (right == counter && isConstant(&function.*, left, 0))))
+    if !down { return false }
+  } else if bound == counter || within(&function.*, bound, header, body) {
+    return false
+  }
+  // The body: the header alone enters it, and it jumps back with the counter stepped.
+  let round = function.block(body)
+  if round.exit != Exit.Jump || List<u64>.length(&round.parameters) != usize.ZERO || graph.predecessorsOf(body).length != usize.ONE { return false }
+  let back = &List<Edge>.asSlice(&round.edges)[usize.ZERO]
+  if back.block != header || List<u64>.length(&back.arguments) != usize.ONE { return false }
+  let stepped = List<u64>.get(&back.arguments, usize.ZERO)
+  let step = function.producerOf(stepped)
+  if step == usize.MAX || function.instruction(step).block != body { return false }
+  let first = function.operandsOf(step)[usize.ZERO]
+  let second = function.operandsOf(step)[usize.ONE]
+  let mut steps = false
+  if let Operation.Binary {operation} = function.instruction(step).operation {
+    if down {
+      steps = operation == Binary.Sub && first == counter && isConstant(&function.*, second, 1)
+    } else {
+      steps = operation == Binary.Add && ((first == counter && isConstant(&function.*, second, 1)) || (second == counter && isConstant(&function.*, first, 1)))
+    }
+  }
+  if !steps { return false }
+  // The byte the body reaches: at the counter going up, at the stepped counter going down.
+  let mut reached = counter
+  if down { reached = stepped }
+  let listed = List<usize>.asSlice(&round.instructions)
+  let mut store = usize.MAX
+  let mut load = usize.MAX
+  let mut indexes = usize.ZERO
+  at = usize.ZERO
+  while at < listed.length {
+    let found = function.instruction(listed[at])
+    match found.operation {
+      Operation.Index => {
+        let operands = function.operandsOf(listed[at])
+        if operands[usize.ONE] != reached || within(&function.*, operands[usize.ZERO], header, body) { return false }
+        indexes = indexes + usize.ONE
+      }
+      Operation.Load {offset, ..} => {
+        if load != usize.MAX || offset != 0 || !found.kind.equals(byte) { return false }
+        load = listed[at]
+      }
+      Operation.Store {offset, ..} => {
+        if store != usize.MAX || offset != 0 { return false }
+        store = listed[at]
+      }
+      _ => { if listed[at] != step { return false } }
+    }
+    at = at + usize.ONE
+  }
+  if store == usize.MAX { return false }
+  let value = function.operandsOf(store)[usize.ZERO]
+  if !function.kindOf(value).equals(byte) { return false }
+  let written = function.producerOf(function.operandsOf(store)[usize.ONE])
+  if written == usize.MAX || function.instruction(written).block != body { return false }
+  if let Operation.Index = function.instruction(written).operation {} else { return false }
+  let destination = function.operandsOf(written)[usize.ZERO]
+  let mut source = none()
+  if load == usize.MAX {
+    // A fill: one address, and a byte from outside the loop.
+    if indexes != usize.ONE || within(&function.*, value, header, body) { return false }
+  } else {
+    // A copy: the byte stored is the one loaded at the same index of a second address.
+    if indexes != 2 || value != function.instruction(load).result { return false }
+    let read = function.producerOf(function.operandsOf(load)[usize.ZERO])
+    if read == usize.MAX || read == written || function.instruction(read).block != body { return false }
+    if let Operation.Index = function.instruction(read).operation {} else { return false }
+    source = function.operandsOf(read)[usize.ZERO]
+  }
+  if readAfter(&function.*, header, body) { return false }
+  // The one edge into the loop from outside, and the counter's first value.
+  let incoming = graph.predecessorsOf(header)
+  if incoming.length != 2 { return false }
+  let mut before = incoming[usize.ZERO]
+  if before == body { before = incoming[usize.ONE] }
+  if before == body || before == header { return false }
+  let entries = List<Edge>.asSlice(&function.block(before).edges)
+  let mut entry = usize.MAX
+  at = usize.ZERO
+  while at < entries.length {
+    if entries[at].block == header {
+      if entry != usize.MAX { return false }
+      entry = at
+    }
+    at = at + usize.ONE
+  }
+  if entry == usize.MAX { return false }
+  let start = List<u64>.get(&entries[entry].arguments, usize.ZERO)
+  let place = head.place
+  let address = function.addressKind()
+  // The new block: the range's first addresses and its count, then the fill, or the check and
+  // the copy.
+  let made = run function.addJumpBlock(after, List<u64>.asSlice(&leaving), place)
+  let mut position = usize.ZERO
+  let mut count = start
+  let mut target = destination
+  let mut origin = source
+  if !down {
+    count = bound
+    if !isConstant(&function.*, start, 0) {
+      let top = run function.insertInstruction(made, position, Operation.Extreme {which: Extreme.UnsignedMaximum}, word, &[start, bound], place)
+      count = run function.insertInstruction(made, position + usize.ONE, Operation.Binary {operation: Binary.Sub}, word, &[top, start], place)
+      target = run function.insertInstruction(made, position + 2, Operation.Index, address, &[destination, start], place)
+      position = position + 3
+      if source != none() {
+        origin = run function.insertInstruction(made, position, Operation.Index, address, &[source, start], place)
+        position = position + usize.ONE
+      }
+    }
+  }
+  if source == none() {
+    drop run function.insertInstruction(made, position, Operation.FillCounted, Kind.unit(), &[target, value, count], place)
+  } else {
+    let high = run function.insertInstruction(made, position, Operation.Cast {operation: Cast.PtrToInt}, word, &[target], place)
+    let low = run function.insertInstruction(made, position + usize.ONE, Operation.Cast {operation: Cast.PtrToInt}, word, &[origin], place)
+    // Going up, the destination must not start inside the source's range above its start: its
+    // distance past the source, wrapping, is at least the count. Going down, the same of the
+    // source past the destination.
+    let mut apart = [high, low]
+    if down { apart = [low, high] }
+    let distance = run function.insertInstruction(made, position + 2, Operation.Binary {operation: Binary.Sub}, word, &apart, place)
+    let clear = run function.insertInstruction(made, position + 3, Operation.Compare {predicate: Predicate.Uge}, Kind.flag(), &[distance, count], place)
+    let copying = run function.addJumpBlock(after, List<u64>.asSlice(&leaving), place)
+    drop run function.insertInstruction(copying, usize.ZERO, Operation.CopyCounted, Kind.unit(), &[target, origin, count], place)
+    run function.setBranch(made, clear, copying, &[], header, &[start])
+  }
+  run function.setEdge(before, entry, made, &[])
+  return true
+}

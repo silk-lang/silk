@@ -9,7 +9,7 @@ Use [`RawLinux`](#RawLinux) only in a raw Linux runtime, such as `silk.platform.
 program uses the libc providers (the `*_native` modules and `silk.platform.native`) instead.
 
 ## Details
-The module exists only on Linux on x86_64 or aarch64, with the `libc` profile set to `none`. The
+The module exists only on Linux on x86_64 or aarch64, with `libc` set to `none`. The
 syscall numbers ([`READ`](#READ), [`WRITE`](#WRITE), [`MMAP`](#MMAP), [`MUNMAP`](#MUNMAP) and [`EXIT_GROUP`](#EXIT_GROUP)) are different on
 each architecture. Use the constants, not literal numbers.
 
@@ -45,7 +45,7 @@ Use it only in a raw Linux runtime, such as `silk.platform.linux.start`. A hoste
 the libc providers (the `*_native` modules and `silk.platform.native`) instead.
 
 ### Details
-It exists only on Linux on x86_64 or aarch64, with the `libc` profile set to `none`. A call
+It exists only on Linux on x86_64 or aarch64, with `libc` set to `none`. A call
 returns the kernel word without change. A value from -4095 through -1 (as `usize`) is an
 error. [`RawLinux.error`](#RawLinux.impl.error) gives `0` for success, or the positive error number.
 

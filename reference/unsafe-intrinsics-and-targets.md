@@ -1120,8 +1120,13 @@ first-class check runs at the use site.
 **Status:** Confirmed
 
 A native symbol is a non-empty ASCII identifier: a letter or underscore followed by letters,
-digits, or underscores. Any other spelling, including an embedded NUL, is rejected at the
+digits, underscores, or `$`. Any other spelling, including an embedded NUL, is rejected at the
 declaration.
+
+On a Mach-O target, a symbol that starts with `section$start$`, `section$end$`, `segment$start$`
+or `segment$end$` names a bound the linker defines, such as
+`section$start$__DATA$__silk_seen`. The object file holds it as written, without the leading
+underscore every C symbol takes there.
 
 Platform entry names such as `main` are ordinary foreign export names: a selected source
 runtime may define them. The remaining private compiler symbols are reserved:
@@ -1179,71 +1184,50 @@ A guarded function stays out of line unless its source asks to inline it with `@
 
 Unannotated calls access externally reachable memory conservatively. Only the explicit sealed [foreign contract](foreign-call-contracts.md) supplies narrower memory, capture, alias or no-return assertions. Raw pointers cross as address lanes; address-taken Silk roots are still reloaded after each call. Ordinary foreign data/error-state reads stay ordinary loads, with no recognized accessor names, global volatility or hardware fences.
 
-Link inputs are compiler-generated objects followed by the ordered structured inputs the project
-manifest names. The optional `[native]` table's `link` array accepts object paths,
-static-archive paths, named libraries with an explicit static or dynamic mode, search paths, and
-Apple frameworks. Paths are resolved relative to the manifest and may not escape the project; a
-name with a path separator, whitespace, NUL, or leading `-` is rejected. Arbitrary linker flags
-stay out of source and manifest.
+Link inputs are compiler-generated objects followed by the ordered typed requirements from
+`Compilation` and each selected package's `build.silk` plan. Objects, static archives, named
+libraries, search paths and Apple frameworks each have a typed operation. Plan paths stay inside
+the package unless a consumer grants a supplied path. A target condition in ordinary static code
+selects platform-specific requirements.
 
-An entry may add `os`, one of `"macos"`, `"linux"`, `"windows"` and `"wasi"` or a list of them.
-A build for another operating system skips the entry instead of refusing it, so one manifest
-declares each platform's libraries and frameworks.
+```silk,ignore
+import silk.build.plan { Framework, Plan }
+import silk.build.step { sourcePath }
+import silk.core.target { Target, OperatingSystem }
 
-```toml
-[native]
-link = [
-  { search-path = "vendor/lib" },
-  { library = "m", mode = "dynamic" },
-  { static-archive = "vendor/libsupport.a" },
-  { framework = "Metal", os = "macos" },
-  { library = "stdc++", mode = "dynamic", os = ["linux", "wasi"] },
-]
+static fn plan() -> Plan {
+  let mut native = Plan.empty()
+  native = Plan.compileC(native, sourcePath("native/support.c"))
+  native = Plan.compileNative(native, "c", sourcePath("native/special.c"), &["-DSPECIAL=1"], &[])
+  if Target.operatingSystem() == OperatingSystem.Darwin {
+    native = Plan.linkFramework(native, "Metal", Framework.make())
+  }
+  return native
+}
+pub const PLAN: Plan = plan()
 ```
 
-A library's `[native].link` reaches every executable that depends on it, directly or through other
-packages, so the executable's manifest repeats none of it. The executable's own inputs come first,
-then each dependency's, with every package before the packages it depends on, so an archive follows
-the objects and archives that use it. An input that several packages list (the same file, library
-with the same mode, or framework) links once, at its last place. A library or object artifact
-links only its own manifest's inputs.
+A library's requirements reach dependent executables, directly or through other packages. Root
+inputs precede dependency inputs; each package precedes the packages it depends on. A repeated
+link input appears once at its last position. Native translation units precede that package's link
+inputs. A static archive artifact includes its compiled native objects.
 
-`[native].sources` names C, Objective-C, C++ and Objective-C++ files of the package that the
-build compiles with Clang. Each entry names its files with exactly one of `c`, `objc`, `cpp` and
-`objcpp`, as a path or a list of paths relative to the manifest's directory; a `*` in a path's
-last segment matches files of that directory, in name order, and a pattern that matches nothing is
-refused. `include` lists directories of the package to search for headers, `flags` lists extra
-Clang flags, and `os` selects systems as for `link`. A package's compiled objects link ahead of its
-`link` entries and reach dependent executables the same way, so dependency sources compile by
-default; a static library artifact archives them. Flags pass an allowlist: defines (`-D`, `-U`),
-warnings (`-W`, `-w`, `-pedantic`), a language standard (`-std=`), optimization (`-O`), debug
-information (`-g`) and code generation flags (`-f`, `-m`). A flag that hands arguments to another
-tool (`-Wl,`, `-Wa,`, `-Wp,`, `-mllvm`), loads code or names a file for Clang (`-fplugin`,
-`-fpass-plugin`, profile and sanitizer lists, module files, `-I`, `-include`, `-B`, `@file`) is
-refused, naming the manifest line. Sources compile with the build's target, profile optimization,
-debug, CPU and platform-supply flags.
+`Plan.compileNative` chooses `c`, `cpp`, `objc` or `objcpp` and accepts per-file flags and include
+paths. `Plan.compileSources` adds a deferred directory and glob pattern; matching paths are sorted
+and an empty match fails. `Compilation` has corresponding language-specific methods. Flags admit
+defines, warnings, language standards, optimization and safe code-generation choices. Flags that
+load compiler plugins, hand arbitrary arguments to another tool or introduce undeclared input
+files are refused. Sources inherit the target, CPU, debug settings and selected SDK.
 
-Each file compiles to an object in `<output>.native`, named by a digest of the Clang and its
-version, those flags, the entry's language, include directories and flags, and the file's path and
-contents. Clang reports the package headers the file included (`-MMD`); the object is reused while
-each still has the digest recorded beside it, and system headers are covered by the Clang, target
-and platform supply in the name. The build reads every source and header itself, so a build that
-changes none of them reuses the executable without starting Clang, an edit to one file or header
-compiles only the objects it reaches, and `silk check` compiles nothing.
-
-```toml
-[native]
-sources = [
-  { c = "native/*.c", include = ["native/include"], flags = ["-DSHIM_VERSION=2", "-Wall"] },
-  { objc = "native/metal/*.m", flags = ["-fno-objc-arc", "-fblocks"], os = "macos" },
-]
-```
+Native object keys include the selected compiler bytes, flags, language, paths, source contents
+and consumed headers. Replacing the compiler or a header invalidates the affected objects.
+Request compilation only consumes resolved paths; archive fetching belongs to resolution.
 
 `[native.archive.<name>]` pins a prebuilt archive, such as a vendor's SDK, by `url` and `sha256`
 (64 hexadecimal digits), either directly or per target under `targets.<target>`, with an optional
-`strip` of leading path segments. A path written `<name>:<path>` in `link` or `sources` names a
-file of that archive, so `{ static-archive = "dawn:lib/libwebgpu_dawn.a", os = "macos" }` and
-`include = ["dawn:include"]` reach Dawn without copying it into the package. Only the declaring
+`strip` of leading path segments. A typed plan uses `sourcePath("<name>:<path>")` to name an archive member.
+For example, `Plan.linkArchive` can consume `sourcePath("dawn:lib/libwebgpu_dawn.a")`,
+and a native include can consume `sourcePath("dawn:include")`. Only the declaring
 manifest may name its archives, and two packages of one build may not declare the same name. A
 build for a target the archive has no `url` for refuses the reference.
 
@@ -1253,7 +1237,7 @@ default), checks its SHA-256 before reading it, and extracts it if it is a ZIP a
 gzip-compressed or plain tar archive. Extraction writes only directories and regular files, skips
 links, and refuses a member path that is absolute or holds a backslash or `..`. A ZIP archive may also not be
 encrypted, span disks, or use a compression method other than stored or DEFLATE. A later build reuses the extraction while its digest matches, and
-`silk check` fetches nothing. With `SILK_OFFLINE` set, a build that needs a missing archive fails
+source analysis does not execute the native compiler. With `SILK_OFFLINE` set, a build that needs a missing archive fails
 naming it.
 
 `[native.override.<name>] path = "<directory>"` in the root manifest, or in
@@ -1262,19 +1246,13 @@ which is never fetched; a relative path is resolved against the file that names 
 machine's file wins over the root's. A dependency's overrides are ignored.
 
 ```toml
-[native]
-link = [
-  { static-archive = "dawn:lib/libwebgpu_dawn.a", os = "macos" },
-  { static-archive = "dawn:lib64/libwebgpu_dawn.a", os = "linux" },
-]
-
 [native.archive.dawn.targets.aarch64-apple-darwin]
 url = "https://github.com/google/dawn/releases/download/<version>/Dawn-<commit>-macos-latest-Release.tar.gz"
 sha256 = "d4f419dcbe81de4b86e6fbf172b647f41c67820a925efca55dae3bd43248d8e2"
 strip = 1
 ```
 
-`[native].function-order` names a text file below the manifest's directory that lists functions,
+`Plan.functionOrder` or `Compilation.functionOrder` names a text file below the manifest's directory that lists functions,
 one per line; blank lines and lines starting with `#` are ignored. Every build writes its names
 beside its output in `<output>.symbols`, one line per symbol: the symbol, its kind and the
 declaration it belongs to, such as `app@0.1.0:src/main.silk::Parser.next`. A line may name a
@@ -1297,9 +1275,8 @@ section and links with `--symbol-ordering-file`, using lld: the one installed be
 skips it silently. A file that lists no symbol, and a wasm32 link, order nothing. Editing the
 listed symbols links the executable again.
 
-```toml
-[native]
-function-order = "startup.order"
+```silk,ignore
+Plan.functionOrder(plan, sourcePath("startup.order"))
 ```
 
 **Boundary:** The compiler does not verify that a link input defines the symbol or that its real

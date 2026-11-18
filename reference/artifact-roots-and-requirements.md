@@ -184,8 +184,9 @@ before a successful plan is published.
 
 ## Build configuration
 
-`--emit` (earlier `build.stage`) accepts `final` (default), `llvm-ir`, `llvm-bitcode`, `assembly`,
-`object` or `wasm-text`. `package.kind` additionally accepts `object`. Intermediate destinations use
+`Compilation.emit` and the source command's `--emit` accept `final` (default), `llvm-ir`, `llvm-bitcode`, `assembly`,
+`object` or `wasm-text`. `Compilation.object` selects a relocatable artifact; `package.kind`
+only distinguishes `executable` and `library` source packages. Intermediate destinations use
 `.ll`, `.bc`, `.s` or `.o`; `silk run` requires a final executable.
 
 `wasm-text` applies to a wasm32 or wasm64 executable. The build links the module as a final build
@@ -200,7 +201,7 @@ stability promise:
 ```toml
 [package]
 name = "custom"
-kind = "object"
+kind = "library"
 
 [unstable]
 composition = { runtimes = [{ name = "custom", module = "runtime" }], defaults = ["custom"], retention = [{ module = "support", declaration = "keep" }], requirements = [] }
@@ -225,8 +226,8 @@ static archives according to hard linkage; framework, script, object and archive
 the corresponding typed payload. Scripts use `{ linker-script = "relative/script.ld" }` and are
 admitted only by GNU/Linux final tool plans. No raw linker options are accepted. Object/archive
 forms preserve unresolved link requirements in the logical plan; final executables/modules require
-every active requirement to have an admitted binding. Explicit flat `[native].link` inputs retain
-their existing ordered build semantics and do not override source requirements.
+every active requirement to have an admitted binding. Typed `Plan` and `Compilation` link inputs preserve
+their declared order and do not override source requirements.
 
 Named loader entries are exact linker symbols, including any target-specific spelling. Final
 library/object forms reject named entries. GNU/Linux executable `entry = { kind = "none" }` uses

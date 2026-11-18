@@ -132,6 +132,22 @@ effect fn accept(self: &mut Self, arg: Arg<'_>) -> bool ! OutOfMemoryError ? &mu
 Stores one occurrence. `arg` is empty for a flag. Returns `false` when it is not a valid
 value.
 
+<a id="bool.impl.FromArg"></a>
+
+## Implementation `FromArg for bool`
+
+```silk
+impl FromArg for bool
+```
+
+<a id="bool.impl.FromArg.fromArg"></a>
+
+### Operation `fromArg`
+
+```silk
+effect fn fromArg(arg: Arg<'_>) -> Result<Self, bool> ! OutOfMemoryError ? &mut Allocator
+```
+
 <a id="String.impl.FromArg"></a>
 
 ## Implementation `FromArg for String`

@@ -1,0 +1,372 @@
+//! Execute the initialization commands of a copied template.
+
+import silk.system.sandbox as Sandbox
+import diagnostic.JsonText
+import driver.CommandPath
+import driver.TemplateCommands { PostInit }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.system.child_process { ChildProcess, ProcessError, ProcessOutcome, ProcessRequest }
+import silk.core.effect { Effect }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.mem.pointer { Pointer }
+import silk.core.result { Result }
+import silk.collections.slice { Slice }
+import silk.text.string { String }
+import silk.num.i32
+import silk.num.usize
+
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  unsafe extern "C" fn _NSGetEnviron() -> *const ?[*]const ?[*]const u8
+
+  unsafe fn environmentVector() -> ?[*]const ?[*]const u8 {
+    unsafe {
+      return Pointer.read(_NSGetEnviron())
+    }
+  }
+} else static if Intrinsic.targetOperatingSystem() != "windows"
+  && Intrinsic.targetOperatingSystem() != "wasi" {
+  unsafe extern "C" static processEnvironment: ?[*]const ?[*]const u8 as "environ"
+
+  unsafe fn environmentVector() -> ?[*]const ?[*]const u8 {
+    unsafe {
+      return processEnvironment
+    }
+  }
+}
+
+// Declared exactly as the standard library declares it, since two declarations of one C symbol must agree.
+unsafe extern "C" fn strlen(text: [*]const u8) -> usize
+
+/// Captured initialization output and exit status.
+pub struct Outcome {
+  pub status: i32,
+  pub output: Bytes,
+  pub errors: Bytes
+}
+
+fn holds(text: &[u8], wanted: u8) -> bool {
+  let mut at = usize.ZERO
+  while at < text.length {
+    if text[at] == wanted {
+      return true
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+effect fn pathFrom(text: &[u8]) -> Path
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match move run Effect.result(Path.fromBytes(text)) {
+    Result<Path, FileError | OutOfMemoryError>.Success { value } => move value
+    Result<Path, FileError | OutOfMemoryError>.Failure { error } => match move error {
+      FileError failure => {
+        drop failure
+        Intrinsic.trap("generate path")
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+}
+
+effect fn joined(directory: &Path, relative: &[u8]) -> Path
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = run Bytes.copy(Path.rawBytes(directory))
+  run Bytes.append(&mut text, b"/")
+  run Bytes.append(&mut text, relative)
+  return match move run Effect.result(Path.fromBytes(Bytes.asSlice(&text))) {
+    Result<Path, FileError | OutOfMemoryError>.Success { value } => move value
+    Result<Path, FileError | OutOfMemoryError>.Failure { error } => match move error {
+      // Entries were checked to be plain relative paths, and the directory is a valid path.
+      FileError failure => {
+        drop failure
+        Intrinsic.trap("generate output path")
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+}
+
+pub effect fn inherit(request: &mut ProcessRequest) -> ()
+  ! HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    let names: [string; 24] = [
+      "PATH",
+      "PATHEXT",
+      "SystemRoot",
+      "SystemDrive",
+      "WINDIR",
+      "COMSPEC",
+      "TEMP",
+      "TMP",
+      "USERPROFILE",
+      "USERNAME",
+      "HOMEDRIVE",
+      "HOMEPATH",
+      "APPDATA",
+      "LOCALAPPDATA",
+      "ProgramData",
+      "ProgramFiles",
+      "ProgramFiles(x86)",
+      "NUMBER_OF_PROCESSORS",
+      "PROCESSOR_ARCHITECTURE",
+      "OS",
+      "CARGO",
+      "CARGO_HOME",
+      "RUSTUP_HOME",
+      "SILK_HOME",
+    ]
+    let mut at = usize.ZERO
+    while at < names.length {
+      if let Option<Bytes>.Some { value } = move run HostInput.variableNamed(names[at]) {
+        run ChildProcess.setVariableBytes(
+          &mut request.*,
+          String.utf8Bytes(names[at]),
+          Bytes.asSlice(&value),
+        )
+      }
+      at = at + usize.ONE
+    }
+    return ()
+  } else {
+    static if Intrinsic.targetOperatingSystem() == "wasi" {
+      // A WASI build starts no programs, so it forwards nothing.
+      return ()
+    } else {
+      let environment = match move Pointer.nonNullMany(unsafe environmentVector()) {
+        Option<[*]const ?[*]const u8>.Some { value } => value
+        Option<[*]const ?[*]const u8>.None => {
+          return ()
+        }
+      }
+      let mut index = usize.ZERO
+      while true {
+        let entry = match move Pointer.nonNullMany(
+          unsafe Pointer.read(unsafe Pointer.at(environment, index)),
+        ) {
+          Option<[*]const u8>.Some { value } => value
+          Option<[*]const u8>.None => {
+            break
+          }
+        }
+        let length = unsafe strlen(entry)
+        let anchor = length
+        let text = unsafe Pointer.borrowMany<usize, u8>(&anchor, entry, length)
+        let mut equals = usize.ZERO
+        while equals < text.length && text[equals] != 61 {
+          equals = equals + usize.ONE
+        }
+        if equals > usize.ZERO && equals < text.length {
+          run ChildProcess.setVariableBytes(
+            &mut request.*,
+            Slice.view<u8>(text, usize.ZERO, equals),
+            Slice.view<u8>(text, equals + usize.ONE, text.length - equals - usize.ONE),
+          )
+        }
+        index = index + usize.ONE
+      }
+      return ()
+    }
+  }
+}
+
+effect fn program(directory: &Path, written: &[u8]) -> Option<Path>
+  ! HostInputError | OutOfMemoryError
+  ? &mut FileSystem | &mut HostInput | &mut Allocator {
+  if holds(written, 47) {
+    return run programOn(directory, written, b"")
+  }
+  let searched = match move run HostInput.variableNamed("PATH") {
+    Option<Bytes>.Some { value } => move value
+    Option<Bytes>.None => {
+      return Option<Path>.none()
+    }
+  }
+  return run programOn(directory, written, Bytes.asSlice(&searched))
+}
+
+effect fn programOn(directory: &Path, written: &[u8], searched: &[u8]) -> Option<Path>
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  if holds(written, 47) {
+    let path = run joined(directory, written)
+    if run isFile(&path) {
+      return Option<Path>.some(move path)
+    }
+    return Option<Path>.none()
+  }
+  let candidates = run CommandPath.searchCandidates(searched, written)
+  let listedCandidates = List<Bytes>.asSlice(&candidates)
+  let mut at = usize.ZERO
+  while at < listedCandidates.length {
+    if run CommandPath.exists(Bytes.asSlice(&listedCandidates[at]), false) {
+      if let Option<Path>.Some { value } = move run CommandPath.pathOf(
+        Bytes.asSlice(&listedCandidates[at]),
+      ) {
+        return Option<Path>.some(move value)
+      }
+    }
+    at = at + usize.ONE
+  }
+  return Option<Path>.none()
+}
+
+effect fn spelled(words: &[Bytes]) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut line = Bytes.make()
+  let mut at = usize.ZERO
+  while at < words.length {
+    if at > usize.ZERO {
+      run Bytes.append(&mut line, b" ")
+    }
+    run Bytes.append(&mut line, Bytes.asSlice(&words[at]))
+    at = at + usize.ONE
+  }
+  return move line
+}
+
+fn confinedPath() -> &'static [u8] {
+  return b"/usr/local/bin:/usr/bin:/bin"
+}
+
+pub effect fn execute(
+  directory: &Path,
+  entries: &[PostInit],
+  compilerRelease: &[u8],
+  arguments: &[Bytes],
+  sandbox: Option<&Path>,
+  home: &Path,
+) -> Outcome
+  ! HostInputError | FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
+  let mut outcome = Outcome { status: 0, output: Bytes.make(), errors: Bytes.make() }
+  let confined = match &sandbox {
+    Option<&Path>.Some { .. } => true
+    Option<&Path>.None => false
+  }
+  if !confined && entries.length > usize.ZERO {
+    run Bytes.append(
+      &mut outcome.errors,
+      b"silk: warning: running the template's [[post-init]] entries without a sandbox (--unsandboxed-post-init)\n",
+    )
+  }
+  let mut index = usize.ZERO
+  while index < entries.length {
+    let words = List<Bytes>.asSlice(&entries[index].command)
+    let line = run spelled(words)
+    let mut resolved = Option<Path>.none()
+    if confined {
+      resolved = run programOn(directory, Bytes.asSlice(&words[usize.ZERO]), confinedPath())
+    } else {
+      resolved = run program(directory, Bytes.asSlice(&words[usize.ZERO]))
+    }
+    let found = match move resolved {
+      Option<Path>.Some { value } => move value
+      Option<Path>.None => {
+        run Bytes.append(&mut outcome.errors, b"silk: [[post-init]][")
+        run JsonText.appendDecimal(&mut outcome.errors, index)
+        run Bytes.append(&mut outcome.errors, b"]: cannot find the program ")
+        run Bytes.append(&mut outcome.errors, Bytes.asSlice(&words[usize.ZERO]))
+        if holds(Bytes.asSlice(&words[usize.ZERO]), 47) {
+          run Bytes.append(&mut outcome.errors, b" in the template\n")
+        } else {
+          if confined {
+            run Bytes.append(&mut outcome.errors, b" in /usr/local/bin, /usr/bin or /bin\n")
+          } else {
+            run Bytes.append(&mut outcome.errors, b" on PATH\n")
+          }
+        }
+        outcome.status = 1
+        return move outcome
+      }
+    }
+    let mut request = match &sandbox {
+      Option<&Path>.Some { value: launcher } => {
+        let writable: [&Path; 2] = [directory, home]
+        let readable = List<Path>.make()
+        run Sandbox.request(launcher, &found, List<Path>.asSlice(&readable), &writable)
+      }
+      Option<&Path>.None => run ChildProcess.requestWithin(&found, directory)
+    }
+    let mut word = usize.ONE
+    while word < words.length {
+      run ChildProcess.addArgumentBytes(&mut request, Bytes.asSlice(&words[word]))
+      word = word + usize.ONE
+    }
+    if entries[index].arguments {
+      let mut added = usize.ZERO
+      while added < arguments.length {
+        run ChildProcess.addArgumentBytes(&mut request, Bytes.asSlice(&arguments[added]))
+        added = added + usize.ONE
+      }
+    }
+    if confined {
+      run ChildProcess.setVariableBytes(&mut request, b"PATH", confinedPath())
+      run ChildProcess.setVariableBytes(&mut request, b"HOME", Path.rawBytes(home))
+      run ChildProcess.setVariableBytes(&mut request, b"TMPDIR", Path.rawBytes(home))
+    } else {
+      run inherit(&mut request)
+    }
+    run ChildProcess.setVariableBytes(&mut request, b"SILK_VERSION", compilerRelease)
+    let finished = match move run Effect.result(ChildProcess.submit(&request)) {
+      Result<ProcessOutcome, ProcessError | OutOfMemoryError>.Success { value } => move value
+      Result<ProcessOutcome, ProcessError | OutOfMemoryError>.Failure {
+        error
+      } => match move error {
+        ProcessError unstarted => {
+          drop unstarted
+          run Bytes.append(&mut outcome.errors, b"silk: cannot start ")
+          run Bytes.append(&mut outcome.errors, Bytes.asSlice(&line))
+          run Bytes.append(&mut outcome.errors, b"\n")
+          outcome.status = 1
+          return move outcome
+        }
+        OutOfMemoryError exhausted => {
+          fail move exhausted
+        }
+      }
+    }
+    run Bytes.append(&mut outcome.output, ChildProcess.outputBytes(&finished))
+    run Bytes.append(&mut outcome.errors, ChildProcess.errorBytes(&finished))
+    let mut succeeded = false
+    if let Option<i32>.Some { value } = move ChildProcess.exitCode(&finished) {
+      succeeded = value == 0
+    }
+    if !succeeded {
+      run Bytes.append(&mut outcome.errors, b"silk: ")
+      run Bytes.append(&mut outcome.errors, Bytes.asSlice(&line))
+      run Bytes.append(&mut outcome.errors, b" failed")
+      if let Option<i32>.Some { value } = move ChildProcess.exitCode(&finished) {
+        run Bytes.append(&mut outcome.errors, b" with status ")
+        if value >= 0 {
+          run JsonText.appendDecimal(&mut outcome.errors, i32.toUsize(value))
+        } else {
+          run Bytes.append(&mut outcome.errors, b"-1")
+        }
+      }
+      run Bytes.append(&mut outcome.errors, b"\n")
+      outcome.status = 1
+      return move outcome
+    }
+    index = index + usize.ONE
+  }
+  return move outcome
+}
+
+effect fn isFile(path: &Path) -> bool
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  return run CommandPath.exists(Path.rawBytes(path), false)
+}

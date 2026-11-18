@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Builds the LLVM that Silk releases ship: one multicall `llvm` executable holding Clang, lld and
-# llvm-ar, for the three targets Silk generates code for, with Clang's resource headers. The
+# llvm-ar, for the three targets Silk generates code for, with Clang's resource headers and, on
+# macOS, compiler-rt's builtins. The
 # multicall binary runs the tool its file name names; the compiler makes the links (`clang`,
 # `ld.lld`, `ld64.lld`, `wasm-ld`, `lld-link`, `llvm-ar`, `llvm-dlltool`) on first use
 # (compiler/src/driver/BundledLlvm.silk), so the release archive carries none.
@@ -9,6 +10,7 @@
 # SOURCE is an unpacked llvm-project source release; OUTPUT must not exist. The result is:
 #   OUTPUT/bin/llvm (llvm.exe on Windows)
 #   OUTPUT/lib/clang/<major>/include
+#   OUTPUT/lib/clang/<major>/lib/darwin/libclang_rt.osx.a (macOS)
 #   OUTPUT/LICENSE.TXT
 # CC and CXX choose the host compiler (default cc and c++). On Linux, run it on the oldest glibc
 # the release supports (manylinux_2_28): the executable links libstdc++ statically and needs only
@@ -29,6 +31,7 @@ fi
 build=${LLVM_BUILD_DIRECTORY:-$source/build-silk}
 jobs=${LLVM_BUILD_JOBS:-$(getconf _NPROCESSORS_ONLN 2> /dev/null || nproc)}
 suffix=
+targets=(llvm-driver llvm-link clang-resource-headers)
 
 flags=(
   -G Ninja
@@ -76,7 +79,7 @@ flags=(
   -DLLVM_TOOL_LLVM_NM_BUILD=OFF
   -DLLVM_TOOL_LLVM_OBJCOPY_BUILD=OFF
   -DLLVM_TOOL_LLVM_OBJDUMP_BUILD=OFF
-  -DLLVM_TOOL_LLVM_RC_BUILD=OFF
+  -DLLVM_TOOL_LLVM_RC_BUILD=ON
   -DLLVM_TOOL_LLVM_READOBJ_BUILD=OFF
   -DLLVM_TOOL_LLVM_READTAPI_BUILD=OFF
   -DLLVM_TOOL_LLVM_SIZE_BUILD=OFF
@@ -92,6 +95,32 @@ case "$(uname -s)" in
     ;;
   Darwin)
     flags+=(-DCMAKE_OSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-12.0}" "-DCMAKE_EXE_LINKER_FLAGS=-Wl,-dead_strip")
+    # Clang takes the build machine's `ld` version as the linker's and, from ld 1250, compiles
+    # Objective-C class messages to `objc_msgSendClass$` stubs that only that linker makes. The
+    # bundle links with its own lld, so the version stays the one its lld can stand in for,
+    # whatever Xcode the build machine has.
+    flags+=(-DHOST_LINK_VERSION=1167.5)
+    # Clang links libclang_rt.osx.a into every macOS program when its resource directory has
+    # one, and C and Objective-C code needs it: `@available` calls its
+    # `__isPlatformVersionAtLeast`. Only the builtins, for macOS on both architectures.
+    flags+=(
+      -DLLVM_ENABLE_RUNTIMES=compiler-rt
+      -DCOMPILER_RT_BUILD_BUILTINS=ON
+      -DCOMPILER_RT_BUILD_SANITIZERS=OFF
+      -DCOMPILER_RT_BUILD_XRAY=OFF
+      -DCOMPILER_RT_BUILD_LIBFUZZER=OFF
+      -DCOMPILER_RT_BUILD_PROFILE=OFF
+      -DCOMPILER_RT_BUILD_CTX_PROFILE=OFF
+      -DCOMPILER_RT_BUILD_MEMPROF=OFF
+      -DCOMPILER_RT_BUILD_ORC=OFF
+      -DCOMPILER_RT_BUILD_GWP_ASAN=OFF
+      -DCOMPILER_RT_ENABLE_IOS=OFF
+      -DCOMPILER_RT_ENABLE_TVOS=OFF
+      -DCOMPILER_RT_ENABLE_WATCHOS=OFF
+      -DCOMPILER_RT_ENABLE_XROS=OFF
+      "-DDARWIN_osx_BUILTIN_ARCHS=arm64;x86_64"
+    )
+    targets+=(builtins)
     ;;
   MINGW* | MSYS*)
     # Git Bash inside an MSVC developer environment (vcvars64), with CC and CXX `cl`. The static
@@ -101,15 +130,25 @@ case "$(uname -s)" in
     ;;
 esac
 cmake -S "$source/llvm" -B "$build" "${flags[@]}"
-ninja -C "$build" -j "$jobs" llvm-driver clang-resource-headers
+ninja -C "$build" -j "$jobs" "${targets[@]}"
 
 mkdir -p "$output/bin"
 output=$(cd "$output" && native_pwd)
 cp "$build/bin/llvm$suffix" "$output/bin/llvm$suffix"
+cp "$build/bin/llvm-link$suffix" "$output/bin/llvm-link$suffix"
 # An MSVC executable keeps its symbols in a separate PDB already.
 if [ -z "$suffix" ]; then strip "$output/bin/llvm" 2> /dev/null || strip -x "$output/bin/llvm"; fi
+if [ -z "$suffix" ]; then strip "$output/bin/llvm-link" 2> /dev/null || strip -x "$output/bin/llvm-link"; fi
 major=$(sed -n 's/^ *set(LLVM_VERSION_MAJOR \([0-9]*\)).*/\1/p' "$source/cmake/Modules/LLVMVersion.cmake")
 mkdir -p "$output/lib/clang/$major"
 cp -R "$build/lib/clang/$major/include" "$output/lib/clang/$major/include"
+if [ "$(uname -s)" = Darwin ]; then
+  mkdir -p "$output/lib/clang/$major/lib/darwin"
+  cp "$build/lib/clang/$major/lib/darwin/libclang_rt.osx.a" "$output/lib/clang/$major/lib/darwin/libclang_rt.osx.a"
+  # Without `-q`: grep reads all of nm's output, so nm never writes to a closed pipe.
+  nm -g "$output/lib/clang/$major/lib/darwin/libclang_rt.osx.a" 2> /dev/null | grep ' T ___isPlatformVersionAtLeast$' > /dev/null
+fi
 cp "$source/llvm/LICENSE.TXT" "$output/LICENSE.TXT"
 "$output/bin/llvm$suffix" clang --version
+"$output/bin/llvm$suffix" llvm-rc /? > /dev/null
+"$output/bin/llvm-link$suffix" --version

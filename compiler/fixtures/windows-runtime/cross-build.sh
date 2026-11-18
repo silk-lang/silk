@@ -2,6 +2,7 @@
 # Uses the already-built N1, never builds another compiler or runs the native corpus.
 set -uo pipefail
 compiler=$1
+export SILK_CLANG="$SILK_TEST_CLANG"
 out=$2
 mkdir -p "$out"
 git rev-parse HEAD > "$out/source-commit.txt"
@@ -41,7 +42,11 @@ name = "windows-$program-fixture"
 version = "0.0.0"
 silk-version = "0.0.0"
 EOF
-  source="$package/src/main.silk"
+  cat > "$package/build.silk" <<'PLAN'
+import silk.build.plan { Plan }
+import silk.build.step { sourcePath }
+pub const PLAN: Plan = Plan.empty()
+PLAN
   if [ "$program" = trust ] || [ "$program" = https ]; then
     python3 - "$package/crypt32.def" <<'PY'
 from pathlib import Path
@@ -56,7 +61,7 @@ PY
     llvm-dlltool -m i386:x86-64 -d "$package/crypt32.def" -l "$package/crypt32.lib" || exit 1
   fi
   if [ "$program" = trust ]; then
-    printf '\n[native]\nlink = [{ object = "companion.obj" }, { static-archive = "crypt32.lib" }]\n' >> "$package/silk.toml"
+    printf '  |> Plan.linkObject(sourcePath("companion.obj"))\n  |> Plan.linkArchive(sourcePath("crypt32.lib"))\n' >> "$package/build.silk"
     if ! "$SILK_TEST_CLANG" --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-stack-protector \
         -Wall -Wextra -Werror -c compiler/fixtures/windows-runtime/trust-contract.c -o "$package/companion.obj"; then
       printf 'trust\tfail: companion\tnot-checked\tnot-checked\n' >> "$out/results.tsv"
@@ -79,14 +84,16 @@ Path(sys.argv[1]).write_text(textwrap.dedent(definition.group(1)).strip() + '\ns
 PY
     printf 'LIBRARY kernel32.dll\nEXPORTS\nSetHandleInformation\n' > "$package/fixture-kernel.def"
     if [ "$program" = https ]; then
-      cat >> "$package/silk.toml" <<'EOF'
-[native]
-link = [{ static-archive = "fixture.lib" }, { static-archive = "fixture-kernel.lib" }, { static-archive = "crypt32.lib" }]
+      cat >> "$package/build.silk" <<'EOF'
+  |> Plan.linkArchive(sourcePath("fixture.lib"))
+  |> Plan.linkArchive(sourcePath("fixture-kernel.lib"))
+  |> Plan.linkArchive(sourcePath("crypt32.lib"))
 EOF
     else
-      cat >> "$package/silk.toml" <<'EOF'
-[native]
-link = [{ object = "companion.obj" }, { static-archive = "fixture.lib" }, { static-archive = "fixture-kernel.lib" }]
+      cat >> "$package/build.silk" <<'EOF'
+  |> Plan.linkObject(sourcePath("companion.obj"))
+  |> Plan.linkArchive(sourcePath("fixture.lib"))
+  |> Plan.linkArchive(sourcePath("fixture-kernel.lib"))
 EOF
       if ! "$SILK_TEST_CLANG" --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-stack-protector \
           -Wall -Wextra -Werror -c "compiler/fixtures/windows-runtime/$program-contract.c" -o "$package/companion.obj"; then
@@ -106,9 +113,9 @@ EOF
   fi
   if [ "$program" = console ]; then
     printf 'LIBRARY kernel32.dll\nEXPORTS\nSetStdHandle\nSetConsoleMode\nCreateConsoleScreenBuffer\nReadConsoleOutputCharacterW\nGetConsoleOutputCP\n' > "$package/fixture.def"
-    cat >> "$package/silk.toml" <<'EOF'
-[native]
-link = [{ object = "companion.obj" }, { static-archive = "fixture.lib" }]
+    cat >> "$package/build.silk" <<'EOF'
+  |> Plan.linkObject(sourcePath("companion.obj"))
+  |> Plan.linkArchive(sourcePath("fixture.lib"))
 EOF
     if ! "$SILK_TEST_CLANG" --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-stack-protector \
         -Wall -Wextra -Werror -c compiler/fixtures/windows-runtime/console-contract.c -o "$package/companion.obj" \
@@ -131,7 +138,7 @@ GetEnvironmentVariableW
 SetLastError
 EOF
     llvm-dlltool -m i386:x86-64 -d "$package/host.def" -l "$package/host.lib" || exit 1
-    printf '\n[native]\nlink = [{ static-archive = "host.lib" }]\n' >> "$package/silk.toml"
+    printf '  |> Plan.linkArchive(sourcePath("host.lib"))\n' >> "$package/build.silk"
     printf 'LIBRARY kernel32.dll\nEXPORTS\nGetCommandLineW\nLocalFree\nGetLastError\nSetLastError\nGetEnvironmentVariableW\nGetStdHandle\nReadFile\nWriteFile\nGetCurrentProcess\nIsProcessInJob\nGetModuleFileNameW\nCreateProcessW\nCloseHandle\nSetEvent\nSleep\nExitProcess\n' > "$package/kernel32.def"
     printf 'LIBRARY shell32.dll\nEXPORTS\nCommandLineToArgvW\n' > "$package/shell32.def"
     if ! "$SILK_TEST_CLANG" --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-stack-protector \
@@ -147,9 +154,9 @@ EOF
   fi
   if [ "$program" = providers ]; then
     printf 'LIBRARY kernel32.dll\nEXPORTS\nCreatePipe\nCloseHandle\nSetStdHandle\n' > "$package/fixture.def"
-    cat >> "$package/silk.toml" <<'EOF'
-[native]
-link = [{ object = "companion.obj" }, { static-archive = "fixture.lib" }]
+    cat >> "$package/build.silk" <<'EOF'
+  |> Plan.linkObject(sourcePath("companion.obj"))
+  |> Plan.linkArchive(sourcePath("fixture.lib"))
 EOF
     if ! "$SILK_TEST_CLANG" --target=x86_64-pc-windows-msvc -O2 -ffreestanding \
         -fno-stack-protector -Wall -Wextra -Werror -DSILK_PROVIDER_COMPANION \
@@ -165,7 +172,8 @@ EOF
   fi
   # Retain actual Silk output and the helpers its unoptimized object requires. This inventory
   # distinguishes emitted dependencies from the broader handwritten compiler-rt risk fixture.
-  if "$compiler" build "$source" -o "$out/$program.ll" --emit llvm-ir --target x86_64-pc-windows-msvc \
+  if node compiler/scripts/CompilationBuild.ts --compiler "$compiler" --manifest "$package/silk.toml" \
+      --output "$out/$program.ll" --emit llvm-ir --target x86_64-pc-windows-msvc \
       --stdlib "$PWD/stdlib" --optimization "$optimization" --debug false > "$out/$program-ir.log" 2>&1 \
       && "$SILK_TEST_CLANG" --target=x86_64-pc-windows-msvc -O0 -c "$out/$program.ll" -o "$out/$program.obj" \
         > "$out/$program-object.log" 2>&1; then
@@ -174,8 +182,9 @@ EOF
     cat "$out/$program-ir.log"
     failed=1
   fi
-  if "$compiler" build "$source" -o "$out/$program.exe" --target x86_64-pc-windows-msvc \
-      --stdlib "$PWD/stdlib" --clang "$SILK_TEST_CLANG" --optimization "$optimization" --debug false > "$out/$program-build.log" 2>&1; then
+  if node compiler/scripts/CompilationBuild.ts --compiler "$compiler" --manifest "$package/silk.toml" \
+      --output "$out/$program.exe" --target x86_64-pc-windows-msvc \
+      --stdlib "$PWD/stdlib" --optimization "$optimization" --debug false > "$out/$program-build.log" 2>&1; then
     if llvm-readobj --file-headers --coff-imports "$out/$program.exe" > "$out/$program-pe.txt" \
         && grep -q 'IMAGE_FILE_MACHINE_AMD64' "$out/$program-pe.txt" \
         && grep -q 'IMAGE_SUBSYSTEM_WINDOWS_CUI' "$out/$program-pe.txt" \

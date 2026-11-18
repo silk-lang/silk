@@ -12,7 +12,7 @@ Use [`Compilation`](#Compilation) to select code for the build request, for exam
 for facts about the machine, such as the architecture and the pointer width.
 
 ## Details
-Each value comes from the compilation profile, which is fixed before specialization. The values
+Each value comes from the compilation settings, which are fixed before specialization. The values
 describe logical requests. They do not find SDKs, load runtime packages, or change the ownership
 rules. Each operation in this module is `static`, so the selection adds no runtime cost.
 

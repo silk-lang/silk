@@ -20,7 +20,7 @@ before it while that one is free, then the chunk's own size with two flags, so a
 coalesces a chunk with both neighbors. Free chunks wait in bins by size: one per 16 bytes below
 1 KiB, then four per power of two. The last chunk is the top, which grows the memory instead of
 joining a bin. Positions are byte offsets from the heap's start; offset zero, inside the
-state, is no chunk. With the `multi` threading profile one lock serializes the heap.
+state, is no chunk. With the `multi` threading setting one lock serializes the heap.
 
 Public declarations: 0.
 

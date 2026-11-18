@@ -1,28 +1,14 @@
-//! Write a project's tasks in Silk: the program that `silk task <name>` and the manifest's
-//! `[tasks]` hooks run.
+//! Commands implemented by a project's tasks.silk program.
 //!
-//! # When to use
-//! Put a project's automation, such as code generation, fixtures, release steps or checks before
-//! `silk pack`, in `src/tasks.silk` instead of shell, Python or JavaScript scripts. The tasks are
-//! the variants of a union that describes the command line with `silk.cli`, so `silk task` with no
-//! name lists them, each task gets typed options, and a misspelled name gets a suggestion.
+//! Put project automation in src/tasks.silk. A command is a union variant described with
+//! silk.cli. `silk build`, `silk run`, `silk test` and `silk plan` run the variants named Build,
+//! Run, Test and Plan; for one the union does not have, Task.main hands the command back and the
+//! toolchain runs its built-in. Dependencies' tasks never run.
 //!
-//! # Details
-//! `silk task` builds the package's `tasks` profile, an executable for this machine whose root
-//! module is `tasks.silk` unless `[profiles.tasks]` says otherwise, and runs it from the package
-//! directory with the user's rights. The profile may add its own dependencies in
-//! `[profiles.tasks.dependencies]`; they are fetched only when the tasks build. A package's tasks
-//! never run where it is a dependency.
-//!
-//! [`Task.main`] reads the command line, runs [`TaskSet.perform`] on the chosen task, and turns a
-//! [`TaskError`] into a one-line report and an exit status. [`Task.exec`] and [`Task.silk`] run
-//! other programs with the terminal and environment of the task. A task that needs another task
-//! calls it: tasks are ordinary functions.
-//!
-//! The environment holds `SILK_PROJECT_ROOT`, the package directory; `SILK_INVOCATION_DIRECTORY`,
-//! where the command was typed; `SILK_COMPILER`, the compiler that built the tasks; and, in a hook,
-//! `SILK_HOOK`, such as `before-build`, and `SILK_HOOK_RESULT`, such as the `silk pack --json`
-//! object after `silk pack`.
+//! Task.main parses typed options and invokes TaskSet.perform. Task.exec and Task.silk share
+//! the developer's terminal and environment. SILK_PROJECT_ROOT is the package directory,
+//! SILK_INVOCATION_DIRECTORY is where the command was typed, and SILK_COMPILER is the compiler
+//! that built the tasks program.
 //!
 //! # Examples
 //! ```silk
@@ -70,8 +56,14 @@
 //!
 //! @category Command line
 
+import silk.build.step { StepError, StepFailure }
+import silk.concurrency.fiber { Cancelled }
+import silk.concurrency.thread_native { SpawnError }
+import silk.schema.issue { SchemaError }
+import silk.text.format { Debug, Format, Formatter }
+import silk.system.filesystem { AtomicWriteError }
 import silk.cli.command { CommandLine }
-import silk.cli.parse { Cli }
+import silk.cli.parse { Cli, Parsed }
 import silk.collections.bytes { Bytes }
 import silk.collections.list { List }
 import silk.collections.slice { Slice }
@@ -79,20 +71,33 @@ import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.core.result { Result }
 import silk.io.writer { Writer, WriterError }
-import silk.io.writer_native { StderrWriter }
+import silk.io.writer_native { StderrWriter, StdoutWriter }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.system.child_process { ChildProcess, Exited, ProcessError, ProcessOutcome, Signaled }
 import silk.system.child_process_native { OsChildProcess }
 import silk.system.filesystem { FileError, FileSystem, Path }
 import silk.system.filesystem_machine { MachineFileSystem }
+import silk.system.executable as Executable
 import silk.system.host_input { HostInput, HostInputError }
 import silk.text.string { InvalidUtf8, String }
 import silk.num.i32
 import silk.num.u32
+import silk.num.usize
+
 static if Intrinsic.targetOperatingSystem() == "windows" {
   import silk.platform.windows.process_image as WindowsProcessImage
-} else static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu") {
-  import silk.system.subprocess { ExitStatus, ExitWatch, SpawnOptions, Stdio, Subprocess, SubprocessError }
+} else static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetAbi() == "apple"
+  && Intrinsic.profileText("libc") == "system")
+  || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu"
+    && Intrinsic.profileText("libc") == "gnu") {
+  import silk.system.subprocess {
+    ExitStatus,
+    ExitWatch,
+    SpawnOptions,
+    Stdio,
+    Subprocess,
+    SubprocessError
+  }
 }
 
 /// A task that failed: what to report, and the exit status the tasks program ends with.
@@ -103,11 +108,19 @@ pub struct TaskError {
   pub status: i32,
 }
 
+impl Debug for TaskError {
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return run Format.writeText(&mut formatter, self.message.view())
+  }
+}
+
 /// A command line whose variants are tasks.
 pub interface TaskSet {
   /// Runs the task this value names, with its options.
   effect fn perform(self: Self) -> ()
-    ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+    ! TaskError | StepFailure | SpawnError | Cancelled
     ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem
 }
 
@@ -119,13 +132,25 @@ impl Task {
   /// the task succeeded, 0 after `--help`, 2 after a command line error, and a failed task's
   /// [`TaskError.status`] after writing `error: <message>` to standard error. An unexpected failure,
   /// such as a file that cannot be read, is reported the same way with status 1.
-  pub effect fn main<T: CommandLine + TaskSet>() -> i32 ? &mut HostInput {
+  ///
+  /// Help names the command `silk task`, as it is typed. `--help` without a task's name lists the
+  /// tasks, then writes the help of each one with its options and arguments. `--help=json` writes
+  /// that help as one JSON object, with every task under `commands`.
+  ///
+  /// `build`, `run`, `test` and `plan` are the toolchain's own commands. When `silk` starts the
+  /// tasks program for one of them and `T` has no variant of that name, nothing runs here: the
+  /// status is 0 and `silk` runs its built-in command.
+  pub effect fn main<T: CommandLine + TaskSet>() -> i32
+    ? &mut HostInput {
     let mut allocator = Allocator.systemAllocatorProvider()
-    return run Effect.catchAll(provided<T>(), unreported) |> Effect.provideMut<Allocator>(&mut allocator)
+    return run Effect.catchAll(provided<T>(), unreported)
+      |> Effect.provideMut<Allocator>(&mut allocator)
   }
 
   /// Fails the task with `message` and status 1.
-  pub effect fn abort(message: string) -> never ! TaskError | OutOfMemoryError ? &mut Allocator {
+  pub effect fn abort(message: string) -> never
+    ! TaskError | OutOfMemoryError
+    ? &mut Allocator {
     fail TaskError { message: run String.copy(message), status: 1 }
   }
 
@@ -147,7 +172,7 @@ impl Task {
   pub effect fn execBytes(program: &[u8], arguments: &[Bytes]) -> ()
     ! TaskError | HostInputError | OutOfMemoryError
     ? &mut HostInput | &mut Allocator | &mut FileSystem {
-    let located = match move run located(program) {
+    let located = match move run Executable.findBytes(program) {
       Option<Path>.Some { value } => move value
       Option<Path>.None => run failed(b"cannot find the program ", program, 127)
     }
@@ -173,9 +198,14 @@ impl Task {
     ? &mut HostInput | &mut Allocator | &mut FileSystem {
     let compiler = match move run HostInput.variableNamed("SILK_COMPILER") {
       Option<Bytes>.Some { value } => move value
-      Option<Bytes>.None => run failed(b"SILK_COMPILER is not set; run the tasks with `silk task`", b"", 1)
+      Option<Bytes>.None => run failed(
+        b"SILK_COMPILER is not set; run the tasks with `silk task`",
+        b"",
+        1,
+      )
     }
     let words = run owned(arguments)
+
     // A path, so the compiler is never looked up on `PATH`.
     run Task.execBytes(Bytes.asSlice(&compiler), List<Bytes>.asSlice(&words))
   }
@@ -189,7 +219,7 @@ impl Task {
   pub effect fn capture(program: string, arguments: &[string]) -> Bytes
     ! TaskError | ProcessError | HostInputError | OutOfMemoryError | WriterError
     ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
-    let located = match move run located(String.utf8Bytes(program)) {
+    let located = match move run Executable.findBytes(String.utf8Bytes(program)) {
       Option<Path>.Some { value } => move value
       Option<Path>.None => run failed(b"cannot find the program ", String.utf8Bytes(program), 127)
     }
@@ -227,7 +257,9 @@ impl Task {
   ///
   /// # Errors
   /// [`TaskError`] when the variable is not set, as outside `silk task`.
-  pub effect fn root() -> Path ! TaskError | HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
+  pub effect fn root() -> Path
+    ! TaskError | HostInputError | OutOfMemoryError
+    ? &mut HostInput | &mut Allocator {
     return run directoryNamed("SILK_PROJECT_ROOT")
   }
 
@@ -236,7 +268,9 @@ impl Task {
   ///
   /// # Errors
   /// [`TaskError`] when the variable is not set, as outside `silk task`.
-  pub effect fn invocationDirectory() -> Path ! TaskError | HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
+  pub effect fn invocationDirectory() -> Path
+    ! TaskError | HostInputError | OutOfMemoryError
+    ? &mut HostInput | &mut Allocator {
     return run directoryNamed("SILK_INVOCATION_DIRECTORY")
   }
 }
@@ -244,18 +278,73 @@ impl Task {
 effect fn performed<T: CommandLine + TaskSet>() -> i32
   ! HostInputError | OutOfMemoryError | WriterError
   ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
-  let chosen = match move run Cli.read<T>() {
-    Result<T, i32>.Success { value } => move value
-    Result<T, i32>.Failure { error } => { return error }
+  let static commands = Cli.commands<T>()
+  if run handedBack(commands) {
+    return 0
+  }
+  let chosen = match move run Cli.fromHost<T>() {
+    Parsed<T>.Run { value } => move value
+
+    // Help names the tasks as they are typed, after `silk task`, and without a task it lists every
+    // task with its options.
+    Parsed<T>.Help { command, json } => {
+      let mut out = StdoutWriter.make()
+      if json {
+        run Cli.writeHelpJsonAs<T>("silk task", command) |> Effect.provideMut<Writer>(&mut out)
+      } else if command == "" {
+        run Cli.writeEachHelp<T>("silk task", "Tasks") |> Effect.provideMut<Writer>(&mut out)
+      } else {
+        run Cli.writeHelpAs<T>("silk task", command) |> Effect.provideMut<Writer>(&mut out)
+      }
+      return 0
+    }
+    Parsed<T>.Version => {
+      let mut out = StdoutWriter.make()
+      run Cli.writeVersion<T>() |> Effect.provideMut<Writer>(&mut out)
+      return 0
+    }
+
+    // The error, then the help of the task it concerns.
+    Parsed<T>.Failed { error, command } => {
+      let mut err = StderrWriter.make()
+      run Cli.writeError(&error) |> Effect.provideMut<Writer>(&mut err)
+      run Writer.writeString("\n") |> Effect.provideMut<Writer>(&mut err)
+      run Cli.writeHelpAs<T>("silk task", command) |> Effect.provideMut<Writer>(&mut err)
+      return 2
+    }
   }
   let outcome = run Effect.result(TaskSet.perform(move chosen))
   let mut err = StderrWriter.make()
   return match move outcome {
-    Result<(), TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError>.Success { .. } => 0
-    Result<(), TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError>.Failure { error } => match move error {
+    Result<(), TaskError | StepFailure | SpawnError | Cancelled>.Success { .. } => 0
+    Result<(), TaskError | StepFailure | SpawnError | Cancelled>.Failure {
+      error
+    } => match move error {
       TaskError failure => {
-        run reportLine(String.utf8Bytes(String.view(&failure.message))) |> Effect.provideMut<Writer>(&mut err)
+        run reportLine(String.utf8Bytes(String.view(&failure.message)))
+          |> Effect.provideMut<Writer>(&mut err)
         failure.status
+      }
+      StepError failure => {
+        run reportLine(String.ownedUtf8Bytes(&failure.message))
+          |> Effect.provideMut<Writer>(&mut err)
+        1
+      }
+      AtomicWriteError failure => {
+        run reportFailure(&failure) |> Effect.provideMut<Writer>(&mut err)
+        1
+      }
+      SchemaError failure => {
+        run reportFailure(&failure) |> Effect.provideMut<Writer>(&mut err)
+        1
+      }
+      SpawnError failure => {
+        run reportFailure(&failure) |> Effect.provideMut<Writer>(&mut err)
+        1
+      }
+      Cancelled failure => {
+        run reportFailure(&failure) |> Effect.provideMut<Writer>(&mut err)
+        1
       }
       ProcessError failure => {
         drop failure
@@ -272,10 +361,13 @@ effect fn performed<T: CommandLine + TaskSet>() -> i32
       }
       HostInputError failure => {
         drop failure
-        run reportLine(b"the command line or the environment could not be read") |> Effect.provideMut<Writer>(&mut err)
+        run reportLine(b"the command line or the environment could not be read")
+          |> Effect.provideMut<Writer>(&mut err)
         1
       }
-      OutOfMemoryError exhausted => { fail move exhausted }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
       WriterError failure => {
         drop failure
         1
@@ -284,37 +376,154 @@ effect fn performed<T: CommandLine + TaskSet>() -> i32
   }
 }
 
-// What a `FileOperation` code was doing, for a report such as `could not read a file: ...`.
-fn fileAction(code: i32) -> &'static [u8] {
-  if code == 0 { return b"read a file" }
-  if code == 1 { return b"write a file" }
-  if code == 2 { return b"look up a file" }
-  if code == 3 { return b"list a directory" }
-  if code == 4 { return b"create a directory" }
-  if code == 5 { return b"remove a file" }
-  if code == 6 { return b"remove a directory" }
-  if code == 7 { return b"use a path" }
-  if code == 8 { return b"create a temporary directory" }
-  if code == 9 { return b"create a file" }
-  if code == 10 { return b"replace a file" }
-  if code == 11 { return b"save a file to storage" }
-  if code == 12 { return b"save a directory to storage" }
+// Whether the command is one of the toolchain's own that `commands`, the space-separated names of
+// the tasks, leaves out. The toolchain names a file in `SILK_TASK_BUILTIN` when it starts the tasks
+// program for such a command; creating that file tells it to run its built-in.
+effect fn handedBack(commands: string) -> bool
+  ! HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator | &mut FileSystem {
+  let name = match move run HostInput.argument(1) {
+    Option<Bytes>.Some { value } => move value
+    Option<Bytes>.None => {
+      return false
+    }
+  }
+  let word = Bytes.asSlice(&name)
+  let reserved = sameBytes(word, b"build") || sameBytes(word, b"run") || sameBytes(word, b"test")
+    || sameBytes(word, b"plan")
+  if !reserved || listed(String.utf8Bytes(commands), word) {
+    return false
+  }
+  let marker = match move run HostInput.variableNamed("SILK_TASK_BUILTIN") {
+    Option<Bytes>.Some { value } => move value
+    Option<Bytes>.None => {
+      return false
+    }
+  }
+  return match move run Effect.result(marked(Bytes.asSlice(&marker))) {
+    Result<(), FileError | OutOfMemoryError>.Success { .. } => true
+    Result<(), FileError | OutOfMemoryError>.Failure { error } => match move error {
+      FileError refused => {
+        drop refused
+        false
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+}
+
+effect fn marked(file: &[u8]) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut Allocator | &mut FileSystem {
+  let path = run Path.fromBytes(file)
+  return run FileSystem.writeFile(&path, b"")
+}
+
+// Whether `name` is one of the space-separated `names`.
+fn listed(names: &[u8], name: &[u8]) -> bool {
+  let mut start: usize = 0
+  let mut at: usize = 0
+  while at <= names.length {
+    if at == names.length || names[at] == 32 {
+      if sameBytes(Slice.view<u8>(names, start, at - start), name) {
+        return true
+      }
+      start = at + 1
+    }
+    at = at + 1
+  }
+  return false
+}
+
+fn sameBytes(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at: usize = 0
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + 1
+  }
+  return true
+}
+
+/// What a `FileOperation` code was doing, for a report such as `could not read a file: ...`.
+pub fn fileAction(code: i32) -> &'static [u8] {
+  if code == 0 {
+    return b"read a file"
+  }
+  if code == 1 {
+    return b"write a file"
+  }
+  if code == 2 {
+    return b"look up a file"
+  }
+  if code == 3 {
+    return b"list a directory"
+  }
+  if code == 4 {
+    return b"create a directory"
+  }
+  if code == 5 {
+    return b"remove a file"
+  }
+  if code == 6 {
+    return b"remove a directory"
+  }
+  if code == 7 {
+    return b"use a path"
+  }
+  if code == 8 {
+    return b"create a temporary directory"
+  }
+  if code == 9 {
+    return b"create a file"
+  }
+  if code == 10 {
+    return b"replace a file"
+  }
+  if code == 11 {
+    return b"save a file to storage"
+  }
+  if code == 12 {
+    return b"save a directory to storage"
+  }
   return b"use the file system"
 }
 
-// Why a file operation failed, from a `FileReason` code.
-fn fileReason(code: i32) -> &'static [u8] {
-  if code == 0 { return b"it does not exist" }
-  if code == 1 { return b"it already exists" }
-  if code == 2 { return b"permission denied" }
+/// Why a file operation failed, from a `FileReason` code.
+pub fn fileReason(code: i32) -> &'static [u8] {
+  if code == 0 {
+    return b"it does not exist"
+  }
+  if code == 1 {
+    return b"it already exists"
+  }
+  if code == 2 {
+    return b"permission denied"
+  }
   if code == 3 {
     return b"the path is not valid; paths must be absolute, so resolve a relative one against Task.root()"
   }
-  if code == 4 { return b"it is a directory where a file was expected, or a file where a directory was" }
-  if code == 5 { return b"the directory is not empty" }
-  if code == 6 { return b"no space is left on the device" }
-  if code == 7 { return b"it is too large" }
-  if code == 8 { return b"this host does not support it" }
+  if code == 4 {
+    return b"it is a directory where a file was expected, or a file where a directory was"
+  }
+  if code == 5 {
+    return b"the directory is not empty"
+  }
+  if code == 6 {
+    return b"no space is left on the device"
+  }
+  if code == 7 {
+    return b"it is too large"
+  }
+  if code == 8 {
+    return b"this host does not support it"
+  }
   return b"the operating system refused"
 }
 
@@ -335,38 +544,60 @@ effect fn unreported<E>(error: E) -> i32 {
   return 1
 }
 
-effect fn reportLine(message: &[u8]) -> () ! WriterError ? &mut Writer {
+effect fn reportFailure<T: Debug>(failure: &T) -> ()
+  ! WriterError
+  ? &mut Writer {
+  run Writer.writeAll(b"error: ")
+  run Format.debug(failure)
+  return run Writer.writeAll(b"\n")
+}
+
+effect fn reportLine(message: &[u8]) -> ()
+  ! WriterError
+  ? &mut Writer {
   run Writer.writeAll(b"error: ")
   run Writer.writeAll(message)
   run Writer.writeAll(b"\n")
 }
 
-effect fn failed(first: &[u8], second: &[u8], status: i32) -> never ! TaskError | OutOfMemoryError ? &mut Allocator {
+effect fn failed(first: &[u8], second: &[u8], status: i32) -> never
+  ! TaskError | OutOfMemoryError
+  ? &mut Allocator {
   let mut message = run Bytes.copy(first)
   run Bytes.append(&mut message, second)
   fail TaskError { message: run textOf(move message), status: status }
 }
 
 // `bytes` as text.
-effect fn textOf(bytes: Bytes) -> String ! OutOfMemoryError ? &mut Allocator {
+effect fn textOf(bytes: Bytes) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
   return match move String.fromBytes(move bytes) {
     Result<String, InvalidUtf8>.Success { value } => move value
-    Result<String, InvalidUtf8>.Failure { .. } => run String.copy("a task failed (its message is not UTF-8)")
+    Result<String, InvalidUtf8>.Failure { .. } => run String.copy(
+      "a task failed (its message is not UTF-8)",
+    )
   }
 }
 
-effect fn appendNumber(text: &mut Bytes, value: i32) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn appendNumber(text: &mut Bytes, value: i32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
   if value < 0 {
     run Bytes.append(&mut text.*, b"-")
     run appendNumber(&mut text.*, 0 - value)
     return ()
   }
-  if value >= 10 { run appendNumber(&mut text.*, value / 10) }
+  if value >= 10 {
+    run appendNumber(&mut text.*, value / 10)
+  }
   let digit = [i32.wrappingToU8(48 + value % 10)]
   run Bytes.append(&mut text.*, &digit)
 }
 
-effect fn owned(arguments: &[string]) -> List<Bytes> ! OutOfMemoryError ? &mut Allocator {
+effect fn owned(arguments: &[string]) -> List<Bytes>
+  ! OutOfMemoryError
+  ? &mut Allocator {
   let mut words = List<Bytes>.make()
   let mut at: usize = 0
   while at < arguments.length {
@@ -376,10 +607,16 @@ effect fn owned(arguments: &[string]) -> List<Bytes> ! OutOfMemoryError ? &mut A
   return move words
 }
 
-effect fn directoryNamed(name: string) -> Path ! TaskError | HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
+effect fn directoryNamed(name: string) -> Path
+  ! TaskError | HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator {
   let value = match move run HostInput.variableNamed(name) {
     Option<Bytes>.Some { value } => move value
-    Option<Bytes>.None => run failed(String.utf8Bytes(name), b" is not set; run the tasks with `silk task`", 1)
+    Option<Bytes>.None => run failed(
+      String.utf8Bytes(name),
+      b" is not set; run the tasks with `silk task`",
+      1,
+    )
   }
   return match move run Effect.result(Path.fromBytes(Bytes.asSlice(&value))) {
     Result<Path, FileError | OutOfMemoryError>.Success { value: path } => move path
@@ -388,120 +625,81 @@ effect fn directoryNamed(name: string) -> Path ! TaskError | HostInputError | Ou
         drop invalid
         run failed(String.utf8Bytes(name), b" is not a path", 1)
       }
-      OutOfMemoryError exhausted => { fail move exhausted }
-    }
-  }
-}
-
-fn onWindows() -> bool {
-  static if Intrinsic.targetOperatingSystem() == "windows" { return true } else { return false }
-}
-
-// The program `written` names: a path when it holds a separator, else the first file of that name
-// in a directory of `PATH`, with `.exe` on Windows.
-effect fn located(written: &[u8]) -> Option<Path> ! HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator | &mut FileSystem {
-  let windows = onWindows()
-  let mut at: usize = 0
-  while at < written.length {
-    if written[at] == 47 || (windows && written[at] == 92) { return run existing(written) }
-    at = at + 1
-  }
-  let searched = match move run HostInput.variableNamed("PATH") {
-    Option<Bytes>.Some { value } => move value
-    Option<Bytes>.None => { return Option<Path>.none() }
-  }
-  let separator: u8 = if windows { 59 } else { 58 }
-  let directories = Bytes.asSlice(&searched)
-  let mut start: usize = 0
-  while start <= directories.length {
-    let mut end = start
-    while end < directories.length && directories[end] != separator { end = end + 1 }
-    if end > start {
-      let mut candidate = run Bytes.copy(Slice.view<u8>(directories, start, end - start))
-      run Bytes.append(&mut candidate, if windows { b"\\" } else { b"/" })
-      run Bytes.append(&mut candidate, written)
-      if let Option<Path>.Some { value } = move run existing(Bytes.asSlice(&candidate)) { return Option<Path>.some(move value) }
-      if windows {
-        run Bytes.append(&mut candidate, b".exe")
-        if let Option<Path>.Some { value } = move run existing(Bytes.asSlice(&candidate)) { return Option<Path>.some(move value) }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
       }
-    }
-    start = end + 1
-  }
-  return Option<Path>.none()
-}
-
-effect fn existing(spelled: &[u8]) -> Option<Path> ! OutOfMemoryError ? &mut Allocator | &mut FileSystem {
-  let path = match move run Effect.result(Path.fromBytes(spelled)) {
-    Result<Path, FileError | OutOfMemoryError>.Success { value } => move value
-    Result<Path, FileError | OutOfMemoryError>.Failure { error } => match move error {
-      FileError invalid => {
-        drop invalid
-        return Option<Path>.none()
-      }
-      OutOfMemoryError exhausted => { fail move exhausted }
-    }
-  }
-  return match move run Effect.result(FileSystem.exists(&path)) {
-    Result<bool, FileError>.Success { value } => if value { Option<Path>.some(move path) } else { Option<Path>.none() }
-    Result<bool, FileError>.Failure { error } => {
-      drop error
-      Option<Path>.none()
     }
   }
 }
 
 // Runs `program` with the task's standard streams and environment, and waits for it: its exit
 // status, 128 plus the signal's number after a signal, or none when it could not start.
-effect fn waited(program: &Path, arguments: &[Bytes]) -> Option<i32> ! OutOfMemoryError ? &mut Allocator {
+effect fn waited(program: &Path, arguments: &[Bytes]) -> Option<i32>
+  ! OutOfMemoryError
+  ? &mut Allocator {
   static if Intrinsic.targetOperatingSystem() == "windows" {
     return match move run WindowsProcessImage.execute(program, arguments, Option<&Path>.none()) {
       Option<u32>.Some { value } => Option<i32>.some(u32.wrappingToI32(value))
       Option<u32>.None => Option<i32>.none()
     }
   } else {
-  static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu") {
-    let mut request = run ChildProcess.request(program)
-    let mut at: usize = 0
-    while at < arguments.length {
-      run ChildProcess.addArgumentBytes(&mut request, Bytes.asSlice(&arguments[at]))
-      at = at + 1
-    }
-    run Subprocess.inheritEnvironment(&mut request)
-    let mut options = SpawnOptions.make()
-    run SpawnOptions.setStdio(&mut options, 0, Stdio.inherit(0))
-    run SpawnOptions.setStdio(&mut options, 1, Stdio.inherit(1))
-    run SpawnOptions.setStdio(&mut options, 2, Stdio.inherit(2))
-    let child = match move run Effect.result(Subprocess.spawn(&request, &options)) {
-      Result<Subprocess, SubprocessError | OutOfMemoryError>.Success { value } => move value
-      Result<Subprocess, SubprocessError | OutOfMemoryError>.Failure { error } => match move error {
-        SubprocessError refused => {
-          drop refused
-          return Option<i32>.none()
+    static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetAbi() == "apple"
+      && Intrinsic.profileText("libc") == "system")
+      || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu"
+        && Intrinsic.profileText("libc") == "gnu") {
+      let mut request = run ChildProcess.request(program)
+      let mut at: usize = 0
+      while at < arguments.length {
+        run ChildProcess.addArgumentBytes(&mut request, Bytes.asSlice(&arguments[at]))
+        at = at + 1
+      }
+      run Subprocess.inheritEnvironment(&mut request)
+      let mut options = SpawnOptions.make()
+      run SpawnOptions.setStdio(&mut options, 0, Stdio.inherit(0))
+      run SpawnOptions.setStdio(&mut options, 1, Stdio.inherit(1))
+      run SpawnOptions.setStdio(&mut options, 2, Stdio.inherit(2))
+      let child = match move run Effect.result(Subprocess.spawn(&request, &options)) {
+        Result<Subprocess, SubprocessError | OutOfMemoryError>.Success { value } => move value
+        Result<Subprocess, SubprocessError | OutOfMemoryError>.Failure {
+          error
+        } => match move error {
+          SubprocessError refused => {
+            drop refused
+            return Option<i32>.none()
+          }
+          OutOfMemoryError exhausted => {
+            fail move exhausted
+          }
         }
-        OutOfMemoryError exhausted => { fail move exhausted }
       }
-    }
-    let ended = run Effect.result(collected(Subprocess.pid(&child)))
-    drop child
-    return match move ended {
-      Result<ExitStatus, SubprocessError>.Success { value } => if value.signaled { Option<i32>.some(128 + value.signal) } else { Option<i32>.some(value.code) }
-      Result<ExitStatus, SubprocessError>.Failure { error } => {
-        drop error
-        Option<i32>.none()
+      let ended = run Effect.result(collected(Subprocess.pid(&child)))
+      drop child
+      return match move ended {
+        Result<ExitStatus, SubprocessError>.Success { value } => if value.signaled {
+          Option<i32>.some(128 + value.signal)
+        } else {
+          Option<i32>.some(value.code)
+        }
+        Result<ExitStatus, SubprocessError>.Failure { error } => {
+          drop error
+          Option<i32>.none()
+        }
       }
+    } else {
+      drop program
+      drop arguments
+      return Option<i32>.none()
     }
-  } else {
-    drop program
-    drop arguments
-    return Option<i32>.none()
-  }
   }
 }
 
-static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu") {
+static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetAbi() == "apple"
+  && Intrinsic.profileText("libc") == "system")
+  || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu"
+    && Intrinsic.profileText("libc") == "gnu") {
   // Waits for the child `pid` to end and collects its status.
-  effect fn collected(pid: i32) -> ExitStatus ! SubprocessError {
+  effect fn collected(pid: i32) -> ExitStatus
+    ! SubprocessError {
     let watch = run ExitWatch.open(pid)
     return run ExitWatch.collect(&watch)
   }

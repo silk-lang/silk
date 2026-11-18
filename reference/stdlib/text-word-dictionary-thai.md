@@ -9,44 +9,66 @@ Use `IcuDictionary` in `silk.text.word_dictionary`, which reads this data. Use t
 only to read the packed trie directly.
 
 ## Details
-The data is `thaidict.txt` of ICU release 78.1: 26383 words in 17325 nodes. A node record is
-seven bytes: the index of its first edge (big-endian u32), its edge count (u16) and 1 when a
-word ends there (u8). An edge record is six bytes: a BMP scalar (u16) and the index of its child
-node (u32). The edges of a node are sorted by scalar.
+The data is `thaidict.txt` of ICU release 78.1: 26383 words in 17325 nodes and 38637 edges. A
+node is a u32: the index of its first edge (24 bits), its edge count (7 bits) and 1 when a word
+ends there (low bit). Edge `i` has the label `labels()[i]` and leads to the node in the little-
+endian u32 at `targets()[4 * i]`. The edges of a node are consecutive and sorted by label. A
+label is a scalar minus `base()`; U+200C and U+200D are the labels 0xfe and 0xff.
+`rootTargets()` holds the child of the root for each of the 256 labels, or 0.
 
 Import as `word_dictionary_thai` with `import silk.text.word_dictionary_thai as word_dictionary_thai`.
 
-Public declarations: 3.
+Public declarations: 5.
 
 <a id="root"></a>
 
 ## `root`
 
 ```silk
-pub fn root() -> usize
+pub fn root() -> u32
 ```
 
-Returns the index of the root node of the trie.
+Returns the packed root node of the trie.
 
-<a id="nodes"></a>
+<a id="base"></a>
 
-## `nodes`
+## `base`
 
 ```silk
-pub fn nodes() -> &'static [u8]
+pub fn base() -> u32
 ```
 
-Returns the node records of the trie, seven bytes each.
+Returns the scalar of label 0.
 
-<a id="edges"></a>
+<a id="labels"></a>
 
-## `edges`
+## `labels`
 
 ```silk
-pub fn edges() -> &'static [u8]
+pub fn labels() -> &'static [u8]
 ```
 
-Returns the edge records of the trie, six bytes each.
+Returns the label of each edge, one byte each.
+
+<a id="targets"></a>
+
+## `targets`
+
+```silk
+pub fn targets() -> &'static [u8]
+```
+
+Returns the packed child node of each edge, four bytes each.
+
+<a id="rootTargets"></a>
+
+## `rootTargets`
+
+```silk
+pub fn rootTargets() -> &'static [u8]
+```
+
+Returns the packed child of the root for each label, or 0, four bytes each.
 
 
 Category: Text.

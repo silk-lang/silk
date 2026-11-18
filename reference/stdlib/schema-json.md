@@ -16,7 +16,8 @@ Decoding streams over the text with `silk.json.scanner.JsonScanner` and builds t
 directly, with no tree of JSON values in between. Each object is scanned once into an index of
 its members, so members may come in any order, and members the type does not name are skipped,
 or reported when its spec is `Spec.strict`. Every problem carries the span of the bytes it is
-about. Encoding writes compact JSON, with struct fields in declaration order.
+about. Encoding writes compact JSON, with struct fields in declaration order. A
+`silk.collections.bytes.Bytes` field is a string in standard Base64 with padding.
 
 ## Examples
 ### Report where a value failed
@@ -82,7 +83,9 @@ impl SchemaJson
 ### Associated function `decode`
 
 ```silk
-pub effect fn decode<T: Schema>(bytes: &[u8]) -> T ! SchemaError | OutOfMemoryError ? &mut Allocator
+pub effect fn decode<T: Schema>(bytes: &[u8]) -> T
+    ! SchemaError | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Reads one value of type `T` from the JSON text `bytes`, stopping at the first problem.
@@ -97,12 +100,27 @@ The whole input must be one JSON value, with optional white space around it.
   that failed, and its issue has the span of the bytes it is about.
 - `OutOfMemoryError` if the `Allocator` cannot supply the value.
 
+<a id="SchemaJson.impl.decodeTagged"></a>
+
+### Associated function `decodeTagged`
+
+```silk
+pub effect fn decodeTagged<T: Schema>(bytes: &[u8]) -> T
+    ! SchemaError | OutOfMemoryError
+    ? &mut Allocator
+```
+
+Reads JSON with options encoded as `[false]` or `[true, value]`, preserving nested options.
+An absent optional record field still decodes to `None`.
+
 <a id="SchemaJson.impl.decodeAll"></a>
 
 ### Associated function `decodeAll`
 
 ```silk
-pub effect fn decodeAll<T: Schema>(bytes: &[u8]) -> T ! SchemaErrors | OutOfMemoryError ? &mut Allocator
+pub effect fn decodeAll<T: Schema>(bytes: &[u8]) -> T
+    ! SchemaErrors | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Reads one value of type `T` from the JSON text `bytes`, reporting every problem.
@@ -124,7 +142,9 @@ reported. At most `MAX_PROBLEMS` (64) are listed.
 ### Associated function `decodeVariant`
 
 ```silk
-pub effect fn decodeVariant<U: Schema>(name: string, bytes: &[u8]) -> U ! SchemaErrors | OutOfMemoryError ? &mut Allocator
+pub effect fn decodeVariant<U: Schema>(name: string, bytes: &[u8]) -> U
+    ! SchemaErrors | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Reads the variant of the union `U` whose wire name is `name` from the JSON object `bytes` of its
@@ -146,8 +166,9 @@ union whose variants are the tools.
 ### Associated function `encode`
 
 ```silk
-pub effect fn encode<T: Schema>(value: &T)
-    -> () ! SchemaError | WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator
+pub effect fn encode<T: Schema>(value: &T) -> ()
+    ! SchemaError | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator
 ```
 
 Writes `value` as compact JSON to the ambient `Writer`.
@@ -158,6 +179,19 @@ Writes `value` as compact JSON to the ambient `Writer`.
   more than 64 levels deep. Its path is empty.
 - `WriterError` if the `Writer` fails. Bytes that it accepted before the failure stay written.
 - `OutOfMemoryError` if a codec needs memory that the `Allocator` cannot supply.
+
+<a id="SchemaJson.impl.encodeTagged"></a>
+
+### Associated function `encodeTagged`
+
+```silk
+pub effect fn encodeTagged<T: Schema>(value: &T) -> ()
+    ! SchemaError | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator
+```
+
+Writes options as `[false]` or `[true, value]`, preserving nested options.
+Optional record fields holding `None` remain omitted.
 
 <a id="JsonSchemaReader"></a>
 
@@ -229,6 +263,14 @@ impl<'input> JsonSchemaReader<'input>
 impl<'input> SchemaReader for JsonSchemaReader<'input>
 ```
 
+<a id="JsonSchemaReader.impl.SchemaReader.taggedOptions"></a>
+
+### Operation `taggedOptions`
+
+```silk
+fn taggedOptions(self: &Self) -> bool
+```
+
 <a id="JsonSchemaReader.impl.SchemaReader.path"></a>
 
 ### Operation `path`
@@ -244,7 +286,9 @@ Returns the path of the part being read.
 ### Operation `report`
 
 ```silk
-effect fn report(self: &mut Self, issue: Issue) -> () ! Issue | OutOfMemoryError ? &mut Allocator
+effect fn report(self: &mut Self, issue: Issue) -> ()
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Fails with the issue, or records it and returns when the reader collects every problem.
@@ -284,7 +328,9 @@ Returns the kind of the last complete value read.
 ### Operation `mark`
 
 ```silk
-effect fn mark(self: &mut Self) -> usize ! OutOfMemoryError ? &mut Allocator
+effect fn mark(self: &mut Self) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Remembers the open objects and lists and the scanner's position.
@@ -294,7 +340,9 @@ Remembers the open objects and lists and the scanner's position.
 ### Operation `recover`
 
 ```silk
-effect fn recover(self: &mut Self, mark: usize, skip: bool) -> () ! Issue | OutOfMemoryError ? &mut Allocator
+effect fn recover(self: &mut Self, mark: usize, skip: bool) -> ()
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Returns to the mark, closing the objects and lists opened since, and reads past the value
@@ -315,7 +363,9 @@ Forgets the mark and every later one.
 ### Operation `boolean`
 
 ```silk
-effect fn boolean(self: &mut Self) -> bool ! Issue | OutOfMemoryError ? &mut Allocator
+effect fn boolean(self: &mut Self) -> bool
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Reads `true` or `false`.
@@ -325,7 +375,9 @@ Reads `true` or `false`.
 ### Operation `signed`
 
 ```silk
-effect fn signed(self: &mut Self) -> i64 ! Issue | OutOfMemoryError ? &mut Allocator
+effect fn signed(self: &mut Self) -> i64
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Reads a JSON number as an `i64`.
@@ -335,7 +387,9 @@ Reads a JSON number as an `i64`.
 ### Operation `unsigned`
 
 ```silk
-effect fn unsigned(self: &mut Self) -> u64 ! Issue | OutOfMemoryError ? &mut Allocator
+effect fn unsigned(self: &mut Self) -> u64
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Reads a JSON number as a `u64`.
@@ -345,7 +399,9 @@ Reads a JSON number as a `u64`.
 ### Operation `float`
 
 ```silk
-effect fn float(self: &mut Self) -> f64 ! Issue | OutOfMemoryError ? &mut Allocator
+effect fn float(self: &mut Self) -> f64
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Reads a JSON number as an `f64`.
@@ -355,7 +411,9 @@ Reads a JSON number as an `f64`.
 ### Operation `text`
 
 ```silk
-effect fn text(self: &mut Self) -> String ! Issue | OutOfMemoryError ? &mut Allocator
+effect fn text(self: &mut Self) -> String
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Reads a JSON string, with its escapes decoded.
@@ -365,7 +423,9 @@ Reads a JSON string, with its escapes decoded.
 ### Operation `null`
 
 ```silk
-effect fn null(self: &mut Self) -> bool ! Issue | OutOfMemoryError ? &mut Allocator
+effect fn null(self: &mut Self) -> bool
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Reads past `null` and returns `true`, or returns `false` for another value.
@@ -375,7 +435,9 @@ Reads past `null` and returns `true`, or returns `false` for another value.
 ### Operation `beginList`
 
 ```silk
-effect fn beginList(self: &mut Self) -> () ! Issue | OutOfMemoryError ? &mut Allocator
+effect fn beginList(self: &mut Self) -> ()
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Reads past `[`.
@@ -385,7 +447,9 @@ Reads past `[`.
 ### Operation `nextElement`
 
 ```silk
-effect fn nextElement(self: &mut Self) -> bool ! Issue | OutOfMemoryError ? &mut Allocator
+effect fn nextElement(self: &mut Self) -> bool
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Returns `true` at the next element, or reads past `]` and returns `false`.
@@ -395,7 +459,9 @@ Returns `true` at the next element, or reads past `]` and returns `false`.
 ### Operation `beginObject`
 
 ```silk
-effect fn beginObject(self: &mut Self) -> () ! Issue | OutOfMemoryError ? &mut Allocator
+effect fn beginObject(self: &mut Self) -> ()
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Reads the object's members into an index once, so `member` finds each without scanning.
@@ -405,18 +471,32 @@ Reads the object's members into an index once, so `member` finds each without sc
 ### Operation `member`
 
 ```silk
-effect fn member(self: &mut Self, key: string) -> bool ! Issue | OutOfMemoryError ? &mut Allocator
+effect fn member(self: &mut Self, key: string) -> bool
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Finds the member `key` in the object's index and leaves the reader at its value. A missing key
 leaves the object's opening brace as the last span.
+
+<a id="JsonSchemaReader.impl.SchemaReader.nextMember"></a>
+
+### Operation `nextMember`
+
+```silk
+effect fn nextMember(self: &mut Self) -> Option<String>
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
+```
 
 <a id="JsonSchemaReader.impl.SchemaReader.rejectUnread"></a>
 
 ### Operation `rejectUnread`
 
 ```silk
-effect fn rejectUnread(self: &mut Self, expected: string<'static>) -> () ! Issue | OutOfMemoryError ? &mut Allocator
+effect fn rejectUnread(self: &mut Self, expected: string<'static>) -> ()
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Reports every member no `member` call found, at its key.
@@ -426,7 +506,9 @@ Reports every member no `member` call found, at its key.
 ### Operation `endObject`
 
 ```silk
-effect fn endObject(self: &mut Self) -> () ! Issue | OutOfMemoryError ? &mut Allocator
+effect fn endObject(self: &mut Self) -> ()
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Jumps past the whole object being read.
@@ -472,12 +554,22 @@ Returns a writer for one top-level value.
 impl SchemaWriter for JsonSchemaWriter
 ```
 
+<a id="JsonSchemaWriter.impl.SchemaWriter.taggedOptions"></a>
+
+### Operation `taggedOptions`
+
+```silk
+fn taggedOptions(self: &Self) -> bool
+```
+
 <a id="JsonSchemaWriter.impl.SchemaWriter.boolean"></a>
 
 ### Operation `boolean`
 
 ```silk
-effect fn boolean(self: &mut Self, value: bool) -> () ! Issue | WriterError ? &mut Writer
+effect fn boolean(self: &mut Self, value: bool) -> ()
+    ! Issue | WriterError
+    ? &mut Writer
 ```
 
 Writes `true` or `false`.
@@ -487,7 +579,9 @@ Writes `true` or `false`.
 ### Operation `signed`
 
 ```silk
-effect fn signed(self: &mut Self, value: i64) -> () ! Issue | WriterError ? &mut Writer
+effect fn signed(self: &mut Self, value: i64) -> ()
+    ! Issue | WriterError
+    ? &mut Writer
 ```
 
 Writes the integer in decimal.
@@ -497,7 +591,9 @@ Writes the integer in decimal.
 ### Operation `unsigned`
 
 ```silk
-effect fn unsigned(self: &mut Self, value: u64) -> () ! Issue | WriterError ? &mut Writer
+effect fn unsigned(self: &mut Self, value: u64) -> ()
+    ! Issue | WriterError
+    ? &mut Writer
 ```
 
 Writes the integer in decimal.
@@ -507,7 +603,9 @@ Writes the integer in decimal.
 ### Operation `float`
 
 ```silk
-effect fn float(self: &mut Self, value: f64) -> () ! Issue | WriterError ? &mut Writer
+effect fn float(self: &mut Self, value: f64) -> ()
+    ! Issue | WriterError
+    ? &mut Writer
 ```
 
 Writes the number. A NaN or an infinity fails with `IssueReason.InvalidValue`.
@@ -517,7 +615,9 @@ Writes the number. A NaN or an infinity fails with `IssueReason.InvalidValue`.
 ### Operation `text`
 
 ```silk
-effect fn text(self: &mut Self, value: string) -> () ! Issue | WriterError ? &mut Writer
+effect fn text(self: &mut Self, value: string) -> ()
+    ! Issue | WriterError
+    ? &mut Writer
 ```
 
 Writes a JSON string, with the escapes JSON needs.
@@ -527,7 +627,9 @@ Writes a JSON string, with the escapes JSON needs.
 ### Operation `null`
 
 ```silk
-effect fn null(self: &mut Self) -> () ! Issue | WriterError ? &mut Writer
+effect fn null(self: &mut Self) -> ()
+    ! Issue | WriterError
+    ? &mut Writer
 ```
 
 Writes `null`.
@@ -537,17 +639,21 @@ Writes `null`.
 ### Operation `beginList`
 
 ```silk
-effect fn beginList(self: &mut Self) -> () ! Issue | WriterError ? &mut Writer
+effect fn beginList(self: &mut Self, count: usize) -> ()
+    ! Issue | WriterError
+    ? &mut Writer
 ```
 
-Writes `[`.
+Writes `[`. JSON does not write `count`.
 
 <a id="JsonSchemaWriter.impl.SchemaWriter.element"></a>
 
 ### Operation `element`
 
 ```silk
-effect fn element(self: &mut Self) -> () ! Issue | WriterError ? &mut Writer
+effect fn element(self: &mut Self) -> ()
+    ! Issue | WriterError
+    ? &mut Writer
 ```
 
 Writes `,` before every element but the first.
@@ -557,7 +663,9 @@ Writes `,` before every element but the first.
 ### Operation `endList`
 
 ```silk
-effect fn endList(self: &mut Self) -> () ! Issue | WriterError ? &mut Writer
+effect fn endList(self: &mut Self) -> ()
+    ! Issue | WriterError
+    ? &mut Writer
 ```
 
 Writes `]`.
@@ -567,17 +675,21 @@ Writes `]`.
 ### Operation `beginObject`
 
 ```silk
-effect fn beginObject(self: &mut Self) -> () ! Issue | WriterError ? &mut Writer
+effect fn beginObject(self: &mut Self, count: usize) -> ()
+    ! Issue | WriterError
+    ? &mut Writer
 ```
 
-Writes `{`.
+Writes `{`. JSON does not write `count`.
 
 <a id="JsonSchemaWriter.impl.SchemaWriter.key"></a>
 
 ### Operation `key`
 
 ```silk
-effect fn key(self: &mut Self, name: string) -> () ! Issue | WriterError ? &mut Writer
+effect fn key(self: &mut Self, name: string) -> ()
+    ! Issue | WriterError
+    ? &mut Writer
 ```
 
 Writes `,` before every member but the first, then the key and `:`.
@@ -587,7 +699,9 @@ Writes `,` before every member but the first, then the key and `:`.
 ### Operation `endObject`
 
 ```silk
-effect fn endObject(self: &mut Self) -> () ! Issue | WriterError ? &mut Writer
+effect fn endObject(self: &mut Self) -> ()
+    ! Issue | WriterError
+    ? &mut Writer
 ```
 
 Writes `}`.
