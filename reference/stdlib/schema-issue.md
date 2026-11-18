@@ -171,6 +171,16 @@ Null
 
 A null value.
 
+<a id="ValueKind.Bytes"></a>
+
+### `Bytes`
+
+```silk
+Bytes
+```
+
+Binary data, such as a MessagePack `bin` value.
+
 <a id="ValueKind.List"></a>
 
 ### `List`

@@ -1,0 +1,299 @@
+//! Per-package backend settings and typed parameter bindings in a compilation graph.
+
+import silk.schema.json { SchemaJson }
+import silk.system.child_process { ChildProcess }
+import silk.core.result { Result }
+import silk.system.host_input { HostInput }
+import silk.system.filesystem { FileSystem }
+import silk.build.definition as Definitions { Parameter }
+import silk.build.options { Optimize }
+import silk.build.parameter as Parameters { Parameter as ParameterInput }
+import silk.schema.schema { Schema }
+import silk.concurrency.thread { Transferable }
+import silk.build.request { ParameterValue }
+import silk.build.step { Deferred, Step, Key, Make, StepError, StepFailure, StepHandle }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator }
+import silk.system.filesystem { Path }
+import silk.build.context as Context
+import silk.build.encoding as Encoding
+import silk.text.string { String, InvalidUtf8 }
+import silk.num.usize
+
+union Binding {
+  Value { pub module: String, pub name: String, pub value: Deferred<ParameterValue> },
+  Path { pub module: String, pub name: String, pub value: Deferred<Path> },
+}
+
+impl Schema for Binding {}
+
+/// Overrides that affect only the selected declared package.
+pub struct Package {
+  pub optimization: Option<Deferred<Optimize>>,
+  pub debugging: Option<Deferred<bool>>,
+  pub bindings: List<Binding>,
+  pub excluded: bool,
+}
+
+impl Schema for Package {}
+
+impl Package {
+  /// Creates an override that preserves the compilation's defaults.
+  pub fn make() -> Self {
+    return Package {
+      optimization: Option<Deferred<Optimize>>.none(),
+      debugging: Option<Deferred<bool>>.none(),
+      bindings: List<Binding>.make(),
+      excluded: false,
+    }
+  }
+
+  /// Selects optimization for code defined in this package, including generic instantiations.
+  pub fn optimize(self: Self, value: Deferred<Optimize>) -> Self {
+    let mut package = move self
+    package.optimization = Option<Deferred<Optimize>>.some(move value)
+    return move package
+  }
+
+  /// Selects debug information for code defined in this package.
+  pub fn debug(self: Self, value: Deferred<bool>) -> Self {
+    let mut package = move self
+    package.debugging = Option<Deferred<bool>>.some(move value)
+    return move package
+  }
+
+  /// Binds a typed value to a public parameter declared in `module`, such as `build.silk`.
+  pub effect fn set<T: Schema + ParameterInput + Transferable + 'static>(
+    self: Self,
+    module: string,
+    name: string,
+    value: Deferred<T>,
+  ) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    let mut package = move self
+    run package.bindings.append(
+      Binding.Value {
+        module: run String.copy(module),
+        name: run String.copy(name),
+        value: run Parameters.deferred(move value),
+      },
+    )
+    return move package
+  }
+
+  /// Grants the package's plan read access to a declared path parameter.
+  pub effect fn supplyPath(self: Self, module: string, name: string, value: Deferred<Path>) -> Self
+    ! StepFailure
+    ? &mut Allocator {
+    let mut package = move self
+    run package.bindings.append(
+      Binding.Path {
+        module: run String.copy(module),
+        name: run String.copy(name),
+        value: move value,
+      },
+    )
+    return move package
+  }
+
+  /// Names a file or directory listed in a declared dependency's `package.include`.
+  /// Only a consumer's use resolves and fetches the dependency. No package code is evaluated.
+  /// The consumer keys the referenced file or tree, including changes to a local dependency.
+  pub effect fn path(name: string, subpath: string) -> Deferred<Path>
+    ! StepFailure
+    ? &mut Allocator | &mut HostInput | &mut FileSystem {
+    let manifest = run Context.manifest()
+    let located = Located {
+      compiler: run Context.compiler(),
+      manifest: run Context.text(&manifest),
+      name: run String.copy(name),
+      subpath: run String.copy(subpath),
+    }
+    let step = run StepHandle.described(
+      "package-path",
+      run Encoding.json<Located>(&located),
+      List<StepHandle>.make(),
+    )
+    return step.resolvedPath()
+  }
+
+  /// Excludes this dependency from the compilation's available import graph.
+  pub fn without(self: Self) -> Self {
+    let mut package = move self
+    package.excluded = true
+    return move package
+  }
+}
+
+/// Declares the deferred values and supplied paths that determine the override.
+pub effect fn key(package: &Package, key: &mut Key) -> ()
+  ! StepFailure
+  ? &mut Allocator {
+  run key.text(
+    if package.excluded {
+      "excluded"
+    } else {
+      "included"
+    },
+  )
+  if let Option<Deferred<Optimize>>.Some { value } = &package.optimization {
+    run key.text("optimization")
+    run key.value(&value)
+  }
+  if let Option<Deferred<bool>>.Some { value } = &package.debugging {
+    run key.text("debug")
+    run key.value(&value)
+  }
+  let bindings = package.bindings.asSlice()
+  let mut at = usize.ZERO
+  while at < bindings.length {
+    match &bindings[at] {
+      Binding.Value { module, name, value } => {
+        run key.text("value")
+        run key.text(module.view())
+        run key.text(name.view())
+        run key.value(&value)
+      }
+      Binding.Path { module, name, value } => {
+        run key.text("path")
+        run key.text(module.view())
+        run key.text(name.view())
+        run key.tree(&value)
+      }
+    }
+    at = at + usize.ONE
+  }
+}
+
+/// Resolves overrides only after every declared producer has completed.
+pub effect fn resolve(package: &Package, make: &mut Make) -> Definitions.Package
+  ! StepFailure
+  ? &mut Allocator {
+  let mut optimization = Option<String>.none()
+  if let Option<Deferred<Optimize>>.Some { value } = &package.optimization {
+    optimization = Option<String>.some(run String.copy((run make.get(&value)).text()))
+  }
+  let mut debugging = Option<bool>.none()
+  if let Option<Deferred<bool>>.Some { value } = &package.debugging {
+    debugging = Option<bool>.some(run make.get(&value))
+  }
+  let mut parameters = List<Parameter>.make()
+  let bindings = package.bindings.asSlice()
+  let mut at = usize.ZERO
+  while at < bindings.length {
+    match &bindings[at] {
+      Binding.Value { module, name, value } => {
+        run parameters.append(
+          Parameter {
+            module: run String.copy(module.view()),
+            name: run String.copy(name.view()),
+            value: run make.get(&value),
+            suppliedPath: false,
+          },
+        )
+      }
+      Binding.Path { module, name, value } => {
+        run parameters.append(
+          Parameter {
+            module: run String.copy(module.view()),
+            name: run String.copy(name.view()),
+            value: ParameterValue.Text { value: run Context.text(&run make.path(&value)) },
+            suppliedPath: true,
+          },
+        )
+      }
+    }
+    at = at + usize.ONE
+  }
+  return Definitions.Package {
+    optimization: move optimization,
+    debug: debugging,
+    parameters: move parameters,
+    excluded: package.excluded,
+  }
+}
+
+struct PackagePath {
+  compiler: Deferred<Path>,
+  manifest: String,
+  name: String,
+  subpath: String,
+  files: Deferred<List<String>>,
+  packages: Deferred<List<String>>,
+}
+
+// A dependency path lookup before the local inputs of its resolution are collected.
+struct Located {
+  pub compiler: Deferred<Path>,
+  pub manifest: String,
+  pub name: String,
+  pub subpath: String,
+}
+
+impl Schema for Located {}
+
+/// Restores a described dependency path lookup as a step this process can run.
+pub effect fn restorePath(step: &[u8]) -> StepHandle
+  ! StepFailure
+  ? &mut Allocator | &mut FileSystem {
+  let located = run SchemaJson.decode<Located>(step)
+  let inputs = run Context.inputs(&run Path.make(located.manifest.view()))
+  return run Step.register(
+    PackagePath {
+      compiler: move located.compiler,
+      manifest: move located.manifest,
+      name: move located.name,
+      subpath: move located.subpath,
+      files: run Deferred<List<String>>.value(move inputs.files),
+      packages: run Deferred<List<String>>.value(move inputs.packages),
+    },
+  )
+}
+
+impl Step for PackagePath {
+  effect fn key(self: &Self, key: &mut Key) -> ()
+    ! StepFailure
+    ? &mut Allocator {
+    run key.file(&self.compiler)
+    run key.text(self.manifest.view())
+    run key.text(self.name.view())
+    run key.text(self.subpath.view())
+    run key.files(&self.files)
+    run key.packageTrees(&self.packages)
+    run key.environment("SILK_HOME")
+    run key.environment("HOME")
+    run key.environment("PATH")
+    run key.environment("SILK_OFFLINE")
+  }
+
+  effect fn make(self: &Self, make: &mut Make) -> ()
+    ! StepFailure
+    ? &mut Allocator {
+    let outcome = run make.exec(
+      &self.compiler,
+      &[
+        "package-path",
+        "--manifest",
+        self.manifest.view(),
+        "--dependency",
+        self.name.view(),
+        "--path",
+        self.subpath.view(),
+      ],
+    )
+    if Option<i32>.unwrapOr(ChildProcess.exitCode(&outcome), 2) != 0 {
+      let mut message = run String.copy("cannot resolve the dependency path")
+      if let Result<string, InvalidUtf8>.Success { value } = move String.fromUtf8(
+        ChildProcess.errorBytes(&outcome),
+      ) {
+        run message.append(": ")
+        run message.append(value)
+      }
+      fail StepError { message: move message }
+    }
+    let path = run SchemaJson.decode<String>(ChildProcess.outputBytes(&outcome))
+    return run make.resolvedPath(&path)
+  }
+}

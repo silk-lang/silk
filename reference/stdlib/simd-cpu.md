@@ -12,7 +12,7 @@ build itself selects the feature, which costs nothing at run time.
 
 ## Details
 A [`CpuFeatures`](#CpuFeatures) value is a set of feature names of the target architecture, spelled as in
-the compilation profile, such as `"avx2"`, `"dotprod"` or `"simd128"`. [`CpuFeatures.selected`](#CpuFeatures.impl.selected)
+`Compilation.cpuFeatures`, such as `"avx2"`, `"dotprod"` or `"simd128"`. [`CpuFeatures.selected`](#CpuFeatures.impl.selected)
 is the set the build selects. [`CpuFeatures.machine`](#CpuFeatures.impl.machine) is the set the running machine has, which
 always includes the selected set:
 
@@ -104,7 +104,7 @@ build itself selects the feature, which costs nothing at run time.
 
 ### Details
 
-The names are spelled as in the compilation profile, such as `"avx2"`, `"dotprod"` or
+The names are spelled as in `Compilation.cpuFeatures`, such as `"avx2"`, `"dotprod"` or
 `"simd128"`. [`CpuFeatures.selected`](#CpuFeatures.impl.selected) is the set the build selects. [`CpuFeatures.machine`](#CpuFeatures.impl.machine) is
 the set the running machine has, asked once per process, and always includes the selected set.
 
@@ -138,7 +138,7 @@ impl CpuFeatures
 pub fn selected() -> CpuFeatures
 ```
 
-Returns the features that the build selects, from the compilation profile.
+Returns the features that the build selects, from the compilation settings.
 
 <a id="CpuFeatures.impl.machine"></a>
 

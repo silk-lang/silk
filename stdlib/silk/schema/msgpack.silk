@@ -1,0 +1,1062 @@
+//! Read and write `Schema` types as MessagePack.
+//!
+//! # When to use
+//! Call [`SchemaMsgpack.decode`] to read a value of a `silk.schema.schema.Schema` type from
+//! MessagePack bytes, [`SchemaMsgpack.decodeAll`] to report every problem in the bytes at once, and
+//! [`SchemaMsgpack.encode`] to write a value to the ambient `Writer`. Use MessagePack instead of
+//! `silk.schema.json.SchemaJson` when the reader is a program and size or binary data matters. Use
+//! `silk.msgpack.value.Msgpack` for MessagePack whose shape is not known in advance.
+//!
+//! # Details
+//! A struct is a map with one text key per field, in declaration order; a union follows the same
+//! tag rules as in JSON. An `Option` that is `None` is `nil`, and a `None` field is left out. A
+//! `silk.collections.bytes.Bytes` field is MessagePack binary data, not Base64 text. Integers are
+//! written in the shortest format and read from any width, and a `float 32` is read as `f64`.
+//!
+//! Decoding streams over the bytes with `silk.msgpack.scanner.MsgpackScanner` and builds the value
+//! directly, with no tree in between. Each map is scanned once into an index of its entries, so
+//! entries may come in any order, and entries the type does not name are skipped, or reported when
+//! its spec is `Spec.strict`. Every problem carries the span of the bytes it is about.
+//!
+//! # Gotchas
+//! A map with a key that is not text cannot be read as a struct. An extension value, such as a
+//! timestamp (type -1), has no schema type and is reported as `IssueReason.InvalidType` where a
+//! field reads it; it is skipped where no field does. Nesting is limited to 64 levels.
+//!
+//! `silk.schema.report.SchemaReport` shows problems as lines and columns of text, which MessagePack
+//! does not have. Show a problem by its `path` and by the byte offsets of its issue's `span`.
+//!
+//! # Examples
+//! ## Write a struct and read it back
+//! ```silk
+//! import silk.collections.bytes { Bytes }
+//! import silk.collections.slice { Slice }
+//! import silk.core.effect { Effect }
+//! import silk.io.writer { Writer, WriterError }
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.schema.issue { SchemaError }
+//! import silk.schema.msgpack { SchemaMsgpack }
+//! import silk.schema.schema { Schema }
+//!
+//! struct Capture {
+//!   bytes: [u8; 64],
+//!   length: usize,
+//! }
+//!
+//! impl Writer for Capture {
+//!   effect fn writeAll(self: &mut Self, value: &[u8]) -> () ! WriterError ? &mut Writer {
+//!     if self.length + value.length > 64 { fail Writer.failure() }
+//!     Slice.copyInto<u8>(&mut self.bytes, self.length, value)
+//!     self.length = self.length + value.length
+//!     return ()
+//!   }
+//!
+//!   effect fn flush(self: &mut Self) -> () ! WriterError ? &mut Writer { return () }
+//! }
+//!
+//! struct Frame {
+//!   pub id: u32,
+//!   pub payload: Bytes,
+//! }
+//!
+//! impl Schema for Frame {}
+//!
+//! effect fn check() -> i32 ! SchemaError | WriterError | OutOfMemoryError ? &mut Allocator {
+//!   let frame = Frame { id: 7, payload: run Bytes.copy(b"\xff\x00") }
+//!   let mut capture = Capture { bytes: [0; 64], length: 0 }
+//!   run SchemaMsgpack.encode<Frame>(&frame) |> Effect.provideMut<Writer>(&mut capture)
+//!   let written = Slice.view<u8>(&capture.bytes, 0, capture.length)
+//!   // {"id": 7, "payload": bin(ff 00)}
+//!   if written != b"\x82\xa2id\x07\xa7payload\xc4\x02\xff\x00" {
+//!     return 1
+//!   }
+//!   let again = run SchemaMsgpack.decode<Frame>(written)
+//!   if again.id != 7 || again.payload.asSlice() != b"\xff\x00" {
+//!     return 2
+//!   }
+//!   return 0
+//! }
+//!
+//! pub effect fn main() -> i32 ! SchemaError | WriterError | OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   return run check() |> Effect.provideMut<Allocator>(&mut allocator)
+//! }
+//! ```
+//!
+//! @category Data formats
+
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.io.writer { Writer, WriterError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.msgpack.output { MsgpackOutput }
+import silk.msgpack.scanner { MAX_DEPTH, MsgpackError, MsgpackScanner, MsgpackSpan, MsgpackToken }
+import silk.num.i64
+import silk.num.u64
+import silk.num.usize
+import silk.schema.issue {
+  Issue,
+  IssueReason,
+  MAX_PROBLEMS,
+  SchemaError,
+  SchemaErrors,
+  Span,
+  ValueKind
+}
+import silk.schema.path { SchemaPath, PathSegment }
+import silk.schema.schema { Schema, SchemaReader, SchemaWriter, Schemas }
+import silk.text.string { String }
+
+/// The owner of the MessagePack entry points. It has no fields and is never constructed.
+pub struct SchemaMsgpack {}
+
+impl SchemaMsgpack {
+  /// Reads one value of type `T` from the MessagePack `bytes`, stopping at the first problem.
+  ///
+  /// # Details
+  ///
+  /// The whole input must be exactly one MessagePack value. A struct is read from a map with text
+  /// keys, in any order; integers are read from any width, and `Bytes` from binary data.
+  ///
+  /// # Errors
+  ///
+  /// - `SchemaError` if the bytes are not valid MessagePack, hold more than one value, or do not
+  ///   hold a `T`. Its `path` names the part that failed, and its issue has the span of the bytes
+  ///   it is about, as byte offsets into `bytes`.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the value.
+  pub effect fn decode<T: Schema>(bytes: &[u8]) -> T
+    ! SchemaError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut reader = MsgpackSchemaReader.make(bytes)
+    let read = run Effect.result(readAll<T>(&mut reader))
+    return match move read {
+      Result<T, Issue | OutOfMemoryError>.Success { value } => move value
+      Result<T, Issue | OutOfMemoryError>.Failure { error } => match move error {
+        Issue { reason, expected, found, span } => {
+          fail SchemaError {
+            path: move reader.path,
+            issue: Issue { reason: reason, expected: expected, found: found, span: span },
+            got: Option<String>.none(),
+          }
+        }
+        OutOfMemoryError {} => {
+          fail OutOfMemoryError {}
+        }
+      }
+    }
+  }
+
+  /// Reads one value of type `T` from the MessagePack `bytes`, reporting every problem.
+  ///
+  /// # Details
+  ///
+  /// A field, element or variant that fails is recorded and skipped, and reading goes on with the
+  /// next one, so one call lists every problem, in input order: a missing key, a wrong type, a
+  /// number out of range and a failed rule alike. Bytes that are not one valid MessagePack value
+  /// are the one problem reported. At most `MAX_PROBLEMS` (64) are listed.
+  ///
+  /// # Errors
+  ///
+  /// - `SchemaErrors` with every problem found.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the value.
+  pub effect fn decodeAll<T: Schema>(bytes: &[u8]) -> T
+    ! SchemaErrors | OutOfMemoryError
+    ? &mut Allocator {
+    let mut reader = MsgpackSchemaReader.collectingAll(bytes)
+    let read = run Effect.result(collectAll<T>(&mut reader))
+    return match move read {
+      Result<T, Issue | OutOfMemoryError>.Success { value } => {
+        if List<SchemaError>.length(&reader.errors) != 0 {
+          fail SchemaErrors { errors: move reader.errors, dropped: reader.dropped }
+        }
+        move value
+      }
+      Result<T, Issue | OutOfMemoryError>.Failure { error } => match move error {
+        Issue { reason, expected, found, span } => {
+          if reason != IssueReason.Reported {
+            run record(
+              &mut reader,
+              Issue { reason: reason, expected: expected, found: found, span: span },
+            )
+          }
+          fail SchemaErrors { errors: move reader.errors, dropped: reader.dropped }
+        }
+        OutOfMemoryError {} => {
+          fail OutOfMemoryError {}
+        }
+      }
+    }
+  }
+
+  /// Writes `value` as MessagePack to the ambient `Writer`, without flushing it.
+  ///
+  /// # Details
+  ///
+  /// A struct is written as a map with one text key per field, in declaration order, without its
+  /// `None` fields. Every value takes the shortest format that holds it, and a float is always a
+  /// `float 64`. Nothing is buffered: each value goes to the `Writer` as it is reached.
+  ///
+  /// # Errors
+  ///
+  /// - `SchemaError` if MessagePack cannot hold the value: text, bytes or a list longer than
+  ///   4294967295, or a value nested more than 64 levels deep. Its path is empty.
+  /// - `WriterError` if the `Writer` fails. Bytes that it accepted before the failure stay written.
+  /// - `OutOfMemoryError` if a codec needs memory that the `Allocator` cannot supply.
+  pub effect fn encode<T: Schema>(value: &T) -> ()
+    ! SchemaError | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator {
+    let mut writer = MsgpackSchemaWriter.make()
+    return run Effect.catch<Issue>(
+      Schemas.write<T, MsgpackSchemaWriter>(value, &mut writer),
+      effect |issue: Issue| -> ()
+        ! SchemaError {
+        fail SchemaError { path: SchemaPath.make(), issue: issue, got: Option<String>.none() }
+      },
+    )
+  }
+}
+
+effect fn readAll<T: Schema>(reader: &mut MsgpackSchemaReader<'_>) -> T
+  ! Issue | OutOfMemoryError
+  ? &mut Allocator {
+  let value = run Schemas.read<T, MsgpackSchemaReader<'_>>(&mut reader.*)
+  run expectEnd(&mut reader.scanner)
+  return move value
+}
+
+effect fn expectEnd(scanner: &mut MsgpackScanner<'_>) -> ()
+  ! Issue {
+  let found = run token(&mut scanner.*)
+  return match found {
+    MsgpackToken.EndOfInput => ()
+    _ => {
+      fail Issue.at(
+        IssueReason.InvalidSyntax,
+        "the end of the input",
+        kindOf(found),
+        tokenSpan(&scanner.*),
+      )
+    }
+  }
+}
+
+// Checks that the whole input is one MessagePack value, so a collecting read never meets broken
+// bytes.
+effect fn collectAll<T: Schema>(reader: &mut MsgpackSchemaReader<'_>) -> T
+  ! Issue | OutOfMemoryError
+  ? &mut Allocator {
+  let mut scanner = MsgpackScanner.fork(&reader.scanner)
+  let end = run skipValue(&mut scanner)
+  drop end
+  run expectEnd(&mut scanner)
+  return run readAll<T>(&mut reader.*)
+}
+
+// One entry of a map: where its key is, and a scanner at its value.
+struct Member<'input> {
+  key: MsgpackSpan,
+  value: MsgpackScanner<'input>,
+  seen: bool,
+}
+
+// A map being read: its entries, and a scanner after its last one.
+struct ObjectFrame<'input> {
+  start: usize,
+  members: List<Member<'input>>,
+  end: MsgpackScanner<'input>,
+  endOffset: usize,
+}
+
+// An array being read: where it starts, and how many elements are not read yet.
+struct ListFrame {
+  start: usize,
+  remaining: usize,
+}
+
+impl Copy for ListFrame {}
+
+// A position a collecting read can return to.
+struct Mark<'input> {
+  frames: usize,
+  lists: usize,
+  scanner: MsgpackScanner<'input>,
+}
+
+/// A `SchemaReader` over MessagePack bytes.
+///
+/// # When to use
+///
+/// [`SchemaMsgpack.decode`] and [`SchemaMsgpack.decodeAll`] use it. Use it directly with
+/// `silk.schema.schema.Schemas.read` to read a value that more bytes follow, which
+/// `SchemaMsgpack.decode` refuses.
+pub struct MsgpackSchemaReader<'input> {
+  scanner: MsgpackScanner<'input>,
+  frames: List<ObjectFrame<'input>>,
+  lists: List<ListFrame>,
+  marks: List<Mark<'input>>,
+  path: SchemaPath,
+  collecting: bool,
+  errors: List<SchemaError>,
+  dropped: usize,
+  last: Option<Span>,
+  lastKind: ValueKind,
+}
+
+impl<'input> MsgpackSchemaReader<'input> {
+  /// Returns a reader at the start of `input` that stops at the first problem.
+  pub fn make(input: &'input [u8]) -> MsgpackSchemaReader<'input> {
+    return MsgpackSchemaReader<'input> {
+      scanner: MsgpackScanner.make(input),
+      frames: List<ObjectFrame<'input>>.make(),
+      lists: List<ListFrame>.make(),
+      marks: List<Mark<'input>>.make(),
+      path: SchemaPath.make(),
+      collecting: false,
+      errors: List<SchemaError>.make(),
+      dropped: usize.ZERO,
+      last: Option<Span>.none(),
+      lastKind: ValueKind.Unknown,
+    }
+  }
+
+  /// Returns a reader at the start of `input` that records every problem instead of stopping at
+  /// the first. Read them with [`MsgpackSchemaReader.intoErrors`].
+  ///
+  /// # Gotchas
+  ///
+  /// A collecting read goes on after a failed part by reading past it, so `input` must be valid
+  /// MessagePack; `SchemaMsgpack.decodeAll` checks that first.
+  pub fn collectingAll(input: &'input [u8]) -> MsgpackSchemaReader<'input> {
+    let mut reader = MsgpackSchemaReader<'input>.make(input)
+    reader.collecting = true
+    return move reader
+  }
+
+  /// Returns the problems the reader recorded, in the order they are in the input.
+  pub fn intoErrors(self: Self) -> List<SchemaError> {
+    return move self.errors
+  }
+}
+
+effect fn record(reader: &mut MsgpackSchemaReader<'_>, issue: Issue) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if List<SchemaError>.length(&reader.errors) >= MAX_PROBLEMS {
+    reader.dropped = reader.dropped + usize.ONE
+    return ()
+  }
+  let path = run SchemaPath.copy(&reader.path)
+
+  // Problems are kept in input order: an unexpected key is found after the fields it precedes.
+  let mut at = List<SchemaError>.length(&reader.errors)
+  if let Option<Span>.Some { value: span } = issue.span {
+    let recorded = List<SchemaError>.asSlice(&reader.errors)
+    while at > usize.ZERO && startsAfter(recorded[at - usize.ONE].issue.span, span.start) {
+      at = at - usize.ONE
+    }
+  }
+  return run List<SchemaError>.insert(
+    &mut reader.errors,
+    at,
+    SchemaError { path: move path, issue: issue, got: Option<String>.none() },
+  )
+}
+
+fn startsAfter(span: Option<Span>, start: usize) -> bool {
+  return match span {
+    Option<Span>.Some { value } => value.start > start
+    Option<Span>.None => false
+  }
+}
+
+fn kindOf(found: MsgpackToken) -> ValueKind {
+  return match found {
+    MsgpackToken.Nil => ValueKind.Null
+    MsgpackToken.Boolean { .. } => ValueKind.Boolean
+    MsgpackToken.Integer { .. } => ValueKind.Number
+    MsgpackToken.Unsigned { .. } => ValueKind.Number
+    MsgpackToken.Float { .. } => ValueKind.Number
+    MsgpackToken.String { .. } => ValueKind.Text
+    MsgpackToken.Binary { .. } => ValueKind.Bytes
+    MsgpackToken.Array { .. } => ValueKind.List
+    MsgpackToken.Map { .. } => ValueKind.Object
+    _ => ValueKind.Unknown
+  }
+}
+
+// The bytes of the last token `scanner` returned: a whole scalar, or the header of an array or a
+// map.
+fn tokenSpan(scanner: &MsgpackScanner<'_>) -> Span {
+  return Span { start: MsgpackScanner.offset(scanner), end: MsgpackScanner.end(scanner) }
+}
+
+fn syntax(error: MsgpackError) -> Issue {
+  return Issue.at(
+    IssueReason.InvalidSyntax,
+    "valid MessagePack",
+    ValueKind.Unknown,
+    Span { start: error.offset, end: error.offset + usize.ONE },
+  )
+}
+
+effect fn token(scanner: &mut MsgpackScanner<'_>) -> MsgpackToken
+  ! Issue {
+  return match move MsgpackScanner.next(&mut scanner.*) {
+    Result<MsgpackToken, MsgpackError>.Success { value } => value
+    Result<MsgpackToken, MsgpackError>.Failure { error } => {
+      fail syntax(error)
+    }
+  }
+}
+
+// The first token of a value: the input must not end here.
+effect fn valueToken(scanner: &mut MsgpackScanner<'_>) -> MsgpackToken
+  ! Issue {
+  let found = run token(&mut scanner.*)
+  if let MsgpackToken.EndOfInput = found {
+    fail Issue.at(
+      IssueReason.InvalidSyntax,
+      "valid MessagePack",
+      ValueKind.Unknown,
+      tokenSpan(&scanner.*),
+    )
+  }
+  return found
+}
+
+effect fn peekToken(scanner: &mut MsgpackScanner<'_>) -> MsgpackToken
+  ! Issue {
+  return match move MsgpackScanner.peek(&mut scanner.*) {
+    Result<MsgpackToken, MsgpackError>.Success { value } => value
+    Result<MsgpackToken, MsgpackError>.Failure { error } => {
+      fail syntax(error)
+    }
+  }
+}
+
+fn tooDeep(scanner: &MsgpackScanner<'_>, found: MsgpackToken) -> Issue {
+  return Issue.at(
+    IssueReason.InvalidValue,
+    "a value nested at most 64 levels deep",
+    kindOf(found),
+    tokenSpan(scanner),
+  )
+}
+
+// Reads past one complete value, nested arrays and maps included, and returns the offset after
+// it.
+effect fn skipValue(scanner: &mut MsgpackScanner<'_>) -> usize
+  ! Issue {
+  // How many values each open array or map still has to read.
+  let mut open: [usize; 64] = [0; 64]
+  let mut depth = usize.ZERO
+  while true {
+    let found = run valueToken(&mut scanner.*)
+    let mut container = true
+    let inside = match found {
+      MsgpackToken.Array { count } => count
+
+      // The scanner returns a map only when the input has two bytes left for each entry.
+      MsgpackToken.Map { count } => count * 2
+      _ => {
+        container = false
+        usize.ZERO
+      }
+    }
+    if container && depth >= MAX_DEPTH {
+      fail tooDeep(&scanner.*, found)
+    }
+    if inside > usize.ZERO {
+      open[depth] = inside
+      depth = depth + usize.ONE
+      continue
+    }
+
+    // A value is complete: so is every array or map it was the last value of.
+    while depth > usize.ZERO {
+      open[depth - usize.ONE] = open[depth - usize.ONE] - usize.ONE
+      if open[depth - usize.ONE] > usize.ZERO {
+        break
+      }
+      depth = depth - usize.ONE
+    }
+    if depth == usize.ZERO {
+      break
+    }
+  }
+  return MsgpackScanner.end(&scanner.*)
+}
+
+fn sameBytes(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+impl<'input> MsgpackSchemaReader<'input> {
+  // Reads the next token as a scalar, remembering its span and kind.
+  effect fn scalar(self: &mut Self) -> MsgpackToken
+    ! Issue {
+    let found = run valueToken(&mut self.scanner)
+    self.last = Option<Span>.some(tokenSpan(&self.scanner))
+    self.lastKind = kindOf(found)
+    return found
+  }
+
+  // An issue about the value the last token starts.
+  fn mismatch(
+    self: &Self,
+    reason: IssueReason,
+    expected: string<'static>,
+    found: MsgpackToken,
+  ) -> Issue {
+    return Issue.at(reason, expected, kindOf(found), tokenSpan(&self.scanner))
+  }
+
+  // Refuses the array or map the last token starts when 64 are already open.
+  effect fn opening(self: &Self, found: MsgpackToken) -> ()
+    ! Issue {
+    if List<ObjectFrame<'input>>.length(&self.frames) + List<ListFrame>.length(&self.lists)
+      >= MAX_DEPTH {
+      fail tooDeep(&self.scanner, found)
+    }
+    return ()
+  }
+}
+
+impl<'input> SchemaReader for MsgpackSchemaReader<'input> {
+  /// Returns the path of the part being read.
+  fn path(self: &mut Self) -> &mut SchemaPath {
+    return &mut self.path
+  }
+
+  /// Fails with the issue, or records it and returns when the reader collects every problem.
+  effect fn report(self: &mut Self, issue: Issue) -> ()
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator {
+    if !self.collecting {
+      fail issue
+    }
+    return run record(&mut self.*, issue)
+  }
+
+  /// Returns whether the reader records every problem.
+  fn collecting(self: &Self) -> bool {
+    return self.collecting
+  }
+
+  /// Returns the span of the last complete value read.
+  fn lastSpan(self: &Self) -> Option<Span> {
+    return self.last
+  }
+
+  /// Returns the kind of the last complete value read.
+  fn lastKind(self: &Self) -> ValueKind {
+    return self.lastKind
+  }
+
+  /// Remembers the open maps and arrays and the scanner's position.
+  effect fn mark(self: &mut Self) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let at = List<Mark<'input>>.length(&self.marks)
+    run List<Mark<'input>>.append(
+      &mut self.marks,
+      Mark<'input> {
+        frames: List<ObjectFrame<'input>>.length(&self.frames),
+        lists: List<ListFrame>.length(&self.lists),
+        scanner: MsgpackScanner.fork(&self.scanner),
+      },
+    )
+    return at
+  }
+
+  /// Returns to the mark, closing the maps and arrays opened since, and reads past the value there
+  /// when `skip` is `true`.
+  effect fn recover(self: &mut Self, mark: usize, skip: bool) -> ()
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator {
+    let marks = List<Mark<'input>>.asSlice(&self.marks)
+    let frames = marks[mark].frames
+    let lists = marks[mark].lists
+    self.scanner = MsgpackScanner.fork(&marks[mark].scanner)
+    List<Mark<'input>>.truncate(&mut self.marks, mark)
+    List<ObjectFrame<'input>>.truncate(&mut self.frames, frames)
+    List<ListFrame>.truncate(&mut self.lists, lists)
+    if skip {
+      let first = run peekToken(&mut self.scanner)
+      drop first
+      let start = MsgpackScanner.offset(&self.scanner)
+      let end = run skipValue(&mut self.scanner)
+      self.last = Option<Span>.some(Span { start: start, end: end })
+    }
+    return ()
+  }
+
+  /// Forgets the mark and every later one.
+  fn release(self: &mut Self, mark: usize) -> () {
+    List<Mark<'input>>.truncate(&mut self.marks, mark)
+    return ()
+  }
+
+  /// Reads `true` or `false`.
+  effect fn boolean(self: &mut Self) -> bool
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator {
+    let found = run self.scalar()
+    return match found {
+      MsgpackToken.Boolean { value } => value
+      _ => {
+        fail self.mismatch(IssueReason.InvalidType, "true or false", found)
+      }
+    }
+  }
+
+  /// Reads an integer of any width as an `i64`. A float is not an integer, even a whole one.
+  effect fn signed(self: &mut Self) -> i64
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator {
+    let found = run self.scalar()
+    return match found {
+      MsgpackToken.Integer { value } => value
+      MsgpackToken.Unsigned { .. } => {
+        fail self.mismatch(IssueReason.InvalidValue, "an integer", found)
+      }
+      _ => {
+        fail self.mismatch(IssueReason.InvalidType, "an integer", found)
+      }
+    }
+  }
+
+  /// Reads an integer of any width as a `u64`. A float is not an integer, even a whole one.
+  effect fn unsigned(self: &mut Self) -> u64
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator {
+    let found = run self.scalar()
+    return match found {
+      MsgpackToken.Unsigned { value } => value
+      MsgpackToken.Integer { value } => match i64.checkedToU64(value) {
+        Option<u64>.Some { value: converted } => converted
+        Option<u64>.None => {
+          fail self.mismatch(IssueReason.InvalidValue, "a non-negative integer", found)
+        }
+      }
+      _ => {
+        fail self.mismatch(IssueReason.InvalidType, "a non-negative integer", found)
+      }
+    }
+  }
+
+  /// Reads a float, or an integer converted to the nearest `f64`.
+  effect fn float(self: &mut Self) -> f64
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator {
+    let found = run self.scalar()
+    return match found {
+      MsgpackToken.Float { value } => value
+      MsgpackToken.Integer { value } => i64.toF64(value)
+      MsgpackToken.Unsigned { value } => u64.toF64(value)
+      _ => {
+        fail self.mismatch(IssueReason.InvalidType, "a number", found)
+      }
+    }
+  }
+
+  /// Reads a MessagePack string. Binary data is not text.
+  effect fn text(self: &mut Self) -> String
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator {
+    let found = run self.scalar()
+    return match found {
+      MsgpackToken.String { span } => {
+        // The scanner checked the UTF-8 of the string.
+        let text = unsafe String.fromUtf8Unchecked(MsgpackScanner.slice(&self.scanner, span))
+        run String.copy(text)
+      }
+      _ => {
+        fail self.mismatch(IssueReason.InvalidType, "text", found)
+      }
+    }
+  }
+
+  /// Reads MessagePack binary data. A string is not binary data, and is not read as Base64.
+  effect fn bytes(self: &mut Self) -> Bytes
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator {
+    let found = run self.scalar()
+    return match found {
+      MsgpackToken.Binary { span } => run Bytes.copy(MsgpackScanner.slice(&self.scanner, span))
+      _ => {
+        fail self.mismatch(IssueReason.InvalidType, "bytes", found)
+      }
+    }
+  }
+
+  /// Reads past `nil` and returns `true`, or returns `false` for another value.
+  effect fn null(self: &mut Self) -> bool
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator {
+    return match run peekToken(&mut self.scanner) {
+      MsgpackToken.Nil => {
+        let skipped = run self.scalar()
+        drop skipped
+        true
+      }
+      _ => false
+    }
+  }
+
+  /// Reads an array header.
+  effect fn beginList(self: &mut Self) -> ()
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator {
+    let found = run valueToken(&mut self.scanner)
+    return match found {
+      MsgpackToken.Array { count } => {
+        run self.opening(found)
+        run List<ListFrame>.append(
+          &mut self.lists,
+          ListFrame { start: MsgpackScanner.offset(&self.scanner), remaining: count },
+        )
+      }
+      _ => {
+        fail self.mismatch(IssueReason.InvalidType, "a list", found)
+      }
+    }
+  }
+
+  /// Returns `true` at the next element, or closes the array and returns `false` after the last.
+  effect fn nextElement(self: &mut Self) -> bool
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator {
+    let top = List<ListFrame>.length(&self.lists) - usize.ONE
+    let frame = List<ListFrame>.get(&self.lists, top)
+    if frame.remaining == usize.ZERO {
+      List<ListFrame>.truncate(&mut self.lists, top)
+      self.last = Option<Span>.some(
+        Span { start: frame.start, end: MsgpackScanner.end(&self.scanner) },
+      )
+      self.lastKind = ValueKind.List
+      return false
+    }
+    List<ListFrame>.set(
+      &mut self.lists,
+      top,
+      ListFrame { start: frame.start, remaining: frame.remaining - usize.ONE },
+    )
+    return true
+  }
+
+  /// Reads the map's entries into an index once, so `member` finds each without scanning.
+  ///
+  /// # Errors
+  ///
+  /// - `Issue` with `IssueReason.InvalidType` for a value that is not a map, or for a map with a
+  ///   key that is not text.
+  effect fn beginObject(self: &mut Self) -> ()
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator {
+    let found = run valueToken(&mut self.scanner)
+    let count = match found {
+      MsgpackToken.Map { count } => count
+      _ => {
+        fail self.mismatch(IssueReason.InvalidType, "an object", found)
+      }
+    }
+    run self.opening(found)
+    let start = MsgpackScanner.offset(&self.scanner)
+    let mut members = List<Member<'input>>.make()
+    let mut at = usize.ZERO
+    while at < count {
+      let next = run valueToken(&mut self.scanner)
+      let key = match next {
+        MsgpackToken.String { span } => span
+        _ => {
+          fail self.mismatch(IssueReason.InvalidType, "a text key", next)
+        }
+      }
+      run List<Member<'input>>.append(
+        &mut members,
+        Member<'input> { key: key, value: MsgpackScanner.fork(&self.scanner), seen: false },
+      )
+      let ignored = run skipValue(&mut self.scanner)
+      drop ignored
+      at = at + usize.ONE
+    }
+    let endOffset = MsgpackScanner.end(&self.scanner)
+    return run List<ObjectFrame<'input>>.append(
+      &mut self.frames,
+      ObjectFrame<'input> {
+        start: start,
+        members: move members,
+        end: MsgpackScanner.fork(&self.scanner),
+        endOffset: endOffset,
+      },
+    )
+  }
+
+  /// Finds the entry `key` in the map's index and leaves the reader at its value; the first one
+  /// when the map repeats the key. A missing key leaves the map's header as the last span.
+  effect fn member(self: &mut Self, key: string) -> bool
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator {
+    let depth = List<ObjectFrame<'input>>.length(&self.frames) - usize.ONE
+    let wanted = String.utf8Bytes(key)
+    let frames = List<ObjectFrame<'input>>.asMutSlice(&mut self.frames)
+    let members = List<Member<'input>>.asMutSlice(&mut frames[depth].members)
+    let mut at = usize.ZERO
+    while at < members.length {
+      if sameBytes(MsgpackScanner.slice(&members[at].value, members[at].key), wanted) {
+        members[at].seen = true
+        let value = MsgpackScanner.fork(&members[at].value)
+        self.scanner = move value
+        return true
+      }
+      at = at + usize.ONE
+    }
+    let start = frames[depth].start
+    self.last = Option<Span>.some(Span { start: start, end: start + usize.ONE })
+    self.lastKind = ValueKind.Missing
+    return false
+  }
+
+  /// Returns the key of the next entry no `member` or `nextMember` call found, and leaves the
+  /// reader at its value. Returns `None` after every entry has been visited.
+  effect fn nextMember(self: &mut Self) -> Option<String>
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator {
+    let depth = List<ObjectFrame<'input>>.length(&self.frames) - usize.ONE
+    let frames = List<ObjectFrame<'input>>.asMutSlice(&mut self.frames)
+    let members = List<Member<'input>>.asMutSlice(&mut frames[depth].members)
+    let mut at = usize.ZERO
+    while at < members.length {
+      if !members[at].seen {
+        members[at].seen = true
+
+        // The scanner checked the UTF-8 of the key.
+        let name = unsafe String.fromUtf8Unchecked(
+          MsgpackScanner.slice(&members[at].value, members[at].key),
+        )
+        let value = MsgpackScanner.fork(&members[at].value)
+        self.scanner = move value
+        return Option<String>.some(run String.copy(name))
+      }
+      at = at + usize.ONE
+    }
+    return Option<String>.none()
+  }
+
+  /// Reports every entry no `member` call found, at its key.
+  effect fn rejectUnread(self: &mut Self, expected: string<'static>) -> ()
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator {
+    let depth = List<ObjectFrame<'input>>.length(&self.frames) - usize.ONE
+    let mut at = usize.ZERO
+    while true {
+      let frames = List<ObjectFrame<'input>>.asSlice(&self.frames)
+      let members = List<Member<'input>>.asSlice(&frames[depth].members)
+      if at >= members.length {
+        break
+      }
+      if !members[at].seen {
+        let key = members[at].key
+        let issue = Issue.at(
+          IssueReason.UnexpectedKey,
+          expected,
+          ValueKind.Text,
+          Span { start: key.offset, end: key.offset + key.length },
+        )
+        if let Option<String>.Some { value: name } = move run SchemaReader.nextMember(&mut self.*) {
+          run self.path.push(PathSegment.Key { name: move name })
+          run SchemaReader.report(&mut self.*, issue)
+          self.path.pop()
+        }
+      }
+      at = at + usize.ONE
+    }
+    return ()
+  }
+
+  /// Jumps past the whole map being read.
+  effect fn endObject(self: &mut Self) -> ()
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator {
+    let frame = match List<ObjectFrame<'input>>.pop(&mut self.frames) {
+      Option<ObjectFrame<'input>>.Some { value } => move value
+      Option<ObjectFrame<'input>>.None => {
+        fail Issue.make(IssueReason.InvalidSyntax, "an object")
+      }
+    }
+    self.scanner = MsgpackScanner.fork(&frame.end)
+    self.last = Option<Span>.some(Span { start: frame.start, end: frame.endOffset })
+    self.lastKind = ValueKind.Object
+    return ()
+  }
+}
+
+/// A `SchemaWriter` that writes MessagePack to the ambient `Writer`.
+///
+/// # When to use
+///
+/// [`SchemaMsgpack.encode`] uses it. Use it directly to write a value inside MessagePack that the
+/// program writes itself with `silk.msgpack.output.MsgpackOutput`.
+///
+/// # Details
+///
+/// It holds no bytes: every call writes straight to the `Writer`. An array or map header carries
+/// the count the schema gives `beginList` and `beginObject`.
+pub struct MsgpackSchemaWriter {
+  depth: usize,
+}
+
+impl MsgpackSchemaWriter {
+  /// Returns a writer for one top-level value.
+  pub fn make() -> MsgpackSchemaWriter {
+    return MsgpackSchemaWriter { depth: usize.ZERO }
+  }
+}
+
+effect fn tooLong(error: MsgpackError) -> ()
+  ! Issue {
+  fail Issue.invalidValue("at most 4294967295 bytes or elements")
+}
+
+effect fn opened(self: &mut MsgpackSchemaWriter) -> ()
+  ! Issue {
+  if self.depth >= MAX_DEPTH {
+    fail Issue.invalidValue("a value nested at most 64 levels deep")
+  }
+  self.depth = self.depth + usize.ONE
+  return ()
+}
+
+impl SchemaWriter for MsgpackSchemaWriter {
+  /// Writes `true` or `false` in one byte.
+  effect fn boolean(self: &mut Self, value: bool) -> ()
+    ! Issue | WriterError
+    ? &mut Writer {
+    return run MsgpackOutput.writeBool(value)
+  }
+
+  /// Writes the integer in the shortest format that holds it.
+  effect fn signed(self: &mut Self, value: i64) -> ()
+    ! Issue | WriterError
+    ? &mut Writer {
+    return run MsgpackOutput.writeSigned(value)
+  }
+
+  /// Writes the integer in the shortest format that holds it.
+  effect fn unsigned(self: &mut Self, value: u64) -> ()
+    ! Issue | WriterError
+    ? &mut Writer {
+    return run MsgpackOutput.writeUnsigned(value)
+  }
+
+  /// Writes the number as a `float 64`, including NaN and the infinities.
+  effect fn float(self: &mut Self, value: f64) -> ()
+    ! Issue | WriterError
+    ? &mut Writer {
+    return run MsgpackOutput.writeFloat(value)
+  }
+
+  /// Writes a MessagePack string.
+  ///
+  /// # Errors
+  ///
+  /// - `Issue` with `IssueReason.InvalidValue` if `value` is longer than 4294967295 bytes.
+  /// - `WriterError` if the `Writer` fails.
+  effect fn text(self: &mut Self, value: string) -> ()
+    ! Issue | WriterError
+    ? &mut Writer {
+    return run Effect.catch<MsgpackError>(MsgpackOutput.writeString(value), tooLong)
+  }
+
+  /// Writes MessagePack binary data, not Base64 text.
+  ///
+  /// # Errors
+  ///
+  /// - `Issue` with `IssueReason.InvalidValue` if `value` is longer than 4294967295 bytes.
+  /// - `WriterError` if the `Writer` fails.
+  effect fn bytes(self: &mut Self, value: &[u8]) -> ()
+    ! Issue | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator {
+    return run Effect.catch<MsgpackError>(MsgpackOutput.writeBinary(value), tooLong)
+  }
+
+  /// Writes `nil`.
+  effect fn null(self: &mut Self) -> ()
+    ! Issue | WriterError
+    ? &mut Writer {
+    return run MsgpackOutput.writeNil()
+  }
+
+  /// Writes the header of an array of `count` elements.
+  ///
+  /// # Errors
+  ///
+  /// - `Issue` with `IssueReason.InvalidValue` if `count` is above 4294967295, or if 64 arrays and
+  ///   maps are already open.
+  /// - `WriterError` if the `Writer` fails.
+  effect fn beginList(self: &mut Self, count: usize) -> ()
+    ! Issue | WriterError
+    ? &mut Writer {
+    run opened(&mut self.*)
+    return run Effect.catch<MsgpackError>(MsgpackOutput.writeArrayHeader(count), tooLong)
+  }
+
+  /// Writes nothing: MessagePack has no separator between elements.
+  effect fn element(self: &mut Self) -> ()
+    ! Issue | WriterError
+    ? &mut Writer {
+    return ()
+  }
+
+  /// Writes nothing: the array's header said how many elements it has.
+  effect fn endList(self: &mut Self) -> ()
+    ! Issue | WriterError
+    ? &mut Writer {
+    self.depth = self.depth - usize.ONE
+    return ()
+  }
+
+  /// Writes the header of a map of `count` entries.
+  ///
+  /// # Errors
+  ///
+  /// - `Issue` with `IssueReason.InvalidValue` if `count` is above 4294967295, or if 64 arrays and
+  ///   maps are already open.
+  /// - `WriterError` if the `Writer` fails.
+  effect fn beginObject(self: &mut Self, count: usize) -> ()
+    ! Issue | WriterError
+    ? &mut Writer {
+    run opened(&mut self.*)
+    return run Effect.catch<MsgpackError>(MsgpackOutput.writeMapHeader(count), tooLong)
+  }
+
+  /// Writes the key as a MessagePack string. Its value comes next.
+  effect fn key(self: &mut Self, name: string) -> ()
+    ! Issue | WriterError
+    ? &mut Writer {
+    return run Effect.catch<MsgpackError>(MsgpackOutput.writeString(name), tooLong)
+  }
+
+  /// Writes nothing: the map's header said how many entries it has.
+  effect fn endObject(self: &mut Self) -> ()
+    ! Issue | WriterError
+    ? &mut Writer {
+    self.depth = self.depth - usize.ONE
+    return ()
+  }
+}

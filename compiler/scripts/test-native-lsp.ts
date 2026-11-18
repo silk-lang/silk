@@ -5,7 +5,7 @@
 // nested close to the parser's limit, where a thread with Darwin's default stack overflows.
 import { strict as assert } from 'node:assert'
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -19,7 +19,7 @@ class SessionError extends Data.TaggedError('LspSessionError')<{
   readonly message: string
 }> {}
 
-const timeoutMs = 10_000
+const timeoutMs = 120_000
 const frame = (message: unknown) => {
   const content = Buffer.from(JSON.stringify(message))
   return Buffer.concat([Buffer.from(`Content-Length: ${content.length}\r\n\r\n`), content])
@@ -35,7 +35,7 @@ interface Session {
 // Starts `silk lsp` and reads framed responses as they arrive. With `smallStacks`, GNU libc gives
 // new threads a 512 KiB stack by default, as Darwin always does, so a thread that only fits the
 // platform default fails here as it would on macOS.
-const start = (silk: string, stdlib: string, smallStacks = false) =>
+const start = (silk: string, stdlib: string, smallStacks = false, env: NodeJS.ProcessEnv = process.env) =>
   Effect.acquireRelease(
     Effect.try({
       try: (): Session => {
@@ -43,8 +43,9 @@ const start = (silk: string, stdlib: string, smallStacks = false) =>
           smallStacks && process.platform === 'linux'
             ? spawn('sh', ['-c', 'ulimit -s 512 && exec "$0" lsp --stdlib "$1"', silk, stdlib], {
                 stdio: 'pipe',
+                env,
               })
-            : spawn(silk, ['lsp', '--stdlib', stdlib], { stdio: 'pipe' })
+            : spawn(silk, ['lsp', '--stdlib', stdlib], { stdio: 'pipe', env })
         let pending = Buffer.alloc(0)
         const ready: Array<Record<string, unknown>> = []
         const waiting: Array<() => void> = []
@@ -618,7 +619,7 @@ const program = Effect.gen(function* () {
   for (const member of ['pricing', 'store']) mkdirSync(join(workspace, member, 'src'), { recursive: true })
   writeFileSync(
     join(workspace, 'pricing', 'silk.toml'),
-    '[package]\nname = "pricing"\nversion = "0.1.0"\nmain = "lib.silk"\nkind = "static-library"\nexports = ["lib"]\n',
+    '[package]\nname = "pricing"\nversion = "0.1.0"\nmain = "lib.silk"\nkind = "library"\nexports = ["lib"]\n',
   )
   writeFileSync(
     join(workspace, 'store', 'silk.toml'),
@@ -688,6 +689,203 @@ const program = Effect.gen(function* () {
   yield* session.send({ jsonrpc: '2.0', method: 'exit' })
   assert.equal(yield* session.exited, 0, 'exit after shutdown stops the server with status 0')
 
+
+  // Saved requests own parameter values and generated/native inputs. The editor never evaluates
+  // the deliberately invalid package plan while reading them, and selects only the plan's set.
+  const plannedRoot = join(directory, 'planned')
+  yield* Effect.try({
+    try: () => {
+      cpSync(resolve('compiler/fixtures/compilation-request'), plannedRoot, { recursive: true })
+      writeFileSync(join(plannedRoot, 'silk.toml'), '[package]\nname = "request-fixture"\nversion = "0.1.0"\nsource = "."\n[workspace]\nmembers = []\noutput-dir = "editor-output"\n')
+      writeFileSync(join(plannedRoot, 'build.silk'), 'this is not a build plan\n')
+      writeFileSync(join(plannedRoot, 'main.silk'),
+        'import dep.value { answer }\nstatic if answer == 42 { pub fn main() -> i32 { return 0 } } else { pub fn main() -> i32 { return "wrong" } }\n')
+      mkdirSync(join(plannedRoot, 'editor-output/requests'), { recursive: true })
+    },
+    catch: (cause) => new SessionError({ reason: 'Spawn', message: String(cause) }),
+  })
+  const savedSource = readFileSync(join(plannedRoot, 'main.silk'), 'utf8')
+  const savedUri = pathToFileURL(join(plannedRoot, 'main.silk')).href
+  const requestsRoot = join(plannedRoot, 'editor-output/requests')
+  const savedRequest = readFileSync(join(plannedRoot, 'request.toml'), 'utf8')
+    .replaceAll('/REQUEST_ROOT', plannedRoot).replaceAll('/STDLIB_ROOT', stdlib)
+    .replace('flags = []', 'flags = ["-DREQUEST_FLAG=1"]')
+    .replace('optimization = "none"', 'optimization = "speed"')
+    .replace('debug = false', 'debug = true')
+    .replace('cpu-features = []', 'cpu = "x86-64-v3"\ncpu-features = []')
+  const aRequest = savedRequest.replace('name = "request-fixture"', 'name = "a"')
+  const bRequest = savedRequest.replace('name = "request-fixture"', 'name = "b"').replace('decimal = "42"', 'decimal = "24"')
+  writeFileSync(join(requestsRoot, 'a.toml'), aRequest)
+  writeFileSync(join(requestsRoot, 'b.toml'), bRequest)
+  writeFileSync(join(requestsRoot, '0-unplanned.toml'), bRequest)
+  writeFileSync(join(requestsRoot, 'plan.json'), JSON.stringify({ version: 1, files: ['a.toml', 'b.toml'] }))
+  // Plan authorizations go to the session's own SILK_HOME, never the developer's.
+  const silkHome = join(directory, 'silk-home')
+  const planned = yield* start(silk, stdlib, false, { ...process.env, SILK_HOME: silkHome })
+  yield* request(planned, 1, 'initialize', {
+    capabilities: { workspace: { didChangeWatchedFiles: { dynamicRegistration: true } } },
+    initializationOptions: { compilation: 'b', workspaceTrusted: false },
+  })
+  yield* planned.send({ jsonrpc: '2.0', method: 'initialized', params: {} })
+  const registration = yield* planned.receive
+  assert.equal(registration['method'], 'client/registerCapability')
+  yield* planned.send({ jsonrpc: '2.0', id: registration['id'], result: null })
+  yield* planned.send({ jsonrpc: '2.0', method: 'textDocument/didOpen',
+    params: { textDocument: { uri: savedUri, languageId: 'silk', version: 1, text: savedSource } } })
+  const selectedB = yield* diagnosticsFor(planned, savedUri, 1, [])
+  assert.ok(selectedB.diagnostics.some(({ code }) => code === 'SEM0129'), JSON.stringify(selectedB))
+  const nativeCommands = JSON.parse(readFileSync(join(plannedRoot, 'editor-output/compile_commands.json'), 'utf8')) as Array<{ file: string; arguments: string[] }>
+  assert.equal(nativeCommands.length, 2, 'the compilation database includes only the plan request set')
+  assert.ok(nativeCommands.every((command) => command.arguments.includes('-DREQUEST_FLAG=1') && command.file === join(plannedRoot, 'native.c')))
+  assert.ok(nativeCommands.every((command) => ['-O2', '-g', '-march=x86-64-v3'].every((flag) => command.arguments.includes(flag))))
+  yield* planned.send({ jsonrpc: '2.0', method: 'workspace/didChangeConfiguration', params: { settings: { silk: { compilation: 'a' } } } })
+  const selectedA = yield* diagnosticsFor(planned, savedUri, 1, [])
+  assert.deepEqual(selectedA.diagnostics, [], JSON.stringify(selectedA))
+  writeFileSync(join(requestsRoot, 'a.toml'), aRequest.replace('decimal = "42"', 'decimal = "24"'))
+  yield* planned.send({ jsonrpc: '2.0', method: 'workspace/didChangeWatchedFiles',
+    params: { changes: [{ uri: pathToFileURL(join(requestsRoot, 'a.toml')).href, type: 2 }] } })
+  const refreshed = yield* diagnosticsFor(planned, savedUri, 1, [])
+  assert.ok(refreshed.diagnostics.some(({ code }) => code === 'SEM0129'), JSON.stringify(refreshed))
+  // With no explicit selection, the plan's first compilation is used, not the earlier unrelated file.
+  writeFileSync(join(requestsRoot, 'a.toml'), aRequest)
+  yield* planned.send({ jsonrpc: '2.0', method: 'workspace/didChangeConfiguration', params: { settings: {} } })
+  assert.deepEqual((yield* diagnosticsFor(planned, savedUri, 1, [])).diagnostics, [])
+  // Editing a malformed manifest does not invalidate a complete saved compilation request.
+  writeFileSync(join(plannedRoot, 'silk.toml'), '[package\n')
+  yield* planned.send({ jsonrpc: '2.0', method: 'workspace/didChangeConfiguration', params: { settings: { silk: { compilation: 'a' } } } })
+  yield* planned.send({ jsonrpc: '2.0', id: 80, method: 'textDocument/documentSymbol', params: { textDocument: { uri: savedUri } } })
+  const malformedManifest = yield* notificationsUntil(planned, 80)
+  const staleHints = malformedManifest.notifications.filter((message) => message['method'] === 'window/showMessage')
+  assert.equal(staleHints.length, 1, JSON.stringify(malformedManifest))
+  assert.match(JSON.stringify(staleHints[0]), /run `silk plan`/)
+  assert.deepEqual((yield* diagnosticsFor(planned, savedUri, 1, malformedManifest.notifications)).diagnostics, [])
+  unlinkSync(join(plannedRoot, 'silk.toml'))
+  yield* planned.send({ jsonrpc: '2.0', method: 'workspace/didChangeConfiguration', params: { settings: { silk: { compilation: 'a' } } } })
+  assert.deepEqual((yield* diagnosticsFor(planned, savedUri, 1, [])).diagnostics, [], 'a removed manifest retains the custom output request')
+  writeFileSync(join(plannedRoot, 'silk.toml'), '[package]\nname = "request-fixture"\nversion = "0.1.0"\nsource = "."\n[workspace]\nmembers = []\noutput-dir = "editor-output"\n')
+  // A custom Plan command is project code, so the server asks before it runs one, and runs it
+  // with the developer's permissions once allowed. The answer lives in SILK_HOME, keyed by the
+  // repository's common Git directory, so a worktree of the same repository is not asked again.
+  const plans = join(silkHome, 'editor-plans')
+  const tasksSource = (witness: string) => `
+import silk.cli.command { Command, CommandLine }
+import silk.cli.task { Task, TaskSet }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.filesystem { FileSystem, FileError, Path }
+import silk.system.host_input { HostInput }
+union Tasks { Plan }
+impl CommandLine for Tasks { static fn command() -> Command<Self> { return Command<Self>.make("editor", "Editor plan") } }
+impl TaskSet for Tasks {
+  effect fn perform(self: Self) -> () ! FileError | OutOfMemoryError ? &mut Allocator | &mut FileSystem {
+    drop self
+    run FileSystem.writeFileWithParents(&run Path.make(${JSON.stringify(witness)}), b"entered")
+  }
+}
+pub effect fn main() -> i32 ? &mut HostInput { return run Task.main<Tasks>() }
+`
+  // The plan's witness sits outside the request directory, which a failed plan restores.
+  const entered = join(plannedRoot, 'editor-output/steps/plan-entered')
+  mkdirSync(join(plannedRoot, '.git'), { recursive: true })
+  unlinkSync(join(plannedRoot, 'build.silk'))
+  writeFileSync(join(plannedRoot, 'tasks.silk'), tasksSource(entered))
+  const asksIn = (notifications: Array<Record<string, unknown>>) =>
+    notifications.filter((message) => message['method'] === 'window/showMessageRequest')
+  const notesIn = (notifications: Array<Record<string, unknown>>) =>
+    notifications.filter((message) => message['method'] === 'window/showMessage')
+  yield* planned.send({ jsonrpc: '2.0', method: 'workspace/didChangeConfiguration',
+    params: { settings: { workspaceTrusted: true, refreshPlan: true } } })
+  yield* planned.send({ jsonrpc: '2.0', id: 81, method: 'textDocument/documentSymbol', params: { textDocument: { uri: savedUri } } })
+  const asking = yield* notificationsUntil(planned, 81)
+  const asked = asksIn(asking.notifications)
+  assert.equal(asked.length, 1, JSON.stringify(asking.notifications))
+  assert.equal(asked[0]!['id'], 'silk-plan-0')
+  const question = asked[0]!['params'] as { message: string; actions: Array<{ title: string }> }
+  assert.deepEqual(question.actions.map(({ title }) => title), ['Allow', 'Not now'])
+  assert.ok(question.message.includes(realpathSync(join(plannedRoot, '.git'))), question.message)
+  assert.equal(existsSync(entered), false, 'nothing runs before the developer answers')
+  const outdatedNotes = notesIn(asking.notifications)
+  assert.equal(outdatedNotes.length, 1, JSON.stringify(asking.notifications))
+  assert.match(JSON.stringify(outdatedNotes[0]), /tasks\.silk changed/)
+  const waiting = yield* diagnosticsFor(planned, savedUri, 1, asking.notifications)
+  assert.deepEqual(waiting.diagnostics, [], 'the saved requests stay in use while the question is open')
+  // Not now keeps the saved requests and is not asked again in the session.
+  yield* planned.send({ jsonrpc: '2.0', id: 'silk-plan-0', result: { title: 'Not now' } })
+  yield* planned.send({ jsonrpc: '2.0', method: 'workspace/didChangeConfiguration',
+    params: { settings: { workspaceTrusted: true, refreshPlan: true } } })
+  yield* planned.send({ jsonrpc: '2.0', id: 82, method: 'textDocument/documentSymbol', params: { textDocument: { uri: savedUri } } })
+  const declined = yield* notificationsUntil(planned, 82)
+  assert.equal(asksIn(declined.notifications).length, 0, JSON.stringify(declined.notifications))
+  assert.equal(notesIn(declined.notifications).length, 0, 'the outdated note is shown once per session')
+  assert.equal(existsSync(entered), false)
+  assert.equal(existsSync(plans), false, 'Not now records nothing')
+  yield* planned.send({ jsonrpc: '2.0', id: 2, method: 'shutdown' })
+  yield* notificationsUntil(planned, 2)
+  yield* planned.send({ jsonrpc: '2.0', method: 'exit' })
+  assert.equal(yield* planned.exited, 0)
+
+  // A new session asks again; Allow records the repository and runs the plan.
+  const allowing = yield* start(silk, stdlib, false, { ...process.env, SILK_HOME: silkHome })
+  yield* request(allowing, 1, 'initialize', {
+    capabilities: {},
+    initializationOptions: { workspaceTrusted: true, refreshPlan: true },
+  })
+  yield* allowing.send({ jsonrpc: '2.0', method: 'initialized', params: {} })
+  yield* allowing.send({ jsonrpc: '2.0', method: 'textDocument/didOpen',
+    params: { textDocument: { uri: savedUri, languageId: 'silk', version: 1, text: savedSource } } })
+  yield* allowing.send({ jsonrpc: '2.0', id: 3, method: 'textDocument/documentSymbol', params: { textDocument: { uri: savedUri } } })
+  const reasked = yield* notificationsUntil(allowing, 3)
+  assert.equal(asksIn(reasked.notifications).length, 1, JSON.stringify(reasked.notifications))
+  yield* allowing.send({ jsonrpc: '2.0', id: 'silk-plan-0', result: { title: 'Allow' } })
+  yield* allowing.send({ jsonrpc: '2.0', id: 4, method: 'textDocument/documentSymbol', params: { textDocument: { uri: savedUri } } })
+  const allowed = yield* notificationsUntil(allowing, 4)
+  assert.equal(asksIn(allowed.notifications).length, 0)
+  const records = readdirSync(plans)
+  assert.equal(records.length, 1, JSON.stringify(records))
+  assert.equal(readFileSync(join(plans, records[0]!), 'utf8'), `git:${realpathSync(join(plannedRoot, '.git'))}\n`)
+  assert.ok(existsSync(entered), 'the allowed Plan command ran')
+  assert.deepEqual((yield* diagnosticsFor(allowing, savedUri, 1, allowed.notifications)).diagnostics, [])
+
+  // A linked worktree of the same repository shares the authorization.
+  const worktreeRoot = join(directory, 'planned-worktree')
+  const worktreeEntered = join(worktreeRoot, 'editor-output/steps/plan-entered')
+  cpSync(plannedRoot, worktreeRoot, { recursive: true, filter: (path) => !path.endsWith('/.git') })
+  rmSync(join(worktreeRoot, 'editor-output/steps'), { recursive: true, force: true })
+  mkdirSync(join(plannedRoot, '.git/worktrees/copy'), { recursive: true })
+  writeFileSync(join(plannedRoot, '.git/worktrees/copy/commondir'), '../..\n')
+  writeFileSync(join(worktreeRoot, '.git'), `gitdir: ${join(plannedRoot, '.git/worktrees/copy')}\n`)
+  writeFileSync(join(worktreeRoot, 'tasks.silk'), tasksSource(worktreeEntered))
+  const worktreeUri = pathToFileURL(join(worktreeRoot, 'main.silk')).href
+  yield* allowing.send({ jsonrpc: '2.0', method: 'textDocument/didOpen',
+    params: { textDocument: { uri: worktreeUri, languageId: 'silk', version: 1, text: savedSource } } })
+  yield* allowing.send({ jsonrpc: '2.0', id: 5, method: 'textDocument/documentSymbol', params: { textDocument: { uri: worktreeUri } } })
+  const shared = yield* notificationsUntil(allowing, 5)
+  assert.equal(asksIn(shared.notifications).length, 0, JSON.stringify(shared.notifications))
+  assert.ok(existsSync(worktreeEntered), 'the worktree runs its Plan command without a new question')
+  assert.equal(readdirSync(plans).length, 1)
+
+  // Turning refresh off prevents any run on the next settings change.
+  unlinkSync(entered)
+  yield* allowing.send({ jsonrpc: '2.0', method: 'workspace/didChangeConfiguration',
+    params: { settings: { workspaceTrusted: true, refreshPlan: false } } })
+  assert.deepEqual((yield* diagnosticsFor(allowing, savedUri, 1, [])).diagnostics, [])
+  assert.equal(existsSync(entered), false)
+  // Without a Plan variant nothing is asked and the tasks program is not even built. The built-in
+  // plan replaces the requests above, so this runs last.
+  const tasksBuild = join(plannedRoot, 'editor-output/steps/tasks')
+  rmSync(join(plannedRoot, 'editor-output/steps'), { recursive: true, force: true })
+  writeFileSync(join(plannedRoot, 'tasks.silk'), tasksSource(entered).replace('union Tasks { Plan }', 'union Tasks { Lint }'))
+  yield* allowing.send({ jsonrpc: '2.0', method: 'workspace/didChangeConfiguration',
+    params: { settings: { workspaceTrusted: true, refreshPlan: true } } })
+  yield* allowing.send({ jsonrpc: '2.0', id: 7, method: 'textDocument/documentSymbol', params: { textDocument: { uri: savedUri } } })
+  const builtIn = yield* notificationsUntil(allowing, 7)
+  assert.equal(asksIn(builtIn.notifications).length, 0, JSON.stringify(builtIn.notifications))
+  assert.equal(existsSync(tasksBuild), false, 'the built-in plan never builds the tasks program')
+  assert.equal(existsSync(entered), false)
+
+  yield* allowing.send({ jsonrpc: '2.0', id: 6, method: 'shutdown' })
+  yield* notificationsUntil(allowing, 6)
+  yield* allowing.send({ jsonrpc: '2.0', method: 'exit' })
+  assert.equal(yield* allowing.exited, 0)
 
   // Exit without shutdown, and input that closes before exit, are both status 1.
   const abrupt = yield* start(silk, stdlib)

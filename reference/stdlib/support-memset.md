@@ -4,6 +4,10 @@
 
 Word-wise compiler support with explicit C linkage and no runtime services.
 
+## Gotchas
+On WebAssembly targets the module declares nothing: every wasm32 executable links
+`memset` from the target's support module, and a second definition would conflict.
+
 Public declarations: 0.
 
 This module declares no public items.

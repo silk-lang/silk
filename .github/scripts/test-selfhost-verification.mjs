@@ -48,7 +48,7 @@ try {
   execFileSync('git', ['add', '.'], { cwd: checkout })
   const gate = join(
     checkout,
-    'build/llvm/x86_64-unknown-linux-gnu/release-with-debug/silk-format-gate',
+    'build/x86_64-unknown-linux-gnu/release/silk-format-gate',
   )
   mkdirSync(join(gate, '..'), { recursive: true })
   const verifyingGate = '#!/bin/sh\nprintf "FORMAT_SAFETY checked=1\\n"\n'
@@ -106,10 +106,15 @@ try {
   writeFileSync(
     compiler,
     `#!/bin/sh
-if [ "$6" != '${checkout}/stdlib' ]; then exit 8; fi
-if ! grep -q 'consumer corpus stdlib witness' "$6/silk/num/i32.silk"; then exit 9; fi
-printf '%s:%s\\n' "$8" "\${10}" >> '${calls}'
-if grep -q 'import silk.json.reflect' "$2"; then
+if [ "$1" = resolve ]; then
+  grep -qxF 'stdlib = "${checkout}/stdlib"' "$3" || exit 8
+  grep -q 'consumer corpus stdlib witness' '${checkout}/stdlib/silk/num/i32.silk' || exit 9
+  optimization=$(sed -n 's/^optimization = "\\(.*\\)"$/\\1/p' "$3")
+  debug=$(sed -n 's/^debug = //p' "$3")
+  printf '%s:%s\\n' "$optimization" "$debug" >> '${calls}'
+  exit 0
+fi
+if grep -q 'import silk.json.reflect' memory/driver.silk; then
   printf '%s\\n' 'SILK_UNSUPPORTED_JSON={"gaps":[{"code":"smoke-gap","reason":"fake compiler gap"}]}' >&2
   exit 1
 fi

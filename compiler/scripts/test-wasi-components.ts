@@ -184,11 +184,19 @@ export const verify = Effect.fn('WasiComponents.verify')(function* (
     yield* fs.copy(wit, join(root, 'wit'))
     yield* fs.writeFileString(
       join(root, 'silk.toml'),
-      `[package]\nname="${name}"\nsource="."\n[profiles.component]\ntarget="wasm32-wasip2"\nruntime={kind="none"}\n[build]\nprofile="component"\n[component]\nwit="wit"\nworld="${world}"\n`,
+      `[package]\nname="${name}"\nsource="."\n[component]\nwit="wit"\nworld="${world}"\n`,
     )
-    const built = yield* invoke(compiler, ['build', '--stdlib', join(repo, 'stdlib')], root)
+    const definition = join(root, 'definition.toml')
+    const request = join(root, 'request.toml')
+    yield* fs.writeFileString(definition,
+      `manifest=${JSON.stringify(join(root, 'silk.toml'))}\nstdlib=${JSON.stringify(join(repo, 'stdlib'))}\n` +
+      '[settings]\nmodules=[]\n[settings.profile]\ntarget="wasm32-wasip2"\nruntime="none"\n' +
+      '[settings.native]\nsources=[]\nlink=[]\n')
+    const resolved = yield* invoke(compiler, ['resolve', '--definition', definition, '--output', request], root)
+    assert.equal(resolved.status, 0, resolved.stderr.toString())
+    const built = yield* invoke(compiler, ['compile', '--request', request], root)
     assert.equal(built.status, 0, built.stderr.toString())
-    return join(root, 'build/llvm/wasm32-wasip2/component', name)
+    return join(root, 'artifact')
   })
   const fixture = join(repo, 'compiler/fixtures/wasi-component')
   const consumer = yield* reactor(

@@ -314,8 +314,9 @@ size, but names or counts of backend symbols are not source-level API.
 its eventual applications might be discoverable dynamically. Every executable path must close its
 arguments and evidence through finite static reachability.
 
-This first stabilization model does not include existential interface storage, heterogeneous
-collections of unknown conforming values, dynamic witness lookup, or runtime specialization.
+An explicitly written `&any I` can borrow different conforming types in one collection
+(ANY-001). The compiler selects their witnesses while closing the build. Each executable
+operation still has a finite set of concrete specializations.
 
 **Diagnostics:** A reachable application with unresolved parameters, ambiguous evidence, or a
 non-concrete requirement row is rejected before lowering and identifies the responsible call or
@@ -691,6 +692,65 @@ borrows, TIR, and instance discovery and must be concrete before layout and MIR.
 representation inference tests,
 finite callable specialization.
 
+### ANY-001 Borrowing a reference-only interface
+
+**Status:** Confirmed
+
+Write `&any Read` when a caller can supply different concrete readers to the same function.
+Every conversion borrows the original value. For example, both entries below refer to live
+values on the caller's stack.
+
+```silk
+interface Read { fn read(self: &Self) -> i32 }
+struct Left {}
+struct Right {}
+impl Read for Left { fn read(self: &Self) -> i32 { return 19 } }
+impl Read for Right { fn read(self: &Self) -> i32 { return 23 } }
+
+pub fn main() -> i32 {
+  let left = Left {}
+  let right = Right {}
+  let both: [&any Read; 2] = [&left, &right]
+  return Read.read(both[0]) + both[1].read()
+}
+```
+
+| Rule | Behavior |
+| --- | --- |
+| R1 | Conversion takes place at a written expected type. A parameter, result, annotated binding, field, array or list element, or union member can supply it. Inference preserves the concrete type. |
+| R2 | `any I` occurs directly behind `&` or `&mut`. A container can hold the reference. |
+| R3 | Supply every argument of each interface, including any requirement row. Join interfaces and thread properties with `+`, as in `&mut any Sink + Transferable`. |
+| R4 | Each interface operation takes its receiver by shared or exclusive reference. The whole interface must qualify, including operations the caller never uses. |
+| R5 | Other parameters, the result and the failure must be independent of `Self`. A callable or Effect parameter can qualify. Each operation needs one exact result representation across all members. |
+| R6 | The concrete type implements every interface and satisfies every named thread property. Each lifetime it contains outlives the borrow. Ordinary exclusive-borrow rules apply to `&mut any I`. |
+| R7 | A reference can narrow to a subset of its contract while keeping its address, tag and borrowing permissions. The contract exposes its operations and offers no downcast or member pattern. |
+| R8 | Qualified and method calls select the active member's witness, including a default operation. Failure propagation, Effect construction, provider selection and suspension use the ordinary union calling convention (UNION-003). |
+| R9 | A build collects conversions in reached instances, erases their lifetimes for membership, and propagates wider sets across narrowing. Reaching a new witness can discover further conversions. |
+| R10 | With zero members the dispatcher is unreachable. A single member permits a direct call. Several members use a switch over stable member tags. |
+| R11 | The closed set determines which calls can suspend or park. Adding a conversion in another module can change a call's behavior. The completed build relates a failed member obligation to the affected call. |
+| R12 | An operation marked `@nonParking` promises that every admitted member keeps the promise for each reached specialization, including its static arguments, providers and required cleanup. |
+| R13 | Static evaluation, reflection on erased types, and foreign import and export signatures require concrete types. |
+| R14 | `any` is contextual in type position when followed by a type path. It remains an ordinary identifier elsewhere. |
+| R15 | The reference contains a 64-bit tag and a target pointer. Both it and `Option<&any I>` occupy 16 bytes on the current 64-bit and wasm32 targets. On wasm32 this includes alignment padding. The optional reference uses the null address for absence. |
+
+**Boundary:** The program's reached conversions determine the possible implementations. Shared
+and exclusive access follow the borrow. To share a reference across threads, write the needed
+property in the contract, for example `&any Read + Concurrent`. A plain `&any Read` exposes
+only what `Read` promises.
+
+**Diagnostics:** `silk check` on a library can reject invalid interface shapes, conversions and
+escaping borrows. A build knows the member set and the exact calls that select those members.
+SEM0121 names an operation that cannot be dispatched. For example, two implementations of
+`Factory.make(self: &Self) -> fn(i32) -> i32` can return closures with different capture
+layouts. Give the operation one concrete result type, or pass the integer to the operation and
+return the computed integer. SEM0139 points to the conversion of a member that can park and
+identifies the dynamic call whose specialization breaks the promise. SEM0263 identifies a
+conversion whose Effect implementation can call back into the same dispatcher before suspension
+and points to the call on that recursive path (SUSP-003).
+SEM0264 points to the conversion when specializing a member witness exceeds the type-complexity
+budget. For example, a witness for `Wrapper<T>` can reach a conversion of `Wrapper<Wrapper<T>>`
+and expand the closed set again. Use a fixed member type or bound the expansion in static code.
+
 ### REP-003 — Representation-dependent values join only at exact type equality
 
 **Status:** Confirmed
@@ -722,6 +782,10 @@ let result = if hexadecimal {
 indirect dispatch, or a uniform closure ABI to make different representations join. A future
 explicit erased-callable type may provide those costs and semantics, but it is not implicit and is
 not part of the first stable model.
+
+An explicitly written erased interface reference (ANY-001) supplies one concrete reference
+representation at a join. An interface operation returning a callable still needs one exact
+result representation independent of the chosen member.
 
 **Diagnostics:** A divergent join identifies the complete expected and supplied represented types
 and points to the first deterministic origin of each representation. It suggests consuming the

@@ -215,6 +215,16 @@ Recursive
 
 The dialect has no recursive references, and the type contains itself.
 
+<a id="JsonSchemaProblem.DynamicKeys"></a>
+
+### `DynamicKeys`
+
+```silk
+DynamicKeys
+```
+
+The dialect requires fixed object keys, and the type contains a dictionary.
+
 <a id="JsonSchemaError"></a>
 
 ## `JsonSchemaError`

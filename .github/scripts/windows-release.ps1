@@ -22,17 +22,12 @@ $top = Join-Path $unpacked "silk-$version-$target"
 $compiler = Join-Path $top 'bin/silkc.exe'
 
 $native = (Resolve-Path -LiteralPath $OutputDirectory).Path
-$arguments = @('--target', $target, '--stdlib', '../stdlib', '--optimization', 'speed', '--debug', 'false', '--clang', $env:SILK_TEST_CLANG)
-Push-Location (Join-Path $Snapshot 'compiler')
-try {
-  & $compiler build src/main.silk -o (Join-Path $native 'compiler.ll') --emit llvm-ir @arguments
-  if ($LASTEXITCODE -ne 0) { throw 'Native compiler IR emission failed' }
-} finally { Pop-Location }
-Push-Location (Join-Path $Snapshot 'tool')
-try {
-  & $compiler build src/main.silk -o (Join-Path $native 'silk.exe') @arguments
-  if ($LASTEXITCODE -ne 0) { throw 'Native tool build failed' }
-} finally { Pop-Location }
+$env:SILK_CLANG = $env:SILK_TEST_CLANG
+$arguments = @('--compiler', $compiler, '--target', $target, '--stdlib', (Join-Path $Snapshot 'stdlib'), '--optimization', 'speed', '--debug', 'false')
+node "$root/compiler/scripts/CompilationBuild.ts" --manifest (Join-Path $Snapshot 'compiler/silk.toml') --output (Join-Path $native 'compiler.ll') --emit llvm-ir @arguments
+if ($LASTEXITCODE -ne 0) { throw 'Native compiler IR emission failed' }
+node "$root/compiler/scripts/CompilationBuild.ts" --manifest (Join-Path $Snapshot 'tool/silk.toml') --output (Join-Path $native 'silk.exe') @arguments
+if ($LASTEXITCODE -ne 0) { throw 'Native tool build failed' }
 node "$root/compiler/scripts/SourceSnapshot.mjs" verify $Snapshot > $null
 if ($LASTEXITCODE -ne 0) { throw 'Native build changed authored inputs' }
 

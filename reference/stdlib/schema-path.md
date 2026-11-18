@@ -88,6 +88,26 @@ pub wire: string<'static>
 
 The variant's name in the data format.
 
+<a id="PathSegment.Key"></a>
+
+### `Key`
+
+```silk
+Key
+```
+
+A dictionary member whose key comes from the input.
+
+<a id="PathSegment.Key.name"></a>
+
+#### Field `name`
+
+```silk
+pub name: String
+```
+
+The owned member name, preserved in diagnostics and JSON pointers.
+
 <a id="PathSegment.Index"></a>
 
 ### `Index`
@@ -107,14 +127,6 @@ pub at: usize
 ```
 
 The position of the element, from 0.
-
-<a id="PathSegment.impl.Copy"></a>
-
-## Implementation `Copy for PathSegment`
-
-```silk
-impl Copy for PathSegment
-```
 
 <a id="SchemaPath"></a>
 

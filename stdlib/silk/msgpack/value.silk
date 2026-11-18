@@ -1,0 +1,449 @@
+//! Parse MessagePack data into an owned tree of values, read fields from it, and write it back.
+//!
+//! # When to use
+//! Use [`Msgpack.parse`] for MessagePack whose shape is not known in advance. Read the tree with
+//! [`Msgpack.field`], [`Msgpack.item`] and the `as` functions such as [`Msgpack.asI64`], or by
+//! matching on [`Value`], and write a tree with [`Msgpack.write`]. To read and write your own types, use
+//! `silk.schema.msgpack.SchemaMsgpack`, which builds no tree. To read tokens without allocating,
+//! use `silk.msgpack.scanner.MsgpackScanner`.
+//!
+//! # Details
+//! A [`Value`] owns everything below it. It holds what MessagePack holds and JSON does not: binary
+//! data, extension values, map keys of any kind, and integers up to the largest `u64`. The tree
+//! does not keep the width a number was written in: an integer is [`Value.Integer`] when it fits in
+//! `i64` and [`Value.Unsigned`] above that, and a `float 32` is widened to `f64`. Writing uses the
+//! shortest format for each value, and `float 64` for every float.
+//!
+//! # Errors
+//! - `MsgpackError` with a `MsgpackReason` and the byte offset of the problem.
+//! - `OutOfMemoryError` if the `Allocator` cannot supply the tree.
+//!
+//! # Gotchas
+//! Nesting is limited to 64 levels. Duplicate map keys are kept as written; [`Msgpack.field`]
+//! returns the first. An extension value, such as a timestamp (type -1), is kept as its type and
+//! payload, not interpreted.
+//!
+//! # Examples
+//! ## Read a field and write the tree back
+//! ```silk
+//! import silk.collections.slice { Slice }
+//! import silk.core.effect { Effect }
+//! import silk.io.writer { Writer, WriterError }
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.msgpack.scanner { MsgpackError }
+//! import silk.msgpack.value { Msgpack }
+//!
+//! struct Capture {
+//!   bytes: [u8; 32],
+//!   length: usize,
+//! }
+//!
+//! impl Writer for Capture {
+//!   effect fn writeAll(self: &mut Self, value: &[u8]) -> () ! WriterError ? &mut Writer {
+//!     if self.length + value.length > 32 { fail Writer.failure() }
+//!     Slice.copyInto<u8>(&mut self.bytes, self.length, value)
+//!     self.length = self.length + value.length
+//!     return ()
+//!   }
+//!
+//!   effect fn flush(self: &mut Self) -> () ! WriterError ? &mut Writer { return () }
+//! }
+//!
+//! pub effect fn main() -> i32 ! MsgpackError | WriterError | OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   // {"port": 8080, "tags": ["a"]}
+//!   let input = b"\x82\xa4port\xcd\x1f\x90\xa4tags\x91\xa1a"
+//!   let document = run Msgpack.parse(input) |> Effect.provideMut<Allocator>(&mut allocator)
+//!   let port = Msgpack.field(&document, "port") |> Msgpack.asI64()
+//!   if port.unwrapOr(0) != 8080 {
+//!     return 1
+//!   }
+//!   let mut capture = Capture { bytes: [0; 32], length: 0 }
+//!   run Msgpack.write(&document) |> Effect.provideMut<Writer>(&mut capture)
+//!   if Slice.view<u8>(&capture.bytes, 0, capture.length) != input {
+//!     return 2
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! @category Data formats
+
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.io.writer { Writer, WriterError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.msgpack.output { MsgpackOutput }
+import silk.msgpack.scanner { MAX_DEPTH, MsgpackError, MsgpackReason, MsgpackScanner, MsgpackToken }
+import silk.num.i64
+import silk.num.u64
+import silk.num.usize
+import silk.text.string { String }
+
+/// One key and value of a MessagePack map.
+pub struct MsgpackEntry {
+  /// The key. MessagePack allows a key of any kind; most data uses text.
+  pub key: Value,
+  /// The value.
+  pub value: Value,
+}
+
+/// An owned MessagePack value: a scalar, or an array or map that owns its elements.
+///
+/// # Details
+///
+/// An integer is `Integer` when it fits in `i64`, whatever width it was written in, and `Unsigned`
+/// only above the largest `i64`. [`Msgpack.write`] writes either in the shortest format, so a tree
+/// built by hand with a small `Unsigned` writes the same bytes as the `Integer`.
+pub union Value {
+  /// `nil`.
+  Nil,
+  /// `true` or `false`.
+  Bool {
+    /// The value.
+    pub value: bool
+  },
+  /// An integer that fits in `i64`.
+  Integer {
+    /// The value.
+    pub value: i64
+  },
+  /// An integer above the largest `i64`.
+  Unsigned {
+    /// The value.
+    pub value: u64
+  },
+  /// A float. A `float 32` in the input is widened to `f64`.
+  Float {
+    /// The value.
+    pub value: f64
+  },
+  /// Text.
+  String {
+    /// The text.
+    pub text: String
+  },
+  /// Binary data.
+  Binary {
+    /// The data.
+    pub bytes: Bytes
+  },
+  /// An array.
+  Array {
+    /// The elements, in order.
+    pub values: List<Value>
+  },
+  /// A map.
+  Map {
+    /// The entries, in the order they were written. Keys are not checked for duplicates.
+    pub entries: List<MsgpackEntry>
+  },
+  /// An extension value, such as a timestamp (type -1). It is not interpreted.
+  Extension {
+    /// The extension type. MessagePack reserves the negative types.
+    pub kind: i8,
+    /// The payload.
+    pub data: Bytes
+  },
+}
+
+/// The owner of the functions that parse, read and write a MessagePack tree. It has no fields and
+/// is never constructed.
+pub struct Msgpack {}
+
+effect fn token(scanner: &mut MsgpackScanner<'_>) -> MsgpackToken
+  ! MsgpackError {
+  return match move MsgpackScanner.next(&mut scanner.*) {
+    Result<MsgpackToken, MsgpackError>.Success { value } => value
+    Result<MsgpackToken, MsgpackError>.Failure { error } => {
+      fail error
+    }
+  }
+}
+
+// Reads one value. `depth` is the number of arrays and maps open around it.
+effect fn parseValue(scanner: &mut MsgpackScanner<'_>, depth: usize) -> Value
+  ! MsgpackError | OutOfMemoryError
+  ? &mut Allocator {
+  let found = run token(&mut scanner.*)
+  return match found {
+    MsgpackToken.Nil => Value.Nil
+    MsgpackToken.Boolean { value } => Value.Bool { value: value }
+    MsgpackToken.Integer { value } => Value.Integer { value: value }
+    MsgpackToken.Unsigned { value } => Value.Unsigned { value: value }
+    MsgpackToken.Float { value } => Value.Float { value: value }
+    MsgpackToken.String { span } => {
+      // The scanner checked the UTF-8 of the string.
+      let text = unsafe String.fromUtf8Unchecked(MsgpackScanner.slice(&scanner.*, span))
+      Value.String { text: run String.copy(text) }
+    }
+    MsgpackToken.Binary { span } => Value.Binary {
+      bytes: run Bytes.copy(MsgpackScanner.slice(&scanner.*, span)),
+    }
+    MsgpackToken.Extension { kind, span } => Value.Extension {
+      kind: kind,
+      data: run Bytes.copy(MsgpackScanner.slice(&scanner.*, span)),
+    }
+    MsgpackToken.Array { count } => {
+      if depth >= MAX_DEPTH {
+        fail MsgpackError {
+          reason: MsgpackReason.DepthExceeded,
+          offset: MsgpackScanner.offset(&scanner.*),
+        }
+      }
+      let mut values = List<Value>.make()
+      let mut at = usize.ZERO
+      while at < count {
+        let value = run parseValue(&mut scanner.*, depth + usize.ONE)
+        run List<Value>.append(&mut values, move value)
+        at = at + usize.ONE
+      }
+      Value.Array { values: move values }
+    }
+    MsgpackToken.Map { count } => {
+      if depth >= MAX_DEPTH {
+        fail MsgpackError {
+          reason: MsgpackReason.DepthExceeded,
+          offset: MsgpackScanner.offset(&scanner.*),
+        }
+      }
+      let mut entries = List<MsgpackEntry>.make()
+      let mut at = usize.ZERO
+      while at < count {
+        let key = run parseValue(&mut scanner.*, depth + usize.ONE)
+        let value = run parseValue(&mut scanner.*, depth + usize.ONE)
+        run List<MsgpackEntry>.append(
+          &mut entries,
+          MsgpackEntry { key: move key, value: move value },
+        )
+        at = at + usize.ONE
+      }
+      Value.Map { entries: move entries }
+    }
+    MsgpackToken.EndOfInput => {
+      fail MsgpackError {
+        reason: MsgpackReason.UnexpectedEnd,
+        offset: MsgpackScanner.length(&scanner.*),
+      }
+    }
+  }
+}
+
+impl Msgpack {
+  /// Parses `bytes`, which must be exactly one MessagePack value, into an owned tree.
+  ///
+  /// # When to use
+  ///
+  /// Use it when the shape of the data is not known in advance. To read a known type, use
+  /// `silk.schema.msgpack.SchemaMsgpack.decode`, which builds no tree.
+  ///
+  /// # Details
+  ///
+  /// Text is checked to be UTF-8 and copied; binary data and extension payloads are copied. An
+  /// integer becomes `Value.Integer` when it fits in `i64` and `Value.Unsigned` above that. Map
+  /// entries keep their order and are not checked for duplicate keys.
+  ///
+  /// # Errors
+  ///
+  /// - `MsgpackError` with `UnexpectedEnd` if `bytes` is empty or ends inside the value,
+  ///   `ReservedByte` for the byte `0xc1`, `InvalidUtf8` for a string that is not UTF-8,
+  ///   `DepthExceeded` if more than 64 arrays and maps are nested, or `TrailingBytes` if bytes
+  ///   follow the value. The partial tree is dropped.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the tree.
+  pub effect fn parse(bytes: &[u8]) -> Value
+    ! MsgpackError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut scanner = MsgpackScanner.make(bytes)
+    let value = run parseValue(&mut scanner, usize.ZERO)
+    if MsgpackScanner.end(&scanner) != bytes.length {
+      fail MsgpackError {
+        reason: MsgpackReason.TrailingBytes,
+        offset: MsgpackScanner.end(&scanner),
+      }
+    }
+    return move value
+  }
+
+  /// Writes `value` as MessagePack through the ambient `Writer`, without flushing it.
+  ///
+  /// # Details
+  ///
+  /// Each value is written in the shortest format that holds it, and every float as a `float 64`,
+  /// so the bytes of a parsed tree can be shorter than its input, and equal trees write equal
+  /// bytes. Map entries are written in their order.
+  ///
+  /// # Errors
+  ///
+  /// - `MsgpackError` with `MsgpackReason.TooLong` if a string, binary value, extension payload,
+  ///   array or map is longer than 4294967295. The values before it stay written.
+  /// - `WriterError` if the `Writer` fails. Bytes that it accepted before the failure stay written.
+  pub effect fn write(value: &Value) -> ()
+    ! MsgpackError | WriterError
+    ? &mut Writer {
+    return match &value.* {
+      Value.Nil => run MsgpackOutput.writeNil()
+      Value.Bool { value: flag } => run MsgpackOutput.writeBool(flag)
+      Value.Integer { value: number } => run MsgpackOutput.writeSigned(number)
+      Value.Unsigned { value: number } => run MsgpackOutput.writeUnsigned(number)
+      Value.Float { value: number } => run MsgpackOutput.writeFloat(number)
+      Value.String { text } => run MsgpackOutput.writeString(String.view(&text))
+      Value.Binary { bytes } => run MsgpackOutput.writeBinary(Bytes.asSlice(&bytes))
+      Value.Extension { kind, data } => run MsgpackOutput.writeExtension(kind, Bytes.asSlice(&data))
+      Value.Array { values } => {
+        let items = List<Value>.asSlice(&values)
+        run MsgpackOutput.writeArrayHeader(items.length)
+        let mut at = usize.ZERO
+        while at < items.length {
+          run Msgpack.write(&items[at])
+          at = at + usize.ONE
+        }
+        ()
+      }
+      Value.Map { entries } => {
+        let members = List<MsgpackEntry>.asSlice(&entries)
+        run MsgpackOutput.writeMapHeader(members.length)
+        let mut at = usize.ZERO
+        while at < members.length {
+          run Msgpack.write(&members[at].key)
+          run Msgpack.write(&members[at].value)
+          at = at + usize.ONE
+        }
+        ()
+      }
+    }
+  }
+
+  /// Returns the value of the first entry of a map whose key is the text `key`. Returns `None` if
+  /// `value` is not a map or has no such key.
+  ///
+  /// # Details
+  ///
+  /// Only a text key matches: a binary key with the same bytes does not. The returned value
+  /// borrows the tree.
+  pub fn field<'a>(value: &'a Value, key: string) -> Option<&'a Value> {
+    match &value.* {
+      Value.Map { entries } => {
+        let members = List<MsgpackEntry>.asSlice(&entries)
+        let mut at = usize.ZERO
+        while at < members.length {
+          if let Value.String { text } = &members[at].key {
+            if String.view(&text) == key {
+              return Option<&'a Value>.some(&members[at].value)
+            }
+          }
+          at = at + usize.ONE
+        }
+      }
+      _ => {}
+    }
+    return Option<&'a Value>.none()
+  }
+
+  /// Returns the value of the first entry whose key is the text `key` if `value` is a present map.
+  /// Returns `None` in other cases.
+  ///
+  /// # When to use
+  ///
+  /// Use it to read nested fields in a chain:
+  /// `Msgpack.field(&document, "user") |> Msgpack.fieldAt("name")`.
+  pub fn fieldAt<'a>(value: Option<&'a Value>, key: string) -> Option<&'a Value> {
+    return match move value {
+      Option<&'a Value>.None => Option<&'a Value>.none()
+      Option<&'a Value>.Some { value: present } => Msgpack.field(present, key)
+    }
+  }
+
+  /// Returns the boolean that a present `Value.Bool` holds, or `None` for an absent value or
+  /// another kind.
+  pub fn asBool(value: Option<&Value>) -> Option<bool> {
+    return match move value {
+      Option<&Value>.None => Option<bool>.none()
+      Option<&Value>.Some { value: present } => match &present.* {
+        Value.Bool { value: flag } => Option<bool>.some(flag)
+        _ => Option<bool>.none()
+      }
+    }
+  }
+
+  /// Returns the integer that a present `Value.Integer` holds, or `None` for an absent value,
+  /// another kind, or a `Value.Unsigned` above the largest `i64`. A float is not converted.
+  pub fn asI64(value: Option<&Value>) -> Option<i64> {
+    return match move value {
+      Option<&Value>.None => Option<i64>.none()
+      Option<&Value>.Some { value: present } => match &present.* {
+        Value.Integer { value: number } => Option<i64>.some(number)
+        Value.Unsigned { value: number } => u64.checkedToI64(number)
+        _ => Option<i64>.none()
+      }
+    }
+  }
+
+  /// Returns the integer that a present `Value.Unsigned`, or a `Value.Integer` of 0 or more,
+  /// holds. Returns `None` for an absent value, another kind, or a negative integer. A float is
+  /// not converted.
+  pub fn asU64(value: Option<&Value>) -> Option<u64> {
+    return match move value {
+      Option<&Value>.None => Option<u64>.none()
+      Option<&Value>.Some { value: present } => match &present.* {
+        Value.Integer { value: number } => i64.checkedToU64(number)
+        Value.Unsigned { value: number } => Option<u64>.some(number)
+        _ => Option<u64>.none()
+      }
+    }
+  }
+
+  /// Returns the number that a present `Value.Float` holds, or a present integer converted to the
+  /// nearest `f64`. Returns `None` for an absent value or another kind.
+  pub fn asF64(value: Option<&Value>) -> Option<f64> {
+    return match move value {
+      Option<&Value>.None => Option<f64>.none()
+      Option<&Value>.Some { value: present } => match &present.* {
+        Value.Float { value: number } => Option<f64>.some(number)
+        Value.Integer { value: number } => Option<f64>.some(i64.toF64(number))
+        Value.Unsigned { value: number } => Option<f64>.some(u64.toF64(number))
+        _ => Option<f64>.none()
+      }
+    }
+  }
+
+  /// Returns the text of a present `Value.String`, or `None` for an absent value or another kind,
+  /// binary data included. The text borrows the tree.
+  pub fn asString<'a>(value: Option<&'a Value>) -> Option<string<'a>> {
+    return match move value {
+      Option<&'a Value>.None => Option<string<'a>>.none()
+      Option<&'a Value>.Some { value: present } => match &present.* {
+        Value.String { text } => Option<string<'a>>.some(String.view(&text))
+        _ => Option<string<'a>>.none()
+      }
+    }
+  }
+
+  /// Returns the data of a present `Value.Binary`, or `None` for an absent value or another kind,
+  /// text included. The data borrows the tree.
+  pub fn asBinary<'a>(value: Option<&'a Value>) -> Option<&'a [u8]> {
+    return match move value {
+      Option<&'a Value>.None => Option<&'a [u8]>.none()
+      Option<&'a Value>.Some { value: present } => match &present.* {
+        Value.Binary { bytes } => Option<&'a [u8]>.some(Bytes.asSlice(&bytes))
+        _ => Option<&'a [u8]>.none()
+      }
+    }
+  }
+
+  /// Returns the element of an array at the zero-based `index`, or `None` if `value` is not an
+  /// array or `index` is out of range. The returned value borrows the tree.
+  pub fn item<'a>(value: &'a Value, index: usize) -> Option<&'a Value> {
+    match &value.* {
+      Value.Array { values } => {
+        let items = List<Value>.asSlice(&values)
+        if index < items.length {
+          return Option<&'a Value>.some(&items[index])
+        }
+      }
+      _ => {}
+    }
+    return Option<&'a Value>.none()
+  }
+}
