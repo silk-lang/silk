@@ -3234,6 +3234,8 @@ struct DeclarationMemo {
 // The escape check of one list of concrete bodies, kept until its unit is no longer current.
 struct EscapeMemo {
   unit: usize,
+  // The raw MIR and source dependencies that established this check's dispatch members.
+  discovery: usize,
   concrete: List<DeclarationId>,
   result: DeclarationCheckResult,
   // The record of the walk that found nothing to report, which `cacheImage` writes.
@@ -7299,14 +7301,20 @@ effect fn recordMembership(resolver: &mut Resolver, instance: &InstanceKey) -> (
 
 // A second artifact can be built in the same source revision with different roots. Give
 // changed membership observations a fresh revision before invalidating their consumers.
-effect fn reconcileMembership(resolver: &mut Resolver) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn reconcileMembership(resolver: &mut Resolver, declarationCheck: bool) -> () ! OutOfMemoryError ? &mut Allocator {
   let observed = List<usize>.asSlice(&resolver.membershipInputs)
   let mut advanced = false
   let mut at = usize.ZERO
   while at < observed.length {
     let input = &mut List<Inputs.Input>.asMutSlice(&mut resolver.sourceInputs.inputs)[observed[at]]
     if let SourceSelector.ErasureMembers {contract} = &input.selector {
-      let digest = ContentHash.of(ErasureIndex.snapshot(&resolver.erasures, Bytes.asSlice(&contract)))
+      let snapshot = if declarationCheck { ErasureIndex.reachedSnapshot(&resolver.erasures, Bytes.asSlice(&contract)) }
+        else { ErasureIndex.snapshot(&resolver.erasures, Bytes.asSlice(&contract)) }
+      // A declaration's closure covers what its roots reach. Another declaration may still have
+      // a current proof for a contract this one never uses. A reached zero-member contract has
+      // a nonempty frozen encoding and must invalidate an earlier nonempty membership.
+      if declarationCheck && snapshot.length == usize.ZERO { at = at + usize.ONE continue }
+      let digest = ContentHash.of(snapshot)
       if !Inputs.unchanged(&input.*, digest) {
         if !advanced { Graph.beginRevision(&mut resolver.graph) advanced = true }
         run Graph.inputChanged(&mut resolver.graph, observed[at], input.module)
@@ -97841,7 +97849,7 @@ impl Semantic {
       let mut named = move concrete
       run Semantic.keepDeclaration(&mut self.*, unit, List<DeclarationId>.remove(&mut named, usize.ZERO), kind == 3, node == usize.MAX)
     } else if kind == 1 {
-      run List<EscapeMemo>.append(&mut self.escapeMemos, EscapeMemo {unit: unit, concrete: move concrete,
+      run List<EscapeMemo>.append(&mut self.escapeMemos, EscapeMemo {unit: unit, discovery: usize.MAX, concrete: move concrete,
         result: DeclarationCheckResult {rejections: move rejections, gaps: List<Shared<BackendGap>>.make(),
           unchecked: List<UncheckedDeclaration>.make()}, captured: Option<CapturedBuild>.none(), reads: usize.MAX})
     } else {
@@ -99134,9 +99142,6 @@ impl Semantic {
   -> DeclarationCheckResult
     ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
     ? &mut Allocator | &mut Types {
-    if let Option<DeclarationCheckResult>.Some {value} = move run Semantic.closeCheckErasures(&mut self.*, &mut request.*, concrete) {
-      return move value
-    }
     let own = resolvedModule(&self.resolver, module)
     // The application's own modules are always left to their own checks, and so are the checked
     // modules of other packages. A walk that leaves every checked module to its own check needs
@@ -99172,18 +99177,38 @@ impl Semantic {
     let unit = u64.toUsize(word.value)
     let boundary = Option<WalkBoundary>.some(WalkBoundary {package: move package, own: move own, checked: move others,
       lookup: move lookup, staticsOnly: staticsOnly})
+    let mayErase = concrete.length > usize.ZERO && (self.resolver.writtenErasure || SourceIndex.hasErasedType(&self.resolver.source))
     let found = escapeMemoOf(List<EscapeMemo>.asSlice(&self.escapeMemos), unit)
     // The record of this check's last walk in this process, which an edit since may leave true.
     let mut previous = Option<CapturedBuild>.none()
     if found != usize.MAX {
       let memos = List<EscapeMemo>.asSlice(&self.escapeMemos)
-      if sameDeclarations(List<DeclarationId>.asSlice(&memos[found].concrete), concrete) && run Semantic.unitCurrent(&mut self.*, unit) {
+      let proof = memos[found].discovery
+      let sameRoots = sameDeclarations(List<DeclarationId>.asSlice(&memos[found].concrete), concrete)
+      if sameRoots && (!mayErase || (proof != usize.MAX && run Semantic.unitCurrent(&mut self.*, proof))) && (run Semantic.unitCurrent(&mut self.*, unit)) {
         let kept = List<EscapeMemo>.asSlice(&self.escapeMemos)
         return run copyCheckResult(&kept[found].result)
       }
-      let EscapeMemo {unit: _, concrete: _, result: _, captured: last, reads: _} = List<EscapeMemo>.remove(&mut self.escapeMemos, found)
+      let EscapeMemo {unit: _, discovery: _, concrete: _, result: _, captured: last, reads: _} = List<EscapeMemo>.remove(&mut self.escapeMemos, found)
       previous = move last
       uncarry(&mut self.carriedUnits, &mut self.carriedRoots, unit)
+    }
+    let mut discovery = usize.MAX
+    if mayErase {
+      let proof = run internKey(&mut self.resolver, Key {family: Family.ModuleCheck, module: module, name: 8,
+        declaration: usize.MAX, member: member, external: false})
+      discovery = u64.toUsize(proof.value)
+      run Graph.startRun(&mut self.resolver.graph, discovery)
+      let recorder = self.resolver.rootRecorder
+      self.resolver.rootRecorder = discovery
+      let attempted = run Effect.result(Semantic.closeCheckErasures(&mut self.*, &mut request.*, concrete))
+      self.resolver.rootRecorder = recorder
+      drop run Graph.finishRun(&mut self.resolver.graph, discovery, Option<ContentHash>.none())
+      let closed = match move attempted {
+        Result<Option<DeclarationCheckResult>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} => move value
+        Result<Option<DeclarationCheckResult>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} => { fail move error }
+      }
+      if let Option<DeclarationCheckResult>.Some {value} = move closed { return move value }
     }
     // The walk an adopted image recorded for this check is replayed when it still describes the
     // check; a walk run here replaces it either way.
@@ -99203,14 +99228,14 @@ impl Semantic {
     }
     if sibling != usize.MAX {
       let recorded = run adoptedAnswer(&self.heldImage, sibling)
-      let replayed = run Semantic.replayKept(&mut self.*, &mut request.*, module, member, unit, concrete, &boundary,
+      let replayed = run Semantic.replayKept(&mut self.*, &mut request.*, module, member, unit, discovery, concrete, &boundary,
         Bytes.asSlice(&recorded), sibling, &[], usize.MAX, false, true)
       if let Option<DeclarationCheckResult>.Some {value: result} = move replayed { return move result }
     }
     let mut kept = Option<EscapeRecordRoot>.none()
     if let Option<EscapeRecordRoot>.Some {value: held} = move adopted {
       let recorded = run adoptedAnswer(&self.heldImage, held.root)
-      let replayed = run Semantic.replayKept(&mut self.*, &mut request.*, module, member, unit, concrete, &boundary,
+      let replayed = run Semantic.replayKept(&mut self.*, &mut request.*, module, member, unit, discovery, concrete, &boundary,
         Bytes.asSlice(&recorded), held.root, &[], usize.MAX, false, false)
       if let Option<DeclarationCheckResult>.Some {value: result} = move replayed { return move result }
       kept = Option<EscapeRecordRoot>.some(move held)
@@ -99220,7 +99245,7 @@ impl Semantic {
       // unit is current.
       if last.guard == usize.MAX || run Semantic.unitCurrent(&mut self.*, last.guard) {
         let recorded = run BuildRecord.encode(&last.record)
-        let replayed = run Semantic.replayKept(&mut self.*, &mut request.*, module, member, unit, concrete, &boundary,
+        let replayed = run Semantic.replayKept(&mut self.*, &mut request.*, module, member, unit, discovery, concrete, &boundary,
           Bytes.asSlice(&recorded), last.carriedRecord, List<CapturedEntry>.asSlice(&last.entries), last.guard, true, false)
         if let Option<DeclarationCheckResult>.Some {value: result} = move replayed { return move result }
       }
@@ -99264,7 +99289,7 @@ impl Semantic {
         run List<EscapeRecordRoot>.append(&mut self.escapeImage.records, move held)
       }
     }
-    run List<EscapeMemo>.append(&mut self.escapeMemos, EscapeMemo {unit: unit, concrete: run copyDeclarations(concrete),
+    run List<EscapeMemo>.append(&mut self.escapeMemos, EscapeMemo {unit: unit, discovery: discovery, concrete: run copyDeclarations(concrete),
       result: run copyCheckResult(&result), captured: move captured, reads: usize.MAX})
     return move result
   }
@@ -99272,7 +99297,7 @@ impl Semantic {
   // Replays the escape walk record `recorded` for the check `unit` of `module` (`replayEscapes`),
   // or walks it again from the record (`rewalkEscapes`) within `boundary`, and keeps what it found
   // as the check's memo; none when neither can tell what the walk finds.
-  effect fn replayKept(self: &mut Self, request: &mut Request, module: usize, member: usize, unit: usize, concrete: &[DeclarationId],
+  effect fn replayKept(self: &mut Self, request: &mut Request, module: usize, member: usize, unit: usize, discovery: usize, concrete: &[DeclarationId],
     boundary: &Option<WalkBoundary>, recorded: &[u8], recordRoot: usize, previous: &[CapturedEntry], guard: usize, inProcess: bool, rewalkOnly: bool)
     -> Option<DeclarationCheckResult>
     ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
@@ -99295,7 +99320,7 @@ impl Semantic {
     }
     if let Option<EscapeReplay>.Some {value: replay} = move replayed {
       let EscapeReplay {captured, result} = move replay
-      run List<EscapeMemo>.append(&mut self.escapeMemos, EscapeMemo {unit: unit, concrete: run copyDeclarations(concrete),
+      run List<EscapeMemo>.append(&mut self.escapeMemos, EscapeMemo {unit: unit, discovery: discovery, concrete: run copyDeclarations(concrete),
         result: run copyCheckResult(&result), captured: Option<CapturedBuild>.some(move captured), reads: reads})
       return Option<DeclarationCheckResult>.some(move result)
     }
@@ -100200,7 +100225,8 @@ impl Semantic {
     self.resolver.closedErasures = false
     self.resolver.erasureDispatchers = List<DiscoveryDispatch>.make()
     self.resolver.effectDispatchers = List<ErasedRecursion.Operation>.make()
-    let mut workers = self.walkWorkers
+    // A retained declaration proof observes every raw MIR dependency in this store.
+    let mut workers = if declarationCheck { usize.ZERO } else { self.walkWorkers }
     while true {
       self.resolver.erasureRound = ErasureRound.make()
       let mut sharing = unshared()
@@ -100246,7 +100272,7 @@ impl Semantic {
     self.resolver.effectDispatchers = List<ErasedRecursion.Operation>.make()
     run ErasureIndex.freeze(&mut self.resolver.erasures)
     self.resolver.closedErasures = true
-    run reconcileMembership(&mut self.resolver)
+    run reconcileMembership(&mut self.resolver, declarationCheck)
     return Option<BackendBuild>.none()
   }
 
@@ -102699,7 +102725,7 @@ impl Semantic {
         List<BuildRoot>.asSlice(&roots), origin, closureNodes, false) { return move refused }
     } else if self.resolver.closedErasures {
       self.resolver.erasures = ErasureIndex.make()
-      run reconcileMembership(&mut self.resolver)
+      run reconcileMembership(&mut self.resolver, false)
     }
     // A revisable store that read a build record replays it; anything it cannot replay walks.
     // A record whose walk an edit changed is walked again from its entries (`rewalkBuild`).
