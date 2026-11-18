@@ -11,8 +11,8 @@
 //! # Details
 //! An address is a base and an offset ([`Place`]): `Offset` and `Index` by a constant add to the
 //! offset, an `Index` by anything else leaves it unknown, and the base is a stack slot, a
-//! symbol, a constant address, or any other value (an argument, a parameter, a loaded or
-//! returned address).
+//! symbol, a constant address, a function argument, or any other value (a parameter, a loaded
+//! or returned address).
 //!
 //! The alias rule decides whether two accesses can touch a common byte:
 //!
@@ -23,6 +23,9 @@
 //!   every slot.
 //! - Two accesses to different slots never alias. A slot that does not escape aliases nothing
 //!   but itself: only an address derived from its `SlotAddress` can reach it, and no callee can.
+//!   A slot whose address escapes still never aliases an access based on a function argument or
+//!   on a symbol: the slot did not exist when the caller made the argument, and a symbol's bytes
+//!   are not on the stack.
 //! - Two accesses from one base alias when both offsets are known and their byte ranges overlap,
 //!   modulo the address width, or when either offset is unknown.
 //! - Any other two accesses may alias: two different values, symbols or constants can hold or
@@ -37,8 +40,8 @@
 //! whose only predecessor it is, and starting from nothing at every merge. A load of the place,
 //! size and kind a store wrote, or an earlier load read, with no aliasing write or clobbering
 //! operation between, becomes that value; a load through an address of unknown place becomes the
-//! value an earlier load through the same address value read, with no write, copy, fill or
-//! clobbering operation at all between; an integer load of bytes inside a wider integer
+//! value an earlier load through the same address value read, with no clobbering operation
+//! between and no write, copy or fill that may alias it; an integer load of bytes inside a wider integer
 //! constant a store wrote becomes the constant those bytes hold; a store of the value a place
 //! already holds goes. Both
 //! removed accesses touch exactly the bytes of an earlier access that did not trap, so neither
@@ -54,6 +57,7 @@
 import backend.SsaDeadCode
 import backend.SsaFunction {
   ConstantForm,
+  Definition,
   Edge,
   Kind,
   Operation,
@@ -76,6 +80,9 @@ pub enum BaseForm {
   Slot,
   /// The value `Place.base`, whatever address it holds.
   Value,
+  /// The function argument `Place.base`, an address its caller made: it may be any address but
+  /// one of this call's own stack slots, which did not exist then.
+  Argument,
   /// The symbol at position `Place.base` among the function's symbols.
   Symbol,
   /// Address zero: the offset is the address.
@@ -109,7 +116,10 @@ pub fn placeOf(function: &SsaFunction, address: u64, offset: u64) -> Place {
       return Place {form: BaseForm.Value, base: at, offset: moved, known: known}
     }
     let producer = function.producerOf(at)
-    if producer == usize.MAX { return Place {form: BaseForm.Value, base: at, offset: moved, known: known} }
+    if producer == usize.MAX {
+      if function.value(at).definition == Definition.Argument { return Place {form: BaseForm.Argument, base: at, offset: moved, known: known} }
+      return Place {form: BaseForm.Value, base: at, offset: moved, known: known}
+    }
     let operands = function.operandsOf(producer)
     match function.instruction(producer).operation {
       Operation.SlotAddress {slot} => { return Place {form: BaseForm.Slot, base: usize.toU64(slot), offset: moved, known: known} }
@@ -145,8 +155,10 @@ pub fn mayAlias(first: Place, size: u64, second: Place, otherSize: u64, escaped:
     if first.base != second.base { return false }
     return overlaps(first, size, second, otherSize, bits)
   }
-  if first.form == BaseForm.Slot { return escaped[u64.toUsize(first.base)] }
-  if second.form == BaseForm.Slot { return escaped[u64.toUsize(second.base)] }
+  // A slot is apart from what the caller's addresses and the symbols reach, even once its own
+  // address has escaped.
+  if first.form == BaseForm.Slot { return escaped[u64.toUsize(first.base)] && second.form != BaseForm.Argument && second.form != BaseForm.Symbol }
+  if second.form == BaseForm.Slot { return escaped[u64.toUsize(second.base)] && first.form != BaseForm.Argument && first.form != BaseForm.Symbol }
   if first.form == second.form && first.base == second.base { return overlaps(first, size, second, otherSize, bits) }
   return true
 }
@@ -509,20 +521,25 @@ impl Copy for Held {}
 fn window() -> usize { return 128 }
 
 // What an earlier load read through an address whose place is not known: the address value,
-// the load's offset and kind, and the value it read.
+// the load's offset and kind, the value it read, what is known of its place, and whether no
+// write since may have changed it.
 struct Read {
   address: u64,
   offset: u64,
   kind: Kind,
   value: u64,
+  place: Place,
+  alive: bool,
 }
 
 impl Copy for Read {}
 
 struct Forwarding {
-  // The loads through addresses of unknown place since the last write of any kind, in the
-  // blocks the walk is in; entries below `readFloor` are not visible.
+  // The loads through addresses of unknown place since the last clobbering operation, in the
+  // blocks the walk is in; entries below `readFloor` are not visible, nor are those a write that
+  // may alias them killed, which `killedReads` lists so a block's end can revive them.
   reads: List<Read>,
+  killedReads: List<usize>,
   readFloor: usize,
   held: List<Held>,
   // Entries below `floor` are not visible: a merge started from nothing.
@@ -540,7 +557,7 @@ struct Forwarding {
 pub effect fn forward(function: &mut SsaFunction) -> bool ! OutOfMemoryError ? &mut Allocator {
   let graph = run SsaGraph.of(&function.*)
   let escaped = run escapedSlots(&function.*)
-  let mut state = Forwarding {reads: List<Read>.make(), readFloor: usize.ZERO, held: List<Held>.make(), floor: usize.ZERO, killed: List<usize>.make(), substitution: List<u64>.make(), escaped: move escaped,
+  let mut state = Forwarding {reads: List<Read>.make(), killedReads: List<usize>.make(), readFloor: usize.ZERO, held: List<Held>.make(), floor: usize.ZERO, killed: List<usize>.make(), substitution: List<u64>.make(), escaped: move escaped,
     bits: function.addressBits, changed: false}
   run List<u64>.appendRepeated(&mut state.substitution, none(), function.valueCount())
   // Entries: a block to enter, or `usize.MAX - mark` to leave the mark at that position.
@@ -557,6 +574,16 @@ pub effect fn forward(function: &mut SsaFunction) -> bool ! OutOfMemoryError ? &
       // A write below this block hid the reads above it only there.
       List<Read>.truncate(&mut state.reads, List<usize>.get(&marks, mark + 3))
       state.readFloor = List<usize>.get(&marks, mark + 4)
+      let revivedReads = List<usize>.get(&marks, mark + 5)
+      while List<usize>.length(&state.killedReads) > revivedReads {
+        let last = List<usize>.length(&state.killedReads) - usize.ONE
+        let again = List<usize>.get(&state.killedReads, last)
+        if again < List<Read>.length(&state.reads) {
+          let reads = List<Read>.asMutSlice(&mut state.reads)
+          reads[again].alive = true
+        }
+        List<usize>.truncate(&mut state.killedReads, last)
+      }
       List<Held>.truncate(&mut state.held, held)
       while List<usize>.length(&state.killed) > killed {
         let last = List<usize>.length(&state.killed) - usize.ONE
@@ -577,6 +604,7 @@ pub effect fn forward(function: &mut SsaFunction) -> bool ! OutOfMemoryError ? &
     run List<usize>.append(&mut marks, state.floor)
     run List<usize>.append(&mut marks, List<Read>.length(&state.reads))
     run List<usize>.append(&mut marks, state.readFloor)
+    run List<usize>.append(&mut marks, List<usize>.length(&state.killedReads))
     run List<usize>.append(&mut walk, usize.MAX - mark)
     if graph.predecessorsOf(block).length != usize.ONE {
       state.floor = List<Held>.length(&state.held)
@@ -661,6 +689,24 @@ fn narrowedAt(state: &Forwarding, function: &SsaFunction, place: Place, size: u6
 }
 
 // Forgets the visible entries `size` bytes at `place` may overwrite.
+// Hides the earlier loads through addresses of unknown place that a write of `size` bytes at
+// `place` may have changed.
+effect fn killReads(state: &mut Forwarding, place: Place, size: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut at = List<Read>.length(&state.reads)
+  let mut seen = usize.ZERO
+  while at > state.readFloor && seen < window() {
+    at = at - usize.ONE
+    seen = seen + usize.ONE
+    let entry = List<Read>.get(&state.reads, at)
+    if entry.alive && mayAlias(entry.place, usize.toU64(entry.kind.storeSize()), place, size, List<bool>.asSlice(&state.escaped), state.bits) {
+      let reads = List<Read>.asMutSlice(&mut state.reads)
+      reads[at].alive = false
+      run List<usize>.append(&mut state.killedReads, at)
+    }
+  }
+  return ()
+}
+
 effect fn kill(state: &mut Forwarding, place: Place, size: u64) -> () ! OutOfMemoryError ? &mut Allocator {
   let length = List<Held>.length(&state.held)
   let mut at = length
@@ -723,8 +769,8 @@ effect fn forwardBlock(state: &mut Forwarding, function: &mut SsaFunction, block
         } else if place.known {
           run List<Held>.append(&mut state.held, Held {place: place, size: size, kind: found.kind, value: found.result, alive: true})
         } else {
-          // The same address value read again with no write of any kind between reads the same
-          // bytes, wherever they are.
+          // The same address value read again, with no write between that may alias it, reads
+          // the same bytes, wherever they are.
           let address = resolved(&state.*, function.operandsOf(instruction)[usize.ZERO])
           let reads = List<Read>.asSlice(&state.reads)
           let mut earlier = none()
@@ -733,14 +779,14 @@ effect fn forwardBlock(state: &mut Forwarding, function: &mut SsaFunction, block
           while read > state.readFloor && seen < window() && earlier == none() {
             read = read - usize.ONE
             seen = seen + usize.ONE
-            if reads[read].address == address && reads[read].offset == offset && reads[read].kind.equals(found.kind) { earlier = reads[read].value }
+            if reads[read].alive && reads[read].address == address && reads[read].offset == offset && reads[read].kind.equals(found.kind) { earlier = reads[read].value }
           }
           if earlier != none() {
             List<u64>.set(&mut state.substitution, u64.toUsize(found.result), earlier)
             function.remove(instruction)
             state.changed = true
           } else {
-            run List<Read>.append(&mut state.reads, Read {address: address, offset: offset, kind: found.kind, value: found.result})
+            run List<Read>.append(&mut state.reads, Read {address: address, offset: offset, kind: found.kind, value: found.result, place: place, alive: true})
           }
         }
       }
@@ -755,19 +801,19 @@ effect fn forwardBlock(state: &mut Forwarding, function: &mut SsaFunction, block
           function.remove(instruction)
           state.changed = true
         } else {
-          state.readFloor = List<Read>.length(&state.reads)
+          run killReads(&mut state.*, place, size)
           run kill(&mut state.*, place, size)
           if place.known { run List<Held>.append(&mut state.held, Held {place: place, size: size, kind: kind, value: value, alive: true}) }
         }
       }
       Operation.CopyBytes {size} => {
         let place = placeOf(&function.*, resolved(&state.*, function.operandsOf(instruction)[usize.ZERO]), 0)
-        state.readFloor = List<Read>.length(&state.reads)
+        run killReads(&mut state.*, place, size)
         run kill(&mut state.*, place, size)
       }
       Operation.Fill {size, ..} => {
         let place = placeOf(&function.*, resolved(&state.*, function.operandsOf(instruction)[usize.ZERO]), 0)
-        state.readFloor = List<Read>.length(&state.reads)
+        run killReads(&mut state.*, place, size)
         run kill(&mut state.*, place, size)
       }
       _ => {
