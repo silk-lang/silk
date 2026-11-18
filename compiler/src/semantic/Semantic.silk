@@ -10338,7 +10338,12 @@ effect fn placeLeaf(resolver: &mut Resolver, leaf: &CacheImage.Leaf, key: &[u8],
   }
   // A cache can be opened before the build roots are known. Membership-dependent definitions
   // wait on this leaf until the walk has closed the member sets.
-  if let SourceSelector.ErasureMembers {..} = &placed.selector { return usize.MAX }
+  if let SourceSelector.ErasureMembers {..} = &placed.selector {
+    // An adopted sweep can reach an erased operation before it reparses the module that
+    // writes its contract. Discover the current members before reusing that sweep.
+    resolver.writtenErasure = true
+    return usize.MAX
+  }
   let known = Inputs.find(&resolver.sourceInputs, placed.module, &placed.selector)
   // A read of a file whose bytes are those the image recorded reads what it read then. A resolution
   // reads the manifests instead, which the image does not record.
@@ -80805,12 +80810,13 @@ struct DispatchTarget {
 // providers and member set share this answer. Only final dispatcher MIR enters ordinary queries.
 struct DiscoveryDispatch {
   instance: InstanceKey,
+  call: RelatedSite,
   contract: usize,
   count: usize,
   mir: Shared<Result<Answer, NoRejection>>,
 }
 
-effect fn discoveryDispatcher(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, key: Key, instance: &InstanceKey, positionOut: &mut usize)
+effect fn discoveryDispatcher(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, key: Key, instance: &InstanceKey, caller: &ModuleId, span: Span, positionOut: &mut usize)
   -> Shared<Result<Answer, NoRejection>> ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
   run List<InstanceKey>.append(&mut resolver.erasureRound.dispatchers, InstanceKey.copy(instance))
   let application = run InstanceKey.selected(instance)
@@ -80833,7 +80839,7 @@ effect fn discoveryDispatcher(resolver: &mut Resolver, owner: &mut Query<Answer,
   let identity = InstanceKey.identity(instance)
   let answer = run resolveUnionDispatchMir(&mut resolver.*, &mut owner.*, key, InstanceKey.copy(instance), &identity, false)
   let mir = run Shared<Result<Answer, NoRejection>>.make(Result<Answer, NoRejection>.succeed(move answer))
-  let result = DiscoveryDispatch {instance: InstanceKey.copy(instance), contract: position, count: count,
+  let result = DiscoveryDispatch {instance: InstanceKey.copy(instance), call: RelatedSite {module: ModuleId.copy(caller), span: span}, contract: position, count: count,
     mir: Shared<Result<Answer, NoRejection>>.clone(&mir)}
   if at == List<DiscoveryDispatch>.length(&resolver.erasureDispatchers) { run List<DiscoveryDispatch>.append(&mut resolver.erasureDispatchers, move result) }
   else { List<DiscoveryDispatch>.set(&mut resolver.erasureDispatchers, at, move result) }
@@ -99126,6 +99132,9 @@ impl Semantic {
   -> DeclarationCheckResult
     ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
     ? &mut Allocator | &mut Types {
+    if let Option<DeclarationCheckResult>.Some {value} = move run Semantic.closeCheckErasures(&mut self.*, &mut request.*, concrete) {
+      return move value
+    }
     let own = resolvedModule(&self.resolver, module)
     // The application's own modules are always left to their own checks, and so are the checked
     // modules of other packages. A walk that leaves every checked module to its own check needs
@@ -100180,6 +100189,104 @@ impl Semantic {
     return List<Shared<Rejection>>.asSlice(&self.buildWarnings)
   }
 
+  // Close exactly the instances reached by these roots. Declaration checks and artifact
+  // builds supply their own roots. Only the final, frozen member sets enter ordinary queries.
+  effect fn closeErasures(self: &mut Self, module: &ModuleId, runtimeSelected: bool, roots: &[BuildRoot], origin: Span,
+    closureNodes: usize, declarationCheck: bool) -> Option<BackendBuild> ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+    ? &mut Allocator | &mut Types {
+    self.resolver.erasures = ErasureIndex.make()
+    self.resolver.closedErasures = false
+    self.resolver.erasureDispatchers = List<DiscoveryDispatch>.make()
+    self.resolver.effectDispatchers = List<ErasedRecursion.Operation>.make()
+    let mut workers = self.walkWorkers
+    while true {
+      self.resolver.erasureRound = ErasureRound.make()
+      let mut sharing = unshared()
+      sharing.workers = workers
+      sharing.frontier = self.walkFrontier
+      let walked = run Effect.result(Semantic.buildFromTimed(&mut self.*, module, runtimeSelected, roots,
+        origin, closureNodes, false, &Option<FrameSelection>.none(), &mut sharing, true))
+      if self.walkCopy { WalkShared.abandon() }
+      let round = match move walked {
+        Result<BackendBuild, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} => move value
+        Result<BackendBuild, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} => { fail move error }
+      }
+      let failed = match &round {
+        BackendBuild.Unsupported {gaps: foundGaps} => List<Shared<BackendGap>>.length(&foundGaps) != usize.ZERO
+        _ => true
+      }
+      if failed { return Option<BackendBuild>.some(move round) }
+      let parts = List<Bytes>.asSlice(&sharing.parts)
+      let mut part = usize.ZERO
+      while !sharing.failed && part < parts.length {
+        if !run ErasureRound.receive(&mut self.resolver.erasureRound, Bytes.asSlice(&parts[part])) { sharing.failed = true }
+        part = part + usize.ONE
+      }
+      if sharing.failed { workers = usize.ZERO continue }
+      if run ErasureRound.close(&self.resolver.erasureRound, &mut self.resolver.erasures) {
+        let mut cycles = run uncoveredDispatchCycles(&mut self.resolver)
+        if List<Shared<Rejection>>.length(&cycles) > usize.ZERO {
+          let first = List<Shared<Rejection>>.remove(&mut cycles, usize.ZERO)
+          return Option<BackendBuild>.some(BackendBuild.Rejected {first: move first, further: move cycles, gaps: List<Shared<BackendGap>>.make()})
+        }
+        break
+      }
+    }
+    if declarationCheck {
+      let mut promises = run checkedErasedPromises(&mut self.resolver, module)
+      if List<Shared<Rejection>>.length(&promises) != usize.ZERO {
+        let first = List<Shared<Rejection>>.remove(&mut promises, usize.ZERO)
+        return Option<BackendBuild>.some(BackendBuild.Rejected {first: move first, further: move promises, gaps: List<Shared<BackendGap>>.make()})
+      }
+    }
+    self.resolver.erasureRound = ErasureRound.make()
+    self.resolver.erasureDispatchers = List<DiscoveryDispatch>.make()
+    self.resolver.effectDispatchers = List<ErasedRecursion.Operation>.make()
+    run ErasureIndex.freeze(&mut self.resolver.erasures)
+    self.resolver.closedErasures = true
+    run reconcileMembership(&mut self.resolver)
+    return Option<BackendBuild>.none()
+  }
+
+  // A declaration-only program has no executable entry. Its concrete declaration roots still
+  // reach conversions and witness calls. Close them before the escape walk reads dispatcher MIR
+  // or replays a previously checked module. Templates and unsupplied providers have no root MIR.
+  effect fn closeCheckErasures(self: &mut Self, request: &mut Request, declarations: &[DeclarationId]) -> Option<DeclarationCheckResult>
+    ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+    if declarations.length == usize.ZERO || (!self.resolver.writtenErasure && !SourceIndex.hasErasedType(&self.resolver.source)) { return Option<DeclarationCheckResult>.none() }
+    let mut roots = List<BuildRoot>.make()
+    let mut at = usize.ZERO
+    while at < declarations.length {
+      let declaration = &declarations[at]
+      let lowered = run Semantic.escapeRootMir(&mut self.*, &mut request.*, declaration)
+      if let Option<Shared<Result<Answer, NoRejection>>>.Some {value: answer} = move lowered {
+        if let Option<usize>.Some {..} = move Shared<Result<Answer, NoRejection>>.with<Option<usize>>(&answer, answerMirIndex) {
+          let identity = run Types.internDeclaration(DeclarationId.copy(declaration))
+          let span = run authoredRequestSpan(&mut self.resolver, declaration, Span.make(usize.ZERO, usize.ZERO))
+          run List<BuildRoot>.append(&mut roots, BuildRoot {key: run InstanceKey.named(&identity), span: span, retained: false})
+        }
+      }
+      at = at + usize.ONE
+    }
+    if List<BuildRoot>.length(&roots) == usize.ZERO { return Option<DeclarationCheckResult>.none() }
+    let closed = run Semantic.closeErasures(&mut self.*, DeclarationId.moduleId(&declarations[0]), false, List<BuildRoot>.asSlice(&roots),
+      Span.make(usize.ZERO, usize.ZERO), staticClosureNodes, true)
+    if let Option<BackendBuild>.Some {value} = move closed {
+      let mut refused = List<Shared<Rejection>>.make()
+      let missing = match move value {
+        BackendBuild.Rejected {first, further, gaps} => {
+          run List<Shared<Rejection>>.append(&mut refused, move first)
+          run mergeRejections(&mut refused, List<Shared<Rejection>>.asSlice(&further))
+          move gaps
+        }
+        BackendBuild.Unsupported {gaps} => move gaps
+        BackendBuild.Module {..} => { return CompilerBug.panic(b"erasure discovery emitted an artifact") }
+      }
+      return Option<DeclarationCheckResult>.some(DeclarationCheckResult {rejections: move refused, gaps: move missing, unchecked: List<UncheckedDeclaration>.make()})
+    }
+    return Option<DeclarationCheckResult>.none()
+  }
+
   // Checks OWN0016 using a MIR-only closure. No declaration added here becomes an emission root.
   // Open templates and provider-dependent declarations keep their Body obligations; they do not
   // acquire fabricated runtime instances merely because the module is loaded.
@@ -100191,6 +100298,9 @@ impl Semantic {
   ) -> DeclarationCheckResult
     ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
     ? &mut Allocator | &mut Types {
+    if let Option<DeclarationCheckResult>.Some {value} = move run Semantic.closeCheckErasures(&mut self.*, &mut request.*, declarations) {
+      return move value
+    }
     let mut capture = BuildCapture.walk()
     return run Semantic.capturedEscapes(&mut self.*, &mut request.*, declarations, boundary, &mut capture, usize.MAX)
   }
@@ -100594,6 +100704,9 @@ impl Semantic {
           let digest = run summaryDigest(&summary, function.observes, capture.patterns)
           run BuildCapture.references(&mut capture.*, entry, &instance, List<MirReference>.asSlice(&function.references), digest)
           run BuildCapture.walked(&mut capture.*, entry, &summary)
+          if self.resolver.closedErasures {
+            run recordErasedFacts(&mut List<CaptureEntry>.asMutSlice(&mut capture.entries)[entry].facts, function, &self.resolver.erasures)
+          }
         }
         run List<SuspensionSummary>.append(&mut summaries, move summary)
         let mut cleanup = copyCleanupRoot(&entered.cleanup)
@@ -102556,51 +102669,9 @@ impl Semantic {
       Option<ModuleId>.Some {..} => true
       Option<ModuleId>.None => false
     }
-    if SourceIndex.hasErasedType(&self.resolver.source) {
-      self.resolver.erasures = ErasureIndex.make()
-      self.resolver.closedErasures = false
-      self.resolver.erasureDispatchers = List<DiscoveryDispatch>.make()
-      self.resolver.effectDispatchers = List<ErasedRecursion.Operation>.make()
-      let mut workers = self.walkWorkers
-      while true {
-        self.resolver.erasureRound = ErasureRound.make()
-        let mut sharing = unshared()
-        sharing.workers = workers
-        sharing.frontier = self.walkFrontier
-        let walked = run Effect.result(Semantic.buildFromTimed(&mut self.*, &module, runtimeSelected, List<BuildRoot>.asSlice(&roots),
-          origin, closureNodes, false, &Option<FrameSelection>.none(), &mut sharing, true))
-        if self.walkCopy { WalkShared.abandon() }
-        let round = match move walked {
-          Result<BackendBuild, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} => move value
-          Result<BackendBuild, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} => { fail move error }
-        }
-        let failed = match &round {
-          BackendBuild.Unsupported {gaps: foundGaps} => List<Shared<BackendGap>>.length(&foundGaps) != usize.ZERO
-          _ => true
-        }
-        if failed { return move round }
-        let parts = List<Bytes>.asSlice(&sharing.parts)
-        let mut part = usize.ZERO
-        while !sharing.failed && part < parts.length {
-          if !run ErasureRound.receive(&mut self.resolver.erasureRound, Bytes.asSlice(&parts[part])) { sharing.failed = true }
-          part = part + usize.ONE
-        }
-        if sharing.failed { workers = usize.ZERO continue }
-        if run ErasureRound.close(&self.resolver.erasureRound, &mut self.resolver.erasures) {
-          let mut cycles = run uncoveredDispatchCycles(&mut self.resolver)
-          if List<Shared<Rejection>>.length(&cycles) > usize.ZERO {
-            let first = List<Shared<Rejection>>.remove(&mut cycles, usize.ZERO)
-            return BackendBuild.Rejected {first: move first, further: move cycles, gaps: List<Shared<BackendGap>>.make()}
-          }
-          break
-        }
-      }
-      self.resolver.erasureRound = ErasureRound.make()
-      self.resolver.erasureDispatchers = List<DiscoveryDispatch>.make()
-      self.resolver.effectDispatchers = List<ErasedRecursion.Operation>.make()
-      run ErasureIndex.freeze(&mut self.resolver.erasures)
-      self.resolver.closedErasures = true
-      run reconcileMembership(&mut self.resolver)
+    if self.resolver.writtenErasure || SourceIndex.hasErasedType(&self.resolver.source) {
+      if let Option<BackendBuild>.Some {value: refused} = move run Semantic.closeErasures(&mut self.*, &module, runtimeSelected,
+        List<BuildRoot>.asSlice(&roots), origin, closureNodes, false) { return move refused }
     } else if self.resolver.closedErasures {
       self.resolver.erasures = ErasureIndex.make()
       run reconcileMembership(&mut self.resolver)
@@ -103721,7 +103792,7 @@ impl Semantic {
         let declarationAccess274 = run internDeclaration(&mut self.resolver, declarationAccess274Request)
         let mut dispatcher = usize.MAX
         let mir = if discovering && operationDispatch(&instance) == OperationDispatch.Erased {
-          run discoveryDispatcher(&mut self.resolver, &mut self.query, declarationAccess274, &instance, &mut dispatcher)
+          run discoveryDispatcher(&mut self.resolver, &mut self.query, declarationAccess274, &instance, &entered.module, entered.span, &mut dispatcher)
         } else { run demandRaw(
           &mut self.resolver,
           &mut self.query,
@@ -106078,6 +106149,7 @@ impl Semantic {
       let mut fresh = run keyFacts(&instance)
       if run walkedElsewhere(boundary, &instance) { fresh.flags = u64.bitOr(fresh.flags, BuildRecord.FACT_ELSEWHERE) }
       run summaryFacts(&mut fresh, &summary, false)
+      if self.resolver.closedErasures { run recordErasedFacts(&mut fresh, &functions[lowered.mir], &self.resolver.erasures) }
       let references = List<MirReference>.asSlice(&functions[lowered.mir].references)
       let mut targets = List<ContentHash>.make()
       let mut edges = List<ContentHash>.make()
@@ -110775,6 +110847,51 @@ effect fn proofProviderRejection(rejected: Shared<Rejection>, key: &InstanceKey,
   run List<MessageArgument>.append(&mut diagnostic.arguments, MessageArgument {name: run Bytes.copy(b"value"), value: run DeclarationId.copySpelling(&id)})
   run List<MessageArgument>.append(&mut diagnostic.arguments, MessageArgument {name: run Bytes.copy(b"provider"), value: run sharedArgumentBytes(&rejected, usize.ZERO, false)})
   return run Shared<Rejection>.make(move diagnostic)
+}
+
+// Check an erased operation's NonParking promise over every reached provider specialization.
+// A module's escape walk may leave a plain body to its own module's check. The closed
+// discovery graph still holds that body's parking and calls, including proof-only witnesses.
+effect fn checkedErasedPromises(resolver: &mut Resolver, root: &ModuleId) -> List<Shared<Rejection>>
+  ! Cycle | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let reached = List<usize>.asSlice(&resolver.emittedMir)
+  let functions = List<MirFunction>.asSlice(&resolver.mirValues)
+  let mut promised = false
+  let mut at = usize.ZERO
+  while at < reached.length && !promised {
+    let owed = List<MirNonParkingRun>.asSlice(&functions[reached[at]].nonParking)
+    let mut obligation = usize.ZERO
+    while obligation < owed.length {
+      if let ParkOrigin.Conversion {..} = &owed[obligation].origin { promised = true break }
+      obligation = obligation + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  if !promised { return List<Shared<Rejection>>.make() }
+  let mut summaries = run List<SuspensionSummary>.makeWithCapacity(reached.length)
+  at = usize.ZERO
+  while at < List<usize>.length(&resolver.emittedMir) {
+    let body = List<usize>.get(&resolver.emittedMir, at)
+    let instance = InstanceKey.copy(&List<MirFunction>.asSlice(&resolver.mirValues)[body].key)
+    let owner = DeclarationId.copyShared(&InstanceKey.identity(&instance))
+    let anchor = run instanceAnchor(&mut resolver.*, &instance)
+    let module = DeclarationId.moduleId(&owner)
+    let definition = &List<MirFunction>.asSlice(&resolver.mirValues)[body]
+    let checked = List<MirNonParkingRun>.length(&definition.nonParking) != usize.ZERO && operationDispatch(&instance) == OperationDispatch.Erased
+    let mut caller = RelatedSite {module: ModuleId.copy(module), span: Span.make(usize.ZERO, usize.ZERO)}
+    if checked {
+      let calls = List<DiscoveryDispatch>.asSlice(&resolver.erasureDispatchers)
+      let mut call = usize.ZERO
+      while call < calls.length && !run InstanceKey.sameInstance(&calls[call].instance, &instance) { call = call + usize.ONE }
+      if call == calls.length { return CompilerBug.panic(b"a reached erased promise has no dispatcher call") }
+      caller = RelatedSite {module: ModuleId.copy(&calls[call].call.module), span: calls[call].call.span}
+    }
+    let mut summary = run SuspensionSummary.make(definition, &instance, module, &anchor, &caller.module, caller.span)
+    if !checked { summary.nonParking = List<ParkObligation>.make() }
+    run List<SuspensionSummary>.append(&mut summaries, move summary)
+    at = at + usize.ONE
+  }
+  return run nonParkingViolations(&mut resolver.*, List<SuspensionSummary>.asSlice(&summaries), root)
 }
 
 effect fn parkingRejection(resolver: &mut Resolver, owed: &ParkObligation, dispatcher: &InstanceKey) -> Shared<Rejection>
