@@ -69,7 +69,7 @@ static fn kind() -> KindOf<Self>
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> Self
+effect fn read(reader: &mut any SchemaReader) -> Self
     ! Issue | OutOfMemoryError
     ? &mut Allocator
 ```

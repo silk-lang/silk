@@ -978,7 +978,7 @@ Override it next to `read` for a type read from one kind of value, usually as
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> Self
+effect fn read(reader: &mut any SchemaReader) -> Self
     ! Issue | OutOfMemoryError
     ? &mut Allocator
 ```
@@ -1196,7 +1196,7 @@ impl Schemas
 ### Associated function `read`
 
 ```silk
-pub effect fn read<T: Schema, R: SchemaReader>(reader: &mut R) -> T
+pub effect fn read<T: Schema>(reader: &mut any SchemaReader) -> T
     ! Issue | OutOfMemoryError
     ? &mut Allocator
 ```
@@ -1213,7 +1213,7 @@ Reads a `T` with its `Schema` implementation and runs its `Schema.check`.
 ### Associated function `readVariant`
 
 ```silk
-pub effect fn readVariant<U: Schema, R: SchemaReader>(reader: &mut R, name: string) -> U
+pub effect fn readVariant<U: Schema>(reader: &mut any SchemaReader, name: string) -> U
     ! Issue | OutOfMemoryError
     ? &mut Allocator
 ```
@@ -1313,9 +1313,9 @@ through a codec with [`Schemas.readVia`](#Schemas.impl.readVia).
 ### Associated function `readVia`
 
 ```silk
-pub effect fn readVia<A, I: Schema, C: Codec<A, I>, R: SchemaReader>(
+pub effect fn readVia<A, I: Schema, C: Codec<A, I>>(
     codec: &C,
-    reader: &mut R,
+    reader: &mut any SchemaReader,
   ) -> A
     ! Issue | OutOfMemoryError
     ? &mut Allocator
@@ -1407,7 +1407,7 @@ Returns `ValueKind.Boolean`.
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> bool
+effect fn read(reader: &mut any SchemaReader) -> bool
     ! Issue | OutOfMemoryError
     ? &mut Allocator
 ```
@@ -1461,7 +1461,7 @@ Returns `ValueKind.Number`.
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> u64
+effect fn read(reader: &mut any SchemaReader) -> u64
     ! Issue | OutOfMemoryError
     ? &mut Allocator
 ```
@@ -1527,7 +1527,7 @@ Returns `ValueKind.Number`.
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> i64
+effect fn read(reader: &mut any SchemaReader) -> i64
     ! Issue | OutOfMemoryError
     ? &mut Allocator
 ```
@@ -1593,7 +1593,7 @@ Returns `ValueKind.Number`.
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> f64
+effect fn read(reader: &mut any SchemaReader) -> f64
     ! Issue | OutOfMemoryError
     ? &mut Allocator
 ```
@@ -1659,7 +1659,7 @@ Returns `ValueKind.Text`.
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> String
+effect fn read(reader: &mut any SchemaReader) -> String
     ! Issue | OutOfMemoryError
     ? &mut Allocator
 ```
@@ -1725,7 +1725,7 @@ Returns `ValueKind.Bytes`.
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> Bytes
+effect fn read(reader: &mut any SchemaReader) -> Bytes
     ! Issue | OutOfMemoryError
     ? &mut Allocator
 ```
@@ -1779,7 +1779,7 @@ Returns the contained schema's value kind and expected description.
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> Box<T>
+effect fn read(reader: &mut any SchemaReader) -> Box<T>
     ! Issue | OutOfMemoryError
     ? &mut Allocator
 ```
@@ -1845,7 +1845,7 @@ Returns the kind of `T`.
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> Option<T>
+effect fn read(reader: &mut any SchemaReader) -> Option<T>
     ! Issue | OutOfMemoryError
     ? &mut Allocator
 ```
@@ -1932,7 +1932,7 @@ Returns `ValueKind.List`.
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> List<T>
+effect fn read(reader: &mut any SchemaReader) -> List<T>
     ! Issue | OutOfMemoryError
     ? &mut Allocator
 ```
@@ -1999,7 +1999,7 @@ Returns `ValueKind.Number`.
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> u8
+effect fn read(reader: &mut any SchemaReader) -> u8
     ! Issue | OutOfMemoryError
     ? &mut Allocator
 ```
@@ -2065,7 +2065,7 @@ Returns `ValueKind.Number`.
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> u16
+effect fn read(reader: &mut any SchemaReader) -> u16
     ! Issue | OutOfMemoryError
     ? &mut Allocator
 ```
@@ -2131,7 +2131,7 @@ Returns `ValueKind.Number`.
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> u32
+effect fn read(reader: &mut any SchemaReader) -> u32
     ! Issue | OutOfMemoryError
     ? &mut Allocator
 ```
@@ -2197,7 +2197,7 @@ Returns `ValueKind.Number`.
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> usize
+effect fn read(reader: &mut any SchemaReader) -> usize
     ! Issue | OutOfMemoryError
     ? &mut Allocator
 ```
@@ -2263,7 +2263,7 @@ Returns `ValueKind.Number`.
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> i8
+effect fn read(reader: &mut any SchemaReader) -> i8
     ! Issue | OutOfMemoryError
     ? &mut Allocator
 ```
@@ -2329,7 +2329,7 @@ Returns `ValueKind.Number`.
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> i16
+effect fn read(reader: &mut any SchemaReader) -> i16
     ! Issue | OutOfMemoryError
     ? &mut Allocator
 ```
@@ -2395,7 +2395,7 @@ Returns `ValueKind.Number`.
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> i32
+effect fn read(reader: &mut any SchemaReader) -> i32
     ! Issue | OutOfMemoryError
     ? &mut Allocator
 ```
@@ -2549,7 +2549,7 @@ static fn kind() -> KindOf<Self>
 ### Operation `read`
 
 ```silk
-effect fn read<R: SchemaReader>(reader: &mut R) -> Self
+effect fn read(reader: &mut any SchemaReader) -> Self
     ! Issue | OutOfMemoryError
     ? &mut Allocator
 ```
