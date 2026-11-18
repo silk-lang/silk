@@ -671,7 +671,7 @@ const writeProgram = Effect.fnUntraced(function* (directory: string, program: Co
   for (const [module, contents] of Object.entries(program.imports)) {
     if (module.startsWith('/') || module.split('/').includes('..'))
       return yield* reject(`unsafe corpus import path: ${module}`)
-    const path = join(directory, `${module}.silk`)
+    const path = join(directory, dirname(programModule), `${module}.silk`)
     yield* fs.makeDirectory(dirname(path), { recursive: true })
     yield* fs.writeFileString(path, contents)
   }
