@@ -558,6 +558,9 @@ pub enum Family {
   /// it and records the root demands and source reads of its sweep against it, so a later check
   /// of an unaffected module is verified instead of swept again.
   ModuleCheck,
+  /// The value of one closed application of a static function that takes no value arguments,
+  /// such as a type's spec. Every static expression that calls it shares the one evaluation.
+  StaticResult,
   /// Whether dropping a value of one closed nominal type runs no cleanup (`cleanupFree`). The key
   /// names the type by its lifetime-erased intern, so every body that holds the type shares one
   /// walk of its fields instead of each walking them again.
@@ -617,6 +620,7 @@ fn familyName(family: Family) -> string<'static> {
     Family.EmissionInputs => "EmissionInputs"
     Family.LlvmText => "LlvmText"
     Family.ModuleCheck => "ModuleCheck"
+    Family.StaticResult => "StaticResult"
     Family.CleanupFree => "CleanupFree"
   }
 }
@@ -997,6 +1001,9 @@ pub union Value {
   /// A constant's initializer value at the type published by its `Constant` fact, and, for a
   /// store that selects editor tables, the literal ranges its evaluation linked to fields.
   Initializer {pub value: Interned<StaticData>, pub links: Option<Shared<List<LinkedName>>>},
+  /// The value a static function without value arguments returns for one closed application, and
+  /// the authored sites of the texts its evaluation kept, which reports about the value name.
+  StaticResult {pub value: Interned<StaticData>, pub origins: Shared<List<StaticExecution.CarriedOrigin>>},
   /// Whether a module-level `static if` condition holds.
   Condition {pub holds: bool},
   /// Whether a type has no runtime layout (STATIC-009).
@@ -2724,6 +2731,10 @@ struct Resolver {
   lambdas: List<ActiveLambda>,
   staticDemandDepth: usize,
   staticDemandLimit: usize,
+  // The static results being evaluated, outermost first, as module ordinal, declaration ordinal
+  // and selected application. A call that reaches one of them again runs in its caller's machine,
+  // which reports the cycle.
+  staticResultsInFlight: List<usize>,
   // The receiver call whose static arguments the body being checked found no selection for: its
   // Body query selects again with it (`resolveBody`).
   discoveredStaticCall: Option<StaticCallHint>,
@@ -5355,6 +5366,7 @@ fn sameValue(left: &Value, right: &Value) -> bool {
       _ => false
     }
     Value.Initializer {..} => false
+    Value.StaticResult {..} => false
     Value.Condition {holds} => match & right.* {
       Value.Condition {holds: other} => holds == other
       _ => false
@@ -8793,6 +8805,7 @@ effect fn resolveOtherFamily(
     Family.EmissionInputs => run resolveEmissionInputs(&mut resolver.*, &mut owner.*, key)
     Family.LlvmText => run resolveLlvmText(&mut resolver.*, key)
     Family.ModuleCheck => CompilerBug.panic(b"a module check runs in checkModule, never as a provider")
+    Family.StaticResult => run resolveStaticResult(&mut resolver.*, &mut owner.*, key)
     Family.CleanupFree => run resolveCleanupFree(&mut resolver.*, &mut owner.*, key)
   }
 }
@@ -9065,6 +9078,7 @@ fn valueTag(value: &Value) -> u64 {
     Value.StaticRouting {..} => 27
     Value.CleanupFree {..} => 28
     Value.InlineSummary {..} => 29
+    Value.StaticResult {..} => 30
     _ => 0
   }
 }
@@ -9177,6 +9191,18 @@ fn fingerprintValue(writer: &mut AnswerFingerprint.Writer, value: &Value) -> () 
     Value.ProfileInput {slot} => { AnswerFingerprint.count(&mut writer.*, slot) }
     Value.LayoutUnsupported => {}
     Value.Initializer {value: published, ..} => { StaticValue.fingerprint(&mut writer.*, &published) }
+    Value.StaticResult {value: published, origins} => {
+      StaticValue.fingerprint(&mut writer.*, &published)
+      Shared<List<StaticExecution.CarriedOrigin>>.with<()>(&origins, |held: &List<StaticExecution.CarriedOrigin>| -> () {
+        let listed = List<StaticExecution.CarriedOrigin>.asSlice(held)
+        let mut at = usize.ZERO
+        while at < listed.length {
+          AnswerFingerprint.count(&mut writer.*, listed[at].span.start)
+          AnswerFingerprint.count(&mut writer.*, listed[at].span.end)
+          at = at + usize.ONE
+        }
+      })
+    }
     Value.InlineSummary {inlinable, directive, size, suspends, callees, encodings} => {
       AnswerFingerprint.flag(&mut writer.*, inlinable)
       AnswerFingerprint.count(&mut writer.*, directive)
@@ -85822,6 +85848,101 @@ effect fn dependentStaticRouting(
   return Shared<Result<Answer, NoRejection>>.with<bool>(&answer, staticRoutingDependent)
 }
 
+fn sharedStaticResult(answer: &Result<Answer, NoRejection>) -> Option<StaticExecution.SharedResult> {
+  if let Result<Answer, NoRejection>.Success {value} = &answer.* {
+    if let Outcome.Success {value: Value.StaticResult {value: published, origins}} = &value.outcome {
+      return Option<StaticExecution.SharedResult>.some(StaticExecution.SharedResult {
+        value: StaticValue.copy(&published),
+        origins: Shared<List<StaticExecution.CarriedOrigin>>.clone(&origins),
+      })
+    }
+  }
+  return Option<StaticExecution.SharedResult>.none()
+}
+
+// Evaluates one closed static application without value arguments in a machine of its own, so
+// what the evaluation reads is recorded against this unit and every caller consumes the unit.
+effect fn resolveStaticResult(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, key: Key) -> Answer
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let module = resolvedModule(&resolver.*, key.module)
+  let mut dependencies = List<Dependency>.make()
+  let span = Span.make(usize.ZERO, usize.ZERO)
+  if key.member == usize.ZERO {
+    return run memberRejected(run reject(&resolver.*, &module, RejectionCode.InvalidConstant, span), move dependencies)
+  }
+  let application = run selectedApplicationAt(&resolver.*, key.member - usize.ONE)
+  let evaluated = run evaluateStaticResult(&mut resolver.*, &mut owner.*, &mut dependencies, &module, &application, span)
+  return match move evaluated {
+    Option<StaticExecution.SharedResult>.Some {value: shared} => {
+      let StaticExecution.SharedResult {value, origins} = move shared
+      memberSuccess(Value.StaticResult {value: move value, origins: move origins}, move dependencies)
+    }
+    Option<StaticExecution.SharedResult>.None => run memberRejected(
+      run reject(&resolver.*, &module, RejectionCode.InvalidConstant, span), move dependencies)
+  }
+}
+
+effect fn evaluateStaticResult(
+  resolver: &mut Resolver,
+  owner: &mut Query<Answer, NoRejection>,
+  dependencies: &mut List<Dependency>,
+  module: &ModuleId,
+  application: &Application,
+  span: Span,
+) -> Option<StaticExecution.SharedResult>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut machine = run StaticExecution.make(
+    inFlightStaticPort(&mut resolver.*, &mut owner.*, &mut dependencies.*),
+    module,
+    StaticExecution.defaultLimits(),
+  )
+  let mut bindings = List<StaticBinding>.make()
+  // A constant the evaluation reaches is resolved and supplied, then the evaluation runs again,
+  // as a static expression's own evaluation does.
+  while StaticExecution.steps(&machine) < StaticExecution.stepLimit(&machine) {
+    let outcome = run Effect.result(StaticExecution.evaluateShared(
+      &mut machine, application, List<StaticBinding>.asSlice(&bindings), span,
+    ))
+    match move outcome {
+      Result<Interned<StaticData>, StaticDiagnostic | OutOfMemoryError>.Success {value} => {
+        let origins = run StaticExecution.carriedOrigins(&machine)
+        // An origin is a span of its module's text, which an edit above it moves without changing
+        // any declaration this evaluation read, so the unit reads each such module's source.
+        let listed = List<StaticExecution.CarriedOrigin>.asSlice(&origins)
+        let mut at = usize.ZERO
+        while at < listed.length {
+          if !toolchainModule(&listed[at].module) {
+            let port = StaticExecution.port(&mut machine)
+            drop run source(&mut port.resolver.*, &listed[at].module)
+          }
+          at = at + usize.ONE
+        }
+        return Option<StaticExecution.SharedResult>.some(StaticExecution.SharedResult {
+          value: move value,
+          origins: run Shared<List<StaticExecution.CarriedOrigin>>.make(move origins),
+        })
+      }
+      Result<Interned<StaticData>, StaticDiagnostic | OutOfMemoryError>.Failure {error} => match move error {
+        OutOfMemoryError {} => { fail OutOfMemoryError {} }
+        StaticDiagnostic {needed, span: failedSpan, ..} => {
+          let reached = match move needed {
+            Option<StaticNeeded>.Some {value} => move value
+            Option<StaticNeeded>.None => { return Option<StaticExecution.SharedResult>.none() }
+          }
+          let supplied = run supplyNeededConstant(&mut machine, &mut bindings, move reached, failedSpan)
+          match move supplied {
+            Result<bool, Shared<Rejection>>.Success {value: bound} => {
+              if !bound { return Option<StaticExecution.SharedResult>.none() }
+            }
+            Result<bool, Shared<Rejection>>.Failure {..} => { return Option<StaticExecution.SharedResult>.none() }
+          }
+        }
+      }
+    }
+  }
+  return Option<StaticExecution.SharedResult>.none()
+}
+
 effect fn resolveStaticRouting(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, key: Key) -> Answer
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
   let mut dependencies = List<Dependency>.make()
@@ -95462,6 +95583,57 @@ impl<'source> StaticPort<'source> {
     return run Effect.useReleaseNonParking(move reservation, move use, move release)
   }
 
+  /// The shared value of a closed static application that takes no value arguments, evaluated
+  /// once per store as its own unit. None when the call must run in the caller's machine instead:
+  /// the function is being evaluated already, the evaluation failed, so the caller reports the
+  /// failure with its own trace, or a constant initializer is collecting editor links.
+  pub effect fn demandStaticResult(self: &mut Self, application: &Application, span: Span)
+  -> Option<StaticExecution.SharedResult>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+    if let Option<List<StaticExecution.EditorLink>>.Some {..} = &self.resolver.staticLinks {
+      return Option<StaticExecution.SharedResult>.none()
+    }
+    let declaration = Application.bodyDeclaration(application)
+    let module = DeclarationId.moduleId(declaration)
+    let identity = run Types.internDeclaration(DeclarationId.copy(declaration))
+    let ordinal = match move run ordinalOfIdentity(&mut self.resolver.*, module, &identity) {
+      Option<usize>.Some {value} => value
+      Option<usize>.None => { return Option<StaticExecution.SharedResult>.none() }
+    }
+    let mut selectedApplication = run Application.copy(application)
+    selectedApplication.statics = List<StaticSlot>.make()
+    let member = run internSelectedApplication(&mut self.resolver.*, &selectedApplication)
+    let moduleOrdinal = run internModule(&mut self.resolver.*, module)
+    let inFlight = List<usize>.asSlice(&self.resolver.staticResultsInFlight)
+    if inFlight.length >= 96 { return Option<StaticExecution.SharedResult>.none() }
+    let mut at = usize.ZERO
+    while at < inFlight.length {
+      if inFlight[at] == moduleOrdinal && inFlight[at + usize.ONE] == ordinal && inFlight[at + 2] == member {
+        return Option<StaticExecution.SharedResult>.none()
+      }
+      at = at + 3
+    }
+    let request = Key {
+      family: Family.StaticResult, module: moduleOrdinal, name: usize.ZERO, declaration: ordinal,
+      member: member + usize.ONE, external: false}
+    let key = run internDeclaration(&mut self.resolver, request)
+    run List<usize>.append(&mut self.resolver.staticResultsInFlight, moduleOrdinal)
+    run List<usize>.append(&mut self.resolver.staticResultsInFlight, ordinal)
+    run List<usize>.append(&mut self.resolver.staticResultsInFlight, member)
+    let demanded = run Effect.result(demandChild(&mut self.resolver.*, &mut self.query.*, &mut self.dependencies.*, key, span))
+    let mut popped = usize.ZERO
+    while popped < 3 {
+      let last = List<usize>.length(&self.resolver.staticResultsInFlight) - usize.ONE
+      drop List<usize>.remove(&mut self.resolver.staticResultsInFlight, last)
+      popped = popped + usize.ONE
+    }
+    let answer = match move demanded {
+      Result<Shared<Result<Answer, NoRejection>>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} => move value
+      Result<Shared<Result<Answer, NoRejection>>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} => { fail move error }
+    }
+    return Shared<Result<Answer, NoRejection>>.with<Option<StaticExecution.SharedResult>>(&answer, sharedStaticResult)
+  }
+
   effect fn demandStaticBodyUnchecked(self: &mut Self, application: &Application, arguments: &[Interned<StaticData>], span: Span)
   -> Option<Shared<Result<Answer, NoRejection>>>
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
@@ -96453,6 +96625,7 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
       erasures: ErasureIndex.make(), erasureRound: ErasureRound.make(), membershipInputs: List<usize>.make(), erasureDispatchers: List<DiscoveryDispatch>.make(), effectDispatchers: List<ErasedRecursion.Operation>.make(), writtenErasure: false, closedErasures: false,
       staticDemandDepth: usize.ZERO,
       staticDemandLimit: usize.MAX,
+      staticResultsInFlight: List<usize>.make(),
       discoveredStaticCall: Option<StaticCallHint>.none(),
       source: move source,
       revisable: revisable,
