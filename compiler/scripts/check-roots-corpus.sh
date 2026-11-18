@@ -1,5 +1,5 @@
 #!/bin/bash
-# Runs `silk check --roots` on every corpus program, each as a one-module package, and prints the
+# Runs `silk check --roots` on every corpus program, each as a package, and prints the
 # programs whose module check roots disagree with the whole-package check.
 # Usage: compiler/scripts/check-roots-corpus.sh <silk> <stdlib> [jobs]
 set -u
@@ -11,8 +11,10 @@ out=$(mktemp -d)
 one() {
   case=$1
   work=$(mktemp -d)
-  cp -r "$case"/. "$work"/
-  rm -f "$work/outcome.json"
+  cp "$case/main.silk" "$work/main.silk"
+  if [ -d "$case/imports" ]; then
+    cp -R "$case/imports/." "$work/"
+  fi
   printf '[package]\nname = "corpus-case"\nversion = "0.1.0"\nsource = "."\n' > "$work/silk.toml"
   name=$(echo "${case#"$corpus"/}" | tr / _)
   (cd "$work" && "$silk" check --roots --stdlib "$stdlib" > /dev/null 2> "$out/$name")
