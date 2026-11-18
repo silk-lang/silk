@@ -71,6 +71,11 @@ Two compiler-owned properties may refine one exact Effect or callable representa
 - `Intrinsic.NonParking` proves that the specialized transitive graph cannot reach external
   parking. Nested transfer remains allowed.
 
+A stored Effect can run with different providers. Each provider specialization that runs must
+satisfy a `NonParking` bound on that Effect, including when the compiler inlines it. If no run
+selects a provider and the proof reaches an operation that needs it, SEM0139 points to the bound
+and identifies the service call. Bind a provider before passing the Effect to that parameter.
+
 These properties are static, witness-free obligations rather than interfaces or services. A failed
 concrete application reports the property obligation at the application and retains its stable
 capture/provider or reachability path.
