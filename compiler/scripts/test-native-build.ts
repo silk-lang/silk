@@ -4176,7 +4176,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     yield* fs.makeDirectory(join(workspace, 'app'), { recursive: true })
     yield* fs.makeDirectory(join(workspace, 'libs/math'), { recursive: true })
     const root = (lengths: string) =>
-      `[workspace]\nmembers = ["app", "libs/*"]\n\n[workspace.dependencies]\nlengths = { ${lengths} }\nmath = { path = "libs/math" }\n`
+      `[workspace]\nmembers = ["app", "libs/*"]\nsilk-version = "0.1.0"\n\n[workspace.dependencies]\nlengths = { ${lengths} }\nmath = { path = "libs/math" }\n`
     yield* fs.writeFileString(join(workspace, 'silk.toml'), root(pin))
     yield* fs.writeFileString(
       join(workspace, 'libs/math/silk.toml'),
@@ -4227,7 +4227,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     yield* fs.writeFileString(join(workspace, 'silk.toml'), root(pin.replace(commit, 'main')))
     const unpinned = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(workspace, 'app'), refusing)
     assert.equal(unpinned.status, 2, 'a shared git dependency without a commit was accepted')
-    assert.match(unpinned.stderr, /Invalid Silk project manifest .*shared\/workspace\/silk\.toml:5: /)
+    assert.match(unpinned.stderr, /Invalid Silk project manifest .*shared\/workspace\/silk\.toml:6: /)
     yield* fs.writeFileString(join(workspace, 'silk.toml'), root(pin))
     // A package no workspace lists has nothing to take the entry from.
     yield* fs.makeDirectory(join(workspace, 'tool'), { recursive: true })
@@ -4421,7 +4421,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     yield* fs.makeDirectory(join(tool, 'src'), { recursive: true })
     yield* fs.makeDirectory(join(tool, 'completions'), { recursive: true })
     const manifest = (more: string) =>
-      `[package]\nname = "packed-tool"\nversion = "1.2.0"\n\n[pack.binary]\ninclude = ["completions", "notes.txt"]\n${more}`
+      `[package]\nname = "packed-tool"\nversion = "1.2.0"\nsilk-version = "0.1.0"\n\n[pack.binary]\ninclude = ["completions", "notes.txt"]\n${more}`
     yield* fs.writeFileString(join(tool, 'silk.toml'), manifest(''))
     yield* fs.writeFileString(join(tool, 'src/main.silk'), 'pub fn main() -> i32 {\n  return 0\n}\n')
     yield* fs.writeFileString(join(tool, 'completions/tool.bash'), 'complete -W "pack" packed-tool\n')
@@ -4494,7 +4494,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     // The table is an executable's.
     yield* fs.writeFileString(
       join(tool, 'silk.toml'),
-      '[package]\nname = "packed-tool"\nversion = "1.2.0"\nkind = "library"\nmain = "main.silk"\nexports = ["main"]\n\n[pack.binary]\n',
+      '[package]\nname = "packed-tool"\nversion = "1.2.0"\nsilk-version = "0.1.0"\nkind = "library"\nmain = "main.silk"\nexports = ["main"]\n\n[pack.binary]\n',
     )
     const library = yield* invoke(silk, ['pack', '--output', output, '--stdlib', standardLibrary], tool, environment, 120_000)
     assert.equal(library.status, 1, 'a library with [pack.binary] was packed')
@@ -4749,7 +4749,10 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   const managedRoot = yield* invoke(silk, ['init', '--workspace', 'managed'], directory)
   assert.equal(managedRoot.status, 0, managedRoot.stderr)
   // A new workspace has one starter executable member, so it builds and runs at once.
-  assert.equal(yield* fs.readFileString(join(managed, 'silk.toml')), '[workspace]\nmembers = ["app"]\n')
+  assert.equal(
+    yield* fs.readFileString(join(managed, 'silk.toml')),
+    '[workspace]\nmembers = ["app"]\nsilk-version = "0.0.0"\n',
+  )
   assert.equal(managedRoot.stdout, '  Created workspace managed with package app\n\n  Next steps:\n    cd managed\n    silk run   build and run it\n')
   assert.equal(yield* fs.exists(join(managed, 'app/src/main.silk')), true)
   assert.equal(yield* fs.exists(join(managed, 'app/.gitignore')), false)
@@ -4760,7 +4763,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   assert.equal(namedRoot.status, 0, namedRoot.stderr)
   assert.equal(
     yield* fs.readFileString(join(directory, 'named/silk.toml')),
-    '[workspace]\nmembers = ["store"]\n',
+    '[workspace]\nmembers = ["store"]\nsilk-version = "0.0.0"\n',
   )
   assert.match(yield* fs.readFileString(join(directory, 'named/store/silk.toml')), /^name = "store"$/m)
   // The rest of this test assembles its members by hand.
@@ -5923,7 +5926,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   yield* fs.makeDirectory(join(embedApp, 'src'), { recursive: true })
   yield* fs.writeFileString(
     join(embedLibrary, 'silk.toml'),
-    '[package]\nname = "embed-library"\nversion = "0.1.0"\nkind = "library"\nmain = "library.silk"\nexports = ["library"]\n',
+    '[package]\nname = "embed-library"\nversion = "0.1.0"\nsilk-version = "0.1.0"\nkind = "library"\nmain = "library.silk"\nexports = ["library"]\n',
   )
   yield* fs.writeFileString(join(embedLibrary, 'js/index.js'), 'export const hello = () => `hi ${1 + 1}`;\n')
   yield* fs.writeFileString(
@@ -6032,7 +6035,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   assert.doesNotMatch(unpacked.stderr, /fixtures/)
   yield* fs.writeFileString(
     join(embedLibrary, 'silk.toml'),
-    '[package]\nname = "embed-library"\nversion = "0.1.0"\nkind = "library"\nmain = "library.silk"\nexports = ["library"]\ninclude = ["js"]\n',
+    '[package]\nname = "embed-library"\nversion = "0.1.0"\nsilk-version = "0.1.0"\nkind = "library"\nmain = "library.silk"\nexports = ["library"]\ninclude = ["js"]\n',
   )
   const packedEmbed = yield* embedPack()
   assert.equal(packedEmbed.status, 0, packedEmbed.stdout + packedEmbed.stderr)
