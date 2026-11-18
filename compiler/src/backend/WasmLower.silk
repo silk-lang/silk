@@ -74,7 +74,7 @@ import backend.Mir {
   Terminator,
   TrapSite,
 }
-import backend.SsaFunction {Binary, Cast, Checked, Count, Extreme, Kind, Modify, Predicate, Reduction, SsaFunction, none, singleBits}
+import backend.SsaFunction {Binary, Cast, Checked, Count, Extreme, Kind, Modify, Predicate, Reduction, SsaFunction, masked, none, singleBits}
 import backend.SsaPipeline
 import backend.SsaPipeline {Level}
 import backend.SsaVerification
@@ -112,7 +112,9 @@ import silk.num.u32
 import silk.num.u64
 import silk.num.u8
 import silk.num.usize
+import silk.collections.hash {Hash}
 import silk.collections.list {List}
+import semantic.InternIndex {InternIndex}
 
 // An aggregate value is never a wasm value: its value is the address of its bytes, and a store
 // copies them. A unit value is `none()`.
@@ -142,6 +144,9 @@ struct Writer {
   observerLocal: usize,
   causeLocal: usize,
   siteLocal: usize,
+  /// The function's trap sites (`MirFunction.traps`) by their origins, since every statement asks
+  /// for its own and an inlining function lists thousands.
+  trapSites: InternIndex,
   /// The target's address width in bits.
   pointerBits: usize,
   /// Whether the memory is shared between threads.
@@ -205,18 +210,32 @@ effect fn writerFor(target: &Target, shared: bool) -> Writer ! OutOfMemoryError 
   let bits = u32.toUsize(Target.pointerBits(target))
   return Writer {fragment: Fragment.make(), function: run SsaFunction.make(b"", bits), counter: usize.ZERO, located: usize.ZERO,
     symbol: Bytes.make(), lines: List<u64>.make(), trap: Option<TrapReport>.none(), observerLocal: usize.MAX, causeLocal: usize.MAX,
-    siteLocal: usize.MAX, pointerBits: bits, shared: shared, slots: List<u64>.make(), companions: List<u64>.make(),
+    siteLocal: usize.MAX, trapSites: InternIndex.make(), pointerBits: bits, shared: shared, slots: List<u64>.make(), companions: List<u64>.make(),
     blocks: List<usize>.make(), alignments: List<usize>.make(), copies: List<CallerCopy>.make(), parameters: List<u64>.make(),
     extras: List<u64>.make(), providers: List<u64>.make(), out: none(), failure: none(), context: none(), observer: none(),
     cause: none(), site: none(), transfer: none(), frame: none(), steps: none(), level: Level.None, verify: false}
 }
 
-// Finds the hidden diagnostic locals of `function`, whose blocks are about to be emitted.
-fn noteDiagnosticLocals(writer: &mut Writer, function: &MirFunction) -> () {
+// Finds the hidden diagnostic locals of `function`, whose blocks are about to be emitted, and
+// indexes its trap sites.
+effect fn noteDiagnosticLocals(writer: &mut Writer, function: &MirFunction) -> () ! OutOfMemoryError ? &mut Allocator {
   writer.observerLocal = diagnosticLocal(function, usize.ZERO)
   writer.causeLocal = diagnosticLocal(function, usize.ONE)
   writer.siteLocal = diagnosticLocal(function, 2)
+  let sites = List<TrapSite>.asSlice(&function.traps)
+  let mut index = run InternIndex.withCapacity(sites.length)
+  let mut at = usize.ZERO
+  while at < sites.length {
+    run InternIndex.record(&mut index, siteHash(sites[at].origin))
+    at = at + usize.ONE
+  }
+  writer.trapSites = move index
   return ()
+}
+
+// The hash a trap site is found by: its origin's node and where its location starts.
+fn siteHash(origin: Origin) -> u64 {
+  return Hash.combine(usize.toU64(origin.node), usize.toU64(origin.location.start))
 }
 
 // Forgets the function just built, keeping the fragment and its counter.
@@ -276,7 +295,7 @@ effect fn endBody(writer: &mut Writer, exported: &[u8]) -> () ! Unsupported | Ou
   run writer.function.finish()
   if writer.verify { run SsaVerification.verify(&writer.function, b"lowering") }
   run SsaPipeline.prepare(&mut writer.*.function, writer.level, writer.verify)
-  let translated = run WasmEmission.emit(&writer.function, writer.shared)
+  let translated = run WasmEmission.emit(&writer.function, writer.shared, writer.level != Level.None)
   return run List<WasmFunction>.append(&mut writer.*.fragment.functions, WasmFunction {body: move translated, exported: run Bytes.copy(exported)})
 }
 
@@ -842,6 +861,75 @@ effect fn overflowPair(writer: &mut Writer, stem: &[u8], kind: Representation, l
   let mut operation = Binary.Add
   if same(stem, b"sub") { operation = Binary.Sub }
   if same(stem, b"mul") { operation = Binary.Mul }
+  // An optimized build writes an unsigned scalar sum or difference as the wrapping operation and
+  // the comparison that says it wrapped: the sum is below an operand, or the left is below the
+  // right. Value numbering then decides the comparison from a dominating one, as a bounds check
+  // before a subtraction is.
+  if writer.level != Level.None && !kind.signed && !kind.floating && kind.lanes == usize.ZERO && kind.bits <= 64 && operation != Binary.Mul {
+    let value = run SsaFunction.binary(&mut writer.*.function, operation, left, right)
+    let mut wrapped = none()
+    if operation == Binary.Add {
+      wrapped = run SsaFunction.compare(&mut writer.*.function, Predicate.Ult, value, left)
+    } else {
+      wrapped = run SsaFunction.compare(&mut writer.*.function, Predicate.Ult, left, right)
+    }
+    return Checked {value: value, overflow: wrapped}
+  }
+  // A signed scalar sum or difference with a constant operand overflows exactly when the other
+  // operand lies past one bound, so the check is one comparison with that bound.
+  if writer.level != Level.None && kind.signed && !kind.floating && kind.lanes == usize.ZERO && kind.bits >= 8 && kind.bits <= 64
+    && operation != Binary.Mul {
+    let constantRight = SsaFunction.isBits(&writer.function, right)
+    let constantLeft = SsaFunction.isBits(&writer.function, left)
+    if constantRight || (constantLeft && operation == Binary.Add) || (constantLeft && operation == Binary.Sub) {
+      let shift = usize.toU64(64 - kind.bits)
+      let greatest = u64.shiftRight(u64.MAX, shift + 1)
+      let least = u64.wrappingSubtract(0, greatest) - 1
+      let mut varying = left
+      let mut fixed = right
+      if !constantRight {
+        varying = right
+        fixed = left
+      }
+      // The constant, sign-extended to 64 bits.
+      let raw = SsaFunction.constantOf(&writer.function, fixed).low
+      let mut constant = u64.shiftLeft(raw, shift)
+      let negative = (constant & 9223372036854775808) != 0
+      constant = u64.shiftRight(constant, shift)
+      if negative && shift != 0 { constant = constant | u64.shiftLeft(u64.MAX, usize.toU64(kind.bits)) }
+      let mut predicate = Predicate.Sgt
+      let mut bound: u64 = 0
+      if operation == Binary.Add {
+        // `v + c` passes the greatest value when `v > greatest - c`, the least when `v < least - c`.
+        if negative {
+          predicate = Predicate.Slt
+          bound = u64.wrappingSubtract(least, constant)
+        } else {
+          bound = u64.wrappingSubtract(greatest, constant)
+        }
+      } else if constantRight {
+        // `v - c` passes the greatest value when `v > greatest + c`, the least when `v < least + c`.
+        if negative {
+          bound = u64.wrappingAdd(greatest, constant)
+        } else {
+          predicate = Predicate.Slt
+          bound = u64.wrappingAdd(least, constant)
+        }
+      } else if negative {
+        // `c - v` passes the least value when `v > c - least`.
+        bound = u64.wrappingSubtract(constant, least)
+      } else {
+        // `c - v` passes the greatest value when `v < c - greatest`.
+        predicate = Predicate.Slt
+        bound = u64.wrappingSubtract(constant, greatest)
+      }
+      let value = run SsaFunction.binary(&mut writer.*.function, operation, left, right)
+      let compared = SsaFunction.kindOf(&writer.function, varying)
+      let limit = run SsaFunction.constant(&mut writer.*.function, compared, bound)
+      let wrapped = run SsaFunction.compare(&mut writer.*.function, predicate, varying, limit)
+      return Checked {value: value, overflow: wrapped}
+    }
+  }
   return run SsaFunction.overflowing(&mut writer.*.function, operation, kind.signed, left, right)
 }
 
@@ -1305,8 +1393,8 @@ effect fn trapReport(writer: &Writer, function: &MirFunction, target: &Target, o
   let observer = writer.observerLocal
   if observer == usize.MAX { return Option<TrapReport>.none() }
   let sites = List<TrapSite>.asSlice(&function.traps)
-  let mut at = usize.ZERO
-  while at < sites.length {
+  let mut at = InternIndex.first(&writer.trapSites, siteHash(origin))
+  while at != usize.MAX {
     if sites[at].origin.node == origin.node && sites[at].origin.location.start == origin.location.start {
       // A trap of an inlined body names the locals holding what its call passed.
       let mut site = writer.siteLocal
@@ -1322,7 +1410,7 @@ effect fn trapReport(writer: &Writer, function: &MirFunction, target: &Target, o
       return Option<TrapReport>.some(TrapReport {observer: slotOf(writer, held), cause: slotOf(writer, cause),
         label: run Bytes.copy(Bytes.asSlice(&sites[at].label)), bits: wordSize(target) * 8, entry: entry})
     }
-    at = at + usize.ONE
+    at = InternIndex.after(&writer.trapSites, at)
   }
   return Option<TrapReport>.none()
 }
@@ -2000,6 +2088,7 @@ effect fn emitScalarBinary(writer: &mut Writer, function: &MirFunction, target: 
   if operation == ScalarBinary.WrappingSubtract { return Value {scalar: kind, value: run binaryOf(&mut writer.*, Binary.Sub, l, r)} }
   if operation == ScalarBinary.WrappingMultiply { return Value {scalar: kind, value: run binaryOf(&mut writer.*, Binary.Mul, l, r)} }
   if operation == ScalarBinary.MultiplyHigh {
+    if kind.bits == 64 { return Value {scalar: kind, value: run highProduct(&mut writer.*, kind, l, r)} }
     // The upper half of the product at twice the width.
     let wide = integerRepresentation(kind.bits * 2, kind.signed)
     let mut extend = Cast.ZExt
@@ -2032,6 +2121,39 @@ effect fn emitScalarBinary(writer: &mut Writer, function: &MirFunction, target: 
     bound = run selectOf(&mut writer.*, negative, minimum, maximum)
   }
   return Value {scalar: kind, value: run selectOf(&mut writer.*, overflow, bound, wrapped)}
+}
+
+// The upper 64 bits of the 128-bit product of two 64-bit integers, from the four products of their
+// 32-bit halves: with a = a1 2^32 + a0 and b = b1 2^32 + b0, the middle sums a1 b0 + (a0 b0 >> 32)
+// and a0 b1 plus the low half of that each fit 64 bits. A signed product is the unsigned one less
+// each operand whose partner is negative.
+effect fn highProduct(writer: &mut Writer, kind: Representation, left: u64, right: u64) -> u64 ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let mask = run intOf(&mut writer.*, kind, 4294967295)
+  let half = run intOf(&mut writer.*, kind, 32)
+  let leftLow = run binaryOf(&mut writer.*, Binary.And, left, mask)
+  let leftHigh = run binaryOf(&mut writer.*, Binary.LShr, left, half)
+  let rightLow = run binaryOf(&mut writer.*, Binary.And, right, mask)
+  let rightHigh = run binaryOf(&mut writer.*, Binary.LShr, right, half)
+  let lowest = run binaryOf(&mut writer.*, Binary.Mul, leftLow, rightLow)
+  let carried = run binaryOf(&mut writer.*, Binary.LShr, lowest, half)
+  let crossed = run binaryOf(&mut writer.*, Binary.Mul, leftHigh, rightLow)
+  let first = run binaryOf(&mut writer.*, Binary.Add, crossed, carried)
+  let firstLow = run binaryOf(&mut writer.*, Binary.And, first, mask)
+  let other = run binaryOf(&mut writer.*, Binary.Mul, leftLow, rightHigh)
+  let second = run binaryOf(&mut writer.*, Binary.Add, other, firstLow)
+  let top = run binaryOf(&mut writer.*, Binary.Mul, leftHigh, rightHigh)
+  let firstHigh = run binaryOf(&mut writer.*, Binary.LShr, first, half)
+  let secondHigh = run binaryOf(&mut writer.*, Binary.LShr, second, half)
+  let partial = run binaryOf(&mut writer.*, Binary.Add, top, firstHigh)
+  let unsigned = run binaryOf(&mut writer.*, Binary.Add, partial, secondHigh)
+  if !kind.signed { return unsigned }
+  let sign = run intOf(&mut writer.*, kind, 63)
+  let leftSign = run binaryOf(&mut writer.*, Binary.AShr, left, sign)
+  let rightSign = run binaryOf(&mut writer.*, Binary.AShr, right, sign)
+  let leftTerm = run binaryOf(&mut writer.*, Binary.And, leftSign, right)
+  let rightTerm = run binaryOf(&mut writer.*, Binary.And, rightSign, left)
+  let less = run binaryOf(&mut writer.*, Binary.Sub, unsigned, leftTerm)
+  return run binaryOf(&mut writer.*, Binary.Sub, less, rightTerm)
 }
 
 // Address transport admits the exact semantic word or data-pointer category, not a storage alias.
@@ -3837,7 +3959,9 @@ effect fn emitBlock(
       Option<Suspended>.None => run trapHere(&mut writer.*)
     }
     Terminator.Unreachable {..} => run trapHere(&mut writer.*)
-    // A switch tests its cases in order, as an unoptimized LLVM build does.
+    // An unoptimized build's switch tests its cases in order, as an unoptimized LLVM build's
+    // does; an optimized one with enough cases is a switch, which the body emits as a table when
+    // its cases are dense (`tableSwitch`).
     Terminator.Switch {value, cases, otherwise, origin: _} => {
       let tested = run emitOperand(&mut writer.*, function, target, layouts, &value)
       return run compareChain(&mut writer.*, &tested, List<SwitchCase>.asSlice(&cases), otherwise, index)
@@ -3852,29 +3976,39 @@ effect fn compareChain(writer: &mut Writer, tested: &Value, cases: &[SwitchCase]
 ! Unsupported | OutOfMemoryError ? &mut Allocator {
   let fallback = blockAt(&writer.*, otherwise)
   if cases.length == usize.ZERO { return run branch(&mut writer.*, fallback) }
-  // A flag is compared as a byte, as an unoptimized LLVM build compares it.
-  let mut compared = tested.*
+  let compared = tested.*
   let flag = compared.scalar.bits == usize.ONE && compared.scalar.lanes == usize.ZERO
-  if flag {
-    let mut byte = compared.scalar
-    byte.bits = 8
-    compared = run castOf(&mut writer.*, Cast.ZExt, tested, byte)
-  }
   let mut next = usize.MAX
   let mut at = usize.ZERO
+  if writer.level != Level.None && !flag && cases.length >= 4 && compared.scalar.lanes == usize.ZERO && compared.scalar.bits <= 32 {
+    let mut pairs = run List<u64>.makeWithCapacity(cases.length * 2)
+    while at < cases.length {
+      run List<u64>.append(&mut pairs, masked(decimalBits(Bytes.asSlice(&cases[at].decimal), cases[at].negative), compared.scalar.bits))
+      run List<u64>.append(&mut pairs, usize.toU64(blockAt(&writer.*, cases[at].target)))
+      at = at + usize.ONE
+    }
+    return run SsaFunction.switch(&mut writer.*.function, compared.value, List<u64>.asSlice(&pairs), fallback)
+  }
   while at < cases.length {
     if at > usize.ZERO { run startBlock(&mut writer.*, next) }
-    // An `i1` case of -1 or 1 is the set flag.
-    let mut bits = decimalBits(Bytes.asSlice(&cases[at].decimal), cases[at].negative)
-    if flag && !same(Bytes.asSlice(&cases[at].decimal), b"0") { bits = 1 }
-    let equal = run compareWith(&mut writer.*, Predicate.Eq, compared.scalar, compared.value, bits)
+    let bits = decimalBits(Bytes.asSlice(&cases[at].decimal), cases[at].negative)
     let mut otherwiseBlock = fallback
     if at + usize.ONE < cases.length {
       next = run labelled(&mut writer.*, b"case")
       otherwiseBlock = next
     }
     let matched = blockAt(&writer.*, cases[at].target)
-    run branchIf(&mut writer.*, equal, matched, otherwiseBlock)
+    if flag {
+      // A flag is its own condition: a case of 0 is the clear flag, any other the set one.
+      if same(Bytes.asSlice(&cases[at].decimal), b"0") {
+        run branchIf(&mut writer.*, compared.value, otherwiseBlock, matched)
+      } else {
+        run branchIf(&mut writer.*, compared.value, matched, otherwiseBlock)
+      }
+    } else {
+      let equal = run compareWith(&mut writer.*, Predicate.Eq, compared.scalar, compared.value, bits)
+      run branchIf(&mut writer.*, equal, matched, otherwiseBlock)
+    }
     at = at + usize.ONE
   }
   return ()
@@ -4235,7 +4369,7 @@ effect fn emitChecked(
   let ordinary = Option<Suspended>.none()
   let blocks = List<Block>.asSlice(&function.blocks)
   run addBlocks(&mut writer, blocks.length)
-  noteDiagnosticLocals(&mut writer, function)
+  run noteDiagnosticLocals(&mut writer, function)
   let mut at = usize.ZERO
   while at < blocks.length {
     let handle = blockAt(&writer, at)
@@ -4996,7 +5130,7 @@ effect fn emitStep(writer: &mut Writer, function: &MirFunction, target: &Target,
     }
     point = point + usize.ONE
   }
-  noteDiagnosticLocals(&mut writer.*, function)
+  run noteDiagnosticLocals(&mut writer.*, function)
   let mut at = usize.ZERO
   while at < blocks.length {
     let handle = blockAt(&writer.*, at)

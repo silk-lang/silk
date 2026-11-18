@@ -205,6 +205,10 @@ pub effect fn copy(function: &MirFunction) -> MirFunction ! OutOfMemoryError ? &
   let inline = List<InstanceKey>.asSlice(&function.inlined)
   at = 0
   while at < inline.length { run List<InstanceKey>.append(&mut inlined, InstanceKey.copy(&inline[at])) at = at + 1 }
+  let mut quiet = List<InstanceKey>.make()
+  let settled = List<InstanceKey>.asSlice(&function.quiet)
+  at = 0
+  while at < settled.length { run List<InstanceKey>.append(&mut quiet, InstanceKey.copy(&settled[at])) at = at + 1 }
   let suspension = match &function.suspension { Option<Origin>.Some {value} => Option<Origin>.some(value) Option<Origin>.None => Option<Origin>.none() }
   let parks = match &function.parks { Option<Origin>.Some {value} => Option<Origin>.some(value) Option<Origin>.None => Option<Origin>.none() }
   return MirFunction {key: InstanceKey.copy(&function.key), borrow: function.borrow, result: Interned<Type>.clone(&function.result),
@@ -213,18 +217,43 @@ pub effect fn copy(function: &MirFunction) -> MirFunction ! OutOfMemoryError ? &
     releasesPackages: function.releasesPackages, nonParking: move nonParking, cancels: move cancels, accesses: move accesses,
     escapes: move escapes, erasures: move erasures, features: run Bytes.copy(Bytes.asSlice(&function.features)), inlining: function.inlining,
     optimizeSize: function.optimizeSize, variadic: function.variadic, frame: run Bytes.copy(Bytes.asSlice(&function.frame)), lines: move lines,
-    variables: move variables, inlined: move inlined}
+    variables: move variables, inlined: move inlined, quiet: move quiet}
 }
 
-/// The largest body, in statements and blocks, that a call inlines without a directive. Numeric
-/// wrappers, accessors and forwarding functions fit; anything with a loop of its own rarely does.
-pub const smallBody: usize = 16
+/// The largest body of its own, in statements and blocks, a function without a directive may have
+/// and still be inlined. Whether it is, at one call, depends on its expanded size
+/// (`plainExpanded`).
+pub const largestBody: usize = 96
+
+/// The largest expanded size, a body's own size and those of the bodies its calls would inline
+/// in turn, that a call inlines for a function without a directive. A caller has no budget of its
+/// own: each call is judged by what it would bring, as LLVM's inliner judges a call by the cost
+/// of the callee after its own inlining.
+pub const plainExpanded: usize = 96
+
+/// The same for a call on a cycle of its caller's blocks in a build for speed, where the call
+/// runs many times for each time its code is paid for.
+pub const loopExpanded: usize = 192
+
+/// The same for a function without a directive in a build for size.
+pub const compactExpanded: usize = 24
+
+/// The largest expanded size an `@inline` function may have and still be inlined.
+pub const hintedExpanded: usize = 256
+
+/// Where the sum of an expanded size stops: any size above it is too large for every call but
+/// one of an `@inlineAlways` function, which no size keeps out.
+pub const expansionCap: usize = 1024
 
 /// The largest body an `@inline` function may have and still be inlined.
-pub const hintedBody: usize = 40
+pub const hintedBody: usize = 128
 
 /// The largest body an `@inlineAlways` function may have and still be inlined.
 pub const alwaysBody: usize = 256
+
+/// The largest body that is no larger than the call it replaces, with the call's operands and
+/// result: an accessor, a wrapping operation, a conversion. Inlining one never grows the caller.
+pub const callSized: usize = 4
 
 /// The size of a body for inlining: its statements and its blocks.
 pub fn size(function: &MirFunction) -> usize {
@@ -245,13 +274,13 @@ pub fn eligible(function: &MirFunction, direct: bool) -> bool {
 }
 
 /// Whether an optimized direct-backend build may inline a call of `function` that is not a
-/// suspension point: its directive allows it, its body is small enough for the directive, it
+/// suspension point: its directive allows it, its own body is small enough for the directive, it
 /// suspends and parks nowhere, and it owes no `Intrinsic.NonParking` proof of its own. Reads `function` alone, so the
 /// decision never depends on the callers. The caller must also exclude recursive expansions and
-/// check that every call the body makes is inlined too (`closed`).
+/// check that nothing the body's calls reach suspends.
 pub fn inlinable(function: &MirFunction) -> bool {
   let limit = match function.inlining {
-    Inlining.Default => smallBody
+    Inlining.Default => largestBody
     Inlining.Hint => hintedBody
     Inlining.Always => alwaysBody
     Inlining.Never => usize.ZERO
@@ -262,6 +291,110 @@ pub fn inlinable(function: &MirFunction) -> bool {
   }
   // A non-parking proof names the instance it is owed for, which must stay reached.
   return List<NonParkingRun>.length(&function.nonParking) == usize.ZERO
+}
+
+/// The directive of an inlinable `function` as a number: 0 for none, 1 for `@inline` and what
+/// counts as it, 2 for `@inlineAlways` and what counts as it.
+pub fn directive(function: &MirFunction) -> usize {
+  return match function.inlining {
+    Inlining.Hint => usize.ONE
+    Inlining.Always => 2
+    _ => usize.ZERO
+  }
+}
+
+/// The largest expanded size a call may bring in for a callee of `directive`: any for
+/// `@inlineAlways`; for none, by whether the build is for size (`compact`) and whether the call
+/// lies on a cycle of its caller's blocks (`inLoop`).
+pub fn expandedLimit(directive: usize, inLoop: bool, compact: bool) -> usize {
+  if directive == 2 { return usize.MAX }
+  if directive == usize.ONE { return hintedExpanded }
+  if compact { return compactExpanded }
+  if inLoop { return loopExpanded }
+  return plainExpanded
+}
+
+/// For each block of `function`, whether control can come back to it: it lies on a cycle of the
+/// blocks' successors.
+pub effect fn loopBlocks(function: &MirFunction) -> List<bool> ! OutOfMemoryError ? &mut Allocator {
+  let blocks = List<Block>.asSlice(&function.blocks)
+  let count = blocks.length
+  let mut cyclic = run List<bool>.makeWithCapacity(count)
+  run List<bool>.appendRepeated(&mut cyclic, false, count)
+  // Tarjan's strongly connected components, with the walk's stack kept by hand: a block is on a
+  // cycle when its component has another block, or it is its own successor.
+  let mut number = run List<usize>.makeWithCapacity(count)
+  run List<usize>.appendRepeated(&mut number, usize.MAX, count)
+  let mut low = run List<usize>.makeWithCapacity(count)
+  run List<usize>.appendRepeated(&mut low, usize.MAX, count)
+  let mut waiting = run List<bool>.makeWithCapacity(count)
+  run List<bool>.appendRepeated(&mut waiting, false, count)
+  let mut component = List<usize>.make()
+  let mut walk = List<usize>.make()
+  let mut edge = List<usize>.make()
+  let mut next = usize.ZERO
+  let mut root = usize.ZERO
+  while root < count {
+    if List<usize>.get(&number, root) == usize.MAX {
+      run List<usize>.append(&mut walk, root)
+      run List<usize>.append(&mut edge, usize.ZERO)
+      List<usize>.set(&mut number, root, next)
+      List<usize>.set(&mut low, root, next)
+      next = next + usize.ONE
+      run List<usize>.append(&mut component, root)
+      List<bool>.set(&mut waiting, root, true)
+      while List<usize>.length(&walk) != usize.ZERO {
+        let top = List<usize>.length(&walk) - usize.ONE
+        let at = List<usize>.get(&walk, top)
+        let taken = List<usize>.get(&edge, top)
+        if taken < MirWalk.successorCount(&blocks[at].terminator) {
+          List<usize>.set(&mut edge, top, taken + usize.ONE)
+          let target = MirWalk.successor(&blocks[at].terminator, taken)
+          if target >= count { continue }
+          if target == at { List<bool>.set(&mut cyclic, at, true) }
+          if List<usize>.get(&number, target) == usize.MAX {
+            run List<usize>.append(&mut walk, target)
+            run List<usize>.append(&mut edge, usize.ZERO)
+            List<usize>.set(&mut number, target, next)
+            List<usize>.set(&mut low, target, next)
+            next = next + usize.ONE
+            run List<usize>.append(&mut component, target)
+            List<bool>.set(&mut waiting, target, true)
+          } else if List<bool>.get(&waiting, target) && List<usize>.get(&number, target) < List<usize>.get(&low, at) {
+            let seen = List<usize>.get(&number, target)
+            List<usize>.set(&mut low, at, seen)
+          }
+          continue
+        }
+        // Every successor is done: the block closes its component when it is the first of it.
+        drop List<usize>.pop(&mut walk)
+        drop List<usize>.pop(&mut edge)
+        if top > usize.ZERO {
+          let parent = List<usize>.get(&walk, top - usize.ONE)
+          if List<usize>.get(&low, at) < List<usize>.get(&low, parent) {
+            let reached = List<usize>.get(&low, at)
+            List<usize>.set(&mut low, parent, reached)
+          }
+        }
+        if List<usize>.get(&low, at) == List<usize>.get(&number, at) {
+          let mut members = usize.ZERO
+          let mut from = List<usize>.length(&component)
+          while from > usize.ZERO && List<usize>.get(&component, from - usize.ONE) != at { from = from - usize.ONE }
+          from = from - usize.ONE
+          members = List<usize>.length(&component) - from
+          while List<usize>.length(&component) > from {
+            let last = List<usize>.length(&component) - usize.ONE
+            let member = List<usize>.get(&component, last)
+            List<usize>.truncate(&mut component, last)
+            List<bool>.set(&mut waiting, member, false)
+            if members > usize.ONE { List<bool>.set(&mut cyclic, member, true) }
+          }
+        }
+      }
+    }
+    root = root + usize.ONE
+  }
+  return move cyclic
 }
 
 /// Whether a small synchronous constructor or value-forwarding body can be spliced before frame
@@ -436,8 +569,10 @@ fn originNode(origin: Origin, highest: usize) -> usize {
   return highest
 }
 
-// One more than the highest origin node `function` uses.
-fn freshNode(function: &MirFunction) -> usize {
+/// One more than the highest origin node `function` uses: the first node a splice into it may
+/// give its origins. [`call`] takes it and moves it past the nodes it used, so a function that
+/// takes many splices is walked for it once.
+pub fn freshNode(function: &MirFunction) -> usize {
   let mut highest = usize.ZERO
   let blocks = List<Block>.asSlice(&function.blocks)
   let mut block = usize.ZERO
@@ -536,7 +671,37 @@ fn mapped(splice: &Splice, local: usize, own: usize) -> usize {
 }
 
 // Copies the callee's report tables and obligations to the caller, at the splice's origins.
-effect fn mergeTables(caller: &mut MirFunction, callee: &MirFunction, splice: &Splice) -> () ! OutOfMemoryError ? &mut Allocator {
+fn plainEdge(edge: &Edge) -> bool {
+  return match &edge.* {
+    Edge.Direct => true
+    _ => false
+  }
+}
+
+fn witnessEdge(edge: &Edge) -> bool {
+  return match &edge.* {
+    Edge.Witness => true
+    _ => false
+  }
+}
+
+// Whether each reference of `callee` can stand in a caller that reached `callee` along `via`. The
+// spliced body is no longer an application on the path from the caller to what it references, so
+// the one edge left must carry what the two did (`Specialization.Admission.enter` admits a
+// recursive specialization by the witness edges on its path): one of them is direct, or both are
+// plain witnesses. Otherwise the call stays.
+fn joinsEdges(via: &Edge, callee: &MirFunction) -> bool {
+  if plainEdge(via) { return true }
+  let references = List<Reference>.asSlice(&callee.references)
+  let mut at = usize.ZERO
+  while at < references.length {
+    if !plainEdge(&references[at].edge) && !(witnessEdge(via) && witnessEdge(&references[at].edge)) { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+effect fn mergeTables(caller: &mut MirFunction, callee: &MirFunction, splice: &Splice, via: &Edge) -> () ! OutOfMemoryError ? &mut Allocator {
   let observer = hiddenLocal(callee, splice, true, false)
   let cause = hiddenLocal(callee, splice, false, true)
   let site = hiddenLocal(callee, splice, false, false)
@@ -603,11 +768,14 @@ effect fn mergeTables(caller: &mut MirFunction, callee: &MirFunction, splice: &S
   let references = List<Reference>.asSlice(&callee.references)
   at = usize.ZERO
   while at < references.length {
+    // A direct reference of the body was reached along the call's edge (`joinsEdges`).
+    let mut edge = Edge.copy(&references[at].edge)
+    if plainEdge(&references[at].edge) { edge = Edge.copy(via) }
     run List<Reference>.append(
       &mut caller.references,
       Reference {
         key: InstanceKey.copy(&references[at].key),
-        edge: Edge.copy(&references[at].edge),
+        edge: move edge,
         origin: splice.origin,
       },
     )
@@ -678,17 +846,25 @@ fn sameFeatures(left: &Bytes, right: &Bytes) -> bool {
   return true
 }
 
-/// Replaces the direct call ending block `point` with `callee`'s checked body.
+/// Replaces the direct call ending block `point` with `callee`'s checked body. `nodes` is the
+/// caller's first unused origin node ([`freshNode`]); a splice moves it past the nodes it gives
+/// the body's origins.
 ///
 /// At a suspension point the callee's cancellation exits chain into the point's own. A splice at
 /// a suspension point, or any splice in a build for LLVM (`direct` false), is refused once the
 /// caller would exceed 256 blocks. Returns false, changing nothing,
 /// when the call's destinations are not whole locals, when the callee compiles for other target
-/// features than the caller, or when a suspension point's splice is refused.
-pub effect fn call(caller: &mut MirFunction, point: usize, callee: &MirFunction, direct: bool) -> bool
+/// features than the caller, when a suspension point's splice is refused, or when `via`, the
+/// edge of the caller's references to the callee, cannot stand for the body's own references:
+/// each of them takes `via` when it is direct, and keeps its own edge when `via` is direct or
+/// both are plain witnesses.
+pub effect fn call(caller: &mut MirFunction, point: usize, callee: &MirFunction, direct: bool, nodes: &mut usize, via: &Edge) -> bool
   ! OutOfMemoryError
   ? &mut Allocator {
   if !sameFeatures(&caller.features, &callee.features) {
+    return false
+  }
+  if !joinsEdges(via, callee) {
     return false
   }
   let mut cancel = usize.MAX
@@ -824,9 +1000,11 @@ pub effect fn call(caller: &mut MirFunction, point: usize, callee: &MirFunction,
     failure: failure,
     cancel: cancel,
     origin: origin,
-    base: freshNode(&caller.*),
+    base: nodes.*,
     sites: move sites,
   }
+  // The splice's origins take one node for each site and one for every other statement.
+  nodes.* = splice.base + List<Origin>.length(&splice.sites) + usize.ONE
 
   // Preserve the flags' association with the moved owner and its projected cleanup component.
   at = usize.ZERO
@@ -886,6 +1064,6 @@ pub effect fn call(caller: &mut MirFunction, point: usize, callee: &MirFunction,
     )
     at = at + 1
   }
-  run mergeTables(&mut caller.*, callee, &splice)
+  run mergeTables(&mut caller.*, callee, &splice, via)
   return true
 }
