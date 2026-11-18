@@ -2707,6 +2707,21 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
       assert.match(tests.stdout, /1 cached, 2 executed/)
     }
   }
+  // Replay the same edits through a long-lived checker and a new store at each step. Both a
+  // missing witness and an operation with a by-value receiver disappear again after repair.
+  const dispatchEdits = [
+    ['body', 'let member = Second {}', 'let member: i32 = 2'],
+    ['body', 'let member: i32 = 2', 'let member = Second {}'],
+    ['header-new-type', 'interface Read { fn read(self: &Self)', 'interface Read { fn read(self: Self)'],
+    ['header-new-type', 'interface Read { fn read(self: Self)', 'interface Read { fn read(self: &Self)'],
+  ].map(([kind, before, after]) =>
+    `[[edit]]\nkind = "${kind}"\nmodule = "members.silk"\nfind = "${before}"\nreplace = "${after}"\n`)
+  yield* fs.writeFileString(join(dispatchTests, 'edits.toml'), dispatchEdits.join('\n'))
+  const checkedMembership = yield* invoke(silk, ['check', '--stdlib', standardLibrary, '--replay', 'edits.toml', '--differential'], dispatchTests)
+  assert.equal(checkedMembership.status, 0, checkedMembership.stderr)
+  const verdicts = [...(checkedMembership.stdout + checkedMembership.stderr).matchAll(/silk-replay-differential step=\d+ rejections=(\d+) differences=(\d+)/g)]
+  assert.deepEqual(verdicts.map(([, rejected, differences]) => [Number(rejected), Number(differences)]),
+    [[0, 0], [1, 0], [0, 0], [1, 0], [0, 0]])
   // A selection that matches no test verified nothing, so it fails, and running it again fails the
   // same way.
   for (let attempt = 0; attempt < 2; attempt++) {
