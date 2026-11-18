@@ -1,0 +1,550 @@
+//! Jump threading of one SSA function: an edge into a block that only tests one of its
+//! parameters against a constant, and that passes a constant for it, goes straight to where the
+//! test would send it.
+//!
+//! # When to use
+//! Run [`thread`] among the scalar passes of an optimized build. A function that returns a
+//! `Result` or an `Option` builds it on several paths that meet in one block, and the caller's
+//! `match` then tests its tag; once the callee is spliced in, each of those paths knows the tag it
+//! passes. Threading sends a path that built a success straight to the success arm, as LLVM's jump
+//! threading does, so the tag is neither passed nor tested.
+//!
+//! # Details
+//! A threaded block ends in a branch and holds at most [`chain`] instructions, each a cast, a
+//! comparison or a wrapping integer operation of one of its parameters, of constants and of the
+//! instructions before it; its condition is that parameter or one of them. It is not the entry
+//! and not a loop's header: a second way into a loop past its header would leave the loop with
+//! two entries.
+//!
+//! Each edge into it that passes a constant for the tested parameter is pointed at a new block
+//! that jumps where that constant sends the branch, with the arguments the branch would have
+//! passed. The values the threaded block defines, its parameters and its instructions' results,
+//! no longer reach every block that reads them along one path, so each one read outside the block
+//! moves into a variable slot: the block stores it, each new block stores what its edge passed
+//! or what the instruction makes of that constant, and each read loads it. `SsaPromotion.promote` then turns the slots back into values,
+//! with block parameters exactly where two of those stores meet.
+//!
+//! Nothing runs that did not run before, and no instruction is copied: a threaded path skips the
+//! block's instructions and its branch.
+
+import backend.SsaFolding
+import backend.SsaFunction {
+  Binary,
+  Cast,
+  Definition,
+  Edge,
+  Exit,
+  Kind,
+  Operation,
+  Predicate,
+  SsaFunction,
+  masked,
+  none,
+}
+import backend.SsaGraph {SsaGraph}
+import backend.SsaPromotion
+import silk.collections.list {List}
+import silk.core.ownership {Copy}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.u64
+import silk.num.usize
+
+/// The most instructions a block may hold for edges to be threaded through it.
+pub fn chain() -> usize { return 4 }
+
+// The position of `value` among the parameters of `block`, or `usize.MAX`.
+fn parameterAt(function: &SsaFunction, block: usize, value: u64) -> usize {
+  let parameters = List<u64>.asSlice(&function.block(block).parameters)
+  let mut at = usize.ZERO
+  while at < parameters.length {
+    if parameters[at] == value { return at }
+    at = at + usize.ONE
+  }
+  return usize.MAX
+}
+
+// The position of `instruction` among the first `before` instructions of `block`, or `usize.MAX`.
+fn instructionAt(function: &SsaFunction, block: usize, instruction: usize, before: usize) -> usize {
+  let listed = List<usize>.asSlice(&function.block(block).instructions)
+  let mut at = usize.ZERO
+  while at < before && at < listed.length {
+    if listed[at] == instruction { return at }
+    at = at + usize.ONE
+  }
+  return usize.MAX
+}
+
+// Whether `kind` is one integer of at most 64 bits.
+fn plain(kind: Kind) -> bool { return kind.isInteger() && !kind.isVector() && kind.bits <= 64 && kind.bits >= usize.ONE }
+
+// The position, among the parameters of `block`, of the one its branch tests, when edges can be
+// threaded through the block; else `usize.MAX`.
+fn testedBy(function: &SsaFunction, block: usize) -> usize {
+  let found = function.block(block)
+  if block == usize.ZERO || found.exit != Exit.Branch || List<u64>.length(&found.parameters) == usize.ZERO { return usize.MAX }
+  let listed = List<usize>.asSlice(&found.instructions)
+  if listed.length > chain() { return usize.MAX }
+  let mut root = none()
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let one = function.instruction(listed[at])
+    let operands = function.operandsOf(listed[at])
+    let known = match one.operation {
+      Operation.Cast {operation} => (operation == Cast.Trunc || operation == Cast.ZExt || operation == Cast.SExt) && plain(one.kind)
+      Operation.Compare {..} => true
+      Operation.Binary {operation} => (operation == Binary.And || operation == Binary.Or || operation == Binary.Xor || operation == Binary.Add
+        || operation == Binary.Sub) && plain(one.kind)
+      _ => false
+    }
+    if !known || !plain(function.kindOf(operands[usize.ZERO])) { return usize.MAX }
+    let mut operand = usize.ZERO
+    while operand < operands.length {
+      let read = operands[operand]
+      if !function.isBits(read) {
+        if parameterAt(function, block, read) != usize.MAX {
+          if root != none() && root != read { return usize.MAX }
+          root = read
+        } else {
+          let producer = function.producerOf(read)
+          if producer == usize.MAX || instructionAt(function, block, producer, at) == usize.MAX { return usize.MAX }
+        }
+      }
+      operand = operand + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  if root == none() {
+    if listed.length != usize.ZERO { return usize.MAX }
+    return parameterAt(function, block, found.value)
+  }
+  if found.value != root {
+    let producer = function.producerOf(found.value)
+    if producer == usize.MAX || instructionAt(function, block, producer, listed.length) == usize.MAX { return usize.MAX }
+  }
+  return parameterAt(function, block, root)
+}
+
+// Whether `left predicate right` holds for two integers of `bits` bits, or 2 for a predicate of
+// floats.
+fn holds(predicate: Predicate, left: u64, right: u64, bits: usize) -> usize {
+  let a = u64.bitXor(SsaFolding.signExtended(left, bits), 9223372036854775808)
+  let b = u64.bitXor(SsaFolding.signExtended(right, bits), 9223372036854775808)
+  let mut held = false
+  if predicate == Predicate.Eq { held = left == right }
+  else if predicate == Predicate.Ne { held = left != right }
+  else if predicate == Predicate.Ult { held = left < right }
+  else if predicate == Predicate.Ule { held = left <= right }
+  else if predicate == Predicate.Ugt { held = left > right }
+  else if predicate == Predicate.Uge { held = left >= right }
+  else if predicate == Predicate.Slt { held = a < b }
+  else if predicate == Predicate.Sle { held = a <= b }
+  else if predicate == Predicate.Sgt { held = a > b }
+  else if predicate == Predicate.Sge { held = a >= b }
+  else { return 2 }
+  if held { return usize.ONE }
+  return usize.ZERO
+}
+
+// The bits of `read`, an operand of instruction `at` of `block`, when `arrived` are the bits of
+// the tested parameter `root` and `made` those of the instructions before.
+fn bitsOf(function: &SsaFunction, block: usize, at: usize, read: u64, root: u64, arrived: u64, made: &List<u64>) -> u64 {
+  if read == root { return arrived }
+  if function.isBits(read) { return masked(function.constantOf(read).low, function.kindOf(read).bits) }
+  return List<u64>.get(made, instructionAt(function, block, function.producerOf(read), at))
+}
+
+// Fills `made` with the bits each instruction of `block` gives when the constant `passed`
+// arrives for its tested parameter, at position `tested`; answers false when one is not decided.
+effect fn outcomes(function: &SsaFunction, block: usize, tested: usize, passed: u64, made: &mut List<u64>) -> bool ! OutOfMemoryError ? &mut Allocator {
+  List<u64>.clear(&mut made.*)
+  if !function.isBits(passed) || !plain(function.kindOf(passed)) { return false }
+  let root = List<u64>.get(&function.block(block).parameters, tested)
+  let arrived = masked(function.constantOf(passed).low, function.kindOf(passed).bits)
+  let listed = List<usize>.asSlice(&function.block(block).instructions)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let one = function.instruction(listed[at])
+    let operands = function.operandsOf(listed[at])
+    let first = bitsOf(function, block, at, operands[usize.ZERO], root, arrived, &made.*)
+    let from = function.kindOf(operands[usize.ZERO])
+    let mut bits: u64 = 0
+    match one.operation {
+      Operation.Cast {operation} => {
+        bits = masked(first, one.kind.bits)
+        if operation == Cast.SExt { bits = masked(SsaFolding.signExtended(first, from.bits), one.kind.bits) }
+      }
+      Operation.Compare {predicate} => {
+        let second = bitsOf(function, block, at, operands[usize.ONE], root, arrived, &made.*)
+        let held = holds(predicate, first, second, from.bits)
+        if held == 2 { return false }
+        bits = usize.toU64(held)
+      }
+      Operation.Binary {operation} => {
+        let second = bitsOf(function, block, at, operands[usize.ONE], root, arrived, &made.*)
+        if operation == Binary.And { bits = u64.bitAnd(first, second) }
+        else if operation == Binary.Or { bits = u64.bitOr(first, second) }
+        else if operation == Binary.Xor { bits = u64.bitXor(first, second) }
+        else if operation == Binary.Add { bits = masked(u64.wrappingAdd(first, second), one.kind.bits) }
+        else { bits = masked(u64.wrappingSubtract(first, second), one.kind.bits) }
+      }
+      _ => { return false }
+    }
+    run List<u64>.append(&mut made.*, bits)
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// The block that defines `value`, or `usize.MAX` for an argument or a constant.
+fn definedIn(function: &SsaFunction, value: u64) -> usize {
+  if value == none() { return usize.MAX }
+  let found = function.value(value)
+  if found.definition == Definition.Parameter { return found.owner }
+  if found.definition == Definition.Result { return function.instruction(found.owner).block }
+  return usize.MAX
+}
+
+// One edge to thread: edge `edge` of block `from`, into block `through`, on along its edge
+// `taken`, by way of the new block `by`.
+struct Threaded {
+  from: usize,
+  edge: usize,
+  through: usize,
+  taken: usize,
+  by: usize,
+}
+
+impl Copy for Threaded {}
+
+/// Threads every edge of `function` that passes a constant for the parameter its target tests;
+/// answers whether it threaded any.
+pub effect fn thread(function: &mut SsaFunction) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let blocks = function.blockCount()
+  // The parameter each block tests, found when an edge into it is first seen.
+  let mut tests = run List<usize>.makeWithCapacity(blocks)
+  run List<usize>.appendRepeated(&mut tests, usize.MAX - usize.ONE, blocks)
+  // The edges that can go on, and what the block each enters makes of the constant it passes.
+  let mut found = List<Threaded>.make()
+  let mut results = List<List<u64>>.make()
+  let mut made = List<u64>.make()
+  let mut from = usize.ZERO
+  while from < blocks {
+    let edges = List<Edge>.asSlice(&function.block(from).edges)
+    let mut edge = usize.ZERO
+    while edge < edges.length {
+      let through = edges[edge].block
+      if through != from {
+        if List<usize>.get(&tests, through) == usize.MAX - usize.ONE { List<usize>.set(&mut tests, through, testedBy(&function.*, through)) }
+        let tested = List<usize>.get(&tests, through)
+        if tested != usize.MAX && run outcomes(&function.*, through, tested, List<u64>.get(&edges[edge].arguments, tested), &mut made) {
+          // The condition is the parameter itself or one of the instructions.
+          let target = function.block(through)
+          let mut condition = masked(function.constantOf(List<u64>.get(&edges[edge].arguments, tested)).low, 64)
+          let producer = function.producerOf(target.value)
+          if producer != usize.MAX { condition = List<u64>.get(&made, instructionAt(&function.*, through, producer, chain())) }
+          let mut taken = usize.ONE
+          if condition != 0 { taken = usize.ZERO }
+          run List<Threaded>.append(&mut found, Threaded {from: from, edge: edge, through: through, taken: taken, by: usize.MAX})
+          let mut copy = List<u64>.make()
+          run List<u64>.appendSlice(&mut copy, List<u64>.asSlice(&made))
+          run List<List<u64>>.append(&mut results, move copy)
+        }
+      }
+      edge = edge + usize.ONE
+    }
+    from = from + usize.ONE
+  }
+  if List<Threaded>.length(&found) == usize.ZERO { return false }
+  // A loop's header keeps every edge into it.
+  let graph = run SsaGraph.of(&function.*)
+  let mut kept = List<Threaded>.make()
+  let mut computed = List<List<u64>>.make()
+  let mut at = usize.ZERO
+  while at < List<Threaded>.length(&found) {
+    let one = List<Threaded>.get(&found, at)
+    let mut header = !graph.reaches(one.through) || !graph.reaches(one.from)
+    if !header {
+      let incoming = graph.predecessorsOf(one.through)
+      let mut each = usize.ZERO
+      while each < incoming.length {
+        if graph.reaches(incoming[each]) && graph.dominates(one.through, incoming[each]) { header = true }
+        each = each + usize.ONE
+      }
+    }
+    if !header {
+      // The constants the block's instructions make on this edge, as values.
+      let bits = List<u64>.asSlice(&List<List<u64>>.asSlice(&results)[at])
+      let mut values = run List<u64>.makeWithCapacity(bits.length)
+      let mut each = usize.ZERO
+      while each < bits.length {
+        let kind = function.kindOf(function.instruction(List<usize>.get(&function.block(one.through).instructions, each)).result)
+        run List<u64>.append(&mut values, run function.constant(kind, bits[each]))
+        each = each + usize.ONE
+      }
+      run List<Threaded>.append(&mut kept, one)
+      run List<List<u64>>.append(&mut computed, move values)
+    }
+    at = at + usize.ONE
+  }
+  let count = List<Threaded>.length(&kept)
+  if count == usize.ZERO { return false }
+  // Which blocks edges are threaded through, whose values may need a slot.
+  let mut threaded = run List<bool>.makeWithCapacity(blocks)
+  run List<bool>.appendRepeated(&mut threaded, false, blocks)
+  at = usize.ZERO
+  while at < count {
+    List<bool>.set(&mut threaded, List<Threaded>.get(&kept, at).through, true)
+    at = at + usize.ONE
+  }
+  // Each edge goes to a new block that jumps on with what the branch would have passed; what the
+  // edge passed is kept for the new block's stores.
+  let mut arrived = run List<List<u64>>.makeWithCapacity(count)
+  at = usize.ZERO
+  while at < count {
+    let mut one = List<Threaded>.get(&kept, at)
+    let mut passed = List<u64>.make()
+    run List<u64>.appendSlice(&mut passed, List<u64>.asSlice(&List<Edge>.asSlice(&function.block(one.from).edges)[one.edge].arguments))
+    let onward = List<Edge>.asSlice(&function.block(one.through).edges)[one.taken].block
+    let mut arguments = List<u64>.make()
+    run List<u64>.appendSlice(&mut arguments, List<u64>.asSlice(&List<Edge>.asSlice(&function.block(one.through).edges)[one.taken].arguments))
+    let mut argument = usize.ZERO
+    while argument < List<u64>.length(&arguments) {
+      let value = List<u64>.get(&arguments, argument)
+      let position = parameterAt(&function.*, one.through, value)
+      if position != usize.MAX {
+        List<u64>.set(&mut arguments, argument, List<u64>.get(&passed, position))
+      } else {
+        let producer = function.producerOf(value)
+        if producer != usize.MAX {
+          let index = instructionAt(&function.*, one.through, producer, chain())
+          if index != usize.MAX { List<u64>.set(&mut arguments, argument, List<u64>.get(&List<List<u64>>.asSlice(&computed)[at], index)) }
+        }
+      }
+      argument = argument + usize.ONE
+    }
+    let place = function.block(one.through).place
+    one.by = run function.addJumpBlock(onward, List<u64>.asSlice(&arguments), place)
+    run function.setEdge(one.from, one.edge, one.by, &[])
+    List<Threaded>.set(&mut kept, at, one)
+    run List<List<u64>>.append(&mut arrived, move passed)
+    at = at + usize.ONE
+  }
+  run rebuild(&mut function.*, List<Threaded>.asSlice(&kept), List<List<u64>>.asSlice(&arrived), List<List<u64>>.asSlice(&computed), List<bool>.asSlice(&threaded))
+  return true
+}
+
+// Puts a store of `value` to `address` at `position` of `block`.
+effect fn storeAt(function: &mut SsaFunction, block: usize, position: usize, value: u64, address: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let place = function.block(block).place
+  drop run function.insertInstruction(block, position, Operation.Store {offset: 0, alignment: usize.ONE}, Kind.unit(), &[value, address], place)
+  return ()
+}
+
+// Moves each value a threaded block defines and another block reads into a variable slot, stored
+// by the block and by each new block of `edges`, which passed `arrived` for the block's
+// parameters and on which its instructions make the constants `computed`, and loaded at each
+// read; then promotes the slots. `threaded` marks the blocks edges were threaded through.
+effect fn rebuild(function: &mut SsaFunction, edges: &[Threaded], arrived: &[List<u64>], computed: &[List<u64>], threaded: &[bool]) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let values = function.valueCount()
+  let blocks = function.blockCount()
+  // The values read outside the threaded block that defines them.
+  let mut needed = run List<bool>.makeWithCapacity(values)
+  run List<bool>.appendRepeated(&mut needed, false, values)
+  let mut any = false
+  let mut block = usize.ZERO
+  while block < blocks {
+    let found = function.block(block)
+    let listed = List<usize>.asSlice(&found.instructions)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      let operands = function.operandsOf(listed[at])
+      let mut operand = usize.ZERO
+      while operand < operands.length {
+        if readElsewhere(&function.*, threaded, operands[operand], block) {
+          List<bool>.set(&mut needed, u64.toUsize(operands[operand]), true)
+          any = true
+        }
+        operand = operand + usize.ONE
+      }
+      at = at + usize.ONE
+    }
+    if readElsewhere(&function.*, threaded, found.value, block) {
+      List<bool>.set(&mut needed, u64.toUsize(found.value), true)
+      any = true
+    }
+    let leaving = List<Edge>.asSlice(&found.edges)
+    let mut edge = usize.ZERO
+    while edge < leaving.length {
+      let arguments = List<u64>.asSlice(&leaving[edge].arguments)
+      let mut argument = usize.ZERO
+      while argument < arguments.length {
+        if readElsewhere(&function.*, threaded, arguments[argument], block) {
+          List<bool>.set(&mut needed, u64.toUsize(arguments[argument]), true)
+          any = true
+        }
+        argument = argument + usize.ONE
+      }
+      edge = edge + usize.ONE
+    }
+    block = block + usize.ONE
+  }
+  // What a threaded edge passed is read by its new block's stores.
+  let mut passing = usize.ZERO
+  while passing < edges.length {
+    let passed = List<u64>.asSlice(&arrived[passing])
+    let mut each = usize.ZERO
+    while each < passed.length {
+      if readElsewhere(&function.*, threaded, passed[each], edges[passing].by) {
+        List<bool>.set(&mut needed, u64.toUsize(passed[each]), true)
+        any = true
+      }
+      each = each + usize.ONE
+    }
+    passing = passing + usize.ONE
+  }
+  if !any { return () }
+  // A slot for each, its address made once in the entry.
+  let pointer = function.addressKind()
+  let mut addresses = run List<u64>.makeWithCapacity(values)
+  run List<u64>.appendRepeated(&mut addresses, none(), values)
+  let mut value = usize.ZERO
+  while value < values {
+    if List<bool>.get(&needed, value) {
+      let kind = function.kindOf(usize.toU64(value))
+      let slot = run function.addVariableSlot(kind)
+      let address = run function.insertInstruction(usize.ZERO, usize.ZERO, Operation.SlotAddress {slot: slot}, pointer, &[], 0)
+      List<u64>.set(&mut addresses, value, address)
+    }
+    value = value + usize.ONE
+  }
+  // Each new block stores what its edge passed, and what the instructions make of it. The
+  // threaded blocks still hold only their own instructions here.
+  let mut at = usize.ZERO
+  while at < edges.length {
+    let one = edges[at]
+    let passed = List<u64>.asSlice(&arrived[at])
+    let mut parameters = List<u64>.make()
+    run List<u64>.appendSlice(&mut parameters, List<u64>.asSlice(&function.block(one.through).parameters))
+    let mut position = usize.ZERO
+    let mut each = usize.ZERO
+    while each < List<u64>.length(&parameters) {
+      let parameter = List<u64>.get(&parameters, each)
+      if List<bool>.get(&needed, u64.toUsize(parameter)) {
+        run storeAt(&mut function.*, one.by, position, passed[each], List<u64>.get(&addresses, u64.toUsize(parameter)))
+        position = position + usize.ONE
+      }
+      each = each + usize.ONE
+    }
+    let constants = List<u64>.asSlice(&computed[at])
+    let mut made = usize.ZERO
+    while made < constants.length {
+      let result = function.instruction(List<usize>.get(&function.block(one.through).instructions, made)).result
+      if List<bool>.get(&needed, u64.toUsize(result)) {
+        run storeAt(&mut function.*, one.by, position, constants[made], List<u64>.get(&addresses, u64.toUsize(result)))
+        position = position + usize.ONE
+      }
+      made = made + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  // The threaded blocks store their parameters on entry and their instructions' results at
+  // their end.
+  block = usize.ONE
+  while block < threaded.length {
+    if threaded[block] {
+      let mut parameters = List<u64>.make()
+      run List<u64>.appendSlice(&mut parameters, List<u64>.asSlice(&function.block(block).parameters))
+      let mut position = usize.ZERO
+      let mut index = usize.ZERO
+      while index < List<u64>.length(&parameters) {
+        let parameter = List<u64>.get(&parameters, index)
+        if List<bool>.get(&needed, u64.toUsize(parameter)) {
+          run storeAt(&mut function.*, block, position, parameter, List<u64>.get(&addresses, u64.toUsize(parameter)))
+          position = position + usize.ONE
+        }
+        index = index + usize.ONE
+      }
+      let own = List<usize>.length(&function.block(block).instructions)
+      let mut each = position
+      while each < own {
+        let result = function.instruction(List<usize>.get(&function.block(block).instructions, each)).result
+        if List<bool>.get(&needed, u64.toUsize(result)) {
+          let end = List<usize>.length(&function.block(block).instructions)
+          run storeAt(&mut function.*, block, end, result, List<u64>.get(&addresses, u64.toUsize(result)))
+        }
+        each = each + usize.ONE
+      }
+    }
+    block = block + usize.ONE
+  }
+  // Each read outside the defining block loads the slot.
+  let all = function.blockCount()
+  block = usize.ZERO
+  while block < all {
+    let place = function.block(block).place
+    let mut count = List<usize>.length(&function.block(block).instructions)
+    let mut position = usize.ZERO
+    while position < count {
+      let instruction = List<usize>.get(&function.block(block).instructions, position)
+      let operands = function.operandsOf(instruction).length
+      let mut operand = usize.ZERO
+      while operand < operands {
+        let read = function.operandsOf(instruction)[operand]
+        if moved(&function.*, List<bool>.asSlice(&needed), read, block) {
+          let kind = function.kindOf(read)
+          let loaded = run function.insertInstruction(block, position, Operation.Load {offset: 0, alignment: usize.ONE}, kind,
+            &[List<u64>.get(&addresses, u64.toUsize(read))], place)
+          function.setOperand(instruction, operand, loaded)
+          position = position + usize.ONE
+          count = count + usize.ONE
+        }
+        operand = operand + usize.ONE
+      }
+      position = position + usize.ONE
+    }
+    let exit = function.block(block).value
+    if moved(&function.*, List<bool>.asSlice(&needed), exit, block) {
+      let kind = function.kindOf(exit)
+      let loaded = run function.insertInstruction(block, count, Operation.Load {offset: 0, alignment: usize.ONE}, kind,
+        &[List<u64>.get(&addresses, u64.toUsize(exit))], place)
+      function.setExitValue(block, loaded)
+      count = count + usize.ONE
+    }
+    let leaving = List<Edge>.length(&function.block(block).edges)
+    let mut edge = usize.ZERO
+    while edge < leaving {
+      let arguments = List<u64>.length(&List<Edge>.asSlice(&function.block(block).edges)[edge].arguments)
+      let mut argument = usize.ZERO
+      while argument < arguments {
+        let read = List<u64>.get(&List<Edge>.asSlice(&function.block(block).edges)[edge].arguments, argument)
+        if moved(&function.*, List<bool>.asSlice(&needed), read, block) {
+          let kind = function.kindOf(read)
+          let loaded = run function.insertInstruction(block, count, Operation.Load {offset: 0, alignment: usize.ONE}, kind,
+            &[List<u64>.get(&addresses, u64.toUsize(read))], place)
+          function.setArgument(block, edge, argument, loaded)
+          count = count + usize.ONE
+        }
+        argument = argument + usize.ONE
+      }
+      edge = edge + usize.ONE
+    }
+    block = block + usize.ONE
+  }
+  // A block every edge into which was threaded is no longer reached, and promotion passes
+  // arguments only along the edges of blocks it walks.
+  drop run function.compact()
+  return run SsaPromotion.promote(&mut function.*, false)
+}
+
+// Whether `value` is defined in a threaded block other than `block`, which reads it.
+fn readElsewhere(function: &SsaFunction, threaded: &[bool], value: u64, block: usize) -> bool {
+  let home = definedIn(function, value)
+  return home != usize.MAX && home != block && home < threaded.length && threaded[home]
+}
+
+// Whether `value` moved to a slot and `block`, which reads it, is not the block that defines it.
+fn moved(function: &SsaFunction, needed: &[bool], value: u64, block: usize) -> bool {
+  if value == none() || u64.toUsize(value) >= needed.length || !needed[u64.toUsize(value)] { return false }
+  return definedIn(function, value) != block
+}
