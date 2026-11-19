@@ -1144,6 +1144,50 @@ struct SpreadBinding {
   storage: Interned<Type>,
 }
 
+// An index operand evaluated ahead of the place that reads it, and the temporary that holds it.
+struct Hoisted {
+  node: usize,
+  local: usize,
+}
+
+impl Copy for Hoisted {}
+
+// One step from a place to the place it projects: `parent` is the projected node, `index` the
+// index operand the step evaluates, each `usize.MAX` when the step has none, and `row` whether the
+// step is a row field.
+struct PlaceLink {
+  parent: usize,
+  index: usize,
+  row: bool,
+}
+
+impl Copy for PlaceLink {}
+
+fn placeLink(body: &Shared<TypedBody>, id: BodyNodeId) -> PlaceLink {
+  return Shared<TypedBody>.with<PlaceLink>(body, |value: &TypedBody| -> PlaceLink {
+    if let BodyNodeKind.Expression {form, ..} = &TypedBody.nodeSlice(value)[id.index].kind {
+      return match &form {
+        BodyExpression.Field {value: subject, ..} => PlaceLink {parent: subject.index, index: usize.MAX, row: false}
+        BodyExpression.Dereference {value: subject} => PlaceLink {parent: subject.index, index: usize.MAX, row: false}
+        BodyExpression.Index {value: subject, index, ..} => PlaceLink {parent: subject.index, index: index.index, row: false}
+        BodyExpression.RowField {subject, index, ..} => PlaceLink {parent: subject.index, index: index.index, row: true}
+        _ => PlaceLink {parent: usize.MAX, index: usize.MAX, row: false}
+      }
+    }
+    return PlaceLink {parent: usize.MAX, index: usize.MAX, row: false}
+  })
+}
+
+// Whether a row field lies on the place `id` names (INDEX-002).
+fn rowDestination(body: &Shared<TypedBody>, id: BodyNodeId) -> bool {
+  let mut link = placeLink(body, id)
+  while link.parent != usize.MAX {
+    if link.row { return true }
+    link = placeLink(body, BodyNodeId {index: link.parent})
+  }
+  return false
+}
+
 struct Builder {
   bindings: List<Binding>,
   projections: List<RuntimeProjection>,
@@ -1154,6 +1198,9 @@ struct Builder {
   loops: List<LoopTargets>,
   scrutinees: List<Scrutinee>,
   narrowed: List<Narrowed>,
+  // The index operands of the row field destinations being written, each read by the node that
+  // would have evaluated it (`hoistIndexes`).
+  hoisted: List<Hoisted>,
   // The cleanup stack: owned locals in acquisition order, and where each open scope starts.
   owners: List<Owner>,
   cleanup: List<CleanupNode>,
@@ -1619,6 +1666,12 @@ fn view(body: &Shared<TypedBody>, id: BodyNodeId, constants: &[ConstantValue]) -
           }
           BodyExpression.Dereference {value} => View.Dereference {
             value: value,
+            ty: Interned<Type>.clone(&ty),
+            origin: origin,
+          }
+          // A row field is the referent of the reference its `Rows` call yields (INDEX-002).
+          BodyExpression.RowField {call, ..} => View.Dereference {
+            value: call,
             ty: Interned<Type>.clone(&ty),
             origin: origin,
           }
@@ -5164,9 +5217,41 @@ effect fn infixChain(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
   return move result
 }
 
+// Evaluates every index operand of the place `id` names, in order, and records each in
+// `builder.hoisted`, where the place reads it. A destination that a row field lies on is located
+// by a `Rows` call, which runs after the replacement value so that the value may read the
+// collection; its index operands are still evaluated first (ASSIGN-002).
+effect fn hoistIndexes(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Module, id: BodyNodeId) -> ()
+! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let link = placeLink(body, id)
+  if link.parent == usize.MAX { return () }
+  run hoistIndexes(&mut builder.*, body, hir, BodyNodeId {index: link.parent})
+  if link.index == usize.MAX || !builder.live { return () }
+  let node = BodyNodeId {index: link.index}
+  let origin = nodeOrigin(body, node)
+  let ty = match move run instanceNodeType(&builder.*, body, node) {
+    Option<Interned<Type>>.Some {value} => move value
+    Option<Interned<Type>>.None => { return run unsupported(&InstanceKey.identity(&builder.function.key), origin, GapCode.TypedForm) }
+  }
+  let input = run expression(&mut builder.*, body, hir, node)
+  if !builder.live { return () }
+  let captured = run temporary(&mut builder.*, &ty, origin)
+  run assign(&mut builder.*, place(captured), Rvalue.Use {value: move input}, origin)
+  run List<Hoisted>.append(&mut builder.hoisted, Hoisted {node: link.index, local: captured})
+  return ()
+}
+
 effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Module, id: BodyNodeId) -> Operand
 ! Gap | CanonicalizationFailure | OutOfMemoryError
 ? &mut Allocator | &mut Types {
+  if List<Hoisted>.length(&builder.hoisted) != usize.ZERO {
+    let held = List<Hoisted>.asSlice(&builder.hoisted)
+    let mut at = usize.ZERO
+    while at < held.length {
+      if held[at].node == id.index { return Operand.Copy {place: place(held[at].local)} }
+      at = at + usize.ONE
+    }
+  }
   let selected = run instanceView(&mut builder.*, body, id)
   let owner = InstanceKey.identity(&builder.function.key)
   return match move selected {
@@ -7731,8 +7816,18 @@ effect fn lowerReplace(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Mo
     Option<BodyNodeId>.Some {value} => value
     Option<BodyNodeId>.None => { return run unsupported(&owner, origin, GapCode.MissingCallArgument) }
   }
-  let destination = run expressionPlace(&mut builder.*, body, hir, target)
-  let value = run expression(&mut builder.*, body, hir, replacement)
+  let mut destination = place(usize.ZERO)
+  let mut value = Operand.Unit
+  if rowDestination(body, target) {
+    let mark = List<Hoisted>.length(&builder.hoisted)
+    run hoistIndexes(&mut builder.*, body, hir, target)
+    if builder.live { value = run expression(&mut builder.*, body, hir, replacement) }
+    if builder.live { destination = run expressionPlace(&mut builder.*, body, hir, target) }
+    List<Hoisted>.truncate(&mut builder.hoisted, mark)
+  } else {
+    destination = run expressionPlace(&mut builder.*, body, hir, target)
+    value = run expression(&mut builder.*, body, hir, replacement)
+  }
   if !builder.live { return Operand.Unit }
   let displaced = run storageValue(&mut builder.*, ty, Rvalue.Use {value: Operand.Move {place: run copyPlace(&destination)}}, origin)
   run assign(&mut builder.*, move destination, Rvalue.Use {value: move value}, origin)
@@ -8095,6 +8190,7 @@ effect fn helperBuilder(creator: &Builder, key: InstanceKey, result: &Interned<T
       locals: move locals, blocks: List<Block>.make(), references: List<Reference>.make(), externs: List<Interned<DeclarationId>>.make(),
       observes: false, contexts: List<ContextText>.make(), traps: List<TrapSite>.make(), suspension: Option<Origin>.none(), parks: Option<Origin>.none(), releasesPackages: false, nonParking: List<NonParkingRun>.make(), cancels: List<Cancel>.make(), accesses: List<SharedAccess>.make(), escapes: List<EscapeSite>.make(), erasures: List<ErasureFact>.make(), features: Bytes.make(), inlining: Inlining.Default, optimizeSize: false, variadic: false, frame: Bytes.make(), lines: List<u64>.make(), variables: List<Variable>.make(), inlined: List<InstanceKey>.make(), quiet: List<InstanceKey>.make()},
     current: usize.ZERO, live: true, loops: List<LoopTargets>.make(), scrutinees: List<Scrutinee>.make(), narrowed: List<Narrowed>.make(),
+    hoisted: List<Hoisted>.make(),
     owners: List<Owner>.make(), cleanup: List<CleanupNode>.make(), states: List<usize>.make(), dropPlans: List<List<usize>>.make(), scopes: List<usize>.make(), temporaries: List<Pending>.make(),
     remainders: List<Remainder>.make(), needs: CleanupNeeds {locals: List<bool>.make(), nodes: List<bool>.make()},
     failure: usize.MAX, plans: List<NodePlan>.make(), storage: List<StoragePlan>.make(), carriers: List<CarrierPlan>.make(),
@@ -11039,8 +11135,18 @@ effect fn lowerStatement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &
       run discard(&mut builder.*, body, hir, id)
     }
     View.PlaceAssignment {target, value, origin} => {
-      let destination = run expressionPlace(&mut builder.*, body, hir, target)
-      let assigned = run expression(&mut builder.*, body, hir, value)
+      let mut destination = place(usize.ZERO)
+      let mut assigned = Operand.Unit
+      if rowDestination(body, target) {
+        let mark = List<Hoisted>.length(&builder.hoisted)
+        run hoistIndexes(&mut builder.*, body, hir, target)
+        if builder.live { assigned = run expression(&mut builder.*, body, hir, value) }
+        if builder.live { destination = run expressionPlace(&mut builder.*, body, hir, target) }
+        List<Hoisted>.truncate(&mut builder.hoisted, mark)
+      } else {
+        destination = run expressionPlace(&mut builder.*, body, hir, target)
+        assigned = run expression(&mut builder.*, body, hir, value)
+      }
       if !builder.live { return () }
       let root = placeOwnerIndex(&builder.*, &destination)
       let targetType = run instanceNodeType(&builder.*, body, target)
@@ -11765,6 +11871,7 @@ impl MirFunction {
       live: true,
       loops: List<LoopTargets>.make(),
       scrutinees: List<Scrutinee>.make(),
+      hoisted: List<Hoisted>.make(),
       narrowed: List<Narrowed>.make(),
       owners: List<Owner>.make(),
       cleanup: List<CleanupNode>.make(),
