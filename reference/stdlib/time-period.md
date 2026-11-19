@@ -21,7 +21,9 @@ that are not zero have the same sign. The calendar fields are not balanced: 14 m
 
 The text form is the ISO 8601 duration, such as `P1Y2M3DT4H30M`. `PlainDate.addPeriod` and
 `PlainDate.periodUntil` of `silk.time.plain_date`, and the same functions of
-`silk.time.plain_date_time`, apply a period to a date and measure one.
+`silk.time.plain_date_time`, apply a period to a date and measure one. `RelativeTo` of
+`silk.time.relative` rounds a period, counts it in one unit, and changes its largest unit,
+from a starting point.
 
 ## Examples
 
