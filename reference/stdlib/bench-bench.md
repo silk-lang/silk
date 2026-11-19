@@ -32,6 +32,12 @@ reads the lines from the program's standard output and from the file it names in
 environment variable `BENCH_OUT`. After every suite has been reported, the task fails if two
 implementations gave different `check:` values for one benchmark.
 
+A program built on another benchmark library is read the same way without changing it:
+`Implementation.googleBenchmark` reads the console table of Google Benchmark, and
+`Implementation.criterion` reads what Criterion or Rust's built-in harness prints. Their
+rows become result lines first, so a Google Benchmark row, a Criterion line and a Silk
+`bench fn` that carry the same name are compared in one table.
+
 An implementation declared with `Implementation.driven` is a harness the task drives, as
 `silk.bench.transport` describes: the task starts it once, with `BENCH_DRIVE` set to `1`,
 asks it for the names of its benchmarks, finds for each the iteration count that makes one
