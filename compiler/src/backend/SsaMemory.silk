@@ -58,6 +58,7 @@
 
 import backend.SsaDeadCode
 import backend.SsaFunction {
+  Binary,
   ConstantForm,
   Definition,
   Edge,
@@ -143,6 +144,84 @@ pub fn placeOf(function: &SsaFunction, address: u64, offset: u64) -> Place {
     steps = steps + usize.ONE
   }
   return Place {form: BaseForm.Value, base: at, offset: moved, known: false}
+}
+
+// An indexed address base + variable * scale + displacement, modulo the address width.
+struct Indexed {
+  address: u64,
+  base: u64,
+  variable: u64,
+  scale: u64,
+  displacement: u64,
+}
+
+impl Copy for Indexed {}
+
+fn indexed(function: &SsaFunction, instruction: usize) -> Indexed {
+  let inputs = function.operandsOf(instruction)
+  let mut result = Indexed {address: function.instruction(instruction).result, base: inputs[usize.ZERO], variable: inputs[usize.ONE], scale: 1, displacement: 0}
+  let mut steps = usize.ZERO
+  while steps < 8 {
+    let producer = function.producerOf(result.variable)
+    if producer == usize.MAX { break }
+    let operation = match function.instruction(producer).operation {
+      Operation.Binary {operation: found} => found
+      _ => { break }
+    }
+    let args = function.operandsOf(producer)
+    let mut variable = args[usize.ZERO]
+    let mut fixed = args[usize.ONE]
+    if !function.isBits(fixed) && operation != Binary.Sub && operation != Binary.Shl { fixed = args[usize.ZERO] variable = args[usize.ONE] }
+    if !function.isBits(fixed) { break }
+    let literal = function.constantOf(fixed).low
+    if operation == Binary.Mul { result.scale = u64.wrappingMultiply(result.scale, literal) }
+    else if operation == Binary.Shl && literal < usize.toU64(function.addressBits) { result.scale = u64.shiftLeft(result.scale, literal) }
+    else if operation == Binary.Add { result.displacement = u64.wrappingAdd(result.displacement, u64.wrappingMultiply(result.scale, literal)) }
+    else if operation == Binary.Sub { result.displacement = u64.wrappingSubtract(result.displacement, u64.wrappingMultiply(result.scale, literal)) }
+    else { break }
+    result.variable = variable
+    steps = steps + usize.ONE
+  }
+  result.scale = masked(result.scale, function.addressBits)
+  return result
+}
+
+/// Reuses an indexed address in its block for later accesses a fixed number of bytes away.
+/// The offset is an explicit wrapping address addition, preserving Wasm memory traps.
+pub effect fn shareIndices(function: &mut SsaFunction) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut seen = List<Indexed>.make()
+  let mut changed = false
+  let mut block = usize.ZERO
+  while block < function.blockCount() {
+    List<Indexed>.truncate(&mut seen, usize.ZERO)
+    let count = List<usize>.length(&function.block(block).instructions)
+    let mut at = usize.ZERO
+    while at < count {
+      let instruction = List<usize>.get(&function.block(block).instructions, at)
+      at = at + usize.ONE
+      if let Operation.Index = function.instruction(instruction).operation {} else { continue }
+      let kind = function.kindOf(function.operandsOf(instruction)[usize.ONE])
+      if kind.bits != function.addressBits || !kind.isInteger() || kind.isVector() { continue }
+      let current = indexed(&function.*, instruction)
+      let prior = List<Indexed>.asSlice(&seen)
+      let mut pos = prior.length
+      let mut found = false
+      while pos > usize.ZERO && prior.length - pos < 32 {
+        pos = pos - usize.ONE
+        let other = prior[pos]
+        if other.variable == current.variable && other.base == current.base && other.scale == current.scale {
+          let delta = masked(u64.wrappingSubtract(current.displacement, other.displacement), function.addressBits)
+          function.replaceWithUnary(instruction, Operation.Offset {offset: delta}, other.address)
+          changed = true
+          found = true
+          break
+        }
+      }
+      if !found { run List<Indexed>.append(&mut seen, current) }
+    }
+    block = block + usize.ONE
+  }
+  return changed
 }
 
 // Whether `size` bytes at `first` and `otherSize` bytes at `second`, offsets from one base, share
@@ -580,8 +659,9 @@ struct Forwarding {
 pub effect fn forward(function: &mut SsaFunction) -> bool ! OutOfMemoryError ? &mut Allocator {
   let graph = run SsaGraph.of(&function.*)
   let escaped = run escapedSlots(&function.*)
+  let bypassed = run bypassTemporaryCopies(&mut function.*, List<bool>.asSlice(&escaped))
   let mut state = Forwarding {reads: List<Read>.make(), killedReads: List<usize>.make(), readFloor: usize.ZERO, held: List<Held>.make(), floor: usize.ZERO, killed: List<usize>.make(), substitution: List<u64>.make(), escaped: move escaped,
-    bits: function.addressBits, changed: false}
+    bits: function.addressBits, changed: bypassed}
   run List<u64>.appendRepeated(&mut state.substitution, none(), function.valueCount())
   // Entries: a block to enter, or `usize.MAX - mark` to leave the mark at that position.
   let mut marks = List<usize>.make()
@@ -766,16 +846,118 @@ effect fn clobber(state: &mut Forwarding) -> () ! OutOfMemoryError ? &mut Alloca
   return ()
 }
 
+// A Wasm memory offset adds without wrapping. Fold a derived argument address only
+// when the whole access fits in the promised object and adding the old offset did not wrap.
+fn foldableOffset(function: &SsaFunction, place: Place, address: u64, offset: u64, size: u64) -> bool {
+  return address != place.base && place.offset >= offset && withinReach(function, place, size)
+}
+
+// A private temporary read by just one copy is unnecessary when a preceding copy
+// in the same block supplied those bytes. Read the original source just once, even
+// when it is external or can trap. Only pure, nontrapping work may separate the two.
+effect fn bypassTemporaryCopies(function: &mut SsaFunction, escaped: &[bool]) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut reads = List<usize>.make()
+  run List<usize>.appendRepeated(&mut reads, usize.ZERO, function.slotCount())
+  let mut block = usize.ZERO
+  while block < function.blockCount() {
+    let listed = List<usize>.asSlice(&function.block(block).instructions)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      let id = listed[at]
+      at = at + usize.ONE
+      let operand = match function.instruction(id).operation {
+        Operation.CopyBytes {..} => usize.ONE
+        Operation.Load {..} => usize.ZERO
+        _ => { continue }
+      }
+      let place = placeOf(&function.*, function.operandsOf(id)[operand], 0)
+      if place.form == BaseForm.Slot {
+        let slot = u64.toUsize(place.base)
+        let count = List<usize>.get(&reads, slot)
+        List<usize>.set(&mut reads, slot, count + usize.ONE)
+      }
+    }
+    block = block + usize.ONE
+  }
+  let mut changed = false
+  block = usize.ZERO
+  while block < function.blockCount() {
+    let count = List<usize>.length(&function.block(block).instructions)
+    let mut prior = usize.MAX
+    let mut at = usize.ZERO
+    while at < count {
+      let id = List<usize>.get(&function.block(block).instructions, at)
+      at = at + usize.ONE
+      let op = function.instruction(id).operation
+      let size = match op {
+        Operation.CopyBytes {size: bytes} => bytes
+        _ => {
+          if !op.isPure() || function.mayTrap(id) { prior = usize.MAX }
+          continue
+        }
+      }
+      let from = placeOf(&function.*, function.operandsOf(id)[usize.ONE], 0)
+      let to = placeOf(&function.*, function.operandsOf(id)[usize.ZERO], 0)
+      if prior != usize.MAX && privateSlotContains(&function.*, escaped, from, size) && List<usize>.get(&reads, u64.toUsize(from.base)) == usize.ONE {
+        let via = placeOf(&function.*, function.operandsOf(prior)[usize.ZERO], 0)
+        let original = function.operandsOf(prior)[usize.ONE]
+        let source = placeOf(&function.*, original, 0)
+        if let Operation.CopyBytes {size: wrote} = function.instruction(prior).operation {
+          if size == wrote && via.form == BaseForm.Slot && via.known && via.base == from.base && via.offset == from.offset
+            && !mayAlias(from, size, source, size, escaped, function.addressBits) && !mayAlias(from, size, to, size, escaped, function.addressBits) {
+            function.setOperand(id, usize.ONE, original)
+            function.remove(prior)
+            changed = true
+          }
+        }
+      }
+      prior = id
+    }
+    block = block + usize.ONE
+  }
+  if changed { function.sweep() }
+  return changed
+}
+
+// Whether all the bytes belong to a single stack slot whose address stays private.
+fn privateSlotContains(function: &SsaFunction, escaped: &[bool], place: Place, size: u64) -> bool {
+  if !place.known || place.form != BaseForm.Slot { return false }
+  let slot = u64.toUsize(place.base)
+  let bytes = function.slot(slot).size
+  return !escaped[slot] && place.offset <= bytes && size <= bytes - place.offset
+}
+
 effect fn forwardBlock(state: &mut Forwarding, function: &mut SsaFunction, block: usize) -> () ! OutOfMemoryError ? &mut Allocator {
   let count = List<usize>.length(&function.block(block).instructions)
+  let mut lastCopy = usize.MAX
   let mut at = usize.ZERO
   while at < count {
     let instruction = List<usize>.get(&function.block(block).instructions, at)
     let found = function.instruction(instruction)
     match found.operation {
-      Operation.Load {offset, ..} => {
-        let place = placeOf(&function.*, resolved(&state.*, function.operandsOf(instruction)[usize.ZERO]), offset)
+      Operation.Load {offset, alignment} => {
+        let mut address = resolved(&state.*, function.operandsOf(instruction)[usize.ZERO])
+        let mut displacement = offset
+        let mut aligned = alignment
+        let mut place = placeOf(&function.*, address, displacement)
         let size = usize.toU64(found.kind.storeSize())
+        // The private snapshot still matches its source. Read a field there so
+        // forwarding can reuse its value and unread copies can disappear.
+        if lastCopy != usize.MAX && place.known && place.form == BaseForm.Slot && place.offset >= offset {
+          let copied = function.operandsOf(lastCopy)
+          let via = placeOf(&function.*, resolved(&state.*, copied[0]), 0)
+          if let Operation.CopyBytes {size: length} = function.instruction(lastCopy).operation {
+            if via.base == place.base && place.offset >= via.offset && size <= length && place.offset - via.offset <= length - size {
+              address = resolved(&state.*, copied[1])
+              displacement = place.offset - via.offset
+              aligned = usize.ONE
+              place = placeOf(&function.*, address, displacement)
+              function.setOperand(instruction, usize.ZERO, address)
+              function.setOperation(instruction, Operation.Load {offset: displacement, alignment: aligned})
+              state.changed = true
+            }
+          }
+        }
         let earlier = heldAt(&state.*, place, size, found.kind)
         let narrowed = narrowedAt(&state.*, &function.*, place, size, found.kind)
         if earlier != usize.MAX {
@@ -790,6 +972,11 @@ effect fn forwardBlock(state: &mut Forwarding, function: &mut SsaFunction, block
           function.remove(instruction)
           state.changed = true
         } else if place.known {
+          if foldableOffset(&function.*, place, address, displacement, size) {
+            function.setOperand(instruction, usize.ZERO, place.base)
+            function.setOperation(instruction, Operation.Load {offset: place.offset, alignment: aligned})
+            state.changed = true
+          }
           run List<Held>.append(&mut state.held, Held {place: place, size: size, kind: found.kind, value: found.result, alive: true})
         } else {
           // The same address value read again, with no write between that may alias it, reads
@@ -802,21 +989,23 @@ effect fn forwardBlock(state: &mut Forwarding, function: &mut SsaFunction, block
           while read > state.readFloor && seen < window() && earlier == none() {
             read = read - usize.ONE
             seen = seen + usize.ONE
-            if reads[read].alive && reads[read].address == address && reads[read].offset == offset && reads[read].kind.equals(found.kind) { earlier = reads[read].value }
+            if reads[read].alive && reads[read].address == address && reads[read].offset == displacement && reads[read].kind.equals(found.kind) { earlier = reads[read].value }
           }
           if earlier != none() {
             List<u64>.set(&mut state.substitution, u64.toUsize(found.result), earlier)
             function.remove(instruction)
             state.changed = true
           } else {
-            run List<Read>.append(&mut state.reads, Read {address: address, offset: offset, kind: found.kind, value: found.result, place: place, alive: true})
+            run List<Read>.append(&mut state.reads, Read {address: address, offset: displacement, kind: found.kind, value: found.result, place: place, alive: true})
           }
         }
       }
-      Operation.Store {offset, ..} => {
+      Operation.Store {offset, alignment} => {
+        lastCopy = usize.MAX
         let operands = function.operandsOf(instruction)
         let value = resolved(&state.*, operands[usize.ZERO])
-        let place = placeOf(&function.*, resolved(&state.*, operands[usize.ONE]), offset)
+        let address = resolved(&state.*, operands[usize.ONE])
+        let place = placeOf(&function.*, address, offset)
         let kind = function.kindOf(value)
         let size = usize.toU64(kind.storeSize())
         let earlier = heldAt(&state.*, place, size, kind)
@@ -824,23 +1013,54 @@ effect fn forwardBlock(state: &mut Forwarding, function: &mut SsaFunction, block
           function.remove(instruction)
           state.changed = true
         } else {
+          if foldableOffset(&function.*, place, address, offset, size) {
+            function.setOperand(instruction, usize.ONE, place.base)
+            function.setOperation(instruction, Operation.Store {offset: place.offset, alignment: alignment})
+            state.changed = true
+          }
           run killReads(&mut state.*, place, size)
           run kill(&mut state.*, place, size)
           if place.known { run List<Held>.append(&mut state.held, Held {place: place, size: size, kind: kind, value: value, alive: true}) }
         }
       }
       Operation.CopyBytes {size} => {
-        let place = placeOf(&function.*, resolved(&state.*, function.operandsOf(instruction)[usize.ZERO]), 0)
+        let operands = function.operandsOf(instruction)
+        let place = placeOf(&function.*, resolved(&state.*, operands[usize.ZERO]), 0)
+        let source = resolved(&state.*, operands[usize.ONE])
+        let mut from = placeOf(&function.*, source, 0)
+        // Bypass the temporary when it still holds the complete copy. The usual
+        // unread-store pass can then drop the first copy if it has no other reader.
+        if lastCopy != usize.MAX {
+          if let Operation.CopyBytes {size: priorSize} = function.instruction(lastCopy).operation {
+            let prior = function.operandsOf(lastCopy)
+            let via = placeOf(&function.*, resolved(&state.*, prior[usize.ZERO]), 0)
+            let original = resolved(&state.*, prior[usize.ONE])
+            let origin = placeOf(&function.*, original, 0)
+            if privateSlotContains(&function.*, List<bool>.asSlice(&state.escaped), origin, priorSize)
+              && size == priorSize && from.known && from.form == BaseForm.Slot && from.base == via.base && from.offset == via.offset {
+              function.setOperand(instruction, usize.ONE, original)
+              from = origin
+              state.changed = true
+            }
+          }
+        }
+        lastCopy = usize.MAX
+        let escaped = List<bool>.asSlice(&state.escaped)
+        if privateSlotContains(&function.*, escaped, place, size) && !mayAlias(from, size, place, size, escaped, function.addressBits) {
+          lastCopy = instruction
+        }
         run killReads(&mut state.*, place, size)
         run kill(&mut state.*, place, size)
       }
       Operation.Fill {size, ..} => {
+        lastCopy = usize.MAX
         let place = placeOf(&function.*, resolved(&state.*, function.operandsOf(instruction)[usize.ZERO]), 0)
         run killReads(&mut state.*, place, size)
         run kill(&mut state.*, place, size)
       }
       _ => {
         if clobbers(found.operation) {
+          lastCopy = usize.MAX
           state.readFloor = List<Read>.length(&state.reads)
           run clobber(&mut state.*)
         }
@@ -881,7 +1101,7 @@ effect fn removeUnreadStores(function: &mut SsaFunction, escaped: &[bool]) -> bo
             run List<Place>.append(&mut reads, from)
             run List<u64>.append(&mut readSizes, size)
           }
-          if writesPrivately(&function.*, escaped, operands[usize.ZERO]) && SsaDeadCode.inFrame(&function.*, operands[usize.ONE]) { run List<usize>.append(&mut writes, instruction) }
+          if size > 0 && privateSlotContains(&function.*, escaped, placeOf(&function.*, operands[0], 0), size) { run List<usize>.append(&mut writes, instruction) }
         }
         Operation.Store {..} => { if writesPrivately(&function.*, escaped, operands[usize.ONE]) { run List<usize>.append(&mut writes, instruction) } }
         Operation.Fill {..} => { if writesPrivately(&function.*, escaped, operands[usize.ZERO]) { run List<usize>.append(&mut writes, instruction) } }
@@ -898,6 +1118,7 @@ effect fn removeUnreadStores(function: &mut SsaFunction, escaped: &[bool]) -> bo
   let mut at = usize.ZERO
   while at < candidates.length {
     let instruction = candidates[at]
+    at = at + usize.ONE
     let found = function.instruction(instruction)
     let operands = function.operandsOf(instruction)
     let mut place = placeOf(&function.*, operands[usize.ZERO], 0)
@@ -918,10 +1139,20 @@ effect fn removeUnreadStores(function: &mut SsaFunction, escaped: &[bool]) -> bo
       other = other + usize.ONE
     }
     if unread {
+      if let Operation.CopyBytes {size: copied} = found.operation {
+        let source = operands[1]
+        if !SsaDeadCode.inFrame(&function.*, source) && !withinReach(&function.*, placeOf(&function.*, source, 0), copied) {
+          // A bulk read checks the entire source range. In linear memory the
+          // last byte checks the same range if the nonwrapping memarg fits.
+          if copied > 0xffffffff || function.addressBits != 32 { continue }
+          let b = found.block
+          let pos = positionIn(&function.*, b, instruction)
+          drop run function.insertInstruction(b, pos, Operation.Load {offset: copied - 1, alignment: usize.ONE}, Kind.integer(8), &[source], found.place)
+        }
+      }
       function.remove(instruction)
       removed = true
     }
-    at = at + usize.ONE
   }
   if removed { function.sweep() }
   return removed
@@ -931,4 +1162,79 @@ effect fn removeUnreadStores(function: &mut SsaFunction, escaped: &[bool]) -> bo
 fn writesPrivately(function: &SsaFunction, escaped: &[bool], address: u64) -> bool {
   let place = placeOf(function, address, 0)
   return place.form == BaseForm.Slot && !escaped[u64.toUsize(place.base)]
+}
+
+// Size in bytes of a scalar constant whose store has this exact little-endian representation.
+fn storedConstant(f: &SsaFunction, id: usize) -> usize {
+  if let Operation.Store {..} = f.instruction(id).operation {} else { return usize.ZERO }
+  let v = f.operandsOf(id)[0]
+  let kind = f.kindOf(v)
+  if !f.isBits(v) || !kind.isInteger() || kind.isVector() { return usize.ZERO }
+  if kind.bits == 1 { return usize.ONE }
+  if kind.bits == 8 || kind.bits == 16 || kind.bits == 32 { return kind.bits / 8 }
+  return usize.ZERO
+}
+
+/// Combines contiguous constant field initializers into in-bounds word stores.
+pub effect fn packStores(f: &mut SsaFunction) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut changed = false
+  let mut block = usize.ZERO
+  while block < f.blockCount() {
+    let length = List<usize>.length(&f.block(block).instructions)
+    let mut i = usize.ZERO
+    while i < length {
+      let start = i
+      let first = List<usize>.get(&f.block(block).instructions, i)
+      i = i + usize.ONE
+      let mut size = storedConstant(&f.*, first)
+      if size == usize.ZERO { continue }
+      let base = match f.instruction(first).operation {
+        Operation.Store {offset, ..} => placeOf(&f.*, f.operandsOf(first)[1], offset)
+        _ => { continue }
+      }
+      if !base.known { continue }
+      let mut span: u64 = 0
+      if base.form == BaseForm.Slot { span = f.slot(u64.toUsize(base.base)).size }
+      else if base.form == BaseForm.Exclusive { span = f.reachOf(base.base) }
+      if base.offset >= span { continue }
+      let mut value = f.constantOf(f.operandsOf(first)[0]).low
+      let mut saved = value
+      let mut width = size
+      let mut stop = start
+      let mut end = i
+      while end < length && end - start <= 16 && size < 8 {
+        let id = List<usize>.get(&f.block(block).instructions, end)
+        let op = f.instruction(id).operation
+        let next = storedConstant(&f.*, id)
+        if next == usize.ZERO {
+          if op.hasSideEffects() || !op.isPure() || f.mayTrap(id) { break }
+        } else {
+          if size + next > 8 || usize.toU64(size + next) > span - base.offset { break }
+          let part = match op {
+            Operation.Store {offset, ..} => placeOf(&f.*, f.operandsOf(id)[1], offset)
+            _ => { break }
+          }
+          if !part.known || part.base != base.base || part.form != base.form || part.offset != base.offset + usize.toU64(size) { break }
+          let bits = f.constantOf(f.operandsOf(id)[0]).low
+          value = value | u64.shiftLeft(bits, usize.toU64(size * 8))
+          size = size + next
+          if size == 2 || size == 4 || size == 8 { stop = end width = size saved = value }
+        }
+        end = end + usize.ONE
+      }
+      if stop != start {
+        let packed = run f.integer(width * 8, saved)
+        f.setOperand(first, usize.ZERO, packed)
+        while i <= stop {
+          let id = List<usize>.get(&f.block(block).instructions, i)
+          if let Operation.Store {..} = f.instruction(id).operation { f.remove(id) }
+          i = i + usize.ONE
+        }
+        changed = true
+      }
+    }
+    block = block + usize.ONE
+  }
+  if changed { f.sweep() }
+  return changed
 }

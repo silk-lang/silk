@@ -1,0 +1,299 @@
+//! Assigns typed wasm locals to non-overlapping lifetimes in a structured function body.
+
+import backend.WasmModule
+import backend.WasmObject
+import backend.WasmObject {Relocation}
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.collections.slice {Slice}
+import silk.core.ownership {Copy}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.u64
+import silk.num.usize
+
+struct Block { start: usize, end: usize, predecessor: usize, definition: usize, visited: usize }
+impl Copy for Block {}
+
+struct Edge { from: usize, next: usize }
+impl Copy for Edge {}
+
+struct Label { target: usize, condition: usize, loop: bool }
+impl Copy for Label {}
+
+struct Access { start: usize, end: usize, local: usize, block: usize, previous: usize }
+impl Copy for Access {}
+
+struct Lifetime { first: usize, last: usize, access: usize, slot: usize, reads: bool, next: usize }
+impl Copy for Lifetime {}
+
+struct Flow { blocks: List<Block>, edges: List<Edge>, labels: List<Label> }
+
+effect fn newBlock(flow: &mut Flow, start: usize) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let id = List<Block>.length(&flow.blocks)
+  run List<Block>.append(&mut flow.*.blocks, Block {start: start, end: start, predecessor: usize.MAX, definition: usize.MAX, visited: usize.MAX})
+  return id
+}
+
+effect fn edge(flow: &mut Flow, from: usize, to: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let block = &mut List<Block>.asMutSlice(&mut flow.*.blocks)[to]
+  let next = block.predecessor
+  block.predecessor = List<Edge>.length(&flow.edges)
+  return run List<Edge>.append(&mut flow.*.edges, Edge {from: from, next: next})
+}
+
+effect fn branch(flow: &mut Flow, from: usize, depth: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let labels = List<Label>.asSlice(&flow.labels)
+  // A branch to the implicit function label returns.
+  if depth < labels.length {
+    let target = labels[labels.length - usize.ONE - depth].target
+    run edge(&mut flow.*, from, target)
+  }
+  return ()
+}
+
+// Records the predecessors of each straight-line block. Forward labels have an empty join
+// block whose position becomes known at end. A loop branches back to its first instruction.
+effect fn control(flow: &mut Flow, code: &[u8], start: usize, end: usize, from: usize) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let op = code[start]
+  let next = run newBlock(&mut flow.*, end)
+  let source = &mut List<Block>.asMutSlice(&mut flow.*.blocks)[from]
+  source.end = start
+  if op >= 2 && op <= 4 {
+    run edge(&mut flow.*, from, next)
+    let mut target = next
+    if op != 3 { target = run newBlock(&mut flow.*, end) }
+    let mut condition = usize.MAX
+    if op == 4 { condition = from }
+    run List<Label>.append(&mut flow.*.labels, Label {target: target, condition: condition, loop: op == 3})
+  } else if op == 5 || op == 0x0B {
+    let top = List<Label>.length(&flow.labels) - usize.ONE
+    let label = List<Label>.get(&flow.labels, top)
+    if op == 5 {
+      run edge(&mut flow.*, from, label.target)
+      run edge(&mut flow.*, label.condition, next)
+      let arm = &mut List<Label>.asMutSlice(&mut flow.*.labels)[top]
+      arm.condition = usize.MAX
+    } else {
+      drop List<Label>.pop(&mut flow.*.labels)
+      if label.loop { run edge(&mut flow.*, from, next) } else {
+        let join = &mut List<Block>.asMutSlice(&mut flow.*.blocks)[label.target]
+        join.start = start
+        join.end = start
+        run edge(&mut flow.*, from, label.target)
+        if label.condition != usize.MAX { run edge(&mut flow.*, label.condition, label.target) }
+        run edge(&mut flow.*, label.target, next)
+      }
+    }
+  } else if op == 0x0C || op == 0x0D || op == 0x0E {
+    let mut at = start + usize.ONE
+    let mut count = usize.ONE
+    if op == 0x0E { count = WasmObject.readCount(code, &mut at) + usize.ONE }
+    while count > usize.ZERO {
+      run branch(&mut flow.*, from, u64.toUsize(WasmObject.readUnsigned(code, &mut at)))
+      count = count - usize.ONE
+    }
+    if op == 0x0D { run edge(&mut flow.*, from, next) }
+  }
+  return next
+}
+
+// Returns the byte after an instruction emitted by WasmBody. An unknown encoding leaves the
+// function in its original allocation. The linker inserts relocated immediates at their recorded offsets.
+fn instructionEnd(code: &[u8], start: usize, relocated: bool) -> usize {
+  let op = code[start]
+  let mut at = start + usize.ONE
+  let mut operands = usize.ZERO
+  if op <= 1 || op == 5 || op == 0x0B || op == 0x0F || op == 0x1A || op == 0x1B || (op >= 0x45 && op <= 0xC4) { return at }
+  if op == 0x43 { return at + 4 }
+  if op == 0x44 { return at + 8 }
+  if (op >= 2 && op <= 4) || op == 0x0C || op == 0x0D || op == 0x10 || op == 0x12
+    || (op >= 0x20 && op <= 0x26) || (op >= 0x3F && op <= 0x42) {
+    operands = usize.ONE
+  } else if op == 0x11 || op == 0x13 || (op >= 0x28 && op <= 0x3E) {
+    operands = 2
+  } else if op == 0x0E {
+    operands = WasmObject.readCount(code, &mut at) + usize.ONE
+  } else if op == 0xFC {
+    let sub = WasmObject.readUnsigned(code, &mut at)
+    if sub == 10 { operands = 2 } else if sub == 11 { operands = usize.ONE } else if sub > 7 { return usize.MAX }
+  } else if op == 0xFE {
+    let sub = WasmObject.readUnsigned(code, &mut at)
+    if sub == 3 { operands = usize.ONE } else if sub <= 2 || (sub >= 0x10 && sub <= 0x4E) { operands = 2 } else { return usize.MAX }
+  } else { return usize.MAX }
+  if relocated { operands = operands - usize.ONE }
+  while operands > usize.ZERO && at < code.length {
+    drop WasmObject.readUnsigned(code, &mut at)
+    operands = operands - usize.ONE
+  }
+  if operands != usize.ZERO { return usize.MAX }
+  return at
+}
+
+// Walk backwards from reads before the first write in their block. A predecessor with a write
+// supplies the value; all other predecessors need it live on entry. Reaching the function
+// entry includes its initial zero. Intervals include both ends of every live back edge.
+effect fn allocate(flow: &mut Flow, code: &[u8], uses: &[Access], lives: &mut [Lifetime], types: &[u8]) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let blocks = List<Block>.asMutSlice(&mut flow.*.blocks)
+  let edges = List<Edge>.asSlice(&flow.edges)
+  let mut work = List<usize>.make()
+  let mut starts = run List<usize>.makeWithCapacity(code.length + usize.ONE)
+  run List<usize>.appendRepeated(&mut starts, usize.MAX, code.length + usize.ONE)
+  let mut local = usize.ZERO
+  while local < lives.length {
+    let life = &mut lives[local]
+    let mut at = life.access
+    let mut current = usize.MAX
+    let mut reads = false
+    // Accesses of one block are contiguous, in reverse instruction order.
+    while at != usize.MAX {
+      let use = uses[at]
+      if current != use.block {
+        if reads { run List<usize>.append(&mut work, current) }
+        current = use.block
+      }
+      reads = code[use.start] == 0x20
+      if !reads { blocks[current].definition = local }
+      at = use.previous
+    }
+    if reads { run List<usize>.append(&mut work, current) }
+    while List<usize>.length(&work) > usize.ZERO {
+      let index = List<usize>.length(&work) - usize.ONE
+      let node = List<usize>.get(&work, index)
+      List<usize>.truncate(&mut work, index)
+      if blocks[node].visited != local {
+        blocks[node].visited = local
+        if blocks[node].start < life.first { life.first = blocks[node].start }
+        let mut link = blocks[node].predecessor
+        while link != usize.MAX {
+          let pred = edges[link].from
+          if blocks[pred].end > life.last { life.last = blocks[pred].end }
+          if blocks[pred].definition != local && blocks[pred].visited != local { run List<usize>.append(&mut work, pred) }
+          link = edges[link].next
+        }
+      }
+    }
+    if life.reads {
+      life.next = List<usize>.get(&starts, life.first)
+      List<usize>.set(&mut starts, life.first, local)
+    }
+    local = local + usize.ONE
+  }
+  let mut assigned = List<u8>.make()
+  let mut ends = List<usize>.make()
+  let mut pos = usize.ZERO
+  while pos < List<usize>.length(&starts) {
+    local = List<usize>.get(&starts, pos)
+    while local != usize.MAX {
+      let ty = types[local]
+      let mut slot = usize.ZERO
+      while slot < List<u8>.length(&assigned) && (List<usize>.get(&ends, slot) >= pos || List<u8>.get(&assigned, slot) != ty) { slot = slot + usize.ONE }
+      if slot == List<u8>.length(&assigned) {
+        run List<u8>.append(&mut assigned, ty)
+        run List<usize>.append(&mut ends, lives[local].last)
+      } else { List<usize>.set(&mut ends, slot, lives[local].last) }
+      lives[local].slot = slot
+      local = lives[local].next
+    }
+    pos = pos + usize.ONE
+  }
+  return move assigned
+}
+
+/// Rewrites function-local indices, declarations and code offsets together. Parameters retain
+/// their indices.
+pub effect fn coalesce(bytes: &mut Bytes, types: &mut List<u8>, parameters: usize, relocations: &mut List<Relocation>, locations: &mut List<u64>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let count = List<u8>.length(&types.*)
+  if count < 2 { return () }
+  let code = Bytes.asSlice(&bytes.*)
+  let mut flow = Flow {blocks: List<Block>.make(), edges: List<Edge>.make(), labels: List<Label>.make()}
+  let mut block = run newBlock(&mut flow, usize.ZERO)
+  let mut accesses = List<Access>.make()
+  let mut lives = run List<Lifetime>.makeWithCapacity(count)
+  run List<Lifetime>.appendRepeated(&mut lives, Lifetime {first: usize.MAX, last: usize.ZERO, access: usize.MAX, slot: usize.MAX, reads: false, next: usize.MAX}, count)
+  let mut relocation = usize.ZERO
+  let originalFixups = List<Relocation>.asSlice(&relocations.*)
+  let mut at = usize.ZERO
+  while at < code.length {
+    let op = code[at]
+    let mut end = at + usize.ONE
+    if op >= 0x20 && op <= 0x22 {
+      let index = u64.toUsize(WasmObject.readUnsigned(code, &mut end))
+      if index >= parameters {
+        let local = index - parameters
+        if local >= count { return () }
+        let use = List<Access>.length(&accesses)
+        let life = &mut List<Lifetime>.asMutSlice(&mut lives)[local]
+        if life.first == usize.MAX { life.first = at }
+        if op == 0x20 { life.reads = true }
+        life.last = at
+        let previous = life.access
+        life.access = use
+        run List<Access>.append(&mut accesses, Access {start: at, end: end, local: local, block: block, previous: previous})
+      }
+    } else {
+      let relocated = relocation < originalFixups.length && originalFixups[relocation].offset == end
+      if relocated { relocation = relocation + usize.ONE }
+      end = instructionEnd(code, at, relocated)
+      if end > code.length { return () }
+      if op == 0 || (op >= 2 && op <= 5) || (op >= 0x0B && op <= 0x0F) || op == 0x12 || op == 0x13 {
+        block = run control(&mut flow, code, at, end, block)
+      }
+    }
+    at = end
+  }
+  let finalBlock = &mut List<Block>.asMutSlice(&mut flow.blocks)[block]
+  finalBlock.end = code.length
+  if relocation != originalFixups.length { return () }
+  let uses = List<Access>.asSlice(&accesses)
+  let mut assigned = run allocate(&mut flow, code, uses, List<Lifetime>.asMutSlice(&mut lives), List<u8>.asSlice(&types.*))
+  let ranges = List<Lifetime>.asSlice(&lives)
+  let mut rewritten = Bytes.make()
+  let mut copied = usize.ZERO
+  let mut loc = usize.ZERO
+  let mut rel = usize.ZERO
+  let places = List<u64>.asMutSlice(&mut locations.*)
+  let fixups = List<Relocation>.asMutSlice(&mut relocations.*)
+  at = usize.ZERO
+  let mut skipSet = false
+  while at < uses.length {
+    let use = uses[at]
+    let size = Bytes.length(&rewritten)
+    while loc < places.length && places[loc] <= usize.toU64(use.start) {
+      places[loc] = usize.toU64(size + (u64.toUsize(places[loc]) - copied))
+      loc = loc + 2
+    }
+    while rel < fixups.length && fixups[rel].offset <= use.start {
+      fixups[rel].offset = size + (fixups[rel].offset - copied)
+      rel = rel + usize.ONE
+    }
+    run Bytes.append(&mut rewritten, Slice.view<u8>(code, copied, use.start - copied))
+    let op = code[use.start]
+    let life = ranges[use.local]
+    // An unread set drops its input and an unread tee leaves its input on the stack.
+    // A get followed by a set into the same physical slot can be removed as a pair.
+    if skipSet { skipSet = false } else if !life.reads {
+      if op == 0x21 { run WasmModule.op(&mut rewritten, 0x1A) }
+    } else if op == 0x20 && at + usize.ONE < uses.length && uses[at + usize.ONE].start == use.end
+      && code[use.end] == 0x21 && ranges[uses[at + usize.ONE].local].slot == life.slot {
+      skipSet = true
+    } else {
+      run WasmModule.op(&mut rewritten, op)
+      run WasmModule.index(&mut rewritten, parameters + life.slot)
+    }
+    copied = use.end
+    at = at + usize.ONE
+  }
+  let size = Bytes.length(&rewritten)
+  while loc < places.length {
+    places[loc] = usize.toU64(size + (u64.toUsize(places[loc]) - copied))
+    loc = loc + 2
+  }
+  while rel < fixups.length {
+    fixups[rel].offset = size + (fixups[rel].offset - copied)
+    rel = rel + usize.ONE
+  }
+  run Bytes.append(&mut rewritten, Slice.view<u8>(code, copied, code.length - copied))
+  bytes.* = move rewritten
+  types.* = move assigned
+  return ()
+}

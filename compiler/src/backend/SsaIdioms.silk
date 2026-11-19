@@ -1,6 +1,6 @@
-//! Loop idioms of one SSA function: a loop that sets or copies one byte each time round becomes
-//! one fill or copy of all its bytes, as LLVM's loop idiom recognition turns such a loop into
-//! `memset` or `memmove`.
+//! Loop idioms of one SSA function. A shift-until-zero loop becomes a bit count, and a loop
+//! that sets or copies one byte each time round becomes one fill or copy of all its bytes. A
+//! loop that only reads a range of bytes checks the range with a single load.
 //!
 //! # When to use
 //! Run [`recognize`] in an optimized build once the scalar passes have folded the loop's checks,
@@ -36,6 +36,7 @@
 import backend.SsaFunction {
   Binary,
   Cast,
+  Count,
   Definition,
   Edge,
   Exit,
@@ -47,13 +48,15 @@ import backend.SsaFunction {
   none,
 }
 import backend.SsaGraph {SsaGraph}
+import backend.SsaLoops
+import backend.SsaValueNumbering {inverse, swapped}
 import silk.collections.list {List}
 import silk.mem.allocator {Allocator, OutOfMemoryError}
 import silk.num.u64
 import silk.num.usize
 
-/// Turns each byte fill loop of `function` into one fill, and puts one copy before each byte copy
-/// loop for the ranges it can copy at once; answers whether it changed anything.
+/// Replaces shift-until-zero loops with bit counts and byte fill or copy loops with bulk
+/// memory operations where their ranges allow it. Returns whether it changed the function.
 pub effect fn recognize(function: &mut SsaFunction) -> bool ! OutOfMemoryError ? &mut Allocator {
   let mut graph = run SsaGraph.of(&function.*)
   // The blocks a rewrite adds hold no loop.
@@ -61,7 +64,7 @@ pub effect fn recognize(function: &mut SsaFunction) -> bool ! OutOfMemoryError ?
   let mut changed = false
   let mut header = usize.ZERO
   while header < blocks {
-    if graph.reaches(header) && run rewrite(&mut function.*, &graph, header) {
+    if graph.reaches(header) && ((run countShifts(&mut function.*, &graph, header)) || (run rewrite(&mut function.*, &graph, header))) {
       changed = true
       graph = run SsaGraph.of(&function.*)
     }
@@ -88,6 +91,73 @@ fn isConstant(function: &SsaFunction, value: u64, bits: u64) -> bool {
   if value == none() || !function.isBits(value) || !function.kindOf(value).isInteger() { return false }
   let constant = function.constantOf(value)
   return constant.low == bits && constant.high == 0
+}
+
+// A loop that shifts an unsigned word right until it is zero increments its counter
+// bits - clz(word) times, including zero turns for a zero word. Give the header
+// the completed values on entry so that every downstream use sees the final state.
+effect fn countShifts(function: &mut SsaFunction, graph: &SsaGraph, header: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let head = function.block(header)
+  if head.exit != Exit.Branch || List<u64>.length(&head.parameters) != 2 || List<usize>.length(&head.instructions) != usize.ONE { return false }
+  let test = List<usize>.get(&head.instructions, usize.ZERO)
+  if function.instruction(test).result != head.value { return false }
+  let predicate = match function.instruction(test).operation {
+    Operation.Compare {predicate} => predicate
+    _ => { return false }
+  }
+  let mut branch = usize.ZERO
+  if predicate == Predicate.Eq { branch = usize.ONE } else if predicate != Predicate.Ne { return false }
+  let inputs = function.operandsOf(test)
+  let mut rest = inputs[0]
+  if isConstant(&function.*, inputs[0], 0) { rest = inputs[1] }
+  else if !isConstant(&function.*, inputs[1], 0) { return false }
+  let params = List<u64>.asSlice(&head.parameters)
+  let mut r = usize.ZERO
+  if params[0] != rest { r = usize.ONE }
+  if params[r] != rest { return false }
+  let c = usize.ONE - r
+  let counter = params[c]
+  let kind = function.kindOf(rest)
+  if !kind.isInteger() || kind.isVector() || (kind.bits != 32 && kind.bits != 64) || !kind.equals(function.kindOf(counter)) { return false }
+  let body = List<Edge>.asSlice(&head.edges)[branch].block
+  if body == List<Edge>.asSlice(&head.edges)[usize.ONE - branch].block || graph.predecessorsOf(body).length != usize.ONE { return false }
+  let round = function.block(body)
+  if round.exit != Exit.Jump || List<usize>.length(&round.instructions) != 2 || List<u64>.length(&round.parameters) != usize.ZERO { return false }
+  let back = &List<Edge>.asSlice(&round.edges)[0]
+  if back.block != header { return false }
+  let args = List<u64>.asSlice(&back.arguments)
+  let shift = function.producerOf(args[r])
+  let step = function.producerOf(args[c])
+  if shift == usize.MAX || step == usize.MAX || function.instruction(shift).block != body || function.instruction(step).block != body { return false }
+  if let Operation.Binary {operation: Binary.LShr} = function.instruction(shift).operation {} else { return false }
+  if let Operation.Binary {operation: Binary.Add} = function.instruction(step).operation {} else { return false }
+  let shifted = function.operandsOf(shift)
+  if shifted[0] != rest || !isConstant(&function.*, shifted[1], 1) { return false }
+  let added = function.operandsOf(step)
+  if !((added[0] == counter && isConstant(&function.*, added[1], 1)) || (added[1] == counter && isConstant(&function.*, added[0], 1))) { return false }
+  let place = head.place
+  let leaving = &List<Edge>.asSlice(&head.edges)[usize.ONE - branch]
+  let after = leaving.block
+  let mut passed = List<u64>.make()
+  run passed.appendSlice(List<u64>.asSlice(&leaving.arguments))
+  let zero = run function.integer(kind.bits, 0)
+  let width = run function.integer(kind.bits, usize.toU64(kind.bits))
+  let mut inLoop = List<bool>.make()
+  run inLoop.appendRepeated(false, function.blockCount())
+  inLoop.set(header, true)
+  inLoop.set(body, true)
+  let entry = run SsaLoops.preheaderOf(&mut function.*, graph, List<bool>.asSlice(&inLoop), header)
+  let entering = List<u64>.asSlice(&List<Edge>.asSlice(&function.block(entry).edges)[0].arguments)
+  let input = entering[r]
+  let initial = entering[c]
+  let end = List<usize>.length(&function.block(entry).instructions)
+  let leading = run function.insertInstruction(entry, end, Operation.Count {which: Count.LeadingZeros}, kind, &[input], place)
+  let turns = run function.insertInstruction(entry, end + 1, Operation.Binary {operation: Binary.Sub}, kind, &[width, leading], place)
+  let total = run function.insertInstruction(entry, end + 2, Operation.Binary {operation: Binary.Add}, kind, &[initial, turns], place)
+  function.setArgument(entry, 0, r, zero)
+  function.setArgument(entry, 0, c, total)
+  run function.setJump(header, after, List<u64>.asSlice(&passed))
+  return true
 }
 
 // Whether a block other than `header` and `body` reads a value one of the two defines.
@@ -215,6 +285,31 @@ effect fn rewrite(function: &mut SsaFunction, graph: &SsaGraph, header: usize) -
     }
     at = at + usize.ONE
   }
+  // In a nonempty contiguous byte range, the highest address is in bounds exactly when
+  // every address is. If the pointer wraps, the range includes the last byte of the address
+  // space. The original header still skips the load when the range is empty.
+  if store == usize.MAX && load != usize.MAX && !down && indexes == usize.ONE {
+    let read = function.producerOf(function.operandsOf(load)[0])
+    if read == usize.MAX || function.instruction(read).block != body { return false }
+    if let Operation.Index = function.instruction(read).operation {} else { return false }
+    if readAfter(&function.*, header, body) { return false }
+    let base = function.operandsOf(read)[0]
+    let place = function.instruction(load).place
+    let address = function.addressKind()
+    let one = run function.constant(word, 1)
+    let maximum = run function.constant(word, u64.MAX)
+    let probe = run function.addJumpBlock(after, List<u64>.asSlice(&leaving), place)
+    let origin = run function.insertInstruction(probe, 0, Operation.Cast {operation: Cast.PtrToInt}, word, &[base], place)
+    let firstByte = run function.insertInstruction(probe, 1, Operation.Binary {operation: Binary.Add}, word, &[origin, counter], place)
+    let end = run function.insertInstruction(probe, 2, Operation.Binary {operation: Binary.Add}, word, &[origin, bound], place)
+    let last = run function.insertInstruction(probe, 3, Operation.Binary {operation: Binary.Sub}, word, &[end, one], place)
+    let wraps = run function.insertInstruction(probe, 4, Operation.Compare {predicate: Predicate.Ult}, Kind.flag(), &[last, firstByte], place)
+    let highest = run function.insertInstruction(probe, 5, Operation.Select, word, &[wraps, maximum, last], place)
+    let pointer = run function.insertInstruction(probe, 6, Operation.Cast {operation: Cast.IntToPtr}, address, &[highest], place)
+    drop run function.insertInstruction(probe, 7, Operation.Load {offset: 0, alignment: usize.ONE}, byte, &[pointer], place)
+    run function.setEdge(header, 0, probe, &[])
+    return true
+  }
   if store == usize.MAX { return false }
   let value = function.operandsOf(store)[usize.ZERO]
   if !function.kindOf(value).equals(byte) { return false }
@@ -293,4 +388,110 @@ effect fn rewrite(function: &mut SsaFunction, graph: &SsaGraph, header: usize) -
   }
   run function.setEdge(before, entry, made, &[])
   return true
+}
+
+// Whether a dominating branch proves value != 0 (nonzero) or value < another unsigned
+// value. The latter makes adding one to an induction value safe even at the type limit.
+fn guarded(function: &SsaFunction, graph: &SsaGraph, block: usize, value: u64, nonzero: bool) -> bool {
+  let mut child = block
+  while graph.dominatorOf(child) != child {
+    let parent = graph.dominatorOf(child)
+    let from = function.block(parent)
+    if from.exit == Exit.Branch && graph.predecessorsOf(child).length == usize.ONE {
+      let edges = List<Edge>.asSlice(&from.edges)
+      let test = function.producerOf(from.value)
+      if (edges[0].block == child || edges[1].block == child) && edges[0].block != edges[1].block && test != usize.MAX {
+        if let Operation.Compare {predicate} = function.instruction(test).operation {
+          let args = function.operandsOf(test)
+          let mut fact = predicate
+          if edges[1].block == child { fact = inverse(fact) }
+          let mut other = args[1]
+          if args[1] == value {
+            fact = swapped(fact)
+            other = args[0]
+          }
+          if args[0] == value || args[1] == value {
+            if !nonzero && fact == Predicate.Ult { return true }
+            if nonzero && (fact == Predicate.Ne || fact == Predicate.Ugt) && isConstant(function, other, 0) { return true }
+          }
+        }
+      }
+    }
+    child = parent
+  }
+  return false
+}
+
+// Carries the remainder of a zero-based, unit-step induction value around the loop.
+// Its next value is zero when it reaches the divisor, and the increment otherwise.
+effect fn carryRemainder(function: &mut SsaFunction, graph: &SsaGraph, instruction: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let found = function.instruction(instruction)
+  let kind = found.kind
+  if !kind.isInteger() || kind.isVector() || (kind.bits != 32 && kind.bits != 64) { return false }
+  let args = function.operandsOf(instruction)
+  let index = args[0]
+  let divisor = args[1]
+  let counter = function.value(index)
+  if counter.definition != Definition.Parameter { return false }
+  let header = counter.owner
+  let incoming = graph.predecessorsOf(header)
+  if incoming.length != 2 { return false }
+  let mut entry = incoming[0]
+  let mut latch = incoming[1]
+  if graph.dominates(header, entry) {
+    entry = incoming[1]
+    latch = incoming[0]
+  }
+  if graph.dominates(header, entry) || !graph.dominates(header, latch) || !graph.dominates(found.block, latch) { return false }
+  let initial = function.block(entry).edgeTo(header)
+  let back = function.block(latch).edgeTo(header)
+  let zero = List<u64>.get(&List<Edge>.asSlice(&function.block(entry).edges)[initial].arguments, counter.index)
+  if !isConstant(&function.*, zero, 0) { return false }
+  let next = List<u64>.get(&List<Edge>.asSlice(&function.block(latch).edges)[back].arguments, counter.index)
+  let step = function.producerOf(next)
+  if step == usize.MAX { return false }
+  if let Operation.Binary {operation: Binary.Add} = function.instruction(step).operation {} else { return false }
+  let terms = function.operandsOf(step)
+  let mut one = terms[1]
+  if terms[1] == index { one = terms[0] }
+  if (terms[0] != index && terms[1] != index) || !isConstant(&function.*, one, 1) { return false }
+  // A constant divisor is already cheap for powers of two. Only carry a dynamic invariant.
+  let def = function.value(divisor)
+  if def.definition != Definition.Argument {
+    let mut owner = def.owner
+    if def.definition == Definition.Result { owner = function.instruction(owner).block }
+    else if def.definition != Definition.Parameter { return false }
+    if owner == header || !graph.dominates(owner, header) { return false }
+  }
+  if !guarded(&function.*, graph, latch, index, false) || !guarded(&function.*, graph, found.block, divisor, true) { return false }
+  let phase = run function.addParameter(header, kind)
+  let at = List<usize>.length(&function.block(latch).instructions)
+  let advanced = run function.insertInstruction(latch, at, Operation.Binary {operation: Binary.Add}, kind, &[phase, one], found.place)
+  let wrap = run function.insertInstruction(latch, at + usize.ONE, Operation.Compare {predicate: Predicate.Eq}, Kind.flag(), &[advanced, divisor], found.place)
+  let carried = run function.insertInstruction(latch, at + 2, Operation.Select, kind, &[wrap, zero, advanced], found.place)
+  run function.appendArgument(entry, initial, zero)
+  run function.appendArgument(latch, back, carried)
+  run function.replaceAllUses(found.result, phase)
+  function.remove(instruction)
+  return true
+}
+
+/// Replaces guarded remainders of unit-step loop counters by a rolling index.
+pub effect fn reduceRemainders(function: &mut SsaFunction, graph: &SsaGraph) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut changed = false
+  let count = function.instructionCount()
+  let mut at = usize.ZERO
+  while at < count {
+    let found = function.instruction(at)
+    if !found.removed {
+      if let Operation.Binary {operation: Binary.URem} = found.operation {
+        if function.value(function.operandsOf(at)[0]).definition == Definition.Parameter {
+          if graph.reaches(found.block) && run carryRemainder(&mut function.*, graph, at) { changed = true }
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+  if changed { function.sweep() }
+  return changed
 }

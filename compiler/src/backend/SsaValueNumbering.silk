@@ -42,8 +42,11 @@ import backend.SsaFolding {isIntegerPredicate}
 import backend.SsaFunction {
   Binary,
   Cast,
+  Count,
   Edge,
   Exit,
+  Extreme,
+  Kind,
   Operation,
   Predicate,
   SsaFunction,
@@ -51,11 +54,15 @@ import backend.SsaFunction {
   none,
 }
 import backend.SsaGraph {SsaGraph}
+import backend.SsaInduction
+import backend.SsaMemory
+import backend.SsaInduction {Counter, incrementOf}
 import silk.collections.list {List}
 import silk.core.option {Option}
 import silk.core.ownership {Copy}
 import silk.mem.allocator {Allocator, OutOfMemoryError}
 import silk.num.i64
+import silk.num.u32
 import silk.num.u64
 import silk.num.usize
 
@@ -96,6 +103,9 @@ struct Numbering {
   // The value each value equals in the blocks the walk is in, by value, or `none()`.
   known: List<u64>,
   knownLog: List<Known>,
+  escaped: List<bool>,
+  // Indexed bases with neighbors at a negative displacement.
+  biased: List<bool>,
   facts: List<Fact>,
   buckets: List<usize>,
   entries: List<Entry>,
@@ -110,11 +120,28 @@ pub effect fn number(function: &mut SsaFunction) -> bool ! OutOfMemoryError ? &m
   let graph = run SsaGraph.of(&function.*)
   let mut size: usize = 16
   while size < function.instructionCount() * 2 { size = size * 2 }
-  let mut state = Numbering {substitution: List<u64>.make(), known: List<u64>.make(), knownLog: List<Known>.make(), facts: List<Fact>.make(),
+  let mut state = Numbering {substitution: List<u64>.make(), known: List<u64>.make(), knownLog: List<Known>.make(), escaped: List<bool>.make(), biased: List<bool>.make(), facts: List<Fact>.make(),
     buckets: List<usize>.make(), entries: List<Entry>.make(), trueFlag: none(), falseFlag: none(), changed: false}
   run List<usize>.appendRepeated(&mut state.buckets, usize.MAX, size)
   run List<u64>.appendRepeated(&mut state.substitution, none(), function.valueCount())
   run List<u64>.appendRepeated(&mut state.known, none(), function.valueCount())
+  let mut id = usize.ZERO
+  while id < function.instructionCount() {
+    if function.instruction(id).removed { id = id + usize.ONE continue }
+    if let Operation.Offset {offset} = function.instruction(id).operation {
+      if masked(offset, function.addressBits) > u64.shiftRight(masked(u64.MAX, function.addressBits), 1) {
+        let base = function.operandsOf(id)[usize.ZERO]
+        let producer = function.producerOf(base)
+        if producer != usize.MAX {
+          if let Operation.Index = function.instruction(producer).operation {
+            if List<bool>.length(&state.biased) == usize.ZERO { run List<bool>.appendRepeated(&mut state.biased, false, function.valueCount()) }
+            List<bool>.set(&mut state.biased, u64.toUsize(base), true)
+          }
+        }
+      }
+    }
+    id = id + usize.ONE
+  }
   // Entries: a block to enter, or `usize.MAX - n` to leave the n-th mark.
   let mut marks = List<usize>.make()
   let mut walk = List<usize>.make()
@@ -133,8 +160,13 @@ pub effect fn number(function: &mut SsaFunction) -> bool ! OutOfMemoryError ? &m
     run List<usize>.append(&mut marks, List<Known>.length(&state.knownLog))
     run List<usize>.append(&mut marks, List<Fact>.length(&state.facts))
     run List<usize>.append(&mut walk, usize.MAX - mark)
+    if let Option<Counter>.Some {value: counter} = SsaInduction.find(&function.*, &graph, block) {
+      run List<Fact>.append(&mut state.facts, Fact {predicate: Predicate.Uge, left: counter.value, right: counter.initial, truth: true})
+      run List<Fact>.append(&mut state.facts, Fact {predicate: Predicate.Ule, left: counter.value, right: counter.limit, truth: true})
+    }
     run learnFromPredecessor(&mut state, &mut function.*, &graph, block)
     run visitBlock(&mut state, &mut function.*, block)
+    run selectPrivateStore(&mut state, &mut function.*, &graph, block)
     run hoistShared(&mut state, &mut function.*, &graph, block)
     let children = graph.childrenOf(block)
     let mut child = children.length
@@ -145,6 +177,76 @@ pub effect fn number(function: &mut SsaFunction) -> bool ! OutOfMemoryError ? &m
   }
   function.sweep()
   return state.changed
+}
+
+// Replace a guarded update of a private array element with a select and store.
+// The immediately preceding load supplies the value to store when the update is
+// skipped. Check the entire byte range and exclude escaped slots: a newly
+// executed store must not be observable through an alias on another thread.
+effect fn selectPrivateStore(state: &mut Numbering, function: &mut SsaFunction, graph: &SsaGraph, block: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let head = function.block(block)
+  if head.exit != Exit.Branch || function.isConstant(head.value) { return () }
+  let listed = List<usize>.asSlice(&head.instructions)
+  if listed.length < 2 { return () }
+  let test = listed[listed.length - usize.ONE]
+  let load = listed[listed.length - 2]
+  let cond = head.value
+  if function.producerOf(cond) != test { return () }
+  if let Operation.Compare {..} = function.instruction(test).operation {} else { return () }
+  let aligned = match function.instruction(load).operation {
+    Operation.Load {offset, alignment} => { if offset != 0 { return () } alignment }
+    _ => { return () }
+  }
+  let original = function.instruction(load).result
+  let kind = function.kindOf(original)
+  if !kind.isInteger() || kind.isVector() || kind.bits != kind.storeSize() * 8 { return () }
+  let target = function.operandsOf(load)[usize.ZERO]
+  let producer = function.producerOf(target)
+  if producer == usize.MAX { return () }
+  if let Operation.Index = function.instruction(producer).operation {} else { return () }
+  let indexed = function.operandsOf(producer)
+  if function.kindOf(indexed[usize.ONE]).bits != function.addressBits { return () }
+  let base = function.producerOf(indexed[usize.ZERO])
+  if base == usize.MAX { return () }
+  let slot = match function.instruction(base).operation { Operation.SlotAddress {slot: which} => which _ => { return () } }
+  let edges = List<Edge>.asSlice(&head.edges)
+  let mut arm = usize.ZERO
+  while arm < 2 {
+    let side = arm
+    arm = arm + usize.ONE
+    let writes = edges[side].block
+    let next = edges[usize.ONE - side].block
+    let path = function.block(writes)
+    if writes == next || writes == block || graph.predecessorsOf(writes).length != usize.ONE || path.exit != Exit.Jump
+      || List<u64>.length(&path.parameters) != usize.ZERO || List<usize>.length(&path.instructions) != usize.ONE { continue }
+    let out = List<Edge>.asSlice(&path.edges)
+    if out[usize.ZERO].block != next || List<u64>.length(&function.block(next).parameters) != usize.ZERO { continue }
+    let store = List<usize>.get(&path.instructions, usize.ZERO)
+    if let Operation.Store {offset, ..} = function.instruction(store).operation { if offset != 0 { continue } } else { continue }
+    let args = function.operandsOf(store)
+    let value = args[usize.ZERO]
+    if args[usize.ONE] != target || !function.kindOf(value).equals(kind) { continue }
+    let compare = function.operandsOf(test)
+    if !(compare[usize.ZERO] == value && compare[usize.ONE] == original) && !(compare[usize.ONE] == value && compare[usize.ZERO] == original) { continue }
+    let bytes = function.slot(slot).size
+    let width = usize.toU64(kind.storeSize())
+    let bounds = rangeOf(&state.*, &function.*, indexed[usize.ONE], rangeDepth())
+    if width > bytes || bounds.high > bytes - width { return () }
+    if List<bool>.length(&state.escaped) == usize.ZERO { state.escaped = run SsaMemory.escapedSlots(&function.*) }
+    if List<bool>.get(&state.escaped, slot) { return () }
+    let at = listed.length
+    let place = function.instruction(store).place
+    let mut yes = value
+    let mut no = original
+    if side == usize.ONE { yes = original no = value }
+    let result = run function.insertInstruction(block, at, Operation.Select, kind, &[cond, yes, no], place)
+    drop run function.insertInstruction(block, at + usize.ONE, Operation.Store {offset: 0, alignment: aligned}, Kind.unit(), &[result, target], place)
+    let skip = run flagOf(&mut state.*, &mut function.*, side == usize.ONE)
+    function.setExitValue(block, skip)
+    state.changed = true
+    return ()
+  }
+  return ()
 }
 
 // Moves to the end of `block`, which the walk has just numbered, the instructions of the two
@@ -378,6 +480,7 @@ effect fn visitBlock(state: &mut Numbering, function: &mut SsaFunction, block: u
     // Instructions a truncation is rewritten into go before it and are numbered next time.
     let mut added = run narrowThrough(&mut state.*, &mut function.*, block, at, instruction)
     added = added + run uncheck(&mut state.*, &mut function.*, block, at + added, instruction)
+    added = added + run foldIndexedAccess(&mut state.*, &mut function.*, block, at + added, instruction)
     at = at + added
     count = count + added
     run visitInstruction(&mut state.*, &mut function.*, instruction)
@@ -409,6 +512,69 @@ effect fn visitBlock(state: &mut Numbering, function: &mut SsaFunction, block: u
     edge = edge + usize.ONE
   }
   return ()
+}
+
+// Fold a fixed neighbor displacement into the Wasm memory immediate when the full
+// access is proven to stay in a stack slot. The immediate adds without wrapping.
+// For negative displacements, subtract the index's lower bound from the shared
+// address so neighboring accesses can use positive immediates from that address.
+effect fn foldIndexedAccess(state: &mut Numbering, function: &mut SsaFunction, block: usize, position: usize, instruction: usize) -> usize
+! OutOfMemoryError ? &mut Allocator {
+  let found = function.instruction(instruction)
+  let mut operand = usize.ZERO
+  let mut size = usize.toU64(found.kind.storeSize())
+  let alignment = match found.operation {
+    Operation.Load {offset, alignment: aligned} => { if offset != 0 { return usize.ZERO } aligned }
+    Operation.Store {offset, alignment: aligned} => {
+      if offset != 0 { return usize.ZERO }
+      operand = usize.ONE
+      size = usize.toU64(function.kindOf(function.operandsOf(instruction)[usize.ZERO]).storeSize())
+      aligned
+    }
+    _ => { return usize.ZERO }
+  }
+  let pointer = function.operandsOf(instruction)[operand]
+  let moved = function.producerOf(pointer)
+  if moved == usize.MAX { return usize.ZERO }
+  let mut delta: u64 = 0
+  let mut base = pointer
+  if let Operation.Offset {offset} = function.instruction(moved).operation {
+    delta = offset
+    base = function.operandsOf(moved)[usize.ZERO]
+  }
+  let biased = u64.toUsize(base) < List<bool>.length(&state.biased) && List<bool>.get(&state.biased, u64.toUsize(base))
+  if delta == 0 && !biased { return usize.ZERO }
+  let index = function.producerOf(base)
+  if index == usize.MAX { return usize.ZERO }
+  if let Operation.Index = function.instruction(index).operation {} else { return usize.ZERO }
+  let args = function.operandsOf(index)
+  let stack = function.producerOf(args[usize.ZERO])
+  if stack == usize.MAX { return usize.ZERO }
+  let slot = match function.instruction(stack).operation { Operation.SlotAddress {slot: which} => which _ => { return usize.ZERO } }
+  if function.kindOf(args[usize.ONE]).bits != function.addressBits { return usize.ZERO }
+  let bounds = rangeOf(&state.*, &function.*, args[usize.ONE], rangeDepth())
+  let bytes = function.slot(slot).size
+  if bounds.high > bytes { return usize.ZERO }
+  let low = masked(u64.wrappingAdd(bounds.low, delta), function.addressBits)
+  let span = bounds.high - bounds.low
+  if low > bytes || span > bytes - low || size > bytes - low - span { return usize.ZERO }
+  let mut added = usize.ZERO
+  let mut address = base
+  let mut immediate = delta
+  if delta > low || (biased && bounds.low != 0) {
+    if low == 0 { return usize.ZERO }
+    let back = masked(u64.wrappingSubtract(0, bounds.low), function.addressBits)
+    let pointerKind = function.kindOf(base)
+    address = run function.insertInstruction(block, position, Operation.Offset {offset: back}, pointerKind, &[base], found.place)
+    added = usize.ONE
+    immediate = low
+  }
+  if address == pointer && immediate == 0 { return usize.ZERO }
+  function.setOperand(instruction, operand, address)
+  if operand == usize.ZERO { function.setOperation(instruction, Operation.Load {offset: immediate, alignment: alignment}) }
+  else { function.setOperation(instruction, Operation.Store {offset: immediate, alignment: alignment}) }
+  state.changed = true
+  return added
 }
 
 // Truncates before a difference from a constant instead of after it: `trunc(c - y)` is
@@ -537,6 +703,28 @@ effect fn uncheck(state: &mut Numbering, function: &mut SsaFunction, block: usiz
         if operation == Binary.Add { fits = first.high <= most - second.high }
         if operation == Binary.Sub { fits = first.low >= second.high }
         if operation == Binary.Mul { fits = first.high == 0 || second.high <= most / first.high }
+      }
+    }
+    if !fits && !signed && operation == Binary.Mul {
+      let mut multiplier = right
+      let mut input = left
+      if !function.isBits(multiplier) { multiplier = left input = right }
+      // An unsigned square fits an even-width result up to a low-half mask.
+      let mut limit = u64.MAX
+      if left == right && kind.bits % 2 == 0 {
+        limit = masked(u64.MAX, kind.bits / 2)
+      } else if function.isBits(multiplier) && function.constantOf(multiplier).low != 0 {
+        limit = masked(u64.MAX, kind.bits) / function.constantOf(multiplier).low
+      }
+      if limit != u64.MAX {
+        let bound = run function.integer(kind.bits, limit)
+        let product = run function.insertInstruction(block, position, Operation.Binary {operation: Binary.Mul}, kind, &[input, multiplier], found.place)
+        let over = run function.insertInstruction(block, position + usize.ONE, Operation.Compare {predicate: Predicate.Ugt}, Kind.flag(),
+          &[input, bound], found.place)
+        run replace(&mut state.*, found.result, product)
+        run replace(&mut state.*, found.result + 1, over)
+        function.remove(instruction)
+        return 2
       }
     }
     if !fits { return usize.ZERO }
@@ -672,6 +860,62 @@ pub fn implies(known: Predicate, asked: Predicate) -> bool {
   }
 }
 
+// Whether `value` is an unsigned scalar remainder by `divisor`. If it produced a value,
+// the divisor was nonzero and the result is strictly below it.
+fn remainderBy(function: &SsaFunction, value: u64, divisor: u64) -> bool {
+  let producer = function.producerOf(value)
+  if producer == usize.MAX { return false }
+  if let Operation.Binary {operation: Binary.URem} = function.instruction(producer).operation {
+    let kind = function.kindOf(value)
+    return kind.isInteger() && !kind.isVector() && function.operandsOf(producer)[usize.ONE] == divisor
+  }
+  return false
+}
+
+// Compare a selected value with one of its alternatives. On one path the two
+// are equal. On the other the selection's own comparison orders them.
+fn selectedBound(function: &SsaFunction, value: u64, bound: u64, asked: Predicate) -> usize {
+  let id = function.producerOf(value)
+  if id == usize.MAX || function.kindOf(value).isVector() { return usize.MAX }
+  let args = function.operandsOf(id)
+  let mut known = Predicate.Eq
+  match function.instruction(id).operation {
+    Operation.Select => {
+      let test = function.producerOf(args[0])
+      if test == usize.MAX { return usize.MAX }
+      known = match function.instruction(test).operation {
+        Operation.Compare {predicate} => predicate
+        _ => { return usize.MAX }
+      }
+      if !isIntegerPredicate(known) { return usize.MAX }
+      let mut other = args[1]
+      if args[2] != bound {
+        if args[1] != bound { return usize.MAX }
+        known = inverse(known)
+        other = args[2]
+      }
+      let cmp = function.operandsOf(test)
+      if cmp[0] == bound && cmp[1] == other { known = swapped(known) }
+      else if cmp[0] != other || cmp[1] != bound { return usize.MAX }
+    }
+    Operation.Extreme {which} => {
+      if args[0] != bound && args[1] != bound { return usize.MAX }
+      known = match which {
+        Extreme.UnsignedMinimum => Predicate.Ule
+        Extreme.UnsignedMaximum => Predicate.Uge
+        Extreme.SignedMinimum => Predicate.Sle
+        Extreme.SignedMaximum => Predicate.Sge
+        _ => { return usize.MAX }
+      }
+    }
+    _ => { return usize.MAX }
+  }
+  if implies(Predicate.Eq, asked) && implies(known, asked) { return usize.ONE }
+  let opposite = inverse(asked)
+  if implies(Predicate.Eq, opposite) && implies(known, opposite) { return usize.ZERO }
+  return usize.MAX
+}
+
 // 1 when a known fact proves comparison `instruction` holds, 0 when it proves it does not, else
 // `usize.MAX`.
 fn decidedByFacts(state: &Numbering, function: &SsaFunction, instruction: usize) -> usize {
@@ -683,6 +927,17 @@ fn decidedByFacts(state: &Numbering, function: &SsaFunction, instruction: usize)
   let operands = function.operandsOf(instruction)
   let left = operands[usize.ZERO]
   let right = operands[usize.ONE]
+  let leftBound = selectedBound(function, left, right, asked)
+  if leftBound != usize.MAX { return leftBound }
+  let rightBound = selectedBound(function, right, left, swapped(asked))
+  if rightBound != usize.MAX { return rightBound }
+  let leftIsRemainder = remainderBy(function, left, right)
+  if leftIsRemainder || remainderBy(function, right, left) {
+    let mut known = Predicate.Ugt
+    if leftIsRemainder { known = Predicate.Ult }
+    if implies(known, asked) { return usize.ONE }
+    if implies(known, inverse(asked)) { return usize.ZERO }
+  }
   let facts = List<Fact>.asSlice(&state.facts)
   let mut at = facts.length
   let mut seen = usize.ZERO
@@ -783,16 +1038,13 @@ fn rangeOf(state: &Numbering, function: &SsaFunction, value: u64, depth: usize) 
           range = Range {low: u64.shiftRight(first.low, second.low), high: u64.shiftRight(first.high, second.low)}
         }
         if operation == Binary.URem && second.low > 0 { range.high = second.high - 1 }
-        // A sum or difference with a constant that cannot wrap moves the range.
-        if operation == Binary.Add && second.low == second.high && first.high <= most - second.low {
-          range = Range {low: first.low + second.low, high: first.high + second.low}
+        // When every endpoint stays in the kind, addition and subtraction are monotone
+        // in each operand. This also bounds row * stride + column for two bounded indices.
+        if operation == Binary.Add && first.high <= most - second.high {
+          range = Range {low: first.low + second.low, high: first.high + second.high}
         }
-        if operation == Binary.Sub && second.low == second.high && first.low >= second.low {
-          range = Range {low: first.low - second.low, high: first.high - second.low}
-        }
-        // A constant less a value that cannot pass it.
-        if operation == Binary.Sub && first.low == first.high && second.high <= first.low && second.low != second.high {
-          range = Range {low: first.low - second.high, high: first.low - second.low}
+        if operation == Binary.Sub && first.low >= second.high {
+          range = Range {low: first.low - second.high, high: first.high - second.low}
         }
       }
       Operation.Cast {operation} => {
@@ -803,6 +1055,21 @@ fn rangeOf(state: &Numbering, function: &SsaFunction, value: u64, depth: usize) 
             // A truncation keeps a value that already fits.
             if source.high <= most { range = source }
           }
+        }
+      }
+      Operation.Count {which} => {
+        let input = rangeOf(state, function, operands[usize.ZERO], depth - cost)
+        let width = usize.toU64(kind.bits)
+        let used = 64 - u32.toU64(u64.leadingZeros(input.high))
+        if which == Count.LeadingZeros {
+          range.low = width - used
+          range.high = u32.toU64(u64.leadingZeros(input.low)) - (64 - width)
+        } else if which == Count.Ones {
+          range.high = used
+          if input.low > 0 { range.low = 1 }
+        } else {
+          range.high = width
+          if input.low > 0 { range.high = used - 1 }
         }
       }
       Operation.Compare {..} => { range.high = 1 }
@@ -829,7 +1096,19 @@ fn rangeOf(state: &Numbering, function: &SsaFunction, value: u64, depth: usize) 
       bound = fact.left
       holding = swapped(holding)
     }
-    if bound == none() || function.kindOf(bound).bits > 64 { continue }
+    if bound == none() {
+      // With x < y, x cannot be the largest unsigned value and y cannot be zero.
+      // This also bounds an ascending or descending index before its unit step.
+      if holding == Predicate.Ult || holding == Predicate.Ugt {
+        let mut smaller = left
+        let mut larger = right
+        if holding == Predicate.Ugt { smaller = right larger = left }
+        if value == smaller && range.high == most { range.high = most - 1 }
+        if value == larger && range.low == 0 { range.low = 1 }
+      }
+      continue
+    }
+    if function.kindOf(bound).bits > 64 { continue }
     let limit = masked(function.constantOf(bound).low, function.kindOf(bound).bits)
     if holding == Predicate.Ult && limit > 0 && limit - 1 < range.high { range.high = limit - 1 }
     if holding == Predicate.Ule && limit < range.high { range.high = limit }
@@ -837,6 +1116,9 @@ fn rangeOf(state: &Numbering, function: &SsaFunction, value: u64, depth: usize) 
     if holding == Predicate.Uge && limit <= most && limit > range.low { range.low = limit }
     if holding == Predicate.Eq && limit <= most { range = Range {low: limit, high: limit} }
   }
+  // Contradictory path facts describe an unreachable block. Keep the endpoints ordered
+  // before a caller uses them in checked host arithmetic.
+  if range.low > range.high { return Range {low: 0, high: most} }
   return range
 }
 
@@ -1030,6 +1312,25 @@ fn signedRangeOf(state: &Numbering, function: &SsaFunction, value: u64, depth: u
   return range
 }
 
+// An unsigned sum is smaller than either addend exactly when the addition wraps.
+fn carryOf(state: &Numbering, function: &SsaFunction, sum: u64, addend: u64, bounds: Range) -> usize {
+  let producer = function.producerOf(sum)
+  if producer == usize.MAX { return usize.MAX }
+  if let Operation.Binary {operation: Binary.Add} = function.instruction(producer).operation {
+    let args = function.operandsOf(producer)
+    let mut other = args[usize.ONE]
+    if args[usize.ZERO] != addend {
+      if args[usize.ONE] != addend { return usize.MAX }
+      other = args[usize.ZERO]
+    }
+    let rest = rangeOf(state, function, other, rangeDepth())
+    let most = masked(u64.MAX, function.kindOf(sum).bits)
+    if rest.high <= most - bounds.high { return usize.ZERO }
+    if rest.low > most - bounds.low { return usize.ONE }
+  }
+  return usize.MAX
+}
+
 // 1 when the unsigned ranges of `left` and `right` prove `left asked right`, 0 when they prove it
 // does not hold, else `usize.MAX`: a bounds check against a constant that an earlier, tighter
 // check or a mask already answers, and the range check of a conversion whose source fits.
@@ -1068,6 +1369,7 @@ fn decidedByRanges(state: &Numbering, function: &SsaFunction, asked: Predicate, 
   if asked == Predicate.Ult {
     if first.high < second.low { return usize.ONE }
     if first.low >= second.high { return usize.ZERO }
+    return carryOf(state, function, left, right, second)
   }
   if asked == Predicate.Ule {
     if first.high <= second.low { return usize.ONE }
@@ -1076,6 +1378,7 @@ fn decidedByRanges(state: &Numbering, function: &SsaFunction, asked: Predicate, 
   if asked == Predicate.Ugt {
     if first.low > second.high { return usize.ONE }
     if first.high <= second.low { return usize.ZERO }
+    return carryOf(state, function, right, left, first)
   }
   if asked == Predicate.Uge {
     if first.low >= second.high { return usize.ONE }
@@ -1085,23 +1388,6 @@ fn decidedByRanges(state: &Numbering, function: &SsaFunction, asked: Predicate, 
   if asked == Predicate.Eq && apart { return usize.ZERO }
   if asked == Predicate.Ne && apart { return usize.ONE }
   return usize.MAX
-}
-
-// The value `value` is one more than, when `value` is the sum of a value and the constant one;
-// else `none()`, which no operand is.
-fn incrementOf(function: &SsaFunction, value: u64) -> u64 {
-  let producer = function.producerOf(value)
-  if producer == usize.MAX { return none() }
-  if let Operation.Binary {operation: Binary.Add} = function.instruction(producer).operation {
-    let operands = function.operandsOf(producer)
-    if function.isBits(operands[usize.ONE]) && function.constantOf(operands[usize.ONE]).low == 1 && !function.isConstant(operands[usize.ZERO]) {
-      return operands[usize.ZERO]
-    }
-    if function.isBits(operands[usize.ZERO]) && function.constantOf(operands[usize.ZERO]).low == 1 && !function.isConstant(operands[usize.ONE]) {
-      return operands[usize.ONE]
-    }
-  }
-  return none()
 }
 
 // A tag per operation variant and its immediates, for the hash.
