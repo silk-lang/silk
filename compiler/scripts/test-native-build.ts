@@ -3363,15 +3363,17 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   const escapedOrder = yield* invoke(silk, ['build', '--stdlib', standardLibrary], ordered, { ...process.env, SILK_CLANG: clang })
   assert.equal(escapedOrder.status, 1, escapedOrder.stderr)
   assert.match(escapedOrder.stderr, /build\.silk computes no plan:/)
+  // The linked executable's Silk functions by the name its symbol table gives them, with their
+  // addresses: a declaration as an order file lists it (`ElfNames`), or a runtime `silk_` symbol.
   const functionAddresses = Effect.fnUntraced(function* (executable: string) {
     const listed = yield* invoke(join(dirname(clang), 'llvm-nm'), ['--defined-only', executable], ordered)
     assert.equal(listed.status, 0, listed.stderr)
-    const addresses = new Map<string, bigint>()
+    const functions: Array<[string, bigint]> = []
     for (const line of listed.stdout.split('\n')) {
-      const symbol = /^([0-9a-f]+) [tT] _?(silk_\S+)$/.exec(line)
-      if (symbol) addresses.set(symbol[2], BigInt(`0x${symbol[1]}`))
+      const symbol = /^([0-9a-f]+) [tT] _?(\S+)$/.exec(line)
+      if (symbol && (symbol[2].includes('::') || symbol[2].startsWith('silk_'))) functions.push([symbol[2], BigInt(`0x${symbol[1]}`)])
     }
-    return addresses
+    return functions
   })
   for (const profile of [[], ['--release']]) {
     const executable = join(ordered, `build/${hostTarget}/${profile.length === 0 ? 'dev' : 'release'}/ordered`)
@@ -3381,43 +3383,47 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
       return yield* functionAddresses(executable)
     })
     yield* writePlan(ordered, '')
-    const unordered = [...(yield* orderedBuild()).entries()].sort((left, right) => (left[1] < right[1] ? -1 : 1))
-    assert.ok(unordered.length > 2, `${profile}: too few Silk functions to order`)
-    // The two functions linked last, listed in reverse.
-    const last = unordered[unordered.length - 1][0]
-    const beforeLast = unordered[unordered.length - 2][0]
-    const placedFirst = (addresses: Map<string, bigint>, first: string, second: string) => {
-      const firstAddress = addresses.get(first) ?? 0n
-      const secondAddress = addresses.get(second) ?? 0n
+    const unordered = [...(yield* orderedBuild())].sort((left, right) => (left[1] < right[1] ? -1 : 1))
+    // The symbol map's rows, and its declarations as the symbol table names them: without the
+    // package's version.
+    const symbolMap = (yield* fs.readFileString(`${executable}.symbols`)).split('\n').map((line) => line.split('\t'))
+    const named = (declaration: string) => declaration.replace(/^([^@:]*)@[^:]*:/, '$1:')
+    const symbolsOf = (name: string) => symbolMap.filter((row) => row.length === 3 && named(row[2]) === name).map((row) => row[0])
+    // A function the symbol table names once and the map gives one symbol, so its symbol orders it alone.
+    const single = unordered.filter(([name]) =>
+      unordered.filter(([other]) => other === name).length === 1 && symbolsOf(name).length === 1)
+    assert.ok(single.length > 2, `${profile}: too few Silk functions to order`)
+    const placedFirst = (functions: Array<[string, bigint]>, first: string, second: string) => {
+      const firstAddress = functions.find(([name]) => name === first)?.[1] ?? 0n
+      const secondAddress = functions.find(([name]) => name === second)?.[1] ?? 0n
       assert.ok(firstAddress < secondAddress, `${profile}: ${first} is not placed before ${second}`)
-      for (const [name, address] of addresses) {
+      for (const [name, address] of functions) {
         if (name !== first && name !== second) assert.ok(secondAddress < address, `${profile}: ${name} is placed before the listed functions`)
       }
     }
-    yield* fs.writeFileString(join(ordered, 'order.txt'), `# startup\n\n  ${last}  \n${beforeLast}\n`)
+    // The two such functions linked last, listed in reverse by symbol.
+    const last = single[single.length - 1][0]
+    const beforeLast = single[single.length - 2][0]
+    yield* fs.writeFileString(join(ordered, 'order.txt'), `# startup\n\n  ${symbolsOf(last)[0]}  \n${symbolsOf(beforeLast)[0]}\n`)
     yield* writePlan(ordered, '  plan = Plan.functionOrder(plan, sourcePath("order.txt"))')
     placedFirst(yield* orderedBuild(), last, beforeLast)
-    yield* fs.writeFileString(join(ordered, 'order.txt'), `${beforeLast}\n${last}\n`)
+    yield* fs.writeFileString(join(ordered, 'order.txt'), `${symbolsOf(beforeLast)[0]}\n${symbolsOf(last)[0]}\n`)
     placedFirst(yield* orderedBuild(), beforeLast, last)
-    // A declaration, as the `.symbols` map's third column spells it, orders every symbol of that
-    // declaration; an entry that names nothing this build emits is reported as a note.
-    const symbolMap = (yield* fs.readFileString(`${executable}.symbols`)).split('\n').map((line) => line.split('\t'))
-    // The latest-placed function that belongs to a Silk declaration; runtime entries such as
-    // `silk_gnu_initialize` have none.
-    const declarationOf = (symbol: string) => symbolMap.find((row) => row[0] === symbol)?.[2] ?? ''
-    const latest = [...unordered].reverse().find(([symbol]) => declarationOf(symbol).includes('::'))
-    assert.ok(latest !== undefined, `${profile}: no linked function has a declaration in the symbol map`)
-    const declaration = declarationOf(latest[0])
-    const declared = new Set(symbolMap.filter((row) => row[2] === declaration).map((row) => row[0]))
+    // A declaration as the symbol table names it orders every symbol of that declaration; an entry
+    // that names nothing this build emits is reported as a note. Runtime entries such as
+    // `silk_gnu_initialize` keep their symbol and have no declaration.
+    const latest = [...unordered].reverse().find(([name]) => name.includes('::'))
+    assert.ok(latest !== undefined, `${profile}: no linked function is named by its declaration`)
+    const declaration = latest[0]
     yield* fs.writeFileString(join(ordered, 'order.txt'), `${declaration}\nsilk_00000000000000000000000000000000\n`)
     const byDeclaration = yield* invoke(silk, ['build', '--stdlib', standardLibrary, ...profile], ordered, { ...process.env, SILK_CLANG: clang })
     assert.equal(byDeclaration.status, 0, byDeclaration.stderr)
     assert.match(byDeclaration.stderr, /silk: note: 1 of 2 entries in .*order\.txt name no function of this build/)
     const declaredAddresses = yield* functionAddresses(executable)
     let latestDeclared = 0n
-    for (const [name, address] of declaredAddresses) if (declared.has(name) && address > latestDeclared) latestDeclared = address
+    for (const [name, address] of declaredAddresses) if (name === declaration && address > latestDeclared) latestDeclared = address
     for (const [name, address] of declaredAddresses) {
-      if (!declared.has(name)) assert.ok(latestDeclared < address, `${profile}: ${name} is placed before ${declaration}`)
+      if (name !== declaration) assert.ok(latestDeclared < address, `${profile}: ${name} is placed before ${declaration}`)
     }
   }
   // Each profile keeps its own cache file, and a file per profile names it, so the next build in

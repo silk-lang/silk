@@ -73,5 +73,7 @@ A name that starts with `_` is never reported, so `let _guard = lock()` keeps a 
 end of its block without a warning. To discard a result at once, write `drop` instead (STMT-001).
 
 **Diagnostics:** `SEM0255` is a warning. Like every warning, it fails `silk check`, `silk build`
-and `silk test` unless `--ignore-warnings` is given. Only the root package's modules are reported, a
-module with syntax errors reports none, `silk build` reports them only when it has no error, and the language server marks the name unnecessary, which editors show faded.
+and `silk test` unless `--ignore-warnings` is given. The root package's modules are reported, and
+so are those of every dependency read by a `path`; a git or archive dependency's modules are not. A
+module with syntax errors reports none, `silk build` reports them only when it has no error, and
+the language server marks the name unnecessary, which editors show faded.

@@ -990,7 +990,9 @@ kind = "library"
 ```
 
 The source root is `[package].source`, `src` when the manifest omits it. The root module is
-`[package].main` below the source root, by default `main.silk`, or `lib.silk` for a library kind.
+`[package].main` below the source root, by default `main.silk`, or `lib.silk` for a library kind. A
+library kind that writes no `main` and has no `lib.silk` is rooted at the first module its `exports`
+lists (PACKAGE-006), so a library made only of exported modules needs no root file of its own.
 `[package].kind` is `executable` (the default), `library` (Silk source for other packages, which a
 build checks and makes no artifact for), `static-library`, `shared-library` or `object`. The version
 defaults to `0.0.0`. A name starts with a lowercase letter and holds lowercase letters, digits,
@@ -1358,7 +1360,8 @@ publishes one, is not reported either, because method syntax and `Type.operation
 interface's operations through it without spelling it. Like every warning, `MOD0007` fails
 `silk check`, `silk build` and `silk test` unless `--ignore-warnings` is given.
 
-Only the root package's modules are reported, a module with syntax errors reports none,
-`silk build` reports them only when the build succeeds, and a binding inside an error's span, such
-as an import of a missing module, reports only the error. The language server marks the binding
-unnecessary, which editors show faded. Imports themselves have no runtime behavior.
+The root package's modules are reported, and so are those of every dependency read by a `path`,
+which is the author's own code; a git or archive dependency's modules are not. A module with syntax
+errors reports none, `silk build` reports them only when the build succeeds, and a binding inside an
+error's span, such as an import of a missing module, reports only the error. The language server
+marks the binding unnecessary, which editors show faded. Imports themselves have no runtime behavior.
