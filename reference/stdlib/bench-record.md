@@ -19,6 +19,10 @@ Both types are `silk.schema.schema.Schema` types, written as JSON with
 Times are nanoseconds and memory is bytes. A raw sample holds whole numbers; the statistics
 of a report are `f64`. Dates are RFC 3339 text in UTC, such as `2026-11-19T14:03:22Z`.
 
+A program that prints result lines is measured by what it reports, not by its process: each
+line is a [`Reading`](#Reading), and a report gives every name the lines carry a table of its own, in
+the unit of the lines.
+
 A run never drops a sample. A warm-up run is kept with `warmup` set, and a run whose program
 failed is kept with its exit status. A report counts the failed runs of a row in `failures`
 and leaves both kinds out of its statistics.
@@ -68,7 +72,7 @@ pub fn main() -> i32 {
 
 Import as `Report` with `import silk.bench.record { Report }`.
 
-Public declarations: 12.
+Public declarations: 14.
 
 <a id="PROTOCOL"></a>
 
@@ -394,6 +398,133 @@ The signal that ended the program, or 0.
 impl Schema for Sample
 ```
 
+<a id="Metric"></a>
+
+## `Metric`
+
+```silk
+pub struct Metric
+```
+
+One value of a reading with its unit.
+
+<a id="Metric.unit"></a>
+
+### Field `unit`
+
+```silk
+pub unit: String
+```
+
+The unit as the program wrote it, such as `ns/op`, `B/op` or `req/s`.
+
+<a id="Metric.value"></a>
+
+### Field `value`
+
+```silk
+pub value: f64
+```
+
+The value, for one iteration.
+
+<a id="Metric.impl.Schema"></a>
+
+## Implementation `Schema for Metric`
+
+```silk
+impl Schema for Metric
+```
+
+<a id="Reading"></a>
+
+## `Reading`
+
+```silk
+pub struct Reading
+```
+
+One sample a program reported as a result line, as `silk.bench.lines` reads it.
+
+<a id="Reading.name"></a>
+
+### Field `name`
+
+```silk
+pub name: String
+```
+
+The name the program gave the sample, without the leading `Benchmark`.
+
+<a id="Reading.implementation"></a>
+
+### Field `implementation`
+
+```silk
+pub implementation: String
+```
+
+The name of the implementation whose run printed the line.
+
+<a id="Reading.round"></a>
+
+### Field `round`
+
+```silk
+pub round: u64
+```
+
+The round of the run that printed the line, from 0.
+
+<a id="Reading.warmup"></a>
+
+### Field `warmup`
+
+```silk
+pub warmup: bool
+```
+
+Whether that run was a warm-up, which statistics leave out.
+
+<a id="Reading.iterations"></a>
+
+### Field `iterations`
+
+```silk
+pub iterations: u64
+```
+
+The number of iterations the sample covers.
+
+<a id="Reading.values"></a>
+
+### Field `values`
+
+```silk
+pub values: List<Metric>
+```
+
+The values of the sample, in the order the program wrote them.
+
+<a id="Reading.check"></a>
+
+### Field `check`
+
+```silk
+pub check: Option<String>
+```
+
+What the program said it computed, from its last `check:` line before this one. Two
+implementations with different checks for one name did not do the same work.
+
+<a id="Reading.impl.Schema"></a>
+
+## Implementation `Schema for Reading`
+
+```silk
+impl Schema for Reading
+```
+
 <a id="Measured"></a>
 
 ## `Measured`
@@ -402,7 +533,7 @@ impl Schema for Sample
 pub struct Measured
 ```
 
-The samples of one benchmark: one combination of a suite's parameters.
+The samples of one combination of a suite's parameters.
 
 <a id="Measured.name"></a>
 
@@ -433,6 +564,17 @@ pub samples: List<Sample>
 ```
 
 Every run, in the order it happened.
+
+<a id="Measured.readings"></a>
+
+### Field `readings`
+
+```silk
+pub readings: List<Reading>
+```
+
+Every result line the runs printed, in the order they were read. Empty when no
+implementation reports result lines.
 
 <a id="Measured.impl.Schema"></a>
 
@@ -620,7 +762,7 @@ How one implementation compares to the reference on one benchmark.
 pub value: f64
 ```
 
-The median time divided by the reference's median time. 0.5 is twice as fast.
+The median divided by the reference's median. For a time, 0.5 is twice as fast.
 
 <a id="Comparison.low"></a>
 
@@ -698,7 +840,8 @@ Whether this is the reference the other rows are compared to.
 pub runs: u64
 ```
 
-The number of measured runs that succeeded.
+The number of values the statistics cover: the measured runs that succeeded, or the result
+lines those runs printed for this benchmark.
 
 <a id="Row.failures"></a>
 
@@ -718,7 +861,8 @@ The number of measured runs whose program failed. They are in no statistic.
 pub median: f64
 ```
 
-The median time from start to exit, in nanoseconds.
+The median, in the table's unit: for process times, the time from start to exit in
+nanoseconds.
 
 <a id="Row.minimum"></a>
 
@@ -728,7 +872,7 @@ The median time from start to exit, in nanoseconds.
 pub minimum: f64
 ```
 
-The fastest run, in nanoseconds.
+The smallest value, in the table's unit.
 
 <a id="Row.maximum"></a>
 
@@ -738,7 +882,7 @@ The fastest run, in nanoseconds.
 pub maximum: f64
 ```
 
-The slowest run, in nanoseconds.
+The largest value, in the table's unit.
 
 <a id="Row.mean"></a>
 
@@ -748,7 +892,7 @@ The slowest run, in nanoseconds.
 pub mean: f64
 ```
 
-The mean time, in nanoseconds.
+The mean, in the table's unit.
 
 <a id="Row.low"></a>
 
@@ -758,7 +902,7 @@ The mean time, in nanoseconds.
 pub low: f64
 ```
 
-The low end of the 95% interval of the median, in nanoseconds.
+The low end of the 95% interval of the median, in the table's unit.
 
 <a id="Row.high"></a>
 
@@ -768,7 +912,7 @@ The low end of the 95% interval of the median, in nanoseconds.
 pub high: f64
 ```
 
-The high end of the 95% interval of the median, in nanoseconds.
+The high end of the 95% interval of the median, in the table's unit.
 
 <a id="Row.outliers"></a>
 
@@ -788,7 +932,7 @@ How many runs lie far outside the others. They are counted, never removed.
 pub user: f64
 ```
 
-The median processor time in user mode, in nanoseconds.
+The median processor time in user mode, in nanoseconds. 0 in a table of result lines.
 
 <a id="Row.system"></a>
 
@@ -798,7 +942,7 @@ The median processor time in user mode, in nanoseconds.
 pub system: f64
 ```
 
-The median processor time in kernel mode, in nanoseconds.
+The median processor time in kernel mode, in nanoseconds. 0 in a table of result lines.
 
 <a id="Row.peak"></a>
 
@@ -818,8 +962,8 @@ The median peak resident memory, in bytes.
 pub ratio: Option<Comparison>
 ```
 
-The comparison to the reference. Absent for the reference itself and for a row with no
-successful run.
+The comparison to the reference. Absent for the reference itself, for a row with no
+successful run, and in a table whose checks differ.
 
 <a id="Row.times"></a>
 
@@ -829,8 +973,29 @@ successful run.
 pub times: List<f64>
 ```
 
-The time of every successful measured run, in nanoseconds, in the order they ran, for a
-renderer that draws the distribution.
+Every value the statistics cover, in the table's unit, in the order they were measured, for
+a renderer that draws the distribution.
+
+<a id="Row.others"></a>
+
+### Field `others`
+
+```silk
+pub others: List<Metric>
+```
+
+The median of each other unit the row's readings carry, in the order the units first
+appear. Empty for a table of process times.
+
+<a id="Row.check"></a>
+
+### Field `check`
+
+```silk
+pub check: Option<String>
+```
+
+What the implementation said it computed, when its readings carry a check.
 
 <a id="Row.impl.Schema"></a>
 
@@ -869,6 +1034,38 @@ pub parameters: List<Pair>
 ```
 
 The parameters of the benchmark.
+
+<a id="Table.unit"></a>
+
+### Field `unit`
+
+```silk
+pub unit: String
+```
+
+The unit of the statistics of the rows: `ns` for the time of a whole process, or the unit
+of the result lines, such as `ns/op` or `req/s`.
+
+<a id="Table.higher"></a>
+
+### Field `higher`
+
+```silk
+pub higher: bool
+```
+
+Whether a larger value is better, as for `req/s`. A ratio above 1 is then `faster`.
+
+<a id="Table.mismatch"></a>
+
+### Field `mismatch`
+
+```silk
+pub mismatch: bool
+```
+
+Whether two rows carry different checks. The rows then have no ratio: the implementations
+did not do the same work.
 
 <a id="Table.rows"></a>
 
@@ -916,7 +1113,8 @@ The name of the implementation.
 pub ratio: f64
 ```
 
-The geometric mean of its ratios to the reference.
+The geometric mean of its ratios to the reference, as time: the ratio of a table where a
+larger value is better is inverted first, so below 1 always means faster.
 
 <a id="Overall.benchmarks"></a>
 

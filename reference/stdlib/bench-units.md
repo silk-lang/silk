@@ -53,7 +53,7 @@ Public declarations: 2.
 pub struct Scale
 ```
 
-A unit of time chosen for a column of durations.
+A unit chosen for a column of values, so that the numbers of the column line up.
 
 <a id="Scale.nanoseconds"></a>
 
@@ -63,7 +63,7 @@ A unit of time chosen for a column of durations.
 pub nanoseconds: f64
 ```
 
-How many nanoseconds one unit holds.
+How many of the base unit one unit holds: nanoseconds for a time, bytes for memory.
 
 <a id="Scale.name"></a>
 
@@ -73,7 +73,18 @@ How many nanoseconds one unit holds.
 pub name: string<'static>
 ```
 
-The unit's name: `ns`, `µs`, `ms`, or `s`.
+The unit's name: `ns`, `µs`, `ms` or `s` for a time, `B`, `KiB`, `MiB` or `GiB` for
+memory. Empty for any other unit, which keeps the name the program gave it.
+
+<a id="Scale.prefix"></a>
+
+### Field `prefix`
+
+```silk
+pub prefix: string<'static>
+```
+
+What follows the number directly for any other unit: nothing, `k`, `M` or `G`.
 
 <a id="Scale.impl.Copy"></a>
 
@@ -110,6 +121,70 @@ pub fn scale(nanoseconds: f64) -> Scale
 ```
 
 Returns the largest unit in which `nanoseconds` is 1 or more, or `ns` for less than 1 µs.
+
+<a id="Units.impl.kind"></a>
+
+### Associated function `kind`
+
+```silk
+pub fn kind(unit: string) -> string<'static>
+```
+
+Returns the kind of the unit `unit`, which decides how its values are scaled: `ns` for a
+time in nanoseconds, `B` for bytes, and nothing for any other unit.
+
+#### Details
+What counts is the text before the first `/`, after a qualifier that ends with `-`. So
+`ns/op`, `user-ns/op` and `ns` are times, and `B/op` and `peak-B` are bytes.
+
+<a id="Units.impl.higher"></a>
+
+### Associated function `higher`
+
+```silk
+pub fn higher(unit: string) -> bool
+```
+
+Returns whether a larger value of the unit `unit` is better: a unit that ends with `/s`
+or `/sec`, such as `req/s` or `MB/s`. For every other unit, smaller is better.
+
+<a id="Units.impl.measure"></a>
+
+### Associated function `measure`
+
+```silk
+pub fn measure(value: f64, unit: string) -> Scale
+```
+
+Returns the scale in which `value` of the unit `unit` reads best: the largest one in which
+it is 1 or more.
+
+<a id="Units.impl.named"></a>
+
+### Associated function `named`
+
+```silk
+pub fn named<'unit>(scale: Scale, unit: string<'unit>) -> string<'unit>
+```
+
+Returns the name that follows the numbers of a column in `scale`: the scale's own name for
+a time or memory, and `unit` as it is for any other unit.
+
+<a id="Units.impl.quantity"></a>
+
+### Associated function `quantity`
+
+```silk
+pub effect fn quantity(value: f64, unit: string) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Returns `value` of the unit `unit` as text with its unit, such as `12.3 ms`, `4.20 MiB` or
+`74.2k req/s`.
+
+#### Errors
+`OutOfMemoryError` if the `Allocator` cannot supply the text.
 
 <a id="Units.impl.appendFixed"></a>
 
@@ -168,8 +243,8 @@ pub effect fn scaled(nanoseconds: f64, scale: Scale) -> String
     ? &mut Allocator
 ```
 
-Returns `nanoseconds` as text in the unit of `scale`, without the unit's name, such as
-`12.3`.
+Returns `nanoseconds`, a value in the base unit of `scale`, as text in the unit of `scale`,
+without the unit's name, such as `12.3`, or `74.2k` for a scale with a prefix.
 
 #### Errors
 `OutOfMemoryError` if the `Allocator` cannot supply the text.

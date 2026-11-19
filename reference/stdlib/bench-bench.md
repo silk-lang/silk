@@ -25,6 +25,13 @@ the [`BenchOptions`](#BenchOptions) it read from the command line. For each suit
 6. The statistics are computed and each declared output is written. A suite without outputs
    prints the terminal table.
 
+An implementation declared with `Implementation.resultLines` is measured by the result lines
+its program prints, as `silk.bench.lines` describes them: each line is a sample, each name the
+lines carry is a benchmark of its own, and its table is in the unit of the lines. The task
+reads the lines from the program's standard output and from the file it names in the
+environment variable `BENCH_OUT`. After every suite has been reported, the task fails if two
+implementations gave different `check:` values for one benchmark.
+
 A run of a program that exits with a status other than 0 is kept in the result file,
 counted in the report, and left out of the statistics. After every suite has been reported,
 the task fails if any measured run failed.
@@ -187,6 +194,16 @@ pub markdown: bool
 ```
 
 Also write each suite's Markdown report to `build/bench/<suite>.md`.
+
+<a id="BenchOptions.lines"></a>
+
+### Field `lines`
+
+```silk
+pub lines: bool
+```
+
+Also write each suite's samples as result lines to `build/bench/<suite>.txt`.
 
 <a id="BenchOptions.note"></a>
 

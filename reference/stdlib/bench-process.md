@@ -81,6 +81,17 @@ pub variables: List<Pair>
 
 The environment variables added to those of this process.
 
+<a id="Launch.output"></a>
+
+### Field `output`
+
+```silk
+pub output: Option<Path>
+```
+
+The file that receives the standard output of a timed run, in place of what the file
+held. Without one, a timed run's output is discarded.
+
 <a id="Timed"></a>
 
 ## `Timed`
