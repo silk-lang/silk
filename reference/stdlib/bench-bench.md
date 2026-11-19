@@ -32,6 +32,17 @@ reads the lines from the program's standard output and from the file it names in
 environment variable `BENCH_OUT`. After every suite has been reported, the task fails if two
 implementations gave different `check:` values for one benchmark.
 
+An implementation declared with `Implementation.driven` is a harness the task drives, as
+`silk.bench.transport` describes: the task starts it once, with `BENCH_DRIVE` set to `1`,
+asks it for the names of its benchmarks, finds for each the iteration count that makes one
+sample last the suite's `Suite.sample` time (50 ms unless set), and then asks every
+implementation for one sample in each round, in a random order. A harness is restarted
+a few times in a benchmark's rounds, so the layout of one process does not decide a result.
+A Silk harness is a program that uses `silk.bench.harness`, or one whose `main` runs the
+`bench fn` declarations of its modules with `silk.bench.bencher.Benchmarks.main`: compile it
+with `Compilation.fromPackage(&options)` and `root` set to its entry file, and give the
+artifact to `Implementation.program`.
+
 Every run records the revision it measured: `--revision`, or else the commit that `HEAD`
 names in the Git repository the package is in. `--record` adds the run to the suite's
 history, `bench/history/<suite>.jsonl`, a text file to commit. `--history` runs nothing and
@@ -52,6 +63,20 @@ the task fails if any measured run failed.
 The statistics are those of `silk.bench.statistics`: the median with a 95% interval, and for
 each implementation the ratio to the suite's reference with an interval and a verdict.
 `--noise` sets how large a difference must be to count; the default is 1%.
+
+`--save <name>` also keeps the result of each suite under a name, in
+`build/bench/saved/<suite>/<name>.json`. `--baseline <name>` adds the implementations of the
+run kept under that name to the report, named `<name>` for a suite with one implementation
+and `<name>:<implementation>` otherwise, and compares the new samples with them. So
+`--save main` before a change and `--baseline main` after it shows what the change did.
+
+`--instrument callgrind` also runs each implementation's program once under Valgrind's
+Callgrind, after the timed rounds, and adds the instructions it executed to the
+implementation's row. Instruction counts barely vary between runs, so they show a small
+change in one implementation that timing cannot. They compare two languages poorly, because
+instructions differ in cost. The count covers the program from start to exit and not the
+processes it starts. A driven program is not counted, and a program that prints result lines
+gets the count only when it reports one benchmark. `valgrind` must be on `PATH`.
 
 ## Gotchas
 - Processes can be measured on Linux with GNU libc and on macOS.
@@ -288,6 +313,37 @@ pub noise: String
 ```
 
 How large a difference must be to count, in percent.
+
+<a id="BenchOptions.save"></a>
+
+### Field `save`
+
+```silk
+pub save: Option<String>
+```
+
+Also keep each suite's result under this name, as `build/bench/saved/<suite>/<name>.json`.
+
+<a id="BenchOptions.baseline"></a>
+
+### Field `baseline`
+
+```silk
+pub baseline: Option<String>
+```
+
+Compare each suite with the result kept under this name.
+
+<a id="BenchOptions.instrument"></a>
+
+### Field `instrument`
+
+```silk
+pub instrument: Option<String>
+```
+
+Also run each implementation's program once under this instrument and report what it
+counted. `callgrind` counts instructions with Valgrind.
 
 <a id="BenchOptions.impl"></a>
 

@@ -29,7 +29,7 @@ Both give the program the environment of this process and then the variables of 
 
 Import as `Process` with `import silk.bench.process { Process }`.
 
-Public declarations: 3.
+Public declarations: 4.
 
 <a id="Launch"></a>
 
@@ -162,6 +162,46 @@ pub signal: i64
 
 The signal that ended the program, or 0.
 
+<a id="Driven"></a>
+
+## `Driven`
+
+```silk
+pub struct Driven
+```
+
+A program that was started with pipes on its standard input and output, to be driven.
+
+<a id="Driven.pid"></a>
+
+### Field `pid`
+
+```silk
+pub pid: i32
+```
+
+The process ID.
+
+<a id="Driven.reads"></a>
+
+### Field `reads`
+
+```silk
+pub reads: i32
+```
+
+The descriptor the program's standard output is read from.
+
+<a id="Driven.writes"></a>
+
+### Field `writes`
+
+```silk
+pub writes: i32
+```
+
+The descriptor the program's standard input is written to.
+
 <a id="Process"></a>
 
 ## `Process`
@@ -266,6 +306,43 @@ here: the status is in the result, and the caller decides.
 `TaskError` with status 127 if the program cannot be started, if `cpus` is more than
 [`Process.processors`](#Process.impl.processors), or if this system cannot measure a process.
 
+<a id="Process.impl.drive"></a>
+
+### Associated function `drive`
+
+```silk
+pub effect fn drive(launch: &Launch, cpus: u32) -> Driven
+    ! TaskError | OutOfMemoryError
+    ? &mut Allocator
+```
+
+Starts `launch` with a pipe on its standard input and one on its standard output, and
+returns at once. With `cpus` above 0, the program may use only that many processors.
+
+#### Details
+Both descriptors of the result are nonblocking, as `silk.bench.transport.StreamTransport`
+expects. End the program with [`Process.finish`](#Process.impl.finish).
+
+#### Errors
+`TaskError` with status 127 if the program cannot be started, if `cpus` is more than
+[`Process.processors`](#Process.impl.processors), or if this system cannot start such a program.
+
+<a id="Process.impl.finish"></a>
+
+### Associated function `finish`
+
+```silk
+pub effect fn finish(driven: &Driven) -> i64
+    ! TaskError | OutOfMemoryError
+    ? &mut Allocator
+```
+
+Closes the pipes of `driven`, which ends a program that reads its standard input to the
+end, waits for the program, and returns its exit status, or -1 when a signal ended it.
+
+#### Errors
+`TaskError` with status 127 if the program's exit cannot be collected.
+
 <a id="Process.impl.perform"></a>
 
 ### Associated function `perform`
@@ -297,6 +374,34 @@ spaces. The line is for a report, not for a shell: nothing is quoted.
 
 #### Errors
 `OutOfMemoryError` if the `Allocator` cannot supply the text.
+
+<a id="Process.impl.instructions"></a>
+
+### Associated function `instructions`
+
+```silk
+pub fn instructions(profile: &[u8]) -> Option<u64>
+```
+
+Returns the number of instructions a Callgrind output file `profile` counted: the first
+number of its `summary:` line, or of its `totals:` line when it has no summary. Returns
+`None` if `profile` has neither line or the line has no number.
+
+#### Examples
+```silk
+import silk.bench.process { Process }
+import silk.core.option { Option }
+
+pub fn main() -> i32 {
+  let profile = b"events: Ir\nfn=main\n1 20\ntotals: 1840\nsummary: 1837 12\n"
+  if let Option<u64>.Some { value } = Process.instructions(profile) {
+    if value == 1837 {
+      return 0
+    }
+  }
+  return 1
+}
+```
 
 
 Category: Benchmarks.

@@ -29,6 +29,10 @@ reads the result lines the program prints, one sample a line, and reports what t
 say in their own unit, such as `ns/op` or `req/s`. A load generator, a server benchmark, or
 a loop that times one function inside a larger program reports this way.
 
+A program that holds several benchmarks and can run each on request says so with
+[`Implementation.driven`](#Implementation.impl.driven): the suite keeps it alive, decides how many iterations a sample
+takes, and takes the samples of the implementations in turns.
+
 [`Suite.parameter`](#Suite.impl.parameter) runs the suite once for each value: `{name}` in an argument is replaced
 by the value, and each combination of values is its own benchmark, named
 `suite/name=value`. [`Suite.cpus`](#Suite.impl.cpus) does the same for the number of processors a program may
@@ -329,6 +333,17 @@ pub reports: bool
 
 Whether the program prints result lines, which then are what the suite measures.
 
+<a id="Implementation.drives"></a>
+
+### Field `drives`
+
+```silk
+pub drives: bool
+```
+
+Whether a benchmark task drives the program: it is started once, and asked for one sample
+at a time.
+
 <a id="Implementation.impl"></a>
 
 ## Implementation `Implementation`
@@ -494,6 +509,29 @@ compared, and the task fails. `revision:` is recorded as the implementation's re
 when the suite gives none. `note:` is added to the notes of the run.
 `view:` suggests a view, as `silk.bench.view.View.parse` reads it, which the reports show
 when the suite declares none.
+
+<a id="Implementation.impl.driven"></a>
+
+### Method `driven`
+
+```silk
+pub fn driven(self: &mut Self) -> ()
+```
+
+Says that the program is a harness the task drives, as `silk.bench.transport` describes:
+the task starts it with `BENCH_DRIVE=1`, asks it for its benchmarks, and asks for one
+sample at a time over its standard input and output.
+
+#### Details
+The task finds how many iterations of each benchmark take the suite's sample time, and
+then, in each round, takes one sample of each benchmark from every implementation, in a
+random order. The programs stay alive between samples, and each is started again a few
+times over a run, so that one unlucky start does not color every sample. The report is in
+the unit of the harness, `ns/op`.
+
+A Silk program answers with `silk.bench.harness.Harness`. A program in another language
+reads the commands from its standard input and prints result lines, which takes a loop of
+a few dozen lines.
 
 <a id="Format"></a>
 
@@ -849,6 +887,17 @@ pub warmups: Option<u64>
 
 The number of warm-up rounds, if the suite sets it.
 
+<a id="Suite.sampling"></a>
+
+### Field `sampling`
+
+```silk
+pub sampling: Option<u64>
+```
+
+How long one sample of a driven implementation should take, in milliseconds, if the suite
+sets it.
+
 <a id="Suite.notes"></a>
 
 ### Field `notes`
@@ -1007,6 +1056,17 @@ pub fn warmup(self: &mut Self, count: u64) -> ()
 
 Sets the number of warm-up rounds, which fill caches before the measured rounds and are
 in no statistic. The default is 1. `--warmup` on the command line wins.
+
+<a id="Suite.impl.sample"></a>
+
+### Method `sample`
+
+```silk
+pub fn sample(self: &mut Self, milliseconds: u64) -> ()
+```
+
+Sets how long one sample of a driven implementation should take, in milliseconds: the
+task asks for as many iterations as fill that time. The default is 50.
 
 <a id="Suite.impl.note"></a>
 
