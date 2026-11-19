@@ -49,12 +49,7 @@ EOF
     continue
   fi
   "$compiler" build "$output/$main/main.silk" --stdlib "$output/stdlib" --target wasm32-unknown-unknown --backend direct -o "$output/$main/program.wasm"
-  node - "$output/$main/program.wasm" <<'JS'
-const { readFileSync } = require('node:fs')
-const { strictEqual } = require('node:assert')
-const program = new WebAssembly.Instance(new WebAssembly.Module(readFileSync(process.argv[2])))
-strictEqual(program.exports.main(), 0)
-JS
+  node "$repository/stdlib/host/wasm-runner.mjs" "$output/$main/program.wasm"
 done
 
 "$compiler" dump mir "$output/main/main.silk" --stdlib "$output/stdlib" > "$output/main.mir"
