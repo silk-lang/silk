@@ -28,6 +28,14 @@
 //! environment variable `BENCH_OUT`. After every suite has been reported, the task fails if two
 //! implementations gave different `check:` values for one benchmark.
 //!
+//! An implementation declared with `Implementation.driven` is a harness the task drives, as
+//! `silk.bench.transport` describes: the task starts it once, with `BENCH_DRIVE` set to `1`,
+//! asks it for the names of its benchmarks, finds for each the iteration count that makes one
+//! sample last the suite's `Suite.sample` time (50 ms unless set), and then asks every
+//! implementation for one sample in each round, in a random order. A harness is restarted
+//! a few times in a benchmark's rounds, so the layout of one process does not decide a result.
+//! A Silk harness is a program that uses `silk.bench.harness`.
+//!
 //! Every run records the revision it measured: `--revision`, or else the commit that `HEAD`
 //! names in the Git repository the package is in. `--record` adds the run to the suite's
 //! history, `bench/history/<suite>.jsonl`, a text file to commit. `--history` runs nothing and
@@ -113,10 +121,11 @@
 //!
 //! @category Benchmarks
 
+import silk.bench.harness { Harness }
 import silk.bench.history { History, Journal }
 import silk.bench.html { Html }
 import silk.bench.lines { Lines }
-import silk.bench.process { Launch, Process, Timed }
+import silk.bench.process { Driven, Launch, Process, Timed }
 import silk.bench.record {
   Environment,
   Measured,
@@ -142,6 +151,7 @@ import silk.bench.suite {
   Part,
   Suite
 }
+import silk.bench.transport { StreamTransport, Transport, TransportError }
 import silk.bench.units { Units }
 import silk.build.encoding as Encoding
 import silk.build.graph { Build, BuildError }
@@ -160,6 +170,7 @@ import silk.git.refs { GitRefError, ObjectId, Ref }
 import silk.io.writer { Writer, WriterError }
 import silk.io.writer_native { StderrWriter, StdoutWriter }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f64
 import silk.num.i64
 import silk.num.u32
 import silk.num.u64
@@ -389,6 +400,7 @@ struct Candidate {
   after: List<Shape>,
   revision: Option<String>,
   reports: bool,
+  drives: bool,
 }
 
 struct Plan {
@@ -410,6 +422,19 @@ struct Settings {
   rounds: u64,
   warmups: u64,
   noise: f64,
+  // How long one sample of a driven implementation should take, in nanoseconds.
+  sample: u64,
+}
+
+// A driven implementation: its process while it lives, and what the task learned from it.
+struct Driver {
+  alive: bool,
+  process: Driven,
+  transport: StreamTransport,
+  // The benchmarks as the harness lists them, and the iterations of one sample of each: 0
+  // until they are found.
+  names: List<String>,
+  counts: List<u64>,
 }
 
 // xorshift64*, to order the implementations of a round.
@@ -653,6 +678,7 @@ effect fn planOf(suite: &Suite, resolved: &[String], at: &mut usize) -> Plan
         after: move conclude,
         revision: move revision,
         reports: named[index].implementation.reports,
+        drives: named[index].implementation.drives,
       },
     )
     index = index + 1
@@ -977,6 +1003,179 @@ effect fn sampleOf(name: string, round: u64, position: usize, warmup: bool, time
   }
 }
 
+// Sends `command` and gathers the lines of the answer, up to the line `done`. Nothing means
+// the other side ended first.
+effect fn conversed(command: string) -> Option<String>
+  ! TransportError | OutOfMemoryError
+  ? &mut Transport | &mut Allocator {
+  run Transport.send(command)
+  let mut text = String.make()
+  while true {
+    match move run Transport.receive() {
+      Option<String>.Some { value } => {
+        if String.trim(value.view()) == "done" {
+          return Option<String>.Some { value: move text }
+        }
+        run text.append(value.view())
+        run text.append("\n")
+      }
+      Option<String>.None => {
+        return Option<String>.None
+      }
+    }
+  }
+  return Option<String>.None
+}
+
+effect fn harnessFailed(who: string, what: string, detail: string) -> never
+  ! TaskError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut message = run String.copy("the harness of ")
+  run message.append(who)
+  run message.append(" ")
+  run message.append(what)
+  run message.append(detail)
+  fail TaskError { message: move message, status: 1 }
+}
+
+// The answer of the harness of `who` to `command`.
+effect fn exchanged(transport: &mut StreamTransport, command: string, who: string) -> String
+  ! TaskError | OutOfMemoryError
+  ? &mut Allocator {
+  let outcome = run Effect.result(conversed(command))
+    |> Effect.provideMut<Transport>(&mut transport)
+  return match move outcome {
+    Result<Option<String>, TransportError | OutOfMemoryError>.Success {
+      value
+    } => match move value {
+      Option<String>.Some { value: text } => move text
+      Option<String>.None => run harnessFailed(who, "ended before it answered: ", command)
+    }
+    Result<Option<String>, TransportError | OutOfMemoryError>.Failure {
+      error
+    } => match move error {
+      TransportError refused => run harnessFailed(
+        who,
+        "cannot be reached: ",
+        refused.message.view(),
+      )
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+}
+
+// Starts the program of `driver` and, the first time, asks for its benchmarks.
+effect fn revived(driver: &mut Driver, launch: &Launch, cpus: u32, who: string) -> ()
+  ! TaskError | OutOfMemoryError
+  ? &mut Allocator {
+  driver.process = run Process.drive(launch, cpus)
+  driver.transport = StreamTransport.over(driver.process.reads, driver.process.writes)
+  driver.alive = true
+  let listed = run exchanged(&mut driver.transport, "list", who)
+  if driver.names.length() > 0 {
+    return ()
+  }
+  let mut names = String.split(listed.view(), "\n")
+  let mut more = true
+  while more {
+    match names.next() {
+      Option<string>.Some { value } => {
+        let name = String.trim(value)
+        if String.byteLength(name) > 0 {
+          run driver.names.append(run String.copy(name))
+          run driver.counts.append(0)
+        }
+      }
+      Option<string>.None => {
+        more = false
+      }
+    }
+  }
+  if driver.names.length() == 0 {
+    run harnessFailed(who, "lists no benchmark", "")
+  }
+}
+
+// Ends the program of `driver`, if it lives.
+effect fn retired(driver: &mut Driver, who: string) -> ()
+  ! TaskError | OutOfMemoryError
+  ? &mut Allocator {
+  if !driver.alive {
+    return ()
+  }
+  driver.alive = false
+
+  // A harness that misses `quit` still ends when its input does.
+  drop run Effect.result(Transport.send("quit"))
+    |> Effect.provideMut<Transport>(&mut driver.transport)
+  let status = run Process.finish(&driver.process)
+  if status != 0 {
+    let mut detail = String.make()
+    if status < 0 {
+      run detail.append("a signal")
+    } else {
+      run detail.append("status ")
+      run Units.appendWhole(&mut detail, i64.toU64(status))
+    }
+    run harnessFailed(who, "ended with ", detail.view())
+  }
+}
+
+// One sample of the benchmark at `index`: the answer to `run <name> <count>`, which holds a
+// result line.
+effect fn drawn(driver: &mut Driver, index: usize, count: u64, who: string) -> String
+  ! TaskError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut command = run String.copy("run ")
+  run command.append(driver.names.asSlice()[index].view())
+  run command.append(" ")
+  run Units.appendWhole(&mut command, count)
+  let reply = run exchanged(&mut driver.transport, command.view(), who)
+  let parsed = run Lines.parse(reply.view())
+  if parsed.lines.length() == 0 {
+    let mut detail = run String.copy(command.view())
+    let settings = parsed.settings.asSlice()
+    let mut at: usize = 0
+    while at < settings.length {
+      if settings[at].name.view() == "error" {
+        run detail.append(" (")
+        run detail.append(settings[at].value.view())
+        run detail.append(")")
+      }
+      at = at + 1
+    }
+    run harnessFailed(who, "gave no result line for: ", detail.view())
+  }
+  return move reply
+}
+
+// Finds how many iterations of the benchmark at `index` take `target` nanoseconds, from the
+// time per iteration the harness reports.
+effect fn calibrated(driver: &mut Driver, index: usize, target: u64, who: string) -> ()
+  ! TaskError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut count: u64 = 1
+  while count < 1000000000 {
+    let reply = run drawn(&mut driver, index, count, who)
+    let parsed = run Lines.parse(reply.view())
+    let first = &parsed.lines.asSlice()[0]
+    let elapsed = match Lines.value(first, "ns/op") {
+      Option<f64>.Some { value } => value * u64.toF64(first.iterations)
+
+      // A harness that reports no time cannot be calibrated: it gets what it asks for.
+      Option<f64>.None => u64.toF64(target)
+    }
+    if elapsed >= u64.toF64(target) {
+      break
+    }
+    count = Harness.grown(count, f64.toU64(elapsed), target)
+  }
+  let counts = driver.counts.asMutSlice()
+  counts[index] = count
+}
+
 effect fn timeBenchmark(
   plan: &Plan,
   combination: &Combination,
@@ -998,18 +1197,39 @@ effect fn timeBenchmark(
   run named.append("/lines-out.txt")
   let mut launches = List<Launch>.make()
   let mut order = List<usize>.make()
+  let mut drivers = List<Driver>.make()
   let mut at: usize = 0
   while at < candidates.length {
     let mut launch = run launchOf(&candidates[at].timed, pairs)
-    if candidates[at].reports {
+    if candidates[at].reports && !candidates[at].drives {
       launch.output = Option<Path>.Some { value: run Path.make(printed.view()) }
       run launch.variables.append(
         Pair { name: run String.copy("BENCH_OUT"), value: run String.copy(named.view()) },
       )
     }
+    if candidates[at].drives {
+      run launch.variables.append(
+        Pair { name: run String.copy("BENCH_DRIVE"), value: run String.copy("1") },
+      )
+    }
     run launches.append(move launch)
     run order.append(at)
+    run drivers.append(
+      Driver {
+        alive: false,
+        process: Driven { pid: 0, reads: -1, writes: -1 },
+        transport: StreamTransport.over(-1, -1),
+        names: List<String>.make(),
+        counts: List<u64>.make(),
+      },
+    )
     at = at + 1
+  }
+
+  // A driven program is started again for each third of the measured rounds.
+  let mut span = (settings.rounds + 2) / 3
+  if span == 0 {
+    span = 1
   }
   let mut readings = List<Reading>.make()
   let mut samples = List<Sample>.make()
@@ -1034,6 +1254,29 @@ effect fn timeBenchmark(
     while position < candidates.length {
       let chosen = order.asSlice()[position]
       run performAll(&candidates[chosen].before, pairs)
+      if candidates[chosen].drives {
+        let who = candidates[chosen].name.view()
+        let all = drivers.asMutSlice()
+        if !all[chosen].alive {
+          run revived(&mut all[chosen], &launches.asSlice()[chosen], combination.cpus, who)
+        }
+        let mut index: usize = 0
+        while index < all[chosen].names.length() {
+          if all[chosen].counts.asSlice()[index] == 0 {
+            run calibrated(&mut all[chosen], index, settings.sample, who)
+          }
+          let count = all[chosen].counts.asSlice()[index]
+          let reply = run drawn(&mut all[chosen], index, count, who)
+          run read(reply.view(), who, chosen, number, warmup, &mut readings, &mut told)
+          index = index + 1
+        }
+        if !warmup && (number + 1) % span == 0 {
+          run retired(&mut all[chosen], who)
+        }
+        run performAll(&candidates[chosen].after, pairs)
+        position = position + 1
+        continue
+      }
       if candidates[chosen].reports {
         // What the last run left must not be read as this run's.
         run FileSystem.writeFileWithParents(&run Path.make(named.view()), b"")
@@ -1053,6 +1296,12 @@ effect fn timeBenchmark(
       position = position + 1
     }
     round = round + 1
+  }
+  let all = drivers.asMutSlice()
+  at = 0
+  while at < all.length {
+    run retired(&mut all[at], candidates[at].name.view())
+    at = at + 1
   }
   return Measured {
     name: run String.copy(combination.name.view()),
@@ -1579,7 +1828,15 @@ effect fn performed(options: &BenchOptions, suites: &[Suite]) -> ()
         at = at + 1
         continue
       }
-      let mut settings = Settings { rounds: 10, warmups: 1, noise: percent / 100.0 }
+      let mut settings = Settings {
+        rounds: 10,
+        warmups: 1,
+        noise: percent / 100.0,
+        sample: 50000000,
+      }
+      if let Option<u64>.Some { value } = suite.sampling {
+        settings.sample = value * 1000000
+      }
       if let Option<u64>.Some { value } = suite.rounds {
         settings.rounds = value
       }

@@ -1,0 +1,355 @@
+//! Carries the lines of the driven benchmark protocol between a benchmark task and a harness.
+//!
+//! # When to use
+//! Provide a [`StreamTransport`] to a `silk.bench.harness.Harness` so that a benchmark task can
+//! drive your program. Implement [`Transport`] yourself to drive a harness that standard input
+//! and output cannot reach: one on another computer behind a socket, or one in a sandbox that
+//! only shares files.
+//!
+//! # Details
+//! The driven protocol is a dialogue of lines, and this service is all of it that touches the
+//! outside: [`Transport.receive`] takes the next line from the other side, and
+//! [`Transport.send`] gives it one. Neither side of the protocol knows what carries the lines.
+//!
+//! The task sends one command a line, and the harness answers each with lines that end with
+//! the line `done`:
+//!
+//! ```text
+//! task     list
+//! harness  BenchmarkParse/file=twitter
+//! harness  BenchmarkWrite
+//! harness  done
+//! task     run BenchmarkParse/file=twitter 2000
+//! harness  BenchmarkParse/file=twitter 2000 165412.50 ns/op
+//! harness  done
+//! task     quit
+//! ```
+//!
+//! - `list` asks for the names of the benchmarks, one a line.
+//! - `run <name> <iterations>` asks for one sample: the harness runs the body that many times
+//!   and answers with one result line, as `silk.bench.lines` describes them. It may send
+//!   configuration lines such as `check: 9f2c41aa` before the result line.
+//! - `quit` ends the harness. The end of the input means the same.
+//!
+//! A harness in another language reads and writes these lines on its standard input and
+//! output. The task starts it with the environment variable `BENCH_DRIVE` set to `1`.
+//!
+//! [`StreamTransport`] carries the lines over two descriptors: [`StreamTransport.standard`] is
+//! standard input and output, which is what a harness uses, and [`StreamTransport.over`] is any
+//! pair, which is what the task uses for the pipes of a harness it started.
+//!
+//! # Gotchas
+//! [`StreamTransport`] works on Linux with GNU libc and on macOS. On another system, every
+//! operation fails.
+//!
+//! # Examples
+//! ```silk
+//! import silk.bench.transport { Transport, TransportError }
+//! import silk.collections.list { List }
+//! import silk.core.effect { Effect }
+//! import silk.core.option { Option }
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.text.string { String }
+//!
+//! // A transport that answers from memory, as a test of a harness would use.
+//! struct Scripted {
+//!   commands: List<String>,
+//!   next: usize,
+//!   answers: List<String>,
+//! }
+//!
+//! impl Transport for Scripted {
+//!   effect fn receive(self: &mut Self) -> Option<String>
+//!     ! TransportError | OutOfMemoryError
+//!     ? &mut Transport | &mut Allocator {
+//!     if self.next == self.commands.length() {
+//!       return Option<String>.None
+//!     }
+//!     self.next = self.next + 1
+//!     return Option<String>.Some {
+//!       value: run String.copy(self.commands.asSlice()[self.next - 1].view()),
+//!     }
+//!   }
+//!
+//!   effect fn send(self: &mut Self, line: string) -> ()
+//!     ! TransportError | OutOfMemoryError
+//!     ? &mut Transport | &mut Allocator {
+//!     return run self.answers.append(run String.copy(line))
+//!   }
+//! }
+//!
+//! // Echoes every command back until the input ends.
+//! effect fn echo() -> ()
+//!   ! TransportError | OutOfMemoryError
+//!   ? &mut Transport | &mut Allocator {
+//!   let mut more = true
+//!   while more {
+//!     match move run Transport.receive() {
+//!       Option<String>.Some { value } => {
+//!         run Transport.send(value.view())
+//!       }
+//!       Option<String>.None => {
+//!         more = false
+//!       }
+//!     }
+//!   }
+//! }
+//!
+//! effect fn check() -> i32 ! TransportError | OutOfMemoryError ? &mut Allocator {
+//!   let mut scripted = Scripted {
+//!     commands: List<String>.make(),
+//!     next: 0,
+//!     answers: List<String>.make(),
+//!   }
+//!   run scripted.commands.append(run String.copy("list"))
+//!   run scripted.commands.append(run String.copy("quit"))
+//!   run echo() |> Effect.provideMut<Transport>(&mut scripted)
+//!   if scripted.answers.length() != 2 || scripted.answers.asSlice()[1].view() != "quit" {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//!
+//! effect fn failed(error: TransportError | OutOfMemoryError) -> i32 {
+//!   drop error
+//!   return 2
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   return run Effect.catchAll(check(), failed) |> Effect.provideMut<Allocator>(&mut allocator)
+//! }
+//! ```
+//!
+//! @category Benchmarks
+
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.io.writer { Writer, WriterError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.format { Debug, Format, Formatter }
+import silk.text.string { InvalidUtf8, String }
+
+static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetAbi() == "apple"
+  && Intrinsic.profileText("libc") == "system")
+  || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu"
+    && Intrinsic.profileText("libc") == "gnu") {
+  import silk.mem.pointer { Pointer }
+  import silk.platform.native.descriptor { NativeDescriptor }
+
+  extern "C" struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+  }
+
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    @foreign(noCapture: .("fds"))
+    unsafe extern "C" fn poll(fds: ?[*]mut PollFd, count: u32, timeout: i32) -> i32
+  } else {
+    @foreign(noCapture: .("fds"))
+    unsafe extern "C" fn poll(fds: ?[*]mut PollFd, count: usize, timeout: i32) -> i32
+  }
+}
+
+/// A line that could not be carried.
+pub struct TransportError {
+  /// What went wrong, as one line.
+  pub message: String,
+}
+
+impl Debug for TransportError {
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return run Format.writeText(&mut formatter, self.message.view())
+  }
+}
+
+/// What carries the lines of the driven protocol to the other side and back.
+pub service Transport {
+  /// Returns the next line from the other side, without its line end, or nothing when the
+  /// other side has ended.
+  ///
+  /// # Errors
+  /// - `TransportError` if the line cannot be read.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the line.
+  effect fn receive() -> Option<String>
+    ! TransportError | OutOfMemoryError
+    ? &mut Transport | &mut Allocator
+
+  /// Gives `line`, which holds no line end, to the other side.
+  ///
+  /// # Errors
+  /// - `TransportError` if the line cannot be written.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply working memory.
+  effect fn send(line: string) -> ()
+    ! TransportError | OutOfMemoryError
+    ? &mut Transport | &mut Allocator
+}
+
+/// A transport over two descriptors: lines are read from one and written to the other.
+///
+/// # Details
+/// Both descriptors may be blocking or nonblocking: an operation waits until the descriptor is
+/// ready. The transport does not close them.
+pub struct StreamTransport {
+  reads: i32,
+  writes: i32,
+  // What was read and is not yet returned, from `taken` on.
+  pending: List<u8>,
+  taken: usize,
+  ended: bool,
+}
+
+impl StreamTransport {
+  /// Returns a transport over standard input and standard output: what a harness uses.
+  pub fn standard() -> StreamTransport {
+    return StreamTransport.over(0, 1)
+  }
+
+  /// Returns a transport that reads lines from the descriptor `reads` and writes lines to the
+  /// descriptor `writes`.
+  pub fn over(reads: i32, writes: i32) -> StreamTransport {
+    return StreamTransport {
+      reads: reads,
+      writes: writes,
+      pending: List<u8>.make(),
+      taken: 0,
+      ended: false,
+    }
+  }
+}
+
+effect fn refused(message: string) -> never
+  ! TransportError | OutOfMemoryError
+  ? &mut Allocator {
+  fail TransportError { message: run String.copy(message) }
+}
+
+// The line that ends at the line feed at `end`, without a carriage return before it.
+effect fn lineOf(bytes: &[u8], start: usize, end: usize) -> String
+  ! TransportError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut last = end
+  if last > start && bytes[last - 1] == 13 {
+    last = last - 1
+  }
+  let mut copy = List<u8>.make()
+  let mut at = start
+  while at < last {
+    run copy.append(bytes[at])
+    at = at + 1
+  }
+  return match move run String.copyUtf8(copy.asSlice()) {
+    Result<String, InvalidUtf8>.Success { value } => move value
+    Result<String, InvalidUtf8>.Failure { .. } => run refused(
+      "a line of the other side is not UTF-8",
+    )
+  }
+}
+
+impl Transport for StreamTransport {
+  effect fn receive(self: &mut Self) -> Option<String>
+    ! TransportError | OutOfMemoryError
+    ? &mut Transport | &mut Allocator {
+    static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetAbi() == "apple"
+      && Intrinsic.profileText("libc") == "system")
+      || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu"
+        && Intrinsic.profileText("libc") == "gnu") {
+      let mut searched = self.taken
+      while true {
+        let bytes = self.pending.asSlice()
+        while searched < bytes.length && bytes[searched] != 10 {
+          searched = searched + 1
+        }
+        if searched < bytes.length {
+          let line = run lineOf(bytes, self.taken, searched)
+          self.taken = searched + 1
+          return Option<String>.Some { value: move line }
+        }
+        if self.ended {
+          // A last line without a line feed still counts.
+          if self.taken < bytes.length {
+            let line = run lineOf(bytes, self.taken, bytes.length)
+            self.taken = bytes.length
+            return Option<String>.Some { value: move line }
+          }
+          return Option<String>.None
+        }
+
+        // Drop what was returned before more is read, so the buffer stays one line long.
+        if self.taken > 0 {
+          let mut rest = List<u8>.make()
+          let mut at = self.taken
+          while at < bytes.length {
+            run rest.append(bytes[at])
+            at = at + 1
+          }
+          searched = searched - self.taken
+          self.pending = move rest
+          self.taken = 0
+        }
+        let mut chunk: [u8; 4096] = [0; 4096]
+        let mut count: usize = 0
+        let mut code = 0
+        if run NativeDescriptor.read(self.reads, &mut chunk, &mut count, &mut code) {
+          if count == 0 {
+            self.ended = true
+          }
+          let mut at: usize = 0
+          while at < count {
+            run self.pending.append(chunk[at])
+            at = at + 1
+          }
+        } else if code == 11 || code == 35 {
+          // Nothing to read yet on a nonblocking descriptor.
+          waitFor(self.reads, 1)
+        } else if code == 104 || code == 54 {
+          // The other side closed its end of a socket.
+          self.ended = true
+        } else {
+          run refused("cannot read a line from the other side")
+        }
+      }
+      return Option<String>.None
+    } else {
+      drop self
+      run refused("this system has no stream transport yet")
+    }
+  }
+
+  effect fn send(self: &mut Self, line: string) -> ()
+    ! TransportError | OutOfMemoryError
+    ? &mut Transport | &mut Allocator {
+    static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetAbi() == "apple"
+      && Intrinsic.profileText("libc") == "system")
+      || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu"
+        && Intrinsic.profileText("libc") == "gnu") {
+      let mut whole = List<u8>.make()
+      run whole.appendSlice(String.utf8Bytes(line))
+      run whole.append(10)
+      let mut code = 0
+      waitFor(self.writes, 4)
+      if !(run NativeDescriptor.writeAll(self.writes, whole.asSlice(), &mut code)) {
+        run refused("cannot write a line to the other side")
+      }
+    } else {
+      drop self
+      drop line
+      run refused("this system has no stream transport yet")
+    }
+  }
+}
+
+static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetAbi() == "apple"
+  && Intrinsic.profileText("libc") == "system")
+  || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu"
+    && Intrinsic.profileText("libc") == "gnu") {
+  // Waits until the descriptor `fd` is ready for `events`: 1 to read, 4 to write.
+  fn waitFor(fd: i32, events: i16) -> () {
+    let mut watched = [PollFd { fd: fd, events: events, revents: 0 }]
+    let _ready = unsafe poll(Pointer.fromMutSlice<PollFd>(&mut watched), 1, -1)
+  }
+}
