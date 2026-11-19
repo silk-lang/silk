@@ -580,6 +580,21 @@ pub fn unixMilliseconds(self: &Self) -> Option<u64>
 
 Returns the Unix millisecond timestamp for RFC version 7, or `None` otherwise.
 
+<a id="Uuid.impl.instant"></a>
+
+### Method `instant`
+
+```silk
+pub fn instant(self: &Self) -> Option<Instant>
+```
+
+Returns the time in the identifier as an instant for RFC versions 1, 6, and 7, or `None`
+otherwise.
+
+Versions 1 and 6 have a precision of 100 nanoseconds and version 7 has a precision of one
+millisecond. The identifier holds the reading of the clock of the computer that made it,
+which the instant repeats without a check.
+
 <a id="Uuid.impl.clockSequence"></a>
 
 ### Method `clockSequence`

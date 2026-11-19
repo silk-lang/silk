@@ -1,0 +1,827 @@
+//! The shared reader and writer of ISO 8601 and RFC 3339 date and time text, and the error type of
+//! every date and time parser.
+//!
+//! # When to use
+//!
+//! Most programs call `parse` on a type, such as `PlainDate.parse` or `Instant.parse`, and print
+//! values with `Display`. Use [`Scanner`] and the `write` functions to build a parser or a
+//! formatter for another type or wire format on the same grammar.
+//!
+//! # Details
+//!
+//! The grammar is the one of ECMAScript Temporal, which includes RFC 3339 and the bracketed
+//! annotations of RFC 9557:
+//!
+//! - A date is `YYYY-MM-DD` or `YYYYMMDD`. A year outside 0 to 9999 has a sign and six digits, as
+//!   in `+012026-01-01`.
+//! - A time is `HH`, `HH:MM`, `HH:MM:SS`, or `HH:MM:SS.fffffffff` with one to nine fraction digits
+//!   after `.` or `,`. The forms without `:` are `HHMM` and `HHMMSS`. Second `60` reads as `59`.
+//! - `T`, `t`, or one space separates a date and a time.
+//! - An offset is `Z`, `z`, `+HH`, `+HH:MM`, `+HHMM`, `+HH:MM:SS`, or `+HHMMSS`, with `-` for
+//!   offsets behind UTC.
+//! - Annotations follow in brackets: a time zone such as `[Europe/Rome]`, then `key=value` pairs
+//!   such as `[u-ca=iso8601]`. A `!` after `[` marks an annotation as critical.
+//!
+//! A [`Scanner`] remembers the first failure and then does nothing. A parser calls the readers in
+//! order and checks [`Scanner.failure`] one time at the end.
+//!
+//! # Examples
+//!
+//! ## Read a date and time with an offset
+//!
+//! ```silk
+//! import silk.core.option { Option }
+//! import silk.text.string { String }
+//! import silk.time.text { OffsetKind, Scanner, TimeParseError }
+//!
+//! pub fn main() -> i32 {
+//!   let mut scanner = Scanner.make(String.utf8Bytes("2026-11-19T17:36:22.5+01:00"))
+//!   let parsed = scanner.dateTime()
+//!   match scanner.failure() {
+//!     Option<TimeParseError>.Some { value } => {
+//!       return 1
+//!     }
+//!     Option<TimeParseError>.None => {}
+//!   }
+//!   if parsed.date.year != 2026 || parsed.time.nanosecond != 500000000 {
+//!     return 2
+//!   }
+//!   if parsed.offset.seconds != 3600 {
+//!     return 3
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! @category Time
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.io.writer { Writer, WriterError }
+import silk.text.format { Debug, Format, Formatter }
+import silk.collections.slice { Slice }
+import silk.time.civil as Civil
+import silk.time.civil { CivilDate }
+import silk.num.i32
+import silk.num.u32
+import silk.num.u8
+import silk.num.usize
+
+/// The cause of a [`TimeParseError`].
+pub enum TimeParseReason {
+  /// The text ends where a digit or a separator must be.
+  UnexpectedEnd,
+  /// The byte at the error offset is not valid in that position.
+  UnexpectedCharacter,
+  /// A field has the right form and a value that does not exist, such as month 13, February 30, or
+  /// hour 24, or the result is outside the range of the type.
+  OutOfRange,
+  /// The text has the UTC designator `Z`, and the type has no zone. A plain date or time with `Z`
+  /// is rejected because the local value it names depends on a zone that the text does not give.
+  UtcNotAllowed,
+  /// The text has no UTC offset, and the type needs one to name a point in time.
+  MissingOffset,
+  /// The text has no time of day, and the type needs one.
+  MissingTime,
+  /// The text has a calendar annotation that is not `[u-ca=iso8601]`.
+  UnsupportedCalendar,
+  /// The text has an annotation that is marked critical with `!` and has a key that this parser
+  /// does not know.
+  UnknownCriticalAnnotation,
+  /// The text can be read as a time and also as a year and month or a month and day, such as
+  /// `1214`. Write a time with the prefix `T` to make it clear.
+  Ambiguous,
+}
+
+impl Debug for TimeParseReason {
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return match &self.* {
+      TimeParseReason.UnexpectedEnd => run Format.write(&mut formatter, b"UnexpectedEnd")
+      TimeParseReason.UnexpectedCharacter => run Format.write(
+        &mut formatter,
+        b"UnexpectedCharacter",
+      )
+      TimeParseReason.OutOfRange => run Format.write(&mut formatter, b"OutOfRange")
+      TimeParseReason.UtcNotAllowed => run Format.write(&mut formatter, b"UtcNotAllowed")
+      TimeParseReason.MissingOffset => run Format.write(&mut formatter, b"MissingOffset")
+      TimeParseReason.MissingTime => run Format.write(&mut formatter, b"MissingTime")
+      TimeParseReason.UnsupportedCalendar => run Format.write(
+        &mut formatter,
+        b"UnsupportedCalendar",
+      )
+      TimeParseReason.UnknownCriticalAnnotation => run Format.write(
+        &mut formatter,
+        b"UnknownCriticalAnnotation",
+      )
+      TimeParseReason.Ambiguous => run Format.write(&mut formatter, b"Ambiguous")
+    }
+  }
+}
+
+/// The error of every date and time parser: why the text is not valid and where.
+pub struct TimeParseError {
+  /// The cause.
+  pub reason: TimeParseReason,
+  /// The byte offset in the text where the parser found the problem. For a missing part it is the
+  /// offset where the part must start.
+  pub offset: usize,
+}
+
+impl Copy for TimeParseError {}
+
+impl Debug for TimeParseError {
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return run Format.debugFields(self, "TimeParseError", &mut formatter)
+  }
+}
+
+/// A time of day as plain numbers, as a [`Scanner`] reads it.
+pub struct ClockTime {
+  /// The hour, from 0 to 23.
+  pub hour: u8,
+  /// The minute, from 0 to 59.
+  pub minute: u8,
+  /// The second, from 0 to 59. The scanner reads second `60` as `59`.
+  pub second: u8,
+  /// The fraction of the second in nanoseconds, from 0 to 999,999,999.
+  pub nanosecond: u32,
+}
+
+impl Copy for ClockTime {}
+
+/// How a text states its UTC offset.
+pub enum OffsetKind {
+  /// The text has no offset.
+  Absent,
+  /// The text has the UTC designator `Z` or `z`.
+  Utc,
+  /// The text has a numeric offset such as `+01:00`.
+  Numeric,
+}
+
+/// The UTC offset that a [`Scanner`] read.
+pub struct ParsedOffset {
+  /// How the text states the offset.
+  pub kind: OffsetKind,
+  /// The offset in seconds east of UTC. It is 0 unless `kind` is `Numeric`.
+  pub seconds: i32,
+}
+
+impl Copy for ParsedOffset {}
+
+/// The parts of a date and time text that [`Scanner.dateTime`] read.
+pub struct ParsedDateTime {
+  /// The date.
+  pub date: CivilDate,
+  /// The time of day. It is midnight when `hasTime` is `false`.
+  pub time: ClockTime,
+  /// `true` if the text has a time of day.
+  pub hasTime: bool,
+  /// The UTC offset. Its kind is `Absent` when the text has none.
+  pub offset: ParsedOffset,
+}
+
+impl Copy for ParsedDateTime {}
+
+/// A reader of date and time text that keeps the first failure.
+///
+/// # Details
+///
+/// Each reader consumes its part and moves forward. After the first failure, each reader does
+/// nothing and returns a zero value, so a parser can call them in order and ask
+/// [`Scanner.failure`] one time at the end.
+pub struct Scanner<'text> {
+  bytes: &'text [u8],
+  at: usize,
+  failed: bool,
+  reason: TimeParseReason,
+  failedAt: usize,
+  zoneStart: usize,
+  zoneLength: usize,
+}
+
+impl<'text> Scanner<'text> {
+  /// Returns a scanner at the start of `bytes`.
+  pub fn make(bytes: &'text [u8]) -> Scanner<'text> {
+    return Scanner<'text> {
+      bytes: bytes,
+      at: 0,
+      failed: false,
+      reason: TimeParseReason.UnexpectedEnd,
+      failedAt: 0,
+      zoneStart: 0,
+      zoneLength: 0,
+    }
+  }
+
+  /// Returns the first failure, or `None` if every reader so far succeeded.
+  pub fn failure(self: &Self) -> Option<TimeParseError> {
+    if self.failed {
+      return Option<TimeParseError>.some(
+        TimeParseError { reason: self.reason, offset: self.failedAt },
+      )
+    }
+    return Option<TimeParseError>.none()
+  }
+
+  /// Records a failure at byte `offset` unless one is already recorded.
+  pub fn reject(self: &mut Self, reason: TimeParseReason, offset: usize) -> () {
+    if !self.failed {
+      self.failed = true
+      self.reason = reason
+      self.failedAt = offset
+    }
+    return ()
+  }
+
+  /// Records a failure at the next byte to read unless one is already recorded.
+  pub fn rejectHere(self: &mut Self, reason: TimeParseReason) -> () {
+    if !self.failed {
+      self.failed = true
+      self.reason = reason
+      self.failedAt = self.at
+    }
+    return ()
+  }
+
+  /// Returns the byte offset of the next byte to read.
+  pub fn position(self: &Self) -> usize {
+    return self.at
+  }
+
+  /// Returns `true` if no bytes are left.
+  pub fn atEnd(self: &Self) -> bool {
+    return self.at >= self.bytes.length
+  }
+
+  /// Returns the next byte without consuming it, or 0 at the end of the text.
+  pub fn peek(self: &Self) -> u8 {
+    if self.at >= self.bytes.length {
+      return 0
+    }
+    return self.bytes[self.at]
+  }
+
+  /// Consumes the next byte if it is `byte` and returns `true`. Otherwise it consumes nothing.
+  pub fn accept(self: &mut Self, byte: u8) -> bool {
+    if !self.failed && self.at < self.bytes.length && self.bytes[self.at] == byte {
+      self.at = self.at + 1
+      return true
+    }
+    return false
+  }
+
+  /// Consumes the next byte, which must be `byte`. Another byte or the end of the text is a
+  /// failure.
+  pub fn expect(self: &mut Self, byte: u8) -> () {
+    if self.failed {
+      return ()
+    }
+    if self.at >= self.bytes.length {
+      self.rejectHere(TimeParseReason.UnexpectedEnd)
+      return ()
+    }
+    if self.bytes[self.at] != byte {
+      self.rejectHere(TimeParseReason.UnexpectedCharacter)
+      return ()
+    }
+    self.at = self.at + 1
+    return ()
+  }
+
+  /// Consumes exactly `count` decimal digits and returns their value. `count` is at most 9.
+  pub fn digits(self: &mut Self, count: usize) -> u32 {
+    if self.failed {
+      return 0
+    }
+    let mut value: u32 = 0
+    let mut index: usize = 0
+    while index < count {
+      if self.at >= self.bytes.length {
+        self.rejectHere(TimeParseReason.UnexpectedEnd)
+        return 0
+      }
+      let byte = self.bytes[self.at]
+      if byte < 48 || byte > 57 {
+        self.rejectHere(TimeParseReason.UnexpectedCharacter)
+        return 0
+      }
+      value = value * 10 + u8.toU32(byte - 48)
+      self.at = self.at + 1
+      index = index + 1
+    }
+    return value
+  }
+
+  /// Consumes the ASCII letters at the next position and returns them. The result is empty when
+  /// the next byte is not a letter.
+  pub fn letters(self: &mut Self) -> &'text [u8] {
+    if self.failed {
+      return Slice.view<u8>(self.bytes, 0, 0)
+    }
+    let start = self.at
+    while self.at < self.bytes.length && isLetter(self.bytes[self.at]) {
+      self.at = self.at + 1
+    }
+    return Slice.view<u8>(self.bytes, start, self.at - start)
+  }
+
+  /// Fails with `UnexpectedCharacter` if bytes are left.
+  pub fn end(self: &mut Self) -> () {
+    if !self.failed && self.at < self.bytes.length {
+      self.rejectHere(TimeParseReason.UnexpectedCharacter)
+    }
+    return ()
+  }
+
+  /// Reads a date: `YYYY-MM-DD`, `YYYYMMDD`, or one of them with a signed six-digit year.
+  ///
+  /// # Details
+  ///
+  /// The month and the day must exist in that year of the ISO calendar, or the scanner fails with
+  /// `OutOfRange`. The year `-000000` is not valid.
+  pub fn date(self: &mut Self) -> CivilDate {
+    let year = self.year()
+    let extended = self.accept(45)
+    let monthAt = self.at
+    let month = self.digits(2)
+    if extended {
+      self.expect(45)
+    }
+    let dayAt = self.at
+    let day = self.digits(2)
+    if self.failed {
+      return CivilDate { year: 0, month: 1, day: 1 }
+    }
+    if month < 1 || month > 12 {
+      self.reject(TimeParseReason.OutOfRange, monthAt)
+      return CivilDate { year: 0, month: 1, day: 1 }
+    }
+    if day < 1 || day > u8.toU32(Civil.daysInMonth(year, u32.toU8(month))) {
+      self.reject(TimeParseReason.OutOfRange, dayAt)
+      return CivilDate { year: 0, month: 1, day: 1 }
+    }
+    return CivilDate { year: year, month: u32.toU8(month), day: u32.toU8(day) }
+  }
+
+  /// Reads a year: four digits, or a sign and six digits. The year `-000000` is a failure.
+  pub fn year(self: &mut Self) -> i32 {
+    let start = self.at
+    if self.accept(43) {
+      return u32.toI32(self.digits(6))
+    }
+    if self.accept(45) {
+      let magnitude = self.digits(6)
+      if !self.failed && magnitude == 0 {
+        self.reject(TimeParseReason.OutOfRange, start)
+      }
+      return -u32.toI32(magnitude)
+    }
+    return u32.toI32(self.digits(4))
+  }
+
+  /// Reads a time of day: `HH`, `HH:MM`, `HH:MM:SS`, `HHMM`, or `HHMMSS`, with an optional fraction
+  /// of one to nine digits after the seconds.
+  ///
+  /// # Details
+  ///
+  /// The hour must be at most 23 and the minute at most 59, or the scanner fails with
+  /// `OutOfRange`. The second can be 60, for a leap second, and reads as 59.
+  pub fn time(self: &mut Self) -> ClockTime {
+    let hourAt = self.at
+    let hour = self.digits(2)
+    let mut minute: u32 = 0
+    let mut second: u32 = 0
+    let mut nanosecond: u32 = 0
+    let minuteAt = self.at + 1
+    let mut secondAt = self.at
+    let mut hasSecond = false
+    if self.accept(58) {
+      minute = self.digits(2)
+      secondAt = self.at + 1
+      if self.accept(58) {
+        second = self.digits(2)
+        hasSecond = true
+      }
+    } else if isDigit(self.peek()) {
+      minute = self.digits(2)
+      secondAt = self.at
+      if isDigit(self.peek()) {
+        second = self.digits(2)
+        hasSecond = true
+      }
+    }
+    if hasSecond && (self.peek() == 46 || self.peek() == 44) {
+      self.at = self.at + 1
+      nanosecond = self.fraction()
+    }
+    if self.failed {
+      return ClockTime { hour: 0, minute: 0, second: 0, nanosecond: 0 }
+    }
+    if hour > 23 {
+      self.reject(TimeParseReason.OutOfRange, hourAt)
+    } else if minute > 59 {
+      self.reject(TimeParseReason.OutOfRange, minuteAt)
+    } else if second > 60 {
+      self.reject(TimeParseReason.OutOfRange, secondAt)
+    }
+    if self.failed {
+      return ClockTime { hour: 0, minute: 0, second: 0, nanosecond: 0 }
+    }
+    if second == 60 {
+      second = 59
+    }
+    return ClockTime {
+      hour: u32.toU8(hour),
+      minute: u32.toU8(minute),
+      second: u32.toU8(second),
+      nanosecond: nanosecond,
+    }
+  }
+
+  /// Reads one to nine fraction digits and returns them as nanoseconds, so `5` is 500,000,000. No
+  /// digit, or a tenth digit, is a failure.
+  pub fn fraction(self: &mut Self) -> u32 {
+    if self.failed {
+      return 0
+    }
+    let mut value: u32 = 0
+    let mut scale: u32 = 100000000
+    let mut count: usize = 0
+    while self.at < self.bytes.length && isDigit(self.bytes[self.at]) {
+      if count == 9 {
+        self.rejectHere(TimeParseReason.UnexpectedCharacter)
+        return 0
+      }
+      value = value + u8.toU32(self.bytes[self.at] - 48) * scale
+      scale = scale / 10
+      count = count + 1
+      self.at = self.at + 1
+    }
+    if count == 0 {
+      if self.at >= self.bytes.length {
+        self.rejectHere(TimeParseReason.UnexpectedEnd)
+      } else {
+        self.rejectHere(TimeParseReason.UnexpectedCharacter)
+      }
+      return 0
+    }
+    return value
+  }
+
+  /// Reads a UTC offset if the next byte starts one: `Z`, `z`, or a sign with `HH`, `HH:MM`,
+  /// `HHMM`, `HH:MM:SS`, or `HHMMSS`.
+  ///
+  /// # Details
+  ///
+  /// When the next byte is not `Z`, `z`, `+`, or `-`, the scanner consumes nothing and the kind of
+  /// the result is `Absent`. The hour must be at most 23, and the minute and the second at most
+  /// 59, or the scanner fails with `OutOfRange`.
+  pub fn offset(self: &mut Self) -> ParsedOffset {
+    if self.failed {
+      return ParsedOffset { kind: OffsetKind.Absent, seconds: 0 }
+    }
+    if self.accept(90) || self.accept(122) {
+      return ParsedOffset { kind: OffsetKind.Utc, seconds: 0 }
+    }
+    let start = self.at
+    let mut negative = false
+    if self.accept(45) {
+      negative = true
+    } else if !self.accept(43) {
+      return ParsedOffset { kind: OffsetKind.Absent, seconds: 0 }
+    }
+    let hour = self.digits(2)
+    let mut minute: u32 = 0
+    let mut second: u32 = 0
+    if self.accept(58) {
+      minute = self.digits(2)
+      if self.accept(58) {
+        second = self.digits(2)
+      }
+    } else if isDigit(self.peek()) {
+      minute = self.digits(2)
+      if isDigit(self.peek()) {
+        second = self.digits(2)
+      }
+    }
+    if self.failed {
+      return ParsedOffset { kind: OffsetKind.Absent, seconds: 0 }
+    }
+    if hour > 23 || minute > 59 || second > 59 {
+      self.reject(TimeParseReason.OutOfRange, start)
+      return ParsedOffset { kind: OffsetKind.Absent, seconds: 0 }
+    }
+    let total = u32.toI32(hour * 3600 + minute * 60 + second)
+    if negative {
+      return ParsedOffset { kind: OffsetKind.Numeric, seconds: -total }
+    }
+    return ParsedOffset { kind: OffsetKind.Numeric, seconds: total }
+  }
+
+  /// Reads the bracketed annotations that end a text, such as `[Europe/Rome][u-ca=iso8601]`.
+  ///
+  /// # Details
+  ///
+  /// The first annotation can be a time zone, which has no `=`. The scanner keeps it for
+  /// [`Scanner.zoneAnnotation`]. The others are `key=value` pairs. The calendar key `u-ca` must
+  /// have the value `iso8601`, in any letter case, or the scanner fails with `UnsupportedCalendar`.
+  /// An annotation with another key is skipped, unless it starts with `!`, which fails with
+  /// `UnknownCriticalAnnotation`.
+  pub fn annotations(self: &mut Self) -> () {
+    let mut first = true
+    while !self.failed && self.peek() == 91 {
+      let open = self.at
+      self.at = self.at + 1
+      let critical = self.accept(33)
+      let start = self.at
+      let mut equals = self.bytes.length
+      while self.at < self.bytes.length && self.bytes[self.at] != 93 {
+        if self.bytes[self.at] == 91 {
+          self.rejectHere(TimeParseReason.UnexpectedCharacter)
+          return ()
+        }
+        if self.bytes[self.at] == 61 && equals == self.bytes.length {
+          equals = self.at
+        }
+        self.at = self.at + 1
+      }
+      if self.at >= self.bytes.length {
+        self.rejectHere(TimeParseReason.UnexpectedEnd)
+        return ()
+      }
+      let close = self.at
+      self.at = self.at + 1
+      if close == start {
+        self.reject(TimeParseReason.UnexpectedCharacter, close)
+        return ()
+      }
+      if equals == self.bytes.length {
+        // A time zone annotation. Only the first annotation can be one.
+        if !first {
+          self.reject(TimeParseReason.UnexpectedCharacter, open)
+          return ()
+        }
+        self.zoneStart = start
+        self.zoneLength = close - start
+      } else if equals - start == 4 && self.bytes[start] == 117 && self.bytes[start + 1] == 45
+        && self.bytes[start + 2] == 99
+        && self.bytes[start + 3] == 97 {
+        if !isIso8601(self.bytes, equals + 1, close) {
+          self.reject(TimeParseReason.UnsupportedCalendar, equals + 1)
+          return ()
+        }
+      } else if critical {
+        self.reject(TimeParseReason.UnknownCriticalAnnotation, open)
+        return ()
+      }
+      first = false
+    }
+    return ()
+  }
+
+  /// Returns the name inside the time zone annotation that [`Scanner.annotations`] read, such as
+  /// `Europe/Rome`, or an empty slice if the text has none.
+  pub fn zoneAnnotation(self: &Self) -> &'text [u8] {
+    return Slice.view<u8>(self.bytes, self.zoneStart, self.zoneLength)
+  }
+
+  /// Reads a whole date and time text: a date, then optionally `T`, `t`, or a space and a time,
+  /// then optionally an offset, then annotations, then the end of the text.
+  ///
+  /// # Details
+  ///
+  /// An offset is read only after a time. The result says which parts the text has; the caller
+  /// decides which are required and which are not allowed.
+  pub fn dateTime(self: &mut Self) -> ParsedDateTime {
+    let date = self.date()
+    let mut time = ClockTime { hour: 0, minute: 0, second: 0, nanosecond: 0 }
+    let mut hasTime = false
+    let mut offset = ParsedOffset { kind: OffsetKind.Absent, seconds: 0 }
+    if self.accept(84) || self.accept(116) || self.accept(32) {
+      time = self.time()
+      hasTime = true
+      offset = self.offset()
+    }
+    self.annotations()
+    self.end()
+    return ParsedDateTime { date: date, time: time, hasTime: hasTime, offset: offset }
+  }
+
+  /// Reads a whole time text: optionally `T` or `t`, a time, then optionally an offset, then
+  /// annotations, then the end of the text.
+  ///
+  /// # Details
+  ///
+  /// Without the prefix `T`, a text that is also a valid year and month or month and day fails
+  /// with `Ambiguous`. These are `HHMM` when it is a valid `MMDD`, `HHMMSS` when it is a valid
+  /// `YYYYMM`, and an hour or `HHMM` with an offset when it is a valid `MM-DD` or `YYYY-MM`. The
+  /// date of the result is `1970-01-01`.
+  pub fn timeOfDay(self: &mut Self) -> ParsedDateTime {
+    let start = self.at
+    let prefixed = self.accept(84) || self.accept(116)
+    let time = self.time()
+    let afterTime = self.at
+    let offset = self.offset()
+    let afterOffset = self.at
+    self.annotations()
+    self.end()
+    if !self.failed && !prefixed && isAmbiguousTime(self.bytes, start, afterTime, afterOffset) {
+      self.reject(TimeParseReason.Ambiguous, start)
+    }
+    return ParsedDateTime {
+      date: CivilDate { year: 1970, month: 1, day: 1 },
+      time: time,
+      hasTime: true,
+      offset: offset,
+    }
+  }
+}
+
+fn isDigit(byte: u8) -> bool {
+  return byte >= 48 && byte <= 57
+}
+
+fn lower(byte: u8) -> u8 {
+  if byte >= 65 && byte <= 90 {
+    return byte + 32
+  }
+  return byte
+}
+
+fn isIso8601(bytes: &[u8], start: usize, end: usize) -> bool {
+  let name = b"iso8601"
+  if end - start != name.length {
+    return false
+  }
+  let mut index: usize = 0
+  while index < name.length {
+    if lower(bytes[start + index]) != name[index] {
+      return false
+    }
+    index = index + 1
+  }
+  return true
+}
+
+fn twoDigits(bytes: &[u8], at: usize) -> u32 {
+  return u8.toU32(bytes[at] - 48) * 10 + u8.toU32(bytes[at + 1] - 48)
+}
+
+fn allDigits(bytes: &[u8], start: usize, end: usize) -> bool {
+  let mut at = start
+  while at < end {
+    if !isDigit(bytes[at]) {
+      return false
+    }
+    at = at + 1
+  }
+  return true
+}
+
+fn validMonthDay(month: u32, day: u32) -> bool {
+  // A month and day without a year allows February 29.
+  return month >= 1 && month <= 12 && day >= 1 && day <= u8.toU32(Civil.daysInMonth(2000, u32.toU8(month)))
+}
+
+// True if the time text from `start`, whose time ends at `afterTime` and whose offset ends at
+// `afterOffset`, is also a valid month-day or year-month text.
+fn isAmbiguousTime(bytes: &[u8], start: usize, afterTime: usize, afterOffset: usize) -> bool {
+  let timeLength = afterTime - start
+  let offsetLength = afterOffset - afterTime
+  if !allDigits(bytes, start, afterTime) {
+    return false
+  }
+  if offsetLength == 0 {
+    if timeLength == 4 {
+      // HHMM that is also MMDD.
+      return validMonthDay(twoDigits(bytes, start), twoDigits(bytes, start + 2))
+    }
+    if timeLength == 6 {
+      // HHMMSS that is also YYYYMM.
+      let month = twoDigits(bytes, start + 4)
+      return month >= 1 && month <= 12
+    }
+    return false
+  }
+  if offsetLength == 3 && bytes[afterTime] == 45 {
+    if timeLength == 2 {
+      // HH-UU that is also MM-DD.
+      return validMonthDay(twoDigits(bytes, start), twoDigits(bytes, afterTime + 1))
+    }
+    if timeLength == 4 {
+      // HHMM-UU that is also YYYY-MM.
+      let month = twoDigits(bytes, afterTime + 1)
+      return month >= 1 && month <= 12
+    }
+  }
+  return false
+}
+
+fn isLetter(byte: u8) -> bool {
+  return (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
+}
+
+/// Writes `value` as two decimal digits at `output[at]` and returns `at + 2`. `value` must be at
+/// most 99.
+pub fn writeTwo(output: &mut [u8], at: usize, value: u8) -> usize {
+  output[at] = value / 10 + 48
+  output[at + 1] = value % 10 + 48
+  return at + 2
+}
+
+/// Writes a year at `output[at]` and returns the offset after it.
+///
+/// # Details
+///
+/// A year from 0 to 9999 is four digits. Another year is a sign and six digits, as in `+012026`
+/// or `-000044`. `year` must be within 999,999 of zero.
+pub fn writeYear(output: &mut [u8], at: usize, year: i32) -> usize {
+  let mut to = at
+  let mut magnitude = year
+  let mut count: usize = 4
+  if year < 0 || year > 9999 {
+    if year < 0 {
+      output[to] = 45
+      magnitude = -year
+    } else {
+      output[to] = 43
+    }
+    to = to + 1
+    count = 6
+  }
+  let mut index = count
+  let mut rest = magnitude
+  while index > 0 {
+    index = index - 1
+    output[to + index] = i32.toU8(rest % 10) + 48
+    rest = rest / 10
+  }
+  return to + count
+}
+
+/// Writes a date as `YYYY-MM-DD` at `output[at]` and returns the offset after it. The text is 10
+/// bytes, or 13 for a year outside 0 to 9999.
+pub fn writeDate(output: &mut [u8], at: usize, date: CivilDate) -> usize {
+  let mut to = writeYear(&mut output, at, date.year)
+  output[to] = 45
+  to = writeTwo(&mut output, to + 1, date.month)
+  output[to] = 45
+  return writeTwo(&mut output, to + 1, date.day)
+}
+
+/// Writes a time as `HH:MM:SS` at `output[at]`, with a fraction when `time.nanosecond` is not
+/// zero, and returns the offset after it.
+///
+/// # Details
+///
+/// The fraction has as many digits as the value needs, without zeros at the end: `12:30:00.5` or
+/// `12:30:00.000000001`. The text is at most 18 bytes.
+pub fn writeTime(output: &mut [u8], at: usize, time: ClockTime) -> usize {
+  let mut to = writeTwo(&mut output, at, time.hour)
+  output[to] = 58
+  to = writeTwo(&mut output, to + 1, time.minute)
+  output[to] = 58
+  to = writeTwo(&mut output, to + 1, time.second)
+  if time.nanosecond != 0 {
+    output[to] = 46
+    to = to + 1
+    let mut divisor: u32 = 100000000
+    let mut left = time.nanosecond
+    while left != 0 {
+      output[to] = u32.toU8(left / divisor) + 48
+      to = to + 1
+      left = left % divisor
+      divisor = divisor / 10
+    }
+  }
+  return to
+}
+
+/// Writes a UTC offset of `seconds` seconds east of UTC as `+HH:MM` at `output[at]` and returns
+/// the offset after it.
+///
+/// # Details
+///
+/// An offset with a seconds part is `+HH:MM:SS`. Offsets behind UTC have the sign `-`, and zero is
+/// `+00:00`. The text is at most 9 bytes. `seconds` must be within 24 hours of zero.
+pub fn writeOffset(output: &mut [u8], at: usize, seconds: i32) -> usize {
+  let mut magnitude = seconds
+  if seconds < 0 {
+    output[at] = 45
+    magnitude = -seconds
+  } else {
+    output[at] = 43
+  }
+  let mut to = writeTwo(&mut output, at + 1, i32.toU8(magnitude / 3600))
+  output[to] = 58
+  to = writeTwo(&mut output, to + 1, i32.toU8(magnitude / 60 % 60))
+  if magnitude % 60 != 0 {
+    output[to] = 58
+    to = writeTwo(&mut output, to + 1, i32.toU8(magnitude % 60))
+  }
+  return to
+}

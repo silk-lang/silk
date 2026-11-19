@@ -23,7 +23,7 @@ Selfhost CI fails when the committed pages differ from the generator's output.
 Each module header ends with an `@category` line (see the style guide). Give a new module the
 category of the modules that it is used with. The current categories are: Numbers, Geometry, Color,
 Core, Text, Collections, Memory, Concurrency, Input and output, System, Data formats, Cryptography,
-TLS and certificates, HTTP, Networking, SIMD, Native platform, Testing, and Compiler support.
+TLS and certificates, HTTP, Networking, SIMD, Native platform, Time, Testing, and Compiler support.
 
 ## Example evidence
 
