@@ -37,7 +37,8 @@ write to state that other threads can see is atomic or done under the lock.
 ### Count on two threads
 ```silk
 import silk.mem.allocator { Allocator, OutOfMemoryError }
-//! import silk.concurrency.thread_native { NativeThread, SpawnError }
+import silk.core.effect { Effect }
+import silk.concurrency.thread_native { NativeThread, SpawnError }
 import silk.concurrency.sync { Arc, Mutex }
 
 fn addOne(total: Arc<Mutex<i32>>) -> i32 {
@@ -84,7 +85,8 @@ pub fn main() -> i32 {
 ### Wait for another thread
 ```silk
 import silk.mem.allocator { Allocator, OutOfMemoryError }
-//! import silk.concurrency.thread_native { NativeThread, SpawnError }
+import silk.core.effect { Effect }
+import silk.concurrency.thread_native { NativeThread, SpawnError }
 import silk.concurrency.sync { Parker, Unparker }
 
 fn wake(unparker: Unparker) -> i32 {
