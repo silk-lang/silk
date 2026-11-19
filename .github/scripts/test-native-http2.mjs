@@ -74,7 +74,7 @@ try {
   )
   writeFileSync(
     join(directory, 'silk.toml'),
-    '[package]\nname = "http2-test"\nversion = "0.0.0"\nsource = "."\n',
+    '[package]\nname = "http2-test"\nsilk-version = "0.0.0"\nversion = "0.0.0"\nsource = "."\n',
   )
   const build = await run(process.env.SILK_COMPILER ?? 'silk', [
     'build',
@@ -276,7 +276,7 @@ try {
   )
   writeFileSync(
     join(serveDirectory, 'silk.toml'),
-    '[package]\nname = "serve-http2-test"\nversion = "0.0.0"\nsource = "."\n',
+    '[package]\nname = "serve-http2-test"\nsilk-version = "0.0.0"\nversion = "0.0.0"\nsource = "."\n',
   )
   const serveExecutable = join(serveDirectory, 'serve')
   const serveBuild = await run(process.env.SILK_COMPILER ?? 'silk', [

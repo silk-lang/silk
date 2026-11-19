@@ -67,7 +67,7 @@ export const verify = Effect.fn('WasiComponents.verify')(function* (
     const root = join(directory, name)
     yield* fs.makeDirectory(root)
     yield* fs.copyFile(join(repo, 'compiler/fixtures', name, 'main.silk'), join(root, 'main.silk'))
-    yield* fs.writeFileString(join(root, 'silk.toml'), `[package]\nname="${name}"\nsource="."\n`)
+    yield* fs.writeFileString(join(root, 'silk.toml'), `[package]\nname="${name}"\nsilk-version = "0.0.0"\nsource="."\n`)
     const output = join(root, 'out.wasm')
     const built = yield* invoke(
       compiler,
@@ -184,7 +184,7 @@ export const verify = Effect.fn('WasiComponents.verify')(function* (
     yield* fs.copy(wit, join(root, 'wit'))
     yield* fs.writeFileString(
       join(root, 'silk.toml'),
-      `[package]\nname="${name}"\nsource="."\n[component]\nwit="wit"\nworld="${world}"\n`,
+      `[package]\nname="${name}"\nsilk-version = "0.0.0"\nsource="."\n[component]\nwit="wit"\nworld="${world}"\n`,
     )
     const definition = join(root, 'definition.toml')
     const request = join(root, 'request.toml')

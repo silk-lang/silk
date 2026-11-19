@@ -42,7 +42,7 @@ build() {
   local package="$work/$name"
   mkdir -p "$package" "$output/$name"
   cp "corpus/native/$name/main.silk" "$package/main.silk"
-  printf '[package]\nname = "corpus"\nversion = "0.0.0"\nsource = "."\n' > "$package/silk.toml"
+  printf '[package]\nname = "corpus"\nsilk-version = "0.0.0"\nversion = "0.0.0"\nsource = "."\n' > "$package/silk.toml"
   python3 - "$package" "$target" "$PWD/stdlib" "$supply" <<'PYCODE'
 import json, sys
 from pathlib import Path

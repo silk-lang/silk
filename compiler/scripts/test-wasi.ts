@@ -35,7 +35,7 @@ const program = Effect.gen(function* () {
   const source = yield* fs.readFileString(join(repo, 'compiler/fixtures/wasi/main.silk'))
   yield* fs.writeFileString(
     join(directory, 'silk.toml'),
-    '[package]\nname = "wasi-test"\nversion = "0.1.0"\nsource = "."\n',
+    '[package]\nname = "wasi-test"\nsilk-version = "0.0.0"\nversion = "0.1.0"\nsource = "."\n',
   )
   const env = {
     ...process.env,
@@ -350,7 +350,7 @@ const program = Effect.gen(function* () {
     yield* fs.makeDirectory(nested, { recursive: true })
     yield* fs.writeFileString(
       join(examples, 'silk.toml'),
-      `[package]\nname = "wasi-examples"\nsource = "."\n`,
+      `[package]\nname = "wasi-examples"\nsilk-version = "0.0.0"\nsource = "."\n`,
     )
     yield* fs.writeFileString(join(examples, 'marker'), 'package directory')
     const example = [

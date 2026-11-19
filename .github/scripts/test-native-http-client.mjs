@@ -88,7 +88,7 @@ try {
   )
   writeFileSync(
     join(directory, 'silk.toml'),
-    '[package]\nname = "native-http-client-test"\nversion = "0.0.0"\nsource = "."\n',
+    '[package]\nname = "native-http-client-test"\nsilk-version = "0.0.0"\nversion = "0.0.0"\nsource = "."\n',
   )
   const executable = join(directory, 'http-client-test')
   const build = await run(compiler, [
