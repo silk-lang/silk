@@ -66,6 +66,14 @@
 //! and `<name>:<implementation>` otherwise, and compares the new samples with them. So
 //! `--save main` before a change and `--baseline main` after it shows what the change did.
 //!
+//! `--instrument callgrind` also runs each implementation's program once under Valgrind's
+//! Callgrind, after the timed rounds, and adds the instructions it executed to the
+//! implementation's row. Instruction counts barely vary between runs, so they show a small
+//! change in one implementation that timing cannot. They compare two languages poorly, because
+//! instructions differ in cost. The count covers the program from start to exit and not the
+//! processes it starts. A driven program is not counted, and a program that prints result lines
+//! gets the count only when it reports one benchmark. `valgrind` must be on `PATH`.
+//!
 //! # Gotchas
 //! - Processes can be measured on Linux with GNU libc and on macOS.
 //! - Statistics cannot repair a noisy computer. Close other programs, and distrust a run whose
@@ -136,6 +144,7 @@ import silk.bench.html { Html }
 import silk.bench.lines { Lines }
 import silk.bench.process { Driven, Launch, Process, Timed }
 import silk.bench.record {
+  Count,
   Environment,
   Measured,
   Metric,
@@ -186,6 +195,7 @@ import silk.num.u64
 import silk.num.usize
 import silk.schema.issue { SchemaError }
 import silk.schema.json { SchemaJson }
+import silk.system.executable as Executable
 import silk.system.filesystem { FileError, FileSystem, Path }
 import silk.system.host_input { HostInput, HostInputError }
 import silk.system.monotonic_clock { MonotonicClock }
@@ -248,6 +258,9 @@ pub struct BenchOptions {
   pub save: Option<String>,
   /// Compare each suite with the result kept under this name.
   pub baseline: Option<String>,
+  /// Also run each implementation's program once under this instrument and report what it
+  /// counted. `callgrind` counts instructions with Valgrind.
+  pub instrument: Option<String>,
 }
 
 impl BenchOptions {
@@ -275,6 +288,7 @@ impl BenchOptions {
       noise: run String.copy("1"),
       save: Option<String>.None,
       baseline: Option<String>.None,
+      instrument: Option<String>.None,
     }
   }
 }
@@ -318,6 +332,10 @@ impl CommandLine for BenchOptions {
       |> Command.option(
         "baseline",
         Opt.about("Compare with the run kept under this name by --save"),
+      )
+      |> Command.option(
+        "instrument",
+        Opt.about("Also count what one run of each program costs; callgrind counts instructions"),
       )
       |> Command.option(
         "record",
@@ -448,6 +466,8 @@ struct Settings {
   noise: f64,
   // How long one sample of a driven implementation should take, in nanoseconds.
   sample: u64,
+  // Where Valgrind is, when each program is also run once under Callgrind.
+  valgrind: Option<String>,
 }
 
 // A driven implementation: its process while it lives, and what the task learned from it.
@@ -1200,6 +1220,70 @@ effect fn calibrated(driver: &mut Driver, index: usize, target: u64, who: string
   counts[index] = count
 }
 
+effect fn uncounted(who: string, what: string, detail: string) -> never
+  ! TaskError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut message = run String.copy(who)
+  run message.append(what)
+  run message.append(detail)
+  fail TaskError { message: move message, status: 1 }
+}
+
+// Runs the program of `launch` once under Callgrind and returns the instructions it counted
+// for that program. Processes the program starts are not counted.
+effect fn instructionsOf(
+  valgrind: string,
+  launch: &Launch,
+  cpus: u32,
+  scratch: string,
+  who: string,
+) -> u64
+  ! TaskError | FileError | OutOfMemoryError
+  ? &mut Allocator | &mut FileSystem | &mut MonotonicClock {
+  let mut file = run String.copy(scratch)
+  run file.append("/callgrind.out")
+  let place = run Path.make(file.view())
+  run FileSystem.writeFileWithParents(&place, b"")
+  let mut arguments = List<String>.make()
+  run arguments.append(run String.copy("--tool=callgrind"))
+  run arguments.append(run String.copy("--quiet"))
+  let mut out = run String.copy("--callgrind-out-file=")
+  run out.append(file.view())
+  run arguments.append(move out)
+  match Path.view(&launch.program) {
+    Option<string>.Some { value } => run arguments.append(run String.copy(value))
+    Option<string>.None => run uncounted(who, " has a program path that is not text", "")
+  }
+  let given = launch.arguments.asSlice()
+  let mut at: usize = 0
+  while at < given.length {
+    run arguments.append(run String.copy(given[at].view()))
+    at = at + 1
+  }
+  let directory = match &launch.directory {
+    Option<Path>.Some { value } => Option<Path>.Some {
+      value: run Path.fromBytes(Path.rawBytes(&value)),
+    }
+    Option<Path>.None => Option<Path>.None
+  }
+  let wrapped = Launch {
+    program: run Path.make(valgrind),
+    arguments: move arguments,
+    directory: move directory,
+    variables: run copyPairs(launch.variables.asSlice()),
+    output: Option<Path>.None,
+  }
+  let timed = run Process.time(&wrapped, cpus)
+  if timed.exit != 0 {
+    run uncounted(who, " did not end well under ", valgrind)
+  }
+  let profile = run FileSystem.readFile(&place)
+  return match Process.instructions(profile.asSlice()) {
+    Option<u64>.Some { value } => value
+    Option<u64>.None => run uncounted(who, " left no instruction count in ", file.view())
+  }
+}
+
 effect fn timeBenchmark(
   plan: &Plan,
   combination: &Combination,
@@ -1327,11 +1411,40 @@ effect fn timeBenchmark(
     run retired(&mut all[at], candidates[at].name.view())
     at = at + 1
   }
+  let mut counts = List<Count>.make()
+  if let Option<String>.Some { value: valgrind } = &settings.valgrind {
+    at = 0
+    while at < candidates.length {
+      // A driven program waits for commands, so one run of it measures nothing.
+      if candidates[at].drives {
+        at = at + 1
+        continue
+      }
+      run performAll(&candidates[at].before, pairs)
+      let value = run instructionsOf(
+        valgrind.view(),
+        &launches.asSlice()[at],
+        combination.cpus,
+        scratch,
+        candidates[at].name.view(),
+      )
+      run performAll(&candidates[at].after, pairs)
+      run counts.append(
+        Count {
+          implementation: run String.copy(candidates[at].name.view()),
+          unit: run String.copy("instructions"),
+          value: u64.toF64(value),
+        },
+      )
+      at = at + 1
+    }
+  }
   return Measured {
     name: run String.copy(combination.name.view()),
     parameters: run copyPairs(pairs),
     samples: move samples,
     readings: move readings,
+    counts: move counts,
   }
 }
 
@@ -1827,6 +1940,23 @@ effect fn performed(options: &BenchOptions, suites: &[Suite]) -> ()
   if !(percent >= 0.0 && percent < 100.0) {
     run invalid("--noise takes a number of percent from 0 to 100, not ", options.noise.view())
   }
+  let valgrind = match &options.instrument {
+    Option<String>.Some { value } => {
+      if value.view() != "callgrind" {
+        run invalid("--instrument takes callgrind, not ", value.view())
+      }
+      match move run Executable.find("valgrind") {
+        Option<Path>.Some { value: found } => match Path.view(&found) {
+          Option<string>.Some { value: text } => Option<String>.Some {
+            value: run String.copy(text),
+          }
+          Option<string>.None => run invalid("the path of valgrind is not text", "")
+        }
+        Option<Path>.None => run invalid("--instrument callgrind needs valgrind on PATH", "")
+      }
+    }
+    Option<String>.None => Option<String>.None
+  }
 
   let mut paths = List<Deferred<Path>>.make()
   run paths.append(run Deferred<Path>.source("build/bench"))
@@ -1874,6 +2004,12 @@ effect fn performed(options: &BenchOptions, suites: &[Suite]) -> ()
         warmups: 1,
         noise: percent / 100.0,
         sample: 50000000,
+        valgrind: match &valgrind {
+          Option<String>.Some { value } => Option<String>.Some {
+            value: run String.copy(value.view()),
+          }
+          Option<String>.None => Option<String>.None
+        },
       }
       if let Option<u64>.Some { value } = suite.sampling {
         settings.sample = value * 1000000
