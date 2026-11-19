@@ -378,6 +378,13 @@ path from that point reads it before it is written again. Cleanup counts as a re
 lifetimes that cleanup observes (LIFE-005). The lifetime parameters of the body and its enclosing
 declarations, and `'static`, are chosen by the caller: their regions hold the whole body.
 
+A call relates its operands and its result through the callee's signature, never through its body.
+A conformance bound of the callee is part of that signature: where the call's inference gave one
+region both to a lifetime parameter that the bound names and to the provider's type argument, as
+`V: Lends<'s, T>` with `View<'r>` for `V` proved as `View<'r>: Lends<'r, T>` (GEN-003), the two
+regions are equal at that call. A value of the provider's type that the call returns then holds
+every loan that the operands lend for that parameter.
+
 A borrow creates a loan whose region is the region of the resulting reference. The loan is in scope
 from the borrow along each path until the path reaches a point its region does not hold, or a write
 of the borrowed place or a prefix of it. While a loan is in scope, conflicting access to its place

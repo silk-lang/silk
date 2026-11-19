@@ -184,6 +184,38 @@ example, if `context: C` fixes `C = Inspection` and the only selected conformanc
 evidence: it fills holes but must agree with every explicit or operand-derived binding already in
 the call.
 
+The same bound gives a lifetime that a written type argument omits. In `holder.lend<View>()` the
+argument `View` omits its lifetime, which is a fresh region of the calling body (LIFE-003). When the
+callee declares `V: Lends<'s, T>` and the selected conformance is
+`impl<'a> Lends<'a, Pair> for View<'a>`, its head equates that region with `'s`, the region the
+operand `self: &'s Self` borrows for. The result `View` therefore keeps the borrow of `holder` in
+scope while it is used (LIFE-006), although the callee's result type is the bare parameter `V`.
+
+```silk
+struct Pair { pub first: i32, pub second: i32 }
+struct Holder<T> { value: T }
+struct View<'a> { pub first: &'a i32 }
+
+interface Lends<'s, T> {
+  fn lend(source: &'s T) -> Self
+}
+
+impl<'a> Lends<'a, Pair> for View<'a> {
+  fn lend(source: &'a Pair) -> View<'a> { return View { first: &source.first } }
+}
+
+impl<T> Holder<T> {
+  fn lend<'s, V: Lends<'s, T>>(self: &'s Self) -> V { return Lends.lend(&self.value) }
+}
+
+fn first(holder: &Holder<Pair>) -> i32 {
+  let view = holder.lend<View>()
+  return view.first.*
+}
+```
+
+A provider that still names an open type or row of the call selects no conformance.
+
 This prefix form is required by existing Effect APIs that explicitly choose one service-role key
 while inferring success, failure, requirement, provider, and remainder parameters from their value
 arguments.
@@ -217,7 +249,8 @@ every type argument or none. That direction is superseded. The current compiler,
 and stable rule use an ordered prefix because provider APIs and ordinary partial selection depend
 on it.
 
-**Evidence:** current inference specification,
+**Evidence:** current inference specification; corpus programs
+`bound-lifetime-ties-omitted-lifetime` and `bound-lifetime-ties-omitted-lifetime-live`;
 [call specialization](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/CallResolution.ts),
 [provider inference](requirements-and-services.md#serv-007--provision-infers-exactly-one-compatible-requirement-key).
 

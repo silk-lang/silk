@@ -1,0 +1,940 @@
+//! Growable lists that store each field of a struct in its own column.
+//!
+//! # When to use
+//! Use [`ColumnList`] for many rows of a small `Copy` struct when loops read or write a few of the
+//! fields at a time, such as the positions of all particles or the kinds of all tokens. A column is
+//! an ordinary slice, so a loop over one field touches only that field's bytes. Use
+//! `silk.collections.list.List` when code handles one whole element at a time, or when the
+//! elements own storage.
+//!
+//! # Details
+//! The row type `T` is a struct or a named tuple that the caller declares. The list keeps one
+//! allocation that holds every column. The columns are in order of falling alignment and then in
+//! declaration order, so no column needs padding: a row of `x: f32`, `alive: bool`, `id: u64`,
+//! `y: f32` is 24 bytes as a struct and 17 bytes in a `ColumnList`.
+//!
+//! [`ColumnList.column`] and [`ColumnList.columnMut`] borrow one column. The column is named by a
+//! string literal that the compiler checks against the fields of the row type, as in
+//! `particles.column("x")`. To use several columns at once, declare a view: a struct in which each
+//! field has the name of a field of the row type and the type `&'a [V]` or `&'a mut [V]`, where `V`
+//! is the type of that field. Implement [`ColumnView`] for it, then call [`ColumnList.columns`] or
+//! [`ColumnList.columnsMut`]. A function that takes the view states in its signature which columns
+//! it reads and which it writes.
+//!
+//! [`ColumnList.make`] does not allocate. The first growth allocates space for four rows, and each
+//! later growth doubles the capacity. A growth moves every column, so a failed growth leaves the
+//! list unchanged.
+//!
+//! # Gotchas
+//! The row type must implement `Copy`, every field of it must be `pub`, and at least one field
+//! must have a size. [`ColumnList.get`], [`ColumnList.set`], [`ColumnList.remove`] and
+//! [`ColumnList.swapRemove`] trap if the index is not less than the length.
+//!
+//! # Examples
+//! ## Read one column
+//! ```silk
+//! import silk.collections.column_list { ColumnList }
+//! import silk.core.effect { Effect }
+//! import silk.core.ownership { Copy }
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//!
+//! struct Particle {
+//!   pub x: f32,
+//!   pub alive: bool,
+//!   pub id: u64,
+//! }
+//!
+//! impl Copy for Particle {}
+//!
+//! effect fn total() -> u64
+//!   ! OutOfMemoryError
+//!   ? &mut Allocator {
+//!   let mut particles = ColumnList<Particle>.make()
+//!   run ColumnList<Particle>.append(&mut particles, Particle { x: 1.5, alive: true, id: 7 })
+//!   run ColumnList<Particle>.append(&mut particles, Particle { x: 2.5, alive: false, id: 8 })
+//!
+//!   // Each column is a slice with one element for each row.
+//!   let alive = ColumnList<Particle>.column(&particles, "alive")
+//!   let ids = ColumnList<Particle>.column(&particles, "id")
+//!   let mut sum: u64 = 0
+//!   let mut at: usize = 0
+//!   while at < alive.length {
+//!     if alive[at] {
+//!       sum = sum + ids[at]
+//!     }
+//!     at = at + 1
+//!   }
+//!   return sum
+//! }
+//!
+//! effect fn recover(error: OutOfMemoryError) -> u64 {
+//!   return 0
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let sum = run total()
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!     |> Effect.catchAll(recover)
+//!   if sum != 7 {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! ## Write one column while reading another
+//! ```silk
+//! import silk.collections.column_list { ColumnList, ColumnView }
+//! import silk.core.effect { Effect }
+//! import silk.core.ownership { Copy }
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//!
+//! struct Particle {
+//!   pub x: f32,
+//!   pub speed: f32,
+//!   pub id: u64,
+//! }
+//!
+//! impl Copy for Particle {}
+//!
+//! // The view names the columns that the loop uses. It can write `x` and can only read `speed`.
+//! struct Step<'a> {
+//!   pub x: &'a mut [f32],
+//!   pub speed: &'a [f32],
+//! }
+//!
+//! impl<'a> ColumnView<'a, Particle> for Step<'a> {}
+//!
+//! fn advance(step: Step<'_>, seconds: f32) -> () {
+//!   let mut at: usize = 0
+//!   while at < step.x.length {
+//!     step.x[at] = step.x[at] + step.speed[at] * seconds
+//!     at = at + 1
+//!   }
+//!   return ()
+//! }
+//!
+//! effect fn moved() -> f32
+//!   ! OutOfMemoryError
+//!   ? &mut Allocator {
+//!   let mut particles = ColumnList<Particle>.make()
+//!   run ColumnList<Particle>.append(&mut particles, Particle { x: 1.0, speed: 4.0, id: 1 })
+//!   let step = ColumnList<Particle>.columnsMut<Step>(&mut particles)
+//!   advance(move step, 0.5)
+//!   return ColumnList<Particle>.get(&particles, 0).x
+//! }
+//!
+//! effect fn recover(error: OutOfMemoryError) -> f32 {
+//!   return 0.0
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let x = run moved()
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!     |> Effect.catchAll(recover)
+//!   if x != 3.0 {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! @category Collections
+
+// A struct-of-arrays list over the allocation substrate. Ordinary Silk: no compiler phase knows
+// this type. The list is one byte buffer, a row count and a row capacity for every `T`. The byte
+// offset of a column is `capacity * bytesBefore(field)`, and `bytesBefore` is static, so the list
+// stores no pointer per column and a column access is one multiply and one add.
+//
+// Rows are `Copy`, so no slot ever needs a drop: removing rows only lowers the count, and dropping
+// the list is the buffer's own release.
+
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.reflect { Reflect, labeledFieldKind, namedKind, positionalKind }
+import silk.core.static_text { StaticText }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.layout { Layout }
+import silk.mem.pointer { Pointer }
+import silk.mem.raw_buffer { RawBuffer }
+import silk.num.usize
+
+/// A growable list of `T` rows that stores each field of `T` in its own column.
+///
+/// # Details
+///
+/// The length is the number of rows. The capacity is the number of rows that fit before the next
+/// growth. All columns live in one allocation, in order of falling alignment and then in
+/// declaration order, with no padding between or inside them. Dropping the list releases the
+/// allocation. A list is affine.
+///
+/// # Gotchas
+///
+/// `T` must implement `Copy`, every field of `T` must be `pub`, and at least one field must have a
+/// size. A field that is itself a struct is one column of that struct.
+pub struct ColumnList<T> {
+  bytes: Intrinsic.RawBuffer<u8>,
+  count: usize,
+  limit: usize,
+}
+
+/// Marks a struct of column slices as a view of the rows `T`, borrowed for `'s`.
+///
+/// # When to use
+///
+/// Implement it, with no operations, for a struct to pass to [`ColumnList.columns`] or
+/// [`ColumnList.columnsMut`]: `impl<'a> ColumnView<'a, Particle> for Step<'a> {}`. The lifetime
+/// ties the view to the borrow of the list, so the list cannot change while the view is in use.
+///
+/// # Gotchas
+///
+/// Each field of the view must be `pub`, must have the name of a field of `T`, and must have the
+/// type `&'a [V]` or `&'a mut [V]`, where `V` is the type of that field.
+pub interface ColumnView<'s, T> {}
+
+impl<T: Copy> ColumnList<T> {
+  /// Returns an empty list. This function does not allocate.
+  pub fn make() -> ColumnList<T> {
+    static if !validRow<T>() {
+      compileError("the row type of a ColumnList is a struct or named tuple with a sized field")
+    }
+    return ColumnList<T> {
+      bytes: Intrinsic.rawBufferEmpty<u8>(),
+      count: usize.ZERO,
+      limit: usize.ZERO,
+    }
+  }
+
+  /// Returns an empty list with storage for exactly `capacity` rows.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the size of `capacity` rows overflows, or the `Allocator` cannot
+  ///   supply the storage.
+  pub effect fn makeWithCapacity(capacity: usize) -> ColumnList<T>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut list = ColumnList<T>.make()
+    if capacity != usize.ZERO {
+      run regrow<T>(&mut list, capacity)
+    }
+    return move list
+  }
+
+  /// Returns the number of rows in the list.
+  pub fn length(self: &Self) -> usize {
+    return self.count
+  }
+
+  /// Returns the number of rows that fit in the current storage before the next growth.
+  pub fn capacity(self: &Self) -> usize {
+    return self.limit
+  }
+
+  /// Returns a shared borrow of the column of `field`, one element for each row, in row order.
+  ///
+  /// # Details
+  ///
+  /// `field` is a static argument. Write the field's name as a string literal:
+  /// `particles.column("x")`. A name that is not a field of `T` is an error at the literal.
+  ///
+  /// # Gotchas
+  ///
+  /// The slice borrows the list. The compiler rejects a change to the list while the slice is
+  /// live.
+  pub fn column<'s, V>(self: &'s Self, static field: Intrinsic.Field<T, V>) -> &'s [V] {
+    unsafe {
+      let start = columnStart<T, V>(&self.bytes, self.limit, field)
+      return Intrinsic.pointerBorrowMany<Self, V>(self, start, self.count)
+    }
+  }
+
+  /// Returns an exclusive borrow of the column of `field`, one element for each row, in row order.
+  ///
+  /// # When to use
+  ///
+  /// Use `columnMut` to change one column in place. To change several columns in one loop, use
+  /// [`ColumnList.columnsMut`].
+  ///
+  /// # Gotchas
+  ///
+  /// The slice cannot change the length. The compiler rejects other uses of the list while the
+  /// slice is live.
+  pub fn columnMut<'s, V>(self: &'s mut Self, static field: Intrinsic.Field<T, V>) -> &'s mut [V] {
+    unsafe {
+      let limit = self.limit
+      let count = self.count
+      let start = columnStartMut<T, V>(&mut self.bytes, limit, field)
+      return Intrinsic.pointerBorrowManyMut<Self, V>(&mut self, start, count)
+    }
+  }
+
+  /// Returns a view of several columns, each one a shared borrow.
+  ///
+  /// # Details
+  ///
+  /// `View` is a struct that the caller declares and for which the caller implements
+  /// [`ColumnView`]. Each field of it has the name of a field of `T` and the type `&'a [V]`, where
+  /// `V` is the type of that field. Write the view type at the call:
+  /// `particles.columns<Positions>()`. A field of the view that is not a field of `T`, or that has
+  /// the type `&'a mut [V]`, is a compile error.
+  ///
+  /// # Gotchas
+  ///
+  /// The view borrows the list. The compiler rejects a change to the list while the view is live.
+  pub fn columns<'s, View: ColumnView<'s, T>>(self: &'s Self) -> View {
+    static if !validView<T, View>(true) {
+      compileError("a view of a ColumnList is a struct with a field for each column it uses")
+    }
+    unsafe {
+      return View {
+        static for slot in Reflect.fields<View>() { [slot]: sharedSlot<'s, T, View>(self, slot) },
+      }
+    }
+  }
+
+  /// Returns a view of several columns, in which each column is a shared or an exclusive borrow.
+  ///
+  /// # When to use
+  ///
+  /// Use `columnsMut` for a loop that writes some columns while it reads others. The view type
+  /// states which is which: a field of type `&'a mut [V]` can be written, and a field of type
+  /// `&'a [V]` can only be read.
+  ///
+  /// # Details
+  ///
+  /// `View` is a struct that the caller declares and for which the caller implements
+  /// [`ColumnView`]. Each field of it has the name of a field of `T` and the type `&'a [V]` or
+  /// `&'a mut [V]`, where `V` is the type of that field. Write the view type at the call:
+  /// `particles.columnsMut<Step>()`. A field of the view that is not a field of `T` is a compile
+  /// error.
+  ///
+  /// # Gotchas
+  ///
+  /// The view cannot change the length. The compiler rejects other uses of the list while the
+  /// view is live.
+  pub fn columnsMut<'s, View: ColumnView<'s, T>>(self: &'s mut Self) -> View {
+    static if !validView<T, View>(false) {
+      compileError("a view of a ColumnList is a struct with a field for each column it uses")
+    }
+    unsafe {
+      let limit = self.limit
+      let count = self.count
+      let base = bufferStartMut(&mut self.bytes)
+      let mut marks = Option<&'s mut Mark>.some(firstMark<'s, Self>(move self))
+      return View {
+        static for slot in Reflect.fields<View>() { [slot]: lentSlot<'s, T, View>(
+          nextMark<'s>(&mut marks),
+          base,
+          limit,
+          count,
+          slot,
+        ) },
+      }
+    }
+  }
+
+  /// Returns the row at `index`, gathered from the columns.
+  ///
+  /// # Gotchas
+  ///
+  /// It traps if `index` is not less than the length.
+  pub fn get(self: &Self, index: usize) -> T {
+    if index >= self.count {
+      return Intrinsic.trap("ColumnList.get: the index is not less than the length")
+    }
+    return rowAt<T>(&self.bytes, self.limit, index)
+  }
+
+  /// Replaces the row at `index` with `row`.
+  ///
+  /// # Gotchas
+  ///
+  /// It traps if `index` is not less than the length.
+  pub fn set(self: &mut Self, index: usize, row: T) -> () {
+    if index >= self.count {
+      return Intrinsic.trap("ColumnList.set: the index is not less than the length")
+    }
+    let limit = self.limit
+    putRow<T>(&mut self.bytes, limit, index, &row)
+    return ()
+  }
+
+  /// Adds `row` at the end of the list.
+  ///
+  /// # Details
+  ///
+  /// If the list is full, it grows: the first growth allocates space for four rows, and each
+  /// later growth doubles the capacity.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the new storage. The list does not
+  ///   change.
+  pub effect fn append(self: &mut Self, row: T) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.count == self.limit {
+      run growFor<T>(&mut self.*, usize.ONE)
+    }
+    let limit = self.limit
+    let index = self.count
+    putRow<T>(&mut self.bytes, limit, index, &row)
+    self.count = index + usize.ONE
+    return ()
+  }
+
+  /// Inserts `row` at `index` and moves the rows from `index` up by one.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the new storage. The list does not
+  ///   change.
+  ///
+  /// # Gotchas
+  ///
+  /// It traps if `index` is more than the length.
+  pub effect fn insert(self: &mut Self, index: usize, row: T) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if index > self.count {
+      return Intrinsic.trap("ColumnList.insert: the index is more than the length")
+    }
+    if self.count == self.limit {
+      run growFor<T>(&mut self.*, usize.ONE)
+    }
+    let limit = self.limit
+    let count = self.count
+    moveRows<T>(&mut self.bytes, limit, index, index + usize.ONE, count - index)
+    putRow<T>(&mut self.bytes, limit, index, &row)
+    self.count = count + usize.ONE
+    return ()
+  }
+
+  /// Removes the last row and returns it, or none if the list is empty.
+  pub fn pop(self: &mut Self) -> Option<T> {
+    if self.count == usize.ZERO {
+      return Option<T>.none()
+    }
+    let index = self.count - usize.ONE
+    let row = rowAt<T>(&self.bytes, self.limit, index)
+    self.count = index
+    return Option<T>.some(row)
+  }
+
+  /// Removes the row at `index`, moves the later rows down by one, and returns the removed row.
+  ///
+  /// # When to use
+  ///
+  /// Use `remove` when the order of the rows matters. [`ColumnList.swapRemove`] moves only one row,
+  /// but it changes the order.
+  ///
+  /// # Gotchas
+  ///
+  /// It traps if `index` is not less than the length.
+  pub fn remove(self: &mut Self, index: usize) -> T {
+    if index >= self.count {
+      return Intrinsic.trap("ColumnList.remove: the index is not less than the length")
+    }
+    let limit = self.limit
+    let count = self.count
+    let row = rowAt<T>(&self.bytes, limit, index)
+    moveRows<T>(&mut self.bytes, limit, index + usize.ONE, index, count - index - usize.ONE)
+    self.count = count - usize.ONE
+    return row
+  }
+
+  /// Removes the row at `index`, puts the last row in its place, and returns the removed row.
+  ///
+  /// # Details
+  ///
+  /// It moves one row whatever the length is, but it changes the order of the rows.
+  ///
+  /// # Gotchas
+  ///
+  /// It traps if `index` is not less than the length.
+  pub fn swapRemove(self: &mut Self, index: usize) -> T {
+    if index >= self.count {
+      return Intrinsic.trap("ColumnList.swapRemove: the index is not less than the length")
+    }
+    let limit = self.limit
+    let last = self.count - usize.ONE
+    let row = rowAt<T>(&self.bytes, limit, index)
+    if index != last {
+      let moved = rowAt<T>(&self.bytes, limit, last)
+      putRow<T>(&mut self.bytes, limit, index, &moved)
+    }
+    self.count = last
+    return row
+  }
+
+  /// Removes all rows and keeps the capacity.
+  pub fn clear(self: &mut Self) -> () {
+    self.count = usize.ZERO
+    return ()
+  }
+
+  /// Removes the rows from `length` to the end and keeps the capacity. It does nothing if
+  /// `length` is not less than the current length.
+  pub fn truncate(self: &mut Self, length: usize) -> () {
+    if length < self.count {
+      self.count = length
+    }
+    return ()
+  }
+
+  /// Makes room for at least `additional` more rows.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the row count overflows, or the `Allocator` cannot supply the
+  ///   storage. The list does not change.
+  pub effect fn reserve(self: &mut Self, additional: usize) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.limit - self.count < additional {
+      run growFor<T>(&mut self.*, additional)
+    }
+    return ()
+  }
+
+  /// Releases the capacity beyond the length.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the smaller storage. The list does not
+  ///   change.
+  pub effect fn shrinkToFit(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.count == self.limit {
+      return ()
+    }
+    if self.count == usize.ZERO {
+      let old = Intrinsic.replace(self.bytes, Intrinsic.rawBufferEmpty<u8>())
+      drop old
+      self.limit = usize.ZERO
+      return ()
+    }
+    let count = self.count
+    return run regrow<T>(&mut self.*, count)
+  }
+}
+
+// Whether `T` can be a row: a declared struct or named tuple whose fields are all visible here and
+// have a size between them. A field that is not `pub` is refused at its declaration.
+static fn validRow<T>() -> bool {
+  let kind = Reflect.typeKind<T>(Reflect.typeOf<T>())
+  if kind != namedKind && kind != positionalKind {
+    return false
+  }
+  let hidden = Reflect.privateField<T>()
+  if StaticText.byteLength(hidden) != usize.ZERO {
+    let mut text = StaticText.concat(
+      "a ColumnList stores every field in its own column, so `",
+      hidden,
+    )
+    text = StaticText.concat(text, "` must be `pub`")
+    StaticText.errorAt(hidden, usize.ZERO, StaticText.byteLength(hidden), text)
+  }
+  return rowBytes<T>() != usize.ZERO
+}
+
+// Whether `View` can be a view of the rows `T`: a declared struct whose fields are all visible
+// here and each name a field of `T`. A view that only reads (`shared`) has no `&mut` field. A field
+// that breaks a rule is refused at its declaration.
+static fn validView<T, View>(shared: bool) -> bool {
+  if Reflect.typeKind<View>(Reflect.typeOf<View>()) != namedKind {
+    return false
+  }
+  let hidden = Reflect.privateField<View>()
+  if StaticText.byteLength(hidden) != usize.ZERO {
+    let mut text = StaticText.concat("a ColumnList fills each field of a view, so `", hidden)
+    text = StaticText.concat(text, "` must be `pub`")
+    StaticText.errorAt(hidden, usize.ZERO, StaticText.byteLength(hidden), text)
+  }
+  static for slot in Reflect.fields<View>() {
+    let label = Reflect.fieldLabel(slot)
+    if !hasColumn<T>(label) {
+      let mut text = StaticText.concat("`", Reflect.typeName<T>())
+      text = StaticText.concat(text, "` has no field `")
+      text = StaticText.concat(text, label)
+      text = StaticText.concat(text, "`, so a view of its columns cannot have one")
+      StaticText.errorAt(label, usize.ZERO, StaticText.byteLength(label), text)
+    }
+    if shared && exclusiveSlot(slot) {
+      let mut text = StaticText.concat("`columns` lends each column as a shared slice, so `", label)
+      text = StaticText.concat(text, "` cannot be `&mut`; use `columnsMut`")
+      StaticText.errorAt(label, usize.ZERO, StaticText.byteLength(label), text)
+    }
+  }
+  return true
+}
+
+// Whether `T` has a field with the name `label`.
+static fn hasColumn<T>(label: string<'static>) -> bool {
+  let mut found = false
+  static for field in Reflect.fields<T>() {
+    if Reflect.fieldLabel(field) == label {
+      found = true
+    }
+  }
+  return found
+}
+
+// Whether the type of a view field is an exclusive reference.
+static fn exclusiveSlot<View, Slice>(slot: Intrinsic.Field<View, Slice>) -> bool {
+  let name = Reflect.typeName<Slice>()
+  return StaticText.byteLength(name) > 4 && StaticText.slice(name, usize.ZERO, 5) == "&mut "
+}
+
+static fn bytesOf<T, V>(field: Intrinsic.Field<T, V>) -> usize {
+  return Layout.of<V>().bytes
+}
+
+static fn alignmentOf<T, V>(field: Intrinsic.Field<T, V>) -> usize {
+  return Layout.of<V>().alignment
+}
+
+// Whether two descriptors of `T` describe the same field: the same name, or the same position in
+// a named tuple.
+static fn sameField<T, A, B>(left: Intrinsic.Field<T, A>, right: Intrinsic.Field<T, B>) -> bool {
+  if Reflect.fieldKind<T, A>(left) == labeledFieldKind {
+    return Reflect.fieldLabel<T, A>(left) == Reflect.fieldLabel<T, B>(right)
+  }
+  return Reflect.fieldOrdinal<T, A>(left) == Reflect.fieldOrdinal<T, B>(right)
+}
+
+// The bytes of one row: the sum of the field sizes, with no padding.
+static fn rowBytes<T>() -> usize {
+  let mut total: usize = 0
+  static for field in Reflect.fields<T>() {
+    total = total + bytesOf(field)
+  }
+  return total
+}
+
+// The alignment of the allocation: the largest field alignment.
+static fn rowAlignment<T>() -> usize {
+  let mut most: usize = 1
+  static for field in Reflect.fields<T>() {
+    if alignmentOf(field) > most {
+      most = alignmentOf(field)
+    }
+  }
+  return most
+}
+
+// The bytes of one row that are stored in front of the column of `target`. Columns are in order of
+// falling alignment and then in declaration order. Each field size is a multiple of its alignment,
+// so `capacity * bytesBefore(target)` is aligned for `target`.
+static fn bytesBefore<T, V>(target: Intrinsic.Field<T, V>) -> usize {
+  let mut total: usize = 0
+  let mut seen = false
+  static for field in Reflect.fields<T>() {
+    if sameField(field, target) {
+      seen = true
+    } else {
+      if alignmentOf(field) > alignmentOf(target)
+        || (alignmentOf(field) == alignmentOf(target) && !seen) {
+        total = total + bytesOf(field)
+      }
+    }
+  }
+  return total
+}
+
+// The first element of the column of `field` in a buffer of `limit` rows. The buffer of an empty
+// list owns no storage; its null base is never read, because the count is zero.
+unsafe fn columnStart<T, V>(
+  bytes: &Intrinsic.RawBuffer<u8>,
+  limit: usize,
+  static field: Intrinsic.Field<T, V>,
+) -> [*]const V {
+  unsafe {
+    let start = Intrinsic.pointerFromSlice<u8>(RawBuffer.view<u8>(bytes, usize.ZERO, usize.ZERO))
+    let base = Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(start)
+    let first = Intrinsic.pointerAt<u8>(base, limit * bytesBefore(field))
+    return Pointer.assumeMany<V>(Pointer.assumeAligned<V>(Pointer.castUnaligned<u8, V>(first)))
+  }
+}
+
+unsafe fn columnStartMut<T, V>(
+  bytes: &mut Intrinsic.RawBuffer<u8>,
+  limit: usize,
+  static field: Intrinsic.Field<T, V>,
+) -> [*]mut V {
+  unsafe {
+    return columnAtMut<T, V>(bufferStartMut(&mut bytes.*), limit, field)
+  }
+}
+
+// The first byte of the buffer, for writes.
+unsafe fn bufferStartMut(bytes: &mut Intrinsic.RawBuffer<u8>) -> [*]mut u8 {
+  unsafe {
+    let mut empty = RawBuffer.viewMut<u8>(&mut bytes.*, usize.ZERO, usize.ZERO)
+    return Intrinsic.pointerRequalify<?[*]mut u8, [*]mut u8>(
+      Intrinsic.pointerFromMutSlice<u8>(&mut empty),
+    )
+  }
+}
+
+unsafe fn columnAtMut<T, V>(
+  base: [*]mut u8,
+  limit: usize,
+  static field: Intrinsic.Field<T, V>,
+) -> [*]mut V {
+  unsafe {
+    let first = Intrinsic.pointerAtMut<u8>(base, limit * bytesBefore(field))
+    return Pointer.assumeManyMut<V>(
+      Pointer.assumeAlignedMut<V>(Pointer.castUnalignedMut<u8, V>(first)),
+    )
+  }
+}
+
+// One field of a shared view: the column of `T` that has the name of `slot`.
+unsafe fn sharedSlot<'s, T, View, V>(
+  list: &'s ColumnList<T>,
+  static slot: Intrinsic.Field<View, &'s [V]>,
+) -> &'s [V] {
+  unsafe {
+    let static source = Reflect.field<T, V>(Reflect.fieldLabel(slot))
+    let start = columnStart<T, V>(&list.bytes, list.limit, source)
+    return Intrinsic.pointerBorrowMany<ColumnList<T>, V>(list, start, list.count)
+  }
+}
+
+// One field of a view that can write: the column of `T` that has the name of `slot`, lent as the
+// slice type the view declares.
+unsafe fn lentSlot<'s, T, View, V, Slice: Lent<'s, V>>(
+  mark: &'s mut Mark,
+  base: [*]mut u8,
+  limit: usize,
+  count: usize,
+  static slot: Intrinsic.Field<View, Slice>,
+) -> Slice {
+  unsafe {
+    let static source = Reflect.field<T, V>(Reflect.fieldLabel(slot))
+    return Lent.lend(move mark, columnAtMut<T, V>(base, limit, source), count)
+  }
+}
+
+// An exclusive borrow of nothing. A view holds one exclusive borrow of the list for each of its
+// fields. The columns are disjoint, so the borrows are too, but the borrow of the list is one
+// value. A mark carries its lifetime to one column.
+struct Mark {}
+
+struct Marks {
+  here: Mark,
+  rest: Mark,
+}
+
+// The two slice types a view field can have.
+interface Lent<'s, V> {
+  fn lend(mark: &'s mut Mark, start: [*]mut V, count: usize) -> Self
+}
+
+impl<'s, V> Lent<'s, V> for &'s [V] {
+  fn lend(mark: &'s mut Mark, start: [*]mut V, count: usize) -> &'s [V] {
+    unsafe {
+      return Intrinsic.pointerBorrowMany<Mark, V>(
+        shared<'s>(move mark),
+        Intrinsic.pointerRequalify<[*]mut V, [*]const V>(start),
+        count,
+      )
+    }
+  }
+}
+
+impl<'s, V> Lent<'s, V> for &'s mut [V] {
+  fn lend(mark: &'s mut Mark, start: [*]mut V, count: usize) -> &'s mut [V] {
+    unsafe {
+      return Intrinsic.pointerBorrowManyMut<Mark, V>(move mark, start, count)
+    }
+  }
+}
+
+// A mark that only reads.
+fn shared<'s>(mark: &'s mut Mark) -> &'s Mark {
+  return &mark.*
+}
+
+// The exclusive borrow of the list as a mark. A mark has no bytes, so it can live at any address.
+unsafe fn firstMark<'s, A>(anchor: &'s mut A) -> &'s mut Mark {
+  unsafe {
+    let place = Pointer.assumeAlignedMut<Mark>(
+      Pointer.castUnalignedMut<A, Mark>(Intrinsic.pointerFromMutRef<A>(&mut anchor.*)),
+    )
+    return Intrinsic.pointerBorrowMut<A, Mark>(move anchor, place)
+  }
+}
+
+// Splits the mark in `marks` in two, keeps one half in `marks` and returns the other.
+unsafe fn nextMark<'s>(marks: &mut Option<&'s mut Mark>) -> &'s mut Mark {
+  let current = match move Intrinsic.replace(marks.*, Option<&'s mut Mark>.none()) {
+    Option<&'s mut Mark>.Some { value } => move value
+    Option<&'s mut Mark>.None => {
+      return Intrinsic.trap("ColumnList: a view mark was taken twice")
+    }
+  }
+  unsafe {
+    let place = Pointer.assumeAlignedMut<Marks>(
+      Pointer.castUnalignedMut<Mark, Marks>(Intrinsic.pointerFromMutRef<Mark>(&mut current.*)),
+    )
+    let both = Intrinsic.pointerBorrowMut<Mark, Marks>(move current, place)
+    marks.* = Option<&'s mut Mark>.some(&mut both.rest)
+    return &mut both.here
+  }
+}
+
+// Reads one element of a column. The caller checked `index` against the row count.
+unsafe fn cell<T, V: Copy>(
+  bytes: &Intrinsic.RawBuffer<u8>,
+  limit: usize,
+  index: usize,
+  static field: Intrinsic.Field<T, V>,
+) -> V {
+  unsafe {
+    return Intrinsic.pointerRead<V>(
+      Intrinsic.pointerAt<V>(columnStart<T, V>(bytes, limit, field), index),
+    )
+  }
+}
+
+// Writes one element of a column. The caller checked `index` against the capacity. Rows are
+// `Copy`, so the write never drops an old value.
+unsafe fn putCell<T, V: Copy>(
+  bytes: &mut Intrinsic.RawBuffer<u8>,
+  limit: usize,
+  index: usize,
+  static field: Intrinsic.Field<T, V>,
+  value: &V,
+) -> () {
+  unsafe {
+    Intrinsic.pointerWrite<V>(
+      Intrinsic.pointerAtMut<V>(columnStartMut<T, V>(&mut bytes.*, limit, field), index),
+      value.*,
+    )
+  }
+  return ()
+}
+
+fn rowAt<T>(bytes: &Intrinsic.RawBuffer<u8>, limit: usize, index: usize) -> T {
+  unsafe {
+    return T {
+      static for field in Reflect.fields<T>() { [field]: cell<T>(bytes, limit, index, field) },
+    }
+  }
+}
+
+fn putRow<T>(bytes: &mut Intrinsic.RawBuffer<u8>, limit: usize, index: usize, row: &T) -> () {
+  unsafe {
+    static for field in Reflect.fields<T>() {
+      putCell<T>(&mut bytes.*, limit, index, field, Reflect.borrowField(row, field))
+    }
+  }
+  return ()
+}
+
+// Moves `count` rows from row `from` to row `to` inside one buffer, one overlapping copy for each
+// column.
+fn moveRows<T>(
+  bytes: &mut Intrinsic.RawBuffer<u8>,
+  limit: usize,
+  from: usize,
+  to: usize,
+  count: usize,
+) -> () {
+  if count == usize.ZERO {
+    return ()
+  }
+  unsafe {
+    static for field in Reflect.fields<T>() {
+      let start = limit * bytesBefore(field)
+      let length = count * bytesOf(field)
+      if length != usize.ZERO {
+        let source = aliased<usize>(&limit, &bytes.*, start + from * bytesOf(field), length)
+        RawBuffer.copy<u8>(&mut bytes.*, start + to * bytesOf(field), source, length)
+      }
+    }
+  }
+  return ()
+}
+
+// `count` bytes of `buffer` from `start`, as a slice that borrows `anchor` instead of `buffer`, so
+// the caller can copy them to another range of the same buffer.
+unsafe fn aliased<'a, A>(
+  anchor: &'a A,
+  buffer: &Intrinsic.RawBuffer<u8>,
+  start: usize,
+  count: usize,
+) -> &'a [u8] {
+  unsafe {
+    let descriptor = Intrinsic.pointerFromRef<Intrinsic.RawBuffer<u8>>(buffer)
+    let alias = Intrinsic.pointerBorrow<A, Intrinsic.RawBuffer<u8>>(anchor, descriptor)
+    return RawBuffer.view<u8>(alias, start, count)
+  }
+}
+
+// The growing path of `append`, `insert` and `reserve`, kept out of line. The capacity becomes at
+// least `count + additional`: four rows on the first growth, then doubling.
+@inlineNever
+effect fn growFor<T>(self: &mut ColumnList<T>, additional: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let needed = match move usize.checkedAdd(self.count, additional) {
+    Option<usize>.Some { value } => value
+    Option<usize>.None => run Allocator.outOfMemory()
+  }
+  let mut next: usize = 4
+  if self.limit != usize.ZERO {
+    next = doubled(self.limit, needed)
+  }
+  while next < needed {
+    next = doubled(next, needed)
+  }
+  return run regrow<T>(&mut self.*, next)
+}
+
+// Twice `capacity`, or `needed` when that overflows `usize`.
+fn doubled(capacity: usize, needed: usize) -> usize {
+  return match move usize.checkedAdd(capacity, capacity) {
+    Option<usize>.Some { value } => value
+    Option<usize>.None => needed
+  }
+}
+
+// Moves the rows into new storage for exactly `next` rows, which is not less than the count. Every
+// column moves, because its offset depends on the capacity. The list changes only after the
+// allocation succeeds.
+effect fn regrow<T>(self: &mut ColumnList<T>, next: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let size = match move usize.checkedMultiply(next, rowBytes<T>()) {
+    Option<usize>.Some { value } => value
+    Option<usize>.None => run Allocator.outOfMemory()
+  }
+  let layout = match Layout.make(size, rowAlignment<T>()) {
+    Layout ready => move ready
+    _ => run Allocator.outOfMemory()
+  }
+  let allocation = run Allocator.allocate(move layout)
+  let mut target = unsafe RawBuffer.from<u8>(move allocation, size)
+  let limit = self.limit
+  let count = self.count
+  unsafe {
+    static for field in Reflect.fields<T>() {
+      let length = count * bytesOf(field)
+      if length != usize.ZERO {
+        let source = RawBuffer.view<u8>(&self.bytes, limit * bytesBefore(field), length)
+        RawBuffer.copy<u8>(&mut target, next * bytesBefore(field), source, length)
+      }
+    }
+  }
+  let old = Intrinsic.replace(self.bytes, move target)
+  drop old
+  self.limit = next
+  return ()
+}
