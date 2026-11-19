@@ -32,3 +32,11 @@ if grep -Eq 'ambientSlot|threadSlot<' "$output/main.mir"; then
   echo 'a default-only ambient call reached a thread-local slot' >&2
   exit 1
 fi
+
+mkdir "$output/rejected"
+cp "$fixture/rejected-argument.silk" "$output/rejected/main.silk"
+if "$compiler" build "$output/rejected/main.silk" --stdlib "$output/stdlib" --clang "$clang" -o "$output/rejected/native" > "$output/rejected.log" 2>&1; then
+  echo 'static evaluation skipped an argument of a discarded ambient operation' >&2
+  exit 1
+fi
+grep -F 'error[SEM0176]' "$output/rejected.log"
