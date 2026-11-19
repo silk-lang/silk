@@ -186,6 +186,52 @@ Returns the date and time `span` later, or earlier for a negative span. Every da
 
 A result outside the range traps. [`PlainDateTime.checkedAdd`](#PlainDateTime.impl.checkedAdd) returns `None` instead.
 
+<a id="PlainDateTime.impl.round"></a>
+
+### Method `round`
+
+```silk
+pub fn round(self: Self, step: TimeIncrement, mode: RoundingMode) -> PlainDateTime
+```
+
+Returns the date and time with the time of day rounded to a multiple of `step` from
+midnight. A time that rounds up to midnight is on the next day.
+
+#### Details
+
+`TimeIncrement.one(TimeUnit.Day)` rounds to the start of this day or of the next day.
+
+#### Gotchas
+
+A result outside the range traps. [`PlainDateTime.checkedRound`](#PlainDateTime.impl.checkedRound) returns `None` instead.
+
+#### Examples
+
+```silk
+import silk.time.plain_date_time { PlainDateTime }
+import silk.time.rounding { RoundingMode, TimeIncrement, TimeUnit }
+
+pub fn main() -> i32 {
+  let late = PlainDateTime.fromFields(2026, 12, 31, 23, 59, 40)
+  let rounded = late.round(TimeIncrement.one(TimeUnit.Minute), RoundingMode.HalfExpand)
+  if &rounded != &PlainDateTime.fromFields(2027, 1, 1, 0, 0, 0) {
+    return 1
+  }
+  return 0
+}
+```
+
+<a id="PlainDateTime.impl.checkedRound"></a>
+
+### Method `checkedRound`
+
+```silk
+pub fn checkedRound(self: Self, step: TimeIncrement, mode: RoundingMode) -> Option<PlainDateTime>
+```
+
+Returns the date and time with the time of day rounded to a multiple of `step` from
+midnight, or `None` when the result is outside the range.
+
 <a id="PlainDateTime.impl.until"></a>
 
 ### Method `until`

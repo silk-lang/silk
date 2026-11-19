@@ -22,24 +22,6 @@ part from 0 to 999,999,999. It has no leap second: second 60 in a text reads as 
 ```silk
 import silk.core.result { Result }
 import silk.time.duration { Duration }
-import silk.time.plain_time { PlainTime }
-import silk.time.text { TimeParseError }
-
-pub fn main() -> i32 {
-  match PlainTime.parse("23:30") {
-    Result<PlainTime, TimeParseError>.Success { value } => {
-      let later = value.addWrapping(Duration.fromMinutes(45))
-      if later.hour() != 0 || later.minute() != 15 {
-        return 1
-      }
-      return 0
-    }
-    Result<PlainTime, TimeParseError>.Failure { error: _ } => {
-      return 2
-    }
-  }
-}
-```
 
 Import as `PlainTime` with `import silk.time.plain_time { PlainTime }`.
 
@@ -210,6 +192,37 @@ around midnight.
 Whole days in `span` have no effect: `23:30` plus 45 minutes is `00:15`, and so is `23:30`
 plus 24 hours and 45 minutes.
 
+<a id="PlainTime.impl.round"></a>
+
+### Method `round`
+
+```silk
+pub fn round(self: Self, step: TimeIncrement, mode: RoundingMode) -> PlainTime
+```
+
+Returns the time rounded to a multiple of `step` from midnight, going around midnight.
+
+#### Details
+
+`23:59:40` rounded to the nearest minute is `00:00`. To keep the day that the rounding
+reaches, round a `PlainDateTime`.
+
+#### Examples
+
+```silk
+import silk.time.plain_time { PlainTime }
+import silk.time.rounding { RoundingMode, TimeIncrement, TimeUnit }
+
+pub fn main() -> i32 {
+  let time = PlainTime.make(9, 7, 31, 0)
+  let rounded = time.round(TimeIncrement.of(5, TimeUnit.Minute), RoundingMode.HalfExpand)
+  if &rounded != &PlainTime.make(9, 10, 0, 0) {
+    return 1
+  }
+  return 0
+}
+```
+
 <a id="PlainTime.impl.until"></a>
 
 ### Method `until`
@@ -356,7 +369,5 @@ effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
     ? &mut Writer
 ```
 
-
-Category: Time.
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`, `wasm64-unknown-unknown`.
