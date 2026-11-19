@@ -1,0 +1,276 @@
+//! Direct reads of the time zone files and settings of a Unix system, for the native zone
+//! providers.
+//!
+//! # When to use
+//! `silk.time.zones_native` uses [`NativeTimeZone`]. Application code uses those providers
+//! through the `TimeZones` and `LocalZone` effects, so a test can replace them.
+//!
+//! # Details
+//! Zone files are looked for in the directory that the variable `TZDIR` names, then in
+//! `/usr/share/zoneinfo`, `/var/db/timezone/zoneinfo`, `/usr/lib/zoneinfo`,
+//! `/usr/share/lib/zoneinfo`, and `/etc/zoneinfo`. The first directory that has the file wins.
+//!
+//! The local zone is the value of the variable `TZ`, or the zone that the link `/etc/localtime`
+//! points to, or the first line of `/etc/timezone`.
+//!
+//! # Gotchas
+//! - The names are not checked here. The caller must check a name with `TimeZones.isValidName`
+//!   before it reads a file, so that a name cannot leave the zone directory.
+//! - This module exists on Darwin x86_64 or aarch64 and on GNU Linux x86_64 or aarch64.
+//!
+//! @category Native platform
+
+static if (Intrinsic.targetOperatingSystem() == "darwin" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64") && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")) {
+  import silk.collections.bytes { Bytes }
+  import silk.collections.slice { Slice }
+  import silk.core.effect { Effect }
+  import silk.core.option { Option }
+  import silk.core.result { Result }
+  import silk.mem.allocator { Allocator, OutOfMemoryError }
+  import silk.mem.pointer { Pointer }
+  import silk.testing.observation as Observation
+  import silk.num.isize
+  import silk.num.usize
+
+  @foreign(noCapture: .("path"))
+  unsafe extern "C" fn open(path: ?[*]const u8, flags: i32, ...) -> i32
+  unsafe extern "C" fn close(fd: i32) -> i32
+  @foreign(noCapture: .("buffer"))
+  unsafe extern "C" fn read(fd: i32, buffer: ?[*]mut u8, count: usize) -> isize
+  @foreign(noCapture: .("path", "buffer"))
+  unsafe extern "C" fn readlink(path: ?[*]const u8, buffer: ?[*]mut u8, size: usize) -> isize
+  @foreign(noCapture: .("name"))
+  unsafe extern "C" fn getenv(name: ?[*]const u8) -> ?[*]const u8
+  // Declared as the other standard library modules declare it: two declarations of one C symbol
+  // in a program must agree (SEM0192).
+  unsafe extern "C" fn strlen(text: [*]const u8) -> usize
+
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    unsafe extern "C" fn __error() -> *mut i32
+    const CLOEXEC: i32 = 16777216
+    unsafe fn currentError() -> i32 { unsafe { return Pointer.read(__error()) } }
+  } else {
+    unsafe extern "C" fn __errno_location() -> *mut i32
+    const CLOEXEC: i32 = 524288
+    unsafe fn currentError() -> i32 { unsafe { return Pointer.read(__errno_location()) } }
+  }
+
+  // The error code of a call that a signal interrupted.
+  const INTERRUPTED: i32 = 4
+
+  // A zone file is a few kilobytes and the index of all zones about 110. A larger file is not
+  // one of them.
+  const LARGEST_FILE: usize = 4194304
+
+  /// The time zone files and settings of the system.
+  pub struct NativeTimeZone {}
+
+  impl NativeTimeZone {
+    /// Returns the contents of the file `name` of the zone directory, such as `Europe/Rome` or
+    /// `tzdata.zi`, or `None` if no zone directory has a readable file with that name.
+    ///
+    /// # Gotchas
+    /// `name` is joined to the directory as it is. Check it with `TimeZones.isValidName` first.
+    ///
+    /// # Errors
+    /// - `OutOfMemoryError` if the `Allocator` cannot supply the contents.
+    pub effect fn readZoneFile(name: &[u8]) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+      Observation.note(Observation.VARIABLE, b"", b"TZDIR")
+      if let Option<Bytes>.Some { value: directory } = move run variable(b"TZDIR\0") {
+        if Bytes.length(&directory) > 0 {
+          if let Option<Bytes>.Some { value } = move run readIn(Bytes.asSlice(&directory), name) {
+            return Option<Bytes>.some(move value)
+          }
+        }
+      }
+      let mut index = usize.ZERO
+      while index < 5 {
+        if let Option<Bytes>.Some { value } = move run readIn(zoneDirectory(index), name) {
+          return Option<Bytes>.some(move value)
+        }
+        index = index + 1
+      }
+      return Option<Bytes>.none()
+    }
+
+    /// Returns the name of the zone that the system is set to, or `None` if the system does not
+    /// say.
+    ///
+    /// # Details
+    /// A set `TZ` variable wins: a leading `:` is removed, a path into a zone directory gives the
+    /// part after `zoneinfo/`, and an empty value means `UTC`. Without `TZ`, the answer is the part
+    /// after `zoneinfo/` of the target of the link `/etc/localtime`, and then the first line of
+    /// `/etc/timezone`. The name is not checked against the zone files, and a `TZ` value can be a
+    /// POSIX rule and not a name.
+    ///
+    /// # Errors
+    /// - `OutOfMemoryError` if the `Allocator` cannot supply the name.
+    pub effect fn localName() -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+      Observation.note(Observation.VARIABLE, b"", b"TZ")
+      if let Option<Bytes>.Some { value: setting } = move run variable(b"TZ\0") {
+        let mut bytes = Bytes.asSlice(&setting)
+        if bytes.length > 0 && bytes[0] == 58 {
+          bytes = Slice.view<u8>(bytes, 1, bytes.length - 1)
+        }
+        if bytes.length == 0 {
+          return Option<Bytes>.some(run Bytes.copy(b"UTC"))
+        }
+        if bytes[0] == 47 {
+          let inside = afterZoneinfo(bytes)
+          if inside.length == 0 {
+            return Option<Bytes>.none()
+          }
+          return Option<Bytes>.some(run Bytes.copy(inside))
+        }
+        return Option<Bytes>.some(run Bytes.copy(bytes))
+      }
+      Observation.mark(Observation.HOST)
+      let mut target = run Bytes.zeroed(1024)
+      let mut count: isize = -1
+      let mut code = INTERRUPTED
+      while count < 0 && code == INTERRUPTED {
+        count = unsafe readlink(
+          Pointer.fromSlice(b"/etc/localtime\0"),
+          Pointer.fromMutSlice(Bytes.asMutSlice(&mut target)),
+          1024,
+        )
+        if count < 0 {
+          code = unsafe currentError()
+        }
+      }
+      if count > 0 {
+        let inside = afterZoneinfo(Slice.view<u8>(Bytes.asSlice(&target), 0, isize.toUsize(count)))
+        if inside.length > 0 {
+          return Option<Bytes>.some(run Bytes.copy(inside))
+        }
+      }
+      if let Option<Bytes>.Some { value: listed } = move run readPath(b"/etc/timezone\0") {
+        let line = firstLine(Bytes.asSlice(&listed))
+        if line.length > 0 {
+          return Option<Bytes>.some(run Bytes.copy(line))
+        }
+      }
+      return Option<Bytes>.none()
+    }
+  }
+
+  fn zoneDirectory(index: usize) -> &'static [u8] {
+    if index == 0 {
+      return b"/usr/share/zoneinfo"
+    }
+    if index == 1 {
+      return b"/var/db/timezone/zoneinfo"
+    }
+    if index == 2 {
+      return b"/usr/lib/zoneinfo"
+    }
+    if index == 3 {
+      return b"/usr/share/lib/zoneinfo"
+    }
+    return b"/etc/zoneinfo"
+  }
+
+  // The part of `path` after its last `zoneinfo/`, or an empty slice.
+  fn afterZoneinfo(path: &[u8]) -> &[u8] {
+    let marker = b"zoneinfo/"
+    let mut found = path.length
+    let mut index = usize.ZERO
+    while index + marker.length <= path.length {
+      let mut same = true
+      let mut at = usize.ZERO
+      while at < marker.length {
+        if path[index + at] != marker[at] {
+          same = false
+        }
+        at = at + 1
+      }
+      if same {
+        found = index + marker.length
+      }
+      index = index + 1
+    }
+    return Slice.view<u8>(path, found, path.length - found)
+  }
+
+  // The first line of `text` without spaces around it.
+  fn firstLine(text: &[u8]) -> &[u8] {
+    let mut start = usize.ZERO
+    while start < text.length && (text[start] == 32 || text[start] == 9) {
+      start = start + 1
+    }
+    let mut end = start
+    while end < text.length && text[end] != 10 && text[end] != 13 && text[end] != 32 && text[end] != 9 {
+      end = end + 1
+    }
+    return Slice.view<u8>(text, start, end - start)
+  }
+
+  // A copy of the environment variable whose NUL-terminated name is `name`, or `None`.
+  effect fn variable(name: &[u8]) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+    let found = Pointer.nonNullMany<u8>(unsafe getenv(Pointer.fromSlice<u8>(name)))
+    return match move found {
+      Option<[*]const u8>.None => Option<Bytes>.none()
+      Option<[*]const u8>.Some { value } => {
+        let length = unsafe strlen(value)
+        let anchor = length
+        let view = unsafe Pointer.borrowMany<usize, u8>(&anchor, value, length)
+        Option<Bytes>.some(run Bytes.copy(view))
+      }
+    }
+  }
+
+  // The contents of the file `name` in `directory`, or `None` if it cannot be read.
+  effect fn readIn(directory: &[u8], name: &[u8]) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+    let mut path = run Bytes.makeWithCapacity(directory.length + name.length + 2)
+    run Bytes.append(&mut path, directory)
+    run Bytes.append(&mut path, b"/")
+    run Bytes.append(&mut path, name)
+    Observation.note(Observation.FILE, b"", Bytes.asSlice(&path))
+    run Bytes.append(&mut path, b"\0")
+    return run readPath(Bytes.asSlice(&path))
+  }
+
+  // The contents of the file at the NUL-terminated `path`, or `None` if it cannot be read.
+  effect fn readPath(path: &[u8]) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+    let mut fd: i32 = -1
+    let mut code = INTERRUPTED
+    while fd < 0 && code == INTERRUPTED {
+      fd = unsafe open(Pointer.fromSlice(path), CLOEXEC)
+      if fd < 0 {
+        code = unsafe currentError()
+      }
+    }
+    if fd < 0 {
+      return Option<Bytes>.none()
+    }
+    let mut contents = Bytes.make()
+    let mut chunk: [u8; 4096] = [0; 4096]
+    let mut reading = true
+    let mut failed = false
+    while reading {
+      let count = unsafe read(fd, Pointer.fromMutSlice(&mut chunk), 4096)
+      if count > 0 {
+        let appended = run Effect.result(Bytes.append(&mut contents, Slice.view<u8>(&chunk, 0, isize.toUsize(count))))
+        if let Result<(), OutOfMemoryError>.Failure { error } = move appended {
+          let _closed = unsafe close(fd)
+          fail move error
+        }
+        if Bytes.length(&contents) > LARGEST_FILE {
+          reading = false
+          failed = true
+        }
+      } else if count == 0 {
+        reading = false
+      } else if unsafe currentError() != INTERRUPTED {
+        // A directory, or a failed device.
+        reading = false
+        failed = true
+      }
+    }
+    let _closed = unsafe close(fd)
+    if failed {
+      return Option<Bytes>.none()
+    }
+    return Option<Bytes>.some(move contents)
+  }
+}

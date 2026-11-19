@@ -1,0 +1,326 @@
+//! The system providers of the `TimeZones` and `LocalZone` effects: the time zone database and
+//! the zone setting of the operating system.
+//!
+//! # When to use
+//! Provide [`OsTimeZones`] for `TimeZones` and [`OsLocalZone`] for `LocalZone` in a program that
+//! shows local times. In a test, provide `FixedTimeZones` and `FixedLocalZone` of
+//! `silk.time.zones`, so the result does not depend on the machine.
+//!
+//! # Details
+//! Each operating system has its own implementation behind these two providers, and a program
+//! names no path and no system call. On Linux and macOS, the zones are the TZif files of the
+//! system: the directory that the variable `TZDIR` names, then `/usr/share/zoneinfo` and the
+//! other usual places. The local zone is the variable `TZ`, then the link `/etc/localtime`, then
+//! the file `/etc/timezone`.
+//!
+//! A zone is read from its file at each lookup. Load a zone one time and keep it.
+//!
+//! # Gotchas
+//! - A minimal container image often has no zone files. Then each lookup fails with the reason
+//!   `UnknownZone`, except for `UTC` and fixed offsets, which need no data.
+//! - The zones change when the operating system updates its database, so two machines can
+//!   disagree about a future date.
+//! - `OsLocalZone` can return a `TZ` value that is a POSIX rule, such as `EST5EDT,M3.2.0,M11.1.0`,
+//!   and not a zone name. `OsTimeZones` gives the zone for such a rule too.
+//! - The providers exist on Darwin x86_64 or aarch64 and on GNU Linux x86_64 or aarch64.
+//!
+//! # Examples
+//! ## Show an instant in the zone of this machine
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.collections.bytes { Bytes }
+//! import silk.core.effect { Effect }
+//! import silk.time.instant { Instant }
+//! import silk.time.zoned { ZonedDateTime }
+//! import silk.time.zones { LocalZone, NoLocalZoneError, TimeZones, ZoneLookupError }
+//! import silk.time.zones_native { OsLocalZone, OsTimeZones }
+//!
+//! effect fn localYear(at: Instant) -> i32
+//!   ! ZoneLookupError | NoLocalZoneError | OutOfMemoryError
+//!   ? &mut TimeZones | &mut LocalZone | &mut Allocator {
+//!   let name = run LocalZone.name()
+//!   let zone = run TimeZones.zoneBytes(Bytes.asSlice(&name))
+//!   return ZonedDateTime.make(at, &zone).date().year()
+//! }
+//!
+//! // A machine without a zone setting or without zone files is not an error of this example.
+//! effect fn missing(error: ZoneLookupError | NoLocalZoneError | OutOfMemoryError) -> i32 {
+//!   return 2026
+//! }
+//!
+//! pub effect fn main() -> i32 {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let mut zones = OsTimeZones.make()
+//!   let mut here = OsLocalZone.make()
+//!   let year = run Effect.catchAll(localYear(Instant.fromUnixSeconds(1795109782)), missing)
+//!     |> Effect.provideMut<TimeZones>(&mut zones)
+//!     |> Effect.provideMut<LocalZone>(&mut here)
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!   if year != 2026 {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! @category Time
+
+static if (Intrinsic.targetOperatingSystem() == "darwin" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64") && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")) {
+  import silk.collections.bytes { Bytes }
+  import silk.collections.list { List }
+  import silk.collections.slice { Slice }
+  import silk.core.effect { Effect }
+  import silk.core.option { Option }
+  import silk.core.result { Result }
+  import silk.mem.allocator { Allocator, OutOfMemoryError }
+  import silk.platform.native.time_zone { NativeTimeZone }
+  import silk.text.string { String }
+  import silk.time.zone { Zone, ZoneDataError }
+  import silk.time.zones as Zones
+  import silk.time.zones { LocalZone, NoLocalZoneError, TimeZones, ZoneLookupError, ZoneLookupReason }
+  import silk.num.usize
+
+  /// The system `TimeZones` provider: the time zone database of the operating system. It has no
+  /// state.
+  ///
+  /// # Gotchas
+  /// - A machine without zone files fails each lookup with the reason `UnknownZone`, except for
+  ///   `UTC` and fixed offsets.
+  pub struct OsTimeZones {}
+
+  impl OsTimeZones {
+    /// Returns a provider. It does not read any file.
+    pub fn make() -> OsTimeZones { return OsTimeZones {} }
+
+    effect fn zoneBytes(self: &mut Self, name: &[u8]) -> Zone ! ZoneLookupError | OutOfMemoryError ? &mut Allocator {
+      if let Option<Zone>.Some { value } = move TimeZones.fixedZone(name) {
+        return move value
+      }
+      if !TimeZones.isValidName(name) {
+        // A `TZ` setting can be a POSIX rule, which has characters that a name cannot have.
+        return run ruleZone(name)
+      }
+      if let Option<Bytes>.Some { value: data } = move run NativeTimeZone.readZoneFile(name) {
+        static if Intrinsic.targetOperatingSystem() == "darwin" {
+          // The usual file system of macOS ignores letter case, so the file can open under a
+          // spelling that the database does not have.
+          let listed = run self.spelled(name)
+          return run decoded(Bytes.asSlice(&listed), Bytes.asSlice(&data))
+        }
+        return run decoded(name, Bytes.asSlice(&data))
+      }
+      // Names are compared without letter case, and the files are not.
+      let spelling = run self.spelled(name)
+      if let Option<Bytes>.Some { value: data } = move run NativeTimeZone.readZoneFile(Bytes.asSlice(&spelling)) {
+        return run decoded(Bytes.asSlice(&spelling), Bytes.asSlice(&data))
+      }
+      // A rule such as `EST5EDT` has the form of a name.
+      return run ruleZone(name)
+    }
+
+    // The spelling that the database has for `name`, or `name` itself if the database does not
+    // list it or has no list.
+    effect fn spelled(self: &mut Self, name: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+      let found = run Effect.result(self.listed())
+      if let Result<List<Bytes>, ZoneLookupError | OutOfMemoryError>.Success { value: known } = move found {
+        let all = List<Bytes>.asSlice(&known)
+        let mut index = usize.ZERO
+        while index < all.length {
+          let candidate = Bytes.asSlice(&all[index])
+          if TimeZones.sameName(candidate, name) {
+            return run Bytes.copy(candidate)
+          }
+          index = index + 1
+        }
+      }
+      return run Bytes.copy(name)
+    }
+
+    effect fn names(self: &mut Self) -> List<Bytes> ! ZoneLookupError | OutOfMemoryError ? &mut Allocator {
+      return run Zones.sortedNames(run self.listed())
+    }
+
+    // The names in the order of the file that lists them.
+    effect fn listed(self: &mut Self) -> List<Bytes> ! ZoneLookupError | OutOfMemoryError ? &mut Allocator {
+      let mut result = List<Bytes>.make()
+      if let Option<Bytes>.Some { value: index } = move run NativeTimeZone.readZoneFile(b"tzdata.zi") {
+        run indexNames(&mut result, Bytes.asSlice(&index))
+      } else if let Option<Bytes>.Some { value: table } = move run NativeTimeZone.readZoneFile(b"zone1970.tab") {
+        run tableNames(&mut result, Bytes.asSlice(&table))
+      } else if let Option<Bytes>.Some { value: table } = move run NativeTimeZone.readZoneFile(b"zone.tab") {
+        run tableNames(&mut result, Bytes.asSlice(&table))
+      } else {
+        fail TimeZones.lookupFailure(ZoneLookupReason.Unreadable)
+      }
+      return move result
+    }
+
+    effect fn version(self: &mut Self) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+      if let Option<Bytes>.Some { value: index } = move run NativeTimeZone.readZoneFile(b"tzdata.zi") {
+        // The first line is `# version 2026b`.
+        let bytes = Bytes.asSlice(&index)
+        let prefix = b"# version "
+        if startsWith(bytes, prefix) {
+          return run Bytes.copy(word(bytes, prefix.length))
+        }
+      }
+      if let Option<Bytes>.Some { value: file } = move run NativeTimeZone.readZoneFile(b"+VERSION") {
+        return run Bytes.copy(word(Bytes.asSlice(&file), 0))
+      }
+      return Bytes.make()
+    }
+  }
+
+  impl TimeZones for OsTimeZones {
+    zoneBytes: OsTimeZones.zoneBytes
+    names: OsTimeZones.names
+    version: OsTimeZones.version
+  }
+
+  /// The system `LocalZone` provider: the zone that this machine is set to. It has no state.
+  ///
+  /// # Gotchas
+  /// - The answer can be a POSIX rule from the variable `TZ`, not a zone name.
+  pub struct OsLocalZone {}
+
+  impl OsLocalZone {
+    /// Returns a provider. It does not read the setting.
+    pub fn make() -> OsLocalZone { return OsLocalZone {} }
+
+    effect fn name(self: &mut Self) -> Bytes ! NoLocalZoneError | OutOfMemoryError ? &mut Allocator {
+      if let Option<Bytes>.Some { value } = move run NativeTimeZone.localName() {
+        return move value
+      }
+      fail LocalZone.unknown()
+    }
+  }
+
+  impl LocalZone for OsLocalZone {
+    name: OsLocalZone.name
+  }
+
+  // The zone of a TZif file with the name `name`, which is ASCII.
+  effect fn decoded(name: &[u8], data: &[u8]) -> Zone ! ZoneLookupError | OutOfMemoryError ? &mut Allocator {
+    let text = unsafe String.fromUtf8Unchecked(name)
+    return match move run Effect.result(Zone.fromTzif(text, data)) {
+      Result<Zone, ZoneDataError | OutOfMemoryError>.Success { value } => move value
+      Result<Zone, ZoneDataError | OutOfMemoryError>.Failure { error } => match move error {
+        ZoneDataError _ => {
+          fail TimeZones.lookupFailure(ZoneLookupReason.InvalidData)
+        }
+        OutOfMemoryError exhausted => {
+          fail move exhausted
+        }
+      }
+    }
+  }
+
+  // The zone of the POSIX rule `name`. A name that is not a rule is an unknown zone, or not a
+  // name at all.
+  effect fn ruleZone(name: &[u8]) -> Zone ! ZoneLookupError | OutOfMemoryError ? &mut Allocator {
+    let valid = TimeZones.isValidName(name)
+    let mut index = usize.ZERO
+    while index < name.length {
+      if name[index] >= 128 {
+        fail TimeZones.lookupFailure(ZoneLookupReason.InvalidName)
+      }
+      index = index + 1
+    }
+    let text = unsafe String.fromUtf8Unchecked(name)
+    return match move run Effect.result(Zone.fromPosixRule(text)) {
+      Result<Zone, ZoneDataError | OutOfMemoryError>.Success { value } => move value
+      Result<Zone, ZoneDataError | OutOfMemoryError>.Failure { error } => match move error {
+        ZoneDataError _ => {
+          if valid {
+            fail TimeZones.lookupFailure(ZoneLookupReason.UnknownZone)
+          }
+          fail TimeZones.lookupFailure(ZoneLookupReason.InvalidName)
+        }
+        OutOfMemoryError exhausted => {
+          fail move exhausted
+        }
+      }
+    }
+  }
+
+  fn startsWith(bytes: &[u8], prefix: &[u8]) -> bool {
+    if bytes.length < prefix.length {
+      return false
+    }
+    let mut index = usize.ZERO
+    while index < prefix.length {
+      if bytes[index] != prefix[index] {
+        return false
+      }
+      index = index + 1
+    }
+    return true
+  }
+
+  // The bytes of `bytes` from `start` up to the next space, tab, or line end.
+  fn word(bytes: &[u8], start: usize) -> &[u8] {
+    let mut end = start
+    while end < bytes.length && bytes[end] != 32 && bytes[end] != 9 && bytes[end] != 10 && bytes[end] != 13 {
+      end = end + 1
+    }
+    return Slice.view<u8>(bytes, start, end - start)
+  }
+
+  // The start of field `field` (from 0) of the line that starts at `start`, where `separator`
+  // parts the fields, or the end of the line.
+  fn fieldStart(bytes: &[u8], start: usize, field: usize, separator: u8) -> usize {
+    let mut at = start
+    let mut left = field
+    while left > 0 {
+      while at < bytes.length && bytes[at] != separator && bytes[at] != 10 {
+        at = at + 1
+      }
+      if at < bytes.length && bytes[at] == separator {
+        at = at + 1
+      }
+      left = left - 1
+    }
+    return at
+  }
+
+  // Adds the zone and link names of a `tzdata.zi` file: `Z name ...` and `L target name`.
+  effect fn indexNames(result: &mut List<Bytes>, bytes: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut start = usize.ZERO
+    while start < bytes.length {
+      if start + 1 < bytes.length && bytes[start + 1] == 32 {
+        if bytes[start] == 90 {
+          run add(&mut result.*, word(bytes, start + 2))
+        } else if bytes[start] == 76 {
+          run add(&mut result.*, word(bytes, fieldStart(bytes, start, 2, 32)))
+        }
+      }
+      while start < bytes.length && bytes[start] != 10 {
+        start = start + 1
+      }
+      start = start + 1
+    }
+    return ()
+  }
+
+  // Adds the zone names of a `zone.tab` file: the third field of each line that is not a comment.
+  effect fn tableNames(result: &mut List<Bytes>, bytes: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut start = usize.ZERO
+    while start < bytes.length {
+      if bytes[start] != 35 {
+        run add(&mut result.*, word(bytes, fieldStart(bytes, start, 2, 9)))
+      }
+      while start < bytes.length && bytes[start] != 10 {
+        start = start + 1
+      }
+      start = start + 1
+    }
+    return ()
+  }
+
+  effect fn add(result: &mut List<Bytes>, name: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    if TimeZones.isValidName(name) {
+      run List<Bytes>.append(&mut result.*, run Bytes.copy(name))
+    }
+    return ()
+  }
+}

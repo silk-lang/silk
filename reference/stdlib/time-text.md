@@ -165,6 +165,16 @@ Ambiguous
 The text can be read as a time and also as a year and month or a month and day, such as
 `1214`. Write a time with the prefix `T` to make it clear.
 
+<a id="TimeParseReason.MissingZone"></a>
+
+### `MissingZone`
+
+```silk
+MissingZone
+```
+
+The text has no time zone annotation such as `[Europe/Rome]`, and the type needs one.
+
 <a id="TimeParseReason.impl.Debug"></a>
 
 ## Implementation `Debug for TimeParseReason`
