@@ -305,6 +305,51 @@ the name.
 #### Errors
 `OutOfMemoryError` if the `Allocator` cannot supply the text.
 
+<a id="Lines.impl.fromGoogleBenchmark"></a>
+
+### Associated function `fromGoogleBenchmark`
+
+```silk
+pub effect fn fromGoogleBenchmark(text: string) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Returns what Google Benchmark printed in `text`, its console table, as result lines: one
+line for each row, with the row's iterations, its `Time` column as `ns/op` and its `CPU`
+column as `cpu-ns/op`. A row `BM_Parse/64  98.1 ns  98.0 ns  7000000` becomes
+`BenchmarkBM_Parse/64 7000000 98.1 ns/op 98 cpu-ns/op`.
+
+#### Details
+A line that is not a row is left out, and so are the rows Google Benchmark adds for
+repetitions, whose names end in `_mean`, `_median`, `_stddev` or `_cv`: the task computes
+its own statistics. Counters after the iterations are left out.
+
+#### Errors
+`OutOfMemoryError` if the `Allocator` cannot supply the text.
+
+<a id="Lines.impl.fromCriterion"></a>
+
+### Associated function `fromCriterion`
+
+```silk
+pub effect fn fromCriterion(text: string) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Returns what a Rust benchmark printed in `text` as result lines with 1 iteration and the
+unit `ns/op`. Two shapes are read: Criterion's `name  time:   [low estimate high]`, of
+which the estimate in the middle is taken, and the `test name ... bench: 1,240 ns/iter
+(+/- 12)` of the built-in harness and of Criterion's `--output-format bencher`.
+
+#### Details
+Criterion writes a long name on a line of its own, before the line with `time:`; that
+name is used. Every other line is left out. A space in a name becomes `_`.
+
+#### Errors
+`OutOfMemoryError` if the `Allocator` cannot supply the text.
+
 
 Category: Benchmarks.
 

@@ -28,6 +28,8 @@ A program that measures itself says so with [`Implementation.resultLines`](#Impl
 reads the result lines the program prints, one sample a line, and reports what the lines
 say in their own unit, such as `ns/op` or `req/s`. A load generator, a server benchmark, or
 a loop that times one function inside a larger program reports this way.
+[`Implementation.googleBenchmark`](#Implementation.impl.googleBenchmark) and [`Implementation.criterion`](#Implementation.impl.criterion) say the same of a program
+that prints the table of Google Benchmark or the lines of a Rust benchmark.
 
 A program that holds several benchmarks and can run each on request says so with
 [`Implementation.driven`](#Implementation.impl.driven): the suite keeps it alive, decides how many iterations a sample
@@ -77,7 +79,7 @@ effect fn jsonParse(options: &Options) -> Suite
 
 Import as `Suite` with `import silk.bench.suite { Suite }`.
 
-Public declarations: 9.
+Public declarations: 10.
 
 <a id="Part"></a>
 
@@ -273,6 +275,46 @@ pub effect fn variable(self: &mut Self, name: string, value: string) -> ()
 
 Sets the environment variable `name` to `value` for the program.
 
+<a id="Dialect"></a>
+
+## `Dialect`
+
+```silk
+pub enum Dialect
+```
+
+The format in which a program prints its own results.
+
+<a id="Dialect.ResultLines"></a>
+
+### `ResultLines`
+
+```silk
+ResultLines
+```
+
+Result lines, as `silk.bench.lines` describes them.
+
+<a id="Dialect.GoogleBenchmark"></a>
+
+### `GoogleBenchmark`
+
+```silk
+GoogleBenchmark
+```
+
+The console table of Google Benchmark.
+
+<a id="Dialect.Criterion"></a>
+
+### `Criterion`
+
+```silk
+Criterion
+```
+
+The lines of Criterion, or of Rust's built-in benchmark harness.
+
 <a id="Implementation"></a>
 
 ## `Implementation`
@@ -332,6 +374,16 @@ pub reports: bool
 ```
 
 Whether the program prints result lines, which then are what the suite measures.
+
+<a id="Implementation.dialect"></a>
+
+### Field `dialect`
+
+```silk
+pub dialect: Dialect
+```
+
+The format of what the program prints, when it prints its results.
 
 <a id="Implementation.drives"></a>
 
@@ -509,6 +561,41 @@ compared, and the task fails. `revision:` is recorded as the implementation's re
 when the suite gives none. `note:` is added to the notes of the run.
 `view:` suggests a view, as `silk.bench.view.View.parse` reads it, which the reports show
 when the suite declares none.
+
+<a id="Implementation.impl.googleBenchmark"></a>
+
+### Method `googleBenchmark`
+
+```silk
+pub fn googleBenchmark(self: &mut Self) -> ()
+```
+
+Says that the program is a Google Benchmark program, and that the suite measures what its
+console table reports, as [`Implementation.resultLines`](#Implementation.impl.resultLines) does for result lines.
+
+#### Details
+Each row of the table is one sample: its `Time` column is reported as `ns/op` and its
+`CPU` column as `cpu-ns/op`. The rows Google Benchmark adds for repetitions are left out.
+`silk.bench.lines.Lines.fromGoogleBenchmark` does the reading. The program must print the
+table to standard output, which is what it does without `--benchmark_format`.
+
+<a id="Implementation.impl.criterion"></a>
+
+### Method `criterion`
+
+```silk
+pub fn criterion(self: &mut Self) -> ()
+```
+
+Says that the program is a Rust benchmark, run by Criterion or by the built-in harness,
+and that the suite measures what it reports, as [`Implementation.resultLines`](#Implementation.impl.resultLines) does for
+result lines.
+
+#### Details
+Each `name  time:   [low estimate high]` line of Criterion is one sample, the estimate in
+the middle, and so is each `test name ... bench: 1,240 ns/iter (+/- 12)` line. Both are
+reported as `ns/op`. `silk.bench.lines.Lines.fromCriterion` does the reading. The program
+must print to standard output, as `cargo bench` does.
 
 <a id="Implementation.impl.driven"></a>
 
