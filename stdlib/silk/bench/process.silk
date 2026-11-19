@@ -1,0 +1,585 @@
+//! Runs one program to its end and measures it: the time it took, the processor time it used,
+//! and its peak memory.
+//!
+//! # When to use
+//! `silk.bench.bench` uses [`Process.time`] for every sample of a command suite. Use it
+//! directly to time a program in a harness of your own.
+//!
+//! # Details
+//! [`Process.time`] starts the program, waits for it, and reads what the system counted for it
+//! with `wait4`: processor time in user and kernel mode, and peak resident memory, over the
+//! program and the children it waited for. The time from start to exit is read from the
+//! `MonotonicClock`. The program's standard input, output and error are closed off, so printing
+//! costs it nothing and does not reach the terminal.
+//!
+//! [`Process.perform`] runs a program for its effect, such as a hook that clears a cache: the
+//! program shares the terminal, and a failure is an error.
+//!
+//! Both give the program the environment of this process and then the variables of the
+//! [`Launch`].
+//!
+//! # Gotchas
+//! - Processes can be measured on Linux with GNU libc and on macOS. On other systems
+//!   [`Process.supported`] is false and both functions fail.
+//! - Only Linux can limit a program to a number of processors.
+//!
+//! @category Benchmarks
+
+import silk.bench.record { Environment, Pair }
+import silk.cli.task { TaskError }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.num.i32
+import silk.num.i64
+import silk.num.u32
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+import silk.system.child_process { ChildProcess, ProcessRequest }
+import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.system_clock { SystemClock }
+import silk.text.string { String }
+import silk.bench.units { Units }
+
+static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetAbi() == "apple"
+  && Intrinsic.profileText("libc") == "system")
+  || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu"
+    && Intrinsic.profileText("libc") == "gnu") {
+  import silk.system.system_info {
+    KernelInfo,
+    MemoryInfo,
+    ProcessorInfo,
+    SystemInfo,
+    SystemInfoError
+  }
+  import silk.system.system_info_native { OsSystemInfo }
+  import silk.system.terminal { Terminal }
+  import silk.collections.bytes { Bytes }
+  import silk.text.string { InvalidUtf8 }
+  import silk.system.subprocess {
+    ExitUsage,
+    ExitWatch,
+    SpawnOptions,
+    Stdio,
+    Subprocess,
+    SubprocessError
+  }
+}
+
+static if Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu"
+  && Intrinsic.profileText("libc") == "gnu" {
+  @foreign(noCapture: .("mask"))
+  unsafe extern "C" fn sched_getaffinity(pid: i32, size: usize, mask: ?[*]mut u8) -> i32
+  @foreign(noCapture: .("mask"))
+  unsafe extern "C" fn sched_setaffinity(pid: i32, size: usize, mask: ?[*]const u8) -> i32
+}
+
+// Room for 1024 processors, the size of glibc's `cpu_set_t`.
+const MASK_BYTES: usize = 128
+
+/// A program ready to start: every path is resolved and every placeholder is filled in.
+pub struct Launch {
+  /// The program.
+  pub program: Path,
+  /// The arguments, without the program's own name.
+  pub arguments: List<String>,
+  /// The working directory. Without one, the program starts in the directory of this process.
+  pub directory: Option<Path>,
+  /// The environment variables added to those of this process.
+  pub variables: List<Pair>,
+}
+
+/// What one run of a program cost.
+pub struct Timed {
+  /// The time from start to exit, in nanoseconds.
+  pub wall: u64,
+  /// The processor time in user mode, in nanoseconds.
+  pub user: u64,
+  /// The processor time in kernel mode, in nanoseconds.
+  pub system: u64,
+  /// The peak resident memory, in bytes.
+  pub peak: u64,
+  /// The exit status, or -1 when a signal ended the program.
+  pub exit: i64,
+  /// The signal that ended the program, or 0.
+  pub signal: i64,
+}
+
+/// The owner type of the process functions. It has no fields and is never constructed.
+pub struct Process {}
+
+impl Process {
+  /// Returns whether this system can measure a process.
+  pub fn supported() -> bool {
+    static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetAbi() == "apple"
+      && Intrinsic.profileText("libc") == "system")
+      || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu"
+        && Intrinsic.profileText("libc") == "gnu") {
+      return true
+    } else {
+      return false
+    }
+  }
+
+  /// Returns the number of processors this process may run on, or 0 on a system where
+  /// [`Process.time`] cannot limit them.
+  pub fn processors() -> u32 {
+    static if Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu"
+      && Intrinsic.profileText("libc") == "gnu" {
+      let mut mask: [u8; 128] = [0; 128]
+      if unsafe sched_getaffinity(0, MASK_BYTES, Pointer.fromMutSlice<u8>(&mut mask)) != 0 {
+        return 0
+      }
+      let mut count: u32 = 0
+      let mut bit: usize = 0
+      while bit < MASK_BYTES * 8 {
+        if isSet(&mask, bit) {
+          count = count + 1
+        }
+        bit = bit + 1
+      }
+      return count
+    } else {
+      return 0
+    }
+  }
+
+  /// Returns the smallest peak memory [`Process.time`] can report for a program started now, in
+  /// bytes, or 0 when there is none.
+  ///
+  /// # Details
+  /// On Linux a new process starts with the peak resident memory of the process that started
+  /// it, so a small program reads as this process's own peak. Other systems count a new
+  /// process from zero.
+  pub effect fn floor() -> u64
+    ? &mut Allocator | &mut FileSystem {
+    static if Intrinsic.targetOperatingSystem() == "linux" {
+      // `VmHWM` is the peak of this process's own memory. `getrusage` would also count the
+      // peak this process started with.
+      return match move run Effect.result(peakOfSelf()) {
+        Result<u64, FileError | OutOfMemoryError>.Success { value } => value
+        Result<u64, FileError | OutOfMemoryError>.Failure { .. } => 0
+      }
+    } else {
+      return 0
+    }
+  }
+
+  /// Returns whether the descriptor `fd`, such as 1 for standard output, is a terminal. It is
+  /// false on a system where [`Process.supported`] is false.
+  pub fn terminal(fd: i32) -> bool {
+    static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetAbi() == "apple"
+      && Intrinsic.profileText("libc") == "system")
+      || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu"
+        && Intrinsic.profileText("libc") == "gnu") {
+      return Terminal.isTerminal(fd)
+    } else {
+      drop fd
+      return false
+    }
+  }
+
+  /// Returns the computer this process runs on, for the record of a run, with no recorded
+  /// environment variables. What the system does not report is `unknown` or 0.
+  ///
+  /// # Errors
+  /// `OutOfMemoryError` if the `Allocator` cannot supply the text.
+  pub effect fn computer() -> Environment
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetAbi() == "apple"
+      && Intrinsic.profileText("libc") == "system")
+      || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu"
+        && Intrinsic.profileText("libc") == "gnu") {
+      let mut info = OsSystemInfo.make()
+      return run gathered() |> Effect.provideMut<SystemInfo>(&mut info)
+    } else {
+      return Environment {
+        system: run String.copy("unknown"),
+        release: run String.copy("unknown"),
+        machine: run String.copy("unknown"),
+        processor: run String.copy("unknown"),
+        processors: 0,
+        usable: 0,
+        memory: 0,
+        load: 0.0,
+        variables: List<Pair>.make(),
+      }
+    }
+  }
+
+  /// Runs `launch` to its end and returns what it cost. With `cpus` above 0, the program may
+  /// run only on that many processors, the first ones this process may use.
+  ///
+  /// # Details
+  /// A program that exits with a status other than 0, or that a signal ends, is not an error
+  /// here: the status is in the result, and the caller decides.
+  ///
+  /// # Errors
+  /// `TaskError` with status 127 if the program cannot be started, if `cpus` is more than
+  /// [`Process.processors`], or if this system cannot measure a process.
+  pub effect fn time(launch: &Launch, cpus: u32) -> Timed
+    ! TaskError | OutOfMemoryError
+    ? &mut Allocator | &mut MonotonicClock {
+    static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetAbi() == "apple"
+      && Intrinsic.profileText("libc") == "system")
+      || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu"
+        && Intrinsic.profileText("libc") == "gnu") {
+      let request = run requestOf(launch)
+      let options = SpawnOptions.make()
+      let restore = run limit(cpus)
+      let started = run MonotonicClock.now()
+      let outcome = run Effect.result(spawned(&request, &options))
+      let ended = run MonotonicClock.now()
+      unlimit(&restore)
+      let measured = match move outcome {
+        Result<ExitUsage, SubprocessError | OutOfMemoryError>.Success { value } => move value
+        Result<ExitUsage, SubprocessError | OutOfMemoryError>.Failure {
+          error
+        } => match move error {
+          SubprocessError refused => run notStarted(launch, refused.code)
+          OutOfMemoryError exhausted => {
+            fail move exhausted
+          }
+        }
+      }
+      let seconds = SystemClock.seconds(&ended) - SystemClock.seconds(&started)
+      let nanoseconds = SystemClock.nanoseconds(&ended) - SystemClock.nanoseconds(&started)
+      let mut exit = i32.toI64(measured.status.code)
+      let mut signal: i64 = 0
+      if measured.status.signaled {
+        exit = -1
+        signal = i32.toI64(measured.status.signal)
+      }
+      return Timed {
+        wall: i64.toU64(seconds * 1000000000 + nanoseconds),
+        user: measured.usage.userMicroseconds * 1000,
+        system: measured.usage.systemMicroseconds * 1000,
+        peak: measured.usage.maxResidentBytes,
+        exit: exit,
+        signal: signal,
+      }
+    } else {
+      drop launch
+      drop cpus
+      fail TaskError {
+        message: run String.copy("this system cannot measure a process yet"),
+        status: 127,
+      }
+    }
+  }
+
+  /// Runs `launch` to its end with the standard streams of this process, for its effect.
+  ///
+  /// # Errors
+  /// `TaskError` if the program cannot be started, exits with a status other than 0, which
+  /// becomes the error's status, or is ended by a signal.
+  pub effect fn perform(launch: &Launch) -> ()
+    ! TaskError | OutOfMemoryError
+    ? &mut Allocator {
+    static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetAbi() == "apple"
+      && Intrinsic.profileText("libc") == "system")
+      || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu"
+        && Intrinsic.profileText("libc") == "gnu") {
+      let request = run requestOf(launch)
+      let mut options = SpawnOptions.make()
+      run SpawnOptions.setStdio(&mut options, 0, Stdio.inherit(0))
+      run SpawnOptions.setStdio(&mut options, 1, Stdio.inherit(1))
+      run SpawnOptions.setStdio(&mut options, 2, Stdio.inherit(2))
+      let measured = match move run Effect.result(spawned(&request, &options)) {
+        Result<ExitUsage, SubprocessError | OutOfMemoryError>.Success { value } => move value
+        Result<ExitUsage, SubprocessError | OutOfMemoryError>.Failure {
+          error
+        } => match move error {
+          SubprocessError refused => run notStarted(launch, refused.code)
+          OutOfMemoryError exhausted => {
+            fail move exhausted
+          }
+        }
+      }
+      if measured.status.signaled || measured.status.code != 0 {
+        let mut message = run Process.text(launch)
+        let mut status: i32 = 1
+        if measured.status.signaled {
+          run message.append(" was ended by signal ")
+          run Units.appendWhole(&mut message, i64.toU64(i32.toI64(measured.status.signal)))
+        } else {
+          run message.append(" failed with status ")
+          run Units.appendWhole(&mut message, i64.toU64(i32.toI64(measured.status.code)))
+          status = measured.status.code
+        }
+        fail TaskError { message: move message, status: status }
+      }
+    } else {
+      drop launch
+      fail TaskError {
+        message: run String.copy("this system cannot run a benchmark hook yet"),
+        status: 127,
+      }
+    }
+  }
+
+  /// Returns `launch` as one line for a reader: the program, then its arguments, separated by
+  /// spaces. The line is for a report, not for a shell: nothing is quoted.
+  ///
+  /// # Errors
+  /// `OutOfMemoryError` if the `Allocator` cannot supply the text.
+  pub effect fn text(launch: &Launch) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut line = String.make()
+    match Path.view(&launch.program) {
+      Option<string>.Some { value } => run line.append(value)
+      Option<string>.None => run line.append("(a program)")
+    }
+    let arguments = launch.arguments.asSlice()
+    let mut at: usize = 0
+    while at < arguments.length {
+      run line.append(" ")
+      run line.append(arguments[at].view())
+      at = at + 1
+    }
+    return move line
+  }
+}
+
+// The `VmHWM` line of `/proc/self/status`, in bytes, or 0 when it is missing.
+effect fn peakOfSelf() -> u64
+  ! FileError | OutOfMemoryError
+  ? &mut Allocator | &mut FileSystem {
+  let path = run Path.make("/proc/self/status")
+  let status = run FileSystem.readFile(&path)
+  let bytes = status.asSlice()
+  let label = b"VmHWM:"
+  let mut at: usize = 0
+  while at + label.length <= bytes.length {
+    let mut same = true
+    let mut index: usize = 0
+    while index < label.length {
+      if bytes[at + index] != label[index] {
+        same = false
+        break
+      }
+      index = index + 1
+    }
+    if same {
+      let mut kilobytes: u64 = 0
+      at = at + label.length
+      while at < bytes.length && (bytes[at] == 32 || bytes[at] == 9) {
+        at = at + 1
+      }
+      while at < bytes.length && bytes[at] >= 48 && bytes[at] <= 57 {
+        kilobytes = kilobytes * 10 + u8.toU64(bytes[at] - 48)
+        at = at + 1
+      }
+      return kilobytes * 1024
+    }
+    at = at + 1
+  }
+  return 0
+}
+
+effect fn notStarted(launch: &Launch, code: i32) -> never
+  ! TaskError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut message = run String.copy("cannot start ")
+  run message.appendOwned(run Process.text(launch))
+  run message.append(" (system error ")
+  run Units.appendWhole(&mut message, i64.toU64(i32.toI64(code)))
+  run message.append(")")
+  fail TaskError { message: move message, status: 127 }
+}
+
+fn isSet(mask: &[u8; 128], bit: usize) -> bool {
+  return u8.bitAnd(mask[bit / 8], u8.shiftLeft(1, usize.toU8(bit % 8))) != 0
+}
+
+static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetAbi() == "apple"
+  && Intrinsic.profileText("libc") == "system")
+  || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu"
+    && Intrinsic.profileText("libc") == "gnu") {
+  effect fn requestOf(launch: &Launch) -> ProcessRequest
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut request = match &launch.directory {
+      Option<Path>.Some { value } => run ChildProcess.requestWithin(&launch.program, &value)
+      Option<Path>.None => run ChildProcess.request(&launch.program)
+    }
+    let arguments = launch.arguments.asSlice()
+    let mut at: usize = 0
+    while at < arguments.length {
+      run ChildProcess.addArgument(&mut request, arguments[at].view())
+      at = at + 1
+    }
+    run Subprocess.inheritEnvironment(&mut request)
+    let variables = launch.variables.asSlice()
+    at = 0
+    while at < variables.length {
+      run ChildProcess.setVariable(
+        &mut request,
+        variables[at].name.view(),
+        variables[at].value.view(),
+      )
+      at = at + 1
+    }
+    return move request
+  }
+
+  effect fn textOf(bytes: &[u8]) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match move run String.copyUtf8(bytes) {
+      Result<String, InvalidUtf8>.Success { value } => move value
+      Result<String, InvalidUtf8>.Failure { .. } => run String.copy("unknown")
+    }
+  }
+
+  effect fn gathered() -> Environment
+    ! OutOfMemoryError
+    ? &mut Allocator | &mut SystemInfo {
+    let mut system = run String.copy("unknown")
+    let mut release = run String.copy("unknown")
+    let mut machine = run String.copy("unknown")
+    match move run Effect.result(SystemInfo.kernel()) {
+      Result<KernelInfo, SystemInfoError | OutOfMemoryError>.Success { value } => {
+        system = run textOf(Bytes.asSlice(&value.name))
+        release = run textOf(Bytes.asSlice(&value.release))
+        machine = run textOf(Bytes.asSlice(&value.machine))
+      }
+      Result<KernelInfo, SystemInfoError | OutOfMemoryError>.Failure { error } => match move error {
+        SystemInfoError unknown => {
+          drop unknown
+        }
+        OutOfMemoryError exhausted => {
+          fail move exhausted
+        }
+      }
+    }
+    let mut processor = run String.copy("unknown")
+    let mut processors: u64 = 0
+    match move run Effect.result(SystemInfo.processors()) {
+      Result<List<ProcessorInfo>, SystemInfoError | OutOfMemoryError>.Success { value } => {
+        processors = usize.toU64(value.length())
+        if value.length() > 0 {
+          processor = run textOf(Bytes.asSlice(&value.asSlice()[0].model))
+        }
+      }
+      Result<List<ProcessorInfo>, SystemInfoError | OutOfMemoryError>.Failure {
+        error
+      } => match move error {
+        SystemInfoError unknown => {
+          drop unknown
+        }
+        OutOfMemoryError exhausted => {
+          fail move exhausted
+        }
+      }
+    }
+    let usable = match move run Effect.result(SystemInfo.availableParallelism()) {
+      Result<usize, SystemInfoError>.Success { value } => usize.toU64(value)
+      Result<usize, SystemInfoError>.Failure { .. } => 0
+    }
+    let memory = match move run Effect.result(SystemInfo.memory()) {
+      Result<MemoryInfo, SystemInfoError>.Success { value } => value.total
+      Result<MemoryInfo, SystemInfoError>.Failure { .. } => 0
+    }
+    let load = match move run Effect.result(SystemInfo.loadAverage()) {
+      Result<[f64; 3], SystemInfoError>.Success { value } => value[0]
+      Result<[f64; 3], SystemInfoError>.Failure { .. } => 0.0
+    }
+    return Environment {
+      system: move system,
+      release: move release,
+      machine: move machine,
+      processor: move processor,
+      processors: processors,
+      usable: usable,
+      memory: memory,
+      load: load,
+      variables: List<Pair>.make(),
+    }
+  }
+
+  // Starts the child and waits for it.
+  effect fn spawned(request: &ProcessRequest, options: &SpawnOptions) -> ExitUsage
+    ! SubprocessError | OutOfMemoryError
+    ? &mut Allocator {
+    let child = run Subprocess.spawn(request, options)
+    let watch = run ExitWatch.open(Subprocess.pid(&child))
+    let measured = run ExitWatch.collectWithUsage(&watch)
+    drop child
+    return move measured
+  }
+}
+
+// The affinity mask to put back after a limited run.
+struct Restore {
+  active: bool,
+  mask: [u8; 128],
+}
+
+// Limits this thread, and so the child it starts next, to the first `cpus` processors it may
+// use. With `cpus` 0 it changes nothing.
+effect fn limit(cpus: u32) -> Restore
+  ! TaskError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut restore = Restore { active: false, mask: [0; 128] }
+  if cpus == 0 {
+    return move restore
+  }
+  static if Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu"
+    && Intrinsic.profileText("libc") == "gnu" {
+    if unsafe sched_getaffinity(0, MASK_BYTES, Pointer.fromMutSlice<u8>(&mut restore.mask)) != 0 {
+      fail TaskError {
+        message: run String.copy("cannot read the processors this process may use"),
+        status: 127,
+      }
+    }
+    let mut chosen: [u8; 128] = [0; 128]
+    let mut taken: u32 = 0
+    let mut bit: usize = 0
+    while bit < MASK_BYTES * 8 && taken < cpus {
+      if isSet(&restore.mask, bit) {
+        chosen[bit / 8] = u8.bitOr(chosen[bit / 8], u8.shiftLeft(1, usize.toU8(bit % 8)))
+        taken = taken + 1
+      }
+      bit = bit + 1
+    }
+    if taken < cpus {
+      let mut message = run String.copy("the suite asks for ")
+      run Units.appendWhole(&mut message, u32.toU64(cpus))
+      run message.append(" processors, and this process may use ")
+      run Units.appendWhole(&mut message, u32.toU64(taken))
+      fail TaskError { message: move message, status: 127 }
+    }
+    if unsafe sched_setaffinity(0, MASK_BYTES, Pointer.fromSlice<u8>(&chosen)) != 0 {
+      fail TaskError {
+        message: run String.copy("cannot limit the processors of a benchmark"),
+        status: 127,
+      }
+    }
+    restore.active = true
+    return move restore
+  } else {
+    fail TaskError {
+      message: run String.copy("only Linux can limit a benchmark to a number of processors"),
+      status: 127,
+    }
+  }
+}
+
+fn unlimit(restore: &Restore) -> () {
+  static if Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu"
+    && Intrinsic.profileText("libc") == "gnu" {
+    if restore.active {
+      let _restored = unsafe sched_setaffinity(0, MASK_BYTES, Pointer.fromSlice<u8>(&restore.mask))
+    }
+  } else {
+    drop restore
+  }
+}
