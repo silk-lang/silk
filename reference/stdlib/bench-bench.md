@@ -70,6 +70,14 @@ run kept under that name to the report, named `<name>` for a suite with one impl
 and `<name>:<implementation>` otherwise, and compares the new samples with them. So
 `--save main` before a change and `--baseline main` after it shows what the change did.
 
+`--instrument callgrind` also runs each implementation's program once under Valgrind's
+Callgrind, after the timed rounds, and adds the instructions it executed to the
+implementation's row. Instruction counts barely vary between runs, so they show a small
+change in one implementation that timing cannot. They compare two languages poorly, because
+instructions differ in cost. The count covers the program from start to exit and not the
+processes it starts. A driven program is not counted, and a program that prints result lines
+gets the count only when it reports one benchmark. `valgrind` must be on `PATH`.
+
 ## Gotchas
 - Processes can be measured on Linux with GNU libc and on macOS.
 - Statistics cannot repair a noisy computer. Close other programs, and distrust a run whose
@@ -325,6 +333,17 @@ pub baseline: Option<String>
 ```
 
 Compare each suite with the result kept under this name.
+
+<a id="BenchOptions.instrument"></a>
+
+### Field `instrument`
+
+```silk
+pub instrument: Option<String>
+```
+
+Also run each implementation's program once under this instrument and report what it
+counted. `callgrind` counts instructions with Valgrind.
 
 <a id="BenchOptions.impl"></a>
 

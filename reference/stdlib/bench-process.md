@@ -375,6 +375,34 @@ spaces. The line is for a report, not for a shell: nothing is quoted.
 #### Errors
 `OutOfMemoryError` if the `Allocator` cannot supply the text.
 
+<a id="Process.impl.instructions"></a>
+
+### Associated function `instructions`
+
+```silk
+pub fn instructions(profile: &[u8]) -> Option<u64>
+```
+
+Returns the number of instructions a Callgrind output file `profile` counted: the first
+number of its `summary:` line, or of its `totals:` line when it has no summary. Returns
+`None` if `profile` has neither line or the line has no number.
+
+#### Examples
+```silk
+import silk.bench.process { Process }
+import silk.core.option { Option }
+
+pub fn main() -> i32 {
+  let profile = b"events: Ir\nfn=main\n1 20\ntotals: 1840\nsummary: 1837 12\n"
+  if let Option<u64>.Some { value } = Process.instructions(profile) {
+    if value == 1837 {
+      return 0
+    }
+  }
+  return 1
+}
+```
+
 
 Category: Benchmarks.
 
