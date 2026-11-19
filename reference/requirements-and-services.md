@@ -841,3 +841,52 @@ reported, and a body that runs an Effect with an open row is not checked.
 **Current compiler:** Aligned.
 
 **Evidence:** `LspCases` publishes `SEM0254` for an `&mut` entry the body only reads.
+
+## AMB-001 — Ambient service declarations and defaults
+
+The standard library may declare an ambient service with `ambient service S default D`.
+The package selected as the standard library owns this privilege. The words `ambient` and
+`default` remain available as identifiers outside the declaration header.
+
+The default names a fieldless struct or a constant value. Its type must implement the service.
+A constant can carry configuration in its fields. Each operation is an `effect fn` that returns
+`()`, has failure `never`, and requires only shared access to the declaring service.
+The caller can report an observation without taking a value from the provider.
+
+```silk
+ambient service Notice default Quiet {
+  effect fn report(code: i32) -> () ? &Notice
+}
+
+struct Quiet {}
+impl Notice for Quiet {
+  effect fn report(self: &Self, code: i32) -> () {}
+}
+```
+
+## AMB-002 — Running an ambient operation
+
+An erased receiver for an ambient service is compiler-private. Source code can write
+`&any I` for an ordinary interface.
+
+A plain function can run an ambient operation. Its callers owe no service requirement.
+A runtime call without an override uses the declared default. In a build that uses only the
+default, a call goes directly to its specialized implementation, including when the operation
+takes type arguments or static arguments.
+
+```silk
+fn recover(code: i32) -> () {
+  run Notice.report(code)
+}
+```
+
+The receiver in an ambient operation declaration is the only place to write that service as a
+requirement. A requirement row, a row argument, a `Without` selector, or an ordinary provider
+selection that names the service is rejected.
+
+During static evaluation, running an ambient operation evaluates its arguments and produces
+`()` without executing the provider.
+
+Each reached specialization of an ambient provider must finish without parking or suspending.
+The build checks transitive calls, including helpers reached after selecting static arguments.
+A default that reaches a suspension boundary reports SEM0269 at its service declaration.
