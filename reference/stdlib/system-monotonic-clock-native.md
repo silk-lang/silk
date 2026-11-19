@@ -15,7 +15,7 @@ and then waits until that deadline. `waitReady` waits in one `poll` for the hand
 on as soon as a socket is ready.
 
 ## Gotchas
-- An `Instant` from this clock means nothing to other clocks. Do not mix it with `SystemClock`
+- A `Mark` from this clock means nothing to other clocks. Do not mix it with `SystemClock`
   times.
 - A wait blocks the whole thread. It does not let another fiber run.
 - A failure of the clock is a trap.
@@ -34,14 +34,7 @@ on as soon as a socket is ready.
 import silk.core.effect { Effect }
 import silk.system.monotonic_clock { MonotonicClock }
 import silk.system.monotonic_clock_native { OsMonotonicClock }
-import silk.system.system_clock { Instant, SystemClock }
-
-// Returns the nanoseconds from `start` to `end`.
-fn elapsed(start: &Instant, end: &Instant) -> i64 {
-  return (SystemClock.seconds(end) - SystemClock.seconds(start)) * 1000000000
-    + SystemClock.nanoseconds(end)
-    - SystemClock.nanoseconds(start)
-}
+import silk.time.duration { Duration }
 
 effect fn measure() -> i32
   ? &mut MonotonicClock {
@@ -50,7 +43,7 @@ effect fn measure() -> i32
   // Wait for 1 millisecond.
   run MonotonicClock.waitFor(1000000)
   let end = run MonotonicClock.now()
-  if elapsed(&start, &end) < 1000000 {
+  if &end.since(start) < &Duration.fromMilliseconds(1) {
     return 1
   }
   return 0
@@ -81,7 +74,7 @@ The system `MonotonicClock` provider. It has no state. A failure is a trap.
 and then waits until that deadline.
 
 ### Gotchas
-- An `Instant` from this clock means nothing to other clocks. Do not mix it with `SystemClock`
+- A `Mark` from this clock means nothing to other clocks. Do not mix it with `SystemClock`
   times.
 - A wait blocks the whole thread. It does not let another fiber run.
 - On Linux, the clock stops while the system sleeps, and needs glibc 2.17 or later. On macOS, it
@@ -119,7 +112,7 @@ impl MonotonicClock for OsMonotonicClock
 ### Operation `now`
 
 ```silk
-effect fn now(self: &mut Self) -> Instant
+effect fn now(self: &mut Self) -> Mark
 ```
 
 <a id="OsMonotonicClock.impl.MonotonicClock.getResolution"></a>
@@ -135,7 +128,7 @@ effect fn getResolution(self: &mut Self) -> u64
 ### Operation `waitUntil`
 
 ```silk
-effect fn waitUntil(self: &mut Self, when: Instant) -> ()
+effect fn waitUntil(self: &mut Self, when: Mark) -> ()
 ```
 
 <a id="OsMonotonicClock.impl.MonotonicClock.waitFor"></a>
@@ -151,7 +144,7 @@ effect fn waitFor(self: &mut Self, howLong: u64) -> ()
 ### Operation `waitReady`
 
 ```silk
-effect fn waitReady(self: &mut Self, watch: &mut [ReadyWatch], until: Option<Instant>) -> usize
+effect fn waitReady(self: &mut Self, watch: &mut [ReadyWatch], until: Option<Mark>) -> usize
 ```
 
 <a id="OsMonotonicClock.impl-2"></a>

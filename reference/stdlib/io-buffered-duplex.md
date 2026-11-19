@@ -41,31 +41,31 @@ import silk.io.memory_byte_duplex {
 }
 import silk.system.monotonic_clock { MonotonicClock, ReadyWatch }
 import silk.core.option { Option }
-import silk.system.system_clock { Instant, SystemClock }
+import silk.time.mark { Mark }
 
 struct FixedClock {}
 
 impl MonotonicClock for FixedClock {
-  effect fn now(self: &mut Self) -> Instant {
-    return SystemClock.make(0, 0)
+  effect fn now(self: &mut Self) -> Mark {
+    return Mark.make(0, 0)
   }
 
   effect fn getResolution(self: &mut Self) -> u64 {
     return 1
   }
 
-  effect fn waitUntil(self: &mut Self, when: Instant) -> () {
+  effect fn waitUntil(self: &mut Self, when: Mark) -> () {
     return ()
   }
 
   effect fn waitFor(self: &mut Self, howLong: u64) -> () {
     return ()
   }
-  effect fn waitReady(self: &mut Self, watch: &mut [ReadyWatch], until: Option<Instant>) -> usize {
+  effect fn waitReady(self: &mut Self, watch: &mut [ReadyWatch], until: Option<Mark>) -> usize {
     if watch.length > 0 { Intrinsic.trap("this clock has no handles to watch") }
     match move until {
-      Option<Instant>.None => {}
-      Option<Instant>.Some {value: when} => {
+      Option<Mark>.None => {}
+      Option<Mark>.Some {value: when} => {
       }
     }
     return 0
@@ -79,13 +79,13 @@ effect fn transport() -> MemoryByteDuplex
   let bytes = run Bytes.copy(&b"ping")
   run List<MemoryReadEvent>.append(
     &mut reads,
-    MemoryReadEvent.Data { readyAt: SystemClock.make(0, 0), bytes: move bytes }
+    MemoryReadEvent.Data { readyAt: Mark.make(0, 0), bytes: move bytes }
   )
   let mut writes = List<MemoryWriteEvent>.make()
   run List<MemoryWriteEvent>.append(
     &mut writes,
     MemoryWriteEvent {
-      readyAt: SystemClock.make(0, 0),
+      readyAt: Mark.make(0, 0),
       action: MemoryWriteAction.Accept { count: 4 }
     }
   )
@@ -98,9 +98,9 @@ effect<'session> fn answer<'session, P>(session: &'session mut BufferedDuplex<'s
   ? &mut MonotonicClock where
   &'session mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock {
   let mut request: [u8; 4] = [0, 0, 0, 0]
-  run BufferedDuplex.readExact(&mut session.*, &mut request, Option<Instant>.none())
-  run BufferedDuplex.writeAll(&mut session.*, b"pong", Option<Instant>.none())
-  return run BufferedDuplex.flush(&mut session.*, Option<Instant>.none())
+  run BufferedDuplex.readExact(&mut session.*, &mut request, Option<Mark>.none())
+  run BufferedDuplex.writeAll(&mut session.*, b"pong", Option<Mark>.none())
+  return run BufferedDuplex.flush(&mut session.*, Option<Mark>.none())
 }
 
 pub effect fn main() -> i32
@@ -253,7 +253,7 @@ Removes `count` unread input bytes from the front of the input buffer.
 pub effect fn fill(
     self: &mut Self,
     minimum: usize,
-    deadline: Option<Instant>,
+    deadline: Option<Mark>,
   ) -> FillOutcome
   ! BufferError
   ? &mut MonotonicClock
@@ -285,7 +285,7 @@ means no time limit.
 pub effect fn readSome(
     self: &mut Self,
     output: &mut [u8],
-    deadline: Option<Instant>,
+    deadline: Option<Mark>,
   ) -> ReadTransfer
   ! BufferError
   ? &mut MonotonicClock
@@ -315,7 +315,7 @@ returns a count of 0 and does not read. `deadline` is an absolute time on the ac
 pub effect fn readExact(
     self: &mut Self,
     output: &mut [u8],
-    deadline: Option<Instant>,
+    deadline: Option<Mark>,
   ) -> ()
   ! BufferError
   ? &mut MonotonicClock
@@ -345,7 +345,7 @@ limit. It applies to each read.
 pub effect fn discardAtMost(
     self: &mut Self,
     limit: usize,
-    deadline: Option<Instant>,
+    deadline: Option<Mark>,
   ) -> DiscardOutcome
   ! BufferError
   ? &mut MonotonicClock
@@ -373,7 +373,7 @@ absolute time on the active `MonotonicClock`. `Option.none()` means no time limi
 pub effect fn discardExact(
     self: &mut Self,
     count: usize,
-    deadline: Option<Instant>,
+    deadline: Option<Mark>,
   ) -> ()
   ! BufferError
   ? &mut MonotonicClock
@@ -403,7 +403,7 @@ limit.
 pub effect fn writeSome(
     self: &mut Self,
     input: &[u8],
-    deadline: Option<Instant>,
+    deadline: Option<Mark>,
   ) -> usize
   ! BufferError
   ? &mut MonotonicClock
@@ -436,7 +436,7 @@ no time limit.
 pub effect fn writeAll(
     self: &mut Self,
     input: &[u8],
-    deadline: Option<Instant>,
+    deadline: Option<Mark>,
   ) -> ()
   ! BufferError
   ? &mut MonotonicClock
@@ -468,7 +468,7 @@ means no time limit. It applies to each transport write.
 pub effect fn writeVecAll(
     self: &mut Self,
     inputs: &[Bytes],
-    deadline: Option<Instant>,
+    deadline: Option<Mark>,
   ) -> ()
   ! BufferError
   ? &mut MonotonicClock
@@ -499,7 +499,7 @@ absolute time on the active `MonotonicClock`. `Option.none()` means no time limi
 ```silk
 pub effect fn flush(
     self: &mut Self,
-    deadline: Option<Instant>,
+    deadline: Option<Mark>,
   ) -> ()
   ! BufferError
   ? &mut MonotonicClock
@@ -529,7 +529,7 @@ time limit. It applies to each transport operation.
 ```silk
 pub effect fn finish(
     self: &mut Self,
-    deadline: Option<Instant>,
+    deadline: Option<Mark>,
   ) -> ()
   ! BufferError
   ? &mut MonotonicClock
@@ -564,7 +564,7 @@ time limit. It applies to each transport operation.
 ```silk
 pub effect fn shutdownWrite(
     self: &mut Self,
-    deadline: Option<Instant>,
+    deadline: Option<Mark>,
   ) -> ()
   ! BufferError
   ? &mut MonotonicClock

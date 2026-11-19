@@ -1031,7 +1031,7 @@ pub effect<'env> fn withUpgrade<
 >(
   request: &'loan mut Request<'request, 'connection, 'transport, P>,
   limits: Limits,
-  deadline: Option<Instant>,
+  deadline: Option<Mark>,
   handler: H,
   use: for<'call, 'transportView: 'call> once fn<'callback>(
     &'call mut BufferedDuplex<'transportView, P>,
@@ -1068,7 +1068,7 @@ pub effect fn reject<'loan, 'request: 'loan, 'connection: 'request, 'transport: 
   request: &'loan mut Request<'request, 'connection, 'transport, P>,
   error: &UpgradeError,
   limits: Limits,
-  deadline: Option<Instant>,
+  deadline: Option<Mark>,
 ) -> ()
 ! UpgradeError | ServerError | OutOfMemoryError
 ? &mut Allocator | &mut MonotonicClock
@@ -1227,7 +1227,7 @@ pub effect fn acceptOwned<D, ?R, P, H: DecisionHandler<D ? R>>(
   limits: Limits,
   options: Options,
   handler: H,
-  deadline: Option<Instant>,
+  deadline: Option<Mark>,
 ) -> Accepted<P>
 ! D | UpgradeError | StreamError | OutOfMemoryError
 ? R | &mut Allocator | &mut MonotonicClock | &mut Random

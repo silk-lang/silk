@@ -51,7 +51,7 @@ pub effect<'env> fn serveNext<
   >(
     listener: &'listener mut Listener,
     limits: Limits,
-    acceptDeadline: Option<Instant>,
+    acceptDeadline: Option<Mark>,
     handler: H,
   ) -> A
   ! E | NativeSocketError | ServerError | BufferError | OutOfMemoryError

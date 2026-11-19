@@ -516,7 +516,7 @@ its cancel exits, and publishes `Cancelled` to the target's Fiber.
 ### Operation `armDeadline`
 
 ```silk
-effect fn armDeadline(deadline: Instant) -> usize ? &mut Scheduler
+effect fn armDeadline(deadline: Mark) -> usize ? &mut Scheduler
 ```
 
 Arms a deadline for the calling task and returns its token, which is never 0.

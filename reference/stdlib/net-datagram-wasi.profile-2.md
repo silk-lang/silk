@@ -67,7 +67,7 @@ impl UdpSocket
 ### Associated function `bind`
 
 ```silk
-pub effect fn bind(network: &Network, local: &SocketAddress, remote: Option<&SocketAddress>, deadline: Option<Instant>) -> UdpSocket
+pub effect fn bind(network: &Network, local: &SocketAddress, remote: Option<&SocketAddress>, deadline: Option<Mark>) -> UdpSocket
       ! SocketError ? &mut MonotonicClock
 ```
 
@@ -89,7 +89,7 @@ Returns the bound local address. A closed socket fails with code 9.
 ### Method `send`
 
 ```silk
-pub effect fn send(self: &mut Self, bytes: &[u8], remote: Option<&SocketAddress>, deadline: Option<Instant>) -> ()
+pub effect fn send(self: &mut Self, bytes: &[u8], remote: Option<&SocketAddress>, deadline: Option<Mark>) -> ()
       ! SocketError ? &mut MonotonicClock
 ```
 
@@ -101,7 +101,7 @@ may use none. Empty payloads are valid datagrams. A closed socket fails with cod
 ### Method `receive`
 
 ```silk
-pub effect fn receive(self: &mut Self, deadline: Option<Instant>) -> Datagram
+pub effect fn receive(self: &mut Self, deadline: Option<Mark>) -> Datagram
       ! SocketError | OutOfMemoryError ? &mut MonotonicClock | &mut Allocator
 ```
 

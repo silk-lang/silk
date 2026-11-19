@@ -94,7 +94,7 @@ initiate shutdown.
 ### Method `flush`
 
 ```silk
-pub effect fn flush(self: &mut Self, deadline: Option<Instant>) -> ()
+pub effect fn flush(self: &mut Self, deadline: Option<Mark>) -> ()
     ! ProtocolError | TransportError | OutOfMemoryError
     ? &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
 ```
@@ -106,7 +106,7 @@ Sends all queued protocol bytes and flushes the transport with the caller's abso
 ### Method `close`
 
 ```silk
-pub effect fn close(self: &mut Self, deadline: Option<Instant>, drainBytes: usize) -> ()
+pub effect fn close(self: &mut Self, deadline: Option<Mark>, drainBytes: usize) -> ()
     ! ProtocolError | TransportError | OutOfMemoryError
     ? &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
 ```
@@ -120,7 +120,7 @@ Drain failures stop draining. Flush and close failures are returned after the cl
 ### Method `next`
 
 ```silk
-pub effect fn next(self: &mut Self, deadline: Option<Instant>) -> Option<Event>
+pub effect fn next(self: &mut Self, deadline: Option<Mark>) -> Option<Event>
     ! ProtocolError | TransportError | OutOfMemoryError
     ? &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
 ```

@@ -1034,7 +1034,7 @@ bytes to get every datagram whole.
 ### Method `waitReadable`
 
 ```silk
-pub effect fn waitReadable(self: &Self, deadline: Instant) -> bool
+pub effect fn waitReadable(self: &Self, deadline: Mark) -> bool
     ! DatagramError
     ? &mut MonotonicClock
 ```
@@ -1053,7 +1053,7 @@ Use it in a program without an event loop. It blocks the thread.
 ## `waitAny`
 
 ```silk
-pub effect fn waitAny(sockets: &[NativeUdpSocket], deadline: Instant) -> bool
+pub effect fn waitAny(sockets: &[NativeUdpSocket], deadline: Mark) -> bool
   ! DatagramError | OutOfMemoryError
   ? &mut MonotonicClock | &mut Allocator
 ```
