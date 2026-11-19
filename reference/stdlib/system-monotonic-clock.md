@@ -10,7 +10,7 @@ wait, for a time or for a socket. Use `silk.system.system_clock` when you need t
 of day.
 
 ## Details
-[`MonotonicClock.now`](#MonotonicClock.now) returns an [`Instant`](./system-system-clock.md#Instant) from an origin that is not specified, such as the
+[`MonotonicClock.now`](#MonotonicClock.now) returns a [`Mark`](./time-mark.md#Mark) from an origin that is not specified, such as the
 start of the computer. Each read is equal to or later than the read before it. A mark or a
 deadline has a meaning only for the clock that made it.
 
@@ -22,9 +22,9 @@ mark is reached. All socket waits go through it, so the provider decides how a w
 native clock blocks the thread in `poll`, and a task scheduler parks only the task.
 
 ## Gotchas
-`Instant` is also the type of system time. The compiler cannot stop you from mixing marks of
-different clocks, or a mark with system time. The native provider blocks the thread when it
-waits. A task scheduler provides a clock whose waits pause only one task. A test clock can move
+A `Mark` is not system time: `SystemClock` returns an `Instant`, a different type. But the
+compiler cannot stop you from mixing marks of two different clocks. The native provider blocks
+the thread when it waits. A task scheduler provides a clock whose waits pause only one task. A test clock can move
 its time forward without sleeping. If a provider returns a value that is not valid, the program
 traps, because this effect has no error type.
 
@@ -34,22 +34,22 @@ traps, because this effect has no error type.
 import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.system.monotonic_clock { MonotonicClock, ReadyWatch }
-import silk.system.system_clock { Instant, SystemClock }
+import silk.time.mark { Mark }
 
 struct VirtualClock {
-  mark: Instant,
+  mark: Mark,
 }
 
 impl MonotonicClock for VirtualClock {
-  effect fn now(self: &mut Self) -> Instant {
-    return SystemClock.make(SystemClock.seconds(&self.mark), SystemClock.nanoseconds(&self.mark))
+  effect fn now(self: &mut Self) -> Mark {
+    return self.mark
   }
 
   effect fn getResolution(self: &mut Self) -> u64 {
     return 1
   }
 
-  effect fn waitUntil(self: &mut Self, when: Instant) -> () {
+  effect fn waitUntil(self: &mut Self, when: Mark) -> () {
     self.mark = move when
     return ()
   }
@@ -60,19 +60,19 @@ impl MonotonicClock for VirtualClock {
   }
 
   // No handle is ever ready on this clock, so a wait moves to `until`.
-  effect fn waitReady(self: &mut Self, watch: &mut [ReadyWatch], until: Option<Instant>) -> usize {
+  effect fn waitReady(self: &mut Self, watch: &mut [ReadyWatch], until: Option<Mark>) -> usize {
     match move until {
-      Option<Instant>.Some {value} => { self.mark = move value }
-      Option<Instant>.None => Intrinsic.trap("VirtualClock: no handle will be ready")
+      Option<Mark>.Some {value} => { self.mark = move value }
+      Option<Mark>.None => Intrinsic.trap("VirtualClock: no handle will be ready")
     }
     return 0
   }
 }
 
 pub fn main() -> i32 {
-  let mut clock = VirtualClock { mark: SystemClock.make(0, 900000000) }
+  let mut clock = VirtualClock { mark: Mark.make(0, 900000000) }
   run MonotonicClock.waitFor(300ms) |> Effect.provideMut<MonotonicClock>(&mut clock)
-  if SystemClock.seconds(&clock.mark) != 1 || SystemClock.nanoseconds(&clock.mark) != 200000000 {
+  if clock.mark.seconds() != 1 || clock.mark.subsecondNanoseconds() != 200000000 {
     return 1
   }
   return 0
@@ -100,16 +100,16 @@ wait. Use `silk.system.system_clock` when you need the date and time of day.
 
 ### Details
 
-[`MonotonicClock.now`](#MonotonicClock.now) returns an `Instant` from an origin that is not specified, such as the
+[`MonotonicClock.now`](#MonotonicClock.now) returns a `Mark` from an origin that is not specified, such as the
 start of the computer. Durations are `u64` nanoseconds. A duration literal such as `300ms` has
 this type. A provider implements all five operations on one timeline. Exclusive access lets
 a test provider move its own time forward and record waits.
 
 ### Gotchas
 
-A mark or a deadline has a meaning only for the clock that made it. `Instant` is also the type
-of system time, and the compiler cannot stop you from mixing marks of different clocks, or a
-mark with system time. The native provider blocks the thread when it waits. A task scheduler
+A mark or a deadline has a meaning only for the clock that made it. A `Mark` is not system
+time, which is an `Instant`, but the compiler cannot stop you from mixing marks of two
+different clocks. The native provider blocks the thread when it waits. A task scheduler
 provides a clock whose waits pause only one task. If a provider returns a value that is not
 valid, the program traps, because this effect has no error type.
 
@@ -118,7 +118,7 @@ valid, the program traps, because this effect has no error type.
 ### Operation `now`
 
 ```silk
-effect fn now() -> Instant ? &mut MonotonicClock
+effect fn now() -> Mark ? &mut MonotonicClock
 ```
 
 Returns the current mark. It is equal to or later than each earlier mark of the same clock.
@@ -139,7 +139,7 @@ lower.
 ### Operation `waitUntil`
 
 ```silk
-effect fn waitUntil(when: Instant) -> () ? &mut MonotonicClock
+effect fn waitUntil(when: Mark) -> () ? &mut MonotonicClock
 ```
 
 Returns when the clock reaches `when`. If `when` is in the past, it returns at once.
@@ -160,7 +160,7 @@ Returns when at least `howLong` nanoseconds have passed on the clock.
 
 #### Gotchas
 
-A duration of 0 can return at once. If the deadline does not fit in an `Instant`, the provider
+A duration of 0 can return at once. If the deadline does not fit in a `Mark`, the provider
 traps.
 
 <a id="MonotonicClock.waitReady"></a>
@@ -168,7 +168,7 @@ traps.
 ### Operation `waitReady`
 
 ```silk
-effect fn waitReady(watch: &mut [ReadyWatch], until: Option<Instant>) -> usize ? &mut MonotonicClock
+effect fn waitReady(watch: &mut [ReadyWatch], until: Option<Mark>) -> usize ? &mut MonotonicClock
 ```
 
 Returns when a handle in `watch` is ready, or when the clock reaches `until`, and returns how
@@ -198,7 +198,7 @@ impl MonotonicClock
 ### Associated function `deadlineAfter`
 
 ```silk
-pub fn deadlineAfter(start: &Instant, howLong: u64) -> Instant
+pub fn deadlineAfter(start: &Mark, howLong: u64) -> Mark
 ```
 
 Returns the mark that is `howLong` nanoseconds after `start`.
@@ -210,7 +210,7 @@ Use it to compute a deadline for operations that take one, such as
 
 #### Details
 
-Every `u64` duration works when the result fits in an `Instant`.
+Every `u64` duration works when the result fits in a `Mark`.
 
 #### Gotchas
 

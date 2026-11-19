@@ -123,7 +123,7 @@ Copies the request method, optional URL parts, and fields. It does not consume t
 ### Method `readBody`
 
 ```silk
-pub effect fn readBody(self: &mut Self, maximum: usize, deadline: Option<Instant>) -> Bytes
+pub effect fn readBody(self: &mut Self, maximum: usize, deadline: Option<Mark>) -> Bytes
       ! HttpError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock
 ```
 
@@ -135,7 +135,7 @@ A second call fails. Dropping a failed read releases its body and stream resourc
 ### Method `respond`
 
 ```silk
-pub effect fn respond(self: Self, status: u16, fields: &[Field], body: &[u8], deadline: Option<Instant>) -> ()
+pub effect fn respond(self: Self, status: u16, fields: &[Field], body: &[u8], deadline: Option<Mark>) -> ()
       ! HttpError ? &mut MonotonicClock
 ```
 

@@ -49,7 +49,7 @@ import silk.http.exchange_native { NativeExchangeError, Options, preflight }
 import silk.http.origin { Origin, OriginError }
 import silk.core.option { Option }
 import silk.core.result { Result }
-import silk.system.system_clock { Instant, SystemClock }
+import silk.time.mark { Mark }
 import silk.uri.uri { Uri }
 import silk.uri.reference { ParseError }
 
@@ -94,7 +94,7 @@ pub fn main() -> i32 {
   }
 
   // The resolver cannot stop at a deadline, so a host name with a deadline fails.
-  options.deadline = Option<Instant>.some(SystemClock.make(5, 0))
+  options.deadline = Option<Mark>.some(Mark.make(5, 0))
   let rejected = match move preflight(&named, &options) {
     Result.Success {..} => false
     Result.Failure { error } => match move error {
@@ -360,7 +360,7 @@ The maximum number of connection attempts. It is 1 through 1024.
 ### Field `deadline`
 
 ```silk
-pub deadline: Option<Instant>
+pub deadline: Option<Mark>
 ```
 
 The absolute deadline for the whole operation, on the monotonic clock. It must be `None` when
@@ -623,7 +623,7 @@ pub effect fn acquireOwned(
   options: Options,
   limits: Limits,
   preparedTrust: Option<TrustSnapshot>,
-  acquisitionDeadline: Option<Instant>,
+  acquisitionDeadline: Option<Mark>,
 ) -> Connection<NativeTransport>
 ! NativeExchangeError | ExchangeError | ResolverError | NativeSocketError | ConnectionError | IdentityError | OutOfMemoryError
 ? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random
@@ -658,7 +658,7 @@ pub effect fn acquireResolvedOwned(
   options: Options,
   limits: Limits,
   preparedTrust: Option<TrustSnapshot>,
-  acquisitionDeadline: Option<Instant>,
+  acquisitionDeadline: Option<Mark>,
 ) -> Connection<NativeTransport>
 ! NativeExchangeError | ExchangeError | NativeSocketError | ConnectionError | IdentityError | OutOfMemoryError
 ? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random
@@ -695,7 +695,7 @@ pub effect fn acquireNegotiatedOwned(
   options: Options,
   limits: Limits,
   preparedTrust: Option<TrustSnapshot>,
-  acquisitionDeadline: Option<Instant>,
+  acquisitionDeadline: Option<Mark>,
 ) -> Negotiated
 ! NativeExchangeError | ExchangeError | ResolverError | NativeSocketError | ConnectionError | IdentityError | OutOfMemoryError
 ? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random
@@ -723,7 +723,7 @@ pub effect fn acquireResolvedNegotiatedOwned(
   options: Options,
   limits: Limits,
   preparedTrust: Option<TrustSnapshot>,
-  acquisitionDeadline: Option<Instant>,
+  acquisitionDeadline: Option<Mark>,
 ) -> Negotiated
 ! NativeExchangeError | ExchangeError | NativeSocketError | ConnectionError | IdentityError | OutOfMemoryError
 ? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random
@@ -759,7 +759,7 @@ pub effect fn acquireUnixOwned(
   options: Options,
   limits: Limits,
   preparedTrust: Option<TrustSnapshot>,
-  acquisitionDeadline: Option<Instant>,
+  acquisitionDeadline: Option<Mark>,
 ) -> Connection<NativeTransport>
 ! NativeExchangeError | ExchangeError | NativeSocketError | ConnectionError | IdentityError | OutOfMemoryError
 ? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random

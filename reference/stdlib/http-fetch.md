@@ -1370,7 +1370,7 @@ Whether to use the proxy policy of the client.
 ### Field `deadline`
 
 ```silk
-pub deadline: Option<Instant>
+pub deadline: Option<Mark>
 ```
 
 One deadline on the `MonotonicClock` for the whole operation, including all redirects.
@@ -1536,7 +1536,7 @@ effect<'call> fn write<'call>(
     sink: &mut Self,
     metadata: &'call ResponseMetadata,
     chunk: &'call [u8],
-    deadline: &'call Option<Instant>,
+    deadline: &'call Option<Mark>,
   ) -> () ! E ? R
 ```
 
@@ -1582,7 +1582,7 @@ effect fn withAttempt(
     httpLimits: ClientLimits,
     poolMode: PoolMode,
     proxyMode: ProxyMode,
-    deadline: Option<Instant>,
+    deadline: Option<Mark>,
   ) -> A ! HandlerError | AcquisitionError ? HandlerRequirements | AcquisitionRequirements | &mut HybridAttempt<'policy, RoutedP, DirectP, A, HandlerError ? HandlerRequirements> where
     HandlerRequirements in Without<HandlerRequirements, ByteDuplex>,
     HandlerRequirements in Without<HandlerRequirements, HttpTransport>

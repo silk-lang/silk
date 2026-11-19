@@ -115,7 +115,7 @@ An owned WASI pollable. Drop releases the resource; it must precede its parent r
 ## `expired`
 
 ```silk
-pub effect fn expired(deadline: &Option<Instant>) -> bool ? &mut MonotonicClock
+pub effect fn expired(deadline: &Option<Mark>) -> bool ? &mut MonotonicClock
 ```
 
 Whether an optional absolute deadline has expired on the supplied monotonic clock.
@@ -143,7 +143,7 @@ Takes ownership of a live pollable handle. The caller must surrender its previou
 ### Method `wait`
 
 ```silk
-pub effect fn wait(self: &Self, deadline: &Option<Instant>) -> bool ? &mut MonotonicClock
+pub effect fn wait(self: &Self, deadline: &Option<Mark>) -> bool ? &mut MonotonicClock
 ```
 
 Waits for readiness, returning false when the deadline on the supplied clock expires.

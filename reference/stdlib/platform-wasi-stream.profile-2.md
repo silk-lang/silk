@@ -100,7 +100,7 @@ Borrows the handle without transferring ownership. It is valid until this owner 
 ### Method `read`
 
 ```silk
-pub effect fn read(self: &mut Self, output: &mut [u8], deadline: Option<Instant>) -> ReadTransfer
+pub effect fn read(self: &mut Self, output: &mut [u8], deadline: Option<Mark>) -> ReadTransfer
       ! StreamError ? &mut MonotonicClock
 ```
 
@@ -156,7 +156,7 @@ Borrows the handle without transferring ownership. It is valid until this owner 
 ### Method `write`
 
 ```silk
-pub effect fn write(self: &mut Self, input: &[u8], deadline: Option<Instant>) -> usize
+pub effect fn write(self: &mut Self, input: &[u8], deadline: Option<Mark>) -> usize
       ! StreamError ? &mut MonotonicClock
 ```
 
@@ -168,7 +168,7 @@ An empty input returns zero; host I/O errors release their error resource before
 ### Method `flush`
 
 ```silk
-pub effect fn flush(self: &mut Self, deadline: Option<Instant>) -> ()
+pub effect fn flush(self: &mut Self, deadline: Option<Mark>) -> ()
       ! StreamError ? &mut MonotonicClock
 ```
 

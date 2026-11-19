@@ -48,7 +48,7 @@ import silk.system.monotonic_clock { MonotonicClock }
 import silk.system.monotonic_clock_native { OsMonotonicClock }
 import silk.system.random { Random }
 import silk.system.random_native { OsRandom }
-import silk.system.system_clock { Instant, SystemClock }
+import silk.time.mark { Mark }
 import silk.http.transport as Transport
 import silk.http.websocket { Event, Opcode, Role, appendFrame }
 import silk.http.websocket_stream { Options, StreamError, WebSocket }
@@ -60,22 +60,22 @@ effect fn program() -> i32
   let mut wire = Bytes.make()
   run appendFrame(&mut wire, Opcode.Text, true, b"ping", Option<[u8; 4]>.some([9, 8, 7, 6]))
   let mut reads = List<MemoryReadEvent>.make()
-  run reads.append(MemoryReadEvent.Data {readyAt: SystemClock.make(0, 0), bytes: move wire})
+  run reads.append(MemoryReadEvent.Data {readyAt: Mark.make(0, 0), bytes: move wire})
   let mut writes = List<MemoryWriteEvent>.make()
   run writes.append(MemoryWriteEvent {
-    readyAt: SystemClock.make(0, 0),
+    readyAt: Mark.make(0, 0),
     action: MemoryWriteAction.Accept {count: 64},
   })
   let mut memory = run MemoryByteDuplex.make(move reads, move writes, 64, 8, Option<i32>.none())
 
   let mut socket = run WebSocket.make(Transport.plain(&mut memory), Role.Server, Options.defaults(), b"")
-  match run socket.readEvent(Option<Instant>.none()) {
+  match run socket.readEvent(Option<Mark>.none()) {
     Event.Text {..} => {
       if socket.messageText() != "ping" { return 1 }
     }
     _ => { return 2 }
   }
-  run socket.writeText("pong", Option<Instant>.none())
+  run socket.writeText("pong", Option<Mark>.none())
   drop socket
   // An unmasked Text frame: 0x81, length 4, then "pong".
   if memory.outbound() != b"\x81\x04pong" { return 3 }
@@ -336,7 +336,7 @@ Returns the transport, to close it or to look at it.
 ### Method `readEvent`
 
 ```silk
-pub effect fn readEvent(self: &mut Self, deadline: Option<Instant>) -> Event
+pub effect fn readEvent(self: &mut Self, deadline: Option<Mark>) -> Event
   ! StreamError | OutOfMemoryError
   ? &mut Allocator | &mut MonotonicClock | &mut Random
   where
@@ -359,7 +359,7 @@ A Ping is answered and a Close is answered before the call returns. The message 
 ### Method `writeText`
 
 ```silk
-pub effect fn writeText(self: &mut Self, text: string, deadline: Option<Instant>) -> ()
+pub effect fn writeText(self: &mut Self, text: string, deadline: Option<Mark>) -> ()
   ! StreamError | OutOfMemoryError
   ? &mut Allocator | &mut MonotonicClock | &mut Random
   where
@@ -377,7 +377,7 @@ Sends `text` as one Text frame, and flushes it.
 ### Method `writeBinary`
 
 ```silk
-pub effect fn writeBinary(self: &mut Self, bytes: &[u8], deadline: Option<Instant>) -> ()
+pub effect fn writeBinary(self: &mut Self, bytes: &[u8], deadline: Option<Mark>) -> ()
   ! StreamError | OutOfMemoryError
   ? &mut Allocator | &mut MonotonicClock | &mut Random
   where
@@ -400,7 +400,7 @@ pub effect fn writeFragment(
     kind: MessageKind,
     payload: &[u8],
     fin: bool,
-    deadline: Option<Instant>,
+    deadline: Option<Mark>,
   ) -> ()
   ! StreamError | OutOfMemoryError
   ? &mut Allocator | &mut MonotonicClock | &mut Random
@@ -420,7 +420,7 @@ and `fin` marks the last one.
 ### Method `writePing`
 
 ```silk
-pub effect fn writePing(self: &mut Self, payload: &[u8], deadline: Option<Instant>) -> ()
+pub effect fn writePing(self: &mut Self, payload: &[u8], deadline: Option<Mark>) -> ()
   ! StreamError | OutOfMemoryError
   ? &mut Allocator | &mut MonotonicClock | &mut Random
   where
@@ -439,7 +439,7 @@ fails or `deadline` passes.
 ### Method `sendClose`
 
 ```silk
-pub effect fn sendClose(self: &mut Self, data: Option<CloseData>, deadline: Option<Instant>) -> ()
+pub effect fn sendClose(self: &mut Self, data: Option<CloseData>, deadline: Option<Mark>) -> ()
   ! StreamError | OutOfMemoryError
   ? &mut Allocator | &mut MonotonicClock | &mut Random
   where
@@ -667,7 +667,7 @@ Returns the last Text message as text. It is empty after a Binary message.
 ### Method `readEvent`
 
 ```silk
-pub effect fn readEvent(self: &mut Self, deadline: Option<Instant>) -> Event
+pub effect fn readEvent(self: &mut Self, deadline: Option<Mark>) -> Event
   ! StreamError | OutOfMemoryError
   ? &mut Allocator | &mut MonotonicClock | &mut Random
   where
@@ -723,7 +723,7 @@ Returns the state of the send side.
 ### Method `writeText`
 
 ```silk
-pub effect fn writeText(self: &Self, text: string, deadline: Option<Instant>) -> ()
+pub effect fn writeText(self: &Self, text: string, deadline: Option<Mark>) -> ()
   ! StreamError | OutOfMemoryError
   ? &mut Allocator | &mut MonotonicClock | &mut Random
   where
@@ -741,7 +741,7 @@ Sends `text` as one Text frame, and flushes it. It waits while another writer se
 ### Method `writeBinary`
 
 ```silk
-pub effect fn writeBinary(self: &Self, bytes: &[u8], deadline: Option<Instant>) -> ()
+pub effect fn writeBinary(self: &Self, bytes: &[u8], deadline: Option<Mark>) -> ()
   ! StreamError | OutOfMemoryError
   ? &mut Allocator | &mut MonotonicClock | &mut Random
   where
@@ -759,7 +759,7 @@ Sends `bytes` as one Binary frame, and flushes it. It waits while another writer
 ### Method `writePing`
 
 ```silk
-pub effect fn writePing(self: &Self, payload: &[u8], deadline: Option<Instant>) -> ()
+pub effect fn writePing(self: &Self, payload: &[u8], deadline: Option<Mark>) -> ()
   ! StreamError | OutOfMemoryError
   ? &mut Allocator | &mut MonotonicClock | &mut Random
   where
@@ -778,7 +778,7 @@ fails or `deadline` passes.
 ### Method `sendClose`
 
 ```silk
-pub effect fn sendClose(self: &Self, data: Option<CloseData>, deadline: Option<Instant>) -> ()
+pub effect fn sendClose(self: &Self, data: Option<CloseData>, deadline: Option<Mark>) -> ()
   ! StreamError | OutOfMemoryError
   ? &mut Allocator | &mut MonotonicClock | &mut Random
   where

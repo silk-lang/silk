@@ -322,7 +322,7 @@ finishes or is cancelled drops its deadlines.
 `Execution.parkTransferable`; blocking the native thread holds up a whole worker. A fiber that
 never parks cannot be cancelled before it ends. A fiber forked after its pool was dropped is
 cancelled before it starts. Pool fibers do not provide the `Scheduler` service, so they use
-`Pool.timeout`, not `Effect.timeout`; there is no deadline form, since an `Instant` names no clock
+`Pool.timeout`, not `Effect.timeout`; there is no deadline form, since a `Mark` names no clock
 the pool can wait on.
 
 **Evidence:** [thread pool](../stdlib/silk/concurrency/thread_pool.silk), native corpus (`thread-pool-tasks`).
