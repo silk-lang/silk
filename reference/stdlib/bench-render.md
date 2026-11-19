@@ -75,6 +75,42 @@ details as a list.
 #### Errors
 `OutOfMemoryError` if the `Allocator` cannot supply the text.
 
+<a id="Render.impl.restates"></a>
+
+### Associated function `restates`
+
+```silk
+pub fn restates(report: &Report, chart: &Chart) -> bool
+```
+
+Returns the lines that describe the run of `report` under its tables: the computer, the
+dates, the label, the revisions, and the notes.
+
+#### Errors
+`OutOfMemoryError` if the `Allocator` cannot supply the lines.
+Returns whether `chart` says only what the tables of `report` already say: the median of
+every implementation relative to the reference, for each benchmark. The terminal and
+Markdown reports leave such a chart out.
+
+<a id="Render.impl.grid"></a>
+
+### Associated function `grid`
+
+```silk
+pub effect fn grid(chart: &Chart, panel: &Panel) -> List<List<String>>
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Returns `panel` of `chart` as the rows of a table, for a renderer that shows a chart as
+text: a heading row, then one row for each series with one cell for each entry of the
+axis. A `distribution` gets the columns `runs`, `smallest`, `largest` and `spread`, where
+the spread is a small histogram of the measured runs between the smallest and the largest
+value of the panel.
+
+#### Errors
+`OutOfMemoryError` if the `Allocator` cannot supply the cells.
+
 <a id="Render.impl.details"></a>
 
 ### Associated function `details`
@@ -84,12 +120,6 @@ pub effect fn details(report: &Report) -> List<String>
     ! OutOfMemoryError
     ? &mut Allocator
 ```
-
-Returns the lines that describe the run of `report` under its tables: the computer, the
-dates, the label, the revisions, and the notes.
-
-#### Errors
-`OutOfMemoryError` if the `Allocator` cannot supply the lines.
 
 <a id="Render.impl.titles"></a>
 
