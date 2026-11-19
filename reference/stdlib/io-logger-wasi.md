@@ -33,17 +33,21 @@ None. `wasi:logging` cannot refuse a message.
 ## Examples
 ```silk,ignore
 import silk.core.effect { Effect }
-import silk.io.logger { LogError, Logger }
+import silk.concurrency.sync { Arc }
+import silk.io.logger { Logger }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.io.logger_wasi { WasiLogger }
 
 pub effect fn main() -> i32
-  ! LogError {
-  let mut logger = WasiLogger.make("startup")
+  ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let logger = run Arc<WasiLogger>.make(WasiLogger.make("startup"))
+    |> Effect.provideMut<Allocator>(&mut allocator)
   let values = .{ count: 3 }
 
   // Logs "started 3 workers" at `info` with the context "startup".
   run Effect.logInfo("started {count} workers", &values)
-    |> Effect.provideMut<Logger>(&mut logger)
+    |> Effect.provideAmbient<Logger>(&logger)
   return 0
 }
 ```

@@ -3,10 +3,10 @@
 # Usage: python3 huge-sources.py <workdir> [case...]
 import os, subprocess, sys, time, shutil
 W=sys.argv[1]; only=sys.argv[2:]
-HDR='import silk.core.effect { Effect }\nimport silk.io.logger { LogError }\nimport silk.io.logger_native { StdoutLogger }\n\n'
+HDR='import silk.core.effect { Effect }\nimport silk.io.writer { Writer, WriterError }\nimport silk.text.format { Format }\nimport silk.io.writer_native { StdoutWriter }\n\n'
 def prog(body, extra=''):
-    return HDR+extra+'\npub effect fn main() -> () ! LogError {\n  let mut logger = StdoutLogger.make()\n'+body+'\n}\n'
-def logv(e): return f'  let v = {e}\n  run Effect.log("{{v}}\\n", &.{{ v: v }}) |> Effect.provideMut(&mut logger)'
+    return HDR+extra+'\npub effect fn main() -> () ! WriterError {\n  let mut stdout = StdoutWriter.make()\n'+body+'\n}\n'
+def logv(e): return f'  let v = {e}\n  run Format.format("{{v}}\\n", &.{{ v: v }}) |> Effect.provideMut<Writer>(&mut stdout)'
 cases = {
  'empty': b'',
  'bom': ('﻿'+prog(logv('1'))).encode(),
@@ -18,8 +18,8 @@ cases = {
  'paren-depth-200': prog(logv('('*200+'1'+')'*200)).encode(),
  'paren-depth-5000': prog(logv('('*5000+'1'+')'*5000)).encode(),
  'add-chain-20000': prog(logv(' + '.join(['1']*20000))).encode(),
- 'nested-blocks-2000': prog('  let v = 1\n'+'  {\n'*2000+'  }\n'*2000+'  run Effect.log("{v}\\n", &.{ v: v }) |> Effect.provideMut(&mut logger)').encode(),
- 'nested-if-1000': prog('  let mut v = 0\n'+''.join(f'  if v < {i+1} {{\n' for i in range(1000))+'  v = 5\n'+'  }\n'*1000+'  run Effect.log("{v}\\n", &.{ v: v }) |> Effect.provideMut(&mut logger)').encode(),
+ 'nested-blocks-2000': prog('  let v = 1\n'+'  {\n'*2000+'  }\n'*2000+'  run Format.format("{v}\\n", &.{ v: v }) |> Effect.provideMut<Writer>(&mut stdout)').encode(),
+ 'nested-if-1000': prog('  let mut v = 0\n'+''.join(f'  if v < {i+1} {{\n' for i in range(1000))+'  v = 5\n'+'  }\n'*1000+'  run Format.format("{v}\\n", &.{ v: v }) |> Effect.provideMut<Writer>(&mut stdout)').encode(),
  'many-lets-30000': prog(''.join(f'  let x{i}: i64 = {i}\n' for i in range(30000))+logv('x29999')).encode(),
  'many-fns-10000': prog(logv('f9999()'), ''.join(f'fn f{i}() -> i32 {{\n  return {i}\n}}\n' for i in range(10000))).encode(),
  'call-chain-3000': prog(logv('f2999()'), 'fn f0() -> i32 {\n  return 1\n}\n'+''.join(f'fn f{i}() -> i32 {{\n  return f{i-1}() + 1\n}}\n' for i in range(1,3000))).encode(),
@@ -40,7 +40,7 @@ cases = {
 for n in (50, 100, 120, 127, 128, 129, 140, 200, 300, 500, 1000):
     cases[f'add-chain-{n}'] = prog(logv(' + '.join(['1']*n))).encode()
 for n in (30, 40, 45, 50, 60, 100, 200, 400):
-    cases[f'nested-if-{n}'] = prog('  let mut v = 0\n'+''.join(f'  if v < {i+1} {{\n' for i in range(n))+'  v = 5\n'+'  }\n'*n+'  run Effect.log("{v}\\n", &.{ v: v }) |> Effect.provideMut(&mut logger)').encode()
+    cases[f'nested-if-{n}'] = prog('  let mut v = 0\n'+''.join(f'  if v < {i+1} {{\n' for i in range(n))+'  v = 5\n'+'  }\n'*n+'  run Format.format("{v}\\n", &.{ v: v }) |> Effect.provideMut<Writer>(&mut stdout)').encode()
 for n in (50, 100, 150):
     cases[f'paren-depth-{n}'] = prog(logv('('*n+'1'+')'*n)).encode()
 for name, data in cases.items():

@@ -19,38 +19,40 @@ into a buffer of 64 bytes on the stack. Thus a short line is one system call, an
 does not allocate.
 
 [`StderrLogger.make`](#StderrLogger.impl.make) colors the level name when standard error is a terminal, the `NO_COLOR`
-environment variable is not set or is empty, and `TERM` is not `dumb`. It checks once, at the
-first message. [`StderrLogger.withColor`](#StderrLogger.impl.withColor) turns color on or off without a check.
+environment variable is not set or is empty, and `TERM` is not `dumb`. It checks once, when the provider is created. [`StderrLogger.withColor`](#StderrLogger.impl.withColor) turns color on or off without a check.
 
 [`StdoutLogger`](#StdoutLogger) formats each message directly to standard output. It adds no level, timestamp,
 or newline, has no lock, and does not allocate.
 
-## Errors
-`LogError` with code 3 if the write fails. Part of the message can be written already.
+A write error ends the current message. The stream may already contain part of the line.
 
 ## Gotchas
 - The providers exist on Windows x86_64 MSVC, WASI, Darwin on x86_64 or aarch64, and Linux with
   GNU libc on x86_64 or aarch64. Windows needs no CRT and automatic color enables console ANSI
   processing.
 - A message template for [`StderrLogger`](#StderrLogger) must not end with a newline. The logger adds one.
-- [`StderrLogger.make`](#StderrLogger.impl.make) reads the environment at the first message. A change to `NO_COLOR` after
+- [`StderrLogger.make`](#StderrLogger.impl.make) reads the environment when the provider is created. A change to `NO_COLOR` after
   that has no effect on the same logger.
 
 ## Examples
 ### Log to standard error
 ```silk
 import silk.core.effect { Effect }
-import silk.io.logger { LogError, Logger }
+import silk.concurrency.sync { Arc }
+import silk.io.logger { Logger }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.io.logger_native { StderrLogger }
 
 pub effect fn main() -> i32
-  ! LogError {
-  let mut logger = StderrLogger.make()
+  ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let logger = run Arc<StderrLogger>.make(StderrLogger.make())
+    |> Effect.provideMut<Allocator>(&mut allocator)
   let values = .{ name: "silk", count: 3 }
 
   // Writes "info: silk started 3 workers" and a newline to standard error.
   run Effect.logInfo("{name} started {count} workers", &values)
-    |> Effect.provideMut<Logger>(&mut logger)
+    |> Effect.provideAmbient<Logger>(&logger)
   return 0
 }
 ```
@@ -58,17 +60,21 @@ pub effect fn main() -> i32
 ### Log to standard output
 ```silk
 import silk.core.effect { Effect }
-import silk.io.logger { LogError, Logger }
+import silk.concurrency.sync { Arc }
+import silk.io.logger { Logger }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.io.logger_native { StdoutLogger }
 
 pub effect fn main() -> i32
-  ! LogError {
-  let mut logger = StdoutLogger.make()
+  ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let logger = run Arc<StdoutLogger>.make(StdoutLogger.make())
+    |> Effect.provideMut<Allocator>(&mut allocator)
   let values = .{ name: "silk", count: 3 }
 
   // The logger adds no newline, so the template ends with one.
   run Effect.logInfo("{name} started {count} workers\n", &values)
-    |> Effect.provideMut<Logger>(&mut logger)
+    |> Effect.provideAmbient<Logger>(&logger)
   return 0
 }
 ```
@@ -77,7 +83,7 @@ WASI does not define terminal detection; automatic color selection is disabled o
 
 Import as `StdoutLogger` with `import silk.io.logger_native { StdoutLogger }`.
 
-Public declarations: 2.
+Public declarations: 3.
 
 <a id="StderrLogger"></a>
 
@@ -125,7 +131,7 @@ anything.
 #### Details
 
 On WASI, automatic color selection stays disabled because WASI does not define terminal
-detection. At the first message, the logger uses color when standard error is a terminal,
+detection. At construction, the logger uses color when standard error is a terminal,
 `NO_COLOR` is not set or is empty, and `TERM` is not `dumb`. Later messages use the same
 answer. Windows also requires successful ANSI console-mode selection; redirected handles stay
 plain.
@@ -144,6 +150,16 @@ does not check the terminal or the environment.
 #### When to use
 
 Use it when the program has its own color setting, such as a `--color` flag.
+
+<a id="writeWarning"></a>
+
+## `writeWarning`
+
+```silk
+pub effect fn writeWarning<Args>(level: LogLevel, static template: string<'static>, args: &Args) -> ()
+```
+
+Writes a default log line to standard error using the target's terminal settings.
 
 <a id="StderrLogger.impl.Logger"></a>
 

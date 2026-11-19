@@ -757,6 +757,8 @@ not require is refused.
 that conforms to no required key does. `SEM0071` never names an optional service. Diagnostics and
 types name the service, `OptionService`.
 
+For a service with a declared observation default, see [AMB-001](#amb-001--ambient-service-declarations-and-defaults).
+
 **Evidence:** [option standard library](../stdlib/silk/core/option.silk),
 `standardOptionIsARequirementKey` and `partialSourcePremisesAndNeverProvidersDecideProvision`
 semantic conformance cases, `optional-service-provision` and `optional-service-plain-provider`
@@ -890,3 +892,21 @@ During static evaluation, running an ambient operation evaluates its arguments a
 Each reached specialization of an ambient provider must finish without parking or suspending.
 The build checks transitive calls, including helpers reached after selecting static arguments.
 A default that reaches a suspension boundary reports SEM0269 at its service declaration.
+
+
+## AMB-003 — Providing and inheriting an ambient service
+
+`Effect.provideAmbient<S>(&handle)` accepts a shared handle of type `Arc<P>`. The provider
+implements `S`, `Transferable`, and `Concurrent` in every profile. The build checks each
+reached operation specialization for parking and suspension. It reports an invalid override at
+the call that introduces the provider.
+
+The selected provider applies throughout the target effect. Returning, failing, or cancelling
+the effect restores the enclosing provider. While an override handles an operation, a call to
+the same service uses its declared default. Other ambient services keep their current providers.
+
+An execution retains the providers current at its creation. This includes structured fibers,
+independent executions, native threads and thread pool tasks. The providers stay alive across
+parks and after the creating scope returns. Driving an execution installs its providers for
+the activation and restores the driver's providers when control returns. Completing or dropping
+the execution releases the handles it retained.

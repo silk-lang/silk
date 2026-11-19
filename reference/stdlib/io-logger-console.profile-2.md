@@ -12,9 +12,8 @@ browser, Node.js, Deno or another JavaScript host. On WASI and native targets, u
 `InMemoryLogger` instead.
 
 ## Details
-The module imports one host function, `console` from the import module `silk`, and only a
-program that provides [`ConsoleLogger`](#ConsoleLogger) imports it: a module that never logs this way keeps
-importing nothing. The standard library's runner, `host/wasm-runner.mjs`, supplies the import.
+The module imports one host function, `console` from the import module `silk`, and programs using
+the default warning and error output or [`ConsoleLogger`](#ConsoleLogger) use this import. The standard library's runner, `host/wasm-runner.mjs`, supplies the import.
 It passes each message to `options.onLog` with its level, and by default to the console method
 of the level: `console.debug` for trace and debug, `console.info`, `console.warn` and
 `console.error`.
@@ -37,24 +36,28 @@ None. A host cannot refuse a message.
 ## Examples
 ```silk,ignore
 import silk.core.effect { Effect }
-import silk.io.logger { LogError, Logger }
+import silk.concurrency.sync { Arc }
+import silk.io.logger { Logger }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.io.logger_console { ConsoleLogger }
 
 pub effect fn main() -> ()
-  ! LogError {
-  let mut logger = ConsoleLogger.make()
+  ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let logger = run Arc<ConsoleLogger>.make(ConsoleLogger.make())
+    |> Effect.provideMut<Allocator>(&mut allocator)
   let values = .{ name: "silk", count: 3 }
 
   // Calls `console.info("silk started 3 workers")` in the host.
   run Effect.logInfo("{name} started {count} workers", &values)
-    |> Effect.provideMut<Logger>(&mut logger)
+    |> Effect.provideAmbient<Logger>(&logger)
   return ()
 }
 ```
 
 Import as `ConsoleLogger` with `import silk.io.logger_console { ConsoleLogger }`.
 
-Public declarations: 1.
+Public declarations: 2.
 
 <a id="ConsoleLogger"></a>
 
@@ -88,6 +91,16 @@ pub fn make() -> ConsoleLogger
 ```
 
 Returns a logger. It does not call the host.
+
+<a id="writeWarning"></a>
+
+## `writeWarning`
+
+```silk
+pub effect fn writeWarning<Args>(level: LogLevel, static template: string<'static>, args: &Args) -> ()
+```
+
+Sends one default warning or error to the host console.
 
 <a id="ConsoleLogger.impl.Logger"></a>
 

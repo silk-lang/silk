@@ -1369,13 +1369,16 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     join(directory, 'logging.silk'),
     [
       'import silk.core.effect { Effect }',
-      'import silk.io.logger { LogError, Logger }',
+      'import silk.io.logger { Logger }',
+      'import silk.concurrency.sync { Arc }',
+      'import silk.mem.allocator { Allocator, OutOfMemoryError }',
       'import silk.io.logger_console { ConsoleLogger }',
-      'pub effect fn main() -> () ! LogError {',
-      '  let mut logger = ConsoleLogger.make()',
+      'pub effect fn main() -> () ! OutOfMemoryError {',
+      '  let mut allocator = Allocator.systemAllocatorProvider()',
+      '  let logger = run Arc<ConsoleLogger>.make(ConsoleLogger.make()) |> Effect.provideMut<Allocator>(&mut allocator)',
       `  let values = .{ name: "silk", long: "${'x'.repeat(600)}" }`,
-      '  run Effect.logInfo("{name} started", &values) |> Effect.provideMut<Logger>(&mut logger)',
-      '  run Effect.logError("long {long}!", &values) |> Effect.provideMut<Logger>(&mut logger)',
+      '  run Effect.logInfo("{name} started", &values) |> Effect.provideAmbient<Logger>(&logger)',
+      '  run Effect.logError("long {long}!", &values) |> Effect.provideAmbient<Logger>(&logger)',
       '  return ()',
       '}',
       '',
@@ -1861,7 +1864,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   // Errors new users meet in the book's later chapters name their subject and the fix, and a
   // `var` binding adds no unknown-value error at each later use.
   const fiberRoot = (body: string) =>
-    'import silk.core.effect { Effect }\nimport silk.concurrency.fiber { Fiber }\nimport silk.io.logger { Logger, LogError }\nimport silk.system.monotonic_clock { MonotonicClock }\nimport silk.mem.allocator { OutOfMemoryError }\nimport silk.concurrency.scheduler { Scheduler, TaskIdExhaustedError }\nimport silk.text.string { String }\n\n' +
+    'import silk.core.effect { Effect }\nimport silk.concurrency.fiber { Fiber }\nimport silk.io.writer { Writer, WriterError }\nimport silk.system.monotonic_clock { MonotonicClock }\nimport silk.mem.allocator { OutOfMemoryError }\nimport silk.concurrency.scheduler { Scheduler, TaskIdExhaustedError }\nimport silk.text.string { String }\n\n' +
     `effect fn root<'text>(title: string<'text>) -> () ! OutOfMemoryError | TaskIdExhaustedError ? &mut Scheduler | &mut MonotonicClock {\n  ${body}\n  drop fiber\n}\n\npub fn main() -> i32 {\n  return 0\n}\n`
   // A method call that borrows its receiver names the receiver, not the method.
   const boardRoot = (body: string) =>
@@ -1871,12 +1874,12 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     `import silk.testing.testing { AssertionError, Testing }\n\n${body}\npub fn main() -> i32 {\n  return 0\n}\n`
   const subjects: Array<{ name: string; files: Record<string, string>; pattern: RegExp; errors?: number }> = [
     {
-      name: 'fiberlogger',
+      name: 'fiberwriter',
       files: {
-        'main.silk': fiberRoot('let fiber = run Fiber<(), LogError>.forkChild(shout())') +
-          'effect fn shout() -> () ! LogError ? &mut Logger { run Effect.log("reminder!\\n", &()) }\n',
+        'main.silk': fiberRoot('let fiber = run Fiber<(), WriterError>.forkChild(shout())') +
+          'effect fn shout() -> () ! WriterError ? &mut Writer { run Writer.writeString("reminder!\\n") }\n',
       },
-      pattern: /error\[SEM0076\] The Effect passed here also requires &mut Logger, but the expected Effect may only require &mut Scheduler \| &mut MonotonicClock/,
+      pattern: /error\[SEM0076\] The Effect passed here also requires &mut Writer, but the expected Effect may only require &mut Scheduler \| &mut MonotonicClock/,
     },
     {
       name: 'fiberborrow',
@@ -2060,14 +2063,14 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     {
       name: 'displaydebug',
       files: {
-        'main.silk': 'import silk.core.effect { Effect }\nimport silk.io.logger { LogError }\nimport silk.core.option { Option }\nimport silk.io.logger_native { StdoutLogger }\n\npub effect fn main() -> () ! LogError {\n  let mut logger = StdoutLogger.make()\n  let o = Option<i32>.some(3)\n  run Effect.log("v {o}", &.{ o: move o }) |> Effect.provideMut(&mut logger)\n}\n',
+        'main.silk': 'import silk.core.effect { Effect }\nimport silk.core.option { Option }\n\npub effect fn main() -> () {\n  let o = Option<i32>.some(3)\n  run Effect.log("v {o}", &.{ o: move o })\n}\n',
       },
       pattern: /no implementation of `silk\.text\.format\.Display` exists for `silk\.core\.option\.Option<i32>`; it implements `silk\.text\.format\.Debug`, so a template prints it with `\{value:\?\}`/,
     },
     {
       name: 'displaynodebug',
       files: {
-        'main.silk': 'import silk.core.effect { Effect }\nimport silk.io.logger { LogError }\nimport silk.io.logger_native { StdoutLogger }\n\nstruct Plain { value: i32, }\n\npub effect fn main() -> () ! LogError {\n  let mut logger = StdoutLogger.make()\n  let p = Plain { value: 1 }\n  run Effect.log("v {p}", &.{ p: move p }) |> Effect.provideMut(&mut logger)\n}\n',
+        'main.silk': 'import silk.core.effect { Effect }\n\nstruct Plain { value: i32, }\n\npub effect fn main() -> () {\n  let p = Plain { value: 1 }\n  run Effect.log("v {p}", &.{ p: move p })\n}\n',
       },
       pattern: /no implementation of `silk\.text\.format\.Display` exists for `main\.Plain`\n/,
     },
@@ -5720,19 +5723,24 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   const logged = join(directory, 'logged')
   yield* fs.makeDirectory(join(logged, 'src'), { recursive: true })
   yield* fs.writeFileString(join(logged, 'silk.toml'), '[package]\nname = "logged"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n')
-  const loggedSource = (message: string) => 'import silk.core.effect { Effect }\nimport silk.io.logger { LogError }\n'
-    + 'import silk.io.logger_native { StdoutLogger }\n\npub effect fn main() -> () ! LogError {\n  let mut logger = StdoutLogger.make()\n'
-    + `  run Effect.log("${message}\\n", &()) |> Effect.provideMut(&mut logger)\n}\n`
+  const loggedSource = (message?: string) => 'import silk.core.effect { Effect }\n\n'
+    + `effect fn observe() -> () {}\nfn leaf() -> () { drop run Effect.result(observe()) ${message === undefined ? '' : `run Effect.logWarning("${message}", &())`} }\n\npub fn main() -> () { leaf() }\n`
   const loggedExecutable = join(logged, `build/${hostTarget}/dev/logged`)
-  const loggedBuild = Effect.fnUntraced(function* (message: string) {
+  const loggedBuild = Effect.fnUntraced(function* (message?: string) {
     const built = yield* invoke(silk, ['build', '--stdlib', standardLibrary, '--timings'], logged, splitEnvironment)
     assert.equal(built.status, 0, built.stderr)
     const ran = yield* invoke(loggedExecutable, [], logged, splitEnvironment)
-    assert.equal(ran.stdout, `${message}\n`, ran.stderr)
+    assert.equal(ran.status, 0, ran.stderr)
+    assert.equal(ran.stderr, message === undefined ? '' : `warning: ${message}\n`, ran.stderr)
     return built.stdout + built.stderr
   })
+  yield* fs.writeFileString(join(logged, 'src/main.silk'), loggedSource())
+  yield* loggedBuild()
+  const originalSymbols = (yield* fs.readFileString(`${loggedExecutable}.symbols`)).trimEnd().split('\n')
   yield* fs.writeFileString(join(logged, 'src/main.silk'), loggedSource('Hello, world!'))
   yield* loggedBuild('Hello, world!')
+  const loggedSymbols = new Set((yield* fs.readFileString(`${loggedExecutable}.symbols`)).trimEnd().split('\n'))
+  for (const symbol of originalSymbols) assert.ok(loggedSymbols.has(symbol), `adding a log call changed ${symbol}`)
   yield* fs.writeFileString(join(logged, 'src/main.silk'), loggedSource('Hello, edit!'))
   const loweredLog = /^\s+codegen\s+([0-9,]+) functions/m.exec(yield* loggedBuild('Hello, edit!'))
   assert.ok(loweredLog !== null && Number(loweredLog[1].replace(/,/g, '')) < 50, `a message edit lowered ${loweredLog?.[1]} functions`)

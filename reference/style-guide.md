@@ -49,7 +49,7 @@ because one API may fail with it. Name the type for its dominant meaning.
 non-blocking style warning or rename action when a public nominal type is introduced primarily as a
 failure type. Such tooling must not imply that the name changes the type's semantics.
 
-**Current standard library:** Consistent. Public error payloads include `FileError`, `LogError`,
+**Current standard library:** Consistent. Public error payloads include `FileError`,
 `ProcessError`, `ParseError`, `HostInputError`, `StreamReadError`, `WriterError`,
 `OutOfMemoryError`, `StalledError`, and `TaskIdExhaustedError`. The `Result<A, F>.Failure` variant
 keeps its existing name because it is ordinary result data rather than an error declaration, and

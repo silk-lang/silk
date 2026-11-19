@@ -260,16 +260,16 @@ def program(seed, nstmts=40):
     for _ in range(g.r.randint(0, 4)): g.make_func()
     for _ in range(nstmts): g.stmt()
     out = []
-    out.append("import silk.core.effect { Effect }\nimport silk.io.logger { LogError }\nimport silk.io.logger_native { StdoutLogger }\n")
+    out.append("import silk.core.effect { Effect }\nimport silk.io.writer { Writer, WriterError }\nimport silk.text.format { Format }\nimport silk.io.writer_native { StdoutWriter }\n")
     out.append("struct Pair {\n  x: i64\n  y: i64\n}\n")
     out.append("fn k(v: i64) -> i64 {\n  return v\n}\n")
     out.append("fn pick(c: bool, a: i64, b: i64) -> i64 {\n  if c {\n    return a\n  }\n  return b\n}\n")
     for f in g.funcs: out.append(f[3])
-    out.append("pub effect fn main() -> () ! LogError {\n  let mut logger = StdoutLogger.make()")
+    out.append("pub effect fn main() -> () ! WriterError {\n  let mut stdout = StdoutWriter.make()")
     out.extend(g.lines)
     expected = []
     for name, v in g.env.items():
-        out.append(f'  run Effect.log("{name}={{v}}\\n", &.{{ v: {name} }}) |> Effect.provideMut(&mut logger)')
+        out.append(f'  run Format.format("{name}={{v}}\\n", &.{{ v: {name} }}) |> Effect.provideMut<Writer>(&mut stdout)')
         expected.append(f"{name}={v}")
     out.append("}\n")
     return "\n".join(out), "\n".join(expected) + ("\n" if expected else "")

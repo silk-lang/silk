@@ -322,6 +322,17 @@ both rather than stopping after the first category.
 **Evidence:** flow specification,
 run diagnostics.
 
+An ambient operation produces a closed Effect. A library function can therefore emit a warning
+without changing its callers' rows or failures.
+
+```silk
+fn warnEmpty() -> () {
+  run Effect.logWarning("config is empty, using defaults", &.{})
+}
+```
+
+See [ambient operation dispatch](requirements-and-services.md#amb-002--running-an-ambient-operation).
+
 ## ANON-EFF-001 — An effectful anonymous callable preserves two delayed boundaries
 
 **Status:** Confirmed

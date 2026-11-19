@@ -15,23 +15,24 @@ const argumentProgram = `import silk.mem.allocator { Allocator, OutOfMemoryError
 import silk.collections.bytes { Bytes }
 import silk.core.effect { Effect }
 import silk.system.host_input { HostInput, HostInputError }
-import silk.io.logger { LogError }
+import silk.io.writer { Writer, WriterError }
+import silk.text.format { Format }
 import silk.core.option { Option }
-import silk.io.logger_native { StdoutLogger }
+import silk.io.writer_native { StdoutWriter }
 import silk.core.result { Result }
 import silk.text.string { String, InvalidUtf8 }
 
 pub effect fn main() -> i32
-  ! LogError | HostInputError | OutOfMemoryError
+  ! WriterError | HostInputError | OutOfMemoryError
   ? &mut HostInput {
-  let mut logger = StdoutLogger.make()
+  let mut stdout = StdoutWriter.make()
   let mut allocator = Allocator.systemAllocatorProvider()
 
   let first = run HostInput.argument(1) |> Effect.provideMut<Allocator>(&mut allocator)
   let name = match move first {
     Option<Bytes>.Some { value } => move value
     Option<Bytes>.None => {
-      run Effect.log("usage: hello <name>\\n", &()) |> Effect.provideMut(&mut logger)
+      run Format.format("usage: hello <name>\\n", &()) |> Effect.provideMut<Writer>(&mut stdout)
       return 2
     }
   }
@@ -40,7 +41,7 @@ pub effect fn main() -> i32
     Result<string, InvalidUtf8>.Failure { .. } => "stranger"
   }
 
-  run Effect.log("Hello, {name}!\\n", &.{ name: text }) |> Effect.provideMut(&mut logger)
+  run Format.format("Hello, {name}!\\n", &.{ name: text }) |> Effect.provideMut<Writer>(&mut stdout)
   return 0
 }
 `
@@ -212,7 +213,7 @@ test('path dependencies with silk add and silk remove', () => {
   const added = silk(h, ['add', `../${lib.split('/').at(-1)}`], { cwd: app })
   assert.equal(added.status, 0, show(added))
   assert.match(read(join(app, 'silk.toml')), new RegExp(`\\[dependencies\\]\\n${dependency} = \\{ path = "\\.\\./[^"]+", package = "[^"]+" \\}`))
-  write(join(app, 'src/main.silk'), `import silk.core.effect { Effect }\nimport silk.io.logger { LogError }\nimport silk.io.logger_native { StdoutLogger }\nimport ${dependency}.lib { countSpaces }\n\npub effect fn main() -> ()\n  ! LogError {\n  let mut logger = StdoutLogger.make()\n  let spaces = countSpaces(b"one two three")\n  run Effect.log("{n} spaces\\n", &.{ n: spaces }) |> Effect.provideMut(&mut logger)\n}\n`)
+  write(join(app, 'src/main.silk'), `import silk.core.effect { Effect }\nimport silk.io.writer { Writer, WriterError }\nimport silk.text.format { Format }\nimport silk.io.writer_native { StdoutWriter }\nimport ${dependency}.lib { countSpaces }\n\npub effect fn main() -> ()\n  ! WriterError {\n  let mut stdout = StdoutWriter.make()\n  let spaces = countSpaces(b"one two three")\n  run Format.format("{n} spaces\\n", &.{ n: spaces }) |> Effect.provideMut<Writer>(&mut stdout)\n}\n`)
   const ran = silk(h, ['run', '--quiet'], { cwd: app })
   assert.equal(ran.status, 0, show(ran))
   assert.equal(ran.stdout, '2 spaces\n')

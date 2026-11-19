@@ -37,8 +37,7 @@ write to state that other threads can see is atomic or done under the lock.
 ### Count on two threads
 ```silk
 import silk.mem.allocator { Allocator, OutOfMemoryError }
-import silk.core.effect { Effect }
-import silk.concurrency.thread_native { NativeThread, SpawnError }
+//! import silk.concurrency.thread_native { NativeThread, SpawnError }
 import silk.concurrency.sync { Arc, Mutex }
 
 fn addOne(total: Arc<Mutex<i32>>) -> i32 {
@@ -85,8 +84,7 @@ pub fn main() -> i32 {
 ### Wait for another thread
 ```silk
 import silk.mem.allocator { Allocator, OutOfMemoryError }
-import silk.core.effect { Effect }
-import silk.concurrency.thread_native { NativeThread, SpawnError }
+//! import silk.concurrency.thread_native { NativeThread, SpawnError }
 import silk.concurrency.sync { Parker, Unparker }
 
 fn wake(unparker: Unparker) -> i32 {
@@ -123,7 +121,7 @@ pub fn main() -> i32 {
 
 Import as `Arc` with `import silk.concurrency.sync { Arc }`.
 
-Public declarations: 6.
+Public declarations: 7.
 
 <a id="Arc"></a>
 
@@ -236,6 +234,70 @@ impl<T> Drop for Arc<T>
 
 ```silk
 fn drop(self: &mut Arc<T>) -> ()
+```
+
+<a id="AmbientHandle"></a>
+
+## `AmbientHandle`
+
+```silk
+pub struct AmbientHandle
+```
+
+<a id="AmbientHandle.impl.Transferable"></a>
+
+## Implementation `Transferable for AmbientHandle`
+
+```silk
+impl Transferable for AmbientHandle
+```
+
+<a id="AmbientHandle.impl.Concurrent"></a>
+
+## Implementation `Concurrent for AmbientHandle`
+
+```silk
+impl Concurrent for AmbientHandle
+```
+
+<a id="AmbientHandle.impl"></a>
+
+## Implementation `AmbientHandle`
+
+```silk
+impl AmbientHandle
+```
+
+<a id="AmbientHandle.impl.retain"></a>
+
+### Associated function `retain`
+
+```silk
+pub fn retain<P: Transferable + Concurrent>(handle: &Arc<P>, tags: [u64; 2]) -> AmbientHandle
+```
+
+<a id="AmbientHandle.impl.clone"></a>
+
+### Method `clone`
+
+```silk
+pub fn clone(self: &Self) -> Self
+```
+
+<a id="AmbientHandle.impl.Drop"></a>
+
+## Implementation `Drop for AmbientHandle`
+
+```silk
+impl Drop for AmbientHandle
+```
+
+<a id="AmbientHandle.impl.Drop.drop"></a>
+
+### Operation `drop`
+
+```silk
+fn drop(self: &mut Self) -> ()
 ```
 
 <a id="Mutex"></a>

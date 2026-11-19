@@ -33,8 +33,6 @@ nothing extra to install.
 
 ```silk
 import silk.core.effect { Effect }
-import silk.io.logger { Logger, LogError }
-import silk.io.logger_native { StdoutLogger }
 
 pub service Random {
   effect fn next(self: &mut Self) -> u32
@@ -43,8 +41,8 @@ pub service Random {
 struct NoSides {}
 
 effect fn roll(sides: u32) -> u32
-  ! NoSides | LogError
-  ? &mut Random | &mut Logger {
+  ! NoSides
+  ? &mut Random {
   if sides == 0 {
     fail NoSides {}
   }
@@ -54,9 +52,7 @@ effect fn roll(sides: u32) -> u32
 }
 ```
 
-Read the signature of `roll` as a contract: it returns a `u32`, it can fail with `NoSides` or
-`LogError`, and it needs a `Random` source and a `Logger`. Nothing else can happen in there
-without the signature changing.
+The signature says that `roll` returns a `u32`, can fail with `NoSides`, and needs a `Random` source. Logging through the ambient `Logger` adds no requirement to its callers.
 
 - **`service` names a need** without saying how it is met.
 - **`!` lists the failures** and **`?` lists the needs.** Leave a need unprovided, or a failure
@@ -130,14 +126,14 @@ Even "hello world" says what it needs and how it can fail:
 
 ```silk
 import silk.core.effect { Effect }
-import silk.io.logger { LogError }
-import silk.io.logger_native { StdoutLogger }
+import silk.io.writer { Writer, WriterError }
+import silk.io.writer_native { StdoutWriter }
 
 pub effect fn main() -> ()
-  ! LogError {
-  let mut logger = StdoutLogger.make()
+  ! WriterError {
+  let mut stdout = StdoutWriter.make()
 
-  run Effect.log("Hello, world!\n", &()) |> Effect.provideMut(&mut logger)
+  run Writer.writeString("Hello, world!\n") |> Effect.provideMut<Writer>(&mut stdout)
 }
 ```
 
@@ -149,6 +145,11 @@ pub effect fn main() -> ()
 through an `impl`, and `main` picks the providers:
 
 ```silk
+import silk.concurrency.sync { Arc }
+import silk.io.logger { Logger }
+import silk.io.logger_native { StdoutLogger }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+
 struct Fixed {
   value: u32,
 }
@@ -164,14 +165,15 @@ effect fn noSides(error: NoSides) -> u32 {
 }
 
 pub effect fn main() -> ()
-  ! LogError {
+  ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
   let mut random = Fixed { value: 41 }
-  let mut logger = StdoutLogger.make()
+  let logger = run Arc<StdoutLogger>.make(StdoutLogger.make()) |> Effect.provideMut<Allocator>(&mut allocator)
 
   drop run roll(6)
     |> Effect.catch<NoSides>(noSides)
     |> Effect.provideMut(&mut random)
-    |> Effect.provideMut(&mut logger)
+    |> Effect.provideAmbient<Logger>(&logger)
 }
 ```
 
@@ -179,8 +181,7 @@ pub effect fn main() -> ()
 rolled 6
 ```
 
-`Effect.catch<NoSides>` takes `NoSides` out of the failure type. `main` still declares `LogError`,
-because nothing handled it.
+`Effect.catch<NoSides>` handles a roll with zero sides. Creating the shared logger can fail with `OutOfMemoryError`.
 
 ### Tests swap the providers
 
@@ -189,17 +190,21 @@ mocked and nothing global is patched. `Testing` and `AssertionError` come from
 `silk.testing.testing`:
 
 ```silk
+import silk.io.logger { InMemoryLogger }
+
 test effect fn rollsTheFaceTheSourceGives() -> ()
-  ! AssertionError<'static> | NoSides | LogError {
+  ! AssertionError<'static> | NoSides | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
   let mut random = Fixed { value: 41 }
-  let mut logger = Logger.inMemoryProvider()
+  let logger = run Arc<InMemoryLogger>.make(run Logger.inMemoryProvider() |> Effect.provideMut<Allocator>(&mut allocator))
+    |> Effect.provideMut<Allocator>(&mut allocator)
 
   let face = run roll(6)
     |> Effect.provideMut(&mut random)
-    |> Effect.provideMut(&mut logger)
+    |> Effect.provideAmbient<Logger>(&logger)
 
   run Testing.expect(face == 6, "41 % 6 + 1 is 6")
-  run Testing.expect(Logger.length(&logger) == 1, "one line was logged")
+  run Testing.expect(Logger.length(logger.get()) == 1, "one line was logged")
 }
 ```
 
