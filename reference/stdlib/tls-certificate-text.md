@@ -20,7 +20,8 @@ of the [`NameTextFormat`](#NameTextFormat) layouts. It decodes BMPString, Univer
 types to UTF-8 and escapes as RFC 2253 does. It checks the strings as OpenSSL does when it
 reads a name, so a name that OpenSSL rejects is an error here too.
 
-[`CertificateText.writeTime`](#CertificateText.impl.writeTime) writes a [`CertificateTime`](./tls-certificate.md#CertificateTime) as `Jan  2 03:04:05 2025 GMT`, and
+[`CertificateText.writeTime`](#CertificateText.impl.writeTime) writes an instant, such as `Certificate.notBefore`, as
+`Jan  2 03:04:05 2025 GMT`, and
 [`CertificateText.writeSerial`](#CertificateText.impl.writeSerial) writes a serial number in upper-case hexadecimal.
 
 ## Errors
@@ -293,12 +294,17 @@ with `\`, and so are a leading space or `#` and a trailing space.
 ### Associated function `writeTime`
 
 ```silk
-pub fn writeTime(time: CertificateTime, output: &mut [u8; 24]) -> usize
+pub fn writeTime(time: Instant, output: &mut [u8; 24]) -> usize
 ```
 
-Writes `time` as OpenSSL's `ASN1_TIME_print` does, such as `Jan  2 03:04:05 2025 GMT`, to
-the start of `output` and returns its length. The day is padded to two places with a
-space and the year is not padded.
+Writes `time` in UTC as OpenSSL's `ASN1_TIME_print` does, such as
+`Jan  2 03:04:05 2025 GMT`, to the start of `output` and returns its length. The day is
+padded to two places with a space and the year is not padded.
+
+#### Details
+
+A fraction of a second is dropped. The year of `time` in UTC must be from 0 to 9999, as it
+is for every time in a certificate, or the function traps.
 
 <a id="CertificateText.impl.serialLength"></a>
 
