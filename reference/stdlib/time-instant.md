@@ -296,6 +296,57 @@ pub fn checkedSubtract(self: Self, span: Duration) -> Option<Instant>
 Returns the instant `span` earlier, or later for a negative span, or `None` when it is
 outside the range.
 
+<a id="Instant.impl.round"></a>
+
+### Method `round`
+
+```silk
+pub fn round(self: Self, step: TimeIncrement, mode: RoundingMode) -> Instant
+```
+
+Returns the instant rounded to a multiple of `step`, counted from the Unix epoch.
+
+#### Details
+
+The steps are those of the time of day in UTC. An instant is a point and not an amount, so
+"away from zero" means later in time, also before 1970: `RoundingMode.Expand` rounds as
+`Ceil` and `HalfExpand` as `HalfCeil`.
+
+#### Gotchas
+
+A result outside the range traps. [`Instant.checkedRound`](#Instant.impl.checkedRound) returns `None` instead.
+
+#### Examples
+
+```silk
+import silk.time.instant { Instant }
+import silk.time.rounding { RoundingMode, TimeIncrement, TimeUnit }
+
+pub fn main() -> i32 {
+  let at = Instant.make(1795000000, 250000000)
+  let second = at.round(TimeIncrement.one(TimeUnit.Second), RoundingMode.HalfExpand)
+  if second.unixSeconds() != 1795000000 || second.subsecondNanoseconds() != 0 {
+    return 1
+  }
+  let hour = at.round(TimeIncrement.one(TimeUnit.Hour), RoundingMode.Ceil)
+  if hour.unixSeconds() != 1795003200 {
+    return 2
+  }
+  return 0
+}
+```
+
+<a id="Instant.impl.checkedRound"></a>
+
+### Method `checkedRound`
+
+```silk
+pub fn checkedRound(self: Self, step: TimeIncrement, mode: RoundingMode) -> Option<Instant>
+```
+
+Returns the instant rounded to a multiple of `step`, counted from the Unix epoch, or `None`
+when the result is outside the range.
+
 <a id="Instant.impl.since"></a>
 
 ### Method `since`

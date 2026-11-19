@@ -373,6 +373,153 @@ pub fn checkedSubtract(self: Self, span: Duration) -> Option<ZonedDateTime<'z>>
 Returns the value `span` earlier on the timeline, or later for a negative span, or `None`
 when it is outside the range of `Instant`.
 
+<a id="ZonedDateTime.impl.checkedRound"></a>
+
+### Method `checkedRound`
+
+```silk
+pub fn checkedRound(self: Self, step: TimeIncrement, mode: RoundingMode) -> Option<ZonedDateTime<'z>>
+```
+
+Returns the value with its local time rounded to a multiple of `step` from midnight, or
+`None` when the result is outside the range.
+
+#### Details
+
+The local date and time are rounded as [`PlainDateTime.round`](./time-plain-date-time.md#PlainDateTime.impl.round) does, and the result keeps
+the UTC offset of this value when the zone has that offset at the rounded time. So a time
+in the repeated hour of an autumn change stays on its side of the change. A rounded time
+that a change skips moves forward by the length of the gap.
+
+`TimeIncrement.one(TimeUnit.Day)` rounds to the start of this day or of the next day in
+the zone, by the real length of the day, which is 23 or 25 hours on the day of a change.
+
+#### Examples
+
+```silk
+import silk.core.result { Result }
+import silk.time.plain_date_time { PlainDateTime }
+import silk.time.rounding { RoundingMode, TimeIncrement, TimeUnit }
+import silk.time.zone { Disambiguation, LocalTimeError, Zone }
+import silk.time.zoned { ZonedDateTime }
+
+pub fn main() -> i32 {
+  let zone = Zone.utc()
+  let local = PlainDateTime.fromFields(2026, 11, 19, 15, 36, 22)
+  match ZonedDateTime.fromLocal(local, &zone, Disambiguation.Compatible) {
+    Result<ZonedDateTime, LocalTimeError>.Success { value } => {
+      let hour = value.round(TimeIncrement.one(TimeUnit.Hour), RoundingMode.HalfExpand)
+      if &hour.toPlainDateTime() != &PlainDateTime.fromFields(2026, 11, 19, 16, 0, 0) {
+        return 1
+      }
+      return 0
+    }
+    Result<ZonedDateTime, LocalTimeError>.Failure { error: _ } => {
+      return 2
+    }
+  }
+}
+```
+
+<a id="ZonedDateTime.impl.round"></a>
+
+### Method `round`
+
+```silk
+pub fn round(self: Self, step: TimeIncrement, mode: RoundingMode) -> ZonedDateTime<'z>
+```
+
+Returns the value with its local time rounded to a multiple of `step` from midnight.
+
+#### Gotchas
+
+A result outside the range traps. [`ZonedDateTime.checkedRound`](#ZonedDateTime.impl.checkedRound) returns `None` instead,
+and describes the rounding.
+
+<a id="ZonedDateTime.impl.checkedAddPeriod"></a>
+
+### Method `checkedAddPeriod`
+
+```silk
+pub fn checkedAddPeriod(self: Self, period: Period, overflow: Overflow) -> Option<ZonedDateTime<'z>>
+```
+
+Returns the value `period` later, or earlier for a negative period, or `None` when the
+result is outside the range or `overflow` rejects a day of the month.
+
+#### Details
+
+The years, months, weeks, and days move the local date and keep the local time, so one day
+later is the same time on the clock on the next day, also over a daylight saving change. A
+local time that a change skips moves forward by the length of the gap, and a repeated one
+is the earlier of the two. The time part of the period is then added as an exact span.
+
+A period with only a time part moves along the timeline, as `+` with a `Duration` does.
+
+<a id="ZonedDateTime.impl.addPeriod"></a>
+
+### Method `addPeriod`
+
+```silk
+pub fn addPeriod(self: Self, period: Period) -> ZonedDateTime<'z>
+```
+
+Returns the value `period` later, or earlier for a negative period. A day of the month that
+the reached month does not have becomes its last day.
+
+#### Gotchas
+
+A result outside the range traps. [`ZonedDateTime.checkedAddPeriod`](#ZonedDateTime.impl.checkedAddPeriod) returns `None`
+instead, and describes the arithmetic.
+
+#### Examples
+
+```silk
+import silk.core.result { Result }
+import silk.time.period { Period }
+import silk.time.plain_date_time { PlainDateTime }
+import silk.time.zone { Disambiguation, LocalTimeError, Zone }
+import silk.time.zoned { ZonedDateTime }
+
+pub fn main() -> i32 {
+  let zone = Zone.utc()
+  let local = PlainDateTime.fromFields(2027, 1, 31, 9, 0, 0)
+  match ZonedDateTime.fromLocal(local, &zone, Disambiguation.Compatible) {
+    Result<ZonedDateTime, LocalTimeError>.Success { value } => {
+      let later = value.addPeriod(Period.ofMonths(1))
+      if &later.toPlainDateTime() != &PlainDateTime.fromFields(2027, 2, 28, 9, 0, 0) {
+        return 1
+      }
+      return 0
+    }
+    Result<ZonedDateTime, LocalTimeError>.Failure { error: _ } => {
+      return 2
+    }
+  }
+}
+```
+
+<a id="ZonedDateTime.impl.periodUntil"></a>
+
+### Method `periodUntil`
+
+```silk
+pub fn periodUntil<'other>(self: Self, other: ZonedDateTime<'other>, largest: DateUnit) -> Period
+```
+
+Returns the period from this value to `other`, with `largest` as its largest unit. The
+period is negative when `other` is earlier.
+
+#### Details
+
+Both values are read in the zone of this value. The date part counts whole years, months,
+weeks, or days on the calendar of the zone, and the time part is the exact span that
+remains. So from noon on the day before a daylight saving change to noon on the day after
+is two days, and [`ZonedDateTime.until`](#ZonedDateTime.impl.until) gives the 47 or 49 hours between the instants.
+
+`self.addPeriod(self.periodUntil(other, largest))` is `other`. Two values on the same local
+date have a period with only a time part.
+
 <a id="ZonedDateTime.impl.since"></a>
 
 ### Method `since`

@@ -212,6 +212,57 @@ Returns the nanosecond part of the span, from 0 to 999,999,999.
 The part counts forward from [`Duration.wholeSeconds`](#Duration.impl.wholeSeconds), also for a negative span. For -1.5
 seconds the whole seconds are `-2` and this part is 500,000,000.
 
+<a id="Duration.impl.round"></a>
+
+### Method `round`
+
+```silk
+pub fn round(self: Self, step: TimeIncrement, mode: RoundingMode) -> Duration
+```
+
+Returns the span rounded to a multiple of `step`.
+
+#### Details
+
+A day is 24 hours. `RoundingMode.HalfExpand` is the rounding of school arithmetic: to the
+nearest step, and away from zero from the middle.
+
+#### Gotchas
+
+A result outside the range traps. [`Duration.checkedRound`](#Duration.impl.checkedRound) returns `None` instead.
+
+#### Examples
+
+```silk
+import silk.time.duration { Duration }
+import silk.time.rounding { RoundingMode, TimeIncrement, TimeUnit }
+
+pub fn main() -> i32 {
+  let span = Duration.make(3 * 3600 + 52 * 60 + 30, 0)
+  let quarter = TimeIncrement.of(15, TimeUnit.Minute)
+  let rounded = span.round(quarter, RoundingMode.HalfExpand)
+  if &rounded != &Duration.make(4 * 3600, 0) {
+    return 1
+  }
+  let down = (-span).round(TimeIncrement.one(TimeUnit.Hour), RoundingMode.Trunc)
+  if &down != &Duration.make(-3 * 3600, 0) {
+    return 2
+  }
+  return 0
+}
+```
+
+<a id="Duration.impl.checkedRound"></a>
+
+### Method `checkedRound`
+
+```silk
+pub fn checkedRound(self: Self, step: TimeIncrement, mode: RoundingMode) -> Option<Duration>
+```
+
+Returns the span rounded to a multiple of `step`, or `None` when the result is outside the
+range.
+
 <a id="Duration.impl.toMilliseconds"></a>
 
 ### Method `toMilliseconds`
