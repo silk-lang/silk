@@ -6,27 +6,40 @@ The system providers of the `TimeZones` and `LocalZone` effects: the time zone d
 the zone setting of the operating system.
 
 ## When to use
-Provide `OsTimeZones` for `TimeZones` and `OsLocalZone` for `LocalZone` in a program that
+Provide [`OsTimeZones`](#OsTimeZones) for `TimeZones` and [`OsLocalZone`](#OsLocalZone) for `LocalZone` in a program that
 shows local times. In a test, provide `FixedTimeZones` and `FixedLocalZone` of
 `silk.time.zones`, so the result does not depend on the machine.
 
 ## Details
 Each operating system has its own implementation behind these two providers, and a program
-names no path and no system call. On Linux and macOS, the zones are the TZif files of the
-system: the directory that the variable `TZDIR` names, then `/usr/share/zoneinfo` and the
-other usual places. The local zone is the variable `TZ`, then the link `/etc/localtime`, then
-the file `/etc/timezone`.
+names no path and no system call.
 
-A zone is read from its file at each lookup. Load a zone one time and keep it.
+- Linux and macOS: the zones are the TZif files of the system, in the directory that the
+  variable `TZDIR` names, then `/usr/share/zoneinfo` and the other usual places. The local
+  zone is the variable `TZ`, then the link `/etc/localtime`, then the file `/etc/timezone`.
+  A zone is read from its file at each lookup.
+- Windows: the system has no IANA zone files, so the zones are the database inside the
+  program, `BundledTimeZones`. The local zone is the zone setting of Windows, mapped to its
+  IANA name by the table of the Unicode CLDR project.
+- WASI: the zones are the database inside the program, and the local zone is the variable
+  `TZ`.
+- Browsers and other JavaScript hosts: the zones are the database inside the program, and
+  the local zone is the one that the host import `silk#time-zone` gives, which the host
+  reads from `Intl.DateTimeFormat`.
+
+[`PreferSystemTimeZones`](#PreferSystemTimeZones) reads the system first and the database inside the program for a
+zone that the system does not have. Load a zone one time and keep it.
 
 ## Gotchas
-- A minimal container image often has no zone files. Then each lookup fails with the reason
-  `UnknownZone`, except for `UTC` and fixed offsets, which need no data.
-- The zones change when the operating system updates its database, so two machines can
-  disagree about a future date.
+- A minimal Linux container image often has no zone files. Then each lookup of `OsTimeZones`
+  fails with the reason `UnknownZone`, except for `UTC` and fixed offsets, which need no
+  data. `PreferSystemTimeZones` still finds the zone.
+- The zones of the system change when the operating system updates its database, so two
+  machines can disagree about a future date.
 - `OsLocalZone` can return a `TZ` value that is a POSIX rule, such as `EST5EDT,M3.2.0,M11.1.0`,
-  and not a zone name. `OsTimeZones` gives the zone for such a rule too.
-- The providers exist on Darwin x86_64 or aarch64 and on GNU Linux x86_64 or aarch64.
+  and not a zone name. On Linux and macOS, `OsTimeZones` gives the zone for such a rule too.
+- A program that names `OsTimeZones` on Windows or WebAssembly, or `PreferSystemTimeZones` on
+  any target, holds the database, about 60 KB.
 
 ## Examples
 ### Show an instant in the zone of this machine
@@ -67,9 +80,200 @@ pub effect fn main() -> i32 {
 }
 ```
 
-Public declarations: 0.
+Import as `OsTimeZones` with `import silk.time.zones_native { OsTimeZones }`.
 
-This module declares no public items.
+Public declarations: 3.
+
+<a id="OsTimeZones"></a>
+
+## `OsTimeZones`
+
+```silk
+pub struct OsTimeZones
+```
+
+The system `TimeZones` provider. On this target the operating system has no time zone
+files, so the zones are the ones of `BundledTimeZones`, inside the program.
+
+<a id="OsTimeZones.impl"></a>
+
+## Implementation `OsTimeZones`
+
+```silk
+impl OsTimeZones
+```
+
+<a id="OsTimeZones.impl.make"></a>
+
+### Associated function `make`
+
+```silk
+pub fn make() -> OsTimeZones
+```
+
+Returns a provider. It does no work until the first lookup.
+
+<a id="OsTimeZones.impl.TimeZones"></a>
+
+## Implementation `TimeZones for OsTimeZones`
+
+```silk
+impl TimeZones for OsTimeZones
+```
+
+<a id="OsTimeZones.impl.TimeZones.zoneBytes"></a>
+
+### Operation `zoneBytes`
+
+```silk
+zoneBytes: OsTimeZones.zoneBytes
+```
+
+<a id="OsTimeZones.impl.TimeZones.names"></a>
+
+### Operation `names`
+
+```silk
+names: OsTimeZones.names
+```
+
+<a id="OsTimeZones.impl.TimeZones.version"></a>
+
+### Operation `version`
+
+```silk
+version: OsTimeZones.version
+```
+
+<a id="OsLocalZone"></a>
+
+## `OsLocalZone`
+
+```silk
+pub struct OsLocalZone
+```
+
+The system `LocalZone` provider: the zone that this machine is set to.
+
+### Details
+
+On Windows it reads the zone setting and maps the Windows name to an IANA name. On WASI it
+reads the variable `TZ`. In a JavaScript host it asks the host. On another target it has
+no answer.
+
+<a id="OsLocalZone.impl"></a>
+
+## Implementation `OsLocalZone`
+
+```silk
+impl OsLocalZone
+```
+
+<a id="OsLocalZone.impl.make"></a>
+
+### Associated function `make`
+
+```silk
+pub fn make() -> OsLocalZone
+```
+
+Returns a provider. It does not read the setting.
+
+<a id="OsLocalZone.impl.LocalZone"></a>
+
+## Implementation `LocalZone for OsLocalZone`
+
+```silk
+impl LocalZone for OsLocalZone
+```
+
+<a id="OsLocalZone.impl.LocalZone.name"></a>
+
+### Operation `name`
+
+```silk
+name: OsLocalZone.name
+```
+
+<a id="PreferSystemTimeZones"></a>
+
+## `PreferSystemTimeZones`
+
+```silk
+pub struct PreferSystemTimeZones
+```
+
+A `TimeZones` provider that asks the operating system first and uses the zones inside the
+program for what the system does not have.
+
+### When to use
+
+It is the provider for a program that must work on every machine: it follows the zone
+updates of the operating system where there are zone files, and it still knows every zone in
+a container without them.
+
+### Details
+
+A lookup asks `OsTimeZones`. If that fails for a reason other than an invalid name, the
+lookup asks `BundledTimeZones`. [`TimeZones.names`](./time-zones.md#TimeZones.names) and [`TimeZones.version`](./time-zones.md#TimeZones.version) are the ones
+of the system, or the ones of the bundle if the system has no list or no version.
+
+### Gotchas
+
+- The program always holds the bundle, about 60 KB.
+- Two zones of one program can come from two releases of the database: one from the system
+  and one from the bundle.
+
+<a id="PreferSystemTimeZones.impl"></a>
+
+## Implementation `PreferSystemTimeZones`
+
+```silk
+impl PreferSystemTimeZones
+```
+
+<a id="PreferSystemTimeZones.impl.make"></a>
+
+### Associated function `make`
+
+```silk
+pub fn make() -> PreferSystemTimeZones
+```
+
+Returns a provider. It does no work until the first lookup.
+
+<a id="PreferSystemTimeZones.impl.TimeZones"></a>
+
+## Implementation `TimeZones for PreferSystemTimeZones`
+
+```silk
+impl TimeZones for PreferSystemTimeZones
+```
+
+<a id="PreferSystemTimeZones.impl.TimeZones.zoneBytes"></a>
+
+### Operation `zoneBytes`
+
+```silk
+zoneBytes: PreferSystemTimeZones.zoneBytes
+```
+
+<a id="PreferSystemTimeZones.impl.TimeZones.names"></a>
+
+### Operation `names`
+
+```silk
+names: PreferSystemTimeZones.names
+```
+
+<a id="PreferSystemTimeZones.impl.TimeZones.version"></a>
+
+### Operation `version`
+
+```silk
+version: PreferSystemTimeZones.version
+```
+
 
 Category: Time.
 
