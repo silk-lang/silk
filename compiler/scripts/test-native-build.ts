@@ -2575,6 +2575,53 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   )
   assert.equal(reopened.status, 1, reopened.stderr)
   assert.match(reopened.stderr, /^src\/main\.silk:3:1: error\[PAR0001\] Expected `\}`$/m)
+  // Whether a build closes the member sets of erased types is a fact of the sources it loads, not
+  // of the answers it reuses. After a check that failed in another module, the next build reuses
+  // the checks of the standard library modules that write `any SchemaReader` without parsing
+  // them, and still lowers their dispatchers instead of stopping at a provisional gap.
+  {
+    const project = join(directory, 'erasedreuse')
+    yield* fs.makeDirectory(join(project, 'src'), { recursive: true })
+    yield* fs.writeFileString(join(project, 'silk.toml'), '[package]\nname = "erasedreuse"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n')
+    yield* fs.writeFileString(
+      join(project, 'src/main.silk'),
+      [
+        'import helper { half }',
+        'import silk.core.effect { Effect }',
+        'import silk.mem.allocator { Allocator, OutOfMemoryError }',
+        'import silk.schema.issue { SchemaError }',
+        'import silk.schema.json { SchemaJson }',
+        'import silk.schema.schema { Schema }',
+        '',
+        'struct Row {',
+        '  pub value: u64,',
+        '}',
+        '',
+        'impl Schema for Row {}',
+        '',
+        'pub effect fn main() -> i32 ! SchemaError | OutOfMemoryError {',
+        '  let mut allocator = Allocator.systemAllocatorProvider()',
+        '  let row = run SchemaJson.decode<Row>(b"{\\"value\\":6}") |> Effect.provideMut<Allocator>(&mut allocator)',
+        '  if half(row.value) == 3 {',
+        '    return 0',
+        '  }',
+        '  return 1',
+        '}',
+        '',
+      ].join('\n'),
+    )
+    const helper = (divisor: string) => `pub fn half(value: u64) -> u64 {\n  return value / ${divisor}\n}\n`
+    yield* fs.writeFileString(join(project, 'src/helper.silk'), helper('"2"'))
+    const refused = yield* invoke(silk, ['build', '--stdlib', standardLibrary], project, { ...process.env, SILK_CLANG: clang })
+    settleCaches(project)
+    assert.equal(refused.status, 1, refused.stderr)
+    assert.match(refused.stderr, /^src\/helper\.silk:2:16: error\[SEM0135\]/m)
+    yield* fs.writeFileString(join(project, 'src/helper.silk'), helper('2'))
+    const built = yield* invoke(silk, ['run', '--stdlib', standardLibrary], project, { ...process.env, SILK_CLANG: clang })
+    settleCaches(project)
+    assert.equal(built.status, 0, built.stderr)
+    assert.doesNotMatch(built.stderr, /unsupported\[/)
+  }
   // A check does not wait for a build's cache write once the file holds a check's escape walks:
   // it reads the file as it stands. While the file holds only a build, the check waits for the
   // write, since the file it leaves is the one the check's own write must carry.
