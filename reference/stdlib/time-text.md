@@ -151,7 +151,8 @@ The text has no date, and the type needs one. Only `silk.time.pattern` reports i
 UnsupportedCalendar
 ```
 
-The text has a calendar annotation that is not `[u-ca=iso8601]`.
+The text has a calendar annotation that the parser does not take: any but `[u-ca=iso8601]`
+for the types of the ISO 8601 calendar, and a name that is no calendar for `CalendarDate`.
 
 <a id="TimeParseReason.UnknownCriticalAnnotation"></a>
 
@@ -488,6 +489,18 @@ pub fn make(bytes: &'text [u8]) -> Scanner<'text>
 
 Returns a scanner at the start of `bytes`.
 
+<a id="Scanner.impl.allowCalendars"></a>
+
+### Method `allowCalendars`
+
+```silk
+pub fn allowCalendars(self: &mut Self) -> ()
+```
+
+Makes [`Scanner.annotations`](#Scanner.impl.annotations) accept a calendar annotation with any value, such as
+`[u-ca=hebrew]`. The caller reads the value with [`Scanner.calendarAnnotation`](#Scanner.impl.calendarAnnotation) and decides
+if it knows that calendar.
+
 <a id="Scanner.impl.failure"></a>
 
 ### Method `failure`
@@ -684,6 +697,8 @@ Reads the bracketed annotations that end a text, such as `[Europe/Rome][u-ca=iso
 The first annotation can be a time zone, which has no `=`. The scanner keeps it for
 [`Scanner.zoneAnnotation`](#Scanner.impl.zoneAnnotation). The others are `key=value` pairs. The calendar key `u-ca` must
 have the value `iso8601`, in any letter case, or the scanner fails with `UnsupportedCalendar`.
+After [`Scanner.allowCalendars`](#Scanner.impl.allowCalendars), every value is accepted. The scanner keeps the value of the
+first calendar annotation for [`Scanner.calendarAnnotation`](#Scanner.impl.calendarAnnotation).
 An annotation with another key is skipped, unless it starts with `!`, which fails with
 `UnknownCriticalAnnotation`.
 
@@ -697,6 +712,17 @@ pub fn zoneAnnotation(self: &Self) -> &'text [u8]
 
 Returns the name inside the time zone annotation that [`Scanner.annotations`](#Scanner.impl.annotations) read, such as
 `Europe/Rome`, or an empty slice if the text has none.
+
+<a id="Scanner.impl.calendarAnnotation"></a>
+
+### Method `calendarAnnotation`
+
+```silk
+pub fn calendarAnnotation(self: &Self) -> &'text [u8]
+```
+
+Returns the value of the first calendar annotation that [`Scanner.annotations`](#Scanner.impl.annotations) read, such as
+`hebrew` for `[u-ca=hebrew]`, or an empty slice if the text has none.
 
 <a id="Scanner.impl.dateTime"></a>
 
