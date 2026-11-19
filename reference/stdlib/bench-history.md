@@ -407,6 +407,27 @@ line, each line ended.
 - `SchemaError` or `WriterError` if an entry cannot be encoded, which a value of a report
   that is not a finite number causes.
 
+<a id="History.impl.bencher"></a>
+
+### Associated function `bencher`
+
+```silk
+pub effect fn bencher(report: &Report) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Returns `report` in Bencher Metric Format, the JSON that the Bencher service reads: one
+object whose keys are `<benchmark>/<implementation>`, each with one measure that holds
+the median as `value` and its 95% interval as `lower_value` and `upper_value`.
+
+#### Details
+The measure is `latency` for a time, which Bencher takes in nanoseconds, and otherwise the
+unit as the report has it, such as `req/s`. Rows with no successful run are left out.
+
+#### Errors
+`OutOfMemoryError` if the `Allocator` cannot supply the text.
+
 <a id="History.impl.parse"></a>
 
 ### Associated function `parse`

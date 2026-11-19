@@ -574,6 +574,17 @@ History
 One line for each row of the report, of `silk.bench.history.History.lines`, to add to a
 history file with [`Output.appending`](#Output.impl.appending).
 
+<a id="Format.Bencher"></a>
+
+### `Bencher`
+
+```silk
+Bencher
+```
+
+Bencher Metric Format, of `silk.bench.history.History.bencher`, the JSON the Bencher
+service reads.
+
 <a id="Destination"></a>
 
 ## `Destination`
