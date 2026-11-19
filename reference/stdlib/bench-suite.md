@@ -6,7 +6,7 @@ Describes what a benchmark run compares: suites, their implementations, the prog
 time, and where the reports go.
 
 ## When to use
-Build a [`Suite`](#Suite) in a project's `tasks.silk` and give it to `silk.bench.bench.Bench.run`. A
+Build a [`Suite`](#Suite) in a project's `tasks.silk` and give it to `silk.bench.bench.Bench.perform`. A
 suite compares implementations of one piece of work: a Silk program and the same program in
 another language, two versions of one program, or one program with different options.
 
@@ -23,6 +23,11 @@ task runs: a package file from `Deferred<Path>.source`, a host path from
 `artifact()` or a `Run` step that builds a program in another language. The steps a suite's
 paths come from run before anything is timed, with the build system's cache, so a second run
 rebuilds nothing that did not change.
+
+A program that measures itself says so with [`Implementation.resultLines`](#Implementation.impl.resultLines): the suite then
+reads the result lines the program prints, one sample a line, and reports what the lines
+say in their own unit, such as `ns/op` or `req/s`. A load generator, a server benchmark, or
+a loop that times one function inside a larger program reports this way.
 
 [`Suite.parameter`](#Suite.impl.parameter) runs the suite once for each value: `{name}` in an argument is replaced
 by the value, and each combination of values is its own benchmark, named
@@ -311,6 +316,16 @@ pub version: Option<String>
 
 The revision recorded for the implementation.
 
+<a id="Implementation.reports"></a>
+
+### Field `reports`
+
+```silk
+pub reports: bool
+```
+
+Whether the program prints result lines, which then are what the suite measures.
+
 <a id="Implementation.impl"></a>
 
 ## Implementation `Implementation`
@@ -453,6 +468,28 @@ pub effect fn revision(self: &mut Self, text: string) -> ()
 Records `text` as the revision of this implementation, such as a commit hash or a version
 number, so a report says what was measured.
 
+<a id="Implementation.impl.resultLines"></a>
+
+### Method `resultLines`
+
+```silk
+pub fn resultLines(self: &mut Self) -> ()
+```
+
+Says that the program prints result lines, as `silk.bench.lines` describes them, and that
+the suite measures what those lines report, not the time of the process.
+
+#### Details
+Each line is one sample of the benchmark its name gives, so one run of the program may
+report many benchmarks and many samples of each. The program writes the lines to standard
+output, or to the file the environment variable `BENCH_OUT` names, which the suite sets
+for every timed run. Lines that are not result lines are ignored.
+
+The suite reads three configuration keys. `check:` says what the program computed, such
+as a checksum or a count: implementations whose checks differ for one benchmark are not
+compared, and the task fails. `revision:` is recorded as the implementation's revision
+when the suite gives none. `note:` is added to the notes of the run.
+
 <a id="Format"></a>
 
 ## `Format`
@@ -514,6 +551,39 @@ Result
 ```
 
 The raw samples as JSON, a `silk.bench.record.RunResult`.
+
+<a id="Format.Lines"></a>
+
+### `Lines`
+
+```silk
+Lines
+```
+
+The samples as result lines, of `silk.bench.lines.Lines.fromResult`, the text format of
+Go's `testing` package that tools such as `benchstat` read.
+
+<a id="Format.History"></a>
+
+### `History`
+
+```silk
+History
+```
+
+One line for each row of the report, of `silk.bench.history.History.lines`, to add to a
+history file with [`Output.appending`](#Output.impl.appending).
+
+<a id="Format.Bencher"></a>
+
+### `Bencher`
+
+```silk
+Bencher
+```
+
+Bencher Metric Format, of `silk.bench.history.History.bencher`, the JSON the Bencher
+service reads.
 
 <a id="Destination"></a>
 

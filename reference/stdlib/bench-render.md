@@ -13,7 +13,9 @@ outputs a suite declares with `Format.Terminal` and `Format.Markdown`. Use
 ## Details
 Each benchmark is one table with one row for each implementation: the median time, its 95%
 interval, the fastest run, the processor time, the peak memory, and the ratio to the
-reference with its interval and verdict. A renderer computes nothing: every number comes
+reference with its interval and verdict. A table of result lines has the median in the unit
+of the lines and, in place of the processor time and the memory, one column for each other
+unit the lines carry. A renderer computes nothing: every number comes
 from the report.
 
 With color, a ratio is green or red only when its verdict is `faster` or `slower`, and dim
@@ -88,6 +90,41 @@ dates, the label, the revisions, and the notes.
 
 #### Errors
 `OutOfMemoryError` if the `Allocator` cannot supply the lines.
+
+<a id="Render.impl.titles"></a>
+
+### Associated function `titles`
+
+```silk
+pub effect fn titles(report: &Report, table: &Table) -> List<String>
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Returns the column titles of `table`, for a renderer that draws its own table: the
+implementation, the median, its interval, the best value, the processor time and peak
+memory of a table of process times or one column for each other unit of a table of result
+lines, and last the comparison to the reference.
+
+#### Errors
+`OutOfMemoryError` if the `Allocator` cannot supply the titles.
+
+<a id="Render.impl.cells"></a>
+
+### Associated function `cells`
+
+```silk
+pub effect fn cells(report: &Report, table: &Table, row: &Row) -> List<String>
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Returns the cells of `row`, a row of `table`, as text: one for each title of
+[`Render.titles`](#Render.impl.titles). A row with no successful run has `-` in every cell between its name and
+its comparison.
+
+#### Errors
+`OutOfMemoryError` if the `Allocator` cannot supply the cells.
 
 <a id="Render.impl.memory"></a>
 

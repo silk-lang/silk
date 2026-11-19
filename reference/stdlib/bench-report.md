@@ -10,6 +10,13 @@ render a saved run again or with another noise threshold. `silk.bench.bench` cal
 every suite it runs.
 
 ## Details
+A combination of parameters whose programs print result lines gets one table for each name
+the lines carry, in the unit of the lines: `ns/op` when a line has it, or else the first
+unit written. The medians of the other units are in the row. Where a larger value is better,
+as for `req/s`, a ratio above 1 has the verdict `faster`. When the lines of two
+implementations carry different checks for one name, the table is marked and no row of it
+has a ratio. Every other combination gets one table of process times, as follows.
+
 Each implementation gets one row for each benchmark. The row's statistics cover the measured
 runs that exited with status 0: warm-up runs and failed runs are left out, and failed runs
 are counted in the row. Every row except the reference's gets its ratio to the reference
