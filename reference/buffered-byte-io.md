@@ -53,7 +53,7 @@ import silk.core.effect { Effect }
 import silk.io.memory_byte_duplex { MemoryByteDuplex, MemoryReadEvent, MemoryWriteEvent }
 import silk.system.monotonic_clock { MonotonicClock }
 import silk.core.option { Option }
-import silk.system.system_clock { Instant, SystemClock }
+import silk.time.mark { Mark }
 import silk.num.u64
 import silk.num.usize
 import silk.collections.list { List }
@@ -62,9 +62,9 @@ struct FixedClock {}
 struct Inspection { minimum: usize }
 
 impl MonotonicClock for FixedClock {
-  effect fn now(self: &mut Self) -> Instant { return SystemClock.make(0, 0) }
+  effect fn now(self: &mut Self) -> Mark { return Mark.make(0, 0) }
   effect fn getResolution(self: &mut Self) -> u64 { return u64.toU64(1) }
-  effect fn waitUntil(self: &mut Self, when: Instant) -> () { drop when return () }
+  effect fn waitUntil(self: &mut Self, when: Mark) -> () { drop when return () }
   effect fn waitFor(self: &mut Self, duration: u64) -> () { drop duration return () }
 }
 
@@ -78,7 +78,7 @@ impl Inspection {
     let filled = run BufferedDuplex.fill(
       &mut session.*,
       context.minimum,
-      Option<Instant>.none(),
+      Option<Mark>.none(),
     )
     return match move filled {
       FillOutcome.Available { count } => count
@@ -188,7 +188,7 @@ not an exact-prefix transfer destination. These operations promise neither zero-
 
 ## Deadlines
 
-Every duplex-backed repeated operation forwards one unchanged absolute `Option<Instant>` on the
+Every duplex-backed repeated operation forwards one unchanged absolute `Option<Mark>` on the
 active `MonotonicClock` timeline. It does not renew a duration after a short read or write.
 StandardInput and Writer adapters expose no deadline parameter because their service contracts do
 not supply that capability.

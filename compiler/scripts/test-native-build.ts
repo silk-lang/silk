@@ -2112,8 +2112,11 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     // A private field the declaring module reads through a public function points at that function.
     {
       name: 'fieldaccessor',
-      files: { 'main.silk': 'import silk.system.system_clock { Instant }\n\nfn f(now: &Instant) -> i64 { return now.seconds() }\n\npub fn main() -> i32 {\n  return 0\n}\n' },
-      pattern: /error\[SEM0028\] Field `seconds` of silk\.system\.system_clock\.Instant is private; read it with `SystemClock\.seconds\(&value\)` instead/,
+      files: {
+        'main.silk': 'import reading { Reading }\n\nfn f(now: &Reading) -> i64 { return now.seconds }\n\npub fn main() -> i32 {\n  return 0\n}\n',
+        'reading.silk': 'pub struct Reading { seconds: i64, }\n\npub struct Clock {}\n\nimpl Clock {\n  pub fn seconds(self: &Reading) -> i64 { return self.seconds }\n}\n',
+      },
+      pattern: /error\[SEM0028\] Field `seconds` of reading\.Reading is private; read it with `Clock\.seconds\(&value\)` instead/,
     },
     // A provision that matches nothing names the provider, the service and what the Effect requires.
     {
@@ -2141,7 +2144,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     {
       name: 'witnessresult',
       files: { 'main.silk': 'import silk.system.system_clock { SystemClock }\n\nstruct Fixed {}\n\nimpl SystemClock for Fixed {\n  effect fn now(self: &mut Self) -> i64 { return 0 }\n  effect fn getResolution(self: &mut Self) -> u64 { return 1 }\n}\n\npub fn main() -> i32 {\n  return 0\n}\n' },
-      pattern: /error\[SEM0083\] Invalid conformance: member `now` does not match the operation of `SystemClock`: it returns `i64`, but the operation returns `silk\.system\.system_clock\.Instant`/,
+      pattern: /error\[SEM0083\] Invalid conformance: member `now` does not match the operation of `SystemClock`: it returns `i64`, but the operation returns `silk\.time\.instant\.Instant`/,
     },
     // A plain `test fn` that runs or declares a failure is told to become a `test effect fn`.
     {
@@ -2575,6 +2578,53 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   )
   assert.equal(reopened.status, 1, reopened.stderr)
   assert.match(reopened.stderr, /^src\/main\.silk:3:1: error\[PAR0001\] Expected `\}`$/m)
+  // Whether a build closes the member sets of erased types is a fact of the sources it loads, not
+  // of the answers it reuses. After a check that failed in another module, the next build reuses
+  // the checks of the standard library modules that write `any SchemaReader` without parsing
+  // them, and still lowers their dispatchers instead of stopping at a provisional gap.
+  {
+    const project = join(directory, 'erasedreuse')
+    yield* fs.makeDirectory(join(project, 'src'), { recursive: true })
+    yield* fs.writeFileString(join(project, 'silk.toml'), '[package]\nname = "erasedreuse"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n')
+    yield* fs.writeFileString(
+      join(project, 'src/main.silk'),
+      [
+        'import helper { half }',
+        'import silk.core.effect { Effect }',
+        'import silk.mem.allocator { Allocator, OutOfMemoryError }',
+        'import silk.schema.issue { SchemaError }',
+        'import silk.schema.json { SchemaJson }',
+        'import silk.schema.schema { Schema }',
+        '',
+        'struct Row {',
+        '  pub value: u64,',
+        '}',
+        '',
+        'impl Schema for Row {}',
+        '',
+        'pub effect fn main() -> i32 ! SchemaError | OutOfMemoryError {',
+        '  let mut allocator = Allocator.systemAllocatorProvider()',
+        '  let row = run SchemaJson.decode<Row>(b"{\\"value\\":6}") |> Effect.provideMut<Allocator>(&mut allocator)',
+        '  if half(row.value) == 3 {',
+        '    return 0',
+        '  }',
+        '  return 1',
+        '}',
+        '',
+      ].join('\n'),
+    )
+    const helper = (divisor: string) => `pub fn half(value: u64) -> u64 {\n  return value / ${divisor}\n}\n`
+    yield* fs.writeFileString(join(project, 'src/helper.silk'), helper('"2"'))
+    const refused = yield* invoke(silk, ['build', '--stdlib', standardLibrary], project, { ...process.env, SILK_CLANG: clang })
+    settleCaches(project)
+    assert.equal(refused.status, 1, refused.stderr)
+    assert.match(refused.stderr, /^src\/helper\.silk:2:16: error\[SEM0135\]/m)
+    yield* fs.writeFileString(join(project, 'src/helper.silk'), helper('2'))
+    const built = yield* invoke(silk, ['run', '--stdlib', standardLibrary], project, { ...process.env, SILK_CLANG: clang })
+    settleCaches(project)
+    assert.equal(built.status, 0, built.stderr)
+    assert.doesNotMatch(built.stderr, /unsupported\[/)
+  }
   // A check does not wait for a build's cache write once the file holds a check's escape walks:
   // it reads the file as it stands. While the file holds only a build, the check waits for the
   // write, since the file it leaves is the one the check's own write must carry.

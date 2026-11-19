@@ -88,22 +88,22 @@ import silk.io.memory_byte_duplex {
 import silk.system.monotonic_clock { MonotonicClock, ReadyWatch }
 import silk.core.option { Option }
 import silk.core.result { Result }
-import silk.system.system_clock { Instant, SystemClock }
+import silk.time.mark { Mark }
 import silk.num.u64
 import silk.num.usize
 
 struct FixedClock {}
 
 impl MonotonicClock for FixedClock {
-  effect fn now(self: &mut Self) -> Instant {
-    return SystemClock.make(0, 0)
+  effect fn now(self: &mut Self) -> Mark {
+    return Mark.make(0, 0)
   }
 
   effect fn getResolution(self: &mut Self) -> u64 {
     return u64.toU64(1)
   }
 
-  effect fn waitUntil(self: &mut Self, when: Instant) -> () {
+  effect fn waitUntil(self: &mut Self, when: Mark) -> () {
     drop when
     return ()
   }
@@ -112,11 +112,11 @@ impl MonotonicClock for FixedClock {
     drop duration
     return ()
   }
-  effect fn waitReady(self: &mut Self, watch: &mut [ReadyWatch], until: Option<Instant>) -> usize {
+  effect fn waitReady(self: &mut Self, watch: &mut [ReadyWatch], until: Option<Mark>) -> usize {
     if watch.length > 0 { Intrinsic.trap("this clock has no handles to watch") }
     match move until {
-      Option<Instant>.None => {}
-      Option<Instant>.Some {value: when} => {
+      Option<Mark>.None => {}
+      Option<Mark>.Some {value: when} => {
         drop when
       }
     }
@@ -185,7 +185,7 @@ effect<'call> fn writeHello<
 ) -> i32
   ! ServerError
   ? &mut MonotonicClock {
-  let progress = run ResponseWriter.writeAll(&mut writer.*, b"Hello", Option<Instant>.none())
+  let progress = run ResponseWriter.writeAll(&mut writer.*, b"Hello", Option<Mark>.none())
   if progress.consumed != 5 {
     return 1
   }
@@ -196,7 +196,7 @@ effect<'call> fn writeHello<
       fail ServerError.Value { error: move error }
     }
   }
-  run ResponseWriter.finish(&mut writer.*, &trailers, Option<Instant>.none())
+  run ResponseWriter.finish(&mut writer.*, &trailers, Option<Mark>.none())
   return 0
 }
 
@@ -248,7 +248,7 @@ effect<'call> fn handleRequest<
     BodyMode.ContentLength { length: u64.toU64(5) },
     ReusePolicy.CloseAfterResponse,
     TrailerPolicy.defaultPolicy(),
-    Option<Instant>.none(),
+    Option<Mark>.none(),
     writeHello,
   )
 }
@@ -272,7 +272,7 @@ impl ConnectionHandler<
     drop handler
 
     // `None` means that the peer closed before a request.
-    return match run withRequest(&mut connection.*, Option<Instant>.none(), handleRequest) {
+    return match run withRequest(&mut connection.*, Option<Mark>.none(), handleRequest) {
       Option.Some { value } => value
       Option.None => 1
     }
@@ -301,14 +301,14 @@ effect fn program() -> i32
   let mut reads = List<MemoryReadEvent>.make()
   run List.append(
     &mut reads,
-    MemoryReadEvent.Data { readyAt: SystemClock.make(0, 0), bytes: move input }
+    MemoryReadEvent.Data { readyAt: Mark.make(0, 0), bytes: move input }
   )
-  run List.append(&mut reads, MemoryReadEvent.End { readyAt: SystemClock.make(0, 0) })
+  run List.append(&mut reads, MemoryReadEvent.End { readyAt: Mark.make(0, 0) })
   let mut writes = List<MemoryWriteEvent>.make()
   run List.append(
     &mut writes,
     MemoryWriteEvent {
-      readyAt: SystemClock.make(0, 0),
+      readyAt: Mark.make(0, 0),
       action: MemoryWriteAction.Accept { count: 256 }
     },
   )
@@ -1272,7 +1272,7 @@ pub effect fn withRequest<
   P,
 >(
   connection: &'request mut Connection<'connection, 'transport, P>,
-  deadline: Option<Instant>,
+  deadline: Option<Mark>,
   callback: for<'call, 'requestView: 'call, 'connectionView: 'requestView, 'transportView: 'connectionView> once fn<'callback>(
     &'call mut Request<'requestView, 'connectionView, 'transportView, P>,
   ) -> once Effect<'call; A ! E ? CallbackRequirements>,
@@ -1305,7 +1305,7 @@ Before a `Head` or `Body` error, the server sends a bare 4xx or 5xx response. Se
 pub effect fn readSome<'request, 'connection, 'transport, P>(
   request: &mut Request<'request, 'connection, 'transport, P>,
   output: &mut [u8],
-  deadline: Option<Instant>,
+  deadline: Option<Mark>,
 ) -> usize
 ! ServerError
 ? &mut MonotonicClock
@@ -1331,7 +1331,7 @@ It returns at least one byte, or zero at the end of the body. If the request has
 pub effect fn discardRemaining<'request, 'connection, 'transport, P>(
   request: &mut Request<'request, 'connection, 'transport, P>,
   maxWireBytes: u64,
-  deadline: Option<Instant>,
+  deadline: Option<Mark>,
 ) -> ()
 ! ServerError
 ? &mut MonotonicClock
@@ -1356,7 +1356,7 @@ needs `Expect: 100-continue`, it sends `100 Continue` first.
 pub effect fn finishConnection<'connection, 'transport, P>(
   connection: &mut Connection<'connection, 'transport, P>,
   maxDrainBytes: usize,
-  deadline: Instant,
+  deadline: Mark,
 ) -> ()
 ! ServerError
 ? &mut MonotonicClock
@@ -1382,7 +1382,7 @@ close. The phase becomes `Closed`.
 pub effect fn sendInformational<'request, 'connection, 'transport, 'value, P>(
   request: &mut Request<'request, 'connection, 'transport, P>,
   head: &ValueResponseHead<'value>,
-  deadline: Option<Instant>,
+  deadline: Option<Mark>,
 ) -> ()
 ! ServerError
 ? &mut MonotonicClock
@@ -1421,7 +1421,7 @@ pub effect fn respond<
   mode: BodyMode,
   reuse: ReusePolicy,
   trailerPolicy: TrailerPolicy<'names>,
-  deadline: Option<Instant>,
+  deadline: Option<Mark>,
   callback: for<'call, 'writerView: 'call, 'requestView: 'writerView, 'connectionView: 'requestView, 'transportView: 'connectionView> once fn<'callback>(
     &'call mut ResponseWriter<'writerView, 'requestView, 'connectionView, 'transportView, P>,
   ) -> once Effect<'call; A ! E ? CallbackRequirements>,
@@ -1460,7 +1460,7 @@ pub effect fn reject<
 >(
   request: &'loan mut Request<'request, 'connection, 'transport, P>,
   head: &ValueResponseHead<'value>,
-  deadline: Option<Instant>,
+  deadline: Option<Mark>,
 ) -> ()
 ! ServerError | OutOfMemoryError
 ? &mut Allocator | &mut MonotonicClock
@@ -1495,7 +1495,7 @@ pub effect fn withUpgrade<
   request: &'loan mut Request<'request, 'connection, 'transport, P>,
   selectedProtocol: string,
   response: &ValueResponseHead<'value>,
-  deadline: Option<Instant>,
+  deadline: Option<Mark>,
   callback: for<'call, 'transportView: 'call> once fn<'callback>(
     &'call mut BufferedDuplex<'transportView, P>,
   ) -> once Effect<'call; A ! E ? CallbackRequirements>,
@@ -1536,7 +1536,7 @@ pub effect fn withTunnel<
 >(
   request: &'loan mut Request<'request, 'connection, 'transport, P>,
   response: &ValueResponseHead<'value>,
-  deadline: Option<Instant>,
+  deadline: Option<Mark>,
   callback: for<'call, 'transportView: 'call> once fn<'callback>(
     &'call mut BufferedDuplex<'transportView, P>,
   ) -> once Effect<'call; A ! E ? CallbackRequirements>,
@@ -1573,7 +1573,7 @@ impl<'writer, 'request, 'connection, 'transport, P>
 pub effect fn writeSome(
     self: &mut Self,
     input: &[u8],
-    deadline: Option<Instant>,
+    deadline: Option<Mark>,
   ) -> WriteProgress
   ! ServerError
   ? &mut MonotonicClock
@@ -1597,7 +1597,7 @@ It accepts at least one byte unless `input` is empty.
 pub effect fn writeAll(
     self: &mut Self,
     input: &[u8],
-    deadline: Option<Instant>,
+    deadline: Option<Mark>,
   ) -> WriteProgress
   ! ServerError
   ? &mut MonotonicClock
@@ -1620,7 +1620,7 @@ Writes all of `input` to the body, and returns the progress.
 pub effect fn finish<'value>(
     self: &mut Self,
     trailers: &Headers<'value>,
-    deadline: Option<Instant>,
+    deadline: Option<Mark>,
   ) -> ()
   ! ServerError
   ? &mut MonotonicClock

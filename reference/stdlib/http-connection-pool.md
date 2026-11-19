@@ -597,7 +597,7 @@ clock, or use the network.
 effect fn acquire(
     context: &Self,
     key: &K,
-    deadline: Option<Instant>,
+    deadline: Option<Mark>,
   ) -> Connection<P> ! AcquisitionError ? AcquisitionRequirements
 ```
 
@@ -935,8 +935,8 @@ pub effect<'env> fn withConnection<
 >(
   handle: &Handle<K, P, C>,
   key: &K,
-  requestDeadline: Option<Instant>,
-  acquisitionDeadline: Option<Instant>,
+  requestDeadline: Option<Mark>,
+  acquisitionDeadline: Option<Mark>,
   handler: H,
 ) -> CheckoutResult<A>
 ! E | KeyCopyError | AcquisitionError | PoolError

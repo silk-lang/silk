@@ -23,15 +23,18 @@ when a signal interrupts the wait, so the total wait does not grow.
 ### Read the clocks
 ```silk
 import silk.platform.native.clock { NativeClock }
-import silk.system.system_clock { SystemClock }
 
 pub fn main() -> i32 {
-  // `true` selects the monotonic clock, `false` the system clock.
-  let first = run NativeClock.now(true)
-  let second = run NativeClock.now(true)
-  if SystemClock.seconds(&second) < SystemClock.seconds(&first) {
+  let first = run NativeClock.now()
+  let second = run NativeClock.now()
+  if &second < &first {
     return 1
   }
+  let today = run NativeClock.systemNow()
+  if today.unixSeconds() < 0 {
+    return 1
+  }
+  // `true` selects the monotonic clock, `false` the system clock.
   let resolution = run NativeClock.resolution(false)
   if resolution == 0 {
     return 1
@@ -83,13 +86,24 @@ impl NativeClock
 ### Associated function `now`
 
 ```silk
-pub effect fn now(monotonic: bool) -> Instant
+pub effect fn now() -> Mark
 ```
 
-Returns the time of the monotonic clock if `monotonic` is true, or of the system clock if it
-is false.
+Returns the reading of the monotonic clock.
 
-A monotonic time is not negative. A failed call or a bad result is a trap.
+It is not negative. A failed call or a bad result is a trap.
+
+<a id="NativeClock.impl.systemNow"></a>
+
+### Associated function `systemNow`
+
+```silk
+pub effect fn systemNow() -> Instant
+```
+
+Returns the date and time of the system clock.
+
+A failed call or a bad result is a trap.
 
 <a id="NativeClock.impl.resolution"></a>
 
@@ -107,7 +121,7 @@ call or a bad result is a trap.
 ### Associated function `waitUntil`
 
 ```silk
-pub effect fn waitUntil(when: Instant) -> ()
+pub effect fn waitUntil(when: Mark) -> ()
 ```
 
 Blocks the thread until the monotonic clock reaches `when`.
@@ -123,7 +137,7 @@ A negative deadline or a failed call is a trap. The wait does not let another fi
 ### Associated function `waitReady`
 
 ```silk
-pub effect fn waitReady(watch: &mut [ReadyWatch], until: Option<Instant>) -> usize
+pub effect fn waitReady(watch: &mut [ReadyWatch], until: Option<Mark>) -> usize
 ```
 
 Waits in one `poll` until a handle in `watch` is ready or the monotonic clock reaches

@@ -44,7 +44,9 @@ import silk.system.monotonic_clock { MonotonicClock, ReadyWatch }
 import silk.core.option { Option }
 import silk.system.random { Random }
 import silk.core.result { Result }
-import silk.system.system_clock { Instant, SystemClock }
+import silk.time.instant { Instant }
+import silk.time.mark { Mark }
+import silk.system.system_clock { SystemClock }
 import silk.tls.client { AlpnConfig, CipherOrder, ClientConfig, ClientLimits, Resumption }
 import silk.tls.connection { OwnedConnection, ConnectionOptions, withClient }
 import silk.tls.trust_anchor { TrustAnchor }
@@ -57,7 +59,7 @@ struct FixedWall {}
 
 impl SystemClock for FixedWall {
   effect fn now(self: &mut Self) -> Instant {
-    return SystemClock.make(0, 0)
+    return Instant.make(0, 0)
   }
 
   effect fn getResolution(self: &mut Self) -> u64 {
@@ -68,15 +70,15 @@ impl SystemClock for FixedWall {
 struct FixedMonotonic {}
 
 impl MonotonicClock for FixedMonotonic {
-  effect fn now(self: &mut Self) -> Instant {
-    return SystemClock.make(0, 0)
+  effect fn now(self: &mut Self) -> Mark {
+    return Mark.make(0, 0)
   }
 
   effect fn getResolution(self: &mut Self) -> u64 {
     return u64.toU64(1)
   }
 
-  effect fn waitUntil(self: &mut Self, when: Instant) -> () {
+  effect fn waitUntil(self: &mut Self, when: Mark) -> () {
     drop when
     return ()
   }
@@ -85,11 +87,11 @@ impl MonotonicClock for FixedMonotonic {
     drop howLong
     return ()
   }
-  effect fn waitReady(self: &mut Self, watch: &mut [ReadyWatch], until: Option<Instant>) -> usize {
+  effect fn waitReady(self: &mut Self, watch: &mut [ReadyWatch], until: Option<Mark>) -> usize {
     if watch.length > 0 { Intrinsic.trap("this clock has no handles to watch") }
     match move until {
-      Option<Instant>.None => {}
-      Option<Instant>.Some {value: when} => {
+      Option<Mark>.None => {}
+      Option<Mark>.Some {value: when} => {
         drop when
       }
     }
@@ -361,7 +363,7 @@ The maximum duration of the handshake, in nanoseconds, measured with the `Monoto
 ### Field `externalDeadline`
 
 ```silk
-pub externalDeadline: Option<Instant>
+pub externalDeadline: Option<Mark>
 ```
 
 An optional absolute deadline on the `MonotonicClock`. If it is earlier than the handshake
@@ -396,7 +398,7 @@ pub struct OwnedConnection<P>
 An authenticated TLS client connection that owns its transport `P`.
 
 Get one from [`authenticateOwned`](#authenticateOwned), or borrow one in the [`withClient`](#withClient) callback. All I/O
-functions take an optional `deadline` on the `MonotonicClock`. Use `Option<Instant>.none()` to
+functions take an optional `deadline` on the `MonotonicClock`. Use `Option<Mark>.none()` to
 wait without a limit. Use [`OwnedConnection.readSome`](#OwnedConnection.impl.readSome), [`OwnedConnection.writeSome`](#OwnedConnection.impl.writeSome), and
 [`OwnedConnection.flush`](#OwnedConnection.impl.flush) for application data.
 
@@ -454,7 +456,7 @@ details.
 pub effect fn readSome<'connection>(
     self: &'connection mut Self,
     output: &mut [u8],
-    deadline: Option<Instant>,
+    deadline: Option<Mark>,
   ) -> ReadTransfer
   ! ConnectionError | OutOfMemoryError
   ? &mut MonotonicClock | &mut Allocator | &mut Random
@@ -482,7 +484,7 @@ of input when the server sent `close_notify`.
 pub effect fn writeSome<'connection>(
     self: &'connection mut Self,
     input: &[u8],
-    deadline: Option<Instant>,
+    deadline: Option<Mark>,
   ) -> usize
   ! ConnectionError | OutOfMemoryError
   ? &mut MonotonicClock | &mut Allocator | &mut Random
@@ -506,7 +508,7 @@ it returns. Call it again with the rest of `input`.
 ### Method `flush`
 
 ```silk
-pub effect fn flush<'connection>(self: &'connection mut Self, deadline: Option<Instant>) -> ()
+pub effect fn flush<'connection>(self: &'connection mut Self, deadline: Option<Mark>) -> ()
   ! ConnectionError | OutOfMemoryError
   ? &mut MonotonicClock | &mut Allocator | &mut Random
   where
@@ -521,7 +523,7 @@ Sends all TLS output that is waiting, then flushes the transport.
 ### Method `shutdownWrite`
 
 ```silk
-pub effect fn shutdownWrite<'connection>(self: &'connection mut Self, deadline: Option<Instant>) -> ()
+pub effect fn shutdownWrite<'connection>(self: &'connection mut Self, deadline: Option<Mark>) -> ()
   ! ConnectionError | OutOfMemoryError
   ? &mut MonotonicClock | &mut Allocator | &mut Random
   where
@@ -794,7 +796,7 @@ Returns the transport half, to look at it.
 ### Method `readSome`
 
 ```silk
-pub effect fn readSome(self: &mut Self, output: &mut [u8], deadline: Option<Instant>) -> ReadTransfer
+pub effect fn readSome(self: &mut Self, output: &mut [u8], deadline: Option<Mark>) -> ReadTransfer
   ! ConnectionError | OutOfMemoryError
   ? &mut MonotonicClock | &mut Allocator | &mut Random
   where
@@ -857,7 +859,7 @@ Returns the transport half, to look at it.
 ### Method `writeSome`
 
 ```silk
-pub effect fn writeSome(self: &mut Self, input: &[u8], deadline: Option<Instant>) -> usize
+pub effect fn writeSome(self: &mut Self, input: &[u8], deadline: Option<Mark>) -> usize
   ! ConnectionError | OutOfMemoryError
   ? &mut MonotonicClock | &mut Allocator
   where
@@ -876,7 +878,7 @@ The errors of [`OwnedConnection.writeSome`](#OwnedConnection.impl.writeSome). Af
 ### Method `flush`
 
 ```silk
-pub effect fn flush(self: &mut Self, deadline: Option<Instant>) -> ()
+pub effect fn flush(self: &mut Self, deadline: Option<Mark>) -> ()
   ! ConnectionError | OutOfMemoryError
   ? &mut MonotonicClock | &mut Allocator
   where
@@ -891,7 +893,7 @@ Sends the TLS records that are waiting, then flushes the transport half.
 ### Method `shutdownWrite`
 
 ```silk
-pub effect fn shutdownWrite(self: &mut Self, deadline: Option<Instant>) -> ()
+pub effect fn shutdownWrite(self: &mut Self, deadline: Option<Mark>) -> ()
   ! ConnectionError | OutOfMemoryError
   ? &mut MonotonicClock | &mut Allocator
   where

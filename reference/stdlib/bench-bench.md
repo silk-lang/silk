@@ -84,6 +84,14 @@ instructions differ in cost. The count covers the program from start to exit and
 processes it starts. A driven program is not counted, and a program that prints result lines
 gets the count only when it reports one benchmark. `valgrind` must be on `PATH`.
 
+`--counters` reads the counters of the processor and the kernel over every timed run, on
+Linux on x86_64 and aarch64, and adds the median of each to the implementation's row:
+`instructions`, `cycles`, `cache-misses`, `branch-misses` and `page-faults`, all in user
+mode. They cover the program and the processes it starts and cost the run
+nothing measurable. A counter the system does not offer is left out without an error: a
+virtual machine or a container often offers only the last, and the hardware counters
+need `/proc/sys/kernel/perf_event_paranoid` at 2 or lower.
+
 ## Gotchas
 - Processes can be measured on Linux with GNU libc and on macOS.
 - Statistics cannot repair a noisy computer. Close other programs, and distrust a run whose
@@ -350,6 +358,18 @@ pub instrument: Option<String>
 
 Also run each implementation's program once under this instrument and report what it
 counted. `callgrind` counts instructions with Valgrind.
+
+<a id="BenchOptions.counters"></a>
+
+### Field `counters`
+
+```silk
+pub counters: bool
+```
+
+Also read the counters of the processor and the kernel over each timed run, where the
+system offers them: instructions, cycles, cache misses, branch misses and page
+faults.
 
 <a id="BenchOptions.impl"></a>
 

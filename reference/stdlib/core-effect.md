@@ -1209,7 +1209,7 @@ running; interrupt them, or let their parent finish.
 ```silk
 pub effect fn timeoutAt<'env, A, E, ?R>(
     self: once Effect<'env; A ! E ? R>,
-    deadline: Instant
+    deadline: Mark
   ) -> A ! E | TimeoutError ? R | &mut Scheduler
 ```
 

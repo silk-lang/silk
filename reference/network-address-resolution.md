@@ -48,7 +48,7 @@ is the origin identity: resolution never replaces it with a CNAME, reverse looku
 ## Finite requests and results
 
 Create a `ResolveRequest` with an owned Host, checked Port, `Any`/`V4`/`V6` family selection,
-`maxResults`, and an optional absolute monotonic Instant. `maxResults` must be from 1 through 64.
+`maxResults`, and an optional absolute monotonic `Mark`. `maxResults` must be from 1 through 64.
 
 `Resolver.resolve` handles numeric hosts without invoking the Resolver provider. When a numeric
 request carries a deadline, it samples MonotonicClock exactly once and treats an equal or past mark

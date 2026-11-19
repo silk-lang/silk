@@ -1,0 +1,1194 @@
+//! Time zone rules: the [`Zone`] type, which tells the UTC offset of a place at each instant and
+//! turns a local date and time into an instant.
+//!
+//! # When to use
+//!
+//! Use a [`Zone`] to show an instant as the local time of a place, or to find the instant that a
+//! local time names. Get a zone by name from the `TimeZones` service of `silk.time.zones`, or
+//! make one from the bytes of a TZif file with [`Zone.fromTzif`]. [`Zone.utc`] and
+//! [`Zone.fixed`] need no data. `silk.time.zoned` joins an instant and a zone into one value.
+//!
+//! # Details
+//!
+//! A zone holds the content of one TZif file of the IANA time zone database: a sorted table of
+//! the instants at which the offset changed, and the POSIX rule that continues after the last
+//! entry. Because the rule is kept, a zone answers for any year, not only for the years in the
+//! table.
+//!
+//! A local time is not always one instant. When clocks go forward, some local times do not
+//! exist. When clocks go back, some local times happen twice. [`Zone.candidates`] returns every
+//! instant, and [`Zone.resolve`] picks one with a [`Disambiguation`].
+//!
+//! # Errors
+//!
+//! - [`ZoneDataError`] from [`Zone.fromTzif`] and [`Zone.fromPosixRule`] if the data is not valid.
+//! - [`LocalTimeError`] from [`Zone.resolve`] if the local time names no instant under the chosen
+//!   `Disambiguation`.
+//!
+//! # Gotchas
+//!
+//! Leap seconds are not counted, as in Unix time. A TZif file with leap second records (the
+//! `right/` files of some systems) is rejected.
+//!
+//! # Examples
+//!
+//! ## Find the offset and resolve a local time
+//!
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.core.effect { Effect }
+//! import silk.core.result { Result }
+//! import silk.time.instant { Instant }
+//! import silk.time.plain_date_time { PlainDateTime }
+//! import silk.time.zone { Disambiguation, LocalTimeError, Zone, ZoneDataError }
+//!
+//! effect fn check() -> i32 ! ZoneDataError | OutOfMemoryError ? &mut Allocator {
+//!   // Central European time: one hour ahead, two in summer.
+//!   let rome = run Zone.fromPosixRule("CET-1CEST,M3.5.0,M10.5.0/3")
+//!   let winter = Instant.fromUnixSeconds(1795109782)
+//!   if rome.offsetAt(winter).totalSeconds() != 3600 {
+//!     return 1
+//!   }
+//!   // 02:30 on the last Sunday of March does not exist: clocks go from 02:00 to 03:00.
+//!   let skipped = PlainDateTime.fromFields(2027, 3, 28, 2, 30, 0)
+//!   if rome.candidates(skipped).count != 0 {
+//!     return 2
+//!   }
+//!   match rome.resolve(skipped, Disambiguation.Compatible) {
+//!     Result<Instant, LocalTimeError>.Success { value } => {
+//!       // The compatible choice moves the time forward by the hour that was skipped.
+//!       if value.toOffset(rome.offsetAt(value)).time().hour() != 3 {
+//!         return 3
+//!       }
+//!     }
+//!     Result<Instant, LocalTimeError>.Failure { error: _ } => {
+//!       return 4
+//!     }
+//!   }
+//!   return 0
+//! }
+//!
+//! effect fn failed(error: ZoneDataError | OutOfMemoryError) -> i32 {
+//!   return 9
+//! }
+//!
+//! pub effect fn main() -> i32 {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   return run Effect.catchAll(check(), failed) |> Effect.provideMut<Allocator>(&mut allocator)
+//! }
+//! ```
+//!
+//! @category Time
+import silk.collections.bytes { Bytes }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.encoding.endian { readU32BigEndian, readU64BigEndian }
+import silk.io.writer { Writer, WriterError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.format { Debug, Format, Formatter }
+import silk.text.string { String }
+import silk.time.civil { civilFromDays, daysFromCivil, daysInMonth, isLeapYear, weekdayFromDays }
+import silk.time.instant { Instant }
+import silk.time.offset { UtcOffset }
+import silk.time.plain_date { PlainDate }
+import silk.time.plain_date_time { PlainDateTime }
+import silk.time.plain_time { PlainTime }
+import silk.time.text as Text
+import silk.num.i32
+import silk.num.u16
+import silk.num.i64
+import silk.num.u32
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+
+const DAY: i64 = 86400
+
+// How many spans of the rule a search for a change of offset walks before it gives up. A rule
+// has two spans a year, so more spans with one offset means that the offset never changes.
+const RULE_WALK: usize = 6
+
+/// How [`Zone.resolve`] picks an instant when a local time does not name exactly one.
+pub enum Disambiguation {
+  /// For a time that happens twice, the earlier instant. For a time that does not exist, the
+  /// time moved forward by the length of the gap. This is the choice of RFC 5545 and of
+  /// ECMAScript Temporal.
+  Compatible,
+  /// For a time that happens twice, the earlier instant. For a time that does not exist, the
+  /// time moved back by the length of the gap.
+  Earlier,
+  /// For a time that happens twice, the later instant. For a time that does not exist, the time
+  /// moved forward by the length of the gap.
+  Later,
+  /// Fail with a [`LocalTimeError`] unless the time names exactly one instant.
+  Reject,
+}
+
+/// Why a local date and time names no instant in a zone.
+pub enum LocalTimeError {
+  /// The local time does not exist, because clocks went forward over it.
+  Skipped,
+  /// The local time happens twice, because clocks went back over it.
+  Repeated,
+  /// The instant is outside the range of `Instant`.
+  OutOfRange,
+  /// A text states a UTC offset that the zone does not have at that local time.
+  OffsetMismatch,
+}
+
+impl Debug for LocalTimeError {
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return match &self.* {
+      LocalTimeError.Skipped => run Format.write(&mut formatter, b"Skipped")
+      LocalTimeError.Repeated => run Format.write(&mut formatter, b"Repeated")
+      LocalTimeError.OutOfRange => run Format.write(&mut formatter, b"OutOfRange")
+      LocalTimeError.OffsetMismatch => run Format.write(&mut formatter, b"OffsetMismatch")
+    }
+  }
+}
+
+/// The cause of a [`ZoneDataError`].
+pub enum ZoneDataReason {
+  /// The data does not start with the TZif magic bytes.
+  NotTzif,
+  /// The data ends before the tables that its header declares.
+  Truncated,
+  /// A table has a value that is not allowed: a transition out of order, an index past the end
+  /// of a table, an offset of 24 hours or more, or a name that is not ASCII.
+  InvalidTable,
+  /// The data has leap second records. This library does not count leap seconds.
+  LeapSeconds,
+  /// The POSIX rule is not valid.
+  InvalidRule,
+}
+
+impl Debug for ZoneDataReason {
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return match &self.* {
+      ZoneDataReason.NotTzif => run Format.write(&mut formatter, b"NotTzif")
+      ZoneDataReason.Truncated => run Format.write(&mut formatter, b"Truncated")
+      ZoneDataReason.InvalidTable => run Format.write(&mut formatter, b"InvalidTable")
+      ZoneDataReason.LeapSeconds => run Format.write(&mut formatter, b"LeapSeconds")
+      ZoneDataReason.InvalidRule => run Format.write(&mut formatter, b"InvalidRule")
+    }
+  }
+}
+
+/// The error of [`Zone.fromTzif`] and [`Zone.fromPosixRule`]: the data is not a valid zone.
+pub struct ZoneDataError {
+  /// The cause.
+  pub reason: ZoneDataReason,
+}
+
+impl Copy for ZoneDataError {}
+
+impl Debug for ZoneDataError {
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    run Format.write(&mut formatter, b"ZoneDataError(")
+    run Debug.debug(&self.reason, &mut formatter)
+    return run Format.write(&mut formatter, b")")
+  }
+}
+
+/// The instants that a local date and time names in a zone, from [`Zone.candidates`].
+pub struct LocalCandidates {
+  /// The number of instants: 1 for most times, 0 for a time that clocks skipped, and 2 for a
+  /// time that happens twice.
+  pub count: u8,
+  /// The first instant. It has a meaning only when `count` is at least 1.
+  pub earlier: Instant,
+  /// The last instant. It is equal to `earlier` unless `count` is 2.
+  pub later: Instant,
+  /// `true` if the time is inside a gap, where clocks went forward. Then `count` is 0, and
+  /// `transition`, `before`, and `after` describe the gap.
+  pub skipped: bool,
+  /// The instant at which the clocks went forward.
+  pub transition: Instant,
+  /// The offset in effect before `transition`.
+  pub before: UtcOffset,
+  /// The offset in effect from `transition`.
+  pub after: UtcOffset,
+}
+
+impl Copy for LocalCandidates {}
+
+// One date of a POSIX rule. `kind` 0 is `Jn` (day 1 to 365, February 29 never counted), 1 is `n`
+// (day 0 to 365, February 29 counted), 2 is `Mm.w.d`.
+struct RuleDate {
+  kind: u8,
+  month: u8,
+  week: u8,
+  day: u16,
+  // Seconds after local midnight; can be negative or more than a day.
+  time: i32,
+}
+
+impl Copy for RuleDate {}
+
+// A POSIX TZ rule. Offsets are seconds east of UTC. Names are ranges of the zone's storage.
+struct Rule {
+  present: bool,
+  hasDaylight: bool,
+  standard: i32,
+  daylight: i32,
+  standardNameAt: usize,
+  standardNameLength: usize,
+  daylightNameAt: usize,
+  daylightNameLength: usize,
+  start: RuleDate,
+  end: RuleDate,
+}
+
+impl Copy for Rule {}
+
+// A stretch of time with one offset: from `start` up to, not including, `end`, in Unix seconds.
+// `i64.MIN` and `i64.MAX` stand for no bound.
+struct Span {
+  offset: i32,
+  daylight: bool,
+  nameAt: usize,
+  nameLength: usize,
+  start: i64,
+  end: i64,
+  inRule: bool,
+}
+
+impl Copy for Span {}
+
+/// The rules of one time zone: its UTC offset at every instant.
+///
+/// # Details
+///
+/// A zone owns its table. It is not `Copy`; share it by reference. `ZonedDateTime` of
+/// `silk.time.zoned` borrows a zone. All operations are plain functions, without effects.
+pub struct Zone {
+  nameBytes: Bytes,
+  // For a zone made without an allocation, the name is here.
+  inlineName: [u8; 9],
+  inlineLength: usize,
+  // The TZif data block, then the text of the POSIX rule.
+  storage: Bytes,
+  // 4 or 8: the width of one transition time in the table.
+  timeWidth: usize,
+  timeCount: usize,
+  typeCount: usize,
+  timesAt: usize,
+  indexesAt: usize,
+  typesAt: usize,
+  namesAt: usize,
+  namesLength: usize,
+  rule: Rule,
+}
+
+impl Zone {
+  /// Returns the zone `UTC`, which has the offset zero at every instant. It does not allocate.
+  pub fn utc() -> Zone {
+    let mut zone = Zone.blank()
+    zone.inlineName[0] = 85
+    zone.inlineName[1] = 84
+    zone.inlineName[2] = 67
+    zone.inlineLength = 3
+    return move zone
+  }
+
+  /// Returns a zone that has the offset `offset` at every instant. It does not allocate.
+  ///
+  /// # Details
+  ///
+  /// The name of the zone is the offset as text, such as `+05:30`.
+  pub fn fixed(offset: UtcOffset) -> Zone {
+    let mut zone = Zone.blank()
+    zone.inlineLength = Text.writeOffset(&mut zone.inlineName, 0, offset.totalSeconds())
+    zone.rule.standard = offset.totalSeconds()
+    return move zone
+  }
+
+  /// Reads a zone from the bytes of a TZif file, the format of the files under
+  /// `/usr/share/zoneinfo`, and gives it the name `name`.
+  ///
+  /// # Details
+  ///
+  /// All versions of the format are read (RFC 9636). For version 2 and later, the 64-bit table
+  /// and the POSIX rule in the footer are used. A version 1 file has a 32-bit table and no rule,
+  /// so after its last transition the offset stays as it is. The zone keeps a copy of the tables;
+  /// `data` is not borrowed.
+  ///
+  /// # Errors
+  ///
+  /// - [`ZoneDataError`] if `data` is not a valid TZif file, or has leap second records.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the copy.
+  pub effect fn fromTzif(name: string, data: &[u8]) -> Zone
+    ! ZoneDataError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut zone = Zone.blank()
+    let layout = match move readLayout(data) {
+      Result<Layout, ZoneDataReason>.Success { value } => value
+      Result<Layout, ZoneDataReason>.Failure { error } => {
+        return run rejectData(error)
+      }
+    }
+    zone.timeWidth = layout.timeWidth
+    zone.timeCount = layout.timeCount
+    zone.typeCount = layout.typeCount
+    zone.timesAt = 0
+    zone.indexesAt = layout.timeCount * layout.timeWidth
+    zone.typesAt = zone.indexesAt + layout.timeCount
+    zone.namesAt = zone.typesAt + layout.typeCount * 6
+    zone.namesLength = layout.nameLength
+    let tables = Slice.view<u8>(data, layout.blockAt, zone.namesAt + zone.namesLength)
+    if let Option<ZoneDataReason>.Some { value: problem } = checkTables(&zone, tables) {
+      return run rejectData(problem)
+    }
+    let ruleText = Slice.view<u8>(data, layout.ruleAt, layout.ruleLength)
+    let ruleBase = tables.length
+    if ruleText.length > 0 {
+      match parseRule(ruleText, ruleBase) {
+        Option<Rule>.Some { value } => {
+          zone.rule = value
+        }
+        Option<Rule>.None => {
+          return run rejectData(ZoneDataReason.InvalidRule)
+        }
+      }
+    } else {
+      zone.rule.present = false
+    }
+    let mut storage = run Bytes.makeWithCapacity(tables.length + ruleText.length)
+    run Bytes.append(&mut storage, tables)
+    run Bytes.append(&mut storage, ruleText)
+    zone.storage = move storage
+    zone.nameBytes = run Bytes.copy(String.utf8Bytes(name))
+    return move zone
+  }
+
+  /// Makes a zone from a POSIX `TZ` rule such as `EST5EDT,M3.2.0,M11.1.0` or `<-03>3`. The name
+  /// of the zone is the rule.
+  ///
+  /// # Details
+  ///
+  /// The rule is a name and an offset for standard time, then optionally a name and an offset
+  /// for daylight time and the two dates on which daylight time starts and ends. An offset is
+  /// hours west of UTC, so `EST5` is five hours behind UTC. A name is three or more letters, or
+  /// text in `<` and `>`. A date is `Mm.w.d` (month, week 1 to 5, day 0 to 6 from Sunday), `Jn`
+  /// (day 1 to 365, without February 29), or `n` (day 0 to 365), with an optional `/time` from
+  /// `-167` to `167` hours. Without a time the change is at 02:00.
+  ///
+  /// # Errors
+  ///
+  /// - [`ZoneDataError`] with the reason `InvalidRule` if `rule` does not have that form. A rule
+  ///   with daylight time and no dates is not accepted.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the copy.
+  pub effect fn fromPosixRule(rule: string) -> Zone
+    ! ZoneDataError | OutOfMemoryError
+    ? &mut Allocator {
+    return run Zone.fromPosixRuleNamed(rule, rule)
+  }
+
+  /// Makes a zone from a POSIX `TZ` rule, as [`Zone.fromPosixRule`] does, and gives it the name
+  /// `name`.
+  ///
+  /// # Errors
+  ///
+  /// - [`ZoneDataError`] and `OutOfMemoryError`, as for [`Zone.fromPosixRule`].
+  pub effect fn fromPosixRuleNamed(name: string, rule: string) -> Zone
+    ! ZoneDataError | OutOfMemoryError
+    ? &mut Allocator {
+    let text = String.utf8Bytes(rule)
+    let mut zone = Zone.blank()
+    match parseRule(text, 0) {
+      Option<Rule>.Some { value } => {
+        zone.rule = value
+      }
+      Option<Rule>.None => {
+        return run rejectData(ZoneDataReason.InvalidRule)
+      }
+    }
+    zone.storage = run Bytes.copy(text)
+    zone.nameBytes = run Bytes.copy(String.utf8Bytes(name))
+    return move zone
+  }
+
+  // A zone with no table and the rule "offset zero, no daylight time".
+  fn blank() -> Zone {
+    let never = RuleDate { kind: 0, month: 0, week: 0, day: 0, time: 0 }
+    return Zone {
+      nameBytes: Bytes.make(),
+      inlineName: [0; 9],
+      inlineLength: 0,
+      storage: Bytes.make(),
+      timeWidth: 8,
+      timeCount: 0,
+      typeCount: 0,
+      timesAt: 0,
+      indexesAt: 0,
+      typesAt: 0,
+      namesAt: 0,
+      namesLength: 0,
+      rule: Rule {
+        present: true,
+        hasDaylight: false,
+        standard: 0,
+        daylight: 0,
+        standardNameAt: 0,
+        standardNameLength: 0,
+        daylightNameAt: 0,
+        daylightNameLength: 0,
+        start: never,
+        end: never,
+      },
+    }
+  }
+
+  /// Returns the name of the zone, as it was given: an IANA name such as `Europe/Rome`, `UTC`,
+  /// an offset such as `+05:30`, or a POSIX rule.
+  pub fn name(self: &Self) -> string {
+    if self.inlineLength > 0 {
+      return unsafe String.fromUtf8Unchecked(Slice.view<u8>(&self.inlineName, 0, self.inlineLength))
+    }
+    // The name came in as a `string`, so the copy is valid UTF-8.
+    return unsafe String.fromUtf8Unchecked(Bytes.asSlice(&self.nameBytes))
+  }
+
+  /// Returns the UTC offset of the zone at the instant `at`.
+  pub fn offsetAt(self: &Self, at: Instant) -> UtcOffset {
+    return UtcOffset.fromSeconds(self.lookup(at.unixSeconds()).offset)
+  }
+
+  /// Returns `true` if daylight saving time is in effect in the zone at the instant `at`.
+  ///
+  /// # Gotchas
+  ///
+  /// This is the flag of the time zone database, and its meaning differs by place. In
+  /// `Europe/Dublin` the flag is set in winter. To find the offset, use [`Zone.offsetAt`].
+  pub fn isDaylightAt(self: &Self, at: Instant) -> bool {
+    return self.lookup(at.unixSeconds()).daylight
+  }
+
+  /// Returns the abbreviation of the zone at the instant `at`, such as `CET` or `CEST`.
+  ///
+  /// # Details
+  ///
+  /// Many zones have no letters and use the offset, such as `-03`. A zone from [`Zone.utc`] or
+  /// [`Zone.fixed`] returns its name.
+  ///
+  /// # Gotchas
+  ///
+  /// An abbreviation does not identify a zone: `CST` is used in North America, China, and Cuba.
+  pub fn abbreviationAt(self: &Self, at: Instant) -> string {
+    let span = self.lookup(at.unixSeconds())
+    if span.nameLength == 0 {
+      return self.name()
+    }
+    // Names are checked to be ASCII when the zone is made.
+    return unsafe String.fromUtf8Unchecked(
+      Slice.view<u8>(Bytes.asSlice(&self.storage), span.nameAt, span.nameLength),
+    )
+  }
+
+  /// Returns the first instant after `at` at which the UTC offset of the zone changes, or `None`
+  /// if it never changes again.
+  ///
+  /// # Details
+  ///
+  /// A change of only the abbreviation or the daylight flag is not counted. The result can be in
+  /// any year: after the end of the table, the changes come from the POSIX rule of the zone.
+  pub fn nextTransition(self: &Self, at: Instant) -> Option<Instant> {
+    let mut span = self.lookup(at.unixSeconds())
+    let mut walked = usize.ZERO
+    while span.end != i64.MAX && walked < RULE_WALK {
+      let following = self.lookup(span.end)
+      if following.offset != span.offset {
+        return Instant.checkedMake(span.end, 0)
+      }
+      if following.inRule {
+        walked = walked + 1
+      }
+      span = following
+    }
+    return Option<Instant>.none()
+  }
+
+  /// Returns the last instant before `at` at which the UTC offset of the zone changed, or `None`
+  /// if it did not change before.
+  ///
+  /// # Details
+  ///
+  /// A change of only the abbreviation or the daylight flag is not counted. When `at` is itself
+  /// an instant of change, the result is the change before it.
+  pub fn previousTransition(self: &Self, at: Instant) -> Option<Instant> {
+    // The last whole second strictly before `at`.
+    let mut second = at.unixSeconds()
+    if at.subsecondNanoseconds() == 0 {
+      second = second - 1
+    }
+    let mut span = self.lookup(second)
+    let mut walked = usize.ZERO
+    while span.start != i64.MIN && walked < RULE_WALK {
+      let preceding = self.lookup(span.start - 1)
+      if preceding.offset != span.offset {
+        return Instant.checkedMake(span.start, 0)
+      }
+      if span.inRule {
+        walked = walked + 1
+      }
+      span = preceding
+    }
+    return Option<Instant>.none()
+  }
+
+  /// Returns the instants at which a clock in the zone shows the date and time `local`.
+  ///
+  /// # Details
+  ///
+  /// Most times give one instant. A time in a gap, where clocks went forward, gives none: the
+  /// result has `skipped` set, with the instant of the change and the offsets on both sides. A
+  /// time in an overlap, where clocks went back, gives two.
+  pub fn candidates(self: &Self, local: PlainDateTime) -> LocalCandidates {
+    let seconds = local.toEpochSeconds()
+    let nanosecond = local.time().subsecondNanoseconds()
+    let mut result = LocalCandidates {
+      count: 0,
+      earlier: Instant.epoch(),
+      later: Instant.epoch(),
+      skipped: false,
+      transition: Instant.epoch(),
+      before: UtcOffset.utc(),
+      after: UtcOffset.utc(),
+    }
+    // Every offset is less than a day, so the instant is within a day of the local reading.
+    let mut span = self.lookup(seconds - DAY)
+    let mut walked = usize.ZERO
+    while walked < 64 {
+      let second = seconds - i32.toI64(span.offset)
+      if second >= span.start && second < span.end {
+        if let Option<Instant>.Some { value } = Instant.checkedMake(second, u32.toI64(nanosecond)) {
+          if result.count == 0 {
+            result.earlier = value
+          }
+          result.later = value
+          if result.count < 2 {
+            result.count = result.count + 1
+          }
+        }
+      }
+      if span.end == i64.MAX || span.end > seconds + DAY {
+        break
+      }
+      let following = self.lookup(span.end)
+      if second >= span.end && seconds - i32.toI64(following.offset) < span.end {
+        if let Option<Instant>.Some { value: change } = Instant.checkedMake(span.end, 0) {
+          result.skipped = true
+          result.transition = change
+          result.before = UtcOffset.fromSeconds(span.offset)
+          result.after = UtcOffset.fromSeconds(following.offset)
+        }
+      }
+      span = following
+      walked = walked + 1
+    }
+    if result.count > 0 {
+      result.skipped = false
+    }
+    return result
+  }
+
+  /// Returns the instant at which a clock in the zone shows the date and time `local`, and uses
+  /// `choice` when the time does not name exactly one instant.
+  ///
+  /// # Errors
+  ///
+  /// - `LocalTimeError.Skipped` or `LocalTimeError.Repeated` if `choice` is
+  ///   `Disambiguation.Reject` and the time names no instant or two.
+  /// - `LocalTimeError.OutOfRange` if the instant is outside the range of `Instant`.
+  pub fn resolve(self: &Self, local: PlainDateTime, choice: Disambiguation) -> Result<Instant, LocalTimeError> {
+    let found = self.candidates(local)
+    if found.count == 1 {
+      return Result<Instant, LocalTimeError>.succeed(found.earlier)
+    }
+    if found.count >= 2 {
+      return match choice {
+        Disambiguation.Compatible => Result<Instant, LocalTimeError>.succeed(found.earlier)
+        Disambiguation.Earlier => Result<Instant, LocalTimeError>.succeed(found.earlier)
+        Disambiguation.Later => Result<Instant, LocalTimeError>.succeed(found.later)
+        Disambiguation.Reject => Result<Instant, LocalTimeError>.failResult(LocalTimeError.Repeated)
+      }
+    }
+    if !found.skipped {
+      return Result<Instant, LocalTimeError>.failResult(LocalTimeError.OutOfRange)
+    }
+    // In a gap, reading the time with the offset before the change moves it forward, and with
+    // the offset after the change moves it back.
+    let offset = match choice {
+      Disambiguation.Compatible => found.before
+      Disambiguation.Later => found.before
+      Disambiguation.Earlier => found.after
+      Disambiguation.Reject => {
+        return Result<Instant, LocalTimeError>.failResult(LocalTimeError.Skipped)
+      }
+    }
+    return match Instant.fromLocal(local, offset) {
+      Option<Instant>.Some { value } => Result<Instant, LocalTimeError>.succeed(value)
+      Option<Instant>.None => Result<Instant, LocalTimeError>.failResult(LocalTimeError.OutOfRange)
+    }
+  }
+
+  /// Returns the first instant of the day `date` in the zone, or `None` if it is outside the
+  /// range of `Instant`.
+  ///
+  /// # Details
+  ///
+  /// This is midnight on most days. On a day when clocks go forward over midnight, the day
+  /// starts at the instant of the change, when the clock shows a later time.
+  pub fn startOfDay(self: &Self, date: PlainDate) -> Option<Instant> {
+    let found = self.candidates(PlainDateTime.make(date, PlainTime.make(0, 0, 0, 0)))
+    if found.count > 0 {
+      return Option<Instant>.some(found.earlier)
+    }
+    if found.skipped {
+      return Option<Instant>.some(found.transition)
+    }
+    return Option<Instant>.none()
+  }
+
+  // The span of one offset that holds the Unix second `second`.
+  fn lookup(self: &Self, second: i64) -> Span {
+    let data = Bytes.asSlice(&self.storage)
+    if self.timeCount == 0 {
+      if self.rule.present {
+        return self.ruleSpan(second, i64.MIN)
+      }
+      return self.typeSpan(data, 0, i64.MIN, i64.MAX)
+    }
+    let first = self.timeAt(data, 0)
+    if second < first {
+      return self.typeSpan(data, 0, i64.MIN, first)
+    }
+    let last = self.timeAt(data, self.timeCount - 1)
+    if second >= last {
+      if self.rule.present {
+        return self.ruleSpan(second, last)
+      }
+      return self.typeSpan(data, u8.toUsize(data[self.indexesAt + self.timeCount - 1]), last, i64.MAX)
+    }
+    // The greatest index whose time is not after `second`. The answer is in `low..high`.
+    let mut low = usize.ZERO
+    let mut high = self.timeCount - 1
+    while high - low > 1 {
+      let middle = low + (high - low) / 2
+      if self.timeAt(data, middle) <= second {
+        low = middle
+      } else {
+        high = middle
+      }
+    }
+    return self.typeSpan(
+      data,
+      u8.toUsize(data[self.indexesAt + low]),
+      self.timeAt(data, low),
+      self.timeAt(data, low + 1),
+    )
+  }
+
+  fn timeAt(self: &Self, data: &[u8], index: usize) -> i64 {
+    if self.timeWidth == 8 {
+      return u64.wrappingToI64(readU64BigEndian(data, self.timesAt + index * 8))
+    }
+    return i32.toI64(u32.wrappingToI32(readU32BigEndian(data, self.timesAt + index * 4)))
+  }
+
+  fn typeSpan(self: &Self, data: &[u8], index: usize, start: i64, end: i64) -> Span {
+    let at = self.typesAt + index * 6
+    let nameAt = self.namesAt + u8.toUsize(data[at + 5])
+    let mut nameLength = usize.ZERO
+    while data[nameAt + nameLength] != 0 {
+      nameLength = nameLength + 1
+    }
+    return Span {
+      offset: u32.wrappingToI32(readU32BigEndian(data, at)),
+      daylight: data[at + 4] != 0,
+      nameAt: nameAt,
+      nameLength: nameLength,
+      start: start,
+      end: end,
+      inRule: false,
+    }
+  }
+
+  // The span of the POSIX rule that holds `second`. The rule is in effect from `floor`.
+  fn ruleSpan(self: &Self, second: i64, floor: i64) -> Span {
+    let rule = self.rule
+    if !rule.hasDaylight {
+      return Span {
+        offset: rule.standard,
+        daylight: false,
+        nameAt: rule.standardNameAt,
+        nameLength: rule.standardNameLength,
+        start: floor,
+        end: i64.MAX,
+        inRule: true,
+      }
+    }
+    let year = civilFromDays(floorDivide(second + i32.toI64(rule.standard), DAY)).year
+    // The last change at or before `second` and the first one after it, among the changes of
+    // three years. On a tie the later one in the walk wins, which is the start of daylight time
+    // when a rule keeps it for the whole year.
+    let mut previous = i64.MIN
+    let mut previousStarts = false
+    let mut next = i64.MAX
+    let mut index = 0
+    while index < 3 {
+      let each = year - 1 + index
+      let starts = ruleDay(rule.start, each) * DAY + i32.toI64(rule.start.time) - i32.toI64(rule.standard)
+      let ends = ruleDay(rule.end, each) * DAY + i32.toI64(rule.end.time) - i32.toI64(rule.daylight)
+      if starts <= ends {
+        if starts <= second && starts >= previous {
+          previous = starts
+          previousStarts = true
+        }
+        if ends <= second && ends >= previous {
+          previous = ends
+          previousStarts = false
+        }
+      } else {
+        if ends <= second && ends >= previous {
+          previous = ends
+          previousStarts = false
+        }
+        if starts <= second && starts >= previous {
+          previous = starts
+          previousStarts = true
+        }
+      }
+      if starts > second && starts < next {
+        next = starts
+      }
+      if ends > second && ends < next {
+        next = ends
+      }
+      index = index + 1
+    }
+    let begin = if previous > floor { previous } else { floor }
+    if previousStarts {
+      return Span {
+        offset: rule.daylight,
+        daylight: true,
+        nameAt: rule.daylightNameAt,
+        nameLength: rule.daylightNameLength,
+        start: begin,
+        end: next,
+        inRule: true,
+      }
+    }
+    return Span {
+      offset: rule.standard,
+      daylight: false,
+      nameAt: rule.standardNameAt,
+      nameLength: rule.standardNameLength,
+      start: begin,
+      end: next,
+      inRule: true,
+    }
+  }
+}
+
+/// Writes the name of the zone and a short description of its table.
+impl Debug for Zone {
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    run Format.write(&mut formatter, b"Zone(")
+    run Format.write(&mut formatter, String.utf8Bytes(self.name()))
+    return run Format.write(&mut formatter, b")")
+  }
+}
+
+effect fn rejectData(reason: ZoneDataReason) -> never ! ZoneDataError {
+  fail ZoneDataError { reason: reason }
+}
+
+fn floorDivide(value: i64, by: i64) -> i64 {
+  let quotient = value / by
+  if value % by < 0 {
+    return quotient - 1
+  }
+  return quotient
+}
+
+// The day, counted from 1970-01-01, on which the rule date falls in `year`.
+fn ruleDay(date: RuleDate, year: i32) -> i64 {
+  let first = daysFromCivil(year, 1, 1)
+  if date.kind == 0 {
+    let day = u16.toI64(date.day)
+    if isLeapYear(year) && day >= 60 {
+      return first + day
+    }
+    return first + day - 1
+  }
+  if date.kind == 1 {
+    return first + u16.toI64(date.day)
+  }
+  let monthStart = daysFromCivil(year, date.month, 1)
+  // Sunday is 0 in a rule and 7 in the ISO numbering.
+  let weekday = u8.toI64(weekdayFromDays(monthStart)) % 7
+  let ahead = (u16.toI64(date.day) - weekday + 7) % 7
+  let mut day = monthStart + ahead + (u8.toI64(date.week) - 1) * 7
+  let monthEnd = monthStart + u8.toI64(daysInMonth(year, date.month))
+  while day >= monthEnd {
+    day = day - 7
+  }
+  return day
+}
+
+// Where the tables of a TZif file are.
+struct Layout {
+  blockAt: usize,
+  timeWidth: usize,
+  timeCount: usize,
+  typeCount: usize,
+  nameLength: usize,
+  ruleAt: usize,
+  ruleLength: usize,
+}
+
+impl Copy for Layout {}
+
+// The six counts of a TZif header, in the order of the file.
+struct Counts {
+  utcCount: u64,
+  standardCount: u64,
+  leapCount: u64,
+  timeCount: u64,
+  typeCount: u64,
+  nameLength: u64,
+}
+
+impl Copy for Counts {}
+
+fn readCounts(data: &[u8], at: usize) -> Counts {
+  return Counts {
+    utcCount: u32.toU64(readU32BigEndian(data, at + 20)),
+    standardCount: u32.toU64(readU32BigEndian(data, at + 24)),
+    leapCount: u32.toU64(readU32BigEndian(data, at + 28)),
+    timeCount: u32.toU64(readU32BigEndian(data, at + 32)),
+    typeCount: u32.toU64(readU32BigEndian(data, at + 36)),
+    nameLength: u32.toU64(readU32BigEndian(data, at + 40)),
+  }
+}
+
+fn hasMagic(data: &[u8], at: usize) -> bool {
+  return data[at] == 84 && data[at + 1] == 90 && data[at + 2] == 105 && data[at + 3] == 102
+}
+
+// The size of a data block with these counts and transition times of `width` bytes.
+fn blockSize(counts: Counts, width: u64) -> u64 {
+  return counts.timeCount * width + counts.timeCount + counts.typeCount * 6 + counts.nameLength
+    + counts.leapCount * (width + 4)
+    + counts.standardCount
+    + counts.utcCount
+}
+
+fn readLayout(data: &[u8]) -> Result<Layout, ZoneDataReason> {
+  let length = usize.toU64(data.length)
+  if data.length < 44 {
+    if data.length >= 4 && hasMagic(data, 0) {
+      return Result<Layout, ZoneDataReason>.failResult(ZoneDataReason.Truncated)
+    }
+    return Result<Layout, ZoneDataReason>.failResult(ZoneDataReason.NotTzif)
+  }
+  if !hasMagic(data, 0) {
+    return Result<Layout, ZoneDataReason>.failResult(ZoneDataReason.NotTzif)
+  }
+  let mut counts = readCounts(data, 0)
+  let mut width: u64 = 4
+  let mut blockAt: u64 = 44
+  if data[4] != 0 {
+    // Version 2 or later: the 32-bit block is followed by a second header and a 64-bit block.
+    let second = 44 + blockSize(counts, 4)
+    if second + 44 > length {
+      return Result<Layout, ZoneDataReason>.failResult(ZoneDataReason.Truncated)
+    }
+    let secondAt = u64.toUsize(second)
+    if !hasMagic(data, secondAt) {
+      return Result<Layout, ZoneDataReason>.failResult(ZoneDataReason.NotTzif)
+    }
+    counts = readCounts(data, secondAt)
+    width = 8
+    blockAt = second + 44
+  }
+  let blockEnd = blockAt + blockSize(counts, width)
+  if blockEnd > length {
+    return Result<Layout, ZoneDataReason>.failResult(ZoneDataReason.Truncated)
+  }
+  if counts.leapCount != 0 {
+    return Result<Layout, ZoneDataReason>.failResult(ZoneDataReason.LeapSeconds)
+  }
+  if counts.typeCount == 0 || counts.typeCount > 256 || counts.nameLength == 0 {
+    return Result<Layout, ZoneDataReason>.failResult(ZoneDataReason.InvalidTable)
+  }
+  let mut ruleAt = u64.toUsize(blockEnd)
+  let mut ruleLength = usize.ZERO
+  if width == 8 {
+    // The footer is the rule between two newlines.
+    if ruleAt >= data.length || data[ruleAt] != 10 {
+      return Result<Layout, ZoneDataReason>.failResult(ZoneDataReason.Truncated)
+    }
+    ruleAt = ruleAt + 1
+    while ruleAt + ruleLength < data.length && data[ruleAt + ruleLength] != 10 {
+      ruleLength = ruleLength + 1
+    }
+    if ruleAt + ruleLength >= data.length {
+      return Result<Layout, ZoneDataReason>.failResult(ZoneDataReason.Truncated)
+    }
+  }
+  return Result<Layout, ZoneDataReason>.succeed(
+    Layout {
+      blockAt: u64.toUsize(blockAt),
+      timeWidth: u64.toUsize(width),
+      timeCount: u64.toUsize(counts.timeCount),
+      typeCount: u64.toUsize(counts.typeCount),
+      nameLength: u64.toUsize(counts.nameLength),
+      ruleAt: ruleAt,
+      ruleLength: ruleLength,
+    },
+  )
+}
+
+// Checks the tables of `zone`, whose positions are offsets in `tables`.
+fn checkTables(zone: &Zone, tables: &[u8]) -> Option<ZoneDataReason> {
+  let mut index = usize.ZERO
+  let mut previous = i64.MIN
+  while index < zone.timeCount {
+    let time = zone.timeAt(tables, index)
+    if index > 0 && time <= previous {
+      return Option<ZoneDataReason>.some(ZoneDataReason.InvalidTable)
+    }
+    previous = time
+    if u8.toUsize(tables[zone.indexesAt + index]) >= zone.typeCount {
+      return Option<ZoneDataReason>.some(ZoneDataReason.InvalidTable)
+    }
+    index = index + 1
+  }
+  index = 0
+  while index < zone.namesLength {
+    if tables[zone.namesAt + index] >= 128 {
+      return Option<ZoneDataReason>.some(ZoneDataReason.InvalidTable)
+    }
+    index = index + 1
+  }
+  if tables[zone.namesAt + zone.namesLength - 1] != 0 {
+    return Option<ZoneDataReason>.some(ZoneDataReason.InvalidTable)
+  }
+  index = 0
+  while index < zone.typeCount {
+    let at = zone.typesAt + index * 6
+    let offset = u32.wrappingToI32(readU32BigEndian(tables, at))
+    if offset <= -86400 || offset >= 86400 || tables[at + 4] > 1
+      || u8.toUsize(tables[at + 5]) >= zone.namesLength {
+      return Option<ZoneDataReason>.some(ZoneDataReason.InvalidTable)
+    }
+    index = index + 1
+  }
+  return Option<ZoneDataReason>.none()
+}
+
+// A reader of a POSIX rule that keeps the first failure.
+struct RuleReader<'text> {
+  text: &'text [u8],
+  at: usize,
+  failed: bool,
+}
+
+impl<'text> RuleReader<'text> {
+  fn peek(self: &Self) -> u8 {
+    if self.at < self.text.length {
+      return self.text[self.at]
+    }
+    return 0
+  }
+
+  // Reads a name and returns its length; the name starts at the returned `at` of the caller.
+  fn name(self: &mut Self, start: &mut usize) -> usize {
+    let mut length = usize.ZERO
+    if self.peek() == 60 {
+      self.at = self.at + 1
+      start.* = self.at
+      while self.peek() != 62 {
+        let byte = self.peek()
+        let allowed = isLetter(byte) || isDigit(byte) || byte == 43 || byte == 45
+        if !allowed {
+          self.failed = true
+          return 0
+        }
+        self.at = self.at + 1
+        length = length + 1
+      }
+      self.at = self.at + 1
+    } else {
+      start.* = self.at
+      while isLetter(self.peek()) {
+        self.at = self.at + 1
+        length = length + 1
+      }
+    }
+    if length < 3 {
+      self.failed = true
+    }
+    return length
+  }
+
+  // Reads up to `most` digits, at least one.
+  fn number(self: &mut Self, most: usize) -> i32 {
+    let mut value = 0
+    let mut count = usize.ZERO
+    while count < most && isDigit(self.peek()) {
+      value = value * 10 + u8.toI32(self.peek() - 48)
+      self.at = self.at + 1
+      count = count + 1
+    }
+    if count == 0 {
+      self.failed = true
+    }
+    return value
+  }
+
+  // Reads `[+-]h[:mm[:ss]]` as seconds, with at most `hourDigits` digits and `mostHours` hours.
+  fn clock(self: &mut Self, hourDigits: usize, mostHours: i32) -> i32 {
+    let mut negative = false
+    if self.peek() == 45 {
+      negative = true
+      self.at = self.at + 1
+    } else if self.peek() == 43 {
+      self.at = self.at + 1
+    }
+    let hours = self.number(hourDigits)
+    let mut minutes = 0
+    let mut seconds = 0
+    if self.peek() == 58 {
+      self.at = self.at + 1
+      minutes = self.number(2)
+      if self.peek() == 58 {
+        self.at = self.at + 1
+        seconds = self.number(2)
+      }
+    }
+    if hours > mostHours || minutes > 59 || seconds > 59 {
+      self.failed = true
+    }
+    let total = hours * 3600 + minutes * 60 + seconds
+    if negative {
+      return -total
+    }
+    return total
+  }
+
+  fn date(self: &mut Self) -> RuleDate {
+    let mut result = RuleDate { kind: 0, month: 1, week: 1, day: 1, time: 7200 }
+    if self.peek() == 77 {
+      self.at = self.at + 1
+      let month = self.number(2)
+      self.expect(46)
+      let week = self.number(1)
+      self.expect(46)
+      let day = self.number(1)
+      if month < 1 || month > 12 || week < 1 || week > 5 || day > 6 {
+        self.failed = true
+        return result
+      }
+      result.kind = 2
+      result.month = i32.toU8(month)
+      result.week = i32.toU8(week)
+      result.day = i32.toU16(day)
+    } else if self.peek() == 74 {
+      self.at = self.at + 1
+      let day = self.number(3)
+      if day < 1 || day > 365 {
+        self.failed = true
+        return result
+      }
+      result.kind = 0
+      result.day = i32.toU16(day)
+    } else {
+      let day = self.number(3)
+      if day > 365 {
+        self.failed = true
+        return result
+      }
+      result.kind = 1
+      result.day = i32.toU16(day)
+    }
+    if self.peek() == 47 {
+      self.at = self.at + 1
+      result.time = self.clock(3, 167)
+    }
+    return result
+  }
+
+  fn expect(self: &mut Self, byte: u8) -> () {
+    if self.peek() == byte {
+      self.at = self.at + 1
+    } else {
+      self.failed = true
+    }
+    return ()
+  }
+}
+
+fn isLetter(byte: u8) -> bool {
+  return (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
+}
+
+fn isDigit(byte: u8) -> bool {
+  return byte >= 48 && byte <= 57
+}
+
+// Reads a POSIX rule. Name positions in the result are offsets in `text` plus `base`.
+fn parseRule(text: &[u8], base: usize) -> Option<Rule> {
+  let mut reader = RuleReader { text: text, at: 0, failed: false }
+  let never = RuleDate { kind: 0, month: 0, week: 0, day: 0, time: 0 }
+  let mut rule = Rule {
+    present: true,
+    hasDaylight: false,
+    standard: 0,
+    daylight: 0,
+    standardNameAt: 0,
+    standardNameLength: 0,
+    daylightNameAt: 0,
+    daylightNameLength: 0,
+    start: never,
+    end: never,
+  }
+  let mut nameAt = usize.ZERO
+  rule.standardNameLength = reader.name(&mut nameAt)
+  rule.standardNameAt = base + nameAt
+  // The text gives hours west of UTC; the rule keeps seconds east.
+  rule.standard = -reader.clock(2, 24)
+  if !reader.failed && reader.at < text.length {
+    rule.hasDaylight = true
+    rule.daylightNameLength = reader.name(&mut nameAt)
+    rule.daylightNameAt = base + nameAt
+    rule.daylight = rule.standard + 3600
+    if reader.peek() != 44 {
+      rule.daylight = -reader.clock(2, 24)
+    }
+    reader.expect(44)
+    rule.start = reader.date()
+    reader.expect(44)
+    rule.end = reader.date()
+  }
+  if reader.failed || reader.at != text.length {
+    return Option<Rule>.none()
+  }
+  if rule.standard <= -86400 || rule.standard >= 86400 || rule.daylight <= -86400
+    || rule.daylight >= 86400 {
+    return Option<Rule>.none()
+  }
+  return Option<Rule>.some(rule)
+}

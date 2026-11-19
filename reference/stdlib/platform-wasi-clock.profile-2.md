@@ -34,11 +34,21 @@ impl WasiClock
 ### Associated function `now`
 
 ```silk
-pub effect fn now(monotonic: bool) -> Instant
+pub effect fn now() -> Mark
 ```
 
-Returns monotonic time when `monotonic` is true, otherwise Unix time.
-A host failure traps.
+Returns the reading of the monotonic clock. A host failure traps.
+
+<a id="WasiClock.impl.systemNow"></a>
+
+### Associated function `systemNow`
+
+```silk
+pub effect fn systemNow() -> Instant
+```
+
+Returns the date and time of the wall clock. A host failure or a time that is not valid
+traps.
 
 <a id="WasiClock.impl.resolution"></a>
 
@@ -55,7 +65,7 @@ Returns the selected clock's resolution in nanoseconds. Zero or a host failure t
 ### Associated function `waitUntil`
 
 ```silk
-pub effect fn waitUntil(when: Instant) -> ()
+pub effect fn waitUntil(when: Mark) -> ()
 ```
 
 Blocks until the monotonic deadline. A negative or unrepresentable deadline traps.

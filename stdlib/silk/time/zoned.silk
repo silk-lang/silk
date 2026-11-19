@@ -1,0 +1,853 @@
+//! Instants seen in a time zone: the [`ZonedDateTime`] type, and [`ZonedText`] for its RFC 9557
+//! text such as `2026-11-19T15:36:22-03:00[America/Sao_Paulo]`.
+//!
+//! # When to use
+//!
+//! Use a [`ZonedDateTime`] when a point in time must keep the place it belongs to: a meeting, a
+//! departure, a time shown to a person. It gives the local date and time, and it finds the
+//! instant of a local time with the daylight saving rules of the zone. For a point in time
+//! without a place, use `Instant`. For a date and time on no timeline, use `PlainDateTime`.
+//!
+//! # Details
+//!
+//! A `ZonedDateTime` is an `Instant` and a borrowed `Zone`, so it is `Copy`, and it cannot
+//! outlive the zone. Get the zone from the `TimeZones` service of `silk.time.zones`.
+//!
+//! To read text, first parse it with [`ZonedText.parse`], which needs no zone. Then load the
+//! zone that the text names, and call [`ZonedDateTime.fromText`]. The two steps are separate
+//! because loading a zone is an effect and parsing is not.
+//!
+//! # Errors
+//!
+//! - `TimeParseError` from [`ZonedText.parse`].
+//! - `LocalTimeError` from [`ZonedDateTime.fromLocal`] and [`ZonedDateTime.fromText`].
+//!
+//! # Examples
+//!
+//! ## Show an instant in a zone, and read a local time
+//!
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.core.effect { Effect }
+//! import silk.core.result { Result }
+//! import silk.time.instant { Instant }
+//! import silk.time.plain_date_time { PlainDateTime }
+//! import silk.time.zone { Disambiguation, LocalTimeError, Zone, ZoneDataError }
+//! import silk.time.zoned { ZonedDateTime }
+//!
+//! effect fn check() -> i32 ! ZoneDataError | OutOfMemoryError ? &mut Allocator {
+//!   let rome = run Zone.fromPosixRule("CET-1CEST,M3.5.0,M10.5.0/3")
+//!   let seen = ZonedDateTime.make(Instant.fromUnixSeconds(1795109782), &rome)
+//!   if seen.time().hour() != 18 || seen.offset().totalSeconds() != 3600 {
+//!     return 1
+//!   }
+//!   let noon = PlainDateTime.fromFields(2027, 7, 1, 12, 0, 0)
+//!   match ZonedDateTime.fromLocal(noon, &rome, Disambiguation.Compatible) {
+//!     Result<ZonedDateTime, LocalTimeError>.Success { value } => {
+//!       // Summer time is two hours ahead of UTC.
+//!       if value.instant().toUtc().time().hour() != 10 {
+//!         return 2
+//!       }
+//!     }
+//!     Result<ZonedDateTime, LocalTimeError>.Failure { error: _ } => {
+//!       return 3
+//!     }
+//!   }
+//!   return 0
+//! }
+//!
+//! effect fn failed(error: ZoneDataError | OutOfMemoryError) -> i32 {
+//!   return 9
+//! }
+//!
+//! pub effect fn main() -> i32 {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   return run Effect.catchAll(check(), failed) |> Effect.provideMut<Allocator>(&mut allocator)
+//! }
+//! ```
+//!
+//! @category Time
+import silk.collections.slice { Slice }
+import silk.core.equal { Equal }
+import silk.core.ops { Add, Subtract }
+import silk.core.option { Option }
+import silk.core.order { Ordering }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.io.writer { Writer, WriterError }
+import silk.text.format { Debug, Display, Format, Formatter }
+import silk.text.string { String }
+import silk.time.duration { Duration }
+import silk.time.instant { Instant }
+import silk.time.offset { UtcOffset }
+import silk.time.period { DateUnit, Overflow, Period }
+import silk.time.plain_date { PlainDate }
+import silk.time.plain_date_time { PlainDateTime }
+import silk.time.plain_time { PlainTime }
+import silk.time.rounding { RoundingMode, TimeIncrement, TimeUnit }
+import silk.time.text as Text
+import silk.time.text { OffsetKind, Scanner, TimeParseError, TimeParseReason }
+import silk.time.zone { Disambiguation, LocalTimeError, Zone }
+import silk.num.i32
+import silk.num.i64
+import silk.num.usize
+
+/// What [`ZonedDateTime.fromText`] does when a text states a UTC offset that its zone does not
+/// have at that local time, which happens when the rules of a zone change after the text was
+/// written.
+pub enum OffsetConflict {
+  /// Keep the instant that the offset in the text gives. The local time can change.
+  Use,
+  /// Do not read the offset. Keep the local time and find the instant in the zone.
+  Ignore,
+  /// Use the offset if the zone has it at that local time. If not, keep the local time and find
+  /// the instant in the zone.
+  Prefer,
+  /// Fail with `LocalTimeError.OffsetMismatch` if the zone does not have the offset at that
+  /// local time.
+  Reject,
+}
+
+/// An instant seen in a time zone.
+///
+/// # Details
+///
+/// The value is an `Instant`, a borrowed `Zone`, and the UTC offset of the zone at that instant.
+/// `==` is true for the same instant in zones with the same name. `+` and `-` with a `Duration`
+/// move along the timeline, and trap when the result is outside the range of `Instant`. `-`
+/// between two values gives the `Duration` between their instants. `Display` writes RFC 9557
+/// text such as `2026-11-19T15:36:22-03:00[America/Sao_Paulo]`.
+pub struct ZonedDateTime<'z> {
+  point: Instant,
+  rules: &'z Zone,
+  shift: UtcOffset,
+}
+
+impl<'z> Copy for ZonedDateTime<'z> {}
+
+impl<'z> ZonedDateTime<'z> {
+  /// Returns the instant `instant` as seen in `zone`.
+  pub fn make(instant: Instant, zone: &'z Zone) -> ZonedDateTime<'z> {
+    return ZonedDateTime { point: instant, rules: zone, shift: zone.offsetAt(instant) }
+  }
+
+  /// Returns the instant at which a clock in `zone` shows the date and time `local`, and uses
+  /// `choice` when the time does not name exactly one instant.
+  ///
+  /// # Errors
+  ///
+  /// - `LocalTimeError.Skipped` or `LocalTimeError.Repeated` if `choice` is
+  ///   `Disambiguation.Reject` and the time names no instant or two.
+  /// - `LocalTimeError.OutOfRange` if the instant is outside the range of `Instant`.
+  pub fn fromLocal(
+    local: PlainDateTime,
+    zone: &'z Zone,
+    choice: Disambiguation
+  ) -> Result<ZonedDateTime<'z>, LocalTimeError> {
+    return match zone.resolve(local, choice) {
+      Result<Instant, LocalTimeError>.Success { value } => Result<ZonedDateTime<'z>, LocalTimeError>.succeed(
+        ZonedDateTime.make(value, zone),
+      )
+      Result<Instant, LocalTimeError>.Failure { error } => Result<ZonedDateTime<'z>, LocalTimeError>.failResult(
+        error,
+      )
+    }
+  }
+
+  /// Returns the value that the parsed text `text` names in `zone`.
+  ///
+  /// # Details
+  ///
+  /// `zone` must be the zone that [`ZonedText.zoneName`] names; this function does not compare
+  /// the names. A text with `Z` gives that instant. A text with a numeric offset is read as
+  /// `conflict` says. An offset without seconds also matches a zone offset that rounds to it,
+  /// because the text of a `ZonedDateTime` rounds its offset to the minute. A text without an
+  /// offset gives the local time, with `choice` for a time that does not name exactly one
+  /// instant. A text without a time gives the start of the day.
+  ///
+  /// # Errors
+  ///
+  /// - `LocalTimeError.OffsetMismatch` if `conflict` is `OffsetConflict.Reject` and the zone does
+  ///   not have the offset of the text at that local time.
+  /// - `LocalTimeError.Skipped` or `LocalTimeError.Repeated` if `choice` is
+  ///   `Disambiguation.Reject` and the local time names no instant or two.
+  /// - `LocalTimeError.OutOfRange` if the instant is outside the range of `Instant`.
+  pub fn fromText(
+    text: &ZonedText<'_>,
+    zone: &'z Zone,
+    conflict: OffsetConflict,
+    choice: Disambiguation
+  ) -> Result<ZonedDateTime<'z>, LocalTimeError> {
+    let local = text.local
+    if !text.timeGiven {
+      return match zone.startOfDay(local.date()) {
+        Option<Instant>.Some { value } => succeed(value, zone)
+        Option<Instant>.None => Result<ZonedDateTime<'z>, LocalTimeError>.failResult(LocalTimeError.OutOfRange)
+      }
+    }
+    match text.offsetKind {
+      OffsetKind.Utc => {
+        return fromOffset(local, UtcOffset.utc(), zone)
+      }
+      OffsetKind.Absent => {
+        return ZonedDateTime.fromLocal(local, zone, choice)
+      }
+      OffsetKind.Numeric => {}
+    }
+    let ignore = match conflict {
+      OffsetConflict.Ignore => true
+      _ => false
+    }
+    if ignore {
+      return ZonedDateTime.fromLocal(local, zone, choice)
+    }
+    let use = match conflict {
+      OffsetConflict.Use => true
+      _ => false
+    }
+    if use {
+      return fromOffset(local, UtcOffset.fromSeconds(text.offsetSeconds), zone)
+    }
+    let found = zone.candidates(local)
+    if found.count >= 1 && offsetMatches(zone.offsetAt(found.earlier).totalSeconds(), text.offsetSeconds) {
+      return succeed(found.earlier, zone)
+    }
+    if found.count >= 2 && offsetMatches(zone.offsetAt(found.later).totalSeconds(), text.offsetSeconds) {
+      return succeed(found.later, zone)
+    }
+    return match conflict {
+      OffsetConflict.Reject => Result<ZonedDateTime<'z>, LocalTimeError>.failResult(LocalTimeError.OffsetMismatch)
+      _ => ZonedDateTime.fromLocal(local, zone, choice)
+    }
+  }
+
+  /// Returns the instant.
+  pub fn instant(self: Self) -> Instant {
+    return self.point
+  }
+
+  /// Returns the zone.
+  pub fn zone(self: Self) -> &'z Zone {
+    return self.rules
+  }
+
+  /// Returns the UTC offset of the zone at this instant.
+  pub fn offset(self: Self) -> UtcOffset {
+    return self.shift
+  }
+
+  /// Returns the date and time that a clock in the zone shows at this instant.
+  pub fn toPlainDateTime(self: Self) -> PlainDateTime {
+    return self.point.toOffset(self.shift)
+  }
+
+  /// Returns the date that a calendar in the zone shows at this instant.
+  pub fn date(self: Self) -> PlainDate {
+    return self.toPlainDateTime().date()
+  }
+
+  /// Returns the time of day that a clock in the zone shows at this instant.
+  pub fn time(self: Self) -> PlainTime {
+    return self.toPlainDateTime().time()
+  }
+
+  /// Returns the abbreviation of the zone at this instant, such as `CET` or `-03`.
+  pub fn abbreviation(self: Self) -> string {
+    return self.rules.abbreviationAt(self.point)
+  }
+
+  /// Returns `true` if daylight saving time is in effect in the zone at this instant.
+  pub fn isDaylight(self: Self) -> bool {
+    return self.rules.isDaylightAt(self.point)
+  }
+
+  /// Returns the same instant as seen in `zone`.
+  pub fn withZone<'other>(self: Self, zone: &'other Zone) -> ZonedDateTime<'other> {
+    return ZonedDateTime.make(self.point, zone)
+  }
+
+  /// Returns the value in the same zone whose clock shows `local`, and uses `choice` when the
+  /// time does not name exactly one instant.
+  ///
+  /// # Errors
+  ///
+  /// - `LocalTimeError`, as for [`ZonedDateTime.fromLocal`].
+  pub fn withLocal(self: Self, local: PlainDateTime, choice: Disambiguation) -> Result<ZonedDateTime<'z>, LocalTimeError> {
+    return ZonedDateTime.fromLocal(local, self.rules, choice)
+  }
+
+  /// Returns the first instant of this local day in the zone, or `None` if it is outside the
+  /// range of `Instant`.
+  ///
+  /// # Details
+  ///
+  /// This is midnight on most days. On a day when clocks go forward over midnight, the day
+  /// starts when the clock shows a later time.
+  pub fn startOfDay(self: Self) -> Option<ZonedDateTime<'z>> {
+    return match self.rules.startOfDay(self.date()) {
+      Option<Instant>.Some { value } => Option<ZonedDateTime<'z>>.some(ZonedDateTime.make(value, self.rules))
+      Option<Instant>.None => Option<ZonedDateTime<'z>>.none()
+    }
+  }
+
+  /// Returns the value `span` later on the timeline, or earlier for a negative span, or `None`
+  /// when it is outside the range of `Instant`.
+  ///
+  /// # Details
+  ///
+  /// The span is exact elapsed time. Across a change of offset, the local time moves by a
+  /// different amount: one hour after 01:30 on a day when clocks go forward at 02:00 is 03:30.
+  pub fn checkedAdd(self: Self, span: Duration) -> Option<ZonedDateTime<'z>> {
+    return match self.point.checkedAdd(span) {
+      Option<Instant>.Some { value } => Option<ZonedDateTime<'z>>.some(ZonedDateTime.make(value, self.rules))
+      Option<Instant>.None => Option<ZonedDateTime<'z>>.none()
+    }
+  }
+
+  /// Returns the value `span` earlier on the timeline, or later for a negative span, or `None`
+  /// when it is outside the range of `Instant`.
+  pub fn checkedSubtract(self: Self, span: Duration) -> Option<ZonedDateTime<'z>> {
+    return match self.point.checkedSubtract(span) {
+      Option<Instant>.Some { value } => Option<ZonedDateTime<'z>>.some(ZonedDateTime.make(value, self.rules))
+      Option<Instant>.None => Option<ZonedDateTime<'z>>.none()
+    }
+  }
+
+  /// Returns the value with its local time rounded to a multiple of `step` from midnight, or
+  /// `None` when the result is outside the range.
+  ///
+  /// # Details
+  ///
+  /// The local date and time are rounded as [`PlainDateTime.round`] does, and the result keeps
+  /// the UTC offset of this value when the zone has that offset at the rounded time. So a time
+  /// in the repeated hour of an autumn change stays on its side of the change. A rounded time
+  /// that a change skips moves forward by the length of the gap.
+  ///
+  /// `TimeIncrement.one(TimeUnit.Day)` rounds to the start of this day or of the next day in
+  /// the zone, by the real length of the day, which is 23 or 25 hours on the day of a change.
+  ///
+  /// # Examples
+  ///
+  /// ```silk
+  /// import silk.core.result { Result }
+  /// import silk.time.plain_date_time { PlainDateTime }
+  /// import silk.time.rounding { RoundingMode, TimeIncrement, TimeUnit }
+  /// import silk.time.zone { Disambiguation, LocalTimeError, Zone }
+  /// import silk.time.zoned { ZonedDateTime }
+  ///
+  /// pub fn main() -> i32 {
+  ///   let zone = Zone.utc()
+  ///   let local = PlainDateTime.fromFields(2026, 11, 19, 15, 36, 22)
+  ///   match ZonedDateTime.fromLocal(local, &zone, Disambiguation.Compatible) {
+  ///     Result<ZonedDateTime, LocalTimeError>.Success { value } => {
+  ///       let hour = value.round(TimeIncrement.one(TimeUnit.Hour), RoundingMode.HalfExpand)
+  ///       if &hour.toPlainDateTime() != &PlainDateTime.fromFields(2026, 11, 19, 16, 0, 0) {
+  ///         return 1
+  ///       }
+  ///       return 0
+  ///     }
+  ///     Result<ZonedDateTime, LocalTimeError>.Failure { error: _ } => {
+  ///       return 2
+  ///     }
+  ///   }
+  /// }
+  /// ```
+  pub fn checkedRound(self: Self, step: TimeIncrement, mode: RoundingMode) -> Option<ZonedDateTime<'z>> {
+    if step.nanoseconds() == TimeIncrement.one(TimeUnit.Day).nanoseconds() {
+      return self.roundToDay(mode)
+    }
+    let local = match self.toPlainDateTime().checkedRound(step, mode) {
+      Option<PlainDateTime>.Some { value } => value
+      Option<PlainDateTime>.None => {
+        return Option<ZonedDateTime<'z>>.none()
+      }
+    }
+    return self.resolveKeepingOffset(local)
+  }
+
+  /// Returns the value with its local time rounded to a multiple of `step` from midnight.
+  ///
+  /// # Gotchas
+  ///
+  /// A result outside the range traps. [`ZonedDateTime.checkedRound`] returns `None` instead,
+  /// and describes the rounding.
+  pub fn round(self: Self, step: TimeIncrement, mode: RoundingMode) -> ZonedDateTime<'z> {
+    return orTrap<'z>(self.checkedRound(step, mode), "ZonedDateTime.round: the value is outside the range")
+  }
+
+  /// Returns the value `period` later, or earlier for a negative period, or `None` when the
+  /// result is outside the range or `overflow` rejects a day of the month.
+  ///
+  /// # Details
+  ///
+  /// The years, months, weeks, and days move the local date and keep the local time, so one day
+  /// later is the same time on the clock on the next day, also over a daylight saving change. A
+  /// local time that a change skips moves forward by the length of the gap, and a repeated one
+  /// is the earlier of the two. The time part of the period is then added as an exact span.
+  ///
+  /// A period with only a time part moves along the timeline, as `+` with a `Duration` does.
+  pub fn checkedAddPeriod(self: Self, period: Period, overflow: Overflow) -> Option<ZonedDateTime<'z>> {
+    if period.isTimeOnly() {
+      return self.checkedAdd(period.time())
+    }
+    let local = self.toPlainDateTime()
+    let date = match local.date().checkedAddPeriod(period.dateOnly(), overflow) {
+      Option<PlainDate>.Some { value } => value
+      Option<PlainDate>.None => {
+        return Option<ZonedDateTime<'z>>.none()
+      }
+    }
+    let moved = match PlainDateTime.checkedMake(date, local.time()) {
+      Option<PlainDateTime>.Some { value } => value
+      Option<PlainDateTime>.None => {
+        return Option<ZonedDateTime<'z>>.none()
+      }
+    }
+    return match self.rules.resolve(moved, Disambiguation.Compatible) {
+      Result<Instant, LocalTimeError>.Success { value } => ZonedDateTime.make(value, self.rules).checkedAdd(
+        period.time(),
+      )
+      Result<Instant, LocalTimeError>.Failure { error: _ } => Option<ZonedDateTime<'z>>.none()
+    }
+  }
+
+  /// Returns the value `period` later, or earlier for a negative period. A day of the month that
+  /// the reached month does not have becomes its last day.
+  ///
+  /// # Gotchas
+  ///
+  /// A result outside the range traps. [`ZonedDateTime.checkedAddPeriod`] returns `None`
+  /// instead, and describes the arithmetic.
+  ///
+  /// # Examples
+  ///
+  /// ```silk
+  /// import silk.core.result { Result }
+  /// import silk.time.period { Period }
+  /// import silk.time.plain_date_time { PlainDateTime }
+  /// import silk.time.zone { Disambiguation, LocalTimeError, Zone }
+  /// import silk.time.zoned { ZonedDateTime }
+  ///
+  /// pub fn main() -> i32 {
+  ///   let zone = Zone.utc()
+  ///   let local = PlainDateTime.fromFields(2027, 1, 31, 9, 0, 0)
+  ///   match ZonedDateTime.fromLocal(local, &zone, Disambiguation.Compatible) {
+  ///     Result<ZonedDateTime, LocalTimeError>.Success { value } => {
+  ///       let later = value.addPeriod(Period.ofMonths(1))
+  ///       if &later.toPlainDateTime() != &PlainDateTime.fromFields(2027, 2, 28, 9, 0, 0) {
+  ///         return 1
+  ///       }
+  ///       return 0
+  ///     }
+  ///     Result<ZonedDateTime, LocalTimeError>.Failure { error: _ } => {
+  ///       return 2
+  ///     }
+  ///   }
+  /// }
+  /// ```
+  pub fn addPeriod(self: Self, period: Period) -> ZonedDateTime<'z> {
+    return orTrap<'z>(
+      self.checkedAddPeriod(period, Overflow.Constrain),
+      "ZonedDateTime.addPeriod: the value is outside the range",
+    )
+  }
+
+  /// Returns the period from this value to `other`, with `largest` as its largest unit. The
+  /// period is negative when `other` is earlier.
+  ///
+  /// # Details
+  ///
+  /// Both values are read in the zone of this value. The date part counts whole years, months,
+  /// weeks, or days on the calendar of the zone, and the time part is the exact span that
+  /// remains. So from noon on the day before a daylight saving change to noon on the day after
+  /// is two days, and [`ZonedDateTime.until`] gives the 47 or 49 hours between the instants.
+  ///
+  /// `self.addPeriod(self.periodUntil(other, largest))` is `other`. Two values on the same local
+  /// date have a period with only a time part.
+  pub fn periodUntil<'other>(self: Self, other: ZonedDateTime<'other>, largest: DateUnit) -> Period {
+    let direction = self.point.until(other.point).sign()
+    if direction == 0 {
+      return Period.zero()
+    }
+    let whole = self.point.until(other.point)
+    let start = self.toPlainDateTime()
+    let end = other.point.toOffset(self.rules.offsetAt(other.point))
+    if &start.date() == &end.date() {
+      return Period.ofTime(whole)
+    }
+    // The time of day of the start is put on a day at or next to the end day, and that day
+    // moves back toward the start until the rest of the way has the direction of the whole.
+    let mut correction: i64 = 0
+    if start.time().until(end.time()).sign() == -direction {
+      correction = 1
+    }
+    let limit: i64 = if direction == 1 { 2 } else { 1 }
+    while correction <= limit {
+      let day = match end.date().checkedAddDays(-i32.toI64(direction) * correction) {
+        Option<PlainDate>.Some { value } => value
+        Option<PlainDate>.None => {
+          return Period.ofTime(whole)
+        }
+      }
+      // On its own day the start stands for itself, also when it is the later of two equal
+      // local times.
+      let between = if &day == &start.date() {
+        self.point
+      } else {
+        match self.rules.resolve(PlainDateTime.make(day, start.time()), Disambiguation.Compatible) {
+          Result<Instant, LocalTimeError>.Success { value } => value
+          Result<Instant, LocalTimeError>.Failure { error: _ } => {
+            return Period.ofTime(whole)
+          }
+        }
+      }
+      let rest = between.until(other.point)
+      if rest.sign() != -direction {
+        let dates = start.date().periodUntil(day, largest)
+        if dates.sign() == -direction {
+          // The clocks went back over midnight between the two values, so the dates go against
+          // the instants.
+          return Period.ofTime(whole)
+        }
+        return Period.make(dates.years(), dates.months(), dates.weeks(), dates.days(), rest)
+      }
+      correction = correction + 1
+    }
+    return Period.ofTime(whole)
+  }
+
+  // The start of this day or of the next day in the zone, by the real length of the day.
+  fn roundToDay(self: Self, mode: RoundingMode) -> Option<ZonedDateTime<'z>> {
+    let today = self.date()
+    let start = match self.rules.startOfDay(today) {
+      Option<Instant>.Some { value } => value
+      Option<Instant>.None => {
+        return Option<ZonedDateTime<'z>>.none()
+      }
+    }
+    let passed = start.until(self.point)
+    if passed.isZero() {
+      return Option<ZonedDateTime<'z>>.some(self)
+    }
+    let tomorrow = match today.checkedAddDays(1) {
+      Option<PlainDate>.Some { value } => value
+      Option<PlainDate>.None => {
+        return Option<ZonedDateTime<'z>>.none()
+      }
+    }
+    let end = match self.rules.startOfDay(tomorrow) {
+      Option<Instant>.Some { value } => value
+      Option<Instant>.None => {
+        return Option<ZonedDateTime<'z>>.none()
+      }
+    }
+    let left = self.point.until(end)
+    let half = if &passed < &left { Ordering.Less } else { if &passed > &left { Ordering.Greater } else { Ordering.Equal } }
+    if mode.roundsUp(false, half, false) {
+      return Option<ZonedDateTime<'z>>.some(ZonedDateTime.make(end, self.rules))
+    }
+    return Option<ZonedDateTime<'z>>.some(ZonedDateTime.make(start, self.rules))
+  }
+
+  // The instant of `local` in the zone that has the offset of this value, or else the one that
+  // `Disambiguation.Compatible` gives.
+  fn resolveKeepingOffset(self: Self, local: PlainDateTime) -> Option<ZonedDateTime<'z>> {
+    let found = self.rules.candidates(local)
+    let wanted = self.shift.totalSeconds()
+    if found.count >= 1 && self.rules.offsetAt(found.earlier).totalSeconds() == wanted {
+      return Option<ZonedDateTime<'z>>.some(ZonedDateTime.make(found.earlier, self.rules))
+    }
+    if found.count >= 2 && self.rules.offsetAt(found.later).totalSeconds() == wanted {
+      return Option<ZonedDateTime<'z>>.some(ZonedDateTime.make(found.later, self.rules))
+    }
+    return match self.rules.resolve(local, Disambiguation.Compatible) {
+      Result<Instant, LocalTimeError>.Success { value } => Option<ZonedDateTime<'z>>.some(
+        ZonedDateTime.make(value, self.rules),
+      )
+      Result<Instant, LocalTimeError>.Failure { error: _ } => Option<ZonedDateTime<'z>>.none()
+    }
+  }
+
+  /// Returns the exact time from `earlier` to this value. It is negative if `earlier` is later.
+  /// The zones do not matter.
+  pub fn since<'other>(self: Self, earlier: ZonedDateTime<'other>) -> Duration {
+    return self.point.since(earlier.point)
+  }
+
+  /// Returns the exact time from this value to `later`. It is negative if `later` is earlier.
+  /// The zones do not matter.
+  pub fn until<'other>(self: Self, later: ZonedDateTime<'other>) -> Duration {
+    return self.point.until(later.point)
+  }
+
+  /// Writes the value as RFC 9557 text, as in `2026-11-19T15:36:22-03:00[America/Sao_Paulo]`,
+  /// at `output[at]`, and returns the offset after it.
+  ///
+  /// # Details
+  ///
+  /// The offset is rounded to the minute, as ECMAScript Temporal writes it. The text has a
+  /// fraction, without zeros at the end, when the nanosecond part is not zero. It is at most 40
+  /// bytes plus the length of the zone name.
+  ///
+  /// # Gotchas
+  ///
+  /// Traps if `output` is too short.
+  pub fn write(self: Self, output: &mut [u8], at: usize) -> usize {
+    let mut to = self.toPlainDateTime().write(&mut output, at)
+    to = Text.writeOffset(&mut output, to, roundToMinute(self.shift.totalSeconds()))
+    let name = String.utf8Bytes(self.rules.name())
+    output[to] = 91
+    to = to + 1
+    let mut index = usize.ZERO
+    while index < name.length {
+      output[to + index] = name[index]
+      index = index + 1
+    }
+    to = to + name.length
+    output[to] = 93
+    return to + 1
+  }
+
+  fn same(left: &ZonedDateTime<'z>, right: &ZonedDateTime<'z>) -> bool {
+    return &left.point == &right.point && left.rules.name() == right.rules.name()
+  }
+
+  fn addOperator(left: ZonedDateTime<'z>, right: Duration) -> ZonedDateTime<'z> {
+    return ZonedDateTime.make(left.point + right, left.rules)
+  }
+
+  fn subtractOperator(left: ZonedDateTime<'z>, right: Duration) -> ZonedDateTime<'z> {
+    return ZonedDateTime.make(left.point - right, left.rules)
+  }
+
+  fn differenceOperator(left: ZonedDateTime<'z>, right: ZonedDateTime<'z>) -> Duration {
+    return left.point.since(right.point)
+  }
+}
+
+impl<'z> Equal for ZonedDateTime<'z> {
+  equals: ZonedDateTime.same
+}
+
+impl<'z> Add<Duration, ZonedDateTime<'z>> for ZonedDateTime<'z> {
+  add: ZonedDateTime.addOperator
+}
+
+impl<'z> Subtract<Duration, ZonedDateTime<'z>> for ZonedDateTime<'z> {
+  subtract: ZonedDateTime.subtractOperator
+}
+
+impl<'z> Subtract<ZonedDateTime<'z>, Duration> for ZonedDateTime<'z> {
+  subtract: ZonedDateTime.differenceOperator
+}
+
+/// Writes RFC 9557 text: the local date and time, the UTC offset rounded to the minute, and the
+/// name of the zone in brackets, as in `2026-11-19T15:36:22-03:00[America/Sao_Paulo]`.
+impl<'z> Display for ZonedDateTime<'z> {
+  effect fn display(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    let mut output: [u8; 42] = [0; 42]
+    let mut length = self.toPlainDateTime().write(&mut output, 0)
+    length = Text.writeOffset(&mut output, length, roundToMinute(self.shift.totalSeconds()))
+    output[length] = 91
+    run Format.write(&mut formatter, Slice.view<u8>(&output, 0, length + 1))
+    run Format.write(&mut formatter, String.utf8Bytes(self.rules.name()))
+    return run Format.write(&mut formatter, b"]")
+  }
+}
+
+/// Writes the same text as `Display`.
+impl<'z> Debug for ZonedDateTime<'z> {
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return run Display.display(self, &mut formatter)
+  }
+}
+
+fn orTrap<'z>(result: Option<ZonedDateTime<'z>>, message: string<'static>) -> ZonedDateTime<'z> {
+  match result {
+    Option<ZonedDateTime<'z>>.Some { value } => {
+      return value
+    }
+    Option<ZonedDateTime<'z>>.None => {
+      return Intrinsic.trap(message)
+    }
+  }
+}
+
+fn succeed<'z>(instant: Instant, zone: &'z Zone) -> Result<ZonedDateTime<'z>, LocalTimeError> {
+  return Result<ZonedDateTime<'z>, LocalTimeError>.succeed(ZonedDateTime.make(instant, zone))
+}
+
+fn fromOffset<'z>(local: PlainDateTime, offset: UtcOffset, zone: &'z Zone) -> Result<ZonedDateTime<'z>, LocalTimeError> {
+  return match Instant.fromLocal(local, offset) {
+    Option<Instant>.Some { value } => succeed(value, zone)
+    Option<Instant>.None => Result<ZonedDateTime<'z>, LocalTimeError>.failResult(LocalTimeError.OutOfRange)
+  }
+}
+
+// Rounds an offset in seconds to the minute, with a half away from zero.
+// True for a byte that the name of a zone or an offset can have.
+fn isNameByte(byte: u8) -> bool {
+  return (byte >= 97 && byte <= 122)
+    || (byte >= 65 && byte <= 90)
+    || (byte >= 48 && byte <= 58)
+    || byte == 47
+    || byte == 95
+    || byte == 45
+    || byte == 43
+    || byte == 46
+}
+
+fn roundToMinute(seconds: i32) -> i32 {
+  if seconds < 0 {
+    return -((-seconds + 30) / 60 * 60)
+  }
+  return (seconds + 30) / 60 * 60
+}
+
+// True if a zone offset is the offset of a text, or rounds to it when the text has no seconds.
+fn offsetMatches(zoneSeconds: i32, textSeconds: i32) -> bool {
+  if zoneSeconds == textSeconds {
+    return true
+  }
+  return textSeconds % 60 == 0 && roundToMinute(zoneSeconds) == textSeconds
+}
+
+/// The parts of RFC 9557 text such as `2026-11-19T15:36:22-03:00[America/Sao_Paulo]`, read
+/// without a zone. [`ZonedDateTime.fromText`] turns it into a value.
+///
+/// # Details
+///
+/// The value borrows the text for the name of the zone.
+pub struct ZonedText<'text> {
+  local: PlainDateTime,
+  timeGiven: bool,
+  offsetKind: OffsetKind,
+  offsetSeconds: i32,
+  zone: &'text [u8],
+}
+
+impl<'text> Copy for ZonedText<'text> {}
+
+impl<'text> ZonedText<'text> {
+  /// Reads the parts of RFC 9557 text such as `2026-11-19T15:36:22-03:00[America/Sao_Paulo]`.
+  ///
+  /// # Details
+  ///
+  /// The text is a date, optionally a time, optionally `Z` or a numeric offset after the time,
+  /// and a time zone annotation in brackets. The annotation is required. Its content is not
+  /// checked against any list of zones. More annotations can follow, as for the other parsers.
+  ///
+  /// # Errors
+  ///
+  /// - `TimeParseReason.MissingZone` if the text has no time zone annotation.
+  /// - `TimeParseReason.UnexpectedCharacter` if the name of the zone has a byte that is not an
+  ///   ASCII letter, a digit, or one of `/`, `_`, `-`, `+`, `.`, and `:`.
+  /// - The other reasons, as for `PlainDateTime.parse`.
+  pub fn parse(text: string<'text>) -> Result<ZonedText<'text>, TimeParseError> {
+    return ZonedText.parseBytes(String.utf8Bytes(text))
+  }
+
+  /// Reads the parts of RFC 9557 text from bytes. See [`ZonedText.parse`].
+  ///
+  /// # Errors
+  ///
+  /// - `TimeParseError`, as for [`ZonedText.parse`].
+  pub fn parseBytes(bytes: &'text [u8]) -> Result<ZonedText<'text>, TimeParseError> {
+    let mut scanner = Scanner.make(bytes)
+    let parsed = scanner.dateTime()
+    match scanner.failure() {
+      Option<TimeParseError>.Some { value } => {
+        return Result<ZonedText<'text>, TimeParseError>.failResult(value)
+      }
+      Option<TimeParseError>.None => {}
+    }
+    let zone = scanner.zoneAnnotation()
+    if zone.length == 0 {
+      return Result<ZonedText<'text>, TimeParseError>.failResult(
+        TimeParseError { reason: TimeParseReason.MissingZone, offset: bytes.length },
+      )
+    }
+    let mut index = usize.ZERO
+    while index < zone.length {
+      if !isNameByte(zone[index]) {
+        // The zone annotation is the first one, so its name starts after the first `[` or `[!`.
+        let mut start = usize.ZERO
+        while start < bytes.length && bytes[start] != 91 {
+          start = start + 1
+        }
+        start = start + 1
+        if start < bytes.length && bytes[start] == 33 {
+          start = start + 1
+        }
+        return Result<ZonedText<'text>, TimeParseError>.failResult(
+          TimeParseError { reason: TimeParseReason.UnexpectedCharacter, offset: start + index },
+        )
+      }
+      index = index + 1
+    }
+    let time = PlainTime.make(
+      parsed.time.hour,
+      parsed.time.minute,
+      parsed.time.second,
+      parsed.time.nanosecond,
+    )
+    match PlainDate.checkedMake(parsed.date.year, parsed.date.month, parsed.date.day) {
+      Option<PlainDate>.Some { value } => {
+        match PlainDateTime.checkedMake(value, time) {
+          Option<PlainDateTime>.Some { value: local } => {
+            return Result<ZonedText<'text>, TimeParseError>.succeed(
+              ZonedText {
+                local: local,
+                timeGiven: parsed.hasTime,
+                offsetKind: parsed.offset.kind,
+                offsetSeconds: parsed.offset.seconds,
+                zone: zone,
+              },
+            )
+          }
+          Option<PlainDateTime>.None => {}
+        }
+      }
+      Option<PlainDate>.None => {}
+    }
+    return Result<ZonedText<'text>, TimeParseError>.failResult(
+      TimeParseError { reason: TimeParseReason.OutOfRange, offset: 0 },
+    )
+  }
+
+  /// Returns the name in the time zone annotation, such as `America/Sao_Paulo` or `+05:30`.
+  pub fn zoneName(self: Self) -> string<'text> {
+    // The parser checked that the name is ASCII.
+    return unsafe String.fromUtf8Unchecked(self.zone)
+  }
+
+  /// Returns the local date and time of the text. The time is midnight when the text has none.
+  pub fn dateTime(self: Self) -> PlainDateTime {
+    return self.local
+  }
+
+  /// Returns `true` if the text has a time of day.
+  pub fn hasTime(self: Self) -> bool {
+    return self.timeGiven
+  }
+
+  /// Returns `true` if the text has the UTC designator `Z`.
+  pub fn isUtc(self: Self) -> bool {
+    return match self.offsetKind {
+      OffsetKind.Utc => true
+      _ => false
+    }
+  }
+
+  /// Returns the numeric UTC offset of the text, or `None` if it has `Z` or no offset.
+  pub fn offset(self: Self) -> Option<UtcOffset> {
+    return match self.offsetKind {
+      OffsetKind.Numeric => UtcOffset.checkedFromSeconds(self.offsetSeconds)
+      _ => Option<UtcOffset>.none()
+    }
+  }
+}

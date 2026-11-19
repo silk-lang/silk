@@ -8,8 +8,10 @@ portable replacements need no native host import.
 
 ## Representation and outcomes
 
-An Instant is signed i64 seconds plus i64 nanoseconds in [0, 1_000_000_000). System time measures
-Unix-epoch civil time, permits negative seconds and can move backwards. Native monotonic time uses
+`SystemClock.now` answers a `silk.time.instant.Instant`: signed i64 seconds since the Unix epoch plus
+nanoseconds in [0, 1_000_000_000). System time permits negative seconds and can move backwards.
+`MonotonicClock.now` answers a `silk.time.mark.Mark`, the same two fields counted from the provider's
+own origin; a `Mark` is a different type, so it cannot be passed where system time is expected. Native monotonic time uses
 the platform's monotonic clock consistently, with nonnegative seconds and a provider-local origin. GNU excludes
 system suspend time; Darwin and Windows include it. Marks from different providers or clock domains are not
 interchangeable deadlines.
@@ -46,7 +48,7 @@ the nominal 100 ns representation unit, not a claim about measured accuracy.
 waitFor reads its starting mark once, computes one checked deadline with MonotonicClock.deadlineAfter,
 and uses the same absolute policy as waitUntil. Fractional addition carries once; no arithmetic wraps.
 A zero duration requires no positive timeline advance. Nonnegative past deadlines return without a
-positive wait. Negative native deadlines are invalid even though the portable Instant can represent them.
+positive wait. Negative native deadlines are invalid even though the portable Mark can represent them.
 
 GNU calls clock_nanosleep with CLOCK_MONOTONIC, TIMER_ABSTIME=1, the unchanged deadline and a null
 remainder pointer. Direct status 0 succeeds and direct EINTR=4 retries. Other statuses trap.

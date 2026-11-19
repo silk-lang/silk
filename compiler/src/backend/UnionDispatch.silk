@@ -13,11 +13,15 @@ import semantic.SourceLocations {Location}
 //! with the receiver's access and calls the member's witness with the remaining parameters and the
 //! providers it needs. An operand the witness borrows is lent to it and dropped after the call,
 //! on both exits. The witness writes the result directly; its failure, when it has one, goes
-//! to this function's failure out-slot and leaves through `Fail`.
+//! to this function's failure out-slot and leaves through `Fail`. A witness whose failure is
+//! narrower than the operation's, as an implementation that cannot fail with every member the
+//! interface names, fails into a temporary that is widened into the out-slot.
 
 import semantic.Types {Types}
 import backend.InstanceKey {InstanceKey}
 import backend.Layout {Layout}
+import backend.UnionProjection
+import backend.UnionProjection {Placement as UnionPlacement}
 import backend.Mir {
   ErasureFact,
   Variable,
@@ -49,6 +53,7 @@ import backend.Mir {
   observerAddress,
 }
 import hir.Hir {Access, InfixOperator, Multiplicity}
+import CompilerBug
 import semantic.DeclarationId {DeclarationId}
 import semantic.Lifetime {Lifetime}
 import semantic.Specialization {Edge}
@@ -81,8 +86,11 @@ pub struct Arm {
   pub callee: InstanceKey,
   /// For each requirement entry of the callee, the index of the own provider that serves it.
   pub providers: List<usize>,
-  /// Whether the callee can fail; its failure type equals this function's failure type.
+  /// Whether the callee can fail.
   pub fails: bool,
+  /// The callee's failure type when it is narrower than this function's, which then widens it;
+  /// none when the two are the same.
+  pub failure: Option<Interned<Type>>,
   /// The operands the callee borrows, by increasing parameter index.
   pub borrows: List<Borrowed>,
 }
@@ -262,7 +270,18 @@ impl UnionDispatch {
       }
       let mut edge = Option<FailureEdge>.none()
       if arms[at].fails {
-        edge = Option<FailureEdge>.some(FailureEdge {destination: place(failure), target: failedExit})
+        match &arms[at].failure {
+          Option<Interned<Type>>.Some {value: narrower} => {
+            let caught = List<Local>.length(&locals)
+            run List<Local>.append(&mut locals, Local {ty: Interned<Type>.clone(&narrower), kind: LocalKind.Temp, origin: origin})
+            let widen = run block(&mut blocks, origin)
+            run widenInto(&mut blocks, &mut locals, widen, caught, &narrower, failure, &self.failure, failedExit, observing, origin)
+            edge = Option<FailureEdge>.some(FailureEdge {destination: place(caught), target: widen})
+          }
+          Option<Interned<Type>>.None => {
+            edge = Option<FailureEdge>.some(FailureEdge {destination: place(failure), target: failedExit})
+          }
+        }
       }
       run List<Reference>.append(&mut references, Reference {key: InstanceKey.copy(&arms[at].callee), edge: Edge.Witness, origin: origin})
       terminate(&mut blocks, arm, Terminator.Call {callee: Callee.Instance {key: InstanceKey.copy(&arms[at].callee)},
@@ -352,6 +371,60 @@ effect fn selectAmbient(blocks: &mut List<Block>, locals: &mut List<Local>, entr
   terminate(&mut blocks.*, restore, Terminator.Goto {target: finish, origin: origin})
   terminate(&mut blocks.*, finish, Terminator.Return {origin: origin})
   return dispatch
+}
+
+// Starting at block `at`, moves the failure in local `caught`, of the narrower type `from`, into
+// local `destination` of the wider type `into`, then continues to `next`. A narrower union spreads
+// each of its members to that member's tag in the wider one. An observing program carries the
+// failure's context with it.
+effect fn widenInto(blocks: &mut List<Block>, locals: &mut List<Local>, at: usize, caught: usize, from: &Interned<Type>,
+  destination: usize, into: &Interned<Type>, next: usize, observing: bool, origin: Origin) -> ()
+  ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut joined = at
+  match move run UnionProjection.within(into, from) {
+    Option<UnionPlacement>.Some {value: UnionPlacement.Whole} => {
+      run statement(&mut blocks.*, at, Statement.Assign {destination: place(destination),
+        value: Rvalue.Use {value: Operand.Move {place: place(caught)}}, origin: origin})
+    }
+    Option<UnionPlacement>.Some {value: UnionPlacement.Tagged {tag, ..}} => {
+      run statement(&mut blocks.*, at, Statement.Assign {destination: place(destination),
+        value: Rvalue.Inject {tag: tag, value: Operand.Move {place: place(caught)}}, origin: origin})
+    }
+    Option<UnionPlacement>.Some {value: UnionPlacement.Spread {tags, ..}} => {
+      let narrower = match move run Type.canonicalUnionMembers(from) {
+        Option<List<Interned<Type>>>.Some {value} => move value
+        Option<List<Interned<Type>>>.None => CompilerBug.panic(b"a widened failure is not a union")
+      }
+      let listed = List<Interned<Type>>.asSlice(&narrower)
+      let wider = List<usize>.asSlice(&tags)
+      let read = List<Local>.length(&locals.*)
+      run List<Local>.append(&mut locals.*, Local {ty: run Layout.tagType(listed.length), kind: LocalKind.Temp, origin: origin})
+      run statement(&mut blocks.*, at, Statement.Assign {destination: place(read), value: Rvalue.Discriminant {place: place(caught)},
+        origin: origin})
+      joined = run block(&mut blocks.*, origin)
+      let unreachable = run block(&mut blocks.*, origin)
+      let mut cases = List<SwitchCase>.make()
+      let mut member = usize.ZERO
+      while member < listed.length {
+        let arm = run block(&mut blocks.*, origin)
+        run List<SwitchCase>.append(&mut cases, SwitchCase {decimal: run Type.extentText(member), negative: false, target: arm})
+        let mut payload = place(caught)
+        run List<Projection>.append(&mut payload.projections, Projection.Payload {index: member, ty: Interned<Type>.clone(&listed[member])})
+        run statement(&mut blocks.*, arm, Statement.Assign {destination: place(destination),
+          value: Rvalue.Inject {tag: wider[member], value: Operand.Move {place: move payload}}, origin: origin})
+        terminate(&mut blocks.*, arm, Terminator.Goto {target: joined, origin: origin})
+        member = member + usize.ONE
+      }
+      terminate(&mut blocks.*, at, Terminator.Switch {value: Operand.Copy {place: place(read)}, cases: move cases,
+        otherwise: unreachable, origin: origin})
+    }
+    Option<UnionPlacement>.None => CompilerBug.panic(b"a dispatcher's failure does not contain its member's")
+  }
+  if observing {
+    run statement(&mut blocks.*, joined, Statement.FailureContext {destination: place(destination),
+      source: Option<Place>.some(place(caught)), origin: origin})
+  }
+  terminate(&mut blocks.*, joined, Terminator.Goto {target: next, origin: origin})
 }
 
 fn ownsCleanup(borrows: &[Borrowed]) -> bool {

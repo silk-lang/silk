@@ -47,21 +47,21 @@ import silk.system.monotonic_clock { MonotonicClock, ReadyWatch }
 import silk.core.option { Option }
 import silk.system.random { Random }
 import silk.core.result { Result }
-import silk.system.system_clock { Instant, SystemClock }
+import silk.time.mark { Mark }
 import silk.num.u64
 
 struct FixedClock {}
 
 impl MonotonicClock for FixedClock {
-  effect fn now(self: &mut Self) -> Instant {
-    return SystemClock.make(0, 0)
+  effect fn now(self: &mut Self) -> Mark {
+    return Mark.make(0, 0)
   }
 
   effect fn getResolution(self: &mut Self) -> u64 {
     return u64.toU64(1)
   }
 
-  effect fn waitUntil(self: &mut Self, when: Instant) -> () {
+  effect fn waitUntil(self: &mut Self, when: Mark) -> () {
     drop when
     return ()
   }
@@ -70,11 +70,11 @@ impl MonotonicClock for FixedClock {
     drop howLong
     return ()
   }
-  effect fn waitReady(self: &mut Self, watch: &mut [ReadyWatch], until: Option<Instant>) -> usize {
+  effect fn waitReady(self: &mut Self, watch: &mut [ReadyWatch], until: Option<Mark>) -> usize {
     if watch.length > 0 { Intrinsic.trap("this clock has no handles to watch") }
     match move until {
-      Option<Instant>.None => {}
-      Option<Instant>.Some {value: when} => {
+      Option<Mark>.None => {}
+      Option<Mark>.Some {value: when} => {
         drop when
       }
     }
@@ -95,13 +95,13 @@ impl Random for ZeroRandom {
 effect fn exchange() -> i32
   ! TransportError | OutOfMemoryError
   ? &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random {
-  let written = run HttpTransport.writeSome(b"ping", Option<Instant>.none())
+  let written = run HttpTransport.writeSome(b"ping", Option<Mark>.none())
   if written != 4 {
     return 1
   }
-  run HttpTransport.flush(Option<Instant>.none())
+  run HttpTransport.flush(Option<Mark>.none())
   let mut reply: [u8; 8] = [0; 8]
-  let count = match run HttpTransport.readSome(&mut reply, Option<Instant>.none()) {
+  let count = match run HttpTransport.readSome(&mut reply, Option<Mark>.none()) {
     ReadTransfer.Data { count } => count
     ReadTransfer.End => {
       return 1
@@ -124,13 +124,13 @@ effect fn program() -> i32
   let mut reads = List<MemoryReadEvent>.make()
   run List.append(
     &mut reads,
-    MemoryReadEvent.Data { readyAt: SystemClock.make(0, 0), bytes: move reply }
+    MemoryReadEvent.Data { readyAt: Mark.make(0, 0), bytes: move reply }
   )
   let mut writes = List<MemoryWriteEvent>.make()
   run List.append(
     &mut writes,
     MemoryWriteEvent {
-      readyAt: SystemClock.make(0, 0),
+      readyAt: Mark.make(0, 0),
       action: MemoryWriteAction.Accept { count: 64 }
     },
   )
@@ -257,7 +257,7 @@ does not flush. After `close`, each read, write, or flush fails with a `Closed` 
 ### Operation `readSomeRaw`
 
 ```silk
-unsafe effect fn readSomeRaw(output: &mut [u8], deadline: Option<Instant>) -> ReadTransfer ! TransportError | OutOfMemoryError ? &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
+unsafe effect fn readSomeRaw(output: &mut [u8], deadline: Option<Mark>) -> ReadTransfer ! TransportError | OutOfMemoryError ? &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
 ```
 
 Reads bytes from the provider into `output`. It is unsafe because it does not check the count.
@@ -268,7 +268,7 @@ Use [`HttpTransport.readSome`](#HttpTransport.impl.readSome).
 ### Operation `writeSomeRaw`
 
 ```silk
-unsafe effect fn writeSomeRaw(input: &[u8], deadline: Option<Instant>) -> usize ! TransportError | OutOfMemoryError ? &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
+unsafe effect fn writeSomeRaw(input: &[u8], deadline: Option<Mark>) -> usize ! TransportError | OutOfMemoryError ? &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
 ```
 
 Writes bytes from `input` to the provider. It is unsafe because it does not check the count.
@@ -279,7 +279,7 @@ Use [`HttpTransport.writeSome`](#HttpTransport.impl.writeSome).
 ### Operation `flush`
 
 ```silk
-effect fn flush(deadline: Option<Instant>) -> () ! TransportError | OutOfMemoryError ? &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
+effect fn flush(deadline: Option<Mark>) -> () ! TransportError | OutOfMemoryError ? &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
 ```
 
 Sends all bytes that writes accepted to the provider.
@@ -309,7 +309,7 @@ impl HttpTransport
 ### Associated function `readSome`
 
 ```silk
-pub effect fn readSome(output: &mut [u8], deadline: Option<Instant>) -> ReadTransfer
+pub effect fn readSome(output: &mut [u8], deadline: Option<Mark>) -> ReadTransfer
   ! TransportError | OutOfMemoryError
   ? &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
 ```
@@ -324,7 +324,7 @@ more than `output.length`, the transport is closed and the read fails.
 ### Associated function `writeSome`
 
 ```silk
-pub effect fn writeSome(input: &[u8], deadline: Option<Instant>) -> usize
+pub effect fn writeSome(input: &[u8], deadline: Option<Mark>) -> usize
   ! TransportError | OutOfMemoryError
   ? &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
 ```

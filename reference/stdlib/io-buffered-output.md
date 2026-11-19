@@ -194,7 +194,7 @@ Each later write of one or more bytes and each later flush fails with `BufferErr
 pub effect fn writeSome(
     self: &mut Self,
     input: &[u8],
-    deadline: Option<Instant>,
+    deadline: Option<Mark>,
   ) -> usize
   ! BufferError
   ? &mut ByteDuplex | &mut MonotonicClock
@@ -231,7 +231,7 @@ transport is not used.
 pub effect fn writeAll(
     self: &mut Self,
     input: &[u8],
-    deadline: Option<Instant>,
+    deadline: Option<Mark>,
   ) -> ()
   ! BufferError
   ? &mut ByteDuplex | &mut MonotonicClock
@@ -268,7 +268,7 @@ this call makes.
 pub effect fn writeVecAll(
     self: &mut Self,
     inputs: &[Bytes],
-    deadline: Option<Instant>,
+    deadline: Option<Mark>,
   ) -> ()
   ! BufferError
   ? &mut ByteDuplex | &mut MonotonicClock
@@ -303,7 +303,7 @@ overflow. `deadline` applies to each transport write that this call makes.
 ```silk
 pub effect fn flush(
     self: &mut Self,
-    deadline: Option<Instant>,
+    deadline: Option<Mark>,
   ) -> ()
   ! BufferError
   ? &mut ByteDuplex | &mut MonotonicClock
@@ -336,7 +336,7 @@ each transport operation that this call makes.
 ```silk
 pub effect fn finish(
     self: &mut Self,
-    deadline: Option<Instant>,
+    deadline: Option<Mark>,
   ) -> ()
   ! BufferError
   ? &mut ByteDuplex | &mut MonotonicClock

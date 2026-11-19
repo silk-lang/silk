@@ -36,11 +36,21 @@ impl WindowsClock
 ### Associated function `now`
 
 ```silk
-pub effect fn now(monotonic: bool) -> Instant
+pub effect fn now() -> Mark
 ```
 
-Returns QPC monotonic time if `monotonic` is true, otherwise precise Unix wall time.
-Failed or negative counter reads and nonpositive frequencies trap.
+Returns QPC monotonic time. Failed or negative counter reads and nonpositive frequencies
+trap.
+
+<a id="WindowsClock.impl.systemNow"></a>
+
+### Associated function `systemNow`
+
+```silk
+pub effect fn systemNow() -> Instant
+```
+
+Returns precise wall time.
 
 <a id="WindowsClock.impl.resolution"></a>
 
@@ -58,7 +68,7 @@ This describes representation granularity, not accuracy. A failed frequency quer
 ### Associated function `waitUntil`
 
 ```silk
-pub effect fn waitUntil(when: Instant) -> ()
+pub effect fn waitUntil(when: Mark) -> ()
 ```
 
 Blocks the host thread until the nonnegative monotonic deadline is reached.

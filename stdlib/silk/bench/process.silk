@@ -25,7 +25,7 @@
 //!
 //! @category Benchmarks
 
-import silk.bench.record { Environment, Pair }
+import silk.bench.record { Environment, Metric, Pair }
 import silk.cli.task { TaskError }
 import silk.collections.list { List }
 import silk.core.effect { Effect }
@@ -42,7 +42,6 @@ import silk.num.usize
 import silk.system.child_process { ChildProcess, ProcessRequest }
 import silk.system.filesystem { FileError, FileSystem, Path }
 import silk.system.monotonic_clock { MonotonicClock }
-import silk.system.system_clock { SystemClock }
 import silk.text.string { String }
 import silk.bench.units { Units }
 
@@ -77,7 +76,13 @@ static if Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() 
   unsafe extern "C" fn sched_getaffinity(pid: i32, size: usize, mask: ?[*]mut u8) -> i32
   @foreign(noCapture: .("mask"))
   unsafe extern "C" fn sched_setaffinity(pid: i32, size: usize, mask: ?[*]const u8) -> i32
+  unsafe extern "C" fn syscall(number: i64, ...) -> i64
+  unsafe extern "C" fn read(fd: i32, buffer: ?[*]mut u8, count: usize) -> isize
+  unsafe extern "C" fn close(fd: i32) -> i32
 }
+
+// How many counters a counted run asks the system for.
+const COUNTERS: usize = 5
 
 // Room for 1024 processors, the size of glibc's `cpu_set_t`.
 const MASK_BYTES: usize = 128
@@ -111,6 +116,10 @@ pub struct Timed {
   pub exit: i64,
   /// The signal that ended the program, or 0.
   pub signal: i64,
+  /// What the system's counters measured over the run, for a run that asked for them: one
+  /// value for each counter the system offers, of `instructions`, `cycles`, `cache-misses`,
+  /// `branch-misses` and `page-faults`.
+  pub counts: List<Metric>,
 }
 
 /// A program that was started with pipes on its standard input and output, to be driven.
@@ -233,10 +242,17 @@ impl Process {
   /// A program that exits with a status other than 0, or that a signal ends, is not an error
   /// here: the status is in the result, and the caller decides.
   ///
+  /// With `counted`, the run also reads the counters of the processor and of the kernel, on
+  /// Linux on x86_64 and aarch64: instructions, cycles, cache misses, branch misses and page
+  /// faults, all in user mode, for the program and the processes it starts, not
+  /// for this process. A counter the system does not offer is left out, so on another system,
+  /// or where the kernel refuses, `counts` is empty; a virtual machine often offers only the
+  /// last.
+  ///
   /// # Errors
   /// `TaskError` with status 127 if the program cannot be started, if `cpus` is more than
   /// [`Process.processors`], or if this system cannot measure a process.
-  pub effect fn time(launch: &Launch, cpus: u32) -> Timed
+  pub effect fn time(launch: &Launch, cpus: u32, counted: bool) -> Timed
     ! TaskError | OutOfMemoryError
     ? &mut Allocator | &mut MonotonicClock {
     static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetAbi() == "apple"
@@ -249,10 +265,12 @@ impl Process {
         run SpawnOptions.setStdio(&mut options, 1, run Stdio.toFile(&value, false))
       }
       let restore = run limit(cpus)
+      let counters = opened(counted)
       let started = run MonotonicClock.now()
       let outcome = run Effect.result(spawned(&request, &options))
       let ended = run MonotonicClock.now()
       unlimit(&restore)
+      let counts = run closed(&counters)
       let measured = match move outcome {
         Result<ExitUsage, SubprocessError | OutOfMemoryError>.Success { value } => move value
         Result<ExitUsage, SubprocessError | OutOfMemoryError>.Failure {
@@ -264,8 +282,6 @@ impl Process {
           }
         }
       }
-      let seconds = SystemClock.seconds(&ended) - SystemClock.seconds(&started)
-      let nanoseconds = SystemClock.nanoseconds(&ended) - SystemClock.nanoseconds(&started)
       let mut exit = i32.toI64(measured.status.code)
       let mut signal: i64 = 0
       if measured.status.signaled {
@@ -273,16 +289,18 @@ impl Process {
         signal = i32.toI64(measured.status.signal)
       }
       return Timed {
-        wall: i64.toU64(seconds * 1000000000 + nanoseconds),
+        wall: i64.toU64(ended.since(started).toNanoseconds().unwrapOr(i64.MAX)),
         user: measured.usage.userMicroseconds * 1000,
         system: measured.usage.systemMicroseconds * 1000,
         peak: measured.usage.maxResidentBytes,
         exit: exit,
         signal: signal,
+        counts: move counts,
       }
     } else {
       drop launch
       drop cpus
+      drop counted
       fail TaskError {
         message: run String.copy("this system cannot measure a process yet"),
         status: 127,
@@ -516,6 +534,114 @@ fn numberAfter(text: &[u8], label: &[u8]) -> Option<u64> {
     at = at + 1
   }
   return Option<u64>.None
+}
+
+// The name of the counter at `at`, as the reports show it.
+fn counterName(at: usize) -> string<'static> {
+  if at == 0 {
+    return "instructions"
+  }
+  if at == 1 {
+    return "cycles"
+  }
+  if at == 2 {
+    return "cache-misses"
+  }
+  if at == 3 {
+    return "branch-misses"
+  }
+  return "page-faults"
+}
+
+// Opens the counters this system offers, or none when `wanted` is false. Each counts, in user
+// mode, the next program this process starts and the processes that program starts, from the
+// moment the program is loaded: this process itself is not counted. A counter the system does
+// not offer, as a virtual machine often offers no hardware counter, is left at -1.
+fn opened(wanted: bool) -> [i32; 5] {
+  let mut descriptors: [i32; 5] = [-1; 5]
+  static if Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu"
+    && Intrinsic.profileText("libc") == "gnu"
+    && (Intrinsic.targetArchitecture() == "x86_64" || Intrinsic.targetArchitecture() == "aarch64") {
+    let mut at: usize = 0
+    while wanted && at < COUNTERS {
+      // `struct perf_event_attr`, 136 bytes: the type and the size in the first word, the
+      // counter in the second, and the flags in the sixth: disabled, inherit, exclude_kernel,
+      // exclude_hv and enable_on_exec.
+      let mut attribute: [u64; 17] = [0; 17]
+
+      // Hardware counters are type 0: instructions 1, cycles 0, cache misses 3, branch misses
+      // 5. The software counter of page faults is type 1, counter 2.
+      let mut kind: u64 = 0
+      let mut counter: u64 = 1
+      if at == 1 {
+        counter = 0
+      } else if at == 2 {
+        counter = 3
+      } else if at == 3 {
+        counter = 5
+      } else if at == 4 {
+        kind = 1
+        counter = 2
+      }
+      attribute[0] = kind + u64.shiftLeft(136, 32)
+      attribute[1] = counter
+      attribute[5] = 0x1063
+      let mut number: i64 = 298
+      static if Intrinsic.targetArchitecture() == "aarch64" {
+        number = 241
+      }
+      let own: i64 = 0
+      let any: i64 = -1
+      let descriptor = unsafe syscall(
+        number,
+        Pointer.fromSlice<u64>(&attribute),
+        own,
+        any,
+        any,
+        own,
+      )
+      if descriptor >= 0 {
+        descriptors[at] = i64.toI32(descriptor)
+      }
+      at = at + 1
+    }
+  } else {
+    drop wanted
+  }
+  return descriptors
+}
+
+// Reads and closes the counters `descriptors` holds, and returns what each counted.
+effect fn closed(descriptors: &[i32; 5]) -> List<Metric>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut counts = List<Metric>.make()
+  static if Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu"
+    && Intrinsic.profileText("libc") == "gnu" {
+    let mut at: usize = 0
+    while at < COUNTERS {
+      if descriptors[at] >= 0 {
+        let mut bytes: [u8; 8] = [0; 8]
+        let got = unsafe read(descriptors[at], Pointer.fromMutSlice<u8>(&mut bytes), 8)
+        let _closed = unsafe close(descriptors[at])
+        if got == 8 {
+          let mut value: u64 = 0
+          let mut index: usize = 8
+          while index > 0 {
+            index = index - 1
+            value = value * 256 + u8.toU64(bytes[index])
+          }
+          run counts.append(
+            Metric { unit: run String.copy(counterName(at)), value: u64.toF64(value) },
+          )
+        }
+      }
+      at = at + 1
+    }
+  } else {
+    drop descriptors
+  }
+  return move counts
 }
 
 // The `VmHWM` line of `/proc/self/status`, in bytes, or 0 when it is missing.

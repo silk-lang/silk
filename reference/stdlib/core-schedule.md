@@ -44,22 +44,22 @@ import silk.core.option { Option }
 import silk.core.schedule { Schedule }
 import silk.system.insecure_random { InsecureRandom }
 import silk.system.monotonic_clock { MonotonicClock, ReadyWatch }
-import silk.system.system_clock { Instant, SystemClock }
+import silk.time.mark { Mark }
 
 struct TestClock {
-  mark: Instant,
+  mark: Mark,
 }
 
 impl MonotonicClock for TestClock {
-  effect fn now(self: &mut Self) -> Instant {
-    return SystemClock.make(SystemClock.seconds(&self.mark), SystemClock.nanoseconds(&self.mark))
+  effect fn now(self: &mut Self) -> Mark {
+    return self.mark
   }
 
   effect fn getResolution(self: &mut Self) -> u64 {
     return 1
   }
 
-  effect fn waitUntil(self: &mut Self, when: Instant) -> () {
+  effect fn waitUntil(self: &mut Self, when: Mark) -> () {
     self.mark = move when
     return ()
   }
@@ -68,11 +68,11 @@ impl MonotonicClock for TestClock {
     self.mark = MonotonicClock.deadlineAfter(&self.mark, howLong)
     return ()
   }
-  effect fn waitReady(self: &mut Self, watch: &mut [ReadyWatch], until: Option<Instant>) -> usize {
+  effect fn waitReady(self: &mut Self, watch: &mut [ReadyWatch], until: Option<Mark>) -> usize {
     if watch.length > 0 { Intrinsic.trap("this clock has no handles to watch") }
     match move until {
-      Option<Instant>.None => {}
-      Option<Instant>.Some {value: when} => {
+      Option<Mark>.None => {}
+      Option<Mark>.Some {value: when} => {
         self.mark = move when
       }
     }
@@ -90,7 +90,7 @@ effect fn beat(beats: &mut Beats) -> () {
 }
 
 pub fn main() -> i32 {
-  let mut clock = TestClock { mark: SystemClock.make(0, 0) }
+  let mut clock = TestClock { mark: Mark.make(0, 0) }
   let mut random = InsecureRandom.seeded(1)
   let mut beats = Beats { count: 0 }
   // One run, then three more, each on the next 500ms beat.
@@ -98,7 +98,7 @@ pub fn main() -> i32 {
   run Effect.repeat(beat(&mut beats), &steady)
     |> Effect.provideMut<InsecureRandom>(&mut random)
     |> Effect.provideMut<MonotonicClock>(&mut clock)
-  if beats.count != 4 || SystemClock.seconds(&clock.mark) != 1 || SystemClock.nanoseconds(&clock.mark) != 500000000 {
+  if beats.count != 4 || clock.mark.seconds() != 1 || clock.mark.subsecondNanoseconds() != 500000000 {
     return 1
   }
   return 0
@@ -364,7 +364,7 @@ The factor is uniform in `[min, max)`, from one `InsecureRandom.nextU64` for eac
 ### Method `start`
 
 ```silk
-pub fn start(self: &Schedule, now: Instant) -> ScheduleState
+pub fn start(self: &Schedule, now: Mark) -> ScheduleState
 ```
 
 Begins one run of `self` at `now`.
@@ -379,7 +379,7 @@ effect, and pass the state to each [`Schedule.next`](#Schedule.impl.next) of the
 ### Method `next`
 
 ```silk
-pub effect fn next(self: &Schedule, state: &mut ScheduleState, now: &Instant) -> Option<u64>
+pub effect fn next(self: &Schedule, state: &mut ScheduleState, now: &Mark) -> Option<u64>
     ? &mut InsecureRandom
 ```
 

@@ -21,14 +21,14 @@ import silk.core.effect {Effect}
 import silk.system.monotonic_clock {MonotonicClock}
 import silk.net.socket_native {ConnectOptions, Connection, NativeSocketError, connectUnix}
 import silk.core.option {Option}
-import silk.system.system_clock {Instant}
+import silk.time.mark {Mark}
 
 effect fn sendRequest(connection: &mut Connection) -> ()
 ! ByteIoError
 ? &mut MonotonicClock {
   let accepted = run ByteDuplex.writeSome(
     b"status\n",
-    Option<Instant>.none(),
+    Option<Mark>.none(),
   ) |> Effect.provideMut<ByteDuplex>(&mut connection.*)
   drop accepted
   return ()
@@ -40,7 +40,7 @@ pub effect fn notifyLocalAgent() -> ()
   return run connectUnix(
     b"/tmp/local-agent.sock",
     ConnectOptions.defaults(),
-    Option<Instant>.none(),
+    Option<Mark>.none(),
     sendRequest,
   )
 }
@@ -62,7 +62,7 @@ filesystem pathname.
 one millisecond. `ConnectOptions.make` admits intervals from 1 through 1,000,000,000 nanoseconds and
 attempt counts from 1 through 1024. `connectResolved` receives already-resolved numeric endpoints;
 DNS is deliberately outside its deadline. One supplied absolute deadline covers setup and every
-candidate without renewal. `Option<Instant>.none()` permits a pending operation to wait indefinitely,
+candidate without renewal. `Option<Mark>.none()` permits a pending operation to wait indefinitely,
 subject to the active `MonotonicClock` provider.
 
 Readiness uses zero-time `poll` (`WSAPoll` on Windows) followed by a positive clock wait, so a local scheduler can run peer
