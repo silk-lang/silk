@@ -1765,7 +1765,7 @@ Returns the trailers, after the content completes.
 pub effect fn readSome(
     self: &mut Self,
     output: &mut [u8],
-    deadline: Option<Instant>,
+    deadline: Option<Mark>,
   ) -> ContentProgress
   ! ContentError<'head>
   ? &mut MonotonicClock

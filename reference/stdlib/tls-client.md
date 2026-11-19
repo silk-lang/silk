@@ -69,7 +69,7 @@ import silk.tls.https_identity { HttpsIdentity, IdentityError, OriginHost, Refer
 import silk.collections.list { List }
 import silk.system.random { Random }
 import silk.core.result { Result }
-import silk.system.system_clock { SystemClock }
+import silk.time.instant { Instant }
 import silk.tls.client { AlpnConfig, CipherOrder, Client, ClientConfig, ClientCredential, ClientLimits, Progress, Resumption, TlsError }
 import silk.tls.record { VersionPolicy }
 import silk.tls.trust_anchor { TrustAnchor }
@@ -119,7 +119,7 @@ pub effect fn main() -> i32
     limits: ClientLimits.defaults(),
     ciphers: CipherOrder.Machine,
   }
-  let made = run Client.make(&config, move trust, SystemClock.make(1789156800, 0), ClientCredential.None)
+  let made = run Client.make(&config, move trust, Instant.make(1789156800, 0), ClientCredential.None)
     |> Effect.provideMut<Random>(&mut random)
     |> Effect.provideMut<Allocator>(&mut allocator)
   let mut client = match move made {

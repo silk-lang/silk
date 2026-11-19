@@ -2109,8 +2109,11 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     // A private field the declaring module reads through a public function points at that function.
     {
       name: 'fieldaccessor',
-      files: { 'main.silk': 'import silk.system.system_clock { Instant }\n\nfn f(now: &Instant) -> i64 { return now.seconds() }\n\npub fn main() -> i32 {\n  return 0\n}\n' },
-      pattern: /error\[SEM0028\] Field `seconds` of silk\.system\.system_clock\.Instant is private; read it with `SystemClock\.seconds\(&value\)` instead/,
+      files: {
+        'main.silk': 'import reading { Reading }\n\nfn f(now: &Reading) -> i64 { return now.seconds }\n\npub fn main() -> i32 {\n  return 0\n}\n',
+        'reading.silk': 'pub struct Reading { seconds: i64, }\n\npub struct Clock {}\n\nimpl Clock {\n  pub fn seconds(self: &Reading) -> i64 { return self.seconds }\n}\n',
+      },
+      pattern: /error\[SEM0028\] Field `seconds` of reading\.Reading is private; read it with `Clock\.seconds\(&value\)` instead/,
     },
     // A provision that matches nothing names the provider, the service and what the Effect requires.
     {
@@ -2138,7 +2141,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     {
       name: 'witnessresult',
       files: { 'main.silk': 'import silk.system.system_clock { SystemClock }\n\nstruct Fixed {}\n\nimpl SystemClock for Fixed {\n  effect fn now(self: &mut Self) -> i64 { return 0 }\n  effect fn getResolution(self: &mut Self) -> u64 { return 1 }\n}\n\npub fn main() -> i32 {\n  return 0\n}\n' },
-      pattern: /error\[SEM0083\] Invalid conformance: member `now` does not match the operation of `SystemClock`: it returns `i64`, but the operation returns `silk\.system\.system_clock\.Instant`/,
+      pattern: /error\[SEM0083\] Invalid conformance: member `now` does not match the operation of `SystemClock`: it returns `i64`, but the operation returns `silk\.time\.instant\.Instant`/,
     },
     // A plain `test fn` that runs or declares a failure is told to become a `test effect fn`.
     {

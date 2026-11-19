@@ -64,14 +64,14 @@ import silk.net.socket_native {
 import silk.net.address { Endpoint, IpAddress, Ipv4Address, Port }
 import silk.core.option { Option }
 import silk.system.monotonic_clock_native { OsMonotonicClock }
-import silk.system.system_clock { Instant }
+import silk.time.mark { Mark }
 
 // Reads one byte from the client and answers with one byte.
 effect fn answer<'call>(view: &'call mut AcceptedView<'call>) -> i32
   ! ByteIoError
   ? &mut MonotonicClock {
   let mut input: [u8; 1] = [0]
-  match move run ByteDuplex.readSome(&mut input, Option<Instant>.none())
+  match move run ByteDuplex.readSome(&mut input, Option<Mark>.none())
     |> Effect.provideMut<ByteDuplex>(&mut view.connection.*) {
     ReadTransfer.Data { count } => {
       if count != 1 || input[0] != 120 {
@@ -84,7 +84,7 @@ effect fn answer<'call>(view: &'call mut AcceptedView<'call>) -> i32
   }
 
   // One byte is always written at once, or the call fails.
-  let written = run ByteDuplex.writeSome(b"y", Option<Instant>.none())
+  let written = run ByteDuplex.writeSome(b"y", Option<Mark>.none())
     |> Effect.provideMut<ByteDuplex>(&mut view.connection.*)
   if written != 1 {
     return 1
@@ -111,18 +111,18 @@ effect fn program() -> i32
   let mut client = run connectResolvedOwned(
     &targets,
     ConnectOptions.defaults(),
-    Option<Instant>.none()
+    Option<Mark>.none()
   )
-  let sent = run ByteDuplex.writeSome(b"x", Option<Instant>.none())
+  let sent = run ByteDuplex.writeSome(b"x", Option<Mark>.none())
     |> Effect.provideMut<ByteDuplex>(&mut client)
   if sent != 1 {
     return 1
   }
-  let accepted = run accept(&mut listener, Option<Instant>.none())
+  let accepted = run accept(&mut listener, Option<Mark>.none())
   run Listener.close(&mut listener)
   let served = run withAccepted<i32, ByteIoError>(move accepted, answer)
   let mut reply: [u8; 1] = [0]
-  let read = run ByteDuplex.readSome(&mut reply, Option<Instant>.none())
+  let read = run ByteDuplex.readSome(&mut reply, Option<Mark>.none())
     |> Effect.provideMut<ByteDuplex>(&mut client)
   run Connection.close(&mut client)
   return match move read {
@@ -880,7 +880,7 @@ The error of the last attempt.
 TimeRangeError
 ```
 
-The time of the next check does not fit in an `Instant`.
+The time of the next check does not fit in a `Mark`.
 
 <a id="NativeSocketError.InvalidEndpoint"></a>
 
@@ -2094,7 +2094,7 @@ Windows returns `FamilyUnsupported` for Unix-domain sockets before creating a so
 ```silk
 pub effect fn accept(
   listener: &mut Listener,
-  deadline: Option<Instant>,
+  deadline: Option<Mark>,
 ) -> Accepted ! NativeSocketError ? &mut MonotonicClock
 ```
 
@@ -2171,7 +2171,7 @@ close error never replaces the result.
 pub effect fn connectResolvedOwned(
   endpoints: &[Endpoint],
   options: ConnectOptions,
-  deadline: Option<Instant>,
+  deadline: Option<Mark>,
 ) -> Connection ! NativeSocketError ? &mut MonotonicClock
 ```
 
@@ -2190,7 +2190,7 @@ Connects to the first of `endpoints` that accepts, and returns the connection.
 pub effect fn connectUnixOwned(
   path: &[u8],
   options: ConnectOptions,
-  deadline: Option<Instant>,
+  deadline: Option<Mark>,
 ) -> Connection ! NativeSocketError ? &mut MonotonicClock
 ```
 
@@ -2212,7 +2212,7 @@ Windows returns `FamilyUnsupported` for Unix-domain sockets before creating a so
 pub effect fn connectResolved<'env, A, E, ?CallbackRequirements>(
   endpoints: &[Endpoint],
   options: ConnectOptions,
-  deadline: Option<Instant>,
+  deadline: Option<Mark>,
   callback: for<'call> once fn<'env>(
     &'call mut Connection
   ) -> once Effect<'call; A ! E ? CallbackRequirements>,
@@ -2240,7 +2240,7 @@ With a deadline of `None`, the connect can wait forever.
 pub effect fn connectUnix<'env, A, E, ?CallbackRequirements>(
   path: &[u8],
   options: ConnectOptions,
-  deadline: Option<Instant>,
+  deadline: Option<Mark>,
   callback: for<'call> once fn<'env>(
     &'call mut Connection
   ) -> once Effect<'call; A ! E ? CallbackRequirements>,

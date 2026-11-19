@@ -61,6 +61,7 @@ import semantic.TypedBody {
   PlaceStep as BodyPlaceStep,
   PatternTest as BodyPatternTest,
   ScalarTest as BodyScalarTest,
+  Node as BodyNode,
   NodeId as BodyNodeId,
   NodeKind as BodyNodeKind,
   Origin,
@@ -200,6 +201,8 @@ pub union Rvalue {
   RunningPackage,
   /// The address of the running function's native stack frame (`Intrinsic.frameAddress`).
   FrameAddress,
+  /// Shared by every ambient service on this thread.
+  AmbientSlot,
   /// The address of the running instance's process word (`Intrinsic.processWord`): one
   /// zero-initialized `u64` per function instance that lives as long as the process.
   ProcessWord,
@@ -450,8 +453,26 @@ pub struct NonParkingRun {
   pub origin: ParkOrigin,
 }
 
+/// The execution guarantee attached to a selected service call.
+pub union CallPromise {
+  Unrestricted,
+  NonParking,
+  Ambient {pub module: ModuleId, pub span: Span},
+}
+
+impl CallPromise {
+  pub fn copy(self: &Self) -> Self {
+    return match &self.* {
+      CallPromise.Unrestricted => CallPromise.Unrestricted
+      CallPromise.NonParking => CallPromise.NonParking
+      CallPromise.Ambient {module, span} => CallPromise.Ambient {module: ModuleId.copy(&module), span: span}
+    }
+  }
+}
+
 /// The authored obligation in a body, at a caller, or at a conversion to an erased contract.
 pub union ParkOrigin {
+  Ambient {pub module: ModuleId, pub span: Span},
   Body {pub site: Origin},
   Entry,
   Conversion {pub fact: ErasureFact},
@@ -461,6 +482,7 @@ impl ParkOrigin {
   pub fn copy(self: &Self) -> Self {
     return match &self.* {
       ParkOrigin.Body {site} => ParkOrigin.Body {site: site}
+      ParkOrigin.Ambient {module, span} => ParkOrigin.Ambient {module: ModuleId.copy(&module), span: span}
       ParkOrigin.Entry => ParkOrigin.Entry
       ParkOrigin.Conversion {fact} => ParkOrigin.Conversion {fact: ErasureFact.copy(&fact)}
     }
@@ -872,7 +894,7 @@ pub struct CallTarget {
   pub witnessFailure: Option<Interned<Type>>,
   /// Whether the callee is a service operation declared `@nonParking`: the selected
   /// witness owes the NonParking proof at this call.
-  pub nonParking: bool,
+  pub promise: CallPromise,
   /// Whether the dispatched provider is `never`: no provider value exists, so the call is never
   /// reached and lowers as unreachable, with no witness to select.
   pub vacuous: bool,
@@ -890,9 +912,11 @@ pub union ProviderSource {
   /// The provider stored in part 1 of the `depth`th binding enclosing the run, outermost first;
   /// `owned` when the part holds the provider value itself rather than its loan.
   Bound {pub depth: usize, pub owned: bool, pub access: Access, pub address: Interned<Type>},
-  /// No provider: an optional service that nothing provides runs absent (SERV-011). The callee
-  /// receives the address, typed `address`, of a fresh value of the fieldless `provider`.
+  /// Supplies a shared address of a fieldless default provider, including an absent optional service.
   Absent {pub provider: Interned<Type>, pub address: Interned<Type>},
+  ConstantDefault {pub provider: Interned<Type>, pub address: Interned<Type>, pub constant: Interned<StaticData>},
+  /// The default provider of an ambient service, including the value of a named constant.
+  Ambient {pub provider: Interned<Type>, pub address: Interned<Type>, pub constant: Option<Interned<StaticData>>, pub erased: Interned<Type>, pub registration: Interned<Type>, pub descriptor: Interned<Type>, pub tagType: Interned<Type>},
 }
 
 impl ProviderSource {
@@ -901,6 +925,14 @@ impl ProviderSource {
       ProviderSource.Own {index} => ProviderSource.Own {index: index}
       ProviderSource.Bound {depth, owned, access, address} => ProviderSource.Bound {depth: depth, owned: owned,
         access: access, address: Interned<Type>.clone(&address)}
+      ProviderSource.ConstantDefault {provider, address, constant} => ProviderSource.ConstantDefault {provider: Interned<Type>.clone(&provider), address: Interned<Type>.clone(&address), constant: Interned<StaticData>.clone(&constant)}
+      ProviderSource.Ambient {provider, address, constant, erased, registration, descriptor, tagType} => {
+        let data = if let Option<Interned<StaticData>>.Some {value} = &constant {
+          Option<Interned<StaticData>>.some(Interned<StaticData>.clone(&value))
+        } else { Option<Interned<StaticData>>.none() }
+        ProviderSource.Ambient {provider: Interned<Type>.clone(&provider), address: Interned<Type>.clone(&address), constant: move data,
+          erased: Interned<Type>.clone(&erased), registration: Interned<Type>.clone(&registration), descriptor: Interned<Type>.clone(&descriptor), tagType: Interned<Type>.clone(&tagType)}
+      }
       ProviderSource.Absent {provider, address} => ProviderSource.Absent {provider: Interned<Type>.clone(&provider),
         address: Interned<Type>.clone(&address)}
     }
@@ -1116,7 +1148,7 @@ fn copyAccess(value: &Option<Access>) -> Option<Access> {
 struct ResolvedCall {
   key: InstanceKey,
   edge: Edge,
-  nonParking: bool,
+  promise: CallPromise,
 }
 
 // The evaluated place of one match subject; arm bindings project from it.
@@ -1144,7 +1176,54 @@ struct SpreadBinding {
   storage: Interned<Type>,
 }
 
+// An index operand evaluated ahead of the place that reads it, and the temporary that holds it.
+struct Hoisted {
+  node: usize,
+  local: usize,
+}
+
+impl Copy for Hoisted {}
+
+// One step from a place to the place it projects: `parent` is the projected node, `index` the
+// index operand the step evaluates, each `usize.MAX` when the step has none, and `row` whether the
+// step is a row field.
+struct PlaceLink {
+  parent: usize,
+  index: usize,
+  row: bool,
+}
+
+impl Copy for PlaceLink {}
+
+fn placeLink(body: &Shared<TypedBody>, id: BodyNodeId) -> PlaceLink {
+  return Shared<TypedBody>.with<PlaceLink>(body, |value: &TypedBody| -> PlaceLink {
+    if let BodyNodeKind.Expression {form, ..} = &TypedBody.nodeSlice(value)[id.index].kind {
+      return match &form {
+        BodyExpression.Field {value: subject, ..} => PlaceLink {parent: subject.index, index: usize.MAX, row: false}
+        BodyExpression.Dereference {value: subject} => PlaceLink {parent: subject.index, index: usize.MAX, row: false}
+        BodyExpression.RowsColumn {value: subject, ..} => PlaceLink {parent: subject.index, index: usize.MAX, row: false}
+        BodyExpression.Index {value: subject, index, ..} => PlaceLink {parent: subject.index, index: index.index, row: false}
+        BodyExpression.RowField {subject, index, ..} => PlaceLink {parent: subject.index, index: index.index, row: true}
+        _ => PlaceLink {parent: usize.MAX, index: usize.MAX, row: false}
+      }
+    }
+    return PlaceLink {parent: usize.MAX, index: usize.MAX, row: false}
+  })
+}
+
+// Whether a row field lies on the place `id` names (INDEX-002).
+fn rowDestination(body: &Shared<TypedBody>, id: BodyNodeId) -> bool {
+  let mut link = placeLink(body, id)
+  while link.parent != usize.MAX {
+    if link.row { return true }
+    link = placeLink(body, BodyNodeId {index: link.parent})
+  }
+  return false
+}
+
 struct Builder {
+  ambientEnabled: bool,
+  ambientKeys: List<u64>,
   bindings: List<Binding>,
   projections: List<RuntimeProjection>,
   calls: List<CallTarget>,
@@ -1154,6 +1233,9 @@ struct Builder {
   loops: List<LoopTargets>,
   scrutinees: List<Scrutinee>,
   narrowed: List<Narrowed>,
+  // The index operands of the row field destinations being written, each read by the node that
+  // would have evaluated it (`hoistIndexes`).
+  hoisted: List<Hoisted>,
   // The cleanup stack: owned locals in acquisition order, and where each open scope starts.
   owners: List<Owner>,
   cleanup: List<CleanupNode>,
@@ -1568,11 +1650,25 @@ fn constantValue(constants: &[ConstantValue], declaration: &Interned<Declaration
 
 // A constant read is typed by the constant's declared type alone; its value comes from
 // `constants`, which the lowering's preparation demanded. Without it the read is unsupported.
-fn view(body: &Shared<TypedBody>, id: BodyNodeId, constants: &[ConstantValue]) -> View {
+// A column of a collection of rows is the collection's own place (INDEX-002): the node whose
+// value node `id` names.
+fn columnSubject(nodes: &[BodyNode], id: BodyNodeId) -> BodyNodeId {
+  let mut at = id
+  while true {
+    match &nodes[at.index].kind {
+      BodyNodeKind.Expression {form: BodyExpression.RowsColumn {value, ..}, ..} => { at = value }
+      _ => { return at }
+    }
+  }
+  return at
+}
+
+fn view(body: &Shared<TypedBody>, written: BodyNodeId, constants: &[ConstantValue]) -> View {
   return Shared<TypedBody>.with<View>(
     body,
     |bodyValue: &TypedBody| -> View {
       let nodes = TypedBody.nodeSlice(bodyValue)
+      let id = columnSubject(nodes, written)
       let origin = nodes[id.index].origin
       return match & nodes[id.index].kind {
         BodyNodeKind.Expression {ty, form} => match & form {
@@ -1619,6 +1715,14 @@ fn view(body: &Shared<TypedBody>, id: BodyNodeId, constants: &[ConstantValue]) -
           }
           BodyExpression.Dereference {value} => View.Dereference {
             value: value,
+            ty: Interned<Type>.clone(&ty),
+            origin: origin,
+          }
+          // `columnSubject` has already stepped through every column.
+          BodyExpression.RowsColumn {..} => View.Unsupported {origin: origin, gap: GapCode.TypedForm}
+          // A row field is the referent of the reference its `Rows` call yields (INDEX-002).
+          BodyExpression.RowField {call, ..} => View.Dereference {
+            value: call,
             ty: Interned<Type>.clone(&ty),
             origin: origin,
           }
@@ -4004,7 +4108,7 @@ effect fn callCallee(builder: &mut Builder, foreign: Option<Interned<Declaration
   }
   run List<Reference>.append(&mut builder.*.function.references,
     Reference {key: InstanceKey.copy(&call.key), edge: move call.edge, origin: origin})
-  if call.nonParking { run oweNonParking(&mut builder.*, &call.key, origin) }
+  run oweCallPromise(&mut builder.*, &call.key, &call.promise, origin)
   return Callee.Instance {key: move call.key}
 }
 
@@ -5164,9 +5268,41 @@ effect fn infixChain(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
   return move result
 }
 
+// Evaluates every index operand of the place `id` names, in order, and records each in
+// `builder.hoisted`, where the place reads it. A destination that a row field lies on is located
+// by a `Rows` call, which runs after the replacement value so that the value may read the
+// collection; its index operands are still evaluated first (ASSIGN-002).
+effect fn hoistIndexes(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Module, id: BodyNodeId) -> ()
+! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let link = placeLink(body, id)
+  if link.parent == usize.MAX { return () }
+  run hoistIndexes(&mut builder.*, body, hir, BodyNodeId {index: link.parent})
+  if link.index == usize.MAX || !builder.live { return () }
+  let node = BodyNodeId {index: link.index}
+  let origin = nodeOrigin(body, node)
+  let ty = match move run instanceNodeType(&builder.*, body, node) {
+    Option<Interned<Type>>.Some {value} => move value
+    Option<Interned<Type>>.None => { return run unsupported(&InstanceKey.identity(&builder.function.key), origin, GapCode.TypedForm) }
+  }
+  let input = run expression(&mut builder.*, body, hir, node)
+  if !builder.live { return () }
+  let captured = run temporary(&mut builder.*, &ty, origin)
+  run assign(&mut builder.*, place(captured), Rvalue.Use {value: move input}, origin)
+  run List<Hoisted>.append(&mut builder.hoisted, Hoisted {node: link.index, local: captured})
+  return ()
+}
+
 effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Module, id: BodyNodeId) -> Operand
 ! Gap | CanonicalizationFailure | OutOfMemoryError
 ? &mut Allocator | &mut Types {
+  if List<Hoisted>.length(&builder.hoisted) != usize.ZERO {
+    let held = List<Hoisted>.asSlice(&builder.hoisted)
+    let mut at = usize.ZERO
+    while at < held.length {
+      if held[at].node == id.index { return Operand.Copy {place: place(held[at].local)} }
+      at = at + usize.ONE
+    }
+  }
   let selected = run instanceView(&mut builder.*, body, id)
   let owner = InstanceKey.identity(&builder.function.key)
   return match move selected {
@@ -5841,6 +5977,40 @@ effect fn primitiveRvalue(
     return Rvalue.Use {value: Operand.Null {ty: Interned<Type>.clone(ty)}}
   }
   if primitive == IntrinsicPrimitive.FrameAddress { return Rvalue.FrameAddress }
+  if primitive == IntrinsicPrimitive.AmbientSlot { return Rvalue.AmbientSlot }
+  if primitive == IntrinsicPrimitive.AmbientEntry {
+    let reference = match move run intrinsicArgumentType(&builder.*, body, callNode, usize.ZERO) {
+      Option<Interned<Type>>.Some {value} => move value
+      _ => { return run unsupported(&owner, origin, GapCode.WitnessOperand) }
+    }
+    let capability = match move Interned<Type>.with<Option<Interned<Type>>>(&reference, |value: &Type| -> Option<Interned<Type>> {
+      if let Type.Reference {referent, ..} = &value.* {
+        return Interned<Type>.with<Option<Interned<Type>>>(&referent, |erased: &Type| -> Option<Interned<Type>> {
+          if let Type.Erased {contracts, ..} = &erased.* { return Option<Interned<Type>>.some(Interned<Type>.clone(&contracts)) }
+          return Option<Interned<Type>>.none()
+        })
+      }
+      return Option<Interned<Type>>.none()
+    }) {
+      Option<Interned<Type>>.Some {value} => move value
+      _ => { return run unsupported(&owner, origin, GapCode.WitnessOperand) }
+    }
+    let services = run Types.intern(Type.Erased {contracts: run Types.intern(Type.Unit), transferable: false, concurrent: false})
+    run List<ErasureFact>.append(&mut builder.function.erasures, ErasureFact {source: Interned<Type>.clone(&capability),
+      target: move services, owner: Interned<DeclarationId>.clone(&owner), origin: origin})
+    let key = run InstanceKey.memberTag(&capability, &DeclarationId.copyShared(&owner))
+    let keys = List<u64>.asSlice(&builder.ambientKeys)
+    let mut index = usize.ZERO
+    while index < keys.length && keys[index] != key { index = index + usize.ONE }
+    let erased = run intrinsicArgument(&mut builder.*, body, hir, callNode, usize.ZERO, origin)
+    let mut tag = run operandPlace(&owner, move erased, origin)
+    run List<Projection>.append(&mut tag.projections, Projection.Field {index: usize.ZERO})
+    let mut fields = List<AggregateField>.make()
+    run List<AggregateField>.append(&mut fields, AggregateField {index: usize.ZERO,
+      value: Operand.Integer {decimal: run decimalBytes(usize.toU64(index)), negative: false, ty: run storagePrimitive(b"u64")}})
+    run List<AggregateField>.append(&mut fields, AggregateField {index: usize.ONE, value: Operand.Copy {place: move tag}})
+    return Rvalue.Aggregate {fields: move fields}
+  }
   if primitive == IntrinsicPrimitive.ProcessWord { return Rvalue.ProcessWord }
   if primitive == IntrinsicPrimitive.ProcessSlot || primitive == IntrinsicPrimitive.ThreadSlot {
     let element = match move Interned<Type>.with<Option<Interned<Type>>>(ty, pointeeOf) {
@@ -7731,8 +7901,18 @@ effect fn lowerReplace(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Mo
     Option<BodyNodeId>.Some {value} => value
     Option<BodyNodeId>.None => { return run unsupported(&owner, origin, GapCode.MissingCallArgument) }
   }
-  let destination = run expressionPlace(&mut builder.*, body, hir, target)
-  let value = run expression(&mut builder.*, body, hir, replacement)
+  let mut destination = place(usize.ZERO)
+  let mut value = Operand.Unit
+  if rowDestination(body, target) {
+    let mark = List<Hoisted>.length(&builder.hoisted)
+    run hoistIndexes(&mut builder.*, body, hir, target)
+    if builder.live { value = run expression(&mut builder.*, body, hir, replacement) }
+    if builder.live { destination = run expressionPlace(&mut builder.*, body, hir, target) }
+    List<Hoisted>.truncate(&mut builder.hoisted, mark)
+  } else {
+    destination = run expressionPlace(&mut builder.*, body, hir, target)
+    value = run expression(&mut builder.*, body, hir, replacement)
+  }
   if !builder.live { return Operand.Unit }
   let displaced = run storageValue(&mut builder.*, ty, Rvalue.Use {value: Operand.Move {place: run copyPlace(&destination)}}, origin)
   run assign(&mut builder.*, move destination, Rvalue.Use {value: move value}, origin)
@@ -7987,6 +8167,10 @@ effect fn lowerExecutionPackage(builder: &mut Builder, body: &Shared<TypedBody>,
     Rvalue.Use {value: Operand.Copy {place: place(address)}}, origin)
   run assign(&mut builder.*, run storagePlace(&place(block), true, &[header, SealedCore.ordinal(CoreField.HeaderLifecycle)]),
     Rvalue.Use {value: run wordOperand(SealedCore.lifecycleWord(Lifecycle.Unstarted))}, origin)
+  if builder.ambientEnabled {
+    run assign(&mut builder.*, run storagePlace(&place(block), true, &[header, SealedCore.ordinal(CoreField.HeaderAmbient)]),
+      Rvalue.Use {value: Operand.Null {ty: run SealedCore.bytes()}}, origin)
+  }
   // The source control words start at zero, and the Execution handle holds the one authority.
   let mut zeroed = SealedCore.ordinal(CoreField.HeaderControl)
   while zeroed <= SealedCore.ordinal(CoreField.HeaderNotifying) {
@@ -8090,11 +8274,13 @@ effect fn helperBuilder(creator: &Builder, key: InstanceKey, result: &Interned<T
     at = at + usize.ONE
   }
   return Builder {
+    ambientEnabled: creator.ambientEnabled, ambientKeys: List<u64>.make(),
     bindings: move bindings, projections: move projections, calls: List<CallTarget>.make(),
     function: MirFunction {key: move key, borrow: BodyBorrowStatus.Checked, result: Interned<Type>.clone(result), parameters: move parameters,
       locals: move locals, blocks: List<Block>.make(), references: List<Reference>.make(), externs: List<Interned<DeclarationId>>.make(),
       observes: false, contexts: List<ContextText>.make(), traps: List<TrapSite>.make(), suspension: Option<Origin>.none(), parks: Option<Origin>.none(), releasesPackages: false, nonParking: List<NonParkingRun>.make(), cancels: List<Cancel>.make(), accesses: List<SharedAccess>.make(), escapes: List<EscapeSite>.make(), erasures: List<ErasureFact>.make(), features: Bytes.make(), inlining: Inlining.Default, optimizeSize: false, variadic: false, frame: Bytes.make(), lines: List<u64>.make(), variables: List<Variable>.make(), inlined: List<InstanceKey>.make(), quiet: List<InstanceKey>.make()},
     current: usize.ZERO, live: true, loops: List<LoopTargets>.make(), scrutinees: List<Scrutinee>.make(), narrowed: List<Narrowed>.make(),
+    hoisted: List<Hoisted>.make(),
     owners: List<Owner>.make(), cleanup: List<CleanupNode>.make(), states: List<usize>.make(), dropPlans: List<List<usize>>.make(), scopes: List<usize>.make(), temporaries: List<Pending>.make(),
     remainders: List<Remainder>.make(), needs: CleanupNeeds {locals: List<bool>.make(), nodes: List<bool>.make()},
     failure: usize.MAX, plans: List<NodePlan>.make(), storage: List<StoragePlan>.make(), carriers: List<CarrierPlan>.make(),
@@ -8676,7 +8862,19 @@ effect fn lowerDrive(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
   let admitted = run storageCondition(&mut builder.*, InfixOperator.BitOr, move unstarted, move relinquished, origin)
   run trapUnless(&mut builder.*, move admitted, TrapReason.InvalidExecutionDrive, origin)
   run recordLifecycle(&mut builder.*, &access, Lifecycle.Running, MemoryOrder.Relaxed, origin)
-  run callErased(&mut builder.*, &access, CoreField.HeaderStart, origin)
+  // Exchange the table at the actual activation boundary. Both callbacks run after restoration.
+  if builder.ambientEnabled {
+    let tableType = run SealedCore.bytes()
+    let slot = run storageValue(&mut builder.*, &run SealedCore.address(&tableType), Rvalue.AmbientSlot, origin)
+    let current = run storagePlace(&place(slot), true, &[])
+    let prior = run storageValue(&mut builder.*, &tableType, Rvalue.Use {value: Operand.Copy {place: run copyPlace(&current)}}, origin)
+    run assign(&mut builder.*, run copyPlace(&current), Rvalue.Use {value: Operand.Copy {place: run headerField(&access, CoreField.HeaderAmbient)}}, origin)
+    run callErased(&mut builder.*, &access, CoreField.HeaderStart, origin)
+    run assign(&mut builder.*, run headerField(&access, CoreField.HeaderAmbient), Rvalue.Use {value: Operand.Copy {place: run copyPlace(&current)}}, origin)
+    run assign(&mut builder.*, move current, Rvalue.Use {value: Operand.Copy {place: place(prior)}}, origin)
+  } else {
+    run callErased(&mut builder.*, &access, CoreField.HeaderStart, origin)
+  }
   // The start returns with the activation still Running when the body completed.
   let parked = run storageCondition(&mut builder.*, InfixOperator.Equals, Operand.Copy {place: run copyPlace(&recorded)},
     run wordOperand(SealedCore.lifecycleWord(Lifecycle.Relinquished)), origin)
@@ -9562,7 +9760,7 @@ effect fn planCall(builder: &mut Builder, target: &CallTarget, environment: &Pla
   let continuation = run block(&mut builder.*, origin)
   run List<Reference>.append(&mut builder.*.function.references,
     Reference {key: InstanceKey.copy(&target.key), edge: Edge.copy(&target.edge), origin: origin})
-  if target.nonParking { run oweNonParking(&mut builder.*, &target.key, origin) }
+  run oweCallPromise(&mut builder.*, &target.key, &target.promise, origin)
   let calleeFailure = match &target.witnessFailure {
     Option<Interned<Type>>.Some {value} => Interned<Type>.clone(&value)
     Option<Interned<Type>>.None => Interned<Type>.clone(failure)
@@ -9776,7 +9974,7 @@ effect fn executePlan(builder: &mut Builder, steps: &[RunPlan], step: usize, env
       run executePlan(&mut builder.*, steps, inner, &deferredPart, output, sink, &mut bound.*, origin)
     }
     RunPlan.Observe {inner, state, stateDrop, callable, callbackDrop, callback, owed} => {
-      if owed { run oweNonParking(&mut builder.*, &callback.key, origin) }
+      if owed { run oweCallPromise(&mut builder.*, &callback.key, &CallPromise.NonParking, origin) }
       // The body runs under the record `[adapter, &mut state, &callback]` with no selected failure
       // (N1, N2), then the callback and the state drop. Its presence makes the whole program
       // observe diagnostics.
@@ -10004,12 +10202,18 @@ effect fn executePlan(builder: &mut Builder, steps: &[RunPlan], step: usize, env
   return ()
 }
 
-// Records a NonParking obligation whose only callee is `key`.
-effect fn oweNonParking(builder: &mut Builder, key: &InstanceKey, origin: Origin) -> () ! OutOfMemoryError ? &mut Allocator {
+// Only constrained calls contribute a witness obligation to the reachability walk.
+effect fn oweCallPromise(builder: &mut Builder, key: &InstanceKey, promise: &CallPromise, origin: Origin) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let source = match &promise.* {
+    CallPromise.Unrestricted => { return () }
+    CallPromise.NonParking => ParkOrigin.Body {site: origin}
+    CallPromise.Ambient {module, span} => ParkOrigin.Ambient {module: ModuleId.copy(&module), span: span}
+  }
   let mut callees = List<InstanceKey>.make()
   run List<InstanceKey>.append(&mut callees, InstanceKey.copy(key))
   return run List<NonParkingRun>.append(&mut builder.*.function.nonParking, NonParkingRun {callees: move callees,
-    glues: List<Interned<Type>>.make(), declarations: List<Interned<DeclarationId>>.make(), exact: true, origin: ParkOrigin.Body {site: origin}})
+    glues: List<Interned<Type>>.make(), declarations: List<Interned<DeclarationId>>.make(), exact: true, origin: move source})
 }
 
 // Appends the instances that running plan step `step` calls: each runner, handler, use, release
@@ -10200,6 +10404,34 @@ effect fn providerOperand(builder: &mut Builder, source: &ProviderSource, bound:
       let reference = run temporary(&mut builder.*, &address, origin)
       run assign(&mut builder.*, place(reference), Rvalue.Ref {access: access, place: run copyPlace(&bound[depth].place)}, origin)
       return Operand.Copy {place: place(reference)}
+    }
+    ProviderSource.ConstantDefault {provider, address, constant} => {
+      let result = run temporary(&mut builder.*, &address, origin)
+      run assign(&mut builder.*, place(result), Rvalue.Use {value: Operand.StaticValue {value: Interned<StaticData>.clone(&constant), ty: Interned<Type>.clone(&provider)}}, origin)
+      return Operand.Copy {place: place(result)}
+    }
+    ProviderSource.Ambient {provider, address, constant, erased, registration, descriptor, tagType} => {
+      let owner = InstanceKey.identity(&builder.function.key)
+      run List<ErasureFact>.append(&mut builder.function.erasures, ErasureFact {source: Interned<Type>.clone(&provider),
+        target: Interned<Type>.clone(&erased), owner: Interned<DeclarationId>.clone(&owner), origin: origin})
+      run List<ErasureFact>.append(&mut builder.function.erasures, ErasureFact {source: Interned<Type>.clone(&registration),
+        target: Interned<Type>.clone(&erased), owner: Interned<DeclarationId>.clone(&owner), origin: origin})
+      let pointer = run temporary(&mut builder.*, &address, origin)
+      if let Option<Interned<StaticData>>.Some {value} = &constant {
+        run assign(&mut builder.*, place(pointer), Rvalue.Use {value: Operand.StaticValue {value: Interned<StaticData>.clone(&value), ty: Interned<Type>.clone(&provider)}}, origin)
+      } else {
+        let quiet = run temporary(&mut builder.*, &provider, origin)
+        run assign(&mut builder.*, place(quiet), Rvalue.Aggregate {fields: List<AggregateField>.make()}, origin)
+        run assign(&mut builder.*, place(pointer), Rvalue.Ref {access: Access.Shared, place: place(quiet)}, origin)
+      }
+      let tag = run InstanceKey.memberTag(&provider, &DeclarationId.copyShared(&owner))
+      let mut fields = List<AggregateField>.make()
+      run List<AggregateField>.append(&mut fields, AggregateField {index: usize.ZERO,
+        value: Operand.Integer {decimal: run decimalBytes(tag), negative: false, ty: Interned<Type>.clone(&tagType)}})
+      run List<AggregateField>.append(&mut fields, AggregateField {index: usize.ONE, value: Operand.Copy {place: place(pointer)}})
+      let value = run temporary(&mut builder.*, &descriptor, origin)
+      run assign(&mut builder.*, place(value), Rvalue.Aggregate {fields: move fields}, origin)
+      return Operand.Copy {place: place(value)}
     }
     ProviderSource.Absent {provider, address} => {
       let absent = run temporary(&mut builder.*, &provider, origin)
@@ -11039,8 +11271,18 @@ effect fn lowerStatement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &
       run discard(&mut builder.*, body, hir, id)
     }
     View.PlaceAssignment {target, value, origin} => {
-      let destination = run expressionPlace(&mut builder.*, body, hir, target)
-      let assigned = run expression(&mut builder.*, body, hir, value)
+      let mut destination = place(usize.ZERO)
+      let mut assigned = Operand.Unit
+      if rowDestination(body, target) {
+        let mark = List<Hoisted>.length(&builder.hoisted)
+        run hoistIndexes(&mut builder.*, body, hir, target)
+        if builder.live { assigned = run expression(&mut builder.*, body, hir, value) }
+        if builder.live { destination = run expressionPlace(&mut builder.*, body, hir, target) }
+        List<Hoisted>.truncate(&mut builder.hoisted, mark)
+      } else {
+        destination = run expressionPlace(&mut builder.*, body, hir, target)
+        assigned = run expression(&mut builder.*, body, hir, value)
+      }
       if !builder.live { return () }
       let root = placeOwnerIndex(&builder.*, &destination)
       let targetType = run instanceNodeType(&builder.*, body, target)
@@ -11316,7 +11558,11 @@ effect fn collectCallNodes(body: &Shared<TypedBody>, id: BodyNodeId, output: &mu
         drop run collectCallNodes(body, child, &mut output.*)
         at = at + usize.ONE
       }
-      // A checked scalar operation invokes one of its carriers.
+      // A registration reads the build's dense service ordinals. Prepare that input with
+      // the call just as checked scalar operations prepare their carriers.
+      if let IntrinsicMember.Primitive {primitive: IntrinsicPrimitive.AmbientEntry} = member {
+        run List<BodyNodeId>.append(&mut output.*, node)
+      }
       if let Option<ScalarOperation>.Some {..} = move checkedOperation(member) { run List<BodyNodeId>.append(&mut output.*, node) }
     }
     // A storage call's facts are prepared with the calls; its operands are evaluated first.
@@ -11664,6 +11910,8 @@ impl MirFunction {
     source: &[u8],
     anchor: &Anchor,
     observing: bool,
+    ambientEnabled: bool,
+    ambientKeys: List<u64>,
     lineTables: bool,
     relativeSites: bool,
     unoptimized: bool,
@@ -11746,6 +11994,7 @@ impl MirFunction {
       run List<Local>.append(&mut locals, Local {ty: move closedFailure, kind: LocalKind.Failure, origin: origin})
     }
     let mut builder = Builder {
+      ambientEnabled: ambientEnabled, ambientKeys: move ambientKeys,
       bindings: move bindings,
       projections: move projections,
       calls: move calls,
@@ -11765,6 +12014,7 @@ impl MirFunction {
       live: true,
       loops: List<LoopTargets>.make(),
       scrutinees: List<Scrutinee>.make(),
+      hoisted: List<Hoisted>.make(),
       narrowed: List<Narrowed>.make(),
       owners: List<Owner>.make(),
       cleanup: List<CleanupNode>.make(),
@@ -12194,7 +12444,7 @@ fn resolvedCallTarget(builder: &Builder, node: BodyNodeId) -> Option<ResolvedCal
   while at < calls.length {
     if calls[at].node.index == node.index {
       return Option<ResolvedCall>.some(ResolvedCall {key: InstanceKey.copy(&calls[at].key), edge: Edge.copy(&calls[at].edge),
-        nonParking: calls[at].nonParking})
+        promise: CallPromise.copy(&calls[at].promise)})
     }
     at = at + usize.ONE
   }

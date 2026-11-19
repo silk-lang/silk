@@ -47,7 +47,7 @@ import silk.http.websocket_stream { StreamError }
 import silk.system.monotonic_clock { MonotonicClock }
 import silk.system.monotonic_clock_native { OsMonotonicClock }
 import silk.system.random { Random }
-import silk.system.system_clock { Instant, SystemClock }
+import silk.time.mark { Mark }
 import silk.uri.reference { ParseError }
 import silk.uri.uri { Uri }
 
@@ -57,7 +57,7 @@ struct Scripted {
 }
 
 impl HttpTransport for Scripted {
-  effect fn readSomeRaw(self: &mut Self, output: &mut [u8], deadline: Option<Instant>) -> ReadTransfer
+  effect fn readSomeRaw(self: &mut Self, output: &mut [u8], deadline: Option<Mark>) -> ReadTransfer
     ! TransportError | OutOfMemoryError
     ? &mut MonotonicClock | &mut Allocator | &mut Random {
     let attempted = run Effect.result(ByteDuplex.readSome(&mut output, move deadline))
@@ -68,7 +68,7 @@ impl HttpTransport for Scripted {
     }
   }
 
-  effect fn writeSomeRaw(self: &mut Self, input: &[u8], deadline: Option<Instant>) -> usize
+  effect fn writeSomeRaw(self: &mut Self, input: &[u8], deadline: Option<Mark>) -> usize
     ! TransportError | OutOfMemoryError
     ? &mut MonotonicClock | &mut Allocator | &mut Random {
     let attempted = run Effect.result(ByteDuplex.writeSome(input, move deadline))
@@ -79,7 +79,7 @@ impl HttpTransport for Scripted {
     }
   }
 
-  effect fn flush(self: &mut Self, deadline: Option<Instant>) -> ()
+  effect fn flush(self: &mut Self, deadline: Option<Mark>) -> ()
     ! TransportError | OutOfMemoryError
     ? &mut MonotonicClock | &mut Allocator | &mut Random {
     drop deadline
@@ -119,16 +119,16 @@ effect fn program() -> i32
   // The 101 response, then a Text frame "hi" from the server.
   let response = run Bytes.copy(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ICX+Yqv66kxgM0FcWaLWlFLwTAI=\r\n\r\n\x81\x02hi")
   let mut reads = List<MemoryReadEvent>.make()
-  run reads.append(MemoryReadEvent.Data {readyAt: SystemClock.make(0, 0), bytes: move response})
+  run reads.append(MemoryReadEvent.Data {readyAt: Mark.make(0, 0), bytes: move response})
   let mut writes = List<MemoryWriteEvent>.make()
-  run writes.append(MemoryWriteEvent {readyAt: SystemClock.make(0, 0), action: MemoryWriteAction.Accept {count: 4096}})
+  run writes.append(MemoryWriteEvent {readyAt: Mark.make(0, 0), action: MemoryWriteAction.Accept {count: 4096}})
   let memory = run MemoryByteDuplex.make(move reads, move writes, 4096, 4, Option<i32>.none())
   let connection = run Client.makeOwned(
     Scripted {memory: move memory},
     origin,
     Version.Http11,
     Limits.defaults(),
-    Option<Instant>.none(),
+    Option<Mark>.none(),
   )
   let entries: [Header<'static>; 0] = []
   let headers = match Headers.make(&entries, Limits.defaults().head.values) {
@@ -139,7 +139,7 @@ effect fn program() -> i32
   let Opened<Scripted> {socket, protocol} = move opened
   if Bytes.length(&protocol) != 0 { return 4 }
   let mut session = move socket
-  match run session.readEvent(Option<Instant>.none()) {
+  match run session.readEvent(Option<Mark>.none()) {
     Event.Text {..} => {
       if session.messageText() != "hi" { return 5 }
     }
@@ -300,7 +300,7 @@ The subprotocols to offer, as the value of `Sec-WebSocket-Protocol`, such as `ch
 ### Field `deadline`
 
 ```silk
-pub deadline: Option<Instant>
+pub deadline: Option<Mark>
 ```
 
 The deadline of the handshake on the `MonotonicClock`, or `None`.

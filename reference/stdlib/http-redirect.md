@@ -315,7 +315,7 @@ The maximum bytes to read.
 #### Field `deadline`
 
 ```silk
-pub deadline: Instant
+pub deadline: Mark
 ```
 
 The deadline of the drain on the `MonotonicClock`. The deadline of the operation also
@@ -1470,7 +1470,7 @@ cancelled. It must not keep the request, the transport, or the exchange.
 effect fn withAttempt(
     client: &mut Self,
     request: AttemptRequest<'policy>,
-    deadline: Option<Instant>,
+    deadline: Option<Mark>,
   ) -> A ! HandlerError | AcquisitionError ? HandlerRequirements | AcquisitionRequirements | &mut Attempt<'policy, P, A, HandlerError ? HandlerRequirements> where
     HandlerRequirements in Without<HandlerRequirements, ByteDuplex>,
     HandlerRequirements in Without<HandlerRequirements, HttpTransport>
@@ -1567,7 +1567,7 @@ cannot open a `CONNECT` tunnel.
 effect fn withAttempt(
     client: &mut Self,
     request: AttemptRequest<'policy>,
-    deadline: Option<Instant>,
+    deadline: Option<Mark>,
   ) -> A ! HandlerError | AcquisitionError ? HandlerRequirements | AcquisitionRequirements | &mut HybridAttempt<'policy, RoutedP, DirectP, A, HandlerError ? HandlerRequirements> where
     HandlerRequirements in Without<HandlerRequirements, ByteDuplex>,
     HandlerRequirements in Without<HandlerRequirements, HttpTransport>
@@ -1751,7 +1751,7 @@ pub effect<'env> fn withEmptyResponse<
   client: &'client mut C,
   request: Request<'uri, 'method, 'headers, 'policy>,
   policy: &'policy Policy,
-  deadline: Option<Instant>,
+  deadline: Option<Mark>,
   scratch: &'scratch mut [u8],
   handler: H,
 ) -> A
@@ -1804,7 +1804,7 @@ pub effect<'env> fn withEmptyHybridResponse<
   client: &'client mut C,
   request: Request<'uri, 'method, 'headers, 'policy>,
   policy: &'policy Policy,
-  deadline: Option<Instant>,
+  deadline: Option<Mark>,
   scratch: &'scratch mut [u8],
   handler: H,
 ) -> A
@@ -1861,7 +1861,7 @@ pub effect<'env> fn withBytesResponse<
   request: Request<'uri, 'method, 'headers, 'policy>,
   policy: &'policy Policy,
   bytes: &'bytes [u8],
-  deadline: Option<Instant>,
+  deadline: Option<Mark>,
   scratch: &'scratch mut [u8],
   handler: H,
 ) -> A
@@ -1917,7 +1917,7 @@ pub effect<'env> fn withBytesHybridResponse<
   request: Request<'uri, 'method, 'headers, 'policy>,
   policy: &'policy Policy,
   bytes: &'bytes [u8],
-  deadline: Option<Instant>,
+  deadline: Option<Mark>,
   scratch: &'scratch mut [u8],
   handler: H,
 ) -> A
@@ -1976,7 +1976,7 @@ pub effect<'env> fn withOneShotResponse<
   request: Request<'uri, 'method, 'headers, 'policy>,
   policy: &'policy Policy,
   producer: Producer,
-  deadline: Option<Instant>,
+  deadline: Option<Mark>,
   scratch: &'scratch mut [u8],
   handler: H,
 ) -> A
@@ -2038,7 +2038,7 @@ pub effect<'env> fn withOneShotHybridResponse<
   request: Request<'uri, 'method, 'headers, 'policy>,
   policy: &'policy Policy,
   producer: Producer,
-  deadline: Option<Instant>,
+  deadline: Option<Mark>,
   scratch: &'scratch mut [u8],
   handler: H,
 ) -> A
@@ -2105,7 +2105,7 @@ pub effect<'env> fn withReplayResponse<
   request: Request<'uri, 'method, 'headers, 'policy>,
   policy: &'policy Policy,
   factory: Factory,
-  deadline: Option<Instant>,
+  deadline: Option<Mark>,
   scratch: &'scratch mut [u8],
   handler: H,
 ) -> A
@@ -2171,7 +2171,7 @@ pub effect<'env> fn withReplayHybridResponse<
   request: Request<'uri, 'method, 'headers, 'policy>,
   policy: &'policy Policy,
   factory: Factory,
-  deadline: Option<Instant>,
+  deadline: Option<Mark>,
   scratch: &'scratch mut [u8],
   handler: H,
 ) -> A

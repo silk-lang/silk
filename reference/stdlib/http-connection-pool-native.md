@@ -247,8 +247,8 @@ pub effect<'env> fn withConnection<
 >(
   handle: &Handle<ConnectionKey, NativeTransport, Context>,
   origin: Origin,
-  requestDeadline: Option<Instant>,
-  acquisitionDeadline: Option<Instant>,
+  requestDeadline: Option<Mark>,
+  acquisitionDeadline: Option<Mark>,
   handler: H,
 ) -> CheckoutResult<A>
 ! E
@@ -295,8 +295,8 @@ pub effect<'env> fn withUnixConnection<
   handle: &Handle<ConnectionKey, NativeTransport, Context>,
   path: &[u8],
   origin: Origin,
-  requestDeadline: Option<Instant>,
-  acquisitionDeadline: Option<Instant>,
+  requestDeadline: Option<Mark>,
+  acquisitionDeadline: Option<Mark>,
   handler: H,
 ) -> CheckoutResult<A>
 ! E

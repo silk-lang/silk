@@ -38,9 +38,9 @@ import silk.core.option { Option }
 import silk.system.monotonic_clock_native { OsMonotonicClock }
 import silk.core.result { Result }
 import silk.net.resolver { FamilySelection, ResolveRequest, ResolvedEndpoints, Resolver, ResolverError }
-import silk.system.system_clock { Instant, SystemClock }
+import silk.time.mark { Mark }
 
-fn request(name: string, deadline: Option<Instant>) -> Option<ResolveRequest> {
+fn request(name: string, deadline: Option<Mark>) -> Option<ResolveRequest> {
   let host = match Host.parse(name) {
     Result<Host, AddressError>.Success { value } => value
     Result<Host, AddressError>.Failure {..} => {
@@ -59,7 +59,7 @@ fn request(name: string, deadline: Option<Instant>) -> Option<ResolveRequest> {
 effect fn countEndpoints(name: string) -> usize
   ! ResolverError | OutOfMemoryError
   ? &mut Resolver | &mut MonotonicClock | &mut Allocator {
-  let lookup = match request(name, Option<Instant>.none()) {
+  let lookup = match request(name, Option<Mark>.none()) {
     Option.Some { value } => move value
     Option.None => {
       return 0
@@ -75,7 +75,7 @@ pub fn main() -> i32 {
   let mut clock = OsMonotonicClock.make()
 
   // A host name with a deadline fails before the lookup starts.
-  let limited = match request("example.com", Option<Instant>.some(SystemClock.make(1, 0))) {
+  let limited = match request("example.com", Option<Mark>.some(Mark.make(1, 0))) {
     Option.Some { value } => move value
     Option.None => {
       return 1

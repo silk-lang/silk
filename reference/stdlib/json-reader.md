@@ -112,7 +112,7 @@ pub effect fn next<'scratch>(
     self: &mut JsonReader,
     input: &mut BufferedInput,
     scratch: &'scratch mut [u8],
-    deadline: Option<Instant>,
+    deadline: Option<Mark>,
   ) -> JsonReadToken<'scratch>
   ! JsonError | BufferError
   ? &mut ByteDuplex | &mut MonotonicClock

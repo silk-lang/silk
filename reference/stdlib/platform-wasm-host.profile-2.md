@@ -67,11 +67,20 @@ host.
 ### Associated function `now`
 
 ```silk
-pub fn now(monotonic: bool) -> Instant
+pub fn now() -> Mark
 ```
 
-Returns the time of the monotonic clock if `monotonic` is true, or of the wall clock, as
-seconds since 1970, if it is false.
+Returns the reading of the monotonic clock of the host.
+
+<a id="JsHost.impl.systemNow"></a>
+
+### Associated function `systemNow`
+
+```silk
+pub fn systemNow() -> Instant
+```
+
+Returns the date and time of the wall clock of the host.
 
 <a id="JsHost.impl.resolution"></a>
 
@@ -89,7 +98,7 @@ wall clock and one microsecond for the monotonic clock, the finest a host promis
 ### Associated function `waitUntil`
 
 ```silk
-pub fn waitUntil(when: Instant) -> ()
+pub fn waitUntil(when: Mark) -> ()
 ```
 
 Reads the monotonic clock until it reaches `when`. It holds the thread while it waits.

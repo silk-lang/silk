@@ -86,7 +86,7 @@ pub effect fn transferAtMost<'source, 'destination, SP, DP>(
   source: &mut BufferedDuplex<'source, SP>,
   destination: &mut BufferedDuplex<'destination, DP>,
   limit: usize,
-  deadline: Option<Instant>,
+  deadline: Option<Mark>,
 ) -> TransferOutcome
 ! BufferError
 ? &mut MonotonicClock
@@ -125,7 +125,7 @@ pub effect fn transferExact<'source, 'destination, SP, DP>(
   source: &mut BufferedDuplex<'source, SP>,
   destination: &mut BufferedDuplex<'destination, DP>,
   count: usize,
-  deadline: Option<Instant>,
+  deadline: Option<Mark>,
 ) -> ()
 ! BufferError
 ? &mut MonotonicClock

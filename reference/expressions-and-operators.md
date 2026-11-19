@@ -996,6 +996,11 @@ the right expression propagates a typed failure, returns, or traps before commit
 not displace the old value. The old value remains the destination's initialized value until
 ordinary structured exit or fatal termination applies its own rules.
 
+A destination that is a field of a row of a collection
+([INDEX-002](values-and-types.md#index-002--a-collection-of-rows-is-indexed-by-field)) evaluates
+its index expressions in step 1, and the collection finds the row after step 2. A row index that is
+out of range therefore traps after the right expression has run.
+
 Cleanup of the displaced value is part of the commit boundary, not an operation that may be moved
 before right-hand evaluation. Backends may optimize this sequence only when the program cannot
 observe a difference.

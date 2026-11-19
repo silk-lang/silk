@@ -842,11 +842,12 @@ A string literal is also the argument of a `static` parameter of type
 `Intrinsic.Field<Owner, Value>`. The literal is the descriptor of the field of `Owner` with that
 name, as `Reflect.field<Owner, Value>("name")` is, and `Value` is inferred from the field when the
 call does not fix it. A library takes a descriptor where it needs the field's type, such as the
-element type of the slice that `ColumnList.column` returns.
+type of the key that `ColumnList.sortBy` orders rows by.
 
 ```silk
-import silk.collections.column_list {ColumnList}
+import silk.collections.column_list {ColumnList, ColumnSort}
 import silk.core.ownership {Copy}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
 
 struct Particle {
   pub x: f32,
@@ -855,8 +856,10 @@ struct Particle {
 
 impl Copy for Particle {}
 
-fn ids(particles: &ColumnList<Particle>) -> &[u64] {
-  return particles.column("id")
+effect fn sortById(particles: &mut ColumnList<Particle>, scratch: &mut ColumnSort) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return run particles.sortBy("id", &mut scratch.*)
 }
 ```
 

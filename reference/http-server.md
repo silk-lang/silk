@@ -30,7 +30,7 @@ The full API requires finite head, body/trailer, input/output, request-count, in
 discard, and shutdown-drain bounds. Input and output capacities must be positive and no larger than
 the buffered-I/O maximum; they are checked before parser or buffer allocation. Other zero bounds
 remain meaningful, and a zero request limit closes without reading. Deadlines are optional absolute
-`Instant` values and are never refreshed between fragments.
+`Mark` values and are never refreshed between fragments.
 
 Request bodies are method-independent and use the shared `silk.http.body` decoder. A handler must
 read a body to completion or explicitly discard it under a finite wire-byte budget before reuse;

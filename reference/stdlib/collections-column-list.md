@@ -5,9 +5,10 @@
 Growable lists that store each field of a struct in its own column.
 
 ## When to use
-Use [`ColumnList`](#ColumnList) for many rows of a small `Copy` struct when loops read or write a few of the
-fields at a time, such as the positions of all particles or the kinds of all tokens. A column is
-an ordinary slice, so a loop over one field touches only that field's bytes. Use
+Use [`ColumnList`](#ColumnList) for many rows of a `Copy` struct when code reads or writes a few of the fields
+at a time, such as the positions of all particles or the links between the nodes of a tree. A
+field access touches only the bytes of that field, so a loop over two fields of a wide row loads
+far less memory than the same loop over a slice of structs. Use
 `silk.collections.list.List` when code handles one whole element at a time, or when the
 elements own storage.
 
@@ -17,13 +18,21 @@ allocation that holds every column. The columns are in order of falling alignmen
 declaration order, so no column needs padding: a row of `x: f32`, `alive: bool`, `id: u64`,
 `y: f32` is 24 bytes as a struct and 17 bytes in a `ColumnList`.
 
-[`ColumnList.column`](#ColumnList.impl.column) and [`ColumnList.columnMut`](#ColumnList.impl.columnMut) borrow one column. The column is named by a
-string literal that the compiler checks against the fields of the row type, as in
-`particles.column("x")`. To use several columns at once, declare a view: a struct in which each
-field has the name of a field of the row type and the type `&'a [V]` or `&'a mut [V]`, where `V`
-is the type of that field. Implement [`ColumnView`](#ColumnView) for it, then call [`ColumnList.columns`](#ColumnList.impl.columns) or
-[`ColumnList.columnsMut`](#ColumnList.impl.columnsMut). A function that takes the view states in its signature which columns
-it reads and which it writes.
+Index a list and name a field to use one field of one row: `particles[3].x` reads it,
+`particles[3].x = 1.0` writes it, and `&mut particles[3].x` borrows it. Fields after the first
+one are ordinary: `particles[3].position.y` is one load from the `position` column. The index
+is a `usize` or a `silk.collections.id.Id` of the row type. Write `..` as the index for the whole
+column: `&particles[..].x` is a `&[f32]` with one element for each row, and
+`&mut particles[..].x` is a `&mut [f32]`. The borrow rules apply to each column apart, so code
+can write one column while it reads another one.
+
+A field that is itself a struct is one column of that struct. Put the fields that code reads
+together in a child struct, and they are next to each other in memory.
+
+[`ColumnList.rows`](#ColumnList.impl.rows) and [`ColumnList.rowsMut`](#ColumnList.impl.rowsMut) give the handles [`Rows`](#Rows) and [`RowsMut`](#RowsMut). A
+handle takes the same index forms as the list. It keeps the address of the storage by value, so
+it is the form to use in a loop and as a parameter in place of a slice of rows.
+[`Rows.range`](#Rows.impl.range) and [`RowsMut.splitAt`](#RowsMut.impl.splitAt) give handles for a part of the rows.
 
 [`ColumnList.make`](#ColumnList.impl.make) does not allocate. The first growth allocates space for four rows, and each
 later growth doubles the capacity. A growth moves every column, so a failed growth leaves the
@@ -31,56 +40,60 @@ list unchanged.
 
 ## Gotchas
 The row type must implement `Copy`, every field of it must be `pub`, and at least one field
-must have a size. [`ColumnList.get`](#ColumnList.impl.get), [`ColumnList.set`](#ColumnList.impl.set), [`ColumnList.remove`](#ColumnList.impl.remove) and
-[`ColumnList.swapRemove`](#ColumnList.impl.swapRemove) trap if the index is not less than the length.
+must have a size. An index alone, as in `particles[3]`, is a compile error: read a whole row
+with [`ColumnList.get`](#ColumnList.impl.get) and replace it with [`ColumnList.set`](#ColumnList.impl.set). A row index traps if it is not
+less than the length.
 
 ## Examples
-### Read one column
+### Read and write the fields of rows
 ```silk
 import silk.collections.column_list { ColumnList }
 import silk.core.effect { Effect }
 import silk.core.ownership { Copy }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 
-struct Particle {
+struct Point {
   pub x: f32,
+  pub y: f32,
+}
+
+impl Copy for Point {}
+
+struct Particle {
+  pub position: Point,
+  pub speed: f32,
   pub alive: bool,
-  pub id: u64,
 }
 
 impl Copy for Particle {}
 
-effect fn total() -> u64
+effect fn moved() -> f32
   ! OutOfMemoryError
   ? &mut Allocator {
   let mut particles = ColumnList<Particle>.make()
-  run ColumnList<Particle>.append(&mut particles, Particle { x: 1.5, alive: true, id: 7 })
-  run ColumnList<Particle>.append(&mut particles, Particle { x: 2.5, alive: false, id: 8 })
-
-  // Each column is a slice with one element for each row.
-  let alive = ColumnList<Particle>.column(&particles, "alive")
-  let ids = ColumnList<Particle>.column(&particles, "id")
-  let mut sum: u64 = 0
+  run particles.append(Particle { position: Point { x: 1.0, y: 0.0 }, speed: 4.0, alive: true })
+  run particles.append(Particle { position: Point { x: 9.0, y: 0.0 }, speed: 1.0, alive: false })
   let mut at: usize = 0
-  while at < alive.length {
-    if alive[at] {
-      sum = sum + ids[at]
+  while at < particles.length() {
+    // Each access loads or stores one field of one row.
+    if particles[at].alive {
+      particles[at].position.x = particles[at].position.x + particles[at].speed * 0.5
     }
     at = at + 1
   }
-  return sum
+  return particles[0].position.x + particles[1].position.x
 }
 
-effect fn recover(error: OutOfMemoryError) -> u64 {
-  return 0
+effect fn recover(error: OutOfMemoryError) -> f32 {
+  return 0.0
 }
 
 pub fn main() -> i32 {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let sum = run total()
+  let sum = run moved()
     |> Effect.provideMut<Allocator>(&mut allocator)
     |> Effect.catchAll(recover)
-  if sum != 7 {
+  if sum != 12.0 {
     return 1
   }
   return 0
@@ -89,7 +102,7 @@ pub fn main() -> i32 {
 
 ### Write one column while reading another
 ```silk
-import silk.collections.column_list { ColumnList, ColumnView }
+import silk.collections.column_list { ColumnList }
 import silk.core.effect { Effect }
 import silk.core.ownership { Copy }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
@@ -102,18 +115,11 @@ struct Particle {
 
 impl Copy for Particle {}
 
-// The view names the columns that the loop uses. It can write `x` and can only read `speed`.
-struct Step<'a> {
-  pub x: &'a mut [f32],
-  pub speed: &'a [f32],
-}
-
-impl<'a> ColumnView<'a, Particle> for Step<'a> {}
-
-fn advance(step: Step<'_>, seconds: f32) -> () {
+// The signature states which column the function writes and which one it reads.
+fn advance(x: &mut [f32], speed: &[f32], seconds: f32) -> () {
   let mut at: usize = 0
-  while at < step.x.length {
-    step.x[at] = step.x[at] + step.speed[at] * seconds
+  while at < x.length {
+    x[at] = x[at] + speed[at] * seconds
     at = at + 1
   }
   return ()
@@ -123,10 +129,10 @@ effect fn moved() -> f32
   ! OutOfMemoryError
   ? &mut Allocator {
   let mut particles = ColumnList<Particle>.make()
-  run ColumnList<Particle>.append(&mut particles, Particle { x: 1.0, speed: 4.0, id: 1 })
-  let step = ColumnList<Particle>.columnsMut<Step>(&mut particles)
-  advance(move step, 0.5)
-  return ColumnList<Particle>.get(&particles, 0).x
+  run particles.append(Particle { x: 1.0, speed: 4.0, id: 1 })
+  // `..` stands for every row. The two borrows are of different columns.
+  advance(&mut particles[..].x, &particles[..].speed, 0.5)
+  return particles[0].x
 }
 
 effect fn recover(error: OutOfMemoryError) -> f32 {
@@ -145,9 +151,63 @@ pub fn main() -> i32 {
 }
 ```
 
+### Pass a part of the rows to a function
+```silk
+import silk.collections.column_list { ColumnList, RowsMut }
+import silk.core.effect { Effect }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+
+struct Cell {
+  pub width: u32,
+  pub offset: u32,
+}
+
+impl Copy for Cell {}
+
+// The function takes a handle in place of a `&mut [Cell]`. Its indexes start at the first row
+// of the handle.
+fn place(cells: RowsMut<'_, Cell>) -> () {
+  let mut cells = move cells
+  let mut offset: u32 = 0
+  let mut at: usize = 0
+  while at < cells.length() {
+    cells[at].offset = offset
+    offset = offset + cells[at].width
+    at = at + 1
+  }
+  return ()
+}
+
+effect fn placed() -> u32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut cells = ColumnList<Cell>.make()
+  run cells.appendRepeated(Cell { width: 10, offset: 0 }, 4)
+  let mut all = cells.rowsMut()
+  place(all.range(1, 4))
+  return cells[3].offset
+}
+
+effect fn recover(error: OutOfMemoryError) -> u32 {
+  return 0
+}
+
+pub fn main() -> i32 {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let offset = run placed()
+    |> Effect.provideMut<Allocator>(&mut allocator)
+    |> Effect.catchAll(recover)
+  if offset != 20 {
+    return 1
+  }
+  return 0
+}
+```
+
 Import as `ColumnList` with `import silk.collections.column_list { ColumnList }`.
 
-Public declarations: 2.
+Public declarations: 5.
 
 <a id="ColumnList"></a>
 
@@ -166,31 +226,140 @@ growth. All columns live in one allocation, in order of falling alignment and th
 declaration order, with no padding between or inside them. Dropping the list releases the
 allocation. A list is affine.
 
+`list[i].field` is one field of one row, where `i` is a `usize` or an `Id<T>`, and
+`list[..].field` is that field of every row as a slice.
+
 ### Gotchas
 
 `T` must implement `Copy`, every field of `T` must be `pub`, and at least one field must have a
 size. A field that is itself a struct is one column of that struct.
 
-<a id="ColumnView"></a>
+<a id="Rows"></a>
 
-## `ColumnView`
+## `Rows`
 
 ```silk
-pub interface ColumnView<'s, T>
+pub struct Rows<'a, T>
 ```
 
-Marks a struct of column slices as a view of the rows `T`, borrowed for `'s`.
+A shared handle for a run of the rows of a [`ColumnList`](#ColumnList), borrowed for `'a`.
 
 ### When to use
 
-Implement it, with no operations, for a struct to pass to [`ColumnList.columns`](#ColumnList.impl.columns) or
-[`ColumnList.columnsMut`](#ColumnList.impl.columnsMut): `impl<'a> ColumnView<'a, Particle> for Step<'a> {}`. The lifetime
-ties the view to the borrow of the list, so the list cannot change while the view is in use.
+Use it where slice-of-struct code has a `&[T]`: as a parameter, and for the rows that a loop
+reads. Get one from [`ColumnList.rows`](#ColumnList.impl.rows), and a part of one from [`Rows.range`](#Rows.impl.range).
+
+### Details
+
+`rows[i].field` reads one field of one row, and `&rows[..].field` is that field of every row of
+the handle as a slice. A `usize` index counts from the first row of the handle. An `Id<T>`
+index is the row's number in the list, whichever rows the handle has. A handle is `Copy`. It
+keeps the address of the storage by value, so a loop does not load it again from the list.
 
 ### Gotchas
 
-Each field of the view must be `pub`, must have the name of a field of `T`, and must have the
-type `&'a [V]` or `&'a mut [V]`, where `V` is the type of that field.
+A row index traps if it names a row outside the handle. The list cannot change while a handle
+is live.
+
+<a id="Rows.impl.Copy"></a>
+
+## Implementation `Copy for Rows<'a, T>`
+
+```silk
+impl<'a, T> Copy for Rows<'a, T>
+```
+
+<a id="RowsMut"></a>
+
+## `RowsMut`
+
+```silk
+pub struct RowsMut<'a, T>
+```
+
+An exclusive handle for a run of the rows of a [`ColumnList`](#ColumnList), borrowed for `'a`.
+
+### When to use
+
+Use it where slice-of-struct code has a `&mut [T]`: as a parameter, and for the rows that a
+loop writes. Get one from [`ColumnList.rowsMut`](#ColumnList.impl.rowsMut). [`RowsMut.range`](#RowsMut.impl.range) lends a part of the rows,
+and [`RowsMut.splitAt`](#RowsMut.impl.splitAt) cuts the handle into two handles that code can write at the same time.
+
+### Details
+
+`rows[i].field` is one field of one row for reading and writing, and `&mut rows[..].field` is
+that field of every row of the handle as a slice. A `usize` index counts from the first row of
+the handle. An `Id<T>` index is the row's number in the list, whichever rows the handle has.
+The handle keeps the address of the storage by value, so a loop does not load it again after
+each store.
+
+### Gotchas
+
+A row index traps if it names a row outside the handle. The handle cannot add or remove rows,
+and the list cannot be used while the handle is live.
+
+<a id="RowsPair"></a>
+
+## `RowsPair`
+
+```silk
+pub struct RowsPair<'a, T>
+```
+
+The two handles that [`RowsMut.splitAt`](#RowsMut.impl.splitAt) returns: the rows before the cut and the rows from it.
+
+<a id="RowsPair.left"></a>
+
+### Field `left`
+
+```silk
+pub left: RowsMut<'a, T>
+```
+
+The rows before the cut.
+
+<a id="RowsPair.right"></a>
+
+### Field `right`
+
+```silk
+pub right: RowsMut<'a, T>
+```
+
+The rows from the cut to the end.
+
+<a id="ColumnSort"></a>
+
+## `ColumnSort`
+
+```silk
+pub struct ColumnSort
+```
+
+The working storage of [`ColumnList.sortBy`](#ColumnList.impl.sortBy).
+
+### When to use
+
+Make one with [`ColumnSort.make`](#ColumnSort.impl.make) and pass it to each sort. It keeps its storage between calls,
+so a sort allocates only when the list has more rows than any list it sorted before.
+
+<a id="ColumnSort.impl"></a>
+
+## Implementation `ColumnSort`
+
+```silk
+impl ColumnSort
+```
+
+<a id="ColumnSort.impl.make"></a>
+
+### Associated function `make`
+
+```silk
+pub fn make() -> ColumnSort
+```
+
+Returns working storage that holds nothing. This function does not allocate.
 
 <a id="ColumnList.impl"></a>
 
@@ -247,96 +416,41 @@ pub fn capacity(self: &Self) -> usize
 
 Returns the number of rows that fit in the current storage before the next growth.
 
-<a id="ColumnList.impl.column"></a>
+<a id="ColumnList.impl.rows"></a>
 
-### Method `column`
-
-```silk
-pub fn column<'s, V>(self: &'s Self, static field: Intrinsic.Field<T, V>) -> &'s [V]
-```
-
-Returns a shared borrow of the column of `field`, one element for each row, in row order.
-
-#### Details
-
-`field` is a static argument. Write the field's name as a string literal:
-`particles.column("x")`. A name that is not a field of `T` is an error at the literal.
-
-#### Gotchas
-
-The slice borrows the list. The compiler rejects a change to the list while the slice is
-live.
-
-<a id="ColumnList.impl.columnMut"></a>
-
-### Method `columnMut`
+### Method `rows`
 
 ```silk
-pub fn columnMut<'s, V>(self: &'s mut Self, static field: Intrinsic.Field<T, V>) -> &'s mut [V]
+pub fn rows<'s>(self: &'s Self) -> Rows<'s, T>
 ```
 
-Returns an exclusive borrow of the column of `field`, one element for each row, in row order.
+Returns a shared handle for all rows of the list.
 
 #### When to use
 
-Use `columnMut` to change one column in place. To change several columns in one loop, use
-[`ColumnList.columnsMut`](#ColumnList.impl.columnsMut).
+Use the handle in a loop that reads fields, and pass it to a function that would take a
+`&[T]` of a slice of structs. `rows[i].field` on the handle does not load the address of the
+storage from the list each time.
 
-#### Gotchas
+<a id="ColumnList.impl.rowsMut"></a>
 
-The slice cannot change the length. The compiler rejects other uses of the list while the
-slice is live.
-
-<a id="ColumnList.impl.columns"></a>
-
-### Method `columns`
+### Method `rowsMut`
 
 ```silk
-pub fn columns<'s, View: ColumnView<'s, T>>(self: &'s Self) -> View
+pub fn rowsMut<'s>(self: &'s mut Self) -> RowsMut<'s, T>
 ```
 
-Returns a view of several columns, each one a shared borrow.
-
-#### Details
-
-`View` is a struct that the caller declares and for which the caller implements
-[`ColumnView`](#ColumnView). Each field of it has the name of a field of `T` and the type `&'a [V]`, where
-`V` is the type of that field. Write the view type at the call:
-`particles.columns<Positions>()`. A field of the view that is not a field of `T`, or that has
-the type `&'a mut [V]`, is a compile error.
-
-#### Gotchas
-
-The view borrows the list. The compiler rejects a change to the list while the view is live.
-
-<a id="ColumnList.impl.columnsMut"></a>
-
-### Method `columnsMut`
-
-```silk
-pub fn columnsMut<'s, View: ColumnView<'s, T>>(self: &'s mut Self) -> View
-```
-
-Returns a view of several columns, in which each column is a shared or an exclusive borrow.
+Returns an exclusive handle for all rows of the list.
 
 #### When to use
 
-Use `columnsMut` for a loop that writes some columns while it reads others. The view type
-states which is which: a field of type `&'a mut [V]` can be written, and a field of type
-`&'a [V]` can only be read.
-
-#### Details
-
-`View` is a struct that the caller declares and for which the caller implements
-[`ColumnView`](#ColumnView). Each field of it has the name of a field of `T` and the type `&'a [V]` or
-`&'a mut [V]`, where `V` is the type of that field. Write the view type at the call:
-`particles.columnsMut<Step>()`. A field of the view that is not a field of `T` is a compile
-error.
+Use the handle in a loop that writes fields, and pass it to a function that would take a
+`&mut [T]` of a slice of structs. The handle keeps the address of the storage by value. A
+loop through `&mut ColumnList` can load it from the list again after each store.
 
 #### Gotchas
 
-The view cannot change the length. The compiler rejects other uses of the list while the
-view is live.
+The list cannot be used while the handle is live, and the handle cannot add or remove rows.
 
 <a id="ColumnList.impl.get"></a>
 
@@ -346,7 +460,12 @@ view is live.
 pub fn get(self: &Self, index: usize) -> T
 ```
 
-Returns the row at `index`, gathered from the columns.
+Returns a copy of the row at `index`.
+
+#### When to use
+
+Use `get` when code needs every field of one row. It reads each column once. To read one
+field, write `list[index].field`.
 
 #### Gotchas
 
@@ -388,6 +507,86 @@ later growth doubles the capacity.
 - `OutOfMemoryError` if the `Allocator` cannot supply the new storage. The list does not
   change.
 
+<a id="ColumnList.impl.appendId"></a>
+
+### Method `appendId`
+
+```silk
+pub effect fn appendId(self: &mut Self, row: T) -> Id<T>
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Adds `row` at the end of the list and returns the id of the new row.
+
+#### When to use
+
+Use it when other rows store a link to the new row as an `Id<T>`.
+
+#### Errors
+
+- `OutOfMemoryError` if the `Allocator` cannot supply the new storage. The list does not
+  change.
+
+#### Gotchas
+
+It traps if the list already has 4,294,967,295 rows, because an `Id` cannot name the next
+one.
+
+<a id="ColumnList.impl.appendWithinCapacity"></a>
+
+### Method `appendWithinCapacity`
+
+```silk
+pub fn appendWithinCapacity(self: &mut Self, row: T) -> bool
+```
+
+Adds `row` at the end of the list if the list is not full. Returns `true` if it added the
+row.
+
+#### When to use
+
+Use it after [`ColumnList.reserve`](#ColumnList.impl.reserve) in code that must not allocate or fail.
+
+<a id="ColumnList.impl.appendSlice"></a>
+
+### Method `appendSlice`
+
+```silk
+pub effect fn appendSlice(self: &mut Self, source: Rows<'_, T>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Adds a copy of each row of `source` at the end of the list, in order.
+
+#### Details
+
+`source` is a handle for rows of another list. For rows `a` to `b` of that list, pass
+`other.rows().range(a, b)`. It copies one column at a time.
+
+#### Errors
+
+- `OutOfMemoryError` if the row count overflows, or the `Allocator` cannot supply the new
+  storage. The list does not change.
+
+<a id="ColumnList.impl.appendRepeated"></a>
+
+### Method `appendRepeated`
+
+```silk
+pub effect fn appendRepeated(self: &mut Self, row: T, count: usize) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Adds `count` copies of `row` at the end of the list.
+
+#### Errors
+
+- `OutOfMemoryError` if the row count overflows, or the `Allocator` cannot supply the new
+  storage. The list does not change.
+
 <a id="ColumnList.impl.insert"></a>
 
 ### Method `insert`
@@ -404,6 +603,49 @@ Inserts `row` at `index` and moves the rows from `index` up by one.
 
 - `OutOfMemoryError` if the `Allocator` cannot supply the new storage. The list does not
   change.
+
+#### Gotchas
+
+It traps if `index` is more than the length.
+
+<a id="ColumnList.impl.insertSlice"></a>
+
+### Method `insertSlice`
+
+```silk
+pub effect fn insertSlice(self: &mut Self, index: usize, source: Rows<'_, T>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Inserts a copy of each row of `source` at `index`, in order, and moves the rows from `index`
+up.
+
+#### Errors
+
+- `OutOfMemoryError` if the row count overflows, or the `Allocator` cannot supply the new
+  storage. The list does not change.
+
+#### Gotchas
+
+It traps if `index` is more than the length.
+
+<a id="ColumnList.impl.insertRepeated"></a>
+
+### Method `insertRepeated`
+
+```silk
+pub effect fn insertRepeated(self: &mut Self, index: usize, row: T, count: usize) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Inserts `count` copies of `row` at `index` and moves the rows from `index` up.
+
+#### Errors
+
+- `OutOfMemoryError` if the row count overflows, or the `Allocator` cannot supply the new
+  storage. The list does not change.
 
 #### Gotchas
 
@@ -456,6 +698,145 @@ It moves one row whatever the length is, but it changes the order of the rows.
 
 It traps if `index` is not less than the length.
 
+<a id="ColumnList.impl.removeRange"></a>
+
+### Method `removeRange`
+
+```silk
+pub fn removeRange(self: &mut Self, start: usize, end: usize) -> ()
+```
+
+Removes the rows from `start` up to but not including `end`, and moves the later rows down.
+
+#### Gotchas
+
+It traps if `start` is more than `end`, or `end` is more than the length.
+
+<a id="ColumnList.impl.moveRange"></a>
+
+### Method `moveRange`
+
+```silk
+pub fn moveRange(self: &mut Self, from: usize, to: usize, count: usize) -> ()
+```
+
+Copies the `count` rows that start at `from` over the `count` rows that start at `to`.
+
+#### Details
+
+The two runs of rows can overlap: each target row gets the value that its source row had
+before the call. The length does not change, and rows outside the target run keep their
+values. It moves one column at a time.
+
+#### Gotchas
+
+It traps if either run of rows goes past the length.
+
+<a id="ColumnList.impl.splitOff"></a>
+
+### Method `splitOff`
+
+```silk
+pub effect fn splitOff(self: &mut Self, at: usize) -> ColumnList<T>
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Removes the rows from `at` to the end and returns them as a new list.
+
+#### Details
+
+The new list has storage for exactly the rows it holds. This list keeps its capacity.
+
+#### Errors
+
+- `OutOfMemoryError` if the `Allocator` cannot supply the storage of the new list. This list
+  does not change.
+
+#### Gotchas
+
+It traps if `at` is more than the length.
+
+<a id="ColumnList.impl.sortBy"></a>
+
+### Method `sortBy`
+
+```silk
+pub effect fn sortBy<K: Order>(
+    self: &mut Self,
+    static key: Intrinsic.Field<T, K>,
+    scratch: &mut ColumnSort,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Sorts the rows by the field `key`, from the least value to the greatest.
+
+#### Details
+
+`key` is a static argument. Write the field's name as a string literal, as in
+`nodes.sortBy("depth", &mut scratch)`. The type of the field must implement `Order`. The sort
+is stable: rows with equal keys keep their order. It orders the row numbers by the key
+column, then moves one column at a time. `scratch` holds the row numbers. It keeps its
+storage, so a later sort of a list that is not longer does not allocate.
+
+#### Errors
+
+- `OutOfMemoryError` if the `Allocator` cannot supply the storage of `scratch`. The list does
+  not change.
+
+#### Gotchas
+
+It traps if the list has more than 4,294,967,295 rows. An `Id<T>` that named a row names
+another row after the sort.
+
+#### Examples
+
+##### Sort rows by one field
+
+```silk
+import silk.collections.column_list { ColumnList, ColumnSort }
+import silk.core.effect { Effect }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+
+struct Task {
+  pub priority: u32,
+  pub id: u64,
+}
+
+impl Copy for Task {}
+
+effect fn first() -> u64
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut tasks = ColumnList<Task>.make()
+  run tasks.append(Task { priority: 3, id: 10 })
+  run tasks.append(Task { priority: 1, id: 11 })
+  run tasks.append(Task { priority: 2, id: 12 })
+  // Keep the scratch and pass it to later sorts.
+  let mut scratch = ColumnSort.make()
+  run tasks.sortBy("priority", &mut scratch)
+  return tasks[0].id
+}
+
+effect fn recover(error: OutOfMemoryError) -> u64 {
+  return 0
+}
+
+pub fn main() -> i32 {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let id = run first()
+    |> Effect.provideMut<Allocator>(&mut allocator)
+    |> Effect.catchAll(recover)
+  if id != 11 {
+    return 1
+  }
+  return 0
+}
+```
+
 <a id="ColumnList.impl.clear"></a>
 
 ### Method `clear`
@@ -465,6 +846,16 @@ pub fn clear(self: &mut Self) -> ()
 ```
 
 Removes all rows and keeps the capacity.
+
+<a id="ColumnList.impl.clearAndFree"></a>
+
+### Method `clearAndFree`
+
+```silk
+pub fn clearAndFree(self: &mut Self) -> ()
+```
+
+Removes all rows and releases the storage. The capacity becomes zero.
 
 <a id="ColumnList.impl.truncate"></a>
 
@@ -489,6 +880,33 @@ pub effect fn reserve(self: &mut Self, additional: usize) -> ()
 
 Makes room for at least `additional` more rows.
 
+#### Details
+
+It can take more room than it needs, so that a series of appends grows the list few times.
+Use [`ColumnList.reserveExact`](#ColumnList.impl.reserveExact) for an exact capacity.
+
+#### Errors
+
+- `OutOfMemoryError` if the row count overflows, or the `Allocator` cannot supply the
+  storage. The list does not change.
+
+<a id="ColumnList.impl.reserveExact"></a>
+
+### Method `reserveExact`
+
+```silk
+pub effect fn reserveExact(self: &mut Self, additional: usize) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Makes room for exactly `additional` more rows if the list has less room than that.
+
+#### When to use
+
+Use it when the final number of rows is known. [`ColumnList.reserve`](#ColumnList.impl.reserve) is the better choice
+before a series of appends of unknown length.
+
 #### Errors
 
 - `OutOfMemoryError` if the row count overflows, or the `Allocator` cannot supply the
@@ -510,6 +928,455 @@ Releases the capacity beyond the length.
 
 - `OutOfMemoryError` if the `Allocator` cannot supply the smaller storage. The list does not
   change.
+
+<a id="Rows.impl"></a>
+
+## Implementation `Rows<'a, T>`
+
+```silk
+impl<'a, T: Copy> Rows<'a, T>
+```
+
+<a id="Rows.impl.length"></a>
+
+### Method `length`
+
+```silk
+pub fn length(self: Self) -> usize
+```
+
+Returns the number of rows of the handle.
+
+<a id="Rows.impl.range"></a>
+
+### Method `range`
+
+```silk
+pub fn range(self: Self, start: usize, end: usize) -> Rows<'a, T>
+```
+
+Returns a handle for the rows from `start` up to but not including `end`.
+
+#### Details
+
+`start` and `end` count from the first row of this handle. In the new handle a `usize` index
+counts from `start`, and an `Id<T>` index stays the row's number in the list.
+
+#### Gotchas
+
+It traps if `start` is more than `end`, or `end` is more than the length.
+
+<a id="Rows.impl.get"></a>
+
+### Method `get`
+
+```silk
+pub fn get(self: Self, index: usize) -> T
+```
+
+Returns a copy of the row at `index`, which counts from the first row of the handle.
+
+#### Gotchas
+
+It traps if `index` is not less than the length.
+
+<a id="RowsMut.impl"></a>
+
+## Implementation `RowsMut<'a, T>`
+
+```silk
+impl<'a, T: Copy> RowsMut<'a, T>
+```
+
+<a id="RowsMut.impl.length"></a>
+
+### Method `length`
+
+```silk
+pub fn length(self: &Self) -> usize
+```
+
+Returns the number of rows of the handle.
+
+<a id="RowsMut.impl.rows"></a>
+
+### Method `rows`
+
+```silk
+pub fn rows<'s>(self: &'s Self) -> Rows<'s, T>
+```
+
+Returns a shared handle for the same rows, for as long as this handle is borrowed.
+
+<a id="RowsMut.impl.range"></a>
+
+### Method `range`
+
+```silk
+pub fn range<'s>(self: &'s mut Self, start: usize, end: usize) -> RowsMut<'s, T>
+```
+
+Returns an exclusive handle for the rows from `start` up to but not including `end`, for as
+long as this handle is borrowed.
+
+#### Details
+
+`start` and `end` count from the first row of this handle. In the new handle a `usize` index
+counts from `start`, and an `Id<T>` index stays the row's number in the list.
+
+#### Gotchas
+
+It traps if `start` is more than `end`, or `end` is more than the length.
+
+<a id="RowsMut.impl.splitAt"></a>
+
+### Method `splitAt`
+
+```silk
+pub fn splitAt(self: Self, at: usize) -> RowsPair<'a, T>
+```
+
+Cuts the handle into a handle for the rows before `at` and a handle for the rows from `at`.
+
+#### When to use
+
+Use it to write two runs of rows at the same time, such as two halves that two functions
+fill.
+
+#### Gotchas
+
+It traps if `at` is more than the length.
+
+#### Examples
+
+##### Write two parts of the rows through two handles
+
+```silk
+import silk.collections.column_list { ColumnList }
+import silk.core.effect { Effect }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+
+struct Cell {
+  pub value: u32,
+}
+
+impl Copy for Cell {}
+
+effect fn sum() -> u32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut cells = ColumnList<Cell>.make()
+  run cells.appendRepeated(Cell { value: 0 }, 4)
+  let pair = cells.rowsMut().splitAt(1)
+  let mut head = move pair.left
+  let mut tail = move pair.right
+  // Both handles are live. Each index counts from the first row of its handle.
+  head[0].value = 1
+  tail[0].value = 20
+  tail[2].value = 300
+  return cells[0].value + cells[1].value + cells[3].value
+}
+
+effect fn recover(error: OutOfMemoryError) -> u32 {
+  return 0
+}
+
+pub fn main() -> i32 {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let total = run sum()
+    |> Effect.provideMut<Allocator>(&mut allocator)
+    |> Effect.catchAll(recover)
+  if total != 321 {
+    return 1
+  }
+  return 0
+}
+```
+
+<a id="RowsMut.impl.get"></a>
+
+### Method `get`
+
+```silk
+pub fn get(self: &Self, index: usize) -> T
+```
+
+Returns a copy of the row at `index`, which counts from the first row of the handle.
+
+#### Gotchas
+
+It traps if `index` is not less than the length.
+
+<a id="RowsMut.impl.set"></a>
+
+### Method `set`
+
+```silk
+pub fn set(self: &mut Self, index: usize, row: T) -> ()
+```
+
+Replaces the row at `index`, which counts from the first row of the handle, with `row`.
+
+#### Gotchas
+
+It traps if `index` is not less than the length.
+
+<a id="ColumnList.impl.Rows"></a>
+
+## Implementation `Intrinsic.Rows<usize, T> for ColumnList<T>`
+
+```silk
+impl<T: Copy> Intrinsic.Rows<usize, T> for ColumnList<T>
+```
+
+<a id="ColumnList.impl.Rows.borrow"></a>
+
+### Operation `borrow`
+
+```silk
+fn borrow<'s, V>(self: &'s Self, index: usize, static field: Intrinsic.Field<T, V>) -> &'s V
+```
+
+<a id="ColumnList.impl.Rows.span"></a>
+
+### Operation `span`
+
+```silk
+fn span<'s, V>(self: &'s Self, static field: Intrinsic.Field<T, V>) -> &'s [V]
+```
+
+<a id="ColumnList.impl.RowsMut"></a>
+
+## Implementation `Intrinsic.RowsMut<usize, T> for ColumnList<T>`
+
+```silk
+impl<T: Copy> Intrinsic.RowsMut<usize, T> for ColumnList<T>
+```
+
+<a id="ColumnList.impl.RowsMut.borrowMut"></a>
+
+### Operation `borrowMut`
+
+```silk
+fn borrowMut<'s, V>(
+    self: &'s mut Self,
+    index: usize,
+    static field: Intrinsic.Field<T, V>,
+  ) -> &'s mut V
+```
+
+<a id="ColumnList.impl.RowsMut.spanMut"></a>
+
+### Operation `spanMut`
+
+```silk
+fn spanMut<'s, V>(self: &'s mut Self, static field: Intrinsic.Field<T, V>) -> &'s mut [V]
+```
+
+<a id="ColumnList.impl.Rows-2"></a>
+
+## Implementation `Intrinsic.Rows<Id<T>, T> for ColumnList<T>`
+
+```silk
+impl<T: Copy> Intrinsic.Rows<Id<T>, T> for ColumnList<T>
+```
+
+<a id="ColumnList.impl.Rows.borrow-2"></a>
+
+### Operation `borrow`
+
+```silk
+fn borrow<'s, V>(self: &'s Self, index: Id<T>, static field: Intrinsic.Field<T, V>) -> &'s V
+```
+
+<a id="ColumnList.impl.Rows.span-2"></a>
+
+### Operation `span`
+
+```silk
+fn span<'s, V>(self: &'s Self, static field: Intrinsic.Field<T, V>) -> &'s [V]
+```
+
+<a id="ColumnList.impl.RowsMut-2"></a>
+
+## Implementation `Intrinsic.RowsMut<Id<T>, T> for ColumnList<T>`
+
+```silk
+impl<T: Copy> Intrinsic.RowsMut<Id<T>, T> for ColumnList<T>
+```
+
+<a id="ColumnList.impl.RowsMut.borrowMut-2"></a>
+
+### Operation `borrowMut`
+
+```silk
+fn borrowMut<'s, V>(
+    self: &'s mut Self,
+    index: Id<T>,
+    static field: Intrinsic.Field<T, V>,
+  ) -> &'s mut V
+```
+
+<a id="ColumnList.impl.RowsMut.spanMut-2"></a>
+
+### Operation `spanMut`
+
+```silk
+fn spanMut<'s, V>(self: &'s mut Self, static field: Intrinsic.Field<T, V>) -> &'s mut [V]
+```
+
+<a id="Rows.impl.Rows"></a>
+
+## Implementation `Intrinsic.Rows<usize, T> for Rows<'a, T>`
+
+```silk
+impl<'a, T: Copy> Intrinsic.Rows<usize, T> for Rows<'a, T>
+```
+
+<a id="Rows.impl.Rows.borrow"></a>
+
+### Operation `borrow`
+
+```silk
+fn borrow<'s, V>(self: &'s Self, index: usize, static field: Intrinsic.Field<T, V>) -> &'s V
+```
+
+<a id="Rows.impl.Rows.span"></a>
+
+### Operation `span`
+
+```silk
+fn span<'s, V>(self: &'s Self, static field: Intrinsic.Field<T, V>) -> &'s [V]
+```
+
+<a id="Rows.impl.Rows-2"></a>
+
+## Implementation `Intrinsic.Rows<Id<T>, T> for Rows<'a, T>`
+
+```silk
+impl<'a, T: Copy> Intrinsic.Rows<Id<T>, T> for Rows<'a, T>
+```
+
+<a id="Rows.impl.Rows.borrow-2"></a>
+
+### Operation `borrow`
+
+```silk
+fn borrow<'s, V>(self: &'s Self, index: Id<T>, static field: Intrinsic.Field<T, V>) -> &'s V
+```
+
+<a id="Rows.impl.Rows.span-2"></a>
+
+### Operation `span`
+
+```silk
+fn span<'s, V>(self: &'s Self, static field: Intrinsic.Field<T, V>) -> &'s [V]
+```
+
+<a id="RowsMut.impl.Rows"></a>
+
+## Implementation `Intrinsic.Rows<usize, T> for RowsMut<'a, T>`
+
+```silk
+impl<'a, T: Copy> Intrinsic.Rows<usize, T> for RowsMut<'a, T>
+```
+
+<a id="RowsMut.impl.Rows.borrow"></a>
+
+### Operation `borrow`
+
+```silk
+fn borrow<'s, V>(self: &'s Self, index: usize, static field: Intrinsic.Field<T, V>) -> &'s V
+```
+
+<a id="RowsMut.impl.Rows.span"></a>
+
+### Operation `span`
+
+```silk
+fn span<'s, V>(self: &'s Self, static field: Intrinsic.Field<T, V>) -> &'s [V]
+```
+
+<a id="RowsMut.impl.RowsMut"></a>
+
+## Implementation `Intrinsic.RowsMut<usize, T> for RowsMut<'a, T>`
+
+```silk
+impl<'a, T: Copy> Intrinsic.RowsMut<usize, T> for RowsMut<'a, T>
+```
+
+<a id="RowsMut.impl.RowsMut.borrowMut"></a>
+
+### Operation `borrowMut`
+
+```silk
+fn borrowMut<'s, V>(
+    self: &'s mut Self,
+    index: usize,
+    static field: Intrinsic.Field<T, V>,
+  ) -> &'s mut V
+```
+
+<a id="RowsMut.impl.RowsMut.spanMut"></a>
+
+### Operation `spanMut`
+
+```silk
+fn spanMut<'s, V>(self: &'s mut Self, static field: Intrinsic.Field<T, V>) -> &'s mut [V]
+```
+
+<a id="RowsMut.impl.Rows-2"></a>
+
+## Implementation `Intrinsic.Rows<Id<T>, T> for RowsMut<'a, T>`
+
+```silk
+impl<'a, T: Copy> Intrinsic.Rows<Id<T>, T> for RowsMut<'a, T>
+```
+
+<a id="RowsMut.impl.Rows.borrow-2"></a>
+
+### Operation `borrow`
+
+```silk
+fn borrow<'s, V>(self: &'s Self, index: Id<T>, static field: Intrinsic.Field<T, V>) -> &'s V
+```
+
+<a id="RowsMut.impl.Rows.span-2"></a>
+
+### Operation `span`
+
+```silk
+fn span<'s, V>(self: &'s Self, static field: Intrinsic.Field<T, V>) -> &'s [V]
+```
+
+<a id="RowsMut.impl.RowsMut-2"></a>
+
+## Implementation `Intrinsic.RowsMut<Id<T>, T> for RowsMut<'a, T>`
+
+```silk
+impl<'a, T: Copy> Intrinsic.RowsMut<Id<T>, T> for RowsMut<'a, T>
+```
+
+<a id="RowsMut.impl.RowsMut.borrowMut-2"></a>
+
+### Operation `borrowMut`
+
+```silk
+fn borrowMut<'s, V>(
+    self: &'s mut Self,
+    index: Id<T>,
+    static field: Intrinsic.Field<T, V>,
+  ) -> &'s mut V
+```
+
+<a id="RowsMut.impl.RowsMut.spanMut-2"></a>
+
+### Operation `spanMut`
+
+```silk
+fn spanMut<'s, V>(self: &'s mut Self, static field: Intrinsic.Field<T, V>) -> &'s mut [V]
+```
 
 
 Category: Collections.

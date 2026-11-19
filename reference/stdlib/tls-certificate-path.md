@@ -15,7 +15,7 @@ Call [`CertificatePath.validate`](#CertificatePath.impl.validate) with the certi
 The validator tries to build a path from the leaf, through the intermediates, to an anchor. At
 each step it tries the anchors first and then the intermediates, in the order that you gave
 them, and it backtracks when a candidate fails. It checks signatures, validity dates at the
-[`Instant`](./system-system-clock.md#Instant) that you give, basic constraints, key usage, the extended key usage for the
+[`Instant`](./time-instant.md#Instant) that you give, basic constraints, key usage, the extended key usage for the
 `CertificatePurpose` that you give, path length, and DNS and IP name constraints.
 [`ValidationLimits`](#ValidationLimits) bound all work, so a hostile chain cannot make it run for
 long.

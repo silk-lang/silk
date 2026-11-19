@@ -134,7 +134,7 @@ effect fn withAttempt(
       httpLimits: Limits,
       poolMode: PoolMode,
       proxyMode: ProxyMode,
-      deadline: Option<Instant>,
+      deadline: Option<Mark>,
     ) -> A
     ! HandlerError | NativeExchangeError
     ? HandlerRequirements | &mut HybridAttempt<
