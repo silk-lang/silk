@@ -325,6 +325,20 @@ pub effect fn file(self: &mut Self, value: &Deferred<Path>) -> ()
 
 Declares one readable file; its bytes or producer key participate in this step's key.
 
+<a id="Key.impl.location"></a>
+
+### Method `location`
+
+```silk
+pub effect fn location(self: &mut Self, value: &Deferred<Path>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Declares a path the step names without reading it, such as a file it will write for the
+user. Only where the path is takes part in the key, so the path need not exist yet.
+`Make.path` resolves it.
+
 <a id="Key.impl.toolchain"></a>
 
 ### Method `toolchain`

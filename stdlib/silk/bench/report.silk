@@ -1,0 +1,1507 @@
+//! Turns the raw samples of a benchmark run into the report a renderer draws.
+//!
+//! # When to use
+//! Call [`Reports.make`] on a `silk.bench.record.RunResult` you read from a result file, to
+//! render a saved run again or with another noise threshold. `silk.bench.bench` calls it for
+//! every suite it runs.
+//!
+//! # Details
+//! A combination of parameters whose programs print result lines gets one table for each name
+//! the lines carry, in the unit of the lines: `ns/op` when a line has it, or else the first
+//! unit written. The medians of the other units are in the row. Where a larger value is better,
+//! as for `req/s`, a ratio above 1 has the verdict `faster`. When the lines of two
+//! implementations carry different checks for one name, the table is marked and no row of it
+//! has a ratio. Every other combination gets one table of process times, as follows.
+//!
+//! Each implementation gets one row for each benchmark. The row's statistics cover the measured
+//! runs that exited with status 0: warm-up runs and failed runs are left out, and failed runs
+//! are counted in the row. Every row except the reference's gets its ratio to the reference
+//! with a 95% interval and a verdict, from `silk.bench.statistics`. A suite with more than one
+//! benchmark also gets the geometric mean of each implementation's ratios.
+//!
+//! @category Benchmarks
+
+import silk.bench.record {
+  Chart,
+  Panel,
+  Point,
+  Series,
+  Comparison,
+  Environment,
+  Measured,
+  Metric,
+  Overall,
+  PROTOCOL,
+  Pair,
+  Reading,
+  Report,
+  Row,
+  RunResult,
+  Sample,
+  Subject,
+  Table
+}
+import silk.bench.statistics { Ratio, Statistics, Summary, Verdict }
+import silk.bench.units { Units }
+import silk.bench.view { View }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f64
+import silk.num.u64
+import silk.num.usize
+import silk.text.format { Format as Text, ParseError }
+import silk.text.string { String }
+
+/// The owner type of the report functions. It has no fields and is never constructed.
+pub struct Reports {}
+
+impl Reports {
+  /// Returns the report of `result`, with verdicts at the noise threshold `noise`, a fraction
+  /// such as 0.01 for 1%.
+  ///
+  /// # Errors
+  /// `OutOfMemoryError` if the `Allocator` cannot supply the report.
+  pub effect fn make(result: &RunResult, noise: f64) -> Report
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut tables = List<Table>.make()
+    let measured = result.benchmarks.asSlice()
+    let subjects = result.implementations.asSlice()
+    let mut at: usize = 0
+    while at < measured.length {
+      if measured[at].readings.length() == 0 {
+        run tables.append(run table(&measured[at], subjects, result.reference.view(), noise))
+      } else {
+        run readingTables(&mut tables, result, &measured[at], noise)
+      }
+      at = at + 1
+    }
+    let mut overall = List<Overall>.make()
+    if tables.length() > 1 {
+      let mut subject: usize = 0
+      while subject < subjects.length {
+        let name = subjects[subject].name.view()
+        if name != result.reference.view() {
+          let mut ratios = List<f64>.make()
+          let listed = tables.asSlice()
+          let mut index: usize = 0
+          while index < listed.length {
+            let rows = listed[index].rows.asSlice()
+            let mut row: usize = 0
+            while row < rows.length {
+              if rows[row].implementation.view() == name {
+                if let Option<Comparison>.Some { value } = &rows[row].ratio {
+                  if listed[index].higher {
+                    run ratios.append(1.0 / value.value)
+                  } else {
+                    run ratios.append(value.value)
+                  }
+                }
+              }
+              row = row + 1
+            }
+            index = index + 1
+          }
+          if ratios.length() > 1 {
+            run overall.append(
+              Overall {
+                implementation: run String.copy(name),
+                ratio: Statistics.geometricMean(ratios.asSlice()),
+                benchmarks: usize.toU64(ratios.length()),
+              },
+            )
+          }
+        }
+        subject = subject + 1
+      }
+    }
+    return Report {
+      protocol: PROTOCOL,
+      suite: run String.copy(result.suite.view()),
+      id: run String.copy(result.id.view()),
+      label: run copyOptional(&result.label),
+      revision: run copyOptional(&result.revision),
+      started: run String.copy(result.started.view()),
+      ended: run String.copy(result.ended.view()),
+      notes: run copyTexts(&result.notes),
+      environment: run copyEnvironment(&result.environment),
+      implementations: run copySubjects(subjects),
+      reference: run String.copy(result.reference.view()),
+      noise: noise,
+      runs: result.runs,
+      floor: result.floor,
+      benchmarks: move tables,
+      overall: move overall,
+      views: run chartsOf(result, noise),
+    }
+  }
+}
+
+// The wall times of the successful measured runs of `name`, in nanoseconds.
+effect fn timesOf(samples: &[Sample], name: string) -> List<f64>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut times = List<f64>.make()
+  let mut at: usize = 0
+  while at < samples.length {
+    if counted(&samples[at], name) {
+      run times.append(u64.toF64(samples[at].wall))
+    }
+    at = at + 1
+  }
+  return move times
+}
+
+fn measuredFor(sample: &Sample, name: string) -> bool {
+  return !sample.warmup && sample.implementation.view() == name
+}
+
+fn counted(sample: &Sample, name: string) -> bool {
+  return measuredFor(sample, name) && sample.exit == 0 && sample.signal == 0
+}
+
+effect fn table(measured: &Measured, subjects: &[Subject], reference: string, noise: f64) -> Table
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let samples = measured.samples.asSlice()
+  let base = run timesOf(samples, reference)
+  let mut rows = List<Row>.make()
+  let mut subject: usize = 0
+  while subject < subjects.length {
+    let name = subjects[subject].name.view()
+    let times = run timesOf(samples, name)
+    let mut user = List<f64>.make()
+    let mut system = List<f64>.make()
+    let mut peak = List<f64>.make()
+    let mut failures: u64 = 0
+    let mut at: usize = 0
+    while at < samples.length {
+      if counted(&samples[at], name) {
+        run user.append(u64.toF64(samples[at].user))
+        run system.append(u64.toF64(samples[at].system))
+        run peak.append(u64.toF64(samples[at].peak))
+      } else if measuredFor(&samples[at], name) {
+        failures = failures + 1
+      }
+      at = at + 1
+    }
+    let summary = run Statistics.summary(times.asSlice())
+    let isReference = name == reference
+    let mut ratio = Option<Comparison>.None
+    if !isReference && times.length() > 0 && base.length() > 0 {
+      let compared = run Statistics.ratio(times.asSlice(), base.asSlice(), noise)
+      ratio = Option<Comparison>.Some {
+        value: Comparison {
+          value: compared.value,
+          low: compared.low,
+          high: compared.high,
+          verdict: run String.copy(verdictText(compared.verdict)),
+        },
+      }
+    }
+    run rows.append(
+      Row {
+        implementation: run String.copy(name),
+        reference: isReference,
+        runs: usize.toU64(summary.count),
+        failures: failures,
+        median: summary.median,
+        minimum: summary.minimum,
+        maximum: summary.maximum,
+        mean: summary.mean,
+        low: summary.low,
+        high: summary.high,
+        outliers: usize.toU64(summary.outliers),
+        user: run Statistics.median(user.asSlice()),
+        system: run Statistics.median(system.asSlice()),
+        peak: run Statistics.median(peak.asSlice()),
+        ratio: move ratio,
+        times: move times,
+        others: List<Metric>.make(),
+        check: Option<String>.None,
+      },
+    )
+    subject = subject + 1
+  }
+  return Table {
+    name: run String.copy(measured.name.view()),
+    parameters: run copyPairs(&measured.parameters),
+    unit: run String.copy("ns"),
+    higher: false,
+    mismatch: false,
+    rows: move rows,
+  }
+}
+
+// Whether the measured run of `name` in `round` ended well. A reading of a run that failed is
+// in no statistic.
+fn succeeded(samples: &[Sample], name: string, round: u64) -> bool {
+  let mut at: usize = 0
+  while at < samples.length {
+    if measuredFor(&samples[at], name) && samples[at].round == round {
+      return samples[at].exit == 0 && samples[at].signal == 0
+    }
+    at = at + 1
+  }
+  return true
+}
+
+fn valueOf(reading: &Reading, unit: string) -> Option<f64> {
+  let values = reading.values.asSlice()
+  let mut at: usize = 0
+  while at < values.length {
+    if values[at].unit.view() == unit {
+      return Option<f64>.Some { value: values[at].value }
+    }
+    at = at + 1
+  }
+  return Option<f64>.None
+}
+
+// The values of `unit` that the counted readings of `title` by `name` carry.
+effect fn valuesOf(measured: &Measured, title: string, name: string, unit: string) -> List<f64>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut values = List<f64>.make()
+  let readings = measured.readings.asSlice()
+  let samples = measured.samples.asSlice()
+  let mut at: usize = 0
+  while at < readings.length {
+    let reading = &readings[at]
+    if !reading.warmup && reading.name.view() == title && reading.implementation.view() == name
+      && succeeded(samples, name, reading.round) {
+      if let Option<f64>.Some { value } = valueOf(reading, unit) {
+        run values.append(value)
+      }
+    }
+    at = at + 1
+  }
+  return move values
+}
+
+// The units the measured readings of `title` carry, in the order they first appear, with
+// `ns/op` first when a reading has it: the first unit is the one the statistics cover.
+effect fn unitsOf(measured: &Measured, title: string) -> List<String>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut units = List<String>.make()
+  let readings = measured.readings.asSlice()
+  let mut at: usize = 0
+  while at < readings.length {
+    if readings[at].name.view() == title {
+      let values = readings[at].values.asSlice()
+      let mut value: usize = 0
+      while value < values.length {
+        let unit = values[value].unit.view()
+        let known = units.asSlice()
+        let mut found = false
+        let mut index: usize = 0
+        while index < known.length {
+          if known[index].view() == unit {
+            found = true
+          }
+          index = index + 1
+        }
+        if !found {
+          run units.append(run String.copy(unit))
+        }
+        value = value + 1
+      }
+    }
+    at = at + 1
+  }
+  let found = units.asSlice()
+  let mut ordered = List<String>.make()
+  at = 0
+  while at < found.length {
+    if found[at].view() == "ns/op" {
+      run ordered.append(run String.copy("ns/op"))
+    }
+    at = at + 1
+  }
+  at = 0
+  while at < found.length {
+    if found[at].view() != "ns/op" {
+      run ordered.append(run String.copy(found[at].view()))
+    }
+    at = at + 1
+  }
+  return move ordered
+}
+
+// The check of the readings of `title` by `name`, and whether `checks` now holds two that
+// differ.
+effect fn checkOf(
+  measured: &Measured,
+  title: string,
+  name: string,
+  checks: &mut List<String>,
+) -> Option<String>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut own = Option<String>.None
+  let readings = measured.readings.asSlice()
+  let mut at: usize = 0
+  while at < readings.length {
+    let reading = &readings[at]
+    if reading.name.view() == title && reading.implementation.view() == name {
+      if let Option<String>.Some { value } = &reading.check {
+        let known = checks.asSlice()
+        let mut found = false
+        let mut index: usize = 0
+        while index < known.length {
+          if known[index].view() == value.view() {
+            found = true
+          }
+          index = index + 1
+        }
+        if !found {
+          run checks.append(run String.copy(value.view()))
+        }
+        own = Option<String>.Some { value: run String.copy(value.view()) }
+      }
+    }
+    at = at + 1
+  }
+  return move own
+}
+
+effect fn readingTable(result: &RunResult, measured: &Measured, title: string, noise: f64) -> Table
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let subjects = result.implementations.asSlice()
+  let reference = result.reference.view()
+  let samples = measured.samples.asSlice()
+  let units = run unitsOf(measured, title)
+  let listed = units.asSlice()
+  let unit = listed[0].view()
+  let higher = Units.higher(unit)
+  let base = run valuesOf(measured, title, reference, unit)
+  let mut checks = List<String>.make()
+  let mut rows = List<Row>.make()
+  let mut subject: usize = 0
+  while subject < subjects.length {
+    let name = subjects[subject].name.view()
+    let values = run valuesOf(measured, title, name, unit)
+    let mut failures: u64 = 0
+    let mut at: usize = 0
+    while at < samples.length {
+      if measuredFor(&samples[at], name) && !counted(&samples[at], name) {
+        failures = failures + 1
+      }
+      at = at + 1
+    }
+    let summary = run Statistics.summary(values.asSlice())
+    let isReference = name == reference
+    let mut ratio = Option<Comparison>.None
+    if !isReference && values.length() > 0 && base.length() > 0 {
+      let compared = run Statistics.ratio(values.asSlice(), base.asSlice(), noise)
+      let mut verdict = compared.verdict
+      if higher {
+        verdict = match compared.verdict {
+          Verdict.Faster => Verdict.Slower
+          Verdict.Slower => Verdict.Faster
+          Verdict.Same => Verdict.Same
+        }
+      }
+      ratio = Option<Comparison>.Some {
+        value: Comparison {
+          value: compared.value,
+          low: compared.low,
+          high: compared.high,
+          verdict: run String.copy(verdictText(verdict)),
+        },
+      }
+    }
+    let mut others = List<Metric>.make()
+    at = 1
+    while at < listed.length {
+      let other = run valuesOf(measured, title, name, listed[at].view())
+      if other.length() > 0 {
+        run others.append(
+          Metric {
+            unit: run String.copy(listed[at].view()),
+            value: run Statistics.median(other.asSlice()),
+          },
+        )
+      }
+      at = at + 1
+    }
+    run rows.append(
+      Row {
+        implementation: run String.copy(name),
+        reference: isReference,
+        runs: usize.toU64(summary.count),
+        failures: failures,
+        median: summary.median,
+        minimum: summary.minimum,
+        maximum: summary.maximum,
+        mean: summary.mean,
+        low: summary.low,
+        high: summary.high,
+        outliers: usize.toU64(summary.outliers),
+        user: 0.0,
+        system: 0.0,
+        peak: 0.0,
+        ratio: move ratio,
+        times: move values,
+        others: move others,
+        check: run checkOf(measured, title, name, &mut checks),
+      },
+    )
+    subject = subject + 1
+  }
+  let mismatch = checks.length() > 1
+  if mismatch {
+    // The implementations did not do the same work, so no row is compared.
+    let all = rows.asMutSlice()
+    let mut at: usize = 0
+    while at < all.length {
+      all[at].ratio = Option<Comparison>.None
+      at = at + 1
+    }
+  }
+
+  // The name the program gave, then the parameters of the combination.
+  let mut name = run String.copy(title)
+  let suffix = String.slice(
+    measured.name.view(),
+    String.byteLength(result.suite.view()),
+    String.byteLength(measured.name.view()) - String.byteLength(result.suite.view()),
+  )
+  if String.byteLength(title) == 0 {
+    name = run String.copy(measured.name.view())
+  } else {
+    run name.append(suffix)
+  }
+  return Table {
+    name: move name,
+    parameters: run copyPairs(&measured.parameters),
+    unit: run String.copy(unit),
+    higher: higher,
+    mismatch: mismatch,
+    rows: move rows,
+  }
+}
+
+// One table for each name the readings of `measured` carry, in the order the names first
+// appear.
+effect fn readingTables(
+  tables: &mut List<Table>,
+  result: &RunResult,
+  measured: &Measured,
+  noise: f64,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let readings = measured.readings.asSlice()
+  let mut at: usize = 0
+  while at < readings.length {
+    let title = readings[at].name.view()
+    let mut seen = false
+    let mut before: usize = 0
+    while before < at {
+      if readings[before].name.view() == title {
+        seen = true
+        break
+      }
+      before = before + 1
+    }
+    if !seen {
+      run tables.append(run readingTable(result, measured, title, noise))
+    }
+    at = at + 1
+  }
+}
+
+fn verdictText(verdict: Verdict) -> string<'static> {
+  return match verdict {
+    Verdict.Faster => "faster"
+    Verdict.Slower => "slower"
+    Verdict.Same => "same"
+  }
+}
+
+effect fn copyOptional(text: &Option<String>) -> Option<String>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match &text.* {
+    Option<String>.Some { value } => Option<String>.Some { value: run String.copy(value.view()) }
+    Option<String>.None => Option<String>.None
+  }
+}
+
+effect fn copyTexts(texts: &List<String>) -> List<String>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut copies = List<String>.make()
+  let listed = texts.asSlice()
+  let mut at: usize = 0
+  while at < listed.length {
+    run copies.append(run String.copy(listed[at].view()))
+    at = at + 1
+  }
+  return move copies
+}
+
+effect fn copyPairs(pairs: &List<Pair>) -> List<Pair>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut copies = List<Pair>.make()
+  let listed = pairs.asSlice()
+  let mut at: usize = 0
+  while at < listed.length {
+    run copies.append(
+      Pair {
+        name: run String.copy(listed[at].name.view()),
+        value: run String.copy(listed[at].value.view()),
+      },
+    )
+    at = at + 1
+  }
+  return move copies
+}
+
+effect fn copySubjects(subjects: &[Subject]) -> List<Subject>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut copies = List<Subject>.make()
+  let mut at: usize = 0
+  while at < subjects.length {
+    run copies.append(
+      Subject {
+        name: run String.copy(subjects[at].name.view()),
+        command: run String.copy(subjects[at].command.view()),
+        revision: run copyOptional(&subjects[at].revision),
+      },
+    )
+    at = at + 1
+  }
+  return move copies
+}
+
+effect fn copyEnvironment(environment: &Environment) -> Environment
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return Environment {
+    system: run String.copy(environment.system.view()),
+    release: run String.copy(environment.release.view()),
+    machine: run String.copy(environment.machine.view()),
+    processor: run String.copy(environment.processor.view()),
+    processors: environment.processors,
+    usable: environment.usable,
+    memory: environment.memory,
+    load: environment.load,
+    variables: run copyPairs(&environment.variables),
+  }
+}
+
+// One implementation's successful samples of one benchmark, in one unit.
+struct Datum {
+  benchmark: String,
+  name: String,
+  implementation: String,
+  parameters: List<Pair>,
+  values: List<f64>,
+  warm: List<f64>,
+}
+
+// One value of a chart before it has a place in a panel.
+struct Cell {
+  panel: String,
+  series: String,
+  x: String,
+  value: f64,
+  low: f64,
+  high: f64,
+}
+
+// The values of `unit` of the runs of `name` that ended well: the measured ones, or the
+// warm-up ones.
+effect fn processValues(samples: &[Sample], name: string, unit: string, warmup: bool) -> List<f64>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut values = List<f64>.make()
+  let mut at: usize = 0
+  while at < samples.length {
+    let sample = &samples[at]
+    if sample.warmup == warmup && sample.implementation.view() == name && sample.exit == 0
+      && sample.signal == 0 {
+      if unit == "ns" {
+        run values.append(u64.toF64(sample.wall))
+      } else if unit == "user-ns" {
+        run values.append(u64.toF64(sample.user))
+      } else if unit == "sys-ns" {
+        run values.append(u64.toF64(sample.system))
+      } else if unit == "peak-B" {
+        run values.append(u64.toF64(sample.peak))
+      }
+    }
+    at = at + 1
+  }
+  return move values
+}
+
+// The values of `unit` that the warm-up readings of `title` by `name` carry.
+effect fn warmOf(measured: &Measured, title: string, name: string, unit: string) -> List<f64>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut values = List<f64>.make()
+  let readings = measured.readings.asSlice()
+  let mut at: usize = 0
+  while at < readings.length {
+    let reading = &readings[at]
+    if reading.warmup && reading.name.view() == title && reading.implementation.view() == name {
+      if let Option<f64>.Some { value } = valueOf(reading, unit) {
+        run values.append(value)
+      }
+    }
+    at = at + 1
+  }
+  return move values
+}
+
+// The names the readings of `measured` carry, in the order they first appear.
+effect fn titlesOf(measured: &Measured) -> List<String>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut titles = List<String>.make()
+  let readings = measured.readings.asSlice()
+  let mut at: usize = 0
+  while at < readings.length {
+    let known = titles.asSlice()
+    let mut found = false
+    let mut index: usize = 0
+    while index < known.length {
+      if known[index].view() == readings[at].name.view() {
+        found = true
+      }
+      index = index + 1
+    }
+    if !found {
+      run titles.append(run String.copy(readings[at].name.view()))
+    }
+    at = at + 1
+  }
+  return move titles
+}
+
+// The name of the table of `title` in `measured`: the name the program gave, then the
+// parameters of the combination.
+effect fn benchmarkName(result: &RunResult, measured: &Measured, title: string) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if String.byteLength(title) == 0 {
+    return run String.copy(measured.name.view())
+  }
+  let mut name = run String.copy(title)
+  run name.append(
+    String.slice(
+      measured.name.view(),
+      String.byteLength(result.suite.view()),
+      String.byteLength(measured.name.view()) - String.byteLength(result.suite.view()),
+    ),
+  )
+  return move name
+}
+
+// Every implementation's samples of `unit`, for each benchmark of `result`.
+effect fn dataOf(result: &RunResult, unit: string) -> List<Datum>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut data = List<Datum>.make()
+  let subjects = result.implementations.asSlice()
+  let measured = result.benchmarks.asSlice()
+  let mut at: usize = 0
+  while at < measured.length {
+    let samples = measured[at].samples.asSlice()
+    if measured[at].readings.length() == 0 {
+      let mut subject: usize = 0
+      while subject < subjects.length {
+        let name = subjects[subject].name.view()
+        run data.append(
+          Datum {
+            benchmark: run String.copy(measured[at].name.view()),
+            name: run String.copy(result.suite.view()),
+            implementation: run String.copy(name),
+            parameters: run copyPairs(&measured[at].parameters),
+            values: run processValues(samples, name, unit, false),
+            warm: run processValues(samples, name, unit, true),
+          },
+        )
+        subject = subject + 1
+      }
+    } else {
+      let titles = run titlesOf(&measured[at])
+      let listed = titles.asSlice()
+      let mut title: usize = 0
+      while title < listed.length {
+        let mut subject: usize = 0
+        while subject < subjects.length {
+          let name = subjects[subject].name.view()
+          let mut shown = run String.copy(listed[title].view())
+          if String.byteLength(shown.view()) == 0 {
+            shown = run String.copy(result.suite.view())
+          }
+          run data.append(
+            Datum {
+              benchmark: run benchmarkName(result, &measured[at], listed[title].view()),
+              name: move shown,
+              implementation: run String.copy(name),
+              parameters: run copyPairs(&measured[at].parameters),
+              values: run valuesOf(&measured[at], listed[title].view(), name, unit),
+              warm: run warmOf(&measured[at], listed[title].view(), name, unit),
+            },
+          )
+          subject = subject + 1
+        }
+        title = title + 1
+      }
+    }
+    at = at + 1
+  }
+  return move data
+}
+
+// The unit the tables of `result` are in: the one of its first benchmark.
+effect fn unitOf(result: &RunResult) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let measured = result.benchmarks.asSlice()
+  if measured.length > 0 && measured[0].readings.length() > 0 {
+    let units = run unitsOf(&measured[0], measured[0].readings.asSlice()[0].name.view())
+    if units.length() > 0 {
+      return run String.copy(units.asSlice()[0].view())
+    }
+  }
+  return run String.copy("ns")
+}
+
+fn numberOf(text: string) -> Option<f64> {
+  return match Text.f64Value(text) {
+    Result<f64, ParseError>.Success { value } => {
+      if f64.isFinite(value) {
+        Option<f64>.Some { value: value }
+      } else {
+        Option<f64>.None
+      }
+    }
+    Result<f64, ParseError>.Failure { .. } => Option<f64>.None
+  }
+}
+
+// The statistic `stat` of `sorted`, which is in ascending order: the median for a name that
+// is not a statistic.
+fn statOf(sorted: &[f64], stat: string) -> f64 {
+  if sorted.length == 0 {
+    return 0.0
+  }
+  if stat == "min" {
+    return sorted[0]
+  }
+  if stat == "max" {
+    return sorted[sorted.length - 1]
+  }
+  if stat == "mean" {
+    let mut sum = 0.0
+    let mut at: usize = 0
+    while at < sorted.length {
+      sum = sum + sorted[at]
+      at = at + 1
+    }
+    return sum / usize.toF64(sorted.length)
+  }
+  let bytes = String.utf8Bytes(stat)
+  if bytes.length > 1 && bytes[0] == 112 {
+    if let Option<f64>.Some { value } = numberOf(String.slice(stat, 1, bytes.length - 1)) {
+      if value >= 0.0 && value <= 100.0 {
+        return Statistics.quantileOfSorted(sorted, value / 100.0)
+      }
+    }
+  }
+  return Statistics.medianOfSorted(sorted)
+}
+
+// What `datum` is along `name`: `impl`, `benchmark`, `name`, or a parameter.
+effect fn dimension(datum: &Datum, name: string) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if name == "impl" {
+    return run String.copy(datum.implementation.view())
+  }
+  if name == "benchmark" {
+    return run String.copy(datum.benchmark.view())
+  }
+  if name == "name" {
+    return run String.copy(datum.name.view())
+  }
+  let pairs = datum.parameters.asSlice()
+  let mut at: usize = 0
+  while at < pairs.length {
+    if pairs[at].name.view() == name {
+      return run String.copy(pairs[at].value.view())
+    }
+    at = at + 1
+  }
+  return String.make()
+}
+
+effect fn spaced(text: &mut String, value: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if String.byteLength(text.view()) > 0 {
+    run text.append(" ")
+  }
+  return run text.append(value)
+}
+
+// What tells `datum` apart once `x` and `series` are taken: the title of its panel.
+effect fn remainder(datum: &Datum, x: string, series: string, facet: string) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if String.byteLength(facet) > 0 {
+    return run dimension(datum, facet)
+  }
+  let mut text = String.make()
+  if x == "benchmark" || series == "benchmark" {
+    if x != "impl" && series != "impl" {
+      run text.append(datum.implementation.view())
+    }
+    return move text
+  }
+  if x != "name" && series != "name" {
+    run text.append(datum.name.view())
+  }
+  let pairs = datum.parameters.asSlice()
+  let mut at: usize = 0
+  while at < pairs.length {
+    if pairs[at].name.view() != x && pairs[at].name.view() != series {
+      run spaced(&mut text, pairs[at].name.view())
+      run text.append("=")
+      run text.append(pairs[at].value.view())
+    }
+    at = at + 1
+  }
+  if x != "impl" && series != "impl" {
+    run spaced(&mut text, datum.implementation.view())
+  }
+  return move text
+}
+
+effect fn placed(panel: &mut Panel, cell: &Cell, numeric: bool) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let known = panel.series.asSlice()
+  let mut found: usize = 0
+  while found < known.length && known[found].name.view() != cell.series.view() {
+    found = found + 1
+  }
+  if found == known.length {
+    run panel.series.append(
+      Series { name: run String.copy(cell.series.view()), points: List<Point>.make() },
+    )
+  }
+  let mut at = 0.0
+  if numeric {
+    if let Option<f64>.Some { value } = numberOf(cell.x.view()) {
+      at = value
+    }
+  }
+  let all = panel.series.asMutSlice()
+  return run all[found].points.append(
+    Point {
+      x: run String.copy(cell.x.view()),
+      at: at,
+      value: cell.value,
+      low: cell.low,
+      high: cell.high,
+      faded: false,
+    },
+  )
+}
+
+// A copy of `points` in the order of their places. Points at one place keep their order.
+effect fn byPlace(points: &[Point]) -> List<Point>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut taken = List<bool>.make()
+  let mut at: usize = 0
+  while at < points.length {
+    run taken.append(false)
+    at = at + 1
+  }
+  let mut ordered = List<Point>.make()
+  let mut count: usize = 0
+  while count < points.length {
+    let marks = taken.asMutSlice()
+    let mut best = points.length
+    at = 0
+    while at < points.length {
+      if !marks[at] && (best == points.length || points[at].at < points[best].at) {
+        best = at
+      }
+      at = at + 1
+    }
+    marks[best] = true
+    run ordered.append(
+      Point {
+        x: run String.copy(points[best].x.view()),
+        at: points[best].at,
+        value: points[best].value,
+        low: points[best].low,
+        high: points[best].high,
+        faded: points[best].faded,
+      },
+    )
+    count = count + 1
+  }
+  return move ordered
+}
+
+// Gives every point of `panel` its place along an axis of entries, in the order the entries
+// first appear or in the order `sort` asks for, and puts the points of each series in order.
+effect fn arranged(panel: &mut Panel, sort: string, numeric: bool) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let lists = panel.series.asMutSlice()
+  if !numeric {
+    let mut entries = List<String>.make()
+    let mut keys = List<f64>.make()
+    let mut series: usize = 0
+    while series < lists.length {
+      let points = lists[series].points.asSlice()
+      let mut at: usize = 0
+      while at < points.length {
+        let known = entries.asSlice()
+        let mut found = false
+        let mut index: usize = 0
+        while index < known.length {
+          if known[index].view() == points[at].x.view() {
+            found = true
+          }
+          index = index + 1
+        }
+        if !found {
+          run entries.append(run String.copy(points[at].x.view()))
+
+          // An entry the first series lacks goes last.
+          if series == 0 {
+            run keys.append(points[at].value)
+          } else {
+            run keys.append(f64.INFINITY)
+          }
+        }
+        at = at + 1
+      }
+      series = series + 1
+    }
+    let listed = entries.asSlice()
+    let weights = keys.asMutSlice()
+    let mut index: usize = 0
+    while index < weights.length {
+      if sort == "-value" && f64.isFinite(weights[index]) {
+        weights[index] = 0.0 - weights[index]
+      } else if sort != "value" && sort != "-value" {
+        weights[index] = usize.toF64(index)
+      }
+      index = index + 1
+    }
+    series = 0
+    while series < lists.length {
+      let points = lists[series].points.asMutSlice()
+      let mut at: usize = 0
+      while at < points.length {
+        // The place of an entry is the number of entries that go before it.
+        let mut own: usize = 0
+        while listed[own].view() != points[at].x.view() {
+          own = own + 1
+        }
+        let mut before: usize = 0
+        index = 0
+        while index < weights.length {
+          if weights[index] < weights[own] || (weights[index] == weights[own] && index < own) {
+            before = before + 1
+          }
+          index = index + 1
+        }
+        points[at].at = usize.toF64(before)
+        at = at + 1
+      }
+      series = series + 1
+    }
+  }
+  let mut series: usize = 0
+  while series < lists.length {
+    let ordered = run byPlace(lists[series].points.asSlice())
+    lists[series].points = move ordered
+    series = series + 1
+  }
+}
+
+// The panels of `cells`, and whether their axis is numeric.
+effect fn assembled(cells: &[Cell], sort: string, numeric: bool) -> List<Panel>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut panels = List<Panel>.make()
+  let mut at: usize = 0
+  while at < cells.length {
+    let known = panels.asSlice()
+    let mut found: usize = 0
+    while found < known.length && known[found].title.view() != cells[at].panel.view() {
+      found = found + 1
+    }
+    if found == known.length {
+      run panels.append(
+        Panel { title: run String.copy(cells[at].panel.view()), series: List<Series>.make() },
+      )
+    }
+    let all = panels.asMutSlice()
+    run placed(&mut all[found], &cells[at], numeric)
+    at = at + 1
+  }
+  let all = panels.asMutSlice()
+  at = 0
+  while at < all.length {
+    run arranged(&mut all[at], sort, numeric)
+    at = at + 1
+  }
+  return move panels
+}
+
+fn numbers(cells: &[Cell]) -> bool {
+  let mut at: usize = 0
+  while at < cells.length {
+    if let Option<f64>.None = numberOf(cells[at].x.view()) {
+      return false
+    }
+    at = at + 1
+  }
+  return cells.length > 0
+}
+
+// What a view asks for, with the defaults of its kind filled in.
+struct Asked {
+  y: String,
+  x: String,
+  series: String,
+  facet: String,
+  stat: String,
+  error: String,
+  normalize: String,
+  sort: String,
+}
+
+effect fn fieldOf(view: &View, name: string, fallback: string) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if let Option<string>.Some { value } = view.value(name) {
+    if String.byteLength(value) > 0 {
+      return run String.copy(value)
+    }
+  }
+  return run String.copy(fallback)
+}
+
+// One cell for each benchmark and implementation with samples: the statistic, its whiskers,
+// and the division by another implementation when the view asks for one.
+effect fn cellsOf(data: &[Datum], asked: &Asked, noise: f64) -> List<Cell>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut cells = List<Cell>.make()
+  let stat = asked.stat.view()
+  let error = asked.error.view()
+  let normalize = asked.normalize.view()
+  let mut at: usize = 0
+  while at < data.length {
+    let datum = &data[at]
+    at = at + 1
+    if datum.values.length() == 0 {
+      continue
+    }
+    let sorted = run Statistics.sorted(datum.values.asSlice())
+    let ordered = sorted.asSlice()
+    let mut value = statOf(ordered, stat)
+    let mut low = value
+    let mut high = value
+    if error == "interval" && stat == "median" {
+      let summary = run Statistics.summary(datum.values.asSlice())
+      low = summary.low
+      high = summary.high
+    } else if error == "range" {
+      low = ordered[0]
+      high = ordered[ordered.length - 1]
+    }
+    if String.byteLength(normalize) > 0 {
+      // The implementation the others are divided by would be a row of ones.
+      if datum.implementation.view() == normalize {
+        continue
+      }
+      let mut base: usize = 0
+      while base < data.length
+        && (data[base].implementation.view() != normalize
+          || data[base].benchmark.view() != datum.benchmark.view()) {
+        base = base + 1
+      }
+      if base == data.length || data[base].values.length() == 0 {
+        continue
+      }
+      if error == "interval" && stat == "median" {
+        let compared = run Statistics.ratio(
+          datum.values.asSlice(),
+          data[base].values.asSlice(),
+          noise,
+        )
+        value = compared.value
+        low = compared.low
+        high = compared.high
+      } else {
+        let other = run Statistics.sorted(data[base].values.asSlice())
+        let divisor = statOf(other.asSlice(), stat)
+        if !(divisor > 0.0) {
+          continue
+        }
+        value = value / divisor
+        low = low / divisor
+        high = high / divisor
+      }
+    }
+    run cells.append(
+      Cell {
+        panel: run remainder(datum, asked.x.view(), asked.series.view(), asked.facet.view()),
+        series: run dimension(datum, asked.series.view()),
+        x: run dimension(datum, asked.x.view()),
+        value: value,
+        low: low,
+        high: high,
+      },
+    )
+  }
+  return move cells
+}
+
+// The panel a benchmark gets when every benchmark has a chart of its own.
+effect fn ownPanel(datum: &Datum, facet: string) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if String.byteLength(facet) > 0 {
+    return run dimension(datum, facet)
+  }
+  return run String.copy(datum.benchmark.view())
+}
+
+// Every sample as a point: the warm-up runs first and faded, then the measured ones, in the
+// order they ran.
+effect fn everySample(data: &[Datum], asked: &Asked) -> List<Panel>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut panels = List<Panel>.make()
+  let mut at: usize = 0
+  while at < data.length {
+    let datum = &data[at]
+    at = at + 1
+    if datum.values.length() == 0 {
+      continue
+    }
+    let title = run ownPanel(datum, asked.facet.view())
+    let known = panels.asSlice()
+    let mut found: usize = 0
+    while found < known.length && known[found].title.view() != title.view() {
+      found = found + 1
+    }
+    if found == known.length {
+      run panels.append(Panel { title: move title, series: List<Series>.make() })
+    }
+    let mut points = List<Point>.make()
+    let warm = datum.warm.asSlice()
+    let values = datum.values.asSlice()
+    let mut index: usize = 0
+    while index < warm.length + values.length {
+      let mut x = String.make()
+      run Units.appendWhole(&mut x, usize.toU64(index + 1))
+      let mut value = 0.0
+      if index < warm.length {
+        value = warm[index]
+      } else {
+        value = values[index - warm.length]
+      }
+      run points.append(
+        Point {
+          x: move x,
+          at: usize.toF64(index),
+          value: value,
+          low: value,
+          high: value,
+          faded: index < warm.length,
+        },
+      )
+      index = index + 1
+    }
+    let all = panels.asMutSlice()
+    run all[found].series.append(
+      Series { name: run dimension(datum, asked.series.view()), points: move points },
+    )
+  }
+  return move panels
+}
+
+const PERCENTILES: [string<'static>; 8] = ["50", "75", "90", "95", "99", "99.9", "99.99", "100"]
+
+// A value for each percentile: what the result lines report in units such as `p99-ns`, or
+// else the percentiles of the samples.
+effect fn percentilesOf(result: &RunResult, data: &[Datum], asked: &Asked) -> List<Panel>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut cells = List<Cell>.make()
+  let mut at: usize = 0
+  while at < PERCENTILES.length {
+    let mut unit = run String.copy("p")
+    run unit.append(PERCENTILES[at])
+    run unit.append("-")
+    run unit.append(asked.y.view())
+    let reported = run dataOf(result, unit.view())
+    let listed = reported.asSlice()
+    let mut index: usize = 0
+    while index < listed.length {
+      if listed[index].values.length() > 0 {
+        let mut x = run String.copy("p")
+        run x.append(PERCENTILES[at])
+        let value = run Statistics.median(listed[index].values.asSlice())
+        run cells.append(
+          Cell {
+            panel: run ownPanel(&listed[index], asked.facet.view()),
+            series: run dimension(&listed[index], asked.series.view()),
+            x: move x,
+            value: value,
+            low: value,
+            high: value,
+          },
+        )
+      }
+      index = index + 1
+    }
+    at = at + 1
+  }
+  if cells.length() == 0 {
+    at = 0
+    while at < PERCENTILES.length {
+      let fraction = match numberOf(PERCENTILES[at]) {
+        Option<f64>.Some { value } => value / 100.0
+        Option<f64>.None => 1.0
+      }
+      let mut index: usize = 0
+      while index < data.length {
+        // A percentile says something only when a sample lies at or beyond it.
+        let count = usize.toF64(data[index].values.length())
+        if count > 0.0 && (fraction >= 1.0 || count * (1.0 - fraction) > 0.999 || fraction <= 0.5) {
+          let sorted = run Statistics.sorted(data[index].values.asSlice())
+          let value = Statistics.quantileOfSorted(sorted.asSlice(), fraction)
+          let mut x = run String.copy("p")
+          run x.append(PERCENTILES[at])
+          run cells.append(
+            Cell {
+              panel: run ownPanel(&data[index], asked.facet.view()),
+              series: run dimension(&data[index], asked.series.view()),
+              x: move x,
+              value: value,
+              low: value,
+              high: value,
+            },
+          )
+        }
+        index = index + 1
+      }
+      at = at + 1
+    }
+  }
+  return run assembled(cells.asSlice(), "", false)
+}
+
+// The first parameter of `result` whose values are all numbers and not all the same, from the
+// parameter at `from` on.
+fn numericParameter(result: &RunResult, from: usize) -> Option<usize> {
+  let measured = result.benchmarks.asSlice()
+  if measured.length < 2 {
+    return Option<usize>.None
+  }
+  let mut at = from
+  while at < measured[0].parameters.length() {
+    let mut all = true
+    let mut differ = false
+    let mut index: usize = 0
+    while index < measured.length {
+      let pairs = measured[index].parameters.asSlice()
+      if at >= pairs.length {
+        all = false
+      } else {
+        if let Option<f64>.None = numberOf(pairs[at].value.view()) {
+          all = false
+        }
+        if pairs[at].value.view() != measured[0].parameters.asSlice()[at].value.view() {
+          differ = true
+        }
+      }
+      index = index + 1
+    }
+    if all && differ {
+      return Option<usize>.Some { value: at }
+    }
+    at = at + 1
+  }
+  return Option<usize>.None
+}
+
+effect fn headingOf(kind: string, asked: &Asked) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = run String.copy(asked.y.view())
+  if Units.kind(asked.y.view()) == "ns" {
+    text = run String.copy("Time")
+  } else if Units.kind(asked.y.view()) == "B" {
+    text = run String.copy("Memory")
+  }
+  if String.byteLength(asked.normalize.view()) > 0 {
+    run text.append(" relative to ")
+    run text.append(asked.normalize.view())
+  }
+  if kind == "line" {
+    run text.append(" by ")
+    run text.append(asked.x.view())
+  } else if kind == "distribution" {
+    run text.append(" of every run")
+  } else if kind == "percentiles" {
+    run text.append(" by percentile")
+  } else if kind == "history" {
+    run text.append(" over the recorded runs")
+  }
+  if asked.stat.view() != "median" && kind != "distribution" && kind != "percentiles" {
+    run text.append(" (")
+    run text.append(asked.stat.view())
+    run text.append(")")
+  }
+  return move text
+}
+
+effect fn chartOf(result: &RunResult, view: &View, noise: f64) -> Chart
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let kind = view.kind.view()
+  let unit = run unitOf(result)
+  let mut across = "benchmark"
+  if kind == "distribution" {
+    across = "run"
+  } else if kind == "percentiles" {
+    across = "percentile"
+  } else if kind == "history" {
+    across = "revision"
+  }
+  let mut divisor = ""
+  if kind == "ratio" {
+    divisor = result.reference.view()
+  }
+  let mut asked = Asked {
+    y: run fieldOf(view, "y", unit.view()),
+    x: run fieldOf(view, "x", across),
+    series: run fieldOf(view, "series", "impl"),
+    facet: run fieldOf(view, "facet", ""),
+    stat: run fieldOf(view, "stat", "median"),
+    error: run fieldOf(view, "error", "interval"),
+    normalize: run fieldOf(view, "normalize", divisor),
+    sort: run fieldOf(view, "sort", ""),
+  }
+  if kind == "line" && asked.x.view() == "benchmark" {
+    // A line without a parameter takes the first numeric one.
+    if let Option<usize>.Some { value } = numericParameter(result, 0) {
+      asked.x = run String.copy(
+        result.benchmarks.asSlice()[0].parameters.asSlice()[value].name.view(),
+      )
+    }
+  }
+  let scale = run fieldOf(view, "scale", "linear")
+  let mut zero = scale.view() == "linear"
+  if let Option<string>.Some { value } = view.value("zero") {
+    zero = value != "false"
+  }
+  let data = run dataOf(result, asked.y.view())
+  let mut numeric = false
+  let mut panels = List<Panel>.make()
+  if kind == "distribution" {
+    panels = run everySample(data.asSlice(), &asked)
+    numeric = true
+  } else if kind == "percentiles" {
+    panels = run percentilesOf(result, data.asSlice(), &asked)
+  } else if kind != "history" {
+    let cells = run cellsOf(data.asSlice(), &asked, noise)
+    numeric = numbers(cells.asSlice())
+    panels = run assembled(cells.asSlice(), asked.sort.view(), numeric)
+  }
+  let heading = run headingOf(kind, &asked)
+  return Chart {
+    kind: run String.copy(kind),
+    title: run fieldOf(view, "title", heading.view()),
+    higher: Units.higher(asked.y.view()),
+    y: move asked.y,
+    x: move asked.x,
+    series: move asked.series,
+    facet: move asked.facet,
+    stat: move asked.stat,
+    error: move asked.error,
+    scale: move scale,
+    zero: zero,
+    normalize: move asked.normalize,
+    sort: move asked.sort,
+    numeric: numeric,
+    fields: run copyPairs(&view.fields),
+    panels: move panels,
+  }
+}
+
+// The views of `result` resolved: the ones it declares, or else the ones the shape of its
+// results asks for.
+effect fn chartsOf(result: &RunResult, noise: f64) -> List<Chart>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut charts = List<Chart>.make()
+  let declared = result.views.asSlice()
+  let mut at: usize = 0
+  while at < declared.length {
+    let view = run View.parse(declared[at].view())
+    run charts.append(run chartOf(result, &view, noise))
+    at = at + 1
+  }
+  if declared.length > 0 {
+    return move charts
+  }
+  let measured = result.benchmarks.asSlice()
+  let mut benchmarks: usize = 0
+  at = 0
+  while at < measured.length {
+    let titles = run titlesOf(&measured[at])
+    if titles.length() > 1 {
+      benchmarks = benchmarks + titles.length()
+    } else {
+      benchmarks = benchmarks + 1
+    }
+    at = at + 1
+  }
+  if benchmarks > 1 && result.implementations.length() > 1 {
+    let view = run View.ratio()
+    run charts.append(run chartOf(result, &view, noise))
+  }
+  let mut from: usize = 0
+  let mut more = true
+  while more {
+    match numericParameter(result, from) {
+      Option<usize>.Some { value } => {
+        let view = run View.line(measured[0].parameters.asSlice()[value].name.view())
+        run charts.append(run chartOf(result, &view, noise))
+        from = value + 1
+      }
+      Option<usize>.None => {
+        more = false
+      }
+    }
+  }
+  return move charts
+}
