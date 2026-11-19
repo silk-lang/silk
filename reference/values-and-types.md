@@ -1510,6 +1510,68 @@ out-of-bounds index `SEM0034`. A dynamic overrun is a runtime trap rather than a
 slice indexing,
 [index diagnostics](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Diagnostic.ts).
 
+### INDEX-002 — A collection of rows is indexed by field
+
+**Status:** Confirmed
+
+A type that implements the sealed interface `Intrinsic.Rows<Index, Row>` keeps each field of its
+`Row` values in storage of its own. `rows[index].field` is a place of the field's type: it reads the
+field of one row, and the same place is the destination of an assignment and the operand of `&` and
+`&mut`. `rows[..].field` is the field of every row, in row order: `&rows[..].field` is a `&[V]` and
+`&mut rows[..].field` is a `&mut [V]`. A field of a field, as in `rows[index].rect.y`, is a place
+inside the first field.
+
+```silk
+import silk.collections.column_list { ColumnList }
+import silk.core.ownership { Copy }
+
+struct Particle {
+  pub x: f32,
+  pub speed: f32,
+}
+
+impl Copy for Particle {}
+
+fn step(particles: &mut ColumnList<Particle>, index: usize) -> f32 {
+  particles[index].x = particles[index].x + particles[index].speed
+  let speeds = &particles[..].speed
+  return speeds[0]
+}
+```
+
+The index type is the `Index` argument of the implementation. A type can implement the interface
+for more than one index type: an integer literal is then a `usize`, and any other index selects the
+implementation by its own type. A write, a `&mut` borrow, a `&mut self` receiver, and
+`Intrinsic.replace` need `Intrinsic.RowsMut<Index, Row>` for the same arguments; a type that
+implements only `Intrinsic.Rows` lends its fields for reading only. The compiler passes the field
+to the implementation as a static `Intrinsic.Field<Row, V>` argument, so the field is resolved at
+compile time, and the implementation decides how the row is found and what a wrong index does.
+
+Two different fields of the rows never overlap, so a borrow of `rows[i].x` or `rows[..].x` and a
+borrow of `rows[j].y` or `rows[..].y` can be live together. Two places of the same field overlap for
+any two indexes. A place of a field overlaps each other use of the collection: a call that changes
+the collection is rejected while a field borrow is in use.
+
+**Boundary:** `rows[index]` and `rows[..]` alone name no value, because no row exists in one place;
+the collection's own functions read and replace a complete row. `..` in an index is valid only in
+front of a field of a collection of rows, and `&rows[..].rect.y` is not a slice, because the `y`
+values are not adjacent in storage. The index value of a row place must be `Copy`. An index out of
+range is the implementation's concern; `silk.collections.column_list.ColumnList` traps. In an
+assignment, the index expressions are evaluated before the right expression, and the row is found
+after it ([ASSIGN-002](expressions-and-operators.md#assign-002--assignment-validates-its-destination-before-evaluating-its-replacement)).
+
+**Diagnostics:** An index alone, a misplaced `..`, and a write through a type that lends its rows
+only for reading report `SEM0032`. An index of the wrong type reports `SEM0033`. A field that the
+row type does not have reports `SEM0027`. Overlapping borrows report the ownership diagnostics of
+any other place.
+
+**Evidence:** [row fields](../corpus/native/column-list-row-fields/main.silk),
+[column borrows](../corpus/native/column-list-column-borrows/main.silk),
+[typed ids as indexes](../corpus/native/column-list-ids/main.silk),
+[whole row read](../corpus/invalid/column-list-whole-row-read/main.silk),
+[two borrows of one column](../corpus/invalid/column-list-two-borrows-of-one-column/main.silk),
+[write through shared rows](../corpus/invalid/column-list-write-through-shared-rows/main.silk).
+
 ### VIEW-001 — References and slices include access mode in their type
 
 **Status:** Confirmed
