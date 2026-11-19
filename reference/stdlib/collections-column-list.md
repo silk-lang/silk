@@ -1159,7 +1159,11 @@ impl<T: Copy> Intrinsic.RowsMut<usize, T> for ColumnList<T>
 ### Operation `borrowMut`
 
 ```silk
-fn borrowMut<'s, V>(self: &'s mut Self, index: usize, static field: Intrinsic.Field<T, V>) -> &'s mut V
+fn borrowMut<'s, V>(
+    self: &'s mut Self,
+    index: usize,
+    static field: Intrinsic.Field<T, V>,
+  ) -> &'s mut V
 ```
 
 <a id="ColumnList.impl.RowsMut.spanMut"></a>
@@ -1207,7 +1211,11 @@ impl<T: Copy> Intrinsic.RowsMut<Id<T>, T> for ColumnList<T>
 ### Operation `borrowMut`
 
 ```silk
-fn borrowMut<'s, V>(self: &'s mut Self, index: Id<T>, static field: Intrinsic.Field<T, V>) -> &'s mut V
+fn borrowMut<'s, V>(
+    self: &'s mut Self,
+    index: Id<T>,
+    static field: Intrinsic.Field<T, V>,
+  ) -> &'s mut V
 ```
 
 <a id="ColumnList.impl.RowsMut.spanMut-2"></a>
@@ -1303,7 +1311,11 @@ impl<'a, T: Copy> Intrinsic.RowsMut<usize, T> for RowsMut<'a, T>
 ### Operation `borrowMut`
 
 ```silk
-fn borrowMut<'s, V>(self: &'s mut Self, index: usize, static field: Intrinsic.Field<T, V>) -> &'s mut V
+fn borrowMut<'s, V>(
+    self: &'s mut Self,
+    index: usize,
+    static field: Intrinsic.Field<T, V>,
+  ) -> &'s mut V
 ```
 
 <a id="RowsMut.impl.RowsMut.spanMut"></a>
@@ -1351,7 +1363,11 @@ impl<'a, T: Copy> Intrinsic.RowsMut<Id<T>, T> for RowsMut<'a, T>
 ### Operation `borrowMut`
 
 ```silk
-fn borrowMut<'s, V>(self: &'s mut Self, index: Id<T>, static field: Intrinsic.Field<T, V>) -> &'s mut V
+fn borrowMut<'s, V>(
+    self: &'s mut Self,
+    index: Id<T>,
+    static field: Intrinsic.Field<T, V>,
+  ) -> &'s mut V
 ```
 
 <a id="RowsMut.impl.RowsMut.spanMut-2"></a>
