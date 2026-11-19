@@ -31,7 +31,7 @@ const session = async (module: string, stdlib: string) => {
   const root = mkdtempSync(join(tmpdir(), 'silk-wasm-lsp-'))
   try {
     mkdirSync(join(root, 'src'))
-    writeFileSync(join(root, 'silk.toml'), '[package]\nname = "demo"\nversion = "0.0.0"\n')
+    writeFileSync(join(root, 'silk.toml'), '[package]\nname = "demo"\nsilk-version = "0.0.0"\nversion = "0.0.0"\n')
     const text = [
       'fn twice(value: i32) -> i32 {',
       '  return value * 2',

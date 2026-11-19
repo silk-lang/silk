@@ -520,7 +520,7 @@ const writeProgram = async (
   const unstable = composition === undefined ? '' : `\n[unstable]\ncomposition = ${composition}\n`
   writeFileSync(
     join(directory, 'silk.toml'),
-    `[package]\nname = "corpus"\nversion = "0.1.0"\nsource = "."\nmain = "${programModule}"\n${unstable}`,
+    `[package]\nname = "corpus"\nsilk-version = "0.0.0"\nversion = "0.1.0"\nsource = "."\nmain = "${programModule}"\n${unstable}`,
   )
   for (const [module, contents] of Object.entries(program.imports)) {
     if (module.startsWith('/') || module.split('/').includes('..'))

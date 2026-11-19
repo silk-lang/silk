@@ -266,7 +266,7 @@ const program = Effect.gen(function* () {
   yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(directory, { recursive: true })))
   writeFileSync(
     join(directory, 'silk.toml'),
-    '[package]\nname = "session"\nversion = "0.1.0"\nsource = "."\n',
+    '[package]\nname = "session"\nsilk-version = "0.0.0"\nversion = "0.1.0"\nsource = "."\n',
   )
   const fixed = 'pub fn main() -> i32 {\n  return 0\n}\n'
   writeFileSync(join(directory, 'main.silk'), fixed)
@@ -619,11 +619,11 @@ const program = Effect.gen(function* () {
   for (const member of ['pricing', 'store']) mkdirSync(join(workspace, member, 'src'), { recursive: true })
   writeFileSync(
     join(workspace, 'pricing', 'silk.toml'),
-    '[package]\nname = "pricing"\nversion = "0.1.0"\nmain = "lib.silk"\nkind = "library"\nexports = ["lib"]\n',
+    '[package]\nname = "pricing"\nsilk-version = "0.0.0"\nversion = "0.1.0"\nmain = "lib.silk"\nkind = "library"\nexports = ["lib"]\n',
   )
   writeFileSync(
     join(workspace, 'store', 'silk.toml'),
-    '[package]\nname = "store"\nversion = "0.1.0"\n\n[dependencies]\npricing = { path = "../pricing" }\n',
+    '[package]\nname = "store"\nsilk-version = "0.0.0"\nversion = "0.1.0"\n\n[dependencies]\npricing = { path = "../pricing" }\n',
   )
   const priced = 'pub fn add(a: i32, b: i32) -> i32 {\n  return a + b\n}\n'
   const stored = 'import pricing.lib { add }\n\npub fn main() -> i32 {\n  return add(1, 2) - 3\n}\n'
@@ -696,7 +696,7 @@ const program = Effect.gen(function* () {
   yield* Effect.try({
     try: () => {
       cpSync(resolve('compiler/fixtures/compilation-request'), plannedRoot, { recursive: true })
-      writeFileSync(join(plannedRoot, 'silk.toml'), '[package]\nname = "request-fixture"\nversion = "0.1.0"\nsource = "."\n[workspace]\nmembers = []\noutput-dir = "editor-output"\n')
+      writeFileSync(join(plannedRoot, 'silk.toml'), '[package]\nname = "request-fixture"\nsilk-version = "0.0.0"\nversion = "0.1.0"\nsource = "."\n[workspace]\nmembers = []\noutput-dir = "editor-output"\n')
       writeFileSync(join(plannedRoot, 'build.silk'), 'this is not a build plan\n')
       writeFileSync(join(plannedRoot, 'main.silk'),
         'import dep.value { answer }\nstatic if answer == 42 { pub fn main() -> i32 { return 0 } } else { pub fn main() -> i32 { return "wrong" } }\n')
@@ -762,7 +762,7 @@ const program = Effect.gen(function* () {
   unlinkSync(join(plannedRoot, 'silk.toml'))
   yield* planned.send({ jsonrpc: '2.0', method: 'workspace/didChangeConfiguration', params: { settings: { silk: { compilation: 'a' } } } })
   assert.deepEqual((yield* diagnosticsFor(planned, savedUri, 1, [])).diagnostics, [], 'a removed manifest retains the custom output request')
-  writeFileSync(join(plannedRoot, 'silk.toml'), '[package]\nname = "request-fixture"\nversion = "0.1.0"\nsource = "."\n[workspace]\nmembers = []\noutput-dir = "editor-output"\n')
+  writeFileSync(join(plannedRoot, 'silk.toml'), '[package]\nname = "request-fixture"\nsilk-version = "0.0.0"\nversion = "0.1.0"\nsource = "."\n[workspace]\nmembers = []\noutput-dir = "editor-output"\n')
   // A custom Plan command is project code, so the server asks before it runs one, and runs it
   // with the developer's permissions once allowed. The answer lives in SILK_HOME, keyed by the
   // repository's common Git directory, so a worktree of the same repository is not asked again.
