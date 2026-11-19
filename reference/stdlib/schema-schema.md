@@ -944,7 +944,9 @@ and `shape` for a type whose wire form is not its fields, usually with [`Schemas
 ### Details
 
 The standard library implements it for `bool`, the integer types, `f64`, `String`, `Bytes`,
-`Box<T>`, `Option<T>`, `List<T>` and `Dictionary<T>`.
+`Box<T>`, `Option<T>`, `List<T>` and `Dictionary<T>`, and for the `silk.time` types `Instant`,
+`PlainDate`, `PlainTime`, `PlainDateTime`, `PlainYearMonth`, `PlainMonthDay`, `Period` and
+`UtcOffset`, which are ISO 8601 text in every format.
 
 <a id="Schema.spec"></a>
 
@@ -1701,6 +1703,454 @@ effect fn satisfies(self: &Self, constraint: Constraint) -> bool
 ```
 
 Tests a length in characters, or a pattern.
+
+<a id="Instant.impl.Schema"></a>
+
+## Implementation `Schema for Instant`
+
+```silk
+impl Schema for Instant
+```
+
+`Instant` is text in every format: an RFC 3339 date and time with an offset, such as `2026-11-19T18:36:22Z`. See `silk.time.codec.TimeText`.
+
+<a id="Instant.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns `ValueKind.Text`.
+
+<a id="Instant.impl.Schema.read"></a>
+
+### Operation `read`
+
+```silk
+effect fn read(reader: &mut any SchemaReader) -> Instant
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
+```
+
+Reads text and parses it.
+
+<a id="Instant.impl.Schema.write"></a>
+
+### Operation `write`
+
+```silk
+effect fn write(self: &Self, writer: &mut any SchemaWriter) -> ()
+    ! Issue | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator
+```
+
+Writes the ISO 8601 text.
+
+<a id="Instant.impl.Schema.shape"></a>
+
+### Operation `shape`
+
+```silk
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self>
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Adds text with a note of the format.
+
+<a id="PlainDate.impl.Schema"></a>
+
+## Implementation `Schema for PlainDate`
+
+```silk
+impl Schema for PlainDate
+```
+
+`PlainDate` is text in every format: a date, such as `2026-11-19`. See `silk.time.codec.TimeText`.
+
+<a id="PlainDate.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns `ValueKind.Text`.
+
+<a id="PlainDate.impl.Schema.read"></a>
+
+### Operation `read`
+
+```silk
+effect fn read(reader: &mut any SchemaReader) -> PlainDate
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
+```
+
+Reads text and parses it.
+
+<a id="PlainDate.impl.Schema.write"></a>
+
+### Operation `write`
+
+```silk
+effect fn write(self: &Self, writer: &mut any SchemaWriter) -> ()
+    ! Issue | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator
+```
+
+Writes the ISO 8601 text.
+
+<a id="PlainDate.impl.Schema.shape"></a>
+
+### Operation `shape`
+
+```silk
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self>
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Adds text with a note of the format.
+
+<a id="PlainTime.impl.Schema"></a>
+
+## Implementation `Schema for PlainTime`
+
+```silk
+impl Schema for PlainTime
+```
+
+`PlainTime` is text in every format: a time of day, such as `18:36:22`. See `silk.time.codec.TimeText`.
+
+<a id="PlainTime.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns `ValueKind.Text`.
+
+<a id="PlainTime.impl.Schema.read"></a>
+
+### Operation `read`
+
+```silk
+effect fn read(reader: &mut any SchemaReader) -> PlainTime
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
+```
+
+Reads text and parses it.
+
+<a id="PlainTime.impl.Schema.write"></a>
+
+### Operation `write`
+
+```silk
+effect fn write(self: &Self, writer: &mut any SchemaWriter) -> ()
+    ! Issue | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator
+```
+
+Writes the ISO 8601 text.
+
+<a id="PlainTime.impl.Schema.shape"></a>
+
+### Operation `shape`
+
+```silk
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self>
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Adds text with a note of the format.
+
+<a id="PlainDateTime.impl.Schema"></a>
+
+## Implementation `Schema for PlainDateTime`
+
+```silk
+impl Schema for PlainDateTime
+```
+
+`PlainDateTime` is text in every format: a date and time, such as `2026-11-19T18:36:22`. See `silk.time.codec.TimeText`.
+
+<a id="PlainDateTime.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns `ValueKind.Text`.
+
+<a id="PlainDateTime.impl.Schema.read"></a>
+
+### Operation `read`
+
+```silk
+effect fn read(reader: &mut any SchemaReader) -> PlainDateTime
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
+```
+
+Reads text and parses it.
+
+<a id="PlainDateTime.impl.Schema.write"></a>
+
+### Operation `write`
+
+```silk
+effect fn write(self: &Self, writer: &mut any SchemaWriter) -> ()
+    ! Issue | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator
+```
+
+Writes the ISO 8601 text.
+
+<a id="PlainDateTime.impl.Schema.shape"></a>
+
+### Operation `shape`
+
+```silk
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self>
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Adds text with a note of the format.
+
+<a id="PlainYearMonth.impl.Schema"></a>
+
+## Implementation `Schema for PlainYearMonth`
+
+```silk
+impl Schema for PlainYearMonth
+```
+
+`PlainYearMonth` is text in every format: a year and month, such as `2026-11`. See `silk.time.codec.TimeText`.
+
+<a id="PlainYearMonth.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns `ValueKind.Text`.
+
+<a id="PlainYearMonth.impl.Schema.read"></a>
+
+### Operation `read`
+
+```silk
+effect fn read(reader: &mut any SchemaReader) -> PlainYearMonth
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
+```
+
+Reads text and parses it.
+
+<a id="PlainYearMonth.impl.Schema.write"></a>
+
+### Operation `write`
+
+```silk
+effect fn write(self: &Self, writer: &mut any SchemaWriter) -> ()
+    ! Issue | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator
+```
+
+Writes the ISO 8601 text.
+
+<a id="PlainYearMonth.impl.Schema.shape"></a>
+
+### Operation `shape`
+
+```silk
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self>
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Adds text with a note of the format.
+
+<a id="PlainMonthDay.impl.Schema"></a>
+
+## Implementation `Schema for PlainMonthDay`
+
+```silk
+impl Schema for PlainMonthDay
+```
+
+`PlainMonthDay` is text in every format: a month and day, such as `11-19`. See `silk.time.codec.TimeText`.
+
+<a id="PlainMonthDay.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns `ValueKind.Text`.
+
+<a id="PlainMonthDay.impl.Schema.read"></a>
+
+### Operation `read`
+
+```silk
+effect fn read(reader: &mut any SchemaReader) -> PlainMonthDay
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
+```
+
+Reads text and parses it.
+
+<a id="PlainMonthDay.impl.Schema.write"></a>
+
+### Operation `write`
+
+```silk
+effect fn write(self: &Self, writer: &mut any SchemaWriter) -> ()
+    ! Issue | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator
+```
+
+Writes the ISO 8601 text.
+
+<a id="PlainMonthDay.impl.Schema.shape"></a>
+
+### Operation `shape`
+
+```silk
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self>
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Adds text with a note of the format.
+
+<a id="Period.impl.Schema"></a>
+
+## Implementation `Schema for Period`
+
+```silk
+impl Schema for Period
+```
+
+`Period` is text in every format: an ISO 8601 duration, such as `P1Y2M3DT4H`. See `silk.time.codec.TimeText`.
+
+<a id="Period.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns `ValueKind.Text`.
+
+<a id="Period.impl.Schema.read"></a>
+
+### Operation `read`
+
+```silk
+effect fn read(reader: &mut any SchemaReader) -> Period
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
+```
+
+Reads text and parses it.
+
+<a id="Period.impl.Schema.write"></a>
+
+### Operation `write`
+
+```silk
+effect fn write(self: &Self, writer: &mut any SchemaWriter) -> ()
+    ! Issue | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator
+```
+
+Writes the ISO 8601 text.
+
+<a id="Period.impl.Schema.shape"></a>
+
+### Operation `shape`
+
+```silk
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self>
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Adds text with a note of the format.
+
+<a id="UtcOffset.impl.Schema"></a>
+
+## Implementation `Schema for UtcOffset`
+
+```silk
+impl Schema for UtcOffset
+```
+
+`UtcOffset` is text in every format: a UTC offset, such as `+01:00`. See `silk.time.codec.TimeText`.
+
+<a id="UtcOffset.impl.Schema.kind"></a>
+
+### Operation `kind`
+
+```silk
+static fn kind() -> KindOf<Self>
+```
+
+Returns `ValueKind.Text`.
+
+<a id="UtcOffset.impl.Schema.read"></a>
+
+### Operation `read`
+
+```silk
+effect fn read(reader: &mut any SchemaReader) -> UtcOffset
+    ! Issue | OutOfMemoryError
+    ? &mut Allocator
+```
+
+Reads text and parses it.
+
+<a id="UtcOffset.impl.Schema.write"></a>
+
+### Operation `write`
+
+```silk
+effect fn write(self: &Self, writer: &mut any SchemaWriter) -> ()
+    ! Issue | WriterError | OutOfMemoryError
+    ? &mut Writer | &mut Allocator
+```
+
+Writes the ISO 8601 text.
+
+<a id="UtcOffset.impl.Schema.shape"></a>
+
+### Operation `shape`
+
+```silk
+effect fn shape(shapes: &mut Shapes) -> ShapeOf<Self>
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Adds text with a note of the format.
 
 <a id="Bytes.impl.Schema"></a>
 
