@@ -6,7 +6,7 @@ Describes what a benchmark run compares: suites, their implementations, the prog
 time, and where the reports go.
 
 ## When to use
-Build a [`Suite`](#Suite) in a project's `tasks.silk` and give it to `silk.bench.bench.Bench.run`. A
+Build a [`Suite`](#Suite) in a project's `tasks.silk` and give it to `silk.bench.bench.Bench.perform`. A
 suite compares implementations of one piece of work: a Silk program and the same program in
 another language, two versions of one program, or one program with different options.
 
