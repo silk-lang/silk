@@ -191,6 +191,16 @@ pub fn name(self: &Self) -> string
 
 Returns the name of the benchmark to run, as it was given to the harness.
 
+<a id="Harness.impl.position"></a>
+
+### Method `position`
+
+```silk
+pub fn position(self: &Self) -> usize
+```
+
+Returns the position of the benchmark to run in the names the harness was given.
+
 <a id="Harness.impl.iterations"></a>
 
 ### Method `iterations`
@@ -200,6 +210,33 @@ pub fn iterations(self: &Self) -> u64
 ```
 
 Returns how many times to run the body.
+
+<a id="Harness.impl.measured"></a>
+
+### Method `measured`
+
+```silk
+pub fn measured(self: &mut Self, nanoseconds: u64) -> ()
+```
+
+Gives the harness the time of the run in nanoseconds, for a body that timed itself, and
+stops the timing of the harness.
+
+<a id="Harness.impl.failed"></a>
+
+### Method `failed`
+
+```silk
+pub effect fn failed(self: &mut Self, text: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Says that the run failed, with `text` as the reason on one line. The harness answers with
+an `error:` line and no result line.
+
+#### Errors
+`OutOfMemoryError` if the `Allocator` cannot supply the copy.
 
 <a id="Harness.impl.reset"></a>
 
