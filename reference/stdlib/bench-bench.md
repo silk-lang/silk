@@ -32,6 +32,14 @@ reads the lines from the program's standard output and from the file it names in
 environment variable `BENCH_OUT`. After every suite has been reported, the task fails if two
 implementations gave different `check:` values for one benchmark.
 
+An implementation declared with `Implementation.driven` is a harness the task drives, as
+`silk.bench.transport` describes: the task starts it once, with `BENCH_DRIVE` set to `1`,
+asks it for the names of its benchmarks, finds for each the iteration count that makes one
+sample last the suite's `Suite.sample` time (50 ms unless set), and then asks every
+implementation for one sample in each round, in a random order. A harness is restarted
+a few times in a benchmark's rounds, so the layout of one process does not decide a result.
+A Silk harness is a program that uses `silk.bench.harness`.
+
 Every run records the revision it measured: `--revision`, or else the commit that `HEAD`
 names in the Git repository the package is in. `--record` adds the run to the suite's
 history, `bench/history/<suite>.jsonl`, a text file to commit. `--history` runs nothing and
