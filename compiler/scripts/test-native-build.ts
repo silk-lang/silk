@@ -5818,6 +5818,23 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   yield* memberBuild('second')
   assert.deepEqual(yield* fs.readFile(firstImage), firstWritten, "building another member leaves a member's cache as it was")
   assert.notEqual(yield* memberImage('second'), firstImage)
+  // A stored Effect can introduce a NonParking proof without running the Effect.
+  // Replay must preserve both the proof and its disappearance after an edit.
+  const proofProject = join(directory, 'nonparking-proof')
+  yield* fs.makeDirectory(proofProject)
+  yield* fs.writeFileString(join(proofProject, 'silk.toml'),
+    '[package]\nname = "nonparking-proof"\nversion = "0.1.0"\nsilk-version = "0.0.0"\nsource = "."\n')
+  const unselected = yield* fs.readFileString(join(repository, 'corpus/invalid/nonparking-unselected-provider/main.silk'))
+  const unconstrained = unselected.replace('hold(closing())', 'closing()')
+  for (const source of [unconstrained, unselected, unselected, unconstrained]) {
+    yield* fs.writeFileString(join(proofProject, 'main.silk'), source)
+    const checked = yield* invoke(silk, ['check', '--roots', '--no-server', '--stdlib', standardLibrary], proofProject, splitEnvironment)
+    const output = checked.stdout + checked.stderr
+    const refused = source === unselected
+    assert.equal(checked.status, refused ? 1 : 0, output)
+    assert.match(output, /silk-check-roots modules=1 rejections=\d+ differences=0/, output)
+    assert.equal(output.includes('error[SEM0139]'), refused, output)
+  }
   // A check replays the escape walks the last check left in the cache. A callback's call into
   // another module of the package is walked below the callback, so an edit there that adds a `run`
   // is reported as a cold check reports it, and an edit that keeps what the walk reads reports
