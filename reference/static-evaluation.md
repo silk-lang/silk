@@ -103,9 +103,15 @@ spec)`), method syntax, or a generic bound (`item.walk(spec)` for `T: Walk`). An
 static operands select the witness instance, as a direct call's select the callee's. A `static fn`
 body cannot call a function with `static` parameters yet.
 
+A static argument may be a phase-only value, such as the field descriptor in
+`holder.width(Reflect.field<Pair, i64>("second"))`, in every one of these call forms, on a generic
+receiver as on any other. The value exists only as that argument: the same expression in a runtime
+position, such as a runtime binding or a runtime argument, is refused there.
+
 **Diagnostics:** Passing a runtime value to a static parameter, reading a runtime local from static
 evaluation, or using a runtime operation in a static initializer reports `SEM0176` at the operation
-and identifies the static boundary that required the value. A call through method syntax or an
+and identifies the static boundary that required the value. A phase-only value in a runtime
+position reports `SEM0176` at that binding or argument. A call through method syntax or an
 interface operation to a function with `static` parameters where its static arguments cannot be
 selected, such as in a `static fn`, reports `SEM0249` at the call.
 
@@ -832,14 +838,42 @@ own parameter, a field name passes through and is checked where the caller write
 For a union, a field name names a field of any of its variants. `Intrinsic.VariantName<Union>` is
 the name of one variant, checked the same way and read with `Reflect.variantNameText`.
 
+A string literal is also the argument of a `static` parameter of type
+`Intrinsic.Field<Owner, Value>`. The literal is the descriptor of the field of `Owner` with that
+name, as `Reflect.field<Owner, Value>("name")` is, and `Value` is inferred from the field when the
+call does not fix it. A library takes a descriptor where it needs the field's type, such as the
+element type of the slice that `ColumnList.column` returns.
+
+```silk
+import silk.collections.column_list {ColumnList}
+import silk.core.ownership {Copy}
+
+struct Particle {
+  pub x: f32,
+  pub id: u64,
+}
+
+impl Copy for Particle {}
+
+fn ids(particles: &ColumnList<Particle>) -> &[u64] {
+  return particles.column("id")
+}
+```
+
 **Boundary:** A field name exists only in static code, like other reflection descriptors. Only a
-literal becomes a field name; computed text does not.
+literal becomes a field name or a descriptor; computed text does not. A literal is a descriptor only
+as a call's static argument: a `let static` binding or a `static fn` argument of a descriptor type
+takes `Reflect.field`.
 
 **Diagnostics:** A literal that names no visible field of `Owner`, or no variant of `Union`, reports
 `SEM0022` at the literal.
+A literal that names a field whose type is not the `Value` the parameter states reports `SEM0012` at
+the literal.
 A field name in a runtime signature or value reports `SEM0176`.
 
-**Evidence:** field name checker and editor table tests.
+**Evidence:** field name checker and editor table tests; corpus programs
+`static-field-literal-argument`, `static-field-literal-unknown-field` and
+`static-field-literal-wrong-type`.
 
 ### STATIC-019 — `Union.[variant] { ... }` builds the variant a static descriptor selects
 
