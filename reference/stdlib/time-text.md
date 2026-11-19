@@ -133,6 +133,16 @@ MissingTime
 
 The text has no time of day, and the type needs one.
 
+<a id="TimeParseReason.MissingDate"></a>
+
+### `MissingDate`
+
+```silk
+MissingDate
+```
+
+The text has no date, and the type needs one. Only `silk.time.pattern` reports it.
+
 <a id="TimeParseReason.UnsupportedCalendar"></a>
 
 ### `UnsupportedCalendar`
