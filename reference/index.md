@@ -68,6 +68,8 @@ not belong in a language rule unless a program can observe them.
   unhandled typed failures, and requirement closure.
 - [Tests and the source runner](testing.md) — test declarations, import-graph discovery, static
   descriptors, runtime filters, sequential execution, and exit behavior.
+- [Benchmarks in source](benchmarks.md) — benchmark declarations and the static catalog an
+  ordinary program runs them from.
 - [Statements and discarded values](statements-and-discarding.md) — which expression results may be
   ignored and how `drop` makes intentional discard explicit.
 - [Effects and execution](effects-and-execution.md) — effect construction, success values, `run`,

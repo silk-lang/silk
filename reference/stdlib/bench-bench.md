@@ -38,7 +38,10 @@ asks it for the names of its benchmarks, finds for each the iteration count that
 sample last the suite's `Suite.sample` time (50 ms unless set), and then asks every
 implementation for one sample in each round, in a random order. A harness is restarted
 a few times in a benchmark's rounds, so the layout of one process does not decide a result.
-A Silk harness is a program that uses `silk.bench.harness`.
+A Silk harness is a program that uses `silk.bench.harness`, or one whose `main` runs the
+`bench fn` declarations of its modules with `silk.bench.bencher.Benchmarks.main`: compile it
+with `Compilation.fromPackage(&options)` and `root` set to its entry file, and give the
+artifact to `Implementation.program`.
 
 Every run records the revision it measured: `--revision`, or else the commit that `HEAD`
 names in the Git repository the package is in. `--record` adds the run to the suite's
@@ -60,6 +63,12 @@ the task fails if any measured run failed.
 The statistics are those of `silk.bench.statistics`: the median with a 95% interval, and for
 each implementation the ratio to the suite's reference with an interval and a verdict.
 `--noise` sets how large a difference must be to count; the default is 1%.
+
+`--save <name>` also keeps the result of each suite under a name, in
+`build/bench/saved/<suite>/<name>.json`. `--baseline <name>` adds the implementations of the
+run kept under that name to the report, named `<name>` for a suite with one implementation
+and `<name>:<implementation>` otherwise, and compares the new samples with them. So
+`--save main` before a change and `--baseline main` after it shows what the change did.
 
 ## Gotchas
 - Processes can be measured on Linux with GNU libc and on macOS.
@@ -296,6 +305,26 @@ pub noise: String
 ```
 
 How large a difference must be to count, in percent.
+
+<a id="BenchOptions.save"></a>
+
+### Field `save`
+
+```silk
+pub save: Option<String>
+```
+
+Also keep each suite's result under this name, as `build/bench/saved/<suite>/<name>.json`.
+
+<a id="BenchOptions.baseline"></a>
+
+### Field `baseline`
+
+```silk
+pub baseline: Option<String>
+```
+
+Compare each suite with the result kept under this name.
 
 <a id="BenchOptions.impl"></a>
 
