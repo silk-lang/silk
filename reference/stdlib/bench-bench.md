@@ -40,6 +40,11 @@ with `--html` and as Markdown with `--markdown`. `--log "text"` runs nothing and
 text to the journal, `bench/journal.md`, under the revision, or under the day without one;
 the history shows it beside the first run of that revision.
 
+A report shows the views the suite declares with `Suite.view`, as `silk.bench.view`
+describes them. A suite without views shows the ones its programs suggest in `view:` lines,
+and without those the report picks by the shape of the results. A `history` view reads the
+suite's history file and adds the run being reported.
+
 A run of a program that exits with a status other than 0 is kept in the result file,
 counted in the report, and left out of the statistics. After every suite has been reported,
 the task fails if any measured run failed.

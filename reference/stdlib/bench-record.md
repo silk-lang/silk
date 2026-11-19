@@ -23,6 +23,10 @@ A program that prints result lines is measured by what it reports, not by its pr
 line is a [`Reading`](#Reading), and a report gives every name the lines carry a table of its own, in
 the unit of the lines.
 
+A result keeps the views of its suite as text, one line each, as `silk.bench.view.View.text`
+writes them. A report holds each view resolved into a [`Chart`](#Chart): panels of series of points,
+with the statistic and the whiskers of every point already computed.
+
 A run never drops a sample. A warm-up run is kept with `warmup` set, and a run whose program
 failed is kept with its exit status. A report counts the failed runs of a row in `failures`
 and leaves both kinds out of its statistics.
@@ -72,7 +76,7 @@ pub fn main() -> i32 {
 
 Import as `Report` with `import silk.bench.record { Report }`.
 
-Public declarations: 14.
+Public declarations: 18.
 
 <a id="PROTOCOL"></a>
 
@@ -746,6 +750,17 @@ pub benchmarks: List<Measured>
 
 The benchmarks, one for each combination of parameters.
 
+<a id="RunResult.views"></a>
+
+### Field `views`
+
+```silk
+pub views: List<String>
+```
+
+The views to show the results with, one line each. Empty means the report picks by the
+shape of the results.
+
 <a id="RunResult.impl.Schema"></a>
 
 ## Implementation `Schema for RunResult`
@@ -1095,6 +1110,342 @@ One row for each implementation, in the order the suite declared them.
 impl Schema for Table
 ```
 
+<a id="Point"></a>
+
+## `Point`
+
+```silk
+pub struct Point
+```
+
+One value of a [`Series`](#Series).
+
+<a id="Point.x"></a>
+
+### Field `x`
+
+```silk
+pub x: String
+```
+
+The entry of the axis the point belongs to, such as `1024`, `p99` or a benchmark name.
+
+<a id="Point.at"></a>
+
+### Field `at`
+
+```silk
+pub at: f64
+```
+
+Where the point is along the axis: the number `x` holds when the axis is numeric, and
+else the position of `x` among the entries of the panel, from 0.
+
+<a id="Point.value"></a>
+
+### Field `value`
+
+```silk
+pub value: f64
+```
+
+The value, in the unit of the chart, or as a ratio when the chart is normalized.
+
+<a id="Point.low"></a>
+
+### Field `low`
+
+```silk
+pub low: f64
+```
+
+The low end of the whisker. Equal to `value` when there is none.
+
+<a id="Point.high"></a>
+
+### Field `high`
+
+```silk
+pub high: f64
+```
+
+The high end of the whisker. Equal to `value` when there is none.
+
+<a id="Point.faded"></a>
+
+### Field `faded`
+
+```silk
+pub faded: bool
+```
+
+Whether the point is a warm-up run of a `distribution`, which a renderer dims.
+
+<a id="Point.impl.Schema"></a>
+
+## Implementation `Schema for Point`
+
+```silk
+impl Schema for Point
+```
+
+<a id="Series"></a>
+
+## `Series`
+
+```silk
+pub struct Series
+```
+
+One line, or one group of bars, of a [`Panel`](#Panel).
+
+<a id="Series.name"></a>
+
+### Field `name`
+
+```silk
+pub name: String
+```
+
+The name, such as the implementation.
+
+<a id="Series.points"></a>
+
+### Field `points`
+
+```silk
+pub points: List<Point>
+```
+
+The points, in the order of the axis.
+
+<a id="Series.impl.Schema"></a>
+
+## Implementation `Schema for Series`
+
+```silk
+impl Schema for Series
+```
+
+<a id="Panel"></a>
+
+## `Panel`
+
+```silk
+pub struct Panel
+```
+
+One separate chart of a [`Chart`](#Chart).
+
+<a id="Panel.title"></a>
+
+### Field `title`
+
+```silk
+pub title: String
+```
+
+What the panel shows, such as a benchmark name. Empty when the chart has one panel that
+covers everything.
+
+<a id="Panel.series"></a>
+
+### Field `series`
+
+```silk
+pub series: List<Series>
+```
+
+The series, in the order they first appear in the results.
+
+<a id="Panel.impl.Schema"></a>
+
+## Implementation `Schema for Panel`
+
+```silk
+impl Schema for Panel
+```
+
+<a id="Chart"></a>
+
+## `Chart`
+
+```silk
+pub struct Chart
+```
+
+A view of a suite with every number computed: what a renderer draws.
+
+<a id="Chart.kind"></a>
+
+### Field `kind`
+
+```silk
+pub kind: String
+```
+
+The kind of the view, such as `line` or `x-flame`.
+
+<a id="Chart.title"></a>
+
+### Field `title`
+
+```silk
+pub title: String
+```
+
+The heading.
+
+<a id="Chart.y"></a>
+
+### Field `y`
+
+```silk
+pub y: String
+```
+
+The unit of the values.
+
+<a id="Chart.x"></a>
+
+### Field `x`
+
+```silk
+pub x: String
+```
+
+What runs along the axis.
+
+<a id="Chart.series"></a>
+
+### Field `series`
+
+```silk
+pub series: String
+```
+
+What each series is.
+
+<a id="Chart.facet"></a>
+
+### Field `facet`
+
+```silk
+pub facet: String
+```
+
+What each panel is. Empty when the panels are whatever `x` and `series` leave.
+
+<a id="Chart.stat"></a>
+
+### Field `stat`
+
+```silk
+pub stat: String
+```
+
+The statistic of the samples each point shows.
+
+<a id="Chart.error"></a>
+
+### Field `error`
+
+```silk
+pub error: String
+```
+
+What the whiskers show: `interval`, `range` or `none`.
+
+<a id="Chart.scale"></a>
+
+### Field `scale`
+
+```silk
+pub scale: String
+```
+
+The scale: `linear`, `log` or `log-log`.
+
+<a id="Chart.zero"></a>
+
+### Field `zero`
+
+```silk
+pub zero: bool
+```
+
+Whether the value axis starts at zero.
+
+<a id="Chart.normalize"></a>
+
+### Field `normalize`
+
+```silk
+pub normalize: String
+```
+
+The implementation every value is divided by. Empty when the values are in the unit `y`.
+
+<a id="Chart.sort"></a>
+
+### Field `sort`
+
+```silk
+pub sort: String
+```
+
+The order of the entries of `x`: `value`, `-value`, or empty for the order they ran in.
+
+<a id="Chart.higher"></a>
+
+### Field `higher`
+
+```silk
+pub higher: bool
+```
+
+Whether a larger value is better, as for `req/s`.
+
+<a id="Chart.numeric"></a>
+
+### Field `numeric`
+
+```silk
+pub numeric: bool
+```
+
+Whether every entry of `x` is a number, so the axis is numeric.
+
+<a id="Chart.fields"></a>
+
+### Field `fields`
+
+```silk
+pub fields: List<Pair>
+```
+
+The fields the view set, also the ones the report does not know, for a renderer of your
+own.
+
+<a id="Chart.panels"></a>
+
+### Field `panels`
+
+```silk
+pub panels: List<Panel>
+```
+
+The panels. A `history` gets its panels from `silk.bench.history.History.drawn`, which
+knows the recorded runs.
+
+<a id="Chart.impl.Schema"></a>
+
+## Implementation `Schema for Chart`
+
+```silk
+impl Schema for Chart
+```
+
 <a id="Overall"></a>
 
 ## `Overall`
@@ -1315,6 +1666,18 @@ pub overall: List<Overall>
 
 The geometric mean of each implementation's ratios, without the reference. Empty when the
 suite has one benchmark, where the mean would repeat the ratio.
+
+<a id="Report.views"></a>
+
+### Field `views`
+
+```silk
+pub views: List<Chart>
+```
+
+The views of the suite, resolved. Without declared views: a `ratio` when several
+implementations ran several benchmarks, and a `line` for each parameter whose values are
+all numbers.
 
 <a id="Report.impl.Schema"></a>
 

@@ -297,6 +297,21 @@ pub fn quantileOfSorted(sorted: &[f64], fraction: f64) -> f64
 Returns the value at `fraction` (0 to 1) of `sorted`, which must be in ascending order,
 between neighbors in a straight line. Returns 0 for no samples.
 
+<a id="Statistics.impl.sorted"></a>
+
+### Associated function `sorted`
+
+```silk
+pub effect fn sorted(samples: &[f64]) -> List<f64>
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Returns a copy of `samples` in ascending order, for [`Statistics.quantileOfSorted`](#Statistics.impl.quantileOfSorted).
+
+#### Errors
+`OutOfMemoryError` if the `Allocator` cannot supply the copy.
+
 <a id="Statistics.impl.median"></a>
 
 ### Associated function `median`

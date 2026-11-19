@@ -34,6 +34,9 @@ by the value, and each combination of values is its own benchmark, named
 `suite/name=value`. [`Suite.cpus`](#Suite.impl.cpus) does the same for the number of processors a program may
 run on, as the parameter `cpus`.
 
+[`Suite.view`](#Suite.impl.view) declares how the reports show the results, as a `silk.bench.view.View`: a
+line against a parameter, every sample, a comparison against another implementation.
+
 [`Suite.output`](#Suite.impl.output) declares where a report goes: an [`Output`](#Output) is a [`Format`](#Format) and a place,
 standard output or a file. A suite without outputs prints the terminal table.
 
@@ -485,10 +488,12 @@ report many benchmarks and many samples of each. The program writes the lines to
 output, or to the file the environment variable `BENCH_OUT` names, which the suite sets
 for every timed run. Lines that are not result lines are ignored.
 
-The suite reads three configuration keys. `check:` says what the program computed, such
+The suite reads four configuration keys. `check:` says what the program computed, such
 as a checksum or a count: implementations whose checks differ for one benchmark are not
 compared, and the task fails. `revision:` is recorded as the implementation's revision
 when the suite gives none. `note:` is added to the notes of the run.
+`view:` suggests a view, as `silk.bench.view.View.parse` reads it, which the reports show
+when the suite declares none.
 
 <a id="Format"></a>
 
@@ -894,6 +899,16 @@ pub outputs: List<Output>
 
 The reports. Empty means the terminal table on standard output.
 
+<a id="Suite.views"></a>
+
+### Field `views`
+
+```silk
+pub views: List<View>
+```
+
+The views. Empty means the report picks by the shape of the results.
+
 <a id="Suite.impl"></a>
 
 ## Implementation `Suite`
@@ -1054,6 +1069,19 @@ pub effect fn output(self: &mut Self, output: Output) -> ()
 
 Adds a report. A suite with at least one output prints nothing else: add
 `Output.stdout(Format.Terminal)` to keep the table.
+
+<a id="Suite.impl.view"></a>
+
+### Method `view`
+
+```silk
+pub effect fn view(self: &mut Self, view: View) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Adds a view: one more way the reports show the results. A suite with at least one view
+gets no other: without any, a report picks views by the shape of the results.
 
 
 Category: Benchmarks.

@@ -428,6 +428,27 @@ unit as the report has it, such as `req/s`. Rows with no successful run are left
 #### Errors
 `OutOfMemoryError` if the `Allocator` cannot supply the text.
 
+<a id="History.impl.drawn"></a>
+
+### Associated function `drawn`
+
+```silk
+pub effect fn drawn(report: &mut Report, recorded: &[Entry]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Gives every `history` chart of `report` its panels: one for each benchmark, with a line for
+each implementation over the runs of `recorded` and then the run of `report` itself.
+
+#### Details
+A run is named by its revision, or by its day when it has none. A chart shows the entries
+in its own unit, so a chart of a unit the history does not hold stays empty. A normalized
+chart shows the ratio each entry recorded, when its reference is the chart's.
+
+#### Errors
+`OutOfMemoryError` if the `Allocator` cannot supply the panels.
+
 <a id="History.impl.parse"></a>
 
 ### Associated function `parse`
