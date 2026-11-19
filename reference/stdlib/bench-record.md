@@ -394,6 +394,17 @@ pub signal: i64
 
 The signal that ended the program, or 0.
 
+<a id="Sample.counts"></a>
+
+### Field `counts`
+
+```silk
+pub counts: List<Metric>
+```
+
+What the system's counters measured over the run, such as `instructions` or
+`page-faults`. Empty unless the run asked for counters with `--counters`.
+
 <a id="Sample.impl.Schema"></a>
 
 ## Implementation `Schema for Sample`
