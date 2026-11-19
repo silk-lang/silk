@@ -55,7 +55,7 @@ pub effect fn main() -> i32
 
 Import as `Certificate` with `import silk.tls.certificate { Certificate }`.
 
-Public declarations: 13.
+Public declarations: 12.
 
 <a id="DecodeLimits"></a>
 
@@ -712,84 +712,6 @@ effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &m
 
 Writes the fields, as `DecodeError { kind: ..., reason: ..., ... }`.
 
-<a id="CertificateTime"></a>
-
-## `CertificateTime`
-
-```silk
-pub struct CertificateTime
-```
-
-A date and time in UTC from a certificate.
-
-<a id="CertificateTime.year"></a>
-
-### Field `year`
-
-```silk
-pub year: u16
-```
-
-The year, from 1 to 9999.
-
-<a id="CertificateTime.month"></a>
-
-### Field `month`
-
-```silk
-pub month: u8
-```
-
-The month, from 1 to 12.
-
-<a id="CertificateTime.day"></a>
-
-### Field `day`
-
-```silk
-pub day: u8
-```
-
-The day of the month.
-
-<a id="CertificateTime.hour"></a>
-
-### Field `hour`
-
-```silk
-pub hour: u8
-```
-
-The hour, from 0 to 23.
-
-<a id="CertificateTime.minute"></a>
-
-### Field `minute`
-
-```silk
-pub minute: u8
-```
-
-The minute, from 0 to 59.
-
-<a id="CertificateTime.second"></a>
-
-### Field `second`
-
-```silk
-pub second: u8
-```
-
-The second, from 0 to 59.
-
-<a id="CertificateTime.impl.Copy"></a>
-
-## Implementation `Copy for CertificateTime`
-
-```silk
-impl Copy for CertificateTime
-```
-
 <a id="BitStringView"></a>
 
 ## `BitStringView`
@@ -1287,7 +1209,7 @@ kept when the high bit is set.
 ### Method `notBefore`
 
 ```silk
-pub fn notBefore(self: &Self) -> CertificateTime
+pub fn notBefore(self: &Self) -> Instant
 ```
 
 Returns the start of the validity period. It does not read a clock.
@@ -1297,7 +1219,7 @@ Returns the start of the validity period. It does not read a clock.
 ### Method `notAfter`
 
 ```silk
-pub fn notAfter(self: &Self) -> CertificateTime
+pub fn notAfter(self: &Self) -> Instant
 ```
 
 Returns the end of the validity period. It does not check that it is after
