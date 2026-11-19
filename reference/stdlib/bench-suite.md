@@ -563,6 +563,17 @@ Lines
 The samples as result lines, of `silk.bench.lines.Lines.fromResult`, the text format of
 Go's `testing` package that tools such as `benchstat` read.
 
+<a id="Format.History"></a>
+
+### `History`
+
+```silk
+History
+```
+
+One line for each row of the report, of `silk.bench.history.History.lines`, to add to a
+history file with [`Output.appending`](#Output.impl.appending).
+
 <a id="Destination"></a>
 
 ## `Destination`

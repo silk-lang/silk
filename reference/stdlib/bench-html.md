@@ -42,6 +42,33 @@ The owner type of the HTML renderer. It has no fields and is never constructed.
 impl Html
 ```
 
+<a id="Html.impl.style"></a>
+
+### Associated function `style`
+
+```silk
+pub fn style() -> string<'static>
+```
+
+Returns the style sheet of the pages this module writes, for another page that should look
+the same.
+
+<a id="Html.impl.escaped"></a>
+
+### Associated function `escaped`
+
+```silk
+pub effect fn escaped(text: &mut String, value: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Appends `value` to `text` with the characters `&`, `<`, `>` and `"` written as HTML
+entities.
+
+#### Errors
+`OutOfMemoryError` if the `Allocator` cannot grow `text`.
+
 <a id="Html.impl.page"></a>
 
 ### Associated function `page`

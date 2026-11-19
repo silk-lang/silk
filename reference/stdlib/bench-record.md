@@ -634,6 +634,16 @@ pub label: Option<String>
 
 The label the run was given, such as `before` or `after`.
 
+<a id="RunResult.revision"></a>
+
+### Field `revision`
+
+```silk
+pub revision: Option<String>
+```
+
+The revision of the project the run measured, such as a commit hash.
+
 <a id="RunResult.started"></a>
 
 ### Field `started`
@@ -1183,6 +1193,16 @@ pub label: Option<String>
 ```
 
 The label the run was given.
+
+<a id="Report.revision"></a>
+
+### Field `revision`
+
+```silk
+pub revision: Option<String>
+```
+
+The revision of the project the run measured, such as a commit hash.
 
 <a id="Report.started"></a>
 

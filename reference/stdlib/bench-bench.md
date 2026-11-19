@@ -32,6 +32,14 @@ reads the lines from the program's standard output and from the file it names in
 environment variable `BENCH_OUT`. After every suite has been reported, the task fails if two
 implementations gave different `check:` values for one benchmark.
 
+Every run records the revision it measured: `--revision`, or else the commit that `HEAD`
+names in the Git repository the package is in. `--record` adds the run to the suite's
+history, `bench/history/<suite>.jsonl`, a text file to commit. `--history` runs nothing and
+prints each suite's history as the tables of `silk.bench.history`, also as a page with charts
+with `--html` and as Markdown with `--markdown`. `--log "text"` runs nothing and adds the
+text to the journal, `bench/journal.md`, under the revision, or under the day without one;
+the history shows it beside the first run of that revision.
+
 A run of a program that exits with a status other than 0 is kept in the result file,
 counted in the report, and left out of the statistics. After every suite has been reported,
 the task fails if any measured run failed.
@@ -224,6 +232,47 @@ pub label: Option<String>
 ```
 
 A label for the run, such as `before` or `after`.
+
+<a id="BenchOptions.revision"></a>
+
+### Field `revision`
+
+```silk
+pub revision: Option<String>
+```
+
+The revision of the project the run measures. Without it, the commit that `HEAD` names in
+the Git repository the package is in.
+
+<a id="BenchOptions.record"></a>
+
+### Field `record`
+
+```silk
+pub record: bool
+```
+
+Also add the run to the suite's history, `bench/history/<suite>.jsonl`.
+
+<a id="BenchOptions.history"></a>
+
+### Field `history`
+
+```silk
+pub history: bool
+```
+
+Print each suite's history and run nothing.
+
+<a id="BenchOptions.log"></a>
+
+### Field `log`
+
+```silk
+pub log: Option<String>
+```
+
+Add this text to the journal, `bench/journal.md`, under the revision, and run nothing.
 
 <a id="BenchOptions.noise"></a>
 
