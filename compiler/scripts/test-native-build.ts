@@ -5748,6 +5748,17 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   yield* fs.remove(join(logged, 'build'), { recursive: true })
   yield* loggedBuild('Hello, edit!')
   assert.deepEqual(yield* fs.readFile(loggedExecutable), warmLog, 'a rewalked build links the executable a cold build links')
+  // Adding the first registration changes the layout captured by Execution.make. Its
+  // cached definition must gain the retain on that edit and lose it after the reverse edit.
+  const inheritance = yield* fs.readFileString(join(repository, 'corpus/native/ambient-logger-inheritance/main.silk'))
+  const unprovided = inheritance.replaceAll(' |> Effect.provideAmbient<Logger>(&handle)', '')
+  for (const [program, expected] of [[unprovided, 1], [inheritance, 0], [unprovided, 1]] as const) {
+    yield* fs.writeFileString(join(logged, 'src/main.silk'), program)
+    const built = yield* invoke(silk, ['build', '--stdlib', standardLibrary], logged, splitEnvironment)
+    assert.equal(built.status, 0, built.stderr)
+    const ran = yield* invoke(loggedExecutable, [], logged, splitEnvironment)
+    assert.equal(ran.status, expected, ran.stderr)
+  }
   // A whole-module link keeps a stamp too, so an unchanged release rebuild links nothing.
   const releaseBuild = Effect.fnUntraced(function* () {
     const built = yield* invoke(silk, ['build', '--release', '--stdlib', standardLibrary], split, splitEnvironment)
