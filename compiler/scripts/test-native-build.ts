@@ -70,6 +70,10 @@ const program = Effect.gen(function* () {
   const tool = process.argv[3]
   assert.ok(compiler && tool, 'usage: node test-native-build.ts <native-compiler> <clang>')
   const silk = resolve(compiler)
+  // `silk pack` refuses a 0.0.0 pin, and a released compiler builds only packages written for its
+  // own release, so the fixtures this test packs pin the running compiler's release.
+  const reportedVersion = spawnSync(silk, ['--version'], { encoding: 'utf8' }).stdout.trim().replace(/^silk v/, '').replace(/\+.*$/, '')
+  const releasePin = reportedVersion === '0.0.0' ? '0.1.0' : reportedVersion
   const clang = resolve(tool)
   const fs = yield* FileSystem.FileSystem
   const directory = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-native-build-' })
@@ -82,7 +86,7 @@ const program = Effect.gen(function* () {
   yield* fs.writeFileString(join(directory, 'main.silk'), source)
   yield* fs.writeFileString(
     join(directory, 'silk.toml'),
-    '[package]\nname = "native-build"\nversion = "0.1.0"\nsource = "."\n',
+    '[package]\nname = "native-build"\nversion = "0.1.0"\nsource = "."\nsilk-version = "0.0.0"\n',
   )
   const sentinel = join(directory, 'clang-sentinel')
   const marker = join(directory, 'clang-called')
@@ -255,9 +259,9 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   // Resolution reads the package definition; only compile --request bypasses manifests and plans.
   yield* fs.remove(join(requestRoot, 'build.silk'))
   yield* fs.writeFileString(join(requestRoot, 'silk.toml'),
-    '[package]\nname = "request-fixture"\nversion = "0.1.0"\nsource = "."\n[dependencies]\ndep = { path = "dependency" }\n')
+    '[package]\nname = "request-fixture"\nversion = "0.1.0"\nsource = "."\nsilk-version = "0.0.0"\n[dependencies]\ndep = { path = "dependency" }\n')
   yield* fs.writeFileString(join(requestRoot, 'dependency/silk.toml'),
-    '[package]\nname = "request-dependency"\nversion = "0.1.0"\nsource = "."\nkind = "library"\nexports = ["value"]\ninclude = ["asset.bin"]\n')
+    '[package]\nname = "request-dependency"\nversion = "0.1.0"\nsource = "."\nkind = "library"\nexports = ["value"]\ninclude = ["asset.bin"]\nsilk-version = "0.0.0"\n')
   const definitionText = (yield* fs.readFileString(join(requestRoot, 'definition.toml')))
     .replaceAll('/REQUEST_ROOT', requestRoot).replaceAll('/STDLIB_ROOT', standardLibrary)
   yield* fs.writeFileString(join(requestRoot, 'definition.toml'), definitionText)
@@ -288,7 +292,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     '-o', graphCompiler, '--stdlib', standardLibrary, '--clang', clang], directory, process.env, 300_000)
   assert.equal(graphCompilerBuilt.status, 0, graphCompilerBuilt.stderr || String(graphCompilerBuilt.error))
   yield* fs.writeFileString(join(directory, 'silk.toml'),
-    '[package]\nname = "native-build"\nversion = "0.1.0"\nsource = "."\n[workspace]\nmembers = ["request-fixture"]\noutput-dir = "request-fixture/custom-output"\n')
+    '[package]\nname = "native-build"\nversion = "0.1.0"\nsource = "."\nsilk-version = "0.0.0"\n[workspace]\nmembers = ["request-fixture"]\noutput-dir = "request-fixture/custom-output"\n')
   yield* fs.writeFile(join(requestRoot, 'dependency/asset.bin'), new Uint8Array([5, 0, 255, 34, 10]))
   const packagePath = (dependency: string, path: string) => invoke(silk,
     ['package-path', '--manifest', join(requestRoot, 'silk.toml'), '--dependency', dependency, '--path', path], requestRoot, requestEnv)
@@ -325,7 +329,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   assert.match(graphRecompiled.stderr, /checks? reused/, 'an edited graph compilation reuses its cache')
   yield* fs.writeFileString(join(requestRoot, 'main.silk'), embedded)
   yield* fs.writeFileString(join(directory, 'silk.toml'),
-    '[package]\nname = "native-build"\nversion = "0.1.0"\nsource = "."\n')
+    '[package]\nname = "native-build"\nversion = "0.1.0"\nsource = "."\nsilk-version = "0.0.0"\n')
   const runnerDirectory = join(directory, 'artifact-runners')
   yield* fs.makeDirectory(runnerDirectory)
   const explicitRunner = join(runnerDirectory, 'explicit')
@@ -347,9 +351,9 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   // Reserved command aliases dispatch to the typed task without interpreting its arguments.
   const aliased = join(directory, 'aliased')
   yield* fs.makeDirectory(join(aliased, 'src'), { recursive: true })
-  yield* fs.writeFileString(join(aliased, 'silk.toml'), '[package]\nname="aliased"\n[dependencies]\ncatalog = {path="catalog"}\n')
+  yield* fs.writeFileString(join(aliased, 'silk.toml'), '[package]\nname="aliased"\nsilk-version = "0.0.0"\n[dependencies]\ncatalog = {path="catalog"}\n')
   yield* fs.makeDirectory(join(aliased, 'catalog'), { recursive: true })
-  yield* fs.writeFileString(join(aliased, 'catalog/silk.toml'), '[package]\nname="task-catalog"\nsource="."\nexports=["description"]\n')
+  yield* fs.writeFileString(join(aliased, 'catalog/silk.toml'), '[package]\nname="task-catalog"\nsource="."\nexports=["description"]\nsilk-version = "0.0.0"\n')
   yield* fs.writeFileString(join(aliased, 'catalog/description.silk'), 'pub const DESCRIPTION: string = "Alias fixture"\n')
   yield* fs.writeFileString(join(aliased, 'src/main.silk'), 'pub fn main() -> i32 { return 42 }\ntest fn smoke() -> () {}\n')
   const aliasSource = (names: ReadonlyArray<string>) => [
@@ -444,7 +448,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   const held = join(directory, 'held-native')
   yield* fs.makeDirectory(join(held, 'src'), { recursive: true })
   yield* fs.makeDirectory(join(held, 'native'), { recursive: true })
-  yield* fs.writeFileString(join(held, 'silk.toml'), '[package]\nname="held-native"\n')
+  yield* fs.writeFileString(join(held, 'silk.toml'), '[package]\nname="held-native"\nsilk-version = "0.0.0"\n')
   yield* fs.writeFileString(join(held, 'build.silk'), [
     'import silk.build.plan { Plan }',
     'import silk.build.step { sourcePath }',
@@ -490,7 +494,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   // Plan.linkDependency; declaring it is not enough, and naming an undeclared one refuses the plan.
   const heldC = join(held, 'held-c')
   yield* fs.makeDirectory(join(heldC, 'src'), { recursive: true })
-  yield* fs.writeFileString(join(heldC, 'silk.toml'), '[package]\nname="held-c"\nkind="library"\nexports=["lib"]\n')
+  yield* fs.writeFileString(join(heldC, 'silk.toml'), '[package]\nname="held-c"\nkind="library"\nexports=["lib"]\nsilk-version = "0.0.0"\n')
   yield* fs.writeFileString(join(heldC, 'src/lib.silk'), '//! Only C.\n')
   yield* fs.writeFileString(join(heldC, 'build.silk'), [
     'import silk.build.plan { Plan }',
@@ -502,7 +506,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     '',
   ].join('\n'))
   yield* fs.writeFileString(join(heldC, 'defines.c'), 'int held_missing_symbol(void) { return 7; }\n')
-  yield* fs.writeFileString(join(held, 'silk.toml'), '[package]\nname="held-native"\n[dependencies]\nheld_c = {path="held-c"}\n')
+  yield* fs.writeFileString(join(held, 'silk.toml'), '[package]\nname="held-native"\nsilk-version = "0.0.0"\n[dependencies]\nheld_c = {path="held-c"}\n')
   yield* fs.writeFileString(join(held, 'src/tasks.silk'), heldTasks(false))
   const heldPlan = (linked: string | undefined) => [
     'import silk.build.plan { Plan }',
@@ -541,6 +545,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   yield* fs.writeFileString(join(held, 'silk.toml'), [
     '[package]',
     'name="held-native"',
+    'silk-version = "0.0.0"',
     '[dependencies]',
     'held_c = {path="held-c"}',
     '[native.archive.prepared]',
@@ -561,7 +566,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   const builtUnfetched = yield* invoke(silk, ['build', '--stdlib', standardLibrary], held, requestEnv, 120_000)
   assert.notEqual(builtUnfetched.status, 0)
   assert.match(builtUnfetched.stderr, /cannot fetch archive prepared/)
-  yield* fs.writeFileString(join(held, 'silk.toml'), '[package]\nname="held-native"\n[dependencies]\nheld_c = {path="held-c"}\n')
+  yield* fs.writeFileString(join(held, 'silk.toml'), '[package]\nname="held-native"\nsilk-version = "0.0.0"\n[dependencies]\nheld_c = {path="held-c"}\n')
   yield* fs.writeFileString(join(held, 'build.silk'), heldPlan('absent'))
   const undeclared = yield* invoke(silk, ['run', '--stdlib', standardLibrary], held, requestEnv, 120_000)
   assert.notEqual(undeclared.status, 0)
@@ -714,11 +719,11 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   yield* fs.writeFileString(join(releaseWorkspace, 'silk.toml'), workspaceManifest)
   yield* fs.writeFileString(
     join(releaseMember, 'silk.toml'),
-    '[package]\nname = "native-release"\nversion = "1.0.0"\n[release]\nversion-file = "src/ReleaseVersion.silk"\n',
+    '[package]\nname = "native-release"\nversion = "1.0.0"\nsilk-version = "0.0.0"\n[release]\nversion-file = "src/ReleaseVersion.silk"\n',
   )
   yield* fs.writeFileString(
     join(releaseWorkspace, 'changes/silk.toml'),
-    '[package]\nname = "release-consumer"\nversion = "0.1.0"\n\n[dependencies]\nreleased = { path = "../compiler" }\n',
+    '[package]\nname = "release-consumer"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n\n[dependencies]\nreleased = { path = "../compiler" }\n',
   )
   for (const args of [
     ['change'],
@@ -1647,7 +1652,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   yield* fs.makeDirectory(join(directory, 'rejected/src'), { recursive: true })
   yield* fs.writeFileString(
     join(directory, 'rejected/silk.toml'),
-    '[package]\nname = "rejected"\nversion = "0.1.0"\n',
+    '[package]\nname = "rejected"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n',
   )
   yield* fs.writeFileString(
     join(directory, 'rejected/src/main.silk'),
@@ -1670,7 +1675,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   yield* fs.makeDirectory(join(directory, 'unknown/src'), { recursive: true })
   yield* fs.writeFileString(
     join(directory, 'unknown/silk.toml'),
-    '[package]\nname = "unknown"\nversion = "0.1.0"\n',
+    '[package]\nname = "unknown"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n',
   )
   yield* fs.writeFileString(
     join(directory, 'unknown/src/main.silk'),
@@ -1692,7 +1697,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   yield* fs.makeDirectory(join(directory, 'casing/src/util'), { recursive: true })
   yield* fs.writeFileString(
     join(directory, 'casing/silk.toml'),
-    '[package]\nname = "casing"\nversion = "0.1.0"\n',
+    '[package]\nname = "casing"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n',
   )
   yield* fs.writeFileString(join(directory, 'casing/src/util/Math.silk'), 'pub fn twice(value: i32) -> i32 {\n  return value * 2\n}\n')
   yield* fs.writeFileString(
@@ -1712,7 +1717,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   yield* fs.makeDirectory(join(directory, 'unused/src'), { recursive: true })
   yield* fs.writeFileString(
     join(directory, 'unused/silk.toml'),
-    '[package]\nname = "unused"\nversion = "0.1.0"\n',
+    '[package]\nname = "unused"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n',
   )
   yield* fs.writeFileString(
     join(directory, 'unused/src/main.silk'),
@@ -1750,12 +1755,12 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   yield* fs.makeDirectory(join(directory, 'unusedapp/src'), { recursive: true })
   yield* fs.writeFileString(
     join(directory, 'unuseddep/silk.toml'),
-    '[package]\nname = "unuseddep"\nversion = "0.1.0"\nkind = "library"\nexports = ["lib"]\n',
+    '[package]\nname = "unuseddep"\nversion = "0.1.0"\nkind = "library"\nexports = ["lib"]\nsilk-version = "0.0.0"\n',
   )
   yield* fs.writeFileString(join(directory, 'unuseddep/src/lib.silk'), 'import silk.num.u64\n\npub fn value() -> i32 {\n  return 0\n}\n')
   yield* fs.writeFileString(
     join(directory, 'unusedapp/silk.toml'),
-    '[package]\nname = "unusedapp"\nversion = "0.1.0"\n\n[dependencies]\nunuseddep = { path = "../unuseddep" }\n',
+    '[package]\nname = "unusedapp"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n\n[dependencies]\nunuseddep = { path = "../unuseddep" }\n',
   )
   yield* fs.writeFileString(join(directory, 'unusedapp/src/main.silk'), 'import unuseddep.lib\n\npub fn main() -> i32 {\n  return lib.value()\n}\n')
   for (const command of ['check', 'build']) {
@@ -1770,7 +1775,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   yield* fs.makeDirectory(join(directory, 'unexported/src'), { recursive: true })
   yield* fs.writeFileString(
     join(directory, 'unexported/silk.toml'),
-    '[package]\nname = "unexported"\nversion = "0.1.0"\nexports = ["nope"]\n',
+    '[package]\nname = "unexported"\nversion = "0.1.0"\nexports = ["nope"]\nsilk-version = "0.0.0"\n',
   )
   yield* fs.writeFileString(
     join(directory, 'unexported/src/main.silk'),
@@ -1820,7 +1825,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   yield* fs.makeDirectory(join(directory, 'synchronous/src'), { recursive: true })
   yield* fs.writeFileString(
     join(directory, 'synchronous/silk.toml'),
-    '[package]\nname = "synchronous"\nversion = "0.1.0"\n\n[unstable]\ncomposition = { runtimes = [{ name = "synchronous", module = "silk/platform/native/start_sync" }], defaults = ["synchronous"] }\n',
+    '[package]\nname = "synchronous"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n\n[unstable]\ncomposition = { runtimes = [{ name = "synchronous", module = "silk/platform/native/start_sync" }], defaults = ["synchronous"] }\n',
   )
   yield* fs.writeFileString(
     join(directory, 'synchronous/src/main.silk'),
@@ -1844,7 +1849,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   yield* fs.makeDirectory(join(directory, 'textmain/src'), { recursive: true })
   yield* fs.writeFileString(
     join(directory, 'textmain/silk.toml'),
-    '[package]\nname = "textmain"\nversion = "0.1.0"\n',
+    '[package]\nname = "textmain"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n',
   )
   yield* fs.writeFileString(join(directory, 'textmain/src/main.silk'), 'pub fn main() -> string {\n  return "x"\n}\n')
   for (const command of ['check', 'build']) {
@@ -2156,7 +2161,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     yield* fs.makeDirectory(join(directory, entry.name, 'src/geo'), { recursive: true })
     yield* fs.writeFileString(
       join(directory, entry.name, 'silk.toml'),
-      `[package]\nname = "${entry.name}"\nversion = "0.1.0"\n`,
+      `[package]\nname = "${entry.name}"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n`,
     )
     for (const [path, text] of Object.entries(entry.files)) {
       yield* fs.writeFileString(join(directory, entry.name, 'src', path), text)
@@ -2172,7 +2177,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   yield* fs.writeFileString(join(directory, 'relative/silk.toml'), '[workspace]\nmembers = ["broken"]\n')
   yield* fs.writeFileString(
     join(directory, 'relative/broken/silk.toml'),
-    '[package]\nname = "broken"\nversion = "0.1.0"\n',
+    '[package]\nname = "broken"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n',
   )
   yield* fs.writeFileString(
     join(directory, 'relative/broken/src/main.silk'),
@@ -2194,7 +2199,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   yield* fs.makeDirectory(join(directory, 'ownruntime/src/support'), { recursive: true })
   yield* fs.writeFileString(
     join(directory, 'ownruntime/silk.toml'),
-    '[package]\nname = "ownruntime"\nversion = "0.1.0"\n\n[unstable]\ncomposition = { runtimes = [{ name = "start", module = "support/start" }], defaults = ["start"] }\n',
+    '[package]\nname = "ownruntime"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n\n[unstable]\ncomposition = { runtimes = [{ name = "start", module = "support/start" }], defaults = ["start"] }\n',
   )
   yield* fs.writeFileString(
     join(directory, 'ownruntime/src/main.silk'),
@@ -2221,7 +2226,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   yield* fs.writeFileString(join(directory, 'staticspec/silk.toml'), '[workspace]\nmembers = ["app", "spec"]\n')
   yield* fs.writeFileString(
     join(directory, 'staticspec/spec/silk.toml'),
-    '[package]\nname = "spec"\nversion = "0.1.0"\nsource = "."\nexports = ["sized"]\n',
+    '[package]\nname = "spec"\nversion = "0.1.0"\nsource = "."\nexports = ["sized"]\nsilk-version = "0.0.0"\n',
   )
   yield* fs.writeFileString(
     join(directory, 'staticspec/spec/sized.silk'),
@@ -2229,7 +2234,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   )
   yield* fs.writeFileString(
     join(directory, 'staticspec/app/silk.toml'),
-    '[package]\nname = "app"\nversion = "0.1.0"\n\n[dependencies]\nspec = { path = "../spec" }\n',
+    '[package]\nname = "app"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n\n[dependencies]\nspec = { path = "../spec" }\n',
   )
   yield* fs.writeFileString(
     join(directory, 'staticspec/app/src/main.silk'),
@@ -2254,7 +2259,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   yield* fs.writeFileString(join(directory, 'privatedep/silk.toml'), '[workspace]\nmembers = ["app", "core"]\n')
   yield* fs.writeFileString(
     join(directory, 'privatedep/core/silk.toml'),
-    '[package]\nname = "core"\nversion = "0.1.0"\nsource = "."\nexports = ["Store"]\n',
+    '[package]\nname = "core"\nversion = "0.1.0"\nsource = "."\nexports = ["Store"]\nsilk-version = "0.0.0"\n',
   )
   yield* fs.writeFileString(
     join(directory, 'privatedep/core/Store.silk'),
@@ -2262,7 +2267,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   )
   yield* fs.writeFileString(
     join(directory, 'privatedep/app/silk.toml'),
-    '[package]\nname = "app"\nversion = "0.1.0"\n\n[dependencies]\ntaskcore = { path = "../core", package = "core" }\n',
+    '[package]\nname = "app"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n\n[dependencies]\ntaskcore = { path = "../core", package = "core" }\n',
   )
   yield* fs.writeFileString(
     join(directory, 'privatedep/app/src/main.silk'),
@@ -2278,7 +2283,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   yield* fs.makeDirectory(join(directory, 'depexport/app/native'), { recursive: true })
   yield* fs.writeFileString(
     join(directory, 'depexport/core/silk.toml'),
-    '[package]\nname = "core"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nexports = ["probes"]\n',
+    '[package]\nname = "core"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nexports = ["probes"]\nsilk-version = "0.0.0"\n',
   )
   yield* fs.writeFileString(
     join(directory, 'depexport/core/probes.silk'),
@@ -2286,7 +2291,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   )
   yield* fs.writeFileString(
     join(directory, 'depexport/app/silk.toml'),
-    '[package]\nname = "app"\nversion = "0.1.0"\nsource = "."\n\n[dependencies]\ncore = { path = "../core" }\n',
+    '[package]\nname = "app"\nversion = "0.1.0"\nsource = "."\nsilk-version = "0.0.0"\n\n[dependencies]\ncore = { path = "../core" }\n',
   )
   yield* fs.writeFileString(
     join(directory, 'depexport/app/native/caller.c'),
@@ -2309,7 +2314,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   yield* fs.writeFileString(join(directory, 'libmsg/silk.toml'), '[workspace]\nmembers = ["geo", "app"]\n')
   yield* fs.writeFileString(
     join(directory, 'libmsg/geo/silk.toml'),
-    '[package]\nname = "geo"\nversion = "0.1.0"\nkind = "library"\nexports = ["lib"]\n',
+    '[package]\nname = "geo"\nversion = "0.1.0"\nkind = "library"\nexports = ["lib"]\nsilk-version = "0.0.0"\n',
   )
   yield* fs.writeFileString(
     join(directory, 'libmsg/geo/src/lib.silk'),
@@ -2317,7 +2322,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   )
   yield* fs.writeFileString(
     join(directory, 'libmsg/app/silk.toml'),
-    '[package]\nname = "app"\nversion = "0.1.0"\n\n[dependencies]\ngeo = { path = "../geo" }\n',
+    '[package]\nname = "app"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n\n[dependencies]\ngeo = { path = "../geo" }\n',
   )
   yield* fs.writeFileString(
     join(directory, 'libmsg/app/src/main.silk'),
@@ -2351,7 +2356,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   assert.equal(escaped.status, 1, escaped.stderr)
   assert.match(escaped.stderr, /^unhandled error: geo\.lib\.BadSide\n {2}at geo\.lib\.side \(/m)
   // A member without its root module but with a `lib.silk` is pointed at the library kind.
-  yield* fs.writeFileString(join(directory, 'libmsg/geo/silk.toml'), '[package]\nname = "geo"\nversion = "0.1.0"\n')
+  yield* fs.writeFileString(join(directory, 'libmsg/geo/silk.toml'), '[package]\nname = "geo"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n')
   const kindless = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(directory, 'libmsg'))
   assert.match(
     kindless.stderr,
@@ -2364,12 +2369,12 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   yield* fs.writeFileString(join(directory, 'adopt/silk.toml'), '[workspace]\nmembers = ["core", "app"]\n')
   yield* fs.writeFileString(
     join(directory, 'adopt/core/silk.toml'),
-    '[package]\nname = "adoptcore"\nversion = "0.1.0"\nkind = "library"\nexports = ["lib"]\n',
+    '[package]\nname = "adoptcore"\nversion = "0.1.0"\nkind = "library"\nexports = ["lib"]\nsilk-version = "0.0.0"\n',
   )
   yield* fs.writeFileString(join(directory, 'adopt/core/src/lib.silk'), 'pub fn size() -> i64 {\n  return 2\n}\n')
   yield* fs.writeFileString(
     join(directory, 'adopt/app/silk.toml'),
-    '[package]\nname = "adoptapp"\nversion = "0.1.0"\n\n[dependencies]\nadoptcore = { path = "../core" }\n',
+    '[package]\nname = "adoptapp"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n\n[dependencies]\nadoptcore = { path = "../core" }\n',
   )
   yield* fs.writeFileString(
     join(directory, 'adopt/app/src/main.silk'),
@@ -2471,7 +2476,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   ]
   for (const [name, source, expected] of [...lendCases, ...patternCases, ...staticCases, ...interopCases, ...templateCases]) {
     yield* fs.makeDirectory(join(directory, `${name}/src`), { recursive: true })
-    yield* fs.writeFileString(join(directory, `${name}/silk.toml`), `[package]\nname = "${name}"\nversion = "0.1.0"\n`)
+    yield* fs.writeFileString(join(directory, `${name}/silk.toml`), `[package]\nname = "${name}"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n`)
     yield* fs.writeFileString(join(directory, `${name}/src/main.silk`), source)
     const checked = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(directory, name))
     assert.equal(checked.status, 1, checked.stderr)
@@ -2486,7 +2491,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   ]
   for (const [name, source, expected] of parkingCases) {
     yield* fs.makeDirectory(join(directory, `${name}/src`), { recursive: true })
-    yield* fs.writeFileString(join(directory, `${name}/silk.toml`), `[package]\nname = "${name}"\nversion = "0.1.0"\n`)
+    yield* fs.writeFileString(join(directory, `${name}/silk.toml`), `[package]\nname = "${name}"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n`)
     yield* fs.writeFileString(join(directory, `${name}/src/main.silk`), source)
     const built = yield* invoke(silk, ['build', '--stdlib', standardLibrary], join(directory, name), { ...process.env, SILK_CLANG: clang })
     assert.equal(built.status, 1, built.stderr)
@@ -2494,13 +2499,13 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   }
   // Silk code may call an `export "C"` function directly, through its C symbol.
   yield* fs.makeDirectory(join(directory, 'callexport/src'), { recursive: true })
-  yield* fs.writeFileString(join(directory, 'callexport/silk.toml'), '[package]\nname = "callexport"\nversion = "0.1.0"\n')
+  yield* fs.writeFileString(join(directory, 'callexport/silk.toml'), '[package]\nname = "callexport"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n')
   yield* fs.writeFileString(join(directory, 'callexport/src/main.silk'), "export \"C\" fn twice(v: i32) -> i32 {\n  return v * 2\n}\n\npub fn main() -> i32 {\n  return unsafe twice(21)\n}\n")
   const exportCall = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(directory, 'callexport'), { ...process.env, SILK_CLANG: clang })
   assert.equal(exportCall.status, 42, exportCall.stderr)
   // A shift count out of range is the caller's mistake, so the trap names the caller's line.
   yield* fs.makeDirectory(join(directory, 'shiftcount/src'), { recursive: true })
-  yield* fs.writeFileString(join(directory, 'shiftcount/silk.toml'), '[package]\nname = "shiftcount"\nversion = "0.1.0"\n')
+  yield* fs.writeFileString(join(directory, 'shiftcount/silk.toml'), '[package]\nname = "shiftcount"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n')
   yield* fs.writeFileString(join(directory, 'shiftcount/src/main.silk'), 'import silk.num.u32\n\nfn count(n: u32) -> u32 { return n + 31 }\n\npub fn main() -> i32 {\n  let shifted = u32.shiftLeft(1, count(1))\n  return u32.toI32(shifted)\n}\n')
   const shiftCount = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(directory, 'shiftcount'), { ...process.env, SILK_CLANG: clang })
   assert.notEqual(shiftCount.status, 0, shiftCount.stderr)
@@ -2517,26 +2522,26 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   // A trap after a fiber resumes names the suspended callers of the resumed frame, which only its
   // frame chain holds: the fiber's driver, not `work`, called `pick`'s step.
   yield* fs.makeDirectory(join(directory, 'resumedtrap/src'), { recursive: true })
-  yield* fs.writeFileString(join(directory, 'resumedtrap/silk.toml'), '[package]\nname = "resumedtrap"\nversion = "0.1.0"\n')
+  yield* fs.writeFileString(join(directory, 'resumedtrap/silk.toml'), '[package]\nname = "resumedtrap"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n')
   yield* fs.writeFileString(join(directory, 'resumedtrap/src/main.silk'), 'import silk.mem.allocator { OutOfMemoryError }\nimport silk.core.effect { Effect }\nimport silk.concurrency.fiber { Cancelled, Fiber }\nimport silk.concurrency.local_scheduler { LocalScheduler, StalledError }\nimport silk.system.monotonic_clock { MonotonicClock }\nimport silk.system.monotonic_clock_native { OsMonotonicClock }\nimport silk.concurrency.scheduler { Scheduler, TaskIdExhaustedError }\nfn at(values: &[i32], index: usize) -> i32 { return values[index] }\neffect fn pick(values: &[i32], index: usize) -> i32 {\n  run Fiber.yieldNow()\n  return at(values, index)\n}\neffect fn work(index: usize) -> i32 {\n  let values = [1, 2, 3]\n  return run pick(&values, index)\n}\neffect fn root() -> i32 ! OutOfMemoryError | TaskIdExhaustedError | Cancelled ? &mut Scheduler | &mut MonotonicClock {\n  let child = run Fiber<i32, never>.forkChild(work(5))\n  return run child.join()\n}\npub effect fn main() -> i32 ! OutOfMemoryError | TaskIdExhaustedError | Cancelled | StalledError {\n  let mut clock = OsMonotonicClock.make()\n  let mut scheduler = LocalScheduler.make()\n  return run scheduler.execute<i32, OutOfMemoryError | TaskIdExhaustedError | Cancelled>(root())\n    |> Effect.provideMut<MonotonicClock>(&mut clock)\n}\n')
   const resumedTrap = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(directory, 'resumedtrap'), { ...process.env, SILK_CLANG: clang })
   assert.notEqual(resumedTrap.status, 0, resumedTrap.stderr)
   assert.match(resumedTrap.stderr, /^fatal trap: index out of bounds\n {2}at main\.at \(main:8:53\)\n {2}at main\.pick\n {2}at main\.work\n {2}at main\.main\n/m)
   // A width or precision field can be any integer, so a bare literal needs no `usize` annotation.
   yield* fs.makeDirectory(join(directory, 'widthint/src'), { recursive: true })
-  yield* fs.writeFileString(join(directory, 'widthint/silk.toml'), '[package]\nname = "widthint"\nversion = "0.1.0"\n')
+  yield* fs.writeFileString(join(directory, 'widthint/silk.toml'), '[package]\nname = "widthint"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n')
   yield* fs.writeFileString(join(directory, 'widthint/src/main.silk'), 'import silk.io.writer_native { StderrWriter }\n\npub fn main() -> i32 {\n  StderrWriter.print("[{name:>w$}] [{v:.p$}]\\n", &.{ name: "Ada", w: 5, v: 7, p: 3 })\n  return 0\n}\n')
   const widthInt = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(directory, 'widthint'), { ...process.env, SILK_CLANG: clang })
   assert.equal(widthInt.status, 0, widthInt.stderr)
   assert.match(widthInt.stderr, /^\[  Ada\] \[007\]$/m)
   // A line that starts with `-1 =>` is the next arm, not a subtraction from the arm before it.
   yield* fs.makeDirectory(join(directory, 'negarm/src'), { recursive: true })
-  yield* fs.writeFileString(join(directory, 'negarm/silk.toml'), '[package]\nname = "negarm"\nversion = "0.1.0"\n')
+  yield* fs.writeFileString(join(directory, 'negarm/silk.toml'), '[package]\nname = "negarm"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n')
   yield* fs.writeFileString(join(directory, 'negarm/src/main.silk'), "fn pick(n: i32) -> i32 {\n  return match n {\n    7 => 1\n    -1 => 2\n    i32 other => other\n  }\n}\n\npub fn main() -> i32 {\n  return pick(-1) + pick(7) + pick(5)\n}\n")
   const negative = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(directory, 'negarm'), { ...process.env, SILK_CLANG: clang })
   assert.equal(negative.status, 8, negative.stderr)
   yield* fs.makeDirectory(join(directory, 'lendok/src'), { recursive: true })
-  yield* fs.writeFileString(join(directory, 'lendok/silk.toml'), '[package]\nname = "lendok"\nversion = "0.1.0"\n')
+  yield* fs.writeFileString(join(directory, 'lendok/silk.toml'), '[package]\nname = "lendok"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n')
   yield* fs.writeFileString(join(directory, 'lendok/src/main.silk'), "fn callMut(mut f: mut fn(i32) -> i32) -> i32 {\n  return f(1)\n}\n\npub fn main() -> i32 {\n  let mut total = 0\n  let mut acc = |x: i32| -> i32 {\n    total = total + x\n    return total\n  }\n  let a = callMut(acc)\n  let b = callMut(acc)\n  let c = acc(100)\n  return a + b + c\n}\n")
   const lent = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(directory, 'lendok'), { ...process.env, SILK_CLANG: clang })
   assert.equal(lent.status, 105, lent.stderr)
@@ -2544,7 +2549,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   yield* fs.makeDirectory(join(directory, 'unclosed/src'), { recursive: true })
   yield* fs.writeFileString(
     join(directory, 'unclosed/silk.toml'),
-    '[package]\nname = "unclosed"\nversion = "0.1.0"\n',
+    '[package]\nname = "unclosed"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n',
   )
   yield* fs.writeFileString(join(directory, 'unclosed/src/main.silk'), 'pub fn main() -> i32 {\n  return 0\n')
   const unclosed = yield* invoke(
@@ -2574,7 +2579,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     const name = checkedFirst ? 'unwaited' : 'waited'
     const project = join(directory, name)
     yield* fs.makeDirectory(join(project, 'src'), { recursive: true })
-    yield* fs.writeFileString(join(project, 'silk.toml'), `[package]\nname = "${name}"\nversion = "0.1.0"\n`)
+    yield* fs.writeFileString(join(project, 'silk.toml'), `[package]\nname = "${name}"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n`)
     yield* fs.writeFileString(join(project, 'src/main.silk'), 'fn half(value: i32) -> i32 {\n  return value / 2\n}\n\npub fn main() -> i32 {\n  return half(0)\n}\n')
     const first = checkedFirst ? ['check', '--no-server'] : ['build']
     const prepared = yield* invoke(silk, [...first, '--stdlib', standardLibrary], project, { ...process.env, SILK_CLANG: clang })
@@ -2607,7 +2612,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   yield* fs.makeDirectory(join(directory, 'tested/src/util'), { recursive: true })
   yield* fs.writeFileString(
     join(directory, 'tested/silk.toml'),
-    '[package]\nname = "tested"\nversion = "0.1.0"\nmain = "main.silk"\nkind = "library"\n',
+    '[package]\nname = "tested"\nversion = "0.1.0"\nmain = "main.silk"\nkind = "library"\nsilk-version = "0.0.0"\n',
   )
   yield* fs.writeFileString(
     join(directory, 'tested/src/main.silk'),
@@ -2694,7 +2699,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   // must run again even though it still passes the same concrete value.
   const dispatchTests = join(directory, 'dispatch-tests')
   yield* fs.makeDirectory(join(dispatchTests, 'src'), { recursive: true })
-  yield* fs.writeFileString(join(dispatchTests, 'silk.toml'), '[package]\nname = "dispatch-tests"\nversion = "0.1.0"\nmain = "main.silk"\nkind = "library"\n')
+  yield* fs.writeFileString(join(dispatchTests, 'silk.toml'), '[package]\nname = "dispatch-tests"\nversion = "0.1.0"\nmain = "main.silk"\nkind = "library"\nsilk-version = "0.0.0"\n')
   yield* fs.writeFileString(join(dispatchTests, 'src/main.silk'), `import members
 test fn readsFirst() -> () { drop members.first() }
 test fn independent() -> () {}
@@ -2752,7 +2757,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   yield* fs.makeDirectory(join(directory, 'stuck/src'), { recursive: true })
   yield* fs.writeFileString(
     join(directory, 'stuck/silk.toml'),
-    '[package]\nname = "stuck"\nversion = "0.1.0"\n',
+    '[package]\nname = "stuck"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n',
   )
   yield* fs.writeFileString(
     join(directory, 'stuck/src/main.silk'),
@@ -2775,7 +2780,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   yield* fs.makeDirectory(join(directory, 'round-shapes/src'), { recursive: true })
   yield* fs.writeFileString(
     join(directory, 'round-shapes/silk.toml'),
-    '[package]\nname = "round-shapes"\nversion = "0.1.0"\nkind = "library"\n',
+    '[package]\nname = "round-shapes"\nversion = "0.1.0"\nkind = "library"\nsilk-version = "0.0.0"\n',
   )
   yield* fs.writeFileString(
     join(directory, 'round-shapes/src/lib.silk'),
@@ -2838,7 +2843,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   )
   assert.equal(clangTests.status, 0, clangTests.stderr)
   yield* fs.writeFileString(join(directory, 'tested/silk.toml'),
-    '[package]\nname = "tested"\nversion = "0.1.0"\nmain = "main.silk"\nkind = "executable"\n')
+    '[package]\nname = "tested"\nversion = "0.1.0"\nmain = "main.silk"\nkind = "executable"\nsilk-version = "0.0.0"\n')
   yield* fs.writeFileString(join(directory, 'tested/src/main.silk'), 'pub fn main() -> i32 { return 0 }\n')
   const unstartedBuild = yield* invoke(
     silk,
@@ -2864,7 +2869,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   // Target conditions in ordinary static code omit irrelevant native requirements.
   const otherSystem = hostTarget.includes('apple-darwin') ? 'Linux' : 'Darwin'
   yield* fs.writeFileString(join(unpackaged, 'silk.toml'),
-    '[package]\nname = "linked"\nversion = "0.1.0"\nsource = "."\n')
+    '[package]\nname = "linked"\nversion = "0.1.0"\nsource = "."\nsilk-version = "0.0.0"\n')
   yield* fs.writeFileString(join(unpackaged, 'main.silk'), 'pub fn main() -> i32 { return 0 }\n')
   yield* writePlan(unpackaged, `  if Target.operatingSystem() == OperatingSystem.${otherSystem} {
     plan = Plan.linkFramework(plan, "Security", Framework.make())
@@ -2882,7 +2887,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   const shimArchive = yield* invoke(join(dirname(clang), 'llvm-ar'), ['rcs', 'libshim.a', 'offset.o'], join(propagated, 'shim'))
   assert.equal(shimArchive.status, 0, shimArchive.stderr)
   yield* fs.writeFileString(join(propagated, 'shim/silk.toml'),
-    '[package]\nname = "shim"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nexports = ["Shim"]\n')
+    '[package]\nname = "shim"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nexports = ["Shim"]\nsilk-version = "0.0.0"\n')
   yield* writePlan(join(propagated, 'shim'), '  plan = Plan.linkArchive(plan, sourcePath("libshim.a"))')
   yield* fs.writeFileString(
     join(propagated, 'shim/Shim.silk'),
@@ -2892,7 +2897,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   // list links once.
   yield* fs.writeFileString(
     join(propagated, 'middle/silk.toml'),
-    '[package]\nname = "middle"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nexports = ["Middle"]\n\n[dependencies]\nshim = { path = "../shim" }\n',
+    '[package]\nname = "middle"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nexports = ["Middle"]\nsilk-version = "0.0.0"\n\n[dependencies]\nshim = { path = "../shim" }\n',
   )
   yield* fs.writeFileString(
     join(propagated, 'middle/Middle.silk'),
@@ -2900,7 +2905,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   )
   yield* fs.writeFileString(
     join(propagated, 'app/silk.toml'),
-    '[package]\nname = "app"\nversion = "0.1.0"\nsource = "."\n\n[dependencies]\nmiddle = { path = "../middle" }\nshim = { path = "../shim" }\n',
+    '[package]\nname = "app"\nversion = "0.1.0"\nsource = "."\nsilk-version = "0.0.0"\n\n[dependencies]\nmiddle = { path = "../middle" }\nshim = { path = "../shim" }\n',
   )
   yield* fs.writeFileString(
     join(propagated, 'app/main.silk'),
@@ -2922,7 +2927,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   const sourcesRoot = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-native-sources-' })
   for (const member of ['clib/native', 'clib/include', 'app']) yield* fs.makeDirectory(join(sourcesRoot, member), { recursive: true })
   yield* fs.writeFileString(join(sourcesRoot, 'clib/silk.toml'),
-    '[package]\nname = "clib"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nexports = ["Clib"]\n')
+    '[package]\nname = "clib"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nexports = ["Clib"]\nsilk-version = "0.0.0"\n')
   const clibPlan = '  plan = Plan.compileNative(plan, "c", sourcePath("native/add.c"), &["-DBASE=40"], &[sourcePath("include")])\n' +
     '  plan = Plan.compileSources(plan, "c", sourcePath("native"), "two*.c", &["-DVALUE=2"], &[])\n'
   yield* writePlan(join(sourcesRoot, 'clib'), clibPlan)
@@ -2933,7 +2938,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     join(sourcesRoot, 'clib/Clib.silk'),
     'unsafe extern "C" fn clib_add(a: i32) -> i32\nunsafe extern "C" fn clib_two() -> i32\n\npub fn value() -> i32 {\n  return unsafe clib_add(unsafe clib_two())\n}\n',
   )
-  yield* fs.writeFileString(join(sourcesRoot, 'app/silk.toml'), '[package]\nname = "app"\nversion = "0.1.0"\nsource = "."\n\n[dependencies]\nclib = { path = "../clib" }\n')
+  yield* fs.writeFileString(join(sourcesRoot, 'app/silk.toml'), '[package]\nname = "app"\nversion = "0.1.0"\nsource = "."\nsilk-version = "0.0.0"\n\n[dependencies]\nclib = { path = "../clib" }\n')
   yield* fs.writeFileString(join(sourcesRoot, 'app/main.silk'), 'import clib.Clib\n\npub fn main() -> i32 {\n  return Clib.value()\n}\n')
   const compiledApp = join(sourcesRoot, 'app')
   const sourcesEnvironment = { ...process.env, SILK_CLANG: clang }
@@ -3010,7 +3015,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   assert.equal(packed.status, 0, packed.stdout + packed.stderr)
   const vendDigest = createHash('sha256').update(yield* fs.readFile(join(vendorArchived, 'vend.tar.gz'))).digest('hex')
   const sysManifest = (digest: string, url = `file://${join(vendorArchived, 'vend.tar.gz')}`) =>
-    '[package]\nname = "sys"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nexports = ["Sys"]\n'
+    '[package]\nname = "sys"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nexports = ["Sys"]\nsilk-version = "0.0.0"\n'
     + `[native.archive.vend]\nurl = "${url}"\nsha256 = "${digest}"\nstrip = 1\n`
   yield* fs.writeFileString(join(vendorArchived, 'sys/silk.toml'), sysManifest(vendDigest))
   const archivePlan = (name = 'vend', path = 'lib/libvend.a') =>
@@ -3020,7 +3025,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   yield* writePlan(join(vendorArchived, 'sys'), archivePlan())
   yield* fs.writeFileString(join(vendorArchived, 'sys/native/shim.c'), '#include "vend.h"\nint shim_value(void) { return vend_base() + 5; }\n')
   yield* fs.writeFileString(join(vendorArchived, 'sys/Sys.silk'), 'unsafe extern "C" fn shim_value() -> i32\n\npub fn value() -> i32 {\n  return unsafe shim_value()\n}\n')
-  const appManifest = '[package]\nname = "app"\nversion = "0.1.0"\nsource = "."\n\n[dependencies]\nsys = { path = "../sys" }\n'
+  const appManifest = '[package]\nname = "app"\nversion = "0.1.0"\nsource = "."\nsilk-version = "0.0.0"\n\n[dependencies]\nsys = { path = "../sys" }\n'
   yield* fs.writeFileString(join(vendorArchived, 'app/silk.toml'), appManifest)
   yield* fs.writeFileString(join(vendorArchived, 'app/main.silk'), 'import sys.Sys\n\npub fn main() -> i32 {\n  return Sys.value()\n}\n')
   const archivedApp = join(vendorArchived, 'app')
@@ -3084,7 +3089,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   for (const member of ['plib/native', 'app']) yield* fs.makeDirectory(join(planned, member), { recursive: true })
   yield* fs.writeFileString(
     join(planned, 'plib/silk.toml'),
-    '[package]\nname = "plib"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nexports = ["Plib"]\n',
+    '[package]\nname = "plib"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nexports = ["Plib"]\nsilk-version = "0.0.0"\n',
   )
   const planScript = (body: string) =>
     'import silk.build.plan { Library, Plan }\nimport silk.build.source { Source }\nimport silk.core.static_text { StaticText }\nimport silk.build.write_files { WriteFiles }\nimport silk.build.run { Run }\nimport silk.build.step { sourcePath }\n\n'
@@ -3103,7 +3108,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     join(planned, 'plib/Plib.silk'),
     'import generated_base\n\nunsafe extern "C" fn plib_twice(a: i32) -> i32\n\npub fn value() -> i32 {\n  return unsafe plib_twice(generated_base.BASE) + 1\n}\n',
   )
-  yield* fs.writeFileString(join(planned, 'app/silk.toml'), '[package]\nname = "app"\nversion = "0.1.0"\nsource = "."\n\n[dependencies]\nplib = { path = "../plib" }\n')
+  yield* fs.writeFileString(join(planned, 'app/silk.toml'), '[package]\nname = "app"\nversion = "0.1.0"\nsource = "."\nsilk-version = "0.0.0"\n\n[dependencies]\nplib = { path = "../plib" }\n')
   yield* fs.writeFileString(join(planned, 'app/main.silk'), 'import plib.Plib\n\npub fn main() -> i32 {\n  return Plib.value()\n}\n')
   const plannedApp = join(planned, 'app')
   const planRun = Effect.fnUntraced(function* (expected: number) {
@@ -3178,7 +3183,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   const planWorkspace = join(directory, 'plan-workspace')
   for (const name of ['first', 'second']) {
     yield* fs.makeDirectory(join(planWorkspace, name), { recursive: true })
-    yield* fs.writeFileString(join(planWorkspace, name, 'silk.toml'), `[package]\nname = "${name}"\nsource = "."\n`)
+    yield* fs.writeFileString(join(planWorkspace, name, 'silk.toml'), `[package]\nname = "${name}"\nsource = "."\nsilk-version = "0.0.0"\n`)
     yield* fs.writeFileString(join(planWorkspace, name, 'main.silk'), 'pub param answer: i32 = 42\npub fn main() -> i32 { return answer }\n')
   }
   yield* fs.writeFileString(join(planWorkspace, 'silk.toml'), '[workspace]\nmembers = ["first", "second"]\n')
@@ -3197,10 +3202,10 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   const importsRoot = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-import-discovery-' })
   for (const member of ['app', 'library', 'leaf']) yield* fs.makeDirectory(join(importsRoot, member))
   yield* fs.writeFileString(join(importsRoot, 'app/silk.toml'),
-    '[package]\nname="imports-app"\nsource="."\n[dependencies]\nlib={path="../library"}\nunused={path="../missing"}\n')
+    '[package]\nname="imports-app"\nsource="."\nsilk-version = "0.0.0"\n[dependencies]\nlib={path="../library"}\nunused={path="../missing"}\n')
   yield* fs.writeFileString(join(importsRoot, 'app/main.silk'), 'import lib.Value\npub fn main() -> i32 { return Value.VALUE }\n')
   yield* fs.writeFileString(join(importsRoot, 'library/silk.toml'),
-    '[package]\nname="imports-library"\nsource="."\nkind="library"\nexports=["Value"]\n[dependencies]\nleaf={path="../leaf"}\n'
+    '[package]\nname="imports-library"\nsource="."\nkind="library"\nexports=["Value"]\nsilk-version = "0.0.0"\n[dependencies]\nleaf={path="../leaf"}\n'
       + 'unused={git="https://github.com/silk-lang/unreachable-test-dependency.git",rev="1111111111111111111111111111111111111111"}\n')
   yield* fs.writeFileString(join(importsRoot, 'library/Value.silk'), 'import generated\npub const VALUE: i32 = generated.VALUE\n')
   yield* fs.writeFileString(join(importsRoot, 'library/build.silk'), [
@@ -3211,7 +3216,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     '}', 'pub const PLAN: Plan = plan()', '',
   ].join('\n'))
   yield* fs.writeFileString(join(importsRoot, 'leaf/silk.toml'),
-    '[package]\nname="imports-leaf"\nsource="."\nkind="library"\nexports=["Value"]\n')
+    '[package]\nname="imports-leaf"\nsource="."\nkind="library"\nexports=["Value"]\nsilk-version = "0.0.0"\n')
   yield* fs.writeFileString(join(importsRoot, 'leaf/Value.silk'), 'pub const VALUE: i32 = 42\n')
   const importsEnvironment = { ...sourcesEnvironment, SILK_OFFLINE: '1' }
   const importsBuilt = yield* invoke(silk, ['build', '--stdlib', standardLibrary], join(importsRoot, 'app'), importsEnvironment)
@@ -3262,7 +3267,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   for (const member of ['tlib/tools', 'app']) yield* fs.makeDirectory(join(tooled, member), { recursive: true })
   yield* fs.writeFileString(
     join(tooled, 'tlib/silk.toml'),
-    '[package]\nname = "tlib"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nexports = ["Tlib"]\n',
+    '[package]\nname = "tlib"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nexports = ["Tlib"]\nsilk-version = "0.0.0"\n',
   )
   yield* fs.writeFileString(
     join(tooled, 'tlib/build.silk'),
@@ -3282,7 +3287,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   yield* fs.writeFileString(join(tooled, 'tlib/Tlib.silk'), 'import generated_base\n\npub fn value() -> i32 {\n  return generated_base.BASE + 1\n}\n')
   const toolApp = join(tooled, 'app')
   const toolManifest = (authorized: boolean, extra = '') =>
-    `[package]\nname = "app"\nversion = "0.1.0"\nsource = "."\n\n[dependencies]\ntlib = { path = "../tlib", tools = ${authorized} }\n${extra}`
+    `[package]\nname = "app"\nversion = "0.1.0"\nsource = "."\nsilk-version = "0.0.0"\n\n[dependencies]\ntlib = { path = "../tlib", tools = ${authorized} }\n${extra}`
   yield* fs.writeFileString(join(toolApp, 'silk.toml'), toolManifest(false))
   yield* fs.writeFileString(join(toolApp, 'main.silk'), 'import tlib.Tlib\n\npub fn main() -> i32 {\n  return Tlib.value()\n}\n')
   const stepBuild = (environment: Record<string, string> = {}) =>
@@ -3354,7 +3359,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   // order, and a change to the file alone links again. A path outside the package is refused.
   const ordered = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-ordered-' })
   yield* fs.writeFileString(join(ordered, 'silk.toml'),
-    '[package]\nname = "ordered"\nversion = "0.1.0"\nsource = "."\n')
+    '[package]\nname = "ordered"\nversion = "0.1.0"\nsource = "."\nsilk-version = "0.0.0"\n')
   yield* fs.writeFileString(
     join(ordered, 'main.silk'),
     'fn twice(value: i32) -> i32 {\n  return value * 2\n}\n\npub fn main() -> i32 {\n  return twice(0)\n}\n',
@@ -3759,7 +3764,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     ? 'export "C" fn silk_tuned_wide(values: simd<f32, 8>) -> simd<f32, 8> { return values }\n\n'
     : ''
   yield* fs.writeFileString(join(tuned, 'src/main.silk'), `${wideExport}${tunedMain}`)
-  const tunedHeader = '[package]\nname = "tuned"\nversion = "0.1.0"\nmain = "main.silk"\n'
+  const tunedHeader = '[package]\nname = "tuned"\nversion = "0.1.0"\nmain = "main.silk"\nsilk-version = "0.0.0"\n'
   yield* fs.writeFileString(join(tuned, 'silk.toml'), tunedHeader)
   const tunedBuild = yield* compileSettings(tuned, 'tuned',
     `[settings.profile]\ntarget = "${hostTarget}"\ncpu-features = ["${x86 ? 'avx2' : 'crc'}"]\n${
@@ -3821,7 +3826,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   yield* fs.writeFileString(join(tuned, 'silk.toml'), `${tunedHeader}\n[packge]\nname = "x"\n`)
   const misspelled = yield* invoke(silk, ['check', '--stdlib', standardLibrary], tuned)
   assert.equal(misspelled.status, 2, misspelled.stderr)
-  assert.match(misspelled.stderr, /Invalid Silk project manifest .*silk\.toml:6: /)
+  assert.match(misspelled.stderr, /Invalid Silk project manifest .*silk\.toml:7: /)
   // Runtime-name resolution is semantic even though the composition's shape is schema-owned.
   yield* fs.writeFileString(
     join(tuned, 'silk.toml'),
@@ -3829,7 +3834,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   )
   const unresolvedRuntime = yield* invoke(silk, ['check', '--stdlib', standardLibrary], tuned)
   assert.equal(unresolvedRuntime.status, 2, unresolvedRuntime.stderr)
-  assert.match(unresolvedRuntime.stderr, /Invalid Silk project manifest .*silk\.toml:6: /)
+  assert.match(unresolvedRuntime.stderr, /Invalid Silk project manifest .*silk\.toml:7: /)
   yield* fs.writeFileString(join(tuned, 'silk.toml'), tunedHeader)
   // Without a runtime, an executable that exports no C `main` is refused before Clang links it.
   const mainless = yield* compileSettings(tuned, 'mainless', '[settings.profile]\nruntime = "none"\n', { ...process.env, SILK_CLANG: sentinel })
@@ -3855,7 +3860,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   yield* fs.makeDirectory(join(boundRoot, 'src'), { recursive: true })
   yield* fs.writeFileString(join(boundRoot, 'src/main.silk'),
     'pub param limit: i32 = 1\n\npub fn main() -> i32 { return limit }\n')
-  yield* fs.writeFileString(join(boundRoot, 'silk.toml'), '[package]\nname = "bound"\nversion = "0.1.0"\n')
+  yield* fs.writeFileString(join(boundRoot, 'silk.toml'), '[package]\nname = "bound"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n')
   const parameter = (name: string, value: string) =>
     `[settings.profile]\n[packages.self]\nexcluded = false\nparameters = [{ module = "main.silk", name = "${name}", supplied-path = false, value = ${value} }]\n`
   for (const value of [7, 3]) {
@@ -3879,11 +3884,11 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   yield* fs.makeDirectory(join(defaultedRoot, 'app/src'), { recursive: true })
   yield* fs.makeDirectory(join(defaultedRoot, 'greeter/src'), { recursive: true })
   yield* fs.writeFileString(join(defaultedRoot, 'greeter/silk.toml'),
-    '[package]\nname = "greeter"\nversion = "0.1.0"\nkind = "library"\nexports = ["lib"]\n')
+    '[package]\nname = "greeter"\nversion = "0.1.0"\nkind = "library"\nexports = ["lib"]\nsilk-version = "0.0.0"\n')
   yield* fs.writeFileString(join(defaultedRoot, 'greeter/src/lib.silk'),
     'pub param times: i32 = 5\n\npub fn count() -> i32 {\n  return times\n}\n')
   yield* fs.writeFileString(join(defaultedRoot, 'app/silk.toml'),
-    '[package]\nname = "app"\nversion = "0.1.0"\n\n[dependencies]\ngreeter = { path = "../greeter" }\n')
+    '[package]\nname = "app"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n\n[dependencies]\ngreeter = { path = "../greeter" }\n')
   yield* fs.writeFileString(join(defaultedRoot, 'app/src/main.silk'),
     'import greeter.lib { count }\n\npub fn main() -> i32 {\n  return count()\n}\n')
   const defaultedRun = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(defaultedRoot, 'app'), { ...process.env, SILK_CLANG: clang })
@@ -3901,7 +3906,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   )
   yield* fs.writeFileString(
     join(directory, 'rooted/silk.toml'),
-    '[package]\nname = "rooted"\nversion = "0.1.0"\nmain = "app/main.silk"\n',
+    '[package]\nname = "rooted"\nversion = "0.1.0"\nmain = "app/main.silk"\nsilk-version = "0.0.0"\n',
   )
   const rooted = yield* invoke(
     silk,
@@ -3927,7 +3932,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   )
   yield* fs.writeFileString(
     join(directory, 'packaged/numbers/silk.toml'),
-    '[package]\nname = "silk-numbers"\nversion = "0.2.0"\nsource = "src"\nexports = ["scale"]\n',
+    '[package]\nname = "silk-numbers"\nversion = "0.2.0"\nsource = "src"\nexports = ["scale"]\nsilk-version = "0.0.0"\n',
   )
   yield* fs.writeFileString(
     join(directory, 'packaged/app/util/digits.silk'),
@@ -3938,7 +3943,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     'import numbers.scale { scale }\nimport util.digits { base }\n\npub fn main() -> i32 {\n  return scale(base()) + 2\n}\n',
   )
   const packagedManifest = (dependency: string) =>
-    `[package]\nname = "app"\nversion = "1.0.0"\nsource = "."\n\n[dependencies]\n${dependency}\n`
+    `[package]\nname = "app"\nversion = "1.0.0"\nsource = "."\nsilk-version = "0.0.0"\n\n[dependencies]\n${dependency}\n`
   yield* fs.writeFileString(
     join(directory, 'packaged/app/silk.toml'),
     packagedManifest('numbers = { path = "../numbers", package = "silk-numbers" }'),
@@ -3963,7 +3968,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   )
   yield* fs.writeFileString(
     join(directory, 'packaged/numbers/silk.toml'),
-    '[package]\nname = "silk-numbers"\nversion = "0.2.0"\nsource = "src"\nexports = ["scale", "tools"]\n',
+    '[package]\nname = "silk-numbers"\nversion = "0.2.0"\nsource = "src"\nexports = ["scale", "tools"]\nsilk-version = "0.0.0"\n',
   )
   yield* fs.writeFileString(
     join(directory, 'packaged/app/main.silk'),
@@ -4031,7 +4036,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   assert.equal(shadowed.status, 2, 'a shadowing dependency name was accepted')
   assert.match(
     shadowed.stderr,
-    /Invalid Silk project manifest .*packaged\/app\/silk\.toml:7: /,
+    /Invalid Silk project manifest .*packaged\/app\/silk\.toml:8: /,
   )
   assert.equal(yield* fs.exists(marker), false)
   // A dependency whose silk.toml is not TOML is refused at that manifest's line.
@@ -4052,7 +4057,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     /Invalid Silk project manifest .*packaged\/broken\/silk\.toml:4: /,
   )
   // A dependency's silk.toml is checked against the manifest schema as the root's is.
-  yield* fs.writeFileString(join(directory, 'packaged/broken/silk.toml'), '[package]\nname = "broken"\nkind = "library"\nnmae = "x"\n')
+  yield* fs.writeFileString(join(directory, 'packaged/broken/silk.toml'), '[package]\nname = "broken"\nkind = "library"\nnmae = "x"\nsilk-version = "0.0.0"\n')
   const unknownField = yield* invoke(
     silk,
     ['run', '--stdlib', standardLibrary],
@@ -4073,7 +4078,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     yield* fs.makeDirectory(join(repository, 'webgpu'), { recursive: true })
     yield* fs.writeFileString(
       join(repository, 'vector/silk.toml'),
-      '[package]\nname = "vector"\nversion = "0.1.0"\nsource = "src"\nexports = ["length"]\n\n[dependencies]\nshared = { path = "../shared" }\n',
+      '[package]\nname = "vector"\nversion = "0.1.0"\nsource = "src"\nexports = ["length"]\nsilk-version = "0.0.0"\n\n[dependencies]\nshared = { path = "../shared" }\n',
     )
     yield* fs.writeFileString(
       join(repository, 'vector/src/length.silk'),
@@ -4081,7 +4086,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     )
     yield* fs.writeFileString(
       join(repository, 'shared/silk.toml'),
-      '[package]\nname = "shared"\nversion = "0.1.0"\nsource = "."\nexports = ["base"]\n',
+      '[package]\nname = "shared"\nversion = "0.1.0"\nsource = "."\nexports = ["base"]\nsilk-version = "0.0.0"\n',
     )
     yield* fs.writeFileString(join(repository, 'shared/base.silk'), 'pub fn base() -> i32 {\n  return 21\n}\n')
     // A package the dependency does not reach is never read, so its manifest may be anything.
@@ -4097,7 +4102,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     const commit = git(['rev-parse', 'HEAD'])
     const silkHome = join(directory, 'git/home')
     const gitManifest = (fields: string) =>
-      `[package]\nname = "app"\nversion = "1.0.0"\nsource = "."\n\n[dependencies]\nvector = { ${fields} }\n`
+      `[package]\nname = "app"\nversion = "1.0.0"\nsource = "."\nsilk-version = "0.0.0"\n\n[dependencies]\nvector = { ${fields} }\n`
     yield* fs.makeDirectory(join(directory, 'git/app'), { recursive: true })
     yield* fs.writeFileString(
       join(directory, 'git/app/main.silk'),
@@ -4128,7 +4133,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     assert.equal(unreachable.status, 2, 'an unreachable commit was accepted')
     assert.match(
       unreachable.stderr,
-      /Invalid Silk project manifest .*git\/app\/silk\.toml:7: /,
+      /Invalid Silk project manifest .*git\/app\/silk\.toml:8: /,
     )
     yield* fs.writeFileString(
       join(directory, 'git/app/silk.toml'),
@@ -4155,7 +4160,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     )
     yield* fs.writeFileString(
       join(repository, 'lengths/silk.toml'),
-      '[package]\nname = "lengths"\nversion = "0.1.0"\nsource = "."\nexports = ["length"]\n\n[dependencies]\nunits = { workspace = true }\n',
+      '[package]\nname = "lengths"\nversion = "0.1.0"\nsource = "."\nexports = ["length"]\nsilk-version = "0.0.0"\n\n[dependencies]\nunits = { workspace = true }\n',
     )
     yield* fs.writeFileString(
       join(repository, 'lengths/length.silk'),
@@ -4163,7 +4168,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     )
     yield* fs.writeFileString(
       join(repository, 'units/silk.toml'),
-      '[package]\nname = "units"\nversion = "0.1.0"\nsource = "."\nexports = ["unit"]\n',
+      '[package]\nname = "units"\nversion = "0.1.0"\nsource = "."\nexports = ["unit"]\nsilk-version = "0.0.0"\n',
     )
     yield* fs.writeFileString(join(repository, 'units/unit.silk'), 'pub fn unit() -> i32 {\n  return 1\n}\n')
     const git = (args: ReadonlyArray<string>) => {
@@ -4182,7 +4187,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     yield* fs.makeDirectory(join(workspace, 'app'), { recursive: true })
     yield* fs.makeDirectory(join(workspace, 'libs/math'), { recursive: true })
     const root = (lengths: string) =>
-      `[workspace]\nmembers = ["app", "libs/*"]\nsilk-version = "0.1.0"\n\n[workspace.dependencies]\nlengths = { ${lengths} }\nmath = { path = "libs/math" }\n`
+      `[workspace]\nmembers = ["app", "libs/*"]\nsilk-version = "${releasePin}"\n\n[workspace.dependencies]\nlengths = { ${lengths} }\nmath = { path = "libs/math" }\n`
     yield* fs.writeFileString(join(workspace, 'silk.toml'), root(pin))
     yield* fs.writeFileString(
       join(workspace, 'libs/math/silk.toml'),
@@ -4239,12 +4244,12 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     yield* fs.makeDirectory(join(workspace, 'tool'), { recursive: true })
     yield* fs.writeFileString(
       join(workspace, 'tool/silk.toml'),
-      '[package]\nname = "shared-tool"\nversion = "0.1.0"\nsource = "."\n\n[dependencies]\nlengths = { workspace = true }\n',
+      '[package]\nname = "shared-tool"\nversion = "0.1.0"\nsource = "."\nsilk-version = "0.0.0"\n\n[dependencies]\nlengths = { workspace = true }\n',
     )
     yield* fs.writeFileString(join(workspace, 'tool/main.silk'), 'import lengths.length { length }\npub fn main() -> i32 {\n  return length()\n}\n')
     const unlisted = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(workspace, 'tool'), refusing)
     assert.equal(unlisted.status, 2, 'a package outside the workspace took a workspace dependency')
-    assert.match(unlisted.stderr, /Invalid Silk project manifest .*shared\/workspace\/tool\/silk\.toml:7: /)
+    assert.match(unlisted.stderr, /Invalid Silk project manifest .*shared\/workspace\/tool\/silk\.toml:8: /)
     yield* fs.remove(join(workspace, 'tool'), { recursive: true })
     // `silk pack` writes the shared pin out, so the archive builds without the workspace.
     const output = join(directory, 'shared/packed')
@@ -4345,7 +4350,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     yield* fs.makeDirectory(join(repository, 'units'), { recursive: true })
     yield* fs.writeFileString(
       join(repository, 'units/silk.toml'),
-      '[package]\nname = "units"\nversion = "0.1.0"\nsource = "."\nexports = ["unit"]\n',
+      '[package]\nname = "units"\nversion = "0.1.0"\nsource = "."\nexports = ["unit"]\nsilk-version = "0.0.0"\n',
     )
     yield* fs.writeFileString(join(repository, 'units/unit.silk'), 'pub fn unit() -> i32 {\n  return 1\n}\n')
     const git = (args: ReadonlyArray<string>) => {
@@ -4362,7 +4367,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     yield* fs.makeDirectory(local, { recursive: true })
     yield* fs.writeFileString(
       join(local, 'silk.toml'),
-      '[package]\nname = "units"\nversion = "0.2.0"\nsource = "."\nexports = ["unit"]\n',
+      '[package]\nname = "units"\nversion = "0.2.0"\nsource = "."\nexports = ["unit"]\nsilk-version = "0.0.0"\n',
     )
     yield* fs.writeFileString(join(local, 'unit.silk'), 'pub fn unit() -> i32 {\n  return 5\n}\n')
     const workspace = join(directory, 'override/workspace')
@@ -4372,7 +4377,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     // Both members pin the git package, so the override settles the diamond on one copy.
     yield* fs.writeFileString(
       join(workspace, 'math/silk.toml'),
-      `[package]\nname = "override-math"\nversion = "0.1.0"\nsource = "."\nexports = ["twice"]\n\n[dependencies]\n${pin}`,
+      `[package]\nname = "override-math"\nversion = "0.1.0"\nsource = "."\nexports = ["twice"]\nsilk-version = "0.0.0"\n\n[dependencies]\n${pin}`,
     )
     yield* fs.writeFileString(
       join(workspace, 'math/twice.silk'),
@@ -4380,7 +4385,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     )
     yield* fs.writeFileString(
       join(workspace, 'app/silk.toml'),
-      `[package]\nname = "override-app"\nversion = "0.1.0"\nsource = "."\n\n[dependencies]\nmath = { path = "../math", package = "override-math" }\n${pin}`,
+      `[package]\nname = "override-app"\nversion = "0.1.0"\nsource = "."\nsilk-version = "0.0.0"\n\n[dependencies]\nmath = { path = "../math", package = "override-math" }\n${pin}`,
     )
     yield* fs.writeFileString(
       join(workspace, 'app/main.silk'),
@@ -4427,7 +4432,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     yield* fs.makeDirectory(join(tool, 'src'), { recursive: true })
     yield* fs.makeDirectory(join(tool, 'completions'), { recursive: true })
     const manifest = (more: string) =>
-      `[package]\nname = "packed-tool"\nversion = "1.2.0"\nsilk-version = "0.1.0"\n\n[pack.binary]\ninclude = ["completions", "notes.txt"]\n${more}`
+      `[package]\nname = "packed-tool"\nversion = "1.2.0"\nsilk-version = "${releasePin}"\n\n[pack.binary]\ninclude = ["completions", "notes.txt"]\n${more}`
     yield* fs.writeFileString(join(tool, 'silk.toml'), manifest(''))
     yield* fs.writeFileString(join(tool, 'src/main.silk'), 'pub fn main() -> i32 {\n  return 0\n}\n')
     yield* fs.writeFileString(join(tool, 'completions/tool.bash'), 'complete -W "pack" packed-tool\n')
@@ -4500,7 +4505,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     // The table is an executable's.
     yield* fs.writeFileString(
       join(tool, 'silk.toml'),
-      '[package]\nname = "packed-tool"\nversion = "1.2.0"\nsilk-version = "0.1.0"\nkind = "library"\nmain = "main.silk"\nexports = ["main"]\n\n[pack.binary]\n',
+      '[package]\nname = "packed-tool"\nversion = "1.2.0"\nsilk-version = "' + releasePin + '"\nkind = "library"\nmain = "main.silk"\nexports = ["main"]\n\n[pack.binary]\n',
     )
     const library = yield* invoke(silk, ['pack', '--output', output, '--stdlib', standardLibrary], tool, environment, 120_000)
     assert.equal(library.status, 1, 'a library with [pack.binary] was packed')
@@ -4683,7 +4688,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   )
   yield* fs.writeFileString(
     join(workspace, 'libs/math/silk.toml'),
-    '[package]\nname = "math"\nversion = "0.1.0"\nsource = "."\nexports = ["twice"]\n',
+    '[package]\nname = "math"\nversion = "0.1.0"\nsource = "."\nexports = ["twice"]\nsilk-version = "0.0.0"\n',
   )
   yield* fs.writeFileString(
     join(workspace, 'libs/math/twice.silk'),
@@ -4691,7 +4696,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   )
   yield* fs.writeFileString(
     join(workspace, 'app/silk.toml'),
-    '[package]\nname = "workspace-app"\nversion = "0.1.0"\nsource = "."\n\n[dependencies]\nmath = { path = "../libs/math" }\n',
+    '[package]\nname = "workspace-app"\nversion = "0.1.0"\nsource = "."\nsilk-version = "0.0.0"\n\n[dependencies]\nmath = { path = "../libs/math" }\n',
   )
   yield* fs.writeFileString(
     join(workspace, 'app/main.silk'),
@@ -4730,7 +4735,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   yield* fs.makeDirectory(join(workspace, 'tool'), { recursive: true })
   yield* fs.writeFileString(
     join(workspace, 'tool/silk.toml'),
-    '[package]\nname = "tool"\nversion = "0.1.0"\nsource = "."\n',
+    '[package]\nname = "tool"\nversion = "0.1.0"\nsource = "."\nsilk-version = "0.0.0"\n',
   )
   yield* fs.writeFileString(
     join(workspace, 'tool/main.silk'),
@@ -4757,7 +4762,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   // A new workspace has one starter executable member, so it builds and runs at once.
   assert.equal(
     yield* fs.readFileString(join(managed, 'silk.toml')),
-    '[workspace]\nmembers = ["app"]\nsilk-version = "0.0.0"\n',
+    `[workspace]\nmembers = ["app"]\nsilk-version = "${reportedVersion}"\n`,
   )
   assert.equal(managedRoot.stdout, '  Created workspace managed with package app\n\n  Next steps:\n    cd managed\n    silk run   build and run it\n')
   assert.equal(yield* fs.exists(join(managed, 'app/src/main.silk')), true)
@@ -4769,7 +4774,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   assert.equal(namedRoot.status, 0, namedRoot.stderr)
   assert.equal(
     yield* fs.readFileString(join(directory, 'named/silk.toml')),
-    '[workspace]\nmembers = ["store"]\nsilk-version = "0.0.0"\n',
+    `[workspace]\nmembers = ["store"]\nsilk-version = "${reportedVersion}"\n`,
   )
   assert.match(yield* fs.readFileString(join(directory, 'named/store/silk.toml')), /^name = "store"$/m)
   // The rest of this test assembles its members by hand.
@@ -5012,7 +5017,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   )
   yield* fs.writeFileString(
     join(directory, 'retained/silk.toml'),
-    '[package]\nname = "retained"\nversion = "0.1.0"\nsource = "."\n\n[unstable]\ncomposition = { runtimes = [{ name = "start", module = "support/start" }], defaults = ["start"], retention = [{ module = "support/keep", declaration = "capability" }] }\n',
+    '[package]\nname = "retained"\nversion = "0.1.0"\nsource = "."\nsilk-version = "0.0.0"\n\n[unstable]\ncomposition = { runtimes = [{ name = "start", module = "support/start" }], defaults = ["start"], retention = [{ module = "support/keep", declaration = "capability" }] }\n',
   )
   const retainedIr = yield* compileSettings(join(directory, 'retained'), 'retained', '[settings]\nemit = "llvm-ir"\n')
   assert.equal(retainedIr.status, 0, retainedIr.stderr)
@@ -5030,7 +5035,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   )
   yield* fs.writeFileString(
     join(directory, 'bare/silk.toml'),
-    '[package]\nname = "bare"\nversion = "0.1.0"\nsource = "."\n',
+    '[package]\nname = "bare"\nversion = "0.1.0"\nsource = "."\nsilk-version = "0.0.0"\n',
   )
   const bare = yield* compileSettings(join(directory, 'bare'), 'bare', '[settings.profile]\nruntime = "none"\n')
 
@@ -5042,7 +5047,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   yield* fs.makeDirectory(join(formatting, 'src'), { recursive: true })
   yield* fs.writeFileString(
     join(formatting, 'silk.toml'),
-    '[package]\nname = "formatting"\nversion = "0.1.0"\nmain = "a.silk"\n',
+    '[package]\nname = "formatting"\nversion = "0.1.0"\nmain = "a.silk"\nsilk-version = "0.0.0"\n',
   )
   yield* fs.writeFileString(join(formatting, 'src/a.silk'), 'pub fn a() -> i32 {\n  return 1\n}\n')
   yield* fs.writeFileString(join(formatting, 'src/b.silk'), 'pub fn b()->i32{return 2}\n')
@@ -5069,7 +5074,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   yield* fs.makeDirectory(join(throughLinks, 'app/src'), { recursive: true })
   yield* fs.writeFileString(
     join(throughLinks, 'real/shared/silk.toml'),
-    '[package]\nname = "shared"\nversion = "0.1.0"\nsource = "src"\nexports = ["numbers"]\n',
+    '[package]\nname = "shared"\nversion = "0.1.0"\nsource = "src"\nexports = ["numbers"]\nsilk-version = "0.0.0"\n',
   )
   yield* fs.writeFileString(
     join(throughLinks, 'real/shared/src/numbers.silk'),
@@ -5083,7 +5088,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   yield* fs.symlink('../../real/helper.silk', join(throughLinks, 'app/src/helper.silk'))
   yield* fs.writeFileString(
     join(throughLinks, 'app/silk.toml'),
-    '[package]\nname = "app"\nversion = "0.1.0"\n\n[dependencies]\nshared = { path = "../via/shared" }\n',
+    '[package]\nname = "app"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n\n[dependencies]\nshared = { path = "../via/shared" }\n',
   )
   yield* fs.writeFileString(
     join(throughLinks, 'app/src/main.silk'),
@@ -5137,7 +5142,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   yield* fs.makeDirectory(join(together, 'src'), { recursive: true })
   yield* fs.writeFileString(
     join(together, 'silk.toml'),
-    '[package]\nname = "together"\nversion = "0.1.0"\n',
+    '[package]\nname = "together"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n',
   )
   yield* fs.writeFileString(join(together, 'src/main.silk'), 'pub fn main() -> i32 { return 5 }\n')
   const started = (args: ReadonlyArray<string>) =>
@@ -5179,7 +5184,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     'int silk_answer(int value);\nint main(void) { return silk_answer(41) == 42 ? 0 : 1; }\n',
   )
   yield* fs.writeFileString(join(library, 'silk.toml'),
-    '[package]\nname = "library"\nversion = "0.1.0"\nmain = "Main.silk"\nkind = "library"\n')
+    '[package]\nname = "library"\nversion = "0.1.0"\nmain = "Main.silk"\nkind = "library"\nsilk-version = "0.0.0"\n')
   const tools = dirname(clang)
   const inspect = Effect.fnUntraced(function* (object: string) {
     const header = yield* invoke(join(tools, 'llvm-readobj'), ['--file-header', object], library)
@@ -5294,13 +5299,13 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   const nativeDependency = join(platformLibrary, 'native-dependency')
   yield* fs.makeDirectory(nativeDependency)
   yield* fs.writeFileString(join(nativeDependency, 'silk.toml'),
-    '[package]\nname = "native-dependency"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nexports = ["Value"]\n')
+    '[package]\nname = "native-dependency"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nexports = ["Value"]\nsilk-version = "0.0.0"\n')
   yield* fs.writeFileString(join(nativeDependency, 'Value.silk'),
     'unsafe extern "C" fn native_answer() -> i32\npub fn answer() -> i32 { return unsafe native_answer() }\n')
   yield* fs.writeFileString(join(nativeDependency, 'answer.c'), 'int native_answer(void) { return 42; }\n')
   yield* writePlan(nativeDependency, '  plan = Plan.compileC(plan, sourcePath("answer.c"))')
   yield* fs.writeFileString(join(platformLibrary, 'silk.toml'),
-    '[package]\nname = "platform-library"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nmain = "main.silk"\n'
+    '[package]\nname = "platform-library"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nmain = "main.silk"\nsilk-version = "0.0.0"\n'
       + '[dependencies]\nnative = { path = "native-dependency" }\n')
   yield* fs.writeFileString(join(platformLibrary, 'main.silk'), [
     'import native.Value',
@@ -5374,7 +5379,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   yield* fs.makeDirectory(join(split, 'src'), { recursive: true })
   yield* fs.writeFileString(
     join(split, 'silk.toml'),
-    '[package]\nname = "split"\nversion = "0.1.0"\n',
+    '[package]\nname = "split"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n',
   )
   const helperSource = (value: number) => `pub fn value() -> i32 {\n  return ${value}\n}\n`
   yield* fs.writeFileString(join(split, 'src/helper.silk'), helperSource(3))
@@ -5475,7 +5480,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   const shared = join(directory, 'shared-units')
   for (const member of ['one', 'two']) {
     yield* fs.makeDirectory(join(shared, member, 'src'), { recursive: true })
-    yield* fs.writeFileString(join(shared, member, 'silk.toml'), `[package]\nname = "${member}"\nversion = "0.1.0"\n`)
+    yield* fs.writeFileString(join(shared, member, 'silk.toml'), `[package]\nname = "${member}"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n`)
     yield* fs.writeFileString(
       join(shared, member, 'src/main.silk'),
       `pub fn main() -> i32 {\n  return ${member === 'one' ? 1 : 2}\n}\n`,
@@ -5522,7 +5527,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   yield* fs.writeFileString(join(siblings, 'silk.toml'), '[workspace]\nmembers = ["spec", "one", "two"]\n')
   yield* fs.writeFileString(
     join(siblings, 'spec/silk.toml'),
-    '[package]\nname = "spec"\nversion = "0.1.0"\nkind = "library"\nexports = ["lib"]\n',
+    '[package]\nname = "spec"\nversion = "0.1.0"\nkind = "library"\nexports = ["lib"]\nsilk-version = "0.0.0"\n',
   )
   yield* fs.writeFileString(
     join(siblings, 'spec/src/lib.silk'),
@@ -5562,7 +5567,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     yield* fs.makeDirectory(join(siblings, member, 'src'), { recursive: true })
     yield* fs.writeFileString(
       join(siblings, member, 'silk.toml'),
-      `[package]\nname = "${member}"\nversion = "0.1.0"\n\n[dependencies]\nspec = { path = "../spec" }\n`,
+      `[package]\nname = "${member}"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n\n[dependencies]\nspec = { path = "../spec" }\n`,
     )
     yield* fs.writeFileString(join(siblings, member, 'src/main.silk'), siblingMain(member === 'one' ? 1 : 2))
   }
@@ -5714,7 +5719,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   // lowers the instances it changed rather than the whole program.
   const logged = join(directory, 'logged')
   yield* fs.makeDirectory(join(logged, 'src'), { recursive: true })
-  yield* fs.writeFileString(join(logged, 'silk.toml'), '[package]\nname = "logged"\nversion = "0.1.0"\n')
+  yield* fs.writeFileString(join(logged, 'silk.toml'), '[package]\nname = "logged"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n')
   const loggedSource = (message: string) => 'import silk.core.effect { Effect }\nimport silk.io.logger { LogError }\n'
     + 'import silk.io.logger_native { StdoutLogger }\n\npub effect fn main() -> () ! LogError {\n  let mut logger = StdoutLogger.make()\n'
     + `  run Effect.log("${message}\\n", &()) |> Effect.provideMut(&mut logger)\n}\n`
@@ -5774,7 +5779,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   const memberSource = (value: number) => `pub fn main() -> i32 {\n  return ${value}\n}\n`
   for (const member of ['first', 'second']) {
     yield* fs.makeDirectory(join(pair, member, 'src'), { recursive: true })
-    yield* fs.writeFileString(join(pair, member, 'silk.toml'), `[package]\nname = "${member}"\nversion = "0.1.0"\n`)
+    yield* fs.writeFileString(join(pair, member, 'silk.toml'), `[package]\nname = "${member}"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n`)
     yield* fs.writeFileString(join(pair, member, 'src/main.silk'), memberSource(1))
   }
   const memberBuild = Effect.fnUntraced(function* (member: string) {
@@ -5802,7 +5807,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   yield* fs.makeDirectory(join(escapes, 'src'), { recursive: true })
   yield* fs.writeFileString(
     join(escapes, 'silk.toml'),
-    '[package]\nname = "escapes"\nversion = "0.1.0"\nmain = "main.silk"\n',
+    '[package]\nname = "escapes"\nversion = "0.1.0"\nmain = "main.silk"\nsilk-version = "0.0.0"\n',
   )
   yield* fs.writeFileString(
     join(escapes, 'src/main.silk'),
@@ -5856,7 +5861,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   const embeds = join(directory, 'embeds')
   yield* fs.makeDirectory(join(embeds, 'src'), { recursive: true })
   yield* fs.makeDirectory(join(embeds, 'shaders'), { recursive: true })
-  yield* fs.writeFileString(join(embeds, 'silk.toml'), '[package]\nname = "embeds"\nversion = "0.1.0"\n')
+  yield* fs.writeFileString(join(embeds, 'silk.toml'), '[package]\nname = "embeds"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n')
   yield* fs.writeFile(join(embeds, 'shaders/b.bin'), new Uint8Array([1, 255, 3]))
   const embedMain = (path: string) => 'import silk.build.source { Source }\nimport silk.num.usize\n\npub fn main() -> i32 {\n'
     + `  let bytes = Source.read("${path}")\n  let text = Source.text("shaders/a.wgsl")\n  if bytes[1] != 255 { return 100 }\n`
@@ -5932,7 +5937,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   yield* fs.makeDirectory(join(embedApp, 'src'), { recursive: true })
   yield* fs.writeFileString(
     join(embedLibrary, 'silk.toml'),
-    '[package]\nname = "embed-library"\nversion = "0.1.0"\nsilk-version = "0.1.0"\nkind = "library"\nmain = "library.silk"\nexports = ["library"]\n',
+    '[package]\nname = "embed-library"\nversion = "0.1.0"\nsilk-version = "' + releasePin + '"\nkind = "library"\nmain = "library.silk"\nexports = ["library"]\n',
   )
   yield* fs.writeFileString(join(embedLibrary, 'js/index.js'), 'export const hello = () => `hi ${1 + 1}`;\n')
   yield* fs.writeFileString(
@@ -5941,7 +5946,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   )
   yield* fs.writeFileString(
     join(embedApp, 'silk.toml'),
-    '[package]\nname = "embed-app"\nversion = "0.1.0"\n\n[dependencies]\nlibrary = { path = "../embed-library", package = "embed-library" }\n',
+    '[package]\nname = "embed-app"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n\n[dependencies]\nlibrary = { path = "../embed-library", package = "embed-library" }\n',
   )
   yield* fs.writeFileString(
     join(embedApp, 'src/main.silk'),
@@ -5968,7 +5973,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   // imports (#3116).
   const served = join(directory, 'served-edits')
   yield* fs.makeDirectory(join(served, 'src'), { recursive: true })
-  yield* fs.writeFileString(join(served, 'silk.toml'), '[package]\nname = "served-edits"\nversion = "0.1.0"\n')
+  yield* fs.writeFileString(join(served, 'silk.toml'), '[package]\nname = "served-edits"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n')
   yield* fs.writeFileString(join(served, 'src/other.silk'), 'pub fn helper() -> i32 { return 1 }\n')
   yield* fs.writeFileString(
     join(served, 'src/main.silk'),
@@ -6041,7 +6046,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   assert.doesNotMatch(unpacked.stderr, /fixtures/)
   yield* fs.writeFileString(
     join(embedLibrary, 'silk.toml'),
-    '[package]\nname = "embed-library"\nversion = "0.1.0"\nsilk-version = "0.1.0"\nkind = "library"\nmain = "library.silk"\nexports = ["library"]\ninclude = ["js"]\n',
+    '[package]\nname = "embed-library"\nversion = "0.1.0"\nsilk-version = "' + releasePin + '"\nkind = "library"\nmain = "library.silk"\nexports = ["library"]\ninclude = ["js"]\n',
   )
   const packedEmbed = yield* embedPack()
   assert.equal(packedEmbed.status, 0, packedEmbed.stdout + packedEmbed.stderr)
