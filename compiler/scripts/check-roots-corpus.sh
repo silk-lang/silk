@@ -15,7 +15,7 @@ one() {
   if [ -d "$case/imports" ]; then
     cp -R "$case/imports/." "$work/"
   fi
-  printf '[package]\nname = "corpus-case"\nversion = "0.1.0"\nsource = "."\n' > "$work/silk.toml"
+  printf '[package]\nname = "corpus-case"\nsilk-version = "0.0.0"\nversion = "0.1.0"\nsource = "."\n' > "$work/silk.toml"
   name=$(echo "${case#"$corpus"/}" | tr / _)
   (cd "$work" && "$silk" check --roots --stdlib "$stdlib" > /dev/null 2> "$out/$name")
   rm -rf "$work"

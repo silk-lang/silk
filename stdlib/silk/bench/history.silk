@@ -1,0 +1,1354 @@
+//! The history of a benchmark suite: one line of text for each result of each run, the journal
+//! a person keeps beside it, and the table that shows progress over time.
+//!
+//! # When to use
+//! Use [`History.lines`] to add a run to a history file, and [`History.parse`] with
+//! [`History.terminal`] or [`History.markdown`] to show how a suite moved from run to run.
+//! `silk.bench.bench` does both for a task: `--record` appends to
+//! `bench/history/<suite>.jsonl`, and `--history` prints the table.
+//!
+//! # Details
+//! A history file is JSON Lines: each line is one [`Entry`], the statistics of one
+//! implementation on one benchmark in one run. Lines are only ever added, so the file diffs and
+//! merges in a repository like any text. An entry holds no raw samples: those stay in the
+//! result file of the run.
+//!
+//! An entry carries the ratio to the reference measured in the same run. That ratio is the
+//! steadiest number to follow over time, because both sides shared the computer and its noise.
+//! Medians of two runs are compared only when both ran on the same computer, by
+//! [`Entry.computer`]: a change is called `faster` or `slower` when the 95% intervals of the two
+//! medians do not overlap, and is a plain percentage otherwise.
+//!
+//! The journal is a Markdown file a person writes, `bench/journal.md`: each `## ` heading is a
+//! revision or a date, and the text under it says what changed there, such as "two-pass parse"
+//! or "moved to a 4-core container". The table shows that text beside the first run of that
+//! revision or date.
+//!
+//! # Examples
+//! ```silk
+//! import silk.bench.history { Journal }
+//! import silk.core.effect { Effect }
+//! import silk.core.option { Option }
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//!
+//! effect fn check() -> i32 ! OutOfMemoryError ? &mut Allocator {
+//!   let text = run Journal.added("# Journal\n", "1503ff0", "two-pass parse")
+//!   let notes = run Journal.parse(text.view())
+//!   return match Journal.find(notes.asSlice(), "1503ff0") {
+//!     Option<string>.Some { value } => if value == "two-pass parse" { 0 } else { 1 }
+//!     Option<string>.None => 2
+//!   }
+//! }
+//!
+//! effect fn failed(error: OutOfMemoryError) -> i32 {
+//!   drop error
+//!   return 3
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   return run Effect.catchAll(check(), failed) |> Effect.provideMut<Allocator>(&mut allocator)
+//! }
+//! ```
+//!
+//! @category Benchmarks
+import silk.bench.html { Html }
+import silk.bench.record { Comparison, Panel, Point, Report, Row, Series, Subject, Table }
+import silk.bench.units { Units }
+import silk.build.encoding as Encoding
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.io.writer { WriterError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f64
+import silk.num.usize
+import silk.schema.issue { SchemaError }
+import silk.schema.json { SchemaJson }
+import silk.schema.schema { Schema }
+import silk.text.string { InvalidUtf8, String }
+
+const RESET: string<'static> = "\x1b[0m"
+
+const BOLD: string<'static> = "\x1b[1m"
+
+const DIM: string<'static> = "\x1b[2m"
+
+const RED: string<'static> = "\x1b[31m"
+
+const GREEN: string<'static> = "\x1b[32m"
+
+/// One line of a history file: the statistics of one implementation on one benchmark in one
+/// run.
+pub struct Entry {
+  /// The name of the suite.
+  pub suite: String,
+  /// The name of the benchmark.
+  pub benchmark: String,
+  /// The name of the implementation.
+  pub implementation: String,
+  /// The unit of the statistics: `ns` for the time of a whole process, or the unit of the
+  /// result lines.
+  pub unit: String,
+  /// Whether a larger value is better.
+  pub higher: bool,
+  /// When the run started, as RFC 3339 text in UTC.
+  pub date: String,
+  /// The run's identity, the same as in its result file.
+  pub id: String,
+  /// The revision of the project the run measured, such as a commit hash.
+  pub revision: Option<String>,
+  /// The revision recorded for the implementation itself, such as the version of a library in
+  /// another language.
+  pub version: Option<String>,
+  /// The label the run was given.
+  pub label: Option<String>,
+  /// The computer of the run in one line: system, hardware, processor, and the number of
+  /// processors the run could use. Medians are compared only between equal computers.
+  pub computer: String,
+  /// The number of values the statistics cover.
+  pub runs: u64,
+  /// The median, in the unit.
+  pub median: f64,
+  /// The low end of the 95% interval of the median.
+  pub low: f64,
+  /// The high end of the 95% interval of the median.
+  pub high: f64,
+  /// The smallest value.
+  pub minimum: f64,
+  /// The name of the implementation the run compared the others to.
+  pub reference: String,
+  /// The median divided by the reference's median in the same run. Absent for the reference
+  /// itself and for a result that was not compared.
+  pub ratio: Option<f64>,
+}
+
+impl Schema for Entry {}
+
+/// One section of a journal: what a person wrote about a revision or a date.
+pub struct Note {
+  /// The heading: a revision or a date.
+  pub key: String,
+  /// The text under the heading, as one line.
+  pub text: String,
+}
+
+/// The owner type of the journal functions. It has no fields and is never constructed.
+pub struct Journal {}
+
+impl Journal {
+  /// Returns the sections of the journal `text`: one [`Note`] for each `## ` heading, with the
+  /// lines under it joined by spaces. Text before the first such heading is left out.
+  ///
+  /// # Errors
+  /// `OutOfMemoryError` if the `Allocator` cannot supply the notes.
+  pub effect fn parse(text: string) -> List<Note>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut notes = List<Note>.make()
+    let bytes = String.utf8Bytes(text)
+    let mut start: usize = 0
+    while start < bytes.length {
+      let mut end = start
+      while end < bytes.length && bytes[end] != 10 {
+        end = end + 1
+      }
+      let line = String.trim(String.slice(text, start, end - start))
+      if String.startsWith(line, "## ") {
+        run notes.append(
+          Note {
+            key: run String.copy(String.trim(String.slice(line, 3, String.byteLength(line) - 3))),
+            text: String.make(),
+          },
+        )
+      } else if String.byteLength(line) > 0 && notes.length() > 0 {
+        let all = notes.asMutSlice()
+        let last = &mut all[all.length - 1]
+        if String.byteLength(last.text.view()) > 0 {
+          run last.text.append(" ")
+        }
+        run last.text.append(line)
+      }
+      start = end + 1
+    }
+    return move notes
+  }
+
+  /// Returns the journal `text` with `entry` added under the heading `key`. When the last
+  /// heading of the journal is `key`, the entry joins its section; otherwise a new section
+  /// starts at the end.
+  ///
+  /// # Errors
+  /// `OutOfMemoryError` if the `Allocator` cannot supply the text.
+  pub effect fn added(text: string, key: string, entry: string) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let notes = run Journal.parse(text)
+    let known = notes.asSlice()
+    let mut whole = run String.copy(text)
+    if String.byteLength(text) > 0 && !String.endsWith(text, "\n") {
+      run whole.append("\n")
+    }
+    if known.length == 0 || known[known.length - 1].key.view() != key {
+      if String.byteLength(text) > 0 {
+        run whole.append("\n")
+      }
+      run whole.append("## ")
+      run whole.append(key)
+      run whole.append("\n\n")
+    } else {
+      run whole.append("\n")
+    }
+    run whole.append(entry)
+    run whole.append("\n")
+    return move whole
+  }
+
+  /// Returns the text of the first section of `notes` whose heading is `key`, or whose heading
+  /// and `key` start alike when one is a shortened form of the other, as with a commit hash of
+  /// 7 and of 40 characters. A shortened form has at least 7 characters.
+  pub fn find<'notes>(notes: &'notes [Note], key: string) -> Option<string<'notes>> {
+    let mut at: usize = 0
+    while at < notes.length {
+      let heading = notes[at].key.view()
+      let alike = heading == key
+        || (String.byteLength(heading) >= 7 && String.startsWith(key, heading))
+        || (String.byteLength(key) >= 7 && String.startsWith(heading, key))
+      if alike {
+        return Option<string<'notes>>.Some { value: notes[at].text.view() }
+      }
+      at = at + 1
+    }
+    return Option<string<'notes>>.None
+  }
+}
+
+/// The owner type of the history functions. It has no fields and is never constructed.
+pub struct History {}
+
+impl History {
+  /// Returns one entry for each row of `report` that has a successful run, in the order of the
+  /// report.
+  ///
+  /// # Errors
+  /// `OutOfMemoryError` if the `Allocator` cannot supply the entries.
+  pub effect fn entries(report: &Report) -> List<Entry>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut entries = List<Entry>.make()
+    let environment = &report.environment
+    let mut computer = run String.copy(environment.system.view())
+    run computer.append(" ")
+    run computer.append(environment.machine.view())
+    run computer.append(", ")
+    run computer.append(environment.processor.view())
+    run computer.append(", ")
+    run Units.appendWhole(&mut computer, environment.usable)
+    run computer.append(" processors")
+    let tables = report.benchmarks.asSlice()
+    let subjects = report.implementations.asSlice()
+    let mut at: usize = 0
+    while at < tables.length {
+      let rows = tables[at].rows.asSlice()
+      let mut row: usize = 0
+      while row < rows.length {
+        if rows[row].runs > 0 {
+          let mut version = Option<String>.None
+          let mut subject: usize = 0
+          while subject < subjects.length {
+            if subjects[subject].name.view() == rows[row].implementation.view() {
+              version = run copyOptional(&subjects[subject].revision)
+            }
+            subject = subject + 1
+          }
+          let ratio = match &rows[row].ratio {
+            Option<Comparison>.Some { value } => Option<f64>.Some { value: value.value }
+            Option<Comparison>.None => Option<f64>.None
+          }
+          run entries.append(
+            Entry {
+              suite: run String.copy(report.suite.view()),
+              benchmark: run String.copy(tables[at].name.view()),
+              implementation: run String.copy(rows[row].implementation.view()),
+              unit: run String.copy(tables[at].unit.view()),
+              higher: tables[at].higher,
+              date: run String.copy(report.started.view()),
+              id: run String.copy(report.id.view()),
+              revision: run copyOptional(&report.revision),
+              version: move version,
+              label: run copyOptional(&report.label),
+              computer: run String.copy(computer.view()),
+              runs: rows[row].runs,
+              median: rows[row].median,
+              low: rows[row].low,
+              high: rows[row].high,
+              minimum: rows[row].minimum,
+              reference: run String.copy(report.reference.view()),
+              ratio: ratio,
+            },
+          )
+        }
+        row = row + 1
+      }
+      at = at + 1
+    }
+    return move entries
+  }
+
+  /// Returns the entries of `report` as the lines to add to a history file: one JSON object a
+  /// line, each line ended.
+  ///
+  /// # Errors
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the text.
+  /// - `SchemaError` or `WriterError` if an entry cannot be encoded, which a value of a report
+  ///   that is not a finite number causes.
+  pub effect fn lines(report: &Report) -> String
+    ! SchemaError | WriterError | OutOfMemoryError
+    ? &mut Allocator {
+    let entries = run History.entries(report)
+    let listed = entries.asSlice()
+    let mut text = String.make()
+    let mut at: usize = 0
+    while at < listed.length {
+      let encoded = run Encoding.json<Entry>(&listed[at])
+      if let Result<String, InvalidUtf8>.Success { value } = move run String.copyUtf8(
+        encoded.asSlice(),
+      ) {
+        run text.appendOwned(move value)
+        run text.append("\n")
+      }
+      at = at + 1
+    }
+    return move text
+  }
+
+  /// Returns `report` in Bencher Metric Format, the JSON that the Bencher service reads: one
+  /// object whose keys are `<benchmark>/<implementation>`, each with one measure that holds
+  /// the median as `value` and its 95% interval as `lower_value` and `upper_value`.
+  ///
+  /// # Details
+  /// The measure is `latency` for a time, which Bencher takes in nanoseconds, and otherwise the
+  /// unit as the report has it, such as `req/s`. Rows with no successful run are left out.
+  ///
+  /// # Errors
+  /// `OutOfMemoryError` if the `Allocator` cannot supply the text.
+  pub effect fn bencher(report: &Report) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut text = run String.copy("{")
+    let tables = report.benchmarks.asSlice()
+    let mut written: usize = 0
+    let mut at: usize = 0
+    while at < tables.length {
+      let rows = tables[at].rows.asSlice()
+      let mut row: usize = 0
+      while row < rows.length {
+        if rows[row].runs > 0 {
+          if written > 0 {
+            run text.append(",")
+          }
+          run text.append("\n  \"")
+          run quoted(&mut text, tables[at].name.view())
+          run text.append("/")
+          run quoted(&mut text, rows[row].implementation.view())
+          run text.append("\": {\"")
+          if Units.kind(tables[at].unit.view()) == "ns" {
+            run text.append("latency")
+          } else {
+            run quoted(&mut text, tables[at].unit.view())
+          }
+          run text.append("\": {\"value\": ")
+          run Units.appendFixed(&mut text, rows[row].median, 3)
+          run text.append(", \"lower_value\": ")
+          run Units.appendFixed(&mut text, rows[row].low, 3)
+          run text.append(", \"upper_value\": ")
+          run Units.appendFixed(&mut text, rows[row].high, 3)
+          run text.append("}}")
+          written = written + 1
+        }
+        row = row + 1
+      }
+      at = at + 1
+    }
+    run text.append("\n}\n")
+    return move text
+  }
+
+  /// Gives every `history` chart of `report` its panels: one for each benchmark, with a line for
+  /// each implementation over the runs of `recorded` and then the run of `report` itself.
+  ///
+  /// # Details
+  /// A run is named by its revision, or by its day when it has none. A chart shows the entries
+  /// in its own unit, so a chart of a unit the history does not hold stays empty. A normalized
+  /// chart shows the ratio each entry recorded, when its reference is the chart's.
+  ///
+  /// # Errors
+  /// `OutOfMemoryError` if the `Allocator` cannot supply the panels.
+  pub effect fn drawn(report: &mut Report, recorded: &[Entry]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let own = run History.entries(&report.*)
+    let mut ids = List<String>.make()
+    let mut at: usize = 0
+    while at < recorded.length {
+      run numbered(&mut ids, recorded[at].id.view())
+      at = at + 1
+    }
+    let before = ids.length()
+    let latest = own.asSlice()
+    at = 0
+    while at < latest.length {
+      run numbered(&mut ids, latest[at].id.view())
+      at = at + 1
+    }
+
+    // A run that is already recorded is not shown twice.
+    let fresh = ids.length() > before
+    let charts = report.views.asMutSlice()
+    let mut chart: usize = 0
+    while chart < charts.length {
+      if charts[chart].kind.view() == "history" {
+        let mut panels = List<Panel>.make()
+        at = 0
+        while at < recorded.length {
+          run plotted(
+            &mut panels,
+            &recorded[at],
+            ids.asSlice(),
+            charts[chart].y.view(),
+            charts[chart].normalize.view(),
+          )
+          at = at + 1
+        }
+        at = 0
+        while fresh && at < latest.length {
+          run plotted(
+            &mut panels,
+            &latest[at],
+            ids.asSlice(),
+            charts[chart].y.view(),
+            charts[chart].normalize.view(),
+          )
+          at = at + 1
+        }
+        charts[chart].panels = move panels
+      }
+      chart = chart + 1
+    }
+  }
+
+  /// Returns the entries of the history file `text`, in the order of its lines. Empty lines are
+  /// skipped.
+  ///
+  /// # Errors
+  /// - `SchemaError` if a line is not an entry.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the entries.
+  pub effect fn parse(text: string) -> List<Entry>
+    ! SchemaError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut entries = List<Entry>.make()
+    let bytes = String.utf8Bytes(text)
+    let mut start: usize = 0
+    while start < bytes.length {
+      let mut end = start
+      while end < bytes.length && bytes[end] != 10 {
+        end = end + 1
+      }
+      let line = String.trim(String.slice(text, start, end - start))
+      if String.byteLength(line) > 0 {
+        run entries.append(run SchemaJson.decode<Entry>(String.utf8Bytes(line)))
+      }
+      start = end + 1
+    }
+    return move entries
+  }
+
+  /// Returns the history `entries` as tables for a terminal: one for each implementation on
+  /// each benchmark, a row a run, oldest first. `notes` are the sections of the journal. With
+  /// `color`, the text holds ANSI escape codes.
+  ///
+  /// # Details
+  /// The columns are the date, the revision, the median, the change from the run before on the
+  /// same computer, the ratio to the reference of the same run, and the journal's text for the
+  /// revision or the day, shown at the first run that has it.
+  ///
+  /// # Errors
+  /// `OutOfMemoryError` if the `Allocator` cannot supply the text.
+  pub effect fn terminal(entries: &[Entry], notes: &[Note], color: bool) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut text = String.make()
+    let groups = run grouped(entries)
+    let listed = groups.asSlice()
+    let mut at: usize = 0
+    while at < listed.length {
+      let first = &entries[listed[at].asSlice()[0]]
+      run paint(&mut text, BOLD, first.benchmark.view(), color)
+      run text.append("  ")
+      run text.append(first.implementation.view())
+      let lines = run linesOf(entries, listed[at].asSlice(), notes)
+      let titles = run headings(first)
+      run text.append("\n")
+      let all = lines.asSlice()
+      let mut widths: [usize; 6] = [0; 6]
+      let mut column: usize = 0
+      while column < 6 {
+        widths[column] = Units.width(titles.asSlice()[column].view())
+        let mut row: usize = 0
+        while row < all.length {
+          let wide = Units.width(all[row].cells.asSlice()[column].view())
+          if wide > widths[column] {
+            widths[column] = wide
+          }
+          row = row + 1
+        }
+        column = column + 1
+      }
+      run text.append("  ")
+      column = 0
+      while column < 6 {
+        if column > 0 {
+          run text.append("  ")
+        }
+        run cell(&mut text, titles.asSlice()[column].view(), widths[column], column, DIM, color)
+        column = column + 1
+      }
+      run text.append("\n")
+      let mut row: usize = 0
+      while row < all.length {
+        run text.append("  ")
+        column = 0
+        while column < 6 {
+          let mut code = ""
+          if column == 3 {
+            if all[row].verdict == "faster" {
+              code = GREEN
+            } else if all[row].verdict == "slower" {
+              code = RED
+            } else {
+              code = DIM
+            }
+          }
+          let value = all[row].cells.asSlice()[column].view()
+          if column < 5 || String.byteLength(value) > 0 {
+            if column > 0 {
+              run text.append("  ")
+            }
+            run cell(&mut text, value, widths[column], column, code, color)
+          }
+          column = column + 1
+        }
+        run text.append("\n")
+        row = row + 1
+      }
+      run text.append("\n")
+      at = at + 1
+    }
+    return move text
+  }
+
+  /// Returns the history `entries` of the suite `suite` as one static HTML page, in the style
+  /// of `silk.bench.html`: for each benchmark a chart over the runs, oldest first, and the
+  /// tables of [`History.terminal`].
+  ///
+  /// # Details
+  /// A chart draws one line for each implementation: its ratio to the reference of the same
+  /// run, with a dashed line at 1, or its median from zero when the benchmark has no ratio. A
+  /// dotted vertical line with a number marks the first run of a revision or a day the journal
+  /// has text for, and the text is listed under the chart.
+  ///
+  /// # Errors
+  /// `OutOfMemoryError` if the `Allocator` cannot supply the text.
+  pub effect fn page(suite: string, entries: &[Entry], notes: &[Note]) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut text = String.make()
+    run text.append("<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">")
+    run text.append(
+      "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>",
+    )
+    run Html.escaped(&mut text, suite)
+    run text.append(" benchmark history</title><style>")
+    run text.append(Html.style())
+    run text.append("</style></head><body><main>\n<h1>")
+    run Html.escaped(&mut text, suite)
+    run text.append(" history</h1>\n")
+    let groups = run grouped(entries)
+    let listed = groups.asSlice()
+    let mut at: usize = 0
+    while at < listed.length {
+      let first = &entries[listed[at].asSlice()[0]]
+
+      // The chart of a benchmark comes before the table of its first implementation.
+      let mut earlier = false
+      let mut before: usize = 0
+      while before < at {
+        if entries[listed[before].asSlice()[0]].benchmark.view() == first.benchmark.view() {
+          earlier = true
+        }
+        before = before + 1
+      }
+      if !earlier {
+        run text.append("<h2>")
+        run Html.escaped(&mut text, first.benchmark.view())
+        run text.append("</h2>\n")
+        run chart(&mut text, entries, first.benchmark.view(), notes)
+      }
+      run text.append("<p class=\"meta\">")
+      run Html.escaped(&mut text, first.implementation.view())
+      run text.append("</p>\n<div class=\"scroll\"><table>\n<tr>")
+      let titles = run headings(first)
+      let named = titles.asSlice()
+      let mut column: usize = 0
+      while column < named.length {
+        run text.append("<th>")
+        run Html.escaped(&mut text, named[column].view())
+        run text.append("</th>")
+        column = column + 1
+      }
+      run text.append("</tr>\n")
+      let lines = run linesOf(entries, listed[at].asSlice(), notes)
+      let all = lines.asSlice()
+      let mut row: usize = 0
+      while row < all.length {
+        run text.append("<tr>")
+        column = 0
+        while column < 6 {
+          if column == 3 && String.byteLength(all[row].verdict) > 0 {
+            run text.append("<td class=\"")
+            run text.append(all[row].verdict)
+            run text.append("\">")
+          } else {
+            run text.append("<td>")
+          }
+          run Html.escaped(&mut text, all[row].cells.asSlice()[column].view())
+          run text.append("</td>")
+          column = column + 1
+        }
+        run text.append("</tr>\n")
+        row = row + 1
+      }
+      run text.append("</table></div>\n")
+      at = at + 1
+    }
+    run text.append("</main></body></html>\n")
+    return move text
+  }
+
+  /// Returns the history `entries` as Markdown: a heading and a table for each implementation
+  /// on each benchmark, with the columns of [`History.terminal`].
+  ///
+  /// # Errors
+  /// `OutOfMemoryError` if the `Allocator` cannot supply the text.
+  pub effect fn markdown(entries: &[Entry], notes: &[Note]) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut text = String.make()
+    let groups = run grouped(entries)
+    let listed = groups.asSlice()
+    let mut at: usize = 0
+    while at < listed.length {
+      let first = &entries[listed[at].asSlice()[0]]
+      run text.append("## ")
+      run text.append(first.benchmark.view())
+      run text.append(", ")
+      run text.append(first.implementation.view())
+      run text.append("\n\n")
+      let titles = run headings(first)
+      run markdownRow(&mut text, titles.asSlice())
+      run text.append("| :-- | :-- | --: | --: | --: | :-- |\n")
+      let lines = run linesOf(entries, listed[at].asSlice(), notes)
+      let all = lines.asSlice()
+      let mut row: usize = 0
+      while row < all.length {
+        run markdownRow(&mut text, all[row].cells.asSlice())
+        row = row + 1
+      }
+      run text.append("\n")
+      at = at + 1
+    }
+    return move text
+  }
+}
+
+// The chart's layout, in SVG units.
+const WIDTH: f64 = 928.0
+
+const LEFT: f64 = 64.0
+
+const RIGHT: f64 = 150.0
+
+const TOP: f64 = 14.0
+
+const HEIGHT: f64 = 200.0
+
+const BOTTOM: f64 = 30.0
+
+effect fn number(text: &mut String, value: f64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return run Units.appendFixed(&mut text, value, 1)
+}
+
+// The journal's text for `entry`: for its revision, or else for its day.
+fn noteOf<'notes>(notes: &'notes [Note], entry: &Entry) -> Option<string<'notes>> {
+  if let Option<String>.Some { value } = &entry.revision {
+    if let Option<string<'notes>>.Some { value: found } = Journal.find(notes, value.view()) {
+      return Option<string<'notes>>.Some { value: found }
+    }
+  }
+  if String.byteLength(entry.date.view()) >= 10 && String.isCharBoundary(entry.date.view(), 10) {
+    return Journal.find(notes, String.slice(entry.date.view(), 0, 10))
+  }
+  return Option<string<'notes>>.None
+}
+
+// A round step that puts about four lines on an axis that spans `span`.
+fn gridStep(span: f64) -> f64 {
+  let mut step = 1.0
+  while step * 10.0 <= span {
+    step = step * 10.0
+  }
+  while step > span {
+    step = step / 10.0
+  }
+  if span / step < 2.0 {
+    return step / 4.0
+  }
+  if span / step < 4.0 {
+    return step / 2.0
+  }
+  if span / step > 6.0 {
+    return step * 2.0
+  }
+  return step
+}
+
+// The chart of one benchmark over its runs.
+effect fn chart(text: &mut String, entries: &[Entry], benchmark: string, notes: &[Note]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  // The runs of the benchmark, oldest first, and its implementations.
+  let mut runs = List<usize>.make()
+  let mut names = List<usize>.make()
+  let mut compared = false
+  let mut at: usize = 0
+  while at < entries.length {
+    if entries[at].benchmark.view() == benchmark {
+      if let Option<f64>.Some { value: _ } = entries[at].ratio {
+        compared = true
+      }
+      let mut known = false
+      let seen = runs.asSlice()
+      let mut index: usize = 0
+      while index < seen.length {
+        if entries[seen[index]].id.view() == entries[at].id.view() {
+          known = true
+        }
+        index = index + 1
+      }
+      if !known {
+        run runs.append(at)
+      }
+      known = false
+      let listed = names.asSlice()
+      index = 0
+      while index < listed.length {
+        if entries[listed[index]].implementation.view() == entries[at].implementation.view() {
+          known = true
+        }
+        index = index + 1
+      }
+      if !known {
+        run names.append(at)
+      }
+    }
+    at = at + 1
+  }
+  let ordered = runs.asSlice()
+  let series = names.asSlice()
+  if ordered.length < 2 {
+    return ()
+  }
+  let unit = entries[ordered[0]].unit.view()
+
+  // The range of the values: ratios around 1, or medians from zero.
+  let mut lowest = 0.0
+  let mut highest = 0.0
+  if compared {
+    lowest = 1.0
+    highest = 1.0
+  }
+  at = 0
+  while at < entries.length {
+    if entries[at].benchmark.view() == benchmark {
+      let mut value = entries[at].median
+      let mut counted = !compared
+      if let Option<f64>.Some { value: ratio } = entries[at].ratio {
+        value = ratio
+        counted = true
+      }
+      if counted {
+        lowest = f64.min(lowest, value)
+        highest = f64.max(highest, value)
+      }
+    }
+    at = at + 1
+  }
+  if highest <= lowest {
+    highest = lowest + 1.0
+  }
+  let step = gridStep(highest - lowest)
+  if compared {
+    lowest = f64.floor(lowest / step) * step
+  }
+  highest = f64.ceil(highest / step) * step
+  let plot = WIDTH - LEFT - RIGHT
+  let total = TOP + HEIGHT + BOTTOM
+  let scale = Units.measure(highest, unit)
+  run text.append("<svg viewBox=\"0 0 ")
+  run number(&mut text, WIDTH)
+  run text.append(" ")
+  run number(&mut text, total)
+  run text.append("\" role=\"img\" aria-label=\"")
+  run Html.escaped(&mut text, benchmark)
+  if compared {
+    run text.append(": ratio to the reference in each run, oldest first\">\n")
+  } else {
+    run text.append(": median of each run, oldest first\">\n")
+  }
+
+  // Horizontal lines with their values.
+  let mut line = lowest
+  while line <= highest + step / 2.0 {
+    let y = TOP + HEIGHT * (highest - line) / (highest - lowest)
+    if compared && f64.abs(line - 1.0) < step / 100.0 {
+      run text.append("<line class=\"one\" x1=\"")
+    } else {
+      run text.append("<line class=\"grid\" x1=\"")
+    }
+    run number(&mut text, LEFT)
+    run text.append("\" y1=\"")
+    run number(&mut text, y)
+    run text.append("\" x2=\"")
+    run number(&mut text, LEFT + plot)
+    run text.append("\" y2=\"")
+    run number(&mut text, y)
+    run text.append("\"/><text text-anchor=\"end\" x=\"")
+    run number(&mut text, LEFT - 8.0)
+    run text.append("\" y=\"")
+    run number(&mut text, y + 4.0)
+    run text.append("\">")
+    if compared {
+      run text.appendOwned(run Units.ratio(line))
+    } else if line > 0.0 {
+      run text.appendOwned(run Units.scaled(line, scale))
+      run text.append(" ")
+      run Html.escaped(&mut text, Units.named(scale, unit))
+    } else {
+      run text.append("0")
+    }
+    run text.append("</text>\n")
+    line = line + step
+  }
+
+  // The first and the last run are named under the axis, and so is each run the journal marks.
+  let mut marks = List<usize>.make()
+  let mut shown = List<String>.make()
+  let mut index: usize = 0
+  while index < ordered.length {
+    let entry = &entries[ordered[index]]
+    let x = LEFT + plot * usize.toF64(index) / usize.toF64(ordered.length - 1)
+    let mut marked = false
+    if let Option<string>.Some { value: note } = noteOf(notes, entry) {
+      let known = shown.asSlice()
+      let mut repeated = false
+      let mut other: usize = 0
+      while other < known.length {
+        if known[other].view() == note {
+          repeated = true
+        }
+        other = other + 1
+      }
+      if !repeated {
+        run shown.append(run String.copy(note))
+        run marks.append(ordered[index])
+        marked = true
+        run text.append("<line class=\"mark\" x1=\"")
+        run number(&mut text, x)
+        run text.append("\" y1=\"")
+        run number(&mut text, TOP)
+        run text.append("\" x2=\"")
+        run number(&mut text, x)
+        run text.append("\" y2=\"")
+        run number(&mut text, TOP + HEIGHT)
+        run text.append("\"/><text class=\"name\" text-anchor=\"middle\" x=\"")
+        run number(&mut text, x)
+        run text.append("\" y=\"")
+        run number(&mut text, TOP - 3.0)
+        run text.append("\">")
+        run Units.appendWhole(&mut text, usize.toU64(marks.length()))
+        run text.append("</text>")
+      }
+    }
+    if index == 0 || index == ordered.length - 1 || marked {
+      if index == 0 {
+        run text.append("<text text-anchor=\"start\" x=\"")
+      } else if index == ordered.length - 1 {
+        run text.append("<text text-anchor=\"end\" x=\"")
+      } else {
+        run text.append("<text text-anchor=\"middle\" x=\"")
+      }
+      run number(&mut text, x)
+      run text.append("\" y=\"")
+      run number(&mut text, total - 8.0)
+      run text.append("\">")
+      run Html.escaped(&mut text, (run tick(entry)).view())
+      run text.append("</text>\n")
+    }
+    index = index + 1
+  }
+
+  // One line for each implementation that has a value to draw.
+  let mut color: usize = 0
+  let mut name: usize = 0
+  while name < series.length {
+    let implementation = entries[series[name]].implementation.view()
+    let mut path = String.make()
+    let mut dots = String.make()
+    let mut lastX = 0.0
+    let mut lastY = 0.0
+    let mut drawn: usize = 0
+    index = 0
+    while index < ordered.length {
+      at = 0
+      while at < entries.length {
+        let entry = &entries[at]
+        if entry.benchmark.view() == benchmark && entry.implementation.view() == implementation
+          && entry.id.view() == entries[ordered[index]].id.view() {
+          let mut value = entry.median
+          let mut counted = !compared
+          if let Option<f64>.Some { value: ratio } = entry.ratio {
+            value = ratio
+            counted = true
+          }
+          if counted {
+            lastX = LEFT + plot * usize.toF64(index) / usize.toF64(ordered.length - 1)
+            lastY = TOP + HEIGHT * (highest - value) / (highest - lowest)
+            if drawn == 0 {
+              run path.append("M")
+            } else {
+              run path.append("L")
+            }
+            run number(&mut path, lastX)
+            run path.append(" ")
+            run number(&mut path, lastY)
+            run dots.append("<circle class=\"s")
+            run Units.appendWhole(&mut dots, usize.toU64(color % 5))
+            run dots.append("\" r=\"3\" cx=\"")
+            run number(&mut dots, lastX)
+            run dots.append("\" cy=\"")
+            run number(&mut dots, lastY)
+            run dots.append("\"/>")
+            drawn = drawn + 1
+          }
+        }
+        at = at + 1
+      }
+      index = index + 1
+    }
+    if drawn > 0 {
+      run text.append("<path class=\"line s")
+      run Units.appendWhole(&mut text, usize.toU64(color % 5))
+      run text.append("\" d=\"")
+      run text.append(path.view())
+      run text.append("\"/>")
+      run text.append(dots.view())
+      run text.append("<text class=\"s")
+      run Units.appendWhole(&mut text, usize.toU64(color % 5))
+      run text.append("\" x=\"")
+      run number(&mut text, lastX + 10.0)
+      run text.append("\" y=\"")
+      run number(&mut text, lastY + 4.0)
+      run text.append("\">")
+      run Html.escaped(&mut text, implementation)
+      run text.append("</text>\n")
+      color = color + 1
+    }
+    name = name + 1
+  }
+  run text.append("</svg>\n")
+  let marked = marks.asSlice()
+  if marked.length > 0 {
+    run text.append("<ol>\n")
+    index = 0
+    while index < marked.length {
+      run text.append("<li>")
+      run Html.escaped(&mut text, (run tick(&entries[marked[index]])).view())
+      run text.append(": ")
+      run Html.escaped(&mut text, shown.asSlice()[index].view())
+      run text.append("</li>\n")
+      index = index + 1
+    }
+    run text.append("</ol>\n")
+  }
+}
+
+// What names a run under the axis: its revision in 10 characters, or else its day.
+effect fn tick(entry: &Entry) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if let Option<String>.Some { value } = &entry.revision {
+    let whole = value.view()
+    if String.byteLength(whole) > 10 && String.isCharBoundary(whole, 10) {
+      return run String.copy(String.slice(whole, 0, 10))
+    }
+    return run String.copy(whole)
+  }
+  let date = entry.date.view()
+  if String.byteLength(date) >= 10 && String.isCharBoundary(date, 10) {
+    return run String.copy(String.slice(date, 0, 10))
+  }
+  return run String.copy(date)
+}
+
+// Appends `value` as the inside of a JSON string: `"` and `\` are escaped, and control
+// characters become spaces.
+effect fn quoted(text: &mut String, value: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let bytes = String.utf8Bytes(value)
+  let mut start: usize = 0
+  let mut at: usize = 0
+  while at < bytes.length {
+    if bytes[at] == 34 || bytes[at] == 92 || bytes[at] < 32 {
+      run text.append(String.slice(value, start, at - start))
+      if bytes[at] == 34 {
+        run text.append("\\\"")
+      } else if bytes[at] == 92 {
+        run text.append("\\\\")
+      } else {
+        run text.append(" ")
+      }
+      start = at + 1
+    }
+    at = at + 1
+  }
+  run text.append(String.slice(value, start, bytes.length - start))
+}
+
+// One row of a history table as text.
+struct Line {
+  cells: List<String>,
+  // "faster", "slower", or empty.
+  verdict: string<'static>,
+}
+
+effect fn copyOptional(text: &Option<String>) -> Option<String>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match &text.* {
+    Option<String>.Some { value } => Option<String>.Some { value: run String.copy(value.view()) }
+    Option<String>.None => Option<String>.None
+  }
+}
+
+// The indexes of `entries` by benchmark and implementation, in the order each pair first
+// appears.
+effect fn grouped(entries: &[Entry]) -> List<List<usize>>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut groups = List<List<usize>>.make()
+  let mut at: usize = 0
+  while at < entries.length {
+    let mut placed = false
+    let all = groups.asMutSlice()
+    let mut group: usize = 0
+    while group < all.length {
+      let first = &entries[all[group].asSlice()[0]]
+      if first.benchmark.view() == entries[at].benchmark.view()
+        && first.implementation.view() == entries[at].implementation.view() {
+        run all[group].append(at)
+        placed = true
+        break
+      }
+      group = group + 1
+    }
+    if !placed {
+      let mut fresh = List<usize>.make()
+      run fresh.append(at)
+      run groups.append(move fresh)
+    }
+    at = at + 1
+  }
+  return move groups
+}
+
+effect fn headings(first: &Entry) -> List<String>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut titles = List<String>.make()
+  run titles.append(run String.copy("date"))
+  run titles.append(run String.copy("revision"))
+  run titles.append(run String.copy("median"))
+  run titles.append(run String.copy("change"))
+  let mut versus = run String.copy("vs ")
+  run versus.append(first.reference.view())
+  run titles.append(move versus)
+  run titles.append(run String.copy("journal"))
+  return move titles
+}
+
+// `2026-11-19T14:03:22Z` as `2026-11-19 14:03`.
+effect fn shortDate(date: string) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if String.byteLength(date) < 16 || !String.isCharBoundary(date, 16) {
+    return run String.copy(date)
+  }
+  let mut text = run String.copy(String.slice(date, 0, 10))
+  run text.append(" ")
+  run text.append(String.slice(date, 11, 5))
+  return move text
+}
+
+effect fn linesOf(entries: &[Entry], group: &[usize], notes: &[Note]) -> List<Line>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut lines = List<Line>.make()
+  let mut shown = List<String>.make()
+  let mut at: usize = 0
+  while at < group.length {
+    let entry = &entries[group[at]]
+    let mut cells = List<String>.make()
+    run cells.append(run shortDate(entry.date.view()))
+    let mut revision = run String.copy("-")
+    if let Option<String>.Some { value } = &entry.revision {
+      let whole = value.view()
+      if String.byteLength(whole) > 10 && String.isCharBoundary(whole, 10) {
+        revision = run String.copy(String.slice(whole, 0, 10))
+      } else {
+        revision = run String.copy(whole)
+      }
+    }
+    run cells.append(move revision)
+    run cells.append(run Units.quantity(entry.median, entry.unit.view()))
+
+    // The change from the run before, when both ran on the same computer.
+    let mut change = String.make()
+    let mut verdict = ""
+    if at > 0 {
+      let before = &entries[group[at - 1]]
+      if before.computer.view() != entry.computer.view() {
+        change = run String.copy("other computer")
+      } else if before.median > 0.0 {
+        let percent = (entry.median / before.median - 1.0) * 100.0
+        if percent >= 0.0 {
+          run change.append("+")
+        }
+        run Units.appendFixed(&mut change, percent, 1)
+        run change.append("%")
+        let above = entry.low > before.high
+        let below = entry.high < before.low
+        if (above && entry.higher) || (below && !entry.higher) {
+          verdict = "faster"
+        } else if above || below {
+          verdict = "slower"
+        }
+        if String.byteLength(verdict) > 0 {
+          run change.append(" ")
+          run change.append(verdict)
+        }
+      }
+    }
+    run cells.append(move change)
+    match entry.ratio {
+      Option<f64>.Some { value } => run cells.append(run Units.ratio(value))
+      Option<f64>.None => {
+        if entry.implementation.view() == entry.reference.view() {
+          run cells.append(run String.copy("reference"))
+        } else {
+          run cells.append(run String.copy("-"))
+        }
+      }
+    }
+
+    // The journal's text for the revision, or else for the day, at the first run that has it.
+    let mut note = ""
+    let mut key = ""
+    if let Option<String>.Some { value } = &entry.revision {
+      if let Option<string>.Some { value: found } = Journal.find(notes, value.view()) {
+        note = found
+        key = value.view()
+      }
+    }
+    if String.byteLength(note) == 0 && String.byteLength(entry.date.view()) >= 10
+      && String.isCharBoundary(entry.date.view(), 10) {
+      let day = String.slice(entry.date.view(), 0, 10)
+      if let Option<string>.Some { value: found } = Journal.find(notes, day) {
+        note = found
+        key = day
+      }
+    }
+    let mut repeated = false
+    let known = shown.asSlice()
+    let mut index: usize = 0
+    while index < known.length {
+      if known[index].view() == key {
+        repeated = true
+      }
+      index = index + 1
+    }
+    if String.byteLength(note) > 0 && !repeated {
+      run shown.append(run String.copy(key))
+      run cells.append(run String.copy(note))
+    } else {
+      run cells.append(String.make())
+    }
+    run lines.append(Line { cells: move cells, verdict: verdict })
+    at = at + 1
+  }
+  return move lines
+}
+
+effect fn paint(text: &mut String, code: string, value: string, color: bool) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let painted = color && String.byteLength(code) > 0 && String.byteLength(value) > 0
+  if painted {
+    run text.append(code)
+  }
+  run text.append(value)
+  if painted {
+    run text.append(RESET)
+  }
+}
+
+// One padded cell. The median, the change and the ratio are right-aligned; the last column takes
+// no padding.
+effect fn cell(
+  text: &mut String,
+  value: string,
+  width: usize,
+  column: usize,
+  code: string,
+  color: bool,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let padding = width - Units.width(value)
+  let right = column >= 2 && column <= 4
+  let mut at: usize = 0
+  if right {
+    while at < padding {
+      run text.append(" ")
+      at = at + 1
+    }
+  }
+  run paint(&mut text, code, value, color)
+  if !right && column < 5 {
+    while at < padding {
+      run text.append(" ")
+      at = at + 1
+    }
+  }
+}
+
+effect fn markdownRow(text: &mut String, cells: &[String]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run text.append("|")
+  let mut at: usize = 0
+  while at < cells.length {
+    run text.append(" ")
+    run text.append(cells[at].view())
+    run text.append(" |")
+    at = at + 1
+  }
+  run text.append("\n")
+}
+
+// Adds `id` to `ids` unless it is there.
+effect fn numbered(ids: &mut List<String>, id: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let known = ids.asSlice()
+  let mut at: usize = 0
+  while at < known.length {
+    if known[at].view() == id {
+      return ()
+    }
+    at = at + 1
+  }
+  return run ids.append(run String.copy(id))
+}
+
+// Adds `entry` to the panel of its benchmark as a point of its implementation's line, at the
+// place of its run in `ids`.
+effect fn plotted(
+  panels: &mut List<Panel>,
+  entry: &Entry,
+  ids: &[String],
+  unit: string,
+  normalize: string,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if entry.unit.view() != unit {
+    return ()
+  }
+  let mut value = entry.median
+  let mut low = entry.low
+  let mut high = entry.high
+  if String.byteLength(normalize) > 0 {
+    if entry.reference.view() != normalize {
+      return ()
+    }
+    match entry.ratio {
+      Option<f64>.Some { value: ratio } => {
+        value = ratio
+        low = ratio
+        high = ratio
+      }
+      Option<f64>.None => {
+        return ()
+      }
+    }
+  }
+  let mut place: usize = 0
+  while place < ids.length && ids[place].view() != entry.id.view() {
+    place = place + 1
+  }
+  let known = panels.asSlice()
+  let mut panel: usize = 0
+  while panel < known.length && known[panel].title.view() != entry.benchmark.view() {
+    panel = panel + 1
+  }
+  if panel == known.length {
+    run panels.append(
+      Panel { title: run String.copy(entry.benchmark.view()), series: List<Series>.make() },
+    )
+  }
+  let all = panels.asMutSlice()
+  let lists = all[panel].series.asSlice()
+  let mut series: usize = 0
+  while series < lists.length && lists[series].name.view() != entry.implementation.view() {
+    series = series + 1
+  }
+  if series == lists.length {
+    run all[panel].series.append(
+      Series { name: run String.copy(entry.implementation.view()), points: List<Point>.make() },
+    )
+  }
+  let lines = all[panel].series.asMutSlice()
+  return run lines[series].points.append(
+    Point {
+      x: run tick(entry),
+      at: usize.toF64(place),
+      value: value,
+      low: low,
+      high: high,
+      faded: false,
+    },
+  )
+}

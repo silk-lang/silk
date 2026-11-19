@@ -23,6 +23,7 @@ import silk.core.result { Result }
 import silk.system.executable as Executable
 import silk.crypto.sha2 { Sha256 }
 import silk.io.writer { Writer, WriterError }
+import silk.io.writer_native { StderrWriter }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.mem.layout { Layout }
 import silk.mem.pointer { Pointer }
@@ -31,7 +32,7 @@ import silk.schema.issue { SchemaError }
 import silk.schema.schema { Schema, Schemas, SchemaReader, SchemaWriter, Spec }
 import silk.schema.issue { Issue }
 import silk.system.sandbox as Sandbox
-import silk.system.child_process { ChildProcess, ProcessError, ProcessOutcome }
+import silk.system.child_process { ChildProcess, ProcessError, ProcessOutcome, ProcessRequest }
 import silk.system.child_process_native { OsChildProcess }
 import silk.system.file_lock { FileLock }
 import silk.system.filesystem {
@@ -432,7 +433,8 @@ enum InputKind {
   Value,
   Files,
   Trees,
-  Packages
+  Packages,
+  Location
 }
 
 struct Input {
@@ -510,6 +512,17 @@ impl Key {
     ? &mut Allocator {
     return run self.inputs.append(
       Input { reference: run copyReference(&value.reference), kind: InputKind.File },
+    )
+  }
+
+  /// Declares a path the step names without reading it, such as a file it will write for the
+  /// user. Only where the path is takes part in the key, so the path need not exist yet.
+  /// `Make.path` resolves it.
+  pub effect fn location(self: &mut Self, value: &Deferred<Path>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run self.inputs.append(
+      Input { reference: run copyReference(&value.reference), kind: InputKind.Location },
     )
   }
 
@@ -1378,12 +1391,50 @@ impl Make {
     return run self.execute(program, arguments, Option<&Deferred<Path>>.some(launcher))
   }
 
+  /// Executes a declared program as [`Make.exec`] does, with the program's standard error on this
+  /// process's own, so what it writes, such as live progress, shows while it runs. Answers whether
+  /// it exited with status 0. Where children cannot share the stream, the errors show once it ends.
+  pub effect fn execShown(
+    self: &mut Self,
+    program: &Deferred<Path>,
+    arguments: &[string],
+  ) -> bool
+    ! StepFailure
+    ? &mut Allocator {
+    let request = run self.request(program, arguments, Option<&Deferred<Path>>.none())
+    if let Option<bool>.Some { value } = run shownExit(&request) {
+      return value
+    }
+    let outcome = run ChildProcess.submit(&request)
+      |> Effect.provideMut<ChildProcess>(&mut self.process)
+    let mut shown = StderrWriter.make()
+    drop run Effect.result(
+      Writer.writeAll(ChildProcess.errorBytes(&outcome)) |> Effect.provideMut<Writer>(&mut shown),
+    )
+    return match move ChildProcess.exitCode(&outcome) {
+      Option<i32>.Some { value } => value == 0
+      Option<i32>.None => false
+    }
+  }
+
   effect fn execute(
     self: &mut Self,
     program: &Deferred<Path>,
     arguments: &[string],
     sandbox: Option<&Deferred<Path>>,
   ) -> ProcessOutcome
+    ! StepFailure
+    ? &mut Allocator {
+    let request = run self.request(program, arguments, sandbox)
+    return run ChildProcess.submit(&request) |> Effect.provideMut<ChildProcess>(&mut self.process)
+  }
+
+  effect fn request(
+    self: &mut Self,
+    program: &Deferred<Path>,
+    arguments: &[string],
+    sandbox: Option<&Deferred<Path>>,
+  ) -> ProcessRequest
     ! StepFailure
     ? &mut Allocator {
     let executable = run self.path(program)
@@ -1429,7 +1480,7 @@ impl Make {
       }
       at = at + usize.ONE
     }
-    return run ChildProcess.submit(&request) |> Effect.provideMut<ChildProcess>(&mut self.process)
+    return move request
   }
 
   /// Whether this compilation should invoke the compiler after writing its request.
@@ -1865,6 +1916,7 @@ effect fn prepareStep(
         InputKind.Files => b"files"
         InputKind.Trees => b"trees"
         InputKind.Packages => b"packages"
+        InputKind.Location => b"location"
       },
     )
     let mut path = Option<Path>.none()
@@ -1893,7 +1945,7 @@ effect fn prepareStep(
         Fingerprint.field(&mut hash, Path.rawBytes(&resolved))
         if input.kind == InputKind.Package {
           run Fingerprint.recordedPackage(&mut hash, &resolved, &outputRoot, &records)
-        } else {
+        } else if input.kind != InputKind.Location {
           run Fingerprint.recorded(&mut hash, &resolved, false, &records)
         }
         path = Option<Path>.some(move resolved)
@@ -1931,7 +1983,7 @@ effect fn prepareStep(
         Fingerprint.field(&mut hash, Path.rawBytes(&resolved))
         if input.kind == InputKind.Package {
           run Fingerprint.recordedPackage(&mut hash, &resolved, &outputRoot, &records)
-        } else {
+        } else if input.kind != InputKind.Location {
           run Fingerprint.recorded(&mut hash, &resolved, false, &records)
         }
         path = Option<Path>.some(move resolved)
@@ -2663,4 +2715,43 @@ effect fn sdkSettingsFingerprint(hash: &mut Sha256, root: &Path) -> ()
   } else {
     Fingerprint.field(&mut hash.*, b"missing-sdk")
   }
+}
+
+// Runs `request` with standard error shared with this process and answers whether it exited
+// with status 0, or nothing where `silk.system.subprocess` cannot start it.
+static if (Intrinsic.targetOperatingSystem() == "darwin" || Intrinsic.targetOperatingSystem() == "linux")
+  && (Intrinsic.targetArchitecture() == "x86_64" || Intrinsic.targetArchitecture() == "aarch64") {
+import silk.system.subprocess { ExitStatus, ExitWatch, SpawnOptions, Stdio, Subprocess, SubprocessError }
+
+effect fn shownExit(request: &ProcessRequest) -> Option<bool> ! OutOfMemoryError ? &mut Allocator {
+  let mut options = SpawnOptions.make()
+  run options.setStdio(0, Stdio.ignore())
+  run options.setStdio(1, Stdio.ignore())
+  run options.setStdio(2, Stdio.inherit(2))
+  let child = match move run Effect.result(Subprocess.spawn(request, &options)) {
+    Result<Subprocess, SubprocessError | OutOfMemoryError>.Success { value } => move value
+    Result<Subprocess, SubprocessError | OutOfMemoryError>.Failure { error } => {
+      drop error
+      return Option<bool>.none()
+    }
+  }
+  let watch = match move run Effect.result(ExitWatch.open(child.pid())) {
+    Result<ExitWatch, SubprocessError>.Success { value } => move value
+    Result<ExitWatch, SubprocessError>.Failure { error } => {
+      drop error
+      return Option<bool>.some(false)
+    }
+  }
+  return match move run Effect.result(watch.collect()) {
+    Result<ExitStatus, SubprocessError>.Success { value } => Option<bool>.some(!value.signaled && value.code == 0)
+    Result<ExitStatus, SubprocessError>.Failure { error } => {
+      drop error
+      Option<bool>.some(false)
+    }
+  }
+}
+} else {
+effect fn shownExit(request: &ProcessRequest) -> Option<bool> ! OutOfMemoryError ? &mut Allocator {
+  return Option<bool>.none()
+}
 }

@@ -325,6 +325,20 @@ pub effect fn file(self: &mut Self, value: &Deferred<Path>) -> ()
 
 Declares one readable file; its bytes or producer key participate in this step's key.
 
+<a id="Key.impl.location"></a>
+
+### Method `location`
+
+```silk
+pub effect fn location(self: &mut Self, value: &Deferred<Path>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Declares a path the step names without reading it, such as a file it will write for the
+user. Only where the path is takes part in the key, so the path need not exist yet.
+`Make.path` resolves it.
+
 <a id="Key.impl.toolchain"></a>
 
 ### Method `toolchain`
@@ -1087,6 +1101,24 @@ pub effect fn execConfined(
 ```
 
 Executes a declared program through a declared sandbox launcher with only keyed reads.
+
+<a id="Make.impl.execShown"></a>
+
+### Method `execShown`
+
+```silk
+pub effect fn execShown(
+    self: &mut Self,
+    program: &Deferred<Path>,
+    arguments: &[string],
+  ) -> bool
+    ! StepFailure
+    ? &mut Allocator
+```
+
+Executes a declared program as [`Make.exec`](#Make.impl.exec) does, with the program's standard error on this
+process's own, so what it writes, such as live progress, shows while it runs. Answers whether
+it exited with status 0. Where children cannot share the stream, the errors show once it ends.
 
 <a id="Make.impl.shouldCompile"></a>
 

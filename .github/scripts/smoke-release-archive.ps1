@@ -39,7 +39,7 @@ try {
   # must hand the compiler SILK_HOME in Windows' own spelling, and git must get normal names.
   $repository = Join-Path $OutputDirectory 'git-repository'
   New-Item -ItemType Directory -Path (Join-Path $repository 'answer') | Out-Null
-  [IO.File]::WriteAllText((Join-Path $repository 'answer/silk.toml'), "[package]`nname = `"answer`"`nversion = `"0.1.0`"`nsource = `".`"`nexports = [`"value`"]`n")
+  [IO.File]::WriteAllText((Join-Path $repository 'answer/silk.toml'), "[package]`nname = `"answer`"`nversion = `"0.1.0`"`nsilk-version = `"$version`"`nsource = `".`"`nexports = [`"value`"]`n")
   [IO.File]::WriteAllText((Join-Path $repository 'answer/value.silk'), "pub fn value() -> i32 { return 42 }`n")
   git -C $repository init --quiet
   if ($LASTEXITCODE -ne 0) { throw 'git init of the dependency repository failed' }

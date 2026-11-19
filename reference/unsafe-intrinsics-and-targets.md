@@ -1259,8 +1259,11 @@ declaration it belongs to, such as `app@0.1.0:src/main.silk::Parser.next`. A lin
 declaration that way, with or without the package's version (`app:src/main.silk::Parser.next`),
 and orders every symbol of that declaration, its generic instances and drop glue included, in the
 map's order. Prefer declarations: they stay the same across compiler versions and dependency
-bumps. A line may also name a symbol, such as `silk_1f3a9c...`, as the program's LLVM IR and a Linux
-`nm` spell it, without the leading underscore Mach-O adds. A Silk function's symbol derives from
+bumps. A Linux executable's symbol table names each Silk function by that declaration without the
+version, so perf, valgrind, objdump and `nm` show `app:src/main.silk::Parser.next`, and a name they
+show can be listed here as written. A line may also name a symbol, such as `silk_1f3a9c...`, as the
+program's LLVM IR, its objects and the map spell it, without the leading underscore Mach-O adds; a
+macOS executable's symbol table keeps those symbols. A Silk function's symbol derives from
 its declaration, not its body, so editing a body keeps it while renaming the function or changing
 its signature does not. When some entries name no function of the build, the build prints a note
 that counts them, so a stale file shows. A Linux or macOS executable link

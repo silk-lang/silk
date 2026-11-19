@@ -10,7 +10,7 @@ root=$(mktemp -d)
 trap 'rm -rf "$root"' EXIT
 mkdir -p "$root/app/tools"
 cd "$root/app"
-printf '[package]\nname = "app"\nversion = "0.1.0"\nsource = "."\n' > silk.toml
+printf '[package]\nname = "app"\nsilk-version = "0.0.0"\nversion = "0.1.0"\nsource = "."\n' > silk.toml
 printf '20' > base.txt
 printf 'secret' > "$root/secret.txt"
 cat > build.silk <<'SILK'

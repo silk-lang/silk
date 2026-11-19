@@ -35,7 +35,7 @@ const program = Effect.gen(function* () {
   const source = yield* fs.readFileString(join(repo, 'compiler/fixtures/wasi/main.silk'))
   yield* fs.writeFileString(
     join(directory, 'silk.toml'),
-    '[package]\nname = "wasi-test"\nversion = "0.1.0"\nsource = "."\n',
+    '[package]\nname = "wasi-test"\nsilk-version = "0.0.0"\nversion = "0.1.0"\nsource = "."\n',
   )
   const env = {
     ...process.env,
@@ -157,6 +157,32 @@ const program = Effect.gen(function* () {
     })
     yield* project(3)
     yield* project(4)
+    // `--backend direct` reaches the wasm build, not the tasks program, which runs on this machine.
+    const tasks = join(directory, 'tasks.silk')
+    yield* fs.writeFileString(
+      tasks,
+      [
+        'import silk.cli.command { Command, CommandLine }',
+        'import silk.cli.task { Task, TaskSet, TaskError }',
+        'import silk.mem.allocator { Allocator, OutOfMemoryError }',
+        'import silk.system.host_input { HostInput }',
+        'union Tasks { Greet }',
+        'impl CommandLine for Tasks {',
+        '  static fn command() -> Command<Tasks> { return Command<Tasks>.make("tasks", "Tasks") }',
+        '}',
+        'impl TaskSet for Tasks {',
+        '  effect fn perform(self: Self) -> () ! TaskError | OutOfMemoryError ? &mut Allocator { return () }',
+        '}',
+        'pub effect fn main() -> i32 ? &mut HostInput { return run Task.main<Tasks>() }',
+        '',
+      ].join('\n'),
+    )
+    yield* fs.writeFileString(join(directory, 'main.silk'), 'pub fn main() -> i32 { return 5 }\n')
+    const withTasks = yield* invoke(compiler, ['build', '--target', 'wasm32-wasip1', '--backend', 'direct', '--stdlib', join(repo, 'stdlib')])
+    assert.equal(withTasks.status, 0, withTasks.stderr.toString())
+    const exited = yield* invoke(wasmtime, ['run', join(directory, 'build/wasm32-wasip1/dev/wasi-test.wasm')])
+    assert.equal(exited.status, 5, exited.stderr.toString())
+    yield* fs.remove(tasks)
   }
   for (const target of ['wasm32-wasip1', 'wasm32-wasip2']) {
     yield* fs.writeFileString(join(directory, 'main.silk'), source)
@@ -350,7 +376,7 @@ const program = Effect.gen(function* () {
     yield* fs.makeDirectory(nested, { recursive: true })
     yield* fs.writeFileString(
       join(examples, 'silk.toml'),
-      `[package]\nname = "wasi-examples"\nsource = "."\n`,
+      `[package]\nname = "wasi-examples"\nsilk-version = "0.0.0"\nsource = "."\n`,
     )
     yield* fs.writeFileString(join(examples, 'marker'), 'package directory')
     const example = [

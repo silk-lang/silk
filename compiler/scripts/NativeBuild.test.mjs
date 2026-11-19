@@ -326,7 +326,7 @@ it.layer(NodeServices.layer, { excludeTestServices: true })((it) => {
         )
         assert.strictEqual(
           readFileSync(join(options.outputDirectory, 'smoke/silk.toml'), 'utf8'),
-          '[package]\nname = "trivial-features"\nversion = "0.1.0"\nsource = "."\n',
+          '[package]\nname = "trivial-features"\nsilk-version = "0.0.0"\nversion = "0.1.0"\nsource = "."\n',
         )
       }),
   )

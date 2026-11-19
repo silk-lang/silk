@@ -666,7 +666,7 @@ const writeProgram = Effect.fnUntraced(function* (directory: string, program: Co
   yield* fs.writeFileString(join(directory, programModule), program.source)
   yield* fs.writeFileString(
     join(directory, 'silk.toml'),
-    '[package]\nname = "corpus"\nversion = "0.1.0"\nsource = "."\n',
+    '[package]\nname = "corpus"\nsilk-version = "0.0.0"\nversion = "0.1.0"\nsource = "."\n',
   )
   for (const [module, contents] of Object.entries(program.imports)) {
     if (module.startsWith('/') || module.split('/').includes('..'))

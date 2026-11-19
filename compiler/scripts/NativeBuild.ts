@@ -436,7 +436,7 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
       yield* fs.writeFileString(smokeSource, program.source, { flag: 'wx' })
       yield* fs.writeFileString(
         join(smokeDirectory, 'silk.toml'),
-        '[package]\nname = "trivial-features"\nversion = "0.1.0"\nsource = "."\n',
+        '[package]\nname = "trivial-features"\nsilk-version = "0.0.0"\nversion = "0.1.0"\nsource = "."\n',
         { flag: 'wx' },
       )
       const smokeBuilt = yield* invoke(
