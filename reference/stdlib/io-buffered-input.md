@@ -39,31 +39,31 @@ import silk.collections.list { List }
 import silk.io.memory_byte_duplex { MemoryByteDuplex, MemoryReadEvent, MemoryWriteEvent }
 import silk.system.monotonic_clock { MonotonicClock, ReadyWatch }
 import silk.core.option { Option }
-import silk.system.system_clock { Instant, SystemClock }
+import silk.time.mark { Mark }
 
 struct FixedClock {}
 
 impl MonotonicClock for FixedClock {
-  effect fn now(self: &mut Self) -> Instant {
-    return SystemClock.make(0, 0)
+  effect fn now(self: &mut Self) -> Mark {
+    return Mark.make(0, 0)
   }
 
   effect fn getResolution(self: &mut Self) -> u64 {
     return 1
   }
 
-  effect fn waitUntil(self: &mut Self, when: Instant) -> () {
+  effect fn waitUntil(self: &mut Self, when: Mark) -> () {
     return ()
   }
 
   effect fn waitFor(self: &mut Self, howLong: u64) -> () {
     return ()
   }
-  effect fn waitReady(self: &mut Self, watch: &mut [ReadyWatch], until: Option<Instant>) -> usize {
+  effect fn waitReady(self: &mut Self, watch: &mut [ReadyWatch], until: Option<Mark>) -> usize {
     if watch.length > 0 { Intrinsic.trap("this clock has no handles to watch") }
     match move until {
-      Option<Instant>.None => {}
-      Option<Instant>.Some {value: when} => {
+      Option<Mark>.None => {}
+      Option<Mark>.Some {value: when} => {
       }
     }
     return 0
@@ -77,11 +77,11 @@ effect fn transport() -> MemoryByteDuplex
   let bytes = run Bytes.copy(&b"GET\nrest")
   run List<MemoryReadEvent>.append(
     &mut reads,
-    MemoryReadEvent.Data { readyAt: SystemClock.make(0, 0), bytes: move bytes }
+    MemoryReadEvent.Data { readyAt: Mark.make(0, 0), bytes: move bytes }
   )
   run List<MemoryReadEvent>.append(
     &mut reads,
-    MemoryReadEvent.End { readyAt: SystemClock.make(0, 0) }
+    MemoryReadEvent.End { readyAt: Mark.make(0, 0) }
   )
   return run MemoryByteDuplex.make(
     move reads,
@@ -96,7 +96,7 @@ effect fn transport() -> MemoryByteDuplex
 effect fn firstLineLength(input: &mut BufferedInput) -> usize
   ! BufferError
   ? &mut ByteDuplex | &mut MonotonicClock {
-  let filled = run BufferedInput.fill(&mut input, 4, Option<Instant>.none())
+  let filled = run BufferedInput.fill(&mut input, 4, Option<Mark>.none())
   drop filled
   let view = BufferedInput.peek(&input)
   let mut length: usize = 0
@@ -665,7 +665,7 @@ Removes `count` unread bytes from the front of the buffer.
 pub effect fn fill(
     self: &mut Self,
     minimum: usize,
-    deadline: Option<Instant>,
+    deadline: Option<Mark>,
   ) -> FillOutcome
   ! BufferError
   ? &mut ByteDuplex | &mut MonotonicClock
@@ -724,7 +724,7 @@ the front of the buffer when necessary. A `minimum` of 0 never reads. There is n
 pub effect fn readSome(
     self: &mut Self,
     output: &mut [u8],
-    deadline: Option<Instant>,
+    deadline: Option<Mark>,
   ) -> ReadTransfer
   ! BufferError
   ? &mut ByteDuplex | &mut MonotonicClock
@@ -781,7 +781,7 @@ count of 0 and does not read.
 pub effect fn readExact(
     self: &mut Self,
     output: &mut [u8],
-    deadline: Option<Instant>,
+    deadline: Option<Mark>,
   ) -> ()
   ! BufferError
   ? &mut ByteDuplex | &mut MonotonicClock
@@ -810,7 +810,7 @@ limit. It applies to each read.
 pub effect fn discardAtMost(
     self: &mut Self,
     limit: usize,
-    deadline: Option<Instant>,
+    deadline: Option<Mark>,
   ) -> DiscardOutcome
   ! BufferError
   ? &mut ByteDuplex | &mut MonotonicClock
@@ -841,7 +841,7 @@ absolute time on the active `MonotonicClock`. `Option.none()` means no time limi
 pub effect fn discardExact(
     self: &mut Self,
     count: usize,
-    deadline: Option<Instant>,
+    deadline: Option<Mark>,
   ) -> ()
   ! BufferError
   ? &mut ByteDuplex | &mut MonotonicClock

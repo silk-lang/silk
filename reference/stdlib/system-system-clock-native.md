@@ -27,15 +27,14 @@ trap.
 ```silk
 import silk.core.effect { Effect }
 import silk.system.system_clock_native { OsSystemClock }
-import silk.system.system_clock { Instant, SystemClock }
+import silk.system.system_clock { SystemClock }
 
 pub fn main() -> i32 {
   let mut clock = OsSystemClock.make()
   let now = run SystemClock.now() |> Effect.provideMut<SystemClock>(&mut clock)
 
   // Seconds since 1970. 1600000000 is in September 2020.
-  let nanoseconds = SystemClock.nanoseconds(&now)
-  if SystemClock.seconds(&now) < 1600000000 || nanoseconds < 0 || nanoseconds >= 1000000000 {
+  if now.unixSeconds() < 1600000000 || now.subsecondNanoseconds() >= 1000000000 {
     return 1
   }
   return 0

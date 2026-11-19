@@ -32,23 +32,19 @@ import silk.concurrency.fiber { Fiber, Cancelled, Outcome }
 import silk.concurrency.local_scheduler { LocalScheduler, StalledError }
 import silk.system.monotonic_clock { MonotonicClock }
 import silk.concurrency.scheduler { Scheduler, TaskIdExhaustedError }
-import silk.system.system_clock { SystemClock }
-import silk.system.system_clock { Instant }
+import silk.time.mark { Mark }
 
 struct ParentClock {
-  mark: Instant,
+  mark: Mark,
 }
 
-effect fn parentNow(self: &mut ParentClock) -> Instant {
-  return SystemClock.make(
-    SystemClock.seconds(&self.mark),
-    SystemClock.nanoseconds(&self.mark),
-  )
+effect fn parentNow(self: &mut ParentClock) -> Mark {
+  return self.mark
 }
 
 effect fn parentResolution(self: &mut ParentClock) -> u64 { return 1 }
 
-effect fn parentWaitUntil(self: &mut ParentClock, deadline: Instant) -> () {
+effect fn parentWaitUntil(self: &mut ParentClock, deadline: Mark) -> () {
   self.mark = move deadline
   return ()
 }
@@ -88,7 +84,7 @@ effect fn recover(
 
 pub fn main() -> i32 {
   let mut scheduler = LocalScheduler.make()
-  let mut clock = ParentClock { mark: SystemClock.make(0, 0) }
+  let mut clock = ParentClock { mark: Mark.make(0, 0) }
   let scheduled = Effect.catchAll(
     LocalScheduler.execute(&mut scheduler, program()),
     recover,

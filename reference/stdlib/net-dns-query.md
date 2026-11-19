@@ -163,7 +163,7 @@ Wait for a reply until `until`, then call [`Exchange.poll`](#Exchange.impl.poll)
 #### Field `until`
 
 ```silk
-pub until: Instant
+pub until: Mark
 ```
 
 The time on the `MonotonicClock` at which the current try ends.
@@ -486,7 +486,7 @@ two-byte length for TCP.
 ### Method `poll`
 
 ```silk
-pub fn poll(self: &mut Self, now: &Instant) -> Step
+pub fn poll(self: &mut Self, now: &Mark) -> Step
 ```
 
 Returns the next thing to do at the time `now` of a `MonotonicClock`.

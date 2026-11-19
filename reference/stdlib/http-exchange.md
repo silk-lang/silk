@@ -61,7 +61,7 @@ import silk.system.monotonic_clock { MonotonicClock, ReadyWatch }
 import silk.core.option { Option }
 import silk.system.random { Random }
 import silk.core.result { Result }
-import silk.system.system_clock { Instant, SystemClock }
+import silk.time.mark { Mark }
 import silk.num.u64
 import silk.uri.uri { Uri }
 import silk.uri.reference { ParseError }
@@ -75,7 +75,7 @@ impl HttpTransport for ScriptedTransport {
   effect fn readSomeRaw(
     self: &mut Self,
     output: &mut [u8],
-    deadline: Option<Instant>
+    deadline: Option<Mark>
   ) -> ReadTransfer
     ! TransportError | OutOfMemoryError
     ? &mut MonotonicClock | &mut Allocator | &mut Random {
@@ -89,7 +89,7 @@ impl HttpTransport for ScriptedTransport {
     }
   }
 
-  effect fn writeSomeRaw(self: &mut Self, input: &[u8], deadline: Option<Instant>) -> usize
+  effect fn writeSomeRaw(self: &mut Self, input: &[u8], deadline: Option<Mark>) -> usize
     ! TransportError | OutOfMemoryError
     ? &mut MonotonicClock | &mut Allocator | &mut Random {
     let attempted = run Effect.result(ByteDuplex.writeSome(input, move deadline))
@@ -102,7 +102,7 @@ impl HttpTransport for ScriptedTransport {
     }
   }
 
-  effect fn flush(self: &mut Self, deadline: Option<Instant>) -> ()
+  effect fn flush(self: &mut Self, deadline: Option<Mark>) -> ()
     ! TransportError | OutOfMemoryError
     ? &mut MonotonicClock | &mut Allocator | &mut Random {
     drop deadline
@@ -118,15 +118,15 @@ impl HttpTransport for ScriptedTransport {
 struct FixedClock {}
 
 impl MonotonicClock for FixedClock {
-  effect fn now(self: &mut Self) -> Instant {
-    return SystemClock.make(0, 0)
+  effect fn now(self: &mut Self) -> Mark {
+    return Mark.make(0, 0)
   }
 
   effect fn getResolution(self: &mut Self) -> u64 {
     return u64.toU64(1)
   }
 
-  effect fn waitUntil(self: &mut Self, when: Instant) -> () {
+  effect fn waitUntil(self: &mut Self, when: Mark) -> () {
     drop when
     return ()
   }
@@ -135,11 +135,11 @@ impl MonotonicClock for FixedClock {
     drop howLong
     return ()
   }
-  effect fn waitReady(self: &mut Self, watch: &mut [ReadyWatch], until: Option<Instant>) -> usize {
+  effect fn waitReady(self: &mut Self, watch: &mut [ReadyWatch], until: Option<Mark>) -> usize {
     if watch.length > 0 { Intrinsic.trap("this clock has no handles to watch") }
     match move until {
-      Option<Instant>.None => {}
-      Option<Instant>.Some {value: when} => {
+      Option<Mark>.None => {}
+      Option<Mark>.Some {value: when} => {
         drop when
       }
     }
@@ -229,13 +229,13 @@ effect fn program() -> i32
   let mut reads = List<MemoryReadEvent>.make()
   run List.append(
     &mut reads,
-    MemoryReadEvent.Data { readyAt: SystemClock.make(0, 0), bytes: move response }
+    MemoryReadEvent.Data { readyAt: Mark.make(0, 0), bytes: move response }
   )
   let mut writes = List<MemoryWriteEvent>.make()
   run List.append(
     &mut writes,
     MemoryWriteEvent {
-      readyAt: SystemClock.make(0, 0),
+      readyAt: Mark.make(0, 0),
       action: MemoryWriteAction.Accept { count: 4096 }
     },
   )
@@ -245,7 +245,7 @@ effect fn program() -> i32
     origin,
     Version.Http11,
     Limits.defaults(),
-    Option<Instant>.none(),
+    Option<Mark>.none(),
   )
   let result = run Client.withExchange(
     &mut connection,
@@ -464,7 +464,7 @@ request needs `Expect: 100-continue`.
 #### Field `deadline`
 
 ```silk
-pub deadline: Instant
+pub deadline: Mark
 ```
 
 The deadline on the `MonotonicClock`. The deadline of the exchange also applies.
@@ -484,7 +484,7 @@ The deadlines of one exchange. They are never restarted between steps.
 ### Field `deadline`
 
 ```silk
-pub deadline: Option<Instant>
+pub deadline: Option<Mark>
 ```
 
 The deadline of the whole exchange on the `MonotonicClock`, or `None` for no deadline.
@@ -1488,7 +1488,7 @@ Returns the HTTP and TLS settings. No default is added.
 ### Operation `acquire`
 
 ```silk
-effect<'env> fn acquire<'env>(client: Self, peer: Origin, deadline: Option<Instant>) -> A ! E | AcquisitionError ? AcquisitionRequirements | R | &mut AcquiredRouteContext<
+effect<'env> fn acquire<'env>(client: Self, peer: Origin, deadline: Option<Mark>) -> A ! E | AcquisitionError ? AcquisitionRequirements | R | &mut AcquiredRouteContext<
     P,
     A,
     E,
@@ -1619,7 +1619,7 @@ pub effect<'env> fn withRoute<
   client: C,
   route: Route<'configuration>,
   preparedTrust: Option<TrustSnapshot>,
-  deadline: Option<Instant>,
+  deadline: Option<Mark>,
   handler: H,
 ) -> A
 ! E | AcquisitionError | ProxyError | ExchangeError | Tls.ConnectionError | IdentityError | OutOfMemoryError
@@ -1650,7 +1650,7 @@ pub effect<'env> fn makeOwned<P: 'env, 'env>(
   origin: Origin,
   version: Version,
   limits: Limits,
-  overallDeadline: Option<Instant>,
+  overallDeadline: Option<Mark>,
 ) -> Connection<P>
 ! ExchangeError | OutOfMemoryError
 ? &mut Allocator
@@ -1670,7 +1670,7 @@ pub effect<'env> fn withOwned<P: 'env, A, E, ?R, H: ConnectionHandler<P, A, E ? 
   origin: Origin,
   version: Version,
   limits: Limits,
-  overallDeadline: Option<Instant>,
+  overallDeadline: Option<Mark>,
   handler: H,
 ) -> A
 ! E | ExchangeError | OutOfMemoryError
@@ -1693,7 +1693,7 @@ pub effect<'env> fn withConnected<'env, P, A, E, ?R, H: ConnectionHandler<Loan<'
   origin: Origin,
   version: Version,
   limits: Limits,
-  overallDeadline: Option<Instant>,
+  overallDeadline: Option<Mark>,
   handler: H,
 ) -> A
 ! E | ExchangeError | OutOfMemoryError
@@ -1853,7 +1853,7 @@ never reads past the end of the response.
 pub effect fn discardRemainingAtMost<'exchange, P>(
   exchange: &mut Exchange<'exchange, P>,
   maxWireBytes: u64,
-  deadline: Option<Instant>,
+  deadline: Option<Mark>,
 ) -> DiscardOutcome
 ! ExchangeError | OutOfMemoryError
 ? &mut MonotonicClock | &mut Allocator | &mut Random
@@ -1882,7 +1882,7 @@ Bad framing, a read error, the deadline, and the allocator still fail with their
 pub effect fn drainAndFinishAtMost<'exchange, P>(
   exchange: &mut Exchange<'exchange, P>,
   maxWireBytes: u64,
-  deadline: Instant,
+  deadline: Mark,
 ) -> DiscardOutcome
 ! ExchangeError | OutOfMemoryError
 ? &mut MonotonicClock | &mut Allocator | &mut Random
@@ -2082,7 +2082,7 @@ A second call returns `InvalidState`.
 ### Method `readSome`
 
 ```silk
-pub effect fn readSome(self: &mut Self, output: &mut [u8], requestedDeadline: Option<Instant>) -> ReadTransfer
+pub effect fn readSome(self: &mut Self, output: &mut [u8], requestedDeadline: Option<Mark>) -> ReadTransfer
   ! ExchangeError | OutOfMemoryError
   ? &mut MonotonicClock | &mut Allocator | &mut Random
   where
@@ -2096,7 +2096,7 @@ Reads bytes. It returns the bytes that came after the response head first.
 ### Method `writeSome`
 
 ```silk
-pub effect fn writeSome(self: &mut Self, input: &[u8], requestedDeadline: Option<Instant>) -> usize
+pub effect fn writeSome(self: &mut Self, input: &[u8], requestedDeadline: Option<Mark>) -> usize
   ! ExchangeError | OutOfMemoryError
   ? &mut MonotonicClock | &mut Allocator | &mut Random
   where

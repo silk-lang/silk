@@ -351,7 +351,7 @@ known how many bytes moved. Close the transport.
 ```silk
 unsafe effect fn readSomeRaw(
     output: &mut [u8],
-    deadline: Option<Instant>
+    deadline: Option<Mark>
   ) -> ReadTransfer ! ByteIoError ? &mut ByteDuplex | &mut MonotonicClock
 ```
 
@@ -364,7 +364,7 @@ The provider read. It puts bytes at the start of `output` and returns their coun
 ```silk
 unsafe effect fn writeSomeRaw(
     input: &[u8],
-    deadline: Option<Instant>
+    deadline: Option<Mark>
   ) -> usize ! ByteIoError ? &mut ByteDuplex | &mut MonotonicClock
 ```
 
@@ -377,7 +377,7 @@ The provider write. It sends bytes from the start of `input` and returns their c
 ```silk
 unsafe effect fn writeSomeVectoredRaw(
     inputs: &[&[u8]],
-    deadline: Option<Instant>
+    deadline: Option<Mark>
   ) -> usize ! ByteIoError ? &mut ByteDuplex | &mut MonotonicClock
 ```
 
@@ -396,7 +396,7 @@ provider with no such operation writes [`ByteDuplex.firstNonEmpty`](#ByteDuplex.
 
 ```silk
 unsafe effect fn flushRaw(
-    deadline: Option<Instant>
+    deadline: Option<Mark>
   ) -> () ! ByteIoError ? &mut ByteDuplex | &mut MonotonicClock
 ```
 
@@ -408,7 +408,7 @@ The provider flush. It sends any bytes that the provider holds in a buffer.
 
 ```silk
 unsafe effect fn shutdownWriteRaw(
-    deadline: Option<Instant>
+    deadline: Option<Mark>
   ) -> () ! ByteIoError ? &mut ByteDuplex | &mut MonotonicClock
 ```
 
@@ -441,7 +441,7 @@ impl ByteDuplex
 ```silk
 pub effect fn readSome(
     output: &mut [u8],
-    deadline: Option<Instant>
+    deadline: Option<Mark>
   ) -> ReadTransfer ! ByteIoError ? &mut ByteDuplex | &mut MonotonicClock
 ```
 
@@ -467,7 +467,7 @@ absolute time on the active `MonotonicClock`. `Option.none()` means no time limi
 ```silk
 pub effect fn writeSome(
     input: &[u8],
-    deadline: Option<Instant>
+    deadline: Option<Mark>
   ) -> usize ! ByteIoError ? &mut ByteDuplex | &mut MonotonicClock
 ```
 
@@ -493,7 +493,7 @@ active `MonotonicClock`. `Option.none()` means no time limit.
 ```silk
 pub effect fn writeSomeVectored(
     inputs: &[&[u8]],
-    deadline: Option<Instant>
+    deadline: Option<Mark>
   ) -> usize ! ByteIoError ? &mut ByteDuplex | &mut MonotonicClock
 ```
 
@@ -540,7 +540,7 @@ the first part is a valid vectored write.
 
 ```silk
 pub effect fn flush(
-    deadline: Option<Instant>
+    deadline: Option<Mark>
   ) -> () ! ByteIoError ? &mut ByteDuplex | &mut MonotonicClock
 ```
 
@@ -556,7 +556,7 @@ Sends any bytes that the provider holds in a buffer.
 
 ```silk
 pub effect fn shutdownWrite(
-    deadline: Option<Instant>
+    deadline: Option<Mark>
   ) -> () ! ByteIoError ? &mut ByteDuplex | &mut MonotonicClock
 ```
 

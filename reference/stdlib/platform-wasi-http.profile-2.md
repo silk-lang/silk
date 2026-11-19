@@ -346,7 +346,7 @@ Converts a WASI HTTP error ordinal, retaining it as the provider cause.
 ## `deadline`
 
 ```silk
-pub fn deadline(value: &Option<Instant>) -> Option<Instant>
+pub fn deadline(value: &Option<Mark>) -> Option<Mark>
 ```
 
 Copies an optional deadline without transferring the caller's option.
@@ -366,7 +366,7 @@ Converts stream failures to HTTP failure kinds.
 ## `wait`
 
 ```silk
-pub unsafe effect fn wait(pollable: u32, until: &Option<Instant>) -> () ! HttpError ? &mut MonotonicClock
+pub unsafe effect fn wait(pollable: u32, until: &Option<Mark>) -> () ! HttpError ? &mut MonotonicClock
 ```
 
 Waits on an owned pollable and releases it, failing if the supplied clock reaches the
@@ -377,7 +377,7 @@ deadline.
 ## `readBody`
 
 ```silk
-pub unsafe effect fn readBody(body: Resource, maximum: usize, until: &Option<Instant>) -> Bytes
+pub unsafe effect fn readBody(body: Resource, maximum: usize, until: &Option<Mark>) -> Bytes
     ! HttpError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock
 ```
 
@@ -389,7 +389,7 @@ bytes. The body must be an incoming-body handle with no existing stream child.
 ## `writeBody`
 
 ```silk
-pub unsafe effect fn writeBody(body: Resource, bytes: &[u8], until: &Option<Instant>) -> ()
+pub unsafe effect fn writeBody(body: Resource, bytes: &[u8], until: &Option<Mark>) -> ()
     ! HttpError ? &mut MonotonicClock
 ```
 

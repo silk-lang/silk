@@ -48,7 +48,7 @@ import silk.net.address {
 import silk.core.option { Option }
 import silk.core.result { Result }
 import silk.net.resolver { FamilySelection, ResolveRequest, ResolvedEndpoints, Resolver, ResolverError }
-import silk.system.system_clock { Instant, SystemClock }
+import silk.time.mark { Mark }
 import silk.num.u64
 
 struct FixedResolver {}
@@ -85,15 +85,15 @@ impl Resolver for FixedResolver {
 struct FixedMonotonic {}
 
 impl MonotonicClock for FixedMonotonic {
-  effect fn now(self: &mut Self) -> Instant {
-    return SystemClock.make(0, 0)
+  effect fn now(self: &mut Self) -> Mark {
+    return Mark.make(0, 0)
   }
 
   effect fn getResolution(self: &mut Self) -> u64 {
     return u64.toU64(1)
   }
 
-  effect fn waitUntil(self: &mut Self, when: Instant) -> () {
+  effect fn waitUntil(self: &mut Self, when: Mark) -> () {
     drop when
     return ()
   }
@@ -102,11 +102,11 @@ impl MonotonicClock for FixedMonotonic {
     drop howLong
     return ()
   }
-  effect fn waitReady(self: &mut Self, watch: &mut [ReadyWatch], until: Option<Instant>) -> usize {
+  effect fn waitReady(self: &mut Self, watch: &mut [ReadyWatch], until: Option<Mark>) -> usize {
     if watch.length > 0 { Intrinsic.trap("this clock has no handles to watch") }
     match move until {
-      Option<Instant>.None => {}
-      Option<Instant>.Some {value: when} => {
+      Option<Mark>.None => {}
+      Option<Mark>.Some {value: when} => {
         drop when
       }
     }
@@ -127,7 +127,7 @@ effect fn program() -> i32
     Port.fromU16(443),
     FamilySelection.V4,
     4,
-    Option<Instant>.none(),
+    Option<Mark>.none(),
   ) {
     Result<ResolveRequest, ResolverError>.Success { value } => move value
     Result<ResolveRequest, ResolverError>.Failure {..} => {
@@ -686,7 +686,7 @@ pub fn make(
     port: Port,
     family: FamilySelection,
     maxResults: usize,
-    deadline: Option<Instant>,
+    deadline: Option<Mark>,
   ) -> Result<ResolveRequest, ResolverError>
 ```
 
@@ -752,7 +752,7 @@ Returns `true` if the request has a deadline.
 ### Method `deadline`
 
 ```silk
-pub fn deadline(self: &Self) -> Option<Instant>
+pub fn deadline(self: &Self) -> Option<Mark>
 ```
 
 Returns the deadline, if there is one. A provider that cannot keep it returns

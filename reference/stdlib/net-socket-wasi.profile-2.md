@@ -176,7 +176,7 @@ Borrows the network handle for unsafe WASI operations. Ownership stays with this
 ### Method `connect`
 
 ```silk
-pub effect fn connect(self: &Self, address: &SocketAddress, deadline: Option<Instant>) -> Connection
+pub effect fn connect(self: &Self, address: &SocketAddress, deadline: Option<Mark>) -> Connection
       ! SocketError ? &mut MonotonicClock
 ```
 
@@ -187,7 +187,7 @@ Opens a TCP connection to `address`, or fails with the host error or timeout cod
 ### Method `listen`
 
 ```silk
-pub effect fn listen(self: &Self, address: &SocketAddress, deadline: Option<Instant>) -> Listener
+pub effect fn listen(self: &Self, address: &SocketAddress, deadline: Option<Mark>) -> Listener
       ! SocketError ? &mut MonotonicClock
 ```
 
@@ -243,7 +243,7 @@ Returns the bound local address, including the port the host chose for a port-ze
 ### Method `accept`
 
 ```silk
-pub effect fn accept(self: &mut Self, deadline: Option<Instant>) -> Connection
+pub effect fn accept(self: &mut Self, deadline: Option<Mark>) -> Connection
       ! SocketError ? &mut MonotonicClock
 ```
 
@@ -327,7 +327,7 @@ impl ByteDuplex for Connection
 ### Operation `readSomeRaw`
 
 ```silk
-unsafe effect fn readSomeRaw(self: &mut Self, output: &mut [u8], deadline: Option<Instant>) -> ReadTransfer
+unsafe effect fn readSomeRaw(self: &mut Self, output: &mut [u8], deadline: Option<Mark>) -> ReadTransfer
       ! ByteIoError ? &mut MonotonicClock
 ```
 
@@ -336,7 +336,7 @@ unsafe effect fn readSomeRaw(self: &mut Self, output: &mut [u8], deadline: Optio
 ### Operation `writeSomeRaw`
 
 ```silk
-unsafe effect fn writeSomeRaw(self: &mut Self, input: &[u8], deadline: Option<Instant>) -> usize
+unsafe effect fn writeSomeRaw(self: &mut Self, input: &[u8], deadline: Option<Mark>) -> usize
       ! ByteIoError ? &mut MonotonicClock
 ```
 
@@ -345,7 +345,7 @@ unsafe effect fn writeSomeRaw(self: &mut Self, input: &[u8], deadline: Option<In
 ### Operation `writeSomeVectoredRaw`
 
 ```silk
-unsafe effect fn writeSomeVectoredRaw(self: &mut Self, inputs: &[&[u8]], deadline: Option<Instant>) -> usize
+unsafe effect fn writeSomeVectoredRaw(self: &mut Self, inputs: &[&[u8]], deadline: Option<Mark>) -> usize
       ! ByteIoError ? &mut MonotonicClock
 ```
 
@@ -354,7 +354,7 @@ unsafe effect fn writeSomeVectoredRaw(self: &mut Self, inputs: &[&[u8]], deadlin
 ### Operation `flushRaw`
 
 ```silk
-unsafe effect fn flushRaw(self: &mut Self, deadline: Option<Instant>) -> ()
+unsafe effect fn flushRaw(self: &mut Self, deadline: Option<Mark>) -> ()
       ! ByteIoError ? &mut MonotonicClock
 ```
 
@@ -363,7 +363,7 @@ unsafe effect fn flushRaw(self: &mut Self, deadline: Option<Instant>) -> ()
 ### Operation `shutdownWriteRaw`
 
 ```silk
-unsafe effect fn shutdownWriteRaw(self: &mut Self, deadline: Option<Instant>) -> ()
+unsafe effect fn shutdownWriteRaw(self: &mut Self, deadline: Option<Mark>) -> ()
       ! ByteIoError ? &mut MonotonicClock
 ```
 
