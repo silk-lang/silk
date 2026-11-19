@@ -1088,6 +1088,24 @@ pub effect fn execConfined(
 
 Executes a declared program through a declared sandbox launcher with only keyed reads.
 
+<a id="Make.impl.execShown"></a>
+
+### Method `execShown`
+
+```silk
+pub effect fn execShown(
+    self: &mut Self,
+    program: &Deferred<Path>,
+    arguments: &[string],
+  ) -> bool
+    ! StepFailure
+    ? &mut Allocator
+```
+
+Executes a declared program as [`Make.exec`](#Make.impl.exec) does, with the program's standard error on this
+process's own, so what it writes, such as live progress, shows while it runs. Answers whether
+it exited with status 0. Where children cannot share the stream, the errors show once it ends.
+
 <a id="Make.impl.shouldCompile"></a>
 
 ### Method `shouldCompile`
