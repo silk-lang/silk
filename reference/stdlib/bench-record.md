@@ -76,7 +76,7 @@ pub fn main() -> i32 {
 
 Import as `Report` with `import silk.bench.record { Report }`.
 
-Public declarations: 18.
+Public declarations: 19.
 
 <a id="PROTOCOL"></a>
 
@@ -529,6 +529,55 @@ implementations with different checks for one name did not do the same work.
 impl Schema for Reading
 ```
 
+<a id="Count"></a>
+
+## `Count`
+
+```silk
+pub struct Count
+```
+
+What an instrument counted over one whole run of an implementation's program, such as the
+instructions `--instrument callgrind` reports.
+
+<a id="Count.implementation"></a>
+
+### Field `implementation`
+
+```silk
+pub implementation: String
+```
+
+The name of the implementation.
+
+<a id="Count.unit"></a>
+
+### Field `unit`
+
+```silk
+pub unit: String
+```
+
+What was counted, such as `instructions`.
+
+<a id="Count.value"></a>
+
+### Field `value`
+
+```silk
+pub value: f64
+```
+
+The count for one run of the program, from start to exit.
+
+<a id="Count.impl.Schema"></a>
+
+## Implementation `Schema for Count`
+
+```silk
+impl Schema for Count
+```
+
 <a id="Measured"></a>
 
 ## `Measured`
@@ -579,6 +628,17 @@ pub readings: List<Reading>
 
 Every result line the runs printed, in the order they were read. Empty when no
 implementation reports result lines.
+
+<a id="Measured.counts"></a>
+
+### Field `counts`
+
+```silk
+pub counts: List<Count>
+```
+
+What an instrument counted for each implementation, one run each. Empty when the run named
+no instrument.
 
 <a id="Measured.impl.Schema"></a>
 

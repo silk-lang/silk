@@ -45,6 +45,25 @@ The owner type of the report functions. It has no fields and is never constructe
 impl Reports
 ```
 
+<a id="Reports.impl.compared"></a>
+
+### Associated function `compared`
+
+```silk
+pub effect fn compared(result: &mut RunResult, earlier: RunResult, label: string) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
+Adds the implementations of the earlier run `earlier` to `result` under the name `label`,
+with their samples for the benchmarks both runs have, and makes the earlier reference the
+reference. An earlier run with one implementation adds it as `label`; one with several
+adds each as `<label>:<name>`. Returns `false`, and adds nothing, if `result` already has
+an implementation named `label`.
+
+#### Errors
+`OutOfMemoryError` if the `Allocator` cannot supply the names.
+
 <a id="Reports.impl.make"></a>
 
 ### Associated function `make`

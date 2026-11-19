@@ -1,0 +1,473 @@
+//! The harness of a Silk program whose benchmarks a benchmark task drives: it answers the
+//! driven protocol and times each run.
+//!
+//! # When to use
+//! Use a [`Harness`] in a program that holds several pieces of work to time, when the samples
+//! of two implementations should be taken in turns from processes that stay alive. Declare the
+//! program in a suite with `silk.bench.suite.Implementation.driven`. A program that does one
+//! piece of work from start to exit needs no harness: a command suite times it as a process.
+//!
+//! # Details
+//! A program gives the harness the names of its benchmarks and then loops on
+//! [`Harness.next`]. Each time it returns `true`, the program runs the body of
+//! [`Harness.name`] exactly [`Harness.iterations`] times. The harness times from the return of
+//! `next` to the next call, and answers with a result line in `ns/op`.
+//!
+//! Started by a benchmark task, the harness follows the commands of the task, which decides
+//! how many iterations a sample takes and takes the samples of the implementations in turns.
+//! The dialogue is the one `silk.bench.transport` describes, over the `Transport` service.
+//!
+//! Started by hand, the same program is a benchmark of its own: for each name the harness
+//! finds an iteration count that takes about 50 ms, or what [`Harness.sample`] sets, then
+//! takes 10 samples, and prints them as result lines, which a suite reads with `Implementation.resultLines` and tools such as
+//! `benchstat` read too.
+//!
+//! [`Harness.reset`] starts the timing again after setup that should not count, and
+//! [`Harness.stop`] and [`Harness.start`] leave a stretch out. [`Harness.check`] reports what
+//! the run computed, so the task can tell when two implementations did different work, and
+//! [`Harness.value`] adds a value in another unit to the result line.
+//!
+//! # Gotchas
+//! A body whose result is never used may be removed by the compiler. Use the result: add it to
+//! a total and give the total to [`Harness.check`].
+//!
+//! # Examples
+//! ```silk,ignore
+//! import silk.bench.harness { Harness }
+//! import silk.bench.transport { StreamTransport, Transport, TransportError }
+//! import silk.core.effect { Effect }
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.system.host_input { HostInput }
+//! import silk.system.monotonic_clock { MonotonicClock }
+//! import silk.system.monotonic_clock_native { OsMonotonicClock }
+//!
+//! effect fn benchmarks() -> ()
+//!   ! TransportError | OutOfMemoryError
+//!   ? &mut Transport | &mut Allocator | &mut MonotonicClock | &mut HostInput {
+//!   let mut harness = run Harness.open(&["Sum/n=1000", "Squares/n=1000"])
+//!   while run harness.next() {
+//!     let mut left = harness.iterations()
+//!     let square = harness.name() == "Squares/n=1000"
+//!     let mut total: u64 = 0
+//!     while left > 0 {
+//!       // One iteration: the work whose time is reported.
+//!       total = 0
+//!       let mut at: u64 = 0
+//!       while at < 1000 {
+//!         if square {
+//!           total = total + at * at
+//!         } else {
+//!           total = total + at
+//!         }
+//!         at = at + 1
+//!       }
+//!       left = left - 1
+//!     }
+//!
+//!     // The same for any number of iterations, so two implementations can be compared.
+//!     run harness.checkNumber(total)
+//!   }
+//! }
+//!
+//! effect fn failed(error: TransportError | OutOfMemoryError) -> i32 {
+//!   drop error
+//!   return 1
+//! }
+//!
+//! effect fn finished() -> i32
+//!   ! TransportError | OutOfMemoryError
+//!   ? &mut Transport | &mut Allocator | &mut MonotonicClock | &mut HostInput {
+//!   run benchmarks()
+//!   return 0
+//! }
+//!
+//! pub effect fn main() -> i32
+//!   ? &mut HostInput {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let mut transport = StreamTransport.standard()
+//!   let mut clock = OsMonotonicClock.make()
+//!   return run Effect.catchAll(finished(), failed)
+//!     |> Effect.provideMut<Transport>(&mut transport)
+//!     |> Effect.provideMut<MonotonicClock>(&mut clock)
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//! }
+//! ```
+//!
+//! @category Benchmarks
+
+import silk.bench.lines { Lines }
+import silk.bench.record { Metric }
+import silk.bench.transport { Transport, TransportError }
+import silk.bench.units { Units }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f64
+import silk.num.i64
+import silk.num.u64
+import silk.system.host_input { HostInput, HostInputError }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.system_clock { Instant, SystemClock }
+import silk.text.format { Format as Text, ParseError }
+import silk.text.string { String }
+
+// How long a sample should take when nobody drives the harness, in nanoseconds, unless the
+// program sets it.
+const TARGET: u64 = 50000000
+
+// How many samples of each benchmark the harness takes when nobody drives it.
+const SAMPLES: u64 = 10
+
+/// The benchmarks of a program, and the run that is in progress.
+pub struct Harness {
+  names: List<String>,
+  // The names as they go over the wire: `Benchmark`, then the name with `_` for each space.
+  wire: List<String>,
+  driven: bool,
+  active: bool,
+  current: usize,
+  count: u64,
+  timing: bool,
+  began: Instant,
+  spent: u64,
+  extras: List<Metric>,
+  mark: Option<String>,
+  // Why the run in progress failed, if it did: the answer is an `error:` line.
+  failure: Option<String>,
+  // Without a driver: whether the count of `current` is still being found, and how many
+  // samples of it are taken.
+  calibrating: bool,
+  sampled: u64,
+  target: u64,
+}
+
+impl Harness {
+  /// Returns a harness for the benchmarks `names`. With `driven`, it follows the commands that
+  /// arrive over the `Transport`; without, it runs every benchmark itself and sends the result
+  /// lines.
+  ///
+  /// # Errors
+  /// `OutOfMemoryError` if the `Allocator` cannot supply the names.
+  pub effect fn make(names: &[string], driven: bool) -> Harness
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut copies = List<String>.make()
+    let mut wire = List<String>.make()
+    let mut at: usize = 0
+    while at < names.length {
+      run copies.append(run String.copy(names[at]))
+      run wire.append(run Lines.named(names[at]))
+      at = at + 1
+    }
+    return Harness {
+      names: move copies,
+      wire: move wire,
+      driven: driven,
+      active: false,
+      current: 0,
+      count: 1,
+      timing: false,
+      began: SystemClock.make(0, 0),
+      spent: 0,
+      extras: List<Metric>.make(),
+      mark: Option<String>.None,
+      failure: Option<String>.None,
+      calibrating: true,
+      sampled: 0,
+      target: TARGET,
+    }
+  }
+
+  /// Returns a harness for the benchmarks `names` that is driven when a benchmark task started
+  /// the program, which the task says with the environment variable `BENCH_DRIVE`.
+  ///
+  /// # Errors
+  /// `OutOfMemoryError` if the `Allocator` cannot supply the names.
+  pub effect fn open(names: &[string]) -> Harness
+    ! OutOfMemoryError
+    ? &mut Allocator | &mut HostInput {
+    let asked = run Effect.result(HostInput.variableNamed("BENCH_DRIVE"))
+    let driven = match move asked {
+      Result<Option<Bytes>, HostInputError | OutOfMemoryError>.Success {
+        value
+      } => match move value {
+        Option<Bytes>.Some { value: text } => Bytes.asSlice(&text).length > 0
+        Option<Bytes>.None => false
+      }
+      Result<Option<Bytes>, HostInputError | OutOfMemoryError>.Failure { .. } => false
+    }
+    return run Harness.make(names, driven)
+  }
+
+  /// Finishes the run in progress, if there is one, and returns whether there is another run
+  /// to do. After `true`, run the body of [`Harness.name`] [`Harness.iterations`] times and
+  /// call `next` again.
+  ///
+  /// # Errors
+  /// - `TransportError` if a line cannot be carried.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply a line.
+  pub effect fn next(self: &mut Self) -> bool
+    ! TransportError | OutOfMemoryError
+    ? &mut Transport | &mut Allocator | &mut MonotonicClock {
+    if self.active {
+      run self.stop()
+      self.active = false
+      if self.driven {
+        run self.answer()
+        run Transport.send("done")
+      } else if self.failure.isSome() {
+        // A failed run ends its benchmark: there is no time to grow from.
+        run self.answer()
+        self.current = self.current + 1
+        self.calibrating = true
+        self.sampled = 0
+        self.count = 1
+      } else if self.calibrating {
+        if self.spent >= self.target || self.count >= 1000000000 {
+          self.calibrating = false
+        } else {
+          self.count = Harness.grown(self.count, self.spent, self.target)
+        }
+      } else {
+        run self.answer()
+        self.sampled = self.sampled + 1
+        if self.sampled == SAMPLES {
+          self.current = self.current + 1
+          self.calibrating = true
+          self.sampled = 0
+          self.count = 1
+        }
+      }
+    }
+    if !self.driven {
+      if self.current >= self.names.length() {
+        return false
+      }
+      run self.begin()
+      return true
+    }
+    while true {
+      let line = match move run Transport.receive() {
+        Option<String>.Some { value } => move value
+        Option<String>.None => {
+          return false
+        }
+      }
+      let command = String.trim(line.view())
+      if command == "quit" {
+        return false
+      }
+      if command == "list" {
+        let wire = self.wire.asSlice()
+        let mut at: usize = 0
+        while at < wire.length {
+          run Transport.send(wire[at].view())
+          at = at + 1
+        }
+        run Transport.send("done")
+      } else if String.startsWith(command, "run ") {
+        // `run <name> <iterations>`: a name holds no space.
+        let rest = String.slice(command, 4, String.byteLength(command) - 4)
+        let mut found = self.wire.length()
+        let mut count: u64 = 0
+        if let Option<usize>.Some { value: space } = String.findLast(rest, " ") {
+          let name = String.slice(rest, 0, space)
+          let wire = self.wire.asSlice()
+          let mut at: usize = 0
+          while at < wire.length {
+            if wire[at].view() == name {
+              found = at
+            }
+            at = at + 1
+          }
+          if let Result<u64, ParseError>.Success { value } = Text.u64Value(
+            String.slice(rest, space + 1, String.byteLength(rest) - space - 1),
+          ) {
+            count = value
+          }
+        }
+        if found < self.wire.length() && count > 0 {
+          self.current = found
+          self.count = count
+          run self.begin()
+          return true
+        }
+        run Transport.send("error: no such benchmark, or no iteration count")
+        run Transport.send("done")
+      } else if String.byteLength(command) > 0 {
+        run Transport.send("error: unknown command")
+        run Transport.send("done")
+      }
+    }
+    return false
+  }
+
+  /// Sets how long one sample should take when nobody drives the harness, in milliseconds. A
+  /// driven harness takes the iteration counts of its task and ignores this.
+  pub fn sample(self: &mut Self, milliseconds: u64) -> () {
+    self.target = milliseconds * 1000000
+  }
+
+  /// Returns the name of the benchmark to run, as it was given to the harness.
+  pub fn name(self: &Self) -> string {
+    return self.names.asSlice()[self.current].view()
+  }
+
+  /// Returns the position of the benchmark to run in the names the harness was given.
+  pub fn position(self: &Self) -> usize {
+    return self.current
+  }
+
+  /// Returns how many times to run the body.
+  pub fn iterations(self: &Self) -> u64 {
+    return self.count
+  }
+
+  /// Gives the harness the time of the run in nanoseconds, for a body that timed itself, and
+  /// stops the timing of the harness.
+  pub fn measured(self: &mut Self, nanoseconds: u64) -> () {
+    self.spent = nanoseconds
+    self.timing = false
+  }
+
+  /// Says that the run failed, with `text` as the reason on one line. The harness answers with
+  /// an `error:` line and no result line.
+  ///
+  /// # Errors
+  /// `OutOfMemoryError` if the `Allocator` cannot supply the copy.
+  pub effect fn failed(self: &mut Self, text: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.failure = Option<String>.Some { value: run String.copy(text) }
+  }
+
+  /// Starts the timing of the run again from zero, after setup that should not count.
+  pub effect fn reset(self: &mut Self) -> ()
+    ? &mut MonotonicClock {
+    self.spent = 0
+    self.began = run MonotonicClock.now()
+    self.timing = true
+  }
+
+  /// Stops the timing, until [`Harness.start`]. Stopping twice changes nothing.
+  pub effect fn stop(self: &mut Self) -> ()
+    ? &mut MonotonicClock {
+    if self.timing {
+      let now = run MonotonicClock.now()
+      let seconds = SystemClock.seconds(&now) - SystemClock.seconds(&self.began)
+      let nanoseconds = SystemClock.nanoseconds(&now) - SystemClock.nanoseconds(&self.began)
+      self.spent = self.spent + i64.toU64(seconds * 1000000000 + nanoseconds)
+      self.timing = false
+    }
+  }
+
+  /// Starts the timing again after [`Harness.stop`]. Starting twice changes nothing.
+  pub effect fn start(self: &mut Self) -> ()
+    ? &mut MonotonicClock {
+    if !self.timing {
+      self.began = run MonotonicClock.now()
+      self.timing = true
+    }
+  }
+
+  /// Reports `text` as what the run computed, such as a checksum. A benchmark task does not
+  /// compare implementations whose checks differ.
+  ///
+  /// # Errors
+  /// `OutOfMemoryError` if the `Allocator` cannot supply the copy.
+  pub effect fn check(self: &mut Self, text: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.mark = Option<String>.Some { value: run String.copy(text) }
+  }
+
+  /// Reports `number` as what the run computed. See [`Harness.check`].
+  ///
+  /// # Errors
+  /// `OutOfMemoryError` if the `Allocator` cannot supply the text.
+  pub effect fn checkNumber(self: &mut Self, number: u64) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut text = String.make()
+    run Units.appendWhole(&mut text, number)
+    self.mark = Option<String>.Some { value: move text }
+  }
+
+  /// Adds `amount` in `unit` to the result line of the run, such as 1024 `B/op`. A unit holds
+  /// no space.
+  ///
+  /// # Errors
+  /// `OutOfMemoryError` if the `Allocator` cannot supply the copy.
+  pub effect fn value(self: &mut Self, unit: string, amount: f64) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run self.extras.append(Metric { unit: run String.copy(unit), value: amount })
+  }
+
+  /// Returns the iteration count to try after `iterations` took `elapsed` nanoseconds, when a
+  /// sample should take `target`: enough to reach the target with a fifth to spare, at least
+  /// twice and at most a hundred times as many.
+  pub fn grown(iterations: u64, elapsed: u64, target: u64) -> u64 {
+    let mut factor = 100.0
+    if elapsed > 0 {
+      factor = u64.toF64(target) / u64.toF64(elapsed) * 1.2
+    }
+    if factor < 2.0 {
+      factor = 2.0
+    }
+    if factor > 100.0 {
+      factor = 100.0
+    }
+    let next = f64.toU64(f64.ceil(u64.toF64(iterations) * factor))
+    if next > 1000000000 {
+      return 1000000000
+    }
+    return next
+  }
+
+  effect fn begin(self: &mut Self) -> ()
+    ? &mut MonotonicClock {
+    self.extras = List<Metric>.make()
+    self.mark = Option<String>.None
+    self.failure = Option<String>.None
+    self.active = true
+    self.spent = 0
+    self.timing = true
+    self.began = run MonotonicClock.now()
+  }
+
+  // Sends the check and the result line of the run that just ended.
+  effect fn answer(self: &mut Self) -> ()
+    ! TransportError | OutOfMemoryError
+    ? &mut Transport | &mut Allocator {
+    if let Option<String>.Some { value: reason } = &self.failure {
+      let mut refused = run String.copy("error: ")
+      run refused.append(reason.view())
+      return run Transport.send(refused.view())
+    }
+    if let Option<String>.Some { value } = &self.mark {
+      let mut said = run String.copy("check: ")
+      run said.append(value.view())
+      run Transport.send(said.view())
+    }
+    let mut line = run String.copy(self.wire.asSlice()[self.current].view())
+    run line.append(" ")
+    run Units.appendWhole(&mut line, self.count)
+    run line.append(" ")
+    run Units.appendFixed(&mut line, u64.toF64(self.spent) / u64.toF64(self.count), 2)
+    run line.append(" ns/op")
+    let extras = self.extras.asSlice()
+    let mut at: usize = 0
+    while at < extras.length {
+      run line.append(" ")
+      run Units.appendFixed(&mut line, extras[at].value, 2)
+      run line.append(" ")
+      run line.append(extras[at].unit.view())
+      at = at + 1
+    }
+    return run Transport.send(line.view())
+  }
+}
