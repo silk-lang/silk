@@ -453,6 +453,92 @@ pub fn daysUntil(self: Self, other: PlainDate) -> i64
 
 Returns the number of days from this date to `other`. It is negative when `other` is earlier.
 
+<a id="PlainDate.impl.checkedAddPeriod"></a>
+
+### Method `checkedAddPeriod`
+
+```silk
+pub fn checkedAddPeriod(self: Self, period: Period, overflow: Overflow) -> Option<PlainDate>
+```
+
+Returns the date that `period` leads to from this date, or `None` when it is outside the
+range, or when `overflow` is `Reject` and the day does not exist in the month reached.
+
+#### Details
+
+The years and months are added first. If the month reached has no such day, as for one
+month after January 31, `Overflow.Constrain` uses the last day of that month. Then the
+weeks and days are added, with the whole days of the time part of the period; the rest of
+the time part is dropped. This is the rule of ECMAScript Temporal.
+
+#### Gotchas
+
+The order matters, so adding and then subtracting the same period does not always return
+the first date: January 31 plus one month is the end of February, and one month before
+that is January 28 or 29.
+
+<a id="PlainDate.impl.addPeriod"></a>
+
+### Method `addPeriod`
+
+```silk
+pub fn addPeriod(self: Self, period: Period) -> PlainDate
+```
+
+Returns the date that `period` leads to from this date, with a day that does not exist in
+the month reached replaced by the last day of that month.
+
+#### Details
+
+The rule is the one of [`PlainDate.checkedAddPeriod`](#PlainDate.impl.checkedAddPeriod) with `Overflow.Constrain`. To go
+back, add `period.negate()`.
+
+#### Gotchas
+
+A result outside the range traps. [`PlainDate.checkedAddPeriod`](#PlainDate.impl.checkedAddPeriod) returns `None` instead.
+
+<a id="PlainDate.impl.checkedAddParts"></a>
+
+### Method `checkedAddParts`
+
+```silk
+pub fn checkedAddParts(self: Self, years: i64, months: i64, days: i64, overflow: Overflow) -> Option<PlainDate>
+```
+
+Returns the date `years` years and `months` months from this date, and then `days` days
+from there, or `None` when it is outside the range, or when `overflow` is `Reject` and the
+day does not exist in the month reached.
+
+#### Details
+
+It is [`PlainDate.checkedAddPeriod`](#PlainDate.impl.checkedAddPeriod) for counts that can have different signs, such as one
+month later and one day earlier.
+
+<a id="PlainDate.impl.periodUntil"></a>
+
+### Method `periodUntil`
+
+```silk
+pub fn periodUntil(self: Self, other: PlainDate, largest: DateUnit) -> Period
+```
+
+Returns the calendar span from this date to `other`, counted in `largest` units first. It
+is negative when `other` is earlier, and its time part is empty.
+
+#### Details
+
+With `DateUnit.Year` or `DateUnit.Month`, the result has the most whole months that can be
+added to this date without passing `other`, and then the days that are left. With
+`DateUnit.Week`, it has whole weeks and days, and with `DateUnit.Day`, only days. Adding
+the result to this date with [`PlainDate.addPeriod`](#PlainDate.impl.addPeriod) gives `other`. This is the rule of
+ECMAScript Temporal.
+
+#### Gotchas
+
+The span from `other` back to this date is not always the negated result. From
+2023-01-29 to 2023-03-01 is 1 month and 1 day, and from 2023-03-01 back to 2023-01-29 is 1
+month and 3 days.
+
 <a id="PlainDate.impl.parse"></a>
 
 ### Associated function `parse`
