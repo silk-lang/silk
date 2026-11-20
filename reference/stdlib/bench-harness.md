@@ -43,6 +43,65 @@ import silk.bench.harness { Harness }
 import silk.bench.transport { StreamTransport, Transport, TransportError }
 import silk.core.effect { Effect }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.host_input { HostInput }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+
+effect fn benchmarks() -> ()
+  ! TransportError | OutOfMemoryError
+  ? &mut Transport | &mut Allocator | &mut MonotonicClock | &mut HostInput {
+  let mut harness = run Harness.open(&["Sum/n=1000", "Squares/n=1000"])
+  while run harness.next() {
+    let mut left = harness.iterations()
+    let square = harness.name() == "Squares/n=1000"
+    let mut total: u64 = 0
+    while left > 0 {
+      // One iteration: the work whose time is reported. The compiler cannot know the
+      // length, so it runs the loop every time.
+      let length: u64 = 1000
+      Harness.keep<u64>(&length)
+      total = 0
+      let mut at: u64 = 0
+      while at < length {
+        if square {
+          total = total + at * at
+        } else {
+          total = total + at
+        }
+        at = at + 1
+      }
+      Harness.keep<u64>(&total)
+      left = left - 1
+    }
+
+    // The same for any number of iterations, so two implementations can be compared.
+    run harness.checkNumber(total)
+  }
+}
+
+effect fn failed(error: TransportError | OutOfMemoryError) -> i32 {
+  drop error
+  return 1
+}
+
+effect fn finished() -> i32
+  ! TransportError | OutOfMemoryError
+  ? &mut Transport | &mut Allocator | &mut MonotonicClock | &mut HostInput {
+  run benchmarks()
+  return 0
+}
+
+pub effect fn main() -> i32
+  ? &mut HostInput {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut transport = StreamTransport.standard()
+  let mut clock = OsMonotonicClock.make()
+  return run Effect.catchAll(finished(), failed)
+    |> Effect.provideMut<Transport>(&mut transport)
+    |> Effect.provideMut<MonotonicClock>(&mut clock)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+```
 
 Import as `Harness` with `import silk.bench.harness { Harness }`.
 
@@ -293,5 +352,7 @@ Returns the iteration count to try after `iterations` took `elapsed` nanoseconds
 sample should take `target`: enough to reach the target with a fifth to spare, at least
 twice and at most a hundred times as many.
 
+
+Category: Benchmarks.
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`, `wasm64-unknown-unknown`.
