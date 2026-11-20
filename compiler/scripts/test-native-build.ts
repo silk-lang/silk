@@ -421,6 +421,34 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   assert.match(customRequest, /\boptimization = "speed"/)
   assert.match(customRequest, /\bdebug = false/)
   assert.equal(yield* fs.exists(join(aliased, 'build/requests/.pending-plan.json')), false)
+  // `silk check` checks the compilation a plan published for its target: here the plan selects a
+  // runtime the manifest lists but does not default to, which only the published request names.
+  const runtimes = join(directory, 'planned-runtime')
+  yield* fs.makeDirectory(join(runtimes, 'src'), { recursive: true })
+  yield* fs.writeFileString(join(runtimes, 'silk.toml'), [
+    '[package]', 'name = "planned"', 'version = "0.1.0"', 'silk-version = "0.0.0"', '',
+    '[unstable.composition]',
+    'runtimes = [{ name = "hosted", module = "silk/platform/native/start" }, { name = "standalone", module = "silk/platform/wasm/start" }]',
+    'defaults = ["hosted"]',
+    'components = [{ capability = "execution-storage", bindings = [',
+    ...['create', 'acquire', 'release', 'destroy'].map((operation) =>
+      `  { operation = "${operation}", module = "silk/concurrency/execution_storage", declaration = "silk_execution_storage_${operation}" },`),
+    '] }]', '',
+  ].join('\n'))
+  yield* fs.writeFileString(join(runtimes, 'src/main.silk'), 'pub fn main() -> i32 {\n  return 7\n}\n')
+  yield* fs.copyFile(join(graphSources, 'runtime_task.silk'), join(runtimes, 'src/tasks.silk'))
+  const wasmTarget = ['--target', 'wasm32-unknown-unknown', '--stdlib', standardLibrary]
+  const unplanned = yield* invoke(silk, ['check', '--no-server', ...wasmTarget], runtimes, requestEnv, 300_000)
+  assert.equal(unplanned.status, 1, unplanned.stderr)
+  assert.match(unplanned.stderr, /runtime module silk\/platform\/native\/start does not support the target wasm32-unknown-unknown/)
+  const wasmPlan = yield* invoke(silk, ['plan', ...wasmTarget], runtimes, requestEnv, 300_000)
+  assert.equal(wasmPlan.status, 0, wasmPlan.stderr)
+  const planned = yield* invoke(silk, ['check', '--no-server', ...wasmTarget], runtimes, requestEnv, 300_000)
+  assert.equal(planned.status, 0, planned.stderr)
+  assert.match(planned.stderr, /^Checking planned \(wasm32-unknown-unknown\)/m)
+  // The host check has no published request and keeps the manifest's default runtime.
+  const hosted = yield* invoke(silk, ['check', '--no-server', '--stdlib', standardLibrary], runtimes, requestEnv, 300_000)
+  assert.equal(hosted.status, 0, hosted.stderr)
   // A graph of a custom step, a compilation that embeds its output and a custom step that reads
   // the artifact: the task program runs the custom steps and the compiler runs the compilation.
   yield* fs.copyFile(join(graphSources, 'mixed_task.silk'), join(aliased, 'src/tasks.silk'))
