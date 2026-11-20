@@ -6,7 +6,7 @@ Package context and local input closure for resolving compilation definitions.
 
 Import as `Context` with `import silk.build.context as Context`.
 
-Public declarations: 9.
+Public declarations: 10.
 
 <a id="manifest"></a>
 
@@ -109,6 +109,20 @@ pub effect fn inputs(manifest: &Path) -> Inputs
 ```
 
 Collects local inputs without fetching remote pins. Unused malformed manifests remain data.
+
+<a id="portable"></a>
+
+## `portable`
+
+```silk
+pub effect fn portable(value: string) -> String
+  ! StepFailure
+  ? &mut Allocator
+```
+
+Spells an absolute path the portable way the build records it (`/C:/...` on Windows). A
+path a program wrote in the host's own spelling, such as `C:\tools` or `C:/tools` on
+Windows, is accepted too.
 
 <a id="standardLibrary"></a>
 
