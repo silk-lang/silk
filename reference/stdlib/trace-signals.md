@@ -279,10 +279,10 @@ impl SignalState
 ### Associated function `make`
 
 ```silk
-pub effect fn make(pages: usize, width: usize) -> Self ! OutOfMemoryError ? &mut Allocator
+pub effect fn make(pages: usize, width: usize, static metrics: bool) -> Self ! OutOfMemoryError ? &mut Allocator
 ```
 
-Preallocates log pages and 16 instruments with eight series and one overflow series each.
+Preallocates log pages. When metrics are enabled, reserves eight series and one overflow series for each of 16 instruments.
 
 <a id="SignalState.impl.appendLog"></a>
 
