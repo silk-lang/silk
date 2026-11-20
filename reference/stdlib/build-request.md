@@ -16,7 +16,7 @@ Every record rejects unknown fields. The `version` field identifies this wire fo
 
 Import as `Request` with `import silk.build.request { Request }`.
 
-Public declarations: 25.
+Public declarations: 26.
 
 <a id="Request"></a>
 
@@ -1144,6 +1144,16 @@ pub storage: Option<Storage>
 
 The execution-storage operations selected by the runtime.
 
+<a id="Composition.traceDirective"></a>
+
+### Field `traceDirective`
+
+```silk
+pub traceDirective: Option<TraceDirective>
+```
+
+The source functions used by the trace directive.
+
 <a id="Composition.impl.Schema"></a>
 
 ## Implementation `Schema for Composition`
@@ -1316,6 +1326,72 @@ impl Schema for Storage
 
 ```silk
 static fn spec() -> Spec<Storage>
+```
+
+<a id="TraceDirective"></a>
+
+## `TraceDirective`
+
+```silk
+pub struct TraceDirective
+```
+
+The four trace directive bindings.
+
+<a id="TraceDirective.enter"></a>
+
+### Field `enter`
+
+```silk
+pub enter: Selector
+```
+
+The declaration that implements enter.
+
+<a id="TraceDirective.exit"></a>
+
+### Field `exit`
+
+```silk
+pub exit: Selector
+```
+
+The declaration that implements exit.
+
+<a id="TraceDirective.failed"></a>
+
+### Field `failed`
+
+```silk
+pub failed: Selector
+```
+
+The declaration that implements failed.
+
+<a id="TraceDirective.cancelled"></a>
+
+### Field `cancelled`
+
+```silk
+pub cancelled: Selector
+```
+
+The declaration that implements cancelled.
+
+<a id="TraceDirective.impl.Schema"></a>
+
+## Implementation `Schema for TraceDirective`
+
+```silk
+impl Schema for TraceDirective
+```
+
+<a id="TraceDirective.impl.Schema.spec"></a>
+
+### Operation `spec`
+
+```silk
+static fn spec() -> Spec<TraceDirective>
 ```
 
 <a id="Native"></a>
