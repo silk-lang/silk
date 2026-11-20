@@ -6,7 +6,7 @@ Distributed tracing for code with or without an effect requirement.
 
 Import as `Trace` with `import silk.trace { Trace }`.
 
-Public declarations: 11.
+Public declarations: 13.
 
 <a id="Recorder"></a>
 
@@ -16,7 +16,7 @@ Public declarations: 11.
 pub type Recorder = Records.Recorder
 ```
 
-Owns the bounded storage for spans.
+Owns the bounded storage for spans, logs and metrics.
 
 <a id="Config"></a>
 
@@ -36,7 +36,27 @@ Configures resource identity, sampling and recording capacity.
 pub type Memory = Records.Memory
 ```
 
-Keeps collected spans in process.
+Keeps exported spans, log records and metric points in process.
+
+<a id="Console"></a>
+
+## `Console`
+
+```silk
+pub type Console = Sinks.Console
+```
+
+A sink that writes telemetry as JSON through the active writer.
+
+<a id="Otlp"></a>
+
+## `Otlp`
+
+```silk
+pub type Otlp<'url> = Sinks.Otlp<'url>
+```
+
+An OTLP/HTTP JSON collector destination.
 
 <a id="SpanContext"></a>
 
