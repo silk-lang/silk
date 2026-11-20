@@ -893,6 +893,8 @@ Each reached specialization of an ambient provider must finish without parking o
 The build checks transitive calls, including helpers reached after selecting static arguments.
 A default that reaches a suspension boundary reports SEM0269 at its service declaration.
 
+The ambient `Tracer` and `Meter` services apply these rules to spans and metrics.
+See [Tracing](tracing.md).
 
 ## AMB-003 — Providing and inheriting an ambient service
 
