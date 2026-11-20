@@ -162,6 +162,17 @@ pub fn read() -> Self
 
 Copies all six words from the installed execution. Returns an empty context outside a provider.
 
+<a id="TraceContext.impl.mayClose"></a>
+
+### Associated function `mayClose`
+
+```silk
+pub fn mayClose(previous: &Self, table: usize, owner: u64, span: u64, record: u64) -> bool
+```
+
+Checks that a span closes in its opening table and in reverse nesting order.
+Returns false when no table was installed or an inactive guard left its original scope.
+
 <a id="TraceContext.impl.install"></a>
 
 ### Associated function `install`

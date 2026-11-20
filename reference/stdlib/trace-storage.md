@@ -185,10 +185,11 @@ Appends to the worker's partial page or acquires a fresh one. No thread waits fo
 ### Method `take`
 
 ```silk
-pub fn take(self: &Self, hint: *mut u64) -> Option<T>
+pub unsafe fn take(self: &Self, hint: *mut u64) -> Option<T>
 ```
 
 Drains ready pages before sealing a partial page. The next consumer can continue a page.
+The caller supplies a live atomic word for the entire call. All concurrent accesses to it must be atomic.
 
 <a id="Pool"></a>
 

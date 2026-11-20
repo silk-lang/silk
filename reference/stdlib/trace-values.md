@@ -338,6 +338,16 @@ pub fn set<V>(self: &mut Self, static key: string<'static>, value: &V) -> ()
 
 Sets a typed value or increments the dropped count when storage is full.
 
+<a id="Attributes.impl.setCaptured"></a>
+
+### Method `setCaptured`
+
+```silk
+pub fn setCaptured(self: &mut Self, static key: string<'static>, value: Value) -> ()
+```
+
+Stores an already-captured value, without invoking user formatting.
+
 <a id="Attributes.impl.fields"></a>
 
 ### Method `fields`
