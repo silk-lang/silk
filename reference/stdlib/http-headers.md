@@ -100,7 +100,7 @@ pub fn main() -> i32 {
 
 Import as `Headers` with `import silk.http.headers { Headers }`.
 
-Public declarations: 6.
+Public declarations: 7.
 
 <a id="Limits"></a>
 
@@ -191,6 +191,16 @@ The maximum memory for a copy, in bytes, including its index. See
 ```silk
 impl Copy for Limits
 ```
+
+<a id="headerNamesEqual"></a>
+
+## `headerNamesEqual`
+
+```silk
+pub fn headerNamesEqual(left: string, right: string) -> bool
+```
+
+Compares HTTP field names using ASCII case folding.
 
 <a id="Headers"></a>
 

@@ -863,6 +863,16 @@ copy of both.
 `User-Agent`, `Accept`, `Authorization`, and `Host` replace the generated values.
 `Content-Length` and `Transfer-Encoding` are generated from the body and are rejected.
 
+<a id="Request.impl.setHeader"></a>
+
+### Method `setHeader`
+
+```silk
+pub effect fn setHeader(self: &mut Self, name: string, value: string) -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Replaces all fields with the given name by one field. Name comparison ignores case.
+
 <a id="Request.impl.bearer"></a>
 
 ### Method `bearer`
