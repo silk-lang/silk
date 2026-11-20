@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Usage: bash .github/scripts/measure-trace-off.sh COMPILER CLANG [probe|trace]
+# Usage: bash .github/scripts/measure-trace-off.sh COMPILER CLANG [probe|trace|metric]
 # Exit 1 if any pair differs. A compiler error stops the experiment immediately.
 set -euo pipefail
 compiler=${1:?pass the compiler to measure}
@@ -20,6 +20,10 @@ case $mode in
   trace)
     source="$fixture/manual.silk"
     erase=(-e '/\/\/ observation[[:space:]]*$/s/./ /g')
+    ;;
+  metric)
+    source="$fixture/meter-main.silk"
+    erase=(-e '/^import silk\.trace { Metric }/s/./ /g' -e '/^  Metric\./s/./ /g')
     ;;
   *) echo "unknown identity fixture: $3" >&2; exit 2 ;;
 esac

@@ -490,6 +490,46 @@ pub fn takeSpan(self: &Self) -> Option<Span>
 
 Takes one finished span. When a producer is writing a slot, draining skips that slot.
 
+<a id="Recorder.impl.Meter"></a>
+
+## Implementation `Meter for Recorder`
+
+```silk
+impl Meter for Recorder
+```
+
+<a id="Recorder.impl.Meter.add"></a>
+
+### Operation `add`
+
+```silk
+effect fn add<Args>(self: &Self, static name: string<'static>, amount: u64, args: &Args) -> ()
+```
+
+<a id="Recorder.impl.Meter.adjust"></a>
+
+### Operation `adjust`
+
+```silk
+effect fn adjust<Args>(self: &Self, static name: string<'static>, amount: i64, args: &Args) -> ()
+```
+
+<a id="Recorder.impl.Meter.gauge"></a>
+
+### Operation `gauge`
+
+```silk
+effect fn gauge<Args>(self: &Self, static name: string<'static>, value: f64, args: &Args) -> ()
+```
+
+<a id="Recorder.impl.Meter.record"></a>
+
+### Operation `record`
+
+```silk
+effect fn record<Args>(self: &Self, static name: string<'static>, value: f64, args: &Args) -> ()
+```
+
 <a id="Recorder.impl.Tracer"></a>
 
 ## Implementation `Tracer for Recorder`
