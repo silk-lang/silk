@@ -12,12 +12,16 @@ cp "$fixture"/{observation,entries,counter,configured,context_probe}.silk "$outp
 
 cat "$fixture/ownership.silk" >> "$output/stdlib/silk/concurrency/sync.silk"
 
-for main in main entries-main ownership-main scoped-main table-main same-member-main cancellation-main scheduler-main thread-main pool-main trace-context-main; do
+for main in main entries-main ownership-main scoped-main table-main same-member-main cancellation-main scheduler-main thread-main pool-main trace-context-main trace-suspend-migrate; do
   mkdir "$output/$main"
-  cp "$fixture/$main.silk" "$output/$main/main.silk"
+  if [[ $main == trace-suspend-migrate ]]; then
+    cp "$repository/corpus/native/$main/main.silk" "$output/$main/main.silk"
+  else
+    cp "$fixture/$main.silk" "$output/$main/main.silk"
+  fi
   "$compiler" build "$output/$main/main.silk" --stdlib "$output/stdlib" --clang "$clang" -o "$output/$main/native"
   "$output/$main/native"
-  if [[ $main == thread-main || $main == pool-main || $main == trace-context-main ]]; then
+  if [[ $main == thread-main || $main == pool-main || $main == trace-context-main || $main == trace-suspend-migrate ]]; then
     project="$output/$main"
     mkdir "$project/src"
     cp "$project/main.silk" "$project/src/main.silk"

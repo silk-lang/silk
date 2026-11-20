@@ -23,6 +23,7 @@ import backend.Mir {
 import backend.MirWalk
 import semantic.DeclarationId { DeclarationId }
 import semantic.Type { Type }
+import silk.mem.shared { Shared }
 import silk.mem.interned { Interned }
 import semantic.TypedBody { AggregateField, Expression, NodeId, NodeKind, ReceiverPass, TypedBody }
 import silk.collections.list { List }
@@ -50,6 +51,21 @@ fn localSlot<'a>(slot: MirWalk.Slot<'a>) -> bool {
   return true
 }
 
+effect fn note(callees: &mut List<InstanceKey>, key: &InstanceKey) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let listed = List<InstanceKey>.asSlice(&callees.*)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if run InstanceKey.sameInstance(&listed[at], key) {
+      return ()
+    }
+    at = at + usize.ONE
+  }
+  run List<InstanceKey>.append(&mut callees.*, InstanceKey.copy(key))
+  return ()
+}
+
 /// Collects the direct callees of a finite sequence of non-trapping local operations.
 /// Any indirect memory access or unknown operation prevents the proof.
 pub effect fn directCalls(function: &MirFunction, children: &mut List<InstanceKey>) -> bool
@@ -74,7 +90,7 @@ pub effect fn directCalls(function: &MirFunction, children: &mut List<InstanceKe
     let mut target = usize.ZERO
     while target < targets.length {
       if !run InstanceKey.sameInstance(&targets[target], &function.key) {
-        run List<InstanceKey>.append(&mut children.*, InstanceKey.copy(&targets[target]))
+        run note(&mut children.*, &targets[target])
       }
       target = target + usize.ONE
     }
@@ -106,7 +122,7 @@ pub effect fn directCalls(function: &MirFunction, children: &mut List<InstanceKe
           }
         }
         Statement.Drop { glue, .. } => {
-          run List<InstanceKey>.append(&mut children.*, InstanceKey.copy(&glue))
+          run note(&mut children.*, &glue)
         }
         _ => {
           return false
@@ -132,7 +148,7 @@ pub effect fn directCalls(function: &MirFunction, children: &mut List<InstanceKe
           return false
         }
         if let Callee.Instance { key } = &callee {
-          run List<InstanceKey>.append(&mut children.*, InstanceKey.copy(&key))
+          run note(&mut children.*, &key)
         } else {
           return false
         }
@@ -179,6 +195,15 @@ fn inertArgument(body: &TypedBody, node: NodeId, needs: &CleanupNeeds, borrowed:
       Expression.Boolean { .. } => true
       Expression.Unit => true
       Expression.EnumMember { .. } => true
+      Expression.Constant { .. } => true
+      Expression.ConcretePrefix { operand, .. } => match &TypedBody.nodeSlice(
+        body,
+      )[operand.index].kind {
+        NodeKind.Expression { form: Expression.Integer { .. }, .. } => true
+        NodeKind.Expression { form: Expression.Float { .. }, .. } => true
+        NodeKind.Expression { form: Expression.Boolean { .. }, .. } => true
+        _ => false
+      }
       Expression.Embedded { .. } => true
       Expression.Local { .. } => true
       Expression.Borrow { value, .. } => inertArgument(body, value, needs, true)
@@ -207,11 +232,105 @@ pub struct Site {
   pub local: usize
 }
 
-pub fn site(body: &TypedBody, call: NodeId, needs: &CleanupNeeds) -> Option<Site> {
+// Maps a directly discarded call to its statement. Uses of binding locals include the
+// local reads which construct a closure's captured environment.
+pub struct Sites {
+  statements: List<usize>,
+  reads: List<bool>
+}
+
+pub effect fn sites(typed: &Shared<TypedBody>) -> Sites
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let count = Shared<TypedBody>.with<usize>(
+    typed,
+    |body: &TypedBody| -> usize {
+      return TypedBody.nodeSlice(body).length
+    },
+  )
+  let locals = Shared<TypedBody>.with<usize>(
+    typed,
+    |body: &TypedBody| -> usize {
+      return TypedBody.localSlice(body).length
+    },
+  )
+  let mut statements = List<usize>.make()
+  let mut reads = List<bool>.make()
+  run List<usize>.appendRepeated(&mut statements, usize.MAX, count)
+  run List<bool>.appendRepeated(&mut reads, false, locals)
+  Shared<TypedBody>.with<()>(
+    typed,
+    |body: &TypedBody| -> () {
+      let nodes = TypedBody.nodeSlice(body)
+      let mut at = usize.ZERO
+      while at < nodes.length {
+        match &nodes[at].kind {
+          NodeKind.Expression { form: Expression.Local { local }, .. } => {
+            List<bool>.set(&mut reads, local.index, true)
+          }
+          NodeKind.Block { statements: children, .. } => {
+            let ids = List<NodeId>.asSlice(&children)
+            let mut i = usize.ZERO
+            while i < ids.length {
+              let statement = ids[i].index
+              let expression = match &nodes[statement].kind {
+                NodeKind.LocalBinding { initializer, .. } => initializer.index
+                NodeKind.Drop { value, .. } => value.index
+                _ => statement
+              }
+              let call = match &nodes[expression].kind {
+                NodeKind.Expression { form: Expression.Run { value, .. }, .. } => value.index
+                _ => expression
+              }
+              if let NodeKind.Expression {
+                form: Expression.DirectCall { constructs, .. },
+                ..
+              } = &nodes[call].kind {
+                if constructs == (call != expression) {
+                  List<usize>.set(&mut statements, call, statement)
+                }
+              }
+              i = i + usize.ONE
+            }
+          }
+          _ => {}
+        }
+        at = at + usize.ONE
+      }
+      return ()
+    },
+  )
+  return Sites { statements: move statements, reads: move reads }
+}
+
+/// Whether the target's value reaches a statement which can discard it.
+pub fn candidate(sites: &Sites, call: NodeId) -> bool {
+  return List<usize>.get(&sites.statements, call.index) != usize.MAX
+}
+
+pub fn site(body: &TypedBody, sites: &Sites, call: NodeId, needs: &CleanupNeeds) -> Option<Site> {
+  let statement = List<usize>.get(&sites.statements, call.index)
+  if statement == usize.MAX {
+    return Option<Site>.none()
+  }
   let nodes = TypedBody.nodeSlice(body)
-  let mut expression = call.index
+  let mut local = usize.MAX
+  let mut expression = statement
+  match &nodes[statement].kind {
+    NodeKind.LocalBinding { local: bound, initializer } => {
+      if List<bool>.get(&sites.reads, bound.index) {
+        return Option<Site>.none()
+      }
+      local = bound.index
+      expression = initializer.index
+    }
+    NodeKind.Drop { value, .. } => {
+      expression = value.index
+    }
+    _ => {}
+  }
   if let NodeKind.Expression {
-    form: Expression.DirectCall { arguments, constructs, receiverPass, .. },
+    form: Expression.DirectCall { arguments, receiverPass, .. },
     ..
   } = &nodes[call.index].kind {
     if Option<ReceiverPass>.isSome(&receiverPass) {
@@ -225,56 +344,7 @@ pub fn site(body: &TypedBody, call: NodeId, needs: &CleanupNeeds) -> Option<Site
       }
       at = at + usize.ONE
     }
-    if constructs {
-      at = call.index + usize.ONE
-      while at < nodes.length {
-        if let NodeKind.Expression { form: Expression.Run { value, .. }, .. } = &nodes[at].kind {
-          if value.index == call.index {
-            expression = at
-            break
-          }
-        }
-        at = at + usize.ONE
-      }
-      if expression == call.index {
-        return Option<Site>.none()
-      }
-    }
-  } else {
-    return Option<Site>.none()
-  }
-  let mut at = expression + usize.ONE
-  let mut statement = expression
-  let mut local = usize.MAX
-  while at < nodes.length {
-    if let NodeKind.LocalBinding { local: bound, initializer } = &nodes[at].kind {
-      if initializer.index == expression {
-        statement = at
-        local = bound.index
-      }
-    }
-    if let NodeKind.Expression { form: Expression.Local { local: read }, .. } = &nodes[at].kind {
-      if local == read.index {
-        return Option<Site>.none()
-      }
-    }
-    at = at + usize.ONE
-  }
-  at = statement + usize.ONE
-  while at < nodes.length {
-    if let NodeKind.Block { statements, .. } = &nodes[at].kind {
-      let ids = List<NodeId>.asSlice(&statements)
-      let mut index = usize.ZERO
-      while index < ids.length {
-        if ids[index].index == statement {
-          return Option<Site>.some(
-            Site { statement: statement, expression: expression, local: local },
-          )
-        }
-        index = index + usize.ONE
-      }
-    }
-    at = at + usize.ONE
+    return Option<Site>.some(Site { statement: statement, expression: expression, local: local })
   }
   return Option<Site>.none()
 }

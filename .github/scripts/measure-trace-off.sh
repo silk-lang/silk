@@ -54,9 +54,16 @@ for target in native wasm; do
         # Object symbols can be content hashes. Check their source identities and the
         # ambient-slot intrinsic in the target's entire reached MIR as well as the artifact.
         "$compiler" dump mir --all "$work/main.silk" "${mir_flags[@]}" > "$work/reached.mir"
-        if grep -E 'silk[/.]trace[/.]| = ambientSlot' "$work/reached.mir" >&2; then
+        if grep -E '^fn silk/trace[/.]| = ambientSlot' "$work/reached.mir" >&2; then
           echo "$target $profile: tracing or an ambient slot survived in reached MIR" >&2
           different=1
+        fi
+        if [[ $target == native ]]; then
+          test -s "$work/artifact.symbols"
+          if grep -F 'silk:silk/trace' "$work/artifact.symbols" >&2; then
+            echo "$target $profile: tracing symbol survived in the object symbol map" >&2
+            different=1
+          fi
         fi
         if LC_ALL=C grep -aqE 'silk[/.]trace[/.]' "$work/artifact"; then
           echo "$target $profile: tracing symbol survived in the artifact" >&2
