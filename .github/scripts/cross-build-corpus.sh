@@ -40,9 +40,11 @@ fi
 build() {
   local name=$1
   local package="$work/$name"
-  mkdir -p "$package" "$output/$name"
-  cp "corpus/native/$name/main.silk" "$package/main.silk"
-  printf '[package]\nname = "corpus"\nsilk-version = "0.0.0"\nversion = "0.0.0"\nsource = "."\n' > "$package/silk.toml"
+  # Use the same logical module and package identity as the native and Wasm corpus runners.
+  local module=memory/driver.silk
+  mkdir -p "$package/memory" "$output/$name"
+  cp "corpus/native/$name/main.silk" "$package/$module"
+  printf '[package]\nname = "corpus"\nsilk-version = "0.0.0"\nversion = "0.1.0"\nsource = "."\nmain = "%s"\n' "$module" > "$package/silk.toml"
   python3 - "$package" "$target" "$PWD/stdlib" "$supply" <<'PYCODE'
 import json, sys
 from pathlib import Path
