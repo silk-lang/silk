@@ -1,0 +1,357 @@
+//! Bounded recording of OpenTelemetry spans and their parent contexts.
+
+import silk.collections.list { List }
+import silk.concurrency.ambient_table { TraceContext }
+import silk.concurrency.atomic { Atomic, MemoryOrder }
+import silk.concurrency.thread { Concurrent, Transferable }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.num.i64
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.platform.native.clock { NativeClock }
+import silk.system.insecure_seed { InsecureSeed }
+import silk.system.random { Random }
+import silk.system.random_native { OsRandom }
+import silk.trace { Place, SpanContext, SpanKind, Tracer }
+import silk.trace.storage { Buffers, Pool, Storage }
+import silk.trace.values { Attributes }
+
+/// The OTel resource, root sampling probability and fixed storage budget.
+pub struct Config {
+  /// Value of the OpenTelemetry service.name resource attribute.
+  pub serviceName: string<'static>,
+  /// Value of service.version. An empty value omits this attribute.
+  pub serviceVersion: string<'static>,
+  /// Fraction of new roots to record. Child spans inherit the parent’s sampled bit.
+  pub sampleRatio: f64,
+  /// Maximum number of sampled spans simultaneously open in the recorder.
+  pub openCapacity: usize,
+  /// Number of preallocated producer pages in each signal buffer pool.
+  pub threadCapacity: usize,
+  /// Maximum records per page. A full pool counts additional observations as drops.
+  pub bufferCapacity: usize,
+}
+impl Copy for Config {}
+impl Config {
+  /// Records all roots with 64 open spans and eight buffers of eight finished spans each.
+  pub fn make(name: string<'static>) -> Self {
+    return Config {serviceName: name, serviceVersion: "", sampleRatio: 1.0,
+      openCapacity: 64, threadCapacity: 8, bufferCapacity: 8}
+  }
+}
+
+/// A timed event and its captured fields.
+pub struct SpanEvent {
+  /// The event name supplied by the instrumented code.
+  pub name: string<'static>,
+  /// The event time in Unix nanoseconds.
+  pub time: u64,
+  /// The captured event fields.
+  pub attributes: Attributes,
+}
+impl Copy for SpanEvent {}
+impl SpanEvent {
+  /// An empty event.
+  pub fn empty() -> Self { return SpanEvent {name: "", time: 0, attributes: Attributes.empty()} }
+}
+
+fn noContext() -> SpanContext { return SpanContext {traceHigh: 0, traceLow: 0, span: 0, flags: 0} }
+
+/// A complete span with owned attributes, events and links. Times are Unix nanoseconds.
+pub struct Span {
+  /// Identifiers and flags of this span.
+  pub context: SpanContext,
+  /// Parent identifiers and flags. A zero parent span ID denotes a root.
+  pub parent: SpanContext,
+  /// Name supplied at the span site.
+  pub name: string<'static>,
+  /// The OpenTelemetry kind of this span.
+  pub kind: SpanKind,
+  /// Source and instrumentation scope for a decorated declaration.
+  pub place: Place,
+  /// Span start time, in Unix nanoseconds.
+  pub start: u64,
+  /// Span completion time, in Unix nanoseconds.
+  pub end: u64,
+  /// Whether this span ended with an error status.
+  pub error: bool,
+  /// Whether cancellation closed this span.
+  pub cancelled: bool,
+  /// Static identity of the failure type on an effect failure exit.
+  pub errorType: string<'static>,
+  /// Captured span attributes.
+  pub attributes: Attributes,
+  /// Event storage. The first eventCount elements are initialized events.
+  pub events: [SpanEvent; 4],
+  /// Number of captured events.
+  pub eventCount: usize,
+  /// Number of events omitted at the per-span limit.
+  pub droppedEvents: u64,
+  /// Links to other spans. Only the first linkCount entries are live.
+  pub links: [SpanContext; 4],
+  /// Number of captured links.
+  pub linkCount: usize,
+  /// Number of links omitted at the per-span limit.
+  pub droppedLinks: u64,
+}
+impl Copy for Span {}
+impl Span {
+  /// Returns an empty record with no parent, events or links.
+  pub fn empty() -> Self {
+    return Span {context: noContext(), parent: noContext(), name: "", kind: SpanKind.Internal,
+      place: Place {function: "", file: "", line: 0, packageName: "", packageVersion: ""},
+      start: 0, end: 0, error: false, cancelled: false, errorType: "", attributes: Attributes.empty(),
+      events: [SpanEvent.empty(); 4], eventCount: 0, droppedEvents: 0,
+      links: [noContext(); 4], linkCount: 0, droppedLinks: 0}
+  }
+}
+
+struct OpenSpan { span: Span, previous: TraceContext }
+impl Copy for OpenSpan {}
+
+// These hints are indexes, never pointers into a potentially destroyed recorder.
+struct Cursor { owner: u64, generator: u64, write: usize }
+impl Copy for Cursor {}
+fn cursor() -> *mut Cursor { return Intrinsic.threadSlot<Cursor>() }
+
+// SplitMix64's bijection disperses neighboring seeds throughout the u64 range.
+fn mix(word: u64) -> u64 {
+  let a = u64.wrappingMultiply(u64.bitXor(word, u64.shiftRight(word, 30)), 13787848793156543929)
+  let b = u64.wrappingMultiply(u64.bitXor(a, u64.shiftRight(a, 27)), 10723151780598845931)
+  return u64.bitXor(b, u64.shiftRight(b, 31))
+}
+fn nextId(state: &mut Cursor) -> u64 {
+  state.generator = u64.wrappingAdd(state.generator, 11400714819323198485)
+  let id = mix(state.generator)
+  if id != 0 { return id }
+  state.generator = u64.wrappingAdd(state.generator, 11400714819323198485)
+  return mix(state.generator)
+}
+fn monotonicNs() -> u64 {
+  let now = run NativeClock.now()
+  return i64.toU64(now.seconds()) * 1000000000 + u32.toU64(now.subsecondNanoseconds())
+}
+fn ids(value: &TraceContext) -> SpanContext {
+  return SpanContext {traceHigh: value.traceHigh, traceLow: value.traceLow, span: value.span,
+    flags: u64.wrappingToU8(value.flags)}
+}
+
+/// Owns all recording storage. Its ambient operations reserve disjoint slots without parking.
+pub struct Recorder {
+  config: Config,
+  tag: u64,
+  seed: u64,
+  baseWall: u64,
+  baseMono: u64,
+  // Allocation-backed atomic words for dropped spans, next thread seed, and drain cursor.
+  counters: Storage<u64>,
+  open: Pool<OpenSpan>,
+  ready: Buffers<Span>,
+}
+impl Concurrent for Recorder {}
+impl Transferable for Recorder {}
+
+impl Recorder {
+  /// Allocates every recording cell and reads the clock bases and an OS random seed.
+  pub effect fn make(config: Config) -> Self ! OutOfMemoryError ? &mut Allocator {
+    if config.threadCapacity != 0 && config.bufferCapacity > usize.MAX / config.threadCapacity {
+      fail OutOfMemoryError {}
+    }
+    let mut random = OsRandom.make()
+    let fixed = run InsecureSeed.fromRandom() |> Effect.provideMut<Random>(&mut random)
+    let source = run InsecureSeed.get() |> Effect.provide<InsecureSeed>(&fixed)
+    let seed = u64.bitXor(mix(InsecureSeed.first(&source)), InsecureSeed.second(&source))
+    let wall = run NativeClock.systemNow()
+    // OTLP timestamps are unsigned nanoseconds. Clamp wall clocks outside that range.
+    let baseWall: u64 = if wall.unixSeconds() < 0 { 0 } else {
+      u64.saturatingAdd(u64.saturatingMultiply(i64.toU64(wall.unixSeconds()), 1000000000),
+        u32.toU64(wall.subsecondNanoseconds()))
+    }
+    let tag = unsafe Atomic.fetchAdd<u64>(Intrinsic.processSlot<u64>(), 1, MemoryOrder.Relaxed) + 1
+    let initial = OpenSpan {span: Span.empty(), previous: TraceContext.empty()}
+    return Recorder {config: config, tag: tag, seed: seed, baseWall: baseWall, baseMono: monotonicNs(),
+      counters: run Storage<u64>.make(3, 0), open: run Pool<OpenSpan>.make(config.openCapacity, initial),
+      ready: run Buffers<Span>.make(config.threadCapacity, config.bufferCapacity, Span.empty())}
+  }
+  /// Returns the OTel service name of this resource.
+  pub fn serviceName(self: &Self) -> string<'static> { return self.config.serviceName }
+  /// Returns the OTel service version of this resource.
+  pub fn serviceVersion(self: &Self) -> string<'static> { return self.config.serviceVersion }
+  /// Returns the current Unix nanoseconds on the recorder's monotonic time base.
+  pub fn now(self: &Self) -> u64 {
+    return u64.saturatingAdd(self.baseWall, monotonicNs() - self.baseMono)
+  }
+  /// Returns the total number of spans lost to pool or buffer exhaustion or export failure.
+  pub fn droppedSpans(self: &Self) -> u64 {
+    return unsafe Atomic.load<u64>(unsafe self.counters.at(0), MemoryOrder.Relaxed)
+  }
+  /// Adds terminal export or recording losses to the resource's drop count.
+  pub fn countDroppedSpans(self: &Self, count: u64) -> () {
+    drop unsafe Atomic.fetchAdd<u64>(unsafe self.counters.at(0), count, MemoryOrder.Relaxed)
+  }
+  fn threadCursor(self: &Self) -> Cursor {
+    let saved = unsafe Pointer.read(cursor())
+    if saved.owner == self.tag { return saved }
+    let serial = unsafe Atomic.fetchAdd<u64>(unsafe self.counters.at(1), 1, MemoryOrder.Relaxed)
+    let lane = if self.config.threadCapacity == 0 { usize.ZERO }
+      else { u64.toUsize(serial % usize.toU64(self.config.threadCapacity)) }
+    return Cursor {owner: self.tag, generator: mix(u64.wrappingAdd(self.seed, serial)),
+      write: lane}
+  }
+  fn sampled(self: &Self, traceLow: u64) -> bool {
+    if self.config.sampleRatio >= 1.0 { return true }
+    if !(self.config.sampleRatio > 0.0) { return false }
+    return u64.toF64(u64.shiftRight(traceLow, 11)) < self.config.sampleRatio * 9007199254740992.0
+  }
+  fn active(self: &Self) -> TraceContext { return TraceContext.read() }
+  fn activeIndex(self: &Self, context: &TraceContext) -> usize {
+    if context.owner != self.tag || context.record == 0 { return self.open.length() }
+    return self.open.indexOf(context.record)
+  }
+  fn finish(self: &Self, cancelled: bool) -> () {
+    let current = self.active()
+    let index = self.activeIndex(&current)
+    if index == self.open.length() { return () }
+    let opened = unsafe Pointer.read(unsafe self.open.at(index))
+    let mut span = opened.span
+    span.end = self.now()
+    if cancelled { span.cancelled = true span.error = true }
+    unsafe TraceContext.install(&opened.previous)
+    self.open.release(index)
+    let mut local = self.threadCursor()
+    if !self.ready.append(&mut local.write, Pointer.address(cursor()), &span) {
+      self.countDroppedSpans(1)
+    }
+    unsafe Pointer.write(cursor(), local)
+  }
+  /// Takes one finished span. When a producer is writing a slot, draining skips that slot.
+  pub fn takeSpan(self: &Self) -> Option<Span> {
+    return unsafe self.ready.take(unsafe self.counters.at(2))
+  }
+}
+impl Tracer for Recorder {
+  effect fn enter<Args>(self: &Self, static name: string<'static>, static kind: SpanKind, static place: Place,
+    args: &Args, remote: Option<SpanContext>) -> () {
+    let previous = self.active()
+    let parent = match move remote {
+      Option<SpanContext>.Some {value} => value
+      Option<SpanContext>.None => ids(&previous)
+    }
+    let mut local = self.threadCursor()
+    let mut context = parent
+    if parent.span == 0 {
+      context.traceHigh = nextId(&mut local)
+      context.traceLow = nextId(&mut local)
+      context.flags = if self.sampled(context.traceLow) { 1 } else { 0 }
+    }
+    context.span = nextId(&mut local)
+    let depth = u64.shiftRight(previous.flags, 8) + 1
+    let mut region = TraceContext {traceHigh: context.traceHigh, traceLow: context.traceLow, span: context.span,
+      flags: u64.bitOr(u64.shiftLeft(depth, 8), u8.toU64(context.flags)), owner: self.tag, record: 0}
+    let sampled = u8.bitAnd(context.flags, 1) != 0
+    let mut index = self.open.length()
+    if sampled { index = self.open.acquire() }
+    unsafe Pointer.write(cursor(), local)
+    if index != self.open.length() {
+      let mut span = Span.empty()
+      span.context = context
+      span.parent = parent
+      span.kind = kind
+      span.name = name
+      span.place = place
+      span.start = self.now()
+      span.attributes = Attributes.make(args)
+      let address = unsafe self.open.at(index)
+      unsafe Pointer.write(address, OpenSpan {span: span, previous: previous})
+      region.record = usize.toU64(Pointer.address(address))
+    } else if sampled { self.countDroppedSpans(1) }
+    unsafe TraceContext.install(&region)
+  }
+  effect fn exit(self: &Self) -> () { self.finish(false) }
+  effect fn cancelled(self: &Self) -> () { self.finish(true) }
+  effect fn failed(self: &Self, static error: string<'static>) -> () {
+    let active = self.active()
+    let slot = self.activeIndex(&active)
+    if slot == self.open.length() { return () }
+    let mut token = ()
+    let opened = unsafe Pointer.borrowMut(&mut token, unsafe self.open.at(slot))
+    opened.span.error = true
+    opened.span.errorType = error
+  }
+  effect fn attribute<V>(self: &Self, static key: string<'static>, value: &V) -> () {
+    let active = self.active()
+    let slot = self.activeIndex(&active)
+    if slot == self.open.length() { return () }
+    let mut token = ()
+    let opened = unsafe Pointer.borrowMut(&mut token, unsafe self.open.at(slot))
+    opened.span.attributes.set<V>(key, value)
+  }
+  effect fn recordError<V>(self: &Self, value: &V) -> () {
+    let active = self.active()
+    let slot = self.activeIndex(&active)
+    if slot == self.open.length() { return () }
+    let mut token = ()
+    let opened = unsafe Pointer.borrowMut(&mut token, unsafe self.open.at(slot))
+    opened.span.error = true
+    opened.span.attributes.set<V>("exception.message", value)
+  }
+  effect fn event<Args>(self: &Self, static name: string<'static>, args: &Args) -> () {
+    let active = self.active()
+    let slot = self.activeIndex(&active)
+    if slot == self.open.length() { return () }
+    let mut token = ()
+    let opened = unsafe Pointer.borrowMut(&mut token, unsafe self.open.at(slot))
+    let index = opened.span.eventCount
+    if index == opened.span.events.length { opened.span.droppedEvents = opened.span.droppedEvents + 1 return () }
+    opened.span.events[index] = SpanEvent {name: name, time: self.now(), attributes: Attributes.make(args)}
+    opened.span.eventCount = index + 1
+  }
+  effect fn link(self: &Self, context: &SpanContext) -> () {
+    let active = self.active()
+    let slot = self.activeIndex(&active)
+    if slot == self.open.length() { return () }
+    let mut token = ()
+    let opened = unsafe Pointer.borrowMut(&mut token, unsafe self.open.at(slot))
+    let index = opened.span.linkCount
+    if index == opened.span.links.length { opened.span.droppedLinks = opened.span.droppedLinks + 1 return () }
+    opened.span.links[index] = context.*
+    opened.span.linkCount = index + 1
+  }
+}
+
+impl Recorder {
+  /// The maximum number of completed spans the recorder can retain.
+  pub fn finishedCapacity(self: &Self) -> usize { return self.ready.length() }
+}
+
+/// An owned collection of exported telemetry records.
+pub struct Memory { collected: List<Span> }
+impl Memory {
+  /// Creates an empty collector.
+  pub fn make() -> Self { return Memory {collected: List<Span>.make()} }
+  /// Borrows the spans in their drain order.
+  pub fn spans(self: &Self) -> &[Span] { return self.collected.asSlice() }
+  /// Appends one span batch.
+  pub effect fn appendSpans(self: &mut Self, values: &[Span]) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.collected.appendSlice(values)
+  }
+  /// Collects at most one recorder capacity of completed spans, reserving space before removal.
+  pub effect fn drain(self: &mut Self, recorder: &Recorder) -> () ! OutOfMemoryError ? &mut Allocator {
+    let count = recorder.finishedCapacity()
+    run self.collected.reserve(count)
+    let mut at: usize = 0
+    while at < count {
+      match recorder.takeSpan() {
+        Option<Span>.Some {value} => { drop self.collected.appendWithinCapacity(value) }
+        Option<Span>.None => { return () }
+      }
+      at = at + 1
+    }
+  }
+}

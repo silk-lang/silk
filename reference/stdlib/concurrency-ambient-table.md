@@ -124,5 +124,57 @@ impl Copy for TraceContext
 impl Copy for AmbientTable
 ```
 
+<a id="TraceContext.impl"></a>
+
+## Implementation `TraceContext`
+
+```silk
+impl TraceContext
+```
+
+<a id="TraceContext.impl.empty"></a>
+
+### Associated function `empty`
+
+```silk
+pub fn empty() -> Self
+```
+
+An execution with no open span has zero identifiers and no recorder.
+
+<a id="TraceContext.impl.tableAddress"></a>
+
+### Associated function `tableAddress`
+
+```silk
+pub fn tableAddress() -> usize
+```
+
+Identifies the installed table across a suspension, or zero outside an ambient scope.
+
+<a id="TraceContext.impl.read"></a>
+
+### Associated function `read`
+
+```silk
+pub fn read() -> Self
+```
+
+Copies all six words from the installed execution. Returns an empty context outside a provider.
+
+<a id="TraceContext.impl.install"></a>
+
+### Associated function `install`
+
+```silk
+pub unsafe fn install(context: &Self) -> ()
+```
+
+Replaces the context of the current execution while its ambient table is installed.
+
+#### Safety
+The caller must own this execution's context. A nonzero record must still belong to the
+recorder and execution that opened it. A saved context can only be restored to that scope.
+
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`, `wasm64-unknown-unknown`.
