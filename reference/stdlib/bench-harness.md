@@ -28,12 +28,14 @@ takes 10 samples, and prints them as result lines, which a suite reads with `Imp
 
 [`Harness.reset`](#Harness.impl.reset) starts the timing again after setup that should not count, and
 [`Harness.stop`](#Harness.impl.stop) and [`Harness.start`](#Harness.impl.start) leave a stretch out. [`Harness.check`](#Harness.impl.check) reports what
-the run computed, so the task can tell when two implementations did different work, and
+the run computed, so the task can tell when two implementations did different work,
+[`Harness.keep`](#Harness.impl.keep) stops the compiler from removing or precomputing the work, and
 [`Harness.value`](#Harness.impl.value) adds a value in another unit to the result line.
 
 ## Gotchas
-A body whose result is never used may be removed by the compiler. Use the result: add it to
-a total and give the total to [`Harness.check`](#Harness.impl.check).
+A body whose result is never used may be removed by the compiler, and a body that computes
+the same value every time may be run once. Give the result of each iteration, and its
+input, to [`Harness.keep`](#Harness.impl.keep).
 
 ## Examples
 ```silk,ignore
@@ -54,10 +56,13 @@ effect fn benchmarks() -> ()
     let square = harness.name() == "Squares/n=1000"
     let mut total: u64 = 0
     while left > 0 {
-      // One iteration: the work whose time is reported.
+      // One iteration: the work whose time is reported. The compiler cannot know the
+      // length, so it runs the loop every time.
+      let length: u64 = 1000
+      Harness.keep<u64>(&length)
       total = 0
       let mut at: u64 = 0
-      while at < 1000 {
+      while at < length {
         if square {
           total = total + at * at
         } else {
@@ -65,6 +70,7 @@ effect fn benchmarks() -> ()
         }
         at = at + 1
       }
+      Harness.keep<u64>(&total)
       left = left - 1
     }
 
@@ -317,6 +323,22 @@ no space.
 
 #### Errors
 `OutOfMemoryError` if the `Allocator` cannot supply the copy.
+
+<a id="Harness.impl.keep"></a>
+
+### Associated function `keep`
+
+```silk
+pub fn keep<T>(value: &T) -> ()
+```
+
+Makes the compiler treat `value` as read and written, so it can neither remove the work
+that computed it nor assume what it holds. Give it the result of each iteration, and an
+input the compiler could otherwise compute with.
+
+#### Gotchas
+On a target without inline assembly, which is every target but Linux on x86_64 and
+aarch64 and macOS on aarch64, the value is only made to live in memory, which stops less.
 
 <a id="Harness.impl.grown"></a>
 
