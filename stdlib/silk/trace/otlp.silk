@@ -1,0 +1,468 @@
+//! OTLP/HTTP JSON encoding for recorder batches.
+
+import silk.collections.bytes { Bytes }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.io.writer { Writer, WriterError }
+import silk.json.output { JsonOutput }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f64
+import silk.num.u8
+import silk.num.u64
+import silk.num.usize
+import silk.text.format { Format }
+import silk.trace { SpanKind }
+import silk.trace.context { SpanContext }
+import silk.trace.record { Span }
+import silk.trace.signals { InstrumentKind, LogRecord, MetricPoint, histogramBounds }
+import silk.trace.values { Attributes, Value }
+
+/// Resource identity and cumulative drops at the time of a flush.
+pub struct Resource {
+  /// The value of the OTel service.name resource attribute.
+  pub serviceName: string<'static>,
+  /// The optional service.version value. An empty string omits it.
+  pub serviceVersion: string<'static>,
+  /// Total spans discarded by this recorder or its destination.
+  pub droppedSpans: u64,
+  /// Total log records discarded by this recorder or its destination.
+  pub droppedLogs: u64,
+  /// Total metric updates or data points discarded.
+  pub droppedMetrics: u64,
+}
+
+/// A borrowed batch for a single OTLP signal.
+pub union Batch<'a> {
+  /// Completed spans, each carrying its instrumentation scope.
+  Spans {pub values: &'a [Span]},
+  /// Completed log records, with optional span context.
+  Logs {pub values: &'a [LogRecord]},
+  /// Cumulative metric snapshots. Set includeDrops on the last batch to report nonzero drop counters at time, in Unix nanoseconds.
+  Metrics {pub values: &'a [MetricPoint], pub includeDrops: bool, pub time: u64},
+}
+
+effect fn number(value: u64) -> () ! WriterError ? &mut Writer {
+  let mut bytes: [u8; 20] = [0; 20]
+  let end = Format.writeU64Display(value, &mut bytes, 0)
+  return run Writer.writeAll(Slice.view<u8>(&bytes, 0, end))
+}
+
+// Protobuf JSON represents 64-bit integers as decimal strings. Enum values stay numbers in OTLP.
+effect fn unsigned(value: u64) -> () ! WriterError ? &mut Writer {
+  run Writer.writeAll(b"\"")
+  run number(value)
+  run Writer.writeAll(b"\"")
+}
+
+effect fn signed(value: i64) -> () ! WriterError ? &mut Writer {
+  let mut bytes: [u8; 20] = [0; 20]
+  let end = Format.writeI64Display(value, &mut bytes, 0)
+  run Writer.writeAll(b"\"")
+  run Writer.writeAll(Slice.view<u8>(&bytes, 0, end))
+  run Writer.writeAll(b"\"")
+}
+
+effect fn real(value: f64) -> () ! WriterError ? &mut Writer {
+  let mut bytes: [u8; 25] = [0; 25]
+  let end = Format.writeF64Debug(value, &mut bytes, 0)
+  if !f64.isFinite(value) { run Writer.writeAll(b"\"") }
+  run Writer.writeAll(Slice.view<u8>(&bytes, 0, end))
+  if !f64.isFinite(value) { run Writer.writeAll(b"\"") }
+}
+
+effect fn hex(value: u64) -> () ! WriterError ? &mut Writer {
+  let mut bytes: [u8; 16] = [0; 16]
+  let mut bits = value
+  let mut at: usize = 16
+  while at != 0 {
+    at = at - 1
+    bytes[at] = b"0123456789abcdef"[u64.toUsize(u64.bitAnd(bits, 15))]
+    bits = u64.shiftRight(bits, 4)
+  }
+  return run Writer.writeAll(&bytes)
+}
+
+effect fn ids(context: &SpanContext) -> () ! WriterError ? &mut Writer {
+  run Writer.writeAll(b"\"traceId\":\"")
+  run hex(context.traceHigh)
+  run hex(context.traceLow)
+  run Writer.writeAll(b"\",\"spanId\":\"")
+  run hex(context.span)
+  run Writer.writeAll(b"\",\"flags\":")
+  run number(u8.toU64(context.flags))
+}
+
+effect fn key(name: string) -> () ! WriterError ? &mut Writer {
+  run Writer.writeAll(b"{\"key\":")
+  run JsonOutput.writeString(name)
+  run Writer.writeAll(b",\"value\":{")
+}
+
+effect fn textAttribute(name: string, text: string) -> () ! WriterError ? &mut Writer {
+  run key(name)
+  run Writer.writeAll(b"\"stringValue\":")
+  run JsonOutput.writeString(text)
+  run Writer.writeAll(b"}}")
+}
+
+effect fn uintField(value: u64) -> () ! WriterError ? &mut Writer {
+  // AnyValue.intValue is signed. Preserve a larger unsigned integer as exact decimal text.
+  if value <= 9223372036854775807 { run Writer.writeAll(b"\"intValue\":") }
+  else { run Writer.writeAll(b"\"stringValue\":") }
+  run unsigned(value)
+}
+
+effect fn uintAttribute(name: string, value: u64) -> () ! WriterError ? &mut Writer {
+  run key(name)
+  run uintField(value)
+  run Writer.writeAll(b"}}")
+}
+
+// A caller may set a key supplied by the encoder. Keep the canonical value and emit each key once.
+effect fn fields(attrs: &Attributes, hasPrior: bool, excluded: &[string<'static>]) -> bool ! WriterError ? &mut Writer {
+  let mut prior = hasPrior
+  let mut i: usize = 0
+  while i < attrs.count {
+    let attr = &attrs.items[i]
+    i = i + 1
+    let mut j: usize = 0
+    while j < excluded.length && excluded[j] != attr.key { j = j + 1 }
+    if j < excluded.length { continue }
+    if prior { run Writer.writeAll(b",") }
+    prior = true
+    run key(attr.key)
+    match &attr.value {
+      Value.Bool {value} => {
+        if value { run Writer.writeAll(b"\"boolValue\":true") }
+        else { run Writer.writeAll(b"\"boolValue\":false") }
+      }
+      Value.Integer {value} => { run Writer.writeAll(b"\"intValue\":") run signed(value) }
+      Value.Unsigned {value} => run uintField(value)
+      Value.Double {value} => { run Writer.writeAll(b"\"doubleValue\":") run real(value) }
+      Value.Text {value} => { run Writer.writeAll(b"\"stringValue\":") run JsonOutput.writeString(value.view()) }
+    }
+    run Writer.writeAll(b"}}")
+  }
+  return prior
+}
+
+// Protobuf drop counts on spans and events are uint32, while the recorder keeps u64 totals.
+effect fn droppedCount(count: u64) -> () ! WriterError ? &mut Writer {
+  return run number(if count > 4294967295 { 4294967295 } else { count })
+}
+
+effect fn resourceFields(identity: &Resource) -> () ! WriterError ? &mut Writer {
+  run Writer.writeAll(b"{\"resource\":{\"attributes\":[")
+  run textAttribute("service.name", identity.serviceName)
+  if identity.serviceVersion != "" {
+    run Writer.writeAll(b",")
+    run textAttribute("service.version", identity.serviceVersion)
+  }
+  if identity.droppedSpans != 0 { run Writer.writeAll(b",") run uintAttribute("otel.dropped_spans", identity.droppedSpans) }
+  if identity.droppedLogs != 0 { run Writer.writeAll(b",") run uintAttribute("otel.dropped_logs", identity.droppedLogs) }
+  if identity.droppedMetrics != 0 { run Writer.writeAll(b",") run uintAttribute("otel.dropped_metrics", identity.droppedMetrics) }
+  run Writer.writeAll(b"]},")
+}
+
+fn kindCode(kind: SpanKind) -> u64 {
+  return match kind {
+    SpanKind.Internal => 1
+    SpanKind.Server => 2
+    SpanKind.Client => 3
+    SpanKind.Producer => 4
+    SpanKind.Consumer => 5
+  }
+}
+
+effect fn spanAttributes(item: &Span) -> () ! WriterError ? &mut Writer {
+  run Writer.writeAll(b",\"attributes\":[")
+  let excluded: [string<'static>; 5] = [
+    if item.place.function != "" { "code.function.name" } else { "" },
+    if item.place.file != "" { "code.file.path" } else { "" },
+    if item.place.line != 0 { "code.line.number" } else { "" },
+    if item.errorType != "" { "exception.type" } else { "" },
+    if item.cancelled { "silk.cancelled" } else { "" },
+  ]
+  let mut prior = run fields(&item.attributes, false, &excluded)
+  if item.place.function != "" {
+    if prior { run Writer.writeAll(b",") }
+    run textAttribute("code.function.name", item.place.function)
+    prior = true
+  }
+  if item.place.file != "" {
+    if prior { run Writer.writeAll(b",") }
+    run textAttribute("code.file.path", item.place.file)
+    prior = true
+  }
+  if item.place.line != 0 {
+    if prior { run Writer.writeAll(b",") }
+    run uintAttribute("code.line.number", item.place.line)
+    prior = true
+  }
+  if item.errorType != "" {
+    if prior { run Writer.writeAll(b",") }
+    run textAttribute("exception.type", item.errorType)
+    prior = true
+  }
+  if item.cancelled {
+    if prior { run Writer.writeAll(b",") }
+    run Writer.writeAll(b"{\"key\":\"silk.cancelled\",\"value\":{\"boolValue\":true}}")
+  }
+  run Writer.writeAll(b"],\"droppedAttributesCount\":")
+  run droppedCount(item.attributes.dropped)
+}
+
+effect fn span(item: &Span) -> () ! WriterError ? &mut Writer {
+  run Writer.writeAll(b"{")
+  run ids(&item.context)
+  if item.parent.span != 0 {
+    run Writer.writeAll(b",\"parentSpanId\":\"")
+    run hex(item.parent.span)
+    run Writer.writeAll(b"\"")
+  }
+  run Writer.writeAll(b",\"name\":")
+  run JsonOutput.writeString(item.name)
+  run Writer.writeAll(b",\"kind\":")
+  run number(kindCode(item.kind))
+  run Writer.writeAll(b",\"startTimeUnixNano\":")
+  run unsigned(item.start)
+  run Writer.writeAll(b",\"endTimeUnixNano\":")
+  run unsigned(item.end)
+  run spanAttributes(item)
+  if item.error || item.cancelled { run Writer.writeAll(b",\"status\":{\"code\":2}") }
+  run Writer.writeAll(b",\"events\":[")
+  let mut i: usize = 0
+  while i < item.eventCount {
+    if i != 0 { run Writer.writeAll(b",") }
+    let event = &item.events[i]
+    run Writer.writeAll(b"{\"timeUnixNano\":")
+    run unsigned(event.time)
+    run Writer.writeAll(b",\"name\":")
+    run JsonOutput.writeString(event.name)
+    run Writer.writeAll(b",\"attributes\":[")
+    drop run fields(&event.attributes, false, &[])
+    run Writer.writeAll(b"],\"droppedAttributesCount\":")
+    run droppedCount(event.attributes.dropped)
+    run Writer.writeAll(b"}")
+    i = i + 1
+  }
+  run Writer.writeAll(b"],\"droppedEventsCount\":")
+  run droppedCount(item.droppedEvents)
+  run Writer.writeAll(b",\"links\":[")
+  i = 0
+  while i < item.linkCount {
+    if i != 0 { run Writer.writeAll(b",") }
+    run Writer.writeAll(b"{")
+    run ids(&item.links[i])
+    run Writer.writeAll(b"}")
+    i = i + 1
+  }
+  run Writer.writeAll(b"],\"droppedLinksCount\":")
+  run droppedCount(item.droppedLinks)
+  run Writer.writeAll(b"}")
+}
+
+fn sameScope(a: &Span, b: &Span) -> bool {
+  return a.place.packageName == b.place.packageName && a.place.packageVersion == b.place.packageVersion
+}
+
+effect fn spans(identity: &Resource, values: &[Span]) -> () ! WriterError ? &mut Writer {
+  run Writer.writeAll(b"{\"resourceSpans\":[")
+  run resourceFields(identity)
+  run Writer.writeAll(b"\"scopeSpans\":[")
+  let mut i: usize = 0
+  while i < values.length {
+    if i != 0 { run Writer.writeAll(b",") }
+    run Writer.writeAll(b"{\"scope\":{\"name\":")
+    let first = i
+    let place = &values[first].place
+    run JsonOutput.writeString(if place.packageName == "" { "silk.trace" } else { place.packageName })
+    if place.packageVersion != "" {
+      run Writer.writeAll(b",\"version\":")
+      run JsonOutput.writeString(place.packageVersion)
+    }
+    run Writer.writeAll(b"},\"spans\":[")
+    while i < values.length && sameScope(&values[first], &values[i]) {
+      if i != first { run Writer.writeAll(b",") }
+      run span(&values[i])
+      i = i + 1
+    }
+    run Writer.writeAll(b"]}")
+  }
+  run Writer.writeAll(b"]}]}")
+}
+
+effect fn logs(identity: &Resource, values: &[LogRecord]) -> () ! WriterError ? &mut Writer {
+  run Writer.writeAll(b"{\"resourceLogs\":[")
+  run resourceFields(identity)
+  run Writer.writeAll(b"\"scopeLogs\":[{\"scope\":{\"name\":\"silk.trace\"},\"logRecords\":[")
+  let mut i: usize = 0
+  while i < values.length {
+    if i != 0 { run Writer.writeAll(b",") }
+    let item = &values[i]
+    run Writer.writeAll(b"{\"timeUnixNano\":")
+    run unsigned(item.time)
+    run Writer.writeAll(b",\"severityNumber\":")
+    run number(item.severity)
+    run Writer.writeAll(b",\"body\":{\"stringValue\":")
+    run JsonOutput.writeString(item.body.view())
+    run Writer.writeAll(b"},\"attributes\":[")
+    run textAttribute("event.template", item.template)
+    drop run fields(&item.attributes, true, &["event.template"])
+    run Writer.writeAll(b"],\"droppedAttributesCount\":")
+    run droppedCount(item.attributes.dropped)
+    if let Option<SpanContext>.Some {value} = &item.context {
+      run Writer.writeAll(b",")
+      run ids(&value)
+    }
+    run Writer.writeAll(b"}")
+    i = i + 1
+  }
+  run Writer.writeAll(b"]}]}]}")
+}
+
+effect fn unsignedPoint(value: u64) -> () ! WriterError ? &mut Writer {
+  if value <= 9223372036854775807 {
+    run Writer.writeAll(b",\"asInt\":")
+    run unsigned(value)
+  } else {
+    run Writer.writeAll(b",\"asDouble\":")
+    run real(u64.toF64(value))
+  }
+}
+
+effect fn point(item: &MetricPoint) -> () ! WriterError ? &mut Writer {
+  run Writer.writeAll(b"{\"attributes\":[")
+  if item.overflow {
+    run Writer.writeAll(b"{\"key\":\"otel.metric.overflow\",\"value\":{\"boolValue\":true}}")
+  } else { drop run fields(&item.attributes, false, &[]) }
+  run Writer.writeAll(b"],\"timeUnixNano\":")
+  run unsigned(item.time)
+  if item.kind != InstrumentKind.Gauge {
+    run Writer.writeAll(b",\"startTimeUnixNano\":")
+    run unsigned(item.start)
+  }
+  match item.kind {
+    InstrumentKind.Histogram => {
+      run Writer.writeAll(b",\"count\":")
+      run unsigned(item.count)
+      run Writer.writeAll(b",\"sum\":")
+      run real(item.value)
+      run Writer.writeAll(b",\"bucketCounts\":[")
+      let mut i: usize = 0
+      while i < item.buckets.length {
+        if i != 0 { run Writer.writeAll(b",") }
+        run unsigned(item.buckets[i])
+        i = i + 1
+      }
+      run Writer.writeAll(b"],\"explicitBounds\":[")
+      let bounds = histogramBounds()
+      i = 0
+      while i < bounds.length {
+        if i != 0 { run Writer.writeAll(b",") }
+        run real(bounds[i])
+        i = i + 1
+      }
+      run Writer.writeAll(b"]")
+    }
+    InstrumentKind.Counter => run unsignedPoint(item.count)
+    InstrumentKind.UpDownCounter => { run Writer.writeAll(b",\"asInt\":") run signed(item.adjustment) }
+    InstrumentKind.Gauge => { run Writer.writeAll(b",\"asDouble\":") run real(item.value) }
+  }
+  run Writer.writeAll(b"}")
+}
+
+effect fn instrument(values: &[MetricPoint], first: usize) -> () ! WriterError ? &mut Writer {
+  let item = &values[first]
+  run Writer.writeAll(b"{\"name\":")
+  run JsonOutput.writeString(item.name)
+  match item.kind {
+    InstrumentKind.Histogram => run Writer.writeAll(b",\"histogram\":{\"aggregationTemporality\":2")
+    InstrumentKind.Gauge => run Writer.writeAll(b",\"gauge\":{")
+    InstrumentKind.Counter => run Writer.writeAll(b",\"sum\":{\"aggregationTemporality\":2,\"isMonotonic\":true")
+    InstrumentKind.UpDownCounter => run Writer.writeAll(b",\"sum\":{\"aggregationTemporality\":2,\"isMonotonic\":false")
+  }
+  if item.kind != InstrumentKind.Gauge { run Writer.writeAll(b",") }
+  run Writer.writeAll(b"\"dataPoints\":[")
+  let mut i = first
+  while i < values.length {
+    if values[i].name == item.name && values[i].kind == item.kind {
+      if i != first { run Writer.writeAll(b",") }
+      run point(&values[i])
+    }
+    i = i + 1
+  }
+  run Writer.writeAll(b"]}}")
+}
+
+effect fn dropMetric(name: string, value: u64, time: u64, prior: bool) -> () ! WriterError ? &mut Writer {
+  if prior { run Writer.writeAll(b",") }
+  run Writer.writeAll(b"{\"name\":")
+  run JsonOutput.writeString(name)
+  run Writer.writeAll(b",\"sum\":{\"aggregationTemporality\":2,\"isMonotonic\":true,\"dataPoints\":[{\"timeUnixNano\":")
+  run unsigned(time)
+  run unsignedPoint(value)
+  run Writer.writeAll(b"}]}}")
+}
+
+effect fn metrics(identity: &Resource, values: &[MetricPoint], includeDrops: bool, time: u64) -> () ! WriterError ? &mut Writer {
+  run Writer.writeAll(b"{\"resourceMetrics\":[")
+  run resourceFields(identity)
+  run Writer.writeAll(b"\"scopeMetrics\":[{\"scope\":{\"name\":\"silk.trace\"},\"metrics\":[")
+  let mut i: usize = 0
+  while i < values.length {
+    let mut prior: usize = 0
+    while prior < i && (values[prior].name != values[i].name || values[prior].kind != values[i].kind) {
+      prior = prior + 1
+    }
+    if prior == i {
+      if i != 0 { run Writer.writeAll(b",") }
+      run instrument(values, i)
+    }
+    i = i + 1
+  }
+  if includeDrops {
+    let mut prior = values.length != 0
+    if identity.droppedSpans != 0 { run dropMetric("otel.dropped_spans", identity.droppedSpans, time, prior) prior = true }
+    if identity.droppedLogs != 0 { run dropMetric("otel.dropped_logs", identity.droppedLogs, time, prior) prior = true }
+    if identity.droppedMetrics != 0 { run dropMetric("otel.dropped_metrics", identity.droppedMetrics, time, prior) }
+  }
+  run Writer.writeAll(b"]}]}]}")
+}
+
+/// Writes one complete OTLP export request, including its resource and instrumentation scopes.
+pub effect fn write(identity: &Resource, batch: &Batch<'_>) -> () ! WriterError ? &mut Writer {
+  match &batch.* {
+    Batch.Spans {values} => run spans(identity, values)
+    Batch.Logs {values} => run logs(identity, values)
+    Batch.Metrics {values, includeDrops, time} => run metrics(identity, values, includeDrops, time)
+  }
+}
+
+// The writes are deterministic for a borrowed batch. Size it once, then fill its exact allocation.
+struct Counter { size: usize }
+impl Writer for Counter {
+  effect fn writeAll(self: &mut Self, data: &[u8]) -> () ! WriterError {
+    if data.length > usize.MAX - self.size { fail Writer.failure() }
+    self.size = self.size + data.length
+  }
+  effect fn flush(self: &mut Self) -> () ! WriterError {}
+}
+
+struct Buffer { bytes: Bytes }
+impl Writer for Buffer {
+  effect fn writeAll(self: &mut Self, data: &[u8]) -> () ! WriterError {
+    if !self.bytes.appendSliceWithinCapacity(data) { fail Writer.failure() }
+  }
+  effect fn flush(self: &mut Self) -> () ! WriterError {}
+}
+
+/// Returns the complete request bytes for an OTLP/HTTP retry or a length-prefixed write.
+pub effect fn encode(identity: &Resource, batch: &Batch<'_>) -> Bytes ! WriterError | OutOfMemoryError ? &mut Allocator {
+  let mut count = Counter {size: 0}
+  run write(identity, batch) |> Effect.provideMut<Writer>(&mut count)
+  let mut buffer = Buffer {bytes: run Bytes.makeWithCapacity(count.size)}
+  run write(identity, batch) |> Effect.provideMut<Writer>(&mut buffer)
+  return move buffer.bytes
+}

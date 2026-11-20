@@ -1,0 +1,129 @@
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.http.client { Http, HttpError, Request, Response }
+import silk.io.writer { WriterError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.monotonic_clock { MonotonicClock, ReadyWatch }
+import silk.text.string { String }
+import silk.time.mark { Mark }
+import silk.trace.otlp { Batch, Resource }
+import silk.trace.context { SpanContext }
+import silk.trace.record { Config, Recorder, Span }
+import silk.trace.signals { LogRecord }
+import silk.trace.values { Attributes, Text }
+import silk.trace.sink { Sink, Otlp, OtlpResponseError }
+
+struct TestClock { waits: usize, last: u64 }
+impl MonotonicClock for TestClock {
+  effect fn now(self: &mut Self) -> Mark { return Mark.make(0, 0) }
+  effect fn getResolution(self: &mut Self) -> u64 { return 1 }
+  effect fn waitFor(self: &mut Self, howLong: u64) -> () {
+    self.waits = self.waits + 1
+    self.last = howLong
+  }
+  effect fn waitUntil(self: &mut Self, when: Mark) -> () {}
+  effect fn waitReady(self: &mut Self, watch: &mut [ReadyWatch], until: Option<Mark>) -> usize { return 0 }
+}
+
+struct Collector { attempts: usize, first: String, firstStatus: u16, laterStatus: u16, reply: string<'static> }
+impl Http for Collector {
+  effect fn sendAll(self: &mut Self, requests: List<Request<'_>>) -> List<Result<Response, HttpError>>
+  ! OutOfMemoryError ? &mut Allocator {
+    return run Http.sendEach(move requests) |> Effect.provideMut<Http>(&mut self.*)
+  }
+
+  effect fn send(self: &mut Self, request: Request<'_>) -> Response ! HttpError | OutOfMemoryError ? &mut Allocator {
+    self.attempts = self.attempts + 1
+    if request.url() != "https://collector.test/otel/v1/traces" || request.contentType().unwrapOr("") != "application/json" {
+      return run Response.make(404, b"")
+    }
+    let payload = String.fromUtf8(request.bodyBytes()).unwrapOr("")
+    if self.attempts == 1 {
+      self.first = run String.copy(payload)
+      return run Response.make(self.firstStatus, String.utf8Bytes(self.reply))
+    }
+    if self.first.view() != payload || payload == "" { return run Response.make(400, b"") }
+    return run Response.make(self.laterStatus, String.utf8Bytes(self.reply))
+  }
+}
+
+effect fn post() -> u64 ! OtlpResponseError | HttpError | OutOfMemoryError | WriterError
+? &mut Http | &mut MonotonicClock | &mut Allocator {
+  let mut target = Otlp.http("https://collector.test/otel/")
+  let batch = [Span.empty()]
+  let identity = Resource {serviceName: "retry", serviceVersion: "", droppedSpans: 0, droppedLogs: 0, droppedMetrics: 0}
+  return run Sink<OtlpResponseError | HttpError | OutOfMemoryError | WriterError ? &mut Allocator | &mut Http | &mut MonotonicClock>.send(
+    &mut target, &identity, &Batch.Spans {values: &batch})
+}
+
+// Observe what a final flush delivers after a destination rejects one log.
+struct Partial { logs: usize, drops: u64, refuse: bool }
+impl Sink<OtlpResponseError ? never> for Partial {
+  effect fn send(self: &mut Self, identity: &Resource, batch: &Batch<'_>) -> u64 ! OtlpResponseError {
+    match &batch.* {
+      Batch.Logs {values} => {
+        self.logs = self.logs + values.length
+        if self.refuse { fail OtlpResponseError {status: 400} }
+        return 1
+      }
+      Batch.Metrics {includeDrops, ..} => {
+        if includeDrops { self.drops = identity.droppedLogs }
+      }
+      Batch.Spans {..} => {}
+    }
+    return 0
+  }
+}
+
+effect fn accounting() -> i32 ! OtlpResponseError | OutOfMemoryError ? &mut Allocator {
+  let rec = run Recorder.make(Config.make("drops"))
+  let log = LogRecord {time: 1, severity: 9, template: "test", body: Text.empty(),
+    attributes: Attributes.empty(), context: Option<SpanContext>.none()}
+  rec.signals.appendLog(log)
+  let mut partial = Partial {logs: 0, drops: 0, refuse: false}
+  run rec.flush(&mut partial)
+  if rec.signals.droppedLogs() != 1 || partial.logs != 1 || partial.drops != 1 { return 10 }
+  partial.refuse = true
+  rec.signals.appendLog(log)
+  let failed = run Effect.result(rec.flush(&mut partial))
+  if let Result.Success {..} = move failed { return 11 }
+  if rec.signals.droppedLogs() != 2 || partial.logs != 2 { return 12 }
+  run rec.flush(&mut partial)
+  if partial.logs != 2 || partial.drops != 2 { return 13 }
+  return 0
+}
+
+effect fn exercise() -> i32 ! OtlpResponseError | HttpError | OutOfMemoryError | WriterError ? &mut Allocator {
+  let mut clock = TestClock {waits: 0, last: 0}
+  let mut collector = Collector {attempts: 0, first: String.make(), firstStatus: 503,
+    laterStatus: 200, reply: """{"partialSuccess":{"rejectedSpans":"1"}}"""}
+  let count = run post() |> Effect.provideMut<Http>(&mut collector) |> Effect.provideMut<MonotonicClock>(&mut clock)
+  if count != 1 || collector.attempts != 2 || clock.waits != 1 || clock.last == 0 { return 1 }
+  collector.attempts = 0
+  collector.firstStatus = 400
+  let permanent = run Effect.result(post() |> Effect.provideMut<Http>(&mut collector) |> Effect.provideMut<MonotonicClock>(&mut clock))
+  if let Result.Success {..} = move permanent { return 2 }
+  if collector.attempts != 1 || clock.waits != 1 { return 3 }
+  collector.attempts = 0
+  collector.firstStatus = 503
+  collector.laterStatus = 503
+  let unavailable = run Effect.result(post() |> Effect.provideMut<Http>(&mut collector) |> Effect.provideMut<MonotonicClock>(&mut clock))
+  if let Result.Success {..} = move unavailable { return 4 }
+  if collector.attempts != 5 || clock.waits != 5 || clock.last != 800000000 { return 5 }
+  collector.attempts = 0
+  collector.firstStatus = 200
+  collector.reply = """{"partialSuccess":{"rejectedSpans":"19"}}"""
+  let malformed = run Effect.result(post() |> Effect.provideMut<Http>(&mut collector) |> Effect.provideMut<MonotonicClock>(&mut clock))
+  if let Result.Success {..} = move malformed { return 6 }
+  if collector.attempts != 1 { return 7 }
+  return run accounting()
+}
+
+effect fn failed<E>(error: E) -> i32 { drop error return 99 }
+
+pub fn main() -> i32 {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(exercise() |> Effect.provideMut<Allocator>(&mut allocator), failed)
+}

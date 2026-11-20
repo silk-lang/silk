@@ -386,6 +386,16 @@ pub struct Recorder
 
 Owns all recording storage. Its ambient operations reserve disjoint slots without parking.
 
+<a id="Recorder.signals"></a>
+
+### Field `signals`
+
+```silk
+pub signals: SignalState
+```
+
+Log buffers and metric instruments shared by this recorder’s providers.
+
 <a id="Recorder.impl.Concurrent"></a>
 
 ## Implementation `Concurrent for Recorder`
@@ -609,6 +619,26 @@ pub fn spans(self: &Self) -> &[Span]
 
 Borrows the spans in their drain order.
 
+<a id="Memory.impl.logs"></a>
+
+### Method `logs`
+
+```silk
+pub fn logs(self: &Self) -> &[LogRecord]
+```
+
+Borrows the delivered log records.
+
+<a id="Memory.impl.metrics"></a>
+
+### Method `metrics`
+
+```silk
+pub fn metrics(self: &Self) -> &[MetricPoint]
+```
+
+Borrows the delivered metric snapshots.
+
 <a id="Memory.impl.appendSpans"></a>
 
 ### Method `appendSpans`
@@ -619,6 +649,26 @@ pub effect fn appendSpans(self: &mut Self, values: &[Span]) -> () ! OutOfMemoryE
 
 Appends one span batch.
 
+<a id="Memory.impl.appendLogs"></a>
+
+### Method `appendLogs`
+
+```silk
+pub effect fn appendLogs(self: &mut Self, values: &[LogRecord]) -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Appends one log batch.
+
+<a id="Memory.impl.appendMetrics"></a>
+
+### Method `appendMetrics`
+
+```silk
+pub effect fn appendMetrics(self: &mut Self, values: &[MetricPoint]) -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Appends one cumulative metric batch.
+
 <a id="Memory.impl.drain"></a>
 
 ### Method `drain`
@@ -628,6 +678,36 @@ pub effect fn drain(self: &mut Self, recorder: &Recorder) -> () ! OutOfMemoryErr
 ```
 
 Collects at most one recorder capacity of completed spans, reserving space before removal.
+
+<a id="Recorder.impl-3"></a>
+
+## Implementation `Recorder`
+
+```silk
+impl Recorder
+```
+
+<a id="Recorder.impl.flush"></a>
+
+### Method `flush`
+
+```silk
+pub effect fn flush<E, ?R, S: Sink<E ? R>>(self: &Self, sink: &mut S) -> ()
+  ! E | OutOfMemoryError ? R | &mut Allocator
+```
+
+Drains the current buffers to a sink, including logs and cumulative metric snapshots.
+
+<a id="Recorder.impl.exportBatches"></a>
+
+### Method `exportBatches`
+
+```silk
+pub effect fn exportBatches<E, ?R, S: Sink<E ? R>>(self: &Self, sink: &mut S) -> ()
+  ! E | OutOfMemoryError ? R | &mut Allocator | &mut MonotonicClock
+```
+
+Periodically flushes the recorder until cancellation or a sink failure.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`, `wasm64-unknown-unknown`.
