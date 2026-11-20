@@ -398,8 +398,9 @@ directory.
 pub struct DirectoryEntryKind
 ```
 
-The kind of a directory entry: a file, a directory, or a symbolic link. Compare with
-[`FileSystem.file`](#FileSystem.impl.file), [`FileSystem.directory`](#FileSystem.impl.directory), and [`FileSystem.symbolicLink`](#FileSystem.impl.symbolicLink).
+The kind of a directory entry: a file, a directory, a symbolic link, or a special file such as
+a socket. Compare with [`FileSystem.file`](#FileSystem.impl.file), [`FileSystem.directory`](#FileSystem.impl.directory),
+[`FileSystem.symbolicLink`](#FileSystem.impl.symbolicLink), and [`FileSystem.specialFile`](#FileSystem.impl.specialFile).
 
 <a id="DirectoryEntryKind.code"></a>
 
@@ -409,7 +410,8 @@ The kind of a directory entry: a file, a directory, or a symbolic link. Compare 
 pub code: i32
 ```
 
-The kind code: 0 for a file, 1 for a directory, 2 for a symbolic link.
+The kind code: 0 for a file, 1 for a directory, 2 for a symbolic link, 3 for anything
+else, such as a socket or a named pipe.
 
 <a id="DirectoryEntry"></a>
 
@@ -907,7 +909,8 @@ Returns the direct children of the directory at `path`, sorted by path bytes.
 
 The listing does not include children of children. Each entry owns its path, so you can keep
 it after you drop the list. An entry that is a symbolic link has the kind
-[`FileSystem.symbolicLink`](#FileSystem.impl.symbolicLink), whatever it points to.
+[`FileSystem.symbolicLink`](#FileSystem.impl.symbolicLink), whatever it points to. A socket, named pipe or device has the
+kind [`FileSystem.specialFile`](#FileSystem.impl.specialFile).
 
 #### Errors
 
@@ -939,9 +942,10 @@ Creates the directory `path`. Its parent must exist.
 effect fn removeFile(path: &Path) -> () ! FileError ? &mut FileSystem
 ```
 
-Removes the regular file or symbolic link at `path`. A link is removed itself, not what it
-points to. A read-only file is removed too, on every host: on Windows the read-only attribute
-does not stop it, just as a file's mode does not on Unix.
+Removes the regular file, symbolic link or special file (a socket, named pipe or device) at
+`path`. A link is removed itself, not what it points to. A read-only file is removed too, on
+every host: on Windows the read-only attribute does not stop it, just as a file's mode does
+not on Unix.
 
 #### Errors
 
@@ -1068,6 +1072,18 @@ pub fn symbolicLink() -> DirectoryEntryKind
 Constructs the symbolic-link [`DirectoryEntryKind`](#DirectoryEntryKind). A listing reports a link itself, not
 what it points to, so a walk of the tree does not follow it.
 
+<a id="FileSystem.impl.specialFile"></a>
+
+### Associated function `specialFile`
+
+```silk
+pub fn specialFile() -> DirectoryEntryKind
+```
+
+Constructs the [`DirectoryEntryKind`](#DirectoryEntryKind) of an entry that is neither a file, a directory nor
+a symbolic link: a socket, a named pipe or a device. A listing reports it so that a walk
+can pass over it; it has no contents to read.
+
 <a id="FileSystem.impl.entryKindCode"></a>
 
 ### Associated function `entryKindCode`
@@ -1076,7 +1092,8 @@ what it points to, so a walk of the tree does not follow it.
 pub fn entryKindCode(kind: DirectoryEntryKind) -> i32
 ```
 
-Returns the code of `kind`: 0 for a file, 1 for a directory, 2 for a symbolic link.
+Returns the code of `kind`: 0 for a file, 1 for a directory, 2 for a symbolic link, 3 for
+a special file.
 
 <a id="FileSystem.impl.fileInfo"></a>
 
