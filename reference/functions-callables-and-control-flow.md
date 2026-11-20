@@ -166,6 +166,15 @@ function is not supported.
 **Evidence:** `corpus/native/function-inline-clauses`, `corpus/invalid/function-inline-clauses-invalid`,
 `failureSlotsEndOnTheirCallsSuccessEdge`.
 
+### FUNC-004. A trace directive observes the execution of a function body
+
+**Status** Candidate
+
+`@trace` opens an observation span on a runtime `fn`, `effect fn` or method with a body. Its optional
+literal arguments are `name`, `kind` and `args`. An effect function opens its span when
+its body starts running. See [TRACE-002](tracing.md#trace-002-function-spans) for the accepted kinds,
+argument capture and exit behavior.
+
 ### CALL-001 — A call evaluates each argument once from left to right
 
 **Status:** Confirmed
