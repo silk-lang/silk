@@ -38,16 +38,13 @@ A write error ends the current message. The stream may already contain part of t
 ### Log to standard error
 ```silk
 import silk.core.effect { Effect }
-import silk.concurrency.sync { Arc }
 import silk.io.logger { Logger }
-import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.allocator { OutOfMemoryError }
 import silk.io.logger_native { StderrLogger }
 
 pub effect fn main() -> i32
   ! OutOfMemoryError {
-  let mut allocator = Allocator.systemAllocatorProvider()
-  let logger = run Arc<StderrLogger>.make(StderrLogger.make())
-    |> Effect.provideMut<Allocator>(&mut allocator)
+  let logger = run StderrLogger.shared()
   let values = .{ name: "silk", count: 3 }
 
   // Writes "info: silk started 3 workers" and a newline to standard error.
@@ -60,16 +57,13 @@ pub effect fn main() -> i32
 ### Log to standard output
 ```silk
 import silk.core.effect { Effect }
-import silk.concurrency.sync { Arc }
 import silk.io.logger { Logger }
-import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.allocator { OutOfMemoryError }
 import silk.io.logger_native { StdoutLogger }
 
 pub effect fn main() -> i32
   ! OutOfMemoryError {
-  let mut allocator = Allocator.systemAllocatorProvider()
-  let logger = run Arc<StdoutLogger>.make(StdoutLogger.make())
-    |> Effect.provideMut<Allocator>(&mut allocator)
+  let logger = run StdoutLogger.shared()
   let values = .{ name: "silk", count: 3 }
 
   // The logger adds no newline, so the template ends with one.

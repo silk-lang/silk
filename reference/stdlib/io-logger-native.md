@@ -38,16 +38,13 @@ A write error ends the current message. The stream may already contain part of t
 ### Log to standard error
 ```silk
 import silk.core.effect { Effect }
-import silk.concurrency.sync { Arc }
 import silk.io.logger { Logger }
-import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.allocator { OutOfMemoryError }
 import silk.io.logger_native { StderrLogger }
 
 pub effect fn main() -> i32
   ! OutOfMemoryError {
-  let mut allocator = Allocator.systemAllocatorProvider()
-  let logger = run Arc<StderrLogger>.make(StderrLogger.make())
-    |> Effect.provideMut<Allocator>(&mut allocator)
+  let logger = run StderrLogger.shared()
   let values = .{ name: "silk", count: 3 }
 
   // Writes "info: silk started 3 workers" and a newline to standard error.
@@ -60,16 +57,13 @@ pub effect fn main() -> i32
 ### Log to standard output
 ```silk
 import silk.core.effect { Effect }
-import silk.concurrency.sync { Arc }
 import silk.io.logger { Logger }
-import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.allocator { OutOfMemoryError }
 import silk.io.logger_native { StdoutLogger }
 
 pub effect fn main() -> i32
   ! OutOfMemoryError {
-  let mut allocator = Allocator.systemAllocatorProvider()
-  let logger = run Arc<StdoutLogger>.make(StdoutLogger.make())
-    |> Effect.provideMut<Allocator>(&mut allocator)
+  let logger = run StdoutLogger.shared()
   let values = .{ name: "silk", count: 3 }
 
   // The logger adds no newline, so the template ends with one.
@@ -135,6 +129,26 @@ detection. At construction, the logger uses color when standard error is a termi
 `NO_COLOR` is not set or is empty, and `TERM` is not `dumb`. Later messages use the same
 answer. Windows also requires successful ANSI console-mode selection; redirected handles stay
 plain.
+
+<a id="StderrLogger.impl.shared"></a>
+
+### Associated function `shared`
+
+```silk
+pub effect fn shared() -> Arc<StderrLogger> ! OutOfMemoryError
+```
+
+Returns the logger of [`StderrLogger.make`](#StderrLogger.impl.make) in an `Arc`, ready for
+`Effect.provideAmbient<Logger>`. It allocates the `Arc` with the system allocator.
+
+#### Details
+
+The logger colors the level name when standard error is a terminal, `NO_COLOR` is not set or
+is empty, and `TERM` is not `dumb`. It checks once, here. On WASI it never colors.
+
+#### Errors
+
+- `OutOfMemoryError` if the system allocator cannot allocate the `Arc`.
 
 <a id="StderrLogger.impl.withColor"></a>
 
@@ -215,6 +229,25 @@ pub fn make() -> StdoutLogger
 ```
 
 Returns a logger. It does not write anything.
+
+<a id="StdoutLogger.impl.shared"></a>
+
+### Associated function `shared`
+
+```silk
+pub effect fn shared() -> Arc<StdoutLogger> ! OutOfMemoryError
+```
+
+Returns a logger in an `Arc`, ready for `Effect.provideAmbient<Logger>`. It allocates the
+`Arc` with the system allocator.
+
+#### Details
+
+The logger writes each formatted message to standard output, with no level and no newline.
+
+#### Errors
+
+- `OutOfMemoryError` if the system allocator cannot allocate the `Arc`.
 
 <a id="StdoutLogger.impl.Logger"></a>
 

@@ -36,16 +36,13 @@ None. A host cannot refuse a message.
 ## Examples
 ```silk,ignore
 import silk.core.effect { Effect }
-import silk.concurrency.sync { Arc }
 import silk.io.logger { Logger }
-import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.allocator { OutOfMemoryError }
 import silk.io.logger_console { ConsoleLogger }
 
 pub effect fn main() -> ()
   ! OutOfMemoryError {
-  let mut allocator = Allocator.systemAllocatorProvider()
-  let logger = run Arc<ConsoleLogger>.make(ConsoleLogger.make())
-    |> Effect.provideMut<Allocator>(&mut allocator)
+  let logger = run ConsoleLogger.shared()
   let values = .{ name: "silk", count: 3 }
 
   // Calls `console.info("silk started 3 workers")` in the host.
@@ -91,6 +88,25 @@ pub fn make() -> ConsoleLogger
 ```
 
 Returns a logger. It does not call the host.
+
+<a id="ConsoleLogger.impl.shared"></a>
+
+### Associated function `shared`
+
+```silk
+pub effect fn shared() -> Arc<ConsoleLogger> ! OutOfMemoryError
+```
+
+Returns a logger in an `Arc`, ready for `Effect.provideAmbient<Logger>`. It allocates the
+`Arc` with the system allocator and does not call the host.
+
+#### Details
+
+The logger passes each formatted message, with its level, to the host's console.
+
+#### Errors
+
+- `OutOfMemoryError` if the system allocator cannot allocate the `Arc`.
 
 <a id="writeWarning"></a>
 
