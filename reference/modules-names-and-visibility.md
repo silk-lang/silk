@@ -1067,12 +1067,13 @@ The module identity is the dependency's package identity and its path below that
 root; the dependency name plays no role. Two packages that depend on the same package share its
 modules and declarations, whatever names they give it.
 
-A dependency's `[package].silk-version` names the release line it was written for. A compiler
-builds it when the versions share a release line under the caret rule: before 1.0 the same minor
-version and an equal or later patch, so `0.3.2` accepts 0.3.2 through 0.3.x but never 0.4; from 1.0
-the same major version and an equal or later minor and patch. A prerelease such as a dev release
-matches only itself, and a prerelease compiler builds only dependencies written for it. A local
-`0.0.0` compiler builds every dependency.
+A dependency's `[package].silk-version` names the oldest release it was written for, in its release
+line. A compiler builds it when the compiler shares that release line under the caret rule and is
+the same release or a later one: before 1.0 the same minor version, so `0.3.2` accepts 0.3.2 through
+0.3.x but never 0.4; from 1.0 the same major version. A prerelease such as a dev release orders
+before its release by semantic version precedence, so `0.1.0-dev.90` accepts 0.1.0-dev.90, every
+later 0.1 dev release and 0.1.0, and a dev compiler never builds a package written for a later dev
+release. Build metadata plays no part. A local `0.0.0` compiler builds every dependency.
 
 **Boundary:** A dependency name must be an identifier other than `silk`, `silkc`, `Intrinsic`
 or `self`. When `package` is present it must equal the dependency's `[package].name`. Dependencies are
