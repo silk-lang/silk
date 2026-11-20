@@ -8,16 +8,16 @@ fixture="$repository/compiler/fixtures/ambient-services"
 output=$(mktemp -d)
 trap 'rm -rf "$output"' EXIT
 cp -R "$repository/stdlib" "$output/stdlib"
-cp "$fixture"/{observation,entries,counter,configured}.silk "$output/stdlib/silk/"
+cp "$fixture"/{observation,entries,counter,configured,context_probe}.silk "$output/stdlib/silk/"
 
 cat "$fixture/ownership.silk" >> "$output/stdlib/silk/concurrency/sync.silk"
 
-for main in main entries-main ownership-main scoped-main table-main same-member-main cancellation-main scheduler-main thread-main pool-main; do
+for main in main entries-main ownership-main scoped-main table-main same-member-main cancellation-main scheduler-main thread-main pool-main trace-context-main; do
   mkdir "$output/$main"
   cp "$fixture/$main.silk" "$output/$main/main.silk"
   "$compiler" build "$output/$main/main.silk" --stdlib "$output/stdlib" --clang "$clang" -o "$output/$main/native"
   "$output/$main/native"
-  if [[ $main == thread-main || $main == pool-main ]]; then
+  if [[ $main == thread-main || $main == pool-main || $main == trace-context-main ]]; then
     project="$output/$main"
     mkdir "$project/src"
     cp "$project/main.silk" "$project/src/main.silk"
