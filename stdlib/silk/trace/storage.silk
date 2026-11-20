@@ -1,0 +1,242 @@
+//! Pinned, preallocated storage for independently claimed recorder slots.
+
+import silk.collections.list { List }
+import silk.concurrency.atomic { Atomic, CompareExchange, MemoryOrder }
+import silk.core.option { Option }
+import silk.num.u64
+import silk.num.usize
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+
+/// The owner prevents reallocation or release until every operation has finished.
+pub struct Storage<T> { owner: List<T>, head: [*]mut T, pub length: usize }
+
+impl<T: Copy> Storage<T> {
+  /// Allocates and initializes every cell before publishing the recorder.
+  pub effect fn make(count: usize, initial: T) -> Self ! OutOfMemoryError ? &mut Allocator {
+    let capacity = if count == 0 { 1 } else { count }
+    let mut owner = run List<T>.makeWithCapacity(capacity)
+    let mut at: usize = 0
+    while at < capacity {
+      if !owner.appendWithinCapacity(initial) { Intrinsic.trap("short recorder allocation") }
+      at = at + 1
+    }
+    let head = unsafe Pointer.assumeManyMut(Pointer.fromMutRef(&mut owner.asMutSlice()[0]))
+    return Storage<T> {owner: move owner, head: head, length: count}
+  }
+  /// The caller owns the slot or accesses it only through atomics.
+  pub unsafe fn at(self: &Self, index: usize) -> *mut T {
+    if index >= self.length { Intrinsic.trap("recorder index out of range") }
+    return unsafe Pointer.atMut(self.head, index)
+  }
+}
+
+/// A bounded set of cells. Independent atomic states protect disjoint payloads.
+pub struct Slots<T> { states: Storage<u32>, payload: Storage<T> }
+impl<T: Copy> Slots<T> {
+  /// Allocates all cells before observation starts.
+  pub effect fn make(count: usize, initial: T) -> Self ! OutOfMemoryError ? &mut Allocator {
+    return Slots<T> {states: run Storage<u32>.make(count, 0), payload: run Storage<T>.make(count, initial)}
+  }
+  /// The configured number of slots.
+  pub fn length(self: &Self) -> usize { return self.states.length }
+
+  /// Claims a single cell when its state still matches the caller's observation.
+  pub fn claimAt(self: &Self, index: usize, from: u32, to: u32) -> bool {
+    if index >= self.states.length { return false }
+    let state = unsafe self.states.at(index)
+    if unsafe Atomic.load<u32>(state, MemoryOrder.Relaxed) != from { return false }
+    return match unsafe Atomic.compareExchange<u32>(state, from, to, MemoryOrder.Acquire, MemoryOrder.Relaxed) {
+      CompareExchange<u32>.Exchanged => true
+      CompareExchange<u32>.Observed {..} => false
+    }
+  }
+
+  /// Attempts one bounded sweep. Returns the capacity when no matching cell is available.
+  pub fn claim(self: &Self, first: usize, from: u32, to: u32) -> usize {
+    let count = self.states.length
+    let mut remaining = count
+    let mut at = if first >= count { 0 } else { first }
+    while remaining > 0 {
+      if self.claimAt(at, from, to) { return at }
+      remaining = remaining - 1
+      at = at + 1
+      if at == count { at = 0 }
+    }
+    return count
+  }
+
+  /// The caller holds an exclusive claim for this index.
+  pub unsafe fn at(self: &Self, index: usize) -> *mut T { return unsafe self.payload.at(index) }
+
+  /// Publishes the payload to a consumer or returns the cell to producers.
+  pub fn publish(self: &Self, index: usize, state: u32) -> () {
+    unsafe Atomic.store<u32>(unsafe self.states.at(index), state, MemoryOrder.Release)
+  }
+}
+
+// Both writers and collectors take an exclusive claim before inspecting the page header.
+// A partial page stays assigned to its thread until a drain seals it. The producer can run
+// on a new worker after suspension, so the page hint lives in worker TLS, never in a span.
+struct Page { owner: usize, read: usize, written: usize }
+impl Copy for Page {}
+const FREE: u32 = 0
+const BUSY: u32 = 1
+const PARTIAL: u32 = 2
+const READY: u32 = 3
+
+/// A pool of producer buffers with release/acquire handoff of full and partial pages.
+pub struct Buffers<T> { pages: Slots<Page>, values: Storage<T>, width: usize }
+impl<T: Copy> Buffers<T> {
+  /// Allocates all page headers and all record slots.
+  pub effect fn make(count: usize, width: usize, initial: T) -> Self ! OutOfMemoryError ? &mut Allocator {
+    if count != 0 && width > usize.MAX / count { fail OutOfMemoryError {} }
+    let pages = run Slots<Page>.make(count, Page {owner: 0, read: 0, written: 0})
+    return Buffers<T> {pages: move pages, values: run Storage<T>.make(count * width, initial), width: width}
+  }
+  /// The maximum number of buffered records.
+  pub fn length(self: &Self) -> usize { return self.values.length }
+
+  fn claimPartial(self: &Self, index: usize, owner: usize) -> bool {
+    if !self.pages.claimAt(index, PARTIAL, BUSY) { return false }
+    let page = unsafe Pointer.read(unsafe self.pages.at(index))
+    if page.owner == owner { return true }
+    self.pages.publish(index, PARTIAL)
+    return false
+  }
+
+  /// Appends to the worker's partial page or acquires a fresh one. No thread waits for a peer.
+  pub fn append(self: &Self, hint: &mut usize, owner: usize, value: &T) -> bool {
+    if self.width == 0 { return false }
+    let count = self.pages.length()
+    let mut pageIndex = count
+    if self.claimPartial(hint.*, owner) { pageIndex = hint.* }
+    if pageIndex == count {
+      pageIndex = self.pages.claim(hint.*, FREE, BUSY)
+      if pageIndex != count {
+        unsafe Pointer.write(unsafe self.pages.at(pageIndex), Page {owner: owner, read: 0, written: 0})
+      } else {
+        // An intervening operation on another recorder can displace this thread's hint.
+        // Reuse a still-owned page before reporting exhaustion.
+        let mut candidate: usize = 0
+        while candidate < count {
+          if self.claimPartial(candidate, owner) { pageIndex = candidate break }
+          candidate = candidate + 1
+        }
+        if pageIndex == count { return false }
+      }
+    }
+    let address = unsafe self.pages.at(pageIndex)
+    let mut page = unsafe Pointer.read(address)
+    unsafe Pointer.write(unsafe self.values.at(pageIndex * self.width + page.written), value.*)
+    page.written = page.written + 1
+    unsafe Pointer.write(address, page)
+    if page.written == self.width {
+      self.pages.publish(pageIndex, READY)
+      hint.* = pageIndex + 1
+    } else {
+      self.pages.publish(pageIndex, PARTIAL)
+      hint.* = pageIndex
+    }
+    return true
+  }
+
+  /// Drains ready pages before sealing a partial page. The next consumer can continue a page.
+  /// The caller supplies a live atomic word for the entire call. All concurrent accesses to it must be atomic.
+  pub unsafe fn take(self: &Self, hint: *mut u64) -> Option<T> {
+    let count = self.pages.length()
+    let first = u64.wrappingToUsize(unsafe Atomic.load<u64>(hint, MemoryOrder.Relaxed))
+    let mut index = self.pages.claim(first, READY, BUSY)
+    if index == count { index = self.pages.claim(first, PARTIAL, BUSY) }
+    if index == count { return Option<T>.none() }
+    let address = unsafe self.pages.at(index)
+    let mut page = unsafe Pointer.read(address)
+    let value = unsafe Pointer.read(unsafe self.values.at(index * self.width + page.read))
+    page.read = page.read + 1
+    unsafe Pointer.write(address, page)
+    if page.read == page.written {
+      self.pages.publish(index, FREE)
+      unsafe Atomic.store<u64>(hint, usize.toU64(index + 1), MemoryOrder.Relaxed)
+    } else {
+      self.pages.publish(index, READY)
+      unsafe Atomic.store<u64>(hint, usize.toU64(index), MemoryOrder.Relaxed)
+    }
+    return Option<T>.some(value)
+  }
+}
+
+// A free-stack word holds a generation and a one-based cell index. The all-ones word
+// permanently switches this pool to per-cell claims before a generation could repeat.
+// This makes an arbitrarily delayed compare-exchange safe even in very long-running services.
+fn taggedHead(previous: u64, index: u64) -> u64 {
+  let generation = u64.shiftRight(previous, 32)
+  if generation == 4294967294 { return u64.MAX }
+  return u64.bitOr(u64.shiftLeft(generation + 1, 32), index)
+}
+
+/// A bounded open-record pool with a lock-free free stack for cross-thread returns.
+pub struct Pool<T> { cells: Slots<T>, next: Storage<u64>, head: Storage<u64> }
+impl<T: Copy> Pool<T> {
+  /// Allocates the records and links the available cells.
+  pub effect fn make(capacity: usize, initial: T) -> Self ! OutOfMemoryError ? &mut Allocator {
+    let cells = run Slots<T>.make(capacity, initial)
+    let links = run Storage<u64>.make(capacity, 0)
+    let count = usize.toU64(capacity)
+    let top = if count > 4294967295 { u64.MAX } else { count }
+    let mut at: usize = 0
+    while at < capacity {
+      unsafe Pointer.write(unsafe links.at(at), usize.toU64(at))
+      at = at + 1
+    }
+    return Pool<T> {cells: move cells, next: move links, head: run Storage<u64>.make(1, top)}
+  }
+  /// The number of cells configured for open spans.
+  pub fn length(self: &Self) -> usize { return self.cells.length() }
+  /// Pops an open cell. Exhaustion returns the capacity as an out-of-range index.
+  pub fn acquire(self: &Self) -> usize {
+    let word = unsafe self.head.at(0)
+    while true {
+      let before = unsafe Atomic.load<u64>(word, MemoryOrder.Acquire)
+      if before == u64.MAX { return self.cells.claim(0, 0, 1) }
+      let first = u64.wrappingToU32(before)
+      if first == 0 { return self.length() }
+      let index = u64.toUsize(u64.bitAnd(before, 4294967295) - 1)
+      let next = unsafe Atomic.load<u64>(unsafe self.next.at(index), MemoryOrder.Relaxed)
+      let desired = taggedHead(before, next)
+      if let CompareExchange<u64>.Exchanged = unsafe Atomic.compareExchange<u64>(word, before, desired,
+        MemoryOrder.AcquireRelease, MemoryOrder.Relaxed) {
+        // A simultaneous transition to per-cell claiming may have claimed this record.
+        if desired != u64.MAX && self.cells.claimAt(index, 0, 1) { return index }
+      }
+    }
+    return self.length()
+  }
+  /// Only the opener of this record may read or write it until release.
+  pub unsafe fn at(self: &Self, index: usize) -> *mut T { return unsafe self.cells.at(index) }
+  /// Resolves a stored machine address to a slot, rejecting addresses outside this pool
+  /// or in the middle of a record. The address stays wide enough on 32-bit WebAssembly.
+  pub fn indexOf(self: &Self, address: u64) -> usize {
+    let count = self.cells.length()
+    if count == 0 { return count }
+    let first = usize.toU64(Pointer.address(unsafe self.cells.at(0)))
+    if address < first { return count }
+    let offset = address - first
+    let stride = usize.toU64(Intrinsic.layoutOf<T>().bytes)
+    if stride == 0 || offset % stride != 0 || offset / stride >= usize.toU64(count) { return count }
+    return u64.toUsize(offset / stride)
+  }
+
+  /// Releases a record even when its closing fiber runs on another worker.
+  pub fn release(self: &Self, index: usize) -> () {
+    self.cells.publish(index, 0)
+    let word = unsafe self.head.at(0)
+    while true {
+      let before = unsafe Atomic.load<u64>(word, MemoryOrder.Acquire)
+      if before == u64.MAX { return () }
+      unsafe Atomic.store<u64>(unsafe self.next.at(index), u64.bitAnd(before, 4294967295), MemoryOrder.Relaxed)
+      if let CompareExchange<u64>.Exchanged = unsafe Atomic.compareExchange<u64>(word, before,
+        taggedHead(before, usize.toU64(index + 1)), MemoryOrder.AcquireRelease, MemoryOrder.Relaxed) { return () }
+    }
+  }
+}

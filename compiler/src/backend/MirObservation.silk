@@ -1,0 +1,505 @@
+//! Proofs used when a discarded inline call and its result's cleanup have no observable effect.
+
+import backend.CleanupNeeds { CleanupNeeds }
+import backend.InstanceKey { InstanceKey }
+import backend.Mir {
+  Block,
+  Callee,
+  ErasureFact,
+  FailureEdge,
+  Local,
+  NonParkingRun,
+  SharedAccess,
+  LocalKind,
+  MirFunction,
+  Place,
+  Projection,
+  Rvalue,
+  Statement,
+  Terminator,
+  TrapSite,
+  Variable
+}
+import backend.MirWalk
+import semantic.DeclarationId { DeclarationId }
+import semantic.Type { Type }
+import silk.mem.shared { Shared }
+import silk.mem.interned { Interned }
+import semantic.TypedBody { AggregateField, Expression, NodeId, NodeKind, ReceiverPass, TypedBody }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.usize
+
+fn localSlot<'a>(slot: MirWalk.Slot<'a>) -> bool {
+  if let Option<&Place>.Some { value: place } = move MirWalk.slotPlace(move slot) {
+    let path = List<Projection>.asSlice(&place.projections)
+    let mut at = usize.ZERO
+    while at < path.length {
+      match &path[at] {
+        Projection.Deref => {
+          return false
+        }
+        Projection.Index { .. } => {
+          return false
+        }
+        _ => {}
+      }
+      at = at + usize.ONE
+    }
+  }
+  return true
+}
+
+effect fn note(callees: &mut List<InstanceKey>, key: &InstanceKey) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let listed = List<InstanceKey>.asSlice(&callees.*)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if run InstanceKey.sameInstance(&listed[at], key) {
+      return ()
+    }
+    at = at + usize.ONE
+  }
+  run List<InstanceKey>.append(&mut callees.*, InstanceKey.copy(key))
+  return ()
+}
+
+/// Collects the direct callees of a finite sequence of non-trapping local operations.
+/// Any indirect memory access or unknown operation prevents the proof.
+pub effect fn directCalls(function: &MirFunction, children: &mut List<InstanceKey>) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if function.releasesPackages || List<SharedAccess>.length(&function.accesses) != usize.ZERO
+    || List<ErasureFact>.length(&function.erasures) != usize.ZERO {
+    return false
+  }
+
+  // Proving each exact target terminates without effects also discharges the ambient
+  // operation's nonparking obligation. Keep structural and deferred obligations in MIR.
+  let obligations = List<NonParkingRun>.asSlice(&function.nonParking)
+  let mut proof = usize.ZERO
+  while proof < obligations.length {
+    let obligation = &obligations[proof]
+    if !obligation.exact || List<Interned<Type>>.length(&obligation.glues) != 0
+      || List<Interned<DeclarationId>>.length(&obligation.declarations) != 0 {
+      return false
+    }
+    let targets = List<InstanceKey>.asSlice(&obligation.callees)
+    let mut target = usize.ZERO
+    while target < targets.length {
+      if !run InstanceKey.sameInstance(&targets[target], &function.key) {
+        run note(&mut children.*, &targets[target])
+      }
+      target = target + usize.ONE
+    }
+    proof = proof + usize.ONE
+  }
+  let blocks = List<Block>.asSlice(&function.blocks)
+  let mut current = usize.ZERO
+  while current < blocks.length {
+    if blocks[current].suspends {
+      return false
+    }
+    let statements = List<Statement>.asSlice(&blocks[current].statements)
+    let mut at = usize.ZERO
+    while at < statements.length {
+      match &statements[at] {
+        Statement.Assign { value, .. } => {
+          let safe = match &value {
+            Rvalue.Use { .. } => true
+            Rvalue.Ref { .. } => true
+            Rvalue.AddressOf { .. } => true
+            Rvalue.Aggregate { .. } => true
+            Rvalue.Variant { .. } => true
+            Rvalue.Inject { .. } => true
+            Rvalue.Fill { .. } => true
+            _ => false
+          }
+          if !safe {
+            return false
+          }
+        }
+        Statement.Drop { glue, .. } => {
+          run note(&mut children.*, &glue)
+        }
+        _ => {
+          return false
+        }
+      }
+      let mut slot = usize.ZERO
+      while slot < MirWalk.statementSlots(&statements[at]) {
+        if !localSlot(MirWalk.statementSlot(&statements[at], slot)) {
+          return false
+        }
+        slot = slot + usize.ONE
+      }
+      at = at + usize.ONE
+    }
+    let term = &blocks[current].terminator
+    let next = match &term.* {
+      Terminator.Return { .. } => {
+        return true
+      }
+      Terminator.Goto { target, .. } => target
+      Terminator.Call { callee, failure, normal, .. } => {
+        if Option<FailureEdge>.isSome(&failure) {
+          return false
+        }
+        if let Callee.Instance { key } = &callee {
+          run note(&mut children.*, &key)
+        } else {
+          return false
+        }
+        let mut slot = usize.ZERO
+        while slot < MirWalk.terminatorSlots(term) {
+          if !localSlot(MirWalk.terminatorSlot(term, slot)) {
+            return false
+          }
+          slot = slot + usize.ONE
+        }
+        normal
+      }
+      _ => {
+        return false
+      }
+    }
+    if next <= current {
+      return false
+    }
+    current = next
+  }
+  return false
+}
+
+// Only arguments with neither observable evaluation nor ownership transfer can disappear.
+fn inertArgument(body: &TypedBody, node: NodeId, needs: &CleanupNeeds, borrowed: bool) -> bool {
+  if let NodeKind.Expression { form, .. } = &TypedBody.nodeSlice(body)[node.index].kind {
+    if CleanupNeeds.node(needs, node.index) {
+      if !borrowed {
+        return false
+      }
+      match &form {
+        Expression.Local { .. } => {}
+        Expression.Field { .. } => {}
+        _ => {
+          return false
+        }
+      }
+    }
+    return match &form {
+      Expression.Text { .. } => true
+      Expression.Integer { .. } => true
+      Expression.Float { .. } => true
+      Expression.Boolean { .. } => true
+      Expression.Unit => true
+      Expression.EnumMember { .. } => true
+      Expression.Constant { .. } => true
+      Expression.ConcretePrefix { operand, .. } => match &TypedBody.nodeSlice(
+        body,
+      )[operand.index].kind {
+        NodeKind.Expression { form: Expression.Integer { .. }, .. } => true
+        NodeKind.Expression { form: Expression.Float { .. }, .. } => true
+        NodeKind.Expression { form: Expression.Boolean { .. }, .. } => true
+        _ => false
+      }
+      Expression.Embedded { .. } => true
+      Expression.Local { .. } => true
+      Expression.Borrow { value, .. } => inertArgument(body, value, needs, true)
+      Expression.Field { value, .. } => inertArgument(body, value, needs, borrowed)
+      Expression.Aggregate { fields, .. } => {
+        let values = List<AggregateField>.asSlice(&fields)
+        let mut at = usize.ZERO
+        while at < values.length {
+          if !inertArgument(body, values[at].value, needs, false) {
+            return false
+          }
+          at = at + usize.ONE
+        }
+        true
+      }
+      _ => false
+    }
+  }
+  return false
+}
+
+/// An expression statement or an unused immutable binding with a direct initializer.
+pub struct Site {
+  pub statement: usize,
+  pub cleanup: Option<Interned<Type>>,
+  pub local: usize
+}
+
+// Maps a directly discarded call to its statement. Uses of binding locals include the
+// local reads which construct a closure's captured environment.
+pub struct Sites {
+  statements: List<usize>,
+  reads: List<bool>,
+  pub hasDrops: bool
+}
+
+pub effect fn sites(typed: &Shared<TypedBody>) -> Sites
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let count = Shared<TypedBody>.with<usize>(
+    typed,
+    |body: &TypedBody| -> usize {
+      return TypedBody.nodeSlice(body).length
+    },
+  )
+  let locals = Shared<TypedBody>.with<usize>(
+    typed,
+    |body: &TypedBody| -> usize {
+      return TypedBody.localSlice(body).length
+    },
+  )
+  let mut statements = List<usize>.make()
+  let mut reads = List<bool>.make()
+  run List<usize>.appendRepeated(&mut statements, usize.MAX, count)
+  run List<bool>.appendRepeated(&mut reads, false, locals)
+  let hasDrops = Shared<TypedBody>.with<bool>(
+    typed,
+    |body: &TypedBody| -> bool {
+      let nodes = TypedBody.nodeSlice(body)
+      let mut drops = false
+
+      // Children precede their parent in the typed arena. Visit a drop before its local
+      // operand so that an explicit early close does not make the binding appear observed.
+      let mut at = nodes.length
+      while at != usize.ZERO {
+        at = at - usize.ONE
+        match &nodes[at].kind {
+          NodeKind.Expression { form: Expression.Local { local }, .. } => {
+            if List<usize>.get(&statements, at) == usize.MAX {
+              List<bool>.set(&mut reads, local.index, true)
+            }
+          }
+          NodeKind.Drop { value, .. } => {
+            let operand = match &nodes[value.index].kind {
+              NodeKind.Expression { form: Expression.Move { value: child, .. }, .. } => child
+              _ => value
+            }
+            if let NodeKind.Expression {
+              form: Expression.Local { .. },
+              ..
+            } = &nodes[operand.index].kind {
+              List<usize>.set(&mut statements, operand.index, at)
+              drops = true
+            }
+          }
+          NodeKind.Block { statements: children, .. } => {
+            let ids = List<NodeId>.asSlice(&children)
+            let mut i = usize.ZERO
+            while i < ids.length {
+              let statement = ids[i].index
+              let expression = match &nodes[statement].kind {
+                NodeKind.LocalBinding { initializer, .. } => initializer.index
+                NodeKind.Drop { value, .. } => value.index
+                _ => statement
+              }
+              let call = match &nodes[expression].kind {
+                NodeKind.Expression { form: Expression.Run { value, .. }, .. } => value.index
+                _ => expression
+              }
+              if let NodeKind.Expression {
+                form: Expression.DirectCall { constructs, .. },
+                ..
+              } = &nodes[call].kind {
+                if constructs == (call != expression) {
+                  List<usize>.set(&mut statements, call, statement)
+                }
+              }
+              i = i + usize.ONE
+            }
+          }
+          _ => {}
+        }
+      }
+      return drops
+    },
+  )
+  return Sites { statements: move statements, reads: move reads, hasDrops: hasDrops }
+}
+
+/// Returns the discarded call's statement and the cleanup type its erasure must prove inert.
+pub fn site(body: &Shared<TypedBody>, sites: &Sites, call: NodeId, needs: &CleanupNeeds) -> Option<Site> {
+  let statement = List<usize>.get(&sites.statements, call.index)
+  if statement == usize.MAX {
+    return Option<Site>.none()
+  }
+  return Shared<TypedBody>.with<Option<Site>>(body, |typed: &TypedBody| -> Option<Site> {
+    return discardedCall(typed, sites, call, needs, statement)
+  })
+}
+
+fn discardedCall(body: &TypedBody, sites: &Sites, call: NodeId, needs: &CleanupNeeds, statement: usize) -> Option<Site> {
+  let nodes = TypedBody.nodeSlice(body)
+  let mut local = usize.MAX
+  let mut expression = statement
+  match &nodes[statement].kind {
+    NodeKind.LocalBinding { local: bound, initializer } => {
+      if List<bool>.get(&sites.reads, bound.index) {
+        return Option<Site>.none()
+      }
+      local = bound.index
+      expression = initializer.index
+    }
+    NodeKind.Drop { value, .. } => {
+      expression = value.index
+    }
+    _ => {}
+  }
+  if let NodeKind.Expression {
+    form: Expression.DirectCall { arguments, receiverPass, .. },
+    ..
+  } = &nodes[call.index].kind {
+    if Option<ReceiverPass>.isSome(&receiverPass) {
+      return Option<Site>.none()
+    }
+    let values = List<NodeId>.asSlice(&arguments)
+    let mut at = usize.ZERO
+    while at < values.length {
+      if !inertArgument(body, values[at], needs, false) {
+        return Option<Site>.none()
+      }
+      at = at + usize.ONE
+    }
+    let mut cleanup = Option<Interned<Type>>.none()
+    if CleanupNeeds.node(needs, expression) || CleanupNeeds.local(needs, local) {
+      if let NodeKind.Expression { ty, .. } = &nodes[expression].kind {
+        cleanup = Option<Interned<Type>>.some(Interned<Type>.clone(&ty))
+      } else {
+        return Option<Site>.none()
+      }
+    }
+    return Option<Site>.some(Site { statement: statement, cleanup: move cleanup, local: local })
+  }
+  return Option<Site>.none()
+}
+
+/// Remove the explicit drops (possibly in distinct branches) of precisely the bindings
+/// whose initializer and cleanup were proven unobservable.
+pub effect fn elideDrops(
+  body: &Shared<TypedBody>,
+  sites: &Sites,
+  bindings: &[usize],
+  initial: List<bool>,
+) -> List<bool>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut elided = move initial
+  let statements = List<usize>.asSlice(&sites.statements)
+  let remaining = statements.length - List<bool>.length(&elided)
+  run List<bool>.appendRepeated(&mut elided, false, remaining)
+  Shared<TypedBody>.with<()>(
+    body,
+    |typed: &TypedBody| -> () {
+      let nodes = TypedBody.nodeSlice(typed)
+      let mut at = usize.ZERO
+      while at < nodes.length {
+        if statements[at] != usize.MAX {
+          if let NodeKind.Expression { form: Expression.Local { local }, .. } = &nodes[at].kind {
+            let mut bound = usize.ZERO
+            while bound < bindings.length {
+              if bindings[bound] == local.index {
+                List<bool>.set(&mut elided, statements[at], true)
+              }
+              bound = bound + usize.ONE
+            }
+          }
+        }
+        at = at + usize.ONE
+      }
+      return ()
+    },
+  )
+  return move elided
+}
+
+pub effect fn removeBindings(function: &mut MirFunction, removed: &[usize]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if removed.length == usize.ZERO {
+    return ()
+  }
+  let mut names = List<usize>.make()
+  let count = List<Local>.length(&function.locals)
+  let mut kept = usize.ZERO
+  let mut at = usize.ZERO
+  while at < count {
+    let mut i = usize.ZERO
+    while i < removed.length && at != removed[i] + usize.ONE {
+      i = i + usize.ONE
+    }
+    if i < removed.length {
+      run List<usize>.append(&mut names, usize.MAX)
+    } else {
+      run List<usize>.append(&mut names, kept)
+      kept = kept + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  let mapping = List<usize>.asSlice(&names)
+  while at != usize.ZERO {
+    at = at - usize.ONE
+    if mapping[at] == usize.MAX {
+      drop List<Local>.remove(&mut function.locals, at)
+    } else {
+      let mut slot = &mut List<Local>.asMutSlice(&mut function.locals)[at]
+      if let LocalKind.User { .. } = &slot.kind {
+        slot.kind = LocalKind.User { index: mapping[at] - usize.ONE }
+      }
+      if let LocalKind.DropFlag { local, path } = &mut slot.kind {
+        local = mapping[local]
+        let mut steps = List<Projection>.asMutSlice(&mut path)
+        let mut step = usize.ZERO
+        while step < steps.length {
+          if let Projection.Index { local: index } = &mut steps[step] {
+            index = mapping[index]
+          }
+          step = step + usize.ONE
+        }
+      }
+    }
+  }
+  let mut blocks = List<Block>.asMutSlice(&mut function.blocks)
+  at = usize.ZERO
+  while at < blocks.length {
+    let mut statements = List<Statement>.asMutSlice(&mut blocks[at].statements)
+    let mut i = usize.ZERO
+    while i < statements.length {
+      MirWalk.renameStatement(&mut statements[i], mapping)
+      i = i + usize.ONE
+    }
+    MirWalk.renameTerminator(&mut blocks[at].terminator, mapping)
+    at = at + usize.ONE
+  }
+  let mut traps = List<TrapSite>.asMutSlice(&mut function.traps)
+  at = usize.ZERO
+  while at < traps.length {
+    if traps[at].observer != usize.MAX {
+      traps[at].observer = mapping[traps[at].observer]
+    }
+    if traps[at].cause != usize.MAX {
+      traps[at].cause = mapping[traps[at].cause]
+    }
+    if traps[at].site != usize.MAX {
+      traps[at].site = mapping[traps[at].site]
+    }
+    at = at + usize.ONE
+  }
+  at = List<Variable>.length(&function.variables)
+  while at != usize.ZERO {
+    at = at - usize.ONE
+    let local = List<Variable>.asSlice(&function.variables)[at].local
+    if mapping[local] == usize.MAX {
+      drop List<Variable>.remove(&mut function.variables, at)
+    } else {
+      let mut variables = List<Variable>.asMutSlice(&mut function.variables)
+      variables[at].local = mapping[local]
+    }
+  }
+  return ()
+}
