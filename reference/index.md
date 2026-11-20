@@ -88,6 +88,7 @@ not belong in a language rule unless a program can observe them.
 - [Requirements and services](requirements-and-services.md) — runtime-provided capabilities,
   dependency-eligible interfaces, conformances, roles, access, provision, and requirement-row
   operations.
+- [Tracing](tracing.md) covers function and manual spans, context propagation, and OpenTelemetry export.
 - [Typed failures](typed-failures.md) — ordinary failure values, propagation, recovery, cleanup,
   diagnostic context, and fatal traps.
 - [Language style guide](style-guide.md) — non-semantic naming and data-first actor-function
