@@ -1,0 +1,303 @@
+//! Bounded recorder storage for structured logs and cumulative metric series.
+
+import silk.collections.list { List }
+import silk.concurrency.atomic { Atomic, CompareExchange, MemoryOrder }
+import silk.concurrency.thread { Concurrent, Transferable }
+import silk.concurrency.sync { Mutex, MutexGuard }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.num.i64
+import silk.num.f64
+import silk.num.u64
+import silk.trace.context { SpanContext }
+import silk.trace.values { Attributes, Text }
+import silk.trace.storage { Buffers, Storage }
+
+/// A log record carries its event timestamp, severity, message template and rendered fields.
+pub struct LogRecord {
+  /// Event timestamp in Unix nanoseconds.
+  pub time: u64,
+  /// OpenTelemetry severity number.
+  pub severity: u64,
+  /// The static format template before argument substitution.
+  pub template: string<'static>,
+  /// The rendered message, retained in bounded UTF-8 storage.
+  pub body: Text,
+  /// Typed fields supplied with the event.
+  pub attributes: Attributes,
+  /// Trace identifiers when a span was active at the log call.
+  pub context: Option<SpanContext>,
+}
+impl Copy for LogRecord {}
+
+/// An OpenTelemetry instrument's aggregation and monotonicity.
+pub enum InstrumentKind { Counter, UpDownCounter, Gauge, Histogram }
+
+/// One cumulative series as observed by an exporter.
+pub struct MetricPoint {
+  /// Static instrument name.
+  pub name: string<'static>,
+  /// Instrument kind selecting the active numeric fields.
+  pub kind: InstrumentKind,
+  /// The attributes identifying this time series.
+  pub attributes: Attributes,
+  /// Whether this point combines observations beyond the series limit.
+  pub overflow: bool,
+  /// Unix timestamp in nanoseconds of the first observation in the series.
+  pub start: u64,
+  /// Unix timestamp in nanoseconds supplied for this snapshot.
+  pub time: u64,
+  /// Monotonic counter sum or number of histogram observations.
+  pub count: u64,
+  /// Signed sum for an up-down counter.
+  pub adjustment: i64,
+  /// Latest gauge sample or sum of histogram observations.
+  pub value: f64,
+  /// Histogram bucket counts in increasing boundary order, including the last unbounded bucket.
+  pub buckets: [u64; 16],
+}
+impl Copy for MetricPoint {}
+
+/// The inclusive upper boundaries of histogram buckets. The last bucket has no upper bound.
+pub fn histogramBounds() -> [f64; 15] {
+  return [0.0, 5.0, 10.0, 25.0, 50.0, 75.0, 100.0, 250.0, 500.0, 750.0, 1000.0, 2500.0, 5000.0, 7500.0, 10000.0]
+}
+
+const INSTRUMENTS: usize = 16
+const SERIES: usize = 8
+fn producerHint() -> *mut usize { return Intrinsic.threadSlot<usize>() }
+
+struct Instrument { hash: u64, name: string<'static>, kind: InstrumentKind }
+impl Copy for Instrument {}
+struct Key { start: u64, attributes: Attributes }
+impl Copy for Key {}
+
+struct Directory {
+  instruments: List<Instrument>,
+  keys: List<Option<Key>>,
+}
+
+// Each numeric row has a stable address in this allocation, which is kept alive by its owner.
+// Only atomics access these words after publication. A histogram update covers several words,
+// so readers and writers take its short gate when copying the count, sum and buckets.
+struct Words { storage: Storage<u64> }
+impl Transferable for Words {}
+impl Concurrent for Words {}
+impl Words {
+  effect fn make(length: usize) -> Self ! OutOfMemoryError ? &mut Allocator {
+    return Words {storage: run Storage<u64>.make(length, 0)}
+  }
+  fn word(self: &Self, index: usize) -> *mut u64 { return unsafe self.storage.at(index) }
+  fn read(self: &Self, index: usize) -> u64 {
+    return unsafe Atomic.load<u64>(self.word(index), MemoryOrder.Relaxed)
+  }
+  fn store(self: &Self, index: usize, value: u64) -> () {
+    unsafe Atomic.store<u64>(self.word(index), value, MemoryOrder.Relaxed)
+  }
+  fn add(self: &Self, index: usize, amount: u64) -> () {
+    drop unsafe Atomic.fetchAdd<u64>(self.word(index), amount, MemoryOrder.Relaxed)
+  }
+  // Preserve the numeric range when a single update would otherwise wrap a cumulative sum.
+  fn addSum(self: &Self, index: usize, delta: u64, static signed: bool) -> () {
+    let target = self.word(index)
+    let mut before = unsafe Atomic.load<u64>(target, MemoryOrder.Relaxed)
+    while true {
+      let after = if signed {
+        i64.wrappingToU64(i64.saturatingAdd(u64.wrappingToI64(before), u64.wrappingToI64(delta)))
+      } else { u64.saturatingAdd(before, delta) }
+      if before == after { return () }
+      match unsafe Atomic.compareExchange<u64>(target, before, after, MemoryOrder.Relaxed, MemoryOrder.Relaxed) {
+        CompareExchange<u64>.Exchanged => { return () }
+        CompareExchange<u64>.Observed {value} => { before = value }
+      }
+    }
+  }
+  fn lock(self: &Self, index: usize) -> () {
+    while true {
+      if let CompareExchange<u64>.Exchanged = unsafe Atomic.compareExchange<u64>(self.word(index), 0, 1, MemoryOrder.Acquire, MemoryOrder.Relaxed) { return () }
+    }
+  }
+  fn unlock(self: &Self, index: usize) -> () {
+    unsafe Atomic.store<u64>(self.word(index), 0, MemoryOrder.Release)
+  }
+}
+
+const STRIDE: usize = 19
+const DROPPED_LOGS: usize = 0
+const DROPPED_METRICS: usize = 1
+const LOG_READ: usize = 2
+const FIRST_SERIES: usize = 3
+
+// The directory is held only across bounded key comparisons, and never across rendering or export.
+fn acquire<'a,T>(lock: &'a Mutex<T>) -> MutexGuard<'a,T> {
+  while true {
+    if let Option<MutexGuard<'a,T>>.Some {value} = lock.tryLock() { return move value }
+  }
+  Intrinsic.trap("unreachable")
+}
+
+/// Owns the fixed-capacity log queue, instrument directory and cumulative aggregations.
+pub struct SignalState {
+  logs: Buffers<LogRecord>,
+  directory: Option<Mutex<Directory>>,
+  numbers: Words,
+}
+
+impl SignalState {
+  /// Preallocates log pages. When metrics are enabled, reserves eight series and one overflow series for each of 16 instruments.
+  pub effect fn make(pages: usize, width: usize, static metrics: bool) -> Self ! OutOfMemoryError ? &mut Allocator {
+    let empty = LogRecord {time: 0, severity: 0, template: "", body: Text.empty(), attributes: Attributes.empty(),
+      context: Option<SpanContext>.none()}
+    let logs = run Buffers<LogRecord>.make(pages, width, empty)
+    static if metrics {
+      let capacity = INSTRUMENTS * (SERIES + 1)
+      let mut keys = run List<Option<Key>>.makeWithCapacity(capacity)
+      let mut i: usize = 0
+      while i < capacity {
+        drop keys.appendWithinCapacity(Option<Key>.none())
+        i = i + 1
+      }
+      let directory = Directory {instruments: run List<Instrument>.makeWithCapacity(INSTRUMENTS), keys: move keys}
+      let gate = run Mutex<Directory>.make(move directory)
+      return SignalState {logs: move logs, directory: Option<Mutex<Directory>>.some(move gate),
+        numbers: run Words.make(FIRST_SERIES + STRIDE * capacity)}
+    } else {
+      return SignalState {logs: move logs, directory: Option<Mutex<Directory>>.none(), numbers: run Words.make(FIRST_SERIES)}
+    }
+  }
+
+  /// Appends to a per-thread page or counts a drop when no page is available.
+  pub fn appendLog(self: &Self, record: LogRecord) -> () {
+    let slot = producerHint()
+    let mut hint = unsafe Pointer.read(slot)
+    if !self.logs.append(&mut hint, Pointer.address(slot), &record) { self.countDroppedLogs(1) }
+    unsafe Pointer.write(slot, hint)
+  }
+
+  /// Returns the maximum number of pending log records the recorder can hold.
+  pub fn logCapacity(self: &Self) -> usize { return self.logs.length() }
+
+  /// Takes one pending log from a full or partially filled thread page.
+  pub fn takeLog(self: &Self) -> Option<LogRecord> {
+    return unsafe self.logs.take(self.numbers.word(LOG_READ))
+  }
+
+  /// Counts records permanently lost during export or enqueue.
+  pub fn countDroppedLogs(self: &Self, count: u64) -> () { self.numbers.add(DROPPED_LOGS, count) }
+  /// Returns the cumulative count of dropped log records.
+  pub fn droppedLogs(self: &Self) -> u64 { return self.numbers.read(DROPPED_LOGS) }
+  /// Adds the number of metric points permanently rejected by an exporter.
+  pub fn countDroppedMetrics(self: &Self, count: u64) -> () { self.numbers.add(DROPPED_METRICS, count) }
+  /// Returns the cumulative count of updates over the instrument limit and permanently rejected points.
+  pub fn droppedMetrics(self: &Self) -> u64 { return self.numbers.read(DROPPED_METRICS) }
+
+  /// Returns the number of possible metric slots, including overflow slots.
+  pub fn metricCapacity(self: &Self) -> usize {
+    return if self.directory.isSome() { INSTRUMENTS * (SERIES + 1) } else { 0 }
+  }
+
+  // A newly visible series must already hold its first observation. Initialize it while the
+  // directory is locked; subsequent numeric updates run after releasing that lock.
+  fn existingSeries(self: &Self, hash: u64, name: string<'static>, kind: InstrumentKind, attrs: &Attributes, time: u64,
+    count: u64, value: f64) -> Option<usize> {
+    let mut guard = match &self.directory {
+      Option<Mutex<Directory>>.Some {value: lock} => acquire(&lock)
+      Option<Mutex<Directory>>.None => { return Option<usize>.none() }
+    }
+    let dir = guard.getMut()
+    let mut instrument: usize = 0
+    while instrument < dir.instruments.length() {
+      let key = dir.instruments.asSlice()[instrument]
+      if key.hash == hash && key.kind == kind && key.name == name { break }
+      instrument = instrument + 1
+    }
+    if instrument == dir.instruments.length() {
+      if instrument == INSTRUMENTS {
+        self.numbers.add(DROPPED_METRICS, 1)
+        return Option<usize>.none()
+      }
+      drop dir.instruments.appendWithinCapacity(Instrument {hash: hash, name: name, kind: kind})
+    }
+    let first = instrument * (SERIES + 1)
+    let keys = dir.keys.asMutSlice()
+    let mut index = first
+    while index < first + SERIES {
+      if let Option<Key>.Some {value: stored} = &keys[index] {
+        if stored.attributes.equivalent(attrs) { return Option<usize>.some(index) }
+      } else {
+        keys[index] = Option<Key>.some(Key {start: time, attributes: attrs.*})
+        self.aggregate(index, kind, count, value)
+        return Option<usize>.none()
+      }
+      index = index + 1
+    }
+    if keys[index].isNone() {
+      keys[index] = Option<Key>.some(Key {start: time, attributes: Attributes.empty()})
+      self.aggregate(index, kind, count, value)
+      return Option<usize>.none()
+    }
+    return Option<usize>.some(index)
+  }
+
+  /// Adds an observation to a series. The count argument holds the signed delta's bits for up-down counters.
+  pub fn observe(self: &Self, hash: u64, name: string<'static>, kind: InstrumentKind, attrs: &Attributes, time: u64, count: u64, value: f64) -> () {
+    if let Option<usize>.Some {value: index} = self.existingSeries(hash, name, kind, attrs, time, count, value) {
+      self.aggregate(index, kind, count, value)
+    }
+  }
+
+  fn aggregate(self: &Self, index: usize, kind: InstrumentKind, count: u64, value: f64) -> () {
+    let base = FIRST_SERIES + STRIDE * index
+    match kind {
+      InstrumentKind.Counter => self.numbers.addSum(base + 1, count, false)
+      InstrumentKind.UpDownCounter => self.numbers.addSum(base + 1, count, true)
+      InstrumentKind.Gauge => self.numbers.store(base + 2, f64.toBits(value))
+      InstrumentKind.Histogram => {
+        let bounds = histogramBounds()
+        let mut bucket: usize = 0
+        while bucket < bounds.length && value > bounds[bucket] { bucket = bucket + 1 }
+        self.numbers.lock(base)
+        self.numbers.add(base + 1, 1)
+        self.numbers.store(base + 2, f64.toBits(f64.fromBits(self.numbers.read(base + 2)) + value))
+        self.numbers.add(base + 3 + bucket, 1)
+        self.numbers.unlock(base)
+      }
+    }
+  }
+
+  /// Copies a cumulative data point at the supplied export timestamp.
+  pub fn metricAt(self: &Self, index: usize, time: u64) -> Option<MetricPoint> {
+    if index >= self.metricCapacity() { return Option<MetricPoint>.none() }
+    let guard = match &self.directory {
+      Option<Mutex<Directory>>.Some {value: lock} => acquire(&lock)
+      Option<Mutex<Directory>>.None => { return Option<MetricPoint>.none() }
+    }
+    let directory = guard.get()
+    let key = match &directory.keys.asSlice()[index] {
+      Option<Key>.Some {value} => value
+      Option<Key>.None => { return Option<MetricPoint>.none() }
+    }
+    if time < key.start { return Option<MetricPoint>.none() }
+    let instrument = directory.instruments.asSlice()[index / (SERIES + 1)]
+    let base = FIRST_SERIES + STRIDE * index
+    let mut buckets: [u64; 16] = [0; 16]
+    if instrument.kind == InstrumentKind.Histogram {
+      self.numbers.lock(base)
+      let mut i: usize = 0
+      while i < buckets.length {
+        buckets[i] = self.numbers.read(base + 3 + i)
+        i = i + 1
+      }
+    }
+    let number = self.numbers.read(base + 1)
+    let value = f64.fromBits(self.numbers.read(base + 2))
+    if instrument.kind == InstrumentKind.Histogram { self.numbers.unlock(base) }
+    return Option<MetricPoint>.some(MetricPoint {
+      name: instrument.name, kind: instrument.kind, attributes: key.attributes, start: key.start, time: time,
+      overflow: index % (SERIES + 1) == SERIES, count: number, adjustment: u64.wrappingToI64(number),
+      value: value, buckets: buckets,
+    })
+  }
+}

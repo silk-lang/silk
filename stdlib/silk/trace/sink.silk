@@ -1,0 +1,305 @@
+//! Destinations for recorder batches. Export runs in the caller's effect.
+
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Drop }
+import silk.core.result { Result }
+import silk.http.client { Http, HttpError, HttpErrorKind, Request, Response }
+import silk.io.writer { Writer, WriterError }
+import silk.json.value { Json, Value }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u64
+import silk.num.usize
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.text.string { String }
+import silk.text.format { Debug, Format, Formatter }
+import silk.trace.otlp as OtlpJson
+import silk.trace.otlp { Batch, Resource }
+import silk.trace.record { Recorder, Span }
+import silk.trace.record as Records
+import silk.trace.signals { LogRecord, MetricPoint }
+
+/// An in-memory destination that retains copies of finished observations.
+pub type Memory = Records.Memory
+
+/// Receives one borrowed signal batch. A successful result is the count rejected by the destination.
+pub interface Sink<E, ?R> {
+  /// Consumes the borrowed batch and returns how many observations the destination rejected.
+  effect fn send(self: &mut Self, identity: &Resource, batch: &Batch<'_>) -> u64 ! E ? R
+}
+
+impl Sink<OutOfMemoryError ? &mut Allocator> for Memory {
+  effect fn send(self: &mut Self, identity: &Resource, batch: &Batch<'_>) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    match &batch.* {
+      Batch.Spans {values} => run self.appendSpans(values)
+      Batch.Logs {values} => run self.appendLogs(values)
+      Batch.Metrics {values, ..} => run self.appendMetrics(values)
+    }
+    return 0
+  }
+}
+
+/// Writes a complete, newline-delimited OTLP JSON request to the active Writer for each batch.
+pub struct Console {}
+impl Sink<WriterError ? &mut Writer> for Console {
+  effect fn send(self: &mut Self, identity: &Resource, batch: &Batch<'_>) -> u64 ! WriterError ? &mut Writer {
+    run OtlpJson.write(identity, batch)
+    run Writer.writeAll(b"\n")
+    run Writer.flush()
+    return 0
+  }
+}
+
+/// A collector returned an unexpected response or exhausted the retry limit.
+pub struct OtlpResponseError {
+  /// The HTTP status received for the final attempt.
+  pub status: u16,
+}
+
+impl Debug for OtlpResponseError {
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return run Format.debugFields(self, "OtlpResponseError", &mut formatter)
+  }
+}
+
+/// An OTLP/HTTP destination. It posts JSON using the active Http client.
+pub struct Otlp<'url> { base: string<'url> }
+
+impl<'url> Otlp<'url> {
+  /// Uses the collector base URL, including any path prefix, for all three signals.
+  pub fn http(base: string<'url>) -> Otlp<'url> { return Otlp<'url> {base: base} }
+}
+
+fn retryable(code: u16) -> bool {
+  return code == 429 || code == 502 || code == 503 || code == 504
+}
+
+// Retry-After delay-seconds takes precedence over our exponential delay.
+fn delay(response: &Response, fallback: u64) -> u64 {
+  if let Option<&[u8]>.Some {value} = response.header("Retry-After") {
+    let text = String.fromUtf8(value).unwrapOr("")
+    if let Result.Success {value: seconds} = u64.parse(text) {
+      if seconds <= u64.MAX / 1000000000 { return seconds * 1000000000 }
+    }
+  }
+  return fallback
+}
+
+fn path(batch: &Batch<'_>) -> string<'static> {
+  return match &batch.* {
+    Batch.Spans {..} => "v1/traces"
+    Batch.Logs {..} => "v1/logs"
+    Batch.Metrics {..} => "v1/metrics"
+  }
+}
+
+fn rejectionKey(batch: &Batch<'_>) -> string<'static> {
+  return match &batch.* {
+    Batch.Spans {..} => "rejectedSpans"
+    Batch.Logs {..} => "rejectedLogRecords"
+    Batch.Metrics {..} => "rejectedDataPoints"
+  }
+}
+
+fn recordsIn(identity: &Resource, batch: &Batch<'_>) -> u64 {
+  match &batch.* {
+    Batch.Spans {values} => { return usize.toU64(values.length) }
+    Batch.Logs {values} => { return usize.toU64(values.length) }
+    Batch.Metrics {values, includeDrops, ..} => {
+      let mut count = usize.toU64(values.length)
+      if includeDrops {
+        if identity.droppedSpans != 0 { count = count + 1 }
+        if identity.droppedLogs != 0 { count = count + 1 }
+        if identity.droppedMetrics != 0 { count = count + 1 }
+      }
+      return count
+    }
+  }
+}
+
+fn rejectedValue(field: &Value) -> Option<u64> {
+  let present = Option<&Value>.some(field)
+  if let Option<u64>.Some {value} = Json.asU64(present) { return Option<u64>.some(value) }
+  if let Option<string>.Some {value} = Json.asString(present) {
+    if let Result.Success {value: count} = u64.parse(value) { return Option<u64>.some(count) }
+  }
+  return Option<u64>.none()
+}
+
+effect fn rejected(response: &Response, identity: &Resource, batch: &Batch<'_>) -> u64
+! OtlpResponseError | HttpError | OutOfMemoryError ? &mut Allocator {
+  if response.body().length == 0 { return 0 }
+  let body = run response.json()
+  if let Value.Object {..} = &body {
+    let partial = match Json.field(&body, "partialSuccess") {
+      Option<&Value>.None => { return 0 }
+      Option<&Value>.Some {value} => value
+    }
+    if let Value.Null = &partial.* { return 0 }
+    if let Value.Object {..} = &partial.* {
+      let field = match Json.field(partial, rejectionKey(batch)) {
+        Option<&Value>.None => { return 0 }
+        Option<&Value>.Some {value} => value
+      }
+      if let Value.Null = &field.* { return 0 }
+      if let Option<u64>.Some {value} = rejectedValue(field) {
+        if value <= recordsIn(identity, batch) { return value }
+      }
+    }
+  }
+  fail OtlpResponseError {status: response.status()}
+}
+
+impl<'url> Sink<OtlpResponseError | HttpError | OutOfMemoryError | WriterError ? &mut Allocator | &mut Http | &mut MonotonicClock> for Otlp<'url> {
+  effect fn send(self: &mut Self, identity: &Resource, batch: &Batch<'_>) -> u64
+  ! OtlpResponseError | HttpError | OutOfMemoryError | WriterError ? &mut Allocator | &mut Http | &mut MonotonicClock {
+    let payload = run OtlpJson.encode(identity, batch)
+    let mut url = run String.copy(self.base)
+    if !String.endsWith(self.base, "/") { run url.append("/") }
+    run url.append(path(batch))
+    let mut attempt: usize = 0
+    let mut backoff: u64 = 100000000
+    while true {
+      let request = Request.post(url.view()).bytes(payload.asSlice(), "application/json")
+      let sent = run Effect.result(Http.send(move request))
+      let mut wait = backoff
+      match move sent {
+        Result.Success {value: response} => {
+          let status = response.status()
+          if status == 200 { return run rejected(&response, identity, batch) }
+          if !retryable(status) || attempt == 4 { fail OtlpResponseError {status: status} }
+          wait = delay(&response, backoff)
+        }
+        Result.Failure {error} => match move error {
+          OutOfMemoryError exhausted => { fail move exhausted }
+          HttpError network => {
+            if attempt == 4 || (network.kind != HttpErrorKind.Connect && network.kind != HttpErrorKind.Timeout) {
+              fail move network
+            }
+          }
+        }
+      }
+      run Effect.sleep(wait)
+      attempt = attempt + 1
+      backoff = backoff * 2
+    }
+  }
+}
+
+const BATCH_SIZE: usize = 32
+
+// A cancelled or failed send owns the observations it already took from the recorder.
+// Charge that batch once on unwind. On success only the destination's rejection count remains.
+struct Pending<'a> { recorder: &'a Recorder, count: u64, spans: bool }
+impl<'a> Drop for Pending<'a> {
+  fn drop(self: &mut Self) -> () {
+    if self.count != 0 {
+      if self.spans { self.recorder.countDroppedSpans(self.count) }
+      else { self.recorder.signals.countDroppedLogs(self.count) }
+    }
+  }
+}
+
+effect fn drainSpans<E, ?R, S: Sink<E ? R>>(recorder: &Recorder, sink: &mut S, identity: &Resource) -> ()
+! E | OutOfMemoryError ? R | &mut Allocator {
+  let mut remaining = recorder.finishedCapacity()
+  let mut batch = List<Span>.make()
+  while remaining != 0 {
+    let mut pending = Pending {recorder: recorder, count: 0, spans: true}
+    while remaining != 0 && batch.length() < BATCH_SIZE {
+      match recorder.takeSpan() {
+        Option<Span>.Some {value} => {
+          pending.count = pending.count + 1
+          if batch.capacity() == 0 { run batch.reserveExact(BATCH_SIZE) }
+          drop batch.appendWithinCapacity(move value)
+          remaining = remaining - 1
+        }
+        Option<Span>.None => { remaining = 0 }
+      }
+    }
+    if batch.length() != 0 {
+      let rejected = run Sink<E ? R>.send(&mut sink.*, identity, &Batch.Spans {values: batch.asSlice()})
+      pending.count = rejected
+      batch.clear()
+    }
+  }
+}
+
+effect fn drainLogs<E, ?R, S: Sink<E ? R>>(recorder: &Recorder, sink: &mut S, identity: &Resource) -> ()
+! E | OutOfMemoryError ? R | &mut Allocator {
+  let mut remaining = recorder.signals.logCapacity()
+  let mut batch = List<LogRecord>.make()
+  while remaining != 0 {
+    let mut pending = Pending {recorder: recorder, count: 0, spans: false}
+    while remaining != 0 && batch.length() < BATCH_SIZE {
+      match recorder.signals.takeLog() {
+        Option<LogRecord>.Some {value} => {
+          pending.count = pending.count + 1
+          if batch.capacity() == 0 { run batch.reserveExact(BATCH_SIZE) }
+          drop batch.appendWithinCapacity(move value)
+          remaining = remaining - 1
+        }
+        Option<LogRecord>.None => { remaining = 0 }
+      }
+    }
+    if batch.length() != 0 {
+      let rejected = run Sink<E ? R>.send(&mut sink.*, identity, &Batch.Logs {values: batch.asSlice()})
+      pending.count = rejected
+      batch.clear()
+    }
+  }
+}
+
+effect fn snapshotMetrics<E, ?R, S: Sink<E ? R>>(recorder: &Recorder, sink: &mut S, identity: &Resource) -> ()
+! E | OutOfMemoryError ? R | &mut Allocator {
+  let mut batch = List<MetricPoint>.make()
+  let time = recorder.now()
+  let mut i: usize = 0
+  while i < recorder.signals.metricCapacity() {
+    if let Option<MetricPoint>.Some {value} = recorder.signals.metricAt(i, time) {
+      if batch.capacity() == 0 { run batch.reserveExact(BATCH_SIZE) }
+      drop batch.appendWithinCapacity(move value)
+      if batch.length() == BATCH_SIZE {
+        let data = Batch.Metrics {values: batch.asSlice(), includeDrops: false, time: time}
+        let rejected = run Sink<E ? R>.send(&mut sink.*, identity, &data)
+        if rejected != 0 { recorder.signals.countDroppedMetrics(rejected) }
+        batch.clear()
+      }
+    }
+    i = i + 1
+  }
+  if batch.length() != 0 || identity.droppedSpans != 0 || identity.droppedLogs != 0 || identity.droppedMetrics != 0 {
+    let data = Batch.Metrics {values: batch.asSlice(), includeDrops: true, time: time}
+    let rejected = run Sink<E ? R>.send(&mut sink.*, identity, &data)
+    if rejected != 0 { recorder.signals.countDroppedMetrics(rejected) }
+  }
+}
+
+fn resourceSnapshot(recorder: &Recorder) -> Resource {
+  return Resource {serviceName: recorder.serviceName(), serviceVersion: recorder.serviceVersion(),
+    droppedSpans: recorder.droppedSpans(), droppedLogs: recorder.signals.droppedLogs(),
+    droppedMetrics: recorder.signals.droppedMetrics()}
+}
+
+/// Drains at most one recorder capacity of completed spans and logs, then snapshots cumulative metrics.
+/// A full batch contains 32 records. A failed send charges the records it consumed to the drop counters.
+pub effect fn flush<E, ?R, S: Sink<E ? R>>(recorder: &Recorder, sink: &mut S) -> ()
+! E | OutOfMemoryError ? R | &mut Allocator {
+  let identity = resourceSnapshot(recorder)
+  run drainSpans<E, R, S>(recorder, &mut sink.*, &identity)
+  run drainLogs<E, R, S>(recorder, &mut sink.*, &identity)
+  // A one-shot flush must publish rejections from the spans and logs it just sent.
+  let finalIdentity = resourceSnapshot(recorder)
+  run snapshotMetrics<E, R, S>(recorder, &mut sink.*, &finalIdentity)
+}
+
+/// Flushes once a second until the caller cancels the exporter or the sink fails.
+/// Run it outside the recorder's ambient scope to keep its requests out of the exported trace.
+pub effect fn exportBatches<E, ?R, S: Sink<E ? R>>(recorder: &Recorder, sink: &mut S) -> ()
+! E | OutOfMemoryError ? R | &mut Allocator | &mut MonotonicClock {
+  while true {
+    run flush<E, R, S>(recorder, &mut sink.*)
+    run Effect.sleep(1000000000)
+  }
+}
