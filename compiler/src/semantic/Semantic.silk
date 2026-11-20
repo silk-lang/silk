@@ -110,6 +110,9 @@ import semantic.Specialization {
 }
 import backend.Mir {
   Lowered,
+  TraceField as MirTraceField,
+  TracePlan as MirTracePlan,
+  TraceSource as MirTraceSource,
   Cancel as MirCancel,
   Inlining as MirInlining,
   ConstantValue as MirConstantValue,
@@ -207,6 +210,7 @@ import semantic.Intrinsic {
 }
 import semantic.ScalarOperation {ScalarOperation}
 import semantic.Lifetime {CanonicalizationFailure, Intersection, Lifetime, Member as LifetimeMember}
+import semantic.TraceDirective { TraceDirective }
 import semantic.ExecutionStorage {Binding as StorageBinding, ExecutionStorage}
 import semantic.Retention {Root as RetentionRoot}
 import semantic.ModuleId {InvalidModulePath, ModuleId}
@@ -2775,6 +2779,7 @@ struct Resolver {
   nextAssembly: usize,
   /// The composition's execution-storage component, which suspendable frames use (SUSP-005).
   executionStorage: Option<ExecutionStorage>,
+  traceDirective: Option<TraceDirective>,
   /// The composition's explicit retention roots (ARTIFACT-003), in manifest order.
   retention: List<RetentionRoot>,
   /// The target's support modules, whose C exports root every executable (see `selectSupport`).
@@ -7485,11 +7490,25 @@ effect fn recordProfileRead(resolver: &mut Resolver, module: &ModuleId, kind: &[
   return run recordRequestInput(&mut resolver.*, module, move fact)
 }
 
+effect fn traceBindingFact(output: &mut Bytes, selected: &StorageBinding) -> () ! OutOfMemoryError ? &mut Allocator {
+  run StableKey.module(&mut output.*, &selected.module)
+  run RuntimeEncoding.field(&mut output.*, Bytes.asSlice(&selected.declaration))
+}
+
 // The value of a request input: the application module the request selects, a fact of the
 // selected profile (or of the assembly's facts before one is published), or a profile parameter's
 // value. It reads the request and profile, never a module's source.
 effect fn captureRequest(resolver: &Resolver, fact: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
   let mut output = Bytes.make()
+  if same(fact, b"trace-directive") {
+    if let Option<TraceDirective>.Some {value: capability} = &resolver.traceDirective {
+      run traceBindingFact(&mut output, &capability.enter)
+      run traceBindingFact(&mut output, &capability.exit)
+      run traceBindingFact(&mut output, &capability.failed)
+      run traceBindingFact(&mut output, &capability.cancelled)
+    }
+    return move output
+  }
   if same(fact, b"application") {
     if resolver.currentApplication == usize.MAX { run RuntimeEncoding.field(&mut output, b"none") }
     else { run StableKey.module(&mut output, &resolvedModule(resolver, resolver.currentApplication)) }
@@ -8275,6 +8294,302 @@ fn supportedConstraints(hir: &Module, constraints: Range) -> bool {
   return true
 }
 
+struct TraceHook {
+  key: InstanceKey,
+  result: Interned<Type>,
+}
+
+// Resolves a capability selector in its package and checks every runtime and static lane
+// before synthesizing a call. Lifetime parameters disappear from the runtime ABI.
+effect fn traceHook(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut List<Dependency>,
+  binding: &StorageBinding, strings: &[Bytes], generic: &Option<Interned<Type>>, runtime: &Option<Interned<Type>>,
+  span: Span) -> Option<TraceHook>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  // Catalog-bound modules can be reached solely through the directive. Give them the
+  // same semantic module handle that a written import establishes before signature lookup.
+  drop run internModule(&mut resolver.*, &binding.module)
+  let selected = match move run select(&mut resolver.*, &mut owner.*, &mut dependencies.*, &binding.module, Bytes.asSlice(&binding.declaration), true) {
+    Result<Selection, Shared<Rejection>>.Success {value} => value
+    _ => { return Option<TraceHook>.none() }
+  }
+  if selected.publicCount != usize.ONE || selected.kind != CandidateKind.Declaration { return Option<TraceHook>.none() }
+  drop run observedDeclaration(&mut resolver.*, &binding.module, selected.declaration, SourceFacet.Directives)
+  let header = run observedDeclaration(&mut resolver.*, &binding.module, selected.declaration, SourceFacet.Header)
+  if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&resolver.*, &header, &binding.module) {
+    let hir = IndexedSource.authored(indexed)
+    let local = &ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))[selected.declaration]
+    if let Node.FunctionHeader {linkage, ..} = Module.node(hir, local.header) {
+      if linkage.present { return Option<TraceHook>.none() }
+    } else { return Option<TraceHook>.none() }
+    if let Option<HirId>.Some {..} = Directives.find(hir, Directives.of(hir, local.local), DirectiveKind.Trace) { return Option<TraceHook>.none() }
+  }
+  let hook = match move run declarationAt(&mut resolver.*, &binding.module, selected.declaration) {
+    Option<DeclarationId>.Some {value} => move value
+    _ => { return Option<TraceHook>.none() }
+  }
+  if DeclarationId.kind(&hook) != OwnerKind.Function { return Option<TraceHook>.none() }
+  let signature = run targetSignature(&mut resolver.*, &mut owner.*, &mut dependencies.*, &hook, span)
+  let facts = match move Shared<Result<Answer, NoRejection>>.with<Option<SignatureFacts>>(&signature, signatureFacts) {
+    Option<SignatureFacts>.Some {value} => move value
+    _ => { return Option<TraceHook>.none() }
+  }
+  if run typeMentionsOwner(&facts.result, &hook) { return Option<TraceHook>.none() }
+  let mut count = strings.length
+  if let Option<Interned<Type>>.Some {..} = &runtime.* { count = count + usize.ONE }
+  if Interned<Row>.with<bool>(&facts.requirements, |row: &Row| -> bool { return rowIsOpen(row) || List<Requirement>.length(&row.entries) != usize.ZERO }) {
+    return Option<TraceHook>.none()
+  }
+  if facts.parameters != count || facts.staticSlots != strings.length || facts.isEffect || facts.isUnsafe || facts.isStatic || facts.isVariadic ||
+    facts.constraints != usize.ZERO || !Interned<Type>.with<bool>(&facts.failure, neverType) { return Option<TraceHook>.none() }
+  let mut request = Request.make()
+  let schema = match move run resolveTargetSchema(&mut resolver.*, &mut owner.*, &mut request, &mut dependencies.*, true, &hook, span) {
+    Option<TargetSchema>.Some {value} => move value
+    _ => { return Option<TraceHook>.none() }
+  }
+  let slots = List<ApplicationSlot>.asSlice(&schema.own)
+  let mut arguments = List<Argument>.make()
+  let mut at = usize.ZERO
+  let mut region = run Types.internLifetime(Lifetime.Static)
+  if let Option<Interned<Type>>.Some {value: wanted} = &runtime.* {
+    if let Type.Reference {lifetime, ..} = &Interned<Type>.get(&wanted).* { region = Interned<Lifetime>.clone(&lifetime) }
+  }
+  let mut used = false
+  while at < slots.length {
+    if slots[at].kind == GenericKind.Lifetime {
+      run List<Argument>.append(&mut arguments, Argument.Lifetime {value: Interned<Lifetime>.clone(&region)})
+    } else if slots[at].kind == GenericKind.Type && !used {
+      if let Option<Interned<Type>>.Some {value} = &generic.* {
+        run List<Argument>.append(&mut arguments, Argument.Type {value: Interned<Type>.clone(&value)})
+        used = true
+      } else { return Option<TraceHook>.none() }
+    } else { return Option<TraceHook>.none() }
+    at = at + usize.ONE
+  }
+  if let Option<Interned<Type>>.Some {..} = &generic.* { if !used { return Option<TraceHook>.none() } }
+  let staticSlots = run signatureStaticSlots(&signature, facts.staticSlots)
+  let mut statics = List<StaticSlot>.make()
+  at = usize.ZERO
+  while at < strings.length {
+    if List<usize>.asSlice(&staticSlots)[at] != at { return Option<TraceHook>.none() }
+    let parameter = Shared<Result<Answer, NoRejection>>.with<Option<Interned<Type>>>(&signature,
+      |answer: &Result<Answer, NoRejection>| -> Option<Interned<Type>> { return signatureParameterAt(answer, at) })
+    if let Option<Interned<Type>>.Some {value} = &parameter {
+      if !Interned<Type>.with<bool>(&value, |ty: &Type| -> bool {
+        return match &ty.* { Type.String {lifetime} => Interned<Lifetime>.with<bool>(&lifetime, staticLifetime) _ => false }
+      }) { return Option<TraceHook>.none() }
+    } else { return Option<TraceHook>.none() }
+    let text = match move StaticValue.text(run Bytes.copy(Bytes.asSlice(&strings[at]))) {
+      Option<StaticData>.Some {value} => run Interned<StaticData>.make(move value)
+      _ => { return Option<TraceHook>.none() }
+    }
+    run List<StaticSlot>.append(&mut statics, StaticSlot {ordinal: at, value: move text})
+    at = at + usize.ONE
+  }
+  let application = Application {target: SpecializationTarget.Named {declaration: move hook}, arguments: move arguments,
+    argumentOrdinals: run applicationOrdinals(slots), scopes: List<ScopeBinding>.make(), statics: move statics}
+  if !run TargetSchema.accepts(&schema, &application) { return Option<TraceHook>.none() }
+  let bindings = run Application.bindings(&application)
+  if let Option<Interned<Type>>.Some {value: wanted} = &runtime.* {
+    let parameter = Shared<Result<Answer, NoRejection>>.with<Option<Interned<Type>>>(&signature,
+      |answer: &Result<Answer, NoRejection>| -> Option<Interned<Type>> { return signatureParameterAt(answer, strings.length) })
+    if let Option<Interned<Type>>.Some {value} = &parameter {
+      if used {
+        if let Type.Reference {access, lifetime, ..} = &Interned<Type>.get(&value).* {
+          if access != Access.Shared || !Interned<Lifetime>.with<bool>(&lifetime, |region: &Lifetime| -> bool {
+            return match &region.* { Lifetime.Parameter {..} => true _ => false }
+          }) { return Option<TraceHook>.none() }
+        } else { return Option<TraceHook>.none() }
+      }
+      let closed = run Type.applyBindings(&value, List<Binding>.asSlice(&bindings), true)
+      if !run Type.runtimeEqualsShared(&closed, &wanted) { return Option<TraceHook>.none() }
+    } else { return Option<TraceHook>.none() }
+  }
+  let result = run Type.applyBindings(&facts.result, List<Binding>.asSlice(&bindings), true)
+  if !used && !Interned<Type>.with<bool>(&result, unitShape) { return Option<TraceHook>.none() }
+  let key = match move run InstanceKey.function(move application) {
+    Result<InstanceKey, CanonicalizationFailure>.Success {value} => move value
+    _ => { return Option<TraceHook>.none() }
+  }
+  return Option<TraceHook>.some(TraceHook {key: move key, result: move result})
+}
+
+effect fn tracePlan(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut List<Dependency>,
+  identity: &Interned<DeclarationId>, module: &ModuleId, clause: TraceClause, anchor: &Anchor, signature: &Shared<Result<Answer, NoRejection>>, application: &Application,
+  bindings: &[Binding], projections: &[RuntimeProjection], failure: &Interned<Type>, observing: bool) -> Result<Option<MirTracePlan>, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let span = clause.span
+  run recordRequestInput(&mut resolver.*, module, run Bytes.copy(b"trace-directive"))
+  let capability = match &resolver.traceDirective {
+    Option<TraceDirective>.Some {value} => run TraceDirective.copy(&value)
+    _ => { return Result<Option<MirTracePlan>, Shared<Rejection>>.failResult(run reject(&resolver.*, module, RejectionCode.TraceCapability, span)) }
+  }
+  let root = run reportRoot(&resolver.*)
+  let mut named = List<ModuleId>.make()
+  let function = run Mir.reportName(&DeclarationId.copyShared(identity), &root, &mut named)
+  let mut strings = List<Bytes>.make()
+  let name = match move clause.name { Option<Bytes>.Some {value} => move value _ => run Bytes.copy(Bytes.asSlice(&function)) }
+  run List<Bytes>.append(&mut strings, move name)
+  run List<Bytes>.append(&mut strings, move clause.kind)
+  run List<Bytes>.append(&mut strings, move function)
+  run List<Bytes>.append(&mut strings, run ModuleId.copyPath(module))
+  let package = run ModuleId.copyPackage(module)
+  let text = Bytes.asSlice(&package)
+  let mut end = usize.ZERO
+  while end < text.length && text[end] != '@' { end = end + usize.ONE }
+  run List<Bytes>.append(&mut strings, run Bytes.copy(Slice.view<u8>(text, usize.ZERO, end)))
+  if end < text.length { end = end + usize.ONE }
+  run List<Bytes>.append(&mut strings, run Bytes.copy(Slice.view<u8>(text, end, text.length - end)))
+  let region = run Types.internLifetime(Lifetime.Local {declaration: DeclarationId.copyShared(identity),
+    ordinal: Anchor.node(anchor, clause.directive), binder: usize.MAX})
+  let selected = List<usize>.asSlice(&clause.parameters)
+  let mut refs = List<Interned<Type>>.make()
+  let mut fields = List<MirTraceField>.make()
+  let mut at = usize.ZERO
+  while at < selected.length {
+    let index = selected[at]
+    let written = Shared<Result<Answer, NoRejection>>.with<Option<Interned<Type>>>(signature,
+      |answer: &Result<Answer, NoRejection>| -> Option<Interned<Type>> { return signatureParameterAt(answer, index) })
+    let parameter = match move written {
+      Option<Interned<Type>>.Some {value} => move value
+      _ => { return Result<Option<MirTracePlan>, Shared<Rejection>>.failResult(run reject(&resolver.*, module, RejectionCode.TraceArgument, span)) }
+    }
+    let ty = run RuntimeType.applyBindings(&parameter, bindings, projections)
+    let reference = run Types.intern(Type.Reference {referent: Interned<Type>.clone(&ty), access: Access.Shared, lifetime: Interned<Lifetime>.clone(&region)})
+    let source = match move StaticSlot.valueAt(&application.statics, index) {
+      Option<Interned<StaticData>>.Some {value} => MirTraceSource.Constant {value: move value, ty: move ty}
+      Option<Interned<StaticData>>.None => {
+        let mut lane = index
+        let statics = List<StaticSlot>.asSlice(&application.statics)
+        let mut earlier = usize.ZERO
+        while earlier < statics.length {
+          if statics[earlier].ordinal < index { lane = lane - usize.ONE }
+          earlier = earlier + usize.ONE
+        }
+        MirTraceSource.Parameter {lane: lane}
+      }
+    }
+    run List<MirTraceField>.append(&mut fields, MirTraceField {source: move source, reference: Interned<Type>.clone(&reference)})
+    run List<Interned<Type>>.append(&mut refs, move reference)
+    at = at + usize.ONE
+  }
+  let occurrence = run Frozen<AnonymousOccurrence>.make(AnonymousOccurrence {declaration: Interned<DeclarationId>.clone(identity),
+    syntax: Anchor.node(anchor, clause.directive), positional: false, labels: move clause.labels})
+  let args = run Types.intern(Type.Anonymous {occurrence: move occurrence, members: run copyTypes(List<Interned<Type>>.asSlice(&refs))})
+  let argsRef = run Types.intern(Type.Reference {referent: Interned<Type>.clone(&args), access: Access.Shared, lifetime: Interned<Lifetime>.clone(&region)})
+  let generic = Option<Interned<Type>>.some(Interned<Type>.clone(&args))
+  let enter = match move run traceHook(&mut resolver.*, &mut owner.*, &mut dependencies.*, &capability.enter, List<Bytes>.asSlice(&strings), &generic,
+    &Option<Interned<Type>>.some(Interned<Type>.clone(&argsRef)), span) {
+    Option<TraceHook>.Some {value} => move value
+    _ => { return Result<Option<MirTracePlan>, Shared<Rejection>>.failResult(run reject(&resolver.*, module, RejectionCode.TraceCapability, span)) }
+  }
+  let guard = Option<Interned<Type>>.some(Interned<Type>.clone(&enter.result))
+  let empty = List<Bytes>.make()
+  let none = Option<Interned<Type>>.none()
+  let exit = match move run traceHook(&mut resolver.*, &mut owner.*, &mut dependencies.*, &capability.exit, List<Bytes>.asSlice(&empty), &none, &guard, span) {
+    Option<TraceHook>.Some {value} => move value
+    _ => { return Result<Option<MirTracePlan>, Shared<Rejection>>.failResult(run reject(&resolver.*, module, RejectionCode.TraceCapability, span)) }
+  }
+  let cancelled = match move run traceHook(&mut resolver.*, &mut owner.*, &mut dependencies.*, &capability.cancelled, List<Bytes>.asSlice(&empty), &none, &guard, span) {
+    Option<TraceHook>.Some {value} => move value
+    _ => { return Result<Option<MirTracePlan>, Shared<Rejection>>.failResult(run reject(&resolver.*, module, RejectionCode.TraceCapability, span)) }
+  }
+  let mut failed = List<InstanceKey>.make()
+  let closedFailure = run RuntimeType.applyBindings(failure, bindings, projections)
+  let members = run Type.canonicalUnionMembers(&closedFailure)
+  let mut errors = match move members {
+    Option<List<Interned<Type>>>.Some {value} => move value
+    _ => run unionMemberCopies(&closedFailure)
+  }
+  if List<Interned<Type>>.length(&errors) == usize.ZERO { run List<Interned<Type>>.append(&mut errors, Interned<Type>.clone(&closedFailure)) }
+  let listed = List<Interned<Type>>.asSlice(&errors)
+  at = usize.ZERO
+  while at < listed.length {
+    let mut label = Bytes.make()
+    if !run Mir.identityText(&listed[at], &root, &mut named, &mut label) { label = run writtenTypeName(module, &listed[at]) }
+    let mut error = List<Bytes>.make()
+    run List<Bytes>.append(&mut error, move label)
+    let marked = match move run traceHook(&mut resolver.*, &mut owner.*, &mut dependencies.*, &capability.failed, List<Bytes>.asSlice(&error), &none, &none, span) {
+      Option<TraceHook>.Some {value} => move value
+      _ => { return Result<Option<MirTracePlan>, Shared<Rejection>>.failResult(run reject(&resolver.*, module, RejectionCode.TraceCapability, span)) }
+    }
+    if !Interned<Type>.with<bool>(&closedFailure, neverType) { run List<InstanceKey>.append(&mut failed, move marked.key) }
+    at = at + usize.ONE
+  }
+  run recordReportNames(&mut resolver.*, module, List<ModuleId>.asSlice(&named))
+  let mut erased = run erasedInlineBody(&mut resolver.*, &mut owner.*, &mut dependencies.*, &enter.key, observing)
+  if erased { erased = run erasedInlineBody(&mut resolver.*, &mut owner.*, &mut dependencies.*, &exit.key, observing) }
+  if erased { erased = run erasedInlineBody(&mut resolver.*, &mut owner.*, &mut dependencies.*, &cancelled.key, observing) }
+  let marks = List<InstanceKey>.asSlice(&failed)
+  at = usize.ZERO
+  while erased && at < marks.length {
+    erased = run erasedInlineBody(&mut resolver.*, &mut owner.*, &mut dependencies.*, &marks[at], observing)
+    at = at + usize.ONE
+  }
+  if erased { return Result<Option<MirTracePlan>, Shared<Rejection>>.succeed(Option<MirTracePlan>.none()) }
+  return Result<Option<MirTracePlan>, Shared<Rejection>>.succeed(Option<MirTracePlan>.some(MirTracePlan {
+    enter: move enter.key, guard: move enter.result, exit: move exit.key, cancelled: move cancelled.key, failed: move failed,
+    args: move args, argsRef: move argsRef, fields: move fields}))
+}
+
+// Literal options and parameter lanes of a traced declaration.
+struct TraceClause {
+  name: Option<Bytes>,
+  kind: Bytes,
+  labels: List<Bytes>,
+  parameters: List<usize>,
+  directive: HirId,
+  span: Span,
+}
+
+effect fn traceClause(hir: &Module, directive: HirId, parameters: Range) -> Result<TraceClause, Span>
+! OutOfMemoryError ? &mut Allocator {
+  let mut clause = TraceClause {name: Option<Bytes>.none(), kind: run Bytes.copy(b"internal"), labels: List<Bytes>.make(),
+    parameters: List<usize>.make(), directive: directive, span: Module.span(hir, directive)}
+  if let Option<HirId>.Some {value: id} = Directives.argument(hir, directive, b"name") {
+    if let Node.TextLiteral {value} = Module.node(hir, id) { clause.name = Option<Bytes>.some(run Bytes.copy(Module.text(hir, value))) }
+    else { return Result<TraceClause, Span>.failResult(Module.span(hir, id)) }
+  }
+  if let Option<HirId>.Some {value: id} = Directives.argument(hir, directive, b"kind") {
+    let kind = match Module.node(hir, id) {
+      Node.TextLiteral {value} => Module.text(hir, value)
+      _ => { return Result<TraceClause, Span>.failResult(Module.span(hir, id)) }
+    }
+    if !same(kind, b"internal") && !same(kind, b"server") && !same(kind, b"client") && !same(kind, b"producer") && !same(kind, b"consumer") {
+      return Result<TraceClause, Span>.failResult(Module.span(hir, id))
+    }
+    clause.kind = run Bytes.copy(kind)
+  }
+  if let Option<HirId>.Some {value: id} = Directives.argument(hir, directive, b"args") {
+    let elements = match Module.node(hir, id) {
+      Node.TupleExpression {elements} => elements
+      Node.UnitLiteral => Range.empty()
+      _ => { return Result<TraceClause, Span>.failResult(Module.span(hir, id)) }
+    }
+    let mut at = usize.ZERO
+    while at < elements.length {
+      let item = Module.child(hir, elements, at)
+      let label = match Module.node(hir, item) {
+        Node.TextLiteral {value} => Module.text(hir, value)
+        _ => { return Result<TraceClause, Span>.failResult(Module.span(hir, item)) }
+      }
+      let mut parameter = usize.ZERO
+      while parameter < parameters.length {
+        if let Node.Parameter {name, ..} = Module.node(hir, Module.child(hir, parameters, parameter)) {
+          if Directives.nameIs(hir, name, label) { break }
+        }
+        parameter = parameter + usize.ONE
+      }
+      if parameter == parameters.length || isStaticIndex(List<usize>.asSlice(&clause.parameters), parameter) {
+        return Result<TraceClause, Span>.failResult(Module.span(hir, item))
+      }
+      run List<usize>.append(&mut clause.parameters, parameter)
+      run List<Bytes>.append(&mut clause.labels, run Bytes.copy(label))
+      at = at + usize.ONE
+    }
+  }
+  return Result<TraceClause, Span>.succeed(move clause)
+}
+
 // The first conflict among a function's or operation's directives: one outside the table or whose
 // arguments do not fit it (SEM0235); one its position does not take, or any on a `static`
 // function, which runs only at compile time (SEM0236); a `@features` list problem (SEM0242,
@@ -8305,8 +8620,10 @@ effect fn directiveConflict(resolver: &mut Resolver, module: &ModuleId, ordinal:
     }
     let mut isUnsafe = false
     let mut isStatic = false
+    let mut traceParameters = Range.empty()
     if let Option<HirId>.Some {value: written} = move contract {
-      if let Option<HirContract>.Some {value: HirContract {isUnsafe: unsafeWritten, isStatic: staticWritten, ..}} = Module.contractOf(hir, written) {
+      if let Option<HirContract>.Some {value: HirContract {isUnsafe: unsafeWritten, isStatic: staticWritten, parameters: params, ..}} = Module.contractOf(hir, written) {
+        traceParameters = params
         isUnsafe = unsafeWritten
         isStatic = staticWritten
       }
@@ -8341,6 +8658,14 @@ effect fn directiveConflict(resolver: &mut Resolver, module: &ModuleId, ordinal:
       run List<MessageArgument>.append(&mut arguments, MessageArgument {name: run Bytes.copy(b"second"),
         value: run Bytes.copy(String.utf8Bytes(Directives.spelling(clash.later)))})
       return Option<HeaderConflict>.some(HeaderConflict {code: RejectionCode.ConflictingDirective, span: clash.span, arguments: move arguments})
+    }
+    if let Option<HirId>.Some {value: trace} = Directives.find(hir, directives, DirectiveKind.Trace) {
+      let span = Module.span(hir, trace)
+      if let Result<TraceClause, Span>.Failure {error} = move run traceClause(hir, trace, traceParameters) {
+        return conflictAt(RejectionCode.TraceArgument, error)
+      }
+      run recordRequestInput(&mut resolver.*, module, run Bytes.copy(b"trace-directive"))
+      if let Option<TraceDirective>.None = &resolver.traceDirective { return conflictAt(RejectionCode.TraceCapability, span) }
     }
   }
   return Option<HeaderConflict>.none()
@@ -84751,6 +85076,48 @@ effect fn lowerMir(
   if usesAmbientHeader {
     ambientEnabled = (run ambientCount(&mut resolver.*, &module)) != usize.ZERO
   }
+  let mut tracing = Option<MirTracePlan>.none()
+  if ownBody {
+    let mut clause = Option<TraceClause>.none()
+    if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&resolver.*, &sourceAnswer, &module) {
+      let hir = IndexedSource.authored(indexed)
+      if hir.hasTraceDirective {
+        let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
+        let local = &declarations[declarationAccess183]
+        if let Option<HirId>.Some {value: directive} = Directives.find(hir, Directives.of(hir, local.local), DirectiveKind.Trace) {
+          if let Node.FunctionHeader {contract, ..} = Module.node(hir, local.header) {
+            if let Option<HirContract>.Some {value: contractData} = Module.contractOf(hir, contract) {
+              if let Result<TraceClause, Span>.Success {value} = move run traceClause(hir, directive, contractData.parameters) {
+                clause = Option<TraceClause>.some(move value)
+              }
+            }
+          }
+        }
+      }
+    }
+    if let Option<TraceClause>.Some {value} = move clause {
+      let site = value.span
+      tracing = match move run tracePlan(&mut resolver.*, &mut owner.*, &mut dependencies, &identity, &module, move value,
+        &anchor, &signature, &callerApplication, List<Binding>.asSlice(&callerBindings), storageProjection, &failureType, observing) {
+        Result<Option<MirTracePlan>, Shared<Rejection>>.Success {value: plan} => move plan
+        Result<Option<MirTracePlan>, Shared<Rejection>>.Failure {error} => { return run mirRejection(&identity, move error, move dependencies) }
+      }
+      if let Option<MirTracePlan>.Some {value: plan} = &tracing {
+        let mut targets = List<InstanceKey>.make()
+        run List<InstanceKey>.append(&mut targets, InstanceKey.copy(&plan.enter))
+        run List<InstanceKey>.append(&mut targets, InstanceKey.copy(&plan.exit))
+        run List<InstanceKey>.append(&mut targets, InstanceKey.copy(&plan.cancelled))
+        let marked = List<InstanceKey>.asSlice(&plan.failed)
+        let mut member = usize.ZERO
+        while member < marked.length {
+          run List<InstanceKey>.append(&mut targets, InstanceKey.copy(&marked[member]))
+          member = member + usize.ONE
+        }
+        run List<MirNonParkingRun>.append(&mut entry, MirNonParkingRun {callees: move targets, glues: List<Interned<Type>>.make(),
+          declarations: List<Interned<DeclarationId>>.make(), exact: true, origin: ParkOrigin.Trace {module: ModuleId.copy(&module), span: site, args: Interned<Type>.clone(&plan.args)}})
+      }
+    }
+  }
   let mut elided = List<bool>.make()
   let mut removedBindings = List<usize>.make()
   if !inspecting && List<MirCallTarget>.length(&provided) != usize.ZERO {
@@ -84834,6 +85201,7 @@ effect fn lowerMir(
         move packageRoot,
         move suspending,
         move constants,
+        move tracing,
       ),
     )
     Option<&IndexedSource>.None => {
@@ -98815,6 +99183,7 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
       parameterAssembly: Option<ParameterAssembly>.none(),
       nextAssembly: usize.ZERO,
       executionStorage: Option<ExecutionStorage>.none(),
+      traceDirective: Option<TraceDirective>.none(),
       retention: List<RetentionRoot>.make(),
       support: List<ModuleId>.make(),
       linkOnlySupport: List<ModuleId>.make(),
@@ -99032,6 +99401,11 @@ impl Semantic {
   /// Selects the execution-storage component a build binds when a reached instance suspends.
   pub fn selectExecutionStorage(self: &mut Self, storage: ExecutionStorage) -> () {
     self.resolver.executionStorage = Option<ExecutionStorage>.some(move storage)
+  }
+
+  /// Installs the four source bindings selected for trace lowering.
+  pub fn selectTraceDirective(self: &mut Self, hooks: TraceDirective) -> () {
+    self.resolver.traceDirective = Option<TraceDirective>.some(move hooks)
   }
   /// Adds one of the target's support modules, such as the standard library's C library for a
   /// target without one, whose C exports an executable roots beside its runtime's, whatever that
@@ -103020,7 +103394,8 @@ impl Semantic {
         let module = DeclarationId.moduleId(&identity)
         let functions = List<MirFunction>.asSlice(&self.resolver.mirValues)
         let function = &functions[value]
-        let summary = run SuspensionSummary.make(function, &instance, module, &anchor, &entered.module, entered.span)
+        let mut summary = run SuspensionSummary.make(function, &instance, module, &anchor, &entered.module, entered.span)
+        SuspensionSummary.recordAmbientCall(&mut summary, &entered.requester, &entered.module, entered.span)
         if capturing {
           let digest = run summaryDigest(&summary, function.observes, capture.patterns)
           run BuildCapture.references(&mut capture.*, entry, &instance, List<MirReference>.asSlice(&function.references), digest)
@@ -106324,7 +106699,8 @@ impl Semantic {
           // computed against the final dispatchers during emission.
           let mut summaryAt = usize.MAX
           if !discovering || List<MirNonParkingRun>.length(&functions[selectedMir].nonParking) != usize.ZERO {
-            let summary = run SuspensionSummary.make(&functions[selectedMir], &instance, &callerModule, &anchor, &entered.module, entered.span)
+            let mut summary = run SuspensionSummary.make(&functions[selectedMir], &instance, &callerModule, &anchor, &entered.module, entered.span)
+            SuspensionSummary.recordAmbientCall(&mut summary, &entered.requester, &entered.module, entered.span)
             if resuming != usize.MAX { summaryAt = List<DiscoverySite>.asSlice(&sites)[resuming].summary }
             if summaryAt == usize.MAX {
               summaryAt = List<SuspensionSummary>.length(&summaries)
@@ -112242,6 +112618,7 @@ struct SummaryEscape {
 // obligation is owed by the call that first reached the instance.
 struct ParkObligation {
   ambient: bool,
+  trace: Option<Interned<Type>>,
   conversion: Option<ErasureFact>,
   callees: List<InstanceKey>,
   glues: List<Interned<Type>>,
@@ -112256,6 +112633,8 @@ struct ParkObligation {
 // local-shared accesses it holds with their callbacks. Every park is also a boundary; a nested
 // transfer is a boundary only.
 struct SuspensionSummary {
+  // The authored caller whose arguments selected an ambient dispatcher specialization.
+  ambientCall: Option<RelatedSite>,
   key: InstanceKey,
   module: ModuleId,
   boundary: Option<Span>,
@@ -112487,6 +112866,11 @@ effect fn belowCallbacks(summaries: &[SuspensionSummary], left: &mut List<Backen
 }
 
 impl SuspensionSummary {
+  fn recordAmbientCall(self: &mut Self, requester: &Option<RelatedSite>, module: &ModuleId, span: Span) -> () {
+    if List<ParkObligation>.length(&self.nonParking) == usize.ZERO || operationDispatch(&self.key) != OperationDispatch.Erased { return () }
+    self.ambientCall = Option<RelatedSite>.some(requestSite(requester, module, span))
+  }
+
   effect fn make(function: &MirFunction, instance: &InstanceKey, module: &ModuleId, anchor: &Option<Anchor>,
     enteredModule: &ModuleId, entered: Span) -> SuspensionSummary
   ! OutOfMemoryError ? &mut Allocator {
@@ -112556,8 +112940,15 @@ impl SuspensionSummary {
       let mut span = entered
       let mut site = ModuleId.copy(enteredModule)
       let mut conversion = Option<ErasureFact>.none()
+      let mut trace = Option<Interned<Type>>.none()
       let mut ambient = false
       match &owed[at].origin {
+        ParkOrigin.Trace {module: declaring, span: declared, args} => {
+          ambient = true
+          site = ModuleId.copy(&declaring)
+          span = declared
+          trace = Option<Interned<Type>>.some(Interned<Type>.clone(&args))
+        }
         ParkOrigin.Ambient {module: declaring, span: declared} => {
           ambient = true
           site = ModuleId.copy(&declaring)
@@ -112572,7 +112963,7 @@ impl SuspensionSummary {
         ParkOrigin.Conversion {fact} => { conversion = Option<ErasureFact>.some(ErasureFact.copy(&fact)) }
         ParkOrigin.Entry => ()
       }
-      let obligation = ParkObligation {ambient: ambient, conversion: move conversion, callees: move callees, glues: move glues,
+      let obligation = ParkObligation {ambient: ambient, trace: move trace, conversion: move conversion, callees: move callees, glues: move glues,
         declarations: move declarations, exact: owed[at].exact, module: move site, span: span}
       run List<ParkObligation>.append(&mut nonParking, move obligation)
       at = at + usize.ONE
@@ -112594,6 +112985,7 @@ impl SuspensionSummary {
       at = at + usize.ONE
     }
     return SuspensionSummary {
+      ambientCall: Option<RelatedSite>.none(),
       key: InstanceKey.copy(instance),
       module: ModuleId.copy(module),
       boundary: move boundary,
@@ -112968,12 +113360,18 @@ effect fn indirectEdges(summaries: &[SuspensionSummary]) -> List<List<usize>> ! 
 // Execution resumes its body through the package's erased start, not a direct call, so a driver
 // does not park when its body does.
 effect fn closeParking(summaries: &[SuspensionSummary]) -> List<bool> ! OutOfMemoryError ? &mut Allocator {
+  return run closeParkingThrough(summaries, &[])
+}
+
+// Closed ambient dispatchers have their own, stronger proof. A failing implementation
+// is reported by that proof; entry-point and other caller proofs can rely on the contract.
+effect fn closeParkingThrough(summaries: &[SuspensionSummary], boundaries: &[bool]) -> List<bool> ! OutOfMemoryError ? &mut Allocator {
   let mut marked = List<bool>.make()
   let mut any = false
   let mut at = usize.ZERO
   while at < summaries.length {
     let origin = match &summaries[at].park {
-      Option<Span>.Some {..} => true
+      Option<Span>.Some {..} => boundaries.length == usize.ZERO || !boundaries[at]
       Option<Span>.None => false
     }
     run List<bool>.append(&mut marked, origin)
@@ -112996,7 +113394,7 @@ effect fn closeParking(summaries: &[SuspensionSummary]) -> List<bool> ! OutOfMem
     }
     at = at + usize.ONE
   }
-  run closeCallers(&mut marked, List<List<CallEdge>>.asSlice(&callers), &[])
+  run closeCallers(&mut marked, List<List<CallEdge>>.asSlice(&callers), boundaries)
   return move marked
 }
 
@@ -113264,8 +113662,131 @@ effect fn checkedErasedPromises(resolver: &mut Resolver, root: &ModuleId) -> Lis
   return run nonParkingViolations(&mut resolver.*, List<SuspensionSummary>.asSlice(&summaries), root)
 }
 
-effect fn parkingRejection(resolver: &mut Resolver, owed: &ParkObligation, dispatcher: &InstanceKey) -> Shared<Rejection>
+// A generic ambient operation can reach an implementation selected for a value supplied
+// by its caller. Follow only edges that can suspend, starting below each provider arm:
+// a provider's own suspension is still reported at the provider's introduction.
+effect fn ambientArgumentWitness(summaries: &[SuspensionSummary], lookup: &InternIndex, marked: &[bool],
+  obligation: &ParkObligation, dispatcher: &InstanceKey) -> Option<Interned<Type>>
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let selected = run InstanceKey.selected(dispatcher)
+  let arguments = List<Argument>.asSlice(&selected.arguments)
+  let mut supplied = false
+  let mut at = usize.ZERO
+  while at < arguments.length {
+    if let Argument.Type {..} = &arguments[at] { supplied = true break }
+    at = at + usize.ONE
+  }
+  if !supplied { return Option<Interned<Type>>.none() }
+  let mut pending = List<usize>.make()
+  let mut seen = List<bool>.make()
+  run List<bool>.appendRepeated(&mut seen, false, summaries.length)
+  let roots = List<InstanceKey>.asSlice(&obligation.callees)
+  at = usize.ZERO
+  while at < roots.length {
+    let root = run summaryPosition(summaries, lookup, &roots[at])
+    if root != usize.MAX && marked[root] {
+      run List<usize>.append(&mut pending, root)
+      List<bool>.set(&mut seen, root, true)
+    }
+    at = at + usize.ONE
+  }
+  let mut head = usize.ZERO
+  while head < List<usize>.length(&pending) {
+    let current = List<usize>.get(&pending, head)
+    head = head + usize.ONE
+    let callees = List<InstanceKey>.asSlice(&summaries[current].callees)
+    let mut edge = usize.ZERO
+    while edge < callees.length {
+      let child = run summaryPosition(summaries, lookup, &callees[edge])
+      edge = edge + usize.ONE
+      if child == usize.MAX || !marked[child] || List<bool>.get(&seen, child) { continue }
+      List<bool>.set(&mut seen, child, true)
+      let candidate = run InstanceKey.selected(&summaries[child].key)
+      if let SpecializationTarget.Operation {provider, implementation, ..} = &candidate.target {
+        // The witness may implement an argument directly, or a field a library visits when
+        // consuming an argument record. The latter re-enters authored code from the library.
+        let foreign = toolchainModule(&summaries[current].module) && !toolchainModule(DeclarationId.moduleId(&implementation))
+        at = usize.ZERO
+        while at < arguments.length {
+          if let Argument.Type {value} = &arguments[at] {
+            if foreign || run Type.runtimeEqualsShared(&value, &provider) { return Option<Interned<Type>>.some(Interned<Type>.clone(&provider)) }
+          }
+          at = at + usize.ONE
+        }
+      }
+      run List<usize>.append(&mut pending, child)
+    }
+  }
+  return Option<Interned<Type>>.none()
+}
+
+// A directive's argument record retains the generating syntax, even after an ambient
+// operation specializes on it. Ordinary source record literals retain their own syntax.
+effect fn traceArgumentSite(resolver: &mut Resolver, dispatcher: &InstanceKey) -> Option<RelatedSite>
 ! Cycle | OutOfMemoryError ? &mut Allocator {
+  let application = run InstanceKey.selected(dispatcher)
+  let arguments = List<Argument>.asSlice(&application.arguments)
+  let mut at = usize.ZERO
+  while at < arguments.length {
+    if let Argument.Type {value} = &arguments[at] {
+      if let Option<AnonymousParts>.Some {value: record} = move run Type.anonymousParts(&value) {
+        let owner = Frozen<AnonymousOccurrence>.with<DeclarationId>(&record.occurrence, |item: &AnonymousOccurrence| -> DeclarationId {
+          return DeclarationId.copyShared(&item.declaration)
+        })
+        let syntax = Frozen<AnonymousOccurrence>.with<usize>(&record.occurrence, |item: &AnonymousOccurrence| -> usize { return item.syntax })
+        let module = DeclarationId.moduleId(&owner)
+        let answer = run observedSource(&mut resolver.*, module, SourceSelector.Identity {identity: DeclarationId.copy(&owner)})
+        if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&resolver.*, &answer, module) {
+          if let Option<usize>.Some {value: ordinal} = move ModuleIndex.ordinalOf(IndexedSource.moduleIndex(indexed), &owner) {
+            if let Option<Anchor>.Some {value: anchor} = move IndexedSource.anchorOf(indexed, ordinal) {
+              let id = Anchor.hir(&anchor, syntax)
+              let hir = IndexedSource.authored(indexed)
+              if let Option<DirectiveKind>.Some {value: DirectiveKind.Trace} = Directives.kindOf(hir, id) {
+                return Option<RelatedSite>.some(RelatedSite {module: ModuleId.copy(module), span: Module.span(hir, id)})
+              }
+            }
+          }
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+  return Option<RelatedSite>.none()
+}
+
+effect fn parkingRejection(resolver: &mut Resolver, owed: &ParkObligation, summary: &SuspensionSummary,
+  argument: &Option<Interned<Type>>) -> Shared<Rejection>
+! Cycle | OutOfMemoryError ? &mut Allocator {
+  if let Option<Interned<Type>>.Some {value: args} = &owed.trace {
+    let mut names = Bytes.make()
+    if let Option<AnonymousParts>.Some {value: record} = move run Type.anonymousParts(&args) {
+      let members = List<Interned<Type>>.asSlice(&record.members)
+      let mut at = usize.ZERO
+      while at < members.length {
+        if let Option<Interned<Type>>.Some {value: ty} = move Interned<Type>.with<Option<Interned<Type>>>(&members[at], referenceReferent) {
+          if at > usize.ZERO { run Bytes.append(&mut names, b", ") }
+          run Bytes.append(&mut names, Bytes.asSlice(&run writtenTypeName(&owed.module, &ty)))
+        }
+        at = at + usize.ONE
+      }
+    }
+    let mut diagnostic = run makeRejection(RejectionCode.TraceSuspension, &owed.module, owed.span)
+    run List<MessageArgument>.append(&mut diagnostic.arguments, MessageArgument {name: run Bytes.copy(b"types"), value: move names})
+    return run Shared<Rejection>.make(move diagnostic)
+  }
+  if let Option<Interned<Type>>.Some {value: ty} = &argument.* {
+    if let Option<RelatedSite>.Some {value: site} = move run traceArgumentSite(&mut resolver.*, &summary.key) {
+      let mut diagnostic = run makeRejection(RejectionCode.TraceSuspension, &site.module, site.span)
+      run List<MessageArgument>.append(&mut diagnostic.arguments, MessageArgument {name: run Bytes.copy(b"types"), value: run writtenTypeName(&site.module, &ty)})
+      return run Shared<Rejection>.make(move diagnostic)
+    }
+    if let Option<RelatedSite>.Some {value: call} = &summary.ambientCall {
+      let mut diagnostic = run makeRejection(RejectionCode.AmbientSuspension, &call.module, call.span)
+      run List<MessageArgument>.append(&mut diagnostic.arguments, MessageArgument {name: run Bytes.copy(b"template"), value: run Bytes.copy(b"1")})
+      run List<MessageArgument>.append(&mut diagnostic.arguments, MessageArgument {name: run Bytes.copy(b"type"), value: run writtenTypeName(&call.module, &ty)})
+      return run Shared<Rejection>.make(move diagnostic)
+    }
+  }
   if owed.ambient { return run reject(&resolver.*, &owed.module, RejectionCode.AmbientSuspension, owed.span) }
   if let Option<ErasureFact>.Some {value: fact} = &owed.conversion {
     let owner = DeclarationId.copyShared(&fact.owner)
@@ -113273,7 +113794,7 @@ effect fn parkingRejection(resolver: &mut Resolver, owed: &ParkObligation, dispa
     let anchor = run declarationAnchor(&mut resolver.*, &owner)
     let mut diagnostic = run makeRejection(RejectionCode.UnsatisfiedExecutableProperty, module, anchoredSpan(&anchor, fact.origin))
     diagnostic.related = Option<RelatedSite>.some(RelatedSite {module: ModuleId.copy(&owed.module), span: owed.span})
-    let operation = DeclarationId.copyShared(&InstanceKey.identity(dispatcher))
+    let operation = DeclarationId.copyShared(&InstanceKey.identity(&summary.key))
     run List<MessageArgument>.append(&mut diagnostic.arguments, MessageArgument {name: run Bytes.copy(b"template"), value: run Bytes.copy(b"3")})
     run List<MessageArgument>.append(&mut diagnostic.arguments, MessageArgument {name: run Bytes.copy(b"member"), value: run writtenTypeName(module, &fact.source)})
     run List<MessageArgument>.append(&mut diagnostic.arguments, MessageArgument {name: run Bytes.copy(b"operation"), value: run shownName(&mut resolver.*, &operation)})
@@ -113314,7 +113835,14 @@ effect fn nonParkingViolations(resolver: &mut Resolver, summaries: &[SuspensionS
     at = at + usize.ONE
   }
   if !owing { return move violations }
-  let parks = run closeParking(summaries)
+  let mut boundaries = List<bool>.make()
+  at = usize.ZERO
+  while at < summaries.length {
+    let dispatcher = !summaries[at].ambientCall.isNone()
+    run List<bool>.append(&mut boundaries, dispatcher)
+    at = at + usize.ONE
+  }
+  let parks = run closeParkingThrough(summaries, List<bool>.asSlice(&boundaries))
   let mut suspendable = List<bool>.make()
   let bare = run bareKeys(summaries)
   let plain = List<Option<InstanceKey>>.asSlice(&bare)
@@ -113429,19 +113957,23 @@ effect fn nonParkingViolations(resolver: &mut Resolver, summaries: &[SuspensionS
         if run parkingGlue(summaries, marked, &dropped[glue], &owner) { proved = false }
         glue = glue + usize.ONE
       }
-      if !proved && (!Option<ErasureFact>.isNone(&owed[obligation].conversion) || !reportedSite(List<ParkSite>.asSlice(&reported), &owed[obligation])) {
+      if !proved && (!summaries[at].ambientCall.isNone() || !Option<ErasureFact>.isNone(&owed[obligation].conversion) || !reportedSite(List<ParkSite>.asSlice(&reported), &owed[obligation])) {
         run List<ParkSite>.append(&mut reported, ParkSite {module: ModuleId.copy(&owed[obligation].module), span: owed[obligation].span})
-        let diagnostic = run parkingRejection(&mut resolver.*, &owed[obligation], &summaries[at].key)
+        let argument = if owed[obligation].ambient && !summaries[at].ambientCall.isNone() {
+          run ambientArgumentWitness(summaries, &lookup, marked, &owed[obligation], &summaries[at].key)
+        } else { Option<Interned<Type>>.none() }
+        let diagnostic = run parkingRejection(&mut resolver.*, &owed[obligation], &summaries[at], &argument)
+        let site = Shared<Rejection>.with<DeclarationRejectionSite>(&diagnostic, declarationRejectionSite)
         let own = match &application {
-          Option<ModuleId>.Some {value} => ModuleId.equals(&owed[obligation].module, &value)
+          Option<ModuleId>.Some {value} => ModuleId.equals(&site.module, &value)
           Option<ModuleId>.None => false
         }
         if own {
-          run List<Shared<Rejection>>.append(&mut violations, move diagnostic)
-        } else if ModuleId.equals(&owed[obligation].module, runtime) {
-          run List<Shared<Rejection>>.append(&mut later, move diagnostic)
+          run appendDeclarationRejection(&mut violations, move diagnostic)
+        } else if ModuleId.equals(&site.module, runtime) {
+          run appendDeclarationRejection(&mut later, move diagnostic)
         } else {
-          run List<Shared<Rejection>>.append(&mut middle, move diagnostic)
+          run appendDeclarationRejection(&mut middle, move diagnostic)
         }
       }
       obligation = obligation + usize.ONE

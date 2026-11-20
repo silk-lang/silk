@@ -401,7 +401,7 @@ A runtime capability supplied by a complete set of declaration bindings.
 pub capability: String
 ```
 
-The supported capability, `execution-storage`.
+The selected capability, `execution-storage` or `trace-directive`.
 
 <a id="Capability.bindings"></a>
 
@@ -411,7 +411,7 @@ The supported capability, `execution-storage`.
 pub bindings: List<StorageBinding>
 ```
 
-One binding for each execution-storage operation.
+One declaration binding for each of the four capability operations.
 
 <a id="Capability.impl.Schema"></a>
 
@@ -445,7 +445,7 @@ fn check(self: &Self, checks: &mut Checks<Self>) -> ()
 pub struct StorageBinding
 ```
 
-One operation supplied by an execution-storage implementation.
+One operation supplied by a runtime capability.
 
 <a id="StorageBinding.operation"></a>
 
@@ -455,7 +455,7 @@ One operation supplied by an execution-storage implementation.
 pub operation: String
 ```
 
-The operation: create, acquire, release, or destroy.
+The operation supplied by this binding.
 
 <a id="StorageBinding.module"></a>
 
