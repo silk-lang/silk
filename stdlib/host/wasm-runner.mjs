@@ -15,6 +15,7 @@
 //
 // A module that reads `OsRandom`, `OsSystemClock` or `OsMonotonicClock` imports `silk.random`
 // (from `crypto.getRandomValues`) and `silk.clock` (from `performance`).
+// A module that reads `OsLocalZone` imports `silk.time-zone` (from `Intl.DateTimeFormat`).
 //
 // Every Worker is created by the top-level thread, never by another Worker, so a thread that
 // returns cannot take the threads it started with it. `main` never runs on the top-level thread,
@@ -141,7 +142,7 @@ const decoder = new TextDecoder()
 // bytes go through a buffer of this Worker's own.
 const randomBuffer = new Uint8Array(65536)
 
-// `silk.random` and `silk.clock` of the providers in `silk.platform.wasm.host`. `origin` is the
+// `silk.random`, `silk.clock` and `silk.time-zone` of the providers in `silk.platform.wasm.host`. `origin` is the
 // `performance.timeOrigin` of the top-level thread, so every Worker reads the same monotonic
 // clock.
 const hostImportsFor = (reading, origin) => ({
@@ -159,6 +160,18 @@ const hostImportsFor = (reading, origin) => ({
   clock: (monotonic) => {
     const now = performance.timeOrigin + performance.now()
     return monotonic ? Math.max(0, now - origin) : now
+  },
+  'time-zone': (address, capacity) => {
+    let name
+    try {
+      name = Intl.DateTimeFormat().resolvedOptions().timeZone
+    } catch {
+      return 0
+    }
+    const bytes = new TextEncoder().encode(name ?? '')
+    if (bytes.length > word(capacity)) return 0
+    new Uint8Array(reading.exports.memory.buffer, word(address), bytes.length).set(bytes)
+    return bytes.length
   },
 })
 

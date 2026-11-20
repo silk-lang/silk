@@ -416,6 +416,86 @@ pub fn capacity(self: &Self) -> usize
 
 Returns the number of rows that fit in the current storage before the next growth.
 
+<a id="ColumnList.impl.column"></a>
+
+### Method `column`
+
+```silk
+pub fn column<'s, V>(self: &'s Self, static field: Intrinsic.Field<T, V>) -> &'s [V]
+```
+
+Returns a shared borrow of the column of `field`, one element for each row, in row order.
+
+#### When to use
+
+Use `column` in a function that takes the field as a static parameter. Code that names the
+field writes `&rows[..].field`, which gives the same slice and lends only that column.
+
+#### Details
+
+`field` is a static argument. Write the field's name as a string literal:
+`ColumnList<Particle>.column(&particles, "x")`. A name that is not a field of `T` is an error
+at the literal.
+
+#### Gotchas
+
+The slice borrows the whole list. The compiler rejects a change to the list, and an
+exclusive borrow of another column, while the slice is live.
+
+#### Examples
+
+##### Add the values of a column that the caller names
+
+```silk
+import silk.collections.column_list { ColumnList }
+import silk.core.effect { Effect }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+
+struct Size {
+  pub width: u32,
+  pub height: u32,
+}
+
+impl Copy for Size {}
+
+// The caller names the field. The function works for every `u32` field of every row type.
+fn total<T: Copy>(rows: &ColumnList<T>, static field: Intrinsic.Field<T, u32>) -> u32 {
+  let values = ColumnList<T>.column(rows, field)
+  let mut sum: u32 = 0
+  let mut index: usize = 0
+  while index < values.length {
+    sum = sum + values[index]
+    index = index + 1
+  }
+  return sum
+}
+
+effect fn heights() -> u32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut sizes = ColumnList<Size>.make()
+  run sizes.append(Size { width: 4, height: 10 })
+  run sizes.append(Size { width: 6, height: 20 })
+  return total<Size>(&sizes, "height")
+}
+
+effect fn recover(error: OutOfMemoryError) -> u32 {
+  return 0
+}
+
+pub fn main() -> i32 {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let sum = run heights()
+    |> Effect.provideMut<Allocator>(&mut allocator)
+    |> Effect.catchAll(recover)
+  if sum != 30 {
+    return 1
+  }
+  return 0
+}
+```
+
 <a id="ColumnList.impl.rows"></a>
 
 ### Method `rows`

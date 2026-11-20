@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+"""Generate stdlib/silk/time/data/tzdb.bin, the time zone bundle of silk.time.zones_bundled.
+
+The bundle holds every zone and link of one checksum-pinned release of the IANA time zone
+database, compiled by `zic` and stripped of the transitions that the TZ string of each zone
+gives, and the CLDR table that maps Windows zone names to IANA
+names. The program needs `zic` (the `tzdata` tools of the system) and, for the first run, the
+network. To move to a new release, change VERSION and the two checksums, run the script, and run
+the `stdlib-time-bundle` corpus program.
+
+Layout of the file, with every integer big-endian and unsigned 32-bit:
+
+    0   "SILKTZ1\\0"
+    8   offset and length of the release name, such as "2026e"
+    16  count and offset of the name table
+    24  count and offset of the data table
+    32  count and offset of the Windows table
+    40  tables, then names, then zone data
+
+A name entry is the offset and length of a zone name and the index of its data entry; the
+entries are sorted by the bytes of the name. A data entry is the offset and length of one TZif
+file; links share the entry of their target. A Windows entry is the offset and length of a Windows
+zone name and the index of the name entry of its IANA zone; the entries are sorted by the
+lower-case bytes of the Windows name.
+"""
+import argparse
+import datetime
+import hashlib
+from pathlib import Path
+import re
+import shutil
+import struct
+import subprocess
+import tarfile
+import time
+import urllib.request
+import xml.etree.ElementTree as ElementTree
+
+ROOT = Path(__file__).resolve().parents[2]
+VERSION = "2026e"
+CLDR = "release-48"
+CACHE = ROOT / "build/tzdb" / VERSION
+OUTPUT = ROOT / "stdlib/silk/time/data/tzdb.bin"
+SOURCES = {
+    "tzdata.tar.gz": (
+        f"https://data.iana.org/time-zones/releases/tzdata{VERSION}.tar.gz",
+        "b26882805f26aac59d5b222978e6580484b834ccdc98be89df2f05a6dc53a652",
+    ),
+    "windowsZones.xml": (
+        f"https://raw.githubusercontent.com/unicode-org/cldr/{CLDR}/common/supplemental/windowsZones.xml",
+        "9cf3db6a31fb382fee21b70be6feba1e82766b0fcd06e6261fb7936a73e537ff",
+    ),
+}
+# The source files of the database that define zones and links. `backzone` is left out, as in
+# the default build of the database, and so is `factory`, which is not a real zone.
+REGIONS = ["africa", "antarctica", "asia", "australasia", "europe", "northamerica", "southamerica", "etcetera", "backward"]
+
+
+def fetch(name):
+    url, digest = SOURCES[name]
+    path = CACHE / name
+    if path.exists():
+        data = path.read_bytes()
+    else:
+        with urllib.request.urlopen(url, timeout=120) as response:
+            data = response.read()
+    actual = hashlib.sha256(data).hexdigest()
+    if actual != digest:
+        raise SystemExit(f"SHA256 mismatch for {name}: expected {digest}, got {actual}; remove a corrupt cache file explicitly before retrying")
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".download")
+        temporary.write_bytes(data)
+        temporary.replace(path)
+    return path
+
+
+def days_from_civil(year, month, day):
+    return datetime.date(year, month, day).toordinal() - datetime.date(1970, 1, 1).toordinal()
+
+
+def parse_rule(text):
+    """Parses a POSIX TZ string into (standard, daylight, start, end); daylight is None if absent."""
+    pattern = re.compile(
+        r"(<[^>]+>|[A-Za-z]+)([-+]?[0-9:]+)"
+        r"(?:(<[^>]+>|[A-Za-z]+)([-+]?[0-9:]+)?,([^,/]+)(?:/([-+]?[0-9:]+))?,([^,/]+)(?:/([-+]?[0-9:]+))?)?"
+    )
+    match = pattern.fullmatch(text)
+    if match is None:
+        raise SystemExit("unsupported TZ string " + text)
+
+    def seconds(value):
+        sign = -1 if value.startswith("-") else 1
+        parts = [int(part) for part in value.lstrip("+-").split(":")]
+        parts += [0] * (3 - len(parts))
+        return sign * (parts[0] * 3600 + parts[1] * 60 + parts[2])
+
+    def name(value):
+        return value.strip("<>")
+
+    standard = (-seconds(match.group(2)), 0, name(match.group(1)))
+    if match.group(3) is None:
+        return standard, None, None, None
+    offset = -seconds(match.group(4)) if match.group(4) else standard[0] + 3600
+    daylight = (offset, 1, name(match.group(3)))
+    start = (match.group(5), seconds(match.group(6) or "2"))
+    end = (match.group(7), seconds(match.group(8) or "2"))
+    return standard, daylight, start, end
+
+
+def rule_day(spec, year):
+    """The day, counted from 1970-01-01, that the date `spec` of a TZ string names in `year`."""
+    if spec.startswith("M"):
+        month, week, weekday = (int(part) for part in spec[1:].split("."))
+        first = days_from_civil(year, month, 1)
+        day = first + (weekday - (first + 4) % 7) % 7 + 7 * (week - 1)
+        last = days_from_civil(year + month // 12, month % 12 + 1, 1)
+        while day >= last:
+            day -= 7
+        return day
+    if spec.startswith("J"):
+        number = int(spec[1:])
+        leap = year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+        return days_from_civil(year, 1, 1) + number - 1 + (1 if leap and number > 59 else 0)
+    return days_from_civil(year, 1, 1) + int(spec)
+
+
+def rule_transitions(rule, first_year, last_year):
+    standard, daylight, start, end = rule
+    rows = []
+    for year in range(first_year, last_year + 1):
+        rows.append((rule_day(start[0], year) * 86400 + start[1] - standard[0], daylight))
+        rows.append((rule_day(end[0], year) * 86400 + end[1] - daylight[0], standard))
+    rows.sort(key=lambda row: row[0])
+    return rows
+
+
+def slim(name, data):
+    """Returns the TZif file `data` without the transitions that its TZ string gives.
+
+    `zic -b fat` writes every transition through 2037. This keeps the transitions up to the last
+    one that the TZ string of the footer does not give, and one more, after which the TZ string
+    holds. The result has an empty version 1 block, as `zic -b slim` writes it. The slim output
+    of zic itself is not used because zic before release 2023a wrote wrong files for zones whose
+    last change of rules is near a transition, such as America/Ojinaga.
+    """
+    def header(at):
+        fields = struct.unpack(">4sc15x6I", data[at:at + 44])
+        if fields[0] != b"TZif":
+            raise SystemExit(name + " is not a TZif file")
+        return fields
+
+    _, version, isut, isstd, leap, times, types, chars = header(0)
+    if version == b"\0":
+        raise SystemExit(name + " has no 64-bit data; zic is too old")
+    at = 44 + times * 5 + types * 6 + chars + leap * 4 * 2 + isstd + isut
+    _, version, isut, isstd, leap, times, types, chars = header(at)
+    if leap != 0:
+        raise SystemExit(name + " has leap seconds")
+    at += 44
+    moments = list(struct.unpack(f">{times}q", data[at:at + 8 * times]))
+    at += 8 * times
+    indexes = list(data[at:at + times])
+    at += times
+    table = data[at + types * 6:at + types * 6 + chars]
+    kinds = []
+    for index in range(types):
+        offset, daylight, text = struct.unpack(">iBB", data[at + index * 6:at + index * 6 + 6])
+        kinds.append((offset, daylight, table[text:table.index(b"\0", text)].decode()))
+    at += types * 6 + chars + isstd + isut
+    if data[at:at + 1] != b"\n" or not data.endswith(b"\n"):
+        raise SystemExit(name + " has no footer")
+    footer = data[at + 1:-1].decode()
+    if footer == "":
+        raise SystemExit(name + " has an empty footer")
+
+    rows = [(moment, kinds[index]) for moment, index in zip(moments, indexes)]
+    initial = kinds[0]
+    # Drop transitions that change nothing; zic writes one at the end of the 32-bit range.
+    kept = []
+    current = initial
+    for moment, kind in rows:
+        if kind != current:
+            kept.append((moment, kind))
+            current = kind
+    rows = kept
+    rule = parse_rule(footer)
+    if rule[1] is None:
+        if current != rule[0]:
+            raise SystemExit(f"{name}: the footer {footer} does not continue the last transition")
+    else:
+        if not rows:
+            raise SystemExit(name + " has a rule and no transitions")
+        first_year = time.gmtime(max(rows[0][0], -2**40)).tm_year - 1
+        given = rule_transitions(rule, first_year, time.gmtime(rows[-1][0]).tm_year + 1)
+        keep = len(rows) - 1
+        while keep > 0:
+            tail = [row for row in given if rows[keep - 1][0] <= row[0] <= rows[-1][0]]
+            if tail != rows[keep - 1:]:
+                break
+            keep -= 1
+        tail = [row for row in given if rows[keep][0] <= row[0] <= rows[-1][0]]
+        if tail != rows[keep:]:
+            raise SystemExit(f"{name}: the footer {footer} does not give the last transitions of the file")
+        rows = rows[:keep + 1]
+
+    used = [initial]
+    for _, kind in rows:
+        if kind not in used:
+            used.append(kind)
+    names = bytearray()
+    places = {}
+    for _, _, text in used:
+        if text not in places:
+            places[text] = len(names)
+            names += text.encode() + b"\0"
+    out = bytearray(struct.pack(">4sc15x6I", b"TZif", version, 0, 0, 0, 0, 1, 1) + bytes(7))
+    out += struct.pack(">4sc15x6I", b"TZif", version, 0, 0, 0, len(rows), len(used), len(names))
+    out += struct.pack(f">{len(rows)}q", *[moment for moment, _ in rows])
+    out += bytes(used.index(kind) for _, kind in rows)
+    for offset, daylight, text in used:
+        out += struct.pack(">iBB", offset, daylight, places[text])
+    out += names
+    out += b"\n" + footer.encode() + b"\n"
+    return bytes(out)
+
+
+def compile_zones():
+    if shutil.which("zic") is None:
+        raise SystemExit("zic is not on PATH; install the time zone compiler of the system")
+    source = CACHE / "source"
+    compiled = CACHE / "compiled"
+    for directory in (source, compiled):
+        if directory.exists():
+            shutil.rmtree(directory)
+    with tarfile.open(fetch("tzdata.tar.gz")) as archive:
+        archive.extractall(source, filter="data")
+    if (source / "version").read_text().strip() != VERSION:
+        raise SystemExit("the archive is not release " + VERSION)
+    subprocess.run(["zic", "-b", "fat", "-d", str(compiled)] + [str(source / region) for region in REGIONS], check=True)
+    zones = {}
+    for path in sorted(compiled.rglob("*")):
+        if path.is_file():
+            name = path.relative_to(compiled).as_posix()
+            zones[name] = slim(name, path.read_bytes())
+    return zones
+
+
+def windows_names(zones):
+    tree = ElementTree.parse(fetch("windowsZones.xml"))
+    rows = {}
+    for row in tree.iter("mapZone"):
+        # Territory 001 is the default zone of a Windows name.
+        if row.get("territory") == "001":
+            target = row.get("type")
+            if target not in zones:
+                raise SystemExit(f"the Windows zone {row.get('other')} maps to {target}, which the database does not have")
+            rows[row.get("other")] = target
+    return rows
+
+
+def build():
+    zones = compile_zones()
+    windows = windows_names(zones)
+    names = sorted(zones, key=lambda name: name.encode())
+    data = []
+    index_of = {}
+    for name in names:
+        if zones[name] not in index_of:
+            index_of[zones[name]] = len(data)
+            data.append(zones[name])
+    windows_rows = sorted(windows.items(), key=lambda row: row[0].lower().encode())
+
+    header = 40
+    name_table = header
+    data_table = name_table + 12 * len(names)
+    windows_table = data_table + 8 * len(data)
+    pool = windows_table + 12 * len(windows_rows)
+    strings = bytearray()
+
+    def text(value):
+        at = pool + len(strings)
+        strings.extend(value.encode())
+        return at, len(value.encode())
+
+    release = text(VERSION)
+    name_entries = [text(name) for name in names]
+    windows_entries = [text(name) for name, _ in windows_rows]
+    blobs = pool + len(strings)
+    out = bytearray(b"SILKTZ1\0")
+    out += struct.pack(">8I", release[0], release[1], len(names), name_table, len(data), data_table, len(windows_rows), windows_table)
+    for (at, length), name in zip(name_entries, names):
+        out += struct.pack(">3I", at, length, index_of[zones[name]])
+    at = blobs
+    for blob in data:
+        out += struct.pack(">2I", at, len(blob))
+        at += len(blob)
+    for (at_name, length), (_, target) in zip(windows_entries, windows_rows):
+        out += struct.pack(">3I", at_name, length, names.index(target))
+    out += strings
+    for blob in data:
+        out += blob
+    return bytes(out), len(names), len(data), len(windows_rows)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--check", action="store_true", help="fail if the file in the repository differs from the generated one")
+    arguments = parser.parse_args()
+    bundle, names, data, windows = build()
+    if arguments.check:
+        if not OUTPUT.exists() or OUTPUT.read_bytes() != bundle:
+            raise SystemExit(f"{OUTPUT.relative_to(ROOT)} is stale; run scripts/time/generate-tzdb")
+    else:
+        OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+        OUTPUT.write_bytes(bundle)
+    print(f"tzdb {VERSION}: {names} names, {data} zone files, {windows} Windows names, {len(bundle)} bytes")
+
+
+if __name__ == "__main__":
+    main()

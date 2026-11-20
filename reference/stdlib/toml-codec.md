@@ -78,7 +78,10 @@ pub interface Serialize
 
 A type that can write itself as one TOML value.
 
-The standard library implements it for `bool`, `i32`, `i64`, `f64`, `string`, and `String`.
+The standard library implements it for `bool`, `i32`, `i64`, `f64`, `string`, and `String`,
+and for the `silk.time` types `Instant`, `PlainDateTime`, `PlainDate`, and `PlainTime`, which
+are written as TOML dates and times. An `Instant` is written in UTC. TOML has years from 0000
+to 9999, and a date outside them fails with `TomlReason.InvalidDateTime`.
 Implement it for your own type to write the type with [`TomlCodec.writeOne`](#TomlCodec.impl.writeOne).
 
 <a id="Serialize.serialize"></a>
@@ -106,8 +109,11 @@ pub interface Decode
 
 A type that can read itself from a TOML value without allocation.
 
-The standard library implements it for `bool` (from `Boolean`), and `i32` and `i64` (from
-`Integer`, with `0x`, `0o`, `0b` and `_`). Read it with [`TomlCodec.decodeOne`](#TomlCodec.impl.decodeOne).
+The standard library implements it for `bool` (from `Boolean`), `i32` and `i64` (from
+`Integer`, with `0x`, `0o`, `0b` and `_`), and the `silk.time` types: `Instant` (from
+`OffsetDateTime`), `PlainDateTime` (from `LocalDateTime`), `PlainDate` (from `LocalDate`), and
+`PlainTime` (from `LocalTime`). A fraction of a second keeps its first nine digits, and second
+`60` reads as `59`. Read it with [`TomlCodec.decodeOne`](#TomlCodec.impl.decodeOne).
 
 <a id="Decode.decode"></a>
 
@@ -388,6 +394,134 @@ impl Deserialize for String
 
 ```silk
 effect fn deserialize(value: &Value) -> Self ! TomlError | OutOfMemoryError ? &mut Allocator
+```
+
+<a id="PlainDate.impl.Serialize"></a>
+
+## Implementation `Serialize for PlainDate`
+
+```silk
+impl Serialize for PlainDate
+```
+
+<a id="PlainDate.impl.Serialize.serialize"></a>
+
+### Operation `serialize`
+
+```silk
+effect fn serialize(self: &Self) -> () ! TomlError | WriterError ? &mut Writer
+```
+
+<a id="PlainDate.impl.Decode"></a>
+
+## Implementation `Decode for PlainDate`
+
+```silk
+impl Decode for PlainDate
+```
+
+<a id="PlainDate.impl.Decode.decode"></a>
+
+### Operation `decode`
+
+```silk
+fn decode(value: &Value) -> Result<Self, TomlError>
+```
+
+<a id="PlainTime.impl.Serialize"></a>
+
+## Implementation `Serialize for PlainTime`
+
+```silk
+impl Serialize for PlainTime
+```
+
+<a id="PlainTime.impl.Serialize.serialize"></a>
+
+### Operation `serialize`
+
+```silk
+effect fn serialize(self: &Self) -> () ! TomlError | WriterError ? &mut Writer
+```
+
+<a id="PlainTime.impl.Decode"></a>
+
+## Implementation `Decode for PlainTime`
+
+```silk
+impl Decode for PlainTime
+```
+
+<a id="PlainTime.impl.Decode.decode"></a>
+
+### Operation `decode`
+
+```silk
+fn decode(value: &Value) -> Result<Self, TomlError>
+```
+
+<a id="PlainDateTime.impl.Serialize"></a>
+
+## Implementation `Serialize for PlainDateTime`
+
+```silk
+impl Serialize for PlainDateTime
+```
+
+<a id="PlainDateTime.impl.Serialize.serialize"></a>
+
+### Operation `serialize`
+
+```silk
+effect fn serialize(self: &Self) -> () ! TomlError | WriterError ? &mut Writer
+```
+
+<a id="PlainDateTime.impl.Decode"></a>
+
+## Implementation `Decode for PlainDateTime`
+
+```silk
+impl Decode for PlainDateTime
+```
+
+<a id="PlainDateTime.impl.Decode.decode"></a>
+
+### Operation `decode`
+
+```silk
+fn decode(value: &Value) -> Result<Self, TomlError>
+```
+
+<a id="Instant.impl.Serialize"></a>
+
+## Implementation `Serialize for Instant`
+
+```silk
+impl Serialize for Instant
+```
+
+<a id="Instant.impl.Serialize.serialize"></a>
+
+### Operation `serialize`
+
+```silk
+effect fn serialize(self: &Self) -> () ! TomlError | WriterError ? &mut Writer
+```
+
+<a id="Instant.impl.Decode"></a>
+
+## Implementation `Decode for Instant`
+
+```silk
+impl Decode for Instant
+```
+
+<a id="Instant.impl.Decode.decode"></a>
+
+### Operation `decode`
+
+```silk
+fn decode(value: &Value) -> Result<Self, TomlError>
 ```
 
 

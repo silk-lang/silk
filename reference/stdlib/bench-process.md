@@ -162,6 +162,18 @@ pub signal: i64
 
 The signal that ended the program, or 0.
 
+<a id="Timed.counts"></a>
+
+### Field `counts`
+
+```silk
+pub counts: List<Metric>
+```
+
+What the system's counters measured over the run, for a run that asked for them: one
+value for each counter the system offers, of `instructions`, `cycles`, `cache-misses`,
+`branch-misses` and `page-faults`.
+
 <a id="Driven"></a>
 
 ## `Driven`
@@ -290,7 +302,7 @@ environment variables. What the system does not report is `unknown` or 0.
 ### Associated function `time`
 
 ```silk
-pub effect fn time(launch: &Launch, cpus: u32) -> Timed
+pub effect fn time(launch: &Launch, cpus: u32, counted: bool) -> Timed
     ! TaskError | OutOfMemoryError
     ? &mut Allocator | &mut MonotonicClock
 ```
@@ -301,6 +313,13 @@ run only on that many processors, the first ones this process may use.
 #### Details
 A program that exits with a status other than 0, or that a signal ends, is not an error
 here: the status is in the result, and the caller decides.
+
+With `counted`, the run also reads the counters of the processor and of the kernel, on
+Linux on x86_64 and aarch64: instructions, cycles, cache misses, branch misses and page
+faults, all in user mode, for the program and the processes it starts, not
+for this process. A counter the system does not offer is left out, so on another system,
+or where the kernel refuses, `counts` is empty; a virtual machine often offers only the
+last.
 
 #### Errors
 `TaskError` with status 127 if the program cannot be started, if `cpus` is more than

@@ -24,24 +24,6 @@ ECMAScript Temporal.
 ```silk
 import silk.core.result { Result }
 import silk.time.duration { Duration }
-import silk.time.plain_date_time { PlainDateTime }
-import silk.time.text { TimeParseError }
-
-pub fn main() -> i32 {
-  match PlainDateTime.parse("2026-12-31T23:30:00") {
-    Result<PlainDateTime, TimeParseError>.Success { value } => {
-      let later = value.add(Duration.fromHours(1))
-      if later.date().year() != 2027 || later.time().minute() != 30 {
-        return 1
-      }
-      return 0
-    }
-    Result<PlainDateTime, TimeParseError>.Failure { error: _ } => {
-      return 2
-    }
-  }
-}
-```
 
 Import as `PlainDateTime` with `import silk.time.plain_date_time { PlainDateTime }`.
 
@@ -204,6 +186,52 @@ Returns the date and time `span` later, or earlier for a negative span. Every da
 
 A result outside the range traps. [`PlainDateTime.checkedAdd`](#PlainDateTime.impl.checkedAdd) returns `None` instead.
 
+<a id="PlainDateTime.impl.round"></a>
+
+### Method `round`
+
+```silk
+pub fn round(self: Self, step: TimeIncrement, mode: RoundingMode) -> PlainDateTime
+```
+
+Returns the date and time with the time of day rounded to a multiple of `step` from
+midnight. A time that rounds up to midnight is on the next day.
+
+#### Details
+
+`TimeIncrement.one(TimeUnit.Day)` rounds to the start of this day or of the next day.
+
+#### Gotchas
+
+A result outside the range traps. [`PlainDateTime.checkedRound`](#PlainDateTime.impl.checkedRound) returns `None` instead.
+
+#### Examples
+
+```silk
+import silk.time.plain_date_time { PlainDateTime }
+import silk.time.rounding { RoundingMode, TimeIncrement, TimeUnit }
+
+pub fn main() -> i32 {
+  let late = PlainDateTime.fromFields(2026, 12, 31, 23, 59, 40)
+  let rounded = late.round(TimeIncrement.one(TimeUnit.Minute), RoundingMode.HalfExpand)
+  if &rounded != &PlainDateTime.fromFields(2027, 1, 1, 0, 0, 0) {
+    return 1
+  }
+  return 0
+}
+```
+
+<a id="PlainDateTime.impl.checkedRound"></a>
+
+### Method `checkedRound`
+
+```silk
+pub fn checkedRound(self: Self, step: TimeIncrement, mode: RoundingMode) -> Option<PlainDateTime>
+```
+
+Returns the date and time with the time of day rounded to a multiple of `step` from
+midnight, or `None` when the result is outside the range.
+
 <a id="PlainDateTime.impl.until"></a>
 
 ### Method `until`
@@ -214,6 +242,58 @@ pub fn until(self: Self, other: PlainDateTime) -> Duration
 
 Returns the exact span from this date and time to `other`, with every day counted as 24
 hours. It is negative when `other` is earlier.
+
+<a id="PlainDateTime.impl.checkedAddPeriod"></a>
+
+### Method `checkedAddPeriod`
+
+```silk
+pub fn checkedAddPeriod(self: Self, period: Period, overflow: Overflow) -> Option<PlainDateTime>
+```
+
+Returns the date and time that `period` leads to, or `None` when it is outside the range,
+or when `overflow` is `Reject` and the day does not exist in the month reached.
+
+#### Details
+
+The time part of the period is added to the time of day, and the whole days that it
+crosses go to the days of the period. Then the date moves as in
+`PlainDate.checkedAddPeriod`: years and months first, with the day held to the month
+reached, and then weeks and days. Every day counts as 24 hours.
+
+<a id="PlainDateTime.impl.addPeriod"></a>
+
+### Method `addPeriod`
+
+```silk
+pub fn addPeriod(self: Self, period: Period) -> PlainDateTime
+```
+
+Returns the date and time that `period` leads to, with a day that does not exist in the
+month reached replaced by the last day of that month.
+
+#### Gotchas
+
+A result outside the range traps. [`PlainDateTime.checkedAddPeriod`](#PlainDateTime.impl.checkedAddPeriod) returns `None`
+instead.
+
+<a id="PlainDateTime.impl.periodUntil"></a>
+
+### Method `periodUntil`
+
+```silk
+pub fn periodUntil(self: Self, other: PlainDateTime, largest: DateUnit) -> Period
+```
+
+Returns the calendar span from this date and time to `other`: years, months, weeks, or
+days as `largest` says, and the time that is left, which is less than 24 hours. It is
+negative when `other` is earlier.
+
+#### Details
+
+The date parts are counted as in `PlainDate.periodUntil`, up to the last whole day before
+`other`. Every day counts as 24 hours. For the exact span in hours and smaller units, use
+[`PlainDateTime.until`](#PlainDateTime.impl.until).
 
 <a id="PlainDateTime.impl.parse"></a>
 
@@ -356,7 +436,5 @@ effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
     ? &mut Writer
 ```
 
-
-Category: Time.
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`, `wasm64-unknown-unknown`.

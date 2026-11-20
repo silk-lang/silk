@@ -80,6 +80,14 @@
 //! processes it starts. A driven program is not counted, and a program that prints result lines
 //! gets the count only when it reports one benchmark. `valgrind` must be on `PATH`.
 //!
+//! `--counters` reads the counters of the processor and the kernel over every timed run, on
+//! Linux on x86_64 and aarch64, and adds the median of each to the implementation's row:
+//! `instructions`, `cycles`, `cache-misses`, `branch-misses` and `page-faults`, all in user
+//! mode. They cover the program and the processes it starts and cost the run
+//! nothing measurable. A counter the system does not offer is left out without an error: a
+//! virtual machine or a container often offers only the last, and the hardware counters
+//! need `/proc/sys/kernel/perf_event_paranoid` at 2 or lower.
+//!
 //! # Gotchas
 //! - Processes can be measured on Linux with GNU libc and on macOS.
 //! - Statistics cannot repair a noisy computer. Close other programs, and distrust a run whose
@@ -196,9 +204,11 @@ import silk.io.writer { Writer, WriterError }
 import silk.io.writer_native { StderrWriter, StdoutWriter }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.f64
+import silk.num.i32
 import silk.num.i64
 import silk.num.u32
 import silk.num.u64
+import silk.num.u8
 import silk.num.usize
 import silk.schema.issue { SchemaError }
 import silk.schema.json { SchemaJson }
@@ -209,6 +219,7 @@ import silk.system.monotonic_clock { MonotonicClock }
 import silk.system.system_clock { SystemClock }
 import silk.text.format { Format as Text, ParseError }
 import silk.text.string { InvalidUtf8, String }
+import silk.time.instant { Instant }
 
 static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetAbi() == "apple"
   && Intrinsic.profileText("libc") == "system")
@@ -268,6 +279,10 @@ pub struct BenchOptions {
   /// Also run each implementation's program once under this instrument and report what it
   /// counted. `callgrind` counts instructions with Valgrind.
   pub instrument: Option<String>,
+  /// Also read the counters of the processor and the kernel over each timed run, where the
+  /// system offers them: instructions, cycles, cache misses, branch misses and page
+  /// faults.
+  pub counters: bool,
 }
 
 impl BenchOptions {
@@ -296,6 +311,7 @@ impl BenchOptions {
       save: Option<String>.None,
       baseline: Option<String>.None,
       instrument: Option<String>.None,
+      counters: false,
     }
   }
 }
@@ -343,6 +359,10 @@ impl CommandLine for BenchOptions {
       |> Command.option(
         "instrument",
         Opt.about("Also count what one run of each program costs; callgrind counts instructions"),
+      )
+      |> Command.option(
+        "counters",
+        Opt.about("Also read hardware and kernel counters over each timed run, where offered"),
       )
       |> Command.option(
         "record",
@@ -474,6 +494,8 @@ struct Settings {
   noise: f64,
   // How long one sample of a driven implementation should take, in nanoseconds.
   sample: u64,
+  // Whether each timed run also reads the system's counters.
+  counters: bool,
   // Where Valgrind is, when each program is also run once under Callgrind.
   valgrind: Option<String>,
 }
@@ -1009,27 +1031,20 @@ effect fn two(text: &mut String, value: u64) -> ()
 effect fn dated(seconds: i64, compact: bool) -> String
   ! OutOfMemoryError
   ? &mut Allocator {
-  let mut whole: u64 = 0
+  // A clock before 1970 or past the range of `Instant` is written as the nearest instant.
+  let mut whole: i64 = 0
   if seconds > 0 {
-    whole = i64.toU64(seconds)
+    whole = seconds
   }
-  let days = whole / 86400
-  let clock = whole % 86400
-
-  // Days to a civil date, after Howard Hinnant's `civil_from_days`.
-  let shifted = days + 719468
-  let era = shifted / 146097
-  let dayOfEra = shifted - era * 146097
-  let yearOfEra = (dayOfEra - dayOfEra / 1460 + dayOfEra / 36524 - dayOfEra / 146096) / 365
-  let dayOfYear = dayOfEra - (365 * yearOfEra + yearOfEra / 4 - yearOfEra / 100)
-  let shiftedMonth = (5 * dayOfYear + 2) / 153
-  let day = dayOfYear - (153 * shiftedMonth + 2) / 5 + 1
-  let mut month = shiftedMonth + 3
-  let mut year = yearOfEra + era * 400
-  if shiftedMonth >= 10 {
-    month = shiftedMonth - 9
-    year = year + 1
+  if whole > Instant.max().unixSeconds() {
+    whole = Instant.max().unixSeconds()
   }
+  let reading = Instant.fromUnixSeconds(whole).toUtc()
+  let year = i32.toU64(reading.date().year())
+  let month = u8.toU64(reading.date().month())
+  let day = u8.toU64(reading.date().day())
+  let clock = u8.toU64(reading.time().hour()) * 3600 + u8.toU64(reading.time().minute()) * 60
+    + u8.toU64(reading.time().second())
   let mut text = String.make()
   run Units.appendWhole(&mut text, year)
   if !compact {
@@ -1057,6 +1072,13 @@ effect fn dated(seconds: i64, compact: bool) -> String
 effect fn sampleOf(name: string, round: u64, position: usize, warmup: bool, timed: &Timed) -> Sample
   ! OutOfMemoryError
   ? &mut Allocator {
+  let mut counts = List<Metric>.make()
+  let read = timed.counts.asSlice()
+  let mut at: usize = 0
+  while at < read.length {
+    run counts.append(Metric { unit: run String.copy(read[at].unit.view()), value: read[at].value })
+    at = at + 1
+  }
   return Sample {
     implementation: run String.copy(name),
     round: round,
@@ -1068,6 +1090,7 @@ effect fn sampleOf(name: string, round: u64, position: usize, warmup: bool, time
     peak: timed.peak,
     exit: timed.exit,
     signal: timed.signal,
+    counts: move counts,
   }
 }
 
@@ -1297,7 +1320,7 @@ effect fn instructionsOf(
     variables: run copyPairs(launch.variables.asSlice()),
     output: Option<Path>.None,
   }
-  let timed = run Process.time(&wrapped, cpus)
+  let timed = run Process.time(&wrapped, cpus, false)
   if timed.exit != 0 {
     run uncounted(who, " did not end well under ", valgrind)
   }
@@ -1413,7 +1436,7 @@ effect fn timeBenchmark(
         // What the last run left must not be read as this run's.
         run FileSystem.writeFileWithParents(&run Path.make(named.view()), b"")
       }
-      let timed = run Process.time(&launches.asSlice()[chosen], combination.cpus)
+      let timed = run Process.time(&launches.asSlice()[chosen], combination.cpus, settings.counters)
       run performAll(&candidates[chosen].after, pairs)
       if candidates[chosen].reports {
         let name = candidates[chosen].name.view()
@@ -2028,6 +2051,7 @@ effect fn performed(options: &BenchOptions, suites: &[Suite]) -> ()
         warmups: 1,
         noise: percent / 100.0,
         sample: 50000000,
+        counters: options.counters,
         valgrind: match &valgrind {
           Option<String>.Some { value } => Option<String>.Some {
             value: run String.copy(value.view()),
