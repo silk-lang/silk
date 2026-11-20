@@ -10,8 +10,10 @@ let server
 let lib
 
 const program = `import silk.core.effect { Effect }
-import silk.io.logger { LogError }
+import silk.io.logger { Logger }
 import silk.io.logger_native { StdoutLogger }
+import silk.concurrency.sync { Arc }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
 import util.Text { shout }
 
 fn total(values: &[i32]) -> i32 {
@@ -24,13 +26,13 @@ fn total(values: &[i32]) -> i32 {
   return sum
 }
 
-pub effect fn main() -> ()
-  ! LogError {
-  let mut logger = StdoutLogger.make()
+pub effect fn main() -> () ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let logger = run Arc<StdoutLogger>.make(StdoutLogger.make()) |> Effect.provideMut<Allocator>(&mut allocator)
   let numbers: [i32; 3] = [1, 2, 3]
   let sum = total(&numbers)
   let loudness = shout()
-  run Effect.log("{sum} {loudness}\\n", &.{ sum: sum, loudness: loudness }) |> Effect.provideMut(&mut logger)
+  run Effect.log("{sum} {loudness}\\n", &.{ sum: sum, loudness: loudness }) |> Effect.provideAmbient<Logger>(&logger)
 }
 `
 
@@ -78,7 +80,7 @@ test('definition opens the declaring file, stdlib included', async () => {
   const imported = await server.request('textDocument/definition', at(program, 'shout()'))
   assert.equal(imported.uri, uriOf(lib))
   const stdlib = await server.request('textDocument/definition', at(program, 'Effect.log', 8))
-  assert.match(stdlib.uri, /\/lib\/silk\/stdlib\/silk\/effect\.silk$/)
+  assert.match(stdlib.uri, /\/lib\/silk\/stdlib\/silk\/core\/effect\.silk$/)
 })
 
 test('completion after a type offers its functions', async () => {
@@ -139,7 +141,7 @@ test('hover on a type used as a qualifier shows its doc comment', { todo: 'findi
 })
 
 test('importing a name the module lacks is reported on the import line', { todo: 'finding 31' }, async () => {
-  const broken = program.replace('import silk.io.logger { LogError }', 'import silk.io.logger { LogError, Nope }')
+  const broken = program.replace('import silk.io.logger { Logger }', 'import silk.io.logger { Logger, Nope }')
   const diagnostics = await change(broken)
   await change(program)
   assert.ok(diagnostics.some((diagnostic) => diagnostic.code === 'SEM0014' && diagnostic.range.start.line === 1), JSON.stringify(diagnostics))

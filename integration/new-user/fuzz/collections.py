@@ -53,9 +53,10 @@ import silk.collections.hash {{ Hash, Word }}
 import silk.collections.hash_map {{ HashMap }}
 import silk.collections.hash_set {{ HashSet }}
 import silk.collections.list {{ List }}
-import silk.io.logger {{ LogError, Logger }}
+import silk.io.writer {{ Writer, WriterError }}
+import silk.text.format {{ Format }}
 import silk.core.option {{ Option }}
-import silk.io.logger_native {{ StdoutLogger }}
+import silk.io.writer_native {{ StdoutWriter }}
 
 fn opt(value: Option<i64>) -> i64 {{
   return match move value {{
@@ -64,23 +65,23 @@ fn opt(value: Option<i64>) -> i64 {{
   }}
 }}
 
-effect fn show(value: i64) -> () ! LogError ? &mut Logger {{
+effect fn show(value: i64) -> () ! WriterError ? &mut Writer {{
   if value == -999999999999999 {{
-    run Effect.log("none\\n", &())
+    run Format.format("none\\n", &())
     return ()
   }}
-  run Effect.log("{{value}}\\n", &.{{ value: value }})
+  run Format.format("{{value}}\\n", &.{{ value: value }})
 }}
 
-effect fn showLen(value: usize) -> () ! LogError ? &mut Logger {{
-  run Effect.log("{{value}}\\n", &.{{ value: value }})
+effect fn showLen(value: usize) -> () ! WriterError ? &mut Writer {{
+  run Format.format("{{value}}\\n", &.{{ value: value }})
 }}
 
-effect fn showBool(value: bool) -> () ! LogError ? &mut Logger {{
-  run Effect.log("{{value}}\\n", &.{{ value: value }})
+effect fn showBool(value: bool) -> () ! WriterError ? &mut Writer {{
+  run Format.format("{{value}}\\n", &.{{ value: value }})
 }}
 
-effect fn dumpList(list: &List<i64>) -> () ! LogError ? &mut Logger {{
+effect fn dumpList(list: &List<i64>) -> () ! WriterError ? &mut Writer {{
   let mut index: usize = 0
   while index < list.length() {{
     run show(list.get(index))
@@ -88,17 +89,17 @@ effect fn dumpList(list: &List<i64>) -> () ! LogError ? &mut Logger {{
   }}
 }}
 
-effect fn body() -> () ! LogError | OutOfMemoryError ? &mut Logger | &mut Allocator {{
+effect fn body() -> () ! WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {{
   let mut map = HashMap<Word, i64>.make(Hash.seed({seed}))
   let mut set = HashSet<Word>.make(Hash.seed({seed + 1}))
   let mut list = List<i64>.make()
 {chr(10).join(lines)}
 }}
 
-pub effect fn main() -> () ! LogError | OutOfMemoryError {{
+pub effect fn main() -> () ! WriterError | OutOfMemoryError {{
   let mut allocator = Allocator.systemAllocatorProvider()
-  let mut logger = StdoutLogger.make()
-  run body() |> Effect.provideMut<Logger>(&mut logger) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut stdout = StdoutWriter.make()
+  run body() |> Effect.provideMut<Writer>(&mut stdout) |> Effect.provideMut<Allocator>(&mut allocator)
 }}
 '''
 open(out,'w').write(src); open(exp,'w').write('\n'.join(expect)+'\n')

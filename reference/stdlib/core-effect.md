@@ -24,7 +24,7 @@ The signatures show how the channels combine. Two steps usually give the unions 
 
 A provider operation removes one exact requirement from `R`. If one provider can satisfy more
 than one requirement, write the requirement as the first type argument, as in
-`Effect.provideMut<Logger at Audit>`. Shared, exclusive, and owned providers have different
+`Effect.provideMut<Writer at Output>`. Shared, exclusive, and owned providers have different
 borrow and capture rules.
 
 ## Gotchas
@@ -159,6 +159,26 @@ import.
 impl Effect
 ```
 
+<a id="Effect.impl.provideAmbient"></a>
+
+### Method `provideAmbient`
+
+```silk
+pub effect fn provideAmbient<'env, S, A, P: Transferable + Concurrent, E, ?R>(
+    self: once Effect<'env; A ! E ? R>, provider: &Arc<P>
+  ) -> A ! E ? R
+```
+
+Installs a shared provider for each ambient observation made while running this effect.
+
+<a id="Effect.impl-2"></a>
+
+## Implementation `Effect`
+
+```silk
+impl Effect
+```
+
 <a id="Effect.impl.log"></a>
 
 ### Associated function `log`
@@ -167,7 +187,7 @@ impl Effect
 pub effect fn log<Args>(
     static template: string<'static>,
     args: &Args
-  ) -> () ! LogError ? &mut Logger
+  ) -> ()
 ```
 
 Sends one log message at `LogLevel.Info` to the active `Logger`.
@@ -183,10 +203,6 @@ Use `log` for an ordinary progress message. Use [`logAt`](#Effect.impl.logAt) or
 The `Logger` provider selects the output format and destination. The message is one complete
 log event.
 
-#### Errors
-
-- `LogError` if the `Logger` provider fails. This function does not buffer or retry.
-
 <a id="Effect.impl.logAt"></a>
 
 ### Associated function `logAt`
@@ -196,7 +212,7 @@ pub effect fn logAt<Args>(
     level: LogLevel,
     static template: string<'static>,
     args: &Args
-  ) -> () ! LogError ? &mut Logger
+  ) -> ()
 ```
 
 Sends one log message at `level` to the active `Logger`.
@@ -211,10 +227,6 @@ Use `logAt` when the level is a value at runtime. Use [`logTrace`](#Effect.impl.
 `template` is a static format template. The compiler checks it against `args` at compile time.
 The `Logger` provider selects the output format and destination.
 
-#### Errors
-
-- `LogError` if the `Logger` provider fails. This function does not buffer or retry.
-
 <a id="Effect.impl.logTrace"></a>
 
 ### Associated function `logTrace`
@@ -223,7 +235,7 @@ The `Logger` provider selects the output format and destination.
 pub effect fn logTrace<Args>(
     static template: string<'static>,
     args: &Args
-  ) -> () ! LogError ? &mut Logger
+  ) -> ()
 ```
 
 Sends one log message at `LogLevel.Trace` to the active `Logger`.
@@ -234,10 +246,6 @@ Sends one log message at `LogLevel.Trace` to the active `Logger`.
 The `Logger` provider selects the output format and destination. Use [`logAt`](#Effect.impl.logAt) when the
 level is a value at runtime.
 
-#### Errors
-
-- `LogError` if the `Logger` provider fails. This function does not retry.
-
 <a id="Effect.impl.logDebug"></a>
 
 ### Associated function `logDebug`
@@ -246,7 +254,7 @@ level is a value at runtime.
 pub effect fn logDebug<Args>(
     static template: string<'static>,
     args: &Args
-  ) -> () ! LogError ? &mut Logger
+  ) -> ()
 ```
 
 Sends one log message at `LogLevel.Debug` to the active `Logger`.
@@ -257,10 +265,6 @@ Sends one log message at `LogLevel.Debug` to the active `Logger`.
 The `Logger` provider selects the output format and destination. Use [`logAt`](#Effect.impl.logAt) when the
 level is a value at runtime.
 
-#### Errors
-
-- `LogError` if the `Logger` provider fails. This function does not retry.
-
 <a id="Effect.impl.logInfo"></a>
 
 ### Associated function `logInfo`
@@ -269,7 +273,7 @@ level is a value at runtime.
 pub effect fn logInfo<Args>(
     static template: string<'static>,
     args: &Args
-  ) -> () ! LogError ? &mut Logger
+  ) -> ()
 ```
 
 Sends one log message at `LogLevel.Info` to the active `Logger`.
@@ -280,10 +284,6 @@ Sends one log message at `LogLevel.Info` to the active `Logger`.
 The `Logger` provider selects the output format and destination. Use [`logAt`](#Effect.impl.logAt) when the
 level is a value at runtime.
 
-#### Errors
-
-- `LogError` if the `Logger` provider fails. This function does not retry.
-
 <a id="Effect.impl.logWarning"></a>
 
 ### Associated function `logWarning`
@@ -292,7 +292,7 @@ level is a value at runtime.
 pub effect fn logWarning<Args>(
     static template: string<'static>,
     args: &Args
-  ) -> () ! LogError ? &mut Logger
+  ) -> ()
 ```
 
 Sends one log message at `LogLevel.Warning` to the active `Logger`.
@@ -303,10 +303,6 @@ Sends one log message at `LogLevel.Warning` to the active `Logger`.
 The `Logger` provider selects the output format and destination. Use [`logAt`](#Effect.impl.logAt) when the
 level is a value at runtime.
 
-#### Errors
-
-- `LogError` if the `Logger` provider fails. This function does not retry.
-
 <a id="Effect.impl.logError"></a>
 
 ### Associated function `logError`
@@ -315,7 +311,7 @@ level is a value at runtime.
 pub effect fn logError<Args>(
     static template: string<'static>,
     args: &Args
-  ) -> () ! LogError ? &mut Logger
+  ) -> ()
 ```
 
 Sends one log message at `LogLevel.Error` to the active `Logger`.
@@ -325,10 +321,6 @@ Sends one log message at `LogLevel.Error` to the active `Logger`.
 `template` is a static format template. The compiler checks it against `args` at compile time.
 The `Logger` provider selects the output format and destination. Use [`logAt`](#Effect.impl.logAt) when the
 level is a value at runtime.
-
-#### Errors
-
-- `LogError` if the `Logger` provider fails. This function does not retry.
 
 <a id="Effect.impl.result"></a>
 
@@ -978,8 +970,8 @@ Use [`provideMut`](#Effect.impl.provideMut) in ordinary code. It has the same be
 #### Details
 
 An exclusive provider can satisfy a shared or an exclusive requirement. The output does not
-need the exact requirement that was selected. For example, `&mut P` for a shared `&Logger`
-removes `&Logger`. The caller gets exclusive access back when the effect completes.
+need the exact requirement that was selected. For example, `&mut P` for a shared `&Random`
+removes `&Random`. The caller gets exclusive access back when the effect completes.
 
 <a id="Effect.impl.bindRequirementOwned"></a>
 
@@ -1052,7 +1044,7 @@ Satisfies one requirement of `self` with an exclusive borrow of `provider`.
 
 #### When to use
 
-Use `provideMut` for a service that changes state, such as an allocator, a logger, or a
+Use `provideMut` for a service that changes state, such as an allocator or a
 counter. Use [`provide`](#Effect.impl.provide) for a read-only service.
 
 #### Details

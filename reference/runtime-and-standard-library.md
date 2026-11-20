@@ -650,22 +650,22 @@ canonical provider modules,
 **Status:** Confirmed
 
 Source composition supplies an application's requirements. The installed hosted startup explicitly
-provides mutable HostInput from an owned process snapshot. It supplies no logger, filesystem, clock,
+provides mutable HostInput from an owned process snapshot. The ambient Logger has its declared default. Startup supplies no filesystem, clock,
 standard stream, or other application service. The standalone WebAssembly startup requires a closed
 application Effect. A custom source runtime may provide services under its own visible contract.
 
 ```silk,ignore
 import silk.core.effect { Effect }
-import silk.io.logger { LogError, LogLevel, Logger }
-import silk.io.logger_native { StdoutLogger }
+import silk.io.writer { Writer, WriterError }
+import silk.io.writer_native { StdoutWriter }
 
-effect fn program() -> () ! LogError ? &mut Logger {
-  return run Logger.log(LogLevel.Info, "ready", &())
+effect fn program() -> () ! WriterError ? &mut Writer {
+  return run Writer.writeString("ready")
 }
 
-pub effect fn main() ! LogError {
-  let mut logger = StdoutLogger.make()
-  return run Effect.provideMut<Logger>(program(), &mut logger)
+pub effect fn main() -> () ! WriterError {
+  let mut stdout = StdoutWriter.make()
+  return run program() |> Effect.provideMut<Writer>(&mut stdout)
 }
 ```
 

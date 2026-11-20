@@ -8,17 +8,18 @@ import { initPackage, join, read, sharedHome, show, silk, write } from './lib.mj
 const h = sharedHome()
 
 const logging = `import silk.core.effect { Effect }
-import silk.io.logger { LogError }
-import silk.io.logger_native { StdoutLogger }
+import silk.io.writer { Writer, WriterError }
+import silk.text.format { Format }
+import silk.io.writer_native { StdoutWriter }
 
-pub effect fn main() -> () ! LogError {
-  let mut logger = StdoutLogger.make()
+pub effect fn main() -> () ! WriterError {
+  let mut stdout = StdoutWriter.make()
 `
 
 // Runs a main body that computes `v` and logs it, returning the command result.
 function runValue(body) {
   const dir = initPackage(h, `value${Math.random().toString(36).slice(2, 8)}`)
-  write(join(dir, 'src/main.silk'), `${logging}${body}\n  run Effect.log("{v}\\n", &.{ v: v }) |> Effect.provideMut(&mut logger)\n}\n`)
+  write(join(dir, 'src/main.silk'), `${logging}${body}\n  run Format.format("{v}\\n", &.{ v: v }) |> Effect.provideMut<Writer>(&mut stdout)\n}\n`)
   return silk(h, ['run', '--quiet'], { cwd: dir })
 }
 
@@ -130,7 +131,7 @@ import geometry { Point, area }
 ${logging}  let a = area(Point { x: 3, y: 4 })
   let s = scale(a)
   let l = LIMIT
-  run Effect.log("{a} {s} {l}\\n", &.{ a: a, s: s, l: l }) |> Effect.provideMut(&mut logger)
+  run Format.format("{a} {s} {l}\\n", &.{ a: a, s: s, l: l }) |> Effect.provideMut<Writer>(&mut stdout)
 }
 `)
   write(file('util.silk'), 'pub const LIMIT: i32 = 10\n\npub fn scale(v: i32) -> i32 {\n  return v * 2\n}\n')

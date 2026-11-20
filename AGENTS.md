@@ -57,6 +57,8 @@ behavior, data format, build artifact, or internal representation is a compatibi
 - Use `service` for runtime-provided Effect contracts and lexical provider replacement. Use
   `interface` for compile-time conformance and specialization only. Explicit `&any I` references
   keep interfaces compile-time by dispatching among the concrete witnesses selected by the build.
+  Only std may declare an `ambient service`. An ambient observation such as logging runs from
+  a plain function and adds no service to its caller's requirement row.
 
 ## Text and bytes
 
