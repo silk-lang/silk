@@ -316,7 +316,7 @@ What a trace holds, from the outside in:
 | `check` | `check.runtime`, one `check.module` per module (`check.sweep` when its declarations are swept rather than verified), `check.escapes` |
 | `codegen` | `codegen.erasures`, `codegen.walk` (a build may walk more than once: `discovering`, `observing`), `codegen.replay` and `codegen.rewalk` of a build record, `codegen.assemble` |
 | `check.imports`, `check.syntax` | What the build checks after the walk |
-| `cache.packs`, `cache.save`, `cache.write` | Keeping the build for the next one; `cache.write` runs in a copy of the process while the link goes on |
+| `cache.packs`, `cache.save`, `cache.write` | Keeping the build for the next one; a build writes in `cache.save`; after `silk check`, `cache.write` runs in a copy of the process |
 | `link` | `link.prepare`, `objects` (`units` in the program, `compiled` of them now), `optimize` |
 | `object` | One codegen unit on a compiling thread, with its `package`: `bitcode.encode` and the Clang `process` |
 | `process` | One program the compiler ran, with its `program` |

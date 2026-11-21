@@ -138,7 +138,10 @@ pub effect fn package(self: Self, alias: string, settings: Package) -> Self
     ? &mut Allocator
 ```
 
-Configures one declared dependency alias, or `self` for this package.
+Configures `self` for this package, a dependency alias declared in its manifest, or the
+package name of any package this compilation reaches, such as a dependency's dependency.
+Every version of a named package in the graph takes the settings. Parameter bindings need a
+declared alias.
 
 <a id="Compilation.impl.without"></a>
 
