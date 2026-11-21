@@ -1,0 +1,329 @@
+import silk.machine.actor { Actors, Reply, Signal }
+import silk.machine.chart { Chart, Enqueue, Machine, Next }
+import silk.machine.snapshot { Status, Steps, TransitionLoopError }
+import silk.concurrency.channel { Channel, Sender }
+import silk.concurrency.fiber { Cancelled, Fiber }
+import silk.concurrency.local_scheduler { LocalScheduler, StalledError }
+import silk.concurrency.scheduler { Scheduler, TaskIdExhaustedError }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+import silk.system.system_clock { SystemClock }
+import silk.system.system_clock_native { OsSystemClock }
+
+// A loader: entering Loading queues a request, and the performer answers with an event.
+
+union Loader {
+  Idle,
+  Loading,
+  Ready,
+  Missing
+}
+
+union LoaderEvent {
+  Load { pub id: u32 },
+  Loaded { pub size: u32 },
+  NotFound,
+}
+
+struct LoaderContext {
+  pub id: u32,
+  pub size: u32,
+}
+
+union LoaderEffect {
+  Fetch { pub id: u32 },
+  Announce { pub size: u32 },
+}
+
+impl Machine<LoaderEvent, LoaderContext, LoaderEffect> for Loader {
+  static fn chart() -> Chart<Loader, LoaderEvent, LoaderContext, LoaderEffect> {
+    return Chart<Loader, LoaderEvent, LoaderContext, LoaderEffect>.of()
+      |> Chart.initial(Loader.Idle)
+      |> Chart.on("Idle", "Load", Loader.Loading)
+      |> Chart.on("Loading", "Loaded", Loader.Ready)
+      |> Chart.on("Loading", "NotFound", Loader.Missing)
+      |> Chart.on("Missing", "Load", Loader.Loading)
+      |> Chart.final("Ready")
+  }
+
+  effect fn handle(
+    state: &Loader,
+    context: &mut LoaderContext,
+    event: &LoaderEvent,
+    enq: &mut Enqueue<LoaderEvent, LoaderEffect>,
+  ) -> Next<Loader>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match &event.* {
+      LoaderEvent.Load { id } => {
+        context.id = id
+      }
+      LoaderEvent.Loaded { size } => {
+        context.size = size
+      }
+      _ => {}
+    }
+    return Next<Loader>.Pass
+  }
+
+  effect fn enter(
+    state: &Loader,
+    context: &mut LoaderContext,
+    enq: &mut Enqueue<LoaderEvent, LoaderEffect>,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match &state.* {
+      Loader.Loading => {
+        run enq.perform(LoaderEffect.Fetch { id: context.id })
+      }
+      Loader.Ready => {
+        run enq.perform(LoaderEffect.Announce { size: context.size })
+      }
+      _ => {}
+    }
+    return ()
+  }
+}
+
+// The service the loader's effects use. The performer's requirement row names it.
+service Files {
+  effect fn size(id: u32) -> Option<u32> ? &mut Files
+
+  effect fn announce(size: u32) -> () ? &mut Files
+}
+
+struct TestFiles {
+  pub fetched: u32,
+  pub announced: u32,
+}
+
+impl Files for TestFiles {
+  effect fn size(self: &mut Self, id: u32) -> Option<u32> {
+    self.fetched = self.fetched + 1
+    if id == 7 {
+      return Option<u32>.Some { value: 42 }
+    }
+    return Option<u32>.None
+  }
+
+  effect fn announce(self: &mut Self, size: u32) -> () {
+    self.announced = size
+    return ()
+  }
+}
+
+effect fn perform(queued: LoaderEffect, reply: &mut Reply<LoaderEvent>) -> ()
+  ! OutOfMemoryError
+  ? &mut Files | &mut Allocator {
+  match move queued {
+    LoaderEffect.Fetch { id } => {
+      match run Files.size(id) {
+        Option<u32>.Some { value } => {
+          run reply.send(LoaderEvent.Loaded { size: value })
+        }
+        Option<u32>.None => {
+          run reply.send(LoaderEvent.NotFound)
+        }
+      }
+    }
+    LoaderEffect.Announce { size } => {
+      run Files.announce(size)
+    }
+  }
+  return ()
+}
+
+effect fn loadScenario() -> ()
+  ! OutOfMemoryError | TransitionLoopError
+  ? &mut Files | &mut Allocator {
+  let mut loader = run Steps.begin<Loader, LoaderEvent, LoaderContext, LoaderEffect>(
+    LoaderContext { id: 0, size: 0 },
+    0,
+  )
+
+  // The request, its answer and the transition the answer causes all happen inside one send.
+  run Actors.send(&mut loader, LoaderEvent.Load { id: 3 }, perform)
+  match &loader.value {
+    Loader.Missing => {}
+    _ => Intrinsic.trap("expected Missing")
+  }
+  run Actors.send(&mut loader, LoaderEvent.Load { id: 7 }, perform)
+  match &loader.status {
+    Status.Done => {}
+    _ => Intrinsic.trap("expected Done")
+  }
+  if loader.pending.length() != 0 || loader.mailbox.length() != 0 {
+    Intrinsic.trap("expected a settled actor")
+  }
+  return ()
+}
+
+test effect fn effectsAnswerWithEvents()
+  ! OutOfMemoryError | TransitionLoopError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut files = TestFiles { fetched: 0, announced: 0 }
+  run loadScenario()
+    |> Effect.provideMut<Files>(&mut files)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  if files.fetched != 2 || files.announced != 42 {
+    Intrinsic.trap("expected two requests and one announcement")
+  }
+  return ()
+}
+
+// The same actor served from a channel, with the events sent by another fiber.
+
+effect fn produce(sender: Sender<LoaderEvent>) -> () {
+  drop run sender.send(LoaderEvent.Load { id: 3 })
+  drop run sender.send(LoaderEvent.Load { id: 7 })
+  drop sender
+  return ()
+}
+
+effect fn served() -> u32
+  ! OutOfMemoryError | TransitionLoopError | TaskIdExhaustedError | Cancelled
+  ? &mut Scheduler | &mut MonotonicClock {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut files = TestFiles { fetched: 0, announced: 0 }
+  let channel = run Channel<LoaderEvent>.make(4) |> Effect.provideMut<Allocator>(&mut allocator)
+  let Channel<LoaderEvent> { sender, receiver } = move channel
+  let producer = run Fiber<(), never>.forkChild(produce(move sender))
+  let mut loader = run Steps.begin<Loader, LoaderEvent, LoaderContext, LoaderEffect>(
+    LoaderContext { id: 0, size: 0 },
+    0,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Actors.serve(&mut loader, &receiver, perform)
+    |> Effect.provideMut<Files>(&mut files)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run producer.join()
+  return files.announced
+}
+
+test effect fn actorServesAChannel()
+  ! OutOfMemoryError | TransitionLoopError | TaskIdExhaustedError | Cancelled | StalledError {
+  let mut clock = OsMonotonicClock.make()
+  let mut scheduler = LocalScheduler.make()
+  let announced = run scheduler.execute<
+    u32,
+    OutOfMemoryError | TransitionLoopError | TaskIdExhaustedError | Cancelled
+  >(served())
+    |> Effect.provideMut<MonotonicClock>(&mut clock)
+  if announced != 42 {
+    Intrinsic.trap("expected the served actor to announce 42")
+  }
+  return ()
+}
+
+// A kettle: the delayed transition is taken while the actor waits, with no second event.
+
+union Kettle {
+  Cold,
+  Heating,
+  Hot
+}
+
+union KettleEvent {
+  Heat,
+}
+
+struct KettleContext {}
+
+union KettleEffect {
+  Whistle,
+}
+
+impl Machine<KettleEvent, KettleContext, KettleEffect> for Kettle {
+  static fn chart() -> Chart<Kettle, KettleEvent, KettleContext, KettleEffect> {
+    return Chart<Kettle, KettleEvent, KettleContext, KettleEffect>.of()
+      |> Chart.initial(Kettle.Cold)
+      |> Chart.on("Cold", "Heat", Kettle.Heating)
+      |> Chart.after("Heating", 30ms, Kettle.Hot)
+      |> Chart.final("Hot")
+  }
+
+  effect fn enter(
+    state: &Kettle,
+    context: &mut KettleContext,
+    enq: &mut Enqueue<KettleEvent, KettleEffect>,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match &state.* {
+      Kettle.Hot => {
+        run enq.perform(KettleEffect.Whistle)
+      }
+      _ => {}
+    }
+    return ()
+  }
+}
+
+effect fn whistle(queued: KettleEffect, reply: &mut Reply<KettleEvent>) -> ()
+  ? &mut Files {
+  drop queued
+  run Files.announce(1)
+  return ()
+}
+
+effect fn switchOn(sender: Sender<Signal<KettleEvent>>) -> () {
+  drop run sender.send(Signal<KettleEvent>.Event { event: KettleEvent.Heat })
+  drop sender
+  return ()
+}
+
+effect fn boiled() -> u32
+  ! OutOfMemoryError | TransitionLoopError | TaskIdExhaustedError | Cancelled
+  ? &mut Scheduler | &mut MonotonicClock {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut clock = OsSystemClock.make()
+  let mut files = TestFiles { fetched: 0, announced: 0 }
+  let channel = run Channel<Signal<KettleEvent>>.make(4)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let Channel<Signal<KettleEvent>> { sender, receiver } = move channel
+  let switch = run Fiber<(), never>.forkChild(
+    switchOn(run sender.clone() |> Effect.provideMut<Allocator>(&mut allocator)),
+  )
+  let started = run SystemClock.now() |> Effect.provideMut<SystemClock>(&mut clock)
+  let mut kettle = run Steps.begin<Kettle, KettleEvent, KettleContext, KettleEffect>(
+    KettleContext {},
+    0,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Actors.drive(&mut kettle, &sender, &receiver, whistle)
+    |> Effect.provideMut<Files>(&mut files)
+    |> Effect.provideMut<SystemClock>(&mut clock)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run switch.join()
+  let finished = run SystemClock.now() |> Effect.provideMut<SystemClock>(&mut clock)
+  match &kettle.status {
+    Status.Done => {}
+    _ => Intrinsic.trap("expected the kettle to finish")
+  }
+
+  // The transition waited for its delay: at least 30 ms of wall clock time passed.
+  let waited = finished.unixMilliseconds() - started.unixMilliseconds()
+  if waited < 29 {
+    Intrinsic.trap("the delayed transition was taken too early")
+  }
+  return files.announced
+}
+
+test effect fn timersFireWhileTheActorWaits()
+  ! OutOfMemoryError | TransitionLoopError | TaskIdExhaustedError | Cancelled | StalledError {
+  let mut clock = OsMonotonicClock.make()
+  let mut scheduler = LocalScheduler.make()
+  let whistled = run scheduler.execute<
+    u32,
+    OutOfMemoryError | TransitionLoopError | TaskIdExhaustedError | Cancelled
+  >(boiled())
+    |> Effect.provideMut<MonotonicClock>(&mut clock)
+  if whistled != 1 {
+    Intrinsic.trap("expected the kettle to whistle")
+  }
+  return ()
+}

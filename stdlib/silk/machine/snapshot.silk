@@ -1,0 +1,399 @@
+//! The whole state of a running machine as one value, and the steps that advance it:
+//! [`Snapshot`] and [`Steps`].
+//!
+//! # When to use
+//! Use [`Steps.begin`] to start a machine and [`Steps.send`] to give it an event without
+//! performing any effect, for example in a test. Use the `silk.machine.actor` module when the
+//! effects must also be performed.
+//!
+//! # Details
+//! A [`Snapshot`] holds the state value, the context, the queued events and effects, the clock and
+//! the running timers. When the four types of the machine implement `Schema`, the snapshot does
+//! too, so a program can write it as JSON, read it back and continue. Every time is `u64`
+//! nanoseconds. [`Steps.advance`] moves the clock and takes the delayed transitions that are due.
+//!
+//! # Gotchas
+//! A step that never settles, or that runs out of memory, leaves the machine with
+//! [`Status.Failed`]. It takes no more events after that.
+//!
+//! @category State machines
+
+import silk.machine.chart { Enqueue, Machine, Machines, TimerChange }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.schema.schema { Schema }
+import silk.io.writer { Writer, WriterError }
+import silk.text.format { Debug, Format, Formatter }
+import silk.text.string { String }
+
+/// Whether a machine can still take events.
+pub union Status {
+  /// It takes events.
+  Active,
+  /// It reached a final state of its root chart.
+  Done,
+  /// It was stopped before it finished.
+  Stopped,
+  /// A step failed: its eventless transitions never settled, or memory ran out. The value is
+  /// where the step stopped, its timers are cancelled and it takes no more events.
+  Failed,
+}
+
+impl Schema for Status {}
+
+/// A running timer of a delayed transition.
+pub struct Timer {
+  /// The place of the chart that declares the delayed transition: the machine's type name,
+  /// then the variant and field of each region down to it, as in `Editor.Open.bold`.
+  pub path: String,
+  /// The position of the delayed transition in that chart.
+  pub index: u32,
+  /// When the timer fires, in nanoseconds of wall clock time.
+  pub deadline: u64,
+}
+
+impl Schema for Timer {}
+
+/// Everything needed to continue a machine.
+pub struct Snapshot<S, E, C, X> {
+  pub version: u32,
+  pub status: Status,
+  /// The state, regions included.
+  pub value: S,
+  pub context: C,
+  /// Events received but not yet processed.
+  pub mailbox: List<E>,
+  /// Effects queued by transitions and not yet performed.
+  pub pending: List<X>,
+  /// The wall clock time of the last step, in nanoseconds. New timers count from it.
+  pub clock: u64,
+  /// Timers of the delayed transitions of the active states.
+  pub timers: List<Timer>,
+}
+
+impl<S: Schema, E: Schema, C: Schema, X: Schema> Schema for Snapshot<S, E, C, X> {}
+
+/// A machine stuck in eventless transitions.
+pub struct TransitionLoopError {}
+
+impl Debug for TransitionLoopError {
+  /// Writes `TransitionLoopError`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return run Format.debugFields(self, "TransitionLoopError", &mut formatter)
+  }
+}
+
+const MAX_ROUNDS: u32 = 1000
+
+pub struct Steps {}
+
+impl Steps {
+  /// Returns the first snapshot of a machine: its initial state entered with `context` at the
+  /// wall clock time `now`, in nanoseconds. A machine without delayed transitions can pass 0.
+  pub effect fn begin<S: Machine<E, C, X>, E, C, X>(context: C, now: u64) -> Snapshot<S, E, C, X>
+    ! OutOfMemoryError | TransitionLoopError
+    ? &mut Allocator {
+    let mut snapshot = Snapshot<S, E, C, X> {
+      version: 2,
+      status: Status.Active,
+      value: Machines.start<S, E, C, X>(),
+      context: move context,
+      mailbox: List<E>.make(),
+      pending: List<X>.make(),
+      clock: now,
+      timers: List<Timer>.make(),
+    }
+    let mut enq = Enqueue<E, X>.at(snapshot.clock)
+    run Machines.enterAll<S, E, C, X>(&snapshot.value, &mut snapshot.context, &mut enq)
+    run Steps.finish<S, E, C, X>(&mut snapshot, move enq)
+    return move snapshot
+  }
+
+  /// Processes `event` and everything it raises, and returns whether a state handled `event`.
+  ///
+  /// # Errors
+  /// `TransitionLoopError` when eventless transitions or raised events never settle, and
+  /// `OutOfMemoryError`. Either one leaves the machine `Status.Failed`, with its timers cancelled,
+  /// so it takes no more events. [`Steps.advance`] fails the same way.
+  pub effect fn send<S: Machine<E, C, X>, E, C, X>(
+    snapshot: &mut Snapshot<S, E, C, X>,
+    event: E,
+  ) -> bool
+    ! OutOfMemoryError | TransitionLoopError
+    ? &mut Allocator {
+    match &snapshot.status {
+      Status.Active => {}
+      _ => {
+        return false
+      }
+    }
+    let outcome = run Effect.result(Steps.process<S, E, C, X>(&mut snapshot.*, move event))
+    match move outcome {
+      Result<bool, OutOfMemoryError | TransitionLoopError>.Success { value } => {
+        return value
+      }
+      Result<bool, OutOfMemoryError | TransitionLoopError>.Failure { error } => {
+        Steps.stopFailed(&mut snapshot.*)
+        match move error {
+          OutOfMemoryError { .. } => {
+            fail OutOfMemoryError {}
+          }
+          TransitionLoopError { .. } => {
+            fail TransitionLoopError {}
+          }
+        }
+      }
+    }
+  }
+
+  effect fn process<S: Machine<E, C, X>, E, C, X>(
+    snapshot: &mut Snapshot<S, E, C, X>,
+    event: E,
+  ) -> bool
+    ! OutOfMemoryError | TransitionLoopError
+    ? &mut Allocator {
+    let mut enq = Enqueue<E, X>.at(snapshot.clock)
+    let handled = run Machines.dispatch<S, E, C, X>(
+      &mut snapshot.value,
+      &mut snapshot.context,
+      &event,
+      &mut enq,
+    )
+    run Steps.finish<S, E, C, X>(&mut snapshot.*, move enq)
+    return handled
+  }
+
+  // A step failed part way: the machine takes no more events and no timer of it fires.
+  fn stopFailed<S, E, C, X>(snapshot: &mut Snapshot<S, E, C, X>) -> () {
+    snapshot.status = Status.Failed
+    snapshot.timers.clear()
+    return ()
+  }
+
+  // Takes eventless transitions and raised events until the machine is stable, then commits.
+  effect fn finish<S: Machine<E, C, X>, E, C, X>(
+    snapshot: &mut Snapshot<S, E, C, X>,
+    queued: Enqueue<E, X>,
+  ) -> ()
+    ! OutOfMemoryError | TransitionLoopError
+    ? &mut Allocator {
+    let mut enq = move queued
+    let mut rounds: u32 = 0
+    while true {
+      rounds = rounds + 1
+      if rounds > MAX_ROUNDS {
+        fail TransitionLoopError {}
+      }
+      if run Machines.settle<S, E, C, X>(&mut snapshot.value, &mut snapshot.context, &mut enq) {
+        continue
+      }
+      if enq.raised.length() == 0 {
+        break
+      }
+      let raised = List<E>.remove(&mut enq.raised, 0)
+      drop run Machines.dispatch<S, E, C, X>(
+        &mut snapshot.value,
+        &mut snapshot.context,
+        &raised,
+        &mut enq,
+      )
+    }
+    while enq.effects.length() != 0 {
+      run List<X>.append(&mut snapshot.pending, List<X>.remove(&mut enq.effects, 0))
+    }
+    while enq.timers.length() != 0 {
+      match List<TimerChange>.remove(&mut enq.timers, 0) {
+        TimerChange.Start { path, index, duration } => {
+          run List<Timer>.append(
+            &mut snapshot.timers,
+            Timer {
+              path: run String.copy(path),
+              index: index,
+              deadline: snapshot.clock + duration,
+            },
+          )
+        }
+        TimerChange.Cancel { path, index } => {
+          Steps.cancel(&mut snapshot.timers, path, index)
+        }
+      }
+    }
+    if Machines.isFinal<S, E, C, X>(&snapshot.value) {
+      snapshot.status = Status.Done
+      snapshot.timers.clear()
+    }
+    return ()
+  }
+
+  fn isTimer(timer: &Timer, path: string, index: u32) -> bool {
+    return timer.index == index && timer.path.view() == path
+  }
+
+  fn cancel(timers: &mut List<Timer>, path: string, index: u32) -> () {
+    let mut position: usize = 0
+    while position < timers.length() {
+      if Steps.isTimer(&timers.asSlice()[position], path, index) {
+        drop List<Timer>.remove(&mut timers.*, position)
+      } else {
+        position = position + 1
+      }
+    }
+    return ()
+  }
+
+  // The position of the timer that fires first among those due at `now`.
+  fn due(timers: &List<Timer>, now: u64) -> Option<usize> {
+    let mut found = Option<usize>.None
+    let mut earliest: u64 = 0
+    let mut position: usize = 0
+    while position < timers.length() {
+      let deadline = timers.asSlice()[position].deadline
+      if deadline <= now {
+        let better = match &found {
+          Option<usize>.None => true
+          Option<usize>.Some { .. } => deadline < earliest
+        }
+        if better {
+          found = Option<usize>.Some { value: position }
+          earliest = deadline
+        }
+      }
+      position = position + 1
+    }
+    return found
+  }
+
+  /// Returns whether an active state of the machine, at any depth, has the tag `tag`.
+  pub fn hasTag<S: Machine<E, C, X>, E, C, X>(
+    snapshot: &Snapshot<S, E, C, X>,
+    tag: string,
+  ) -> bool {
+    return Machines.hasTag<S, E, C, X>(&snapshot.value, tag)
+  }
+
+  /// Returns the meta data under `key` of the active state of the machine, or of the first of
+  /// its regions that has one.
+  pub fn meta<S: Machine<E, C, X>, E, C, X>(snapshot: &Snapshot<S, E, C, X>, key: string) -> Option<
+    string<'static>
+  > {
+    return Machines.meta<S, E, C, X>(&snapshot.value, key)
+  }
+
+  /// Returns the deadline of the timer that fires first, in nanoseconds of wall clock time.
+  ///
+  /// # Details
+  /// It is the earliest of the machine's own timers and of [`Machine.deadline`], which is how
+  /// the timers of a child machine are counted.
+  pub fn nextDeadline<S: Machine<E, C, X>, E, C, X>(snapshot: &Snapshot<S, E, C, X>) -> Option<
+    u64
+  > {
+    let mut found: Option<u64> = Machine.deadline(&snapshot.value, &snapshot.context)
+    let mut position: usize = 0
+    while position < snapshot.timers.length() {
+      let deadline = snapshot.timers.asSlice()[position].deadline
+      let better = match &found {
+        Option<u64>.None => true
+        Option<u64>.Some { value } => deadline < value
+      }
+      if better {
+        found = Option<u64>.Some { value: deadline }
+      }
+      position = position + 1
+    }
+    return found
+  }
+
+  /// Moves the machine's clock to `now` and takes the delayed transitions that are due, earliest
+  /// first. Returns whether one was taken.
+  ///
+  /// # Details
+  /// `now` is wall clock time in nanoseconds. A deadline is kept as it was set, so a timer whose
+  /// deadline passed while the program was not running fires on the first call after a restore.
+  /// When [`Machine.deadline`] is due, [`Machine.tick`] runs one time after the machine's own
+  /// timers.
+  pub effect fn advance<S: Machine<E, C, X>, E, C, X>(
+    snapshot: &mut Snapshot<S, E, C, X>,
+    now: u64,
+  ) -> bool
+    ! OutOfMemoryError | TransitionLoopError
+    ? &mut Allocator {
+    let outcome = run Effect.result(Steps.elapse<S, E, C, X>(&mut snapshot.*, now))
+    match move outcome {
+      Result<bool, OutOfMemoryError | TransitionLoopError>.Success { value } => {
+        return value
+      }
+      Result<bool, OutOfMemoryError | TransitionLoopError>.Failure { error } => {
+        Steps.stopFailed(&mut snapshot.*)
+        match move error {
+          OutOfMemoryError { .. } => {
+            fail OutOfMemoryError {}
+          }
+          TransitionLoopError { .. } => {
+            fail TransitionLoopError {}
+          }
+        }
+      }
+    }
+  }
+
+  effect fn elapse<S: Machine<E, C, X>, E, C, X>(
+    snapshot: &mut Snapshot<S, E, C, X>,
+    now: u64,
+  ) -> bool
+    ! OutOfMemoryError | TransitionLoopError
+    ? &mut Allocator {
+    if now > snapshot.clock {
+      snapshot.clock = now
+    }
+    let mut taken = false
+    while true {
+      match &snapshot.status {
+        Status.Active => {}
+        _ => {
+          break
+        }
+      }
+      match Steps.due(&snapshot.timers, now) {
+        Option<usize>.None => {
+          break
+        }
+        Option<usize>.Some { value: position } => {
+          let timer = List<Timer>.remove(&mut snapshot.timers, position)
+          let mut enq = Enqueue<E, X>.at(snapshot.clock)
+          if run Machines.elapse<S, E, C, X>(
+            &mut snapshot.value,
+            &mut snapshot.context,
+            timer.path.view(),
+            timer.index,
+            &mut enq,
+          ) {
+            taken = true
+          }
+          run Steps.finish<S, E, C, X>(&mut snapshot.*, move enq)
+        }
+      }
+    }
+    let wake: Option<u64> = Machine.deadline(&snapshot.value, &snapshot.context)
+    match move wake {
+      Option.Some { value: deadline } => {
+        let active = match &snapshot.status {
+          Status.Active => true
+          _ => false
+        }
+        if active && deadline <= now {
+          let mut enq = Enqueue<E, X>.at(snapshot.clock)
+          run Machine.tick(&snapshot.value, &mut snapshot.context, now, &mut enq)
+          run Steps.finish<S, E, C, X>(&mut snapshot.*, move enq)
+          taken = true
+        }
+      }
+      Option.None => {}
+    }
+    return taken
+  }
+}

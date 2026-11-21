@@ -1,0 +1,244 @@
+//! A download that retries: a machine with context, guards, effects and a JSON snapshot.
+import silk.machine.actor { Actors, Reply }
+import silk.machine.chart { Chart, Enqueue, Machine, Next }
+import silk.machine.snapshot { Snapshot, Status, Steps, TransitionLoopError }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.io.writer { Writer, WriterError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.schema.issue { SchemaError }
+import silk.schema.json { SchemaJson }
+import silk.schema.schema { Schema }
+
+union Download {
+  Idle,
+  Fetching,
+  Retrying,
+  Complete,
+  Failed
+}
+
+union DownloadEvent {
+  Start,
+  Received { pub bytes: u64 },
+  Lost,
+}
+
+struct DownloadContext {
+  pub attempts: u32,
+  pub bytes: u64,
+}
+
+union DownloadEffect {
+  Fetch { pub attempt: u32 },
+}
+
+impl Schema for Download {}
+
+impl Schema for DownloadEvent {}
+
+impl Schema for DownloadContext {}
+
+impl Schema for DownloadEffect {}
+
+fn canRetry(context: &DownloadContext, event: &DownloadEvent) -> bool {
+  return context.attempts < 3
+}
+
+impl Machine<DownloadEvent, DownloadContext, DownloadEffect> for Download {
+  static fn chart() -> Chart<Download, DownloadEvent, DownloadContext, DownloadEffect> {
+    return Chart<Download, DownloadEvent, DownloadContext, DownloadEffect>.of()
+      |> Chart.initial(Download.Idle)
+      |> Chart.on("Idle", "Start", Download.Fetching)
+      |> Chart.onWhen("Fetching", "Lost", Download.Retrying, canRetry)
+      |> Chart.on("Fetching", "Lost", Download.Failed)
+      |> Chart.after("Retrying", 1s, Download.Fetching)
+      |> Chart.tag("Fetching", "busy")
+      |> Chart.tag("Retrying", "busy")
+      |> Chart.final("Complete")
+      |> Chart.final("Failed")
+  }
+
+  // Runs when a state is entered. Entering Fetching queues the request.
+  effect fn enter(
+    state: &Download,
+    context: &mut DownloadContext,
+    enq: &mut Enqueue<DownloadEvent, DownloadEffect>,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match &state.* {
+      Download.Fetching => {
+        context.attempts = context.attempts + 1
+        run enq.perform(DownloadEffect.Fetch { attempt: context.attempts })
+      }
+      _ => {}
+    }
+    return ()
+  }
+
+  // The transitions that need the data of the event. The chart takes the rest.
+  effect fn handle(
+    state: &Download,
+    context: &mut DownloadContext,
+    event: &DownloadEvent,
+    enq: &mut Enqueue<DownloadEvent, DownloadEffect>,
+  ) -> Next<Download>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match &state.* {
+      Download.Fetching => {
+        match &event.* {
+          DownloadEvent.Received { bytes } => {
+            context.bytes = bytes
+            return Next<Download>.To { state: Download.Complete }
+          }
+          _ => {}
+        }
+      }
+      _ => {}
+    }
+    return Next<Download>.Pass
+  }
+}
+
+type DownloadSnapshot = Snapshot<Download, DownloadEvent, DownloadContext, DownloadEffect>
+
+// The service the effects use.
+service Network {
+  effect fn fetch(attempt: u32) -> Option<u64> ? &mut Network
+}
+
+// Performs one effect and answers with events.
+effect fn perform(queued: DownloadEffect, reply: &mut Reply<DownloadEvent>) -> ()
+  ! OutOfMemoryError
+  ? &mut Network | &mut Allocator {
+  match move queued {
+    DownloadEffect.Fetch { attempt } => {
+      match run Network.fetch(attempt) {
+        Option<u64>.Some { value } => {
+          run reply.send(DownloadEvent.Received { bytes: value })
+        }
+        Option<u64>.None => {
+          run reply.send(DownloadEvent.Lost)
+        }
+      }
+    }
+  }
+  return ()
+}
+
+// A network that loses the first request.
+struct FlakyNetwork {
+  pub requests: u32,
+}
+
+impl Network for FlakyNetwork {
+  effect fn fetch(self: &mut Self, attempt: u32) -> Option<u64> {
+    self.requests = self.requests + 1
+    if attempt < 2 {
+      return Option<u64>.None
+    }
+    return Option<u64>.Some { value: 2048 }
+  }
+}
+
+struct Capture {
+  bytes: [u8; 1024],
+  length: usize,
+}
+
+impl Writer for Capture {
+  effect fn writeAll(self: &mut Self, value: &[u8]) -> ()
+    ! WriterError
+    ? &mut Writer {
+    let mut index: usize = 0
+    while index < value.length {
+      self.bytes[self.length] = value[index]
+      self.length = self.length + 1
+      index = index + 1
+    }
+    return ()
+  }
+
+  effect fn flush(self: &mut Self) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return ()
+  }
+}
+
+fn holds(capture: &Capture, expected: &[u8]) -> bool {
+  if capture.length != expected.length {
+    return false
+  }
+  let mut index: usize = 0
+  while index < expected.length {
+    if capture.bytes[index] != expected[index] {
+      return false
+    }
+    index = index + 1
+  }
+  return true
+}
+
+effect fn downloadScenario() -> ()
+  ! OutOfMemoryError | TransitionLoopError | SchemaError
+  ? &mut Network | &mut Allocator {
+  let mut download = run Steps.begin<Download, DownloadEvent, DownloadContext, DownloadEffect>(
+    DownloadContext { attempts: 0, bytes: 0 },
+    0,
+  )
+
+  // Start enters Fetching, the request is lost, and the machine waits to retry.
+  run Actors.send(&mut download, DownloadEvent.Start, perform)
+  match &download.value {
+    Download.Retrying => {}
+    _ => Intrinsic.trap("expected Retrying")
+  }
+  if !Steps.hasTag(&download, "busy") {
+    Intrinsic.trap("a retrying download is busy")
+  }
+
+  // The snapshot is plain data: it goes to JSON with its running timer.
+  let mut capture = Capture { bytes: [0; 1024], length: 0 }
+  let encoded = run Effect.result(SchemaJson.encode<DownloadSnapshot>(&download))
+    |> Effect.provideMut<Writer>(&mut capture)
+  match move encoded {
+    Result<(), SchemaError | WriterError | OutOfMemoryError>.Success { .. } => {}
+    Result<(), SchemaError | WriterError | OutOfMemoryError>.Failure { .. } => Intrinsic.trap(
+      "snapshot JSON",
+    )
+  }
+  if !holds(
+    &capture,
+    b"{\"version\":2,\"status\":\"Active\",\"value\":\"Retrying\",\"context\":{\"attempts\":1,\"bytes\":0},\"mailbox\":[],\"pending\":[],\"clock\":0,\"timers\":[{\"path\":\"Download\",\"index\":0,\"deadline\":1000000000}]}",
+  ) {
+    Intrinsic.trap("the JSON of the snapshot")
+  }
+
+  // Read back, it continues: one second later the retry succeeds.
+  let mut restored = run SchemaJson.decode<DownloadSnapshot>(
+    Slice.view(&capture.bytes, 0, capture.length),
+  )
+  run Actors.advance(&mut restored, 1s, perform)
+  match &restored.status {
+    Status.Done => {}
+    _ => Intrinsic.trap("expected the download done")
+  }
+  if restored.context.bytes != 2048 || restored.context.attempts != 2 {
+    Intrinsic.trap("two attempts and 2048 bytes")
+  }
+  return ()
+}
+
+test effect fn readmeExample()
+  ! OutOfMemoryError | TransitionLoopError | SchemaError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut network = FlakyNetwork { requests: 0 }
+  return run downloadScenario()
+    |> Effect.provideMut<Network>(&mut network)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}

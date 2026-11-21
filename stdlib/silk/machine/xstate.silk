@@ -1,0 +1,973 @@
+//! A `Definition` written as an xstate machine config, the JSON that Stately Studio and other
+//! xstate tools read.
+//!
+//! # Details
+//! Every `on`, `always` and `after` entry is written as an array of transitions, which xstate
+//! accepts for one transition too. Silk guards are functions without a name of their own, so a
+//! guarded transition gets the guard name `<state>.<event>`, `<state>.always` for an eventless
+//! one. A tool shows the name, and the function stays in the Silk source. A `Chart.onDone` row
+//! is the state's `onDone`, read back from a target or an array of targets.
+//!
+//! [`Xstate.read`] takes the same format back. It accepts a transition as a state name, as an
+//! object with `target` and an optional `guard`, or as an array of those, which are the forms
+//! xstate and Stately Studio write. A transition on an event without a target takes the event
+//! and changes no state, which `Chart.stay` does, and the event `*` is the transition that any
+//! event takes. Actions, context and other keys a `Definition` has no place for are left out.
+//!
+//! A state with a history and child states is written with one more child, the history state
+//! `hist`, and a transition to the history targets `<state>.hist`. Reading takes any history
+//! child state as the history of its parent, kept in the context field `last<State>`, and a
+//! target with a dot as a transition to the history of the state before the dot.
+//!
+//! # Errors
+//! `XstateError` from [`Xstate.read`] when the config has no `initial` state, has a part of the
+//! wrong JSON kind, or names a delay that is not a number of milliseconds.
+//!
+//! # Gotchas
+//! xstate names the child states of a compound state but not the region that holds them. A
+//! compound state `Red` is read as one region with the field `region` and the chart name
+//! `RedRegion`. Each child state of a parallel state is read as a region whose field and chart
+//! name are the child's key. Rename them in the definition before generating Silk source.
+//!
+//! @category State machines
+
+import silk.machine.definition {
+  AlwaysDefinition,
+  ChartDefinition,
+  Definition,
+  Definitions,
+  DelayDefinition,
+  MetaDefinition,
+  RegionDefinition,
+  RememberDefinition,
+  StateDefinition,
+  TransitionDefinition
+}
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.io.writer { Writer, WriterError }
+import silk.json.scanner { JsonError }
+import silk.json.value { JsonDocument, JsonKind, JsonNode }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u64
+import silk.num.u8
+import silk.text.format { Debug, Format, Formatter }
+import silk.text.string { String }
+
+/// Why an xstate config could not be read as a `Definition`.
+pub union XstateError {
+  /// The config or one of its states is not a JSON object.
+  NotAnObject,
+  /// The config or a compound state has no `initial` state name.
+  MissingInitial,
+  /// A transition is not a state name, an object or an array of those.
+  BadTransition,
+  /// A key of `after` is not a number of milliseconds.
+  BadDelay,
+}
+
+impl Debug for XstateError {
+  /// Writes the name of the variant.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return match &self.* {
+      XstateError.NotAnObject => run Format.write(&mut formatter, b"XstateError.NotAnObject")
+      XstateError.MissingInitial => run Format.write(&mut formatter, b"XstateError.MissingInitial")
+      XstateError.BadTransition => run Format.write(&mut formatter, b"XstateError.BadTransition")
+      XstateError.BadDelay => run Format.write(&mut formatter, b"XstateError.BadDelay")
+    }
+  }
+}
+
+pub struct Xstate {}
+
+impl Xstate {
+  /// Reads an xstate machine config in JSON as a `Definition`.
+  pub effect fn read(bytes: &[u8]) -> Definition
+    ! JsonError | OutOfMemoryError | XstateError
+    ? &mut Allocator {
+    let document = run JsonDocument.parse(bytes)
+    let root = document.root()
+    if !isKind(&document, root, JsonKind.Object) {
+      fail XstateError.NotAnObject
+    }
+    let name = match document.field(root, "id") {
+      Option<JsonNode>.Some { value } => stringOr(&document, value, "Machine")
+      Option<JsonNode>.None => "Machine"
+    }
+    let mut charts = List<ChartDefinition>.make()
+    run readChart(&document, root, name, &mut charts)
+    return Definition { name: run String.copy(name), charts: move charts }
+  }
+
+  /// Writes `definition` as an xstate machine config in JSON. A state with one region is
+  /// written as a compound state and a state with several as a parallel state.
+  pub effect fn write(definition: &Definition) -> ()
+    ! WriterError
+    ? &mut Writer {
+    run Writer.writeAll(b"{\"id\":")
+    run text(definition.name.view())
+    run Writer.writeAll(b",")
+    run chartBody(definition, definition.name.view(), "")
+    run Writer.writeAll(b"}")
+    return ()
+  }
+}
+
+// "initial":"State","states":{...}: the part a machine and a compound state have in common.
+// A chart the definition does not have is written with no states. `history` is "deep" or
+// "shallow" when the state that holds the chart has a history, which is written as one more
+// child state called `hist`.
+effect fn chartBody(definition: &Definition, name: string, history: string) -> ()
+  ! WriterError
+  ? &mut Writer {
+  let charts = definition.charts.asSlice()
+  let position = Definitions.find(definition, name)
+  if position == charts.length {
+    run Writer.writeAll(b"\"states\":{}")
+    return ()
+  }
+  run Writer.writeAll(b"\"initial\":")
+  run text(charts[position].initial.view())
+  run Writer.writeAll(b",\"states\":{")
+  let states = charts[position].states.asSlice()
+  let mut index: usize = 0
+  while index < states.length {
+    if index != 0 {
+      run Writer.writeAll(b",")
+    }
+    run state(definition, states, &states[index])
+    index = index + 1
+  }
+  if history != "" {
+    if states.length != 0 {
+      run Writer.writeAll(b",")
+    }
+    run historyState(history)
+  }
+  run Writer.writeAll(b"}")
+  return ()
+}
+
+effect fn historyState(history: string) -> ()
+  ! WriterError
+  ? &mut Writer {
+  run Writer.writeAll(b"\"hist\":{\"type\":\"history\",\"history\":")
+  run text(history)
+  run Writer.writeAll(b"}")
+  return ()
+}
+
+// "deep" or "shallow" when `state` has a history and child states to come back to, "" otherwise.
+fn historyOf(state: &StateDefinition) -> string<'static> {
+  if state.regions.length() == 0 {
+    return ""
+  }
+  return match &state.remember {
+    Option<RememberDefinition>.Some { value } => {
+      if value.deep {
+        "deep"
+      } else {
+        "shallow"
+      }
+    }
+    Option<RememberDefinition>.None => ""
+  }
+}
+
+// Whether the state called `name` is written with a history child state.
+fn hasHistory(states: &[StateDefinition], name: string) -> bool {
+  let mut index: usize = 0
+  while index < states.length {
+    if states[index].name.view() == name {
+      return historyOf(&states[index]) != ""
+    }
+    index = index + 1
+  }
+  return false
+}
+
+effect fn state(
+  definition: &Definition,
+  siblings: &[StateDefinition],
+  state: &StateDefinition,
+) -> ()
+  ! WriterError
+  ? &mut Writer {
+  run text(state.name.view())
+  run Writer.writeAll(b":{")
+  let mut written = false
+  if state.final {
+    run Writer.writeAll(b"\"type\":\"final\"")
+    written = true
+  }
+  let tags = state.tags.asSlice()
+  if tags.length != 0 {
+    if written {
+      run Writer.writeAll(b",")
+    }
+    run Writer.writeAll(b"\"tags\":[")
+    let mut index: usize = 0
+    while index < tags.length {
+      if index != 0 {
+        run Writer.writeAll(b",")
+      }
+      run text(tags[index].view())
+      index = index + 1
+    }
+    run Writer.writeAll(b"]")
+    written = true
+  }
+  if state.meta.length() != 0 {
+    if written {
+      run Writer.writeAll(b",")
+    }
+    run metaMember(state.meta.asSlice())
+    written = true
+  }
+  let regions = state.regions.asSlice()
+  if regions.length == 1 {
+    // A compound state: the states of its one region are its child states.
+    if written {
+      run Writer.writeAll(b",")
+    }
+    run chartBody(definition, regions[0].chart.view(), historyOf(state))
+    written = true
+  }
+  if regions.length > 1 {
+    // A parallel state: one child state per region, named after the region's field.
+    if written {
+      run Writer.writeAll(b",")
+    }
+    run Writer.writeAll(b"\"type\":\"parallel\",\"states\":{")
+    let mut index: usize = 0
+    while index < regions.length {
+      if index != 0 {
+        run Writer.writeAll(b",")
+      }
+      run text(regions[index].field.view())
+      run Writer.writeAll(b":{")
+      run chartBody(definition, regions[index].chart.view(), "")
+      run Writer.writeAll(b"}")
+      index = index + 1
+    }
+    if historyOf(state) != "" {
+      run Writer.writeAll(b",")
+      run historyState(historyOf(state))
+    }
+    run Writer.writeAll(b"}")
+    written = true
+  }
+  if state.on.length() != 0 {
+    if written {
+      run Writer.writeAll(b",")
+    }
+    run events(siblings, state)
+    written = true
+  }
+  if state.always.length() != 0 {
+    if written {
+      run Writer.writeAll(b",")
+    }
+    run eventless(state)
+    written = true
+  }
+  if state.after.length() != 0 {
+    if written {
+      run Writer.writeAll(b",")
+    }
+    run delays(state.after.asSlice())
+    written = true
+  }
+  if state.done.view() != "" {
+    if written {
+      run Writer.writeAll(b",")
+    }
+    run Writer.writeAll(b"\"onDone\":{\"target\":")
+    run text(state.done.view())
+    run Writer.writeAll(b"}")
+  }
+  run Writer.writeAll(b"}")
+  return ()
+}
+
+// "on":{"Event":[{"target":"State"},...],...}, one key per event, in the order of first use.
+effect fn events(siblings: &[StateDefinition], state: &StateDefinition) -> ()
+  ! WriterError
+  ? &mut Writer {
+  let all = state.on.asSlice()
+  run Writer.writeAll(b"\"on\":{")
+  let mut first = true
+  let mut index: usize = 0
+  while index < all.length {
+    if !eventSeen(all, index) {
+      if !first {
+        run Writer.writeAll(b",")
+      }
+      first = false
+      run text(all[index].event.view())
+      run Writer.writeAll(b":[")
+      let mut inner = index
+      let mut firstInner = true
+      while inner < all.length {
+        if all[inner].event.view() == all[index].event.view() {
+          if !firstInner {
+            run Writer.writeAll(b",")
+          }
+          firstInner = false
+          run transition(siblings, state, &all[inner])
+        }
+        inner = inner + 1
+      }
+      run Writer.writeAll(b"]")
+    }
+    index = index + 1
+  }
+  run Writer.writeAll(b"}")
+  return ()
+}
+
+fn eventSeen(all: &[TransitionDefinition], index: usize) -> bool {
+  let mut earlier: usize = 0
+  while earlier < index {
+    if all[earlier].event.view() == all[index].event.view() {
+      return true
+    }
+    earlier = earlier + 1
+  }
+  return false
+}
+
+effect fn transition(
+  siblings: &[StateDefinition],
+  state: &StateDefinition,
+  transition: &TransitionDefinition,
+) -> ()
+  ! WriterError
+  ? &mut Writer {
+  run Writer.writeAll(b"{")
+  let mut written = false
+
+  // A transition that stays has no target: xstate then takes the event and changes nothing.
+  if transition.target.view() != "" {
+    run Writer.writeAll(b"\"target\":")
+    if transition.history && hasHistory(siblings, transition.target.view()) {
+      run Writer.writeAll(b"\"")
+      run escaped(transition.target.view())
+      run Writer.writeAll(b".hist\"")
+    } else {
+      run text(transition.target.view())
+    }
+    written = true
+  }
+  if transition.guarded {
+    if written {
+      run Writer.writeAll(b",")
+    }
+    run Writer.writeAll(b"\"guard\":\"")
+    run escaped(state.name.view())
+    run Writer.writeAll(b".")
+    run escaped(transition.event.view())
+    run Writer.writeAll(b"\"")
+    written = true
+  }
+  if transition.meta.length() != 0 {
+    if written {
+      run Writer.writeAll(b",")
+    }
+    run metaMember(transition.meta.asSlice())
+  }
+  run Writer.writeAll(b"}")
+  return ()
+}
+
+// The member "meta": an object with one text member per entry.
+effect fn metaMember(meta: &[MetaDefinition]) -> ()
+  ! WriterError
+  ? &mut Writer {
+  run Writer.writeAll(b"\"meta\":{")
+  let mut index: usize = 0
+  while index < meta.length {
+    if index != 0 {
+      run Writer.writeAll(b",")
+    }
+    run text(meta[index].key.view())
+    run Writer.writeAll(b":")
+    run text(meta[index].value.view())
+    index = index + 1
+  }
+  run Writer.writeAll(b"}")
+  return ()
+}
+
+effect fn eventless(state: &StateDefinition) -> ()
+  ! WriterError
+  ? &mut Writer {
+  let all = state.always.asSlice()
+  run Writer.writeAll(b"\"always\":[")
+  let mut index: usize = 0
+  while index < all.length {
+    if index != 0 {
+      run Writer.writeAll(b",")
+    }
+    run always(state, &all[index])
+    index = index + 1
+  }
+  run Writer.writeAll(b"]")
+  return ()
+}
+
+effect fn always(state: &StateDefinition, always: &AlwaysDefinition) -> ()
+  ! WriterError
+  ? &mut Writer {
+  run Writer.writeAll(b"{\"target\":")
+  run text(always.target.view())
+  if always.guarded {
+    run Writer.writeAll(b",\"guard\":\"")
+    run escaped(state.name.view())
+    run Writer.writeAll(b".always\"")
+  }
+  run Writer.writeAll(b"}")
+  return ()
+}
+
+// "after":{"3000":[{"target":"State"}],...}, one key per delay, in the order of first use.
+effect fn delays(all: &[DelayDefinition]) -> ()
+  ! WriterError
+  ? &mut Writer {
+  run Writer.writeAll(b"\"after\":{")
+  let mut first = true
+  let mut index: usize = 0
+  while index < all.length {
+    if !delaySeen(all, index) {
+      if !first {
+        run Writer.writeAll(b",")
+      }
+      first = false
+      run Writer.writeAll(b"\"")
+      run number(all[index].duration / 1ms)
+      run Writer.writeAll(b"\":[")
+      let mut inner = index
+      let mut firstInner = true
+      while inner < all.length {
+        if all[inner].duration / 1ms == all[index].duration / 1ms {
+          if !firstInner {
+            run Writer.writeAll(b",")
+          }
+          firstInner = false
+          run Writer.writeAll(b"{\"target\":")
+          run text(all[inner].target.view())
+          run Writer.writeAll(b"}")
+        }
+        inner = inner + 1
+      }
+      run Writer.writeAll(b"]")
+    }
+    index = index + 1
+  }
+  run Writer.writeAll(b"}")
+  return ()
+}
+
+fn delaySeen(all: &[DelayDefinition], index: usize) -> bool {
+  let mut earlier: usize = 0
+  while earlier < index {
+    if all[earlier].duration / 1ms == all[index].duration / 1ms {
+      return true
+    }
+    earlier = earlier + 1
+  }
+  return false
+}
+
+effect fn number(value: u64) -> ()
+  ! WriterError
+  ? &mut Writer {
+  let mut digits: [u8; 20] = [0; 20]
+  let mut start: usize = 20
+  let mut rest = value
+  while true {
+    start = start - 1
+    digits[start] = u64.toU8(rest % 10) + 48
+    rest = rest / 10
+    if rest == 0 {
+      break
+    }
+  }
+  run Writer.writeAll(Slice.view(&digits, start, 20 - start))
+  return ()
+}
+
+effect fn text(value: string) -> ()
+  ! WriterError
+  ? &mut Writer {
+  run Writer.writeAll(b"\"")
+  run escaped(value)
+  run Writer.writeAll(b"\"")
+  return ()
+}
+
+// Writes `value` with the JSON escapes for quotes, backslashes and control bytes.
+effect fn escaped(value: string) -> ()
+  ! WriterError
+  ? &mut Writer {
+  let bytes = String.utf8Bytes(value)
+  let hex = b"0123456789abcdef"
+  let mut index: usize = 0
+  while index < bytes.length {
+    let byte = bytes[index]
+    if byte == 34 {
+      run Writer.writeAll(b"\\\"")
+    } else if byte == 92 {
+      run Writer.writeAll(b"\\\\")
+    } else if byte < 32 {
+      let code: [u8; 6] = [92, 117, 48, 48, hex[u8.toUsize(byte / 16)], hex[u8.toUsize(byte % 16)]]
+      run Writer.writeAll(&code)
+    } else {
+      run Writer.writeAll(Slice.view(bytes, index, 1))
+    }
+    index = index + 1
+  }
+  return ()
+}
+
+fn isKind(document: &JsonDocument, node: JsonNode, kind: JsonKind) -> bool {
+  return document.kind(node) == kind
+}
+
+fn stringOr<'a>(document: &'a JsonDocument, node: JsonNode, otherwise: string<'a>) -> string<'a> {
+  return match document.asString(node) {
+    Option.Some { value } => value
+    Option.None => otherwise
+  }
+}
+
+effect fn readState(
+  document: &JsonDocument,
+  label: string,
+  node: JsonNode,
+  charts: &mut List<ChartDefinition>,
+) -> StateDefinition
+  ! OutOfMemoryError | XstateError
+  ? &mut Allocator {
+  if !isKind(document, node, JsonKind.Object) {
+    fail XstateError.NotAnObject
+  }
+  let kind = match document.field(node, "type") {
+    Option<JsonNode>.Some { value } => stringOr(document, value, "")
+    Option<JsonNode>.None => ""
+  }
+  let final = kind == "final"
+  let mut regions = List<RegionDefinition>.make()
+  let mut remember = Option<RememberDefinition>.None
+  match document.field(node, "states") {
+    Option<JsonNode>.Some { value: children } => {
+      if !isKind(document, children, JsonKind.Object) {
+        fail XstateError.NotAnObject
+      }
+
+      // A history child state is the history of this state, kept in a context field named
+      // after the state.
+      let mut scan = document.members(children)
+      while true {
+        match scan.next(document) {
+          Option.Some { value: member } => {
+            let depth = historyKind(document, member.value)
+            if depth != "" {
+              let mut field = run String.copy("last")
+              run field.append(label)
+              remember = Option<RememberDefinition>.Some {
+                value: RememberDefinition { field: move field, deep: depth == "deep" }
+              }
+            }
+          }
+          Option.None => {
+            break
+          }
+        }
+      }
+      if kind == "parallel" {
+        // Each child state of a parallel state is a region, with the child's key as its field.
+        let mut members = document.members(children)
+        while true {
+          match members.next(document) {
+            Option.Some { value: member } => {
+              if historyKind(document, member.value) != "" {
+                continue
+              }
+              let key = stringOr(document, member.key, "")
+              run List<RegionDefinition>.append(
+                &mut regions,
+                RegionDefinition { field: run String.copy(key), chart: run String.copy(key) },
+              )
+              run readChart(document, member.value, key, &mut charts.*)
+            }
+            Option.None => {
+              break
+            }
+          }
+        }
+      } else {
+        // A compound state has one region, named after the state.
+        let mut name = run String.copy(label)
+        run name.append("Region")
+        run readChart(document, node, name.view(), &mut charts.*)
+        run List<RegionDefinition>.append(
+          &mut regions,
+          RegionDefinition { field: run String.copy("region"), chart: move name },
+        )
+      }
+    }
+    Option<JsonNode>.None => {}
+  }
+
+  // "tags" is one name or an array of names.
+  let mut tags = List<String>.make()
+  match document.field(node, "tags") {
+    Option<JsonNode>.Some { value: named } => {
+      if isKind(document, named, JsonKind.Array) {
+        let mut items = document.items(named)
+        while true {
+          match items.next(document) {
+            Option.Some { value: item } => {
+              run List<String>.append(&mut tags, run String.copy(stringOr(document, item, "")))
+            }
+            Option.None => {
+              break
+            }
+          }
+        }
+      } else {
+        run List<String>.append(&mut tags, run String.copy(stringOr(document, named, "")))
+      }
+    }
+    Option<JsonNode>.None => {}
+  }
+
+  let mut meta = run readMeta(document, node)
+  let mut on = List<TransitionDefinition>.make()
+  match document.field(node, "on") {
+    Option<JsonNode>.Some { value: events } => {
+      if !isKind(document, events, JsonKind.Object) {
+        fail XstateError.NotAnObject
+      }
+      let mut members = document.members(events)
+      while true {
+        match members.next(document) {
+          Option.Some { value: member } => {
+            let event = stringOr(document, member.key, "")
+            let mut targets = List<Target>.make()
+            run readTargets(document, member.value, &mut targets)
+            while targets.length() != 0 {
+              let target = List<Target>.remove(&mut targets, 0)
+              run List<TransitionDefinition>.append(
+                &mut on,
+                TransitionDefinition {
+                  event: run String.copy(event),
+                  target: move target.state,
+                  guarded: target.guarded,
+                  history: target.history,
+                  meta: move target.meta,
+                },
+              )
+            }
+          }
+          Option.None => {
+            break
+          }
+        }
+      }
+    }
+    Option<JsonNode>.None => {}
+  }
+  let mut always = List<AlwaysDefinition>.make()
+  match document.field(node, "always") {
+    Option<JsonNode>.Some { value: eventless } => {
+      let mut targets = List<Target>.make()
+      run readTargets(document, eventless, &mut targets)
+      while targets.length() != 0 {
+        let target = List<Target>.remove(&mut targets, 0)
+        if target.state.view() != "" {
+          run List<AlwaysDefinition>.append(
+            &mut always,
+            AlwaysDefinition { target: move target.state, guarded: target.guarded },
+          )
+        }
+      }
+    }
+    Option<JsonNode>.None => {}
+  }
+  let mut after = List<DelayDefinition>.make()
+  match document.field(node, "after") {
+    Option<JsonNode>.Some { value: delays } => {
+      if !isKind(document, delays, JsonKind.Object) {
+        fail XstateError.NotAnObject
+      }
+      let mut members = document.members(delays)
+      while true {
+        match members.next(document) {
+          Option.Some { value: member } => {
+            let milliseconds = run readDelay(stringOr(document, member.key, ""))
+            let mut targets = List<Target>.make()
+            run readTargets(document, member.value, &mut targets)
+            while targets.length() != 0 {
+              let target = List<Target>.remove(&mut targets, 0)
+              if target.state.view() != "" {
+                run List<DelayDefinition>.append(
+                  &mut after,
+                  DelayDefinition { duration: milliseconds * 1ms, target: move target.state },
+                )
+              }
+            }
+          }
+          Option.None => {
+            break
+          }
+        }
+      }
+    }
+    Option<JsonNode>.None => {}
+  }
+  let mut done = run String.copy("")
+  match document.field(node, "onDone") {
+    Option<JsonNode>.Some { value: finished } => {
+      let mut targets = List<Target>.make()
+      run readTargets(document, finished, &mut targets)
+      if targets.length() != 0 {
+        let target = List<Target>.remove(&mut targets, 0)
+        done = move target.state
+      }
+    }
+    Option<JsonNode>.None => {}
+  }
+  return StateDefinition {
+    name: run String.copy(label),
+    final: final,
+    on: move on,
+    always: move always,
+    after: move after,
+    done: move done,
+    tags: move tags,
+    meta: move meta,
+    regions: move regions,
+    remember: move remember,
+  }
+}
+
+// Reads the `initial` and `states` of a machine or of a compound state as a chart named `name`.
+effect fn readChart(
+  document: &JsonDocument,
+  node: JsonNode,
+  name: string,
+  charts: &mut List<ChartDefinition>,
+) -> ()
+  ! OutOfMemoryError | XstateError
+  ? &mut Allocator {
+  if !isKind(document, node, JsonKind.Object) {
+    fail XstateError.NotAnObject
+  }
+  let initial = match document.field(node, "initial") {
+    Option<JsonNode>.Some { value } => stringOr(document, value, "")
+    Option<JsonNode>.None => ""
+  }
+  if initial == "" {
+    fail XstateError.MissingInitial
+  }
+  let mut states = List<StateDefinition>.make()
+  match document.field(node, "states") {
+    Option<JsonNode>.Some { value: children } => {
+      if !isKind(document, children, JsonKind.Object) {
+        fail XstateError.NotAnObject
+      }
+      let mut members = document.members(children)
+      while true {
+        match members.next(document) {
+          Option.Some { value: member } => {
+            if historyKind(document, member.value) != "" {
+              continue
+            }
+            let label = stringOr(document, member.key, "")
+            run List<StateDefinition>.append(
+              &mut states,
+              run readState(document, label, member.value, &mut charts.*),
+            )
+          }
+          Option.None => {
+            break
+          }
+        }
+      }
+    }
+    Option<JsonNode>.None => {}
+  }
+  run List<ChartDefinition>.append(
+    &mut charts.*,
+    ChartDefinition {
+      name: run String.copy(name),
+      initial: run String.copy(initial),
+      states: move states,
+    },
+  )
+  return ()
+}
+
+struct Target {
+  state: String,
+  guarded: bool,
+  // Whether the target named a state below a sibling, which is read as that sibling's history.
+  history: bool,
+  meta: List<MetaDefinition>,
+}
+
+// The member "meta" of `node`, an object. Its text members are kept, the others are not.
+effect fn readMeta(document: &JsonDocument, node: JsonNode) -> List<MetaDefinition>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut meta = List<MetaDefinition>.make()
+  match document.field(node, "meta") {
+    Option<JsonNode>.Some { value: entries } => {
+      if isKind(document, entries, JsonKind.Object) {
+        let mut members = document.members(entries)
+        while true {
+          match members.next(document) {
+            Option.Some { value: member } => {
+              if isKind(document, member.value, JsonKind.String) {
+                run List<MetaDefinition>.append(
+                  &mut meta,
+                  MetaDefinition {
+                    key: run String.copy(stringOr(document, member.key, "")),
+                    value: run String.copy(stringOr(document, member.value, "")),
+                  },
+                )
+              }
+            }
+            Option.None => {
+              break
+            }
+          }
+        }
+      }
+    }
+    Option<JsonNode>.None => {}
+  }
+  return move meta
+}
+
+// A target `Open.hist` is the history of the sibling `Open`.
+effect fn targetOf(text: string, guarded: bool, meta: List<MetaDefinition>) -> Target
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match String.find(text, ".") {
+    Option<usize>.Some { value } => Target {
+      state: run String.copy(String.slice(text, 0, value)),
+      guarded: guarded,
+      history: true,
+      meta: move meta,
+    }
+    Option<usize>.None => Target {
+      state: run String.copy(text),
+      guarded: guarded,
+      history: false,
+      meta: move meta,
+    }
+  }
+}
+
+// "deep" or "shallow" when `node` is a history state, "" otherwise.
+fn historyKind(document: &JsonDocument, node: JsonNode) -> string<'static> {
+  if !isKind(document, node, JsonKind.Object) {
+    return ""
+  }
+  let kind = match document.field(node, "type") {
+    Option<JsonNode>.Some { value } => stringOr(document, value, "")
+    Option<JsonNode>.None => ""
+  }
+  if kind != "history" {
+    return ""
+  }
+  let depth = match document.field(node, "history") {
+    Option<JsonNode>.Some { value } => stringOr(document, value, "")
+    Option<JsonNode>.None => ""
+  }
+  if depth == "deep" {
+    return "deep"
+  }
+  return "shallow"
+}
+
+// Reads one transition or an array of them. A transition without a target has the target "".
+effect fn readTargets(document: &JsonDocument, node: JsonNode, targets: &mut List<Target>) -> ()
+  ! OutOfMemoryError | XstateError
+  ? &mut Allocator {
+  if isKind(document, node, JsonKind.Array) {
+    let mut items = document.items(node)
+    while true {
+      match items.next(document) {
+        Option.Some { value: item } => {
+          run readTarget(document, item, &mut targets.*)
+        }
+        Option.None => {
+          break
+        }
+      }
+    }
+    return ()
+  }
+  return run readTarget(document, node, &mut targets.*)
+}
+
+effect fn readTarget(document: &JsonDocument, node: JsonNode, targets: &mut List<Target>) -> ()
+  ! OutOfMemoryError | XstateError
+  ? &mut Allocator {
+  if isKind(document, node, JsonKind.String) {
+    run List<Target>.append(
+      &mut targets.*,
+      run targetOf(stringOr(document, node, ""), false, List<MetaDefinition>.make()),
+    )
+    return ()
+  }
+  if !isKind(document, node, JsonKind.Object) {
+    fail XstateError.BadTransition
+  }
+  let guarded = match document.field(node, "guard") {
+    Option<JsonNode>.Some { .. } => true
+    Option<JsonNode>.None => false
+  }
+  let meta = run readMeta(document, node)
+  match document.field(node, "target") {
+    Option<JsonNode>.Some { value } => {
+      if !isKind(document, value, JsonKind.String) {
+        fail XstateError.BadTransition
+      }
+      run List<Target>.append(
+        &mut targets.*,
+        run targetOf(stringOr(document, value, ""), guarded, move meta),
+      )
+    }
+    Option<JsonNode>.None => {
+      // No target: the state takes the event and stays.
+      run List<Target>.append(&mut targets.*, run targetOf("", guarded, move meta))
+    }
+  }
+  return ()
+}
+
+effect fn readDelay(key: string) -> u64
+  ! XstateError {
+  let bytes = String.utf8Bytes(key)
+  if bytes.length == 0 || bytes.length > 18 {
+    fail XstateError.BadDelay
+  }
+  let mut value: u64 = 0
+  let mut index: usize = 0
+  while index < bytes.length {
+    if bytes[index] < 48 || bytes[index] > 57 {
+      fail XstateError.BadDelay
+    }
+    value = value * 10 + u8.toU64(bytes[index] - 48)
+    index = index + 1
+  }
+  return value
+}

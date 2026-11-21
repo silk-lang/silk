@@ -1,0 +1,1817 @@
+//! Statecharts written as a static table over union types: [`Chart`] and [`Machine`].
+//!
+//! # When to use
+//! Use this module to describe behavior that depends on a state: a download that retries, a form
+//! with steps, a connection that opens and closes. Write the states as a union, the events as a
+//! union, and implement [`Machine`] for the state union with a [`Chart`] that connects them. Use
+//! the `silk.machine.simple` module when the machine keeps no data and queues no effects.
+//!
+//! # Details
+//! A chart row names the state it leaves and the event it takes, and the compiler checks both
+//! names against the unions. The state a row enters is a value of the state union, so a state can
+//! hold data. A machine never performs work: `enter`, `exit` and `handle` queue effects as values
+//! through [`Enqueue`], and the caller performs them. Guards are built with [`Guards`]. A field of
+//! a state that holds a machine of its own is a region, declared with [`Chart.region`].
+//!
+//! # Gotchas
+//! Rows for one state and event are tried in the order they are written. Put a guarded row before
+//! the plain row for the same state and event.
+//!
+//! @category State machines
+
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.reflect { Reflect }
+import silk.core.static_sequence { StaticSequence }
+import silk.core.static_text { StaticText }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.num.usize
+import silk.schema.schema { Schema }
+
+const GUARD_FUNCTION: u8 = 0
+
+const GUARD_AND: u8 = 1
+
+const GUARD_OR: u8 = 2
+
+const GUARD_NOT: u8 = 3
+
+/// A guard: one function, or guards combined with `and`, `or` and `not`. Built with [`Guards`].
+pub struct Guard {
+  kind: u8,
+  function: Intrinsic.StaticSequence<Intrinsic.FunctionRef>,
+  parts: Intrinsic.StaticSequence<Guard>,
+}
+
+/// Builds guards out of several functions for [`Chart.onWhen`] and the other `When` builders.
+///
+/// # When to use
+/// Use it when a transition depends on more than one check, so each check stays a small
+/// function that can be named and reused:
+/// `Guards.and(Guards.of(isPaid), Guards.not(Guards.of(isLocked)))`. A `When` builder takes
+/// such a guard or one function directly.
+///
+/// # Details
+/// The functions of one guard all have the contract of the place the guard is used:
+/// `fn(&C, &E) -> bool` on a transition that takes an event, `fn(&C) -> bool` on an eventless
+/// one. A function with another contract is a compile error where the chart is used. `and`
+/// and `or` stop at the first part that decides the answer, in the order written.
+pub struct Guards {}
+
+impl Guards {
+  /// A guard that holds when `function` returns true.
+  pub static fn of<F>(function: F) -> Guard {
+    return Guard {
+      kind: GUARD_FUNCTION,
+      function: StaticSequence.append<Intrinsic.FunctionRef>(
+        StaticSequence.empty<Intrinsic.FunctionRef>(),
+        Intrinsic.functionRef<F>(function),
+      ),
+      parts: StaticSequence.empty<Guard>(),
+    }
+  }
+
+  /// Returns `guard` when it is a [`Guard`], and the guard of the function `guard` otherwise.
+  pub static fn from<G>(guard: G) -> Guard {
+    static if Reflect.typeKind<G>(Reflect.typeOf<G>())
+      == Reflect.typeKind<Guard>(Reflect.typeOf<Guard>()) {
+      return guard
+    } else {
+      return Guards.of<G>(guard)
+    }
+  }
+
+  /// A guard that holds when `guard` does not.
+  pub static fn not(guard: Guard) -> Guard {
+    return Guard {
+      kind: GUARD_NOT,
+      function: StaticSequence.empty<Intrinsic.FunctionRef>(),
+      parts: only(guard),
+    }
+  }
+
+  /// A guard that holds when both `first` and `second` hold.
+  pub static fn and(first: Guard, second: Guard) -> Guard {
+    return Guard {
+      kind: GUARD_AND,
+      function: StaticSequence.empty<Intrinsic.FunctionRef>(),
+      parts: StaticSequence.append<Guard>(only(first), second),
+    }
+  }
+
+  /// A guard that holds when `first` or `second` holds.
+  pub static fn or(first: Guard, second: Guard) -> Guard {
+    return Guard {
+      kind: GUARD_OR,
+      function: StaticSequence.empty<Intrinsic.FunctionRef>(),
+      parts: StaticSequence.append<Guard>(only(first), second),
+    }
+  }
+}
+
+/// One declared transition.
+pub struct Edge<S> {
+  pub state: string<'static>,
+  pub event: string<'static>,
+  /// The value the transition enters, or nothing for a transition that takes the event and stays.
+  pub target: Intrinsic.StaticSequence<S>,
+  /// The guard of the transition, over functions `fn(&C, &E) -> bool`. Empty when unguarded.
+  pub guard: Intrinsic.StaticSequence<Guard>,
+  /// Whether the target is entered as it was when it was last left, see [`Chart.history`].
+  pub history: bool,
+  /// The meta data of the transition, see [`Chart.metaOn`].
+  pub meta: Intrinsic.StaticSequence<Meta>,
+}
+
+/// A tag of a state: a name that several states can share, asked for with [`Machines.hasTag`].
+pub struct Tag {
+  pub state: string<'static>,
+  pub tag: string<'static>,
+}
+
+/// One entry of the meta data of a state: a text `value` under a `key`, read with
+/// [`Machines.meta`].
+pub struct Meta {
+  pub state: string<'static>,
+  pub key: string<'static>,
+  pub value: string<'static>,
+}
+
+/// The event name of a transition that any event takes.
+pub const ANY: string<'static> = "*"
+
+/// A state whose value is kept when its chart leaves it, so a transition can come back to it.
+pub struct Remember {
+  pub state: string<'static>,
+  /// The label of the field of the context that keeps the value, a `History<S>`.
+  pub field: string<'static>,
+  /// Whether the regions come back whole. When false only their own states come back, and the
+  /// regions below those start again.
+  pub deep: bool,
+}
+
+/// The value a state had when its chart last left it. A field of the context of this type keeps
+/// the history of one state, see [`Chart.history`].
+pub struct History<S> {
+  pub last: Option<S>,
+}
+
+impl<S: Schema> Schema for History<S> {}
+
+impl<S> History<S> {
+  /// Returns a history that remembers nothing.
+  pub fn empty() -> History<S> {
+    return History<S> { last: Option<S>.None }
+  }
+
+  /// Takes the remembered value out, leaving nothing remembered.
+  pub fn take(self: &mut Self) -> Option<S> {
+    return replace<Option<S>>(&mut self.last, Option<S>.None)
+  }
+}
+
+/// One declared eventless transition, taken as soon as its state is active and its condition holds.
+pub struct Always<S> {
+  pub state: string<'static>,
+  pub target: S,
+  /// The condition of the transition, over functions `fn(&C) -> bool`. Empty when it has none.
+  pub condition: Intrinsic.StaticSequence<Guard>,
+}
+
+/// The static description of one level of a machine: the variants of `S` are its states, the
+/// variants of `E` its events, `C` its context and `X` its effects.
+/// A delayed transition: `target` is taken when `state` stayed active for `duration`, in
+/// nanoseconds.
+pub struct Delay<S> {
+  pub state: string<'static>,
+  pub target: S,
+  pub duration: u64,
+  /// The position of this delay in its chart. With the chart's type name it identifies a timer.
+  pub index: u32,
+}
+
+pub struct Chart<S, E, C, X> {
+  /// The value the machine starts with: empty until [`Chart.initial`] gives one.
+  pub start: Intrinsic.StaticSequence<S>,
+  pub edges: Intrinsic.StaticSequence<Edge<S>>,
+  /// The labels of the variant fields that hold a child region.
+  pub regions: Intrinsic.StaticSequence<string<'static>>,
+  pub eventless: Intrinsic.StaticSequence<Always<S>>,
+  /// The transitions taken when every region of their state is in a final state.
+  pub dones: Intrinsic.StaticSequence<Always<S>>,
+  /// The labels of the final states.
+  pub finals: Intrinsic.StaticSequence<string<'static>>,
+  pub delays: Intrinsic.StaticSequence<Delay<S>>,
+  /// The states that are remembered when the chart leaves them.
+  pub histories: Intrinsic.StaticSequence<Remember>,
+  pub tags: Intrinsic.StaticSequence<Tag>,
+  /// The meta data of the states.
+  pub metas: Intrinsic.StaticSequence<Meta>,
+}
+
+impl<S, E, C, X> Chart<S, E, C, X> {
+  pub static fn of() -> Chart<S, E, C, X> {
+    return Chart<S, E, C, X> {
+      start: StaticSequence.empty<S>(),
+      edges: StaticSequence.empty<Edge<S>>(),
+      regions: StaticSequence.empty<string<'static>>(),
+      eventless: StaticSequence.empty<Always<S>>(),
+      dones: StaticSequence.empty<Always<S>>(),
+      finals: StaticSequence.empty<string<'static>>(),
+      delays: StaticSequence.empty<Delay<S>>(),
+      histories: StaticSequence.empty<Remember>(),
+      tags: StaticSequence.empty<Tag>(),
+      metas: StaticSequence.empty<Meta>(),
+    }
+  }
+
+  /// Makes `state` the value the machine starts with. It is a value of the state union, with
+  /// its fields: the data the state holds and, for a state with regions, the state each region
+  /// starts in.
+  pub static fn initial(chart: Chart<S, E, C, X>, state: S) -> Chart<S, E, C, X> {
+    let mut changed = chart
+    changed.start = StaticSequence.append<S>(StaticSequence.empty<S>(), state)
+    return changed
+  }
+
+  pub static fn region(chart: Chart<S, E, C, X>, field: Intrinsic.FieldName<S>) -> Chart<
+    S,
+    E,
+    C,
+    X
+  > {
+    let mut changed = chart
+    changed.regions = StaticSequence.append<string<'static>>(
+      chart.regions,
+      Reflect.fieldNameText<S>(field),
+    )
+    return changed
+  }
+
+  /// Adds a transition: in the state named `state`, the event named `event` takes the machine
+  /// to `target`.
+  ///
+  /// # Details
+  /// `state` and `event` are names, because a transition leaves a state and takes an event
+  /// whatever their fields hold. `target` is a value of the state union, so it gives the
+  /// fields of the state it enters: its data, and the state of each of its regions. This holds
+  /// for the target of every kind of transition.
+  ///
+  /// A transition between two values of one state runs no exit and no entry function of that
+  /// state, only those of the regions that changed.
+  pub static fn on(
+    chart: Chart<S, E, C, X>,
+    state: Intrinsic.VariantName<S>,
+    event: Intrinsic.VariantName<E>,
+    target: S,
+  ) -> Chart<S, E, C, X> {
+    let mut changed = chart
+    changed.edges = StaticSequence.append<Edge<S>>(
+      chart.edges,
+      Edge<S> {
+        state: Reflect.variantNameText<S>(state),
+        event: Reflect.variantNameText<E>(event),
+        target: StaticSequence.append<S>(StaticSequence.empty<S>(), target),
+        guard: StaticSequence.empty<Guard>(),
+        history: false,
+        meta: StaticSequence.empty<Meta>(),
+      },
+    )
+    return changed
+  }
+
+  /// Like [`Chart.on`], taken only when `guard` holds. `guard` is a function
+  /// `fn(&C, &E) -> bool`, or a [`Guard`] that [`Guards`] builds from several. This holds for
+  /// every `When` builder.
+  pub static fn onWhen<G>(
+    chart: Chart<S, E, C, X>,
+    state: Intrinsic.VariantName<S>,
+    event: Intrinsic.VariantName<E>,
+    target: S,
+    guard: G,
+  ) -> Chart<S, E, C, X> {
+    let mut changed = chart
+    changed.edges = StaticSequence.append<Edge<S>>(
+      chart.edges,
+      Edge<S> {
+        state: Reflect.variantNameText<S>(state),
+        event: Reflect.variantNameText<E>(event),
+        target: StaticSequence.append<S>(StaticSequence.empty<S>(), target),
+        guard: only(Guards.from<G>(guard)),
+        history: false,
+        meta: StaticSequence.empty<Meta>(),
+      },
+    )
+    return changed
+  }
+
+  /// Adds a transition that any event takes when no transition of `state` that names the event
+  /// is taken. This is xstate's wildcard transition.
+  pub static fn onAny(
+    chart: Chart<S, E, C, X>,
+    state: Intrinsic.VariantName<S>,
+    target: S,
+  ) -> Chart<S, E, C, X> {
+    let mut changed = chart
+    changed.edges = StaticSequence.append<Edge<S>>(
+      chart.edges,
+      Edge<S> {
+        state: Reflect.variantNameText<S>(state),
+        event: ANY,
+        target: StaticSequence.append<S>(StaticSequence.empty<S>(), target),
+        guard: StaticSequence.empty<Guard>(),
+        history: false,
+        meta: StaticSequence.empty<Meta>(),
+      },
+    )
+    return changed
+  }
+
+  /// Like [`Chart.onAny`], taken only when `guard` holds.
+  pub static fn onAnyWhen<G>(
+    chart: Chart<S, E, C, X>,
+    state: Intrinsic.VariantName<S>,
+    target: S,
+    guard: G,
+  ) -> Chart<S, E, C, X> {
+    let mut changed = chart
+    changed.edges = StaticSequence.append<Edge<S>>(
+      chart.edges,
+      Edge<S> {
+        state: Reflect.variantNameText<S>(state),
+        event: ANY,
+        target: StaticSequence.append<S>(StaticSequence.empty<S>(), target),
+        guard: only(Guards.from<G>(guard)),
+        history: false,
+        meta: StaticSequence.empty<Meta>(),
+      },
+    )
+    return changed
+  }
+
+  /// Makes `state` take `event` without a transition, so the states above it do not get the
+  /// event. This is xstate's forbidden transition.
+  pub static fn stay(
+    chart: Chart<S, E, C, X>,
+    state: Intrinsic.VariantName<S>,
+    event: Intrinsic.VariantName<E>,
+  ) -> Chart<S, E, C, X> {
+    let mut changed = chart
+    changed.edges = StaticSequence.append<Edge<S>>(
+      chart.edges,
+      Edge<S> {
+        state: Reflect.variantNameText<S>(state),
+        event: Reflect.variantNameText<E>(event),
+        target: StaticSequence.empty<S>(),
+        guard: StaticSequence.empty<Guard>(),
+        history: false,
+        meta: StaticSequence.empty<Meta>(),
+      },
+    )
+    return changed
+  }
+
+  /// Like [`Chart.stay`], only when `guard` holds.
+  pub static fn stayWhen<G>(
+    chart: Chart<S, E, C, X>,
+    state: Intrinsic.VariantName<S>,
+    event: Intrinsic.VariantName<E>,
+    guard: G,
+  ) -> Chart<S, E, C, X> {
+    let mut changed = chart
+    changed.edges = StaticSequence.append<Edge<S>>(
+      chart.edges,
+      Edge<S> {
+        state: Reflect.variantNameText<S>(state),
+        event: Reflect.variantNameText<E>(event),
+        target: StaticSequence.empty<S>(),
+        guard: only(Guards.from<G>(guard)),
+        history: false,
+        meta: StaticSequence.empty<Meta>(),
+      },
+    )
+    return changed
+  }
+
+  /// Makes `state` take every event that no transition of the state names, without a
+  /// transition, so the states above it get none of them.
+  pub static fn stayAny(chart: Chart<S, E, C, X>, state: Intrinsic.VariantName<S>) -> Chart<
+    S,
+    E,
+    C,
+    X
+  > {
+    let mut changed = chart
+    changed.edges = StaticSequence.append<Edge<S>>(
+      chart.edges,
+      Edge<S> {
+        state: Reflect.variantNameText<S>(state),
+        event: ANY,
+        target: StaticSequence.empty<S>(),
+        guard: StaticSequence.empty<Guard>(),
+        history: false,
+        meta: StaticSequence.empty<Meta>(),
+      },
+    )
+    return changed
+  }
+
+  /// Gives `state` the tag `tag`. Several states can have one tag, and a state several tags.
+  pub static fn tag(
+    chart: Chart<S, E, C, X>,
+    state: Intrinsic.VariantName<S>,
+    tag: string<'static>,
+  ) -> Chart<S, E, C, X> {
+    let mut changed = chart
+    changed.tags = StaticSequence.append<Tag>(
+      chart.tags,
+      Tag { state: Reflect.variantNameText<S>(state), tag: tag },
+    )
+    return changed
+  }
+
+  /// Gives `state` the meta data `value` under `key`: static text about the state for the
+  /// program to read while the state is active, such as a label or the name of a view. A state
+  /// can have several keys.
+  pub static fn meta(
+    chart: Chart<S, E, C, X>,
+    state: Intrinsic.VariantName<S>,
+    key: string<'static>,
+    value: string<'static>,
+  ) -> Chart<S, E, C, X> {
+    let mut changed = chart
+    changed.metas = StaticSequence.append<Meta>(
+      chart.metas,
+      Meta { state: Reflect.variantNameText<S>(state), key: key, value: value },
+    )
+    return changed
+  }
+
+  /// Gives the transition that `event` takes in `state` the meta data `value` under `key`:
+  /// static text about the transition for tools that read the chart, such as a label for a
+  /// diagram or a note for a test generator.
+  ///
+  /// # Details
+  /// The meta data goes to the last transition declared so far for `state` and `event`, so
+  /// write it right after the row it describes. When a state has a guarded row and a plain row
+  /// for one event, each one takes its own. It is a compile error when no row was declared.
+  /// The meta data is part of the `Definition` of the machine and of its xstate config. It is
+  /// not read while the machine runs: for that, give the target state a [`Chart.meta`].
+  pub static fn metaOn(
+    chart: Chart<S, E, C, X>,
+    state: Intrinsic.VariantName<S>,
+    event: Intrinsic.VariantName<E>,
+    key: string<'static>,
+    value: string<'static>,
+  ) -> Chart<S, E, C, X> {
+    return Chart.describe(
+      chart,
+      Reflect.variantNameText<S>(state),
+      Reflect.variantNameText<E>(event),
+      key,
+      value,
+    )
+  }
+
+  /// Like [`Chart.metaOn`], for the transition that any event takes, see [`Chart.onAny`].
+  pub static fn metaOnAny(
+    chart: Chart<S, E, C, X>,
+    state: Intrinsic.VariantName<S>,
+    key: string<'static>,
+    value: string<'static>,
+  ) -> Chart<S, E, C, X> {
+    return Chart.describe(chart, Reflect.variantNameText<S>(state), ANY, key, value)
+  }
+
+  static fn describe(
+    chart: Chart<S, E, C, X>,
+    state: string<'static>,
+    event: string<'static>,
+    key: string<'static>,
+    value: string<'static>,
+  ) -> Chart<S, E, C, X> {
+    let count = StaticSequence.length<Edge<S>>(chart.edges)
+    let mut last = count
+    let mut index: usize = 0
+    while index < count {
+      let edge = StaticSequence.at<Edge<S>>(chart.edges, index)
+      if edge.state == state && edge.event == event {
+        last = index
+      }
+      index = index + 1
+    }
+    if last == count {
+      compileError("metaOn: the state has no transition for this event yet")
+    }
+    let mut edges = StaticSequence.empty<Edge<S>>()
+    index = 0
+    while index < count {
+      let mut edge = StaticSequence.at<Edge<S>>(chart.edges, index)
+      if index == last {
+        edge.meta = StaticSequence.append<Meta>(
+          edge.meta,
+          Meta { state: state, key: key, value: value },
+        )
+      }
+      edges = StaticSequence.append<Edge<S>>(edges, edge)
+      index = index + 1
+    }
+    let mut changed = chart
+    changed.edges = edges
+    return changed
+  }
+
+  /// Keeps the value of `state`, with its regions, in the context field `field` when the chart
+  /// leaves the state. The field is a `History<S>`. A transition added with [`Chart.resume`]
+  /// enters the state as it was, which is xstate's deep history.
+  ///
+  /// # Details
+  /// The kept value is a copy of the state, so the data fields of the states of a chart with a
+  /// history, and of the regions below them, must be `Copy`.
+  ///
+  /// The value is kept whenever the state is left: when this chart leaves it, and when a parent
+  /// state that holds this chart as a region is left.
+  pub static fn history(
+    chart: Chart<S, E, C, X>,
+    state: Intrinsic.VariantName<S>,
+    field: Intrinsic.FieldName<C>,
+  ) -> Chart<S, E, C, X> {
+    let mut changed = chart
+    changed.histories = StaticSequence.append<Remember>(
+      chart.histories,
+      Remember {
+        state: Reflect.variantNameText<S>(state),
+        field: Reflect.fieldNameText<C>(field),
+        deep: true,
+      },
+    )
+    return changed
+  }
+
+  /// Like [`Chart.history`], but a transition that comes back restores only the state of each
+  /// region, and the regions below those start at their initial states. This is xstate's
+  /// shallow history.
+  pub static fn shallowHistory(
+    chart: Chart<S, E, C, X>,
+    state: Intrinsic.VariantName<S>,
+    field: Intrinsic.FieldName<C>,
+  ) -> Chart<S, E, C, X> {
+    let mut changed = chart
+    changed.histories = StaticSequence.append<Remember>(
+      chart.histories,
+      Remember {
+        state: Reflect.variantNameText<S>(state),
+        field: Reflect.fieldNameText<C>(field),
+        deep: false,
+      },
+    )
+    return changed
+  }
+
+  /// Adds a transition to the history of the state of `target`: the state is entered as it was
+  /// when the chart last left it, or as `target` when nothing is remembered. Entry functions
+  /// run for every state entered.
+  pub static fn resume(
+    chart: Chart<S, E, C, X>,
+    state: Intrinsic.VariantName<S>,
+    event: Intrinsic.VariantName<E>,
+    target: S,
+  ) -> Chart<S, E, C, X> {
+    let mut changed = chart
+    changed.edges = StaticSequence.append<Edge<S>>(
+      chart.edges,
+      Edge<S> {
+        state: Reflect.variantNameText<S>(state),
+        event: Reflect.variantNameText<E>(event),
+        target: StaticSequence.append<S>(StaticSequence.empty<S>(), target),
+        guard: StaticSequence.empty<Guard>(),
+        history: true,
+        meta: StaticSequence.empty<Meta>(),
+      },
+    )
+    return changed
+  }
+
+  /// Like [`Chart.resume`], taken only when `guard` holds.
+  pub static fn resumeWhen<G>(
+    chart: Chart<S, E, C, X>,
+    state: Intrinsic.VariantName<S>,
+    event: Intrinsic.VariantName<E>,
+    target: S,
+    guard: G,
+  ) -> Chart<S, E, C, X> {
+    let mut changed = chart
+    changed.edges = StaticSequence.append<Edge<S>>(
+      chart.edges,
+      Edge<S> {
+        state: Reflect.variantNameText<S>(state),
+        event: Reflect.variantNameText<E>(event),
+        target: StaticSequence.append<S>(StaticSequence.empty<S>(), target),
+        guard: only(Guards.from<G>(guard)),
+        history: true,
+        meta: StaticSequence.empty<Meta>(),
+      },
+    )
+    return changed
+  }
+
+  pub static fn final(chart: Chart<S, E, C, X>, state: Intrinsic.VariantName<S>) -> Chart<
+    S,
+    E,
+    C,
+    X
+  > {
+    let mut changed = chart
+    changed.finals = StaticSequence.append<string<'static>>(
+      chart.finals,
+      Reflect.variantNameText<S>(state),
+    )
+    return changed
+  }
+
+  pub static fn always(
+    chart: Chart<S, E, C, X>,
+    state: Intrinsic.VariantName<S>,
+    target: S,
+  ) -> Chart<S, E, C, X> {
+    let mut changed = chart
+    changed.eventless = StaticSequence.append<Always<S>>(
+      chart.eventless,
+      Always<S> {
+        state: Reflect.variantNameText<S>(state),
+        target: target,
+        condition: StaticSequence.empty<Guard>(),
+      },
+    )
+    return changed
+  }
+
+  pub static fn alwaysWhen<G>(
+    chart: Chart<S, E, C, X>,
+    state: Intrinsic.VariantName<S>,
+    target: S,
+    condition: G,
+  ) -> Chart<S, E, C, X> {
+    let mut changed = chart
+    changed.eventless = StaticSequence.append<Always<S>>(
+      chart.eventless,
+      Always<S> {
+        state: Reflect.variantNameText<S>(state),
+        target: target,
+        condition: only(Guards.from<G>(condition)),
+      },
+    )
+    return changed
+  }
+
+  /// Adds a transition taken as soon as every region of `state` is in a final state of its
+  /// chart: the region of a compound state, or all the regions of a parallel state. This is
+  /// xstate's `onDone`.
+  ///
+  /// # Details
+  /// It is an eventless transition, tried after the [`Chart.always`] rows of the state. Its
+  /// target must leave the state's variant or start a region outside its final state, or the
+  /// machine never settles and the step fails with `TransitionLoopError`.
+  pub static fn onDone(
+    chart: Chart<S, E, C, X>,
+    state: Intrinsic.VariantName<S>,
+    target: S,
+  ) -> Chart<S, E, C, X> {
+    let mut changed = chart
+    changed.dones = StaticSequence.append<Always<S>>(
+      chart.dones,
+      Always<S> {
+        state: Reflect.variantNameText<S>(state),
+        target: target,
+        condition: StaticSequence.empty<Guard>(),
+      },
+    )
+    return changed
+  }
+
+  /// Adds a delayed transition: after `duration` in `state`, the machine goes to `target`.
+  /// A duration is nanoseconds, so a duration literal such as `500ms` or `1m30s` gives one.
+  /// The timer starts when the state is entered and is cancelled when the state is left.
+  pub static fn after(
+    chart: Chart<S, E, C, X>,
+    state: Intrinsic.VariantName<S>,
+    duration: u64,
+    target: S,
+  ) -> Chart<S, E, C, X> {
+    let mut changed = chart
+    changed.delays = StaticSequence.append<Delay<S>>(
+      chart.delays,
+      Delay<S> {
+        state: Reflect.variantNameText<S>(state),
+        target: target,
+        duration: duration,
+        index: usize.toU32(StaticSequence.length<Delay<S>>(chart.delays)),
+      },
+    )
+    return changed
+  }
+
+  pub static fn isFinal(chart: Chart<S, E, C, X>, label: string<'static>) -> bool {
+    let mut index: usize = 0
+    while index < StaticSequence.length<string<'static>>(chart.finals) {
+      if StaticSequence.at<string<'static>>(chart.finals, index) == label {
+        return true
+      }
+      index = index + 1
+    }
+    return false
+  }
+
+  pub static fn isRegion(chart: Chart<S, E, C, X>, label: string<'static>) -> bool {
+    let mut index: usize = 0
+    while index < StaticSequence.length<string<'static>>(chart.regions) {
+      if StaticSequence.at<string<'static>>(chart.regions, index) == label {
+        return true
+      }
+      index = index + 1
+    }
+    return false
+  }
+}
+
+/// What a transition function decided.
+pub union Next<S> {
+  /// Not handled here: the parent state gets the event.
+  Pass,
+  /// Handled without a state change.
+  Stay,
+  /// Handled by moving to `state`.
+  To { pub state: S },
+}
+
+/// What a step queued: events for the machine itself and effects to perform after the commit.
+pub struct Enqueue<E, X> {
+  pub raised: List<E>,
+  pub effects: List<X>,
+  /// Timers started and cancelled by the states entered and left, in order.
+  pub timers: List<TimerChange>,
+  /// The machine's clock at this step, in nanoseconds of wall clock time. A handler that
+  /// starts a child machine passes it on.
+  pub clock: u64,
+}
+
+/// A timer of a delayed transition that a step started or cancelled.
+pub union TimerChange {
+  Start { pub path: string<'static>, pub index: u32, pub duration: u64 },
+  Cancel { pub path: string<'static>, pub index: u32 },
+}
+
+impl<E, X> Enqueue<E, X> {
+  pub fn make() -> Enqueue<E, X> {
+    return Enqueue<E, X>.at(0)
+  }
+
+  /// Returns an empty queue for a step taken at the wall clock time `clock`, in nanoseconds.
+  pub fn at(clock: u64) -> Enqueue<E, X> {
+    return Enqueue<E, X> {
+      raised: List<E>.make(),
+      effects: List<X>.make(),
+      timers: List<TimerChange>.make(),
+      clock: clock,
+    }
+  }
+
+  pub effect fn raise(self: &mut Self, event: E) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run List<E>.append(&mut self.raised, move event)
+  }
+
+  pub effect fn perform(self: &mut Self, effect_: X) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run List<X>.append(&mut self.effects, move effect_)
+  }
+}
+
+pub interface Machine<E, C, X> {
+  static fn chart() -> Chart<Self, E, C, X>
+
+  /// The transition function of this level. The default handles nothing.
+  effect fn handle(state: &Self, context: &mut C, event: &E, enq: &mut Enqueue<E, X>) -> Next<Self>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return Next<Self>.Pass
+  }
+
+  effect fn enter(state: &Self, context: &mut C, enq: &mut Enqueue<E, X>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return ()
+  }
+
+  effect fn exit(state: &Self, context: &mut C, enq: &mut Enqueue<E, X>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return ()
+  }
+
+  /// The next time something the context holds needs [`Machine.tick`], in nanoseconds of wall
+  /// clock time. A machine with a child returns the child's next deadline. The default has
+  /// none. Only the machine's own states are asked, not its regions.
+  fn deadline(state: &Self, context: &C) -> Option<u64> {
+    return Option<u64>.None
+  }
+
+  /// Runs when the clock reaches [`Machine.deadline`]. A machine with a child advances the
+  /// child to `now` here and moves its effects into `enq`. The default does nothing.
+  effect fn tick(state: &Self, context: &mut C, now: u64, enq: &mut Enqueue<E, X>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return ()
+  }
+}
+
+static fn chartOf<S: Machine<E, C, X>, E, C, X>() -> Chart<S, E, C, X> {
+  return Machine.chart()
+}
+
+pub static fn hasGuard<S>(edge: Edge<S>) -> bool {
+  return StaticSequence.length<Guard>(edge.guard) != 0
+}
+
+pub static fn hasCondition<S>(always: Always<S>) -> bool {
+  return StaticSequence.length<Guard>(always.condition) != 0
+}
+
+static fn only(guard: Guard) -> Intrinsic.StaticSequence<Guard> {
+  return StaticSequence.append<Guard>(StaticSequence.empty<Guard>(), guard)
+}
+
+// Whether `guard` holds, when its functions take the context and the event.
+fn guardHolds<C, E>(static guard: Guard, context: &C, event: &E) -> bool {
+  static if guard.kind == GUARD_FUNCTION {
+    static for function in guard.function {
+      let static call = Intrinsic.functionAs<fn<'static>(&C, &E) -> bool>(function)
+      return call(context, event)
+    }
+    return true
+  } else {
+    static if guard.kind == GUARD_NOT {
+      static for part in guard.parts {
+        return !guardHolds<C, E>(part, context, event)
+      }
+      return true
+    } else {
+      static if guard.kind == GUARD_AND {
+        static for part in guard.parts {
+          if !guardHolds<C, E>(part, context, event) {
+            return false
+          }
+        }
+        return true
+      } else {
+        static for part in guard.parts {
+          if guardHolds<C, E>(part, context, event) {
+            return true
+          }
+        }
+        return false
+      }
+    }
+  }
+}
+
+// Whether `guard` holds, when its functions take only the context.
+fn conditionHolds<C>(static guard: Guard, context: &C) -> bool {
+  static if guard.kind == GUARD_FUNCTION {
+    static for function in guard.function {
+      let static call = Intrinsic.functionAs<fn<'static>(&C) -> bool>(function)
+      return call(context)
+    }
+    return true
+  } else {
+    static if guard.kind == GUARD_NOT {
+      static for part in guard.parts {
+        return !conditionHolds<C>(part, context)
+      }
+      return true
+    } else {
+      static if guard.kind == GUARD_AND {
+        static for part in guard.parts {
+          if !conditionHolds<C>(part, context) {
+            return false
+          }
+        }
+        return true
+      } else {
+        static for part in guard.parts {
+          if conditionHolds<C>(part, context) {
+            return true
+          }
+        }
+        return false
+      }
+    }
+  }
+}
+
+// Puts `value` in `place` and returns what was there.
+fn replace<T>(place: &mut T, value: T) -> T {
+  unsafe {
+    let pointer = Pointer.fromMutRef<T>(&mut place.*)
+    let old = Pointer.take<T>(pointer)
+    Pointer.put<T>(pointer, move value)
+    return move old
+  }
+}
+
+pub struct Machines {}
+
+impl Machines {
+  /// The initial state of `S`: the value its chart gives to [`Chart.initial`].
+  pub fn start<S: Machine<E, C, X>, E, C, X>() -> S {
+    let static chart = chartOf<S, E, C, X>()
+    static for value in chart.start {
+      return value
+    }
+    Intrinsic.trap("the chart names no initial state")
+  }
+
+  /// Runs the entry functions of `state`, parents before children, and starts the timers of
+  /// the states entered.
+  pub effect fn enterAll<S: Machine<E, C, X>, E, C, X>(
+    state: &S,
+    context: &mut C,
+    enq: &mut Enqueue<E, X>,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run Machines.enterAt<S, E, C, X>(
+      Reflect.typeName<S>(),
+      state,
+      &mut context.*,
+      &mut enq.*,
+    )
+  }
+
+  /// Runs the exit functions of `state`, children before parents, and cancels the timers of
+  /// the states left.
+  pub effect fn exitAll<S: Machine<E, C, X>, E, C, X>(
+    state: &S,
+    context: &mut C,
+    enq: &mut Enqueue<E, X>,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run Machines.exitAt<S, E, C, X>(Reflect.typeName<S>(), state, &mut context.*, &mut enq.*)
+  }
+
+  // `path` names the place of the chart `S` in the machine: the root's type name, then the
+  // variant and the field of each region below it, as in `Editor.Open.bold`. Timers are kept by
+  // path, so two regions of one chart type keep their own.
+  effect fn enterAt<S: Machine<E, C, X>, E, C, X>(
+    static path: string<'static>,
+    state: &S,
+    context: &mut C,
+    enq: &mut Enqueue<E, X>,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let static chart = chartOf<S, E, C, X>()
+    run Machine.enter(state, &mut context.*, &mut enq.*)
+    static for variant in Reflect.variants<S>() {
+      if Reflect.isVariant(state, variant) {
+        static for delay in chart.delays {
+          static if delay.state == Reflect.variantLabel(variant) {
+            run List<TimerChange>.append(
+              &mut enq.timers,
+              TimerChange.Start { path: path, index: delay.index, duration: delay.duration },
+            )
+          }
+        }
+        static for field in Reflect.variantFields(variant) {
+          static if Chart.isRegion(chart, Reflect.fieldLabel(field)) {
+            run Machines.enterAt(
+              regionPath(path, Reflect.variantLabel(variant), Reflect.fieldLabel(field)),
+              Reflect.borrowVariantField(state, variant, field),
+              &mut context.*,
+              &mut enq.*,
+            )
+          }
+        }
+      }
+    }
+    return ()
+  }
+
+  effect fn exitAt<S: Machine<E, C, X>, E, C, X>(
+    static path: string<'static>,
+    state: &S,
+    context: &mut C,
+    enq: &mut Enqueue<E, X>,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let static chart = chartOf<S, E, C, X>()
+    static for variant in Reflect.variants<S>() {
+      if Reflect.isVariant(state, variant) {
+        static for field in Reflect.variantFields(variant) {
+          static if Chart.isRegion(chart, Reflect.fieldLabel(field)) {
+            run Machines.exitAt(
+              regionPath(path, Reflect.variantLabel(variant), Reflect.fieldLabel(field)),
+              Reflect.borrowVariantField(state, variant, field),
+              &mut context.*,
+              &mut enq.*,
+            )
+          }
+        }
+      }
+    }
+    static for variant in Reflect.variants<S>() {
+      if Reflect.isVariant(state, variant) {
+        static for delay in chart.delays {
+          static if delay.state == Reflect.variantLabel(variant) {
+            run List<TimerChange>.append(
+              &mut enq.timers,
+              TimerChange.Cancel { path: path, index: delay.index },
+            )
+          }
+        }
+      }
+    }
+    run Machine.exit(state, &mut context.*, &mut enq.*)
+    return ()
+  }
+
+  // Exits what is active in `old` and not in `next`.
+  effect fn exitChanged<S: Machine<E, C, X>, E, C, X>(
+    static path: string<'static>,
+    old: &S,
+    next: &S,
+    context: &mut C,
+    enq: &mut Enqueue<E, X>,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let static chart = chartOf<S, E, C, X>()
+    static for variant in Reflect.variants<S>() {
+      if Reflect.isVariant(old, variant) && Reflect.isVariant(next, variant) {
+        static for field in Reflect.variantFields(variant) {
+          static if Chart.isRegion(chart, Reflect.fieldLabel(field)) {
+            run Machines.exitChanged(
+              regionPath(path, Reflect.variantLabel(variant), Reflect.fieldLabel(field)),
+              Reflect.borrowVariantField(old, variant, field),
+              Reflect.borrowVariantField(next, variant, field),
+              &mut context.*,
+              &mut enq.*,
+            )
+          }
+        }
+        return ()
+      }
+    }
+    return run Machines.exitAt(path, old, &mut context.*, &mut enq.*)
+  }
+
+  // Enters what is active in `next` and not in `old`.
+  effect fn enterChanged<S: Machine<E, C, X>, E, C, X>(
+    static path: string<'static>,
+    old: &S,
+    next: &S,
+    context: &mut C,
+    enq: &mut Enqueue<E, X>,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let static chart = chartOf<S, E, C, X>()
+    static for variant in Reflect.variants<S>() {
+      if Reflect.isVariant(old, variant) && Reflect.isVariant(next, variant) {
+        static for field in Reflect.variantFields(variant) {
+          static if Chart.isRegion(chart, Reflect.fieldLabel(field)) {
+            run Machines.enterChanged(
+              regionPath(path, Reflect.variantLabel(variant), Reflect.fieldLabel(field)),
+              Reflect.borrowVariantField(old, variant, field),
+              Reflect.borrowVariantField(next, variant, field),
+              &mut context.*,
+              &mut enq.*,
+            )
+          }
+        }
+        return ()
+      }
+    }
+    return run Machines.enterAt(path, next, &mut context.*, &mut enq.*)
+  }
+
+  // Replaces `state` by `target`, running exit and entry functions for what changed.
+  effect fn transit<S: Machine<E, C, X>, E, C, X>(
+    static path: string<'static>,
+    state: &mut S,
+    target: S,
+    context: &mut C,
+    enq: &mut Enqueue<E, X>,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run Machines.exitChanged(path, &state.*, &target, &mut context.*, &mut enq.*)
+    run Machines.enterChanged(path, &state.*, &target, &mut context.*, &mut enq.*)
+    let old = replace<S>(&mut state.*, move target)
+    Machines.rememberLeft<S, E, C, X>(&old, &state.*, &mut context.*)
+    return ()
+  }
+
+  // Keeps the history of every state that is active in `old` and not in `now`: the state the
+  // chart left, and the states of its regions, which were left with it.
+  fn rememberLeft<S: Machine<E, C, X>, E, C, X>(old: &S, now: &S, context: &mut C) -> () {
+    let static chart = chartOf<S, E, C, X>()
+    static for variant in Reflect.variants<S>() {
+      if Reflect.isVariant(old, variant) && Reflect.isVariant(now, variant) {
+        static for field in Reflect.variantFields(variant) {
+          static if Chart.isRegion(chart, Reflect.fieldLabel(field)) {
+            Machines.regionLeft(chart, variant, field, old, now, &mut context.*)
+          }
+        }
+        return ()
+      }
+    }
+    return Machines.rememberAll<S, E, C, X>(old, &mut context.*)
+  }
+
+  // Keeps the history of the active state of `old` and of the states of its regions.
+  fn rememberAll<S: Machine<E, C, X>, E, C, X>(old: &S, context: &mut C) -> () {
+    let static chart = chartOf<S, E, C, X>()
+    static for variant in Reflect.variants<S>() {
+      if Reflect.isVariant(old, variant) {
+        static for field in Reflect.variantFields(variant) {
+          static if Chart.isRegion(chart, Reflect.fieldLabel(field)) {
+            Machines.regionAll(chart, variant, field, old, &mut context.*)
+          }
+        }
+        static for item in chart.histories {
+          static if item.state == Reflect.variantLabel(variant) {
+            static for field in Reflect.fields<C>() {
+              static if Reflect.fieldLabel(field) == item.field {
+                Machines.keep<S, C>(&mut context.*, field, Machines.copy<S, E, C, X>(old))
+              }
+            }
+          }
+        }
+      }
+    }
+    return ()
+  }
+
+  fn regionLeft<S, V: Machine<E, C, X>, E, C, X>(
+    static chart: Chart<S, E, C, X>,
+    static variant: Intrinsic.Variant<S>,
+    static field: Intrinsic.Field<S, V>,
+    old: &S,
+    now: &S,
+    context: &mut C,
+  ) -> () {
+    return Machines.rememberLeft<V, E, C, X>(
+      Reflect.borrowVariantField(old, variant, field),
+      Reflect.borrowVariantField(now, variant, field),
+      &mut context.*,
+    )
+  }
+
+  fn regionAll<S, V: Machine<E, C, X>, E, C, X>(
+    static chart: Chart<S, E, C, X>,
+    static variant: Intrinsic.Variant<S>,
+    static field: Intrinsic.Field<S, V>,
+    old: &S,
+    context: &mut C,
+  ) -> () {
+    return Machines.rememberAll<V, E, C, X>(
+      Reflect.borrowVariantField(old, variant, field),
+      &mut context.*,
+    )
+  }
+
+  // A copy of `value`: a state is a variant, the states of its regions and its data.
+  fn copy<S: Machine<E, C, X>, E, C, X>(value: &S) -> S {
+    static for variant in Reflect.variants<S>() {
+      if Reflect.isVariant(value, variant) {
+        return S.[variant] {
+          static for field in Reflect.variantFields(variant) { [field]: Machines.fieldCopy(
+            chartOf<S, E, C, X>(),
+            variant,
+            field,
+            value,
+          ) },
+        }
+      }
+    }
+    Intrinsic.trap("a union value is one of its variants")
+  }
+
+  // A region is copied as a state. Any other field is data, and data is `Copy`.
+  fn fieldCopy<S, V, E, C, X>(
+    static chart: Chart<S, E, C, X>,
+    static variant: Intrinsic.Variant<S>,
+    static field: Intrinsic.Field<S, V>,
+    owner: &S,
+  ) -> V {
+    static if Chart.isRegion(chart, Reflect.fieldLabel(field)) {
+      return Machines.regionCopy<V, E, C, X>(Reflect.borrowVariantField(owner, variant, field))
+    } else {
+      return Machines.dataCopy<V>(Reflect.borrowVariantField(owner, variant, field))
+    }
+  }
+
+  fn regionCopy<V: Machine<E, C, X>, E, C, X>(region: &V) -> V {
+    return Machines.copy<V, E, C, X>(region)
+  }
+
+  fn dataCopy<V: Copy>(data: &V) -> V {
+    return data.*
+  }
+
+  fn keep<S, C>(context: &mut C, static field: Intrinsic.Field<C, History<S>>, value: S) -> () {
+    let history = Reflect.borrowFieldMut(&mut context.*, field)
+    history.last = Option<S>.Some { value: move value }
+    return ()
+  }
+
+  fn recall<S, C>(context: &mut C, static field: Intrinsic.Field<C, History<S>>) -> Option<S> {
+    let history = Reflect.borrowFieldMut(&mut context.*, field)
+    return history.take()
+  }
+
+  // The value a transition enters: the remembered one for a transition to the history of a
+  // state that has one, `fallback` otherwise.
+  fn entryOf<S: Machine<E, C, X>, E, C, X>(
+    static history: bool,
+    fallback: S,
+    context: &mut C,
+  ) -> S {
+    let static chart = chartOf<S, E, C, X>()
+    static if history {
+      static for to in Reflect.variants<S>() {
+        static for item in chart.histories {
+          static if item.state == Reflect.variantLabel(to) {
+            if Reflect.isVariant(&fallback, to) {
+              static for field in Reflect.fields<C>() {
+                static if Reflect.fieldLabel(field) == item.field {
+                  if let Option.Some { value } = Machines.recall<S, C>(&mut context.*, field) {
+                    // A restored snapshot can hold anything in the field: only the state it is
+                    // the history of comes back.
+                    if Reflect.isVariant(&value, to) {
+                      static if item.deep {
+                        return move value
+                      }
+                      return Machines.shallow<S, E, C, X>(&value, to)
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    return move fallback
+  }
+
+  // `value` with each region at the state it has, and the regions below those at their start.
+  fn shallow<S: Machine<E, C, X>, E, C, X>(value: &S, static variant: Intrinsic.Variant<S>) -> S {
+    return S.[variant] {
+      static for field in Reflect.variantFields(variant) { [field]: Machines.fieldShallow(
+        chartOf<S, E, C, X>(),
+        variant,
+        field,
+        value,
+      ) },
+    }
+  }
+
+  // A region comes back at the state it has, with the regions below it at their start. Any
+  // other field is data and comes back as it is.
+  fn fieldShallow<S, V, E, C, X>(
+    static chart: Chart<S, E, C, X>,
+    static variant: Intrinsic.Variant<S>,
+    static field: Intrinsic.Field<S, V>,
+    owner: &S,
+  ) -> V {
+    static if Chart.isRegion(chart, Reflect.fieldLabel(field)) {
+      return Machines.regionShallow<V, E, C, X>(Reflect.borrowVariantField(owner, variant, field))
+    } else {
+      return Machines.dataCopy<V>(Reflect.borrowVariantField(owner, variant, field))
+    }
+  }
+
+  fn regionShallow<V: Machine<E, C, X>, E, C, X>(region: &V) -> V {
+    static for inner in Reflect.variants<V>() {
+      if Reflect.isVariant(region, inner) {
+        return V.[inner] {
+          static for field in Reflect.variantFields(inner) { [field]: Machines.fieldReset(
+            chartOf<V, E, C, X>(),
+            inner,
+            field,
+            region,
+          ) },
+        }
+      }
+    }
+    Intrinsic.trap("a union value is one of its variants")
+  }
+
+  // A region starts again. Any other field is data and stays as it is.
+  fn fieldReset<S, V, E, C, X>(
+    static chart: Chart<S, E, C, X>,
+    static variant: Intrinsic.Variant<S>,
+    static field: Intrinsic.Field<S, V>,
+    owner: &S,
+  ) -> V {
+    static if Chart.isRegion(chart, Reflect.fieldLabel(field)) {
+      return Machines.regionStart<V, E, C, X>()
+    } else {
+      return Machines.dataCopy<V>(Reflect.borrowVariantField(owner, variant, field))
+    }
+  }
+
+  fn regionStart<V: Machine<E, C, X>, E, C, X>() -> V {
+    return Machines.start<V, E, C, X>()
+  }
+
+  /// Offers `event` to `state`, deepest states first, and returns whether a state handled it.
+  ///
+  /// # Details
+  /// The step has two passes, as an xstate microstep does. The first one picks, in every
+  /// active state, the declared transition the event takes, so every guard sees the context
+  /// as it was before the event. The second one takes them, deepest states first, with their
+  /// exit and entry functions. `Machine.handle` runs in the second pass, before the declared
+  /// transitions of its state, so it sees what the states below it and the regions before it
+  /// changed. A final state takes no events.
+  pub effect fn dispatch<S: Machine<E, C, X>, E, C, X>(
+    state: &mut S,
+    context: &mut C,
+    event: &E,
+    enq: &mut Enqueue<E, X>,
+  ) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut choices = List<u32>.make()
+    run Machines.select<S, E, C, X>(&state.*, &context.*, event, &mut choices)
+    let mut cursor: usize = 0
+    return run Machines.dispatchAt<S, E, C, X>(
+      Reflect.typeName<S>(),
+      &mut state.*,
+      &mut context.*,
+      event,
+      &mut enq.*,
+      &choices,
+      &mut cursor,
+    )
+  }
+
+  // Appends, for `state` and then for every region below it, the position plus one of the
+  // declared transition the event takes there, or 0 when there is none. A final state takes
+  // nothing and its regions are not visited.
+  effect fn select<S: Machine<E, C, X>, E, C, X>(
+    state: &S,
+    context: &C,
+    event: &E,
+    choices: &mut List<u32>,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let static chart = chartOf<S, E, C, X>()
+    if Machines.isFinal<S, E, C, X>(state) {
+      return run List<u32>.append(&mut choices.*, 0)
+    }
+    let mut choice: u32 = 0
+    static for from in Reflect.variants<S>() {
+      if Reflect.isVariant(state, from) {
+        // Transitions that name the event come first, in the order they were declared.
+        let mut position: u32 = 0
+        static for edge in chart.edges {
+          position = position + 1
+          static if edge.state == Reflect.variantLabel(from) {
+            static for on in Reflect.variants<E>() {
+              static if edge.event == Reflect.variantLabel(on) {
+                if choice == 0 && Reflect.isVariant(event, on)
+                  && Machines.allows<S, C, E>(edge, context, event) {
+                  choice = position
+                }
+              }
+            }
+          }
+        }
+
+        // Then the transitions that any event takes.
+        position = 0
+        static for edge in chart.edges {
+          position = position + 1
+          static if edge.state == Reflect.variantLabel(from) {
+            static if edge.event == ANY {
+              if choice == 0 && Machines.allows<S, C, E>(edge, context, event) {
+                choice = position
+              }
+            }
+          }
+        }
+      }
+    }
+    run List<u32>.append(&mut choices.*, choice)
+    static for variant in Reflect.variants<S>() {
+      if Reflect.isVariant(state, variant) {
+        static for field in Reflect.variantFields(variant) {
+          static if Chart.isRegion(chart, Reflect.fieldLabel(field)) {
+            run Machines.selectRegion(chart, variant, field, state, context, event, &mut choices.*)
+          }
+        }
+      }
+    }
+    return ()
+  }
+
+  effect fn selectRegion<S, V: Machine<E, C, X>, E, C, X>(
+    static chart: Chart<S, E, C, X>,
+    static variant: Intrinsic.Variant<S>,
+    static field: Intrinsic.Field<S, V>,
+    owner: &S,
+    context: &C,
+    event: &E,
+    choices: &mut List<u32>,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run Machines.select<V, E, C, X>(
+      Reflect.borrowVariantField(owner, variant, field),
+      context,
+      event,
+      &mut choices.*,
+    )
+  }
+
+  // The second pass of `dispatch`. `cursor` walks `choices` in the order `select` wrote them.
+  effect fn dispatchAt<S: Machine<E, C, X>, E, C, X>(
+    static path: string<'static>,
+    state: &mut S,
+    context: &mut C,
+    event: &E,
+    enq: &mut Enqueue<E, X>,
+    choices: &List<u32>,
+    cursor: &mut usize,
+  ) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let static chart = chartOf<S, E, C, X>()
+    let choice = choices.get(cursor.*)
+    cursor.* = cursor.* + 1
+    if Machines.isFinal<S, E, C, X>(&state.*) {
+      return false
+    }
+    let mut handled = false
+    static for variant in Reflect.variants<S>() {
+      if Reflect.isVariant(&state.*, variant) {
+        static for field in Reflect.variantFields(variant) {
+          static if Chart.isRegion(chart, Reflect.fieldLabel(field)) {
+            let region = Reflect.borrowVariantFieldMut(&mut state.*, variant, field)
+            if run Machines.dispatchAt(
+              regionPath(path, Reflect.variantLabel(variant), Reflect.fieldLabel(field)),
+              &mut region,
+              &mut context.*,
+              event,
+              &mut enq.*,
+              choices,
+              &mut cursor.*,
+            ) {
+              handled = true
+            }
+          }
+        }
+      }
+    }
+    if handled {
+      return true
+    }
+
+    let next = run Machine.handle(&state.*, &mut context.*, event, &mut enq.*)
+    match move next {
+      Next<S>.To { state: target } => {
+        run Machines.transit(path, &mut state.*, move target, &mut context.*, &mut enq.*)
+        return true
+      }
+      Next<S>.Stay => {
+        return true
+      }
+      Next<S>.Pass => {}
+    }
+
+    if choice == 0 {
+      return false
+    }
+    static for from in Reflect.variants<S>() {
+      if Reflect.isVariant(&state.*, from) {
+        let mut position: u32 = 0
+        static for edge in chart.edges {
+          position = position + 1
+          static if edge.state == Reflect.variantLabel(from) {
+            if position == choice {
+              run Machines.take<S, E, C, X>(path, edge, &mut state.*, &mut context.*, &mut enq.*)
+              return true
+            }
+          }
+        }
+      }
+    }
+    return false
+  }
+
+  // Moves `state` to the target of `edge`. An edge without a target changes nothing.
+  effect fn take<S: Machine<E, C, X>, E, C, X>(
+    static path: string<'static>,
+    static edge: Edge<S>,
+    state: &mut S,
+    context: &mut C,
+    enq: &mut Enqueue<E, X>,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    static for value in edge.target {
+      let target = Machines.entryOf<S, E, C, X>(edge.history, value, &mut context.*)
+      run Machines.transit<S, E, C, X>(path, &mut state.*, move target, &mut context.*, &mut enq.*)
+    }
+    return ()
+  }
+
+  /// Returns whether an active state of `state`, at any depth, has the tag `tag`.
+  pub fn hasTag<S: Machine<E, C, X>, E, C, X>(state: &S, tag: string) -> bool {
+    let static chart = chartOf<S, E, C, X>()
+    static for variant in Reflect.variants<S>() {
+      if Reflect.isVariant(state, variant) {
+        static for item in chart.tags {
+          static if item.state == Reflect.variantLabel(variant) {
+            if item.tag == tag {
+              return true
+            }
+          }
+        }
+        static for field in Reflect.variantFields(variant) {
+          static if Chart.isRegion(chart, Reflect.fieldLabel(field)) {
+            if Machines.hasTag(Reflect.borrowVariantField(state, variant, field), tag) {
+              return true
+            }
+          }
+        }
+      }
+    }
+    return false
+  }
+
+  /// Returns the meta data under `key` of the active state of `state`. When that state has
+  /// none, returns the first one its regions have, in the order of their fields.
+  pub fn meta<S: Machine<E, C, X>, E, C, X>(state: &S, key: string) -> Option<string<'static>> {
+    let static chart = chartOf<S, E, C, X>()
+    static for variant in Reflect.variants<S>() {
+      if Reflect.isVariant(state, variant) {
+        static for item in chart.metas {
+          static if item.state == Reflect.variantLabel(variant) {
+            if item.key == key {
+              return Option<string<'static>>.Some { value: item.value }
+            }
+          }
+        }
+        static for field in Reflect.variantFields(variant) {
+          static if Chart.isRegion(chart, Reflect.fieldLabel(field)) {
+            match Machines.meta(Reflect.borrowVariantField(state, variant, field), key) {
+              Option.Some { value } => {
+                return Option<string<'static>>.Some { value: value }
+              }
+              Option.None => {}
+            }
+          }
+        }
+      }
+    }
+    return Option<string<'static>>.None
+  }
+
+  /// Takes one enabled eventless transition, and returns whether it took one.
+  ///
+  /// # Details
+  /// The regions of the active state come first, deepest first, then the state's own
+  /// transitions: its [`Chart.always`] rows, then its [`Chart.onDone`] rows, which are taken
+  /// when every region of the state is in a final state.
+  pub effect fn settle<S: Machine<E, C, X>, E, C, X>(
+    state: &mut S,
+    context: &mut C,
+    enq: &mut Enqueue<E, X>,
+  ) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run Machines.settleAt<S, E, C, X>(
+      Reflect.typeName<S>(),
+      &mut state.*,
+      &mut context.*,
+      &mut enq.*,
+    )
+  }
+
+  effect fn settleAt<S: Machine<E, C, X>, E, C, X>(
+    static path: string<'static>,
+    state: &mut S,
+    context: &mut C,
+    enq: &mut Enqueue<E, X>,
+  ) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let static chart = chartOf<S, E, C, X>()
+    static for variant in Reflect.variants<S>() {
+      if Reflect.isVariant(&state.*, variant) {
+        static for field in Reflect.variantFields(variant) {
+          static if Chart.isRegion(chart, Reflect.fieldLabel(field)) {
+            let region = Reflect.borrowVariantFieldMut(&mut state.*, variant, field)
+            if run Machines.settleAt(
+              regionPath(path, Reflect.variantLabel(variant), Reflect.fieldLabel(field)),
+              &mut region,
+              &mut context.*,
+              &mut enq.*,
+            ) {
+              return true
+            }
+          }
+        }
+      }
+    }
+    static for from in Reflect.variants<S>() {
+      if Reflect.isVariant(&state.*, from) {
+        static for always in chart.eventless {
+          static if always.state == Reflect.variantLabel(from) {
+            if Machines.holds<S, C>(always, &context.*) {
+              let target: S = always.target
+              run Machines.transit<S, E, C, X>(
+                path,
+                &mut state.*,
+                move target,
+                &mut context.*,
+                &mut enq.*,
+              )
+              return true
+            }
+          }
+        }
+        static for done in chart.dones {
+          static if done.state == Reflect.variantLabel(from) {
+            if Machines.regionsDone<S, E, C, X>(&state.*, from)
+              && Machines.holds<S, C>(done, &context.*) {
+              let target: S = done.target
+              run Machines.transit<S, E, C, X>(
+                path,
+                &mut state.*,
+                move target,
+                &mut context.*,
+                &mut enq.*,
+              )
+              return true
+            }
+          }
+        }
+      }
+    }
+    return false
+  }
+
+  // Whether `state` has regions and every one of them is in a final state of its chart.
+  fn regionsDone<S: Machine<E, C, X>, E, C, X>(
+    state: &S,
+    static variant: Intrinsic.Variant<S>,
+  ) -> bool {
+    let static chart = chartOf<S, E, C, X>()
+    let mut any = false
+    static for field in Reflect.variantFields(variant) {
+      static if Chart.isRegion(chart, Reflect.fieldLabel(field)) {
+        any = true
+        if !Machines.regionFinal(chart, variant, field, state) {
+          return false
+        }
+      }
+    }
+    return any
+  }
+
+  fn regionFinal<S, V: Machine<E, C, X>, E, C, X>(
+    static chart: Chart<S, E, C, X>,
+    static variant: Intrinsic.Variant<S>,
+    static field: Intrinsic.Field<S, V>,
+    owner: &S,
+  ) -> bool {
+    return Machines.isFinal<V, E, C, X>(Reflect.borrowVariantField(owner, variant, field))
+  }
+
+  /// Takes the delayed transition `index` of the chart at `path`, if its state is active, and
+  /// returns whether it was taken. `path` is the one the timer was started with.
+  pub effect fn elapse<S: Machine<E, C, X>, E, C, X>(
+    state: &mut S,
+    context: &mut C,
+    path: string,
+    index: u32,
+    enq: &mut Enqueue<E, X>,
+  ) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run Machines.elapseAt<S, E, C, X>(
+      Reflect.typeName<S>(),
+      &mut state.*,
+      &mut context.*,
+      path,
+      index,
+      &mut enq.*,
+    )
+  }
+
+  effect fn elapseAt<S: Machine<E, C, X>, E, C, X>(
+    static at: string<'static>,
+    state: &mut S,
+    context: &mut C,
+    path: string,
+    index: u32,
+    enq: &mut Enqueue<E, X>,
+  ) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let static chart = chartOf<S, E, C, X>()
+    if path == at {
+      static for from in Reflect.variants<S>() {
+        if Reflect.isVariant(&state.*, from) {
+          static for delay in chart.delays {
+            static if delay.state == Reflect.variantLabel(from) {
+              if delay.index == index {
+                let target: S = delay.target
+                run Machines.transit<S, E, C, X>(
+                  at,
+                  &mut state.*,
+                  move target,
+                  &mut context.*,
+                  &mut enq.*,
+                )
+                return true
+              }
+            }
+          }
+        }
+      }
+      return false
+    }
+    static for variant in Reflect.variants<S>() {
+      if Reflect.isVariant(&state.*, variant) {
+        static for field in Reflect.variantFields(variant) {
+          static if Chart.isRegion(chart, Reflect.fieldLabel(field)) {
+            let region = Reflect.borrowVariantFieldMut(&mut state.*, variant, field)
+            if run Machines.elapseAt(
+              regionPath(at, Reflect.variantLabel(variant), Reflect.fieldLabel(field)),
+              &mut region,
+              &mut context.*,
+              path,
+              index,
+              &mut enq.*,
+            ) {
+              return true
+            }
+          }
+        }
+      }
+    }
+    return false
+  }
+
+  /// Returns whether `state` is a final state of its chart.
+  pub fn isFinal<S: Machine<E, C, X>, E, C, X>(state: &S) -> bool {
+    let static chart = chartOf<S, E, C, X>()
+    static for variant in Reflect.variants<S>() {
+      static if Chart.isFinal(chart, Reflect.variantLabel(variant)) {
+        if Reflect.isVariant(state, variant) {
+          return true
+        }
+      }
+    }
+    return false
+  }
+
+  fn holds<S, C>(static always: Always<S>, context: &C) -> bool {
+    static for condition in always.condition {
+      return conditionHolds<C>(condition, context)
+    }
+    return true
+  }
+
+  fn allows<S, C, E>(static edge: Edge<S>, context: &C, event: &E) -> bool {
+    static for guard in edge.guard {
+      return guardHolds<C, E>(guard, context, event)
+    }
+    return true
+  }
+}
+
+// The path of the region in the field `field` of the variant `variant` of the chart at `path`.
+static fn regionPath(
+  path: string<'static>,
+  variant: string<'static>,
+  field: string<'static>,
+) -> string<'static> {
+  return StaticText.concat(
+    StaticText.concat(StaticText.concat(StaticText.concat(path, "."), variant), "."),
+    field,
+  )
+}
