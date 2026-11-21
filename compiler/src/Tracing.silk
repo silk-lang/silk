@@ -114,12 +114,12 @@ static if supported {
   import silk.platform.native.file { NativeFile, NativeFileError, OPEN_APPEND, OPEN_CREATE, OPEN_WRITE_ONLY }
   import silk.trace { SpanContext, SpanGuard, SpanKind, Trace, Tracer }
   import silk.trace.log { OtelLogger }
-  import silk.trace.otlp { Batch, Resource, encode }
+  import silk.trace.otlp { Batch, Resource, encodeInto }
   import silk.trace.record { Config, Recorder, Span }
   import silk.trace.signals { LogRecord }
 
   // How many spans or logs one line of the file holds.
-  const batch: usize = 32
+  const batch: usize = 128
 
   // How many calls of `pump` pass between two writes.
   const pumped: u32 = 64
@@ -142,6 +142,8 @@ static if supported {
     wanted: List<u64>,
     wantedCount: usize,
     spans: List<Span>,
+    // The line being written, kept so that encoding a line needs no allocation.
+    line: Bytes,
     logs: List<LogRecord>,
     // Whether a write failed: the file is then left alone.
     broken: bool,
@@ -251,6 +253,7 @@ static if supported {
       wanted: List<u64>.make(),
       wantedCount: usize.ZERO,
       spans: List<Span>.make(),
+      line: Bytes.make(),
       logs: List<LogRecord>.make(),
       broken: false,
       parent: Option<SpanContext>.none(),
@@ -454,13 +457,10 @@ static if supported {
     }
   }
 
-  effect fn encoded(bytes: Result<Bytes, WriterError | OutOfMemoryError>) -> Bytes {
-    return match move bytes {
-      Result<Bytes, WriterError | OutOfMemoryError>.Success { value } => move value
-      Result<Bytes, WriterError | OutOfMemoryError>.Failure { error } => {
-        drop error
-        return Bytes.make()
-      }
+  effect fn encoded(result: Result<(), WriterError | OutOfMemoryError>, line: &mut Bytes) -> () {
+    if let Result<(), WriterError | OutOfMemoryError>.Failure { error } = move result {
+      drop error
+      Bytes.clear(&mut line.*)
     }
   }
 
@@ -476,15 +476,33 @@ static if supported {
 
   // Appends one request to the file with one write, so that the lines of the processes that
   // share the file never mix.
-  effect fn writeLine(state: &mut State, line: Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
-    let mut text = move line
-    if Bytes.length(&text) == usize.ZERO || state.broken {
+  effect fn writeLine(state: &mut State) -> () ! OutOfMemoryError ? &mut Allocator {
+    if Bytes.length(&state.line) == usize.ZERO || state.broken {
       return ()
     }
-    run Bytes.append(&mut text, b"\n")
+    run Bytes.append(&mut state.line, b"\n")
     let mut error = 0
-    if !run NativeDescriptor.writeAll(state.descriptor, Bytes.asSlice(&text), &mut error) {
+    if !run NativeDescriptor.writeAll(state.descriptor, Bytes.asSlice(&state.line), &mut error) {
       state.broken = true
+    }
+  }
+
+  // Writes `values` as lines of at most `batch` spans.
+  effect fn writeSpanSlice(state: &mut State, values: &[Span]) -> () ! OutOfMemoryError ? &mut Allocator {
+    let resource = identity(state.recorder.get())
+    let mut start = usize.ZERO
+    while start < values.length {
+      let mut count = values.length - start
+      if count > batch {
+        count = batch
+      }
+      run encoded(
+        run Effect.result(encodeInto(&resource, &Batch.Spans { values: Slice.view<Span>(values, start, count) },
+          &mut state.line)),
+        &mut state.line,
+      )
+      run writeLine(&mut state.*)
+      start = start + count
     }
   }
 
@@ -492,12 +510,10 @@ static if supported {
     if List<Span>.length(&state.spans) == usize.ZERO {
       return ()
     }
-    let resource = identity(state.recorder.get())
-    let line = run encoded(
-      run Effect.result(encode(&resource, &Batch.Spans { values: List<Span>.asSlice(&state.spans) })),
-    )
+    let spans = Intrinsic.replace(state.spans, List<Span>.make())
+    run writeSpanSlice(&mut state.*, List<Span>.asSlice(&spans))
+    state.spans = move spans
     List<Span>.clear(&mut state.spans)
-    return run writeLine(&mut state.*, move line)
   }
 
   effect fn writeLogs(state: &mut State) -> () ! OutOfMemoryError ? &mut Allocator {
@@ -505,11 +521,13 @@ static if supported {
       return ()
     }
     let resource = identity(state.recorder.get())
-    let line = run encoded(
-      run Effect.result(encode(&resource, &Batch.Logs { values: List<LogRecord>.asSlice(&state.logs) })),
+    run encoded(
+      run Effect.result(encodeInto(&resource, &Batch.Logs { values: List<LogRecord>.asSlice(&state.logs) },
+        &mut state.line)),
+      &mut state.line,
     )
     List<LogRecord>.clear(&mut state.logs)
-    return run writeLine(&mut state.*, move line)
+    return run writeLine(&mut state.*)
   }
 
   // Takes what the recorder has finished and writes what the file keeps of it.
@@ -520,29 +538,31 @@ static if supported {
       run List<Span>.reserveExact(&mut state.spans, batch)
       run List<LogRecord>.reserveExact(&mut state.logs, batch)
     }
-    List<Span>.clear(&mut state.taken)
     List<bool>.clear(&mut state.kept)
+    // `taken` keeps its records from drain to drain, so a span is copied into one in place, and
+    // only what it holds.
+    let mut count = usize.ZERO
     let mut remaining = recorder.get().finishedCapacity()
     while remaining != usize.ZERO {
-      match recorder.get().takeSpan() {
-        Option<Span>.Some { value } => {
-          remaining = remaining - usize.ONE
-          if !(state.abandoned && value.context.span == state.root.context.span) {
-            run List<Span>.append(&mut state.taken, value)
-          }
+      if count == List<Span>.length(&state.taken) {
+        run List<Span>.append(&mut state.taken, Span.empty())
+      }
+      let slot = &mut List<Span>.asMutSlice(&mut state.taken)[count]
+      if recorder.get().takeSpanInto(&mut slot.*) {
+        remaining = remaining - usize.ONE
+        if !(state.abandoned && slot.context.span == state.root.context.span) {
+          count = count + usize.ONE
         }
-        Option<Span>.None => {
-          remaining = usize.ZERO
-        }
+      } else {
+        remaining = usize.ZERO
       }
     }
     // A span closes after everything below it, so what a drain takes holds no span whose
     // children an earlier drain did not. Within one drain the order is the recorder's pages',
     // so the parents are settled over the whole of it.
-    let count = List<Span>.length(&state.taken)
     let filtering = state.queries && state.minimum != 0
     let mut at = usize.ZERO
-    while at < count {
+    while filtering && at < count {
       let span = &List<Span>.asSlice(&state.taken)[at]
       let kept = keeps(span, state.minimum)
       let parent = span.parent.span
@@ -569,18 +589,26 @@ static if supported {
         at = at + usize.ONE
       }
     }
-    at = usize.ZERO
-    while at < count {
-      if List<bool>.get(&state.kept, at) {
-        let span = List<Span>.asSlice(&state.taken)[at]
-        drop List<Span>.appendWithinCapacity(&mut state.spans, span)
-        if List<Span>.length(&state.spans) == batch {
-          run writeSpans(&mut state.*)
+    // The kept spans move to the front of what was taken, in order, and are written from there.
+    let mut held = usize.ZERO
+    if filtering {
+      at = usize.ZERO
+      while at < count {
+        if List<bool>.get(&state.kept, at) {
+          if held != at {
+            let taken = List<Span>.asMutSlice(&mut state.taken)
+            taken[held] = taken[at]
+          }
+          held = held + usize.ONE
         }
+        at = at + usize.ONE
       }
-      at = at + usize.ONE
+    } else {
+      held = count
     }
-    run writeSpans(&mut state.*)
+    let taken = Intrinsic.replace(state.taken, List<Span>.make())
+    run writeSpanSlice(&mut state.*, Slice.view<Span>(List<Span>.asSlice(&taken), usize.ZERO, held))
+    state.taken = move taken
     remaining = recorder.get().signals.logCapacity()
     while remaining != usize.ZERO {
       match recorder.get().signals.takeLog() {

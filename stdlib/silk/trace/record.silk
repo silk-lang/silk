@@ -9,6 +9,7 @@ import silk.core.option { Option }
 import silk.core.ownership { Copy }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.mem.pointer { Pointer }
+import silk.num.f64
 import silk.num.i64
 import silk.num.u8
 import silk.num.u32
@@ -35,7 +36,8 @@ pub struct Config {
   pub serviceVersion: string<'static>,
   /// Fraction of new roots to record. Child spans inherit the parent’s sampled bit.
   pub sampleRatio: f64,
-  /// Maximum number of sampled spans simultaneously open in the recorder.
+  /// Number of span records beyond the finished-span buffers. A record is held from the span's
+  /// open until a drain takes it, so open spans and undrained finished spans share the pool.
   pub openCapacity: usize,
   /// Number of preallocated producer pages in each signal buffer pool.
   pub threadCapacity: usize,
@@ -122,8 +124,38 @@ impl Span {
   }
 }
 
-struct OpenSpan { span: Span, previous: TraceContext, table: usize }
+// What recording one span touches, kept together so that a span costs a few cache lines. The
+// attributes, events and links live apart in the record's `SpanBody`, which only spans that
+// have them touch beyond the attribute count.
+struct OpenSpan {
+  context: SpanContext,
+  parent: SpanContext,
+  previous: TraceContext,
+  table: usize,
+  name: string<'static>,
+  kind: SpanKind,
+  place: Place,
+  start: u64,
+  end: u64,
+  error: bool,
+  cancelled: bool,
+  errorType: string<'static>,
+  eventCount: usize,
+  droppedEvents: u64,
+  linkCount: usize,
+  droppedLinks: u64,
+}
 impl Copy for OpenSpan {}
+impl OpenSpan {
+  fn canAppendEvent(self: &mut Self) -> bool {
+    if self.eventCount < 4 { return true }
+    self.droppedEvents = self.droppedEvents + 1
+    return false
+  }
+}
+
+struct SpanBody { attributes: Attributes, events: [SpanEvent; 4], links: [SpanContext; 4] }
+impl Copy for SpanBody {}
 
 // These hints are indexes, never pointers into a potentially destroyed recorder.
 struct Cursor { owner: u64, generator: u64, write: usize }
@@ -147,6 +179,79 @@ fn monotonicNs() -> u64 {
   let now = run NativeClock.now()
   return i64.toU64(now.seconds()) * 1000000000 + u32.toU64(now.subsecondNanoseconds())
 }
+
+// Span times come from the processor's tick counter where it runs at a constant rate shared by
+// every core, the way profilers time zones: reading it costs a few cycles, a clock call costs
+// dozens. The rate is measured against the monotonic clock once per process, and a copy made
+// with fork inherits it. Elsewhere the ticks are the monotonic clock's nanoseconds.
+static if Intrinsic.targetArchitecture() == "x86_64" && ((Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu") || Intrinsic.targetOperatingSystem() == "darwin") {
+  @inlineAlways
+  fn ticks() -> u64 {
+    return unsafe Intrinsic.assembly<u64>("rdtsc\nshlq $$32, %rdx\norq %rdx, %rax", "={rax}", "rdx,flags", "none", true, false, ())
+  }
+  // CPUID leaf 0x80000007 reports in EDX bit 8 a tick counter that runs at a constant rate in
+  // every power state; leaf 0x80000000 gives the highest extended leaf.
+  fn steadyTicks() -> bool {
+    let highest = unsafe Intrinsic.assembly<u64>("movl $$0x80000000, %eax\nxorl %ecx, %ecx\nmovq %rbx, %rsi\ncpuid\nmovq %rsi, %rbx",
+      "={rax}", "rcx,rdx,rsi,flags", "none", true, false, ())
+    if u64.bitAnd(highest, 4294967295) < 2147483655 { return false }
+    let features = unsafe Intrinsic.assembly<u64>("movl $$0x80000007, %eax\nxorl %ecx, %ecx\nmovq %rbx, %rsi\ncpuid\nmovq %rsi, %rbx",
+      "={rdx}", "rax,rcx,rsi,flags", "none", true, false, ())
+    return u64.bitAnd(features, 256) != 0
+  }
+  fn fixedRate() -> f64 { return 0.0 }
+} else {
+static if Intrinsic.targetArchitecture() == "aarch64" && ((Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu") || Intrinsic.targetOperatingSystem() == "darwin") {
+  @inlineAlways
+  fn ticks() -> u64 {
+    return unsafe Intrinsic.assembly<u64>("mrs $0, cntvct_el0", "=r", "", "none", true, false, ())
+  }
+  fn steadyTicks() -> bool { return true }
+  // The generic timer states its frequency, so nothing needs measuring.
+  fn fixedRate() -> f64 {
+    let frequency = unsafe Intrinsic.assembly<u64>("mrs $0, cntfrq_el0", "=r", "", "none", true, false, ())
+    if frequency == 0 { return 0.0 }
+    return 1000000000.0 / u64.toF64(frequency)
+  }
+} else {
+  @inlineAlways
+  fn ticks() -> u64 { return monotonicNs() }
+  fn steadyTicks() -> bool { return false }
+  fn fixedRate() -> f64 { return 0.0 }
+}
+}
+
+// The process's tick rate: nanoseconds per tick, or zero before it is known. A rate of one with
+// `clock` set means the ticks are the monotonic clock itself.
+struct TickRate { nanoseconds: f64, clock: bool, known: bool }
+impl Copy for TickRate {}
+
+fn tickRate() -> TickRate {
+  let slot = Intrinsic.processSlot<TickRate>()
+  let saved = unsafe Pointer.read(slot)
+  if saved.known { return saved }
+  let mut rate = TickRate {nanoseconds: 1.0, clock: true, known: true}
+  if steadyTicks() {
+    let fixed = fixedRate()
+    if fixed > 0.0 {
+      rate = TickRate {nanoseconds: fixed, clock: false, known: true}
+    } else {
+      // Two millisecond-long windows; the longer the window, the less the clock calls' own
+      // time weighs. The counter must have moved forward for the rate to be believed.
+      let startClock = monotonicNs()
+      let startTicks = ticks()
+      let mut clock = monotonicNs()
+      while clock - startClock < 2000000 { clock = monotonicNs() }
+      let endTicks = ticks()
+      if endTicks > startTicks {
+        rate = TickRate {nanoseconds: u64.toF64(clock - startClock) / u64.toF64(endTicks - startTicks), clock: false,
+          known: true}
+      }
+    }
+  }
+  unsafe Pointer.write(slot, rate)
+  return rate
+}
 fn sameRecord(first: TraceContext, second: TraceContext) -> bool {
   return first.owner == second.owner && first.span == second.span && first.record == second.record
 }
@@ -162,10 +267,17 @@ pub struct Recorder {
   seed: u64,
   baseWall: u64,
   baseMono: u64,
+  baseTicks: u64,
+  rate: f64,
+  // An empty span to copy, as building one writes every attribute, event and link.
+  blank: Span,
   // Allocation-backed atomic words for dropped spans, next thread seed, and drain cursor.
   counters: Storage<u64>,
+  // Each record is written in place from open to drain; producers hand finished record numbers
+  // to the drain, so no span is copied on the recording path.
   open: Pool<OpenSpan>,
-  ready: Buffers<Span>,
+  bodies: Storage<SpanBody>,
+  ready: Buffers<u32>,
   /// Log buffers and metric instruments shared by this recorder’s providers.
   pub signals: SignalState,
 }
@@ -178,6 +290,8 @@ impl Recorder {
     if config.threadCapacity != 0 && config.bufferCapacity > usize.MAX / config.threadCapacity {
       fail OutOfMemoryError {}
     }
+    let finished = config.threadCapacity * config.bufferCapacity
+    if finished > 4294967295 || config.openCapacity > 4294967295 - finished { fail OutOfMemoryError {} }
     let static metrics = Intrinsic.ambientCount<Meter>() > 0
     let mut random = OsRandom.make()
     let fixed = run InsecureSeed.fromRandom() |> Effect.provideMut<Random>(&mut random)
@@ -190,10 +304,19 @@ impl Recorder {
         u32.toU64(wall.subsecondNanoseconds()))
     }
     let tag = unsafe Atomic.fetchAdd<u64>(Intrinsic.processSlot<u64>(), 1, MemoryOrder.Relaxed) + 1
-    let initial = OpenSpan {span: Span.empty(), previous: TraceContext.empty(), table: 0}
-    return Recorder {config: config, tag: tag, seed: seed, baseWall: baseWall, baseMono: monotonicNs(),
-      counters: run Storage<u64>.make(3, 0), open: run Pool<OpenSpan>.make(config.openCapacity, initial),
-      ready: run Buffers<Span>.make(config.threadCapacity, config.bufferCapacity, Span.empty()), signals: run SignalState.make(config.threadCapacity, config.bufferCapacity, metrics)}
+    let rate = tickRate()
+    let baseMono = monotonicNs()
+    let baseTicks = if rate.clock { baseMono } else { ticks() }
+    let blank = Span.empty()
+    let initial = OpenSpan {context: blank.context, parent: blank.parent, previous: TraceContext.empty(), table: 0,
+      name: "", kind: SpanKind.Internal, place: blank.place, start: 0, end: 0, error: false, cancelled: false,
+      errorType: "", eventCount: 0, droppedEvents: 0, linkCount: 0, droppedLinks: 0}
+    let body = SpanBody {attributes: blank.attributes, events: blank.events, links: blank.links}
+    return Recorder {config: config, tag: tag, seed: seed, baseWall: baseWall, baseMono: baseMono,
+      baseTicks: baseTicks, rate: rate.nanoseconds, blank: blank,
+      counters: run Storage<u64>.make(3, 0), open: run Pool<OpenSpan>.make(config.openCapacity + finished, initial),
+      bodies: run Storage<SpanBody>.make(config.openCapacity + finished, body),
+      ready: run Buffers<u32>.make(config.threadCapacity, config.bufferCapacity, 0), signals: run SignalState.make(config.threadCapacity, config.bufferCapacity, metrics)}
   }
   /// Returns the OTel service name of this resource.
   pub fn serviceName(self: &Self) -> string<'static> { return self.config.serviceName }
@@ -201,7 +324,9 @@ impl Recorder {
   pub fn serviceVersion(self: &Self) -> string<'static> { return self.config.serviceVersion }
   /// Returns the current Unix nanoseconds on the recorder's monotonic time base.
   pub fn now(self: &Self) -> u64 {
-    return u64.saturatingAdd(self.baseWall, monotonicNs() - self.baseMono)
+    let current = ticks()
+    if current <= self.baseTicks { return self.baseWall }
+    return u64.saturatingAdd(self.baseWall, unsafe f64.toU64Unchecked(u64.toF64(current - self.baseTicks) * self.rate))
   }
   /// Returns the total number of spans lost to pool or buffer exhaustion or export failure.
   pub fn droppedSpans(self: &Self) -> u64 {
@@ -226,32 +351,84 @@ impl Recorder {
     return u64.toF64(u64.shiftRight(traceLow, 11)) < self.config.sampleRatio * 9007199254740992.0
   }
   fn active(self: &Self) -> TraceContext { return TraceContext.read() }
+  // A context names its open record by number plus one, zero for none.
   fn activeIndex(self: &Self, context: &TraceContext) -> usize {
-    if context.owner != self.tag || context.record == 0 { return self.open.length() }
-    return self.open.indexOf(context.record)
+    let count = self.open.length()
+    if context.owner != self.tag || context.record == 0 || context.record > usize.toU64(count) { return count }
+    return u64.toUsize(context.record - 1)
   }
   fn finish(self: &Self, cancelled: bool) -> () {
     let current = self.active()
     let index = self.activeIndex(&current)
     if index == self.open.length() { return () }
-    let opened = unsafe Pointer.read(unsafe self.open.at(index))
+    let end = self.now()
+    let mut token = ()
+    let opened = unsafe Pointer.borrowMut(&mut token, unsafe self.open.at(index))
     // A nested provide copies its parent's context and can even install this recorder
-    // again. Only the original table can return its record to the shared pool.
+    // again. Only the original table can hand its record to the drain.
     if opened.table != TraceContext.tableAddress() { return () }
-    let mut span = opened.span
-    span.end = self.now()
-    if cancelled { span.cancelled = true span.error = true }
+    opened.end = end
+    if cancelled { opened.cancelled = true opened.error = true }
     unsafe TraceContext.install(&opened.previous)
-    self.open.release(index)
     let mut local = self.threadCursor()
-    if !self.ready.append(&mut local.write, Pointer.address(cursor()), &span) {
+    if !self.ready.append(&mut local.write, Pointer.address(cursor()), &usize.toU32(index)) {
+      self.open.release(index)
       self.countDroppedSpans(1)
     }
     unsafe Pointer.write(cursor(), local)
   }
   /// Takes one finished span. When a producer is writing a slot, draining skips that slot.
   pub fn takeSpan(self: &Self) -> Option<Span> {
-    return unsafe self.ready.take(unsafe self.counters.at(2))
+    let mut span = self.blank
+    if self.takeSpanInto(&mut span) { return Option<Span>.some(span) }
+    return Option<Span>.none()
+  }
+
+  /// Takes one finished span into `span`, as [`takeSpan`] does, and returns whether there was
+  /// one. Only what the span holds is written: its attributes, events and links past their counts
+  /// keep what `span` held, so a drain that reuses one record copies no more than the span's
+  /// contents.
+  pub fn takeSpanInto(self: &Self, span: &mut Span) -> bool {
+    let index = match unsafe self.ready.take(unsafe self.counters.at(2)) {
+      Option<u32>.Some {value} => u32.toUsize(value)
+      Option<u32>.None => { return false }
+    }
+    let mut token = ()
+    let opened = unsafe Pointer.borrow(&token, unsafe self.open.at(index))
+    let body = unsafe Pointer.borrow(&token, unsafe self.bodies.at(index))
+    span.context = opened.context
+    span.parent = opened.parent
+    span.name = opened.name
+    span.kind = opened.kind
+    span.place = opened.place
+    span.start = opened.start
+    span.end = opened.end
+    span.error = opened.error
+    span.cancelled = opened.cancelled
+    span.errorType = opened.errorType
+    let mut at: usize = 0
+    while at < body.attributes.count {
+      span.attributes.items[at] = body.attributes.items[at]
+      at = at + 1
+    }
+    span.attributes.count = body.attributes.count
+    span.attributes.dropped = body.attributes.dropped
+    at = 0
+    while at < opened.eventCount {
+      span.events[at] = body.events[at]
+      at = at + 1
+    }
+    span.eventCount = opened.eventCount
+    span.droppedEvents = opened.droppedEvents
+    at = 0
+    while at < opened.linkCount {
+      span.links[at] = body.links[at]
+      at = at + 1
+    }
+    span.linkCount = opened.linkCount
+    span.droppedLinks = opened.droppedLinks
+    self.open.release(index)
+    return true
   }
 }
 impl Meter for Recorder {
@@ -295,22 +472,37 @@ impl Tracer for Recorder {
     if sampled { index = self.open.acquire() }
     unsafe Pointer.write(cursor(), local)
     if index != self.open.length() {
-      let mut span = Span.empty()
-      span.context = context
-      span.parent = parent
-      span.kind = kind
-      span.name = name
-      span.place = place
-      span.start = self.now()
-      span.attributes = Attributes.make(args)
-      let address = unsafe self.open.at(index)
+      // The claimed record is written in place; only its counts are reset, so earlier
+      // contents past them are never read.
+      let mut token = ()
+      let opened = unsafe Pointer.borrowMut(&mut token, unsafe self.open.at(index))
+      opened.previous = previous
+      opened.table = table
+      opened.context = context
+      opened.parent = parent
+      opened.name = name
+      opened.kind = kind
+      opened.place = place
+      opened.end = 0
+      opened.error = false
+      opened.cancelled = false
+      opened.errorType = ""
+      opened.eventCount = 0
+      opened.droppedEvents = 0
+      opened.linkCount = 0
+      opened.droppedLinks = 0
+      let mut cold = ()
+      let body = unsafe Pointer.borrowMut(&mut cold, unsafe self.bodies.at(index))
+      body.attributes.count = 0
+      body.attributes.dropped = 0
+      body.attributes.fields(args)
       // A user Display implementation can explicitly invoke a recorder. The saved
       // parent must still be live when it becomes this guard's restoration target.
       if !sameRecord(previous, self.active()) {
         Intrinsic.trap("formatting span attributes changed the enclosing span")
       }
-      unsafe Pointer.write(address, OpenSpan {span: span, previous: previous, table: table})
-      region.record = usize.toU64(Pointer.address(address))
+      opened.start = self.now()
+      region.record = usize.toU64(index) + 1
     } else if sampled { self.countDroppedSpans(1) }
     unsafe TraceContext.install(&region)
   }
@@ -322,8 +514,8 @@ impl Tracer for Recorder {
     if slot == self.open.length() { return () }
     let mut token = ()
     let opened = unsafe Pointer.borrowMut(&mut token, unsafe self.open.at(slot))
-    opened.span.error = true
-    opened.span.errorType = error
+    opened.error = true
+    opened.errorType = error
   }
   effect fn attribute<V>(self: &Self, static key: string<'static>, value: &V) -> () {
     let active = self.active()
@@ -331,9 +523,9 @@ impl Tracer for Recorder {
     if slot == self.open.length() { return () }
     let captured = Value.capture<V>(value)
     if !sameRecord(active, self.active()) { return () }
-    let mut token = ()
-    let opened = unsafe Pointer.borrowMut(&mut token, unsafe self.open.at(slot))
-    opened.span.attributes.setCaptured(key, captured)
+    let mut cold = ()
+    let body = unsafe Pointer.borrowMut(&mut cold, unsafe self.bodies.at(slot))
+    body.attributes.setCaptured(key, captured)
   }
   effect fn recordError<V>(self: &Self, value: &V) -> () {
     let active = self.active()
@@ -343,25 +535,29 @@ impl Tracer for Recorder {
     if !sameRecord(active, self.active()) { return () }
     let mut token = ()
     let opened = unsafe Pointer.borrowMut(&mut token, unsafe self.open.at(slot))
-    opened.span.error = true
-    opened.span.attributes.setCaptured("exception.message", captured)
+    opened.error = true
+    let mut cold = ()
+    let body = unsafe Pointer.borrowMut(&mut cold, unsafe self.bodies.at(slot))
+    body.attributes.setCaptured("exception.message", captured)
   }
   effect fn event<Args>(self: &Self, static name: string<'static>, args: &Args) -> () {
     let active = self.active()
     let slot = self.activeIndex(&active)
     if slot == self.open.length() { return () }
     let mut check = ()
-    if !(unsafe Pointer.borrowMut(&mut check, unsafe self.open.at(slot))).span.canAppendEvent() { return () }
+    if !(unsafe Pointer.borrowMut(&mut check, unsafe self.open.at(slot))).canAppendEvent() { return () }
     // Display may synchronously provide a tracer and observe the same span.
     // Release the borrow of its storage across that callback, then recheck its capacity.
     let attributes = Attributes.make(args)
     if !sameRecord(active, self.active()) { return () }
     let mut token = ()
     let opened = unsafe Pointer.borrowMut(&mut token, unsafe self.open.at(slot))
-    if !opened.span.canAppendEvent() { return () }
-    let index = opened.span.eventCount
-    opened.span.events[index] = SpanEvent {name: name, time: self.now(), attributes: attributes}
-    opened.span.eventCount = index + 1
+    if !opened.canAppendEvent() { return () }
+    let index = opened.eventCount
+    let mut cold = ()
+    let body = unsafe Pointer.borrowMut(&mut cold, unsafe self.bodies.at(slot))
+    body.events[index] = SpanEvent {name: name, time: self.now(), attributes: attributes}
+    opened.eventCount = index + 1
   }
   effect fn link(self: &Self, context: &SpanContext) -> () {
     let active = self.active()
@@ -369,10 +565,12 @@ impl Tracer for Recorder {
     if slot == self.open.length() { return () }
     let mut token = ()
     let opened = unsafe Pointer.borrowMut(&mut token, unsafe self.open.at(slot))
-    let index = opened.span.linkCount
-    if index == opened.span.links.length { opened.span.droppedLinks = opened.span.droppedLinks + 1 return () }
-    opened.span.links[index] = context.*
-    opened.span.linkCount = index + 1
+    let index = opened.linkCount
+    if index == 4 { opened.droppedLinks = opened.droppedLinks + 1 return () }
+    let mut cold = ()
+    let body = unsafe Pointer.borrowMut(&mut cold, unsafe self.bodies.at(slot))
+    body.links[index] = context.*
+    opened.linkCount = index + 1
   }
 }
 

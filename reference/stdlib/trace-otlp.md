@@ -6,7 +6,7 @@ OTLP/HTTP JSON encoding for recorder batches.
 
 Import as `OtlpJson` with `import silk.trace.otlp as OtlpJson`.
 
-Public declarations: 4.
+Public declarations: 5.
 
 <a id="Resource"></a>
 
@@ -167,6 +167,19 @@ pub effect fn encode(identity: &Resource, batch: &Batch<'_>) -> Bytes ! WriterEr
 ```
 
 Returns the complete request bytes for an OTLP/HTTP retry or a length-prefixed write.
+
+<a id="encodeInto"></a>
+
+## `encodeInto`
+
+```silk
+pub effect fn encodeInto(identity: &Resource, batch: &Batch<'_>, output: &mut Bytes) -> ()
+  ! WriterError | OutOfMemoryError ? &mut Allocator
+```
+
+Replaces the contents of `output` with the complete request bytes. A buffer kept from one
+request to the next has the room for the next one already, which is then encoded in one pass;
+otherwise it is measured first and grown to fit.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`, `wasm64-unknown-unknown`.
