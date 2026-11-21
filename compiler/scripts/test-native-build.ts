@@ -287,6 +287,18 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   assert.equal(generatedRan.status, 0, generatedRan.stderr)
   yield* fs.writeFileString(definitionFile, definitionText)
   yield* fs.writeFileString(join(requestRoot, 'silk.toml'), manifestBeforeExclusion)
+  // A package override names a package of the graph by its package name, not only by an alias.
+  yield* fs.writeFileString(definitionFile,
+    definitionText + '\n[packages.request-dependency]\noptimization = "speed"\nexcluded = false\nparameters = []\n')
+  const namedResolved = yield* invoke(silk, ['resolve', '--definition', definitionFile, '--output', resolvedFile], requestRoot, requestEnv, 120_000)
+  assert.equal(namedResolved.status, 0, namedResolved.stderr)
+  assert.match(yield* fs.readFileString(resolvedFile), /\{name = "request-dependency", [^\n]*optimization = "speed"/)
+  yield* fs.writeFileString(definitionFile,
+    definitionText + '\n[packages.no-such-package]\noptimization = "speed"\nexcluded = false\nparameters = []\n')
+  const unknownResolved = yield* invoke(silk, ['resolve', '--definition', definitionFile, '--output', resolvedFile], requestRoot, requestEnv, 120_000)
+  assert.notEqual(unknownResolved.status, 0)
+  assert.match(unknownResolved.stderr, /no package in this compilation is named or aliased no-such-package/)
+  yield* fs.writeFileString(definitionFile, definitionText)
   const graphCompiler = join(directory, 'graph-compilation-test')
   const graphCompilerBuilt = yield* invoke(silk, ['build', join(graphSources, 'compile.silk'),
     '-o', graphCompiler, '--stdlib', standardLibrary, '--clang', clang], directory, process.env, 300_000)
