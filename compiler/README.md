@@ -341,13 +341,19 @@ Whether or not the runs have spans, each compilation logs what they add up to, a
 under its `semantic` span:
 
 - `queries: {runs} runs for {demands} demands`: the store's `demands`, `hits` and `runs`.
-- `query.family {family}`: per family, its `runs`, `own_ns` (the time in its runs and in no query
-  they demanded) and `total_ns`.
+- `query.family {family}`: per family, its `runs`, its `hits` (demands its memo answered without a
+  run), how many of those hits were `verified` (marked outdated by an edit, then found current),
+  `own_ns` (the time in its runs and in no query they demanded) and `total_ns`.
 - `query.module {module}`: the same for the queries about one module's declarations, for each
   module that took a millisecond or more of its own. This is the list of files that are slow to
   check.
 
-The numbers are the records' attributes; `event.template` tells the three apart.
+The numbers are the records' attributes; `event.template` tells the three apart. The `cache` span
+of a store that reads a cache file says what it took from it: `adopted_roots` (module checks
+reused), `stale_roots` (those to check again), `adopted_units` (query answers adopted current),
+`changed_inputs` (sources and inputs that read differently now), and `own` (whether the file was
+the package's own or a dependency's). The `objects` span of a build gives its `units` and how
+many were `compiled`, the rest coming from the object cache.
 
 An attribute keeps 64 bytes of text, so a longer path or name keeps its end. The recorder is
 bounded and never waits: a trace that lacks spans says so on standard error when the process ends.
