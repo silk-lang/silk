@@ -5637,6 +5637,12 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     )
     assert.ok(!tracedBuild.names.some((name) => name.startsWith('query.')), 'query runs have spans only when asked')
     assert.ok(tracedBuild.templates.some((template) => template.startsWith('query.family')), 'a build logs its query families')
+    // The request the traced build published, read before the next traced command clears `build`.
+    const tracedRequests = join(shared, 'build/requests')
+    const tracedPublished = (yield* fs.readDirectory(tracedRequests)).find((name) => name.startsWith('one.') && name.endsWith('.toml'))
+    assert.ok(tracedPublished, 'a build publishes its request')
+    const tracedRequest = yield* fs.readFileString(join(tracedRequests, tracedPublished))
+    assert.doesNotMatch(tracedRequest, /^\[trace\]/m, 'a published request asks for no trace')
     // A member checked in a copy of the process, then in a compiler of its own.
     const tracedCopies = yield* traceOf(['check', '--no-server', '--workspace', '--trace-queries', '0'], splitEnvironment)
     assert.equal(count(tracedCopies.names, 'unit.check'), 2)
@@ -5657,11 +5663,6 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     assert.ok(tracedAlone.names.includes('check'), 'a traced check asks no check server')
     // A compilation request asks for a trace with its `trace` record, and the compilation
     // continues the span the record names.
-    const tracedRequests = join(shared, 'build/requests')
-    const tracedPublished = (yield* fs.readDirectory(tracedRequests)).find((name) => name.startsWith('one.') && name.endsWith('.toml'))
-    assert.ok(tracedPublished, 'a build publishes its request')
-    const tracedRequest = yield* fs.readFileString(join(tracedRequests, tracedPublished))
-    assert.doesNotMatch(tracedRequest, /^\[trace\]/m, 'a published request asks for no trace')
     const traceParent = '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01'
     yield* fs.remove(traceFile, { force: true })
     const compiledTraced = yield* invoke(
