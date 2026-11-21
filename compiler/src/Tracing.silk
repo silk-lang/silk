@@ -1,0 +1,887 @@
+//! Tracing of the compiler's own work.
+//!
+//! With `SILK_TRACE` naming a file, a compiler process records what it does as OpenTelemetry spans
+//! and logs through `silk.trace`, and appends them to that file as OTLP JSON, one request per
+//! line. The spans are opened where the work is: `@trace` on the function that does a phase, and
+//! `Trace.span` where the name or an attribute is only known inside. Without `SILK_TRACE` no
+//! recorder is provided, every span is the default provider's empty one, and nothing here reads a
+//! clock or allocates.
+//!
+//! One semantic query and one borrow check are far smaller than a phase, and a build runs them
+//! by the hundred thousand, so their spans are recorded only with `SILK_TRACE_QUERIES` set, to the
+//! number of microseconds a run must take to be kept (0 keeps every one). A shorter run is kept
+//! too when something below it is, so no span of the file lacks its parent. Their totals are
+//! logged either way, by query family and by module.
+//!
+//! The recorder is bounded and never waits, and nothing here starts a thread: a process that
+//! copies itself with `fork` must have one. So the thread that compiles writes the file itself,
+//! with [`pump`] after pieces of work and [`flush`] before the process copies or replaces itself.
+
+import driver.ProcessImage
+import driver.ProcessMemory
+import ReleaseVersion
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u8
+import silk.num.u64
+import silk.num.usize
+import silk.system.host_input { HostInput }
+import silk.text.format { ParseError }
+import silk.text.string { InvalidUtf8, String }
+
+/// Whether this compiler can trace itself: it needs a host whose files it can append to.
+pub const supported: bool = (Intrinsic.targetOperatingSystem() == "darwin" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64") && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64"))
+
+/// The enclosing query and the start of one timed query run; [`leaveQuery`] closes it.
+pub struct QueryMark {
+  slot: usize,
+  module: usize,
+  outerSlot: usize,
+  outerModule: usize,
+  started: u64,
+}
+
+impl Copy for QueryMark {}
+
+/// The runs of one query family, or of the queries about one module's declarations.
+pub struct QueryTime {
+  /// The family's name; empty for a module.
+  pub name: string<'static>,
+  pub runs: u64,
+  /// The time in these runs and in no query they demanded, in nanoseconds.
+  pub own: u64,
+  /// The time in these runs with everything they demanded, in nanoseconds. A run that demands
+  /// its own family counts the inner run twice.
+  pub total: u64,
+}
+
+impl Copy for QueryTime {}
+
+/// The text of `bytes` for a span attribute: its last 64 bytes, as an attribute keeps no more and
+/// the end of a path or of a declaration's name says more than its start.
+pub fn label<'a>(bytes: &'a [u8]) -> string<'a> {
+  let mut start = usize.ZERO
+  if bytes.length > 64 {
+    start = bytes.length - 64
+  }
+  while start < bytes.length && u8.bitAnd(bytes[start], 192) == 128 {
+    start = start + usize.ONE
+  }
+  return match String.fromUtf8(Slice.view<u8>(bytes, start, bytes.length - start)) {
+    Result<string<'a>, InvalidUtf8>.Success { value } => value
+    Result<string<'a>, InvalidUtf8>.Failure { .. } => ""
+  }
+}
+
+/// The last component of the path `bytes` for a span attribute, as [`label`] gives it: the name
+/// of a program or of a file whose directory says nothing.
+pub fn leaf<'a>(bytes: &'a [u8]) -> string<'a> {
+  let mut start = bytes.length
+  while start > usize.ZERO && bytes[start - usize.ONE] != 47 && bytes[start - usize.ONE] != 92 {
+    start = start - usize.ONE
+  }
+  return label(Slice.view<u8>(bytes, start, bytes.length - start))
+}
+
+static if supported {
+  import silk.concurrency.sync { Arc }
+  import silk.io.logger { Logger }
+  import silk.io.writer { WriterError }
+  import silk.io.writer_native { StderrWriter }
+  import silk.mem.pointer { Pointer }
+  import silk.num.i64
+  import silk.num.u32
+  import silk.platform.native.clock { NativeClock }
+  import silk.platform.native.descriptor { NativeDescriptor }
+  import silk.platform.native.file { NativeFile, NativeFileError, OPEN_APPEND, OPEN_CREATE, OPEN_WRITE_ONLY }
+  import silk.trace { SpanContext, SpanGuard, SpanKind, Trace, Tracer }
+  import silk.trace.log { OtelLogger }
+  import silk.trace.otlp { Batch, Resource, encode }
+  import silk.trace.record { Config, Recorder, Span }
+  import silk.trace.signals { LogRecord }
+
+  // How many spans or logs one line of the file holds.
+  const batch: usize = 32
+
+  // How many calls of `pump` pass between two writes.
+  const pumped: u32 = 64
+
+  // What the process records with, and what its compiling thread keeps between writes. Only
+  // that thread reads or writes it; the recorder inside is what the other threads share.
+  struct State {
+    recorder: Arc<Recorder>,
+    descriptor: i32,
+    // Whether query runs and borrow checks have spans.
+    queries: bool,
+    // The shortest query run or borrow check the file keeps, in nanoseconds.
+    minimum: u64,
+    calls: u32,
+    // What one drain took from the recorder, and which of it the file keeps.
+    taken: List<Span>,
+    kept: List<bool>,
+    // The parents of the spans the file has kept: a table of span identifiers, zero where
+    // empty. A query run too short to keep is kept all the same when something below it was.
+    wanted: List<u64>,
+    wantedCount: usize,
+    spans: List<Span>,
+    logs: List<LogRecord>,
+    // Whether a write failed: the file is then left alone.
+    broken: bool,
+    // The span of the whole process, kept to write it if the process ends without closing it.
+    root: Span,
+    rooted: bool,
+    // The root span was written by `abandon`: its own close is left out.
+    abandoned: bool,
+    families: List<QueryTime>,
+    modules: List<QueryTime>,
+    active: usize,
+    activeModule: usize,
+    since: u64,
+  }
+
+  /// A traced process's recorder and state. `main` keeps one for as long as the process runs,
+  /// and a copy of the process makes its own with [`copied`].
+  pub struct Session {
+    recorder: Arc<Recorder>,
+    logger: Arc<OtelLogger>,
+    state: State,
+  }
+
+  // The address of the running session's state, or null when the process is not traced.
+  fn slot() -> *mut ?*mut State {
+    return Intrinsic.processSlot<?*mut State>()
+  }
+
+  fn now() -> u64 {
+    let time = run NativeClock.now()
+    return i64.toU64(time.seconds()) * 1000000000 + u32.toU64(time.subsecondNanoseconds())
+  }
+
+  /// Whether this process is traced.
+  pub fn on() -> bool {
+    return !Pointer.isNull<State>(unsafe Pointer.read(slot()))
+  }
+
+  /// Whether each query run and each borrow check has a span of its own.
+  pub fn queries() -> bool {
+    let mut anchor = ()
+    if let Option<*mut State>.Some { value } = Pointer.nonNullMut<State>(unsafe Pointer.read(slot())) {
+      return (unsafe Pointer.borrowMut(&mut anchor, value)).queries
+    }
+    return false
+  }
+
+  /// A reading of the clock for [`lasted`], or zero when query runs and borrow checks have no
+  /// spans.
+  pub fn clock() -> u64 {
+    if queries() {
+      return now()
+    }
+    return 0
+  }
+
+  /// Whether the query run or borrow check that began at `began`, a [`clock`] reading, has run
+  /// long enough for the file to keep its span. What a span says about its subject costs more
+  /// than the span, so it is worked out only for the spans that are kept.
+  pub fn lasted(began: u64) -> bool {
+    let mut anchor = ()
+    if let Option<*mut State>.Some { value } = Pointer.nonNullMut<State>(unsafe Pointer.read(slot())) {
+      let state = unsafe Pointer.borrowMut(&mut anchor, value)
+      return state.queries && now() - began >= state.minimum
+    }
+    return false
+  }
+
+  /// A span for one query run or borrow check, named `name`, when those are recorded.
+  @inlineAlways
+  pub fn detail(static name: string<'static>) -> Option<SpanGuard> {
+    if queries() {
+      return Option<SpanGuard>.some(Trace.span(name))
+    }
+    return Option<SpanGuard>.none()
+  }
+
+  // A recorder's sizes: for a process that compiles, or with `small` for a copy that does one
+  // piece of work.
+  fn settings(small: bool) -> Config {
+    let mut config = Config.make("silkc")
+    config.serviceVersion = label(ReleaseVersion.value())
+    // The deepest chain of open spans: queries demand queries.
+    config.openCapacity = if small { 64 } else { 2048 }
+    // Finished spans wait in pages of 128 until the compiling thread writes them: 64 pages hold
+    // what the parsing and code generation threads finish while it waits for them.
+    config.threadCapacity = if small { 4 } else { 64 }
+    config.bufferCapacity = 128
+    return config
+  }
+
+  effect fn session(descriptor: i32, queries: bool, minimum: u64, small: bool) -> Session
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let recorder = run Arc<Recorder>.make(run Recorder.make(settings(small)))
+    let logger = run Arc<OtelLogger>.make(OtelLogger.make(&recorder))
+    let state = State {
+      recorder: recorder.clone(),
+      descriptor: descriptor,
+      queries: queries,
+      minimum: minimum,
+      calls: 0,
+      taken: List<Span>.make(),
+      kept: List<bool>.make(),
+      wanted: List<u64>.make(),
+      wantedCount: usize.ZERO,
+      spans: List<Span>.make(),
+      logs: List<LogRecord>.make(),
+      broken: false,
+      root: Span.empty(),
+      rooted: false,
+      abandoned: false,
+      families: List<QueryTime>.make(),
+      modules: List<QueryTime>.make(),
+      active: usize.MAX,
+      activeModule: usize.MAX,
+      since: 0,
+    }
+    return Session { recorder: move recorder, logger: move logger, state: move state }
+  }
+
+  effect fn unset<E>(error: E) -> Option<Bytes> {
+    drop error
+    return Option<Bytes>.none()
+  }
+
+  effect fn variable(name: string) -> Option<Bytes> ? &mut HostInput | &mut Allocator {
+    return run Effect.catchAll(HostInput.variableNamed(name), unset)
+  }
+
+  effect fn unopened(error: NativeFileError) -> i32 {
+    drop error
+    return -1
+  }
+
+  /// The session of a process `SILK_TRACE` asks to trace, or none. The language server is never
+  /// traced: it has no end to write a trace at.
+  pub effect fn open() -> Option<Session>
+    ! OutOfMemoryError
+    ? &mut HostInput | &mut Allocator {
+    let path = match move run variable("SILK_TRACE") {
+      Option<Bytes>.Some { value } => move value
+      Option<Bytes>.None => {
+        return Option<Session>.none()
+      }
+    }
+    if Bytes.length(&path) == usize.ZERO {
+      return Option<Session>.none()
+    }
+    if let Option<Bytes>.Some { value: command } = move run Effect.catchAll(HostInput.argument(usize.ONE), unset) {
+      if label(Bytes.asSlice(&command)) == "lsp" {
+        return Option<Session>.none()
+      }
+    }
+    let descriptor = run Effect.catch<NativeFileError>(
+      NativeFile.open(Bytes.asSlice(&path), OPEN_WRITE_ONLY + OPEN_CREATE + OPEN_APPEND, 420),
+      unopened,
+    )
+    if descriptor < 0 {
+      StderrWriter.print("silk: cannot write the trace file SILK_TRACE names\n", &())
+      return Option<Session>.none()
+    }
+    let mut queries = false
+    let mut minimum = u64.MAX
+    if let Option<Bytes>.Some { value } = move run variable("SILK_TRACE_QUERIES") {
+      if let Result<u64, ParseError>.Success { value: microseconds } = u64.parse(label(Bytes.asSlice(&value))) {
+        queries = true
+        minimum = u64.saturatingMultiply(microseconds, 1000)
+      } else {
+        StderrWriter.print("silk: SILK_TRACE_QUERIES must be a number of microseconds\n", &())
+      }
+    }
+    return Option<Session>.some(run session(descriptor, queries, minimum, false))
+  }
+
+  /// Makes `session` the one this process records into. `session` must stay where it is until
+  /// [`close`].
+  pub fn install(session: &mut Session) -> () {
+    unsafe Pointer.write(slot(), Pointer.fromMutRef(&mut session.state))
+  }
+
+  /// In a copy of the process made with `fork`: a session of the copy's own, writing to the same
+  /// file, or none when the process is not traced. The copy must [`install`] it and run its work
+  /// [`within`] it, so that its spans have identifiers no other process makes and continue the
+  /// trace under the span that was open at the copy. `small` is for a copy that does one piece of
+  /// work rather than a compilation: its recorder holds little.
+  pub effect fn copied(small: bool) -> Option<Session> ! OutOfMemoryError ? &mut Allocator {
+    let mut anchor = ()
+    if let Option<*mut State>.Some { value } = Pointer.nonNullMut<State>(unsafe Pointer.read(slot())) {
+      let state = unsafe Pointer.borrowMut(&mut anchor, value)
+      let descriptor = state.descriptor
+      let queries = state.queries
+      let minimum = state.minimum
+      // What the original left unwritten is the original's to write.
+      unsafe Pointer.write(slot(), Pointer.null<State>())
+      return Option<Session>.some(run session(descriptor, queries, minimum, small))
+    }
+    return Option<Session>.none()
+  }
+
+  /// Ends the tracing of a copy of the process that cannot run [`within`] a session of its own,
+  /// as one made in the middle of a walk: what it does from here is in no trace.
+  pub fn silence() -> () {
+    unsafe Pointer.write(slot(), Pointer.null<State>())
+  }
+
+  /// Runs `work` with `session` recording its spans and logs, or as it is without one.
+  pub effect fn within<'env, A, E, ?R>(session: &Option<Session>, work: once Effect<'env; A ! E ? R>) -> A
+    ! E
+    ? R {
+    if let Option<Session>.Some { value } = &session.* {
+      return run move work
+        |> Effect.provideAmbient<Logger>(&value.logger)
+        |> Effect.provideAmbient<Tracer>(&value.recorder)
+    }
+    return run move work
+  }
+
+  /// Opens the span of the whole process, named `silkc`, with its command. It continues the trace
+  /// of the process that started this one when `TRACEPARENT` names it, and sets `TRACEPARENT` for
+  /// the processes this one starts.
+  pub effect fn root() -> SpanGuard ? &mut HostInput | &mut Allocator {
+    let mut anchor = ()
+    let state = match Pointer.nonNullMut<State>(unsafe Pointer.read(slot())) {
+      Option<*mut State>.Some { value } => unsafe Pointer.borrowMut(&mut anchor, value)
+      Option<*mut State>.None => {
+        return Trace.spanOf("silkc", SpanKind.Server)
+      }
+    }
+    let mut remote = Option<SpanContext>.none()
+    if let Option<Bytes>.Some { value } = move run variable("TRACEPARENT") {
+      remote = Trace.parseTraceparent(label(Bytes.asSlice(&value)))
+    }
+    let guard = match remote {
+      Option<SpanContext>.Some { value } => Trace.spanFrom(&value, "silkc")
+      Option<SpanContext>.None => Trace.spanOf("silkc", SpanKind.Server)
+    }
+    let mut command = Bytes.make()
+    if let Option<Bytes>.Some { value } = move run Effect.catchAll(HostInput.argument(usize.ONE), unset) {
+      command = move value
+    }
+    Trace.set("command", &label(Bytes.asSlice(&command)))
+    if let Option<SpanContext>.Some { value: current } = Trace.current() {
+      state.root.context = current
+      if let Option<SpanContext>.Some { value: parent } = remote {
+        state.root.parent = parent
+      }
+      state.root.name = "silkc"
+      state.root.kind = SpanKind.Server
+      state.root.start = state.recorder.get().now()
+      state.root.attributes.set("command", &label(Bytes.asSlice(&command)))
+      state.rooted = true
+      let header = Trace.traceparent(&current)
+      drop run Effect.result(ProcessImage.setVariable(b"TRACEPARENT", String.utf8Bytes(header.view())))
+    }
+    return move guard
+  }
+
+  /// The `TRACEPARENT` value with which a compiler this process starts continues its trace under
+  /// the current span, or none when the process is not traced.
+  pub effect fn parent() -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+    if on() {
+      if let Option<SpanContext>.Some { value } = Trace.current() {
+        let header = Trace.traceparent(&value)
+        return Option<Bytes>.some(run Bytes.copy(String.utf8Bytes(header.view())))
+      }
+    }
+    return Option<Bytes>.none()
+  }
+
+  // Whether the file keeps `span` for what it is: every span but a query run or borrow check
+  // shorter than `minimum` that neither failed nor has an event.
+  fn keeps(span: &Span, minimum: u64) -> bool {
+    if minimum == 0 || span.end - span.start >= minimum || span.error || span.eventCount != usize.ZERO {
+      return true
+    }
+    return !(String.startsWith(span.name, "query.") || span.name == "borrow.check")
+  }
+
+  // Whether the table `wanted` holds the span identifier `id`.
+  fn wants(wanted: &[u64], id: u64) -> bool {
+    if wanted.length == usize.ZERO || id == 0 {
+      return false
+    }
+    let mask = wanted.length - usize.ONE
+    let mut at = usize.bitAnd(u64.wrappingToUsize(id), mask)
+    while wanted[at] != 0 {
+      if wanted[at] == id {
+        return true
+      }
+      at = usize.bitAnd(at + usize.ONE, mask)
+    }
+    return false
+  }
+
+  fn place(wanted: &mut [u64], id: u64) -> bool {
+    let mask = wanted.length - usize.ONE
+    let mut at = usize.bitAnd(u64.wrappingToUsize(id), mask)
+    while wanted[at] != 0 {
+      if wanted[at] == id {
+        return false
+      }
+      at = usize.bitAnd(at + usize.ONE, mask)
+    }
+    wanted[at] = id
+    return true
+  }
+
+  // Adds the span identifier `id` to the table of parents the file must keep.
+  effect fn want(state: &mut State, id: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+    if id == 0 {
+      return ()
+    }
+    if (state.wantedCount + usize.ONE) * 2 > List<u64>.length(&state.wanted) {
+      let mut size: usize = 1024
+      while size < List<u64>.length(&state.wanted) * 2 {
+        size = size * 2
+      }
+      let mut grown = List<u64>.make()
+      run List<u64>.appendRepeated(&mut grown, 0, size)
+      let held = List<u64>.asSlice(&state.wanted)
+      let mut at = usize.ZERO
+      while at < held.length {
+        if held[at] != 0 {
+          drop place(List<u64>.asMutSlice(&mut grown), held[at])
+        }
+        at = at + usize.ONE
+      }
+      state.wanted = move grown
+    }
+    if place(List<u64>.asMutSlice(&mut state.wanted), id) {
+      state.wantedCount = state.wantedCount + usize.ONE
+    }
+  }
+
+  effect fn encoded(bytes: Result<Bytes, WriterError | OutOfMemoryError>) -> Bytes {
+    return match move bytes {
+      Result<Bytes, WriterError | OutOfMemoryError>.Success { value } => move value
+      Result<Bytes, WriterError | OutOfMemoryError>.Failure { error } => {
+        drop error
+        return Bytes.make()
+      }
+    }
+  }
+
+  fn identity(recorder: &Recorder) -> Resource {
+    return Resource {
+      serviceName: recorder.serviceName(),
+      serviceVersion: recorder.serviceVersion(),
+      droppedSpans: recorder.droppedSpans(),
+      droppedLogs: recorder.signals.droppedLogs(),
+      droppedMetrics: 0,
+    }
+  }
+
+  // Appends one request to the file with one write, so that the lines of the processes that
+  // share the file never mix.
+  effect fn writeLine(state: &mut State, line: Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut text = move line
+    if Bytes.length(&text) == usize.ZERO || state.broken {
+      return ()
+    }
+    run Bytes.append(&mut text, b"\n")
+    let mut error = 0
+    if !run NativeDescriptor.writeAll(state.descriptor, Bytes.asSlice(&text), &mut error) {
+      state.broken = true
+    }
+  }
+
+  effect fn writeSpans(state: &mut State) -> () ! OutOfMemoryError ? &mut Allocator {
+    if List<Span>.length(&state.spans) == usize.ZERO {
+      return ()
+    }
+    let resource = identity(state.recorder.get())
+    let line = run encoded(
+      run Effect.result(encode(&resource, &Batch.Spans { values: List<Span>.asSlice(&state.spans) })),
+    )
+    List<Span>.clear(&mut state.spans)
+    return run writeLine(&mut state.*, move line)
+  }
+
+  effect fn writeLogs(state: &mut State) -> () ! OutOfMemoryError ? &mut Allocator {
+    if List<LogRecord>.length(&state.logs) == usize.ZERO {
+      return ()
+    }
+    let resource = identity(state.recorder.get())
+    let line = run encoded(
+      run Effect.result(encode(&resource, &Batch.Logs { values: List<LogRecord>.asSlice(&state.logs) })),
+    )
+    List<LogRecord>.clear(&mut state.logs)
+    return run writeLine(&mut state.*, move line)
+  }
+
+  // Takes what the recorder has finished and writes what the file keeps of it.
+  effect fn drain(state: &mut State) -> () ! OutOfMemoryError ? &mut Allocator {
+    state.calls = 0
+    let recorder = state.recorder.clone()
+    if List<Span>.capacity(&state.spans) == usize.ZERO {
+      run List<Span>.reserveExact(&mut state.spans, batch)
+      run List<LogRecord>.reserveExact(&mut state.logs, batch)
+    }
+    List<Span>.clear(&mut state.taken)
+    List<bool>.clear(&mut state.kept)
+    let mut remaining = recorder.get().finishedCapacity()
+    while remaining != usize.ZERO {
+      match recorder.get().takeSpan() {
+        Option<Span>.Some { value } => {
+          remaining = remaining - usize.ONE
+          if !(state.abandoned && value.context.span == state.root.context.span) {
+            run List<Span>.append(&mut state.taken, value)
+          }
+        }
+        Option<Span>.None => {
+          remaining = usize.ZERO
+        }
+      }
+    }
+    // A span closes after everything below it, so what a drain takes holds no span whose
+    // children an earlier drain did not. Within one drain the order is the recorder's pages',
+    // so the parents are settled over the whole of it.
+    let count = List<Span>.length(&state.taken)
+    let filtering = state.queries && state.minimum != 0
+    let mut at = usize.ZERO
+    while at < count {
+      let span = &List<Span>.asSlice(&state.taken)[at]
+      let kept = keeps(span, state.minimum)
+      let parent = span.parent.span
+      run List<bool>.append(&mut state.kept, kept)
+      if kept && filtering {
+        run want(&mut state.*, parent)
+      }
+      at = at + usize.ONE
+    }
+    let mut settling = filtering
+    while settling {
+      settling = false
+      at = usize.ZERO
+      while at < count {
+        if !List<bool>.get(&state.kept, at) {
+          let span = &List<Span>.asSlice(&state.taken)[at]
+          let parent = span.parent.span
+          if wants(List<u64>.asSlice(&state.wanted), span.context.span) {
+            List<bool>.set(&mut state.kept, at, true)
+            run want(&mut state.*, parent)
+            settling = true
+          }
+        }
+        at = at + usize.ONE
+      }
+    }
+    at = usize.ZERO
+    while at < count {
+      if List<bool>.get(&state.kept, at) {
+        let span = List<Span>.asSlice(&state.taken)[at]
+        drop List<Span>.appendWithinCapacity(&mut state.spans, span)
+        if List<Span>.length(&state.spans) == batch {
+          run writeSpans(&mut state.*)
+        }
+      }
+      at = at + usize.ONE
+    }
+    run writeSpans(&mut state.*)
+    remaining = recorder.get().signals.logCapacity()
+    while remaining != usize.ZERO {
+      match recorder.get().signals.takeLog() {
+        Option<LogRecord>.Some { value } => {
+          remaining = remaining - usize.ONE
+          drop List<LogRecord>.appendWithinCapacity(&mut state.logs, value)
+          if List<LogRecord>.length(&state.logs) == batch {
+            run writeLogs(&mut state.*)
+          }
+        }
+        Option<LogRecord>.None => {
+          remaining = usize.ZERO
+        }
+      }
+    }
+    return run writeLogs(&mut state.*)
+  }
+
+  /// Counts one piece of finished work, and writes what the recorder has finished once enough of
+  /// them have passed. Call it on the compiling thread, after a span closes: often enough that
+  /// the recorder never fills, which costs it spans.
+  pub effect fn pump() -> () ? &mut Allocator {
+    let mut anchor = ()
+    if let Option<*mut State>.Some { value } = Pointer.nonNullMut<State>(unsafe Pointer.read(slot())) {
+      let state = unsafe Pointer.borrowMut(&mut anchor, value)
+      state.calls = state.calls + 1
+      if state.calls >= pumped {
+        drop run Effect.result(drain(&mut state.*))
+      }
+    }
+  }
+
+  /// Writes everything the recorder has finished: after the work of other threads has been
+  /// collected, and before this process copies itself, so that the copy holds nothing unwritten.
+  pub effect fn flush() -> () ? &mut Allocator {
+    let mut anchor = ()
+    if let Option<*mut State>.Some { value } = Pointer.nonNullMut<State>(unsafe Pointer.read(slot())) {
+      drop run Effect.result(drain(unsafe Pointer.borrowMut(&mut anchor, value)))
+    }
+  }
+
+  /// Writes everything finished, and the process's span as ending now: for a process about to be
+  /// replaced by the program it built, which never returns to close that span.
+  pub effect fn abandon() -> () ? &mut Allocator {
+    let mut anchor = ()
+    if let Option<*mut State>.Some { value } = Pointer.nonNullMut<State>(unsafe Pointer.read(slot())) {
+      let state = unsafe Pointer.borrowMut(&mut anchor, value)
+      drop run Effect.result(drain(&mut state.*))
+      if state.rooted && !state.abandoned {
+        state.abandoned = true
+        let mut root = state.root
+        root.end = state.recorder.get().now()
+        if List<Span>.appendWithinCapacity(&mut state.spans, root) {
+          drop run Effect.result(writeSpans(&mut state.*))
+        }
+      }
+    }
+  }
+
+  /// Writes what is left and ends the tracing of this process. Reports the spans the recorder
+  /// had no room for, since a trace that lacks spans misleads.
+  pub effect fn close(session: &mut Session) -> () ? &mut Allocator {
+    run flush()
+    unsafe Pointer.write(slot(), Pointer.null<State>())
+    let dropped = session.recorder.get().droppedSpans()
+    if dropped != 0 {
+      StderrWriter.print("silk: the trace lacks {} spans the recorder had no room for\n", &.(dropped))
+    }
+    if session.state.broken {
+      StderrWriter.print("silk: could not write all of the trace file\n", &())
+    }
+    drop run Effect.result(NativeFile.close(session.state.descriptor))
+  }
+
+  /// Records the largest resident memory of the process so far on the current span.
+  pub effect fn memory() -> () {
+    if on() {
+      let peak = run ProcessMemory.peakBytes()
+      Trace.set("memory.peak_bytes", &peak)
+    }
+  }
+
+  fn settle(state: &mut State, current: u64) -> () {
+    let spent = current - state.since
+    if state.active != usize.MAX {
+      let families = List<QueryTime>.asMutSlice(&mut state.families)
+      families[state.active].own = families[state.active].own + spent
+    }
+    if state.activeModule != usize.MAX {
+      let modules = List<QueryTime>.asMutSlice(&mut state.modules)
+      modules[state.activeModule].own = modules[state.activeModule].own + spent
+    }
+    state.since = current
+  }
+
+  /// Starts one run of the query family numbered `family`, called `name`, about a declaration of the
+  /// module numbered `module` (`usize.MAX` for none). The run that was open stops counting its
+  /// own time until [`leaveQuery`]. Does nothing when the process is not traced.
+  pub effect fn enterQuery(family: usize, name: string<'static>, module: usize) -> QueryMark
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut anchor = ()
+    let state = match Pointer.nonNullMut<State>(unsafe Pointer.read(slot())) {
+      Option<*mut State>.Some { value } => unsafe Pointer.borrowMut(&mut anchor, value)
+      Option<*mut State>.None => {
+        return QueryMark { slot: usize.MAX, module: usize.MAX, outerSlot: usize.MAX, outerModule: usize.MAX, started: 0 }
+      }
+    }
+    let empty = QueryTime { name: "", runs: 0, own: 0, total: 0 }
+    while List<QueryTime>.length(&state.families) <= family {
+      run List<QueryTime>.append(&mut state.families, empty)
+    }
+    while module != usize.MAX && List<QueryTime>.length(&state.modules) <= module {
+      run List<QueryTime>.append(&mut state.modules, empty)
+    }
+    let current = now()
+    settle(&mut state.*, current)
+    let families = List<QueryTime>.asMutSlice(&mut state.families)
+    families[family].name = name
+    families[family].runs = families[family].runs + 1
+    if module != usize.MAX {
+      let modules = List<QueryTime>.asMutSlice(&mut state.modules)
+      modules[module].runs = modules[module].runs + 1
+    }
+    let mark = QueryMark {
+      slot: family,
+      module: module,
+      outerSlot: state.active,
+      outerModule: state.activeModule,
+      started: current,
+    }
+    state.active = family
+    state.activeModule = module
+    return mark
+  }
+
+  /// Ends the run `mark` opened, also one that failed. Calls nest as [`enterQuery`] did.
+  pub fn leaveQuery(mark: QueryMark) -> () {
+    if mark.slot == usize.MAX {
+      return ()
+    }
+    let mut anchor = ()
+    if let Option<*mut State>.Some { value } = Pointer.nonNullMut<State>(unsafe Pointer.read(slot())) {
+      let state = unsafe Pointer.borrowMut(&mut anchor, value)
+      let current = now()
+      settle(&mut state.*, current)
+      let families = List<QueryTime>.asMutSlice(&mut state.families)
+      families[mark.slot].total = families[mark.slot].total + current - mark.started
+      if mark.module != usize.MAX {
+        let modules = List<QueryTime>.asMutSlice(&mut state.modules)
+        modules[mark.module].total = modules[mark.module].total + current - mark.started
+      }
+      state.active = mark.outerSlot
+      state.activeModule = mark.outerModule
+    }
+  }
+
+  /// The query runs since the last [`takeQueryTimes`], by family: one entry per family that ran.
+  /// Then by module, at the module's number. Both start again from nothing.
+  pub effect fn takeQueryTimes(families: &mut List<QueryTime>, modules: &mut List<QueryTime>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut anchor = ()
+    if let Option<*mut State>.Some { value } = Pointer.nonNullMut<State>(unsafe Pointer.read(slot())) {
+      let state = unsafe Pointer.borrowMut(&mut anchor, value)
+      let ran = List<QueryTime>.asSlice(&state.families)
+      let mut at = usize.ZERO
+      while at < ran.length {
+        if ran[at].runs != 0 {
+          run List<QueryTime>.append(&mut families.*, ran[at])
+        }
+        at = at + usize.ONE
+      }
+      run List<QueryTime>.appendSlice(&mut modules.*, List<QueryTime>.asSlice(&state.modules))
+      List<QueryTime>.clear(&mut state.families)
+      List<QueryTime>.clear(&mut state.modules)
+    }
+  }
+} else {
+  import silk.trace { SpanGuard, SpanKind, Trace }
+
+  /// A traced process's recorder and state. This compiler traces nothing.
+  pub struct Session {}
+
+  /// Whether this process is traced. Never, in this compiler.
+  pub fn on() -> bool {
+    return false
+  }
+
+  /// Whether each query run and each borrow check has a span of its own. Never, in this compiler.
+  pub fn queries() -> bool {
+    return false
+  }
+
+  /// A reading of the clock for [`lasted`]. Zero, in this compiler.
+  pub fn clock() -> u64 {
+    return 0
+  }
+
+  /// Whether a query run or borrow check has run long enough to keep. Never, in this compiler.
+  pub fn lasted(began: u64) -> bool {
+    return false
+  }
+
+  /// A span for one query run or borrow check. None, in this compiler.
+  @inlineAlways
+  pub fn detail(static name: string<'static>) -> Option<SpanGuard> {
+    return Option<SpanGuard>.none()
+  }
+
+  /// The session of a process `SILK_TRACE` asks to trace. None, in this compiler.
+  pub effect fn open() -> Option<Session>
+    ! OutOfMemoryError
+    ? &mut HostInput | &mut Allocator {
+    return Option<Session>.none()
+  }
+
+  /// Makes `session` the one this process records into. Nothing, in this compiler.
+  pub fn install(session: &mut Session) -> () {
+    return ()
+  }
+
+  /// A session for a copy of the process. None, in this compiler.
+  pub effect fn copied(small: bool) -> Option<Session> ! OutOfMemoryError ? &mut Allocator {
+    return Option<Session>.none()
+  }
+
+  /// Ends the tracing of a copy of the process. Nothing, in this compiler.
+  pub fn silence() -> () {
+    return ()
+  }
+
+  /// Runs `work`. This compiler records none of it.
+  pub effect fn within<'env, A, E, ?R>(session: &Option<Session>, work: once Effect<'env; A ! E ? R>) -> A
+    ! E
+    ? R {
+    return run move work
+  }
+
+  /// Opens the span of the whole process. An empty one, in this compiler.
+  pub effect fn root() -> SpanGuard ? &mut HostInput | &mut Allocator {
+    return Trace.spanOf("silkc", SpanKind.Server)
+  }
+
+  /// The `TRACEPARENT` value for a compiler this process starts. None, in this compiler.
+  pub effect fn parent() -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+    return Option<Bytes>.none()
+  }
+
+  /// Counts one piece of finished work. Nothing, in this compiler.
+  pub effect fn pump() -> () ? &mut Allocator {
+    return ()
+  }
+
+  /// Writes everything the recorder has finished. Nothing, in this compiler.
+  pub effect fn flush() -> () ? &mut Allocator {
+    return ()
+  }
+
+  /// Writes everything finished and the process's span. Nothing, in this compiler.
+  pub effect fn abandon() -> () ? &mut Allocator {
+    return ()
+  }
+
+  /// Ends the tracing of this process. Nothing, in this compiler.
+  pub effect fn close(session: &mut Session) -> () ? &mut Allocator {
+    return ()
+  }
+
+  /// Records the process's peak memory on the current span. Nothing, in this compiler.
+  pub effect fn memory() -> () {
+    return ()
+  }
+
+  /// Starts one run of a query family. Nothing, in this compiler.
+  pub effect fn enterQuery(family: usize, name: string<'static>, module: usize) -> QueryMark
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return QueryMark { slot: usize.MAX, module: usize.MAX, outerSlot: usize.MAX, outerModule: usize.MAX, started: 0 }
+  }
+
+  /// Ends the run `mark` opened. Nothing, in this compiler.
+  pub fn leaveQuery(mark: QueryMark) -> () {
+    return ()
+  }
+
+  /// The query runs since the last call, by family and by module. None, in this compiler.
+  pub effect fn takeQueryTimes(families: &mut List<QueryTime>, modules: &mut List<QueryTime>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return ()
+  }
+}
