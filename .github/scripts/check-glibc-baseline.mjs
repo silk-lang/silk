@@ -28,7 +28,7 @@ const otherBranches = new Set([
   'host_processor_info', 'vm_deallocate', 'task_info', 'thread_info', '_NSGetExecutablePath',
   'kqueue', 'kevent', 'stat', 'lstat', 'fcopyfile', 'clonefile', 'pthread_threadid_np',
   // Windows
-  'closesocket', 'ioctlsocket', '__silk_stderr_lock', '__silk_stderr_once',
+  'closesocket', 'ioctlsocket', 'GetCurrentThreadId', '__silk_stderr_lock', '__silk_stderr_once',
   // The linker's bounds of the section that holds a test runner's table of executed functions.
   '__start_silk_seen', '__stop_silk_seen',
 ])
