@@ -1,0 +1,464 @@
+//! Walks a machine through every state it can reach: [`Explorer`] and [`Walk`].
+//!
+//! # When to use
+//! Use this module to check a machine as a whole, in a test. [`Explorer.walk`] runs the machine
+//! for real, with its guards, its context and its regions, and gives back every step it could
+//! take. The walk then answers questions about the whole machine: which events no state
+//! handles, which states nothing reaches, which rows overlap, and what a command leaves from
+//! start to end. Use the `silk.machine.paths` module for one path to each state of one chart
+//! read as data.
+//!
+//! # Details
+//! The walk starts from the snapshots it is given and sends every event of a list to each
+//! snapshot it has not seen. Two snapshots are the same when their MessagePack bytes are, so
+//! the state union, the event union, the context and the effects must implement `Schema`. A
+//! state that waits for the world, see `Chart.awaits`, gets only the events it waits for.
+//! Every other state gets only the events that no state waits for.
+//!
+//! # Gotchas
+//! The walk ends only when the machine has a finite number of snapshots. Give
+//! [`Explorer.walk`] a limit, and check [`Walk.complete`].
+//!
+//! @category State machines
+
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.io.writer { Writer, WriterError }
+import silk.machine.chart { Machine, Machines }
+import silk.machine.snapshot { Snapshot, Status, Steps, TransitionLoopError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.schema.issue { SchemaError }
+import silk.schema.msgpack { SchemaMsgpack }
+import silk.schema.schema { Schema }
+
+/// One event sent to one snapshot of a walk.
+pub struct Step<X> {
+  /// The position in [`Walk.nodes`] of the snapshot the event was sent to.
+  pub from: usize,
+  /// The position of the event in the list given to [`Explorer.walk`].
+  pub event: usize,
+  /// Whether a state handled the event. A step that no state handled is a hole: nobody wrote
+  /// a row for this event in this state.
+  pub handled: bool,
+  /// The largest number of rows of one state that applied to the event, see
+  /// `Machines.contenders`. More than 1 means that the order of the rows decided.
+  pub contenders: u32,
+  /// The effects the step queued, in order.
+  pub effects: List<X>,
+  /// The position in [`Walk.nodes`] of the snapshot the step reached.
+  pub to: usize,
+}
+
+/// One snapshot a walk reached.
+pub struct Node<S, E, C, X> {
+  pub snapshot: Snapshot<S, E, C, X>,
+  /// Whether an active state waits for an answer of the world, see `Chart.awaits`.
+  pub awaiting: bool,
+  // The snapshot as MessagePack, which tells it apart from the others.
+  key: Bytes,
+}
+
+/// What one event leaves from the moment it is sent until the machine waits for nothing:
+/// the step of the event, then one step for each answer of the world.
+pub struct Run {
+  /// The position in [`Walk.nodes`] of the snapshot the run starts from.
+  pub from: usize,
+  /// The positions in [`Walk.steps`] of the steps of the run, in order. The first one is the
+  /// step of the event, the others are the steps of the answers.
+  pub steps: List<usize>,
+  /// The position in [`Walk.nodes`] of the snapshot the run ends in.
+  pub to: usize,
+  /// Whether the run ends in a snapshot that waits for nothing. A run that does not is one
+  /// that went on for more steps than the limit given to [`Walk.runs`], or that waits for an
+  /// answer no step gives.
+  pub settled: bool,
+}
+
+/// Every snapshot a machine reached and every step between them, from [`Explorer.walk`].
+pub struct Walk<S, E, C, X> {
+  pub nodes: List<Node<S, E, C, X>>,
+  pub steps: List<Step<X>>,
+  /// Whether the walk saw every snapshot the machine can reach. It is false when the walk
+  /// stopped at its limit.
+  pub complete: bool,
+}
+
+// A writer that counts the bytes it is given.
+struct Counter {
+  size: usize,
+}
+
+impl Writer for Counter {
+  effect fn writeAll(self: &mut Self, data: &[u8]) -> () ! WriterError {
+    self.size = self.size + data.length
+  }
+
+  effect fn flush(self: &mut Self) -> () ! WriterError {}
+}
+
+// A writer that fills bytes whose capacity was reserved.
+struct Buffer {
+  bytes: Bytes,
+}
+
+impl Writer for Buffer {
+  effect fn writeAll(self: &mut Self, data: &[u8]) -> () ! WriterError {
+    if !self.bytes.appendSliceWithinCapacity(data) {
+      fail Writer.failure()
+    }
+  }
+
+  effect fn flush(self: &mut Self) -> () ! WriterError {}
+}
+
+// `value` as MessagePack.
+effect fn encoded<T: Schema>(value: &T) -> Bytes
+  ! SchemaError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut counter = Counter { size: 0 }
+  let counted = run Effect.result(SchemaMsgpack.encode<T>(value))
+    |> Effect.provideMut<Writer>(&mut counter)
+  match move counted {
+    Result<(), SchemaError | WriterError | OutOfMemoryError>.Success { .. } => {}
+    Result<(), SchemaError | WriterError | OutOfMemoryError>.Failure { error } => match move error {
+      SchemaError refused => {
+        fail move refused
+      }
+      WriterError { .. } => Intrinsic.trap("a counting writer takes every byte")
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+  let mut buffer = Buffer { bytes: run Bytes.makeWithCapacity(counter.size) }
+  let written = run Effect.result(SchemaMsgpack.encode<T>(value))
+    |> Effect.provideMut<Writer>(&mut buffer)
+  match move written {
+    Result<(), SchemaError | WriterError | OutOfMemoryError>.Success { .. } => {}
+    Result<(), SchemaError | WriterError | OutOfMemoryError>.Failure { error } => match move error {
+      SchemaError refused => {
+        fail move refused
+      }
+      WriterError { .. } => Intrinsic.trap("the buffer has room for the counted bytes")
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+  return move buffer.bytes
+}
+
+// A copy of `value`, made by writing it and reading it back.
+effect fn copied<T: Schema>(value: &T) -> T
+  ! SchemaError | OutOfMemoryError
+  ? &mut Allocator {
+  let bytes = run encoded<T>(value)
+  return run SchemaMsgpack.decode<T>(bytes.asSlice())
+}
+
+pub struct Explorer {}
+
+impl Explorer {
+  /// Walks the machine from each snapshot of `starts`, sending every event of `events` to
+  /// every snapshot it reaches, until it has seen them all or holds `limit` snapshots.
+  ///
+  /// # Details
+  /// A snapshot whose active state waits for the world, see `Chart.awaits`, gets the events
+  /// of `events` that it waits for. Any other snapshot gets the events that no state of the
+  /// machine waits for. A machine that is done, stopped or failed gets none. The effects a
+  /// step queued are moved into its [`Step`], so every snapshot of the walk has none pending.
+  ///
+  /// # Errors
+  /// `SchemaError` when a snapshot or an event cannot be written as MessagePack or read back.
+  /// `TransitionLoopError` when a step never settles. `OutOfMemoryError`.
+  pub effect fn walk<S: Machine<E, C, X> + Schema, E: Schema, C: Schema, X: Schema>(
+    starts: List<Snapshot<S, E, C, X>>,
+    events: &[E],
+    limit: usize,
+  ) -> Walk<S, E, C, X>
+    ! SchemaError | OutOfMemoryError | TransitionLoopError
+    ? &mut Allocator {
+    let mut walk = Walk<S, E, C, X> {
+      nodes: List<Node<S, E, C, X>>.make(),
+      steps: List<Step<X>>.make(),
+      complete: true,
+    }
+    let mut first = move starts
+    while first.length() != 0 {
+      let mut snapshot = List<Snapshot<S, E, C, X>>.remove(&mut first, 0)
+      snapshot.pending.clear()
+      drop run Explorer.place<S, E, C, X>(&mut walk, move snapshot)
+    }
+    let mut at: usize = 0
+    while at < walk.nodes.length() {
+      let active = match &walk.nodes.asSlice()[at].snapshot.status {
+        Status.Active => true
+        _ => false
+      }
+      if !active {
+        at = at + 1
+        continue
+      }
+      let awaiting = walk.nodes.asSlice()[at].awaiting
+      let mut index: usize = 0
+      while index < events.length {
+        let wanted = if awaiting {
+          Machines.awaits<S, E, C, X>(&walk.nodes.asSlice()[at].snapshot.value, &events[index])
+        } else {
+          !Machines.isAnswer<S, E, C, X>(&events[index])
+        }
+        if wanted {
+          if walk.nodes.length() >= limit {
+            walk.complete = false
+            return move walk
+          }
+          let mut next = run copied<Snapshot<S, E, C, X>>(&walk.nodes.asSlice()[at].snapshot)
+          let contenders = Machines.contenders<S, E, C, X>(
+            &next.value,
+            &next.context,
+            &events[index],
+          )
+          let handled = run Steps.send<S, E, C, X>(&mut next, run copied<E>(&events[index]))
+          let mut effects = List<X>.make()
+          while next.pending.length() != 0 {
+            run List<X>.append(&mut effects, List<X>.remove(&mut next.pending, 0))
+          }
+          let to = run Explorer.place<S, E, C, X>(&mut walk, move next)
+          run List<Step<X>>.append(
+            &mut walk.steps,
+            Step<X> {
+              from: at,
+              event: index,
+              handled: handled,
+              contenders: contenders,
+              effects: move effects,
+              to: to,
+            },
+          )
+        }
+        index = index + 1
+      }
+      at = at + 1
+    }
+    return move walk
+  }
+
+  // The position of `snapshot` among the nodes of `walk`, added when the walk has not seen it.
+  effect fn place<S: Machine<E, C, X> + Schema, E: Schema, C: Schema, X: Schema>(
+    walk: &mut Walk<S, E, C, X>,
+    snapshot: Snapshot<S, E, C, X>,
+  ) -> usize
+    ! SchemaError | OutOfMemoryError
+    ? &mut Allocator {
+    let key = run encoded<Snapshot<S, E, C, X>>(&snapshot)
+    let nodes = walk.nodes.asSlice()
+    let mut index: usize = 0
+    while index < nodes.length {
+      if nodes[index].key.asSlice() == key.asSlice() {
+        return index
+      }
+      index = index + 1
+    }
+    let awaiting = Machines.awaiting<S, E, C, X>(&snapshot.value)
+    run List<Node<S, E, C, X>>.append(
+      &mut walk.nodes,
+      Node<S, E, C, X> { snapshot: move snapshot, awaiting: awaiting, key: move key },
+    )
+    return walk.nodes.length() - 1
+  }
+}
+
+impl<S: Machine<E, C, X>, E, C, X> Walk<S, E, C, X> {
+  /// Returns the positions in [`Walk.steps`] of the steps that no state handled, in the order
+  /// the walk took them. Each one is a state and an event that nobody wrote a row for.
+  pub effect fn holes(self: &Self) -> List<usize>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut found = List<usize>.make()
+    let steps = self.steps.asSlice()
+    let mut index: usize = 0
+    while index < steps.length {
+      if !steps[index].handled {
+        run List<usize>.append(&mut found, index)
+      }
+      index = index + 1
+    }
+    return move found
+  }
+
+  /// Returns the positions in [`Walk.steps`] of the steps where more than one row of one
+  /// state applied, so the order the rows were written in decided which one was taken.
+  pub effect fn overlaps(self: &Self) -> List<usize>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut found = List<usize>.make()
+    let steps = self.steps.asSlice()
+    let mut index: usize = 0
+    while index < steps.length {
+      if steps[index].contenders > 1 {
+        run List<usize>.append(&mut found, index)
+      }
+      index = index + 1
+    }
+    return move found
+  }
+
+  /// Returns the names of the states that are active in no snapshot of the walk, as
+  /// `Machines.states` names them, such as `Door.Open`.
+  pub effect fn unreached(self: &Self) -> List<string<'static>>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut seen = List<string<'static>>.make()
+    let nodes = self.nodes.asSlice()
+    let mut index: usize = 0
+    while index < nodes.length {
+      let mut names = List<string<'static>>.make()
+      run Machines.active<S, E, C, X>(&nodes[index].snapshot.value, &mut names)
+      let active = names.asSlice()
+      let mut position: usize = 0
+      while position < active.length {
+        if !contains(seen.asSlice(), active[position]) {
+          run List<string<'static>>.append(&mut seen, active[position])
+        }
+        position = position + 1
+      }
+      index = index + 1
+    }
+    let mut all = List<string<'static>>.make()
+    run Machines.states<S, E, C, X>(&mut all)
+    let mut missing = List<string<'static>>.make()
+    let listed = all.asSlice()
+    index = 0
+    while index < listed.length {
+      if !contains(seen.asSlice(), listed[index]) && !contains(missing.asSlice(), listed[index]) {
+        run List<string<'static>>.append(&mut missing, listed[index])
+      }
+      index = index + 1
+    }
+    return move missing
+  }
+
+  /// Returns the positions in [`Walk.nodes`] of the snapshots that can take no event: the
+  /// machine is active there and no step from the snapshot was handled.
+  pub effect fn stuck(self: &Self) -> List<usize>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut found = List<usize>.make()
+    let nodes = self.nodes.asSlice()
+    let steps = self.steps.asSlice()
+    let mut index: usize = 0
+    while index < nodes.length {
+      let active = match &nodes[index].snapshot.status {
+        Status.Active => true
+        _ => false
+      }
+      let mut leaves = false
+      let mut position: usize = 0
+      while position < steps.length {
+        if steps[position].from == index && steps[position].handled {
+          leaves = true
+          break
+        }
+        position = position + 1
+      }
+      if active && !leaves {
+        run List<usize>.append(&mut found, index)
+      }
+      index = index + 1
+    }
+    return move found
+  }
+
+  /// Returns every run of the walk: for each step from a snapshot that waits for nothing, the
+  /// step and each way the world can answer until the machine waits for nothing again.
+  ///
+  /// # Details
+  /// A step that reaches a snapshot that waits for the world continues with each step from
+  /// that snapshot, so one event gives one run for each combination of answers. A run stops
+  /// after `limit` steps with [`Run.settled`] false, which is how a machine whose answers
+  /// go in a circle shows. Steps that no state handled start no run.
+  pub effect fn runs(self: &Self, limit: usize) -> List<Run>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut found = List<Run>.make()
+    let nodes = self.nodes.asSlice()
+    let steps = self.steps.asSlice()
+
+    // Every start of a run, as its last step and the start it continues.
+    let mut partials = List<Partial>.make()
+    let mut index: usize = 0
+    while index < steps.length {
+      if steps[index].handled && !nodes[steps[index].from].awaiting {
+        run List<Partial>.append(&mut partials, Partial { before: PARTIAL_NONE, step: index, depth: 1 })
+      }
+      index = index + 1
+    }
+    let mut current: usize = 0
+    while current < partials.length() {
+      let step = partials.asSlice()[current].step
+      let depth = partials.asSlice()[current].depth
+      let last = steps[step].to
+      let mut continued = false
+      if nodes[last].awaiting && depth < limit {
+        index = 0
+        while index < steps.length {
+          if steps[index].from == last && steps[index].handled {
+            continued = true
+            run List<Partial>.append(&mut partials, Partial { before: current, step: index, depth: depth + 1 })
+          }
+          index = index + 1
+        }
+      }
+      if !continued {
+        let mut taken = List<usize>.make()
+        let mut position: usize = 0
+        while position < depth {
+          run List<usize>.append(&mut taken, 0)
+          position = position + 1
+        }
+        let mut at = current
+        position = depth
+        while position > 0 {
+          position = position - 1
+          let mut slots = List<usize>.asMutSlice(&mut taken)
+          slots[position] = partials.asSlice()[at].step
+          at = partials.asSlice()[at].before
+        }
+        let first = taken.asSlice()[0]
+        run List<Run>.append(
+          &mut found,
+          Run {
+            from: steps[first].from,
+            steps: move taken,
+            to: last,
+            settled: !nodes[last].awaiting,
+          },
+        )
+      }
+      current = current + 1
+    }
+    return move found
+  }
+}
+
+const PARTIAL_NONE: usize = 18446744073709551615
+
+// The start of a run: its last step, the start it continues, and how many steps it has.
+struct Partial {
+  before: usize,
+  step: usize,
+  depth: usize,
+}
+
+fn contains(names: &[string<'static>], name: string) -> bool {
+  let mut index: usize = 0
+  while index < names.length {
+    if names[index] == name {
+      return true
+    }
+    index = index + 1
+  }
+  return false
+}
