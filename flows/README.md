@@ -21,6 +21,10 @@ Run them from this directory.
 
 - `silk task cover [--check]` writes `flows.json`, the routes of the tool's machine.
 - `silk task pages [--check]` writes the pages of `reference/flows`.
+- `silk task chart --machine <name>` prints a machine (`Silk`, `ProjectFlow`, `DependencyFlow`,
+  `BuildFlow` or `ServerFlow`) as an xstate config in JSON. To see it drawn, paste it into a new
+  machine in Stately Studio (https://stately.ai/editor) as `createMachine(<the JSON>)`, with
+  Import.
 - `silk task trips` prints the trips of the compiler's machines: paths of commands that together
   take every command from every state it can start in, each way it can go from there.
 - `silk task drive --silk <tool> --toolchain <dir>` types every route and every trip into a real
