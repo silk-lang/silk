@@ -56,7 +56,8 @@ Fraction of new roots to record. Child spans inherit the parent’s sampled bit.
 pub openCapacity: usize
 ```
 
-Maximum number of sampled spans simultaneously open in the recorder.
+Number of span records beyond the finished-span buffers. A record is held from the span's
+open until a drain takes it, so open spans and undrained finished spans share the pool.
 
 <a id="Config.threadCapacity"></a>
 
@@ -350,6 +351,18 @@ pub droppedLinks: u64
 
 Number of links omitted at the per-span limit.
 
+<a id="Span.thread"></a>
+
+### Field `thread`
+
+```silk
+pub thread: u64
+```
+
+The operating system's identifier of the thread that opened this span, written as
+`thread.id`; zero where the target gives none. A span whose fiber moves to another thread
+keeps the thread it opened on.
+
 <a id="Span.impl.Copy"></a>
 
 ## Implementation `Copy for Span`
@@ -489,6 +502,19 @@ pub fn takeSpan(self: &Self) -> Option<Span>
 ```
 
 Takes one finished span. When a producer is writing a slot, draining skips that slot.
+
+<a id="Recorder.impl.takeSpanInto"></a>
+
+### Method `takeSpanInto`
+
+```silk
+pub fn takeSpanInto(self: &Self, span: &mut Span) -> bool
+```
+
+Takes one finished span into `span`, as [`takeSpan`](#Recorder.impl.takeSpan) does, and returns whether there was
+one. Only what the span holds is written: its attributes, events and links past their counts
+keep what `span` held, so a drain that reuses one record copies no more than the span's
+contents.
 
 <a id="Recorder.impl.Meter"></a>
 

@@ -323,25 +323,37 @@ What a trace holds, from the outside in:
 
 With `--trace-queries`, each run of a semantic query is a span named for its family, such as
 `query.Body` or `query.Mir`, with the declaration it is about as `subject`, and each borrow check
-is a `borrow.check`. They nest as the queries demanded each other, so the tree under a
+is a `borrow.check`. A run about a declaration says where it is written: its package as
+`silk.package`, its module's path in the package as `code.file.path`, and the line and column of
+its header as `code.line.number` and `code.column.number`. A borrow check gives the package and
+path, and its parent query run the line. They nest as the queries demanded each other, so the tree under a
 `check.module` or a `codegen.walk` is the order the work was done in. A build runs hundreds of
 thousands of them: the value is the number of microseconds a run must take to be written, `0` for
 every one. A shorter run is written too when a span below it is, such as the parse of a file an
-import read first, so every span of the file has its parent. Recording them costs each run about
-two microseconds, which shows in the time of a span that holds thousands: a check of 2,300
-modules runs a million of them and takes a sixth longer.
+import read first, so every span of the file has its parent. Recording a span costs about a
+tenth of a microsecond. A thread of its own writes the file, about two microseconds a span, most
+of that its JSON, while the compiling thread goes on; it stops before the compiler copies itself
+with `fork`. A check of the harfrust shaping test harness writes 240,000 spans and takes about 2%
+longer. Without `--trace`, or with only the phases traced, a build takes as long as one with no
+tracing in the compiler at all.
 
 Whether or not the runs have spans, each compilation logs what they add up to, as log records
 under its `semantic` span:
 
 - `queries: {runs} runs for {demands} demands`: the store's `demands`, `hits` and `runs`.
-- `query.family {family}`: per family, its `runs`, `own_ns` (the time in its runs and in no query
-  they demanded) and `total_ns`.
+- `query.family {family}`: per family, its `runs`, its `hits` (demands its memo answered without a
+  run), how many of those hits were `verified` (marked outdated by an edit, then found current),
+  `own_ns` (the time in its runs and in no query they demanded) and `total_ns`.
 - `query.module {module}`: the same for the queries about one module's declarations, for each
   module that took a millisecond or more of its own. This is the list of files that are slow to
   check.
 
-The numbers are the records' attributes; `event.template` tells the three apart.
+The numbers are the records' attributes; `event.template` tells the three apart. The `cache` span
+of a store that reads a cache file says what it took from it: `adopted_roots` (module checks
+reused), `stale_roots` (those to check again), `adopted_units` (query answers adopted current),
+`changed_inputs` (sources and inputs that read differently now), and `own` (whether the file was
+the package's own or a dependency's). The `objects` span of a build gives its `units` and how
+many were `compiled`, the rest coming from the object cache.
 
 An attribute keeps 64 bytes of text, so a longer path or name keeps its end. The recorder is
 bounded and never waits: a trace that lacks spans says so on standard error when the process ends.

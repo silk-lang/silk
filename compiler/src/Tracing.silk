@@ -14,9 +14,10 @@
 //! too when something below it is, so no span of the file lacks its parent. Their totals are
 //! logged either way, by query family and by module.
 //!
-//! The recorder is bounded and never waits, and nothing here starts a thread: a process that
-//! copies itself with `fork` must have one. So the thread that compiles writes the file itself,
-//! with [`pump`] after pieces of work and [`flush`] before the process copies or replaces itself.
+//! The recorder is bounded and never waits. A thread of its own writes the file, so that the
+//! thread that compiles only records: [`pump`], after pieces of work, starts it, and [`flush`]
+//! stops it and writes what is left. A process that copies itself with `fork` must have no other
+//! thread, so it flushes first; so does one that replaces itself.
 
 import driver.ProcessMemory
 import ReleaseVersion
@@ -66,6 +67,10 @@ pub struct QueryTime {
   /// The family's name; empty for a module.
   pub name: string<'static>,
   pub runs: u64,
+  /// The demands its memo answered without a run, the ones it had to verify among them included.
+  pub hits: u64,
+  /// The memo's answers that an edit had marked outdated and that were verified current.
+  pub verified: u64,
   /// The time in these runs and in no query they demanded, in nanoseconds.
   pub own: u64,
   /// The time in these runs with everything they demanded, in nanoseconds. A run that demands
@@ -102,7 +107,8 @@ pub fn leaf<'a>(bytes: &'a [u8]) -> string<'a> {
 }
 
 static if supported {
-  import silk.concurrency.sync { Arc }
+  import silk.concurrency.sync { Arc, Parker, Unparker }
+  import silk.concurrency.thread_native { JoinHandle, NativeThread, SpawnError }
   import silk.io.logger { Logger }
   import silk.io.writer { WriterError }
   import silk.io.writer_native { StderrWriter }
@@ -114,26 +120,29 @@ static if supported {
   import silk.platform.native.file { NativeFile, NativeFileError, OPEN_APPEND, OPEN_CREATE, OPEN_WRITE_ONLY }
   import silk.trace { SpanContext, SpanGuard, SpanKind, Trace, Tracer }
   import silk.trace.log { OtelLogger }
-  import silk.trace.otlp { Batch, Resource, encode }
+  import silk.trace.otlp { Batch, Resource, encodeInto }
   import silk.trace.record { Config, Recorder, Span }
   import silk.trace.signals { LogRecord }
 
   // How many spans or logs one line of the file holds.
-  const batch: usize = 32
+  const batch: usize = 128
 
   // How many calls of `pump` pass between two writes.
   const pumped: u32 = 64
 
-  // What the process records with, and what its compiling thread keeps between writes. Only
-  // that thread reads or writes it; the recorder inside is what the other threads share.
-  struct State {
+  // How long the writing thread waits between two writes, in nanoseconds: the recorder holds
+  // 8192 finished spans, which the fastest work fills in no less than several milliseconds.
+  const writeNanos: u64 = 1000000
+
+  // What writes the file: what the drains take from the recorder, and which of it the file keeps.
+  // The writing thread holds it while one runs, and the compiling thread between.
+  struct Sink {
     recorder: Arc<Recorder>,
     descriptor: i32,
     // Whether query runs and borrow checks have spans.
     queries: bool,
     // The shortest query run or borrow check the file keeps, in nanoseconds.
     minimum: u64,
-    calls: u32,
     // What one drain took from the recorder, and which of it the file keeps.
     taken: List<Span>,
     kept: List<bool>,
@@ -142,9 +151,38 @@ static if supported {
     wanted: List<u64>,
     wantedCount: usize,
     spans: List<Span>,
+    // The line being written, kept so that encoding a line needs no allocation.
+    line: Bytes,
     logs: List<LogRecord>,
     // Whether a write failed: the file is then left alone.
     broken: bool,
+    // The identifier of the process's span once `abandon` wrote it, whose own close is left out;
+    // zero before.
+    abandoned: u64,
+  }
+
+  // The thread that writes the file while the compiling thread works, and the token that stops it.
+  struct Writing {
+    thread: JoinHandle<Sink>,
+    wake: Unparker,
+  }
+
+  // What the process records with, and what its compiling thread keeps. Only that thread reads or
+  // writes it; the recorder inside is what the other threads share.
+  struct State {
+    recorder: Arc<Recorder>,
+    descriptor: i32,
+    // Whether query runs and borrow checks have spans.
+    queries: bool,
+    // The shortest query run or borrow check the file keeps, in nanoseconds.
+    minimum: u64,
+    calls: u32,
+    // What writes the file, when no thread holds it.
+    sink: Option<Sink>,
+    // The thread that holds it, while one runs.
+    writing: Option<Writing>,
+    // Whether a thread could not be started: the compiling thread then writes the file itself.
+    threadless: bool,
     // The span the process's own continues, when the program that started it gave one.
     parent: Option<SpanContext>,
     // The span of the whole process, kept to write it if the process ends without closing it.
@@ -235,6 +273,24 @@ static if supported {
     return config
   }
 
+  fn fresh(recorder: &Arc<Recorder>, descriptor: i32, queries: bool, minimum: u64) -> Sink {
+    return Sink {
+      recorder: recorder.clone(),
+      descriptor: descriptor,
+      queries: queries,
+      minimum: minimum,
+      taken: List<Span>.make(),
+      kept: List<bool>.make(),
+      wanted: List<u64>.make(),
+      wantedCount: usize.ZERO,
+      spans: List<Span>.make(),
+      line: Bytes.make(),
+      logs: List<LogRecord>.make(),
+      broken: false,
+      abandoned: 0,
+    }
+  }
+
   effect fn session(descriptor: i32, queries: bool, minimum: u64, small: bool) -> Session
     ! OutOfMemoryError
     ? &mut Allocator {
@@ -246,13 +302,9 @@ static if supported {
       queries: queries,
       minimum: minimum,
       calls: 0,
-      taken: List<Span>.make(),
-      kept: List<bool>.make(),
-      wanted: List<u64>.make(),
-      wantedCount: usize.ZERO,
-      spans: List<Span>.make(),
-      logs: List<LogRecord>.make(),
-      broken: false,
+      sink: Option<Sink>.some(fresh(&recorder, descriptor, queries, minimum)),
+      writing: Option<Writing>.none(),
+      threadless: false,
       parent: Option<SpanContext>.none(),
       root: Span.empty(),
       rooted: false,
@@ -428,7 +480,7 @@ static if supported {
   }
 
   // Adds the span identifier `id` to the table of parents the file must keep.
-  effect fn want(state: &mut State, id: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  effect fn want(state: &mut Sink, id: u64) -> () ! OutOfMemoryError ? &mut Allocator {
     if id == 0 {
       return ()
     }
@@ -454,13 +506,10 @@ static if supported {
     }
   }
 
-  effect fn encoded(bytes: Result<Bytes, WriterError | OutOfMemoryError>) -> Bytes {
-    return match move bytes {
-      Result<Bytes, WriterError | OutOfMemoryError>.Success { value } => move value
-      Result<Bytes, WriterError | OutOfMemoryError>.Failure { error } => {
-        drop error
-        return Bytes.make()
-      }
+  effect fn encoded(result: Result<(), WriterError | OutOfMemoryError>, line: &mut Bytes) -> () {
+    if let Result<(), WriterError | OutOfMemoryError>.Failure { error } = move result {
+      drop error
+      Bytes.clear(&mut line.*)
     }
   }
 
@@ -476,73 +525,92 @@ static if supported {
 
   // Appends one request to the file with one write, so that the lines of the processes that
   // share the file never mix.
-  effect fn writeLine(state: &mut State, line: Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
-    let mut text = move line
-    if Bytes.length(&text) == usize.ZERO || state.broken {
+  effect fn writeLine(state: &mut Sink) -> () ! OutOfMemoryError ? &mut Allocator {
+    if Bytes.length(&state.line) == usize.ZERO || state.broken {
       return ()
     }
-    run Bytes.append(&mut text, b"\n")
+    run Bytes.append(&mut state.line, b"\n")
     let mut error = 0
-    if !run NativeDescriptor.writeAll(state.descriptor, Bytes.asSlice(&text), &mut error) {
+    if !run NativeDescriptor.writeAll(state.descriptor, Bytes.asSlice(&state.line), &mut error) {
       state.broken = true
     }
   }
 
-  effect fn writeSpans(state: &mut State) -> () ! OutOfMemoryError ? &mut Allocator {
+  // Writes `values` as lines of at most `batch` spans.
+  effect fn writeSpanSlice(state: &mut Sink, values: &[Span]) -> () ! OutOfMemoryError ? &mut Allocator {
+    let resource = identity(state.recorder.get())
+    let mut start = usize.ZERO
+    while start < values.length {
+      let mut count = values.length - start
+      if count > batch {
+        count = batch
+      }
+      run encoded(
+        run Effect.result(encodeInto(&resource, &Batch.Spans { values: Slice.view<Span>(values, start, count) },
+          &mut state.line)),
+        &mut state.line,
+      )
+      run writeLine(&mut state.*)
+      start = start + count
+    }
+  }
+
+  effect fn writeSpans(state: &mut Sink) -> () ! OutOfMemoryError ? &mut Allocator {
     if List<Span>.length(&state.spans) == usize.ZERO {
       return ()
     }
-    let resource = identity(state.recorder.get())
-    let line = run encoded(
-      run Effect.result(encode(&resource, &Batch.Spans { values: List<Span>.asSlice(&state.spans) })),
-    )
+    let spans = Intrinsic.replace(state.spans, List<Span>.make())
+    run writeSpanSlice(&mut state.*, List<Span>.asSlice(&spans))
+    state.spans = move spans
     List<Span>.clear(&mut state.spans)
-    return run writeLine(&mut state.*, move line)
   }
 
-  effect fn writeLogs(state: &mut State) -> () ! OutOfMemoryError ? &mut Allocator {
+  effect fn writeLogs(state: &mut Sink) -> () ! OutOfMemoryError ? &mut Allocator {
     if List<LogRecord>.length(&state.logs) == usize.ZERO {
       return ()
     }
     let resource = identity(state.recorder.get())
-    let line = run encoded(
-      run Effect.result(encode(&resource, &Batch.Logs { values: List<LogRecord>.asSlice(&state.logs) })),
+    run encoded(
+      run Effect.result(encodeInto(&resource, &Batch.Logs { values: List<LogRecord>.asSlice(&state.logs) },
+        &mut state.line)),
+      &mut state.line,
     )
     List<LogRecord>.clear(&mut state.logs)
-    return run writeLine(&mut state.*, move line)
+    return run writeLine(&mut state.*)
   }
 
   // Takes what the recorder has finished and writes what the file keeps of it.
-  effect fn drain(state: &mut State) -> () ! OutOfMemoryError ? &mut Allocator {
-    state.calls = 0
+  effect fn drain(state: &mut Sink) -> () ! OutOfMemoryError ? &mut Allocator {
     let recorder = state.recorder.clone()
     if List<Span>.capacity(&state.spans) == usize.ZERO {
       run List<Span>.reserveExact(&mut state.spans, batch)
       run List<LogRecord>.reserveExact(&mut state.logs, batch)
     }
-    List<Span>.clear(&mut state.taken)
     List<bool>.clear(&mut state.kept)
+    // `taken` keeps its records from drain to drain, so a span is copied into one in place, and
+    // only what it holds.
+    let mut count = usize.ZERO
     let mut remaining = recorder.get().finishedCapacity()
     while remaining != usize.ZERO {
-      match recorder.get().takeSpan() {
-        Option<Span>.Some { value } => {
-          remaining = remaining - usize.ONE
-          if !(state.abandoned && value.context.span == state.root.context.span) {
-            run List<Span>.append(&mut state.taken, value)
-          }
+      if count == List<Span>.length(&state.taken) {
+        run List<Span>.append(&mut state.taken, Span.empty())
+      }
+      let slot = &mut List<Span>.asMutSlice(&mut state.taken)[count]
+      if recorder.get().takeSpanInto(&mut slot.*) {
+        remaining = remaining - usize.ONE
+        if state.abandoned == 0 || slot.context.span != state.abandoned {
+          count = count + usize.ONE
         }
-        Option<Span>.None => {
-          remaining = usize.ZERO
-        }
+      } else {
+        remaining = usize.ZERO
       }
     }
     // A span closes after everything below it, so what a drain takes holds no span whose
     // children an earlier drain did not. Within one drain the order is the recorder's pages',
     // so the parents are settled over the whole of it.
-    let count = List<Span>.length(&state.taken)
     let filtering = state.queries && state.minimum != 0
     let mut at = usize.ZERO
-    while at < count {
+    while filtering && at < count {
       let span = &List<Span>.asSlice(&state.taken)[at]
       let kept = keeps(span, state.minimum)
       let parent = span.parent.span
@@ -569,18 +637,26 @@ static if supported {
         at = at + usize.ONE
       }
     }
-    at = usize.ZERO
-    while at < count {
-      if List<bool>.get(&state.kept, at) {
-        let span = List<Span>.asSlice(&state.taken)[at]
-        drop List<Span>.appendWithinCapacity(&mut state.spans, span)
-        if List<Span>.length(&state.spans) == batch {
-          run writeSpans(&mut state.*)
+    // The kept spans move to the front of what was taken, in order, and are written from there.
+    let mut held = usize.ZERO
+    if filtering {
+      at = usize.ZERO
+      while at < count {
+        if List<bool>.get(&state.kept, at) {
+          if held != at {
+            let taken = List<Span>.asMutSlice(&mut state.taken)
+            taken[held] = taken[at]
+          }
+          held = held + usize.ONE
         }
+        at = at + usize.ONE
       }
-      at = at + usize.ONE
+    } else {
+      held = count
     }
-    run writeSpans(&mut state.*)
+    let taken = Intrinsic.replace(state.taken, List<Span>.make())
+    run writeSpanSlice(&mut state.*, Slice.view<Span>(List<Span>.asSlice(&taken), usize.ZERO, held))
+    state.taken = move taken
     remaining = recorder.get().signals.logCapacity()
     while remaining != usize.ZERO {
       match recorder.get().signals.takeLog() {
@@ -599,26 +675,91 @@ static if supported {
     return run writeLogs(&mut state.*)
   }
 
+  // The writing thread: writes what the recorder has finished every `writeNanos`, until it is
+  // woken, and hands back what writes the file.
+  effect fn writingLoop(sink: Sink, parker: Parker) -> Sink {
+    let mut allocator = Allocator.systemAllocatorProvider()
+    let mut held = move sink
+    while !parker.parkTimeout(writeNanos) {
+      drop run Effect.result(drain(&mut held) |> Effect.provideMut<Allocator>(&mut allocator))
+    }
+    return move held
+  }
+
+  // Starts the writing thread with what writes the file. When no thread can start, the compiling
+  // thread writes the file itself from then on.
+  effect fn start(state: &mut State) -> () ! OutOfMemoryError ? &mut Allocator {
+    let sink = match move Intrinsic.replace(state.sink, Option<Sink>.none()) {
+      Option<Sink>.Some { value } => move value
+      Option<Sink>.None => {
+        return ()
+      }
+    }
+    let parker = run Parker.make()
+    let wake = parker.unparker()
+    let started = run Effect.result(NativeThread.spawn(|| -> Sink {
+      return run writingLoop(move sink, move parker)
+    }))
+    match move started {
+      Result<JoinHandle<Sink>, OutOfMemoryError | SpawnError>.Success { value } => {
+        state.writing = Option<Writing>.some(Writing { thread: move value, wake: move wake })
+      }
+      Result<JoinHandle<Sink>, OutOfMemoryError | SpawnError>.Failure { error } => {
+        drop error
+        // What the thread was to hold held nothing yet unwritten but its buffers.
+        state.threadless = true
+        state.sink = Option<Sink>.some(fresh(&state.recorder, state.descriptor, state.queries, state.minimum))
+      }
+    }
+  }
+
+  // Stops the writing thread, if one runs, and takes back what writes the file.
+  fn stop(state: &mut State) -> () {
+    if let Option<Writing>.Some { value } = move Intrinsic.replace(state.writing, Option<Writing>.none()) {
+      let writing = move value
+      writing.wake.unpark()
+      state.sink = Option<Sink>.some(writing.thread.join())
+    }
+  }
+
+  // Stops the writing thread and writes everything the recorder has finished.
+  effect fn settled(state: &mut State) -> () ! OutOfMemoryError ? &mut Allocator {
+    stop(&mut state.*)
+    if let Option<Sink>.Some { value } = &mut state.sink {
+      run drain(&mut value)
+    }
+  }
+
   /// Counts one piece of finished work, and writes what the recorder has finished once enough of
-  /// them have passed. Call it on the compiling thread, after a span closes: often enough that
-  /// the recorder never fills, which costs it spans.
+  /// them have passed: on a thread of its own, started then, or on this one when none can start.
+  /// Call it on the compiling thread, after a span closes: often enough that the recorder never
+  /// fills, which costs it spans.
   pub effect fn pump() -> () ? &mut Allocator {
     let mut anchor = ()
     if let Option<*mut State>.Some { value } = Pointer.nonNullMut<State>(unsafe Pointer.read(slot())) {
       let state = unsafe Pointer.borrowMut(&mut anchor, value)
       state.calls = state.calls + 1
       if state.calls >= pumped {
-        drop run Effect.result(drain(&mut state.*))
+        state.calls = 0
+        if state.threadless {
+          if let Option<Sink>.Some { value: sink } = &mut state.sink {
+            drop run Effect.result(drain(&mut sink))
+          }
+        } else {
+          drop run Effect.result(start(&mut state.*))
+        }
       }
     }
   }
 
-  /// Writes everything the recorder has finished: after the work of other threads has been
-  /// collected, and before this process copies itself, so that the copy holds nothing unwritten.
+  /// Stops the thread that writes the file and writes everything the recorder has finished:
+  /// after the work of other threads has been collected, and before this process copies itself
+  /// with `fork`, so that the copy has no other thread and holds nothing unwritten. The next
+  /// [`pump`] starts the thread again.
   pub effect fn flush() -> () ? &mut Allocator {
     let mut anchor = ()
     if let Option<*mut State>.Some { value } = Pointer.nonNullMut<State>(unsafe Pointer.read(slot())) {
-      drop run Effect.result(drain(unsafe Pointer.borrowMut(&mut anchor, value)))
+      drop run Effect.result(settled(unsafe Pointer.borrowMut(&mut anchor, value)))
     }
   }
 
@@ -628,13 +769,16 @@ static if supported {
     let mut anchor = ()
     if let Option<*mut State>.Some { value } = Pointer.nonNullMut<State>(unsafe Pointer.read(slot())) {
       let state = unsafe Pointer.borrowMut(&mut anchor, value)
-      drop run Effect.result(drain(&mut state.*))
+      drop run Effect.result(settled(&mut state.*))
       if state.rooted && !state.abandoned {
         state.abandoned = true
         let mut root = state.root
         root.end = state.recorder.get().now()
-        if List<Span>.appendWithinCapacity(&mut state.spans, root) {
-          drop run Effect.result(writeSpans(&mut state.*))
+        if let Option<Sink>.Some { value: sink } = &mut state.sink {
+          sink.abandoned = root.context.span
+          if List<Span>.appendWithinCapacity(&mut sink.spans, root) {
+            drop run Effect.result(writeSpans(&mut sink))
+          }
         }
       }
     }
@@ -649,7 +793,11 @@ static if supported {
     if dropped != 0 {
       StderrWriter.print("silk: the trace lacks {} spans the recorder had no room for\n", &.(dropped))
     }
-    if session.state.broken {
+    let broken = match &session.state.sink {
+      Option<Sink>.Some { value } => value.broken
+      Option<Sink>.None => false
+    }
+    if broken {
       StderrWriter.print("silk: could not write all of the trace file\n", &())
     }
     drop run Effect.result(NativeFile.close(session.state.descriptor))
@@ -689,7 +837,7 @@ static if supported {
         return QueryMark { slot: usize.MAX, module: usize.MAX, outerSlot: usize.MAX, outerModule: usize.MAX, started: 0 }
       }
     }
-    let empty = QueryTime { name: "", runs: 0, own: 0, total: 0 }
+    let empty = QueryTime { name: "", runs: 0, hits: 0, verified: 0, own: 0, total: 0 }
     while List<QueryTime>.length(&state.families) <= family {
       run List<QueryTime>.append(&mut state.families, empty)
     }
@@ -715,6 +863,31 @@ static if supported {
     state.active = family
     state.activeModule = module
     return mark
+  }
+
+  /// Counts a demand of the query family numbered `family`, called `name`, that its memo answered
+  /// without a run; `verified` when the answer had been marked outdated and was verified current.
+  /// Does nothing when the process is not traced.
+  pub effect fn countHit(family: usize, name: string<'static>, verified: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut anchor = ()
+    let state = match Pointer.nonNullMut<State>(unsafe Pointer.read(slot())) {
+      Option<*mut State>.Some { value } => unsafe Pointer.borrowMut(&mut anchor, value)
+      Option<*mut State>.None => {
+        return ()
+      }
+    }
+    let empty = QueryTime { name: "", runs: 0, hits: 0, verified: 0, own: 0, total: 0 }
+    while List<QueryTime>.length(&state.families) <= family {
+      run List<QueryTime>.append(&mut state.families, empty)
+    }
+    let families = List<QueryTime>.asMutSlice(&mut state.families)
+    families[family].name = name
+    families[family].hits = families[family].hits + 1
+    if verified {
+      families[family].verified = families[family].verified + 1
+    }
   }
 
   /// Ends the run `mark` opened, also one that failed. Calls nest as [`enterQuery`] did.
@@ -749,7 +922,7 @@ static if supported {
       let ran = List<QueryTime>.asSlice(&state.families)
       let mut at = usize.ZERO
       while at < ran.length {
-        if ran[at].runs != 0 {
+        if ran[at].runs != 0 || ran[at].hits != 0 {
           run List<QueryTime>.append(&mut families.*, ran[at])
         }
         at = at + usize.ONE
@@ -861,6 +1034,11 @@ static if supported {
     ! OutOfMemoryError
     ? &mut Allocator {
     return QueryMark { slot: usize.MAX, module: usize.MAX, outerSlot: usize.MAX, outerModule: usize.MAX, started: 0 }
+  }
+
+  /// Counts a demand its memo answered. Nothing, in this compiler.
+  pub effect fn countHit(family: usize, name: string<'static>, verified: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+    return ()
   }
 
   /// Ends the run `mark` opened. Nothing, in this compiler.
