@@ -1,14 +1,15 @@
 //! Tracing of the compiler's own work.
 //!
-//! With `SILK_TRACE` naming a file, a compiler process records what it does as OpenTelemetry spans
-//! and logs through `silk.trace`, and appends them to that file as OTLP JSON, one request per
-//! line. The spans are opened where the work is: `@trace` on the function that does a phase, and
-//! `Trace.span` where the name or an attribute is only known inside. Without `SILK_TRACE` no
-//! recorder is provided, every span is the default provider's empty one, and nothing here reads a
-//! clock or allocates.
+//! Asked for a trace, a compiler process records what it does as OpenTelemetry spans and logs
+//! through `silk.trace`, and appends them to a file as OTLP JSON, one request per line. A command
+//! is asked with `--trace <file>`, and `silkc compile` by the `trace` record of its compilation
+//! request: [`Options`] is either. The environment asks for nothing. The spans are opened where
+//! the work is: `@trace` on the function that does a phase, and `Trace.span` where the name or an
+//! attribute is only known inside. Unasked, no recorder is provided, every span is the default
+//! provider's empty one, and nothing here reads a clock or allocates.
 //!
 //! One semantic query and one borrow check are far smaller than a phase, and a build runs them
-//! by the hundred thousand, so their spans are recorded only with `SILK_TRACE_QUERIES` set, to the
+//! by the hundred thousand, so their spans are recorded only when [`Options.queries`] gives the
 //! number of microseconds a run must take to be kept (0 keeps every one). A shorter run is kept
 //! too when something below it is, so no span of the file lacks its parent. Their totals are
 //! logged either way, by query family and by module.
@@ -17,7 +18,6 @@
 //! copies itself with `fork` must have one. So the thread that compiles writes the file itself,
 //! with [`pump`] after pieces of work and [`flush`] before the process copies or replaces itself.
 
-import driver.ProcessImage
 import driver.ProcessMemory
 import ReleaseVersion
 import silk.collections.bytes { Bytes }
@@ -32,8 +32,20 @@ import silk.num.u8
 import silk.num.u64
 import silk.num.usize
 import silk.system.host_input { HostInput }
-import silk.text.format { ParseError }
 import silk.text.string { InvalidUtf8, String }
+
+/// What a compiler process is asked to trace: the `--trace` options of its command line, or the
+/// `trace` record of the compilation request it compiles.
+pub struct Options {
+  /// The file the trace is appended to, as written; it is created when absent.
+  pub file: Bytes,
+  /// How many microseconds a semantic query run or a borrow check must take to be a span of its
+  /// own; zero makes every one a span, and none leaves both without spans.
+  pub queries: Option<u64>,
+  /// The W3C `traceparent` of the span the process's own span continues: the one open in the
+  /// program that started this process for a part of its traced work.
+  pub parent: Option<Bytes>,
+}
 
 /// Whether this compiler can trace itself: it needs a host whose files it can append to.
 pub const supported: bool = (Intrinsic.targetOperatingSystem() == "darwin" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64") && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64"))
@@ -133,6 +145,8 @@ static if supported {
     logs: List<LogRecord>,
     // Whether a write failed: the file is then left alone.
     broken: bool,
+    // The span the process's own continues, when the program that started it gave one.
+    parent: Option<SpanContext>,
     // The span of the whole process, kept to write it if the process ends without closing it.
     root: Span,
     rooted: bool,
@@ -239,6 +253,7 @@ static if supported {
       spans: List<Span>.make(),
       logs: List<LogRecord>.make(),
       broken: false,
+      parent: Option<SpanContext>.none(),
       root: Span.empty(),
       rooted: false,
       abandoned: false,
@@ -256,53 +271,33 @@ static if supported {
     return Option<Bytes>.none()
   }
 
-  effect fn variable(name: string) -> Option<Bytes> ? &mut HostInput | &mut Allocator {
-    return run Effect.catchAll(HostInput.variableNamed(name), unset)
-  }
-
   effect fn unopened(error: NativeFileError) -> i32 {
     drop error
     return -1
   }
 
-  /// The session of a process `SILK_TRACE` asks to trace, or none. The language server is never
-  /// traced: it has no end to write a trace at.
-  pub effect fn open() -> Option<Session>
-    ! OutOfMemoryError
-    ? &mut HostInput | &mut Allocator {
-    let path = match move run variable("SILK_TRACE") {
-      Option<Bytes>.Some { value } => move value
-      Option<Bytes>.None => {
-        return Option<Session>.none()
-      }
-    }
-    if Bytes.length(&path) == usize.ZERO {
-      return Option<Session>.none()
-    }
-    if let Option<Bytes>.Some { value: command } = move run Effect.catchAll(HostInput.argument(usize.ONE), unset) {
-      if label(Bytes.asSlice(&command)) == "lsp" {
-        return Option<Session>.none()
-      }
-    }
+  /// The session of a process asked to trace itself as `options` say, or none when the file
+  /// cannot be opened, which standard error then says.
+  pub effect fn open(options: &Options) -> Option<Session> ! OutOfMemoryError ? &mut Allocator {
     let descriptor = run Effect.catch<NativeFileError>(
-      NativeFile.open(Bytes.asSlice(&path), OPEN_WRITE_ONLY + OPEN_CREATE + OPEN_APPEND, 420),
+      NativeFile.open(Bytes.asSlice(&options.file), OPEN_WRITE_ONLY + OPEN_CREATE + OPEN_APPEND, 420),
       unopened,
     )
     if descriptor < 0 {
-      StderrWriter.print("silk: cannot write the trace file SILK_TRACE names\n", &())
+      StderrWriter.print("silk: cannot write the trace file\n", &())
       return Option<Session>.none()
     }
     let mut queries = false
     let mut minimum = u64.MAX
-    if let Option<Bytes>.Some { value } = move run variable("SILK_TRACE_QUERIES") {
-      if let Result<u64, ParseError>.Success { value: microseconds } = u64.parse(label(Bytes.asSlice(&value))) {
-        queries = true
-        minimum = u64.saturatingMultiply(microseconds, 1000)
-      } else {
-        StderrWriter.print("silk: SILK_TRACE_QUERIES must be a number of microseconds\n", &())
-      }
+    if let Option<u64>.Some { value: microseconds } = options.queries {
+      queries = true
+      minimum = u64.saturatingMultiply(microseconds, 1000)
     }
-    return Option<Session>.some(run session(descriptor, queries, minimum, false))
+    let mut opened = run session(descriptor, queries, minimum, false)
+    if let Option<Bytes>.Some { value } = &options.parent {
+      opened.state.parent = Trace.parseTraceparent(label(Bytes.asSlice(&value)))
+    }
+    return Option<Session>.some(move opened)
   }
 
   /// Makes `session` the one this process records into. `session` must stay where it is until
@@ -348,9 +343,8 @@ static if supported {
     return run move work
   }
 
-  /// Opens the span of the whole process, named `silkc`, with its command. It continues the trace
-  /// of the process that started this one when `TRACEPARENT` names it, and sets `TRACEPARENT` for
-  /// the processes this one starts.
+  /// Opens the span of the whole process, named `silkc`, with its command. It continues the span
+  /// [`Options.parent`] named when the session was opened.
   pub effect fn root() -> SpanGuard ? &mut HostInput | &mut Allocator {
     let mut anchor = ()
     let state = match Pointer.nonNullMut<State>(unsafe Pointer.read(slot())) {
@@ -359,10 +353,7 @@ static if supported {
         return Trace.spanOf("silkc", SpanKind.Server)
       }
     }
-    let mut remote = Option<SpanContext>.none()
-    if let Option<Bytes>.Some { value } = move run variable("TRACEPARENT") {
-      remote = Trace.parseTraceparent(label(Bytes.asSlice(&value)))
-    }
+    let remote = state.parent
     let guard = match remote {
       Option<SpanContext>.Some { value } => Trace.spanFrom(&value, "silkc")
       Option<SpanContext>.None => Trace.spanOf("silkc", SpanKind.Server)
@@ -382,14 +373,12 @@ static if supported {
       state.root.start = state.recorder.get().now()
       state.root.attributes.set("command", &label(Bytes.asSlice(&command)))
       state.rooted = true
-      let header = Trace.traceparent(&current)
-      drop run Effect.result(ProcessImage.setVariable(b"TRACEPARENT", String.utf8Bytes(header.view())))
     }
     return move guard
   }
 
-  /// The `TRACEPARENT` value with which a compiler this process starts continues its trace under
-  /// the current span, or none when the process is not traced.
+  /// The W3C `traceparent` of the current span, with which a compiler this process starts
+  /// continues the trace under it, or none when the process is not traced.
   pub effect fn parent() -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
     if on() {
       if let Option<SpanContext>.Some { value } = Trace.current() {
@@ -771,6 +760,7 @@ static if supported {
     }
   }
 } else {
+  import silk.io.writer_native { StderrWriter }
   import silk.trace { SpanGuard, SpanKind, Trace }
 
   /// A traced process's recorder and state. This compiler traces nothing.
@@ -802,10 +792,10 @@ static if supported {
     return Option<SpanGuard>.none()
   }
 
-  /// The session of a process `SILK_TRACE` asks to trace. None, in this compiler.
-  pub effect fn open() -> Option<Session>
-    ! OutOfMemoryError
-    ? &mut HostInput | &mut Allocator {
+  /// The session of a process asked to trace itself. None, in this compiler, which standard
+  /// error says.
+  pub effect fn open(options: &Options) -> Option<Session> ! OutOfMemoryError ? &mut Allocator {
+    StderrWriter.print("silk: this compiler cannot write a trace on this host\n", &())
     return Option<Session>.none()
   }
 
@@ -836,7 +826,7 @@ static if supported {
     return Trace.spanOf("silkc", SpanKind.Server)
   }
 
-  /// The `TRACEPARENT` value for a compiler this process starts. None, in this compiler.
+  /// The `traceparent` for a compiler this process starts. None, in this compiler.
   pub effect fn parent() -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
     return Option<Bytes>.none()
   }

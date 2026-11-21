@@ -18,6 +18,12 @@ generated module source files. Parameters record their declaring module, type, d
 default when available, and selected value. Integer parameters use decimal text to preserve
 their exact value through JSON tools.
 
+A request's optional `trace` record asks the compiler to record its own work on that request:
+`file` is the absolute path it appends OpenTelemetry spans and logs to as OTLP JSON lines,
+`queries` the number of microseconds a semantic query run must take to be a span, and `parent` a
+W3C `traceparent` under which the compilation continues another program's trace. The record
+changes nothing else the compiler writes, and a build writes none into the request it publishes.
+
 An ordinary artifact build writes `requests/<artifact-name>.toml` beside its output. Generated
 source files are retained under `requests/sources/`. Replaying a request requires the source
 files and native inputs it names to remain available. The request itself contains no executable

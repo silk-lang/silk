@@ -280,16 +280,27 @@ name or an attribute is only known inside. `src/Tracing.silk` provides the recor
 the trace. It is off unless asked for:
 
 ```sh
-SILK_TRACE=build.ndjson silk build                          # phases, files, units
-SILK_TRACE=build.ndjson SILK_TRACE_QUERIES=100 silk build   # and each query run of 100 µs or more
+silk build --trace build.ndjson                       # phases, files, units
+silk build --trace build.ndjson --trace-queries 100   # and each query run of 100 µs or more
 ```
 
-`SILK_TRACE` names a file the compiler appends to: OTLP JSON, one request per line, which an
-OpenTelemetry collector takes at `/v1/traces` and `/v1/logs` as it is. Every process of one
-command writes to the same file under one trace: the workspace members a build copies itself for,
-the copy that writes the semantic cache, and the compilers a task starts, which continue the trace
-that `TRACEPARENT` names. Linux and macOS compilers trace; the others ignore the variables. The
-language server is never traced.
+`--trace` names a file the compiler appends to: OTLP JSON, one request per line, which an
+OpenTelemetry collector takes at `/v1/traces` and `/v1/logs` as it is. `build`, `check`, `test`,
+`run`, `debug`, `hash` and `task` take it. Every process of one command writes to the same file
+under one trace: the workspace members a build copies itself for, the copy that writes the
+semantic cache, and the compiler a workspace command starts for each member. A traced `check`
+does its work in its own process and asks no check server.
+
+`silkc compile --request` takes the same from the `trace` record of its compilation request
+(`CompilerTrace` in `silk.build.request`): the `file`, the `queries` threshold, and the `parent`,
+a W3C `traceparent` under which the compilation's spans continue the trace of the program that
+wrote the request. A command takes that parent as `--trace-parent`. Nothing in the environment
+asks for a trace, and a build writes no `trace` record into the request it publishes.
+
+The compilations a tasks program starts are not traced yet: `silk task --trace` and a `build` that
+`src/tasks.silk` answers trace the compiler that builds the tasks program, and no `trace` record
+reaches the requests its graph compiles. Linux and macOS compilers trace; another host's says it
+cannot. The language server has no such option.
 
 What a trace holds, from the outside in:
 
@@ -310,7 +321,7 @@ What a trace holds, from the outside in:
 | `object` | One codegen unit on a compiling thread, with its `package`: `bitcode.encode` and the Clang `process` |
 | `process` | One program the compiler ran, with its `program` |
 
-With `SILK_TRACE_QUERIES`, each run of a semantic query is a span named for its family, such as
+With `--trace-queries`, each run of a semantic query is a span named for its family, such as
 `query.Body` or `query.Mir`, with the declaration it is about as `subject`, and each borrow check
 is a `borrow.check`. They nest as the queries demanded each other, so the tree under a
 `check.module` or a `codegen.walk` is the order the work was done in. A build runs hundreds of
@@ -337,7 +348,7 @@ bounded and never waits: a trace that lacks spans says so on standard error when
 
 A new span is one line. Put `@trace(name: "phase.step")` on the function, or open
 `let _traced = Trace.span("phase.step")` and name what it is about with
-`Trace.set("module", &Tracing.label(path))`. Without `SILK_TRACE` a span costs a few nanoseconds,
+`Trace.set("module", &Tracing.label(path))`. Without a trace asked for, a span costs a few nanoseconds,
 but its attributes are still evaluated: build one that allocates only under `Tracing.on()`. A
 span opened for every query or body must be a `Tracing.detail` span. Work in a loop that ends
 many spans calls `Tracing.pump()` so the recorder is written before it fills, and a process calls

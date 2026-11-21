@@ -16,7 +16,7 @@ Every record rejects unknown fields. The `version` field identifies this wire fo
 
 Import as `Request` with `import silk.build.request { Request }`.
 
-Public declarations: 26.
+Public declarations: 27.
 
 <a id="Request"></a>
 
@@ -217,6 +217,16 @@ pub runner: Option<Runner>
 ```
 
 The program used to run a foreign artifact or its tests.
+
+<a id="Request.trace"></a>
+
+### Field `trace`
+
+```silk
+pub trace: Option<CompilerTrace>
+```
+
+Where the compiler records its own work on this request as a trace, when asked.
 
 <a id="Request.impl.Schema"></a>
 
@@ -1934,6 +1944,67 @@ impl Schema for Runner
 
 ```silk
 static fn spec() -> Spec<Runner>
+```
+
+<a id="CompilerTrace"></a>
+
+## `CompilerTrace`
+
+```silk
+pub struct CompilerTrace
+```
+
+The compiler's record of its own work on one request: OpenTelemetry spans and logs, appended
+to a file as OTLP JSON, one export request per line. It changes nothing the compiler writes
+besides that file.
+
+<a id="CompilerTrace.file"></a>
+
+### Field `file`
+
+```silk
+pub file: String
+```
+
+The absolute path of the file the compiler appends the trace to, creating it when absent.
+
+<a id="CompilerTrace.queries"></a>
+
+### Field `queries`
+
+```silk
+pub queries: Option<u64>
+```
+
+How many microseconds one semantic query run or one borrow check must take to be a span of
+its own; zero makes every one a span. Absent, the trace has no span for either.
+
+<a id="CompilerTrace.parent"></a>
+
+### Field `parent`
+
+```silk
+pub parent: Option<String>
+```
+
+The W3C `traceparent` of the span this compilation continues, so that the trace of the
+program that started the compiler holds the compilation. Absent, the compilation starts a
+trace of its own.
+
+<a id="CompilerTrace.impl.Schema"></a>
+
+## Implementation `Schema for CompilerTrace`
+
+```silk
+impl Schema for CompilerTrace
+```
+
+<a id="CompilerTrace.impl.Schema.spec"></a>
+
+### Operation `spec`
+
+```silk
+static fn spec() -> Spec<CompilerTrace>
 ```
 
 <a id="Request.impl"></a>

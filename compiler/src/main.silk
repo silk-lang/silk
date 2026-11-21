@@ -186,7 +186,8 @@ import silk.build.request as Requests {
   Platform as RequestPlatform,
   Wasm as RequestWasm,
   MacOS as RequestMacOS,
-  Installation as RequestInstallation
+  Installation as RequestInstallation,
+  CompilerTrace
 }
 import driver.CHeader
 import driver.CompilationPlatform
@@ -211,7 +212,8 @@ import driver.ProjectCommand as ProjectCommands {
   Dump as DumpCommand,
   SourceBuild as SourceBuildCommand,
   SourceTest as SourceTestCommand,
-  Test as TestCommand
+  Test as TestCommand,
+  TraceOptions
 }
 import driver.ProjectPlan as ProjectPlans { PlanError, ProjectPlan }
 import driver.ProjectInitializer as ProjectInitializers {
@@ -11264,7 +11266,8 @@ effect fn checkProject(working: &Path, command: CheckCommand) -> i32
   // A check of one package leaves a check server behind (`CheckServer`). A workspace check leaves
   // none: each member's server would hold its whole store, and a workspace of many members would
   // fill the machine's memory with them.
-  let serve = !noServer && projects.length == usize.ONE
+  // A traced check does its work in this process, where the trace is recorded.
+  let serve = !noServer && projects.length == usize.ONE && !Tracing.on()
 
   // Members check side by side in copies of the process, except in a replay, which compares one
   // run's steps.
@@ -11434,6 +11437,14 @@ effect fn memberRequest(compiler: &[u8], manifest: &Path, quiet: bool) -> Proces
     if selects(argument, b"--package=") || selects(argument, b"--manifest-path=") {
       continue
     }
+    // The member's trace continues under the span that starts it, not the one this process's did.
+    if same(argument, b"--trace-parent") {
+      at = at + usize.ONE
+      continue
+    }
+    if selects(argument, b"--trace-parent=") {
+      continue
+    }
     if same(argument, b"--no-server") {
       silenced = true
     }
@@ -11444,16 +11455,14 @@ effect fn memberRequest(compiler: &[u8], manifest: &Path, quiet: bool) -> Proces
   if quiet && !silenced {
     run ChildProcess.addArgument(&mut request, "--no-server")
   }
-  // A traced compiler's member continues its trace under the span that starts it.
-  let traced = run Tracing.parent()
+  if let Option<Bytes>.Some { value } = move run Tracing.parent() {
+    run ChildProcess.addArgument(&mut request, "--trace-parent")
+    run ChildProcess.addArgumentBytes(&mut request, Bytes.asSlice(&value))
+  }
   let names = run HostInput.variableNames()
   let listed = List<Bytes>.asSlice(&names)
   at = usize.ZERO
   while at < listed.length {
-    if Option<Bytes>.isSome(&traced) && same(Bytes.asSlice(&listed[at]), b"TRACEPARENT") {
-      at = at + usize.ONE
-      continue
-    }
     if let Option<Bytes>.Some { value } = move run HostInput.variable(Bytes.asSlice(&listed[at])) {
       run ChildProcess.setVariableBytes(
         &mut request,
@@ -11462,9 +11471,6 @@ effect fn memberRequest(compiler: &[u8], manifest: &Path, quiet: bool) -> Proces
       )
     }
     at = at + usize.ONE
-  }
-  if let Option<Bytes>.Some { value } = &traced {
-    run ChildProcess.setVariableBytes(&mut request, b"TRACEPARENT", Bytes.asSlice(&value))
   }
   return move request
 }
@@ -13683,6 +13689,9 @@ effect fn taskAlias(working: &Path, name: &[u8], arguments: &[Bytes]) -> Option<
     // The compiler's own options stay with the compiler, so a tasks program reads only its own;
     // the compilations its graph runs honor them through the environment `tasksEnvironment` sets.
     let selection = same(word, b"--manifest-path") || same(word, b"--stdlib")
+      || same(word, b"--trace")
+      || same(word, b"--trace-queries")
+      || same(word, b"--trace-parent")
       || same(word, b"--clang")
       || same(word, b"--package")
       || same(word, b"-p")
@@ -13693,6 +13702,9 @@ effect fn taskAlias(working: &Path, name: &[u8], arguments: &[Bytes]) -> Option<
       || same(word, b"--ignore-warnings")
       || selects(word, b"--manifest-path=")
       || selects(word, b"--stdlib=")
+      || selects(word, b"--trace=")
+      || selects(word, b"--trace-queries=")
+      || selects(word, b"--trace-parent=")
       || selects(word, b"--clang=")
       || selects(word, b"--package=")
       || selects(word, b"--backend=")
@@ -16797,8 +16809,50 @@ effect fn report(
   return 1
 }
 
-effect fn untraced(error: OutOfMemoryError) -> Option<Tracing.Session> {
+effect fn untraced<E>(error: E) -> Option<Tracing.Session> {
   drop error
+  return Option<Tracing.Session>.none()
+}
+
+// The session the command line asks for with `--trace <file>`, or none. It is opened before the
+// line is parsed, because it records the whole command; the command's parser checks the options.
+effect fn commandTracing() -> Option<Tracing.Session>
+  ! HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator {
+  let written = run HostInput.arguments()
+  let arguments = List<Bytes>.asSlice(&written)
+  if arguments.length < 2 {
+    return Option<Tracing.Session>.none()
+  }
+  let TraceOptions { trace, traceQueries, traceParent } = move run ProjectCommands.traceOptions(
+    Bytes.asSlice(&arguments[1]),
+    Slice.view<Bytes>(arguments, 2, arguments.length - 2),
+  )
+  return match move trace {
+    Option<Bytes>.Some { value: file } => run Tracing.open(
+      &Tracing.Options { file: move file, queries: traceQueries, parent: move traceParent },
+    )
+    Option<Bytes>.None => Option<Tracing.Session>.none()
+  }
+}
+
+// The session the compilation request `request` asks for with its `trace` record, or none.
+effect fn requestTracing(request: &CompilationRequest) -> Option<Tracing.Session>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if let Option<CompilerTrace>.Some { value } = &request.trace {
+    let mut parent = Option<Bytes>.none()
+    if let Option<String>.Some { value: named } = &value.parent {
+      parent = Option<Bytes>.some(run Bytes.copy(String.ownedUtf8Bytes(&named)))
+    }
+    return run Tracing.open(
+      &Tracing.Options {
+        file: run Bytes.copy(String.ownedUtf8Bytes(&value.file)),
+        queries: value.queries,
+        parent: move parent,
+      },
+    )
+  }
   return Option<Tracing.Session>.none()
 }
 
@@ -16808,8 +16862,8 @@ pub effect fn main() -> i32
   let mut typeTable = TypeTable.make()
   let mut output = StdoutWriter.make()
 
-  // The process's own trace, when `SILK_TRACE` asks for one.
-  let mut tracing = run Effect.catchAll(Tracing.open(), untraced)
+  // The process's own trace, when its command line asks for one with `--trace`.
+  let mut tracing = run Effect.catchAll(commandTracing(), untraced)
     |> Effect.provideMut<Allocator>(&mut allocator)
   if let Option<Tracing.Session>.Some { value } = &mut tracing {
     Tracing.install(&mut value)
@@ -16994,8 +17048,49 @@ effect fn compileRequest(working: &Path, file: &Bytes, ignoreWarnings: bool, rep
       }
     }
   }
-  let profile = run CompilationRequests.profile(&request)
-  let bindings = run CompilationRequests.bindings(&request)
+
+  // A request that asks for a trace is compiled within a session of its own, under a span of
+  // the process that continues the one the request names.
+  let mut tracing = run requestTracing(&request)
+  if let Option<Tracing.Session>.Some { value } = &mut tracing {
+    Tracing.install(&mut value)
+  }
+  let status = run Tracing.within(&tracing, compileTraced(working, &request, ignoreWarnings, reported))
+  if let Option<Tracing.Session>.Some { value } = &mut tracing {
+    run Tracing.close(&mut value)
+  }
+  return status
+}
+
+effect fn compileTraced(
+  working: &Path,
+  request: &CompilationRequest,
+  ignoreWarnings: bool,
+  reported: bool,
+) -> i32
+  ! ApplicationError
+    | InitialProfileProblem
+    | FileError
+    | ProcessError
+    | HostInputError
+    | InvalidModulePath
+    | InvalidSourceRoot
+    | InvalidDependency
+    | MissingManifest
+    | InvalidBuildComposition
+    | MissingStandardLibrary
+    | InvalidNativeLinkInput
+    | TomlError
+    | RegistrationClosed
+    | ConflictingPackageSource
+    | Cycle
+    | RevisionMismatch
+    | OutOfMemoryError
+    | WriterError
+  ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types {
+  let _traced = run Tracing.root()
+  let profile = run CompilationRequests.profile(request)
+  let bindings = run CompilationRequests.bindings(request)
   let source = run Path.make(request.root.view())
   let output = run Path.make(request.output.view())
   let library = Option<Path>.some(run Path.make(request.stdlib.view()))
@@ -17021,7 +17116,7 @@ effect fn compileRequest(working: &Path, file: &Bytes, ignoreWarnings: bool, rep
   } else {
     Stage.Final
   }
-  let supply = run requestSupply(&request)
+  let supply = run requestSupply(request)
 
   // A tasks program's graph runs this for `silk build`, which passes its own options through the
   // environment (`tasksEnvironment`).
@@ -17070,7 +17165,7 @@ effect fn compileRequest(working: &Path, file: &Bytes, ignoreWarnings: bool, rep
   let mut built = run Path.fromBytes(Path.rawBytes(&output))
   if let Option<Path>.Some { value: root } = &kept {
     cacheHome = run SemanticCache.directory(&root, String.ownedUtf8Bytes(&request.name))
-    built = run keptArtifact(&root, &request)
+    built = run keptArtifact(&root, request)
     if let Option<Path>.Some { value: directory } = move run Path.parent(&built) {
       run FileSystem.createDirectoriesRecursively(&directory)
     }
@@ -17101,7 +17196,7 @@ effect fn compileRequest(working: &Path, file: &Bytes, ignoreWarnings: bool, rep
     MirListing.Off,
     warningsIgnored,
     true,
-    Option<&CompilationRequest>.some(&request),
+    Option<&CompilationRequest>.some(request),
     false,
     Option<Path>.none(),
     false,
