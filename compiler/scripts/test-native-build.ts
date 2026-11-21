@@ -5586,6 +5586,102 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   const checkedReport = checkedBoth.stdout + checkedBoth.stderr
   assert.ok(checkedReport.indexOf('Finished one') < checkedReport.indexOf('Finished two'), checkedReport)
   assert.match(checkedReport, /Finished 2 packages/)
+  // --trace: a compiler writes its own work as OTLP spans and logs (compiler/src/Tracing.silk), on
+  // the hosts whose compilers trace. Every process of a command writes one trace: the tree is
+  // whole whether a member runs in a copy of the process or in a compiler of its own. Only the
+  // command line and a compilation request ask for a trace; the environment does not.
+  if (process.platform === 'linux' || process.platform === 'darwin') {
+    type TracedSpan = { traceId: string; spanId: string; parentSpanId?: string; name: string; attributes: ReadonlyArray<{ key: string }> }
+    const traceFile = join(directory, 'trace.ndjson')
+    const readTrace = Effect.fnUntraced(function* () {
+      const spans: Array<TracedSpan> = []
+      const templates: Array<string> = []
+      for (const line of (yield* fs.readFileString(traceFile)).split('\n').filter((text) => text !== '')) {
+        const request = (yield* decodeJson(line)) as {
+          resourceSpans?: ReadonlyArray<{ scopeSpans: ReadonlyArray<{ spans: ReadonlyArray<TracedSpan> }> }>
+          resourceLogs?: ReadonlyArray<{ scopeLogs: ReadonlyArray<{ logRecords: ReadonlyArray<{ attributes: ReadonlyArray<{ key: string; value: { stringValue?: string } }> }> }> }>
+        }
+        for (const resource of request.resourceSpans ?? []) for (const scope of resource.scopeSpans) spans.push(...scope.spans)
+        for (const resource of request.resourceLogs ?? []) {
+          for (const scope of resource.scopeLogs) {
+            for (const record of scope.logRecords) {
+              templates.push(record.attributes.find((attribute) => attribute.key === 'event.template')?.value.stringValue ?? '')
+            }
+          }
+        }
+      }
+      const known = new Set(spans.map((span) => span.spanId))
+      const roots = spans.filter((span) => span.parentSpanId === undefined || !known.has(span.parentSpanId))
+      assert.deepEqual(roots.map((span) => span.name), ['silkc'], 'every span but the command\'s own has its parent in the file')
+      assert.equal(new Set(spans.map((span) => span.traceId)).size, 1, 'one command is one trace')
+      assert.equal(known.size, spans.length, 'no two spans share an identifier')
+      return { names: spans.map((span) => span.name), spans, templates }
+    })
+    const traceOf = Effect.fnUntraced(function* (args: ReadonlyArray<string>, environment: NodeJS.ProcessEnv) {
+      yield* fs.remove(traceFile, { force: true })
+      yield* fs.remove(join(shared, 'build'), { recursive: true, force: true })
+      const ran = yield* invoke(silk, [...args, '--trace', traceFile, '--stdlib', standardLibrary], shared, environment)
+      assert.equal(ran.status, 0, ran.stderr)
+      assert.doesNotMatch(ran.stderr, /the trace lacks|trace file/)
+      settleCaches(shared)
+      return yield* readTrace()
+    })
+    const count = (names: ReadonlyArray<string>, name: string) => names.filter((found) => found === name).length
+    const tracedBuild = yield* traceOf(['build', '--package', 'one'], splitEnvironment)
+    for (const phase of ['unit.build', 'load', 'parse.file', 'semantic', 'check', 'codegen', 'codegen.walk', 'link', 'object', 'process']) {
+      assert.ok(tracedBuild.names.includes(phase), `a build's trace has a ${phase} span`)
+    }
+    assert.ok(
+      tracedBuild.spans.some((span) => span.name === 'parse.file' && span.attributes.some((attribute) => attribute.key === 'module')),
+      'a parsed file names its module',
+    )
+    assert.ok(!tracedBuild.names.some((name) => name.startsWith('query.')), 'query runs have spans only when asked')
+    assert.ok(tracedBuild.templates.some((template) => template.startsWith('query.family')), 'a build logs its query families')
+    // The request the traced build published, compiled before the next traced command clears
+    // `build`.
+    const tracedRequests = join(shared, 'build/requests')
+    const tracedPublished = (yield* fs.readDirectory(tracedRequests)).find((name) => name.startsWith('one.') && name.endsWith('.toml'))
+    assert.ok(tracedPublished, 'a build publishes its request')
+    const tracedRequest = yield* fs.readFileString(join(tracedRequests, tracedPublished))
+    assert.doesNotMatch(tracedRequest, /^\[trace\]/m, 'a published request asks for no trace')
+    // A compilation request asks for a trace with its `trace` record, and the compilation
+    // continues the span the record names.
+    const traceParent = '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01'
+    yield* fs.remove(traceFile, { force: true })
+    const compiledTraced = yield* invoke(
+      silk,
+      ['compile', '--request', '-'],
+      shared,
+      { ...splitEnvironment, SILK_TRACE: join(directory, 'ignored.ndjson') },
+      120_000,
+      `${tracedRequest}\n[trace]\nfile = ${JSON.stringify(traceFile)}\nparent = "${traceParent}"\n`,
+    )
+    assert.equal(compiledTraced.status, 0, compiledTraced.stderr)
+    assert.equal(yield* fs.exists(join(directory, 'ignored.ndjson')), false, 'the environment asks for no trace')
+    const tracedCompile = yield* readTrace()
+    const compileRoot = tracedCompile.spans.find((span) => span.name === 'silkc')
+    assert.equal(compileRoot?.traceId, '0af7651916cd43dd8448eb211c80319c')
+    assert.equal(compileRoot?.parentSpanId, 'b7ad6b7169203331')
+    assert.ok(tracedCompile.names.includes('semantic'))
+    // A member checked in a copy of the process, then in a compiler of its own.
+    const tracedCopies = yield* traceOf(['check', '--no-server', '--workspace', '--trace-queries', '0'], splitEnvironment)
+    assert.equal(count(tracedCopies.names, 'unit.check'), 2)
+    assert.equal(count(tracedCopies.names, 'silkc'), 1)
+    assert.ok(tracedCopies.names.some((name) => name.startsWith('query.')), '--trace-queries gives each query run a span')
+    assert.ok(tracedCopies.names.includes('borrow.check'))
+    // A threshold leaves out the short query runs, but none that holds a span the trace keeps,
+    // such as the parse of a file an import was first to read.
+    const tracedSlow = yield* traceOf(['build', '--package', 'two', '--trace-queries=60000000'], splitEnvironment)
+    assert.ok(tracedSlow.names.includes('parse.file'))
+    assert.ok(tracedSlow.names.filter((name) => name.startsWith('query.')).length < tracedCopies.names.length / 4)
+    const tracedProcesses = yield* traceOf(['check', '--no-server', '--workspace'], inProcesses)
+    assert.equal(count(tracedProcesses.names, 'unit.check'), 2)
+    assert.equal(count(tracedProcesses.names, 'silkc'), 3, 'each member compiler continues the command\'s trace')
+    // A traced check of one package does its work in this process, though earlier checks left a
+    // server behind.
+    const tracedAlone = yield* traceOf(['check', '--package', 'one'], splitEnvironment)
+    assert.ok(tracedAlone.names.includes('check'), 'a traced check asks no check server')
+  }
   yield* fs.writeFileString(join(shared, 'two/src/main.silk'), 'pub fn main() -> i32 {\n  return missing\n}\n')
   const checkedBroken = yield* invoke(silk, ['check', '--workspace', '--stdlib', standardLibrary], shared, inProcesses)
   assert.equal(checkedBroken.status, 1, checkedBroken.stderr)

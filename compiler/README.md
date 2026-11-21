@@ -10,7 +10,7 @@ compiles it again.
 | `conformance/` | Native conformance programs and runners |
 | `fixtures/` | Test inputs |
 | `scripts/` | Build, release and verification scripts used by CI |
-| `profiling/` | The opt-in Tracy build (see below) |
+| `profiling/` | Measurements of the compiler's generated code |
 | `native-seed.json` | The pinned seed compiler used to build N1 |
 | `silk.toml` | Package manifest |
 
@@ -58,7 +58,7 @@ request's roots (`Request.forgetRoots`) and the lowered functions no answer name
 (`Semantic.releaseStaleMir`), which a unit that reruns has replaced.
 `rejections` counts the root package's rejections and every parsed module's syntax errors, and
 `update-us` and `check-us` are the wall time of `Semantic.update` and of the check. Step 0 is the
-first check. The `replayUpdate` and `replayCheck` Tracy zones cover the same spans.
+first check. The `replay.update` and `replay.check` spans of a trace cover the same work.
 
 A script is a TOML file of `[[edit]]` tables applied in order. `kind` is `trivia`, `body`,
 `header-same-type`, `header-new-type`, `add`, `delete` or `rename`, and `module` is the edited
@@ -272,23 +272,84 @@ The compiler, `silkc` in a release, knows nothing about Silk versions: it runs i
 [silk tool](../tool) chooses and installs versions and forwards each command to the selected
 compiler with `SILK_TOOLCHAIN` and `SILK_HOME` set.
 
-## Profiling with Tracy
+## Tracing the compiler
 
-`src/Profiler.silk` opens [Tracy](https://github.com/wolfpld/tracy) zones around the build
-phases (`build`, `preloadProgram`, `buildArtifact`, `checkDeclarations`, `buildFrom`,
-`compileIr`, and `replayUpdate` and `replayCheck` for an edit replay), every semantic query provider run (named by its family, such as `Body`, `Signature`,
-`Mir` or `LlvmText`) and each `BorrowCheck`. Query and borrow-check zones carry the declaration
-they work on, such as `semantic/Semantic.lowerMir`, as zone text. Ordinary builds leave it off, so they declare and call
-nothing. To build an instrumented compiler at `.scratch/silk-tracy`:
+The compiler records its own work as OpenTelemetry spans and logs with `silk.trace`, the way a
+Silk program does: `@trace` on the function that does a piece of work, `Trace.span` where the
+name or an attribute is only known inside. `src/Tracing.silk` provides the recorder and writes
+the trace. It is off unless asked for:
 
 ```sh
-SILK=path/to/silk CLANG=path/to/clang compiler/profiling/build-tracy.sh
+silk build --trace build.ndjson                       # phases, files, units
+silk build --trace build.ndjson --trace-queries 100   # and each query run of 100 µs or more
 ```
 
-The script fetches Tracy v0.14.1 into `.scratch`, copies the compiler to `.scratch/tracy-build`,
-switches `Profiler.enabled` on there and links the Tracy client; the checkout is not modified.
-Start the Tracy profiler or `tracy-capture -o run.tracy`, then run the compiler with
-`TRACY_NO_EXIT=1` so it waits until the trace is sent. Use the Tracy v0.14.1 tools; the trace
-protocol changes between releases. A new zone is one line, `let zone = Profiler.zone(b"name")`,
-and lasts until the value drops; `Profiler.text(&zone, text)` labels it, inside
-`static if Profiler.enabled` so ordinary builds never build the text.
+`--trace` names a file the compiler appends to: OTLP JSON, one request per line, which an
+OpenTelemetry collector takes at `/v1/traces` and `/v1/logs` as it is. `build`, `check`, `test`,
+`run`, `debug`, `hash` and `task` take it. Every process of one command writes to the same file
+under one trace: the workspace members a build copies itself for, the copy that writes the
+semantic cache, and the compiler a workspace command starts for each member. A traced `check`
+does its work in its own process and asks no check server.
+
+`silkc compile --request` takes the same from the `trace` record of its compilation request
+(`CompilerTrace` in `silk.build.request`): the `file`, the `queries` threshold, and the `parent`,
+a W3C `traceparent` under which the compilation's spans continue the trace of the program that
+wrote the request. A command takes that parent as `--trace-parent`. Nothing in the environment
+asks for a trace, and a build writes no `trace` record into the request it publishes.
+
+The compilations a tasks program starts are not traced yet: `silk task --trace` and a `build` that
+`src/tasks.silk` answers trace the compiler that builds the tasks program, and no `trace` record
+reaches the requests its graph compiles. Linux and macOS compilers trace; another host's says it
+cannot. The language server has no such option.
+
+What a trace holds, from the outside in:
+
+| Span | The work |
+| --- | --- |
+| `silkc` | The process, with its `command` |
+| `project.select`, `compiler.stamp`, `target` | Finding the packages, the compiler's identity, one package's artifact |
+| `unit.build`, `unit.check`, `unit.test` | One compilation, with its `output`, `target` and `optimization` |
+| `load` | `load.sources`, then one `load.wave` per level of imports: `load.read`, `load.parse` and `load.imports` |
+| `parse.file` | One file, with its `module` (as `package:path`) and `bytes`: `lex`, `parse`, `hir.lower`. Under `load.parse` on the parsing threads, or where a query first read a file no load parsed |
+| `cache` | Reading the semantic cache of the last build |
+| `semantic` | `check` and `codegen`, with the process's `memory.peak_bytes` at their end |
+| `check` | `check.runtime`, one `check.module` per module (`check.sweep` when its declarations are swept rather than verified), `check.escapes` |
+| `codegen` | `codegen.erasures`, `codegen.walk` (a build may walk more than once: `discovering`, `observing`), `codegen.replay` and `codegen.rewalk` of a build record, `codegen.assemble` |
+| `check.imports`, `check.syntax` | What the build checks after the walk |
+| `cache.packs`, `cache.save`, `cache.write` | Keeping the build for the next one; `cache.write` runs in a copy of the process while the link goes on |
+| `link` | `link.prepare`, `objects` (`units` in the program, `compiled` of them now), `optimize` |
+| `object` | One codegen unit on a compiling thread, with its `package`: `bitcode.encode` and the Clang `process` |
+| `process` | One program the compiler ran, with its `program` |
+
+With `--trace-queries`, each run of a semantic query is a span named for its family, such as
+`query.Body` or `query.Mir`, with the declaration it is about as `subject`, and each borrow check
+is a `borrow.check`. They nest as the queries demanded each other, so the tree under a
+`check.module` or a `codegen.walk` is the order the work was done in. A build runs hundreds of
+thousands of them: the value is the number of microseconds a run must take to be written, `0` for
+every one. A shorter run is written too when a span below it is, such as the parse of a file an
+import read first, so every span of the file has its parent. Recording them costs each run about
+two microseconds, which shows in the time of a span that holds thousands: a check of 2,300
+modules runs a million of them and takes a sixth longer.
+
+Whether or not the runs have spans, each compilation logs what they add up to, as log records
+under its `semantic` span:
+
+- `queries: {runs} runs for {demands} demands`: the store's `demands`, `hits` and `runs`.
+- `query.family {family}`: per family, its `runs`, `own_ns` (the time in its runs and in no query
+  they demanded) and `total_ns`.
+- `query.module {module}`: the same for the queries about one module's declarations, for each
+  module that took a millisecond or more of its own. This is the list of files that are slow to
+  check.
+
+The numbers are the records' attributes; `event.template` tells the three apart.
+
+An attribute keeps 64 bytes of text, so a longer path or name keeps its end. The recorder is
+bounded and never waits: a trace that lacks spans says so on standard error when the process ends.
+
+A new span is one line. Put `@trace(name: "phase.step")` on the function, or open
+`let _traced = Trace.span("phase.step")` and name what it is about with
+`Trace.set("module", &Tracing.label(path))`. Without a trace asked for, a span costs a few nanoseconds,
+but its attributes are still evaluated: build one that allocates only under `Tracing.on()`. A
+span opened for every query or body must be a `Tracing.detail` span. Work in a loop that ends
+many spans calls `Tracing.pump()` so the recorder is written before it fills, and a process calls
+`Tracing.flush()` before it copies itself.
