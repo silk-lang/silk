@@ -328,9 +328,11 @@ is a `borrow.check`. They nest as the queries demanded each other, so the tree u
 thousands of them: the value is the number of microseconds a run must take to be written, `0` for
 every one. A shorter run is written too when a span below it is, such as the parse of a file an
 import read first, so every span of the file has its parent. Recording a span costs about a
-tenth of a microsecond, and writing it about two, most of that its JSON: a check of the harfrust
-shaping test harness writes 240,000 of them and takes about 6% longer. Without `--trace`, or with
-only the phases traced, a build takes as long as one with no tracing in the compiler at all.
+tenth of a microsecond. A thread of its own writes the file, about two microseconds a span, most
+of that its JSON, while the compiling thread goes on; it stops before the compiler copies itself
+with `fork`. A check of the harfrust shaping test harness writes 240,000 spans and takes about 2%
+longer. Without `--trace`, or with only the phases traced, a build takes as long as one with no
+tracing in the compiler at all.
 
 Whether or not the runs have spans, each compilation logs what they add up to, as log records
 under its `semantic` span:
