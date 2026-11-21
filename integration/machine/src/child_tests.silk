@@ -1,0 +1,420 @@
+import silk.machine.actor { Actors, Reply }
+import silk.machine.chart { Chart, Enqueue, Machine, Next }
+import silk.machine.child { Child, Replies }
+import silk.machine.snapshot { Snapshot, Status, Steps, TransitionLoopError }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.io.writer { Writer, WriterError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.schema.issue { SchemaError }
+import silk.schema.json { SchemaJson }
+import silk.schema.schema { Schema }
+
+// The child: a payment that charges a card when it starts and finishes on the answer, or gives
+// up after a second without one.
+
+union Payment {
+  Charging,
+  Paid,
+  Declined
+}
+
+union PaymentEvent {
+  Approved,
+  Refused,
+}
+
+impl Copy for PaymentEvent {}
+
+struct PaymentContext {
+  pub amount: u32,
+}
+
+union PaymentEffect {
+  Charge { pub amount: u32 },
+}
+
+impl Schema for Payment {}
+
+impl Schema for PaymentEvent {}
+
+impl Schema for PaymentContext {}
+
+impl Schema for PaymentEffect {}
+
+impl Machine<PaymentEvent, PaymentContext, PaymentEffect> for Payment {
+  static fn chart() -> Chart<Payment, PaymentEvent, PaymentContext, PaymentEffect> {
+    return Chart<Payment, PaymentEvent, PaymentContext, PaymentEffect>.of()
+      |> Chart.initial(Payment.Charging)
+      |> Chart.on("Charging", "Approved", Payment.Paid)
+      |> Chart.on("Charging", "Refused", Payment.Declined)
+      |> Chart.after("Charging", 1s, Payment.Declined)
+      |> Chart.final("Paid")
+      |> Chart.final("Declined")
+  }
+
+  effect fn enter(
+    state: &Payment,
+    context: &mut PaymentContext,
+    enq: &mut Enqueue<PaymentEvent, PaymentEffect>,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match &state.* {
+      Payment.Charging => {
+        run enq.perform(PaymentEffect.Charge { amount: context.amount })
+      }
+      _ => {}
+    }
+    return ()
+  }
+}
+
+// The parent: a shop that starts a payment when it enters Paying and stops it when it leaves.
+
+type PaymentChild = Child<Payment, PaymentEvent, PaymentContext, PaymentEffect>
+
+union Shop {
+  Browsing,
+  Paying,
+  Sorry,
+  Thanks
+}
+
+union ShopEvent {
+  Buy { pub amount: u32 },
+  // An event for the payment, sent back by the payment's performer.
+  Pay { pub event: PaymentEvent },
+  Settled,
+}
+
+struct ShopContext {
+  pub amount: u32,
+  pub payment: PaymentChild,
+}
+
+union ShopEffect {
+  // An effect of the payment, performed by the payment's performer.
+  Payment { pub effect_: PaymentEffect },
+  Receipt { pub amount: u32 },
+}
+
+impl Schema for Shop {}
+
+impl Schema for ShopEvent {}
+
+impl Schema for ShopContext {}
+
+impl Schema for ShopEffect {}
+
+fn paid(context: &ShopContext, event: &ShopEvent) -> bool {
+  return match &context.payment.snapshot {
+    Option.Some { value } => match &value.value {
+      Payment.Paid => true
+      _ => false
+    }
+    Option.None => false
+  }
+}
+
+fn asShopEffect(queued: PaymentEffect) -> ShopEffect {
+  return ShopEffect.Payment { effect_: move queued }
+}
+
+fn asShopEvent(event: PaymentEvent) -> ShopEvent {
+  return ShopEvent.Pay { event: event }
+}
+
+impl Machine<ShopEvent, ShopContext, ShopEffect> for Shop {
+  static fn chart() -> Chart<Shop, ShopEvent, ShopContext, ShopEffect> {
+    return Chart<Shop, ShopEvent, ShopContext, ShopEffect>.of()
+      |> Chart.initial(Shop.Browsing)
+      |> Chart.on("Browsing", "Buy", Shop.Paying)
+      |> Chart.onWhen("Paying", "Settled", Shop.Thanks, paid)
+      |> Chart.on("Paying", "Settled", Shop.Sorry)
+      |> Chart.on("Sorry", "Buy", Shop.Paying)
+      |> Chart.final("Thanks")
+  }
+
+  effect fn handle(
+    state: &Shop,
+    context: &mut ShopContext,
+    event: &ShopEvent,
+    enq: &mut Enqueue<ShopEvent, ShopEffect>,
+  ) -> Next<Shop>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match &event.* {
+      ShopEvent.Buy { amount } => {
+        context.amount = amount
+      }
+      ShopEvent.Pay { event: inner } => {
+        drop run context.payment.send(inner)
+        run context.payment.drain(&mut enq.*, asShopEffect)
+        if context.payment.isDone() {
+          run enq.raise(ShopEvent.Settled)
+        }
+        return Next<Shop>.Stay
+      }
+      _ => {}
+    }
+    return Next<Shop>.Pass
+  }
+
+  effect fn enter(
+    state: &Shop,
+    context: &mut ShopContext,
+    enq: &mut Enqueue<ShopEvent, ShopEffect>,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match &state.* {
+      Shop.Paying => {
+        run context.payment.start(PaymentContext { amount: context.amount }, enq.clock)
+        run context.payment.drain(&mut enq.*, asShopEffect)
+      }
+      Shop.Thanks => {
+        run enq.perform(ShopEffect.Receipt { amount: context.amount })
+      }
+      _ => {}
+    }
+    return ()
+  }
+
+  // The payment's timers count as the shop's: the shop wakes up for them and steps the payment.
+  fn deadline(state: &Shop, context: &ShopContext) -> Option<u64> {
+    return context.payment.nextDeadline()
+  }
+
+  effect fn tick(
+    state: &Shop,
+    context: &mut ShopContext,
+    now: u64,
+    enq: &mut Enqueue<ShopEvent, ShopEffect>,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    drop run context.payment.advance(now)
+    run context.payment.drain(&mut enq.*, asShopEffect)
+    if context.payment.isDone() {
+      run enq.raise(ShopEvent.Settled)
+    }
+    return ()
+  }
+
+  effect fn exit(
+    state: &Shop,
+    context: &mut ShopContext,
+    enq: &mut Enqueue<ShopEvent, ShopEffect>,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match &state.* {
+      Shop.Paying => {
+        context.payment.stop()
+      }
+      _ => {}
+    }
+    return ()
+  }
+}
+
+// The card service the payment's effects use.
+service Cards {
+  effect fn charge(amount: u32) -> bool ? &mut Cards
+
+  effect fn receipt(amount: u32) -> () ? &mut Cards
+}
+
+struct TestCards {
+  pub charges: u32,
+  pub receipts: u32,
+}
+
+impl Cards for TestCards {
+  effect fn charge(self: &mut Self, amount: u32) -> bool {
+    self.charges = self.charges + 1
+    return amount <= 100
+  }
+
+  effect fn receipt(self: &mut Self, amount: u32) -> () {
+    self.receipts = self.receipts + amount
+    return ()
+  }
+}
+
+effect fn performPayment(queued: PaymentEffect, reply: &mut Reply<PaymentEvent>) -> ()
+  ! OutOfMemoryError
+  ? &mut Cards | &mut Allocator {
+  match move queued {
+    PaymentEffect.Charge { amount } => {
+      if run Cards.charge(amount) {
+        run reply.send(PaymentEvent.Approved)
+      } else {
+        run reply.send(PaymentEvent.Refused)
+      }
+    }
+  }
+  return ()
+}
+
+effect fn performShop(queued: ShopEffect, reply: &mut Reply<ShopEvent>) -> ()
+  ! OutOfMemoryError
+  ? &mut Cards | &mut Allocator {
+  match move queued {
+    ShopEffect.Payment { effect_: inner } => {
+      let mut answers = Replies.make<PaymentEvent>()
+      run performPayment(move inner, &mut answers)
+      run Replies.forward(move answers, &mut reply.*, asShopEvent)
+    }
+    ShopEffect.Receipt { amount } => {
+      run Cards.receipt(amount)
+    }
+  }
+  return ()
+}
+
+type ShopSnapshot = Snapshot<Shop, ShopEvent, ShopContext, ShopEffect>
+
+struct Capture {
+  bytes: [u8; 1024],
+  length: usize,
+}
+
+impl Writer for Capture {
+  effect fn writeAll(self: &mut Self, value: &[u8]) -> ()
+    ! WriterError
+    ? &mut Writer {
+    let mut index: usize = 0
+    while index < value.length {
+      self.bytes[self.length] = value[index]
+      self.length = self.length + 1
+      index = index + 1
+    }
+    return ()
+  }
+
+  effect fn flush(self: &mut Self) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return ()
+  }
+}
+
+effect fn shopScenario() -> ()
+  ! OutOfMemoryError | TransitionLoopError | SchemaError
+  ? &mut Cards | &mut Allocator {
+  let mut shop = run Steps.begin<Shop, ShopEvent, ShopContext, ShopEffect>(
+    ShopContext { amount: 0, payment: PaymentChild.absent() },
+    0,
+  )
+
+  // The payment starts, is refused, and the shop moves on, all inside one send.
+  run Actors.send(&mut shop, ShopEvent.Buy { amount: 500 }, performShop)
+  match &shop.value {
+    Shop.Sorry => {}
+    _ => Intrinsic.trap("expected Sorry")
+  }
+  if shop.context.payment.isActive() {
+    Intrinsic.trap("leaving Paying stops the payment")
+  }
+
+  // A step without the performer leaves the child started and its effect queued in the parent.
+  drop run Steps.send(&mut shop, ShopEvent.Buy { amount: 50 })
+  if !shop.context.payment.isActive() || shop.pending.length() != 1 {
+    Intrinsic.trap("expected a running payment and one queued effect")
+  }
+
+  // The snapshot holds the child, so the tree is saved and restored as one value.
+  let mut capture = Capture { bytes: [0; 1024], length: 0 }
+  let encoded = run Effect.result(SchemaJson.encode<ShopSnapshot>(&shop))
+    |> Effect.provideMut<Writer>(&mut capture)
+  match move encoded {
+    Result<(), SchemaError | WriterError | OutOfMemoryError>.Success { .. } => {}
+    Result<(), SchemaError | WriterError | OutOfMemoryError>.Failure { .. } => Intrinsic.trap(
+      "shop snapshot JSON",
+    )
+  }
+  let mut restored = run SchemaJson.decode<ShopSnapshot>(
+    Slice.view(&capture.bytes, 0, capture.length),
+  )
+  if !restored.context.payment.isActive() {
+    Intrinsic.trap("the restored shop has its payment")
+  }
+  run Actors.settle(&mut restored, performShop)
+  match &restored.status {
+    Status.Done => {}
+    _ => Intrinsic.trap("expected the restored shop to finish")
+  }
+  return ()
+}
+
+test effect fn parentRunsAChild()
+  ! OutOfMemoryError | TransitionLoopError | SchemaError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut cards = TestCards { charges: 0, receipts: 0 }
+  run shopScenario()
+    |> Effect.provideMut<Cards>(&mut cards)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  if cards.charges != 2 || cards.receipts != 50 {
+    Intrinsic.trap("expected two charges and one receipt of 50")
+  }
+  return ()
+}
+
+// A card service that never answers: the payment's own timer ends the wait.
+
+effect fn performNothing(queued: ShopEffect, reply: &mut Reply<ShopEvent>) -> () {
+  drop queued
+  return ()
+}
+
+effect fn timeoutScenario() -> ()
+  ! OutOfMemoryError | TransitionLoopError
+  ? &mut Allocator {
+  let mut shop = run Steps.begin<Shop, ShopEvent, ShopContext, ShopEffect>(
+    ShopContext { amount: 0, payment: PaymentChild.absent() },
+    5s,
+  )
+  run Actors.send(&mut shop, ShopEvent.Buy { amount: 50 }, performNothing)
+  match &shop.value {
+    Shop.Paying => {}
+    _ => Intrinsic.trap("expected Paying while the charge is not answered")
+  }
+
+  // The shop has no timer of its own. Its next deadline is the payment's, on the shop's clock.
+  match Steps.nextDeadline(&shop) {
+    Option<u64>.Some { value } => {
+      if value != 6s {
+        Intrinsic.trap("the payment gives up one second after it started")
+      }
+    }
+    Option<u64>.None => Intrinsic.trap("the payment's timer counts as the shop's")
+  }
+  run Actors.advance(&mut shop, 5s500ms, performNothing)
+  match &shop.value {
+    Shop.Paying => {}
+    _ => Intrinsic.trap("nothing is due before the deadline")
+  }
+
+  // At the deadline the shop steps the payment, which gives up, and the shop moves on.
+  run Actors.advance(&mut shop, 6s, performNothing)
+  match &shop.value {
+    Shop.Sorry => {}
+    _ => Intrinsic.trap("expected Sorry after the payment gave up")
+  }
+  match Steps.nextDeadline(&shop) {
+    Option<u64>.Some { .. } => Intrinsic.trap("a stopped payment has no deadline")
+    Option<u64>.None => {}
+  }
+  return ()
+}
+
+test effect fn childTimersWakeTheParent()
+  ! OutOfMemoryError | TransitionLoopError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run timeoutScenario() |> Effect.provideMut<Allocator>(&mut allocator)
+}

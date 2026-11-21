@@ -1,0 +1,453 @@
+//! The plan: the paths a run of the real `silk` tool takes, with what each step must leave.
+//!
+//! [`planned`] walks the machine in `Silk` and chooses paths. A [`Route`] is one path: the
+//! computer it starts on and its moves. A [`Move`] is one command with the answers of the world
+//! that follow it, the footprint the machine leaves for them, and the computer afterwards.
+//! [`written`] gives the plan as the text of `flows.json`, and [`read`] reads that text back.
+//!
+//! The plan is checked in. A change to a row of the chart then shows in review as a change to
+//! the moves that take the row: another exit status, another message, a new path.
+//!
+//! There are two kinds of route. The cover routes are chosen by the walk, one move each, so that
+//! every transition of the chart is taken at least once. The story routes are the paths of
+//! `Stories`, which a person wrote.
+
+import Computer { Computer }
+import Footprint { Footprint }
+import Laws
+import Silk { Silk, Typed }
+import Stories { Story, stories }
+import Walks { events, walked }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.reflect { Reflect }
+import silk.core.result { Result }
+import silk.io.writer { Writer, WriterError }
+import silk.machine.chart { Machines }
+import silk.machine.explore { Run, Walk }
+import silk.machine.rules { Rules }
+import silk.machine.snapshot { Steps, TransitionLoopError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.usize
+import silk.schema.issue { SchemaError }
+import silk.schema.json { SchemaJson }
+import silk.schema.schema { Schema }
+import silk.text.string { String }
+
+/// Why a route is in the plan.
+pub enum Kind {
+  /// The walk chose it, to take a transition no other route takes.
+  Cover,
+  /// A person wrote it, in `Stories`.
+  Story,
+}
+
+/// One command, from the moment it is typed until the tool ends.
+pub struct Move {
+  /// What the user types.
+  pub command: Typed,
+  /// What the world answers while the command runs, in order.
+  pub answers: List<Typed>,
+  /// Everything the command leaves, in order. Nothing else is allowed.
+  pub footprint: List<Footprint>,
+  /// The computer after the command.
+  pub state: Computer,
+  /// The reasons of the laws the command is under, see `Laws`.
+  pub reasons: List<String>,
+}
+
+/// One path through the tool.
+pub struct Route {
+  /// A short name without spaces: `cover-012`, or the name of the story.
+  pub name: String,
+  pub kind: Kind,
+  /// What the route shows, in one sentence.
+  pub about: String,
+  /// The computer the route starts on.
+  pub start: Computer,
+  pub moves: List<Move>,
+}
+
+/// The paths of a run, and what they cover.
+pub struct Plan {
+  /// How many transitions the chart has: the different combinations of a state, a kind of event,
+  /// the footprint it leaves and the state it leads to that the walk met.
+  pub transitions: usize,
+  /// How many of them a cover route takes.
+  pub covered: usize,
+  pub routes: List<Route>,
+}
+
+impl Schema for Kind {}
+
+impl Schema for Move {}
+
+impl Schema for Route {}
+
+impl Schema for Plan {}
+
+// A writer that counts the bytes it is given.
+struct Counter {
+  size: usize,
+}
+
+impl Writer for Counter {
+  effect fn writeAll(self: &mut Self, data: &[u8]) -> ()
+    ! WriterError {
+    self.size = self.size + data.length
+  }
+
+  effect fn flush(self: &mut Self) -> () ! WriterError {}
+}
+
+// A writer that fills bytes whose capacity was reserved.
+struct Buffer {
+  bytes: Bytes,
+}
+
+impl Writer for Buffer {
+  effect fn writeAll(self: &mut Self, data: &[u8]) -> ()
+    ! WriterError {
+    if !self.bytes.appendSliceWithinCapacity(data) {
+      fail Writer.failure()
+    }
+  }
+
+  effect fn flush(self: &mut Self) -> () ! WriterError {}
+}
+
+/// `value` as JSON text.
+///
+/// # Errors
+/// `SchemaError` when JSON cannot hold the value. `OutOfMemoryError`.
+pub effect fn json<T: Schema>(value: &T) -> Bytes
+  ! SchemaError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut counter = Counter { size: 0 }
+  let counted = run Effect.result(SchemaJson.encode<T>(value))
+    |> Effect.provideMut<Writer>(&mut counter)
+  match move counted {
+    Result<(), SchemaError | WriterError | OutOfMemoryError>.Success { .. } => {}
+    Result<(), SchemaError | WriterError | OutOfMemoryError>.Failure { error } => match move error {
+      SchemaError refused => {
+        fail move refused
+      }
+      WriterError { .. } => Intrinsic.trap("a counting writer takes every byte")
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+  let mut buffer = Buffer { bytes: run Bytes.makeWithCapacity(counter.size) }
+  let written = run Effect.result(SchemaJson.encode<T>(value))
+    |> Effect.provideMut<Writer>(&mut buffer)
+  match move written {
+    Result<(), SchemaError | WriterError | OutOfMemoryError>.Success { .. } => {}
+    Result<(), SchemaError | WriterError | OutOfMemoryError>.Failure { error } => match move error {
+      SchemaError refused => {
+        fail move refused
+      }
+      WriterError { .. } => Intrinsic.trap("the buffer has room for the counted bytes")
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+  return move buffer.bytes
+}
+
+/// A second value of `value`, made by writing it as JSON and reading it back.
+///
+/// # Errors
+/// `SchemaError` when JSON cannot hold the value. `OutOfMemoryError`.
+pub effect fn again<T: Schema>(value: &T) -> T
+  ! SchemaError | OutOfMemoryError
+  ? &mut Allocator {
+  let text = run json<T>(value)
+  return run SchemaJson.decode<T>(text.asSlice())
+}
+
+/// The position of the variant of `value` in its union `U`, from 0.
+pub fn variant<U>(value: &U) -> usize {
+  let mut at: usize = 0
+  static for on in Reflect.variants<U>() {
+    if Reflect.isVariant(value, on) {
+      return at
+    }
+    at = at + 1
+  }
+  return at
+}
+
+/// The position of `text` in `known`. A text that is not in `known` joins it at its end.
+///
+/// # Errors
+/// `OutOfMemoryError`.
+pub effect fn interned(known: &mut List<Bytes>, text: Bytes) -> usize
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let listed = List<Bytes>.asSlice(&known.*)
+  let mut at: usize = 0
+  while at < listed.length {
+    if listed[at].asSlice() == text.asSlice() {
+      return at
+    }
+    at = at + 1
+  }
+  run List<Bytes>.append(&mut known.*, move text)
+  return at
+}
+
+// Appends the reasons of the laws `event` is under on `computer`, each one once.
+effect fn reasoned(computer: &Computer, event: &Typed, reasons: &mut List<String>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut found = List<string<'static>>.make()
+  run Rules<Typed, Computer, Footprint>.applying(Laws.laws(), computer, event, &mut found)
+  let all = found.asSlice()
+  let mut at: usize = 0
+  while at < all.length {
+    let mut seen = false
+    let mut before: usize = 0
+    while before < at {
+      if all[before] == all[at] {
+        seen = true
+      }
+      before = before + 1
+    }
+    if !seen {
+      run List<String>.append(&mut reasons.*, run String.copy(all[at]))
+    }
+    at = at + 1
+  }
+  return ()
+}
+
+// `number` as three digits.
+effect fn numbered(prefix: string, number: usize) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let digits: [string<'static>; 10] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+  let mut name = run String.copy(prefix)
+  run String.append(&mut name, digits[number / 100 % 10])
+  run String.append(&mut name, digits[number / 10 % 10])
+  run String.append(&mut name, digits[number % 10])
+  return move name
+}
+
+// The cover routes: for each different way a command goes through the chart, the first run of
+// the walk that goes that way.
+effect fn covered(plan: &mut Plan) -> ()
+  ! OutOfMemoryError | TransitionLoopError | SchemaError
+  ? &mut Allocator {
+  let tried = run events()
+  let events = tried.asSlice()
+  let walk = run walked(events)
+  let runs = run walk.runs(12)
+  let nodes = walk.nodes.asSlice()
+  let steps = walk.steps.asSlice()
+
+  // The transition each step takes. Two steps take one transition when they leave one state
+  // on one kind of event, leave the same footprint and reach one state.
+  let mut footprints = List<Bytes>.make()
+  let mut transitions = List<Bytes>.make()
+  let mut taken = List<usize>.make()
+  let mut index: usize = 0
+  while index < steps.length {
+    let step = &steps[index]
+    let mut transition: usize = 0
+    if step.handled {
+      let left = run interned(&mut footprints, run json<List<Footprint>>(&step.effects))
+      let mut key = Bytes.make()
+      let parts: [u8; 5] = [
+        usize.toU8(variant<Silk>(&nodes[step.from].snapshot.value)),
+        usize.toU8(variant<Typed>(&events[step.event])),
+        usize.toU8(left / 256),
+        usize.toU8(left % 256),
+        usize.toU8(variant<Silk>(&nodes[step.to].snapshot.value)),
+      ]
+      run Bytes.append(&mut key, &parts)
+      transition = run interned(&mut transitions, move key)
+    }
+    run List<usize>.append(&mut taken, transition)
+    index = index + 1
+  }
+  plan.transitions = transitions.length()
+
+  // The way each run goes: the transitions of its steps, in order.
+  let mut ways = List<Bytes>.make()
+  let all = runs.asSlice()
+  index = 0
+  while index < all.length {
+    let chosen = &all[index]
+    let mut way = Bytes.make()
+    let mut position: usize = 0
+    while position < chosen.steps.length() {
+      let transition = taken.asSlice()[chosen.steps.asSlice()[position]]
+      let parts: [u8; 2] = [usize.toU8(transition / 256), usize.toU8(transition % 256)]
+      run Bytes.append(&mut way, &parts)
+      position = position + 1
+    }
+    let known = ways.length()
+    let at = run interned(&mut ways, move way)
+    if at == known {
+      run List<Route>.append(&mut plan.routes, run routed(&walk, events, chosen, known))
+    }
+    index = index + 1
+  }
+  plan.covered = transitions.length()
+  return ()
+}
+
+// The cover route of `chosen`, the run number `number` of the plan.
+effect fn routed(
+  walk: &Walk<Silk, Typed, Computer, Footprint>,
+  events: &[Typed],
+  chosen: &Run,
+  number: usize,
+) -> Route
+  ! OutOfMemoryError | SchemaError
+  ? &mut Allocator {
+  let nodes = walk.nodes.asSlice()
+  let steps = walk.steps.asSlice()
+  let taken = chosen.steps.asSlice()
+  let start = &nodes[chosen.from].snapshot.context
+  let command = &events[steps[taken[0]].event]
+  let mut answers = List<Typed>.make()
+  let mut footprint = List<Footprint>.make()
+  let mut position: usize = 0
+  while position < taken.length {
+    let step = &steps[taken[position]]
+    if position > 0 {
+      run List<Typed>.append(&mut answers, run again<Typed>(&events[step.event]))
+    }
+    let left = step.effects.asSlice()
+    let mut at: usize = 0
+    while at < left.length {
+      run List<Footprint>.append(&mut footprint, run again<Footprint>(&left[at]))
+      at = at + 1
+    }
+    position = position + 1
+  }
+  let mut reasons = List<String>.make()
+  run reasoned(start, command, &mut reasons)
+  let mut moves = List<Move>.make()
+  run List<Move>.append(
+    &mut moves,
+    Move {
+      command: run again<Typed>(command),
+      answers: move answers,
+      footprint: move footprint,
+      state: run again<Computer>(&nodes[chosen.to].snapshot.context),
+      reasons: move reasons,
+    },
+  )
+  return Route {
+    name: run numbered("cover-", number + 1),
+    kind: Kind.Cover,
+    about: run String.copy("One way a command goes through the chart."),
+    start: run again<Computer>(start),
+    moves: move moves,
+  }
+}
+
+// The route of `story`: its events as moves, each a command and the answers that follow it.
+effect fn told(story: Story) -> Route
+  ! OutOfMemoryError | TransitionLoopError | SchemaError
+  ? &mut Allocator {
+  let mut story = move story
+  let start = run again<Computer>(&story.start)
+  let mut shot = run Steps.begin<Silk, Typed, Computer, Footprint>(move story.start, 0)
+  let mut moves = List<Move>.make()
+  while story.events.length() != 0 {
+    let command = List<Typed>.remove(&mut story.events, 0)
+    let mut reasons = List<String>.make()
+    run reasoned(&shot.context, &command, &mut reasons)
+    let typed = run again<Typed>(&command)
+    if !run Steps.send<Silk, Typed, Computer, Footprint>(&mut shot, move command) {
+      Intrinsic.trap("a story is a path of the machine")
+    }
+    let mut answers = List<Typed>.make()
+    while Machines.awaiting<Silk, Typed, Computer, Footprint>(&shot.value)
+      && story.events.length() != 0 {
+      let answer = List<Typed>.remove(&mut story.events, 0)
+      run List<Typed>.append(&mut answers, run again<Typed>(&answer))
+      if !run Steps.send<Silk, Typed, Computer, Footprint>(&mut shot, move answer) {
+        Intrinsic.trap("a story is a path of the machine")
+      }
+    }
+    let mut footprint = List<Footprint>.make()
+    while shot.pending.length() != 0 {
+      run List<Footprint>.append(&mut footprint, List<Footprint>.remove(&mut shot.pending, 0))
+    }
+    run List<Move>.append(
+      &mut moves,
+      Move {
+        command: move typed,
+        answers: move answers,
+        footprint: move footprint,
+        state: run again<Computer>(&shot.context),
+        reasons: move reasons,
+      },
+    )
+  }
+  return Route {
+    name: run String.copy(story.name),
+    kind: Kind.Story,
+    about: run String.copy(story.about),
+    start: move start,
+    moves: move moves,
+  }
+}
+
+/// The plan of the `silk` tool: the cover routes of the walk, then the stories.
+///
+/// # Errors
+/// `SchemaError` and `TransitionLoopError` as `Explorer.walk` gives them. `OutOfMemoryError`.
+pub effect fn planned() -> Plan
+  ! OutOfMemoryError | TransitionLoopError | SchemaError
+  ? &mut Allocator {
+  let mut plan = Plan { transitions: 0, covered: 0, routes: List<Route>.make() }
+  run covered(&mut plan)
+  let mut all = run stories()
+  while all.length() != 0 {
+    run List<Route>.append(&mut plan.routes, run told(List<Story>.remove(&mut all, 0)))
+  }
+  return move plan
+}
+
+/// `plan` as the text of `flows.json`: one JSON object, with one route on each line.
+///
+/// # Errors
+/// `SchemaError` when a value cannot be written as JSON. `OutOfMemoryError`.
+pub effect fn written(plan: &Plan) -> Bytes
+  ! OutOfMemoryError | SchemaError
+  ? &mut Allocator {
+  let mut text = run Bytes.copy(b"{\"transitions\":")
+  run Bytes.append(&mut text, (run json<usize>(&plan.transitions)).asSlice())
+  run Bytes.append(&mut text, b",\"covered\":")
+  run Bytes.append(&mut text, (run json<usize>(&plan.covered)).asSlice())
+  run Bytes.append(&mut text, b",\"routes\":[\n")
+  let routes = plan.routes.asSlice()
+  let mut at: usize = 0
+  while at < routes.length {
+    if at > 0 {
+      run Bytes.append(&mut text, b",\n")
+    }
+    run Bytes.append(&mut text, (run json<Route>(&routes[at])).asSlice())
+    at = at + 1
+  }
+  run Bytes.append(&mut text, b"\n]}\n")
+  return move text
+}
+
+/// Reads the text of `flows.json`.
+///
+/// # Errors
+/// `SchemaError` when the text is not a plan. `OutOfMemoryError`.
+pub effect fn read(text: &[u8]) -> Plan
+  ! OutOfMemoryError | SchemaError
+  ? &mut Allocator {
+  return run SchemaJson.decode<Plan>(text)
+}

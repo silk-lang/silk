@@ -1,0 +1,2019 @@
+//! Running one command of the `silk` tool through its machine: [`Session`].
+//!
+//! The machine in the `flows` package decides what every command does. This module is its hands.
+//! [`begin`] reads the command line, fills the machine's `Computer` from the real disk and
+//! environment, and sends the command. The machine answers with footprints, and the session does
+//! each one: it prints what a `Says` names, writes what a `Changes` names, and keeps the status of
+//! an `Exits`. While the machine waits for the world, [`needs`] says what the next step takes, and
+//! [`work`], [`fetch`] or [`ask`] does the work of the state and sends the answer. A command is
+//! over when `needs` is `Need.Nothing`, and the session then holds its exit status.
+//!
+//! So this module holds no rule about what a command does. It holds the texts, and the work
+//! behind each answer.
+
+import Command as Commands { Context, Kind, Request }
+import Install as ToolchainInstall { HostFiles, InstallError, ReleaseSource }
+import Manifests
+import ReleaseArchive
+import Toolchains as Toolchains { IgnoredPin, Origin, PinTarget, Selection, UnknownPin }
+import flows.Computer { Age, Choice, Computer, Named, Pinned, Project, Release, Source, Store, Version }
+import flows.Footprint { Footprint, Message, Place, Program }
+import flows.Silk { Silk, Typed }
+import tomledit.ManifestEdit as ManifestEdits
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.machine.snapshot { Snapshot, Steps, TransitionLoopError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u8
+import silk.num.usize
+import silk.system.child_process { ChildProcess, ProcessError, ProcessOutcome }
+import silk.system.filesystem { FileError, FileSystem, Path }
+
+/// What the next step of a command takes.
+pub enum Need {
+  /// Nothing: the command is over, and `Session.status` is its exit status.
+  Nothing,
+  /// The disk: [`work`] does the step.
+  Files,
+  /// The release source: [`fetch`] does the step.
+  Network,
+  /// A compiler to ask for its overview: [`ask`] does the step.
+  Compiler,
+  /// The compiler in `Session.launch` takes the place of the tool. When it does not start,
+  /// [`stuck`] ends the command.
+  Launch,
+}
+
+/// The compiler a command starts.
+pub struct Launch {
+  /// The path of the compiler.
+  pub executable: Bytes,
+
+  /// The full version of the compiler, which is its `SILK_TOOLCHAIN`.
+  pub version: Bytes,
+
+  /// How many leading arguments the compiler does not receive: 1 for a `+<version>`.
+  pub skip: usize,
+}
+
+/// One command of the tool in progress: the machine, and the real names behind its facts.
+pub struct Session {
+  snapshot: Snapshot<Silk, Typed, Computer, Footprint>,
+  request: Request,
+
+  // The versions this command met, by the position the machine knows them by.
+  versions: List<Bytes>,
+
+  // The pin of the project, or why it cannot be read, and where `silk set` writes.
+  pin: Option<Selection>,
+  unknown: Option<UnknownPin>,
+  target: Option<PinTarget>,
+
+  // `default` in settings.toml, or empty.
+  standard: Bytes,
+
+  // The version a command for the compiler runs with, and why.
+  selected: Selection,
+
+  // The version the command is about: its position, the text that names it, and its full name.
+  subject: Choice,
+  wanted: Bytes,
+  full: Bytes,
+
+  // For `use uninstall`: whether the directory held a whole toolchain.
+  whole: bool,
+
+  // Why the last step failed, as lines for standard error.
+  stopped: Bytes,
+
+  // The install in progress.
+  staging: Option<Path>,
+  locked: bool,
+  archive: Bytes,
+  signature: Bytes,
+  fresh: bool,
+
+  // The edits `silk set` makes.
+  rewritten: Bytes,
+  rewrites: bool,
+  members: List<Path>,
+  memberTexts: List<Bytes>,
+  changed: bool,
+
+  // The overview of the compiler `silk --help` asked.
+  overview: Bytes,
+
+  /// The compiler to start, once [`needs`] is `Need.Launch`.
+  pub launch: Option<Launch>,
+
+  /// The exit status, once [`needs`] is `Need.Nothing`.
+  pub status: i32,
+
+  /// The text for standard output that no one took yet with [`spoken`].
+  pub output: Bytes,
+
+  /// The text for standard error that no one took yet with [`spoken`].
+  pub errors: Bytes,
+}
+
+/// Text a session printed.
+pub struct Spoken {
+  /// The text for standard output.
+  pub output: Bytes,
+
+  /// The text for standard error.
+  pub errors: Bytes,
+}
+
+// Where the machine stands, as a value that can be copied.
+enum Stand {
+  Idle,
+  Resolving,
+  Choosing,
+  Editing,
+  Downloading,
+  Verifying,
+  Unpacking,
+  Ready,
+  Starting,
+  Checking,
+  Replacing,
+  Asking,
+  Comparing,
+}
+
+fn stand(state: &Silk) -> Stand {
+  return match &state.* {
+    Silk.Idle => Stand.Idle
+    Silk.Resolving => Stand.Resolving
+    Silk.Choosing => Stand.Choosing
+    Silk.Editing => Stand.Editing
+    Silk.Downloading => Stand.Downloading
+    Silk.Verifying => Stand.Verifying
+    Silk.Unpacking => Stand.Unpacking
+    Silk.Ready => Stand.Ready
+    Silk.Starting => Stand.Starting
+    Silk.Checking => Stand.Checking
+    Silk.Replacing => Stand.Replacing
+    Silk.Asking => Stand.Asking
+    Silk.Comparing => Stand.Comparing
+  }
+}
+
+fn choiceAt(index: usize) -> Choice {
+  if index == usize.ZERO {
+    return Choice.First
+  }
+  if index == usize.ONE {
+    return Choice.Second
+  }
+  if index == usize.add(0, 2) {
+    return Choice.Third
+  }
+  return Choice.Fourth
+}
+
+fn versionAt(index: usize) -> Version {
+  if index == usize.ZERO {
+    return Version.First
+  }
+  if index == usize.ONE {
+    return Version.Second
+  }
+  if index == usize.add(0, 2) {
+    return Version.Third
+  }
+  return Version.Fourth
+}
+
+fn namedAt(index: usize) -> Named {
+  if index == usize.ZERO {
+    return Named.First
+  }
+  if index == usize.ONE {
+    return Named.Second
+  }
+  if index == usize.add(0, 2) {
+    return Named.Third
+  }
+  return Named.Fourth
+}
+
+fn contains(text: &[u8], byte: u8) -> bool {
+  let mut at = usize.ZERO
+  while at < text.length {
+    if text[at] == byte {
+      return true
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// Whether `left` and `right` name one version: one is the other, with or without build metadata.
+fn oneVersion(left: &[u8], right: &[u8]) -> bool {
+  return Toolchains.matches(left, right) || Toolchains.matches(right, left)
+}
+
+// The position of `text` among the versions the command met, or their count when it is new.
+fn position(versions: &List<Bytes>, text: &[u8]) -> usize {
+  let known = List<Bytes>.asSlice(versions)
+  let mut at = usize.ZERO
+  while at < known.length {
+    if oneVersion(Bytes.asSlice(&known[at]), text) {
+      return at
+    }
+    at = at + usize.ONE
+  }
+  return known.length
+}
+
+// The position of `text`, which joins the versions the command met when it is new.
+effect fn register(versions: &mut List<Bytes>, text: &[u8]) -> usize
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let at = position(&versions.*, text)
+  if at == List.length(&versions.*) {
+    // One command names its own version, the environment's, the pin and the default.
+    if at == usize.add(0, 4) {
+      Intrinsic.trap("one command meets at most four versions")
+    }
+    run List<Bytes>.append(&mut versions.*, run Bytes.copy(text))
+  }
+  return at
+}
+
+// What the store holds for `text`, and how old it is next to the tool.
+effect fn release(context: &Context, text: &[u8]) -> Release
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let mut store = Store.Absent
+  if let Option<Path>.Some { value: home } = &context.home {
+    if let Option<Bytes>.Some { .. } = move run Toolchains.find(&home, text) {
+      store = Store.Installed
+    } else if let Option<Bytes>.Some { .. } = move run Toolchains.present(&home, text) {
+      store = Store.Damaged
+    }
+  }
+  let mut age = Age.Newer
+  if oneVersion(text, context.release) {
+    age = Age.Own
+  } else if !Commands.same(context.release, b"0.0.0") && Toolchains.compare(text, context.release) < 0 {
+    age = Age.Older
+  }
+  return Release { store: store, age: age }
+}
+
+effect fn copied(selected: &Selection) -> Selection
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let manifest = match &selected.manifest {
+    Option<Path>.Some { value } => Option<Path>.some(run Manifests.copyPath(&value))
+    Option<Path>.None => Option<Path>.none()
+  }
+  let ignored = match &selected.ignored {
+    Option<IgnoredPin>.Some { value } => Option<IgnoredPin>.some(
+      IgnoredPin {
+        manifest: run Manifests.copyPath(&value.manifest),
+        version: run Bytes.copy(Bytes.asSlice(&value.version)),
+      },
+    )
+    Option<IgnoredPin>.None => Option<IgnoredPin>.none()
+  }
+  return Selection {
+    version: run Bytes.copy(Bytes.asSlice(&selected.version)),
+    origin: selected.origin,
+    manifest: move manifest,
+    ignored: move ignored,
+  }
+}
+
+effect fn unselected() -> Selection
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return Selection {
+    version: Bytes.make(),
+    origin: Origin.Nothing,
+    manifest: Option<Path>.none(),
+    ignored: Option<IgnoredPin>.none(),
+  }
+}
+
+effect fn named(origin: Origin, version: &[u8]) -> Selection
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return Selection {
+    version: run Bytes.copy(version),
+    origin: origin,
+    manifest: Option<Path>.none(),
+    ignored: Option<IgnoredPin>.none(),
+  }
+}
+
+// What the tool knows before it looks at the computer.
+effect fn opened(request: Request) -> Session
+  ! OutOfMemoryError | TransitionLoopError
+  ? &mut Allocator {
+  return Session {
+    snapshot: run Steps.begin<Silk, Typed, Computer, Footprint>(Computer.empty(), 0),
+    request: move request,
+    versions: List<Bytes>.make(),
+    pin: Option<Selection>.none(),
+    unknown: Option<UnknownPin>.none(),
+    target: Option<PinTarget>.none(),
+    standard: Bytes.make(),
+    selected: run unselected(),
+    subject: Choice.Nothing,
+    wanted: Bytes.make(),
+    full: Bytes.make(),
+    whole: false,
+    stopped: Bytes.make(),
+    staging: Option<Path>.none(),
+    locked: false,
+    archive: Bytes.make(),
+    signature: Bytes.make(),
+    fresh: false,
+    rewritten: Bytes.make(),
+    rewrites: false,
+    members: List<Path>.make(),
+    memberTexts: List<Bytes>.make(),
+    changed: false,
+    overview: Bytes.make(),
+    launch: Option<Launch>.none(),
+    status: 0,
+    output: Bytes.make(),
+    errors: Bytes.make(),
+  }
+}
+
+// Fills `computer` with the project around the working directory, and keeps the pin's real names.
+effect fn observeProject(session: &mut Session, context: &Context, computer: &mut Computer) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  if let Option<Path>.None = move run Manifests.discover(&context.working) {
+    return ()
+  }
+  computer.project = Project.Package
+
+  // A pin of the project's own table that is no version stops `silk set` too. Members that
+  // disagree, or a member's pin that is no version, stop every command but `silk set`.
+  let own = run Effect.result(Toolchains.pinned(&context.working))
+  match move own {
+    Result<Option<Selection>, UnknownPin | FileError | OutOfMemoryError>.Success { .. } => {}
+    Result<Option<Selection>, UnknownPin | FileError | OutOfMemoryError>.Failure {
+      error
+    } => match move error {
+      UnknownPin unknown => {
+        computer.pin.state = Pinned.Unreadable
+        session.unknown = Option<UnknownPin>.some(move unknown)
+        return ()
+      }
+      FileError failed => {
+        fail move failed
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+  let whole = run Effect.result(Toolchains.projectPin(&context.working))
+  match move whole {
+    Result<Option<Selection>, UnknownPin | FileError | OutOfMemoryError>.Success {
+      value
+    } => {
+      if let Option<Selection>.Some { value: pinned } = move value {
+        let at = run register(&mut session.versions, Bytes.asSlice(&pinned.version))
+        computer.pin.state = if pinned.origin == Origin.Members {
+          Pinned.Members
+        } else {
+          Pinned.Own
+        }
+        computer.pin.version = choiceAt(at)
+        if let Option<IgnoredPin>.Some { .. } = &pinned.ignored {
+          computer.ignored = true
+        }
+        session.pin = Option<Selection>.some(move pinned)
+      }
+    }
+    Result<Option<Selection>, UnknownPin | FileError | OutOfMemoryError>.Failure {
+      error
+    } => match move error {
+      UnknownPin unknown => {
+        computer.pin.state = Pinned.Split
+        session.unknown = Option<UnknownPin>.some(move unknown)
+      }
+      FileError failed => {
+        fail move failed
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+  let located = run Effect.result(Toolchains.pinTarget(&context.working))
+  match move located {
+    Result<Option<PinTarget>, UnknownPin | FileError | OutOfMemoryError>.Success {
+      value
+    } => {
+      if let Option<PinTarget>.Some { value: target } = move value {
+        if Commands.same(target.table, b"workspace") {
+          computer.project = Project.Workspace
+          let strays = run Toolchains.memberPins(&target.manifest)
+          computer.strays = List.length(&strays) > usize.ZERO
+        }
+        session.target = Option<PinTarget>.some(move target)
+      }
+    }
+    Result<Option<PinTarget>, UnknownPin | FileError | OutOfMemoryError>.Failure {
+      error
+    } => match move error {
+      UnknownPin unknown => {
+        drop unknown
+      }
+      FileError failed => {
+        fail move failed
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+  return ()
+}
+
+// The computer as the machine sees it, from the real disk and environment.
+effect fn observe(session: &mut Session, context: &Context) -> Computer
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let mut computer = Computer.empty()
+  computer.autoInstall = context.autoInstall
+  if let Option<Path>.Some { .. } = &context.bundled {
+    computer.bundled = true
+  }
+  if let Option<Bytes>.Some { value } = &context.environment {
+    let written = Bytes.asSlice(&value)
+    if written.length > usize.ZERO {
+      if Manifests.isSemanticVersion(written) {
+        computer.environment = namedAt(run register(&mut session.versions, written))
+      } else {
+        computer.environment = Named.Malformed
+      }
+    }
+  }
+  computer.home = false
+  if let Option<Path>.Some { value: home } = &context.home {
+    computer.home = true
+    if let Option<Bytes>.Some { value: standard } = move run Toolchains.defaultVersion(&home) {
+      computer.standard = choiceAt(run register(&mut session.versions, Bytes.asSlice(&standard)))
+      session.standard = move standard
+    }
+    let store = run Path.join(&home, "toolchains")
+    computer.debris = run ToolchainInstall.leftStaging(&store)
+  }
+  run observeProject(&mut session.*, context, &mut computer)
+  return move computer
+}
+
+// The command as the machine takes it. A version it names joins the versions the command met.
+effect fn typed(session: &mut Session) -> Typed
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let kind = session.request.kind
+  let install = session.request.install
+  let stable = session.request.stable
+  if kind == Kind.Use || kind == Kind.Uninstall || kind == Kind.Set {
+    let at = run register(&mut session.versions, Bytes.asSlice(&session.request.version))
+    if kind == Kind.Use {
+      return Typed.Use { version: versionAt(at) }
+    }
+    if kind == Kind.Uninstall {
+      return Typed.Uninstall { version: versionAt(at) }
+    }
+    return Typed.Set { version: versionAt(at), install: install }
+  }
+  if kind == Kind.Run {
+    let mut asked = Named.Unset
+    if session.request.plus {
+      asked = Named.Malformed
+      if Manifests.isSemanticVersion(Bytes.asSlice(&session.request.version)) {
+        asked = namedAt(run register(&mut session.versions, Bytes.asSlice(&session.request.version)))
+      }
+    }
+    return Typed.Run { asked: asked }
+  }
+  return match kind {
+    Kind.UseNewest => Typed.UseNewest { stable: stable }
+    Kind.UsePinned => Typed.UsePinned
+    Kind.List => Typed.List
+    Kind.Which => Typed.Which
+    Kind.SetNewest => Typed.SetNewest { stable: stable, install: install }
+    Kind.UpdateSelf => Typed.UpdateSelf
+    Kind.Help => Typed.Help { bare: session.request.bare }
+    Kind.Near => Typed.Near
+    _ => Typed.Misuse
+  }
+}
+
+// What `+<version>` says for `event`.
+fn askedOf(event: &Typed) -> Named {
+  return match &event.* {
+    Typed.Run { asked } => asked
+    _ => Named.Unset
+  }
+}
+
+// The real names behind the version the machine selects on `computer`.
+effect fn selection(session: &Session, context: &Context, computer: &Computer, asked: Named) -> Selection
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let picked = computer.selects(asked)
+  return match picked.origin {
+    Source.CommandLine => run named(
+      Origin.CommandLine,
+      Bytes.asSlice(&session.request.version),
+    )
+    Source.Environment => match &context.environment {
+      Option<Bytes>.Some { value } => run named(Origin.Environment, Bytes.asSlice(&value))
+      Option<Bytes>.None => run unselected()
+    }
+    Source.Project => match &session.pin {
+      Option<Selection>.Some { value } => run copied(&value)
+      Option<Selection>.None => run unselected()
+    }
+    Source.Default => run named(Origin.Default, Bytes.asSlice(&session.standard))
+    Source.Nothing => run unselected()
+  }
+}
+
+// Sends `event` to the machine. The model check of the `flows` package proves that the chart
+// has a row for every command, and for every answer of a state that waits.
+effect fn send(session: &mut Session, event: Typed) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let sent = run Effect.result(
+    Steps.send<Silk, Typed, Computer, Footprint>(&mut session.snapshot, move event),
+  )
+  match move sent {
+    Result<bool, OutOfMemoryError | TransitionLoopError>.Success { value } => {
+      if !value {
+        Intrinsic.trap("the machine has a row for every command and answer")
+      }
+    }
+    Result<bool, OutOfMemoryError | TransitionLoopError>.Failure { error } => match move error {
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+      TransitionLoopError looped => {
+        drop looped
+        Intrinsic.trap("the machine settles after every event")
+      }
+    }
+  }
+  return ()
+}
+
+// Keeps why a step failed, as the line the command prints.
+effect fn halt(session: &mut Session, stopped: &InstallError) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = run Bytes.copy(b"silk: ")
+  run Bytes.append(&mut text, Bytes.asSlice(&stopped.message))
+  run Bytes.append(&mut text, b"\n")
+  session.stopped = move text
+  return ()
+}
+
+// Keeps that a file of the home directory could not be written or moved.
+effect fn haltOnFiles(session: &mut Session) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  session.stopped = run Bytes.copy(b"silk: a file operation failed in the Silk home directory\n")
+  return ()
+}
+
+// The report of an install: `Installed Silk <version> in <directory>`.
+effect fn installedText(session: &Session, context: &Context, changed: bool, text: &mut Bytes) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut Allocator {
+  let home = match &context.home {
+    Option<Path>.Some { value } => &value
+    Option<Path>.None => {
+      return ()
+    }
+  }
+  let directory = run Toolchains.directory(home, Bytes.asSlice(&session.full))
+  let kind = session.request.kind
+  if session.request.json && kind != Kind.Run {
+    if kind == Kind.Set || kind == Kind.SetNewest {
+      return ()
+    }
+    run Bytes.append(&mut text.*, b"{\"version\":")
+    run Commands.appendString(&mut text.*, Bytes.asSlice(&session.full))
+    run Bytes.append(&mut text.*, b",\"path\":")
+    run Commands.appendString(&mut text.*, Path.rawBytes(&directory))
+    run Commands.appendFlag(&mut text.*, b"changed", changed)
+    run Commands.appendFlag(&mut text.*, b"default", kind != Kind.UsePinned)
+    run Bytes.append(&mut text.*, b"}\n")
+    return ()
+  }
+  if changed {
+    run Bytes.append(&mut text.*, b"Installed Silk ")
+  } else {
+    run Bytes.append(&mut text.*, b"Silk ")
+  }
+  run Bytes.append(&mut text.*, Bytes.asSlice(&session.full))
+  if changed {
+    run Bytes.append(&mut text.*, b" in ")
+  } else {
+    run Bytes.append(&mut text.*, b" is already installed in ")
+  }
+  run Bytes.append(&mut text.*, Path.rawBytes(&directory))
+  run Bytes.append(&mut text.*, b"\n")
+  return ()
+}
+
+// The command that installs the selected version, or the newest when nothing is selected.
+effect fn installHint(session: &Session) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if session.selected.origin == Origin.Nothing {
+    return run Bytes.copy(b"silk use latest")
+  }
+  return run Commands.installCommand(&session.selected)
+}
+
+// The path of the compiler of the selected version, when the store holds it.
+effect fn selectedCompiler(session: &Session, context: &Context) -> Option<Bytes>
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  if session.selected.origin != Origin.Nothing {
+    if let Option<Path>.Some { value: home } = &context.home {
+      if let Option<Bytes>.Some { value: name } = move run Toolchains.find(
+        &home,
+        Bytes.asSlice(&session.selected.version),
+      ) {
+        let executable = run Toolchains.executable(&home, Bytes.asSlice(&name))
+        return Option<Bytes>.some(run Bytes.copy(Path.rawBytes(&executable)))
+      }
+    }
+  }
+  return Option<Bytes>.none()
+}
+
+// `silk use which`: the selected version and why, as text or JSON.
+effect fn whichText(session: &Session, context: &Context, output: &mut Bytes) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let selected = &session.selected
+  let path = run selectedCompiler(session, context)
+  if !session.request.json {
+    run Bytes.append(&mut output.*, Bytes.asSlice(&selected.version))
+    run Bytes.append(&mut output.*, b" (")
+    run Commands.because(selected, &mut output.*)
+    run Bytes.append(&mut output.*, b")\n")
+    if let Option<Bytes>.Some { value } = &path {
+      run Bytes.append(&mut output.*, Bytes.asSlice(&value))
+      run Bytes.append(&mut output.*, b"\n")
+    }
+    return ()
+  }
+  run Bytes.append(&mut output.*, b"{\"version\":")
+  if selected.origin == Origin.Nothing {
+    run Bytes.append(&mut output.*, b"null")
+  } else {
+    run Commands.appendString(&mut output.*, Bytes.asSlice(&selected.version))
+  }
+  run Bytes.append(&mut output.*, b",\"origin\":")
+  run Commands.appendString(&mut output.*, Toolchains.originName(selected.origin))
+  run Bytes.append(&mut output.*, b",\"manifest\":")
+  match &selected.manifest {
+    Option<Path>.Some { value } => run Commands.appendString(&mut output.*, Path.rawBytes(&value))
+    Option<Path>.None => run Bytes.append(&mut output.*, b"null")
+  }
+  match &path {
+    Option<Bytes>.Some { value } => {
+      run Bytes.append(&mut output.*, b",\"installed\":true,\"path\":")
+      run Commands.appendString(&mut output.*, Bytes.asSlice(&value))
+    }
+    Option<Bytes>.None => run Bytes.append(&mut output.*, b",\"installed\":false,\"path\":null")
+  }
+  run Bytes.append(&mut output.*, b",\"install\":")
+  let install = run installHint(session)
+  run Commands.appendString(&mut output.*, Bytes.asSlice(&install))
+  run Bytes.append(&mut output.*, b"}\n")
+  return ()
+}
+
+// `silk use list`: the installed versions, as text or JSON.
+effect fn listText(session: &Session, context: &Context, output: &mut Bytes) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let home = match &context.home {
+    Option<Path>.Some { value } => &value
+    Option<Path>.None => {
+      return ()
+    }
+  }
+  let json = session.request.json
+  let names = run Toolchains.installed(home)
+  if json {
+    run Bytes.append(&mut output.*, b"{\"home\":")
+    run Commands.appendString(&mut output.*, Path.rawBytes(home))
+    run Bytes.append(&mut output.*, b",\"toolchains\":[")
+  }
+  let listed = List<Bytes>.asSlice(&names)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let name = Bytes.asSlice(&listed[at])
+    let isPinned = match &session.pin {
+      Option<Selection>.Some { value } => Toolchains.matches(Bytes.asSlice(&value.version), name)
+      Option<Selection>.None => false
+    }
+    let isDefault = Bytes.length(&session.standard) > usize.ZERO
+      && Toolchains.matches(Bytes.asSlice(&session.standard), name)
+    let isSelected = session.selected.origin != Origin.Nothing
+      && Toolchains.matches(Bytes.asSlice(&session.selected.version), name)
+    let executable = run Toolchains.executable(home, name)
+    run Commands.entry(
+      &mut output.*,
+      json,
+      at == usize.ZERO,
+      name,
+      Path.rawBytes(&executable),
+      isSelected,
+      isPinned,
+      isDefault,
+    )
+    at = at + usize.ONE
+  }
+  if json {
+    run Bytes.append(&mut output.*, b"]}\n")
+  } else if listed.length == usize.ZERO {
+    run Bytes.append(
+      &mut output.*,
+      b"No Silk versions are installed. Install the newest with: silk use latest\n",
+    )
+  }
+  return ()
+}
+
+// `silk set`: where the pin was written, as text or JSON.
+effect fn pinnedText(session: &Session, output: &mut Bytes) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let target = match &session.target {
+    Option<PinTarget>.Some { value } => &value
+    Option<PinTarget>.None => {
+      return ()
+    }
+  }
+  let named = Bytes.asSlice(&session.full)
+  if session.request.json {
+    run Bytes.append(&mut output.*, b"{\"version\":")
+    run Commands.appendString(&mut output.*, named)
+    run Bytes.append(&mut output.*, b",\"manifest\":")
+    run Commands.appendString(&mut output.*, Path.rawBytes(&target.manifest))
+    run Bytes.append(&mut output.*, b",\"table\":")
+    run Commands.appendString(&mut output.*, target.table)
+    run Bytes.append(&mut output.*, b",\"previous\":")
+    match &target.previous {
+      Option<Bytes>.Some { value } => run Commands.appendString(&mut output.*, Bytes.asSlice(&value))
+      Option<Bytes>.None => run Bytes.append(&mut output.*, b"null")
+    }
+    run Bytes.append(&mut output.*, b",\"members\":[")
+    let moved = List<Path>.asSlice(&session.members)
+    let mut listed = usize.ZERO
+    while listed < moved.length {
+      if listed > usize.ZERO {
+        run Bytes.append(&mut output.*, b",")
+      }
+      run Commands.appendString(&mut output.*, Path.rawBytes(&moved[listed]))
+      listed = listed + usize.ONE
+    }
+    run Bytes.append(&mut output.*, b"]")
+    run Commands.appendFlag(&mut output.*, b"changed", session.changed)
+    run Commands.appendFlag(
+      &mut output.*,
+      b"installed",
+      session.snapshot.context.installed(session.subject),
+    )
+    run Commands.appendFlag(&mut output.*, b"downloaded", session.fresh)
+    run Bytes.append(&mut output.*, b"}\n")
+    return ()
+  }
+  run Bytes.append(&mut output.*, b"Pinned Silk ")
+  run Bytes.append(&mut output.*, named)
+  run Bytes.append(&mut output.*, b" in ")
+  run Bytes.append(&mut output.*, Path.rawBytes(&target.manifest))
+  run Bytes.append(&mut output.*, b" ([")
+  run Bytes.append(&mut output.*, target.table)
+  run Bytes.append(&mut output.*, b"].silk-version")
+  if let Option<Bytes>.Some { value } = &target.previous {
+    if session.changed {
+      run Bytes.append(&mut output.*, b", was ")
+      run Bytes.append(&mut output.*, Bytes.asSlice(&value))
+    }
+  }
+  run Bytes.append(&mut output.*, b")\n")
+  return ()
+}
+
+// The words of `message` for this command: `output` is for standard output and `errors` for
+// standard error.
+effect fn said(session: &Session, context: &Context, message: Message, output: &mut Bytes, errors: &mut Bytes) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let json = session.request.json
+  let kind = session.request.kind
+  let full = Bytes.asSlice(&session.full)
+  match message {
+    Message.Usage => {
+      run Bytes.append(&mut errors.*, Bytes.asSlice(&session.request.complaint))
+    }
+    Message.UnknownCommand => {
+      run Bytes.append(&mut errors.*, b"silk: unknown command `")
+      run Bytes.append(&mut errors.*, Bytes.asSlice(&session.request.word))
+      run Bytes.append(&mut errors.*, b"`; did you mean `silk ")
+      run Bytes.append(&mut errors.*, session.request.meant)
+      run Bytes.append(&mut errors.*, b"`?\nRun `silk --help` for the commands.\n")
+    }
+    Message.NoHome => {
+      let reported = run Commands.noHome()
+      run Bytes.append(&mut errors.*, Bytes.asSlice(&reported.errors))
+    }
+    Message.BadEnvironment => {
+      if let Option<Commands.Outcome>.Some { value } = move run Commands.badEnvironment(context) {
+        run Bytes.append(&mut errors.*, Bytes.asSlice(&value.errors))
+      }
+    }
+    Message.BadRequest => {
+      run Bytes.append(&mut errors.*, b"silk: `+")
+      run Bytes.append(&mut errors.*, Bytes.asSlice(&session.request.version))
+      run Bytes.append(
+        &mut errors.*,
+        b"` is not a Silk version; +<version> takes a semantic version such as +0.1.0-dev.11\n",
+      )
+    }
+    Message.UnknownPin => {
+      if let Option<UnknownPin>.Some { value } = &session.unknown {
+        let reported = run Commands.unknownPin(&value)
+        run Bytes.append(&mut errors.*, Bytes.asSlice(&reported.errors))
+      }
+    }
+    Message.Versions => {
+      run listText(session, context, &mut output.*)
+    }
+    Message.Selected => {
+      run whichText(session, context, &mut output.*)
+    }
+    Message.NothingSelected => {
+      if kind == Kind.Which && json {
+        run whichText(session, context, &mut output.*)
+      }
+      run Bytes.append(
+        &mut errors.*,
+        b"silk: no Silk version is selected here: no project pins one and there is no default.\nInstall the newest Silk as the default with: silk use latest\n",
+      )
+    }
+    Message.NotInstalled => {
+      run Bytes.append(&mut errors.*, b"silk: Silk ")
+      run Bytes.append(&mut errors.*, Bytes.asSlice(&session.selected.version))
+      run Bytes.append(&mut errors.*, b" (")
+      run Commands.because(&session.selected, &mut errors.*)
+      run Bytes.append(&mut errors.*, b") is not installed.\nInstall it with: ")
+      let install = run installHint(session)
+      run Bytes.append(&mut errors.*, Bytes.asSlice(&install))
+      run Bytes.append(&mut errors.*, b"\n")
+    }
+    Message.IgnoredPin => {
+      run Commands.ignoredNote(&session.selected, &mut errors.*)
+    }
+    Message.NothingToRemove => {
+      run Bytes.append(&mut output.*, Bytes.asSlice(&session.request.version))
+      run Bytes.append(&mut output.*, b" is not installed; nothing to remove\n")
+    }
+    Message.Removed => {
+      run Bytes.append(&mut output.*, b"Removed ")
+      run Bytes.append(&mut output.*, full)
+      if !session.whole {
+        run Bytes.append(&mut output.*, b" (an incomplete install with no compiler)")
+      }
+      run Bytes.append(&mut output.*, b"\n")
+    }
+    Message.WasDefault => {
+      run Bytes.append(
+        &mut errors.*,
+        b"It was your default; choose another with: silk use <version>\n",
+      )
+    }
+    Message.PinnedHere => {
+      if let Option<Selection>.Some { value } = &session.pin {
+        run Bytes.append(&mut errors.*, b"This project pins it (")
+        run Commands.because(&value, &mut errors.*)
+        run Bytes.append(
+          &mut errors.*,
+          b"), so its commands stop until you reinstall it with: silk use\n",
+        )
+      }
+    }
+    Message.NoPin => {
+      run Bytes.append(
+        &mut errors.*,
+        b"silk use: this directory has no project that pins a Silk version.\nPin one with `silk set <version>`, or install a version as your default with `silk use <version>`.\n",
+      )
+    }
+    Message.Installing => {
+      run Bytes.append(&mut errors.*, b"silk: installing Silk ")
+      run Bytes.append(&mut errors.*, Bytes.asSlice(&session.wanted))
+      run Bytes.append(&mut errors.*, b" (auto-install is on)\n")
+    }
+    Message.Installed => {
+      // The output of a command for the compiler stays alone on standard output.
+      if kind == Kind.Run {
+        run installedText(session, context, true, &mut errors.*)
+      } else {
+        run installedText(session, context, true, &mut output.*)
+      }
+    }
+    Message.AlreadyInstalled => {
+      run installedText(session, context, false, &mut output.*)
+    }
+    Message.DefaultSet => {
+      if !json {
+        run Bytes.append(&mut output.*, b"Default Silk version: ")
+        run Bytes.append(&mut output.*, full)
+        run Bytes.append(&mut output.*, b"\n")
+      }
+    }
+    Message.StillPins => {
+      if let Option<Selection>.Some { value } = &session.pin {
+        run Bytes.append(&mut errors.*, b"Note: this project still pins Silk ")
+        run Bytes.append(&mut errors.*, Bytes.asSlice(&value.version))
+        run Bytes.append(&mut errors.*, b" (")
+        run Commands.because(&value, &mut errors.*)
+        run Bytes.append(&mut errors.*, b"). To move it: silk set ")
+        run Bytes.append(&mut errors.*, full)
+        run Bytes.append(&mut errors.*, b"\n")
+      }
+    }
+    Message.NoProject => {
+      run Bytes.append(
+        &mut errors.*,
+        b"silk set: no silk.toml here or above; start a project with `silk init`\n",
+      )
+    }
+    Message.CannotEdit => {
+      run Bytes.append(&mut errors.*, Bytes.asSlice(&session.stopped))
+    }
+    Message.Pinned => {
+      run pinnedText(session, &mut output.*)
+    }
+    Message.MembersUnpinned => {
+      if !json {
+        let moved = List<Path>.asSlice(&session.members)
+        let mut listed = usize.ZERO
+        while listed < moved.length {
+          run Bytes.append(&mut output.*, b"Removed [package].silk-version from ")
+          run Bytes.append(&mut output.*, Path.rawBytes(&moved[listed]))
+          run Bytes.append(&mut output.*, b", a workspace member the workspace's pin covers\n")
+          listed = listed + usize.ONE
+        }
+      }
+    }
+    Message.NotInstalledYet => {
+      if !json {
+        run Bytes.append(&mut errors.*, b"Silk ")
+        run Bytes.append(&mut errors.*, full)
+        run Bytes.append(&mut errors.*, b" is not installed yet. Install it with: silk use\n")
+      }
+    }
+    Message.OlderThanTool => {
+      // A manifest written for this release may use fields an older Silk cannot read.
+      if !json {
+        run Bytes.append(&mut errors.*, b"note: Silk ")
+        run Bytes.append(&mut errors.*, full)
+        run Bytes.append(&mut errors.*, b" is older than this tool (")
+        run Bytes.append(&mut errors.*, context.release)
+        run Bytes.append(
+          &mut errors.*,
+          b"); if it cannot read this silk.toml, pin a newer version or edit the manifest for it\n",
+        )
+      }
+    }
+    Message.NotPublished => {
+      run Bytes.append(&mut errors.*, b"silk: no published Silk release is version ")
+      run Bytes.append(&mut errors.*, Bytes.asSlice(&session.wanted))
+      run Bytes.append(&mut errors.*, b"\n")
+    }
+    Message.NoStable => {
+      run Bytes.append(
+        &mut errors.*,
+        b"silk: no stable Silk release is published yet; `latest --dev` names the newest dev release\n",
+      )
+    }
+    Message.NoReleases => {
+      run Bytes.append(&mut errors.*, b"silk: the release listing names no published Silk release\n")
+    }
+    Message.Unreachable => {
+      run Bytes.append(&mut errors.*, Bytes.asSlice(&session.stopped))
+    }
+    Message.DownloadFailed => {
+      run Bytes.append(&mut errors.*, Bytes.asSlice(&session.stopped))
+    }
+    Message.Forged => {
+      run Bytes.append(&mut errors.*, Bytes.asSlice(&session.stopped))
+    }
+    Message.Corrupt => {
+      run Bytes.append(&mut errors.*, Bytes.asSlice(&session.stopped))
+    }
+    Message.Blocked => {
+      run Bytes.append(&mut errors.*, Bytes.asSlice(&session.stopped))
+    }
+    Message.CannotRun => {
+      if let Option<Launch>.Some { value } = &session.launch {
+        run Bytes.append(&mut errors.*, b"silk: cannot run ")
+        run Bytes.append(&mut errors.*, Bytes.asSlice(&value.executable))
+        run Bytes.append(&mut errors.*, b"\n")
+      }
+    }
+    Message.UpToDate => {
+      run Bytes.append(&mut output.*, b"silk ")
+      run Bytes.append(&mut output.*, context.release)
+      run Bytes.append(&mut output.*, b" is up to date (newest release: ")
+      run Bytes.append(&mut output.*, full)
+      run Bytes.append(&mut output.*, b")\n")
+    }
+    Message.Updated => {
+      run Bytes.append(&mut output.*, b"Updated silk to ")
+      run Bytes.append(&mut output.*, full)
+      if let Option<Path>.Some { value: home } = &context.home {
+        run Bytes.append(&mut output.*, b" in ")
+        run Bytes.append(&mut output.*, Path.rawBytes(&home))
+        run Bytes.append(&mut output.*, b"/bin/silk")
+      }
+      run Bytes.append(&mut output.*, b"\n")
+    }
+
+    // `silk` alone prints the help as an error, so it goes to standard error.
+    Message.Overview => {
+      if session.request.bare {
+        run Bytes.append(&mut errors.*, Bytes.asSlice(&session.overview))
+        run Bytes.append(&mut errors.*, b"\n")
+      } else {
+        run Bytes.append(&mut output.*, Bytes.asSlice(&session.overview))
+        run Bytes.append(&mut output.*, b"\n")
+      }
+    }
+    Message.HelpFailed => {
+      run Bytes.append(&mut errors.*, Bytes.asSlice(&session.stopped))
+    }
+    Message.OwnCommands => {
+      if session.request.bare {
+        run Bytes.append(&mut errors.*, Commands.usage())
+      } else {
+        run Bytes.append(&mut output.*, Commands.usage())
+      }
+    }
+  }
+  return ()
+}
+
+// The compiler a `Runs` footprint names.
+effect fn launched(session: &Session, context: &Context, program: Program) -> Option<Launch>
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let skip = if session.request.kind == Kind.Run && session.request.plus { usize.ONE } else { usize.ZERO }
+  if program == Program.Bundled {
+    if let Option<Path>.Some { value: compiler } = &context.bundled {
+      return Option<Launch>.some(
+        Launch {
+          executable: run Bytes.copy(Path.rawBytes(&compiler)),
+          version: run Bytes.copy(context.release),
+          skip: skip,
+        },
+      )
+    }
+    return Option<Launch>.none()
+  }
+  if let Option<Path>.Some { value: home } = &context.home {
+    if let Option<Bytes>.Some { value: name } = move run Toolchains.find(
+      &home,
+      Bytes.asSlice(&session.selected.version),
+    ) {
+      let executable = run Toolchains.executable(&home, Bytes.asSlice(&name))
+      return Option<Launch>.some(
+        Launch {
+          executable: run Bytes.copy(Path.rawBytes(&executable)),
+          version: move name,
+          skip: skip,
+        },
+      )
+    }
+  }
+  return Option<Launch>.none()
+}
+
+// Writes the manifest `silk set` edits, once.
+effect fn writeManifest(session: &mut Session) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  if !session.rewrites {
+    return ()
+  }
+  session.rewrites = false
+  if let Option<PinTarget>.Some { value: target } = &session.target {
+    run FileSystem.writeFile(&target.manifest, Bytes.asSlice(&session.rewritten))
+    session.changed = true
+  }
+  return ()
+}
+
+// Does what one footprint says. A footprint of a step that the session did as a whole, such as
+// the download of an archive or the move of a toolchain into place, is already done.
+effect fn perform(session: &mut Session, context: &Context, footprint: &Footprint) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  match &footprint.* {
+    Footprint.Says { message } => {
+      let mut output = Bytes.make()
+      let mut errors = Bytes.make()
+      run said(&session.*, context, message, &mut output, &mut errors)
+      run Bytes.append(&mut session.output, Bytes.asSlice(&output))
+      run Bytes.append(&mut session.errors, Bytes.asSlice(&errors))
+    }
+    Footprint.Exits { status } => {
+      session.status = u8.toI32(status)
+    }
+    Footprint.Runs { program } => {
+      session.launch = run launched(&session.*, context, program)
+    }
+    Footprint.Changes { place } => {
+      if place == Place.Settings {
+        // The default is the full version, so it never moves when a newer build is installed.
+        if let Option<Path>.Some { value: home } = &context.home {
+          run Toolchains.setDefault(&home, Bytes.asSlice(&session.full))
+        }
+      }
+      if place == Place.Manifest {
+        run writeManifest(&mut session.*)
+      }
+      if place == Place.Members {
+        let moved = List<Path>.asSlice(&session.members)
+        let texts = List<Bytes>.asSlice(&session.memberTexts)
+        let mut written = usize.ZERO
+        while written < moved.length {
+          run FileSystem.writeFile(&moved[written], Bytes.asSlice(&texts[written]))
+          written = written + usize.ONE
+        }
+        if moved.length > usize.ZERO {
+          session.changed = true
+        }
+      }
+    }
+    Footprint.Removes { place } => {
+      if place == Place.Toolchain && session.request.kind == Kind.Uninstall {
+        if let Option<Path>.Some { value: home } = &context.home {
+          let root = run Toolchains.directory(&home, Bytes.asSlice(&session.full))
+          run FileSystem.removeDirectoryRecursively(&root)
+        }
+      }
+      if place == Place.Staging {
+        if let Option<Path>.Some { value: staging } = &session.staging {
+          let cleaned = run Effect.result(FileSystem.removeDirectoryRecursively(&staging))
+          drop cleaned
+        }
+        session.staging = Option<Path>.none()
+      }
+    }
+    _ => {}
+  }
+  return ()
+}
+
+// Does every footprint the machine left.
+effect fn drain(session: &mut Session, context: &Context) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  while List.length(&session.snapshot.pending) > usize.ZERO {
+    let footprint = List<Footprint>.remove(&mut session.snapshot.pending, 0)
+    run perform(&mut session.*, context, &footprint)
+  }
+  return ()
+}
+
+// Sends `answer` and does what the machine says next.
+effect fn answer(session: &mut Session, context: &Context, event: Typed) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  run send(&mut session.*, move event)
+  return run drain(&mut session.*, context)
+}
+
+/// Starts the command `arguments`, the command line without the name of the program, on the
+/// computer `context` describes.
+///
+/// It reads the words, looks at the disk, sends the command to the machine and does what the
+/// machine says until the machine waits for the world or the command is over. `use list`,
+/// `use which`, `use uninstall` and every refused command are over when this returns.
+/// [`needs`] says what comes next.
+///
+/// # Errors
+/// `FileError` when a manifest, the settings or the store cannot be read or written.
+pub effect fn begin(context: &Context, arguments: &[Bytes]) -> Session
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let request = run Commands.read(arguments)
+  let opening = run Effect.result(opened(move request))
+  let mut session = match move opening {
+    Result<Session, OutOfMemoryError | TransitionLoopError>.Success { value } => move value
+    Result<Session, OutOfMemoryError | TransitionLoopError>.Failure { error } => match move error {
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+      TransitionLoopError looped => {
+        drop looped
+        Intrinsic.trap("the machine settles when it starts")
+      }
+    }
+  }
+  let mut computer = run observe(&mut session, context)
+  let event = run typed(&mut session)
+  session.selected = run selection(&session, context, &computer, askedOf(&event))
+
+  // The version the command is about, when the words or the computer already name it.
+  let kind = session.request.kind
+  if kind == Kind.Use || kind == Kind.Uninstall || kind == Kind.Set {
+    session.wanted = run Bytes.copy(Bytes.asSlice(&session.request.version))
+  } else if kind == Kind.UsePinned {
+    if let Option<Selection>.Some { value } = &session.pin {
+      session.wanted = run Bytes.copy(Bytes.asSlice(&value.version))
+    }
+  } else {
+    session.wanted = run Bytes.copy(Bytes.asSlice(&session.selected.version))
+  }
+  session.full = run Bytes.copy(Bytes.asSlice(&session.wanted))
+  if Bytes.length(&session.wanted) > usize.ZERO {
+    let at = position(&session.versions, Bytes.asSlice(&session.wanted))
+    if at < List.length(&session.versions) {
+      session.subject = choiceAt(at)
+    }
+    if let Option<Path>.Some { value: home } = &context.home {
+      let found = run Toolchains.find(&home, Bytes.asSlice(&session.wanted))
+      if let Option<Bytes>.Some { value: name } = move found {
+        session.full = move name
+        session.whole = true
+      } else if kind == Kind.Uninstall {
+        let present = run Toolchains.present(&home, Bytes.asSlice(&session.wanted))
+        if let Option<Bytes>.Some { value: name } = move present {
+          session.full = move name
+        }
+      }
+    }
+  }
+
+  // What the store holds for each version the command met.
+  let known = List.length(&session.versions)
+  let mut at = usize.ZERO
+  while at < known {
+    let facts = run release(context, Bytes.asSlice(&List<Bytes>.asSlice(&session.versions)[at]))
+    computer.keep(choiceAt(at), facts.store)
+    computer.date(choiceAt(at), facts.age)
+    at = at + usize.ONE
+  }
+  session.snapshot.context = move computer
+  run answer(&mut session, context, move event)
+  return move session
+}
+
+/// What the next step of the command takes.
+pub fn needs(session: &Session) -> Need {
+  return match stand(&session.snapshot.value) {
+    Stand.Idle => Need.Nothing
+    Stand.Ready => Need.Nothing
+    Stand.Starting => Need.Launch
+    Stand.Asking => Need.Compiler
+    Stand.Comparing => Need.Compiler
+    Stand.Resolving => Need.Network
+    Stand.Choosing => Need.Network
+    Stand.Checking => Need.Network
+    Stand.Downloading => Need.Network
+    Stand.Editing => Need.Files
+    Stand.Verifying => Need.Files
+    Stand.Unpacking => Need.Files
+    Stand.Replacing => Need.Files
+  }
+}
+
+/// Takes the text the session printed since the last call, so the caller can show it while a
+/// long step such as a download runs.
+pub effect fn spoken(session: &mut Session) -> Spoken
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let taken = Spoken {
+    output: run Bytes.copy(Bytes.asSlice(&session.output)),
+    errors: run Bytes.copy(Bytes.asSlice(&session.errors)),
+  }
+  session.output.clear()
+  session.errors.clear()
+  return move taken
+}
+
+// The published releases, or the answer that says why there is no listing.
+effect fn listing(session: &mut Session) -> Result<List<Bytes>, Typed>
+  ! OutOfMemoryError
+  ? &mut ReleaseSource | &mut Allocator {
+  let listed = run Effect.result(ReleaseSource.releases())
+  return match move listed {
+    Result<List<Bytes>, InstallError | OutOfMemoryError>.Success { value } => Result<
+      List<Bytes>,
+      Typed
+    >.succeed(move value)
+    Result<List<Bytes>, InstallError | OutOfMemoryError>.Failure { error } => match move error {
+      InstallError stopped => {
+        run halt(&mut session.*, &stopped)
+        if stopped.status == ToolchainInstall.NETWORK {
+          return Result<List<Bytes>, Typed>.failResult(Typed.Unreachable)
+        }
+        return Result<List<Bytes>, Typed>.failResult(Typed.Blocked)
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+}
+
+// Is the version published? A version with build metadata names one release, so nothing is
+// asked.
+effect fn resolved(session: &mut Session) -> Typed
+  ! OutOfMemoryError
+  ? &mut ReleaseSource | &mut Allocator {
+  if contains(Bytes.asSlice(&session.wanted), 43) {
+    session.full = run Bytes.copy(Bytes.asSlice(&session.wanted))
+    return Typed.Found
+  }
+  let published = match move run listing(&mut session.*) {
+    Result<List<Bytes>, Typed>.Success { value } => move value
+    Result<List<Bytes>, Typed>.Failure { error } => {
+      return move error
+    }
+  }
+  let candidates = List<Bytes>.asSlice(&published)
+  let best = ToolchainInstall.newest(candidates, Bytes.asSlice(&session.wanted), false)
+  if let Option<usize>.Some { value } = move best {
+    session.full = run Bytes.copy(Bytes.asSlice(&candidates[value]))
+    return Typed.Found
+  }
+  return Typed.Missing
+}
+
+// Which release is the newest? It becomes the version the command is about.
+effect fn chosen(session: &mut Session, context: &Context) -> Typed
+  ! FileError | OutOfMemoryError
+  ? &mut ReleaseSource | &mut FileSystem | &mut Allocator {
+  let published = match move run listing(&mut session.*) {
+    Result<List<Bytes>, Typed>.Success { value } => move value
+    Result<List<Bytes>, Typed>.Failure { error } => {
+      return move error
+    }
+  }
+  let candidates = List<Bytes>.asSlice(&published)
+  let stable = session.request.stable
+  let best = ToolchainInstall.newest(candidates, if stable { b"latest" } else { b"dev" }, stable)
+  let name = match move best {
+    Option<usize>.Some { value } => Bytes.asSlice(&candidates[value])
+    Option<usize>.None => {
+      if stable && candidates.length > usize.ZERO {
+        return Typed.NoStable
+      }
+      return Typed.NoReleases
+    }
+  }
+  let known = List.length(&session.versions)
+  let at = run register(&mut session.versions, name)
+  if at == known {
+    let facts = run release(context, name)
+    session.snapshot.context.keep(choiceAt(at), facts.store)
+    session.snapshot.context.date(choiceAt(at), facts.age)
+  }
+  session.subject = choiceAt(at)
+  session.wanted = run Bytes.copy(name)
+  session.full = run Bytes.copy(name)
+  if let Option<Path>.Some { value: home } = &context.home {
+    if let Option<Bytes>.Some { value: installed } = move run Toolchains.find(&home, name) {
+      session.full = move installed
+    }
+  }
+  return Typed.Newest { version: versionAt(at) }
+}
+
+// Is a newer tool published? The newest stable release counts, or the newest of any kind with
+// `--dev` or while none is stable.
+effect fn checked(session: &mut Session, context: &Context) -> Typed
+  ! OutOfMemoryError
+  ? &mut ReleaseSource | &mut Allocator {
+  let published = match move run listing(&mut session.*) {
+    Result<List<Bytes>, Typed>.Success { value } => move value
+    Result<List<Bytes>, Typed>.Failure { error } => {
+      return move error
+    }
+  }
+  let candidates = List<Bytes>.asSlice(&published)
+  let mut best = ToolchainInstall.newest(candidates, b"latest", !session.request.dev)
+  if let Option<usize>.None = &best {
+    best = ToolchainInstall.newest(candidates, b"dev", false)
+  }
+  let name = match move best {
+    Option<usize>.Some { value } => Bytes.asSlice(&candidates[value])
+    Option<usize>.None => {
+      return Typed.NoReleases
+    }
+  }
+  session.full = run Bytes.copy(name)
+  if Toolchains.compare(name, context.release) <= 0 {
+    return Typed.Current
+  }
+  return Typed.Outdated
+}
+
+// Takes the install lock, clears what interrupted installs left, and makes the directory the
+// archive unpacks into.
+effect fn stage(session: &mut Session, home: &Path) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut HostFiles | &mut Allocator {
+  // One install at a time per home, so concurrent installs of a version download it once. The
+  // lock only saves work: when it cannot be taken, the final rename still keeps installs apart.
+  let lockFile = run Path.join(home, ".install.lock")
+  run FileSystem.createDirectoriesRecursively(home)
+  session.locked = run HostFiles.lock(&lockFile)
+  let store = run Path.join(home, "toolchains")
+  run FileSystem.createDirectoriesRecursively(&store)
+  if session.locked {
+    run ToolchainInstall.removeStaging(&store)
+  }
+  let staging = run FileSystem.createTemporaryDirectory(&store, b".install-")
+  session.staging = Option<Path>.some(move staging)
+  return ()
+}
+
+// One asset of the release the command is about, or the answer that says why it did not come.
+effect fn asset(session: &mut Session, name: &[u8]) -> Result<Bytes, Typed>
+  ! OutOfMemoryError
+  ? &mut ReleaseSource | &mut Allocator {
+  let fetched = run Effect.result(ReleaseSource.asset(Bytes.asSlice(&session.full), name))
+  return match move fetched {
+    Result<Bytes, InstallError | OutOfMemoryError>.Success { value } => Result<Bytes, Typed>.succeed(
+      move value,
+    )
+    Result<Bytes, InstallError | OutOfMemoryError>.Failure { error } => match move error {
+      InstallError stopped => {
+        run halt(&mut session.*, &stopped)
+        if stopped.status == ToolchainInstall.NETWORK {
+          return Result<Bytes, Typed>.failResult(Typed.Cut)
+        }
+        return Result<Bytes, Typed>.failResult(Typed.Blocked)
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+}
+
+// The archive of the release and its signature. A toolchain also gets its staging directory.
+effect fn downloaded(session: &mut Session, context: &Context) -> Typed
+  ! OutOfMemoryError
+  ? &mut ReleaseSource | &mut FileSystem | &mut HostFiles | &mut Allocator {
+  if session.request.kind != Kind.UpdateSelf {
+    let home = match &context.home {
+      Option<Path>.Some { value } => &value
+      Option<Path>.None => {
+        run haltOnFiles(&mut session.*)
+        return Typed.Blocked
+      }
+    }
+    let staged = run Effect.result(stage(&mut session.*, home))
+    if let Result<(), FileError | OutOfMemoryError>.Failure { error } = move staged {
+      match move error {
+        FileError failed => {
+          drop failed
+          run haltOnFiles(&mut session.*)
+          return Typed.Blocked
+        }
+        OutOfMemoryError exhausted => {
+          fail move exhausted
+        }
+      }
+    }
+  }
+  let archiveName = run ToolchainInstall.archiveName(Bytes.asSlice(&session.full), context.target)
+  let signatureName = run ToolchainInstall.signatureName(Bytes.asSlice(&session.full), context.target)
+  session.archive = match move run asset(&mut session.*, Bytes.asSlice(&archiveName)) {
+    Result<Bytes, Typed>.Success { value } => move value
+    Result<Bytes, Typed>.Failure { error } => {
+      return move error
+    }
+  }
+  session.signature = match move run asset(&mut session.*, Bytes.asSlice(&signatureName)) {
+    Result<Bytes, Typed>.Success { value } => move value
+    Result<Bytes, Typed>.Failure { error } => {
+      return move error
+    }
+  }
+  return Typed.Arrived
+}
+
+// Releases the install lock once no install of this command is staging.
+effect fn release_(session: &mut Session) -> ()
+  ? &mut HostFiles {
+  if session.locked {
+    if let Option<Path>.None = &session.staging {
+      run HostFiles.unlock()
+      session.locked = false
+    }
+  }
+  return ()
+}
+
+/// Does one step that asks the release source, when [`needs`] is `Need.Network`: it finds the
+/// release a version names, the newest release, or a newer tool, or downloads the archive of a
+/// release and its signature. It then sends the answer to the machine and does what the machine
+/// says next.
+///
+/// A release source that fails is an answer too: the command ends with exit status 4 when the
+/// source cannot be reached, and with 1 when it lacks a file.
+///
+/// # Errors
+/// `FileError` when the store cannot be read, or a file the machine says to write cannot be.
+pub effect fn fetch(session: &mut Session, context: &Context) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut ReleaseSource | &mut FileSystem | &mut HostFiles | &mut Allocator {
+  let event = match stand(&session.snapshot.value) {
+    Stand.Resolving => run resolved(&mut session.*)
+    Stand.Choosing => run chosen(&mut session.*, context)
+    Stand.Checking => run checked(&mut session.*, context)
+    Stand.Downloading => run downloaded(&mut session.*, context)
+    _ => {
+      return ()
+    }
+  }
+  run answer(&mut session.*, context, move event)
+  return run release_(&mut session.*)
+}
+
+// Ends a step of [`fetch`] whose release source could not open: `stopped` says why.
+effect fn refused(session: &mut Session, stopped: &InstallError) -> Typed
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run halt(&mut session.*, stopped)
+  let network = stopped.status == ToolchainInstall.NETWORK
+  if !network {
+    return Typed.Blocked
+  }
+  return match stand(&session.snapshot.value) {
+    Stand.Downloading => Typed.Cut
+    _ => Typed.Unreachable
+  }
+}
+
+/// Ends a step that asks the release source, when the source itself cannot open: `stopped` says
+/// why. It is the answer [`fetch`] gives when the source fails, sent without a source.
+///
+/// # Errors
+/// `FileError` when a file the machine says to remove cannot be.
+pub effect fn unreachable(session: &mut Session, context: &Context, stopped: &InstallError) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  if needs(&session.*) != Need.Network {
+    return ()
+  }
+  let event = run refused(&mut session.*, stopped)
+  return run answer(&mut session.*, context, move event)
+}
+
+// The new text of the manifests `silk set` pins. Every edit is made before any file is written.
+effect fn edited(session: &mut Session, context: &Context) -> Typed
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let manifest = match &session.target {
+    Option<PinTarget>.Some { value } => run Manifests.copyPath(&value.manifest)
+    Option<PinTarget>.None => {
+      session.stopped = run Bytes.copy(b"silk set: no silk.toml here or above\n")
+      return Typed.Refused
+    }
+  }
+  let table: &'static [u8] = match &session.target {
+    Option<PinTarget>.Some { value } => value.table
+    Option<PinTarget>.None => b"package"
+  }
+  let text = run FileSystem.readFile(&manifest)
+
+  // A pin names the release without its build metadata, which the release's version number
+  // already identifies. A release older than this tool keeps it: those releases compare a pin
+  // with its build metadata, so without it they refuse the dependencies written for them.
+  let named = run Bytes.copy(Bytes.asSlice(&session.full))
+  let older = !Commands.same(context.release, b"0.0.0")
+    && Toolchains.compare(Bytes.asSlice(&named), context.release) < 0
+  let pinned = if older {
+    Bytes.asSlice(&named)
+  } else {
+    Commands.withoutMetadata(Bytes.asSlice(&named))
+  }
+  let quoted = run ManifestEdits.quoted(pinned)
+  let mut rewritten = match move run Commands.edit(
+    &manifest,
+    Bytes.asSlice(&text),
+    table,
+    Bytes.asSlice(&quoted),
+  ) {
+    Result<Bytes, Commands.Outcome>.Success { value } => move value
+    Result<Bytes, Commands.Outcome>.Failure { error } => {
+      session.stopped = move error.errors
+      return Typed.Refused
+    }
+  }
+
+  // The workspace's pin covers its members, and a member that also pins one is refused, so
+  // pinning a workspace removes its members' own pins.
+  if Commands.same(table, b"workspace") {
+    let pins = run Toolchains.memberPins(&manifest)
+    let found = List<Path>.asSlice(&pins)
+    let mut at = usize.ZERO
+    while at < found.length {
+      let member = run Manifests.copyPath(&found[at])
+      at = at + usize.ONE
+      if Commands.same(Path.rawBytes(&member), Path.rawBytes(&manifest)) {
+        // The workspace's own package shares its manifest.
+        rewritten = match move run Commands.unpin(&member, Bytes.asSlice(&rewritten)) {
+          Result<Bytes, Commands.Outcome>.Success { value } => move value
+          Result<Bytes, Commands.Outcome>.Failure { error } => {
+            session.stopped = move error.errors
+            return Typed.Refused
+          }
+        }
+      } else {
+        let before = run FileSystem.readFile(&member)
+        let after = match move run Commands.unpin(&member, Bytes.asSlice(&before)) {
+          Result<Bytes, Commands.Outcome>.Success { value } => move value
+          Result<Bytes, Commands.Outcome>.Failure { error } => {
+            session.stopped = move error.errors
+            return Typed.Refused
+          }
+        }
+        if !Commands.same(Bytes.asSlice(&after), Bytes.asSlice(&before)) {
+          run List<Path>.append(&mut session.members, move member)
+          run List<Bytes>.append(&mut session.memberTexts, move after)
+        }
+      }
+    }
+  }
+  session.rewrites = !Commands.same(Bytes.asSlice(&rewritten), Bytes.asSlice(&text))
+  session.rewritten = move rewritten
+  return Typed.Edited { respells: session.rewrites }
+}
+
+// Did the release key sign the archive, for this release and file?
+effect fn verified(session: &mut Session, context: &Context) -> Typed
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let checked = run Effect.result(
+    ToolchainInstall.verify(
+      context.releaseKey,
+      Bytes.asSlice(&session.full),
+      context.target,
+      Bytes.asSlice(&session.archive),
+      Bytes.asSlice(&session.signature),
+    ),
+  )
+  return match move checked {
+    Result<(), InstallError | OutOfMemoryError>.Success { .. } => Typed.Genuine
+    Result<(), InstallError | OutOfMemoryError>.Failure { error } => match move error {
+      InstallError stopped => {
+        run halt(&mut session.*, &stopped)
+        if stopped.status == ToolchainInstall.VERIFICATION {
+          return Typed.Forged
+        }
+        return Typed.Blocked
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+}
+
+/// Unpacks `archive`, the release archive of `version` for `target`, into `staging` and moves
+/// it into the store of `home` as `version`. When the store already holds a whole toolchain of
+/// `version`, that one stays and `staging` is removed.
+///
+/// # Errors
+/// `InstallError` when the archive is corrupt or the toolchain cannot be moved into the store.
+/// `FileError` when the disk refuses a step.
+pub effect fn place(home: &Path, staging: &Path, version: &[u8], target: &[u8], archive: &[u8]) -> ()
+  ! InstallError | FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut HostFiles | &mut Allocator {
+  let top = run ToolchainInstall.topName(version, target)
+  run ToolchainInstall.unpack(archive, Bytes.asSlice(&top), staging, ReleaseArchive.windows(target))
+
+  // Another install of the version may have finished while this one worked. Its toolchain may
+  // already run, so it stays.
+  if let Option<Bytes>.Some { .. } = move run Toolchains.find(home, version) {
+    let cleaned = run Effect.result(FileSystem.removeDirectoryRecursively(staging))
+    drop cleaned
+    return ()
+  }
+
+  // A directory already named for the version holds no whole toolchain: the new one replaces it.
+  let destination = run Toolchains.directory(home, version)
+  if run FileSystem.exists(&destination) {
+    let cleared = run Effect.result(FileSystem.removeDirectoryRecursively(&destination))
+    drop cleared
+  }
+
+  // Temporary directories are private. An installed toolchain is readable like any program.
+  let opened = run HostFiles.markExecutable(staging)
+  if !opened || !run HostFiles.rename(staging, &destination) {
+    let cleaned = run Effect.result(FileSystem.removeDirectoryRecursively(staging))
+    drop cleaned
+    if let Option<Bytes>.Some { .. } = move run Toolchains.find(home, version) {
+      return ()
+    }
+    fail run ToolchainInstall.stopped(
+      1,
+      &[b"cannot move the new toolchain to ", Path.rawBytes(&destination)],
+    )
+  }
+  return ()
+}
+
+// The answer for a step on the disk that `ran` reports.
+effect fn settled(session: &mut Session, ran: Result<(), InstallError | FileError | OutOfMemoryError>, done: Typed) -> Typed
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match move ran {
+    Result<(), InstallError | FileError | OutOfMemoryError>.Success { .. } => move done
+    Result<(), InstallError | FileError | OutOfMemoryError>.Failure { error } => match move error {
+      InstallError stopped => {
+        run halt(&mut session.*, &stopped)
+        if stopped.status == ToolchainInstall.VERIFICATION {
+          return Typed.Corrupt
+        }
+        return Typed.Blocked
+      }
+      FileError failed => {
+        drop failed
+        run haltOnFiles(&mut session.*)
+        return Typed.Blocked
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+}
+
+// Unpacks the archive and moves the toolchain into place.
+effect fn unpacked(session: &mut Session, context: &Context) -> Typed
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut HostFiles | &mut Allocator {
+  let home = match &context.home {
+    Option<Path>.Some { value } => &value
+    Option<Path>.None => {
+      run haltOnFiles(&mut session.*)
+      return Typed.Blocked
+    }
+  }
+  let staging = match &session.staging {
+    Option<Path>.Some { value } => run Manifests.copyPath(&value)
+    Option<Path>.None => {
+      run haltOnFiles(&mut session.*)
+      return Typed.Blocked
+    }
+  }
+  let ran = run Effect.result(
+    place(
+      home,
+      &staging,
+      Bytes.asSlice(&session.full),
+      context.target,
+      Bytes.asSlice(&session.archive),
+    ),
+  )
+  let event = run settled(&mut session.*, move ran, Typed.Placed)
+  if let Typed.Placed = &event {
+    session.staging = Option<Path>.none()
+    session.fresh = true
+  }
+  return move event
+}
+
+/// Takes the tool out of `archive`, the release archive of `version` for `target`, and puts it in
+/// the place of `home/bin/silk`, even while that program runs.
+///
+/// # Errors
+/// `InstallError` when the archive holds no tool or the program cannot be replaced. `FileError`
+/// when the disk refuses a step.
+pub effect fn swap(home: &Path, version: &[u8], target: &[u8], archive: &[u8]) -> ()
+  ! InstallError | FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut HostFiles | &mut Allocator {
+  let windows = ReleaseArchive.windows(target)
+  let top = run ToolchainInstall.topName(version, target)
+  let tool = run ToolchainInstall.member(
+    archive,
+    Bytes.asSlice(&top),
+    if windows { b"bin/silk.exe" } else { b"bin/silk" },
+    windows,
+  )
+  let program = match move tool {
+    Option<Bytes>.Some { value } => move value
+    Option<Bytes>.None => {
+      fail run ToolchainInstall.stopped(1, &[b"Silk ", version, b" has no silk tool"])
+    }
+  }
+  let bin = run Path.join(home, "bin")
+  run FileSystem.createDirectoriesRecursively(&bin)
+  let staging = run FileSystem.createTemporaryDirectory(&bin, b".update-")
+  let replaced = run Effect.result(
+    ToolchainInstall.replaceProgram(Bytes.asSlice(&program), &staging, &bin, windows),
+  )
+  let cleaned = run Effect.result(FileSystem.removeDirectoryRecursively(&staging))
+  drop cleaned
+  if let Result<(), InstallError | FileError | OutOfMemoryError>.Failure { error } = move replaced {
+    fail move error
+  }
+  return ()
+}
+
+// Replaces the tool's own program.
+effect fn replaced(session: &mut Session, context: &Context) -> Typed
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut HostFiles | &mut Allocator {
+  let home = match &context.home {
+    Option<Path>.Some { value } => &value
+    Option<Path>.None => {
+      run haltOnFiles(&mut session.*)
+      return Typed.Blocked
+    }
+  }
+  let ran = run Effect.result(
+    swap(home, Bytes.asSlice(&session.full), context.target, Bytes.asSlice(&session.archive)),
+  )
+  return run settled(&mut session.*, move ran, Typed.Replaced)
+}
+
+/// Does one step on the disk, when [`needs`] is `Need.Files`: it works out the edits of
+/// `silk set`, checks the signature of a downloaded archive, unpacks a toolchain into the
+/// store, or replaces the tool's own program. It then sends the answer to the machine and does
+/// what the machine says next.
+///
+/// # Errors
+/// `FileError` when a manifest cannot be read or written.
+pub effect fn work(session: &mut Session, context: &Context) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut HostFiles | &mut Allocator {
+  let event = match stand(&session.snapshot.value) {
+    Stand.Editing => run edited(&mut session.*, context)
+    Stand.Verifying => run verified(&mut session.*, context)
+    Stand.Unpacking => run unpacked(&mut session.*, context)
+    Stand.Replacing => run replaced(&mut session.*, context)
+    _ => {
+      return ()
+    }
+  }
+  run answer(&mut session.*, context, move event)
+  return run release_(&mut session.*)
+}
+
+/// Does every step on the disk and at the release source until the command needs something
+/// else: nothing, a compiler to ask, or a compiler to start.
+///
+/// # Errors
+/// `FileError` when a manifest, the settings or the store cannot be read or written.
+pub effect fn finish(session: &mut Session, context: &Context) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut ReleaseSource | &mut FileSystem | &mut HostFiles | &mut Allocator {
+  while true {
+    let need = needs(&session.*)
+    if need == Need.Files {
+      run work(&mut session.*, context)
+    } else if need == Need.Network {
+      run fetch(&mut session.*, context)
+    } else {
+      return ()
+    }
+  }
+  return ()
+}
+
+// The overview the compiler in `launch` prints for `--help`, or why there is none in
+// `Session.stopped`.
+effect fn overviewOf(session: &mut Session) -> Option<Bytes>
+  ! FileError | OutOfMemoryError
+  ? &mut ChildProcess | &mut Allocator {
+  let executable = match &session.launch {
+    Option<Launch>.Some { value } => run Bytes.copy(Bytes.asSlice(&value.executable))
+    Option<Launch>.None => {
+      session.stopped = run Bytes.copy(b"silk: no compiler can answer\n")
+      return Option<Bytes>.none()
+    }
+  }
+  let version = match &session.launch {
+    Option<Launch>.Some { value } => run Bytes.copy(Bytes.asSlice(&value.version))
+    Option<Launch>.None => Bytes.make()
+  }
+  let program = run Path.fromBytes(Bytes.asSlice(&executable))
+  let mut request = run ChildProcess.request(&program)
+  run ChildProcess.addArgument(&mut request, "--help")
+  run ChildProcess.setVariableBytes(&mut request, b"SILK_TOOLCHAIN", Bytes.asSlice(&version))
+  let ran = run Effect.result(ChildProcess.submit(&request))
+  let outcome = match move ran {
+    Result<ProcessOutcome, ProcessError | OutOfMemoryError>.Success { value } => move value
+    Result<ProcessOutcome, ProcessError | OutOfMemoryError>.Failure { error } => match move error {
+      ProcessError failed => {
+        drop failed
+        let mut reason = run Bytes.copy(b"silk: cannot run ")
+        run Bytes.append(&mut reason, Bytes.asSlice(&executable))
+        run Bytes.append(&mut reason, b"\n")
+        session.stopped = move reason
+        return Option<Bytes>.none()
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+  if let Option<i32>.Some { value } = ChildProcess.exitCode(&outcome) {
+    if value == 0 {
+      return Option<Bytes>.some(run Bytes.copy(ChildProcess.outputBytes(&outcome)))
+    }
+  }
+  let mut reason = run Bytes.copy(b"silk: ")
+  run Bytes.append(&mut reason, Bytes.asSlice(&executable))
+  run Bytes.append(&mut reason, b" --help failed\n")
+  run Bytes.append(&mut reason, ChildProcess.errorBytes(&outcome))
+  session.stopped = move reason
+  return Option<Bytes>.none()
+}
+
+/// Asks the selected compiler for its overview, when [`needs`] is `Need.Compiler`, sends the
+/// answer to the machine and does what the machine says next.
+///
+/// `silk --help` prints that overview before the tool's own commands, so the commands it lists
+/// are the ones that compiler runs. A first word near a command of the tool, such as `tset`,
+/// is the compiler's when the overview lists it or a word one edit away, and the command then
+/// goes on as a command for the compiler.
+///
+/// # Errors
+/// `FileError` when the path of the compiler is no path, or the store cannot be read.
+pub effect fn ask(session: &mut Session, context: &Context) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut ChildProcess | &mut FileSystem | &mut Allocator {
+  let comparing = match stand(&session.snapshot.value) {
+    Stand.Asking => false
+    Stand.Comparing => true
+    _ => {
+      return ()
+    }
+  }
+  let overview = run overviewOf(&mut session.*)
+  let mut event = if comparing { Typed.Unowned } else { Typed.Silent }
+  if let Option<Bytes>.Some { value } = move overview {
+    if !comparing {
+      event = Typed.Told
+    } else if Commands.nearListed(Bytes.asSlice(&session.request.word), Bytes.asSlice(&value)) {
+      event = Typed.Owned
+    }
+    session.overview = move value
+  }
+  return run answer(&mut session.*, context, move event)
+}
+
+/// Ends the command when [`needs`] is `Need.Launch` and the compiler in `Session.launch` did
+/// not start: the command says so and exits with status 1.
+///
+/// # Errors
+/// `FileError` when a file the machine says to write cannot be.
+pub effect fn stuck(session: &mut Session, context: &Context) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  if needs(&session.*) != Need.Launch {
+    return ()
+  }
+  return run answer(&mut session.*, context, Typed.Stuck)
+}
+
+/// Runs the command `arguments` to its end, or to the point where it needs a compiler: it is
+/// [`begin`] and then [`finish`]. `use`, `set` and `update self` are over when this returns.
+///
+/// # Errors
+/// `FileError` when a manifest, the settings or the store cannot be read or written.
+pub effect fn complete(context: &Context, arguments: &[Bytes]) -> Session
+  ! FileError | OutOfMemoryError
+  ? &mut ReleaseSource | &mut FileSystem | &mut HostFiles | &mut Allocator {
+  let mut session = run begin(context, arguments)
+  run finish(&mut session, context)
+  return move session
+}

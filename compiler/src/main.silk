@@ -2,6 +2,7 @@ import silk.system.host_path as HostPath
 import driver.OptimizationFlags
 import driver.PackageCodegen
 import driver.RequestText
+import silk.build.events { BuildEvent, BuildEvents }
 import silk.build.options { Optimize }
 import silk.build.host as GraphHost
 import silk.build.definition {
@@ -8546,6 +8547,7 @@ fn silentProgress() -> ProgressSettings {
     units: 0,
     timings: false,
     costs: false,
+    events: -1,
   }
 }
 
@@ -8618,6 +8620,13 @@ effect fn progressSettingsFor(
       width = parsed
     }
   }
+  // With SILK_EVENTS set, each unit also reports what it does to that file.
+  let mut events: i32 = -1
+  if let Option<Bytes>.Some { value: reported } = move run HostInput.variableNamed(BuildEvents.variable()) {
+    if Bytes.length(&reported) > usize.ZERO {
+      events = run BuildEvents.open(Bytes.asSlice(&reported))
+    }
+  }
   return ProgressSettings {
     display: display,
     color: color,
@@ -8628,6 +8637,7 @@ effect fn progressSettingsFor(
     units: units,
     timings: timings,
     costs: false,
+    events: events,
   }
 }
 
@@ -8687,6 +8697,7 @@ effect fn unitsProgress(settings: &ProgressSettings) -> Progress
     units: 0,
     timings: false,
     costs: false,
+    events: -1,
   }
   return run Progress.start(&whole, b"", b"", b"")
 }
@@ -9287,6 +9298,7 @@ fn unitSettings(packages: &ProgressSettings, targets: usize) -> ProgressSettings
     units: packages.units,
     timings: packages.timings,
     costs: packages.costs,
+    events: packages.events,
   }
 }
 
@@ -9549,6 +9561,22 @@ effect fn checkTarget(
   if let Option<Bytes>.Some { .. } = move run HostInput.variableNamed("SILK_CHECK_SERVER_TIMINGS") {
     serverTimings = true
   }
+
+  // `SILK_CHECK_SERVER_IDLE` is how many milliseconds a server waits for its next client before
+  // it leaves, for a run that cannot wait the usual time.
+  let mut serverIdle = CheckServer.IDLE_MILLISECONDS
+  if let Option<Bytes>.Some { value: written } = move run HostInput.variableNamed("SILK_CHECK_SERVER_IDLE") {
+    let digits = Bytes.asSlice(&written)
+    let mut parsed: i32 = 0
+    let mut at = usize.ZERO
+    while at < digits.length && at < 8 && digits[at] >= 48 && digits[at] <= 57 {
+      parsed = parsed * 10 + u8.toI32(digits[at] - 48)
+      at = at + usize.ONE
+    }
+    if at == digits.length && parsed > 0 {
+      serverIdle = parsed
+    }
+  }
   if serve && abandon && !roots {
     if let Option<Bytes>.Some { value: stamped } = &compiler.* {
       if let Option<Bytes>.Some { value: socket } = move run checkServerSocket(
@@ -9568,6 +9596,7 @@ effect fn checkTarget(
           Bytes.asSlice(&socket),
           Bytes.asSlice(&serverKey),
         ) {
+          run Progress.note(&progress, &BuildEvent.ServerAnswered)
           run Bytes.append(&mut out, Bytes.asSlice(&answered.report))
           if answered.status == 0 {
             run Progress.end(&mut progress, b"")
@@ -9736,6 +9765,8 @@ effect fn checkTarget(
         &cacheHome,
         &loadedCaches,
         serverTimings,
+        serverIdle,
+        &progress,
       )
       CheckServer.exit(0)
     }
@@ -9793,7 +9824,7 @@ effect fn checkServerSocket(
 
   // The environment a check reads (a tool, the registry home, a debug switch) is part of what it
   // answers, so a client with another environment asks another server.
-  let read: [string; 17] = [
+  let read: [string; 18] = [
     "PATH",
     "HOME",
     "SILK_HOME",
@@ -9806,6 +9837,7 @@ effect fn checkServerSocket(
     "SILK_VERIFY_MIR",
     "SILK_WALK_WORKERS",
     "SILK_CHECK_SERVER_TIMINGS",
+    "SILK_CHECK_SERVER_IDLE",
     "SDKROOT",
     "DEVELOPER_DIR",
     "NO_COLOR",
@@ -9871,14 +9903,22 @@ effect fn serveChecks(
   cacheHome: &Option<Path>,
   loadedCaches: &List<Path>,
   timings: bool,
+  idleLimit: i32,
+  progress: &Progress,
 ) -> ()
   ! OutOfMemoryError
   ? &mut FileSystem | &mut Allocator | &mut Types {
   let mut clock = OsMonotonicClock.make()
+
+  // A server that leaves sooner than the usual watch also looks at its project that often.
+  let watch = if idleLimit < CheckServer.WATCH_MILLISECONDS { idleLimit } else { CheckServer.WATCH_MILLISECONDS }
   let listener = run CheckServer.listenAt(socket)
   if listener < 0 {
     return ()
   }
+
+  // Only a server that listens is reported, so the event means that the next check has one to ask.
+  run Progress.note(progress, &BuildEvent.ServerStarted)
   let shape = run programShape(&sources.*)
   run releaseReplayed(&mut store.*, &mut request.*)
   let mut checked = usize.ZERO
@@ -9890,14 +9930,15 @@ effect fn serveChecks(
   let mut crowded = false
   let mut idle = 0
   while true {
-    let client = CheckServer.next(listener, CheckServer.WATCH_MILLISECONDS)
+    let client = CheckServer.next(listener, watch)
     if client == CheckServer.TIMED_OUT {
-      idle = idle + CheckServer.WATCH_MILLISECONDS
-      if idle >= CheckServer.IDLE_MILLISECONDS {
-        break
-      }
+      // The shape comes first, so a server that leaves for both reasons writes nothing.
       if !ContentHash.equals(run programShape(&sources.*), shape) {
         reshaped = true
+        break
+      }
+      idle = idle + watch
+      if idle >= idleLimit {
         break
       }
       if run CheckServer.crowded() {
@@ -11554,6 +11595,7 @@ effect fn runSideBySide(
     units: settings.units,
     timings: settings.timings,
     costs: settings.costs,
+    events: settings.events,
   }
 
   // Per member, by its place in `order`: 0 waiting, 1 running, 2 finished.
@@ -15037,6 +15079,14 @@ effect fn initTemplate(
         fail move exhausted
       }
     }
+  }
+
+  // Every template has a manifest, so a directory that has one is refused before anything is
+  // fetched: the answer does not depend on the network.
+  let manifest = run Path.join(directory, "silk.toml")
+  if run FileSystem.exists(&manifest) {
+    run reportInitialization(&InitializationError.ExistingFile { path: move manifest })
+    return 2
   }
   let store = match move run GitCheckouts.store() {
     Option<Path>.Some { value } => move value

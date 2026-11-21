@@ -1,0 +1,259 @@
+//! Durable actors: a machine that is saved after every change and continues after a restart.
+import silk.machine.actor { Durable, Reply }
+import silk.machine.chart { Chart, Enqueue, Machine }
+import silk.machine.snapshot { Snapshot, Status, Steps, TransitionLoopError }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.io.writer { Writer, WriterError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.schema.issue { SchemaError }
+import silk.schema.json { SchemaJson }
+import silk.schema.schema { Schema }
+
+// An order: paying charges the bank, and the answer ships the order.
+
+union Order {
+  Cart,
+  Paying,
+  Shipped
+}
+
+union OrderEvent {
+  Pay,
+  Paid,
+}
+
+struct OrderContext {
+  pub amount: u32,
+}
+
+union OrderEffect {
+  Charge { pub amount: u32 },
+  Ship,
+}
+
+impl Schema for Order {}
+
+impl Schema for OrderEvent {}
+
+impl Schema for OrderContext {}
+
+impl Schema for OrderEffect {}
+
+impl Machine<OrderEvent, OrderContext, OrderEffect> for Order {
+  static fn chart() -> Chart<Order, OrderEvent, OrderContext, OrderEffect> {
+    return Chart<Order, OrderEvent, OrderContext, OrderEffect>.of()
+      |> Chart.initial(Order.Cart)
+      |> Chart.on("Cart", "Pay", Order.Paying)
+      |> Chart.on("Paying", "Paid", Order.Shipped)
+      |> Chart.final("Shipped")
+  }
+
+  effect fn enter(
+    state: &Order,
+    context: &mut OrderContext,
+    enq: &mut Enqueue<OrderEvent, OrderEffect>,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match &state.* {
+      Order.Paying => {
+        run enq.perform(OrderEffect.Charge { amount: context.amount })
+      }
+      Order.Shipped => {
+        run enq.perform(OrderEffect.Ship)
+      }
+      _ => {}
+    }
+    return ()
+  }
+}
+
+type OrderSnapshot = Snapshot<Order, OrderEvent, OrderContext, OrderEffect>
+
+// The bank the effects use. Its first charge never comes back: the program stops there.
+service Bank {
+  effect fn charge(amount: u32) -> bool ? &mut Bank
+
+  effect fn ship() -> () ? &mut Bank
+}
+
+struct TestBank {
+  pub attempts: u32,
+  pub shipped: u32,
+}
+
+impl Bank for TestBank {
+  effect fn charge(self: &mut Self, amount: u32) -> bool {
+    self.attempts = self.attempts + 1
+    return self.attempts > 1
+  }
+
+  effect fn ship(self: &mut Self) -> () {
+    self.shipped = self.shipped + 1
+    return ()
+  }
+}
+
+// The program stopped while an effect was performed.
+struct Stopped {}
+
+effect fn perform(queued: OrderEffect, reply: &mut Reply<OrderEvent>) -> ()
+  ! Stopped | OutOfMemoryError
+  ? &mut Bank | &mut Allocator {
+  match move queued {
+    OrderEffect.Charge { amount } => {
+      if !(run Bank.charge(amount)) {
+        fail Stopped {}
+      }
+      run reply.send(OrderEvent.Paid)
+    }
+    OrderEffect.Ship => {
+      run Bank.ship()
+    }
+  }
+  return ()
+}
+
+// Where the snapshot is kept: the last saved JSON text.
+service Disk {
+  effect fn store(text: &[u8]) -> () ? &mut Disk
+}
+
+struct TestDisk {
+  pub bytes: [u8; 1024],
+  pub length: usize,
+  pub saves: u32,
+}
+
+impl Disk for TestDisk {
+  effect fn store(self: &mut Self, text: &[u8]) -> () {
+    let mut index: usize = 0
+    while index < text.length {
+      self.bytes[index] = text[index]
+      index = index + 1
+    }
+    self.length = text.length
+    self.saves = self.saves + 1
+    return ()
+  }
+}
+
+struct Capture {
+  bytes: [u8; 1024],
+  length: usize,
+}
+
+impl Writer for Capture {
+  effect fn writeAll(self: &mut Self, value: &[u8]) -> ()
+    ! WriterError
+    ? &mut Writer {
+    let mut index: usize = 0
+    while index < value.length {
+      self.bytes[self.length] = value[index]
+      self.length = self.length + 1
+      index = index + 1
+    }
+    return ()
+  }
+
+  effect fn flush(self: &mut Self) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return ()
+  }
+}
+
+// The `save` of the durable actor: the snapshot as JSON on the disk.
+effect fn save(snapshot: &OrderSnapshot) -> ()
+  ! OutOfMemoryError
+  ? &mut Disk | &mut Allocator {
+  let mut capture = Capture { bytes: [0; 1024], length: 0 }
+  let encoded = run Effect.result(SchemaJson.encode<OrderSnapshot>(snapshot))
+    |> Effect.provideMut<Writer>(&mut capture)
+  match move encoded {
+    Result<(), SchemaError | WriterError | OutOfMemoryError>.Success { .. } => {}
+    Result<(), SchemaError | WriterError | OutOfMemoryError>.Failure { .. } => Intrinsic.trap(
+      "snapshot JSON",
+    )
+  }
+  run Disk.store(Slice.view(&capture.bytes, 0, capture.length))
+  return ()
+}
+
+// The first run of the program: it stops while the bank is charged.
+effect fn firstRun() -> bool
+  ! OutOfMemoryError | TransitionLoopError
+  ? &mut Bank | &mut Disk | &mut Allocator {
+  let mut order = run Steps.begin<Order, OrderEvent, OrderContext, OrderEffect>(
+    OrderContext { amount: 30 },
+    0,
+  )
+  let sent = run Effect.result(Durable.send(&mut order, OrderEvent.Pay, perform, save))
+  return match move sent {
+    Result<(), Stopped | OutOfMemoryError | TransitionLoopError>.Failure { .. } => true
+    Result<(), Stopped | OutOfMemoryError | TransitionLoopError>.Success { .. } => false
+  }
+}
+
+// The second run: it starts from the snapshot on the disk and finishes the order.
+effect fn secondRun(stored: &[u8]) -> ()
+  ! Stopped | OutOfMemoryError | TransitionLoopError | SchemaError
+  ? &mut Bank | &mut Disk | &mut Allocator {
+  let mut order = run SchemaJson.decode<OrderSnapshot>(stored)
+  match &order.value {
+    Order.Paying => {}
+    _ => Intrinsic.trap("the saved order is being paid")
+  }
+  if order.pending.length() != 1 {
+    Intrinsic.trap("the charge is still queued in the saved snapshot")
+  }
+  run Durable.settle(&mut order, perform, save)
+  match &order.status {
+    Status.Done => {}
+    _ => Intrinsic.trap("expected the order done")
+  }
+  return ()
+}
+
+test effect fn durableActorContinuesAfterARestart()
+  ! Stopped | OutOfMemoryError | TransitionLoopError | SchemaError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut bank = TestBank { attempts: 0, shipped: 0 }
+  let mut disk = TestDisk { bytes: [0; 1024], length: 0, saves: 0 }
+  let stopped = run firstRun()
+    |> Effect.provideMut<Bank>(&mut bank)
+    |> Effect.provideMut<Disk>(&mut disk)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  if !stopped || disk.saves != 1 {
+    Intrinsic.trap("the first run saves the step and stops in the charge")
+  }
+  let mut stored: [u8; 1024] = [0; 1024]
+  let length = disk.length
+  let mut index: usize = 0
+  while index < length {
+    stored[index] = disk.bytes[index]
+    index = index + 1
+  }
+  run secondRun(Slice.view(&stored, 0, length))
+    |> Effect.provideMut<Bank>(&mut bank)
+    |> Effect.provideMut<Disk>(&mut disk)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+
+  // The charge was performed again, the order shipped one time, and every change was saved:
+  // the charge, the step it caused, and the shipping.
+  if bank.attempts != 2 || bank.shipped != 1 || disk.saves != 4 {
+    Intrinsic.trap("expected the charge repeated, one shipment and four saves")
+  }
+  let last = run SchemaJson.decode<OrderSnapshot>(Slice.view(&disk.bytes, 0, disk.length))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  match &last.status {
+    Status.Done => {}
+    _ => Intrinsic.trap("the last save holds the finished order")
+  }
+  if last.pending.length() != 0 {
+    Intrinsic.trap("the last save has no queued effects")
+  }
+  return ()
+}

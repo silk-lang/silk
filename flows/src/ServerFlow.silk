@@ -1,0 +1,277 @@
+//! The check server of a package as a machine: [`Serving`] is where a command stands,
+//! [`Call`] is what the user types and does, and [`Desk`] is the package and whether a check
+//! server answers for it.
+//!
+//! This machine is a reference. The compiler does not run it: a run of the real compiler is
+//! compared with it, and a disagreement is a bug in the compiler or a wrong row here.
+//!
+//! `silk check` leaves a check server behind when the build directory had nothing to answer the
+//! check with. The server keeps what the check learned, and answers the next checks of the
+//! package, so they do no work of their own. A package has one server at a time. The server
+//! leaves when nothing asks it for a while, and writes what its answers taught it to the build
+//! directory as it goes. It also leaves when the manifest of the package changes, and then
+//! writes nothing. `silk check --no-server` neither asks a server nor leaves one.
+
+import Trail { Note, Spot, Trail }
+import silk.build.events { Work }
+import silk.collections.list { List }
+import silk.machine.chart { Chart, Enqueue, Guards, Machine, Next }
+import silk.machine.rules { Rules }
+import silk.machine.snapshot { Snapshot, Steps, TransitionLoopError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.schema.schema { Schema }
+
+/// Where one command stands. No command of this machine waits for the world, so there is one
+/// state.
+pub union Serving {
+  /// No command runs.
+  Resting,
+}
+
+/// What the user types, and what the user does between commands.
+pub union Call {
+  /// `silk check`.
+  Check,
+  /// `silk check --no-server`.
+  CheckAlone,
+  /// `silk clean`.
+  Clean,
+  /// The user writes a new source that is right.
+  Edit,
+  /// The user writes a new source with a type error.
+  Break,
+  /// The user changes the manifest of the package and does nothing for a while. A server that
+  /// is there sees that the package is another one now, and leaves.
+  Reshape,
+  /// The user does nothing for longer than a check server stays without being asked.
+  Wait,
+}
+
+/// The package, its build directory and its check server.
+pub struct Desk {
+  /// Whether the source has a type error.
+  pub broken: bool,
+  /// Whether there is a build directory, which has something to answer a check with.
+  pub kept: bool,
+  /// Whether a check server is there.
+  pub serving: bool,
+  /// Whether the server that is there answered a check, so it knows more than the build
+  /// directory holds.
+  pub answered: bool,
+}
+
+impl Schema for Serving {}
+
+impl Schema for Call {}
+
+impl Schema for Desk {}
+
+impl Desk {
+  /// A package with a right source that was never checked.
+  pub fn new() -> Desk {
+    return Desk { broken: false, kept: false, serving: false, answered: false }
+  }
+}
+
+fn serving(desk: &Desk, event: &Call) -> bool {
+  return desk.serving
+}
+
+fn cold(desk: &Desk, event: &Call) -> bool {
+  return !desk.kept
+}
+
+fn kept(desk: &Desk, event: &Call) -> bool {
+  return desk.kept
+}
+
+fn right(desk: &Desk) -> bool {
+  return !desk.broken
+}
+
+fn wrong(desk: &Desk) -> bool {
+  return desk.broken
+}
+
+type Rows = Chart<Serving, Call, Desk, Trail>
+
+// How a check ends: with the type error when the source has one.
+static fn ended(chart: Rows) -> Rows {
+  return chart
+    |> Chart.leavesWhen(
+      Guards.named("the source is right", right),
+      &[Trail.Says { note: Note.Finished }, Trail.Exits { status: 0 }],
+    )
+    |> Chart.leavesWhen(
+      Guards.named("the source has a type error", wrong),
+      &[
+        Trail.Says { note: Note.Diagnostic },
+        Trail.Says { note: Note.Failed },
+        Trail.Exits { status: 1 },
+      ],
+    )
+}
+
+// What a row leaves when the command checks by itself.
+static fn alone(chart: Rows) -> Rows {
+  return chart
+    |> Chart.leaves(&[Trail.Does { work: Work.Check }, Trail.Changes { spot: Spot.Cache }])
+}
+
+impl Machine<Call, Desk, Trail> for Serving {
+  static fn chart() -> Chart<Serving, Call, Desk, Trail> {
+    return Chart<Serving, Call, Desk, Trail>.of()
+      |> Chart.initial(Serving.Resting)
+
+      // silk check
+      |> Chart.stayWhen("Resting", "Check", Guards.named("a server is there", serving))
+      |> Chart.leaves(&[Trail.Asks])
+      |> ended()
+      |> Chart.stayWhen("Resting", "Check", Guards.named("there is no build directory", cold))
+      |> alone()
+      |> Chart.leaves(&[Trail.Serves, Trail.Creates { spot: Spot.Socket }])
+      |> ended()
+      |> Chart.stay("Resting", "Check")
+      |> alone()
+      |> ended()
+
+      // silk check --no-server
+      |> Chart.stay("Resting", "CheckAlone")
+      |> alone()
+      |> ended()
+
+      // silk clean
+      |> Chart.stayWhen("Resting", "Clean", Guards.named("there is a build directory", kept))
+      |> Chart.leaves(
+        &[
+          Trail.Removes { spot: Spot.Cache },
+          Trail.Says { note: Note.Cleaned },
+          Trail.Exits { status: 0 },
+        ],
+      )
+      |> Chart.stay("Resting", "Clean")
+      |> Chart.leaves(&[Trail.Says { note: Note.NothingToClean }, Trail.Exits { status: 0 }])
+
+      // What the user does. `handle` changes the desk, and no command runs.
+      |> Chart.stay("Resting", "Edit")
+      |> Chart.stay("Resting", "Break")
+      |> Chart.stay("Resting", "Reshape")
+      |> Chart.stay("Resting", "Wait")
+  }
+
+  // What the user does to the package, and what a server does when nothing asks it.
+  effect fn handle(
+    state: &Serving,
+    context: &mut Desk,
+    event: &Call,
+    enq: &mut Enqueue<Call, Trail>,
+  ) -> Next<Serving>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match &event.* {
+      Call.Edit => {
+        context.broken = false
+      }
+      Call.Break => {
+        context.broken = true
+      }
+
+      // The server leaves, and writes nothing: what it knows is of a package that is gone.
+      Call.Reshape => {
+        context.serving = false
+        context.answered = false
+      }
+
+      // The server leaves, and writes what its answers taught it to the build directory.
+      Call.Wait => {
+        if context.serving && context.answered {
+          context.kept = true
+        }
+        context.serving = false
+        context.answered = false
+      }
+      _ => {}
+    }
+    return Next<Serving>.Pass
+  }
+
+  // The desk after one effect of a row.
+  fn absorb(state: &Serving, context: &mut Desk, effect_: &Trail) -> () {
+    match &effect_.* {
+      Trail.Serves => {
+        context.serving = true
+        context.answered = false
+      }
+      Trail.Asks => {
+        context.answered = true
+      }
+      Trail.Changes { spot } => {
+        if spot == Spot.Cache {
+          context.kept = true
+        }
+      }
+      Trail.Removes { spot } => {
+        if spot == Spot.Cache {
+          context.kept = false
+        }
+      }
+      _ => {}
+    }
+    return ()
+  }
+}
+
+/// The promises the check server keeps on every path, each with its reason.
+pub static fn laws() -> Rules<Call, Desk, Trail> {
+  return Rules<Call, Desk, Trail>.of()
+    |> Rules.never("CheckAlone", Trail.Asks, "--no-server asks no server")
+    |> Rules.never("CheckAlone", Trail.Serves, "--no-server leaves no server")
+    |> Rules.neverWhen(
+      "Check",
+      serving,
+      Trail.Creates { spot: Spot.Socket },
+      "a package has one check server at a time",
+    )
+    |> Rules.neverWhen(
+      "Check",
+      serving,
+      Trail.Does { work: Work.Check },
+      "a check that a server answers does no work of its own",
+    )
+    |> Rules.never("Clean", Trail.Asks, "silk clean needs no server")
+    |> Rules.neverAny(Trail.Changes { spot: Spot.Sources }, "a check edits no source")
+    |> Rules.neverAny(Trail.Changes { spot: Spot.Manifest }, "a check edits no manifest")
+    |> Rules.neverAny(Trail.Does { work: Work.Codegen }, "a check generates no code")
+}
+
+type Shot = Snapshot<Serving, Call, Desk, Trail>
+
+/// The package a walk starts from, and a run sets up: a right source, never checked.
+///
+/// # Errors
+/// `TransitionLoopError` as `Steps.begin` gives it. `OutOfMemoryError`.
+pub effect fn starts() -> List<Shot>
+  ! OutOfMemoryError | TransitionLoopError
+  ? &mut Allocator {
+  let mut shots = List<Shot>.make()
+  run List<Shot>.append(&mut shots, run Steps.begin<Serving, Call, Desk, Trail>(Desk.new(), 0))
+  return move shots
+}
+
+/// Everything a user can type or do.
+///
+/// # Errors
+/// `OutOfMemoryError`.
+pub effect fn events() -> List<Call>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut all = List<Call>.make()
+  run List<Call>.append(&mut all, Call.Check)
+  run List<Call>.append(&mut all, Call.CheckAlone)
+  run List<Call>.append(&mut all, Call.Clean)
+  run List<Call>.append(&mut all, Call.Edit)
+  run List<Call>.append(&mut all, Call.Break)
+  run List<Call>.append(&mut all, Call.Reshape)
+  run List<Call>.append(&mut all, Call.Wait)
+  return move all
+}

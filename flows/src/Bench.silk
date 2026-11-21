@@ -1,0 +1,1314 @@
+//! The local world of the compiler's reference machines: a real home directory and project
+//! that a run of the real compiler happens in, and what compares the run with a machine.
+//!
+//! A [`Bench`] holds what every trip of a run shares: the `silk` tool and the toolchain under
+//! test, a git host for templates and an archive for dependencies, both made of files. A
+//! [`Stage`] is the directory of one trip. Every command is typed into the tool, which runs the
+//! compiler of the toolchain as an installed version, so a run also checks that the tool and the
+//! compiler work together.
+//!
+//! Each machine has a [`Binding`], the three tables between its words and real ones:
+//!
+//! - Act: [`Binding.act`] turns a command into a command line, and the answers of the world
+//!   into an arrangement, such as a git host that is not there. It also says where the command
+//!   is typed, in `Stage.inside`.
+//! - Observe: [`Binding.observed`] reads the disk and gives the context it shows. It never asks
+//!   the compiler, because the compiler is what the run checks.
+//! - Match: [`judged`] compares what a command left with its `Trail`. Everything the trail
+//!   lists must be there, and nothing else may be.
+//!
+//! [`taken`] takes one trip of a machine on its binding.
+//!
+//! # Gotchas
+//! The module names host functions of POSIX, so it builds for Linux and macOS only.
+
+import Picture { Change, Difference, Picture }
+import Plan { json }
+import Trail { Note, Spot, Trail }
+import Trips { Trip }
+import World { Outcome }
+import silk.build.events { BuildEvent, BuildEvents, Fetch, Work }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.num.i32
+import silk.num.u8
+import silk.num.usize
+import silk.core.result { Result }
+import silk.platform.native.file { NativeFile, NativeFileError }
+import silk.schema.issue { SchemaError }
+import silk.schema.schema { Schema }
+import silk.system.child_process { ChildProcess, ProcessError }
+import silk.text.string { String }
+import silk.core.effect { Effect }
+import silk.system.filesystem { DirectoryEntry, FileError, FileSystem, Path }
+
+@foreign(noCapture: .("path"))
+unsafe extern "C" fn chmod(path: ?[*]const u8, mode: u32) -> i32
+
+// An exclusive lock on an open file, which waits for the process that holds one.
+unsafe extern "C" fn flock(descriptor: i32, operation: i32) -> i32
+
+@foreign(noCapture: ("from", "to"))
+unsafe extern "C" fn rename(from: ?[*]const u8, to: ?[*]const u8) -> i32
+
+@foreign(noCapture: ("target", "path"))
+unsafe extern "C" fn symlink(target: ?[*]const u8, path: ?[*]const u8) -> i32
+
+/// What every trip of a run shares.
+pub struct Bench {
+  // The directory of the bench.
+  base: Path,
+  // The directory that holds one directory for each trip.
+  root: Path,
+  // The tool under test.
+  tool: Path,
+  // The toolchain under test: a directory with `bin/silkc` and `lib/silk`, as a release
+  // archive lays them out.
+  toolchain: Path,
+  // The version of the tool, which names the toolchain as an installed version.
+  release: Bytes,
+  // The version the compiler of the toolchain has, which is the release but for a compiler
+  // built outside a release.
+  version: Bytes,
+  // The Clang the compiler uses, or empty text for the one of the toolchain.
+  clang: Bytes,
+  // The search path of the programs the compiler starts: git, sh.
+  programs: Bytes,
+  // The directory no command may write to, which the hook of one template reaches for.
+  outside: Path,
+}
+
+/// The directory of one trip.
+pub struct Stage {
+  pub directory: Path,
+  /// The home directory. The stores of the compiler are in `.silk` below it.
+  pub home: Path,
+  /// Where the commands are typed, and the directory above every project of the trip.
+  pub work: Path,
+  /// The directory below the work directory where the commands are typed, or empty text for
+  /// the work directory itself.
+  pub inside: &'static [u8],
+  /// Where the check server of the trip has its socket: a directory with a short path below
+  /// `/tmp`, because the path of a socket has room for about a hundred bytes.
+  pub runtime: Path,
+  // The file the compiler reports its events to.
+  events: Path,
+  /// Whether the next command runs with `SILK_OFFLINE` set.
+  pub offline: bool,
+  /// How many times the trip changed a source, so that every change is a new text.
+  pub edits: usize,
+}
+
+fn holds(text: &[u8], part: &[u8]) -> bool {
+  let mut at: usize = 0
+  while at + part.length <= text.length {
+    if Slice.view<u8>(text, at, part.length) == part {
+      return true
+    }
+    at = at + 1
+  }
+  return false
+}
+
+fn startsWith(text: &[u8], prefix: &[u8]) -> bool {
+  return text.length >= prefix.length && Slice.view<u8>(text, 0, prefix.length) == prefix
+}
+
+/// The texts of `parts`, one after the other.
+///
+/// # Errors
+/// `OutOfMemoryError`.
+pub effect fn joined(parts: &[&[u8]]) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = Bytes.make()
+  let mut at: usize = 0
+  while at < parts.length {
+    run Bytes.append(&mut text, parts[at])
+    at = at + 1
+  }
+  return move text
+}
+
+// `path` as the host takes it: with a NUL at its end.
+effect fn hosted(path: &[u8]) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let ending: [u8; 1] = [0]
+  return run joined(&[path, &ending])
+}
+
+effect fn counted(text: &mut Bytes, number: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if number >= 10 {
+    run counted(&mut text.*, number / 10)
+  }
+  let digit: [u8; 1] = [usize.toU8(number % 10) + 48]
+  return run Bytes.append(&mut text.*, &digit)
+}
+
+// Takes and gives back the lock on every file below `directory` whose name ends in `.lock` and
+// that is in a cache: `cached` is whether `directory` is below a directory `cache`.
+effect fn awaited(directory: &Path, cached: bool) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let listed = run FileSystem.listDirectory(directory)
+  let children = List<DirectoryEntry>.asSlice(&listed)
+  let mut at: usize = 0
+  while at < children.length {
+    let child = &children[at]
+    at = at + 1
+    let path = Path.rawBytes(&child.path)
+    if child.kind.code == 1 {
+      let inside = cached
+        || (path.length > 6 && Slice.view<u8>(path, path.length - 6, 6) == b"/cache")
+      run awaited(&child.path, inside)
+    } else if cached && child.kind.code == 0 && path.length > 5
+      && Slice.view<u8>(path, path.length - 5, 5) == b".lock" {
+      // 2 is LOCK_EX on Linux and macOS.
+      if let Result<i32, NativeFileError>.Success { value: descriptor } = move run Effect.result(
+        NativeFile.open(path, 0, 0),
+      ) {
+        let _locked = unsafe flock(descriptor, 2)
+        drop run Effect.result(NativeFile.close(descriptor))
+      }
+    }
+  }
+  return ()
+}
+
+// The template `name` of a git host: a package, with a `[[post-init]]` entry that runs
+// `hook` when `hook` is not empty.
+effect fn template(repository: &Path, name: string, hook: &[u8]) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let directory = run Path.join(repository, name)
+  run FileSystem.createDirectoriesRecursively(&run Path.join(&directory, "src"))
+  let mut manifest = run Bytes.copy(
+    b"[package]\nname = \"template\"\nversion = \"0.1.0\"\ndescription = \"A template of the local world\"\n",
+  )
+  if hook.length != 0 {
+    run Bytes.append(&mut manifest, b"\n[[post-init]]\nrun = [\"sh\", \"-c\", \"")
+    run Bytes.append(&mut manifest, hook)
+    run Bytes.append(&mut manifest, b"\"]\n")
+  }
+  run FileSystem.writeFile(&run Path.join(&directory, "silk.toml"), manifest.asSlice())
+  return run FileSystem.writeFile(
+    &run Path.join(&directory, "src/main.silk"),
+    b"pub fn main() -> i32 {\n  return 0\n}\n",
+  )
+}
+
+impl Bench {
+  /// A bench in the directory `root`, for the tool whose program is `tool` and the toolchain in
+  /// the directory `toolchain`. `release` is the version of the tool, and `version` the one of the
+  /// compiler of the toolchain, or empty text when it is `release` too. `clang` is the Clang the compiler
+  /// uses, or empty text for the one of the toolchain, and `programs` the search path where
+  /// `git`, `sh` and `tar` are found.
+  ///
+  /// # Details
+  /// It makes four git hosts below `root/hosts`, each one repository `silk-lang/examples`:
+  /// `a` has the templates `default` and `plain` without entries, `hooked` whose entry writes a
+  /// file into the project, and `failing` whose entry writes outside the project. In `b` the
+  /// `default` template is the hooked one, in `c` the failing one, and `d` has no `default`.
+  /// It also makes the library package `shelf` in `root/archives/shelf`, whose module `lib` has
+  /// the function `add`, and the archive `root/archives/shelf.tar.gz` of it.
+  ///
+  /// # Errors
+  /// `FileError` when a file cannot be written. `ProcessError` when `git` or `tar` does not
+  /// start. `OutOfMemoryError`.
+  pub effect fn made(
+    root: &Path,
+    tool: &[u8],
+    toolchain: &Path,
+    release: &[u8],
+    version: &[u8],
+    clang: &[u8],
+    programs: &[u8],
+  ) -> Bench
+    ! FileError | ProcessError | OutOfMemoryError
+    ? &mut FileSystem | &mut ChildProcess | &mut Allocator {
+    let bench = Bench {
+      base: run Path.fromBytes(Path.rawBytes(root)),
+      root: run Path.join(root, "trips"),
+      tool: run Path.join(root, "silk"),
+      toolchain: run Path.fromBytes(Path.rawBytes(toolchain)),
+      release: run Bytes.copy(release),
+      version: run Bytes.copy(
+        if version.length == 0 {
+          release
+        } else {
+          version
+        },
+      ),
+      clang: run Bytes.copy(clang),
+      programs: run Bytes.copy(programs),
+      outside: run Path.join(root, "outside"),
+    }
+    run FileSystem.createDirectoriesRecursively(&bench.root)
+    run FileSystem.createDirectoriesRecursively(&bench.outside)
+    run FileSystem.writeFile(&bench.tool, tool)
+    let target = run hosted(Path.rawBytes(&bench.tool))
+    if unsafe chmod(Pointer.fromSlice<u8>(target.asSlice()), 493) != 0 {
+      fail FileSystem.error(FileSystem.writeFileOperation(), FileSystem.other())
+    }
+
+    let reaching = run joined(&[b"echo stray > ", Path.rawBytes(&bench.outside), b"/stray.txt"])
+    let passing = b"echo hooked > hooked.txt"
+    let variants: [string<'static>; 4] = ["a", "b", "c", "d"]
+    let mut at: usize = 0
+    while at < variants.length {
+      let host = run Path.join(&run Path.join(root, "hosts"), variants[at])
+      let repository = run Path.join(&host, "silk-lang/examples.git")
+      run FileSystem.createDirectoriesRecursively(&repository)
+      run template(&repository, "plain", b"")
+      run template(&repository, "hooked", passing)
+      run template(&repository, "failing", reaching.asSlice())
+      if at == 0 {
+        run template(&repository, "default", b"")
+      } else if at == 1 {
+        run template(&repository, "default", passing)
+      } else if at == 2 {
+        run template(&repository, "default", reaching.asSlice())
+      }
+      run bench.host(&repository, &[b"git", b"init", b"--quiet"])
+      run bench.host(&repository, &[b"git", b"add", b"--all"])
+      run bench.host(
+        &repository,
+        &[
+          b"git",
+          b"-c",
+          b"user.name=flows",
+          b"-c",
+          b"user.email=flows@localhost",
+          b"commit",
+          b"--quiet",
+          b"--message",
+          b"templates",
+        ],
+      )
+      at = at + 1
+    }
+
+    let archives = run Path.join(root, "archives")
+    run FileSystem.createDirectoriesRecursively(&run Path.join(&archives, "shelf/src"))
+    run FileSystem.writeFile(
+      &run Path.join(&archives, "shelf/silk.toml"),
+      b"[package]\nname = \"shelf\"\nversion = \"0.1.0\"\nkind = \"library\"\nexports = [\"lib\"]\n",
+    )
+    run FileSystem.writeFile(
+      &run Path.join(&archives, "shelf/src/lib.silk"),
+      b"/// The sum of `left` and `right`.\npub fn add(left: i32, right: i32) -> i32 {\n  return left + right\n}\n",
+    )
+    run bench.host(&archives, &[b"tar", b"-czf", b"shelf.tar.gz", b"shelf"])
+    return move bench
+  }
+
+  // Runs a program of the host in `directory`, to make a part of the bench.
+  effect fn host(self: &Self, directory: &Path, words: &[&[u8]]) -> ()
+    ! FileError | ProcessError | OutOfMemoryError
+    ? &mut ChildProcess | &mut Allocator {
+    let mut request = run ChildProcess.requestWithin(&run Path.make("/usr/bin/env"), directory)
+    let mut at: usize = 0
+    while at < words.length {
+      run ChildProcess.addArgumentBytes(&mut request, words[at])
+      at = at + 1
+    }
+    run ChildProcess.setVariableBytes(&mut request, b"PATH", self.programs.asSlice())
+    run ChildProcess.setVariableBytes(&mut request, b"HOME", Path.rawBytes(&self.outside))
+    let ended = run ChildProcess.submit(&request)
+    match ChildProcess.exitCode(&ended) {
+      Option<i32>.Some { value } => {
+        if value == 0 {
+          return ()
+        }
+      }
+      Option<i32>.None => {}
+    }
+    fail FileSystem.error(FileSystem.createFileOperation(), FileSystem.other())
+  }
+
+  /// Waits for `seconds`, a number as `sleep` takes it, such as `0.3`.
+  ///
+  /// # Errors
+  /// `FileError` when `sleep` fails. `ProcessError` when it does not start. `OutOfMemoryError`.
+  pub effect fn pause(self: &Self, seconds: &[u8]) -> ()
+    ! FileError | ProcessError | OutOfMemoryError
+    ? &mut ChildProcess | &mut Allocator {
+    return run self.host(&self.outside, &[b"sleep", seconds])
+  }
+
+  /// The version of the compiler of the toolchain, without its build metadata: what `silk init`
+  /// writes as `silk-version`.
+  pub fn pinned(self: &Self) -> &[u8] {
+    let text = self.version.asSlice()
+    let mut end: usize = 0
+    while end < text.length && text[end] != 43 {
+      end = end + 1
+    }
+    return Slice.view<u8>(text, 0, end)
+  }
+
+  /// The URL of the archive of the library `shelf`.
+  ///
+  /// # Errors
+  /// `OutOfMemoryError`.
+  pub effect fn archive(self: &Self) -> Bytes
+    ! FileError | OutOfMemoryError
+    ? &mut Allocator {
+    return run joined(&[b"file://", Path.rawBytes(&self.base), b"/archives/shelf.tar.gz"])
+  }
+
+  /// The file of the archive of the library `shelf`.
+  ///
+  /// # Errors
+  /// `FileError` when the path cannot be made. `OutOfMemoryError`.
+  pub effect fn archiveFile(self: &Self) -> Path
+    ! FileError | OutOfMemoryError
+    ? &mut Allocator {
+    return run Path.join(&self.base, "archives/shelf.tar.gz")
+  }
+
+  /// The directory of a library package that is not in an archive: `shelf`, as a directory.
+  ///
+  /// # Errors
+  /// `FileError` when the path cannot be made. `OutOfMemoryError`.
+  pub effect fn library(self: &Self) -> Path
+    ! FileError | OutOfMemoryError
+    ? &mut Allocator {
+    return run Path.join(&self.base, "archives/shelf")
+  }
+
+  /// A new stage for the trip `name`: an empty work directory, and a home directory where the
+  /// toolchain under test is an installed version and git finds the host `a`.
+  ///
+  /// # Errors
+  /// `FileError` when a file cannot be written. `OutOfMemoryError`.
+  pub effect fn stage(self: &Self, name: &[u8]) -> Stage
+    ! FileError | OutOfMemoryError
+    ? &mut FileSystem | &mut Allocator {
+    let directory = run Path.joinBytes(&self.root, name)
+    let stage = Stage {
+      directory: run Path.fromBytes(Path.rawBytes(&directory)),
+      home: run Path.join(&directory, "home"),
+      work: run Path.join(&directory, "work"),
+      runtime: run FileSystem.createTemporaryDirectory(&run Path.make("/tmp"), b"sk"),
+      events: run Path.join(&directory, "events"),
+      inside: b"",
+      offline: false,
+      edits: 0,
+    }
+    run FileSystem.createDirectoriesRecursively(&stage.work)
+    let store = run Path.join(&stage.home, ".silk")
+    run FileSystem.createDirectoriesRecursively(&run Path.join(&store, "git"))
+    run FileSystem.createDirectoriesRecursively(&run Path.join(&store, "archives"))
+    let versions = run Path.join(&store, "toolchains")
+    run FileSystem.createDirectoriesRecursively(&versions)
+    let from = run hosted(Path.rawBytes(&self.toolchain))
+    let to = run hosted(Path.rawBytes(&run Path.joinBytes(&versions, self.release.asSlice())))
+    if unsafe symlink(Pointer.fromSlice<u8>(from.asSlice()), Pointer.fromSlice<u8>(to.asSlice()))
+      != 0 {
+      fail FileSystem.error(FileSystem.createFileOperation(), FileSystem.other())
+    }
+    run stage.hosts(self, b"a")
+    return move stage
+  }
+}
+
+impl Stage {
+  /// Makes git find the host `variant` of the bench where `https://github.com/` is asked for.
+  /// A variant the bench did not make, such as `none`, is a host that does not answer.
+  ///
+  /// # Errors
+  /// `FileError` when the configuration of git cannot be written. `OutOfMemoryError`.
+  pub effect fn hosts(self: &Self, bench: &Bench, variant: &[u8]) -> ()
+    ! FileError | OutOfMemoryError
+    ? &mut FileSystem | &mut Allocator {
+    let text = run joined(
+      &[
+        b"[url \"file://",
+        Path.rawBytes(&bench.base),
+        b"/hosts/",
+        variant,
+        b"/\"]\n\tinsteadOf = https://github.com/\n",
+      ],
+    )
+    return run FileSystem.writeFile(&run Path.join(&self.home, ".gitconfig"), text.asSlice())
+  }
+
+  /// Gives the directory `from` the name `to`, as a user who moves a project does.
+  ///
+  /// # Errors
+  /// `FileError` when the host refuses. `OutOfMemoryError`.
+  pub effect fn renamed(self: &Self, from: &Path, to: &Path) -> ()
+    ! FileError | OutOfMemoryError
+    ? &mut Allocator {
+    let old = run hosted(Path.rawBytes(from))
+    let new = run hosted(Path.rawBytes(to))
+    if unsafe rename(Pointer.fromSlice<u8>(old.asSlice()), Pointer.fromSlice<u8>(new.asSlice()))
+      != 0 {
+      fail FileSystem.error(FileSystem.createFileOperation(), FileSystem.other())
+    }
+    return ()
+  }
+
+  /// Types `silk` and `words` in the directory `directory` and gives what came back.
+  ///
+  /// # Errors
+  /// `ProcessError` when the tool does not start. `OutOfMemoryError`.
+  pub effect fn typed(self: &Self, bench: &Bench, directory: &Path, words: &[Bytes]) -> Outcome
+    ! ProcessError | FileError | OutOfMemoryError
+    ? &mut ChildProcess | &mut Allocator {
+    let mut request = run ChildProcess.requestWithin(&bench.tool, directory)
+    let mut at: usize = 0
+    while at < words.length {
+      run ChildProcess.addArgumentBytes(&mut request, words[at].asSlice())
+      at = at + 1
+    }
+    run ChildProcess.setVariableBytes(&mut request, b"PATH", bench.programs.asSlice())
+    run ChildProcess.setVariableBytes(&mut request, b"HOME", Path.rawBytes(&self.home))
+    run ChildProcess.setVariableBytes(
+      &mut request,
+      b"XDG_RUNTIME_DIR",
+      Path.rawBytes(&self.runtime),
+    )
+    run ChildProcess.setVariableBytes(&mut request, b"SILK_TOOLCHAIN", bench.release.asSlice())
+    run ChildProcess.setVariableBytes(&mut request, b"SILK_PROGRESS", b"plain")
+    run ChildProcess.setVariableBytes(&mut request, b"NO_COLOR", b"1")
+    run ChildProcess.setVariableBytes(&mut request, b"SILK_EVENTS", Path.rawBytes(&self.events))
+    run ChildProcess.setVariableBytes(&mut request, b"SILK_CHECK_SERVER_IDLE", b"8000")
+    if bench.clang.length() != 0 {
+      run ChildProcess.setVariableBytes(&mut request, b"SILK_CLANG", bench.clang.asSlice())
+    }
+    if self.offline {
+      run ChildProcess.setVariableBytes(&mut request, b"SILK_OFFLINE", b"1")
+    }
+    let ended = run ChildProcess.submit(&request)
+    let status = match ChildProcess.exitCode(&ended) {
+      Option<i32>.Some { value } => value
+      Option<i32>.None => -1
+    }
+    return Outcome {
+      status: status,
+      output: run Bytes.copy(ChildProcess.outputBytes(&ended)),
+      errors: run Bytes.copy(ChildProcess.errorBytes(&ended)),
+    }
+  }
+
+  /// A picture of everything a command may not touch without a trail: the home directory, the
+  /// work directory, the directory of the socket, and the directory outside the trip.
+  ///
+  /// # Errors
+  /// `FileError` when a file cannot be read. `OutOfMemoryError`.
+  pub effect fn pictured(self: &Self, bench: &Bench) -> Picture
+    ! FileError | OutOfMemoryError
+    ? &mut FileSystem | &mut Allocator {
+    let mut picture = Picture.empty()
+    run picture.add(b"home", &self.home)
+    run picture.add(b"work", &self.work)
+    run picture.add(b"run", &self.runtime)
+    run picture.add(b"outside", &bench.outside)
+    return move picture
+  }
+
+  /// Waits until the check server a command left behind reports that it listens, for five
+  /// seconds at most.
+  ///
+  /// # Errors
+  /// `FileError` when the file of events cannot be read. `ProcessError` when `sleep` does not
+  /// start. `OutOfMemoryError`.
+  pub effect fn settled(self: &Self, bench: &Bench) -> ()
+    ! FileError | ProcessError | OutOfMemoryError
+    ? &mut FileSystem | &mut ChildProcess | &mut Allocator {
+    let mut tries: usize = 0
+    while tries < 50 {
+      if run FileSystem.exists(&self.events) {
+        let text = run FileSystem.readFile(&self.events)
+        if holds(text.asSlice(), b"ServerStarted") {
+          return ()
+        }
+      }
+      run bench.pause(b"0.1")
+      tries = tries + 1
+    }
+    return ()
+  }
+
+  /// Waits until every cache of the trip is written.
+  ///
+  /// # Details
+  /// A check or a build returns before its cache is on the disk: a copy of the process writes
+  /// it, and holds a lock on a file beside it until it is done. This takes each such lock once,
+  /// which waits for the copy.
+  ///
+  /// # Errors
+  /// `FileError` when a directory cannot be listed. `OutOfMemoryError`.
+  pub effect fn quiet(self: &Self) -> ()
+    ! FileError | OutOfMemoryError
+    ? &mut FileSystem | &mut Allocator {
+    return run awaited(&self.work, false)
+  }
+
+  /// The events the compiler reported since the last call, in order.
+  ///
+  /// # Errors
+  /// `SchemaError` when the file of events is not one. `FileError`. `OutOfMemoryError`.
+  pub effect fn reported(self: &Self) -> List<BuildEvent>
+    ! SchemaError | FileError | OutOfMemoryError
+    ? &mut FileSystem | &mut Allocator {
+    if !run FileSystem.exists(&self.events) {
+      return List<BuildEvent>.make()
+    }
+    let text = run FileSystem.readFile(&self.events)
+    run FileSystem.removeFile(&self.events)
+    return run BuildEvents.read(text.asSlice())
+  }
+}
+
+// The words a message always has.
+fn mark(note: Note) -> &'static [u8] {
+  return match note {
+    Note.Created => b"Created "
+    Note.Joined => b" to the "
+    Note.Taken => b"Refusing to overwrite"
+    Note.Clash => b"cannot be combined"
+    Note.Unfetched => b"Cannot fetch template"
+    Note.Unlisted => b"names no directory"
+    Note.HookFailed => b"so the project was removed"
+    Note.Templates => b"Templates in "
+    Note.Added => b"Added dependency"
+    Note.Duplicate => b"already has a dependency"
+    Note.Unreadable => b"Cannot read Silk project manifest"
+    Note.Mismatch => b"has SHA-256"
+    Note.CannotFetch => b"cannot fetch"
+    Note.Offline => b"SILK_OFFLINE is set"
+    Note.Dropped => b"Removed dependency"
+    Note.NoSuch => b"has no dependency"
+    Note.Finished => b"Finished "
+    Note.Failed => b"Failed "
+    Note.Diagnostic => b"error["
+    Note.Greeting => b"Hello, "
+    Note.Cleaned => b"Removed /"
+    Note.NothingToClean => b"Nothing to clean"
+    Note.Formatted => b": formatted"
+    Note.NeedsFormatting => b"needs formatting"
+    Note.Unchanged => b": unchanged"
+  }
+}
+
+fn noteName(note: Note) -> &'static [u8] {
+  return match note {
+    Note.Created => b"that the project was created"
+    Note.Joined => b"that the package joined its workspace"
+    Note.Taken => b"that the directory has a project"
+    Note.Clash => b"that the options cannot be combined"
+    Note.Unfetched => b"that the template cannot be fetched"
+    Note.Unlisted => b"that the template names no directory"
+    Note.HookFailed => b"that an entry failed and the project was removed"
+    Note.Templates => b"the templates"
+    Note.Added => b"that the dependency was added"
+    Note.Duplicate => b"that the dependency is there already"
+    Note.Unreadable => b"that the directory has no manifest"
+    Note.Mismatch => b"that the archive is another one"
+    Note.CannotFetch => b"that the archive cannot be fetched"
+    Note.Offline => b"that SILK_OFFLINE forbids the fetch"
+    Note.Dropped => b"that the dependency was removed"
+    Note.NoSuch => b"that there is no such dependency"
+    Note.Finished => b"that it finished"
+    Note.Failed => b"that it failed"
+    Note.Diagnostic => b"an error of a source"
+    Note.Greeting => b"what the program prints"
+    Note.Cleaned => b"that the build directory was removed"
+    Note.NothingToClean => b"that there is nothing to clean"
+    Note.Formatted => b"that a file was formatted"
+    Note.NeedsFormatting => b"that a file needs formatting"
+    Note.Unchanged => b"that a file is formatted already"
+  }
+}
+
+fn spotName(spot: Spot) -> &'static [u8] {
+  return match spot {
+    Spot.Project => b"the new project"
+    Spot.Workspace => b"the manifest of the workspace"
+    Spot.Manifest => b"the manifest of the project"
+    Spot.Sources => b"the sources"
+    Spot.Cache => b"the cache"
+    Spot.Output => b"the output of the build"
+    Spot.Archive => b"the archive in the store"
+    Spot.Socket => b"the socket of the check server"
+  }
+}
+
+fn changeName(change: Change) -> &'static [u8] {
+  return match change {
+    Change.Created => b"creates"
+    Change.Changed => b"changes"
+    Change.Removed => b"removes"
+  }
+}
+
+// The part of `path` after `prefix` and a `/`, or empty text when `path` is not below `prefix`.
+fn below<'a>(path: &'a [u8], prefix: &[u8]) -> &'a [u8] {
+  if path.length > prefix.length + 1 && startsWith(path, prefix) && path[prefix.length] == 47 {
+    return Slice.view<u8>(path, prefix.length + 1, path.length - prefix.length - 1)
+  }
+  return Slice.view<u8>(path, 0, 0)
+}
+
+// The spot the path of a picture belongs to: 0 for none, or the position of the spot plus one.
+// A project is `work/new` for `silk init`, and `work/app` or `work/moved` for the others.
+fn spotted(path: &[u8]) -> Option<Spot> {
+  if path == b"work/new" || below(path, b"work/new").length != 0 {
+    return Option<Spot>.Some { value: Spot.Project }
+  }
+  if path == b"work/silk.toml" {
+    return Option<Spot>.Some { value: Spot.Workspace }
+  }
+  if below(path, b"home/.silk/archives").length != 0 {
+    return Option<Spot>.Some { value: Spot.Archive }
+  }
+  if below(path, b"run").length != 0 {
+    return Option<Spot>.Some { value: Spot.Socket }
+  }
+  let mut inside = below(path, b"work/app")
+  if inside.length == 0 {
+    inside = below(path, b"work/moved")
+  }
+  if inside == b"silk.toml" {
+    return Option<Spot>.Some { value: Spot.Manifest }
+  }
+  if below(inside, b"src").length != 0 {
+    return Option<Spot>.Some { value: Spot.Sources }
+  }
+  let built = below(inside, b"build")
+  if built.length != 0 && !startsWith(built, b"cache/") && !startsWith(built, b"requests/") {
+    // The program is `build/<target>/<profile>/app`.
+    let mut slashes: usize = 0
+    let mut at: usize = 0
+    while at < built.length {
+      if built[at] == 47 {
+        slashes = slashes + 1
+      }
+      at = at + 1
+    }
+    if slashes == 2 && built.length > 4 && Slice.view<u8>(built, built.length - 4, 4) == b"/app" {
+      return Option<Spot>.Some { value: Spot.Output }
+    }
+  }
+  if inside == b"build" || built.length != 0 {
+    return Option<Spot>.Some { value: Spot.Cache }
+  }
+  return Option<Spot>.None
+}
+
+// What a command did to one spot.
+struct Claim {
+  spot: Spot,
+  created: bool,
+  changed: bool,
+  removed: bool,
+  // The first path that shows it.
+  path: Bytes,
+}
+
+// What the differences in one spot are together: created when every one is, removed when
+// every one is, and changed otherwise. A cache is written to or removed, nothing else.
+fn summed(claim: &Claim) -> Change {
+  if claim.removed && !claim.created && !claim.changed {
+    return Change.Removed
+  }
+  if claim.spot == Spot.Cache {
+    return Change.Changed
+  }
+  if claim.created && !claim.changed && !claim.removed {
+    return Change.Created
+  }
+  return Change.Changed
+}
+
+// What `trail` says of `spot`: 0 for nothing, 1 created, 2 changed, 3 removed. A spot that is
+// created and then removed is as it was.
+fn said(trail: &[Trail], spot: Spot) -> usize {
+  let mut state: usize = 0
+  let mut at: usize = 0
+  while at < trail.length {
+    match &trail[at] {
+      Trail.Creates { spot: named } => {
+        if named == spot {
+          state = if spot == Spot.Cache {
+            2
+          } else {
+            1
+          }
+        }
+      }
+      Trail.Changes { spot: named } => {
+        if named == spot && state == 0 {
+          state = 2
+        }
+      }
+      Trail.Removes { spot: named } => {
+        if named == spot {
+          state = if state == 1 {
+            0
+          } else {
+            3
+          }
+        }
+      }
+      _ => {}
+    }
+    at = at + 1
+  }
+  return state
+}
+
+fn fetches(trail: &[Trail], source: Fetch) -> bool {
+  let mut at: usize = 0
+  while at < trail.length {
+    if let Trail.Fetches { source: named } = &trail[at] {
+      if named == source {
+        return true
+      }
+    }
+    at = at + 1
+  }
+  return false
+}
+
+fn serves(trail: &[Trail]) -> bool {
+  let mut at: usize = 0
+  while at < trail.length {
+    if let Trail.Serves = &trail[at] {
+      return true
+    }
+    at = at + 1
+  }
+  return false
+}
+
+fn worked(events: &[BuildEvent], work: Work) -> bool {
+  let mut at: usize = 0
+  while at < events.length {
+    if let BuildEvent.Phase { work: done, .. } = &events[at] {
+      if done == work {
+        return true
+      }
+    }
+    at = at + 1
+  }
+  return false
+}
+
+fn fetched(events: &[BuildEvent], source: Fetch) -> bool {
+  let mut at: usize = 0
+  while at < events.length {
+    if let BuildEvent.Fetching { source: asked } = &events[at] {
+      if asked == source {
+        return true
+      }
+    }
+    at = at + 1
+  }
+  return false
+}
+
+fn served(events: &[BuildEvent], started: bool) -> bool {
+  let mut at: usize = 0
+  while at < events.length {
+    let found = match &events[at] {
+      BuildEvent.ServerStarted => started
+      BuildEvent.ServerAnswered => !started
+      _ => false
+    }
+    if found {
+      return true
+    }
+    at = at + 1
+  }
+  return false
+}
+
+// One line of a report when `listed` and `seen` differ.
+effect fn compared(wrong: &mut List<Bytes>, listed: bool, seen: bool, what: &[&[u8]]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if listed == seen {
+    return ()
+  }
+  let mut line = run Bytes.copy(
+    if listed {
+      b"the trail lists "
+    } else {
+      b"no trail lists "
+    },
+  )
+  run Bytes.append(&mut line, (run joined(what)).asSlice())
+  run Bytes.append(
+    &mut line,
+    if listed {
+      b", and the run does not show it"
+    } else {
+      b", and the run shows it"
+    },
+  )
+  return run List<Bytes>.append(&mut wrong.*, move line)
+}
+
+/// Compares what a command left with `trail`, and gives one line for each thing that differs.
+/// No line means that the command left its trail and nothing else.
+///
+/// `outcome` is what the tool gave back, `differences` what changed on the disk of the stage,
+/// with paths as [`Stage.pictured`] names them, and `events` what the compiler reported.
+///
+/// # Details
+/// The exit status must be the one of the trail. A message must be there when the trail lists
+/// it and must not be there otherwise. Every file that changed must belong to a spot the trail
+/// lists, and every spot it lists must show the change it says, where the changes of one spot
+/// count together: created when every one is new, removed when every one is gone, changed
+/// otherwise. A spot the trail creates and then removes must show nothing, and a cache or a
+/// program the trail changes may show nothing, because the same bytes can be written again. The compiler must
+/// report a fetch, a check, a code generation, a link and a check server exactly when the trail
+/// lists them.
+///
+/// # Errors
+/// `OutOfMemoryError`.
+pub effect fn judged(
+  trail: &[Trail],
+  outcome: &Outcome,
+  differences: &[Difference],
+  events: &[BuildEvent],
+) -> List<Bytes>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut wrong = List<Bytes>.make()
+
+  let mut status: i32 = -2
+  let mut at: usize = 0
+  while at < trail.length {
+    if let Trail.Exits { status: listed } = &trail[at] {
+      status = u8.toI32(listed)
+    }
+    at = at + 1
+  }
+  if status != outcome.status {
+    let line = if outcome.status < 0 {
+      b"the command was ended by a signal"
+    } else {
+      b"the exit status is not the one of the trail"
+    }
+    run List<Bytes>.append(&mut wrong, run Bytes.copy(line))
+  }
+  if holds(outcome.output.asSlice(), b"\x1b[") || holds(outcome.errors.asSlice(), b"\x1b[") {
+    run List<Bytes>.append(&mut wrong, run Bytes.copy(b"the command writes color codes to a pipe"))
+  }
+
+  let notes: [Note; 25] = [
+    Note.Created,
+    Note.Joined,
+    Note.Taken,
+    Note.Clash,
+    Note.Unfetched,
+    Note.Unlisted,
+    Note.HookFailed,
+    Note.Templates,
+    Note.Added,
+    Note.Duplicate,
+    Note.Unreadable,
+    Note.Mismatch,
+    Note.CannotFetch,
+    Note.Offline,
+    Note.Dropped,
+    Note.NoSuch,
+    Note.Finished,
+    Note.Failed,
+    Note.Diagnostic,
+    Note.Greeting,
+    Note.Cleaned,
+    Note.NothingToClean,
+    Note.Formatted,
+    Note.NeedsFormatting,
+    Note.Unchanged,
+  ]
+  let mut noted: usize = 0
+  while noted < notes.length {
+    let note = notes[noted]
+    noted = noted + 1
+    let mut listed = false
+    at = 0
+    while at < trail.length {
+      if let Trail.Says { note: named } = &trail[at] {
+        if named == note {
+          listed = true
+        }
+      }
+      at = at + 1
+    }
+    let seen = holds(outcome.output.asSlice(), mark(note))
+      || holds(outcome.errors.asSlice(), mark(note))
+    run compared(&mut wrong, listed, seen, &[b"the message ", noteName(note)])
+  }
+
+  let mut claims = List<Claim>.make()
+  at = 0
+  while at < differences.length {
+    let difference = &differences[at]
+    at = at + 1
+    let path = difference.path.asSlice()
+    if path == b"home/.silk/git" || below(path, b"home/.silk/git").length != 0 {
+      // The checkouts git keeps in the home directory, which any fetch with git may write.
+      if !fetches(trail, Fetch.Template) && !fetches(trail, Fetch.Checkout) {
+        run List<Bytes>.append(
+          &mut wrong,
+          run joined(
+            &[
+              b"the command ",
+              changeName(difference.change),
+              b" ",
+              path,
+              b", and its trail lists no fetch with git",
+            ],
+          ),
+        )
+      }
+      continue
+    }
+    match spotted(path) {
+      Option<Spot>.Some { value: spot } => {
+        let mut found = claims.length()
+        let known = claims.asSlice()
+        let mut each: usize = 0
+        while each < known.length {
+          if known[each].spot == spot {
+            found = each
+          }
+          each = each + 1
+        }
+        if found == claims.length() {
+          run List<Claim>.append(
+            &mut claims,
+            Claim {
+              spot: spot,
+              created: false,
+              changed: false,
+              removed: false,
+              path: run Bytes.copy(path),
+            },
+          )
+        }
+        let mut all = List<Claim>.asMutSlice(&mut claims)
+        match difference.change {
+          Change.Created => {
+            all[found].created = true
+          }
+          Change.Changed => {
+            all[found].changed = true
+          }
+          Change.Removed => {
+            all[found].removed = true
+          }
+        }
+      }
+      Option<Spot>.None => {
+        run List<Bytes>.append(
+          &mut wrong,
+          run joined(
+            &[
+              b"the command ",
+              changeName(difference.change),
+              b" ",
+              path,
+              b", which no trail names",
+            ],
+          ),
+        )
+      }
+    }
+  }
+  let spots: [Spot; 8] = [
+    Spot.Project,
+    Spot.Workspace,
+    Spot.Manifest,
+    Spot.Sources,
+    Spot.Cache,
+    Spot.Output,
+    Spot.Archive,
+    Spot.Socket,
+  ]
+  let mut placed: usize = 0
+  while placed < spots.length {
+    let spot = spots[placed]
+    placed = placed + 1
+    let listed = said(trail, spot)
+    let mut seen: usize = 0
+    let mut shown = claims.length()
+    let known = claims.asSlice()
+    let mut each: usize = 0
+    while each < known.length {
+      if known[each].spot == spot {
+        seen = match summed(&known[each]) {
+          Change.Created => 1
+          Change.Changed => 2
+          Change.Removed => 3
+        }
+        shown = each
+      }
+      each = each + 1
+    }
+
+    // A cache or a program that is written again with the same bytes shows no change.
+    let unseen = listed == 2 && seen == 0 && (spot == Spot.Cache || spot == Spot.Output)
+    if listed != seen && !unseen {
+      let words: [&'static [u8]; 4] = [b"leaves", b"creates", b"changes", b"removes"]
+      run List<Bytes>.append(
+        &mut wrong,
+        run joined(
+          &[
+            b"the trail ",
+            words[listed],
+            b" ",
+            spotName(spot),
+            b", and the command ",
+            words[seen],
+            b" it",
+            if shown < known.length {
+              b": "
+            } else {
+              b""
+            },
+            if shown < known.length {
+              known[shown].path.asSlice()
+            } else {
+              b""
+            },
+          ],
+        ),
+      )
+    }
+  }
+
+  let sources: [Fetch; 3] = [Fetch.Template, Fetch.Archive, Fetch.Checkout]
+  let sourceNames: [&'static [u8]; 3] = [b"a template", b"an archive", b"a checkout"]
+  let mut asked: usize = 0
+  while asked < sources.length {
+    let source = sources[asked]
+    asked = asked + 1
+    let mut listed = false
+    at = 0
+    while at < trail.length {
+      if let Trail.Fetches { source: named } = &trail[at] {
+        if named == source {
+          listed = true
+        }
+      }
+      at = at + 1
+    }
+    run compared(
+      &mut wrong,
+      listed,
+      fetched(events, source),
+      &[b"a fetch of ", sourceNames[asked - 1]],
+    )
+  }
+  let works: [Work; 3] = [Work.Check, Work.Codegen, Work.Link]
+  let workNames: [&'static [u8]; 3] = [b"a check", b"a code generation", b"a link"]
+  let mut which: usize = 0
+  while which < works.length {
+    let mut listed = false
+    at = 0
+    while at < trail.length {
+      if let Trail.Does { work: named } = &trail[at] {
+        if named == works[which] {
+          listed = true
+        }
+      }
+      at = at + 1
+    }
+    run compared(&mut wrong, listed, worked(events, works[which]), &[workNames[which]])
+    which = which + 1
+  }
+  let mut asks = false
+  let mut serves = false
+  at = 0
+  while at < trail.length {
+    match &trail[at] {
+      Trail.Asks => {
+        asks = true
+      }
+      Trail.Serves => {
+        serves = true
+      }
+      _ => {}
+    }
+    at = at + 1
+  }
+  run compared(&mut wrong, asks, served(events, false), &[b"an answer of a check server"])
+  run compared(&mut wrong, serves, served(events, true), &[b"a new check server"])
+  return move wrong
+}
+
+/// The binding of one reference machine to the bench. `E` is the event of the machine and `C`
+/// its context.
+pub interface Binding<E, C> {
+  /// Sets `stage` up so that its disk shows `start`, a context a walk of the machine starts from.
+  effect fn arrange(self: &Self, stage: &mut Stage, bench: &Bench, start: &C) -> ()
+    ! FileError | ProcessError | OutOfMemoryError
+    ? &mut FileSystem | &mut ChildProcess | &mut Allocator
+
+  /// Arranges the world so that it gives `answers` to `command`, and gives the words to type
+  /// after `silk`. When `command` is something the user does to the disk, such as an edit, it
+  /// does that and gives no word.
+  effect fn act(self: &Self, stage: &mut Stage, bench: &Bench, command: &E, answers: &[E]) -> List<
+    Bytes
+  >
+    ! FileError | ProcessError | OutOfMemoryError
+    ? &mut FileSystem | &mut ChildProcess | &mut Allocator
+
+  /// The context the disk of `stage` shows.
+  effect fn observed(self: &Self, stage: &Stage, bench: &Bench) -> C
+    ! FileError | OutOfMemoryError
+    ? &mut FileSystem | &mut Allocator
+
+  /// `context` with only what a disk can show, so that it can be compared with
+  /// [`Binding.observed`].
+  fn shown(self: &Self, context: &C) -> C
+
+  /// What is wrong after `command` left `trail` and gave `outcome` back, beyond what [`judged`]
+  /// compares, one line for each thing.
+  effect fn sound(
+    self: &Self,
+    stage: &Stage,
+    bench: &Bench,
+    command: &E,
+    trail: &[Trail],
+    outcome: &Outcome,
+  ) -> List<Bytes>
+    ! FileError | OutOfMemoryError
+    ? &mut FileSystem | &mut Allocator
+}
+
+// Whether the disk of `stage` shows `expected`. When it does not, `wrong` gets a line.
+effect fn shows<B: Binding<E, C>, E, C: Schema>(
+  binding: &B,
+  stage: &Stage,
+  bench: &Bench,
+  expected: &C,
+  when: &[u8],
+  wrong: &mut List<Bytes>,
+) -> ()
+  ! FileError | OutOfMemoryError | SchemaError
+  ? &mut FileSystem | &mut Allocator {
+  let seen = run json<C>(&binding.shown(&run binding.observed(stage, bench)))
+  let said = run json<C>(&binding.shown(expected))
+  if seen.asSlice() != said.asSlice() {
+    run List<Bytes>.append(
+      &mut wrong.*,
+      run joined(
+        &[when, b" the machine says ", said.asSlice(), b" and the disk shows ", seen.asSlice()],
+      ),
+    )
+  }
+  return ()
+}
+
+/// Takes `trip` on the real tool and compiler of `bench`. It gives what went wrong, with the
+/// command it went wrong at, or nothing.
+///
+/// # Errors
+/// `FileError` when the stage cannot be read or written. `ProcessError` when the tool does not
+/// start. `SchemaError` when a context cannot be written as JSON, or the file of events is not
+/// one. `OutOfMemoryError`.
+pub effect fn taken<B: Binding<E, C>, E: Schema, C: Schema>(
+  binding: &B,
+  bench: &Bench,
+  trip: &Trip<E, C, Trail>,
+) -> List<Bytes>
+  ! FileError | ProcessError | SchemaError | OutOfMemoryError
+  ? &mut FileSystem | &mut ChildProcess | &mut Allocator {
+  let mut stage = run bench.stage(String.utf8Bytes(trip.name.view()))
+  run binding.arrange(&mut stage, bench, &trip.start)
+  let mut wrong = List<Bytes>.make()
+  run shows<B, E, C>(binding, &stage, bench, &trip.start, b"before the first command", &mut wrong)
+  let legs = trip.legs.asSlice()
+  let mut at: usize = 0
+  while at < legs.length && wrong.length() == 0 {
+    let leg = &legs[at]
+    at = at + 1
+    let words = run binding.act(&mut stage, bench, &leg.command, leg.answers.asSlice())
+    let mut heard = Option<Outcome>.none()
+    if words.length() != 0 {
+      let inside = stage.inside
+      let directory = if inside.length == 0 {
+        run Path.fromBytes(Path.rawBytes(&stage.work))
+      } else {
+        run Path.joinBytes(&stage.work, inside)
+      }
+      drop run stage.reported()
+      let first = run stage.pictured(bench)
+      let outcome = run stage.typed(bench, &directory, words.asSlice())
+      if serves(leg.footprint.asSlice()) {
+        run stage.settled(bench)
+      }
+      run stage.quiet()
+      let second = run stage.pictured(bench)
+      let differences = run first.differences(&second)
+      let events = run stage.reported()
+      wrong = run judged(leg.footprint.asSlice(), &outcome, differences.asSlice(), events.asSlice())
+      let mut more = run binding.sound(
+        &stage,
+        bench,
+        &leg.command,
+        leg.footprint.asSlice(),
+        &outcome,
+      )
+      while more.length() != 0 {
+        run List<Bytes>.append(&mut wrong, List<Bytes>.remove(&mut more, 0))
+      }
+      heard = Option<Outcome>.some(move outcome)
+    }
+    run shows<B, E, C>(binding, &stage, bench, &leg.state, b"after the command", &mut wrong)
+    if wrong.length() != 0 {
+      let mut report = List<Bytes>.make()
+      let mut line = run Bytes.copy(b"at command ")
+      run counted(&mut line, at)
+      run Bytes.append(&mut line, b", ")
+      run Bytes.append(&mut line, (run json<E>(&leg.command)).asSlice())
+      if words.length() != 0 {
+        run Bytes.append(&mut line, b": silk")
+        let typed = words.asSlice()
+        let mut word: usize = 0
+        while word < typed.length {
+          run Bytes.append(&mut line, b" ")
+          run Bytes.append(&mut line, typed[word].asSlice())
+          word = word + 1
+        }
+      }
+      run List<Bytes>.append(&mut report, move line)
+      while wrong.length() != 0 {
+        run List<Bytes>.append(&mut report, List<Bytes>.remove(&mut wrong, 0))
+      }
+      if let Option<Outcome>.Some { value } = &heard {
+        run List<Bytes>.append(
+          &mut report,
+          run joined(&[b"standard output: ", value.output.asSlice()]),
+        )
+        run List<Bytes>.append(
+          &mut report,
+          run joined(&[b"standard error: ", value.errors.asSlice()]),
+        )
+      }
+      run FileSystem.removeDirectoryRecursively(&stage.runtime)
+      return move report
+    }
+  }
+  run FileSystem.removeDirectoryRecursively(&stage.runtime)
+  if wrong.length() == 0 {
+    run FileSystem.removeDirectoryRecursively(&stage.directory)
+  }
+  return move wrong
+}

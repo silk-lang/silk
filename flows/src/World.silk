@@ -1,0 +1,1963 @@
+//! The local world: a real home directory, project and release mirror that a run of the real
+//! `silk` tool happens in, and the binding between them and the machine.
+//!
+//! The machine in `Silk` speaks of versions by position and of places by name. This module is
+//! the only place where those words meet real ones. It has the three tables of a binding:
+//!
+//! - Act: [`Scene.prepare`] turns a command into a command line, and the answers of the world
+//!   into an arrangement: what the mirror lists, whether the network answers, whether a manifest
+//!   can be edited, whether the compiler starts.
+//! - Observe: [`Scene.observed`] reads the disk and gives the `Computer` it shows. It never asks
+//!   the tool, because the tool is what the run checks.
+//! - Match: [`Scene.judged`] compares what a command left with its footprint. Everything the
+//!   footprint lists must be there, and nothing else may be.
+//!
+//! A [`World`] holds what every route shares, and a [`Scene`] is the directory of one route.
+//!
+//! # What the local world cannot arrange
+//! The tool accepts only archives that the release key signed, so no local archive passes the
+//! check of the signature. A download that stops after the release listing arrived needs a proxy
+//! between the tool and the network. [`World.lacks`] names what a route needs and the world
+//! lacks, and a run skips that route and counts it. A download itself leaves nothing on the
+//! disk, so a `Downloads` footprint is not compared.
+
+import Computer { Age, Choice, Computer, Named, Pin, Pinned, Project, Store, chosen }
+import Footprint { Footprint, Message, Place, Program }
+import Picture { Change, Difference, Picture }
+import Plan { Move, json }
+import Silk { Silk, Typed }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.machine.snapshot { Steps, TransitionLoopError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.num.i32
+import silk.num.u8
+import silk.num.usize
+import silk.schema.issue { SchemaError }
+import silk.schema.json { SchemaJson }
+import silk.schema.schema { Schema }
+import silk.system.child_process { ChildProcess, ProcessError }
+import silk.system.filesystem { DirectoryEntry, FileError, FileSystem, Path }
+
+@foreign(noCapture: .("path"))
+unsafe extern "C" fn chmod(path: ?[*]const u8, mode: u32) -> i32
+
+@foreign(noCapture: ("oldPath", "newPath"))
+unsafe extern "C" fn link(oldPath: ?[*]const u8, newPath: ?[*]const u8) -> i32
+
+/// What every route of a run shares: the tool under test and the stand-in compiler.
+pub struct World {
+  // The directory that holds one directory for each route.
+  root: Path,
+  // The tool under test, the stand-in compiler, and the stand-in without the right to run.
+  tool: Path,
+  compiler: Path,
+  inert: Path,
+  // The version the tool under test came with.
+  release: Bytes,
+}
+
+/// The directory of one route: its home directory, its project and its mirror.
+pub struct Scene {
+  directory: Path,
+  home: Path,
+  project: Path,
+  mirror: Path,
+  records: Path,
+  programs: Path,
+
+  // What the environment says, which no file shows.
+  hasHome: bool,
+  autoInstall: bool,
+  environment: Named,
+  bundled: bool,
+
+  // Whether the commands are typed in the member `a` of the workspace.
+  inMember: bool,
+
+  // How the next command meets the network: not at all, or through a mirror that is not there.
+  dead: bool,
+  broken: bool,
+  // Whether the next command names versions with their build metadata.
+  full: bool,
+}
+
+/// What one command of the tool gave back.
+pub struct Outcome {
+  /// The exit status, or -1 when a signal ended the tool.
+  pub status: i32,
+  pub output: Bytes,
+  pub errors: Bytes,
+}
+
+// How the manifest that pins the project is written.
+enum Style {
+  // As the tool writes it.
+  Usual,
+  // With the pin in the spelling the tool does not write.
+  Respelled,
+  // With dotted keys, which the tool reads and cannot edit.
+  Dotted,
+}
+
+// What the mirror lists.
+enum Listing {
+  // No release.
+  Nothing,
+  // The version the command is about.
+  Subject,
+  // One release that is not stable.
+  Unstable,
+  // One release that is newer than every tool.
+  Newer,
+  // One release that is older than every tool.
+  Older,
+}
+
+// What one move needs from the world.
+struct Setting {
+  // Why the world cannot arrange the move, or empty.
+  lack: &'static [u8],
+  dead: bool,
+  broken: bool,
+  full: bool,
+  resolves: bool,
+  listing: Listing,
+  listed: Choice,
+  assets: bool,
+  style: Style,
+  runnable: bool,
+  told: bool,
+  owned: bool,
+}
+
+// Where the machine stands, as a value that can be copied.
+enum Stand {
+  Idle,
+  Resolving,
+  Choosing,
+  Editing,
+  Downloading,
+  Verifying,
+  Unpacking,
+  Ready,
+  Starting,
+  Checking,
+  Replacing,
+  Asking,
+  Comparing,
+}
+
+fn stand(state: &Silk) -> Stand {
+  return match &state.* {
+    Silk.Idle => Stand.Idle
+    Silk.Resolving => Stand.Resolving
+    Silk.Choosing => Stand.Choosing
+    Silk.Editing => Stand.Editing
+    Silk.Downloading => Stand.Downloading
+    Silk.Verifying => Stand.Verifying
+    Silk.Unpacking => Stand.Unpacking
+    Silk.Ready => Stand.Ready
+    Silk.Starting => Stand.Starting
+    Silk.Checking => Stand.Checking
+    Silk.Replacing => Stand.Replacing
+    Silk.Asking => Stand.Asking
+    Silk.Comparing => Stand.Comparing
+  }
+}
+
+// The answer of the world, as a value that can be copied.
+enum Answer {
+  Found,
+  Missing,
+  Newest,
+  NoStable,
+  NoReleases,
+  Unreachable,
+  Edited,
+  Respelled,
+  Refused,
+  Arrived,
+  Cut,
+  Genuine,
+  Forged,
+  Blocked,
+  Started,
+  Stuck,
+  Outdated,
+  Current,
+  Told,
+  Silent,
+  Owned,
+  Unowned,
+  Other,
+}
+
+fn answered(event: &Typed) -> Answer {
+  return match &event.* {
+    Typed.Found => Answer.Found
+    Typed.Missing => Answer.Missing
+    Typed.Newest { .. } => Answer.Newest
+    Typed.NoStable => Answer.NoStable
+    Typed.NoReleases => Answer.NoReleases
+    Typed.Unreachable => Answer.Unreachable
+    Typed.Edited { respells } => if respells {
+      Answer.Respelled
+    } else {
+      Answer.Edited
+    }
+    Typed.Refused => Answer.Refused
+    Typed.Arrived => Answer.Arrived
+    Typed.Cut => Answer.Cut
+    Typed.Genuine => Answer.Genuine
+    Typed.Forged => Answer.Forged
+    Typed.Blocked => Answer.Blocked
+    Typed.Started => Answer.Started
+    Typed.Stuck => Answer.Stuck
+    Typed.Outdated => Answer.Outdated
+    Typed.Current => Answer.Current
+    Typed.Told => Answer.Told
+    Typed.Silent => Answer.Silent
+    Typed.Owned => Answer.Owned
+    Typed.Unowned => Answer.Unowned
+    _ => Answer.Other
+  }
+}
+
+// The word the runner types for a mistyped command. It is one edit away from `use`.
+const NEAR: &'static [u8] = b"uze"
+
+// A pin that is no version.
+const NO_VERSION: &'static [u8] = b"banana"
+
+// The versions of members that disagree, and of a member's pin its workspace passes over. No
+// position of the machine has these names.
+const ONE_MEMBER: &'static [u8] = b"96.0.0"
+
+const OTHER_MEMBER: &'static [u8] = b"97.0.0"
+
+// The first line the stand-in compiler prints as its overview.
+const OVERVIEW: &'static [u8] = b"Stand-in compiler of the flows run"
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  return left == right
+}
+
+// Whether `text` holds `part`.
+fn holds(text: &[u8], part: &[u8]) -> bool {
+  if part.length == 0 {
+    return true
+  }
+  let mut at: usize = 0
+  while at + part.length <= text.length {
+    if Slice.view<u8>(text, at, part.length) == part {
+      return true
+    }
+    at = at + 1
+  }
+  return false
+}
+
+fn startsWith(text: &[u8], prefix: &[u8]) -> bool {
+  return text.length >= prefix.length && Slice.view<u8>(text, 0, prefix.length) == prefix
+}
+
+// `text` up to its build metadata.
+fn short(text: &[u8]) -> &[u8] {
+  let mut at: usize = 0
+  while at < text.length && text[at] != 43 {
+    at = at + 1
+  }
+  return Slice.view<u8>(text, 0, at)
+}
+
+// Whether `text` names a release that is not stable.
+fn unstable(text: &[u8]) -> bool {
+  let name = short(text)
+  let mut at: usize = 0
+  while at < name.length {
+    if name[at] == 45 {
+      return true
+    }
+    at = at + 1
+  }
+  return false
+}
+
+effect fn joined(parts: &[&[u8]]) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = Bytes.make()
+  let mut at: usize = 0
+  while at < parts.length {
+    run Bytes.append(&mut text, parts[at])
+    at = at + 1
+  }
+  return move text
+}
+
+// `path` as the host takes it: with a NUL at its end.
+effect fn hosted(path: &Path) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let ending: [u8; 1] = [0]
+  return run joined(&[Path.rawBytes(path), &ending])
+}
+
+// Makes `target` a second name of the file `source`.
+effect fn linked(source: &Path, target: &Path) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut Allocator {
+  let from = run hosted(source)
+  let to = run hosted(target)
+  let status = unsafe link(
+    Pointer.fromSlice<u8>(from.asSlice()),
+    Pointer.fromSlice<u8>(to.asSlice()),
+  )
+  if status != 0 {
+    fail FileSystem.error(FileSystem.createFileOperation(), FileSystem.other())
+  }
+  return ()
+}
+
+// Removes the file at `path` when there is one.
+effect fn cleared(path: &Path) -> ()
+  ! FileError
+  ? &mut FileSystem {
+  if run FileSystem.exists(path) {
+    run FileSystem.removeFile(path)
+  }
+  return ()
+}
+
+// Removes the directory at `path` and all in it when there is one, and makes it again, empty.
+effect fn emptied(path: &Path) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  if run FileSystem.exists(path) {
+    run FileSystem.removeDirectoryRecursively(path)
+  }
+  return run FileSystem.createDirectoriesRecursively(path)
+}
+
+// The target triple that names the archives of the host.
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  static if Intrinsic.targetArchitecture() == "x86_64" {
+    fn hostTarget() -> &'static [u8] {
+      return b"x86_64-apple-darwin"
+    }
+  } else {
+    fn hostTarget() -> &'static [u8] {
+      return b"aarch64-apple-darwin"
+    }
+  }
+} else {
+  static if Intrinsic.targetArchitecture() == "aarch64" {
+    fn hostTarget() -> &'static [u8] {
+      return b"aarch64-unknown-linux-gnu"
+    }
+  } else {
+    fn hostTarget() -> &'static [u8] {
+      return b"x86_64-unknown-linux-gnu"
+    }
+  }
+}
+
+// The version a command names, or nothing.
+fn versionOf(event: &Typed) -> Choice {
+  return match &event.* {
+    Typed.Use { version } => chosen(version)
+    Typed.Uninstall { version } => chosen(version)
+    Typed.Set { version, .. } => chosen(version)
+    Typed.Newest { version } => chosen(version)
+    Typed.Run { asked } => match asked {
+      Named.First => Choice.First
+      Named.Second => Choice.Second
+      Named.Third => Choice.Third
+      Named.Fourth => Choice.Fourth
+      _ => Choice.Nothing
+    }
+    _ => Choice.Nothing
+  }
+}
+
+fn environmentOf(value: Named) -> Choice {
+  return match value {
+    Named.First => Choice.First
+    Named.Second => Choice.Second
+    Named.Third => Choice.Third
+    Named.Fourth => Choice.Fourth
+    _ => Choice.Nothing
+  }
+}
+
+// Whether `version` is one whose age the tool under test decides: the one older than the tool,
+// and the tool's own.
+fn dated(version: Choice) -> bool {
+  return version == Choice.First || version == Choice.Second
+}
+
+// A second value of `value`, made by writing it and reading it back.
+effect fn again<T: Schema>(value: &T) -> T
+  ! SchemaError | OutOfMemoryError
+  ? &mut Allocator {
+  let text = run json<T>(value)
+  return run SchemaJson.decode<T>(text.asSlice())
+}
+
+impl World {
+  /// A world in the directory `root`, for the tool whose program is `tool` and whose version is
+  /// `release`. `standin` is the program that plays the compiler, see [`compiler`].
+  ///
+  /// # Errors
+  /// `FileError` when a program cannot be written to `root`. `OutOfMemoryError`.
+  pub effect fn made(root: &Path, tool: &[u8], standin: &[u8], release: &[u8]) -> World
+    ! FileError | OutOfMemoryError
+    ? &mut FileSystem | &mut Allocator {
+    let world = World {
+      root: run Path.join(root, "routes"),
+      tool: run Path.join(root, "silk"),
+      compiler: run Path.join(root, "silkc"),
+      inert: run Path.join(root, "silkc-inert"),
+      release: run Bytes.copy(release),
+    }
+    run FileSystem.createDirectoriesRecursively(&world.root)
+    run FileSystem.writeFile(&world.tool, tool)
+    run FileSystem.writeFile(&world.compiler, standin)
+    run FileSystem.writeFile(&world.inert, standin)
+    run World.runnable(&world.tool)
+    run World.runnable(&world.compiler)
+    return move world
+  }
+
+  effect fn runnable(path: &Path) -> ()
+    ! FileError | OutOfMemoryError
+    ? &mut Allocator {
+    let target = run hosted(path)
+    let status = unsafe chmod(Pointer.fromSlice<u8>(target.asSlice()), 493)
+    if status != 0 {
+      fail FileSystem.error(FileSystem.writeFileOperation(), FileSystem.other())
+    }
+    return ()
+  }
+
+  // Whether the tool under test is a release, so that a version can be older than it.
+  fn released(self: &Self) -> bool {
+    return !same(self.release.asSlice(), b"0.0.0")
+  }
+
+  // The full name of `version`.
+  fn name(self: &Self, version: Choice) -> &[u8] {
+    return match version {
+      Choice.Nothing => b""
+      Choice.First => b"0.0.1+flows"
+      Choice.Second => self.release.asSlice()
+      Choice.Third => b"98.0.0+flows"
+      Choice.Fourth => b"99.0.0+flows"
+    }
+  }
+
+  // The name of `version` as a command or a file spells it.
+  fn spelled(self: &Self, version: Choice, full: bool) -> &[u8] {
+    if full {
+      return self.name(version)
+    }
+    return short(self.name(version))
+  }
+
+  // The position of the version that `text` names with or without its build metadata.
+  fn positioned(self: &Self, text: &[u8]) -> Choice {
+    let all: [Choice; 4] = [Choice.First, Choice.Second, Choice.Third, Choice.Fourth]
+    let mut at: usize = 0
+    while at < 4 {
+      if same(text, self.name(all[at])) || same(text, short(self.name(all[at]))) {
+        return all[at]
+      }
+      at = at + 1
+    }
+    return Choice.Nothing
+  }
+
+  // What `event` needs from the world while the machine stands in `state` about `subject`.
+  fn needed(
+    self: &Self,
+    setting: &mut Setting,
+    state: Stand,
+    subject: Choice,
+    stable: bool,
+    updates: bool,
+    event: &Typed,
+  ) -> () {
+    let answer = answered(event)
+    match state {
+      Stand.Resolving => {
+        setting.resolves = true
+        if answer == Answer.Found {
+          setting.listing = Listing.Subject
+          setting.listed = subject
+        } else if answer == Answer.Blocked {
+          setting.broken = true
+        } else if answer != Answer.Missing && answer != Answer.Unreachable {
+          setting.lack = b"an answer the local world does not know"
+        }
+      }
+      Stand.Choosing => {
+        if answer == Answer.Newest {
+          setting.listing = Listing.Subject
+          setting.listed = versionOf(event)
+          if stable && unstable(self.name(versionOf(event))) {
+            setting.lack = b"a stable release with the version of the tool under test"
+          }
+        } else if answer == Answer.NoStable {
+          setting.listing = Listing.Unstable
+        } else if answer == Answer.Blocked {
+          setting.broken = true
+        } else if answer != Answer.NoReleases && answer != Answer.Unreachable {
+          setting.lack = b"an answer the local world does not know"
+        }
+      }
+      Stand.Checking => {
+        if answer == Answer.Outdated {
+          setting.listing = Listing.Newer
+        } else if answer == Answer.Current {
+          setting.listing = Listing.Older
+          if !self.released() {
+            setting.lack = b"a tool with a release version"
+          }
+        } else if answer == Answer.Blocked {
+          setting.broken = true
+        } else if answer != Answer.NoReleases && answer != Answer.Unreachable {
+          setting.lack = b"an answer the local world does not know"
+        }
+      }
+      Stand.Downloading => {
+        if answer == Answer.Arrived {
+          setting.assets = true
+        } else if answer == Answer.Cut {
+          // The listing arrived, so the network was there a moment ago.
+          if setting.listing != Listing.Nothing && !setting.resolves {
+            setting.lack = b"a proxy that stops a download after the listing arrived"
+          }
+        } else if answer != Answer.Blocked {
+          setting.lack = b"an answer the local world does not know"
+        }
+      }
+      Stand.Verifying => {
+        if answer != Answer.Forged {
+          setting.lack = b"an archive that the release key signed"
+        }
+      }
+      Stand.Editing => {
+        if answer == Answer.Respelled {
+          setting.style = Style.Respelled
+        } else if answer == Answer.Refused {
+          setting.style = Style.Dotted
+        } else if answer != Answer.Edited {
+          setting.lack = b"an answer the local world does not know"
+        }
+      }
+      Stand.Starting => {
+        if answer == Answer.Stuck {
+          setting.runnable = false
+          if setting.told {
+            setting.lack = b"a compiler that answers and then does not start"
+          }
+        } else if answer != Answer.Started {
+          setting.lack = b"an answer the local world does not know"
+        }
+      }
+      Stand.Asking => {
+        if answer == Answer.Told {
+          setting.told = true
+        } else if answer != Answer.Silent {
+          setting.lack = b"an answer the local world does not know"
+        }
+      }
+      Stand.Comparing => {
+        if answer == Answer.Owned {
+          setting.told = true
+          setting.owned = true
+        } else if answer == Answer.Unowned {
+          setting.told = true
+        } else {
+          setting.lack = b"an answer the local world does not know"
+        }
+      }
+      _ => {
+        setting.lack = b"an archive that the release key signed"
+      }
+    }
+    if updates && state == Stand.Downloading {
+      setting.listed = Choice.Nothing
+    }
+    return ()
+  }
+
+  // What `step` needs from the world on the computer `before`.
+  effect fn setting(self: &Self, before: &Computer, step: &Move) -> Setting
+    ! OutOfMemoryError | TransitionLoopError | SchemaError
+    ? &mut Allocator {
+    let mut setting = Setting {
+      lack: b"",
+      dead: false,
+      broken: false,
+      full: false,
+      resolves: false,
+      listing: Listing.Nothing,
+      listed: Choice.Nothing,
+      assets: false,
+      style: Style.Usual,
+      runnable: true,
+      told: false,
+      owned: false,
+    }
+    let answers = step.answers.asSlice()
+    let mut found = false
+    let mut at: usize = 0
+    while at < answers.length {
+      let answer = answered(&answers[at])
+      if answer == Answer.Unreachable || answer == Answer.Cut {
+        setting.dead = true
+      }
+      if answer == Answer.Found {
+        found = true
+      }
+      at = at + 1
+    }
+
+    // A version with its build metadata names one release, so the tool asks no listing for it.
+    // That is the one way a download can stop when the network was never there.
+    setting.full = setting.dead && found
+    let stable = match &step.command {
+      Typed.UseNewest { stable } => stable
+      Typed.SetNewest { stable, .. } => stable
+      _ => false
+    }
+    let updates = match &step.command {
+      Typed.UpdateSelf => true
+      _ => false
+    }
+    if !self.released() {
+      let mut meets = dated(versionOf(&step.command)) || dated(before.standard)
+        || dated(before.pinned())
+        || dated(environmentOf(before.environment))
+        || before.first.store != Store.Absent
+        || before.second.store != Store.Absent
+      at = 0
+      while at < answers.length {
+        if dated(versionOf(&answers[at])) {
+          meets = true
+        }
+        at = at + 1
+      }
+      if meets {
+        setting.lack = b"a tool with a release version"
+      }
+    }
+    let mut shot = run Steps.begin<Silk, Typed, Computer, Footprint>(run again<Computer>(before), 0)
+    if !run Steps.send<Silk, Typed, Computer, Footprint>(
+      &mut shot,
+      run again<Typed>(&step.command),
+    ) {
+      Intrinsic.trap("the plan holds commands the machine takes")
+    }
+    at = 0
+    while at < answers.length {
+      let lack = setting.lack
+      self.needed(
+        &mut setting,
+        stand(&shot.value),
+        shot.context.subject,
+        stable,
+        updates,
+        &answers[at],
+      )
+      if lack.length != 0 {
+        setting.lack = lack
+      }
+      if !run Steps.send<Silk, Typed, Computer, Footprint>(
+        &mut shot,
+        run again<Typed>(&answers[at]),
+      ) {
+        Intrinsic.trap("the plan holds answers the machine takes")
+      }
+      at = at + 1
+    }
+    return move setting
+  }
+
+  /// What the route that starts on `start` and makes `moves` needs and the local world lacks, or
+  /// empty text when the world can arrange all of it.
+  ///
+  /// # Errors
+  /// `TransitionLoopError` and `SchemaError` when the plan is not one of the machine.
+  /// `OutOfMemoryError`.
+  pub effect fn lacks(self: &Self, start: &Computer, moves: &[Move]) -> &'static [u8]
+    ! OutOfMemoryError | TransitionLoopError | SchemaError
+    ? &mut Allocator {
+    let mut at: usize = 0
+    while at < moves.length {
+      let before = if at == 0 {
+        start
+      } else {
+        &moves[at - 1].state
+      }
+      let setting = run self.setting(before, &moves[at])
+      if setting.lack.length != 0 {
+        return setting.lack
+      }
+      at = at + 1
+    }
+    return b""
+  }
+
+  /// Makes the directory of the route `name` and arranges it as `computer` says: the home
+  /// directory with its versions and its default, and the project with its pin.
+  ///
+  /// # Errors
+  /// `FileError` when a file cannot be written. `OutOfMemoryError`.
+  pub effect fn arrange(self: &Self, name: &[u8], computer: &Computer) -> Scene
+    ! FileError | OutOfMemoryError
+    ? &mut FileSystem | &mut Allocator {
+    let directory = run Path.joinBytes(&self.root, name)
+    let scene = Scene {
+      home: run Path.join(&directory, "home"),
+      project: run Path.join(&directory, "project"),
+      mirror: run Path.join(&directory, "mirror"),
+      records: run Path.join(&directory, "records"),
+      programs: run Path.join(&directory, "tool/bin"),
+      directory: move directory,
+      hasHome: computer.home,
+      autoInstall: computer.autoInstall,
+      environment: computer.environment,
+      bundled: computer.bundled,
+      inMember: computer.project == Project.Workspace && computer.pin.state == Pinned.Own
+        && computer.ignored,
+      dead: false,
+      broken: false,
+      full: false,
+    }
+    run emptied(&scene.directory)
+    run FileSystem.createDirectoriesRecursively(&scene.project)
+    run FileSystem.createDirectoriesRecursively(&scene.records)
+    run FileSystem.createDirectoriesRecursively(&scene.programs)
+    run linked(&self.tool, &run Path.join(&scene.programs, "silk"))
+    if computer.bundled {
+      run linked(&self.compiler, &run Path.join(&scene.programs, "silkc"))
+    }
+    if computer.home {
+      run FileSystem.createDirectoriesRecursively(&scene.home)
+      let all: [Choice; 4] = [Choice.First, Choice.Second, Choice.Third, Choice.Fourth]
+      let mut at: usize = 0
+      while at < 4 {
+        let store = computer.store(all[at])
+        if store != Store.Absent {
+          let top = run Path.joinBytes(
+            &run Path.join(&scene.home, "toolchains"),
+            self.name(all[at]),
+          )
+          if store == Store.Installed {
+            let programs = run Path.join(&top, "bin")
+            run FileSystem.createDirectoriesRecursively(&programs)
+            run linked(&self.compiler, &run Path.join(&programs, "silkc"))
+          } else {
+            let library = run Path.join(&top, "lib")
+            run FileSystem.createDirectoriesRecursively(&library)
+            run FileSystem.writeFile(
+              &run Path.join(&library, "left"),
+              b"what a disk cleaner left\n",
+            )
+          }
+        }
+        at = at + 1
+      }
+      if computer.debris {
+        let left = run Path.join(&scene.home, "toolchains/.install-left")
+        run FileSystem.createDirectoriesRecursively(&left)
+        run FileSystem.writeFile(&run Path.join(&left, "part"), b"half of a download\n")
+      }
+    }
+    return move scene
+  }
+}
+
+// One `silk.toml`: the lines of its table, then its pin when `pin` is not empty.
+effect fn manifest(table: &[u8], lines: &[u8], pin: &[u8], dotted: bool) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = Bytes.make()
+  if !dotted {
+    run Bytes.append(&mut text, (run joined(&[b"[", table, b"]\n", lines])).asSlice())
+    if pin.length != 0 {
+      run Bytes.append(&mut text, (run joined(&[b"silk-version = \"", pin, b"\"\n"])).asSlice())
+    }
+    return move text
+  }
+
+  // The same table with dotted keys: each line gets the name of the table before it.
+  let mut start: usize = 0
+  while start < lines.length {
+    let mut end = start
+    while end < lines.length && lines[end] != 10 {
+      end = end + 1
+    }
+    run Bytes.append(
+      &mut text,
+      (run joined(&[table, b".", Slice.view<u8>(lines, start, end - start), b"\n"])).asSlice(),
+    )
+    start = end + 1
+  }
+  if pin.length != 0 {
+    run Bytes.append(
+      &mut text,
+      (run joined(&[table, b".silk-version = \"", pin, b"\"\n"])).asSlice(),
+    )
+  }
+  return move text
+}
+
+// The pin a manifest states, or empty text. It reads the manifests this module writes and the
+// edits the tool makes to them: a `silk-version` line in a table, or with a dotted key.
+fn pinOf(text: &[u8]) -> &[u8] {
+  let mut start: usize = 0
+  while start < text.length {
+    let mut end = start
+    while end < text.length && text[end] != 10 {
+      end = end + 1
+    }
+    let line = Slice.view<u8>(text, start, end - start)
+    let mut key = line
+    if startsWith(key, b"package.") {
+      key = Slice.view<u8>(key, 8, key.length - 8)
+    } else if startsWith(key, b"workspace.") {
+      key = Slice.view<u8>(key, 10, key.length - 10)
+    }
+    if startsWith(key, b"silk-version") {
+      let mut open: usize = 0
+      while open < key.length && key[open] != 34 {
+        open = open + 1
+      }
+      let mut close = open + 1
+      while close < key.length && key[close] != 34 {
+        close = close + 1
+      }
+      if close < key.length {
+        return Slice.view<u8>(key, open + 1, close - open - 1)
+      }
+    }
+    start = end + 1
+  }
+  return b""
+}
+
+impl Scene {
+  // Writes the manifests of the project as `computer` says. `forced` says whether every pin is
+  // spelled as `full` says, and not as the tool writes it.
+  effect fn projected(
+    self: &Self,
+    world: &World,
+    computer: &Computer,
+    style: Style,
+    forced: bool,
+    full: bool,
+  ) -> ()
+    ! FileError | OutOfMemoryError
+    ? &mut FileSystem | &mut Allocator {
+    if computer.project == Project.Absent {
+      return ()
+    }
+    let version = computer.pin.version
+
+    // The tool pins a release older than itself with its build metadata, and any other without.
+    let mut whole = world.released() && computer.age(version) == Age.Older
+    if style == Style.Respelled {
+      whole = !whole
+    }
+    if forced {
+      whole = full
+    }
+    let pin = if computer.pin.state == Pinned.Own {
+      world.spelled(version, whole)
+    } else if computer.pin.state == Pinned.Unreadable {
+      NO_VERSION
+    } else {
+      b""
+    }
+    let dotted = style == Style.Dotted
+    let root = run Path.join(&self.project, "silk.toml")
+    if computer.project == Project.Package {
+      let text = run manifest(b"package", b"name = \"demo\"\nversion = \"0.1.0\"\n", pin, dotted)
+      return run FileSystem.writeFile(&root, text.asSlice())
+    }
+    let text = run manifest(b"workspace", b"members = [\"a\", \"b\"]\n", pin, dotted)
+    run FileSystem.writeFile(&root, text.asSlice())
+    let agreed = world.spelled(version, whole)
+    let one = match computer.pin.state {
+      Pinned.Members => agreed
+      Pinned.Split => ONE_MEMBER
+      Pinned.Own => if computer.ignored {
+        OTHER_MEMBER
+      } else {
+        b""
+      }
+      _ => b""
+    }
+    let other = match computer.pin.state {
+      Pinned.Members => agreed
+      Pinned.Split => OTHER_MEMBER
+      Pinned.Own => if computer.strays && !computer.ignored {
+        pin
+      } else {
+        b""
+      }
+      _ => b""
+    }
+    let first = run Path.join(&self.project, "a")
+    let second = run Path.join(&self.project, "b")
+    run FileSystem.createDirectoriesRecursively(&first)
+    run FileSystem.createDirectoriesRecursively(&second)
+    let mine = run manifest(b"package", b"name = \"a\"\nversion = \"0.1.0\"\n", one, false)
+    run FileSystem.writeFile(&run Path.join(&first, "silk.toml"), mine.asSlice())
+    let yours = run manifest(b"package", b"name = \"b\"\nversion = \"0.1.0\"\n", other, false)
+    return run FileSystem.writeFile(&run Path.join(&second, "silk.toml"), yours.asSlice())
+  }
+
+  // Gives the stand-in compiler at `programs/silkc` its orders: where it writes that it ran,
+  // whether it starts, whether it gives an overview, and whether the overview lists the
+  // mistyped word. A compiler that is no stand-in is left alone.
+  effect fn ordered(
+    self: &Self,
+    world: &World,
+    programs: &Path,
+    record: &[u8],
+    setting: &Setting,
+  ) -> ()
+    ! FileError | OutOfMemoryError
+    ? &mut FileSystem | &mut Allocator {
+    let program = run Path.join(programs, "silkc")
+    if !run FileSystem.exists(&program) {
+      return ()
+    }
+    run FileSystem.removeFile(&program)
+    if setting.runnable {
+      run linked(&world.compiler, &program)
+    } else {
+      run linked(&world.inert, &program)
+    }
+    let orders = run joined(
+      &[
+        Path.rawBytes(&self.records),
+        b"/",
+        record,
+        b"\n",
+        if setting.told {
+          b"told"
+        } else {
+          b"silent"
+        },
+        b"\n",
+        if setting.owned {
+          NEAR
+        } else {
+          b""
+        },
+        b"\n",
+      ],
+    )
+    return run FileSystem.writeFile(&run Path.join(programs, "silkc.flows"), orders.asSlice())
+  }
+
+  /// Arranges what `step` needs on the computer `before` and gives the words to type. It writes
+  /// the manifests and the default again as `before` says, fills the mirror, and tells the
+  /// stand-in compilers what to do.
+  ///
+  /// # Errors
+  /// `FileError` when a file cannot be written. `TransitionLoopError` and `SchemaError` when the
+  /// plan is not one of the machine. `OutOfMemoryError`.
+  pub effect fn prepare(self: &mut Self, world: &World, before: &Computer, step: &Move) -> List<
+    Bytes
+  >
+    ! FileError | OutOfMemoryError | TransitionLoopError | SchemaError
+    ? &mut FileSystem | &mut Allocator {
+    let setting = run world.setting(before, step)
+    self.dead = setting.dead
+    self.broken = setting.broken
+    self.full = setting.full || !setting.resolves
+    let sets = match &step.command {
+      Typed.Set { .. } => true
+      Typed.SetNewest { .. } => true
+      _ => false
+    }
+    run self.projected(world, before, setting.style, setting.resolves && !sets, setting.full)
+    if self.hasHome && before.standard != Choice.Nothing {
+      let text = run joined(&[b"default = \"", world.spelled(before.standard, self.full), b"\"\n"])
+      run FileSystem.writeFile(&run Path.join(&self.home, "settings.toml"), text.asSlice())
+    }
+
+    // The mirror, as the answers say.
+    if run FileSystem.exists(&self.mirror) {
+      run FileSystem.removeDirectoryRecursively(&self.mirror)
+    }
+    if !setting.dead && !setting.broken {
+      run FileSystem.createDirectoriesRecursively(&self.mirror)
+      let listed: &[u8] = match setting.listing {
+        Listing.Subject => world.name(setting.listed)
+        Listing.Nothing => b""
+        Listing.Unstable => b"0.0.2-dev.1+flows"
+        Listing.Newer => world.name(Choice.Fourth)
+        Listing.Older => world.name(Choice.First)
+      }
+      if listed.length != 0 {
+        let release = run Path.joinBytes(&self.mirror, (run joined(&[b"v", listed])).asSlice())
+        run FileSystem.createDirectoriesRecursively(&release)
+        if setting.assets {
+          let archive = run joined(&[b"silk-", listed, b"-", hostTarget(), b".tar.gz"])
+          run FileSystem.writeFile(
+            &run Path.joinBytes(&release, archive.asSlice()),
+            b"no archive of Silk\n",
+          )
+          let signature = run joined(&[archive.asSlice(), b".minisig"])
+          run FileSystem.writeFile(
+            &run Path.joinBytes(&release, signature.asSlice()),
+            b"no signature\n",
+          )
+        }
+      }
+    }
+
+    // The compilers.
+    run emptied(&self.records)
+    run self.ordered(world, &self.programs, b"bundled", &setting)
+    if self.hasHome {
+      let store = run Path.join(&self.home, "toolchains")
+      if run FileSystem.exists(&store) {
+        let listed = run FileSystem.listDirectory(&store)
+        let entries = List<DirectoryEntry>.asSlice(&listed)
+        let mut at: usize = 0
+        while at < entries.length {
+          if entries[at].kind.code == 1 {
+            let programs = run Path.join(&entries[at].path, "bin")
+            run self.ordered(world, &programs, b"compiler", &setting)
+          }
+          at = at + 1
+        }
+      }
+    }
+
+    // The words.
+    let mut words = List<Bytes>.make()
+    let install = match &step.command {
+      Typed.Set { install, .. } => install
+      Typed.SetNewest { install, .. } => install
+      _ => true
+    }
+    let version = world.spelled(versionOf(&step.command), setting.full)
+    match &step.command {
+      Typed.Misuse => {
+        run List<Bytes>.append(&mut words, run Bytes.copy(b"use"))
+        run List<Bytes>.append(&mut words, run Bytes.copy(b"--no-such-option"))
+      }
+      Typed.Use { .. } => {
+        run List<Bytes>.append(&mut words, run Bytes.copy(b"use"))
+        run List<Bytes>.append(&mut words, run Bytes.copy(version))
+      }
+      Typed.UseNewest { stable } => {
+        run List<Bytes>.append(&mut words, run Bytes.copy(b"use"))
+        run List<Bytes>.append(
+          &mut words,
+          run Bytes.copy(
+            if stable {
+              b"latest"
+            } else {
+              b"dev"
+            },
+          ),
+        )
+      }
+      Typed.UsePinned => {
+        run List<Bytes>.append(&mut words, run Bytes.copy(b"use"))
+      }
+      Typed.List => {
+        run List<Bytes>.append(&mut words, run Bytes.copy(b"use"))
+        run List<Bytes>.append(&mut words, run Bytes.copy(b"list"))
+      }
+      Typed.Which => {
+        run List<Bytes>.append(&mut words, run Bytes.copy(b"use"))
+        run List<Bytes>.append(&mut words, run Bytes.copy(b"which"))
+      }
+      Typed.Uninstall { .. } => {
+        run List<Bytes>.append(&mut words, run Bytes.copy(b"use"))
+        run List<Bytes>.append(&mut words, run Bytes.copy(b"uninstall"))
+        run List<Bytes>.append(&mut words, run Bytes.copy(version))
+      }
+      Typed.Set { .. } => {
+        run List<Bytes>.append(&mut words, run Bytes.copy(b"set"))
+        run List<Bytes>.append(&mut words, run Bytes.copy(version))
+      }
+      Typed.SetNewest { stable, .. } => {
+        run List<Bytes>.append(&mut words, run Bytes.copy(b"set"))
+        run List<Bytes>.append(
+          &mut words,
+          run Bytes.copy(
+            if stable {
+              b"latest"
+            } else {
+              b"dev"
+            },
+          ),
+        )
+      }
+      Typed.UpdateSelf => {
+        run List<Bytes>.append(&mut words, run Bytes.copy(b"update"))
+        run List<Bytes>.append(&mut words, run Bytes.copy(b"self"))
+      }
+      Typed.Run { asked } => {
+        if asked == Named.Malformed {
+          run List<Bytes>.append(&mut words, run joined(&[b"+", NO_VERSION]))
+        } else if asked != Named.Unset {
+          run List<Bytes>.append(&mut words, run joined(&[b"+", version]))
+        }
+        run List<Bytes>.append(&mut words, run Bytes.copy(b"build"))
+      }
+      Typed.Help { bare } => {
+        if !bare {
+          run List<Bytes>.append(&mut words, run Bytes.copy(b"--help"))
+        }
+      }
+      Typed.Near => {
+        run List<Bytes>.append(&mut words, run Bytes.copy(NEAR))
+      }
+      _ => Intrinsic.trap("a move starts with a command")
+    }
+    if !install {
+      run List<Bytes>.append(&mut words, run Bytes.copy(b"--no-install"))
+    }
+    return move words
+  }
+
+  /// Types `words` after `silk`, in the project, and waits for the tool to end.
+  ///
+  /// # Errors
+  /// `ProcessError` when the tool cannot start. `FileError` when a path is no path.
+  /// `OutOfMemoryError`.
+  pub effect fn typed(self: &Self, world: &World, words: &[Bytes]) -> Outcome
+    ! ProcessError | FileError | OutOfMemoryError
+    ? &mut ChildProcess | &mut Allocator {
+    let program = run Path.join(&self.programs, "silk")
+    let working = if self.inMember {
+      run Path.join(&self.project, "a")
+    } else {
+      run Path.fromBytes(Path.rawBytes(&self.project))
+    }
+    let mut request = run ChildProcess.requestWithin(&program, &working)
+    let mut at: usize = 0
+    while at < words.length {
+      run ChildProcess.addArgumentBytes(&mut request, words[at].asSlice())
+      at = at + 1
+    }
+    run ChildProcess.setVariableBytes(&mut request, b"PATH", Path.rawBytes(&self.programs))
+    run ChildProcess.setVariableBytes(&mut request, b"SILK_PROGRESS", b"never")
+    if self.hasHome {
+      run ChildProcess.setVariableBytes(&mut request, b"SILK_HOME", Path.rawBytes(&self.home))
+    }
+    if self.autoInstall {
+      run ChildProcess.setVariableBytes(&mut request, b"SILK_AUTO_INSTALL", b"1")
+    }
+    if self.environment == Named.Malformed {
+      run ChildProcess.setVariableBytes(&mut request, b"SILK_TOOLCHAIN", NO_VERSION)
+    } else if self.environment != Named.Unset {
+      run ChildProcess.setVariableBytes(
+        &mut request,
+        b"SILK_TOOLCHAIN",
+        world.spelled(environmentOf(self.environment), self.full),
+      )
+    }
+
+    // Without a network every trust source is missing, so the tool reaches no real host.
+    if self.dead {
+      run ChildProcess.setVariableBytes(&mut request, b"SSL_CERT_FILE", Path.rawBytes(&self.mirror))
+    } else {
+      run ChildProcess.setVariableBytes(
+        &mut request,
+        b"SILK_TOOLCHAIN_MIRROR",
+        Path.rawBytes(&self.mirror),
+      )
+    }
+    let ended = run ChildProcess.submit(&request)
+    let status = match ChildProcess.exitCode(&ended) {
+      Option<i32>.Some { value } => value
+      Option<i32>.None => -1
+    }
+    return Outcome {
+      status: status,
+      output: run Bytes.copy(ChildProcess.outputBytes(&ended)),
+      errors: run Bytes.copy(ChildProcess.errorBytes(&ended)),
+    }
+  }
+
+  /// A picture of everything in the scene that a command may not touch without a footprint:
+  /// the home directory, the project, the mirror and the directory of the tool.
+  ///
+  /// # Errors
+  /// `FileError` when a file cannot be read. `OutOfMemoryError`.
+  pub effect fn pictured(self: &Self) -> Picture
+    ! FileError | OutOfMemoryError
+    ? &mut FileSystem | &mut Allocator {
+    let mut picture = Picture.empty()
+    run picture.add(b"home", &self.home)
+    run picture.add(b"project", &self.project)
+    run picture.add(b"mirror", &self.mirror)
+    run picture.add(b"tool", &run Path.join(&self.directory, "tool"))
+    return move picture
+  }
+
+  /// The names of the records the stand-in compilers wrote since the last [`Scene.prepare`]:
+  /// `compiler` when the compiler of a version ran, `bundled` when the one beside the tool did.
+  ///
+  /// # Errors
+  /// `FileError` when the records cannot be listed. `OutOfMemoryError`.
+  pub effect fn ran(self: &Self) -> List<Bytes>
+    ! FileError | OutOfMemoryError
+    ? &mut FileSystem | &mut Allocator {
+    let mut names = List<Bytes>.make()
+    let listed = run FileSystem.listDirectory(&self.records)
+    let entries = List<DirectoryEntry>.asSlice(&listed)
+    let mut at: usize = 0
+    while at < entries.length {
+      let path = Path.rawBytes(&entries[at].path)
+      let mut start = path.length
+      while start > 0 && path[start - 1] != 47 {
+        start = start - 1
+      }
+      run List<Bytes>.append(
+        &mut names,
+        run Bytes.copy(Slice.view<u8>(path, start, path.length - start)),
+      )
+      at = at + 1
+    }
+    return move names
+  }
+
+  // The pin of the manifest at `relative` below the project, or empty text.
+  effect fn pinAt(self: &Self, relative: string) -> Bytes
+    ! FileError | OutOfMemoryError
+    ? &mut FileSystem | &mut Allocator {
+    let path = run Path.join(&self.project, relative)
+    if !run FileSystem.exists(&path) {
+      return Bytes.make()
+    }
+    let text = run FileSystem.readFile(&path)
+    return run Bytes.copy(pinOf(text.asSlice()))
+  }
+
+  /// The computer the disk shows, read without the tool: what the home directory holds, the
+  /// default, and the project with its pin.
+  ///
+  /// # Errors
+  /// `FileError` when a file cannot be read. `OutOfMemoryError`.
+  pub effect fn observed(self: &Self, world: &World) -> Computer
+    ! FileError | OutOfMemoryError
+    ? &mut FileSystem | &mut Allocator {
+    let mut computer = Computer.empty()
+    computer.home = self.hasHome
+    computer.autoInstall = self.autoInstall
+    computer.environment = self.environment
+    computer.bundled = self.bundled
+    if self.hasHome {
+      let settings = run Path.join(&self.home, "settings.toml")
+      if run FileSystem.exists(&settings) {
+        let text = run FileSystem.readFile(&settings)
+        let lines = text.asSlice()
+        let mut start: usize = 0
+        while start < lines.length {
+          let mut end = start
+          while end < lines.length && lines[end] != 10 {
+            end = end + 1
+          }
+          let line = Slice.view<u8>(lines, start, end - start)
+          if startsWith(line, b"default = \"") && line.length > 12 {
+            computer.standard = world.positioned(Slice.view<u8>(line, 11, line.length - 12))
+          }
+          start = end + 1
+        }
+      }
+      let store = run Path.join(&self.home, "toolchains")
+      if run FileSystem.exists(&store) {
+        let listed = run FileSystem.listDirectory(&store)
+        let entries = List<DirectoryEntry>.asSlice(&listed)
+        let mut at: usize = 0
+        while at < entries.length {
+          let path = Path.rawBytes(&entries[at].path)
+          let mut start = path.length
+          while start > 0 && path[start - 1] != 47 {
+            start = start - 1
+          }
+          let name = Slice.view<u8>(path, start, path.length - start)
+          if startsWith(name, b".install-") {
+            computer.debris = true
+          } else if entries[at].kind.code == 1 {
+            let whole = run FileSystem.exists(&run Path.join(&entries[at].path, "bin/silkc"))
+            computer.keep(
+              world.positioned(name),
+              if whole {
+                Store.Installed
+              } else {
+                Store.Damaged
+              },
+            )
+          }
+          at = at + 1
+        }
+      }
+    }
+    let root = run Path.join(&self.project, "silk.toml")
+    if !run FileSystem.exists(&root) {
+      return move computer
+    }
+    let text = run FileSystem.readFile(&root)
+    let shared = holds(text.asSlice(), b"[workspace]") || startsWith(text.asSlice(), b"workspace.")
+    computer.project = if shared {
+      Project.Workspace
+    } else {
+      Project.Package
+    }
+    let own = pinOf(text.asSlice())
+    let one = run self.pinAt("a/silk.toml")
+    let other = run self.pinAt("b/silk.toml")
+    if own.length != 0 {
+      let version = world.positioned(own)
+      if version == Choice.Nothing {
+        computer.pin = Pin { state: Pinned.Unreadable, version: Choice.Nothing }
+      } else {
+        computer.pin = Pin { state: Pinned.Own, version: version }
+      }
+      computer.strays = shared && (one.length() != 0 || other.length() != 0)
+      computer.ignored = self.inMember && one.length() != 0
+        && world.positioned(one.asSlice()) != version
+      return move computer
+    }
+    if !shared || (one.length() == 0 && other.length() == 0) {
+      return move computer
+    }
+    computer.strays = true
+    if one.length() != 0 && other.length() != 0 && !same(one.asSlice(), other.asSlice()) {
+      computer.pin = Pin { state: Pinned.Split, version: Choice.Nothing }
+      return move computer
+    }
+    let agreed = if one.length() != 0 {
+      one.asSlice()
+    } else {
+      other.asSlice()
+    }
+    computer.pin = Pin { state: Pinned.Members, version: world.positioned(agreed) }
+    return move computer
+  }
+}
+
+/// `computer` with only what a disk can show. Two computers that a disk cannot tell apart give
+/// the same value.
+///
+/// The machine keeps some facts apart that are one fact on a disk. Without a home directory
+/// there are no versions and no default. A member's own pin is passed over only below a
+/// workspace that pins a version. And members that pin a version are members with pins of their
+/// own.
+pub fn shown(computer: &Computer) -> Computer {
+  let mut plain = Computer.empty()
+  plain.home = computer.home
+  plain.autoInstall = computer.autoInstall
+  plain.bundled = computer.bundled
+  plain.environment = computer.environment
+  plain.project = computer.project
+  plain.pin = Pin { state: computer.pin.state, version: computer.pinned() }
+  plain.strays = computer.memberPins()
+  plain.ignored = computer.ignored && computer.project == Project.Workspace
+    && computer.pin.state == Pinned.Own
+  if computer.home {
+    plain.standard = computer.standard
+    plain.debris = computer.debris
+    plain.first.store = computer.first.store
+    plain.second.store = computer.second.store
+    plain.third.store = computer.third.store
+    plain.fourth.store = computer.fourth.store
+  }
+  return move plain
+}
+
+// Whether `message` goes to standard output when the command is `command`.
+fn aloud(message: Message, command: &Typed) -> bool {
+  let bare = match &command.* {
+    Typed.Help { bare } => bare
+    _ => false
+  }
+  let forwards = match &command.* {
+    Typed.Run { .. } => true
+    _ => false
+  }
+  return match message {
+    Message.Versions => true
+    Message.Selected => true
+    Message.NothingToRemove => true
+    Message.Removed => true
+    Message.Installed => !forwards
+    Message.AlreadyInstalled => true
+    Message.DefaultSet => true
+    Message.Pinned => true
+    Message.MembersUnpinned => true
+    Message.UpToDate => true
+    Message.Updated => true
+    Message.Overview => !bare
+    Message.OwnCommands => !bare
+    _ => false
+  }
+}
+
+// Words that only `message` prints, or empty text when its words are not fixed.
+fn mark(message: Message) -> &'static [u8] {
+  return match message {
+    Message.UnknownCommand => b"silk: unknown command `"
+    Message.NoHome => b"silk: cannot find the toolchain directory"
+    Message.BadEnvironment => b"silk: SILK_TOOLCHAIN="
+    Message.BadRequest => b"is not a Silk version; +<version> takes"
+    Message.NothingSelected => b"no Silk version is selected here"
+    Message.NotInstalled => b") is not installed.\nInstall it with: "
+    Message.IgnoredPin => b"silk: note: "
+    Message.NothingToRemove => b"is not installed; nothing to remove"
+    Message.WasDefault => b"It was your default"
+    Message.PinnedHere => b"This project pins it ("
+    Message.NoPin => b"has no project that pins a Silk version"
+    Message.Installing => b"(auto-install is on)"
+    Message.Installed => b"Installed Silk "
+    Message.AlreadyInstalled => b" is already installed in "
+    Message.DefaultSet => b"Default Silk version: "
+    Message.StillPins => b"Note: this project still pins Silk "
+    Message.NoProject => b"start a project with `silk init`"
+    Message.Pinned => b"Pinned Silk "
+    Message.MembersUnpinned => b"Removed [package].silk-version from "
+    Message.NotInstalledYet => b"is not installed yet. Install it with: silk use"
+    Message.OlderThanTool => b"is older than this tool ("
+    Message.NotPublished => b"no published Silk release is version "
+    Message.NoStable => b"no stable Silk release is published yet"
+    Message.NoReleases => b"the release listing names no published Silk release"
+    Message.Forged => b"is not signed by the Silk release key"
+    Message.CannotRun => b"silk: cannot run "
+    Message.UpToDate => b" is up to date (newest release: "
+    Message.Updated => b"Updated silk to "
+    Message.Overview => b"Stand-in compiler of the flows run"
+    Message.OwnCommands => b"The silk tool runs these commands itself"
+    _ => b""
+  }
+}
+
+const MESSAGES: [Message; 30] = [
+  Message.UnknownCommand,
+  Message.NoHome,
+  Message.BadEnvironment,
+  Message.BadRequest,
+  Message.NothingSelected,
+  Message.NotInstalled,
+  Message.IgnoredPin,
+  Message.NothingToRemove,
+  Message.WasDefault,
+  Message.PinnedHere,
+  Message.NoPin,
+  Message.Installing,
+  Message.Installed,
+  Message.AlreadyInstalled,
+  Message.DefaultSet,
+  Message.StillPins,
+  Message.NoProject,
+  Message.Pinned,
+  Message.MembersUnpinned,
+  Message.NotInstalledYet,
+  Message.OlderThanTool,
+  Message.NotPublished,
+  Message.NoStable,
+  Message.NoReleases,
+  Message.Forged,
+  Message.CannotRun,
+  Message.UpToDate,
+  Message.Updated,
+  Message.Overview,
+  Message.OwnCommands,
+]
+
+fn placeName(place: Place) -> &'static [u8] {
+  return match place {
+    Place.Toolchain => b"the directory of a version"
+    Place.Staging => b"a staging directory"
+    Place.Settings => b"settings.toml"
+    Place.Manifest => b"the manifest that pins the project"
+    Place.Members => b"the manifests of the members"
+    Place.Tool => b"the tool"
+  }
+}
+
+fn changeName(change: Change) -> &'static [u8] {
+  return match change {
+    Change.Created => b"creates "
+    Change.Changed => b"changes "
+    Change.Removed => b"removes "
+  }
+}
+
+// One thing a command did to a place.
+struct Claim {
+  place: Place,
+  change: Change,
+  // The first path that shows it.
+  path: Bytes,
+}
+
+// The part of `path` after `prefix` and a `/`, or empty text when `path` is not below `prefix`.
+fn below<'a>(path: &'a [u8], prefix: &[u8]) -> &'a [u8] {
+  if path.length > prefix.length + 1 && startsWith(path, prefix) && path[prefix.length] == 47 {
+    return Slice.view<u8>(path, prefix.length + 1, path.length - prefix.length - 1)
+  }
+  return b""
+}
+
+// Whether `path` has no `/`.
+fn single(path: &[u8]) -> bool {
+  let mut at: usize = 0
+  while at < path.length {
+    if path[at] == 47 {
+      return false
+    }
+    at = at + 1
+  }
+  return true
+}
+
+effect fn claim(claims: &mut List<Claim>, place: Place, change: Change, path: &[u8]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let known = List<Claim>.asSlice(&claims.*)
+  let mut at: usize = 0
+  while at < known.length {
+    if known[at].place == place && known[at].change == change {
+      return ()
+    }
+    at = at + 1
+  }
+  return run List<Claim>.append(
+    &mut claims.*,
+    Claim { place: place, change: change, path: run Bytes.copy(path) },
+  )
+}
+
+fn claimed(claims: &[Claim], place: Place, change: Change) -> bool {
+  let mut at: usize = 0
+  while at < claims.length {
+    if claims[at].place == place && claims[at].change == change {
+      return true
+    }
+    at = at + 1
+  }
+  return false
+}
+
+// Whether `footprint` lists that `place` is created, changed or removed, as `change` says.
+fn listed(footprint: &[Footprint], place: Place, change: Change) -> bool {
+  let mut at: usize = 0
+  while at < footprint.length {
+    let found = match &footprint[at] {
+      Footprint.Creates { place: named } => named == place && change == Change.Created
+      Footprint.Changes { place: named } => named == place && change == Change.Changed
+      Footprint.Removes { place: named } => named == place && change == Change.Removed
+      _ => false
+    }
+    if found {
+      return true
+    }
+    at = at + 1
+  }
+  return false
+}
+
+/// Compares what a command left with the footprint of `step`, and gives one line for each
+/// thing that differs. No line means that the command left its footprint and nothing else.
+///
+/// `outcome` is what the tool gave back, `differences` what changed on the disk of the scene,
+/// with paths that start at its directory, and `ran` the names of the records the stand-in
+/// compilers wrote: `compiler` for the compiler of a version, `bundled` for the one beside the
+/// tool.
+///
+/// # Details
+/// The exit status must be the one of the footprint. Standard output must be empty exactly
+/// when the footprint has no message for it, and so must standard error. A message whose words
+/// are fixed must be there when the footprint lists it and must not be there otherwise. Every
+/// file that changed must belong to a place the footprint lists, and every place it lists must
+/// show a change. A compiler must have run exactly when the footprint says so. A download
+/// leaves nothing to compare.
+///
+/// # Errors
+/// `OutOfMemoryError`.
+pub effect fn judged(
+  step: &Move,
+  outcome: &Outcome,
+  differences: &[Difference],
+  ran: &[Bytes],
+) -> List<Bytes>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut wrong = List<Bytes>.make()
+  let footprint = step.footprint.asSlice()
+
+  // The exit status. A command that became the compiler ends with the compiler's, and the
+  // stand-in ends with 0.
+  let mut status: i32 = 0
+  let mut at: usize = 0
+  while at < footprint.length {
+    if let Footprint.Exits { status: named } = &footprint[at] {
+      status = u8.toI32(named)
+    }
+    at = at + 1
+  }
+  if outcome.status == -1 {
+    run List<Bytes>.append(&mut wrong, run Bytes.copy(b"a signal ended the tool"))
+  } else if outcome.status != status {
+    run List<Bytes>.append(
+      &mut wrong,
+      run joined(
+        &[
+          b"the footprint says exit status ",
+          (run decimal(status)).asSlice(),
+          b" and the tool ended with ",
+          (run decimal(outcome.status)).asSlice(),
+        ],
+      ),
+    )
+  }
+
+  // The messages.
+  let mut speaks = false
+  let mut complains = false
+  at = 0
+  while at < footprint.length {
+    if let Footprint.Says { message } = &footprint[at] {
+      if aloud(message, &step.command) {
+        speaks = true
+      } else {
+        complains = true
+      }
+      let words = mark(message)
+      let heard = if aloud(message, &step.command) {
+        outcome.output.asSlice()
+      } else {
+        outcome.errors.asSlice()
+      }
+      if !holds(heard, words) {
+        run List<Bytes>.append(
+          &mut wrong,
+          run joined(
+            &[
+              b"the footprint lists a message with the words \"",
+              words,
+              b"\" and the tool did not print them",
+            ],
+          ),
+        )
+      }
+    }
+    at = at + 1
+  }
+  if speaks != (outcome.output.length() != 0) {
+    run List<Bytes>.append(
+      &mut wrong,
+      run Bytes.copy(
+        if speaks {
+          b"the footprint lists a message for standard output and the tool printed none"
+        } else {
+          b"the tool printed on standard output and the footprint lists no message for it"
+        },
+      ),
+    )
+  }
+  if complains != (outcome.errors.length() != 0) {
+    run List<Bytes>.append(
+      &mut wrong,
+      run Bytes.copy(
+        if complains {
+          b"the footprint lists a message for standard error and the tool printed none"
+        } else {
+          b"the tool printed on standard error and the footprint lists no message for it"
+        },
+      ),
+    )
+  }
+  at = 0
+  while at < MESSAGES.length {
+    let message = MESSAGES[at]
+    let mut said = false
+    let mut each: usize = 0
+    while each < footprint.length {
+      if let Footprint.Says { message: named } = &footprint[each] {
+        if named == message {
+          said = true
+        }
+      }
+      each = each + 1
+    }
+    if !said
+      && (holds(outcome.output.asSlice(), mark(message))
+        || holds(outcome.errors.asSlice(), mark(message))) {
+      run List<Bytes>.append(
+        &mut wrong,
+        run joined(
+          &[b"the tool printed \"", mark(message), b"\" and the footprint lists no such message"],
+        ),
+      )
+    }
+    at = at + 1
+  }
+
+  // What every command keeps: no crash, and no color where no terminal is.
+  let texts: [&[u8]; 2] = [outcome.output.asSlice(), outcome.errors.asSlice()]
+  at = 0
+  while at < 2 {
+    let escape: [u8; 1] = [27]
+    if holds(texts[at], &escape) {
+      run List<Bytes>.append(
+        &mut wrong,
+        run Bytes.copy(b"the tool printed color codes where no terminal is"),
+      )
+    }
+    if holds(texts[at], b"panic") || holds(texts[at], b"trap")
+      || holds(texts[at], b"Segmentation") {
+      run List<Bytes>.append(&mut wrong, run Bytes.copy(b"the tool crashed"))
+    }
+    at = at + 1
+  }
+
+  // The files. Each difference belongs to one place, or to none.
+  let mut claims = List<Claim>.make()
+  at = 0
+  while at < differences.length {
+    let path = differences[at].path.asSlice()
+    let change = differences[at].change
+    let version = below(path, b"home/toolchains")
+    let member = same(path, b"project/a/silk.toml") || same(path, b"project/b/silk.toml")
+    if same(path, b"home/settings.toml") {
+      // The file is made when the first default is set, which the machine calls a change too.
+      run claim(&mut claims, Place.Settings, Change.Changed, path)
+    } else if same(path, b"project/silk.toml") && change == Change.Changed {
+      run claim(&mut claims, Place.Manifest, Change.Changed, path)
+    } else if member && change == Change.Changed {
+      run claim(&mut claims, Place.Members, Change.Changed, path)
+    } else if same(path, b"home/bin/silk") {
+      run claim(&mut claims, Place.Tool, Change.Changed, path)
+    } else if startsWith(version, b".install-") {
+      // What is in a staging directory comes and goes with it.
+      if single(version) {
+        run claim(&mut claims, Place.Staging, change, path)
+      }
+    } else if version.length != 0 {
+      // A file that comes into the directory of a version, or changes there, makes the version.
+      if single(version) && change == Change.Removed {
+        run claim(&mut claims, Place.Toolchain, Change.Removed, path)
+      } else if change != Change.Removed {
+        run claim(&mut claims, Place.Toolchain, Change.Created, path)
+      }
+    } else if !(same(path, b"home") || same(path, b"home/toolchains") || same(path, b"home/bin")
+      || same(path, b"home/.install.lock")) {
+      run List<Bytes>.append(
+        &mut wrong,
+        run joined(&[b"the tool ", changeName(change), path, b", which no footprint names"]),
+      )
+    }
+    at = at + 1
+  }
+  let found = List<Claim>.asSlice(&claims)
+  at = 0
+  while at < found.length {
+    if !listed(footprint, found[at].place, found[at].change) {
+      run List<Bytes>.append(
+        &mut wrong,
+        run joined(
+          &[
+            b"the tool ",
+            changeName(found[at].change),
+            found[at].path.asSlice(),
+            b", and the footprint does not list that it ",
+            changeName(found[at].change),
+            placeName(found[at].place),
+          ],
+        ),
+      )
+    }
+    at = at + 1
+  }
+  let places: [Place; 6] = [
+    Place.Toolchain,
+    Place.Staging,
+    Place.Settings,
+    Place.Manifest,
+    Place.Members,
+    Place.Tool,
+  ]
+  let changes: [Change; 3] = [Change.Created, Change.Changed, Change.Removed]
+  at = 0
+  while at < 6 {
+    let mut each: usize = 0
+    while each < 3 {
+      // A place that a command makes and removes again shows nothing afterwards.
+      let passing = listed(footprint, places[at], Change.Created)
+        && listed(footprint, places[at], Change.Removed)
+      if listed(footprint, places[at], changes[each]) && !passing
+        && !claimed(found, places[at], changes[each]) {
+        run List<Bytes>.append(
+          &mut wrong,
+          run joined(
+            &[
+              b"the footprint lists that the command ",
+              changeName(changes[each]),
+              placeName(places[at]),
+              b", and the disk shows no such change",
+            ],
+          ),
+        )
+      }
+      each = each + 1
+    }
+    at = at + 1
+  }
+
+  // The compilers.
+  let programs: [Program; 2] = [Program.Compiler, Program.Bundled]
+  let names: [&[u8]; 2] = [b"compiler", b"bundled"]
+  at = 0
+  while at < 2 {
+    let mut expected = false
+    let mut each: usize = 0
+    while each < footprint.length {
+      if let Footprint.Runs { program } = &footprint[each] {
+        if program == programs[at] {
+          expected = true
+        }
+      }
+      each = each + 1
+    }
+
+    // A compiler that does not start writes nothing.
+    each = 0
+    while each < step.answers.length() {
+      if answered(&step.answers.asSlice()[each]) == Answer.Stuck {
+        expected = false
+      }
+      each = each + 1
+    }
+    let mut started = false
+    each = 0
+    while each < ran.length {
+      if same(ran[each].asSlice(), names[at]) {
+        started = true
+      }
+      each = each + 1
+    }
+    if expected != started {
+      run List<Bytes>.append(
+        &mut wrong,
+        run joined(
+          &[
+            if expected {
+              b"the footprint lists that the tool runs the "
+            } else {
+              b"the tool ran the "
+            },
+            if at == 0 {
+              b"compiler of a version"
+            } else {
+              b"compiler beside the tool"
+            },
+            if expected {
+              b", and it did not run"
+            } else {
+              b", and the footprint does not list it"
+            },
+          ],
+        ),
+      )
+    }
+    at = at + 1
+  }
+  return move wrong
+}
+
+// `number` in decimal digits.
+effect fn decimal(number: i32) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = Bytes.make()
+  if number < 0 {
+    run Bytes.append(&mut text, b"-")
+    run Bytes.append(&mut text, (run decimal(0 - number)).asSlice())
+    return move text
+  }
+  if number >= 10 {
+    run Bytes.append(&mut text, (run decimal(number / 10)).asSlice())
+  }
+  let digit: [u8; 1] = [i32.toU8(number % 10) + 48]
+  run Bytes.append(&mut text, &digit)
+  return move text
+}
+
+/// Plays the compiler `silkc` in a scene. `arguments` is the command line, with the path of the
+/// program first. The exit status is the answer.
+///
+/// The stand-in reads its orders from the file `silkc.flows` beside itself: the file it writes
+/// its command line to, so the run sees that it started, then `told` or `silent`, then a word
+/// its overview lists. For `--help` it prints an overview, or fails when the orders say
+/// `silent`. For any other command it prints nothing and ends with 0.
+///
+/// # Errors
+/// `FileError` when the orders cannot be read or the record cannot be written.
+/// `OutOfMemoryError`.
+pub effect fn compiler(arguments: &[Bytes], output: &mut Bytes) -> i32
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let beside = run joined(&[arguments[0].asSlice(), b".flows"])
+  let orders = run FileSystem.readFile(&run Path.fromBytes(beside.asSlice()))
+  let text = orders.asSlice()
+  let nothing = Slice.view<u8>(text, 0, 0)
+  let mut lines: [&[u8]; 3] = [nothing, nothing, nothing]
+  let mut start: usize = 0
+  let mut line: usize = 0
+  while start < text.length && line < 3 {
+    let mut end = start
+    while end < text.length && text[end] != 10 {
+      end = end + 1
+    }
+    lines[line] = Slice.view<u8>(text, start, end - start)
+    line = line + 1
+    start = end + 1
+  }
+  let mut record = Bytes.make()
+  let mut at: usize = 1
+  while at < arguments.length {
+    run Bytes.append(&mut record, arguments[at].asSlice())
+    run Bytes.append(&mut record, b"\n")
+    at = at + 1
+  }
+  run FileSystem.writeFile(&run Path.fromBytes(lines[0]), record.asSlice())
+  if arguments.length != 2 || !same(arguments[1].asSlice(), b"--help") {
+    return 0
+  }
+  if same(lines[1], b"silent") {
+    return 1
+  }
+  run Bytes.append(&mut output.*, OVERVIEW)
+  run Bytes.append(
+    &mut output.*,
+    b"\n\nCommands:\n  build  Build the package\n  check  Check the package\n",
+  )
+  if lines[2].length != 0 {
+    run Bytes.append(
+      &mut output.*,
+      (run joined(&[b"  ", lines[2], b"  A command of this compiler\n"])).asSlice(),
+    )
+  }
+  return 0
+}
