@@ -10,7 +10,8 @@
 //! Each machine has a [`Binding`], the three tables between its words and real ones:
 //!
 //! - Act: [`Binding.act`] turns a command into a command line, and the answers of the world
-//!   into an arrangement, such as a git host that is not there.
+//!   into an arrangement, such as a git host that is not there. It also says where the command
+//!   is typed, in `Stage.inside`.
 //! - Observe: [`Binding.observed`] reads the disk and gives the context it shows. It never asks
 //!   the compiler, because the compiler is what the run checks.
 //! - Match: [`judged`] compares what a command left with its `Trail`. Everything the trail
@@ -36,17 +37,26 @@ import silk.mem.pointer { Pointer }
 import silk.num.i32
 import silk.num.u8
 import silk.num.usize
+import silk.core.result { Result }
+import silk.platform.native.file { NativeFile, NativeFileError }
 import silk.schema.issue { SchemaError }
 import silk.schema.schema { Schema }
 import silk.system.child_process { ChildProcess, ProcessError }
 import silk.text.string { String }
-import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.core.effect { Effect }
+import silk.system.filesystem { DirectoryEntry, FileError, FileSystem, Path }
 
 @foreign(noCapture: .("path"))
-unsafe extern "C" fn chmod(path: ?[*] const u8, mode: u32) -> i32
+unsafe extern "C" fn chmod(path: ?[*]const u8, mode: u32) -> i32
+
+// An exclusive lock on an open file, which waits for the process that holds one.
+unsafe extern "C" fn flock(descriptor: i32, operation: i32) -> i32
+
+@foreign(noCapture: ("from", "to"))
+unsafe extern "C" fn rename(from: ?[*]const u8, to: ?[*]const u8) -> i32
 
 @foreign(noCapture: ("target", "path"))
-unsafe extern "C" fn symlink(target: ?[*] const u8, path: ?[*] const u8) -> i32
+unsafe extern "C" fn symlink(target: ?[*]const u8, path: ?[*]const u8) -> i32
 
 /// What every trip of a run shares.
 pub struct Bench {
@@ -79,7 +89,11 @@ pub struct Stage {
   pub home: Path,
   /// Where the commands are typed, and the directory above every project of the trip.
   pub work: Path,
-  /// Where the check server of the trip has its socket.
+  /// The directory below the work directory where the commands are typed, or empty text for
+  /// the work directory itself.
+  pub inside: &'static [u8],
+  /// Where the check server of the trip has its socket: a directory with a short path below
+  /// `/tmp`, because the path of a socket has room for about a hundred bytes.
   pub runtime: Path,
   // The file the compiler reports its events to.
   events: Path,
@@ -128,6 +142,46 @@ effect fn hosted(path: &[u8]) -> Bytes
   return run joined(&[path, &ending])
 }
 
+effect fn counted(text: &mut Bytes, number: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if number >= 10 {
+    run counted(&mut text.*, number / 10)
+  }
+  let digit: [u8; 1] = [usize.toU8(number % 10) + 48]
+  return run Bytes.append(&mut text.*, &digit)
+}
+
+// Takes and gives back the lock on every file below `directory` whose name ends in `.lock` and
+// that is in a cache: `cached` is whether `directory` is below a directory `cache`.
+effect fn awaited(directory: &Path, cached: bool) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let listed = run FileSystem.listDirectory(directory)
+  let children = List<DirectoryEntry>.asSlice(&listed)
+  let mut at: usize = 0
+  while at < children.length {
+    let child = &children[at]
+    at = at + 1
+    let path = Path.rawBytes(&child.path)
+    if child.kind.code == 1 {
+      let inside = cached
+        || (path.length > 6 && Slice.view<u8>(path, path.length - 6, 6) == b"/cache")
+      run awaited(&child.path, inside)
+    } else if cached && child.kind.code == 0 && path.length > 5
+      && Slice.view<u8>(path, path.length - 5, 5) == b".lock" {
+      // 2 is LOCK_EX on Linux and macOS.
+      if let Result<i32, NativeFileError>.Success { value: descriptor } = move run Effect.result(
+        NativeFile.open(path, 0, 0),
+      ) {
+        let _locked = unsafe flock(descriptor, 2)
+        drop run Effect.result(NativeFile.close(descriptor))
+      }
+    }
+  }
+  return ()
+}
+
 // The template `name` of a git host: a package, with a `[[post-init]]` entry that runs
 // `hook` when `hook` is not empty.
 effect fn template(repository: &Path, name: string, hook: &[u8]) -> ()
@@ -162,12 +216,21 @@ impl Bench {
   /// `a` has the templates `default` and `plain` without entries, `hooked` whose entry writes a
   /// file into the project, and `failing` whose entry writes outside the project. In `b` the
   /// `default` template is the hooked one, in `c` the failing one, and `d` has no `default`.
-  /// It also makes the archive `root/archives/shelf.tar.gz` of a library package `shelf`.
+  /// It also makes the library package `shelf` in `root/archives/shelf`, whose module `lib` has
+  /// the function `add`, and the archive `root/archives/shelf.tar.gz` of it.
   ///
   /// # Errors
   /// `FileError` when a file cannot be written. `ProcessError` when `git` or `tar` does not
   /// start. `OutOfMemoryError`.
-  pub effect fn made(root: &Path, tool: &[u8], toolchain: &Path, release: &[u8], version: &[u8], clang: &[u8], programs: &[u8]) -> Bench
+  pub effect fn made(
+    root: &Path,
+    tool: &[u8],
+    toolchain: &Path,
+    release: &[u8],
+    version: &[u8],
+    clang: &[u8],
+    programs: &[u8],
+  ) -> Bench
     ! FileError | ProcessError | OutOfMemoryError
     ? &mut FileSystem | &mut ChildProcess | &mut Allocator {
     let bench = Bench {
@@ -176,7 +239,13 @@ impl Bench {
       tool: run Path.join(root, "silk"),
       toolchain: run Path.fromBytes(Path.rawBytes(toolchain)),
       release: run Bytes.copy(release),
-      version: run Bytes.copy(if version.length == 0 { release } else { version }),
+      version: run Bytes.copy(
+        if version.length == 0 {
+          release
+        } else {
+          version
+        },
+      ),
       clang: run Bytes.copy(clang),
       programs: run Bytes.copy(programs),
       outside: run Path.join(root, "outside"),
@@ -230,7 +299,7 @@ impl Bench {
     run FileSystem.createDirectoriesRecursively(&run Path.join(&archives, "shelf/src"))
     run FileSystem.writeFile(
       &run Path.join(&archives, "shelf/silk.toml"),
-      b"[package]\nname = \"shelf\"\nversion = \"0.1.0\"\nsilk-version = \"0.0.0\"\n",
+      b"[package]\nname = \"shelf\"\nversion = \"0.1.0\"\nkind = \"library\"\nexports = [\"lib\"]\n",
     )
     run FileSystem.writeFile(
       &run Path.join(&archives, "shelf/src/lib.silk"),
@@ -262,6 +331,16 @@ impl Bench {
       Option<i32>.None => {}
     }
     fail FileSystem.error(FileSystem.createFileOperation(), FileSystem.other())
+  }
+
+  /// Waits for `seconds`, a number as `sleep` takes it, such as `0.3`.
+  ///
+  /// # Errors
+  /// `FileError` when `sleep` fails. `ProcessError` when it does not start. `OutOfMemoryError`.
+  pub effect fn pause(self: &Self, seconds: &[u8]) -> ()
+    ! FileError | ProcessError | OutOfMemoryError
+    ? &mut ChildProcess | &mut Allocator {
+    return run self.host(&self.outside, &[b"sleep", seconds])
   }
 
   /// The version of the compiler of the toolchain, without its build metadata: what `silk init`
@@ -318,13 +397,13 @@ impl Bench {
       directory: run Path.fromBytes(Path.rawBytes(&directory)),
       home: run Path.join(&directory, "home"),
       work: run Path.join(&directory, "work"),
-      runtime: run Path.join(&directory, "run"),
+      runtime: run FileSystem.createTemporaryDirectory(&run Path.make("/tmp"), b"sk"),
       events: run Path.join(&directory, "events"),
+      inside: b"",
       offline: false,
       edits: 0,
     }
     run FileSystem.createDirectoriesRecursively(&stage.work)
-    run FileSystem.createDirectoriesRecursively(&stage.runtime)
     let store = run Path.join(&stage.home, ".silk")
     run FileSystem.createDirectoriesRecursively(&run Path.join(&store, "git"))
     run FileSystem.createDirectoriesRecursively(&run Path.join(&store, "archives"))
@@ -332,7 +411,8 @@ impl Bench {
     run FileSystem.createDirectoriesRecursively(&versions)
     let from = run hosted(Path.rawBytes(&self.toolchain))
     let to = run hosted(Path.rawBytes(&run Path.joinBytes(&versions, self.release.asSlice())))
-    if unsafe symlink(Pointer.fromSlice<u8>(from.asSlice()), Pointer.fromSlice<u8>(to.asSlice())) != 0 {
+    if unsafe symlink(Pointer.fromSlice<u8>(from.asSlice()), Pointer.fromSlice<u8>(to.asSlice()))
+      != 0 {
       fail FileSystem.error(FileSystem.createFileOperation(), FileSystem.other())
     }
     run stage.hosts(self, b"a")
@@ -361,6 +441,22 @@ impl Stage {
     return run FileSystem.writeFile(&run Path.join(&self.home, ".gitconfig"), text.asSlice())
   }
 
+  /// Gives the directory `from` the name `to`, as a user who moves a project does.
+  ///
+  /// # Errors
+  /// `FileError` when the host refuses. `OutOfMemoryError`.
+  pub effect fn renamed(self: &Self, from: &Path, to: &Path) -> ()
+    ! FileError | OutOfMemoryError
+    ? &mut Allocator {
+    let old = run hosted(Path.rawBytes(from))
+    let new = run hosted(Path.rawBytes(to))
+    if unsafe rename(Pointer.fromSlice<u8>(old.asSlice()), Pointer.fromSlice<u8>(new.asSlice()))
+      != 0 {
+      fail FileSystem.error(FileSystem.createFileOperation(), FileSystem.other())
+    }
+    return ()
+  }
+
   /// Types `silk` and `words` in the directory `directory` and gives what came back.
   ///
   /// # Errors
@@ -376,12 +472,16 @@ impl Stage {
     }
     run ChildProcess.setVariableBytes(&mut request, b"PATH", bench.programs.asSlice())
     run ChildProcess.setVariableBytes(&mut request, b"HOME", Path.rawBytes(&self.home))
-    run ChildProcess.setVariableBytes(&mut request, b"XDG_RUNTIME_DIR", Path.rawBytes(&self.runtime))
+    run ChildProcess.setVariableBytes(
+      &mut request,
+      b"XDG_RUNTIME_DIR",
+      Path.rawBytes(&self.runtime),
+    )
     run ChildProcess.setVariableBytes(&mut request, b"SILK_TOOLCHAIN", bench.release.asSlice())
     run ChildProcess.setVariableBytes(&mut request, b"SILK_PROGRESS", b"plain")
     run ChildProcess.setVariableBytes(&mut request, b"NO_COLOR", b"1")
     run ChildProcess.setVariableBytes(&mut request, b"SILK_EVENTS", Path.rawBytes(&self.events))
-    run ChildProcess.setVariableBytes(&mut request, b"SILK_CHECK_SERVER_IDLE", b"1000")
+    run ChildProcess.setVariableBytes(&mut request, b"SILK_CHECK_SERVER_IDLE", b"8000")
     if bench.clang.length() != 0 {
       run ChildProcess.setVariableBytes(&mut request, b"SILK_CLANG", bench.clang.asSlice())
     }
@@ -414,6 +514,44 @@ impl Stage {
     run picture.add(b"run", &self.runtime)
     run picture.add(b"outside", &bench.outside)
     return move picture
+  }
+
+  /// Waits until the check server a command left behind reports that it listens, for five
+  /// seconds at most.
+  ///
+  /// # Errors
+  /// `FileError` when the file of events cannot be read. `ProcessError` when `sleep` does not
+  /// start. `OutOfMemoryError`.
+  pub effect fn settled(self: &Self, bench: &Bench) -> ()
+    ! FileError | ProcessError | OutOfMemoryError
+    ? &mut FileSystem | &mut ChildProcess | &mut Allocator {
+    let mut tries: usize = 0
+    while tries < 50 {
+      if run FileSystem.exists(&self.events) {
+        let text = run FileSystem.readFile(&self.events)
+        if holds(text.asSlice(), b"ServerStarted") {
+          return ()
+        }
+      }
+      run bench.pause(b"0.1")
+      tries = tries + 1
+    }
+    return ()
+  }
+
+  /// Waits until every cache of the trip is written.
+  ///
+  /// # Details
+  /// A check or a build returns before its cache is on the disk: a copy of the process writes
+  /// it, and holds a lock on a file beside it until it is done. This takes each such lock once,
+  /// which waits for the copy.
+  ///
+  /// # Errors
+  /// `FileError` when a directory cannot be listed. `OutOfMemoryError`.
+  pub effect fn quiet(self: &Self) -> ()
+    ! FileError | OutOfMemoryError
+    ? &mut FileSystem | &mut Allocator {
+    return run awaited(&self.work, false)
   }
 
   /// The events the compiler reported since the last call, in order.
@@ -547,12 +685,23 @@ fn spotted(path: &[u8]) -> Option<Spot> {
   if below(inside, b"src").length != 0 {
     return Option<Spot>.Some { value: Spot.Sources }
   }
-  if inside == b"build" || inside == b"build/cache" || inside == b"build/requests"
-    || below(inside, b"build/cache").length != 0 || below(inside, b"build/requests").length != 0 {
-    return Option<Spot>.Some { value: Spot.Cache }
+  let built = below(inside, b"build")
+  if built.length != 0 && !startsWith(built, b"cache/") && !startsWith(built, b"requests/") {
+    // The program is `build/<target>/<profile>/app`.
+    let mut slashes: usize = 0
+    let mut at: usize = 0
+    while at < built.length {
+      if built[at] == 47 {
+        slashes = slashes + 1
+      }
+      at = at + 1
+    }
+    if slashes == 2 && built.length > 4 && Slice.view<u8>(built, built.length - 4, 4) == b"/app" {
+      return Option<Spot>.Some { value: Spot.Output }
+    }
   }
-  if below(inside, b"build").length != 0 {
-    return Option<Spot>.Some { value: Spot.Output }
+  if inside == b"build" || built.length != 0 {
+    return Option<Spot>.Some { value: Spot.Cache }
   }
   return Option<Spot>.None
 }
@@ -591,7 +740,11 @@ fn said(trail: &[Trail], spot: Spot) -> usize {
     match &trail[at] {
       Trail.Creates { spot: named } => {
         if named == spot {
-          state = if spot == Spot.Cache { 2 } else { 1 }
+          state = if spot == Spot.Cache {
+            2
+          } else {
+            1
+          }
         }
       }
       Trail.Changes { spot: named } => {
@@ -601,7 +754,11 @@ fn said(trail: &[Trail], spot: Spot) -> usize {
       }
       Trail.Removes { spot: named } => {
         if named == spot {
-          state = if state == 1 { 0 } else { 3 }
+          state = if state == 1 {
+            0
+          } else {
+            3
+          }
         }
       }
       _ => {}
@@ -618,6 +775,17 @@ fn fetches(trail: &[Trail], source: Fetch) -> bool {
       if named == source {
         return true
       }
+    }
+    at = at + 1
+  }
+  return false
+}
+
+fn serves(trail: &[Trail]) -> bool {
+  let mut at: usize = 0
+  while at < trail.length {
+    if let Trail.Serves = &trail[at] {
+      return true
     }
     at = at + 1
   }
@@ -673,9 +841,22 @@ effect fn compared(wrong: &mut List<Bytes>, listed: bool, seen: bool, what: &[&[
   if listed == seen {
     return ()
   }
-  let mut line = run Bytes.copy(if listed { b"the trail lists " } else { b"no trail lists " })
+  let mut line = run Bytes.copy(
+    if listed {
+      b"the trail lists "
+    } else {
+      b"no trail lists "
+    },
+  )
   run Bytes.append(&mut line, (run joined(what)).asSlice())
-  run Bytes.append(&mut line, if listed { b", and the run does not show it" } else { b", and the run shows it" })
+  run Bytes.append(
+    &mut line,
+    if listed {
+      b", and the run does not show it"
+    } else {
+      b", and the run shows it"
+    },
+  )
   return run List<Bytes>.append(&mut wrong.*, move line)
 }
 
@@ -690,13 +871,19 @@ effect fn compared(wrong: &mut List<Bytes>, listed: bool, seen: bool, what: &[&[
 /// it and must not be there otherwise. Every file that changed must belong to a spot the trail
 /// lists, and every spot it lists must show the change it says, where the changes of one spot
 /// count together: created when every one is new, removed when every one is gone, changed
-/// otherwise. A spot the trail creates and then removes must show nothing. The compiler must
+/// otherwise. A spot the trail creates and then removes must show nothing, and a cache or a
+/// program the trail changes may show nothing, because the same bytes can be written again. The compiler must
 /// report a fetch, a check, a code generation, a link and a check server exactly when the trail
 /// lists them.
 ///
 /// # Errors
 /// `OutOfMemoryError`.
-pub effect fn judged(trail: &[Trail], outcome: &Outcome, differences: &[Difference], events: &[BuildEvent]) -> List<Bytes>
+pub effect fn judged(
+  trail: &[Trail],
+  outcome: &Outcome,
+  differences: &[Difference],
+  events: &[BuildEvent],
+) -> List<Bytes>
   ! OutOfMemoryError
   ? &mut Allocator {
   let mut wrong = List<Bytes>.make()
@@ -710,7 +897,11 @@ pub effect fn judged(trail: &[Trail], outcome: &Outcome, differences: &[Differen
     at = at + 1
   }
   if status != outcome.status {
-    let line = if outcome.status < 0 { b"the command was ended by a signal" } else { b"the exit status is not the one of the trail" }
+    let line = if outcome.status < 0 {
+      b"the command was ended by a signal"
+    } else {
+      b"the exit status is not the one of the trail"
+    }
     run List<Bytes>.append(&mut wrong, run Bytes.copy(line))
   }
   if holds(outcome.output.asSlice(), b"\x1b[") || holds(outcome.errors.asSlice(), b"\x1b[") {
@@ -758,7 +949,8 @@ pub effect fn judged(trail: &[Trail], outcome: &Outcome, differences: &[Differen
       }
       at = at + 1
     }
-    let seen = holds(outcome.output.asSlice(), mark(note)) || holds(outcome.errors.asSlice(), mark(note))
+    let seen = holds(outcome.output.asSlice(), mark(note))
+      || holds(outcome.errors.asSlice(), mark(note))
     run compared(&mut wrong, listed, seen, &[b"the message ", noteName(note)])
   }
 
@@ -773,7 +965,15 @@ pub effect fn judged(trail: &[Trail], outcome: &Outcome, differences: &[Differen
       if !fetches(trail, Fetch.Template) && !fetches(trail, Fetch.Checkout) {
         run List<Bytes>.append(
           &mut wrong,
-          run joined(&[b"the command ", changeName(difference.change), b" ", path, b", and its trail lists no fetch with git"]),
+          run joined(
+            &[
+              b"the command ",
+              changeName(difference.change),
+              b" ",
+              path,
+              b", and its trail lists no fetch with git",
+            ],
+          ),
         )
       }
       continue
@@ -792,7 +992,13 @@ pub effect fn judged(trail: &[Trail], outcome: &Outcome, differences: &[Differen
         if found == claims.length() {
           run List<Claim>.append(
             &mut claims,
-            Claim { spot: spot, created: false, changed: false, removed: false, path: run Bytes.copy(path) },
+            Claim {
+              spot: spot,
+              created: false,
+              changed: false,
+              removed: false,
+              path: run Bytes.copy(path),
+            },
           )
         }
         let mut all = List<Claim>.asMutSlice(&mut claims)
@@ -811,7 +1017,15 @@ pub effect fn judged(trail: &[Trail], outcome: &Outcome, differences: &[Differen
       Option<Spot>.None => {
         run List<Bytes>.append(
           &mut wrong,
-          run joined(&[b"the command ", changeName(difference.change), b" ", path, b", which no trail names"]),
+          run joined(
+            &[
+              b"the command ",
+              changeName(difference.change),
+              b" ",
+              path,
+              b", which no trail names",
+            ],
+          ),
         )
       }
     }
@@ -846,7 +1060,10 @@ pub effect fn judged(trail: &[Trail], outcome: &Outcome, differences: &[Differen
       }
       each = each + 1
     }
-    if listed != seen {
+
+    // A cache or a program that is written again with the same bytes shows no change.
+    let unseen = listed == 2 && seen == 0 && (spot == Spot.Cache || spot == Spot.Output)
+    if listed != seen && !unseen {
       let words: [&'static [u8]; 4] = [b"leaves", b"creates", b"changes", b"removes"]
       run List<Bytes>.append(
         &mut wrong,
@@ -859,8 +1076,16 @@ pub effect fn judged(trail: &[Trail], outcome: &Outcome, differences: &[Differen
             b", and the command ",
             words[seen],
             b" it",
-            if shown < known.length { b": " } else { b"" },
-            if shown < known.length { known[shown].path.asSlice() } else { b"" },
+            if shown < known.length {
+              b": "
+            } else {
+              b""
+            },
+            if shown < known.length {
+              known[shown].path.asSlice()
+            } else {
+              b""
+            },
           ],
         ),
       )
@@ -883,7 +1108,12 @@ pub effect fn judged(trail: &[Trail], outcome: &Outcome, differences: &[Differen
       }
       at = at + 1
     }
-    run compared(&mut wrong, listed, fetched(events, source), &[b"a fetch of ", sourceNames[asked - 1]])
+    run compared(
+      &mut wrong,
+      listed,
+      fetched(events, source),
+      &[b"a fetch of ", sourceNames[asked - 1]],
+    )
   }
   let works: [Work; 3] = [Work.Check, Work.Codegen, Work.Link]
   let workNames: [&'static [u8]; 3] = [b"a check", b"a code generation", b"a link"]
@@ -933,13 +1163,11 @@ pub interface Binding<E, C> {
   /// Arranges the world so that it gives `answers` to `command`, and gives the words to type
   /// after `silk`. When `command` is something the user does to the disk, such as an edit, it
   /// does that and gives no word.
-  effect fn act(self: &Self, stage: &mut Stage, bench: &Bench, command: &E, answers: &[E]) -> List<Bytes>
+  effect fn act(self: &Self, stage: &mut Stage, bench: &Bench, command: &E, answers: &[E]) -> List<
+    Bytes
+  >
     ! FileError | ProcessError | OutOfMemoryError
     ? &mut FileSystem | &mut ChildProcess | &mut Allocator
-
-  /// The directory below the work directory where `command` is typed, or empty text for the
-  /// work directory itself.
-  fn place(self: &Self, stage: &Stage, command: &E) -> &'static [u8]
 
   /// The context the disk of `stage` shows.
   effect fn observed(self: &Self, stage: &Stage, bench: &Bench) -> C
@@ -950,15 +1178,29 @@ pub interface Binding<E, C> {
   /// [`Binding.observed`].
   fn shown(self: &Self, context: &C) -> C
 
-  /// What is wrong on the disk of `stage` after `command` left `trail`, beyond what [`judged`]
+  /// What is wrong after `command` left `trail` and gave `outcome` back, beyond what [`judged`]
   /// compares, one line for each thing.
-  effect fn sound(self: &Self, stage: &Stage, bench: &Bench, command: &E, trail: &[Trail]) -> List<Bytes>
+  effect fn sound(
+    self: &Self,
+    stage: &Stage,
+    bench: &Bench,
+    command: &E,
+    trail: &[Trail],
+    outcome: &Outcome,
+  ) -> List<Bytes>
     ! FileError | OutOfMemoryError
     ? &mut FileSystem | &mut Allocator
 }
 
 // Whether the disk of `stage` shows `expected`. When it does not, `wrong` gets a line.
-effect fn shows<B: Binding<E, C>, E, C: Schema>(binding: &B, stage: &Stage, bench: &Bench, expected: &C, when: &[u8], wrong: &mut List<Bytes>) -> ()
+effect fn shows<B: Binding<E, C>, E, C: Schema>(
+  binding: &B,
+  stage: &Stage,
+  bench: &Bench,
+  expected: &C,
+  when: &[u8],
+  wrong: &mut List<Bytes>,
+) -> ()
   ! FileError | OutOfMemoryError | SchemaError
   ? &mut FileSystem | &mut Allocator {
   let seen = run json<C>(&binding.shown(&run binding.observed(stage, bench)))
@@ -966,7 +1208,9 @@ effect fn shows<B: Binding<E, C>, E, C: Schema>(binding: &B, stage: &Stage, benc
   if seen.asSlice() != said.asSlice() {
     run List<Bytes>.append(
       &mut wrong.*,
-      run joined(&[when, b" the machine says ", said.asSlice(), b" and the disk shows ", seen.asSlice()]),
+      run joined(
+        &[when, b" the machine says ", said.asSlice(), b" and the disk shows ", seen.asSlice()],
+      ),
     )
   }
   return ()
@@ -979,7 +1223,11 @@ effect fn shows<B: Binding<E, C>, E, C: Schema>(binding: &B, stage: &Stage, benc
 /// `FileError` when the stage cannot be read or written. `ProcessError` when the tool does not
 /// start. `SchemaError` when a context cannot be written as JSON, or the file of events is not
 /// one. `OutOfMemoryError`.
-pub effect fn taken<B: Binding<E, C>, E: Schema, C: Schema>(binding: &B, bench: &Bench, trip: &Trip<E, C, Trail>) -> List<Bytes>
+pub effect fn taken<B: Binding<E, C>, E: Schema, C: Schema>(
+  binding: &B,
+  bench: &Bench,
+  trip: &Trip<E, C, Trail>,
+) -> List<Bytes>
   ! FileError | ProcessError | SchemaError | OutOfMemoryError
   ? &mut FileSystem | &mut ChildProcess | &mut Allocator {
   let mut stage = run bench.stage(String.utf8Bytes(trip.name.view()))
@@ -994,16 +1242,30 @@ pub effect fn taken<B: Binding<E, C>, E: Schema, C: Schema>(binding: &B, bench: 
     let words = run binding.act(&mut stage, bench, &leg.command, leg.answers.asSlice())
     let mut heard = Option<Outcome>.none()
     if words.length() != 0 {
-      let inside = binding.place(&stage, &leg.command)
-      let directory = if inside.length == 0 { run Path.fromBytes(Path.rawBytes(&stage.work)) } else { run Path.joinBytes(&stage.work, inside) }
+      let inside = stage.inside
+      let directory = if inside.length == 0 {
+        run Path.fromBytes(Path.rawBytes(&stage.work))
+      } else {
+        run Path.joinBytes(&stage.work, inside)
+      }
       drop run stage.reported()
       let first = run stage.pictured(bench)
       let outcome = run stage.typed(bench, &directory, words.asSlice())
+      if serves(leg.footprint.asSlice()) {
+        run stage.settled(bench)
+      }
+      run stage.quiet()
       let second = run stage.pictured(bench)
       let differences = run first.differences(&second)
       let events = run stage.reported()
       wrong = run judged(leg.footprint.asSlice(), &outcome, differences.asSlice(), events.asSlice())
-      let mut more = run binding.sound(&stage, bench, &leg.command, leg.footprint.asSlice())
+      let mut more = run binding.sound(
+        &stage,
+        bench,
+        &leg.command,
+        leg.footprint.asSlice(),
+        &outcome,
+      )
       while more.length() != 0 {
         run List<Bytes>.append(&mut wrong, List<Bytes>.remove(&mut more, 0))
       }
@@ -1012,7 +1274,9 @@ pub effect fn taken<B: Binding<E, C>, E: Schema, C: Schema>(binding: &B, bench: 
     run shows<B, E, C>(binding, &stage, bench, &leg.state, b"after the command", &mut wrong)
     if wrong.length() != 0 {
       let mut report = List<Bytes>.make()
-      let mut line = run Bytes.copy(b"at ")
+      let mut line = run Bytes.copy(b"at command ")
+      run counted(&mut line, at)
+      run Bytes.append(&mut line, b", ")
       run Bytes.append(&mut line, (run json<E>(&leg.command)).asSlice())
       if words.length() != 0 {
         run Bytes.append(&mut line, b": silk")
@@ -1029,12 +1293,20 @@ pub effect fn taken<B: Binding<E, C>, E: Schema, C: Schema>(binding: &B, bench: 
         run List<Bytes>.append(&mut report, List<Bytes>.remove(&mut wrong, 0))
       }
       if let Option<Outcome>.Some { value } = &heard {
-        run List<Bytes>.append(&mut report, run joined(&[b"standard output: ", value.output.asSlice()]))
-        run List<Bytes>.append(&mut report, run joined(&[b"standard error: ", value.errors.asSlice()]))
+        run List<Bytes>.append(
+          &mut report,
+          run joined(&[b"standard output: ", value.output.asSlice()]),
+        )
+        run List<Bytes>.append(
+          &mut report,
+          run joined(&[b"standard error: ", value.errors.asSlice()]),
+        )
       }
+      run FileSystem.removeDirectoryRecursively(&stage.runtime)
       return move report
     }
   }
+  run FileSystem.removeDirectoryRecursively(&stage.runtime)
   if wrong.length() == 0 {
     run FileSystem.removeDirectoryRecursively(&stage.directory)
   }

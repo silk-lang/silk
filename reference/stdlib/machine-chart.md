@@ -276,6 +276,17 @@ The position of the row among the rows of its kind.
 pub effects: Intrinsic.StaticSequence<X>
 ```
 
+<a id="Leaves.condition"></a>
+
+### Field `condition`
+
+```silk
+pub condition: Intrinsic.StaticSequence<Guard>
+```
+
+The guard of [`Chart.leavesWhen`](#Chart.impl.leavesWhen): the row leaves the effects only when it holds. Empty
+for [`Chart.leaves`](#Chart.impl.leaves).
+
 <a id="Awaited"></a>
 
 ## `Awaited`
@@ -977,6 +988,38 @@ of the states the row leaves and before the entry functions of the states it ent
 A row without a target queues them and changes no state. For each effect the machine
 first calls `Machine.absorb`, so the context can take in what the effect means. The
 `Definition` of the machine keeps the effects as text.
+
+#### Gotchas
+It is a compile error when the chart has no row yet.
+
+<a id="Chart.impl.leavesWhen"></a>
+
+### Associated function `leavesWhen`
+
+```silk
+pub static fn leavesWhen<G>(chart: Chart<S, E, C, X>, condition: G, effects: &[X]) -> Chart<
+    S,
+    E,
+    C,
+    X
+  >
+```
+
+Says that the last row added also leaves `effects`, in this order, when `condition`
+holds as the row is taken.
+
+#### When to use
+Use it for a part of a row's footprint that depends on the context, such as a note the
+row prints only when a project pins another version. It keeps one row for one decision
+where two rows with two guards would differ in one effect.
+
+#### Details
+`condition` is a function `fn(&C) -> bool` or a [`Guard`](#Guard) of such functions, whatever
+the kind of the row. It sees the context after `Machine.handle` ran for the event and
+before the context absorbed any effect of the row, so two guards of one row never see
+what the other's effects changed. The effects keep their place among the other `leaves`
+of the row. The `Definition` of the machine keeps each effect as text followed by
+` when ` and the name of the guard. One row takes at most 63 lists of effects.
 
 #### Gotchas
 It is a compile error when the chart has no row yet.

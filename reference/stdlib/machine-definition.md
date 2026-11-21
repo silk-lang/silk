@@ -108,7 +108,8 @@ Whether the target is entered from its history, as it was when its chart last le
 pub leaves: List<String>
 ```
 
-The effects the transition leaves, from `Chart.leaves`, each as a program writes it.
+The effects the transition leaves, from `Chart.leaves`, each as a program writes it. An
+effect of `Chart.leavesWhen` ends in ` when ` and the name of its guard, or `guarded`.
 
 <a id="TransitionDefinition.meta"></a>
 
@@ -164,7 +165,8 @@ The name of the condition, from `Guards.named`, or an empty string when it has n
 pub leaves: List<String>
 ```
 
-The effects the transition leaves, from `Chart.leaves`, each as a program writes it.
+The effects the transition leaves, from `Chart.leaves`, each as a program writes it. An
+effect of `Chart.leavesWhen` ends in ` when ` and the name of its guard, or `guarded`.
 
 <a id="DelayDefinition"></a>
 
@@ -200,7 +202,8 @@ pub target: String
 pub leaves: List<String>
 ```
 
-The effects the transition leaves, from `Chart.leaves`, each as a program writes it.
+The effects the transition leaves, from `Chart.leaves`, each as a program writes it. An
+effect of `Chart.leavesWhen` ends in ` when ` and the name of its guard, or `guarded`.
 
 <a id="RegionDefinition"></a>
 
