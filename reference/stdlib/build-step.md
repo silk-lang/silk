@@ -374,7 +374,8 @@ pub effect fn packageTree(self: &mut Self, value: &Deferred<Path>) -> ()
     ? &mut Allocator
 ```
 
-Declares package contents, excluding the root `build` directory and `.git` metadata.
+Declares package contents, excluding the root `build`, `.git` and `node_modules` directories.
+A symbolic link that leaves the package counts by its target path and is not followed.
 Generated inputs below `build` must be declared separately through their producer.
 
 <a id="Key.impl.value"></a>
@@ -424,7 +425,8 @@ pub effect fn packageTrees(self: &mut Self, paths: &Deferred<List<String>>) -> (
     ? &mut Allocator
 ```
 
-Declares deferred package directories, excluding each root's build and version-control data.
+Declares deferred package directories, excluding each root's `build`, `.git` and
+`node_modules` directories. A symbolic link that leaves a package counts by its target path.
 
 <a id="Key.impl.environment"></a>
 

@@ -83,8 +83,9 @@ pub effect fn package(hash: &mut Sha256, input: &Path, output: &Path) -> ()
   ? &mut FileSystem | &mut Allocator
 ```
 
-Hashes package files, excluding build outputs and version-control metadata at package roots.
-`output` is the current workspace output directory, excluded at any depth.
+Hashes package files, excluding `build`, `.git` and `node_modules` at package roots.
+`output` is the current workspace output directory, excluded at any depth. A symbolic link that
+leaves the package adds its target path and is not followed.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`, `wasm64-unknown-unknown`.
