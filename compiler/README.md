@@ -323,7 +323,10 @@ What a trace holds, from the outside in:
 
 With `--trace-queries`, each run of a semantic query is a span named for its family, such as
 `query.Body` or `query.Mir`, with the declaration it is about as `subject`, and each borrow check
-is a `borrow.check`. They nest as the queries demanded each other, so the tree under a
+is a `borrow.check`. A run about a declaration says where it is written: its package as
+`silk.package`, its module's path in the package as `code.file.path`, and the line and column of
+its header as `code.line.number` and `code.column.number`. A borrow check gives the package and
+path, and its parent query run the line. They nest as the queries demanded each other, so the tree under a
 `check.module` or a `codegen.walk` is the order the work was done in. A build runs hundreds of
 thousands of them: the value is the number of microseconds a run must take to be written, `0` for
 every one. A shorter run is written too when a span below it is, such as the parse of a file an

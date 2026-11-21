@@ -351,6 +351,18 @@ pub droppedLinks: u64
 
 Number of links omitted at the per-span limit.
 
+<a id="Span.thread"></a>
+
+### Field `thread`
+
+```silk
+pub thread: u64
+```
+
+The operating system's identifier of the thread that opened this span, written as
+`thread.id`; zero where the target gives none. A span whose fiber moves to another thread
+keeps the thread it opened on.
+
 <a id="Span.impl.Copy"></a>
 
 ## Implementation `Copy for Span`
