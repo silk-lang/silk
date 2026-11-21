@@ -1,0 +1,349 @@
+//! What a `silk` command did, as a file of events: [`BuildEvent`] and [`BuildEvents`].
+//!
+//! # When to use
+//! Use this module in a tool that must know what a build or a check really did: whether it
+//! compiled or found the program already built, whether it ran the linker, whether it asked the
+//! network, whether a check server answered. Files and timings cannot tell these apart. Set the
+//! environment variable `SILK_EVENTS` to the path of a file before a `silk` command, and read the
+//! file with [`BuildEvents.read`] after it.
+//!
+//! # Details
+//! With `SILK_EVENTS` set, the compiler appends one MessagePack value to the file for each
+//! [`BuildEvent`], in the order things happen, and creates the file when it is not there. Each
+//! value is a `BuildEvent` as `silk.schema.msgpack.SchemaMsgpack` writes it. The file is a plain
+//! sequence of values with nothing between them.
+//!
+//! Each event is appended with one write, so the events of several processes that share the file,
+//! such as the members of a workspace built side by side, do not mix inside a value.
+//!
+//! # Gotchas
+//! - The compiler never truncates the file. Remove it before a command to see only that command.
+//! - A unit that was already built reports [`BuildEvent.Finished`] with no [`BuildEvent.Phase`]
+//!   before it.
+//! - [`BuildEvents.write`] and [`BuildEvents.append`] write on Darwin and on Linux with GNU libc, on
+//!   x86_64 and aarch64. On other targets they write nothing and answer `false`.
+//!
+//! # Examples
+//! ## Write two events and read them back
+//! ```silk
+//! import silk.build.events { BuildEvent, BuildEvents, Work }
+//! import silk.collections.list { List }
+//! import silk.core.effect { Effect }
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.schema.issue { SchemaError }
+//! import silk.text.string { String }
+//!
+//! effect fn program() -> i32
+//!   ! SchemaError | OutOfMemoryError
+//!   ? &mut Allocator {
+//!   let mut bytes = run BuildEvents.encoded(
+//!     &BuildEvent.Phase { unit: run String.copy("hello"), work: Work.Link },
+//!   )
+//!   let second = run BuildEvents.encoded(
+//!     &BuildEvent.Finished { unit: run String.copy("hello"), passed: true },
+//!   )
+//!   run bytes.append(second.asSlice())
+//!   let events = run BuildEvents.read(bytes.asSlice())
+//!   if events.length() != 2 {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//!
+//! pub effect fn main() -> i32 {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let done = run Effect.result(program()) |> Effect.provideMut<Allocator>(&mut allocator)
+//!   return done.unwrapOr(2)
+//! }
+//! ```
+
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.io.writer { Writer, WriterError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.msgpack.scanner { MsgpackError, MsgpackScanner, MsgpackToken }
+import silk.schema.issue { Issue, IssueReason, SchemaError }
+import silk.schema.msgpack { SchemaMsgpack }
+import silk.schema.path { SchemaPath }
+import silk.schema.schema { Schema }
+import silk.text.string { String }
+
+static if (Intrinsic.targetOperatingSystem() == "darwin" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64") && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")) {
+  import silk.platform.native.file {
+    NativeFile,
+    NativeFileError,
+    OPEN_APPEND,
+    OPEN_CLOSE_ON_EXEC,
+    OPEN_CREATE,
+    OPEN_WRITE_ONLY,
+  }
+}
+
+/// One kind of work a compilation unit does, in the order a build does them.
+pub enum Work {
+  /// Reading the manifest and the sources.
+  Load,
+  /// Reading what the last build or check of the unit left in its cache.
+  Cache,
+  /// Checking the modules that the cache does not answer for.
+  Check,
+  /// Generating code.
+  Codegen,
+  /// Optimizing a whole module before the link.
+  Optimize,
+  /// Linking the program.
+  Link,
+}
+
+/// Something a command fetches from the network or from a `file:` URL.
+pub enum Fetch {
+  /// The repository of a project template, for `silk init`.
+  Template,
+  /// The archive of a dependency.
+  Archive,
+  /// One commit of the repository of a git dependency.
+  Checkout,
+}
+
+/// One thing a `silk` command did.
+pub union BuildEvent {
+  /// The unit `unit`, a package by its name, starts one kind of work.
+  Phase { pub unit: String, pub work: Work },
+  /// The unit `unit` ended. `passed` is false when it reported errors. A unit that reports this
+  /// with no `Phase` before it was already built, and nothing was done.
+  Finished { pub unit: String, pub passed: bool },
+  /// The command starts to fetch something. The event comes before the fetch, so it is also
+  /// there when the fetch fails.
+  Fetching { pub source: Fetch },
+  /// The check left a check server behind, which answers the next checks of the project.
+  ServerStarted,
+  /// A check server that an earlier check left behind answered this check.
+  ServerAnswered,
+}
+
+impl Schema for Work {}
+
+impl Schema for Fetch {}
+
+impl Schema for BuildEvent {}
+
+// A writer that counts the bytes it is given.
+struct Counter {
+  size: usize,
+}
+
+impl Writer for Counter {
+  effect fn writeAll(self: &mut Self, data: &[u8]) -> () ! WriterError {
+    self.size = self.size + data.length
+  }
+
+  effect fn flush(self: &mut Self) -> () ! WriterError {}
+}
+
+// A writer that fills bytes whose capacity was reserved.
+struct Buffer {
+  bytes: Bytes,
+}
+
+impl Writer for Buffer {
+  effect fn writeAll(self: &mut Self, data: &[u8]) -> () ! WriterError {
+    if !self.bytes.appendSliceWithinCapacity(data) {
+      fail Writer.failure()
+    }
+  }
+
+  effect fn flush(self: &mut Self) -> () ! WriterError {}
+}
+
+// Moves `scanner` past one whole value. False when the input ends or is not MessagePack.
+fn passed(scanner: &mut MsgpackScanner<'_>) -> bool {
+  let mut waiting: usize = 1
+  while waiting > 0 {
+    match scanner.next() {
+      Result<MsgpackToken, MsgpackError>.Success { value } => match value {
+        MsgpackToken.Array { count } => {
+          waiting = waiting + count
+        }
+        MsgpackToken.Map { count } => {
+          waiting = waiting + count + count
+        }
+        MsgpackToken.EndOfInput => {
+          return false
+        }
+        _ => {}
+      }
+      Result<MsgpackToken, MsgpackError>.Failure { .. } => {
+        return false
+      }
+    }
+    waiting = waiting - 1
+  }
+  return true
+}
+
+/// The file of events that `SILK_EVENTS` names: writing one event to it, and reading them all.
+pub struct BuildEvents {}
+
+impl BuildEvents {
+  /// The name of the environment variable that holds the path of the file: `SILK_EVENTS`.
+  pub fn variable() -> string<'static> {
+    return "SILK_EVENTS"
+  }
+
+  /// `event` as one MessagePack value, as the file holds it.
+  ///
+  /// # Errors
+  /// - `SchemaError` when MessagePack cannot hold the event: a unit name longer than 4294967295
+  ///   bytes.
+  /// - `OutOfMemoryError` when the `Allocator` cannot supply the bytes.
+  pub effect fn encoded(event: &BuildEvent) -> Bytes
+    ! SchemaError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut counter = Counter { size: 0 }
+    let counted = run Effect.result(SchemaMsgpack.encode<BuildEvent>(event))
+      |> Effect.provideMut<Writer>(&mut counter)
+    match move counted {
+      Result<(), SchemaError | WriterError | OutOfMemoryError>.Success { .. } => {}
+      Result<(), SchemaError | WriterError | OutOfMemoryError>.Failure { error } => match move error {
+        SchemaError refused => {
+          fail move refused
+        }
+        WriterError { .. } => Intrinsic.trap("a counting writer takes every byte")
+        OutOfMemoryError exhausted => {
+          fail move exhausted
+        }
+      }
+    }
+    let mut buffer = Buffer { bytes: run Bytes.makeWithCapacity(counter.size) }
+    let written = run Effect.result(SchemaMsgpack.encode<BuildEvent>(event))
+      |> Effect.provideMut<Writer>(&mut buffer)
+    match move written {
+      Result<(), SchemaError | WriterError | OutOfMemoryError>.Success { .. } => {}
+      Result<(), SchemaError | WriterError | OutOfMemoryError>.Failure { error } => match move error {
+        SchemaError refused => {
+          fail move refused
+        }
+        WriterError { .. } => Intrinsic.trap("the buffer has room for the counted bytes")
+        OutOfMemoryError exhausted => {
+          fail move exhausted
+        }
+      }
+    }
+    return move buffer.bytes
+  }
+
+  /// Opens the file at `path` for [`BuildEvents.write`], and creates it when it is not there.
+  /// Answers its descriptor, or -1 when the file cannot be opened.
+  ///
+  /// # Details
+  /// The descriptor stays open until the process ends, and a program the process starts does not
+  /// get it. A process that reports many events opens the file once and keeps the descriptor.
+  pub effect fn open(path: &[u8]) -> i32 {
+    static if (Intrinsic.targetOperatingSystem() == "darwin" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64") && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")) {
+      let opened = run Effect.result(
+        NativeFile.open(path, OPEN_WRITE_ONLY | OPEN_CREATE | OPEN_APPEND | OPEN_CLOSE_ON_EXEC, 420),
+      )
+      return match move opened {
+        Result<i32, NativeFileError>.Success { value } => value
+        Result<i32, NativeFileError>.Failure { .. } => -1
+      }
+    } else {
+      drop path
+      return -1
+    }
+  }
+
+  /// Appends `event` to the file that [`BuildEvents.open`] opened as `descriptor`. Answers
+  /// whether the event was written. A `descriptor` of -1 writes nothing.
+  ///
+  /// # Details
+  /// The event goes to the file in one write at its end, so events that several processes append
+  /// at once stay whole. An event that cannot be written is lost and nothing else happens: a
+  /// command must not fail because its report could not be written.
+  ///
+  /// # Errors
+  /// `OutOfMemoryError` when the `Allocator` cannot supply the bytes of the event.
+  pub effect fn write(descriptor: i32, event: &BuildEvent) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if descriptor < 0 {
+      return false
+    }
+    let bytes = match move run Effect.result(BuildEvents.encoded(event)) {
+      Result<Bytes, SchemaError | OutOfMemoryError>.Success { value } => move value
+      Result<Bytes, SchemaError | OutOfMemoryError>.Failure { error } => match move error {
+        SchemaError refused => {
+          drop refused
+          return false
+        }
+        OutOfMemoryError exhausted => {
+          fail move exhausted
+        }
+      }
+    }
+    static if (Intrinsic.targetOperatingSystem() == "darwin" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64") && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")) {
+      let wrote = run Effect.result(NativeFile.write(descriptor, bytes.asSlice(), Option<u64>.none()))
+      return match move wrote {
+        Result<usize, NativeFileError>.Success { value } => value == bytes.length()
+        Result<usize, NativeFileError>.Failure { .. } => false
+      }
+    } else {
+      drop bytes
+      return false
+    }
+  }
+
+  /// Appends `event` to the file at `path`, which is created when it is not there. Answers
+  /// whether the event was written.
+  ///
+  /// # Details
+  /// It opens the file, writes the event in one write at its end and closes the file. A file that
+  /// cannot be opened or written loses the event and nothing else happens.
+  ///
+  /// # Errors
+  /// `OutOfMemoryError` when the `Allocator` cannot supply the bytes of the event.
+  pub effect fn append(path: &[u8], event: &BuildEvent) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let descriptor = run BuildEvents.open(path)
+    let written = run BuildEvents.write(descriptor, event)
+    static if (Intrinsic.targetOperatingSystem() == "darwin" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64") && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")) {
+      if descriptor >= 0 {
+        drop run Effect.result(NativeFile.close(descriptor))
+      }
+    }
+    return written
+  }
+
+  /// Reads every event of `bytes`, the content of the file, in order.
+  ///
+  /// # Errors
+  /// - `SchemaError` when `bytes` is not a sequence of whole MessagePack values, or a value is
+  ///   not a `BuildEvent`. A span of its issue is in byte offsets into the value that failed.
+  /// - `OutOfMemoryError` when the `Allocator` cannot supply the events.
+  pub effect fn read(bytes: &[u8]) -> List<BuildEvent>
+    ! SchemaError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut events = List<BuildEvent>.make()
+    let mut scanner = MsgpackScanner.make(bytes)
+    let mut start: usize = 0
+    while start < bytes.length {
+      if !passed(&mut scanner) {
+        fail SchemaError {
+          path: SchemaPath.make(),
+          issue: Issue.make(IssueReason.InvalidSyntax, "a whole MessagePack value"),
+          got: Option<String>.none(),
+        }
+      }
+      let end = scanner.end()
+      let event = run SchemaMsgpack.decode<BuildEvent>(Slice.view<u8>(bytes, start, end - start))
+      run List<BuildEvent>.append(&mut events, move event)
+      start = end
+    }
+    return move events
+  }
+}
