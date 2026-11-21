@@ -13,18 +13,21 @@ import { isVersion } from './SemVer.mjs'
 
 export class SourceSnapshotError extends Data.TaggedError('SourceSnapshotError') {}
 const invalid = (message) => Effect.fail(new SourceSnapshotError({ message }))
-export const roots = ['changes', 'compiler', 'silk.toml', 'stdlib', 'tomledit', 'tool']
+export const roots = ['changes', 'compiler', 'flows', 'silk.toml', 'stdlib', 'tomledit', 'tool']
 /** The compiler package, its source dependencies, and their workspace configuration. */
 export const isCompilerInput = (path) =>
   path === 'silk.toml' ||
   path === 'tool/silk.toml' ||
   path === 'changes/silk.toml' ||
+  path === 'flows/silk.toml' ||
   path.startsWith('compiler/') ||
   path.startsWith('tomledit/')
-// The release archive's `bin/silk`, the silk tool, is built from the same snapshot, with `changes/` as its
-// dependency. Only their manifests, which the workspace needs, are compiler inputs.
+// The release archive's `bin/silk`, the silk tool, is built from the same snapshot, with `changes/` and
+// `flows/` as its dependencies. Only their manifests, which the workspace needs, are compiler inputs.
 const isSnapshotInput = (path) =>
-  isCompilerInput(path) || path.startsWith('stdlib/') || path.startsWith('tool/') || path.startsWith('changes/')
+  isCompilerInput(path) || path.startsWith('stdlib/') || path.startsWith('tool/') ||
+  path.startsWith('changes/') ||
+  path.startsWith('flows/')
 const requiredFiles = ['silk.toml', 'compiler/silk.toml', 'compiler/src/main.silk']
 const completeClosure = (files) =>
   requiredFiles.every((required) => files.some(({ path }) => path === required)) &&
