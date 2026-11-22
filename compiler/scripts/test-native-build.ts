@@ -2700,7 +2700,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     const first = checkedFirst ? ['check', '--no-server'] : ['build']
     const prepared = yield* invoke(silk, [...first, '--stdlib', standardLibrary], project, { ...process.env, SILK_CLANG: clang })
     assert.equal(prepared.status, 0, prepared.stderr)
-    const cache = join(project, 'build/cache', name)
+    const cache = compilerCache(join(project, 'build/cache', name))
     const lock = (yield* fs.readDirectory(cache)).find((entry) => /^semantic-[0-9a-f]{32}\.lock$/.test(entry))
     assert.ok(lock, `${name}: the cache names no lock file`)
     // Stands in for a build's writer: it holds the write lock, and not the one a check's write holds too.
@@ -6045,9 +6045,10 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     assert.equal(built.status, 0, built.stderr)
   })
   const memberImage = Effect.fnUntraced(function* (member: string) {
-    const names = (yield* fs.readDirectory(join(pair, 'build/cache', member))).filter((name) => /^semantic-[0-9a-f]{32}$/.test(name))
+    const cache = compilerCache(join(pair, 'build/cache', member))
+    const names = (yield* fs.readDirectory(cache)).filter((name) => /^semantic-[0-9a-f]{32}$/.test(name))
     assert.equal(names.length, 1, `expected one semantic cache for ${member}, found ${names.join(', ')}`)
-    return join(pair, 'build/cache', member, names[0])
+    return join(cache, names[0])
   })
   yield* memberBuild('first')
   const firstImage = yield* memberImage('first')
