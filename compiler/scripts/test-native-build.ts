@@ -2,7 +2,7 @@
 import { strict as assert } from 'node:assert'
 import { createHash } from 'node:crypto'
 import { spawn, spawnSync, type SpawnSyncReturns } from 'node:child_process'
-import { existsSync, readdirSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -42,11 +42,16 @@ const settleCaches = (cwd: string) => {
   const directories = (path: string) =>
     existsSync(path) ? readdirSync(path, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => join(path, entry.name)) : []
   const caches = [cwd, ...directories(cwd)].map((root) => join(root, 'build', 'cache'))
-  const locks = caches.flatMap(directories).flatMap((cache) => readdirSync(cache).filter((name) => name.endsWith('.lock')).map((name) => join(cache, name)))
+  // Each compiler keeps its files in a directory below its package's (`SemanticCache.directory`).
+  const locks = caches.flatMap(directories).flatMap(directories).flatMap((cache) => readdirSync(cache).filter((name) => name.endsWith('.lock')).map((name) => join(cache, name)))
   if (locks.length === 0) return
   const waited = spawnSync('python3', ['-c', 'import fcntl, sys\nfor path in sys.argv[1:]:\n    fcntl.flock(open(path), fcntl.LOCK_SH)', ...locks], { encoding: 'utf8' })
   assert.equal(waited.status, 0, waited.stderr)
 }
+// The directory of the compiler that used `packageCache`, a package's cache directory, last: the
+// first one its `compilers` file names.
+const compilerCache = (packageCache: string) =>
+  join(packageCache, readFileSync(join(packageCache, 'compilers'), 'utf8').split('\n')[0])
 const invoke = Effect.fnUntraced(function* (
   command: string,
   args: ReadonlyArray<string>,
@@ -330,7 +335,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   // The compilation builds outside its step with the package cache, so the next one after an edit
   // reuses the checks of what it did not change.
   assert.ok(yield* fs.exists(join(requestRoot, 'custom-output/steps/compilations/x86_64-unknown-linux-gnu/dev/request-fixture')))
-  const graphCache = join(requestRoot, 'custom-output/cache/request-fixture')
+  const graphCache = compilerCache(join(requestRoot, 'custom-output/cache/request-fixture'))
   assert.ok((yield* fs.readDirectory(graphCache)).some((name) => name.startsWith('semantic-')), 'the graph compilation keeps a semantic cache')
   const embedded = yield* fs.readFileString(join(requestRoot, 'main.silk'))
   yield* fs.writeFileString(join(requestRoot, 'main.silk'), embedded.replace('{ return 8 }', '{ return 9 }'))
@@ -2696,7 +2701,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     const first = checkedFirst ? ['check', '--no-server'] : ['build']
     const prepared = yield* invoke(silk, [...first, '--stdlib', standardLibrary], project, { ...process.env, SILK_CLANG: clang })
     assert.equal(prepared.status, 0, prepared.stderr)
-    const cache = join(project, 'build/cache', name)
+    const cache = compilerCache(join(project, 'build/cache', name))
     const lock = (yield* fs.readDirectory(cache)).find((entry) => /^semantic-[0-9a-f]{32}\.lock$/.test(entry))
     assert.ok(lock, `${name}: the cache names no lock file`)
     // Stands in for a build's writer: it holds the write lock, and not the one a check's write holds too.
@@ -3555,7 +3560,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   }
   // Each profile keeps its own cache file, and a file per profile names it, so the next build in
   // either profile prefetches its own file rather than none.
-  const orderedCache = join(ordered, 'build/cache/ordered')
+  const orderedCache = compilerCache(join(ordered, 'build/cache/ordered'))
   const orderedEntries = yield* fs.readDirectory(orderedCache)
   const profileImages = orderedEntries.filter((name) => /^semantic-[0-9a-f]{32}$/.test(name)).sort()
   assert.equal(profileImages.length, 2, `expected a cache file per profile, found ${profileImages.join(', ')}`)
@@ -5534,7 +5539,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   // The cache keeps each module's LLVM text as a file of its own beside the image, named by its
   // digest, so an unchanged rebuild finds every module's text where the last build left it.
   const packNames = Effect.fnUntraced(function* () {
-    const cache = join(split, 'build/cache/split')
+    const cache = compilerCache(join(split, 'build/cache/split'))
     const folders = (yield* fs.readDirectory(cache)).filter((name) => name.endsWith('.packs'))
     assert.equal(folders.length, 1, `expected one pack folder, found ${folders.join(', ')}`)
     return (yield* fs.readDirectory(join(cache, folders[0]))).sort()
@@ -5548,7 +5553,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   assert.doesNotMatch(firstRebuild.stdout + firstRebuild.stderr, /^\s+load\s/m, 'the first rebuild after a cold build loads nothing')
   // A load reads an unchanged file's imports from the summaries the last load kept beside the
   // cache instead of parsing the file, so an unchanged rebuild leaves them as they were.
-  const importSummaries = join(split, 'build/cache/split/imports')
+  const importSummaries = join(compilerCache(join(split, 'build/cache/split')), 'imports')
   const summarizedAt = (yield* fs.stat(importSummaries)).mtime
   // An unchanged rebuild links nothing either: the executable stays the file the last link wrote.
   const splitExecutable = join(split, `build/${hostTarget}/dev/split`)
@@ -6043,9 +6048,10 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     assert.equal(built.status, 0, built.stderr)
   })
   const memberImage = Effect.fnUntraced(function* (member: string) {
-    const names = (yield* fs.readDirectory(join(pair, 'build/cache', member))).filter((name) => /^semantic-[0-9a-f]{32}$/.test(name))
+    const cache = compilerCache(join(pair, 'build/cache', member))
+    const names = (yield* fs.readDirectory(cache)).filter((name) => /^semantic-[0-9a-f]{32}$/.test(name))
     assert.equal(names.length, 1, `expected one semantic cache for ${member}, found ${names.join(', ')}`)
-    return join(pair, 'build/cache', member, names[0])
+    return join(cache, names[0])
   })
   yield* memberBuild('first')
   const firstImage = yield* memberImage('first')
