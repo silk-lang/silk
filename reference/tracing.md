@@ -164,6 +164,10 @@ package that produced a decorated span.
 `trace_processor`. A span is a slice on the track of the thread that opened it, a log is an
 instant on the process's `log` track, and each metric series and counter sample is a counter
 track; a histogram is left out. Packets of several processes appended to one file form one
-trace, as each process interns its names in a sequence of its own.
+trace, as each process interns its names in a sequence of its own. Each span carries its ID and
+its parent's, and each log the ID of the span current when it was written; the trace ID is
+written when a sequence moves to another trace. `PerfettoReader` decodes such a trace back into
+tracks, slices, instants and samples with those IDs, from whole packets at a time, so a reader can
+follow a file that its writer still appends to.
 
-[OTLP JSON encoding](../corpus/native/trace-otlp-json/main.silk) · [Retry behavior](../corpus/native/trace-otlp-retry/main.silk)
+[OTLP JSON encoding](../corpus/native/trace-otlp-json/main.silk) · [Retry behavior](../corpus/native/trace-otlp-retry/main.silk) · [Perfetto round trip](../corpus/native/trace-perfetto/main.silk)

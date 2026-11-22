@@ -1,10 +1,12 @@
-//! Perfetto trace encoding for recorder batches and counter samples.
+//! Perfetto trace encoding and decoding for recorder batches and counter samples.
 //!
 //! A Perfetto trace is a sequence of `TracePacket` messages, each one written as field 1 of the
 //! `Trace` message. Bytes made of whole packets are a trace on their own, and so is a file that
 //! several writers append whole packets to. The Perfetto UI and `trace_processor` open it, with each
 //! span as a slice on the track of the thread that opened it, each log as an instant on the
 //! process's `log` track, and each metric series and counter sample as a counter track.
+//! [`Perfetto`] writes such a trace a batch at a time, and [`PerfettoReader`] reads one back a
+//! chunk at a time, so a reader can follow a file that a running program still appends to.
 
 import silk.collections.bytes { Bytes }
 import silk.collections.hash { Hash }
@@ -12,6 +14,8 @@ import silk.collections.hash_map { HashMap }
 import silk.collections.list { List }
 import silk.collections.slice { Slice }
 import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
 import silk.io.writer { Writer, WriterError }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.f64
@@ -21,10 +25,11 @@ import silk.num.u8
 import silk.num.u64
 import silk.num.usize
 import silk.text.format { Format }
-import silk.text.string { String }
+import silk.text.string { InvalidUtf8, String }
 import silk.trace.otlp { Batch, Resource }
 import silk.trace.record { Span }
 import silk.trace.signals { InstrumentKind, LogRecord, MetricPoint }
+import silk.trace.context { SpanContext }
 import silk.trace.sink { Sink }
 import silk.trace.values { Attributes, Value }
 
@@ -51,6 +56,16 @@ struct Series {
 // text: event names, debug annotation names, and debug annotation string values.
 enum Table { Names, Keys, Strings }
 
+// The interned keys of the IDs an event carries, zero for one it leaves out.
+struct IdKeys {
+  span: u64,
+  parent: u64,
+  high: u64,
+  low: u64,
+}
+
+impl Copy for IdKeys {}
+
 const SEQ_INCREMENTAL_STATE_CLEARED: u64 = 1
 const SEQ_NEEDS_INCREMENTAL_STATE: u64 = 2
 const TYPE_SLICE_BEGIN: u64 = 1
@@ -70,10 +85,15 @@ const TYPE_COUNTER: u64 = 4
 /// The process ID numbers the sequence, so the packets of processes that append to one file at
 /// the same time keep their interned names apart. A span becomes a slice on the track of the
 /// thread that opened it, or on the process's `spans` track when the target gives no thread ID,
-/// with its attributes, source location and error as arguments. A log becomes an instant named
-/// by its template on the process's `log` track, with its message and severity. Each metric series
-/// becomes a counter track named by its instrument and attributes; a histogram has no single value
-/// over time and is left out. Times are the recorder's Unix nanoseconds.
+/// with its attributes, source location and error as arguments, and its ID and its parent's as
+/// `span.id` and `parent.id`. The trace a span belongs to is written as `trace.id.high` and
+/// `trace.id.low` on the first span of each trace in a row, and holds for the spans after it in
+/// the sequence, so a reader rebuilds every parent link and trace whatever thread or process a
+/// parent ran on ([`PerfettoReader`]). A log becomes an instant named by its template on the
+/// process's `log` track, with its message, severity and the IDs of the span current when it was
+/// written. Each metric series becomes a counter track named by its instrument and attributes; a
+/// histogram has no single value over time and is left out. Times are the recorder's Unix
+/// nanoseconds.
 ///
 /// # Gotchas
 /// A trace viewer nests slices by their times. Two spans of one thread that start at the same
@@ -94,6 +114,10 @@ pub struct Perfetto {
   series: List<Series>,
   // Whether the process's `log` track was written.
   logged: bool,
+  // The trace whose spans the sequence writes now, as its last `trace.id` fields named it; zero
+  // before any.
+  traceHigh: u64,
+  traceLow: u64,
   // The offset of the open `InternedData` of the packet being written, or zero for none.
   interned: usize,
   // What one batch encodes to when the sequence writes to a `Writer` as a sink.
@@ -164,6 +188,19 @@ fn close(out: &mut Bytes, at: usize) -> () {
   bytes[at - 1] = u64.wrappingToU8(u64.bitAnd(u64.shiftRight(size, 21), 127))
 }
 
+// A debug annotation whose interned key is `name` and whose varint field `field` holds `value`.
+// Its two varints take at most 23 bytes, so its length takes one byte where `open` takes four.
+effect fn smallArgument(out: &mut Bytes, name: u64, field: u64, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  run varint(&mut out.*, key(4, 2))
+  run out.append(b"\x00")
+  let at = out.length()
+  run number(&mut out.*, 1, name)
+  run number(&mut out.*, field, value)
+  let size = usize.toU64(out.length() - at)
+  let bytes = out.asMutSlice()
+  bytes[at - 1] = u64.wrappingToU8(size)
+}
+
 // A track identifier for `value` within the process `pid`; zero is never one.
 fn uuid(pid: i32, value: u64) -> u64 {
   let hashed = Hash.combine(Hash.mix(&Hash.seed(1953260658), i32.wrappingToU64(pid)), value)
@@ -197,6 +234,8 @@ impl Perfetto {
       counters: HashMap<string<'static>, u64>.make(Hash.seed(0)),
       series: List<Series>.make(),
       logged: false,
+      traceHigh: 0,
+      traceLow: 0,
       interned: 0,
       buffer: Bytes.make(),
     }
@@ -390,10 +429,39 @@ impl Perfetto {
 
   // A debug annotation `name` whose value is the interned static string `value`.
   effect fn staticArgument(self: &mut Self, name: u64, value: u64, out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
-    let annotation = run open(&mut out.*, 4)
-    run number(&mut out.*, 1, name)
-    run number(&mut out.*, 17, value)
-    close(&mut out.*, annotation)
+    return run smallArgument(&mut out.*, name, 17, value)
+  }
+
+  // A debug annotation `name` whose value is the unsigned `value`.
+  effect fn unsignedArgument(self: &mut Self, name: u64, value: u64, out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+    return run smallArgument(&mut out.*, name, 3, value)
+  }
+
+  // Interns the keys of the IDs that place an event of `context` in its trace, under `parent`
+  // when it has one, before the event opens: `trace.id.*` only when the sequence's trace changes.
+  effect fn internIds(self: &mut Self, context: &SpanContext, parent: u64, out: &mut Bytes) -> IdKeys
+    ! OutOfMemoryError ? &mut Allocator {
+    let mut keys = IdKeys {span: 0, parent: 0, high: 0, low: 0}
+    keys.span = run self.intern(Table.Keys, "span.id", &mut out.*)
+    if parent != 0 { keys.parent = run self.intern(Table.Keys, "parent.id", &mut out.*) }
+    if context.traceHigh != self.traceHigh || context.traceLow != self.traceLow {
+      keys.high = run self.intern(Table.Keys, "trace.id.high", &mut out.*)
+      keys.low = run self.intern(Table.Keys, "trace.id.low", &mut out.*)
+    }
+    return keys
+  }
+
+  // Writes the IDs `internIds` interned the keys of, and makes `context`'s trace the sequence's.
+  effect fn writeIds(self: &mut Self, keys: IdKeys, context: &SpanContext, parent: u64, out: &mut Bytes) -> ()
+    ! OutOfMemoryError ? &mut Allocator {
+    run self.unsignedArgument(keys.span, context.span, &mut out.*)
+    if keys.parent != 0 { run self.unsignedArgument(keys.parent, parent, &mut out.*) }
+    if keys.high != 0 {
+      run self.unsignedArgument(keys.high, context.traceHigh, &mut out.*)
+      run self.unsignedArgument(keys.low, context.traceLow, &mut out.*)
+      self.traceHigh = context.traceHigh
+      self.traceLow = context.traceLow
+    }
   }
 
   effect fn span(self: &mut Self, item: &Span, out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
@@ -418,11 +486,13 @@ impl Perfetto {
     let failureKey = if failure != 0 { run self.intern(Table.Keys, "exception.type", &mut out.*) } else { 0 }
     let errorKey = if item.error { run self.intern(Table.Keys, "error", &mut out.*) } else { 0 }
     let cancelledKey = if item.cancelled { run self.intern(Table.Keys, "silk.cancelled", &mut out.*) } else { 0 }
+    let ids = run self.internIds(&item.context, item.parent.span, &mut out.*)
     self.endInterned(&mut out.*)
     let event = run open(&mut out.*, 11)
     run number(&mut out.*, 9, TYPE_SLICE_BEGIN)
     run number(&mut out.*, 11, track)
     run number(&mut out.*, 10, name)
+    run self.writeIds(ids, &item.context, item.parent.span, &mut out.*)
     run self.arguments(&item.attributes, &mut out.*)
     if function != 0 { run self.staticArgument(functionKey, function, &mut out.*) }
     if file != 0 { run self.staticArgument(fileKey, file, &mut out.*) }
@@ -472,11 +542,18 @@ impl Perfetto {
     let message = run self.intern(Table.Keys, "message", &mut out.*)
     let severity = run self.intern(Table.Keys, "severity", &mut out.*)
     run self.internAttributes(&item.attributes, &mut out.*)
+    let mut ids = IdKeys {span: 0, parent: 0, high: 0, low: 0}
+    if let Option<SpanContext>.Some {value} = &item.context {
+      ids = run self.internIds(&value, 0, &mut out.*)
+    }
     self.endInterned(&mut out.*)
     let event = run open(&mut out.*, 11)
     run number(&mut out.*, 9, TYPE_INSTANT)
     run number(&mut out.*, 11, track)
     run number(&mut out.*, 10, name)
+    if let Option<SpanContext>.Some {value} = &item.context {
+      run self.writeIds(ids, &value, 0, &mut out.*)
+    }
     let body = run open(&mut out.*, 4)
     run number(&mut out.*, 1, message)
     run text(&mut out.*, 6, String.utf8Bytes(item.body.view()))
@@ -592,4 +669,597 @@ effect fn appendValue(out: &mut Bytes, item: &Value) -> () ! OutOfMemoryError ? 
     Value.Double {value} => Format.writeF64Debug(value, &mut digits, 0)
   }
   run out.append(Slice.view<u8>(&digits, 0, end))
+}
+
+/// A value a decoded event carries in one of its fields.
+pub union FieldValue {
+  /// A truth value.
+  Bool {pub value: bool},
+  /// A signed integer.
+  Integer {pub value: i64},
+  /// An unsigned integer.
+  Unsigned {pub value: u64},
+  /// A floating-point number.
+  Double {pub value: f64},
+  /// Text.
+  Text {pub value: String},
+}
+
+/// One field of a decoded event: the name and value of one of its debug annotations, such as an
+/// attribute of a span.
+pub struct Field {
+  /// The annotation's name, such as `code.file.path`.
+  pub key: String,
+  /// The annotation's value.
+  pub value: FieldValue,
+}
+
+/// The IDs that place a decoded slice or instant in its OpenTelemetry trace. Each is zero where
+/// the trace does not say, as for another writer's event or a log written outside every span.
+pub struct Ids {
+  /// The high 64 bits of the trace ID.
+  pub traceHigh: u64,
+  /// The low 64 bits of the trace ID.
+  pub traceLow: u64,
+  /// The span's own ID, or for a log the ID of the span current when it was written.
+  pub span: u64,
+  /// The parent span's ID; zero for a root.
+  pub parent: u64,
+}
+
+impl Copy for Ids {}
+
+/// One item of a Perfetto trace that [`PerfettoReader`] decodes, in the order the trace holds it.
+pub union Event {
+  /// A process's track.
+  Process {pub track: u64, pub pid: i64, pub name: String},
+  /// A thread's track, in the process `pid`.
+  Thread {pub track: u64, pub pid: i64, pub tid: i64},
+  /// A track of counter samples below the track `parent`, zero for none, measured in `unit`.
+  Counter {pub track: u64, pub parent: u64, pub name: String, pub unit: CounterUnit},
+  /// A track with only a name, such as a process's `log` or `spans` track.
+  Named {pub track: u64, pub parent: u64, pub name: String},
+  /// A slice whose start and end the trace holds one after the other, as [`Perfetto`] writes
+  /// every span: its times in Unix nanoseconds, its IDs and its fields.
+  Slice {pub track: u64, pub start: u64, pub end: u64, pub name: String, pub ids: Ids, pub fields: List<Field>},
+  /// The start of a slice whose end comes later in the trace, as another writer may write one.
+  Begin {pub track: u64, pub time: u64, pub name: String, pub ids: Ids, pub fields: List<Field>},
+  /// The end of the latest slice begun on `track` that has not ended.
+  End {pub track: u64, pub time: u64},
+  /// Something that happened at one time, such as a log record.
+  Instant {pub track: u64, pub time: u64, pub name: String, pub ids: Ids, pub fields: List<Field>},
+  /// A counter's value at `time`.
+  Sample {pub track: u64, pub time: u64, pub value: f64},
+}
+
+/// Bytes that are not a Perfetto trace: a malformed field, text that is not UTF-8, or an interned
+/// name that no earlier packet of its sequence defined.
+pub struct PerfettoError {
+  /// Where, in the bytes passed to [`PerfettoReader.read`], the packet at fault starts.
+  pub offset: usize,
+}
+
+// What one packet sequence has interned, each table mapping an ID to its text in `texts`, and the
+// trace its spans belong to now.
+struct Sequence {
+  id: u64,
+  names: HashMap<u64, usize>,
+  keys: HashMap<u64, usize>,
+  strings: HashMap<u64, usize>,
+  texts: List<String>,
+  traceHigh: u64,
+  traceLow: u64,
+}
+
+// A slice start held until the next packet says whether its end follows it.
+struct Waiting {
+  sequence: u64,
+  track: u64,
+  time: u64,
+  name: String,
+  ids: Ids,
+  fields: List<Field>,
+}
+
+/// Decodes a Perfetto trace into [`Event`]s, a chunk of bytes at a time.
+///
+/// # When to use
+/// Read a trace that [`Perfetto`] or another TrackEvent writer recorded: a whole file at once,
+/// or a file a running program still appends to, by passing each newly appended chunk to
+/// [`read`] with whatever the last call left unread before it.
+///
+/// # Details
+/// A packet's interned names stay with its sequence until the sequence says its state was
+/// cleared, so a reader must see a sequence from its first packet. [`Perfetto`] writes each span's
+/// start and end side by side, and the reader joins them into one [`Event.Slice`]; it holds a
+/// start until the next packet shows whether its end follows, and [`finish`] hands over the last
+/// one. A span's trace comes from the latest `trace.id` fields of its sequence. Packet timestamps
+/// are read as they are: a trace that times packets by clock snapshots or timestamp deltas reads
+/// with the raw values.
+pub struct PerfettoReader {
+  sequences: List<Sequence>,
+  waiting: Option<Waiting>,
+}
+
+// One field of a protobuf message: its number and wire type, a varint or fixed value, and for a
+// length-delimited field the range of its bytes.
+struct Entry {
+  number: u64,
+  wire: u64,
+  value: u64,
+  start: usize,
+  length: usize,
+}
+
+impl Copy for Entry {}
+
+// A varint at some offset: its value and the offset after it, `usize.MAX` when it runs past the
+// bytes and zero when it is longer than a varint can be.
+struct Varint {
+  value: u64,
+  next: usize,
+}
+
+impl Copy for Varint {}
+
+fn varintAt(bytes: &[u8], at: usize) -> Varint {
+  let mut value: u64 = 0
+  let mut shift: u64 = 0
+  let mut i = at
+  while i < bytes.length {
+    let byte = u8.toU64(bytes[i])
+    if shift < 64 {
+      value = u64.bitOr(value, u64.shiftLeft(u64.bitAnd(byte, 127), shift))
+    }
+    i = i + 1
+    if byte < 128 {
+      return Varint {value: value, next: i}
+    }
+    shift = shift + 7
+    if shift >= 70 {
+      return Varint {value: 0, next: 0}
+    }
+  }
+  return Varint {value: 0, next: usize.MAX}
+}
+
+// The `count` bytes at `at` as a little-endian number.
+fn littleEndian(bytes: &[u8], at: usize, count: usize) -> u64 {
+  let mut value: u64 = 0
+  let mut i = count
+  while i > 0 {
+    i = i - 1
+    value = u64.bitOr(u64.shiftLeft(value, 8), u8.toU64(bytes[at + i]))
+  }
+  return value
+}
+
+// Reads the field at `at` of `message` into `entry` and returns the offset after it, or
+// `usize.MAX` for a field that is malformed or runs past the message.
+fn nextEntry(message: &[u8], at: usize, entry: &mut Entry) -> usize {
+  let tag = varintAt(message, at)
+  if tag.next == 0 || tag.next == usize.MAX {
+    return usize.MAX
+  }
+  entry.number = u64.shiftRight(tag.value, 3)
+  entry.wire = u64.bitAnd(tag.value, 7)
+  if entry.wire == 0 {
+    let read = varintAt(message, tag.next)
+    if read.next == 0 || read.next == usize.MAX {
+      return usize.MAX
+    }
+    entry.value = read.value
+    return read.next
+  }
+  if entry.wire == 1 || entry.wire == 5 {
+    let size: usize = if entry.wire == 1 { 8 } else { 4 }
+    if tag.next + size > message.length {
+      return usize.MAX
+    }
+    entry.value = littleEndian(message, tag.next, size)
+    return tag.next + size
+  }
+  if entry.wire == 2 {
+    let length = varintAt(message, tag.next)
+    if length.next == 0 || length.next == usize.MAX {
+      return usize.MAX
+    }
+    if length.value > usize.toU64(message.length - length.next) {
+      return usize.MAX
+    }
+    entry.start = length.next
+    entry.length = u64.toUsize(length.value)
+    return entry.start + entry.length
+  }
+  return usize.MAX
+}
+
+fn emptyEntry() -> Entry {
+  return Entry {number: 0, wire: 0, value: 0, start: 0, length: 0}
+}
+
+// The bytes of the length-delimited field `entry` read from `message`.
+fn bytesOf<'a>(message: &'a [u8], entry: &Entry) -> &'a [u8] {
+  return Slice.view<u8>(message, entry.start, entry.length)
+}
+
+// `bytes` as owned text, or a failure at `offset` when they are not UTF-8.
+effect fn textOf(bytes: &[u8], offset: usize) -> String ! PerfettoError | OutOfMemoryError ? &mut Allocator {
+  return match move run String.copyUtf8(bytes) {
+    Result<String, InvalidUtf8>.Success {value} => move value
+    Result<String, InvalidUtf8>.Failure {error} => {
+      drop error
+      fail PerfettoError {offset: offset}
+    }
+  }
+}
+
+fn unitOf(code: u64, percent: bool) -> CounterUnit {
+  if percent { return CounterUnit.Percent }
+  if code == 1 { return CounterUnit.Nanoseconds }
+  if code == 3 { return CounterUnit.Bytes }
+  return CounterUnit.Count
+}
+
+impl PerfettoReader {
+  /// A reader at the start of a trace.
+  pub fn make() -> Self {
+    return PerfettoReader {sequences: List<Sequence>.make(), waiting: Option<Waiting>.none()}
+  }
+
+  /// Decodes the whole packets at the start of `bytes`, appends their events to `events`, and
+  /// returns how many bytes it decoded. A packet that `bytes` ends inside is left unread: pass its
+  /// bytes again, with what follows them, to the next call.
+  ///
+  /// # Errors
+  /// - [`PerfettoError`] for bytes that are not a Perfetto trace, at the packet at fault; the
+  ///   events of the packets before it are appended.
+  /// - `OutOfMemoryError` if the `Allocator` cannot hold the events or the interned names.
+  pub effect fn read(self: &mut Self, bytes: &[u8], events: &mut List<Event>) -> usize
+    ! PerfettoError | OutOfMemoryError ? &mut Allocator {
+    let mut at = usize.ZERO
+    while at < bytes.length {
+      let tag = varintAt(bytes, at)
+      if tag.next == usize.MAX {
+        return at
+      }
+      if tag.next == 0 || u64.bitAnd(tag.value, 7) != 2 {
+        fail PerfettoError {offset: at}
+      }
+      let length = varintAt(bytes, tag.next)
+      if length.next == usize.MAX {
+        return at
+      }
+      if length.next == 0 {
+        fail PerfettoError {offset: at}
+      }
+      if length.value > usize.toU64(bytes.length - length.next) {
+        return at
+      }
+      let end = length.next + u64.toUsize(length.value)
+      // `Trace` holds its packets in field 1; another field is no packet.
+      if u64.shiftRight(tag.value, 3) == 1 {
+        run self.packet(Slice.view<u8>(bytes, length.next, end - length.next), at, &mut events.*)
+      }
+      at = end
+    }
+    return at
+  }
+
+  /// Hands over, as an [`Event.Begin`], the slice start the last packet left waiting for its end.
+  /// Call it once no more bytes of the trace will come.
+  pub effect fn finish(self: &mut Self, events: &mut List<Event>) -> () ! OutOfMemoryError ? &mut Allocator {
+    return run self.release(&mut events.*)
+  }
+
+  // Appends the waiting slice start, if any, as a `Begin`.
+  effect fn release(self: &mut Self, events: &mut List<Event>) -> () ! OutOfMemoryError ? &mut Allocator {
+    if let Option<Waiting>.Some {value} = move Intrinsic.replace(self.waiting, Option<Waiting>.none()) {
+      let Waiting {track, time, name, ids, fields, ..} = move value
+      run events.append(Event.Begin {track: track, time: time, name: move name, ids: ids, fields: move fields})
+    }
+  }
+
+  // The index of sequence `id` in `sequences`, which a sequence first seen is added to.
+  effect fn sequenceSlot(self: &mut Self, id: u64) -> usize ! OutOfMemoryError ? &mut Allocator {
+    let known = self.sequences.asSlice()
+    let mut at = usize.ZERO
+    while at < known.length {
+      if known[at].id == id {
+        return at
+      }
+      at = at + usize.ONE
+    }
+    run self.sequences.append(Sequence {
+      id: id,
+      names: HashMap<u64, usize>.make(Hash.seed(0)),
+      keys: HashMap<u64, usize>.make(Hash.seed(0)),
+      strings: HashMap<u64, usize>.make(Hash.seed(0)),
+      texts: List<String>.make(),
+      traceHigh: 0,
+      traceLow: 0,
+    })
+    return self.sequences.length() - usize.ONE
+  }
+
+  // Decodes one packet, `body`, which starts at `offset`.
+  effect fn packet(self: &mut Self, body: &[u8], offset: usize, events: &mut List<Event>) -> ()
+    ! PerfettoError | OutOfMemoryError ? &mut Allocator {
+    let mut time: u64 = 0
+    let mut sequence: u64 = 0
+    let mut flags: u64 = 0
+    let mut interned = emptyEntry()
+    let mut event = emptyEntry()
+    let mut descriptor = emptyEntry()
+    let mut entry = emptyEntry()
+    let mut at = usize.ZERO
+    while at < body.length {
+      at = nextEntry(body, at, &mut entry)
+      if at == usize.MAX {
+        fail PerfettoError {offset: offset}
+      }
+      if entry.wire == 0 && entry.number == 8 { time = entry.value }
+      if entry.wire == 0 && entry.number == 10 { sequence = entry.value }
+      if entry.wire == 0 && entry.number == 13 { flags = entry.value }
+      if entry.wire == 2 && entry.number == 12 { interned = entry }
+      if entry.wire == 2 && entry.number == 11 { event = entry }
+      if entry.wire == 2 && entry.number == 60 { descriptor = entry }
+    }
+    let slot = run self.sequenceSlot(sequence)
+    if u64.bitAnd(flags, SEQ_INCREMENTAL_STATE_CLEARED) != 0 {
+      let state = &mut self.sequences.asMutSlice()[slot]
+      state.names.clear()
+      state.keys.clear()
+      state.strings.clear()
+      state.texts.clear()
+      state.traceHigh = 0
+      state.traceLow = 0
+    }
+    if interned.number != 0 {
+      run self.internData(slot, bytesOf(body, &interned), offset)
+    }
+    if descriptor.number != 0 {
+      run self.release(&mut events.*)
+      run self.describe(bytesOf(body, &descriptor), offset, &mut events.*)
+    }
+    if event.number != 0 {
+      run self.trackEvent(slot, sequence, time, bytesOf(body, &event), offset, &mut events.*)
+    }
+  }
+
+  // Adds the names an `InternedData` message defines to sequence `slot`'s tables.
+  effect fn internData(self: &mut Self, slot: usize, data: &[u8], offset: usize) -> ()
+    ! PerfettoError | OutOfMemoryError ? &mut Allocator {
+    let mut entry = emptyEntry()
+    let mut at = usize.ZERO
+    while at < data.length {
+      at = nextEntry(data, at, &mut entry)
+      if at == usize.MAX {
+        fail PerfettoError {offset: offset}
+      }
+      if entry.wire != 2 || (entry.number != 2 && entry.number != 3 && entry.number != 29) {
+        continue
+      }
+      let named = bytesOf(data, &entry)
+      let mut iid: u64 = 0
+      let mut text = String.make()
+      let mut inner = emptyEntry()
+      let mut within = usize.ZERO
+      while within < named.length {
+        within = nextEntry(named, within, &mut inner)
+        if within == usize.MAX {
+          fail PerfettoError {offset: offset}
+        }
+        if inner.wire == 0 && inner.number == 1 { iid = inner.value }
+        if inner.wire == 2 && inner.number == 2 { text = run textOf(bytesOf(named, &inner), offset) }
+      }
+      let state = &mut self.sequences.asMutSlice()[slot]
+      let index = state.texts.length()
+      run state.texts.append(move text)
+      if entry.number == 2 {
+        drop run state.names.insert(iid, index)
+      } else if entry.number == 3 {
+        drop run state.keys.insert(iid, index)
+      } else {
+        drop run state.strings.insert(iid, index)
+      }
+    }
+  }
+
+  // The text sequence `slot` interned in `table` as `iid`, or a failure at `offset`.
+  effect fn internedText(self: &Self, slot: usize, table: Table, iid: u64, offset: usize) -> String
+    ! PerfettoError | OutOfMemoryError ? &mut Allocator {
+    let state = &self.sequences.asSlice()[slot]
+    let found = match table {
+      Table.Names => state.names.get(iid)
+      Table.Keys => state.keys.get(iid)
+      Table.Strings => state.strings.get(iid)
+    }
+    return match found {
+      Option<usize>.Some {value} => run String.copy(state.texts.asSlice()[value].view())
+      Option<usize>.None => {
+        fail PerfettoError {offset: offset}
+      }
+    }
+  }
+
+  // Decodes a `TrackDescriptor` into the event for its kind of track.
+  effect fn describe(self: &mut Self, data: &[u8], offset: usize, events: &mut List<Event>) -> ()
+    ! PerfettoError | OutOfMemoryError ? &mut Allocator {
+    let mut track: u64 = 0
+    let mut parent: u64 = 0
+    let mut name = String.make()
+    let mut process = emptyEntry()
+    let mut thread = emptyEntry()
+    let mut counter = emptyEntry()
+    let mut entry = emptyEntry()
+    let mut at = usize.ZERO
+    while at < data.length {
+      at = nextEntry(data, at, &mut entry)
+      if at == usize.MAX {
+        fail PerfettoError {offset: offset}
+      }
+      if entry.wire == 0 && entry.number == 1 { track = entry.value }
+      if entry.wire == 0 && entry.number == 5 { parent = entry.value }
+      if entry.wire == 2 && (entry.number == 2 || entry.number == 10) { name = run textOf(bytesOf(data, &entry), offset) }
+      if entry.wire == 2 && entry.number == 3 { process = entry }
+      if entry.wire == 2 && entry.number == 4 { thread = entry }
+      if entry.wire == 2 && entry.number == 8 { counter = entry }
+    }
+    let mut inner = emptyEntry()
+    if process.number != 0 {
+      let described = bytesOf(data, &process)
+      let mut pid: i64 = 0
+      let mut processName = String.make()
+      at = usize.ZERO
+      while at < described.length {
+        at = nextEntry(described, at, &mut inner)
+        if at == usize.MAX {
+          fail PerfettoError {offset: offset}
+        }
+        if inner.wire == 0 && inner.number == 1 { pid = u64.wrappingToI64(inner.value) }
+        if inner.wire == 2 && inner.number == 6 { processName = run textOf(bytesOf(described, &inner), offset) }
+      }
+      return run events.append(Event.Process {track: track, pid: pid, name: move processName})
+    }
+    if thread.number != 0 {
+      let described = bytesOf(data, &thread)
+      let mut pid: i64 = 0
+      let mut tid: i64 = 0
+      at = usize.ZERO
+      while at < described.length {
+        at = nextEntry(described, at, &mut inner)
+        if at == usize.MAX {
+          fail PerfettoError {offset: offset}
+        }
+        if inner.wire == 0 && inner.number == 1 { pid = u64.wrappingToI64(inner.value) }
+        if inner.wire == 0 && inner.number == 2 { tid = u64.wrappingToI64(inner.value) }
+      }
+      return run events.append(Event.Thread {track: track, pid: pid, tid: tid})
+    }
+    if counter.number != 0 {
+      let described = bytesOf(data, &counter)
+      let mut code: u64 = 0
+      let mut percent = false
+      at = usize.ZERO
+      while at < described.length {
+        at = nextEntry(described, at, &mut inner)
+        if at == usize.MAX {
+          fail PerfettoError {offset: offset}
+        }
+        if inner.wire == 0 && inner.number == 3 { code = inner.value }
+        if inner.wire == 2 && inner.number == 6 { percent = sameBytes(bytesOf(described, &inner), b"%") }
+      }
+      return run events.append(Event.Counter {track: track, parent: parent, name: move name, unit: unitOf(code, percent)})
+    }
+    return run events.append(Event.Named {track: track, parent: parent, name: move name})
+  }
+
+  // Decodes a `TrackEvent` of sequence `slot` at `time` into its event, joining a slice's start to
+  // the end that follows it.
+  effect fn trackEvent(self: &mut Self, slot: usize, sequence: u64, time: u64, data: &[u8], offset: usize,
+    events: &mut List<Event>) -> () ! PerfettoError | OutOfMemoryError ? &mut Allocator {
+    let mut kind: u64 = 0
+    let mut track: u64 = 0
+    let mut name = String.make()
+    let mut value: f64 = 0.0
+    let mut ids = Ids {traceHigh: 0, traceLow: 0, span: 0, parent: 0}
+    let mut fields = List<Field>.make()
+    let mut entry = emptyEntry()
+    let mut at = usize.ZERO
+    while at < data.length {
+      at = nextEntry(data, at, &mut entry)
+      if at == usize.MAX {
+        fail PerfettoError {offset: offset}
+      }
+      if entry.wire == 0 && entry.number == 9 { kind = entry.value }
+      if entry.wire == 0 && entry.number == 11 { track = entry.value }
+      if entry.wire == 0 && entry.number == 10 { name = run self.internedText(slot, Table.Names, entry.value, offset) }
+      if entry.wire == 2 && entry.number == 23 { name = run textOf(bytesOf(data, &entry), offset) }
+      if entry.wire == 0 && entry.number == 30 { value = i64.toF64(u64.wrappingToI64(entry.value)) }
+      if entry.wire == 1 && entry.number == 44 { value = f64.fromBits(entry.value) }
+      if entry.wire == 2 && entry.number == 4 {
+        run self.annotation(slot, bytesOf(data, &entry), offset, &mut ids, &mut fields)
+      }
+    }
+    if ids.span != 0 {
+      let state = &self.sequences.asSlice()[slot]
+      ids.traceHigh = state.traceHigh
+      ids.traceLow = state.traceLow
+    }
+    if kind == TYPE_SLICE_END {
+      if let Option<Waiting>.Some {value: started} = move Intrinsic.replace(self.waiting, Option<Waiting>.none()) {
+        if started.sequence == sequence && started.track == track {
+          let Waiting {time: start, name: startName, ids: startIds, fields: startFields, ..} = move started
+          return run events.append(Event.Slice {track: track, start: start, end: time, name: move startName, ids: startIds,
+            fields: move startFields})
+        }
+        self.waiting = Option<Waiting>.some(move started)
+        run self.release(&mut events.*)
+      }
+      return run events.append(Event.End {track: track, time: time})
+    }
+    run self.release(&mut events.*)
+    if kind == TYPE_SLICE_BEGIN {
+      self.waiting = Option<Waiting>.some(Waiting {sequence: sequence, track: track, time: time, name: move name, ids: ids,
+        fields: move fields})
+      return ()
+    }
+    if kind == TYPE_INSTANT {
+      return run events.append(Event.Instant {track: track, time: time, name: move name, ids: ids, fields: move fields})
+    }
+    if kind == TYPE_COUNTER {
+      return run events.append(Event.Sample {track: track, time: time, value: value})
+    }
+  }
+
+  // Decodes one `DebugAnnotation` of sequence `slot`: the IDs into `ids` and the sequence's trace,
+  // anything else into `fields`.
+  effect fn annotation(self: &mut Self, slot: usize, data: &[u8], offset: usize, ids: &mut Ids, fields: &mut List<Field>) -> ()
+    ! PerfettoError | OutOfMemoryError ? &mut Allocator {
+    let mut key = String.make()
+    let mut value = FieldValue.Bool {value: false}
+    let mut entry = emptyEntry()
+    let mut at = usize.ZERO
+    while at < data.length {
+      at = nextEntry(data, at, &mut entry)
+      if at == usize.MAX {
+        fail PerfettoError {offset: offset}
+      }
+      if entry.wire == 0 && entry.number == 1 { key = run self.internedText(slot, Table.Keys, entry.value, offset) }
+      if entry.wire == 2 && entry.number == 10 { key = run textOf(bytesOf(data, &entry), offset) }
+      if entry.wire == 0 && entry.number == 2 { value = FieldValue.Bool {value: entry.value != 0} }
+      if entry.wire == 0 && entry.number == 3 { value = FieldValue.Unsigned {value: entry.value} }
+      if entry.wire == 0 && entry.number == 4 { value = FieldValue.Integer {value: u64.wrappingToI64(entry.value)} }
+      if entry.wire == 1 && entry.number == 5 { value = FieldValue.Double {value: f64.fromBits(entry.value)} }
+      if entry.wire == 2 && entry.number == 6 { value = FieldValue.Text {value: run textOf(bytesOf(data, &entry), offset)} }
+      if entry.wire == 0 && entry.number == 17 {
+        value = FieldValue.Text {value: run self.internedText(slot, Table.Strings, entry.value, offset)}
+      }
+    }
+    let unsigned = match &value {
+      FieldValue.Unsigned {value: number} => number
+      _ => 0
+    }
+    let named = key.view()
+    if named == "span.id" {
+      ids.span = unsigned
+      return ()
+    }
+    if named == "parent.id" {
+      ids.parent = unsigned
+      return ()
+    }
+    if named == "trace.id.high" {
+      let state = &mut self.sequences.asMutSlice()[slot]
+      state.traceHigh = unsigned
+      return ()
+    }
+    if named == "trace.id.low" {
+      let state = &mut self.sequences.asMutSlice()[slot]
+      state.traceLow = unsigned
+      return ()
+    }
+    run fields.append(Field {key: move key, value: move value})
+  }
 }
