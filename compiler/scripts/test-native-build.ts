@@ -1707,7 +1707,8 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   assert.equal(checked.stdout, '')
   assert.match(checked.stderr, new RegExp(`^Checking greeting \\(${hostTarget}\\)\n`))
   assert.match(checked.stderr, new RegExp(`^Checking greeting \\(${foreign}\\)\n`, 'm'))
-  assert.equal(checked.stderr.match(/^Finished greeting in /gm)?.length, 2, checked.stderr)
+  // The two targets, and first the package's tasks program, which `silk init` writes.
+  assert.equal(checked.stderr.match(/^Finished greeting in /gm)?.length, 3, checked.stderr)
   assert.doesNotMatch(checked.stderr, /\x1b/)
   assert.equal(yield* fs.exists(marker), false, 'check must not invoke Clang')
   yield* fs.makeDirectory(join(directory, 'rejected/src'), { recursive: true })
@@ -3594,14 +3595,14 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     { ...process.env, SILK_CLANG: clang },
   )
   assert.equal(released.status, 0, released.stderr)
-  // Each compilation names its artifact relative to the working directory, not the project;
-  // standard output stays empty.
+  // The base tasks file builds it, from the package directory, so the artifact is named
+  // relative to the package; standard output stays empty.
   assert.equal(released.stdout, '')
   assert.match(released.stderr, new RegExp(`^Compiling greeting \\(${hostTarget}, release\\)\n`))
   assert.match(released.stderr, /^  codegen   [1-9][0-9,]* functions/m)
   assert.match(
     released.stderr,
-    new RegExp(`^Finished greeting/build/${hostTarget}/release/greeting in [0-9.ms ]+s\n$`, 'm'),
+    new RegExp(`^Finished build/${hostTarget}/release/greeting in [0-9.ms ]+s\n$`, 'm'),
   )
   assert.equal(
     yield* fs.exists(join(directory, 'greeting/build', hostTarget, 'release/greeting')),

@@ -55,7 +55,9 @@ impl TaskSet for Tasks {
     ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
     match move self {
       Tasks.Build { options, out } => run Standard.build(run compilation(&options), out.view())
-      Tasks.Run { options, arguments } => run Standard.start(run compilation(&options), &arguments)
+      Tasks.Run { options, arguments } => {
+        run Standard.start(run compilation(&options), &options, &arguments)
+      }
       Tasks.Dev { options, arguments } => run Standard.dev(&options, &arguments)
       Tasks.Plan { options } => run Standard.plan(run compilation(&options))
     }
@@ -130,17 +132,18 @@ their names and permissions.
 ### Associated function `start`
 
 ```silk
-pub effect fn start(compilation: Compilation, arguments: &List<String>) -> ()
+pub effect fn start(compilation: Compilation, options: &Options, arguments: &List<String>) -> ()
     ! BuildError | TaskError
     ? &mut Allocator | &mut FileSystem | &mut HostInput
 ```
 
 Builds `compilation` and runs its program with `arguments`, sharing the task's terminal and
-environment, and waits for it.
+environment, and waits for it. `options` are the ones `compilation` was made from: a
+`--target` this machine cannot run is refused before anything is built.
 
 #### Errors
 [`BuildError`](./build-graph.md#BuildError) when the build fails; [`TaskError`](./cli-task.md#TaskError) with the program's status when it ends
-with a nonzero one.
+with a nonzero one, or status 2 for a target this machine cannot run.
 
 <a id="Standard.impl.plan"></a>
 
