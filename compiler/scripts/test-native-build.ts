@@ -1631,7 +1631,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   assert.equal(initialized.status, 0, initialized.stderr)
   // It names the project relative to the working directory, then what to run next: `cd` into the
   // project, then `silk run` with what it does. Output that is not a terminal has no escape codes.
-  assert.equal(initialized.stdout, '  Created greeting from the minimal template\n\n  Next steps:\n    cd greeting\n    silk run   build and run it\n')
+  assert.equal(initialized.stdout, '  Created greeting from the minimal template\n\n  Next steps:\n    cd greeting\n    silk dev   run it, and run it again when you change it\n')
   const greeted = yield* invoke(
     silk,
     ['run', '--stdlib', standardLibrary],
@@ -4885,7 +4885,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     yield* fs.readFileString(join(managed, 'silk.toml')),
     `[workspace]\nmembers = ["app"]\nsilk-version = "${reportedVersion}"\n`,
   )
-  assert.equal(managedRoot.stdout, '  Created workspace managed with package app\n\n  Next steps:\n    cd managed\n    silk run   build and run it\n')
+  assert.equal(managedRoot.stdout, '  Created workspace managed with package app\n\n  Next steps:\n    cd managed\n    silk dev   run it, and run it again when you change it\n')
   assert.equal(yield* fs.exists(join(managed, 'app/src/main.silk')), true)
   assert.equal(yield* fs.exists(join(managed, 'app/.gitignore')), false)
   const starterRun = yield* invoke(silk, ['run', '--stdlib', standardLibrary], managed, withClang)

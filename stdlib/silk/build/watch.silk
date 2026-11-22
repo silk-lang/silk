@@ -1,0 +1,262 @@
+//! Running a command again each time a project's sources change, for `silk dev`.
+//!
+//! The command runs as the leader of its own process group, so that stopping it also stops the
+//! program it started. While it runs, SIGTERM, SIGINT and SIGHUP are held: the next look stops the
+//! group, and [`restarting`] answers 128 plus the signal's number. It needs macOS or Linux.
+//!
+//! @category Build
+
+static if Intrinsic.targetOperatingSystem() == "darwin"
+  || Intrinsic.targetOperatingSystem() == "linux" {
+  import silk.collections.bytes { Bytes }
+  import silk.collections.list { List }
+  import silk.core.effect { Effect }
+  import silk.core.option { Option }
+  import silk.core.result { Result }
+  import silk.io.writer_native { StderrWriter }
+  import silk.mem.allocator { Allocator, OutOfMemoryError }
+  import silk.system.child_process { ChildProcess }
+  import silk.system.filesystem { DirectoryInfo, FileError, FileInfo, FileSystem, Path }
+  import silk.text.string { String }
+  import silk.system.monotonic_clock { MonotonicClock }
+  import silk.system.monotonic_clock_native { OsMonotonicClock }
+  import silk.system.signal_watch { SignalError, SignalWatch }
+  import silk.system.subprocess { ExitStatus, SpawnOptions, Stdio, Subprocess, SubprocessError }
+  import silk.num.u8
+
+  unsafe extern "C" fn kill(pid: i32, signal: i32) -> i32
+
+  /// What a package's development run watches below `root`: its `src` directory and its
+  /// `silk.toml`.
+  pub effect fn packageSources(root: &Path) -> List<Path>
+    ! FileError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut sources = List<Path>.make()
+    run sources.append(run Path.join(root, "src"))
+    run sources.append(run Path.join(root, "silk.toml"))
+    return move sources
+  }
+
+  /// Runs `program` with `arguments` in `directory`, sharing the terminal and environment, and runs
+  /// it again each time a file under one of `sources` (a directory or a file) changes, stopping the
+  /// running one first. A run that ends by itself is reported, and the next change starts it again.
+  /// Directories named `build` or `node_modules`, and names starting with `.`, are not watched.
+  /// Answers 128 plus the number of the signal that stopped it, or 1 when the program cannot be
+  /// started.
+  pub effect fn restarting(
+    program: &Path,
+    arguments: &[Bytes],
+    directory: &Path,
+    sources: &[Path],
+  ) -> i32
+    ! FileError | OutOfMemoryError
+    ? &mut Allocator | &mut FileSystem {
+    let mut stops = match move run Effect.result(watched()) {
+      Result<SignalWatch, SignalError>.Success { value } => move value
+      Result<SignalWatch, SignalError>.Failure { error } => {
+        drop error
+        StderrWriter.print("silk dev: cannot watch for Control-C\n", &.())
+        return 1
+      }
+    }
+    while true {
+      let mut seen = run fingerprint(sources)
+      let pid = match run start(program, arguments, directory) {
+        Option<i32>.Some { value } => value
+        Option<i32>.None => {
+          StderrWriter.print("silk dev: the command could not be started\n", &.())
+          return 1
+        }
+      }
+      let mut running = true
+      while true {
+        let arrived = run signal(&mut stops)
+        if arrived != 0 {
+          if running {
+            stop(pid)
+          }
+          return 128 + arrived
+        }
+        if running {
+          if let Option<i32>.Some { value: code } = ended(pid) {
+            running = false
+            if code == 0 {
+              StderrWriter.print("silk dev: the program ended; waiting for a change\n", &.())
+            } else {
+              StderrWriter.print("silk dev: the run failed; waiting for a change\n", &.())
+            }
+          }
+        }
+        pause(300)
+        let now = run fingerprint(sources)
+        if now != seen {
+          StderrWriter.print("silk dev: a source changed; restarting\n", &.())
+          if running {
+            stop(pid)
+          }
+          break
+        }
+        seen = now
+      }
+    }
+    return 0
+  }
+
+  effect fn watched() -> SignalWatch
+    ! SignalError {
+    let mut watch = run SignalWatch.open()
+    run watch.add(SignalWatch.terminate())
+    run watch.add(SignalWatch.interrupt())
+    run watch.add(SignalWatch.hangup())
+    return move watch
+  }
+
+  // The first stop signal that arrived since the last look, or 0.
+  effect fn signal(watch: &mut SignalWatch) -> i32 {
+    let mut received: [i32; 4] = [0; 4]
+    return match move run Effect.result(watch.read(&mut received)) {
+      Result<usize, SignalError>.Success { value: count } => if count != 0 {
+        received[0]
+      } else {
+        0
+      }
+      Result<usize, SignalError>.Failure { error } => {
+        drop error
+        0
+      }
+    }
+  }
+
+  // Starts `program` as the leader of a new process group, sharing the terminal; its process id.
+  effect fn start(program: &Path, arguments: &[Bytes], directory: &Path) -> Option<i32>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut request = run ChildProcess.requestWithin(program, directory)
+    let mut at: usize = 0
+    while at < arguments.length {
+      run ChildProcess.addArgumentBytes(&mut request, arguments[at].asSlice())
+      at = at + 1
+    }
+    run Subprocess.inheritEnvironment(&mut request)
+    let mut options = SpawnOptions.make()
+    options.setDetached(true)
+    run options.setStdio(0, Stdio.inherit(0))
+    run options.setStdio(1, Stdio.inherit(1))
+    run options.setStdio(2, Stdio.inherit(2))
+    return match move run Effect.result(Subprocess.spawn(&request, &options)) {
+      Result<Subprocess, SubprocessError | OutOfMemoryError>.Success { value } => Option<i32>.some(
+        value.pid(),
+      )
+      Result<Subprocess, SubprocessError | OutOfMemoryError>.Failure { error } => match move error {
+        OutOfMemoryError exhausted => {
+          fail move exhausted
+        }
+        SubprocessError refused => {
+          drop refused
+          Option<i32>.none()
+        }
+      }
+    }
+  }
+
+  // The exit status of `pid` when it has ended, collecting it.
+  fn ended(pid: i32) -> Option<i32> {
+    return match move run Effect.result(Subprocess.tryWait(pid)) {
+      Result<Option<ExitStatus>, SubprocessError>.Success { value } => match move value {
+        Option<ExitStatus>.Some { value: status } => Option<i32>.some(
+          if status.signaled {
+            128 + status.signal
+          } else {
+            status.code
+          },
+        )
+        Option<ExitStatus>.None => Option<i32>.none()
+      }
+      Result<Option<ExitStatus>, SubprocessError>.Failure { error } => {
+        drop error
+        Option<i32>.some(1)
+      }
+    }
+  }
+
+  // Asks the group `pid` leads to end (SIGTERM), then makes it (SIGKILL) after five seconds.
+  fn stop(pid: i32) -> () {
+    let group = 0 - pid
+    drop run Effect.result(Subprocess.kill(group, 15))
+    let mut waited: u32 = 0
+    let mut collected = false
+
+    // The leader ends first; the rest of its group can outlive it.
+    while waited < 200 {
+      if !collected {
+        collected = ended(pid).isSome()
+      }
+      if collected && unsafe kill(group, 0) != 0 {
+        return ()
+      }
+      if waited == 100 {
+        drop run Effect.result(Subprocess.kill(group, 9))
+      }
+      pause(50)
+      waited = waited + 1
+    }
+  }
+
+  fn pause(milliseconds: u64) -> () {
+    let mut clock = OsMonotonicClock.make()
+    run MonotonicClock.waitFor(milliseconds * 1000000)
+      |> Effect.provideMut<MonotonicClock>(&mut clock)
+  }
+
+  // A fingerprint of the files below `sources`: their paths and contents, folded.
+  effect fn fingerprint(sources: &[Path]) -> u64
+    ! FileError | OutOfMemoryError
+    ? &mut Allocator | &mut FileSystem {
+    let mut hash: u64 = 2166136261
+    let mut at: usize = 0
+    while at < sources.length {
+      if run FileSystem.exists(&sources[at]) {
+        match run FileSystem.stat(&sources[at]) {
+          FileInfo _file => {
+            let bytes = run FileSystem.readFile(&sources[at])
+            fold(&mut hash, Path.rawBytes(&sources[at]))
+            fold(&mut hash, bytes.asSlice())
+          }
+          DirectoryInfo _directory => run folded(&sources[at], &mut hash)
+        }
+      }
+      at = at + 1
+    }
+    return hash
+  }
+
+  effect fn folded(directory: &Path, hash: &mut u64) -> ()
+    ! FileError | OutOfMemoryError
+    ? &mut Allocator | &mut FileSystem {
+    let entries = run FileSystem.listDirectory(directory)
+    let items = entries.asSlice()
+    let mut at: usize = 0
+    while at < items.length {
+      let name = Path.name(&items[at].path).unwrapOr("")
+      let hidden = name == "build" || name == "node_modules" || String.startsWith(name, ".")
+      if !hidden && items[at].kind.code == 1 {
+        run folded(&items[at].path, &mut hash.*)
+      } else if !hidden && items[at].kind.code == 0 {
+        let bytes = run FileSystem.readFile(&items[at].path)
+        fold(&mut hash.*, Path.rawBytes(&items[at].path))
+        fold(&mut hash.*, bytes.asSlice())
+      }
+      at = at + 1
+    }
+  }
+
+  fn fold(hash: &mut u64, bytes: &[u8]) -> () {
+    let mut at: usize = 0
+    let mut value = hash.*
+    while at < bytes.length {
+      value = ((value ^ u8.toU64(bytes[at])) * 16777619) & 4294967295
+      at = at + 1
+    }
+    hash.* = value
+  }
+}

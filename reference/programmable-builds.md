@@ -4,7 +4,9 @@ A manifest identifies a package and declares its dependencies. A command constru
 
 ## Commands
 
-`build`, `run`, `test` and `plan` are reserved task names. Each has a built-in implementation. A variant in the root package's `tasks.silk` replaces that built-in. Other variants are project commands, invoked with `silk task <name>`.
+`build`, `run`, `dev`, `test` and `plan` are reserved task names. Each has a built-in implementation. A variant in the root package's `tasks.silk` replaces that built-in. Other variants are project commands, invoked with `silk task <name>`. The built-in `dev` runs `silk run` with the same options and arguments, and runs it again each time a file in the package's sources or its manifest changes, until it is stopped; it needs macOS or Linux.
+
+`silk init` writes `src/tasks.silk` for a program: `Build`, `Run`, `Dev` and `Plan` variants that each call one function of `silk.build.tasks` with the compilation one `compilation` function makes from the command's options. A project changes a setting in that function, and every standard task and the editor see it; it replaces one arm to change one task, and adds variants for its own tasks. `Standard.build` takes `--out <dir>` to copy the artifacts there; `Standard.dev` runs the project's own `Run` again on each change. A library gets no tasks file; `silk test` stays the built-in.
 
 A tasks module implements `CommandLine` and `TaskSet` for its command union and calls `Task.main<Tasks>()` from its entry. It declares nothing else. A package without a `tasks.silk` uses the built-ins directly. A package with one sends all four reserved commands to its tasks program, so that program is built first. For a reserved command the union has no variant for, `Task.main` runs nothing and the toolchain runs its built-in. The built-in `build` and `run` make and start the package's program, so a package whose root module is `tasks.silk` itself has none: without a `Build` or `Run` variant, `silk build` and `silk run` report the unknown command. Only the root package's tasks run. Dependencies contribute static `build.silk` plans and ordinary modules the root may import.
 

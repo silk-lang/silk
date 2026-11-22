@@ -253,6 +253,7 @@ a schedule, arenas, unions and compile-time evaluation, and
 | --------------------------- | --------------------------------------------------------------- |
 | `silk init`                 | Create a package or a workspace, optionally from a template     |
 | `silk build` / `silk run`   | Compile for one or more `--target`s, in dev mode or `--release` |
+| `silk dev`                  | Run the package, and run it again each time its sources change  |
 | `silk check`                | Report type, ownership and effect errors without building       |
 | `silk test`                 | Run the tests a change can affect                               |
 | `silk format`               | Format Silk and TOML, with `--check` for CI                     |
