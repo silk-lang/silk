@@ -1631,7 +1631,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   assert.equal(initialized.status, 0, initialized.stderr)
   // It names the project relative to the working directory, then what to run next: `cd` into the
   // project, then `silk run` with what it does. Output that is not a terminal has no escape codes.
-  assert.equal(initialized.stdout, '  Created greeting from the minimal template\n\n  Next steps:\n    cd greeting\n    silk run   build and run it\n')
+  assert.equal(initialized.stdout, '  Created greeting from the minimal template\n\n  Next steps:\n    cd greeting\n    silk dev   run it, and run it again when you change it\n')
   const greeted = yield* invoke(
     silk,
     ['run', '--stdlib', standardLibrary],
@@ -1707,7 +1707,8 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   assert.equal(checked.stdout, '')
   assert.match(checked.stderr, new RegExp(`^Checking greeting \\(${hostTarget}\\)\n`))
   assert.match(checked.stderr, new RegExp(`^Checking greeting \\(${foreign}\\)\n`, 'm'))
-  assert.equal(checked.stderr.match(/^Finished greeting in /gm)?.length, 2, checked.stderr)
+  // The two targets, and first the package's tasks program, which `silk init` writes.
+  assert.equal(checked.stderr.match(/^Finished greeting in /gm)?.length, 3, checked.stderr)
   assert.doesNotMatch(checked.stderr, /\x1b/)
   assert.equal(yield* fs.exists(marker), false, 'check must not invoke Clang')
   yield* fs.makeDirectory(join(directory, 'rejected/src'), { recursive: true })
@@ -3594,10 +3595,10 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     { ...process.env, SILK_CLANG: clang },
   )
   assert.equal(released.status, 0, released.stderr)
-  // Each compilation names its artifact relative to the working directory, not the project;
-  // standard output stays empty.
+  // Each compilation names its artifact relative to the working directory, not the project, the
+  // base tasks file's build too; standard output stays empty.
   assert.equal(released.stdout, '')
-  assert.match(released.stderr, new RegExp(`^Compiling greeting \\(${hostTarget}, release\\)\n`))
+  assert.match(released.stderr, new RegExp(`^Compiling greeting \\(${hostTarget}, release\\)\n`, 'm'))
   assert.match(released.stderr, /^  codegen   [1-9][0-9,]* functions/m)
   assert.match(
     released.stderr,
@@ -3611,10 +3612,11 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     silk,
     ['run', '--manifest-path', manifest, '--target', foreign, '--stdlib', standardLibrary],
     directory,
-    { ...process.env, SILK_CLANG: sentinel },
+    { ...process.env, SILK_CLANG: clang },
   )
+  // The tasks program may build first, with the real Clang; the program itself is not built.
   assert.equal(foreignRun.status, 2, 'run must refuse a foreign target')
-  assert.equal(yield* fs.exists(marker), false)
+  assert.equal(yield* fs.exists(join(directory, 'greeting/build', foreign, 'dev/greeting')), false)
   // A multi-threaded wasm32 request links one shared memory the host imports, with the request's
   // maximum, and runs its native threads as Workers under the stdlib's Node runner.
   const threads = join(directory, 'threads')
@@ -4885,7 +4887,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     yield* fs.readFileString(join(managed, 'silk.toml')),
     `[workspace]\nmembers = ["app"]\nsilk-version = "${reportedVersion}"\n`,
   )
-  assert.equal(managedRoot.stdout, '  Created workspace managed with package app\n\n  Next steps:\n    cd managed\n    silk run   build and run it\n')
+  assert.equal(managedRoot.stdout, '  Created workspace managed with package app\n\n  Next steps:\n    cd managed\n    silk dev   run it, and run it again when you change it\n')
   assert.equal(yield* fs.exists(join(managed, 'app/src/main.silk')), true)
   assert.equal(yield* fs.exists(join(managed, 'app/.gitignore')), false)
   const starterRun = yield* invoke(silk, ['run', '--stdlib', standardLibrary], managed, withClang)
@@ -4971,7 +4973,8 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   const onlyRunnable = yield* invoke(silk, ['run', '--stdlib', standardLibrary], managed, withClang)
   assert.equal(onlyRunnable.status, 7, onlyRunnable.stderr)
   // `run` reports its build as `build` does, and a failed one ends with its `Failed` line on
-  // standard error; standard output is left to the program.
+  // standard error; standard output is left to the program. The package's tasks program is
+  // built first, with the same Clang, so it is the one that fails here.
   const unlinked = yield* invoke(
     silk,
     ['run', '-p', 'hello', '--stdlib', standardLibrary, '--clang', join(managed, 'no-such-clang')],
@@ -4980,7 +4983,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   )
   assert.equal(unlinked.status, 2, unlinked.stderr)
   assert.equal(unlinked.stdout, '')
-  assert.match(unlinked.stderr, /^Compiling hello \(/m)
+  assert.match(unlinked.stderr, /^Compiling hello tasks \(/m)
   assert.match(unlinked.stderr, /^  link      failed +[0-9.ms ]+s$/m)
   assert.match(unlinked.stderr, /^Failed hello in /m)
   assert.doesNotMatch(unlinked.stderr + unlinked.stdout, /Run summary/)

@@ -5,9 +5,10 @@
 Commands implemented by a project's tasks.silk program.
 
 Put project automation in src/tasks.silk. A command is a union variant described with
-silk.cli. `silk build`, `silk run`, `silk test` and `silk plan` run the variants named Build,
-Run, Test and Plan; for one the union does not have, Task.main hands the command back and the
-toolchain runs its built-in. Dependencies' tasks never run.
+silk.cli. `silk build`, `silk run`, `silk dev`, `silk test` and `silk plan` run the variants
+named Build, Run, Dev, Test and Plan; for one the union does not have, Task.main hands the
+command back and the toolchain runs its built-in. Dependencies' tasks never run. `silk init`
+writes a tasks.silk whose standard variants call `silk.build.tasks`.
 
 Task.main parses typed options and invokes TaskSet.perform. Task.exec and Task.silk share
 the developer's terminal and environment. SILK_PROJECT_ROOT is the package directory,
@@ -168,7 +169,7 @@ Help names the command `silk task`, as it is typed. `--help` without a task's na
 tasks, then writes the help of each one with its options and arguments. `--help=json` writes
 that help as one JSON object, with every task under `commands`.
 
-`build`, `run`, `test` and `plan` are the toolchain's own commands. When `silk` starts the
+`build`, `run`, `dev`, `test` and `plan` are the toolchain's own commands. When `silk` starts the
 tasks program for one of them and `T` has no variant of that name, nothing runs here: the
 status is 0 and `silk` runs its built-in command.
 
