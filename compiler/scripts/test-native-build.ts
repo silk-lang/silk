@@ -3176,6 +3176,16 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   yield* archivedRun(35, { ...vendorArchiveEnvironment, SILK_OFFLINE: '1' })
   yield* fs.writeFileString(join(vendorArchived, 'app/silk.toml'), `${appManifest}\n[native.override.vend]\npath = "${join(vendorArchived, 'alt')}"\n`)
   yield* archivedRun(55)
+  // A declared archive is named by its bytes in the link stamp: an unchanged rebuild links
+  // nothing, and new bytes at the same path link again.
+  const archivedExecutable = join(archivedApp, `build/${hostTarget}/dev/app`)
+  const archivedAt = (yield* fs.stat(archivedExecutable)).mtime
+  yield* archivedRun(55)
+  assert.deepEqual((yield* fs.stat(archivedExecutable)).mtime, archivedAt, 'an unchanged build with a declared archive leaves the executable as it was')
+  yield* packVendor('alt', 60)
+  yield* archivedRun(65)
+  yield* packVendor('alt', 50)
+  yield* archivedRun(55)
   yield* fs.writeFileString(join(vendorArchived, 'app/silk.toml'), appManifest)
   yield* fs.writeFileString(join(vendorArchived, 'home/native-overrides.toml'), '[native.override.vend]\npath = "../alt"\n')
   yield* archivedRun(55)
