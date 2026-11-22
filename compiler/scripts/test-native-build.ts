@@ -5875,6 +5875,26 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     builtSecond * 3 < builtFirst,
     `built together, the second program emitted ${builtSecond} functions beside the first one's ${builtFirst}`,
   )
+  // A test runner borrows its sibling's record too, but lists only its own package's tests: the
+  // runner of `two`, which has none, does not run the test of `spec`, whose runner it follows.
+  yield* fs.writeFileString(
+    join(siblings, 'spec/src/lib.silk'),
+    [
+      yield* fs.readFileString(join(siblings, 'spec/src/lib.silk')),
+      'import silk.testing.testing { AssertionError, Testing }',
+      '',
+      'test effect fn sizesOne() -> () ! AssertionError<\'static> {',
+      '  run Testing.expect(sized(1) == 1, "one is one")',
+      '}',
+      '',
+    ].join('\n'),
+  )
+  yield* fs.remove(join(siblings, 'build'), { recursive: true })
+  for (const [member, discovered] of [['spec', 1], ['two', 0], ['two', 0]] as const) {
+    const tested = yield* invoke(silk, ['test', '--package', member, '--stdlib', standardLibrary], siblings, splitEnvironment)
+    assert.equal(tested.status, 0, tested.stdout + tested.stderr)
+    assert.match(tested.stdout, new RegExp(`, ${discovered} discovered\\)$`, 'm'), tested.stdout + tested.stderr)
+  }
   // Each unit carries line tables made from the lines its location markers name, so a function
   // that moves recompiles its unit alone, and the unit's rows name the lines it moved to.
   const rowLines = Effect.fnUntraced(function* (object: string) {
