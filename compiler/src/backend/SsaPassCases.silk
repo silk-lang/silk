@@ -5,7 +5,25 @@
 import backend.SsaControlFlow
 import backend.SsaDeadCode
 import backend.SsaFolding
-import backend.SsaFunction {Binary, Cast, Count, Edge, Exit, Extreme, Kind, Operation, Predicate, Reduction, SsaFunction, none}
+import backend.SsaFunction {
+  AbiExtension,
+  ArchOperation,
+  Binary,
+  CallingConvention,
+  Cast,
+  Count,
+  Edge,
+  Exit,
+  Extreme,
+  Kind,
+  MemoryEffect,
+  Operation,
+  ParameterAbi,
+  Predicate,
+  Reduction,
+  SsaFunction,
+  none,
+}
 import backend.SsaGraph {SsaGraph}
 import backend.SsaIdioms
 import backend.SsaInduction
@@ -30,7 +48,7 @@ import silk.num.u64
 import silk.num.usize
 
 // The instructions a test counts.
-enum Sort { Add, Divide, Load, Store, Copy, CountedCopy, CountedFill, Call, Compare, Select, Cast, Overflow, Any }
+enum Sort { Add, Divide, Load, Store, Copy, CountedCopy, CountedFill, Call, Compare, Select, Cast, Overflow, Arch, Asm, SlotMarker, Any }
 
 fn sorted(operation: Operation, sort: Sort) -> bool {
   return match operation {
@@ -46,6 +64,10 @@ fn sorted(operation: Operation, sort: Sort) -> bool {
     Operation.Select => sort == Sort.Any || sort == Sort.Select
     Operation.Cast {..} => sort == Sort.Any || sort == Sort.Cast
     Operation.Overflow {..} => sort == Sort.Any || sort == Sort.Overflow
+    Operation.ArchIntrinsic {..} => sort == Sort.Any || sort == Sort.Arch
+    Operation.InlineAsm {..} => sort == Sort.Any || sort == Sort.Asm
+    Operation.SlotStart {..} => sort == Sort.Any || sort == Sort.SlotMarker
+    Operation.SlotEnd {..} => sort == Sort.Any || sort == Sort.SlotMarker
     _ => sort == Sort.Any
   }
 }
@@ -2765,4 +2787,139 @@ effect fn bitCountRanges() -> () ! OutOfMemoryError | AssertionError<'static> ? 
   drop run SsaValueNumbering.number(&mut g)
   drop run SsaDeadCode.eliminate(&mut g)
   run Testing.expect(g.block(0).value == leadingZeros, "subtracting the bit length from the width leaves its leading-zero count")
+}
+
+test effect fn preservesTwoResultCallsAndPairReturnsThroughPipeline() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run pairPipelineClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn pairPipelineClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut f = run SsaFunction.make(b"pair_pipeline", 64)
+  let i64Kind = Kind.integer(64)
+  let f64Kind = Kind.float(64)
+  let x = run f.argument(i64Kind)
+  f.setCallingConvention(CallingConvention.C, false, AbiExtension.None)
+  f.setResults(i64Kind, f64Kind)
+  let entry = run f.newBlock()
+  f.startBlock(entry)
+  let abi = run f.addCallAbi(CallingConvention.C, AbiExtension.None, &[ParameterAbi.plain()])
+  let pair = run f.callWithAbi(b"make_pair", &[x], i64Kind, f64Kind, abi)
+  let one = run f.integer(64, 1)
+  let dead = run f.binary(Binary.Mul, x, one)
+  drop dead
+  let first = run f.binary(Binary.Add, pair, one)
+  let second = run f.binary(Binary.Add, pair + 1, pair + 1)
+  run f.retPair(first, second)
+  run f.finish()
+  run SsaPipeline.prepare(&mut f, Level.Speed, true)
+  run Testing.expect(run wellFormed(&f), "2-result call and pair return pass full speed pipeline with verification")
+  let exitBlock = returning(&f)
+  run Testing.expect(exitBlock != usize.MAX, "a returning block remains")
+  run Testing.expect(f.block(exitBlock).value != none() && f.block(exitBlock).secondValue != none(),
+    "both primary and secondary return values stay live through DCE and speed passes")
+  run Testing.expect(count(&f, Sort.Call, usize.MAX) == usize.ONE, "the 2-result call is preserved")
+}
+
+test effect fn deduplicatesArchIntrinsicsAndPreservesInlineAsmBarriers() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run archAndAsmPassClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn archAndAsmPassClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut f = run SsaFunction.make(b"arch_gvn", 64)
+  let v2i64 = Kind.vector(Kind.integer(64), 2)
+  let v4i32 = Kind.vector(Kind.integer(32), 4)
+  let a = run f.argument(v2i64)
+  let b = run f.argument(v2i64)
+  let c = run f.argument(v4i32)
+  let ptr = run f.argument(Kind.address(64))
+  f.setResult(Kind.integer(64))
+  let entry = run f.newBlock()
+  f.startBlock(entry)
+  // Two identical pure ArchIntrinsics -> GVN merges them into one.
+  let aes1 = run f.archIntrinsic(ArchOperation.X86AesEncrypt, 0, &[a, b], v2i64)
+  let aes2 = run f.archIntrinsic(ArchOperation.X86AesEncrypt, 0, &[a, b], v2i64)
+  let aesXor = run f.binary(Binary.Xor, aes1, aes2)
+  // Two ArchIntrinsics with different immediates -> must NOT merge.
+  let sha0 = run f.archIntrinsic(ArchOperation.X86Sha1Rounds4, 0, &[c, c], v4i32)
+  let sha1 = run f.archIntrinsic(ArchOperation.X86Sha1Rounds4, 1, &[c, c], v4i32)
+  let shaXor = run f.binary(Binary.Xor, sha0, sha1)
+  // Two identical InlineAsm blocks -> must NOT merge, and memory-writing asm blocks forwarding.
+  let fortyTwo = run f.integer(64, 42)
+  run f.store(fortyTwo, ptr, 0, 8)
+  let t0 = run f.inlineAsm(b"rdtsc", b"=r", b"", MemoryEffect.None, false, false, &[], Kind.integer(64))
+  let t1 = run f.inlineAsm(b"rdtsc", b"=r", b"", MemoryEffect.None, false, false, &[], Kind.integer(64))
+  drop run f.inlineAsm(b"lock; nop", b"", b"memory", MemoryEffect.ReadWrite, true, false, &[], Kind.unit())
+  let reloaded = run f.load(Kind.integer(64), ptr, 0, 8)
+  let zero32 = run f.integer(32, 0)
+  let e0 = run f.extractElement(aesXor, zero32)
+  let shaElem = run f.extractElement(shaXor, zero32)
+  let e1 = run f.cast(Cast.ZExt, shaElem, Kind.integer(64))
+  let sum0 = run f.binary(Binary.Add, t0, t1)
+  let sum1 = run f.binary(Binary.Add, sum0, reloaded)
+  let sum2 = run f.binary(Binary.Add, sum1, e0)
+  let total = run f.binary(Binary.Add, sum2, e1)
+  run f.ret(total)
+  run f.finish()
+  run SsaPipeline.prepare(&mut f, Level.Speed, true)
+  run Testing.expect(run wellFormed(&f), "arch intrinsic + inline asm function passes full speed pipeline")
+  // aes1 ^ aes2 folds to 0 after GVN merges aes2 -> aes1, leaving sha0 + sha1 = 2 arch intrinsics!
+  run Testing.expect(count(&f, Sort.Arch, usize.MAX) == 2,
+    "identical pure ArchIntrinsics are deduplicated while distinct immediates stay separate")
+  run Testing.expect(count(&f, Sort.Asm, usize.MAX) == 3,
+    "distinct InlineAsm instructions are never merged by GVN and side-effecting asm stays")
+  run Testing.expect(count(&f, Sort.Load, usize.MAX) == usize.ONE,
+    "load after memory-clobbering InlineAsm is not forwarded across the barrier")
+}
+
+test effect fn handlesSlotLifetimeMarkersInPromotionAndMemory() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run slotLifetimePassClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn slotLifetimePassClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  // Case 1: non-escaping scalar slot with SlotStart/SlotEnd is promoted and its markers removed.
+  let mut promoted = run SsaFunction.make(b"promoted_lifetime", 64)
+  let i64Kind = Kind.integer(64)
+  let arg = run promoted.argument(i64Kind)
+  promoted.setResult(i64Kind)
+  let b0 = run promoted.newBlock()
+  promoted.startBlock(b0)
+  let s0 = run promoted.slotOf(8, 8)
+  run promoted.slotStart(0)
+  run promoted.store(arg, s0, 0, 8)
+  let val = run promoted.load(i64Kind, s0, 0, 8)
+  run promoted.slotEnd(0)
+  run promoted.ret(val)
+  run promoted.finish()
+  run SsaPromotion.promote(&mut promoted, true)
+  run Testing.expect(run wellFormed(&promoted), "promoting a slot with lifetime markers produces valid SSA")
+  run Testing.expect(count(&promoted, Sort.SlotMarker, usize.MAX) == usize.ZERO,
+    "promoting a stack slot removes its SlotStart and SlotEnd markers")
+  run Testing.expect(count(&promoted, Sort.Load, usize.MAX) == usize.ZERO && count(&promoted, Sort.Store, usize.MAX) == usize.ZERO,
+    "promoted slot loads and stores are eliminated")
+
+  // Case 2: escaped slot keeps its SlotStart/SlotEnd markers and blocks forwarding across boundaries.
+  let mut escaped = run SsaFunction.make(b"escaped_lifetime", 64)
+  escaped.setResult(i64Kind)
+  let e0 = run escaped.newBlock()
+  escaped.startBlock(e0)
+  let slot = run escaped.slotOf(8, 8)
+  run escaped.slotStart(0)
+  drop run escaped.call(b"observe_slot", &[slot], Kind.unit())
+  let seven = run escaped.integer(64, 7)
+  run escaped.store(seven, slot, 0, 8)
+  run escaped.slotEnd(0)
+  run escaped.slotStart(0)
+  let after = run escaped.load(i64Kind, slot, 0, 8)
+  run escaped.slotEnd(0)
+  run escaped.ret(after)
+  run escaped.finish()
+  run SsaPipeline.prepare(&mut escaped, Level.Speed, true)
+  run Testing.expect(run wellFormed(&escaped), "escaped slot with lifetime markers passes full speed pipeline")
+  run Testing.expect(count(&escaped, Sort.SlotMarker, usize.MAX) == 4,
+    "unpromoted escaped slot preserves its SlotStart and SlotEnd markers")
+  run Testing.expect(count(&escaped, Sort.Load, usize.MAX) == usize.ONE,
+    "store-to-load forwarding does not cross a SlotEnd/SlotStart lifetime boundary")
 }
