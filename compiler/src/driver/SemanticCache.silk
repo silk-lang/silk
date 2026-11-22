@@ -8,12 +8,16 @@
 //! cannot be written is left as it was.
 //!
 //! # Details
-//! Each root package keeps its cache files in a directory of its own, `<output>/cache/<package>`
-//! ([`directory`]), so workspace members that share an output directory never replace each
-//! other's. The file lives there at `semantic-<digest>`, where the digest names the target and
-//! profile, so builds that alternate between profiles each keep their own file warm. The image
-//! inside is stamped with the compiler too ([`CacheStamp`]), and another compiler's file reads as
-//! empty and is replaced.
+//! Each root package keeps its cache files in a directory of its own, and each compiler that builds
+//! it one below that, `<output>/cache/<package>/<compiler>` ([`directory`]). Workspace members that
+//! share an output directory never replace each other's files, and neither do compilers that build
+//! one package at once, such as an editor's language server of one release and a command line of
+//! another. The package's `compilers` file names the compilers that used their files last, and the
+//! package keeps the directories of only the last few ([`claim`]). The file lives at
+//! `semantic-<digest>`, where the digest names the target and profile, so builds that alternate
+//! between profiles each keep their own file warm. The image inside is stamped with the compiler
+//! too ([`CacheStamp`]): a compiler rebuilt at the same path, which keeps the same directory, reads
+//! its predecessor's file as empty and replaces it.
 //!
 //! The image is two files ([`CacheImage.Files`]): its leaves and nodes at that path, and its roots
 //! at `semantic-<digest>.roots`, which [`prefetch`] reads and decodes on threads of their own.
@@ -56,6 +60,7 @@ import silk.mem.allocator {Allocator, OutOfMemoryError}
 import silk.collections.bytes {Bytes}
 import silk.core.effect {Effect}
 import silk.system.filesystem {AtomicWriteError, DirectoryEntry, FileError, FileSystem, Path}
+import silk.text.string {String}
 import silk.collections.list {List}
 import silk.concurrency.thread_native {JoinHandle, NativeThread, SpawnError}
 import silk.core.option {Option}
@@ -111,11 +116,15 @@ effect fn appendHex(output: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &
   return run Bytes.append(&mut output.*, &digits)
 }
 
-/// The directory of `package`'s cache files below the output directory `output`; none when no
-/// such path can be formed.
-pub effect fn directory(output: &Path, package: &[u8]) -> Option<Path> ! OutOfMemoryError ? &mut Allocator {
+/// The directory of this compiler's cache files for `package` below the output directory `output`:
+/// `<output>/cache/<package>/<compiler>`, where `<compiler>` is 16 hex digits of
+/// `CacheStamp.tag`; none when no such path can be formed.
+pub effect fn directory(output: &Path, package: &[u8]) -> Option<Path> ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let tag = run CacheStamp.tag()
   let mut relative = run Bytes.copy(b"cache/")
   run Bytes.append(&mut relative, package)
+  run Bytes.append(&mut relative, b"/")
+  run appendHex(&mut relative, tag.high)
   return match move run Effect.result(Path.joinBytes(output, Bytes.asSlice(&relative))) {
     Result<Path, FileError | OutOfMemoryError>.Success {value} => Option<Path>.some(move value)
     Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
@@ -126,6 +135,109 @@ pub effect fn directory(output: &Path, package: &[u8]) -> Option<Path> ! OutOfMe
       OutOfMemoryError exhausted => { fail move exhausted }
     }
   }
+}
+
+// How many compilers keep cache files for one package: the ones that used theirs last.
+const keptCompilers: usize = 3
+
+// Records in its package's `compilers` file that this compiler, whose directory is `cache`, used
+// its files last: the file names the compilers that did, most recent first, `keptCompilers` at
+// most. When that changes the list, the package's directory keeps only the directories the list
+// names; another compiler's directory, or a file an earlier layout of the cache left there, is
+// removed. A compiler that already used its files last writes nothing.
+effect fn claim(cache: &Path) -> () ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let own = match Path.name(cache) {
+    Option<string>.Some {value} => String.utf8Bytes(value)
+    Option<string>.None => { return () }
+  }
+  let package = match move run Path.parent(cache) {
+    Option<Path>.Some {value} => move value
+    Option<Path>.None => { return () }
+  }
+  let listed = match move run Effect.result(Path.joinBytes(&package, b"compilers")) {
+    Result<Path, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => {
+        drop failure
+        return ()
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let previous = match move run Effect.result(FileSystem.readFile(&listed)) {
+    Result<Bytes, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => {
+        drop failure
+        Bytes.make()
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let mut kept = List<Bytes>.make()
+  run List<Bytes>.append(&mut kept, run Bytes.copy(own))
+  let text = Bytes.asSlice(&previous)
+  let mut start = usize.ZERO
+  let mut at = usize.ZERO
+  while at <= text.length {
+    if at == text.length || text[at] == 10 {
+      let name = Slice.view<u8>(text, start, at - start)
+      if start == usize.ZERO && same(name, own) {
+        return ()
+      }
+      if name.length > usize.ZERO && !same(name, own) && List<Bytes>.length(&kept) < keptCompilers {
+        run List<Bytes>.append(&mut kept, run Bytes.copy(name))
+      }
+      start = at + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  let names = List<Bytes>.asSlice(&kept)
+  let mut written = Bytes.make()
+  at = usize.ZERO
+  while at < names.length {
+    run Bytes.append(&mut written, Bytes.asSlice(&names[at]))
+    run Bytes.append(&mut written, b"\n")
+    at = at + usize.ONE
+  }
+  match move run Effect.result(write(&listed, Bytes.asSlice(&written))) {
+    Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Success {..} => {}
+    Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => { drop failure }
+      AtomicWriteError failure => { drop failure }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let present = run entries(&package)
+  let found = List<DirectoryEntry>.asSlice(&present)
+  at = usize.ZERO
+  while at < found.length {
+    let entry = &found[at]
+    at = at + usize.ONE
+    let name = match Path.name(&entry.path) {
+      Option<string>.Some {value} => String.utf8Bytes(value)
+      Option<string>.None => { continue }
+    }
+    if same(name, b"compilers") || listedName(names, name) {
+      continue
+    }
+    if entry.kind.code == FileSystem.directory().code {
+      drop run Effect.result(FileSystem.removeDirectoryRecursively(&entry.path))
+    } else {
+      drop run Effect.result(FileSystem.removeFile(&entry.path))
+    }
+  }
+}
+
+fn listedName(names: &[Bytes], name: &[u8]) -> bool {
+  let mut at = usize.ZERO
+  while at < names.length {
+    if same(Bytes.asSlice(&names[at]), name) {
+      return true
+    }
+    at = at + usize.ONE
+  }
+  return false
 }
 
 /// Waits until no copy of an earlier build is writing a cache file below the output directory
@@ -145,14 +257,28 @@ pub effect fn settle(output: &Path) -> () ! OutOfMemoryError ? &mut FileSystem |
   let found = List<DirectoryEntry>.asSlice(&packages)
   let mut at = usize.ZERO
   while at < found.length {
-    let files = run entries(&found[at].path)
-    let held = List<DirectoryEntry>.asSlice(&files)
-    let mut file = usize.ZERO
-    while file < held.length {
-      if lockName(Path.rawBytes(&held[file].path)) { run DetachedWriter.waitFor(&held[file].path) }
-      file = file + usize.ONE
+    // Each compiler's files are a directory below the package's; a compiler that keeps its files
+    // in the package's directory itself, as an earlier layout did, may be writing there too.
+    run settleFiles(&found[at].path)
+    let compilers = run entries(&found[at].path)
+    let held = List<DirectoryEntry>.asSlice(&compilers)
+    let mut compiler = usize.ZERO
+    while compiler < held.length {
+      if held[compiler].kind.code == FileSystem.directory().code { run settleFiles(&held[compiler].path) }
+      compiler = compiler + usize.ONE
     }
     at = at + usize.ONE
+  }
+}
+
+// Waits for each write of a cache file in `directory` that a copy of an earlier build still runs.
+effect fn settleFiles(directory: &Path) -> () ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let files = run entries(directory)
+  let held = List<DirectoryEntry>.asSlice(&files)
+  let mut file = usize.ZERO
+  while file < held.length {
+    if lockName(Path.rawBytes(&held[file].path)) { run DetachedWriter.waitFor(&held[file].path) }
+    file = file + usize.ONE
   }
 }
 
@@ -515,6 +641,7 @@ pub effect fn open(store: &mut Semantic, request: &Request, cache: &Path, compil
 pub effect fn openPrefetched(store: &mut Semantic, request: &Request, cache: &Path, compiler: &[u8], linked: bool, building: bool,
   prefetched: Option<Prefetch>, dependencies: &[Path], runtime: &[Path]) -> Option<CacheFile>
   ! Cycle | OutOfMemoryError ? &mut FileSystem | &mut Allocator | &mut Types {
+  run claim(cache)
   let stamp = run CacheStamp.stamp(&store.*, compiler)
   let identity = run Semantic.stampIdentity(&store.*)
   let digest = ContentHash.of(Bytes.asSlice(&identity))
