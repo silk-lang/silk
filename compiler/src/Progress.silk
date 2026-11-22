@@ -2,8 +2,11 @@
 //!
 //! A build or check names its unit with a heading, then opens one phase at a time: `load`, `cache`,
 //! `check`, `codegen` and `link`. Each phase counts its work and, when it ends, leaves one summary
-//! row with its time. Borrow checking runs inside the check and codegen walks, so its bodies and
-//! time are accumulated beside them and reported as a row of their own.
+//! row with its time. A check or codegen that worked on more than one package leaves a tree of its
+//! packages under its row, each under the packages that depend on it, with the package's items,
+//! share of the phase and time; no row is wider than a phase row. Borrow checking runs inside the
+//! check and codegen walks, so its bodies and time are accumulated beside them and reported as a
+//! row of their own.
 //!
 //! On a terminal the open phase is one status line redrawn in place, at most every 50 ms. Otherwise
 //! each row is written once, as plain text, when its phase ends. An `off` reporter writes nothing
@@ -105,6 +108,38 @@ pub struct QueryClock {
 
 impl Copy for QueryClock {}
 
+// One package's part of a phase: its name without its version, such as `mod-b`, the modules or
+// functions the phase counted for it, and the time charged to it.
+struct Share {
+  name: Bytes,
+  items: usize,
+  nanos: u64,
+}
+
+// That package `owner` depends on package `dependency`, both named without a version.
+struct Edge {
+  owner: Bytes,
+  dependency: Bytes,
+}
+
+// One row of a phase's package tree: the guide drawn before the package, the visible width of the
+// guide and name, the package's slot among the phase's shares (`usize.MAX` for a package the phase
+// did no work for), and whether the package's row is already above.
+struct TreeRow {
+  guide: Bytes,
+  width: usize,
+  name: Bytes,
+  slot: usize,
+  repeated: bool,
+}
+
+// The visible width of a phase row between its lead and its time: the phase name, two spaces and
+// the detail column.
+const rowSpan: usize = 44
+
+// The package tree starts two columns right of the phase names and keeps their time column.
+const treeSpan: usize = 42
+
 // How many items each slowest list keeps.
 const slowestKept: usize = 5
 
@@ -163,6 +198,16 @@ pub struct Progress {
   borrowNanos: u64,
   borrowFrom: u64,
   borrowLast: u64,
+  // The open phase's packages, the one its time is charged to now (`usize.MAX` for none), and
+  // when that charge started.
+  shares: List<Share>,
+  share: usize,
+  shareFrom: u64,
+  // The build's package dependencies and standard library, from `depend` and `knowPackages`, which
+  // nest the package rows. They hold for every phase of the unit.
+  edges: List<Edge>,
+  standard: Bytes,
+  graphed: bool,
 
   // Where the unit reports its phases and its end, as `Settings.events`, and its name there.
   events: i32,
@@ -239,6 +284,12 @@ impl Progress {
       borrowNanos: 0,
       borrowFrom: 0,
       borrowLast: 0,
+      shares: List<Share>.make(),
+      share: usize.MAX,
+      shareFrom: 0,
+      edges: List<Edge>.make(),
+      standard: Bytes.make(),
+      graphed: false,
       events: -1,
       unit: Bytes.make(),
       ended: false,
@@ -369,6 +420,7 @@ impl Progress {
     Bytes.clear(&mut self.subject)
     self.expected = 0
     self.phaseStarted = run now()
+    Progress.clearShares(&mut self.*)
     run Progress.draw(&mut self.*)
   }
 
@@ -386,6 +438,7 @@ impl Progress {
     self.total = 0
     self.expected = 0
     self.phaseStarted = run now()
+    Progress.clearShares(&mut self.*)
     run Progress.draw(&mut self.*)
   }
 
@@ -617,12 +670,101 @@ impl Progress {
     self.timedFrom = run now()
   }
 
-  /// Ends the time of the item `timeItem` started, so work after the open phase's last module or
-  /// function is not counted as that item's.
+  /// Ends the time of the item `timeItem` started, and the open phase's charge to a package, so
+  /// work after the open phase's last module or function is counted as neither's.
   pub effect fn endItem(self: &mut Progress) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    if self.share != usize.MAX {
+      Progress.settleShare(&mut self.*, run now())
+    }
     return run Progress.settle(&mut self.*)
+  }
+
+  /// Whether the open phase keeps a row for each package, so callers name an item's package only
+  /// when it is kept: a check or codegen whose rows are shown.
+  pub fn sharing(self: &Progress) -> bool {
+    return self.open && !self.quiet && !self.compact && self.display != Display.Off
+      && (self.phase == Phase.Check || self.phase == Phase.Codegen)
+  }
+
+  /// The slot of `package`, a package identity such as `mod-b@0.1.0`, among the open phase's
+  /// packages, or `usize.MAX` when the phase has not reached it.
+  pub fn shareOf(self: &Progress, package: &[u8]) -> usize {
+    let name = packageName(package)
+    let shares = List<Share>.asSlice(&self.shares)
+    let mut at = usize.ZERO
+    while at < shares.length {
+      if sameName(Bytes.asSlice(&shares[at].name), name) {
+        return at
+      }
+      at = at + usize.ONE
+    }
+    return usize.MAX
+  }
+
+  /// Adds `package`, a package identity the open phase has not reached, and returns its slot.
+  pub effect fn addShare(self: &mut Progress, package: &[u8]) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run List<Share>.append(&mut self.shares, Share { name: run Bytes.copy(packageName(package)), items: 0, nanos: 0 })
+    return List<Share>.length(&self.shares) - usize.ONE
+  }
+
+  /// Charges the open phase's time from now on to the package in `slot`, from `shareOf` or
+  /// `addShare`, and counts one item of it when `counted`. The previous charge ends.
+  pub effect fn enterShare(self: &mut Progress, slot: usize, counted: bool) -> () {
+    if !Progress.sharing(&self.*) {
+      return ()
+    }
+    let current = run now()
+    Progress.settleShare(&mut self.*, current)
+    if counted {
+      let shares = List<Share>.asMutSlice(&mut self.shares)
+      shares[slot].items = shares[slot].items + usize.ONE
+    }
+    self.share = slot
+    self.shareFrom = current
+  }
+
+  // Ends the open charge at `current`, adding its time to its package.
+  fn settleShare(self: &mut Progress, current: u64) -> () {
+    if self.share != usize.MAX {
+      let shares = List<Share>.asMutSlice(&mut self.shares)
+      shares[self.share].nanos = shares[self.share].nanos + current - self.shareFrom
+      self.share = usize.MAX
+    }
+  }
+
+  fn clearShares(self: &mut Progress) -> () {
+    List<Share>.clear(&mut self.shares)
+    self.share = usize.MAX
+  }
+
+  /// Whether `knowPackages` has recorded the build's package graph, so a caller gives it once.
+  pub fn knowsPackages(self: &Progress) -> bool {
+    return self.graphed
+  }
+
+  /// Records that package `owner` depends on package `dependency`, both package identities such as
+  /// `mod-b@0.1.0`, so a package's row nests under the rows of the packages that depend on it.
+  pub effect fn depend(self: &mut Progress, owner: &[u8], dependency: &[u8]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run List<Edge>.append(&mut self.edges, Edge {
+      owner: run Bytes.copy(packageName(owner)),
+      dependency: run Bytes.copy(packageName(dependency)),
+    })
+  }
+
+  /// Records that every dependency was given to `depend` and that `standard`, a package identity,
+  /// is the standard library, whose row comes after the build's own packages.
+  pub effect fn knowPackages(self: &mut Progress, standard: &[u8]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    Bytes.clear(&mut self.standard)
+    run Bytes.append(&mut self.standard, packageName(standard))
+    self.graphed = true
   }
 
   /// A reading for [`bill`], or zero when the slowest lists are not kept or a reading already
@@ -1043,6 +1185,7 @@ impl Progress {
     run Progress.settle(&mut self.*)
     self.open = false
     let current = run now()
+    Progress.settleShare(&mut self.*, current)
     let name = Progress.phaseName(self.phase)
     let nanos = current - self.phaseStarted
     // `--timings` shows what the build had used when the phase ended.
@@ -1051,6 +1194,242 @@ impl Progress {
       memory = run ProcessMemory.peakBytes()
     }
     run Progress.row(&mut self.*, name, detail, nanos, memory, succeeded)
+    run Progress.shareRows(&mut self.*, nanos)
+    Progress.clearShares(&mut self.*)
+  }
+
+  // Writes the package tree of the phase that just ended, which took `phaseNanos`, when the phase
+  // reached more than one package.
+  effect fn shareRows(self: &mut Progress, phaseNanos: u64) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.quiet || self.compact || List<Share>.length(&self.shares) < 2 {
+      return ()
+    }
+    let text = run Progress.shareText(&self.*, phaseNanos)
+    run Progress.clear(&mut self.*)
+    run write(Bytes.asSlice(&text))
+  }
+
+  // The rows of the phase's package tree, each ending in a newline. The names share one column,
+  // wide enough for the deepest, and the times keep the phase rows' column.
+  effect fn shareText(self: &Progress, phaseNanos: u64) -> Bytes
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let rows = run Progress.treeRows(self)
+    let listed = List<TreeRow>.asSlice(&rows)
+    let mut column: usize = 8
+    let mut at = usize.ZERO
+    while at < listed.length {
+      if listed[at].width > column {
+        column = listed[at].width
+      }
+      at = at + usize.ONE
+    }
+    let mut text = Bytes.make()
+    at = usize.ZERO
+    while at < listed.length {
+      run Progress.treeLine(self, &listed[at], column, phaseNanos, &mut text)
+      at = at + usize.ONE
+    }
+    return move text
+  }
+
+  // The phase's packages as tree rows: first each package no other package depends on, in the order
+  // the phase reached them, with the packages it depends on below it in manifest order; then the
+  // standard library and any package no row above reached.
+  effect fn treeRows(self: &Progress) -> List<TreeRow>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut rows = List<TreeRow>.make()
+    let mut placed = List<Bytes>.make()
+    let shares = List<Share>.asSlice(&self.shares)
+    let mut at = usize.ZERO
+    while at < shares.length {
+      let name = Bytes.asSlice(&shares[at].name)
+      if !sameName(name, Bytes.asSlice(&self.standard)) && !Progress.depended(self, name) {
+        run Progress.placeTree(self, name, b"", usize.ZERO, false, false, &mut rows, &mut placed)
+      }
+      at = at + usize.ONE
+    }
+    at = usize.ZERO
+    while at < shares.length {
+      let name = Bytes.asSlice(&shares[at].name)
+      if !listed(&placed, name) {
+        run Progress.placeTree(self, name, b"", usize.ZERO, false, false, &mut rows, &mut placed)
+      }
+      at = at + usize.ONE
+    }
+    return move rows
+  }
+
+  // Whether a package of the build depends on package `name`.
+  fn depended(self: &Progress, name: &[u8]) -> bool {
+    let edges = List<Edge>.asSlice(&self.edges)
+    let mut at = usize.ZERO
+    while at < edges.length {
+      if sameName(Bytes.asSlice(&edges[at].dependency), name) {
+        return true
+      }
+      at = at + usize.ONE
+    }
+    return false
+  }
+
+  // Adds the row of package `name` after `prefix`, the guide of its ancestors `prefixWidth` columns
+  // wide, and below it the rows of the packages it depends on. A `nested` row gets a branch, which
+  // `last` closes. A package already placed gets a row that says so and nothing below it.
+  effect fn placeTree(
+    self: &Progress,
+    name: &[u8],
+    prefix: &[u8],
+    prefixWidth: usize,
+    nested: bool,
+    last: bool,
+    rows: &mut List<TreeRow>,
+    placed: &mut List<Bytes>,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let live = self.display == Display.Live
+    let mut guide = run Bytes.copy(prefix)
+    let mut inner = run Bytes.copy(prefix)
+    let mut width = prefixWidth
+    if nested {
+      if !live {
+        run Bytes.append(&mut guide, b"   ")
+        run Bytes.append(&mut inner, b"   ")
+      } else if last {
+        run Bytes.append(&mut guide, b"\xE2\x94\x94\xE2\x94\x80 ")
+        run Bytes.append(&mut inner, b"   ")
+      } else {
+        run Bytes.append(&mut guide, b"\xE2\x94\x9C\xE2\x94\x80 ")
+        run Bytes.append(&mut inner, b"\xE2\x94\x82  ")
+      }
+      width = width + 3
+    }
+    let repeated = listed(&placed.*, name)
+    run List<TreeRow>.append(&mut rows.*, TreeRow {
+      guide: move guide,
+      width: width + name.length,
+      name: run Bytes.copy(name),
+      slot: Progress.shareOf(self, name),
+      repeated: repeated,
+    })
+    if repeated {
+      return ()
+    }
+    run List<Bytes>.append(&mut placed.*, run Bytes.copy(name))
+    let edges = List<Edge>.asSlice(&self.edges)
+    let mut children = usize.ZERO
+    let mut at = usize.ZERO
+    while at < edges.length {
+      if sameName(Bytes.asSlice(&edges[at].owner), name) {
+        children = children + usize.ONE
+      }
+      at = at + usize.ONE
+    }
+    let mut reached = usize.ZERO
+    at = usize.ZERO
+    while at < edges.length {
+      if sameName(Bytes.asSlice(&edges[at].owner), name) {
+        reached = reached + usize.ONE
+        run Progress.placeTree(
+          self,
+          Bytes.asSlice(&edges[at].dependency),
+          Bytes.asSlice(&inner),
+          width,
+          true,
+          reached == children,
+          &mut rows.*,
+          &mut placed.*,
+        )
+      }
+      at = at + usize.ONE
+    }
+  }
+
+  // Appends one tree row to `text`: its guide and package, padded to `column`, then its items, its
+  // share of `phaseNanos` and its time in the phase rows' time column. A package already above
+  // says so instead, and a package the phase did no work for shows only its name.
+  effect fn treeLine(self: &Progress, row: &TreeRow, column: usize, phaseNanos: u64, text: &mut Bytes) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut line = Bytes.make()
+    let idle = row.repeated || row.slot == usize.MAX
+    if self.display == Display.Live {
+      run Bytes.append(&mut line, b"         ")
+      run Progress.paint(self, &mut line, b"\x1b[2m", Bytes.asSlice(&row.guide))
+      if idle {
+        run Progress.paint(self, &mut line, b"\x1b[2m", Bytes.asSlice(&row.name))
+      } else {
+        run Progress.paint(self, &mut line, b"\x1b[1m", Bytes.asSlice(&row.name))
+      }
+    } else {
+      run Bytes.append(&mut line, b"    ")
+      run Bytes.append(&mut line, Bytes.asSlice(&row.guide))
+      run Bytes.append(&mut line, Bytes.asSlice(&row.name))
+    }
+    if row.repeated {
+      run Bytes.append(&mut line, b"  ")
+      run Progress.paint(self, &mut line, b"\x1b[2m", b"(above)")
+    }
+    if idle {
+      run Bytes.append(&mut line, b"\n")
+      return run Bytes.append(&mut text.*, Bytes.asSlice(&line))
+    }
+    let share = &List<Share>.asSlice(&self.shares)[row.slot]
+    let mut used = row.width
+    while used < column + 2 {
+      run Bytes.append(&mut line, b" ")
+      used = used + usize.ONE
+    }
+    let unit = unitName(self.phase, share.items != usize.ONE)
+    if unit.length > usize.ZERO {
+      let mut counted = Bytes.make()
+      run Progress.appendCount(&mut counted, share.items)
+      run Bytes.append(&mut counted, b" ")
+      run Bytes.append(&mut counted, unit)
+      run Bytes.append(&mut line, Bytes.asSlice(&counted))
+      used = used + Bytes.length(&counted)
+    }
+    // The share ends two columns before the time; a row too wide for that keeps one space.
+    if used + 4 > treeSpan - 2 {
+      run Bytes.append(&mut line, b" ")
+    }
+    while used + 4 < treeSpan - 2 {
+      run Bytes.append(&mut line, b" ")
+      used = used + usize.ONE
+    }
+    let mut percent = usize.ZERO
+    if phaseNanos > 0 {
+      let mut part = share.nanos
+      if part > phaseNanos {
+        part = phaseNanos
+      }
+      percent = u64.toUsize(u64.divide(part * 100, phaseNanos))
+    }
+    // A package that took some time but less than a hundredth of the phase reads `<1%`, not `0%`.
+    let mut shown = Bytes.make()
+    if percent == usize.ZERO && share.nanos > 0 {
+      run Bytes.append(&mut shown, b" <1%")
+    } else {
+      if percent < 100 {
+        run Bytes.append(&mut shown, b" ")
+      }
+      if percent < 10 {
+        run Bytes.append(&mut shown, b" ")
+      }
+      run JsonText.appendDecimal(&mut shown, percent)
+      run Bytes.append(&mut shown, b"%")
+    }
+    run Progress.paint(self, &mut line, b"\x1b[2m", Bytes.asSlice(&shown))
+    run Bytes.append(&mut line, b"  ")
+    let mut elapsed = Bytes.make()
+    run Progress.appendFineDuration(&mut elapsed, share.nanos)
+    run Progress.paint(self, &mut line, b"\x1b[2m", Bytes.asSlice(&elapsed))
+    run Bytes.append(&mut line, b"\n")
+    run Bytes.append(&mut text.*, Bytes.asSlice(&line))
   }
 
   // Writes one summary row: `✓ check     97 modules           1.91s`, and after the time the
@@ -1307,6 +1686,19 @@ effect fn write(bytes: &[u8]) -> () {
   return ()
 }
 
+// Whether `names` holds `name`.
+fn listed(names: &List<Bytes>, name: &[u8]) -> bool {
+  let held = List<Bytes>.asSlice(names)
+  let mut at = usize.ZERO
+  while at < held.length {
+    if sameName(Bytes.asSlice(&held[at]), name) {
+      return true
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
 // Whether two item names are the same bytes.
 fn sameName(left: &[u8], right: &[u8]) -> bool {
   if left.length != right.length {
@@ -1320,6 +1712,19 @@ fn sameName(left: &[u8], right: &[u8]) -> bool {
     at = at + usize.ONE
   }
   return true
+}
+
+// The name of a package identity without its version: `mod-b` for `mod-b@0.1.0`. A build holds
+// one version of each package, so the name alone tells its packages apart.
+fn packageName(package: &[u8]) -> &[u8] {
+  let mut at = usize.ZERO
+  while at < package.length {
+    if package[at] == 64 {
+      return Slice.view<u8>(package, usize.ZERO, at)
+    }
+    at = at + usize.ONE
+  }
+  return package
 }
 
 // Keeps `name`, which took `nanos`, in `slowest` when the list has room or it is slower than the
