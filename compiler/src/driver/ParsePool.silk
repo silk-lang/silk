@@ -1,0 +1,349 @@
+//! The threads that parse a load's source files.
+//!
+//! A load reads its modules in waves, one level of imports at a time, and parses each wave's files
+//! before it reads their imports. It also parses ahead the files the last build's store parsed,
+//! which it waits for only at its end. [`ParsePool`] keeps the same threads for the whole load: a
+//! share of files waits in one queue until a thread takes it, a thread starts only when a share
+//! waits and no thread is idle, and the threads stop when the pool is dropped. The thread that
+//! loads parses the shares of a wave no thread has taken while it waits for the wave, so a wave
+//! never waits on a thread that is busy parsing ahead.
+
+import semantic.SourceUnit { Parsed, SourceUnit }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.concurrency.sync { Arc, Condition, Mutex }
+import silk.concurrency.thread { Concurrent, Transferable }
+import silk.concurrency.thread_native { JoinHandle, NativeThread, SpawnError }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Drop }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.usize
+import silk.trace { SpanContext, Trace }
+import Tracing
+
+/// One file to parse.
+pub struct ParseJob {
+  /// Where the parsed file goes: its place among the files of its wave, or among the modules the
+  /// load scanned for a file parsed ahead.
+  pub slot: usize,
+  /// The module's name for the span of its parse, or nothing when the process is not traced.
+  pub name: Bytes,
+  /// The file's contents.
+  pub bytes: Bytes,
+}
+
+/// The syntax of one [`ParseJob`]'s file, at the job's slot.
+pub struct ParsedFile {
+  pub slot: usize,
+  pub parsed: Parsed,
+}
+
+/// What waits for a share: the wave being loaded, or the end of the load, for a file parsed ahead.
+pub enum Group { Wave, Ahead }
+
+// A share of files waiting for a thread, with the span that was current when it was queued.
+struct Share {
+  group: Group,
+  jobs: List<ParseJob>,
+  parent: Option<SpanContext>,
+}
+
+// What the threads share: the shares waiting, what was parsed for each group, how many shares of
+// each group are queued or being parsed, how many threads wait for a share, and whether the pool
+// is being dropped.
+struct Queue {
+  shares: List<Share>,
+  wave: List<ParsedFile>,
+  ahead: List<ParsedFile>,
+  wavePending: usize,
+  aheadPending: usize,
+  idle: usize,
+  closed: bool,
+}
+
+impl Transferable for Queue {}
+
+// The queue, the condition a thread waits on for a share, and the one the loading thread waits on
+// for a group to finish.
+struct Shared {
+  queue: Mutex<Queue>,
+  work: Condition,
+  finished: Condition,
+}
+
+impl Transferable for Shared {}
+impl Concurrent for Shared {}
+
+/// The threads that parse a load's files, and the shares they have not finished.
+pub struct ParsePool {
+  shared: Arc<Shared>,
+  workers: List<JoinHandle<()>>,
+  limit: usize,
+}
+
+impl ParsePool {
+  /// A pool that runs at most `limit` threads beside the one that loads. It starts none until a
+  /// share waits.
+  pub effect fn make(limit: usize) -> ParsePool ! OutOfMemoryError ? &mut Allocator {
+    let queue = Queue {
+      shares: List<Share>.make(),
+      wave: List<ParsedFile>.make(),
+      ahead: List<ParsedFile>.make(),
+      wavePending: usize.ZERO,
+      aheadPending: usize.ZERO,
+      idle: usize.ZERO,
+      closed: false,
+    }
+    let shared = Shared {
+      queue: run Mutex<Queue>.make(move queue),
+      work: run Condition.make(),
+      finished: run Condition.make(),
+    }
+    return ParsePool { shared: run Arc<Shared>.make(move shared), workers: List<JoinHandle<()>>.make(), limit: limit }
+  }
+
+  /// How many threads can parse at once: the pool's and the one that loads.
+  pub fn width(self: &Self) -> usize {
+    return self.limit + usize.ONE
+  }
+
+  /// Queues `jobs` for `group` as one share, and starts a thread for it when no thread is idle and
+  /// fewer than the limit run. A pool whose thread cannot start leaves the share to [`collect`].
+  pub effect fn submit(self: &mut Self, group: Group, jobs: List<ParseJob>) -> () ! OutOfMemoryError ? &mut Allocator {
+    if List<ParseJob>.length(&jobs) == usize.ZERO {
+      return ()
+    }
+    let share = Share { group: group, jobs: move jobs, parent: Trace.current() }
+    let mut guard = self.shared.get().queue.lock()
+    let queue = guard.getMut()
+    run List<Share>.append(&mut queue.shares, move share)
+    if group == Group.Wave {
+      queue.wavePending = queue.wavePending + usize.ONE
+    } else {
+      queue.aheadPending = queue.aheadPending + usize.ONE
+    }
+    let start = List<Share>.length(&queue.shares) > queue.idle && List<JoinHandle<()>>.length(&self.workers) < self.limit
+    drop guard
+    self.shared.get().work.notifyOne()
+    if start {
+      let shared = self.shared.clone()
+      match move run Effect.result(NativeThread.spawn(|| -> () {
+        return run work(move shared)
+      })) {
+        Result<JoinHandle<()>, OutOfMemoryError | SpawnError>.Success { value } => {
+          run List<JoinHandle<()>>.append(&mut self.workers, move value)
+        }
+        Result<JoinHandle<()>, OutOfMemoryError | SpawnError>.Failure { error } => match move error {
+          SpawnError unstarted => {
+            drop unstarted
+            // No thread runs from here on; every share is the loading thread's.
+            self.limit = List<JoinHandle<()>>.length(&self.workers)
+          }
+          OutOfMemoryError exhausted => {
+            fail move exhausted
+          }
+        }
+      }
+    }
+  }
+
+  /// Waits for every share of `group` and returns the files parsed for it, in no order. While it
+  /// waits, this thread parses the shares of `group` no thread has taken. A file a thread could not
+  /// parse for lack of memory is missing.
+  pub effect fn collect(self: &mut Self, group: Group) -> List<ParsedFile> ! OutOfMemoryError ? &mut Allocator {
+    let mut files = List<ParsedFile>.make()
+    while true {
+      let mut guard = self.shared.get().queue.lock()
+      let taken = takeShare(guard.getMut(), group)
+      if let Option<Share>.Some { value } = move taken {
+        drop guard
+        let Share { jobs, parent, .. } = move value
+        let parsed = run parseShare(move jobs, parent)
+        run List<ParsedFile>.appendList(&mut files, move parsed)
+        continue
+      }
+      let queue = guard.getMut()
+      let pending = if group == Group.Wave { queue.wavePending } else { queue.aheadPending }
+      if pending == usize.ZERO {
+        let done = if group == Group.Wave {
+          Intrinsic.replace(queue.wave, List<ParsedFile>.make())
+        } else {
+          Intrinsic.replace(queue.ahead, List<ParsedFile>.make())
+        }
+        drop guard
+        run List<ParsedFile>.appendList(&mut files, move done)
+        return move files
+      }
+      self.shared.get().finished.wait(&mut guard)
+    }
+    return move files
+  }
+}
+
+impl Drop for ParsePool {
+  // Tells the threads to stop once the queue is empty, so that dropping their handles, which waits
+  // for them, ends.
+  fn drop(self: &mut Self) -> () {
+    let mut guard = self.shared.get().queue.lock()
+    let queue = guard.getMut()
+    queue.closed = true
+    drop guard
+    self.shared.get().work.notifyAll()
+  }
+}
+
+// Removes the first share of `group` from the queue, counting it as no longer pending: the caller
+// parses it before it looks at the counts again.
+fn takeShare(queue: &mut Queue, group: Group) -> Option<Share> {
+  let shares = List<Share>.asSlice(&queue.shares)
+  let mut at = usize.ZERO
+  while at < shares.length {
+    if shares[at].group == group {
+      if group == Group.Wave {
+        queue.wavePending = queue.wavePending - usize.ONE
+      } else {
+        queue.aheadPending = queue.aheadPending - usize.ONE
+      }
+      return Option<Share>.some(List<Share>.remove(&mut queue.shares, at))
+    }
+    at = at + usize.ONE
+  }
+  return Option<Share>.none()
+}
+
+// A pool thread: parses shares, oldest first, until the pool is dropped and the queue is empty.
+effect fn work(shared: Arc<Shared>) -> () {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  while true {
+    let share = match move next(shared.get()) {
+      Option<Share>.Some { value } => move value
+      Option<Share>.None => {
+        return ()
+      }
+    }
+    let Share { group, jobs, parent } = move share
+    let parsed = run Effect.result(parseShare(move jobs, parent) |> Effect.provideMut<Allocator>(&mut allocator))
+    let files = match move parsed {
+      Result<List<ParsedFile>, OutOfMemoryError>.Success { value } => move value
+      Result<List<ParsedFile>, OutOfMemoryError>.Failure { error } => {
+        drop error
+        List<ParsedFile>.make()
+      }
+    }
+    let mut guard = shared.get().queue.lock()
+    let queue = guard.getMut()
+    if group == Group.Wave {
+      queue.wavePending = queue.wavePending - usize.ONE
+      drop run Effect.result(List<ParsedFile>.appendList(&mut queue.wave, move files) |> Effect.provideMut<Allocator>(&mut allocator))
+    } else {
+      queue.aheadPending = queue.aheadPending - usize.ONE
+      drop run Effect.result(List<ParsedFile>.appendList(&mut queue.ahead, move files) |> Effect.provideMut<Allocator>(&mut allocator))
+    }
+    drop guard
+    shared.get().finished.notifyAll()
+  }
+}
+
+// Waits for a share and takes it, or none once the pool is dropped and no share waits.
+fn next(shared: &Shared) -> Option<Share> {
+  let mut guard = shared.queue.lock()
+  while true {
+    let queue = guard.getMut()
+    if List<Share>.length(&queue.shares) > usize.ZERO {
+      return Option<Share>.some(List<Share>.remove(&mut queue.shares, usize.ZERO))
+    }
+    if queue.closed {
+      return Option<Share>.none()
+    }
+    queue.idle = queue.idle + usize.ONE
+    shared.work.wait(&mut guard)
+    let woken = guard.getMut()
+    woken.idle = woken.idle - usize.ONE
+  }
+  return Option<Share>.none()
+}
+
+// Parses `jobs` under a span that continues `parent`, the span that was current when its share was
+// queued, so that each file's span has the load's.
+effect fn parseShare(jobs: List<ParseJob>, parent: Option<SpanContext>) -> List<ParsedFile>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if let Option<SpanContext>.Some { value } = parent {
+    let _traced = Trace.spanFrom(&value, "parse.share")
+    Trace.set("files", &List<ParseJob>.length(&jobs))
+    return run parseEach(move jobs)
+  }
+  return run parseEach(move jobs)
+}
+
+/// Parses each of `jobs` on this thread.
+pub effect fn parseEach(jobs: List<ParseJob>) -> List<ParsedFile>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut pending = move jobs
+  let mut files = List<ParsedFile>.make()
+  while List<ParseJob>.length(&pending) > usize.ZERO {
+    let last = List<ParseJob>.length(&pending) - usize.ONE
+    let ParseJob { slot, name, bytes } = List<ParseJob>.remove(&mut pending, last)
+    run List<ParsedFile>.append(
+      &mut files,
+      ParsedFile { slot: slot, parsed: run parseFile(Bytes.asSlice(&name), move bytes) },
+    )
+  }
+  return move files
+}
+
+// The syntax of the file `name`, under a span that names it.
+effect fn parseFile(name: &[u8], bytes: Bytes) -> Parsed ! OutOfMemoryError ? &mut Allocator {
+  let _traced = Trace.span("parse.file")
+  Trace.set("module", &Tracing.label(name))
+  Trace.set("bytes", &Bytes.length(&bytes))
+  return run SourceUnit.parseSyntax(move bytes)
+}
+
+/// Splits `jobs` into `count` shares of about the same size in bytes: the largest file first, each
+/// to the lightest share. Empty shares are left out.
+pub effect fn split(jobs: List<ParseJob>, count: usize) -> List<List<ParseJob>> ! OutOfMemoryError ? &mut Allocator {
+  let mut pending = move jobs
+  let mut shares = List<List<ParseJob>>.make()
+  let mut loads = List<usize>.make()
+  while List<List<ParseJob>>.length(&shares) < count {
+    run List<List<ParseJob>>.append(&mut shares, List<ParseJob>.make())
+    run List<usize>.append(&mut loads, usize.ZERO)
+  }
+  while List<ParseJob>.length(&pending) > usize.ZERO {
+    let jobs = List<ParseJob>.asSlice(&pending)
+    let mut largest = usize.ZERO
+    let mut at = usize.ONE
+    while at < jobs.length {
+      if Bytes.length(&jobs[at].bytes) > Bytes.length(&jobs[largest].bytes) {
+        largest = at
+      }
+      at = at + usize.ONE
+    }
+    let job = List<ParseJob>.remove(&mut pending, largest)
+    let weights = List<usize>.asSlice(&loads)
+    let mut lightest = usize.ZERO
+    at = usize.ONE
+    while at < weights.length {
+      if weights[at] < weights[lightest] {
+        lightest = at
+      }
+      at = at + usize.ONE
+    }
+    let load = List<usize>.get(&loads, lightest) + Bytes.length(&job.bytes)
+    List<usize>.set(&mut loads, lightest, load)
+    let mut writable = List<List<ParseJob>>.asMutSlice(&mut shares)
+    run List<ParseJob>.append(&mut writable[lightest], move job)
+  }
+  let mut filled = List<List<ParseJob>>.make()
+  while List<List<ParseJob>>.length(&shares) > usize.ZERO {
+    let share = List<List<ParseJob>>.remove(&mut shares, usize.ZERO)
+    if List<ParseJob>.length(&share) > usize.ZERO {
+      run List<List<ParseJob>>.append(&mut filled, move share)
+    }
+  }
+  return move filled
+}

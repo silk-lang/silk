@@ -59,7 +59,8 @@ import silk.toml.value { Toml, TomlChild, Value as TomlValue }
 import silk.num.usize
 import silk.io.writer { Writer }
 import silk.collections.list { List }
-import silk.concurrency.thread_native { JoinHandle, NativeThread, SpawnError }
+import silk.concurrency.thread_native { NativeThread }
+import driver.ParsePool as ParsePools { Group, ParseJob, ParsedFile, ParsePool }
 import silk.trace { Trace }
 import Tracing
 
@@ -366,9 +367,9 @@ effect fn takeWave(wave: &mut List<WaveModule>, at: usize) -> WaveModule
   return Intrinsic.replace(held[at], move empty)
 }
 
-// The syntax of each of `jobs`, at its slot of `count`, parsed on up to `threads` threads beside
-// this one, largest first to the lightest share. A slot a thread could not parse is none.
-effect fn parseWave(jobs: List<ParseJob>, count: usize, threads: usize) -> List<Option<Parsed>>
+// The syntax of each of `jobs`, at its slot of `count`: a wave of one file parsed here, a larger
+// one split between `pool`'s threads and this one. A slot no thread could parse is none.
+effect fn parseWave(pool: &mut ParsePool, jobs: List<ParseJob>, count: usize) -> List<Option<Parsed>>
   ! OutOfMemoryError
   ? &mut Allocator {
   let mut slots = List<Option<Parsed>>.make()
@@ -376,63 +377,15 @@ effect fn parseWave(jobs: List<ParseJob>, count: usize, threads: usize) -> List<
   while List<Option<Parsed>>.length(&slots) < count {
     run List<Option<Parsed>>.append(&mut slots, Option<Parsed>.none())
   }
-  let mut pending = move jobs
-  let mut shares = List<List<ParseJob>>.make()
-  let mut loads = List<usize>.make()
-  let mut share = usize.ZERO
-
-  // A wave of one file parses here.
-  let mut used = threads
-  if List<ParseJob>.length(&pending) < 2 {
-    used = usize.ZERO
+  if List<ParseJob>.length(&jobs) < 2 {
+    run placeParsed(&mut slots, run ParsePools.parseEach(move jobs))
+    return move slots
   }
-  while share <= used {
-    run List<List<ParseJob>>.append(&mut shares, List<ParseJob>.make())
-    run List<usize>.append(&mut loads, usize.ZERO)
-    share = share + usize.ONE
-  }
-  while List<ParseJob>.length(&pending) > usize.ZERO {
-    let jobs = List<ParseJob>.asSlice(&pending)
-    let mut largest = usize.ZERO
-    let mut at = usize.ONE
-    while at < jobs.length {
-      if Bytes.length(&jobs[at].bytes) > Bytes.length(&jobs[largest].bytes) {
-        largest = at
-      }
-      at = at + usize.ONE
-    }
-    let job = List<ParseJob>.remove(&mut pending, largest)
-    let weights = List<usize>.asSlice(&loads)
-    let mut lightest = usize.ZERO
-    at = usize.ONE
-    while at < weights.length {
-      if weights[at] < weights[lightest] {
-        lightest = at
-      }
-      at = at + usize.ONE
-    }
-    let load = List<usize>.get(&loads, lightest) + Bytes.length(&job.bytes)
-    List<usize>.set(&mut loads, lightest, load)
-    let mut writable = List<List<ParseJob>>.asMutSlice(&mut shares)
-    run List<ParseJob>.append(&mut writable[lightest], move job)
-  }
-  let own = List<List<ParseJob>>.remove(&mut shares, usize.ZERO)
-  let mut workers = List<JoinHandle<List<ParsedFile>>>.make()
+  let mut shares = run ParsePools.split(move jobs, pool.width())
   while List<List<ParseJob>>.length(&shares) > usize.ZERO {
-    let jobs = List<List<ParseJob>>.remove(&mut shares, usize.ZERO)
-
-    // A share no thread takes parses here.
-    if List<JoinHandle<List<ParsedFile>>>.length(&workers) < threads {
-      run parseAhead(&mut workers, move jobs)
-    } else {
-      run placeParsed(&mut slots, run parseEach(move jobs))
-    }
+    run pool.submit(Group.Wave, List<List<ParseJob>>.remove(&mut shares, usize.ZERO))
   }
-  run placeParsed(&mut slots, run parseEach(move own))
-  while List<JoinHandle<List<ParsedFile>>>.length(&workers) > usize.ZERO {
-    let handle = List<JoinHandle<List<ParsedFile>>>.remove(&mut workers, usize.ZERO)
-    run placeParsed(&mut slots, handle.join())
-  }
+  run placeParsed(&mut slots, run pool.collect(Group.Wave))
   return move slots
 }
 
@@ -449,33 +402,12 @@ effect fn placeParsed(slots: &mut List<Option<Parsed>>, files: List<ParsedFile>)
   }
 }
 
-struct ParseJob {
-  slot: usize,
-  // The module's name for the span of its parse, or nothing when the process is not traced.
-  name: Bytes,
-  bytes: Bytes,
-}
-
 // The name of `module` for a span, as `package:path`, or nothing when the process is not traced.
 effect fn tracedName(module: &ModuleId) -> Bytes ! OutOfMemoryError ? &mut Allocator {
   if Tracing.on() {
     return run ModuleId.copyPackagePath(module)
   }
   return Bytes.make()
-}
-
-// The syntax of the file `name`, under a span that names it.
-effect fn parseFile(name: &[u8], bytes: Bytes) -> Parsed ! OutOfMemoryError ? &mut Allocator {
-  let _traced = Trace.span("parse.file")
-  Trace.set("module", &Tracing.label(name))
-  Trace.set("bytes", &Bytes.length(&bytes))
-  return run SourceUnit.parseSyntax(move bytes)
-}
-
-// What a thread parsed for one `ParseJob`.
-struct ParsedFile {
-  slot: usize,
-  parsed: Parsed,
 }
 
 /// The existing filesystem provider selected for one canonical source request.
@@ -3418,11 +3350,11 @@ pub effect fn preload(self: &mut ModuleSources, roots: &[ModuleId]) -> ()
   List<ModuleId>.clear(&mut self.claimFree)
   List<LoadedDigest>.clear(&mut self.digests)
 
-  // A file the last build's store parsed is parsed again ahead, on threads of their own, while
-  // this load reads and parses the rest (see `ImportSummaries.wasParsed`).
+  // A file the last build's store parsed is parsed again ahead, by the pool's threads, while this
+  // load reads and parses the rest (see `ImportSummaries.wasParsed`). The pool keeps its threads
+  // for the whole load, and they stop when it is dropped at the end.
   let mut ahead = List<ParseJob>.make()
-  let mut workers = List<JoinHandle<List<ParsedFile>>>.make()
-  let threads = NativeThread.processorCount() - usize.ONE
+  let mut pool = run ParsePool.make(NativeThread.processorCount() - usize.ONE)
   let number = Revision.revisionNumber(&self.revision)
   let mut scanned = List<ModuleId>.make()
 
@@ -3481,11 +3413,9 @@ pub effect fn preload(self: &mut ModuleSources, roots: &[ModuleId]) -> ()
           )
         }
 
-        // The jobs found so far parse while this file does.
-        if !hit && List<JoinHandle<List<ParsedFile>>>.length(&workers) < threads {
-          run parseAhead(&mut workers, Intrinsic.replace(ahead, List<ParseJob>.make()))
-        }
         if !hit {
+          // The jobs found so far parse while this file does.
+          run pool.submit(Group.Ahead, Intrinsic.replace(ahead, List<ParseJob>.make()))
           run List<ParseJob>.append(
             &mut misses,
             ParseJob {
@@ -3502,13 +3432,9 @@ pub effect fn preload(self: &mut ModuleSources, roots: &[ModuleId]) -> ()
       }
     }
     drop reading
-    let mut free = usize.ZERO
-    if List<JoinHandle<List<ParsedFile>>>.length(&workers) < threads {
-      free = threads - List<JoinHandle<List<ParsedFile>>>.length(&workers)
-    }
     let parsing = Trace.span("load.parse")
     Trace.set("files", &List<ParseJob>.length(&misses))
-    let mut syntax = run parseWave(move misses, List<WaveModule>.length(&wave), free)
+    let mut syntax = run parseWave(&mut pool, move misses, List<WaveModule>.length(&wave))
     drop parsing
     let summarizing = Trace.span("load.imports")
     let mut taken = usize.ZERO
@@ -3595,62 +3521,14 @@ pub effect fn preload(self: &mut ModuleSources, roots: &[ModuleId]) -> ()
     run Tracing.flush()
   }
 
-  // The rest is split between the threads left and this one.
-  let mut shares = List<List<ParseJob>>.make()
-  let mut share = usize.ZERO
-  let mut live = List<JoinHandle<List<ParsedFile>>>.length(&workers)
-  if live > threads {
-    live = threads
-  }
-  let free = threads - live
-  while share <= free {
-    run List<List<ParseJob>>.append(&mut shares, List<ParseJob>.make())
-    share = share + usize.ONE
-  }
-  let mut loads = List<usize>.make()
-  while List<usize>.length(&loads) < List<List<ParseJob>>.length(&shares) {
-    run List<usize>.append(&mut loads, usize.ZERO)
-  }
-
-  // Largest first, each to the lightest share.
-  while List<ParseJob>.length(&ahead) > usize.ZERO {
-    let jobs = List<ParseJob>.asSlice(&ahead)
-    let mut largest = usize.ZERO
-    let mut at = usize.ONE
-    while at < jobs.length {
-      if Bytes.length(&jobs[at].bytes) > Bytes.length(&jobs[largest].bytes) {
-        largest = at
-      }
-      at = at + usize.ONE
-    }
-    let job = List<ParseJob>.remove(&mut ahead, largest)
-    let weights = List<usize>.asSlice(&loads)
-    let mut lightest = usize.ZERO
-    at = usize.ONE
-    while at < weights.length {
-      if weights[at] < weights[lightest] {
-        lightest = at
-      }
-      at = at + usize.ONE
-    }
-    let load = List<usize>.get(&loads, lightest) + Bytes.length(&job.bytes)
-    List<usize>.set(&mut loads, lightest, load)
-    let mut writable = List<List<ParseJob>>.asMutSlice(&mut shares)
-    run List<ParseJob>.append(&mut writable[lightest], move job)
-  }
-  let own = List<List<ParseJob>>.remove(&mut shares, usize.ZERO)
+  // The rest is split between the pool's threads and this one, which waits for every file parsed
+  // ahead.
+  let mut shares = run ParsePools.split(move ahead, pool.width())
   while List<List<ParseJob>>.length(&shares) > usize.ZERO {
-    run parseAhead(&mut workers, List<List<ParseJob>>.remove(&mut shares, usize.ZERO))
+    run pool.submit(Group.Ahead, List<List<ParseJob>>.remove(&mut shares, usize.ZERO))
   }
-  let mut files = run parseEach(move own)
-  while List<JoinHandle<List<ParsedFile>>>.length(&workers) > usize.ZERO {
-    let handle = List<JoinHandle<List<ParsedFile>>>.remove(&mut workers, usize.ZERO)
-    let mut joined = handle.join()
-    while List<ParsedFile>.length(&joined) > usize.ZERO {
-      let last = List<ParsedFile>.length(&joined) - usize.ONE
-      run List<ParsedFile>.append(&mut files, List<ParsedFile>.remove(&mut joined, last))
-    }
-  }
+  let mut files = run pool.collect(Group.Ahead)
+  drop pool
 
   // A store takes each unit by its module and bytes, so their order does not matter.
   while List<ParsedFile>.length(&files) > usize.ZERO {
@@ -3660,70 +3538,6 @@ pub effect fn preload(self: &mut ModuleSources, roots: &[ModuleId]) -> ()
     run List<SourceUnit>.append(&mut self.parsed, move unit)
   }
   return run Tracing.flush()
-}
-
-// Starts parsing `jobs` on a thread of its own. When no thread starts, the store parses each file
-// when it first reads it.
-effect fn parseAhead(workers: &mut List<JoinHandle<List<ParsedFile>>>, jobs: List<ParseJob>) -> ()
-  ! OutOfMemoryError
-  ? &mut Allocator {
-  if List<ParseJob>.length(&jobs) == usize.ZERO {
-    return ()
-  }
-  match move run Effect.result(
-    NativeThread.spawn(
-      || -> List<ParsedFile> {
-        return run parseDetached(move jobs)
-      },
-    ),
-  ) {
-    Result<JoinHandle<List<ParsedFile>>, OutOfMemoryError | SpawnError>.Success { value } => {
-      run List<JoinHandle<List<ParsedFile>>>.append(&mut workers.*, move value)
-    }
-    Result<JoinHandle<List<ParsedFile>>, OutOfMemoryError | SpawnError>.Failure {
-      error
-    } => match move error {
-      SpawnError unstarted => {
-        drop unstarted
-      }
-      OutOfMemoryError exhausted => {
-        fail move exhausted
-      }
-    }
-  }
-  return ()
-}
-
-// `parseEach` on a thread of its own, with an allocator of its own. A thread that runs out of
-// memory parses nothing, and the store parses each file when it first reads it.
-effect fn parseDetached(jobs: List<ParseJob>) -> List<ParsedFile> {
-  let mut allocator = Allocator.systemAllocatorProvider()
-  let parsed = run Effect.result(
-    parseEach(move jobs) |> Effect.provideMut<Allocator>(&mut allocator),
-  )
-  return match move parsed {
-    Result<List<ParsedFile>, OutOfMemoryError>.Success { value } => move value
-    Result<List<ParsedFile>, OutOfMemoryError>.Failure { error } => {
-      drop error
-      return List<ParsedFile>.make()
-    }
-  }
-}
-
-effect fn parseEach(jobs: List<ParseJob>) -> List<ParsedFile>
-  ! OutOfMemoryError
-  ? &mut Allocator {
-  let mut pending = move jobs
-  let mut files = List<ParsedFile>.make()
-  while List<ParseJob>.length(&pending) > usize.ZERO {
-    let last = List<ParseJob>.length(&pending) - usize.ONE
-    let ParseJob { slot, name, bytes } = List<ParseJob>.remove(&mut pending, last)
-    run List<ParsedFile>.append(
-      &mut files,
-      ParsedFile { slot: slot, parsed: run parseFile(Bytes.asSlice(&name), move bytes) },
-    )
-  }
-  return move files
 }
 
 /// The digests of the modules the last load read that a store reading `events` parsed, for

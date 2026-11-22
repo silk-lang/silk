@@ -316,7 +316,8 @@ What a trace holds, from the outside in:
 | `project.select`, `compiler.stamp`, `target` | Finding the packages, the compiler's identity, one package's artifact |
 | `unit.build`, `unit.check`, `unit.test` | One compilation, with its `output`, `target` and `optimization` |
 | `load` | `load.sources`, then one `load.wave` per level of imports: `load.read`, `load.parse` and `load.imports` |
-| `parse.file` | One file, with its `module` (as `package:path`) and `bytes`: `lex`, `parse`, `hir.lower`. Under `load.parse` on the parsing threads, or where a query first read a file no load parsed |
+| `parse.share` | One share of a wave's files, or of the files parsed ahead, with its `files`, on the thread that parsed it. The load keeps one thread per processor but one for all its waves, and parses a wave's untaken shares itself, so each parsing thread is one track. Under the span that was current when the share was queued |
+| `parse.file` | One file, with its `module` (as `package:path`) and `bytes`: `lex`, `parse`, `hir.lower`. Under a `parse.share`, under `load.parse` for a wave of one file, or where a query first read a file no load parsed |
 | `cache` | Reading the semantic cache of the last build |
 | `semantic` | `check` and `codegen`, with the process's `memory.peak_bytes` at their end |
 | `check` | `check.runtime`, one `check.module` per module (`check.sweep` when its declarations are swept rather than verified), `check.escapes` |
