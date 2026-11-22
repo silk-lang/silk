@@ -19,7 +19,9 @@ default when available, and selected value. Integer parameters use decimal text 
 their exact value through JSON tools.
 
 A request's optional `trace` record asks the compiler to record its own work on that request:
-`file` is the absolute path it appends OpenTelemetry spans and logs to as OTLP JSON lines,
+`file` is the absolute path it appends OpenTelemetry spans and logs to, as OTLP JSON lines or, for
+a path ending in `.pftrace` or `.perfetto-trace`, as Perfetto packets with memory and processor
+counters,
 `queries` the number of microseconds a semantic query run must take to be a span, and `parent` a
 W3C `traceparent` under which the compilation continues another program's trace. The record
 changes nothing else the compiler writes, and a build writes none into the request it publishes.

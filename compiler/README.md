@@ -282,14 +282,20 @@ the trace. It is off unless asked for:
 ```sh
 silk build --trace build.ndjson                       # phases, files, units
 silk build --trace build.ndjson --trace-queries 100   # and each query run of 100 µs or more
+silk build --trace build.pftrace                      # the same as a Perfetto trace, with counters
 ```
 
 `--trace` names a file the compiler appends to: OTLP JSON, one request per line, which an
-OpenTelemetry collector takes at `/v1/traces` and `/v1/logs` as it is. `build`, `check`, `test`,
-`run`, `debug`, `hash` and `task` take it. Every process of one command writes to the same file
-under one trace: the workspace members a build copies itself for, the copy that writes the
-semantic cache, and the compiler a workspace command starts for each member. A traced `check`
-does its work in its own process and asks no check server.
+OpenTelemetry collector takes at `/v1/traces` and `/v1/logs` as it is. A file named `.pftrace`
+or `.perfetto-trace` gets Perfetto packets instead (`silk.trace.perfetto`), which
+[ui.perfetto.dev](https://ui.perfetto.dev) and `trace_processor` open: each span is a slice on
+the track of the thread that ran it, each log an instant on the process's `log` track, and every
+10 ms the process's resident memory (`memory.resident`) and the share of one processor its
+threads used (`cpu`, in percent) are counters. `build`, `check`, `test`, `run`, `debug`, `hash`
+and `task` take it. Every process of one command writes to the same file under one trace: the
+workspace members a build copies itself for, the copy that writes the semantic cache, and the
+compiler a workspace command starts for each member. A traced `check` does its work in its own
+process and asks no check server.
 
 `silkc compile --request` takes the same from the `trace` record of its compilation request
 (`CompilerTrace` in `silk.build.request`): the `file`, the `queries` threshold, and the `parent`,

@@ -6,7 +6,7 @@ Distributed tracing and metrics for code with or without an effect requirement.
 
 Import as `Trace` with `import silk.trace { Trace }`.
 
-Public declarations: 15.
+Public declarations: 16.
 
 <a id="Recorder"></a>
 
@@ -57,6 +57,16 @@ pub type Otlp<'url> = Sinks.Otlp<'url>
 ```
 
 An OTLP/HTTP JSON collector destination.
+
+<a id="Perfetto"></a>
+
+## `Perfetto`
+
+```silk
+pub type Perfetto = Perfettos.Perfetto
+```
+
+A sink that writes telemetry as Perfetto trace packets through the active writer.
 
 <a id="SpanContext"></a>
 

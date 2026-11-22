@@ -1,0 +1,192 @@
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.num.i64
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.format { Format }
+import silk.text.string { String }
+import silk.trace { SpanContext }
+import silk.trace.otlp { Batch, Resource }
+import silk.trace.perfetto { CounterUnit, Event, Field, FieldValue, Ids, Perfetto, PerfettoError, PerfettoReader }
+import silk.trace.record { Span }
+import silk.trace.signals { LogRecord }
+import silk.trace.values { Attributes, Text }
+
+const IDENTITY: Resource = Resource {serviceName: "checkout", serviceVersion: "", droppedSpans: 0, droppedLogs: 0, droppedMetrics: 0}
+
+fn span(name: string<'static>, traceLow: u64, id: u64, parent: u64, thread: u64, start: u64, end: u64) -> Span {
+  let mut item = Span.empty()
+  item.context = SpanContext {traceHigh: 7, traceLow: traceLow, span: id, flags: 1}
+  item.parent = SpanContext {traceHigh: 7, traceLow: traceLow, span: parent, flags: 1}
+  item.name = name
+  item.thread = thread
+  item.start = start
+  item.end = end
+  return item
+}
+
+// Two traces: `load` on thread 100 with `parse` on thread 200 below it, which ends first as a
+// recorder drains it, then `other`; a log written in `load`; and a counter sample.
+effect fn record() -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut writer = Perfetto.make(41)
+  let mut trace = Bytes.make()
+  let mut chunk = Bytes.make()
+  let mut child = span("parse", 1, 12, 11, 200, 120, 180)
+  let size: i64 = 4096
+  child.attributes.set("bytes", &size)
+  let spans = [child, span("load", 1, 11, 0, 100, 100, 300), span("other", 2, 21, 0, 100, 400, 500)]
+  run writer.encodeInto(&IDENTITY, &Batch.Spans {values: &spans}, &mut chunk)
+  run trace.append(chunk.asSlice())
+  let log = LogRecord {time: 150, severity: 9, template: "read {}", body: Text.render("read {}", &.(3)),
+    attributes: Attributes.empty(), context: Option<SpanContext>.some(SpanContext {traceHigh: 7, traceLow: 1, span: 11, flags: 1})}
+  run writer.encodeInto(&IDENTITY, &Batch.Logs {values: &[log]}, &mut chunk)
+  run trace.append(chunk.asSlice())
+  run writer.sample(&IDENTITY, "memory.resident", CounterUnit.Bytes, 600, 1024.0, &mut trace)
+  return move trace
+}
+
+effect fn number(out: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut digits: [u8; 20] = [0; 20]
+  let end = Format.writeU64Display(value, &mut digits, 0)
+  run out.append(Slice.view<u8>(&digits, 0, end))
+}
+
+effect fn ids(out: &mut Bytes, value: &Ids) -> () ! OutOfMemoryError ? &mut Allocator {
+  run out.append(b" ")
+  run number(&mut out.*, value.traceHigh)
+  run out.append(b":")
+  run number(&mut out.*, value.traceLow)
+  run out.append(b" span ")
+  run number(&mut out.*, value.span)
+  run out.append(b" parent ")
+  run number(&mut out.*, value.parent)
+}
+
+effect fn fields(out: &mut Bytes, values: &List<Field>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let items = values.asSlice()
+  let mut at: usize = 0
+  while at < items.length {
+    run out.append(b" ")
+    run out.append(String.utf8Bytes(items[at].key.view()))
+    run out.append(b"=")
+    match &items[at].value {
+      FieldValue.Bool {value} => run out.append(if value { b"true" } else { b"false" })
+      FieldValue.Integer {value} => run number(&mut out.*, i64.toU64(value))
+      FieldValue.Unsigned {value} => run number(&mut out.*, value)
+      FieldValue.Double {..} => run out.append(b"double")
+      FieldValue.Text {value} => run out.append(String.utf8Bytes(value.view()))
+    }
+    at = at + 1
+  }
+}
+
+// One line per event, naming what a reader of the trace needs: the kind, the name, the times
+// and the IDs. Track identifiers differ by process, so they are left out.
+effect fn describe(events: &List<Event>) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut out = Bytes.make()
+  let items = events.asSlice()
+  let mut at: usize = 0
+  while at < items.length {
+    match &items[at] {
+      Event.Process {pid, name, ..} => {
+        run out.append(b"process ")
+        run number(&mut out, i64.toU64(pid))
+        run out.append(b" ")
+        run out.append(String.utf8Bytes(name.view()))
+      }
+      Event.Thread {tid, ..} => {
+        run out.append(b"thread ")
+        run number(&mut out, i64.toU64(tid))
+      }
+      Event.Counter {name, unit, ..} => {
+        run out.append(b"counter ")
+        run out.append(String.utf8Bytes(name.view()))
+        if unit == CounterUnit.Bytes { run out.append(b" bytes") }
+      }
+      Event.Named {name, ..} => {
+        run out.append(b"track ")
+        run out.append(String.utf8Bytes(name.view()))
+      }
+      Event.Slice {start, end, name, ids: found, fields: held, ..} => {
+        run out.append(b"slice ")
+        run out.append(String.utf8Bytes(name.view()))
+        run out.append(b" ")
+        run number(&mut out, start)
+        run out.append(b"-")
+        run number(&mut out, end)
+        run ids(&mut out, &found)
+        run fields(&mut out, &held)
+      }
+      Event.Begin {name, ..} => {
+        run out.append(b"begin ")
+        run out.append(String.utf8Bytes(name.view()))
+      }
+      Event.End {..} => run out.append(b"end")
+      Event.Instant {time, name, ids: found, fields: held, ..} => {
+        run out.append(b"instant ")
+        run out.append(String.utf8Bytes(name.view()))
+        run out.append(b" ")
+        run number(&mut out, time)
+        run ids(&mut out, &found)
+        run fields(&mut out, &held)
+      }
+      Event.Sample {time, value, ..} => {
+        run out.append(b"sample ")
+        run number(&mut out, time)
+        if value == 1024.0 { run out.append(b" 1024") }
+      }
+    }
+    run out.append(b"\n")
+    at = at + 1
+  }
+  return move out
+}
+
+// Reads `trace` by appending `step` bytes at a time to what the last read left, as a reader that
+// follows a growing file does.
+effect fn readInSteps(trace: &[u8], step: usize) -> List<Event> ! PerfettoError | OutOfMemoryError ? &mut Allocator {
+  let mut reader = PerfettoReader.make()
+  let mut events = List<Event>.make()
+  let mut pending = Bytes.make()
+  let mut at: usize = 0
+  while at < trace.length {
+    let mut count = step
+    if count > trace.length - at { count = trace.length - at }
+    run pending.append(Slice.view<u8>(trace, at, count))
+    at = at + count
+    let used = run reader.read(pending.asSlice(), &mut events)
+    let rest = run Bytes.copy(Slice.view<u8>(pending.asSlice(), used, pending.length() - used))
+    pending = move rest
+  }
+  run reader.finish(&mut events)
+  if pending.length() != 0 { return List<Event>.make() }
+  return move events
+}
+
+effect fn check() -> i32 ! PerfettoError | OutOfMemoryError ? &mut Allocator {
+  let trace = run record()
+  let whole = run readInSteps(trace.asSlice(), trace.length())
+  let expected = "process 41 checkout\nthread 200\nslice parse 120-180 7:1 span 12 parent 11 bytes=4096\nthread 100\nslice load 100-300 7:1 span 11 parent 0\nslice other 400-500 7:2 span 21 parent 0\ntrack log\ninstant read {} 150 7:1 span 11 parent 0 message=read 3 severity=9\ncounter memory.resident bytes\nsample 600 1024\n"
+  let described = run describe(&whole)
+  if String.fromUtf8(described.asSlice()).unwrapOr("") != expected { return 1 }
+  let stepped = run readInSteps(trace.asSlice(), 3)
+  let again = run describe(&stepped)
+  if String.fromUtf8(again.asSlice()).unwrapOr("") != expected { return 2 }
+  // A packet whose field is a group, which no Perfetto trace holds, is refused.
+  let mut reader = PerfettoReader.make()
+  let mut events = List<Event>.make()
+  if let Result<usize, PerfettoError | OutOfMemoryError>.Success {..} = move run Effect.result(reader.read(b"\x0b\x01\x02", &mut events)) {
+    return 3
+  }
+  return 0
+}
+
+effect fn failed(error: PerfettoError | OutOfMemoryError) -> i32 { return 99 }
+
+pub fn main() -> i32 {
+  let mut alloc = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(check() |> Effect.provideMut<Allocator>(&mut alloc), failed)
+}
