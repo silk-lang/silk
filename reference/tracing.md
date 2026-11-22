@@ -160,4 +160,10 @@ The OTLP/HTTP sink posts JSON to `/v1/traces`, `/v1/logs` and `/v1/metrics`.
 Resource attributes identify the service. The instrumentation scope identifies the
 package that produced a decorated span.
 
+`silk.trace.perfetto` encodes the same batches as Perfetto trace packets for the Perfetto UI and
+`trace_processor`. A span is a slice on the track of the thread that opened it, a log is an
+instant on the process's `log` track, and each metric series and counter sample is a counter
+track; a histogram is left out. Packets of several processes appended to one file form one
+trace, as each process interns its names in a sequence of its own.
+
 [OTLP JSON encoding](../corpus/native/trace-otlp-json/main.silk) · [Retry behavior](../corpus/native/trace-otlp-retry/main.silk)

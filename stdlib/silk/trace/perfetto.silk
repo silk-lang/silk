@@ -1,0 +1,595 @@
+//! Perfetto trace encoding for recorder batches and counter samples.
+//!
+//! A Perfetto trace is a sequence of `TracePacket` messages, each one written as field 1 of the
+//! `Trace` message. Bytes made of whole packets are a trace on their own, and so is a file that
+//! several writers append whole packets to. The Perfetto UI and `trace_processor` open it, with each
+//! span as a slice on the track of the thread that opened it, each log as an instant on the
+//! process's `log` track, and each metric series and counter sample as a counter track.
+
+import silk.collections.bytes { Bytes }
+import silk.collections.hash { Hash }
+import silk.collections.hash_map { HashMap }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.io.writer { Writer, WriterError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f64
+import silk.num.i32
+import silk.num.i64
+import silk.num.u8
+import silk.num.u64
+import silk.num.usize
+import silk.text.format { Format }
+import silk.text.string { String }
+import silk.trace.otlp { Batch, Resource }
+import silk.trace.record { Span }
+import silk.trace.signals { InstrumentKind, LogRecord, MetricPoint }
+import silk.trace.sink { Sink }
+import silk.trace.values { Attributes, Value }
+
+/// What a counter track measures, which a trace viewer uses to format its values.
+pub enum CounterUnit {
+  /// A plain number of things.
+  Count,
+  /// A size in bytes.
+  Bytes,
+  /// A duration in nanoseconds.
+  Nanoseconds,
+  /// A percentage, where 100 is one whole.
+  Percent,
+}
+
+// One metric series: its track's name, built from the instrument and its attributes, and the
+// track's identifier.
+struct Series {
+  name: Bytes,
+  uuid: u64,
+}
+
+// The interned tables of a sequence, with the `InternedData` field and the field of each entry's
+// text: event names, debug annotation names, and debug annotation string values.
+enum Table { Names, Keys, Strings }
+
+const SEQ_INCREMENTAL_STATE_CLEARED: u64 = 1
+const SEQ_NEEDS_INCREMENTAL_STATE: u64 = 2
+const TYPE_SLICE_BEGIN: u64 = 1
+const TYPE_SLICE_END: u64 = 2
+const TYPE_INSTANT: u64 = 3
+const TYPE_COUNTER: u64 = 4
+
+/// One process's Perfetto packet sequence: the names it has interned and the tracks it has
+/// described.
+///
+/// # When to use
+/// Keep one `Perfetto` for each process that writes a trace, and pass it every batch and sample
+/// the process writes, so that each name and track is written once. As a [`Sink`] it writes each
+/// batch to the active `Writer`.
+///
+/// # Details
+/// The process ID numbers the sequence, so the packets of processes that append to one file at
+/// the same time keep their interned names apart. A span becomes a slice on the track of the
+/// thread that opened it, or on the process's `spans` track when the target gives no thread ID,
+/// with its attributes, source location and error as arguments. A log becomes an instant named
+/// by its template on the process's `log` track, with its message and severity. Each metric series
+/// becomes a counter track named by its instrument and attributes; a histogram has no single value
+/// over time and is left out. Times are the recorder's Unix nanoseconds.
+///
+/// # Gotchas
+/// A trace viewer nests slices by their times. Two spans of one thread that start at the same
+/// nanosecond nest in the order they were written, which is the order they ended, so a span and
+/// its first child must start at different times. The recorder's tick counters ensure it on Apple
+/// and Linux targets, where opening a span takes longer than one tick.
+pub struct Perfetto {
+  pid: i32,
+  sequence: u64,
+  started: bool,
+  described: bool,
+  next: u64,
+  names: HashMap<string<'static>, u64>,
+  keys: HashMap<string<'static>, u64>,
+  strings: HashMap<string<'static>, u64>,
+  threads: HashMap<u64, bool>,
+  counters: HashMap<string<'static>, u64>,
+  series: List<Series>,
+  // Whether the process's `log` track was written.
+  logged: bool,
+  // The offset of the open `InternedData` of the packet being written, or zero for none.
+  interned: usize,
+  // What one batch encodes to when the sequence writes to a `Writer` as a sink.
+  buffer: Bytes,
+}
+
+// Appends `value` as a protobuf varint.
+effect fn varint(out: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut bytes: [u8; 10] = [0; 10]
+  let mut rest = value
+  let mut at: usize = 0
+  while rest >= 128 {
+    bytes[at] = u64.wrappingToU8(u64.bitOr(u64.bitAnd(rest, 127), 128))
+    rest = u64.shiftRight(rest, 7)
+    at = at + 1
+  }
+  bytes[at] = u64.wrappingToU8(rest)
+  run out.append(Slice.view<u8>(&bytes, 0, at + 1))
+}
+
+fn key(field: u64, wire: u64) -> u64 {
+  return u64.bitOr(u64.shiftLeft(field, 3), wire)
+}
+
+effect fn number(out: &mut Bytes, field: u64, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  run varint(&mut out.*, key(field, 0))
+  run varint(&mut out.*, value)
+}
+
+// A protobuf `int64` or `int32` field: a negative value is the varint of its 64-bit two's complement.
+effect fn signed(out: &mut Bytes, field: u64, value: i64) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run number(&mut out.*, field, i64.wrappingToU64(value))
+}
+
+effect fn real(out: &mut Bytes, field: u64, value: f64) -> () ! OutOfMemoryError ? &mut Allocator {
+  run varint(&mut out.*, key(field, 1))
+  let bits = f64.toBits(value)
+  let mut bytes: [u8; 8] = [0; 8]
+  let mut at: usize = 0
+  while at < 8 {
+    bytes[at] = u64.wrappingToU8(u64.shiftRight(bits, usize.toU64(at) * 8))
+    at = at + 1
+  }
+  run out.append(&bytes)
+}
+
+effect fn text(out: &mut Bytes, field: u64, value: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  run varint(&mut out.*, key(field, 2))
+  run varint(&mut out.*, usize.toU64(value.length))
+  run out.append(value)
+}
+
+// Opens the message in `field` and returns where its contents start. Its length is four bytes that
+// `close` fills in, a varint padded with continuation bits, as Perfetto's own writer leaves room.
+effect fn open(out: &mut Bytes, field: u64) -> usize ! OutOfMemoryError ? &mut Allocator {
+  run varint(&mut out.*, key(field, 2))
+  run out.append(b"\x80\x80\x80\x00")
+  return out.length()
+}
+
+// Writes the length of the message `open` started at `at`, which must be below 2^28 bytes.
+fn close(out: &mut Bytes, at: usize) -> () {
+  let size = usize.toU64(out.length() - at)
+  let bytes = out.asMutSlice()
+  bytes[at - 4] = u64.wrappingToU8(u64.bitOr(u64.bitAnd(size, 127), 128))
+  bytes[at - 3] = u64.wrappingToU8(u64.bitOr(u64.bitAnd(u64.shiftRight(size, 7), 127), 128))
+  bytes[at - 2] = u64.wrappingToU8(u64.bitOr(u64.bitAnd(u64.shiftRight(size, 14), 127), 128))
+  bytes[at - 1] = u64.wrappingToU8(u64.bitAnd(u64.shiftRight(size, 21), 127))
+}
+
+// A track identifier for `value` within the process `pid`; zero is never one.
+fn uuid(pid: i32, value: u64) -> u64 {
+  let hashed = Hash.combine(Hash.mix(&Hash.seed(1953260658), i32.wrappingToU64(pid)), value)
+  return if hashed == 0 { 1 } else { hashed }
+}
+
+fn textHash(value: &[u8]) -> u64 {
+  let mut hashed: u64 = 14695981039346656037
+  let mut at: usize = 0
+  while at < value.length {
+    hashed = u64.wrappingMultiply(u64.bitXor(hashed, u8.toU64(value[at])), 1099511628211)
+    at = at + 1
+  }
+  return hashed
+}
+
+impl Perfetto {
+  /// Starts the packet sequence of the process `pid`. Nothing is written until the first batch or
+  /// sample.
+  pub fn make(pid: i32) -> Self {
+    return Perfetto {
+      pid: pid,
+      sequence: if pid > 0 { i32.toU64(pid) } else { 1 },
+      started: false,
+      described: false,
+      next: 1,
+      names: HashMap<string<'static>, u64>.make(Hash.seed(0)),
+      keys: HashMap<string<'static>, u64>.make(Hash.seed(0)),
+      strings: HashMap<string<'static>, u64>.make(Hash.seed(0)),
+      threads: HashMap<u64, bool>.make(Hash.seed(0)),
+      counters: HashMap<string<'static>, u64>.make(Hash.seed(0)),
+      series: List<Series>.make(),
+      logged: false,
+      interned: 0,
+      buffer: Bytes.make(),
+    }
+  }
+
+  /// Replaces the contents of `output` with the packets of `batch`, preceded by the descriptions
+  /// of the tracks and names they use first. `identity` names the process the first time.
+  pub effect fn encodeInto(self: &mut Self, identity: &Resource, batch: &Batch<'_>, output: &mut Bytes) -> ()
+    ! OutOfMemoryError ? &mut Allocator {
+    output.clear()
+    run self.describeProcess(identity.serviceName, &mut output.*)
+    match &batch.* {
+      Batch.Spans {values} => {
+        let mut at: usize = 0
+        while at < values.length {
+          run self.span(&values[at], &mut output.*)
+          at = at + 1
+        }
+      }
+      Batch.Logs {values} => {
+        let mut at: usize = 0
+        while at < values.length {
+          run self.log(&values[at], &mut output.*)
+          at = at + 1
+        }
+      }
+      Batch.Metrics {values, ..} => {
+        let mut at: usize = 0
+        while at < values.length {
+          run self.metric(&values[at], &mut output.*)
+          at = at + 1
+        }
+      }
+    }
+  }
+
+  /// Appends to `output` the value `value` of the counter `name` at `time`, in Unix nanoseconds,
+  /// and the counter's track the first time, measured in `unit`. `identity` names the process the
+  /// first time.
+  pub effect fn sample(self: &mut Self, identity: &Resource, name: string<'static>, unit: CounterUnit, time: u64,
+    value: f64, output: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.describeProcess(identity.serviceName, &mut output.*)
+    let mut track: u64 = 0
+    if let Option<u64>.Some {value: known} = self.counters.get(name) {
+      track = known
+    } else {
+      track = uuid(self.pid, textHash(String.utf8Bytes(name)))
+      run self.describeCounter(track, String.utf8Bytes(name), unit, &mut output.*)
+      drop run self.counters.insert(name, track)
+    }
+    run self.counterValue(track, time, Option<i64>.none(), value, &mut output.*)
+  }
+
+  // The process track, written before the first packet that needs it.
+  effect fn describeProcess(self: &mut Self, name: string<'static>, out: &mut Bytes) -> ()
+    ! OutOfMemoryError ? &mut Allocator {
+    if self.described { return () }
+    self.described = true
+    let packet = run open(&mut out.*, 1)
+    let descriptor = run open(&mut out.*, 60)
+    run number(&mut out.*, 1, uuid(self.pid, 0))
+    let process = run open(&mut out.*, 3)
+    run signed(&mut out.*, 1, i32.toI64(self.pid))
+    run text(&mut out.*, 6, String.utf8Bytes(name))
+    close(&mut out.*, process)
+    close(&mut out.*, descriptor)
+    close(&mut out.*, packet)
+  }
+
+  // The track of the thread `thread`, written the first time a span of the thread is.
+  effect fn threadTrack(self: &mut Self, thread: u64, out: &mut Bytes) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let track = uuid(self.pid, if thread == 0 { 1 } else { u64.bitOr(thread, 9223372036854775808) })
+    if self.threads.contains(thread) { return track }
+    drop run self.threads.insert(thread, true)
+    let packet = run open(&mut out.*, 1)
+    let descriptor = run open(&mut out.*, 60)
+    run number(&mut out.*, 1, track)
+    if thread == 0 {
+      run number(&mut out.*, 5, uuid(self.pid, 0))
+      run text(&mut out.*, 2, b"spans")
+    } else {
+      let described = run open(&mut out.*, 4)
+      run signed(&mut out.*, 1, i32.toI64(self.pid))
+      run signed(&mut out.*, 2, u64.wrappingToI64(thread))
+      close(&mut out.*, described)
+    }
+    close(&mut out.*, descriptor)
+    close(&mut out.*, packet)
+    return track
+  }
+
+  // A counter track under the process.
+  effect fn describeCounter(self: &mut Self, track: u64, name: &[u8], unit: CounterUnit, out: &mut Bytes) -> ()
+    ! OutOfMemoryError ? &mut Allocator {
+    let packet = run open(&mut out.*, 1)
+    let descriptor = run open(&mut out.*, 60)
+    run number(&mut out.*, 1, track)
+    run number(&mut out.*, 5, uuid(self.pid, 0))
+    run text(&mut out.*, 2, name)
+    let counter = run open(&mut out.*, 8)
+    match unit {
+      CounterUnit.Count => run number(&mut out.*, 3, 2)
+      CounterUnit.Bytes => run number(&mut out.*, 3, 3)
+      CounterUnit.Nanoseconds => run number(&mut out.*, 3, 1)
+      CounterUnit.Percent => run text(&mut out.*, 6, b"%")
+    }
+    close(&mut out.*, counter)
+    close(&mut out.*, descriptor)
+    close(&mut out.*, packet)
+  }
+
+  // Opens a sequenced packet at `time`; the first packet of the sequence resets its interned state.
+  effect fn openPacket(self: &mut Self, time: u64, out: &mut Bytes) -> usize ! OutOfMemoryError ? &mut Allocator {
+    let packet = run open(&mut out.*, 1)
+    run number(&mut out.*, 8, time)
+    run number(&mut out.*, 10, self.sequence)
+    if self.started {
+      run number(&mut out.*, 13, SEQ_NEEDS_INCREMENTAL_STATE)
+    } else {
+      self.started = true
+      run number(&mut out.*, 13, u64.bitOr(SEQ_INCREMENTAL_STATE_CLEARED, SEQ_NEEDS_INCREMENTAL_STATE))
+      run number(&mut out.*, 87, 1)
+    }
+    self.interned = 0
+    return packet
+  }
+
+  // The interned ID of `value` in `table`, adding the entry to the open packet's `InternedData` the
+  // first time.
+  effect fn intern(self: &mut Self, table: Table, value: string<'static>, out: &mut Bytes) -> u64
+    ! OutOfMemoryError ? &mut Allocator {
+    let known = match table {
+      Table.Names => self.names.get(value)
+      Table.Keys => self.keys.get(value)
+      Table.Strings => self.strings.get(value)
+    }
+    if let Option<u64>.Some {value: id} = known { return id }
+    let id = self.next
+    self.next = self.next + 1
+    match table {
+      Table.Names => { drop run self.names.insert(value, id) }
+      Table.Keys => { drop run self.keys.insert(value, id) }
+      Table.Strings => { drop run self.strings.insert(value, id) }
+    }
+    if self.interned == 0 { self.interned = run open(&mut out.*, 12) }
+    let entry = run open(&mut out.*, tableField(table))
+    run number(&mut out.*, 1, id)
+    run text(&mut out.*, 2, String.utf8Bytes(value))
+    close(&mut out.*, entry)
+    return id
+  }
+
+  // Closes the open packet's `InternedData`, before the event that uses it.
+  fn endInterned(self: &mut Self, out: &mut Bytes) -> () {
+    if self.interned != 0 {
+      close(&mut out.*, self.interned)
+      self.interned = 0
+    }
+  }
+
+  // Interns the keys and static strings `attributes` uses, so that `arguments` finds them.
+  effect fn internAttributes(self: &mut Self, attributes: &Attributes, out: &mut Bytes) -> ()
+    ! OutOfMemoryError ? &mut Allocator {
+    let mut at: usize = 0
+    while at < attributes.count {
+      drop run self.intern(Table.Keys, attributes.items[at].key, &mut out.*)
+      at = at + 1
+    }
+  }
+
+  // Writes `attributes` as debug annotations of the open event.
+  effect fn arguments(self: &mut Self, attributes: &Attributes, out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut at: usize = 0
+    while at < attributes.count {
+      let item = &attributes.items[at]
+      at = at + 1
+      // `internAttributes` interned the key before the event opened, so this writes nothing.
+      let name = run self.intern(Table.Keys, item.key, &mut out.*)
+      let annotation = run open(&mut out.*, 4)
+      run number(&mut out.*, 1, name)
+      match &item.value {
+        Value.Bool {value} => run number(&mut out.*, 2, if value { 1 } else { 0 })
+        Value.Integer {value} => run signed(&mut out.*, 4, value)
+        Value.Unsigned {value} => run number(&mut out.*, 3, value)
+        Value.Double {value} => run real(&mut out.*, 5, value)
+        Value.Text {value} => run text(&mut out.*, 6, String.utf8Bytes(value.view()))
+      }
+      close(&mut out.*, annotation)
+    }
+  }
+
+  // A debug annotation `name` whose value is the interned static string `value`.
+  effect fn staticArgument(self: &mut Self, name: u64, value: u64, out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+    let annotation = run open(&mut out.*, 4)
+    run number(&mut out.*, 1, name)
+    run number(&mut out.*, 17, value)
+    close(&mut out.*, annotation)
+  }
+
+  effect fn span(self: &mut Self, item: &Span, out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+    let track = run self.threadTrack(item.thread, &mut out.*)
+    let packet = run self.openPacket(item.start, &mut out.*)
+    let name = run self.intern(Table.Names, item.name, &mut out.*)
+    run self.internAttributes(&item.attributes, &mut out.*)
+    let mut function: u64 = 0
+    let mut file: u64 = 0
+    let mut line: u64 = 0
+    let mut failure: u64 = 0
+    if item.place.function != "" {
+      function = run self.intern(Table.Strings, item.place.function, &mut out.*)
+    }
+    if item.place.file != "" {
+      file = run self.intern(Table.Strings, item.place.file, &mut out.*)
+    }
+    if item.place.line != 0 { line = run self.intern(Table.Keys, "code.line.number", &mut out.*) }
+    if item.errorType != "" { failure = run self.intern(Table.Strings, item.errorType, &mut out.*) }
+    let functionKey = if function != 0 { run self.intern(Table.Keys, "code.function.name", &mut out.*) } else { 0 }
+    let fileKey = if file != 0 { run self.intern(Table.Keys, "code.file.path", &mut out.*) } else { 0 }
+    let failureKey = if failure != 0 { run self.intern(Table.Keys, "exception.type", &mut out.*) } else { 0 }
+    let errorKey = if item.error { run self.intern(Table.Keys, "error", &mut out.*) } else { 0 }
+    let cancelledKey = if item.cancelled { run self.intern(Table.Keys, "silk.cancelled", &mut out.*) } else { 0 }
+    self.endInterned(&mut out.*)
+    let event = run open(&mut out.*, 11)
+    run number(&mut out.*, 9, TYPE_SLICE_BEGIN)
+    run number(&mut out.*, 11, track)
+    run number(&mut out.*, 10, name)
+    run self.arguments(&item.attributes, &mut out.*)
+    if function != 0 { run self.staticArgument(functionKey, function, &mut out.*) }
+    if file != 0 { run self.staticArgument(fileKey, file, &mut out.*) }
+    if line != 0 {
+      let annotation = run open(&mut out.*, 4)
+      run number(&mut out.*, 1, line)
+      run number(&mut out.*, 3, item.place.line)
+      close(&mut out.*, annotation)
+    }
+    if failure != 0 { run self.staticArgument(failureKey, failure, &mut out.*) }
+    if errorKey != 0 {
+      let annotation = run open(&mut out.*, 4)
+      run number(&mut out.*, 1, errorKey)
+      run number(&mut out.*, 2, 1)
+      close(&mut out.*, annotation)
+    }
+    if cancelledKey != 0 {
+      let annotation = run open(&mut out.*, 4)
+      run number(&mut out.*, 1, cancelledKey)
+      run number(&mut out.*, 2, 1)
+      close(&mut out.*, annotation)
+    }
+    close(&mut out.*, event)
+    close(&mut out.*, packet)
+    let ending = run self.openPacket(item.end, &mut out.*)
+    let end = run open(&mut out.*, 11)
+    run number(&mut out.*, 9, TYPE_SLICE_END)
+    run number(&mut out.*, 11, track)
+    close(&mut out.*, end)
+    close(&mut out.*, ending)
+  }
+
+  effect fn log(self: &mut Self, item: &LogRecord, out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+    let track = uuid(self.pid, 2)
+    if !self.logged {
+      self.logged = true
+      let packet = run open(&mut out.*, 1)
+      let descriptor = run open(&mut out.*, 60)
+      run number(&mut out.*, 1, track)
+      run number(&mut out.*, 5, uuid(self.pid, 0))
+      run text(&mut out.*, 2, b"log")
+      close(&mut out.*, descriptor)
+      close(&mut out.*, packet)
+    }
+    let packet = run self.openPacket(item.time, &mut out.*)
+    let name = run self.intern(Table.Names, item.template, &mut out.*)
+    let message = run self.intern(Table.Keys, "message", &mut out.*)
+    let severity = run self.intern(Table.Keys, "severity", &mut out.*)
+    run self.internAttributes(&item.attributes, &mut out.*)
+    self.endInterned(&mut out.*)
+    let event = run open(&mut out.*, 11)
+    run number(&mut out.*, 9, TYPE_INSTANT)
+    run number(&mut out.*, 11, track)
+    run number(&mut out.*, 10, name)
+    let body = run open(&mut out.*, 4)
+    run number(&mut out.*, 1, message)
+    run text(&mut out.*, 6, String.utf8Bytes(item.body.view()))
+    close(&mut out.*, body)
+    let level = run open(&mut out.*, 4)
+    run number(&mut out.*, 1, severity)
+    run number(&mut out.*, 3, item.severity)
+    close(&mut out.*, level)
+    run self.arguments(&item.attributes, &mut out.*)
+    close(&mut out.*, event)
+    close(&mut out.*, packet)
+  }
+
+  effect fn metric(self: &mut Self, item: &MetricPoint, out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+    if item.kind == InstrumentKind.Histogram { return () }
+    // The series' track name: the instrument, then its attributes as `{key=value, ...}`.
+    let mut name = run Bytes.copy(String.utf8Bytes(item.name))
+    if item.overflow {
+      run name.append(b"{otel.metric.overflow}")
+    } else if item.attributes.count != 0 {
+      run name.append(b"{")
+      let mut at: usize = 0
+      while at < item.attributes.count {
+        if at != 0 { run name.append(b", ") }
+        let attribute = &item.attributes.items[at]
+        run name.append(String.utf8Bytes(attribute.key))
+        run name.append(b"=")
+        run appendValue(&mut name, &attribute.value)
+        at = at + 1
+      }
+      run name.append(b"}")
+    }
+    let known = self.series.asSlice()
+    let mut track: u64 = 0
+    let mut at: usize = 0
+    while at < known.length {
+      if sameBytes(known[at].name.asSlice(), name.asSlice()) { track = known[at].uuid }
+      at = at + 1
+    }
+    if track == 0 {
+      track = uuid(self.pid, u64.bitOr(textHash(name.asSlice()), 1))
+      run self.describeCounter(track, name.asSlice(), CounterUnit.Count, &mut out.*)
+      run self.series.append(Series {name: move name, uuid: track})
+    }
+    match item.kind {
+      InstrumentKind.Counter => run self.counterValue(track, item.time, Option<i64>.some(u64.wrappingToI64(item.count)), 0.0, &mut out.*)
+      InstrumentKind.UpDownCounter => run self.counterValue(track, item.time, Option<i64>.some(item.adjustment), 0.0, &mut out.*)
+      InstrumentKind.Gauge => run self.counterValue(track, item.time, Option<i64>.none(), item.value, &mut out.*)
+      InstrumentKind.Histogram => {}
+    }
+  }
+
+  // A counter value on `track` at `time`: `whole` when the value is an integer, else `fraction`.
+  effect fn counterValue(self: &mut Self, track: u64, time: u64, whole: Option<i64>, fraction: f64, out: &mut Bytes) -> ()
+    ! OutOfMemoryError ? &mut Allocator {
+    let packet = run self.openPacket(time, &mut out.*)
+    let event = run open(&mut out.*, 11)
+    run number(&mut out.*, 9, TYPE_COUNTER)
+    run number(&mut out.*, 11, track)
+    match whole {
+      Option<i64>.Some {value} => run signed(&mut out.*, 30, value)
+      Option<i64>.None => run real(&mut out.*, 44, fraction)
+    }
+    close(&mut out.*, event)
+    close(&mut out.*, packet)
+  }
+}
+
+impl Sink<WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator> for Perfetto {
+  effect fn send(self: &mut Self, identity: &Resource, batch: &Batch<'_>) -> u64
+    ! WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
+    let mut buffer = Intrinsic.replace(self.buffer, Bytes.make())
+    run self.encodeInto(identity, batch, &mut buffer)
+    run Writer.writeAll(buffer.asSlice())
+    self.buffer = move buffer
+    return 0
+  }
+}
+
+fn sameBytes(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at: usize = 0
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + 1
+  }
+  return true
+}
+
+// The `InternedData` field of the entries of `table`.
+fn tableField(table: Table) -> u64 {
+  return match table {
+    Table.Names => 2
+    Table.Keys => 3
+    Table.Strings => 29
+  }
+}
+
+// Appends a metric attribute's value as a track name shows it.
+effect fn appendValue(out: &mut Bytes, item: &Value) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut digits: [u8; 25] = [0; 25]
+  let end = match &item.* {
+    Value.Bool {value} => {
+      run out.append(if value { b"true" } else { b"false" })
+      return ()
+    }
+    Value.Text {value} => {
+      run out.append(String.utf8Bytes(value.view()))
+      return ()
+    }
+    Value.Integer {value} => Format.writeI64Display(value, &mut digits, 0)
+    Value.Unsigned {value} => Format.writeU64Display(value, &mut digits, 0)
+    Value.Double {value} => Format.writeF64Debug(value, &mut digits, 0)
+  }
+  run out.append(Slice.view<u8>(&digits, 0, end))
+}

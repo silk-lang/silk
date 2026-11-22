@@ -1,7 +1,9 @@
 //! Tracing of the compiler's own work.
 //!
 //! Asked for a trace, a compiler process records what it does as OpenTelemetry spans and logs
-//! through `silk.trace`, and appends them to a file as OTLP JSON, one request per line. A command
+//! through `silk.trace`, and appends them to a file: as OTLP JSON, one request per line, or as
+//! Perfetto packets for a file named `.pftrace` or `.perfetto-trace`, with the process's resident
+//! memory and processor use sampled as counters beside them. A command
 //! is asked with `--trace <file>`, and `silkc compile` by the `trace` record of its compilation
 //! request: [`Options`] is either. The environment asks for nothing. The spans are opened where
 //! the work is: `@trace` on the function that does a phase, and `Trace.span` where the name or an
@@ -118,9 +120,12 @@ static if supported {
   import silk.platform.native.clock { NativeClock }
   import silk.platform.native.descriptor { NativeDescriptor }
   import silk.platform.native.file { NativeFile, NativeFileError, OPEN_APPEND, OPEN_CREATE, OPEN_WRITE_ONLY }
+  import silk.system.system_info { ResourceUsage, SystemInfo, SystemInfoError, UsageScope }
+  import silk.system.system_info_native { OsSystemInfo }
   import silk.trace { SpanContext, SpanGuard, SpanKind, Trace, Tracer }
   import silk.trace.log { OtelLogger }
   import silk.trace.otlp { Batch, Resource, encodeInto }
+  import silk.trace.perfetto { CounterUnit, Perfetto }
   import silk.trace.record { Config, Recorder, Span }
   import silk.trace.signals { LogRecord }
 
@@ -133,6 +138,11 @@ static if supported {
   // How long the writing thread waits between two writes, in nanoseconds: the recorder holds
   // 8192 finished spans, which the fastest work fills in no less than several milliseconds.
   const writeNanos: u64 = 1000000
+
+  // How long passes between two samples of the process's memory and processor use in a Perfetto
+  // file, in nanoseconds: often enough to show a phase's shape, seldom enough that a sample's
+  // processor share is not mostly rounding.
+  const sampleNanos: u64 = 10000000
 
   // What writes the file: what the drains take from the recorder, and which of it the file keeps.
   // The writing thread holds it while one runs, and the compiling thread between.
@@ -159,6 +169,12 @@ static if supported {
     // The identifier of the process's span once `abandon` wrote it, whose own close is left out;
     // zero before.
     abandoned: u64,
+    // The packet sequence of a Perfetto file, which writes no newlines; none for OTLP JSON.
+    perfetto: Option<Perfetto>,
+    // The process's processor time at the last sample, in microseconds, and the sample's time;
+    // zero before the first.
+    processor: u64,
+    sampled: u64,
   }
 
   // The thread that writes the file while the compiling thread works, and the token that stops it.
@@ -183,6 +199,9 @@ static if supported {
     writing: Option<Writing>,
     // Whether a thread could not be started: the compiling thread then writes the file itself.
     threadless: bool,
+    // Whether the file is a Perfetto trace, and the process it numbers the sequence by.
+    perfetto: bool,
+    pid: i32,
     // The span the process's own continues, when the program that started it gave one.
     parent: Option<SpanContext>,
     // The span of the whole process, kept to write it if the process ends without closing it.
@@ -273,7 +292,7 @@ static if supported {
     return config
   }
 
-  fn fresh(recorder: &Arc<Recorder>, descriptor: i32, queries: bool, minimum: u64) -> Sink {
+  fn fresh(recorder: &Arc<Recorder>, descriptor: i32, queries: bool, minimum: u64, perfetto: bool, pid: i32) -> Sink {
     return Sink {
       recorder: recorder.clone(),
       descriptor: descriptor,
@@ -288,23 +307,30 @@ static if supported {
       logs: List<LogRecord>.make(),
       broken: false,
       abandoned: 0,
+      perfetto: if perfetto { Option<Perfetto>.some(Perfetto.make(pid)) } else { Option<Perfetto>.none() },
+      processor: 0,
+      sampled: 0,
     }
   }
 
-  effect fn session(descriptor: i32, queries: bool, minimum: u64, small: bool) -> Session
+  effect fn session(descriptor: i32, queries: bool, minimum: u64, small: bool, perfetto: bool) -> Session
     ! OutOfMemoryError
     ? &mut Allocator {
     let recorder = run Arc<Recorder>.make(run Recorder.make(settings(small)))
     let logger = run Arc<OtelLogger>.make(OtelLogger.make(&recorder))
+    let mut info = OsSystemInfo.make()
+    let pid = run SystemInfo.processId() |> Effect.provideMut<SystemInfo>(&mut info)
     let state = State {
       recorder: recorder.clone(),
       descriptor: descriptor,
       queries: queries,
       minimum: minimum,
       calls: 0,
-      sink: Option<Sink>.some(fresh(&recorder, descriptor, queries, minimum)),
+      sink: Option<Sink>.some(fresh(&recorder, descriptor, queries, minimum, perfetto, pid)),
       writing: Option<Writing>.none(),
       threadless: false,
+      perfetto: perfetto,
+      pid: pid,
       parent: Option<SpanContext>.none(),
       root: Span.empty(),
       rooted: false,
@@ -345,7 +371,9 @@ static if supported {
       queries = true
       minimum = u64.saturatingMultiply(microseconds, 1000)
     }
-    let mut opened = run session(descriptor, queries, minimum, false)
+    let named = label(Bytes.asSlice(&options.file))
+    let perfetto = String.endsWith(named, ".pftrace") || String.endsWith(named, ".perfetto-trace")
+    let mut opened = run session(descriptor, queries, minimum, false, perfetto)
     if let Option<Bytes>.Some { value } = &options.parent {
       opened.state.parent = Trace.parseTraceparent(label(Bytes.asSlice(&value)))
     }
@@ -370,9 +398,10 @@ static if supported {
       let descriptor = state.descriptor
       let queries = state.queries
       let minimum = state.minimum
+      let perfetto = state.perfetto
       // What the original left unwritten is the original's to write.
       unsafe Pointer.write(slot(), Pointer.null<State>())
-      return Option<Session>.some(run session(descriptor, queries, minimum, small))
+      return Option<Session>.some(run session(descriptor, queries, minimum, small, perfetto))
     }
     return Option<Session>.none()
   }
@@ -513,6 +542,20 @@ static if supported {
     }
   }
 
+  // Replaces the line with `batch` as the file holds it: one OTLP request, or Perfetto packets. A
+  // batch that cannot be encoded leaves the line empty.
+  effect fn encodeBatch(state: &mut Sink, batch: &Batch<'_>) -> () ? &mut Allocator {
+    let resource = identity(state.recorder.get())
+    if let Option<Perfetto>.Some { value } = &mut state.perfetto {
+      if let Result<(), OutOfMemoryError>.Failure { error } = move run Effect.result(value.encodeInto(&resource, batch, &mut state.line)) {
+        drop error
+        Bytes.clear(&mut state.line)
+      }
+      return ()
+    }
+    run encoded(run Effect.result(encodeInto(&resource, batch, &mut state.line)), &mut state.line)
+  }
+
   fn identity(recorder: &Recorder) -> Resource {
     return Resource {
       serviceName: recorder.serviceName(),
@@ -523,33 +566,70 @@ static if supported {
     }
   }
 
-  // Appends one request to the file with one write, so that the lines of the processes that
-  // share the file never mix.
+  // Appends the line to the file with one write, so that what the processes that share the file
+  // write never mixes. An OTLP request ends with a newline.
   effect fn writeLine(state: &mut Sink) -> () ! OutOfMemoryError ? &mut Allocator {
     if Bytes.length(&state.line) == usize.ZERO || state.broken {
       return ()
     }
-    run Bytes.append(&mut state.line, b"\n")
+    if Option<Perfetto>.isNone(&state.perfetto) {
+      run Bytes.append(&mut state.line, b"\n")
+    }
     let mut error = 0
     if !run NativeDescriptor.writeAll(state.descriptor, Bytes.asSlice(&state.line), &mut error) {
       state.broken = true
     }
   }
 
+  // Writes to a Perfetto file the process's resident memory and the share of one processor its
+  // threads used since the last sample, as `memory.resident` and `cpu`, at most every `sampleNanos`.
+  effect fn sample(state: &mut Sink) -> () ! OutOfMemoryError ? &mut Allocator {
+    if Option<Perfetto>.isNone(&state.perfetto) {
+      return ()
+    }
+    let time = state.recorder.get().now()
+    if state.sampled != 0 && time - state.sampled < sampleNanos {
+      return ()
+    }
+    let mut info = OsSystemInfo.make()
+    let usage = match move run Effect.result(SystemInfo.resourceUsage(UsageScope.Process) |> Effect.provideMut<SystemInfo>(&mut info)) {
+      Result<ResourceUsage, SystemInfoError>.Success { value } => value
+      Result<ResourceUsage, SystemInfoError>.Failure { error } => {
+        drop error
+        return ()
+      }
+    }
+    let mut resident: u64 = 0
+    if let Result<u64, SystemInfoError>.Success { value } = move run Effect.result(SystemInfo.residentSetSize() |> Effect.provideMut<SystemInfo>(&mut info)) {
+      resident = value
+    }
+    let processor = usage.userMicroseconds + usage.systemMicroseconds
+    let resource = identity(state.recorder.get())
+    Bytes.clear(&mut state.line)
+    if let Option<Perfetto>.Some { value } = &mut state.perfetto {
+      if resident != 0 {
+        run value.sample(&resource, "memory.resident", CounterUnit.Bytes, time, u64.toF64(resident), &mut state.line)
+      }
+      if state.sampled != 0 && processor >= state.processor {
+        // Microseconds of processor time over nanoseconds of wall time, as a percentage.
+        let share = u64.toF64(processor - state.processor) * 100000.0 / u64.toF64(time - state.sampled)
+        run value.sample(&resource, "cpu", CounterUnit.Percent, time, share, &mut state.line)
+      }
+    }
+    state.processor = processor
+    state.sampled = time
+    return run writeLine(&mut state.*)
+  }
+
   // Writes `values` as lines of at most `batch` spans.
   effect fn writeSpanSlice(state: &mut Sink, values: &[Span]) -> () ! OutOfMemoryError ? &mut Allocator {
-    let resource = identity(state.recorder.get())
     let mut start = usize.ZERO
     while start < values.length {
       let mut count = values.length - start
       if count > batch {
         count = batch
       }
-      run encoded(
-        run Effect.result(encodeInto(&resource, &Batch.Spans { values: Slice.view<Span>(values, start, count) },
-          &mut state.line)),
-        &mut state.line,
-      )
+      run encodeBatch(&mut state.*, &Batch.Spans { values: Slice.view<Span>(values, start, count) })
       run writeLine(&mut state.*)
       start = start + count
     }
@@ -569,12 +649,9 @@ static if supported {
     if List<LogRecord>.length(&state.logs) == usize.ZERO {
       return ()
     }
-    let resource = identity(state.recorder.get())
-    run encoded(
-      run Effect.result(encodeInto(&resource, &Batch.Logs { values: List<LogRecord>.asSlice(&state.logs) },
-        &mut state.line)),
-      &mut state.line,
-    )
+    let logs = Intrinsic.replace(state.logs, List<LogRecord>.make())
+    run encodeBatch(&mut state.*, &Batch.Logs { values: List<LogRecord>.asSlice(&logs) })
+    state.logs = move logs
     List<LogRecord>.clear(&mut state.logs)
     return run writeLine(&mut state.*)
   }
@@ -672,7 +749,8 @@ static if supported {
         }
       }
     }
-    return run writeLogs(&mut state.*)
+    run writeLogs(&mut state.*)
+    return run sample(&mut state.*)
   }
 
   // The writing thread: writes what the recorder has finished every `writeNanos`, until it is
@@ -708,7 +786,7 @@ static if supported {
         drop error
         // What the thread was to hold held nothing yet unwritten but its buffers.
         state.threadless = true
-        state.sink = Option<Sink>.some(fresh(&state.recorder, state.descriptor, state.queries, state.minimum))
+        state.sink = Option<Sink>.some(fresh(&state.recorder, state.descriptor, state.queries, state.minimum, state.perfetto, state.pid))
       }
     }
   }
